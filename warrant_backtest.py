@@ -1913,33 +1913,41 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
     # Google Sheets 版券商查詢：B2 下拉選單。
     if ws_xlsx.title == "券商查詢":
         try:
-            # 券商清單放在「券商查詢資料」P2:Pn。
+            # 使用 ONE_OF_LIST 直接寫入券商清單，比 ONE_OF_RANGE 更穩定，
+            # 可避免部分環境下跨工作表範圍驗證未顯示下拉箭頭。
             sh = get_gsheet_spreadsheet()
             data_ws = sh.worksheet("券商查詢資料") if sh else None
-            data_row_count = data_ws.row_count if data_ws else 100
-            requests.append({
-                "setDataValidation": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": 2,
-                        "startColumnIndex": 1,
-                        "endColumnIndex": 2,
-                    },
-                    "rule": {
-                        "condition": {
-                            "type": "ONE_OF_RANGE",
-                            "values": [
-                                {
-                                    "userEnteredValue": "='券商查詢資料'!$P$2:$P$" + str(max(data_row_count, 2))
-                                }
-                            ],
+            broker_values = []
+
+            if data_ws:
+                for value in data_ws.col_values(16)[1:]:
+                    value = str(value).strip()
+                    if value and value not in broker_values:
+                        broker_values.append(value)
+
+            if broker_values:
+                requests.append({
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 2,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2,
                         },
-                        "showCustomUi": True,
-                        "strict": True,
-                    },
-                }
-            })
+                        "rule": {
+                            "condition": {
+                                "type": "ONE_OF_LIST",
+                                "values": [
+                                    {"userEnteredValue": broker}
+                                    for broker in broker_values
+                                ],
+                            },
+                            "showCustomUi": True,
+                            "strict": True,
+                        },
+                    }
+                })
         except Exception as e:
             print(f"  ⚠️ 券商查詢下拉選單建立失敗：{type(e).__name__}: {e}")
 
@@ -4795,6 +4803,9 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
     2. 組合包含 AB / AC / AD / BC / BD / CD / ABC / ABD / ACD / BCD / ABCD。
     3. 只有該分點同時具備該組合內所有事件類型，才列入該組合勝率。
     4. 勝率只用「已出清」事件計算，未出清不列入勝敗。
+
+    排版邏輯：
+    參考「勝率統計」工作表，每個分點獨立區塊顯示，方便閱讀與截圖。
     """
     ws = wb.create_sheet("ABCD組合勝率")
 
@@ -4819,30 +4830,6 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
         "最高報酬%",
         "最低報酬%",
     ]
-
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    title_cell = ws.cell(1, 1)
-    title_cell.value = "ABCD 所有組合勝率統計（依分點）"
-    title_cell.font = Font(bold=True, color="000000", size=14)
-    title_cell.fill = YELLOW
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
-
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
-    note_cell = ws.cell(2, 1)
-    note_cell.value = "統計邏輯：只有該分點同時具備該組合內所有事件類型，才列入該組合勝率；勝率只用「已出清」事件計算，未出清不列入勝敗。"
-    note_cell.font = Font(color="666666")
-    note_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.row_dimensions[2].height = 24
-
-    header_row = 4
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(header_row, col_idx)
-        cell.value = header
-        cell.font = Font(bold=True, color="000000")
-        cell.fill = YELLOW
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[header_row].height = 24
 
     stat_records = collect_stat_records(a_events, b_events, c_events, d_events)
 
@@ -4876,7 +4863,43 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
     ]
 
     thin_gray = Side(style="thin", color="B7B7B7")
+    medium_gray = Side(style="medium", color="999999")
     normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    broker_border = Border(left=medium_gray, right=medium_gray, top=medium_gray, bottom=medium_gray)
+
+    current_row = 1
+
+    ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(headers))
+    title_cell = ws.cell(current_row, 1)
+    title_cell.value = "ABCD 所有組合勝率統計（依分點）"
+    title_cell.font = Font(bold=True, color="000000", size=14)
+    title_cell.fill = YELLOW
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell.border = normal_border
+    ws.row_dimensions[current_row].height = 28
+
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(current_row, col_idx)
+        cell.fill = YELLOW
+        cell.border = normal_border
+
+    current_row += 1
+
+    ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(headers))
+    note_cell = ws.cell(current_row, 1)
+    note_cell.value = "統計邏輯：只有該分點同時具備該組合內所有事件類型，才列入該組合勝率；勝率只用「已出清」事件計算，未出清不列入勝敗。"
+    note_cell.font = Font(color="666666")
+    note_cell.fill = WHITE
+    note_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    note_cell.border = normal_border
+    ws.row_dimensions[current_row].height = 24
+
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(current_row, col_idx)
+        cell.fill = WHITE
+        cell.border = normal_border
+
+    current_row += 2
 
     for broker in broker_order:
         if stat_df.empty:
@@ -4890,6 +4913,33 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
                 event_counts[code] = 0
             else:
                 event_counts[code] = int((broker_g["事件代碼"] == code).sum())
+
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(headers))
+        title_cell = ws.cell(current_row, 1)
+        title_cell.value = f"分點：{broker}"
+        title_cell.font = Font(bold=True, color="000000", size=12)
+        title_cell.fill = GRAY
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
+        title_cell.border = broker_border
+        ws.row_dimensions[current_row].height = 22
+
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(current_row, col_idx)
+            cell.fill = GRAY
+            cell.border = broker_border
+
+        current_row += 1
+
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(current_row, col_idx)
+            cell.value = header
+            cell.font = Font(bold=True, color="000000")
+            cell.fill = YELLOW
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = normal_border
+        ws.row_dimensions[current_row].height = 24
+
+        current_row += 1
 
         for combo_name, combo_codes in combo_defs:
             has_all = all(event_counts.get(code, 0) > 0 for code in combo_codes)
@@ -4971,17 +5021,15 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
                     "-",
                 ]
 
-            ws.append(row_values)
-            current_row = ws.max_row
-
-            for col_idx in range(1, len(headers) + 1):
+            for col_idx, value in enumerate(row_values, 1):
                 cell = ws.cell(current_row, col_idx)
+                cell.value = value
                 cell.font = Font(color="000000")
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 cell.border = normal_border
 
                 if col_idx == 4:
-                    if cell.value == "是":
+                    if value == "是":
                         cell.fill = PatternFill("solid", fgColor="EAF2F8")
                     else:
                         cell.fill = GRAY
@@ -4989,21 +5037,15 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
                     cell.fill = WHITE
 
             ws.row_dimensions[current_row].height = 22
+            current_row += 1
 
-    for col_idx in range(1, len(headers) + 1):
-        ws.cell(1, col_idx).fill = YELLOW
-        ws.cell(2, col_idx).fill = WHITE
-
-    for row_idx in [1, 2, header_row]:
-        for col_idx in range(1, len(headers) + 1):
-            ws.cell(row_idx, col_idx).border = normal_border
+        current_row += 1
 
     col_widths = [16, 8, 14, 14, 10, 10, 10, 10, 12, 12, 12, 10, 10, 10, 10, 14, 12, 12, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    ws.freeze_panes = "A5"
-
+    ws.freeze_panes = "A4"
 
 def fmt_ratio_value(numerator, denominator):
     try:
