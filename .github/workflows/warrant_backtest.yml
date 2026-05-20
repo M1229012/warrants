@@ -1,0 +1,60 @@
+name: Warrant Backtest Google Sheet
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 台灣時間約 18:30 執行，GitHub Actions cron 使用 UTC
+    - cron: "30 10 * * 1-5"
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      OUTPUT_DIR: output
+      CACHE_DIR: warrant_cache
+      USE_CACHE: "1"
+      GSHEET_ENABLE: "1"
+      GSHEET_UPLOAD_RESULTS: "1"
+      GSHEET_NAME: "權證分點籌碼"
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      FAST_SKIP_RECENT_PRESCAN: "1"
+      FETCH_GROUP_WARRANT_PRICES: "0"
+      MAX_WORKERS: "50"
+      PRICE_WORKERS: "60"
+      PRESCAN_WORKERS: "60"
+      FIND_BROKER_WORKERS: "40"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore local cache backup
+        uses: actions/cache@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-cache-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run warrant backtest
+        run: |
+          mkdir -p output
+          python warrant_backtest.py
+
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warrant-backtest-excel
+          path: output/*.xlsx
