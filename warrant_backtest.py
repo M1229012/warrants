@@ -989,7 +989,23 @@ def get_or_create_worksheet(title, rows=100, cols=20):
             return None
 
 
-GSHEET_TEXT_HEADER_KEYWORDS = ("權證代號", "券商代號", "代號")
+GSHEET_TEXT_HEADER_KEYWORDS = (
+    "權證代號",
+    "權證代碼",
+    "權證清單",
+    "券商代號",
+    "券商代碼",
+    "股票代號",
+    "股票代碼",
+    "標的股",
+    "標的代號",
+    "標的代碼",
+    "證券代號",
+    "證券代碼",
+    "商品代號",
+    "商品代碼",
+    "代號",
+)
 
 
 def clean_gsheet_value(value):
@@ -1084,6 +1100,87 @@ def normalize_gsheet_values_for_text_columns(values):
                 out[row_idx][col_idx] = add_gsheet_text_prefix(out[row_idx][col_idx])
 
     return out
+
+
+def collect_gsheet_text_column_ranges(values):
+    """
+    根據工作表前 10 列的表頭，找出需要強制使用「純文字」格式的欄位範圍。
+
+    這裡除了「權證代號 / 券商代號 / 代號」之外，也包含「權證清單」、
+    「股票代號」、「標的股」等欄位，避免 Google Sheet 把 0 開頭的代號自動轉成數字。
+    """
+    ranges = []
+
+    if not values:
+        return ranges
+
+    scan_limit = min(len(values), 10)
+    header_rows = []
+
+    for row_idx in range(scan_limit):
+        row = list(values[row_idx])
+        text_cols = []
+
+        for col_idx, header in enumerate(row):
+            if is_gsheet_text_header(header):
+                text_cols.append(col_idx)
+
+        if text_cols:
+            header_rows.append((row_idx, text_cols))
+
+    for header_row_idx, text_cols in header_rows:
+        next_header_rows = [idx for idx, _ in header_rows if idx > header_row_idx]
+        end_row = min(next_header_rows) if next_header_rows else len(values)
+
+        if end_row <= header_row_idx + 1:
+            continue
+
+        for col_idx in text_cols:
+            ranges.append({
+                "start_row": header_row_idx + 1,
+                "end_row": end_row,
+                "start_col": col_idx,
+                "end_col": col_idx + 1,
+            })
+
+    return ranges
+
+
+def apply_text_format_to_gsheet(gws, values):
+    """
+    將 Google Sheet 中的代號相關欄位套用純文字格式。
+
+    write_values_to_worksheet() 已經會在代號欄位前加單引號，這裡再補上
+    Google Sheets 的 TEXT numberFormat，雙重避免權證代號、股票代號、券商代號
+    或權證清單中的 0 開頭代號被吃掉。
+    """
+    if gws is None or not values:
+        return
+
+    requests = []
+
+    for r in collect_gsheet_text_column_ranges(values):
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": gws.id,
+                    "startRowIndex": r["start_row"],
+                    "endRowIndex": r["end_row"],
+                    "startColumnIndex": r["start_col"],
+                    "endColumnIndex": r["end_col"],
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": "TEXT"
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+
+    _gsheet_batch_update(requests)
 
 
 
@@ -1348,6 +1445,8 @@ def write_values_to_worksheet(ws, values):
             start_row = start + 1
             cell_range = f"A{start_row}"
             ws.update(values=chunk, range_name=cell_range, value_input_option="USER_ENTERED")
+
+        apply_text_format_to_gsheet(ws, normalized_values)
 
         return True
     except Exception as e:
