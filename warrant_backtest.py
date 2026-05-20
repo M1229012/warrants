@@ -1185,6 +1185,434 @@ def write_cache_to_gsheet(df, path):
         print(f"  ⚠️ 快取同步到 Google Sheet 失敗：{path}，原因：{type(e).__name__}: {e}")
 
 
+
+def _hex_to_gsheet_color(hex_value):
+    if not hex_value:
+        return None
+
+    s = str(hex_value).strip()
+
+    if not s or s in ("00000000", "FFFFFFFF"):
+        # 00000000 在 openpyxl 常代表無填色，不是真的黑色背景。
+        return None
+
+    if len(s) == 8:
+        s = s[-6:]
+
+    if len(s) != 6:
+        return None
+
+    try:
+        return {
+            "red": int(s[0:2], 16) / 255,
+            "green": int(s[2:4], 16) / 255,
+            "blue": int(s[4:6], 16) / 255,
+        }
+    except Exception:
+        return None
+
+
+def _openpyxl_color_to_gsheet(color_obj):
+    if color_obj is None:
+        return None
+
+    try:
+        if color_obj.type == "rgb" and color_obj.rgb:
+            return _hex_to_gsheet_color(color_obj.rgb)
+    except Exception:
+        pass
+
+    return None
+
+
+def _openpyxl_fill_to_gsheet(cell):
+    try:
+        fill = cell.fill
+        if fill is None or fill.fill_type is None:
+            return None
+
+        color = _openpyxl_color_to_gsheet(fill.fgColor)
+        return color
+    except Exception:
+        return None
+
+
+def _openpyxl_font_to_gsheet(cell):
+    text_format = {}
+
+    try:
+        font = cell.font
+
+        if font is None:
+            return text_format
+
+        if font.bold is not None:
+            text_format["bold"] = bool(font.bold)
+
+        if font.italic is not None:
+            text_format["italic"] = bool(font.italic)
+
+        if font.sz:
+            text_format["fontSize"] = int(float(font.sz))
+
+        color = _openpyxl_color_to_gsheet(font.color)
+        if color:
+            text_format["foregroundColor"] = color
+    except Exception:
+        pass
+
+    return text_format
+
+
+def _openpyxl_alignment_to_gsheet(cell):
+    fmt = {}
+
+    try:
+        alignment = cell.alignment
+
+        horizontal_map = {
+            "center": "CENTER",
+            "left": "LEFT",
+            "right": "RIGHT",
+        }
+        vertical_map = {
+            "center": "MIDDLE",
+            "top": "TOP",
+            "bottom": "BOTTOM",
+        }
+
+        if alignment.horizontal in horizontal_map:
+            fmt["horizontalAlignment"] = horizontal_map[alignment.horizontal]
+
+        if alignment.vertical in vertical_map:
+            fmt["verticalAlignment"] = vertical_map[alignment.vertical]
+
+        if alignment.wrap_text:
+            fmt["wrapStrategy"] = "WRAP"
+    except Exception:
+        pass
+
+    return fmt
+
+
+def _openpyxl_number_format_to_gsheet(cell):
+    try:
+        nf = str(cell.number_format or "").strip()
+
+        if not nf or nf == "General":
+            return None
+
+        if "%" in nf:
+            return {"type": "PERCENT", "pattern": nf}
+
+        if "#" in nf or "0" in nf:
+            return {"type": "NUMBER", "pattern": nf}
+    except Exception:
+        pass
+
+    return None
+
+
+def _cell_gsheet_format(cell):
+    fmt = {}
+
+    bg = _openpyxl_fill_to_gsheet(cell)
+    if bg:
+        fmt["backgroundColor"] = bg
+
+    text_format = _openpyxl_font_to_gsheet(cell)
+    if text_format:
+        fmt["textFormat"] = text_format
+
+    align_format = _openpyxl_alignment_to_gsheet(cell)
+    fmt.update(align_format)
+
+    number_format = _openpyxl_number_format_to_gsheet(cell)
+    if number_format:
+        fmt["numberFormat"] = number_format
+
+    return fmt
+
+
+def _format_fields(fmt):
+    fields = []
+
+    if "backgroundColor" in fmt:
+        fields.append("userEnteredFormat.backgroundColor")
+    if "textFormat" in fmt:
+        for key in fmt["textFormat"].keys():
+            fields.append(f"userEnteredFormat.textFormat.{key}")
+    if "horizontalAlignment" in fmt:
+        fields.append("userEnteredFormat.horizontalAlignment")
+    if "verticalAlignment" in fmt:
+        fields.append("userEnteredFormat.verticalAlignment")
+    if "wrapStrategy" in fmt:
+        fields.append("userEnteredFormat.wrapStrategy")
+    if "numberFormat" in fmt:
+        fields.append("userEnteredFormat.numberFormat")
+
+    return ",".join(fields)
+
+
+def _gsheet_batch_update(requests, chunk_size=400):
+    if not requests:
+        return
+
+    sh = get_gsheet_spreadsheet()
+
+    if sh is None:
+        return
+
+    for start in range(0, len(requests), chunk_size):
+        chunk = requests[start:start + chunk_size]
+        try:
+            sh.batch_update({"requests": chunk})
+        except Exception as e:
+            print(f"  ⚠️ Google Sheet 格式套用失敗：{type(e).__name__}: {e}")
+            return
+
+
+def _openpyxl_freeze_to_grid_properties(ws_xlsx):
+    frozen_rows = 0
+    frozen_cols = 0
+
+    try:
+        pane = ws_xlsx.freeze_panes
+
+        if pane:
+            from openpyxl.utils.cell import coordinate_to_tuple
+            row, col = coordinate_to_tuple(str(pane))
+            frozen_rows = max(row - 1, 0)
+            frozen_cols = max(col - 1, 0)
+    except Exception:
+        pass
+
+    return frozen_rows, frozen_cols
+
+
+def _excel_width_to_pixels(width):
+    try:
+        return max(20, int(float(width) * 7 + 5))
+    except Exception:
+        return None
+
+
+def _excel_height_to_pixels(height):
+    try:
+        return max(18, int(float(height) * 1.333))
+    except Exception:
+        return None
+
+
+def normalize_formula_for_gsheet(value):
+    if not isinstance(value, str):
+        return value
+
+    if not value.startswith("="):
+        return value
+
+    # Google Sheets 對中文工作表名稱建議加單引號，避免公式解析失敗。
+    value = value.replace("INDEX(券商查詢資料!", "INDEX('券商查詢資料'!")
+    value = value.replace(",券商查詢資料!", ",'券商查詢資料'!")
+    value = value.replace("MATCH($B$2&\"|\"&$A", "MATCH($B$2&\"|\"&$A")
+    return value
+
+
+def apply_excel_style_to_gsheet(ws_xlsx, gws):
+    """
+    將 openpyxl 產生的 Excel 樣式轉成 Google Sheets 格式。
+
+    會同步：
+    1. 背景色、字體粗細 / 字色 / 字級
+    2. 文字置中、換行、數字格式
+    3. 欄寬、列高、凍結列 / 欄
+    4. 合併儲存格
+    5. 隱藏工作表
+    6. 券商查詢 B2 下拉選單
+
+    Google Sheets API 與 Excel 格式模型不同，因此外框只保留主要視覺效果，
+    但 A/B/C/D 的紅綠藍橘狀態色、標頭色與查詢頁互動功能會完整保留。
+    """
+    if gws is None:
+        return
+
+    sheet_id = int(gws.id)
+    requests = []
+
+    frozen_rows, frozen_cols = _openpyxl_freeze_to_grid_properties(ws_xlsx)
+
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": sheet_id,
+                "hidden": bool(ws_xlsx.sheet_state == "hidden"),
+                "gridProperties": {
+                    "frozenRowCount": frozen_rows,
+                    "frozenColumnCount": frozen_cols,
+                },
+            },
+            "fields": "hidden,gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+        }
+    })
+
+    # 先清除舊合併範圍，避免重複執行時 mergeCells 失敗。
+    requests.append({
+        "unmergeCells": {
+            "range": {
+                "sheetId": sheet_id,
+            }
+        }
+    })
+
+    # 合併儲存格。
+    for merged_range in ws_xlsx.merged_cells.ranges:
+        try:
+            requests.append({
+                "mergeCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": merged_range.min_row - 1,
+                        "endRowIndex": merged_range.max_row,
+                        "startColumnIndex": merged_range.min_col - 1,
+                        "endColumnIndex": merged_range.max_col,
+                    },
+                    "mergeType": "MERGE_ALL",
+                }
+            })
+        except Exception:
+            pass
+
+    # 欄寬。
+    for col_idx in range(1, ws_xlsx.max_column + 1):
+        letter = get_column_letter(col_idx)
+        width = ws_xlsx.column_dimensions[letter].width
+        pixel_size = _excel_width_to_pixels(width) if width else None
+
+        if pixel_size:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_idx - 1,
+                        "endIndex": col_idx,
+                    },
+                    "properties": {
+                        "pixelSize": pixel_size,
+                    },
+                    "fields": "pixelSize",
+                }
+            })
+
+    # 列高。
+    for row_idx in range(1, ws_xlsx.max_row + 1):
+        height = ws_xlsx.row_dimensions[row_idx].height
+        pixel_size = _excel_height_to_pixels(height) if height else None
+
+        if pixel_size:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_idx - 1,
+                        "endIndex": row_idx,
+                    },
+                    "properties": {
+                        "pixelSize": pixel_size,
+                    },
+                    "fields": "pixelSize",
+                }
+            })
+
+    # 逐列壓縮相同格式的連續儲存格，減少 batchUpdate 請求數量。
+    import json as _json
+
+    for row_idx in range(1, ws_xlsx.max_row + 1):
+        run_start = None
+        run_fmt = None
+        run_key = None
+
+        for col_idx in range(1, ws_xlsx.max_column + 2):
+            if col_idx <= ws_xlsx.max_column:
+                cell = ws_xlsx.cell(row_idx, col_idx)
+                fmt = _cell_gsheet_format(cell)
+                key = _json.dumps(fmt, sort_keys=True, ensure_ascii=False) if fmt else None
+            else:
+                fmt = None
+                key = None
+
+            if key and run_key is None:
+                run_start = col_idx
+                run_fmt = fmt
+                run_key = key
+            elif key and key == run_key:
+                continue
+            else:
+                if run_key and run_start is not None and run_fmt:
+                    fields = _format_fields(run_fmt)
+                    if fields:
+                        requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": row_idx - 1,
+                                    "endRowIndex": row_idx,
+                                    "startColumnIndex": run_start - 1,
+                                    "endColumnIndex": col_idx - 1,
+                                },
+                                "cell": {
+                                    "userEnteredFormat": run_fmt,
+                                },
+                                "fields": fields,
+                            }
+                        })
+
+                if key:
+                    run_start = col_idx
+                    run_fmt = fmt
+                    run_key = key
+                else:
+                    run_start = None
+                    run_fmt = None
+                    run_key = None
+
+    # Google Sheets 版券商查詢：B2 下拉選單。
+    if ws_xlsx.title == "券商查詢":
+        try:
+            # 券商清單放在「券商查詢資料」P2:Pn。
+            sh = get_gsheet_spreadsheet()
+            data_ws = sh.worksheet("券商查詢資料") if sh else None
+            data_row_count = data_ws.row_count if data_ws else 100
+            requests.append({
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2,
+                        "startColumnIndex": 1,
+                        "endColumnIndex": 2,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_RANGE",
+                            "values": [
+                                {
+                                    "userEnteredValue": "='券商查詢資料'!$P$2:$P$" + str(max(data_row_count, 2))
+                                }
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            })
+        except Exception as e:
+            print(f"  ⚠️ 券商查詢下拉選單建立失敗：{type(e).__name__}: {e}")
+
+    _gsheet_batch_update(requests)
+
+
 def upload_excel_to_google_sheet(xlsx_path):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -1199,8 +1627,13 @@ def upload_excel_to_google_sheet(xlsx_path):
             title = safe_worksheet_title(ws_xlsx.title)
             values = []
 
-            for row in ws_xlsx.iter_rows(values_only=True):
-                values.append([clean_gsheet_value(cell) for cell in row])
+            for row in ws_xlsx.iter_rows(values_only=False):
+                row_values = []
+                for cell in row:
+                    value = cell.value
+                    value = normalize_formula_for_gsheet(value)
+                    row_values.append(clean_gsheet_value(value))
+                values.append(row_values)
 
             if not values:
                 values = [[""]]
@@ -1209,6 +1642,7 @@ def upload_excel_to_google_sheet(xlsx_path):
             gws = get_or_create_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
 
             if write_values_to_worksheet(gws, values):
+                apply_excel_style_to_gsheet(ws_xlsx, gws)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
 
     except Exception as e:
