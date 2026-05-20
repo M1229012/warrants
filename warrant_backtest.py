@@ -20,7 +20,7 @@ D：同一分點 + 同一標的，近10個交易日累積淨買進金額 >= 100�
 9. 顏色說明
 
 執行：python warrant_backtest.py
-依賴：pip install requests pandas openpyxl lxml html5lib beautifulsoup4 gspread google-auth
+依賴：pip install requests pandas openpyxl
 """
 
 import json, re, time, os
@@ -40,9 +40,9 @@ from openpyxl.worksheet.datavalidation import DataValidation
 # 設定
 # ══════════════════════════════════════════════════════════════════════
 
-OUTPUT_DIR    = os.getenv("OUTPUT_DIR", r"C:\Users\chen1_ukw0m7r\Downloads")
+OUTPUT_DIR    = r"C:\Users\chen1_ukw0m7r\Downloads"
 AMOUNT_THRESH = 1_000_000
-MAX_WORKERS   = 15
+MAX_WORKERS   = 50
 DAYS_HISTORY  = 250
 RECENT_RANKING_DAYS = 62
 D_WINDOW_DAYS = 10
@@ -52,17 +52,29 @@ D_WINDOW_DAYS = 10
 # 第二次之後會優先讀取快取，只針對最近有出現目標分點的候選組合補抓新資料。
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
-CACHE_RECENT_SCAN_DAYS = int(os.getenv("CACHE_RECENT_SCAN_DAYS", "5"))
+CACHE_RECENT_SCAN_DAYS = int(os.getenv("CACHE_RECENT_SCAN_DAYS", "3"))
+PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "60"))
+PRESCAN_WORKERS = int(os.getenv("PRESCAN_WORKERS", "60"))
+FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
+
+# 加速模式：
+# 1. 有候選組合快取時，預設不再每天掃描全市場權證，只更新既有候選組合的 API5 歷史資料。
+#    若需要重新發現新權證 / 新候選組合，可執行前設定 FAST_SKIP_RECENT_PRESCAN=0。
+# 2. B / C / D 工作表的 D+ 欄位只使用標的股價格，預設不再額外抓群組事件中每一檔權證價格。
+#    若未來需要群組事件權證明細價格，可設定 FETCH_GROUP_WARRANT_PRICES=1。
+FAST_SKIP_RECENT_PRESCAN = os.getenv("FAST_SKIP_RECENT_PRESCAN", "1").strip().lower() not in ("0", "false", "no")
+FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
+
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 WARRANTS_CACHE_PATH   = os.path.join(CACHE_DIR, "warrants_cache.csv")
 BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "candidates_cache.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
+PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -862,6 +874,251 @@ def get_price_nearest(prices, date):
 
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# Google Sheet 快取 / 結果同步工具（GitHub Actions 部署用）
+# ══════════════════════════════════════════════════════════════════════
+
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
+
+_GSHEET_CLIENT = None
+_GSHEET_SPREADSHEET = None
+
+CACHE_SHEET_NAME_MAP = {
+    "warrants_cache.csv": "快取_權證清單",
+    "broker_map_cache.csv": "快取_分點代號",
+    "candidates_cache.csv": "快取_候選組合",
+    "broker_warrant_history_cache.csv": "快取_分點歷史",
+    "price_cache.csv": "快取_價格",
+}
+
+
+def gsheet_enabled():
+    return bool(os.getenv("GCP_SERVICE_KEY", "").strip())
+
+
+def get_gsheet_client():
+    global _GSHEET_CLIENT
+
+    if _GSHEET_CLIENT is not None:
+        return _GSHEET_CLIENT
+
+    service_key = os.getenv("GCP_SERVICE_KEY", "").strip()
+
+    if not service_key:
+        return None
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        info = json.loads(service_key)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        _GSHEET_CLIENT = gspread.authorize(creds)
+        return _GSHEET_CLIENT
+    except Exception as e:
+        print(f"  ⚠️ Google Sheet 金鑰初始化失敗：{type(e).__name__}: {e}")
+        return None
+
+
+def get_gsheet_spreadsheet():
+    global _GSHEET_SPREADSHEET
+
+    if _GSHEET_SPREADSHEET is not None:
+        return _GSHEET_SPREADSHEET
+
+    gc = get_gsheet_client()
+
+    if gc is None:
+        return None
+
+    try:
+        if GOOGLE_SHEET_ID:
+            _GSHEET_SPREADSHEET = gc.open_by_key(GOOGLE_SHEET_ID)
+        else:
+            _GSHEET_SPREADSHEET = gc.open(GOOGLE_SHEET_NAME)
+        return _GSHEET_SPREADSHEET
+    except Exception as e:
+        try:
+            _GSHEET_SPREADSHEET = gc.create(GOOGLE_SHEET_NAME)
+            print(f"  ✅ 已建立 Google Sheet：{GOOGLE_SHEET_NAME}")
+            return _GSHEET_SPREADSHEET
+        except Exception as e2:
+            print(f"  ⚠️ Google Sheet 開啟/建立失敗：{type(e).__name__}: {e} / {type(e2).__name__}: {e2}")
+            return None
+
+
+def safe_worksheet_title(title):
+    title = str(title).strip()
+    bad_chars = [":", "\\", "/", "?", "*", "[", "]"]
+    for ch in bad_chars:
+        title = title.replace(ch, "_")
+    return title[:100] if title else "工作表"
+
+
+def cache_sheet_name_from_path(path):
+    base = os.path.basename(str(path))
+    return CACHE_SHEET_NAME_MAP.get(base, safe_worksheet_title(f"快取_{os.path.splitext(base)[0]}"))
+
+
+def get_or_create_worksheet(title, rows=100, cols=20):
+    sh = get_gsheet_spreadsheet()
+
+    if sh is None:
+        return None
+
+    title = safe_worksheet_title(title)
+
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        try:
+            return sh.add_worksheet(title=title, rows=max(int(rows), 1), cols=max(int(cols), 1))
+        except Exception as e:
+            print(f"  ⚠️ 建立工作表失敗：{title}，原因：{type(e).__name__}: {e}")
+            return None
+
+
+def clean_gsheet_value(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, (int, float)):
+        return value
+
+    return str(value)
+
+
+def write_values_to_worksheet(ws, values):
+    if ws is None:
+        return False
+
+    if not values:
+        values = [[""]]
+
+    row_count = max(len(values), 1)
+    col_count = max(max((len(row) for row in values), default=1), 1)
+
+    normalized_values = []
+    for row in values:
+        row = list(row)
+        if len(row) < col_count:
+            row = row + [""] * (col_count - len(row))
+        normalized_values.append([clean_gsheet_value(v) for v in row])
+
+    try:
+        ws.clear()
+        ws.resize(rows=max(row_count, 1), cols=max(col_count, 1))
+
+        for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
+            chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
+            start_row = start + 1
+            cell_range = f"A{start_row}"
+            ws.update(values=chunk, range_name=cell_range, value_input_option="USER_ENTERED")
+
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Google Sheet 寫入失敗：{ws.title}，原因：{type(e).__name__}: {e}")
+        return False
+
+
+def read_cache_from_gsheet(path):
+    if not GSHEET_CACHE_ENABLED or not gsheet_enabled():
+        return pd.DataFrame()
+
+    title = cache_sheet_name_from_path(path)
+
+    try:
+        sh = get_gsheet_spreadsheet()
+        if sh is None:
+            return pd.DataFrame()
+
+        ws = sh.worksheet(title)
+        values = ws.get_all_values()
+
+        if not values or len(values) < 2:
+            return pd.DataFrame()
+
+        headers = [str(h).strip() for h in values[0]]
+        rows = values[1:]
+
+        if not headers or all(h == "" for h in headers):
+            return pd.DataFrame()
+
+        fixed_rows = []
+        n_cols = len(headers)
+        for row in rows:
+            row = list(row)
+            if len(row) < n_cols:
+                row = row + [""] * (n_cols - len(row))
+            elif len(row) > n_cols:
+                row = row[:n_cols]
+            fixed_rows.append(row)
+
+        df = pd.DataFrame(fixed_rows, columns=headers).fillna("")
+        print(f"  ☁️ 已從 Google Sheet 讀取快取：{title}，共 {len(df):,} 筆")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def write_cache_to_gsheet(df, path):
+    if not GSHEET_CACHE_ENABLED or not gsheet_enabled():
+        return
+
+    if df is None:
+        return
+
+    try:
+        title = cache_sheet_name_from_path(path)
+        df2 = df.copy().fillna("")
+        values = [list(df2.columns)] + df2.astype(str).values.tolist()
+        ws = get_or_create_worksheet(title, rows=max(len(values), 100), cols=max(len(df2.columns), 20))
+
+        if write_values_to_worksheet(ws, values):
+            print(f"  ☁️ 已同步快取到 Google Sheet：{title}，共 {len(df2):,} 筆")
+    except Exception as e:
+        print(f"  ⚠️ 快取同步到 Google Sheet 失敗：{path}，原因：{type(e).__name__}: {e}")
+
+
+def upload_excel_to_google_sheet(xlsx_path):
+    if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
+        print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
+        return
+
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(xlsx_path, data_only=False)
+
+        for ws_xlsx in wb.worksheets:
+            title = safe_worksheet_title(ws_xlsx.title)
+            values = []
+
+            for row in ws_xlsx.iter_rows(values_only=True):
+                values.append([clean_gsheet_value(cell) for cell in row])
+
+            if not values:
+                values = [[""]]
+
+            max_cols = max(max((len(row) for row in values), default=1), 1)
+            gws = get_or_create_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
+
+            if write_values_to_worksheet(gws, values):
+                print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
+
+    except Exception as e:
+        print(f"  ⚠️ Excel 同步 Google Sheet 失敗：{type(e).__name__}: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 快取工具：避免每次重爬舊資料
 # ══════════════════════════════════════════════════════════════════════
@@ -874,7 +1131,18 @@ def read_cache_csv(path):
     if not cache_enabled():
         return pd.DataFrame()
 
-    # GitHub Actions 環境通常沒有本機快取，因此優先從 Google Sheet 快取工作表讀取。
+    # 本機執行時：優先讀本機快取，並順手上傳到 Google Sheet，方便先把本機快取種到雲端。
+    # GitHub Actions 執行時：優先讀 Google Sheet 快取，因為 runner 通常是乾淨環境。
+    local_first = os.getenv("GITHUB_ACTIONS", "").strip().lower() != "true"
+
+    if local_first and os.path.exists(path):
+        try:
+            df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+            write_cache_to_gsheet(df, path)
+            return df
+        except Exception as e:
+            print(f"  ⚠️ 本機快取讀取失敗：{path}，原因：{e}")
+
     df_from_gsheet = read_cache_from_gsheet(path)
 
     if df_from_gsheet is not None and not df_from_gsheet.empty:
@@ -890,6 +1158,7 @@ def read_cache_csv(path):
 
     try:
         df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+        write_cache_to_gsheet(df, path)
         return df
     except Exception as e:
         print(f"  ⚠️ 快取讀取失敗：{path}，原因：{e}")
@@ -906,8 +1175,161 @@ def write_cache_csv(df, path):
     except Exception as e:
         print(f"  ⚠️ 快取寫入失敗：{path}，原因：{e}")
 
-    # 本機快取寫完後，同步一份到 Google Sheet，讓 GitHub Actions 下次可先從雲端快取讀取。
     write_cache_to_gsheet(df, path)
+
+
+def load_price_cache():
+    """
+    讀取價格持久化快取。
+
+    快取欄位：
+    1. 代號
+    2. 日期
+    3. 收盤價
+
+    代號會統一用 normalize_price_code() 正規化，避免同一檔股票 / 權證
+    因為補零或去零產生重複抓取。
+    """
+    df = read_cache_csv(PRICE_CACHE_PATH)
+
+    if df.empty:
+        return {}
+
+    required_cols = ["代號", "日期", "收盤價"]
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"  ⚠️ 價格快取欄位不完整，缺少：{col}")
+            return {}
+
+    price_cache = {}
+
+    for _, row in df.iterrows():
+        code = normalize_price_code(row.get("代號", ""))
+
+        if not code:
+            continue
+
+        date_str = normalize_date_str(row.get("日期", ""))
+        dt = parse_date(date_str)
+
+        if not dt:
+            continue
+
+        price = safe_price_float(row.get("收盤價", ""))
+
+        if price is None:
+            continue
+
+        price_cache.setdefault(code, {})[dt.strftime("%Y/%m/%d")] = price
+
+    return price_cache
+
+
+def save_price_cache(price_cache):
+    """
+    寫入價格持久化快取。
+
+    寫入前會再做一次代號正規化，避免 064390 / 64390 之類別名重複存檔。
+    """
+    if not USE_CACHE or not price_cache:
+        return
+
+    canonical = {}
+
+    for code, prices in price_cache.items():
+        norm_code = normalize_price_code(code)
+
+        if not norm_code or not prices:
+            continue
+
+        for date_str, price in prices.items():
+            dt = parse_date(date_str)
+            price = safe_price_float(price)
+
+            if not dt or price is None:
+                continue
+
+            canonical.setdefault(norm_code, {})[dt.strftime("%Y/%m/%d")] = price
+
+    rows = []
+
+    for code in sorted(canonical.keys()):
+        for date_str in sorted(canonical[code].keys()):
+            rows.append({
+                "代號": code,
+                "日期": date_str,
+                "收盤價": canonical[code][date_str],
+            })
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows, columns=["代號", "日期", "收盤價"])
+    write_cache_csv(df, PRICE_CACHE_PATH)
+    print(f"  💾 已更新價格快取：{PRICE_CACHE_PATH}，共 {len(df):,} 筆")
+
+
+def get_cached_prices_for_code(price_cache, code):
+    """
+    從價格快取中取出指定代號的價格。
+
+    同時支援補零版與去零版查找，最後回傳單一合併後 dict。
+    """
+    out = {}
+    norm_code = normalize_price_code(code)
+
+    if not norm_code:
+        return out
+
+    lookup_codes = []
+    for c in price_code_variants(norm_code):
+        if c and c not in lookup_codes:
+            lookup_codes.append(c)
+
+        no_zero = c.lstrip("0")
+        if no_zero and no_zero not in lookup_codes:
+            lookup_codes.append(no_zero)
+
+        norm_c = normalize_price_code(c)
+        if norm_c and norm_c not in lookup_codes:
+            lookup_codes.append(norm_c)
+
+    for c in lookup_codes:
+        cached = price_cache.get(c)
+
+        if not cached:
+            continue
+
+        out = merge_price_dicts(out, cached)
+
+    return out
+
+
+def add_price_aliases(price_cache, code, prices):
+    """
+    在記憶體 price_cache 中建立補零 / 去零別名，
+    避免 Excel 或 pandas 吃掉前導 0 時查不到。
+    """
+    if not prices:
+        prices = {}
+
+    norm_code = normalize_price_code(code)
+
+    if not norm_code:
+        return
+
+    price_cache[norm_code] = prices
+
+    no_zero = norm_code.lstrip("0")
+
+    if no_zero:
+        price_cache[no_zero] = prices
+
+    raw_code = str(code).strip()
+
+    if raw_code:
+        price_cache[raw_code] = prices
+
 
 
 def candidate_key_from_tuple(c):
@@ -1153,9 +1575,9 @@ def merge_items_into_history_cache(history_df, new_items):
         combined = new_df
     else:
         history_df = history_df.copy()
-        remove_mask = history_df.apply(
-            lambda r: candidate_key_from_values(r["權證代號"], r["券商代號"]) in new_keys,
-            axis=1
+        remove_mask = pd.Series(
+            [candidate_key_from_values(w, b) in new_keys for w, b in zip(history_df["權證代號"], history_df["券商代號"])],
+            index=history_df.index
         )
         old_keep_df = history_df[~remove_mask].copy()
         combined = pd.concat([old_keep_df, new_df], ignore_index=True)
@@ -1195,9 +1617,9 @@ def items_from_history_cache(history_df, candidate_filter=None):
     df = history_df.copy().fillna("")
 
     if candidate_filter:
-        mask = df.apply(
-            lambda r: candidate_key_from_values(r["權證代號"], r["券商代號"]) in candidate_filter,
-            axis=1
+        mask = pd.Series(
+            [candidate_key_from_values(w, b) in candidate_filter for w, b in zip(df["權證代號"], df["券商代號"])],
+            index=df.index
         )
         df = df[mask].copy()
 
@@ -1439,7 +1861,7 @@ def find_broker_codes_live(warrants):
                 hits[label] = (name, row.get("V2", ""))
         return hits
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=FIND_BROKER_WORKERS) as ex:
         futures = {ex.submit(scan_one, w["代號"]): w for w in warrants[:300]}
 
         for future in as_completed(futures):
@@ -1453,6 +1875,9 @@ def find_broker_codes_live(warrants):
                     found[label] = (name, code)
 
             if len(found) == len(TARGET_PATTERNS):
+                for pending_future in futures:
+                    if not pending_future.done():
+                        pending_future.cancel()
                 break
 
     for label, (name, code) in found.items():
@@ -1518,7 +1943,7 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
         return hits
 
-    with ThreadPoolExecutor(max_workers=30) as ex:
+    with ThreadPoolExecutor(max_workers=PRESCAN_WORKERS) as ex:
         futures = {ex.submit(prescan_one, w): w for w in warrants}
 
         for future in as_completed(futures):
@@ -1556,8 +1981,19 @@ def prescan_all(warrants, broker_map):
     cached_candidates = load_candidates_cache()
 
     if cached_candidates:
-        print("【Step 3a】讀取候選組合快取，並補掃最近資料...")
+        print("【Step 3a】讀取候選組合快取...")
         print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates)} 組")
+
+        if FAST_SKIP_RECENT_PRESCAN:
+            # 每日執行時最大的耗時通常不是日期範圍，而是 prescan_all_live 仍然會掃描全市場所有權證。
+            # 有候選組合快取時，直接更新既有候選組合的 API5 歷史資料，避免每天對全市場權證逐一 api4_get。
+            # 若要重新發現新權證 / 新候選組合，請設定 FAST_SKIP_RECENT_PRESCAN=0。
+            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in cached_candidates}
+            print("  ⚡ 加速模式：已略過全市場最近資料預掃描，改為更新既有候選組合。")
+            print("  ⚠️ 若需重新發現新權證候選，請設定 FAST_SKIP_RECENT_PRESCAN=0 後再執行。")
+            print(f"  ✅ 本次需檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
+            return cached_candidates
+
         print(f"  🔄 補掃最近 {CACHE_RECENT_SCAN_DAYS} 天，用來判斷需要更新的候選組合...")
 
         recent_candidates = prescan_all_live(warrants, broker_map, scan_days=CACHE_RECENT_SCAN_DAYS)
@@ -1930,6 +2366,53 @@ def filter_a_events_unique_warrants(a_events):
 # B / C 群組事件出清推估
 # ══════════════════════════════════════════════════════════════════════
 
+
+_GROUP_OUTCOME_SALE_ROWS_CACHE = {}
+
+
+def get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
+    """
+    B / C / D 出清推估用的賣出資料快取。
+
+    原本 simulate_group_outcome() 每產生一筆群組事件，都會重新掃該權證的 item["df"]。
+    D 類事件數量一多，這裡會被重複執行很多次。
+    這版改成同一個「券商代號 + 權證代號」只整理一次賣出資料，後面直接重用。
+    """
+    key = (str(broker_code).strip(), str(warrant_code).strip())
+
+    if key in _GROUP_OUTCOME_SALE_ROWS_CACHE:
+        return _GROUP_OUTCOME_SALE_ROWS_CACHE[key]
+
+    item = item_map.get(key)
+    rows = []
+
+    if item:
+        df = item.get("df", pd.DataFrame())
+
+        if df is not None and not df.empty:
+            needed_cols = ["日期", "賣出股數", "賣出金額"]
+
+            if all(col in df.columns for col in needed_cols):
+                for date, sell_s, sell_a in df[needed_cols].itertuples(index=False, name=None):
+                    try:
+                        sell_s = int(sell_s)
+                        sell_a = int(sell_a)
+                    except:
+                        continue
+
+                    if sell_s > 0:
+                        rows.append({
+                            "日期": normalize_date_str(date),
+                            "權證代號": key[1],
+                            "賣出股數": sell_s,
+                            "賣出金額": sell_a,
+                        })
+
+    rows = sorted(rows, key=lambda x: (x["日期"], x["權證代號"]))
+    _GROUP_OUTCOME_SALE_ROWS_CACHE[key] = rows
+    return rows
+
+
 def simulate_group_outcome(event, item_map):
     lots = []
 
@@ -1961,22 +2444,13 @@ def simulate_group_outcome(event, item_map):
         return event
 
     future_sales = []
+    event_end_date = normalize_date_str(event["結束日"])
+    broker_code = str(event["券商代號"]).strip()
 
     for warrant_code in sorted(set(lot["權證代號"] for lot in lots)):
-        item = item_map.get((event["券商代號"], warrant_code))
-        if not item:
-            continue
-
-        df = item["df"]
-
-        for _, row in df.iterrows():
-            if row["日期"] > event["結束日"] and int(row["賣出股數"]) > 0:
-                future_sales.append({
-                    "日期": row["日期"],
-                    "權證代號": warrant_code,
-                    "賣出股數": int(row["賣出股數"]),
-                    "賣出金額": int(row["賣出金額"]),
-                })
+        for sale in get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
+            if sale["日期"] > event_end_date:
+                future_sales.append(sale)
 
     future_sales = sorted(future_sales, key=lambda x: (x["日期"], x["權證代號"]))
 
@@ -2141,6 +2615,7 @@ def build_b_events(daily_records, item_map):
 # C：同分點 + 同標的，連續 3 交易日多檔權證累積買超 >= 100萬
 # ══════════════════════════════════════════════════════════════════════
 
+
 def build_c_events(daily_records, item_map):
     events = []
     used_c_keys = set()
@@ -2150,71 +2625,147 @@ def build_c_events(daily_records, item_map):
         return events
 
     df = pd.DataFrame(daily_records)
-    df = df[(df["買超金額"] > 0) & (df["買超股數"] > 0)]
+    df = df[(df["買超金額"] > 0) & (df["買超股數"] > 0)].copy()
 
     if df.empty:
         return events
 
-    # C 類必須使用「連續 3 個交易日」視窗，
-    # 不能使用同一分點、同一標的任意 3 個有買超的日期。
-    # 這裡用已抓回資料中出現過的全部日期建立全域交易日序列，
-    # 再逐一取 [D, D+1, D+2] 的連續 3 個交易日做累積判斷。
+    # C 類必須使用「連續 3 個交易日」視窗。
+    # 速度優化：同一群組內改用滑動視窗累加 / 扣除，避免每個視窗重複 isin + groupby。
     trade_dates = sorted(df["日期"].dropna().unique())
 
     if len(trade_dates) < 3:
         return events
 
-    trade_windows = []
-    for i in range(len(trade_dates) - 2):
-        trade_windows.append(trade_dates[i:i+3])
+    window_days = 3
+    date_to_idx = {d: i for i, d in enumerate(trade_dates)}
+    df["日期序號"] = df["日期"].map(date_to_idx)
+    df = df.dropna(subset=["日期序號"]).copy()
+    df["日期序號"] = df["日期序號"].astype(int)
+
+    if df.empty:
+        return events
 
     main_group_cols = ["分點", "分點名稱", "券商代號", "標的股"]
 
-    for key, g in df.groupby(main_group_cols):
+    for key, g in df.groupby(main_group_cols, sort=False):
         broker_label, broker_name, broker_code, underlying_code = key
 
-        for window_dates in trade_windows:
-            wg = g[g["日期"].isin(window_dates)]
+        if g.empty:
+            continue
 
-            if wg.empty:
+        g = g.sort_values(["日期序號", "權證代號"]).reset_index(drop=True)
+        rows_by_idx = {}
+
+        for row in g[[
+            "日期序號", "日期", "券商代號", "標的股", "權證代號", "權證名稱", "買超金額", "買超股數"
+        ]].itertuples(index=False, name=None):
+            idx = int(row[0])
+            rows_by_idx.setdefault(idx, []).append(row)
+
+        if not rows_by_idx:
+            continue
+
+        min_idx = min(rows_by_idx.keys())
+        max_idx = max(rows_by_idx.keys())
+
+        start_i_min = max(0, min_idx - window_days + 1)
+        start_i_max = min(max_idx, len(trade_dates) - window_days)
+
+        if start_i_max < start_i_min:
+            continue
+
+        window_lot_map = {}
+        window_keys = set()
+
+        def add_row_to_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, buy_shares = row
+            lot_key = (date, normalize_warrant_code_for_unique(warrant_code), warrant_name)
+
+            rec = window_lot_map.setdefault(lot_key, {
+                "買進日": date,
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "金額": 0,
+                "股數": 0,
+            })
+
+            rec["金額"] += int(buy_amount)
+            rec["股數"] += int(buy_shares)
+
+            window_keys.add(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        def remove_row_from_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, buy_shares = row
+            lot_key = (date, normalize_warrant_code_for_unique(warrant_code), warrant_name)
+            rec = window_lot_map.get(lot_key)
+
+            if rec:
+                rec["金額"] -= int(buy_amount)
+                rec["股數"] -= int(buy_shares)
+
+                if rec["金額"] == 0 and rec["股數"] == 0:
+                    window_lot_map.pop(lot_key, None)
+
+            window_keys.discard(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        first_start = start_i_min
+        first_end = first_start + window_days - 1
+
+        for idx in range(first_start, first_end + 1):
+            for row in rows_by_idx.get(idx, []):
+                add_row_to_window(row)
+
+        for start_idx in range(start_i_min, start_i_max + 1):
+            end_idx = start_idx + window_days - 1
+
+            if start_idx > start_i_min:
+                remove_idx = start_idx - 1
+                add_idx = end_idx
+
+                for row in rows_by_idx.get(remove_idx, []):
+                    remove_row_from_window(row)
+
+                for row in rows_by_idx.get(add_idx, []):
+                    add_row_to_window(row)
+
+            if not window_lot_map:
                 continue
 
-            window_keys = set()
-            for _, used_row in wg.iterrows():
-                window_keys.add(make_daily_key(
-                    used_row["券商代號"],
-                    used_row["標的股"],
-                    used_row["日期"],
-                    used_row["權證代號"],
-                ))
-
-            # 避免 C 類滑動 3 日視窗彼此重複使用同一批資料
             if window_keys & used_c_keys:
                 continue
 
             lots = []
 
-            lot_rows = wg.groupby(["日期", "權證代號", "權證名稱"], as_index=False).agg({
-                "買超金額": "sum",
-                "買超股數": "sum",
-            })
+            for lot_key in sorted(window_lot_map.keys()):
+                rec = window_lot_map[lot_key]
+                warrant_code = normalize_warrant_code_for_unique(rec["權證代號"])
 
-            for _, lr in lot_rows.iterrows():
-                warrant_code = normalize_warrant_code_for_unique(lr["權證代號"])
-
-                # C 類內部已經使用過的權證，不再進入後續 C 事件。
                 if warrant_code in used_c_warrant_codes:
                     continue
 
-                if int(lr["買超金額"]) <= 0 or int(lr["買超股數"]) <= 0:
+                lot_amount = int(rec["金額"])
+                lot_shares = int(rec["股數"])
+
+                if lot_amount <= 0 or lot_shares <= 0:
                     continue
 
                 lots.append({
-                    "買進日": lr["日期"],
-                    "權證代號": lr["權證代號"],
-                    "權證名稱": lr["權證名稱"],
-                    "金額": int(lr["買超金額"]),
-                    "股數": int(lr["買超股數"]),
+                    "買進日": rec["買進日"],
+                    "權證代號": rec["權證代號"],
+                    "權證名稱": rec["權證名稱"],
+                    "金額": lot_amount,
+                    "股數": lot_shares,
                 })
 
             warrant_count = len(set(normalize_warrant_code_for_unique(lot["權證代號"]) for lot in lots))
@@ -2227,6 +2778,8 @@ def build_c_events(daily_records, item_map):
                 continue
             if total_shares <= 0:
                 continue
+
+            window_dates = trade_dates[start_idx:end_idx + 1]
 
             event = {
                 "事件類型": "C-同標的3日累積買超",
@@ -2270,6 +2823,7 @@ def make_c_exclude_keys(c_events):
 # D：同分點 + 同標的，近 N 個交易日累積淨買進 >= 100萬
 # ══════════════════════════════════════════════════════════════════════
 
+
 def build_d_events(daily_records, item_map, window_days=None):
     """
     D 類補強慢慢買 / 分批買情境：
@@ -2281,9 +2835,10 @@ def build_d_events(daily_records, item_map, window_days=None):
     4. 累積淨買進股數 > 0
     5. A / B / C 已使用過的權證代號不再重複進 D
 
-    注意：
-    D 類是用「買超金額 = 買進金額 - 賣出金額」來做累積，
-    目的在補足 A/B/C 抓不到的慢慢吃貨型態。
+    速度優化版：
+    原本每個群組、每個視窗都重新做 DataFrame isin + groupby，
+    會非常慢。這版改成同一群組內用滑動視窗累加 / 扣除，
+    避免大量重複篩選與 groupby。
     """
     if window_days is None:
         window_days = D_WINDOW_DAYS
@@ -2300,7 +2855,7 @@ def build_d_events(daily_records, item_map, window_days=None):
     if df.empty:
         return events
 
-    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0)]
+    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0)].copy()
 
     if df.empty:
         return events
@@ -2310,60 +2865,143 @@ def build_d_events(daily_records, item_map, window_days=None):
     if len(trade_dates) < window_days:
         return events
 
-    trade_windows = []
-    for i in range(len(trade_dates) - window_days + 1):
-        trade_windows.append(trade_dates[i:i + window_days])
+    date_to_idx = {d: i for i, d in enumerate(trade_dates)}
+    df["日期序號"] = df["日期"].map(date_to_idx)
+    df = df.dropna(subset=["日期序號"]).copy()
+    df["日期序號"] = df["日期序號"].astype(int)
+
+    if df.empty:
+        return events
 
     main_group_cols = ["分點", "分點名稱", "券商代號", "標的股"]
 
-    for key, g in df.groupby(main_group_cols):
+    for key, g in df.groupby(main_group_cols, sort=False):
         broker_label, broker_name, broker_code, underlying_code = key
 
-        for window_dates in trade_windows:
-            wg = g[g["日期"].isin(window_dates)]
+        if g.empty:
+            continue
 
-            if wg.empty:
+        g = g.sort_values(["日期序號", "權證代號"]).reset_index(drop=True)
+        rows_by_idx = {}
+
+        for row in g[[
+            "日期序號", "日期", "券商代號", "標的股", "權證代號", "權證名稱",
+            "買進金額", "賣出金額", "買進股數", "賣出股數"
+        ]].itertuples(index=False, name=None):
+            idx = int(row[0])
+            rows_by_idx.setdefault(idx, []).append(row)
+
+        if not rows_by_idx:
+            continue
+
+        min_idx = min(rows_by_idx.keys())
+        max_idx = max(rows_by_idx.keys())
+
+        start_i_min = max(0, min_idx - window_days + 1)
+        start_i_max = min(max_idx, len(trade_dates) - window_days)
+
+        if start_i_max < start_i_min:
+            continue
+
+        window_warrant_map = {}
+        window_keys = set()
+
+        def add_row_to_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
+            warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
+
+            net_amount = int(buy_amount) - int(sell_amount)
+            net_shares = int(buy_shares) - int(sell_shares)
+
+            rec = window_warrant_map.setdefault(warrant_code_norm, {
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "買超金額": 0,
+                "買超股數": 0,
+            })
+
+            rec["買超金額"] += net_amount
+            rec["買超股數"] += net_shares
+
+            window_keys.add(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        def remove_row_from_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
+            warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
+
+            net_amount = int(buy_amount) - int(sell_amount)
+            net_shares = int(buy_shares) - int(sell_shares)
+
+            rec = window_warrant_map.get(warrant_code_norm)
+
+            if rec:
+                rec["買超金額"] -= net_amount
+                rec["買超股數"] -= net_shares
+
+                if rec["買超金額"] == 0 and rec["買超股數"] == 0:
+                    window_warrant_map.pop(warrant_code_norm, None)
+
+            window_keys.discard(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        first_start = start_i_min
+        first_end = first_start + window_days - 1
+
+        for idx in range(first_start, first_end + 1):
+            for row in rows_by_idx.get(idx, []):
+                add_row_to_window(row)
+
+        for start_idx in range(start_i_min, start_i_max + 1):
+            end_idx = start_idx + window_days - 1
+
+            if start_idx > start_i_min:
+                remove_idx = start_idx - 1
+                add_idx = end_idx
+
+                for row in rows_by_idx.get(remove_idx, []):
+                    remove_row_from_window(row)
+
+                for row in rows_by_idx.get(add_idx, []):
+                    add_row_to_window(row)
+
+            if not window_warrant_map:
                 continue
-
-            window_keys = set()
-            for _, used_row in wg.iterrows():
-                window_keys.add(make_daily_key(
-                    used_row["券商代號"],
-                    used_row["標的股"],
-                    used_row["日期"],
-                    used_row["權證代號"],
-                ))
 
             # 避免 D 類滑動視窗彼此重複使用同一批資料
             if window_keys & used_d_keys:
                 continue
 
-            start_date = window_dates[0]
-            end_date = window_dates[-1]
+            start_date = trade_dates[start_idx]
+            end_date = trade_dates[end_idx]
             lots = []
 
-            lot_rows = wg.groupby(["權證代號", "權證名稱"], as_index=False).agg({
-                "買超金額": "sum",
-                "買超股數": "sum",
-            })
-
-            for _, lr in lot_rows.iterrows():
-                warrant_code = normalize_warrant_code_for_unique(lr["權證代號"])
+            for warrant_code in sorted(window_warrant_map.keys()):
+                rec = window_warrant_map[warrant_code]
+                warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
 
                 # D 類內部已經使用過的權證，不再進入後續 D 事件。
-                if warrant_code in used_d_warrant_codes:
+                if warrant_code_norm in used_d_warrant_codes:
                     continue
 
-                lot_amount = int(lr["買超金額"])
-                lot_shares = int(lr["買超股數"])
+                lot_amount = int(rec["買超金額"])
+                lot_shares = int(rec["買超股數"])
 
                 if lot_amount <= 0 or lot_shares <= 0:
                     continue
 
                 lots.append({
                     "買進日": end_date,
-                    "權證代號": lr["權證代號"],
-                    "權證名稱": lr["權證名稱"],
+                    "權證代號": rec["權證代號"],
+                    "權證名稱": rec["權證名稱"],
                     "金額": lot_amount,
                     "股數": lot_shares,
                 })
@@ -2451,56 +3089,106 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
             end_dt = dt + timedelta(days=160)
             update_code_range(ev["標的股"], start_dt, end_dt)
 
-            # B / C 雖然 D+ 欄位主要看標的，但權證清單中的權證也先抓，
-            # 後續若要查明細或補權證狀態，不需要重抓。
-            for lot in ev.get("lots", []):
-                update_code_range(lot.get("權證代號"), start_dt, end_dt)
+            # B / C / D 的 D+ 欄位目前只看標的股，因此預設不再抓群組事件中每一檔權證價格。
+            # 這可以大幅降低價格補抓數量；若未來需要群組事件權證明細價格，
+            # 可設定 FETCH_GROUP_WARRANT_PRICES=1。
+            if FETCH_GROUP_WARRANT_PRICES:
+                for lot in ev.get("lots", []):
+                    update_code_range(lot.get("權證代號"), start_dt, end_dt)
 
     all_codes = list(code_ranges.keys())
     price_cache = {}
     total = len(all_codes)
-    done = 0
 
     if total == 0:
         print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
         return price_cache
 
-    def fetch_one(code):
+    persistent_price_cache = load_price_cache()
+    print(f"  價格快取讀取：{len(persistent_price_cache):,} 個代號")
+
+    today = datetime.today()
+    fetch_plan = {}
+
+    for code in all_codes:
         start_dt, end_dt = code_ranges[code]
+
+        if end_dt > today:
+            end_dt = today
+
+        if start_dt > end_dt:
+            start_dt = end_dt
+
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
+
+        if cached_prices:
+            add_price_aliases(price_cache, code, cached_prices)
+
+            valid_dates = sorted([d for d, p in cached_prices.items() if p is not None and p > 0])
+            latest_dt = parse_date(valid_dates[-1]) if valid_dates else None
+
+            # 快取不只看最後日期，也要檢查覆蓋率品質。
+            # 若快取筆數太少、有效日期不足，或覆蓋不到需求區間，仍重新補抓完整區間，避免 D+ 欄位大量出現 -。
+            if prices_need_yahoo_fallback(cached_prices, start_dt, end_dt):
+                fetch_plan[code] = [start_dt, end_dt]
+            elif latest_dt and latest_dt < end_dt:
+                fetch_start_dt = latest_dt + timedelta(days=1)
+
+                if fetch_start_dt <= end_dt:
+                    fetch_plan[code] = [fetch_start_dt, end_dt]
+            elif not latest_dt:
+                fetch_plan[code] = [start_dt, end_dt]
+        else:
+            add_price_aliases(price_cache, code, {})
+            fetch_plan[code] = [start_dt, end_dt]
+
+    print(f"  價格代號去重後：{total:,} 檔")
+    print(f"  價格快取命中：{total - len(fetch_plan):,} 檔")
+    print(f"  本次需補抓價格：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
+        return price_cache
+
+    def fetch_one(code):
+        start_dt, end_dt = fetch_plan[code]
         return code, fetch_twse_prices(code, start_dt, end_dt)
 
-    price_workers = min(22, max(10, MAX_WORKERS))
+    price_workers = PRICE_WORKERS
     print(f"  價格抓取執行緒：{price_workers}")
 
+    done = 0
+
     with ThreadPoolExecutor(max_workers=price_workers) as ex:
-        futures = {ex.submit(fetch_one, code): code for code in all_codes}
+        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
         for future in as_completed(futures):
             done += 1
 
             try:
-                code, prices = future.result()
-                price_cache[code] = prices
+                code, fetched_prices = future.result()
+                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+                merged_prices = merge_price_dicts(old_prices, fetched_prices)
 
-                # 同時用去零版 / 補零版建立別名，避免 Excel 或 pandas 吃掉前導 0 時查不到。
                 norm_code = normalize_price_code(code)
-                if norm_code and norm_code not in price_cache:
-                    price_cache[norm_code] = prices
 
-                no_zero = norm_code.lstrip("0") if norm_code else ""
-                if no_zero and no_zero not in price_cache:
-                    price_cache[no_zero] = prices
+                if norm_code:
+                    persistent_price_cache[norm_code] = merged_prices
+
+                add_price_aliases(price_cache, code, merged_prices)
 
             except:
                 code = futures[future]
-                price_cache[code] = {}
+                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+                add_price_aliases(price_cache, code, old_prices)
 
             if done % 20 == 0:
-                print(f"  [{done}/{total}] 收盤價抓取中...")
+                print(f"  [{done}/{len(fetch_plan)}] 收盤價補抓中...")
+
+    save_price_cache(persistent_price_cache)
 
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
     return price_cache
-
 
 # ══════════════════════════════════════════════════════════════════════
 # D+1 ~ D+20
@@ -3230,6 +3918,225 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.freeze_panes = "A1"
+
+
+def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
+    """
+    新增「ABCD組合勝率」工作表。
+
+    統計邏輯：
+    1. 以分點為單位。
+    2. 組合包含 AB / AC / AD / BC / BD / CD / ABC / ABD / ACD / BCD / ABCD。
+    3. 只有該分點同時具備該組合內所有事件類型，才列入該組合勝率。
+    4. 勝率只用「已出清」事件計算，未出清不列入勝敗。
+    """
+    ws = wb.create_sheet("ABCD組合勝率")
+
+    headers = [
+        "分點",
+        "組合",
+        "包含事件",
+        "是否同時出現",
+        "A事件數",
+        "B事件數",
+        "C事件數",
+        "D事件數",
+        "組合事件數",
+        "已出清筆數",
+        "未出清筆數",
+        "勝筆數",
+        "敗筆數",
+        "平手筆數",
+        "勝率",
+        "平均持有天數",
+        "平均報酬%",
+        "最高報酬%",
+        "最低報酬%",
+    ]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    title_cell = ws.cell(1, 1)
+    title_cell.value = "ABCD 所有組合勝率統計（依分點）"
+    title_cell.font = Font(bold=True, color="000000", size=14)
+    title_cell.fill = YELLOW
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    note_cell = ws.cell(2, 1)
+    note_cell.value = "統計邏輯：只有該分點同時具備該組合內所有事件類型，才列入該組合勝率；勝率只用「已出清」事件計算，未出清不列入勝敗。"
+    note_cell.font = Font(color="666666")
+    note_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 24
+
+    header_row = 4
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(header_row, col_idx)
+        cell.value = header
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = YELLOW
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[header_row].height = 24
+
+    stat_records = collect_stat_records(a_events, b_events, c_events, d_events)
+
+    if not stat_records:
+        stat_df = pd.DataFrame(columns=[
+            "分點", "事件代碼", "事件類型", "是否出清",
+            "結果", "持有天數", "報酬%"
+        ])
+    else:
+        stat_df = pd.DataFrame(stat_records)
+
+    broker_order = list(TARGET_PATTERNS.keys())
+
+    if not stat_df.empty:
+        for broker in sorted(stat_df["分點"].dropna().unique()):
+            if broker not in broker_order:
+                broker_order.append(broker)
+
+    combo_defs = [
+        ("AB",   ["A", "B"]),
+        ("AC",   ["A", "C"]),
+        ("AD",   ["A", "D"]),
+        ("BC",   ["B", "C"]),
+        ("BD",   ["B", "D"]),
+        ("CD",   ["C", "D"]),
+        ("ABC",  ["A", "B", "C"]),
+        ("ABD",  ["A", "B", "D"]),
+        ("ACD",  ["A", "C", "D"]),
+        ("BCD",  ["B", "C", "D"]),
+        ("ABCD", ["A", "B", "C", "D"]),
+    ]
+
+    thin_gray = Side(style="thin", color="B7B7B7")
+    normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+    for broker in broker_order:
+        if stat_df.empty:
+            broker_g = pd.DataFrame(columns=stat_df.columns)
+        else:
+            broker_g = stat_df[stat_df["分點"] == broker].copy()
+
+        event_counts = {}
+        for code in ["A", "B", "C", "D"]:
+            if broker_g.empty:
+                event_counts[code] = 0
+            else:
+                event_counts[code] = int((broker_g["事件代碼"] == code).sum())
+
+        for combo_name, combo_codes in combo_defs:
+            has_all = all(event_counts.get(code, 0) > 0 for code in combo_codes)
+            include_text = " + ".join(combo_codes)
+
+            if has_all and not broker_g.empty:
+                combo_g = broker_g[broker_g["事件代碼"].isin(combo_codes)].copy()
+
+                combo_event_count = len(combo_g)
+                closed_g = combo_g[combo_g["是否出清"] == True]
+                open_g = combo_g[combo_g["是否出清"] == False]
+
+                closed_count = len(closed_g)
+                open_count = len(open_g)
+
+                win_count = int((closed_g["結果"] == "勝").sum()) if closed_count > 0 else 0
+                loss_count = int((closed_g["結果"] == "敗").sum()) if closed_count > 0 else 0
+                flat_count = int((closed_g["結果"] == "平手").sum()) if closed_count > 0 else 0
+
+                win_rate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
+
+                avg_holding_days = None
+                if closed_count > 0:
+                    holding_series = pd.to_numeric(closed_g["持有天數"], errors="coerce").dropna()
+                    if len(holding_series) > 0:
+                        avg_holding_days = round(float(holding_series.mean()), 2)
+
+                avg_return = None
+                max_return = None
+                min_return = None
+                if closed_count > 0:
+                    return_series = pd.to_numeric(closed_g["報酬%"], errors="coerce").dropna()
+                    if len(return_series) > 0:
+                        avg_return = round(float(return_series.mean()), 2)
+                        max_return = round(float(return_series.max()), 2)
+                        min_return = round(float(return_series.min()), 2)
+
+                row_values = [
+                    broker,
+                    combo_name,
+                    include_text,
+                    "是",
+                    event_counts["A"],
+                    event_counts["B"],
+                    event_counts["C"],
+                    event_counts["D"],
+                    combo_event_count,
+                    closed_count,
+                    open_count,
+                    win_count,
+                    loss_count,
+                    flat_count,
+                    "-" if win_rate is None else f"{win_rate:.2f}%",
+                    "-" if avg_holding_days is None else avg_holding_days,
+                    "-" if avg_return is None else f"{avg_return:+.2f}%",
+                    "-" if max_return is None else f"{max_return:+.2f}%",
+                    "-" if min_return is None else f"{min_return:+.2f}%",
+                ]
+            else:
+                row_values = [
+                    broker,
+                    combo_name,
+                    include_text,
+                    "否",
+                    event_counts["A"],
+                    event_counts["B"],
+                    event_counts["C"],
+                    event_counts["D"],
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                ]
+
+            ws.append(row_values)
+            current_row = ws.max_row
+
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(current_row, col_idx)
+                cell.font = Font(color="000000")
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = normal_border
+
+                if col_idx == 4:
+                    if cell.value == "是":
+                        cell.fill = PatternFill("solid", fgColor="EAF2F8")
+                    else:
+                        cell.fill = GRAY
+                else:
+                    cell.fill = WHITE
+
+            ws.row_dimensions[current_row].height = 22
+
+    for col_idx in range(1, len(headers) + 1):
+        ws.cell(1, col_idx).fill = YELLOW
+        ws.cell(2, col_idx).fill = WHITE
+
+    for row_idx in [1, 2, header_row]:
+        for col_idx in range(1, len(headers) + 1):
+            ws.cell(row_idx, col_idx).border = normal_border
+
+    col_widths = [16, 8, 14, 14, 10, 10, 10, 10, 12, 12, 12, 10, 10, 10, 10, 14, 12, 12, 12]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A5"
 
 
 def fmt_ratio_value(numerator, denominator):
@@ -4210,6 +5117,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_broker_query_sheet(wb, items)
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
+    write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
 
     apply_global_amount_comma_format(wb)
 
@@ -4226,6 +5134,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
 
     today_fn = datetime.today().strftime("%Y%m%d")
@@ -4237,6 +5146,7 @@ def main():
     print(f"C：同分點 + 同標的 + 連續3交易日多檔權證累積買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
+    print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
