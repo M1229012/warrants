@@ -1061,6 +1061,70 @@ def is_gsheet_text_header(header):
     return any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS)
 
 
+def _strip_trailing_excel_decimal_for_code(s):
+    s = str(s).strip()
+
+    if s.endswith(".0"):
+        head = s[:-2]
+        if head.isdigit():
+            return head
+
+    return s
+
+
+def normalize_gsheet_code_text_value(header, value):
+    """
+    Google Sheet 寫入 / 讀回時的代號欄位修正。
+
+    目的：
+    1. 權證代號若被 Google Sheet 轉成 5 碼，例如 30004，補回 030004。
+    2. 權證清單內的每一個 5 碼權證代號也補回 6 碼。
+    3. 股票代號 / 標的股 / 券商代號只維持文字，不任意補零，避免破壞原代號。
+    4. 公式欄位不可處理，避免 =IFERROR(...) 被改成純文字。
+    """
+    if value is None:
+        return ""
+
+    s = str(value).strip()
+
+    if s == "":
+        return ""
+
+    if s.startswith("="):
+        return s
+
+    had_prefix = s.startswith("'")
+    if had_prefix:
+        s = s[1:]
+
+    header = str(header).strip()
+    s = _strip_trailing_excel_decimal_for_code(s)
+
+    if "權證清單" in header:
+        # 權證清單常見格式：30004 海華國票...；60234 文華統一...
+        # 若 Google Sheet 已經把 030004 轉成 30004，這裡將每段開頭的 5 碼權證補回 6 碼。
+        def repl(match):
+            token = match.group(0)
+            return token.zfill(6) if token.isdigit() and len(token) == 5 else token
+
+        s = re.sub(r"(?<!\d)\d{5}(?!\d)", repl, s)
+        return ("'" + s) if had_prefix else s
+
+    if "權證代號" in header or "權證代碼" in header:
+        if s.isdigit() and len(s) == 5:
+            s = s.zfill(6)
+        return ("'" + s) if had_prefix else s
+
+    # 快取_權證清單 的欄位名稱是「代號」，價格快取也可能是「代號」。
+    # 只有 5 碼純數字才視為權證前導 0 被吃掉，補回 6 碼；4 碼股票不補。
+    if header in ("代號", "證券代號", "證券代碼", "商品代號", "商品代碼"):
+        if s.isdigit() and len(s) == 5:
+            s = s.zfill(6)
+        return ("'" + s) if had_prefix else s
+
+    return ("'" + s) if had_prefix else s
+
+
 def add_gsheet_text_prefix(value):
     """
     讓 Google Sheet 用文字格式寫入代號欄位。
@@ -1145,6 +1209,8 @@ def normalize_gsheet_values_for_text_columns(values):
                 if isinstance(cell_value, str) and cell_value.strip().startswith("="):
                     continue
 
+                header = out[header_row_idx][col_idx] if col_idx < len(out[header_row_idx]) else ""
+                cell_value = normalize_gsheet_code_text_value(header, cell_value)
                 out[row_idx][col_idx] = add_gsheet_text_prefix(cell_value)
 
     return out
@@ -1652,6 +1718,7 @@ def read_cache_from_gsheet(path):
         for col in df.columns:
             if is_gsheet_text_header(col):
                 df[col] = df[col].map(strip_gsheet_text_prefix)
+                df[col] = df[col].map(lambda v, _col=col: normalize_gsheet_code_text_value(_col, v))
 
         print(f"  ☁️ 已從 Google Sheet 讀取快取：{title}，共 {len(df):,} 筆")
         return df
