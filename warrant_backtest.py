@@ -1086,6 +1086,240 @@ def normalize_gsheet_values_for_text_columns(values):
     return out
 
 
+
+GSHEET_COMMA_NUMBER_HEADER_KEYWORDS = (
+    "排名",
+    "金額",
+    "股數",
+    "張數",
+    "筆數",
+    "事件數",
+    "權證檔數",
+    "買進分點數",
+    "涵蓋權證數",
+    "持有天數",
+    "價格筆數",
+)
+
+GSHEET_COMMA_NUMBER_EXCLUDE_KEYWORDS = (
+    "代號",
+    "日期",
+    "名稱",
+    "清單",
+    "類型",
+    "狀態",
+    "均價",
+    "勝率",
+    "占比",
+    "比例",
+    "報酬%",
+    "獲利%",
+)
+
+
+def is_gsheet_comma_number_header(header):
+    """
+    判斷 Google Sheet 結果工作表中，哪些欄位要用千分位逗號顯示。
+
+    注意：
+    1. 權證代號 / 券商代號 / 代號欄位不能套數字格式，否則開頭 0 會被吃掉。
+    2. 日期、名稱、清單、百分比、均價等欄位不套用千分位。
+    3. 這個函式只用在「結果工作表」同步，不改快取工作表邏輯。
+    """
+    header = str(header).strip()
+
+    if not header:
+        return False
+
+    if header.startswith("D+"):
+        return False
+
+    if is_gsheet_text_header(header):
+        return False
+
+    for keyword in GSHEET_COMMA_NUMBER_EXCLUDE_KEYWORDS:
+        if keyword in header:
+            return False
+
+    return any(keyword in header for keyword in GSHEET_COMMA_NUMBER_HEADER_KEYWORDS)
+
+
+def _parse_comma_number_for_gsheet(value):
+    """
+    將 1,234 / 12,345.67 這類字串轉成數字，讓 Google Sheet 可以搭配 numberFormat 顯示逗號。
+    公式、空值、百分比、文字說明都保持原樣。
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        return value
+
+    s = str(value).strip()
+
+    if s == "" or s == "-":
+        return value
+
+    if s.startswith("="):
+        return value
+
+    if "%" in s or "\n" in s or "；" in s:
+        return value
+
+    raw = s.replace(",", "").strip()
+
+    if raw.startswith("+"):
+        raw = raw[1:]
+
+    if raw.startswith("-"):
+        sign = "-"
+        num_part = raw[1:]
+    else:
+        sign = ""
+        num_part = raw
+
+    if not num_part:
+        return value
+
+    if num_part.replace(".", "", 1).isdigit():
+        try:
+            if "." in num_part:
+                return float(sign + num_part)
+            return int(sign + num_part)
+        except Exception:
+            return value
+
+    return value
+
+
+def normalize_result_values_for_comma_numbers(values):
+    """
+    Google Sheet 結果同步前，將需要千分位的欄位轉成數字。
+
+    原因：若直接把 "1,234" 用 USER_ENTERED 寫入 Google Sheet，可能被解析成數字但顯示為 1234，
+    或在部分語系下變成文字。這裡先依表頭把金額 / 股數 / 張數 / 筆數等欄位轉成數字，
+    後續再用 Google Sheets numberFormat 套 #,##0，確保畫面會顯示逗號。
+    """
+    if not values:
+        return values
+
+    out = [list(row) for row in values]
+    header_rows = []
+
+    scan_limit = min(len(out), 10)
+    for row_idx in range(scan_limit):
+        row = out[row_idx]
+        number_cols = []
+
+        for col_idx, header in enumerate(row):
+            if is_gsheet_comma_number_header(header):
+                number_cols.append(col_idx)
+
+        if number_cols:
+            header_rows.append((row_idx, number_cols))
+
+    if not header_rows:
+        return out
+
+    for header_row_idx, number_cols in header_rows:
+        next_header_rows = [idx for idx, _ in header_rows if idx > header_row_idx]
+        end_row = min(next_header_rows) if next_header_rows else len(out)
+
+        for row_idx in range(header_row_idx + 1, end_row):
+            for col_idx in number_cols:
+                if col_idx >= len(out[row_idx]):
+                    continue
+
+                out[row_idx][col_idx] = _parse_comma_number_for_gsheet(out[row_idx][col_idx])
+
+    return out
+
+
+def _gsheet_number_pattern_for_header(header):
+    header = str(header).strip()
+
+    if "平均" in header or "收盤價" in header:
+        return "#,##0.00"
+
+    return "#,##0"
+
+
+def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
+    """
+    將結果工作表的金額 / 股數 / 張數 / 筆數等欄位套用 Google Sheets 千分位格式。
+
+    這裡只補 Google Sheet 顯示格式，不改原本 Excel 產生邏輯，也不影響快取讀寫。
+    """
+    if gws is None:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    header_rows = []
+    scan_limit = min(ws_xlsx.max_row, 10)
+
+    for row_idx in range(1, scan_limit + 1):
+        number_cols = []
+
+        for col_idx in range(1, ws_xlsx.max_column + 1):
+            header = ws_xlsx.cell(row_idx, col_idx).value
+
+            if is_gsheet_comma_number_header(header):
+                number_cols.append((col_idx, _gsheet_number_pattern_for_header(header)))
+
+        if number_cols:
+            header_rows.append((row_idx, number_cols))
+
+    if not header_rows:
+        return
+
+    requests = []
+
+    for idx, (header_row_idx, number_cols) in enumerate(header_rows):
+        if idx + 1 < len(header_rows):
+            end_row = header_rows[idx + 1][0] - 1
+        else:
+            end_row = ws_xlsx.max_row
+
+        start_data_row = header_row_idx + 1
+
+        if start_data_row > end_row:
+            continue
+
+        for col_idx, pattern in number_cols:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_data_row - 1,
+                        "endRowIndex": end_row,
+                        "startColumnIndex": col_idx - 1,
+                        "endColumnIndex": col_idx,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "NUMBER",
+                                "pattern": pattern,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            })
+
+    _gsheet_batch_update(requests)
+
+
 def write_values_to_worksheet(ws, values):
     if ws is None:
         return False
@@ -1638,11 +1872,14 @@ def upload_excel_to_google_sheet(xlsx_path):
             if not values:
                 values = [[""]]
 
+            values = normalize_result_values_for_comma_numbers(values)
+
             max_cols = max(max((len(row) for row in values), default=1), 1)
             gws = get_or_create_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
 
             if write_values_to_worksheet(gws, values):
                 apply_excel_style_to_gsheet(ws_xlsx, gws)
+                apply_comma_number_format_to_gsheet(ws_xlsx, gws)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
 
     except Exception as e:
