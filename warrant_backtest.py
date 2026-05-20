@@ -4321,7 +4321,7 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
     for ev in a_events:
         dt = parse_date(ev["買進日"])
         if dt:
-            start_dt = dt - timedelta(days=10)
+            start_dt = dt - timedelta(days=60)
             end_dt = dt + timedelta(days=160)
             update_code_range(ev["權證代號"], start_dt, end_dt)
             update_code_range(ev["標的股"], start_dt, end_dt)
@@ -4329,7 +4329,7 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
     for ev in b_events + c_events + d_events:
         dt = parse_date(ev["結束日"])
         if dt:
-            start_dt = dt - timedelta(days=10)
+            start_dt = dt - timedelta(days=60)
             end_dt = dt + timedelta(days=160)
             update_code_range(ev["標的股"], start_dt, end_dt)
 
@@ -4638,6 +4638,71 @@ def make_group_day_cells(ev, price_cache):
     return day_values, day_status
 
 
+def fmt_price_value(v):
+    if v is None:
+        return "-"
+
+    try:
+        v = float(v)
+        if v <= 0:
+            return "-"
+        if v.is_integer():
+            return int(v)
+        return round(v, 2)
+    except:
+        return "-"
+
+
+def get_ma_status_cells(price_cache, underlying_code, base_date):
+    """
+    依照事件選出日計算標的股技術狀態：
+    1. 標的股股價：選出日當天或之前最近一個交易日收盤價
+    2. 5MA：若標的股股價 > 當天 5 日均線，顯示 ✓，否則空白
+    3. 20MA：若當天 20 日均線 > 前一交易日 20 日均線，顯示 ✓，否則空白
+    """
+    prices = get_price_series_from_cache(price_cache, underlying_code)
+
+    if not prices:
+        return "-", "", ""
+
+    base_date = normalize_date_str(base_date)
+    valid_rows = []
+
+    for d, p in prices.items():
+        dt = parse_date(d)
+        price = safe_price_float(p)
+
+        if not dt or price is None:
+            continue
+
+        if normalize_date_str(d) <= base_date:
+            valid_rows.append((normalize_date_str(d), price))
+
+    valid_rows = sorted(valid_rows, key=lambda x: x[0])
+
+    if not valid_rows:
+        return "-", "", ""
+
+    current_price = valid_rows[-1][1]
+    close_values = [p for _, p in valid_rows]
+
+    ma5_mark = ""
+    ma20_mark = ""
+
+    if len(close_values) >= 5:
+        ma5 = sum(close_values[-5:]) / 5
+        if current_price > ma5:
+            ma5_mark = "✓"
+
+    if len(close_values) >= 21:
+        ma20_today = sum(close_values[-20:]) / 20
+        ma20_prev = sum(close_values[-21:-1]) / 20
+        if ma20_today > ma20_prev:
+            ma20_mark = "✓"
+
+    return fmt_price_value(current_price), ma5_mark, ma20_mark
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Excel 樣式
 # ══════════════════════════════════════════════════════════════════════
@@ -4721,7 +4786,7 @@ def write_a_sheet(wb, a_events, item_map, price_cache):
 
     headers = [
         "事件類型", "分點", "權證代號", "權證名稱", "標的股",
-        "買進日", "買進張數", "買進金額", "買進均價",
+        "買進日", "標的股股價", "5MA", "20MA", "買進張數", "買進金額", "買進均價",
         "減碼日", "減碼均價", "減碼獲利%",
         "出清日", "出清均價", "出清獲利%",
         "持有天數",
@@ -4742,6 +4807,11 @@ def write_a_sheet(wb, a_events, item_map, price_cache):
 
     for ev in sorted_events:
         day_values, day_status = make_a_day_cells(ev, item_map, price_cache)
+        underlying_price, ma5_mark, ma20_mark = get_ma_status_cells(
+            price_cache,
+            ev.get("標的股"),
+            ev.get("買進日"),
+        )
 
         row = [
             ev["事件類型"],
@@ -4750,6 +4820,9 @@ def write_a_sheet(wb, a_events, item_map, price_cache):
             ev["權證名稱"],
             ev["標的股"],
             ev["買進日"],
+            underlying_price,
+            ma5_mark,
+            ma20_mark,
             ev["買進張數"],
             fmt_amount(ev["買進金額"]),
             ev["買進均價"],
@@ -4764,17 +4837,17 @@ def write_a_sheet(wb, a_events, item_map, price_cache):
 
         ws.append(row)
         current_row_idx = ws.max_row
-        status_rows.append(["none"] * 16 + day_status)
+        status_rows.append(["none"] * 19 + day_status)
 
         if ev["減碼獲利%"] is not None:
-            # A 工作表第 12 欄為「減碼獲利%」
-            exit_profit_result_cells.append((current_row_idx, 12, ev["減碼獲利%"]))
+            # A 工作表第 15 欄為「減碼獲利%」
+            exit_profit_result_cells.append((current_row_idx, 15, ev["減碼獲利%"]))
 
         if ev["出清獲利%"] is not None:
-            # A 工作表第 15 欄為「出清獲利%」
-            exit_profit_result_cells.append((current_row_idx, 15, ev["出清獲利%"]))
+            # A 工作表第 18 欄為「出清獲利%」
+            exit_profit_result_cells.append((current_row_idx, 18, ev["出清獲利%"]))
 
-    col_widths = [18, 14, 10, 22, 8, 12, 10, 12, 10, 12, 10, 12, 12, 10, 12, 10] + [16] * 20
+    col_widths = [18, 14, 10, 22, 8, 12, 12, 8, 8, 10, 12, 10, 12, 10, 12, 12, 10, 12, 10] + [16] * 20
     style_sheet(ws, col_widths, status_rows)
 
     for row_idx, col_idx, return_pct in exit_profit_result_cells:
@@ -4789,25 +4862,25 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
     if is_c:
         headers = [
             "事件類型", "分點", "標的股",
-            "起始日", "結束日",
+            "起始日", "結束日", "標的股股價", "5MA", "20MA",
             "涵蓋權證數", "權證清單",
             "買超金額", "買超張數",
             "減碼日", "減碼賣出金額", "減碼獲利%",
             "出清日", "出清賣出金額", "出清獲利%",
             "持有天數",
         ] + day_cols
-        fixed_len = 16
+        fixed_len = 19
     else:
         headers = [
             "事件類型", "分點", "標的股",
-            "事件日",
+            "事件日", "標的股股價", "5MA", "20MA",
             "涵蓋權證數", "權證清單",
             "買超金額", "買超張數",
             "減碼日", "減碼賣出金額", "減碼獲利%",
             "出清日", "出清賣出金額", "出清獲利%",
             "持有天數",
         ] + day_cols
-        fixed_len = 15
+        fixed_len = 18
 
     ws.append(headers)
     status_rows = []
@@ -4825,6 +4898,12 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
 
     for ev in sorted_events:
         day_values, day_status = make_group_day_cells(ev, price_cache)
+        ma_base_date = ev.get("結束日") if is_c else ev.get("事件日")
+        underlying_price, ma5_mark, ma20_mark = get_ma_status_cells(
+            price_cache,
+            ev.get("標的股"),
+            ma_base_date,
+        )
 
         if is_c:
             row = [
@@ -4833,6 +4912,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
                 ev["標的股"],
                 ev["起始日"],
                 ev["結束日"],
+                underlying_price,
+                ma5_mark,
+                ma20_mark,
                 ev["涵蓋權證數"],
                 ev["權證清單"],
                 fmt_amount(ev["買超金額"]),
@@ -4851,6 +4933,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
                 ev["分點"],
                 ev["標的股"],
                 ev["事件日"],
+                underlying_price,
+                ma5_mark,
+                ma20_mark,
                 ev["涵蓋權證數"],
                 ev["權證清單"],
                 fmt_amount(ev["買超金額"]),
@@ -4869,19 +4954,19 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
         status_rows.append(["none"] * fixed_len + day_status)
 
         if ev["減碼獲利%"] is not None:
-            # B 工作表第 11 欄為「減碼獲利%」；C 工作表第 12 欄為「減碼獲利%」
-            reduce_profit_col_idx = 12 if is_c else 11
+            # B 工作表第 14 欄為「減碼獲利%」；C / D 工作表第 15 欄為「減碼獲利%」
+            reduce_profit_col_idx = 15 if is_c else 14
             exit_profit_result_cells.append((current_row_idx, reduce_profit_col_idx, ev["減碼獲利%"]))
 
         if ev["出清獲利%"] is not None:
-            # B 工作表第 14 欄為「出清獲利%」；C 工作表第 15 欄為「出清獲利%」
-            exit_profit_col_idx = 15 if is_c else 14
+            # B 工作表第 17 欄為「出清獲利%」；C / D 工作表第 18 欄為「出清獲利%」
+            exit_profit_col_idx = 18 if is_c else 17
             exit_profit_result_cells.append((current_row_idx, exit_profit_col_idx, ev["出清獲利%"]))
 
     if is_c:
-        col_widths = [20, 14, 8, 12, 12, 12, 45, 14, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
+        col_widths = [20, 14, 8, 12, 12, 12, 8, 8, 12, 45, 14, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
     else:
-        col_widths = [20, 14, 8, 12, 12, 45, 14, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
+        col_widths = [20, 14, 8, 12, 12, 8, 8, 12, 45, 14, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
 
     style_sheet(ws, col_widths, status_rows)
 
