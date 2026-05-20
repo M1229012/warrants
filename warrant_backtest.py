@@ -887,8 +887,16 @@ GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() no
 GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 
+# Google Sheets API 有「每分鐘寫入請求」限制。
+# 結果工作表很多、又要同步格式時，如果沒有節流與 429 重試，
+# 會出現後面工作表建立 / 寫入失敗，甚至因先刪後建導致工作表消失。
+GSHEET_WRITE_SLEEP_SECONDS = float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS", "1.25"))
+GSHEET_MAX_RETRIES = int(os.getenv("GSHEET_MAX_RETRIES", "6"))
+GSHEET_RETRY_BASE_SECONDS = float(os.getenv("GSHEET_RETRY_BASE_SECONDS", "12"))
+
 _GSHEET_CLIENT = None
 _GSHEET_SPREADSHEET = None
+_GSHEET_LAST_WRITE_TS = 0.0
 
 CACHE_SHEET_NAME_MAP = {
     "warrants_cache.csv": "快取_權證清單",
@@ -901,6 +909,66 @@ CACHE_SHEET_NAME_MAP = {
 
 def gsheet_enabled():
     return bool(os.getenv("GCP_SERVICE_KEY", "").strip())
+
+
+def is_gsheet_quota_error(exc):
+    msg = str(exc)
+    return (
+        "429" in msg
+        or "Quota exceeded" in msg
+        or "RESOURCE_EXHAUSTED" in msg
+        or "Write requests per minute" in msg
+    )
+
+
+def gsheet_write_sleep():
+    """
+    Google Sheets 寫入節流。
+
+    這不是改資料邏輯，而是避免短時間連續建立 / 清除 / 寫入 / 套格式
+    造成 429 quota exceeded。
+    """
+    global _GSHEET_LAST_WRITE_TS
+
+    if GSHEET_WRITE_SLEEP_SECONDS <= 0:
+        return
+
+    now = time.time()
+    elapsed = now - _GSHEET_LAST_WRITE_TS
+
+    if elapsed < GSHEET_WRITE_SLEEP_SECONDS:
+        time.sleep(GSHEET_WRITE_SLEEP_SECONDS - elapsed)
+
+    _GSHEET_LAST_WRITE_TS = time.time()
+
+
+def gsheet_api_call(description, func, *args, **kwargs):
+    """
+    所有 Google Sheet 寫入動作統一走這裡：
+    1. 先節流
+    2. 遇到 429 自動等待重試
+    3. 不讓暫時 quota 造成後續工作表消失
+    """
+    last_error = None
+
+    for attempt in range(1, GSHEET_MAX_RETRIES + 1):
+        try:
+            gsheet_write_sleep()
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+
+            if not is_gsheet_quota_error(e):
+                raise
+
+            wait_seconds = min(90, GSHEET_RETRY_BASE_SECONDS * attempt)
+            print(
+                f"  ⚠️ Google Sheet 觸發寫入配額限制，{description} 第 {attempt}/{GSHEET_MAX_RETRIES} 次重試，"
+                f"等待 {wait_seconds:.0f} 秒..."
+            )
+            time.sleep(wait_seconds)
+
+    raise last_error
 
 
 def get_gsheet_client():
@@ -983,7 +1051,13 @@ def get_or_create_worksheet(title, rows=100, cols=20):
         return sh.worksheet(title)
     except Exception:
         try:
-            return sh.add_worksheet(title=title, rows=max(int(rows), 1), cols=max(int(cols), 1))
+            return gsheet_api_call(
+                f"建立工作表 {title}",
+                sh.add_worksheet,
+                title=title,
+                rows=max(int(rows), 1),
+                cols=max(int(cols), 1),
+            )
         except Exception as e:
             print(f"  ⚠️ 建立工作表失敗：{title}，原因：{type(e).__name__}: {e}")
             return None
@@ -991,11 +1065,17 @@ def get_or_create_worksheet(title, rows=100, cols=20):
 
 def get_or_recreate_result_worksheet(title, rows=100, cols=20):
     """
-    結果工作表每次同步前重新建立，避免沿用舊的 Google Sheet 純文字格式。
+    取得結果工作表。
 
-    先前「券商查詢」的公式欄位曾被套用 TEXT 格式，導致 =IFERROR(...) 被當成文字顯示。
-    Google Sheet 的 clear() 只會清內容，不一定會清掉舊格式，因此結果工作表改用刪除後重建。
-    快取工作表不使用此函式，仍保留原本的快取讀寫流程。
+    重要修正：
+    以前為了清掉舊格式，會先刪除再重建結果工作表。
+    但 Google Sheets API 有每分鐘寫入限制，一旦刪除後重建遇到 429，
+    會導致「券商查詢」、「ABCD組合勝率」等工作表直接消失。
+
+    這版改成不刪除工作表：
+    1. 已存在就沿用
+    2. 不存在才建立
+    3. 寫入前會清除舊格式與資料，再重新寫入與套樣式
     """
     sh = get_gsheet_spreadsheet()
 
@@ -1007,24 +1087,19 @@ def get_or_recreate_result_worksheet(title, rows=100, cols=20):
     cols = max(int(cols), 1)
 
     try:
-        existing = sh.worksheet(title)
-
-        try:
-            worksheets = sh.worksheets()
-            if len(worksheets) <= 1:
-                sh.add_worksheet(title="__tmp_delete_guard__", rows=1, cols=1)
-        except Exception:
-            pass
-
-        sh.del_worksheet(existing)
+        return sh.worksheet(title)
     except Exception:
-        pass
-
-    try:
-        return sh.add_worksheet(title=title, rows=rows, cols=cols)
-    except Exception as e:
-        print(f"  ⚠️ 重建結果工作表失敗：{title}，原因：{type(e).__name__}: {e}")
-        return get_or_create_worksheet(title, rows=rows, cols=cols)
+        try:
+            return gsheet_api_call(
+                f"建立結果工作表 {title}",
+                sh.add_worksheet,
+                title=title,
+                rows=rows,
+                cols=cols,
+            )
+        except Exception as e:
+            print(f"  ⚠️ 建立結果工作表失敗：{title}，原因：{type(e).__name__}: {e}")
+            return None
 
 
 GSHEET_TEXT_HEADER_KEYWORDS = (
@@ -1643,6 +1718,46 @@ def apply_date_format_to_gsheet(ws_xlsx, gws):
     _gsheet_batch_update(requests)
 
 
+def reset_worksheet_before_value_write(ws, row_count, col_count):
+    """
+    寫入值之前先清掉舊格式、舊資料驗證與舊合併範圍。
+
+    這可以解決「券商查詢」公式被舊的純文字格式吃掉，
+    同時避免因刪除 / 重建工作表造成 429 後工作表消失。
+    """
+    if ws is None:
+        return
+
+    try:
+        sheet_id = int(ws.id)
+    except Exception:
+        return
+
+    requests = [
+        {
+            "unmergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                }
+            }
+        },
+        {
+            "updateCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": max(int(row_count), 1),
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max(int(col_count), 1),
+                },
+                "fields": "userEnteredFormat,dataValidation",
+            }
+        },
+    ]
+
+    _gsheet_batch_update(requests)
+
+
 def write_values_to_worksheet(ws, values):
     if ws is None:
         return False
@@ -1663,14 +1778,28 @@ def write_values_to_worksheet(ws, values):
     normalized_values = normalize_gsheet_values_for_text_columns(normalized_values)
 
     try:
-        ws.clear()
-        ws.resize(rows=max(row_count, 1), cols=max(col_count, 1))
+        # 不再使用 delete/recreate。先 resize，再清格式，最後寫入值。
+        # 這樣遇到 429 時不會把既有工作表刪掉。
+        gsheet_api_call(
+            f"調整工作表大小 {ws.title}",
+            ws.resize,
+            rows=max(row_count, 1),
+            cols=max(col_count, 1),
+        )
+
+        reset_worksheet_before_value_write(ws, row_count, col_count)
 
         for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
             chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
             start_row = start + 1
             cell_range = f"A{start_row}"
-            ws.update(values=chunk, range_name=cell_range, value_input_option="USER_ENTERED")
+            gsheet_api_call(
+                f"寫入工作表資料 {ws.title} A{start_row}",
+                ws.update,
+                values=chunk,
+                range_name=cell_range,
+                value_input_option="USER_ENTERED",
+            )
 
         apply_text_format_to_gsheet(ws, normalized_values)
 
@@ -1914,7 +2043,7 @@ def _format_fields(fmt):
     return ",".join(fields)
 
 
-def _gsheet_batch_update(requests, chunk_size=400):
+def _gsheet_batch_update(requests, chunk_size=1000):
     if not requests:
         return
 
@@ -1926,7 +2055,11 @@ def _gsheet_batch_update(requests, chunk_size=400):
     for start in range(0, len(requests), chunk_size):
         chunk = requests[start:start + chunk_size]
         try:
-            sh.batch_update({"requests": chunk})
+            gsheet_api_call(
+                f"套用 Google Sheet 格式 batchUpdate {start + 1}-{start + len(chunk)}",
+                sh.batch_update,
+                {"requests": chunk},
+            )
         except Exception as e:
             print(f"  ⚠️ Google Sheet 格式套用失敗：{type(e).__name__}: {e}")
             return
@@ -2222,7 +2355,7 @@ def upload_excel_to_google_sheet(xlsx_path):
             if sh is not None:
                 tmp_ws = sh.worksheet("__tmp_delete_guard__")
                 if len(sh.worksheets()) > 1:
-                    sh.del_worksheet(tmp_ws)
+                    gsheet_api_call("刪除暫時工作表 __tmp_delete_guard__", sh.del_worksheet, tmp_ws)
         except Exception:
             pass
 
