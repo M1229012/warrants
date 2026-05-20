@@ -989,6 +989,44 @@ def get_or_create_worksheet(title, rows=100, cols=20):
             return None
 
 
+def get_or_recreate_result_worksheet(title, rows=100, cols=20):
+    """
+    結果工作表每次同步前重新建立，避免沿用舊的 Google Sheet 純文字格式。
+
+    先前「券商查詢」的公式欄位曾被套用 TEXT 格式，導致 =IFERROR(...) 被當成文字顯示。
+    Google Sheet 的 clear() 只會清內容，不一定會清掉舊格式，因此結果工作表改用刪除後重建。
+    快取工作表不使用此函式，仍保留原本的快取讀寫流程。
+    """
+    sh = get_gsheet_spreadsheet()
+
+    if sh is None:
+        return None
+
+    title = safe_worksheet_title(title)
+    rows = max(int(rows), 1)
+    cols = max(int(cols), 1)
+
+    try:
+        existing = sh.worksheet(title)
+
+        try:
+            worksheets = sh.worksheets()
+            if len(worksheets) <= 1:
+                sh.add_worksheet(title="__tmp_delete_guard__", rows=1, cols=1)
+        except Exception:
+            pass
+
+        sh.del_worksheet(existing)
+    except Exception:
+        pass
+
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except Exception as e:
+        print(f"  ⚠️ 重建結果工作表失敗：{title}，原因：{type(e).__name__}: {e}")
+        return get_or_create_worksheet(title, rows=rows, cols=cols)
+
+
 GSHEET_TEXT_HEADER_KEYWORDS = (
     "權證代號",
     "權證代碼",
@@ -1030,6 +1068,9 @@ def add_gsheet_text_prefix(value):
     若使用 USER_ENTERED 寫入 064390，Google Sheet 可能會自動轉成數字 64390；
     對權證代號 / 券商代號欄位加上前導單引號，可保留開頭 0。
     Google Sheet 顯示時不會顯示這個單引號，只會把儲存格視為文字。
+
+    注意：如果儲存格內容是公式，不能加單引號，否則 Google Sheet 會把公式當成純文字顯示。
+    例如「券商查詢」工作表的前 15 名查詢欄位就是公式欄位，必須保持 =IFERROR(...) 可計算。
     """
     if value is None:
         return ""
@@ -1038,6 +1079,9 @@ def add_gsheet_text_prefix(value):
 
     if s == "":
         return ""
+
+    if s.startswith("="):
+        return s
 
     if s.startswith("'"):
         return s
@@ -1097,7 +1141,11 @@ def normalize_gsheet_values_for_text_columns(values):
                 if col_idx >= len(out[row_idx]):
                     continue
 
-                out[row_idx][col_idx] = add_gsheet_text_prefix(out[row_idx][col_idx])
+                cell_value = out[row_idx][col_idx]
+                if isinstance(cell_value, str) and cell_value.strip().startswith("="):
+                    continue
+
+                out[row_idx][col_idx] = add_gsheet_text_prefix(cell_value)
 
     return out
 
@@ -1153,8 +1201,15 @@ def apply_text_format_to_gsheet(gws, values):
     write_values_to_worksheet() 已經會在代號欄位前加單引號，這裡再補上
     Google Sheets 的 TEXT numberFormat，雙重避免權證代號、股票代號、券商代號
     或權證清單中的 0 開頭代號被吃掉。
+
+    注意：「券商查詢」工作表的資料列是公式查詢結果，不可把公式欄位套成純文字，
+    否則 Google Sheet 會顯示 =IFERROR(...) 文字而不是計算結果。
+    權證代號與權證清單的文字格式會保留在「券商查詢資料」隱藏工作表中。
     """
     if gws is None or not values:
+        return
+
+    if str(getattr(gws, "title", "")).strip() == "券商查詢":
         return
 
     requests = []
@@ -1407,6 +1462,111 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
                             "numberFormat": {
                                 "type": "NUMBER",
                                 "pattern": pattern,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            })
+
+    _gsheet_batch_update(requests)
+
+
+GSHEET_DATE_HEADER_KEYWORDS = (
+    "日期",
+    "買進日",
+    "賣出日",
+    "事件日",
+    "起始日",
+    "結束日",
+    "減碼日",
+    "出清日",
+    "最近買進日",
+    "第一筆日期",
+    "最後筆日期",
+)
+
+
+def is_gsheet_date_header(header):
+    """
+    判斷 Google Sheet 中哪些欄位應該以日期格式顯示。
+
+    主要修正「券商查詢」工作表的「最近買進日」：
+    Google Sheet 公式 INDEX/MATCH 從資料表抓到日期時，常會以日期序號顯示，
+    例如 46160。這裡統一把日期欄位套成 yyyy/mm/dd，讓畫面顯示正常日期。
+    """
+    header = str(header).strip()
+
+    if not header:
+        return False
+
+    if "天數" in header:
+        return False
+
+    return any(keyword in header for keyword in GSHEET_DATE_HEADER_KEYWORDS)
+
+
+def apply_date_format_to_gsheet(ws_xlsx, gws):
+    """
+    將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd。
+
+    這裡只修正 Google Sheet 顯示格式，不改原本 Excel 產生邏輯，
+    也不改快取內容。尤其可避免「最近買進日」顯示成 46160 這類日期序號。
+    """
+    if gws is None:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    header_rows = []
+    scan_limit = min(ws_xlsx.max_row, 10)
+
+    for row_idx in range(1, scan_limit + 1):
+        date_cols = []
+
+        for col_idx in range(1, ws_xlsx.max_column + 1):
+            header = ws_xlsx.cell(row_idx, col_idx).value
+
+            if is_gsheet_date_header(header):
+                date_cols.append(col_idx)
+
+        if date_cols:
+            header_rows.append((row_idx, date_cols))
+
+    if not header_rows:
+        return
+
+    requests = []
+
+    for idx, (header_row_idx, date_cols) in enumerate(header_rows):
+        if idx + 1 < len(header_rows):
+            end_row = header_rows[idx + 1][0] - 1
+        else:
+            end_row = ws_xlsx.max_row
+
+        start_data_row = header_row_idx + 1
+
+        if start_data_row > end_row:
+            continue
+
+        for col_idx in date_cols:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_data_row - 1,
+                        "endRowIndex": end_row,
+                        "startColumnIndex": col_idx - 1,
+                        "endColumnIndex": col_idx,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "DATE",
+                                "pattern": "yyyy/mm/dd",
                             }
                         }
                     },
@@ -1982,12 +2142,22 @@ def upload_excel_to_google_sheet(xlsx_path):
             values = normalize_result_values_for_comma_numbers(values)
 
             max_cols = max(max((len(row) for row in values), default=1), 1)
-            gws = get_or_create_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
+            gws = get_or_recreate_result_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
 
             if write_values_to_worksheet(gws, values):
                 apply_excel_style_to_gsheet(ws_xlsx, gws)
                 apply_comma_number_format_to_gsheet(ws_xlsx, gws)
+                apply_date_format_to_gsheet(ws_xlsx, gws)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
+
+        try:
+            sh = get_gsheet_spreadsheet()
+            if sh is not None:
+                tmp_ws = sh.worksheet("__tmp_delete_guard__")
+                if len(sh.worksheets()) > 1:
+                    sh.del_worksheet(tmp_ws)
+        except Exception:
+            pass
 
     except Exception as e:
         print(f"  ⚠️ Excel 同步 Google Sheet 失敗：{type(e).__name__}: {e}")
