@@ -40,7 +40,8 @@ from openpyxl.worksheet.datavalidation import DataValidation
 # 設定
 # ══════════════════════════════════════════════════════════════════════
 
-OUTPUT_DIR    = r"C:\Users\chen1_ukw0m7r\Downloads"
+DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
 MAX_WORKERS   = 50
 DAYS_HISTORY  = 250
@@ -68,6 +69,7 @@ FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip(
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
 
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 WARRANTS_CACHE_PATH   = os.path.join(CACHE_DIR, "warrants_cache.csv")
@@ -987,6 +989,9 @@ def get_or_create_worksheet(title, rows=100, cols=20):
             return None
 
 
+GSHEET_TEXT_HEADER_KEYWORDS = ("權證代號", "券商代號", "代號")
+
+
 def clean_gsheet_value(value):
     if value is None:
         return ""
@@ -995,6 +1000,90 @@ def clean_gsheet_value(value):
         return value
 
     return str(value)
+
+
+def is_gsheet_text_header(header):
+    header = str(header).strip()
+    return any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS)
+
+
+def add_gsheet_text_prefix(value):
+    """
+    讓 Google Sheet 用文字格式寫入代號欄位。
+
+    若使用 USER_ENTERED 寫入 064390，Google Sheet 可能會自動轉成數字 64390；
+    對權證代號 / 券商代號欄位加上前導單引號，可保留開頭 0。
+    Google Sheet 顯示時不會顯示這個單引號，只會把儲存格視為文字。
+    """
+    if value is None:
+        return ""
+
+    s = str(value).strip()
+
+    if s == "":
+        return ""
+
+    if s.startswith("'"):
+        return s
+
+    return "'" + s
+
+
+def strip_gsheet_text_prefix(value):
+    if value is None:
+        return ""
+
+    s = str(value)
+
+    if s.startswith("'"):
+        return s[1:]
+
+    return s
+
+
+def normalize_gsheet_values_for_text_columns(values):
+    """
+    依據表頭自動判斷權證代號 / 券商代號 / 代號欄位，
+    寫入 Google Sheet 前強制改成文字，避免前導 0 被吃掉。
+
+    支援：
+    1. 快取工作表：表頭通常在第 1 列。
+    2. 一般結果工作表：表頭多數也在第 1 列。
+    3. 例如 ABCD組合勝率 這種表頭在第 4 列的工作表，會掃前 10 列找表頭。
+    """
+    if not values:
+        return values
+
+    out = [list(row) for row in values]
+    header_rows = []
+
+    scan_limit = min(len(out), 10)
+    for row_idx in range(scan_limit):
+        row = out[row_idx]
+        text_cols = []
+
+        for col_idx, header in enumerate(row):
+            if is_gsheet_text_header(header):
+                text_cols.append(col_idx)
+
+        if text_cols:
+            header_rows.append((row_idx, text_cols))
+
+    if not header_rows:
+        return out
+
+    for header_row_idx, text_cols in header_rows:
+        next_header_rows = [idx for idx, _ in header_rows if idx > header_row_idx]
+        end_row = min(next_header_rows) if next_header_rows else len(out)
+
+        for row_idx in range(header_row_idx + 1, end_row):
+            for col_idx in text_cols:
+                if col_idx >= len(out[row_idx]):
+                    continue
+
+                out[row_idx][col_idx] = add_gsheet_text_prefix(out[row_idx][col_idx])
+
+    return out
 
 
 def write_values_to_worksheet(ws, values):
@@ -1013,6 +1102,8 @@ def write_values_to_worksheet(ws, values):
         if len(row) < col_count:
             row = row + [""] * (col_count - len(row))
         normalized_values.append([clean_gsheet_value(v) for v in row])
+
+    normalized_values = normalize_gsheet_values_for_text_columns(normalized_values)
 
     try:
         ws.clear()
@@ -1064,6 +1155,11 @@ def read_cache_from_gsheet(path):
             fixed_rows.append(row)
 
         df = pd.DataFrame(fixed_rows, columns=headers).fillna("")
+
+        for col in df.columns:
+            if is_gsheet_text_header(col):
+                df[col] = df[col].map(strip_gsheet_text_prefix)
+
         print(f"  ☁️ 已從 Google Sheet 讀取快取：{title}，共 {len(df):,} 筆")
         return df
     except Exception:
@@ -5120,6 +5216,10 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
 
     apply_global_amount_comma_format(wb)
+
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     wb.save(output_path)
 
