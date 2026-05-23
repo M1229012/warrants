@@ -47,7 +47,7 @@ jobs:
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pillow gspread google-auth
+          pip install requests pandas pillow gspread google-auth matplotlib
 
       - name: Generate image from Google Sheet and send to Discord
         run: |
