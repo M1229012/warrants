@@ -606,17 +606,13 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         draw.line([bx + 18, y + 174, bx + card_w2 - 18, y + 174], fill=BORDER, width=1)
         draw.text((bx + 18, y + 187), f"賣方：{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", font=F(18, True), fill=GREEN)
 
+    # 今日無動作分點固定放在有動作分點卡片下方。
+    # 原本 active_brokers = 3 時，會嘗試把無動作區塊塞到右側剩餘空間，
+    # 但三張卡片已接近滿版，剩餘寬度可能變成負數，造成 PIL rounded_rectangle 報錯。
     inactive_box_bottom = y + card_h2
     if inactive_brokers:
-        if max_cards >= 4:
-            ix, iy, iw, ih = 40, y + card_h2 + 16, 1120, 90
-            inactive_box_bottom = iy + ih
-        else:
-            ix = 40 + max_cards * (card_w2 + card_gap)
-            iy = y
-            iw = 1120 - ix
-            ih = card_h2
-            inactive_box_bottom = y + card_h2
+        ix, iy, iw, ih = 40, y + card_h2 + 16, 1120, 90
+        inactive_box_bottom = iy + ih
 
         rounded_rect(ix, iy, ix + iw, iy + ih, 16, fill=WHITE, outline=BORDER, width=2)
         title_y = iy + 20
