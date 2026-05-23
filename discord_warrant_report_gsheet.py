@@ -1514,17 +1514,6 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 # ══════════════════════════════════════════════════════════════════════
 # Discord
 # ══════════════════════════════════════════════════════════════════════
-
-def send_to_discord(webhook_url: str, image_path: Path, target: date, content_text: str | None = None):
-    content = content_text or f"📊 {target:%Y/%m/%d} 精選分點買賣超追蹤"
-    with image_path.open("rb") as f:
-        files = {"file": (image_path.name, f, "image/png")}
-        data = {"content": content}
-        resp = requests.post(webhook_url, data=data, files=files, timeout=60)
-    if not (200 <= resp.status_code < 300):
-        raise RuntimeError(f"Discord webhook 發送失敗：{resp.status_code} {resp.text}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=os.getenv("TARGET_DATE", ""))
@@ -1563,17 +1552,8 @@ def main():
     if not webhook_url:
         raise RuntimeError("找不到 DISCORD_WEBHOOK_URL_TEST，請先在 GitHub Secrets 設定。")
 
-    send_to_discord(
-        webhook_url,
-        output_path,
-        target
-    )
-
-    send_to_discord(
-        webhook_url,
-        consensus_output_path,
-        target
-    )
+    send_to_discord(webhook_url,output_path,target)
+    send_to_discord(webhook_url,consensus_output_path,target)
 
     print("Discord 已發送 2 張圖片。")
 
