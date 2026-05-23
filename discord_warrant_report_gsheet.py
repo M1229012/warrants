@@ -1413,9 +1413,9 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     kpi_w = (content_w - 2 * kpi_gap) / 3
 
     kpis = [
-        ("TOP10合計買超", fmt_wan(total_amount), RED),
         ("TOP10淨累積買超", fmt_wan(total_net_amount), RED if total_net_amount >= 0 else GREEN),
         ("統計期間", f"{len(trading_dates)} 個交易日", NAVY2),
+        ("追蹤分點", f"{len(TRACKED_BROKERS)} 家", NAVY2),
     ]
 
     for i, (title, val, color) in enumerate(kpis):
@@ -1432,8 +1432,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP10", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "合計買超", "淨累積買超", "分點數", "事件", "主力分點"]
-    col_w = [0.70, 2.10, 1.80, 1.95, 0.95, 1.10, 3.60]
+    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "主力分點"]
+    col_w = [0.70, 2.35, 2.20, 1.00, 1.20, 4.75]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -1458,16 +1458,15 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             values = [
                 str(i + 1),
                 fit(r["target"], 14),
-                fmt_wan(r["amount"]),
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
-                fit(f'{r["top_broker"]} {fmt_wan(r["top_broker_amount"])}', 18),
+                fit(f'{r["top_broker"]} {fmt_wan(r["top_broker_amount"])}', 22),
             ]
 
-            colors = [TEXT, TEXT, RED, net_color, TEXT, NAVY2, TEXT]
-            aligns = ["center", "left", "right", "right", "center", "center", "left"]
-            bolds = [True, True, True, True, True, True, True]
+            colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
+            aligns = ["center", "left", "right", "center", "center", "left"]
+            bolds = [True, True, True, True, True, True]
 
             x = margin_x
             for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
