@@ -791,17 +791,17 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     gap = 0.18
 
     # 分點卡片顯示規則：
-    # - 有動作分點 3~5 個：只顯示有動作分點，並排同一排
+    # - 有動作分點 3~5 個：只顯示有動作分點，並排同一排；今日無動作分點顯示在下方長條
     # - 有動作分點 0~2 個：加入「今日無動作分點」摘要框，避免畫面只剩少數卡片
     show_inactive_card = len(active_brokers) <= 2 and bool(inactive_brokers)
+    show_inactive_bar = len(active_brokers) >= 3 and bool(inactive_brokers)
     broker_card_items = active_brokers[:] + (["__INACTIVE__"] if show_inactive_card else [])
 
     active_rows = 1 if broker_card_items else 0
     broker_card_h = 1.55
     broker_area_h = active_rows * broker_card_h
 
-    # 不再另外拉出「今日無動作分點」獨立長條
-    inactive_h = 0.0
+    inactive_h = 0.58 if show_inactive_bar else 0.0
 
     section_title_h = 0.55
     header_h = 0.42
@@ -823,6 +823,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + kpi_h
         + gap
         + broker_area_h
+        + (gap + inactive_h if show_inactive_bar else 0)
         + gap
         + buy_table_h
         + (gap + sell_table_h if sell_rows else 0)
@@ -988,6 +989,15 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             text(x + 0.70, cy + 0.28, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 12.5, GREEN, BOLD)
 
     y -= broker_area_h
+
+    # 有動作分點 3～5 個時，維持原本方式：今日無動作分點顯示在下方長條
+    if show_inactive_bar:
+        y -= gap
+        rounded(margin_x, y - inactive_h, content_w, inactive_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點：", 15, NAVY, BOLD)
+        text(margin_x + 2.02, y - inactive_h / 2, "、".join(inactive_brokers), 15, TEXT, BOLD)
+        y -= inactive_h
+
     y -= gap
 
     # ─────────────────────────────────────────────
