@@ -294,12 +294,13 @@ def fmt_wan(v: float) -> str:
 
 def normalize_return_pct(v):
     """
-    將 Google Sheet 的權證報酬率統一轉成「百分比數值」。
+    將 Google Sheet 權證報酬率統一轉成「百分比數值」。
 
-    修正重點：
-    - Google Sheet 有時會把 +28.1% 讀成 "28.1%"，這種已經是百分比，直接用 28.1。
-    - 有時會把 +165.08% 存成 1.6508，這是小數報酬率，要乘上 100 變成 165.08。
-    - 若原始值已經大於 5，例如 28.1、-10.2，視為已經是百分比，不再乘 100。
+    例：
+    - "11.67%" -> 11.67
+    - 11.67    -> 11.67
+    - 0.1167   -> 11.67
+    - 1.6508   -> 165.08
     """
     try:
         if v is None:
@@ -314,15 +315,14 @@ def normalize_return_pct(v):
         if pct is None:
             return None
 
-        # 有 % 符號：代表 Google Sheet 已經格式化成百分比字串
         if has_percent:
             return pct
 
-        # 沒有 % 符號：若數值在 -5~5 之間，通常是小數報酬率，例如 1.6508 = +165.08%
+        # 無 % 符號且落在 -5~5，視為小數報酬率
         if -5 < pct < 5:
             return pct * 100.0
 
-        # 其他情況視為已經是百分比，例如 28.1 = +28.1%
+        # 其他視為已經是百分比
         return pct
 
     except Exception:
@@ -527,7 +527,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
 
 
 def append_sell(sells: list[dict], broker: str, status: str, event: str, underlying, warrant_name: str,
-                amount: float, qty: int, sheet_name: str, return_pct=None):
+                amount: float, qty: int, sheet_name: str, return_pct=None, buy_amount=None):
     if amount < SELL_THRESHOLD and not (status == "出清" and DISPLAY_EXIT_ALWAYS):
         return
 
@@ -541,7 +541,8 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
         "underlying": underlying_code,
         "stock_name": stock_name,
         "warrant": strip_gsheet_text_prefix(warrant_name),
-        "amount": amount,
+        "amount": amount,                         # 賣出 / 減碼 / 出清金額
+        "buy_amount": safe_float(buy_amount, 0),  # 對應買進金額，用於同標的合計報酬率
         "qty": qty,
         "return_pct": normalize_return_pct(return_pct),
         "sheet": sheet_name,
@@ -574,14 +575,14 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
             amount = safe_float(r.get("減碼均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
             append_sell(
                 sells, broker, "減碼", event, r.get("標的股"), r.get("權證名稱"),
-                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("減碼獲利%")
+                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("減碼獲利%"), r.get("買進金額")
             )
 
         if parse_date_value(r.get("出清日")) == target:
             amount = safe_float(r.get("出清均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
             append_sell(
                 sells, broker, "出清", event, r.get("標的股"), r.get("權證名稱"),
-                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("出清獲利%")
+                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("出清獲利%"), r.get("買進金額")
             )
 
     # B/C/D：同標的合買、3 日累積、10 日累積
@@ -612,13 +613,13 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
             if parse_date_value(r.get("減碼日")) == target:
                 append_sell(
                     sells, broker, "減碼", event, r.get("標的股"), r.get("權證清單"),
-                    safe_float(r.get("減碼賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("減碼獲利%")
+                    safe_float(r.get("減碼賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("減碼獲利%"), r.get("買超金額")
                 )
 
             if parse_date_value(r.get("出清日")) == target:
                 append_sell(
                     sells, broker, "出清", event, r.get("標的股"), r.get("權證清單"),
-                    safe_float(r.get("出清賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("出清獲利%")
+                    safe_float(r.get("出清賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("出清獲利%"), r.get("買超金額")
                 )
 
     return buys, sells
@@ -632,7 +633,13 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     groups = defaultdict(list)
 
     for a in actions:
-        key = (a["broker"], a.get("status", ""), a["event"], a["underlying"] or a["warrant"])
+        # 賣方明細採「同一天、同分點、同狀態、同標的」直接合計。
+        # 若同一標的同一天同時出現在 A/B/C/D，會合併為一列，報酬率用買進金額與賣出金額概算。
+        # 買方仍保留事件別，避免買超訊號被過度合併。
+        if kind == "sell":
+            key = (a["broker"], a.get("status", ""), "ABCD合計", a["underlying"] or a["warrant"])
+        else:
+            key = (a["broker"], a.get("status", ""), a["event"], a["underlying"] or a["warrant"])
         groups[key].append(a)
 
     result = []
@@ -641,55 +648,61 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         qty = sum(i.get("qty", 0) for i in items)
         warrant_count = len(items)
 
-        # 權證報酬率彙總：
-        # 單筆直接使用 Google Sheet 內的「減碼獲利% / 出清獲利%」。
-        # 多筆同標的權證合併時，不用標的股報酬率，也不是單純平均；
-        # 以每筆權證的賣出金額與權證報酬率反推成本，再計算整體累積報酬率。
-        #
-        # 若 r = 權證報酬率，例如 +20% = 20
-        # 賣出金額 = 成本 * (1 + r/100)
-        # 成本 = 賣出金額 / (1 + r/100)
-        # 合併報酬率 = (總賣出金額 - 總成本) / 總成本 * 100
-        valid_returns = [
-            (i.get("return_pct"), i.get("amount", 0))
-            for i in items
-            if i.get("return_pct") is not None and float(i.get("amount", 0) or 0) > 0
-        ]
+        # 賣方報酬率合計邏輯：
+        # 你希望同一天 A/B/C/D 若有同一標的賣方動作，直接加總概算。
+        # 因此優先使用：
+        #   報酬率 = (合計賣出金額 - 合計買進金額) / 合計買進金額
+        # 這樣能和「買進金額都有，直接加在一起算」的邏輯一致。
+        total_buy_amount = sum(safe_float(i.get("buy_amount"), 0) for i in items)
 
-        if valid_returns:
-            total_sell_amount = 0.0
-            total_cost_amount = 0.0
-
-            for pct, sell_amount in valid_returns:
-                pct = float(pct)
-                sell_amount = float(sell_amount or 0)
-                denominator = 1.0 + pct / 100.0
-
-                # 避免 -100% 附近造成除以 0
-                if denominator <= 0:
-                    continue
-
-                cost_amount = sell_amount / denominator
-                total_sell_amount += sell_amount
-                total_cost_amount += cost_amount
-
-            if total_cost_amount > 0:
-                return_pct = ((total_sell_amount - total_cost_amount) / total_cost_amount) * 100.0
-            else:
-                return_pct = sum(float(p) for p, _ in valid_returns) / len(valid_returns)
+        if kind == "sell" and total_buy_amount > 0:
+            return_pct = ((amount - total_buy_amount) / total_buy_amount) * 100.0
         else:
-            return_pct = None
+            # fallback：若沒有買進金額，才用個別報酬率反推成本。
+            valid_returns = [
+                (i.get("return_pct"), i.get("amount", 0))
+                for i in items
+                if i.get("return_pct") is not None and float(i.get("amount", 0) or 0) > 0
+            ]
+
+            if valid_returns:
+                total_sell_amount = 0.0
+                total_cost_amount = 0.0
+
+                for pct, sell_amount in valid_returns:
+                    pct = float(pct)
+                    sell_amount = float(sell_amount or 0)
+                    denominator = 1.0 + pct / 100.0
+
+                    if denominator <= 0:
+                        continue
+
+                    cost_amount = sell_amount / denominator
+                    total_sell_amount += sell_amount
+                    total_cost_amount += cost_amount
+
+                if total_cost_amount > 0:
+                    return_pct = ((total_sell_amount - total_cost_amount) / total_cost_amount) * 100.0
+                else:
+                    return_pct = sum(float(p) for p, _ in valid_returns) / len(valid_returns)
+            else:
+                return_pct = None
 
         underlying = items[0].get("underlying", "")
         stock_name = items[0].get("stock_name", "")
         target_label = f"{underlying} {stock_name}".strip() if underlying else ""
 
+        if kind == "sell":
+            event = "/".join(sorted({str(i.get("event", "")) for i in items if str(i.get("event", "")).strip()})) or event
+
         if warrant_count >= 2 and underlying:
             display_target = target_label if target_label else f"{underlying}"
-            content = f"{warrant_count} 檔權證"
+            content = f"{event}｜{warrant_count} 筆權證事件" if kind == "sell" else f"{warrant_count} 檔權證"
         else:
             display_target = target_label if target_label else (underlying if underlying else items[0].get("warrant", ""))
             content = items[0].get("warrant", "") or f"{warrant_count} 檔權證"
+            if kind == "sell" and event:
+                content = f"{event}｜{content}"
 
         result.append({
             "broker": broker,
