@@ -79,7 +79,25 @@ WARRANT_ISSUER_TOKENS = [
     "摩根大通", "麥格理", "法銀巴黎", "上海商銀"
 ]
 
+
 _STOCK_NAME_MAP = None
+
+# 浮水印設定
+WATERMARK_TEXT = "By 股市艾斯出品-轉傳請註明\n資訊分享非投資建議 投資請自行評估風險"
+WATERMARK_ALPHA = 0.80
+
+CENTER_WATERMARK_TEXT = "股市艾斯\n權證分點追蹤"
+CENTER_WATERMARK_ALPHA = 0.055
+CENTER_WATERMARK_FONT_SIZE = 68
+CENTER_WATERMARK_ROTATION = 18
+
+# 事件代號說明
+EVENT_LEGEND_ITEMS = [
+    ("A", "單檔權證單日大買"),
+    ("B", "同標的單日合買"),
+    ("C", "同標的3日累積"),
+    ("D", "近10日累積淨買"),
+]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -680,8 +698,9 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
 
+    event_legend_h = 0.82
     bottom_note_h = 0.75
-    footer_h = 0.35
+    footer_h = 0.48
 
     fig_h = (
         top_h
@@ -692,6 +711,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + gap
         + buy_table_h
         + (gap + sell_table_h if sell_rows else 0)
+        + gap
+        + event_legend_h
         + gap
         + bottom_note_h
         + footer_h
@@ -752,7 +773,40 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         s = str(s)
         return s if len(s) <= n else s[:n - 1] + "…"
 
+    def draw_center_watermark():
+        try:
+            ax.text(
+                0.5, 0.50, CENTER_WATERMARK_TEXT,
+                transform=ax.transAxes,
+                ha="center", va="center",
+                fontsize=CENTER_WATERMARK_FONT_SIZE,
+                fontproperties=BOLD,
+                color="#2C3440",
+                alpha=CENTER_WATERMARK_ALPHA,
+                rotation=CENTER_WATERMARK_ROTATION,
+                linespacing=1.18,
+                zorder=0.8,
+            )
+        except Exception:
+            pass
+
+    def draw_bottom_watermark():
+        ax.text(
+            fig_w - margin_x - 0.05,
+            0.23,
+            WATERMARK_TEXT,
+            ha="right",
+            va="bottom",
+            fontsize=10.5,
+            linespacing=1.25,
+            fontproperties=FONT,
+            color="#2C3440",
+            alpha=WATERMARK_ALPHA,
+            zorder=20,
+        )
+
     date_label = f"{target.month}/{target.day}"
+    draw_center_watermark()
 
     # ─────────────────────────────────────────────
     # Header
@@ -890,8 +944,27 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
         y = draw_table(f"{date_label} 賣方提醒", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
 
-    # Bottom note
+    # Event legend
     y -= gap
+    rounded(margin_x, y - event_legend_h, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+    text(margin_x + 0.25, y - 0.25, "事件代號說明", 14, NAVY, BOLD)
+
+    legend_x = margin_x + 1.72
+    legend_y1 = y - 0.25
+    legend_y2 = y - 0.58
+    per_w = 5.10
+
+    for idx, (code_name, desc) in enumerate(EVENT_LEGEND_ITEMS):
+        lx = legend_x + (idx % 2) * per_w
+        ly = legend_y1 if idx < 2 else legend_y2
+        badge_color = NAVY if code_name in {"A", "B"} else GREEN
+
+        rounded(lx, ly - 0.13, 0.34, 0.26, fc=badge_color, ec=badge_color, lw=0.8, r=0.08)
+        text(lx + 0.17, ly, code_name, 10.5, WHITE, BOLD, ha="center")
+        text(lx + 0.44, ly, desc, 11.5, TEXT, FONT)
+
+    # Bottom note
+    y -= event_legend_h + gap
     rounded(margin_x, y - bottom_note_h, content_w, bottom_note_h, fc=WHITE, ec=NAVY2, lw=1.0, r=0.08)
     text(margin_x + 0.25, y - bottom_note_h / 2, "今日重點", 15, NAVY, BOLD)
     top_broker = max(TRACKED_BROKERS, key=lambda b: broker_summary[b]["buy_amount"]) if buys else "無"
@@ -900,6 +973,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
     # footer
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
+    draw_bottom_watermark()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
