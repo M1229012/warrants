@@ -1,10 +1,10 @@
-name: Discord Warrant Branch Report
+name: Discord Warrant Branch Report From Google Sheet
 
 on:
   workflow_dispatch:
     inputs:
       target_date:
-        description: "指定日期，例如 2026-05-18。留空則自動抓 Excel 內最新日期"
+        description: "指定圖卡日期，例如 2026-05-18。留空則自動抓 Google Sheet 內最新日期"
         required: false
         default: ""
   schedule:
@@ -17,27 +17,22 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # 依你的檔案位置調整。若 Excel 是其他 workflow 產生，請改成對應路徑。
-      EXCEL_PATH: 權證分點籌碼.xlsx
+      GOOGLE_SHEET_NAME: "權證分點籌碼"
+      # 建議你用 GOOGLE_SHEET_ID，比名稱更穩；若不用可刪掉這行或留空。
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
-      # 買超 100 萬才列入
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+
       BUY_THRESHOLD: "1000000"
-
-      # 賣方用買超門檻的 20%，也就是 20 萬才顯示
       SELL_THRESHOLD_RATIO: "0.2"
-
-      # 預設出清也要達賣方門檻才顯示；若要出清不管金額都顯示，改成 "1"
       DISPLAY_EXIT_ALWAYS: "0"
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
-      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # 若你的 Excel 是另一個 workflow 產生，不在 repo 內，
-      # 請在這裡加入下載 artifact 或執行產生 Excel 的步驟。
 
       - name: Install system fonts
         run: |
@@ -52,14 +47,14 @@ jobs:
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests pandas pillow gspread google-auth
 
-      - name: Generate image and send to Discord
+      - name: Generate image from Google Sheet and send to Discord
         run: |
           if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            python discord_warrant_report.py --date "${{ github.event.inputs.target_date }}"
+            python discord_warrant_report_gsheet.py --date "${{ github.event.inputs.target_date }}"
           else
-            python discord_warrant_report.py
+            python discord_warrant_report_gsheet.py
           fi
 
       - name: Upload generated image artifact
