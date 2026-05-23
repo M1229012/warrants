@@ -7,4 +7,4 @@ beautifulsoup4
 gspread
 google-auth
 Pillow
-
+matplotlib
