@@ -1566,15 +1566,13 @@ def main():
     send_to_discord(
         webhook_url,
         output_path,
-        target,
-        content_text=f"📊 {target:%Y/%m/%d} 精選分點買賣超追蹤"
+        target
     )
 
     send_to_discord(
         webhook_url,
         consensus_output_path,
-        target,
-        content_text=f"📊 {target:%Y/%m/%d} 近一個月交易日｜五大分點共識淨買超 TOP15"
+        target
     )
 
     print("Discord 已發送 2 張圖片。")
