@@ -82,13 +82,9 @@ WARRANT_ISSUER_TOKENS = [
 
 _STOCK_NAME_MAP = None
 
-# 浮水印設定
-WATERMARK_TEXT = "By 股市艾斯出品-轉傳請註明\n資訊分享非投資建議 投資請自行評估風險"
-WATERMARK_ALPHA = 0.80
-
-CENTER_WATERMARK_TEXT = "股市艾斯\n權證分點追蹤"
+CENTER_WATERMARK_TEXT = "股市艾斯\n台股ＤＣ討論群"
 CENTER_WATERMARK_ALPHA = 0.055
-CENTER_WATERMARK_FONT_SIZE = 68
+CENTER_WATERMARK_FONT_SIZE = 92
 CENTER_WATERMARK_ROTATION = 18
 
 # 事件代號說明
@@ -604,15 +600,40 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         qty = sum(i.get("qty", 0) for i in items)
         warrant_count = len(items)
 
+        # 權證報酬率彙總：
+        # 單筆直接使用 Google Sheet 內的「減碼獲利% / 出清獲利%」。
+        # 多筆同標的權證合併時，不用標的股報酬率，也不是單純平均；
+        # 以每筆權證的賣出金額與權證報酬率反推成本，再計算整體累積報酬率。
+        #
+        # 若 r = 權證報酬率，例如 +20% = 20
+        # 賣出金額 = 成本 * (1 + r/100)
+        # 成本 = 賣出金額 / (1 + r/100)
+        # 合併報酬率 = (總賣出金額 - 總成本) / 總成本 * 100
         valid_returns = [
             (i.get("return_pct"), i.get("amount", 0))
             for i in items
-            if i.get("return_pct") is not None
+            if i.get("return_pct") is not None and float(i.get("amount", 0) or 0) > 0
         ]
+
         if valid_returns:
-            total_weight = sum(max(float(w), 0.0) for _, w in valid_returns)
-            if total_weight > 0:
-                return_pct = sum(float(p) * max(float(w), 0.0) for p, w in valid_returns) / total_weight
+            total_sell_amount = 0.0
+            total_cost_amount = 0.0
+
+            for pct, sell_amount in valid_returns:
+                pct = float(pct)
+                sell_amount = float(sell_amount or 0)
+                denominator = 1.0 + pct / 100.0
+
+                # 避免 -100% 附近造成除以 0
+                if denominator <= 0:
+                    continue
+
+                cost_amount = sell_amount / denominator
+                total_sell_amount += sell_amount
+                total_cost_amount += cost_amount
+
+            if total_cost_amount > 0:
+                return_pct = ((total_sell_amount - total_cost_amount) / total_cost_amount) * 100.0
             else:
                 return_pct = sum(float(p) for p, _ in valid_returns) / len(valid_returns)
         else:
@@ -727,7 +748,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
 
     event_legend_h = 0.82
-    bottom_note_h = 0.75
     footer_h = 0.48
 
     fig_h = (
@@ -741,8 +761,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + (gap + sell_table_h if sell_rows else 0)
         + gap
         + event_legend_h
-        + gap
-        + bottom_note_h
         + footer_h
     )
 
@@ -995,15 +1013,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         text(lx + 0.17, ly, code_name, 10.5, WHITE, BOLD, ha="center")
         text(lx + 0.44, ly, desc, 11.5, TEXT, FONT)
 
-    # Bottom note
-    y -= event_legend_h + gap
-    rounded(margin_x, y - bottom_note_h, content_w, bottom_note_h, fc=WHITE, ec=NAVY2, lw=1.0, r=0.08)
-    text(margin_x + 0.25, y - bottom_note_h / 2, "今日重點", 15, NAVY, BOLD)
-    top_broker = max(TRACKED_BROKERS, key=lambda b: broker_summary[b]["buy_amount"]) if buys else "無"
-    note = f"{top_broker} 為當日主要買超分點；無動作分點縮小顯示，主圖只保留主要買賣超。"
-    text(margin_x + 1.70, y - bottom_note_h / 2, note, 13, TEXT, FONT)
-
     # footer
+    y -= event_legend_h
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
     draw_bottom_watermark()
 
