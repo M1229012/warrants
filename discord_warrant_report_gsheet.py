@@ -82,7 +82,11 @@ WARRANT_ISSUER_TOKENS = [
 
 _STOCK_NAME_MAP = None
 
-CENTER_WATERMARK_TEXT = "股市艾斯\n台股ＤＣ討論群"
+# 浮水印設定
+WATERMARK_TEXT = "By 股市艾斯出品-轉傳請註明\n資訊分享非投資建議 投資請自行評估風險"
+WATERMARK_ALPHA = 0.80
+
+CENTER_WATERMARK_TEXT = "股市艾斯\n權證分點追蹤"
 CENTER_WATERMARK_ALPHA = 0.055
 CENTER_WATERMARK_FONT_SIZE = 92
 CENTER_WATERMARK_ROTATION = 18
@@ -838,18 +842,9 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             pass
 
     def draw_bottom_watermark():
-        ax.text(
-            fig_w - margin_x - 0.05,
-            0.23,
-            ha="right",
-            va="bottom",
-            fontsize=10.5,
-            linespacing=1.25,
-            fontproperties=FONT,
-            color="#2C3440",
-            alpha=WATERMARK_ALPHA,
-            zorder=60,
-        )
+        # 已移除右下角「股市艾斯出品」浮水印，只保留中央淡色浮水印。
+        # 保留空函式是為了避免舊版殘留呼叫時發生 NameError。
+        pass
 
     date_label = f"{target.month}/{target.day}"
     draw_center_watermark()
@@ -1015,7 +1010,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     # footer
     y -= event_legend_h
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
-    draw_bottom_watermark()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
