@@ -292,6 +292,43 @@ def fmt_wan(v: float) -> str:
     return f"{money_to_wan(v):.1f} 萬"
 
 
+def normalize_return_pct(v):
+    """
+    將 Google Sheet 的權證報酬率統一轉成「百分比數值」。
+
+    修正重點：
+    - Google Sheet 有時會把 +28.1% 讀成 "28.1%"，這種已經是百分比，直接用 28.1。
+    - 有時會把 +165.08% 存成 1.6508，這是小數報酬率，要乘上 100 變成 165.08。
+    - 若原始值已經大於 5，例如 28.1、-10.2，視為已經是百分比，不再乘 100。
+    """
+    try:
+        if v is None:
+            return None
+
+        raw = strip_gsheet_text_prefix(v)
+        if raw == "" or raw == "-":
+            return None
+
+        has_percent = "%" in str(raw)
+        pct = safe_float(raw, None)
+        if pct is None:
+            return None
+
+        # 有 % 符號：代表 Google Sheet 已經格式化成百分比字串
+        if has_percent:
+            return pct
+
+        # 沒有 % 符號：若數值在 -5~5 之間，通常是小數報酬率，例如 1.6508 = +165.08%
+        if -5 < pct < 5:
+            return pct * 100.0
+
+        # 其他情況視為已經是百分比，例如 28.1 = +28.1%
+        return pct
+
+    except Exception:
+        return None
+
+
 def fmt_return_pct(v) -> str:
     try:
         if v is None or v == "":
@@ -506,7 +543,7 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
         "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
-        "return_pct": safe_float(return_pct, None) if return_pct not in [None, ""] else None,
+        "return_pct": normalize_return_pct(return_pct),
         "sheet": sheet_name,
     })
 
