@@ -841,7 +841,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         ax.text(
             fig_w - margin_x - 0.05,
             0.23,
-            WATERMARK_TEXT,
             ha="right",
             va="bottom",
             fontsize=10.5,
