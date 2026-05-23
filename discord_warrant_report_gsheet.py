@@ -1329,8 +1329,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     margin_x = 0.40
     content_w = fig_w - 2 * margin_x
 
-    top_h = 1.90
-    kpi_h = 1.18
+    top_h = 1.95
+    legend_h = 0.45
     gap = 0.18
     section_title_h = 0.55
     header_h = 0.42
@@ -1339,8 +1339,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     table_h = section_title_h + header_h + max(1, n) * row_h
 
-    fig_h = top_h + kpi_h + gap + table_h + footer_h
-    fig_h = max(fig_h, 8.2)
+    fig_h = top_h + legend_h + gap + table_h + footer_h
+    fig_h = max(fig_h, 7.6)
 
     BG = "#F6F8FB"
     WHITE = "#FFFFFF"
@@ -1427,33 +1427,33 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     # Header
     y = fig_h - 0.45
     text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP10", 28, NAVY, BOLD)
-    y -= 0.35
+    y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
-    y -= 0.28
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}", 13.5, NAVY2, BOLD)
-    y -= 0.28
-    text(margin_x + 0.18, y, "同標的合併計算｜單位：萬元", 13, TEXT, BOLD)
+    y -= 0.30
+    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
 
-    # KPI
-    y -= 0.24
-    kpi_y = y - kpi_h
-    kpi_gap = 0.30
-    kpi_w = (content_w - 2 * kpi_gap) / 3
+    # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
+    y -= 0.28
+    legend_y = y - legend_h
+    rounded(margin_x, legend_y, content_w, legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
 
-    kpis = [
-        ("TOP10淨累積買超", fmt_wan(total_net_amount), RED if total_net_amount >= 0 else GREEN),
-        ("A / B", "單檔大買／同標的單日合買", NAVY2),
-        ("C / D", "3日累積／近10日淨買", NAVY2),
+    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP10淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
+
+    legend_items = [
+        ("A", "單檔權證單日大買"),
+        ("B", "同標的單日合買"),
+        ("C", "同標的3日累積"),
+        ("D", "近10日累積淨買"),
     ]
 
-    for i, (title, val, color) in enumerate(kpis):
-        x = margin_x + i * (kpi_w + kpi_gap)
-        rounded(x, kpi_y, kpi_w, kpi_h, fc=PINK if i == 0 else WHITE, ec=color, lw=1.2, r=0.09)
-        text(x + 0.25, kpi_y + 0.78, title, 15, TEXT, BOLD)
-        value_size = 21 if i == 0 else 14
-        text(x + 0.25, kpi_y + 0.34, val, value_size, color, BOLD)
+    lx = margin_x + 3.40
+    for code_name, desc in legend_items:
+        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
+        text(lx + 0.16, legend_y + legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
+        text(lx + 0.40, legend_y + legend_h / 2, desc, 10.8, TEXT, FONT)
+        lx += 2.15 if code_name in {"A", "B"} else 1.95
 
-    y = kpi_y - gap
+    y = legend_y - gap
 
     # Table
     table_top = y
