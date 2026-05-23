@@ -856,7 +856,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 x = margin_x
                 for val, w, c, a, is_bold in zip(values, col_widths, colors, aligns, bolds):
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 12, c, BOLD if is_bold else FONT, ha=a)
+                    text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 14, c, BOLD if is_bold else FONT, ha=a)
                     x += w
         return y_top - table_h
 
