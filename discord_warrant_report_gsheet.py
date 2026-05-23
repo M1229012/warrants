@@ -755,6 +755,21 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
                 if sell_event_label:
                     content = f"{sell_event_label}｜{content}"
 
+        # 賣超明細內容欄最前面固定保留 A/B/C/D 事件代號。
+        # 注意：賣方資料可能在前面被合併成 warrant_count >= 2，
+        # 因此不能只在單筆 else 分支加前綴，必須在 result.append 前統一處理。
+        if kind == "sell":
+            sell_event_label = event
+            if not sell_event_label or sell_event_label == "ABCD合計":
+                sell_event_label = "/".join(sorted({
+                    str(i.get("event", "")).strip()
+                    for i in items
+                    if str(i.get("event", "")).strip()
+                }))
+
+            if sell_event_label and not str(content).startswith(f"{sell_event_label}｜"):
+                content = f"{sell_event_label}｜{content}"
+
         result.append({
             "broker": broker,
             "status": status,
