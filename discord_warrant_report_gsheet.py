@@ -56,7 +56,6 @@ TRACKED_BROKERS = [
 BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
 SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.2"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
-LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "22"))
 
 # 若你未來想讓「出清不管金額都顯示」，改成 "1"
 DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
@@ -784,11 +783,14 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     kpi_h = 1.25
     gap = 0.18
 
-    active_rows = max(1, math.ceil(len(active_brokers) / 3)) if active_brokers else 0
+    # 五個追蹤分點固定同一排顯示：有動作、無動作都直接顯示在卡片內
+    card_brokers = TRACKED_BROKERS[:]
+    active_rows = 1 if card_brokers else 0
     broker_card_h = 1.55
-    broker_area_h = active_rows * broker_card_h + max(0, active_rows - 1) * gap
+    broker_area_h = active_rows * broker_card_h
 
-    inactive_h = 0.58 if inactive_brokers else 0.0
+    # 不再另外拉出「今日無動作分點」獨立區塊
+    inactive_h = 0.0
 
     section_title_h = 0.55
     header_h = 0.42
@@ -802,7 +804,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
 
-    event_legend_h = 0.45
+    event_legend_h = 0.82
     footer_h = 0.48
 
     fig_h = (
@@ -810,7 +812,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + kpi_h
         + gap
         + broker_area_h
-        + (gap + inactive_h if inactive_brokers else 0)
         + gap
         + buy_table_h
         + (gap + sell_table_h if sell_rows else 0)
@@ -938,43 +939,35 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     y = kpi_y - gap
 
     # ─────────────────────────────────────────────
-    # Broker cards：五個分點盡量同一排並排，讓當日買超 / 賣方狀態更好比較
+    # Broker cards：3~5 個分點都維持單排並列；無動作分點也直接顯示在卡片內
     # ─────────────────────────────────────────────
-    if active_brokers:
-        cards_per_row = 5
-        card_gap = 0.12
+    if card_brokers:
+        cards_per_row = len(card_brokers)
+        card_gap = 0.14
         card_w = (content_w - (cards_per_row - 1) * card_gap) / cards_per_row
-        for idx, b in enumerate(active_brokers):
-            row = idx // cards_per_row
+        for idx, b in enumerate(card_brokers):
             col = idx % cards_per_row
             x = margin_x + col * (card_w + card_gap)
-            cy = y - row * (broker_card_h + gap) - broker_card_h
+            cy = y - broker_card_h
             s = broker_summary[b]
-            rounded(x, cy, card_w, broker_card_h, fc=WHITE, ec=NAVY2, lw=1.1, r=0.08)
-            rect(x, cy + broker_card_h - 0.40, card_w, 0.40, fc=NAVY)
 
-            # 五欄並排後寬度較窄，字體微縮避免爆版
-            text(x + card_w / 2, cy + broker_card_h - 0.20, b, 12.5, WHITE, BOLD, ha="center")
-            text(x + card_w / 2, cy + broker_card_h - 0.58, f"平均 {s['avg_hold_days']:.1f} 天", 9.5, TEXT, FONT, ha="center")
-            ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.76, cy + 0.76], color=BORDER, linewidth=0.8)
+            # 無動作分點以較淡底色呈現，但仍與其他分點並排
+            card_fc = "#F8FAFC" if not s["has_action"] else WHITE
+            rounded(x, cy, card_w, broker_card_h, fc=card_fc, ec=NAVY2, lw=1.1, r=0.08)
+            rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
 
-            text(x + 0.13, cy + 0.54, "買超", 10.5, RED, BOLD)
-            text(x + 0.62, cy + 0.54, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 10.5, RED, BOLD)
+            # 字體比原本放大 2
+            text(x + card_w / 2, cy + broker_card_h - 0.21, b, 17, WHITE, BOLD, ha="center")
+            text(x + card_w / 2, cy + broker_card_h - 0.62, f"平均持有 {s['avg_hold_days']:.1f} 天", 13, TEXT, FONT, ha="center")
+            ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.80, cy + 0.80], color=BORDER, linewidth=0.8)
 
-            text(x + 0.13, cy + 0.27, "賣超", 10.5, GREEN, BOLD)
-            text(x + 0.62, cy + 0.27, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 10.5, GREEN, BOLD)
+            text(x + 0.10, cy + 0.58, "買超", 14, RED, BOLD)
+            text(x + 0.66, cy + 0.58, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 15, RED, BOLD)
+
+            text(x + 0.10, cy + 0.28, "賣方", 14, GREEN, BOLD)
+            text(x + 0.66, cy + 0.28, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 14, GREEN, BOLD)
 
     y -= broker_area_h
-
-    # 無動作分點縮小顯示
-    if inactive_brokers:
-        y -= gap
-        # 今日無動作分點：縮小成一行，避免標題與分點名稱中間空太大
-        rounded(margin_x, y - inactive_h, content_w, inactive_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點：", 13, NAVY, BOLD)
-        text(margin_x + 1.85, y - inactive_h / 2, "、".join(inactive_brokers), 13, TEXT, BOLD)
-        y -= inactive_h
-
     y -= gap
 
     # ─────────────────────────────────────────────
@@ -1043,471 +1036,28 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
         y = draw_table(f"{date_label} 今日賣超明細", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
 
-    # Event legend：改成與近一個月圖相同的橫條式說明
+    # Event legend
     y -= gap
-    legend_y = y - event_legend_h
-    rounded(margin_x, legend_y, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+    rounded(margin_x, y - event_legend_h, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+    text(margin_x + 0.25, y - 0.25, "事件代號說明", 14, NAVY, BOLD)
 
-    text(margin_x + 0.25, legend_y + event_legend_h / 2, "事件代號說明", 13.5, NAVY, BOLD)
+    legend_x = margin_x + 1.72
+    legend_y1 = y - 0.25
+    legend_y2 = y - 0.58
+    per_w = 5.10
 
-    legend_items = [
-        ("A", "單檔權證單日大買"),
-        ("B", "同標的單日合買"),
-        ("C", "同標的3日累積"),
-        ("D", "近10日累積淨買"),
-    ]
+    for idx, (code_name, desc) in enumerate(EVENT_LEGEND_ITEMS):
+        lx = legend_x + (idx % 2) * per_w
+        ly = legend_y1 if idx < 2 else legend_y2
+        # 事件代號屬於分類說明，不使用紅/綠，避免被誤解成買方或賣方訊號
+        badge_color = "#334155"
 
-    lx = margin_x + 2.00
-    for code_name, desc in legend_items:
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.40, legend_y + event_legend_h / 2, desc, 10.8, TEXT, FONT)
-        lx += 2.20 if code_name in {"A", "B"} else 1.98
+        rounded(lx, ly - 0.13, 0.34, 0.26, fc=badge_color, ec=badge_color, lw=0.8, r=0.08)
+        text(lx + 0.17, ly, code_name, 10.5, WHITE, BOLD, ha="center")
+        text(lx + 0.44, ly, desc, 11.5, TEXT, FONT)
 
     # footer
     y -= event_legend_h
-    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
-    plt.close(fig)
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 近一個月交易日｜五大分點共識買超 TOP10
-# ══════════════════════════════════════════════════════════════════════
-
-def get_buy_event_date(row, sheet_name: str) -> date | None:
-    """依事件工作表取得該筆買超事件日期。"""
-    if sheet_name == SHEET_A:
-        return parse_date_value(row.get("買進日"))
-    if sheet_name == SHEET_B:
-        return parse_date_value(row.get("事件日"))
-    if sheet_name in [SHEET_C, SHEET_D]:
-        return parse_date_value(row.get("結束日"))
-    return None
-
-
-def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
-    """依事件工作表取得該筆賣方事件日期。status = 減碼 / 出清"""
-    col = "減碼日" if status == "減碼" else "出清日"
-    return parse_date_value(row.get(col))
-
-
-def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> list[date]:
-    """
-    從 A/B/C/D 買超事件中抓出 <= target 的有效事件日期，
-    再往前取最近 N 個「有資料的交易日」。
-
-    這樣春節、連假、休市時不會因為日曆天不足而失真。
-    """
-    dates = set()
-
-    plans = [
-        (SHEET_A, ["分點", "買進日"]),
-        (SHEET_B, ["分點", "事件日"]),
-        (SHEET_C, ["分點", "結束日"]),
-        (SHEET_D, ["分點", "結束日"]),
-    ]
-
-    for sheet_name, cols in plans:
-        try:
-            df = read_gsheet_table(sheet_name, cols)
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            d = get_buy_event_date(r, sheet_name)
-            if d and d <= target:
-                dates.add(d)
-
-    return sorted(dates, reverse=True)[:lookback_days]
-
-
-def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
-    """
-    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP15。
-
-    統計來源：
-    - A_單檔大買：買進日 / 買進金額
-    - B_同標的單日合計：事件日 / 買超金額
-    - C_同標的3日累積：結束日 / 買超金額
-    - D_近10日累積淨買進：結束日 / 買超金額
-
-    合併方式：
-    - 同標的股合併
-    - 淨累積買超 = 合計買超 - 合計賣方金額
-    - 僅保留淨累積買超 > 0 的標的
-    - 依淨累積買超由大到小排序
-    """
-    trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
-    date_set = set(trading_dates)
-
-    if not trading_dates:
-        return [], []
-
-    agg = {}
-
-    def ensure_item(underlying):
-        code = normalize_underlying(underlying)
-        if not code:
-            return None, None
-
-        stock_name = get_stock_name_map().get(code, "")
-        label = f"{code} {stock_name}".strip()
-
-        if code not in agg:
-            agg[code] = {
-                "underlying": code,
-                "stock_name": stock_name,
-                "target": label,
-                "amount": 0.0,       # 合計買超
-                "net_amount": 0.0,   # 淨累積買超 = 買超 - 賣方
-                "count": 0,
-                "brokers": set(),
-                "events": set(),
-                "broker_amounts": defaultdict(float),
-                "broker_net_amounts": defaultdict(float),
-                "first_date": None,
-                "last_date": None,
-            }
-
-        return code, agg[code]
-
-    def add_buy_row(sheet_name, event_code, row, event_date, amount):
-        if not event_date or event_date not in date_set:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        amount = safe_float(amount)
-        if amount <= 0:
-            return
-
-        code, item = ensure_item(row.get("標的股"))
-        if not item:
-            return
-
-        item["amount"] += amount
-        item["net_amount"] += amount
-        item["count"] += 1
-        item["brokers"].add(broker)
-        item["events"].add(event_code)
-        item["broker_amounts"][broker] += amount
-        item["broker_net_amounts"][broker] += amount
-
-        if item["first_date"] is None or event_date < item["first_date"]:
-            item["first_date"] = event_date
-        if item["last_date"] is None or event_date > item["last_date"]:
-            item["last_date"] = event_date
-
-    def add_sell_row(row, event_date, amount):
-        if not event_date or event_date not in date_set:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        amount = safe_float(amount)
-        if amount <= 0:
-            return
-
-        code = normalize_underlying(row.get("標的股"))
-        if not code or code not in agg:
-            return
-
-        agg[code]["net_amount"] -= amount
-        agg[code]["broker_net_amounts"][broker] -= amount
-
-    # A：買超與賣方
-    try:
-        A = read_gsheet_table(
-            SHEET_A,
-            ["分點", "標的股", "買進日", "買進金額", "買進張數",
-             "減碼日", "減碼均價", "出清日", "出清均價", "權證名稱"]
-        )
-
-        for _, r in A.iterrows():
-            add_buy_row(SHEET_A, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
-
-        for _, r in A.iterrows():
-            d = get_sell_event_date(r, SHEET_A, "減碼")
-            if d and d in date_set:
-                sell_amount = safe_float(r.get("減碼均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
-                add_sell_row(r, d, sell_amount)
-
-            d = get_sell_event_date(r, SHEET_A, "出清")
-            if d and d in date_set:
-                sell_amount = safe_float(r.get("出清均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
-                add_sell_row(r, d, sell_amount)
-    except Exception:
-        pass
-
-    # B/C/D：買超與賣方
-    plans = [
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
-    ]
-
-    for sheet_name, event_code, date_col in plans:
-        try:
-            df = read_gsheet_table(
-                sheet_name,
-                ["分點", "標的股", date_col, "買超金額",
-                 "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
-            )
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            add_buy_row(sheet_name, event_code, r, parse_date_value(r.get(date_col)), r.get("買超金額"))
-
-        for _, r in df.iterrows():
-            d = get_sell_event_date(r, sheet_name, "減碼")
-            if d and d in date_set:
-                add_sell_row(r, d, r.get("減碼賣出金額"))
-
-            d = get_sell_event_date(r, sheet_name, "出清")
-            if d and d in date_set:
-                add_sell_row(r, d, r.get("出清賣出金額"))
-
-    rows = []
-    for item in agg.values():
-        # 共識淨買超榜只保留目前仍為正淨買超的標的
-        if item["net_amount"] <= 0:
-            continue
-
-        top_broker = ""
-        top_amount = 0.0
-        if item["broker_amounts"]:
-            top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
-
-        participant_brokers = [
-            (broker, amount)
-            for broker, amount in item["broker_net_amounts"].items()
-            if amount > 0
-        ]
-        participant_brokers.sort(key=lambda kv: kv[1], reverse=True)
-
-        rows.append({
-            "target": item["target"],
-            "amount": item["amount"],
-            "net_amount": item["net_amount"],
-            "count": item["count"],
-            "broker_count": len(participant_brokers) if participant_brokers else len(item["brokers"]),
-            "brokers": sorted(item["brokers"]),
-            "events": "/".join(sorted(item["events"])),
-            "top_broker": top_broker,
-            "top_broker_amount": top_amount,
-            "participant_brokers": participant_brokers,
-            "first_date": item["first_date"],
-            "last_date": item["last_date"],
-        })
-
-    rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
-    return rows[:15], trading_dates
-
-
-def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
-    """
-    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP15
-    """
-    rows, trading_dates = collect_consensus_buy_top10(target, lookback_days)
-    n = len(rows)
-
-    if trading_dates:
-        period_text = f"{min(trading_dates):%Y/%m/%d} ～ {max(trading_dates):%Y/%m/%d}"
-    else:
-        period_text = "無有效期間"
-
-    total_amount = sum(r["amount"] for r in rows)
-    total_net_amount = sum(r["net_amount"] for r in rows)
-
-    # 動態版面
-    fig_w = 13.0
-    margin_x = 0.40
-    content_w = fig_w - 2 * margin_x
-
-    top_h = 1.95
-    legend_h = 0.45
-    gap = 0.18
-    section_title_h = 0.55
-    header_h = 0.42
-    row_h = 0.50
-    footer_h = 0.45
-
-    table_h = section_title_h + header_h + max(1, n) * row_h
-
-    fig_h = top_h + legend_h + gap + table_h + footer_h
-    fig_h = max(fig_h, 7.6)
-
-    BG = "#F6F8FB"
-    WHITE = "#FFFFFF"
-    NAVY = "#061D3D"
-    NAVY2 = "#0B2E5B"
-    RED = "#D92323"
-    GREEN = "#16803C"
-    TEXT = "#111827"
-    MUTED = "#64748B"
-    BORDER = "#C9D5E3"
-    ROW_ALT = "#FAFCFF"
-    HEADER_BG = "#F3F7FC"
-    PINK = "#FFF2F2"
-
-    font_path = get_font_path(False)
-    bold_path = get_font_path(True)
-    FONT = font_manager.FontProperties(fname=font_path)
-    BOLD = font_manager.FontProperties(fname=bold_path)
-
-    plt.rcParams["axes.unicode_minus"] = False
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
-    ax.set_xlim(0, fig_w)
-    ax.set_ylim(0, fig_h)
-    ax.set_axis_off()
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
-        patch = patches.FancyBboxPatch(
-            (x, y), w, h,
-            boxstyle=f"round,pad=0,rounding_size={r}",
-            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z
-        )
-        ax.add_patch(patch)
-        return patch
-
-    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
-        patch = patches.Rectangle((x, y), w, h, linewidth=lw if ec else 0,
-                                  edgecolor=ec, facecolor=fc, zorder=z)
-        ax.add_patch(patch)
-        return patch
-
-    def text(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5):
-        ax.text(x, y, str(s), fontsize=size, color=color, fontproperties=fp or FONT,
-                ha=ha, va=va, zorder=z)
-
-    def fit(s, n_chars):
-        s = str(s)
-        return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
-
-    def fmt_participant_brokers(row, limit=5):
-        """
-        顯示所有參與分點的淨累積買超金額。
-        多數情況只有 1 家；若有多家共識買超，會完整列出。
-        """
-        items = row.get("participant_brokers", [])
-        if not items:
-            top_broker = row.get("top_broker", "")
-            top_amount = row.get("top_broker_amount", 0)
-            return fit(f"{top_broker} {fmt_wan(top_amount)}", 24)
-
-        shown = items[:limit]
-        text_items = [f"{broker} {fmt_wan(amount)}" for broker, amount in shown]
-        if len(items) > limit:
-            text_items.append(f"等{len(items)}家")
-        return fit("、".join(text_items), 30)
-
-    # 中央浮水印
-    try:
-        ax.text(
-            0.5, 0.50, CENTER_WATERMARK_TEXT,
-            transform=ax.transAxes,
-            ha="center", va="center",
-            fontsize=CENTER_WATERMARK_FONT_SIZE,
-            fontproperties=BOLD,
-            color="#2C3440",
-            alpha=CENTER_WATERMARK_ALPHA,
-            rotation=CENTER_WATERMARK_ROTATION,
-            linespacing=1.18,
-            zorder=50,
-        )
-    except Exception:
-        pass
-
-    # Header
-    y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP15", 28, NAVY, BOLD)
-    y -= 0.48
-    text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
-    y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
-
-    # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
-    y -= 0.28
-    legend_y = y - legend_h
-    rounded(margin_x, legend_y, content_w, legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-
-    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
-
-    legend_items = [
-        ("A", "單檔權證單日大買"),
-        ("B", "同標的單日合買"),
-        ("C", "同標的3日累積"),
-        ("D", "近10日累積淨買"),
-    ]
-
-    lx = margin_x + 3.40
-    for code_name, desc in legend_items:
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.40, legend_y + legend_h / 2, desc, 10.8, TEXT, FONT)
-        lx += 2.15 if code_name in {"A", "B"} else 1.95
-
-    y = legend_y - gap
-
-    # Table
-    table_top = y
-    rounded(margin_x, table_top - table_h, content_w, table_h, fc=WHITE, ec=NAVY, lw=1.2, r=0.08)
-    rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
-    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP15", 19, WHITE, BOLD)
-
-    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "參與分點"]
-    col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
-
-    header_y_top = table_top - section_title_h
-    rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
-
-    x = margin_x
-    for h, w in zip(headers, col_w):
-        text(x + w / 2, header_y_top - header_h / 2, h, 12, NAVY, BOLD, ha="center")
-        ax.plot([x, x], [table_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-        x += w
-    ax.plot([margin_x + content_w, margin_x + content_w], [table_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-
-    data_y = header_y_top - header_h
-    if not rows:
-        rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨累積買超為正的標的", 13, MUTED, BOLD, ha="center")
-    else:
-        for i, r in enumerate(rows):
-            ry = data_y - (i + 1) * row_h
-            rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
-
-            net_color = RED if r["net_amount"] > 0 else GREEN if r["net_amount"] < 0 else TEXT
-            values = [
-                str(i + 1),
-                fit(r["target"], 14),
-                fmt_wan(r["net_amount"]),
-                str(r["broker_count"]),
-                r["events"],
-                fmt_participant_brokers(r),
-            ]
-
-            colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
-            aligns = ["center", "left", "right", "center", "center", "left"]
-            bolds = [True, True, True, True, True, True]
-
-            x = margin_x
-            for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
-                px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
-                x += w
-
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1520,13 +1070,11 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 # ══════════════════════════════════════════════════════════════════════
 
 def send_to_discord(webhook_url: str, image_path: Path, target: date):
-    """
-    只上傳圖片到 Discord，不另外傳送文字內容。
-    """
+    content = f"📊 {target:%Y/%m/%d} 精選分點買賣超追蹤"
     with image_path.open("rb") as f:
         files = {"file": (image_path.name, f, "image/png")}
-        resp = requests.post(webhook_url, files=files, timeout=60)
-
+        data = {"content": content}
+        resp = requests.post(webhook_url, data=data, files=files, timeout=60)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Discord webhook 發送失敗：{resp.status_code} {resp.text}")
 
@@ -1544,7 +1092,6 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP15.png"
 
     history = read_history_stats_from_gsheet()
     buys, sells = extract_actions_from_gsheet(target)
@@ -1554,12 +1101,10 @@ def main():
         f"目標日期：{target:%Y-%m-%d}\n"
         f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
-        f"輸出圖檔1：{output_path}\n"
-        f"輸出圖檔2：{consensus_output_path}"
+        f"輸出圖檔：{output_path}"
     )
 
     draw_report_image(target, buys, sells, history, output_path)
-    draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
 
     if args.no_discord:
         print("已設定 --no-discord，只輸出圖片，不發送 Discord。")
@@ -1570,9 +1115,7 @@ def main():
         raise RuntimeError("找不到 DISCORD_WEBHOOK_URL_TEST，請先在 GitHub Secrets 設定。")
 
     send_to_discord(webhook_url, output_path, target)
-    send_to_discord(webhook_url, consensus_output_path, target)
-
-    print("Discord 已發送 2 張圖片。")
+    print("Discord 已發送。")
 
 
 if __name__ == "__main__":
