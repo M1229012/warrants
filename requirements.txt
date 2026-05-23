@@ -6,7 +6,5 @@ html5lib
 beautifulsoup4
 gspread
 google-auth
-pandas==2.2.3
-openpyxl==3.1.5
-Pillow==11.0.0
-requests==2.32.3
+Pillow
+
