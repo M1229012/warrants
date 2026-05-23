@@ -964,9 +964,10 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     # 無動作分點縮小顯示
     if inactive_brokers:
         y -= gap
+        # 今日無動作分點：縮小成一行，避免標題與分點名稱中間空太大
         rounded(margin_x, y - inactive_h, content_w, inactive_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點", 13, NAVY, BOLD)
-        text(margin_x + 2.35, y - inactive_h / 2, "、".join(inactive_brokers), 13, TEXT, BOLD)
+        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點：", 13, NAVY, BOLD)
+        text(margin_x + 1.55, y - inactive_h / 2, "、".join(inactive_brokers), 13, TEXT, BOLD)
         y -= inactive_h
 
     y -= gap
