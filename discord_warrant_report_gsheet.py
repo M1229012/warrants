@@ -1123,7 +1123,7 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
 
 def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
     """
-    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識買超 TOP10。
+    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP10。
 
     統計來源：
     - A_單檔大買：買進日 / 買進金額
@@ -1131,9 +1131,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     - C_同標的3日累積：結束日 / 買超金額
     - D_近10日累積淨買進：結束日 / 買超金額
 
-    顯示欄位：
-    - 合計買超：近一個月交易日內，同標的合計買超金額
-    - 淨累積買超：近一個月交易日內，同標的合計買超 - 合計賣方金額
+    合併方式：
+    - 同標的股合併
+    - 淨累積買超 = 合計買超 - 合計賣方金額
+    - 僅保留淨累積買超 > 0 的標的
+    - 依淨累積買超由大到小排序
     """
     trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
     date_set = set(trading_dates)
@@ -1156,8 +1158,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 "underlying": code,
                 "stock_name": stock_name,
                 "target": label,
-                "amount": 0.0,       # 累積買超
-                "net_amount": 0.0,   # 買超 - 賣方
+                "amount": 0.0,       # 合計買超
+                "net_amount": 0.0,   # 淨累積買超 = 買超 - 賣方
                 "count": 0,
                 "brokers": set(),
                 "events": set(),
@@ -1218,8 +1220,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     try:
         A = read_gsheet_table(
             SHEET_A,
-            ["分點", "標的股", "買進日", "買進金額", "買進張數", "減碼日", "減碼均價", "出清日", "出清均價", "權證名稱"]
+            ["分點", "標的股", "買進日", "買進金額", "買進張數",
+             "減碼日", "減碼均價", "出清日", "出清均價", "權證名稱"]
         )
+
         for _, r in A.iterrows():
             add_buy_row(SHEET_A, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
 
@@ -1247,7 +1251,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         try:
             df = read_gsheet_table(
                 sheet_name,
-                ["分點", "標的股", date_col, "買超金額", "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
+                ["分點", "標的股", date_col, "買超金額",
+                 "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
             )
         except Exception:
             continue
@@ -1266,6 +1271,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
     rows = []
     for item in agg.values():
+        # 共識淨買超榜只保留目前仍為正淨買超的標的
+        if item["net_amount"] <= 0:
+            continue
+
         top_broker = ""
         top_amount = 0.0
         if item["broker_amounts"]:
@@ -1285,13 +1294,13 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             "last_date": item["last_date"],
         })
 
-    rows.sort(key=lambda x: (x["amount"], x["net_amount"], x["broker_count"]), reverse=True)
+    rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
     return rows[:10], trading_dates
 
 
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
     """
-    第二張圖：近一個月交易日｜五大分點共識買超 TOP10
+    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP10
     """
     rows, trading_dates = collect_consensus_buy_top10(target, lookback_days)
     n = len(rows)
@@ -1389,7 +1398,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識買超 TOP10", 28, NAVY, BOLD)
+    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP10", 28, NAVY, BOLD)
     y -= 0.35
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.28
@@ -1421,7 +1430,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     table_top = y
     rounded(margin_x, table_top - table_h, content_w, table_h, fc=WHITE, ec=NAVY, lw=1.2, r=0.08)
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
-    text(margin_x + 0.30, table_top - section_title_h / 2, "共識買超 TOP10", 19, WHITE, BOLD)
+    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP10", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "合計買超", "淨累積買超", "分點數", "事件", "主力分點"]
     col_w = [0.70, 2.10, 1.80, 1.95, 0.95, 1.10, 3.60]
@@ -1439,7 +1448,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     data_y = header_y_top - header_h
     if not rows:
         rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有可統計的買超資料", 13, MUTED, BOLD, ha="center")
+        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨累積買超為正的標的", 13, MUTED, BOLD, ha="center")
     else:
         for i, r in enumerate(rows):
             ry = data_y - (i + 1) * row_h
@@ -1500,7 +1509,7 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識買超TOP10.png"
+    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP10.png"
 
     history = read_history_stats_from_gsheet()
     buys, sells = extract_actions_from_gsheet(target)
@@ -1536,7 +1545,7 @@ def main():
         webhook_url,
         consensus_output_path,
         target,
-        content_text=f"📊 {target:%Y/%m/%d} 近一個月交易日｜五大分點共識買超 TOP10"
+        content_text=f"📊 {target:%Y/%m/%d} 近一個月交易日｜五大分點共識淨買超 TOP10"
     )
 
     print("Discord 已發送 2 張圖片。")
