@@ -1164,6 +1164,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 "brokers": set(),
                 "events": set(),
                 "broker_amounts": defaultdict(float),
+                "broker_net_amounts": defaultdict(float),
                 "first_date": None,
                 "last_date": None,
             }
@@ -1192,6 +1193,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         item["brokers"].add(broker)
         item["events"].add(event_code)
         item["broker_amounts"][broker] += amount
+        item["broker_net_amounts"][broker] += amount
 
         if item["first_date"] is None or event_date < item["first_date"]:
             item["first_date"] = event_date
@@ -1215,6 +1217,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             return
 
         agg[code]["net_amount"] -= amount
+        agg[code]["broker_net_amounts"][broker] -= amount
 
     # A：買超與賣方
     try:
@@ -1280,16 +1283,24 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if item["broker_amounts"]:
             top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
 
+        participant_brokers = [
+            (broker, amount)
+            for broker, amount in item["broker_net_amounts"].items()
+            if amount > 0
+        ]
+        participant_brokers.sort(key=lambda kv: kv[1], reverse=True)
+
         rows.append({
             "target": item["target"],
             "amount": item["amount"],
             "net_amount": item["net_amount"],
             "count": item["count"],
-            "broker_count": len(item["brokers"]),
+            "broker_count": len(participant_brokers) if participant_brokers else len(item["brokers"]),
             "brokers": sorted(item["brokers"]),
             "events": "/".join(sorted(item["events"])),
             "top_broker": top_broker,
             "top_broker_amount": top_amount,
+            "participant_brokers": participant_brokers,
             "first_date": item["first_date"],
             "last_date": item["last_date"],
         })
@@ -1379,6 +1390,23 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
+    def fmt_participant_brokers(row, limit=5):
+        """
+        顯示所有參與分點的淨累積買超金額。
+        多數情況只有 1 家；若有多家共識買超，會完整列出。
+        """
+        items = row.get("participant_brokers", [])
+        if not items:
+            top_broker = row.get("top_broker", "")
+            top_amount = row.get("top_broker_amount", 0)
+            return fit(f"{top_broker} {fmt_wan(top_amount)}", 24)
+
+        shown = items[:limit]
+        text_items = [f"{broker} {fmt_wan(amount)}" for broker, amount in shown]
+        if len(items) > limit:
+            text_items.append(f"等{len(items)}家")
+        return fit("、".join(text_items), 30)
+
     # 中央浮水印
     try:
         ax.text(
@@ -1414,15 +1442,16 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     kpis = [
         ("TOP10淨累積買超", fmt_wan(total_net_amount), RED if total_net_amount >= 0 else GREEN),
-        ("統計期間", f"{len(trading_dates)} 個交易日", NAVY2),
-        ("追蹤分點", f"{len(TRACKED_BROKERS)} 家", NAVY2),
+        ("A / B", "單檔大買／同標的單日合買", NAVY2),
+        ("C / D", "3日累積／近10日淨買", NAVY2),
     ]
 
     for i, (title, val, color) in enumerate(kpis):
         x = margin_x + i * (kpi_w + kpi_gap)
         rounded(x, kpi_y, kpi_w, kpi_h, fc=PINK if i == 0 else WHITE, ec=color, lw=1.2, r=0.09)
         text(x + 0.25, kpi_y + 0.78, title, 15, TEXT, BOLD)
-        text(x + 0.25, kpi_y + 0.34, val, 21 if i < 2 else 19, color, BOLD)
+        value_size = 21 if i == 0 else 14
+        text(x + 0.25, kpi_y + 0.34, val, value_size, color, BOLD)
 
     y = kpi_y - gap
 
@@ -1432,8 +1461,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP10", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "主力分點"]
-    col_w = [0.70, 2.35, 2.20, 1.00, 1.20, 4.75]
+    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "參與分點"]
+    col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -1461,7 +1490,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
-                fit(f'{r["top_broker"]} {fmt_wan(r["top_broker_amount"])}', 22),
+                fmt_participant_brokers(r),
             ]
 
             colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
