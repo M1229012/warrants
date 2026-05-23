@@ -508,7 +508,7 @@ def read_history_stats_from_gsheet() -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_name: str,
-               amount: float, qty: int, sheet_name: str):
+               amount: float, qty: int, sheet_name: str, warrant_code: str = ""):
     if amount < BUY_THRESHOLD:
         return
 
@@ -520,6 +520,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
         "event": event,
         "underlying": underlying_code,
         "stock_name": stock_name,
+        "warrant_code": normalize_code(warrant_code),
         "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
@@ -556,7 +557,7 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
 
     # A：單檔權證大買
     a_cols = [
-        "事件類型", "分點", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
+        "事件類型", "分點", "權證代碼", "權證代號", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
         "減碼日", "減碼均價", "減碼獲利%", "出清日", "出清均價", "出清獲利%"
     ]
     A = read_gsheet_table(SHEET_A, a_cols)
@@ -568,7 +569,8 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
         if parse_date_value(r.get("買進日")) == target:
             append_buy(
                 buys, broker, event, r.get("標的股"), r.get("權證名稱"),
-                safe_float(r.get("買進金額")), safe_int(r.get("買進張數")), SHEET_A
+                safe_float(r.get("買進金額")), safe_int(r.get("買進張數")), SHEET_A,
+                r.get("權證代碼") or r.get("權證代號")
             )
 
         if parse_date_value(r.get("減碼日")) == target:
@@ -700,8 +702,12 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             display_target = target_label if target_label else f"{underlying}"
             content = f"{event}｜{warrant_count} 筆權證事件" if kind == "sell" else f"{warrant_count} 檔權證"
         else:
-            display_target = target_label if target_label else (underlying if underlying else items[0].get("warrant", ""))
-            content = items[0].get("warrant", "") or f"{warrant_count} 檔權證"
+            warrant_code = items[0].get("warrant_code", "")
+            warrant_name = items[0].get("warrant", "")
+            warrant_label = f"{warrant_code} {warrant_name}".strip() if warrant_code else warrant_name
+
+            display_target = target_label if target_label else (underlying if underlying else warrant_label)
+            content = warrant_label or f"{warrant_count} 檔權證"
             if kind == "sell" and event:
                 content = f"{event}｜{content}"
 
