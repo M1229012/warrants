@@ -938,11 +938,11 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     y = kpi_y - gap
 
     # ─────────────────────────────────────────────
-    # Broker cards：依 active_brokers 自動換行
+    # Broker cards：五個分點盡量同一排並排，讓當日買超 / 賣方狀態更好比較
     # ─────────────────────────────────────────────
     if active_brokers:
-        cards_per_row = 3
-        card_gap = 0.25
+        cards_per_row = 5
+        card_gap = 0.12
         card_w = (content_w - (cards_per_row - 1) * card_gap) / cards_per_row
         for idx, b in enumerate(active_brokers):
             row = idx // cards_per_row
@@ -951,14 +951,18 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             cy = y - row * (broker_card_h + gap) - broker_card_h
             s = broker_summary[b]
             rounded(x, cy, card_w, broker_card_h, fc=WHITE, ec=NAVY2, lw=1.1, r=0.08)
-            rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
-            text(x + card_w / 2, cy + broker_card_h - 0.21, b, 15, WHITE, BOLD, ha="center")
-            text(x + card_w / 2, cy + broker_card_h - 0.62, f"平均持有 {s['avg_hold_days']:.1f} 天", 11, TEXT, FONT, ha="center")
-            ax.plot([x + 0.18, x + card_w - 0.18], [cy + 0.80, cy + 0.80], color=BORDER, linewidth=0.8)
-            text(x + 0.18, cy + 0.58, "買超", 12, RED, BOLD)
-            text(x + 0.88, cy + 0.58, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 13, RED, BOLD)
-            text(x + 0.18, cy + 0.28, "賣方", 12, GREEN, BOLD)
-            text(x + 0.88, cy + 0.28, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 12, GREEN, BOLD)
+            rect(x, cy + broker_card_h - 0.40, card_w, 0.40, fc=NAVY)
+
+            # 五欄並排後寬度較窄，字體微縮避免爆版
+            text(x + card_w / 2, cy + broker_card_h - 0.20, b, 12.5, WHITE, BOLD, ha="center")
+            text(x + card_w / 2, cy + broker_card_h - 0.58, f"平均 {s['avg_hold_days']:.1f} 天", 9.5, TEXT, FONT, ha="center")
+            ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.76, cy + 0.76], color=BORDER, linewidth=0.8)
+
+            text(x + 0.13, cy + 0.54, "買超", 10.5, RED, BOLD)
+            text(x + 0.62, cy + 0.54, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 10.5, RED, BOLD)
+
+            text(x + 0.13, cy + 0.27, "賣超", 10.5, GREEN, BOLD)
+            text(x + 0.62, cy + 0.27, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 10.5, GREEN, BOLD)
 
     y -= broker_area_h
 
