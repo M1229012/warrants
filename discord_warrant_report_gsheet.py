@@ -33,6 +33,12 @@ import requests
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib import font_manager
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 基本設定
@@ -503,6 +509,13 @@ def make_font(size, bold=False):
 
 
 def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
+    """
+    Matplotlib 動態版面引擎：
+    - 不固定圖片高度
+    - 不固定表格高度
+    - 高度完全依照：有動作分點數、無動作分點列、買超筆數、賣方筆數自動增加
+    - 邏輯參考處置股圖卡的 get_base_layout / setup_canvas 概念
+    """
     buys = compress_actions(buys_raw, "buy")
     sells = compress_actions(sells_raw, "sell")
 
@@ -526,186 +539,259 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     active_brokers = [b for b in TRACKED_BROKERS if broker_summary[b]["has_action"]]
     inactive_brokers = [b for b in TRACKED_BROKERS if not broker_summary[b]["has_action"]]
 
-    W, H = 1200, 1500
-    img = Image.new("RGB", (W, H), "#F7F9FC")
-    draw = ImageDraw.Draw(img)
+    # ─────────────────────────────────────────────
+    # 動態版面參數：整體高度由資料量計算，不寫死
+    # ─────────────────────────────────────────────
+    fig_w = 13.0
+    margin_x = 0.40
+    content_w = fig_w - 2 * margin_x
 
-    NAVY = "#071E41"
+    top_h = 1.55
+    kpi_h = 1.25
+    gap = 0.18
+
+    active_rows = max(1, math.ceil(len(active_brokers) / 3)) if active_brokers else 0
+    broker_card_h = 1.55
+    broker_area_h = active_rows * broker_card_h + max(0, active_rows - 1) * gap
+
+    inactive_h = 0.58 if inactive_brokers else 0.0
+
+    section_title_h = 0.55
+    header_h = 0.42
+    row_h = 0.48
+
+    buy_rows = buys
+    sell_rows = sells
+
+    buy_table_h = section_title_h + header_h + max(1, len(buy_rows)) * row_h
+    sell_table_h = 0.0
+    if sell_rows:
+        sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
+
+    bottom_note_h = 0.75
+    footer_h = 0.35
+
+    fig_h = (
+        top_h
+        + kpi_h
+        + gap
+        + broker_area_h
+        + (gap + inactive_h if inactive_brokers else 0)
+        + gap
+        + buy_table_h
+        + (gap + sell_table_h if sell_rows else 0)
+        + gap
+        + bottom_note_h
+        + footer_h
+    )
+
+    # 避免資料太少時圖片過扁
+    fig_h = max(fig_h, 9.5)
+
+    # ─────────────────────────────────────────────
+    # 顏色與字型
+    # ─────────────────────────────────────────────
+    BG = "#F6F8FB"
+    WHITE = "#FFFFFF"
+    NAVY = "#061D3D"
     NAVY2 = "#0B2E5B"
-    RED = "#D61F1F"
+    RED = "#D92323"
     GREEN = "#0B7A32"
     TEXT = "#111827"
     MUTED = "#64748B"
-    BORDER = "#CBD5E1"
-    WHITE = "#FFFFFF"
-    PINK = "#FFF1F1"
+    BORDER = "#C9D5E3"
+    ROW_ALT = "#FAFCFF"
+    HEADER_BG = "#F3F7FC"
+    PINK = "#FFF2F2"
     MINT = "#EFFAF2"
 
-    def F(size, bold=False):
-        return make_font(size, bold)
+    font_path = get_font_path(False)
+    bold_path = get_font_path(True)
+    FONT = font_manager.FontProperties(fname=font_path)
+    BOLD = font_manager.FontProperties(fname=bold_path)
 
-    def rounded_rect(x1, y1, x2, y2, r=18, fill=WHITE, outline=BORDER, width=2):
-        draw.rounded_rectangle([x1, y1, x2, y2], radius=r, fill=fill, outline=outline, width=width)
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
+    ax.set_xlim(0, fig_w)
+    ax.set_ylim(0, fig_h)
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
-    def rect(x1, y1, x2, y2, fill, outline=None, width=1):
-        draw.rectangle([x1, y1, x2, y2], fill=fill, outline=outline, width=width)
+    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
+        patch = patches.FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle=f"round,pad=0,rounding_size={r}",
+            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z
+        )
+        ax.add_patch(patch)
+        return patch
 
-    def center_text(text, x1, y1, x2, y2, font, fill=TEXT):
-        bbox = draw.textbbox((0, 0), str(text), font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((x1 + (x2 - x1 - tw) / 2, y1 + (y2 - y1 - th) / 2 - 2), str(text), font=font, fill=fill)
+    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
+        patch = patches.Rectangle((x, y), w, h, linewidth=lw if ec else 0,
+                                  edgecolor=ec, facecolor=fc, zorder=z)
+        ax.add_patch(patch)
+        return patch
 
-    def fit_text(text, max_chars):
-        text = str(text)
-        return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+    def text(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5, weight=None):
+        ax.text(x, y, str(s), fontsize=size, color=color, fontproperties=fp or FONT,
+                ha=ha, va=va, zorder=z)
+
+    def fit(s, n):
+        s = str(s)
+        return s if len(s) <= n else s[:n - 1] + "…"
 
     date_label = f"{target.month}/{target.day}"
-    draw.text((50, 28), f"{date_label} 精選分點買賣超追蹤", font=F(58, True), fill=NAVY)
-    draw.text((55, 104), f"精選 5 家分點｜只看 {target:%Y/%m/%d} 當日動作", font=F(28, True), fill=NAVY2)
-    draw.text((55, 148), "紅色＝買超　綠色＝賣方提醒　單位：萬元", font=F(22, True), fill=TEXT)
 
+    # ─────────────────────────────────────────────
+    # Header
+    # ─────────────────────────────────────────────
+    y = fig_h - 0.45
+    text(margin_x + 0.15, y, f"{date_label} 精選分點買賣超追蹤", 31, NAVY, BOLD)
+    y -= 0.42
+    text(margin_x + 0.18, y, f"精選 5 家分點｜只看 {target:%Y/%m/%d} 當日動作", 17, NAVY2, BOLD)
+    y -= 0.32
+    text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣方提醒　單位：萬元", 13, TEXT, BOLD)
+
+    # ─────────────────────────────────────────────
+    # KPI cards
+    # ─────────────────────────────────────────────
+    y -= 0.25
+    kpi_y = y - kpi_h
+    kpi_gap = 0.30
+    kpi_w = (content_w - 2 * kpi_gap) / 3
     kpis = [
-        ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK),
-        ("賣方提醒", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT),
-        ("淨買超", "", fmt_wan(net), RED if net >= 0 else GREEN, PINK if net >= 0 else MINT),
+        ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK, "↗"),
+        ("賣方提醒", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
+        ("淨買超", "", fmt_wan(net), RED if net >= 0 else GREEN, PINK if net >= 0 else MINT, "◎"),
     ]
-
-    x0, y0 = 40, 205
-    card_w, card_h, gap = 350, 145, 25
-    for i, (title, mid, val, color, bg) in enumerate(kpis):
-        x = x0 + i * (card_w + gap)
-        rounded_rect(x, y0, x + card_w, y0 + card_h, 18, fill=bg, outline=color, width=2)
-        draw.ellipse([x + 24, y0 + 34, x + 86, y0 + 96], fill=color)
-        icon = "↗" if title == "今日買超" else "−" if title == "賣方提醒" else "◎"
-        center_text(icon, x + 24, y0 + 34, x + 86, y0 + 96, F(38, True), WHITE)
-        draw.text((x + 110, y0 + 28), title, font=F(27, True), fill=TEXT)
+    for i, (title, mid, val, color, bg, icon) in enumerate(kpis):
+        x = margin_x + i * (kpi_w + kpi_gap)
+        rounded(x, kpi_y, kpi_w, kpi_h, fc=bg, ec=color, lw=1.3, r=0.09)
+        circle = patches.Circle((x + 0.48, kpi_y + kpi_h / 2), radius=0.28, facecolor=color, edgecolor=color, zorder=3)
+        ax.add_patch(circle)
+        text(x + 0.48, kpi_y + kpi_h / 2, icon, 22, WHITE, BOLD, ha="center")
+        text(x + 0.88, kpi_y + 0.86, title, 16, TEXT, BOLD)
         if mid:
-            draw.text((x + 110, y0 + 65), mid, font=F(26, True), fill=color)
-            draw.text((x + 110, y0 + 102), val, font=F(31, True), fill=color)
+            text(x + 0.88, kpi_y + 0.54, mid, 15, color, BOLD)
+            text(x + 0.88, kpi_y + 0.23, val, 18, color, BOLD)
         else:
-            draw.text((x + 110, y0 + 76), val, font=F(34, True), fill=color)
+            text(x + 0.88, kpi_y + 0.42, val, 20, color, BOLD)
 
-    # 有動作分點卡；無動作分點縮小
-    y = 380
-    max_cards = min(len(active_brokers), 4)
-    card_gap = 22
-    card_w2 = int((1120 - card_gap * (max_cards - 1)) / max_cards) if max_cards else 270
-    card_h2 = 215
+    y = kpi_y - gap
 
-    for i, b in enumerate(active_brokers[:4]):
-        bx = 40 + i * (card_w2 + card_gap)
-        s = broker_summary[b]
-        rounded_rect(bx, y, bx + card_w2, y + card_h2, 16, fill=WHITE, outline=NAVY2, width=2)
-        rect(bx, y, bx + card_w2, y + 50, fill=NAVY, outline=NAVY)
-        center_text(b, bx, y, bx + card_w2, y + 50, F(24, True), WHITE)
-        center_text(f"平均持有 {s['avg_hold_days']:.1f} 天", bx, y + 58, bx + card_w2, y + 90, F(19), TEXT)
-        draw.line([bx + 18, y + 98, bx + card_w2 - 18, y + 98], fill=BORDER, width=1)
+    # ─────────────────────────────────────────────
+    # Broker cards：依 active_brokers 自動換行
+    # ─────────────────────────────────────────────
+    if active_brokers:
+        cards_per_row = 3
+        card_gap = 0.25
+        card_w = (content_w - (cards_per_row - 1) * card_gap) / cards_per_row
+        for idx, b in enumerate(active_brokers):
+            row = idx // cards_per_row
+            col = idx % cards_per_row
+            x = margin_x + col * (card_w + card_gap)
+            cy = y - row * (broker_card_h + gap) - broker_card_h
+            s = broker_summary[b]
+            rounded(x, cy, card_w, broker_card_h, fc=WHITE, ec=NAVY2, lw=1.1, r=0.08)
+            rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
+            text(x + card_w / 2, cy + broker_card_h - 0.21, b, 15, WHITE, BOLD, ha="center")
+            text(x + card_w / 2, cy + broker_card_h - 0.62, f"平均持有 {s['avg_hold_days']:.1f} 天", 11, TEXT, FONT, ha="center")
+            ax.plot([x + 0.18, x + card_w - 0.18], [cy + 0.80, cy + 0.80], color=BORDER, linewidth=0.8)
+            text(x + 0.18, cy + 0.58, "買超", 12, RED, BOLD)
+            text(x + 0.88, cy + 0.58, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 13, RED, BOLD)
+            text(x + 0.18, cy + 0.28, "賣方", 12, GREEN, BOLD)
+            text(x + 0.88, cy + 0.28, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 12, GREEN, BOLD)
 
-        draw.text((bx + 18, y + 112), "買超", font=F(20, True), fill=RED)
-        draw.text((bx + 18, y + 142), f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", font=F(21, True), fill=RED)
-        draw.line([bx + 18, y + 174, bx + card_w2 - 18, y + 174], fill=BORDER, width=1)
-        draw.text((bx + 18, y + 187), f"賣方：{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", font=F(18, True), fill=GREEN)
+    y -= broker_area_h
 
-    # 今日無動作分點固定放在有動作分點卡片下方。
-    # 原本 active_brokers = 3 時，會嘗試把無動作區塊塞到右側剩餘空間，
-    # 但三張卡片已接近滿版，剩餘寬度可能變成負數，造成 PIL rounded_rectangle 報錯。
-    inactive_box_bottom = y + card_h2
+    # 無動作分點縮小顯示
     if inactive_brokers:
-        ix, iy, iw, ih = 40, y + card_h2 + 16, 1120, 90
-        inactive_box_bottom = iy + ih
+        y -= gap
+        rounded(margin_x, y - inactive_h, content_w, inactive_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點", 13, NAVY, BOLD)
+        text(margin_x + 2.35, y - inactive_h / 2, "、".join(inactive_brokers), 13, TEXT, BOLD)
+        y -= inactive_h
 
-        rounded_rect(ix, iy, ix + iw, iy + ih, 16, fill=WHITE, outline=BORDER, width=2)
-        title_y = iy + 20
-        draw.text((ix + 24, title_y), "今日無動作分點", font=F(23, True), fill=NAVY)
-        inactive_text = "、".join(inactive_brokers)
-        draw.text((ix + 24, title_y + 42), inactive_text, font=F(20, True), fill=TEXT)
+    y -= gap
 
-    table_y = inactive_box_bottom + 25
-    table_x, table_w = 40, 1120
-    sells_exist = len(sells) > 0
-    buy_table_h = 430 if sells_exist else 560
+    # ─────────────────────────────────────────────
+    # 通用表格繪製
+    # ─────────────────────────────────────────────
+    def draw_table(title, rows, headers, col_widths, row_builder, title_color, amount_color, y_top):
+        table_h = section_title_h + header_h + max(1, len(rows)) * row_h
+        rounded(margin_x, y_top - table_h, content_w, table_h, fc=WHITE, ec=title_color, lw=1.2, r=0.08)
+        rect(margin_x, y_top - section_title_h, content_w, section_title_h, fc=title_color)
+        text(margin_x + 0.30, y_top - section_title_h / 2, title, 19, WHITE, BOLD)
 
-    rounded_rect(table_x, table_y, table_x + table_w, table_y + buy_table_h, 16, fill=WHITE, outline=NAVY2, width=2)
-    rect(table_x, table_y, table_x + table_w, table_y + 60, fill=NAVY, outline=NAVY)
-    draw.text((table_x + 28, table_y + 12), f"{date_label} 今日買超明細", font=F(33, True), fill=WHITE)
+        header_y_top = y_top - section_title_h
+        rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
+        x = margin_x
+        for h, w in zip(headers, col_widths):
+            text(x + w / 2, header_y_top - header_h / 2, h, 12, NAVY, BOLD, ha="center")
+            ax.plot([x, x], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
+            x += w
+        ax.plot([margin_x + content_w, margin_x + content_w], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
 
-    headers = ["排名", "分點", "事件", "標的 / 權證", "內容", "買超金額"]
-    cols = [70, 210, 90, 250, 275, 225]
-    hy = table_y + 60
-    rect(table_x, hy, table_x + table_w, hy + 48, fill="#F3F7FC", outline=BORDER)
-    cx = table_x
-    for h, wid in zip(headers, cols):
-        center_text(h, cx, hy, cx + wid, hy + 48, F(20, True), NAVY)
-        cx += wid
-        draw.line([cx, hy, cx, table_y + buy_table_h], fill=BORDER, width=1)
+        data_y = header_y_top - header_h
+        if not rows:
+            rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
+            text(margin_x + content_w / 2, data_y - row_h / 2, "今日沒有達顯示條件的資料", 13, MUTED, BOLD, ha="center")
+        else:
+            for i, r in enumerate(rows):
+                ry = data_y - (i + 1) * row_h
+                rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
+                values, colors, aligns, bolds = row_builder(i, r)
+                x = margin_x
+                for val, w, c, a, is_bold in zip(values, col_widths, colors, aligns, bolds):
+                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
+                    text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 12, c, BOLD if is_bold else FONT, ha=a)
+                    x += w
+        return y_top - table_h
 
-    max_buy_rows = 6 if sells_exist else 8
-    row_h = 56
-    ry = hy + 48
-    for idx, r in enumerate(buys[:max_buy_rows], 1):
-        rect(table_x, ry, table_x + table_w, ry + row_h, fill=WHITE if idx % 2 else "#FAFCFF", outline=BORDER)
-        values = [
-            str(idx),
-            r["broker"],
-            r["event"],
-            fit_text(r["target"], 12),
-            fit_text(r["content"], 16),
-            fmt_wan(r["amount"]),
-        ]
-        cx = table_x
-        for j, (txt, wid) in enumerate(zip(values, cols)):
-            if j in [0, 2]:
-                center_text(txt, cx, ry, cx + wid, ry + row_h, F(20, True), RED if j == 2 else TEXT)
-            elif j == 5:
-                center_text(txt, cx, ry, cx + wid, ry + row_h, F(22, True), RED)
-            else:
-                draw.text((cx + 12, ry + 14), txt, font=F(19, True if j in [1, 3] else False), fill=TEXT)
-            cx += wid
-        ry += row_h
+    # Buy table
+    buy_headers = ["排名", "分點", "事件", "標的 / 權證", "內容", "買超金額"]
+    buy_col_w = [0.75, 2.25, 0.90, 2.55, 3.05, 2.50]
 
-    sell_y = table_y + buy_table_h + 25
-    if sells_exist:
-        sell_h = 255
-        rounded_rect(table_x, sell_y, table_x + table_w, sell_y + sell_h, 16, fill=WHITE, outline=GREEN, width=2)
-        rect(table_x, sell_y, table_x + table_w, sell_y + 58, fill=GREEN, outline=GREEN)
-        draw.text((table_x + 28, sell_y + 12), f"{date_label} 賣方提醒", font=F(31, True), fill=WHITE)
+    def buy_builder(i, r):
+        return (
+            [str(i + 1), r["broker"], r["event"], r["target"], r["content"], fmt_wan(r["amount"])],
+            [TEXT, TEXT, RED, TEXT, TEXT, RED],
+            ["center", "left", "center", "left", "left", "right"],
+            [True, True, True, True, False, True],
+        )
 
-        headers2 = ["分點", "狀態", "標的 / 權證", "內容", "賣方金額"]
-        cols2 = [220, 120, 330, 280, 170]
-        hy2 = sell_y + 58
-        rect(table_x, hy2, table_x + table_w, hy2 + 42, fill="#F3F7FC", outline=BORDER)
-        cx = table_x
-        for h, wid in zip(headers2, cols2):
-            center_text(h, cx, hy2, cx + wid, hy2 + 42, F(19, True), NAVY)
-            cx += wid
-            draw.line([cx, hy2, cx, sell_y + sell_h], fill=BORDER, width=1)
+    y = draw_table(f"{date_label} 今日買超明細", buy_rows, buy_headers, buy_col_w, buy_builder, NAVY, RED, y)
 
-        ry = hy2 + 42
-        for r in sells[:3]:
-            rect(table_x, ry, table_x + table_w, ry + 49, fill=WHITE, outline=BORDER)
-            values = [r["broker"], r["status"], fit_text(r["target"], 18), fit_text(r["content"], 18), fmt_wan(r["amount"])]
-            cx = table_x
-            for j, (txt, wid) in enumerate(zip(values, cols2)):
-                if j == 1:
-                    center_text(txt, cx, ry, cx + wid, ry + 49, F(20, True), GREEN)
-                elif j == 4:
-                    center_text(txt, cx, ry, cx + wid, ry + 49, F(21, True), GREEN)
-                else:
-                    draw.text((cx + 12, ry + 13), txt, font=F(18, True if j == 0 else False), fill=TEXT)
-                cx += wid
-            ry += 49
+    # Sell table
+    if sell_rows:
+        y -= gap
+        sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "賣方金額"]
+        sell_col_w = [2.35, 1.20, 3.10, 3.20, 2.15]
 
-    by = 1390
-    rounded_rect(40, by, 1160, 1460, 16, fill=WHITE, outline=NAVY2, width=2)
-    draw.text((65, by + 16), "今日重點", font=F(24, True), fill=NAVY)
+        def sell_builder(i, r):
+            return (
+                [r["broker"], r["status"], r["target"], r["content"], fmt_wan(r["amount"])],
+                [TEXT, GREEN, TEXT, TEXT, GREEN],
+                ["left", "center", "left", "left", "right"],
+                [True, True, True, False, True],
+            )
 
+        y = draw_table(f"{date_label} 賣方提醒", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
+
+    # Bottom note
+    y -= gap
+    rounded(margin_x, y - bottom_note_h, content_w, bottom_note_h, fc=WHITE, ec=NAVY2, lw=1.0, r=0.08)
+    text(margin_x + 0.25, y - bottom_note_h / 2, "今日重點", 15, NAVY, BOLD)
     top_broker = max(TRACKED_BROKERS, key=lambda b: broker_summary[b]["buy_amount"]) if buys else "無"
     note = f"{top_broker} 為當日主要買超分點；無動作分點縮小顯示，主圖只保留主要買賣超。"
-    draw.text((205, by + 16), note, font=F(22), fill=TEXT)
-    draw.text((455, 1470), "本圖為籌碼追蹤整理，不構成投資建議。", font=F(18), fill=MUTED)
+    text(margin_x + 1.70, y - bottom_note_h / 2, note, 13, TEXT, FONT)
+
+    # footer
+    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(output_path, quality=95)
+    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
+    plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════
