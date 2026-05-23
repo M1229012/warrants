@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日精選分點買賣超追蹤圖卡
-- 買超：紅色
-- 賣方提醒：綠色
-- 只追蹤指定 5 家分點
-- 買超門檻預設 100 萬
-- 賣方顯示門檻預設為買超門檻的 20%，也就是 20 萬
-- 圖卡不公開內部門檻，只呈現主要買賣動作
-- 產生 PNG 並送到 DISCORD_WEBHOOK_URL_TEST
+每日精選分點買賣超追蹤圖卡｜Google Sheet 讀取版
+
+用途：
+- 直接讀取 Google Sheet「權證分點籌碼」內的 A/B/C/D 與勝率統計工作表
+- 不需要本機 Excel
+- 產生一頁式 PNG
+- 發送到 DISCORD_WEBHOOK_URL_TEST
+
+必要 GitHub Secrets：
+- GCP_SERVICE_KEY
+- DISCORD_WEBHOOK_URL_TEST
+
+可選環境變數：
+- GOOGLE_SHEET_ID：建議使用，最穩
+- GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟，預設「權證分點籌碼」
+- TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
 """
 
 from __future__ import annotations
 
 import os
-import math
+import re
+import json
 import argparse
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import requests
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 基本設定
+# ══════════════════════════════════════════════════════════════════════
 
 TRACKED_BROKERS = [
     "華南永昌台中",
@@ -40,6 +53,9 @@ SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATI
 # 若你未來想讓「出清不管金額都顯示」，改成 "1"
 DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
 
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+
 SHEET_A = "A_單檔大買"
 SHEET_B = "B_同標的單日合計"
 SHEET_C = "C_同標的3日累積"
@@ -49,16 +65,188 @@ SHEET_STAT = "勝率統計"
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
 
 
-def parse_date_value(v) -> date | None:
-    if pd.isna(v):
-        return None
+# ══════════════════════════════════════════════════════════════════════
+# Google Sheet 讀取
+# ══════════════════════════════════════════════════════════════════════
+
+_GSHEET = None
+
+
+def get_gsheet():
+    global _GSHEET
+    if _GSHEET is not None:
+        return _GSHEET
+
+    service_key = os.getenv("GCP_SERVICE_KEY", "").strip()
+    if not service_key:
+        raise RuntimeError("找不到 GCP_SERVICE_KEY，請先在 GitHub Secrets 設定。")
+
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    info = json.loads(service_key)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+
+    if GOOGLE_SHEET_ID:
+        _GSHEET = gc.open_by_key(GOOGLE_SHEET_ID)
+    else:
+        _GSHEET = gc.open(GOOGLE_SHEET_NAME)
+
+    return _GSHEET
+
+
+def strip_gsheet_text_prefix(v):
+    s = "" if v is None else str(v).strip()
+    return s[1:] if s.startswith("'") else s
+
+
+def worksheet_values(sheet_name: str) -> list[list[str]]:
+    sh = get_gsheet()
+    ws = sh.worksheet(sheet_name)
+    return ws.get_all_values()
+
+
+def read_gsheet_table(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
+    """
+    讀取一般工作表：
+    - 第 1 列是表頭
+    - 後面是資料
+    - 自動補齊欄位數
+    - 只保留 needed_cols 交集
+    - 篩選 TRACKED_BROKERS
+    """
+    values = worksheet_values(sheet_name)
+    if not values:
+        return pd.DataFrame()
+
+    headers = [str(h).strip() for h in values[0]]
+    if not headers or all(h == "" for h in headers):
+        return pd.DataFrame()
+
+    n_cols = len(headers)
+    rows = []
+    for row in values[1:]:
+        row = list(row)
+        if len(row) < n_cols:
+            row += [""] * (n_cols - len(row))
+        elif len(row) > n_cols:
+            row = row[:n_cols]
+        rows.append([strip_gsheet_text_prefix(x) for x in row])
+
+    df = pd.DataFrame(rows, columns=headers).fillna("")
+
+    if needed_cols is not None:
+        keep_cols = [c for c in needed_cols if c in df.columns]
+        df = df[keep_cols].copy()
+
+    if "分點" in df.columns:
+        df = df[df["分點"].isin(TRACKED_BROKERS)].copy()
+
+    return df
+
+
+def read_gsheet_stat_raw() -> pd.DataFrame:
+    """
+    勝率統計表不是標準單一表頭，因此用 header=None 方式讀。
+    """
+    values = worksheet_values(SHEET_STAT)
+    max_cols = max((len(r) for r in values), default=0)
+    fixed = []
+    for row in values:
+        row = list(row)
+        if len(row) < max_cols:
+            row += [""] * (max_cols - len(row))
+        fixed.append([strip_gsheet_text_prefix(x) for x in row])
+    return pd.DataFrame(fixed).fillna("")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 資料清洗工具
+# ══════════════════════════════════════════════════════════════════════
+
+def parse_google_serial_date(s: str) -> date | None:
+    """
+    Google Sheet 若日期格式沒有套好，可能會變成 46160 這種日期序號。
+    Google Sheets 日期序號：1899-12-30 為 day 0。
+    """
     try:
-        t = pd.to_datetime(v, errors="coerce")
+        if not re.fullmatch(r"\d+(\.0)?", str(s).strip()):
+            return None
+        serial = int(float(str(s).strip()))
+        if serial < 20000 or serial > 80000:
+            return None
+        return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+    except Exception:
+        return None
+
+
+def parse_date_value(v) -> date | None:
+    if v is None:
+        return None
+
+    s = strip_gsheet_text_prefix(v)
+    if not s or s == "-":
+        return None
+
+    serial_date = parse_google_serial_date(s)
+    if serial_date:
+        return serial_date
+
+    try:
+        # 支援 2026/05/18、2026-05-18、2026-05-18 00:00:00
+        t = pd.to_datetime(s.replace("年", "/").replace("月", "/").replace("日", ""), errors="coerce")
         if pd.isna(t):
             return None
         return t.date()
     except Exception:
         return None
+
+
+def safe_float(v, default=0.0) -> float:
+    try:
+        if v is None:
+            return default
+
+        s = strip_gsheet_text_prefix(v)
+        if s == "" or s == "-":
+            return default
+
+        # Google Sheet 可能讀到 1,003,600 或 +30.36%
+        s = s.replace(",", "").replace("%", "").replace("＋", "+").strip()
+        if s.startswith("+"):
+            s = s[1:]
+
+        return float(s)
+    except Exception:
+        return default
+
+
+def safe_int(v, default=0) -> int:
+    try:
+        return int(float(str(safe_float(v))))
+    except Exception:
+        return default
+
+
+def normalize_code(v) -> str:
+    s = strip_gsheet_text_prefix(v)
+    if not s or s == "-":
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def normalize_underlying(v) -> str:
+    s = normalize_code(v)
+    if s.isdigit():
+        return str(int(s))
+    return s
 
 
 def money_to_wan(v: float) -> float:
@@ -69,37 +257,11 @@ def fmt_wan(v: float) -> str:
     return f"{money_to_wan(v):.1f} 萬"
 
 
-def safe_float(v, default=0.0) -> float:
-    try:
-        if pd.isna(v) or v == "-":
-            return default
-        return float(v)
-    except Exception:
-        return default
+# ══════════════════════════════════════════════════════════════════════
+# 日期推斷 / 勝率統計
+# ══════════════════════════════════════════════════════════════════════
 
-
-def safe_int(v, default=0) -> int:
-    try:
-        if pd.isna(v) or v == "-":
-            return default
-        return int(float(v))
-    except Exception:
-        return default
-
-
-def short_event_name(sheet_name: str) -> str:
-    if sheet_name == SHEET_A:
-        return "A"
-    if sheet_name == SHEET_B:
-        return "B"
-    if sheet_name == SHEET_C:
-        return "C"
-    if sheet_name == SHEET_D:
-        return "D"
-    return ""
-
-
-def infer_latest_date(excel_path: Path) -> date:
+def infer_latest_date_from_gsheet() -> date:
     candidates = []
 
     read_plan = [
@@ -111,33 +273,50 @@ def infer_latest_date(excel_path: Path) -> date:
 
     for sheet, cols in read_plan:
         try:
-            df = pd.read_excel(excel_path, sheet_name=sheet, usecols=lambda c: c in cols)
+            df = read_gsheet_table(sheet, cols)
         except Exception:
             continue
+
         for c in cols:
-            if c in df.columns:
-                for v in df[c].dropna().tolist():
-                    d = parse_date_value(v)
-                    if d:
-                        candidates.append(d)
+            if c not in df.columns:
+                continue
+            for v in df[c].dropna().tolist():
+                d = parse_date_value(v)
+                if d:
+                    candidates.append(d)
 
     if not candidates:
-        raise RuntimeError("無法從 Excel 推斷日期，請用 TARGET_DATE=YYYY-MM-DD 指定。")
+        raise RuntimeError("無法從 Google Sheet 推斷日期，請用 TARGET_DATE=YYYY-MM-DD 指定。")
+
     return max(candidates)
 
 
-def read_history_stats(excel_path: Path) -> dict:
+def read_history_stats_from_gsheet() -> dict:
     """
-    勝率統計表格式較特殊，因此用 header=None 抓「全部-A+B+C+D合併」列。
+    勝率統計表格式：
+    某列為：
+    分點, 事件類型, 事件數, 已出清筆數, ... 勝率, 平均持有天數 ...
+    其中事件類型為「全部-A+B+C+D合併」。
     """
     result = {}
     try:
-        stat = pd.read_excel(excel_path, sheet_name=SHEET_STAT, header=None)
+        stat = read_gsheet_stat_raw()
     except Exception:
-        return result
+        stat = pd.DataFrame()
 
     for broker in TRACKED_BROKERS:
-        rows = stat[(stat[0] == broker) & (stat[1] == "全部-A+B+C+D合併")]
+        result[broker] = {
+            "total_events": 0,
+            "win_rate": 0.0,
+            "avg_hold_days": 0.0,
+        }
+
+        if stat.empty or stat.shape[1] < 10:
+            continue
+
+        rows = stat[(stat[0].astype(str).str.strip() == broker) &
+                    (stat[1].astype(str).str.strip() == "全部-A+B+C+D合併")]
+
         if not rows.empty:
             r = rows.iloc[0]
             result[broker] = {
@@ -145,36 +324,24 @@ def read_history_stats(excel_path: Path) -> dict:
                 "win_rate": safe_float(r[8]),
                 "avg_hold_days": safe_float(r[9]),
             }
-        else:
-            result[broker] = {
-                "total_events": 0,
-                "win_rate": 0.0,
-                "avg_hold_days": 0.0,
-            }
+
     return result
 
 
-def load_sheet(excel_path: Path, sheet_name: str, needed_cols: list[str]) -> pd.DataFrame:
-    try:
-        df = pd.read_excel(excel_path, sheet_name=sheet_name, usecols=lambda c: c in needed_cols)
-    except ValueError:
-        # 部分欄位不存在時 fallback 全讀，再取交集
-        df = pd.read_excel(excel_path, sheet_name=sheet_name)
-        df = df[[c for c in needed_cols if c in df.columns]]
-    if "分點" in df.columns:
-        df = df[df["分點"].isin(TRACKED_BROKERS)].copy()
-    return df
-
+# ══════════════════════════════════════════════════════════════════════
+# 買賣資料抽取
+# ══════════════════════════════════════════════════════════════════════
 
 def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_name: str,
                amount: float, qty: int, sheet_name: str):
     if amount < BUY_THRESHOLD:
         return
+
     buys.append({
-        "broker": broker,
+        "broker": str(broker).strip(),
         "event": event,
-        "underlying": "" if pd.isna(underlying) else str(int(float(underlying))) if isinstance(underlying, (int, float)) and not pd.isna(underlying) else str(underlying),
-        "warrant": str(warrant_name) if pd.notna(warrant_name) else "",
+        "underlying": normalize_underlying(underlying),
+        "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
         "sheet": sheet_name,
@@ -185,19 +352,20 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
                 amount: float, qty: int, sheet_name: str):
     if amount < SELL_THRESHOLD and not (status == "出清" and DISPLAY_EXIT_ALWAYS):
         return
+
     sells.append({
-        "broker": broker,
+        "broker": str(broker).strip(),
         "status": status,
         "event": event,
-        "underlying": "" if pd.isna(underlying) else str(int(float(underlying))) if isinstance(underlying, (int, float)) and not pd.isna(underlying) else str(underlying),
-        "warrant": str(warrant_name) if pd.notna(warrant_name) else "",
+        "underlying": normalize_underlying(underlying),
+        "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
         "sheet": sheet_name,
     })
 
 
-def extract_actions(excel_path: Path, target: date) -> tuple[list[dict], list[dict]]:
+def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
     buys: list[dict] = []
     sells: list[dict] = []
 
@@ -206,7 +374,7 @@ def extract_actions(excel_path: Path, target: date) -> tuple[list[dict], list[di
         "事件類型", "分點", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
         "減碼日", "減碼均價", "減碼獲利%", "出清日", "出清均價", "出清獲利%"
     ]
-    A = load_sheet(excel_path, SHEET_A, a_cols)
+    A = read_gsheet_table(SHEET_A, a_cols)
 
     for _, r in A.iterrows():
         broker = r.get("分點", "")
@@ -247,7 +415,7 @@ def extract_actions(excel_path: Path, target: date) -> tuple[list[dict], list[di
     ]
 
     for sheet_name, event_date_col, event in plans:
-        df = load_sheet(excel_path, sheet_name, common_cols)
+        df = read_gsheet_table(sheet_name, common_cols)
 
         for _, r in df.iterrows():
             broker = r.get("分點", "")
@@ -279,6 +447,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     單筆則顯示權證名稱。
     """
     groups = defaultdict(list)
+
     for a in actions:
         key = (a["broker"], a.get("status", ""), a["event"], a["underlying"] or a["warrant"])
         groups[key].append(a)
@@ -289,7 +458,6 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         qty = sum(i.get("qty", 0) for i in items)
         warrant_count = len(items)
 
-        # 若同標的多筆，主欄顯示標的股；若單筆，顯示權證
         underlying = items[0].get("underlying", "")
         if warrant_count >= 2 and underlying:
             display_target = f"{underlying}"
@@ -314,6 +482,10 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 繪圖
+# ══════════════════════════════════════════════════════════════════════
+
 def get_font_path(bold=False):
     candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -330,13 +502,7 @@ def make_font(size, bold=False):
     return ImageFont.truetype(get_font_path(bold), size)
 
 
-def draw_report_image(
-    target: date,
-    buys_raw: list[dict],
-    sells_raw: list[dict],
-    history: dict,
-    output_path: Path,
-):
+def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
     buys = compress_actions(buys_raw, "buy")
     sells = compress_actions(sells_raw, "sell")
 
@@ -344,7 +510,6 @@ def draw_report_image(
     sell_total = sum(x["amount"] for x in sells)
     net = buy_total - sell_total
 
-    # 分點 summary
     broker_summary = {}
     for b in TRACKED_BROKERS:
         b_buys = [x for x in buys if x["broker"] == b]
@@ -394,13 +559,11 @@ def draw_report_image(
         text = str(text)
         return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
 
-    # Header
     date_label = f"{target.month}/{target.day}"
     draw.text((50, 28), f"{date_label} 精選分點買賣超追蹤", font=F(58, True), fill=NAVY)
     draw.text((55, 104), f"精選 5 家分點｜只看 {target:%Y/%m/%d} 當日動作", font=F(28, True), fill=NAVY2)
     draw.text((55, 148), "紅色＝買超　綠色＝賣方提醒　單位：萬元", font=F(22, True), fill=TEXT)
 
-    # KPI cards
     kpis = [
         ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK),
         ("賣方提醒", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT),
@@ -422,12 +585,13 @@ def draw_report_image(
         else:
             draw.text((x + 110, y0 + 76), val, font=F(34, True), fill=color)
 
-    # Active broker cards
+    # 有動作分點卡；無動作分點縮小
     y = 380
     max_cards = min(len(active_brokers), 4)
     card_gap = 22
     card_w2 = int((1120 - card_gap * (max_cards - 1)) / max_cards) if max_cards else 270
     card_h2 = 215
+
     for i, b in enumerate(active_brokers[:4]):
         bx = 40 + i * (card_w2 + card_gap)
         s = broker_summary[b]
@@ -439,25 +603,31 @@ def draw_report_image(
 
         draw.text((bx + 18, y + 112), "買超", font=F(20, True), fill=RED)
         draw.text((bx + 18, y + 142), f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", font=F(21, True), fill=RED)
-
         draw.line([bx + 18, y + 174, bx + card_w2 - 18, y + 174], fill=BORDER, width=1)
         draw.text((bx + 18, y + 187), f"賣方：{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", font=F(18, True), fill=GREEN)
 
+    inactive_box_bottom = y + card_h2
     if inactive_brokers:
-        ix = 40 + max_cards * (card_w2 + card_gap) if max_cards < 4 else 40
-        iy = y + card_h2 + 16 if max_cards >= 4 else y
-        iw = 1120 if max_cards >= 4 else 1120 - ix
-        ih = 90 if max_cards >= 4 else card_h2
+        if max_cards >= 4:
+            ix, iy, iw, ih = 40, y + card_h2 + 16, 1120, 90
+            inactive_box_bottom = iy + ih
+        else:
+            ix = 40 + max_cards * (card_w2 + card_gap)
+            iy = y
+            iw = 1120 - ix
+            ih = card_h2
+            inactive_box_bottom = y + card_h2
+
         rounded_rect(ix, iy, ix + iw, iy + ih, 16, fill=WHITE, outline=BORDER, width=2)
         title_y = iy + 20
         draw.text((ix + 24, title_y), "今日無動作分點", font=F(23, True), fill=NAVY)
         inactive_text = "、".join(inactive_brokers)
         draw.text((ix + 24, title_y + 42), inactive_text, font=F(20, True), fill=TEXT)
 
-    # Tables
-    table_y = 625 if not inactive_brokers or max_cards < 4 else 715
-    buy_table_h = 430 if sells else 560
+    table_y = inactive_box_bottom + 25
     table_x, table_w = 40, 1120
+    sells_exist = len(sells) > 0
+    buy_table_h = 430 if sells_exist else 560
 
     rounded_rect(table_x, table_y, table_x + table_w, table_y + buy_table_h, 16, fill=WHITE, outline=NAVY2, width=2)
     rect(table_x, table_y, table_x + table_w, table_y + 60, fill=NAVY, outline=NAVY)
@@ -473,7 +643,7 @@ def draw_report_image(
         cx += wid
         draw.line([cx, hy, cx, table_y + buy_table_h], fill=BORDER, width=1)
 
-    max_buy_rows = 6 if sells else 8
+    max_buy_rows = 6 if sells_exist else 8
     row_h = 56
     ry = hy + 48
     for idx, r in enumerate(buys[:max_buy_rows], 1):
@@ -497,10 +667,9 @@ def draw_report_image(
             cx += wid
         ry += row_h
 
-    # 賣方提醒
     sell_y = table_y + buy_table_h + 25
-    sell_h = 255
-    if sells:
+    if sells_exist:
+        sell_h = 255
         rounded_rect(table_x, sell_y, table_x + table_w, sell_y + sell_h, 16, fill=WHITE, outline=GREEN, width=2)
         rect(table_x, sell_y, table_x + table_w, sell_y + 58, fill=GREEN, outline=GREEN)
         draw.text((table_x + 28, sell_y + 12), f"{date_label} 賣方提醒", font=F(31, True), fill=WHITE)
@@ -529,10 +698,7 @@ def draw_report_image(
                     draw.text((cx + 12, ry + 13), txt, font=F(18, True if j == 0 else False), fill=TEXT)
                 cx += wid
             ry += 49
-    else:
-        sell_y -= 20
 
-    # Bottom note
     by = 1390
     rounded_rect(40, by, 1160, 1460, 16, fill=WHITE, outline=NAVY2, width=2)
     draw.text((65, by + 16), "今日重點", font=F(24, True), fill=NAVY)
@@ -546,6 +712,10 @@ def draw_report_image(
     img.save(output_path, quality=95)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Discord
+# ══════════════════════════════════════════════════════════════════════
+
 def send_to_discord(webhook_url: str, image_path: Path, target: date):
     content = f"📊 {target:%Y/%m/%d} 精選分點買賣超追蹤"
     with image_path.open("rb") as f:
@@ -558,41 +728,36 @@ def send_to_discord(webhook_url: str, image_path: Path, target: date):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--excel", default=os.getenv("EXCEL_PATH", "權證分點籌碼.xlsx"))
     parser.add_argument("--date", default=os.getenv("TARGET_DATE", ""))
     parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
     parser.add_argument("--no-discord", action="store_true")
     args = parser.parse_args()
 
-    excel_path = Path(args.excel)
-    if not excel_path.exists():
-        raise FileNotFoundError(f"找不到 Excel 檔案：{excel_path}")
-
     if args.date:
         target = datetime.strptime(args.date, "%Y-%m-%d").date()
     else:
-        target = infer_latest_date(excel_path)
+        target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
 
-    history = read_history_stats(excel_path)
-    buys, sells = extract_actions(excel_path, target)
+    history = read_history_stats_from_gsheet()
+    buys, sells = extract_actions_from_gsheet(target)
 
-    make_msg = (
+    print(
+        f"Google Sheet：{GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME}\n"
         f"目標日期：{target:%Y-%m-%d}\n"
         f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
         f"輸出圖檔：{output_path}"
     )
-    print(make_msg)
 
     draw_report_image(target, buys, sells, history, output_path)
 
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "")
     if args.no_discord:
         print("已設定 --no-discord，只輸出圖片，不發送 Discord。")
         return
 
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "")
     if not webhook_url:
         raise RuntimeError("找不到 DISCORD_WEBHOOK_URL_TEST，請先在 GitHub Secrets 設定。")
 
