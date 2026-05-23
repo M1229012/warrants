@@ -802,7 +802,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
 
-    event_legend_h = 0.82
+    event_legend_h = 0.45
     footer_h = 0.48
 
     fig_h = (
@@ -1039,25 +1039,26 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
         y = draw_table(f"{date_label} 今日賣超明細", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
 
-    # Event legend
+    # Event legend：改成與近一個月圖相同的橫條式說明
     y -= gap
-    rounded(margin_x, y - event_legend_h, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-    text(margin_x + 0.25, y - 0.25, "事件代號說明", 14, NAVY, BOLD)
+    legend_y = y - event_legend_h
+    rounded(margin_x, legend_y, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
 
-    legend_x = margin_x + 1.72
-    legend_y1 = y - 0.25
-    legend_y2 = y - 0.58
-    per_w = 5.10
+    text(margin_x + 0.25, legend_y + event_legend_h / 2, "事件代號說明", 13.5, NAVY, BOLD)
 
-    for idx, (code_name, desc) in enumerate(EVENT_LEGEND_ITEMS):
-        lx = legend_x + (idx % 2) * per_w
-        ly = legend_y1 if idx < 2 else legend_y2
-        # 事件代號屬於分類說明，不使用紅/綠，避免被誤解成買方或賣方訊號
-        badge_color = "#334155"
+    legend_items = [
+        ("A", "單檔權證單日大買"),
+        ("B", "同標的單日合買"),
+        ("C", "同標的3日累積"),
+        ("D", "近10日累積淨買"),
+    ]
 
-        rounded(lx, ly - 0.13, 0.34, 0.26, fc=badge_color, ec=badge_color, lw=0.8, r=0.08)
-        text(lx + 0.17, ly, code_name, 10.5, WHITE, BOLD, ha="center")
-        text(lx + 0.44, ly, desc, 11.5, TEXT, FONT)
+    lx = margin_x + 2.00
+    for code_name, desc in legend_items:
+        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
+        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
+        text(lx + 0.40, legend_y + event_legend_h / 2, desc, 10.8, TEXT, FONT)
+        lx += 2.20 if code_name in {"A", "B"} else 1.98
 
     # footer
     y -= event_legend_h
