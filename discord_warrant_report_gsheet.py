@@ -965,11 +965,18 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
             if item == "__INACTIVE__":
                 # 0~2 個有動作分點時，把今日無動作分點做成一個方框
+                # 不用 fit() 直接硬截斷，改成分成兩行顯示，避免出現「永豐金竹...」這種省略。
                 rounded(x, cy, card_w, broker_card_h, fc="#F8FAFC", ec=BORDER, lw=1.1, r=0.08)
                 rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
                 text(x + card_w / 2, cy + broker_card_h - 0.21, "今日無動作分點", 15, WHITE, BOLD, ha="center")
-                text(x + 0.16, cy + 0.74, "無買超 / 賣方", 13, MUTED, BOLD)
-                text(x + 0.16, cy + 0.42, fit("、".join(inactive_brokers), 12), 14, TEXT, BOLD)
+                text(x + 0.16, cy + 0.75, "無買超 / 賣方", 13, MUTED, BOLD)
+
+                inactive_line_1 = "、".join(inactive_brokers[:2])
+                inactive_line_2 = "、".join(inactive_brokers[2:])
+
+                text(x + 0.16, cy + 0.48, inactive_line_1, 12.5, TEXT, BOLD)
+                if inactive_line_2:
+                    text(x + 0.16, cy + 0.24, inactive_line_2, 12.5, TEXT, BOLD)
                 continue
 
             b = item
