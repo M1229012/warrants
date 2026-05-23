@@ -293,6 +293,25 @@ def fmt_wan(v: float) -> str:
     return f"{money_to_wan(v):.1f} 萬"
 
 
+def count_warrants_in_text(text: str) -> int:
+    """
+    計算權證名稱 / 權證清單中的權證檔數。
+    用於圖卡顯示時，把很長的權證清單改成「N 檔權證」，
+    避免表格內出現截斷的「...」而影響閱讀。
+    """
+    s = strip_gsheet_text_prefix(text)
+    if not s or s == "-":
+        return 0
+
+    parts = []
+    for p in re.split(r"[；;]", s):
+        p = p.strip()
+        if p:
+            parts.append(p)
+
+    return len(parts) if parts else 1
+
+
 def normalize_return_pct(v):
     """
     將 Google Sheet 權證報酬率統一轉成「百分比數值」。
@@ -522,6 +541,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
         "stock_name": stock_name,
         "warrant_code": normalize_code(warrant_code),
         "warrant": strip_gsheet_text_prefix(warrant_name),
+        "warrant_list_count": count_warrants_in_text(warrant_name),
         "amount": amount,
         "qty": qty,
         "sheet": sheet_name,
@@ -700,14 +720,30 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
 
         if warrant_count >= 2 and underlying:
             display_target = target_label if target_label else f"{underlying}"
-            content = f"{event}｜{warrant_count} 筆權證事件" if kind == "sell" else f"{warrant_count} 檔權證"
+
+            first_item = items[0]
+            first_code = first_item.get("warrant_code", "")
+            first_name = first_item.get("warrant", "")
+            first_label = f"{first_code} {first_name}".strip() if first_code else first_name
+
+            # 多筆同標的合併時，內容欄仍顯示其中一檔權證，再用 ... 表示還有其他權證
+            content = f"{first_label}；..." if first_label else f"{warrant_count} 檔權證"
         else:
             warrant_code = items[0].get("warrant_code", "")
             warrant_name = items[0].get("warrant", "")
             warrant_label = f"{warrant_code} {warrant_name}".strip() if warrant_code else warrant_name
+            list_count = safe_int(items[0].get("warrant_list_count", 0))
 
             display_target = target_label if target_label else (underlying if underlying else warrant_label)
-            content = warrant_label or f"{warrant_count} 檔權證"
+
+            # B/C/D 通常是權證清單；若有多檔，顯示第一檔權證 + ...
+            # 這樣至少能看到其中一支權證代碼/名稱，不會只剩「N 檔權證」。
+            if kind == "buy" and event in {"B", "C", "D"} and list_count >= 2 and warrant_label:
+                first_warrant = re.split(r"[；;]", warrant_label)[0].strip()
+                content = f"{first_warrant}；..."
+            else:
+                content = warrant_label or f"{warrant_count} 檔權證"
+
             if kind == "sell" and event:
                 content = f"{event}｜{content}"
 
