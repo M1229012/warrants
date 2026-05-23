@@ -292,6 +292,18 @@ def fmt_wan(v: float) -> str:
     return f"{money_to_wan(v):.1f} 萬"
 
 
+def fmt_return_pct(v) -> str:
+    try:
+        if v is None or v == "":
+            return "-"
+        pct = safe_float(v, None)
+        if pct is None:
+            return "-"
+        return f"{pct:+.1f}%"
+    except Exception:
+        return "-"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 日期推斷 / 勝率統計
 # ══════════════════════════════════════════════════════════════════════
@@ -478,7 +490,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
 
 
 def append_sell(sells: list[dict], broker: str, status: str, event: str, underlying, warrant_name: str,
-                amount: float, qty: int, sheet_name: str):
+                amount: float, qty: int, sheet_name: str, return_pct=None):
     if amount < SELL_THRESHOLD and not (status == "出清" and DISPLAY_EXIT_ALWAYS):
         return
 
@@ -494,6 +506,7 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
         "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
+        "return_pct": safe_float(return_pct, None) if return_pct not in [None, ""] else None,
         "sheet": sheet_name,
     })
 
@@ -524,14 +537,14 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
             amount = safe_float(r.get("減碼均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
             append_sell(
                 sells, broker, "減碼", event, r.get("標的股"), r.get("權證名稱"),
-                amount, safe_int(r.get("買進張數")), SHEET_A
+                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("減碼獲利%")
             )
 
         if parse_date_value(r.get("出清日")) == target:
             amount = safe_float(r.get("出清均價")) * safe_float(r.get("買進張數")) * NTD_PER_WARRANT_POINT
             append_sell(
                 sells, broker, "出清", event, r.get("標的股"), r.get("權證名稱"),
-                amount, safe_int(r.get("買進張數")), SHEET_A
+                amount, safe_int(r.get("買進張數")), SHEET_A, r.get("出清獲利%")
             )
 
     # B/C/D：同標的合買、3 日累積、10 日累積
@@ -562,13 +575,13 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
             if parse_date_value(r.get("減碼日")) == target:
                 append_sell(
                     sells, broker, "減碼", event, r.get("標的股"), r.get("權證清單"),
-                    safe_float(r.get("減碼賣出金額")), safe_int(r.get("買超張數")), sheet_name
+                    safe_float(r.get("減碼賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("減碼獲利%")
                 )
 
             if parse_date_value(r.get("出清日")) == target:
                 append_sell(
                     sells, broker, "出清", event, r.get("標的股"), r.get("權證清單"),
-                    safe_float(r.get("出清賣出金額")), safe_int(r.get("買超張數")), sheet_name
+                    safe_float(r.get("出清賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("出清獲利%")
                 )
 
     return buys, sells
@@ -591,6 +604,20 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         qty = sum(i.get("qty", 0) for i in items)
         warrant_count = len(items)
 
+        valid_returns = [
+            (i.get("return_pct"), i.get("amount", 0))
+            for i in items
+            if i.get("return_pct") is not None
+        ]
+        if valid_returns:
+            total_weight = sum(max(float(w), 0.0) for _, w in valid_returns)
+            if total_weight > 0:
+                return_pct = sum(float(p) * max(float(w), 0.0) for p, w in valid_returns) / total_weight
+            else:
+                return_pct = sum(float(p) for p, _ in valid_returns) / len(valid_returns)
+        else:
+            return_pct = None
+
         underlying = items[0].get("underlying", "")
         stock_name = items[0].get("stock_name", "")
         target_label = f"{underlying} {stock_name}".strip() if underlying else ""
@@ -610,6 +637,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             "content": content,
             "amount": amount,
             "qty": qty,
+            "return_pct": return_pct,
             "count": warrant_count,
             "kind": kind,
         })
@@ -785,7 +813,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 alpha=CENTER_WATERMARK_ALPHA,
                 rotation=CENTER_WATERMARK_ROTATION,
                 linespacing=1.18,
-                zorder=0.8,
+                # 浮水印放在所有圖層最上方，但透明度很低，不影響閱讀
+                zorder=50,
             )
         except Exception:
             pass
@@ -802,7 +831,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             fontproperties=FONT,
             color="#2C3440",
             alpha=WATERMARK_ALPHA,
-            zorder=20,
+            zorder=60,
         )
 
     date_label = f"{target.month}/{target.day}"
@@ -931,15 +960,17 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     # Sell table
     if sell_rows:
         y -= gap
-        sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "賣方金額"]
-        sell_col_w = [2.35, 1.20, 3.10, 3.20, 2.15]
+        sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "報酬率", "賣方金額"]
+        sell_col_w = [2.05, 1.05, 2.75, 2.55, 1.25, 2.35]
 
         def sell_builder(i, r):
+            ret_text = fmt_return_pct(r.get("return_pct"))
+            ret_color = RED if safe_float(r.get("return_pct"), 0) > 0 else GREEN if safe_float(r.get("return_pct"), 0) < 0 else TEXT
             return (
-                [r["broker"], r["status"], r["target"], r["content"], fmt_wan(r["amount"])],
-                [TEXT, GREEN, TEXT, TEXT, GREEN],
-                ["left", "center", "left", "left", "right"],
-                [True, True, True, False, True],
+                [r["broker"], r["status"], r["target"], r["content"], ret_text, fmt_wan(r["amount"])],
+                [TEXT, GREEN, TEXT, TEXT, ret_color, GREEN],
+                ["left", "center", "left", "left", "right", "right"],
+                [True, True, True, False, True, True],
             )
 
         y = draw_table(f"{date_label} 賣方提醒", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
@@ -957,7 +988,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     for idx, (code_name, desc) in enumerate(EVENT_LEGEND_ITEMS):
         lx = legend_x + (idx % 2) * per_w
         ly = legend_y1 if idx < 2 else legend_y2
-        badge_color = NAVY if code_name in {"A", "B"} else GREEN
+        # 事件代號屬於分類說明，不使用紅/綠，避免被誤解成買方或賣方訊號
+        badge_color = "#334155"
 
         rounded(lx, ly - 0.13, 0.34, 0.26, fc=badge_color, ec=badge_color, lw=0.8, r=0.08)
         text(lx + 0.17, ly, code_name, 10.5, WHITE, BOLD, ha="center")
