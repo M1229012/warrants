@@ -22,13 +22,13 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 import json
 import argparse
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, date, timedelta
-import math
 
 import requests
 import pandas as pd
@@ -70,6 +70,16 @@ SHEET_D = "D_近10日累積淨買進"
 SHEET_STAT = "勝率統計"
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
+
+# 常見權證發行券商關鍵字，用來從權證名稱中反推標的股名。
+WARRANT_ISSUER_TOKENS = [
+    "元大", "凱基", "群益", "富邦", "國泰", "永豐", "永豐金", "國票", "中信",
+    "台新", "兆豐", "元富", "玉山", "第一金", "新光", "日盛", "康和", "統一",
+    "宏遠", "合庫", "犇亞", "華南永昌", "台企銀", "聯邦", "高盛", "瑞銀",
+    "摩根大通", "麥格理", "法銀巴黎", "上海商銀"
+]
+
+_STOCK_NAME_MAP = None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -268,6 +278,96 @@ def fmt_wan(v: float) -> str:
 # 日期推斷 / 勝率統計
 # ══════════════════════════════════════════════════════════════════════
 
+
+def extract_stock_name_from_warrant_text(text: str) -> str:
+    """
+    從權證名稱或權證清單中的單筆名稱，推估標的股名。
+    例如：
+    - 聯發科元大5B購04 -> 聯發科
+    - 047358 台積電永豐6C購01 -> 台積電
+    """
+    s = strip_gsheet_text_prefix(text).strip()
+    if not s:
+        return ""
+
+    # 若是一整串清單，取第一筆非空項目
+    for sep in ["；", ";"]:
+        if sep in s:
+            parts = [p.strip() for p in s.split(sep) if p.strip()]
+            if parts:
+                s = parts[0]
+                break
+
+    # 去掉前面的權證代碼，如 047358
+    s = re.sub(r"^\d+\s*", "", s).strip()
+    if not s:
+        return ""
+
+    # 找最早出現的券商關鍵字，前面那段通常就是股名
+    hit_idx = None
+    for token in WARRANT_ISSUER_TOKENS:
+        idx = s.find(token)
+        if idx > 0:
+            if hit_idx is None or idx < hit_idx:
+                hit_idx = idx
+
+    if hit_idx is not None:
+        name = s[:hit_idx].strip()
+        # 避免抓到過長雜訊
+        if 0 < len(name) <= 12:
+            return name
+
+    return ""
+
+
+def build_stock_name_map_from_gsheet() -> dict[str, str]:
+    """
+    從 A/B/C/D 工作表蒐集 標的股代碼 -> 股名 映射。
+    """
+    name_counter: dict[str, Counter] = defaultdict(Counter)
+
+    def add_mapping(underlying, text):
+        code = normalize_underlying(underlying)
+        if not code:
+            return
+        name = extract_stock_name_from_warrant_text(text)
+        if name:
+            name_counter[code][name] += 1
+
+    # A 表：直接用權證名稱
+    try:
+        A = read_gsheet_table(SHEET_A, ["標的股", "權證名稱"])
+        for _, r in A.iterrows():
+            add_mapping(r.get("標的股", ""), r.get("權證名稱", ""))
+    except Exception:
+        pass
+
+    # B/C/D：用權證清單
+    for sheet_name in [SHEET_B, SHEET_C, SHEET_D]:
+        try:
+            df = read_gsheet_table(sheet_name, ["標的股", "權證清單"])
+            for _, r in df.iterrows():
+                add_mapping(r.get("標的股", ""), r.get("權證清單", ""))
+        except Exception:
+            pass
+
+    stock_map = {}
+    for code, counter in name_counter.items():
+        if counter:
+            # 次數最多優先；同次數時名稱較短者優先
+            best_name = sorted(counter.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
+            stock_map[code] = best_name
+
+    return stock_map
+
+
+def get_stock_name_map() -> dict[str, str]:
+    global _STOCK_NAME_MAP
+    if _STOCK_NAME_MAP is None:
+        _STOCK_NAME_MAP = build_stock_name_map_from_gsheet()
+    return _STOCK_NAME_MAP
+
+
 def infer_latest_date_from_gsheet() -> date:
     candidates = []
 
@@ -344,10 +444,14 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
     if amount < BUY_THRESHOLD:
         return
 
+    underlying_code = normalize_underlying(underlying)
+    stock_name = get_stock_name_map().get(underlying_code, "")
+
     buys.append({
         "broker": str(broker).strip(),
         "event": event,
-        "underlying": normalize_underlying(underlying),
+        "underlying": underlying_code,
+        "stock_name": stock_name,
         "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
@@ -360,11 +464,15 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
     if amount < SELL_THRESHOLD and not (status == "出清" and DISPLAY_EXIT_ALWAYS):
         return
 
+    underlying_code = normalize_underlying(underlying)
+    stock_name = get_stock_name_map().get(underlying_code, "")
+
     sells.append({
         "broker": str(broker).strip(),
         "status": status,
         "event": event,
-        "underlying": normalize_underlying(underlying),
+        "underlying": underlying_code,
+        "stock_name": stock_name,
         "warrant": strip_gsheet_text_prefix(warrant_name),
         "amount": amount,
         "qty": qty,
@@ -466,11 +574,14 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         warrant_count = len(items)
 
         underlying = items[0].get("underlying", "")
+        stock_name = items[0].get("stock_name", "")
+        target_label = f"{underlying} {stock_name}".strip() if underlying else ""
+
         if warrant_count >= 2 and underlying:
-            display_target = f"{underlying}"
+            display_target = target_label if target_label else f"{underlying}"
             content = f"{warrant_count} 檔權證"
         else:
-            display_target = underlying if underlying else items[0].get("warrant", "")
+            display_target = target_label if target_label else (underlying if underlying else items[0].get("warrant", ""))
             content = items[0].get("warrant", "") or f"{warrant_count} 檔權證"
 
         result.append({
