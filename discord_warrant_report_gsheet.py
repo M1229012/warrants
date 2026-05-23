@@ -744,8 +744,16 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             else:
                 content = warrant_label or f"{warrant_count} 檔權證"
 
-            if kind == "sell" and event:
-                content = f"{event}｜{content}"
+            if kind == "sell":
+                sell_event_label = event
+                if not sell_event_label or sell_event_label == "ABCD合計":
+                    sell_event_label = "/".join(sorted({
+                        str(i.get("event", "")).strip()
+                        for i in items
+                        if str(i.get("event", "")).strip()
+                    }))
+                if sell_event_label:
+                    content = f"{sell_event_label}｜{content}"
 
         result.append({
             "broker": broker,
