@@ -857,7 +857,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     y -= 0.42
     text(margin_x + 0.18, y, f"精選 5 家分點｜華南永昌台中、元大南屯、富邦敦南、永豐金內湖、永豐金竹北", 15, NAVY2, BOLD)
     y -= 0.32
-    text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣方提醒　單位：萬元", 13, TEXT, BOLD)
+    text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣超　單位：萬元", 13, TEXT, BOLD)
 
     # ─────────────────────────────────────────────
     # KPI cards
@@ -868,7 +868,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     kpi_w = (content_w - 2 * kpi_gap) / 3
     kpis = [
         ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK, "↗"),
-        ("賣方提醒", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
+        ("今日賣超", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
         ("淨買超", "", fmt_wan(net), RED if net >= 0 else GREEN, PINK if net >= 0 else MINT, "◎"),
     ]
     for i, (title, mid, val, color, bg, icon) in enumerate(kpis):
@@ -985,7 +985,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 [True, True, True, False, True, True],
             )
 
-        y = draw_table(f"{date_label} 賣方提醒", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
+        y = draw_table(f"{date_label} 今日賣超明細", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
 
     # Event legend
     y -= gap
