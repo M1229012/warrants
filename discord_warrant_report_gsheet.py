@@ -1123,7 +1123,7 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
 
 def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
     """
-    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP10。
+    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP15。
 
     統計來源：
     - A_單檔大買：買進日 / 買進金額
@@ -1306,12 +1306,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         })
 
     rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
-    return rows[:10], trading_dates
+    return rows[:15], trading_dates
 
 
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
     """
-    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP10
+    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP15
     """
     rows, trading_dates = collect_consensus_buy_top10(target, lookback_days)
     n = len(rows)
@@ -1426,7 +1426,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP10", 28, NAVY, BOLD)
+    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP15", 28, NAVY, BOLD)
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
@@ -1437,7 +1437,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     legend_y = y - legend_h
     rounded(margin_x, legend_y, content_w, legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
 
-    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP10淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
+    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
 
     legend_items = [
         ("A", "單檔權證單日大買"),
@@ -1459,7 +1459,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     table_top = y
     rounded(margin_x, table_top - table_h, content_w, table_h, fc=WHITE, ec=NAVY, lw=1.2, r=0.08)
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
-    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP10", 19, WHITE, BOLD)
+    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "參與分點"]
     col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
@@ -1537,7 +1537,7 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP10.png"
+    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP15.png"
 
     history = read_history_stats_from_gsheet()
     buys, sells = extract_actions_from_gsheet(target)
@@ -1573,7 +1573,7 @@ def main():
         webhook_url,
         consensus_output_path,
         target,
-        content_text=f"📊 {target:%Y/%m/%d} 近一個月交易日｜五大分點共識淨買超 TOP10"
+        content_text=f"📊 {target:%Y/%m/%d} 近一個月交易日｜五大分點共識淨買超 TOP15"
     )
 
     print("Discord 已發送 2 張圖片。")
