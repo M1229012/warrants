@@ -1786,10 +1786,10 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
-                PUBLIC_MASK_PARTICIPANTS,
+                fmt_participant_brokers(r),
             ]
 
-            colors = [TEXT, MUTED, net_color, TEXT, NAVY2, MUTED]
+            colors = [TEXT, MUTED, net_color, TEXT, NAVY2, TEXT]
             aligns = ["center", "left", "right", "center", "center", "left"]
             bolds = [True, True, True, True, True, True]
 
@@ -1809,20 +1809,6 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                             z=12,
                         )
                     mosaic_regions.append((x + 0.10, ry + row_h * 0.14, w - 0.20, row_h * 0.72))
-                elif val == PUBLIC_MASK_PARTICIPANTS:
-                    preview_participants = fmt_participant_brokers(r)
-                    if preview_participants:
-                        text(
-                            x + 0.12,
-                            ry + row_h / 2,
-                            preview_participants,
-                            14,
-                            TEXT,
-                            BOLD if is_bold else FONT,
-                            ha="left",
-                            z=12,
-                        )
-                    mosaic_regions.append((x + 0.08, ry + row_h * 0.14, w - 0.16, row_h * 0.72))
                 else:
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                     text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
