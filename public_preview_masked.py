@@ -108,9 +108,15 @@ PUBLIC_PREVIEW_BANNER = "公開預覽版｜完整名單已更新於艾斯 DC 群
 PUBLIC_MASK_BLOCK = "__PUBLIC_MASK_BLOCK__"
 PUBLIC_MASK_SKIP = "__PUBLIC_MASK_SKIP__"
 PUBLIC_MASK_TARGET = "__PUBLIC_MASK_TARGET__"
-# 半透明遮罩：讓底下內容隱約可見，保留一點「預覽感」
-PUBLIC_MASK_COLOR = (148 / 255, 163 / 255, 184 / 255, 0.38)
-PUBLIC_MASK_EDGE = (100 / 255, 116 / 255, 139 / 255, 0.55)
+# 像素馬賽克遮罩：用深淺灰色小方塊覆蓋敏感文字，保留公開預覽感
+PUBLIC_MASK_COLOR = (148 / 255, 163 / 255, 184 / 255, 0.36)
+PUBLIC_MASK_EDGE = (100 / 255, 116 / 255, 139 / 255, 0.50)
+PUBLIC_MOSAIC_COLORS = [
+    (15 / 255, 23 / 255, 42 / 255, 0.82),
+    (51 / 255, 65 / 255, 85 / 255, 0.72),
+    (100 / 255, 116 / 255, 139 / 255, 0.62),
+    (203 / 255, 213 / 255, 225 / 255, 0.50),
+]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -958,6 +964,58 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         s = str(s)
         return s if len(s) <= n else s[:n - 1] + "…"
 
+    def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
+        """
+        公開預覽用像素馬賽克：
+        - 不是實心灰條
+        - 不是一格一格分開
+        - 以整塊區域鋪上深淺不同的小方塊，接近真實馬賽克效果
+        """
+        # 先鋪一層很淡的底，讓整塊遮罩連成一體
+        rounded(
+            x, y, w, h,
+            fc=(226 / 255, 232 / 255, 240 / 255, 0.34),
+            ec=(148 / 255, 163 / 255, 184 / 255, 0.42),
+            lw=0.45,
+            r=0.055,
+            z=z,
+        )
+
+        seed = sum(ord(ch) for ch in str(seed_text)) + int(x * 97) + int(y * 131)
+        cell_w = 0.085
+        cell_h = 0.070
+        pad_x = 0.08
+        pad_y = 0.06
+
+        cols = max(6, int((w - 2 * pad_x) / cell_w))
+        rows_n = max(2, int((h - 2 * pad_y) / cell_h))
+
+        for rr in range(rows_n):
+            for cc in range(cols):
+                # 留一點空白，避免整塊變死灰色；用 deterministic pattern，不需 random
+                v = (seed + rr * 37 + cc * 17 + (rr + cc) * 11) % 100
+                if v < 34:
+                    continue
+
+                color = PUBLIC_MOSAIC_COLORS[(seed + rr * 5 + cc * 3) % len(PUBLIC_MOSAIC_COLORS)]
+                bx = x + pad_x + cc * cell_w
+                by = y + pad_y + rr * cell_h
+
+                # 讓方塊大小略有變化，比固定格更像文字被馬賽克
+                bw = cell_w * (0.62 + ((seed + cc * 7 + rr * 3) % 4) * 0.10)
+                bh = cell_h * (0.62 + ((seed + cc * 5 + rr * 9) % 4) * 0.08)
+
+                ax.add_patch(
+                    patches.Rectangle(
+                        (bx, by),
+                        bw,
+                        bh,
+                        linewidth=0,
+                        facecolor=color,
+                        zorder=z + 1,
+                    )
+                )
+
     def draw_center_watermark():
         try:
             ax.text(
@@ -1122,38 +1180,35 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                         continue
 
                     if val == PUBLIC_MASK_BLOCK:
-                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊半透明圓角遮罩
+                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊像素馬賽克
                         block_w = w
                         if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP:
                             block_w += col_widths[col_idx + 1]
 
-                        # 底下先畫淡淡的原始內容，再蓋上半透明遮罩，保留「預覽感」
                         preview_target = str(r.get("target", "")).strip() if isinstance(r, dict) else ""
                         preview_content = str(r.get("content", "")).strip() if isinstance(r, dict) else ""
                         preview_text = "　".join([t for t in [preview_target, preview_content] if t])
 
+                        # 先畫原字，再用像素馬賽克蓋住，達成「右圖」那種效果
                         if preview_text:
                             text(
-                                x + 0.24,
+                                x + 0.20,
                                 ry + row_h / 2,
                                 fit(preview_text, max(12, int(block_w * 5.8))),
                                 13,
-                                "#64748B",
-                                FONT,
+                                "#334155",
+                                BOLD,
                                 ha="left",
                                 z=12,
                             )
 
-                        rounded(
-                            x + 0.16,
-                            ry + row_h * 0.18,
-                            block_w - 0.32,
-                            row_h * 0.64,
-                            fc=PUBLIC_MASK_COLOR,
-                            ec=PUBLIC_MASK_EDGE,
-                            lw=0.7,
-                            r=0.08,
-                            z=20,
+                        draw_mosaic_mask(
+                            x + 0.15,
+                            ry + row_h * 0.15,
+                            block_w - 0.30,
+                            row_h * 0.70,
+                            seed_text=preview_text,
+                            z=22,
                         )
 
                         x += block_w
@@ -1553,6 +1608,51 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
+    def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
+        """
+        第二張圖公開預覽用像素馬賽克。
+        """
+        rounded(
+            x, y, w, h,
+            fc=(226 / 255, 232 / 255, 240 / 255, 0.34),
+            ec=(148 / 255, 163 / 255, 184 / 255, 0.42),
+            lw=0.45,
+            r=0.055,
+            z=z,
+        )
+
+        seed = sum(ord(ch) for ch in str(seed_text)) + int(x * 97) + int(y * 131)
+        cell_w = 0.085
+        cell_h = 0.070
+        pad_x = 0.08
+        pad_y = 0.06
+
+        cols = max(6, int((w - 2 * pad_x) / cell_w))
+        rows_n = max(2, int((h - 2 * pad_y) / cell_h))
+
+        for rr in range(rows_n):
+            for cc in range(cols):
+                v = (seed + rr * 37 + cc * 17 + (rr + cc) * 11) % 100
+                if v < 34:
+                    continue
+
+                color = PUBLIC_MOSAIC_COLORS[(seed + rr * 5 + cc * 3) % len(PUBLIC_MOSAIC_COLORS)]
+                bx = x + pad_x + cc * cell_w
+                by = y + pad_y + rr * cell_h
+                bw = cell_w * (0.62 + ((seed + cc * 7 + rr * 3) % 4) * 0.10)
+                bh = cell_h * (0.62 + ((seed + cc * 5 + rr * 9) % 4) * 0.08)
+
+                ax.add_patch(
+                    patches.Rectangle(
+                        (bx, by),
+                        bw,
+                        bh,
+                        linewidth=0,
+                        facecolor=color,
+                        zorder=z + 1,
+                    )
+                )
+
     def fmt_participant_brokers(row, limit=5):
         """
         顯示所有參與分點的淨累積買超金額。
@@ -1672,26 +1772,23 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                     preview_target = str(r.get("target", "")).strip()
                     if preview_target:
                         text(
-                            x + 0.20,
+                            x + 0.18,
                             ry + row_h / 2,
                             fit(preview_target, max(10, int(w * 6.0))),
                             13,
-                            "#64748B",
-                            FONT,
+                            "#334155",
+                            BOLD,
                             ha="left",
                             z=12,
                         )
 
-                    rounded(
-                        x + 0.16,
-                        ry + row_h * 0.18,
-                        w - 0.32,
-                        row_h * 0.64,
-                        fc=PUBLIC_MASK_COLOR,
-                        ec=PUBLIC_MASK_EDGE,
-                        lw=0.7,
-                        r=0.08,
-                        z=20,
+                    draw_mosaic_mask(
+                        x + 0.14,
+                        ry + row_h * 0.15,
+                        w - 0.28,
+                        row_h * 0.70,
+                        seed_text=preview_target,
+                        z=22,
                     )
                 else:
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
