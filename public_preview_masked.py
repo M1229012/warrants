@@ -102,8 +102,14 @@ EVENT_LEGEND_ITEMS = [
 
 # 公開發文版橫幅文案
 PUBLIC_PREVIEW_BANNER = "公開預覽版｜完整名單已更新於艾斯 DC 群"
-PUBLIC_MASK_TARGET = "████████"
-PUBLIC_MASK_CONTENT = "████████████"
+
+# 公開版遮罩標記：
+# 實際畫面不顯示文字，而是由繪圖函式畫成灰色圓角遮罩條。
+PUBLIC_MASK_BLOCK = "__PUBLIC_MASK_BLOCK__"
+PUBLIC_MASK_SKIP = "__PUBLIC_MASK_SKIP__"
+PUBLIC_MASK_TARGET = "__PUBLIC_MASK_TARGET__"
+PUBLIC_MASK_COLOR = "#CBD5E1"
+PUBLIC_MASK_EDGE = "#94A3B8"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1104,10 +1110,45 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
                 values, colors, aligns, bolds = row_builder(i, r)
                 x = margin_x
-                for val, w, c, a, is_bold in zip(values, col_widths, colors, aligns, bolds):
+                col_idx = 0
+                while col_idx < len(col_widths):
+                    val = values[col_idx]
+                    w = col_widths[col_idx]
+
+                    if val == PUBLIC_MASK_SKIP:
+                        x += w
+                        col_idx += 1
+                        continue
+
+                    if val == PUBLIC_MASK_BLOCK:
+                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊灰色圓角遮罩
+                        block_w = w
+                        if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP:
+                            block_w += col_widths[col_idx + 1]
+
+                        rounded(
+                            x + 0.16,
+                            ry + row_h * 0.26,
+                            block_w - 0.32,
+                            row_h * 0.48,
+                            fc=PUBLIC_MASK_COLOR,
+                            ec=PUBLIC_MASK_EDGE,
+                            lw=0.6,
+                            r=0.07,
+                            z=20,
+                        )
+
+                        x += block_w
+                        col_idx += 2 if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP else 1
+                        continue
+
+                    c = colors[col_idx]
+                    a = aligns[col_idx]
+                    is_bold = bolds[col_idx]
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                     text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 14, c, BOLD if is_bold else FONT, ha=a)
                     x += w
+                    col_idx += 1
         return y_top - table_h
 
     # Buy table
@@ -1116,7 +1157,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
     def buy_builder(i, r):
         return (
-            [str(i + 1), r["broker"], r["event"], PUBLIC_MASK_TARGET, PUBLIC_MASK_CONTENT, fmt_wan(r["amount"])],
+            [str(i + 1), r["broker"], r["event"], PUBLIC_MASK_BLOCK, PUBLIC_MASK_SKIP, fmt_wan(r["amount"])],
             [TEXT, TEXT, RED, MUTED, MUTED, RED],
             ["center", "left", "center", "left", "left", "right"],
             [True, True, True, True, False, True],
@@ -1134,7 +1175,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             ret_text = fmt_return_pct(r.get("return_pct"))
             ret_color = RED if safe_float(r.get("return_pct"), 0) > 0 else GREEN if safe_float(r.get("return_pct"), 0) < 0 else TEXT
             return (
-                [r["broker"], r["status"], PUBLIC_MASK_TARGET, PUBLIC_MASK_CONTENT, ret_text, fmt_wan(r["amount"])],
+                [r["broker"], r["status"], PUBLIC_MASK_BLOCK, PUBLIC_MASK_SKIP, ret_text, fmt_wan(r["amount"])],
                 [TEXT, GREEN, MUTED, MUTED, ret_color, GREEN],
                 ["left", "center", "left", "left", "right", "right"],
                 [True, True, True, False, True, True],
@@ -1609,8 +1650,21 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
             x = margin_x
             for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
-                px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
+                if val == PUBLIC_MASK_TARGET:
+                    rounded(
+                        x + 0.16,
+                        ry + row_h * 0.25,
+                        w - 0.32,
+                        row_h * 0.50,
+                        fc=PUBLIC_MASK_COLOR,
+                        ec=PUBLIC_MASK_EDGE,
+                        lw=0.6,
+                        r=0.07,
+                        z=20,
+                    )
+                else:
+                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
+                    text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
 
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
