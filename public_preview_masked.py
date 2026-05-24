@@ -825,6 +825,33 @@ def make_font(size, bold=False):
     return ImageFont.truetype(get_font_path(bold), size)
 
 
+
+
+def pixelate_image_regions(image_path: Path, regions: list[tuple[float, float, float, float]], fig_w: float, fig_h: float, pixel_scale: float = 0.12):
+    """對已輸出的 PNG 指定區域做真正的像素化馬賽克。"""
+    if not regions:
+        return
+    img = Image.open(image_path).convert("RGBA")
+    img_w, img_h = img.size
+    for x, y, w, h in regions:
+        if w <= 0 or h <= 0:
+            continue
+        left = max(0, int(round(x / fig_w * img_w)))
+        right = min(img_w, int(round((x + w) / fig_w * img_w)))
+        top = max(0, int(round((fig_h - (y + h)) / fig_h * img_h)))
+        bottom = min(img_h, int(round((fig_h - y) / fig_h * img_h)))
+        if right <= left or bottom <= top:
+            continue
+        region = img.crop((left, top, right, bottom))
+        rw, rh = region.size
+        small_w = max(6, int(rw * pixel_scale))
+        small_h = max(4, int(rh * pixel_scale))
+        mosaic = region.resize((small_w, small_h), Image.Resampling.BILINEAR)
+        mosaic = mosaic.resize((rw, rh), Image.Resampling.NEAREST)
+        img.paste(mosaic, (left, top))
+    img.save(image_path)
+
+
 def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
     """
     Matplotlib 動態版面引擎：
@@ -963,6 +990,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     def fit(s, n):
         s = str(s)
         return s if len(s) <= n else s[:n - 1] + "…"
+
+    mosaic_regions: list[tuple[float, float, float, float]] = []
 
     def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
         """
@@ -1121,6 +1150,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             # 此區字體比前一版放大 2
             text(x + card_w / 2, cy + broker_card_h - 0.21, b, 14.5, WHITE, BOLD, ha="center")
             text(x + card_w / 2, cy + broker_card_h - 0.60, f"平均 {s['avg_hold_days']:.1f} 天", 11.5, TEXT, FONT, ha="center")
+            mosaic_regions.append((x + card_w * 0.36, cy + broker_card_h - 0.69, card_w * 0.28, 0.14))
             ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.78, cy + 0.78], color=BORDER, linewidth=0.8)
 
             text(x + 0.12, cy + 0.56, "買超", 12.5, RED, BOLD)
@@ -1180,7 +1210,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                         continue
 
                     if val == PUBLIC_MASK_BLOCK:
-                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊像素馬賽克
+                        # 公開版：把「標的 / 權證」與「內容」合併成一整塊真正的像素馬賽克
                         block_w = w
                         if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP:
                             block_w += col_widths[col_idx + 1]
@@ -1189,28 +1219,19 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                         preview_content = str(r.get("content", "")).strip() if isinstance(r, dict) else ""
                         preview_text = "　".join([t for t in [preview_target, preview_content] if t])
 
-                        # 先畫原字，再用像素馬賽克蓋住，達成「右圖」那種效果
                         if preview_text:
                             text(
                                 x + 0.20,
                                 ry + row_h / 2,
                                 fit(preview_text, max(12, int(block_w * 5.8))),
                                 13,
-                                "#334155",
+                                TEXT,
                                 BOLD,
                                 ha="left",
                                 z=12,
                             )
 
-                        draw_mosaic_mask(
-                            x + 0.15,
-                            ry + row_h * 0.15,
-                            block_w - 0.30,
-                            row_h * 0.70,
-                            seed_text=preview_text,
-                            z=22,
-                        )
-
+                        mosaic_regions.append((x + 0.10, ry + row_h * 0.12, block_w - 0.20, row_h * 0.76))
                         x += block_w
                         col_idx += 2 if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP else 1
                         continue
@@ -1284,6 +1305,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
     plt.close(fig)
+    pixelate_image_regions(output_path, mosaic_regions, fig_w, fig_h)
+    pixelate_image_regions(output_path, mosaic_regions, fig_w, fig_h)
 
 
 
@@ -1608,6 +1631,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
+    mosaic_regions: list[tuple[float, float, float, float]] = []
+
     def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
         """
         第二張圖公開預覽用像素馬賽克。
@@ -1776,20 +1801,12 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                             ry + row_h / 2,
                             fit(preview_target, max(10, int(w * 6.0))),
                             13,
-                            "#334155",
+                            TEXT,
                             BOLD,
                             ha="left",
                             z=12,
                         )
-
-                    draw_mosaic_mask(
-                        x + 0.14,
-                        ry + row_h * 0.15,
-                        w - 0.28,
-                        row_h * 0.70,
-                        seed_text=preview_target,
-                        z=22,
-                    )
+                    mosaic_regions.append((x + 0.10, ry + row_h * 0.14, w - 0.20, row_h * 0.72))
                 else:
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                     text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
