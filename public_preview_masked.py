@@ -108,6 +108,7 @@ PUBLIC_PREVIEW_BANNER = "公開預覽版｜完整名單已更新於艾斯 DC 群
 PUBLIC_MASK_BLOCK = "__PUBLIC_MASK_BLOCK__"
 PUBLIC_MASK_SKIP = "__PUBLIC_MASK_SKIP__"
 PUBLIC_MASK_TARGET = "__PUBLIC_MASK_TARGET__"
+PUBLIC_MASK_PARTICIPANTS = "__PUBLIC_MASK_PARTICIPANTS__"
 # 像素馬賽克遮罩：用深淺灰色小方塊覆蓋敏感文字，保留公開預覽感
 PUBLIC_MASK_COLOR = (148 / 255, 163 / 255, 184 / 255, 0.36)
 PUBLIC_MASK_EDGE = (100 / 255, 116 / 255, 139 / 255, 0.50)
@@ -1150,7 +1151,8 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             # 此區字體比前一版放大 2
             text(x + card_w / 2, cy + broker_card_h - 0.21, b, 14.5, WHITE, BOLD, ha="center")
             text(x + card_w / 2, cy + broker_card_h - 0.60, f"平均 {s['avg_hold_days']:.1f} 天", 11.5, TEXT, FONT, ha="center")
-            mosaic_regions.append((x + card_w * 0.36, cy + broker_card_h - 0.69, card_w * 0.28, 0.14))
+            # 公開版：平均持有天數整行遮完整，避免只遮到中間數字
+            mosaic_regions.append((x + card_w * 0.26, cy + broker_card_h - 0.72, card_w * 0.48, 0.22))
             ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.78, cy + 0.78], color=BORDER, linewidth=0.8)
 
             text(x + 0.12, cy + 0.56, "買超", 12.5, RED, BOLD)
@@ -1784,10 +1786,10 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
-                fmt_participant_brokers(r),
+                PUBLIC_MASK_PARTICIPANTS,
             ]
 
-            colors = [TEXT, MUTED, net_color, TEXT, NAVY2, TEXT]
+            colors = [TEXT, MUTED, net_color, TEXT, NAVY2, MUTED]
             aligns = ["center", "left", "right", "center", "center", "left"]
             bolds = [True, True, True, True, True, True]
 
@@ -1807,6 +1809,20 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                             z=12,
                         )
                     mosaic_regions.append((x + 0.10, ry + row_h * 0.14, w - 0.20, row_h * 0.72))
+                elif val == PUBLIC_MASK_PARTICIPANTS:
+                    preview_participants = fmt_participant_brokers(r)
+                    if preview_participants:
+                        text(
+                            x + 0.12,
+                            ry + row_h / 2,
+                            preview_participants,
+                            14,
+                            TEXT,
+                            BOLD if is_bold else FONT,
+                            ha="left",
+                            z=12,
+                        )
+                    mosaic_regions.append((x + 0.08, ry + row_h * 0.14, w - 0.16, row_h * 0.72))
                 else:
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                     text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
