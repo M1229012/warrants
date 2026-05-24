@@ -1833,6 +1833,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
     plt.close(fig)
+    pixelate_image_regions(output_path, mosaic_regions, fig_w, fig_h)
 
 
 # ══════════════════════════════════════════════════════════════════════
