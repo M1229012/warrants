@@ -108,8 +108,9 @@ PUBLIC_PREVIEW_BANNER = "公開預覽版｜完整名單已更新於艾斯 DC 群
 PUBLIC_MASK_BLOCK = "__PUBLIC_MASK_BLOCK__"
 PUBLIC_MASK_SKIP = "__PUBLIC_MASK_SKIP__"
 PUBLIC_MASK_TARGET = "__PUBLIC_MASK_TARGET__"
-PUBLIC_MASK_COLOR = "#CBD5E1"
-PUBLIC_MASK_EDGE = "#94A3B8"
+# 半透明遮罩：讓底下內容隱約可見，保留一點「預覽感」
+PUBLIC_MASK_COLOR = (148 / 255, 163 / 255, 184 / 255, 0.38)
+PUBLIC_MASK_EDGE = (100 / 255, 116 / 255, 139 / 255, 0.55)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1121,20 +1122,37 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                         continue
 
                     if val == PUBLIC_MASK_BLOCK:
-                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊灰色圓角遮罩
+                        # 公開版：把「標的 / 權證」與「內容」合併成同一整塊半透明圓角遮罩
                         block_w = w
                         if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP:
                             block_w += col_widths[col_idx + 1]
 
+                        # 底下先畫淡淡的原始內容，再蓋上半透明遮罩，保留「預覽感」
+                        preview_target = str(r.get("target", "")).strip() if isinstance(r, dict) else ""
+                        preview_content = str(r.get("content", "")).strip() if isinstance(r, dict) else ""
+                        preview_text = "　".join([t for t in [preview_target, preview_content] if t])
+
+                        if preview_text:
+                            text(
+                                x + 0.24,
+                                ry + row_h / 2,
+                                fit(preview_text, max(12, int(block_w * 5.8))),
+                                13,
+                                "#64748B",
+                                FONT,
+                                ha="left",
+                                z=12,
+                            )
+
                         rounded(
                             x + 0.16,
-                            ry + row_h * 0.26,
+                            ry + row_h * 0.18,
                             block_w - 0.32,
-                            row_h * 0.48,
+                            row_h * 0.64,
                             fc=PUBLIC_MASK_COLOR,
                             ec=PUBLIC_MASK_EDGE,
-                            lw=0.6,
-                            r=0.07,
+                            lw=0.7,
+                            r=0.08,
                             z=20,
                         )
 
@@ -1651,15 +1669,28 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             x = margin_x
             for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
                 if val == PUBLIC_MASK_TARGET:
+                    preview_target = str(r.get("target", "")).strip()
+                    if preview_target:
+                        text(
+                            x + 0.20,
+                            ry + row_h / 2,
+                            fit(preview_target, max(10, int(w * 6.0))),
+                            13,
+                            "#64748B",
+                            FONT,
+                            ha="left",
+                            z=12,
+                        )
+
                     rounded(
                         x + 0.16,
-                        ry + row_h * 0.25,
+                        ry + row_h * 0.18,
                         w - 0.32,
-                        row_h * 0.50,
+                        row_h * 0.64,
                         fc=PUBLIC_MASK_COLOR,
                         ec=PUBLIC_MASK_EDGE,
-                        lw=0.6,
-                        r=0.07,
+                        lw=0.7,
+                        r=0.08,
                         z=20,
                     )
                 else:
