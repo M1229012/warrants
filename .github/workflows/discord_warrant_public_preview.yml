@@ -62,9 +62,9 @@ jobs:
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: |
           if [ -n "$TARGET_DATE" ]; then
-            python discord_warrant_report_gsheet.py --date "$TARGET_DATE"
+            python public_preview_masked.py --date "$TARGET_DATE"
           else
-            python discord_warrant_report_gsheet.py
+            python public_preview_masked.py
           fi
 
       - name: Upload generated images as artifact
