@@ -1189,7 +1189,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
     # Buy table
     buy_headers = ["排名", "分點", "事件", "標的 / 權證", "內容", "買超金額"]
-    buy_col_w = [0.75, 2.25, 0.90, 2.55, 3.05, 2.50]
+    buy_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
 
     def buy_builder(i, r):
         return (
