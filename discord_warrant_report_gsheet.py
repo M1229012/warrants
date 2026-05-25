@@ -1205,7 +1205,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         y -= gap
         sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "報酬率", "賣方金額"]
-        sell_col_w = [2.05, 1.05, 2.75, 2.55, 1.25, 2.35]
+        sell_col_w = [2.05, 1.05, 2.75, 2.25, 1.55, 2.35]
 
         def sell_builder(i, r):
             ret_text = fmt_return_pct(r.get("return_pct"))
