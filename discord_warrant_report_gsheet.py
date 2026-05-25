@@ -852,7 +852,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         if kind == "buy":
             add_count = max((safe_int(i.get("add_count", 0), 0) for i in items), default=0)
             if add_count > 1:
-                add_count_label = f"加碼#{add_count}"
+                add_count_label = f"加碼{add_count}"
                 if not str(content).startswith(f"{add_count_label}｜"):
                     content = f"{add_count_label}｜{content}"
 
@@ -1181,9 +1181,30 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
                 values, colors, aligns, bolds = row_builder(i, r)
                 x = margin_x
-                for val, w, c, a, is_bold in zip(values, col_widths, colors, aligns, bolds):
+                for val, w, c, a, is_bold, h in zip(values, col_widths, colors, aligns, bolds, headers):
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 14, c, BOLD if is_bold else FONT, ha=a)
+                    display_val = fit(val, max(5, int(w * 6.0)))
+
+                    # 只針對買超明細「內容」欄，把「加碼N｜」前綴獨立畫成粗體。
+                    # 後面的權證名稱維持原本一般字體，避免整格都變粗。
+                    if h == "內容" and a == "left":
+                        m = re.match(r"^(加碼\d+｜)(.*)$", str(display_val))
+                        if m:
+                            prefix = m.group(1)
+                            rest = m.group(2)
+
+                            text(px, ry + row_h / 2, prefix, 14, c, BOLD, ha="left")
+
+                            prefix_offset = 0.0
+                            for ch in prefix:
+                                prefix_offset += 0.085 if ord(ch) < 128 else 0.17
+                            prefix_offset += 0.03
+
+                            text(px + prefix_offset, ry + row_h / 2, rest, 14, c, FONT, ha="left")
+                        else:
+                            text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
+                    else:
+                        text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                     x += w
         return y_top - table_h
 
@@ -1205,7 +1226,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         y -= gap
         sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "報酬率", "賣方金額"]
-        sell_col_w = [2.05, 1.05, 2.75, 2.25, 1.55, 2.35]
+        sell_col_w = [2.05, 1.05, 2.25, 2.75, 1.55, 2.35]
 
         def sell_builder(i, r):
             ret_text = fmt_return_pct(r.get("return_pct"))
