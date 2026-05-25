@@ -17,6 +17,7 @@
 - GOOGLE_SHEET_ID：建議使用，最穩
 - GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟，預設「權證分點籌碼」
 - TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
+- ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
 SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.2"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
 LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "22"))
+# 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
+ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
 
 # 若你未來想讓「出清不管金額都顯示」，改成 "1"
 DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
@@ -544,6 +547,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
         "warrant_list_count": count_warrants_in_text(warrant_name),
         "amount": amount,
         "qty": qty,
+        "add_count": 0,
         "sheet": sheet_name,
     })
 
@@ -569,6 +573,74 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
         "return_pct": normalize_return_pct(return_pct),
         "sheet": sheet_name,
     })
+
+
+def collect_broker_underlying_add_count_map(target: date, lookback_days: int = ADD_COUNT_LOOKBACK_TRADING_DAYS) -> dict[tuple[str, str], int]:
+    """
+    計算「同一分點 + 同一標的」在近 N 個有效交易日內，
+    出現達買超門檻事件的不同日期次數。
+
+    顯示規則：
+    - 第 1 次加碼：圖卡不顯示任何標籤
+    - 第 2 次以上：圖卡顯示「第N次加碼」
+
+    注意：
+    同一天同一分點同一標的即使同時出現在 A/B/C/D，仍只算 1 次。
+    這裡的 lookback_days 專門給第幾次加碼使用，不會影響原本近一個月 TOP15 圖。
+    """
+    try:
+        trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
+    except Exception:
+        trading_dates = []
+
+    if not trading_dates:
+        return {}
+
+    date_set = set(trading_dates)
+    counter: dict[tuple[str, str], set[date]] = defaultdict(set)
+
+    def add_count_event(row, event_date, amount):
+        if not event_date or event_date not in date_set or event_date > target:
+            return
+
+        broker = str(row.get("分點", "")).strip()
+        if broker not in TRACKED_BROKERS:
+            return
+
+        underlying = normalize_underlying(row.get("標的股"))
+        if not underlying:
+            return
+
+        if safe_float(amount) < BUY_THRESHOLD:
+            return
+
+        counter[(broker, underlying)].add(event_date)
+
+    # A：單檔權證大買
+    try:
+        A = read_gsheet_table(SHEET_A, ["分點", "標的股", "買進日", "買進金額"])
+        for _, r in A.iterrows():
+            add_count_event(r, parse_date_value(r.get("買進日")), r.get("買進金額"))
+    except Exception:
+        pass
+
+    # B/C/D：同標的合買、3 日累積、10 日累積
+    plans = [
+        (SHEET_B, "事件日"),
+        (SHEET_C, "結束日"),
+        (SHEET_D, "結束日"),
+    ]
+
+    for sheet_name, date_col in plans:
+        try:
+            df = read_gsheet_table(sheet_name, ["分點", "標的股", date_col, "買超金額"])
+        except Exception:
+            continue
+
+        for _, r in df.iterrows():
+            add_count_event(r, parse_date_value(r.get(date_col)), r.get("買超金額"))
+
+    return {key: len(days) for key, days in counter.items()}
 
 
 def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
@@ -644,6 +716,11 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
                     sells, broker, "出清", event, r.get("標的股"), r.get("權證清單"),
                     safe_float(r.get("出清賣出金額")), safe_int(r.get("買超張數")), sheet_name, r.get("出清獲利%"), r.get("買超金額")
                 )
+
+    add_count_map = collect_broker_underlying_add_count_map(target, ADD_COUNT_LOOKBACK_TRADING_DAYS)
+    for item in buys:
+        key = (item.get("broker", ""), item.get("underlying", ""))
+        item["add_count"] = safe_int(add_count_map.get(key, 1), 1)
 
     return buys, sells
 
@@ -770,6 +847,15 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             if sell_event_label and not str(content).startswith(f"{sell_event_label}｜"):
                 content = f"{sell_event_label}｜{content}"
 
+        add_count = 0
+        add_count_label = ""
+        if kind == "buy":
+            add_count = max((safe_int(i.get("add_count", 0), 0) for i in items), default=0)
+            if add_count > 1:
+                add_count_label = f"第{add_count}次加碼"
+                if not str(content).startswith(f"{add_count_label}｜"):
+                    content = f"{add_count_label}｜{content}"
+
         result.append({
             "broker": broker,
             "status": status,
@@ -781,6 +867,8 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             "return_pct": return_pct,
             "count": warrant_count,
             "kind": kind,
+            "add_count": add_count,
+            "add_count_label": add_count_label,
         })
 
     result.sort(key=lambda x: x["amount"], reverse=True)
@@ -1642,6 +1730,7 @@ def main():
         f"目標日期：{target:%Y-%m-%d}\n"
         f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
+        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日\n"
         f"輸出圖檔1：{output_path}\n"
         f"輸出圖檔2：{consensus_output_path}"
     )
