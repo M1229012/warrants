@@ -852,7 +852,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         if kind == "buy":
             add_count = max((safe_int(i.get("add_count", 0), 0) for i in items), default=0)
             if add_count > 1:
-                add_count_label = f"第{add_count}次加碼"
+                add_count_label = f"加碼#{add_count}"
                 if not str(content).startswith(f"{add_count_label}｜"):
                     content = f"{add_count_label}｜{content}"
 
