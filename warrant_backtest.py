@@ -59,11 +59,12 @@ PRESCAN_WORKERS = int(os.getenv("PRESCAN_WORKERS", "60"))
 FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
 
 # 加速模式：
-# 1. 有候選組合快取時，預設不再每天掃描全市場權證，只更新既有候選組合的 API5 歷史資料。
-#    若需要重新發現新權證 / 新候選組合，可執行前設定 FAST_SKIP_RECENT_PRESCAN=0。
+# 1. 有候選組合快取時，仍會每天補掃全市場最近 CACHE_RECENT_SCAN_DAYS 天，
+#    用來發現新權證 / 新候選組合；舊候選資料則優先使用快取，避免重抓完整歷史。
+#    FAST_SKIP_RECENT_PRESCAN 僅保留為相容舊設定，不再作為每日主流程的跳過依據。
 # 2. B / C / D 工作表的 D+ 欄位只使用標的股價格，預設不再額外抓群組事件中每一檔權證價格。
 #    若未來需要群組事件權證明細價格，可設定 FETCH_GROUP_WARRANT_PRICES=1。
-FAST_SKIP_RECENT_PRESCAN = os.getenv("FAST_SKIP_RECENT_PRESCAN", "1").strip().lower() not in ("0", "false", "no")
+FAST_SKIP_RECENT_PRESCAN = os.getenv("FAST_SKIP_RECENT_PRESCAN", "0").strip().lower() not in ("0", "false", "no")
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
 
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
@@ -3079,7 +3080,46 @@ def get_all_call_warrants():
     if cached_warrants:
         print("【Step 1】讀取認購權證清單快取...")
         print(f"  ✅ 已讀取權證清單快取：{len(cached_warrants)} 支")
-        return cached_warrants
+
+        # 每日執行仍要即時更新權證清單，避免新上市 / 新出現的權證不在 warrants_cache.csv，
+        # 導致後續全市場最近資料預掃描也完全掃不到該權證。
+        print("  🔄 即時更新今日認購權證清單，並與快取合併...")
+        live_warrants = get_all_call_warrants_live()
+
+        if not live_warrants:
+            print("  ⚠️ 即時權證清單取得失敗，改用既有權證清單快取。")
+            return cached_warrants
+
+        merged = {}
+        for w in cached_warrants:
+            code = str(w.get("代號", "")).strip()
+            if code:
+                merged[code] = w
+
+        old_count = len(merged)
+        new_count = 0
+
+        for w in live_warrants:
+            code = str(w.get("代號", "")).strip()
+            if not code:
+                continue
+
+            if code not in merged:
+                new_count += 1
+
+            # 以即時清單為準更新名稱、標的股與標的名稱，
+            # 避免舊快取的標的資訊不完整或過期。
+            merged[code] = w
+
+        warrants = list(merged.values())
+        save_warrants_cache(warrants)
+
+        print(
+            f"  ✅ 權證清單更新完成：原快取 {old_count:,} 支，"
+            f"即時清單 {len(live_warrants):,} 支，新增 {new_count:,} 支，合併後 {len(warrants):,} 支"
+        )
+
+        return warrants
 
     warrants = get_all_call_warrants_live()
     save_warrants_cache(warrants)
@@ -3231,16 +3271,14 @@ def prescan_all(warrants, broker_map):
         print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates)} 組")
 
         if FAST_SKIP_RECENT_PRESCAN:
-            # 每日執行時最大的耗時通常不是日期範圍，而是 prescan_all_live 仍然會掃描全市場所有權證。
-            # 有候選組合快取時，直接更新既有候選組合的 API5 歷史資料，避免每天對全市場權證逐一 api4_get。
-            # 若要重新發現新權證 / 新候選組合，請設定 FAST_SKIP_RECENT_PRESCAN=0。
-            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in cached_candidates}
-            print("  ⚡ 加速模式：已略過全市場最近資料預掃描，改為更新既有候選組合。")
-            print("  ⚠️ 若需重新發現新權證候選，請設定 FAST_SKIP_RECENT_PRESCAN=0 後再執行。")
-            print(f"  ✅ 本次需檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
-            return cached_candidates
+            print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前每日主流程仍會補掃全市場最近資料，避免漏掉新權證 / 新候選組合。")
 
-        print(f"  🔄 補掃最近 {CACHE_RECENT_SCAN_DAYS} 天，用來判斷需要更新的候選組合...")
+        # 正式每日流程：
+        # 1. 先保留候選組合快取，避免重抓所有完整歷史。
+        # 2. 再輕量補掃全市場最近 CACHE_RECENT_SCAN_DAYS 天，用 API4 找新出現的目標分點。
+        # 3. 只把最近有出現目標分點的候選放進 PRESCAN_REFRESH_KEYS，
+        #    主流程 Step 3b 才會針對這些候選用 API5 補抓完整歷史。
+        print(f"  🔄 補掃全市場最近 {CACHE_RECENT_SCAN_DAYS} 天，用來發現新權證 / 新候選組合...")
 
         recent_candidates = prescan_all_live(warrants, broker_map, scan_days=CACHE_RECENT_SCAN_DAYS)
         PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
@@ -3252,7 +3290,7 @@ def prescan_all(warrants, broker_map):
             f"  ✅ 候選組合快取合併完成：舊 {len(cached_candidates)} 組，"
             f"最近掃到 {len(recent_candidates)} 組，合併後 {len(merged_candidates)} 組"
         )
-        print(f"  ✅ 本次需檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
+        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
 
         return merged_candidates
 
