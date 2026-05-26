@@ -3,11 +3,11 @@ name: Warrant Backtest Google Sheet
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 17 * * 1-5"
-      timezone: "Asia/Taipei"
+    # Asia/Taipei 17:10 = UTC 09:10
+    - cron: "10 9 * * 1-5"
 
-    - cron: "5,35 21 * * 1-5"
-      timezone: "Asia/Taipei"
+    # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
+    - cron: "5,35 13 * * 1-5"
 
 jobs:
   run-backtest:
@@ -18,13 +18,21 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
       USE_CACHE: "1"
+      FORCE_FULL_CACHE_REFRESH: "0"
+
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
       GSHEET_NAME: "權證分點籌碼"
+      GOOGLE_SHEET_NAME: "權證分點籌碼"
+      GSHEET_CACHE_ENABLED: "1"
+      GSHEET_RESULT_ENABLED: "1"
+
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+
       FAST_SKIP_RECENT_PRESCAN: "0"
       CACHE_RECENT_SCAN_DAYS: "3"
       FETCH_GROUP_WARRANT_PRICES: "0"
+
       MAX_WORKERS: "50"
       PRICE_WORKERS: "60"
       PRESCAN_WORKERS: "60"
