@@ -912,18 +912,31 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         buy_amount = 0
 
         lookup_info = event_lookup.get((broker, warrant_code))
-        if lookup_info:
-            if is_unclassified_event(event):
-                event = lookup_info.get("event", event)
-            if not underlying:
-                underlying = lookup_info.get("underlying", underlying)
-            if not warrant_name:
-                warrant_name = lookup_info.get("warrant_name", warrant_name)
-            return_pct = lookup_info.get("return_pct")
-            buy_amount = lookup_info.get("buy_amount", 0)
+
+        # 重要：
+        # 「每日賣出明細」來自實際分點賣出資料，可能包含同分點散戶或非本策略事件的賣出。
+        # 為避免把沒有先經過 A/B/C/D 買超條件篩選的權證放進圖卡，
+        # 這裡一律要求「分點 + 權證代號」必須曾出現在 A/B/C/D 事件中。
+        if not lookup_info:
+            continue
 
         if is_unclassified_event(event):
-            event = "未歸類"
+            event = lookup_info.get("event", event)
+
+        if not underlying:
+            underlying = lookup_info.get("underlying", underlying)
+
+        if not warrant_name:
+            warrant_name = lookup_info.get("warrant_name", warrant_name)
+
+        return_pct = lookup_info.get("return_pct")
+        buy_amount = lookup_info.get("buy_amount", 0)
+
+        if is_unclassified_event(event):
+            # 能進到這裡代表權證有在 A/B/C/D lookup 裡，
+            # 但事件代號仍沒有解析成功。為了避免圖卡出現「未歸類」，
+            # 直接跳過，保留圖卡只顯示確定通過 A/B/C/D 的資料。
+            continue
 
         sell_amount = safe_float(r.get("賣出金額"), 0)
         sell_qty = safe_int(r.get("賣出張數"), 0)
@@ -1628,6 +1641,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
     agg = {}
 
+    # 只記錄本次近 N 個有效交易日內，真正被 A/B/C/D 買超事件納入統計的
+    # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單
+    # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
+    counted_warrant_keys: set[tuple[str, str]] = set()
+
     def ensure_item(underlying, warrant_text=""):
         code = normalize_underlying(underlying, warrant_text)
         if not code:
@@ -1686,6 +1704,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if item["last_date"] is None or event_date > item["last_date"]:
             item["last_date"] = event_date
 
+        # 建立本次 TOP15 統計範圍內的權證白名單。
+        # A 表通常是一檔權證；B/C/D 則從權證清單拆出多檔權證。
+        if sheet_name == SHEET_A:
+            warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
+            if warrant_code:
+                counted_warrant_keys.add((broker, warrant_code))
+        else:
+            for warrant_code, _ in parse_warrant_items_from_text(warrant_text):
+                if warrant_code:
+                    counted_warrant_keys.add((broker, warrant_code))
+
     def add_sell_row(row, event_date, amount):
         if not event_date or event_date not in date_set:
             return
@@ -1710,8 +1739,9 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     try:
         A = read_gsheet_table(
             SHEET_A,
-            ["分點", "標的股", "買進日", "買進金額", "買進張數",
-             "減碼日", "減碼均價", "出清日", "出清均價", "權證名稱"]
+            ["分點", "標的股", "權證代碼", "權證代號", "權證名稱",
+             "買進日", "買進金額", "買進張數",
+             "減碼日", "減碼均價", "出清日", "出清均價"]
         )
 
         for _, r in A.iterrows():
@@ -1748,7 +1778,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     try:
         sell_df = read_gsheet_table_optional(
             SHEET_DAILY_SELL,
-            ["日期", "分點", "標的股", "權證名稱", "賣出金額"]
+            ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
         )
 
         if not sell_df.empty:
@@ -1759,6 +1789,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
                 broker = str(r.get("分點", "")).strip()
                 if broker not in TRACKED_BROKERS:
+                    continue
+
+                warrant_code = normalize_warrant_code(r.get("權證代號", ""))
+                if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
                     continue
 
                 warrant_text = r.get("權證名稱", "")
