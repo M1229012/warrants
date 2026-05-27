@@ -854,7 +854,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             if add_count > 1:
                 add_count_label = f"加碼{add_count}"
                 if not str(content).startswith(f"{add_count_label}｜"):
-                    content = f"{add_count_label}｜{content}"
+                    content = f"{add_count_label}｜ {content}"
 
         result.append({
             "broker": broker,
