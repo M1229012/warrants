@@ -2934,23 +2934,18 @@ def build_stock_map(df):
     return stock_map
 
 
-def normalize_stock_name_text(value):
-    """
-    股票名稱比對用的標準化函式：
-    只移除半形 / 全形空白，不改動原本中文內容。
-    """
-    return str(value).strip().replace(" ", "").replace("　", "")
+def normalize_stock_name_text(s):
+    return str(s).strip().replace(" ", "").replace("　", "")
 
 
 def make_stock_aliases(stock_name, exact_stock_names=None):
     """
-    建立股票簡稱，但避免「簡稱」撞到另一檔股票的完整名稱。
+    建立股票名稱候選別名，但避免把某一檔股票的簡稱撞到另一檔真實股票名稱。
 
     修正重點：
-    - 3266「昇陽」與 8028「昇陽半 / 昇陽半導體」容易互相誤判。
-    - 若某檔股票移除尾綴後得到的簡稱，剛好是另一檔股票完整名稱，就不使用該簡稱。
-      例如「昇陽半導體」不可再產生「昇陽」作為 alias，因為「昇陽」本身就是 3266。
-    - 仍保留較長前綴，例如「昇陽半」，讓「昇陽半XXX購」可以正確對到 8028。
+    1. 8028 昇陽半導體可產生「昇陽半」，讓「昇陽半XXX購」正確對到 8028。
+    2. 8028 昇陽半導體不可產生「昇陽」，因為「昇陽」本身是 3266。
+    3. 後續比對會用最長前綴優先，因此「昇陽半」會優先於「昇陽」。
     """
     name = normalize_stock_name_text(stock_name)
     aliases = set()
@@ -2959,6 +2954,7 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
         return aliases
 
     exact_stock_names = exact_stock_names or set()
+
     aliases.add(name)
 
     suffixes = [
@@ -2978,19 +2974,18 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
                 candidate = stripped[:-len(suffix)]
                 stripped = candidate
 
-                # 如果簡稱剛好是另一檔股票的完整名稱，就不要加入。
-                # 例如：昇陽半導體 -> 昇陽，但「昇陽」本身是 3266。
+                # 如果切出來的簡稱剛好是另一檔股票的完整名稱，就不要加入。
+                # 例如「昇陽半導體」切成「昇陽」，但「昇陽」本身是 3266。
                 if candidate not in exact_stock_names or candidate == name:
                     aliases.add(candidate)
 
                 changed = True
                 break
 
-    # 權證名稱有時會使用股名較短前綴，例如「昇陽半」代表「昇陽半導體」。
-    # 但若前綴剛好撞到另一檔股票完整名稱，就跳過，避免把 3266 昇陽誤判成 8028 昇陽半。
     for n in range(min(4, len(name)), 1, -1):
         candidate = name[:n]
 
+        # 前綴簡稱若撞到另一檔真實股票名稱，也不要加入。
         if candidate in exact_stock_names and candidate != name:
             continue
 
@@ -2999,65 +2994,86 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
     return {a for a in aliases if len(a) >= 2}
 
 
-def find_underlying_info(warrant_name, stock_map):
-    wname = normalize_stock_name_text(warrant_name)
+def build_underlying_resolver(stock_map):
+    """
+    預先建立完整股名與安全 alias 對照表。
 
-    # 建立「標準化完整股名 -> 代號 / 原股名」對照表。
-    exact_name_map = {}
+    重要：
+    原本 find_underlying_info() 會先用完整股名比對，導致「昇陽半XXX購」
+    先被短股名「昇陽」吃到，誤判成 3266。
+    這版改成完整股名與 alias 全部放在同一個候選表，統一採「最長前綴優先」。
+    因此「昇陽半」會優先於「昇陽」。
+    """
+    exact_stock_names = set()
 
-    for stock_name, stock_code in stock_map.items():
+    for stock_name in stock_map.keys():
         sname = normalize_stock_name_text(stock_name)
-
         if sname:
-            exact_name_map[sname] = (stock_code, stock_name)
+            exact_stock_names.add(sname)
 
-    exact_stock_names = set(exact_name_map.keys())
-
-    # 第一層：完整股名直接比對，最安全。
-    # 例如「昇陽元大...」應直接對到 3266 昇陽；
-    # 「昇陽半元大...」則應優先對到 8028 昇陽半 / 昇陽半導體。
-    for sname in sorted(exact_stock_names, key=len, reverse=True):
-        if sname and wname.startswith(sname):
-            stock_code, stock_name = exact_name_map[sname]
-            return stock_code, stock_name
-
-    # 第二層：權證名稱常會使用簡稱，例如「雍智國票59購01」對應「雍智科技」。
-    # 這裡仍保留簡稱比對，但 make_stock_aliases() 會排除會撞到其他真實股票名稱的簡稱。
     candidates = []
+    seen = set()
+
+    def add_candidate(prefix, stock_code, stock_name, is_exact_alias):
+        prefix_norm = normalize_stock_name_text(prefix)
+        stock_name_norm = normalize_stock_name_text(stock_name)
+
+        if not prefix_norm:
+            return
+
+        key = (prefix_norm, str(stock_code), stock_name_norm)
+
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        candidates.append({
+            "prefix": prefix_norm,
+            "prefix_len": len(prefix_norm),
+            "is_exact_alias": 1 if is_exact_alias else 0,
+            "stock_name_len": len(stock_name_norm),
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+        })
 
     for stock_name, stock_code in stock_map.items():
         stock_name_norm = normalize_stock_name_text(stock_name)
 
+        # 完整股名也是候選，但不再獨立提前回傳，避免短完整股名壓過較長 alias。
+        add_candidate(stock_name_norm, stock_code, stock_name, True)
+
         for alias in make_stock_aliases(stock_name, exact_stock_names):
             alias_norm = normalize_stock_name_text(alias)
+            add_candidate(alias_norm, stock_code, stock_name, alias_norm == stock_name_norm)
 
-            if alias_norm and wname.startswith(alias_norm):
-                candidates.append({
-                    "alias_len": len(alias_norm),
-                    "is_exact_alias": 1 if alias_norm == stock_name_norm else 0,
-                    "stock_name_len": len(stock_name_norm),
-                    "stock_code": stock_code,
-                    "stock_name": stock_name,
-                    "alias": alias_norm,
-                })
+    candidates = sorted(
+        candidates,
+        key=lambda x: (
+            x["prefix_len"],
+            x["is_exact_alias"],
+            -x["stock_name_len"],
+        ),
+        reverse=True
+    )
 
-    if candidates:
-        # 排序原則：
-        # 1. alias 越長越優先，例如「昇陽半」優先於「昇陽」
-        # 2. alias 若等於原始股名，優先
-        # 3. 若仍相同，股名較短者優先，避免長股名用過短簡稱壓過真正短股名
-        candidates = sorted(
-            candidates,
-            key=lambda x: (
-                x["alias_len"],
-                x["is_exact_alias"],
-                -x["stock_name_len"],
-            ),
-            reverse=True
-        )
+    return candidates
 
-        best = candidates[0]
-        return best["stock_code"], best["stock_name"]
+
+def find_underlying_info(warrant_name, stock_map, resolver=None):
+    wname = normalize_stock_name_text(warrant_name)
+
+    if not wname:
+        return "", ""
+
+    if resolver is None:
+        resolver = build_underlying_resolver(stock_map)
+
+    for rec in resolver:
+        prefix = rec["prefix"]
+
+        if prefix and wname.startswith(prefix):
+            return rec["stock_code"], rec["stock_name"]
 
     return "", ""
 
@@ -3103,6 +3119,9 @@ def get_all_call_warrants_live():
         except Exception as e:
             print(f"  ⚠️ {market_name} ISIN 清單取得失敗：{e}")
 
+    # 只建立一次 resolver，避免每檔權證都重新掃全部股票與 alias，保持執行速度。
+    underlying_resolver = build_underlying_resolver(stock_map)
+
     seen_warrants = set()
 
     for market_name, df in all_dfs:
@@ -3124,7 +3143,7 @@ def get_all_call_warrants_live():
                     continue
 
                 seen_warrants.add(code)
-                underlying, underlying_name = find_underlying_info(name, stock_map)
+                underlying, underlying_name = find_underlying_info(name, stock_map, underlying_resolver)
 
                 warrants.append({
                     "代號": code,
@@ -3135,7 +3154,6 @@ def get_all_call_warrants_live():
 
     print(f"  ✅ 共 {len(warrants)} 支認購權證")
     return warrants
-
 
 
 
