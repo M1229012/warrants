@@ -2934,13 +2934,31 @@ def build_stock_map(df):
     return stock_map
 
 
-def make_stock_aliases(stock_name):
-    name = str(stock_name).strip()
+def normalize_stock_name_text(value):
+    """
+    股票名稱比對用的標準化函式：
+    只移除半形 / 全形空白，不改動原本中文內容。
+    """
+    return str(value).strip().replace(" ", "").replace("　", "")
+
+
+def make_stock_aliases(stock_name, exact_stock_names=None):
+    """
+    建立股票簡稱，但避免「簡稱」撞到另一檔股票的完整名稱。
+
+    修正重點：
+    - 3266「昇陽」與 8028「昇陽半 / 昇陽半導體」容易互相誤判。
+    - 若某檔股票移除尾綴後得到的簡稱，剛好是另一檔股票完整名稱，就不使用該簡稱。
+      例如「昇陽半導體」不可再產生「昇陽」作為 alias，因為「昇陽」本身就是 3266。
+    - 仍保留較長前綴，例如「昇陽半」，讓「昇陽半XXX購」可以正確對到 8028。
+    """
+    name = normalize_stock_name_text(stock_name)
     aliases = set()
 
     if not name:
         return aliases
 
+    exact_stock_names = exact_stock_names or set()
     aliases.add(name)
 
     suffixes = [
@@ -2957,42 +2975,89 @@ def make_stock_aliases(stock_name):
         changed = False
         for suffix in suffixes:
             if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
-                stripped = stripped[:-len(suffix)]
-                aliases.add(stripped)
+                candidate = stripped[:-len(suffix)]
+                stripped = candidate
+
+                # 如果簡稱剛好是另一檔股票的完整名稱，就不要加入。
+                # 例如：昇陽半導體 -> 昇陽，但「昇陽」本身是 3266。
+                if candidate not in exact_stock_names or candidate == name:
+                    aliases.add(candidate)
+
                 changed = True
                 break
 
+    # 權證名稱有時會使用股名較短前綴，例如「昇陽半」代表「昇陽半導體」。
+    # 但若前綴剛好撞到另一檔股票完整名稱，就跳過，避免把 3266 昇陽誤判成 8028 昇陽半。
     for n in range(min(4, len(name)), 1, -1):
-        aliases.add(name[:n])
+        candidate = name[:n]
+
+        if candidate in exact_stock_names and candidate != name:
+            continue
+
+        aliases.add(candidate)
 
     return {a for a in aliases if len(a) >= 2}
 
 
 def find_underlying_info(warrant_name, stock_map):
-    wname = str(warrant_name).strip().replace(" ", "").replace("　", "")
+    wname = normalize_stock_name_text(warrant_name)
+
+    # 建立「標準化完整股名 -> 代號 / 原股名」對照表。
+    exact_name_map = {}
+
+    for stock_name, stock_code in stock_map.items():
+        sname = normalize_stock_name_text(stock_name)
+
+        if sname:
+            exact_name_map[sname] = (stock_code, stock_name)
+
+    exact_stock_names = set(exact_name_map.keys())
 
     # 第一層：完整股名直接比對，最安全。
-    for stock_name in sorted(stock_map.keys(), key=len, reverse=True):
-        sname = str(stock_name).strip().replace(" ", "").replace("　", "")
-
+    # 例如「昇陽元大...」應直接對到 3266 昇陽；
+    # 「昇陽半元大...」則應優先對到 8028 昇陽半 / 昇陽半導體。
+    for sname in sorted(exact_stock_names, key=len, reverse=True):
         if sname and wname.startswith(sname):
-            return stock_map[stock_name], stock_name
+            stock_code, stock_name = exact_name_map[sname]
+            return stock_code, stock_name
 
     # 第二層：權證名稱常會使用簡稱，例如「雍智國票59購01」對應「雍智科技」。
-    # 因此用常見股名簡稱補判斷，但仍採最長別名優先，降低誤判。
+    # 這裡仍保留簡稱比對，但 make_stock_aliases() 會排除會撞到其他真實股票名稱的簡稱。
     candidates = []
 
     for stock_name, stock_code in stock_map.items():
-        for alias in make_stock_aliases(stock_name):
-            alias_norm = alias.replace(" ", "").replace("　", "")
+        stock_name_norm = normalize_stock_name_text(stock_name)
+
+        for alias in make_stock_aliases(stock_name, exact_stock_names):
+            alias_norm = normalize_stock_name_text(alias)
 
             if alias_norm and wname.startswith(alias_norm):
-                candidates.append((len(alias_norm), len(str(stock_name)), stock_code, stock_name, alias_norm))
+                candidates.append({
+                    "alias_len": len(alias_norm),
+                    "is_exact_alias": 1 if alias_norm == stock_name_norm else 0,
+                    "stock_name_len": len(stock_name_norm),
+                    "stock_code": stock_code,
+                    "stock_name": stock_name,
+                    "alias": alias_norm,
+                })
 
     if candidates:
-        candidates = sorted(candidates, key=lambda x: (x[0], x[1]), reverse=True)
-        _, _, stock_code, stock_name, _ = candidates[0]
-        return stock_code, stock_name
+        # 排序原則：
+        # 1. alias 越長越優先，例如「昇陽半」優先於「昇陽」
+        # 2. alias 若等於原始股名，優先
+        # 3. 若仍相同，股名較短者優先，避免長股名用過短簡稱壓過真正短股名
+        candidates = sorted(
+            candidates,
+            key=lambda x: (
+                x["alias_len"],
+                x["is_exact_alias"],
+                -x["stock_name_len"],
+            ),
+            reverse=True
+        )
+
+        best = candidates[0]
+        return best["stock_code"], best["stock_name"]
 
     return "", ""
 
