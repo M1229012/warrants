@@ -578,15 +578,16 @@ def append_sell(sells: list[dict], broker: str, status: str, event: str, underly
 def collect_broker_underlying_add_count_map(target: date, lookback_days: int = ADD_COUNT_LOOKBACK_TRADING_DAYS) -> dict[tuple[str, str], int]:
     """
     計算「同一分點 + 同一標的」在近 N 個有效交易日內，
-    出現達買超門檻事件的不同日期次數。
+    出現達買超門檻且尚未出清事件的不同日期次數。
 
     顯示規則：
     - 第 1 次加碼：圖卡不顯示任何標籤
-    - 第 2 次以上：圖卡顯示「第N次加碼」
+    - 第 2 次以上：圖卡顯示「加碼N」
 
     注意：
     同一天同一分點同一標的即使同時出現在 A/B/C/D，仍只算 1 次。
     這裡的 lookback_days 專門給第幾次加碼使用，不會影響原本近一個月 TOP15 圖。
+    已在目標日前或目標日出清的買超事件不納入加碼次數；減碼但尚未出清仍會納入。
     """
     try:
         trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
@@ -601,6 +602,12 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     def add_count_event(row, event_date, amount):
         if not event_date or event_date not in date_set or event_date > target:
+            return
+
+        # 已出清的權證不算入「第幾次加碼」。
+        # 規則：出清日空白或出清日在目標日之後才納入；出清日 <= 目標日則排除。
+        exit_date = parse_date_value(row.get("出清日"))
+        if exit_date and exit_date <= target:
             return
 
         broker = str(row.get("分點", "")).strip()
@@ -618,7 +625,7 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     # A：單檔權證大買
     try:
-        A = read_gsheet_table(SHEET_A, ["分點", "標的股", "買進日", "買進金額"])
+        A = read_gsheet_table(SHEET_A, ["分點", "標的股", "買進日", "買進金額", "出清日"])
         for _, r in A.iterrows():
             add_count_event(r, parse_date_value(r.get("買進日")), r.get("買進金額"))
     except Exception:
@@ -633,7 +640,7 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     for sheet_name, date_col in plans:
         try:
-            df = read_gsheet_table(sheet_name, ["分點", "標的股", date_col, "買超金額"])
+            df = read_gsheet_table(sheet_name, ["分點", "標的股", date_col, "買超金額", "出清日"])
         except Exception:
             continue
 
@@ -641,6 +648,7 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
             add_count_event(r, parse_date_value(r.get(date_col)), r.get("買超金額"))
 
     return {key: len(days) for key, days in counter.items()}
+
 
 
 def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
