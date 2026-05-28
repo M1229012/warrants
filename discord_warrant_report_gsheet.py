@@ -1889,7 +1889,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
             usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
 
-            if not is_counted_warrant:
+            # 非 A/B/C/D 的大額賣超只用「目標日當天」判斷與扣減。
+            # A/B/C/D 白名單權證的賣出仍維持整個統計期間扣減。
+            # 避免 RUN_MODE=1 全市場補抓後，把近一個月所有非策略大額賣單都扣進 TOP15，
+            # 導致 TOP15 全部被扣成負數而空白。
+            if not is_counted_warrant and d == target:
                 non_abcd_sell_amounts[(d, broker, code)] += amount
 
         qualifying_non_abcd_keys = {
