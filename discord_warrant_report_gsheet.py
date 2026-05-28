@@ -76,8 +76,9 @@ SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
-# 若某權證不曾出現在 A/B/C/D，但同一分點今天對同一標的的實際賣出金額合計 >= 100 萬，
-# 仍納入今日賣超明細顯示。預設沿用買超門檻 100 萬，可由環境變數覆蓋。
+# 非 A/B/C/D 權證若同一分點 + 同一標的於同一天實際賣出合計達此門檻，
+# 仍納入今日賣超明細與近一個月 TOP15 淨買超扣減。
+# 預設沿用 BUY_THRESHOLD，也就是 100 萬。
 NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
     os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
 )
@@ -117,25 +118,6 @@ EVENT_LEGEND_ITEMS = [
     ("B", "同標的單日合買"),
     ("C", "同標的3日累積"),
     ("D", "近10日累積淨買"),
-]
-
-# 公開發文版橫幅文案
-PUBLIC_PREVIEW_BANNER = "公開預覽版｜完整名單已更新於艾斯 DC 群"
-
-# 公開版遮罩標記：
-# 實際畫面不顯示文字，而是由繪圖函式畫成灰色圓角遮罩條。
-PUBLIC_MASK_BLOCK = "__PUBLIC_MASK_BLOCK__"
-PUBLIC_MASK_SKIP = "__PUBLIC_MASK_SKIP__"
-PUBLIC_MASK_TARGET = "__PUBLIC_MASK_TARGET__"
-PUBLIC_MASK_PARTICIPANTS = "__PUBLIC_MASK_PARTICIPANTS__"
-# 像素馬賽克遮罩：用深淺灰色小方塊覆蓋敏感文字，保留公開預覽感
-PUBLIC_MASK_COLOR = (148 / 255, 163 / 255, 184 / 255, 0.36)
-PUBLIC_MASK_EDGE = (100 / 255, 116 / 255, 139 / 255, 0.50)
-PUBLIC_MOSAIC_COLORS = [
-    (15 / 255, 23 / 255, 42 / 255, 0.82),
-    (51 / 255, 65 / 255, 85 / 255, 0.72),
-    (100 / 255, 116 / 255, 139 / 255, 0.62),
-    (203 / 255, 213 / 255, 225 / 255, 0.50),
 ]
 
 
@@ -915,11 +897,11 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
     欄位中的「賣出金額 / 賣出張數」即為官方分點每日資料，
     不再用 A 表的「減碼均價 × 買進張數」推估。
 
-    額外規則：
-    - 若該權證曾出現在 A/B/C/D，照原本事件邏輯顯示。
-    - 若該權證不曾出現在 A/B/C/D，但同一分點今天對同一標的的實際賣出金額合計 >= 100 萬，
-      也納入圖卡，避免漏掉明顯的大額賣超。
-    - 這類額外納入的資料不強制標示 A/B/C/D，只顯示權證與賣出金額。
+    顯示規則：
+    1. 若該筆「分點 + 權證代號」曾出現在 A/B/C/D，照原本事件邏輯顯示。
+    2. 若該權證未出現在 A/B/C/D，但同一分點今天對同一標的的賣出金額合計
+       達 NON_ABCD_SELL_UNDERLYING_THRESHOLD，仍納入賣超明細。
+       這類資料不標 A/B/C/D，直接顯示權證與賣出金額。
     """
     needed_cols = [
         "日期", "分點", "分點名稱", "券商代號",
@@ -936,7 +918,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
     event_lookup = build_sell_event_lookup_from_abcd(target)
 
-    # 先找出「不在 A/B/C/D，但同一分點 + 同一標的今日實際賣出合計 >= 100 萬」的標的。
+    # 先統計非 A/B/C/D 權證在「同一天 + 同分點 + 同標的」的實際賣出合計。
+    # 達 100 萬以上才會被納入圖卡，避免小額散戶賣單干擾。
     non_abcd_underlying_amounts: dict[tuple[str, str], float] = defaultdict(float)
 
     for _, r in df.iterrows():
@@ -955,8 +938,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         if sell_amount <= 0 or not underlying:
             continue
 
-        lookup_info = event_lookup.get((broker, warrant_code))
-        if not lookup_info:
+        if not event_lookup.get((broker, warrant_code)):
             non_abcd_underlying_amounts[(broker, underlying)] += sell_amount
 
     qualifying_non_abcd_underlyings = {
@@ -979,8 +961,6 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         event = normalize_event_code(event_raw)
         status = str(r.get("狀態", "")).strip() or "賣超"
         underlying = normalize_underlying(r.get("標的股"), warrant_name)
-        return_pct = None
-        buy_amount = 0
 
         sell_amount = safe_float(r.get("賣出金額"), 0)
         sell_qty = safe_int(r.get("賣出張數"), 0)
@@ -988,6 +968,9 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
         if sell_qty <= 0:
             sell_qty = int(safe_float(r.get("賣出股數"), 0) // 1000)
+
+        if sell_amount <= 0:
+            continue
 
         lookup_info = event_lookup.get((broker, warrant_code))
 
@@ -1006,11 +989,11 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
             if is_unclassified_event(event):
                 # 權證雖可對到 A/B/C/D 白名單，但事件代號仍無法解析時，
-                # 為避免圖卡出現未歸類標籤，改成純賣超顯示，不再強加 A/B/C/D 前綴。
+                # 不強行標註 A/B/C/D，直接當作單一賣超顯示。
                 event = "單一賣超"
 
             # 若 A/B/C/D lookup 有買進均價，則用實際賣出均價估算報酬率。
-            # A 類通常較精準；B/C/D 為群組平均成本概算，但比完全空白更接近實際。
+            # A 類通常較精準；B/C/D 為群組平均成本概算。
             buy_avg = safe_float(lookup_info.get("buy_avg"), 0)
             if buy_avg > 0 and sell_qty > 0:
                 buy_amount = buy_avg * sell_qty * NTD_PER_WARRANT_POINT
@@ -1035,7 +1018,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             )
             continue
 
-        # 不在 A/B/C/D 的權證：僅當同一分點今日對該標的實際賣出合計 >= 100 萬才納入。
+        # 不在 A/B/C/D 的權證：同一分點 + 同一標的今日實際賣出合計 >= 100 萬才納入。
         if (broker, underlying) not in qualifying_non_abcd_underlyings:
             continue
 
@@ -1054,6 +1037,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             warrant_code=warrant_code,
             force_include=True,
         )
+
 
 
 def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
@@ -1219,7 +1203,8 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
                     sell_event_label = "/".join(sorted({
                         str(i.get("event", "")).strip()
                         for i in items
-                        if str(i.get("event", "")).strip() and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
+                        if str(i.get("event", "")).strip()
+                        and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
                     }))
                 if sell_event_label:
                     content = f"{sell_event_label}｜{content}"
@@ -1233,7 +1218,8 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
                 sell_event_label = "/".join(sorted({
                     str(i.get("event", "")).strip()
                     for i in items
-                    if str(i.get("event", "")).strip() and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
+                    if str(i.get("event", "")).strip()
+                    and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
                 }))
 
             if sell_event_label and not str(content).startswith(f"{sell_event_label}｜"):
@@ -1287,32 +1273,6 @@ def make_font(size, bold=False):
     return ImageFont.truetype(get_font_path(bold), size)
 
 
-
-def pixelate_image_regions(image_path: Path, regions: list[tuple[float, float, float, float]], fig_w: float, fig_h: float, pixel_scale: float = 0.12):
-    """對已輸出的 PNG 指定區域做真正的像素化馬賽克。"""
-    if not regions:
-        return
-    img = Image.open(image_path).convert("RGBA")
-    img_w, img_h = img.size
-    for x, y, w, h in regions:
-        if w <= 0 or h <= 0:
-            continue
-        left = max(0, int(round(x / fig_w * img_w)))
-        right = min(img_w, int(round((x + w) / fig_w * img_w)))
-        top = max(0, int(round((fig_h - (y + h)) / fig_h * img_h)))
-        bottom = min(img_h, int(round((fig_h - y) / fig_h * img_h)))
-        if right <= left or bottom <= top:
-            continue
-        region = img.crop((left, top, right, bottom))
-        rw, rh = region.size
-        small_w = max(6, int(rw * pixel_scale))
-        small_h = max(4, int(rh * pixel_scale))
-        mosaic = region.resize((small_w, small_h), Image.Resampling.BILINEAR)
-        mosaic = mosaic.resize((rw, rh), Image.Resampling.NEAREST)
-        img.paste(mosaic, (left, top))
-    img.save(image_path)
-
-
 def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
     """
     Matplotlib 動態版面引擎：
@@ -1351,7 +1311,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     margin_x = 0.40
     content_w = fig_w - 2 * margin_x
 
-    top_h = 1.90
+    top_h = 1.55
     kpi_h = 1.25
     gap = 0.18
 
@@ -1452,60 +1412,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         s = str(s)
         return s if len(s) <= n else s[:n - 1] + "…"
 
-    mosaic_regions: list[tuple[float, float, float, float]] = []
-
-    def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
-        """
-        公開預覽用像素馬賽克：
-        - 不是實心灰條
-        - 不是一格一格分開
-        - 以整塊區域鋪上深淺不同的小方塊，接近真實馬賽克效果
-        """
-        # 先鋪一層很淡的底，讓整塊遮罩連成一體
-        rounded(
-            x, y, w, h,
-            fc=(226 / 255, 232 / 255, 240 / 255, 0.34),
-            ec=(148 / 255, 163 / 255, 184 / 255, 0.42),
-            lw=0.45,
-            r=0.055,
-            z=z,
-        )
-
-        seed = sum(ord(ch) for ch in str(seed_text)) + int(x * 97) + int(y * 131)
-        cell_w = 0.085
-        cell_h = 0.070
-        pad_x = 0.08
-        pad_y = 0.06
-
-        cols = max(6, int((w - 2 * pad_x) / cell_w))
-        rows_n = max(2, int((h - 2 * pad_y) / cell_h))
-
-        for rr in range(rows_n):
-            for cc in range(cols):
-                # 留一點空白，避免整塊變死灰色；用 deterministic pattern，不需 random
-                v = (seed + rr * 37 + cc * 17 + (rr + cc) * 11) % 100
-                if v < 34:
-                    continue
-
-                color = PUBLIC_MOSAIC_COLORS[(seed + rr * 5 + cc * 3) % len(PUBLIC_MOSAIC_COLORS)]
-                bx = x + pad_x + cc * cell_w
-                by = y + pad_y + rr * cell_h
-
-                # 讓方塊大小略有變化，比固定格更像文字被馬賽克
-                bw = cell_w * (0.62 + ((seed + cc * 7 + rr * 3) % 4) * 0.10)
-                bh = cell_h * (0.62 + ((seed + cc * 5 + rr * 9) % 4) * 0.08)
-
-                ax.add_patch(
-                    patches.Rectangle(
-                        (bx, by),
-                        bw,
-                        bh,
-                        linewidth=0,
-                        facecolor=color,
-                        zorder=z + 1,
-                    )
-                )
-
     def draw_center_watermark():
         try:
             ax.text(
@@ -1542,16 +1448,10 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     y -= 0.32
     text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣超　單位：萬元", 13, TEXT, BOLD)
 
-    # 公開預覽版橫幅
-    y -= 0.34
-    banner_h = 0.34
-    rounded(margin_x + 0.12, y - banner_h / 2, content_w - 0.24, banner_h, fc="#FFF7ED", ec="#FDBA74", lw=1.0, r=0.09)
-    text(fig_w / 2, y, PUBLIC_PREVIEW_BANNER, 13, "#9A3412", BOLD, ha="center")
-
     # ─────────────────────────────────────────────
     # KPI cards
     # ─────────────────────────────────────────────
-    y -= 0.26
+    y -= 0.25
     kpi_y = y - kpi_h
     kpi_gap = 0.30
     kpi_w = (content_w - 2 * kpi_gap) / 3
@@ -1611,8 +1511,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             # 此區字體比前一版放大 2
             text(x + card_w / 2, cy + broker_card_h - 0.21, b, 14.5, WHITE, BOLD, ha="center")
             text(x + card_w / 2, cy + broker_card_h - 0.60, f"平均 {s['avg_hold_days']:.1f} 天", 11.5, TEXT, FONT, ha="center")
-            # 公開版：平均持有天數整行遮完整，避免只遮到中間數字
-            mosaic_regions.append((x + card_w * 0.26, cy + broker_card_h - 0.72, card_w * 0.48, 0.22))
             ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.78, cy + 0.78], color=BORDER, linewidth=0.8)
 
             text(x + 0.12, cy + 0.56, "買超", 12.5, RED, BOLD)
@@ -1661,60 +1559,41 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
                 values, colors, aligns, bolds = row_builder(i, r)
                 x = margin_x
-                col_idx = 0
-                while col_idx < len(col_widths):
-                    val = values[col_idx]
-                    w = col_widths[col_idx]
-
-                    if val == PUBLIC_MASK_SKIP:
-                        x += w
-                        col_idx += 1
-                        continue
-
-                    if val == PUBLIC_MASK_BLOCK:
-                        # 公開版：把「標的 / 權證」與「內容」合併成一整塊真正的像素馬賽克
-                        block_w = w
-                        if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP:
-                            block_w += col_widths[col_idx + 1]
-
-                        preview_target = str(r.get("target", "")).strip() if isinstance(r, dict) else ""
-                        preview_content = str(r.get("content", "")).strip() if isinstance(r, dict) else ""
-                        preview_text = "　".join([t for t in [preview_target, preview_content] if t])
-
-                        if preview_text:
-                            text(
-                                x + 0.20,
-                                ry + row_h / 2,
-                                fit(preview_text, max(12, int(block_w * 5.8))),
-                                13,
-                                TEXT,
-                                BOLD,
-                                ha="left",
-                                z=12,
-                            )
-
-                        mosaic_regions.append((x + 0.10, ry + row_h * 0.12, block_w - 0.20, row_h * 0.76))
-                        x += block_w
-                        col_idx += 2 if col_idx + 1 < len(col_widths) and values[col_idx + 1] == PUBLIC_MASK_SKIP else 1
-                        continue
-
-                    c = colors[col_idx]
-                    a = aligns[col_idx]
-                    is_bold = bolds[col_idx]
+                for val, w, c, a, is_bold, h in zip(values, col_widths, colors, aligns, bolds, headers):
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    text(px, ry + row_h / 2, fit(val, max(5, int(w * 6.0))), 14, c, BOLD if is_bold else FONT, ha=a)
+                    display_val = fit(val, max(5, int(w * 6.0)))
+
+                    # 只針對買超明細「內容」欄，把「加碼N｜」前綴獨立畫成粗體。
+                    # 後面的權證名稱維持原本一般字體，避免整格都變粗。
+                    if h == "內容" and a == "left":
+                        m = re.match(r"^(加碼\d+｜)(.*)$", str(display_val))
+                        if m:
+                            prefix = m.group(1)
+                            rest = m.group(2)
+
+                            text(px, ry + row_h / 2, prefix, 14, c, BOLD, ha="left")
+
+                            prefix_offset = 0.0
+                            for ch in prefix:
+                                prefix_offset += 0.085 if ord(ch) < 128 else 0.17
+                            prefix_offset += 0.03
+
+                            text(px + prefix_offset, ry + row_h / 2, rest, 14, c, FONT, ha="left")
+                        else:
+                            text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
+                    else:
+                        text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                     x += w
-                    col_idx += 1
         return y_top - table_h
 
     # Buy table
     buy_headers = ["排名", "分點", "事件", "標的 / 權證", "內容", "買超金額"]
-    buy_col_w = [0.75, 2.25, 0.90, 2.55, 3.05, 2.50]
+    buy_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
 
     def buy_builder(i, r):
         return (
-            [str(i + 1), r["broker"], r["event"], PUBLIC_MASK_BLOCK, PUBLIC_MASK_SKIP, fmt_wan(r["amount"])],
-            [TEXT, TEXT, RED, MUTED, MUTED, RED],
+            [str(i + 1), r["broker"], r["event"], r["target"], r["content"], fmt_wan(r["amount"])],
+            [TEXT, TEXT, RED, TEXT, TEXT, RED],
             ["center", "left", "center", "left", "left", "right"],
             [True, True, True, True, False, True],
         )
@@ -1725,14 +1604,14 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         y -= gap
         sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "報酬率", "賣方金額"]
-        sell_col_w = [2.05, 1.05, 2.75, 2.55, 1.25, 2.35]
+        sell_col_w = [2.05, 1.05, 2.25, 2.75, 1.55, 2.35]
 
         def sell_builder(i, r):
             ret_text = fmt_return_pct(r.get("return_pct"))
             ret_color = RED if safe_float(r.get("return_pct"), 0) > 0 else GREEN if safe_float(r.get("return_pct"), 0) < 0 else TEXT
             return (
-                [r["broker"], r["status"], PUBLIC_MASK_BLOCK, PUBLIC_MASK_SKIP, ret_text, fmt_wan(r["amount"])],
-                [TEXT, GREEN, MUTED, MUTED, ret_color, GREEN],
+                [r["broker"], r["status"], r["target"], r["content"], ret_text, fmt_wan(r["amount"])],
+                [TEXT, GREEN, TEXT, TEXT, ret_color, GREEN],
                 ["left", "center", "left", "left", "right", "right"],
                 [True, True, True, False, True, True],
             )
@@ -1767,7 +1646,6 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
     plt.close(fig)
-    pixelate_image_regions(output_path, mosaic_regions, fig_w, fig_h)
 
 
 
@@ -1983,8 +1861,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 注意：每日賣出明細通常只輸出最近幾天，不能拿來做近一個月 TOP15，
     # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
     #
-    # 這裡只扣本次 TOP15 統計期間內，已被 A/B/C/D 買超事件納入的
-    # 「分點 + 權證代號」，避免同分點其他散戶或非策略權證賣出被扣進來。
+    # 扣減規則：
+    # 1. 原本 A/B/C/D 事件納入過的「分點 + 權證代號」照常扣。
+    # 2. 非 A/B/C/D 權證若同一天同一分點同一標的賣出合計 >= 100 萬，也扣。
+    #    這是為了讓元大南屯賣南亞科這種明顯大額賣單可以反映到 TOP15。
     sell_rows_loaded = False
     try:
         sell_df = read_gsheet_table_optional(
@@ -1994,17 +1874,20 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         if not sell_df.empty:
             sell_rows_loaded = True
+
+            sell_period_start = min(trading_dates)
+            sell_period_end = target
+
+            usable_sell_rows = []
+            non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
+
             for _, r in sell_df.iterrows():
                 d = parse_date_value(r.get("日期"))
-                if not d or d not in date_set:
+                if not d or d < sell_period_start or d > sell_period_end:
                     continue
 
                 broker = str(r.get("分點", "")).strip()
                 if broker not in TRACKED_BROKERS:
-                    continue
-
-                warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-                if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
                     continue
 
                 warrant_text = r.get("權證名稱", "")
@@ -2014,6 +1897,24 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
                 amount = safe_float(r.get("賣出金額"), 0)
                 if amount <= 0:
+                    continue
+
+                warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+                is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
+
+                usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
+
+                if not is_counted_warrant:
+                    non_abcd_sell_amounts[(d, broker, code)] += amount
+
+            qualifying_non_abcd_sell_keys = {
+                key
+                for key, amount in non_abcd_sell_amounts.items()
+                if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
+            }
+
+            for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
+                if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_sell_keys:
                     continue
 
                 agg[code]["net_amount"] -= amount
@@ -2031,17 +1932,19 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             )
 
             if not sell_df.empty:
+                sell_period_start = min(trading_dates)
+                sell_period_end = target
+
+                usable_sell_rows = []
+                non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
+
                 for _, r in sell_df.iterrows():
                     d = parse_date_value(r.get("日期"))
-                    if not d or d not in date_set:
+                    if not d or d < sell_period_start or d > sell_period_end:
                         continue
 
                     broker = str(r.get("分點", "")).strip()
                     if broker not in TRACKED_BROKERS:
-                        continue
-
-                    warrant_code = normalize_warrant_code(r.get("權證代號", ""))
-                    if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
                         continue
 
                     warrant_text = r.get("權證名稱", "")
@@ -2051,6 +1954,24 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
                     amount = safe_float(r.get("賣出金額"), 0)
                     if amount <= 0:
+                        continue
+
+                    warrant_code = normalize_warrant_code(r.get("權證代號", ""))
+                    is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
+
+                    usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
+
+                    if not is_counted_warrant:
+                        non_abcd_sell_amounts[(d, broker, code)] += amount
+
+                qualifying_non_abcd_sell_keys = {
+                    key
+                    for key, amount in non_abcd_sell_amounts.items()
+                    if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
+                }
+
+                for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
+                    if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_sell_keys:
                         continue
 
                     agg[code]["net_amount"] -= amount
@@ -2115,7 +2036,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     margin_x = 0.40
     content_w = fig_w - 2 * margin_x
 
-    top_h = 2.30
+    top_h = 1.95
     legend_h = 0.45
     gap = 0.18
     section_title_h = 0.55
@@ -2176,53 +2097,6 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
-    mosaic_regions: list[tuple[float, float, float, float]] = []
-
-    def draw_mosaic_mask(x, y, w, h, seed_text="", z=24):
-        """
-        第二張圖公開預覽用像素馬賽克。
-        """
-        rounded(
-            x, y, w, h,
-            fc=(226 / 255, 232 / 255, 240 / 255, 0.34),
-            ec=(148 / 255, 163 / 255, 184 / 255, 0.42),
-            lw=0.45,
-            r=0.055,
-            z=z,
-        )
-
-        seed = sum(ord(ch) for ch in str(seed_text)) + int(x * 97) + int(y * 131)
-        cell_w = 0.085
-        cell_h = 0.070
-        pad_x = 0.08
-        pad_y = 0.06
-
-        cols = max(6, int((w - 2 * pad_x) / cell_w))
-        rows_n = max(2, int((h - 2 * pad_y) / cell_h))
-
-        for rr in range(rows_n):
-            for cc in range(cols):
-                v = (seed + rr * 37 + cc * 17 + (rr + cc) * 11) % 100
-                if v < 34:
-                    continue
-
-                color = PUBLIC_MOSAIC_COLORS[(seed + rr * 5 + cc * 3) % len(PUBLIC_MOSAIC_COLORS)]
-                bx = x + pad_x + cc * cell_w
-                by = y + pad_y + rr * cell_h
-                bw = cell_w * (0.62 + ((seed + cc * 7 + rr * 3) % 4) * 0.10)
-                bh = cell_h * (0.62 + ((seed + cc * 5 + rr * 9) % 4) * 0.08)
-
-                ax.add_patch(
-                    patches.Rectangle(
-                        (bx, by),
-                        bw,
-                        bh,
-                        linewidth=0,
-                        facecolor=color,
-                        zorder=z + 1,
-                    )
-                )
-
     def fmt_participant_brokers(row, limit=5):
         """
         顯示所有參與分點的淨累積買超金額。
@@ -2264,12 +2138,6 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
     text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
-
-    # 公開預覽版橫幅
-    y -= 0.34
-    banner_h = 0.34
-    rounded(margin_x + 0.12, y - banner_h / 2, content_w - 0.24, banner_h, fc="#FFF7ED", ec="#FDBA74", lw=1.0, r=0.09)
-    text(fig_w / 2, y, PUBLIC_PREVIEW_BANNER, 13, "#9A3412", BOLD, ha="center")
 
     # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
     y -= 0.28
@@ -2325,36 +2193,21 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             net_color = RED if r["net_amount"] > 0 else GREEN if r["net_amount"] < 0 else TEXT
             values = [
                 str(i + 1),
-                PUBLIC_MASK_TARGET,
+                fit(r["target"], 14),
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
                 fmt_participant_brokers(r),
             ]
 
-            colors = [TEXT, MUTED, net_color, TEXT, NAVY2, TEXT]
+            colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
             aligns = ["center", "left", "right", "center", "center", "left"]
             bolds = [True, True, True, True, True, True]
 
             x = margin_x
             for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
-                if val == PUBLIC_MASK_TARGET:
-                    preview_target = str(r.get("target", "")).strip()
-                    if preview_target:
-                        text(
-                            x + 0.18,
-                            ry + row_h / 2,
-                            fit(preview_target, max(10, int(w * 6.0))),
-                            13,
-                            TEXT,
-                            BOLD,
-                            ha="left",
-                            z=12,
-                        )
-                    mosaic_regions.append((x + 0.10, ry + row_h * 0.14, w - 0.20, row_h * 0.72))
-                else:
-                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
+                px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
+                text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
 
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
@@ -2362,7 +2215,6 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
     plt.close(fig)
-    pixelate_image_regions(output_path, mosaic_regions, fig_w, fig_h)
 
 
 # ══════════════════════════════════════════════════════════════════════
