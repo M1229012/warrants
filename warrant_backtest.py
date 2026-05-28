@@ -3732,6 +3732,11 @@ def build_a_events_from_df(item):
                 ev["剩餘股數"] -= alloc
                 sell_left -= alloc
 
+                # ★ 新增：累計這個事件「已實現賣出金額」（依每批實際賣價加權）。
+                #   出清時用此累計值對原始買進成本算報酬，
+                #   才不會只用最後一筆賣價，與 B/C/D 的累積實現報酬一致。
+                ev["已實現賣出金額"] += alloc * sell_p
+
                 if ev["剩餘股數"] > 0:
                     if ev["減碼日"] is None:
                         ev["減碼日"] = date
@@ -3741,8 +3746,24 @@ def build_a_events_from_df(item):
                 else:
                     ev["狀態"] = "出清"
                     ev["出清日"] = date
-                    ev["出清均價"] = sell_p
-                    ev["出清獲利%"] = round((sell_p - ev["買進均價"]) / ev["買進均價"] * 100, 2) if ev["買進均價"] else None
+
+                    # ★ 修改：出清均價改用「加權平均賣出價」= 累計賣出金額 / 原始買進股數，
+                    #   出清獲利% 改用「累計賣出金額 vs 原始買進金額」。
+                    #   注意成本基準必須用 ev["買進金額"]，不是迴圈中的 buy_a。
+                    cost_basis = ev["買進金額"]
+                    total_sold_shares = ev["買進股數"]
+
+                    if total_sold_shares > 0:
+                        ev["出清均價"] = round(ev["已實現賣出金額"] / total_sold_shares, 4)
+                    else:
+                        ev["出清均價"] = sell_p
+
+                    if cost_basis:
+                        ev["出清獲利%"] = round(
+                            (ev["已實現賣出金額"] - cost_basis) / cost_basis * 100, 2
+                        )
+                    else:
+                        ev["出清獲利%"] = None
 
                     buy_dt = parse_date(ev["買進日"])
                     exit_dt = parse_date(date)
@@ -3773,6 +3794,7 @@ def build_a_events_from_df(item):
                 "買進金額": buy_a,
                 "買進均價": buy_p,
                 "剩餘股數": buy_s,
+                "已實現賣出金額": 0,   # ★ 新增：累計已賣出金額，供出清時加權計算報酬
                 "狀態": "持有",
                 "減碼日": None,
                 "減碼均價": None,
