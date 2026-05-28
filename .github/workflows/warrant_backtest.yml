@@ -1,72 +1,77 @@
 name: Warrant Backtest Google Sheet
 
 on:
-  workflow_dispatch:
-  schedule:
-    # Asia/Taipei 17:10 = UTC 09:10
-    - cron: "10 9 * * 1-5"
+workflow_dispatch:
+schedule:
+# Asia/Taipei 17:10 = UTC 09:10
+- cron: "10 9 * * 1-5"
 
-    # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
-    - cron: "5,35 13 * * 1-5"
+```
+# Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
+- cron: "5,35 13 * * 1-5"
+```
 
 jobs:
-  run-backtest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+run-backtest:
+runs-on: ubuntu-latest
+timeout-minutes: 360
 
-    env:
-      OUTPUT_DIR: output
-      CACHE_DIR: warrant_cache
-      USE_CACHE: "1"
-      FORCE_FULL_CACHE_REFRESH: "0"
+```
+env:
+  OUTPUT_DIR: output
+  CACHE_DIR: warrant_cache
+  USE_CACHE: "1"
+  FORCE_FULL_CACHE_REFRESH: "0"
+  RUN_MODE: "1"
 
-      GSHEET_ENABLE: "1"
-      GSHEET_UPLOAD_RESULTS: "1"
-      GSHEET_NAME: "權證分點籌碼"
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
-      GSHEET_CACHE_ENABLED: "1"
-      GSHEET_RESULT_ENABLED: "1"
+  GSHEET_ENABLE: "1"
+  GSHEET_UPLOAD_RESULTS: "1"
+  GSHEET_NAME: "權證分點籌碼"
+  GOOGLE_SHEET_NAME: "權證分點籌碼"
+  GSHEET_CACHE_ENABLED: "1"
+  GSHEET_RESULT_ENABLED: "1"
 
-      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+  GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      FAST_SKIP_RECENT_PRESCAN: "0"
-      CACHE_RECENT_SCAN_DAYS: "3"
-      FETCH_GROUP_WARRANT_PRICES: "0"
+  FAST_SKIP_RECENT_PRESCAN: "0"
+  CACHE_RECENT_SCAN_DAYS: "3"
+  FETCH_GROUP_WARRANT_PRICES: "0"
 
-      MAX_WORKERS: "50"
-      PRICE_WORKERS: "60"
-      PRESCAN_WORKERS: "60"
-      FIND_BROKER_WORKERS: "40"
+  MAX_WORKERS: "50"
+  PRICE_WORKERS: "60"
+  PRESCAN_WORKERS: "60"
+  FIND_BROKER_WORKERS: "40"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
 
-      - name: Restore local cache backup
-        uses: actions/cache@v4
-        with:
-          path: warrant_cache
-          key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            warrant-cache-${{ runner.os }}-
+  - name: Restore local cache backup
+    uses: actions/cache@v4
+    with:
+      path: warrant_cache
+      key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
+      restore-keys: |
+        warrant-cache-${{ runner.os }}-
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
 
-      - name: Run warrant backtest
-        run: |
-          mkdir -p output
-          python warrant_backtest.py
+  - name: Run warrant backtest
+    run: |
+      mkdir -p output
+      python warrant_backtest.py
 
-      - name: Upload Excel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: warrant-backtest-excel
-          path: output/*.xlsx
+  - name: Upload Excel artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: warrant-backtest-excel
+      path: output/*.xlsx
+```
