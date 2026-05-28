@@ -19,7 +19,7 @@ jobs:
       CACHE_DIR: warrant_cache
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
-      RUN_MODE: "1"
+      RUN_MODE: "2"
 
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
