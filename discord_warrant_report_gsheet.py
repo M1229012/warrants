@@ -1381,9 +1381,20 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     - 不固定表格高度
     - 高度完全依照：有動作分點數、無動作分點列、買超筆數、賣方筆數自動增加
     - 邏輯參考處置股圖卡的 get_base_layout / setup_canvas 概念
+
+    賣方顯示門檻補強：
+    - 最終圖卡上顯示的每一列賣超明細，最低都必須達 SELL_THRESHOLD（預設 20 萬）。
+    - 不再因 DISPLAY_EXIT_ALWAYS 或 force_include 等例外邏輯，讓 20 萬以下的小單顯示到圖片上。
+    - 這樣可以避免抓到只是同分點散戶零星買賣，而不是你要追蹤的分點大戶行為。
     """
     buys = compress_actions(buys_raw, "buy")
     sells = compress_actions(sells_raw, "sell")
+
+    # 嚴格套用最終圖卡賣方顯示門檻：
+    # 只要是顯示在圖片上的賣超列，合併後金額最低都必須 >= SELL_THRESHOLD。
+    # 這裡放在 compress_actions 之後，代表即使同標的多筆小單合併，只要合併後未達 20 萬，
+    # 也不會顯示在圖卡上。
+    sells = [x for x in sells if safe_float(x.get("amount"), 0) >= SELL_THRESHOLD]
 
     buy_total = sum(x["amount"] for x in buys)
     sell_total = sum(x["amount"] for x in sells)
