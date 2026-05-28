@@ -1857,7 +1857,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             return
 
         sell_period_start = min(trading_dates)
-        sell_period_end = max(trading_dates)
+        sell_period_end = target
 
         usable_sell_rows = []
         non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
