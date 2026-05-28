@@ -1831,6 +1831,69 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
 
+    def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
+        """
+        TOP15 賣方扣減規則：
+        1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
+        2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
+           也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
+           能正確反映到近一個月 TOP15 淨買超。
+
+        注意：對於第 2 類，只是拿「同日同分點同標的合計 >= 門檻」作為納入條件；
+        一旦達標，該組合底下當天所有賣出列都會被扣減。
+        """
+        if sell_df.empty:
+            return
+
+        sell_period_start = min(trading_dates)
+        sell_period_end = max(trading_dates)
+
+        usable_sell_rows = []
+        non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
+
+        for _, r in sell_df.iterrows():
+            d = parse_date_value(r.get("日期"))
+            if not d or d < sell_period_start or d > sell_period_end:
+                continue
+
+            broker = str(r.get("分點", "")).strip()
+            if broker not in TRACKED_BROKERS:
+                continue
+
+            warrant_text = r.get("權證名稱", "")
+            code = normalize_underlying(r.get("標的股"), warrant_text)
+            if not code or code not in agg:
+                continue
+
+            amount = safe_float(r.get("賣出金額"), 0)
+            if amount <= 0:
+                continue
+
+            warrant_code = ""
+            for col in code_col_candidates:
+                warrant_code = normalize_warrant_code(r.get(col, ""))
+                if warrant_code:
+                    break
+
+            is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
+            usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
+
+            if not is_counted_warrant:
+                non_abcd_sell_amounts[(d, broker, code)] += amount
+
+        qualifying_non_abcd_keys = {
+            key
+            for key, amount in non_abcd_sell_amounts.items()
+            if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
+        }
+
+        for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
+            if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_keys:
+                continue
+
+            agg[code]["net_amount"] -= amount
+            agg[code]["broker_net_amounts"][broker] -= amount
+
     def ensure_item(underlying, warrant_text=""):
         code = normalize_underlying(underlying, warrant_text)
         if not code:
@@ -1962,8 +2025,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 注意：每日賣出明細通常只輸出最近幾天，不能拿來做近一個月 TOP15，
     # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
     #
-    # 這裡只扣本次 TOP15 統計期間內，已被 A/B/C/D 買超事件納入的
-    # 「分點 + 權證代號」，避免同分點其他散戶或非策略權證賣出被扣進來。
+    # 扣減規則：
+    # 1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
+    # 2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
+    #    也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
+    #    能正確反映到近一個月 TOP15 淨買超。
     sell_rows_loaded = False
     try:
         sell_df = read_gsheet_table_optional(
@@ -1973,30 +2039,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         if not sell_df.empty:
             sell_rows_loaded = True
-            for _, r in sell_df.iterrows():
-                d = parse_date_value(r.get("日期"))
-                if not d or d not in date_set:
-                    continue
-
-                broker = str(r.get("分點", "")).strip()
-                if broker not in TRACKED_BROKERS:
-                    continue
-
-                warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-                if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
-                    continue
-
-                warrant_text = r.get("權證名稱", "")
-                code = normalize_underlying(r.get("標的股"), warrant_text)
-                if not code or code not in agg:
-                    continue
-
-                amount = safe_float(r.get("賣出金額"), 0)
-                if amount <= 0:
-                    continue
-
-                agg[code]["net_amount"] -= amount
-                agg[code]["broker_net_amounts"][broker] -= amount
+            apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼"])
     except Exception:
         pass
 
@@ -2010,30 +2053,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             )
 
             if not sell_df.empty:
-                for _, r in sell_df.iterrows():
-                    d = parse_date_value(r.get("日期"))
-                    if not d or d not in date_set:
-                        continue
-
-                    broker = str(r.get("分點", "")).strip()
-                    if broker not in TRACKED_BROKERS:
-                        continue
-
-                    warrant_code = normalize_warrant_code(r.get("權證代號", ""))
-                    if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
-                        continue
-
-                    warrant_text = r.get("權證名稱", "")
-                    code = normalize_underlying(r.get("標的股"), warrant_text)
-                    if not code or code not in agg:
-                        continue
-
-                    amount = safe_float(r.get("賣出金額"), 0)
-                    if amount <= 0:
-                        continue
-
-                    agg[code]["net_amount"] -= amount
-                    agg[code]["broker_net_amounts"][broker] -= amount
+                apply_sell_deduction_from_df(sell_df, ["權證代號"])
         except Exception:
             pass
 
