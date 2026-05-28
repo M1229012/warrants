@@ -76,9 +76,8 @@ SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
-# 非 A/B/C/D 權證若同一分點 + 同一標的於同一天實際賣出合計達此門檻，
-# 仍納入今日賣超明細與近一個月 TOP15 淨買超扣減。
-# 預設沿用 BUY_THRESHOLD，也就是 100 萬。
+# 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
+# 仍納入今日賣超明細。預設沿用買超門檻 100 萬。
 NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
     os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
 )
@@ -889,6 +888,100 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
     return lookup
 
 
+
+def build_warrant_sell_history_return_lookup(target: date) -> dict[tuple[str, str], dict]:
+    """
+    從「快取_分點歷史」估算指定日期各分點 + 權證代號的賣出報酬率與對應成本。
+
+    用途：
+    1. A/B/C/D 白名單權證若事件表本身沒有報酬率，可用歷史實際買賣資料補估。
+    2. 不在 A/B/C/D，但因「同分點 + 同標的今日賣出合計 >= 100 萬」而被納入圖卡的權證，
+       也能顯示合理的報酬率。
+
+    估算法：
+    - 以「同分點 + 同權證代號」為單位
+    - 使用加權平均成本法（依快取_分點歷史的每日買進 / 賣出金額與股數）
+    - 對目標日的賣出，先以目標日前累積持有成本計算賣出報酬率，再更新剩餘持有部位
+    """
+    needed_cols = [
+        "日期", "分點", "權證代號", "權證代碼", "權證名稱",
+        "買進股數", "賣出股數", "買進金額", "賣出金額"
+    ]
+
+    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+    if df.empty:
+        return {}
+
+    grouped: dict[tuple[str, str], dict] = defaultdict(lambda: defaultdict(lambda: {
+        "buy_qty": 0.0, "sell_qty": 0.0, "buy_amt": 0.0, "sell_amt": 0.0
+    }))
+
+    for _, r in df.iterrows():
+        d = parse_date_value(r.get("日期"))
+        if not d or d > target:
+            continue
+
+        broker = str(r.get("分點", "")).strip()
+        if broker not in TRACKED_BROKERS:
+            continue
+
+        warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+        if not warrant_code:
+            continue
+
+        bucket = grouped[(broker, warrant_code)][d]
+        bucket["buy_qty"] += safe_float(r.get("買進股數"), 0)
+        bucket["sell_qty"] += safe_float(r.get("賣出股數"), 0)
+        bucket["buy_amt"] += safe_float(r.get("買進金額"), 0)
+        bucket["sell_amt"] += safe_float(r.get("賣出金額"), 0)
+
+    result: dict[tuple[str, str], dict] = {}
+
+    for key, by_date in grouped.items():
+        hold_qty = 0.0      # 股數
+        hold_cost = 0.0     # 金額
+
+        for d in sorted(by_date.keys()):
+            row = by_date[d]
+            buy_qty = safe_float(row.get("buy_qty"), 0)
+            sell_qty = safe_float(row.get("sell_qty"), 0)
+            buy_amt = safe_float(row.get("buy_amt"), 0)
+            sell_amt = safe_float(row.get("sell_amt"), 0)
+
+            # 先處理賣出，確保目標日報酬率是用「賣出前持有成本」估算。
+            if sell_qty > 0:
+                avg_cost = (hold_cost / hold_qty) if hold_qty > 0 else 0.0
+                sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
+
+                est_buy_amount = 0.0
+                est_return_pct = None
+
+                if avg_cost > 0:
+                    est_buy_amount = avg_cost * sell_qty
+                    if sell_avg > 0:
+                        est_return_pct = ((sell_avg - avg_cost) / avg_cost) * 100.0
+
+                if d == target:
+                    result[key] = {
+                        "buy_amount": est_buy_amount,
+                        "return_pct": est_return_pct,
+                    }
+
+                remove_qty = min(sell_qty, hold_qty)
+                if remove_qty > 0 and avg_cost > 0:
+                    hold_cost -= avg_cost * remove_qty
+                    hold_qty -= remove_qty
+                    if hold_qty < 1e-9:
+                        hold_qty = 0.0
+                        hold_cost = 0.0
+
+            if buy_qty > 0:
+                hold_qty += buy_qty
+                hold_cost += buy_amt
+
+    return result
+
+
 def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
     """
     今日賣超明細改讀「每日賣出明細」。
@@ -902,6 +995,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
     2. 若該權證未出現在 A/B/C/D，但同一分點今天對同一標的的賣出金額合計
        達 NON_ABCD_SELL_UNDERLYING_THRESHOLD，仍納入賣超明細。
        這類資料不標 A/B/C/D，直接顯示權證與賣出金額。
+    3. 非 A/B/C/D 的大額單標的賣超，會從「快取_分點歷史」估算該權證的
+       加權平均成本與賣出報酬率。
     """
     needed_cols = [
         "日期", "分點", "分點名稱", "券商代號",
@@ -917,9 +1012,9 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         return
 
     event_lookup = build_sell_event_lookup_from_abcd(target)
+    history_return_lookup = build_warrant_sell_history_return_lookup(target)
 
-    # 先統計非 A/B/C/D 權證在「同一天 + 同分點 + 同標的」的實際賣出合計。
-    # 達 100 萬以上才會被納入圖卡，避免小額散戶賣單干擾。
+    # 先統計「不在 A/B/C/D 白名單」的權證，在同一天 + 同分點 + 同標的的實際賣出合計。
     non_abcd_underlying_amounts: dict[tuple[str, str], float] = defaultdict(float)
 
     for _, r in df.iterrows():
@@ -964,8 +1059,6 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
         sell_amount = safe_float(r.get("賣出金額"), 0)
         sell_qty = safe_int(r.get("賣出張數"), 0)
-        sell_avg = safe_float(r.get("賣出均價"), 0)
-
         if sell_qty <= 0:
             sell_qty = int(safe_float(r.get("賣出股數"), 0) // 1000)
 
@@ -973,6 +1066,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             continue
 
         lookup_info = event_lookup.get((broker, warrant_code))
+        hist_info = history_return_lookup.get((broker, warrant_code), {})
 
         if lookup_info:
             if is_unclassified_event(event):
@@ -985,22 +1079,29 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
                 warrant_name = lookup_info.get("warrant_name", warrant_name)
 
             return_pct = normalize_return_pct(lookup_info.get("return_pct"))
-            buy_amount = 0
+            buy_amount = 0.0
 
             if is_unclassified_event(event):
                 # 權證雖可對到 A/B/C/D 白名單，但事件代號仍無法解析時，
                 # 不強行標註 A/B/C/D，直接當作單一賣超顯示。
                 event = "單一賣超"
 
-            # 若 A/B/C/D lookup 有買進均價，則用實際賣出均價估算報酬率。
-            # A 類通常較精準；B/C/D 為群組平均成本概算。
             buy_avg = safe_float(lookup_info.get("buy_avg"), 0)
+            sell_avg = safe_float(r.get("賣出均價"), 0)
+
             if buy_avg > 0 and sell_qty > 0:
                 buy_amount = buy_avg * sell_qty * NTD_PER_WARRANT_POINT
                 if return_pct is None and sell_avg > 0:
                     return_pct = ((sell_avg - buy_avg) / buy_avg) * 100.0
             else:
                 buy_amount = safe_float(lookup_info.get("buy_amount"), 0)
+
+            # 若事件表本身沒有足夠資訊，再用快取_分點歷史補估
+            if (return_pct is None or safe_float(buy_amount, 0) <= 0) and hist_info:
+                if return_pct is None:
+                    return_pct = hist_info.get("return_pct")
+                if safe_float(buy_amount, 0) <= 0:
+                    buy_amount = safe_float(hist_info.get("buy_amount"), 0)
 
             append_sell(
                 sells,
@@ -1032,8 +1133,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             sell_amount,
             sell_qty,
             SHEET_DAILY_SELL,
-            None,
-            0,
+            hist_info.get("return_pct"),
+            safe_float(hist_info.get("buy_amount"), 0),
             warrant_code=warrant_code,
             force_include=True,
         )
@@ -1861,10 +1962,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 注意：每日賣出明細通常只輸出最近幾天，不能拿來做近一個月 TOP15，
     # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
     #
-    # 扣減規則：
-    # 1. 原本 A/B/C/D 事件納入過的「分點 + 權證代號」照常扣。
-    # 2. 非 A/B/C/D 權證若同一天同一分點同一標的賣出合計 >= 100 萬，也扣。
-    #    這是為了讓元大南屯賣南亞科這種明顯大額賣單可以反映到 TOP15。
+    # 這裡只扣本次 TOP15 統計期間內，已被 A/B/C/D 買超事件納入的
+    # 「分點 + 權證代號」，避免同分點其他散戶或非策略權證賣出被扣進來。
     sell_rows_loaded = False
     try:
         sell_df = read_gsheet_table_optional(
@@ -1874,20 +1973,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         if not sell_df.empty:
             sell_rows_loaded = True
-
-            sell_period_start = min(trading_dates)
-            sell_period_end = target
-
-            usable_sell_rows = []
-            non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
-
             for _, r in sell_df.iterrows():
                 d = parse_date_value(r.get("日期"))
-                if not d or d < sell_period_start or d > sell_period_end:
+                if not d or d not in date_set:
                     continue
 
                 broker = str(r.get("分點", "")).strip()
                 if broker not in TRACKED_BROKERS:
+                    continue
+
+                warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+                if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
                     continue
 
                 warrant_text = r.get("權證名稱", "")
@@ -1897,24 +1993,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
                 amount = safe_float(r.get("賣出金額"), 0)
                 if amount <= 0:
-                    continue
-
-                warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-                is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
-
-                usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
-
-                if not is_counted_warrant:
-                    non_abcd_sell_amounts[(d, broker, code)] += amount
-
-            qualifying_non_abcd_sell_keys = {
-                key
-                for key, amount in non_abcd_sell_amounts.items()
-                if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
-            }
-
-            for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
-                if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_sell_keys:
                     continue
 
                 agg[code]["net_amount"] -= amount
@@ -1932,19 +2010,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             )
 
             if not sell_df.empty:
-                sell_period_start = min(trading_dates)
-                sell_period_end = target
-
-                usable_sell_rows = []
-                non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
-
                 for _, r in sell_df.iterrows():
                     d = parse_date_value(r.get("日期"))
-                    if not d or d < sell_period_start or d > sell_period_end:
+                    if not d or d not in date_set:
                         continue
 
                     broker = str(r.get("分點", "")).strip()
                     if broker not in TRACKED_BROKERS:
+                        continue
+
+                    warrant_code = normalize_warrant_code(r.get("權證代號", ""))
+                    if not warrant_code or (broker, warrant_code) not in counted_warrant_keys:
                         continue
 
                     warrant_text = r.get("權證名稱", "")
@@ -1954,24 +2030,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
                     amount = safe_float(r.get("賣出金額"), 0)
                     if amount <= 0:
-                        continue
-
-                    warrant_code = normalize_warrant_code(r.get("權證代號", ""))
-                    is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
-
-                    usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
-
-                    if not is_counted_warrant:
-                        non_abcd_sell_amounts[(d, broker, code)] += amount
-
-                qualifying_non_abcd_sell_keys = {
-                    key
-                    for key, amount in non_abcd_sell_amounts.items()
-                    if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
-                }
-
-                for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
-                    if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_sell_keys:
                         continue
 
                     agg[code]["net_amount"] -= amount
