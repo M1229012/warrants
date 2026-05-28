@@ -79,8 +79,26 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 WARRANTS_CACHE_PATH   = os.path.join(CACHE_DIR, "warrants_cache.csv")
 BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "candidates_cache.csv")
+CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
+CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
+
+# 執行模式：
+# RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
+#             讓今日買賣超明細盡量完整，例如元大南屯今日賣南亞科所有相關認購權證。
+# RUN_MODE=2：完整清單模式。使用目前 TARGET_PATTERNS 內所有分點，維持原本完整分點清單邏輯。
+RUN_MODE = int(os.getenv("RUN_MODE", os.getenv("BROKER_RUN_MODE", "1")) or "1")
+SELECTED_TARGET_LABELS_DEFAULT = [
+    "華南永昌台中",
+    "元大南屯",
+    "富邦敦南",
+    "永豐金內湖",
+    "永豐金竹北",
+]
+SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
+SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
+SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -148,6 +166,127 @@ FALLBACK = {
     "國票中正":       ("國票-中正",       "7797"),
     "國票敦北法人":   ("國票-敦北法人",   "779c"),
 }
+
+FULL_TARGET_PATTERNS = dict(TARGET_PATTERNS)
+FULL_FALLBACK = dict(FALLBACK)
+
+
+def parse_selected_target_labels():
+    if SELECTED_TARGET_LABELS_ENV:
+        labels = [
+            x.strip()
+            for x in re.split(r"[,;；、\n\r\t]+", SELECTED_TARGET_LABELS_ENV)
+            if x.strip()
+        ]
+    else:
+        labels = list(SELECTED_TARGET_LABELS_DEFAULT)
+
+    out = []
+    for label in labels:
+        if label not in out:
+            out.append(label)
+
+    return out
+
+
+def configure_run_mode():
+    """
+    依 RUN_MODE 切換分點範圍與候選快取。
+
+    RUN_MODE=1：
+    - 只保留 SELECTED_TARGET_LABELS 指定的精選分點。
+    - 候選快取使用 candidates_cache_selected5.csv，避免與完整清單模式混在一起。
+    - 歷史分點快取仍共用 broker_warrant_history_cache.csv，因為 key 是權證代號 + 券商代號 + 日期，
+      可讓精選模式抓到的新資料補強整體歷史資料。
+
+    RUN_MODE=2：
+    - 使用完整 TARGET_PATTERNS 分點清單。
+    - 候選快取使用原本 candidates_cache.csv。
+    """
+    global RUN_MODE, TARGET_PATTERNS, FALLBACK, CANDIDATES_CACHE_PATH
+
+    try:
+        RUN_MODE = int(os.getenv("RUN_MODE", os.getenv("BROKER_RUN_MODE", str(RUN_MODE))) or "1")
+    except Exception:
+        RUN_MODE = 1
+
+    if RUN_MODE not in (1, 2):
+        print(f"  ⚠️ RUN_MODE={RUN_MODE} 不支援，改用 RUN_MODE=1 精選分點模式。")
+        RUN_MODE = 1
+
+    if RUN_MODE == 1:
+        selected_labels = parse_selected_target_labels()
+        missing = [label for label in selected_labels if label not in FULL_TARGET_PATTERNS]
+
+        if missing:
+            print(f"  ⚠️ SELECTED_TARGET_LABELS 中有不存在於 TARGET_PATTERNS 的分點，已略過：{missing}")
+
+        active_labels = [label for label in selected_labels if label in FULL_TARGET_PATTERNS]
+
+        if not active_labels:
+            print("  ⚠️ 精選分點清單為空，改用預設 5 間分點。")
+            active_labels = [
+                label for label in SELECTED_TARGET_LABELS_DEFAULT
+                if label in FULL_TARGET_PATTERNS
+            ]
+
+        TARGET_PATTERNS = {
+            label: FULL_TARGET_PATTERNS[label]
+            for label in active_labels
+        }
+        FALLBACK = {
+            label: FULL_FALLBACK[label]
+            for label in active_labels
+            if label in FULL_FALLBACK
+        }
+        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_SELECTED5_PATH
+        print("  ✅ RUN_MODE=1：精選分點全市場追蹤模式")
+        print(f"  ✅ 精選分點：{', '.join(TARGET_PATTERNS.keys())}")
+        print(f"  ✅ 候選快取：{CANDIDATES_CACHE_PATH}")
+    else:
+        TARGET_PATTERNS = dict(FULL_TARGET_PATTERNS)
+        FALLBACK = dict(FULL_FALLBACK)
+        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_ALL_PATH
+        print("  ✅ RUN_MODE=2：完整分點清單模式")
+        print(f"  ✅ 分點數：{len(TARGET_PATTERNS)}")
+        print(f"  ✅ 候選快取：{CANDIDATES_CACHE_PATH}")
+
+
+def filter_broker_map_for_active_targets(broker_map):
+    if not broker_map:
+        return {}
+
+    active_labels = set(TARGET_PATTERNS.keys())
+    return {
+        label: value
+        for label, value in broker_map.items()
+        if label in active_labels
+    }
+
+
+def filter_candidates_by_broker_map(candidates, broker_map):
+    if not candidates:
+        return []
+
+    if not broker_map:
+        return []
+
+    allowed_labels = set(broker_map.keys())
+    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
+
+    out = []
+    for c in candidates:
+        try:
+            label = str(c[4]).strip()
+            broker_code = str(c[6]).strip()
+        except Exception:
+            continue
+
+        if label in allowed_labels or broker_code in allowed_codes:
+            out.append(c)
+
+    return out
+
 
 HDR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -936,6 +1075,7 @@ CACHE_SHEET_NAME_MAP = {
     "warrants_cache.csv": "快取_權證清單",
     "broker_map_cache.csv": "快取_分點代號",
     "candidates_cache.csv": "快取_候選組合",
+    "candidates_cache_selected5.csv": "快取_候選組合_精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
 }
@@ -2723,7 +2863,7 @@ def load_broker_map_cache():
         name = str(row["分點名稱"]).strip()
         code = str(row["券商代號"]).strip()
 
-        if label and name and code:
+        if label and name and code and label in TARGET_PATTERNS:
             broker_map[label] = (name, code)
 
     missing = [k for k in TARGET_PATTERNS if k not in broker_map]
@@ -3408,7 +3548,8 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS
 
-    cached_candidates = load_candidates_cache()
+    broker_map = filter_broker_map_for_active_targets(broker_map)
+    cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
 
     if cached_candidates:
         print("【Step 3a】讀取候選組合快取...")
@@ -3419,15 +3560,19 @@ def prescan_all(warrants, broker_map):
 
         # 正式每日流程：
         # 1. 先保留候選組合快取，避免重抓所有完整歷史。
-        # 2. 再輕量補掃全市場最近 CACHE_RECENT_SCAN_DAYS 天，用 API4 找新出現的目標分點。
-        # 3. 只把最近有出現目標分點的候選放進 PRESCAN_REFRESH_KEYS，
-        #    主流程 Step 3b 才會針對這些候選用 API5 補抓完整歷史。
-        print(f"  🔄 補掃全市場最近 {CACHE_RECENT_SCAN_DAYS} 天，用來發現新權證 / 新候選組合...")
+        # 2. 再全市場補掃最近幾天，用 API4 找新出現的目標分點。
+        # 3. RUN_MODE=1 時 broker_map 只包含精選 5 分點，因此會針對這 5 間全市場補掃，
+        #    只要今天這 5 間在某檔權證有買 / 賣紀錄，就會加入 recent_candidates，
+        #    進而讓 Step 3b 用 API5 抓完整 250 天歷史。
+        scan_days = SELECTED_FULL_SCAN_DAYS if RUN_MODE == 1 else CACHE_RECENT_SCAN_DAYS
+        print(f"  🔄 補掃全市場最近 {scan_days} 天，用來發現新權證 / 新候選組合...")
 
-        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=CACHE_RECENT_SCAN_DAYS)
+        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+        recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
         PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
 
         merged_candidates = merge_candidates(cached_candidates, recent_candidates)
+        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
         save_candidates_cache(merged_candidates)
 
         print(
@@ -3438,7 +3583,9 @@ def prescan_all(warrants, broker_map):
 
         return merged_candidates
 
-    candidates = prescan_all_live(warrants, broker_map, scan_days=40)
+    initial_scan_days = SELECTED_INITIAL_SCAN_DAYS if RUN_MODE == 1 else 40
+    candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
+    candidates = filter_candidates_by_broker_map(candidates, broker_map)
     PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
     save_candidates_cache(candidates)
     return candidates
@@ -6906,6 +7053,8 @@ def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
 
+    configure_run_mode()
+
     today_fn = datetime.today().strftime("%Y%m%d")
     output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_ABCD_{today_fn}.xlsx")
 
@@ -6914,7 +7063,9 @@ def main():
     print(f"B：同分點 + 同標的 + 單日多檔權證合計買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"C：同分點 + 同標的 + 連續3交易日多檔權證累積買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
+    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點全市場追蹤，2=完整分點清單）")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
+    print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
     print("=" * 70)
 
@@ -6925,7 +7076,7 @@ def main():
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
 
-    broker_map = find_broker_codes(warrants)
+    broker_map = filter_broker_map_for_active_targets(find_broker_codes(warrants))
 
     if not broker_map:
         elapsed = time.time() - program_start
