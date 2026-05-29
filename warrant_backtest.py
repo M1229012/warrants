@@ -9,6 +9,8 @@
 4. 自動畫出支撐、壓力、大量支撐區、三角收斂線
 5. 抓取近 14 日新聞 RSS 摘要
 6. 輸出 PNG 圖像週報
+7. 從官方上市/上櫃權證每日成交資料抓取當日有成交認購權證
+8. 輸出全市場認購權證成交金額 TOP20 與後續抓分點用的權證清單
 
 本程式為 MVP 版本，欄位名稱已盡量做自動對應。
 如果你的 Google Sheet 欄位名稱不同，請優先調整 COLUMN_ALIASES。
@@ -25,6 +27,7 @@ import textwrap
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
@@ -267,6 +270,297 @@ def wrap_zh_text(text: str, width: int = 34) -> str:
 
 def clean_stock_id(stock_id: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", str(stock_id).strip())
+
+
+
+# ============================================================
+# 3-1. 官方每日認購權證成交資料
+# ============================================================
+
+DAILY_CALL_WARRANT_SOURCES: Dict[str, Dict[str, str]] = {
+    # 上市：臺灣證券交易所 OpenAPI
+    "上市": {
+        "url": "https://openapi.twse.com.tw/v1/opendata/t187ap42_L",
+        "format": "json",
+    },
+    # 上櫃：公開資訊觀測站 OpenData CSV
+    "上櫃": {
+        "url": "https://mopsfin.twse.com.tw/opendata/t187ap42_O.csv",
+        "format": "csv",
+    },
+}
+
+
+def clean_daily_number(value: Any) -> float:
+    """解析官方每日成交檔的數字欄位。"""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+
+    s = str(value).strip()
+    if not s or s in {"-", "--", "nan", "None"}:
+        return 0.0
+
+    s = (
+        s.replace(",", "")
+        .replace(" ", "")
+        .replace("\u3000", "")
+        .replace("+", "")
+    )
+    s = re.sub(r"[^0-9.\-]", "", s)
+
+    if not s or s in {".", "-"}:
+        return 0.0
+
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def normalize_warrant_code(value: Any) -> str:
+    """權證代號保留英數字，避免 CSV 讀取時產生空白或奇怪符號。"""
+    return re.sub(r"[^0-9A-Za-z]", "", str(value).strip())
+
+
+def read_official_json(url: str) -> pd.DataFrame:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    data = resp.json()
+    if not isinstance(data, list):
+        raise RuntimeError(f"官方 JSON 回傳格式不是 list，實際格式：{type(data)}")
+
+    return pd.DataFrame(data)
+
+
+def read_official_csv(url: str) -> pd.DataFrame:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    last_error: Optional[Exception] = None
+    for enc in ["utf-8-sig", "utf-8", "cp950", "big5"]:
+        try:
+            text = resp.content.decode(enc)
+            return pd.read_csv(StringIO(text))
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"官方 CSV 解析失敗：{last_error}")
+
+
+def fetch_daily_warrant_data_by_market(market: str, config: Dict[str, str]) -> pd.DataFrame:
+    url = config["url"]
+    fmt = config["format"].lower().strip()
+
+    if fmt == "json":
+        df = read_official_json(url)
+    elif fmt == "csv":
+        df = read_official_csv(url)
+    else:
+        raise ValueError(f"不支援的官方資料格式：{fmt}")
+
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.strip()
+    )
+    df["市場"] = market
+    return df
+
+
+def fetch_official_daily_warrant_data() -> pd.DataFrame:
+    """
+    抓取官方上市與上櫃權證每日成交資料。
+    這裡只負責抓官方成交資訊，不抓分點。
+    """
+    frames: List[pd.DataFrame] = []
+
+    for market, config in DAILY_CALL_WARRANT_SOURCES.items():
+        print(f"抓取官方{market}權證每日成交資料：{config['url']}")
+        df = fetch_daily_warrant_data_by_market(market, config)
+        if df.empty:
+            print(f"  - {market} 無資料")
+            continue
+        frames.append(df)
+
+    if not frames:
+        raise RuntimeError("官方上市/上櫃權證每日成交資料皆為空。")
+
+    all_df = pd.concat(frames, ignore_index=True, sort=False)
+    all_df.columns = [str(c).strip() for c in all_df.columns]
+
+    required_cols = ["交易日期", "權證代號", "權證名稱", "成交金額"]
+    missing_cols = [c for c in required_cols if c not in all_df.columns]
+    if missing_cols:
+        raise RuntimeError(
+            f"官方每日權證成交資料缺少必要欄位：{missing_cols}。"
+            f"目前欄位：{list(all_df.columns)}"
+        )
+
+    if "成交數量" in all_df.columns:
+        volume_col = "成交數量"
+    elif "成交張數" in all_df.columns:
+        volume_col = "成交張數"
+    else:
+        volume_col = None
+
+    all_df["交易日期_str"] = all_df["交易日期"].astype(str).str.strip()
+    all_df["權證代號"] = all_df["權證代號"].apply(normalize_warrant_code)
+    all_df["權證名稱"] = all_df["權證名稱"].astype(str).str.strip()
+    all_df["成交金額_num"] = all_df["成交金額"].apply(clean_daily_number)
+
+    if volume_col:
+        all_df["成交數量_num"] = all_df[volume_col].apply(clean_daily_number)
+    else:
+        all_df["成交數量_num"] = 0.0
+
+    return all_df
+
+
+def get_latest_official_trade_date(df: pd.DataFrame) -> str:
+    if "交易日期_str" not in df.columns:
+        df = df.copy()
+        df["交易日期_str"] = df["交易日期"].astype(str).str.strip()
+    dates = [str(x).strip() for x in df["交易日期_str"].dropna().tolist() if str(x).strip()]
+    if not dates:
+        raise RuntimeError("官方每日權證成交資料沒有可用的交易日期。")
+    return max(dates)
+
+
+def build_today_call_warrant_universe(min_amount: float = 0, top_n: Optional[int] = None) -> pd.DataFrame:
+    """
+    以官方上市/上櫃每日成交資料建立今日認購權證清單。
+    之後抓分點資訊時，請改用這份清單，不要再全市場權證盲掃。
+    """
+    all_df = fetch_official_daily_warrant_data()
+    latest_trade_date = get_latest_official_trade_date(all_df)
+    print(f"官方權證每日成交資料最新交易日期：{latest_trade_date}")
+
+    today_df = all_df[all_df["交易日期_str"] == latest_trade_date].copy()
+
+    call_df = today_df[
+        today_df["權證名稱"].astype(str).str.contains("購", na=False)
+        & (today_df["成交金額_num"] >= float(min_amount))
+        & (today_df["成交數量_num"] > 0)
+    ].copy()
+
+    call_df = call_df.sort_values("成交金額_num", ascending=False).reset_index(drop=True)
+
+    if top_n is not None and top_n > 0:
+        call_df = call_df.head(top_n).copy()
+
+    return call_df
+
+
+def build_call_warrant_top20() -> pd.DataFrame:
+    """產生全市場認購權證當日成交金額 TOP20。"""
+    call_df = build_today_call_warrant_universe(min_amount=0, top_n=20)
+
+    result = call_df.copy()
+    result.insert(0, "排名", range(1, len(result) + 1))
+
+    keep_cols = [
+        "排名",
+        "交易日期",
+        "市場",
+        "權證代號",
+        "權證名稱",
+        "成交金額_num",
+        "成交數量_num",
+    ]
+
+    result = result[keep_cols].rename(columns={
+        "成交金額_num": "成交金額",
+        "成交數量_num": "成交數量",
+    })
+
+    return result
+
+
+def get_warrant_codes_for_broker_fetch(min_amount: float = 500_000, top_n: Optional[int] = 500) -> List[str]:
+    """
+    產生後續抓分點用的權證代號清單。
+    預設只抓成交金額 >= 50 萬，最多前 500 檔，避免浪費時間掃流動性太差的權證。
+    """
+    call_df = build_today_call_warrant_universe(min_amount=min_amount, top_n=top_n)
+
+    codes = (
+        call_df["權證代號"]
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+
+    print(f"後續準備抓分點的認購權證數量：{len(codes)}")
+    return codes
+
+
+def export_daily_call_warrant_outputs(
+    output_dir: str = "output",
+    broker_min_amount: float = 500_000,
+    broker_top_n: Optional[int] = 500,
+) -> Tuple[Path, Path]:
+    """
+    輸出：
+    1. 全市場認購權證當日成交金額 TOP20 Excel
+    2. 後續抓分點用的認購權證代號 CSV
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    top20 = build_call_warrant_top20()
+    trade_date = str(top20["交易日期"].iloc[0]) if not top20.empty else datetime.now().strftime("%Y%m%d")
+
+    top20_path = output_path / f"全市場認購權證成交金額TOP20_{trade_date}.xlsx"
+
+    with pd.ExcelWriter(top20_path, engine="openpyxl") as writer:
+        top20.to_excel(writer, sheet_name="成交金額TOP20", index=False)
+        ws = writer.book["成交金額TOP20"]
+
+        widths = {
+            "A": 8,
+            "B": 14,
+            "C": 10,
+            "D": 14,
+            "E": 28,
+            "F": 18,
+            "G": 18,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+        for row in range(2, ws.max_row + 1):
+            ws[f"F{row}"].number_format = '#,##0'
+            ws[f"G{row}"].number_format = '#,##0'
+
+    broker_codes = get_warrant_codes_for_broker_fetch(
+        min_amount=broker_min_amount,
+        top_n=broker_top_n,
+    )
+
+    broker_codes_path = output_path / f"今日認購權證分點抓取清單_{trade_date}.csv"
+    pd.DataFrame({"權證代號": broker_codes}).to_csv(
+        broker_codes_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(f"已輸出 TOP20：{top20_path}")
+    print(f"已輸出分點抓取清單：{broker_codes_path}")
+
+    return top20_path, broker_codes_path
 
 
 # ============================================================
@@ -1106,12 +1400,44 @@ def generate_report(stock_id: str, sheet_name: str, worksheet_name: Optional[str
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="產生大戶權證追蹤圖像週報")
-    parser.add_argument("--stock-id", required=True, help="股票代號，例如 2408")
+    parser = argparse.ArgumentParser(description="產生大戶權證追蹤圖像週報 / 官方認購權證成交金額 TOP20")
+    parser.add_argument("--stock-id", default=None, help="股票代號，例如 2408；產生個股週報時必填")
     parser.add_argument("--sheet-name", default=os.getenv("GSHEET_NAME", "權證分點籌碼"), help="Google Sheet 名稱")
     parser.add_argument("--worksheet", default=os.getenv("GSHEET_WORKSHEET", "") or None, help="工作表名稱，空白代表讀取所有 worksheet")
-    parser.add_argument("--output-dir", default=os.getenv("OUTPUT_DIR", "output"), help="圖片輸出資料夾")
+    parser.add_argument("--output-dir", default=os.getenv("OUTPUT_DIR", "output"), help="圖片 / 表單輸出資料夾")
+
+    # 新增：官方每日認購權證成交資訊，不再全市場盲掃權證
+    parser.add_argument(
+        "--daily-call-top20",
+        action="store_true",
+        help="只抓官方上市/上櫃認購權證每日成交資料，輸出當日成交金額 TOP20 與後續抓分點用清單",
+    )
+    parser.add_argument(
+        "--broker-min-amount",
+        type=float,
+        default=float(os.getenv("BROKER_MIN_AMOUNT", "500000")),
+        help="後續抓分點清單的最低成交金額門檻，預設 500000",
+    )
+    parser.add_argument(
+        "--broker-top-n",
+        type=int,
+        default=int(os.getenv("BROKER_TOP_N", "500")),
+        help="後續抓分點清單最多取前幾檔，預設 500；設定 0 代表不限制",
+    )
+
     args = parser.parse_args()
+
+    if args.daily_call_top20:
+        broker_top_n = args.broker_top_n if args.broker_top_n and args.broker_top_n > 0 else None
+        export_daily_call_warrant_outputs(
+            output_dir=args.output_dir,
+            broker_min_amount=args.broker_min_amount,
+            broker_top_n=broker_top_n,
+        )
+        return
+
+    if not args.stock_id:
+        raise ValueError("產生個股週報時必須提供 --stock-id；若只要輸出認購權證 TOP20，請使用 --daily-call-top20。")
 
     generate_report(
         stock_id=args.stock_id,
