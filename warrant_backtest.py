@@ -83,6 +83,7 @@ CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
 CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
+ACTIVE_WARRANTS_CACHE_PATH = os.path.join(CACHE_DIR, "active_warrants_today_cache.csv")
 
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
@@ -104,6 +105,23 @@ SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
 # SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+
+# 今日成交量權證前置過濾：
+# 原本 RUN_MODE=1 會建立「所有認購權證 × 精選分點」候選池，再全部跑 API5。
+# 這會浪費大量時間在今日沒有成交量的權證上。
+# ACTIVE_WARRANT_FILTER_ENABLE=1 時，主流程會先用 MoneyDJ API4 掃描最近 ACTIVE_WARRANT_SCAN_DAYS 天，
+# 找出最新交易日有分點成交資料的認購權證，再只針對這些權證建立候選池與跑 API5。
+ACTIVE_WARRANT_FILTER_ENABLE = os.getenv("ACTIVE_WARRANT_FILTER_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+ACTIVE_WARRANT_SCAN_DAYS = int(os.getenv("ACTIVE_WARRANT_SCAN_DAYS", "3"))
+ACTIVE_WARRANT_WORKERS = int(os.getenv("ACTIVE_WARRANT_WORKERS", str(PRESCAN_WORKERS)))
+ACTIVE_WARRANT_FORCE_REFRESH = os.getenv("ACTIVE_WARRANT_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
+ACTIVE_WARRANT_FALLBACK_TO_ALL = os.getenv("ACTIVE_WARRANT_FALLBACK_TO_ALL", "0").strip().lower() in ("1", "true", "yes")
+ACTIVE_WARRANT_MIN_ROWS = int(os.getenv("ACTIVE_WARRANT_MIN_ROWS", "1"))
+
+# 供 Excel「今日標的買超TOP20」使用。
+ACTIVE_WARRANT_LATEST_TRADE_DATE = ""
+ACTIVE_WARRANT_FILTER_SOURCE = ""
+
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -291,6 +309,33 @@ def filter_candidates_by_broker_map(candidates, broker_map):
             out.append(c)
 
     return out
+
+
+def filter_candidates_by_warrant_codes(candidates, allowed_warrant_codes):
+    if not candidates:
+        return []
+
+    if not allowed_warrant_codes:
+        return []
+
+    allowed_warrant_codes = {
+        normalize_warrant_code_for_filter(code)
+        for code in allowed_warrant_codes
+        if normalize_warrant_code_for_filter(code)
+    }
+
+    out = []
+    for c in candidates:
+        try:
+            warrant_code = normalize_warrant_code_for_filter(c[0])
+        except Exception:
+            continue
+
+        if warrant_code in allowed_warrant_codes:
+            out.append(c)
+
+    return out
+
 
 
 HDR = {
@@ -1083,6 +1128,7 @@ CACHE_SHEET_NAME_MAP = {
     "candidates_cache_selected5.csv": "快取_候選組合_精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
+    "active_warrants_today_cache.csv": "快取_今日有成交權證",
 }
 
 
@@ -3415,6 +3461,275 @@ def get_all_call_warrants():
     return warrants
 
 
+
+def normalize_warrant_code_for_filter(code):
+    s = str(code).strip()
+
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    s = "".join(ch for ch in s if ch.isdigit())
+
+    if len(s) == 5:
+        s = s.zfill(6)
+
+    return s
+
+
+def active_warrant_cache_run_date():
+    return datetime.today().strftime("%Y/%m/%d")
+
+
+def load_active_warrants_cache(warrants):
+    """
+    讀取「今日有成交權證」快取。
+
+    快取目的：
+    1. 避免同一天重跑時又對所有權證打 API4。
+    2. GitHub Actions / 本機都可透過既有 read_cache_csv() 同步 Google Sheet 快取。
+    """
+    if ACTIVE_WARRANT_FORCE_REFRESH:
+        return [], ""
+
+    df = read_cache_csv(ACTIVE_WARRANTS_CACHE_PATH)
+
+    if df.empty:
+        return [], ""
+
+    required_cols = ["執行日期", "最新交易日", "權證代號"]
+    for col in required_cols:
+        if col not in df.columns:
+            return [], ""
+
+    run_date = active_warrant_cache_run_date()
+    df = df[df["執行日期"].astype(str).str.strip() == run_date].copy()
+
+    if df.empty:
+        return [], ""
+
+    latest_trade_date = str(df["最新交易日"].iloc[0]).strip()
+
+    warrant_map = {
+        normalize_warrant_code_for_filter(w.get("代號", "")): w
+        for w in warrants
+        if normalize_warrant_code_for_filter(w.get("代號", ""))
+    }
+
+    active_codes = []
+    for code in df["權證代號"].astype(str).tolist():
+        code = normalize_warrant_code_for_filter(code)
+        if code and code in warrant_map and code not in active_codes:
+            active_codes.append(code)
+
+    active_warrants = [warrant_map[code] for code in active_codes]
+
+    if active_warrants:
+        print(
+            f"  ♻️ 已讀取今日有成交權證快取：{len(active_warrants):,} 支，"
+            f"最新交易日：{latest_trade_date}"
+        )
+
+    return active_warrants, latest_trade_date
+
+
+def save_active_warrants_cache(active_warrants, latest_trade_date):
+    if not USE_CACHE or not active_warrants:
+        return
+
+    rows = []
+    run_date = active_warrant_cache_run_date()
+
+    for w in active_warrants:
+        rows.append({
+            "執行日期": run_date,
+            "最新交易日": latest_trade_date,
+            "權證代號": normalize_warrant_code_for_filter(w.get("代號", "")),
+            "權證名稱": str(w.get("名稱", "")).strip(),
+            "標的股": str(w.get("標的股", "")).strip(),
+            "標的名稱": str(w.get("標的名稱", "")).strip(),
+        })
+
+    df = pd.DataFrame(rows, columns=[
+        "執行日期", "最新交易日", "權證代號", "權證名稱", "標的股", "標的名稱"
+    ])
+
+    write_cache_csv(df, ACTIVE_WARRANTS_CACHE_PATH)
+    print(f"  💾 已更新今日有成交權證快取：{ACTIVE_WARRANTS_CACHE_PATH}")
+
+
+def get_api4_row_date(row):
+    for key in ["V1", "日期", "date", "Date"]:
+        if key in row:
+            date_str = normalize_date_str(row.get(key, ""))
+            if parse_date(date_str):
+                return date_str
+    return ""
+
+
+def api4_row_has_trade(row):
+    """
+    判斷 API4 回傳列是否代表該權證在該日有成交 / 分點資料。
+
+    API4 是權證分點資料，欄位版本可能會變動，因此這裡採保守邏輯：
+    1. 只要該列有有效日期，且沒有明顯是空列，就視為該權證當日有成交分點資料。
+    2. 若列中有數字欄位，至少一個數值 > 0 也視為有效。
+    """
+    row_date = get_api4_row_date(row)
+    if not row_date:
+        return False
+
+    numeric_hit = False
+    for value in row.values():
+        try:
+            v = float(str(value).replace(",", "").strip())
+            if v > 0:
+                numeric_hit = True
+                break
+        except:
+            pass
+
+    return numeric_hit or bool(row)
+
+
+def filter_warrants_by_today_volume(warrants):
+    """
+    今日成交量前置過濾。
+
+    原本流程：
+        所有認購權證 → 所有權證 × 特定分點 → API5
+
+    新流程：
+        所有認購權證 → API4 找最新交易日有成交量的權證
+        → 只用這批權證建立「權證 × 特定分點」候選池 → API5
+
+    注意：
+    - 這裡的「今天」以 API4 在最近 ACTIVE_WARRANT_SCAN_DAYS 天內抓到的最新交易日為準。
+      若週末 / 國定假日 / 資料尚未更新，會自動使用最近一個有資料的交易日。
+    - 若完全抓不到任何有成交權證，預設不會回退全市場，避免又掃全市場。
+      需要緊急回退才設定 ACTIVE_WARRANT_FALLBACK_TO_ALL=1。
+    """
+    global ACTIVE_WARRANT_LATEST_TRADE_DATE, ACTIVE_WARRANT_FILTER_SOURCE
+
+    if not ACTIVE_WARRANT_FILTER_ENABLE:
+        ACTIVE_WARRANT_FILTER_SOURCE = "disabled"
+        print("【Step 1b】ACTIVE_WARRANT_FILTER_ENABLE=0，略過今日成交量過濾，沿用全部認購權證。")
+        return warrants
+
+    print("【Step 1b】過濾今日有成交量的認購權證...")
+
+    cached_active_warrants, cached_latest_date = load_active_warrants_cache(warrants)
+
+    if cached_active_warrants:
+        ACTIVE_WARRANT_LATEST_TRADE_DATE = cached_latest_date
+        ACTIVE_WARRANT_FILTER_SOURCE = "cache"
+        print(
+            f"  ✅ 今日成交量過濾完成 [快取]：全部 {len(warrants):,} 支 "
+            f"→ 有成交 {len(cached_active_warrants):,} 支"
+        )
+        return cached_active_warrants
+
+    today = datetime.today()
+    end_s = today.strftime("%Y/%m/%d")
+    start_s = (today - timedelta(days=max(ACTIVE_WARRANT_SCAN_DAYS, 1))).strftime("%Y/%m/%d")
+
+    date_to_codes = {}
+    code_to_rows = {}
+    warrant_map = {
+        normalize_warrant_code_for_filter(w.get("代號", "")): w
+        for w in warrants
+        if normalize_warrant_code_for_filter(w.get("代號", ""))
+    }
+
+    done = 0
+
+    def scan_one(w):
+        code = normalize_warrant_code_for_filter(w.get("代號", ""))
+        hits = []
+
+        if not code:
+            return code, hits
+
+        try:
+            rows = api4_get(code, start_s, end_s)
+        except:
+            rows = []
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            if not api4_row_has_trade(row):
+                continue
+
+            date_str = get_api4_row_date(row)
+            if not date_str:
+                continue
+
+            hits.append(date_str)
+
+        return code, hits
+
+    print(
+        f"  🔎 使用 API4 掃描最近 {ACTIVE_WARRANT_SCAN_DAYS} 天："
+        f"{start_s} ~ {end_s}，權證數 {len(warrants):,}，workers={ACTIVE_WARRANT_WORKERS}"
+    )
+
+    with ThreadPoolExecutor(max_workers=ACTIVE_WARRANT_WORKERS) as ex:
+        futures = {ex.submit(scan_one, w): w for w in warrants}
+
+        for future in as_completed(futures):
+            done += 1
+
+            try:
+                code, hit_dates = future.result()
+            except:
+                code, hit_dates = "", []
+
+            if code and hit_dates:
+                code_to_rows[code] = len(hit_dates)
+                for date_str in hit_dates:
+                    date_to_codes.setdefault(date_str, set()).add(code)
+
+            if done % 1000 == 0:
+                print(f"  [{done:,}/{len(warrants):,}] 今日成交量過濾中，已有資料權證 {len(code_to_rows):,} 支...")
+
+    if not date_to_codes:
+        print("  ⚠️ API4 未掃到任何最近成交權證。")
+        if ACTIVE_WARRANT_FALLBACK_TO_ALL:
+            ACTIVE_WARRANT_FILTER_SOURCE = "fallback_all"
+            print("  ⚠️ ACTIVE_WARRANT_FALLBACK_TO_ALL=1，回退使用全部認購權證。")
+            return warrants
+        ACTIVE_WARRANT_LATEST_TRADE_DATE = ""
+        ACTIVE_WARRANT_FILTER_SOURCE = "empty"
+        return []
+
+    latest_trade_date = sorted(
+        date_to_codes.keys(),
+        key=lambda d: parse_date(d) or datetime.min
+    )[-1]
+
+    active_codes = sorted(date_to_codes.get(latest_trade_date, set()))
+    active_warrants = [warrant_map[code] for code in active_codes if code in warrant_map]
+
+    if ACTIVE_WARRANT_MIN_ROWS > 1:
+        active_warrants = [
+            w for w in active_warrants
+            if code_to_rows.get(normalize_warrant_code_for_filter(w.get("代號", "")), 0) >= ACTIVE_WARRANT_MIN_ROWS
+        ]
+
+    ACTIVE_WARRANT_LATEST_TRADE_DATE = latest_trade_date
+    ACTIVE_WARRANT_FILTER_SOURCE = "api4"
+
+    save_active_warrants_cache(active_warrants, latest_trade_date)
+
+    print(
+        f"  ✅ 今日成交量過濾完成 [API4]：全部 {len(warrants):,} 支 "
+        f"→ 最新交易日 {latest_trade_date} 有成交 {len(active_warrants):,} 支"
+    )
+
+    return active_warrants
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Step 2：找目標分點券商代號
 # ══════════════════════════════════════════════════════════════════════
@@ -3612,7 +3927,13 @@ def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
+    active_warrant_codes = {
+        normalize_warrant_code_for_filter(w.get("代號", ""))
+        for w in warrants
+        if normalize_warrant_code_for_filter(w.get("代號", ""))
+    }
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
+    cached_candidates = filter_candidates_by_warrant_codes(cached_candidates, active_warrant_codes)
 
     # RUN_MODE=1 的核心修正：
     # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
@@ -3628,6 +3949,7 @@ def prescan_all(warrants, broker_map):
 
         merged_candidates = merge_candidates(cached_candidates, full_selected_candidates)
         merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
 
         if SELECTED_REFRESH_ALL_WARRANTS:
             # 每次都更新所有精選分點 × 全市場權證，確保今日賣超完整。
@@ -3671,6 +3993,7 @@ def prescan_all(warrants, broker_map):
 
         merged_candidates = merge_candidates(cached_candidates, recent_candidates)
         merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
         save_candidates_cache(merged_candidates)
 
         print(
@@ -7131,6 +7454,208 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     ws.freeze_panes = "A2"
 
+
+def get_latest_trade_date_from_items(items):
+    latest_dt = None
+    latest_str = ""
+
+    for item in items:
+        df = item.get("df", pd.DataFrame())
+
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        for date_str in df["日期"].dropna().astype(str).tolist():
+            date_str = normalize_date_str(date_str)
+            dt = parse_date(date_str)
+
+            if not dt:
+                continue
+
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
+                latest_str = date_str
+
+    return latest_str
+
+
+def build_today_underlying_net_buy_rows(items, target_date=None):
+    """
+    建立「今日權證累積買超前 20 名標的」資料。
+
+    排名單位：標的股，不是單檔權證。
+    統計範圍：目前追蹤的特定分點 + 今日有成交權證候選池。
+    計算方式：
+        標的累積買超金額 = Σ(買進金額 - 賣出金額)
+    """
+    if not items:
+        return [], ""
+
+    if not target_date:
+        target_date = ACTIVE_WARRANT_LATEST_TRADE_DATE or get_latest_trade_date_from_items(items)
+
+    target_date = normalize_date_str(target_date)
+
+    ranking_map = {}
+
+    for item in items:
+        df = item.get("df", pd.DataFrame())
+
+        if df is None or df.empty:
+            continue
+
+        warrant_code = str(item.get("warrant_code", "")).strip()
+        warrant_name = str(item.get("warrant_name", "")).strip()
+        underlying_code = str(item.get("underlying_code", "")).strip()
+        underlying_name = str(item.get("underlying_name", "")).strip()
+        broker_label = str(item.get("broker_label", "")).strip()
+
+        if not underlying_code:
+            continue
+
+        for row in df.itertuples(index=False):
+            row_dict = row._asdict()
+            row_date = normalize_date_str(row_dict.get("日期", ""))
+
+            if row_date != target_date:
+                continue
+
+            buy_amount = int(row_dict.get("買進金額", 0) or 0)
+            sell_amount = int(row_dict.get("賣出金額", 0) or 0)
+            buy_shares = int(row_dict.get("買進股數", 0) or 0)
+            sell_shares = int(row_dict.get("賣出股數", 0) or 0)
+
+            if buy_amount <= 0 and sell_amount <= 0:
+                continue
+
+            key = (underlying_code, underlying_name)
+
+            if key not in ranking_map:
+                ranking_map[key] = {
+                    "日期": target_date,
+                    "標的股": underlying_code,
+                    "標的名稱": underlying_name,
+                    "買進金額": 0,
+                    "賣出金額": 0,
+                    "買超金額": 0,
+                    "買進股數": 0,
+                    "賣出股數": 0,
+                    "買超股數": 0,
+                    "權證代號集合": set(),
+                    "權證清單": [],
+                    "分點買超": {},
+                }
+
+            rec = ranking_map[key]
+            net_amount = buy_amount - sell_amount
+            net_shares = buy_shares - sell_shares
+
+            rec["買進金額"] += buy_amount
+            rec["賣出金額"] += sell_amount
+            rec["買超金額"] += net_amount
+            rec["買進股數"] += buy_shares
+            rec["賣出股數"] += sell_shares
+            rec["買超股數"] += net_shares
+
+            if warrant_code:
+                rec["權證代號集合"].add(warrant_code)
+                label = f"{warrant_code} {warrant_name}".strip()
+                if label and label not in rec["權證清單"]:
+                    rec["權證清單"].append(label)
+
+            if broker_label:
+                rec["分點買超"][broker_label] = rec["分點買超"].get(broker_label, 0) + net_amount
+
+    rows = []
+
+    for rec in ranking_map.values():
+        if rec["買超金額"] <= 0:
+            continue
+
+        broker_text = "；".join(
+            f"{broker}:{fmt_amount(amount)}"
+            for broker, amount in sorted(rec["分點買超"].items(), key=lambda x: x[1], reverse=True)
+            if amount != 0
+        )
+
+        rows.append({
+            "日期": rec["日期"],
+            "標的股": rec["標的股"],
+            "標的名稱": rec["標的名稱"],
+            "買進金額": rec["買進金額"],
+            "賣出金額": rec["賣出金額"],
+            "買超金額": rec["買超金額"],
+            "買進股數": rec["買進股數"],
+            "賣出股數": rec["賣出股數"],
+            "買超股數": rec["買超股數"],
+            "買超張數": rec["買超股數"] // 1000,
+            "涵蓋權證數": len(rec["權證代號集合"]),
+            "分點買超明細": broker_text,
+            "權證清單": "；".join(rec["權證清單"][:80]),
+        })
+
+    rows = sorted(rows, key=lambda x: x["買超金額"], reverse=True)[:20]
+
+    for idx, row in enumerate(rows, 1):
+        row["排名"] = idx
+
+    return rows, target_date
+
+
+def write_today_underlying_net_buy_top20_sheet(wb, items):
+    ws = wb.create_sheet("今日標的買超TOP20")
+
+    rows, target_date = build_today_underlying_net_buy_rows(items)
+
+    headers = [
+        "排名",
+        "日期",
+        "標的股",
+        "標的名稱",
+        "買進金額",
+        "賣出金額",
+        "買超金額",
+        "買進股數",
+        "賣出股數",
+        "買超股數",
+        "買超張數",
+        "涵蓋權證數",
+        "分點買超明細",
+        "權證清單",
+    ]
+
+    ws.append(headers)
+
+    for row in rows:
+        ws.append([
+            row.get("排名", ""),
+            row.get("日期", target_date),
+            row.get("標的股", ""),
+            row.get("標的名稱", ""),
+            fmt_amount(row.get("買進金額")),
+            fmt_amount(row.get("賣出金額")),
+            fmt_amount(row.get("買超金額")),
+            fmt_amount(row.get("買進股數")),
+            fmt_amount(row.get("賣出股數")),
+            fmt_amount(row.get("買超股數")),
+            fmt_amount(row.get("買超張數")),
+            fmt_amount(row.get("涵蓋權證數")),
+            row.get("分點買超明細", ""),
+            row.get("權證清單", ""),
+        ])
+
+    if not rows:
+        ws.append(["", target_date or "-", "無今日標的買超資料"])
+        ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=8)
+
+    col_widths = [8, 12, 10, 14, 14, 14, 14, 14, 14, 14, 10, 12, 45, 80]
+    style_sheet(ws, col_widths, header_row=1)
+
+    for row_idx in range(2, ws.max_row + 1):
+        ws.cell(row_idx, 7).fill = RED
+        ws.cell(row_idx, 7).font = Font(bold=True, color="000000")
+
+
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
     print("【Step 5】建立 Excel...")
 
@@ -7138,6 +7663,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     default_ws = wb.active
     wb.remove(default_ws)
 
+    write_today_underlying_net_buy_top20_sheet(wb, items)
     write_a_sheet(wb, a_events, item_map, price_cache)
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
@@ -7187,11 +7713,20 @@ def main():
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
+    print(f"今日成交量過濾：ACTIVE_WARRANT_FILTER_ENABLE={ACTIVE_WARRANT_FILTER_ENABLE}，ACTIVE_WARRANT_SCAN_DAYS={ACTIVE_WARRANT_SCAN_DAYS}")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
 
     if not warrants:
+        elapsed = time.time() - program_start
+        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        return
+
+    warrants = filter_warrants_by_today_volume(warrants)
+
+    if not warrants:
+        print("⚠️ 今日成交量過濾後沒有任何權證，停止執行。")
         elapsed = time.time() - program_start
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
