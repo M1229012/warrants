@@ -8,3 +8,5 @@ gspread
 google-auth
 Pillow
 matplotlib
+feedparser
+python-dateutil
