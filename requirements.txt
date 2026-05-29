@@ -10,3 +10,5 @@ Pillow
 matplotlib
 feedparser
 python-dateutil
+yfinance
+numpy
