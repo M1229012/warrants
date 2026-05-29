@@ -105,31 +105,6 @@ SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
-
-# 官方每日成交檔前置篩選設定：
-# 目的：不再使用 ISIN 全市場權證清單盲掃；改為先抓官方上市 + 上櫃每日成交檔，
-#      只針對最新交易日「有成交的認購權證」後續抓分點，避免大量空資料。
-OFFICIAL_WARRANT_FILTER_ENABLE = os.getenv("OFFICIAL_WARRANT_FILTER_ENABLE", "1").strip().lower() not in ("0", "false", "no")
-OFFICIAL_WARRANT_MIN_TRADE_AMOUNT = int(os.getenv("OFFICIAL_WARRANT_MIN_TRADE_AMOUNT", "0"))
-OFFICIAL_WARRANT_TOP_N_RAW = os.getenv("OFFICIAL_WARRANT_TOP_N", "").strip()
-OFFICIAL_WARRANT_TOP_N = int(OFFICIAL_WARRANT_TOP_N_RAW) if OFFICIAL_WARRANT_TOP_N_RAW.isdigit() and int(OFFICIAL_WARRANT_TOP_N_RAW) > 0 else None
-OFFICIAL_WARRANT_FALLBACK_TO_ISIN = os.getenv("OFFICIAL_WARRANT_FALLBACK_TO_ISIN", "0").strip().lower() not in ("0", "false", "no")
-
-OFFICIAL_DAILY_WARRANT_SOURCES = {
-    "上市": {
-        "url": "https://openapi.twse.com.tw/v1/opendata/t187ap42_L",
-        "type": "json",
-    },
-    "上櫃": {
-        "url": "https://mopsfin.twse.com.tw/opendata/t187ap42_O.csv",
-        "type": "csv",
-    },
-}
-
-# get_all_call_warrants_live() 會更新這兩個全域變數，build_excel() 會據此新增「當日認購成交TOP20」工作表。
-OFFICIAL_CALL_WARRANT_TOP20_CACHE = []
-OFFICIAL_CALL_WARRANT_LATEST_TRADE_DATE = ""
-
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
 
@@ -313,43 +288,6 @@ def filter_candidates_by_broker_map(candidates, broker_map):
             continue
 
         if label in allowed_labels or broker_code in allowed_codes:
-            out.append(c)
-
-    return out
-
-
-def filter_candidates_by_warrant_universe(candidates, warrants):
-    """
-    依照本次官方成交檔取得的「今日有成交認購權證清單」過濾候選組合。
-
-    目的：
-    1. 避免候選組合快取把以前全市場掃描過的舊權證帶回來。
-    2. 確保後續 API5 只抓本次官方成交檔中最新交易日有成交的認購權證。
-    3. 不改變分點、A/B/C/D 的計算邏輯，只限制候選權證範圍。
-    """
-    if not candidates:
-        return []
-
-    if not warrants:
-        return []
-
-    allowed_codes = {
-        str(w.get("代號", "")).strip()
-        for w in warrants
-        if str(w.get("代號", "")).strip()
-    }
-
-    if not allowed_codes:
-        return []
-
-    out = []
-    for c in candidates:
-        try:
-            warrant_code = str(c[0]).strip()
-        except Exception:
-            continue
-
-        if warrant_code in allowed_codes:
             out.append(c)
 
     return out
@@ -3350,336 +3288,8 @@ def find_underlying(warrant_name, stock_map):
     return code
 
 
-def get_stock_map_from_isin_live():
-    """
-    只抓上市 / 上櫃股票名稱對照表，用於從權證名稱推回標的股。
-
-    注意：這裡不是用 ISIN 取得全市場權證清單，只是借用 ISIN 的股票名稱清單建立 stock_map，
-    後續實際要抓分點的權證清單仍以官方每日成交檔為準。
-    """
-    stock_map = {}
-    isin_modes = [
-        ("上市", "2"),
-        ("上櫃", "4"),
-    ]
-
-    for market_name, mode in isin_modes:
-        try:
-            resp = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=30
-            )
-            resp.raise_for_status()
-            resp.encoding = "cp950"
-
-            tables = pd.read_html(StringIO(resp.text))
-            df = tables[0].iloc[2:].reset_index(drop=True)
-            stock_map.update(build_stock_map(df))
-
-            print(f"  ✅ 已取得{market_name}股票名稱對照：{len(df)} 筆")
-        except Exception as e:
-            print(f"  ⚠️ {market_name}股票名稱對照取得失敗：{e}")
-
-    return stock_map
-
-
-def clean_official_warrant_number(value):
-    if value is None:
-        return 0.0
-
-    s = str(value).strip()
-    if not s or s in {"-", "--", "nan", "None", "null"}:
-        return 0.0
-
-    s = s.replace(",", "").replace(" ", "").replace("\u3000", "")
-    s = re.sub(r"[^0-9.\-]", "", s)
-
-    if not s or s in {"-", "."}:
-        return 0.0
-
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def normalize_official_date_str(value):
-    s = str(value or "").strip().replace("-", "/")
-    if not s:
-        return ""
-
-    m = re.match(r"^(\d{2,4})/(\d{1,2})/(\d{1,2})$", s)
-    if not m:
-        return s
-
-    y = int(m.group(1))
-    mth = int(m.group(2))
-    d = int(m.group(3))
-
-    # 官方檔若用民國年，例如 115/05/29，轉成西元 2026/05/29。
-    if y < 1911:
-        y += 1911
-
-    return f"{y:04d}/{mth:02d}/{d:02d}"
-
-
-def normalize_official_warrant_code(value):
-    s = str(value or "").strip()
-
-    if s.endswith(".0"):
-        s = s[:-2]
-
-    digits = "".join(ch for ch in s if ch.isdigit())
-
-    if not digits:
-        return ""
-
-    # 權證通常 6 碼；若被 pandas / Google Sheet 吃掉前導 0 變 5 碼，補回 6 碼。
-    if len(digits) == 5:
-        digits = digits.zfill(6)
-
-    return digits
-
-
-def get_official_col(df, aliases):
-    norm_map = {
-        str(c).strip().replace(" ", "").replace("\n", ""): c
-        for c in df.columns
-    }
-
-    for alias in aliases:
-        key = str(alias).strip().replace(" ", "").replace("\n", "")
-        if key in norm_map:
-            return norm_map[key]
-
-    return None
-
-
-def fetch_official_json_dataframe(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-
-    if isinstance(data, dict) and isinstance(data.get("data"), list):
-        data = data.get("data")
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"官方 JSON 格式不是 list，實際格式：{type(data)}")
-
-    return pd.DataFrame(data)
-
-
-def fetch_official_csv_dataframe(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-
-    last_error = None
-    for enc in ["utf-8-sig", "utf-8", "cp950", "big5"]:
-        try:
-            text = r.content.decode(enc)
-            return pd.read_csv(StringIO(text))
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"官方 CSV 解析失敗：{last_error}")
-
-
-def fetch_official_daily_warrant_trading():
-    """
-    抓官方上市 + 上櫃認購/售權證每日成交資料。
-
-    這裡只負責抓官方成交檔，不抓分點。
-    """
-    frames = []
-
-    for market, cfg in OFFICIAL_DAILY_WARRANT_SOURCES.items():
-        url = cfg["url"]
-        source_type = cfg["type"]
-        print(f"  🔄 抓取官方{market}權證每日成交資料：{url}")
-
-        try:
-            if source_type == "json":
-                df = fetch_official_json_dataframe(url)
-            elif source_type == "csv":
-                df = fetch_official_csv_dataframe(url)
-            else:
-                raise ValueError(f"未知資料格式：{source_type}")
-
-            df.columns = (
-                df.columns.astype(str)
-                .str.replace("\ufeff", "", regex=False)
-                .str.strip()
-            )
-            df["市場"] = market
-            frames.append(df)
-            print(f"  ✅ 官方{market}權證每日成交資料：{len(df):,} 筆")
-        except Exception as e:
-            print(f"  ⚠️ 官方{market}權證每日成交資料取得失敗：{type(e).__name__}: {e}")
-
-    if not frames:
-        return pd.DataFrame()
-
-    all_df = pd.concat(frames, ignore_index=True, sort=False)
-
-    date_col = get_official_col(all_df, ["交易日期", "日期", "成交日期"])
-    code_col = get_official_col(all_df, ["權證代號", "證券代號", "商品代號", "代號"])
-    name_col = get_official_col(all_df, ["權證名稱", "證券名稱", "商品名稱", "名稱"])
-    amount_col = get_official_col(all_df, ["成交金額", "成交值", "成交金額(元)"])
-    volume_col = get_official_col(all_df, ["成交張數", "成交數量", "成交股數", "成交量"])
-
-    missing = []
-    if date_col is None:
-        missing.append("交易日期")
-    if code_col is None:
-        missing.append("權證代號")
-    if name_col is None:
-        missing.append("權證名稱")
-    if amount_col is None:
-        missing.append("成交金額")
-
-    if missing:
-        raise RuntimeError(
-            f"官方權證成交檔缺少必要欄位：{missing}\n"
-            f"目前欄位：{list(all_df.columns)}"
-        )
-
-    out = pd.DataFrame()
-    out["交易日期"] = all_df[date_col].map(normalize_official_date_str)
-    out["市場"] = all_df.get("市場", "")
-    out["權證代號"] = all_df[code_col].map(normalize_official_warrant_code)
-    out["權證名稱"] = all_df[name_col].astype(str).str.strip()
-    out["成交金額"] = all_df[amount_col]
-    out["成交金額_num"] = all_df[amount_col].map(clean_official_warrant_number)
-
-    if volume_col is not None:
-        out["成交張數"] = all_df[volume_col]
-        out["成交張數_num"] = all_df[volume_col].map(clean_official_warrant_number)
-    else:
-        out["成交張數"] = 0
-        out["成交張數_num"] = 0.0
-
-    out = out[
-        (out["權證代號"].astype(str).str.len() > 0)
-        & (out["權證名稱"].astype(str).str.len() > 0)
-        & (out["交易日期"].astype(str).str.len() > 0)
-    ].copy()
-
-    return out
-
-
-def build_today_official_call_warrant_dataframe():
-    """
-    建立「最新交易日有成交的認購權證」DataFrame。
-
-    注意：
-    - 這裡可以保證官方成交檔最新交易日有成交。
-    - 這裡不能保證一定有分點買超；買超要等 API5 分點資料抓回來後才知道。
-    """
-    global OFFICIAL_CALL_WARRANT_TOP20_CACHE, OFFICIAL_CALL_WARRANT_LATEST_TRADE_DATE
-
-    all_df = fetch_official_daily_warrant_trading()
-
-    if all_df.empty:
-        OFFICIAL_CALL_WARRANT_TOP20_CACHE = []
-        OFFICIAL_CALL_WARRANT_LATEST_TRADE_DATE = ""
-        return pd.DataFrame()
-
-    latest_trade_date = str(all_df["交易日期"].max()).strip()
-    OFFICIAL_CALL_WARRANT_LATEST_TRADE_DATE = latest_trade_date
-
-    today_df = all_df[all_df["交易日期"].astype(str).str.strip() == latest_trade_date].copy()
-
-    call_df = today_df[
-        today_df["權證名稱"].astype(str).str.contains("購", na=False)
-        & (today_df["成交金額_num"] > 0)
-        & (today_df["成交張數_num"] > 0)
-    ].copy()
-
-    call_df = call_df.drop_duplicates(subset=["權證代號"], keep="first")
-    call_df = call_df.sort_values("成交金額_num", ascending=False).reset_index(drop=True)
-
-    top20_df = call_df.head(20).copy()
-    top20_rows = []
-    for idx, row in enumerate(top20_df.itertuples(index=False), start=1):
-        row_dict = row._asdict()
-        top20_rows.append({
-            "排名": idx,
-            "交易日期": row_dict.get("交易日期", ""),
-            "市場": row_dict.get("市場", ""),
-            "權證代號": row_dict.get("權證代號", ""),
-            "權證名稱": row_dict.get("權證名稱", ""),
-            "成交金額": int(round(float(row_dict.get("成交金額_num", 0) or 0))),
-            "成交張數": int(round(float(row_dict.get("成交張數_num", 0) or 0))),
-        })
-
-    OFFICIAL_CALL_WARRANT_TOP20_CACHE = top20_rows
-
-    if OFFICIAL_WARRANT_MIN_TRADE_AMOUNT > 0:
-        call_df = call_df[call_df["成交金額_num"] >= OFFICIAL_WARRANT_MIN_TRADE_AMOUNT].copy()
-
-    if OFFICIAL_WARRANT_TOP_N is not None:
-        call_df = call_df.head(OFFICIAL_WARRANT_TOP_N).copy()
-
-    print(
-        f"  ✅ 官方成交檔最新交易日：{latest_trade_date}｜"
-        f"有成交認購權證：{len(call_df):,} 檔｜"
-        f"成交金額門檻：{OFFICIAL_WARRANT_MIN_TRADE_AMOUNT:,}｜"
-        f"TOP_N：{OFFICIAL_WARRANT_TOP_N if OFFICIAL_WARRANT_TOP_N is not None else '全部'}"
-    )
-
-    return call_df
-
-
-def official_call_df_to_warrants(call_df):
-    """
-    將官方成交檔 DataFrame 轉成原本程式使用的 warrants 結構：
-    {代號, 名稱, 標的股, 標的名稱}
-    """
-    if call_df is None or call_df.empty:
-        return []
-
-    print("  🔄 建立股票名稱對照表，用於解析權證標的股...")
-    stock_map = get_stock_map_from_isin_live()
-    underlying_resolver = build_underlying_resolver(stock_map) if stock_map else []
-
-    warrants = []
-    seen = set()
-
-    for row in call_df.itertuples(index=False):
-        row_dict = row._asdict()
-        code = normalize_official_warrant_code(row_dict.get("權證代號", ""))
-        name = str(row_dict.get("權證名稱", "")).strip()
-
-        if not code or not name:
-            continue
-
-        if code in seen:
-            continue
-
-        seen.add(code)
-        underlying, underlying_name = find_underlying_info(name, stock_map, underlying_resolver) if stock_map else ("", "")
-
-        warrants.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": underlying,
-            "標的名稱": underlying_name,
-        })
-
-    print(f"  ✅ 官方成交檔認購權證清單建立完成：{len(warrants):,} 支")
-    return warrants
-
-
-def get_all_call_warrants_live_from_isin():
-    print("【Step 1】取所有認購權證清單（ISIN 備援）...")
+def get_all_call_warrants_live():
+    print("【Step 1】取所有認購權證清單...")
     warrants = []
 
     # strMode=2：上市有價證券
@@ -3747,68 +3357,62 @@ def get_all_call_warrants_live_from_isin():
                     "標的名稱": underlying_name
                 })
 
-    print(f"  ✅ 共 {len(warrants)} 支認購權證 [ISIN 備援]")
+    print(f"  ✅ 共 {len(warrants)} 支認購權證")
     return warrants
 
 
-def get_all_call_warrants_live():
-    """
-    Step 1 主資料來源：官方上市 + 上櫃每日成交檔。
-
-    原本是用 ISIN 抓全市場所有認購權證；現在改為：
-    1. 抓官方每日成交檔
-    2. 取最新交易日
-    3. 篩出有成交的認購權證
-    4. 後續只針對這批權證抓分點
-    """
-    print("【Step 1】取官方最新交易日有成交的認購權證清單...")
-
-    if OFFICIAL_WARRANT_FILTER_ENABLE:
-        try:
-            call_df = build_today_official_call_warrant_dataframe()
-            warrants = official_call_df_to_warrants(call_df)
-
-            if warrants:
-                return warrants
-
-            print("  ⚠️ 官方成交檔未取得有效認購權證清單。")
-        except Exception as e:
-            print(f"  ⚠️ 官方成交檔認購權證清單建立失敗：{type(e).__name__}: {e}")
-
-        if OFFICIAL_WARRANT_FALLBACK_TO_ISIN:
-            print("  ⚠️ 改用 ISIN 全市場認購權證清單作為備援。")
-            return get_all_call_warrants_live_from_isin()
-
-        return []
-
-    print("  ⚠️ OFFICIAL_WARRANT_FILTER_ENABLE=0，改用 ISIN 全市場認購權證清單。")
-    return get_all_call_warrants_live_from_isin()
 
 
 def get_all_call_warrants():
-    """
-    取得本次要抓分點的認購權證清單。
-
-    新版邏輯：
-    - 每次優先抓官方上市 + 上櫃每日成交檔。
-    - 若官方成交檔成功，只回傳最新交易日有成交的認購權證，不再與舊快取全市場清單合併。
-    - 這樣可以避免舊快取把已經沒有成交的權證帶回來，造成後續 API5 浪費時間。
-    - 只有官方成交檔失敗且允許備援時，才讀舊快取或 ISIN。
-    """
-    live_warrants = get_all_call_warrants_live()
-
-    if live_warrants:
-        save_warrants_cache(live_warrants)
-        return live_warrants
-
     cached_warrants = load_warrants_cache()
 
-    if cached_warrants and OFFICIAL_WARRANT_FALLBACK_TO_ISIN:
-        print("【Step 1】官方成交檔失敗，讀取認購權證清單快取作為備援...")
-        print(f"  ✅ 已讀取權證清單快取：{len(cached_warrants):,} 支")
-        return cached_warrants
+    if cached_warrants:
+        print("【Step 1】讀取認購權證清單快取...")
+        print(f"  ✅ 已讀取權證清單快取：{len(cached_warrants)} 支")
 
-    return []
+        # 每日執行仍要即時更新權證清單，避免新上市 / 新出現的權證不在 warrants_cache.csv，
+        # 導致後續全市場最近資料預掃描也完全掃不到該權證。
+        print("  🔄 即時更新今日認購權證清單，並與快取合併...")
+        live_warrants = get_all_call_warrants_live()
+
+        if not live_warrants:
+            print("  ⚠️ 即時權證清單取得失敗，改用既有權證清單快取。")
+            return cached_warrants
+
+        merged = {}
+        for w in cached_warrants:
+            code = str(w.get("代號", "")).strip()
+            if code:
+                merged[code] = w
+
+        old_count = len(merged)
+        new_count = 0
+
+        for w in live_warrants:
+            code = str(w.get("代號", "")).strip()
+            if not code:
+                continue
+
+            if code not in merged:
+                new_count += 1
+
+            # 以即時清單為準更新名稱、標的股與標的名稱，
+            # 避免舊快取的標的資訊不完整或過期。
+            merged[code] = w
+
+        warrants = list(merged.values())
+        save_warrants_cache(warrants)
+
+        print(
+            f"  ✅ 權證清單更新完成：原快取 {old_count:,} 支，"
+            f"即時清單 {len(live_warrants):,} 支，新增 {new_count:,} 支，合併後 {len(warrants):,} 支"
+        )
+
+        return warrants
+
+    warrants = get_all_call_warrants_live()
+    save_warrants_cache(warrants)
+    return warrants
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -4009,7 +3613,6 @@ def prescan_all(warrants, broker_map):
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-    cached_candidates = filter_candidates_by_warrant_universe(cached_candidates, warrants)
 
     # RUN_MODE=1 的核心修正：
     # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
@@ -4022,11 +3625,9 @@ def prescan_all(warrants, broker_map):
 
         full_selected_candidates = build_selected_full_market_candidates(warrants, broker_map)
         full_selected_candidates = filter_candidates_by_broker_map(full_selected_candidates, broker_map)
-        full_selected_candidates = filter_candidates_by_warrant_universe(full_selected_candidates, warrants)
 
         merged_candidates = merge_candidates(cached_candidates, full_selected_candidates)
         merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        merged_candidates = filter_candidates_by_warrant_universe(merged_candidates, warrants)
 
         if SELECTED_REFRESH_ALL_WARRANTS:
             # 每次都更新所有精選分點 × 全市場權證，確保今日賣超完整。
@@ -4038,11 +3639,9 @@ def prescan_all(warrants, broker_map):
             print(f"  🔄 SELECTED_REFRESH_ALL_WARRANTS=0：僅補掃最近 {scan_days} 天 API4 候選，用於加速但完整性較低。")
             recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
             recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-            recent_candidates = filter_candidates_by_warrant_universe(recent_candidates, warrants)
             PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
             merged_candidates = merge_candidates(merged_candidates, recent_candidates)
             merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-            merged_candidates = filter_candidates_by_warrant_universe(merged_candidates, warrants)
 
         save_candidates_cache(merged_candidates)
 
@@ -4068,12 +3667,10 @@ def prescan_all(warrants, broker_map):
 
         recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
         recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-        recent_candidates = filter_candidates_by_warrant_universe(recent_candidates, warrants)
         PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
 
         merged_candidates = merge_candidates(cached_candidates, recent_candidates)
         merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        merged_candidates = filter_candidates_by_warrant_universe(merged_candidates, warrants)
         save_candidates_cache(merged_candidates)
 
         print(
@@ -4087,7 +3684,6 @@ def prescan_all(warrants, broker_map):
     initial_scan_days = 40
     candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
     candidates = filter_candidates_by_broker_map(candidates, broker_map)
-    candidates = filter_candidates_by_warrant_universe(candidates, warrants)
     PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
     save_candidates_cache(candidates)
     return candidates
@@ -7535,72 +7131,6 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     ws.freeze_panes = "A2"
 
-
-def write_daily_call_warrant_top20_sheet(wb):
-    """
-    新增「當日認購成交TOP20」工作表。
-
-    資料來源為 get_all_call_warrants_live() 抓到的官方上市 + 上櫃每日成交檔，
-    排序依據為最新交易日認購權證成交金額。
-    """
-    ws = wb.create_sheet("當日認購成交TOP20")
-
-    headers = [
-        "排名",
-        "交易日期",
-        "市場",
-        "權證代號",
-        "權證名稱",
-        "成交金額",
-        "成交張數",
-    ]
-
-    ws.append(headers)
-
-    rows = OFFICIAL_CALL_WARRANT_TOP20_CACHE or []
-
-    for row in rows:
-        ws.append([
-            row.get("排名", ""),
-            row.get("交易日期", ""),
-            row.get("市場", ""),
-            row.get("權證代號", ""),
-            row.get("權證名稱", ""),
-            row.get("成交金額", 0),
-            row.get("成交張數", 0),
-        ])
-
-    if not rows:
-        ws.append(["", OFFICIAL_CALL_WARRANT_LATEST_TRADE_DATE or "-", "", "", "目前未取得官方認購權證成交 TOP20 資料", "", ""])
-
-    col_widths = [8, 14, 10, 14, 28, 16, 14]
-    thin_gray = Side(style="thin", color="B7B7B7")
-    normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
-
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="000000")
-        cell.fill = YELLOW
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = normal_border
-
-    ws.row_dimensions[1].height = 24
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = Font(color="000000")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = normal_border
-            cell.fill = WHITE
-
-    for row_idx in range(2, ws.max_row + 1):
-        ws.cell(row_idx, 6).number_format = '#,##0'
-        ws.cell(row_idx, 7).number_format = '#,##0'
-
-    ws.freeze_panes = "A2"
-
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
     print("【Step 5】建立 Excel...")
 
@@ -7608,7 +7138,6 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     default_ws = wb.active
     wb.remove(default_ws)
 
-    write_daily_call_warrant_top20_sheet(wb)
     write_a_sheet(wb, a_events, item_map, price_cache)
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
@@ -7658,11 +7187,6 @@ def main():
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
-    print(
-        f"官方成交檔篩選：ENABLE={OFFICIAL_WARRANT_FILTER_ENABLE}，"
-        f"MIN_TRADE_AMOUNT={OFFICIAL_WARRANT_MIN_TRADE_AMOUNT:,}，"
-        f"TOP_N={OFFICIAL_WARRANT_TOP_N if OFFICIAL_WARRANT_TOP_N is not None else '全部'}"
-    )
     print("=" * 70)
 
     warrants = get_all_call_warrants()
