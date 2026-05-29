@@ -136,7 +136,7 @@ FULL_MARKET_UNDERLYING_TOP20_CACHE_PATH = os.path.join(CACHE_DIR, "full_market_u
 FULL_MARKET_TOP20_POSITIVE_ONLY = os.getenv("FULL_MARKET_TOP20_POSITIVE_ONLY", "1").strip().lower() not in ("0", "false", "no")
 API4_AMOUNT_MULTIPLIER = int(os.getenv("API4_AMOUNT_MULTIPLIER", "1000"))
 FULL_MARKET_TOP20_API5_WORKERS = int(os.getenv("FULL_MARKET_TOP20_API5_WORKERS", str(MAX_WORKERS)))
-FULL_MARKET_UNDERLYING_TOP20_CACHE_VERSION = "api5_amount_v1"
+FULL_MARKET_UNDERLYING_TOP20_CACHE_VERSION = "api5_amount_v2_underlying_broker"
 
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
@@ -3208,12 +3208,14 @@ def normalize_stock_name_text(s):
 
 def make_stock_aliases(stock_name, exact_stock_names=None):
     """
-    建立股票名稱候選別名，但避免把某一檔股票的簡稱撞到另一檔真實股票名稱。
+    建立股票 / ETF 名稱候選別名，但避免把某一檔商品的簡稱撞到另一檔真實股票名稱。
 
     修正重點：
     1. 8028 昇陽半導體可產生「昇陽半」，讓「昇陽半XXX購」正確對到 8028。
     2. 8028 昇陽半導體不可產生「昇陽」，因為「昇陽」本身是 3266。
-    3. 後續比對會用最長前綴優先，因此「昇陽半」會優先於「昇陽」。
+    3. ETF 名稱常見為「元大台灣50」，但權證名稱會寫成「台灣50元大...購」，
+       因此要額外建立「台灣50」這類去掉發行商前綴的 alias。
+    4. 不再產生「台灣」這種過短且高度模糊的 alias，避免「台灣50」被誤判成 3045 台灣大。
     """
     name = normalize_stock_name_text(stock_name)
     aliases = set()
@@ -3223,7 +3225,42 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
 
     exact_stock_names = exact_stock_names or set()
 
+    # 這些字詞太短或太通用，不能當作權證名稱前綴判斷，否則容易把 ETF / 指數權證誤判成個股。
+    ambiguous_aliases = {
+        "台灣", "臺灣", "台股", "臺股", "元大", "富邦", "國泰", "群益",
+        "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光",
+        "第一", "第一金", "日盛", "華南", "華南永昌",
+    }
+
+    issuer_prefixes = [
+        "元大", "富邦", "國泰", "群益", "凱基", "中信", "永豐", "兆豐",
+        "統一", "台新", "復華", "新光", "第一金", "日盛", "華南永昌",
+    ]
+
     aliases.add(name)
+
+    def add_safe_alias(candidate):
+        candidate = normalize_stock_name_text(candidate)
+
+        if not candidate or len(candidate) < 2:
+            return
+
+        if candidate in ambiguous_aliases:
+            return
+
+        # 如果切出來的簡稱剛好是另一檔股票 / ETF 的完整名稱，就不要加入。
+        if candidate in exact_stock_names and candidate != name:
+            return
+
+        aliases.add(candidate)
+
+    # ETF / 指數商品別名：元大台灣50 -> 台灣50，元大高股息 -> 高股息。
+    # 僅在剩餘名稱含數字或長度 >= 3 時加入，避免產生太泛用的發行商縮寫。
+    for issuer in issuer_prefixes:
+        if name.startswith(issuer) and len(name) > len(issuer) + 1:
+            candidate = name[len(issuer):]
+            if any(ch.isdigit() for ch in candidate) or len(candidate) >= 3:
+                add_safe_alias(candidate)
 
     suffixes = [
         "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
@@ -3241,23 +3278,15 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
             if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
                 candidate = stripped[:-len(suffix)]
                 stripped = candidate
-
-                # 如果切出來的簡稱剛好是另一檔股票的完整名稱，就不要加入。
-                # 例如「昇陽半導體」切成「昇陽」，但「昇陽」本身是 3266。
-                if candidate not in exact_stock_names or candidate == name:
-                    aliases.add(candidate)
-
+                add_safe_alias(candidate)
                 changed = True
                 break
 
-    for n in range(min(4, len(name)), 1, -1):
+    # 僅產生 3~4 字前綴，不再產生 2 字前綴，避免「台灣50」被「台灣」吃掉。
+    # 兩字股票名稱本身仍會因 aliases.add(name) 被保留，例如南亞、鴻海。
+    for n in range(min(4, len(name)), 2, -1):
         candidate = name[:n]
-
-        # 前綴簡稱若撞到另一檔真實股票名稱，也不要加入。
-        if candidate in exact_stock_names and candidate != name:
-            continue
-
-        aliases.add(candidate)
+        add_safe_alias(candidate)
 
     return {a for a in aliases if len(a) >= 2}
 
@@ -3675,13 +3704,14 @@ def save_full_market_underlying_top20_cache(rows, target_date):
             "累積買超股數": row.get("累積買超股數", 0),
             "買超張數": row.get("買超張數", 0),
             "涵蓋權證數": row.get("涵蓋權證數", 0),
+            "買超前三分點": row.get("買超前三分點", ""),
             "權證買超明細": row.get("權證買超明細", ""),
         }
         out_rows.append(out)
 
     df = pd.DataFrame(out_rows, columns=[
         "執行日期", "資料來源版本", "日期", "排名", "標的股", "標的名稱",
-        "累積買超金額", "累積買超股數", "買超張數", "涵蓋權證數", "權證買超明細"
+        "累積買超金額", "累積買超股數", "買超張數", "涵蓋權證數", "買超前三分點", "權證買超明細"
     ])
 
     write_cache_csv(df, FULL_MARKET_UNDERLYING_TOP20_CACHE_PATH)
@@ -3781,6 +3811,7 @@ def build_full_market_underlying_top20_from_api5_pairs(api5_pairs, target_date):
                 "標的股": str(rec.get("標的股", "")).strip(),
                 "標的名稱": str(rec.get("標的名稱", "")).strip(),
                 "券商代號": broker_code,
+                "券商名稱": str(rec.get("券商名稱", "")).strip(),
             }
 
     unique_records = list(unique_pairs.values())
@@ -3857,6 +3888,7 @@ def build_full_market_underlying_top20_from_api5_pairs(api5_pairs, target_date):
                                 "累積買超股數": 0,
                                 "權證代號集合": set(),
                                 "權證買超": {},
+                                "分點買超": {},
                             }
 
                         row = ranking_map[key]
@@ -3867,6 +3899,12 @@ def build_full_market_underlying_top20_from_api5_pairs(api5_pairs, target_date):
                             row["權證代號集合"].add(warrant_code)
                             wkey = f"{warrant_code} {warrant_name}".strip()
                             row["權證買超"][wkey] = row["權證買超"].get(wkey, 0) + int(amount_to_add)
+
+                        broker_name = str(rec.get("券商名稱", "")).strip()
+                        broker_code = str(rec.get("券商代號", "")).strip()
+                        bkey = f"{broker_name}({broker_code})" if broker_name and broker_code else (broker_name or broker_code)
+                        if bkey:
+                            row["分點買超"][bkey] = row["分點買超"].get(bkey, 0) + int(amount_to_add)
 
             if done % 1000 == 0 or done == total:
                 print(f"  [{done:,}/{total:,}] API5 全市場買超重算中，成功 {success:,} 組...")
@@ -3882,6 +3920,12 @@ def build_full_market_underlying_top20_from_api5_pairs(api5_pairs, target_date):
             if amount > 0
         )
 
+        top_broker_text = "；".join(
+            f"{name}:{fmt_amount(amount)}"
+            for name, amount in sorted(rec.get("分點買超", {}).items(), key=lambda x: x[1], reverse=True)[:3]
+            if amount > 0
+        )
+
         rows.append({
             "日期": rec["日期"],
             "標的股": rec["標的股"],
@@ -3890,6 +3934,7 @@ def build_full_market_underlying_top20_from_api5_pairs(api5_pairs, target_date):
             "累積買超股數": rec["累積買超股數"],
             "買超張數": rec["累積買超股數"] // 1000,
             "涵蓋權證數": len(rec["權證代號集合"]),
+            "買超前三分點": top_broker_text,
             "權證買超明細": warrant_text,
         })
 
@@ -4027,6 +4072,81 @@ def api4_row_has_trade(row):
     return numeric_hit or bool(row)
 
 
+
+def rebuild_full_market_top20_from_active_warrants(active_warrants, target_date):
+    """
+    當「今日有成交權證」已使用快取，但 TOP20 快取因版本更新或缺欄位而不存在時，
+    用快取中的今日有成交權證重新掃當日 API4 分點清單，再由 API5 重算 TOP20。
+
+    這可以避免改版後只讀到 active_warrants_today_cache，卻因舊 TOP20 快取被淘汰而無法產生榜單。
+    """
+    target_date = normalize_date_str(target_date)
+
+    if not active_warrants or not parse_date(target_date):
+        return []
+
+    api4_pairs = []
+    done = 0
+
+    def scan_one(w):
+        code = normalize_warrant_code_for_filter(w.get("代號", ""))
+        rows_out = []
+
+        if not code:
+            return rows_out
+
+        try:
+            rows = api4_get(code, target_date, target_date)
+        except Exception:
+            rows = []
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            if normalize_date_str(get_api4_row_date(row)) != target_date:
+                continue
+
+            if not api4_row_has_trade(row):
+                continue
+
+            broker_code = str(row.get("V2", "")).strip()
+            if not broker_code:
+                continue
+
+            rows_out.append({
+                "日期": target_date,
+                "權證代號": code,
+                "權證名稱": str(w.get("名稱", "")).strip(),
+                "標的股": str(w.get("標的股", "")).strip(),
+                "標的名稱": str(w.get("標的名稱", "")).strip(),
+                "券商代號": broker_code,
+                "券商名稱": str(row.get("V3", "")).strip(),
+            })
+
+        return rows_out
+
+    print(
+        f"  🔄 重新建立全市場標的買超 TOP20："
+        f"使用今日有成交權證快取 {len(active_warrants):,} 支，日期 {target_date}"
+    )
+
+    with ThreadPoolExecutor(max_workers=ACTIVE_WARRANT_WORKERS) as ex:
+        futures = {ex.submit(scan_one, w): w for w in active_warrants}
+
+        for future in as_completed(futures):
+            done += 1
+            try:
+                api4_pairs.extend(future.result())
+            except Exception:
+                pass
+
+            if done % 1000 == 0:
+                print(f"  [{done:,}/{len(active_warrants):,}] 重建 TOP20 API4 分點清單中，累計 {len(api4_pairs):,} 筆...")
+
+    return build_full_market_underlying_top20_from_api5_pairs(api4_pairs, target_date)
+
+
 def filter_warrants_by_today_volume(warrants):
     """
     今日成交量前置過濾 + 全市場標的權證買超 TOP20 建立。
@@ -4062,10 +4182,18 @@ def filter_warrants_by_today_volume(warrants):
             FULL_MARKET_UNDERLYING_TOP20_DATE = cached_top20_date
             FULL_MARKET_UNDERLYING_TOP20_SOURCE = "cache"
         else:
-            FULL_MARKET_UNDERLYING_TOP20_ROWS = []
-            FULL_MARKET_UNDERLYING_TOP20_DATE = cached_latest_date
-            FULL_MARKET_UNDERLYING_TOP20_SOURCE = "cache_missing_top20"
-            print("  ⚠️ 今日有成交權證使用快取，但全市場標的買超 TOP20 快取不存在；若要重建榜單請設定 ACTIVE_WARRANT_FORCE_REFRESH=1。")
+            rebuilt_top20_rows = rebuild_full_market_top20_from_active_warrants(cached_active_warrants, cached_latest_date)
+
+            if rebuilt_top20_rows:
+                FULL_MARKET_UNDERLYING_TOP20_ROWS = rebuilt_top20_rows
+                FULL_MARKET_UNDERLYING_TOP20_DATE = cached_latest_date
+                FULL_MARKET_UNDERLYING_TOP20_SOURCE = "cache_active_rebuilt_api5"
+                save_full_market_underlying_top20_cache(rebuilt_top20_rows, cached_latest_date)
+            else:
+                FULL_MARKET_UNDERLYING_TOP20_ROWS = []
+                FULL_MARKET_UNDERLYING_TOP20_DATE = cached_latest_date
+                FULL_MARKET_UNDERLYING_TOP20_SOURCE = "cache_missing_top20"
+                print("  ⚠️ 今日有成交權證使用快取，但全市場標的買超 TOP20 快取不存在且重建失敗；可設定 ACTIVE_WARRANT_FORCE_REFRESH=1 全量重建。")
 
         print(
             f"  ✅ 今日成交量過濾完成 [快取]：全部 {len(warrants):,} 支 "
@@ -4125,6 +4253,7 @@ def filter_warrants_by_today_volume(warrants):
                     "標的股": str(w.get("標的股", "")).strip(),
                     "標的名稱": str(w.get("標的名稱", "")).strip(),
                     "券商代號": broker_code,
+                    "券商名稱": str(row.get("V3", "")).strip(),
                 })
 
         return code, hits, ranking_rows
@@ -8003,6 +8132,7 @@ def write_today_underlying_net_buy_top20_sheet(wb, items):
         "累積買超股數",
         "買超張數",
         "涵蓋權證數",
+        "買超前三分點",
         "權證買超明細",
     ]
 
@@ -8018,14 +8148,15 @@ def write_today_underlying_net_buy_top20_sheet(wb, items):
             fmt_amount(row.get("累積買超股數")),
             fmt_amount(row.get("買超張數")),
             fmt_amount(row.get("涵蓋權證數")),
+            row.get("買超前三分點", ""),
             row.get("權證買超明細", ""),
         ])
 
     if not rows:
         ws.append(["", target_date or "-", "無全市場今日標的買超資料；請設定 ACTIVE_WARRANT_FORCE_REFRESH=1 重新建立榜單"])
-        ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=9)
+        ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=10)
 
-    col_widths = [8, 12, 10, 14, 16, 16, 12, 12, 90]
+    col_widths = [8, 12, 10, 14, 16, 16, 12, 12, 46, 90]
     style_sheet(ws, col_widths, header_row=1)
 
     for row_idx in range(2, ws.max_row + 1):
