@@ -304,6 +304,128 @@ def build_gspread_client() -> gspread.Client:
     )
 
 
+def _normalize_col_name(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _known_header_names() -> set:
+    names = set()
+    for alias_list in COLUMN_ALIASES.values():
+        for name in alias_list:
+            names.add(_normalize_col_name(name))
+    return names
+
+
+def _make_unique_headers(raw_headers: Sequence[Any]) -> List[str]:
+    """
+    gspread.get_all_records() 遇到空白欄名或重複欄名會直接報錯，
+    這裡改成自己清洗欄位名稱：
+    - 空白欄位命名為 __blank_col_N
+    - 重複欄位加上 __2、__3 後綴
+    """
+    headers: List[str] = []
+    seen: Dict[str, int] = {}
+
+    for idx, header in enumerate(raw_headers, start=1):
+        name = str(header or "").strip()
+        if not name:
+            name = f"__blank_col_{idx}"
+
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}__{seen[name]}"
+        else:
+            seen[name] = 1
+
+        headers.append(name)
+
+    return headers
+
+
+def _detect_header_row(values: List[List[str]], force_first_non_empty: bool = False) -> Optional[int]:
+    """
+    自動找出真正的標題列。
+    你的 Google Sheet 可能前幾列是標題、說明、空白列或合併儲存格，
+    所以不能直接假設第 1 列就是欄位名稱。
+    """
+    known_names = _known_header_names()
+    best_idx: Optional[int] = None
+    best_score = -1
+    best_hits = 0
+
+    for idx, row in enumerate(values[:30]):
+        cells = [str(c or "").strip() for c in row]
+        non_empty_count = sum(1 for c in cells if c)
+        if non_empty_count == 0:
+            continue
+
+        alias_hits = sum(1 for c in cells if _normalize_col_name(c) in known_names)
+        score = alias_hits * 100 + min(non_empty_count, 30)
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+            best_hits = alias_hits
+
+    if best_idx is not None and best_hits > 0:
+        return best_idx
+
+    if force_first_non_empty:
+        for idx, row in enumerate(values[:30]):
+            non_empty_count = sum(1 for c in row if str(c or "").strip())
+            if non_empty_count >= 2:
+                return idx
+
+    return None
+
+
+def _worksheet_to_dataframe(ws: gspread.Worksheet, force_first_non_empty_header: bool = False) -> Optional[pd.DataFrame]:
+    """
+    用 get_all_values() 取代 get_all_records()，避免：
+    gspread.exceptions.GSpreadException: the header row contains duplicates: ['']
+    """
+    values = ws.get_all_values()
+    if not values:
+        print(f"  - 略過工作表「{ws.title}」：空白工作表")
+        return None
+
+    header_idx = _detect_header_row(values, force_first_non_empty=force_first_non_empty_header)
+    if header_idx is None:
+        print(f"  - 略過工作表「{ws.title}」：找不到可辨識的標題列")
+        return None
+
+    raw_headers = values[header_idx]
+    max_cols = max(len(raw_headers), *(len(r) for r in values[header_idx + 1:])) if len(values) > header_idx + 1 else len(raw_headers)
+
+    raw_headers = list(raw_headers) + [""] * (max_cols - len(raw_headers))
+    headers = _make_unique_headers(raw_headers[:max_cols])
+
+    rows: List[List[str]] = []
+    for row in values[header_idx + 1:]:
+        padded = list(row) + [""] * (max_cols - len(row))
+        padded = padded[:max_cols]
+        if any(str(cell or "").strip() for cell in padded):
+            rows.append(padded)
+
+    if not rows:
+        print(f"  - 略過工作表「{ws.title}」：標題列下方沒有資料")
+        return None
+
+    df = pd.DataFrame(rows, columns=headers)
+
+    # 移除整欄皆空的空白欄位，避免合併儲存格或多餘欄位污染資料
+    blank_cols = [
+        c for c in df.columns
+        if str(c).startswith("__blank_col_") and df[c].astype(str).str.strip().eq("").all()
+    ]
+    if blank_cols:
+        df = df.drop(columns=blank_cols)
+
+    df["__worksheet__"] = ws.title
+    print(f"  - 已讀取工作表「{ws.title}」：{len(df)} 筆，標題列第 {header_idx + 1} 列")
+    return df
+
+
 def load_warrant_sheet(sheet_name: str, worksheet_name: Optional[str] = None) -> pd.DataFrame:
     client = build_gspread_client()
     spreadsheet = client.open(sheet_name)
@@ -315,17 +437,20 @@ def load_warrant_sheet(sheet_name: str, worksheet_name: Optional[str] = None) ->
         worksheets = spreadsheet.worksheets()
 
     for ws in worksheets:
-        records = ws.get_all_records()
-        if not records:
-            continue
-        df = pd.DataFrame(records)
-        df["__worksheet__"] = ws.title
-        frames.append(df)
+        df = _worksheet_to_dataframe(
+            ws,
+            force_first_non_empty_header=bool(worksheet_name),
+        )
+        if df is not None and not df.empty:
+            frames.append(df)
 
     if not frames:
-        raise RuntimeError(f"Google Sheet：{sheet_name} 沒有讀到任何資料。")
+        raise RuntimeError(
+            f"Google Sheet：{sheet_name} 沒有讀到任何資料。"
+            "請確認工作表有標題列，或在 workflow 的 worksheet 輸入正確工作表名稱。"
+        )
 
-    result = pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True, sort=False)
     result.columns = [str(c).strip() for c in result.columns]
     return result
 
