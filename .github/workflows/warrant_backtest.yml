@@ -49,6 +49,15 @@ on:
           - "開"
           - "關"
 
+      report_scope:
+        description: "報表資料範圍"
+        required: true
+        default: "本次候選資料"
+        type: choice
+        options:
+          - "本次候選資料"
+          - "完整歷史資料"
+
   schedule:
     # Asia/Taipei 17:10 = UTC 09:10
     - cron: "10 9 * * 1-5"
@@ -79,13 +88,17 @@ jobs:
       #   只抓今日有成交權證 → API4 預篩 → API5 補資料 → append 到快取_分點歷史
       #   不重算完整報表、不抓價格、不產完整 Excel 結果表
       # 完整報表重算：
-      #   用快取_分點歷史重算 A/B/C/D、勝率、Excel、Google Sheet 結果表
+      #   會重算 A/B/C/D、勝率、Excel、Google Sheet 結果表
       DATA_UPDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '完整報表重算' && '0' || '1' }}
 
-      # 是否使用完整歷史重算報表
-      # 每日快速更新預設 0
-      # 完整報表重算預設 1
-      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '完整報表重算' && '1' || '0' }}
+      # 報表資料範圍
+      # 本次候選資料：
+      #   用這次 OpenAPI + API4 預篩命中的候選組合產生報表
+      #   適合每日精選5分點產圖，速度較快，也避免完整歷史互斥規則影響今日明細
+      # 完整歷史資料：
+      #   用整份快取_分點歷史重算 A/B/C/D 與勝率
+      #   適合週末或手動重算長期勝率，但速度較慢
+      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.report_scope == '完整歷史資料' && '1' || '0' }}
 
       # OpenAPI 今日有成交權證預篩天數
       # 每日更新建議 1，避免掃太久
