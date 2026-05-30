@@ -25,7 +25,7 @@ jobs:
       # 分點模式
       # RUN_MODE=1：精選分點
       # RUN_MODE=2：完整 TARGET_PATTERNS 分點清單
-      RUN_MODE: "2"
+      RUN_MODE: "1"
 
       # OpenAPI 今日有成交權證 + API4 預篩天數
       OPENAPI_ACTIVE_PRESCAN_DAYS: "3"
