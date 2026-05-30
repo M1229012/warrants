@@ -17,17 +17,34 @@ jobs:
     env:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
+
+      # 快取設定
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
+
+      # 分點模式
+      # RUN_MODE=1：精選分點
+      # RUN_MODE=2：完整 TARGET_PATTERNS 分點清單
       RUN_MODE: "2"
+
+      # OpenAPI 今日有成交權證 + API4 預篩天數
       OPENAPI_ACTIVE_PRESCAN_DAYS: "3"
 
+      # 關閉精選分點 × 全部權證的暴力候選池
+      # 即使 RUN_MODE=2 目前不主要用到，也保留，避免之後切回 RUN_MODE=1 又爆量
       SELECTED_FORCE_ALL_WARRANTS: "0"
       SELECTED_REFRESH_ALL_WARRANTS: "0"
 
+      # 歷史資料設定
+      # 第一次新候選抓較長歷史，之後每日只補最近資料
       INITIAL_HISTORY_DAYS: "750"
       DAILY_UPDATE_DAYS: "5"
 
+      # 歷史快取改為 append / merge，不覆蓋舊資料
+      HISTORY_CACHE_APPEND_ONLY: "1"
+      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+
+      # Google Sheet 設定
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
       GSHEET_NAME: "權證分點籌碼"
@@ -37,14 +54,19 @@ jobs:
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
+      # 其他流程設定
       FAST_SKIP_RECENT_PRESCAN: "0"
       CACHE_RECENT_SCAN_DAYS: "3"
       FETCH_GROUP_WARRANT_PRICES: "0"
+
+      # 測試每日最新資料速度時可設 1
+      # 平常若想吃同日快取可改 0
       ACTIVE_WARRANT_FORCE_REFRESH: "1"
-      
+
+      # 執行緒設定
       MAX_WORKERS: "50"
       PRICE_WORKERS: "60"
-      PRESCAN_WORKERS: "60"
+      PRESCAN_WORKERS: "40"
       FIND_BROKER_WORKERS: "40"
 
     steps:
