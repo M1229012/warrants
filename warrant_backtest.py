@@ -8424,7 +8424,7 @@ def write_daily_underlying_top20_sheet(wb, rows=None, mode="positive", target_da
         row[15].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         row[16].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, today_d_events, today_item_map, price_cache, output_path):
+def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, today_d_events, today_item_map, price_cache, output_path, today_items=None):
     """
     精選 5 分點當日買賣超產圖模式專用 Excel。
 
@@ -8447,6 +8447,12 @@ def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, tod
     write_group_sheet(wb, "今日_B_同標的單日合計", today_b_events, price_cache, is_c=False)
     write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
+
+    # 每日產圖模式也要同步更新「每日賣出明細」，
+    # 否則產圖程式會讀到舊的賣出明細，導致圖片賣方資訊錯誤。
+    daily_sell_items = today_items or list(today_item_map.values())
+    write_daily_sell_detail_sheet(wb, daily_sell_items, today_a_events, today_b_events, today_c_events, today_d_events)
+
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
 
@@ -8785,13 +8791,23 @@ def build_daily_signal_items_from_history_cache(history_df, broker_map, target_d
         print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
         return []
 
-    # 每日產圖只需要 target_date 以前的原始資料；保留完整歷史，讓 C/D 可正確用舊資料累積。
-    # 不要用本次 candidate_keys 限制，也不要只保留 OpenAPI 今日有成交權證。
-    df = df[df["日期"].map(normalize_date_str) <= target_date].copy()
+    # 每日產圖只需要「目標交易日往前 D_WINDOW_DAYS 個交易日」的原始資料。
+    # 這仍然是用更新後的快取_分點歷史來算，不再被本次 candidate_keys 限制；
+    # 但不用把 18～20 萬筆完整歷史全部還原成 items，避免每日產圖模式拖到十幾分鐘。
+    # A / B 只看 target_date，C 看結束日為 target_date 的 3 日，D 看結束日為 target_date 的近 10 日，
+    # 因此最後 D_WINDOW_DAYS 個交易日已足夠判斷今日圖片資料。
+    signal_dates = get_last_trade_dates_from_history_df(df, target_date, D_WINDOW_DAYS)
+
+    if target_date not in signal_dates:
+        signal_dates = sorted(set(signal_dates + [target_date]))
+
+    df = df[df["日期"].map(normalize_date_str).isin(signal_dates)].copy()
 
     if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史內沒有 {target_date} 以前的追蹤分點資料。")
+        print(f"{prefix}⚠️ 快取_分點歷史內沒有 {target_date} 及其近 {D_WINDOW_DAYS} 個交易日的追蹤分點資料。")
         return []
+
+    print(f"{prefix}✅ 每日產圖計算視窗：{', '.join(signal_dates)}")
 
     # 保留有買賣紀錄的資料列，避免大量全 0 資料拖慢後續 groupby。
     for col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "買超金額", "買超股數"]:
@@ -8816,13 +8832,13 @@ def build_daily_signal_items_from_history_cache(history_df, broker_map, target_d
     last_date = df["日期"].map(normalize_date_str).max() if "日期" in df.columns else ""
 
     print(
-        f"{prefix}✅ 每日產圖資料來源：使用更新後 快取_分點歷史 的追蹤分點完整原始資料，"
+        f"{prefix}✅ 每日產圖資料來源：使用更新後 快取_分點歷史 的追蹤分點近 {D_WINDOW_DAYS} 個交易日原始資料，"
         f"日期範圍 {first_date} ~ {last_date}，資料 {len(df):,} 筆，還原 {len(items):,} 組 權證×分點"
     )
     print(f"{prefix}✅ 今日 A/B/C/D 目標日期：{target_date}；後續只輸出事件日 / 結束日為此日期的今日訊號。")
     return items
 
-def build_today_image_abcd_events_from_items(items, context_label="今日候選"):
+def build_today_image_abcd_events_from_items(items, context_label="今日候選", target_date=None):
     """
     今日圖片 / 今日_* 工作表專用 A/B/C/D 建立函式。
 
@@ -8844,7 +8860,10 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     for item in items or []:
         item_map[(item["broker_code"], item["warrant_code"])] = item
 
-    target_date = latest_trade_date_from_items(items)
+    # 重要修正：今日圖片的目標日期必須以 OpenAPI 最新交易日為準。
+    # 不能再從 items 自己推最新日期，否則當 API5 或快取資料不完整時，
+    # 今日_* 可能會被錯誤地用舊日期計算，造成 B/C/D 少資料。
+    target_date = normalize_date_str(target_date) if target_date else latest_trade_date_from_items(items)
 
     if not target_date:
         print(f"{prefix}⚠️ 無法判斷今日候選最新交易日，今日_* 工作表將為空。")
@@ -9073,7 +9092,8 @@ def main():
 
         today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
             today_items,
-            context_label="每日產圖"
+            context_label="每日產圖",
+            target_date=target_date_for_today
         )
 
         if not today_a_events and not today_b_events and not today_c_events and not today_d_events:
@@ -9099,6 +9119,7 @@ def main():
             today_item_map,
             price_cache,
             output_path,
+            today_items=today_items,
         )
         upload_excel_to_google_sheet(output_path)
 
@@ -9119,9 +9140,9 @@ def main():
 
     candidate_today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
     target_date_for_today = (
-        latest_trade_date_from_items(candidate_today_items)
+        latest_trade_date_from_warrants(warrants)
         or latest_trade_date_from_items(fetched_items)
-        or latest_trade_date_from_warrants(warrants)
+        or latest_trade_date_from_items(candidate_today_items)
     )
     today_items = build_daily_signal_items_from_history_cache(
         history_cache_df,
@@ -9170,7 +9191,8 @@ def main():
     if TODAY_IMAGE_USE_CURRENT_CANDIDATES and today_items:
         today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
             today_items,
-            context_label="今日候選"
+            context_label="今日候選",
+            target_date=target_date_for_today
         )
         print("  ✅ 已建立 今日_* 工作表資料來源；主結果表仍保留完整歷史。")
 
