@@ -120,7 +120,7 @@ ACTIVE_WARRANT_FORCE_REFRESH = os.getenv("ACTIVE_WARRANT_FORCE_REFRESH", "0").st
 # 全市場每日標的 TOP20：
 # 這組榜單不受 RUN_MODE / TARGET_PATTERNS / 精選 5 分點限制。
 # 流程是：OpenAPI 今日有成交認購權證 → API4 找該權證當日所有分點 → API5 回查當日買賣超 → 依標的彙總。
-FULL_MARKET_TOP20_ENABLE = os.getenv("FULL_MARKET_TOP20_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+FULL_MARKET_TOP20_ENABLE = os.getenv("FULL_MARKET_TOP20_ENABLE", "0").strip().lower() not in ("0", "false", "no")
 FULL_MARKET_TOP20_API4_WORKERS = int(os.getenv("FULL_MARKET_TOP20_API4_WORKERS", str(PRESCAN_WORKERS)))
 FULL_MARKET_TOP20_API5_WORKERS = int(os.getenv("FULL_MARKET_TOP20_API5_WORKERS", str(MAX_WORKERS)))
 FULL_MARKET_TOP20_DAYS = int(os.getenv("FULL_MARKET_TOP20_DAYS", str(max(DAILY_UPDATE_DAYS, 5))))
@@ -8008,8 +8008,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", d_events, price_cache, is_c=True)
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
-    write_daily_underlying_top20_sheet(wb, full_market_top20_net_rows, mode="net", target_date=full_market_top20_trade_date)
-    write_daily_underlying_top20_sheet(wb, full_market_top20_positive_rows, mode="positive", target_date=full_market_top20_trade_date)
+    # 全市場每日標的 TOP20 已停用：避免為了找全市場 TOP3 分點而大量呼叫 API4 / API5。
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
@@ -8208,7 +8207,10 @@ def main():
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
 
-    full_market_top20_net_rows, full_market_top20_positive_rows, full_market_top20_trade_date = build_full_market_daily_underlying_top20_rows(warrants)
+    # 全市場每日標的 TOP20 已停用。
+    # 原本這裡會對今日有成交認購權證抓全市場所有分點，再用 API5 回查買賣超，執行時間過長。
+    # 目前保留 A/B/C/D 與精選 / 完整分點追蹤流程，不再建立每日標的淨買超TOP20 / 每日標的買超TOP20。
+    full_market_top20_net_rows, full_market_top20_positive_rows, full_market_top20_trade_date = [], [], ""
 
     price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
 
