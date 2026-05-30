@@ -2913,18 +2913,278 @@ def candidate_key_from_values(warrant_code, broker_code):
     return (str(warrant_code).strip(), str(broker_code).strip())
 
 
+
+_UNDERLYING_LOOKUP_CACHE = None
+
+
+def _first_non_empty(*values):
+    for value in values:
+        s = str(value or "").strip()
+        if s and s.lower() not in ("nan", "none", "null"):
+            return s
+    return ""
+
+
+def _read_raw_cache_frame_for_lookup(path):
+    """
+    只給標的股對照表使用的安全讀取函式。
+
+    注意：
+    這裡不能呼叫 read_cache_csv()，避免又觸發標準快取流程造成遞迴或額外寫回。
+    順序：本機 CSV → Google Sheet 快取。
+    """
+    frames = []
+
+    try:
+        if os.path.exists(path):
+            df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+            if df is not None and not df.empty:
+                frames.append(df)
+    except Exception:
+        pass
+
+    try:
+        df_gs = read_cache_from_gsheet(path)
+        if df_gs is not None and not df_gs.empty:
+            frames.append(df_gs.fillna(""))
+    except Exception:
+        pass
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True).fillna("")
+
+
+def build_underlying_lookup_from_existing_sources():
+    """
+    建立更穩定的「權證 → 標的股」對照表。
+
+    這是修正每日產圖少資料的關鍵：
+    官方 OpenAPI 只有權證代號 / 權證名稱 / 成交量，沒有標的股代號。
+    若快取_權證清單曾被 OpenAPI 有成交清單覆蓋成空白標的股，B/C/D 會因為沒有標的股而直接略過。
+
+    新版會同時從以下來源回補：
+    1. 快取_權證清單 / warrants_cache.csv
+    2. 快取_分點歷史 / broker_warrant_history_cache.csv
+    3. 快取_候選組合_OpenAPI精選5 / 其他候選快取
+
+    原則：只要任何來源有非空標的股，就保留下來；新的空白資料不能蓋掉舊的正確標的股。
+    """
+    code_map = {}
+    stock_map = {}
+
+    def add_mapping(warrant_code, warrant_name="", underlying_code="", underlying_name=""):
+        code = normalize_openapi_warrant_code(warrant_code)
+        if not code:
+            return
+
+        name = str(warrant_name or "").strip()
+        ucode = str(underlying_code or "").strip()
+        uname = str(underlying_name or "").strip()
+
+        rec = code_map.setdefault(code, {
+            "代號": code,
+            "名稱": "",
+            "標的股": "",
+            "標的名稱": "",
+        })
+
+        rec["名稱"] = _first_non_empty(rec.get("名稱", ""), name)
+        rec["標的股"] = _first_non_empty(rec.get("標的股", ""), ucode)
+        rec["標的名稱"] = _first_non_empty(rec.get("標的名稱", ""), uname)
+
+        if rec.get("標的股") and rec.get("標的名稱"):
+            stock_map[rec["標的名稱"]] = rec["標的股"]
+
+    # 1) 權證清單快取
+    df_warrants = _read_raw_cache_frame_for_lookup(WARRANTS_CACHE_PATH)
+    if df_warrants is not None and not df_warrants.empty:
+        for _, row in df_warrants.iterrows():
+            add_mapping(
+                row.get("代號", ""),
+                row.get("名稱", ""),
+                row.get("標的股", ""),
+                row.get("標的名稱", ""),
+            )
+
+    # 2) 分點歷史快取。這張通常最可靠，因為舊版完整資料曾經正確寫入標的股。
+    df_history = _read_raw_cache_frame_for_lookup(HISTORY_CACHE_PATH)
+    if df_history is not None and not df_history.empty:
+        for _, row in df_history.iterrows():
+            add_mapping(
+                row.get("權證代號", ""),
+                row.get("權證名稱", ""),
+                row.get("標的股", ""),
+                row.get("標的名稱", ""),
+            )
+
+    # 3) 候選組合快取。補強部分還沒進歷史，但候選快取有標的股的資料。
+    candidate_paths = [
+        CANDIDATES_CACHE_PATH,
+        CANDIDATES_CACHE_ALL_PATH,
+        CANDIDATES_CACHE_SELECTED5_PATH,
+        CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH,
+    ]
+    seen_paths = []
+    for cp in candidate_paths:
+        if cp and cp not in seen_paths:
+            seen_paths.append(cp)
+
+    for cp in seen_paths:
+        df_candidates = _read_raw_cache_frame_for_lookup(cp)
+        if df_candidates is None or df_candidates.empty:
+            continue
+        for _, row in df_candidates.iterrows():
+            add_mapping(
+                row.get("權證代號", ""),
+                row.get("權證名稱", ""),
+                row.get("標的股", ""),
+                row.get("標的名稱", ""),
+            )
+
+    return code_map, stock_map
+
+
+def get_underlying_lookup_cache(force_reload=False):
+    global _UNDERLYING_LOOKUP_CACHE
+
+    if _UNDERLYING_LOOKUP_CACHE is not None and not force_reload:
+        return _UNDERLYING_LOOKUP_CACHE
+
+    code_map, stock_map = build_underlying_lookup_from_existing_sources()
+    resolver = build_underlying_resolver(stock_map) if stock_map else []
+
+    _UNDERLYING_LOOKUP_CACHE = {
+        "code_map": code_map,
+        "stock_map": stock_map,
+        "resolver": resolver,
+    }
+
+    mapped_count = sum(1 for rec in code_map.values() if rec.get("標的股"))
+    print(f"  ♻️ 標的股對照表建立完成：權證 {len(code_map):,} 支，其中有標的股 {mapped_count:,} 支；標的名稱 {len(stock_map):,} 個")
+    return _UNDERLYING_LOOKUP_CACHE
+
+
+def backfill_underlying_for_warrant(warrant_code, warrant_name="", underlying_code="", underlying_name=""):
+    """
+    回補單一權證的標的股資料。
+
+    優先順序：
+    1. 呼叫端已經給的標的股
+    2. 權證代號對照表
+    3. 權證名稱最長前綴推回標的股
+    """
+    ucode = str(underlying_code or "").strip()
+    uname = str(underlying_name or "").strip()
+
+    if ucode:
+        return ucode, uname
+
+    lookup = get_underlying_lookup_cache()
+    code = normalize_openapi_warrant_code(warrant_code)
+    name = str(warrant_name or "").strip()
+
+    rec = lookup.get("code_map", {}).get(code, {})
+    ucode = _first_non_empty(rec.get("標的股", ""), ucode)
+    uname = _first_non_empty(rec.get("標的名稱", ""), uname)
+
+    if ucode:
+        return ucode, uname
+
+    stock_map = lookup.get("stock_map", {})
+    resolver = lookup.get("resolver", [])
+    if name and stock_map:
+        ucode2, uname2 = find_underlying_info(name, stock_map, resolver)
+        if ucode2:
+            return ucode2, uname2
+
+    return "", uname
+
+
+def fill_missing_underlying_fields(df):
+    """把同一檔權證在不同來源中的非空標的股補回空白列。"""
+    if df is None or df.empty or "權證代號" not in df.columns:
+        return df
+
+    df = df.copy().fillna("")
+    for col in ["權證名稱", "標的股", "標的名稱"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # 先依同一權證代號內的非空資料回補。
+    for code, idxs in df.groupby("權證代號").groups.items():
+        idxs = list(idxs)
+        for col in ["權證名稱", "標的股", "標的名稱"]:
+            non_empty = [str(v).strip() for v in df.loc[idxs, col].tolist() if str(v).strip()]
+            if non_empty:
+                df.loc[idxs, col] = df.loc[idxs, col].map(lambda v, _fill=non_empty[0]: str(v).strip() or _fill)
+
+    # 再用全域 lookup 回補仍然空白的標的股。
+    try:
+        for idx, row in df.iterrows():
+            if str(row.get("標的股", "")).strip():
+                continue
+            ucode, uname = backfill_underlying_for_warrant(
+                row.get("權證代號", ""),
+                row.get("權證名稱", ""),
+                row.get("標的股", ""),
+                row.get("標的名稱", ""),
+            )
+            if ucode:
+                df.at[idx, "標的股"] = ucode
+                if uname:
+                    df.at[idx, "標的名稱"] = uname
+    except Exception:
+        pass
+
+    return df
+
 def save_warrants_cache(warrants):
     if not USE_CACHE or not warrants:
         return
 
-    df = pd.DataFrame(warrants)
-
     wanted_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    for col in wanted_cols:
-        if col not in df.columns:
-            df[col] = ""
+    new_df = pd.DataFrame(warrants).fillna("")
 
-    write_cache_csv(df[wanted_cols], WARRANTS_CACHE_PATH)
+    for col in wanted_cols:
+        if col not in new_df.columns:
+            new_df[col] = ""
+
+    new_df = new_df[wanted_cols].copy()
+    new_df["代號"] = new_df["代號"].map(normalize_openapi_warrant_code)
+
+    # 重要修正：OpenAPI 每日成交檔沒有標的股。
+    # 新資料若標的股空白，不能覆蓋舊快取中已經存在的正確標的股，
+    # 否則 B/C/D 會因標的股空白而少資料。
+    old_df = _read_raw_cache_frame_for_lookup(WARRANTS_CACHE_PATH)
+    if old_df is not None and not old_df.empty:
+        for col in wanted_cols:
+            if col not in old_df.columns:
+                old_df[col] = ""
+        old_df = old_df[wanted_cols].copy().fillna("")
+        old_df["代號"] = old_df["代號"].map(normalize_openapi_warrant_code)
+        combined = pd.concat([old_df, new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    # 同一權證代號保留非空資料，新的空白欄位不會把舊的標的股洗掉。
+    combined = combined.fillna("")
+    rows = []
+    for code, g in combined.groupby("代號", sort=False):
+        if not str(code).strip():
+            continue
+        rows.append({
+            "代號": code,
+            "名稱": _first_non_empty(*g["名稱"].tolist()),
+            "標的股": _first_non_empty(*g["標的股"].tolist()),
+            "標的名稱": _first_non_empty(*g["標的名稱"].tolist()),
+        })
+
+    df = pd.DataFrame(rows, columns=wanted_cols)
+    write_cache_csv(df, WARRANTS_CACHE_PATH)
+    # 權證清單快取更新後，下次回補標的股要重新建立 lookup。
+    get_underlying_lookup_cache(force_reload=True)
     print(f"  💾 已更新權證清單快取：{WARRANTS_CACHE_PATH}")
 
 
@@ -3186,6 +3446,10 @@ def merge_items_into_history_cache(history_df, new_items):
     combined["權證代號"] = combined["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
     combined["券商代號"] = combined["券商代號"].astype(str).str.strip()
 
+    # 重要修正：新抓 API5 資料若標的股是空白，不能覆蓋舊歷史中的正確標的股。
+    # 先用同一權證代號的非空標的股回補，再去重保留最新買賣超數字。
+    combined = fill_missing_underlying_fields(combined)
+
     # append 後只針對同日同組資料去重，保留最後一筆（也就是本次新抓資料）。
     combined = combined.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
@@ -3231,6 +3495,9 @@ def normalize_history_cache_df(history_df):
     df["日期"] = df["日期"].map(normalize_date_str)
     df["權證代號"] = df["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
     df["券商代號"] = df["券商代號"].astype(str).str.strip()
+
+    # 讓歷史快取讀回後也自動補回同一權證的標的股，避免 B/C/D 因標的股空白被略過。
+    df = fill_missing_underlying_fields(df)
 
     df = df.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
@@ -3683,53 +3950,16 @@ def load_warrants_lookup_cache_for_openapi():
     官方 OpenAPI 的每日成交檔只有權證代號、名稱、成交金額、成交量，
     沒有直接提供標的股代號。
 
-    因此這裡只把既有「快取_權證清單 / warrants_cache.csv」當成標的股對照表使用，
-    不再從 ISIN 掃今日有成交權證，也不再用凱基。
+    新版不只讀「快取_權證清單」，也會從「快取_分點歷史」與候選快取回補標的股，
+    避免 OpenAPI 有成交清單把舊的標的股對照洗成空白後，造成 B/C/D 少資料。
     """
-    df = pd.DataFrame()
-
-    try:
-        if os.path.exists(WARRANTS_CACHE_PATH):
-            df = pd.read_csv(WARRANTS_CACHE_PATH, dtype=str, encoding=CACHE_ENCODING).fillna("")
-    except Exception:
-        df = pd.DataFrame()
-
-    if df.empty:
-        try:
-            df = read_cache_from_gsheet(WARRANTS_CACHE_PATH)
-        except Exception:
-            df = pd.DataFrame()
-
-    if df is None or df.empty:
-        return {}, {}
-
-    required_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    for col in required_cols:
-        if col not in df.columns:
-            return {}, {}
-
-    code_map = {}
-    stock_map = {}
-
-    for _, row in df.iterrows():
-        code = normalize_openapi_warrant_code(row.get("代號", ""))
-        name = str(row.get("名稱", "")).strip()
-        underlying_code = str(row.get("標的股", "")).strip()
-        underlying_name = str(row.get("標的名稱", "")).strip()
-
-        if code and name:
-            code_map[code] = {
-                "代號": code,
-                "名稱": name,
-                "標的股": underlying_code,
-                "標的名稱": underlying_name,
-            }
-
-        if underlying_code and underlying_name:
-            stock_map[underlying_name] = underlying_code
+    lookup = get_underlying_lookup_cache(force_reload=True)
+    code_map = lookup.get("code_map", {})
+    stock_map = lookup.get("stock_map", {})
 
     if code_map:
-        print(f"  ♻️ 已讀取既有權證清單快取作為標的對照：{len(code_map):,} 支")
+        mapped_count = sum(1 for rec in code_map.values() if rec.get("標的股"))
+        print(f"  ♻️ 已讀取多來源標的對照：權證 {len(code_map):,} 支，其中有標的股 {mapped_count:,} 支")
 
     return code_map, stock_map
 
@@ -4193,6 +4423,15 @@ def process_candidate(warrant_code, warrant_name, underlying_code, underlying_na
         })
 
     df = pd.DataFrame(records).sort_values("日期").reset_index(drop=True)
+
+    # 重要修正：OpenAPI 今日有成交權證有些缺標的股。
+    # 在建立 item 前先從權證清單 / 分點歷史 / 候選快取回補，否則 B/C/D 會因沒有標的股而略過。
+    underlying_code, underlying_name = backfill_underlying_for_warrant(
+        warrant_code,
+        warrant_name,
+        underlying_code,
+        underlying_name,
+    )
 
     item = {
         "warrant_code":    warrant_code,
@@ -8434,6 +8673,155 @@ def filter_events_to_target_date(events, date_fields, target_date):
     return out
 
 
+
+def latest_trade_date_from_warrants(warrants):
+    """從 OpenAPI 最新有成交權證清單取得最新交易日。"""
+    latest_dt = None
+    latest_str = ""
+
+    for w in warrants or []:
+        d_norm = normalize_date_str(w.get("交易日期", ""))
+        dt = parse_date(d_norm)
+        if not dt:
+            continue
+        if latest_dt is None or dt > latest_dt:
+            latest_dt = dt
+            latest_str = d_norm
+
+    return latest_str
+
+
+def get_last_trade_dates_from_history_df(history_df, target_date, count):
+    """
+    從快取_分點歷史找出 target_date 往前的最近 N 個交易日。
+
+    每日產圖模式不能只用「今天 API4 有命中的權證」來建 C/D，
+    因為 C=3日累積、D=10日累積時，部分權證可能在前幾天有買超，
+    但最新交易日沒有成交，所以不會出現在本次 OpenAPI 今日有成交名單。
+
+    因此這裡改用快取_分點歷史的日期序列，取最新交易日往前 N 個交易日，
+    再用這段視窗內精選 5 分點的所有權證資料建立今日 B/C/D。
+    """
+    if history_df is None or history_df.empty or not target_date:
+        return []
+
+    target_date = normalize_date_str(target_date)
+    df = history_df.copy().fillna("")
+
+    if "日期" not in df.columns:
+        return []
+
+    dates = []
+    for d in df["日期"].dropna().unique():
+        d_norm = normalize_date_str(d)
+        dt = parse_date(d_norm)
+        if not dt:
+            continue
+        if d_norm <= target_date:
+            dates.append(d_norm)
+
+    dates = sorted(set(dates))
+
+    if count <= 0:
+        return dates
+
+    return dates[-count:]
+
+
+def build_daily_signal_items_from_history_cache(history_df, broker_map, target_date, context_label="每日產圖"):
+    """
+    建立每日產圖專用 items。
+
+    這版的核心修正：
+    每日產圖不是只用「本次 OpenAPI + API4 命中的 candidate_keys」來算，
+    也不是只拿最新交易日前 3 / 10 天視窗去硬湊。
+
+    正確流程是：
+    1. 先把本次 API5 抓到的最新資料 append / merge 到 快取_分點歷史。
+    2. 再以「更新後的整份 快取_分點歷史」作為今日圖片 A/B/C/D 的原始資料來源。
+    3. 只篩選目前追蹤的精選 5 分點 / 目標分點。
+    4. 只排除 target_date 之後的未來資料；target_date 以前的原始資料都保留。
+    5. 後續 build_today_image_abcd_events_from_items() 會自行決定：
+       - 今日 A / B：只看 target_date 當天。
+       - 今日 C：用原始歷史資料中結束日為 target_date 的 3 日累積。
+       - 今日 D：用原始歷史資料中結束日為 target_date 的近 10 日累積。
+
+    這樣才能符合「今天最新資料 + 原本 B/C/D 原始資料一起計算，符合就是符合」的需求，
+    避免因 candidate_filter 太窄而少掉原本應該顯示在圖片上的 B/C/D 股票。
+    """
+    prefix = f"【{context_label}】" if context_label else ""
+
+    if history_df is None or history_df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史為空，無法建立每日產圖資料來源。")
+        return []
+
+    if not broker_map:
+        print(f"{prefix}⚠️ broker_map 為空，無法建立每日產圖資料來源。")
+        return []
+
+    target_date = normalize_date_str(target_date)
+    if not target_date:
+        print(f"{prefix}⚠️ 無法判斷每日產圖目標日期，改用候選資料。")
+        return []
+
+    df = normalize_history_cache_df(history_df)
+
+    if df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史正規化後為空，無法建立每日產圖資料來源。")
+        return []
+
+    allowed_labels = {str(label).strip() for label in broker_map.keys()}
+    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
+
+    broker_mask = pd.Series(False, index=df.index)
+    if "分點" in df.columns:
+        broker_mask = broker_mask | df["分點"].astype(str).str.strip().isin(allowed_labels)
+    if "券商代號" in df.columns:
+        broker_mask = broker_mask | df["券商代號"].astype(str).str.strip().isin(allowed_codes)
+
+    df = df[broker_mask].copy()
+
+    if df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
+        return []
+
+    # 每日產圖只需要 target_date 以前的原始資料；保留完整歷史，讓 C/D 可正確用舊資料累積。
+    # 不要用本次 candidate_keys 限制，也不要只保留 OpenAPI 今日有成交權證。
+    df = df[df["日期"].map(normalize_date_str) <= target_date].copy()
+
+    if df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史內沒有 {target_date} 以前的追蹤分點資料。")
+        return []
+
+    # 保留有買賣紀錄的資料列，避免大量全 0 資料拖慢後續 groupby。
+    for col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "買超金額", "買超股數"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    df = df[
+        (df.get("買進金額", 0) != 0)
+        | (df.get("賣出金額", 0) != 0)
+        | (df.get("買進股數", 0) != 0)
+        | (df.get("賣出股數", 0) != 0)
+        | (df.get("買超金額", 0) != 0)
+        | (df.get("買超股數", 0) != 0)
+    ].copy()
+
+    if df.empty:
+        print(f"{prefix}⚠️ 每日產圖資料來源內沒有買賣超資料。")
+        return []
+
+    items = items_from_history_cache(df)
+    first_date = df["日期"].map(normalize_date_str).min() if "日期" in df.columns else ""
+    last_date = df["日期"].map(normalize_date_str).max() if "日期" in df.columns else ""
+
+    print(
+        f"{prefix}✅ 每日產圖資料來源：使用更新後 快取_分點歷史 的追蹤分點完整原始資料，"
+        f"日期範圍 {first_date} ~ {last_date}，資料 {len(df):,} 筆，還原 {len(items):,} 組 權證×分點"
+    )
+    print(f"{prefix}✅ 今日 A/B/C/D 目標日期：{target_date}；後續只輸出事件日 / 結束日為此日期的今日訊號。")
+    return items
+
 def build_today_image_abcd_events_from_items(items, context_label="今日候選"):
     """
     今日圖片 / 今日_* 工作表專用 A/B/C/D 建立函式。
@@ -8543,7 +8931,7 @@ def main():
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
     print(f"每日快速更新模式：DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}")
-    print(f"今日圖片使用本次候選資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
+    print(f"今日圖片使用更新後完整原始資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
     print(f"執行方案：RUN_PLAN={RUN_PLAN}（daily_signal=精選5分點當日買賣超產圖，full_report=完整資料回補與回測）")
     print(f"每日產圖 API5 補抓筆數：DAILY_SIGNAL_API5_DAYS={DAILY_SIGNAL_API5_DAYS}")
     print(f"價格補抓範圍：PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE}（today=只補今日圖片需要價格，full=完整歷史補價）")
@@ -8655,11 +9043,27 @@ def main():
     # 精選 5 分點當日買賣超產圖模式：
     # 只使用本次 API5 新抓回來的最近資料建立 今日_A/B/C/D，不重算完整歷史勝率與排行。
     if IS_DAILY_SIGNAL_MODE:
-        today_items = fetched_items
+        # 每日產圖需要「今天最新 API5 資料 + 原本快取_分點歷史原始資料」一起判斷。
+        # 因此不能再用 candidate_keys 限制今日_A/B/C/D 的資料來源。
+        # 正確做法是：本次 API5 先 append / merge 到 history_cache_df，
+        # 再從更新後的整份歷史快取篩出追蹤分點資料，建立今日 A/B/C/D。
+        candidate_today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+        target_date_for_today = (
+            latest_trade_date_from_warrants(warrants)
+            or latest_trade_date_from_items(fetched_items)
+            or latest_trade_date_from_items(candidate_today_items)
+        )
 
-        # 若 API5 瞬間有少數失敗，從已 append / merge 的快取中補同候選資料，避免整批空白。
+        today_items = build_daily_signal_items_from_history_cache(
+            history_cache_df,
+            broker_map,
+            target_date_for_today,
+            context_label="每日產圖"
+        )
+
+        # 若歷史視窗資料不可用，才退回本次候選資料。
         if not today_items:
-            today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+            today_items = candidate_today_items or fetched_items
 
         if not today_items:
             print("⚠️ 每日產圖模式沒有可用的本次候選資料")
@@ -8712,13 +9116,25 @@ def main():
     # 主結果表永遠使用完整歷史快取資料，避免 Google Sheet 原本 A/B/C/D、勝率、排行被本次候選資料洗掉。
     # 今日圖片 / 推播需要的本次候選資料，會另外建立「今日_*」工作表。
     full_items = items_from_history_cache(history_cache_df)
-    today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+
+    candidate_today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    target_date_for_today = (
+        latest_trade_date_from_items(candidate_today_items)
+        or latest_trade_date_from_items(fetched_items)
+        or latest_trade_date_from_warrants(warrants)
+    )
+    today_items = build_daily_signal_items_from_history_cache(
+        history_cache_df,
+        broker_map,
+        target_date_for_today,
+        context_label="今日候選"
+    )
 
     if not full_items and fetched_items:
         full_items = fetched_items
 
     if not today_items and fetched_items:
-        today_items = fetched_items
+        today_items = candidate_today_items or fetched_items
 
     items = full_items
 
