@@ -84,8 +84,15 @@ SKIP_PRICE_FETCH = os.getenv("SKIP_PRICE_FETCH", "0").strip().lower() in ("1", "
 
 # 報表資料範圍開關：
 # REPORT_FULL_HISTORY=1：完整歷史快取重算 A/B/C/D 與勝率，資料最完整但較慢。
-# REPORT_FULL_HISTORY=0：只用本次候選組合產生報表，速度接近舊版但勝率範圍較小。
+# REPORT_FULL_HISTORY=0：不再用本次候選資料覆蓋主結果表；主結果表仍保留完整歷史，
+#                        本次候選資料會另外輸出到「今日_*」工作表，避免舊結果表被洗掉。
 REPORT_FULL_HISTORY = os.getenv("REPORT_FULL_HISTORY", "1").strip().lower() not in ("0", "false", "no")
+
+# 今日圖片 / 推播資料來源：
+# TODAY_IMAGE_USE_CURRENT_CANDIDATES=1 時，會用本次 OpenAPI + API4 + API5 命中的候選資料，
+# 另外建立「今日_A_單檔大買 / 今日_B_同標的單日合計 / 今日_C_同標的3日累積 / 今日_D_近10日累積淨買進」工作表。
+# 主 A/B/C/D 結果表仍使用完整歷史資料，不會被本次候選資料覆蓋。
+TODAY_IMAGE_USE_CURRENT_CANDIDATES = os.getenv("TODAY_IMAGE_USE_CURRENT_CANDIDATES", "1").strip().lower() not in ("0", "false", "no")
 
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
@@ -5543,8 +5550,8 @@ def apply_exit_profit_result_outline(ws, row_idx, col_idx, return_pct):
 # 建立 Excel：A / B / C / 勝率統計
 # ══════════════════════════════════════════════════════════════════════
 
-def write_a_sheet(wb, a_events, item_map, price_cache):
-    ws = wb.create_sheet("A_單檔大買")
+def write_a_sheet(wb, a_events, item_map, price_cache, sheet_name="A_單檔大買"):
+    ws = wb.create_sheet(sheet_name)
 
     day_cols = [f"D+{i}" for i in range(1, 21)]
 
@@ -8019,13 +8026,32 @@ def write_daily_underlying_top20_sheet(wb, rows=None, mode="positive", target_da
         row[15].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         row[16].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, full_market_top20_net_rows=None, full_market_top20_positive_rows=None, full_market_top20_trade_date=""):
+def build_excel(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    item_map,
+    price_cache,
+    items,
+    output_path,
+    full_market_top20_net_rows=None,
+    full_market_top20_positive_rows=None,
+    full_market_top20_trade_date="",
+    today_a_events=None,
+    today_b_events=None,
+    today_c_events=None,
+    today_d_events=None,
+    today_item_map=None,
+    today_items=None,
+):
     print("【Step 5】建立 Excel...")
 
     wb = Workbook()
     default_ws = wb.active
     wb.remove(default_ws)
 
+    # 主結果表：永遠使用完整歷史資料，避免本次候選資料把舊 A/B/C/D、勝率統計洗掉。
     write_a_sheet(wb, a_events, item_map, price_cache)
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
@@ -8039,6 +8065,19 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
+
+    # 今日圖片 / 推播專用表：只用本次候選資料產生，不覆蓋主結果表。
+    # 若 notify_discord.py 要抓每日正確明細，可改讀這四張「今日_*」工作表。
+    if today_item_map is not None and (today_a_events is not None or today_b_events is not None or today_c_events is not None or today_d_events is not None):
+        today_a_events = today_a_events or []
+        today_b_events = today_b_events or []
+        today_c_events = today_c_events or []
+        today_d_events = today_d_events or []
+
+        write_a_sheet(wb, today_a_events, today_item_map, price_cache, sheet_name="今日_A_單檔大買")
+        write_group_sheet(wb, "今日_B_同標的單日合計", today_b_events, price_cache, is_c=False)
+        write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
+        write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
 
     apply_global_amount_comma_format(wb)
 
@@ -8057,6 +8096,69 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
 # ══════════════════════════════════════════════════════════════════════
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
+
+
+def build_abcd_events_from_items(items, context_label=""):
+    """
+    從指定 items 建立 A/B/C/D 事件。
+
+    用途：
+    1. 完整歷史資料 → 主 A/B/C/D 結果表、勝率統計、長期統計。
+    2. 本次候選資料 → 今日圖片 / 推播專用「今日_*」工作表。
+
+    這樣可以同時做到：
+    - 主結果表保留完整歷史，不會被本次候選資料覆蓋。
+    - 今日圖片使用本次 OpenAPI + API4 + API5 命中的候選資料，避免完整歷史互斥規則影響今日明細。
+    """
+    prefix = f"【{context_label}】" if context_label else ""
+
+    item_map = {}
+    a_events = []
+
+    for item in items:
+        item_map[(item["broker_code"], item["warrant_code"])] = item
+        a_events.extend(item.get("events_a", []))
+
+    # A 類內部先做權證代號唯一化：
+    # 同一檔權證若有多筆 A 事件，只保留買進日較新、同日買進金額較大的那筆。
+    a_events = filter_a_events_unique_warrants(a_events)
+
+    daily_records = build_daily_records(items)
+
+    # A > B > C > D 權證代號層級互斥：
+    # 只要同一檔權證已經進入 A，後續 B / C / D 完全不再使用這檔權證。
+    a_warrant_codes = collect_event_warrant_codes(a_events)
+    daily_records_for_b = filter_daily_records_by_warrant_codes(daily_records, a_warrant_codes)
+
+    print(f"{prefix}【Step 3c】建立 B 類事件：同標的單日合計買超...")
+    b_events = build_b_events(daily_records_for_b, item_map)
+    print(f"  ✅ {prefix}B 類事件：{len(b_events)} 筆")
+
+    # 已經進入 B 的權證代號，不再進入 C / D。
+    b_warrant_codes = collect_event_warrant_codes(b_events)
+    daily_records_for_c = filter_daily_records_by_warrant_codes(
+        daily_records_for_b,
+        b_warrant_codes
+    )
+
+    print(f"{prefix}【Step 3d】建立 C 類事件：同標的 3 日累積買超...")
+    c_events = build_c_events(daily_records_for_c, item_map)
+    print(f"  ✅ {prefix}C 類事件：{len(c_events)} 筆")
+
+    # 已經進入 C 的權證代號，不再進入 D。
+    c_warrant_codes = collect_event_warrant_codes(c_events)
+    daily_records_for_d = filter_daily_records_by_warrant_codes(
+        daily_records_for_c,
+        c_warrant_codes
+    )
+
+    print(f"{prefix}【Step 3e】建立 D 類事件：同標的近 {D_WINDOW_DAYS} 日累積淨買進...")
+    d_events = build_d_events(daily_records_for_d, item_map, window_days=D_WINDOW_DAYS)
+    print(f"  ✅ {prefix}D 類事件：{len(d_events)} 筆")
+
+    print(f"  ✅ {prefix}A 類事件：{len(a_events)} 筆")
+
+    return item_map, a_events, b_events, c_events, d_events
 
 def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
@@ -8079,7 +8181,9 @@ def main():
     print(f"寫回前合併 Google Sheet 歷史：HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE={HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE}")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
-    print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}，SKIP_PRICE_FETCH={SKIP_PRICE_FETCH}，DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}，REPORT_FULL_HISTORY={REPORT_FULL_HISTORY}")
+    print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
+    print(f"每日快速更新模式：DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}")
+    print(f"今日圖片使用本次候選資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
@@ -8110,21 +8214,17 @@ def main():
     history_cache_df = load_history_cache()
     history_keys = history_cache_keys(history_cache_df)
 
-    if DATA_UPDATE_ONLY:
-        cached_items = []
-        print("  ⚡ DATA_UPDATE_ONLY=1：略過從歷史快取還原 item 與 A 事件，僅做資料更新。")
-    else:
-        cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
-        if cached_items:
-            print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
+    if cached_items:
+        print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
 
     candidates_to_fetch = []
 
     for c in candidates:
         key = candidate_key_from_tuple(c)
 
-        # 沒有歷史快取：第一次建檔抓三年資料（預設 INITIAL_HISTORY_DAYS=750）。
+        # 沒有歷史快取：第一次建檔抓較長歷史。
         # 已有歷史快取且最近 prescan 有看到目標分點：只抓最近 DAILY_UPDATE_DAYS 筆，append 進歷史快取。
         if key not in history_keys:
             candidates_to_fetch.append((c, DAYS_HISTORY, "三年建檔"))
@@ -8132,7 +8232,7 @@ def main():
             candidates_to_fetch.append((c, DAILY_UPDATE_DAYS, "每日附加"))
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
-    print(f"  ✅ 第一次建檔抓取天數：{DAYS_HISTORY} 筆 / 約 3 年")
+    print(f"  ✅ 第一次建檔抓取天數：{DAYS_HISTORY} 筆")
     print(f"  ✅ 既有候選每日附加抓取筆數：{DAILY_UPDATE_DAYS} 筆")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
@@ -8166,34 +8266,42 @@ def main():
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         save_history_cache(history_cache_df)
 
+    # 每日快速更新模式：只更新「快取_分點歷史」後結束，不產生 / 不同步結果工作表。
+    # 適合每天收盤後測試最新資料抓取速度，也可避免結果工作表被覆蓋。
     if DATA_UPDATE_ONLY:
         elapsed = time.time() - program_start
         minutes = int(elapsed // 60)
         seconds = elapsed % 60
-        print("  ⚡ DATA_UPDATE_ONLY=1：每日資料更新模式完成。")
-        print("  ✅ 已完成：OpenAPI 今日有成交權證、API4 預篩、API5 補資料、快取_分點歷史 append / merge。")
-        print("  ⏭️ 已跳過：完整 A/B/C/D 重算、價格補抓、Excel 產生、Google Sheet 結果工作表同步。")
-        print(f"\n{'=' * 70}")
-        print("✅ 快速更新完成！")
-        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
-        print(f"⏱️ 約為：{minutes} 分 {seconds:.2f} 秒")
+        print("\n⚡ DATA_UPDATE_ONLY=1：每日快速更新模式完成。")
+        print("   已完成 OpenAPI 今日有成交權證預篩、API5 補資料、快取_分點歷史 append / merge。")
+        print("   本模式不重算 A/B/C/D、不抓價格、不產生 Excel、不同步結果工作表。")
+        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒，約 {minutes} 分 {seconds:.2f} 秒")
         return
 
-    # 勝率統計與所有報表使用完整歷史快取，而不是只看本次候選。
-    # 這樣第一次三年建檔後，之後每日附加資料不會洗掉舊資料，勝率才會越累積越有意義。
-    if REPORT_FULL_HISTORY:
-        items = items_from_history_cache(history_cache_df)
-    else:
-        items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    # 主結果表永遠使用完整歷史快取資料，避免 Google Sheet 原本 A/B/C/D、勝率、排行被本次候選資料洗掉。
+    # 今日圖片 / 推播需要的本次候選資料，會另外建立「今日_*」工作表。
+    full_items = items_from_history_cache(history_cache_df)
+    today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
-    if not items and fetched_items:
-        items = fetched_items
+    if not full_items and fetched_items:
+        full_items = fetched_items
+
+    if not today_items and fetched_items:
+        today_items = fetched_items
+
+    items = full_items
+
+    if REPORT_FULL_HISTORY:
+        print("  ✅ 主結果表使用完整歷史快取資料，不會被本次候選資料覆蓋。")
+    else:
+        print("  ⚠️ REPORT_FULL_HISTORY=0 已不再讓本次候選資料覆蓋主結果表。")
+        print("     主 A/B/C/D、勝率、排行仍使用完整歷史資料；本次候選資料另輸出到 今日_* 工作表。")
 
     if items:
-        if REPORT_FULL_HISTORY:
-            print(f"  ✅ 本次報表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
-        else:
-            print(f"  ⚡ REPORT_FULL_HISTORY=0：本次報表只使用候選組合資料：{len(items):,} 組 權證×分點")
+        print(f"  ✅ 主結果表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
+
+    if today_items:
+        print(f"  ✅ 今日圖片 / 推播候選資料：{len(today_items):,} 組 權證×分點")
 
     if not items:
         print("⚠️ 無任何候選資料")
@@ -8201,51 +8309,23 @@ def main():
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
 
-    item_map = {}
-    a_events = []
-
-    for item in items:
-        item_map[(item["broker_code"], item["warrant_code"])] = item
-        a_events.extend(item.get("events_a", []))
-
-    # A 類內部先做權證代號唯一化：
-    # 同一檔權證若有多筆 A 事件，只保留買進日較新、同日買進金額較大的那筆。
-    a_events = filter_a_events_unique_warrants(a_events)
-
-    daily_records = build_daily_records(items)
-
-    # A > B > C > D 權證代號層級互斥：
-    # 只要同一檔權證已經進入 A，後續 B / C / D 完全不再使用這檔權證。
-    a_warrant_codes = collect_event_warrant_codes(a_events)
-    daily_records_for_b = filter_daily_records_by_warrant_codes(daily_records, a_warrant_codes)
-
-    print("【Step 3c】建立 B 類事件：同標的單日合計買超...")
-    b_events = build_b_events(daily_records_for_b, item_map)
-    print(f"  ✅ B 類事件：{len(b_events)} 筆")
-
-    # 已經進入 B 的權證代號，不再進入 C / D。
-    b_warrant_codes = collect_event_warrant_codes(b_events)
-    daily_records_for_c = filter_daily_records_by_warrant_codes(
-        daily_records_for_b,
-        b_warrant_codes
+    item_map, a_events, b_events, c_events, d_events = build_abcd_events_from_items(
+        items,
+        context_label="完整歷史"
     )
 
-    print("【Step 3d】建立 C 類事件：同標的 3 日累積買超...")
-    c_events = build_c_events(daily_records_for_c, item_map)
-    print(f"  ✅ C 類事件：{len(c_events)} 筆")
+    today_item_map = None
+    today_a_events = []
+    today_b_events = []
+    today_c_events = []
+    today_d_events = []
 
-    # 已經進入 C 的權證代號，不再進入 D。
-    c_warrant_codes = collect_event_warrant_codes(c_events)
-    daily_records_for_d = filter_daily_records_by_warrant_codes(
-        daily_records_for_c,
-        c_warrant_codes
-    )
-
-    print(f"【Step 3e】建立 D 類事件：同標的近 {D_WINDOW_DAYS} 日累積淨買進...")
-    d_events = build_d_events(daily_records_for_d, item_map, window_days=D_WINDOW_DAYS)
-    print(f"  ✅ D 類事件：{len(d_events)} 筆")
-
-    print(f"  ✅ A 類事件：{len(a_events)} 筆")
+    if TODAY_IMAGE_USE_CURRENT_CANDIDATES and today_items:
+        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_abcd_events_from_items(
+            today_items,
+            context_label="今日候選"
+        )
+        print("  ✅ 已建立 今日_* 工作表資料來源；主結果表仍保留完整歷史。")
 
     if not a_events and not b_events and not c_events and not d_events:
         print("⚠️ A/B/C/D 皆無事件")
@@ -8258,7 +8338,12 @@ def main():
     # 目前保留 A/B/C/D 與精選 / 完整分點追蹤流程，不再建立每日標的淨買超TOP20 / 每日標的買超TOP20。
     full_market_top20_net_rows, full_market_top20_positive_rows, full_market_top20_trade_date = [], [], ""
 
-    price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
+    price_a_events = a_events + (today_a_events or [])
+    price_b_events = b_events + (today_b_events or [])
+    price_c_events = c_events + (today_c_events or [])
+    price_d_events = d_events + (today_d_events or [])
+
+    price_cache = fetch_all_prices(price_a_events, price_b_events, price_c_events, price_d_events)
 
     build_excel(
         a_events,
@@ -8272,6 +8357,12 @@ def main():
         full_market_top20_net_rows=full_market_top20_net_rows,
         full_market_top20_positive_rows=full_market_top20_positive_rows,
         full_market_top20_trade_date=full_market_top20_trade_date,
+        today_a_events=today_a_events,
+        today_b_events=today_b_events,
+        today_c_events=today_c_events,
+        today_d_events=today_d_events,
+        today_item_map=today_item_map,
+        today_items=today_items,
     )
     upload_excel_to_google_sheet(output_path)
 
