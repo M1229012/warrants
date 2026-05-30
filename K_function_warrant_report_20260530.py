@@ -1,14 +1,12 @@
 import pandas as pd
 import requests
-import Triangle5ma
-import HighFly
 import matplotlib.pyplot as plt
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.font_manager as fm
 import matplotlib.dates as mdates
-from X_function import get_institutional_stats_finmind
+from matplotlib.ticker import FuncFormatter
 import io
 import os
 import json
@@ -122,46 +120,6 @@ def fetch_stock_data_yf(stock_code: str, period="120d"):
             continue
 
     return None, None, None
-
-# ==================== 三大法人資料 ====================
-def fetch_inst_60d_from_x(stock_code: str, days: int = 60) -> pd.DataFrame:
-    """
-    從 X_function.get_institutional_stats_finmind 取回法人資料（單位：張）
-    回傳欄位: Date, foreign, invest, dealer, total
-    """
-    # ✅ X_function 只能吃 (stock_code, n_days)
-    # 為了拿到「近60個交易日」，用日曆日抓寬一點較保險（避免假日/空資料）
-    inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
-
-    if inst is None or inst.empty:
-        return pd.DataFrame()
-
-    # inst 欄位：date, 外資, 投信, 自營商（你程式裡就是這樣）
-    need_cols = {"date", "外資", "投信", "自營商"}
-    if not need_cols.issubset(inst.columns):
-        print(f"⚠️ 法人資料欄位不符: {inst.columns.tolist()}")
-        return pd.DataFrame()
-
-    out = inst.copy()
-
-    # ✅ Date 轉 datetime，方便跟 yfinance index join
-    out["Date"] = pd.to_datetime(out["date"])
-
-    # ✅ 映射成 K 線那套命名
-    out["foreign"] = pd.to_numeric(out["外資"], errors="coerce").fillna(0)
-    out["invest"]  = pd.to_numeric(out["投信"], errors="coerce").fillna(0)
-    out["dealer"]  = pd.to_numeric(out["自營商"], errors="coerce").fillna(0)
-
-    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
-
-    # 你的 X_function 最後是 date 降冪（最新在最上），這裡改成升冪再取尾巴
-    out = out.sort_values("Date").tail(days).reset_index(drop=True)
-    print(">>> [DEBUG] inst60 head:\n", out.head())
-    print(">>> [DEBUG] inst60 columns:", out.columns.tolist())
-
-
-    return out[["Date", "foreign", "invest", "dealer", "total"]]
-
 
 # ==================== 權證分點 Google Sheet 資料 ====================
 WARRANT_GSHEET_DEFAULT_NAME = "權證分點籌碼"
@@ -561,6 +519,96 @@ def _plot_warrant_event_markers(candle_ax, plot_df: pd.DataFrame, x: list, warra
             candle_ax.scatter(i, sell_y, marker="D", s=90, color=color, edgecolor="white", linewidth=0.7, zorder=24)
             candle_ax.text(i, sell_y, f"權賣\n{count_txt}", ha="center", va="bottom", fontsize=8,
                            color=color, fontweight="bold", zorder=25)
+
+
+def _format_money_axis(v, pos=None) -> str:
+    """權證金額座標軸顯示。"""
+    try:
+        v = float(v)
+    except Exception:
+        return "0"
+    abs_v = abs(v)
+    sign = "-" if v < 0 else ""
+    if abs_v >= 100000000:
+        return f"{sign}{abs_v / 100000000:.1f}億"
+    if abs_v >= 10000:
+        return f"{sign}{abs_v / 10000:.0f}萬"
+    return f"{v:.0f}"
+
+
+def plot_warrant_daily_net_bars(ax, warrant_events: pd.DataFrame, plot_df: pd.DataFrame, x: list):
+    """
+    權證報告專用：顯示 K 線區間內，每日權證分點淨買賣超金額。
+    正值為買超，負值為賣超。
+    """
+    ax.text(
+        0.01, 1.25, "權證分點日別淨買賣超",
+        transform=ax.transAxes,
+        ha="left", va="center",
+        fontsize=15, color="#111111",
+        clip_on=False
+    )
+
+    if warrant_events is None or warrant_events.empty:
+        ax.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.45)
+        ax.text(
+            0.5, 0.5, "圖中區間無權證分點資料",
+            transform=ax.transAxes,
+            ha="center", va="center",
+            fontsize=14, alpha=0.65
+        )
+        ax.set_ylim(-1, 1)
+        return
+
+    events = warrant_events.copy()
+    events["Date"] = pd.to_datetime(events["Date"]).dt.normalize()
+    daily = events.groupby("Date", as_index=True)["net_amount"].sum().sort_index()
+
+    date_to_x = {pd.Timestamp(dt).normalize(): i for i, dt in enumerate(plot_df.index)}
+    xs, vals = [], []
+    for dt, val in daily.items():
+        if dt in date_to_x:
+            xs.append(date_to_x[dt])
+            vals.append(float(val))
+
+    if not vals:
+        ax.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.45)
+        ax.text(
+            0.5, 0.5, "圖中區間無權證分點資料",
+            transform=ax.transAxes,
+            ha="center", va="center",
+            fontsize=14, alpha=0.65
+        )
+        ax.set_ylim(-1, 1)
+        return
+
+    colors = ["#D81B60" if v >= 0 else "#00897B" for v in vals]
+    ax.bar(xs, vals, width=0.72, color=colors, alpha=0.72)
+    ax.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.55)
+    ax.yaxis.set_major_formatter(FuncFormatter(_format_money_axis))
+
+    max_abs = max(abs(v) for v in vals)
+    max_abs = max_abs if max_abs > 0 else 1
+    ax.set_ylim(-max_abs * 1.25, max_abs * 1.25)
+
+    latest_dt = daily.index.max()
+    latest_val = float(daily.loc[latest_dt])
+    total_val = float(daily.sum())
+    buy_count = int((events["net_amount"] > 0).sum())
+    sell_count = int((events["net_amount"] < 0).sum())
+
+    summary = (
+        f"最新 {latest_dt.strftime('%m/%d')} {_format_money_zh(latest_val)}｜"
+        f"區間合計 {_format_money_zh(total_val)}｜買{buy_count} / 賣{sell_count}"
+    )
+    ax.text(
+        0.99, 1.25, summary,
+        transform=ax.transAxes,
+        ha="right", va="center",
+        fontsize=13, color="#333333",
+        clip_on=False
+    )
+
 
 # ==================== 價量累積疊圖 ====================
 
@@ -1270,121 +1318,7 @@ def draw_inst_header_like_legend(inst_ax, plot_df):
 # ==================== 圖表繪製 ====================
 
 
-def _is_triangle5ma_signal(window: pd.DataFrame) -> bool:
-    if len(window) < 50:
-        return False
-
-    hist = window[window['Volume'] != 0].copy()
-    if len(hist) < 50:
-        return False
-
-    today_close = hist['Close'].iloc[-1]
-    avg_close_5d = hist['Close'].iloc[-6:-1].mean()
-    avg_close_30d = hist['Close'].iloc[-30:].mean()
-    avg_close_31_50d = hist['Close'].iloc[-50:-30].mean()
-    today_volume = hist['Volume'].iloc[-1]
-    yesterday_volume = hist['Volume'].iloc[-2]
-
-    high_price_30d_date = hist['High'].iloc[-30:].idxmax()
-    if high_price_30d_date >= hist.index[-6]:
-        return False
-
-    hist_1_31d = hist.iloc[-31:-1]
-    low_price = hist_1_31d['Low'].min()
-    low_price_date = hist_1_31d['Low'].idxmin()
-    low_price_loc = hist.index.get_loc(low_price_date)
-    filtered_hist_right = hist.iloc[low_price_loc + 4:] if low_price_loc + 4 < len(hist) else hist.iloc[low_price_loc + 1:]
-    if filtered_hist_right.empty:
-        return False
-
-    second_low_price = filtered_hist_right['Low'].min()
-    second_low_price_date = filtered_hist_right['Low'].idxmin()
-    low_date_range = hist.loc[low_price_date:second_low_price_date]
-    low_non_zero_volume_count = len(low_date_range[low_date_range['Volume'] != 0]) - 1
-    low_slope = (second_low_price - low_price) / low_non_zero_volume_count if low_non_zero_volume_count != 0 else 0
-
-    hist_1_41d = hist.iloc[-41:-1]
-    high_price = hist_1_41d['High'].max()
-    high_price_date = hist_1_41d['High'].idxmax()
-    if high_price_date in hist.iloc[-11:-1].index:
-        return False
-
-    high_price_loc = hist.index.get_loc(high_price_date)
-    filtered_high_hist = hist.iloc[high_price_loc + 4:] if high_price_loc + 4 < len(hist) else hist.iloc[high_price_loc + 1:]
-    if filtered_high_hist.empty:
-        return False
-
-    second_high_price = filtered_high_hist['High'].max()
-    second_high_price_date = filtered_high_hist['High'].idxmin()
-    high_date_range = hist.loc[high_price_date:second_high_price_date]
-    high_non_zero_volume_count = len(high_date_range[high_date_range['Volume'] != 0]) - 1
-    high_slope = (second_high_price - high_price) / high_non_zero_volume_count if high_non_zero_volume_count != 0 else 0
-
-    three_day_gain = (today_close - hist['Close'].iloc[-4:-1].iloc[0]) / hist['Close'].iloc[-4:-1].iloc[0]
-    today_date = hist_1_41d.index[-1]
-    high_to_today_non_zero_volume_count = len(hist.loc[high_price_date:today_date][hist['Volume'] != 0])
-    expected_price_today = high_price + high_slope * high_to_today_non_zero_volume_count
-    if today_close >= expected_price_today:
-        return False
-
-    return (
-        today_volume > 0.8 * yesterday_volume
-        and today_close > avg_close_5d
-        and avg_close_30d > avg_close_31_50d * 1.07
-        and abs(high_slope) < abs(low_slope)
-        and low_slope > 0
-        and three_day_gain < 0.08
-        and today_volume > 1000000
-        and round(high_slope, 5) > -1
-    )
-
-
-def _is_highfly_signal(window: pd.DataFrame) -> bool:
-    if len(window) < 30:
-        return False
-    hist = window.copy()
-    hist['5d_ma'] = hist['Close'].rolling(window=5).mean()
-    hist['10d_ma'] = hist['Close'].rolling(window=10).mean()
-    hist['20d_ma'] = hist['Close'].rolling(window=20).mean()
-
-    close_today = round(hist['Close'].iloc[-1], 2)
-    open_today = hist['Open'].iloc[-1]
-    high_today = hist['High'].iloc[-1]
-    low_today = hist['Low'].iloc[-1]
-    volume_today = hist['Volume'].iloc[-1]
-
-    if volume_today <= 1000000:
-        return False
-    if hist['High'].iloc[-2] != hist['High'][-31:-1].max():
-        return False
-    if hist['Open'].iloc[-2] <= hist['Close'].iloc[-2] or (hist['High'].iloc[-2] - hist['Low'].iloc[-2]) / hist['Low'].iloc[-2] < 0.02:
-        return False
-    if close_today < hist['5d_ma'].iloc[-1] or (high_today - low_today) / low_today < 0.02:
-        return False
-    if hist['10d_ma'].iloc[-1] <= hist['10d_ma'].iloc[-2]:
-        return False
-    if hist['20d_ma'].iloc[-1] <= hist['20d_ma'].iloc[-2]:
-        return False
-    if (close_today - open_today) / open_today > 0.03:
-        return False
-    return True
-
-
-def _build_strategy_signal_map(df: pd.DataFrame, back_days: int = 30):
-    df = df.sort_index().copy()
-    signal_map = {}
-    start_idx = max(0, len(df) - back_days)
-    for i in range(start_idx, len(df)):
-        day = df.index[i]
-        labels = []
-        if _is_triangle5ma_signal(df.iloc[: i + 1]):
-            labels.append("三角")
-        if _is_highfly_signal(df.iloc[: i + 1]):
-            labels.append("高檔")
-        if labels:
-            signal_map[day.normalize()] = labels
-    return signal_map
-
+# 權證報告不使用三角收斂 / 高檔飛舞策略標記。
 def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60, warrant_events: pd.DataFrame = None):
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
     df["Close_prev"] = df["Close"].shift(1)
@@ -1393,12 +1327,7 @@ def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60,
     x = list(range(len(plot_df)))
     warrant_events_in_plot = _filter_warrant_events_for_plot(warrant_events, plot_df.index)
 
-    # 策略標記失敗時不影響原本 !k 流程
-    try:
-        strategy_signal_map = _build_strategy_signal_map(df, back_days=30)
-    except Exception as e:
-        print(f"⚠️ 策略標記建立失敗，略過標記: {e}")
-        strategy_signal_map = {}
+    # 權證報告不使用三角收斂 / 高檔飛舞策略標記。
     date_labels = [d.strftime("%m-%d") for d in plot_df.index]
     up = plot_df["Close"] >= plot_df["Open"]
     down = ~up
@@ -1552,47 +1481,10 @@ def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60,
             if 1 <= r <= len(panel_row_colors):
                 cell.get_text().set_color(panel_row_colors[r - 1][c])
 
-    # ✅ 籌碼箭頭
-    ARROW_SIZE = 110      # 原本 220 → 減半
-    ARROW_ALPHA = 0.6     # 半透明
-    ARROW_Z = 9  
-# ✅ 籌碼箭頭（縮小 + 半透明）
-    if {"chip_dir", "chip_color"}.issubset(plot_df.columns):
-        for ii in range(len(plot_df)):
-            direction = int(plot_df["chip_dir"].iloc[ii]) if not pd.isna(plot_df["chip_dir"].iloc[ii]) else 0
-            if direction == 0:
-                continue
-    
-            c = plot_df["chip_color"].iloc[ii]
-    
-            if direction > 0:
-                candle_ax.scatter(
-                    x[ii],
-                    plot_df["Low"].iloc[ii] * 0.985,
-                    marker="^",
-                    s=ARROW_SIZE,
-                    color=c,
-                    alpha=ARROW_ALPHA,
-                    zorder=ARROW_Z
-                )
-            else:
-                candle_ax.scatter(
-                    x[ii],
-                    plot_df["High"].iloc[ii] * 1.015,
-                    marker="v",
-                    s=ARROW_SIZE,
-                    color=c,
-                    alpha=ARROW_ALPHA,
-                    zorder=ARROW_Z
-                )
-
-
-    # 依 !tra5ma / !highfly 條件標記近 30 天符合訊號
+    # 權證分點買賣超標記區
     y_min = plot_df["Low"].min()
     y_max = plot_df["High"].max()
     y_span = max(y_max - y_min, 1e-6)
-    marker_y = y_min - y_span * 0.09
-
     has_warrant_events = warrant_events_in_plot is not None and not warrant_events_in_plot.empty
     has_warrant_buy = has_warrant_events and (warrant_events_in_plot["net_amount"].sum() > 0 or (warrant_events_in_plot["net_amount"] > 0).any())
     has_warrant_sell = has_warrant_events and (warrant_events_in_plot["net_amount"].sum() < 0 or (warrant_events_in_plot["net_amount"] < 0).any())
@@ -1606,23 +1498,6 @@ def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60,
     # ✅ 權證分點買賣超標記：圖中範圍有事件才標在 K 線主圖
     _plot_warrant_event_markers(candle_ax, plot_df, x, warrant_events_in_plot, warrant_buy_y, warrant_sell_y)
 
-    for i, dt in enumerate(plot_df.index):
-        labels = strategy_signal_map.get(pd.Timestamp(dt).normalize(), [])
-        if not labels:
-            continue
-
-        if "三角" in labels:
-            candle_ax.scatter(
-                i - 0.12, marker_y, marker="o", s=48,
-                color="#2EBD59", edgecolor="white", linewidth=0.6, zorder=21
-            )
-
-        if "高檔" in labels:
-            candle_ax.scatter(
-                i + 0.12, marker_y, marker="o", s=48,
-                color="#7EDCFF", edgecolor="white", linewidth=0.6, zorder=21
-            )
-
     adjust_right_axis(candle_ax)
 
     # ✅ MA備註（不影響箭頭）
@@ -1634,18 +1509,12 @@ def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60,
                                  boxstyle="round,pad=0.4", alpha=0.9),
                        color="#D31F1F")
 
-    # === 籌碼箭頭圖例定義（集中管理） ===
+    # === 權證標記圖例 ===
     chip_legend_items = [
-        ("^", "red",   "三大法人"),
-        ("^", "orange","投信"),
-        ("^", "#1F3A8A", "外資"),
-        ("^", "gray",  "自營商"),
-        ("o", "#2EBD59", "三角收斂"),
-        ("o", "#7EDCFF", "高檔飛舞"),
         ("D", "#D81B60", "權證買超"),
         ("D", "#00897B", "權證賣超"),
     ]
-    # === 籌碼箭頭圖例（左下角，懸浮） ===
+    # === 權證標記圖例（左下角，懸浮） ===
     legend_x = 0.02     # 左右位置（axes fraction）
     legend_y = 0.05     # 底部起始位置
     line_gap = 0.045    # 每一行的間距
@@ -1798,16 +1667,10 @@ def plot_stock_chart(df: pd.DataFrame, stock_code: str = "", lookback: int = 60,
 
     
 
-    # 三大法人（取代 DMI）
-    
-    inst_ax = axes[4]
-    
-    plot_institutional_stacked_bars(inst_ax, plot_df, x)
-    
-    # ✅ 不用 legend，改成自己畫一行
-    draw_inst_header_like_legend(inst_ax, plot_df)
-    
-    adjust_right_axis(inst_ax)
+    # 權證分點日別淨買賣超（取代原本三大法人面板）
+    warrant_ax = axes[4]
+    plot_warrant_daily_net_bars(warrant_ax, warrant_events_in_plot, plot_df, x)
+    adjust_right_axis(warrant_ax)
 
 
     # RSI
@@ -1856,38 +1719,10 @@ def generate_k_chart(stock_code: str) -> io.BytesIO:
             return None
 
         df = calculate_indicators(df)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
 
-        # === 只做一次：抓法人 → 對齊 index → join ===
-        inst60 = fetch_inst_60d_from_x(stock_code, days=70)
-
-        if inst60 is None or inst60.empty:
-            print("⚠️ inst60 為空，略過籌碼箭頭 join")
-            # 沒有法人也沒關係，後面 build_chip_priority_signal 會走防呆
-            df[["foreign", "invest", "dealer", "total"]] = 0
-        else:
-            # 確保 Date 欄位存在且為 datetime
-            if "Date" not in inst60.columns:
-                print(f"⚠️ inst60 欄位異常：{inst60.columns.tolist()}，略過 join")
-                df[["foreign", "invest", "dealer", "total"]] = 0
-            else:
-                inst60 = inst60.copy()
-                inst60["Date"] = pd.to_datetime(inst60["Date"])
-                inst60 = inst60.set_index("Date").sort_index()
-
-                # yfinance index 也是 datetime，確保一致（去掉時區）
-                df = df.copy()
-                df.index = pd.to_datetime(df.index).tz_localize(None)
-
-                keep_cols = ["foreign", "invest", "dealer", "total"]
-                for c in keep_cols:
-                    if c not in inst60.columns:
-                        inst60[c] = 0
-
-                df = df.join(inst60[keep_cols], how="left")
-                df[keep_cols] = df[keep_cols].fillna(0)
-
-        # === 產生籌碼箭頭 ===
-        df = build_chip_priority_signal(df)
+        # 權證報告版本：不依賴 Triangle5ma / HighFly / X_function，
+        # 也不產生三大法人籌碼箭頭，避免 GitHub 缺少外部檔案而失敗。
 
         # === 權證分點資料：只抓 K 線顯示範圍附近的 Google Sheet 資料 ===
         lookback = 70
