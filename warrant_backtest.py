@@ -198,6 +198,12 @@ FULL_MARKET_TOP20_LIMIT_WARRANTS = int(os.getenv("FULL_MARKET_TOP20_LIMIT_WARRAN
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
 
+# 每日產圖模式用：
+# 記錄「更新後快取_分點歷史」中，追蹤分點在目標日前已經符合 A 類的權證代號。
+# 今日 B/C/D 必須排除這些歷史 A 權證，避免同一檔權證先前已經被 A 判斷後，
+# 又因今日同標的累積條件被放進 B/C/D。
+DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = set()
+
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
     "富邦北高雄":     r"富邦.*北高雄",
@@ -8791,7 +8797,34 @@ def build_daily_signal_items_from_history_cache(history_df, broker_map, target_d
         print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
         return []
 
-    # 每日產圖只需要「目標交易日往前 D_WINDOW_DAYS 個交易日」的原始資料。
+    # 重要修正：今日 B/C/D 的資料來源必須先排除「歷史已符合 A 類」的權證。
+    # A 類定義是單檔權證單日買進金額 >= AMOUNT_THRESH。
+    # 這裡直接從更新後的快取_分點歷史判斷，不依賴完整 A_單檔大買工作表，
+    # 避免每日產圖模式又讀完整結果表造成速度變慢。
+    global DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES
+    try:
+        df["日期"] = df["日期"].map(normalize_date_str)
+        for col in ["買進金額", "買進股數"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+        hist_a_df = df[
+            (df["日期"].map(normalize_date_str) <= target_date)
+            & (df["買進金額"] >= AMOUNT_THRESH)
+            & (df["買進股數"] > 0)
+        ].copy()
+
+        DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = {
+            normalize_warrant_code_for_unique(code)
+            for code in hist_a_df.get("權證代號", pd.Series(dtype=str)).astype(str).tolist()
+            if str(code).strip()
+        }
+        print(f"{prefix}✅ 歷史 A 權證排除清單：{len(DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES):,} 檔")
+    except Exception as e:
+        DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = set()
+        print(f"{prefix}⚠️ 歷史 A 權證排除清單建立失敗，今日 B/C/D 僅排除今日 A：{type(e).__name__}: {e}")
+
+    # 每日產圖只需要「目標交易日往前 D_WINDOW_DAYS 個交易日」的原始資料.
     # 這仍然是用更新後的快取_分點歷史來算，不再被本次 candidate_keys 限制；
     # 但不用把 18～20 萬筆完整歷史全部還原成 items，避免每日產圖模式拖到十幾分鐘。
     # A / B 只看 target_date，C 看結束日為 target_date 的 3 日，D 看結束日為 target_date 的近 10 日，
@@ -9007,9 +9040,20 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
 
     daily_records_all = build_daily_records(items)
 
-    # B：只用最新交易日當天資料，且只排除最新交易日 A 用過的權證。
+    # 重要修正：今日 B/C/D 不能只排除「今日 A」。
+    # 若同一檔權證在歷史上已經符合 A 類，後續即使今天同標的累積達 B/C/D，
+    # 也不能再把該權證放進今日 B/C/D。這才符合 A/B/C/D 權證互斥邏輯。
+    today_a_warrant_codes = collect_event_warrant_codes(a_events)
+    historical_a_warrant_codes = set(DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES)
+    a_warrant_codes = historical_a_warrant_codes | today_a_warrant_codes
+    if historical_a_warrant_codes:
+        print(
+            f"{prefix}✅ 今日 B/C/D 排除歷史 A 權證：歷史 A {len(historical_a_warrant_codes):,} 檔，"
+            f"今日 A {len(today_a_warrant_codes):,} 檔，合計排除 {len(a_warrant_codes):,} 檔"
+        )
+
+    # B：只用最新交易日當天資料，且排除歷史 A / 今日 A 用過的權證。
     today_records = filter_records_by_dates(daily_records_all, [target_date])
-    a_warrant_codes = collect_event_warrant_codes(a_events)
     today_records_for_b = filter_daily_records_by_warrant_codes(today_records, a_warrant_codes)
 
     print(f"{prefix}【Step 3c】建立今日 B 類事件：同標的單日合計買超...")
@@ -9017,7 +9061,7 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     b_events = filter_events_to_target_date(b_events, ["事件日", "結束日"], target_date)
     print(f"  ✅ {prefix}今日 B 類事件：{len(b_events)} 筆")
 
-    # C：只用最新交易日往前 3 個交易日視窗，且只排除今日 A / 今日 B 用過的權證。
+    # C：只用最新交易日往前 3 個交易日視窗，且排除歷史 A / 今日 A / 今日 B 用過的權證。
     b_warrant_codes = collect_event_warrant_codes(b_events)
     records_for_c_base = filter_daily_records_by_warrant_codes(daily_records_all, a_warrant_codes | b_warrant_codes)
     c_dates = get_last_trade_dates_from_records(records_for_c_base, target_date, 3)
@@ -9037,7 +9081,7 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     )
     print(f"  ✅ {prefix}今日 C 類事件：{len(c_events)} 筆")
 
-    # D：只用最新交易日往前 D_WINDOW_DAYS 交易日視窗，且只排除今日 A / B / C 用過的權證。
+    # D：只用最新交易日往前 D_WINDOW_DAYS 交易日視窗，且排除歷史 A / 今日 A / B / C 用過的權證。
     c_warrant_codes = collect_event_warrant_codes(c_events)
     records_for_d_base = filter_daily_records_by_warrant_codes(
         daily_records_all,
