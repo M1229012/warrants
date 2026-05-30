@@ -71,6 +71,22 @@ FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
 FAST_SKIP_RECENT_PRESCAN = os.getenv("FAST_SKIP_RECENT_PRESCAN", "0").strip().lower() not in ("0", "false", "no")
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
 
+# 每日收盤快速更新模式：
+# DATA_UPDATE_ONLY=1 時，只執行「OpenAPI 今日有成交權證 → API4 預篩 → API5 補資料 → append / merge 到快取_分點歷史」。
+# 會跳過完整 A/B/C/D 重算、價格補抓、Excel 產生與結果工作表同步，適合每天測試收盤後新資料更新速度。
+# DATA_UPDATE_ONLY=0 時，維持原本完整報表流程。
+DATA_UPDATE_ONLY = os.getenv("DATA_UPDATE_ONLY", "0").strip().lower() in ("1", "true", "yes")
+
+# 價格補抓開關：
+# SKIP_PRICE_FETCH=1 時，Step 4 不再補抓 TWSE / TPEx / Yahoo 價格，只讀取既有快取_價格。
+# 適合每日快速產生 / 更新買賣超資料；若需要完整 D+1～D+20、標的股股價、5MA、20MA，再設為 0 手動跑一次。
+SKIP_PRICE_FETCH = os.getenv("SKIP_PRICE_FETCH", "0").strip().lower() in ("1", "true", "yes")
+
+# 報表資料範圍開關：
+# REPORT_FULL_HISTORY=1：完整歷史快取重算 A/B/C/D 與勝率，資料最完整但較慢。
+# REPORT_FULL_HISTORY=0：只用本次候選組合產生報表，速度接近舊版但勝率範圍較小。
+REPORT_FULL_HISTORY = os.getenv("REPORT_FULL_HISTORY", "1").strip().lower() not in ("0", "false", "no")
+
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
 
@@ -5039,6 +5055,13 @@ def build_d_events(daily_records, item_map, window_days=None):
 def fetch_all_prices(a_events, b_events, c_events, d_events):
     print("【Step 4】抓收盤價...")
 
+    if SKIP_PRICE_FETCH:
+        print("  ⚡ SKIP_PRICE_FETCH=1：跳過外部價格補抓，只使用既有價格快取。")
+        print("  ⚠️ D+1～D+20、標的股股價、5MA、20MA 可能會出現空白或 -。")
+        persistent_price_cache = load_price_cache()
+        print(f"  ✅ 價格快取讀取：{len(persistent_price_cache):,} 個代號")
+        return persistent_price_cache
+
     code_ranges = {}
 
     def update_code_range(code, start_dt, end_dt):
@@ -8056,7 +8079,7 @@ def main():
     print(f"寫回前合併 Google Sheet 歷史：HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE={HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE}")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
-    print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
+    print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}，SKIP_PRICE_FETCH={SKIP_PRICE_FETCH}，DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}，REPORT_FULL_HISTORY={REPORT_FULL_HISTORY}")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
@@ -8087,10 +8110,14 @@ def main():
     history_cache_df = load_history_cache()
     history_keys = history_cache_keys(history_cache_df)
 
-    cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    if DATA_UPDATE_ONLY:
+        cached_items = []
+        print("  ⚡ DATA_UPDATE_ONLY=1：略過從歷史快取還原 item 與 A 事件，僅做資料更新。")
+    else:
+        cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
-    if cached_items:
-        print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
+        if cached_items:
+            print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
 
     candidates_to_fetch = []
 
@@ -8139,15 +8166,34 @@ def main():
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         save_history_cache(history_cache_df)
 
+    if DATA_UPDATE_ONLY:
+        elapsed = time.time() - program_start
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
+        print("  ⚡ DATA_UPDATE_ONLY=1：每日資料更新模式完成。")
+        print("  ✅ 已完成：OpenAPI 今日有成交權證、API4 預篩、API5 補資料、快取_分點歷史 append / merge。")
+        print("  ⏭️ 已跳過：完整 A/B/C/D 重算、價格補抓、Excel 產生、Google Sheet 結果工作表同步。")
+        print(f"\n{'=' * 70}")
+        print("✅ 快速更新完成！")
+        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
+        print(f"⏱️ 約為：{minutes} 分 {seconds:.2f} 秒")
+        return
+
     # 勝率統計與所有報表使用完整歷史快取，而不是只看本次候選。
     # 這樣第一次三年建檔後，之後每日附加資料不會洗掉舊資料，勝率才會越累積越有意義。
-    items = items_from_history_cache(history_cache_df)
+    if REPORT_FULL_HISTORY:
+        items = items_from_history_cache(history_cache_df)
+    else:
+        items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
     if not items and fetched_items:
         items = fetched_items
 
     if items:
-        print(f"  ✅ 本次報表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
+        if REPORT_FULL_HISTORY:
+            print(f"  ✅ 本次報表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
+        else:
+            print(f"  ⚡ REPORT_FULL_HISTORY=0：本次報表只使用候選組合資料：{len(items):,} 組 權證×分點")
 
     if not items:
         print("⚠️ 無任何候選資料")
