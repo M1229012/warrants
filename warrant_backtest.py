@@ -94,6 +94,16 @@ REPORT_FULL_HISTORY = os.getenv("REPORT_FULL_HISTORY", "1").strip().lower() not 
 # 主 A/B/C/D 結果表仍使用完整歷史資料，不會被本次候選資料覆蓋。
 TODAY_IMAGE_USE_CURRENT_CANDIDATES = os.getenv("TODAY_IMAGE_USE_CURRENT_CANDIDATES", "1").strip().lower() not in ("0", "false", "no")
 
+# 價格補抓範圍：
+# today / current / current_candidates：每日盤後預設模式，只針對「今日_*」本次候選事件補抓缺少的價格。
+#                                   主 A/B/C/D 完整歷史表只使用既有「快取_價格」，不為舊歷史事件大量補價。
+# full / all / history：完整回測模式，針對主 A/B/C/D + 今日_* 全部事件補抓缺少的價格，速度較慢但價格最完整。
+# 搭配 SKIP_PRICE_FETCH=1 時，仍會完全跳過外部價格補抓。
+PRICE_FETCH_SCOPE = os.getenv("PRICE_FETCH_SCOPE", "today").strip().lower()
+if PRICE_FETCH_SCOPE not in ("today", "current", "current_candidates", "full", "all", "history"):
+    print(f"  ⚠️ PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE} 不支援，改用 today 每日盤後價格模式。")
+    PRICE_FETCH_SCOPE = "today"
+
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
 
@@ -5205,6 +5215,119 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
     return price_cache
 
+
+def collect_price_codes_from_events(a_events, b_events, c_events, d_events):
+    """
+    收集報表需要顯示價格的代號，但不做任何外部價格補抓。
+
+    用途：
+    - 每日盤後快速模式下，主 A/B/C/D 完整歷史表只讀既有快取_價格。
+    - 今日_* 工作表才另外補抓本次候選需要的價格。
+    """
+    codes = set()
+
+    def add_code(code):
+        code = normalize_price_code(code)
+        if code:
+            codes.add(code)
+
+    for ev in a_events or []:
+        add_code(ev.get("權證代號"))
+        add_code(ev.get("標的股"))
+
+    for ev in list(b_events or []) + list(c_events or []) + list(d_events or []):
+        add_code(ev.get("標的股"))
+
+        if FETCH_GROUP_WARRANT_PRICES:
+            for lot in ev.get("lots", []):
+                add_code(lot.get("權證代號"))
+
+    return codes
+
+
+def load_cached_prices_for_events(a_events, b_events, c_events, d_events):
+    """
+    只從既有快取_價格讀取指定事件需要的代號價格，不補抓外部資料。
+
+    這是每日盤後加速的核心：
+    主 A/B/C/D 完整歷史表仍會產生，但不會為了歷史事件缺價去大量打 TWSE / TPEx / Yahoo。
+    """
+    persistent_price_cache = load_price_cache()
+    price_cache = {}
+    codes = collect_price_codes_from_events(a_events, b_events, c_events, d_events)
+
+    for code in codes:
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
+        add_price_aliases(price_cache, code, cached_prices)
+
+    print(
+        f"  ✅ 價格快取模式：需顯示價格代號 {len(codes):,} 檔，"
+        f"已從既有快取載入 {len(price_cache):,} 個代號別名，不補抓歷史缺價"
+    )
+    return price_cache
+
+
+def merge_price_cache_maps(*caches):
+    """合併多個記憶體價格快取 dict。"""
+    merged = {}
+
+    for cache in caches:
+        if not cache:
+            continue
+
+        for code, prices in cache.items():
+            norm_code = normalize_price_code(code)
+
+            if not norm_code:
+                continue
+
+            old_prices = get_cached_prices_for_code(merged, norm_code)
+            merged_prices = merge_price_dicts(old_prices, prices)
+            add_price_aliases(merged, norm_code, merged_prices)
+
+    return merged
+
+
+def build_price_cache_for_report(price_a_events, price_b_events, price_c_events, price_d_events,
+                                 today_a_events=None, today_b_events=None, today_c_events=None, today_d_events=None):
+    """
+    依 PRICE_FETCH_SCOPE 建立報表價格快取。
+
+    預設 PRICE_FETCH_SCOPE=today：
+    1. 只針對 今日_* 本次候選事件補抓缺少的價格。
+    2. 主 A/B/C/D 完整歷史事件只讀既有快取_價格，不補抓舊歷史缺價。
+    3. 適合每日盤後快速取得圖片資訊。
+
+    PRICE_FETCH_SCOPE=full：
+    - 維持完整回測模式，對主 A/B/C/D + 今日_* 全部事件補抓缺少的價格。
+    """
+    today_a_events = today_a_events or []
+    today_b_events = today_b_events or []
+    today_c_events = today_c_events or []
+    today_d_events = today_d_events or []
+
+    if SKIP_PRICE_FETCH:
+        print("【Step 4】抓收盤價...")
+        print("  ⚡ SKIP_PRICE_FETCH=1：跳過外部價格補抓，只使用既有價格快取。")
+        return load_cached_prices_for_events(price_a_events, price_b_events, price_c_events, price_d_events)
+
+    if PRICE_FETCH_SCOPE in ("full", "all", "history"):
+        print("  ✅ 價格補抓範圍：完整歷史資料 full，會補抓主 A/B/C/D + 今日_* 缺少的價格。")
+        return fetch_all_prices(price_a_events, price_b_events, price_c_events, price_d_events)
+
+    print("  ✅ 價格補抓範圍：每日盤後 today，只補抓 今日_* 本次候選事件需要的價格。")
+    print("     主 A/B/C/D 完整歷史表只使用既有 快取_價格，不補抓歷史缺價。")
+
+    today_has_events = bool(today_a_events or today_b_events or today_c_events or today_d_events)
+
+    if today_has_events:
+        # 這裡會更新 / 保存快取_價格，但範圍只限今日候選事件需要的代號。
+        fetch_all_prices(today_a_events, today_b_events, today_c_events, today_d_events)
+    else:
+        print("  ⚠️ 今日_* 事件為空，略過外部價格補抓。")
+
+    return load_cached_prices_for_events(price_a_events, price_b_events, price_c_events, price_d_events)
+
 # ══════════════════════════════════════════════════════════════════════
 # D+1 ~ D+20
 # ══════════════════════════════════════════════════════════════════════
@@ -8184,6 +8307,7 @@ def main():
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
     print(f"每日快速更新模式：DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}")
     print(f"今日圖片使用本次候選資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
+    print(f"價格補抓範圍：PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE}（today=只補今日圖片需要價格，full=完整歷史補價）")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
@@ -8343,7 +8467,16 @@ def main():
     price_c_events = c_events + (today_c_events or [])
     price_d_events = d_events + (today_d_events or [])
 
-    price_cache = fetch_all_prices(price_a_events, price_b_events, price_c_events, price_d_events)
+    price_cache = build_price_cache_for_report(
+        price_a_events,
+        price_b_events,
+        price_c_events,
+        price_d_events,
+        today_a_events=today_a_events,
+        today_b_events=today_b_events,
+        today_c_events=today_c_events,
+        today_d_events=today_d_events,
+    )
 
     build_excel(
         a_events,
