@@ -8283,6 +8283,161 @@ def build_abcd_events_from_items(items, context_label=""):
 
     return item_map, a_events, b_events, c_events, d_events
 
+
+def latest_trade_date_from_items(items):
+    """
+    取得本次候選資料中最新的 API5 日期。
+
+    用途：
+    今日圖片 / 今日_* 工作表只應該呈現最新交易日的訊號，
+    但 C / D 類仍需要往前 3 日 / 10 日的資料做累積判斷。
+    """
+    latest_dt = None
+    latest_str = ""
+
+    for item in items or []:
+        df = item.get("df")
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        for d in df["日期"].dropna().unique():
+            d_norm = normalize_date_str(d)
+            dt = parse_date(d_norm)
+            if not dt:
+                continue
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
+                latest_str = d_norm
+
+    return latest_str
+
+
+def filter_records_by_dates(daily_records, allowed_dates):
+    if not daily_records or not allowed_dates:
+        return []
+
+    allowed_dates = {normalize_date_str(d) for d in allowed_dates if str(d).strip()}
+
+    return [
+        row for row in daily_records
+        if normalize_date_str(row.get("日期", "")) in allowed_dates
+    ]
+
+
+def get_last_trade_dates_from_records(daily_records, target_date, count):
+    if not daily_records or not target_date:
+        return []
+
+    target_date = normalize_date_str(target_date)
+    dates = sorted({
+        normalize_date_str(row.get("日期", ""))
+        for row in daily_records
+        if str(row.get("日期", "")).strip()
+        and normalize_date_str(row.get("日期", "")) <= target_date
+    })
+
+    if count <= 0:
+        return dates
+
+    return dates[-count:]
+
+
+def filter_events_to_target_date(events, date_fields, target_date):
+    if not events or not target_date:
+        return []
+
+    target_date = normalize_date_str(target_date)
+    out = []
+
+    for ev in events:
+        for field in date_fields:
+            if normalize_date_str(ev.get(field, "")) == target_date:
+                out.append(ev)
+                break
+
+    return out
+
+
+def build_today_image_abcd_events_from_items(items, context_label="今日候選"):
+    """
+    今日圖片 / 今日_* 工作表專用 A/B/C/D 建立函式。
+
+    與完整歷史回測不同，今日圖片只應呈現「最新交易日」的訊號：
+    - A：只看最新交易日當天的單檔大買。
+    - B：只看最新交易日當天的同標的單日合買。
+    - C：只看「結束日 = 最新交易日」的 3 日累積。
+    - D：只看「結束日 = 最新交易日」的近 10 日累積。
+
+    關鍵修正：
+    完整歷史版的 A > B > C > D 權證代號互斥，會把同一檔權證在過去日期出現過的 A/B/C
+    也拿來排除今日 B/C/D，導致今日圖片少資料。
+
+    今日圖片版只在「最新交易日相關視窗」內做互斥，避免歷史事件污染今日明細。
+    """
+    prefix = f"【{context_label}】" if context_label else ""
+
+    item_map = {}
+    for item in items or []:
+        item_map[(item["broker_code"], item["warrant_code"])] = item
+
+    target_date = latest_trade_date_from_items(items)
+
+    if not target_date:
+        print(f"{prefix}⚠️ 無法判斷今日候選最新交易日，今日_* 工作表將為空。")
+        return item_map, [], [], [], []
+
+    print(f"{prefix}今日圖片 / 今日_* 事件目標日期：{target_date}")
+
+    # A：只保留最新交易日的 A 事件，避免過去 A 事件把今日 B/C/D 權證整個排掉。
+    a_events = []
+    for item in items or []:
+        for ev in item.get("events_a", []):
+            if normalize_date_str(ev.get("買進日", "")) == target_date:
+                a_events.append(ev)
+
+    a_events = filter_a_events_unique_warrants(a_events)
+
+    daily_records_all = build_daily_records(items)
+
+    # B：只用最新交易日當天資料，且只排除最新交易日 A 用過的權證。
+    today_records = filter_records_by_dates(daily_records_all, [target_date])
+    a_warrant_codes = collect_event_warrant_codes(a_events)
+    today_records_for_b = filter_daily_records_by_warrant_codes(today_records, a_warrant_codes)
+
+    print(f"{prefix}【Step 3c】建立今日 B 類事件：同標的單日合計買超...")
+    b_events = build_b_events(today_records_for_b, item_map)
+    b_events = filter_events_to_target_date(b_events, ["事件日", "結束日"], target_date)
+    print(f"  ✅ {prefix}今日 B 類事件：{len(b_events)} 筆")
+
+    # C：只用最新交易日往前 3 個交易日視窗，且只排除今日 A / 今日 B 用過的權證。
+    b_warrant_codes = collect_event_warrant_codes(b_events)
+    records_for_c_base = filter_daily_records_by_warrant_codes(daily_records_all, a_warrant_codes | b_warrant_codes)
+    c_dates = get_last_trade_dates_from_records(records_for_c_base, target_date, 3)
+    records_for_c = filter_records_by_dates(records_for_c_base, c_dates)
+
+    print(f"{prefix}【Step 3d】建立今日 C 類事件：結束日為今日的 3 日累積買超...")
+    c_events = build_c_events(records_for_c, item_map)
+    c_events = filter_events_to_target_date(c_events, ["結束日", "事件日"], target_date)
+    print(f"  ✅ {prefix}今日 C 類事件：{len(c_events)} 筆")
+
+    # D：只用最新交易日往前 D_WINDOW_DAYS 交易日視窗，且只排除今日 A / B / C 用過的權證。
+    c_warrant_codes = collect_event_warrant_codes(c_events)
+    records_for_d_base = filter_daily_records_by_warrant_codes(
+        daily_records_all,
+        a_warrant_codes | b_warrant_codes | c_warrant_codes
+    )
+    d_dates = get_last_trade_dates_from_records(records_for_d_base, target_date, D_WINDOW_DAYS)
+    records_for_d = filter_records_by_dates(records_for_d_base, d_dates)
+
+    print(f"{prefix}【Step 3e】建立今日 D 類事件：結束日為今日的近 {D_WINDOW_DAYS} 日累積淨買進...")
+    d_events = build_d_events(records_for_d, item_map, window_days=D_WINDOW_DAYS)
+    d_events = filter_events_to_target_date(d_events, ["結束日", "事件日"], target_date)
+    print(f"  ✅ {prefix}今日 D 類事件：{len(d_events)} 筆")
+
+    print(f"  ✅ {prefix}今日 A 類事件：{len(a_events)} 筆")
+
+    return item_map, a_events, b_events, c_events, d_events
+
 def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
@@ -8445,7 +8600,7 @@ def main():
     today_d_events = []
 
     if TODAY_IMAGE_USE_CURRENT_CANDIDATES and today_items:
-        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_abcd_events_from_items(
+        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
             today_items,
             context_label="今日候選"
         )
