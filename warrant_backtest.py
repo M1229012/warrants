@@ -104,6 +104,42 @@ if PRICE_FETCH_SCOPE not in ("today", "current", "current_candidates", "full", "
     print(f"  ⚠️ PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE} 不支援，改用 today 每日盤後價格模式。")
     PRICE_FETCH_SCOPE = "today"
 
+# ══════════════════════════════════════════════════════════════════════
+# 兩種執行方案
+# ══════════════════════════════════════════════════════════════════════
+# RUN_PLAN=daily_signal：精選 5 分點當日買賣超產圖模式。
+#   - 每天收盤後快速抓最新資料、更新快取_分點歷史、產生今日_A/B/C/D 工作表。
+#   - 強制 RUN_MODE=1，只追蹤精選 5 分點。
+#   - 新舊候選都只抓最近 DAILY_SIGNAL_API5_DAYS 筆 API5，不抓 250/750 筆歷史。
+#   - 只建立今日_A/B/C/D、價格狀態與顏色說明，不重算完整歷史勝率與排行。
+#   - 價格只補今日圖片需要的權證 / 標的股價格。
+# RUN_PLAN=full_report：完整資料回補與回測模式。
+#   - 適合其他時間手動跑完整資料、完整歷史 A/B/C/D、勝率、排行與完整價格補抓。
+RUN_PLAN_RAW = os.getenv("RUN_PLAN", os.getenv("EXECUTION_PLAN", os.getenv("JOB_MODE", "daily_signal"))).strip()
+RUN_PLAN_LOOKUP_KEY = RUN_PLAN_RAW.lower()
+RUN_PLAN_ALIASES = {
+    "daily": "daily_signal",
+    "daily_signal": "daily_signal",
+    "daily_image": "daily_signal",
+    "today": "daily_signal",
+    "today_image": "daily_signal",
+    "selected5_today": "daily_signal",
+    "精選5分點當日買賣超產圖": "daily_signal",
+    "精選5分點當日買賣超": "daily_signal",
+    "full": "full_report",
+    "full_report": "full_report",
+    "full_history": "full_report",
+    "backtest": "full_report",
+    "完整資料回補與回測": "full_report",
+    "完整資料": "full_report",
+}
+RUN_PLAN = RUN_PLAN_ALIASES.get(RUN_PLAN_RAW, RUN_PLAN_ALIASES.get(RUN_PLAN_LOOKUP_KEY, "daily_signal"))
+IS_DAILY_SIGNAL_MODE = RUN_PLAN == "daily_signal"
+IS_FULL_REPORT_MODE = RUN_PLAN == "full_report"
+DAILY_SIGNAL_API5_DAYS = int(os.getenv("DAILY_SIGNAL_API5_DAYS", "12"))
+if DAILY_SIGNAL_API5_DAYS < D_WINDOW_DAYS:
+    DAILY_SIGNAL_API5_DAYS = D_WINDOW_DAYS + 2
+
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
 
@@ -8149,6 +8185,46 @@ def write_daily_underlying_top20_sheet(wb, rows=None, mode="positive", target_da
         row[15].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         row[16].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
+def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, today_d_events, today_item_map, price_cache, output_path):
+    """
+    精選 5 分點當日買賣超產圖模式專用 Excel。
+
+    這個模式只輸出今日圖片 / 推播需要的工作表，不重寫主 A/B/C/D、勝率、排行等完整歷史結果表，
+    因此可避免每天盤後產圖時把舊結果表洗掉，也能大幅減少完整回測與歷史補價時間。
+    """
+    print("【Step 5】建立每日盤後產圖用 Excel...")
+
+    wb = Workbook()
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    today_a_events = today_a_events or []
+    today_b_events = today_b_events or []
+    today_c_events = today_c_events or []
+    today_d_events = today_d_events or []
+    today_item_map = today_item_map or {}
+
+    write_a_sheet(wb, today_a_events, today_item_map, price_cache, sheet_name="今日_A_單檔大買")
+    write_group_sheet(wb, "今日_B_同標的單日合計", today_b_events, price_cache, is_c=False)
+    write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
+    write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
+    write_price_status_sheet(wb, price_cache)
+    write_color_legend_sheet(wb)
+
+    apply_global_amount_comma_format(wb)
+
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    wb.save(output_path)
+
+    print(
+        f"  ✅ 已存：{output_path} "
+        f"（今日A:{len(today_a_events)} 筆，今日B:{len(today_b_events)} 筆，今日C:{len(today_c_events)} 筆，今日D:{len(today_d_events)} 筆）"
+    )
+
+
 def build_excel(
     a_events,
     b_events,
@@ -8439,8 +8515,14 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     return item_map, a_events, b_events, c_events, d_events
 
 def main():
+    global RUN_MODE
+
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
+
+    # 兩種方案固定邏輯：daily_signal 一律使用精選 5 分點。
+    if IS_DAILY_SIGNAL_MODE:
+        RUN_MODE = 1
 
     configure_run_mode()
 
@@ -8462,6 +8544,8 @@ def main():
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
     print(f"每日快速更新模式：DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}")
     print(f"今日圖片使用本次候選資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
+    print(f"執行方案：RUN_PLAN={RUN_PLAN}（daily_signal=精選5分點當日買賣超產圖，full_report=完整資料回補與回測）")
+    print(f"每日產圖 API5 補抓筆數：DAILY_SIGNAL_API5_DAYS={DAILY_SIGNAL_API5_DAYS}")
     print(f"價格補抓範圍：PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE}（today=只補今日圖片需要價格，full=完整歷史補價）")
     print("=" * 70)
 
@@ -8500,19 +8584,30 @@ def main():
 
     candidates_to_fetch = []
 
-    for c in candidates:
-        key = candidate_key_from_tuple(c)
+    if IS_DAILY_SIGNAL_MODE:
+        # 每日盤後產圖模式：
+        # 這裡的目標是「今天精選 5 分點買賣超圖片」，不是完整回測建檔。
+        # 因此不管候選是否為新權證，都只抓最近 DAILY_SIGNAL_API5_DAYS 筆 API5，足夠判斷：
+        # A=今日、B=今日、C=結束日為今日的 3 日、D=結束日為今日的 10 日。
+        candidates_to_fetch = [(c, DAILY_SIGNAL_API5_DAYS, "每日產圖") for c in candidates]
+    else:
+        for c in candidates:
+            key = candidate_key_from_tuple(c)
 
-        # 沒有歷史快取：第一次建檔抓較長歷史。
-        # 已有歷史快取且最近 prescan 有看到目標分點：只抓最近 DAILY_UPDATE_DAYS 筆，append 進歷史快取。
-        if key not in history_keys:
-            candidates_to_fetch.append((c, DAYS_HISTORY, "三年建檔"))
-        elif key in PRESCAN_REFRESH_KEYS:
-            candidates_to_fetch.append((c, DAILY_UPDATE_DAYS, "每日附加"))
+            # 完整資料回補與回測模式：
+            # 沒有歷史快取：抓 INITIAL_HISTORY_DAYS / DAYS_HISTORY 建檔。
+            # 已有歷史快取且最近 prescan 有看到目標分點：只抓最近 DAILY_UPDATE_DAYS 筆，append 進歷史快取。
+            if key not in history_keys:
+                candidates_to_fetch.append((c, DAYS_HISTORY, "完整建檔"))
+            elif key in PRESCAN_REFRESH_KEYS:
+                candidates_to_fetch.append((c, DAILY_UPDATE_DAYS, "每日附加"))
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
-    print(f"  ✅ 第一次建檔抓取天數：{DAYS_HISTORY} 筆")
-    print(f"  ✅ 既有候選每日附加抓取筆數：{DAILY_UPDATE_DAYS} 筆")
+    if IS_DAILY_SIGNAL_MODE:
+        print(f"  ✅ 每日產圖模式：所有候選只抓最近 {DAILY_SIGNAL_API5_DAYS} 筆 API5，不抓完整歷史")
+    else:
+        print(f"  ✅ 完整建檔抓取天數：{DAYS_HISTORY} 筆")
+        print(f"  ✅ 既有候選每日附加抓取筆數：{DAILY_UPDATE_DAYS} 筆")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
     fetched_items = []
@@ -8546,8 +8641,8 @@ def main():
         save_history_cache(history_cache_df)
 
     # 每日快速更新模式：只更新「快取_分點歷史」後結束，不產生 / 不同步結果工作表。
-    # 適合每天收盤後測試最新資料抓取速度，也可避免結果工作表被覆蓋。
-    if DATA_UPDATE_ONLY:
+    # 保留相容舊設定；新的每日產圖請使用 RUN_PLAN=daily_signal。
+    if DATA_UPDATE_ONLY and not IS_DAILY_SIGNAL_MODE:
         elapsed = time.time() - program_start
         minutes = int(elapsed // 60)
         seconds = elapsed % 60
@@ -8555,6 +8650,63 @@ def main():
         print("   已完成 OpenAPI 今日有成交權證預篩、API5 補資料、快取_分點歷史 append / merge。")
         print("   本模式不重算 A/B/C/D、不抓價格、不產生 Excel、不同步結果工作表。")
         print(f"⏱️ 總執行時間：{elapsed:.2f} 秒，約 {minutes} 分 {seconds:.2f} 秒")
+        return
+
+    # 精選 5 分點當日買賣超產圖模式：
+    # 只使用本次 API5 新抓回來的最近資料建立 今日_A/B/C/D，不重算完整歷史勝率與排行。
+    if IS_DAILY_SIGNAL_MODE:
+        today_items = fetched_items
+
+        # 若 API5 瞬間有少數失敗，從已 append / merge 的快取中補同候選資料，避免整批空白。
+        if not today_items:
+            today_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+
+        if not today_items:
+            print("⚠️ 每日產圖模式沒有可用的本次候選資料")
+            elapsed = time.time() - program_start
+            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+            return
+
+        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
+            today_items,
+            context_label="每日產圖"
+        )
+
+        if not today_a_events and not today_b_events and not today_c_events and not today_d_events:
+            print("⚠️ 今日_A/B/C/D 皆無事件，但仍會輸出今日工作表供檢查。")
+
+        # 每日產圖模式只補今日圖片需要的價格，不補完整歷史缺價。
+        price_cache = build_price_cache_for_report(
+            today_a_events,
+            today_b_events,
+            today_c_events,
+            today_d_events,
+            today_a_events=today_a_events,
+            today_b_events=today_b_events,
+            today_c_events=today_c_events,
+            today_d_events=today_d_events,
+        )
+
+        build_daily_signal_excel(
+            today_a_events,
+            today_b_events,
+            today_c_events,
+            today_d_events,
+            today_item_map,
+            price_cache,
+            output_path,
+        )
+        upload_excel_to_google_sheet(output_path)
+
+        elapsed = time.time() - program_start
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
+
+        print(f"\n{'=' * 70}")
+        print("✅ 每日產圖模式完成！")
+        print(f"📄 {output_path}")
+        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
+        print(f"⏱️ 約為：{minutes} 分 {seconds:.2f} 秒")
         return
 
     # 主結果表永遠使用完整歷史快取資料，避免 Google Sheet 原本 A/B/C/D、勝率、排行被本次候選資料洗掉。
