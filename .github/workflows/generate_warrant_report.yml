@@ -1,25 +1,24 @@
-name: Generate Warrant Image Report
+name: Warrant Report Manual Test
 
 on:
   workflow_dispatch:
     inputs:
       stock_codes:
-        description: "股票代號，可用逗號分隔，例如 2408,2330"
+        description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
         required: false
         default: "2408"
-  schedule:
-    # GitHub Actions cron 使用 UTC。
-    # 台灣時間週一到週五 17:10 = UTC 09:10。
-    - cron: "10 9 * * 1-5"
 
 jobs:
-  run-warrant-report:
+  run-warrant-report-test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     env:
       OUTPUT_DIR: output
-      STOCK_CODES: ${{ inputs.stock_codes || vars.STOCK_CODES || '2408' }}
+      STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
+
+      # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
+      MPLBACKEND: Agg
 
       # Google Sheet 設定
       WARRANT_GSHEET_ENABLE: "1"
@@ -31,16 +30,17 @@ jobs:
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
       WARRANT_REPORT_MAX_ROWS: "8"
 
-      # Discord 推播設定
-      # 這裡會抓 GitHub Secrets 裡的 DISCORD_WEBHOOK_URL_TEST
+      # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
-
-      # 備用：如果未來你要改回正式頻道，也可以新增 DISCORD_WEBHOOK_URL
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install system fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,18 +48,19 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Run warrant report
+      - name: Run warrant report test
         run: python run_report.py
 
-      - name: Upload report artifacts
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: warrant-report-output
+          name: warrant-report-test-output
           path: output/*.png
           if-no-files-found: warn
