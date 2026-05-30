@@ -87,6 +87,13 @@ CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candid
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
+# 歷史分點資料保護：
+# 1. 第一次或 GitHub Actions 執行時，會優先讀取 Google Sheet「快取_分點歷史」作為歷史基底。
+# 2. 每日新抓 API5 資料時，只 append / 合併新日期，不整組覆蓋舊資料。
+# 3. 寫回 Google Sheet 前，再把雲端既有「快取_分點歷史」合併一次，避免因本機快取不完整而洗掉舊歷史。
+HISTORY_CACHE_APPEND_ONLY = os.getenv("HISTORY_CACHE_APPEND_ONLY", "1").strip().lower() not in ("0", "false", "no")
+HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE = os.getenv("HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE", "1").strip().lower() not in ("0", "false", "no")
+
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
 #             讓今日買賣超明細盡量完整，例如元大南屯今日賣南亞科所有相關認購權證。
@@ -3006,7 +3013,9 @@ def load_history_cache():
             print(f"  ⚠️ 原始分點資料快取欄位不完整，缺少：{col}")
             return pd.DataFrame()
 
-    return df[required_cols].copy()
+    df = normalize_history_cache_df(df[required_cols].copy())
+    print(f"  ✅ 歷史分點快取載入完成：{len(df):,} 筆，來源可包含 Google Sheet 快取_分點歷史 / 本機快取")
+    return df
 
 
 def history_cache_keys(history_df):
@@ -3112,12 +3121,98 @@ def merge_items_into_history_cache(history_df, new_items):
     return combined
 
 
+def normalize_history_cache_df(history_df):
+    """
+    正規化歷史分點快取欄位與型別。
+
+    這個函式專門給 append-only 歷史快取使用，確保 Google Sheet 舊資料、
+    本機 CSV 舊資料與本次 API5 新資料可以安全合併。
+    """
+    required_cols = [
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    ]
+
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=required_cols)
+
+    df = history_df.copy().fillna("")
+
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[required_cols].copy()
+
+    numeric_cols = ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    df["日期"] = df["日期"].map(normalize_date_str)
+    df["權證代號"] = df["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
+    df["券商代號"] = df["券商代號"].astype(str).str.strip()
+
+    df = df.drop_duplicates(
+        subset=["權證代號", "券商代號", "日期"],
+        keep="last"
+    )
+
+    df = df.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
+    return df
+
+
+def merge_history_cache_frames(base_df, add_df):
+    """
+    append-only 合併歷史分點資料。
+
+    用途：
+    - base_df：Google Sheet / 本機既有歷史資料
+    - add_df：本次 API5 新抓資料或本機合併資料
+
+    合併規則：
+    - 舊資料保留
+    - 新資料附加
+    - 同一 權證代號 + 券商代號 + 日期 重複時保留最後一筆
+    """
+    base_df = normalize_history_cache_df(base_df)
+    add_df = normalize_history_cache_df(add_df)
+
+    if base_df.empty:
+        return add_df
+
+    if add_df.empty:
+        return base_df
+
+    combined = pd.concat([base_df, add_df], ignore_index=True)
+    return normalize_history_cache_df(combined)
+
+
 def save_history_cache(history_df):
     if not USE_CACHE or history_df is None or history_df.empty:
         return
 
+    history_df = normalize_history_cache_df(history_df)
+
+    # 防呆重點：每日更新不應該洗掉 Google Sheet 既有「快取_分點歷史」。
+    # 因此寫回前再讀一次雲端歷史快取，把雲端舊資料與本次資料 append 合併。
+    if HISTORY_CACHE_APPEND_ONLY and HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE and GSHEET_CACHE_ENABLED and gsheet_enabled():
+        try:
+            gsheet_history_df = read_cache_from_gsheet(HISTORY_CACHE_PATH)
+            if gsheet_history_df is not None and not gsheet_history_df.empty:
+                before_rows = len(history_df)
+                gsheet_rows = len(gsheet_history_df)
+                history_df = merge_history_cache_frames(gsheet_history_df, history_df)
+                print(
+                    f"  🔒 append-only 歷史保護：已合併 Google Sheet 既有快取 {gsheet_rows:,} 筆 "
+                    f"+ 本次本機歷史 {before_rows:,} 筆 → 寫回 {len(history_df):,} 筆"
+                )
+        except Exception as e:
+            print(f"  ⚠️ append-only 歷史保護讀取 Google Sheet 失敗，改用本機合併結果寫回：{type(e).__name__}: {e}")
+
     write_cache_csv(history_df, HISTORY_CACHE_PATH)
-    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}")
+    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}，共 {len(history_df):,} 筆")
 
 
 def items_from_history_cache(history_df, candidate_filter=None):
@@ -7561,6 +7656,8 @@ def main():
     print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點 OpenAPI 今日有成交權證預篩，2=完整分點清單）")
     print(f"OpenAPI 預篩天數：OPENAPI_ACTIVE_PRESCAN_DAYS={OPENAPI_ACTIVE_PRESCAN_DAYS}")
     print(f"今日活躍權證強制刷新：ACTIVE_WARRANT_FORCE_REFRESH={ACTIVE_WARRANT_FORCE_REFRESH}")
+    print(f"歷史快取 append-only：HISTORY_CACHE_APPEND_ONLY={HISTORY_CACHE_APPEND_ONLY}")
+    print(f"寫回前合併 Google Sheet 歷史：HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE={HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE}")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
