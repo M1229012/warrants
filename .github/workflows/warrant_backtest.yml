@@ -19,7 +19,7 @@ jobs:
       CACHE_DIR: warrant_cache
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
-      RUN_MODE: "1"
+      RUN_MODE: "2"
       OPENAPI_ACTIVE_PRESCAN_DAYS: "3"
 
       SELECTED_FORCE_ALL_WARRANTS: "0"
