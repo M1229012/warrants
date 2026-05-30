@@ -46,7 +46,8 @@ DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower()
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
 MAX_WORKERS   = 50
-DAYS_HISTORY  = 250
+DAYS_HISTORY  = int(os.getenv("INITIAL_HISTORY_DAYS", os.getenv("DAYS_HISTORY", "750")))
+DAILY_UPDATE_DAYS = int(os.getenv("DAILY_UPDATE_DAYS", "5"))
 RECENT_RANKING_DAYS = 62
 SELL_DETAIL_DAYS = int(os.getenv("SELL_DETAIL_DAYS", "3"))
 D_WINDOW_DAYS = 10
@@ -363,7 +364,7 @@ API4 = ("https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
 
 API5 = ("https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
         "/d8/f5/27/twWarrantData.xdjjson"
-        "?x=warrant-chip0002-5&c=250&a={warrant}&b={broker}&revision=2018_07_31_1")
+        "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1")
 
 # Excel 顏色（柔和舒適版）
 RED    = PatternFill("solid", fgColor="F4CCCC")
@@ -469,10 +470,16 @@ def api4_get(code, start, end):
         return []
 
 
-def api5_get(warrant, broker):
+def api5_get(warrant, broker, days=None):
     try:
         session = get_thread_session()
-        r = session.get(API5.format(warrant=warrant, broker=broker), headers=HDR, timeout=(5, 12))
+        try:
+            days = int(days if days is not None else DAYS_HISTORY)
+        except Exception:
+            days = DAYS_HISTORY
+        if days <= 0:
+            days = DAYS_HISTORY
+        r = session.get(API5.format(warrant=warrant, broker=broker, days=days), headers=HDR, timeout=(5, 12))
         data = json.loads(r.content.decode("utf-8"))
         rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
         return rs.get("Result", [])
@@ -3042,14 +3049,25 @@ def item_to_history_rows(item):
 
 
 def merge_items_into_history_cache(history_df, new_items):
+    """
+    將本次 API5 抓回來的新資料「附加 / 合併」進歷史快取。
+
+    舊版邏輯會把同一組「權證代號 + 券商代號」的所有舊資料刪掉，
+    再用本次 API5 回傳資料整組取代。這在日後只抓當日 / 近幾日更新時，
+    會把三年建檔資料覆蓋掉。
+
+    新版邏輯：
+    1. 舊資料全部保留。
+    2. 新資料直接 append。
+    3. 只在同一組「權證代號 + 券商代號 + 日期」重複時，保留最後一筆新資料。
+    4. 因此第一次抓三年建檔後，之後每天只抓當日 / 近幾日資料也不會洗掉舊歷史。
+    """
     if not new_items:
         return history_df if history_df is not None else pd.DataFrame()
 
     new_rows = []
-    new_keys = set()
 
     for item in new_items:
-        new_keys.add(candidate_key_from_values(item["warrant_code"], item["broker_code"]))
         new_rows.extend(item_to_history_rows(item))
 
     new_df = pd.DataFrame(new_rows)
@@ -3060,26 +3078,34 @@ def merge_items_into_history_cache(history_df, new_items):
     if history_df is None or history_df.empty:
         combined = new_df
     else:
-        history_df = history_df.copy()
-        remove_mask = pd.Series(
-            [candidate_key_from_values(w, b) in new_keys for w, b in zip(history_df["權證代號"], history_df["券商代號"])],
-            index=history_df.index
-        )
-        old_keep_df = history_df[~remove_mask].copy()
-        combined = pd.concat([old_keep_df, new_df], ignore_index=True)
+        combined = pd.concat([history_df.copy(), new_df], ignore_index=True)
+
+    required_cols = [
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    ]
+
+    for col in required_cols:
+        if col not in combined.columns:
+            combined[col] = ""
 
     numeric_cols = ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]
     for col in numeric_cols:
         combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype(int)
 
     combined["日期"] = combined["日期"].map(normalize_date_str)
+    combined["權證代號"] = combined["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
+    combined["券商代號"] = combined["券商代號"].astype(str).str.strip()
 
+    # append 後只針對同日同組資料去重，保留最後一筆（也就是本次新抓資料）。
     combined = combined.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
         keep="last"
     )
 
-    combined = combined.sort_values(
+    combined = combined[required_cols].sort_values(
         ["權證代號", "券商代號", "日期"]
     ).reset_index(drop=True)
 
@@ -3969,8 +3995,8 @@ def build_a_events_from_df(item):
 # Step 3b：抓候選組合歷史資料
 # ══════════════════════════════════════════════════════════════════════
 
-def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code):
-    rows = api5_get(warrant_code, broker_code)
+def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code, history_days=None):
+    rows = api5_get(warrant_code, broker_code, days=history_days)
 
     if not rows:
         return None
@@ -7288,6 +7314,196 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     ws.freeze_panes = "A2"
 
+
+
+def _latest_trade_date_from_items(items):
+    latest = None
+
+    for item in items or []:
+        df = item.get("df")
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        for d in df["日期"].dropna().unique():
+            dt = parse_date(d)
+            if not dt:
+                continue
+            if latest is None or dt > latest:
+                latest = dt
+
+    return latest.strftime("%Y/%m/%d") if latest else ""
+
+
+def build_daily_underlying_top20_rows(items, mode="positive", target_date=""):
+    """
+    建立每日標的權證買超 TOP20。
+
+    mode="positive"：單純買超金額排名，只累加每筆買超金額 > 0 的資料。
+    mode="net"：淨買超金額排名，買進金額 - 賣出金額正負都納入。
+
+    資料來源使用目前歷史快取中的分點資料 items。
+    因為每日主流程只更新 OpenAPI 今日有成交權證 + 目標分點候選，
+    所以這張表會隨著 broker_warrant_history_cache.csv 的累積而增加完整度。
+    """
+    if not items:
+        return [], target_date or ""
+
+    if not target_date:
+        target_date = _latest_trade_date_from_items(items)
+
+    if not target_date:
+        return [], ""
+
+    ranking = {}
+
+    for item in items:
+        df = item.get("df")
+        if df is None or df.empty:
+            continue
+
+        wcode = str(item.get("warrant_code", "")).strip()
+        wname = str(item.get("warrant_name", "")).strip()
+        ucode = str(item.get("underlying_code", "")).strip()
+        uname = str(item.get("underlying_name", "")).strip()
+        broker_label = str(item.get("broker_label", "")).strip()
+        broker_name = str(item.get("broker_name", "")).strip()
+
+        if not ucode:
+            continue
+
+        day_df = df[df["日期"].map(normalize_date_str) == target_date].copy()
+        if day_df.empty:
+            continue
+
+        for row in day_df.itertuples(index=False):
+            row_dict = row._asdict()
+            buy_amount = int(row_dict.get("買進金額", 0) or 0)
+            sell_amount = int(row_dict.get("賣出金額", 0) or 0)
+            buy_shares = int(row_dict.get("買進股數", 0) or 0)
+            sell_shares = int(row_dict.get("賣出股數", 0) or 0)
+            net_amount = int(row_dict.get("買超金額", buy_amount - sell_amount) or 0)
+            net_shares = int(row_dict.get("買超股數", buy_shares - sell_shares) or 0)
+
+            if mode == "positive":
+                if net_amount <= 0:
+                    continue
+                add_amount = net_amount
+                add_shares = max(net_shares, 0)
+            else:
+                add_amount = net_amount
+                add_shares = net_shares
+
+            rec = ranking.setdefault((ucode, uname), {
+                "日期": target_date,
+                "標的股": ucode,
+                "標的名稱": uname,
+                "買進金額": 0,
+                "賣出金額": 0,
+                "買超金額": 0,
+                "買進股數": 0,
+                "賣出股數": 0,
+                "買超股數": 0,
+                "涵蓋權證": set(),
+                "明細": [],
+            })
+
+            rec["買進金額"] += buy_amount
+            rec["賣出金額"] += sell_amount
+            rec["買超金額"] += add_amount
+            rec["買進股數"] += buy_shares
+            rec["賣出股數"] += sell_shares
+            rec["買超股數"] += add_shares
+            if wcode:
+                rec["涵蓋權證"].add(wcode)
+
+            if add_amount != 0:
+                rec["明細"].append({
+                    "權證代號": wcode,
+                    "權證名稱": wname,
+                    "分點": broker_label or broker_name,
+                    "金額": add_amount,
+                })
+
+    rows = []
+    for rec in ranking.values():
+        if rec["買超金額"] <= 0:
+            continue
+
+        details = sorted(rec["明細"], key=lambda x: abs(int(x.get("金額", 0))), reverse=True)[:20]
+        detail_text = "；".join([
+            f'{d.get("權證代號", "")} {d.get("權證名稱", "")} {d.get("分點", "")}:{fmt_amount(d.get("金額", 0))}'
+            for d in details
+            if d.get("權證代號")
+        ])
+
+        rows.append({
+            "日期": rec["日期"],
+            "標的股": rec["標的股"],
+            "標的名稱": rec["標的名稱"],
+            "買進金額": rec["買進金額"],
+            "賣出金額": rec["賣出金額"],
+            "買超金額": rec["買超金額"],
+            "買進股數": rec["買進股數"],
+            "賣出股數": rec["賣出股數"],
+            "買超股數": rec["買超股數"],
+            "買超張數": int(rec["買超股數"] // 1000),
+            "涵蓋權證數": len(rec["涵蓋權證"]),
+            "權證買超明細": detail_text,
+        })
+
+    rows = sorted(rows, key=lambda x: int(x.get("買超金額", 0)), reverse=True)[:20]
+
+    for idx, row in enumerate(rows, 1):
+        row["排名"] = idx
+
+    return rows, target_date
+
+
+def write_daily_underlying_top20_sheet(wb, items, mode="positive"):
+    sheet_name = "每日標的買超TOP20" if mode == "positive" else "每日標的淨買超TOP20"
+    ws = wb.create_sheet(sheet_name)
+    rows, target_date = build_daily_underlying_top20_rows(items, mode=mode)
+
+    title = "單純買超金額排名（只累加正買超）" if mode == "positive" else "淨買超金額排名（買進 - 賣出）"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+    ws.cell(1, 1).value = f"{sheet_name}｜{title}｜日期：{target_date or '-'}"
+    ws.cell(1, 1).font = Font(bold=True, size=13, color="000000")
+    ws.cell(1, 1).fill = YELLOW
+    ws.cell(1, 1).alignment = Alignment(horizontal="center", vertical="center")
+
+    headers = [
+        "排名", "日期", "標的股", "標的名稱",
+        "買進金額", "賣出金額", "買超金額",
+        "買進股數", "賣出股數", "買超股數", "買超張數", "涵蓋權證數", "權證買超明細"
+    ]
+    ws.append(headers)
+
+    for row in rows:
+        ws.append([
+            row.get("排名", ""),
+            row.get("日期", ""),
+            row.get("標的股", ""),
+            row.get("標的名稱", ""),
+            int(row.get("買進金額", 0)),
+            int(row.get("賣出金額", 0)),
+            int(row.get("買超金額", 0)),
+            int(row.get("買進股數", 0)),
+            int(row.get("賣出股數", 0)),
+            int(row.get("買超股數", 0)),
+            int(row.get("買超張數", 0)),
+            int(row.get("涵蓋權證數", 0)),
+            row.get("權證買超明細", ""),
+        ])
+
+    col_widths = [8, 12, 10, 14, 14, 14, 14, 14, 14, 14, 10, 12, 80]
+    style_sheet(ws, col_widths, header_row=2)
+    ws.freeze_panes = "A3"
+
+    for row in ws.iter_rows(min_row=3):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        row[12].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
     print("【Step 5】建立 Excel...")
 
@@ -7300,6 +7516,8 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", d_events, price_cache, is_c=True)
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
+    write_daily_underlying_top20_sheet(wb, items, mode="net")
+    write_daily_underlying_top20_sheet(wb, items, mode="positive")
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
@@ -7386,12 +7604,16 @@ def main():
     for c in candidates:
         key = candidate_key_from_tuple(c)
 
-        # 沒有歷史快取：一定要抓
-        # 最近 prescan 有看到目標分點：重新抓 API5，補進最新資料
-        if key not in history_keys or key in PRESCAN_REFRESH_KEYS:
-            candidates_to_fetch.append(c)
+        # 沒有歷史快取：第一次建檔抓三年資料（預設 INITIAL_HISTORY_DAYS=750）。
+        # 已有歷史快取且最近 prescan 有看到目標分點：只抓最近 DAILY_UPDATE_DAYS 筆，append 進歷史快取。
+        if key not in history_keys:
+            candidates_to_fetch.append((c, DAYS_HISTORY, "三年建檔"))
+        elif key in PRESCAN_REFRESH_KEYS:
+            candidates_to_fetch.append((c, DAILY_UPDATE_DAYS, "每日附加"))
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
+    print(f"  ✅ 第一次建檔抓取天數：{DAYS_HISTORY} 筆 / 約 3 年")
+    print(f"  ✅ 既有候選每日附加抓取筆數：{DAILY_UPDATE_DAYS} 筆")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
     fetched_items = []
@@ -7400,8 +7622,8 @@ def main():
     if candidates_to_fetch:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {
-                ex.submit(process_candidate, *c): c
-                for c in candidates_to_fetch
+                ex.submit(process_candidate, *c, history_days=history_days): (c, history_days, fetch_mode)
+                for c, history_days, fetch_mode in candidates_to_fetch
             }
 
             for future in as_completed(futures):
@@ -7424,10 +7646,15 @@ def main():
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         save_history_cache(history_cache_df)
 
-    items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    # 勝率統計與所有報表使用完整歷史快取，而不是只看本次候選。
+    # 這樣第一次三年建檔後，之後每日附加資料不會洗掉舊資料，勝率才會越累積越有意義。
+    items = items_from_history_cache(history_cache_df)
 
     if not items and fetched_items:
         items = fetched_items
+
+    if items:
+        print(f"  ✅ 本次報表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
 
     if not items:
         print("⚠️ 無任何候選資料")
