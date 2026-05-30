@@ -43,7 +43,7 @@ on:
       skip_price_fetch:
         description: "是否跳過價格補抓"
         required: true
-        default: "開"
+        default: "關"
         type: choice
         options:
           - "開"
