@@ -65,7 +65,7 @@ jobs:
 
       # 執行緒設定
       MAX_WORKERS: "60"
-      PRICE_WORKERS: "60"
+      PRICE_WORKERS: "80"
       PRESCAN_WORKERS: "40"
       FIND_BROKER_WORKERS: "40"
 
