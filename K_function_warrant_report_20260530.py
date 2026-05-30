@@ -1069,7 +1069,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
     ax_header.text(0.01, 0.58, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=32, fontweight="bold", ha="left", va="center")
     ax_header.text(0.01, 0.12, f"週報區間：{period}｜資料：相關認購權證 × 全部分點｜資訊僅供教育參考，非投資建議", color=MUTED, fontsize=13, ha="left", va="center")
-    PLACEHOLDER
+    ax_header.text(0.99, 0.58, "By 股市艾斯出品\\n轉傳請註明", color=MUTED, fontsize=14, fontweight="bold", ha="right", va="center")
 
     # Summary cards
     ax_cards = fig.add_subplot(gs[1, :])
