@@ -33,7 +33,7 @@ on:
       daily_update_days:
         description: "每日補抓最近幾筆 API5 資料"
         required: true
-        default: "5"
+        default: "3"
         type: choice
         options:
           - "1"
@@ -58,6 +58,15 @@ on:
           - "本次候選資料"
           - "完整歷史資料"
 
+      price_fetch_scope:
+        description: "價格補抓範圍"
+        required: true
+        default: "只補今日圖片價格"
+        type: choice
+        options:
+          - "只補今日圖片價格"
+          - "完整歷史缺價補抓"
+
   schedule:
     # Asia/Taipei 17:10 = UTC 09:10
     - cron: "10 9 * * 1-5"
@@ -81,7 +90,6 @@ jobs:
       # 分點模式
       # 精選5分點 = RUN_MODE 1
       # 完整分點清單 = RUN_MODE 2
-      # 預設：精選5分點
       RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.broker_mode == '完整分點清單' && '2' || '1' }}
 
       # 執行模式
@@ -90,31 +98,29 @@ jobs:
       #   不重算完整報表、不抓價格、不產完整 Excel 結果表
       # 完整報表重算：
       #   會重算 A/B/C/D、勝率、Excel、Google Sheet 結果表
-      # 預設：完整報表重算
-      DATA_UPDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '每日快速更新' && '1' || '0' }}
+      DATA_UPDATE_ONLY: ${{ github.event_name != 'workflow_dispatch' && '0' || (github.event.inputs.execution_mode == '完整報表重算' && '0' || '1') }}
 
       # 報表資料範圍
       # 本次候選資料：
       #   用這次 OpenAPI + API4 預篩命中的候選組合產生報表
-      #   適合單純產今日候選表，但不建議覆蓋主 A/B/C/D 長期表
+      #   適合每日精選5分點產圖，速度較快，也避免完整歷史互斥規則影響今日明細
       # 完整歷史資料：
       #   用整份快取_分點歷史重算 A/B/C/D 與勝率
-      #   預設使用完整歷史，避免舊資料被洗掉
-      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.report_scope == '本次候選資料' && '0' || '1' }}
+      #   適合週末或手動重算長期勝率，但速度較慢
+      REPORT_FULL_HISTORY: ${{ github.event_name != 'workflow_dispatch' && '1' || (github.event.inputs.report_scope == '完整歷史資料' && '1' || '0') }}
 
       # OpenAPI 今日有成交權證預篩天數
-      # 每日更新建議 1，避免掃太久；真正補資料筆數由 DAILY_UPDATE_DAYS 控制
+      # 每日更新建議 1，避免掃太久
       OPENAPI_ACTIVE_PRESCAN_DAYS: "1"
 
       # 今日活躍權證是否強制重新抓取
-      # 開 = 每次重新抓 OpenAPI + API4 預篩，確保最新資料
+      # 開 = 每次重新抓 OpenAPI + API4 預篩
       # 關 = 同一天重跑時可吃候選快取，比較快
-      # 預設：開
       ACTIVE_WARRANT_FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_refresh == '關' && '0' || '1' }}
 
       # 每日補抓最近幾筆 API5 資料
-      # 預設 5：比 3 更完整，可補回資料延遲或前幾次 Actions 失敗造成的缺口
-      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.daily_update_days || '5' }}
+      # 建議 3，避免前一天 GitHub Actions 失敗或資料延遲造成漏補
+      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.daily_update_days || '3' }}
 
       # 新候選第一次補抓歷史筆數
       # 已完成建檔後，日常可用 250
@@ -128,8 +134,12 @@ jobs:
       # 是否跳過價格補抓
       # 開 = 不補抓 TWSE / TPEx / Yahoo 價格，只使用既有快取_價格，速度較快
       # 關 = 補抓價格，D+1～D+20、標的股股價、5MA、20MA 較完整，但會慢很多
-      # 預設：關，也就是正常抓價格
-      SKIP_PRICE_FETCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_price_fetch == '開' && '1' || '0' }}
+      SKIP_PRICE_FETCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_price_fetch == '關' && '0' || '1' }}
+
+      # 價格補抓範圍
+      # 只補今日圖片價格 = 每日盤後預設，只補 今日_* 本次候選事件需要的價格，主 A/B/C/D 歷史表只用既有快取_價格
+      # 完整歷史缺價補抓 = 手動完整回測用，會補抓主 A/B/C/D + 今日_* 全部事件缺少的價格，速度較慢
+      PRICE_FETCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.price_fetch_scope == '完整歷史缺價補抓' && 'full' || 'today' }}
 
       # 已停用的舊版暴力候選池
       SELECTED_FORCE_ALL_WARRANTS: "0"
@@ -149,9 +159,9 @@ jobs:
       GOOGLE_SHEET_NAME: "權證分點籌碼"
       GSHEET_CACHE_ENABLED: "1"
 
-      # 每日快速更新時，不同步完整結果表
-      # 完整報表重算時，同步 A/B/C/D、勝率統計等結果工作表
-      GSHEET_RESULT_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '每日快速更新' && '0' || '1' }}
+      # 每日快速更新時，不需要同步完整結果表
+      # 完整報表重算時，才同步 A/B/C/D、勝率統計等結果工作表
+      GSHEET_RESULT_ENABLED: ${{ github.event_name != 'workflow_dispatch' && '1' || (github.event.inputs.execution_mode == '完整報表重算' && '1' || '0') }}
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
