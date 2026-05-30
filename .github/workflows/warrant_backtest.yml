@@ -37,8 +37,8 @@ jobs:
 
       # 歷史資料設定
       # 第一次新候選抓較長歷史，之後每日只補最近資料
-      INITIAL_HISTORY_DAYS: "750"
-      DAILY_UPDATE_DAYS: "5"
+      INITIAL_HISTORY_DAYS: "250"
+      DAILY_UPDATE_DAYS: "1"
 
       # 歷史快取改為 append / merge，不覆蓋舊資料
       HISTORY_CACHE_APPEND_ONLY: "1"
@@ -64,7 +64,7 @@ jobs:
       ACTIVE_WARRANT_FORCE_REFRESH: "1"
 
       # 執行緒設定
-      MAX_WORKERS: "50"
+      MAX_WORKERS: "60"
       PRICE_WORKERS: "60"
       PRESCAN_WORKERS: "40"
       FIND_BROKER_WORKERS: "40"
