@@ -8838,6 +8838,131 @@ def build_daily_signal_items_from_history_cache(history_df, broker_map, target_d
     print(f"{prefix}✅ 今日 A/B/C/D 目標日期：{target_date}；後續只輸出事件日 / 結束日為此日期的今日訊號。")
     return items
 
+
+def build_target_date_positive_buy_lots_for_event(event, daily_records, target_date):
+    """
+    每日產圖專用：
+    C / D 事件的成立條件可以使用 3 日 / 10 日歷史資料，
+    但「今日買超明細」顯示的權證清單與買超金額，必須只保留 target_date 當天實際買超的權證。
+
+    修正原因：
+    build_c_events / build_d_events 會把視窗內所有符合累積條件的權證放進 lots。
+    尤其 D 類原本是近 10 日累積淨買進，若不重新過濾，
+    5/26 買進的權證也可能出現在 5/29 今日買超圖卡，造成誤判。
+    """
+    if not event or not daily_records or not target_date:
+        return []
+
+    target_date = normalize_date_str(target_date)
+    broker_code = str(event.get("券商代號", "")).strip()
+    broker_label = str(event.get("分點", "")).strip()
+    underlying_code = str(event.get("標的股", "")).strip()
+    event_warrant_codes = collect_event_warrant_codes([event])
+
+    if not broker_code and not broker_label:
+        return []
+    if not underlying_code:
+        return []
+    if not event_warrant_codes:
+        return []
+
+    lot_map = {}
+
+    for row in daily_records:
+        row_date = normalize_date_str(row.get("日期", ""))
+        if row_date != target_date:
+            continue
+
+        row_broker_code = str(row.get("券商代號", "")).strip()
+        row_broker_label = str(row.get("分點", "")).strip()
+        if broker_code and row_broker_code != broker_code:
+            continue
+        if not broker_code and broker_label and row_broker_label != broker_label:
+            continue
+
+        if str(row.get("標的股", "")).strip() != underlying_code:
+            continue
+
+        row_warrant_code = normalize_warrant_code_for_unique(row.get("權證代號", ""))
+        if row_warrant_code not in event_warrant_codes:
+            continue
+
+        buy_amount = int(row.get("買超金額", 0) or 0)
+        buy_shares = int(row.get("買超股數", 0) or 0)
+
+        # 今日買超明細只保留 target_date 當天實際買超，
+        # 舊日期買進、今日沒買超、或今日為賣超 / 淨賣超者都不能出現在今日買超圖卡。
+        if buy_amount <= 0 or buy_shares <= 0:
+            continue
+
+        key = (row_warrant_code, str(row.get("權證名稱", "")).strip())
+        rec = lot_map.setdefault(key, {
+            "買進日": target_date,
+            "權證代號": row.get("權證代號", ""),
+            "權證名稱": row.get("權證名稱", ""),
+            "金額": 0,
+            "股數": 0,
+        })
+        rec["金額"] += buy_amount
+        rec["股數"] += buy_shares
+
+    lots = []
+    for key in sorted(lot_map.keys()):
+        rec = lot_map[key]
+        if int(rec.get("金額", 0)) > 0 and int(rec.get("股數", 0)) > 0:
+            lots.append(rec)
+
+    return lots
+
+
+def rewrite_today_accum_event_with_target_date_lots(event, today_lots, item_map):
+    """
+    C / D 事件成立條件仍由原本 3 日 / 10 日視窗判斷，
+    但今日圖片與今日_* 工作表的顯示內容改為 target_date 當天實際買超的 lots。
+    """
+    if not event or not today_lots:
+        return None
+
+    new_event = dict(event)
+    new_event["lots"] = today_lots
+    new_event["涵蓋權證數"] = len({normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in today_lots})
+    new_event["權證清單"] = "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in today_lots])
+    new_event["買超金額"] = int(sum(int(lot.get("金額", 0) or 0) for lot in today_lots))
+    new_event["買超股數"] = int(sum(int(lot.get("股數", 0) or 0) for lot in today_lots))
+    new_event["買超張數"] = int(new_event["買超股數"] // 1000)
+
+    if new_event["買超金額"] <= 0 or new_event["買超股數"] <= 0:
+        return None
+
+    # 重新用今日實際買超 lots 模擬後續減碼 / 出清，避免賣方與報酬率引用到舊日期 lots。
+    new_event = simulate_group_outcome(new_event, item_map)
+    return new_event
+
+
+def filter_today_accum_events_to_target_date_buys(events, daily_records, item_map, target_date, context_label="每日產圖", event_code=""):
+    """
+    每日產圖專用過濾：
+    C / D 可用歷史視窗判斷是否符合策略，但進入今日_* 表前，
+    必須確認事件內至少有一檔權證在 target_date 當天實際買超。
+    同時把顯示金額與權證清單改成 target_date 當天買超資料。
+    """
+    prefix = f"【{context_label}】" if context_label else ""
+    kept = []
+    dropped = 0
+
+    for ev in events or []:
+        today_lots = build_target_date_positive_buy_lots_for_event(ev, daily_records, target_date)
+        new_ev = rewrite_today_accum_event_with_target_date_lots(ev, today_lots, item_map)
+        if new_ev is None:
+            dropped += 1
+            continue
+        kept.append(new_ev)
+
+    if event_code:
+        print(f"  ✅ {prefix}今日 {event_code} 類事件當日買超過濾：保留 {len(kept)} 筆，排除非當日買超 {dropped} 筆")
+
+    return kept
+
 def build_today_image_abcd_events_from_items(items, context_label="今日候選", target_date=None):
     """
     今日圖片 / 今日_* 工作表專用 A/B/C/D 建立函式。
@@ -8901,6 +9026,15 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     print(f"{prefix}【Step 3d】建立今日 C 類事件：結束日為今日的 3 日累積買超...")
     c_events = build_c_events(records_for_c, item_map)
     c_events = filter_events_to_target_date(c_events, ["結束日", "事件日"], target_date)
+    # 重要修正：C 類成立可以看 3 日累積，但今日圖卡只顯示 target_date 當天實際買超的權證與金額。
+    c_events = filter_today_accum_events_to_target_date_buys(
+        c_events,
+        daily_records_all,
+        item_map,
+        target_date,
+        context_label=context_label,
+        event_code="C",
+    )
     print(f"  ✅ {prefix}今日 C 類事件：{len(c_events)} 筆")
 
     # D：只用最新交易日往前 D_WINDOW_DAYS 交易日視窗，且只排除今日 A / B / C 用過的權證。
@@ -8915,6 +9049,15 @@ def build_today_image_abcd_events_from_items(items, context_label="今日候選"
     print(f"{prefix}【Step 3e】建立今日 D 類事件：結束日為今日的近 {D_WINDOW_DAYS} 日累積淨買進...")
     d_events = build_d_events(records_for_d, item_map, window_days=D_WINDOW_DAYS)
     d_events = filter_events_to_target_date(d_events, ["結束日", "事件日"], target_date)
+    # 重要修正：D 類成立可以看近 10 日累積淨買進，但今日圖卡只顯示 target_date 當天實際買超的權證與金額。
+    d_events = filter_today_accum_events_to_target_date_buys(
+        d_events,
+        daily_records_all,
+        item_map,
+        target_date,
+        context_label=context_label,
+        event_code="D",
+    )
     print(f"  ✅ {prefix}今日 D 類事件：{len(d_events)} 筆")
 
     print(f"  ✅ {prefix}今日 A 類事件：{len(a_events)} 筆")
