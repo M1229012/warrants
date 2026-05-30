@@ -67,10 +67,18 @@ DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 
-SHEET_A = "A_單檔大買"
-SHEET_B = "B_同標的單日合計"
-SHEET_C = "C_同標的3日累積"
-SHEET_D = "D_近10日累積淨買進"
+# 完整歷史表：給加碼次數、近一個月共識買超、勝率/歷史查詢使用。
+SHEET_A_FULL = os.getenv("SHEET_A_FULL", "A_單檔大買")
+SHEET_B_FULL = os.getenv("SHEET_B_FULL", "B_同標的單日合計")
+SHEET_C_FULL = os.getenv("SHEET_C_FULL", "C_同標的3日累積")
+SHEET_D_FULL = os.getenv("SHEET_D_FULL", "D_近10日累積淨買進")
+
+# 每日產圖表：給今日買賣超圖卡使用。這裡預設讀主程式產出的「今日_*」工作表，
+# 避免圖片誤讀完整歷史 A/B/C/D，導致每日圖卡少資料或吃到舊資料。
+SHEET_A = os.getenv("SHEET_A", "今日_A_單檔大買")
+SHEET_B = os.getenv("SHEET_B", "今日_B_同標的單日合計")
+SHEET_C = os.getenv("SHEET_C", "今日_C_同標的3日累積")
+SHEET_D = os.getenv("SHEET_D", "今日_D_近10日累積淨買進")
 SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
@@ -485,16 +493,17 @@ def build_stock_name_map_from_gsheet() -> dict[str, str]:
                 code = mapped_code
             name_counter[code][name] += 1
 
-    # A 表：直接用權證名稱
-    try:
-        A = read_gsheet_table(SHEET_A, ["標的股", "權證名稱"])
-        for _, r in A.iterrows():
-            add_mapping(r.get("標的股", ""), r.get("權證名稱", ""))
-    except Exception:
-        pass
+    # A 表：直接用權證名稱。今日表與完整歷史表都讀，讓股票名稱對照更完整。
+    for sheet_name in [SHEET_A, SHEET_A_FULL]:
+        try:
+            A = read_gsheet_table(sheet_name, ["標的股", "權證名稱"])
+            for _, r in A.iterrows():
+                add_mapping(r.get("標的股", ""), r.get("權證名稱", ""))
+        except Exception:
+            pass
 
-    # B/C/D：用權證清單
-    for sheet_name in [SHEET_B, SHEET_C, SHEET_D]:
+    # B/C/D：用權證清單。今日表與完整歷史表都讀，避免今日表資料較少時無法反推股名。
+    for sheet_name in [SHEET_B, SHEET_C, SHEET_D, SHEET_B_FULL, SHEET_C_FULL, SHEET_D_FULL]:
         try:
             df = read_gsheet_table(sheet_name, ["標的股", "權證清單"])
             for _, r in df.iterrows():
@@ -520,34 +529,49 @@ def get_stock_name_map() -> dict[str, str]:
 
 
 def infer_latest_date_from_gsheet() -> date:
-    candidates = []
+    """
+    先從每日產圖用的 今日_A/B/C/D 推斷目標日期；
+    若今日表不存在或為空，再退回完整歷史 A/B/C/D。
+    這樣圖片預設會跟每日產圖模式的最新資料一致。
+    """
+    def collect_dates_from_plan(read_plan):
+        candidates = []
+        for sheet, cols in read_plan:
+            try:
+                df = read_gsheet_table(sheet, cols)
+            except Exception:
+                continue
 
-    read_plan = [
+            for c in cols:
+                if c not in df.columns:
+                    continue
+                for v in df[c].dropna().tolist():
+                    d = parse_date_value(v)
+                    if d:
+                        candidates.append(d)
+        return candidates
+
+    today_plan = [
         (SHEET_A, ["買進日", "減碼日", "出清日"]),
         (SHEET_B, ["事件日", "減碼日", "出清日"]),
         (SHEET_C, ["結束日", "減碼日", "出清日"]),
         (SHEET_D, ["結束日", "減碼日", "出清日"]),
     ]
+    full_plan = [
+        (SHEET_A_FULL, ["買進日", "減碼日", "出清日"]),
+        (SHEET_B_FULL, ["事件日", "減碼日", "出清日"]),
+        (SHEET_C_FULL, ["結束日", "減碼日", "出清日"]),
+        (SHEET_D_FULL, ["結束日", "減碼日", "出清日"]),
+    ]
 
-    for sheet, cols in read_plan:
-        try:
-            df = read_gsheet_table(sheet, cols)
-        except Exception:
-            continue
-
-        for c in cols:
-            if c not in df.columns:
-                continue
-            for v in df[c].dropna().tolist():
-                d = parse_date_value(v)
-                if d:
-                    candidates.append(d)
+    candidates = collect_dates_from_plan(today_plan)
+    if not candidates:
+        candidates = collect_dates_from_plan(full_plan)
 
     if not candidates:
         raise RuntimeError("無法從 Google Sheet 推斷日期，請用 TARGET_DATE=YYYY-MM-DD 指定。")
 
     return max(candidates)
-
 
 def read_history_stats_from_gsheet() -> dict:
     """
@@ -692,9 +716,9 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
         counter[(broker, underlying)].add(event_date)
 
-    # A：單檔權證大買
+    # A：單檔權證大買。加碼次數要看完整歷史表，不使用今日表。
     try:
-        A = read_gsheet_table(SHEET_A, ["分點", "標的股", "買進日", "買進金額", "出清日"])
+        A = read_gsheet_table(SHEET_A_FULL, ["分點", "標的股", "買進日", "買進金額", "出清日"])
         for _, r in A.iterrows():
             add_count_event(r, parse_date_value(r.get("買進日")), r.get("買進金額"))
     except Exception:
@@ -702,9 +726,9 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     # B/C/D：同標的合買、3 日累積、10 日累積
     plans = [
-        (SHEET_B, "事件日"),
-        (SHEET_C, "結束日"),
-        (SHEET_D, "結束日"),
+        (SHEET_B_FULL, "事件日"),
+        (SHEET_C_FULL, "結束日"),
+        (SHEET_D_FULL, "結束日"),
     ]
 
     for sheet_name, date_col in plans:
@@ -841,9 +865,9 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
 
     # B/C/D：用權證清單拆出每一檔權證
     plans = [
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
+        (SHEET_B_FULL, "B", "事件日"),
+        (SHEET_C_FULL, "C", "結束日"),
+        (SHEET_D_FULL, "D", "結束日"),
     ]
 
     for sheet_name, event_code, date_col in plans:
@@ -1768,11 +1792,11 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
 def get_buy_event_date(row, sheet_name: str) -> date | None:
     """依事件工作表取得該筆買超事件日期。"""
-    if sheet_name == SHEET_A:
+    if sheet_name in (SHEET_A, SHEET_A_FULL):
         return parse_date_value(row.get("買進日"))
-    if sheet_name == SHEET_B:
+    if sheet_name in (SHEET_B, SHEET_B_FULL):
         return parse_date_value(row.get("事件日"))
-    if sheet_name in [SHEET_C, SHEET_D]:
+    if sheet_name in (SHEET_C, SHEET_D, SHEET_C_FULL, SHEET_D_FULL):
         return parse_date_value(row.get("結束日"))
     return None
 
@@ -1793,10 +1817,10 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
     dates = set()
 
     plans = [
-        (SHEET_A, ["分點", "買進日"]),
-        (SHEET_B, ["分點", "事件日"]),
-        (SHEET_C, ["分點", "結束日"]),
-        (SHEET_D, ["分點", "結束日"]),
+        (SHEET_A_FULL, ["分點", "買進日"]),
+        (SHEET_B_FULL, ["分點", "事件日"]),
+        (SHEET_C_FULL, ["分點", "結束日"]),
+        (SHEET_D_FULL, ["分點", "結束日"]),
     ]
 
     for sheet_name, cols in plans:
@@ -1969,7 +1993,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         # 建立本次 TOP15 統計範圍內的權證白名單。
         # A 表通常是一檔權證；B/C/D 則從權證清單拆出多檔權證。
-        if sheet_name == SHEET_A:
+        if sheet_name in (SHEET_A, SHEET_A_FULL):
             warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
             if warrant_code:
                 counted_warrant_keys.add((broker, warrant_code))
@@ -2001,14 +2025,14 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # A：買超與賣方
     try:
         A = read_gsheet_table(
-            SHEET_A,
+            SHEET_A_FULL,
             ["分點", "標的股", "權證代碼", "權證代號", "權證名稱",
              "買進日", "買進金額", "買進張數",
              "減碼日", "減碼均價", "出清日", "出清均價"]
         )
 
         for _, r in A.iterrows():
-            add_buy_row(SHEET_A, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
+            add_buy_row(SHEET_A_FULL, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
 
         # 賣方扣減改由「每日賣出明細」統一處理，避免 A 類部分減碼被整筆買進張數放大。
     except Exception:
