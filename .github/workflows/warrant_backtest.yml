@@ -20,6 +20,7 @@ jobs:
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
       RUN_MODE: "1"
+      OPENAPI_ACTIVE_PRESCAN_DAYS: "3"
 
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
