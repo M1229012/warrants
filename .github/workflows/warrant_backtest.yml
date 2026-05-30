@@ -2,6 +2,53 @@ name: Warrant Backtest Google Sheet
 
 on:
   workflow_dispatch:
+    inputs:
+      execution_mode:
+        description: "執行模式"
+        required: true
+        default: "每日快速更新"
+        type: choice
+        options:
+          - "每日快速更新"
+          - "完整報表重算"
+
+      broker_mode:
+        description: "分點範圍"
+        required: true
+        default: "精選5分點"
+        type: choice
+        options:
+          - "精選5分點"
+          - "完整分點清單"
+
+      force_refresh:
+        description: "今日活躍權證是否重新抓取"
+        required: true
+        default: "開"
+        type: choice
+        options:
+          - "開"
+          - "關"
+
+      daily_update_days:
+        description: "每日補抓最近幾筆 API5 資料"
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "5"
+
+      skip_price_fetch:
+        description: "是否跳過價格補抓"
+        required: true
+        default: "開"
+        type: choice
+        options:
+          - "開"
+          - "關"
+
   schedule:
     # Asia/Taipei 17:10 = UTC 09:10
     - cron: "10 9 * * 1-5"
@@ -18,39 +65,65 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
 
-      # 快取設定
+      # 基本快取設定
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
 
-      # 是否跳過價格補抓
-      # 1 = 不再補抓 TWSE / TPEx / Yahoo 收盤價，只使用既有「快取_價格」
-      #     優點：每日跑精選 5 分點 ABCD 速度會快很多
-      #     缺點：D+1～D+20、標的股股價、5MA、20MA 可能不完整或顯示 -
-      # 0 = 正常補抓價格，報表較完整，但執行時間會明顯變久
-      # 建議：平常每日排程用 1；需要更新完整價格 / D+ 表現時，手動改成 0 跑一次
-      SKIP_PRICE_FETCH: "1"
-
       # 分點模式
-      # RUN_MODE=1：精選分點
-      # RUN_MODE=2：完整 TARGET_PATTERNS 分點清單
-      RUN_MODE: "1"
+      # 精選5分點 = RUN_MODE 1
+      # 完整分點清單 = RUN_MODE 2
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.broker_mode == '完整分點清單' && '2' || '1' }}
 
-      # OpenAPI 今日有成交權證 + API4 預篩天數
+      # 執行模式
+      # 每日快速更新：
+      #   只抓今日有成交權證 → API4 預篩 → API5 補資料 → append 到快取_分點歷史
+      #   不重算完整報表、不抓價格、不產完整 Excel 結果表
+      # 完整報表重算：
+      #   用快取_分點歷史重算 A/B/C/D、勝率、Excel、Google Sheet 結果表
+      DATA_UPDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '完整報表重算' && '0' || '1' }}
+
+      # 是否使用完整歷史重算報表
+      # 每日快速更新預設 0
+      # 完整報表重算預設 1
+      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '完整報表重算' && '1' || '0' }}
+
+      # OpenAPI 今日有成交權證預篩天數
+      # 每日更新建議 1，避免掃太久
       OPENAPI_ACTIVE_PRESCAN_DAYS: "1"
 
-      # 關閉精選分點 × 全部權證的暴力候選池
-      # 即使 RUN_MODE=2 目前不主要用到，也保留，避免之後切回 RUN_MODE=1 又爆量
+      # 今日活躍權證是否強制重新抓取
+      # 開 = 每次重新抓 OpenAPI + API4 預篩
+      # 關 = 同一天重跑時可吃候選快取，比較快
+      ACTIVE_WARRANT_FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_refresh == '關' && '0' || '1' }}
+
+      # 每日補抓最近幾筆 API5 資料
+      # 建議 3，避免前一天 GitHub Actions 失敗或資料延遲造成漏補
+      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.daily_update_days || '3' }}
+
+      # 新候選第一次補抓歷史筆數
+      # 已完成建檔後，日常可用 250
+      INITIAL_HISTORY_DAYS: "250"
+
+      # 歷史快取 append / merge 保護
+      # 這兩個一定要保留，避免 Google Sheet 舊資料被洗掉
+      HISTORY_CACHE_APPEND_ONLY: "1"
+      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+
+      # 是否跳過價格補抓
+      # 開 = 不補抓 TWSE / TPEx / Yahoo 價格，只使用既有快取_價格，速度較快
+      # 關 = 補抓價格，D+1～D+20、標的股股價、5MA、20MA 較完整，但會慢很多
+      SKIP_PRICE_FETCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_price_fetch == '關' && '0' || '1' }}
+
+      # 已停用的舊版暴力候選池
       SELECTED_FORCE_ALL_WARRANTS: "0"
       SELECTED_REFRESH_ALL_WARRANTS: "0"
 
-      # 歷史資料設定
-      # 第一次新候選抓較長歷史，之後每日只補最近資料
-      INITIAL_HISTORY_DAYS: "250"
-      DAILY_UPDATE_DAYS: "1"
+      # 不抓群組事件每一檔權證價格，只看標的股價格
+      FETCH_GROUP_WARRANT_PRICES: "0"
 
-      # 歷史快取改為 append / merge，不覆蓋舊資料
-      HISTORY_CACHE_APPEND_ONLY: "1"
-      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+      # 保留相容舊設定，不作為主要跳過依據
+      FAST_SKIP_RECENT_PRESCAN: "0"
+      CACHE_RECENT_SCAN_DAYS: "3"
 
       # Google Sheet 設定
       GSHEET_ENABLE: "1"
@@ -58,22 +131,16 @@ jobs:
       GSHEET_NAME: "權證分點籌碼"
       GOOGLE_SHEET_NAME: "權證分點籌碼"
       GSHEET_CACHE_ENABLED: "1"
-      GSHEET_RESULT_ENABLED: "1"
+
+      # 每日快速更新時，不需要同步完整結果表
+      # 完整報表重算時，才同步 A/B/C/D、勝率統計等結果工作表
+      GSHEET_RESULT_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.execution_mode == '完整報表重算' && '1' || '0' }}
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      # 其他流程設定
-      FAST_SKIP_RECENT_PRESCAN: "0"
-      CACHE_RECENT_SCAN_DAYS: "3"
-      FETCH_GROUP_WARRANT_PRICES: "0"
-
-      # 測試每日最新資料速度時可設 1
-      # 平常若想吃同日快取可改 0
-      ACTIVE_WARRANT_FORCE_REFRESH: "1"
-
       # 執行緒設定
       MAX_WORKERS: "60"
-      PRICE_WORKERS: "80"
+      PRICE_WORKERS: "60"
       PRESCAN_WORKERS: "40"
       FIND_BROKER_WORKERS: "40"
 
@@ -85,6 +152,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Restore local cache backup
         uses: actions/cache@v4
@@ -105,7 +173,9 @@ jobs:
           python warrant_backtest.py
 
       - name: Upload Excel artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: warrant-backtest-excel
           path: output/*.xlsx
+          if-no-files-found: ignore
