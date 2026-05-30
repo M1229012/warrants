@@ -3175,6 +3175,57 @@ def items_from_history_cache(history_df, candidate_filter=None):
     return items
 
 
+def filter_history_df_by_active_brokers(history_df, broker_map):
+    """
+    給近兩月排行 / 券商查詢 / 每日賣出明細使用的報表資料範圍。
+
+    修正重點：
+    今日成交量過濾後，A/B/C/D 的事件分析只會使用「今日有成交權證」候選，
+    但原本第二張圖 / TOP15 / 券商查詢 / 近兩月排行不能也被限制成今日有成交權證，
+    否則舊有持倉、近兩月累積買超、券商前 15 名查詢會變空白或嚴重缺資料。
+
+    因此這裡只依照目前 RUN_MODE 的有效分點範圍過濾 history_cache，
+    不依照今日有成交權證過濾。
+    """
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+
+    if not broker_map:
+        return history_df.copy()
+
+    allowed_labels = {str(label).strip() for label in broker_map.keys()}
+    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
+
+    df = history_df.copy().fillna("")
+
+    if "分點" not in df.columns or "券商代號" not in df.columns:
+        return df
+
+    mask = (
+        df["分點"].astype(str).str.strip().isin(allowed_labels)
+        | df["券商代號"].astype(str).str.strip().isin(allowed_codes)
+    )
+
+    return df[mask].copy()
+
+
+def items_from_history_cache_for_reports(history_df, broker_map):
+    """
+    建立報表用完整 items。
+
+    與主流程 items 不同：
+    - 主流程 items：今日有成交權證 × 目前分點，用於 A/B/C/D 與本次 API5 更新。
+    - 報表 items：目前分點的完整歷史快取，不受今日有成交權證限制，
+      用於每日賣出明細、近兩月排行、券商查詢 TOP15。
+    """
+    report_history_df = filter_history_df_by_active_brokers(history_df, broker_map)
+
+    if report_history_df is None or report_history_df.empty:
+        return []
+
+    return items_from_history_cache(report_history_df)
+
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 1：取所有認購權證 + 標的股代號
@@ -6927,7 +6978,7 @@ def collect_recent_trade_date_sets(items, cutoff_dt):
     return last_5_dates, last_20_dates
 
 
-def write_recent_warrant_amount_ranking_sheet(wb, items):
+def write_recent_warrant_amount_ranking_sheet(wb, report_items):
     ws = wb.create_sheet("近兩月買賣金額排行")
 
     headers = [
@@ -7093,7 +7144,7 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
     ws.freeze_panes = "A2"
 
 
-def write_underlying_broker_count_ranking_sheet(wb, items):
+def write_underlying_broker_count_ranking_sheet(wb, report_items):
     ws = wb.create_sheet("近兩月分點數排行")
 
     headers = [
@@ -7302,7 +7353,7 @@ def write_underlying_broker_count_ranking_sheet(wb, items):
 
 
 
-def write_broker_query_sheet(wb, items):
+def write_broker_query_sheet(wb, report_items):
     """
     新增「券商查詢」工作表：
     可用下拉選單選擇券商，並顯示該券商目前「標的股」相關權證總淨買進金額前 15 名。
@@ -7914,7 +7965,7 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events):
     return source_map
 
 
-def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events):
+def write_daily_sell_detail_sheet(wb, report_items, a_events, b_events, c_events, d_events):
     """
     新增「每日賣出明細」工作表。
 
@@ -8164,8 +8215,11 @@ def write_today_underlying_net_buy_top20_sheet(wb, items):
         ws.cell(row_idx, 5).font = Font(bold=True, color="000000")
 
 
-def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
+def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, report_items=None):
     print("【Step 5】建立 Excel...")
+
+    if report_items is None:
+        report_items = items
 
     wb = Workbook()
     default_ws = wb.active
@@ -8176,11 +8230,11 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", d_events, price_cache, is_c=True)
-    write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
+    write_daily_sell_detail_sheet(wb, report_items, a_events, b_events, c_events, d_events)
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
-    write_recent_warrant_amount_ranking_sheet(wb, items)
-    write_underlying_broker_count_ranking_sheet(wb, items)
-    write_broker_query_sheet(wb, items)
+    write_recent_warrant_amount_ranking_sheet(wb, report_items)
+    write_underlying_broker_count_ranking_sheet(wb, report_items)
+    write_broker_query_sheet(wb, report_items)
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
@@ -8313,6 +8367,18 @@ def main():
     if not items and fetched_items:
         items = fetched_items
 
+    # 報表用完整歷史資料：
+    # 今日成交量過濾只應限制本次 A/B/C/D 與 API5 更新候選，
+    # 不能限制近兩月排行、券商查詢 TOP15、每日賣出明細，
+    # 否則原本第二張圖 / TOP15 會因只剩今日有成交權證而變空白。
+    report_items = items_from_history_cache_for_reports(history_cache_df, broker_map)
+
+    if not report_items:
+        report_items = items
+
+    print(f"  ✅ A/B/C/D 本次分析資料：{len(items):,} 組")
+    print(f"  ✅ 近兩月排行 / TOP15 報表資料：{len(report_items):,} 組")
+
     if not items:
         print("⚠️ 無任何候選資料")
         elapsed = time.time() - program_start
@@ -8373,7 +8439,7 @@ def main():
 
     price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
 
-    build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path)
+    build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, report_items=report_items)
     upload_excel_to_google_sheet(output_path)
 
     elapsed = time.time() - program_start
