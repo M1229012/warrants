@@ -22,6 +22,14 @@ jobs:
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
 
+      # 是否跳過價格補抓
+      # 1 = 不再補抓 TWSE / TPEx / Yahoo 收盤價，只使用既有「快取_價格」
+      #     優點：每日跑精選 5 分點 ABCD 速度會快很多
+      #     缺點：D+1～D+20、標的股股價、5MA、20MA 可能不完整或顯示 -
+      # 0 = 正常補抓價格，報表較完整，但執行時間會明顯變久
+      # 建議：平常每日排程用 1；需要更新完整價格 / D+ 表現時，手動改成 0 跑一次
+      SKIP_PRICE_FETCH: "1"
+
       # 分點模式
       # RUN_MODE=1：精選分點
       # RUN_MODE=2：完整 TARGET_PATTERNS 分點清單
