@@ -28,7 +28,7 @@ jobs:
       RUN_MODE: "1"
 
       # OpenAPI 今日有成交權證 + API4 預篩天數
-      OPENAPI_ACTIVE_PRESCAN_DAYS: "3"
+      OPENAPI_ACTIVE_PRESCAN_DAYS: "1"
 
       # 關閉精選分點 × 全部權證的暴力候選池
       # 即使 RUN_MODE=2 目前不主要用到，也保留，避免之後切回 RUN_MODE=1 又爆量
