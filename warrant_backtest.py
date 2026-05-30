@@ -104,6 +104,10 @@ SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
 # OpenAPI 版本預篩天數：只針對「今日有成交認購權證」用 API4 找目標分點候選。
 # 找到候選後才會進 API5；不再建立「權證 × 分點」全組合。
 OPENAPI_ACTIVE_PRESCAN_DAYS = int(os.getenv("OPENAPI_ACTIVE_PRESCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
+# ACTIVE_WARRANT_FORCE_REFRESH=1：每天測試新資料速度時，不沿用候選組合快取，
+# 直接以本次 OpenAPI 今日有成交權證 + API4 預篩命中的候選為準，
+# 避免舊版「今日有成交權證 × 精選分點」的 8~9 萬組候選被快取帶回來。
+ACTIVE_WARRANT_FORCE_REFRESH = os.getenv("ACTIVE_WARRANT_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -244,7 +248,9 @@ def configure_run_mode():
             for label in active_labels
             if label in FULL_FALLBACK
         }
-        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_SELECTED5_PATH
+        # OpenAPI 今日有成交權證版本使用獨立候選快取，
+        # 避免沿用舊版 candidates_cache_selected5.csv 內的「權證 × 5 分點」全組合。
+        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH
         print("  ✅ RUN_MODE=1：精選分點今日有成交權證追蹤模式")
         print(f"  ✅ 精選分點：{', '.join(TARGET_PATTERNS.keys())}")
         print(f"  ✅ 候選快取：{CANDIDATES_CACHE_PATH}")
@@ -3798,17 +3804,15 @@ def prescan_all(warrants, broker_map):
         if normalize_openapi_warrant_code(w.get("代號", ""))
     }
 
-    cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-    cached_candidates = filter_candidates_by_warrant_codes(cached_candidates, active_warrant_codes)
-
     # OpenAPI 版本的關鍵修正：
     # 1. 不再建立「今日有成交權證 × 精選分點」全組合候選池。
-    #    例如 19,153 支權證 × 5 個分點 = 95,765 組 API5，這就是前一版跑很久的原因。
-    # 2. 改成只對 OpenAPI 已篩出的「今日有成交認購權證」做 API4 預篩。
-    # 3. API4 找到目標分點出現後，才把該「權證 × 分點」丟進 API5。
-    # 4. 候選快取使用 OpenAPI 專用檔案，避免沿用舊版 95,000+ 全組合快取。
+    # 2. 不再沿用舊版 candidates_cache_selected5.csv 的全組合快取。
+    # 3. ACTIVE_WARRANT_FORCE_REFRESH=1 時，完全忽略候選快取，只用本次 API4 預篩命中的候選。
+    # 4. 只有 API4 真的看到目標分點的「權證 × 分點」才進 API5。
     scan_days = max(1, int(OPENAPI_ACTIVE_PRESCAN_DAYS))
     print(f"【Step 3a】OpenAPI 今日有成交權證預篩：最近 {scan_days} 天找目標分點候選...")
+    print(f"  ✅ ACTIVE_WARRANT_FORCE_REFRESH={int(ACTIVE_WARRANT_FORCE_REFRESH)}")
+    print(f"  ✅ OpenAPI 今日有成交權證數：{len(active_warrant_codes):,} 支")
 
     recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
     recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
@@ -3816,19 +3820,30 @@ def prescan_all(warrants, broker_map):
 
     PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
 
-    merged_candidates = merge_candidates(cached_candidates, recent_candidates)
-    merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-    merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
+    if ACTIVE_WARRANT_FORCE_REFRESH:
+        # 測試每天新資料速度時，候選池只使用本次預篩結果。
+        # 這裡會覆蓋 OpenAPI 專用候選快取，避免 86,900 / 95,765 這種舊全組合候選再次被帶入。
+        final_candidates = recent_candidates
+        print("  ✅ 強制刷新模式：忽略候選組合快取，只使用本次 OpenAPI + API4 預篩命中候選。")
+    else:
+        cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
+        cached_candidates = filter_candidates_by_warrant_codes(cached_candidates, active_warrant_codes)
+        merged_candidates = merge_candidates(cached_candidates, recent_candidates)
+        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
+        final_candidates = merged_candidates
+        print(
+            f"  ✅ 非強制刷新模式：快取 {len(cached_candidates):,} 組，"
+            f"本次預篩 {len(recent_candidates):,} 組，合併後 {len(final_candidates):,} 組"
+        )
 
-    save_candidates_cache(merged_candidates)
+    save_candidates_cache(final_candidates)
 
-    print(
-        f"  ✅ OpenAPI 候選組合完成：快取 {len(cached_candidates):,} 組，"
-        f"本次預篩 {len(recent_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
-    )
+    print(f"  ✅ OpenAPI 本次預篩命中候選：{len(recent_candidates):,} 組")
+    print(f"  ✅ OpenAPI 最終候選組合：{len(final_candidates):,} 組")
     print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
 
-    return merged_candidates
+    return final_candidates
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -7327,6 +7342,7 @@ def main():
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
     print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點 OpenAPI 今日有成交權證預篩，2=完整分點清單）")
     print(f"OpenAPI 預篩天數：OPENAPI_ACTIVE_PRESCAN_DAYS={OPENAPI_ACTIVE_PRESCAN_DAYS}")
+    print(f"今日活躍權證強制刷新：ACTIVE_WARRANT_FORCE_REFRESH={ACTIVE_WARRANT_FORCE_REFRESH}")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
