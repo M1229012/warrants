@@ -81,6 +81,8 @@ BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "candidates_cache.csv")
 CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
 CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
+# OpenAPI 今日有成交權證版本專用候選快取，避免沿用舊版「全組合」候選快取造成 95,000+ 組 API5 更新。
+CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_openapi_active_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
@@ -99,11 +101,9 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
-# RUN_MODE=1 精選 5 分點完整追蹤設定：
-# SELECTED_FORCE_ALL_WARRANTS=1：不再只靠 API4 prescan 候選，而是直接建立「今日有成交認購權證 × 精選分點」候選池。
-# SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
-SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
-SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+# OpenAPI 版本預篩天數：只針對「今日有成交認購權證」用 API4 找目標分點候選。
+# 找到候選後才會進 API5；不再建立「權證 × 分點」全組合。
+OPENAPI_ACTIVE_PRESCAN_DAYS = int(os.getenv("OPENAPI_ACTIVE_PRESCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -1108,6 +1108,7 @@ CACHE_SHEET_NAME_MAP = {
     "broker_map_cache.csv": "快取_分點代號",
     "candidates_cache.csv": "快取_候選組合",
     "candidates_cache_selected5.csv": "快取_候選組合_精選5",
+    "candidates_cache_openapi_active_selected5.csv": "快取_候選組合_OpenAPI精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
 }
@@ -3786,63 +3787,6 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
 
 
-def build_selected_full_market_candidates(warrants, broker_map):
-    """
-    RUN_MODE=1 精選分點今日有成交權證候選池。
-
-    目的：
-    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
-    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
-
-    這裡改成針對精選分點建立「今日有成交認購權證 × 精選分點」候選組合，
-    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
-    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
-    """
-    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：今日有成交認購權證 × 精選分點...")
-
-    if not warrants or not broker_map:
-        return []
-
-    candidates = []
-    seen = set()
-
-    for w in warrants:
-        warrant_code = str(w.get("代號", "")).strip()
-        warrant_name = str(w.get("名稱", "")).strip()
-        underlying_code = str(w.get("標的股", "")).strip()
-        underlying_name = str(w.get("標的名稱", "")).strip()
-
-        if not warrant_code or not warrant_name:
-            continue
-
-        for label, (broker_name, broker_code) in broker_map.items():
-            broker_code = str(broker_code).strip()
-            if not broker_code:
-                continue
-
-            c = (
-                warrant_code,
-                warrant_name,
-                underlying_code,
-                underlying_name,
-                label,
-                str(broker_name).strip(),
-                broker_code,
-            )
-            key = candidate_key_from_tuple(c)
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-            candidates.append(c)
-
-    print(
-        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
-        f"→ {len(candidates):,} 組候選"
-    )
-    return candidates
-
 
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS
@@ -3857,83 +3801,34 @@ def prescan_all(warrants, broker_map):
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
     cached_candidates = filter_candidates_by_warrant_codes(cached_candidates, active_warrant_codes)
 
-    # RUN_MODE=1 的核心修正：
-    # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
-    # 因為 API4 prescan 可能只回傳部分排行 / 區間資料，會造成今天大額賣超分散在多檔權證時漏抓。
-    # 這裡直接建立「今日有成交認購權證 × 精選分點」候選池，再由 API5 抓完整歷史。
-    if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS:
-        if cached_candidates:
-            print("【Step 3a】讀取精選分點候選組合快取...")
-            print(f"  ✅ 已讀取精選候選組合快取：{len(cached_candidates):,} 組")
+    # OpenAPI 版本的關鍵修正：
+    # 1. 不再建立「今日有成交權證 × 精選分點」全組合候選池。
+    #    例如 19,153 支權證 × 5 個分點 = 95,765 組 API5，這就是前一版跑很久的原因。
+    # 2. 改成只對 OpenAPI 已篩出的「今日有成交認購權證」做 API4 預篩。
+    # 3. API4 找到目標分點出現後，才把該「權證 × 分點」丟進 API5。
+    # 4. 候選快取使用 OpenAPI 專用檔案，避免沿用舊版 95,000+ 全組合快取。
+    scan_days = max(1, int(OPENAPI_ACTIVE_PRESCAN_DAYS))
+    print(f"【Step 3a】OpenAPI 今日有成交權證預篩：最近 {scan_days} 天找目標分點候選...")
 
-        full_selected_candidates = build_selected_full_market_candidates(warrants, broker_map)
-        full_selected_candidates = filter_candidates_by_broker_map(full_selected_candidates, broker_map)
+    recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+    recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
+    recent_candidates = filter_candidates_by_warrant_codes(recent_candidates, active_warrant_codes)
 
-        merged_candidates = merge_candidates(cached_candidates, full_selected_candidates)
-        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
+    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
 
-        if SELECTED_REFRESH_ALL_WARRANTS:
-            # 每次都更新所有精選分點 × 今日有成交權證，確保今日賣超完整。
-            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in full_selected_candidates}
-            print("  ✅ SELECTED_REFRESH_ALL_WARRANTS=1：本次將用 API5 更新所有精選分點完整候選組合。")
-        else:
-            # 若使用者日後想加速，可改成 0，退回只更新 API4 最近掃到的候選；但可能再次漏掉分散式大額賣超。
-            scan_days = SELECTED_FULL_SCAN_DAYS
-            print(f"  🔄 SELECTED_REFRESH_ALL_WARRANTS=0：僅補掃最近 {scan_days} 天 API4 候選，用於加速但完整性較低。")
-            recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
-            recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
-            merged_candidates = merge_candidates(merged_candidates, recent_candidates)
-            merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-            merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
+    merged_candidates = merge_candidates(cached_candidates, recent_candidates)
+    merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+    merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
 
-        save_candidates_cache(merged_candidates)
+    save_candidates_cache(merged_candidates)
 
-        print(
-            f"  ✅ 精選分點候選組合完成：快取 {len(cached_candidates):,} 組，"
-            f"完整候選 {len(full_selected_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
-        )
-        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
+    print(
+        f"  ✅ OpenAPI 候選組合完成：快取 {len(cached_candidates):,} 組，"
+        f"本次預篩 {len(recent_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
+    )
+    print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
 
-        return merged_candidates
-
-    if cached_candidates:
-        print("【Step 3a】讀取候選組合快取...")
-        print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates)} 組")
-
-        if FAST_SKIP_RECENT_PRESCAN:
-            print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前每日主流程仍會補掃今日有成交權證最近資料，避免漏掉新權證 / 新候選組合。")
-
-        # RUN_MODE=2 維持原本完整分點清單邏輯：
-        # 先保留候選組合快取，再用 API4 補掃最近幾天的新候選組合。
-        scan_days = CACHE_RECENT_SCAN_DAYS
-        print(f"  🔄 補掃今日有成交權證最近 {scan_days} 天，用來發現新權證 / 新候選組合...")
-
-        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
-        recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-        PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
-
-        merged_candidates = merge_candidates(cached_candidates, recent_candidates)
-        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
-        save_candidates_cache(merged_candidates)
-
-        print(
-            f"  ✅ 候選組合快取合併完成：舊 {len(cached_candidates)} 組，"
-            f"最近掃到 {len(recent_candidates)} 組，合併後 {len(merged_candidates)} 組"
-        )
-        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
-
-        return merged_candidates
-
-    initial_scan_days = 40
-    candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
-    candidates = filter_candidates_by_broker_map(candidates, broker_map)
-    candidates = filter_candidates_by_warrant_codes(candidates, active_warrant_codes)
-    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
-    save_candidates_cache(candidates)
-    return candidates
+    return merged_candidates
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -7430,7 +7325,8 @@ def main():
     print(f"B：同分點 + 同標的 + 單日多檔權證合計買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"C：同分點 + 同標的 + 連續3交易日多檔權證累積買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
-    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點今日有成交權證追蹤，2=完整分點清單）")
+    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點 OpenAPI 今日有成交權證預篩，2=完整分點清單）")
+    print(f"OpenAPI 預篩天數：OPENAPI_ACTIVE_PRESCAN_DAYS={OPENAPI_ACTIVE_PRESCAN_DAYS}")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
