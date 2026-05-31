@@ -1346,17 +1346,22 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
 
 
 def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
+    # 單張摘要卡片：保留獨立卡片感，並讓上方藏青色 band 與圓角外框貼齊。
+    rounding = 0.026
+    band_h = 0.078
+
     box = FancyBboxPatch(
         (x, y), w, h,
         transform=ax.transAxes,
-        boxstyle="round,pad=0.000,rounding_size=0.025",
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
         facecolor=PANEL2,
         edgecolor=GOLD,
-        linewidth=1.5
+        linewidth=1.25,
+        zorder=1,
     )
     ax.add_patch(box)
 
-    band_h = 0.085
+    # 上方藏青色 band：使用 Rectangle 並裁切到外框圓角，避免左右縮短或圓角不貼合。
     band = Rectangle(
         (x, y + h - band_h),
         w,
@@ -1365,11 +1370,13 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
         facecolor=GOLD,
         edgecolor=GOLD,
         linewidth=0,
-        alpha=0.96
+        alpha=0.96,
+        zorder=2,
     )
     band.set_clip_path(box)
     ax.add_patch(band)
 
+    # 標題
     ax.text(
         x + w / 2,
         y + h - 0.15,
@@ -1378,9 +1385,11 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
         color=MUTED,
         fontsize=29,
         ha="center",
-        va="top"
+        va="top",
+        zorder=4,
     )
 
+    # 數字：固定同一水平線，避免每格看起來不整齊。
     ax.text(
         x + w / 2,
         y + 0.30,
@@ -1390,7 +1399,8 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
         fontsize=42,
         fontweight="bold",
         ha="center",
-        va="center"
+        va="center",
+        zorder=4,
     )
 
     if sub:
@@ -1402,9 +1412,9 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
             color=MUTED,
             fontsize=22,
             ha="center",
-            va="bottom"
+            va="bottom",
+            zorder=4,
         )
-
 
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
@@ -1460,7 +1470,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
 
-    card_w, gap = 0.83, 0.01
+    card_w, gap = 0.158, 0.035
     start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
     for i, (lab, val, sub, col) in enumerate(cards):
         draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
