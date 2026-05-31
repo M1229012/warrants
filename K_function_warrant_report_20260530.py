@@ -66,8 +66,8 @@ WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
 API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
 API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
-API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "12"))
-API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "10"))
+API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
+API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
@@ -1656,6 +1656,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
     wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95, label=line_label)
+    wnet_ax.tick_params(axis="y", labelsize=22)
 
     if len(cum_vals):
         cmax = max(float(np.nanmax(cum_vals)), 0.0)
@@ -1675,7 +1676,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
         wnet_ax2.set_ylim(-zero_frac * scale, (1 - zero_frac) * scale)
     
-    wnet_ax2.tick_params(colors=MUTED, labelsize=18)
+    wnet_ax2.tick_params(colors=MUTED, labelsize=22)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
         spine.set_visible(False)
