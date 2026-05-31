@@ -67,7 +67,7 @@ WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
 API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
 API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
-API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
+API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "250"))
 API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
@@ -971,21 +971,55 @@ def get_openapi_active_call_df() -> pd.DataFrame:
     return active_df
 
 
+
 def normalize_stock_name_text(s: str) -> str:
     return str(s or "").strip().replace(" ", "").replace("　", "")
 
 
+def build_stock_map_from_isin_df(df: pd.DataFrame) -> Dict[str, str]:
+    """從 TWSE ISIN 清單建立「股票名稱 → 股票代號」對照。"""
+    stock_map = {}
+    if df is None or df.empty:
+        return stock_map
+
+    for _, row in df.iterrows():
+        cell = str(row.iloc[0]).strip()
+        if "　" in cell:
+            parts = cell.split("　", 1)
+            code, name = parts[0].strip(), parts[1].strip()
+        else:
+            m = re.match(r"^(\d{4})\s+(.+)$", cell)
+            if not m:
+                continue
+            code, name = m.group(1).strip(), m.group(2).strip()
+
+        if len(code) == 4 and code.isdigit() and name:
+            stock_map[normalize_stock_name_text(name)] = code
+
+    return stock_map
+
+
 def make_stock_aliases(stock_name: str, exact_stock_names=None) -> List[str]:
+    """建立較安全的股名簡稱，用於從權證名稱反推標的。"""
     name = normalize_stock_name_text(stock_name)
     aliases = set([name]) if name else set()
     exact_stock_names = {normalize_stock_name_text(x) for x in (exact_stock_names or set()) if normalize_stock_name_text(x)}
+
     ambiguous_aliases = {
         "台灣", "臺灣", "台股", "臺股", "元大", "富邦", "國泰", "群益",
         "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光",
         "第一", "第一金", "日盛", "華南", "華南永昌",
     }
-    issuer_prefixes = ["元大", "富邦", "國泰", "群益", "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光", "第一金", "日盛", "華南永昌"]
-    suffixes = ["半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療", "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業", "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品", "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥"]
+    issuer_prefixes = [
+        "元大", "富邦", "國泰", "群益", "凱基", "中信", "永豐", "兆豐",
+        "統一", "台新", "復華", "新光", "第一金", "日盛", "華南永昌",
+    ]
+    suffixes = [
+        "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
+        "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業",
+        "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品",
+        "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥",
+    ]
 
     def add_safe_alias(candidate: str) -> None:
         c = normalize_stock_name_text(candidate)
@@ -997,6 +1031,7 @@ def make_stock_aliases(stock_name: str, exact_stock_names=None) -> List[str]:
             return
         aliases.add(c)
 
+    # ETF / 商品權證常見名稱會去掉發行商前綴，例如「元大台灣50」→「台灣50」。
     for issuer in issuer_prefixes:
         if name.startswith(issuer) and len(name) > len(issuer) + 1:
             candidate = name[len(issuer):]
@@ -1014,88 +1049,190 @@ def make_stock_aliases(stock_name: str, exact_stock_names=None) -> List[str]:
                 changed = True
                 break
 
-    # 只補三字以上前綴，避免「昇陽半」誤切成「昇陽」後撞到另一檔股票。
+    # 只補三字以上前綴，避免「昇陽半導體」切成「昇陽」撞到 3266 昇陽。
     for n in range(min(4, len(name)), 2, -1):
         add_safe_alias(name[:n])
+
     return sorted(aliases, key=len, reverse=True)
 
 
-def build_stock_name_map_from_warrant_lookup(lookup: Dict[str, dict]) -> Dict[str, str]:
-    stock_map = {}
-    for rec in lookup.values():
-        ucode = _clean_code(rec.get("underlying_code", ""))
-        uname = normalize_stock_name_text(rec.get("underlying_name", ""))
-        if ucode and uname:
-            stock_map.setdefault(uname, ucode)
-    return stock_map
-
-
-def resolve_underlying_by_warrant_name(warrant_name: str, stock_map: Dict[str, str]) -> Tuple[str, str]:
+def find_underlying_info_from_stock_map(warrant_name: str, stock_map: Dict[str, str]) -> Tuple[str, str]:
+    """從權證名稱反推標的股代號與名稱。"""
     wname = normalize_stock_name_text(warrant_name)
     if not wname or not stock_map:
         return "", ""
-    exact_names = set(stock_map.keys())
+
+    # 第一層：完整股名最長優先，最安全。
+    for stock_name in sorted(stock_map.keys(), key=len, reverse=True):
+        if stock_name and wname.startswith(stock_name):
+            return stock_map[stock_name], stock_name
+
+    # 第二層：用安全簡稱補判斷。
+    exact_stock_names = set(stock_map.keys())
     candidates = []
-    for sname, scode in stock_map.items():
-        for alias in make_stock_aliases(sname, exact_names):
-            if alias and wname.startswith(alias):
-                candidates.append((len(alias), scode, sname))
+    for stock_name, stock_code in stock_map.items():
+        for alias in make_stock_aliases(stock_name, exact_stock_names):
+            alias_norm = normalize_stock_name_text(alias)
+            if alias_norm and wname.startswith(alias_norm):
+                candidates.append((len(alias_norm), len(stock_name), stock_code, stock_name))
+
     if not candidates:
         return "", ""
+
     candidates.sort(reverse=True)
-    _, scode, sname = candidates[0]
-    return scode, sname
+    _, _, stock_code, stock_name = candidates[0]
+    return stock_code, stock_name
+
+
+def get_all_call_warrants_live_isin() -> List[dict]:
+    """
+    參考原權證回測程式的權證母體抓法：
+    不使用 TWSE/TPEx OpenAPI 每日成交資料，而是用 ISIN 清單抓上市 + 上櫃所有目前掛牌認購權證。
+
+    這可以避開 GitHub Actions 執行時 OpenAPI 回傳 0 筆，導致全市場權證快取完全抓不到資料的問題。
+    """
+    print("【Step 1】使用 ISIN 清單取得所有認購權證清單...")
+    warrants = []
+    stock_map = {}
+    all_dfs = []
+
+    isin_modes = [
+        ("上市", "2"),
+        ("上櫃", "4"),
+    ]
+
+    for market_name, mode in isin_modes:
+        try:
+            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+            resp = get_thread_session().get(url, headers={"User-Agent": HDR.get("User-Agent", "Mozilla/5.0")}, timeout=(8, 30))
+            resp.raise_for_status()
+            resp.encoding = "cp950"
+            tables = pd.read_html(io.StringIO(resp.text))
+            if not tables:
+                print(f"  ⚠️ {market_name} ISIN 沒有讀到表格")
+                continue
+            df = tables[0].iloc[2:].reset_index(drop=True)
+            all_dfs.append((market_name, df))
+            stock_map.update(build_stock_map_from_isin_df(df))
+            print(f"  ✅ 已取得{market_name} ISIN 清單：{len(df):,} 筆")
+        except Exception as e:
+            print(f"  ⚠️ {market_name} ISIN 清單取得失敗：{type(e).__name__}: {e}")
+
+    seen_warrants = set()
+    for market_name, df in all_dfs:
+        for _, row in df.iterrows():
+            cell = str(row.iloc[0]).strip()
+            if "　" in cell:
+                parts = cell.split("　", 1)
+                code, name = parts[0].strip(), parts[1].strip()
+            else:
+                m = re.match(r"^(\d{6})\s+(.+)$", cell)
+                if not m:
+                    continue
+                code, name = m.group(1).strip(), m.group(2).strip()
+
+            code = normalize_openapi_warrant_code(code)
+            if not (code and len(code) == 6 and code.isdigit() and "購" in name):
+                continue
+            if "售" in name or "牛" in name or "熊" in name:
+                continue
+            if code in seen_warrants:
+                continue
+
+            seen_warrants.add(code)
+            underlying_code, underlying_name = find_underlying_info_from_stock_map(name, stock_map)
+            warrants.append({
+                "代號": code,
+                "名稱": name,
+                "標的股": underlying_code,
+                "標的名稱": underlying_name,
+                "市場": market_name,
+            })
+
+    print(f"  ✅ 共 {len(warrants):,} 支認購權證（ISIN 上市+上櫃）")
+    return warrants
+
+
+def save_warrant_master_cache_to_gsheet(warrants: List[dict]) -> None:
+    """把 ISIN 取得的權證清單同步到 Google Sheet「快取_權證清單」，供之後標的回補使用。"""
+    if not warrants:
+        return
+    try:
+        df = pd.DataFrame(warrants).fillna("")
+        for c in ["代號", "名稱", "標的股", "標的名稱", "市場"]:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[["代號", "名稱", "標的股", "標的名稱", "市場"]].copy()
+        df["代號"] = df["代號"].map(normalize_openapi_warrant_code)
+        df = df.drop_duplicates(subset=["代號"], keep="last").sort_values("代號").reset_index(drop=True)
+        if _write_dataframe_to_worksheet("快取_權證清單", df):
+            print(f"  💾 已更新快取_權證清單：{len(df):,} 支")
+    except Exception as e:
+        print(f"  ⚠️ 快取_權證清單寫入失敗：{type(e).__name__}: {e}")
 
 
 def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
-    """取得指定標的的最新交易日有成交認購權證；母體是全市場 TWSE + TPEx，不限制任何分點。"""
-    active_df = get_openapi_active_call_df()
-    if active_df is None or active_df.empty:
+    """
+    取得指定標的的全市場認購權證。
+
+    重要修正：
+    - 舊版使用 OpenAPI「最新交易日有成交權證」當母體，OpenAPI 回 0 筆時整個 cache 模式會失敗。
+    - 這版改用原回測程式的 ISIN 上市 + 上櫃所有認購權證清單，再依標的股篩選。
+    - 後續仍然用 MoneyDJ API4 掃該權證所有分點，API5 回查買賣超金額。
+    """
+    stock_code = _clean_code(stock_code)
+    stock_name_norm = normalize_stock_name_text(stock_name)
+
+    warrants_all = get_all_call_warrants_live_isin()
+    if not warrants_all:
+        # ISIN 臨時失敗時，最後才嘗試讀 Google Sheet 快取_權證清單。
+        cached = read_gsheet_worksheet("快取_權證清單")
+        if cached is not None and not cached.empty:
+            warrants_all = []
+            for _, r in cached.fillna("").iterrows():
+                wcode = normalize_openapi_warrant_code(r.get("代號", r.get("權證代號", "")))
+                wname = str(r.get("名稱", r.get("權證名稱", ""))).strip()
+                ucode = _clean_code(r.get("標的股", r.get("標的代號", "")))
+                uname = str(r.get("標的名稱", "")).strip()
+                if wcode and wname:
+                    warrants_all.append({"代號": wcode, "名稱": wname, "標的股": ucode, "標的名稱": uname, "市場": str(r.get("市場", "")).strip()})
+            print(f"  ♻️ 已改用快取_權證清單：{len(warrants_all):,} 支")
+
+    if not warrants_all:
         return []
 
-    lookup = load_warrant_underlying_lookup()
-    stock_map = build_stock_name_map_from_warrant_lookup(lookup)
-    # 把本次查詢標的加入 stock_map，讓第一次沒有舊快取時也能用權證名稱前綴判斷。
-    if stock_name and stock_code:
-        stock_map.setdefault(normalize_stock_name_text(stock_name), str(stock_code))
+    save_warrant_master_cache_to_gsheet(warrants_all)
 
-    aliases = make_stock_aliases(stock_name, exact_stock_names=set(stock_map.keys()))
+    exact_names = {normalize_stock_name_text(w.get("標的名稱", "")) for w in warrants_all if normalize_stock_name_text(w.get("標的名稱", ""))}
+    aliases = make_stock_aliases(stock_name_norm, exact_stock_names=exact_names)
+
     warrants = []
     seen = set()
-    stock_code = str(stock_code).strip()
-
-    for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
-        code = normalize_openapi_warrant_code(r.get("代號"))
-        name = str(r.get("名稱", "")).strip()
-        if not code or code in seen:
-            continue
-
-        cached = lookup.get(code, {})
-        ucode = _clean_code(cached.get("underlying_code", ""))
-        uname = str(cached.get("underlying_name", "")).strip()
-        if not ucode:
-            ucode2, uname2 = resolve_underlying_by_warrant_name(name, stock_map)
-            ucode = ucode2 or ucode
-            uname = uname or uname2
-
+    for w in warrants_all:
+        code = normalize_openapi_warrant_code(w.get("代號", ""))
+        name = str(w.get("名稱", "")).strip()
+        ucode = _clean_code(w.get("標的股", ""))
+        uname = str(w.get("標的名稱", "")).strip()
         name_norm = normalize_stock_name_text(name)
+
+        # 主要用標的股代號，名稱前綴只作為補救。
         name_match = any(alias and name_norm.startswith(alias) for alias in aliases)
         if ucode == stock_code or name_match:
+            if code in seen:
+                continue
             seen.add(code)
             warrants.append({
                 "代號": code,
                 "名稱": name,
                 "標的股": stock_code,
                 "標的名稱": uname or stock_name,
-                "交易日期": str(r.get("交易日期", "")).strip(),
-                "市場": str(r.get("市場", "")).strip(),
-                "成交金額": int(r.get("成交金額", 0) or 0),
-                "成交量": int(r.get("成交量", 0) or 0),
+                "市場": str(w.get("市場", "")).strip(),
             })
 
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-    print(f"✅ {stock_code} 相關有成交認購權證：{len(warrants):,} 支（全市場 TWSE+TPEx 母體）")
+
+    print(f"✅ {stock_code} {stock_name} 相關認購權證：{len(warrants):,} 支（ISIN 全市場母體）")
     return warrants
 
 def api4_get(code, start, end):
@@ -1221,14 +1358,14 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
 def fetch_live_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
     """只抓 live 全市場權證分點資料，不讀 Google Sheet 快取。
 
-    參考原權證回測程式的重點修正：API4 預篩日期要跟 OpenAPI 最新交易日一致，
-    不要在假日或非交易日時用 datetime.today() 去查，否則會掃不到分點。
+    權證母體改用 ISIN 全市場認購權證清單；API4 查詢結束日使用 K 線資料最新日，
+    避免 GitHub Actions 執行當天是假日或 OpenAPI 回 0 筆時整段資料抓不到。
     """
     warrants = get_all_active_call_warrants(stock_code, stock_name)
-    target_dt = parse_date(OPENAPI_LATEST_TRADE_DATE) or pd.Timestamp(end_date).to_pydatetime()
+    target_dt = pd.Timestamp(end_date).to_pydatetime()
     start_s = (target_dt - timedelta(days=max(1, API4_SCAN_CALENDAR_DAYS) - 1)).strftime("%Y/%m/%d")
     end_s = target_dt.strftime("%Y/%m/%d")
-    print(f"✅ API4 全分點掃描日期範圍：{start_s} ~ {end_s}（OpenAPI 最新交易日：{OPENAPI_LATEST_TRADE_DATE or '-'}）")
+    print(f"✅ API4 全分點掃描日期範圍：{start_s} ~ {end_s}（以股價資料最新日為準）")
     pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
     live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
     if live is None or live.empty:
