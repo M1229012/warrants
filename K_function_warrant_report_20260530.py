@@ -1353,7 +1353,7 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
     box = FancyBboxPatch(
         (x, y), w, h,
         transform=ax.transAxes,
-        boxstyle=f"round,pad=0.010,rounding_size={rounding}",
+        boxstyle=f"round,pad=0.004,rounding_size={rounding}",
         facecolor=PANEL2,
         edgecolor=GOLD,
         linewidth=1.25,
@@ -1557,7 +1557,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
 
-    card_w, gap = 0.172, 0.020
+    card_w, gap = 0.158, 0.035
     start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
     for i, (lab, val, sub, col) in enumerate(cards):
         draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
