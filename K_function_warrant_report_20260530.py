@@ -1600,7 +1600,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
     candle_ax.yaxis.tick_right()
     for label in candle_ax.get_yticklabels():
-    label.set_fontweight("bold")
+        label.set_fontweight("bold")
     latest = plot_df.iloc[-1]
     prev_close = plot_df["Close"].iloc[-2] if len(plot_df) >= 2 else latest["Close"]
     diff = latest["Close"] - prev_close
