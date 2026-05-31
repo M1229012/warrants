@@ -82,6 +82,7 @@ SHEET_D = os.getenv("SHEET_D", "今日_D_近10日累積淨買進")
 SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
+SHEET_SOURCE_WARNING = os.getenv("SHEET_SOURCE_WARNING", "資料來源警示")
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
 # 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
@@ -237,6 +238,38 @@ def read_gsheet_table_optional(sheet_name: str, needed_cols: list[str] | None = 
         return read_gsheet_table(sheet_name, needed_cols)
     except Exception:
         return pd.DataFrame()
+
+
+def read_data_source_warning_from_gsheet() -> dict:
+    """讀取主程式輸出的「資料來源警示」工作表，若使用防呆舊資料則在圖卡上標示。"""
+    info = {
+        "used_fallback": False,
+        "latest_trade_date": "",
+        "warning": "",
+        "source_mode": "",
+    }
+
+    try:
+        values = worksheet_values(SHEET_SOURCE_WARNING)
+    except Exception:
+        return info
+
+    for row in values[1:]:
+        if len(row) < 2:
+            continue
+        key = strip_gsheet_text_prefix(row[0]).strip()
+        val = strip_gsheet_text_prefix(row[1]).strip()
+
+        if key == "資料來源模式":
+            info["source_mode"] = val
+        elif key == "是否使用舊資料防呆":
+            info["used_fallback"] = val == "是"
+        elif key == "本次權證成交資料交易日":
+            info["latest_trade_date"] = val
+        elif key == "警示說明":
+            info["warning"] = val
+
+    return info
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1398,7 +1431,7 @@ def make_font(size, bold=False):
     return ImageFont.truetype(get_font_path(bold), size)
 
 
-def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
+def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path, source_warning: dict | None = None):
     """
     Matplotlib 動態版面引擎：
     - 不固定圖片高度
@@ -1583,6 +1616,13 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     text(margin_x + 0.18, y, f"精選 5 家分點｜華南永昌台中、元大南屯、富邦敦南、永豐金內湖、永豐金竹北", 15, NAVY2, BOLD)
     y -= 0.32
     text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣超　單位：萬元", 13, TEXT, BOLD)
+
+    source_warning = source_warning or {}
+    if source_warning.get("used_fallback"):
+        y -= 0.30
+        warn_date = source_warning.get("latest_trade_date") or "-"
+        warn_text = f"⚠️ 注意：官方 OpenAPI 當次無完整資料，本圖使用防呆快取資料｜資料日期：{warn_date}"
+        text(margin_x + 0.18, y, warn_text, 13.5, "#B45309", BOLD)
 
     # ─────────────────────────────────────────────
     # KPI cards
@@ -2367,6 +2407,7 @@ def main():
 
     history = read_history_stats_from_gsheet()
     buys, sells = extract_actions_from_gsheet(target)
+    source_warning = read_data_source_warning_from_gsheet()
 
     print(
         f"Google Sheet：{GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME}\n"
@@ -2378,7 +2419,7 @@ def main():
         f"輸出圖檔2：{consensus_output_path}"
     )
 
-    draw_report_image(target, buys, sells, history, output_path)
+    draw_report_image(target, buys, sells, history, output_path, source_warning=source_warning)
     draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
 
     if args.no_discord:
