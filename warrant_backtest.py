@@ -4551,12 +4551,24 @@ def find_broker_codes(warrants):
 # Step 3a：預篩有目標分點出現的 (權證, 分點) 組合
 # ══════════════════════════════════════════════════════════════════════
 
-def prescan_all_live(warrants, broker_map, scan_days=40):
+def prescan_all_live(warrants, broker_map, scan_days=40, target_date=None):
     print("【Step 3a】預篩：找有目標分點的權證...")
 
-    today = datetime.today()
-    end_s   = today.strftime("%Y/%m/%d")
-    start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
+    # 重要：API4 預篩日期必須跟 OpenAPI 權證清單的交易日期一致。
+    # 假日測試或使用 OPENAPI_TWSE/TPEX_FALLBACK_FILE 時，datetime.today() 可能是週末或非交易日，
+    # 若仍用今天日期查 API4，會得到 0 組候選。
+    # 因此優先使用 OpenAPI_DATA_SOURCE_INFO['latest_trade_date'] / target_date 作為 API4 查詢結束日。
+    target_date = normalize_date_str(target_date or OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", ""))
+    target_dt = parse_date(target_date)
+
+    if target_dt is None:
+        target_dt = datetime.today()
+
+    scan_days = max(1, int(scan_days or 1))
+    end_s = target_dt.strftime("%Y/%m/%d")
+    start_s = (target_dt - timedelta(days=scan_days - 1)).strftime("%Y/%m/%d")
+
+    print(f"  ✅ API4 預篩日期範圍：{start_s} ~ {end_s}")
 
     broker_codes_set = {code for _, code in broker_map.values()}
     code_to_label    = {code: label for label, (_, code) in broker_map.items()}
@@ -4632,7 +4644,13 @@ def prescan_all(warrants, broker_map):
     print(f"  ✅ ACTIVE_WARRANT_FORCE_REFRESH={int(ACTIVE_WARRANT_FORCE_REFRESH)}")
     print(f"  ✅ OpenAPI 今日有成交權證數：{len(active_warrant_codes):,} 支")
 
-    recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+    api4_target_date = (
+        OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", "")
+        or latest_trade_date_from_warrants(warrants)
+    )
+    print(f"  ✅ API4 預篩目標交易日：{api4_target_date or '-'}")
+
+    recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days, target_date=api4_target_date)
     recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
     recent_candidates = filter_candidates_by_warrant_codes(recent_candidates, active_warrant_codes)
 
