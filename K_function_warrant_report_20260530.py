@@ -1400,8 +1400,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
-    ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
+    ax_cards = fig.add_subplot(gs[1, :]) 
+    ax_cards.set_axis_off()
+
     card_w, gap = 0.175, 0.015
+    start_x = (1 - (5 * card_w + 4 * gap)) / 2
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
         ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
