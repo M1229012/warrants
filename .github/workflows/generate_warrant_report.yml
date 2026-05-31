@@ -25,6 +25,9 @@ jobs:
       GSHEET_NAME: "權證分點籌碼"
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
+      # FinMind 設定：三大法人資料來源
+      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
@@ -53,6 +56,10 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2
+
+      - name: Check FinMind token
+        run: |
+          python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
 
       - name: Run warrant report test
         run: python run_report.py
