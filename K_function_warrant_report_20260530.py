@@ -1620,8 +1620,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_lots = plot_df["Volume"] / 1000
     vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
-    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.2, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.2, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
     vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
     vol_ax.yaxis.tick_right()
 
@@ -1646,7 +1646,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
-    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label=line_label)
+    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95, label=line_label)
     
     if len(cum_vals):
         cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
