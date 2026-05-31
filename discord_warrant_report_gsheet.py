@@ -1856,47 +1856,18 @@ def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
 
 def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> list[date]:
     """
-    取得 TOP15 統計用的近 N 個有效交易日。
+    從 A/B/C/D 買超事件中抓出 <= target 的有效事件日期，
+    再往前取最近 N 個「有資料的交易日」。
 
-    修正版重點：
-    - 優先從「快取_分點歷史」抓交易日，因為這張是原始 API5 歷史資料，
-      每日產圖模式一定會更新，且不會因 A/B/C/D 完整表尚未同步完成而抓不到日期。
-    - 若「快取_分點歷史」讀不到，才退回 A/B/C/D 與 今日_A/B/C/D 事件表抓日期。
-
-    這可以避免每日產圖模式中，TOP15 出現「近 0 個有效交易日 / 無有效期間」的問題。
+    這樣春節、連假、休市時不會因為日曆天不足而失真。
     """
-    dates: set[date] = set()
+    dates = set()
 
-    # 1) 優先用原始歷史快取取得有效交易日。
-    try:
-        hist_df = read_gsheet_table_optional(SHEET_HISTORY, ["日期", "分點"])
-        if not hist_df.empty and "日期" in hist_df.columns:
-            for _, r in hist_df.iterrows():
-                d = parse_date_value(r.get("日期"))
-                if d and d <= target:
-                    dates.add(d)
-    except Exception:
-        pass
-
-    if dates:
-        result = sorted(dates, reverse=True)[:lookback_days]
-        print(
-            f"TOP15 統計交易日來源：{SHEET_HISTORY}，"
-            f"近 {len(result)} 個有效交易日"
-            + (f"，期間 {min(result):%Y/%m/%d} ~ {max(result):%Y/%m/%d}" if result else "")
-        )
-        return result
-
-    # 2) 備援：從 A/B/C/D 事件表與今日事件表取得有效交易日。
     plans = [
         (SHEET_A_FULL, ["分點", "買進日"]),
         (SHEET_B_FULL, ["分點", "事件日"]),
         (SHEET_C_FULL, ["分點", "結束日"]),
         (SHEET_D_FULL, ["分點", "結束日"]),
-        (SHEET_A, ["分點", "買進日"]),
-        (SHEET_B, ["分點", "事件日"]),
-        (SHEET_C, ["分點", "結束日"]),
-        (SHEET_D, ["分點", "結束日"]),
     ]
 
     for sheet_name, cols in plans:
@@ -1910,12 +1881,7 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
             if d and d <= target:
                 dates.add(d)
 
-    result = sorted(dates, reverse=True)[:lookback_days]
-    print(
-        f"TOP15 統計交易日來源：A/B/C/D 事件表，近 {len(result)} 個有效交易日"
-        + (f"，期間 {min(result):%Y/%m/%d} ~ {max(result):%Y/%m/%d}" if result else "")
-    )
-    return result
+    return sorted(dates, reverse=True)[:lookback_days]
 
 
 def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
@@ -1938,7 +1904,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     date_set = set(trading_dates)
 
     if not trading_dates:
-        print("⚠️ TOP15 找不到有效交易日，請確認快取_分點歷史 / A/B/C/D 工作表是否已同步到 Google Sheet。")
         return [], []
 
     agg = {}
@@ -1947,7 +1912,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
-    seen_buy_event_keys: set[tuple] = set()
 
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
@@ -2061,18 +2025,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if not item:
             return
 
-        # 同一事件若同時存在於完整表與今日表，只計算一次。
-        if sheet_name in (SHEET_A, SHEET_A_FULL):
-            dedup_warrant = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
-            buy_key = (event_code, broker, code, event_date.isoformat(), dedup_warrant, round(amount, 4))
-        else:
-            warrant_codes_for_key = tuple(wc for wc, _ in parse_warrant_items_from_text(warrant_text))
-            buy_key = (event_code, broker, code, event_date.isoformat(), warrant_codes_for_key, round(amount, 4))
-
-        if buy_key in seen_buy_event_keys:
-            return
-        seen_buy_event_keys.add(buy_key)
-
         item["amount"] += amount
         item["net_amount"] += amount
         item["count"] += 1
@@ -2117,76 +2069,28 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         agg[code]["net_amount"] -= amount
         agg[code]["broker_net_amounts"][broker] -= amount
 
-    # 判斷 TOP15 是否需要補讀今日表。
-    # 正確版 TOP15 應以完整 A/B/C/D 表為主。
-    # 只有當完整表尚未包含 target 日期時，才用 今日_A/B/C/D 補上每日產圖剛產生的 target 日資料。
-    # 避免完整表已含 target，卻又合併 今日_*，造成邊界金額些微重複、排名與正確版不一致。
-    full_event_dates: set[date] = set()
-    full_date_plans = [
-        (SHEET_A_FULL, "買進日"),
-        (SHEET_B_FULL, "事件日"),
-        (SHEET_C_FULL, "結束日"),
-        (SHEET_D_FULL, "結束日"),
-    ]
-    for full_sheet_name, full_date_col in full_date_plans:
-        try:
-            full_date_df = read_gsheet_table(full_sheet_name, ["分點", full_date_col])
-        except Exception:
-            continue
-        if full_date_df.empty or full_date_col not in full_date_df.columns:
-            continue
-        for _, _r in full_date_df.iterrows():
-            _d = parse_date_value(_r.get(full_date_col))
-            if _d and _d <= target:
-                full_event_dates.add(_d)
-
-    full_max_date = max(full_event_dates) if full_event_dates else None
-    use_today_event_sheets = not full_max_date or full_max_date < target
-    if use_today_event_sheets:
-        print(
-            "TOP15 事件來源：完整 A/B/C/D 尚未包含目標日，"
-            f"使用 今日_A/B/C/D 補上 {target:%Y/%m/%d}；"
-            f"完整表最新日：{full_max_date:%Y/%m/%d}" if full_max_date else
-            f"TOP15 事件來源：完整 A/B/C/D 無有效日期，使用 今日_A/B/C/D 補上 {target:%Y/%m/%d}"
-        )
-    else:
-        print(
-            "TOP15 事件來源：完整 A/B/C/D 已包含目標日，"
-            f"只使用完整表計算，不合併今日表；完整表最新日：{full_max_date:%Y/%m/%d}"
-        )
-
     # A：買超與賣方
-    # TOP15 以完整表為主；只有完整表未包含 target 時才補今日表。
-    a_source_sheets = [SHEET_A_FULL] + ([SHEET_A] if use_today_event_sheets else [])
-    for sheet_name in a_source_sheets:
-        try:
-            A = read_gsheet_table(
-                sheet_name,
-                ["分點", "標的股", "權證代碼", "權證代號", "權證名稱",
-                 "買進日", "買進金額", "買進張數",
-                 "減碼日", "減碼均價", "出清日", "出清均價"]
-            )
+    try:
+        A = read_gsheet_table(
+            SHEET_A_FULL,
+            ["分點", "標的股", "權證代碼", "權證代號", "權證名稱",
+             "買進日", "買進金額", "買進張數",
+             "減碼日", "減碼均價", "出清日", "出清均價"]
+        )
 
-            for _, r in A.iterrows():
-                add_buy_row(sheet_name, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
+        for _, r in A.iterrows():
+            add_buy_row(SHEET_A_FULL, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
 
-            # 賣方扣減改由「每日賣出明細」統一處理，避免 A 類部分減碼被整筆買進張數放大。
-        except Exception:
-            pass
+        # 賣方扣減改由「每日賣出明細」統一處理，避免 A 類部分減碼被整筆買進張數放大。
+    except Exception:
+        pass
 
     # B/C/D：買超與賣方
-    # TOP15 以完整表為主；只有完整表未包含 target 時才補今日表。
     plans = [
-        (SHEET_B_FULL, "B", "事件日"),
-        (SHEET_C_FULL, "C", "結束日"),
-        (SHEET_D_FULL, "D", "結束日"),
+        (SHEET_B, "B", "事件日"),
+        (SHEET_C, "C", "結束日"),
+        (SHEET_D, "D", "結束日"),
     ]
-    if use_today_event_sheets:
-        plans.extend([
-            (SHEET_B, "B", "事件日"),
-            (SHEET_C, "C", "結束日"),
-            (SHEET_D, "D", "結束日"),
-        ])
 
     for sheet_name, event_code, date_col in plans:
         try:
