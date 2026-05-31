@@ -66,8 +66,8 @@ WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
 API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
 API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
-API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
-API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
+API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "12"))
+API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "10"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
@@ -83,6 +83,9 @@ HEDGE_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_HEDGE_MIN_SIDE_AMOUNT", "100000
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
+FULL_MARKET_CACHE_SHEET = os.getenv("WARRANT_FULL_MARKET_CACHE_SHEET", "快取_全市場分點歷史").strip()
+LEGACY_CACHE_SHEET = os.getenv("WARRANT_LEGACY_CACHE_SHEET", "快取_分點歷史").strip()
+USE_LEGACY_CACHE = os.getenv("WARRANT_USE_LEGACY_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 _THREAD_LOCAL = threading.local()
 
@@ -442,134 +445,24 @@ def _to_lots(series: pd.Series) -> pd.Series:
     return s
 
 
-def _classify_finmind_inst_name(name) -> str:
-    """將 FinMind 三大法人分類名稱統一成 foreign / invest / dealer。"""
-    s = str(name or "").strip().lower()
-    if not s:
-        return ""
-    if "investment_trust" in s or "投信" in s:
-        return "invest"
-    if "dealer" in s or "自營" in s:
-        return "dealer"
-    if "foreign" in s or "外資" in s or "陸資" in s:
-        return "foreign"
-    return ""
-
-
-def _pick_existing_col(df: pd.DataFrame, candidates: List[str]) -> str:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return ""
-
-
-def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
-    """
-    直接使用 FINMIND_API_TOKEN 從 FinMind API 抓三大法人買賣超。
-    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
-    """
-    token = os.getenv("FINMIND_API_TOKEN", "").strip()
-    if not token:
-        print("⚠️ 未設定 FINMIND_API_TOKEN，略過 FinMind 三大法人資料")
-        return pd.DataFrame()
-
-    try:
-        end_dt = datetime.today()
-        start_dt = end_dt - timedelta(days=max(int(days * 2.8), 120))
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {
-            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-            "data_id": str(stock_code).strip(),
-            "start_date": start_dt.strftime("%Y-%m-%d"),
-            "end_date": end_dt.strftime("%Y-%m-%d"),
-            "token": token,
-        }
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": HDR["User-Agent"],
-        }
-        resp = requests.get(url, params=params, headers=headers, timeout=(8, 30))
-        resp.raise_for_status()
-        payload = resp.json()
-        data = payload.get("data", []) if isinstance(payload, dict) else payload
-        if not data:
-            msg = payload.get("msg", "") if isinstance(payload, dict) else ""
-            print(f"⚠️ FinMind 三大法人資料為空：{stock_code} {msg}")
-            return pd.DataFrame()
-
-        raw = pd.DataFrame(data).fillna(0)
-        date_col = _pick_existing_col(raw, ["date", "Date", "日期"])
-        name_col = _pick_existing_col(raw, ["name", "institutional_investor", "investor", "type", "category", "法人"])
-        net_col = _pick_existing_col(raw, ["net", "buy_sell", "buy_sell_amount", "買賣超", "買賣超股數"])
-        buy_col = _pick_existing_col(raw, ["buy", "buy_amount", "buy_volume", "買進", "買進股數"])
-        sell_col = _pick_existing_col(raw, ["sell", "sell_amount", "sell_volume", "賣出", "賣出股數"])
-
-        if not date_col or not name_col:
-            print(f"⚠️ FinMind 三大法人欄位不符：{raw.columns.tolist()}")
-            return pd.DataFrame()
-
-        tmp = raw.copy()
-        tmp["Date"] = pd.to_datetime(tmp[date_col], errors="coerce")
-        tmp = tmp.dropna(subset=["Date"])
-        tmp["inst_group"] = tmp[name_col].map(_classify_finmind_inst_name)
-        tmp = tmp[tmp["inst_group"].isin(["foreign", "invest", "dealer"])]
-        if tmp.empty:
-            print(f"⚠️ FinMind 三大法人分類不到外資/投信/自營商：{stock_code}")
-            return pd.DataFrame()
-
-        if net_col:
-            tmp["net_value"] = pd.to_numeric(tmp[net_col], errors="coerce").fillna(0.0)
-        elif buy_col and sell_col:
-            tmp["net_value"] = (
-                pd.to_numeric(tmp[buy_col], errors="coerce").fillna(0.0)
-                - pd.to_numeric(tmp[sell_col], errors="coerce").fillna(0.0)
-            )
-        else:
-            print(f"⚠️ FinMind 三大法人找不到買賣超或買進/賣出欄位：{raw.columns.tolist()}")
-            return pd.DataFrame()
-
-        grouped = tmp.groupby(["Date", "inst_group"], as_index=False)["net_value"].sum()
-        pivot = grouped.pivot(index="Date", columns="inst_group", values="net_value").fillna(0.0)
-        for c in ["foreign", "invest", "dealer"]:
-            if c not in pivot.columns:
-                pivot[c] = 0.0
-
-        out = pivot.reset_index()[["Date", "foreign", "invest", "dealer"]].copy()
-        out["foreign"] = _to_lots(out["foreign"])
-        out["invest"] = _to_lots(out["invest"])
-        out["dealer"] = _to_lots(out["dealer"])
-        out["total"] = out["foreign"] + out["invest"] + out["dealer"]
-        out = out.sort_values("Date").tail(days).reset_index(drop=True)
-        print(f"✅ FinMind 三大法人資料：{stock_code}，{len(out):,} 筆")
-        return out[["Date", "foreign", "invest", "dealer", "total"]]
-    except Exception as e:
-        print(f"⚠️ FinMind 三大法人資料抓取失敗：{e}")
-        return pd.DataFrame()
-
-
 def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     """
-    優先使用 FINMIND_API_TOKEN 直接從 FinMind API 抓三大法人資料。
-    若環境變數未設定或 API 失敗，才使用 X_function 備援。
+    從 X_function.get_institutional_stats_finmind 取回法人資料。
     回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
     """
-    out = fetch_inst_60d_from_finmind_token(stock_code, days=days)
-    if out is not None and not out.empty:
-        return out
-
     if get_institutional_stats_finmind is None:
-        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，且 FinMind 未取得資料，略過三大法人資料")
+        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，略過三大法人資料")
         return pd.DataFrame()
     try:
         inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
     except Exception as e:
-        print(f"⚠️ X_function 三大法人資料抓取失敗：{e}")
+        print(f"⚠️ 三大法人資料抓取失敗：{e}")
         return pd.DataFrame()
     if inst is None or inst.empty:
         return pd.DataFrame()
     need_cols = {"date", "外資", "投信", "自營商"}
     if not need_cols.issubset(inst.columns):
-        print(f"⚠️ X_function 法人資料欄位不符：{inst.columns.tolist()}")
+        print(f"⚠️ 法人資料欄位不符：{inst.columns.tolist()}")
         return pd.DataFrame()
     out = inst.copy()
     out["Date"] = pd.to_datetime(out["date"], errors="coerce")
@@ -579,7 +472,6 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     out["dealer"] = _to_lots(out["自營商"])
     out["total"] = out["foreign"] + out["invest"] + out["dealer"]
     out = out.sort_values("Date").tail(days).reset_index(drop=True)
-    print(f"✅ X_function 三大法人備援資料：{stock_code}，{len(out):,} 筆")
     return out[["Date", "foreign", "invest", "dealer", "total"]]
 
 
@@ -729,8 +621,12 @@ def normalize_history_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    raw = read_gsheet_worksheet("快取_分點歷史")
+    raw = read_gsheet_worksheet(FULL_MARKET_CACHE_SHEET)
     events = normalize_history_cache_df(raw)
+    if events.empty and USE_LEGACY_CACHE:
+        print(f"⚠️ {FULL_MARKET_CACHE_SHEET} 沒有命中，改用舊快取表 {LEGACY_CACHE_SHEET}")
+        raw = read_gsheet_worksheet(LEGACY_CACHE_SHEET)
+        events = normalize_history_cache_df(raw)
     if events.empty:
         return pd.DataFrame()
     stock_code = _clean_code(stock_code)
@@ -744,7 +640,7 @@ def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None)
 
 def load_warrant_underlying_lookup() -> Dict[str, dict]:
     lookup = {}
-    for sheet_name in ["快取_權證清單", "快取_分點歷史", "快取_候選組合_OpenAPI精選5", "快取_候選組合", "快取_候選組合_精選5"]:
+    for sheet_name in ["快取_權證清單", FULL_MARKET_CACHE_SHEET, LEGACY_CACHE_SHEET, "快取_候選組合_OpenAPI精選5", "快取_候選組合", "快取_候選組合_精選5"]:
         df = read_gsheet_worksheet(sheet_name)
         if df is None or df.empty:
             continue
@@ -758,6 +654,103 @@ def load_warrant_underlying_lookup() -> Dict[str, dict]:
             rec["underlying_name"] = rec["underlying_name"] or str(r.get("標的名稱", "")).strip()
     return lookup
 
+
+
+# ============================================================
+# Google Sheet 全市場分點快取寫入
+# ============================================================
+
+CACHE_COLUMNS = [
+    "日期",
+    "標的股",
+    "標的名稱",
+    "權證代號",
+    "權證名稱",
+    "券商代號",
+    "分點",
+    "分點名稱",
+    "買進金額",
+    "賣出金額",
+    "買超金額",
+    "資料來源",
+    "更新時間",
+]
+
+
+def _get_or_create_worksheet(sh, title: str, rows: int = 1000, cols: int = 20):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def warrant_events_to_cache_df(events: pd.DataFrame, source: str = "full_market_live") -> pd.DataFrame:
+    if events is None or events.empty:
+        return pd.DataFrame(columns=CACHE_COLUMNS)
+    df = events.copy().fillna("")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    if df.empty:
+        return pd.DataFrame(columns=CACHE_COLUMNS)
+    now_s = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    out = pd.DataFrame()
+    out["日期"] = df["Date"].dt.strftime("%Y/%m/%d")
+    out["標的股"] = df.get("underlying_code", "").astype(str).map(_clean_code)
+    out["標的名稱"] = df.get("underlying_name", "").astype(str).str.strip()
+    out["權證代號"] = df.get("warrant_code", "").map(normalize_openapi_warrant_code)
+    out["權證名稱"] = df.get("warrant_name", "").astype(str).str.strip()
+    out["券商代號"] = df.get("broker_code", "").astype(str).str.strip()
+    out["分點"] = df.get("branch", "").astype(str).str.strip()
+    out["分點名稱"] = out["分點"]
+    out["買進金額"] = pd.to_numeric(df.get("buy_amount", 0), errors="coerce").fillna(0).astype(float).round(0).astype(int)
+    out["賣出金額"] = pd.to_numeric(df.get("sell_amount", 0), errors="coerce").fillna(0).astype(float).round(0).astype(int)
+    out["買超金額"] = pd.to_numeric(df.get("net_amount", 0), errors="coerce").fillna(0).astype(float).round(0).astype(int)
+    out["資料來源"] = source
+    out["更新時間"] = now_s
+    out = out[(out["權證代號"].astype(str).str.len() > 0) & (out["分點"].astype(str).str.len() > 0)].copy()
+    return out[CACHE_COLUMNS]
+
+
+def upsert_full_market_cache_to_gsheet(events: pd.DataFrame, sheet_name: str = FULL_MARKET_CACHE_SHEET) -> int:
+    """將全市場權證分點買賣超資料 upsert 到 Google Sheet。"""
+    new_df = warrant_events_to_cache_df(events)
+    if new_df.empty:
+        print("⚠️ 沒有可寫入 Google Sheet 的全市場分點資料")
+        return 0
+
+    sh = _open_gsheet()
+    if sh is None:
+        print("❌ 無法開啟 Google Sheet，無法寫入全市場分點快取")
+        return 0
+
+    ws = _get_or_create_worksheet(sh, sheet_name, rows=max(len(new_df) + 100, 1000), cols=len(CACHE_COLUMNS) + 2)
+    try:
+        records = ws.get_all_records(empty2zero=False, head=1)
+        old_df = pd.DataFrame(records).fillna("") if records else pd.DataFrame(columns=CACHE_COLUMNS)
+    except Exception:
+        old_df = pd.DataFrame(columns=CACHE_COLUMNS)
+
+    for c in CACHE_COLUMNS:
+        if c not in old_df.columns:
+            old_df[c] = ""
+    old_df = old_df[CACHE_COLUMNS]
+
+    merged = pd.concat([old_df, new_df], ignore_index=True, sort=False).fillna("")
+    # 唯一鍵：同一天、同權證、同券商代號、同分點，只保留最後一次更新。
+    key_cols = ["日期", "權證代號", "券商代號", "分點"]
+    merged = merged.drop_duplicates(subset=key_cols, keep="last")
+    merged = merged.sort_values(["日期", "標的股", "權證代號", "券商代號", "分點"]).reset_index(drop=True)
+
+    values = [CACHE_COLUMNS] + merged.astype(str).values.tolist()
+    try:
+        ws.clear()
+        ws.resize(rows=max(len(values) + 50, 1000), cols=len(CACHE_COLUMNS))
+        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+        print(f"✅ 已寫入 {sheet_name}：新增/更新 {len(new_df):,} 筆，表內總筆數 {len(merged):,} 筆")
+        return len(new_df)
+    except Exception as e:
+        print(f"❌ 寫入 {sheet_name} 失敗：{e}")
+        return 0
 
 # ============================================================
 # 權證全市場分點資料：OpenAPI 權證母體 + API4 分點 + API5 金額
@@ -996,6 +989,44 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
     return df.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
 
 
+
+def fetch_live_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
+    """只抓 live 全市場權證分點資料，不讀 Google Sheet 快取。"""
+    end_dt = pd.Timestamp(end_date).to_pydatetime()
+    start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
+    end_s = end_dt.strftime("%Y/%m/%d")
+    warrants = get_all_active_call_warrants(stock_code, stock_name)
+    pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
+    live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
+    if live is None or live.empty:
+        print("⚠️ Live 沒有抓到全市場權證分點資料")
+        return pd.DataFrame(columns=["Date", "branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name", "buy_amount", "sell_amount", "net_amount"])
+    print(f"🌐 Live 權證全分點資料：{len(live):,} 筆")
+    return live
+
+
+def update_full_market_warrant_cache(stock_code: str) -> pd.DataFrame:
+    """給 GitHub Actions cache 模式使用：輸入股票代號後抓全市場權證分點買賣超，寫入 Google Sheet。"""
+    stock_code = str(stock_code).strip()
+    stock_name = get_tw_stock_name(stock_code)
+    stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
+    if stock_df is None or stock_df.empty:
+        print(f"❌ 股價資料不足，無法決定快取區間：{stock_code}")
+        return pd.DataFrame()
+    stock_df = calculate_indicators(stock_df)
+    plot_df = stock_df.tail(CHART_LOOKBACK)
+    start_date = pd.Timestamp(plot_df.index.min()).normalize()
+    end_date = pd.Timestamp(plot_df.index.max()).normalize()
+    print(f"🚀 更新 {stock_code} {stock_name} 全市場權證分點快取，資料區間 {start_date.date()} ~ {end_date.date()}")
+    live = fetch_live_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
+    if live is None or live.empty:
+        print(f"⚠️ {stock_code} 沒有可寫入的全市場權證分點資料")
+        return pd.DataFrame()
+    written = upsert_full_market_cache_to_gsheet(live, sheet_name=FULL_MARKET_CACHE_SHEET)
+    print(f"✅ {stock_code} 全市場權證分點快取完成：抓到 {len(live):,} 筆，寫入/更新 {written:,} 筆")
+    return live
+
+
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
     # 先讀既有快取，速度最快；再用 live 補足最新全分點資料。
     cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
@@ -1005,15 +1036,9 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         print(f"☁️ Google Sheet 快取_分點歷史命中：{len(cached):,} 筆")
 
     if LIVE_FETCH_ENABLE:
-        end_dt = pd.Timestamp(end_date).to_pydatetime()
-        start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
-        end_s = end_dt.strftime("%Y/%m/%d")
-        warrants = get_all_active_call_warrants(stock_code, stock_name)
-        pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
-        live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
-        if not live.empty:
+        live = fetch_live_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
+        if live is not None and not live.empty:
             frames.append(live)
-            print(f"🌐 Live 權證全分點資料：{len(live):,} 筆")
 
     if not frames:
         return pd.DataFrame(columns=["Date", "branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name", "buy_amount", "sell_amount", "net_amount"])
@@ -1412,7 +1437,7 @@ def add_panel_title(ax, title, subtitle=""):
         ax.text(0.01, 0.86, subtitle, transform=ax.transAxes, ha="left", va="top", color=MUTED, fontsize=11)
 
 
-def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.15, scale=1.08):
+def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.18, scale=1.08):
     if df is None or df.empty:
         return
     lows, highs, opens, closes, volumes = df["Low"], df["High"], df["Open"], df["Close"], df["Volume"]
@@ -1445,10 +1470,10 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
         w = scaled[i] * width_max
         if i == max_idx:
             rect_color = "#DC2626"   # 第一大量：紅色
-            rect_alpha = 0.2
+            rect_alpha = 0.34
         elif i == second_idx:
             rect_color = "#F59E0B"   # 第二大量：橘色
-            rect_alpha = 0.2
+            rect_alpha = 0.30
         else:
             rect_color = color       # 其餘維持原本淺藍
             rect_alpha = alpha
@@ -1558,7 +1583,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.45, 2.05, 8.2, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  height_ratios=[1.45, 2.05, 6.9, 2.6, 3.3, 5.2, 10.6, 8.3],
                   hspace=0.24, wspace=0.25)
 
     # Header
@@ -1590,23 +1615,21 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     candle_ax = fig.add_subplot(gs[2, :])
     style_ax(candle_ax, "股價趨勢｜K線、均線、布林與價量分布")
     plot_candles(candle_ax, plot_df, x)
-    candle_ax.plot(x, plot_df["MA5"], color=RED, linewidth=2.1, label=f"5MA {plot_df['MA5'].iloc[-1]:.2f}")
-    candle_ax.plot(x, plot_df["MA10"], color=ORANGE, linewidth=2.1, label=f"10MA {plot_df['MA10'].iloc[-1]:.2f}")
-    candle_ax.plot(x, plot_df["MA20"], color=LIME, linewidth=2.1, label=f"20MA {plot_df['MA20'].iloc[-1]:.2f}")
-    candle_ax.plot(x, plot_df["MA60"], color=BLUE, linewidth=2.1, label=f"60MA {plot_df['MA60'].iloc[-1]:.2f}")
-    candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9)
-    candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9)
+    candle_ax.plot(x, plot_df["MA5"], color=RED, linewidth=1.6, label=f"5MA {plot_df['MA5'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA10"], color=ORANGE, linewidth=1.3, label=f"10MA {plot_df['MA10'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA20"], color=LIME, linewidth=1.3, label=f"20MA {plot_df['MA20'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA60"], color=BLUE, linewidth=1.4, label=f"60MA {plot_df['MA60'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
+    candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
     add_weighted_volume_profile_overlay(candle_ax, plot_df)
     candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
     candle_ax.yaxis.tick_right()
-    for label in candle_ax.get_yticklabels():
-        label.set_fontweight("bold")
     latest = plot_df.iloc[-1]
     prev_close = plot_df["Close"].iloc[-2] if len(plot_df) >= 2 else latest["Close"]
     diff = latest["Close"] - prev_close
     pct = diff / prev_close * 100 if prev_close else np.nan
     latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
-    candle_ax.text(0.012, 0.88, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
+    candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
                    bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
@@ -1620,8 +1643,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_lots = plot_df["Volume"] / 1000
     vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
-    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.2, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.2, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
     vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
     vol_ax.yaxis.tick_right()
 
@@ -1643,39 +1666,15 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     line_label = f"累計淨買賣超｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}"
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label=bar_label)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
-
-    # 柱狀圖 Y 軸自動貼合資料，但一定包含 0
-    if len(vals):
-        vmin = min(float(np.nanmin(vals)), 0.0)
-        vmax = max(float(np.nanmax(vals)), 0.0)
-        vspan = max(vmax - vmin, 1.0)
-        vpad = vspan * 0.15
-        wnet_ax.set_ylim(vmin - vpad, vmax + vpad)
-
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
-    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95, label=line_label)
-    wnet_ax.tick_params(axis="y", labelsize=22)
-
+    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label=line_label)
     if len(cum_vals):
-        cmax = max(float(np.nanmax(cum_vals)), 0.0)
-        cmin = min(float(np.nanmin(cum_vals)), 0.0)
-
-    # 取得柱狀圖 0 軸在畫面中的相對位置
-        y1_min, y1_max = wnet_ax.get_ylim()
-        zero_frac = (0 - y1_min) / (y1_max - y1_min)
-
-    # 避免極端情況
-        zero_frac = min(max(zero_frac, 0.05), 0.95)
-
-    # 讓折線圖右軸的 0 軸對齊柱狀圖 0 軸
-        upper_need = cmax / (1 - zero_frac) if (1 - zero_frac) > 0 else cmax
-        lower_need = abs(cmin) / zero_frac if zero_frac > 0 else abs(cmin)
-        scale = max(upper_need, lower_need, 1.0) * 1.12
-
-        wnet_ax2.set_ylim(-zero_frac * scale, (1 - zero_frac) * scale)
-    
+        cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
+        lim = max(abs(cmax), abs(cmin), 1.0)
+        # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
+        wnet_ax2.set_ylim(-lim * 3.2, lim * 3.2)
     wnet_ax2.tick_params(colors=MUTED, labelsize=22)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
