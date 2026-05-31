@@ -1447,7 +1447,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.45, 2.05, 7.6, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  height_ratios=[1.45, 2.05, 8.2, 2.6, 3.3, 5.2, 10.6, 8.3],
                   hspace=0.24, wspace=0.25)
 
     # Header
