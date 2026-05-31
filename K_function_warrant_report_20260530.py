@@ -1634,14 +1634,80 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # Warrant daily net bars + cumulative line
     wnet_ax = fig.add_subplot(gs[5, :], sharex=candle_ax)
-    style_ax(wnet_ax, "權證資金流｜柱狀 = 單日淨買賣超；折線 = 累計淨買賣超")
+    style_ax(wnet_ax, "權證資金流")
     vals = daily_net["net_amount"].astype(float).values
     cum_vals = np.cumsum(vals)
     latest_net = vals[-1] if len(vals) else 0.0
     latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
-    bar_label = f"單日淨買賣超｜最新日 {fmt_money(latest_net)}"
-    line_label = f"累計淨買賣超｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}"
-    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label=bar_label)
+    latest_bar_color = RED if latest_net >= 0 else GREEN
+
+    # A 方案：不使用圖內 legend，改用圖表上方的圖示資訊列，避免擋住柱狀圖與折線。
+    info_y = 1.065
+    wnet_ax.add_patch(Rectangle(
+        (0.34, info_y - 0.028), 0.018, 0.048,
+        transform=wnet_ax.transAxes,
+        facecolor=latest_bar_color,
+        edgecolor=latest_bar_color,
+        linewidth=0,
+        alpha=0.90,
+        clip_on=False,
+        zorder=10,
+    ))
+    wnet_ax.text(
+        0.365, info_y, f"最新日 {fmt_money(latest_net)}",
+        transform=wnet_ax.transAxes,
+        color=TEXT,
+        fontsize=25,
+        fontweight="bold",
+        ha="left",
+        va="center",
+        clip_on=False,
+        zorder=10,
+    )
+    wnet_ax.plot(
+        [0.535, 0.575], [info_y, info_y],
+        transform=wnet_ax.transAxes,
+        color=BLUE,
+        linewidth=3.0,
+        alpha=0.95,
+        solid_capstyle="round",
+        clip_on=False,
+        zorder=10,
+    )
+    wnet_ax.text(
+        0.585, info_y, f"本週合計 {fmt_money(ctx['total_net'])}",
+        transform=wnet_ax.transAxes,
+        color=TEXT,
+        fontsize=25,
+        fontweight="bold",
+        ha="left",
+        va="center",
+        clip_on=False,
+        zorder=10,
+    )
+    wnet_ax.plot(
+        [0.765, 0.805], [info_y, info_y],
+        transform=wnet_ax.transAxes,
+        color=BLUE,
+        linewidth=3.0,
+        alpha=0.95,
+        solid_capstyle="round",
+        clip_on=False,
+        zorder=10,
+    )
+    wnet_ax.text(
+        0.815, info_y, f"累計 {fmt_money(latest_cum)}",
+        transform=wnet_ax.transAxes,
+        color=TEXT,
+        fontsize=25,
+        fontweight="bold",
+        ha="left",
+        va="center",
+        clip_on=False,
+        zorder=10,
+    )
+
+    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
 
     # 柱狀圖 Y 軸自動貼合資料，但一定包含 0
@@ -1655,7 +1721,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
-    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95, label=line_label)
+    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
     wnet_ax.tick_params(axis="y", labelsize=22)
 
     if len(cum_vals):
@@ -1681,9 +1747,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     for spine in wnet_ax2.spines.values():
         spine.set_visible(False)
     wnet_ax2.grid(False)
-    h1, l1 = wnet_ax.get_legend_handles_labels()
-    h2, l2 = wnet_ax2.get_legend_handles_labels()
-    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=30, labelcolor=TEXT)
 
     # TOP5 tables
     ax_top = fig.add_subplot(gs[6, :])
