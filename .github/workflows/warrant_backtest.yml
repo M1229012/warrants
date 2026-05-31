@@ -37,8 +37,8 @@ jobs:
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
 
-      OPENAPI_TWSE_FALLBACK_FILE: "test_data/t187ap42_L.csv"
-      OPENAPI_TPEX_FALLBACK_FILE: "test_data/t187ap42_O.csv"
+      OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
+      OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
       
 
       # 分點模式
