@@ -695,7 +695,7 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
         if exit_date and exit_date <= target:
             return
 
-        broker = row_broker(row)
+        broker = str(row.get("分點", "")).strip()
         if broker not in TRACKED_BROKERS:
             return
 
