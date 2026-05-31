@@ -1346,17 +1346,85 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
 
 
 def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
-    box = FancyBboxPatch((x, y), w, h, transform=ax.transAxes,
-                         boxstyle="round,pad=0.016,rounding_size=0.025",
-                         facecolor=PANEL2, edgecolor=GOLD, linewidth=1.5)
-    ax.add_patch(box)
-    ax.add_patch(Rectangle((x, y + h - 0.066), w, 0.066, transform=ax.transAxes,
-                           facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-    ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=29, ha="center", va="top")
-    ax.text(x + w / 2, y + 0.30, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
-    if sub:
-        ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
+    # 單張摘要卡片：保留獨立卡片感，但避免卡片彼此黏在一起。
+    rounding = 0.026
+    band_h = 0.078
 
+    box = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.010,rounding_size={rounding}",
+        facecolor=PANEL2,
+        edgecolor=GOLD,
+        linewidth=1.25,
+        zorder=1,
+    )
+    ax.add_patch(box)
+
+    # 上方藏青色 band：用 rounded patch 做上方圓角，再用同色矩形補齊下緣，
+    # 避免原本 Rectangle 和卡片圓弧不貼合的問題。
+    band = FancyBboxPatch(
+        (x, y + h - band_h), w, band_h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor=GOLD,
+        edgecolor=GOLD,
+        linewidth=0,
+        alpha=0.96,
+        zorder=2,
+    )
+    ax.add_patch(band)
+    ax.add_patch(
+        Rectangle(
+            (x, y + h - band_h), w, band_h * 0.48,
+            transform=ax.transAxes,
+            facecolor=GOLD,
+            edgecolor=GOLD,
+            linewidth=0,
+            alpha=0.96,
+            zorder=3,
+        )
+    )
+
+    # 標題
+    ax.text(
+        x + w / 2,
+        y + h - 0.15,
+        label,
+        transform=ax.transAxes,
+        color=MUTED,
+        fontsize=29,
+        ha="center",
+        va="top",
+        zorder=4,
+    )
+
+    # 數字：固定同一水平線，避免每格看起來不整齊。
+    ax.text(
+        x + w / 2,
+        y + 0.30,
+        value,
+        transform=ax.transAxes,
+        color=value_color,
+        fontsize=42,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        zorder=4,
+    )
+
+    if sub:
+        ax.text(
+            x + w / 2,
+            y + 0.10,
+            sub,
+            transform=ax.transAxes,
+            color=MUTED,
+            fontsize=22,
+            ha="center",
+            va="bottom",
+            zorder=4,
+        )
 
 def draw_summary_strip(ax, cards, x=0.025, y=0.14, w=0.95, h=0.72):
     """
@@ -1489,7 +1557,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
 
-    draw_summary_strip(ax_cards, cards)
+    card_w, gap = 0.172, 0.020
+    start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
+    for i, (lab, val, sub, col) in enumerate(cards):
+        draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
 
     # K line
     candle_ax = fig.add_subplot(gs[2, :])
