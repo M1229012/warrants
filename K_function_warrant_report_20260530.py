@@ -1711,13 +1711,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     draw_header_bar(wnet_ax, 0.130, latest_bar_color)
     draw_header_text(wnet_ax, 0.150, f"最新日 {fmt_money(latest_net)}", latest_bar_color)
 
-    draw_header_sep(wnet_ax, 0.235)
-    draw_header_line(wnet_ax, 0.250, week_color)
-    draw_header_text(wnet_ax, 0.290, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
+    draw_header_sep(wnet_ax, 0.265)
+    draw_header_line(wnet_ax, 0.280, week_color)
+    draw_header_text(wnet_ax, 0.320, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
 
-    draw_header_sep(wnet_ax, 0.475)
-    draw_header_line(wnet_ax, 0.490, BLUE)
-    draw_header_text(wnet_ax, 0.530, f"累計 {fmt_money(latest_cum)}", BLUE)
+    draw_header_sep(wnet_ax, 0.415)
+    draw_header_line(wnet_ax, 0.430, BLUE)
+    draw_header_text(wnet_ax, 0.470, f"累計 {fmt_money(latest_cum)}", BLUE)
 
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
