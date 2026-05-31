@@ -2087,9 +2087,9 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
     # B/C/D：買超與賣方
     plans = [
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
+        (SHEET_B_FULL, "B", "事件日"),
+        (SHEET_C_FULL, "C", "結束日"),
+        (SHEET_D_FULL, "D", "結束日"),
     ]
 
     for sheet_name, event_code, date_col in plans:
