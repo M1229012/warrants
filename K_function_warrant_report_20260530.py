@@ -1346,47 +1346,30 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
 
 
 def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
-    # 單張摘要卡片：保留獨立卡片感，但避免卡片彼此黏在一起。
-    rounding = 0.026
-    band_h = 0.078
-
     box = FancyBboxPatch(
         (x, y), w, h,
         transform=ax.transAxes,
-        boxstyle=f"round,pad=0.004,rounding_size={rounding}",
+        boxstyle="round,pad=0.000,rounding_size=0.025",
         facecolor=PANEL2,
         edgecolor=GOLD,
-        linewidth=1.25,
-        zorder=1,
+        linewidth=1.5
     )
     ax.add_patch(box)
 
-    # 上方藏青色 band：用 rounded patch 做上方圓角，再用同色矩形補齊下緣，
-    # 避免原本 Rectangle 和卡片圓弧不貼合的問題。
-    band = FancyBboxPatch(
-        (x, y + h - band_h), w, band_h,
+    band_h = 0.085
+    band = Rectangle(
+        (x, y + h - band_h),
+        w,
+        band_h,
         transform=ax.transAxes,
-        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
         facecolor=GOLD,
         edgecolor=GOLD,
         linewidth=0,
-        alpha=0.96,
-        zorder=2,
+        alpha=0.96
     )
+    band.set_clip_path(box)
     ax.add_patch(band)
-    ax.add_patch(
-        Rectangle(
-            (x, y + h - band_h), w, band_h * 0.48,
-            transform=ax.transAxes,
-            facecolor=GOLD,
-            edgecolor=GOLD,
-            linewidth=0,
-            alpha=0.96,
-            zorder=3,
-        )
-    )
 
-    # 標題
     ax.text(
         x + w / 2,
         y + h - 0.15,
@@ -1395,11 +1378,9 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
         color=MUTED,
         fontsize=29,
         ha="center",
-        va="top",
-        zorder=4,
+        va="top"
     )
 
-    # 數字：固定同一水平線，避免每格看起來不整齊。
     ax.text(
         x + w / 2,
         y + 0.30,
@@ -1409,8 +1390,7 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
         fontsize=42,
         fontweight="bold",
         ha="center",
-        va="center",
-        zorder=4,
+        va="center"
     )
 
     if sub:
@@ -1422,87 +1402,9 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
             color=MUTED,
             fontsize=22,
             ha="center",
-            va="bottom",
-            zorder=4,
+            va="bottom"
         )
 
-def draw_summary_strip(ax, cards, x=0.025, y=0.14, w=0.95, h=0.72):
-    """
-    一整條摘要列，取代原本 5 張獨立卡片。
-    cards 格式：[(label, value, sub, color), ...]
-    """
-    ax.set_axis_off()
-
-    # 外框
-    box = FancyBboxPatch(
-        (x, y), w, h,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0.012,rounding_size=0.018",
-        facecolor=PANEL2,
-        edgecolor=GOLD,
-        linewidth=1.4,
-    )
-    ax.add_patch(box)
-
-    # 上方藏青色 band
-    band_h = 0.085
-    ax.add_patch(
-        Rectangle(
-            (x, y + h - band_h),
-            w,
-            band_h,
-            transform=ax.transAxes,
-            boxstyle="round,pad=0.004,rounding_size=0.025",
-            facecolor=GOLD,
-            edgecolor=GOLD,
-            linewidth=0,
-            alpha=0.96,
-        )
-    )
-
-    n = len(cards)
-    cell_w = w / n if n else w
-
-    for i, (label, value, sub, value_color) in enumerate(cards):
-        cx = x + i * cell_w
-        center_x = cx + cell_w / 2
-
-        # 垂直分隔線
-        if i > 0:
-            ax.plot(
-                [cx, cx],
-                [y + 0.10, y + h - 0.10],
-                transform=ax.transAxes,
-                color=GOLD,
-                linewidth=1.0,
-                alpha=0.26,
-            )
-
-        # 標題
-        ax.text(
-            center_x,
-            y + h - 0.19,
-            label,
-            transform=ax.transAxes,
-            color=MUTED,
-            fontsize=29,
-            fontweight="bold",
-            ha="center",
-            va="center",
-        )
-
-        # 數字：全部固定在同一水平線
-        ax.text(
-            center_x,
-            y + 0.30,
-            value,
-            transform=ax.transAxes,
-            color=value_color,
-            fontsize=42,
-            fontweight="bold",
-            ha="center",
-            va="center",
-        )
 
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
@@ -1558,7 +1460,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
 
-    card_w, gap = 0.17, 0.03
+    card_w, gap = 0.83, 0.01
     start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
     for i, (lab, val, sub, col) in enumerate(cards):
         draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
