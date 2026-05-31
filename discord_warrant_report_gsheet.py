@@ -695,7 +695,7 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
         if exit_date and exit_date <= target:
             return
 
-        broker = str(row.get("分點", "")).strip()
+        broker = row_broker(row)
         if broker not in TRACKED_BROKERS:
             return
 
@@ -1859,10 +1859,37 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
-    # 補一個「分點 + 權證代號 -> 標的股」對照。
-    # 只用來讓 TOP15 扣賣超時，遇到「快取_分點歷史」沒有標的股欄位或標的股空白，
-    # 仍可依照原本 A/B/C/D 買超事件的同一檔權證，扣回正確標的。
     counted_warrant_underlying_map: dict[tuple[str, str], str] = {}
+
+    def row_broker(row) -> str:
+        """
+        取得分點名稱。
+        快取_分點歷史有些版本欄位叫「分點」，有些版本叫「分點名稱」，
+        這裡只做欄位容錯，不改原本 TOP15 統計邏輯。
+        """
+        for c in ["分點", "分點名稱", "券商名稱"]:
+            v = str(row.get(c, "")).strip()
+            if v:
+                return v
+        return ""
+
+    def code_from_stock_name_or_text(raw_code, warrant_text="") -> str:
+        """
+        取得標的代號。
+        原邏輯仍以「標的股」為主；若快取表標的股空白，
+        則用權證名稱反推股名，再回到目前 agg 裡找同股名的代號。
+        """
+        code = normalize_underlying(raw_code, warrant_text)
+        if code in agg:
+            return code
+
+        stock_name = extract_stock_name_from_warrant_text(warrant_text)
+        if stock_name:
+            for k, item in agg.items():
+                if str(item.get("stock_name", "")).strip() == stock_name:
+                    return k
+
+        return code
 
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
@@ -1889,7 +1916,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if not d or d < sell_period_start or d > sell_period_end:
                 continue
 
-            broker = str(r.get("分點", "")).strip()
+            broker = row_broker(r)
             if broker not in TRACKED_BROKERS:
                 continue
 
@@ -1903,20 +1930,16 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
             is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
 
-            # 整體扣減邏輯維持原本版本：
-            # - A/B/C/D 白名單權證：扣整個統計期間的實際賣出
-            # - 非白名單權證：只在目標日同分點同標的大額賣出達門檻時扣
-            #
-            # 這裡只補一個欄位容錯：
-            # 有些「快取_分點歷史」列沒有標的股，原本會直接 continue，
-            # 造成 TOP15 沒有扣到賣超。若該權證本來就在 A/B/C/D 買超白名單，
-            # 就用前面買超事件記錄的標的股代號回填，不改變原本統計邏輯。
-            code = ""
+            # A/B/C/D 白名單權證優先用買超事件建立的對照表回填標的，
+            # 避免快取_分點歷史的「標的股」空白，導致賣出金額完全沒被扣掉。
             if is_counted_warrant:
                 code = counted_warrant_underlying_map.get((broker, warrant_code), "")
-
-            if not code:
-                code = normalize_underlying(r.get("標的股"), warrant_text)
+            else:
+                raw_underlying = (
+                    r.get("標的股") or r.get("標的股代碼") or r.get("標的代號")
+                    or r.get("股票代號") or r.get("標的名稱")
+                )
+                code = code_from_stock_name_or_text(raw_underlying, warrant_text)
 
             if not code or code not in agg:
                 continue
@@ -2022,7 +2045,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if not event_date or event_date not in date_set:
             return
 
-        broker = str(row.get("分點", "")).strip()
+        broker = row_broker(row)
         if broker not in TRACKED_BROKERS:
             return
 
@@ -2031,7 +2054,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             return
 
         warrant_text = row.get("權證名稱") or row.get("權證清單") or ""
-        code = normalize_underlying(row.get("標的股"), warrant_text)
+        code = code_from_stock_name_or_text(row.get("標的股"), warrant_text)
         if not code or code not in agg:
             return
 
@@ -2089,7 +2112,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     try:
         sell_df = read_gsheet_table_optional(
             SHEET_HISTORY,
-            ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
+            ["日期", "分點", "分點名稱", "券商名稱", "標的股", "標的股代碼", "標的代號", "股票代號", "標的名稱", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
         )
 
         if not sell_df.empty:
@@ -2104,7 +2127,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         try:
             sell_df = read_gsheet_table_optional(
                 SHEET_DAILY_SELL,
-                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
+                ["日期", "分點", "分點名稱", "券商名稱", "標的股", "標的股代碼", "標的代號", "股票代號", "標的名稱", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
             )
 
             if not sell_df.empty:
