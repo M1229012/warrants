@@ -1357,6 +1357,84 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
     if sub:
         ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
 
+
+def draw_summary_strip(ax, cards, x=0.025, y=0.14, w=0.95, h=0.72):
+    """
+    一整條摘要列，取代原本 5 張獨立卡片。
+    cards 格式：[(label, value, sub, color), ...]
+    """
+    ax.set_axis_off()
+
+    # 外框
+    box = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle="round,pad=0.012,rounding_size=0.018",
+        facecolor=PANEL2,
+        edgecolor=GOLD,
+        linewidth=1.4,
+    )
+    ax.add_patch(box)
+
+    # 上方藏青色 band
+    band_h = 0.085
+    ax.add_patch(
+        Rectangle(
+            (x, y + h - band_h),
+            w,
+            band_h,
+            transform=ax.transAxes,
+            facecolor=GOLD,
+            edgecolor=GOLD,
+            linewidth=0,
+            alpha=0.96,
+        )
+    )
+
+    n = len(cards)
+    cell_w = w / n if n else w
+
+    for i, (label, value, sub, value_color) in enumerate(cards):
+        cx = x + i * cell_w
+        center_x = cx + cell_w / 2
+
+        # 垂直分隔線
+        if i > 0:
+            ax.plot(
+                [cx, cx],
+                [y + 0.10, y + h - 0.10],
+                transform=ax.transAxes,
+                color=GOLD,
+                linewidth=1.0,
+                alpha=0.26,
+            )
+
+        # 標題
+        ax.text(
+            center_x,
+            y + h - 0.19,
+            label,
+            transform=ax.transAxes,
+            color=MUTED,
+            fontsize=29,
+            fontweight="bold",
+            ha="center",
+            va="center",
+        )
+
+        # 數字：全部固定在同一水平線
+        ax.text(
+            center_x,
+            y + 0.30,
+            value,
+            transform=ax.transAxes,
+            color=value_color,
+            fontsize=42,
+            fontweight="bold",
+            ha="center",
+            va="center",
+        )
+
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
     width = 0.72
@@ -1400,20 +1478,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
-    ax_cards = fig.add_subplot(gs[1, :]) 
+    ax_cards = fig.add_subplot(gs[1, :])
     ax_cards.set_axis_off()
 
-    card_w, gap = 0.15, 0.015
-    start_x = (1 - (5 * card_w + 4 * gap)) / 2
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
         ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
-        ("權證週淨流向", fmt_money(ctx["total_net"]),"", RED if ctx["total_net"] >= 0 else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]), "", RED if ctx["total_net"] >= 0 else GREEN),
         ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
-    for i, (lab, val, sub, col) in enumerate(cards):
-        draw_card(ax_cards, 0.01 + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
+
+    draw_summary_strip(ax_cards, cards)
 
     # K line
     candle_ax = fig.add_subplot(gs[2, :])
