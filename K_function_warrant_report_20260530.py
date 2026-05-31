@@ -1353,7 +1353,7 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
     ax.add_patch(Rectangle((x, y + h - 0.066), w, 0.066, transform=ax.transAxes,
                            facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
     ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=29, ha="center", va="top")
-    ax.text(x + w / 2, y + 0.43, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
+    ax.text(x + w / 2, y + 0.35, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
     if sub:
         ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
 
@@ -1395,19 +1395,19 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
-    ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=54, fontweight="bold", ha="left", va="center")
-    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=25, ha="left", va="center")
+    ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
+    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=32, ha="left", va="center")
     ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=36, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
     card_w, gap = 0.188, 0.01
     cards = [
-        ("本週股價", fmt_pct(ctx["stock_ret"]), "收盤對週初", RED if ctx["stock_ret"] >= 0 else GREEN),
-        ("本週量能", fmt_pct(ctx["vol_change"]), "相對前 5 交易日", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
-        ("權證週淨流向", fmt_money(ctx["total_net"]), ctx["bias"], RED if ctx["total_net"] >= 0 else GREEN),
-        ("本週買進", fmt_money_abs(ctx["total_buy"]), "全部分點合計", RED),
-        ("本週賣出", fmt_money_abs(ctx["total_sell"]), "全部分點合計", GREEN),
+        ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
+        ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]),, RED if ctx["total_net"] >= 0 else GREEN),
+        ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
+        ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
     for i, (lab, val, sub, col) in enumerate(cards):
         draw_card(ax_cards, 0.01 + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
