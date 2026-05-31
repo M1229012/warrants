@@ -1493,7 +1493,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     diff = latest["Close"] - prev_close
     pct = diff / prev_close * 100 if prev_close else np.nan
     latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
-    candle_ax.text(0.012, 0.85, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
+    candle_ax.text(0.012, 0.88, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
                    bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
