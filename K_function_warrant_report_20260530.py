@@ -1405,7 +1405,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
         ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
-        ("權證週淨流向", fmt_money(ctx["total_net"]),, RED if ctx["total_net"] >= 0 else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]),"", RED if ctx["total_net"] >= 0 else GREEN),
         ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
