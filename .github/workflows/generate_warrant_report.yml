@@ -1,21 +1,30 @@
-name: Warrant Report Manual Test
+name: Warrant Report / Full Market Cache
 
 on:
   workflow_dispatch:
     inputs:
+      action_mode:
+        description: "執行模式：report=產生週報圖片；cache=抓取全市場權證分點買賣超到 Google Sheet"
+        required: true
+        default: "report"
+        type: choice
+        options:
+          - report
+          - cache
       stock_codes:
         description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
         required: false
         default: "2408"
 
 jobs:
-  run-warrant-report-test:
+  run-warrant-task:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     env:
       OUTPUT_DIR: output
       STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
+      WARRANT_ACTION: ${{ inputs.action_mode || 'report' }}
 
       # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
       MPLBACKEND: Agg
@@ -25,8 +34,8 @@ jobs:
       GSHEET_NAME: "權證分點籌碼"
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      WARRANT_API5_DAYS: "110"
-      WARRANT_API4_SCAN_CALENDAR_DAYS: "110"
+      # 全市場權證分點快取表名稱
+      WARRANT_FULL_MARKET_CACHE_SHEET: "快取_全市場分點歷史"
 
       # FinMind 設定：三大法人資料來源
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
@@ -36,8 +45,13 @@ jobs:
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
       WARRANT_REPORT_MAX_ROWS: "8"
 
-      # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
+      # 權證資金流回補天數
+      WARRANT_API5_DAYS: "110"
+      WARRANT_API4_SCAN_CALENDAR_DAYS: "110"
+
+      # Discord 推播設定：report 模式可推播；cache 模式不會推播圖片
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
       - name: Checkout repository
@@ -60,17 +74,28 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Check FinMind token
+      - name: Check environment
         run: |
-          python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
+          python - <<'PY'
+          import os
+          print('WARRANT_ACTION =', os.getenv('WARRANT_ACTION'))
+          print('STOCK_CODES =', os.getenv('STOCK_CODES'))
+          print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')
+          print('GCP_SERVICE_KEY =', 'SET' if os.getenv('GCP_SERVICE_KEY') else 'EMPTY')
+          print('WARRANT_API5_DAYS =', os.getenv('WARRANT_API5_DAYS'))
+          print('WARRANT_API4_SCAN_CALENDAR_DAYS =', os.getenv('WARRANT_API4_SCAN_CALENDAR_DAYS'))
+          print('WARRANT_FULL_MARKET_CACHE_SHEET =', os.getenv('WARRANT_FULL_MARKET_CACHE_SHEET'))
+          PY
 
-      - name: Run warrant report test
+      - name: Run warrant task
         run: python run_report.py
 
-      - name: Upload report artifact
+      - name: Upload output artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: warrant-report-test-output
-          path: output/*.png
+          name: warrant-task-output
+          path: |
+            output/*.png
+            output/*.txt
           if-no-files-found: warn
