@@ -1403,7 +1403,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_cards = fig.add_subplot(gs[1, :]) 
     ax_cards.set_axis_off()
 
-    card_w, gap = 0.175, 0.015
+    card_w, gap = 0.15, 0.015
     start_x = (1 - (5 * card_w + 4 * gap)) / 2
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
