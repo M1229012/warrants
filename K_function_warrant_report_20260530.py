@@ -1634,68 +1634,71 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # Warrant daily net bars + cumulative line
     wnet_ax = fig.add_subplot(gs[5, :], sharex=candle_ax)
-    style_ax(wnet_ax, "權證資金流")
+    style_ax(wnet_ax)
     vals = daily_net["net_amount"].astype(float).values
     cum_vals = np.cumsum(vals)
     latest_net = vals[-1] if len(vals) else 0.0
     latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
     latest_bar_color = RED if latest_net >= 0 else GREEN
-
-    # 膠囊資訊列：接續在「權證資金流」標題後方，取代圖內 legend，避免擋住柱狀圖與折線。
-    badge_y = 1.065
-    badge_h = 0.074
-    badge_start_x = 0.18
-    badge_gap = 0.018
-    latest_badge_w = 0.165
-    week_badge_w = 0.205
-    cum_badge_w = 0.165
     week_color = RED if ctx["total_net"] >= 0 else GREEN
 
-    def draw_wnet_badge(ax, x0, width, text, text_color=TEXT, icon_kind="", icon_color=TEXT):
-        y0 = badge_y - badge_h / 2
-        badge = FancyBboxPatch(
-            (x0, y0), width, badge_h,
-            transform=ax.transAxes,
-            boxstyle="round,pad=0.004,rounding_size=0.022",
-            facecolor="#FFFFFF",
-            edgecolor=GRID,
-            linewidth=1.05,
-            alpha=0.96,
-            clip_on=False,
-            zorder=10,
-        )
-        ax.add_patch(badge)
+    # 權證資金流標題列：用小圖示與分隔線接在標題後方，不使用 legend / 膠囊，避免擋住圖表本體。
+    header_y = 1.062
+    wnet_ax.text(
+        0.000, header_y, "權證資金流",
+        transform=wnet_ax.transAxes,
+        color=GOLD,
+        fontsize=34,
+        fontweight="bold",
+        ha="left",
+        va="center",
+        clip_on=False,
+        zorder=12,
+    )
 
-        text_x = x0 + 0.024
-        if icon_kind == "bar":
-            ax.add_patch(Rectangle(
-                (x0 + 0.018, badge_y - 0.016), 0.014, 0.032,
-                transform=ax.transAxes,
-                facecolor=icon_color,
-                edgecolor=icon_color,
-                linewidth=0,
-                alpha=0.92,
-                clip_on=False,
-                zorder=11,
-            ))
-            text_x = x0 + 0.041
-        elif icon_kind == "line":
-            ax.plot(
-                [x0 + 0.018, x0 + 0.046], [badge_y, badge_y],
-                transform=ax.transAxes,
-                color=icon_color,
-                linewidth=3.0,
-                alpha=0.95,
-                solid_capstyle="round",
-                clip_on=False,
-                zorder=11,
-            )
-            text_x = x0 + 0.056
-
+    def draw_header_sep(ax, x0):
         ax.text(
-            text_x, badge_y, text,
+            x0, header_y, "|",
             transform=ax.transAxes,
-            color=text_color,
+            color=MUTED,
+            fontsize=25,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            alpha=0.82,
+            clip_on=False,
+            zorder=12,
+        )
+
+    def draw_header_bar(ax, x0, color):
+        ax.add_patch(Rectangle(
+            (x0, header_y - 0.012), 0.013, 0.024,
+            transform=ax.transAxes,
+            facecolor=color,
+            edgecolor=color,
+            linewidth=0,
+            alpha=0.92,
+            clip_on=False,
+            zorder=12,
+        ))
+
+    def draw_header_line(ax, x0, color):
+        ax.plot(
+            [x0, x0 + 0.030], [header_y, header_y],
+            transform=ax.transAxes,
+            color=color,
+            linewidth=2.6,
+            alpha=0.95,
+            solid_capstyle="round",
+            clip_on=False,
+            zorder=12,
+        )
+
+    def draw_header_text(ax, x0, text, color):
+        ax.text(
+            x0, header_y, text,
+            transform=ax.transAxes,
+            color=color,
             fontsize=22,
             fontweight="bold",
             ha="left",
@@ -1704,31 +1707,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             zorder=12,
         )
 
-    draw_wnet_badge(
-        wnet_ax,
-        badge_start_x,
-        latest_badge_w,
-        f"最新日 {fmt_money(latest_net)}",
-        text_color=latest_bar_color,
-        icon_kind="bar",
-        icon_color=latest_bar_color,
-    )
-    draw_wnet_badge(
-        wnet_ax,
-        badge_start_x + latest_badge_w + badge_gap,
-        week_badge_w,
-        f"本週合計 {fmt_money(ctx['total_net'])}",
-        text_color=week_color,
-    )
-    draw_wnet_badge(
-        wnet_ax,
-        badge_start_x + latest_badge_w + badge_gap + week_badge_w + badge_gap,
-        cum_badge_w,
-        f"累計 {fmt_money(latest_cum)}",
-        text_color=BLUE,
-        icon_kind="line",
-        icon_color=BLUE,
-    )
+    draw_header_sep(wnet_ax, 0.145)
+    draw_header_bar(wnet_ax, 0.168, latest_bar_color)
+    draw_header_text(wnet_ax, 0.188, f"最新日 {fmt_money(latest_net)}", latest_bar_color)
+
+    draw_header_sep(wnet_ax, 0.335)
+    draw_header_line(wnet_ax, 0.358, week_color)
+    draw_header_text(wnet_ax, 0.398, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
+
+    draw_header_sep(wnet_ax, 0.600)
+    draw_header_line(wnet_ax, 0.623, BLUE)
+    draw_header_text(wnet_ax, 0.663, f"累計 {fmt_money(latest_cum)}", BLUE)
 
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
