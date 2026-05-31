@@ -1643,36 +1643,37 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     week_color = RED if ctx["total_net"] >= 0 else GREEN
 
     # 權證資金流標題列：用小圖示與分隔線接在標題後方，不使用 legend / 膠囊，避免擋住圖表本體。
+    # 這裡改成「動態接續排列」：每一段畫完後，依照實際文字寬度自動接下一段，
+    # 避免遇到幾十萬、幾千萬或億級數字時，固定 x 座標造成間距忽大忽小。
     header_y = 1.062
-    wnet_ax.text(
-        0.000, header_y, "權證資金流",
-        transform=wnet_ax.transAxes,
-        color=GOLD,
-        fontsize=34,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        clip_on=False,
-        zorder=12,
-    )
 
-    def draw_header_sep(ax, x0):
-        ax.text(
-            x0, header_y, "|",
+    def advance_x_by_px(ax, x0, gap_px):
+        base_xy = ax.transAxes.transform((x0, header_y))
+        return ax.transAxes.inverted().transform((base_xy[0] + gap_px, base_xy[1]))[0]
+
+    def draw_header_text_and_advance(ax, x0, text, color, fontsize=22, fontweight="bold", gap_px=16, alpha=1.0):
+        t = ax.text(
+            x0, header_y, text,
             transform=ax.transAxes,
-            color=MUTED,
-            fontsize=25,
-            fontweight="bold",
-            ha="center",
+            color=color,
+            fontsize=fontsize,
+            fontweight=fontweight,
+            ha="left",
             va="center",
-            alpha=0.82,
+            alpha=alpha,
             clip_on=False,
             zorder=12,
         )
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        bbox = t.get_window_extent(renderer=renderer)
+        y_disp = ax.transAxes.transform((0, header_y))[1]
+        return ax.transAxes.inverted().transform((bbox.x1 + gap_px, y_disp))[0]
 
-    def draw_header_bar(ax, x0, color):
+    def draw_header_bar_and_advance(ax, x0, color, gap_px=8):
+        bar_w = 0.013
         ax.add_patch(Rectangle(
-            (x0, header_y - 0.012), 0.013, 0.024,
+            (x0, header_y - 0.012), bar_w, 0.024,
             transform=ax.transAxes,
             facecolor=color,
             edgecolor=color,
@@ -1681,10 +1682,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             clip_on=False,
             zorder=12,
         ))
+        return advance_x_by_px(ax, x0 + bar_w, gap_px)
 
-    def draw_header_line(ax, x0, color):
+    def draw_header_line_and_advance(ax, x0, color, gap_px=10):
+        line_w = 0.030
         ax.plot(
-            [x0, x0 + 0.030], [header_y, header_y],
+            [x0, x0 + line_w], [header_y, header_y],
             transform=ax.transAxes,
             color=color,
             linewidth=2.6,
@@ -1693,31 +1696,25 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             clip_on=False,
             zorder=12,
         )
+        return advance_x_by_px(ax, x0 + line_w, gap_px)
 
-    def draw_header_text(ax, x0, text, color):
-        ax.text(
-            x0, header_y, text,
-            transform=ax.transAxes,
-            color=color,
-            fontsize=22,
-            fontweight="bold",
-            ha="left",
-            va="center",
-            clip_on=False,
-            zorder=12,
-        )
+    xpos = 0.000
+    xpos = draw_header_text_and_advance(
+        wnet_ax, xpos, "權證資金流", GOLD,
+        fontsize=34, fontweight="bold", gap_px=22,
+    )
 
-    draw_header_sep(wnet_ax, 0.115)
-    draw_header_bar(wnet_ax, 0.130, latest_bar_color)
-    draw_header_text(wnet_ax, 0.150, f"最新日 {fmt_money(latest_net)}", latest_bar_color)
+    xpos = draw_header_text_and_advance(wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
+    xpos = draw_header_bar_and_advance(wnet_ax, xpos, latest_bar_color, gap_px=8)
+    xpos = draw_header_text_and_advance(wnet_ax, xpos, f"最新日 {fmt_money(latest_net)}", latest_bar_color, gap_px=22)
 
-    draw_header_sep(wnet_ax, 0.265)
-    draw_header_line(wnet_ax, 0.280, week_color)
-    draw_header_text(wnet_ax, 0.320, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
+    xpos = draw_header_text_and_advance(wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
+    xpos = draw_header_line_and_advance(wnet_ax, xpos, week_color, gap_px=10)
+    xpos = draw_header_text_and_advance(wnet_ax, xpos, f"本週合計 {fmt_money(ctx['total_net'])}", week_color, gap_px=22)
 
-    draw_header_sep(wnet_ax, 0.435)
-    draw_header_line(wnet_ax, 0.450, BLUE)
-    draw_header_text(wnet_ax, 0.490, f"累計 {fmt_money(latest_cum)}", BLUE)
+    xpos = draw_header_text_and_advance(wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
+    xpos = draw_header_line_and_advance(wnet_ax, xpos, BLUE, gap_px=10)
+    draw_header_text_and_advance(wnet_ax, xpos, f"累計 {fmt_money(latest_cum)}", BLUE, gap_px=0)
 
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
