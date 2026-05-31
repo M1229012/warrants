@@ -1229,8 +1229,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(26, 42), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.2, 2.05, 6.4, 2.2, 2.8, 4.2, 5.4, 4.7],
-                  hspace=0.58, wspace=0.25)
+                  height_ratios=[1.15, 1.95, 6.7, 2.25, 2.85, 4.45, 7.25, 5.15],
+                  hspace=0.30, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -1316,8 +1316,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label="累計淨買賣超")
     if len(cum_vals):
         cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
-        span = max(cmax - cmin, abs(cmax), 1.0)
-        wnet_ax2.set_ylim(cmin - span * 0.1, cmax + span * 2.4)
+        lim = max(abs(cmax), abs(cmin), 1.0)
+        # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
+        wnet_ax2.set_ylim(-lim * 1.15, lim * 1.15)
     wnet_ax2.tick_params(colors=MUTED, labelsize=14)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
@@ -1341,14 +1342,15 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         (0.52, "本週淨賣超分點 TOP5", sell_top, GREEN),
     ]
     for x0, title, df_top, side_color in sections:
-        ax_top.add_patch(FancyBboxPatch((x0, 0.04), 0.46, 0.92, transform=ax_top.transAxes,
-                                        boxstyle="round,pad=0.012,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
-        ax_top.text(x0 + 0.02, 0.92, title, transform=ax_top.transAxes, color=side_color, fontsize=26, fontweight="bold", ha="left", va="top")
-        ax_top.text(x0 + 0.02, 0.84, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=18, ha="left", va="top")
+        ax_top.add_patch(FancyBboxPatch((x0, 0.025), 0.46, 0.955, transform=ax_top.transAxes,
+                                        boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35))
+        ax_top.text(x0 + 0.02, 0.955, title, transform=ax_top.transAxes, color=side_color, fontsize=26, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.875, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=17, ha="left", va="top")
         if df_top.empty:
-            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=16, ha="left", va="center")
+            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=17, ha="left", va="center")
         else:
-            y = 0.73
+            y = 0.755
+            row_gap = 0.145
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
                 amt = float(r["net_amount"])
@@ -1357,27 +1359,27 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 wamt = float(r.get("max_warrant_amount", 0.0))
                 # rank circle
                 circ_x = x0 + 0.03
-                circ_y = y - 0.01
-                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=18, fontweight="bold",
-                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
-                ax_top.text(x0 + 0.06, y + 0.01, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=16, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.42, y + 0.01, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=20, fontweight="bold", ha="right", va="center")
-                rep = f"代表權證：{wcode} {wname[:15]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, y - 0.07, rep, transform=ax_top.transAxes, color=MUTED, fontsize=18, ha="left", va="center")
-                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.135, y - 0.135], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
-                y -= 0.185
+                circ_y = y - 0.005
+                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=17, fontweight="bold",
+                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.23", facecolor=GOLD, edgecolor=GOLD))
+                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=16, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=20, fontweight="bold", ha="right", va="center")
+                rep = f"代表權證：{wcode} {wname[:14]}｜{fmt_money(wamt)}"
+                ax_top.text(x0 + 0.06, y - 0.058, rep, transform=ax_top.transAxes, color=MUTED, fontsize=16, ha="left", va="center")
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.105, y - 0.105], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
+                y -= row_gap
 
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "下週觀察 / 重要消息")]:
-        ax_notes.add_patch(FancyBboxPatch((x0, 0.08), 0.46, 0.84, transform=ax_notes.transAxes,
+        ax_notes.add_patch(FancyBboxPatch((x0, 0.06), 0.46, 0.88, transform=ax_notes.transAxes,
                                           boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
-        ax_notes.text(x0 + 0.02, 0.86, title, transform=ax_notes.transAxes, color=GOLD, fontsize=26, fontweight="bold", ha="left", va="top")
-    y = 0.70
+        ax_notes.text(x0 + 0.02, 0.88, title, transform=ax_notes.transAxes, color=GOLD, fontsize=26, fontweight="bold", ha="left", va="top")
+    y = 0.72
     for p in key_points[:4]:
         ax_notes.text(0.04, y, "• " + wrap_text(p, width=44, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
         y -= 0.185
-    y = 0.70
+    y = 0.72
     for p in watch_points[:4]:
         ax_notes.text(0.54, y, "• " + wrap_text(p, width=44, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
         y -= 0.185
