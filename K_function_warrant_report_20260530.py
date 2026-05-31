@@ -1647,12 +1647,22 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
     wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label=line_label)
+    
     if len(cum_vals):
         cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
-        lim = max(abs(cmax), abs(cmin), 1.0)
-        # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
-        wnet_ax2.set_ylim(-lim * 3.2, lim * 3.2)
-    wnet_ax2.tick_params(colors=MUTED, labelsize=22)
+
+    # 自動貼合累計淨買賣超資料，並保留一點上下空間
+        top = max(cmax, 0)
+        bottom = min(cmin, 0)
+        span = top - bottom
+
+        if span <= 0:
+            span = max(abs(cmax), abs(cmin), 1.0)
+
+        pad = span * 0.18
+        wnet_ax2.set_ylim(bottom - pad, top + pad)
+        
+    wnet_ax2.tick_params(colors=MUTED, labelsize=18)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
         spine.set_visible(False)
