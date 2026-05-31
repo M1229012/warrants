@@ -1860,6 +1860,63 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
 
+    # 同時記錄「分點 + 權證代號 -> 標的股代號」。
+    # 原本 TOP15 沒有扣掉賣超，常見原因是「快取_分點歷史」只有權證代號，
+    # 不一定有標的股欄位；若只靠 r.get("標的股") 會拿不到 code，賣出列就會被整筆跳過。
+    counted_warrant_underlying_map: dict[tuple[str, str], str] = {}
+
+    stock_name_reverse_map = {}
+    try:
+        for _code, _name in get_stock_name_map().items():
+            _name = str(_name).strip()
+            if _code and _name and _name not in stock_name_reverse_map:
+                stock_name_reverse_map[_name] = _code
+    except Exception:
+        stock_name_reverse_map = {}
+
+    def resolve_warrant_code_from_row(row, code_col_candidates: list[str]) -> str:
+        for col in code_col_candidates:
+            warrant_code = normalize_warrant_code(row.get(col, ""))
+            if warrant_code:
+                return warrant_code
+        return ""
+
+    def resolve_underlying_code_from_sell_row(row, broker: str, warrant_code: str, warrant_text: str) -> str:
+        """
+        TOP15 扣賣超時用的標的代號解析。
+
+        優先順序：
+        1. 若該權證本來就在本次 A/B/C/D 統計白名單，直接用買超事件記錄的標的代號。
+        2. 讀取賣出資料本身可能存在的標的股代號欄位。
+        3. 若只有標的名稱，利用 A/B/C/D 建出的股票名稱對照表反查代號。
+        4. 最後才從權證名稱反推標的名稱再反查代號。
+        """
+        if broker and warrant_code:
+            mapped = counted_warrant_underlying_map.get((broker, warrant_code), "")
+            if mapped:
+                return mapped
+
+        for col in ["標的股", "標的股代碼", "標的代號", "標的代碼", "股票代號", "標的證券代號"]:
+            code = normalize_underlying(row.get(col, ""), warrant_text)
+            if code:
+                return code
+
+        for col in ["標的名稱", "股票名稱", "標的股名稱", "股名"]:
+            name = strip_gsheet_text_prefix(row.get(col, "")).strip()
+            if not name:
+                continue
+            mapped = KNOWN_UNDERLYING_NAME_CODE_MAP.get(name) or stock_name_reverse_map.get(name)
+            if mapped:
+                return mapped
+
+        inferred_name = extract_stock_name_from_warrant_text(warrant_text)
+        if inferred_name:
+            mapped = KNOWN_UNDERLYING_NAME_CODE_MAP.get(inferred_name) or stock_name_reverse_map.get(inferred_name)
+            if mapped:
+                return mapped
+
+        return ""
+
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
         TOP15 賣方扣減規則：
@@ -1890,19 +1947,14 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 continue
 
             warrant_text = r.get("權證名稱", "")
-            code = normalize_underlying(r.get("標的股"), warrant_text)
+            warrant_code = resolve_warrant_code_from_row(r, code_col_candidates)
+            code = resolve_underlying_code_from_sell_row(r, broker, warrant_code, warrant_text)
             if not code or code not in agg:
                 continue
 
             amount = safe_float(r.get("賣出金額"), 0)
             if amount <= 0:
                 continue
-
-            warrant_code = ""
-            for col in code_col_candidates:
-                warrant_code = normalize_warrant_code(r.get(col, ""))
-                if warrant_code:
-                    break
 
             is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
             usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
@@ -1991,10 +2043,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
             if warrant_code:
                 counted_warrant_keys.add((broker, warrant_code))
+                counted_warrant_underlying_map[(broker, warrant_code)] = code
         else:
             for warrant_code, _ in parse_warrant_items_from_text(warrant_text):
                 if warrant_code:
                     counted_warrant_keys.add((broker, warrant_code))
+                    counted_warrant_underlying_map[(broker, warrant_code)] = code
 
     def add_sell_row(row, event_date, amount):
         if not event_date or event_date not in date_set:
@@ -2067,12 +2121,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     try:
         sell_df = read_gsheet_table_optional(
             SHEET_HISTORY,
-            ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
+            [
+                "日期", "分點",
+                "標的股", "標的股代碼", "標的代號", "標的代碼", "股票代號", "標的證券代號",
+                "標的名稱", "股票名稱", "標的股名稱", "股名",
+                "權證代號", "權證代碼", "代號", "權證名稱", "賣出金額"
+            ]
         )
 
         if not sell_df.empty:
             sell_rows_loaded = True
-            apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼"])
+            apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼", "代號"])
     except Exception:
         pass
 
@@ -2082,11 +2141,16 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         try:
             sell_df = read_gsheet_table_optional(
                 SHEET_DAILY_SELL,
-                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
+                [
+                    "日期", "分點",
+                    "標的股", "標的股代碼", "標的代號", "標的代碼", "股票代號", "標的證券代號",
+                    "標的名稱", "股票名稱", "標的股名稱", "股名",
+                    "權證代號", "權證代碼", "代號", "權證名稱", "賣出金額"
+                ]
             )
 
             if not sell_df.empty:
-                apply_sell_deduction_from_df(sell_df, ["權證代號"])
+                apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼", "代號"])
         except Exception:
             pass
 
