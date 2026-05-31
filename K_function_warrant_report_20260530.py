@@ -1543,6 +1543,45 @@ def plot_candles(ax, plot_df: pd.DataFrame, x: list):
             ax.bar(i, body_h, bottom=body_low, width=width, color=color, edgecolor=color, align="center", zorder=4)
 
 
+def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
+    """放大 K 線圖 Y 軸顯示範圍，並增加上方留白，避免股價飆高時貼近圖框。"""
+    if plot_df is None or plot_df.empty:
+        return
+
+    price_cols = [
+        "Low", "High",
+        "MA5", "MA10", "MA20", "MA60",
+        "BB_UPPER", "BB_LOWER",
+    ]
+
+    values = []
+    for col in price_cols:
+        if col in plot_df.columns:
+            s = pd.to_numeric(plot_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            if not s.empty:
+                values.append(s)
+
+    if not values:
+        return
+
+    all_values = pd.concat(values, ignore_index=True)
+    y_min = float(all_values.min())
+    y_max = float(all_values.max())
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        return
+
+    span = y_max - y_min
+    latest_close = float(pd.to_numeric(plot_df["Close"], errors="coerce").dropna().iloc[-1]) if "Close" in plot_df.columns and not pd.to_numeric(plot_df["Close"], errors="coerce").dropna().empty else 1.0
+    if span <= 0:
+        span = max(abs(latest_close) * 0.08, 1.0)
+
+    # 上方留白刻意比下方大，讓高檔 K 線不會貼到圖框，看起來會往下一點。
+    lower_pad = max(span * 0.12, abs(latest_close) * 0.015, 1.0)
+    upper_pad = max(span * 0.26, abs(latest_close) * 0.035, 1.0)
+
+    ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
+
+
 def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_titles: List[str]):
     ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
@@ -1597,6 +1636,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9)
     candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9)
     add_weighted_volume_profile_overlay(candle_ax, plot_df)
+    adjust_candle_price_ylim(candle_ax, plot_df)
     candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
     candle_ax.yaxis.tick_right()
     for label in candle_ax.get_yticklabels():
