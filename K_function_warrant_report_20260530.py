@@ -1412,7 +1412,7 @@ def add_panel_title(ax, title, subtitle=""):
         ax.text(0.01, 0.86, subtitle, transform=ax.transAxes, ha="left", va="top", color=MUTED, fontsize=11)
 
 
-def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.18, scale=1.08):
+def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.15, scale=1.08):
     if df is None or df.empty:
         return
     lows, highs, opens, closes, volumes = df["Low"], df["High"], df["Open"], df["Close"], df["Volume"]
@@ -1445,10 +1445,10 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
         w = scaled[i] * width_max
         if i == max_idx:
             rect_color = "#DC2626"   # 第一大量：紅色
-            rect_alpha = 0.34
+            rect_alpha = 0.2
         elif i == second_idx:
             rect_color = "#F59E0B"   # 第二大量：橘色
-            rect_alpha = 0.30
+            rect_alpha = 0.2
         else:
             rect_color = color       # 其餘維持原本淺藍
             rect_alpha = alpha
