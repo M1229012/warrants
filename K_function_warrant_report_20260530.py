@@ -22,8 +22,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from matplotlib.gridspec import GridSpec
-from matplotlib.patches import FancyBboxPatch, Rectangle
+from matplotlib.patches import FancyBboxPatch, Rectangle, Patch
 from matplotlib.ticker import FuncFormatter
+
+try:
+    from X_function import get_institutional_stats_finmind
+except Exception:
+    get_institutional_stats_finmind = None
 
 
 # ============================================================
@@ -85,19 +90,17 @@ _THREAD_LOCAL = threading.local()
 BG = "#F5F5F7"        # 淺灰白背景，不使用整片深藍底
 PANEL = "#FFFFFF"     # 圖表面板
 PANEL2 = "#FFFFFF"    # 卡片底色
-GRID = "#E8EBF0"      # 藏青色 20% 版本，作為分隔線 / 淺格線
-TEXT = "#142033"      # 主要文字
-MUTED = "#536179"     # 次要文字
+GRID = "#CAD3DF"      # 淺灰藍格線
+TEXT = "#101828"      # 主要文字
+MUTED = "#667085"     # 次要文字
 NAVY = "#1D2B44"      # 藏青色主色，接近 Apple 常用的沉穩深藍灰
 GOLD = NAVY            # 既有變數沿用為主色
-RED = "#D85C5C"       # 買超 / 上漲，降低彩度
-GREEN = "#2A9D8F"     # 賣超 / 下跌，降低彩度
-BLUE = "#315F95"      # 累計資金流折線，保留
+RED = "#E85D5D"       # 買超 / 上漲
+GREEN = "#2CB39A"     # 賣超 / 下跌
+BLUE = "#315F95"      # 累計資金流折線
 ORANGE = "#F59E0B"
 LIME = "#2E8B57"
 PURPLE = "#6F5BD8"
-NAVY_LIGHT = "#E8EBF0"
-NAVY_SOFT = "#F0F3F7"
 WHITE = "#FFFFFF"
 
 # 字型：GitHub Actions 建議安裝 fonts-noto-cjk
@@ -425,6 +428,108 @@ def get_macd_signals(df):
         notes.append("空頭背離")
     return "．".join(notes)
 
+
+
+# ============================================================
+# 三大法人資料與繪圖
+# ============================================================
+
+def _to_lots(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    # FinMind 有時是股數、有時是張；若數值明顯偏大，轉成張。
+    if s.abs().median(skipna=True) > 50000:
+        return s / 1000.0
+    return s
+
+
+def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
+    """
+    從 X_function.get_institutional_stats_finmind 取回法人資料。
+    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
+    """
+    if get_institutional_stats_finmind is None:
+        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，略過三大法人資料")
+        return pd.DataFrame()
+    try:
+        inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
+    except Exception as e:
+        print(f"⚠️ 三大法人資料抓取失敗：{e}")
+        return pd.DataFrame()
+    if inst is None or inst.empty:
+        return pd.DataFrame()
+    need_cols = {"date", "外資", "投信", "自營商"}
+    if not need_cols.issubset(inst.columns):
+        print(f"⚠️ 法人資料欄位不符：{inst.columns.tolist()}")
+        return pd.DataFrame()
+    out = inst.copy()
+    out["Date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["Date"])
+    out["foreign"] = _to_lots(out["外資"])
+    out["invest"] = _to_lots(out["投信"])
+    out["dealer"] = _to_lots(out["自營商"])
+    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
+    out = out.sort_values("Date").tail(days).reset_index(drop=True)
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
+
+
+def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
+    """三大法人買賣超（正負堆疊柱狀圖），單位：張。"""
+    if not {"foreign", "invest", "dealer"}.issubset(plot_df.columns):
+        ax.text(0.5, 0.5, "尚無三大法人資料", transform=ax.transAxes,
+                ha="center", va="center", fontsize=26, color=MUTED)
+        return
+
+    c_foreign = "#7CB5EC"  # 外資
+    c_invest = "#F59E0B"   # 投信
+    c_dealer = "#9CA3AF"   # 自營商
+
+    f = pd.to_numeric(plot_df["foreign"], errors="coerce").fillna(0).astype(float).values
+    i = pd.to_numeric(plot_df["invest"], errors="coerce").fillna(0).astype(float).values
+    d = pd.to_numeric(plot_df["dealer"], errors="coerce").fillna(0).astype(float).values
+
+    f_pos, i_pos, d_pos = np.clip(f, 0, None), np.clip(i, 0, None), np.clip(d, 0, None)
+    f_neg, i_neg, d_neg = np.clip(f, None, 0), np.clip(i, None, 0), np.clip(d, None, 0)
+
+    width = 0.72
+    alpha = 0.78
+    ax.bar(x, f_pos, width=width, bottom=0, color=c_foreign, alpha=alpha, label="外資")
+    ax.bar(x, i_pos, width=width, bottom=f_pos, color=c_invest, alpha=alpha, label="投信")
+    ax.bar(x, d_pos, width=width, bottom=f_pos + i_pos, color=c_dealer, alpha=alpha, label="自營商")
+    ax.bar(x, f_neg, width=width, bottom=0, color=c_foreign, alpha=alpha)
+    ax.bar(x, i_neg, width=width, bottom=f_neg, color=c_invest, alpha=alpha)
+    ax.bar(x, d_neg, width=width, bottom=f_neg + i_neg, color=c_dealer, alpha=alpha)
+    ax.axhline(0, color=GOLD, linewidth=1.1, linestyle="--", alpha=0.65)
+
+    max_abs = np.nanmax(np.abs(np.concatenate([f, i, d]))) if len(f) else 1
+    max_abs = 1 if max_abs == 0 or pd.isna(max_abs) else max_abs
+    ax.set_ylim(-max_abs * 1.35, max_abs * 1.35)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos=None: f"{v:,.0f}張" if abs(v) >= 1 else "0"))
+
+
+def draw_inst_header_like_legend(inst_ax, plot_df: pd.DataFrame):
+    """依照原始 K 線圖樣式，在三大法人圖上方顯示外資 / 投信 / 自營商 / 合計。"""
+    c_foreign = "#7CB5EC"
+    c_invest = "#F59E0B"
+    c_dealer = "#9CA3AF"
+    c_total = GOLD
+    if plot_df.empty:
+        return
+    last = plot_df.iloc[-1]
+    f = float(last.get("foreign", 0) or 0)
+    i = float(last.get("invest", 0) or 0)
+    d = float(last.get("dealer", 0) or 0)
+    t = f + i + d
+    def fmt(v):
+        return f"{v:+,.0f}張"
+    handles = [
+        Patch(facecolor=c_foreign, edgecolor=c_foreign, label=f"外資 {fmt(f)}"),
+        Patch(facecolor=c_invest, edgecolor=c_invest, label=f"投信 {fmt(i)}"),
+        Patch(facecolor=c_dealer, edgecolor=c_dealer, label=f"自營商 {fmt(d)}"),
+        Patch(facecolor=c_total, edgecolor=c_total, label=f"合計 {fmt(t)}"),
+    ]
+    inst_ax.legend(handles=handles, loc="upper left", ncol=4, frameon=False,
+                   fontsize=26, handlelength=1.1, handletextpad=0.45,
+                   columnspacing=1.15, borderaxespad=0.2, labelcolor=TEXT)
 
 # ============================================================
 # Google Sheet 快取讀取：用來回補「權證 → 標的」或直接取歷史分點快取
@@ -1103,7 +1208,7 @@ def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 
         return parts[:max_items]
     if not NEWS_ENABLE:
         return []
-    query = f'"{stock_code}" OR "{stock_name}" when:7d'
+    query = f'("{stock_code}" OR "{stock_name}") (營收 OR 轉型 OR 題材 OR AI OR 記憶體 OR DRAM OR 半導體 OR 報價 OR 法說 OR 外資 OR 投信) when:7d'
     url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": query,
         "hl": "zh-TW",
@@ -1129,7 +1234,7 @@ def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 
 
 
 def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], ctx: dict | None = None) -> List[str]:
-    """將新聞整理成較適合週報的重點句。"""
+    """整理最近一週新聞，優先抓營收、轉型、題材、產業熱點。"""
     titles = []
     seen = set()
     for t in news_titles or []:
@@ -1139,33 +1244,38 @@ def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], 
         seen.add(s)
         titles.append(s)
 
-    def find_any(keywords):
+    def pick(keywords, used):
         for tt in titles:
+            if tt in used:
+                continue
             if any(k in tt for k in keywords):
+                used.add(tt)
                 return tt
         return ""
 
-    points = []
-    rating = find_any(["調升", "調降", "評等", "目標價", "外資", "投信", "券商"])
-    industry = find_any(["DRAM", "記憶體", "半導體", "報價", "AI", "伺服器", "需求", "供給"])
-    company = find_any([stock_name, stock_code, "法說", "營收", "資本支出", "股利", "產能"])
+    used = set()
+    revenue = pick(["營收", "月增", "年增", "業績", "財報", "獲利", "EPS"], used)
+    theme = pick(["題材", "AI", "伺服器", "記憶體", "DRAM", "半導體", "報價", "HBM", "漲價", "缺貨"], used)
+    transform = pick(["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望"], used)
+    broker = pick(["外資", "投信", "券商", "評等", "目標價", "調升", "調降"], used)
+    company = pick([stock_name, stock_code], used)
 
-    if rating:
-        points.append(f"法人觀點：{rating}")
-    if industry:
-        points.append(f"產業動向：{industry}")
-    if company:
+    points = []
+    if revenue:
+        points.append(f"營收 / 財報：{revenue}")
+    if theme:
+        points.append(f"本週題材：{theme}")
+    if transform:
+        points.append(f"轉型 / 展望：{transform}")
+    if broker:
+        points.append(f"法人觀點：{broker}")
+    if company and len(points) < 4:
         points.append(f"公司消息：{company}")
     if not points and titles:
-        points = [f"本週消息：{t}" for t in titles[:2]]
-
-    if ctx is not None:
-        direction = "偏買超" if ctx.get("total_net", 0) > 0 else "偏賣超" if ctx.get("total_net", 0) < 0 else "多空拉鋸"
-        points.append(f"資金面：本週權證淨流向 {fmt_money(ctx.get('total_net', 0))}，整體籌碼 {direction}。")
-
+        points = [f"新聞線索：{t}" for t in titles[:4]]
     if not points:
-        points = ["若要更精準的『本週重要消息』，建議以環境變數 WEEKLY_NEWS_TEXT 手動覆寫。"]
-    return points[:3]
+        points = ["本週未抓到明確新聞題材；可用 WEEKLY_NEWS_TEXT 手動填入營收、轉型或題材重點。"]
+    return points[:4]
 
 
 # ============================================================
@@ -1174,14 +1284,13 @@ def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], 
 
 def style_ax(ax, title=None, title_color=GOLD):
     ax.set_facecolor(PANEL)
-    ax.tick_params(colors=MUTED, labelsize=33)
+    ax.tick_params(colors=MUTED, labelsize=28)
     for spine in ax.spines.values():
-        spine.set_color(GOLD)
-        spine.set_alpha(0.32)
-        spine.set_linewidth(1.25)
-    ax.grid(True, color=GOLD, alpha=0.10, linewidth=0.85)
+        spine.set_color(GRID)
+        spine.set_linewidth(1.1)
+    ax.grid(True, color=GRID, alpha=0.35, linewidth=0.7)
     if title:
-        ax.set_title(title, loc="left", fontsize=32, color=title_color, fontweight="bold", pad=14)
+        ax.set_title(title, loc="left", fontsize=38, color=title_color, fontweight="bold", pad=14)
     ax.yaxis.label.set_color(MUTED)
     ax.xaxis.label.set_color(MUTED)
 
@@ -1241,9 +1350,9 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
                          boxstyle="round,pad=0.016,rounding_size=0.025",
                          facecolor=PANEL2, edgecolor=GOLD, linewidth=1.5)
     ax.add_patch(box)
-    ax.add_patch(Rectangle((x, y + h - 0.090), w, 0.090, transform=ax.transAxes,
+    ax.add_patch(Rectangle((x, y + h - 0.066), w, 0.066, transform=ax.transAxes,
                            facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-    ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=27, ha="center", va="top")
+    ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=29, ha="center", va="top")
     ax.text(x + w / 2, y + 0.43, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
     if sub:
         ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
@@ -1275,20 +1384,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     daily_net = daily_warrant_net(plot_df, plot_events)
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
     key_points = build_key_points(ctx, stock_name)
-    watch_points = build_watch_points(ctx, stock_name, news_titles)
+    news_points = build_news_points(stock_code, stock_name, news_titles, ctx)
 
-    fig = plt.figure(figsize=(32, 66), facecolor=BG)
+    fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.2, 2.15, 7.0, 2.8, 3.5, 5.5, 12.9, 11.2],
-                  hspace=0.34, wspace=0.25)
+                  height_ratios=[1.15, 2.05, 6.9, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  hspace=0.24, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
-    ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=46, fontweight="bold", ha="left", va="center")
-    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=23, ha="left", va="center")
-    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=44, fontweight="bold", ha="right", va="center")
+    ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=54, fontweight="bold", ha="left", va="center")
+    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=25, ha="left", va="center")
+    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=36, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
@@ -1314,18 +1423,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
     candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
     add_weighted_volume_profile_overlay(candle_ax, plot_df)
-    candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=28, labelcolor=TEXT)
+    candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
     candle_ax.yaxis.tick_right()
     latest = plot_df.iloc[-1]
     prev_close = plot_df["Close"].iloc[-2] if len(plot_df) >= 2 else latest["Close"]
     diff = latest["Close"] - prev_close
     pct = diff / prev_close * 100 if prev_close else np.nan
     latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
-    candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=25, ha="left", va="top",
-                   bbox=dict(facecolor=PANEL2, edgecolor=GOLD, boxstyle="round,pad=0.30", alpha=0.95))
+    candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
+                   bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
-        candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=29, fontweight="bold", ha="center", va="center",
+        candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=31, fontweight="bold", ha="center", va="center",
                        bbox=dict(facecolor="#F6F8FB", edgecolor=GOLD, boxstyle="round,pad=0.28", alpha=0.95))
 
     # Volume
@@ -1335,40 +1444,38 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_lots = plot_df["Volume"] / 1000
     vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
-    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.6, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.6, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.legend(loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
+    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.2, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.2, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
     vol_ax.yaxis.tick_right()
 
-    # KD only (週報版保留單一指標節省空間)
-    kd_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
-    style_ax(kd_ax, "KD 指標")
-    kd_ax.plot(x, plot_df["K9"], color=BLUE, linewidth=3.0, label=f"K9 {plot_df['K9'].iloc[-1]:.2f}")
-    kd_ax.plot(x, plot_df["D9"], color=ORANGE, linewidth=3.0, label=f"D9 {plot_df['D9'].iloc[-1]:.2f}")
-    kd_ax.plot(x, plot_df["J9"], color=LIME, linewidth=2.5, label=f"J9 {plot_df['J9'].iloc[-1]:.2f}")
-    kd_ax.axhline(80, color=RED, linestyle="--", linewidth=0.8, alpha=0.5)
-    kd_ax.axhline(20, color=GREEN, linestyle="--", linewidth=0.8, alpha=0.5)
-    kd_ax.legend(loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
-    kd_note = get_kd_signals(plot_df)
-    if kd_note:
-        kd_ax.text(0.98, 0.93, kd_note, transform=kd_ax.transAxes, ha="right", va="top", color=GOLD, fontsize=21, fontweight="bold")
+    # 三大法人買賣超（取代 KD）
+    inst_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
+    style_ax(inst_ax, "三大法人買賣超")
+    plot_institutional_stacked_bars(inst_ax, plot_df, x)
+    draw_inst_header_like_legend(inst_ax, plot_df)
+    inst_ax.yaxis.tick_right()
 
     # Warrant daily net bars + cumulative line
     wnet_ax = fig.add_subplot(gs[5, :], sharex=candle_ax)
     style_ax(wnet_ax, "權證資金流｜柱狀 = 單日淨買賣超；折線 = 累計淨買賣超")
     vals = daily_net["net_amount"].astype(float).values
     cum_vals = np.cumsum(vals)
-    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label="單日淨買賣超")
+    latest_net = vals[-1] if len(vals) else 0.0
+    latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
+    bar_label = f"單日淨買賣超｜最新日 {fmt_money(latest_net)}"
+    line_label = f"累計淨買賣超｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}"
+    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label=bar_label)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
-    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label="累計淨買賣超")
+    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label=line_label)
     if len(cum_vals):
         cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
         lim = max(abs(cmax), abs(cmin), 1.0)
         # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
-        wnet_ax2.set_ylim(-lim * 4.2, lim * 4.2)
+        wnet_ax2.set_ylim(-lim * 3.2, lim * 3.2)
     wnet_ax2.tick_params(colors=MUTED, labelsize=22)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
@@ -1376,12 +1483,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax2.grid(False)
     h1, l1 = wnet_ax.get_legend_handles_labels()
     h2, l2 = wnet_ax2.get_legend_handles_labels()
-    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
-    latest_net = vals[-1] if len(vals) else 0.0
-    latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
-    wnet_ax.text(0.99, 0.75, f"最新日 {fmt_money(latest_net)}｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}", transform=wnet_ax.transAxes,
-                 color=WHITE, fontsize=27, fontweight="bold", ha="right", va="top",
-                 bbox=dict(facecolor=GOLD, edgecolor=GOLD, boxstyle="round,pad=0.32", alpha=0.96))
+    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=30, labelcolor=TEXT)
 
     # TOP5 tables
     ax_top = fig.add_subplot(gs[6, :])
@@ -1393,16 +1495,15 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ]
     for x0, title, df_top, side_color in sections:
         ax_top.add_patch(FancyBboxPatch((x0, 0.02), 0.46, 0.965, transform=ax_top.transAxes,
-                                        boxstyle="round,pad=0.016,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.6))
+                                        boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35))
         ax_top.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=GOLD, fontsize=38, fontweight="bold", ha="left", va="top")
-        ax_top.add_patch(Rectangle((x0 + 0.015, 0.765), 0.43, 0.060, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0.8, alpha=0.96))
-        ax_top.text(x0 + 0.025, 0.812, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.82, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
         if df_top.empty:
-            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=21, ha="left", va="center")
+            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
         else:
-            y = 0.69
-            row_gap = 0.162
+            y = 0.73
+            row_gap = 0.15
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
                 amt = float(r["net_amount"])
@@ -1412,38 +1513,38 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 # rank circle
                 circ_x = x0 + 0.03
                 circ_y = y - 0.005
-                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=27, fontweight="bold",
-                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.27", facecolor=GOLD, edgecolor=GOLD))
-                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=34, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=44, fontweight="bold", ha="right", va="center")
-                rep = f"代表權證：{wcode} {wname[:9]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, y - 0.066, rep, transform=ax_top.transAxes, color=MUTED, fontsize=39, ha="left", va="center")
-                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.124, y - 0.124], transform=ax_top.transAxes, color=GOLD, linewidth=0.8, alpha=0.16)
+                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold",
+                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
+                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
+                ax_top.text(x0 + 0.06, y - 0.060, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
                 y -= row_gap
 
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
-    for x0, title in [(0.02, "本週重點"), (0.52, "下週觀察 / 重要消息")]:
+    for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
         ax_notes.add_patch(FancyBboxPatch((x0, 0.035), 0.46, 0.93, transform=ax_notes.transAxes,
-                                          boxstyle="round,pad=0.018,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.6))
+                                          boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
         ax_notes.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_notes.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-        ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=40, fontweight="bold", ha="left", va="top")
-    y = 0.80
+        ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=42, fontweight="bold", ha="left", va="top")
+    y = 0.79
     for p in key_points[:4]:
-        ax_notes.text(0.04, y, "• " + wrap_text(p, width=30, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=38, ha="left", va="top")
-        y -= 0.215
-    y = 0.80
-    for p in watch_points[:5]:
-        ax_notes.text(0.54, y, "• " + wrap_text(p, width=30, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=38, ha="left", va="top")
-        y -= 0.215
+        ax_notes.text(0.04, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        y -= 0.165
+    y = 0.79
+    for p in news_points[:5]:
+        ax_notes.text(0.54, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        y -= 0.165
 
     # x ticks
     interval = max(1, len(x) // 12)
-    for ax in [candle_ax, vol_ax, kd_ax, wnet_ax]:
+    for ax in [candle_ax, vol_ax, inst_ax, wnet_ax]:
         ax.set_xlim(-1, len(x))
     wnet_ax.set_xticks(x[::interval])
-    wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=30)
-    for ax in [candle_ax, vol_ax, kd_ax]:
+    wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=26)
+    for ax in [candle_ax, vol_ax, inst_ax]:
         plt.setp(ax.get_xticklabels(), visible=False)
 
     fig.subplots_adjust(left=0.035, right=0.965, top=0.975, bottom=0.03)
@@ -1464,6 +1565,19 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             return None
         stock_df = calculate_indicators(stock_df)
         stock_df["Close_prev"] = stock_df["Close"].shift(1)
+
+        # 三大法人資料：對齊股價日期，讓週報可顯示三大法人買賣超。
+        inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
+        if inst_df is not None and not inst_df.empty:
+            inst_df = inst_df.copy()
+            inst_df["Date"] = pd.to_datetime(inst_df["Date"]).dt.tz_localize(None)
+            inst_df = inst_df.set_index("Date").sort_index()
+            stock_df = stock_df.join(inst_df[["foreign", "invest", "dealer", "total"]], how="left")
+        for c in ["foreign", "invest", "dealer", "total"]:
+            if c not in stock_df.columns:
+                stock_df[c] = 0.0
+        stock_df[["foreign", "invest", "dealer", "total"]] = stock_df[["foreign", "invest", "dealer", "total"]].fillna(0.0)
+
         plot_df = stock_df.tail(CHART_LOOKBACK)
         start_date = pd.Timestamp(plot_df.index.min()).normalize()
         end_date = pd.Timestamp(plot_df.index.max()).normalize()
