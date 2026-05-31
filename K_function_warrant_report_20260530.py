@@ -90,9 +90,9 @@ TEXT = "#142033"      # 主要文字
 MUTED = "#536179"     # 次要文字
 NAVY = "#1D2B44"      # 藏青色主色，接近 Apple 常用的沉穩深藍灰
 GOLD = NAVY            # 既有變數沿用為主色
-RED = "#E85D5D"       # 買超 / 上漲
-GREEN = "#2CB39A"     # 賣超 / 下跌
-BLUE = "#315F95"      # 累計資金流折線
+RED = "#D85C5C"       # 買超 / 上漲，降低彩度
+GREEN = "#2A9D8F"     # 賣超 / 下跌，降低彩度
+BLUE = "#315F95"      # 累計資金流折線，保留
 ORANGE = "#F59E0B"
 LIME = "#2E8B57"
 PURPLE = "#6F5BD8"
@@ -1174,14 +1174,14 @@ def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], 
 
 def style_ax(ax, title=None, title_color=GOLD):
     ax.set_facecolor(PANEL)
-    ax.tick_params(colors=MUTED, labelsize=31)
+    ax.tick_params(colors=MUTED, labelsize=33)
     for spine in ax.spines.values():
         spine.set_color(GOLD)
         spine.set_alpha(0.32)
         spine.set_linewidth(1.25)
     ax.grid(True, color=GOLD, alpha=0.10, linewidth=0.85)
     if title:
-        ax.set_title(title, loc="left", fontsize=31, color=title_color, fontweight="bold", pad=14)
+        ax.set_title(title, loc="left", fontsize=32, color=title_color, fontweight="bold", pad=14)
     ax.yaxis.label.set_color(MUTED)
     ax.xaxis.label.set_color(MUTED)
 
@@ -1241,7 +1241,7 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
                          boxstyle="round,pad=0.016,rounding_size=0.025",
                          facecolor=PANEL2, edgecolor=GOLD, linewidth=1.5)
     ax.add_patch(box)
-    ax.add_patch(Rectangle((x, y + h - 0.080), w, 0.080, transform=ax.transAxes,
+    ax.add_patch(Rectangle((x, y + h - 0.090), w, 0.090, transform=ax.transAxes,
                            facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
     ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=27, ha="center", va="top")
     ax.text(x + w / 2, y + 0.43, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
@@ -1277,10 +1277,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     key_points = build_key_points(ctx, stock_name)
     watch_points = build_watch_points(ctx, stock_name, news_titles)
 
-    fig = plt.figure(figsize=(31, 62), facecolor=BG)
+    fig = plt.figure(figsize=(32, 66), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.2, 2.15, 7.0, 2.8, 3.5, 5.5, 12.3, 10.2],
-                  hspace=0.30, wspace=0.25)
+                  height_ratios=[1.2, 2.15, 7.0, 2.8, 3.5, 5.5, 12.9, 11.2],
+                  hspace=0.34, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -1288,7 +1288,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
     ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=46, fontweight="bold", ha="left", va="center")
     ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=23, ha="left", va="center")
-    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=41, fontweight="bold", ha="right", va="center")
+    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=44, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
@@ -1314,7 +1314,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
     candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
     add_weighted_volume_profile_overlay(candle_ax, plot_df)
-    candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
+    candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=28, labelcolor=TEXT)
     candle_ax.yaxis.tick_right()
     latest = plot_df.iloc[-1]
     prev_close = plot_df["Close"].iloc[-2] if len(plot_df) >= 2 else latest["Close"]
@@ -1322,7 +1322,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     pct = diff / prev_close * 100 if prev_close else np.nan
     latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
     candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=25, ha="left", va="top",
-                   bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
+                   bbox=dict(facecolor=PANEL2, edgecolor=GOLD, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
         candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=29, fontweight="bold", ha="center", va="center",
@@ -1337,7 +1337,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
     vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.6, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
     vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.6, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
+    vol_ax.legend(loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
     vol_ax.yaxis.tick_right()
 
     # KD only (週報版保留單一指標節省空間)
@@ -1348,7 +1348,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     kd_ax.plot(x, plot_df["J9"], color=LIME, linewidth=2.5, label=f"J9 {plot_df['J9'].iloc[-1]:.2f}")
     kd_ax.axhline(80, color=RED, linestyle="--", linewidth=0.8, alpha=0.5)
     kd_ax.axhline(20, color=GREEN, linestyle="--", linewidth=0.8, alpha=0.5)
-    kd_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
+    kd_ax.legend(loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
     kd_note = get_kd_signals(plot_df)
     if kd_note:
         kd_ax.text(0.98, 0.93, kd_note, transform=kd_ax.transAxes, ha="right", va="top", color=GOLD, fontsize=21, fontweight="bold")
@@ -1376,11 +1376,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax2.grid(False)
     h1, l1 = wnet_ax.get_legend_handles_labels()
     h2, l2 = wnet_ax2.get_legend_handles_labels()
-    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
+    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=28, labelcolor=TEXT)
     latest_net = vals[-1] if len(vals) else 0.0
     latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
     wnet_ax.text(0.99, 0.75, f"最新日 {fmt_money(latest_net)}｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}", transform=wnet_ax.transAxes,
-                 color=WHITE, fontsize=24, fontweight="bold", ha="right", va="top",
+                 color=WHITE, fontsize=27, fontweight="bold", ha="right", va="top",
                  bbox=dict(facecolor=GOLD, edgecolor=GOLD, boxstyle="round,pad=0.32", alpha=0.96))
 
     # TOP5 tables
@@ -1395,14 +1395,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ax_top.add_patch(FancyBboxPatch((x0, 0.02), 0.46, 0.965, transform=ax_top.transAxes,
                                         boxstyle="round,pad=0.016,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.6))
         ax_top.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=38, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=GOLD, fontsize=38, fontweight="bold", ha="left", va="top")
         ax_top.add_patch(Rectangle((x0 + 0.015, 0.765), 0.43, 0.060, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0.8, alpha=0.96))
         ax_top.text(x0 + 0.025, 0.812, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold", ha="left", va="top")
         if df_top.empty:
             ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=21, ha="left", va="center")
         else:
-            y = 0.695
-            row_gap = 0.158
+            y = 0.69
+            row_gap = 0.162
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
                 amt = float(r["net_amount"])
@@ -1414,10 +1414,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 circ_y = y - 0.005
                 ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=27, fontweight="bold",
                            ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.27", facecolor=GOLD, edgecolor=GOLD))
-                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=32, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=41, fontweight="bold", ha="right", va="center")
+                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=34, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=44, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:9]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, y - 0.066, rep, transform=ax_top.transAxes, color=MUTED, fontsize=36, ha="left", va="center")
+                ax_top.text(x0 + 0.06, y - 0.066, rep, transform=ax_top.transAxes, color=MUTED, fontsize=39, ha="left", va="center")
                 ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.124, y - 0.124], transform=ax_top.transAxes, color=GOLD, linewidth=0.8, alpha=0.16)
                 y -= row_gap
 
@@ -1430,19 +1430,19 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=40, fontweight="bold", ha="left", va="top")
     y = 0.80
     for p in key_points[:4]:
-        ax_notes.text(0.04, y, "• " + wrap_text(p, width=31, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=35, ha="left", va="top")
-        y -= 0.205
+        ax_notes.text(0.04, y, "• " + wrap_text(p, width=30, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=38, ha="left", va="top")
+        y -= 0.215
     y = 0.80
     for p in watch_points[:5]:
-        ax_notes.text(0.54, y, "• " + wrap_text(p, width=31, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=35, ha="left", va="top")
-        y -= 0.205
+        ax_notes.text(0.54, y, "• " + wrap_text(p, width=30, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=38, ha="left", va="top")
+        y -= 0.215
 
     # x ticks
     interval = max(1, len(x) // 12)
     for ax in [candle_ax, vol_ax, kd_ax, wnet_ax]:
         ax.set_xlim(-1, len(x))
     wnet_ax.set_xticks(x[::interval])
-    wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=28)
+    wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=30)
     for ax in [candle_ax, vol_ax, kd_ax]:
         plt.setp(ax.get_xticklabels(), visible=False)
 
