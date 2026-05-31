@@ -15,6 +15,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 import yfinance as yf
 
 import matplotlib
@@ -66,8 +67,8 @@ WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
 API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
 API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
-API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "12"))
-API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "10"))
+API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
+API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
@@ -86,6 +87,17 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip
 FULL_MARKET_CACHE_SHEET = os.getenv("WARRANT_FULL_MARKET_CACHE_SHEET", "快取_全市場分點歷史").strip()
 LEGACY_CACHE_SHEET = os.getenv("WARRANT_LEGACY_CACHE_SHEET", "快取_分點歷史").strip()
 USE_LEGACY_CACHE = os.getenv("WARRANT_USE_LEGACY_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# OpenAPI 防呆：參考原權證回測程式的「TWSE + TPEx 最新成交認購權證」邏輯。
+# cache 模式會先抓官方即時 OpenAPI；若假日或其中一邊暫時空值，會改用此快取表備援，避免全市場資料少掉上市/上櫃。
+OPENAPI_DAILY_CACHE_SHEET = os.getenv("WARRANT_OPENAPI_DAILY_CACHE_SHEET", "快取_OpenAPI每日成交").strip()
+OPENAPI_FALLBACK_ENABLE = os.getenv("WARRANT_OPENAPI_FALLBACK_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+OPENAPI_REQUIRE_BOTH_MARKETS = os.getenv("WARRANT_OPENAPI_REQUIRE_BOTH_MARKETS", "1").strip().lower() not in ("0", "false", "no")
+OPENAPI_LATEST_TRADE_DATE = ""
+TPEX_WARRANT_DAILY_OPENAPI_URLS = [
+    TPEX_WARRANT_DAILY_OPENAPI_URL,
+    "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_warrant_trading_overview",
+]
 
 _THREAD_LOCAL = threading.local()
 
@@ -122,9 +134,13 @@ plt.rcParams["axes.unicode_minus"] = False
 # ============================================================
 
 def get_thread_session() -> requests.Session:
+    """每個 thread 使用自己的 Session，並重用 HTTP connection，加速大量 API4 / API5 請求。"""
     session = getattr(_THREAD_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         _THREAD_LOCAL.session = session
     return session
 
@@ -757,22 +773,28 @@ def upsert_full_market_cache_to_gsheet(events: pd.DataFrame, sheet_name: str = F
 # ============================================================
 
 def fetch_openapi_json(url: str, source_name: str):
+    print(f"  🌐 抓取 {source_name} OpenAPI：{url}")
     try:
         r = get_thread_session().get(url, headers=OPENAPI_WARRANT_HEADERS, timeout=(8, 30))
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, list):
-            print(f"✅ {source_name} OpenAPI：{len(data):,} 筆")
-            return data
+        if not isinstance(data, list):
+            raise RuntimeError(f"{source_name} OpenAPI 回傳格式不是 list：{type(data)}")
+        print(f"  ✅ {source_name} OpenAPI：{len(data):,} 筆")
+        return data
     except Exception as e:
-        print(f"⚠️ {source_name} OpenAPI 抓取失敗：{e}")
-    return []
+        print(f"  ⚠️ {source_name} OpenAPI 抓取失敗：{type(e).__name__}: {e}")
+        return []
 
 
 def fetch_twse_openapi_warrant_daily_df() -> pd.DataFrame:
     data = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
     df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}.issubset(df.columns):
+    if df.empty:
+        return pd.DataFrame()
+    required = {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}
+    if not required.issubset(df.columns):
+        print(f"  ⚠️ 上市 TWSE 欄位不完整，實際欄位：{df.columns.tolist()}")
         return pd.DataFrame()
     out = pd.DataFrame()
     out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
@@ -786,54 +808,152 @@ def fetch_twse_openapi_warrant_daily_df() -> pd.DataFrame:
 
 
 def fetch_tpex_openapi_warrant_daily_df() -> pd.DataFrame:
-    data = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
-    df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}.issubset(df.columns):
-        return pd.DataFrame()
-    out = pd.DataFrame()
-    out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
-    out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-    out["市場"] = "上櫃"
-    out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-    out["名稱"] = df["權證名稱"].astype(str).str.strip()
-    out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    out["成交量"] = df["成交數量"].map(clean_openapi_number)
-    return out
+    """TPEx 偶爾會短暫回傳空值，這裡參考原回測程式做多 URL + 重試。"""
+    urls = []
+    for url in TPEX_WARRANT_DAILY_OPENAPI_URLS:
+        if url and url not in urls:
+            urls.append(url)
+
+    for attempt in range(1, 4):
+        for url in urls:
+            data = fetch_openapi_json(url, f"上櫃 TPEx 第{attempt}次")
+            df = pd.DataFrame(data).fillna("")
+            if df.empty:
+                continue
+            required = {"交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}
+            if not required.issubset(df.columns):
+                print(f"  ⚠️ 上櫃 TPEx 欄位不完整，實際欄位：{df.columns.tolist()}")
+                continue
+            out = pd.DataFrame()
+            date_col = "Date" if "Date" in df.columns else "交易日期"
+            out["出表日期"] = df[date_col].map(normalize_openapi_trade_date)
+            out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+            out["市場"] = "上櫃"
+            out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+            out["名稱"] = df["權證名稱"].astype(str).str.strip()
+            out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+            out["成交量"] = df["成交數量"].map(clean_openapi_number)
+            if not out.empty:
+                return out
+        if attempt < 3:
+            print("  ⚠️ TPEx OpenAPI 暫時沒有資料，等待 5 秒後重試...")
+            time.sleep(5)
+    return pd.DataFrame()
 
 
-def make_stock_aliases(stock_name: str) -> List[str]:
-    name = str(stock_name or "").strip().replace(" ", "")
-    aliases = [name] if name else []
-    suffixes = ["半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療", "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業", "企業", "國際", "控股", "投控"]
-    stripped = name
-    changed = True
-    while changed:
-        changed = False
-        for suf in suffixes:
-            if stripped.endswith(suf) and len(stripped) > len(suf) + 1:
-                stripped = stripped[: -len(suf)]
-                if len(stripped) >= 2 and stripped not in aliases:
-                    aliases.append(stripped)
-                changed = True
-                break
-    # 不主動切兩字，避免昇陽半/昇陽這類誤判；只保留三字以上安全前綴
-    if len(name) >= 3 and name[:3] not in aliases:
-        aliases.append(name[:3])
-    return [a for a in aliases if a]
+OPENAPI_DAILY_CACHE_COLS = ["出表日期", "交易日期", "市場", "代號", "名稱", "成交金額", "成交量"]
 
 
-def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
+def normalize_openapi_daily_cache_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+    df = df.copy().fillna("")
+    if all(c in df.columns for c in ["交易日期", "市場", "代號", "名稱", "成交量"]):
+        out = pd.DataFrame()
+        out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date) if "出表日期" in df.columns else df["交易日期"].map(normalize_openapi_trade_date)
+        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+        out["市場"] = df["市場"].astype(str).str.strip()
+        out["代號"] = df["代號"].map(normalize_openapi_warrant_code)
+        out["名稱"] = df["名稱"].astype(str).str.strip()
+        out["成交金額"] = df["成交金額"].map(clean_openapi_number) if "成交金額" in df.columns else 0
+        out["成交量"] = df["成交量"].map(clean_openapi_number)
+        return out[OPENAPI_DAILY_CACHE_COLS]
+    return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+
+def _write_dataframe_to_worksheet(title: str, df: pd.DataFrame, chunk_rows: int = 3000) -> bool:
+    sh = _open_gsheet()
+    if sh is None:
+        return False
+    try:
+        ws = _get_or_create_worksheet(sh, title, rows=max(len(df) + 50, 1000), cols=max(len(df.columns), 10))
+        values = [list(df.columns)] + df.astype(str).fillna("").values.tolist()
+        ws.clear()
+        ws.resize(rows=max(len(values) + 50, 1000), cols=max(len(df.columns), 10))
+        for start in range(0, len(values), chunk_rows):
+            ws.update(values=values[start:start + chunk_rows], range_name=f"A{start + 1}", value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Google Sheet 寫入 {title} 失敗：{type(e).__name__}: {e}")
+        return False
+
+
+def save_openapi_daily_cache_df(df: pd.DataFrame) -> None:
+    df = normalize_openapi_daily_cache_df(df)
+    if df.empty:
+        return
+    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
+    if _write_dataframe_to_worksheet(OPENAPI_DAILY_CACHE_SHEET, df[OPENAPI_DAILY_CACHE_COLS]):
+        latest = get_openapi_latest_trade_date(df)
+        print(f"  💾 已更新 {OPENAPI_DAILY_CACHE_SHEET}：{len(df):,} 筆，最新交易日 {latest or '-'}")
+
+
+def load_openapi_daily_cache_df() -> pd.DataFrame:
+    raw = read_gsheet_worksheet(OPENAPI_DAILY_CACHE_SHEET)
+    df = normalize_openapi_daily_cache_df(raw)
+    if df.empty:
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
+    latest = get_openapi_latest_trade_date(df)
+    print(f"  ♻️ 已讀取 {OPENAPI_DAILY_CACHE_SHEET}：{len(df):,} 筆，最新交易日 {latest or '-'}")
+    return df[OPENAPI_DAILY_CACHE_COLS]
+
+
+def get_openapi_latest_trade_date(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "交易日期" not in df.columns:
+        return ""
+    dates = sorted([d for d in df["交易日期"].dropna().unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
+    return dates[-1] if dates else ""
+
+
+def get_openapi_active_call_df() -> pd.DataFrame:
+    """取得最新交易日有成交量的全市場認購權證，並做 TWSE / TPEx 缺資料防呆。"""
+    global OPENAPI_LATEST_TRADE_DATE
+
+    twse_df = fetch_twse_openapi_warrant_daily_df()
+    tpex_df = fetch_tpex_openapi_warrant_daily_df()
     frames = []
-    for f in [fetch_twse_openapi_warrant_daily_df(), fetch_tpex_openapi_warrant_daily_df()]:
-        if f is not None and not f.empty:
-            frames.append(f)
-    if not frames:
-        return []
-    all_df = pd.concat(frames, ignore_index=True).fillna("")
-    trade_dates = sorted([d for d in all_df["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
-    if not trade_dates:
-        return []
-    latest_trade_date = trade_dates[-1]
+    if twse_df is not None and not twse_df.empty:
+        frames.append(twse_df)
+    if tpex_df is not None and not tpex_df.empty:
+        frames.append(tpex_df)
+
+    live_ok = bool(frames) and (not OPENAPI_REQUIRE_BOTH_MARKETS or (twse_df is not None and not twse_df.empty and tpex_df is not None and not tpex_df.empty))
+    if live_ok:
+        all_df = pd.concat(frames, ignore_index=True).fillna("")
+        all_df = normalize_openapi_daily_cache_df(all_df)
+        save_openapi_daily_cache_df(all_df)
+        source_desc = "官方即時 live"
+    else:
+        missing = []
+        if twse_df is None or twse_df.empty:
+            missing.append("TWSE 上市")
+        if tpex_df is None or tpex_df.empty:
+            missing.append("TPEx 上櫃")
+        print(f"  ⚠️ 官方 OpenAPI 缺少資料：{', '.join(missing) or '未知'}")
+        if not OPENAPI_FALLBACK_ENABLE:
+            print("  ❌ WARRANTY_OPENAPI_FALLBACK_ENABLE=0，停止使用備援快取")
+            return pd.DataFrame()
+        all_df = load_openapi_daily_cache_df()
+        if all_df.empty:
+            # 若沒有合併快取，至少使用本次已抓到的市場資料，避免完全沒有資料。
+            if frames:
+                all_df = normalize_openapi_daily_cache_df(pd.concat(frames, ignore_index=True).fillna(""))
+                source_desc = "官方即時 live（單市場資料）"
+            else:
+                print("  ❌ 找不到可用 OpenAPI live 或防呆快取")
+                return pd.DataFrame()
+        else:
+            source_desc = "Google Sheet OpenAPI 防呆快取"
+
+    all_df = normalize_openapi_daily_cache_df(all_df)
+    all_df = all_df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last")
+    latest_trade_date = get_openapi_latest_trade_date(all_df)
+    OPENAPI_LATEST_TRADE_DATE = latest_trade_date
+    if not latest_trade_date:
+        print("  ⚠️ OpenAPI 資料沒有有效交易日期")
+        return pd.DataFrame()
+
     active_df = all_df[
         (all_df["交易日期"] == latest_trade_date)
         & (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
@@ -841,34 +961,142 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
         & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
         & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
     ].copy()
+    active_df = active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).reset_index(drop=True)
+
+    twse_count = len(active_df[active_df["市場"] == "上市"]) if not active_df.empty else 0
+    tpex_count = len(active_df[active_df["市場"] == "上櫃"]) if not active_df.empty else 0
+    print(f"  ✅ OpenAPI 使用來源：{source_desc}")
+    print(f"  ✅ OpenAPI 最新交易日：{latest_trade_date}")
+    print(f"  ✅ 最新交易日成交量 > 0 認購權證：{len(active_df):,} 支（上市 {twse_count:,} / 上櫃 {tpex_count:,}）")
+    return active_df
+
+
+def normalize_stock_name_text(s: str) -> str:
+    return str(s or "").strip().replace(" ", "").replace("　", "")
+
+
+def make_stock_aliases(stock_name: str, exact_stock_names=None) -> List[str]:
+    name = normalize_stock_name_text(stock_name)
+    aliases = set([name]) if name else set()
+    exact_stock_names = {normalize_stock_name_text(x) for x in (exact_stock_names or set()) if normalize_stock_name_text(x)}
+    ambiguous_aliases = {
+        "台灣", "臺灣", "台股", "臺股", "元大", "富邦", "國泰", "群益",
+        "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光",
+        "第一", "第一金", "日盛", "華南", "華南永昌",
+    }
+    issuer_prefixes = ["元大", "富邦", "國泰", "群益", "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光", "第一金", "日盛", "華南永昌"]
+    suffixes = ["半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療", "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業", "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品", "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥"]
+
+    def add_safe_alias(candidate: str) -> None:
+        c = normalize_stock_name_text(candidate)
+        if not c or len(c) < 2:
+            return
+        if c in ambiguous_aliases:
+            return
+        if c in exact_stock_names and c != name:
+            return
+        aliases.add(c)
+
+    for issuer in issuer_prefixes:
+        if name.startswith(issuer) and len(name) > len(issuer) + 1:
+            candidate = name[len(issuer):]
+            if any(ch.isdigit() for ch in candidate) or len(candidate) >= 3:
+                add_safe_alias(candidate)
+
+    stripped = name
+    changed = True
+    while changed:
+        changed = False
+        for suf in suffixes:
+            if stripped.endswith(suf) and len(stripped) > len(suf) + 1:
+                stripped = stripped[:-len(suf)]
+                add_safe_alias(stripped)
+                changed = True
+                break
+
+    # 只補三字以上前綴，避免「昇陽半」誤切成「昇陽」後撞到另一檔股票。
+    for n in range(min(4, len(name)), 2, -1):
+        add_safe_alias(name[:n])
+    return sorted(aliases, key=len, reverse=True)
+
+
+def build_stock_name_map_from_warrant_lookup(lookup: Dict[str, dict]) -> Dict[str, str]:
+    stock_map = {}
+    for rec in lookup.values():
+        ucode = _clean_code(rec.get("underlying_code", ""))
+        uname = normalize_stock_name_text(rec.get("underlying_name", ""))
+        if ucode and uname:
+            stock_map.setdefault(uname, ucode)
+    return stock_map
+
+
+def resolve_underlying_by_warrant_name(warrant_name: str, stock_map: Dict[str, str]) -> Tuple[str, str]:
+    wname = normalize_stock_name_text(warrant_name)
+    if not wname or not stock_map:
+        return "", ""
+    exact_names = set(stock_map.keys())
+    candidates = []
+    for sname, scode in stock_map.items():
+        for alias in make_stock_aliases(sname, exact_names):
+            if alias and wname.startswith(alias):
+                candidates.append((len(alias), scode, sname))
+    if not candidates:
+        return "", ""
+    candidates.sort(reverse=True)
+    _, scode, sname = candidates[0]
+    return scode, sname
+
+
+def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
+    """取得指定標的的最新交易日有成交認購權證；母體是全市場 TWSE + TPEx，不限制任何分點。"""
+    active_df = get_openapi_active_call_df()
+    if active_df is None or active_df.empty:
+        return []
+
     lookup = load_warrant_underlying_lookup()
-    aliases = make_stock_aliases(stock_name)
+    stock_map = build_stock_name_map_from_warrant_lookup(lookup)
+    # 把本次查詢標的加入 stock_map，讓第一次沒有舊快取時也能用權證名稱前綴判斷。
+    if stock_name and stock_code:
+        stock_map.setdefault(normalize_stock_name_text(stock_name), str(stock_code))
+
+    aliases = make_stock_aliases(stock_name, exact_stock_names=set(stock_map.keys()))
     warrants = []
     seen = set()
+    stock_code = str(stock_code).strip()
+
     for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
         code = normalize_openapi_warrant_code(r.get("代號"))
         name = str(r.get("名稱", "")).strip()
         if not code or code in seen:
             continue
+
         cached = lookup.get(code, {})
         ucode = _clean_code(cached.get("underlying_code", ""))
         uname = str(cached.get("underlying_name", "")).strip()
-        name_match = any(name.replace(" ", "").startswith(a) for a in aliases if a)
-        if ucode == str(stock_code) or name_match:
+        if not ucode:
+            ucode2, uname2 = resolve_underlying_by_warrant_name(name, stock_map)
+            ucode = ucode2 or ucode
+            uname = uname or uname2
+
+        name_norm = normalize_stock_name_text(name)
+        name_match = any(alias and name_norm.startswith(alias) for alias in aliases)
+        if ucode == stock_code or name_match:
             seen.add(code)
             warrants.append({
                 "代號": code,
                 "名稱": name,
-                "標的股": str(stock_code),
+                "標的股": stock_code,
                 "標的名稱": uname or stock_name,
+                "交易日期": str(r.get("交易日期", "")).strip(),
+                "市場": str(r.get("市場", "")).strip(),
                 "成交金額": int(r.get("成交金額", 0) or 0),
                 "成交量": int(r.get("成交量", 0) or 0),
             })
+
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-    print(f"✅ {stock_code} 相關有成交認購權證：{len(warrants):,} 支")
+    print(f"✅ {stock_code} 相關有成交認購權證：{len(warrants):,} 支（全市場 TWSE+TPEx 母體）")
     return warrants
-
 
 def api4_get(code, start, end):
     try:
@@ -991,11 +1219,16 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
 
 
 def fetch_live_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
-    """只抓 live 全市場權證分點資料，不讀 Google Sheet 快取。"""
-    end_dt = pd.Timestamp(end_date).to_pydatetime()
-    start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
-    end_s = end_dt.strftime("%Y/%m/%d")
+    """只抓 live 全市場權證分點資料，不讀 Google Sheet 快取。
+
+    參考原權證回測程式的重點修正：API4 預篩日期要跟 OpenAPI 最新交易日一致，
+    不要在假日或非交易日時用 datetime.today() 去查，否則會掃不到分點。
+    """
     warrants = get_all_active_call_warrants(stock_code, stock_name)
+    target_dt = parse_date(OPENAPI_LATEST_TRADE_DATE) or pd.Timestamp(end_date).to_pydatetime()
+    start_s = (target_dt - timedelta(days=max(1, API4_SCAN_CALENDAR_DAYS) - 1)).strftime("%Y/%m/%d")
+    end_s = target_dt.strftime("%Y/%m/%d")
+    print(f"✅ API4 全分點掃描日期範圍：{start_s} ~ {end_s}（OpenAPI 最新交易日：{OPENAPI_LATEST_TRADE_DATE or '-'}）")
     pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
     live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
     if live is None or live.empty:
