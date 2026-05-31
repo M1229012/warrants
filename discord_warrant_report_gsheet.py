@@ -1856,19 +1856,43 @@ def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
 
 def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> list[date]:
     """
-    從 A/B/C/D 買超事件中抓出 <= target 的有效事件日期，
-    再往前取最近 N 個「有資料的交易日」。
+    取得 TOP15 統計用的近 N 個有效交易日。
 
-    這樣春節、連假、休市時不會因為日曆天不足而失真。
+    修正版重點：
+    - 優先從「快取_分點歷史」抓交易日，因為這張是原始 API5 歷史資料，
+      每日產圖模式一定會更新，且不會因 A/B/C/D 完整表尚未同步完成而抓不到日期。
+    - 若「快取_分點歷史」讀不到，才退回 A/B/C/D 與 今日_A/B/C/D 事件表抓日期。
+
+    這可以避免每日產圖模式中，TOP15 出現「近 0 個有效交易日 / 無有效期間」的問題。
     """
-    dates = set()
+    dates: set[date] = set()
 
+    # 1) 優先用原始歷史快取取得有效交易日。
+    try:
+        hist_df = read_gsheet_table_optional(SHEET_HISTORY, ["日期", "分點"])
+        if not hist_df.empty and "日期" in hist_df.columns:
+            for _, r in hist_df.iterrows():
+                d = parse_date_value(r.get("日期"))
+                if d and d <= target:
+                    dates.add(d)
+    except Exception:
+        pass
+
+    if dates:
+        result = sorted(dates, reverse=True)[:lookback_days]
+        print(
+            f"TOP15 統計交易日來源：{SHEET_HISTORY}，"
+            f"近 {len(result)} 個有效交易日"
+            + (f"，期間 {min(result):%Y/%m/%d} ~ {max(result):%Y/%m/%d}" if result else "")
+        )
+        return result
+
+    # 2) 備援：從 A/B/C/D 事件表與今日事件表取得有效交易日。
     plans = [
         (SHEET_A_FULL, ["分點", "買進日"]),
         (SHEET_B_FULL, ["分點", "事件日"]),
         (SHEET_C_FULL, ["分點", "結束日"]),
         (SHEET_D_FULL, ["分點", "結束日"]),
-        # 每日產圖模式只更新今日表時，也要把今日交易日納入 TOP15 統計區間。
         (SHEET_A, ["分點", "買進日"]),
         (SHEET_B, ["分點", "事件日"]),
         (SHEET_C, ["分點", "結束日"]),
@@ -1886,7 +1910,12 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
             if d and d <= target:
                 dates.add(d)
 
-    return sorted(dates, reverse=True)[:lookback_days]
+    result = sorted(dates, reverse=True)[:lookback_days]
+    print(
+        f"TOP15 統計交易日來源：A/B/C/D 事件表，近 {len(result)} 個有效交易日"
+        + (f"，期間 {min(result):%Y/%m/%d} ~ {max(result):%Y/%m/%d}" if result else "")
+    )
+    return result
 
 
 def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
@@ -1909,6 +1938,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     date_set = set(trading_dates)
 
     if not trading_dates:
+        print("⚠️ TOP15 找不到有效交易日，請確認快取_分點歷史 / A/B/C/D 工作表是否已同步到 Google Sheet。")
         return [], []
 
     agg = {}
