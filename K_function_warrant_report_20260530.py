@@ -1582,6 +1582,64 @@ def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
     ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
 
 
+def adjust_volume_ylim(ax, plot_df: pd.DataFrame):
+    """增加成交量圖上方留白，避免大量柱狀或均量線貼到 legend / 圖框。"""
+    if plot_df is None or plot_df.empty:
+        return
+
+    values = []
+    if "Volume" in plot_df.columns:
+        s = pd.to_numeric(plot_df["Volume"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna() / 1000
+        if not s.empty:
+            values.append(s)
+    for col in ["MV5", "MV20"]:
+        if col in plot_df.columns:
+            s = pd.to_numeric(plot_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna() / 1000
+            if not s.empty:
+                values.append(s)
+
+    if not values:
+        return
+
+    all_values = pd.concat(values, ignore_index=True)
+    y_max = float(all_values.max())
+    if not np.isfinite(y_max) or y_max <= 0:
+        return
+
+    # 成交量沒有負值，直接把上緣放大，讓 legend 與最高量柱中間有空間。
+    ax.set_ylim(0, y_max * 1.45)
+
+
+def adjust_institutional_ylim(ax, plot_df: pd.DataFrame):
+    """增加三大法人圖上下留白，避免正負堆疊柱貼到 legend、文字或圖框。"""
+    if plot_df is None or plot_df.empty:
+        return
+    if not {"foreign", "invest", "dealer"}.issubset(plot_df.columns):
+        return
+
+    f = pd.to_numeric(plot_df["foreign"], errors="coerce").fillna(0).astype(float).values
+    i = pd.to_numeric(plot_df["invest"], errors="coerce").fillna(0).astype(float).values
+    d = pd.to_numeric(plot_df["dealer"], errors="coerce").fillna(0).astype(float).values
+    if len(f) == 0:
+        return
+
+    pos_stack = np.clip(f, 0, None) + np.clip(i, 0, None) + np.clip(d, 0, None)
+    neg_stack = np.clip(f, None, 0) + np.clip(i, None, 0) + np.clip(d, None, 0)
+    y_min = min(float(np.nanmin(neg_stack)), 0.0)
+    y_max = max(float(np.nanmax(pos_stack)), 0.0)
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        return
+
+    span = y_max - y_min
+    if span <= 0:
+        span = max(abs(y_max), abs(y_min), 1.0)
+
+    # 上方留白比下方多一點，避免 legend 與正值堆疊柱互相壓到。
+    upper_pad = span * 0.32
+    lower_pad = span * 0.18
+    ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
+
+
 def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_titles: List[str]):
     ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
@@ -1662,6 +1720,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
     vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
     vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+    adjust_volume_ylim(vol_ax, plot_df)
     vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
     vol_ax.yaxis.tick_right()
 
@@ -1669,6 +1728,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     inst_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
     style_ax(inst_ax, "三大法人買賣超")
     plot_institutional_stacked_bars(inst_ax, plot_df, x)
+    adjust_institutional_ylim(inst_ax, plot_df)
     draw_inst_header_like_legend(inst_ax, plot_df)
     inst_ax.yaxis.tick_right()
 
