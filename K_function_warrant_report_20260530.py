@@ -1,2447 +1,1668 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-每日精選分點買賣超追蹤圖卡｜Google Sheet 讀取版
-
-用途：
-- 直接讀取 Google Sheet「權證分點籌碼」內的 A/B/C/D 與勝率統計工作表
-- 不需要本機 Excel
-- 產生一頁式 PNG
-- 發送到 DISCORD_WEBHOOK_URL_TEST
-
-必要 GitHub Secrets：
-- GCP_SERVICE_KEY
-- DISCORD_WEBHOOK_URL_TEST
-
-可選環境變數：
-- GOOGLE_SHEET_ID：建議使用，最穩
-- GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟，預設「權證分點籌碼」
-- TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
-- ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
-"""
-
-from __future__ import annotations
-
-import os
-import math
-import re
+import io
 import json
-import argparse
-from pathlib import Path
-from collections import defaultdict, Counter
-from datetime import datetime, date, timedelta
+import math
+import os
+import re
+import textwrap
+import time
+import threading
+import urllib.parse
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
 
-import requests
+import numpy as np
 import pandas as pd
-from PIL import Image, ImageDraw, ImageFont
+import requests
+import yfinance as yf
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib import font_manager
+import matplotlib.font_manager as fm
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import FancyBboxPatch, Rectangle, Patch
+from matplotlib.ticker import FuncFormatter
+
+try:
+    from X_function import get_institutional_stats_finmind
+except Exception:
+    get_institutional_stats_finmind = None
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ============================================================
 # 基本設定
-# ══════════════════════════════════════════════════════════════════════
+# ============================================================
 
-TRACKED_BROKERS = [
-    "華南永昌台中",
-    "元大南屯",
-    "永豐金竹北",
-    "永豐金內湖",
-    "富邦敦南",
-]
-
-BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
-SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.2"))
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
-LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "22"))
-# 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
-ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
-
-# 若你未來想讓「出清不管金額都顯示」，改成 "1"
-DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
-
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-
-# 完整歷史表：給加碼次數、近一個月共識買超、勝率/歷史查詢使用。
-SHEET_A_FULL = os.getenv("SHEET_A_FULL", "A_單檔大買")
-SHEET_B_FULL = os.getenv("SHEET_B_FULL", "B_同標的單日合計")
-SHEET_C_FULL = os.getenv("SHEET_C_FULL", "C_同標的3日累積")
-SHEET_D_FULL = os.getenv("SHEET_D_FULL", "D_近10日累積淨買進")
-
-# 每日產圖表：給今日買賣超圖卡使用。這裡預設讀主程式產出的「今日_*」工作表，
-# 避免圖片誤讀完整歷史 A/B/C/D，導致每日圖卡少資料或吃到舊資料。
-SHEET_A = os.getenv("SHEET_A", "今日_A_單檔大買")
-SHEET_B = os.getenv("SHEET_B", "今日_B_同標的單日合計")
-SHEET_C = os.getenv("SHEET_C", "今日_C_同標的3日累積")
-SHEET_D = os.getenv("SHEET_D", "今日_D_近10日累積淨買進")
-SHEET_STAT = "勝率統計"
-SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
-SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
-SHEET_SOURCE_WARNING = os.getenv("SHEET_SOURCE_WARNING", "資料來源警示")
-
-NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
-# 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
-# 仍納入今日賣超明細。預設沿用買超門檻 100 萬。
-NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
-    os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
-)
-
-# 常見權證發行券商關鍵字，用來從權證名稱中反推標的股名。
-WARRANT_ISSUER_TOKENS = [
-    "元大", "凱基", "群益", "富邦", "國泰", "永豐", "永豐金", "國票", "中信",
-    "台新", "兆豐", "元富", "玉山", "第一金", "新光", "日盛", "康和", "統一",
-    "宏遠", "合庫", "犇亞", "華南永昌", "台企銀", "聯邦", "高盛", "瑞銀",
-    "摩根大通", "麥格理", "法銀巴黎", "上海商銀"
-]
-
-# 已知 ETF / 指數型商品名稱對應。
-# 目的：避免權證名稱「台灣50...」被主表舊標的股代號誤帶成 3045。
-KNOWN_UNDERLYING_NAME_CODE_MAP = {
-    "台灣50": "0050",
-    "臺灣50": "0050",
-    "元大台灣50": "0050",
-    "元大臺灣50": "0050",
+HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
+    "Referer": "https://pscnetsecrwd.moneydj.com/",
 }
 
+OPENAPI_WARRANT_HEADERS = {
+    "User-Agent": HDR["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
-_STOCK_NAME_MAP = None
+TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
+TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
 
-# 浮水印設定
-WATERMARK_TEXT = "By 股市艾斯出品-轉傳請註明\n資訊分享非投資建議 投資請自行評估風險"
-WATERMARK_ALPHA = 0.80
+API4 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
+    "/9b/6e/0a/TwWarrantData.xdjjson"
+    "?a={code}&x=warrant-chip0002-4&c={start}&d={end}&revision=2018_07_31_1"
+)
+API5 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
+    "/d8/f5/27/twWarrantData.xdjjson"
+    "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
+)
 
-CENTER_WATERMARK_TEXT = "股市艾斯\n台股DC討論群"
-CENTER_WATERMARK_ALPHA = 0.06
-CENTER_WATERMARK_FONT_SIZE = 108
-CENTER_WATERMARK_ROTATION = 18
+# 週報參數
+WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
+CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
+API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
+API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
+API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "12"))
+API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "10"))
+MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
+MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
+LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_FALLBACK_ENABLE = os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+# 疑似造市 / 避險對沖設定
+# 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
+HEDGE_MARK_THRESHOLD = float(os.getenv("WARRANT_HEDGE_MARK_THRESHOLD", os.getenv("WARRANT_HEDGE_THRESHOLD", "0.08")))
+HEDGE_FILTER_THRESHOLD = float(os.getenv("WARRANT_HEDGE_FILTER_THRESHOLD", "0.03"))
+HEDGE_FILTER_ENABLE = os.getenv("WARRANT_HEDGE_FILTER_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+HEDGE_MIN_GROSS_AMOUNT = float(os.getenv("WARRANT_HEDGE_MIN_GROSS_AMOUNT", "3000000"))
+HEDGE_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_HEDGE_MIN_SIDE_AMOUNT", "1000000"))
 
-# 事件代號說明
-EVENT_LEGEND_ITEMS = [
-    ("A", "單檔權證單日大買"),
-    ("B", "同標的單日合買"),
-    ("C", "同標的3日累積"),
-    ("D", "近10日累積淨買"),
-]
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 
+_THREAD_LOCAL = threading.local()
 
-# ══════════════════════════════════════════════════════════════════════
-# Google Sheet 讀取
-# ══════════════════════════════════════════════════════════════════════
+# 視覺風格：淺背景 + Apple 風格藏青色元素
+BG = "#F5F5F7"        # 淺灰白背景，不使用整片深藍底
+PANEL = "#FFFFFF"     # 圖表面板
+PANEL2 = "#FFFFFF"    # 卡片底色
+GRID = "#CAD3DF"      # 淺灰藍格線
+TEXT = "#101828"      # 主要文字
+MUTED = "#667085"     # 次要文字
+NAVY = "#1D2B44"      # 藏青色主色，接近 Apple 常用的沉穩深藍灰
+GOLD = NAVY            # 既有變數沿用為主色
+RED = "#E85D5D"       # 買超 / 上漲
+GREEN = "#2CB39A"     # 賣超 / 下跌
+BLUE = "#315F95"      # 累計資金流折線
+ORANGE = "#F59E0B"
+LIME = "#2E8B57"
+PURPLE = "#6F5BD8"
+WHITE = "#FFFFFF"
 
-_GSHEET = None
-
-
-def get_gsheet():
-    global _GSHEET
-    if _GSHEET is not None:
-        return _GSHEET
-
-    service_key = os.getenv("GCP_SERVICE_KEY", "").strip()
-    if not service_key:
-        raise RuntimeError("找不到 GCP_SERVICE_KEY，請先在 GitHub Secrets 設定。")
-
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    info = json.loads(service_key)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    if GOOGLE_SHEET_ID:
-        _GSHEET = gc.open_by_key(GOOGLE_SHEET_ID)
-    else:
-        _GSHEET = gc.open(GOOGLE_SHEET_NAME)
-
-    return _GSHEET
-
-
-def strip_gsheet_text_prefix(v):
-    s = "" if v is None else str(v).strip()
-    return s[1:] if s.startswith("'") else s
-
-
-def worksheet_values(sheet_name: str) -> list[list[str]]:
-    sh = get_gsheet()
-    ws = sh.worksheet(sheet_name)
-    return ws.get_all_values()
+# 字型：GitHub Actions 建議安裝 fonts-noto-cjk
+available_fonts = [f.name for f in fm.fontManager.ttflist]
+for font_name in ["Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans TC", "Microsoft JhengHei", "SimHei"]:
+    if font_name in available_fonts:
+        plt.rcParams["font.family"] = font_name
+        break
+else:
+    plt.rcParams["font.family"] = "DejaVu Sans"
+plt.rcParams["axes.unicode_minus"] = False
 
 
-def read_gsheet_table(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
-    """
-    讀取一般工作表：
-    - 第 1 列是表頭
-    - 後面是資料
-    - 自動補齊欄位數
-    - 只保留 needed_cols 交集
-    - 篩選 TRACKED_BROKERS
-    """
-    values = worksheet_values(sheet_name)
-    if not values:
-        return pd.DataFrame()
+# ============================================================
+# 共用工具
+# ============================================================
 
-    headers = [str(h).strip() for h in values[0]]
-    if not headers or all(h == "" for h in headers):
-        return pd.DataFrame()
+def get_thread_session() -> requests.Session:
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_LOCAL.session = session
+    return session
 
-    n_cols = len(headers)
-    rows = []
-    for row in values[1:]:
-        row = list(row)
-        if len(row) < n_cols:
-            row += [""] * (n_cols - len(row))
-        elif len(row) > n_cols:
-            row = row[:n_cols]
-        rows.append([strip_gsheet_text_prefix(x) for x in row])
 
-    df = pd.DataFrame(rows, columns=headers).fillna("")
+def _clean_code(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip().replace("'", "")
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s.strip()
 
-    if needed_cols is not None:
-        keep_cols = [c for c in needed_cols if c in df.columns]
-        df = df[keep_cols].copy()
 
-    if "分點" in df.columns:
-        df = df[df["分點"].isin(TRACKED_BROKERS)].copy()
+def normalize_openapi_warrant_code(code) -> str:
+    s = str(code or "").strip().upper().replace("'", "")
+    if s.endswith(".0"):
+        s = s[:-2]
+    if s.isdigit() and len(s) == 5:
+        s = s.zfill(6)
+    return s
 
+
+def normalize_date_str(date_str) -> str:
+    dt = parse_date(date_str)
+    return dt.strftime("%Y/%m/%d") if dt else str(date_str or "").strip()
+
+
+def parse_date(date_str):
+    try:
+        if date_str is None:
+            return None
+        s = str(date_str).strip().replace("-", "/").replace(".", "/")
+        if not s or s in ("-", "--", "nan", "None"):
+            return None
+        if re.fullmatch(r"\d{7}", s):  # ROC yyyMMdd
+            y = int(s[:3]) + 1911
+            m = int(s[3:5])
+            d = int(s[5:7])
+            return datetime(y, m, d)
+        if re.fullmatch(r"\d{8}", s):
+            y = int(s[:4])
+            m = int(s[4:6])
+            d = int(s[6:8])
+            if y < 1911:
+                y += 1911
+            return datetime(y, m, d)
+        parts = s.split("/")
+        if len(parts) != 3:
+            return None
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        if y < 1911:
+            y += 1911
+        return datetime(y, m, d)
+    except Exception:
+        return None
+
+
+def normalize_openapi_trade_date(date_value) -> str:
+    dt = parse_date(date_value)
+    return dt.strftime("%Y/%m/%d") if dt else str(date_value or "").strip()
+
+
+def parse_openapi_trade_date_for_sort(date_value):
+    return parse_date(date_value) or datetime.min
+
+
+def clean_openapi_number(value) -> int:
+    if value is None:
+        return 0
+    s = str(value).strip().replace(",", "").replace(" ", "").replace("　", "")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if not s or s in ("-", "."):
+        return 0
+    try:
+        return int(round(float(s)))
+    except Exception:
+        return 0
+
+
+def fmt_money(v: float) -> str:
+    try:
+        v = float(v)
+    except Exception:
+        return "-"
+    sign = "+" if v > 0 else "-" if v < 0 else ""
+    av = abs(v)
+    if av >= 100000000:
+        return f"{sign}{av / 100000000:.2f}億"
+    if av >= 10000:
+        return f"{sign}{av / 10000:.0f}萬"
+    return f"{v:+,.0f}"
+
+
+def fmt_money_abs(v: float) -> str:
+    return fmt_money(abs(float(v)))
+
+
+def fmt_pct(v: float) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{v:+.2f}%"
+
+
+def money_tick(v, pos=None):
+    try:
+        return fmt_money(v).replace("+", "")
+    except Exception:
+        return str(v)
+
+
+def wrap_text(s: str, width: int = 18, max_lines: int = 2) -> str:
+    s = str(s or "").strip()
+    if len(s) <= width:
+        return s
+    lines = textwrap.wrap(s, width=width)
+    lines = lines[:max_lines]
+    if len("".join(lines)) < len(s):
+        lines[-1] = lines[-1][: max(0, width - 1)] + "…"
+    return "\n".join(lines)
+
+
+# ============================================================
+# 股價 / 指標
+# ============================================================
+
+def get_tw_stock_name(stock_code: str) -> str:
+    stock_code = str(stock_code).strip()
+    # TWSE
+    try:
+        url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json"
+        resp = requests.get(url, timeout=8)
+        for item in resp.json().get("data", []):
+            if str(item[0]).strip() == stock_code:
+                return str(item[1]).strip()
+    except Exception:
+        pass
+    # TPEx
+    try:
+        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=json"
+        resp = requests.get(url, timeout=8)
+        tables = resp.json().get("tables", [])
+        if tables:
+            for item in tables[0].get("data", []):
+                if str(item[0]).strip() == stock_code:
+                    return str(item[1]).strip()
+    except Exception:
+        pass
+    return "未知公司"
+
+
+def fetch_stock_data_yf(stock_code: str, period="160d"):
+    for suffix, market in [("TW", "上市"), ("TWO", "上櫃")]:
+        full_code = f"{stock_code}.{suffix}"
+        try:
+            print(f"🔍 下載股價：{full_code}")
+            df = yf.download(full_code, period=period, interval="1d", progress=False, auto_adjust=False)
+            if df is None or df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            need = {"Open", "High", "Low", "Close", "Volume"}
+            if not need.issubset(df.columns):
+                continue
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy().dropna()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df.index.name = "Date"
+            return df, market, full_code
+        except Exception as e:
+            print(f"⚠️ {full_code} 下載失敗：{e}")
+    return None, None, None
+
+
+def add_supertrend(df: pd.DataFrame, period=10, multiplier=2.5, use_atr=True) -> pd.DataFrame:
+    df = df.copy()
+    hl2 = (df["High"] + df["Low"]) / 2
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"] - df["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean() if use_atr else tr.rolling(period).mean()
+    upper_basic = hl2 - multiplier * atr
+    lower_basic = hl2 + multiplier * atr
+    upper_band = upper_basic.copy()
+    lower_band = lower_basic.copy()
+    trend = [1]
+    supertrend = [np.nan]
+    buy_signal = [False]
+    sell_signal = [False]
+    for i in range(1, len(df)):
+        upper_band.iloc[i] = max(upper_basic.iloc[i], upper_band.iloc[i - 1]) if df["Close"].iloc[i - 1] > upper_band.iloc[i - 1] else upper_basic.iloc[i]
+        lower_band.iloc[i] = min(lower_basic.iloc[i], lower_band.iloc[i - 1]) if df["Close"].iloc[i - 1] < lower_band.iloc[i - 1] else lower_basic.iloc[i]
+        prev = trend[-1]
+        if prev == -1 and df["Close"].iloc[i] > lower_band.iloc[i - 1]:
+            trend.append(1)
+        elif prev == 1 and df["Close"].iloc[i] < upper_band.iloc[i - 1]:
+            trend.append(-1)
+        else:
+            trend.append(prev)
+        buy_signal.append(trend[-1] == 1 and trend[-2] == -1)
+        sell_signal.append(trend[-1] == -1 and trend[-2] == 1)
+        supertrend.append(upper_band.iloc[i] if trend[-1] == 1 else lower_band.iloc[i])
+    return pd.DataFrame({
+        "Supertrend": supertrend,
+        "Supertrend_Trend": trend,
+        "Supertrend_Buy": buy_signal,
+        "Supertrend_Sell": sell_signal,
+    }, index=df.index)
+
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for n in [5, 10, 20, 60]:
+        df[f"MA{n}"] = df["Close"].rolling(n).mean()
+    df["MV5"] = df["Volume"].rolling(5).mean()
+    df["MV20"] = df["Volume"].rolling(20).mean()
+    low_min = df["Low"].rolling(9).min()
+    high_max = df["High"].rolling(9).max()
+    rsv = (df["Close"] - low_min) / (high_max - low_min) * 100
+    df["K9"] = rsv.ewm(com=2).mean()
+    df["D9"] = df["K9"].ewm(com=2).mean()
+    df["J9"] = 3 * df["K9"] - 2 * df["D9"]
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["DIF"] = ema12 - ema26
+    df["MACD"] = df["DIF"].ewm(span=9, adjust=False).mean()
+    df["OSC"] = df["DIF"] - df["MACD"]
+    df["BB_MID"] = df["Close"].rolling(20).mean()
+    df["BB_STD"] = df["Close"].rolling(20).std()
+    df["BB_UPPER"] = df["BB_MID"] + 2 * df["BB_STD"]
+    df["BB_LOWER"] = df["BB_MID"] - 2 * df["BB_STD"]
+    df["BB_WIDTH"] = df["BB_UPPER"] - df["BB_LOWER"]
+    df[["Supertrend", "Supertrend_Trend", "Supertrend_Buy", "Supertrend_Sell"]] = add_supertrend(df)
     return df
 
 
-def read_gsheet_stat_raw() -> pd.DataFrame:
-    """
-    勝率統計表不是標準單一表頭，因此用 header=None 方式讀。
-    """
-    values = worksheet_values(SHEET_STAT)
-    max_cols = max((len(r) for r in values), default=0)
-    fixed = []
-    for row in values:
-        row = list(row)
-        if len(row) < max_cols:
-            row += [""] * (max_cols - len(row))
-        fixed.append([strip_gsheet_text_prefix(x) for x in row])
-    return pd.DataFrame(fixed).fillna("")
+def get_ma_kline_signals(df: pd.DataFrame) -> str:
+    if len(df) < 3:
+        return ""
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    notes = []
+    if latest["MA5"] > latest["MA10"] > latest["MA20"] > latest["MA60"]:
+        notes.append("均線多頭排列")
+    elif latest["MA5"] < latest["MA10"] < latest["MA20"] < latest["MA60"]:
+        notes.append("均線空頭排列")
+    if prev["MA5"] < prev["MA20"] and latest["MA5"] > latest["MA20"]:
+        notes.append("均線黃金交叉")
+    elif prev["MA5"] > prev["MA20"] and latest["MA5"] < latest["MA20"]:
+        notes.append("均線死亡交叉")
+    if all(latest["Close"] > latest[ma] for ma in ["MA5", "MA10", "MA20", "MA60"]):
+        notes.append("強勢站上均線")
+    elif all(latest["Close"] < latest[ma] for ma in ["MA5", "MA10", "MA20", "MA60"]):
+        notes.append("全面跌破均線")
+    if latest["Close"] > latest["MA60"] and latest["Close"] > latest["Open"] and latest["Volume"] > prev["Volume"]:
+        notes.append("帶量突破年線")
+    if latest["Close"] < latest["MA20"] and latest["Close"] < latest["Open"] and latest["Volume"] > prev["Volume"]:
+        notes.append("帶量長黑跌破月線")
+    return "．".join(notes)
 
 
-def read_gsheet_table_optional(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
+def get_kd_signals(df):
+    if len(df) < 2:
+        return ""
+    k, d, j = df["K9"].iloc[-1], df["D9"].iloc[-1], df["J9"].iloc[-1]
+    kp, dp, jp = df["K9"].iloc[-2], df["D9"].iloc[-2], df["J9"].iloc[-2]
+    notes = []
+    if kp < dp and k > d:
+        notes.append("KD黃金交叉")
+    if kp > dp and k < d:
+        notes.append("KD死亡交叉")
+    if k < 20 and k > kp:
+        notes.append("K低檔翻揚")
+    if k > 80 and k < kp:
+        notes.append("K高檔鈍化")
+    if jp < kp and j > k:
+        notes.append("J上穿K")
+    if jp > kp and j < k:
+        notes.append("J下穿K")
+    if j >= 100:
+        notes.append("J過熱")
+    if j <= 0:
+        notes.append("J過冷")
+    return "．".join(notes)
+
+
+def get_macd_signals(df):
+    if len(df) < 7:
+        return ""
+    dif, macd, osc, close = df["DIF"], df["MACD"], df["OSC"], df["Close"]
+    notes = []
+    if dif.iloc[-2] < macd.iloc[-2] and dif.iloc[-1] > macd.iloc[-1]:
+        notes.append("MACD黃叉")
+    if dif.iloc[-2] > macd.iloc[-2] and dif.iloc[-1] < macd.iloc[-1]:
+        notes.append("MACD死叉")
+    if osc.iloc[-2] < 0 and osc.iloc[-1] > 0:
+        notes.append("OSC翻多")
+    if osc.iloc[-2] > 0 and osc.iloc[-1] < 0:
+        notes.append("OSC翻空")
+    n = 6
+    if close.iloc[-1] < close.iloc[-n] and dif.iloc[-1] > dif.iloc[-n] and osc.iloc[-1] < 0:
+        notes.append("多頭背離")
+    if close.iloc[-1] > close.iloc[-n] and dif.iloc[-1] < dif.iloc[-n] and osc.iloc[-1] > 0:
+        notes.append("空頭背離")
+    return "．".join(notes)
+
+
+
+# ============================================================
+# 三大法人資料與繪圖
+# ============================================================
+
+def _to_lots(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    # FinMind 有時是股數、有時是張；若數值明顯偏大，轉成張。
+    if s.abs().median(skipna=True) > 50000:
+        return s / 1000.0
+    return s
+
+
+def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     """
-    讀取可能不存在的工作表。
-    主要用於「每日賣出明細」：若舊版主程式尚未產生該表，圖片程式不應直接中斷。
+    從 X_function.get_institutional_stats_finmind 取回法人資料。
+    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
     """
+    if get_institutional_stats_finmind is None:
+        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，略過三大法人資料")
+        return pd.DataFrame()
     try:
-        return read_gsheet_table(sheet_name, needed_cols)
+        inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
+    except Exception as e:
+        print(f"⚠️ 三大法人資料抓取失敗：{e}")
+        return pd.DataFrame()
+    if inst is None or inst.empty:
+        return pd.DataFrame()
+    need_cols = {"date", "外資", "投信", "自營商"}
+    if not need_cols.issubset(inst.columns):
+        print(f"⚠️ 法人資料欄位不符：{inst.columns.tolist()}")
+        return pd.DataFrame()
+    out = inst.copy()
+    out["Date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["Date"])
+    out["foreign"] = _to_lots(out["外資"])
+    out["invest"] = _to_lots(out["投信"])
+    out["dealer"] = _to_lots(out["自營商"])
+    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
+    out = out.sort_values("Date").tail(days).reset_index(drop=True)
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
+
+
+def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
+    """三大法人買賣超（正負堆疊柱狀圖），單位：張。"""
+    if not {"foreign", "invest", "dealer"}.issubset(plot_df.columns):
+        ax.text(0.5, 0.5, "尚無三大法人資料", transform=ax.transAxes,
+                ha="center", va="center", fontsize=26, color=MUTED)
+        return
+
+    c_foreign = "#7CB5EC"  # 外資
+    c_invest = "#F59E0B"   # 投信
+    c_dealer = "#9CA3AF"   # 自營商
+
+    f = pd.to_numeric(plot_df["foreign"], errors="coerce").fillna(0).astype(float).values
+    i = pd.to_numeric(plot_df["invest"], errors="coerce").fillna(0).astype(float).values
+    d = pd.to_numeric(plot_df["dealer"], errors="coerce").fillna(0).astype(float).values
+
+    f_pos, i_pos, d_pos = np.clip(f, 0, None), np.clip(i, 0, None), np.clip(d, 0, None)
+    f_neg, i_neg, d_neg = np.clip(f, None, 0), np.clip(i, None, 0), np.clip(d, None, 0)
+
+    width = 0.72
+    alpha = 0.78
+    ax.bar(x, f_pos, width=width, bottom=0, color=c_foreign, alpha=alpha, label="外資")
+    ax.bar(x, i_pos, width=width, bottom=f_pos, color=c_invest, alpha=alpha, label="投信")
+    ax.bar(x, d_pos, width=width, bottom=f_pos + i_pos, color=c_dealer, alpha=alpha, label="自營商")
+    ax.bar(x, f_neg, width=width, bottom=0, color=c_foreign, alpha=alpha)
+    ax.bar(x, i_neg, width=width, bottom=f_neg, color=c_invest, alpha=alpha)
+    ax.bar(x, d_neg, width=width, bottom=f_neg + i_neg, color=c_dealer, alpha=alpha)
+    ax.axhline(0, color=GOLD, linewidth=1.1, linestyle="--", alpha=0.65)
+
+    max_abs = np.nanmax(np.abs(np.concatenate([f, i, d]))) if len(f) else 1
+    max_abs = 1 if max_abs == 0 or pd.isna(max_abs) else max_abs
+    ax.set_ylim(-max_abs * 1.35, max_abs * 1.35)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos=None: f"{v:,.0f}張" if abs(v) >= 1 else "0"))
+
+
+def draw_inst_header_like_legend(inst_ax, plot_df: pd.DataFrame):
+    """依照原始 K 線圖樣式，在三大法人圖上方顯示外資 / 投信 / 自營商 / 合計。"""
+    c_foreign = "#7CB5EC"
+    c_invest = "#F59E0B"
+    c_dealer = "#9CA3AF"
+    c_total = GOLD
+    if plot_df.empty:
+        return
+    last = plot_df.iloc[-1]
+    f = float(last.get("foreign", 0) or 0)
+    i = float(last.get("invest", 0) or 0)
+    d = float(last.get("dealer", 0) or 0)
+    t = f + i + d
+    def fmt(v):
+        return f"{v:+,.0f}張"
+    handles = [
+        Patch(facecolor=c_foreign, edgecolor=c_foreign, label=f"外資 {fmt(f)}"),
+        Patch(facecolor=c_invest, edgecolor=c_invest, label=f"投信 {fmt(i)}"),
+        Patch(facecolor=c_dealer, edgecolor=c_dealer, label=f"自營商 {fmt(d)}"),
+        Patch(facecolor=c_total, edgecolor=c_total, label=f"合計 {fmt(t)}"),
+    ]
+    inst_ax.legend(handles=handles, loc="upper left", ncol=4, frameon=False,
+                   fontsize=26, handlelength=1.1, handletextpad=0.45,
+                   columnspacing=1.15, borderaxespad=0.2, labelcolor=TEXT)
+
+# ============================================================
+# Google Sheet 快取讀取：用來回補「權證 → 標的」或直接取歷史分點快取
+# ============================================================
+
+def _build_gspread_client():
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as e:
+        print(f"⚠️ gspread/google-auth 未安裝，略過 Google Sheet 快取：{e}")
+        return None
+    raw_key = os.getenv("GCP_SERVICE_KEY", "").strip()
+    if not raw_key:
+        return None
+    try:
+        info = json.loads(raw_key)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"⚠️ GCP_SERVICE_KEY 解析失敗：{e}")
+        return None
+
+
+def _open_gsheet():
+    gc = _build_gspread_client()
+    if gc is None:
+        return None
+    try:
+        return gc.open_by_key(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else gc.open(GOOGLE_SHEET_NAME)
+    except Exception as e:
+        print(f"⚠️ Google Sheet 開啟失敗：{e}")
+        return None
+
+
+def read_gsheet_worksheet(title: str) -> pd.DataFrame:
+    if not GSHEET_FALLBACK_ENABLE:
+        return pd.DataFrame()
+    sh = _open_gsheet()
+    if sh is None:
+        return pd.DataFrame()
+    try:
+        ws = sh.worksheet(title)
+        records = ws.get_all_records(empty2zero=False, head=1)
+        return pd.DataFrame(records).fillna("") if records else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 
-def read_data_source_warning_from_gsheet() -> dict:
-    """讀取主程式輸出的「資料來源警示」工作表，若使用防呆舊資料則在圖卡上標示。"""
-    info = {
-        "used_fallback": False,
-        "latest_trade_date": "",
-        "warning": "",
-        "source_mode": "",
+def normalize_history_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    df = raw_df.copy().fillna("")
+    col_map = {
+        "日期": "Date",
+        "權證代號": "warrant_code",
+        "權證名稱": "warrant_name",
+        "標的股": "underlying_code",
+        "標的名稱": "underlying_name",
+        "分點": "branch",
+        "分點名稱": "broker_name",
+        "券商代號": "broker_code",
+        "買進金額": "buy_amount",
+        "賣出金額": "sell_amount",
+        "買超金額": "net_amount",
     }
+    missing = [c for c in col_map if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    for src, dst in col_map.items():
+        out[dst] = df[src]
+    out["Date"] = out["Date"].map(lambda x: pd.Timestamp(normalize_date_str(x)) if parse_date(x) else pd.NaT)
+    out = out.dropna(subset=["Date"])
+    out["Date"] = out["Date"].dt.normalize()
+    for c in ["buy_amount", "sell_amount", "net_amount"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(float)
+    out["warrant_code"] = out["warrant_code"].map(normalize_openapi_warrant_code)
+    out["underlying_code"] = out["underlying_code"].map(_clean_code)
+    out["branch"] = out["branch"].astype(str).str.strip()
+    out["broker_name"] = out["broker_name"].astype(str).str.strip()
+    out["branch"] = np.where(out["branch"].str.len() > 0, out["branch"], out["broker_name"])
+    out["side"] = np.where(out["net_amount"] >= 0, "買超", "賣超")
+    return out
 
-    try:
-        values = worksheet_values(SHEET_SOURCE_WARNING)
-    except Exception:
-        return info
 
-    for row in values[1:]:
-        if len(row) < 2:
+def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
+    raw = read_gsheet_worksheet("快取_分點歷史")
+    events = normalize_history_cache_df(raw)
+    if events.empty:
+        return pd.DataFrame()
+    stock_code = _clean_code(stock_code)
+    events = events[events["underlying_code"].astype(str) == stock_code].copy()
+    if start_date is not None:
+        events = events[events["Date"] >= pd.Timestamp(start_date).normalize()]
+    if end_date is not None:
+        events = events[events["Date"] <= pd.Timestamp(end_date).normalize()]
+    return events.reset_index(drop=True)
+
+
+def load_warrant_underlying_lookup() -> Dict[str, dict]:
+    lookup = {}
+    for sheet_name in ["快取_權證清單", "快取_分點歷史", "快取_候選組合_OpenAPI精選5", "快取_候選組合", "快取_候選組合_精選5"]:
+        df = read_gsheet_worksheet(sheet_name)
+        if df is None or df.empty:
             continue
-        key = strip_gsheet_text_prefix(row[0]).strip()
-        val = strip_gsheet_text_prefix(row[1]).strip()
-
-        if key == "資料來源模式":
-            info["source_mode"] = val
-        elif key == "是否使用舊資料防呆":
-            info["used_fallback"] = val == "是"
-        elif key == "本次權證成交資料交易日":
-            info["latest_trade_date"] = val
-        elif key == "警示說明":
-            info["warning"] = val
-
-    return info
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 資料清洗工具
-# ══════════════════════════════════════════════════════════════════════
-
-def parse_google_serial_date(s: str) -> date | None:
-    """
-    Google Sheet 若日期格式沒有套好，可能會變成 46160 這種日期序號。
-    Google Sheets 日期序號：1899-12-30 為 day 0。
-    """
-    try:
-        if not re.fullmatch(r"\d+(\.0)?", str(s).strip()):
-            return None
-        serial = int(float(str(s).strip()))
-        if serial < 20000 or serial > 80000:
-            return None
-        return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
-    except Exception:
-        return None
-
-
-def parse_date_value(v) -> date | None:
-    if v is None:
-        return None
-
-    s = strip_gsheet_text_prefix(v)
-    if not s or s == "-":
-        return None
-
-    serial_date = parse_google_serial_date(s)
-    if serial_date:
-        return serial_date
-
-    try:
-        # 支援 2026/05/18、2026-05-18、2026-05-18 00:00:00
-        t = pd.to_datetime(s.replace("年", "/").replace("月", "/").replace("日", ""), errors="coerce")
-        if pd.isna(t):
-            return None
-        return t.date()
-    except Exception:
-        return None
-
-
-def safe_float(v, default=0.0) -> float:
-    try:
-        if v is None:
-            return default
-
-        s = strip_gsheet_text_prefix(v)
-        if s == "" or s == "-":
-            return default
-
-        # Google Sheet 可能讀到 1,003,600 或 +30.36%
-        s = s.replace(",", "").replace("%", "").replace("＋", "+").strip()
-        if s.startswith("+"):
-            s = s[1:]
-
-        return float(s)
-    except Exception:
-        return default
-
-
-def safe_int(v, default=0) -> int:
-    try:
-        return int(float(str(safe_float(v))))
-    except Exception:
-        return default
-
-
-def normalize_code(v) -> str:
-    s = strip_gsheet_text_prefix(v)
-    if not s or s == "-":
-        return ""
-    if s.endswith(".0") and s[:-2].isdigit():
-        s = s[:-2]
-    return s
-
-
-def normalize_warrant_code(v) -> str:
-    s = normalize_code(v)
-    if not s:
-        return ""
-
-    if s.isdigit() and len(s) == 5:
-        return s.zfill(6)
-
-    return s
-
-
-def normalize_underlying(v, warrant_text: str = "") -> str:
-    s = normalize_code(v)
-
-    # 若權證名稱可明確辨識為特定 ETF / 商品，優先用名稱修正代號。
-    # 例如「台灣50元大5A購08」應為 0050，不應顯示成 3045。
-    name = ""
-    try:
-        if warrant_text:
-            name = extract_stock_name_from_warrant_text(warrant_text)
-    except Exception:
-        name = ""
-
-    if name:
-        mapped_code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(name)
-        if mapped_code:
-            return mapped_code
-
-    if s.isdigit():
-        # 股票 / ETF 標的代號應保留前導 0，例如 0050。
-        # 若 Google Sheet 曾把 0050 轉成 50，這裡補回 4 碼。
-        if len(s) < 4:
-            return s.zfill(4)
-        return s
-
-    return s
-
-
-def money_to_wan(v: float) -> float:
-    return round(float(v or 0) / 10000, 1)
-
-
-def fmt_wan(v: float) -> str:
-    return f"{money_to_wan(v):.1f} 萬"
-
-
-def count_warrants_in_text(text: str) -> int:
-    """
-    計算權證名稱 / 權證清單中的權證檔數。
-    用於圖卡顯示時，把很長的權證清單改成「N 檔權證」，
-    避免表格內出現截斷的「...」而影響閱讀。
-    """
-    s = strip_gsheet_text_prefix(text)
-    if not s or s == "-":
-        return 0
-
-    parts = []
-    for p in re.split(r"[；;]", s):
-        p = p.strip()
-        if p:
-            parts.append(p)
-
-    return len(parts) if parts else 1
-
-
-def normalize_return_pct(v):
-    """
-    將 Google Sheet 權證報酬率統一轉成「百分比數值」。
-
-    例：
-    - "11.67%" -> 11.67
-    - 11.67    -> 11.67
-    - 0.1167   -> 11.67
-    - 1.6508   -> 165.08
-    """
-    try:
-        if v is None:
-            return None
-
-        raw = strip_gsheet_text_prefix(v)
-        if raw == "" or raw == "-":
-            return None
-
-        has_percent = "%" in str(raw)
-        pct = safe_float(raw, None)
-        if pct is None:
-            return None
-
-        if has_percent:
-            return pct
-
-        # 無 % 符號且落在 -5~5，視為小數報酬率
-        if -5 < pct < 5:
-            return pct * 100.0
-
-        # 其他視為已經是百分比
-        return pct
-
-    except Exception:
-        return None
-
-
-def fmt_return_pct(v) -> str:
-    try:
-        if v is None or v == "":
-            return "-"
-        pct = safe_float(v, None)
-        if pct is None:
-            return "-"
-        return f"{pct:+.1f}%"
-    except Exception:
-        return "-"
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 日期推斷 / 勝率統計
-# ══════════════════════════════════════════════════════════════════════
-
-
-def extract_stock_name_from_warrant_text(text: str) -> str:
-    """
-    從權證名稱或權證清單中的單筆名稱，推估標的股名。
-    例如：
-    - 聯發科元大5B購04 -> 聯發科
-    - 047358 台積電永豐6C購01 -> 台積電
-    """
-    s = strip_gsheet_text_prefix(text).strip()
-    if not s:
-        return ""
-
-    # 若是一整串清單，取第一筆非空項目
-    for sep in ["；", ";"]:
-        if sep in s:
-            parts = [p.strip() for p in s.split(sep) if p.strip()]
-            if parts:
-                s = parts[0]
-                break
-
-    # 去掉前面的權證代碼，如 047358
-    s = re.sub(r"^\d+\s*", "", s).strip()
-    if not s:
-        return ""
-
-    # 找最早出現的券商關鍵字，前面那段通常就是股名
-    hit_idx = None
-    for token in WARRANT_ISSUER_TOKENS:
-        idx = s.find(token)
-        if idx > 0:
-            if hit_idx is None or idx < hit_idx:
-                hit_idx = idx
-
-    if hit_idx is not None:
-        name = s[:hit_idx].strip()
-        # 避免抓到過長雜訊
-        if 0 < len(name) <= 12:
-            return name
-
-    return ""
-
-
-def build_stock_name_map_from_gsheet() -> dict[str, str]:
-    """
-    從 A/B/C/D 工作表蒐集 標的股代碼 -> 股名 映射。
-    """
-    name_counter: dict[str, Counter] = defaultdict(Counter)
-
-    def add_mapping(underlying, text):
-        code = normalize_underlying(underlying, text)
-        if not code:
-            return
-        name = extract_stock_name_from_warrant_text(text)
-        if name:
-            mapped_code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(name)
-            if mapped_code:
-                code = mapped_code
-            name_counter[code][name] += 1
-
-    # A 表：直接用權證名稱。今日表與完整歷史表都讀，讓股票名稱對照更完整。
-    for sheet_name in [SHEET_A, SHEET_A_FULL]:
-        try:
-            A = read_gsheet_table(sheet_name, ["標的股", "權證名稱"])
-            for _, r in A.iterrows():
-                add_mapping(r.get("標的股", ""), r.get("權證名稱", ""))
-        except Exception:
-            pass
-
-    # B/C/D：用權證清單。今日表與完整歷史表都讀，避免今日表資料較少時無法反推股名。
-    for sheet_name in [SHEET_B, SHEET_C, SHEET_D, SHEET_B_FULL, SHEET_C_FULL, SHEET_D_FULL]:
-        try:
-            df = read_gsheet_table(sheet_name, ["標的股", "權證清單"])
-            for _, r in df.iterrows():
-                add_mapping(r.get("標的股", ""), r.get("權證清單", ""))
-        except Exception:
-            pass
-
-    stock_map = {}
-    for code, counter in name_counter.items():
-        if counter:
-            # 次數最多優先；同次數時名稱較短者優先
-            best_name = sorted(counter.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
-            stock_map[code] = best_name
-
-    return stock_map
-
-
-def get_stock_name_map() -> dict[str, str]:
-    global _STOCK_NAME_MAP
-    if _STOCK_NAME_MAP is None:
-        _STOCK_NAME_MAP = build_stock_name_map_from_gsheet()
-    return _STOCK_NAME_MAP
-
-
-def infer_latest_date_from_gsheet() -> date:
-    """
-    先從每日產圖用的 今日_A/B/C/D 推斷目標日期；
-    若今日表不存在或為空，再退回完整歷史 A/B/C/D。
-    這樣圖片預設會跟每日產圖模式的最新資料一致。
-    """
-    def collect_dates_from_plan(read_plan):
-        candidates = []
-        for sheet, cols in read_plan:
-            try:
-                df = read_gsheet_table(sheet, cols)
-            except Exception:
+        for _, r in df.iterrows():
+            wcode = normalize_openapi_warrant_code(r.get("代號", r.get("權證代號", "")))
+            if not wcode:
                 continue
-
-            for c in cols:
-                if c not in df.columns:
-                    continue
-                for v in df[c].dropna().tolist():
-                    d = parse_date_value(v)
-                    if d:
-                        candidates.append(d)
-        return candidates
-
-    today_plan = [
-        (SHEET_A, ["買進日", "減碼日", "出清日"]),
-        (SHEET_B, ["事件日", "減碼日", "出清日"]),
-        (SHEET_C, ["結束日", "減碼日", "出清日"]),
-        (SHEET_D, ["結束日", "減碼日", "出清日"]),
-    ]
-    full_plan = [
-        (SHEET_A_FULL, ["買進日", "減碼日", "出清日"]),
-        (SHEET_B_FULL, ["事件日", "減碼日", "出清日"]),
-        (SHEET_C_FULL, ["結束日", "減碼日", "出清日"]),
-        (SHEET_D_FULL, ["結束日", "減碼日", "出清日"]),
-    ]
-
-    candidates = collect_dates_from_plan(today_plan)
-    if not candidates:
-        candidates = collect_dates_from_plan(full_plan)
-
-    if not candidates:
-        raise RuntimeError("無法從 Google Sheet 推斷日期，請用 TARGET_DATE=YYYY-MM-DD 指定。")
-
-    return max(candidates)
-
-def read_history_stats_from_gsheet() -> dict:
-    """
-    勝率統計表格式：
-    某列為：
-    分點, 事件類型, 事件數, 已出清筆數, ... 勝率, 平均持有天數 ...
-    其中事件類型為「全部-A+B+C+D合併」。
-    """
-    result = {}
-    try:
-        stat = read_gsheet_stat_raw()
-    except Exception:
-        stat = pd.DataFrame()
-
-    for broker in TRACKED_BROKERS:
-        result[broker] = {
-            "total_events": 0,
-            "win_rate": 0.0,
-            "avg_hold_days": 0.0,
-        }
-
-        if stat.empty or stat.shape[1] < 10:
-            continue
-
-        rows = stat[(stat[0].astype(str).str.strip() == broker) &
-                    (stat[1].astype(str).str.strip() == "全部-A+B+C+D合併")]
-
-        if not rows.empty:
-            r = rows.iloc[0]
-            result[broker] = {
-                "total_events": safe_int(r[2]),
-                "win_rate": safe_float(r[8]),
-                "avg_hold_days": safe_float(r[9]),
-            }
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 買賣資料抽取
-# ══════════════════════════════════════════════════════════════════════
-
-def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_name: str,
-               amount: float, qty: int, sheet_name: str, warrant_code: str = ""):
-    if amount < BUY_THRESHOLD:
-        return
-
-    underlying_code = normalize_underlying(underlying, warrant_name)
-    stock_name = get_stock_name_map().get(underlying_code, "")
-    if not stock_name:
-        stock_name = extract_stock_name_from_warrant_text(warrant_name)
-
-    buys.append({
-        "broker": str(broker).strip(),
-        "event": event,
-        "underlying": underlying_code,
-        "stock_name": stock_name,
-        "warrant_code": normalize_warrant_code(warrant_code),
-        "warrant": strip_gsheet_text_prefix(warrant_name),
-        "warrant_list_count": count_warrants_in_text(warrant_name),
-        "amount": amount,
-        "qty": qty,
-        "add_count": 0,
-        "sheet": sheet_name,
-    })
-
-
-def append_sell(sells: list[dict], broker: str, status: str, event: str, underlying, warrant_name: str,
-                amount: float, qty: int, sheet_name: str, return_pct=None, buy_amount=None,
-                warrant_code: str = "", force_include: bool = False):
-    if not force_include and amount < SELL_THRESHOLD and not (status == "出清" and DISPLAY_EXIT_ALWAYS):
-        return
-
-    underlying_code = normalize_underlying(underlying, warrant_name)
-    stock_name = get_stock_name_map().get(underlying_code, "")
-    if not stock_name:
-        stock_name = extract_stock_name_from_warrant_text(warrant_name)
-
-    sells.append({
-        "broker": str(broker).strip(),
-        "status": str(status).strip() or "賣超",
-        "event": str(event).strip() or "未歸類",
-        "underlying": underlying_code,
-        "stock_name": stock_name,
-        "warrant_code": normalize_warrant_code(warrant_code),
-        "warrant": strip_gsheet_text_prefix(warrant_name),
-        "warrant_list_count": count_warrants_in_text(warrant_name),
-        "amount": amount,                         # 實際賣出金額
-        "buy_amount": safe_float(buy_amount, 0),  # 對應買進金額；每日賣出明細無法精準對應時保留 0
-        "qty": qty,
-        "return_pct": normalize_return_pct(return_pct),
-        "sheet": sheet_name,
-    })
-
-
-def collect_broker_underlying_add_count_map(target: date, lookback_days: int = ADD_COUNT_LOOKBACK_TRADING_DAYS) -> dict[tuple[str, str], int]:
-    """
-    計算「同一分點 + 同一標的」在近 N 個有效交易日內，
-    出現達買超門檻且尚未出清事件的不同日期次數。
-
-    顯示規則：
-    - 第 1 次加碼：圖卡不顯示任何標籤
-    - 第 2 次以上：圖卡顯示「加碼N」
-
-    注意：
-    同一天同一分點同一標的即使同時出現在 A/B/C/D，仍只算 1 次。
-    這裡的 lookback_days 專門給第幾次加碼使用，不會影響原本近一個月 TOP15 圖。
-    已在目標日前或目標日出清的買超事件不納入加碼次數；減碼但尚未出清仍會納入。
-    """
-    try:
-        trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
-    except Exception:
-        trading_dates = []
-
-    if not trading_dates:
-        return {}
-
-    date_set = set(trading_dates)
-    counter: dict[tuple[str, str], set[date]] = defaultdict(set)
-
-    def add_count_event(row, event_date, amount):
-        if not event_date or event_date not in date_set or event_date > target:
-            return
-
-        # 已出清的權證不算入「第幾次加碼」。
-        # 規則：出清日空白或出清日在目標日之後才納入；出清日 <= 目標日則排除。
-        exit_date = parse_date_value(row.get("出清日"))
-        if exit_date and exit_date <= target:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        warrant_text = row.get("權證名稱") or row.get("權證清單") or ""
-        underlying = normalize_underlying(row.get("標的股"), warrant_text)
-        if not underlying:
-            return
-
-        if safe_float(amount) < BUY_THRESHOLD:
-            return
-
-        counter[(broker, underlying)].add(event_date)
-
-    # A：單檔權證大買。加碼次數要看完整歷史表，不使用今日表。
-    try:
-        A = read_gsheet_table(SHEET_A_FULL, ["分點", "標的股", "買進日", "買進金額", "出清日"])
-        for _, r in A.iterrows():
-            add_count_event(r, parse_date_value(r.get("買進日")), r.get("買進金額"))
-    except Exception:
-        pass
-
-    # B/C/D：同標的合買、3 日累積、10 日累積
-    plans = [
-        (SHEET_B_FULL, "事件日"),
-        (SHEET_C_FULL, "結束日"),
-        (SHEET_D_FULL, "結束日"),
-    ]
-
-    for sheet_name, date_col in plans:
-        try:
-            df = read_gsheet_table(sheet_name, ["分點", "標的股", date_col, "買超金額", "出清日"])
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            add_count_event(r, parse_date_value(r.get(date_col)), r.get("買超金額"))
-
-    return {key: len(days) for key, days in counter.items()}
-
-
-
-def normalize_event_code(v) -> str:
-    s = strip_gsheet_text_prefix(v).strip()
-    if not s or s == "-":
-        return ""
-
-    # 常見格式：
-    # A
-    # A | 066145 聯發永豐63購02
-    # A-單檔權證大買
-    # B/C/D
-    hits = []
-    for code in ["A", "B", "C", "D"]:
-        if re.search(rf"(^|[^A-Z]){code}([^A-Z]|$)", s):
-            hits.append(code)
-
-    if hits:
-        return "/".join(hits)
-
-    return s
-
-
-def is_unclassified_event(v) -> bool:
-    s = normalize_event_code(v)
-    return s in ["", "-", "未歸類", "ABCD合計"]
-
-
-def parse_warrant_items_from_text(text_value: str) -> list[tuple[str, str]]:
-    """
-    將「權證清單」拆成 [(權證代號, 權證名稱), ...]。
-    例如：
-    066145 聯發永豐63購02；066594 華邦富邦5C購02
-    """
-    s = strip_gsheet_text_prefix(text_value)
-    if not s or s == "-":
-        return []
-
-    items = []
-    for part in re.split(r"[；;]", s):
-        part = part.strip()
-        if not part:
-            continue
-
-        m = re.match(r"^(\d{5,6})\s*(.*)$", part)
-        if m:
-            wcode = normalize_warrant_code(m.group(1))
-            wname = m.group(2).strip()
-            items.append((wcode, wname))
-        else:
-            items.append(("", part))
-
-    return items
-
-
-def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[str, str], dict]:
-    """
-    從 A/B/C/D 工作表建立「分點 + 權證代號」對照，
-    用於每日賣出明細中事件為「未歸類」時補回 A/B/C/D，
-    並盡量補上該事件的減碼 / 出清報酬率。
-    """
-    lookup: dict[tuple[str, str], dict] = {}
-
-    def put(broker, warrant_code, info):
-        broker = str(broker).strip()
-        warrant_code = normalize_warrant_code(warrant_code)
-
-        if not broker or not warrant_code:
-            return
-
-        key = (broker, warrant_code)
-
-        old = lookup.get(key)
-        if old:
-            # A 優先於 B/C/D；同事件則保留較新的事件日資訊。
-            priority = {"A": 4, "B": 3, "C": 2, "D": 1}
-            old_p = priority.get(str(old.get("event", "")), 0)
-            new_p = priority.get(str(info.get("event", "")), 0)
-            if old_p > new_p:
-                return
-
-        lookup[key] = info
-
-    # A：單檔權證大買
-    # 先讀完整表，再讀今日表。今日表可補上每日模式剛產出的事件；
-    # 完整表則可補回歷史事件，避免今日賣出明細被標成未歸類。
-    for sheet_name in [SHEET_A_FULL, SHEET_A]:
-        try:
-            A = read_gsheet_table(
-                sheet_name,
-                [
-                    "分點", "權證代碼", "權證代號", "權證名稱", "標的股",
-                    "買進日", "買進張數", "買進金額", "減碼日", "減碼獲利%", "出清日", "出清獲利%"
-                ]
-            )
-
-            for _, r in A.iterrows():
-                broker = r.get("分點", "")
-                warrant_code = r.get("權證代碼") or r.get("權證代號")
-                warrant_name = r.get("權證名稱", "")
-                underlying = normalize_underlying(r.get("標的股"), warrant_name)
-
-                return_pct = None
-                if target and parse_date_value(r.get("出清日")) == target:
-                    return_pct = r.get("出清獲利%")
-                elif target and parse_date_value(r.get("減碼日")) == target:
-                    return_pct = r.get("減碼獲利%")
-
-                buy_amount = safe_float(r.get("買進金額"), 0)
-                buy_qty = safe_float(r.get("買進張數"), 0)
-                buy_avg = buy_amount / (buy_qty * NTD_PER_WARRANT_POINT) if buy_amount > 0 and buy_qty > 0 else 0
-
-                put(broker, warrant_code, {
-                    "event": "A",
-                    "underlying": underlying,
-                    "warrant_name": strip_gsheet_text_prefix(warrant_name),
-                    "return_pct": return_pct,
-                    "buy_amount": buy_amount,
-                    "buy_avg": buy_avg,
-                    "event_date": parse_date_value(r.get("買進日")),
-                })
-        except Exception:
-            pass
-
-    # B/C/D：用權證清單拆出每一檔權證。
-    # 完整表用於歷史事件對照；今日表用於每日模式剛產出的 5/29 事件。
-    plans = [
-        (SHEET_B_FULL, "B", "事件日"),
-        (SHEET_C_FULL, "C", "結束日"),
-        (SHEET_D_FULL, "D", "結束日"),
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
-    ]
-
-    for sheet_name, event_code, date_col in plans:
-        try:
-            df = read_gsheet_table(
-                sheet_name,
-                [
-                    "分點", "標的股", date_col, "權證清單",
-                    "買超金額", "買超張數", "減碼日", "減碼獲利%",
-                    "出清日", "出清獲利%"
-                ]
-            )
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            broker = r.get("分點", "")
-            warrant_list = r.get("權證清單", "")
-            underlying = normalize_underlying(r.get("標的股"), warrant_list)
-
-            return_pct = None
-            if target and parse_date_value(r.get("出清日")) == target:
-                return_pct = r.get("出清獲利%")
-            elif target and parse_date_value(r.get("減碼日")) == target:
-                return_pct = r.get("減碼獲利%")
-
-            buy_amount = safe_float(r.get("買超金額"), 0)
-            buy_qty = safe_float(r.get("買超張數"), 0)
-            buy_avg = buy_amount / (buy_qty * NTD_PER_WARRANT_POINT) if buy_amount > 0 and buy_qty > 0 else 0
-
-            for warrant_code, warrant_name in parse_warrant_items_from_text(warrant_list):
-                put(broker, warrant_code, {
-                    "event": event_code,
-                    "underlying": underlying,
-                    "warrant_name": strip_gsheet_text_prefix(warrant_name),
-                    "return_pct": return_pct,
-                    "buy_amount": buy_amount,
-                    "buy_avg": buy_avg,
-                    "event_date": parse_date_value(r.get(date_col)),
-                })
-
+            rec = lookup.setdefault(wcode, {"warrant_name": "", "underlying_code": "", "underlying_name": ""})
+            rec["warrant_name"] = rec["warrant_name"] or str(r.get("名稱", r.get("權證名稱", ""))).strip()
+            rec["underlying_code"] = rec["underlying_code"] or _clean_code(r.get("標的股", r.get("標的代號", "")))
+            rec["underlying_name"] = rec["underlying_name"] or str(r.get("標的名稱", "")).strip()
     return lookup
 
 
+# ============================================================
+# 權證全市場分點資料：OpenAPI 權證母體 + API4 分點 + API5 金額
+# ============================================================
 
-def build_warrant_sell_history_return_lookup(target: date) -> dict[tuple[str, str], dict]:
-    """
-    從「快取_分點歷史」估算指定日期各分點 + 權證代號的賣出報酬率與對應成本。
+def fetch_openapi_json(url: str, source_name: str):
+    try:
+        r = get_thread_session().get(url, headers=OPENAPI_WARRANT_HEADERS, timeout=(8, 30))
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            print(f"✅ {source_name} OpenAPI：{len(data):,} 筆")
+            return data
+    except Exception as e:
+        print(f"⚠️ {source_name} OpenAPI 抓取失敗：{e}")
+    return []
 
-    用途：
-    1. A/B/C/D 白名單權證若事件表本身沒有報酬率，可用歷史實際買賣資料補估。
-    2. 不在 A/B/C/D，但因「同分點 + 同標的今日賣出合計 >= 100 萬」而被納入圖卡的權證，
-       也能顯示合理的報酬率。
 
-    估算法：
-    - 以「同分點 + 同權證代號」為單位
-    - 使用加權平均成本法（依快取_分點歷史的每日買進 / 賣出金額與股數）
-    - 對目標日的賣出，先以目標日前累積持有成本計算賣出報酬率，再更新剩餘持有部位
-    """
-    needed_cols = [
-        "日期", "分點", "權證代號", "權證代碼", "權證名稱",
-        "買進股數", "賣出股數", "買進金額", "賣出金額"
-    ]
+def fetch_twse_openapi_warrant_daily_df() -> pd.DataFrame:
+    data = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
+    df = pd.DataFrame(data).fillna("")
+    if df.empty or not {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}.issubset(df.columns):
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
+    out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+    out["市場"] = "上市"
+    out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+    out["名稱"] = df["權證名稱"].astype(str).str.strip()
+    out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+    out["成交量"] = df["成交張數"].map(clean_openapi_number)
+    return out
 
-    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+
+def fetch_tpex_openapi_warrant_daily_df() -> pd.DataFrame:
+    data = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
+    df = pd.DataFrame(data).fillna("")
+    if df.empty or not {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}.issubset(df.columns):
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
+    out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+    out["市場"] = "上櫃"
+    out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+    out["名稱"] = df["權證名稱"].astype(str).str.strip()
+    out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+    out["成交量"] = df["成交數量"].map(clean_openapi_number)
+    return out
+
+
+def make_stock_aliases(stock_name: str) -> List[str]:
+    name = str(stock_name or "").strip().replace(" ", "")
+    aliases = [name] if name else []
+    suffixes = ["半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療", "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業", "企業", "國際", "控股", "投控"]
+    stripped = name
+    changed = True
+    while changed:
+        changed = False
+        for suf in suffixes:
+            if stripped.endswith(suf) and len(stripped) > len(suf) + 1:
+                stripped = stripped[: -len(suf)]
+                if len(stripped) >= 2 and stripped not in aliases:
+                    aliases.append(stripped)
+                changed = True
+                break
+    # 不主動切兩字，避免昇陽半/昇陽這類誤判；只保留三字以上安全前綴
+    if len(name) >= 3 and name[:3] not in aliases:
+        aliases.append(name[:3])
+    return [a for a in aliases if a]
+
+
+def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
+    frames = []
+    for f in [fetch_twse_openapi_warrant_daily_df(), fetch_tpex_openapi_warrant_daily_df()]:
+        if f is not None and not f.empty:
+            frames.append(f)
+    if not frames:
+        return []
+    all_df = pd.concat(frames, ignore_index=True).fillna("")
+    trade_dates = sorted([d for d in all_df["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
+    if not trade_dates:
+        return []
+    latest_trade_date = trade_dates[-1]
+    active_df = all_df[
+        (all_df["交易日期"] == latest_trade_date)
+        & (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
+        & (all_df["名稱"].astype(str).str.contains("購", na=False))
+        & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
+        & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
+    ].copy()
+    lookup = load_warrant_underlying_lookup()
+    aliases = make_stock_aliases(stock_name)
+    warrants = []
+    seen = set()
+    for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
+        code = normalize_openapi_warrant_code(r.get("代號"))
+        name = str(r.get("名稱", "")).strip()
+        if not code or code in seen:
+            continue
+        cached = lookup.get(code, {})
+        ucode = _clean_code(cached.get("underlying_code", ""))
+        uname = str(cached.get("underlying_name", "")).strip()
+        name_match = any(name.replace(" ", "").startswith(a) for a in aliases if a)
+        if ucode == str(stock_code) or name_match:
+            seen.add(code)
+            warrants.append({
+                "代號": code,
+                "名稱": name,
+                "標的股": str(stock_code),
+                "標的名稱": uname or stock_name,
+                "成交金額": int(r.get("成交金額", 0) or 0),
+                "成交量": int(r.get("成交量", 0) or 0),
+            })
+    if MAX_WARRANTS > 0:
+        warrants = warrants[:MAX_WARRANTS]
+    print(f"✅ {stock_code} 相關有成交認購權證：{len(warrants):,} 支")
+    return warrants
+
+
+def api4_get(code, start, end):
+    try:
+        r = get_thread_session().get(API4.format(code=code, start=start, end=end), headers=HDR, timeout=(5, 15))
+        data = json.loads(r.content.decode("utf-8"))
+        rows = []
+        for item in (data if isinstance(data, list) else [data]):
+            rows.extend(item.get("ResultSet", {}).get("Result", []))
+        return rows
+    except Exception:
+        return []
+
+
+def api5_get(warrant, broker, days=None):
+    try:
+        days = int(days if days is not None else API5_DAYS)
+        r = get_thread_session().get(API5.format(warrant=warrant, broker=broker, days=days), headers=HDR, timeout=(5, 15))
+        data = json.loads(r.content.decode("utf-8"))
+        rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
+        return rs.get("Result", [])
+    except Exception:
+        return []
+
+
+def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_s: str) -> List[dict]:
+    pairs = {}
+    if not warrants:
+        return []
+
+    def scan_one(w):
+        out = []
+        for row in api4_get(w["代號"], start_s, end_s):
+            broker_code = str(row.get("V2", "")).strip()
+            broker_name = str(row.get("V3", "")).strip()
+            if not broker_code:
+                continue
+            out.append({
+                "warrant_code": w["代號"],
+                "warrant_name": w["名稱"],
+                "underlying_code": w.get("標的股", ""),
+                "underlying_name": w.get("標的名稱", ""),
+                "broker_code": broker_code,
+                "branch": broker_name,
+            })
+        return out
+
+    print(f"🔎 API4 掃描全部分點：{len(warrants):,} 支權證，workers={API4_WORKERS}")
+    with ThreadPoolExecutor(max_workers=max(1, API4_WORKERS)) as ex:
+        futures = {ex.submit(scan_one, w): w for w in warrants}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                for rec in fut.result():
+                    pairs[(rec["warrant_code"], rec["broker_code"])] = rec
+            except Exception:
+                pass
+            if i % 100 == 0:
+                print(f"  API4 {i:,}/{len(warrants):,}，pairs={len(pairs):,}")
+    pair_list = list(pairs.values())
+    if MAX_PAIRS > 0:
+        pair_list = pair_list[:MAX_PAIRS]
+    print(f"✅ API4 完成：{len(pair_list):,} 組 權證×分點")
+    return pair_list
+
+
+def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date=None) -> pd.DataFrame:
+    rows = []
+    if not pair_list:
+        return pd.DataFrame()
+
+    def fetch_one(p):
+        out = []
+        api_rows = api5_get(p["warrant_code"], p["broker_code"], days=API5_DAYS)
+        for row in api_rows or []:
+            buy_s = int(float(row.get("V2", 0) or 0))
+            sell_s = int(float(row.get("V3", 0) or 0))
+            buy_a = int(float(row.get("V4", 0) or 0) * 1000)
+            sell_a = int(float(row.get("V5", 0) or 0) * 1000)
+            net_a = buy_a - sell_a
+            if buy_a == 0 and sell_a == 0:
+                continue
+            dt = parse_date(row.get("V1", ""))
+            if not dt:
+                continue
+            out.append({
+                "Date": pd.Timestamp(dt).normalize(),
+                "branch": p["branch"],
+                "broker_code": p["broker_code"],
+                "warrant_code": p["warrant_code"],
+                "warrant_name": p["warrant_name"],
+                "underlying_code": p.get("underlying_code", ""),
+                "underlying_name": p.get("underlying_name", ""),
+                "buy_amount": float(buy_a),
+                "sell_amount": float(sell_a),
+                "net_amount": float(net_a),
+                "buy_shares": buy_s,
+                "sell_shares": sell_s,
+            })
+        return out
+
+    print(f"💰 API5 回查買賣金額：{len(pair_list):,} 組，workers={API5_WORKERS}")
+    with ThreadPoolExecutor(max_workers=max(1, API5_WORKERS)) as ex:
+        futures = {ex.submit(fetch_one, p): p for p in pair_list}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                rows.extend(fut.result())
+            except Exception:
+                pass
+            if i % 200 == 0:
+                print(f"  API5 {i:,}/{len(pair_list):,}，events={len(rows):,}")
+    df = pd.DataFrame(rows)
     if df.empty:
-        return {}
-
-    grouped: dict[tuple[str, str], dict] = defaultdict(lambda: defaultdict(lambda: {
-        "buy_qty": 0.0, "sell_qty": 0.0, "buy_amt": 0.0, "sell_amt": 0.0
-    }))
-
-    for _, r in df.iterrows():
-        d = parse_date_value(r.get("日期"))
-        if not d or d > target:
-            continue
-
-        broker = str(r.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            continue
-
-        warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-        if not warrant_code:
-            continue
-
-        bucket = grouped[(broker, warrant_code)][d]
-        bucket["buy_qty"] += safe_float(r.get("買進股數"), 0)
-        bucket["sell_qty"] += safe_float(r.get("賣出股數"), 0)
-        bucket["buy_amt"] += safe_float(r.get("買進金額"), 0)
-        bucket["sell_amt"] += safe_float(r.get("賣出金額"), 0)
-
-    result: dict[tuple[str, str], dict] = {}
-
-    for key, by_date in grouped.items():
-        hold_qty = 0.0      # 股數
-        hold_cost = 0.0     # 金額
-
-        for d in sorted(by_date.keys()):
-            row = by_date[d]
-            buy_qty = safe_float(row.get("buy_qty"), 0)
-            sell_qty = safe_float(row.get("sell_qty"), 0)
-            buy_amt = safe_float(row.get("buy_amt"), 0)
-            sell_amt = safe_float(row.get("sell_amt"), 0)
-
-            # 先處理賣出，確保目標日報酬率是用「賣出前持有成本」估算。
-            if sell_qty > 0:
-                avg_cost = (hold_cost / hold_qty) if hold_qty > 0 else 0.0
-                sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
-
-                est_buy_amount = 0.0
-                est_return_pct = None
-
-                if avg_cost > 0:
-                    est_buy_amount = avg_cost * sell_qty
-                    if sell_avg > 0:
-                        est_return_pct = ((sell_avg - avg_cost) / avg_cost) * 100.0
-
-                if d == target:
-                    result[key] = {
-                        "buy_amount": est_buy_amount,
-                        "return_pct": est_return_pct,
-                    }
-
-                remove_qty = min(sell_qty, hold_qty)
-                if remove_qty > 0 and avg_cost > 0:
-                    hold_cost -= avg_cost * remove_qty
-                    hold_qty -= remove_qty
-                    if hold_qty < 1e-9:
-                        hold_qty = 0.0
-                        hold_cost = 0.0
-
-            if buy_qty > 0:
-                hold_qty += buy_qty
-                hold_cost += buy_amt
-
-    return result
+        return df
+    if start_date is not None:
+        df = df[df["Date"] >= pd.Timestamp(start_date).normalize()]
+    if end_date is not None:
+        df = df[df["Date"] <= pd.Timestamp(end_date).normalize()]
+    df["side"] = np.where(df["net_amount"] >= 0, "買超", "賣超")
+    return df.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
 
 
-def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
+def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
+    # 先讀既有快取，速度最快；再用 live 補足最新全分點資料。
+    cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
+    frames = []
+    if not cached.empty:
+        frames.append(cached)
+        print(f"☁️ Google Sheet 快取_分點歷史命中：{len(cached):,} 筆")
+
+    if LIVE_FETCH_ENABLE:
+        end_dt = pd.Timestamp(end_date).to_pydatetime()
+        start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
+        end_s = end_dt.strftime("%Y/%m/%d")
+        warrants = get_all_active_call_warrants(stock_code, stock_name)
+        pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
+        live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
+        if not live.empty:
+            frames.append(live)
+            print(f"🌐 Live 權證全分點資料：{len(live):,} 筆")
+
+    if not frames:
+        return pd.DataFrame(columns=["Date", "branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name", "buy_amount", "sell_amount", "net_amount"])
+
+    events = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+    for c in ["buy_amount", "sell_amount", "net_amount"]:
+        events[c] = pd.to_numeric(events[c], errors="coerce").fillna(0.0)
+    events["Date"] = pd.to_datetime(events["Date"]).dt.normalize()
+    events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
+    events["branch"] = events["branch"].astype(str).str.strip()
+    events["broker_code"] = events["broker_code"].astype(str).str.strip()
+    # 合併 live/cache 重複資料
+    group_cols = ["Date", "broker_code", "branch", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]
+    events = events.groupby(group_cols, as_index=False, dropna=False).agg({
+        "buy_amount": "max",
+        "sell_amount": "max",
+        "net_amount": "max",
+    })
+    events = events[(events["buy_amount"] > 0) | (events["sell_amount"] > 0) | (events["net_amount"].abs() > 0)].copy()
+    events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
+    return events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+
+# ============================================================
+# 週報統計
+# ============================================================
+
+def filter_out_market_maker_hedges(
+    events_df: pd.DataFrame,
+    hedge_threshold: float = HEDGE_MARK_THRESHOLD,
+    do_filter: bool = False,
+    min_gross_amount: float = HEDGE_MIN_GROSS_AMOUNT,
+    min_side_amount: float = HEDGE_MIN_SIDE_AMOUNT,
+):
     """
-    今日賣超明細改讀「每日賣出明細」。
+    偵測 / 過濾疑似造市對沖。
 
-    這張表是主程式由原始 API5 分點歷史資料整理出來，
-    欄位中的「賣出金額 / 賣出張數」即為官方分點每日資料，
-    不再用 A 表的「減碼均價 × 買進張數」推估。
+    判斷條件：同券商、同權證、同日期，且買賣雙邊都有一定金額，
+    若 abs(買進 - 賣出) / (買進 + 賣出) <= 門檻，視為疑似對沖。
 
-    顯示規則：
-    1. 若該筆「分點 + 權證代號」曾出現在 A/B/C/D，照原本事件邏輯顯示。
-    2. 若該權證未出現在 A/B/C/D，但同一分點今天對同一標的的賣出金額合計
-       達 NON_ABCD_SELL_UNDERLYING_THRESHOLD，仍納入賣超明細。
-       這類資料不標 A/B/C/D，直接顯示權證與賣出金額。
-    3. 非 A/B/C/D 的大額單標的賣超，會從「快取_分點歷史」估算該權證的
-       加權平均成本與賣出報酬率。
+    預設 do_filter=False，只回報疑似筆數，不刪資料，避免漏抓大額主力單。
     """
-    needed_cols = [
-        "日期", "分點", "分點名稱", "券商代號",
-        "事件", "狀態",
-        "標的股", "標的名稱",
-        "權證代號", "權證名稱",
-        "賣出張數", "賣出股數", "賣出金額", "賣出均價",
-        "事件日", "事件來源",
-    ]
+    if events_df is None or events_df.empty:
+        return events_df, 0
+    need_cols = {"broker_code", "warrant_code", "Date", "buy_amount", "sell_amount"}
+    if not need_cols.issubset(events_df.columns):
+        return events_df, 0
 
-    df = read_gsheet_table_optional(SHEET_DAILY_SELL, needed_cols)
-    if df.empty:
-        return
+    e = events_df.copy()
+    e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+    grouped = e.groupby(["broker_code", "warrant_code", "Date"], as_index=False).agg({
+        "buy_amount": "sum",
+        "sell_amount": "sum",
+    })
+    grouped["gross_amount"] = grouped["buy_amount"] + grouped["sell_amount"]
+    grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+    grouped["net_ratio"] = np.where(
+        grouped["gross_amount"] > 0,
+        grouped["net_amount"].abs() / grouped["gross_amount"],
+        1.0,
+    )
 
-    event_lookup = build_sell_event_lookup_from_abcd(target)
-    history_return_lookup = build_warrant_sell_history_return_lookup(target)
+    hedge_groups = grouped[
+        (grouped["gross_amount"] >= min_gross_amount)
+        & (grouped["buy_amount"] >= min_side_amount)
+        & (grouped["sell_amount"] >= min_side_amount)
+        & (grouped["net_ratio"] <= hedge_threshold)
+    ][["broker_code", "warrant_code", "Date"]]
 
-    # 先統計「不在 A/B/C/D 白名單」的權證，在同一天 + 同分點 + 同標的的實際賣出合計。
-    non_abcd_underlying_amounts: dict[tuple[str, str], float] = defaultdict(float)
+    if hedge_groups.empty:
+        return e, 0
 
-    for _, r in df.iterrows():
-        if parse_date_value(r.get("日期")) != target:
-            continue
+    hedge_index = hedge_groups.set_index(["broker_code", "warrant_code", "Date"]).index
+    mask = e.set_index(["broker_code", "warrant_code", "Date"]).index.isin(hedge_index)
+    n_rows = int(mask.sum())
 
-        broker = str(r.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            continue
+    if do_filter:
+        return e.loc[~mask].copy(), n_rows
+    return e, n_rows
 
-        warrant_code = normalize_warrant_code(r.get("權證代號", ""))
-        warrant_name = strip_gsheet_text_prefix(r.get("權證名稱", ""))
-        underlying = normalize_underlying(r.get("標的股"), warrant_name)
-        sell_amount = safe_float(r.get("賣出金額"), 0)
 
-        if sell_amount <= 0 or not underlying:
-            continue
+def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
+    points = []
+    df = ctx["plot_df"]
+    latest = df.iloc[-1]
+    close = float(latest["Close"])
+    ma5 = float(latest["MA5"])
+    ma20 = float(latest["MA20"])
+    ma60 = float(latest["MA60"])
+    k9 = float(latest.get("K9", np.nan))
+    d9 = float(latest.get("D9", np.nan))
+    vol = float(latest.get("Volume", np.nan))
+    mv20 = float(latest.get("MV20", np.nan))
 
-        if not event_lookup.get((broker, warrant_code)):
-            non_abcd_underlying_amounts[(broker, underlying)] += sell_amount
+    if close >= ma5 >= ma20:
+        points.append(f"技術面：收盤 {close:.0f} 站穩 5MA {ma5:.1f} 與 20MA {ma20:.1f}，下週先看短均線是否續揚。")
+    elif close >= ma20:
+        points.append(f"技術面：收盤仍守 20MA {ma20:.1f}，但需觀察能否重新站回 5MA {ma5:.1f}。")
+    else:
+        points.append(f"技術面：收盤已落在 20MA {ma20:.1f} 下方，下週需留意月線是否轉為壓力。")
 
-    qualifying_non_abcd_underlyings = {
-        key
-        for key, amount in non_abcd_underlying_amounts.items()
-        if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
+    if close > ma60:
+        points.append(f"中期趨勢：目前仍在 60MA {ma60:.1f} 之上，中期架構尚未轉弱。")
+    else:
+        points.append(f"中期趨勢：股價已逼近或跌破 60MA {ma60:.1f}，中期防守力道需再確認。")
+
+    if not pd.isna(vol) and not pd.isna(mv20) and mv20 > 0:
+        vr = vol / mv20
+        points.append(f"量能面：最新日量能約為月均量 {vr:.1f} 倍，若再放量，短線趨勢延續性會更好。")
+
+    if not pd.isna(k9) and not pd.isna(d9):
+        if k9 >= 80 and d9 >= 80:
+            points.append(f"動能面：KD 位於高檔（K {k9:.1f} / D {d9:.1f}），若續強屬高檔鈍化；跌破 5MA 則要防拉回。")
+        elif k9 > d9:
+            points.append(f"動能面：K 值高於 D 值，短線動能仍偏多，但需搭配量能不失溫。")
+        else:
+            points.append(f"動能面：K 值低於 D 值，下週需觀察是否重新黃金交叉。")
+
+    net = float(ctx.get("total_net", 0))
+    if net > 0:
+        points.append(f"權證籌碼：本週淨買超 {fmt_money(net)}，若下週紅柱續增、累計線續上彎，代表追價資金延續。")
+    elif net < 0:
+        points.append(f"權證籌碼：本週淨賣超 {fmt_money(net)}，若下週綠柱持續，需留意權證資金退潮。")
+    else:
+        points.append("權證籌碼：本週淨流向接近中性，下週需觀察是否出現連續性紅柱或綠柱。")
+
+    e = ctx.get("week_events")
+    if e is not None and not e.empty:
+        by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
+        if not by_branch.empty:
+            top_branch = str(by_branch.index[0])
+            top_amt = float(by_branch.iloc[0])
+            points.append(f"分點觀察：目前由「{top_branch}」領軍 {fmt_money(top_amt)}，下週可觀察是否續買或轉為調節。")
+
+    news_points = build_news_points(ctx.get("stock_code", ""), stock_name, news_titles, ctx)
+    if news_points:
+        points.append(news_points[0])
+
+    return points[:5]
+
+
+def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, week_days: int = WEEK_TRADING_DAYS):
+    plot_df = stock_df.tail(CHART_LOOKBACK).copy()
+    trading_dates = list(plot_df.index)
+    week_dates = trading_dates[-week_days:] if len(trading_dates) >= week_days else trading_dates
+    week_start = pd.Timestamp(week_dates[0]).normalize() if week_dates else pd.NaT
+    week_end = pd.Timestamp(week_dates[-1]).normalize() if week_dates else pd.NaT
+
+    week_stock = plot_df.loc[week_dates].copy() if week_dates else plot_df.tail(0)
+    prev_stock = plot_df.iloc[max(0, len(plot_df) - week_days * 2): max(0, len(plot_df) - week_days)].copy()
+
+    start_close = float(week_stock["Close"].iloc[0]) if not week_stock.empty else np.nan
+    end_close = float(week_stock["Close"].iloc[-1]) if not week_stock.empty else np.nan
+    stock_ret = (end_close / start_close - 1) * 100 if start_close and not np.isnan(start_close) else np.nan
+    week_vol = float(week_stock["Volume"].sum()) if not week_stock.empty else 0.0
+    prev_vol = float(prev_stock["Volume"].sum()) if not prev_stock.empty else 0.0
+    vol_change = (week_vol / prev_vol - 1) * 100 if prev_vol > 0 else np.nan
+
+    hedge_removed = 0
+    if warrant_events is None or warrant_events.empty:
+        week_events = pd.DataFrame(columns=["Date", "branch", "warrant_code", "warrant_name", "buy_amount", "sell_amount", "net_amount"])
+        plot_events = week_events.copy()
+    else:
+        e = warrant_events.copy()
+        e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+        # 預設只偵測疑似造市 / 避險對沖，不直接刪除，避免把大額主力單誤刪。
+        # 標記門檻：8%；若主動啟用刪除，才用更嚴格的 3%。
+        hedge_candidates = 0
+        if HEDGE_FILTER_ENABLE:
+            e, hedge_removed = filter_out_market_maker_hedges(
+                e,
+                hedge_threshold=HEDGE_FILTER_THRESHOLD,
+                do_filter=True,
+            )
+        else:
+            _, hedge_candidates = filter_out_market_maker_hedges(
+                e,
+                hedge_threshold=HEDGE_MARK_THRESHOLD,
+                do_filter=False,
+            )
+            hedge_removed = 0
+        week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
+        plot_events = e[(e["Date"] >= pd.Timestamp(plot_df.index.min()).normalize()) & (e["Date"] <= pd.Timestamp(plot_df.index.max()).normalize())].copy()
+
+    total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
+    total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
+    total_net = float(week_events["net_amount"].sum()) if not week_events.empty else 0.0
+    bias = "偏買超" if total_net > 0 else "偏賣超" if total_net < 0 else "中性"
+
+    return {
+        "plot_df": plot_df,
+        "plot_events": plot_events,
+        "week_events": week_events,
+        "week_start": week_start,
+        "week_end": week_end,
+        "stock_ret": stock_ret,
+        "week_vol": week_vol,
+        "vol_change": vol_change,
+        "total_buy": total_buy,
+        "total_sell": total_sell,
+        "total_net": total_net,
+        "bias": bias,
+        "hedge_removed": hedge_removed,
+        "hedge_candidates": hedge_candidates if "hedge_candidates" in locals() else 0,
     }
 
-    for _, r in df.iterrows():
-        if parse_date_value(r.get("日期")) != target:
-            continue
 
-        broker = str(r.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            continue
+def daily_warrant_net(plot_df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    dates = pd.to_datetime(plot_df.index).normalize()
+    out = pd.DataFrame({"Date": dates})
+    if events is None or events.empty:
+        out["net_amount"] = 0.0
+        out["buy_amount"] = 0.0
+        out["sell_amount"] = 0.0
+        return out
+    e = events.copy()
+    e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+    g = e.groupby("Date", as_index=False).agg({"net_amount": "sum", "buy_amount": "sum", "sell_amount": "sum"})
+    out = out.merge(g, on="Date", how="left").fillna(0.0)
+    return out
 
-        warrant_code = normalize_warrant_code(r.get("權證代號", ""))
-        warrant_name = strip_gsheet_text_prefix(r.get("權證名稱", ""))
-        event_raw = r.get("事件") or r.get("事件來源")
-        event = normalize_event_code(event_raw)
-        status = str(r.get("狀態", "")).strip() or "賣超"
-        underlying = normalize_underlying(r.get("標的股"), warrant_name)
 
-        sell_amount = safe_float(r.get("賣出金額"), 0)
-        sell_qty = safe_int(r.get("賣出張數"), 0)
-        if sell_qty <= 0:
-            sell_qty = int(safe_float(r.get("賣出股數"), 0) // 1000)
+def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
+    cols = ["branch", "net_amount", "max_warrant_code", "max_warrant_name", "max_warrant_amount"]
+    if week_events is None or week_events.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
+    e = week_events.copy()
+    e["branch"] = e["branch"].replace("", "未知分點")
+    branch_sum = e.groupby("branch", as_index=False).agg({"net_amount": "sum", "buy_amount": "sum", "sell_amount": "sum"})
 
-        if sell_amount <= 0:
-            continue
-
-        lookup_info = event_lookup.get((broker, warrant_code))
-        hist_info = history_return_lookup.get((broker, warrant_code), {})
-
-        if lookup_info:
-            if is_unclassified_event(event):
-                event = lookup_info.get("event", event)
-
-            if not underlying:
-                underlying = lookup_info.get("underlying", underlying)
-
-            if not warrant_name:
-                warrant_name = lookup_info.get("warrant_name", warrant_name)
-
-            return_pct = normalize_return_pct(lookup_info.get("return_pct"))
-            buy_amount = 0.0
-
-            if is_unclassified_event(event):
-                # 權證雖可對到 A/B/C/D 白名單，但事件代號仍無法解析時，
-                # 不強行標註 A/B/C/D，直接當作單一賣超顯示。
-                event = "單一賣超"
-
-            buy_avg = safe_float(lookup_info.get("buy_avg"), 0)
-            sell_avg = safe_float(r.get("賣出均價"), 0)
-
-            if buy_avg > 0 and sell_qty > 0:
-                buy_amount = buy_avg * sell_qty * NTD_PER_WARRANT_POINT
-                if return_pct is None and sell_avg > 0:
-                    return_pct = ((sell_avg - buy_avg) / buy_avg) * 100.0
+    def add_max_warrant(df, positive=True):
+        rows = []
+        for _, br in df.iterrows():
+            branch = br["branch"]
+            sub = e[e["branch"] == branch]
+            wg = sub.groupby(["warrant_code", "warrant_name"], as_index=False).agg({"net_amount": "sum"})
+            if wg.empty:
+                max_code, max_name, max_amt = "", "", 0.0
             else:
-                buy_amount = safe_float(lookup_info.get("buy_amount"), 0)
-
-            # 若事件表本身沒有足夠資訊，再用快取_分點歷史補估
-            if (return_pct is None or safe_float(buy_amount, 0) <= 0) and hist_info:
-                if return_pct is None:
-                    return_pct = hist_info.get("return_pct")
-                if safe_float(buy_amount, 0) <= 0:
-                    buy_amount = safe_float(hist_info.get("buy_amount"), 0)
-
-            append_sell(
-                sells,
-                broker,
-                status,
-                event,
-                underlying,
-                warrant_name,
-                sell_amount,
-                sell_qty,
-                SHEET_DAILY_SELL,
-                return_pct,
-                buy_amount,
-                warrant_code=warrant_code,
-            )
-            continue
-
-        # 不在 A/B/C/D 的權證：同一分點 + 同一標的今日實際賣出合計 >= 100 萬才納入。
-        if (broker, underlying) not in qualifying_non_abcd_underlyings:
-            continue
-
-        append_sell(
-            sells,
-            broker,
-            status,
-            "單一賣超",
-            underlying,
-            warrant_name,
-            sell_amount,
-            sell_qty,
-            SHEET_DAILY_SELL,
-            hist_info.get("return_pct"),
-            safe_float(hist_info.get("buy_amount"), 0),
-            warrant_code=warrant_code,
-            force_include=True,
-        )
-
-
-
-def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
-    buys: list[dict] = []
-    sells: list[dict] = []
-
-    # A：單檔權證大買
-    # 注意：買超明細仍維持原本 A/B/C/D 事件邏輯；
-    # 賣超明細改由「每日賣出明細」讀取實際賣出金額，避免部分減碼被整筆買進張數放大。
-    a_cols = [
-        "事件類型", "分點", "權證代碼", "權證代號", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
-        "減碼日", "減碼均價", "減碼獲利%", "出清日", "出清均價", "出清獲利%"
-    ]
-    A = read_gsheet_table(SHEET_A, a_cols)
-
-    for _, r in A.iterrows():
-        broker = r.get("分點", "")
-        event = "A"
-
-        if parse_date_value(r.get("買進日")) == target:
-            append_buy(
-                buys, broker, event, r.get("標的股"), r.get("權證名稱"),
-                safe_float(r.get("買進金額")), safe_int(r.get("買進張數")), SHEET_A,
-                r.get("權證代碼") or r.get("權證代號")
-            )
-
-    # B/C/D：同標的合買、3 日累積、10 日累積
-    plans = [
-        (SHEET_B, "事件日", "B"),
-        (SHEET_C, "結束日", "C"),
-        (SHEET_D, "結束日", "D"),
-    ]
-
-    common_cols = [
-        "事件類型", "分點", "標的股", "事件日", "起始日", "結束日", "涵蓋權證數", "權證清單",
-        "買超金額", "買超張數", "減碼日", "減碼賣出金額", "減碼獲利%",
-        "出清日", "出清賣出金額", "出清獲利%"
-    ]
-
-    for sheet_name, event_date_col, event in plans:
-        df = read_gsheet_table(sheet_name, common_cols)
-
-        for _, r in df.iterrows():
-            broker = r.get("分點", "")
-
-            if parse_date_value(r.get(event_date_col)) == target:
-                append_buy(
-                    buys, broker, event, r.get("標的股"), r.get("權證清單"),
-                    safe_float(r.get("買超金額")), safe_int(r.get("買超張數")), sheet_name
-                )
-
-    # 今日賣超明細一律讀取主程式產生的「每日賣出明細」。
-    append_daily_sell_rows_from_gsheet(sells, target)
-
-    add_count_map = collect_broker_underlying_add_count_map(target, ADD_COUNT_LOOKBACK_TRADING_DAYS)
-    for item in buys:
-        key = (item.get("broker", ""), item.get("underlying", ""))
-        item["add_count"] = safe_int(add_count_map.get(key, 1), 1)
-
-    return buys, sells
-
-def compress_actions(actions: list[dict], kind: str) -> list[dict]:
-    """
-    同一分點、同一事件、同一標的若有多筆權證，合併成標的顯示。
-    單筆則顯示權證名稱。
-    """
-    groups = defaultdict(list)
-
-    for a in actions:
-        # 賣方明細採「同一天、同分點、同狀態、同標的」直接合計。
-        # 若同一標的同一天同時出現在 A/B/C/D，會合併為一列，報酬率用買進金額與賣出金額概算。
-        # 買方仍保留事件別，避免買超訊號被過度合併。
-        if kind == "sell":
-            key = (a["broker"], a.get("status", ""), "ABCD合計", a["underlying"] or a["warrant"])
-        else:
-            key = (a["broker"], a.get("status", ""), a["event"], a["underlying"] or a["warrant"])
-        groups[key].append(a)
-
-    result = []
-    for (broker, status, event, key_name), items in groups.items():
-        amount = sum(i["amount"] for i in items)
-        qty = sum(i.get("qty", 0) for i in items)
-        warrant_count = len(items)
-
-        # 賣方報酬率合計邏輯：
-        # 你希望同一天 A/B/C/D 若有同一標的賣方動作，直接加總概算。
-        # 因此優先使用：
-        #   報酬率 = (合計賣出金額 - 合計買進金額) / 合計買進金額
-        # 這樣能和「買進金額都有，直接加在一起算」的邏輯一致。
-        total_buy_amount = sum(safe_float(i.get("buy_amount"), 0) for i in items)
-
-        if kind == "sell" and total_buy_amount > 0:
-            return_pct = ((amount - total_buy_amount) / total_buy_amount) * 100.0
-        else:
-            # fallback：若沒有買進金額，才用個別報酬率反推成本。
-            valid_returns = [
-                (i.get("return_pct"), i.get("amount", 0))
-                for i in items
-                if i.get("return_pct") is not None and float(i.get("amount", 0) or 0) > 0
-            ]
-
-            if valid_returns:
-                total_sell_amount = 0.0
-                total_cost_amount = 0.0
-
-                for pct, sell_amount in valid_returns:
-                    pct = float(pct)
-                    sell_amount = float(sell_amount or 0)
-                    denominator = 1.0 + pct / 100.0
-
-                    if denominator <= 0:
-                        continue
-
-                    cost_amount = sell_amount / denominator
-                    total_sell_amount += sell_amount
-                    total_cost_amount += cost_amount
-
-                if total_cost_amount > 0:
-                    return_pct = ((total_sell_amount - total_cost_amount) / total_cost_amount) * 100.0
-                else:
-                    return_pct = sum(float(p) for p, _ in valid_returns) / len(valid_returns)
-            else:
-                return_pct = None
-
-        underlying = items[0].get("underlying", "")
-        stock_name = items[0].get("stock_name", "")
-        target_label = f"{underlying} {stock_name}".strip() if underlying else ""
-
-        if kind == "sell":
-            event = "/".join(sorted({str(i.get("event", "")) for i in items if str(i.get("event", "")).strip()})) or event
-            if event in {"未歸類", "單一賣超"}:
-                event = ""
-
-        if warrant_count >= 2 and underlying:
-            display_target = target_label if target_label else f"{underlying}"
-
-            first_item = items[0]
-            first_code = first_item.get("warrant_code", "")
-            first_name = first_item.get("warrant", "")
-            first_label = f"{first_code} {first_name}".strip() if first_code else first_name
-
-            # 多筆同標的合併時，內容欄仍顯示其中一檔權證，再用 ... 表示還有其他權證
-            content = f"{first_label}；..." if first_label else f"{warrant_count} 檔權證"
-        else:
-            warrant_code = items[0].get("warrant_code", "")
-            warrant_name = items[0].get("warrant", "")
-            warrant_label = f"{warrant_code} {warrant_name}".strip() if warrant_code else warrant_name
-            list_count = safe_int(items[0].get("warrant_list_count", 0))
-
-            display_target = target_label if target_label else (underlying if underlying else warrant_label)
-
-            # B/C/D 通常是權證清單；若有多檔，顯示第一檔權證 + ...
-            # 這樣至少能看到其中一支權證代碼/名稱，不會只剩「N 檔權證」。
-            if kind == "buy" and event in {"B", "C", "D"} and list_count >= 2 and warrant_label:
-                first_warrant = re.split(r"[；;]", warrant_label)[0].strip()
-                content = f"{first_warrant}；..."
-            else:
-                content = warrant_label or f"{warrant_count} 檔權證"
-
-            if kind == "sell":
-                sell_event_label = event
-                if not sell_event_label or sell_event_label == "ABCD合計":
-                    sell_event_label = "/".join(sorted({
-                        str(i.get("event", "")).strip()
-                        for i in items
-                        if str(i.get("event", "")).strip()
-                        and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
-                    }))
-                if sell_event_label:
-                    content = f"{sell_event_label}｜{content}"
-
-        # 賣超明細內容欄最前面固定保留 A/B/C/D 事件代號。
-        # 注意：賣方資料可能在前面被合併成 warrant_count >= 2，
-        # 因此不能只在單筆 else 分支加前綴，必須在 result.append 前統一處理。
-        if kind == "sell":
-            sell_event_label = event
-            if not sell_event_label or sell_event_label == "ABCD合計":
-                sell_event_label = "/".join(sorted({
-                    str(i.get("event", "")).strip()
-                    for i in items
-                    if str(i.get("event", "")).strip()
-                    and str(i.get("event", "")).strip() not in {"未歸類", "單一賣超"}
-                }))
-
-            if sell_event_label and not str(content).startswith(f"{sell_event_label}｜"):
-                content = f"{sell_event_label}｜{content}"
-
-        add_count = 0
-        add_count_label = ""
-        if kind == "buy":
-            add_count = max((safe_int(i.get("add_count", 0), 0) for i in items), default=0)
-            if add_count > 1:
-                add_count_label = f"加碼{add_count}"
-                if not str(content).startswith(f"{add_count_label}｜"):
-                    content = f"{add_count_label}｜ {content}"
-
-        result.append({
-            "broker": broker,
-            "status": status,
-            "event": event,
-            "target": display_target,
-            "content": content,
-            "amount": amount,
-            "qty": qty,
-            "return_pct": return_pct,
-            "count": warrant_count,
-            "kind": kind,
-            "add_count": add_count,
-            "add_count_label": add_count_label,
-        })
-
-    result.sort(key=lambda x: x["amount"], reverse=True)
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 繪圖
-# ══════════════════════════════════════════════════════════════════════
-
-def get_font_path(bold=False):
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return candidates[-1]
-
-
-def make_font(size, bold=False):
-    return ImageFont.truetype(get_font_path(bold), size)
-
-
-def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path, source_warning: dict | None = None):
-    """
-    Matplotlib 動態版面引擎：
-    - 不固定圖片高度
-    - 不固定表格高度
-    - 高度完全依照：有動作分點數、無動作分點列、買超筆數、賣方筆數自動增加
-    - 邏輯參考處置股圖卡的 get_base_layout / setup_canvas 概念
-
-    賣方顯示門檻補強：
-    - 最終圖卡上顯示的每一列賣超明細，最低都必須達 SELL_THRESHOLD（預設 20 萬）。
-    - 不再因 DISPLAY_EXIT_ALWAYS 或 force_include 等例外邏輯，讓 20 萬以下的小單顯示到圖片上。
-    - 這樣可以避免抓到只是同分點散戶零星買賣，而不是你要追蹤的分點大戶行為。
-    """
-    buys = compress_actions(buys_raw, "buy")
-    sells = compress_actions(sells_raw, "sell")
-
-    # 嚴格套用最終圖卡賣方顯示門檻：
-    # 只要是顯示在圖片上的賣超列，合併後金額最低都必須 >= SELL_THRESHOLD。
-    # 這裡放在 compress_actions 之後，代表即使同標的多筆小單合併，只要合併後未達 20 萬，
-    # 也不會顯示在圖卡上。
-    sells = [x for x in sells if safe_float(x.get("amount"), 0) >= SELL_THRESHOLD]
-
-    buy_total = sum(x["amount"] for x in buys)
-    sell_total = sum(x["amount"] for x in sells)
-    net = buy_total - sell_total
-
-    broker_summary = {}
-    for b in TRACKED_BROKERS:
-        b_buys = [x for x in buys if x["broker"] == b]
-        b_sells = [x for x in sells if x["broker"] == b]
-        broker_summary[b] = {
-            "buy_count": sum(x["count"] for x in b_buys),
-            "buy_amount": sum(x["amount"] for x in b_buys),
-            "sell_count": sum(x["count"] for x in b_sells),
-            "sell_amount": sum(x["amount"] for x in b_sells),
-            "has_action": bool(b_buys or b_sells),
-            "avg_hold_days": history.get(b, {}).get("avg_hold_days", 0.0),
-        }
-
-    active_brokers = [b for b in TRACKED_BROKERS if broker_summary[b]["has_action"]]
-    inactive_brokers = [b for b in TRACKED_BROKERS if not broker_summary[b]["has_action"]]
-
-    # ─────────────────────────────────────────────
-    # 動態版面參數：整體高度由資料量計算，不寫死
-    # ─────────────────────────────────────────────
-    fig_w = 13.0
-    margin_x = 0.40
-    content_w = fig_w - 2 * margin_x
-
-    top_h = 1.55
-    kpi_h = 1.25
-    gap = 0.18
-
-    # 分點卡片顯示規則：
-    # - 有動作分點 3~5 個：只顯示有動作分點，並排同一排；今日無動作分點顯示在下方長條
-    # - 有動作分點 0~2 個：加入「今日無動作分點」摘要框，避免畫面只剩少數卡片
-    show_inactive_card = len(active_brokers) <= 2 and bool(inactive_brokers)
-    show_inactive_bar = len(active_brokers) >= 3 and bool(inactive_brokers)
-    broker_card_items = active_brokers[:] + (["__INACTIVE__"] if show_inactive_card else [])
-
-    active_rows = 1 if broker_card_items else 0
-    broker_card_h = 1.55
-    broker_area_h = active_rows * broker_card_h
-
-    inactive_h = 0.58 if show_inactive_bar else 0.0
-
-    section_title_h = 0.55
-    header_h = 0.42
-    row_h = 0.48
-
-    buy_rows = buys
-    sell_rows = sells
-
-    buy_table_h = section_title_h + header_h + max(1, len(buy_rows)) * row_h
-    sell_table_h = 0.0
-    if sell_rows:
-        sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
-
-    event_legend_h = 0.45
-    footer_h = 0.48
-
-    fig_h = (
-        top_h
-        + kpi_h
-        + gap
-        + broker_area_h
-        + (gap + inactive_h if show_inactive_bar else 0)
-        + gap
-        + buy_table_h
-        + (gap + sell_table_h if sell_rows else 0)
-        + gap
-        + event_legend_h
-        + footer_h
-    )
-
-    # 避免資料太少時圖片過扁
-    fig_h = max(fig_h, 9.5)
-
-    # ─────────────────────────────────────────────
-    # 顏色與字型
-    # ─────────────────────────────────────────────
-    BG = "#F6F8FB"
-    WHITE = "#FFFFFF"
-    NAVY = "#061D3D"
-    NAVY2 = "#0B2E5B"
-    RED = "#D92323"
-    GREEN = "#0B7A32"
-    TEXT = "#111827"
-    MUTED = "#64748B"
-    BORDER = "#C9D5E3"
-    ROW_ALT = "#FAFCFF"
-    HEADER_BG = "#F3F7FC"
-    PINK = "#FFF2F2"
-    MINT = "#EFFAF2"
-
-    font_path = get_font_path(False)
-    bold_path = get_font_path(True)
-    FONT = font_manager.FontProperties(fname=font_path)
-    BOLD = font_manager.FontProperties(fname=bold_path)
-
-    plt.rcParams["axes.unicode_minus"] = False
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
-    ax.set_xlim(0, fig_w)
-    ax.set_ylim(0, fig_h)
-    ax.set_axis_off()
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
-        patch = patches.FancyBboxPatch(
-            (x, y), w, h,
-            boxstyle=f"round,pad=0,rounding_size={r}",
-            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z
-        )
-        ax.add_patch(patch)
-        return patch
-
-    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
-        patch = patches.Rectangle((x, y), w, h, linewidth=lw if ec else 0,
-                                  edgecolor=ec, facecolor=fc, zorder=z)
-        ax.add_patch(patch)
-        return patch
-
-    def text(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5, weight=None):
-        ax.text(x, y, str(s), fontsize=size, color=color, fontproperties=fp or FONT,
-                ha=ha, va=va, zorder=z)
-
-    def fit(s, n):
-        s = str(s)
-        return s if len(s) <= n else s[:n - 1] + "…"
-
-    def draw_center_watermark():
-        try:
-            ax.text(
-                0.5, 0.50, CENTER_WATERMARK_TEXT,
-                transform=ax.transAxes,
-                ha="center", va="center",
-                fontsize=CENTER_WATERMARK_FONT_SIZE,
-                fontproperties=BOLD,
-                color="#2C3440",
-                alpha=CENTER_WATERMARK_ALPHA,
-                rotation=CENTER_WATERMARK_ROTATION,
-                linespacing=1.18,
-                # 浮水印放在所有圖層最上方，但透明度很低，不影響閱讀
-                zorder=50,
-            )
-        except Exception:
-            pass
-
-    def draw_bottom_watermark():
-        # 已移除右下角「股市艾斯出品」浮水印，只保留中央淡色浮水印。
-        # 保留空函式是為了避免舊版殘留呼叫時發生 NameError。
-        pass
-
-    date_label = f"{target.month}/{target.day}"
-    draw_center_watermark()
-
-    # ─────────────────────────────────────────────
-    # Header
-    # ─────────────────────────────────────────────
-    y = fig_h - 0.45
-    text(margin_x + 0.15, y, f"{date_label} 精選分點買賣超追蹤", 31, NAVY, BOLD)
-    y -= 0.42
-    text(margin_x + 0.18, y, f"精選 5 家分點｜華南永昌台中、元大南屯、富邦敦南、永豐金內湖、永豐金竹北", 15, NAVY2, BOLD)
-    y -= 0.32
-    text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣超　單位：萬元", 13, TEXT, BOLD)
-
-    source_warning = source_warning or {}
-    if source_warning.get("used_fallback"):
-        y -= 0.30
-        warn_date = source_warning.get("latest_trade_date") or "-"
-        warn_text = f"⚠️ 注意：官方 OpenAPI 當次無完整資料，本圖使用防呆快取資料｜資料日期：{warn_date}"
-        text(margin_x + 0.18, y, warn_text, 13.5, "#B45309", BOLD)
-
-    # ─────────────────────────────────────────────
-    # KPI cards
-    # ─────────────────────────────────────────────
-    y -= 0.25
-    kpi_y = y - kpi_h
-    kpi_gap = 0.30
-    kpi_w = (content_w - 2 * kpi_gap) / 3
-    kpis = [
-        ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK, "↗"),
-        ("今日賣超", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
-        ("淨買超", "", fmt_wan(net), RED if net >= 0 else GREEN, PINK if net >= 0 else MINT, "◎"),
-    ]
-    for i, (title, mid, val, color, bg, icon) in enumerate(kpis):
-        x = margin_x + i * (kpi_w + kpi_gap)
-        rounded(x, kpi_y, kpi_w, kpi_h, fc=bg, ec=color, lw=1.3, r=0.09)
-        circle = patches.Circle((x + 0.48, kpi_y + kpi_h / 2), radius=0.28, facecolor=color, edgecolor=color, zorder=3)
-        ax.add_patch(circle)
-        text(x + 0.48, kpi_y + kpi_h / 2, icon, 22, WHITE, BOLD, ha="center")
-        text(x + 0.88, kpi_y + 0.86, title, 16, TEXT, BOLD)
-        if mid:
-            text(x + 0.88, kpi_y + 0.54, mid, 15, color, BOLD)
-            text(x + 0.88, kpi_y + 0.23, val, 18, color, BOLD)
-        else:
-            text(x + 0.88, kpi_y + 0.42, val, 20, color, BOLD)
-
-    y = kpi_y - gap
-
-    # ─────────────────────────────────────────────
-    # Broker cards：維持單排 3~5 欄；若有動作分點 0~2 個，加入「今日無動作分點」摘要框
-    # ─────────────────────────────────────────────
-    if broker_card_items:
-        cards_per_row = min(5, max(3, len(broker_card_items)))
-        card_gap = 0.14
-        card_w = (content_w - (cards_per_row - 1) * card_gap) / cards_per_row
-
-        for idx, item in enumerate(broker_card_items):
-            col = idx % cards_per_row
-            x = margin_x + col * (card_w + card_gap)
-            cy = y - broker_card_h
-
-            if item == "__INACTIVE__":
-                # 0~2 個有動作分點時，把今日無動作分點做成一個方框。
-                # 設計與一般分點卡片一致：同樣 NAVY 標題列、同樣白底與外框。
-                # 名稱改成單行顯示，避免明明放得下卻被硬換行。
-                rounded(x, cy, card_w, broker_card_h, fc=WHITE, ec=NAVY2, lw=1.1, r=0.08)
-                rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
-                text(x + card_w / 2, cy + broker_card_h - 0.21, "今日無動作分點", 14.5, WHITE, BOLD, ha="center")
-
-                text(x + card_w / 2, cy + broker_card_h - 0.60, "無買超 / 賣方", 11.5, TEXT, FONT, ha="center")
-                ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.78, cy + 0.78], color=BORDER, linewidth=0.8)
-
-                inactive_text = "、".join(inactive_brokers)
-                text(x + 0.12, cy + 0.48, inactive_text, 12.0, TEXT, BOLD)
-                continue
-
-            b = item
-            s = broker_summary[b]
-            rounded(x, cy, card_w, broker_card_h, fc=WHITE, ec=NAVY2, lw=1.1, r=0.08)
-            rect(x, cy + broker_card_h - 0.42, card_w, 0.42, fc=NAVY)
-
-            # 此區字體比前一版放大 2
-            text(x + card_w / 2, cy + broker_card_h - 0.21, b, 14.5, WHITE, BOLD, ha="center")
-            text(x + card_w / 2, cy + broker_card_h - 0.60, f"平均 {s['avg_hold_days']:.1f} 天", 11.5, TEXT, FONT, ha="center")
-            ax.plot([x + 0.12, x + card_w - 0.12], [cy + 0.78, cy + 0.78], color=BORDER, linewidth=0.8)
-
-            text(x + 0.12, cy + 0.56, "買超", 12.5, RED, BOLD)
-            text(x + 0.70, cy + 0.56, f"{s['buy_count']}筆 / {fmt_wan(s['buy_amount'])}", 12.5, RED, BOLD)
-
-            text(x + 0.12, cy + 0.28, "賣超", 12.5, GREEN, BOLD)
-            text(x + 0.70, cy + 0.28, f"{s['sell_count']}筆 / {fmt_wan(s['sell_amount'])}", 12.5, GREEN, BOLD)
-
-    y -= broker_area_h
-
-    # 有動作分點 3～5 個時，維持原本方式：今日無動作分點顯示在下方長條
-    if show_inactive_bar:
-        y -= gap
-        rounded(margin_x, y - inactive_h, content_w, inactive_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-        text(margin_x + 0.25, y - inactive_h / 2, "今日無動作分點：", 15, NAVY, BOLD)
-        text(margin_x + 2.02, y - inactive_h / 2, "、".join(inactive_brokers), 15, TEXT, BOLD)
-        y -= inactive_h
-
-    y -= gap
-
-    # ─────────────────────────────────────────────
-    # 通用表格繪製
-    # ─────────────────────────────────────────────
-    def draw_table(title, rows, headers, col_widths, row_builder, title_color, amount_color, y_top):
-        table_h = section_title_h + header_h + max(1, len(rows)) * row_h
-        rounded(margin_x, y_top - table_h, content_w, table_h, fc=WHITE, ec=title_color, lw=1.2, r=0.08)
-        rect(margin_x, y_top - section_title_h, content_w, section_title_h, fc=title_color)
-        text(margin_x + 0.30, y_top - section_title_h / 2, title, 19, WHITE, BOLD)
-
-        header_y_top = y_top - section_title_h
-        rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
-        x = margin_x
-        for h, w in zip(headers, col_widths):
-            text(x + w / 2, header_y_top - header_h / 2, h, 12, NAVY, BOLD, ha="center")
-            ax.plot([x, x], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-            x += w
-        ax.plot([margin_x + content_w, margin_x + content_w], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-
-        data_y = header_y_top - header_h
-        if not rows:
-            rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-            text(margin_x + content_w / 2, data_y - row_h / 2, "今日沒有達顯示條件的資料", 13, MUTED, BOLD, ha="center")
-        else:
-            for i, r in enumerate(rows):
-                ry = data_y - (i + 1) * row_h
-                rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
-                values, colors, aligns, bolds = row_builder(i, r)
-                x = margin_x
-                for val, w, c, a, is_bold, h in zip(values, col_widths, colors, aligns, bolds, headers):
-                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    display_val = fit(val, max(5, int(w * 6.0)))
-
-                    # 只針對買超明細「內容」欄，把「加碼N｜」前綴獨立畫成粗體。
-                    # 後面的權證名稱維持原本一般字體，避免整格都變粗。
-                    if h == "內容" and a == "left":
-                        m = re.match(r"^(加碼\d+｜)(.*)$", str(display_val))
-                        if m:
-                            prefix = m.group(1)
-                            rest = m.group(2)
-
-                            text(px, ry + row_h / 2, prefix, 14, c, BOLD, ha="left")
-
-                            prefix_offset = 0.0
-                            for ch in prefix:
-                                prefix_offset += 0.085 if ord(ch) < 128 else 0.17
-                            prefix_offset += 0.03
-
-                            text(px + prefix_offset, ry + row_h / 2, rest, 14, c, FONT, ha="left")
-                        else:
-                            text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
-                    else:
-                        text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
-                    x += w
-        return y_top - table_h
-
-    # Buy table
-    buy_headers = ["排名", "分點", "事件", "標的 / 權證", "內容", "買超金額"]
-    buy_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
-
-    def buy_builder(i, r):
-        return (
-            [str(i + 1), r["broker"], r["event"], r["target"], r["content"], fmt_wan(r["amount"])],
-            [TEXT, TEXT, RED, TEXT, TEXT, RED],
-            ["center", "left", "center", "left", "left", "right"],
-            [True, True, True, True, False, True],
-        )
-
-    y = draw_table(f"{date_label} 今日買超明細", buy_rows, buy_headers, buy_col_w, buy_builder, NAVY, RED, y)
-
-    # Sell table
-    if sell_rows:
-        y -= gap
-        sell_headers = ["分點", "狀態", "標的 / 權證", "內容", "報酬率", "賣方金額"]
-        sell_col_w = [2.05, 1.05, 2.25, 2.75, 1.55, 2.35]
-
-        def sell_builder(i, r):
-            ret_text = fmt_return_pct(r.get("return_pct"))
-            ret_color = RED if safe_float(r.get("return_pct"), 0) > 0 else GREEN if safe_float(r.get("return_pct"), 0) < 0 else TEXT
-            return (
-                [r["broker"], r["status"], r["target"], r["content"], ret_text, fmt_wan(r["amount"])],
-                [TEXT, GREEN, TEXT, TEXT, ret_color, GREEN],
-                ["left", "center", "left", "left", "right", "right"],
-                [True, True, True, False, True, True],
-            )
-
-        y = draw_table(f"{date_label} 今日賣超明細", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
-
-    # Event legend：改成與近一個月圖相同的橫條式說明
-    y -= gap
-    legend_y = y - event_legend_h
-    rounded(margin_x, legend_y, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-
-    text(margin_x + 0.25, legend_y + event_legend_h / 2, "事件代號說明", 13.5, NAVY, BOLD)
-
-    legend_items = [
-        ("A", "單檔權證單日大買"),
-        ("B", "同標的單日合買"),
-        ("C", "同標的3日累積"),
-        ("D", "近10日累積淨買"),
-    ]
-
-    lx = margin_x + 2.00
-    for code_name, desc in legend_items:
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.40, legend_y + event_legend_h / 2, desc, 10.8, TEXT, FONT)
-        lx += 2.20 if code_name in {"A", "B"} else 1.98
-
-    # footer
-    y -= event_legend_h
-    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
-    plt.close(fig)
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 近一個月交易日｜五大分點共識買超 TOP10
-# ══════════════════════════════════════════════════════════════════════
-
-def get_buy_event_date(row, sheet_name: str) -> date | None:
-    """依事件工作表取得該筆買超事件日期。"""
-    if sheet_name in (SHEET_A, SHEET_A_FULL):
-        return parse_date_value(row.get("買進日"))
-    if sheet_name in (SHEET_B, SHEET_B_FULL):
-        return parse_date_value(row.get("事件日"))
-    if sheet_name in (SHEET_C, SHEET_D, SHEET_C_FULL, SHEET_D_FULL):
-        return parse_date_value(row.get("結束日"))
-    return None
-
-
-def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
-    """依事件工作表取得該筆賣方事件日期。status = 減碼 / 出清"""
-    col = "減碼日" if status == "減碼" else "出清日"
-    return parse_date_value(row.get(col))
-
-
-def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> list[date]:
-    """
-    從 A/B/C/D 買超事件中抓出 <= target 的有效事件日期，
-    再往前取最近 N 個「有資料的交易日」。
-
-    這樣春節、連假、休市時不會因為日曆天不足而失真。
-    """
-    dates = set()
-
-    plans = [
-        (SHEET_A_FULL, ["分點", "買進日"]),
-        (SHEET_B_FULL, ["分點", "事件日"]),
-        (SHEET_C_FULL, ["分點", "結束日"]),
-        (SHEET_D_FULL, ["分點", "結束日"]),
-    ]
-
-    for sheet_name, cols in plans:
-        try:
-            df = read_gsheet_table(sheet_name, cols)
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            d = get_buy_event_date(r, sheet_name)
-            if d and d <= target:
-                dates.add(d)
-
-    return sorted(dates, reverse=True)[:lookback_days]
-
-
-def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
-    """
-    統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP15。
-
-    統計來源：
-    - A_單檔大買：買進日 / 買進金額
-    - B_同標的單日合計：事件日 / 買超金額
-    - C_同標的3日累積：結束日 / 買超金額
-    - D_近10日累積淨買進：結束日 / 買超金額
-
-    合併方式：
-    - 同標的股合併
-    - 淨累積買超 = 合計買超 - 合計賣方金額
-    - 僅保留淨累積買超 > 0 的標的
-    - 依淨累積買超由大到小排序
-    """
-    trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
-    date_set = set(trading_dates)
-
-    if not trading_dates:
-        return [], []
-
-    agg = {}
-
-    # 只記錄本次近 N 個有效交易日內，真正被 A/B/C/D 買超事件納入統計的
-    # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單
-    # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
-    counted_warrant_keys: set[tuple[str, str]] = set()
-
-    def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
-        """
-        TOP15 賣方扣減規則：
-        1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
-        2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
-           也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
-           能正確反映到近一個月 TOP15 淨買超。
-
-        注意：對於第 2 類，只是拿「同日同分點同標的合計 >= 門檻」作為納入條件；
-        一旦達標，該組合底下當天所有賣出列都會被扣減。
-        """
-        if sell_df.empty:
-            return
-
-        sell_period_start = min(trading_dates)
-        sell_period_end = target
-
-        usable_sell_rows = []
-        non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
-
-        for _, r in sell_df.iterrows():
-            d = parse_date_value(r.get("日期"))
-            if not d or d < sell_period_start or d > sell_period_end:
-                continue
-
-            broker = str(r.get("分點", "")).strip()
-            if broker not in TRACKED_BROKERS:
-                continue
-
-            warrant_text = r.get("權證名稱", "")
-            code = normalize_underlying(r.get("標的股"), warrant_text)
-            if not code or code not in agg:
-                continue
-
-            amount = safe_float(r.get("賣出金額"), 0)
-            if amount <= 0:
-                continue
-
-            warrant_code = ""
-            for col in code_col_candidates:
-                warrant_code = normalize_warrant_code(r.get(col, ""))
-                if warrant_code:
-                    break
-
-            is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
-            usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
-
-            # 非 A/B/C/D 的大額賣超只用「目標日當天」判斷與扣減。
-            # A/B/C/D 白名單權證的賣出仍維持整個統計期間扣減。
-            # 避免 RUN_MODE=1 全市場補抓後，把近一個月所有非策略大額賣單都扣進 TOP15，
-            # 導致 TOP15 全部被扣成負數而空白。
-            if not is_counted_warrant and d == target:
-                non_abcd_sell_amounts[(d, broker, code)] += amount
-
-        qualifying_non_abcd_keys = {
-            key
-            for key, amount in non_abcd_sell_amounts.items()
-            if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
-        }
-
-        for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
-            if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_keys:
-                continue
-
-            agg[code]["net_amount"] -= amount
-            agg[code]["broker_net_amounts"][broker] -= amount
-
-    def ensure_item(underlying, warrant_text=""):
-        code = normalize_underlying(underlying, warrant_text)
-        if not code:
-            return None, None
-
-        stock_name = get_stock_name_map().get(code, "")
-        if not stock_name:
-            stock_name = extract_stock_name_from_warrant_text(warrant_text)
-        label = f"{code} {stock_name}".strip()
-
-        if code not in agg:
-            agg[code] = {
-                "underlying": code,
-                "stock_name": stock_name,
-                "target": label,
-                "amount": 0.0,       # 合計買超
-                "net_amount": 0.0,   # 淨累積買超 = 買超 - 賣方
-                "count": 0,
-                "brokers": set(),
-                "events": set(),
-                "broker_amounts": defaultdict(float),
-                "broker_net_amounts": defaultdict(float),
-                "first_date": None,
-                "last_date": None,
-            }
-
-        return code, agg[code]
-
-    def add_buy_row(sheet_name, event_code, row, event_date, amount):
-        if not event_date or event_date not in date_set:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        amount = safe_float(amount)
-        if amount <= 0:
-            return
-
-        warrant_text = row.get("權證名稱") or row.get("權證清單") or ""
-        code, item = ensure_item(row.get("標的股"), warrant_text)
-        if not item:
-            return
-
-        item["amount"] += amount
-        item["net_amount"] += amount
-        item["count"] += 1
-        item["brokers"].add(broker)
-        item["events"].add(event_code)
-        item["broker_amounts"][broker] += amount
-        item["broker_net_amounts"][broker] += amount
-
-        if item["first_date"] is None or event_date < item["first_date"]:
-            item["first_date"] = event_date
-        if item["last_date"] is None or event_date > item["last_date"]:
-            item["last_date"] = event_date
-
-        # 建立本次 TOP15 統計範圍內的權證白名單。
-        # A 表通常是一檔權證；B/C/D 則從權證清單拆出多檔權證。
-        if sheet_name in (SHEET_A, SHEET_A_FULL):
-            warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
-            if warrant_code:
-                counted_warrant_keys.add((broker, warrant_code))
-        else:
-            for warrant_code, _ in parse_warrant_items_from_text(warrant_text):
-                if warrant_code:
-                    counted_warrant_keys.add((broker, warrant_code))
-
-    def add_sell_row(row, event_date, amount):
-        if not event_date or event_date not in date_set:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        amount = safe_float(amount)
-        if amount <= 0:
-            return
-
-        warrant_text = row.get("權證名稱") or row.get("權證清單") or ""
-        code = normalize_underlying(row.get("標的股"), warrant_text)
-        if not code or code not in agg:
-            return
-
-        agg[code]["net_amount"] -= amount
-        agg[code]["broker_net_amounts"][broker] -= amount
-
-    # A：買超與賣方
-    try:
-        A = read_gsheet_table(
-            SHEET_A_FULL,
-            ["分點", "標的股", "權證代碼", "權證代號", "權證名稱",
-             "買進日", "買進金額", "買進張數",
-             "減碼日", "減碼均價", "出清日", "出清均價"]
-        )
-
-        for _, r in A.iterrows():
-            add_buy_row(SHEET_A_FULL, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
-
-        # 賣方扣減改由「每日賣出明細」統一處理，避免 A 類部分減碼被整筆買進張數放大。
-    except Exception:
-        pass
-
-    # B/C/D：買超與賣方
-    plans = [
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
-    ]
-
-    for sheet_name, event_code, date_col in plans:
-        try:
-            df = read_gsheet_table(
-                sheet_name,
-                ["分點", "標的股", date_col, "買超金額",
-                 "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
-            )
-        except Exception:
-            continue
-
-        for _, r in df.iterrows():
-            add_buy_row(sheet_name, event_code, r, parse_date_value(r.get(date_col)), r.get("買超金額"))
-
-        # 賣方扣減改由「每日賣出明細」統一處理，避免群組事件中單檔實際賣出被漏算或誤估。
-
-    # 使用「快取_分點歷史」扣減近 N 個有效交易日內的實際賣出金額。
-    # 注意：每日賣出明細通常只輸出最近幾天，不能拿來做近一個月 TOP15，
-    # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
-    #
-    # 扣減規則：
-    # 1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
-    # 2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
-    #    也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
-    #    能正確反映到近一個月 TOP15 淨買超。
-    sell_rows_loaded = False
-    try:
-        sell_df = read_gsheet_table_optional(
-            SHEET_HISTORY,
-            ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
-        )
-
-        if not sell_df.empty:
-            sell_rows_loaded = True
-            apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼"])
-    except Exception:
-        pass
-
-    # 舊版主程式若尚未同步「快取_分點歷史」到 Google Sheet，才退回每日賣出明細。
-    # 但每日賣出明細可能只含最近幾天，因此只作備援，不作主要來源。
-    if not sell_rows_loaded:
-        try:
-            sell_df = read_gsheet_table_optional(
-                SHEET_DAILY_SELL,
-                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
-            )
-
-            if not sell_df.empty:
-                apply_sell_deduction_from_df(sell_df, ["權證代號"])
-        except Exception:
-            pass
-
-    rows = []
-    for item in agg.values():
-        # 共識淨買超榜只保留目前仍為正淨買超的標的
-        if item["net_amount"] <= 0:
-            continue
-
-        top_broker = ""
-        top_amount = 0.0
-        if item["broker_amounts"]:
-            top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
-
-        participant_brokers = [
-            (broker, amount)
-            for broker, amount in item["broker_net_amounts"].items()
-            if amount > 0
-        ]
-        participant_brokers.sort(key=lambda kv: kv[1], reverse=True)
-
-        rows.append({
-            "target": item["target"],
-            "amount": item["amount"],
-            "net_amount": item["net_amount"],
-            "count": item["count"],
-            "broker_count": len(participant_brokers) if participant_brokers else len(item["brokers"]),
-            "brokers": sorted(item["brokers"]),
-            "events": "/".join(sorted(item["events"])),
-            "top_broker": top_broker,
-            "top_broker_amount": top_amount,
-            "participant_brokers": participant_brokers,
-            "first_date": item["first_date"],
-            "last_date": item["last_date"],
-        })
-
-    rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
-    return rows[:15], trading_dates
-
-
-def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
-    """
-    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP15
-    """
-    rows, trading_dates = collect_consensus_buy_top10(target, lookback_days)
-    n = len(rows)
-
-    if trading_dates:
-        period_text = f"{min(trading_dates):%Y/%m/%d} ～ {max(trading_dates):%Y/%m/%d}"
+                pick = wg.sort_values("net_amount", ascending=not positive).iloc[0]
+                max_code, max_name, max_amt = pick["warrant_code"], pick["warrant_name"], float(pick["net_amount"])
+            rows.append({
+                "branch": branch,
+                "net_amount": float(br["net_amount"]),
+                "max_warrant_code": max_code,
+                "max_warrant_name": max_name,
+                "max_warrant_amount": max_amt,
+            })
+        return pd.DataFrame(rows, columns=cols)
+
+    buy_br = branch_sum[branch_sum["net_amount"] > 0].sort_values("net_amount", ascending=False).head(topn)
+    sell_br = branch_sum[branch_sum["net_amount"] < 0].sort_values("net_amount", ascending=True).head(topn)
+    return add_max_warrant(buy_br, positive=True), add_max_warrant(sell_br, positive=False)
+
+
+def build_key_points(ctx, stock_name: str):
+    points = []
+    df = ctx["plot_df"]
+    latest = df.iloc[-1]
+    net = ctx["total_net"]
+
+    close = float(latest["Close"])
+    ma20 = float(latest["MA20"])
+    ma60 = float(latest["MA60"])
+    ma_state = get_ma_kline_signals(df)
+    if close > ma20 and close > ma60:
+        pos = "站穩月線、季線之上"
+    elif close > ma60:
+        pos = "回到季線之上、月線之下"
     else:
-        period_text = "無有效期間"
+        pos = "跌破月線或季線"
+    points.append(f"股價本週 {fmt_pct(ctx['stock_ret'])}，最新收盤 {close:.0f}，{pos}" + (f"，{ma_state}" if ma_state else "") + "。")
 
-    total_amount = sum(r["amount"] for r in rows)
-    total_net_amount = sum(r["net_amount"] for r in rows)
+    vol_ratio = latest["Volume"] / latest["MV20"] if latest.get("MV20", np.nan) and not pd.isna(latest.get("MV20", np.nan)) else np.nan
+    if not pd.isna(vol_ratio):
+        tag = "爆量" if vol_ratio >= 2 else "增溫" if vol_ratio >= 1.2 else "量縮"
+        points.append(f"本週量能較前週 {fmt_pct(ctx['vol_change'])}，最新日約為月均量 {vol_ratio:.1f} 倍（{tag}）。")
 
-    # 動態版面
-    fig_w = 13.0
-    margin_x = 0.40
-    content_w = fig_w - 2 * margin_x
+    e = ctx["week_events"]
+    if e is not None and not e.empty:
+        by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
+        top_branch = str(by_branch.index[0])
+        top_amt = float(by_branch.iloc[0])
+        pos_sum = by_branch.clip(lower=0).sum()
+        share = by_branch.head(3).clip(lower=0).sum() / max(1.0, pos_sum) * 100 if pos_sum > 0 else 0.0
+        points.append(f"權證淨流向 {fmt_money(net)}（{ctx['bias']}），由「{top_branch}」領軍 {fmt_money(top_amt)}，前三大分點佔買超 {share:.0f}%。")
 
-    top_h = 1.95
-    legend_h = 0.45
-    gap = 0.18
-    section_title_h = 0.55
-    header_h = 0.42
-    row_h = 0.50
-    footer_h = 0.45
+    if ctx.get("hedge_removed", 0) > 0:
+        points.append(f"本週已過濾疑似造市 / 避險紀錄 {ctx['hedge_removed']} 筆，降低發行商自營單干擾。")
+    elif ctx.get("hedge_candidates", 0) > 0:
+        points.append(f"偵測到疑似買賣對沖紀錄 {ctx['hedge_candidates']} 筆；目前保留不刪除，避免誤刪大額主力單。")
+    return points[:4]
 
-    table_h = section_title_h + header_h + max(1, n) * row_h
 
-    fig_h = top_h + legend_h + gap + table_h + footer_h
-    fig_h = max(fig_h, 7.6)
+# ============================================================
+# 新聞抓取：先做可用版，後續可再換 MOPS / OpenAI 摘要
+# ============================================================
 
-    BG = "#F6F8FB"
-    WHITE = "#FFFFFF"
-    NAVY = "#061D3D"
-    NAVY2 = "#0B2E5B"
-    RED = "#D92323"
-    GREEN = "#16803C"
-    TEXT = "#111827"
-    MUTED = "#64748B"
-    BORDER = "#C9D5E3"
-    ROW_ALT = "#FAFCFF"
-    HEADER_BG = "#F3F7FC"
-    PINK = "#FFF2F2"
-
-    font_path = get_font_path(False)
-    bold_path = get_font_path(True)
-    FONT = font_manager.FontProperties(fname=font_path)
-    BOLD = font_manager.FontProperties(fname=bold_path)
-
-    plt.rcParams["axes.unicode_minus"] = False
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
-    ax.set_xlim(0, fig_w)
-    ax.set_ylim(0, fig_h)
-    ax.set_axis_off()
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
-        patch = patches.FancyBboxPatch(
-            (x, y), w, h,
-            boxstyle=f"round,pad=0,rounding_size={r}",
-            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z
-        )
-        ax.add_patch(patch)
-        return patch
-
-    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
-        patch = patches.Rectangle((x, y), w, h, linewidth=lw if ec else 0,
-                                  edgecolor=ec, facecolor=fc, zorder=z)
-        ax.add_patch(patch)
-        return patch
-
-    def text(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5):
-        ax.text(x, y, str(s), fontsize=size, color=color, fontproperties=fp or FONT,
-                ha=ha, va=va, zorder=z)
-
-    def fit(s, n_chars):
-        s = str(s)
-        return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
-
-    def fmt_participant_brokers(row, limit=5):
-        """
-        顯示所有參與分點的淨累積買超金額。
-        多數情況只有 1 家；若有多家共識買超，會完整列出。
-        """
-        items = row.get("participant_brokers", [])
-        if not items:
-            top_broker = row.get("top_broker", "")
-            top_amount = row.get("top_broker_amount", 0)
-            return fit(f"{top_broker} {fmt_wan(top_amount)}", 24)
-
-        shown = items[:limit]
-        text_items = [f"{broker} {fmt_wan(amount)}" for broker, amount in shown]
-        if len(items) > limit:
-            text_items.append(f"等{len(items)}家")
-        return fit("、".join(text_items), 30)
-
-    # 中央浮水印
+def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
+    manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
+    if manual:
+        parts = [x.strip() for x in re.split(r"[\n；;]+", manual) if x.strip()]
+        return parts[:max_items]
+    if not NEWS_ENABLE:
+        return []
+    query = f'("{stock_code}" OR "{stock_name}") (營收 OR 轉型 OR 題材 OR AI OR 記憶體 OR DRAM OR 半導體 OR 報價 OR 法說 OR 外資 OR 投信) when:7d'
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": query,
+        "hl": "zh-TW",
+        "gl": "TW",
+        "ceid": "TW:zh-Hant",
+    })
     try:
-        ax.text(
-            0.5, 0.50, CENTER_WATERMARK_TEXT,
-            transform=ax.transAxes,
-            ha="center", va="center",
-            fontsize=CENTER_WATERMARK_FONT_SIZE,
-            fontproperties=BOLD,
-            color="#2C3440",
-            alpha=CENTER_WATERMARK_ALPHA,
-            rotation=CENTER_WATERMARK_ROTATION,
-            linespacing=1.18,
-            zorder=50,
-        )
-    except Exception:
-        pass
-
-    # Header
-    y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP15", 28, NAVY, BOLD)
-    y -= 0.48
-    text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
-    y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
-
-    # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
-    y -= 0.28
-    legend_y = y - legend_h
-    rounded(margin_x, legend_y, content_w, legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-
-    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
-
-    legend_items = [
-        ("A", "單檔權證單日大買"),
-        ("B", "同標的單日合買"),
-        ("C", "同標的3日累積"),
-        ("D", "近10日累積淨買"),
-    ]
-
-    lx = margin_x + 3.40
-    for code_name, desc in legend_items:
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.40, legend_y + legend_h / 2, desc, 10.8, TEXT, FONT)
-        lx += 2.15 if code_name in {"A", "B"} else 1.95
-
-    y = legend_y - gap
-
-    # Table
-    table_top = y
-    rounded(margin_x, table_top - table_h, content_w, table_h, fc=WHITE, ec=NAVY, lw=1.2, r=0.08)
-    rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
-    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP15", 19, WHITE, BOLD)
-
-    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "參與分點"]
-    col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
-
-    header_y_top = table_top - section_title_h
-    rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
-
-    x = margin_x
-    for h, w in zip(headers, col_w):
-        text(x + w / 2, header_y_top - header_h / 2, h, 12, NAVY, BOLD, ha="center")
-        ax.plot([x, x], [table_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-        x += w
-    ax.plot([margin_x + content_w, margin_x + content_w], [table_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
-
-    data_y = header_y_top - header_h
-    if not rows:
-        rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨累積買超為正的標的", 13, MUTED, BOLD, ha="center")
-    else:
-        for i, r in enumerate(rows):
-            ry = data_y - (i + 1) * row_h
-            rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
-
-            net_color = RED if r["net_amount"] > 0 else GREEN if r["net_amount"] < 0 else TEXT
-            values = [
-                str(i + 1),
-                fit(r["target"], 14),
-                fmt_wan(r["net_amount"]),
-                str(r["broker_count"]),
-                r["events"],
-                fmt_participant_brokers(r),
-            ]
-
-            colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
-            aligns = ["center", "left", "right", "center", "center", "left"]
-            bolds = [True, True, True, True, True, True]
-
-            x = margin_x
-            for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
-                px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
-                x += w
-
-    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
-    plt.close(fig)
+        r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        titles = []
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            title = re.sub(r"\s+-\s+[^-]+$", "", title)
+            if title and title not in titles:
+                titles.append(title)
+            if len(titles) >= max_items:
+                break
+        return titles
+    except Exception as e:
+        print(f"⚠️ Google News RSS 抓取失敗：{e}")
+        return []
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Discord
-# ══════════════════════════════════════════════════════════════════════
+def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], ctx: dict | None = None) -> List[str]:
+    """整理最近一週新聞，優先抓營收、轉型、題材、產業熱點。"""
+    titles = []
+    seen = set()
+    for t in news_titles or []:
+        s = re.sub(r"\s+", " ", str(t or "").strip())
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        titles.append(s)
 
-def send_to_discord(webhook_url: str, image_path: Path, target: date):
-    """
-    只上傳圖片到 Discord，不另外傳送文字內容。
-    """
-    with image_path.open("rb") as f:
-        files = {"file": (image_path.name, f, "image/png")}
-        resp = requests.post(webhook_url, files=files, timeout=60)
+    def pick(keywords, used):
+        for tt in titles:
+            if tt in used:
+                continue
+            if any(k in tt for k in keywords):
+                used.add(tt)
+                return tt
+        return ""
 
-    if not (200 <= resp.status_code < 300):
-        raise RuntimeError(f"Discord webhook 發送失敗：{resp.status_code} {resp.text}")
+    used = set()
+    revenue = pick(["營收", "月增", "年增", "業績", "財報", "獲利", "EPS"], used)
+    theme = pick(["題材", "AI", "伺服器", "記憶體", "DRAM", "半導體", "報價", "HBM", "漲價", "缺貨"], used)
+    transform = pick(["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望"], used)
+    broker = pick(["外資", "投信", "券商", "評等", "目標價", "調升", "調降"], used)
+    company = pick([stock_name, stock_code], used)
+
+    points = []
+    if revenue:
+        points.append(f"營收 / 財報：{revenue}")
+    if theme:
+        points.append(f"本週題材：{theme}")
+    if transform:
+        points.append(f"轉型 / 展望：{transform}")
+    if broker:
+        points.append(f"法人觀點：{broker}")
+    if company and len(points) < 4:
+        points.append(f"公司消息：{company}")
+    if not points and titles:
+        points = [f"新聞線索：{t}" for t in titles[:4]]
+    if not points:
+        points = ["本週未抓到明確新聞題材；可用 WEEKLY_NEWS_TEXT 手動填入營收、轉型或題材重點。"]
+    return points[:4]
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--date", default=os.getenv("TARGET_DATE", ""))
-    parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
-    parser.add_argument("--no-discord", action="store_true")
-    args = parser.parse_args()
+# ============================================================
+# 繪圖工具
+# ============================================================
 
-    if args.date:
-        target = datetime.strptime(args.date, "%Y-%m-%d").date()
-    else:
-        target = infer_latest_date_from_gsheet()
+def style_ax(ax, title=None, title_color=GOLD):
+    ax.set_facecolor(PANEL)
+    ax.tick_params(colors=MUTED, labelsize=28)
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+        spine.set_linewidth(1.1)
+    ax.grid(True, color=GRID, alpha=0.35, linewidth=0.7)
+    if title:
+        ax.set_title(title, loc="left", fontsize=38, color=title_color, fontweight="bold", pad=14)
+    ax.yaxis.label.set_color(MUTED)
+    ax.xaxis.label.set_color(MUTED)
 
-    output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP15.png"
 
-    history = read_history_stats_from_gsheet()
-    buys, sells = extract_actions_from_gsheet(target)
-    source_warning = read_data_source_warning_from_gsheet()
+def add_panel_title(ax, title, subtitle=""):
+    ax.text(0.01, 0.96, title, transform=ax.transAxes, ha="left", va="top", color=TEXT, fontsize=16, fontweight="bold")
+    if subtitle:
+        ax.text(0.01, 0.86, subtitle, transform=ax.transAxes, ha="left", va="top", color=MUTED, fontsize=11)
 
-    print(
-        f"Google Sheet：{GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME}\n"
-        f"目標日期：{target:%Y-%m-%d}\n"
-        f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
-        f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
-        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日\n"
-        f"輸出圖檔1：{output_path}\n"
-        f"輸出圖檔2：{consensus_output_path}"
-    )
 
-    draw_report_image(target, buys, sells, history, output_path, source_warning=source_warning)
-    draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
-
-    if args.no_discord:
-        print("已設定 --no-discord，只輸出圖片，不發送 Discord。")
+def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.18, scale=1.08):
+    if df is None or df.empty:
         return
+    lows, highs, opens, closes, volumes = df["Low"], df["High"], df["Open"], df["Close"], df["Volume"]
+    price_min, price_max = lows.min(), highs.max()
+    if price_max <= price_min:
+        return
+    bins = np.linspace(price_min, price_max, n_bins + 1)
+    centers = (bins[:-1] + bins[1:]) / 2
+    height = bins[1] - bins[0]
+    profile = np.zeros(n_bins)
+    for i in range(len(df)):
+        vol, low, high, open_, close = volumes.iloc[i], lows.iloc[i], highs.iloc[i], opens.iloc[i], closes.iloc[i]
+        body_min, body_max = min(open_, close), max(open_, close)
+        ranges = [((low, body_min), 0.2), ((body_min, body_max), 0.6), ((body_max, high), 0.2)]
+        for (start, end), weight in ranges:
+            if end - start < 1e-6:
+                continue
+            idxs = np.where((centers >= start) & (centers <= end))[0]
+            if len(idxs):
+                profile[idxs] += vol * weight / len(idxs)
+    if profile.max() <= 0:
+        return
+    scaled = profile / profile.max()
+    x_min, x_max = ax.get_xlim()
+    width_max = (x_max - x_min) / scale
+    sorted_idx = np.argsort(profile)[::-1]
+    max_idx = int(sorted_idx[0]) if len(sorted_idx) else -1
+    second_idx = int(sorted_idx[1]) if len(sorted_idx) > 1 else -1
+    for i in range(n_bins):
+        w = scaled[i] * width_max
+        if i == max_idx:
+            rect_color = "#DC2626"   # 第一大量：紅色
+            rect_alpha = 0.34
+        elif i == second_idx:
+            rect_color = "#F59E0B"   # 第二大量：橘色
+            rect_alpha = 0.30
+        else:
+            rect_color = color       # 其餘維持原本淺藍
+            rect_alpha = alpha
+        ax.add_patch(Rectangle((x_min, centers[i] - height / 2), w, height, color=rect_color, alpha=rect_alpha, zorder=0, clip_on=True))
+    ax.set_xlim(x_min, x_max)
 
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "")
-    if not webhook_url:
-        raise RuntimeError("找不到 DISCORD_WEBHOOK_URL_TEST，請先在 GitHub Secrets 設定。")
 
-    send_to_discord(webhook_url, output_path, target)
-    send_to_discord(webhook_url, consensus_output_path, target)
+def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
+    # 單張摘要卡片：保留獨立卡片感，並讓上方藏青色 band 與圓角外框貼齊。
+    rounding = 0.026
+    band_h = 0.078
 
-    print("Discord 已發送 2 張圖片。")
+    box = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor=PANEL2,
+        edgecolor=GOLD,
+        linewidth=1.25,
+        zorder=1,
+    )
+    ax.add_patch(box)
+
+    # 上方藏青色 band：使用 Rectangle 並裁切到外框圓角，避免左右縮短或圓角不貼合。
+    band = Rectangle(
+        (x, y + h - band_h),
+        w,
+        band_h,
+        transform=ax.transAxes,
+        facecolor=GOLD,
+        edgecolor=GOLD,
+        linewidth=0,
+        alpha=0.96,
+        zorder=2,
+    )
+    band.set_clip_path(box)
+    ax.add_patch(band)
+
+    # 標題
+    ax.text(
+        x + w / 2,
+        y + h - 0.15,
+        label,
+        transform=ax.transAxes,
+        color=MUTED,
+        fontsize=29,
+        ha="center",
+        va="top",
+        zorder=4,
+    )
+
+    # 數字：固定同一水平線，避免每格看起來不整齊。
+    ax.text(
+        x + w / 2,
+        y + 0.30,
+        value,
+        transform=ax.transAxes,
+        color=value_color,
+        fontsize=42,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        zorder=4,
+    )
+
+    if sub:
+        ax.text(
+            x + w / 2,
+            y + 0.10,
+            sub,
+            transform=ax.transAxes,
+            color=MUTED,
+            fontsize=22,
+            ha="center",
+            va="bottom",
+            zorder=4,
+        )
+
+def plot_candles(ax, plot_df: pd.DataFrame, x: list):
+    up = plot_df["Close"] >= plot_df["Open"]
+    width = 0.72
+    for i in x:
+        color = RED if up.iloc[i] else GREEN
+        op, cl = float(plot_df["Open"].iloc[i]), float(plot_df["Close"].iloc[i])
+        hi, lo = float(plot_df["High"].iloc[i]), float(plot_df["Low"].iloc[i])
+        ax.plot([i, i], [lo, hi], color=color, linewidth=1.3, zorder=3)
+        body_low = min(op, cl)
+        body_h = abs(cl - op)
+        if body_h < max(0.01, cl * 0.0005):
+            ax.plot([i - width / 2, i + width / 2], [cl, cl], color=color, linewidth=2.5, zorder=4)
+        else:
+            ax.bar(i, body_h, bottom=body_low, width=width, color=color, edgecolor=color, align="center", zorder=4)
 
 
-if __name__ == "__main__":
-    main()
+def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_titles: List[str]):
+    ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+    ctx["stock_code"] = stock_code
+    plot_df = ctx["plot_df"].copy()
+    plot_events = ctx["plot_events"]
+    week_events = ctx["week_events"]
+    x = list(range(len(plot_df)))
+    date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in plot_df.index]
+    daily_net = daily_warrant_net(plot_df, plot_events)
+    buy_top, sell_top = top_branch_tables(week_events, topn=5)
+    key_points = build_key_points(ctx, stock_name)
+    news_points = build_news_points(stock_code, stock_name, news_titles, ctx)
+
+    fig = plt.figure(figsize=(28, 54), facecolor=BG)
+    gs = GridSpec(8, 12, figure=fig,
+                  height_ratios=[1.45, 2.05, 7.6, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  hspace=0.24, wspace=0.25)
+
+    # Header
+    ax_header = fig.add_subplot(gs[0, :])
+    ax_header.set_axis_off()
+    period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
+    ax_header.text(0.01, 0.50, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
+    ax_header.text(0.01, -0.10, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=32, ha="left", va="center")
+    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
+
+    # Cards
+    ax_cards = fig.add_subplot(gs[1, :])
+    ax_cards.set_axis_off()
+
+    cards = [
+        ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
+        ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]), "", RED if ctx["total_net"] >= 0 else GREEN),
+        ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
+        ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
+    ]
+
+    card_w, gap = 0.183, 0.01
+    start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
+    for i, (lab, val, sub, col) in enumerate(cards):
+        draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
+
+    # K line
+    candle_ax = fig.add_subplot(gs[2, :])
+    style_ax(candle_ax, "股價趨勢｜K線、均線、布林與價量分布")
+    plot_candles(candle_ax, plot_df, x)
+    candle_ax.plot(x, plot_df["MA5"], color=RED, linewidth=1.6, label=f"5MA {plot_df['MA5'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA10"], color=ORANGE, linewidth=1.3, label=f"10MA {plot_df['MA10'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA20"], color=LIME, linewidth=1.3, label=f"20MA {plot_df['MA20'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["MA60"], color=BLUE, linewidth=1.4, label=f"60MA {plot_df['MA60'].iloc[-1]:.2f}")
+    candle_ax.plot(x, plot_df["BB_UPPER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
+    candle_ax.plot(x, plot_df["BB_LOWER"], linestyle="--", color=MUTED, linewidth=0.9, alpha=0.9)
+    add_weighted_volume_profile_overlay(candle_ax, plot_df)
+    candle_ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=26, labelcolor=TEXT)
+    candle_ax.yaxis.tick_right()
+    latest = plot_df.iloc[-1]
+    prev_close = plot_df["Close"].iloc[-2] if len(plot_df) >= 2 else latest["Close"]
+    diff = latest["Close"] - prev_close
+    pct = diff / prev_close * 100 if prev_close else np.nan
+    latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
+    candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
+                   bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
+    ma_note = get_ma_kline_signals(plot_df)
+    if ma_note:
+        candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=31, fontweight="bold", ha="center", va="center",
+                       bbox=dict(facecolor="#F6F8FB", edgecolor=GOLD, boxstyle="round,pad=0.28", alpha=0.95))
+
+    # Volume
+    vol_ax = fig.add_subplot(gs[3, :], sharex=candle_ax)
+    style_ax(vol_ax, "成交量")
+    up = plot_df["Close"] >= plot_df["Open"]
+    vol_lots = plot_df["Volume"] / 1000
+    vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
+    vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
+    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=1.2, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=1.2, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+    vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
+    vol_ax.yaxis.tick_right()
+
+    # 三大法人買賣超（取代 KD）
+    inst_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
+    style_ax(inst_ax, "三大法人買賣超")
+    plot_institutional_stacked_bars(inst_ax, plot_df, x)
+    draw_inst_header_like_legend(inst_ax, plot_df)
+    inst_ax.yaxis.tick_right()
+
+    # Warrant daily net bars + cumulative line
+    wnet_ax = fig.add_subplot(gs[5, :], sharex=candle_ax)
+    style_ax(wnet_ax, "權證資金流｜柱狀 = 單日淨買賣超；折線 = 累計淨買賣超")
+    vals = daily_net["net_amount"].astype(float).values
+    cum_vals = np.cumsum(vals)
+    latest_net = vals[-1] if len(vals) else 0.0
+    latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
+    bar_label = f"單日淨買賣超｜最新日 {fmt_money(latest_net)}"
+    line_label = f"累計淨買賣超｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}"
+    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label=bar_label)
+    wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
+    wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
+    wnet_ax.yaxis.tick_right()
+    wnet_ax2 = wnet_ax.twinx()
+    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=1.8, alpha=0.95, label=line_label)
+    if len(cum_vals):
+        cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
+        lim = max(abs(cmax), abs(cmin), 1.0)
+        # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
+        wnet_ax2.set_ylim(-lim * 3.2, lim * 3.2)
+    wnet_ax2.tick_params(colors=MUTED, labelsize=22)
+    wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
+    for spine in wnet_ax2.spines.values():
+        spine.set_visible(False)
+    wnet_ax2.grid(False)
+    h1, l1 = wnet_ax.get_legend_handles_labels()
+    h2, l2 = wnet_ax2.get_legend_handles_labels()
+    wnet_ax.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=30, labelcolor=TEXT)
+
+    # TOP5 tables
+    ax_top = fig.add_subplot(gs[6, :])
+    ax_top.set_axis_off()
+    ax_top.set_facecolor(BG)
+    sections = [
+        (0.02, "本週淨買超分點 TOP5", buy_top, RED),
+        (0.52, "本週淨賣超分點 TOP5", sell_top, GREEN),
+    ]
+    for x0, title, df_top, side_color in sections:
+        ax_top.add_patch(FancyBboxPatch((x0, 0.02), 0.46, 0.965, transform=ax_top.transAxes,
+                                        boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35))
+        ax_top.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
+        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.82, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
+        if df_top.empty:
+            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
+        else:
+            y = 0.73
+            row_gap = 0.15
+            for rank, (_, r) in enumerate(df_top.iterrows(), 1):
+                branch = str(r["branch"]) or "未知分點"
+                amt = float(r["net_amount"])
+                wcode = str(r.get("max_warrant_code", ""))
+                wname = str(r.get("max_warrant_name", ""))
+                wamt = float(r.get("max_warrant_amount", 0.0))
+                # rank circle
+                circ_x = x0 + 0.03
+                circ_y = y - 0.005
+                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold",
+                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
+                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
+                ax_top.text(x0 + 0.06, y - 0.060, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
+                y -= row_gap
+
+    # Notes row
+    ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
+    for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
+        ax_notes.add_patch(FancyBboxPatch((x0, 0.035), 0.46, 0.93, transform=ax_notes.transAxes,
+                                          boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
+        ax_notes.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_notes.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
+        ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=42, fontweight="bold", ha="left", va="top")
+    y = 0.79
+    for p in key_points[:4]:
+        ax_notes.text(0.04, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        y -= 0.165
+    y = 0.79
+    for p in news_points[:5]:
+        ax_notes.text(0.54, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        y -= 0.165
+
+    # x ticks
+    interval = max(1, len(x) // 12)
+    for ax in [candle_ax, vol_ax, inst_ax, wnet_ax]:
+        ax.set_xlim(-1, len(x))
+    wnet_ax.set_xticks(x[::interval])
+    wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=26)
+    for ax in [candle_ax, vol_ax, inst_ax]:
+        plt.setp(ax.get_xticklabels(), visible=False)
+
+    fig.subplots_adjust(left=0.035, right=0.965, top=0.975, bottom=0.03)
+    return fig
+
+
+# ============================================================
+# 對外入口
+# ============================================================
+
+def generate_warrant_report(stock_code: str) -> io.BytesIO:
+    try:
+        stock_code = str(stock_code).strip()
+        stock_name = get_tw_stock_name(stock_code)
+        stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
+        if stock_df is None or stock_df.empty:
+            print(f"❌ 股價資料不足：{stock_code}")
+            return None
+        stock_df = calculate_indicators(stock_df)
+        stock_df["Close_prev"] = stock_df["Close"].shift(1)
+
+        # 三大法人資料：對齊股價日期，讓週報可顯示三大法人買賣超。
+        inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
+        if inst_df is not None and not inst_df.empty:
+            inst_df = inst_df.copy()
+            inst_df["Date"] = pd.to_datetime(inst_df["Date"]).dt.tz_localize(None)
+            inst_df = inst_df.set_index("Date").sort_index()
+            stock_df = stock_df.join(inst_df[["foreign", "invest", "dealer", "total"]], how="left")
+        for c in ["foreign", "invest", "dealer", "total"]:
+            if c not in stock_df.columns:
+                stock_df[c] = 0.0
+        stock_df[["foreign", "invest", "dealer", "total"]] = stock_df[["foreign", "invest", "dealer", "total"]].fillna(0.0)
+
+        plot_df = stock_df.tail(CHART_LOOKBACK)
+        start_date = pd.Timestamp(plot_df.index.min()).normalize()
+        end_date = pd.Timestamp(plot_df.index.max()).normalize()
+
+        print(f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，資料區間 {start_date.date()} ~ {end_date.date()}")
+        warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
+        print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
+        news_titles = fetch_google_news_titles(stock_code, stock_name, max_items=5)
+
+        fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_titles)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", pad_inches=0.18, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        import traceback
+        print(f"❌ 產生權證週報錯誤：{e}")
+        traceback.print_exc()
+        return None
+
+
+def generate_k_chart(stock_code: str) -> io.BytesIO:
+    """保留相容舊呼叫。"""
+    return generate_warrant_report(stock_code)
