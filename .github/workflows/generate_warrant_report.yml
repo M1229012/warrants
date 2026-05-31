@@ -25,6 +25,9 @@ jobs:
       GSHEET_NAME: "權證分點籌碼"
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
+      WARRANT_API5_DAYS: "110"
+      WARRANT_API4_SCAN_CALENDAR_DAYS: "110"
+
       # FinMind 設定：三大法人資料來源
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
 
