@@ -61,6 +61,9 @@ API5 = (
     "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
 )
 
+# MoneyDJ 個股法人持股 / 三大法人買賣超頁面
+MONEYDJ_INST_URL = "https://www.moneydj.com/Z/ZC/ZCL/ZCL.djhtm?a={code}"
+
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
@@ -442,13 +445,222 @@ def _to_lots(series: pd.Series) -> pd.Series:
     return s
 
 
+def _decode_moneydj_html(resp: requests.Response) -> str:
+    """MoneyDJ 舊頁面常見 Big5/CP950 編碼，這裡集中處理避免亂碼造成表格解析失敗。"""
+    candidates = []
+    if getattr(resp, "encoding", None):
+        candidates.append(resp.encoding)
+    if getattr(resp, "apparent_encoding", None):
+        candidates.append(resp.apparent_encoding)
+    candidates.extend(["big5", "cp950", "utf-8"])
+    raw = resp.content
+    for enc in candidates:
+        if not enc:
+            continue
+        try:
+            html = raw.decode(enc, errors="ignore")
+            if "法人" in html or "外資" in html or "投信" in html:
+                return html
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _parse_moneydj_signed_number(value) -> float:
+    """將 MoneyDJ 表格中的 +1,234 / -1,234 / 空白 / -- 轉成 float。"""
+    s = str(value or "").strip()
+    s = (
+        s.replace(",", "")
+         .replace("＋", "+")
+         .replace("－", "-")
+         .replace("−", "-")
+         .replace("\xa0", "")
+         .replace(" ", "")
+         .replace("　", "")
+    )
+    if not s or s in ("-", "--", "—"):
+        return 0.0
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except Exception:
+        return 0.0
+
+
+def _parse_moneydj_inst_rows_from_tables(html: str) -> List[dict]:
+    """
+    從 MoneyDJ 個股法人持股頁解析三大法人買賣超。
+    MoneyDJ ZCL 表格常見欄位順序：
+    日期、外資不含自營、外資自營、投信、自營商自行買賣、自營商避險、總合、...
+    本函式會把：
+      foreign = 外資不含自營 + 外資自營
+      invest  = 投信
+      dealer  = 自營商自行買賣 + 自營商避險
+    單位維持 MoneyDJ 表格的「張」。
+    """
+    rows = []
+
+    # 先用 pandas.read_html，GitHub Actions 常見環境可直接解析。
+    table_rows = []
+    try:
+        for tbl in pd.read_html(io.StringIO(html)):
+            if tbl is None or tbl.empty:
+                continue
+            for _, r in tbl.iterrows():
+                table_rows.append([str(v).strip() for v in r.tolist()])
+    except Exception:
+        table_rows = []
+
+    # 若 read_html 失敗，使用內建 HTMLParser 做備援，不額外依賴 bs4/lxml。
+    if not table_rows:
+        from html.parser import HTMLParser
+
+        class _TableParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.in_cell = False
+                self.current_cell = []
+                self.current_row = []
+                self.rows = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag.lower() in ("td", "th"):
+                    self.in_cell = True
+                    self.current_cell = []
+
+            def handle_data(self, data):
+                if self.in_cell:
+                    self.current_cell.append(data)
+
+            def handle_endtag(self, tag):
+                tag = tag.lower()
+                if tag in ("td", "th") and self.in_cell:
+                    cell = "".join(self.current_cell).strip()
+                    self.current_row.append(re.sub(r"\s+", " ", cell))
+                    self.current_cell = []
+                    self.in_cell = False
+                elif tag == "tr":
+                    if self.current_row:
+                        self.rows.append(self.current_row)
+                    self.current_row = []
+
+        parser = _TableParser()
+        try:
+            parser.feed(html)
+            table_rows = parser.rows
+        except Exception:
+            table_rows = []
+
+    for row in table_rows:
+        if not row:
+            continue
+
+        # 找日期欄位，避免把表頭或合計列誤判成資料列。
+        date_idx = -1
+        date_text = ""
+        for idx, cell in enumerate(row):
+            m = re.search(r"\d{4}/\d{1,2}/\d{1,2}", str(cell))
+            if m:
+                date_idx = idx
+                date_text = m.group(0)
+                break
+        if date_idx < 0:
+            continue
+
+        dt = parse_date(date_text)
+        if not dt:
+            continue
+
+        # 日期同一格後面若被黏到數字，也一起補進 numeric source。
+        date_cell = str(row[date_idx])
+        tail_after_date = re.sub(r"^.*?\d{4}/\d{1,2}/\d{1,2}", "", date_cell).strip()
+        numeric_sources = []
+        if tail_after_date:
+            numeric_sources.append(tail_after_date)
+        numeric_sources.extend(row[date_idx + 1:])
+
+        nums = []
+        for cell in numeric_sources:
+            s = str(cell or "").strip()
+            if not s:
+                continue
+            # 一格內有時會黏多個數字，全部拆出來。
+            for m in re.finditer(r"[-+＋－−]?\d[\d,]*(?:\.\d+)?", s.replace(" ", "")):
+                nums.append(_parse_moneydj_signed_number(m.group(0)))
+
+        if len(nums) >= 6:
+            foreign = nums[0] + nums[1]
+            invest = nums[2]
+            dealer = nums[3] + nums[4]
+            total = nums[5]
+        elif len(nums) >= 4:
+            foreign = nums[0]
+            invest = nums[1]
+            dealer = nums[2]
+            total = nums[3]
+        else:
+            continue
+
+        rows.append({
+            "Date": pd.Timestamp(dt).normalize(),
+            "foreign": float(foreign),
+            "invest": float(invest),
+            "dealer": float(dealer),
+            "total": float(total),
+        })
+
+    if not rows:
+        return []
+
+    # 同一天如果表格重複出現，只保留第一次解析到的資料。
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["Date"], keep="first")
+    out = out.sort_values("Date")
+    return out.to_dict("records")
+
+
+def fetch_inst_60d_from_moneydj(stock_code: str, days: int = 80) -> pd.DataFrame:
+    """
+    從 MoneyDJ 個股法人持股頁抓三大法人買賣超。
+    回傳欄位: Date, foreign, invest, dealer, total，單位：張。
+    """
+    stock_code = str(stock_code).strip()
+    url = MONEYDJ_INST_URL.format(code=urllib.parse.quote(stock_code))
+    try:
+        r = get_thread_session().get(url, headers=HDR, timeout=(8, 25))
+        r.raise_for_status()
+        html = _decode_moneydj_html(r)
+        rows = _parse_moneydj_inst_rows_from_tables(html)
+        if not rows:
+            print(f"⚠️ MoneyDJ 三大法人資料解析不到資料：{stock_code}")
+            return pd.DataFrame()
+        out = pd.DataFrame(rows)
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+        out = out.dropna(subset=["Date"])
+        for c in ["foreign", "invest", "dealer", "total"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
+        out = out.sort_values("Date").tail(days).reset_index(drop=True)
+        print(f"✅ MoneyDJ 三大法人資料：{stock_code}，{len(out):,} 筆")
+        return out[["Date", "foreign", "invest", "dealer", "total"]]
+    except Exception as e:
+        print(f"⚠️ MoneyDJ 三大法人資料抓取失敗：{stock_code}，{e}")
+        return pd.DataFrame()
+
+
 def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     """
-    從 X_function.get_institutional_stats_finmind 取回法人資料。
+    優先從 MoneyDJ 取回三大法人買賣超資料。
+    若 MoneyDJ 暫時解析失敗，才回退使用 X_function.get_institutional_stats_finmind。
     回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
     """
+    moneydj_df = fetch_inst_60d_from_moneydj(stock_code, days=days)
+    if moneydj_df is not None and not moneydj_df.empty:
+        return moneydj_df
+
     if get_institutional_stats_finmind is None:
-        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，略過三大法人資料")
+        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，且 MoneyDJ 也未取得資料，略過三大法人資料")
         return pd.DataFrame()
     try:
         inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
@@ -469,6 +681,7 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     out["dealer"] = _to_lots(out["自營商"])
     out["total"] = out["foreign"] + out["invest"] + out["dealer"]
     out = out.sort_values("Date").tail(days).reset_index(drop=True)
+    print(f"✅ X_function 三大法人備援資料：{stock_code}，{len(out):,} 筆")
     return out[["Date", "foreign", "invest", "dealer", "total"]]
 
 
@@ -1346,75 +1559,16 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
 
 
 def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
-    # 單張摘要卡片：保留獨立卡片感，並讓上方藏青色 band 與圓角外框貼齊。
-    rounding = 0.026
-    band_h = 0.078
-
-    box = FancyBboxPatch(
-        (x, y), w, h,
-        transform=ax.transAxes,
-        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
-        facecolor=PANEL2,
-        edgecolor=GOLD,
-        linewidth=1.25,
-        zorder=1,
-    )
+    box = FancyBboxPatch((x, y), w, h, transform=ax.transAxes,
+                         boxstyle="round,pad=0.016,rounding_size=0.025",
+                         facecolor=PANEL2, edgecolor=GOLD, linewidth=1.5)
     ax.add_patch(box)
-
-    # 上方藏青色 band：使用 Rectangle 並裁切到外框圓角，避免左右縮短或圓角不貼合。
-    band = Rectangle(
-        (x, y + h - band_h),
-        w,
-        band_h,
-        transform=ax.transAxes,
-        facecolor=GOLD,
-        edgecolor=GOLD,
-        linewidth=0,
-        alpha=0.96,
-        zorder=2,
-    )
-    band.set_clip_path(box)
-    ax.add_patch(band)
-
-    # 標題
-    ax.text(
-        x + w / 2,
-        y + h - 0.15,
-        label,
-        transform=ax.transAxes,
-        color=MUTED,
-        fontsize=29,
-        ha="center",
-        va="top",
-        zorder=4,
-    )
-
-    # 數字：固定同一水平線，避免每格看起來不整齊。
-    ax.text(
-        x + w / 2,
-        y + 0.30,
-        value,
-        transform=ax.transAxes,
-        color=value_color,
-        fontsize=42,
-        fontweight="bold",
-        ha="center",
-        va="center",
-        zorder=4,
-    )
-
+    ax.add_patch(Rectangle((x, y + h - 0.066), w, 0.066, transform=ax.transAxes,
+                           facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
+    ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=29, ha="center", va="top")
+    ax.text(x + w / 2, y + 0.30, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
     if sub:
-        ax.text(
-            x + w / 2,
-            y + 0.10,
-            sub,
-            transform=ax.transAxes,
-            color=MUTED,
-            fontsize=22,
-            ha="center",
-            va="bottom",
-            zorder=4,
-        )
+        ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
 
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
@@ -1447,7 +1601,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.45, 2.05, 8.2, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  height_ratios=[1.45, 2.05, 6.9, 2.6, 3.3, 5.2, 10.6, 8.3],
                   hspace=0.24, wspace=0.25)
 
     # Header
@@ -1459,21 +1613,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
-    ax_cards = fig.add_subplot(gs[1, :])
+    ax_cards = fig.add_subplot(gs[1, :]) 
     ax_cards.set_axis_off()
 
+    card_w, gap = 0.15, 0.015
+    start_x = (1 - (5 * card_w + 4 * gap)) / 2
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
         ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
-        ("權證週淨流向", fmt_money(ctx["total_net"]), "", RED if ctx["total_net"] >= 0 else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]),"", RED if ctx["total_net"] >= 0 else GREEN),
         ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
-
-    card_w, gap = 0.183, 0.01
-    start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
     for i, (lab, val, sub, col) in enumerate(cards):
-        draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
+        draw_card(ax_cards, 0.01 + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
 
     # K line
     candle_ax = fig.add_subplot(gs[2, :])
@@ -1493,7 +1646,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     diff = latest["Close"] - prev_close
     pct = diff / prev_close * 100 if prev_close else np.nan
     latest_info = f"{plot_df.index[-1].strftime('%Y/%m/%d')}  開 {latest['Open']:.2f}  高 {latest['High']:.2f}  低 {latest['Low']:.2f}  收 {latest['Close']:.2f}  {diff:+.2f} ({pct:+.2f}%)"
-    candle_ax.text(0.012, 0.88, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
+    candle_ax.text(0.012, 0.92, latest_info, transform=candle_ax.transAxes, color=TEXT, fontsize=27, ha="left", va="top",
                    bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
