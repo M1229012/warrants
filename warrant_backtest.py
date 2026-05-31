@@ -160,6 +160,23 @@ HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.cs
 DAILY_RAW_CACHE_PATH  = os.path.join(CACHE_DIR, "daily_broker_warrant_raw_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
+# OpenAPI 每日成交資料防呆快取：
+# 平常交易日抓到 TWSE + TPEx 正常資料時，會把標準化後的官方 OpenAPI 每日成交資料存起來。
+# 假日或官方 API 暫時回傳空資料時，會自動改用最近一次非空快取，避免產出「少掉上市 / 上櫃權證」的錯圖。
+OPENAPI_DAILY_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_cache.csv")
+OPENAPI_DAILY_TWSE_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_twse_cache.csv")
+OPENAPI_DAILY_TPEX_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_tpex_cache.csv")
+OPENAPI_FALLBACK_ENABLE = os.getenv("OPENAPI_FALLBACK_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+OPENAPI_FAIL_ON_FALLBACK = os.getenv("OPENAPI_FAIL_ON_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
+OPENAPI_DATA_SOURCE_INFO = {
+    "source_mode": "live",
+    "used_fallback": False,
+    "warning": "",
+    "latest_trade_date": "",
+    "twse_rows": 0,
+    "tpex_rows": 0,
+}
+
 # 歷史分點資料保護：
 # 1. 第一次或 GitHub Actions 執行時，會優先讀取 Google Sheet「快取_分點歷史」作為歷史基底。
 # 2. 每日新抓 API5 資料時，只 append / 合併新日期，不整組覆蓋舊資料。
@@ -1218,6 +1235,9 @@ CACHE_SHEET_NAME_MAP = {
     "candidates_cache_openapi_active_selected5.csv": "快取_候選組合_OpenAPI精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "daily_broker_warrant_raw_cache.csv": "快取_每日分點權證原始買賣超",
+    "openapi_warrant_daily_cache.csv": "快取_OpenAPI每日成交",
+    "openapi_warrant_daily_twse_cache.csv": "快取_OpenAPI每日成交_TWSE",
+    "openapi_warrant_daily_tpex_cache.csv": "快取_OpenAPI每日成交_TPEx",
     "price_cache.csv": "快取_價格",
 }
 
@@ -3882,6 +3902,167 @@ def fetch_tpex_openapi_warrant_daily_df():
     return last_df
 
 
+OPENAPI_DAILY_CACHE_COLS = ["出表日期", "交易日期", "市場", "代號", "名稱", "成交金額", "成交量"]
+
+
+def normalize_openapi_daily_cache_df(df):
+    """把 live / cache / 本地檔案的 OpenAPI 每日成交資料統一成標準欄位。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+    df = df.copy().fillna("")
+
+    # 已經是標準格式。
+    if all(col in df.columns for col in ["交易日期", "市場", "代號", "名稱", "成交量"]):
+        out = pd.DataFrame()
+        out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date) if "出表日期" in df.columns else df["交易日期"].map(normalize_openapi_trade_date)
+        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+        out["市場"] = df["市場"].astype(str).str.strip()
+        out["代號"] = df["代號"].map(normalize_openapi_warrant_code)
+        out["名稱"] = df["名稱"].astype(str).str.strip()
+        out["成交金額"] = df["成交金額"].map(clean_openapi_number) if "成交金額" in df.columns else 0
+        out["成交量"] = df["成交量"].map(clean_openapi_number)
+        return out[OPENAPI_DAILY_CACHE_COLS].copy()
+
+    # TWSE 原始格式。
+    if all(col in df.columns for col in ["出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"]):
+        out = pd.DataFrame()
+        out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
+        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+        out["市場"] = "上市"
+        out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+        out["名稱"] = df["權證名稱"].astype(str).str.strip()
+        out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+        out["成交量"] = df["成交張數"].map(clean_openapi_number)
+        return out[OPENAPI_DAILY_CACHE_COLS].copy()
+
+    # TPEx 原始格式。
+    if all(col in df.columns for col in ["交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"]):
+        out = pd.DataFrame()
+        date_source_col = "Date" if "Date" in df.columns else "交易日期"
+        out["出表日期"] = df[date_source_col].map(normalize_openapi_trade_date)
+        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+        out["市場"] = "上櫃"
+        out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+        out["名稱"] = df["權證名稱"].astype(str).str.strip()
+        out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+        out["成交量"] = df["成交數量"].map(clean_openapi_number)
+        return out[OPENAPI_DAILY_CACHE_COLS].copy()
+
+    return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+
+def save_openapi_daily_cache_df(df, path, label):
+    """只在資料非空時更新 OpenAPI 防呆快取，避免假日空資料覆蓋最後有效檔。"""
+    df = normalize_openapi_daily_cache_df(df)
+    if df.empty:
+        return
+
+    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
+    write_cache_csv(df[OPENAPI_DAILY_CACHE_COLS], path)
+    print(f"  💾 已更新 {label} 防呆快取：{path}，共 {len(df):,} 筆")
+
+
+def load_openapi_daily_cache_df(path, label="OpenAPI 防呆快取"):
+    df = read_cache_csv(path)
+    df = normalize_openapi_daily_cache_df(df)
+    if df.empty:
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
+    trade_dates = sorted([d for d in df["交易日期"].dropna().unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
+    latest_date = trade_dates[-1] if trade_dates else ""
+    print(f"  ♻️ 已讀取 {label}：{len(df):,} 筆，最新交易日 {latest_date or '-'}")
+    return df[OPENAPI_DAILY_CACHE_COLS].copy()
+
+
+def load_openapi_daily_file_df(path, label="OpenAPI 本地備援檔"):
+    """支援讀取先前下載的 JSON / CSV / XLSX OpenAPI 檔案，作為假日測試備援。"""
+    path = str(path or "").strip()
+    if not path:
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            df = pd.DataFrame(data).fillna("")
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, dtype=str).fillna("")
+        else:
+            df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+
+        out = normalize_openapi_daily_cache_df(df)
+        if not out.empty:
+            print(f"  ♻️ 已讀取 {label}：{path}，共 {len(out):,} 筆")
+        return out
+    except Exception as e:
+        print(f"  ⚠️ {label} 讀取失敗：{path}，原因：{type(e).__name__}: {e}")
+        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+
+def load_openapi_fallback_from_files():
+    """依環境變數指定的本地檔案讀取備援資料。"""
+    frames = []
+
+    combined_path = os.getenv("OPENAPI_FALLBACK_FILE", "").strip()
+    if combined_path:
+        combined_df = load_openapi_daily_file_df(combined_path, "OPENAPI_FALLBACK_FILE")
+        if not combined_df.empty:
+            return combined_df
+
+    twse_path = os.getenv("OPENAPI_TWSE_FALLBACK_FILE", "").strip()
+    tpex_path = os.getenv("OPENAPI_TPEX_FALLBACK_FILE", "").strip()
+
+    if twse_path:
+        twse_df = load_openapi_daily_file_df(twse_path, "OPENAPI_TWSE_FALLBACK_FILE")
+        if not twse_df.empty:
+            frames.append(twse_df)
+
+    if tpex_path:
+        tpex_df = load_openapi_daily_file_df(tpex_path, "OPENAPI_TPEX_FALLBACK_FILE")
+        if not tpex_df.empty:
+            frames.append(tpex_df)
+
+    if frames:
+        return pd.concat(frames, ignore_index=True).fillna("")
+
+    return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
+
+
+def get_openapi_latest_trade_date(df):
+    if df is None or df.empty or "交易日期" not in df.columns:
+        return ""
+    trade_dates = sorted([d for d in df["交易日期"].dropna().unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
+    return trade_dates[-1] if trade_dates else ""
+
+
+def set_openapi_data_source_info(source_mode, used_fallback, warning, latest_trade_date, twse_rows, tpex_rows):
+    OPENAPI_DATA_SOURCE_INFO["source_mode"] = source_mode
+    OPENAPI_DATA_SOURCE_INFO["used_fallback"] = bool(used_fallback)
+    OPENAPI_DATA_SOURCE_INFO["warning"] = str(warning or "")
+    OPENAPI_DATA_SOURCE_INFO["latest_trade_date"] = str(latest_trade_date or "")
+    OPENAPI_DATA_SOURCE_INFO["twse_rows"] = int(twse_rows or 0)
+    OPENAPI_DATA_SOURCE_INFO["tpex_rows"] = int(tpex_rows or 0)
+
+    try:
+        note_path = os.path.join(OUTPUT_DIR, "openapi_data_source_warning.txt")
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write(f"source_mode={OPENAPI_DATA_SOURCE_INFO['source_mode']}\n")
+            f.write(f"used_fallback={OPENAPI_DATA_SOURCE_INFO['used_fallback']}\n")
+            f.write(f"latest_trade_date={OPENAPI_DATA_SOURCE_INFO['latest_trade_date']}\n")
+            f.write(f"twse_rows={OPENAPI_DATA_SOURCE_INFO['twse_rows']}\n")
+            f.write(f"tpex_rows={OPENAPI_DATA_SOURCE_INFO['tpex_rows']}\n")
+            f.write(f"warning={OPENAPI_DATA_SOURCE_INFO['warning']}\n")
+    except Exception:
+        pass
+
+
+
 def normalize_stock_name_text(s):
     return str(s).strip().replace(" ", "").replace("　", "")
 
@@ -4115,46 +4296,99 @@ def enrich_openapi_warrants_with_underlying(active_df):
 
 def get_all_call_warrants():
     """
-    改用官方 OpenAPI 作為唯一權證母體：
+    改用官方 OpenAPI 作為唯一權證母體，並加入假日 / API 空資料防呆。
 
-    TWSE OpenAPI：
-      https://openapi.twse.com.tw/v1/opendata/t187ap42_L
+    正常交易日：
+      1. 抓 TWSE + TPEx OpenAPI。
+      2. 兩邊都有資料時，更新 OpenAPI 防呆快取。
+      3. 用 live 資料產生最新交易日有成交認購權證清單。
 
-    TPEx OpenAPI：
-      https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O
-
-    流程：
-    1. 只抓上市 / 上櫃權證每日成交檔。
-    2. 自動取資料中的最新交易日。
-    3. 只保留成交量 > 0 的認購權證。
-    4. 後續 A/B/C/D 只針對這份名單建立候選組合與 API5 更新。
-    5. 不再使用 ISIN 今日有成交權證清單，也不再使用 KGI。
+    假日或官方 API 暫時回傳空資料：
+      1. 不硬跑空資料。
+      2. 自動改用最近一次非空 OpenAPI 防呆快取 / 指定本地備援檔。
+      3. 在 log、output/openapi_data_source_warning.txt、Google Sheet「資料來源警示」標明：本次使用舊資料。
     """
     print("【Step 1】使用官方 OpenAPI 取得最新交易日有成交量的認購權證清單...")
 
-    frames = []
-
     twse_df = fetch_twse_openapi_warrant_daily_df()
-    if not twse_df.empty:
-        frames.append(twse_df)
-
     tpex_df = fetch_tpex_openapi_warrant_daily_df()
-    allow_tpex_empty = os.getenv("ALLOW_TPEX_EMPTY", "0").strip().lower() in ("1", "true", "yes")
 
-    if tpex_df.empty:
-        if not allow_tpex_empty:
-            print("  ❌ 上櫃 TPEx OpenAPI 回傳 0 筆，停止執行，避免 7xxxxx 上櫃權證整批漏掉造成錯誤圖表。")
-            print("     若你確認今天 TPEx 本來就沒有資料，可設定 ALLOW_TPEX_EMPTY=1 強制繼續。")
-            return []
-        print("  ⚠️ ALLOW_TPEX_EMPTY=1，TPEx 為空仍強制繼續。")
+    live_twse_ok = twse_df is not None and not twse_df.empty
+    live_tpex_ok = tpex_df is not None and not tpex_df.empty
+    use_fallback = False
+    source_warning = ""
+
+    if live_twse_ok:
+        save_openapi_daily_cache_df(twse_df, OPENAPI_DAILY_TWSE_CACHE_PATH, "TWSE OpenAPI")
+    if live_tpex_ok:
+        save_openapi_daily_cache_df(tpex_df, OPENAPI_DAILY_TPEX_CACHE_PATH, "TPEx OpenAPI")
+
+    if live_twse_ok and live_tpex_ok:
+        all_df = pd.concat([twse_df, tpex_df], ignore_index=True).fillna("")
+        all_df = normalize_openapi_daily_cache_df(all_df)
+        save_openapi_daily_cache_df(all_df, OPENAPI_DAILY_CACHE_PATH, "TWSE+TPEx OpenAPI 合併")
+        source_mode = "live"
     else:
-        frames.append(tpex_df)
+        missing_parts = []
+        if not live_twse_ok:
+            missing_parts.append("TWSE 上市")
+        if not live_tpex_ok:
+            missing_parts.append("TPEx 上櫃")
 
-    if not frames:
-        print("  ⚠️ 官方 OpenAPI 未取得任何權證成交資料。")
+        if not OPENAPI_FALLBACK_ENABLE:
+            print(f"  ❌ 官方 OpenAPI 缺少資料：{', '.join(missing_parts)}，且 OPENAPI_FALLBACK_ENABLE=0，停止執行。")
+            set_openapi_data_source_info("live_failed", False, "官方 OpenAPI 缺少資料且未啟用備援", "", 0, 0)
+            return []
+
+        print(f"  ⚠️ 官方 OpenAPI 缺少資料：{', '.join(missing_parts)}。")
+        print("  🔁 啟動防呆：改用最近一次非空 OpenAPI 快取 / 本地備援檔，避免產出缺資料圖表。")
+
+        fallback_df = load_openapi_daily_cache_df(OPENAPI_DAILY_CACHE_PATH, "最近一次 TWSE+TPEx OpenAPI 合併快取")
+
+        if fallback_df.empty:
+            fallback_df = load_openapi_fallback_from_files()
+
+        if fallback_df.empty:
+            # 最後嘗試用分市場快取合併。
+            frames = []
+            twse_cache_df = load_openapi_daily_cache_df(OPENAPI_DAILY_TWSE_CACHE_PATH, "TWSE OpenAPI 分市場快取")
+            tpex_cache_df = load_openapi_daily_cache_df(OPENAPI_DAILY_TPEX_CACHE_PATH, "TPEx OpenAPI 分市場快取")
+            if not twse_cache_df.empty:
+                frames.append(twse_cache_df)
+            if not tpex_cache_df.empty:
+                frames.append(tpex_cache_df)
+            if frames:
+                fallback_df = pd.concat(frames, ignore_index=True).fillna("")
+                fallback_df = normalize_openapi_daily_cache_df(fallback_df)
+
+        if fallback_df.empty:
+            print("  ❌ 找不到可用的 OpenAPI 防呆快取 / 本地備援檔，停止執行。")
+            print("     建議在交易日成功跑一次，或設定 OPENAPI_FALLBACK_FILE / OPENAPI_TWSE_FALLBACK_FILE / OPENAPI_TPEX_FALLBACK_FILE。")
+            set_openapi_data_source_info("fallback_missing", False, "找不到可用的 OpenAPI 防呆快取 / 本地備援檔", "", 0, 0)
+            return []
+
+        all_df = fallback_df.copy().fillna("")
+        use_fallback = True
+        source_mode = "fallback_cache"
+        fallback_trade_date = get_openapi_latest_trade_date(all_df)
+        source_warning = (
+            f"⚠️ 本次官方 OpenAPI 回傳空資料或資料不完整，已改用最近一次非空 OpenAPI 防呆快取。"
+            f"圖片 / 今日表使用的資料日期：{fallback_trade_date or '-'}；"
+            f"缺少來源：{', '.join(missing_parts)}。"
+        )
+        print(f"  {source_warning}")
+
+        if OPENAPI_FAIL_ON_FALLBACK:
+            print("  ❌ OPENAPI_FAIL_ON_FALLBACK=1：偵測到使用舊 OpenAPI 快取，停止執行。")
+            set_openapi_data_source_info(source_mode, True, source_warning + "；因 OPENAPI_FAIL_ON_FALLBACK=1 已停止", fallback_trade_date, 0, 0)
+            return []
+
+    if all_df is None or all_df.empty:
+        print("  ⚠️ 官方 OpenAPI / 防呆快取皆未取得任何權證成交資料。")
+        set_openapi_data_source_info("empty", use_fallback, "官方 OpenAPI / 防呆快取皆無資料", "", 0, 0)
         return []
 
-    all_df = pd.concat(frames, ignore_index=True).fillna("")
+    all_df = normalize_openapi_daily_cache_df(all_df)
     all_df = all_df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last")
 
     trade_dates = sorted(
@@ -4163,7 +4397,8 @@ def get_all_call_warrants():
     )
 
     if not trade_dates:
-        print("  ⚠️ 官方 OpenAPI 資料沒有有效交易日期。")
+        print("  ⚠️ 官方 OpenAPI / 防呆快取資料沒有有效交易日期。")
+        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "OpenAPI 資料沒有有效交易日期", "", 0, 0)
         return []
 
     latest_trade_date = trade_dates[-1]
@@ -4181,20 +4416,45 @@ def get_all_call_warrants():
         ascending=[False, False],
     ).reset_index(drop=True)
 
-    print(f"  ✅ 官方 OpenAPI 最新交易日：{latest_trade_date}")
+    twse_active_count = len(active_df[active_df["市場"] == "上市"]) if not active_df.empty else 0
+    tpex_active_count = len(active_df[active_df["市場"] == "上櫃"]) if not active_df.empty else 0
+
+    print(f"  ✅ OpenAPI 使用來源：{'防呆快取/備援檔' if use_fallback else '官方即時 live'}")
+    print(f"  ✅ OpenAPI 最新交易日：{latest_trade_date}")
     print(f"  ✅ 最新交易日成交量 > 0 認購權證：{len(active_df):,} 支")
-    if not active_df.empty:
-        print(f"     上市：{len(active_df[active_df['市場'] == '上市']):,} 支")
-        print(f"     上櫃：{len(active_df[active_df['市場'] == '上櫃']):,} 支")
+    print(f"     上市：{twse_active_count:,} 支")
+    print(f"     上櫃：{tpex_active_count:,} 支")
+
+    if use_fallback:
+        print("  ⚠️ 注意：本次使用的是防呆快取 / 備援檔，不是今日 live OpenAPI。請確認圖片日期後再推播。")
+
+    # 防呆：若最新交易日 active_df 某市場為 0，通常代表資料不完整，除非使用者明確允許。
+    allow_tpex_empty = os.getenv("ALLOW_TPEX_EMPTY", "0").strip().lower() in ("1", "true", "yes")
+    allow_twse_empty = os.getenv("ALLOW_TWSE_EMPTY", "0").strip().lower() in ("1", "true", "yes")
+
+    if twse_active_count == 0 and not allow_twse_empty:
+        print("  ❌ 最新交易日上市認購權證為 0，停止執行，避免圖表缺上市權證。")
+        print("     若你確認這是預期狀況，可設定 ALLOW_TWSE_EMPTY=1 強制繼續。")
+        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "上市認購權證為 0，已停止", latest_trade_date, twse_active_count, tpex_active_count)
+        return []
+
+    if tpex_active_count == 0 and not allow_tpex_empty:
+        print("  ❌ 最新交易日上櫃認購權證為 0，停止執行，避免 7xxxxx 上櫃權證整批漏掉造成錯誤圖表。")
+        print("     若你確認這是預期狀況，可設定 ALLOW_TPEX_EMPTY=1 強制繼續。")
+        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "上櫃認購權證為 0，已停止", latest_trade_date, twse_active_count, tpex_active_count)
+        return []
+
+    set_openapi_data_source_info(source_mode, use_fallback, source_warning, latest_trade_date, twse_active_count, tpex_active_count)
 
     warrants = enrich_openapi_warrants_with_underlying(active_df)
 
     if warrants:
+        # 注意：save_warrants_cache 是今日有成交權證清單快取，不可作為 OpenAPI 防呆原始檔；
+        # OpenAPI 防呆原始檔已由 OPENAPI_DAILY_CACHE_PATH 負責保存。
         save_warrants_cache(warrants)
         print(f"  ✅ Step 1 完成：後續只處理 OpenAPI 有成交認購權證 {len(warrants):,} 支")
 
     return warrants
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 2：找目標分點券商代號
@@ -7745,6 +8005,48 @@ def write_color_legend_sheet(wb):
 
 
 
+def write_openapi_data_source_sheet(wb):
+    """輸出 OpenAPI 資料來源狀態，避免使用防呆舊資料時使用者不知道。"""
+    ws = wb.create_sheet("資料來源警示")
+
+    headers = ["項目", "內容"]
+    ws.append(headers)
+
+    source_mode = OPENAPI_DATA_SOURCE_INFO.get("source_mode", "")
+    used_fallback = bool(OPENAPI_DATA_SOURCE_INFO.get("used_fallback", False))
+    latest_trade_date = OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", "")
+    warning = OPENAPI_DATA_SOURCE_INFO.get("warning", "")
+
+    rows = [
+        ("資料來源模式", "防呆快取 / 本地備援檔" if used_fallback else "官方即時 live OpenAPI"),
+        ("是否使用舊資料防呆", "是" if used_fallback else "否"),
+        ("本次權證成交資料交易日", latest_trade_date or "-"),
+        ("上市有成交認購權證數", str(OPENAPI_DATA_SOURCE_INFO.get("twse_rows", 0))),
+        ("上櫃有成交認購權證數", str(OPENAPI_DATA_SOURCE_INFO.get("tpex_rows", 0))),
+        ("警示說明", warning or "本次使用官方即時 OpenAPI，未啟用舊資料防呆。"),
+        ("提醒", "若這張表顯示『使用舊資料防呆=是』，代表圖片日期不是今天即時 OpenAPI，而是最近一次有效交易日資料。"),
+    ]
+
+    for row in rows:
+        ws.append(list(row))
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = YELLOW
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    warn_fill = PatternFill("solid", fgColor="FCE5CD") if used_fallback else PatternFill("solid", fgColor="D9EAD3")
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = Font(color="000000", bold=(used_fallback and row[0].row in (3, 7, 8)))
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            cell.fill = warn_fill if used_fallback else WHITE
+
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 120
+    ws.freeze_panes = "A2"
+
+
 
 def build_event_warrant_source_map(a_events, b_events, c_events, d_events):
     """
@@ -8564,6 +8866,7 @@ def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, tod
 
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
+    write_openapi_data_source_sheet(wb)
 
     apply_global_amount_comma_format(wb)
 
@@ -8617,6 +8920,7 @@ def build_excel(
     write_broker_query_sheet(wb, items)
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
+    write_openapi_data_source_sheet(wb)
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
 
     # 今日圖片 / 推播專用表：只用本次候選資料產生，不覆蓋主結果表。
