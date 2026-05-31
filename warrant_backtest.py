@@ -206,7 +206,6 @@ PRESCAN_REFRESH_KEYS = set()
 # 記錄「更新後快取_分點歷史」中，追蹤分點在目標日前已經符合 A 類的權證代號。
 # 今日 B/C/D 必須排除這些歷史 A 權證，避免同一檔權證先前已經被 A 判斷後，
 # 又因今日同標的累積條件被放進 B/C/D。
-DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = set()
 
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
@@ -3693,6 +3692,10 @@ def items_from_history_cache(history_df, candidate_filter=None):
 
 TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
 TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
+TPEX_WARRANT_DAILY_OPENAPI_URLS = [
+    "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O",
+    "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_warrant_trading_overview",
+]
 
 OPENAPI_WARRANT_HEADERS = {
     "User-Agent": HDR.get("User-Agent", "Mozilla/5.0"),
@@ -3830,29 +3833,53 @@ def fetch_twse_openapi_warrant_daily_df():
 
 
 def fetch_tpex_openapi_warrant_daily_df():
-    data = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
-    df = pd.DataFrame(data).fillna("")
+    """
+    取得 TPEx 上櫃權證每日成交資料。
 
-    if df.empty:
-        return pd.DataFrame()
+    TPEx OpenAPI 偶爾會短暫回傳空 list。若直接繼續跑，7xxxxx 上櫃權證會整批漏掉，
+    今日買超圖與 B/C/D 都會錯。因此這裡會重試；若仍為 0，主流程會停止，不產圖。
+    """
+    last_df = pd.DataFrame()
 
-    required_cols = ["Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"]
-    missing = [col for col in required_cols if col not in df.columns]
+    urls = []
+    for url in TPEX_WARRANT_DAILY_OPENAPI_URLS:
+        if url and url not in urls:
+            urls.append(url)
 
-    if missing:
-        print(f"  ⚠️ 上櫃 TPEx 欄位不完整，缺少：{missing}，實際欄位：{df.columns.tolist()}")
-        return pd.DataFrame()
+    for attempt in range(1, 4):
+        for url in urls:
+            data = fetch_openapi_json(url, f"上櫃 TPEx 第{attempt}次")
+            df = pd.DataFrame(data).fillna("")
 
-    out = pd.DataFrame()
-    out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
-    out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-    out["市場"] = "上櫃"
-    out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-    out["名稱"] = df["權證名稱"].astype(str).str.strip()
-    out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    out["成交量"] = df["成交數量"].map(clean_openapi_number)
+            if df.empty:
+                continue
 
-    return out
+            required_cols = ["Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"]
+            missing = [col for col in required_cols if col not in df.columns]
+
+            if missing:
+                print(f"  ⚠️ 上櫃 TPEx 欄位不完整，缺少：{missing}，實際欄位：{df.columns.tolist()}")
+                continue
+
+            out = pd.DataFrame()
+            out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
+            out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
+            out["市場"] = "上櫃"
+            out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+            out["名稱"] = df["權證名稱"].astype(str).str.strip()
+            out["成交金額"] = df["成交金額"].map(clean_openapi_number)
+            out["成交量"] = df["成交數量"].map(clean_openapi_number)
+
+            if not out.empty:
+                return out
+
+            last_df = out
+
+        if attempt < 3:
+            print("  ⚠️ TPEx OpenAPI 暫時沒有資料，等待 5 秒後重試...")
+            time.sleep(5)
+
+    return last_df
 
 
 def normalize_stock_name_text(s):
@@ -4112,7 +4139,15 @@ def get_all_call_warrants():
         frames.append(twse_df)
 
     tpex_df = fetch_tpex_openapi_warrant_daily_df()
-    if not tpex_df.empty:
+    allow_tpex_empty = os.getenv("ALLOW_TPEX_EMPTY", "0").strip().lower() in ("1", "true", "yes")
+
+    if tpex_df.empty:
+        if not allow_tpex_empty:
+            print("  ❌ 上櫃 TPEx OpenAPI 回傳 0 筆，停止執行，避免 7xxxxx 上櫃權證整批漏掉造成錯誤圖表。")
+            print("     若你確認今天 TPEx 本來就沒有資料，可設定 ALLOW_TPEX_EMPTY=1 強制繼續。")
+            return []
+        print("  ⚠️ ALLOW_TPEX_EMPTY=1，TPEx 為空仍強制繼續。")
+    else:
         frames.append(tpex_df)
 
     if not frames:
@@ -8626,7 +8661,7 @@ def build_abcd_events_from_items(items, context_label=""):
 
     這樣可以同時做到：
     - 主結果表保留完整歷史，不會被本次候選資料覆蓋。
-    - 今日圖片使用本次 OpenAPI + API4 + API5 命中的候選資料，避免完整歷史互斥規則影響今日明細。
+    - 今日圖片同樣使用這套主流程運算；最後才依目標日期篩選 今日_*，避免另外重寫 B/C/D 造成結果不一致。
     """
     prefix = f"【{context_label}】" if context_label else ""
 
@@ -8754,6 +8789,80 @@ def filter_events_to_target_date(events, date_fields, target_date):
 
 
 
+def build_signal_abcd_items_from_history_cache(history_df, broker_map, target_date, context_label="每日產圖"):
+    """
+    每日產圖 / 今日_* 表專用資料來源。
+
+    資料來源仍是更新後的「快取_分點歷史」原始 API5 買賣超資料；
+    運算方式完全沿用原本正確的 A → B → C → D 主流程。
+    注意：這裡刻意使用 target_date 以前的完整追蹤分點歷史，而不是只取近 10 個交易日。
+    原因是 A/B/C/D 的互斥規則是「以權證代號為單位」跨完整歷史互斥；
+    若只取近 10 日，10 日前曾進 A/B/C/D 的權證可能會在今日 B/C/D 被重複使用。
+    今日表只在最後依 target_date 篩選，不另外重寫 B/C/D。
+    """
+    prefix = f"【{context_label}】" if context_label else ""
+
+    if history_df is None or history_df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史為空，無法建立 ABCD 運算資料來源。")
+        return []
+
+    if not broker_map:
+        print(f"{prefix}⚠️ broker_map 為空，無法建立 ABCD 運算資料來源。")
+        return []
+
+    target_date = normalize_date_str(target_date)
+    if not target_date:
+        print(f"{prefix}⚠️ 無目標日期，無法建立 ABCD 運算資料來源。")
+        return []
+
+    df = normalize_history_cache_df(history_df)
+    if df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史正規化後為空，無法建立 ABCD 運算資料來源。")
+        return []
+
+    allowed_labels = {str(label).strip() for label in broker_map.keys()}
+    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
+
+    broker_mask = pd.Series(False, index=df.index)
+    if "分點" in df.columns:
+        broker_mask = broker_mask | df["分點"].astype(str).str.strip().isin(allowed_labels)
+    if "券商代號" in df.columns:
+        broker_mask = broker_mask | df["券商代號"].astype(str).str.strip().isin(allowed_codes)
+
+    df = df[broker_mask].copy()
+    if df.empty:
+        print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
+        return []
+
+    df["日期"] = df["日期"].map(normalize_date_str)
+    df = df[df["日期"] <= target_date].copy()
+
+    if df.empty:
+        print(f"{prefix}⚠️ 追蹤分點在 {target_date} 以前沒有原始資料。")
+        return []
+
+    print(
+        f"{prefix}✅ ABCD 運算資料來源：更新後快取_分點歷史完整歷史互斥，"
+        f"追蹤分點 {len(allowed_labels)} 個，{target_date} 以前原始資料 {len(df):,} 筆。"
+    )
+
+    items = items_from_history_cache(df)
+    print(f"{prefix}✅ 已還原 ABCD 運算 items：{len(items):,} 組 權證×分點")
+    return items
+
+
+def filter_today_events_from_abcd(a_events, b_events, c_events, d_events, target_date):
+    """
+    完全照原本正確的 A → B → C → D 運算完成後，最後才篩出今日事件。
+    """
+    target_date = normalize_date_str(target_date)
+    today_a_events = filter_events_to_target_date(a_events, ["買進日", "事件日"], target_date)
+    today_b_events = filter_events_to_target_date(b_events, ["事件日", "結束日"], target_date)
+    today_c_events = filter_events_to_target_date(c_events, ["結束日", "事件日"], target_date)
+    today_d_events = filter_events_to_target_date(d_events, ["結束日", "事件日"], target_date)
+    return today_a_events, today_b_events, today_c_events, today_d_events
+
+
 def latest_trade_date_from_warrants(warrants):
     """從 OpenAPI 最新有成交權證清單取得最新交易日。"""
     latest_dt = None
@@ -8771,585 +8880,7 @@ def latest_trade_date_from_warrants(warrants):
     return latest_str
 
 
-def get_last_trade_dates_from_history_df(history_df, target_date, count):
-    """
-    從快取_分點歷史找出 target_date 往前的最近 N 個交易日。
 
-    每日產圖模式不能只用「今天 API4 有命中的權證」來建 C/D，
-    因為 C=3日累積、D=10日累積時，部分權證可能在前幾天有買超，
-    但最新交易日沒有成交，所以不會出現在本次 OpenAPI 今日有成交名單。
-
-    因此這裡改用快取_分點歷史的日期序列，取最新交易日往前 N 個交易日，
-    再用這段視窗內精選 5 分點的所有權證資料建立今日 B/C/D。
-    """
-    if history_df is None or history_df.empty or not target_date:
-        return []
-
-    target_date = normalize_date_str(target_date)
-    df = history_df.copy().fillna("")
-
-    if "日期" not in df.columns:
-        return []
-
-    dates = []
-    for d in df["日期"].dropna().unique():
-        d_norm = normalize_date_str(d)
-        dt = parse_date(d_norm)
-        if not dt:
-            continue
-        if d_norm <= target_date:
-            dates.append(d_norm)
-
-    dates = sorted(set(dates))
-
-    if count <= 0:
-        return dates
-
-    return dates[-count:]
-
-
-def build_daily_signal_items_from_history_cache(history_df, broker_map, target_date, context_label="每日產圖"):
-    """
-    建立每日產圖專用 items。
-
-    這版的核心修正：
-    每日產圖不是只用「本次 OpenAPI + API4 命中的 candidate_keys」來算，
-    也不是只拿最新交易日前 3 / 10 天視窗去硬湊。
-
-    正確流程是：
-    1. 先把本次 API5 抓到的最新資料 append / merge 到 快取_分點歷史。
-    2. 再以「更新後的整份 快取_分點歷史」作為今日圖片 A/B/C/D 的原始資料來源。
-    3. 只篩選目前追蹤的精選 5 分點 / 目標分點。
-    4. 只排除 target_date 之後的未來資料；target_date 以前的原始資料都保留。
-    5. 後續 build_today_image_abcd_events_from_items() 會自行決定：
-       - 今日 A / B：只看 target_date 當天。
-       - 今日 C：用原始歷史資料中結束日為 target_date 的 3 日累積。
-       - 今日 D：用原始歷史資料中結束日為 target_date 的近 10 日累積。
-
-    這樣才能符合「今天最新資料 + 原本 B/C/D 原始資料一起計算，符合就是符合」的需求，
-    避免因 candidate_filter 太窄而少掉原本應該顯示在圖片上的 B/C/D 股票。
-    """
-    prefix = f"【{context_label}】" if context_label else ""
-
-    if history_df is None or history_df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史為空，無法建立每日產圖資料來源。")
-        return []
-
-    if not broker_map:
-        print(f"{prefix}⚠️ broker_map 為空，無法建立每日產圖資料來源。")
-        return []
-
-    target_date = normalize_date_str(target_date)
-    if not target_date:
-        print(f"{prefix}⚠️ 無法判斷每日產圖目標日期，改用候選資料。")
-        return []
-
-    df = normalize_history_cache_df(history_df)
-
-    if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史正規化後為空，無法建立每日產圖資料來源。")
-        return []
-
-    allowed_labels = {str(label).strip() for label in broker_map.keys()}
-    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
-
-    broker_mask = pd.Series(False, index=df.index)
-    if "分點" in df.columns:
-        broker_mask = broker_mask | df["分點"].astype(str).str.strip().isin(allowed_labels)
-    if "券商代號" in df.columns:
-        broker_mask = broker_mask | df["券商代號"].astype(str).str.strip().isin(allowed_codes)
-
-    df = df[broker_mask].copy()
-
-    if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
-        return []
-
-    # 重要修正：今日 B/C/D 的資料來源必須先排除「歷史已符合 A 類」的權證。
-    # A 類定義是單檔權證單日買進金額 >= AMOUNT_THRESH。
-    # 這裡直接從更新後的快取_分點歷史判斷，不依賴完整 A_單檔大買工作表，
-    # 避免每日產圖模式又讀完整結果表造成速度變慢。
-    global DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES
-    try:
-        df["日期"] = df["日期"].map(normalize_date_str)
-        for col in ["買進金額", "買進股數"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-        hist_a_df = df[
-            (df["日期"].map(normalize_date_str) <= target_date)
-            & (df["買進金額"] >= AMOUNT_THRESH)
-            & (df["買進股數"] > 0)
-        ].copy()
-
-        DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = {
-            normalize_warrant_code_for_unique(code)
-            for code in hist_a_df.get("權證代號", pd.Series(dtype=str)).astype(str).tolist()
-            if str(code).strip()
-        }
-        print(f"{prefix}✅ 歷史 A 權證排除清單：{len(DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES):,} 檔")
-    except Exception as e:
-        DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES = set()
-        print(f"{prefix}⚠️ 歷史 A 權證排除清單建立失敗，今日 B/C/D 僅排除今日 A：{type(e).__name__}: {e}")
-
-    # 每日產圖只需要「目標交易日往前 D_WINDOW_DAYS 個交易日」的原始資料.
-    # 這仍然是用更新後的快取_分點歷史來算，不再被本次 candidate_keys 限制；
-    # 但不用把 18～20 萬筆完整歷史全部還原成 items，避免每日產圖模式拖到十幾分鐘。
-    # A / B 只看 target_date，C 看結束日為 target_date 的 3 日，D 看結束日為 target_date 的近 10 日，
-    # 因此最後 D_WINDOW_DAYS 個交易日已足夠判斷今日圖片資料。
-    signal_dates = get_last_trade_dates_from_history_df(df, target_date, D_WINDOW_DAYS)
-
-    if target_date not in signal_dates:
-        signal_dates = sorted(set(signal_dates + [target_date]))
-
-    df = df[df["日期"].map(normalize_date_str).isin(signal_dates)].copy()
-
-    if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史內沒有 {target_date} 及其近 {D_WINDOW_DAYS} 個交易日的追蹤分點資料。")
-        return []
-
-    print(f"{prefix}✅ 每日產圖計算視窗：{', '.join(signal_dates)}")
-
-    # 保留有買賣紀錄的資料列，避免大量全 0 資料拖慢後續 groupby。
-    for col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "買超金額", "買超股數"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-    df = df[
-        (df.get("買進金額", 0) != 0)
-        | (df.get("賣出金額", 0) != 0)
-        | (df.get("買進股數", 0) != 0)
-        | (df.get("賣出股數", 0) != 0)
-        | (df.get("買超金額", 0) != 0)
-        | (df.get("買超股數", 0) != 0)
-    ].copy()
-
-    if df.empty:
-        print(f"{prefix}⚠️ 每日產圖資料來源內沒有買賣超資料。")
-        return []
-
-    items = items_from_history_cache(df)
-    first_date = df["日期"].map(normalize_date_str).min() if "日期" in df.columns else ""
-    last_date = df["日期"].map(normalize_date_str).max() if "日期" in df.columns else ""
-
-    print(
-        f"{prefix}✅ 每日產圖資料來源：使用更新後 快取_分點歷史 的追蹤分點近 {D_WINDOW_DAYS} 個交易日原始資料，"
-        f"日期範圍 {first_date} ~ {last_date}，資料 {len(df):,} 筆，還原 {len(items):,} 組 權證×分點"
-    )
-    print(f"{prefix}✅ 今日 A/B/C/D 目標日期：{target_date}；後續只輸出事件日 / 結束日為此日期的今日訊號。")
-    return items
-
-
-def build_target_date_positive_buy_lots_for_event(event, daily_records, target_date):
-    """
-    每日產圖專用：
-    C / D 事件的成立條件可以使用 3 日 / 10 日歷史資料，
-    但「今日買超明細」顯示的權證清單與買超金額，必須只保留 target_date 當天實際買超的權證。
-
-    修正原因：
-    build_c_events / build_d_events 會把視窗內所有符合累積條件的權證放進 lots。
-    尤其 D 類原本是近 10 日累積淨買進，若不重新過濾，
-    5/26 買進的權證也可能出現在 5/29 今日買超圖卡，造成誤判。
-    """
-    if not event or not daily_records or not target_date:
-        return []
-
-    target_date = normalize_date_str(target_date)
-    broker_code = str(event.get("券商代號", "")).strip()
-    broker_label = str(event.get("分點", "")).strip()
-    underlying_code = str(event.get("標的股", "")).strip()
-    event_warrant_codes = collect_event_warrant_codes([event])
-
-    if not broker_code and not broker_label:
-        return []
-    if not underlying_code:
-        return []
-    if not event_warrant_codes:
-        return []
-
-    lot_map = {}
-
-    for row in daily_records:
-        row_date = normalize_date_str(row.get("日期", ""))
-        if row_date != target_date:
-            continue
-
-        row_broker_code = str(row.get("券商代號", "")).strip()
-        row_broker_label = str(row.get("分點", "")).strip()
-        if broker_code and row_broker_code != broker_code:
-            continue
-        if not broker_code and broker_label and row_broker_label != broker_label:
-            continue
-
-        if str(row.get("標的股", "")).strip() != underlying_code:
-            continue
-
-        row_warrant_code = normalize_warrant_code_for_unique(row.get("權證代號", ""))
-        if row_warrant_code not in event_warrant_codes:
-            continue
-
-        buy_amount = int(row.get("買超金額", 0) or 0)
-        buy_shares = int(row.get("買超股數", 0) or 0)
-
-        # 今日買超明細只保留 target_date 當天實際買超，
-        # 舊日期買進、今日沒買超、或今日為賣超 / 淨賣超者都不能出現在今日買超圖卡。
-        if buy_amount <= 0 or buy_shares <= 0:
-            continue
-
-        key = (row_warrant_code, str(row.get("權證名稱", "")).strip())
-        rec = lot_map.setdefault(key, {
-            "買進日": target_date,
-            "權證代號": row.get("權證代號", ""),
-            "權證名稱": row.get("權證名稱", ""),
-            "金額": 0,
-            "股數": 0,
-        })
-        rec["金額"] += buy_amount
-        rec["股數"] += buy_shares
-
-    lots = []
-    for key in sorted(lot_map.keys()):
-        rec = lot_map[key]
-        if int(rec.get("金額", 0)) > 0 and int(rec.get("股數", 0)) > 0:
-            lots.append(rec)
-
-    return lots
-
-
-def rewrite_today_accum_event_with_target_date_lots(event, today_lots, item_map):
-    """
-    C / D 事件成立條件仍由原本 3 日 / 10 日視窗判斷，
-    但今日圖片與今日_* 工作表的顯示內容改為 target_date 當天實際買超的 lots。
-    """
-    if not event or not today_lots:
-        return None
-
-    new_event = dict(event)
-    new_event["lots"] = today_lots
-    new_event["涵蓋權證數"] = len({normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in today_lots})
-    new_event["權證清單"] = "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in today_lots])
-    new_event["買超金額"] = int(sum(int(lot.get("金額", 0) or 0) for lot in today_lots))
-    new_event["買超股數"] = int(sum(int(lot.get("股數", 0) or 0) for lot in today_lots))
-    new_event["買超張數"] = int(new_event["買超股數"] // 1000)
-
-    if new_event["買超金額"] <= 0 or new_event["買超股數"] <= 0:
-        return None
-
-    # 重新用今日實際買超 lots 模擬後續減碼 / 出清，避免賣方與報酬率引用到舊日期 lots。
-    new_event = simulate_group_outcome(new_event, item_map)
-    return new_event
-
-
-def filter_today_accum_events_to_target_date_buys(events, daily_records, item_map, target_date, context_label="每日產圖", event_code=""):
-    """
-    每日產圖專用過濾：
-    C / D 可用歷史視窗判斷是否符合策略，但進入今日_* 表前，
-    必須確認事件內至少有一檔權證在 target_date 當天實際買超。
-    同時把顯示金額與權證清單改成 target_date 當天買超資料。
-    """
-    prefix = f"【{context_label}】" if context_label else ""
-    kept = []
-    dropped = 0
-
-    for ev in events or []:
-        today_lots = build_target_date_positive_buy_lots_for_event(ev, daily_records, target_date)
-        new_ev = rewrite_today_accum_event_with_target_date_lots(ev, today_lots, item_map)
-        if new_ev is None:
-            dropped += 1
-            continue
-        kept.append(new_ev)
-
-    if event_code:
-        print(f"  ✅ {prefix}今日 {event_code} 類事件當日買超過濾：保留 {len(kept)} 筆，排除非當日買超 {dropped} 筆")
-
-    return kept
-
-def _today_positive_records_dataframe(daily_records, target_date, exclude_warrant_codes=None):
-    """
-    每日產圖核心資料表：只取 target_date 當天實際買超的原始資料。
-
-    注意：B/C/D 是否成立可以回看歷史，但「今日買超明細」一定只能從這張表出發。
-    """
-    if not daily_records:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(daily_records).fillna("")
-    if df.empty:
-        return df
-
-    target_date = normalize_date_str(target_date)
-    df["日期"] = df["日期"].map(normalize_date_str)
-
-    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-    df = df[
-        (df["日期"] == target_date)
-        & (df["買超金額"] > 0)
-        & (df["買超股數"] > 0)
-        & (df["標的股"].astype(str).str.strip() != "")
-    ].copy()
-
-    if exclude_warrant_codes:
-        exclude_warrant_codes = {
-            normalize_warrant_code_for_unique(code)
-            for code in exclude_warrant_codes
-            if str(code).strip()
-        }
-        df = df[~df["權證代號"].map(normalize_warrant_code_for_unique).isin(exclude_warrant_codes)].copy()
-
-    return df
-
-
-def _build_today_lots_from_group_df(group_df):
-    lots = []
-    if group_df is None or group_df.empty:
-        return lots
-
-    warrant_rows = group_df.groupby(["權證代號", "權證名稱"], as_index=False).agg({
-        "買超金額": "sum",
-        "買超股數": "sum",
-    })
-
-    for wr in warrant_rows.itertuples(index=False):
-        wr = wr._asdict()
-        amount = int(wr.get("買超金額", 0) or 0)
-        shares = int(wr.get("買超股數", 0) or 0)
-        if amount <= 0 or shares <= 0:
-            continue
-        lots.append({
-            "買進日": normalize_date_str(group_df["日期"].iloc[0]),
-            "權證代號": str(wr.get("權證代號", "")).strip(),
-            "權證名稱": str(wr.get("權證名稱", "")).strip(),
-            "金額": amount,
-            "股數": shares,
-        })
-
-    return lots
-
-
-def _make_today_group_event(event_code, broker_label, broker_name, broker_code, underlying_code,
-                            start_date, end_date, today_lots, item_map, condition_amount=None):
-    if not today_lots:
-        return None
-
-    total_amount = int(sum(int(lot.get("金額", 0) or 0) for lot in today_lots))
-    total_shares = int(sum(int(lot.get("股數", 0) or 0) for lot in today_lots))
-    warrant_count = len({normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in today_lots if lot.get("權證代號")})
-
-    if total_amount <= 0 or total_shares <= 0 or warrant_count <= 0:
-        return None
-
-    event_name_map = {
-        "B": "B-同標的單日合計買超",
-        "C": "C-同標的3日累積買超",
-        "D": f"D-同標的近{D_WINDOW_DAYS}日累積淨買進",
-    }
-
-    event = {
-        "事件類型": event_name_map.get(event_code, event_code),
-        "事件代碼": event_code,
-        "分點": broker_label,
-        "分點名稱": broker_name,
-        "券商代號": broker_code,
-        "標的股": underlying_code,
-        "起始日": normalize_date_str(start_date),
-        "結束日": normalize_date_str(end_date),
-        "事件日": normalize_date_str(end_date),
-        "涵蓋權證數": warrant_count,
-        "權證清單": "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in today_lots]),
-        # 每日圖卡的顯示金額：只使用 target_date 當天實際買超金額。
-        "買超金額": total_amount,
-        "買超股數": total_shares,
-        "買超張數": total_shares // 1000,
-        "lots": today_lots,
-    }
-
-    if condition_amount is not None:
-        event["條件累積金額"] = int(condition_amount)
-
-    event = simulate_group_outcome(event, item_map)
-    return event
-
-
-def _sum_window_amount_for_group(daily_records_df, broker_code, underlying_code, date_list, warrant_codes=None, net=False):
-    if daily_records_df is None or daily_records_df.empty or not date_list:
-        return 0
-
-    df = daily_records_df
-    mask = (
-        (df["券商代號"].astype(str).str.strip() == str(broker_code).strip())
-        & (df["標的股"].astype(str).str.strip() == str(underlying_code).strip())
-        & (df["日期"].map(normalize_date_str).isin([normalize_date_str(d) for d in date_list]))
-    )
-
-    if warrant_codes:
-        warrant_codes = {normalize_warrant_code_for_unique(code) for code in warrant_codes if str(code).strip()}
-        mask = mask & df["權證代號"].map(normalize_warrant_code_for_unique).isin(warrant_codes)
-
-    sub = df[mask].copy()
-    if sub.empty:
-        return 0
-
-    if net:
-        # D 類用近 N 日累積淨買進；買超金額可為正負。
-        return int(pd.to_numeric(sub["買超金額"], errors="coerce").fillna(0).sum())
-
-    # C 類用累積買超，只累加正買超。
-    sub = sub[pd.to_numeric(sub["買超金額"], errors="coerce").fillna(0) > 0]
-    if sub.empty:
-        return 0
-    return int(pd.to_numeric(sub["買超金額"], errors="coerce").fillna(0).sum())
-
-
-def build_today_image_abcd_events_from_items(items, context_label="今日候選", target_date=None):
-    """
-    今日圖片 / 今日_* 工作表專用 A/B/C/D 建立函式。
-
-    這版改成真正的「今日買超導向」：
-    1. 先從 target_date 當天實際買超原始資料出發。
-    2. 今日 A：單檔當日買進金額 >= 100 萬。
-    3. 今日 B/C/D：只允許 target_date 當天實際買超的權證進入今日圖卡。
-    4. C/D 的成立條件可以回看 3 日 / 10 日歷史，但顯示金額只用 target_date 當天買超。
-    5. 歷史已符合 A 的權證不可再進 B/C/D，避免 A/B/C/D 互斥失效。
-    """
-    prefix = f"【{context_label}】" if context_label else ""
-
-    item_map = {}
-    for item in items or []:
-        item_map[(item["broker_code"], item["warrant_code"])] = item
-
-    target_date = normalize_date_str(target_date) if target_date else latest_trade_date_from_items(items)
-
-    if not target_date:
-        print(f"{prefix}⚠️ 無法判斷今日候選最新交易日，今日_* 工作表將為空。")
-        return item_map, [], [], [], []
-
-    print(f"{prefix}今日圖片 / 今日_* 事件目標日期：{target_date}")
-
-    daily_records_all = build_daily_records(items)
-    if not daily_records_all:
-        print(f"{prefix}⚠️ 無每日原始買賣超資料，今日_* 工作表將為空。")
-        return item_map, [], [], [], []
-
-    records_df = pd.DataFrame(daily_records_all).fillna("")
-    records_df["日期"] = records_df["日期"].map(normalize_date_str)
-    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]:
-        if col in records_df.columns:
-            records_df[col] = pd.to_numeric(records_df[col], errors="coerce").fillna(0).astype(int)
-
-    # 今日 A：只看 target_date 當天單檔權證買進金額 >= 門檻。
-    a_events = []
-    for item in items or []:
-        for ev in item.get("events_a", []):
-            if normalize_date_str(ev.get("買進日", "")) == target_date:
-                a_events.append(ev)
-    a_events = filter_a_events_unique_warrants(a_events)
-
-    # 歷史 A 黑名單：只要曾經達 A，後續 B/C/D 不再使用該權證。
-    today_a_warrant_codes = collect_event_warrant_codes(a_events)
-    historical_a_warrant_codes = set(DAILY_SIGNAL_HISTORICAL_A_WARRANT_CODES)
-    a_warrant_codes = historical_a_warrant_codes | today_a_warrant_codes
-
-    if historical_a_warrant_codes:
-        print(
-            f"{prefix}✅ 今日 B/C/D 排除歷史 A 權證：歷史 A {len(historical_a_warrant_codes):,} 檔，"
-            f"今日 A {len(today_a_warrant_codes):,} 檔，合計排除 {len(a_warrant_codes):,} 檔"
-        )
-
-    # 後續 B/C/D 只從 target_date 當天實際買超資料出發。
-    today_df = _today_positive_records_dataframe(daily_records_all, target_date, exclude_warrant_codes=a_warrant_codes)
-
-    if today_df.empty:
-        print(f"{prefix}⚠️ {target_date} 當天扣除 A 權證後，沒有可用於 B/C/D 的實際買超原始資料。")
-        print(f"  ✅ {prefix}今日 A 類事件：{len(a_events)} 筆")
-        return item_map, a_events, [], [], []
-
-    print(f"{prefix}✅ 今日 B/C/D 候選來源：{len(today_df):,} 筆 target_date 當天實際買超原始資料")
-
-    used_warrant_codes = set(a_warrant_codes)
-    b_events = []
-    c_events = []
-    d_events = []
-
-    group_cols = ["分點", "分點名稱", "券商代號", "標的股"]
-
-    # B：今天同分點 + 同標的 + 多檔權證合計買超 >= 門檻。
-    print(f"{prefix}【Step 3c】建立今日 B 類事件：從今日實際買超資料出發...")
-    for key, g in today_df.groupby(group_cols, sort=False):
-        broker_label, broker_name, broker_code, underlying_code = key
-        g = g[~g["權證代號"].map(normalize_warrant_code_for_unique).isin(used_warrant_codes)].copy()
-        if g.empty:
-            continue
-        lots = _build_today_lots_from_group_df(g)
-        warrant_count = len({normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in lots})
-        total_today_amount = int(sum(int(lot.get("金額", 0) or 0) for lot in lots))
-        if warrant_count < 2:
-            continue
-        if total_today_amount < AMOUNT_THRESH:
-            continue
-        ev = _make_today_group_event("B", broker_label, broker_name, broker_code, underlying_code, target_date, target_date, lots, item_map, condition_amount=total_today_amount)
-        if ev:
-            b_events.append(ev)
-            used_warrant_codes.update(collect_event_warrant_codes([ev]))
-    print(f"  ✅ {prefix}今日 B 類事件：{len(b_events)} 筆")
-
-    # C：今天有買超，且近 3 交易日累積買超 >= 門檻。
-    c_dates = get_last_trade_dates_from_records(daily_records_all, target_date, 3)
-    print(f"{prefix}【Step 3d】建立今日 C 類事件：今日買超 + 近 3 日累積判斷...")
-    for key, g in today_df.groupby(group_cols, sort=False):
-        broker_label, broker_name, broker_code, underlying_code = key
-        g = g[~g["權證代號"].map(normalize_warrant_code_for_unique).isin(used_warrant_codes)].copy()
-        if g.empty:
-            continue
-        lots = _build_today_lots_from_group_df(g)
-        warrant_codes = {normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in lots}
-        condition_amount = _sum_window_amount_for_group(
-            records_df,
-            broker_code,
-            underlying_code,
-            c_dates,
-            warrant_codes=warrant_codes,
-            net=False,
-        )
-        if condition_amount < AMOUNT_THRESH:
-            continue
-        ev = _make_today_group_event("C", broker_label, broker_name, broker_code, underlying_code, c_dates[0] if c_dates else target_date, target_date, lots, item_map, condition_amount=condition_amount)
-        if ev:
-            c_events.append(ev)
-            used_warrant_codes.update(collect_event_warrant_codes([ev]))
-    print(f"  ✅ {prefix}今日 C 類事件：{len(c_events)} 筆")
-
-    # D：今天有買超，且近 10 交易日累積淨買進 >= 門檻。
-    d_dates = get_last_trade_dates_from_records(daily_records_all, target_date, D_WINDOW_DAYS)
-    print(f"{prefix}【Step 3e】建立今日 D 類事件：今日買超 + 近 {D_WINDOW_DAYS} 日累積淨買進判斷...")
-    for key, g in today_df.groupby(group_cols, sort=False):
-        broker_label, broker_name, broker_code, underlying_code = key
-        g = g[~g["權證代號"].map(normalize_warrant_code_for_unique).isin(used_warrant_codes)].copy()
-        if g.empty:
-            continue
-        lots = _build_today_lots_from_group_df(g)
-        warrant_codes = {normalize_warrant_code_for_unique(lot.get("權證代號", "")) for lot in lots}
-        condition_amount = _sum_window_amount_for_group(
-            records_df,
-            broker_code,
-            underlying_code,
-            d_dates,
-            warrant_codes=warrant_codes,
-            net=True,
-        )
-        if condition_amount < AMOUNT_THRESH:
-            continue
-        ev = _make_today_group_event("D", broker_label, broker_name, broker_code, underlying_code, d_dates[0] if d_dates else target_date, target_date, lots, item_map, condition_amount=condition_amount)
-        if ev:
-            d_events.append(ev)
-            used_warrant_codes.update(collect_event_warrant_codes([ev]))
-    print(f"  ✅ {prefix}今日 D 類事件：{len(d_events)} 筆")
-
-    print(f"  ✅ {prefix}今日 A 類事件：{len(a_events)} 筆")
-
-    return item_map, a_events, b_events, c_events, d_events
 
 def main():
     global RUN_MODE
@@ -9513,27 +9044,41 @@ def main():
             or latest_trade_date_from_items(candidate_today_items)
         )
 
-        today_items = build_daily_signal_items_from_history_cache(
+        today_items = build_signal_abcd_items_from_history_cache(
             signal_history_df,
             broker_map,
             target_date_for_today,
             context_label="每日產圖"
         )
 
-        # 若歷史視窗資料不可用，才退回本次候選資料。
+        # 若更新後歷史資料不可用，才退回本次候選資料。
         if not today_items:
             today_items = candidate_today_items or fetched_items
 
         if not today_items:
-            print("⚠️ 每日產圖模式沒有可用的本次候選資料")
+            print("⚠️ 每日產圖模式沒有可用的 ABCD 運算資料")
             elapsed = time.time() - program_start
             print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
             return
 
-        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
+        # 核心修正：每日產圖也使用原本成功版的完整 A → B → C → D 主流程，
+        # 不再使用額外重寫的今日 B/C/D 演算法。最後才篩選 target_date 的事件。
+        today_item_map, calc_a_events, calc_b_events, calc_c_events, calc_d_events = build_abcd_events_from_items(
             today_items,
-            context_label="每日產圖",
-            target_date=target_date_for_today
+            context_label="每日產圖ABCD主流程"
+        )
+        today_a_events, today_b_events, today_c_events, today_d_events = filter_today_events_from_abcd(
+            calc_a_events,
+            calc_b_events,
+            calc_c_events,
+            calc_d_events,
+            target_date_for_today
+        )
+
+        print(
+            f"  ✅ 每日產圖最後篩選 {target_date_for_today}："
+            f"今日A {len(today_a_events)} 筆、今日B {len(today_b_events)} 筆、"
+            f"今日C {len(today_c_events)} 筆、今日D {len(today_d_events)} 筆"
         )
 
         if not today_a_events and not today_b_events and not today_c_events and not today_d_events:
@@ -9585,7 +9130,7 @@ def main():
         or latest_trade_date_from_items(fetched_items)
         or latest_trade_date_from_items(candidate_today_items)
     )
-    today_items = build_daily_signal_items_from_history_cache(
+    today_items = build_signal_abcd_items_from_history_cache(
         signal_history_df,
         broker_map,
         target_date_for_today,
@@ -9630,12 +9175,18 @@ def main():
     today_d_events = []
 
     if TODAY_IMAGE_USE_CURRENT_CANDIDATES and today_items:
-        today_item_map, today_a_events, today_b_events, today_c_events, today_d_events = build_today_image_abcd_events_from_items(
+        today_item_map, today_calc_a, today_calc_b, today_calc_c, today_calc_d = build_abcd_events_from_items(
             today_items,
-            context_label="今日候選",
-            target_date=target_date_for_today
+            context_label="今日候選ABCD主流程"
         )
-        print("  ✅ 已建立 今日_* 工作表資料來源；主結果表仍保留完整歷史。")
+        today_a_events, today_b_events, today_c_events, today_d_events = filter_today_events_from_abcd(
+            today_calc_a,
+            today_calc_b,
+            today_calc_c,
+            today_calc_d,
+            target_date_for_today
+        )
+        print("  ✅ 已使用原本 A→B→C→D 主流程建立 今日_* 工作表資料來源；主結果表仍保留完整歷史。")
 
     if not a_events and not b_events and not c_events and not d_events:
         print("⚠️ A/B/C/D 皆無事件")
