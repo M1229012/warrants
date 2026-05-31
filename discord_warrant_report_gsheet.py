@@ -1434,9 +1434,6 @@ def get_font_path(bold=False):
     return candidates[-1]
 
 
-def make_font(size, bold=False):
-    return ImageFont.truetype(get_font_path(bold), size)
-
 
 def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path, source_warning: dict | None = None):
     """
@@ -1848,11 +1845,6 @@ def get_buy_event_date(row, sheet_name: str) -> date | None:
     return None
 
 
-def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
-    """依事件工作表取得該筆賣方事件日期。status = 減碼 / 出清"""
-    col = "減碼日" if status == "減碼" else "出清日"
-    return parse_date_value(row.get(col))
-
 
 def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> list[date]:
     """
@@ -1887,6 +1879,10 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
 def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRADING_DAYS) -> tuple[list[dict], list[date]]:
     """
     統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP15。
+
+    TOP15 只讀完整 A/B/C/D 工作表，不讀 今日_A/B/C/D。
+    今日資料應由 warrant_backtest.py 先重算並寫入完整 A/B/C/D，
+    這樣可避免完整表與今日表重複加總。
 
     統計來源：
     - A_單檔大買：買進日 / 買進金額
