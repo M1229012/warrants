@@ -3218,35 +3218,6 @@ def save_warrants_cache(warrants):
     print(f"  💾 已更新權證清單快取：{WARRANTS_CACHE_PATH}")
 
 
-def load_warrants_cache():
-    df = read_cache_csv(WARRANTS_CACHE_PATH)
-
-    if df.empty:
-        return []
-
-    required_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    for col in required_cols:
-        if col not in df.columns:
-            return []
-
-    warrants = []
-    for row in df.itertuples(index=False):
-        row = row._asdict()
-        code = str(row["代號"]).strip()
-        name = str(row["名稱"]).strip()
-
-        if not code or not name:
-            continue
-
-        warrants.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": str(row.get("標的股", "")).strip(),
-            "標的名稱": str(row.get("標的名稱", "")).strip(),
-        })
-
-    return warrants
-
 
 def save_broker_map_cache(broker_map):
     if not USE_CACHE or not broker_map:
@@ -4242,10 +4213,6 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
     return "", ""
 
 
-def find_underlying(warrant_name, stock_map):
-    code, _ = find_underlying_info(warrant_name, stock_map)
-    return code
-
 
 def load_warrants_lookup_cache_for_openapi():
     """
@@ -4897,27 +4864,6 @@ def make_daily_key(broker_code, underlying_code, date, warrant_code):
     )
 
 
-def make_a_exclude_keys(a_events):
-    """
-    A > B > C 去重：
-    已經被 A 單檔大買抓到的「券商分點 + 標的股 + 日期 + 權證」
-    不再進入 B / C 的同標的合計買超判斷。
-    """
-    keys = set()
-
-    for ev in a_events:
-        if not ev.get("標的股"):
-            continue
-
-        keys.add(make_daily_key(
-            ev.get("券商代號"),
-            ev.get("標的股"),
-            ev.get("買進日"),
-            ev.get("權證代號"),
-        ))
-
-    return keys
-
 
 def make_b_exclude_keys(b_events):
     """
@@ -4941,25 +4887,6 @@ def make_b_exclude_keys(b_events):
 
     return keys
 
-
-def filter_daily_records(daily_records, exclude_keys):
-    if not exclude_keys:
-        return daily_records
-
-    filtered = []
-
-    for row in daily_records:
-        key = make_daily_key(
-            row.get("券商代號"),
-            row.get("標的股"),
-            row.get("日期"),
-            row.get("權證代號"),
-        )
-
-        if key not in exclude_keys:
-            filtered.append(row)
-
-    return filtered
 
 
 
@@ -5510,14 +5437,6 @@ def build_c_events(daily_records, item_map):
     return events
 
 
-def make_c_exclude_keys(c_events):
-    """
-    A > B > C > D 去重：
-    已經被 C 同標的 3 日累積買超抓到的資料，
-    不再進入 D 的近 N 日累積淨買進判斷。
-    """
-    return make_b_exclude_keys(c_events)
-
 
 # ══════════════════════════════════════════════════════════════════════
 # D：同分點 + 同標的，近 N 個交易日累積淨買進 >= 100萬
@@ -5948,26 +5867,6 @@ def load_cached_prices_for_events(a_events, b_events, c_events, d_events):
     )
     return price_cache
 
-
-def merge_price_cache_maps(*caches):
-    """合併多個記憶體價格快取 dict。"""
-    merged = {}
-
-    for cache in caches:
-        if not cache:
-            continue
-
-        for code, prices in cache.items():
-            norm_code = normalize_price_code(code)
-
-            if not norm_code:
-                continue
-
-            old_prices = get_cached_prices_for_code(merged, norm_code)
-            merged_prices = merge_price_dicts(old_prices, prices)
-            add_price_aliases(merged, norm_code, merged_prices)
-
-    return merged
 
 
 def build_price_cache_for_report(price_a_events, price_b_events, price_c_events, price_d_events,
@@ -8396,482 +8295,7 @@ def _extract_target_date_row_from_api5(rows, target_date):
     return None
 
 
-def build_full_market_daily_underlying_top20_rows(warrants, target_date=""):
-    """
-    建立「全市場」每日標的權證買超 TOP20。
 
-    這個榜單刻意不使用 items，也不受 RUN_MODE / TARGET_PATTERNS / 精選分點限制。
-
-    流程：
-    1. 使用 OpenAPI 最新交易日有成交量 > 0 的認購權證作為權證母體。
-    2. 對每一檔權證用 API4 抓該交易日所有有出現在分點籌碼表的券商分點。
-    3. 對每一組「權證 × 分點」用 API5 回查該交易日買進 / 賣出金額。
-    4. 依標的股彙總：
-       - 每日標的淨買超TOP20：買進金額 - 賣出金額，正負都納入。
-       - 每日標的買超TOP20：只累加正買超金額，不扣賣超。
-    5. 每個標的另外列出該標的買超金額最大的分點與前三名分點，用來發掘不在精選清單內的新分點。
-    """
-    if not FULL_MARKET_TOP20_ENABLE:
-        return [], [], target_date or ""
-
-    if not warrants:
-        return [], [], target_date or ""
-
-    if not target_date:
-        target_date = _latest_trade_date_from_warrants(warrants)
-
-    if not target_date:
-        return [], [], ""
-
-    active_warrants = []
-    seen_warrants = set()
-
-    for w in warrants:
-        wcode = normalize_openapi_warrant_code(w.get("代號", ""))
-        wname = str(w.get("名稱", "")).strip()
-        ucode = str(w.get("標的股", "")).strip()
-        uname = str(w.get("標的名稱", "")).strip()
-        trade_date = normalize_date_str(w.get("交易日期", target_date))
-
-        if trade_date and trade_date != target_date:
-            continue
-        if not wcode or not wname or not ucode:
-            continue
-        if wcode in seen_warrants:
-            continue
-
-        seen_warrants.add(wcode)
-        active_warrants.append({
-            "代號": wcode,
-            "名稱": wname,
-            "標的股": ucode,
-            "標的名稱": uname,
-        })
-
-    if FULL_MARKET_TOP20_LIMIT_WARRANTS > 0:
-        active_warrants = active_warrants[:FULL_MARKET_TOP20_LIMIT_WARRANTS]
-        print(f"  ⚠️ FULL_MARKET_TOP20_LIMIT_WARRANTS={FULL_MARKET_TOP20_LIMIT_WARRANTS}，只測試前 {len(active_warrants):,} 支權證。")
-
-    print("【Step 3f】建立全市場每日標的權證買超 TOP20（不限制精選分點）...")
-    print(f"  ✅ TOP20 統計日期：{target_date}")
-    print(f"  ✅ TOP20 權證母體：OpenAPI 今日有成交認購權證 {len(active_warrants):,} 支")
-
-    if not active_warrants:
-        return [], [], target_date
-
-    pairs = {}
-    done = 0
-
-    def fetch_brokers_for_warrant(w):
-        rows = api4_get(w["代號"], target_date, target_date)
-        out = []
-        seen = set()
-
-        for row in rows or []:
-            broker_code = str(row.get("V2", "")).strip()
-            broker_name = str(row.get("V3", "")).strip()
-
-            if not broker_code:
-                continue
-
-            key = (w["代號"], broker_code)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            out.append({
-                "權證代號": w["代號"],
-                "權證名稱": w["名稱"],
-                "標的股": w["標的股"],
-                "標的名稱": w.get("標的名稱", ""),
-                "券商代號": broker_code,
-                "分點名稱": broker_name,
-            })
-
-        return out
-
-    workers_api4 = max(1, int(FULL_MARKET_TOP20_API4_WORKERS))
-    print(f"  🔎 API4 掃描全市場分點，workers={workers_api4}")
-
-    with ThreadPoolExecutor(max_workers=workers_api4) as ex:
-        futures = {ex.submit(fetch_brokers_for_warrant, w): w for w in active_warrants}
-
-        for future in as_completed(futures):
-            done += 1
-            try:
-                result = future.result()
-            except Exception:
-                result = []
-
-            for rec in result:
-                key = (rec["權證代號"], rec["券商代號"])
-                pairs[key] = rec
-
-            if done % 1000 == 0:
-                print(f"  [{done:,}/{len(active_warrants):,}] API4 全市場分點掃描中，累計 {len(pairs):,} 組 權證×分點...")
-
-    pair_list = list(pairs.values())
-    print(f"  ✅ API4 完成：共 {len(pair_list):,} 組 權證×分點 需要 API5 回查當日金額")
-
-    if not pair_list:
-        return [], [], target_date
-
-    ranking = {}
-    done = 0
-
-    def fetch_pair_today_amount(pair):
-        rows = api5_get(pair["權證代號"], pair["券商代號"], days=FULL_MARKET_TOP20_DAYS)
-        day_row = _extract_target_date_row_from_api5(rows, target_date)
-
-        if not day_row:
-            return None
-
-        buy_amount = int(day_row.get("買進金額", 0) or 0)
-        sell_amount = int(day_row.get("賣出金額", 0) or 0)
-        buy_shares = int(day_row.get("買進股數", 0) or 0)
-        sell_shares = int(day_row.get("賣出股數", 0) or 0)
-        net_amount = int(day_row.get("買超金額", buy_amount - sell_amount) or 0)
-        net_shares = int(day_row.get("買超股數", buy_shares - sell_shares) or 0)
-
-        if buy_amount == 0 and sell_amount == 0 and buy_shares == 0 and sell_shares == 0:
-            return None
-
-        out = dict(pair)
-        out.update({
-            "日期": target_date,
-            "買進金額": buy_amount,
-            "賣出金額": sell_amount,
-            "買進股數": buy_shares,
-            "賣出股數": sell_shares,
-            "淨買超金額": net_amount,
-            "淨買超股數": net_shares,
-            "單純買超金額": max(net_amount, 0),
-            "單純買超股數": max(net_shares, 0) if net_amount > 0 else 0,
-        })
-        return out
-
-    workers_api5 = max(1, int(FULL_MARKET_TOP20_API5_WORKERS))
-    print(f"  💰 API5 回查全市場當日買賣超，workers={workers_api5}，days={FULL_MARKET_TOP20_DAYS}")
-
-    with ThreadPoolExecutor(max_workers=workers_api5) as ex:
-        futures = {ex.submit(fetch_pair_today_amount, pair): pair for pair in pair_list}
-
-        for future in as_completed(futures):
-            done += 1
-            try:
-                rec = future.result()
-            except Exception:
-                rec = None
-
-            if rec:
-                key = (rec["標的股"], rec.get("標的名稱", ""))
-                agg = ranking.setdefault(key, {
-                    "日期": target_date,
-                    "標的股": rec["標的股"],
-                    "標的名稱": rec.get("標的名稱", ""),
-                    "買進金額": 0,
-                    "賣出金額": 0,
-                    "淨買超金額": 0,
-                    "單純買超金額": 0,
-                    "買進股數": 0,
-                    "賣出股數": 0,
-                    "淨買超股數": 0,
-                    "單純買超股數": 0,
-                    "涵蓋權證": set(),
-                    "涵蓋分點": set(),
-                    "分點統計": {},
-                    "權證明細": {},
-                })
-
-                buy_amount = int(rec.get("買進金額", 0) or 0)
-                sell_amount = int(rec.get("賣出金額", 0) or 0)
-                net_amount = int(rec.get("淨買超金額", 0) or 0)
-                pos_amount = int(rec.get("單純買超金額", 0) or 0)
-                buy_shares = int(rec.get("買進股數", 0) or 0)
-                sell_shares = int(rec.get("賣出股數", 0) or 0)
-                net_shares = int(rec.get("淨買超股數", 0) or 0)
-                pos_shares = int(rec.get("單純買超股數", 0) or 0)
-
-                agg["買進金額"] += buy_amount
-                agg["賣出金額"] += sell_amount
-                agg["淨買超金額"] += net_amount
-                agg["單純買超金額"] += pos_amount
-                agg["買進股數"] += buy_shares
-                agg["賣出股數"] += sell_shares
-                agg["淨買超股數"] += net_shares
-                agg["單純買超股數"] += pos_shares
-                agg["涵蓋權證"].add(rec["權證代號"])
-                agg["涵蓋分點"].add(rec["券商代號"])
-
-                bkey = (rec["券商代號"], rec.get("分點名稱", ""))
-                bstat = agg["分點統計"].setdefault(bkey, {
-                    "買進金額": 0,
-                    "賣出金額": 0,
-                    "淨買超金額": 0,
-                    "單純買超金額": 0,
-                })
-                bstat["買進金額"] += buy_amount
-                bstat["賣出金額"] += sell_amount
-                bstat["淨買超金額"] += net_amount
-                bstat["單純買超金額"] += pos_amount
-
-                wkey = (rec["權證代號"], rec.get("權證名稱", ""))
-                wstat = agg["權證明細"].setdefault(wkey, {
-                    "淨買超金額": 0,
-                    "單純買超金額": 0,
-                })
-                wstat["淨買超金額"] += net_amount
-                wstat["單純買超金額"] += pos_amount
-
-            if done % 1000 == 0:
-                print(f"  [{done:,}/{len(pair_list):,}] API5 全市場 TOP20 回查中，已彙總 {len(ranking):,} 個標的...")
-
-    def make_rows(mode):
-        metric_key = "單純買超金額" if mode == "positive" else "淨買超金額"
-        share_key = "單純買超股數" if mode == "positive" else "淨買超股數"
-        rows = []
-
-        for agg in ranking.values():
-            metric_value = int(agg.get(metric_key, 0) or 0)
-            if metric_value <= 0:
-                continue
-
-            top_broker, top_broker_amount, top3_text = _format_top_brokers_for_top20(
-                agg.get("分點統計", {}),
-                metric_key,
-                limit=3,
-            )
-
-            detail_items = []
-            for (wcode, wname), wstat in agg.get("權證明細", {}).items():
-                amount = int(wstat.get(metric_key, 0) or 0)
-                if amount <= 0:
-                    continue
-                detail_items.append((wcode, wname, amount))
-
-            detail_items = sorted(detail_items, key=lambda x: int(x[2]), reverse=True)[:20]
-            detail_text = "；".join([
-                f"{wcode} {wname}:{fmt_amount(amount)}"
-                for wcode, wname, amount in detail_items
-            ])
-
-            rows.append({
-                "日期": agg.get("日期", target_date),
-                "標的股": agg.get("標的股", ""),
-                "標的名稱": agg.get("標的名稱", ""),
-                "買進金額": int(agg.get("買進金額", 0) or 0),
-                "賣出金額": int(agg.get("賣出金額", 0) or 0),
-                "淨買超金額": int(agg.get("淨買超金額", 0) or 0),
-                "單純買超金額": int(agg.get("單純買超金額", 0) or 0),
-                "買進股數": int(agg.get("買進股數", 0) or 0),
-                "賣出股數": int(agg.get("賣出股數", 0) or 0),
-                "排行買超股數": int(agg.get(share_key, 0) or 0),
-                "排行買超張數": int((agg.get(share_key, 0) or 0) // 1000),
-                "涵蓋權證數": len(agg.get("涵蓋權證", set())),
-                "涵蓋分點數": len(agg.get("涵蓋分點", set())),
-                "買超第一分點": top_broker,
-                "買超第一分點金額": int(top_broker_amount or 0),
-                "買超前三分點": top3_text,
-                "權證買超明細": detail_text,
-                "排行金額": metric_value,
-            })
-
-        rows = sorted(rows, key=lambda x: int(x.get("排行金額", 0)), reverse=True)[:20]
-
-        for idx, row in enumerate(rows, 1):
-            row["排名"] = idx
-
-        return rows
-
-    net_rows = make_rows("net")
-    positive_rows = make_rows("positive")
-
-    print(f"  ✅ 全市場每日標的淨買超 TOP20：{len(net_rows):,} 筆")
-    print(f"  ✅ 全市場每日標的單純買超 TOP20：{len(positive_rows):,} 筆")
-
-    return net_rows, positive_rows, target_date
-
-
-def build_daily_underlying_top20_rows(items, mode="positive", target_date=""):
-    """
-    保留舊版函式作為備援。
-
-    注意：新版 Excel 預設不使用這個函式，因為它只會根據 items 內已有的分點資料彙總，
-    會受 RUN_MODE / TARGET_PATTERNS / 歷史快取完整度影響，不符合「全市場、不限分點」的 TOP20 需求。
-    """
-    if not items:
-        return [], target_date or ""
-
-    if not target_date:
-        target_date = _latest_trade_date_from_items(items)
-
-    if not target_date:
-        return [], ""
-
-    ranking = {}
-
-    for item in items:
-        df = item.get("df")
-        if df is None or df.empty:
-            continue
-
-        wcode = str(item.get("warrant_code", "")).strip()
-        wname = str(item.get("warrant_name", "")).strip()
-        ucode = str(item.get("underlying_code", "")).strip()
-        uname = str(item.get("underlying_name", "")).strip()
-        broker_label = str(item.get("broker_label", "")).strip()
-        broker_name = str(item.get("broker_name", "")).strip()
-
-        if not ucode:
-            continue
-
-        day_df = df[df["日期"].map(normalize_date_str) == target_date].copy()
-        if day_df.empty:
-            continue
-
-        for row in day_df.itertuples(index=False):
-            row_dict = row._asdict()
-            buy_amount = int(row_dict.get("買進金額", 0) or 0)
-            sell_amount = int(row_dict.get("賣出金額", 0) or 0)
-            buy_shares = int(row_dict.get("買進股數", 0) or 0)
-            sell_shares = int(row_dict.get("賣出股數", 0) or 0)
-            net_amount = int(row_dict.get("買超金額", buy_amount - sell_amount) or 0)
-            net_shares = int(row_dict.get("買超股數", buy_shares - sell_shares) or 0)
-
-            if mode == "positive":
-                if net_amount <= 0:
-                    continue
-                add_amount = net_amount
-                add_shares = max(net_shares, 0)
-            else:
-                add_amount = net_amount
-                add_shares = net_shares
-
-            rec = ranking.setdefault((ucode, uname), {
-                "日期": target_date,
-                "標的股": ucode,
-                "標的名稱": uname,
-                "買進金額": 0,
-                "賣出金額": 0,
-                "買超金額": 0,
-                "買進股數": 0,
-                "賣出股數": 0,
-                "買超股數": 0,
-                "涵蓋權證": set(),
-                "明細": [],
-            })
-
-            rec["買進金額"] += buy_amount
-            rec["賣出金額"] += sell_amount
-            rec["買超金額"] += add_amount
-            rec["買進股數"] += buy_shares
-            rec["賣出股數"] += sell_shares
-            rec["買超股數"] += add_shares
-            if wcode:
-                rec["涵蓋權證"].add(wcode)
-
-            if add_amount != 0:
-                rec["明細"].append({
-                    "權證代號": wcode,
-                    "權證名稱": wname,
-                    "分點": broker_label or broker_name,
-                    "金額": add_amount,
-                })
-
-    rows = []
-    for rec in ranking.values():
-        if rec["買超金額"] <= 0:
-            continue
-
-        details = sorted(rec["明細"], key=lambda x: abs(int(x.get("金額", 0))), reverse=True)[:20]
-        detail_text = "；".join([
-            f'{d.get("權證代號", "")} {d.get("權證名稱", "")} {d.get("分點", "")}:{fmt_amount(d.get("金額", 0))}'
-            for d in details
-            if d.get("權證代號")
-        ])
-
-        rows.append({
-            "日期": rec["日期"],
-            "標的股": rec["標的股"],
-            "標的名稱": rec["標的名稱"],
-            "買進金額": rec["買進金額"],
-            "賣出金額": rec["賣出金額"],
-            "排行金額": rec["買超金額"],
-            "買進股數": rec["買進股數"],
-            "賣出股數": rec["賣出股數"],
-            "排行買超股數": rec["買超股數"],
-            "排行買超張數": int(rec["買超股數"] // 1000),
-            "涵蓋權證數": len(rec["涵蓋權證"]),
-            "涵蓋分點數": 0,
-            "買超第一分點": "",
-            "買超第一分點金額": 0,
-            "買超前三分點": "",
-            "權證買超明細": detail_text,
-        })
-
-    rows = sorted(rows, key=lambda x: int(x.get("排行金額", 0)), reverse=True)[:20]
-
-    for idx, row in enumerate(rows, 1):
-        row["排名"] = idx
-
-    return rows, target_date
-
-
-def write_daily_underlying_top20_sheet(wb, rows=None, mode="positive", target_date=""):
-    sheet_name = "每日標的買超TOP20" if mode == "positive" else "每日標的淨買超TOP20"
-    ws = wb.create_sheet(sheet_name)
-
-    rows = rows or []
-
-    title = "全市場單純買超金額排名（只累加正買超，不限制分點）" if mode == "positive" else "全市場淨買超金額排名（買進 - 賣出，不限制分點）"
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=17)
-    ws.cell(1, 1).value = f"{sheet_name}｜{title}｜日期：{target_date or '-'}"
-    ws.cell(1, 1).font = Font(bold=True, size=13, color="000000")
-    ws.cell(1, 1).fill = YELLOW
-    ws.cell(1, 1).alignment = Alignment(horizontal="center", vertical="center")
-
-    ranking_header = "單純買超金額" if mode == "positive" else "淨買超金額"
-
-    headers = [
-        "排名", "日期", "標的股", "標的名稱",
-        "買進金額", "賣出金額", ranking_header,
-        "買進股數", "賣出股數", "排行買超股數", "排行買超張數",
-        "涵蓋權證數", "涵蓋分點數",
-        "買超第一分點", "買超第一分點金額", "買超前三分點", "權證買超明細"
-    ]
-    ws.append(headers)
-
-    for row in rows:
-        ranking_amount = int(row.get("單純買超金額", row.get("排行金額", 0)) or 0) if mode == "positive" else int(row.get("淨買超金額", row.get("排行金額", 0)) or 0)
-        ws.append([
-            row.get("排名", ""),
-            row.get("日期", ""),
-            row.get("標的股", ""),
-            row.get("標的名稱", ""),
-            int(row.get("買進金額", 0) or 0),
-            int(row.get("賣出金額", 0) or 0),
-            ranking_amount,
-            int(row.get("買進股數", 0) or 0),
-            int(row.get("賣出股數", 0) or 0),
-            int(row.get("排行買超股數", 0) or 0),
-            int(row.get("排行買超張數", 0) or 0),
-            int(row.get("涵蓋權證數", 0) or 0),
-            int(row.get("涵蓋分點數", 0) or 0),
-            row.get("買超第一分點", ""),
-            int(row.get("買超第一分點金額", 0) or 0),
-            row.get("買超前三分點", ""),
-            row.get("權證買超明細", ""),
-        ])
-
-    col_widths = [8, 12, 10, 14, 14, 14, 14, 14, 14, 14, 10, 12, 12, 24, 16, 60, 90]
-    style_sheet(ws, col_widths, header_row=2)
-    ws.freeze_panes = "A3"
-
-    for row in ws.iter_rows(min_row=3):
-        for cell in row:
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        row[15].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        row[16].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
 def build_daily_signal_excel(
     today_a_events,
@@ -8894,10 +8318,11 @@ def build_daily_signal_excel(
     精選 5 分點當日買賣超產圖模式專用 Excel。
 
     修正版重點：
-    1. 第一張「今日買賣超圖」仍讀 今日_A/B/C/D。
-    2. 第二張「近一個月 TOP15」與分點卡平均天數，不能讀到舊的完整表，
-       所以每日產圖模式也會同步輸出完整 A/B/C/D 與勝率統計。
-    3. 這裡只是把已經在記憶體中算好的完整 A→B→C→D 結果寫出，
+    1. 完整 A/B/C/D 是唯一主資料，會直接寫回原本的完整工作表。
+    2. 今日_A/B/C/D 只是從完整 A/B/C/D 篩出的今日圖卡資料。
+    3. 第二張「近一個月 TOP15」只讀完整 A/B/C/D，不讀今日表，
+       因此不會出現完整表 + 今日表重複加總。
+    4. 這裡只是把已經在記憶體中算好的完整 A→B→C→D 結果寫出，
        不會額外重抓完整 API5，也不會額外補完整歷史價格。
     """
     print("【Step 5】建立每日盤後產圖用 Excel...")
@@ -9122,34 +8547,6 @@ def latest_trade_date_from_items(items):
     return latest_str
 
 
-def filter_records_by_dates(daily_records, allowed_dates):
-    if not daily_records or not allowed_dates:
-        return []
-
-    allowed_dates = {normalize_date_str(d) for d in allowed_dates if str(d).strip()}
-
-    return [
-        row for row in daily_records
-        if normalize_date_str(row.get("日期", "")) in allowed_dates
-    ]
-
-
-def get_last_trade_dates_from_records(daily_records, target_date, count):
-    if not daily_records or not target_date:
-        return []
-
-    target_date = normalize_date_str(target_date)
-    dates = sorted({
-        normalize_date_str(row.get("日期", ""))
-        for row in daily_records
-        if str(row.get("日期", "")).strip()
-        and normalize_date_str(row.get("日期", "")) <= target_date
-    })
-
-    if count <= 0:
-        return dates
-
-    return dates[-count:]
 
 
 def filter_events_to_target_date(events, date_fields, target_date):
@@ -9407,7 +8804,9 @@ def main():
         return
 
     # 精選 5 分點當日買賣超產圖模式：
-    # 只使用本次 API5 新抓回來的最近資料建立 今日_A/B/C/D，不重算完整歷史勝率與排行。
+    # 使用更新後的完整原始分點歷史重算完整 A/B/C/D，
+    # 再從完整 A/B/C/D 篩出 今日_A/B/C/D。
+    # TOP15 只讀完整 A/B/C/D，不再把完整表與今日表混合，避免重複加總。
     if IS_DAILY_SIGNAL_MODE:
         # 每日產圖需要「今天最新 API5 資料 + 原本快取_分點歷史原始資料」一起判斷。
         # 因此不能再用 candidate_keys 限制今日_A/B/C/D 的資料來源。
