@@ -881,24 +881,55 @@ def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
     points = []
     df = ctx["plot_df"]
     latest = df.iloc[-1]
-    ma5, ma20 = float(latest["MA5"]), float(latest["MA20"])
     close = float(latest["Close"])
+    ma5 = float(latest["MA5"])
+    ma20 = float(latest["MA20"])
+    ma60 = float(latest["MA60"])
+    k9 = float(latest.get("K9", np.nan))
+    d9 = float(latest.get("D9", np.nan))
+
+    # 1) 技術面：支撐 / 趨勢
     if close >= ma5 >= ma20:
-        points.append(f"下週觀察：股價是否續守 5MA {ma5:.1f} 與 20MA {ma20:.1f}，若守穩則短線趨勢仍偏多。")
+        points.append(f"技術面：收盤 {close:.0f} 站上 5MA {ma5:.1f} 與 20MA {ma20:.1f}，下週先觀察短均是否延續上彎。")
     elif close >= ma20:
-        points.append(f"下週觀察：股價雖仍在月線 {ma20:.1f} 之上，但需留意 5MA {ma5:.1f} 能否重新站回。")
+        points.append(f"技術面：收盤 {close:.0f} 仍守 20MA {ma20:.1f}，但需觀察能否重新站回 5MA {ma5:.1f}。")
     else:
-        points.append(f"下週觀察：股價已接近或跌破月線 {ma20:.1f}，需留意支撐是否失守。")
+        points.append(f"技術面：收盤 {close:.0f} 低於 20MA {ma20:.1f}，下週需優先觀察月線是否轉為壓力。")
 
-    if ctx.get("total_net", 0) > 0:
-        points.append(f"籌碼觀察：本週權證淨流向 {fmt_money(ctx['total_net'])}，若下週續見淨買超，代表資金延續度佳。")
+    # 2) KD：過熱 / 鈍化 / 轉弱風險
+    if not pd.isna(k9) and not pd.isna(d9):
+        if k9 >= 80 and d9 >= 80:
+            points.append(f"動能面：KD 位於高檔（K {k9:.1f} / D {d9:.1f}），若股價續強可視為高檔鈍化，若跌破短均則留意轉弱。")
+        elif k9 > d9:
+            points.append(f"動能面：K 值 {k9:.1f} 高於 D 值 {d9:.1f}，短線動能仍在，但需搭配量能確認。")
+        else:
+            points.append(f"動能面：K 值 {k9:.1f} 低於 D 值 {d9:.1f}，下週需觀察是否重新黃金交叉。")
+
+    # 3) 權證籌碼：淨流向延續
+    net = float(ctx.get("total_net", 0))
+    if net > 0:
+        points.append(f"權證籌碼：本週淨買超 {fmt_money(net)}，下週若單日柱狀續紅且累計線上彎，代表追價資金延續。")
+    elif net < 0:
+        points.append(f"權證籌碼：本週淨賣超 {fmt_money(net)}，下週若仍續綠，需留意權證資金退潮與短線降溫。")
     else:
-        points.append(f"籌碼觀察：本週權證淨流向 {fmt_money(ctx['total_net'])}，若下週仍續賣超，需留意短線追價意願。")
+        points.append("權證籌碼：本週淨流向接近中性，下週需觀察是否出現連續兩日以上明確紅柱或綠柱。")
 
+    # 4) 分點集中度 / 代表分點
+    e = ctx.get("week_events")
+    if e is not None and not e.empty:
+        by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
+        if not by_branch.empty:
+            top_branch = str(by_branch.index[0])
+            top_amt = float(by_branch.iloc[0])
+            points.append(f"分點觀察：目前以「{top_branch}」領軍 {fmt_money(top_amt)}，下週需觀察是否續買或轉為調節。")
+
+    # 5) 新聞 / 事件，只補一則避免版面過滿
     news_points = build_news_points(ctx.get("stock_code", ""), stock_name, news_titles, ctx)
-    for p in news_points[:2]:
+    for p in news_points[:1]:
         points.append(p)
-    return points[:4]
+
+    return points[:5]
+
 
 def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, week_days: int = WEEK_TRADING_DAYS):
     plot_df = stock_df.tail(CHART_LOOKBACK).copy()
@@ -1178,11 +1209,21 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
     scaled = profile / profile.max()
     x_min, x_max = ax.get_xlim()
     width_max = (x_max - x_min) / scale
-    max_idx = int(np.argmax(profile))
+    sorted_idx = np.argsort(profile)[::-1]
+    max_idx = int(sorted_idx[0]) if len(sorted_idx) else -1
+    second_idx = int(sorted_idx[1]) if len(sorted_idx) > 1 else -1
     for i in range(n_bins):
         w = scaled[i] * width_max
-        rect_color = "#DC2626" if i == max_idx else color
-        ax.add_patch(Rectangle((x_min, centers[i] - height / 2), w, height, color=rect_color, alpha=alpha, zorder=0, clip_on=True))
+        if i == max_idx:
+            rect_color = "#DC2626"   # 第一大量：紅色
+            rect_alpha = 0.34
+        elif i == second_idx:
+            rect_color = "#F59E0B"   # 第二大量：橘色
+            rect_alpha = 0.30
+        else:
+            rect_color = color       # 其餘維持原本淺藍
+            rect_alpha = alpha
+        ax.add_patch(Rectangle((x_min, centers[i] - height / 2), w, height, color=rect_color, alpha=rect_alpha, zorder=0, clip_on=True))
     ax.set_xlim(x_min, x_max)
 
 
@@ -1227,18 +1268,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     key_points = build_key_points(ctx, stock_name)
     watch_points = build_watch_points(ctx, stock_name, news_titles)
 
-    fig = plt.figure(figsize=(26, 42), facecolor=BG)
+    fig = plt.figure(figsize=(26, 48), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.15, 1.95, 6.7, 2.25, 2.85, 4.45, 7.25, 5.15],
-                  hspace=0.30, wspace=0.25)
+                  height_ratios=[1.15, 1.95, 6.7, 2.25, 2.85, 4.45, 9.1, 7.0],
+                  hspace=0.28, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
     ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=46, fontweight="bold", ha="left", va="center")
-    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資料：相關認購權證 × 全部分點｜疑似對沖：8%標記、3%才過濾，預設不刪除｜資訊僅供教育參考", color=MUTED, fontsize=21, ha="left", va="center")
-    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=MUTED, fontsize=20, fontweight="bold", ha="right", va="center")
+    ax_header.text(0.01, 0.15, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=21, ha="left", va="center")
+    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=MUTED, fontsize=24, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
@@ -1293,9 +1334,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # KD only (週報版保留單一指標節省空間)
     kd_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
     style_ax(kd_ax, "KD 指標")
-    kd_ax.plot(x, plot_df["K9"], color=BLUE, linewidth=1.5, label=f"K9 {plot_df['K9'].iloc[-1]:.2f}")
-    kd_ax.plot(x, plot_df["D9"], color=ORANGE, linewidth=1.5, label=f"D9 {plot_df['D9'].iloc[-1]:.2f}")
-    kd_ax.plot(x, plot_df["J9"], color=LIME, linewidth=1.2, label=f"J9 {plot_df['J9'].iloc[-1]:.2f}")
+    kd_ax.plot(x, plot_df["K9"], color=BLUE, linewidth=2.2, label=f"K9 {plot_df['K9'].iloc[-1]:.2f}")
+    kd_ax.plot(x, plot_df["D9"], color=ORANGE, linewidth=2.2, label=f"D9 {plot_df['D9'].iloc[-1]:.2f}")
+    kd_ax.plot(x, plot_df["J9"], color=LIME, linewidth=1.9, label=f"J9 {plot_df['J9'].iloc[-1]:.2f}")
     kd_ax.axhline(80, color=RED, linestyle="--", linewidth=0.8, alpha=0.5)
     kd_ax.axhline(20, color=GREEN, linestyle="--", linewidth=0.8, alpha=0.5)
     kd_ax.legend(loc="upper left", frameon=False, fontsize=18, labelcolor=TEXT)
@@ -1318,7 +1359,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
         lim = max(abs(cmax), abs(cmin), 1.0)
         # 讓累計折線的 0 軸位於面板中間，避免折線貼在最下方
-        wnet_ax2.set_ylim(-lim * 1.15, lim * 1.15)
+        wnet_ax2.set_ylim(-lim * 2.05, lim * 2.05)
     wnet_ax2.tick_params(colors=MUTED, labelsize=14)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
@@ -1344,13 +1385,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     for x0, title, df_top, side_color in sections:
         ax_top.add_patch(FancyBboxPatch((x0, 0.025), 0.46, 0.955, transform=ax_top.transAxes,
                                         boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35))
-        ax_top.text(x0 + 0.02, 0.955, title, transform=ax_top.transAxes, color=side_color, fontsize=26, fontweight="bold", ha="left", va="top")
-        ax_top.text(x0 + 0.02, 0.875, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=17, ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.955, title, transform=ax_top.transAxes, color=side_color, fontsize=30, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.875, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=21, ha="left", va="top")
         if df_top.empty:
-            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=17, ha="left", va="center")
+            ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=21, ha="left", va="center")
         else:
             y = 0.755
-            row_gap = 0.145
+            row_gap = 0.147
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
                 amt = float(r["net_amount"])
@@ -1360,29 +1401,29 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 # rank circle
                 circ_x = x0 + 0.03
                 circ_y = y - 0.005
-                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=17, fontweight="bold",
+                ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=21, fontweight="bold",
                            ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.23", facecolor=GOLD, edgecolor=GOLD))
-                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=16, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=20, fontweight="bold", ha="right", va="center")
+                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=20, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=24, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:14]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, y - 0.058, rep, transform=ax_top.transAxes, color=MUTED, fontsize=16, ha="left", va="center")
-                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.105, y - 0.105], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
+                ax_top.text(x0 + 0.06, y - 0.060, rep, transform=ax_top.transAxes, color=MUTED, fontsize=20, ha="left", va="center")
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
                 y -= row_gap
 
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "下週觀察 / 重要消息")]:
-        ax_notes.add_patch(FancyBboxPatch((x0, 0.06), 0.46, 0.88, transform=ax_notes.transAxes,
+        ax_notes.add_patch(FancyBboxPatch((x0, 0.045), 0.46, 0.91, transform=ax_notes.transAxes,
                                           boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
-        ax_notes.text(x0 + 0.02, 0.88, title, transform=ax_notes.transAxes, color=GOLD, fontsize=26, fontweight="bold", ha="left", va="top")
-    y = 0.72
+        ax_notes.text(x0 + 0.02, 0.895, title, transform=ax_notes.transAxes, color=GOLD, fontsize=34, fontweight="bold", ha="left", va="top")
+    y = 0.735
     for p in key_points[:4]:
-        ax_notes.text(0.04, y, "• " + wrap_text(p, width=44, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
-        y -= 0.185
-    y = 0.72
-    for p in watch_points[:4]:
-        ax_notes.text(0.54, y, "• " + wrap_text(p, width=44, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
-        y -= 0.185
+        ax_notes.text(0.04, y, "• " + wrap_text(p, width=38, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
+        y -= 0.198
+    y = 0.735
+    for p in watch_points[:5]:
+        ax_notes.text(0.54, y, "• " + wrap_text(p, width=38, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=21, ha="left", va="top")
+        y -= 0.198
 
     # x ticks
     interval = max(1, len(x) // 12)
