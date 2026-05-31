@@ -3976,13 +3976,24 @@ def load_openapi_daily_cache_df(path, label="OpenAPI 防呆快取"):
     return df[OPENAPI_DAILY_CACHE_COLS].copy()
 
 
-def load_openapi_daily_file_df(path, label="OpenAPI 本地備援檔"):
-    """支援讀取先前下載的 JSON / CSV / XLSX OpenAPI 檔案，作為假日測試備援。"""
+def load_openapi_daily_file_df(path, label="OpenAPI 本地備援檔", force_market=None):
+    """支援讀取先前下載的 JSON / CSV / XLSX OpenAPI 檔案，作為假日測試備援。
+
+    force_market：
+    - 使用 OPENAPI_TWSE_FALLBACK_FILE 時強制標成「上市」
+    - 使用 OPENAPI_TPEX_FALLBACK_FILE 時強制標成「上櫃」
+
+    這個防呆很重要：
+    有些本地 CSV 可能已經被前一版測試程式加過「市場」欄，
+    或欄位格式已經是標準格式。若不強制指定，TWSE 檔可能被舊欄位內容誤判成上櫃，
+    造成 log 出現「上市 0、上櫃 19153」這種錯誤分類。
+    """
     path = str(path or "").strip()
     if not path:
         return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
 
     if not os.path.exists(path):
+        print(f"  ⚠️ {label} 找不到檔案：{path}")
         return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
 
     try:
@@ -3994,11 +4005,18 @@ def load_openapi_daily_file_df(path, label="OpenAPI 本地備援檔"):
         elif ext in (".xlsx", ".xls"):
             df = pd.read_excel(path, dtype=str).fillna("")
         else:
+            # utf-8-sig 可處理你本地下載 / pandas 輸出的 BOM CSV。
             df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
 
         out = normalize_openapi_daily_cache_df(df)
+
+        if force_market and not out.empty:
+            force_market = str(force_market).strip()
+            out["市場"] = force_market
+
         if not out.empty:
-            print(f"  ♻️ 已讀取 {label}：{path}，共 {len(out):,} 筆")
+            market_counts = out["市場"].value_counts(dropna=False).to_dict() if "市場" in out.columns else {}
+            print(f"  ♻️ 已讀取 {label}：{path}，共 {len(out):,} 筆，市場分布：{market_counts}")
         return out
     except Exception as e:
         print(f"  ⚠️ {label} 讀取失敗：{path}，原因：{type(e).__name__}: {e}")
@@ -4019,12 +4037,14 @@ def load_openapi_fallback_from_files():
     tpex_path = os.getenv("OPENAPI_TPEX_FALLBACK_FILE", "").strip()
 
     if twse_path:
-        twse_df = load_openapi_daily_file_df(twse_path, "OPENAPI_TWSE_FALLBACK_FILE")
+        # 分開指定的 TWSE 備援檔，一律強制標成「上市」。
+        twse_df = load_openapi_daily_file_df(twse_path, "OPENAPI_TWSE_FALLBACK_FILE", force_market="上市")
         if not twse_df.empty:
             frames.append(twse_df)
 
     if tpex_path:
-        tpex_df = load_openapi_daily_file_df(tpex_path, "OPENAPI_TPEX_FALLBACK_FILE")
+        # 分開指定的 TPEx 備援檔，一律強制標成「上櫃」。
+        tpex_df = load_openapi_daily_file_df(tpex_path, "OPENAPI_TPEX_FALLBACK_FILE", force_market="上櫃")
         if not tpex_df.empty:
             frames.append(tpex_df)
 
