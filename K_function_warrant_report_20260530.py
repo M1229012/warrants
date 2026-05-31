@@ -61,9 +61,6 @@ API5 = (
     "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
 )
 
-# MoneyDJ 個股法人持股 / 三大法人買賣超頁面
-MONEYDJ_INST_URL = "https://www.moneydj.com/Z/ZC/ZCL/ZCL.djhtm?a={code}"
-
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
@@ -445,227 +442,301 @@ def _to_lots(series: pd.Series) -> pd.Series:
     return s
 
 
-def _decode_moneydj_html(resp: requests.Response) -> str:
-    """MoneyDJ 舊頁面常見 Big5/CP950 編碼，這裡集中處理避免亂碼造成表格解析失敗。"""
-    candidates = []
-    if getattr(resp, "encoding", None):
-        candidates.append(resp.encoding)
-    if getattr(resp, "apparent_encoding", None):
-        candidates.append(resp.apparent_encoding)
-    candidates.extend(["big5", "cp950", "utf-8"])
-    raw = resp.content
-    for enc in candidates:
-        if not enc:
-            continue
-        try:
-            html = raw.decode(enc, errors="ignore")
-            if "法人" in html or "外資" in html or "投信" in html:
-                return html
-        except Exception:
-            continue
-    return raw.decode("utf-8", errors="ignore")
-
-
-def _parse_moneydj_signed_number(value) -> float:
-    """將 MoneyDJ 表格中的 +1,234 / -1,234 / 空白 / -- 轉成 float。"""
-    s = str(value or "").strip()
-    s = (
-        s.replace(",", "")
-         .replace("＋", "+")
-         .replace("－", "-")
-         .replace("−", "-")
-         .replace("\xa0", "")
-         .replace(" ", "")
-         .replace("　", "")
-    )
-    if not s or s in ("-", "--", "—"):
+def _clean_inst_number(value) -> float:
+    """將三大法人 API 回傳的字串數字轉成 float。"""
+    if value is None:
         return 0.0
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
-    if not m:
+    s = str(value).strip().replace(",", "").replace(" ", "").replace("　", "")
+    s = s.replace("--", "0").replace("－", "-")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if not s or s in ("-", "."):
         return 0.0
     try:
-        return float(m.group(0))
+        return float(s)
     except Exception:
         return 0.0
 
 
-def _parse_moneydj_inst_rows_from_tables(html: str) -> List[dict]:
+def _shares_to_lots(value) -> float:
+    """交易所三大法人日報欄位為股數，這裡統一轉成張。"""
+    return _clean_inst_number(value) / 1000.0
+
+
+def _find_field_index(fields, include_words, exclude_words=None):
+    """依欄位文字找 index，避免 TWSE / TPEx 欄名略有不同。"""
+    exclude_words = exclude_words or []
+    clean_fields = [str(f).replace(" ", "").replace("　", "") for f in fields]
+    for idx, f in enumerate(clean_fields):
+        if all(w in f for w in include_words) and not any(w in f for w in exclude_words):
+            return idx
+    return None
+
+
+def _extract_inst_row_from_payload(payload, stock_code: str, date_dt: datetime):
+    """從 TWSE / TPEx JSON 裡找出指定股票的三大法人買賣超。"""
+    stock_code = str(stock_code).strip()
+    tables = []
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("tables"), list):
+            for t in payload.get("tables", []):
+                if isinstance(t, dict):
+                    fields = t.get("fields") or t.get("columns") or []
+                    data = t.get("data") or t.get("aaData") or []
+                    tables.append((fields, data))
+        fields = payload.get("fields") or payload.get("columns") or []
+        data = payload.get("data") or payload.get("aaData") or []
+        if data:
+            tables.append((fields, data))
+    elif isinstance(payload, list):
+        tables.append(([], payload))
+
+    for fields, rows in tables:
+        if not rows:
+            continue
+
+        for row in rows:
+            # dict 格式
+            if isinstance(row, dict):
+                code = str(row.get("證券代號", row.get("代號", row.get("股票代號", row.get("stock_id", ""))))).strip()
+                if code != stock_code:
+                    continue
+
+                def pick_dict(include_words, exclude_words=None):
+                    exclude_words = exclude_words or []
+                    for k, v in row.items():
+                        kk = str(k).replace(" ", "").replace("　", "")
+                        if all(w in kk for w in include_words) and not any(w in kk for w in exclude_words):
+                            return v
+                    return 0
+
+                foreign_v = pick_dict(["外", "買賣超"], ["外資自營商"])
+                invest_v = pick_dict(["投信", "買賣超"])
+                dealer_v = pick_dict(["自營商", "買賣超"], ["外資", "自行", "避險"])
+                if _clean_inst_number(dealer_v) == 0:
+                    dealer_v = _clean_inst_number(pick_dict(["自營商", "自行", "買賣超"], ["外資"])) + _clean_inst_number(pick_dict(["自營商", "避險", "買賣超"], ["外資"]))
+                    dealer_lots = dealer_v / 1000.0
+                else:
+                    dealer_lots = _shares_to_lots(dealer_v)
+                total_v = pick_dict(["三大法人", "買賣超"])
+                foreign_lots = _shares_to_lots(foreign_v)
+                invest_lots = _shares_to_lots(invest_v)
+                total_lots = _shares_to_lots(total_v) if _clean_inst_number(total_v) != 0 else foreign_lots + invest_lots + dealer_lots
+                return {
+                    "Date": pd.Timestamp(date_dt).normalize(),
+                    "foreign": foreign_lots,
+                    "invest": invest_lots,
+                    "dealer": dealer_lots,
+                    "total": total_lots,
+                }
+
+            # list 格式
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            code = str(row[0]).strip()
+            if code != stock_code:
+                continue
+
+            fields = list(fields or [])
+            if not fields:
+                # 若沒有欄位名稱，無法安全判斷，不硬猜，避免欄位錯置。
+                continue
+
+            foreign_idx = _find_field_index(fields, ["外", "買賣超"], ["外資自營商"])
+            invest_idx = _find_field_index(fields, ["投信", "買賣超"])
+            dealer_idx = _find_field_index(fields, ["自營商", "買賣超"], ["外資", "自行", "避險"])
+            dealer_self_idx = _find_field_index(fields, ["自營商", "自行", "買賣超"], ["外資"])
+            dealer_hedge_idx = _find_field_index(fields, ["自營商", "避險", "買賣超"], ["外資"])
+            total_idx = _find_field_index(fields, ["三大法人", "買賣超"])
+
+            def get_idx(idx):
+                if idx is None or idx >= len(row):
+                    return 0
+                return row[idx]
+
+            foreign_lots = _shares_to_lots(get_idx(foreign_idx))
+            invest_lots = _shares_to_lots(get_idx(invest_idx))
+            if dealer_idx is not None:
+                dealer_lots = _shares_to_lots(get_idx(dealer_idx))
+            else:
+                dealer_lots = (_clean_inst_number(get_idx(dealer_self_idx)) + _clean_inst_number(get_idx(dealer_hedge_idx))) / 1000.0
+            total_lots = _shares_to_lots(get_idx(total_idx)) if total_idx is not None else foreign_lots + invest_lots + dealer_lots
+
+            return {
+                "Date": pd.Timestamp(date_dt).normalize(),
+                "foreign": foreign_lots,
+                "invest": invest_lots,
+                "dealer": dealer_lots,
+                "total": total_lots,
+            }
+    return None
+
+
+def _fetch_twse_inst_one_day(stock_code: str, date_dt: datetime):
+    """上市股票：從 TWSE 三大法人買賣超日報抓指定股票。"""
+    date_s = pd.Timestamp(date_dt).strftime("%Y%m%d")
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_s}&selectType=ALLBUT0999&response=json",
+        f"https://www.twse.com.tw/fund/T86?date={date_s}&selectType=ALLBUT0999&response=json",
+    ]
+    for url in urls:
+        try:
+            r = get_thread_session().get(url, headers=HDR, timeout=(6, 18))
+            if r.status_code != 200:
+                continue
+            payload = r.json()
+            if isinstance(payload, dict) and payload.get("stat") not in (None, "OK"):
+                continue
+            rec = _extract_inst_row_from_payload(payload, stock_code, date_dt)
+            if rec is not None:
+                return rec
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_tpex_inst_one_day(stock_code: str, date_dt: datetime):
+    """上櫃股票：從 TPEx 三大法人買賣明細資訊抓指定股票。"""
+    dt = pd.Timestamp(date_dt)
+    roc_s = f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
+    greg_s = dt.strftime("%Y/%m/%d")
+    urls = [
+        f"https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade?date={greg_s}&type=Daily&response=json",
+        f"https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade?date={roc_s}&type=Daily&response=json",
+        f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={roc_s}&s=0,asc",
+        f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={greg_s}&s=0,asc",
+    ]
+    headers = dict(HDR)
+    headers["Referer"] = "https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/detail/day.html"
+    for url in urls:
+        try:
+            r = get_thread_session().get(url, headers=headers, timeout=(6, 18))
+            if r.status_code != 200:
+                continue
+            payload = r.json()
+            rec = _extract_inst_row_from_payload(payload, stock_code, date_dt)
+            if rec is not None:
+                return rec
+        except Exception:
+            continue
+    return None
+
+
+def fetch_inst_from_exchange_api(stock_code: str, days: int = 80, end_date=None) -> pd.DataFrame:
     """
-    從 MoneyDJ 個股法人持股頁解析三大法人買賣超。
-    MoneyDJ ZCL 表格常見欄位順序：
-    日期、外資不含自營、外資自營、投信、自營商自行買賣、自營商避險、總合、...
-    本函式會把：
-      foreign = 外資不含自營 + 外資自營
-      invest  = 投信
-      dealer  = 自營商自行買賣 + 自營商避險
-    單位維持 MoneyDJ 表格的「張」。
+    不依賴 X_function，直接從交易所公開日報 API 抓三大法人買賣超。
+    - TWSE：三大法人買賣超日報 T86
+    - TPEx：三大法人買賣明細資訊 dailyTrade / 舊版 3itrade_hedge_result
+    單位統一為張。
     """
+    end_dt = pd.Timestamp(end_date).to_pydatetime() if end_date is not None else datetime.now()
     rows = []
-
-    # 先用 pandas.read_html，GitHub Actions 常見環境可直接解析。
-    table_rows = []
-    try:
-        for tbl in pd.read_html(io.StringIO(html)):
-            if tbl is None or tbl.empty:
-                continue
-            for _, r in tbl.iterrows():
-                table_rows.append([str(v).strip() for v in r.tolist()])
-    except Exception:
-        table_rows = []
-
-    # 若 read_html 失敗，使用內建 HTMLParser 做備援，不額外依賴 bs4/lxml。
-    if not table_rows:
-        from html.parser import HTMLParser
-
-        class _TableParser(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.in_cell = False
-                self.current_cell = []
-                self.current_row = []
-                self.rows = []
-
-            def handle_starttag(self, tag, attrs):
-                if tag.lower() in ("td", "th"):
-                    self.in_cell = True
-                    self.current_cell = []
-
-            def handle_data(self, data):
-                if self.in_cell:
-                    self.current_cell.append(data)
-
-            def handle_endtag(self, tag):
-                tag = tag.lower()
-                if tag in ("td", "th") and self.in_cell:
-                    cell = "".join(self.current_cell).strip()
-                    self.current_row.append(re.sub(r"\s+", " ", cell))
-                    self.current_cell = []
-                    self.in_cell = False
-                elif tag == "tr":
-                    if self.current_row:
-                        self.rows.append(self.current_row)
-                    self.current_row = []
-
-        parser = _TableParser()
-        try:
-            parser.feed(html)
-            table_rows = parser.rows
-        except Exception:
-            table_rows = []
-
-    for row in table_rows:
-        if not row:
+    # 用日曆日多抓一點，避開假日 / 國定假日 / API 無資料日。
+    max_back_days = int(days * 2.4) + 20
+    for offset in range(max_back_days + 1):
+        d = end_dt - timedelta(days=offset)
+        # 週末通常沒有資料，略過可減少請求數。
+        if d.weekday() >= 5:
             continue
-
-        # 找日期欄位，避免把表頭或合計列誤判成資料列。
-        date_idx = -1
-        date_text = ""
-        for idx, cell in enumerate(row):
-            m = re.search(r"\d{4}/\d{1,2}/\d{1,2}", str(cell))
-            if m:
-                date_idx = idx
-                date_text = m.group(0)
+        rec = _fetch_twse_inst_one_day(stock_code, d)
+        if rec is None:
+            rec = _fetch_tpex_inst_one_day(stock_code, d)
+        if rec is not None:
+            rows.append(rec)
+            if len(rows) >= days:
                 break
-        if date_idx < 0:
-            continue
-
-        dt = parse_date(date_text)
-        if not dt:
-            continue
-
-        # 日期同一格後面若被黏到數字，也一起補進 numeric source。
-        date_cell = str(row[date_idx])
-        tail_after_date = re.sub(r"^.*?\d{4}/\d{1,2}/\d{1,2}", "", date_cell).strip()
-        numeric_sources = []
-        if tail_after_date:
-            numeric_sources.append(tail_after_date)
-        numeric_sources.extend(row[date_idx + 1:])
-
-        nums = []
-        for cell in numeric_sources:
-            s = str(cell or "").strip()
-            if not s:
-                continue
-            # 一格內有時會黏多個數字，全部拆出來。
-            for m in re.finditer(r"[-+＋－−]?\d[\d,]*(?:\.\d+)?", s.replace(" ", "")):
-                nums.append(_parse_moneydj_signed_number(m.group(0)))
-
-        if len(nums) >= 6:
-            foreign = nums[0] + nums[1]
-            invest = nums[2]
-            dealer = nums[3] + nums[4]
-            total = nums[5]
-        elif len(nums) >= 4:
-            foreign = nums[0]
-            invest = nums[1]
-            dealer = nums[2]
-            total = nums[3]
-        else:
-            continue
-
-        rows.append({
-            "Date": pd.Timestamp(dt).normalize(),
-            "foreign": float(foreign),
-            "invest": float(invest),
-            "dealer": float(dealer),
-            "total": float(total),
-        })
+        time.sleep(0.03)
 
     if not rows:
-        return []
-
-    # 同一天如果表格重複出現，只保留第一次解析到的資料。
-    out = pd.DataFrame(rows)
-    out = out.drop_duplicates(subset=["Date"], keep="first")
-    out = out.sort_values("Date")
-    return out.to_dict("records")
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).drop_duplicates(subset=["Date"]).sort_values("Date").tail(days).reset_index(drop=True)
+    print(f"✅ 交易所三大法人資料：{stock_code}，{len(out):,} 筆")
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
 
 
-def fetch_inst_60d_from_moneydj(stock_code: str, days: int = 80) -> pd.DataFrame:
-    """
-    從 MoneyDJ 個股法人持股頁抓三大法人買賣超。
-    回傳欄位: Date, foreign, invest, dealer, total，單位：張。
-    """
-    stock_code = str(stock_code).strip()
-    url = MONEYDJ_INST_URL.format(code=urllib.parse.quote(stock_code))
+def fetch_inst_from_finmind_direct(stock_code: str, days: int = 80, end_date=None) -> pd.DataFrame:
+    """備援：直接呼叫 FinMind 公開 API，不需要 X_function.py。"""
+    end_dt = pd.Timestamp(end_date).to_pydatetime() if end_date is not None else datetime.now()
+    start_dt = end_dt - timedelta(days=int(days * 2.5) + 20)
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": str(stock_code).strip(),
+        "start_date": start_dt.strftime("%Y-%m-%d"),
+        "end_date": end_dt.strftime("%Y-%m-%d"),
+    }
     try:
-        r = get_thread_session().get(url, headers=HDR, timeout=(8, 25))
+        r = get_thread_session().get(url, params=params, headers={"User-Agent": HDR["User-Agent"]}, timeout=(8, 25))
         r.raise_for_status()
-        html = _decode_moneydj_html(r)
-        rows = _parse_moneydj_inst_rows_from_tables(html)
-        if not rows:
-            print(f"⚠️ MoneyDJ 三大法人資料解析不到資料：{stock_code}")
+        payload = r.json()
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if not data:
             return pd.DataFrame()
-        out = pd.DataFrame(rows)
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-        out = out.dropna(subset=["Date"])
+        df = pd.DataFrame(data)
+        if df.empty or not {"date", "name"}.issubset(df.columns):
+            return pd.DataFrame()
+
+        buy_col = "buy" if "buy" in df.columns else "buy_amount" if "buy_amount" in df.columns else None
+        sell_col = "sell" if "sell" in df.columns else "sell_amount" if "sell_amount" in df.columns else None
+        if buy_col is None or sell_col is None:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        df["net"] = pd.to_numeric(df[buy_col], errors="coerce").fillna(0) - pd.to_numeric(df[sell_col], errors="coerce").fillna(0)
+        df["name_s"] = df["name"].astype(str)
+
+        def name_mask(keys):
+            m = pd.Series(False, index=df.index)
+            for k in keys:
+                m = m | df["name_s"].str.contains(k, case=False, regex=False, na=False)
+            return m
+
+        rows = []
+        for dt, sub in df.groupby("Date"):
+            foreign = sub.loc[name_mask(["Foreign", "外資", "外陸資"]), "net"].sum()
+            invest = sub.loc[name_mask(["Investment_Trust", "投信"]), "net"].sum()
+            dealer = sub.loc[name_mask(["Dealer", "自營商"]), "net"].sum()
+            rows.append({
+                "Date": pd.Timestamp(dt).normalize(),
+                "foreign": foreign,
+                "invest": invest,
+                "dealer": dealer,
+                "total": foreign + invest + dealer,
+            })
+        out = pd.DataFrame(rows).sort_values("Date").tail(days).reset_index(drop=True)
         for c in ["foreign", "invest", "dealer", "total"]:
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
-        out = out.sort_values("Date").tail(days).reset_index(drop=True)
-        print(f"✅ MoneyDJ 三大法人資料：{stock_code}，{len(out):,} 筆")
+            out[c] = _to_lots(out[c])
+        print(f"✅ FinMind 三大法人備援資料：{stock_code}，{len(out):,} 筆")
         return out[["Date", "foreign", "invest", "dealer", "total"]]
     except Exception as e:
-        print(f"⚠️ MoneyDJ 三大法人資料抓取失敗：{stock_code}，{e}")
+        print(f"⚠️ FinMind 直接抓取三大法人失敗：{e}")
         return pd.DataFrame()
 
 
-def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
+def fetch_inst_60d_from_x(stock_code: str, days: int = 80, end_date=None) -> pd.DataFrame:
     """
-    優先從 MoneyDJ 取回三大法人買賣超資料。
-    若 MoneyDJ 暫時解析失敗，才回退使用 X_function.get_institutional_stats_finmind。
-    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
+    取得三大法人買賣超，單位：張。
+    優先順序：
+    1. 交易所公開日報 API（TWSE / TPEx）
+    2. FinMind 直接 API
+    3. 原本的 X_function.get_institutional_stats_finmind
     """
-    moneydj_df = fetch_inst_60d_from_moneydj(stock_code, days=days)
-    if moneydj_df is not None and not moneydj_df.empty:
-        return moneydj_df
+    out = fetch_inst_from_exchange_api(stock_code, days=days, end_date=end_date)
+    if out is not None and not out.empty:
+        return out
+
+    out = fetch_inst_from_finmind_direct(stock_code, days=days, end_date=end_date)
+    if out is not None and not out.empty:
+        return out
 
     if get_institutional_stats_finmind is None:
-        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，且 MoneyDJ 也未取得資料，略過三大法人資料")
+        print("⚠️ 交易所 / FinMind 皆未取得三大法人資料，且找不到 X_function.get_institutional_stats_finmind，略過三大法人資料")
         return pd.DataFrame()
     try:
         inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
     except Exception as e:
-        print(f"⚠️ 三大法人資料抓取失敗：{e}")
+        print(f"⚠️ X_function 三大法人資料抓取失敗：{e}")
         return pd.DataFrame()
     if inst is None or inst.empty:
         return pd.DataFrame()
@@ -683,7 +754,6 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     out = out.sort_values("Date").tail(days).reset_index(drop=True)
     print(f"✅ X_function 三大法人備援資料：{stock_code}，{len(out):,} 筆")
     return out[["Date", "foreign", "invest", "dealer", "total"]]
-
 
 def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
     """三大法人買賣超（正負堆疊柱狀圖），單位：張。"""
@@ -1559,16 +1629,75 @@ def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, 
 
 
 def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
-    box = FancyBboxPatch((x, y), w, h, transform=ax.transAxes,
-                         boxstyle="round,pad=0.016,rounding_size=0.025",
-                         facecolor=PANEL2, edgecolor=GOLD, linewidth=1.5)
+    # 單張摘要卡片：保留獨立卡片感，並讓上方藏青色 band 與圓角外框貼齊。
+    rounding = 0.026
+    band_h = 0.078
+
+    box = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor=PANEL2,
+        edgecolor=GOLD,
+        linewidth=1.25,
+        zorder=1,
+    )
     ax.add_patch(box)
-    ax.add_patch(Rectangle((x, y + h - 0.066), w, 0.066, transform=ax.transAxes,
-                           facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
-    ax.text(x + w / 2, y + h - 0.15, label, transform=ax.transAxes, color=MUTED, fontsize=29, ha="center", va="top")
-    ax.text(x + w / 2, y + 0.30, value, transform=ax.transAxes, color=value_color, fontsize=42, fontweight="bold", ha="center", va="center")
+
+    # 上方藏青色 band：使用 Rectangle 並裁切到外框圓角，避免左右縮短或圓角不貼合。
+    band = Rectangle(
+        (x, y + h - band_h),
+        w,
+        band_h,
+        transform=ax.transAxes,
+        facecolor=GOLD,
+        edgecolor=GOLD,
+        linewidth=0,
+        alpha=0.96,
+        zorder=2,
+    )
+    band.set_clip_path(box)
+    ax.add_patch(band)
+
+    # 標題
+    ax.text(
+        x + w / 2,
+        y + h - 0.15,
+        label,
+        transform=ax.transAxes,
+        color=MUTED,
+        fontsize=29,
+        ha="center",
+        va="top",
+        zorder=4,
+    )
+
+    # 數字：固定同一水平線，避免每格看起來不整齊。
+    ax.text(
+        x + w / 2,
+        y + 0.30,
+        value,
+        transform=ax.transAxes,
+        color=value_color,
+        fontsize=42,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        zorder=4,
+    )
+
     if sub:
-        ax.text(x + w / 2, y + 0.10, sub, transform=ax.transAxes, color=MUTED, fontsize=22, ha="center", va="bottom")
+        ax.text(
+            x + w / 2,
+            y + 0.10,
+            sub,
+            transform=ax.transAxes,
+            color=MUTED,
+            fontsize=22,
+            ha="center",
+            va="bottom",
+            zorder=4,
+        )
 
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
@@ -1613,20 +1742,21 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
-    ax_cards = fig.add_subplot(gs[1, :]) 
+    ax_cards = fig.add_subplot(gs[1, :])
     ax_cards.set_axis_off()
 
-    card_w, gap = 0.15, 0.015
-    start_x = (1 - (5 * card_w + 4 * gap)) / 2
     cards = [
         ("本週股價", fmt_pct(ctx["stock_ret"]), "", RED if ctx["stock_ret"] >= 0 else GREEN),
         ("本週量能", fmt_pct(ctx["vol_change"]), "", RED if (not np.isnan(ctx["vol_change"]) and ctx["vol_change"] >= 0) else GREEN),
-        ("權證週淨流向", fmt_money(ctx["total_net"]),"", RED if ctx["total_net"] >= 0 else GREEN),
+        ("權證週淨流向", fmt_money(ctx["total_net"]), "", RED if ctx["total_net"] >= 0 else GREEN),
         ("本週買進", fmt_money_abs(ctx["total_buy"]), "", RED),
         ("本週賣出", fmt_money_abs(ctx["total_sell"]), "", GREEN),
     ]
+
+    card_w, gap = 0.183, 0.01
+    start_x = (1 - (len(cards) * card_w + (len(cards) - 1) * gap)) / 2
     for i, (lab, val, sub, col) in enumerate(cards):
-        draw_card(ax_cards, 0.01 + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
+        draw_card(ax_cards, start_x + i * (card_w + gap), 0.06, card_w, 0.88, lab, val, sub, col)
 
     # K line
     candle_ax = fig.add_subplot(gs[2, :])
@@ -1783,7 +1913,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         stock_df["Close_prev"] = stock_df["Close"].shift(1)
 
         # 三大法人資料：對齊股價日期，讓週報可顯示三大法人買賣超。
-        inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
+        inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80), end_date=stock_df.index.max())
         if inst_df is not None and not inst_df.empty:
             inst_df = inst_df.copy()
             inst_df["Date"] = pd.to_datetime(inst_df["Date"]).dt.tz_localize(None)
