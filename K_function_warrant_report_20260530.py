@@ -1707,17 +1707,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             zorder=12,
         )
 
-    draw_header_sep(wnet_ax, 0.145)
-    draw_header_bar(wnet_ax, 0.168, latest_bar_color)
-    draw_header_text(wnet_ax, 0.188, f"最新日 {fmt_money(latest_net)}", latest_bar_color)
+    draw_header_sep(wnet_ax, 0.115)
+    draw_header_bar(wnet_ax, 0.135, latest_bar_color)
+    draw_header_text(wnet_ax, 0.155, f"最新日 {fmt_money(latest_net)}", latest_bar_color)
 
-    draw_header_sep(wnet_ax, 0.335)
-    draw_header_line(wnet_ax, 0.358, week_color)
-    draw_header_text(wnet_ax, 0.398, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
+    draw_header_sep(wnet_ax, 0.305)
+    draw_header_line(wnet_ax, 0.325, week_color)
+    draw_header_text(wnet_ax, 0.365, f"本週合計 {fmt_money(ctx['total_net'])}", week_color)
 
-    draw_header_sep(wnet_ax, 0.600)
-    draw_header_line(wnet_ax, 0.623, BLUE)
-    draw_header_text(wnet_ax, 0.663, f"累計 {fmt_money(latest_cum)}", BLUE)
+    draw_header_sep(wnet_ax, 0.545)
+    draw_header_line(wnet_ax, 0.565, BLUE)
+    draw_header_text(wnet_ax, 0.605, f"累計 {fmt_money(latest_cum)}", BLUE)
 
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
