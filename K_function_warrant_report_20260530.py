@@ -1643,25 +1643,38 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     line_label = f"累計淨買賣超｜本週合計 {fmt_money(ctx['total_net'])}｜累計 {fmt_money(latest_cum)}"
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85, label=bar_label)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
+
+    # 柱狀圖 Y 軸自動貼合資料，但一定包含 0
+    if len(vals):
+        vmin = min(float(np.nanmin(vals)), 0.0)
+        vmax = max(float(np.nanmax(vals)), 0.0)
+        vspan = max(vmax - vmin, 1.0)
+        vpad = vspan * 0.15
+        wnet_ax.set_ylim(vmin - vpad, vmax + vpad)
+
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
     wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95, label=line_label)
-    
+
     if len(cum_vals):
-        cmax, cmin = float(np.nanmax(cum_vals)), float(np.nanmin(cum_vals))
+        cmax = max(float(np.nanmax(cum_vals)), 0.0)
+        cmin = min(float(np.nanmin(cum_vals)), 0.0)
 
-    # 自動貼合累計淨買賣超資料，並保留一點上下空間
-        top = max(cmax, 0)
-        bottom = min(cmin, 0)
-        span = top - bottom
+    # 取得柱狀圖 0 軸在畫面中的相對位置
+        y1_min, y1_max = wnet_ax.get_ylim()
+        zero_frac = (0 - y1_min) / (y1_max - y1_min)
 
-        if span <= 0:
-            span = max(abs(cmax), abs(cmin), 1.0)
+    # 避免極端情況
+        zero_frac = min(max(zero_frac, 0.05), 0.95)
 
-        pad = span * 0.18
-        wnet_ax2.set_ylim(bottom - pad, top + pad)
-        
+    # 讓折線圖右軸的 0 軸對齊柱狀圖 0 軸
+        upper_need = cmax / (1 - zero_frac) if (1 - zero_frac) > 0 else cmax
+        lower_need = abs(cmin) / zero_frac if zero_frac > 0 else abs(cmin)
+        scale = max(upper_need, lower_need, 1.0) * 1.12
+
+        wnet_ax2.set_ylim(-zero_frac * scale, (1 - zero_frac) * scale)
+    
     wnet_ax2.tick_params(colors=MUTED, labelsize=18)
     wnet_ax2.yaxis.set_major_formatter(FuncFormatter(money_tick))
     for spine in wnet_ax2.spines.values():
