@@ -1641,70 +1641,93 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
     latest_bar_color = RED if latest_net >= 0 else GREEN
 
-    # A 方案：不使用圖內 legend，改用圖表上方的圖示資訊列，避免擋住柱狀圖與折線。
-    info_y = 1.065
-    wnet_ax.add_patch(Rectangle(
-        (0.34, info_y - 0.028), 0.018, 0.048,
-        transform=wnet_ax.transAxes,
-        facecolor=latest_bar_color,
-        edgecolor=latest_bar_color,
-        linewidth=0,
-        alpha=0.90,
-        clip_on=False,
-        zorder=10,
-    ))
-    wnet_ax.text(
-        0.365, info_y, f"最新日 {fmt_money(latest_net)}",
-        transform=wnet_ax.transAxes,
-        color=TEXT,
-        fontsize=25,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        clip_on=False,
-        zorder=10,
+    # 膠囊資訊列：接續在「權證資金流」標題後方，取代圖內 legend，避免擋住柱狀圖與折線。
+    badge_y = 1.065
+    badge_h = 0.074
+    badge_start_x = 0.18
+    badge_gap = 0.018
+    latest_badge_w = 0.165
+    week_badge_w = 0.205
+    cum_badge_w = 0.165
+    week_color = RED if ctx["total_net"] >= 0 else GREEN
+
+    def draw_wnet_badge(ax, x0, width, text, text_color=TEXT, icon_kind="", icon_color=TEXT):
+        y0 = badge_y - badge_h / 2
+        badge = FancyBboxPatch(
+            (x0, y0), width, badge_h,
+            transform=ax.transAxes,
+            boxstyle="round,pad=0.004,rounding_size=0.022",
+            facecolor="#FFFFFF",
+            edgecolor=GRID,
+            linewidth=1.05,
+            alpha=0.96,
+            clip_on=False,
+            zorder=10,
+        )
+        ax.add_patch(badge)
+
+        text_x = x0 + 0.024
+        if icon_kind == "bar":
+            ax.add_patch(Rectangle(
+                (x0 + 0.018, badge_y - 0.016), 0.014, 0.032,
+                transform=ax.transAxes,
+                facecolor=icon_color,
+                edgecolor=icon_color,
+                linewidth=0,
+                alpha=0.92,
+                clip_on=False,
+                zorder=11,
+            ))
+            text_x = x0 + 0.041
+        elif icon_kind == "line":
+            ax.plot(
+                [x0 + 0.018, x0 + 0.046], [badge_y, badge_y],
+                transform=ax.transAxes,
+                color=icon_color,
+                linewidth=3.0,
+                alpha=0.95,
+                solid_capstyle="round",
+                clip_on=False,
+                zorder=11,
+            )
+            text_x = x0 + 0.056
+
+        ax.text(
+            text_x, badge_y, text,
+            transform=ax.transAxes,
+            color=text_color,
+            fontsize=22,
+            fontweight="bold",
+            ha="left",
+            va="center",
+            clip_on=False,
+            zorder=12,
+        )
+
+    draw_wnet_badge(
+        wnet_ax,
+        badge_start_x,
+        latest_badge_w,
+        f"最新日 {fmt_money(latest_net)}",
+        text_color=latest_bar_color,
+        icon_kind="bar",
+        icon_color=latest_bar_color,
     )
-    wnet_ax.plot(
-        [0.535, 0.575], [info_y, info_y],
-        transform=wnet_ax.transAxes,
-        color=BLUE,
-        linewidth=3.0,
-        alpha=0.95,
-        solid_capstyle="round",
-        clip_on=False,
-        zorder=10,
+    draw_wnet_badge(
+        wnet_ax,
+        badge_start_x + latest_badge_w + badge_gap,
+        week_badge_w,
+        f"本週合計 {fmt_money(ctx['total_net'])}",
+        text_color=week_color,
     )
-    wnet_ax.text(
-        0.585, info_y, f"本週合計 {fmt_money(ctx['total_net'])}",
-        transform=wnet_ax.transAxes,
-        color=TEXT,
-        fontsize=25,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        clip_on=False,
-        zorder=10,
-    )
-    wnet_ax.plot(
-        [0.765, 0.805], [info_y, info_y],
-        transform=wnet_ax.transAxes,
-        color=BLUE,
-        linewidth=3.0,
-        alpha=0.95,
-        solid_capstyle="round",
-        clip_on=False,
-        zorder=10,
-    )
-    wnet_ax.text(
-        0.815, info_y, f"累計 {fmt_money(latest_cum)}",
-        transform=wnet_ax.transAxes,
-        color=TEXT,
-        fontsize=25,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        clip_on=False,
-        zorder=10,
+    draw_wnet_badge(
+        wnet_ax,
+        badge_start_x + latest_badge_w + badge_gap + week_badge_w + badge_gap,
+        cum_badge_w,
+        f"累計 {fmt_money(latest_cum)}",
+        text_color=BLUE,
+        icon_kind="line",
+        icon_color=BLUE,
     )
 
     wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
