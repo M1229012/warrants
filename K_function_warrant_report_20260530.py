@@ -71,7 +71,7 @@ API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "250"))
 API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
-LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "0").strip().lower() not in ("0", "false", "no")
 GSHEET_FALLBACK_ENABLE = os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 # 疑似造市 / 避險對沖設定
@@ -87,6 +87,18 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip
 FULL_MARKET_CACHE_SHEET = os.getenv("WARRANT_FULL_MARKET_CACHE_SHEET", "快取_全市場分點歷史").strip()
 LEGACY_CACHE_SHEET = os.getenv("WARRANT_LEGACY_CACHE_SHEET", "快取_分點歷史").strip()
 USE_LEGACY_CACHE = os.getenv("WARRANT_USE_LEGACY_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# 快速全市場快取設定
+# 核心思路：不要每次一次抓完所有 權證×分點 的 API5，改成「分點組合快取 + 缺漏分批回補」。
+# 第一次跑 cache：建立/補充分點組合，並只抓前 N 組缺漏 API5。
+# 後續重跑 cache：自動跳過已經有歷史資料的 pair，接續抓未完成的 pair。
+FULL_MARKET_PAIR_CACHE_SHEET = os.getenv("WARRANT_FULL_MARKET_PAIR_CACHE_SHEET", "快取_全市場分點組合").strip()
+CACHE_MAX_API5_PAIRS_PER_RUN = int(os.getenv("WARRANT_CACHE_MAX_API5_PAIRS", os.getenv("WARRANT_CACHE_MAX_PAIRS_PER_RUN", "600")))
+CACHE_PAIR_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_CACHE_PAIR_SCAN_CALENDAR_DAYS", os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110")))
+CACHE_PAIR_RESCAN_ENABLE = os.getenv("WARRANT_CACHE_PAIR_RESCAN_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+CACHE_REFRESH_STALE_PAIRS = os.getenv("WARRANT_CACHE_REFRESH_STALE_PAIRS", "0").strip().lower() in ("1", "true", "yes", "on")
+CACHE_APPEND_ONLY = os.getenv("WARRANT_CACHE_APPEND_ONLY", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_APPEND_CHUNK_ROWS = int(os.getenv("WARRANT_GSHEET_APPEND_CHUNK_ROWS", "4000"))
 
 # OpenAPI 防呆：參考原權證回測程式的「TWSE + TPEx 最新成交認購權證」邏輯。
 # cache 模式會先抓官方即時 OpenAPI；若假日或其中一邊暫時空值，會改用此快取表備援，避免全市場資料少掉上市/上櫃。
@@ -768,6 +780,198 @@ def upsert_full_market_cache_to_gsheet(events: pd.DataFrame, sheet_name: str = F
         print(f"❌ 寫入 {sheet_name} 失敗：{e}")
         return 0
 
+
+PAIR_CACHE_COLUMNS = [
+    "標的股",
+    "標的名稱",
+    "權證代號",
+    "權證名稱",
+    "券商代號",
+    "分點",
+    "分點名稱",
+    "建立日期",
+    "更新時間",
+]
+
+
+def normalize_pair_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=PAIR_CACHE_COLUMNS)
+    df = raw_df.copy().fillna("")
+    for c in PAIR_CACHE_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[PAIR_CACHE_COLUMNS].copy()
+    df["標的股"] = df["標的股"].map(_clean_code)
+    df["權證代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
+    df["券商代號"] = df["券商代號"].astype(str).str.strip()
+    df["分點"] = df["分點"].astype(str).str.strip()
+    df["分點名稱"] = np.where(df["分點名稱"].astype(str).str.len() > 0, df["分點名稱"], df["分點"])
+    df = df[(df["標的股"].astype(str).str.len() > 0) & (df["權證代號"].astype(str).str.len() > 0) & (df["券商代號"].astype(str).str.len() > 0)].copy()
+    df = df.drop_duplicates(subset=["標的股", "權證代號", "券商代號", "分點"], keep="last")
+    return df.reset_index(drop=True)
+
+
+def pair_key(warrant_code, broker_code) -> tuple:
+    return (normalize_openapi_warrant_code(warrant_code), str(broker_code).strip())
+
+
+def pair_dict_key(p: dict) -> tuple:
+    return pair_key(p.get("warrant_code", p.get("權證代號", "")), p.get("broker_code", p.get("券商代號", "")))
+
+
+def read_full_market_pair_cache(stock_code: str) -> List[dict]:
+    raw = read_gsheet_worksheet(FULL_MARKET_PAIR_CACHE_SHEET)
+    df = normalize_pair_cache_df(raw)
+    if df.empty:
+        return []
+    stock_code = _clean_code(stock_code)
+    df = df[df["標的股"].astype(str) == stock_code].copy()
+    if df.empty:
+        return []
+    pairs = []
+    for _, r in df.iterrows():
+        pairs.append({
+            "warrant_code": normalize_openapi_warrant_code(r.get("權證代號", "")),
+            "warrant_name": str(r.get("權證名稱", "")).strip(),
+            "underlying_code": _clean_code(r.get("標的股", "")),
+            "underlying_name": str(r.get("標的名稱", "")).strip(),
+            "broker_code": str(r.get("券商代號", "")).strip(),
+            "branch": str(r.get("分點", "")).strip() or str(r.get("分點名稱", "")).strip(),
+        })
+    print(f"☁️ 已讀取 {FULL_MARKET_PAIR_CACHE_SHEET}：{stock_code} 共 {len(pairs):,} 組 權證×分點")
+    return pairs
+
+
+def append_full_market_pair_cache_to_gsheet(pair_list: List[dict], sheet_name: str = FULL_MARKET_PAIR_CACHE_SHEET) -> int:
+    if not pair_list:
+        return 0
+    sh = _open_gsheet()
+    if sh is None:
+        print("⚠️ 無法開啟 Google Sheet，略過分點組合快取寫入")
+        return 0
+    ws = _get_or_create_worksheet(sh, sheet_name, rows=max(len(pair_list) + 100, 1000), cols=len(PAIR_CACHE_COLUMNS) + 2)
+    try:
+        old_records = ws.get_all_records(empty2zero=False, head=1)
+        old_df = normalize_pair_cache_df(pd.DataFrame(old_records).fillna("")) if old_records else pd.DataFrame(columns=PAIR_CACHE_COLUMNS)
+    except Exception:
+        old_df = pd.DataFrame(columns=PAIR_CACHE_COLUMNS)
+
+    now_s = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    today_s = datetime.now().strftime("%Y/%m/%d")
+    new_rows = []
+    for p in pair_list:
+        new_rows.append({
+            "標的股": _clean_code(p.get("underlying_code", "")),
+            "標的名稱": str(p.get("underlying_name", "")).strip(),
+            "權證代號": normalize_openapi_warrant_code(p.get("warrant_code", "")),
+            "權證名稱": str(p.get("warrant_name", "")).strip(),
+            "券商代號": str(p.get("broker_code", "")).strip(),
+            "分點": str(p.get("branch", "")).strip(),
+            "分點名稱": str(p.get("branch", "")).strip(),
+            "建立日期": today_s,
+            "更新時間": now_s,
+        })
+    new_df = normalize_pair_cache_df(pd.DataFrame(new_rows))
+    if new_df.empty:
+        return 0
+    combined = normalize_pair_cache_df(pd.concat([old_df, new_df], ignore_index=True, sort=False).fillna(""))
+    values = [PAIR_CACHE_COLUMNS] + combined.astype(str).values.tolist()
+    try:
+        ws.clear()
+        ws.resize(rows=max(len(values) + 50, 1000), cols=len(PAIR_CACHE_COLUMNS))
+        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+        print(f"✅ 已寫入 {sheet_name}：新增/更新 {len(new_df):,} 組，表內總組數 {len(combined):,}")
+        return len(new_df)
+    except Exception as e:
+        print(f"⚠️ 寫入 {sheet_name} 失敗：{e}")
+        return 0
+
+
+def append_full_market_cache_to_gsheet(events: pd.DataFrame, sheet_name: str = FULL_MARKET_CACHE_SHEET) -> int:
+    """高速寫入模式：只 append 新資料，不整張表 clear/rewrite。
+
+    速度比 upsert 快很多。重複資料由讀取週報時 groupby 去重；
+    cache 模式也會先跳過已抓過的 pair，正常情況不會大量重複。
+    """
+    new_df = warrant_events_to_cache_df(events)
+    if new_df.empty:
+        print("⚠️ 沒有可 append 的全市場分點資料")
+        return 0
+    sh = _open_gsheet()
+    if sh is None:
+        print("❌ 無法開啟 Google Sheet，無法寫入全市場分點快取")
+        return 0
+    ws = _get_or_create_worksheet(sh, sheet_name, rows=max(len(new_df) + 100, 1000), cols=len(CACHE_COLUMNS) + 2)
+    try:
+        existing_values = ws.get_all_values()
+        if not existing_values:
+            ws.update(values=[CACHE_COLUMNS], range_name="A1", value_input_option="USER_ENTERED")
+        values = new_df.astype(str).values.tolist()
+        for start in range(0, len(values), max(1, GSHEET_APPEND_CHUNK_ROWS)):
+            chunk = values[start:start + max(1, GSHEET_APPEND_CHUNK_ROWS)]
+            ws.append_rows(chunk, value_input_option="USER_ENTERED")
+        print(f"✅ 已高速 append 到 {sheet_name}：{len(new_df):,} 筆")
+        return len(new_df)
+    except Exception as e:
+        print(f"❌ 高速 append 寫入 {sheet_name} 失敗：{e}")
+        return 0
+
+
+def get_existing_history_pair_max_dates(stock_code: str) -> Dict[tuple, pd.Timestamp]:
+    cached = load_cached_warrant_history(stock_code)
+    if cached is None or cached.empty:
+        return {}
+    out = {}
+    cached = cached.copy()
+    cached["Date"] = pd.to_datetime(cached["Date"], errors="coerce").dt.normalize()
+    cached = cached.dropna(subset=["Date"])
+    if cached.empty:
+        return {}
+    for (wcode, bcode), g in cached.groupby(["warrant_code", "broker_code"], dropna=False):
+        key = pair_key(wcode, bcode)
+        if key[0] and key[1]:
+            out[key] = pd.Timestamp(g["Date"].max()).normalize()
+    print(f"☁️ 既有歷史 pair：{len(out):,} 組，可自動跳過已抓過組合")
+    return out
+
+
+def merge_pair_lists(*pair_lists: List[dict]) -> List[dict]:
+    merged = {}
+    for pair_list in pair_lists:
+        for p in pair_list or []:
+            key = pair_dict_key(p)
+            if not key[0] or not key[1]:
+                continue
+            merged[key] = p
+    return list(merged.values())
+
+
+def select_pairs_to_fetch_fast(pair_list: List[dict], existing_pair_max_dates: Dict[tuple, pd.Timestamp], end_date) -> List[dict]:
+    if not pair_list:
+        return []
+    end_ts = pd.Timestamp(end_date).normalize()
+    missing = []
+    stale = []
+    for p in pair_list:
+        key = pair_dict_key(p)
+        if key not in existing_pair_max_dates:
+            missing.append(p)
+        elif CACHE_REFRESH_STALE_PAIRS and existing_pair_max_dates[key] < end_ts:
+            stale.append(p)
+
+    selected = missing + stale
+    total_need = len(selected)
+    if CACHE_MAX_API5_PAIRS_PER_RUN > 0 and len(selected) > CACHE_MAX_API5_PAIRS_PER_RUN:
+        selected = selected[:CACHE_MAX_API5_PAIRS_PER_RUN]
+    print(
+        f"⚡ 快速快取模式：全部 pairs={len(pair_list):,}，缺漏={len(missing):,}，需刷新={len(stale):,}，"
+        f"本次抓={len(selected):,}，剩餘約={max(total_need - len(selected), 0):,}"
+    )
+    if CACHE_MAX_API5_PAIRS_PER_RUN > 0 and total_need > len(selected):
+        print("   ℹ️ 為了避免單次 Action 跑超久，本次只抓一批；重跑 cache 會自動接續抓剩下的 pair。")
+    return selected
+
 # ============================================================
 # 權證全市場分點資料：OpenAPI 權證母體 + API4 分點 + API5 金額
 # ============================================================
@@ -1376,24 +1580,78 @@ def fetch_live_warrant_events_full_market(stock_code: str, stock_name: str, star
 
 
 def update_full_market_warrant_cache(stock_code: str) -> pd.DataFrame:
-    """給 GitHub Actions cache 模式使用：輸入股票代號後抓全市場權證分點買賣超，寫入 Google Sheet。"""
+    """給 GitHub Actions cache 模式使用：快速建立 / 回補全市場權證分點買賣超快取。
+
+    速度最快的做法：
+    1. 先讀「快取_全市場分點組合」，有 pair 就不重掃 API4。
+    2. 沒有 pair 或手動要求重掃時，才用 API4 掃 權證×分點。
+    3. 讀「快取_全市場分點歷史」找已抓過的 pair，自動跳過。
+    4. 本次只抓缺漏 pair 的前 N 組 API5，避免 Action 跑 1～2 小時。
+    5. 寫入 Google Sheet 採 append-only，不整張表重寫，速度差很多。
+    """
     stock_code = str(stock_code).strip()
     stock_name = get_tw_stock_name(stock_code)
     stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
     if stock_df is None or stock_df.empty:
         print(f"❌ 股價資料不足，無法決定快取區間：{stock_code}")
         return pd.DataFrame()
+
     stock_df = calculate_indicators(stock_df)
     plot_df = stock_df.tail(CHART_LOOKBACK)
     start_date = pd.Timestamp(plot_df.index.min()).normalize()
     end_date = pd.Timestamp(plot_df.index.max()).normalize()
     print(f"🚀 更新 {stock_code} {stock_name} 全市場權證分點快取，資料區間 {start_date.date()} ~ {end_date.date()}")
-    live = fetch_live_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
-    if live is None or live.empty:
-        print(f"⚠️ {stock_code} 沒有可寫入的全市場權證分點資料")
+    print(
+        f"⚡ 快速模式參數：pair_scan_days={CACHE_PAIR_SCAN_CALENDAR_DAYS}，"
+        f"max_api5_pairs={CACHE_MAX_API5_PAIRS_PER_RUN}，append_only={CACHE_APPEND_ONLY}，"
+        f"refresh_stale={CACHE_REFRESH_STALE_PAIRS}"
+    )
+
+    # 1) 先讀 pair 快取，避免每次都掃 API4。
+    cached_pairs = read_full_market_pair_cache(stock_code)
+
+    # 2) 只有 pair 快取不存在，或使用者明確要求重掃時，才掃 API4。
+    scanned_pairs = []
+    if (not cached_pairs) or CACHE_PAIR_RESCAN_ENABLE:
+        warrants = get_all_active_call_warrants(stock_code, stock_name)
+        target_dt = pd.Timestamp(end_date).to_pydatetime()
+        start_s = (target_dt - timedelta(days=max(1, CACHE_PAIR_SCAN_CALENDAR_DAYS) - 1)).strftime("%Y/%m/%d")
+        end_s = target_dt.strftime("%Y/%m/%d")
+        print(f"✅ API4 全分點掃描日期範圍：{start_s} ~ {end_s}（只建立分點組合，不直接抓全部 API5）")
+        scanned_pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
+        append_full_market_pair_cache_to_gsheet(scanned_pairs)
+
+    all_pairs = merge_pair_lists(cached_pairs, scanned_pairs)
+    if not all_pairs:
+        print(f"⚠️ {stock_code} 沒有掃到任何 權證×分點 組合")
         return pd.DataFrame()
-    written = upsert_full_market_cache_to_gsheet(live, sheet_name=FULL_MARKET_CACHE_SHEET)
-    print(f"✅ {stock_code} 全市場權證分點快取完成：抓到 {len(live):,} 筆，寫入/更新 {written:,} 筆")
+
+    # 3) 讀既有歷史快取，跳過已經抓過的 pair。
+    existing_pair_dates = get_existing_history_pair_max_dates(stock_code)
+    pairs_to_fetch = select_pairs_to_fetch_fast(all_pairs, existing_pair_dates, end_date)
+
+    if not pairs_to_fetch:
+        cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
+        if cached is not None and not cached.empty:
+            print(f"✅ {stock_code} 目前沒有缺漏 pair，本次不需 API5；既有快取 {len(cached):,} 筆")
+            return cached
+        print(f"⚠️ {stock_code} 沒有需要抓的 pair，但也沒有既有歷史資料")
+        return pd.DataFrame()
+
+    # 4) 只回補本批缺漏 pair。這是最省時間的關鍵。
+    live = fetch_api5_events_for_pairs(pairs_to_fetch, start_date=start_date, end_date=end_date)
+    if live is None or live.empty:
+        print(f"⚠️ {stock_code} 本批 API5 沒有抓到可寫入資料")
+        return pd.DataFrame()
+
+    # 5) Google Sheet 寫入使用 append-only，避免整張表重寫。
+    if CACHE_APPEND_ONLY:
+        written = append_full_market_cache_to_gsheet(live, sheet_name=FULL_MARKET_CACHE_SHEET)
+    else:
+        written = upsert_full_market_cache_to_gsheet(live, sheet_name=FULL_MARKET_CACHE_SHEET)
+
+    print(f"✅ {stock_code} 快速全市場權證分點快取完成：本批抓到 {len(live):,} 筆，寫入 {written:,} 筆")
+    print("ℹ️ 若仍有剩餘 pair，請重跑 cache；程式會自動跳過已完成 pair，接續補剩下資料。")
     return live
 
 
