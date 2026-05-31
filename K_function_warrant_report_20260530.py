@@ -1388,16 +1388,16 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.15, 2.05, 6.9, 2.6, 3.3, 5.2, 10.6, 8.3],
+                  height_ratios=[1.45, 2.05, 6.9, 2.6, 3.3, 5.2, 10.6, 8.3],
                   hspace=0.24, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
-    ax_header.text(0.01, 0.62, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
+    ax_header.text(0.01, 0.65, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
     ax_header.text(0.01, 0.05, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=32, ha="left", va="center")
-    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=36, fontweight="bold", ha="right", va="center")
+    ax_header.text(0.99, 0.65, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :]); ax_cards.set_axis_off()
