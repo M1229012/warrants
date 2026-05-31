@@ -8873,12 +8873,32 @@ def write_daily_underlying_top20_sheet(wb, rows=None, mode="positive", target_da
         row[15].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         row[16].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, today_d_events, today_item_map, price_cache, output_path, today_items=None):
+def build_daily_signal_excel(
+    today_a_events,
+    today_b_events,
+    today_c_events,
+    today_d_events,
+    today_item_map,
+    price_cache,
+    output_path,
+    today_items=None,
+    full_a_events=None,
+    full_b_events=None,
+    full_c_events=None,
+    full_d_events=None,
+    full_item_map=None,
+    full_items=None,
+    write_image_support_full_sheets=True,
+):
     """
     精選 5 分點當日買賣超產圖模式專用 Excel。
 
-    這個模式只輸出今日圖片 / 推播需要的工作表，不重寫主 A/B/C/D、勝率、排行等完整歷史結果表，
-    因此可避免每天盤後產圖時把舊結果表洗掉，也能大幅減少完整回測與歷史補價時間。
+    修正版重點：
+    1. 第一張「今日買賣超圖」仍讀 今日_A/B/C/D。
+    2. 第二張「近一個月 TOP15」與分點卡平均天數，不能讀到舊的完整表，
+       所以每日產圖模式也會同步輸出完整 A/B/C/D 與勝率統計。
+    3. 這裡只是把已經在記憶體中算好的完整 A→B→C→D 結果寫出，
+       不會額外重抓完整 API5，也不會額外補完整歷史價格。
     """
     print("【Step 5】建立每日盤後產圖用 Excel...")
 
@@ -8897,10 +8917,28 @@ def build_daily_signal_excel(today_a_events, today_b_events, today_c_events, tod
     write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
 
-    # 每日產圖模式也要同步更新「每日賣出明細」，
-    # 否則產圖程式會讀到舊的賣出明細，導致圖片賣方資訊錯誤。
-    daily_sell_items = today_items or list(today_item_map.values())
-    write_daily_sell_detail_sheet(wb, daily_sell_items, today_a_events, today_b_events, today_c_events, today_d_events)
+    # 圖片支援用完整表：
+    # notify_discord.py 的第二張 TOP15、分點卡平均天數、賣出事件對照仍需要完整 A/B/C/D 與勝率統計。
+    # 若每日產圖只更新 今日_*，圖片就會混到舊的完整表，造成 TOP15 停在前一交易日或平均天數錯誤。
+    full_a_events = full_a_events if full_a_events is not None else today_a_events
+    full_b_events = full_b_events if full_b_events is not None else today_b_events
+    full_c_events = full_c_events if full_c_events is not None else today_c_events
+    full_d_events = full_d_events if full_d_events is not None else today_d_events
+    full_item_map = full_item_map if full_item_map is not None else today_item_map
+    full_items = full_items if full_items is not None else (today_items or list(today_item_map.values()))
+
+    if write_image_support_full_sheets:
+        print("  ✅ 每日產圖同步更新完整 A/B/C/D 與勝率統計，避免圖片 TOP15 / 分點卡讀到舊資料。")
+        write_a_sheet(wb, full_a_events, full_item_map, price_cache)
+        write_group_sheet(wb, "B_同標的單日合計", full_b_events, price_cache, is_c=False)
+        write_group_sheet(wb, "C_同標的3日累積", full_c_events, price_cache, is_c=True)
+        write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", full_d_events, price_cache, is_c=True)
+        write_stats_sheet(wb, full_a_events, full_b_events, full_c_events, full_d_events)
+
+    # 每日產圖模式也要同步更新「每日賣出明細」。
+    # 這裡必須使用完整歷史 full_items + 完整 A/B/C/D 事件對照，
+    # 否則今日賣方圖卡會只吃到今日事件，漏掉歷史事件在今日的減碼 / 出清。
+    write_daily_sell_detail_sheet(wb, full_items, full_a_events, full_b_events, full_c_events, full_d_events)
 
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
@@ -9447,6 +9485,13 @@ def main():
             price_cache,
             output_path,
             today_items=today_items,
+            full_a_events=calc_a_events,
+            full_b_events=calc_b_events,
+            full_c_events=calc_c_events,
+            full_d_events=calc_d_events,
+            full_item_map=today_item_map,
+            full_items=today_items,
+            write_image_support_full_sheets=True,
         )
         upload_excel_to_google_sheet(output_path)
 
