@@ -1860,7 +1860,18 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
 
-    def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
+    # 記錄已經從「快取_分點歷史」扣過的賣出金額。
+    # 後面再用「每日賣出明細」補扣目標日資料時，只補扣每日明細比快取多出的差額，
+    # 避免同一筆賣出被重複扣兩次。
+    deducted_sell_amounts: dict[tuple[date, str, str, str], float] = defaultdict(float)
+
+    def apply_sell_deduction_from_df(
+        sell_df: pd.DataFrame,
+        code_col_candidates: list[str],
+        *,
+        supplement_existing: bool = False,
+        target_only: bool = False,
+    ):
         """
         TOP15 賣方扣減規則：
         1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
@@ -1874,8 +1885,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if sell_df.empty:
             return
 
-        sell_period_start = min(trading_dates)
-        sell_period_end = target
+        if target_only:
+            sell_period_start = target
+            sell_period_end = target
+        else:
+            sell_period_start = min(trading_dates)
+            sell_period_end = target
 
         usable_sell_rows = []
         non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
@@ -1924,8 +1939,22 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_keys:
                 continue
 
-            agg[code]["net_amount"] -= amount
-            agg[code]["broker_net_amounts"][broker] -= amount
+            deduction_key = (d, broker, code, warrant_code)
+
+            if supplement_existing:
+                # 每日賣出明細常會比快取_分點歷史更新；
+                # 若同一日期/分點/標的/權證在快取已扣過，只補扣每日明細多出的差額。
+                already_deducted = safe_float(deducted_sell_amounts.get(deduction_key, 0), 0)
+                deduction_amount = amount - already_deducted
+                if deduction_amount <= 0:
+                    continue
+                deducted_sell_amounts[deduction_key] = already_deducted + deduction_amount
+            else:
+                deduction_amount = amount
+                deducted_sell_amounts[deduction_key] += deduction_amount
+
+            agg[code]["net_amount"] -= deduction_amount
+            agg[code]["broker_net_amounts"][broker] -= deduction_amount
 
     def ensure_item(underlying, warrant_text=""):
         code = normalize_underlying(underlying, warrant_text)
@@ -2076,19 +2105,25 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     except Exception:
         pass
 
-    # 舊版主程式若尚未同步「快取_分點歷史」到 Google Sheet，才退回每日賣出明細。
-    # 但每日賣出明細可能只含最近幾天，因此只作備援，不作主要來源。
-    if not sell_rows_loaded:
-        try:
-            sell_df = read_gsheet_table_optional(
-                SHEET_DAILY_SELL,
-                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
-            )
+    # 每日賣出明細通常只含最近幾天，不能取代整段近一個月快取；
+    # 但目標日當天它通常比快取_分點歷史更新，因此在快取扣完後，
+    # 再用每日賣出明細補扣「同一筆賣出在每日明細中多出的差額」。
+    # 若舊版主程式尚未同步快取，這段也會自然變成每日明細的備援扣減。
+    try:
+        sell_df = read_gsheet_table_optional(
+            SHEET_DAILY_SELL,
+            ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
+        )
 
-            if not sell_df.empty:
-                apply_sell_deduction_from_df(sell_df, ["權證代號"])
-        except Exception:
-            pass
+        if not sell_df.empty:
+            apply_sell_deduction_from_df(
+                sell_df,
+                ["權證代號"],
+                supplement_existing=sell_rows_loaded,
+                target_only=sell_rows_loaded,
+            )
+    except Exception:
+        pass
 
     rows = []
     for item in agg.values():
