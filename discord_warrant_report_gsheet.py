@@ -2117,9 +2117,48 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         agg[code]["net_amount"] -= amount
         agg[code]["broker_net_amounts"][broker] -= amount
 
+    # 判斷 TOP15 是否需要補讀今日表。
+    # 正確版 TOP15 應以完整 A/B/C/D 表為主。
+    # 只有當完整表尚未包含 target 日期時，才用 今日_A/B/C/D 補上每日產圖剛產生的 target 日資料。
+    # 避免完整表已含 target，卻又合併 今日_*，造成邊界金額些微重複、排名與正確版不一致。
+    full_event_dates: set[date] = set()
+    full_date_plans = [
+        (SHEET_A_FULL, "買進日"),
+        (SHEET_B_FULL, "事件日"),
+        (SHEET_C_FULL, "結束日"),
+        (SHEET_D_FULL, "結束日"),
+    ]
+    for full_sheet_name, full_date_col in full_date_plans:
+        try:
+            full_date_df = read_gsheet_table(full_sheet_name, ["分點", full_date_col])
+        except Exception:
+            continue
+        if full_date_df.empty or full_date_col not in full_date_df.columns:
+            continue
+        for _, _r in full_date_df.iterrows():
+            _d = parse_date_value(_r.get(full_date_col))
+            if _d and _d <= target:
+                full_event_dates.add(_d)
+
+    full_max_date = max(full_event_dates) if full_event_dates else None
+    use_today_event_sheets = not full_max_date or full_max_date < target
+    if use_today_event_sheets:
+        print(
+            "TOP15 事件來源：完整 A/B/C/D 尚未包含目標日，"
+            f"使用 今日_A/B/C/D 補上 {target:%Y/%m/%d}；"
+            f"完整表最新日：{full_max_date:%Y/%m/%d}" if full_max_date else
+            f"TOP15 事件來源：完整 A/B/C/D 無有效日期，使用 今日_A/B/C/D 補上 {target:%Y/%m/%d}"
+        )
+    else:
+        print(
+            "TOP15 事件來源：完整 A/B/C/D 已包含目標日，"
+            f"只使用完整表計算，不合併今日表；完整表最新日：{full_max_date:%Y/%m/%d}"
+        )
+
     # A：買超與賣方
-    # 完整表 + 今日表都讀；若完整表已包含今日，add_buy_row 會自動去重。
-    for sheet_name in [SHEET_A_FULL, SHEET_A]:
+    # TOP15 以完整表為主；只有完整表未包含 target 時才補今日表。
+    a_source_sheets = [SHEET_A_FULL] + ([SHEET_A] if use_today_event_sheets else [])
+    for sheet_name in a_source_sheets:
         try:
             A = read_gsheet_table(
                 sheet_name,
@@ -2136,16 +2175,18 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             pass
 
     # B/C/D：買超與賣方
-    # TOP15 應以完整表為主；今日表用於每日模式剛補上的 target 日。
-    # add_buy_row 會用事件 key 去重，避免完整表與今日表同時有同一筆時重複加總。
+    # TOP15 以完整表為主；只有完整表未包含 target 時才補今日表。
     plans = [
         (SHEET_B_FULL, "B", "事件日"),
         (SHEET_C_FULL, "C", "結束日"),
         (SHEET_D_FULL, "D", "結束日"),
-        (SHEET_B, "B", "事件日"),
-        (SHEET_C, "C", "結束日"),
-        (SHEET_D, "D", "結束日"),
     ]
+    if use_today_event_sheets:
+        plans.extend([
+            (SHEET_B, "B", "事件日"),
+            (SHEET_C, "C", "結束日"),
+            (SHEET_D, "D", "結束日"),
+        ])
 
     for sheet_name, event_code, date_col in plans:
         try:
