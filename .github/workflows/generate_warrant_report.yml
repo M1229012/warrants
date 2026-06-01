@@ -1,67 +1,153 @@
-name: 🧪 測試推播 (手動/更新觸發)
+name: Warrant Report Manual Test
+
+
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'notify_discord.py'  # 只有改程式碼才觸發測試
-  workflow_dispatch:        # 讓你可以手動按按鈕測試
+
+  workflow_dispatch:
+
+    inputs:
+
+      stock_codes:
+
+        description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
+
+        required: false
+
+        default: "2408"
+
+
 
 jobs:
-  test-notification:
+
+  run-warrant-report-test:
+
     runs-on: ubuntu-latest
 
+    timeout-minutes: 60
+
+
+
+    env:
+
+      OUTPUT_DIR: output
+
+      STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
+
+
+
+      # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
+
+      MPLBACKEND: Agg
+
+
+
+      # Google Sheet 設定
+
+      WARRANT_GSHEET_ENABLE: "1"
+
+      GSHEET_NAME: "權證分點籌碼"
+
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+
+
+
+      # FinMind 設定：三大法人資料來源
+
+      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+
+
+
+      # Gemini / LLM 新聞與本週重點摘要設定
+
+      WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
+
+      GEMINI_MODEL: gemini-2.5-flash
+
+
+
+      # 權證分點報告設定
+
+      WARRANT_EVENT_MIN_AMOUNT: "0"
+
+      WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
+
+      WARRANT_REPORT_MAX_ROWS: "8"
+
+
+
+      # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
+
+      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+
+
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Checkout repository
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install gspread google-auth requests yfinance selenium webdriver_manager lxml matplotlib pandas numpy beautifulsoup4 google-genai googlenewsdecoder
+        uses: actions/checkout@v4
 
-    - name: Create Service Key
-      env:
-        GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
-      run: |
-        python - <<'PY'
-        import os
 
-        key = os.getenv("GCP_SERVICE_KEY", "").strip()
-        if not key:
-            raise RuntimeError("GCP_SERVICE_KEY is empty")
 
-        with open("service_key.json", "w", encoding="utf-8") as f:
-            f.write(key)
-        PY
+      - name: Install system fonts
 
-    - name: Check Gemini API Key
-      env:
-        WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
-      run: |
-        if [ -z "$WARRANTS_API_KEY" ]; then
-          echo "❌ WARRANTS_API_KEY is empty"
-          exit 1
-        else
-          echo "✅ WARRANTS_API_KEY is set"
-        fi
+        run: |
 
-    - name: Run Discord Notification (Test Mode)
-      env:
-        DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
-        GOOGLE_APPLICATION_CREDENTIALS: service_key.json
-        WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
-        GEMINI_MODEL: gemini-2.5-flash
-      run: |
-        python notify_discord.py
+          sudo apt-get update
 
-    - name: Cleanup Service Key
-      if: always()
-      run: rm -f service_key.json
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Set up Python
+
+        uses: actions/setup-python@v5
+
+        with:
+
+          python-version: "3.11"
+
+          cache: "pip"
+
+
+
+      - name: Install Python dependencies
+
+        run: |
+
+          python -m pip install --upgrade pip
+
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+          pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2 beautifulsoup4 lxml google-genai googlenewsdecoder
+
+      - name: Check FinMind token
+
+        run: |
+
+          python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
+
+      - name: Check Gemini API key
+
+        run: |
+
+          python -c "import os; print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY')"
+
+      - name: Run warrant report test
+
+        run: python run_report.py
+
+
+
+      - name: Upload report artifact
+
+        uses: actions/upload-artifact@v4
+
+        if: always()
+
+        with:
+
+          name: warrant-report-test-output
+
+          path: output/*.png
+
+          if-no-files-found: warn
