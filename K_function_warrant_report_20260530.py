@@ -1868,9 +1868,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         (0.52, "本週淨賣超分點 TOP5", sell_top, GREEN),
     ]
     for x0, title, df_top, side_color in sections:
-        ax_top.add_patch(FancyBboxPatch((x0, 0.02), 0.46, 0.965, transform=ax_top.transAxes,
-                                        boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35))
-        ax_top.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
+        card_y = 0.02
+        card_w = 0.46
+        card_h = 0.965
+        card_pad = 0.014
+        band_h = 0.035
+        box = FancyBboxPatch((x0, card_y), card_w, card_h, transform=ax_top.transAxes,
+                             boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35)
+        ax_top.add_patch(box)
+        band = Rectangle((x0 - card_pad, card_y + card_h - band_h), card_w + card_pad * 2, band_h,
+                         transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95)
+        band.set_clip_path(box)
+        ax_top.add_patch(band)
         ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
         ax_top.text(x0 + 0.02, 0.82, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
         if df_top.empty:
@@ -1889,10 +1898,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 circ_y = y - 0.005
                 ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold",
                            ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
-                ax_top.text(x0 + 0.06, y + 0.012, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.425, y + 0.012, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                branch_y = y + 0.012
+                rep_y = y - 0.060
+                amount_y = (branch_y + rep_y) / 2
+                ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
+                ax_top.text(x0 + 0.425, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, y - 0.060, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
+                ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
                 ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
                 y -= row_gap
 
