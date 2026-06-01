@@ -1341,6 +1341,7 @@ def build_key_points(ctx, stock_name: str):
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
+NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "90"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "3"))
@@ -2536,17 +2537,14 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 6. 嚴禁把台積電、瑞昱、聯詠或其他公司的目標價 / EPS / 營收預估寫成「{display_name}」的重點；若無法判斷數字屬於哪家公司，就不要使用該數字。
 7. 若句子格式像「A 公司目標價 3000 元、B 公司目標價 5922 元」，整理 {display_name} 時只能保留 B 公司明確對應的數字，不可混用 A 公司數字。
 8. 若新聞片段出現記憶體、DRAM、HBM、伺服器、PCB、載板等產業詞，必須確認該產業詞在同一句或相鄰句明確連到「{stock_code} {display_name}」；不能把同篇文章中其他股票的產業題材寫成本股票重點。
-9. 優先整理具體事實，例如：
-   - 外資或法人目標價、評等、升評、降評
-   - EPS、營收、毛利率、獲利
-   - 接單、出貨、產能、長約
-   - 產品報價、供需、漲價幅度
-   - AI、伺服器、ASIC、TPU、記憶體、DRAM、半導體需求
-10. 請輸出 3～4 點，整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字；若只有 2 點，每點要更完整。
-11. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
-12. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～90 個中文字。
-13. 若不同文章報同一件事，合併成一點，並寫出共同核心。
-14. 請保留最關鍵的數字或事件，但不要塞滿數字。
+9. 優先整理與「{stock_code} {display_name}」公司本身產業、基本面或股價可能受影響的消息，不要整理同篇文章中其他公司的題材。
+10. 具體重點優先順序：法人目標價 / 評等 / 升降評、EPS / 每股純益、營收 / 毛利率 / 獲利、ASP / 報價 / 供需、接單 / 出貨 / 產能 / 長約、公司本身所屬產業趨勢。
+11. 若產業詞、目標價、EPS、營收、ASP、毛利率或獲利預估沒有在同一句或相鄰句明確連到「{stock_code} {display_name}」，不要寫進重點。
+12. 請最多輸出 3 點，建議 2～3 點；整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字，若只有 2 點，每點要更完整。
+13. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
+14. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～90 個中文字。
+15. 若不同文章報同一件事，合併成一點，並寫出共同核心。
+16. 請保留最關鍵的數字或事件，但不要塞滿數字。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
 格式：
@@ -2722,12 +2720,13 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
     prompt = (
         f"請根據以下一週內新聞內文，整理 {stock_code} {stock_name} 的新聞重點。\n"
         "要求：\n"
-        "1. 請輸出 4 點，每點 35 到 60 個中文字。\n"
+        "1. 最多輸出 3 點，每點 45 到 90 個中文字。\n"
         "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
         "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
         "4. 每點要像研究摘要，說明原因、影響或觀察方向，不要寫成聳動標題。\n"
-        "5. 優先聚焦營收/財報、產業題材、展望布局、法人觀點或風險。\n"
-        "6. 若資料不足，寧可保守，不要臆測。\n\n"
+        "5. 只聚焦公司本身可能影響股價的消息：公司產業、法人目標價/評等、EPS/每股純益、營收、毛利率、獲利、ASP/報價、接單出貨、產能與供需。\n"
+        "6. 若目標價、EPS、營收、ASP、毛利率或產業題材沒有明確指向本公司，請不要使用。\n"
+        "7. 若資料不足，寧可保守，不要臆測。\n\n"
         + "\n\n".join(blocks)
     )
 
@@ -2851,13 +2850,13 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     # 依照獨立 Gemini 測試程式邏輯：只把「有足夠內文」的文章送給 Gemini。
     ai_points = _summarize_news_with_gemini(body_records, stock_code, stock_name)
     if ai_points:
-        return _ensure_news_summary_min_total(ai_points, body_records, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
+        return _ensure_news_summary_min_total(ai_points, body_records, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
 
     # Gemini 不可用或失敗時，仍優先從真正內文抽重點；最後才用 RSS 摘要作為備援素材。
     rule_source = body_records if body_records else fallback_records
     rule_points = _rule_based_news_summary(rule_source, stock_code, stock_name)
     if rule_points:
-        return _ensure_news_summary_min_total(rule_points, rule_source, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
+        return _ensure_news_summary_min_total(rule_points, rule_source, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
 
     if not body_records:
         return ["本週近7天新聞多為標題或短摘要，未取得足夠原文可統整；目前不輸出標題式內容，建議稍後重跑或補手動新聞重點。"]
@@ -3553,7 +3552,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             y -= notes_line_height * line_count + notes_item_gap
 
     draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.775)
-    draw_note_items(news_points[:5], 0.54, 0.52 + 0.55 - notes_right_padding, 0.775)
+    draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.55 - notes_right_padding, 0.775)
 
     # x ticks
     interval = max(1, len(x) // 12)
