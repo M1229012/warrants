@@ -2400,7 +2400,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
                   height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 9.55, 9.05],
-                  hspace=0.14, wspace=0.25)
+                  hspace=0.20, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -2614,7 +2614,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         card_y = -0.015
         card_w = 0.46
         card_h = 0.940
-        band_h = 0.035
+        band_h = 0.078
         box = FancyBboxPatch((x0, card_y), card_w, card_h, transform=ax_top.transAxes,
                              boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35,
                              zorder=1, clip_on=False)
@@ -2624,13 +2624,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                          zorder=2, clip_on=False)
         band.set_clip_path(box)
         ax_top.add_patch(band)
-        ax_top.text(x0 + 0.02, 0.855, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
-        ax_top.text(x0 + 0.02, 0.780, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.825, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.750, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
         if df_top.empty:
             ax_top.text(x0 + 0.03, 0.56, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
         else:
-            y = 0.660
-            row_gap = 0.145
+            y = 0.635
+            row_gap = 0.142
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
                 amt = float(r["net_amount"])
@@ -2658,7 +2658,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         note_y = 0.025
         note_w = 0.46
         note_h = 0.955
-        note_band_h = 0.040
+        note_band_h = 0.078
         note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
                                   boxstyle="round,pad=0.000,rounding_size=0.022", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
                                   zorder=1, clip_on=False)
@@ -2668,7 +2668,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                               zorder=2, clip_on=False)
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
-        ax_notes.text(x0 + 0.02, note_y + note_h - 0.075, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False)
+        ax_notes.text(x0 + 0.02, note_y + note_h - 0.120, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False)
     notes_fontsize = 32
     notes_line_height = 0.058
     notes_item_gap = 0.036
@@ -2758,8 +2758,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.82)
-    draw_note_items(news_points[:5], 0.54, 0.52 + 0.55 - notes_right_padding, 0.82)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.775)
+    draw_note_items(news_points[:5], 0.54, 0.52 + 0.55 - notes_right_padding, 0.775)
 
     # x ticks
     interval = max(1, len(x) // 12)
