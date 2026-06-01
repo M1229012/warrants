@@ -1839,8 +1839,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     agg = {}
 
     # 只記錄本次近 N 個有效交易日內，真正被 A/B/C/D 買超事件納入統計的
-    # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單
-    # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
+    # 「分點 + 權證代號」。後續賣方扣減只扣這些權證，避免把同分點其他散戶賣單、
+    # 舊部位賣單，或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 金額被低估。
     counted_warrant_keys: set[tuple[str, str]] = set()
 
     # 以「分點 + 權證代號」建立持倉成本批次。
@@ -2070,10 +2070,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
         TOP15 賣方扣減規則：
-        1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
-        2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
-           也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
-           能正確反映到近一個月 TOP15。
+        1. 只扣「本次近 N 個有效交易日內，被 A/B/C/D 買超事件納入統計的
+           同一分點 + 同一權證代號」。
+        2. 不再扣非 A/B/C/D 白名單的同標的大額賣出，避免舊部位或非策略事件賣單
+           誤扣本次 TOP15 的淨買超成本。
 
         重要修正：
         - 舊版是直接扣「賣出成交金額」。
@@ -2089,7 +2089,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         history_sell_cost_lookup = build_period_sell_cost_lookup(sell_period_start, sell_period_end)
 
         usable_sell_rows = []
-        non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
 
         for _, r in sell_df.iterrows():
             d = parse_date_value(r.get("日期"))
@@ -2119,6 +2118,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
             is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
 
+            # TOP15 只扣 A/B/C/D 白名單內的同一權證代號。
+            # 非 A/B/C/D 的同標的大額賣出不再納入扣減，避免舊部位賣單誤扣新買超事件。
+            if not is_counted_warrant:
+                continue
+
             usable_sell_rows.append({
                 "date": d,
                 "broker": broker,
@@ -2126,24 +2130,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 "warrant_code": warrant_code,
                 "sell_amount": sell_amount,
                 "sell_qty_units": sell_qty_units,
-                "is_counted_warrant": is_counted_warrant,
             })
 
-            # 非 A/B/C/D 的大額賣超只用「目標日當天」判斷與扣減。
-            # A/B/C/D 白名單權證的賣出仍維持整個統計期間扣減。
-            # 這裡仍用賣出成交金額判斷是否達到「大額賣超」門檻；
-            # 但實際扣減時會改扣成本，不會扣賣出成交金額。
-            if not is_counted_warrant and d == target:
-                non_abcd_sell_amounts[(d, broker, code)] += sell_amount
-
-        qualifying_non_abcd_keys = {
-            key
-            for key, amount in non_abcd_sell_amounts.items()
-            if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
-        }
-
         # 同一天、同分點、同標的、同權證先合併，避免 Google Sheet 若有多列時重複扣同一筆歷史成本。
-        grouped_sell_rows: dict[tuple[date, str, str, str, bool], dict] = defaultdict(lambda: {
+        grouped_sell_rows: dict[tuple[date, str, str, str], dict] = defaultdict(lambda: {
             "sell_amount": 0.0,
             "sell_qty_units": 0.0,
         })
@@ -2153,16 +2143,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             broker = row["broker"]
             code = row["underlying"]
             warrant_code = row["warrant_code"]
-            is_counted_warrant = row["is_counted_warrant"]
 
-            if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_keys:
-                continue
-
-            key = (d, broker, code, warrant_code, is_counted_warrant)
+            key = (d, broker, code, warrant_code)
             grouped_sell_rows[key]["sell_amount"] += safe_float(row.get("sell_amount"), 0)
             grouped_sell_rows[key]["sell_qty_units"] += safe_float(row.get("sell_qty_units"), 0)
 
-        for (d, broker, code, warrant_code, is_counted_warrant), row in grouped_sell_rows.items():
+        for (d, broker, code, warrant_code), row in grouped_sell_rows.items():
             sell_qty_units = safe_float(row.get("sell_qty_units"), 0)
             if sell_qty_units <= 0:
                 # 沒有張數就無法換算原始成本；不要退回扣賣出金額，避免再次低估。
@@ -2172,16 +2158,13 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
             # A/B/C/D 白名單權證優先用本次統計範圍內建立的買進成本批次扣除。
             # 重要：只能扣事件日 <= 賣出日的買進批次，避免較早賣出扣到後面新買進。
-            if is_counted_warrant:
-                sell_cost = deduct_sell_cost_from_positions(broker, warrant_code, sell_qty_units, d)
+            sell_cost = deduct_sell_cost_from_positions(broker, warrant_code, sell_qty_units, d)
 
             # 若本次統計範圍沒有可扣成本，才用快取_分點歷史估算的加權平均成本作備援。
-            # 但對 A/B/C/D 白名單權證，若根本沒有事件日 <= 賣出日的買進批次，
-            # 代表這筆賣出早於本次策略買進，不可用備援成本去扣新買進。
-            if sell_cost <= 0 and warrant_code:
-                allow_history_fallback = (not is_counted_warrant) or has_eligible_position_lot(broker, warrant_code, d)
-                if allow_history_fallback:
-                    sell_cost = safe_float(history_sell_cost_lookup.get((d, broker, warrant_code), 0), 0)
+            # 但若根本沒有事件日 <= 賣出日的買進批次，代表這筆賣出早於本次策略買進，
+            # 不可用備援成本去扣新買進。
+            if sell_cost <= 0 and warrant_code and has_eligible_position_lot(broker, warrant_code, d):
+                sell_cost = safe_float(history_sell_cost_lookup.get((d, broker, warrant_code), 0), 0)
 
             if sell_cost <= 0:
                 continue
@@ -2326,9 +2309,10 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
     #
     # 扣減規則：
-    # 1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
-    # 2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
-    #    也一併扣減，但實際扣掉的是該賣出張數對應的原始成本。
+    # 1. 只扣本次近 N 個有效交易日內，已被 A/B/C/D 買超事件納入統計的
+    #    「同一分點 + 同一權證代號」。
+    # 2. 不再扣非 A/B/C/D 白名單的同標的大額賣出，避免舊部位或非策略事件賣單
+    #    誤扣本次 TOP15 的淨買超成本。
     sell_rows_loaded = False
     try:
         sell_df = read_gsheet_table_optional(
