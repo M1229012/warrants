@@ -607,7 +607,7 @@ def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
                 ha="center", va="center", fontsize=26, color=MUTED)
         return
 
-    c_foreign = "#1D2B44"  # 外資
+    c_foreign = "#7CB5EC"  # 外資
     c_invest = "#F59E0B"   # 投信
     c_dealer = "#9CA3AF"   # 自營商
 
@@ -636,7 +636,7 @@ def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
 
 def draw_inst_header_like_legend(inst_ax, plot_df: pd.DataFrame):
     """依照原始 K 線圖樣式，在三大法人圖上方顯示外資 / 投信 / 自營商 / 合計。"""
-    c_foreign = "#1D2B44"
+    c_foreign = "#7CB5EC"
     c_invest = "#F59E0B"
     c_dealer = "#9CA3AF"
     c_total = GOLD
