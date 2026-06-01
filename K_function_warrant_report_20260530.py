@@ -1913,7 +1913,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
         note_y = 0.035
-        note_w = 0.43
+        note_w = 0.46
         note_h = 0.93
         note_band_h = 0.035
         note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
@@ -1932,7 +1932,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     notes_max_lines = 3
     notes_right_padding = 0.025
 
-    def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
+    def wrap_text_by_pixel(ax, fig, text, max_width_axes=0.42, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
         """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
         s = str(text or "").strip()
         if not s:
