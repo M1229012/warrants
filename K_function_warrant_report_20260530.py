@@ -1335,7 +1335,9 @@ def build_key_points(ctx, stock_name: str):
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "42"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "72"))
+NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
+NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "3"))
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
 NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
@@ -2097,6 +2099,124 @@ def _clean_summary_points(raw_points: List[str]) -> List[str]:
     return points
 
 
+def _count_summary_chars(points: List[str]) -> int:
+    """計算新聞重點實際文字量；排除項目符號與空白，避免低於圖片需要的資訊密度。"""
+    joined = "".join(str(p or "") for p in points or [])
+    joined = re.sub(r"[\s•\-–—\d\.、\)）:：，,。；;]", "", joined)
+    return len(joined)
+
+
+def _parse_raw_points_from_llm(output_text: str) -> List[str]:
+    parsed = _extract_json_from_text(output_text)
+    raw_points = []
+    if isinstance(parsed, dict):
+        raw_points = parsed.get("points", []) or []
+    elif isinstance(parsed, list):
+        raw_points = parsed
+
+    if not raw_points:
+        for line in str(output_text or "").splitlines():
+            line = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", line).strip()
+            if line:
+                raw_points.append(line)
+    return [str(p) for p in raw_points]
+
+
+def _clean_news_summary_points(raw_points: List[str]) -> List[str]:
+    """新聞專用清理：保留較完整的重點，使總字數可達 150 字以上。"""
+    points = []
+    for p in raw_points or []:
+        s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
+        if not s or _is_bad_news_sentence(s):
+            continue
+        if s in points:
+            continue
+        points.append(s)
+        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
+            break
+    return points
+
+
+def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
+    """Gemini 輸出太短時，從 7 天內原文候選句補足重點字數；不使用新聞標題硬湊。"""
+    used_points = used_points or []
+    candidates = _collect_news_sentences(records)
+    if not candidates:
+        return []
+
+    broad_keywords = [
+        stock_code, stock_name, "營收", "財報", "獲利", "EPS", "毛利", "毛利率", "AI", "伺服器",
+        "半導體", "記憶體", "DRAM", "NAND", "HBM", "報價", "漲價", "供需", "需求",
+        "法說", "展望", "接單", "出貨", "產能", "擴產", "合作", "法人", "外資", "投信",
+        "評等", "目標價", "調升", "調降", "客戶", "長約", "庫存", "價格", "景氣",
+    ]
+    scored = []
+    used_compare = {_title_compare_text(p) for p in used_points if p}
+    for c in candidates:
+        text = c.get("text", "")
+        if not text or _is_bad_news_sentence(text):
+            continue
+        cmp_text = _title_compare_text(text)
+        if not cmp_text or cmp_text in used_compare:
+            continue
+        score = _score_news_sentence(text, broad_keywords, stock_code, stock_name)
+        if score > 0:
+            scored.append((score, text))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    extra = []
+    for _, text in scored:
+        point = _trim_news_point(text, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
+        if not point or _is_bad_news_sentence(point):
+            continue
+        cmp_point = _title_compare_text(point)
+        if cmp_point in used_compare:
+            continue
+        extra.append(point)
+        used_compare.add(cmp_point)
+        if len(extra) >= NEWS_SUMMARY_MAX_POINTS:
+            break
+    return extra
+
+
+def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
+    """確保新聞區塊至少約 150 字；資料不足時仍只從 7 天內新聞素材補充。"""
+    points = _clean_news_summary_points(points)
+    if _count_summary_chars(points) >= NEWS_SUMMARY_MIN_TOTAL_CHARS and len(points) >= min(NEWS_SUMMARY_MIN_POINTS, NEWS_SUMMARY_MAX_POINTS):
+        return points[:NEWS_SUMMARY_MAX_POINTS]
+
+    expanded = points[:]
+    for p in _build_news_expansion_points(records, stock_code, stock_name, used_points=expanded):
+        if len(expanded) >= NEWS_SUMMARY_MAX_POINTS:
+            break
+        if p not in expanded:
+            expanded.append(p)
+        if _count_summary_chars(expanded) >= NEWS_SUMMARY_MIN_TOTAL_CHARS and len(expanded) >= min(NEWS_SUMMARY_MIN_POINTS, NEWS_SUMMARY_MAX_POINTS):
+            break
+
+    if _count_summary_chars(expanded) >= NEWS_SUMMARY_MIN_TOTAL_CHARS:
+        return expanded[:NEWS_SUMMARY_MAX_POINTS]
+
+    # 若點數已滿但總字數仍不足，嘗試用更完整候選句替換較短重點。
+    longer_candidates = _build_news_expansion_points(records, stock_code, stock_name, used_points=[])
+    for cand in longer_candidates:
+        if not expanded:
+            expanded.append(cand)
+        else:
+            shortest_idx = min(range(len(expanded)), key=lambda i: len(expanded[i]))
+            if len(cand) > len(expanded[shortest_idx]) and cand not in expanded:
+                expanded[shortest_idx] = cand
+        if _count_summary_chars(expanded) >= NEWS_SUMMARY_MIN_TOTAL_CHARS:
+            break
+
+    return expanded[:NEWS_SUMMARY_MAX_POINTS]
+
+
+def _parse_gemini_news_points(output_text: str, records: List[dict], stock_code: str, stock_name: str) -> List[str]:
+    raw_points = _parse_raw_points_from_llm(output_text)
+    return _ensure_news_summary_min_total(raw_points, records, stock_code, stock_name)
+
+
 def _get_warrants_api_key() -> str:
     """讀取 Gemini API Key；GitHub Actions 使用 WARRANTS_API_KEY。"""
     return (
@@ -2171,20 +2291,7 @@ def _call_gemini_with_retry(prompt: str):
 
 
 def _parse_gemini_points(output_text: str) -> List[str]:
-    parsed = _extract_json_from_text(output_text)
-    raw_points = []
-    if isinstance(parsed, dict):
-        raw_points = parsed.get("points", []) or []
-    elif isinstance(parsed, list):
-        raw_points = parsed
-
-    if not raw_points:
-        for line in str(output_text or "").splitlines():
-            line = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", line).strip()
-            if line:
-                raw_points.append(line)
-
-    return _clean_summary_points([str(p) for p in raw_points])
+    return _clean_summary_points(_parse_raw_points_from_llm(output_text))
 
 
 def _build_gemini_news_articles(records: List[dict]) -> List[dict]:
@@ -2227,22 +2334,23 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 
 任務：
 整理近 7 天的「本週新聞重點」，輸出給圖片週報右下角使用。
+請綜合多篇新聞內文與媒體 / 法人說法，統整出重點中的重點，不要逐篇列標題。
 
 嚴格規則：
 1. 不要直接複製新聞標題。
 2. 不要輸出新聞網站名稱、作者、網址、完整看、看更多、延伸閱讀。
 3. 不要把只有股價漲停、亮燈、強漲、創高、焦點股這類描述當成重點。
-4. 每一點必須來自新聞內文，不可以幻想。
+4. 每一點必須來自近 7 天新聞內文，不可以幻想，不可以使用外部知識。
 5. 優先整理具體事實，例如：
    - 外資或法人目標價、評等、升評、降評
    - EPS、營收、毛利率、獲利
    - 接單、出貨、產能、長約
    - 產品報價、供需、漲價幅度
    - AI、伺服器、ASIC、TPU、記憶體、DRAM、半導體需求
-6. 如果沒有具體內文，寧可少於 4 點，不要硬湊。
+6. 請輸出 3～4 點，整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字；若只有 2 點，每點要更完整。
 7. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
-8. 圖片區塊很小，請只寫重點中的重點，每點 24～46 個中文字。
-9. 若不同文章報同一件事，合併成一點。
+8. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～72 個中文字。
+9. 若不同文章報同一件事，合併成一點，並寫出共同核心。
 10. 請保留最關鍵的數字或事件，但不要塞滿數字。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
@@ -2264,9 +2372,9 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     print(f"送入 Gemini 的文章數：{len(usable_articles)}")
     print("=" * 100)
     output_text = _call_gemini_with_retry(prompt)
-    points = _parse_gemini_points(output_text or "")
+    points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
     if points:
-        print(f"✅ Gemini 新聞重點完成：{len(points)} 點")
+        print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
     return points
 
 def _safe_float(v, default=np.nan):
@@ -2530,7 +2638,7 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
                 points.append(pick)
                 used.add(text)
 
-    return _clean_summary_points(points)
+    return _ensure_news_summary_min_total(points, records, stock_code, stock_name)
 
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
@@ -2548,17 +2656,17 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     # 依照獨立 Gemini 測試程式邏輯：只把「有足夠內文」的文章送給 Gemini。
     ai_points = _summarize_news_with_gemini(body_records, stock_code, stock_name)
     if ai_points:
-        return ai_points[:NEWS_SUMMARY_MAX_POINTS]
+        return _ensure_news_summary_min_total(ai_points, body_records, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
     # Gemini 不可用或失敗時，仍優先從真正內文抽重點；最後才用 RSS 摘要作為備援素材。
     rule_source = body_records if body_records else fallback_records
     rule_points = _rule_based_news_summary(rule_source, stock_code, stock_name)
     if rule_points:
-        return rule_points[:NEWS_SUMMARY_MAX_POINTS]
+        return _ensure_news_summary_min_total(rule_points, rule_source, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
     if not body_records:
-        return ["本週新聞多為標題或摘要，未抓到足夠原文可統整；可稍後重跑或補手動新聞重點。"]
-    return ["本週新聞內文有效句不足，未輸出標題式內容；可用 WEEKLY_NEWS_TEXT 手動補重點。"]
+        return ["本週近7天新聞多為標題或短摘要，未取得足夠原文可統整；目前不輸出標題式內容，建議稍後重跑或補手動新聞重點。"]
+    return ["本週近7天新聞雖有原文素材，但有效句不足以整理成完整重點；目前不輸出標題式內容，可用 WEEKLY_NEWS_TEXT 手動補充。"]
 
 
 # ============================================================
