@@ -1926,15 +1926,81 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
         ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top")
-    notes_wrap_width = 27
     notes_fontsize = 33
     notes_line_height = 0.062
     notes_item_gap = 0.045
+    notes_max_lines = 3
+    notes_right_padding = 0.025
 
-    def draw_note_items(items, x_left, y_start):
+    def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
+        """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
+        s = str(text or "").strip()
+        if not s:
+            return ""
+
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bbox = ax.get_window_extent(renderer=renderer)
+        max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width
+
+        width_cache = {}
+
+        def measure_px(candidate: str) -> float:
+            if candidate in width_cache:
+                return width_cache[candidate]
+            tmp = ax.text(
+                0, 0, candidate,
+                transform=ax.transAxes,
+                fontsize=fontsize,
+                fontweight=fontweight,
+                ha="left",
+                va="top",
+                alpha=0,
+            )
+            bbox = tmp.get_window_extent(renderer=renderer)
+            tmp.remove()
+            width_cache[candidate] = bbox.width
+            return bbox.width
+
+        lines = []
+        current = ""
+        for ch in s:
+            prefix = first_prefix if not lines else next_prefix
+            candidate = current + ch
+            if measure_px(prefix + candidate) <= max_width_px or not current:
+                current = candidate
+            else:
+                lines.append(current.rstrip())
+                current = ch.lstrip()
+
+        if current:
+            lines.append(current.rstrip())
+
+        if max_lines and len(lines) > max_lines:
+            lines = lines[:max_lines]
+            last_prefix = first_prefix if max_lines == 1 else next_prefix
+            last = lines[-1].rstrip()
+            while last and measure_px(last_prefix + last + "…") > max_width_px:
+                last = last[:-1].rstrip()
+            lines[-1] = (last + "…") if last else "…"
+
+        return "\n".join(lines)
+
+    def draw_note_items(items, x_left, x_right, y_start):
         y = y_start
+        max_width_axes = max(0.05, x_right - x_left)
         for p in items:
-            body = wrap_text(p, width=notes_wrap_width, max_lines=3)
+            body = wrap_text_by_pixel(
+                ax_notes,
+                fig,
+                p,
+                max_width_axes=max_width_axes,
+                fontsize=notes_fontsize,
+                fontweight="normal",
+                max_lines=notes_max_lines,
+                first_prefix="• ",
+                next_prefix="  ",
+            )
             note_text = "• " + body.replace("\n", "\n  ")
             line_count = note_text.count("\n") + 1
             ax_notes.text(
@@ -1949,8 +2015,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.79)
-    draw_note_items(news_points[:5], 0.54, 0.79)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.43 - notes_right_padding, 0.79)
+    draw_note_items(news_points[:5], 0.54, 0.52 + 0.43 - notes_right_padding, 0.79)
 
     # x ticks
     interval = max(1, len(x) // 12)
