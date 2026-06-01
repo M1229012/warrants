@@ -1990,13 +1990,35 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             position_lots_by_warrant[(broker, warrant_code)].append(lot)
             counted_warrant_keys.add((broker, warrant_code))
 
-    def deduct_sell_cost_from_positions(broker: str, warrant_code: str, sell_qty_units: float) -> float:
-        """用賣出張數扣掉對應的原始買進成本，回傳本次應扣成本。"""
+    def has_eligible_position_lot(broker: str, warrant_code: str, sell_date: date | None) -> bool:
+        """檢查是否存在事件日 <= 賣出日的買進批次，避免較早賣出扣到較晚買進。"""
+        broker = str(broker).strip()
+        warrant_code = normalize_warrant_code(warrant_code)
+
+        if not broker or not warrant_code or not sell_date:
+            return False
+
+        lots = position_lots_by_warrant.get((broker, warrant_code), [])
+        for lot in lots:
+            lot_event_date = lot.get("event_date")
+            if lot_event_date and lot_event_date <= sell_date:
+                return True
+
+        return False
+
+    def deduct_sell_cost_from_positions(broker: str, warrant_code: str, sell_qty_units: float, sell_date: date | None) -> float:
+        """
+        用賣出張數扣掉對應的原始買進成本，回傳本次應扣成本。
+
+        重要：
+        - 只能扣「事件日 <= 賣出日」的買進批次。
+        - 避免統計期間內較早的賣出，錯誤扣到後面才新出現的 A/B/C/D 買進。
+        """
         broker = str(broker).strip()
         warrant_code = normalize_warrant_code(warrant_code)
         sell_qty_units = safe_float(sell_qty_units, 0)
 
-        if not broker or not warrant_code or sell_qty_units <= 0:
+        if not broker or not warrant_code or sell_qty_units <= 0 or not sell_date:
             return 0.0
 
         lots = position_lots_by_warrant.get((broker, warrant_code), [])
@@ -2014,6 +2036,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if lot_id in used_lot_ids:
                 continue
             used_lot_ids.add(lot_id)
+
+            lot_event_date = lot.get("event_date")
+            if not lot_event_date or lot_event_date > sell_date:
+                # 賣出日早於該買進事件日，不可扣這筆新的買進成本。
+                continue
 
             lot_qty = safe_float(lot.get("remaining_qty_units"), 0)
             lot_cost = safe_float(lot.get("remaining_cost"), 0)
@@ -2052,6 +2079,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         - 舊版是直接扣「賣出成交金額」。
         - 新版改為扣「賣出張數對應的原始買進成本」。
         - 這樣權證大賺時，不會因為賣出成交金額變大而低估剩餘買超成本。
+        - 只扣事件日 <= 賣出日的買進批次，避免較早賣出扣到後面新買進。
         """
         if sell_df.empty:
             return
@@ -2143,12 +2171,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             sell_cost = 0.0
 
             # A/B/C/D 白名單權證優先用本次統計範圍內建立的買進成本批次扣除。
+            # 重要：只能扣事件日 <= 賣出日的買進批次，避免較早賣出扣到後面新買進。
             if is_counted_warrant:
-                sell_cost = deduct_sell_cost_from_positions(broker, warrant_code, sell_qty_units)
+                sell_cost = deduct_sell_cost_from_positions(broker, warrant_code, sell_qty_units, d)
 
             # 若本次統計範圍沒有可扣成本，才用快取_分點歷史估算的加權平均成本作備援。
+            # 但對 A/B/C/D 白名單權證，若根本沒有事件日 <= 賣出日的買進批次，
+            # 代表這筆賣出早於本次策略買進，不可用備援成本去扣新買進。
             if sell_cost <= 0 and warrant_code:
-                sell_cost = safe_float(history_sell_cost_lookup.get((d, broker, warrant_code), 0), 0)
+                allow_history_fallback = (not is_counted_warrant) or has_eligible_position_lot(broker, warrant_code, d)
+                if allow_history_fallback:
+                    sell_cost = safe_float(history_sell_cost_lookup.get((d, broker, warrant_code), 0), 0)
 
             if sell_cost <= 0:
                 continue
