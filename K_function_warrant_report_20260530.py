@@ -1903,7 +1903,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rep_y = y - 0.060
                 amount_y = (branch_y + rep_y) / 2
                 ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + 0.425, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                ax_top.text(x0 + card_w - 0.018, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
                 ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
                 ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
@@ -1925,14 +1925,16 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                               zorder=2)
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
-        ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top")
+    notes_wrap_width = 29
+    notes_fontsize = 33
     y = 0.79
     for p in key_points[:4]:
-        ax_notes.text(0.04, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        ax_notes.text(0.04, y, "• " + wrap_text(p, width=notes_wrap_width, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=notes_fontsize, ha="left", va="top")
         y -= 0.165
     y = 0.79
     for p in news_points[:5]:
-        ax_notes.text(0.54, y, "• " + wrap_text(p, width=34, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=29, ha="left", va="top")
+        ax_notes.text(0.54, y, "• " + wrap_text(p, width=notes_wrap_width, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=notes_fontsize, ha="left", va="top")
         y -= 0.165
 
     # x ticks
