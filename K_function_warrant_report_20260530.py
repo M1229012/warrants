@@ -607,7 +607,7 @@ def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
                 ha="center", va="center", fontsize=26, color=MUTED)
         return
 
-    c_foreign = "#7CB5EC"  # 外資
+    c_foreign = "#1D2B44"  # 外資
     c_invest = "#F59E0B"   # 投信
     c_dealer = "#9CA3AF"   # 自營商
 
