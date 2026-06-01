@@ -46,8 +46,7 @@ DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower()
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
 MAX_WORKERS   = 50
-DAYS_HISTORY  = int(os.getenv("INITIAL_HISTORY_DAYS", os.getenv("DAYS_HISTORY", "750")))
-DAILY_UPDATE_DAYS = int(os.getenv("DAILY_UPDATE_DAYS", "5"))
+DAYS_HISTORY  = 250
 RECENT_RANKING_DAYS = 62
 SELL_DETAIL_DAYS = int(os.getenv("SELL_DETAIL_DAYS", "3"))
 D_WINDOW_DAYS = 10
@@ -63,82 +62,13 @@ PRESCAN_WORKERS = int(os.getenv("PRESCAN_WORKERS", "60"))
 FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
 
 # 加速模式：
-# 1. 有候選組合快取時，仍會每天補掃今日有成交權證最近 CACHE_RECENT_SCAN_DAYS 天，
+# 1. 有候選組合快取時，仍會每天補掃全市場最近 CACHE_RECENT_SCAN_DAYS 天，
 #    用來發現新權證 / 新候選組合；舊候選資料則優先使用快取，避免重抓完整歷史。
 #    FAST_SKIP_RECENT_PRESCAN 僅保留為相容舊設定，不再作為每日主流程的跳過依據。
 # 2. B / C / D 工作表的 D+ 欄位只使用標的股價格，預設不再額外抓群組事件中每一檔權證價格。
 #    若未來需要群組事件權證明細價格，可設定 FETCH_GROUP_WARRANT_PRICES=1。
 FAST_SKIP_RECENT_PRESCAN = os.getenv("FAST_SKIP_RECENT_PRESCAN", "0").strip().lower() not in ("0", "false", "no")
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
-
-# 每日收盤快速更新模式：
-# DATA_UPDATE_ONLY=1 時，只執行「OpenAPI 今日有成交權證 → API4 預篩 → API5 補資料 → append / merge 到快取_分點歷史」。
-# 會跳過完整 A/B/C/D 重算、價格補抓、Excel 產生與結果工作表同步，適合每天測試收盤後新資料更新速度。
-# DATA_UPDATE_ONLY=0 時，維持原本完整報表流程。
-DATA_UPDATE_ONLY = os.getenv("DATA_UPDATE_ONLY", "0").strip().lower() in ("1", "true", "yes")
-
-# 價格補抓開關：
-# SKIP_PRICE_FETCH=1 時，Step 4 不再補抓 TWSE / TPEx / Yahoo 價格，只讀取既有快取_價格。
-# 適合每日快速產生 / 更新買賣超資料；若需要完整 D+1～D+20、標的股股價、5MA、20MA，再設為 0 手動跑一次。
-SKIP_PRICE_FETCH = os.getenv("SKIP_PRICE_FETCH", "0").strip().lower() in ("1", "true", "yes")
-
-# 報表資料範圍開關：
-# REPORT_FULL_HISTORY=1：完整歷史快取重算 A/B/C/D 與勝率，資料最完整但較慢。
-# REPORT_FULL_HISTORY=0：不再用本次候選資料覆蓋主結果表；主結果表仍保留完整歷史，
-#                        本次候選資料會另外輸出到「今日_*」工作表，避免舊結果表被洗掉。
-REPORT_FULL_HISTORY = os.getenv("REPORT_FULL_HISTORY", "1").strip().lower() not in ("0", "false", "no")
-
-# 今日圖片 / 推播資料來源：
-# TODAY_IMAGE_USE_CURRENT_CANDIDATES=1 時，會用本次 OpenAPI + API4 + API5 命中的候選資料，
-# 另外建立「今日_A_單檔大買 / 今日_B_同標的單日合計 / 今日_C_同標的3日累積 / 今日_D_近10日累積淨買進」工作表。
-# 主 A/B/C/D 結果表仍使用完整歷史資料，不會被本次候選資料覆蓋。
-TODAY_IMAGE_USE_CURRENT_CANDIDATES = os.getenv("TODAY_IMAGE_USE_CURRENT_CANDIDATES", "1").strip().lower() not in ("0", "false", "no")
-
-# 價格補抓範圍：
-# today / current / current_candidates：每日盤後預設模式，只針對「今日_*」本次候選事件補抓缺少的價格。
-#                                   主 A/B/C/D 完整歷史表只使用既有「快取_價格」，不為舊歷史事件大量補價。
-# full / all / history：完整回測模式，針對主 A/B/C/D + 今日_* 全部事件補抓缺少的價格，速度較慢但價格最完整。
-# 搭配 SKIP_PRICE_FETCH=1 時，仍會完全跳過外部價格補抓。
-PRICE_FETCH_SCOPE = os.getenv("PRICE_FETCH_SCOPE", "today").strip().lower()
-if PRICE_FETCH_SCOPE not in ("today", "current", "current_candidates", "full", "all", "history"):
-    print(f"  ⚠️ PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE} 不支援，改用 today 每日盤後價格模式。")
-    PRICE_FETCH_SCOPE = "today"
-
-# ══════════════════════════════════════════════════════════════════════
-# 兩種執行方案
-# ══════════════════════════════════════════════════════════════════════
-# RUN_PLAN=daily_signal：精選 5 分點當日買賣超產圖模式。
-#   - 每天收盤後快速抓最新資料、更新快取_分點歷史、產生今日_A/B/C/D 工作表。
-#   - 強制 RUN_MODE=1，只追蹤精選 5 分點。
-#   - 新舊候選都只抓最近 DAILY_SIGNAL_API5_DAYS 筆 API5，不抓 250/750 筆歷史。
-#   - 只建立今日_A/B/C/D、價格狀態與顏色說明，不重算完整歷史勝率與排行。
-#   - 價格只補今日圖片需要的權證 / 標的股價格。
-# RUN_PLAN=full_report：完整資料回補與回測模式。
-#   - 適合其他時間手動跑完整資料、完整歷史 A/B/C/D、勝率、排行與完整價格補抓。
-RUN_PLAN_RAW = os.getenv("RUN_PLAN", os.getenv("EXECUTION_PLAN", os.getenv("JOB_MODE", "daily_signal"))).strip()
-RUN_PLAN_LOOKUP_KEY = RUN_PLAN_RAW.lower()
-RUN_PLAN_ALIASES = {
-    "daily": "daily_signal",
-    "daily_signal": "daily_signal",
-    "daily_image": "daily_signal",
-    "today": "daily_signal",
-    "today_image": "daily_signal",
-    "selected5_today": "daily_signal",
-    "精選5分點當日買賣超產圖": "daily_signal",
-    "精選5分點當日買賣超": "daily_signal",
-    "full": "full_report",
-    "full_report": "full_report",
-    "full_history": "full_report",
-    "backtest": "full_report",
-    "完整資料回補與回測": "full_report",
-    "完整資料": "full_report",
-}
-RUN_PLAN = RUN_PLAN_ALIASES.get(RUN_PLAN_RAW, RUN_PLAN_ALIASES.get(RUN_PLAN_LOOKUP_KEY, "daily_signal"))
-IS_DAILY_SIGNAL_MODE = RUN_PLAN == "daily_signal"
-IS_FULL_REPORT_MODE = RUN_PLAN == "full_report"
-DAILY_SIGNAL_API5_DAYS = int(os.getenv("DAILY_SIGNAL_API5_DAYS", "12"))
-if DAILY_SIGNAL_API5_DAYS < D_WINDOW_DAYS:
-    DAILY_SIGNAL_API5_DAYS = D_WINDOW_DAYS + 2
 
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
@@ -151,38 +81,8 @@ BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "candidates_cache.csv")
 CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
 CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
-# OpenAPI 今日有成交權證版本專用候選快取，避免沿用舊版「全組合」候選快取造成 95,000+ 組 API5 更新。
-CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_openapi_active_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
-# 每日產圖專用原始買賣超快取：
-# 用來保存 API5 每天抓到的原始分點買賣超資料，尤其是「單檔未滿 100 萬、但未來可能組成 B/C/D」的資料。
-# 欄位格式與 快取_分點歷史 相同；每日 A/B/C/D 會以這張原始快取 + 快取_分點歷史 合併後作為計算來源。
-DAILY_RAW_CACHE_PATH  = os.path.join(CACHE_DIR, "daily_broker_warrant_raw_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
-
-# OpenAPI 每日成交資料防呆快取：
-# 平常交易日抓到 TWSE + TPEx 正常資料時，會把標準化後的官方 OpenAPI 每日成交資料存起來。
-# 假日或官方 API 暫時回傳空資料時，會自動改用最近一次非空快取，避免產出「少掉上市 / 上櫃權證」的錯圖。
-OPENAPI_DAILY_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_cache.csv")
-OPENAPI_DAILY_TWSE_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_twse_cache.csv")
-OPENAPI_DAILY_TPEX_CACHE_PATH = os.path.join(CACHE_DIR, "openapi_warrant_daily_tpex_cache.csv")
-OPENAPI_FALLBACK_ENABLE = os.getenv("OPENAPI_FALLBACK_ENABLE", "1").strip().lower() not in ("0", "false", "no")
-OPENAPI_FAIL_ON_FALLBACK = os.getenv("OPENAPI_FAIL_ON_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
-OPENAPI_DATA_SOURCE_INFO = {
-    "source_mode": "live",
-    "used_fallback": False,
-    "warning": "",
-    "latest_trade_date": "",
-    "twse_rows": 0,
-    "tpex_rows": 0,
-}
-
-# 歷史分點資料保護：
-# 1. 第一次或 GitHub Actions 執行時，會優先讀取 Google Sheet「快取_分點歷史」作為歷史基底。
-# 2. 每日新抓 API5 資料時，只 append / 合併新日期，不整組覆蓋舊資料。
-# 3. 寫回 Google Sheet 前，再把雲端既有「快取_分點歷史」合併一次，避免因本機快取不完整而洗掉舊歷史。
-HISTORY_CACHE_APPEND_ONLY = os.getenv("HISTORY_CACHE_APPEND_ONLY", "1").strip().lower() not in ("0", "false", "no")
-HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE = os.getenv("HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE", "1").strip().lower() not in ("0", "false", "no")
 
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
@@ -199,30 +99,14 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
-# OpenAPI 版本預篩天數：只針對「今日有成交認購權證」用 API4 找目標分點候選。
-# 找到候選後才會進 API5；不再建立「權證 × 分點」全組合。
-OPENAPI_ACTIVE_PRESCAN_DAYS = int(os.getenv("OPENAPI_ACTIVE_PRESCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
-# ACTIVE_WARRANT_FORCE_REFRESH=1：每天測試新資料速度時，不沿用候選組合快取，
-# 直接以本次 OpenAPI 今日有成交權證 + API4 預篩命中的候選為準，
-# 避免舊版「今日有成交權證 × 精選分點」的 8~9 萬組候選被快取帶回來。
-ACTIVE_WARRANT_FORCE_REFRESH = os.getenv("ACTIVE_WARRANT_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
-
-# 全市場每日標的 TOP20：
-# 這組榜單不受 RUN_MODE / TARGET_PATTERNS / 精選 5 分點限制。
-# 流程是：OpenAPI 今日有成交認購權證 → API4 找該權證當日所有分點 → API5 回查當日買賣超 → 依標的彙總。
-FULL_MARKET_TOP20_ENABLE = os.getenv("FULL_MARKET_TOP20_ENABLE", "0").strip().lower() not in ("0", "false", "no")
-FULL_MARKET_TOP20_API4_WORKERS = int(os.getenv("FULL_MARKET_TOP20_API4_WORKERS", str(PRESCAN_WORKERS)))
-FULL_MARKET_TOP20_API5_WORKERS = int(os.getenv("FULL_MARKET_TOP20_API5_WORKERS", str(MAX_WORKERS)))
-FULL_MARKET_TOP20_DAYS = int(os.getenv("FULL_MARKET_TOP20_DAYS", str(max(DAILY_UPDATE_DAYS, 5))))
-FULL_MARKET_TOP20_LIMIT_WARRANTS = int(os.getenv("FULL_MARKET_TOP20_LIMIT_WARRANTS", "0"))
+# RUN_MODE=1 精選 5 分點完整追蹤設定：
+# SELECTED_FORCE_ALL_WARRANTS=1：不再只靠 API4 prescan 候選，而是直接建立「所有認購權證 × 精選分點」候選池。
+# SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
+SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
-
-# 每日產圖模式用：
-# 記錄「更新後快取_分點歷史」中，追蹤分點在目標日前已經符合 A 類的權證代號。
-# 今日 B/C/D 必須排除這些歷史 A 權證，避免同一檔權證先前已經被 A 判斷後，
-# 又因今日同標的累積條件被放進 B/C/D。
 
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
@@ -360,10 +244,8 @@ def configure_run_mode():
             for label in active_labels
             if label in FULL_FALLBACK
         }
-        # OpenAPI 今日有成交權證版本使用獨立候選快取，
-        # 避免沿用舊版 candidates_cache_selected5.csv 內的「權證 × 5 分點」全組合。
-        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH
-        print("  ✅ RUN_MODE=1：精選分點今日有成交權證追蹤模式")
+        CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_SELECTED5_PATH
+        print("  ✅ RUN_MODE=1：精選分點全市場追蹤模式")
         print(f"  ✅ 精選分點：{', '.join(TARGET_PATTERNS.keys())}")
         print(f"  ✅ 候選快取：{CANDIDATES_CACHE_PATH}")
     else:
@@ -411,33 +293,6 @@ def filter_candidates_by_broker_map(candidates, broker_map):
     return out
 
 
-def filter_candidates_by_warrant_codes(candidates, allowed_warrant_codes):
-    if not candidates:
-        return []
-
-    if not allowed_warrant_codes:
-        return []
-
-    allowed_warrant_codes = {
-        normalize_openapi_warrant_code(code)
-        for code in allowed_warrant_codes
-        if normalize_openapi_warrant_code(code)
-    }
-
-    out = []
-
-    for c in candidates:
-        try:
-            warrant_code = normalize_openapi_warrant_code(c[0])
-        except Exception:
-            continue
-
-        if warrant_code in allowed_warrant_codes:
-            out.append(c)
-
-    return out
-
-
 HDR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*",
@@ -475,7 +330,7 @@ API4 = ("https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
 
 API5 = ("https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
         "/d8/f5/27/twWarrantData.xdjjson"
-        "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1")
+        "?x=warrant-chip0002-5&c=250&a={warrant}&b={broker}&revision=2018_07_31_1")
 
 # Excel 顏色（柔和舒適版）
 RED    = PatternFill("solid", fgColor="F4CCCC")
@@ -581,16 +436,10 @@ def api4_get(code, start, end):
         return []
 
 
-def api5_get(warrant, broker, days=None):
+def api5_get(warrant, broker):
     try:
         session = get_thread_session()
-        try:
-            days = int(days if days is not None else DAYS_HISTORY)
-        except Exception:
-            days = DAYS_HISTORY
-        if days <= 0:
-            days = DAYS_HISTORY
-        r = session.get(API5.format(warrant=warrant, broker=broker, days=days), headers=HDR, timeout=(5, 12))
+        r = session.get(API5.format(warrant=warrant, broker=broker), headers=HDR, timeout=(5, 12))
         data = json.loads(r.content.decode("utf-8"))
         rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
         return rs.get("Result", [])
@@ -1209,7 +1058,7 @@ def get_price_nearest(prices, date):
 # Google Sheet 快取 / 結果同步工具（GitHub Actions 部署用）
 # ══════════════════════════════════════════════════════════════════════
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼_2")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
@@ -1232,12 +1081,7 @@ CACHE_SHEET_NAME_MAP = {
     "broker_map_cache.csv": "快取_分點代號",
     "candidates_cache.csv": "快取_候選組合",
     "candidates_cache_selected5.csv": "快取_候選組合_精選5",
-    "candidates_cache_openapi_active_selected5.csv": "快取_候選組合_OpenAPI精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
-    "daily_broker_warrant_raw_cache.csv": "快取_每日分點權證原始買賣超",
-    "openapi_warrant_daily_cache.csv": "快取_OpenAPI每日成交",
-    "openapi_warrant_daily_twse_cache.csv": "快取_OpenAPI每日成交_TWSE",
-    "openapi_warrant_daily_tpex_cache.csv": "快取_OpenAPI每日成交_TPEx",
     "price_cache.csv": "快取_價格",
 }
 
@@ -2943,280 +2787,49 @@ def candidate_key_from_values(warrant_code, broker_code):
     return (str(warrant_code).strip(), str(broker_code).strip())
 
 
-
-_UNDERLYING_LOOKUP_CACHE = None
-
-
-def _first_non_empty(*values):
-    for value in values:
-        s = str(value or "").strip()
-        if s and s.lower() not in ("nan", "none", "null"):
-            return s
-    return ""
-
-
-def _read_raw_cache_frame_for_lookup(path):
-    """
-    只給標的股對照表使用的安全讀取函式。
-
-    注意：
-    這裡不能呼叫 read_cache_csv()，避免又觸發標準快取流程造成遞迴或額外寫回。
-    順序：本機 CSV → Google Sheet 快取。
-    """
-    frames = []
-
-    try:
-        if os.path.exists(path):
-            df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
-            if df is not None and not df.empty:
-                frames.append(df)
-    except Exception:
-        pass
-
-    try:
-        df_gs = read_cache_from_gsheet(path)
-        if df_gs is not None and not df_gs.empty:
-            frames.append(df_gs.fillna(""))
-    except Exception:
-        pass
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(frames, ignore_index=True).fillna("")
-
-
-def build_underlying_lookup_from_existing_sources():
-    """
-    建立更穩定的「權證 → 標的股」對照表。
-
-    這是修正每日產圖少資料的關鍵：
-    官方 OpenAPI 只有權證代號 / 權證名稱 / 成交量，沒有標的股代號。
-    若快取_權證清單曾被 OpenAPI 有成交清單覆蓋成空白標的股，B/C/D 會因為沒有標的股而直接略過。
-
-    新版會同時從以下來源回補：
-    1. 快取_權證清單 / warrants_cache.csv
-    2. 快取_分點歷史 / broker_warrant_history_cache.csv
-    3. 快取_候選組合_OpenAPI精選5 / 其他候選快取
-
-    原則：只要任何來源有非空標的股，就保留下來；新的空白資料不能蓋掉舊的正確標的股。
-    """
-    code_map = {}
-    stock_map = {}
-
-    def add_mapping(warrant_code, warrant_name="", underlying_code="", underlying_name=""):
-        code = normalize_openapi_warrant_code(warrant_code)
-        if not code:
-            return
-
-        name = str(warrant_name or "").strip()
-        ucode = str(underlying_code or "").strip()
-        uname = str(underlying_name or "").strip()
-
-        rec = code_map.setdefault(code, {
-            "代號": code,
-            "名稱": "",
-            "標的股": "",
-            "標的名稱": "",
-        })
-
-        rec["名稱"] = _first_non_empty(rec.get("名稱", ""), name)
-        rec["標的股"] = _first_non_empty(rec.get("標的股", ""), ucode)
-        rec["標的名稱"] = _first_non_empty(rec.get("標的名稱", ""), uname)
-
-        if rec.get("標的股") and rec.get("標的名稱"):
-            stock_map[rec["標的名稱"]] = rec["標的股"]
-
-    # 1) 權證清單快取
-    df_warrants = _read_raw_cache_frame_for_lookup(WARRANTS_CACHE_PATH)
-    if df_warrants is not None and not df_warrants.empty:
-        for _, row in df_warrants.iterrows():
-            add_mapping(
-                row.get("代號", ""),
-                row.get("名稱", ""),
-                row.get("標的股", ""),
-                row.get("標的名稱", ""),
-            )
-
-    # 2) 分點歷史快取。這張通常最可靠，因為舊版完整資料曾經正確寫入標的股。
-    df_history = _read_raw_cache_frame_for_lookup(HISTORY_CACHE_PATH)
-    if df_history is not None and not df_history.empty:
-        for _, row in df_history.iterrows():
-            add_mapping(
-                row.get("權證代號", ""),
-                row.get("權證名稱", ""),
-                row.get("標的股", ""),
-                row.get("標的名稱", ""),
-            )
-
-    # 3) 候選組合快取。補強部分還沒進歷史，但候選快取有標的股的資料。
-    candidate_paths = [
-        CANDIDATES_CACHE_PATH,
-        CANDIDATES_CACHE_ALL_PATH,
-        CANDIDATES_CACHE_SELECTED5_PATH,
-        CANDIDATES_CACHE_OPENAPI_ACTIVE_SELECTED5_PATH,
-    ]
-    seen_paths = []
-    for cp in candidate_paths:
-        if cp and cp not in seen_paths:
-            seen_paths.append(cp)
-
-    for cp in seen_paths:
-        df_candidates = _read_raw_cache_frame_for_lookup(cp)
-        if df_candidates is None or df_candidates.empty:
-            continue
-        for _, row in df_candidates.iterrows():
-            add_mapping(
-                row.get("權證代號", ""),
-                row.get("權證名稱", ""),
-                row.get("標的股", ""),
-                row.get("標的名稱", ""),
-            )
-
-    return code_map, stock_map
-
-
-def get_underlying_lookup_cache(force_reload=False):
-    global _UNDERLYING_LOOKUP_CACHE
-
-    if _UNDERLYING_LOOKUP_CACHE is not None and not force_reload:
-        return _UNDERLYING_LOOKUP_CACHE
-
-    code_map, stock_map = build_underlying_lookup_from_existing_sources()
-    resolver = build_underlying_resolver(stock_map) if stock_map else []
-
-    _UNDERLYING_LOOKUP_CACHE = {
-        "code_map": code_map,
-        "stock_map": stock_map,
-        "resolver": resolver,
-    }
-
-    mapped_count = sum(1 for rec in code_map.values() if rec.get("標的股"))
-    print(f"  ♻️ 標的股對照表建立完成：權證 {len(code_map):,} 支，其中有標的股 {mapped_count:,} 支；標的名稱 {len(stock_map):,} 個")
-    return _UNDERLYING_LOOKUP_CACHE
-
-
-def backfill_underlying_for_warrant(warrant_code, warrant_name="", underlying_code="", underlying_name=""):
-    """
-    回補單一權證的標的股資料。
-
-    優先順序：
-    1. 呼叫端已經給的標的股
-    2. 權證代號對照表
-    3. 權證名稱最長前綴推回標的股
-    """
-    ucode = str(underlying_code or "").strip()
-    uname = str(underlying_name or "").strip()
-
-    if ucode:
-        return ucode, uname
-
-    lookup = get_underlying_lookup_cache()
-    code = normalize_openapi_warrant_code(warrant_code)
-    name = str(warrant_name or "").strip()
-
-    rec = lookup.get("code_map", {}).get(code, {})
-    ucode = _first_non_empty(rec.get("標的股", ""), ucode)
-    uname = _first_non_empty(rec.get("標的名稱", ""), uname)
-
-    if ucode:
-        return ucode, uname
-
-    stock_map = lookup.get("stock_map", {})
-    resolver = lookup.get("resolver", [])
-    if name and stock_map:
-        ucode2, uname2 = find_underlying_info(name, stock_map, resolver)
-        if ucode2:
-            return ucode2, uname2
-
-    return "", uname
-
-
-def fill_missing_underlying_fields(df):
-    """把同一檔權證在不同來源中的非空標的股補回空白列。"""
-    if df is None or df.empty or "權證代號" not in df.columns:
-        return df
-
-    df = df.copy().fillna("")
-    for col in ["權證名稱", "標的股", "標的名稱"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    # 先依同一權證代號內的非空資料回補。
-    for code, idxs in df.groupby("權證代號").groups.items():
-        idxs = list(idxs)
-        for col in ["權證名稱", "標的股", "標的名稱"]:
-            non_empty = [str(v).strip() for v in df.loc[idxs, col].tolist() if str(v).strip()]
-            if non_empty:
-                df.loc[idxs, col] = df.loc[idxs, col].map(lambda v, _fill=non_empty[0]: str(v).strip() or _fill)
-
-    # 再用全域 lookup 回補仍然空白的標的股。
-    try:
-        for idx, row in df.iterrows():
-            if str(row.get("標的股", "")).strip():
-                continue
-            ucode, uname = backfill_underlying_for_warrant(
-                row.get("權證代號", ""),
-                row.get("權證名稱", ""),
-                row.get("標的股", ""),
-                row.get("標的名稱", ""),
-            )
-            if ucode:
-                df.at[idx, "標的股"] = ucode
-                if uname:
-                    df.at[idx, "標的名稱"] = uname
-    except Exception:
-        pass
-
-    return df
-
 def save_warrants_cache(warrants):
     if not USE_CACHE or not warrants:
         return
 
+    df = pd.DataFrame(warrants)
+
     wanted_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    new_df = pd.DataFrame(warrants).fillna("")
-
     for col in wanted_cols:
-        if col not in new_df.columns:
-            new_df[col] = ""
+        if col not in df.columns:
+            df[col] = ""
 
-    new_df = new_df[wanted_cols].copy()
-    new_df["代號"] = new_df["代號"].map(normalize_openapi_warrant_code)
-
-    # 重要修正：OpenAPI 每日成交檔沒有標的股。
-    # 新資料若標的股空白，不能覆蓋舊快取中已經存在的正確標的股，
-    # 否則 B/C/D 會因標的股空白而少資料。
-    old_df = _read_raw_cache_frame_for_lookup(WARRANTS_CACHE_PATH)
-    if old_df is not None and not old_df.empty:
-        for col in wanted_cols:
-            if col not in old_df.columns:
-                old_df[col] = ""
-        old_df = old_df[wanted_cols].copy().fillna("")
-        old_df["代號"] = old_df["代號"].map(normalize_openapi_warrant_code)
-        combined = pd.concat([old_df, new_df], ignore_index=True)
-    else:
-        combined = new_df
-
-    # 同一權證代號保留非空資料，新的空白欄位不會把舊的標的股洗掉。
-    combined = combined.fillna("")
-    rows = []
-    for code, g in combined.groupby("代號", sort=False):
-        if not str(code).strip():
-            continue
-        rows.append({
-            "代號": code,
-            "名稱": _first_non_empty(*g["名稱"].tolist()),
-            "標的股": _first_non_empty(*g["標的股"].tolist()),
-            "標的名稱": _first_non_empty(*g["標的名稱"].tolist()),
-        })
-
-    df = pd.DataFrame(rows, columns=wanted_cols)
-    write_cache_csv(df, WARRANTS_CACHE_PATH)
-    # 權證清單快取更新後，下次回補標的股要重新建立 lookup。
-    get_underlying_lookup_cache(force_reload=True)
+    write_cache_csv(df[wanted_cols], WARRANTS_CACHE_PATH)
     print(f"  💾 已更新權證清單快取：{WARRANTS_CACHE_PATH}")
 
+
+def load_warrants_cache():
+    df = read_cache_csv(WARRANTS_CACHE_PATH)
+
+    if df.empty:
+        return []
+
+    required_cols = ["代號", "名稱", "標的股", "標的名稱"]
+    for col in required_cols:
+        if col not in df.columns:
+            return []
+
+    warrants = []
+    for row in df.itertuples(index=False):
+        row = row._asdict()
+        code = str(row["代號"]).strip()
+        name = str(row["名稱"]).strip()
+
+        if not code or not name:
+            continue
+
+        warrants.append({
+            "代號": code,
+            "名稱": name,
+            "標的股": str(row.get("標的股", "")).strip(),
+            "標的名稱": str(row.get("標的名稱", "")).strip(),
+        })
+
+    return warrants
 
 
 def save_broker_map_cache(broker_map):
@@ -3352,9 +2965,7 @@ def load_history_cache():
             print(f"  ⚠️ 原始分點資料快取欄位不完整，缺少：{col}")
             return pd.DataFrame()
 
-    df = normalize_history_cache_df(df[required_cols].copy())
-    print(f"  ✅ 歷史分點快取載入完成：{len(df):,} 筆，來源可包含 Google Sheet 快取_分點歷史 / 本機快取")
-    return df
+    return df[required_cols].copy()
 
 
 def history_cache_keys(history_df):
@@ -3397,25 +3008,14 @@ def item_to_history_rows(item):
 
 
 def merge_items_into_history_cache(history_df, new_items):
-    """
-    將本次 API5 抓回來的新資料「附加 / 合併」進歷史快取。
-
-    舊版邏輯會把同一組「權證代號 + 券商代號」的所有舊資料刪掉，
-    再用本次 API5 回傳資料整組取代。這在日後只抓當日 / 近幾日更新時，
-    會把三年建檔資料覆蓋掉。
-
-    新版邏輯：
-    1. 舊資料全部保留。
-    2. 新資料直接 append。
-    3. 只在同一組「權證代號 + 券商代號 + 日期」重複時，保留最後一筆新資料。
-    4. 因此第一次抓三年建檔後，之後每天只抓當日 / 近幾日資料也不會洗掉舊歷史。
-    """
     if not new_items:
         return history_df if history_df is not None else pd.DataFrame()
 
     new_rows = []
+    new_keys = set()
 
     for item in new_items:
+        new_keys.add(candidate_key_from_values(item["warrant_code"], item["broker_code"]))
         new_rows.extend(item_to_history_rows(item))
 
     new_df = pd.DataFrame(new_rows)
@@ -3426,202 +3026,38 @@ def merge_items_into_history_cache(history_df, new_items):
     if history_df is None or history_df.empty:
         combined = new_df
     else:
-        combined = pd.concat([history_df.copy(), new_df], ignore_index=True)
-
-    required_cols = [
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數", "買進金額", "賣出金額",
-        "買超股數", "買超金額",
-    ]
-
-    for col in required_cols:
-        if col not in combined.columns:
-            combined[col] = ""
+        history_df = history_df.copy()
+        remove_mask = pd.Series(
+            [candidate_key_from_values(w, b) in new_keys for w, b in zip(history_df["權證代號"], history_df["券商代號"])],
+            index=history_df.index
+        )
+        old_keep_df = history_df[~remove_mask].copy()
+        combined = pd.concat([old_keep_df, new_df], ignore_index=True)
 
     numeric_cols = ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]
     for col in numeric_cols:
         combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype(int)
 
     combined["日期"] = combined["日期"].map(normalize_date_str)
-    combined["權證代號"] = combined["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
-    combined["券商代號"] = combined["券商代號"].astype(str).str.strip()
 
-    # 重要修正：新抓 API5 資料若標的股是空白，不能覆蓋舊歷史中的正確標的股。
-    # 先用同一權證代號的非空標的股回補，再去重保留最新買賣超數字。
-    combined = fill_missing_underlying_fields(combined)
-
-    # append 後只針對同日同組資料去重，保留最後一筆（也就是本次新抓資料）。
     combined = combined.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
         keep="last"
     )
 
-    combined = combined[required_cols].sort_values(
+    combined = combined.sort_values(
         ["權證代號", "券商代號", "日期"]
     ).reset_index(drop=True)
 
     return combined
 
 
-def normalize_history_cache_df(history_df):
-    """
-    正規化歷史分點快取欄位與型別。
-
-    這個函式專門給 append-only 歷史快取使用，確保 Google Sheet 舊資料、
-    本機 CSV 舊資料與本次 API5 新資料可以安全合併。
-    """
-    required_cols = [
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數", "買進金額", "賣出金額",
-        "買超股數", "買超金額",
-    ]
-
-    if history_df is None or history_df.empty:
-        return pd.DataFrame(columns=required_cols)
-
-    df = history_df.copy().fillna("")
-
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = df[required_cols].copy()
-
-    numeric_cols = ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-    df["日期"] = df["日期"].map(normalize_date_str)
-    df["權證代號"] = df["權證代號"].astype(str).str.strip().map(normalize_openapi_warrant_code)
-    df["券商代號"] = df["券商代號"].astype(str).str.strip()
-
-    # 讓歷史快取讀回後也自動補回同一權證的標的股，避免 B/C/D 因標的股空白被略過。
-    df = fill_missing_underlying_fields(df)
-
-    df = df.drop_duplicates(
-        subset=["權證代號", "券商代號", "日期"],
-        keep="last"
-    )
-
-    df = df.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
-    return df
-
-
-def merge_history_cache_frames(base_df, add_df):
-    """
-    append-only 合併歷史分點資料。
-
-    用途：
-    - base_df：Google Sheet / 本機既有歷史資料
-    - add_df：本次 API5 新抓資料或本機合併資料
-
-    合併規則：
-    - 舊資料保留
-    - 新資料附加
-    - 同一 權證代號 + 券商代號 + 日期 重複時保留最後一筆
-    """
-    base_df = normalize_history_cache_df(base_df)
-    add_df = normalize_history_cache_df(add_df)
-
-    if base_df.empty:
-        return add_df
-
-    if add_df.empty:
-        return base_df
-
-    combined = pd.concat([base_df, add_df], ignore_index=True)
-    return normalize_history_cache_df(combined)
-
-
 def save_history_cache(history_df):
     if not USE_CACHE or history_df is None or history_df.empty:
         return
 
-    history_df = normalize_history_cache_df(history_df)
-
-    # 防呆重點：每日更新不應該洗掉 Google Sheet 既有「快取_分點歷史」。
-    # 因此寫回前再讀一次雲端歷史快取，把雲端舊資料與本次資料 append 合併。
-    if HISTORY_CACHE_APPEND_ONLY and HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE and GSHEET_CACHE_ENABLED and gsheet_enabled():
-        try:
-            gsheet_history_df = read_cache_from_gsheet(HISTORY_CACHE_PATH)
-            if gsheet_history_df is not None and not gsheet_history_df.empty:
-                before_rows = len(history_df)
-                gsheet_rows = len(gsheet_history_df)
-                history_df = merge_history_cache_frames(gsheet_history_df, history_df)
-                print(
-                    f"  🔒 append-only 歷史保護：已合併 Google Sheet 既有快取 {gsheet_rows:,} 筆 "
-                    f"+ 本次本機歷史 {before_rows:,} 筆 → 寫回 {len(history_df):,} 筆"
-                )
-        except Exception as e:
-            print(f"  ⚠️ append-only 歷史保護讀取 Google Sheet 失敗，改用本機合併結果寫回：{type(e).__name__}: {e}")
-
     write_cache_csv(history_df, HISTORY_CACHE_PATH)
-    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}，共 {len(history_df):,} 筆")
-
-
-def load_daily_raw_cache():
-    """
-    讀取每日產圖專用原始買賣超快取。
-
-    這張快取專門保存 API5 每天抓到的原始資料，不論單檔是否達 100 萬都保存。
-    目的：避免「今天單檔未達 A，但與歷史資料合併後可形成 B/C/D」的權證被漏算。
-    """
-    df = read_cache_csv(DAILY_RAW_CACHE_PATH)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    required_cols = [
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數", "買進金額", "賣出金額",
-        "買超股數", "買超金額",
-    ]
-
-    for col in required_cols:
-        if col not in df.columns:
-            print(f"  ⚠️ 每日原始買賣超快取欄位不完整，缺少：{col}")
-            return pd.DataFrame()
-
-    df = normalize_history_cache_df(df[required_cols].copy())
-    print(f"  ✅ 每日原始買賣超快取載入完成：{len(df):,} 筆")
-    return df
-
-
-def save_daily_raw_cache(raw_df):
-    """
-    寫入每日產圖專用原始買賣超快取。
-
-    這裡不套用 save_history_cache() 的完整歷史二次讀取保護，避免每日產圖模式又多讀一次大型快取。
-    raw_df 本身已經透過 merge_history_cache_frames / merge_items_into_history_cache 做 append + 去重。
-    """
-    if not USE_CACHE or raw_df is None or raw_df.empty:
-        return
-
-    raw_df = normalize_history_cache_df(raw_df)
-    write_cache_csv(raw_df, DAILY_RAW_CACHE_PATH)
-    print(f"  💾 已更新每日原始買賣超快取：{DAILY_RAW_CACHE_PATH}，共 {len(raw_df):,} 筆")
-
-
-def merge_daily_raw_cache_with_history(history_df):
-    """
-    將 快取_分點歷史 與 快取_每日分點權證原始買賣超 合併成每日訊號計算來源。
-
-    A/B/C/D 每日產圖只應該從原始買賣超資料計算，不能從 A/B/C/D 結果表反推。
-    """
-    daily_raw_df = load_daily_raw_cache()
-
-    if daily_raw_df is None or daily_raw_df.empty:
-        return normalize_history_cache_df(history_df)
-
-    combined = merge_history_cache_frames(history_df, daily_raw_df)
-    print(
-        f"  ✅ 每日訊號原始資料來源合併完成：快取_分點歷史 {0 if history_df is None else len(history_df):,} 筆 "
-        f"+ 每日原始快取 {len(daily_raw_df):,} 筆 → {len(combined):,} 筆"
-    )
-    return combined
+    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}")
 
 
 def items_from_history_cache(history_df, candidate_filter=None):
@@ -3678,380 +3114,29 @@ def items_from_history_cache(history_df, candidate_filter=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Step 1：官方 OpenAPI 取「最新交易日有成交量」認購權證 + 標的股代號
+# Step 1：取所有認購權證 + 標的股代號
 # ══════════════════════════════════════════════════════════════════════
 
-TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
-TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
-TPEX_WARRANT_DAILY_OPENAPI_URLS = [
-    "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O",
-    "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_warrant_trading_overview",
-]
-
-OPENAPI_WARRANT_HEADERS = {
-    "User-Agent": HDR.get("User-Agent", "Mozilla/5.0"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-
-def normalize_openapi_trade_date(date_value):
-    """
-    官方 OpenAPI 權證每日成交資料日期格式：
-    1150529 -> 2026/05/29
-    115/05/29 -> 2026/05/29
-    20260529 -> 2026/05/29
-    2026/05/29 -> 2026/05/29
-    """
-    s = str(date_value or "").strip()
-
-    if not s:
-        return ""
-
-    s = s.replace("-", "/").replace(".", "/")
-
-    if re.fullmatch(r"\d{7}", s):
-        y = int(s[:3]) + 1911
-        m = int(s[3:5])
-        d = int(s[5:7])
-        return f"{y:04d}/{m:02d}/{d:02d}"
-
-    if re.fullmatch(r"\d{8}", s):
-        y = int(s[:4])
-        m = int(s[4:6])
-        d = int(s[6:8])
-        if y >= 1911:
-            return f"{y:04d}/{m:02d}/{d:02d}"
-
-    m = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", s)
-    if m:
-        y = int(m.group(1))
-        mm = int(m.group(2))
-        dd = int(m.group(3))
-
-        if y < 1911:
-            y += 1911
-
-        return f"{y:04d}/{mm:02d}/{dd:02d}"
-
-    return s
-
-
-def parse_openapi_trade_date_for_sort(date_value):
-    try:
-        return datetime.strptime(normalize_openapi_trade_date(date_value), "%Y/%m/%d")
-    except Exception:
-        return datetime.min
-
-
-def clean_openapi_number(value):
-    if value is None:
-        return 0
-
-    s = str(value).strip()
-
-    if not s or s in ("-", "--", "None", "nan", "null"):
-        return 0
-
-    s = s.replace(",", "").replace(" ", "").replace("\u3000", "")
-    s = re.sub(r"[^0-9.\-]", "", s)
-
-    if not s or s in ("-", "."):
-        return 0
-
-    try:
-        return int(round(float(s)))
-    except Exception:
-        return 0
-
-
-def normalize_openapi_warrant_code(code):
-    s = str(code or "").strip().upper()
-
-    if s.endswith(".0"):
-        s = s[:-2]
-
-    # 認售權證常有 T 字尾；這裡最後只保留認購，所以代號需為 6 碼數字。
-    if s.isdigit() and len(s) == 5:
-        s = s.zfill(6)
-
-    return s
-
-
-def fetch_openapi_json(url, source_name):
-    print(f"  🌐 抓取{source_name} OpenAPI：{url}")
-
-    try:
-        session = get_thread_session()
-        r = session.get(url, headers=OPENAPI_WARRANT_HEADERS, timeout=(8, 30))
-        r.raise_for_status()
-        data = r.json()
-
-        if not isinstance(data, list):
-            raise RuntimeError(f"{source_name} OpenAPI 回傳格式不是 list：{type(data)}")
-
-        print(f"  ✅ {source_name} 原始筆數：{len(data):,}")
-        return data
-    except Exception as e:
-        print(f"  ⚠️ {source_name} OpenAPI 抓取失敗：{type(e).__name__}: {e}")
-        return []
-
-
-def fetch_twse_openapi_warrant_daily_df():
-    data = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
-    df = pd.DataFrame(data).fillna("")
-
-    if df.empty:
-        return pd.DataFrame()
-
-    required_cols = ["出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"]
-    missing = [col for col in required_cols if col not in df.columns]
-
-    if missing:
-        print(f"  ⚠️ 上市 TWSE 欄位不完整，缺少：{missing}，實際欄位：{df.columns.tolist()}")
-        return pd.DataFrame()
-
-    out = pd.DataFrame()
-    out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
-    out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-    out["市場"] = "上市"
-    out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-    out["名稱"] = df["權證名稱"].astype(str).str.strip()
-    out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    out["成交量"] = df["成交張數"].map(clean_openapi_number)
-
-    return out
-
-
-def fetch_tpex_openapi_warrant_daily_df():
-    """
-    取得 TPEx 上櫃權證每日成交資料。
-
-    TPEx OpenAPI 偶爾會短暫回傳空 list。若直接繼續跑，7xxxxx 上櫃權證會整批漏掉，
-    今日買超圖與 B/C/D 都會錯。因此這裡會重試；若仍為 0，主流程會停止，不產圖。
-    """
-    last_df = pd.DataFrame()
-
-    urls = []
-    for url in TPEX_WARRANT_DAILY_OPENAPI_URLS:
-        if url and url not in urls:
-            urls.append(url)
-
-    for attempt in range(1, 4):
-        for url in urls:
-            data = fetch_openapi_json(url, f"上櫃 TPEx 第{attempt}次")
-            df = pd.DataFrame(data).fillna("")
-
-            if df.empty:
-                continue
-
-            required_cols = ["Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"]
-            missing = [col for col in required_cols if col not in df.columns]
-
-            if missing:
-                print(f"  ⚠️ 上櫃 TPEx 欄位不完整，缺少：{missing}，實際欄位：{df.columns.tolist()}")
-                continue
-
-            out = pd.DataFrame()
-            out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
-            out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-            out["市場"] = "上櫃"
-            out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-            out["名稱"] = df["權證名稱"].astype(str).str.strip()
-            out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-            out["成交量"] = df["成交數量"].map(clean_openapi_number)
-
-            if not out.empty:
-                return out
-
-            last_df = out
-
-        if attempt < 3:
-            print("  ⚠️ TPEx OpenAPI 暫時沒有資料，等待 5 秒後重試...")
-            time.sleep(5)
-
-    return last_df
-
-
-OPENAPI_DAILY_CACHE_COLS = ["出表日期", "交易日期", "市場", "代號", "名稱", "成交金額", "成交量"]
-
-
-def normalize_openapi_daily_cache_df(df):
-    """把 live / cache / 本地檔案的 OpenAPI 每日成交資料統一成標準欄位。"""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-    df = df.copy().fillna("")
-
-    # 已經是標準格式。
-    if all(col in df.columns for col in ["交易日期", "市場", "代號", "名稱", "成交量"]):
-        out = pd.DataFrame()
-        out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date) if "出表日期" in df.columns else df["交易日期"].map(normalize_openapi_trade_date)
-        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-        out["市場"] = df["市場"].astype(str).str.strip()
-        out["代號"] = df["代號"].map(normalize_openapi_warrant_code)
-        out["名稱"] = df["名稱"].astype(str).str.strip()
-        out["成交金額"] = df["成交金額"].map(clean_openapi_number) if "成交金額" in df.columns else 0
-        out["成交量"] = df["成交量"].map(clean_openapi_number)
-        return out[OPENAPI_DAILY_CACHE_COLS].copy()
-
-    # TWSE 原始格式。
-    if all(col in df.columns for col in ["出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"]):
-        out = pd.DataFrame()
-        out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
-        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-        out["市場"] = "上市"
-        out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-        out["名稱"] = df["權證名稱"].astype(str).str.strip()
-        out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-        out["成交量"] = df["成交張數"].map(clean_openapi_number)
-        return out[OPENAPI_DAILY_CACHE_COLS].copy()
-
-    # TPEx 原始格式。
-    if all(col in df.columns for col in ["交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"]):
-        out = pd.DataFrame()
-        date_source_col = "Date" if "Date" in df.columns else "交易日期"
-        out["出表日期"] = df[date_source_col].map(normalize_openapi_trade_date)
-        out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
-        out["市場"] = "上櫃"
-        out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
-        out["名稱"] = df["權證名稱"].astype(str).str.strip()
-        out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-        out["成交量"] = df["成交數量"].map(clean_openapi_number)
-        return out[OPENAPI_DAILY_CACHE_COLS].copy()
-
-    return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-
-def save_openapi_daily_cache_df(df, path, label):
-    """只在資料非空時更新 OpenAPI 防呆快取，避免假日空資料覆蓋最後有效檔。"""
-    df = normalize_openapi_daily_cache_df(df)
-    if df.empty:
-        return
-
-    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
-    write_cache_csv(df[OPENAPI_DAILY_CACHE_COLS], path)
-    print(f"  💾 已更新 {label} 防呆快取：{path}，共 {len(df):,} 筆")
-
-
-def load_openapi_daily_cache_df(path, label="OpenAPI 防呆快取"):
-    df = read_cache_csv(path)
-    df = normalize_openapi_daily_cache_df(df)
-    if df.empty:
-        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-    df = df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last").reset_index(drop=True)
-    trade_dates = sorted([d for d in df["交易日期"].dropna().unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
-    latest_date = trade_dates[-1] if trade_dates else ""
-    print(f"  ♻️ 已讀取 {label}：{len(df):,} 筆，最新交易日 {latest_date or '-'}")
-    return df[OPENAPI_DAILY_CACHE_COLS].copy()
-
-
-def load_openapi_daily_file_df(path, label="OpenAPI 本地備援檔", force_market=None):
-    """支援讀取先前下載的 JSON / CSV / XLSX OpenAPI 檔案，作為假日測試備援。
-
-    force_market：
-    - 使用 OPENAPI_TWSE_FALLBACK_FILE 時強制標成「上市」
-    - 使用 OPENAPI_TPEX_FALLBACK_FILE 時強制標成「上櫃」
-
-    這個防呆很重要：
-    有些本地 CSV 可能已經被前一版測試程式加過「市場」欄，
-    或欄位格式已經是標準格式。若不強制指定，TWSE 檔可能被舊欄位內容誤判成上櫃，
-    造成 log 出現「上市 0、上櫃 19153」這種錯誤分類。
-    """
-    path = str(path or "").strip()
-    if not path:
-        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-    if not os.path.exists(path):
-        print(f"  ⚠️ {label} 找不到檔案：{path}")
-        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-    try:
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".json":
-            with open(path, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-            df = pd.DataFrame(data).fillna("")
-        elif ext in (".xlsx", ".xls"):
-            df = pd.read_excel(path, dtype=str).fillna("")
+def build_stock_map(df):
+    stock_map = {}
+
+    for row in df.itertuples(index=False, name=None):
+        cell = str(row[0]).strip()
+
+        if "　" in cell:
+            parts = cell.split("　", 1)
+            code, name = parts[0].strip(), parts[1].strip()
         else:
-            # utf-8-sig 可處理你本地下載 / pandas 輸出的 BOM CSV。
-            df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+            m = re.match(r"^(\d{4})\s+(.+)$", cell)
+            if m:
+                code, name = m.group(1), m.group(2)
+            else:
+                continue
 
-        out = normalize_openapi_daily_cache_df(df)
+        if len(code) == 4 and code.isdigit():
+            stock_map[name] = code
 
-        if force_market and not out.empty:
-            force_market = str(force_market).strip()
-            out["市場"] = force_market
-
-        if not out.empty:
-            market_counts = out["市場"].value_counts(dropna=False).to_dict() if "市場" in out.columns else {}
-            print(f"  ♻️ 已讀取 {label}：{path}，共 {len(out):,} 筆，市場分布：{market_counts}")
-        return out
-    except Exception as e:
-        print(f"  ⚠️ {label} 讀取失敗：{path}，原因：{type(e).__name__}: {e}")
-        return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-
-def load_openapi_fallback_from_files():
-    """依環境變數指定的本地檔案讀取備援資料。"""
-    frames = []
-
-    combined_path = os.getenv("OPENAPI_FALLBACK_FILE", "").strip()
-    if combined_path:
-        combined_df = load_openapi_daily_file_df(combined_path, "OPENAPI_FALLBACK_FILE")
-        if not combined_df.empty:
-            return combined_df
-
-    twse_path = os.getenv("OPENAPI_TWSE_FALLBACK_FILE", "").strip()
-    tpex_path = os.getenv("OPENAPI_TPEX_FALLBACK_FILE", "").strip()
-
-    if twse_path:
-        # 分開指定的 TWSE 備援檔，一律強制標成「上市」。
-        twse_df = load_openapi_daily_file_df(twse_path, "OPENAPI_TWSE_FALLBACK_FILE", force_market="上市")
-        if not twse_df.empty:
-            frames.append(twse_df)
-
-    if tpex_path:
-        # 分開指定的 TPEx 備援檔，一律強制標成「上櫃」。
-        tpex_df = load_openapi_daily_file_df(tpex_path, "OPENAPI_TPEX_FALLBACK_FILE", force_market="上櫃")
-        if not tpex_df.empty:
-            frames.append(tpex_df)
-
-    if frames:
-        return pd.concat(frames, ignore_index=True).fillna("")
-
-    return pd.DataFrame(columns=OPENAPI_DAILY_CACHE_COLS)
-
-
-def get_openapi_latest_trade_date(df):
-    if df is None or df.empty or "交易日期" not in df.columns:
-        return ""
-    trade_dates = sorted([d for d in df["交易日期"].dropna().unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
-    return trade_dates[-1] if trade_dates else ""
-
-
-def set_openapi_data_source_info(source_mode, used_fallback, warning, latest_trade_date, twse_rows, tpex_rows):
-    OPENAPI_DATA_SOURCE_INFO["source_mode"] = source_mode
-    OPENAPI_DATA_SOURCE_INFO["used_fallback"] = bool(used_fallback)
-    OPENAPI_DATA_SOURCE_INFO["warning"] = str(warning or "")
-    OPENAPI_DATA_SOURCE_INFO["latest_trade_date"] = str(latest_trade_date or "")
-    OPENAPI_DATA_SOURCE_INFO["twse_rows"] = int(twse_rows or 0)
-    OPENAPI_DATA_SOURCE_INFO["tpex_rows"] = int(tpex_rows or 0)
-
-    try:
-        note_path = os.path.join(OUTPUT_DIR, "openapi_data_source_warning.txt")
-        with open(note_path, "w", encoding="utf-8") as f:
-            f.write(f"source_mode={OPENAPI_DATA_SOURCE_INFO['source_mode']}\n")
-            f.write(f"used_fallback={OPENAPI_DATA_SOURCE_INFO['used_fallback']}\n")
-            f.write(f"latest_trade_date={OPENAPI_DATA_SOURCE_INFO['latest_trade_date']}\n")
-            f.write(f"twse_rows={OPENAPI_DATA_SOURCE_INFO['twse_rows']}\n")
-            f.write(f"tpex_rows={OPENAPI_DATA_SOURCE_INFO['tpex_rows']}\n")
-            f.write(f"warning={OPENAPI_DATA_SOURCE_INFO['warning']}\n")
-    except Exception:
-        pass
-
+    return stock_map
 
 
 def normalize_stock_name_text(s):
@@ -4060,14 +3145,12 @@ def normalize_stock_name_text(s):
 
 def make_stock_aliases(stock_name, exact_stock_names=None):
     """
-    建立股票 / ETF 名稱候選別名，但避免把某一檔商品的簡稱撞到另一檔真實股票名稱。
+    建立股票名稱候選別名，但避免把某一檔股票的簡稱撞到另一檔真實股票名稱。
 
-    重點：
+    修正重點：
     1. 8028 昇陽半導體可產生「昇陽半」，讓「昇陽半XXX購」正確對到 8028。
     2. 8028 昇陽半導體不可產生「昇陽」，因為「昇陽」本身是 3266。
-    3. ETF 名稱常見為「元大台灣50」，權證名稱會寫成「台灣50元大...購」，
-       因此會額外建立「台灣50」這類去掉發行商前綴的 alias。
-    4. 不產生「台灣」這種過短且高度模糊的 alias，避免「台灣50」被誤判成「台灣大」。
+    3. 後續比對會用最長前綴優先，因此「昇陽半」會優先於「昇陽」。
     """
     name = normalize_stock_name_text(stock_name)
     aliases = set()
@@ -4077,38 +3160,7 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
 
     exact_stock_names = exact_stock_names or set()
 
-    ambiguous_aliases = {
-        "台灣", "臺灣", "台股", "臺股", "元大", "富邦", "國泰", "群益",
-        "凱基", "中信", "永豐", "兆豐", "統一", "台新", "復華", "新光",
-        "第一", "第一金", "日盛", "華南", "華南永昌",
-    }
-
-    issuer_prefixes = [
-        "元大", "富邦", "國泰", "群益", "凱基", "中信", "永豐", "兆豐",
-        "統一", "台新", "復華", "新光", "第一金", "日盛", "華南永昌",
-    ]
-
     aliases.add(name)
-
-    def add_safe_alias(candidate):
-        candidate = normalize_stock_name_text(candidate)
-
-        if not candidate or len(candidate) < 2:
-            return
-
-        if candidate in ambiguous_aliases:
-            return
-
-        if candidate in exact_stock_names and candidate != name:
-            return
-
-        aliases.add(candidate)
-
-    for issuer in issuer_prefixes:
-        if name.startswith(issuer) and len(name) > len(issuer) + 1:
-            candidate = name[len(issuer):]
-            if any(ch.isdigit() for ch in candidate) or len(candidate) >= 3:
-                add_safe_alias(candidate)
 
     suffixes = [
         "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
@@ -4126,20 +3178,36 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
             if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
                 candidate = stripped[:-len(suffix)]
                 stripped = candidate
-                add_safe_alias(candidate)
+
+                # 如果切出來的簡稱剛好是另一檔股票的完整名稱，就不要加入。
+                # 例如「昇陽半導體」切成「昇陽」，但「昇陽」本身是 3266。
+                if candidate not in exact_stock_names or candidate == name:
+                    aliases.add(candidate)
+
                 changed = True
                 break
 
-    # 兩字股票名稱本身仍保留，但不再從較長名稱額外切出 2 字前綴。
-    for n in range(min(4, len(name)), 2, -1):
-        add_safe_alias(name[:n])
+    for n in range(min(4, len(name)), 1, -1):
+        candidate = name[:n]
+
+        # 前綴簡稱若撞到另一檔真實股票名稱，也不要加入。
+        if candidate in exact_stock_names and candidate != name:
+            continue
+
+        aliases.add(candidate)
 
     return {a for a in aliases if len(a) >= 2}
 
 
 def build_underlying_resolver(stock_map):
     """
-    預先建立完整股名與安全 alias 對照表，統一採「最長前綴優先」。
+    預先建立完整股名與安全 alias 對照表。
+
+    重要：
+    原本 find_underlying_info() 會先用完整股名比對，導致「昇陽半XXX購」
+    先被短股名「昇陽」吃到，誤判成 3266。
+    這版改成完整股名與 alias 全部放在同一個候選表，統一採「最長前綴優先」。
+    因此「昇陽半」會優先於「昇陽」。
     """
     exact_stock_names = set()
 
@@ -4176,6 +3244,8 @@ def build_underlying_resolver(stock_map):
 
     for stock_name, stock_code in stock_map.items():
         stock_name_norm = normalize_stock_name_text(stock_name)
+
+        # 完整股名也是候選，但不再獨立提前回傳，避免短完整股名壓過較長 alias。
         add_candidate(stock_name_norm, stock_code, stock_name, True)
 
         for alias in make_stock_aliases(stock_name, exact_stock_names):
@@ -4213,235 +3283,137 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
     return "", ""
 
 
-
-def load_warrants_lookup_cache_for_openapi():
-    """
-    官方 OpenAPI 的每日成交檔只有權證代號、名稱、成交金額、成交量，
-    沒有直接提供標的股代號。
-
-    新版不只讀「快取_權證清單」，也會從「快取_分點歷史」與候選快取回補標的股，
-    避免 OpenAPI 有成交清單把舊的標的股對照洗成空白後，造成 B/C/D 少資料。
-    """
-    lookup = get_underlying_lookup_cache(force_reload=True)
-    code_map = lookup.get("code_map", {})
-    stock_map = lookup.get("stock_map", {})
-
-    if code_map:
-        mapped_count = sum(1 for rec in code_map.values() if rec.get("標的股"))
-        print(f"  ♻️ 已讀取多來源標的對照：權證 {len(code_map):,} 支，其中有標的股 {mapped_count:,} 支")
-
-    return code_map, stock_map
+def find_underlying(warrant_name, stock_map):
+    code, _ = find_underlying_info(warrant_name, stock_map)
+    return code
 
 
-def enrich_openapi_warrants_with_underlying(active_df):
-    if active_df is None or active_df.empty:
-        return []
-
-    cache_code_map, stock_map = load_warrants_lookup_cache_for_openapi()
-    resolver = build_underlying_resolver(stock_map) if stock_map else []
+def get_all_call_warrants_live():
+    print("【Step 1】取所有認購權證清單...")
     warrants = []
-    seen = set()
-    missing_underlying_count = 0
 
-    for _, row in active_df.iterrows():
-        code = normalize_openapi_warrant_code(row.get("代號", ""))
-        name = str(row.get("名稱", "")).strip()
+    # strMode=2：上市有價證券
+    # strMode=4：上櫃有價證券
+    # 兩邊都要抓，否則上櫃標的的權證，例如 70xxxx 權證會漏掉。
+    isin_modes = [
+        ("上市", "2"),
+        ("上櫃", "4"),
+    ]
 
-        if not code or not name or code in seen:
-            continue
+    all_dfs = []
+    stock_map = {}
 
-        cached = cache_code_map.get(code, {})
-        underlying_code = str(cached.get("標的股", "")).strip()
-        underlying_name = str(cached.get("標的名稱", "")).strip()
+    for market_name, mode in isin_modes:
+        try:
+            resp = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30
+            )
+            resp.raise_for_status()
+            resp.encoding = "cp950"
 
-        if not underlying_code and stock_map:
-            underlying_code, underlying_name = find_underlying_info(name, stock_map, resolver)
+            tables = pd.read_html(StringIO(resp.text))
+            df = tables[0].iloc[2:].reset_index(drop=True)
 
-        if not underlying_code:
-            missing_underlying_count += 1
+            all_dfs.append((market_name, df))
+            stock_map.update(build_stock_map(df))
 
-        seen.add(code)
-        warrants.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": underlying_code,
-            "標的名稱": underlying_name,
-            "交易日期": str(row.get("交易日期", "")).strip(),
-            "市場": str(row.get("市場", "")).strip(),
-            "成交金額": int(row.get("成交金額", 0) or 0),
-            "成交量": int(row.get("成交量", 0) or 0),
-        })
+            print(f"  ✅ 已取得{market_name} ISIN 清單：{len(df)} 筆")
 
-    if missing_underlying_count:
-        print(
-            f"  ⚠️ 有 {missing_underlying_count:,} 支今日有成交認購權證未能從既有快取推回標的股，"
-            f"B/C/D 會自動略過這些沒有標的股的資料。"
-        )
+        except Exception as e:
+            print(f"  ⚠️ {market_name} ISIN 清單取得失敗：{e}")
 
+    # 只建立一次 resolver，避免每檔權證都重新掃全部股票與 alias，保持執行速度。
+    underlying_resolver = build_underlying_resolver(stock_map)
+
+    seen_warrants = set()
+
+    for market_name, df in all_dfs:
+        for row in df.itertuples(index=False, name=None):
+            cell = str(row[0]).strip()
+
+            if "\u3000" in cell:
+                parts = cell.split("\u3000", 1)
+                code, name = parts[0].strip(), parts[1].strip()
+            else:
+                m = re.match(r"^(\d{6})\s+(.+)$", cell)
+                if m:
+                    code, name = m.group(1), m.group(2)
+                else:
+                    continue
+
+            if len(code) == 6 and code.isdigit() and "購" in name:
+                if code in seen_warrants:
+                    continue
+
+                seen_warrants.add(code)
+                underlying, underlying_name = find_underlying_info(name, stock_map, underlying_resolver)
+
+                warrants.append({
+                    "代號": code,
+                    "名稱": name,
+                    "標的股": underlying,
+                    "標的名稱": underlying_name
+                })
+
+    print(f"  ✅ 共 {len(warrants)} 支認購權證")
     return warrants
+
+
 
 
 def get_all_call_warrants():
-    """
-    改用官方 OpenAPI 作為唯一權證母體，並加入假日 / API 空資料防呆。
+    cached_warrants = load_warrants_cache()
 
-    正常交易日：
-      1. 抓 TWSE + TPEx OpenAPI。
-      2. 兩邊都有資料時，更新 OpenAPI 防呆快取。
-      3. 用 live 資料產生最新交易日有成交認購權證清單。
+    if cached_warrants:
+        print("【Step 1】讀取認購權證清單快取...")
+        print(f"  ✅ 已讀取權證清單快取：{len(cached_warrants)} 支")
 
-    假日或官方 API 暫時回傳空資料：
-      1. 不硬跑空資料。
-      2. 自動改用最近一次非空 OpenAPI 防呆快取 / 指定本地備援檔。
-      3. 在 log、output/openapi_data_source_warning.txt、Google Sheet「資料來源警示」標明：本次使用舊資料。
-    """
-    print("【Step 1】使用官方 OpenAPI 取得最新交易日有成交量的認購權證清單...")
+        # 每日執行仍要即時更新權證清單，避免新上市 / 新出現的權證不在 warrants_cache.csv，
+        # 導致後續全市場最近資料預掃描也完全掃不到該權證。
+        print("  🔄 即時更新今日認購權證清單，並與快取合併...")
+        live_warrants = get_all_call_warrants_live()
 
-    twse_df = fetch_twse_openapi_warrant_daily_df()
-    tpex_df = fetch_tpex_openapi_warrant_daily_df()
+        if not live_warrants:
+            print("  ⚠️ 即時權證清單取得失敗，改用既有權證清單快取。")
+            return cached_warrants
 
-    live_twse_ok = twse_df is not None and not twse_df.empty
-    live_tpex_ok = tpex_df is not None and not tpex_df.empty
-    use_fallback = False
-    source_warning = ""
+        merged = {}
+        for w in cached_warrants:
+            code = str(w.get("代號", "")).strip()
+            if code:
+                merged[code] = w
 
-    if live_twse_ok:
-        save_openapi_daily_cache_df(twse_df, OPENAPI_DAILY_TWSE_CACHE_PATH, "TWSE OpenAPI")
-    if live_tpex_ok:
-        save_openapi_daily_cache_df(tpex_df, OPENAPI_DAILY_TPEX_CACHE_PATH, "TPEx OpenAPI")
+        old_count = len(merged)
+        new_count = 0
 
-    if live_twse_ok and live_tpex_ok:
-        all_df = pd.concat([twse_df, tpex_df], ignore_index=True).fillna("")
-        all_df = normalize_openapi_daily_cache_df(all_df)
-        save_openapi_daily_cache_df(all_df, OPENAPI_DAILY_CACHE_PATH, "TWSE+TPEx OpenAPI 合併")
-        source_mode = "live"
-    else:
-        missing_parts = []
-        if not live_twse_ok:
-            missing_parts.append("TWSE 上市")
-        if not live_tpex_ok:
-            missing_parts.append("TPEx 上櫃")
+        for w in live_warrants:
+            code = str(w.get("代號", "")).strip()
+            if not code:
+                continue
 
-        if not OPENAPI_FALLBACK_ENABLE:
-            print(f"  ❌ 官方 OpenAPI 缺少資料：{', '.join(missing_parts)}，且 OPENAPI_FALLBACK_ENABLE=0，停止執行。")
-            set_openapi_data_source_info("live_failed", False, "官方 OpenAPI 缺少資料且未啟用備援", "", 0, 0)
-            return []
+            if code not in merged:
+                new_count += 1
 
-        print(f"  ⚠️ 官方 OpenAPI 缺少資料：{', '.join(missing_parts)}。")
-        print("  🔁 啟動防呆：改用最近一次非空 OpenAPI 快取 / 本地備援檔，避免產出缺資料圖表。")
+            # 以即時清單為準更新名稱、標的股與標的名稱，
+            # 避免舊快取的標的資訊不完整或過期。
+            merged[code] = w
 
-        fallback_df = load_openapi_daily_cache_df(OPENAPI_DAILY_CACHE_PATH, "最近一次 TWSE+TPEx OpenAPI 合併快取")
-
-        if fallback_df.empty:
-            fallback_df = load_openapi_fallback_from_files()
-
-        if fallback_df.empty:
-            # 最後嘗試用分市場快取合併。
-            frames = []
-            twse_cache_df = load_openapi_daily_cache_df(OPENAPI_DAILY_TWSE_CACHE_PATH, "TWSE OpenAPI 分市場快取")
-            tpex_cache_df = load_openapi_daily_cache_df(OPENAPI_DAILY_TPEX_CACHE_PATH, "TPEx OpenAPI 分市場快取")
-            if not twse_cache_df.empty:
-                frames.append(twse_cache_df)
-            if not tpex_cache_df.empty:
-                frames.append(tpex_cache_df)
-            if frames:
-                fallback_df = pd.concat(frames, ignore_index=True).fillna("")
-                fallback_df = normalize_openapi_daily_cache_df(fallback_df)
-
-        if fallback_df.empty:
-            print("  ❌ 找不到可用的 OpenAPI 防呆快取 / 本地備援檔，停止執行。")
-            print("     建議在交易日成功跑一次，或設定 OPENAPI_FALLBACK_FILE / OPENAPI_TWSE_FALLBACK_FILE / OPENAPI_TPEX_FALLBACK_FILE。")
-            set_openapi_data_source_info("fallback_missing", False, "找不到可用的 OpenAPI 防呆快取 / 本地備援檔", "", 0, 0)
-            return []
-
-        all_df = fallback_df.copy().fillna("")
-        use_fallback = True
-        source_mode = "fallback_cache"
-        fallback_trade_date = get_openapi_latest_trade_date(all_df)
-        source_warning = (
-            f"⚠️ 本次官方 OpenAPI 回傳空資料或資料不完整，已改用最近一次非空 OpenAPI 防呆快取。"
-            f"圖片 / 今日表使用的資料日期：{fallback_trade_date or '-'}；"
-            f"缺少來源：{', '.join(missing_parts)}。"
-        )
-        print(f"  {source_warning}")
-
-        if OPENAPI_FAIL_ON_FALLBACK:
-            print("  ❌ OPENAPI_FAIL_ON_FALLBACK=1：偵測到使用舊 OpenAPI 快取，停止執行。")
-            set_openapi_data_source_info(source_mode, True, source_warning + "；因 OPENAPI_FAIL_ON_FALLBACK=1 已停止", fallback_trade_date, 0, 0)
-            return []
-
-    if all_df is None or all_df.empty:
-        print("  ⚠️ 官方 OpenAPI / 防呆快取皆未取得任何權證成交資料。")
-        set_openapi_data_source_info("empty", use_fallback, "官方 OpenAPI / 防呆快取皆無資料", "", 0, 0)
-        return []
-
-    all_df = normalize_openapi_daily_cache_df(all_df)
-    all_df = all_df.drop_duplicates(subset=["市場", "代號", "交易日期"], keep="last")
-
-    trade_dates = sorted(
-        [d for d in all_df["交易日期"].dropna().unique() if str(d).strip()],
-        key=parse_openapi_trade_date_for_sort
-    )
-
-    if not trade_dates:
-        print("  ⚠️ 官方 OpenAPI / 防呆快取資料沒有有效交易日期。")
-        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "OpenAPI 資料沒有有效交易日期", "", 0, 0)
-        return []
-
-    latest_trade_date = trade_dates[-1]
-
-    active_df = all_df[
-        (all_df["交易日期"] == latest_trade_date)
-        & (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
-        & (all_df["名稱"].astype(str).str.contains("購", na=False))
-        & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
-        & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
-    ].copy()
-
-    active_df = active_df.sort_values(
-        ["成交金額", "成交量"],
-        ascending=[False, False],
-    ).reset_index(drop=True)
-
-    twse_active_count = len(active_df[active_df["市場"] == "上市"]) if not active_df.empty else 0
-    tpex_active_count = len(active_df[active_df["市場"] == "上櫃"]) if not active_df.empty else 0
-
-    print(f"  ✅ OpenAPI 使用來源：{'防呆快取/備援檔' if use_fallback else '官方即時 live'}")
-    print(f"  ✅ OpenAPI 最新交易日：{latest_trade_date}")
-    print(f"  ✅ 最新交易日成交量 > 0 認購權證：{len(active_df):,} 支")
-    print(f"     上市：{twse_active_count:,} 支")
-    print(f"     上櫃：{tpex_active_count:,} 支")
-
-    if use_fallback:
-        print("  ⚠️ 注意：本次使用的是防呆快取 / 備援檔，不是今日 live OpenAPI。請確認圖片日期後再推播。")
-
-    # 防呆：若最新交易日 active_df 某市場為 0，通常代表資料不完整，除非使用者明確允許。
-    allow_tpex_empty = os.getenv("ALLOW_TPEX_EMPTY", "0").strip().lower() in ("1", "true", "yes")
-    allow_twse_empty = os.getenv("ALLOW_TWSE_EMPTY", "0").strip().lower() in ("1", "true", "yes")
-
-    if twse_active_count == 0 and not allow_twse_empty:
-        print("  ❌ 最新交易日上市認購權證為 0，停止執行，避免圖表缺上市權證。")
-        print("     若你確認這是預期狀況，可設定 ALLOW_TWSE_EMPTY=1 強制繼續。")
-        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "上市認購權證為 0，已停止", latest_trade_date, twse_active_count, tpex_active_count)
-        return []
-
-    if tpex_active_count == 0 and not allow_tpex_empty:
-        print("  ❌ 最新交易日上櫃認購權證為 0，停止執行，避免 7xxxxx 上櫃權證整批漏掉造成錯誤圖表。")
-        print("     若你確認這是預期狀況，可設定 ALLOW_TPEX_EMPTY=1 強制繼續。")
-        set_openapi_data_source_info(source_mode, use_fallback, source_warning or "上櫃認購權證為 0，已停止", latest_trade_date, twse_active_count, tpex_active_count)
-        return []
-
-    set_openapi_data_source_info(source_mode, use_fallback, source_warning, latest_trade_date, twse_active_count, tpex_active_count)
-
-    warrants = enrich_openapi_warrants_with_underlying(active_df)
-
-    if warrants:
-        # 注意：save_warrants_cache 是今日有成交權證清單快取，不可作為 OpenAPI 防呆原始檔；
-        # OpenAPI 防呆原始檔已由 OPENAPI_DAILY_CACHE_PATH 負責保存。
+        warrants = list(merged.values())
         save_warrants_cache(warrants)
-        print(f"  ✅ Step 1 完成：後續只處理 OpenAPI 有成交認購權證 {len(warrants):,} 支")
 
+        print(
+            f"  ✅ 權證清單更新完成：原快取 {old_count:,} 支，"
+            f"即時清單 {len(live_warrants):,} 支，新增 {new_count:,} 支，合併後 {len(warrants):,} 支"
+        )
+
+        return warrants
+
+    warrants = get_all_call_warrants_live()
+    save_warrants_cache(warrants)
     return warrants
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 2：找目標分點券商代號
@@ -4518,24 +3490,12 @@ def find_broker_codes(warrants):
 # Step 3a：預篩有目標分點出現的 (權證, 分點) 組合
 # ══════════════════════════════════════════════════════════════════════
 
-def prescan_all_live(warrants, broker_map, scan_days=40, target_date=None):
+def prescan_all_live(warrants, broker_map, scan_days=40):
     print("【Step 3a】預篩：找有目標分點的權證...")
 
-    # 重要：API4 預篩日期必須跟 OpenAPI 權證清單的交易日期一致。
-    # 假日測試或使用 OPENAPI_TWSE/TPEX_FALLBACK_FILE 時，datetime.today() 可能是週末或非交易日，
-    # 若仍用今天日期查 API4，會得到 0 組候選。
-    # 因此優先使用 OpenAPI_DATA_SOURCE_INFO['latest_trade_date'] / target_date 作為 API4 查詢結束日。
-    target_date = normalize_date_str(target_date or OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", ""))
-    target_dt = parse_date(target_date)
-
-    if target_dt is None:
-        target_dt = datetime.today()
-
-    scan_days = max(1, int(scan_days or 1))
-    end_s = target_dt.strftime("%Y/%m/%d")
-    start_s = (target_dt - timedelta(days=scan_days - 1)).strftime("%Y/%m/%d")
-
-    print(f"  ✅ API4 預篩日期範圍：{start_s} ~ {end_s}")
+    today = datetime.today()
+    end_s   = today.strftime("%Y/%m/%d")
+    start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
 
     broker_codes_set = {code for _, code in broker_map.values()}
     code_to_label    = {code: label for label, (_, code) in broker_map.items()}
@@ -4590,63 +3550,143 @@ def prescan_all_live(warrants, broker_map, scan_days=40, target_date=None):
 
 
 
+def build_selected_full_market_candidates(warrants, broker_map):
+    """
+    RUN_MODE=1 精選分點完整追蹤候選池。
+
+    目的：
+    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
+    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
+
+    這裡改成針對精選分點建立「所有認購權證 × 精選分點」候選組合，
+    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
+    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
+    """
+    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：所有認購權證 × 精選分點...")
+
+    if not warrants or not broker_map:
+        return []
+
+    candidates = []
+    seen = set()
+
+    for w in warrants:
+        warrant_code = str(w.get("代號", "")).strip()
+        warrant_name = str(w.get("名稱", "")).strip()
+        underlying_code = str(w.get("標的股", "")).strip()
+        underlying_name = str(w.get("標的名稱", "")).strip()
+
+        if not warrant_code or not warrant_name:
+            continue
+
+        for label, (broker_name, broker_code) in broker_map.items():
+            broker_code = str(broker_code).strip()
+            if not broker_code:
+                continue
+
+            c = (
+                warrant_code,
+                warrant_name,
+                underlying_code,
+                underlying_name,
+                label,
+                str(broker_name).strip(),
+                broker_code,
+            )
+            key = candidate_key_from_tuple(c)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            candidates.append(c)
+
+    print(
+        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
+        f"→ {len(candidates):,} 組候選"
+    )
+    return candidates
+
 
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
-    active_warrant_codes = {
-        normalize_openapi_warrant_code(w.get("代號", ""))
-        for w in warrants
-        if normalize_openapi_warrant_code(w.get("代號", ""))
-    }
+    cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
 
-    # OpenAPI 版本的關鍵修正：
-    # 1. 不再建立「今日有成交權證 × 精選分點」全組合候選池。
-    # 2. 不再沿用舊版 candidates_cache_selected5.csv 的全組合快取。
-    # 3. ACTIVE_WARRANT_FORCE_REFRESH=1 時，完全忽略候選快取，只用本次 API4 預篩命中的候選。
-    # 4. 只有 API4 真的看到目標分點的「權證 × 分點」才進 API5。
-    scan_days = max(1, int(OPENAPI_ACTIVE_PRESCAN_DAYS))
-    print(f"【Step 3a】OpenAPI 今日有成交權證預篩：最近 {scan_days} 天找目標分點候選...")
-    print(f"  ✅ ACTIVE_WARRANT_FORCE_REFRESH={int(ACTIVE_WARRANT_FORCE_REFRESH)}")
-    print(f"  ✅ OpenAPI 今日有成交權證數：{len(active_warrant_codes):,} 支")
+    # RUN_MODE=1 的核心修正：
+    # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
+    # 因為 API4 prescan 可能只回傳部分排行 / 區間資料，會造成今天大額賣超分散在多檔權證時漏抓。
+    # 這裡直接建立「所有認購權證 × 精選分點」候選池，再由 API5 抓完整歷史。
+    if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS:
+        if cached_candidates:
+            print("【Step 3a】讀取精選分點候選組合快取...")
+            print(f"  ✅ 已讀取精選候選組合快取：{len(cached_candidates):,} 組")
 
-    api4_target_date = (
-        OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", "")
-        or latest_trade_date_from_warrants(warrants)
-    )
-    print(f"  ✅ API4 預篩目標交易日：{api4_target_date or '-'}")
+        full_selected_candidates = build_selected_full_market_candidates(warrants, broker_map)
+        full_selected_candidates = filter_candidates_by_broker_map(full_selected_candidates, broker_map)
 
-    recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days, target_date=api4_target_date)
-    recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-    recent_candidates = filter_candidates_by_warrant_codes(recent_candidates, active_warrant_codes)
+        merged_candidates = merge_candidates(cached_candidates, full_selected_candidates)
+        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
 
-    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
+        if SELECTED_REFRESH_ALL_WARRANTS:
+            # 每次都更新所有精選分點 × 全市場權證，確保今日賣超完整。
+            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in full_selected_candidates}
+            print("  ✅ SELECTED_REFRESH_ALL_WARRANTS=1：本次將用 API5 更新所有精選分點完整候選組合。")
+        else:
+            # 若使用者日後想加速，可改成 0，退回只更新 API4 最近掃到的候選；但可能再次漏掉分散式大額賣超。
+            scan_days = SELECTED_FULL_SCAN_DAYS
+            print(f"  🔄 SELECTED_REFRESH_ALL_WARRANTS=0：僅補掃最近 {scan_days} 天 API4 候選，用於加速但完整性較低。")
+            recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+            recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
+            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
+            merged_candidates = merge_candidates(merged_candidates, recent_candidates)
+            merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
 
-    if ACTIVE_WARRANT_FORCE_REFRESH:
-        # 測試每天新資料速度時，候選池只使用本次預篩結果。
-        # 這裡會覆蓋 OpenAPI 專用候選快取，避免 86,900 / 95,765 這種舊全組合候選再次被帶入。
-        final_candidates = recent_candidates
-        print("  ✅ 強制刷新模式：忽略候選組合快取，只使用本次 OpenAPI + API4 預篩命中候選。")
-    else:
-        cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-        cached_candidates = filter_candidates_by_warrant_codes(cached_candidates, active_warrant_codes)
+        save_candidates_cache(merged_candidates)
+
+        print(
+            f"  ✅ 精選分點候選組合完成：快取 {len(cached_candidates):,} 組，"
+            f"完整候選 {len(full_selected_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
+        )
+        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
+
+        return merged_candidates
+
+    if cached_candidates:
+        print("【Step 3a】讀取候選組合快取...")
+        print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates)} 組")
+
+        if FAST_SKIP_RECENT_PRESCAN:
+            print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前每日主流程仍會補掃全市場最近資料，避免漏掉新權證 / 新候選組合。")
+
+        # RUN_MODE=2 維持原本完整分點清單邏輯：
+        # 先保留候選組合快取，再用 API4 補掃最近幾天的新候選組合。
+        scan_days = CACHE_RECENT_SCAN_DAYS
+        print(f"  🔄 補掃全市場最近 {scan_days} 天，用來發現新權證 / 新候選組合...")
+
+        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+        recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
+        PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
+
         merged_candidates = merge_candidates(cached_candidates, recent_candidates)
         merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        merged_candidates = filter_candidates_by_warrant_codes(merged_candidates, active_warrant_codes)
-        final_candidates = merged_candidates
+        save_candidates_cache(merged_candidates)
+
         print(
-            f"  ✅ 非強制刷新模式：快取 {len(cached_candidates):,} 組，"
-            f"本次預篩 {len(recent_candidates):,} 組，合併後 {len(final_candidates):,} 組"
+            f"  ✅ 候選組合快取合併完成：舊 {len(cached_candidates)} 組，"
+            f"最近掃到 {len(recent_candidates)} 組，合併後 {len(merged_candidates)} 組"
         )
+        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
 
-    save_candidates_cache(final_candidates)
+        return merged_candidates
 
-    print(f"  ✅ OpenAPI 本次預篩命中候選：{len(recent_candidates):,} 組")
-    print(f"  ✅ OpenAPI 最終候選組合：{len(final_candidates):,} 組")
-    print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
-
-    return final_candidates
+    initial_scan_days = 40
+    candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
+    candidates = filter_candidates_by_broker_map(candidates, broker_map)
+    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
+    save_candidates_cache(candidates)
+    return candidates
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -4772,8 +3812,8 @@ def build_a_events_from_df(item):
 # Step 3b：抓候選組合歷史資料
 # ══════════════════════════════════════════════════════════════════════
 
-def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code, history_days=None):
-    rows = api5_get(warrant_code, broker_code, days=history_days)
+def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code):
+    rows = api5_get(warrant_code, broker_code)
 
     if not rows:
         return None
@@ -4797,15 +3837,6 @@ def process_candidate(warrant_code, warrant_name, underlying_code, underlying_na
         })
 
     df = pd.DataFrame(records).sort_values("日期").reset_index(drop=True)
-
-    # 重要修正：OpenAPI 今日有成交權證有些缺標的股。
-    # 在建立 item 前先從權證清單 / 分點歷史 / 候選快取回補，否則 B/C/D 會因沒有標的股而略過。
-    underlying_code, underlying_name = backfill_underlying_for_warrant(
-        warrant_code,
-        warrant_name,
-        underlying_code,
-        underlying_name,
-    )
 
     item = {
         "warrant_code":    warrant_code,
@@ -4864,6 +3895,27 @@ def make_daily_key(broker_code, underlying_code, date, warrant_code):
     )
 
 
+def make_a_exclude_keys(a_events):
+    """
+    A > B > C 去重：
+    已經被 A 單檔大買抓到的「券商分點 + 標的股 + 日期 + 權證」
+    不再進入 B / C 的同標的合計買超判斷。
+    """
+    keys = set()
+
+    for ev in a_events:
+        if not ev.get("標的股"):
+            continue
+
+        keys.add(make_daily_key(
+            ev.get("券商代號"),
+            ev.get("標的股"),
+            ev.get("買進日"),
+            ev.get("權證代號"),
+        ))
+
+    return keys
+
 
 def make_b_exclude_keys(b_events):
     """
@@ -4887,6 +3939,25 @@ def make_b_exclude_keys(b_events):
 
     return keys
 
+
+def filter_daily_records(daily_records, exclude_keys):
+    if not exclude_keys:
+        return daily_records
+
+    filtered = []
+
+    for row in daily_records:
+        key = make_daily_key(
+            row.get("券商代號"),
+            row.get("標的股"),
+            row.get("日期"),
+            row.get("權證代號"),
+        )
+
+        if key not in exclude_keys:
+            filtered.append(row)
+
+    return filtered
 
 
 
@@ -5437,6 +4508,14 @@ def build_c_events(daily_records, item_map):
     return events
 
 
+def make_c_exclude_keys(c_events):
+    """
+    A > B > C > D 去重：
+    已經被 C 同標的 3 日累積買超抓到的資料，
+    不再進入 D 的近 N 日累積淨買進判斷。
+    """
+    return make_b_exclude_keys(c_events)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # D：同分點 + 同標的，近 N 個交易日累積淨買進 >= 100萬
@@ -5673,13 +4752,6 @@ def build_d_events(daily_records, item_map, window_days=None):
 def fetch_all_prices(a_events, b_events, c_events, d_events):
     print("【Step 4】抓收盤價...")
 
-    if SKIP_PRICE_FETCH:
-        print("  ⚡ SKIP_PRICE_FETCH=1：跳過外部價格補抓，只使用既有價格快取。")
-        print("  ⚠️ D+1～D+20、標的股股價、5MA、20MA 可能會出現空白或 -。")
-        persistent_price_cache = load_price_cache()
-        print(f"  ✅ 價格快取讀取：{len(persistent_price_cache):,} 個代號")
-        return persistent_price_cache
-
     code_ranges = {}
 
     def update_code_range(code, start_dt, end_dt):
@@ -5815,99 +4887,6 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
 
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
     return price_cache
-
-
-def collect_price_codes_from_events(a_events, b_events, c_events, d_events):
-    """
-    收集報表需要顯示價格的代號，但不做任何外部價格補抓。
-
-    用途：
-    - 每日盤後快速模式下，主 A/B/C/D 完整歷史表只讀既有快取_價格。
-    - 今日_* 工作表才另外補抓本次候選需要的價格。
-    """
-    codes = set()
-
-    def add_code(code):
-        code = normalize_price_code(code)
-        if code:
-            codes.add(code)
-
-    for ev in a_events or []:
-        add_code(ev.get("權證代號"))
-        add_code(ev.get("標的股"))
-
-    for ev in list(b_events or []) + list(c_events or []) + list(d_events or []):
-        add_code(ev.get("標的股"))
-
-        if FETCH_GROUP_WARRANT_PRICES:
-            for lot in ev.get("lots", []):
-                add_code(lot.get("權證代號"))
-
-    return codes
-
-
-def load_cached_prices_for_events(a_events, b_events, c_events, d_events):
-    """
-    只從既有快取_價格讀取指定事件需要的代號價格，不補抓外部資料。
-
-    這是每日盤後加速的核心：
-    主 A/B/C/D 完整歷史表仍會產生，但不會為了歷史事件缺價去大量打 TWSE / TPEx / Yahoo。
-    """
-    persistent_price_cache = load_price_cache()
-    price_cache = {}
-    codes = collect_price_codes_from_events(a_events, b_events, c_events, d_events)
-
-    for code in codes:
-        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
-        add_price_aliases(price_cache, code, cached_prices)
-
-    print(
-        f"  ✅ 價格快取模式：需顯示價格代號 {len(codes):,} 檔，"
-        f"已從既有快取載入 {len(price_cache):,} 個代號別名，不補抓歷史缺價"
-    )
-    return price_cache
-
-
-
-def build_price_cache_for_report(price_a_events, price_b_events, price_c_events, price_d_events,
-                                 today_a_events=None, today_b_events=None, today_c_events=None, today_d_events=None):
-    """
-    依 PRICE_FETCH_SCOPE 建立報表價格快取。
-
-    預設 PRICE_FETCH_SCOPE=today：
-    1. 只針對 今日_* 本次候選事件補抓缺少的價格。
-    2. 主 A/B/C/D 完整歷史事件只讀既有快取_價格，不補抓舊歷史缺價。
-    3. 適合每日盤後快速取得圖片資訊。
-
-    PRICE_FETCH_SCOPE=full：
-    - 維持完整回測模式，對主 A/B/C/D + 今日_* 全部事件補抓缺少的價格。
-    """
-    today_a_events = today_a_events or []
-    today_b_events = today_b_events or []
-    today_c_events = today_c_events or []
-    today_d_events = today_d_events or []
-
-    if SKIP_PRICE_FETCH:
-        print("【Step 4】抓收盤價...")
-        print("  ⚡ SKIP_PRICE_FETCH=1：跳過外部價格補抓，只使用既有價格快取。")
-        return load_cached_prices_for_events(price_a_events, price_b_events, price_c_events, price_d_events)
-
-    if PRICE_FETCH_SCOPE in ("full", "all", "history"):
-        print("  ✅ 價格補抓範圍：完整歷史資料 full，會補抓主 A/B/C/D + 今日_* 缺少的價格。")
-        return fetch_all_prices(price_a_events, price_b_events, price_c_events, price_d_events)
-
-    print("  ✅ 價格補抓範圍：每日盤後 today，只補抓 今日_* 本次候選事件需要的價格。")
-    print("     主 A/B/C/D 完整歷史表只使用既有 快取_價格，不補抓歷史缺價。")
-
-    today_has_events = bool(today_a_events or today_b_events or today_c_events or today_d_events)
-
-    if today_has_events:
-        # 這裡會更新 / 保存快取_價格，但範圍只限今日候選事件需要的代號。
-        fetch_all_prices(today_a_events, today_b_events, today_c_events, today_d_events)
-    else:
-        print("  ⚠️ 今日_* 事件為空，略過外部價格補抓。")
-
-    return load_cached_prices_for_events(price_a_events, price_b_events, price_c_events, price_d_events)
 
 # ══════════════════════════════════════════════════════════════════════
 # D+1 ~ D+20
@@ -6254,8 +5233,8 @@ def apply_exit_profit_result_outline(ws, row_idx, col_idx, return_pct):
 # 建立 Excel：A / B / C / 勝率統計
 # ══════════════════════════════════════════════════════════════════════
 
-def write_a_sheet(wb, a_events, item_map, price_cache, sheet_name="A_單檔大買"):
-    ws = wb.create_sheet(sheet_name)
+def write_a_sheet(wb, a_events, item_map, price_cache):
+    ws = wb.create_sheet("A_單檔大買")
 
     day_cols = [f"D+{i}" for i in range(1, 21)]
 
@@ -7942,48 +6921,6 @@ def write_color_legend_sheet(wb):
 
 
 
-def write_openapi_data_source_sheet(wb):
-    """輸出 OpenAPI 資料來源狀態，避免使用防呆舊資料時使用者不知道。"""
-    ws = wb.create_sheet("資料來源警示")
-
-    headers = ["項目", "內容"]
-    ws.append(headers)
-
-    source_mode = OPENAPI_DATA_SOURCE_INFO.get("source_mode", "")
-    used_fallback = bool(OPENAPI_DATA_SOURCE_INFO.get("used_fallback", False))
-    latest_trade_date = OPENAPI_DATA_SOURCE_INFO.get("latest_trade_date", "")
-    warning = OPENAPI_DATA_SOURCE_INFO.get("warning", "")
-
-    rows = [
-        ("資料來源模式", "防呆快取 / 本地備援檔" if used_fallback else "官方即時 live OpenAPI"),
-        ("是否使用舊資料防呆", "是" if used_fallback else "否"),
-        ("本次權證成交資料交易日", latest_trade_date or "-"),
-        ("上市有成交認購權證數", str(OPENAPI_DATA_SOURCE_INFO.get("twse_rows", 0))),
-        ("上櫃有成交認購權證數", str(OPENAPI_DATA_SOURCE_INFO.get("tpex_rows", 0))),
-        ("警示說明", warning or "本次使用官方即時 OpenAPI，未啟用舊資料防呆。"),
-        ("提醒", "若這張表顯示『使用舊資料防呆=是』，代表圖片日期不是今天即時 OpenAPI，而是最近一次有效交易日資料。"),
-    ]
-
-    for row in rows:
-        ws.append(list(row))
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="000000")
-        cell.fill = YELLOW
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    warn_fill = PatternFill("solid", fgColor="FCE5CD") if used_fallback else PatternFill("solid", fgColor="D9EAD3")
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = Font(color="000000", bold=(used_fallback and row[0].row in (3, 7, 8)))
-            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            cell.fill = warn_fill if used_fallback else WHITE
-
-    ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 120
-    ws.freeze_panes = "A2"
-
-
 
 def build_event_warrant_source_map(a_events, b_events, c_events, d_events):
     """
@@ -8194,248 +7131,25 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     ws.freeze_panes = "A2"
 
-
-
-
-def _latest_trade_date_from_items(items):
-    latest = None
-
-    for item in items or []:
-        df = item.get("df")
-        if df is None or df.empty or "日期" not in df.columns:
-            continue
-
-        for d in df["日期"].dropna().unique():
-            dt = parse_date(d)
-            if not dt:
-                continue
-            if latest is None or dt > latest:
-                latest = dt
-
-    return latest.strftime("%Y/%m/%d") if latest else ""
-
-
-def _latest_trade_date_from_warrants(warrants):
-    latest = None
-
-    for w in warrants or []:
-        d = str(w.get("交易日期", "")).strip()
-        dt = parse_date(d)
-        if not dt:
-            continue
-        if latest is None or dt > latest:
-            latest = dt
-
-    return latest.strftime("%Y/%m/%d") if latest else ""
-
-
-def _broker_display_name(broker_name, broker_code):
-    broker_name = str(broker_name or "").strip()
-    broker_code = str(broker_code or "").strip()
-
-    if broker_name and broker_code:
-        return f"{broker_name}({broker_code})"
-    if broker_name:
-        return broker_name
-    return broker_code
-
-
-def _format_top_brokers_for_top20(broker_map, metric_key, limit=3):
-    rows = []
-
-    for (broker_code, broker_name), rec in broker_map.items():
-        amount = int(rec.get(metric_key, 0) or 0)
-        if amount <= 0:
-            continue
-
-        rows.append({
-            "券商代號": broker_code,
-            "分點名稱": broker_name,
-            "金額": amount,
-        })
-
-    rows = sorted(rows, key=lambda x: int(x.get("金額", 0)), reverse=True)
-
-    text = "；".join([
-        f'{_broker_display_name(r.get("分點名稱", ""), r.get("券商代號", ""))}:{fmt_amount(r.get("金額", 0))}'
-        for r in rows[:limit]
-    ])
-
-    first_name = ""
-    first_amount = 0
-
-    if rows:
-        first_name = _broker_display_name(rows[0].get("分點名稱", ""), rows[0].get("券商代號", ""))
-        first_amount = int(rows[0].get("金額", 0) or 0)
-
-    return first_name, first_amount, text
-
-
-def _extract_target_date_row_from_api5(rows, target_date):
-    target_date = normalize_date_str(target_date)
-
-    for row in rows or []:
-        if normalize_date_str(row.get("V1", "")) != target_date:
-            continue
-
-        buy_s = int(float(row.get("V2", 0) or 0))
-        sell_s = int(float(row.get("V3", 0) or 0))
-        buy_a = int(float(row.get("V4", 0) or 0) * 1000)
-        sell_a = int(float(row.get("V5", 0) or 0) * 1000)
-
-        return {
-            "買進股數": buy_s,
-            "賣出股數": sell_s,
-            "買進金額": buy_a,
-            "賣出金額": sell_a,
-            "買超股數": buy_s - sell_s,
-            "買超金額": buy_a - sell_a,
-        }
-
-    return None
-
-
-
-
-def build_daily_signal_excel(
-    today_a_events,
-    today_b_events,
-    today_c_events,
-    today_d_events,
-    today_item_map,
-    price_cache,
-    output_path,
-    today_items=None,
-    full_a_events=None,
-    full_b_events=None,
-    full_c_events=None,
-    full_d_events=None,
-    full_item_map=None,
-    full_items=None,
-    write_image_support_full_sheets=True,
-):
-    """
-    精選 5 分點當日買賣超產圖模式專用 Excel。
-
-    修正版重點：
-    1. 完整 A/B/C/D 是唯一主資料，會直接寫回原本的完整工作表。
-    2. 今日_A/B/C/D 只是從完整 A/B/C/D 篩出的今日圖卡資料。
-    3. 第二張「近一個月 TOP15」只讀完整 A/B/C/D，不讀今日表，
-       因此不會出現完整表 + 今日表重複加總。
-    4. 這裡只是把已經在記憶體中算好的完整 A→B→C→D 結果寫出，
-       不會額外重抓完整 API5，也不會額外補完整歷史價格。
-    """
-    print("【Step 5】建立每日盤後產圖用 Excel...")
-
-    wb = Workbook()
-    default_ws = wb.active
-    wb.remove(default_ws)
-
-    today_a_events = today_a_events or []
-    today_b_events = today_b_events or []
-    today_c_events = today_c_events or []
-    today_d_events = today_d_events or []
-    today_item_map = today_item_map or {}
-
-    write_a_sheet(wb, today_a_events, today_item_map, price_cache, sheet_name="今日_A_單檔大買")
-    write_group_sheet(wb, "今日_B_同標的單日合計", today_b_events, price_cache, is_c=False)
-    write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
-    write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
-
-    # 圖片支援用完整表：
-    # notify_discord.py 的第二張 TOP15、分點卡平均天數、賣出事件對照仍需要完整 A/B/C/D 與勝率統計。
-    # 若每日產圖只更新 今日_*，圖片就會混到舊的完整表，造成 TOP15 停在前一交易日或平均天數錯誤。
-    full_a_events = full_a_events if full_a_events is not None else today_a_events
-    full_b_events = full_b_events if full_b_events is not None else today_b_events
-    full_c_events = full_c_events if full_c_events is not None else today_c_events
-    full_d_events = full_d_events if full_d_events is not None else today_d_events
-    full_item_map = full_item_map if full_item_map is not None else today_item_map
-    full_items = full_items if full_items is not None else (today_items or list(today_item_map.values()))
-
-    if write_image_support_full_sheets:
-        print("  ✅ 每日產圖同步更新完整 A/B/C/D 與勝率統計，避免圖片 TOP15 / 分點卡讀到舊資料。")
-        write_a_sheet(wb, full_a_events, full_item_map, price_cache)
-        write_group_sheet(wb, "B_同標的單日合計", full_b_events, price_cache, is_c=False)
-        write_group_sheet(wb, "C_同標的3日累積", full_c_events, price_cache, is_c=True)
-        write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", full_d_events, price_cache, is_c=True)
-        write_stats_sheet(wb, full_a_events, full_b_events, full_c_events, full_d_events)
-
-    # 每日產圖模式也要同步更新「每日賣出明細」。
-    # 這裡必須使用完整歷史 full_items + 完整 A/B/C/D 事件對照，
-    # 否則今日賣方圖卡會只吃到今日事件，漏掉歷史事件在今日的減碼 / 出清。
-    write_daily_sell_detail_sheet(wb, full_items, full_a_events, full_b_events, full_c_events, full_d_events)
-
-    write_price_status_sheet(wb, price_cache)
-    write_color_legend_sheet(wb)
-    write_openapi_data_source_sheet(wb)
-
-    apply_global_amount_comma_format(wb)
-
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    wb.save(output_path)
-
-    print(
-        f"  ✅ 已存：{output_path} "
-        f"（今日A:{len(today_a_events)} 筆，今日B:{len(today_b_events)} 筆，今日C:{len(today_c_events)} 筆，今日D:{len(today_d_events)} 筆）"
-    )
-
-
-def build_excel(
-    a_events,
-    b_events,
-    c_events,
-    d_events,
-    item_map,
-    price_cache,
-    items,
-    output_path,
-    full_market_top20_net_rows=None,
-    full_market_top20_positive_rows=None,
-    full_market_top20_trade_date="",
-    today_a_events=None,
-    today_b_events=None,
-    today_c_events=None,
-    today_d_events=None,
-    today_item_map=None,
-    today_items=None,
-):
+def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
     print("【Step 5】建立 Excel...")
 
     wb = Workbook()
     default_ws = wb.active
     wb.remove(default_ws)
 
-    # 主結果表：永遠使用完整歷史資料，避免本次候選資料把舊 A/B/C/D、勝率統計洗掉。
     write_a_sheet(wb, a_events, item_map, price_cache)
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", d_events, price_cache, is_c=True)
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
-    # 全市場每日標的 TOP20 已停用：避免為了找全市場 TOP3 分點而大量呼叫 API4 / API5。
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
     write_broker_query_sheet(wb, items)
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
-    write_openapi_data_source_sheet(wb)
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
-
-    # 今日圖片 / 推播專用表：只用本次候選資料產生，不覆蓋主結果表。
-    # 若 notify_discord.py 要抓每日正確明細，可改讀這四張「今日_*」工作表。
-    if today_item_map is not None and (today_a_events is not None or today_b_events is not None or today_c_events is not None or today_d_events is not None):
-        today_a_events = today_a_events or []
-        today_b_events = today_b_events or []
-        today_c_events = today_c_events or []
-        today_d_events = today_d_events or []
-
-        write_a_sheet(wb, today_a_events, today_item_map, price_cache, sheet_name="今日_A_單檔大買")
-        write_group_sheet(wb, "今日_B_同標的單日合計", today_b_events, price_cache, is_c=False)
-        write_group_sheet(wb, "今日_C_同標的3日累積", today_c_events, price_cache, is_c=True)
-        write_group_sheet(wb, f"今日_D_近{D_WINDOW_DAYS}日累積淨買進", today_d_events, price_cache, is_c=True)
 
     apply_global_amount_comma_format(wb)
 
@@ -8455,219 +7169,9 @@ def build_excel(
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
 
-
-def build_abcd_events_from_items(items, context_label=""):
-    """
-    從指定 items 建立 A/B/C/D 事件。
-
-    用途：
-    1. 完整歷史資料 → 主 A/B/C/D 結果表、勝率統計、長期統計。
-    2. 本次候選資料 → 今日圖片 / 推播專用「今日_*」工作表。
-
-    這樣可以同時做到：
-    - 主結果表保留完整歷史，不會被本次候選資料覆蓋。
-    - 今日圖片同樣使用這套主流程運算；最後才依目標日期篩選 今日_*，避免另外重寫 B/C/D 造成結果不一致。
-    """
-    prefix = f"【{context_label}】" if context_label else ""
-
-    item_map = {}
-    a_events = []
-
-    for item in items:
-        item_map[(item["broker_code"], item["warrant_code"])] = item
-        a_events.extend(item.get("events_a", []))
-
-    # A 類內部先做權證代號唯一化：
-    # 同一檔權證若有多筆 A 事件，只保留買進日較新、同日買進金額較大的那筆。
-    a_events = filter_a_events_unique_warrants(a_events)
-
-    daily_records = build_daily_records(items)
-
-    # A > B > C > D 權證代號層級互斥：
-    # 只要同一檔權證已經進入 A，後續 B / C / D 完全不再使用這檔權證。
-    a_warrant_codes = collect_event_warrant_codes(a_events)
-    daily_records_for_b = filter_daily_records_by_warrant_codes(daily_records, a_warrant_codes)
-
-    print(f"{prefix}【Step 3c】建立 B 類事件：同標的單日合計買超...")
-    b_events = build_b_events(daily_records_for_b, item_map)
-    print(f"  ✅ {prefix}B 類事件：{len(b_events)} 筆")
-
-    # 已經進入 B 的權證代號，不再進入 C / D。
-    b_warrant_codes = collect_event_warrant_codes(b_events)
-    daily_records_for_c = filter_daily_records_by_warrant_codes(
-        daily_records_for_b,
-        b_warrant_codes
-    )
-
-    print(f"{prefix}【Step 3d】建立 C 類事件：同標的 3 日累積買超...")
-    c_events = build_c_events(daily_records_for_c, item_map)
-    print(f"  ✅ {prefix}C 類事件：{len(c_events)} 筆")
-
-    # 已經進入 C 的權證代號，不再進入 D。
-    c_warrant_codes = collect_event_warrant_codes(c_events)
-    daily_records_for_d = filter_daily_records_by_warrant_codes(
-        daily_records_for_c,
-        c_warrant_codes
-    )
-
-    print(f"{prefix}【Step 3e】建立 D 類事件：同標的近 {D_WINDOW_DAYS} 日累積淨買進...")
-    d_events = build_d_events(daily_records_for_d, item_map, window_days=D_WINDOW_DAYS)
-    print(f"  ✅ {prefix}D 類事件：{len(d_events)} 筆")
-
-    print(f"  ✅ {prefix}A 類事件：{len(a_events)} 筆")
-
-    return item_map, a_events, b_events, c_events, d_events
-
-
-def latest_trade_date_from_items(items):
-    """
-    取得本次候選資料中最新的 API5 日期。
-
-    用途：
-    今日圖片 / 今日_* 工作表只應該呈現最新交易日的訊號，
-    但 C / D 類仍需要往前 3 日 / 10 日的資料做累積判斷。
-    """
-    latest_dt = None
-    latest_str = ""
-
-    for item in items or []:
-        df = item.get("df")
-        if df is None or df.empty or "日期" not in df.columns:
-            continue
-
-        for d in df["日期"].dropna().unique():
-            d_norm = normalize_date_str(d)
-            dt = parse_date(d_norm)
-            if not dt:
-                continue
-            if latest_dt is None or dt > latest_dt:
-                latest_dt = dt
-                latest_str = d_norm
-
-    return latest_str
-
-
-
-
-def filter_events_to_target_date(events, date_fields, target_date):
-    if not events or not target_date:
-        return []
-
-    target_date = normalize_date_str(target_date)
-    out = []
-
-    for ev in events:
-        for field in date_fields:
-            if normalize_date_str(ev.get(field, "")) == target_date:
-                out.append(ev)
-                break
-
-    return out
-
-
-
-def build_signal_abcd_items_from_history_cache(history_df, broker_map, target_date, context_label="每日產圖"):
-    """
-    每日產圖 / 今日_* 表專用資料來源。
-
-    資料來源仍是更新後的「快取_分點歷史」原始 API5 買賣超資料；
-    運算方式完全沿用原本正確的 A → B → C → D 主流程。
-    注意：這裡刻意使用 target_date 以前的完整追蹤分點歷史，而不是只取近 10 個交易日。
-    原因是 A/B/C/D 的互斥規則是「以權證代號為單位」跨完整歷史互斥；
-    若只取近 10 日，10 日前曾進 A/B/C/D 的權證可能會在今日 B/C/D 被重複使用。
-    今日表只在最後依 target_date 篩選，不另外重寫 B/C/D。
-    """
-    prefix = f"【{context_label}】" if context_label else ""
-
-    if history_df is None or history_df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史為空，無法建立 ABCD 運算資料來源。")
-        return []
-
-    if not broker_map:
-        print(f"{prefix}⚠️ broker_map 為空，無法建立 ABCD 運算資料來源。")
-        return []
-
-    target_date = normalize_date_str(target_date)
-    if not target_date:
-        print(f"{prefix}⚠️ 無目標日期，無法建立 ABCD 運算資料來源。")
-        return []
-
-    df = normalize_history_cache_df(history_df)
-    if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史正規化後為空，無法建立 ABCD 運算資料來源。")
-        return []
-
-    allowed_labels = {str(label).strip() for label in broker_map.keys()}
-    allowed_codes = {str(code).strip() for _, code in broker_map.values()}
-
-    broker_mask = pd.Series(False, index=df.index)
-    if "分點" in df.columns:
-        broker_mask = broker_mask | df["分點"].astype(str).str.strip().isin(allowed_labels)
-    if "券商代號" in df.columns:
-        broker_mask = broker_mask | df["券商代號"].astype(str).str.strip().isin(allowed_codes)
-
-    df = df[broker_mask].copy()
-    if df.empty:
-        print(f"{prefix}⚠️ 快取_分點歷史內找不到目前追蹤分點資料。")
-        return []
-
-    df["日期"] = df["日期"].map(normalize_date_str)
-    df = df[df["日期"] <= target_date].copy()
-
-    if df.empty:
-        print(f"{prefix}⚠️ 追蹤分點在 {target_date} 以前沒有原始資料。")
-        return []
-
-    print(
-        f"{prefix}✅ ABCD 運算資料來源：更新後快取_分點歷史完整歷史互斥，"
-        f"追蹤分點 {len(allowed_labels)} 個，{target_date} 以前原始資料 {len(df):,} 筆。"
-    )
-
-    items = items_from_history_cache(df)
-    print(f"{prefix}✅ 已還原 ABCD 運算 items：{len(items):,} 組 權證×分點")
-    return items
-
-
-def filter_today_events_from_abcd(a_events, b_events, c_events, d_events, target_date):
-    """
-    完全照原本正確的 A → B → C → D 運算完成後，最後才篩出今日事件。
-    """
-    target_date = normalize_date_str(target_date)
-    today_a_events = filter_events_to_target_date(a_events, ["買進日", "事件日"], target_date)
-    today_b_events = filter_events_to_target_date(b_events, ["事件日", "結束日"], target_date)
-    today_c_events = filter_events_to_target_date(c_events, ["結束日", "事件日"], target_date)
-    today_d_events = filter_events_to_target_date(d_events, ["結束日", "事件日"], target_date)
-    return today_a_events, today_b_events, today_c_events, today_d_events
-
-
-def latest_trade_date_from_warrants(warrants):
-    """從 OpenAPI 最新有成交權證清單取得最新交易日。"""
-    latest_dt = None
-    latest_str = ""
-
-    for w in warrants or []:
-        d_norm = normalize_date_str(w.get("交易日期", ""))
-        dt = parse_date(d_norm)
-        if not dt:
-            continue
-        if latest_dt is None or dt > latest_dt:
-            latest_dt = dt
-            latest_str = d_norm
-
-    return latest_str
-
-
-
-
 def main():
-    global RUN_MODE
-
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
-
-    # 兩種方案固定邏輯：daily_signal 一律使用精選 5 分點。
-    if IS_DAILY_SIGNAL_MODE:
-        RUN_MODE = 1
 
     configure_run_mode()
 
@@ -8679,19 +7183,10 @@ def main():
     print(f"B：同分點 + 同標的 + 單日多檔權證合計買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"C：同分點 + 同標的 + 連續3交易日多檔權證累積買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
-    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點 OpenAPI 今日有成交權證預篩，2=完整分點清單）")
-    print(f"OpenAPI 預篩天數：OPENAPI_ACTIVE_PRESCAN_DAYS={OPENAPI_ACTIVE_PRESCAN_DAYS}")
-    print(f"今日活躍權證強制刷新：ACTIVE_WARRANT_FORCE_REFRESH={ACTIVE_WARRANT_FORCE_REFRESH}")
-    print(f"歷史快取 append-only：HISTORY_CACHE_APPEND_ONLY={HISTORY_CACHE_APPEND_ONLY}")
-    print(f"寫回前合併 Google Sheet 歷史：HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE={HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE}")
+    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點全市場追蹤，2=完整分點清單）")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
-    print(f"每日快速更新模式：DATA_UPDATE_ONLY={DATA_UPDATE_ONLY}")
-    print(f"今日圖片使用更新後完整原始資料：TODAY_IMAGE_USE_CURRENT_CANDIDATES={TODAY_IMAGE_USE_CURRENT_CANDIDATES}")
-    print(f"執行方案：RUN_PLAN={RUN_PLAN}（daily_signal=精選5分點當日買賣超產圖，full_report=完整資料回補與回測）")
-    print(f"每日產圖 API5 補抓筆數：DAILY_SIGNAL_API5_DAYS={DAILY_SIGNAL_API5_DAYS}")
-    print(f"價格補抓範圍：PRICE_FETCH_SCOPE={PRICE_FETCH_SCOPE}（today=只補今日圖片需要價格，full=完整歷史補價）")
     print("=" * 70)
 
     warrants = get_all_call_warrants()
@@ -8729,30 +7224,15 @@ def main():
 
     candidates_to_fetch = []
 
-    if IS_DAILY_SIGNAL_MODE:
-        # 每日盤後產圖模式：
-        # 這裡的目標是「今天精選 5 分點買賣超圖片」，不是完整回測建檔。
-        # 因此不管候選是否為新權證，都只抓最近 DAILY_SIGNAL_API5_DAYS 筆 API5，足夠判斷：
-        # A=今日、B=今日、C=結束日為今日的 3 日、D=結束日為今日的 10 日。
-        candidates_to_fetch = [(c, DAILY_SIGNAL_API5_DAYS, "每日產圖") for c in candidates]
-    else:
-        for c in candidates:
-            key = candidate_key_from_tuple(c)
+    for c in candidates:
+        key = candidate_key_from_tuple(c)
 
-            # 完整資料回補與回測模式：
-            # 沒有歷史快取：抓 INITIAL_HISTORY_DAYS / DAYS_HISTORY 建檔。
-            # 已有歷史快取且最近 prescan 有看到目標分點：只抓最近 DAILY_UPDATE_DAYS 筆，append 進歷史快取。
-            if key not in history_keys:
-                candidates_to_fetch.append((c, DAYS_HISTORY, "完整建檔"))
-            elif key in PRESCAN_REFRESH_KEYS:
-                candidates_to_fetch.append((c, DAILY_UPDATE_DAYS, "每日附加"))
+        # 沒有歷史快取：一定要抓
+        # 最近 prescan 有看到目標分點：重新抓 API5，補進最新資料
+        if key not in history_keys or key in PRESCAN_REFRESH_KEYS:
+            candidates_to_fetch.append(c)
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
-    if IS_DAILY_SIGNAL_MODE:
-        print(f"  ✅ 每日產圖模式：所有候選只抓最近 {DAILY_SIGNAL_API5_DAYS} 筆 API5，不抓完整歷史")
-    else:
-        print(f"  ✅ 完整建檔抓取天數：{DAYS_HISTORY} 筆")
-        print(f"  ✅ 既有候選每日附加抓取筆數：{DAILY_UPDATE_DAYS} 筆")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
     fetched_items = []
@@ -8761,8 +7241,8 @@ def main():
     if candidates_to_fetch:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {
-                ex.submit(process_candidate, *c, history_days=history_days): (c, history_days, fetch_mode)
-                for c, history_days, fetch_mode in candidates_to_fetch
+                ex.submit(process_candidate, *c): c
+                for c in candidates_to_fetch
             }
 
             for future in as_completed(futures):
@@ -8782,166 +7262,13 @@ def main():
         print("  ✅ 所有候選組合皆可使用快取，略過 API5 歷史資料重抓")
 
     if fetched_items:
-        # 每日產圖 / 完整回補都先把 API5 抓回來的「原始分點權證買賣超」寫入專用快取。
-        # 這會保存未達 A 門檻的單檔權證買超，讓後續 B/C/D 可以正確累積判斷。
-        daily_raw_cache_df = load_daily_raw_cache()
-        daily_raw_cache_df = merge_items_into_history_cache(daily_raw_cache_df, fetched_items)
-        save_daily_raw_cache(daily_raw_cache_df)
-
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         save_history_cache(history_cache_df)
 
-    # 每日快速更新模式：只更新「快取_分點歷史」後結束，不產生 / 不同步結果工作表。
-    # 保留相容舊設定；新的每日產圖請使用 RUN_PLAN=daily_signal。
-    if DATA_UPDATE_ONLY and not IS_DAILY_SIGNAL_MODE:
-        elapsed = time.time() - program_start
-        minutes = int(elapsed // 60)
-        seconds = elapsed % 60
-        print("\n⚡ DATA_UPDATE_ONLY=1：每日快速更新模式完成。")
-        print("   已完成 OpenAPI 今日有成交權證預篩、API5 補資料、快取_分點歷史 append / merge。")
-        print("   本模式不重算 A/B/C/D、不抓價格、不產生 Excel、不同步結果工作表。")
-        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒，約 {minutes} 分 {seconds:.2f} 秒")
-        return
+    items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
-    # 精選 5 分點當日買賣超產圖模式：
-    # 使用更新後的完整原始分點歷史重算完整 A/B/C/D，
-    # 再從完整 A/B/C/D 篩出 今日_A/B/C/D。
-    # TOP15 只讀完整 A/B/C/D，不再把完整表與今日表混合，避免重複加總。
-    if IS_DAILY_SIGNAL_MODE:
-        # 每日產圖需要「今天最新 API5 資料 + 原本快取_分點歷史原始資料」一起判斷。
-        # 因此不能再用 candidate_keys 限制今日_A/B/C/D 的資料來源。
-        # 正確做法是：本次 API5 先 append / merge 到 history_cache_df，
-        # 再從更新後的整份歷史快取篩出追蹤分點資料，建立今日 A/B/C/D。
-        # 每日產圖的唯一計算來源 = 快取_分點歷史 + 快取_每日分點權證原始買賣超。
-        # 這樣單檔未達 100 萬、但可累積形成 B/C/D 的原始資料不會漏掉。
-        signal_history_df = merge_daily_raw_cache_with_history(history_cache_df)
-
-        candidate_today_items = items_from_history_cache(signal_history_df, candidate_filter=candidate_keys)
-        target_date_for_today = (
-            latest_trade_date_from_warrants(warrants)
-            or latest_trade_date_from_items(fetched_items)
-            or latest_trade_date_from_items(candidate_today_items)
-        )
-
-        today_items = build_signal_abcd_items_from_history_cache(
-            signal_history_df,
-            broker_map,
-            target_date_for_today,
-            context_label="每日產圖"
-        )
-
-        # 若更新後歷史資料不可用，才退回本次候選資料。
-        if not today_items:
-            today_items = candidate_today_items or fetched_items
-
-        if not today_items:
-            print("⚠️ 每日產圖模式沒有可用的 ABCD 運算資料")
-            elapsed = time.time() - program_start
-            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
-            return
-
-        # 核心修正：每日產圖也使用原本成功版的完整 A → B → C → D 主流程，
-        # 不再使用額外重寫的今日 B/C/D 演算法。最後才篩選 target_date 的事件。
-        today_item_map, calc_a_events, calc_b_events, calc_c_events, calc_d_events = build_abcd_events_from_items(
-            today_items,
-            context_label="每日產圖ABCD主流程"
-        )
-        today_a_events, today_b_events, today_c_events, today_d_events = filter_today_events_from_abcd(
-            calc_a_events,
-            calc_b_events,
-            calc_c_events,
-            calc_d_events,
-            target_date_for_today
-        )
-
-        print(
-            f"  ✅ 每日產圖最後篩選 {target_date_for_today}："
-            f"今日A {len(today_a_events)} 筆、今日B {len(today_b_events)} 筆、"
-            f"今日C {len(today_c_events)} 筆、今日D {len(today_d_events)} 筆"
-        )
-
-        if not today_a_events and not today_b_events and not today_c_events and not today_d_events:
-            print("⚠️ 今日_A/B/C/D 皆無事件，但仍會輸出今日工作表供檢查。")
-
-        # 每日產圖模式只補今日圖片需要的價格，不補完整歷史缺價。
-        price_cache = build_price_cache_for_report(
-            today_a_events,
-            today_b_events,
-            today_c_events,
-            today_d_events,
-            today_a_events=today_a_events,
-            today_b_events=today_b_events,
-            today_c_events=today_c_events,
-            today_d_events=today_d_events,
-        )
-
-        build_daily_signal_excel(
-            today_a_events,
-            today_b_events,
-            today_c_events,
-            today_d_events,
-            today_item_map,
-            price_cache,
-            output_path,
-            today_items=today_items,
-            full_a_events=calc_a_events,
-            full_b_events=calc_b_events,
-            full_c_events=calc_c_events,
-            full_d_events=calc_d_events,
-            full_item_map=today_item_map,
-            full_items=today_items,
-            write_image_support_full_sheets=True,
-        )
-        upload_excel_to_google_sheet(output_path)
-
-        elapsed = time.time() - program_start
-        minutes = int(elapsed // 60)
-        seconds = elapsed % 60
-
-        print(f"\n{'=' * 70}")
-        print("✅ 每日產圖模式完成！")
-        print(f"📄 {output_path}")
-        print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
-        print(f"⏱️ 約為：{minutes} 分 {seconds:.2f} 秒")
-        return
-
-    # 主結果表永遠使用完整歷史快取資料，避免 Google Sheet 原本 A/B/C/D、勝率、排行被本次候選資料洗掉。
-    # 今日圖片 / 推播需要的本次候選資料，會另外建立「今日_*」工作表。
-    full_items = items_from_history_cache(history_cache_df)
-
-    signal_history_df = merge_daily_raw_cache_with_history(history_cache_df)
-    candidate_today_items = items_from_history_cache(signal_history_df, candidate_filter=candidate_keys)
-    target_date_for_today = (
-        latest_trade_date_from_warrants(warrants)
-        or latest_trade_date_from_items(fetched_items)
-        or latest_trade_date_from_items(candidate_today_items)
-    )
-    today_items = build_signal_abcd_items_from_history_cache(
-        signal_history_df,
-        broker_map,
-        target_date_for_today,
-        context_label="今日候選"
-    )
-
-    if not full_items and fetched_items:
-        full_items = fetched_items
-
-    if not today_items and fetched_items:
-        today_items = candidate_today_items or fetched_items
-
-    items = full_items
-
-    if REPORT_FULL_HISTORY:
-        print("  ✅ 主結果表使用完整歷史快取資料，不會被本次候選資料覆蓋。")
-    else:
-        print("  ⚠️ REPORT_FULL_HISTORY=0 已不再讓本次候選資料覆蓋主結果表。")
-        print("     主 A/B/C/D、勝率、排行仍使用完整歷史資料；本次候選資料另輸出到 今日_* 工作表。")
-
-    if items:
-        print(f"  ✅ 主結果表使用完整歷史快取資料：{len(items):,} 組 權證×分點")
-
-    if today_items:
-        print(f"  ✅ 今日圖片 / 推播候選資料：{len(today_items):,} 組 權證×分點")
+    if not items and fetched_items:
+        items = fetched_items
 
     if not items:
         print("⚠️ 無任何候選資料")
@@ -8949,30 +7276,51 @@ def main():
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
 
-    item_map, a_events, b_events, c_events, d_events = build_abcd_events_from_items(
-        items,
-        context_label="完整歷史"
+    item_map = {}
+    a_events = []
+
+    for item in items:
+        item_map[(item["broker_code"], item["warrant_code"])] = item
+        a_events.extend(item.get("events_a", []))
+
+    # A 類內部先做權證代號唯一化：
+    # 同一檔權證若有多筆 A 事件，只保留買進日較新、同日買進金額較大的那筆。
+    a_events = filter_a_events_unique_warrants(a_events)
+
+    daily_records = build_daily_records(items)
+
+    # A > B > C > D 權證代號層級互斥：
+    # 只要同一檔權證已經進入 A，後續 B / C / D 完全不再使用這檔權證。
+    a_warrant_codes = collect_event_warrant_codes(a_events)
+    daily_records_for_b = filter_daily_records_by_warrant_codes(daily_records, a_warrant_codes)
+
+    print("【Step 3c】建立 B 類事件：同標的單日合計買超...")
+    b_events = build_b_events(daily_records_for_b, item_map)
+    print(f"  ✅ B 類事件：{len(b_events)} 筆")
+
+    # 已經進入 B 的權證代號，不再進入 C / D。
+    b_warrant_codes = collect_event_warrant_codes(b_events)
+    daily_records_for_c = filter_daily_records_by_warrant_codes(
+        daily_records_for_b,
+        b_warrant_codes
     )
 
-    today_item_map = None
-    today_a_events = []
-    today_b_events = []
-    today_c_events = []
-    today_d_events = []
+    print("【Step 3d】建立 C 類事件：同標的 3 日累積買超...")
+    c_events = build_c_events(daily_records_for_c, item_map)
+    print(f"  ✅ C 類事件：{len(c_events)} 筆")
 
-    if TODAY_IMAGE_USE_CURRENT_CANDIDATES and today_items:
-        today_item_map, today_calc_a, today_calc_b, today_calc_c, today_calc_d = build_abcd_events_from_items(
-            today_items,
-            context_label="今日候選ABCD主流程"
-        )
-        today_a_events, today_b_events, today_c_events, today_d_events = filter_today_events_from_abcd(
-            today_calc_a,
-            today_calc_b,
-            today_calc_c,
-            today_calc_d,
-            target_date_for_today
-        )
-        print("  ✅ 已使用原本 A→B→C→D 主流程建立 今日_* 工作表資料來源；主結果表仍保留完整歷史。")
+    # 已經進入 C 的權證代號，不再進入 D。
+    c_warrant_codes = collect_event_warrant_codes(c_events)
+    daily_records_for_d = filter_daily_records_by_warrant_codes(
+        daily_records_for_c,
+        c_warrant_codes
+    )
+
+    print(f"【Step 3e】建立 D 類事件：同標的近 {D_WINDOW_DAYS} 日累積淨買進...")
+    d_events = build_d_events(daily_records_for_d, item_map, window_days=D_WINDOW_DAYS)
+    print(f"  ✅ D 類事件：{len(d_events)} 筆")
+
+    print(f"  ✅ A 類事件：{len(a_events)} 筆")
 
     if not a_events and not b_events and not c_events and not d_events:
         print("⚠️ A/B/C/D 皆無事件")
@@ -8980,46 +7328,9 @@ def main():
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
 
-    # 全市場每日標的 TOP20 已停用。
-    # 原本這裡會對今日有成交認購權證抓全市場所有分點，再用 API5 回查買賣超，執行時間過長。
-    # 目前保留 A/B/C/D 與精選 / 完整分點追蹤流程，不再建立每日標的淨買超TOP20 / 每日標的買超TOP20。
-    full_market_top20_net_rows, full_market_top20_positive_rows, full_market_top20_trade_date = [], [], ""
+    price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
 
-    price_a_events = a_events + (today_a_events or [])
-    price_b_events = b_events + (today_b_events or [])
-    price_c_events = c_events + (today_c_events or [])
-    price_d_events = d_events + (today_d_events or [])
-
-    price_cache = build_price_cache_for_report(
-        price_a_events,
-        price_b_events,
-        price_c_events,
-        price_d_events,
-        today_a_events=today_a_events,
-        today_b_events=today_b_events,
-        today_c_events=today_c_events,
-        today_d_events=today_d_events,
-    )
-
-    build_excel(
-        a_events,
-        b_events,
-        c_events,
-        d_events,
-        item_map,
-        price_cache,
-        items,
-        output_path,
-        full_market_top20_net_rows=full_market_top20_net_rows,
-        full_market_top20_positive_rows=full_market_top20_positive_rows,
-        full_market_top20_trade_date=full_market_top20_trade_date,
-        today_a_events=today_a_events,
-        today_b_events=today_b_events,
-        today_c_events=today_c_events,
-        today_d_events=today_d_events,
-        today_item_map=today_item_map,
-        today_items=today_items,
-    )
+    build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path)
     upload_excel_to_google_sheet(output_path)
 
     elapsed = time.time() - program_start
