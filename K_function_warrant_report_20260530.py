@@ -2614,7 +2614,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         card_y = -0.015
         card_w = 0.46
         card_h = 0.940
-        band_h = 0.078
+        band_h = 0.035
         box = FancyBboxPatch((x0, card_y), card_w, card_h, transform=ax_top.transAxes,
                              boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35,
                              zorder=1, clip_on=False)
@@ -2658,7 +2658,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         note_y = 0.025
         note_w = 0.46
         note_h = 0.955
-        note_band_h = 0.078
+        note_band_h = 0.040
         note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
                                   boxstyle="round,pad=0.000,rounding_size=0.022", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
                                   zorder=1, clip_on=False)
