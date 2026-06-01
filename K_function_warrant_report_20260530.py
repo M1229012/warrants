@@ -1881,7 +1881,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                          zorder=2)
         band.set_clip_path(box)
         ax_top.add_patch(band)
-        ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.915, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
         ax_top.text(x0 + 0.02, 0.82, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
         if df_top.empty:
             ax_top.text(x0 + 0.03, 0.60, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
@@ -1903,7 +1903,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rep_y = y - 0.060
                 amount_y = (branch_y + rep_y) / 2
                 ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + card_w - 0.018, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                ax_top.text(x0 + card_w - 0.012, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
                 ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
                 ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
