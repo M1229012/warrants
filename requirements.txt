@@ -12,3 +12,5 @@ feedparser
 python-dateutil
 yfinance
 numpy
+google-genai
+googlenewsdecoder
