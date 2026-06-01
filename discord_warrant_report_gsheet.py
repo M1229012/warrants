@@ -1818,16 +1818,17 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     統計近 N 個有效交易日內，五大追蹤分點對同一標的的共識淨買超 TOP15。
 
     統計來源：
-    - A_單檔大買：買進日 / 買進金額
-    - B_同標的單日合計：事件日 / 買超金額
-    - C_同標的3日累積：結束日 / 買超金額
-    - D_近10日累積淨買進：結束日 / 買超金額
+    - A_單檔大買：買進日 / 買進金額 / 買進張數
+    - B_同標的單日合計：事件日 / 買超金額 / 買超張數
+    - C_同標的3日累積：結束日 / 買超金額 / 買超張數
+    - D_近10日累積淨買進：結束日 / 買超金額 / 買超張數
 
     合併方式：
     - 同標的股合併
-    - 淨累積買超 = 合計買超 - 合計賣方金額
-    - 僅保留淨累積買超 > 0 的標的
-    - 依淨累積買超由大到小排序
+    - 淨買超成本 = 合計買超成本 - 已賣出張數對應的原始買進成本
+    - 不再用「賣出成交金額」直接扣買進金額，避免權證大漲時把剩餘庫存低估
+    - 僅保留淨買超成本 > 0 的標的
+    - 依淨買超成本由大到小排序
     """
     trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
     date_set = set(trading_dates)
@@ -1842,22 +1843,222 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     # 或不屬於本策略事件的權證賣出拿來扣，導致 TOP15 被錯誤清空。
     counted_warrant_keys: set[tuple[str, str]] = set()
 
+    # 以「分點 + 權證代號」建立持倉成本批次。
+    # 重點：賣出時扣的是「賣出張數對應的原始買進成本」，不是扣賣出成交金額。
+    # A 表可精準對到單檔權證；B/C/D 若是多檔權證合計，則使用該列的平均成本作為估算。
+    position_lots_by_warrant: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    lot_seq = 0
+
+    def get_row_buy_qty_units(row, sheet_name: str) -> float:
+        """取得買進數量，統一轉為權證單位數；表內張數 × 1000。"""
+        if sheet_name == SHEET_A:
+            qty_lots = safe_float(row.get("買進張數"), 0)
+        else:
+            qty_lots = safe_float(row.get("買超張數"), 0)
+        return qty_lots * NTD_PER_WARRANT_POINT if qty_lots > 0 else 0.0
+
+    def get_row_sell_qty_units(row) -> float:
+        """取得賣出數量，優先使用賣出股數；沒有時用賣出張數 × 1000。"""
+        sell_qty_units = safe_float(row.get("賣出股數"), 0)
+        if sell_qty_units <= 0:
+            sell_qty_lots = safe_float(row.get("賣出張數"), 0)
+            if sell_qty_lots > 0:
+                sell_qty_units = sell_qty_lots * NTD_PER_WARRANT_POINT
+        return sell_qty_units
+
+    def build_period_sell_cost_lookup(sell_period_start: date, sell_period_end: date) -> dict[tuple[date, str, str], float]:
+        """
+        從「快取_分點歷史」估算統計期間內每一筆賣出的原始成本。
+
+        這是給以下情況備援：
+        - 權證沒有在 A/B/C/D 的持倉批次中建立到可用張數。
+        - 非 A/B/C/D 白名單但符合大額同標的賣超扣減條件。
+
+        估算法：
+        - 以同分點 + 同權證代號為單位。
+        - 依歷史買進股數 / 買進金額建立加權平均成本。
+        - 賣出時用「賣出股數 × 賣出前平均成本」作為扣減成本。
+        - 同一天若同時有買有賣，沿用前面報酬率估算函式的邏輯：先處理賣出，再處理買進。
+        """
+        needed_cols = [
+            "日期", "分點", "權證代號", "權證代碼",
+            "買進股數", "賣出股數", "買進金額", "賣出金額"
+        ]
+        hist_df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+        if hist_df.empty:
+            return {}
+
+        grouped: dict[tuple[str, str], dict] = defaultdict(lambda: defaultdict(lambda: {
+            "buy_qty": 0.0,
+            "sell_qty": 0.0,
+            "buy_amt": 0.0,
+            "sell_amt": 0.0,
+        }))
+
+        for _, r in hist_df.iterrows():
+            d = parse_date_value(r.get("日期"))
+            if not d or d > sell_period_end:
+                continue
+
+            broker = str(r.get("分點", "")).strip()
+            if broker not in TRACKED_BROKERS:
+                continue
+
+            warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+            if not warrant_code:
+                continue
+
+            bucket = grouped[(broker, warrant_code)][d]
+            bucket["buy_qty"] += safe_float(r.get("買進股數"), 0)
+            bucket["sell_qty"] += safe_float(r.get("賣出股數"), 0)
+            bucket["buy_amt"] += safe_float(r.get("買進金額"), 0)
+            bucket["sell_amt"] += safe_float(r.get("賣出金額"), 0)
+
+        result: dict[tuple[date, str, str], float] = defaultdict(float)
+
+        for (broker, warrant_code), by_date in grouped.items():
+            hold_qty = 0.0
+            hold_cost = 0.0
+
+            for d in sorted(by_date.keys()):
+                row = by_date[d]
+                buy_qty = safe_float(row.get("buy_qty"), 0)
+                sell_qty = safe_float(row.get("sell_qty"), 0)
+                buy_amt = safe_float(row.get("buy_amt"), 0)
+
+                if sell_qty > 0:
+                    avg_cost = (hold_cost / hold_qty) if hold_qty > 0 else 0.0
+                    sell_cost = avg_cost * sell_qty if avg_cost > 0 else 0.0
+
+                    if sell_period_start <= d <= sell_period_end and sell_cost > 0:
+                        result[(d, broker, warrant_code)] += sell_cost
+
+                    remove_qty = min(sell_qty, hold_qty)
+                    if remove_qty > 0 and avg_cost > 0:
+                        remove_cost = avg_cost * remove_qty
+                        hold_cost -= remove_cost
+                        hold_qty -= remove_qty
+                        if hold_qty < 1e-9:
+                            hold_qty = 0.0
+                            hold_cost = 0.0
+
+                if buy_qty > 0:
+                    hold_qty += buy_qty
+                    hold_cost += buy_amt
+
+        return dict(result)
+
+    def register_position_lot(
+        broker: str,
+        underlying_code: str,
+        event_code: str,
+        event_date: date,
+        amount: float,
+        buy_qty_units: float,
+        warrant_codes: list[str],
+    ):
+        """建立買進成本批次，之後用賣出張數扣原始成本。"""
+        nonlocal lot_seq
+
+        broker = str(broker).strip()
+        amount = safe_float(amount, 0)
+        buy_qty_units = safe_float(buy_qty_units, 0)
+        warrant_codes = [normalize_warrant_code(w) for w in warrant_codes if normalize_warrant_code(w)]
+
+        if not broker or not underlying_code or amount <= 0 or buy_qty_units <= 0 or not warrant_codes:
+            return
+
+        lot_seq += 1
+        avg_cost_per_unit = amount / buy_qty_units
+        lot = {
+            "lot_id": lot_seq,
+            "broker": broker,
+            "underlying": underlying_code,
+            "event": event_code,
+            "event_date": event_date,
+            "buy_amount": amount,
+            "remaining_cost": amount,
+            "buy_qty_units": buy_qty_units,
+            "remaining_qty_units": buy_qty_units,
+            "avg_cost_per_unit": avg_cost_per_unit,
+            "warrant_codes": set(warrant_codes),
+        }
+
+        # 同一個 B/C/D 群組批次可能包含多檔權證，因此同一個 lot 會掛到多個權證代號底下。
+        # 之後任一檔權證賣出，都會從同一個 lot 的剩餘張數與剩餘成本扣除，避免重複扣減。
+        for warrant_code in warrant_codes:
+            position_lots_by_warrant[(broker, warrant_code)].append(lot)
+            counted_warrant_keys.add((broker, warrant_code))
+
+    def deduct_sell_cost_from_positions(broker: str, warrant_code: str, sell_qty_units: float) -> float:
+        """用賣出張數扣掉對應的原始買進成本，回傳本次應扣成本。"""
+        broker = str(broker).strip()
+        warrant_code = normalize_warrant_code(warrant_code)
+        sell_qty_units = safe_float(sell_qty_units, 0)
+
+        if not broker or not warrant_code or sell_qty_units <= 0:
+            return 0.0
+
+        lots = position_lots_by_warrant.get((broker, warrant_code), [])
+        if not lots:
+            return 0.0
+
+        # 依事件日期 FIFO 扣成本；同日則依建立順序。
+        lots = sorted(lots, key=lambda x: (x.get("event_date") or date.min, x.get("lot_id", 0)))
+        remaining_sell_qty = sell_qty_units
+        deducted_cost = 0.0
+        used_lot_ids = set()
+
+        for lot in lots:
+            lot_id = lot.get("lot_id")
+            if lot_id in used_lot_ids:
+                continue
+            used_lot_ids.add(lot_id)
+
+            lot_qty = safe_float(lot.get("remaining_qty_units"), 0)
+            lot_cost = safe_float(lot.get("remaining_cost"), 0)
+            avg_cost_per_unit = safe_float(lot.get("avg_cost_per_unit"), 0)
+
+            if remaining_sell_qty <= 0:
+                break
+            if lot_qty <= 0 or lot_cost <= 0 or avg_cost_per_unit <= 0:
+                continue
+
+            remove_qty = min(remaining_sell_qty, lot_qty)
+            remove_cost = min(lot_cost, remove_qty * avg_cost_per_unit)
+
+            lot["remaining_qty_units"] = lot_qty - remove_qty
+            lot["remaining_cost"] = lot_cost - remove_cost
+
+            if lot["remaining_qty_units"] < 1e-9:
+                lot["remaining_qty_units"] = 0.0
+            if lot["remaining_cost"] < 1e-6:
+                lot["remaining_cost"] = 0.0
+
+            deducted_cost += remove_cost
+            remaining_sell_qty -= remove_qty
+
+        return deducted_cost
+
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
         TOP15 賣方扣減規則：
         1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
         2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
            也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
-           能正確反映到近一個月 TOP15 淨買超。
+           能正確反映到近一個月 TOP15。
 
-        注意：對於第 2 類，只是拿「同日同分點同標的合計 >= 門檻」作為納入條件；
-        一旦達標，該組合底下當天所有賣出列都會被扣減。
+        重要修正：
+        - 舊版是直接扣「賣出成交金額」。
+        - 新版改為扣「賣出張數對應的原始買進成本」。
+        - 這樣權證大賺時，不會因為賣出成交金額變大而低估剩餘買超成本。
         """
         if sell_df.empty:
             return
 
         sell_period_start = min(trading_dates)
         sell_period_end = target
+        history_sell_cost_lookup = build_period_sell_cost_lookup(sell_period_start, sell_period_end)
 
         usable_sell_rows = []
         non_abcd_sell_amounts: dict[tuple[date, str, str], float] = defaultdict(float)
@@ -1876,9 +2077,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if not code or code not in agg:
                 continue
 
-            amount = safe_float(r.get("賣出金額"), 0)
-            if amount <= 0:
+            sell_amount = safe_float(r.get("賣出金額"), 0)
+            if sell_amount <= 0:
                 continue
+
+            sell_qty_units = get_row_sell_qty_units(r)
 
             warrant_code = ""
             for col in code_col_candidates:
@@ -1887,14 +2090,23 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                     break
 
             is_counted_warrant = bool(warrant_code and (broker, warrant_code) in counted_warrant_keys)
-            usable_sell_rows.append((d, broker, code, warrant_code, amount, is_counted_warrant))
+
+            usable_sell_rows.append({
+                "date": d,
+                "broker": broker,
+                "underlying": code,
+                "warrant_code": warrant_code,
+                "sell_amount": sell_amount,
+                "sell_qty_units": sell_qty_units,
+                "is_counted_warrant": is_counted_warrant,
+            })
 
             # 非 A/B/C/D 的大額賣超只用「目標日當天」判斷與扣減。
             # A/B/C/D 白名單權證的賣出仍維持整個統計期間扣減。
-            # 避免 RUN_MODE=1 全市場補抓後，把近一個月所有非策略大額賣單都扣進 TOP15，
-            # 導致 TOP15 全部被扣成負數而空白。
+            # 這裡仍用賣出成交金額判斷是否達到「大額賣超」門檻；
+            # 但實際扣減時會改扣成本，不會扣賣出成交金額。
             if not is_counted_warrant and d == target:
-                non_abcd_sell_amounts[(d, broker, code)] += amount
+                non_abcd_sell_amounts[(d, broker, code)] += sell_amount
 
         qualifying_non_abcd_keys = {
             key
@@ -1902,12 +2114,47 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if amount >= NON_ABCD_SELL_UNDERLYING_THRESHOLD
         }
 
-        for d, broker, code, warrant_code, amount, is_counted_warrant in usable_sell_rows:
+        # 同一天、同分點、同標的、同權證先合併，避免 Google Sheet 若有多列時重複扣同一筆歷史成本。
+        grouped_sell_rows: dict[tuple[date, str, str, str, bool], dict] = defaultdict(lambda: {
+            "sell_amount": 0.0,
+            "sell_qty_units": 0.0,
+        })
+
+        for row in usable_sell_rows:
+            d = row["date"]
+            broker = row["broker"]
+            code = row["underlying"]
+            warrant_code = row["warrant_code"]
+            is_counted_warrant = row["is_counted_warrant"]
+
             if not is_counted_warrant and (d, broker, code) not in qualifying_non_abcd_keys:
                 continue
 
-            agg[code]["net_amount"] -= amount
-            agg[code]["broker_net_amounts"][broker] -= amount
+            key = (d, broker, code, warrant_code, is_counted_warrant)
+            grouped_sell_rows[key]["sell_amount"] += safe_float(row.get("sell_amount"), 0)
+            grouped_sell_rows[key]["sell_qty_units"] += safe_float(row.get("sell_qty_units"), 0)
+
+        for (d, broker, code, warrant_code, is_counted_warrant), row in grouped_sell_rows.items():
+            sell_qty_units = safe_float(row.get("sell_qty_units"), 0)
+            if sell_qty_units <= 0:
+                # 沒有張數就無法換算原始成本；不要退回扣賣出金額，避免再次低估。
+                continue
+
+            sell_cost = 0.0
+
+            # A/B/C/D 白名單權證優先用本次統計範圍內建立的買進成本批次扣除。
+            if is_counted_warrant:
+                sell_cost = deduct_sell_cost_from_positions(broker, warrant_code, sell_qty_units)
+
+            # 若本次統計範圍沒有可扣成本，才用快取_分點歷史估算的加權平均成本作備援。
+            if sell_cost <= 0 and warrant_code:
+                sell_cost = safe_float(history_sell_cost_lookup.get((d, broker, warrant_code), 0), 0)
+
+            if sell_cost <= 0:
+                continue
+
+            agg[code]["net_amount"] -= sell_cost
+            agg[code]["broker_net_amounts"][broker] -= sell_cost
 
     def ensure_item(underlying, warrant_text=""):
         code = normalize_underlying(underlying, warrant_text)
@@ -1924,8 +2171,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 "underlying": code,
                 "stock_name": stock_name,
                 "target": label,
-                "amount": 0.0,       # 合計買超
-                "net_amount": 0.0,   # 淨累積買超 = 買超 - 賣方
+                "amount": 0.0,       # 合計買超成本
+                "net_amount": 0.0,   # 淨買超成本 = 買超成本 - 已賣出張數對應的原始成本
                 "count": 0,
                 "brokers": set(),
                 "events": set(),
@@ -1967,36 +2214,41 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if item["last_date"] is None or event_date > item["last_date"]:
             item["last_date"] = event_date
 
-        # 建立本次 TOP15 統計範圍內的權證白名單。
+        # 建立本次 TOP15 統計範圍內的買進成本批次。
         # A 表通常是一檔權證；B/C/D 則從權證清單拆出多檔權證。
+        buy_qty_units = get_row_buy_qty_units(row, sheet_name)
+
         if sheet_name == SHEET_A:
             warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
             if warrant_code:
-                counted_warrant_keys.add((broker, warrant_code))
+                register_position_lot(
+                    broker=broker,
+                    underlying_code=code,
+                    event_code=event_code,
+                    event_date=event_date,
+                    amount=amount,
+                    buy_qty_units=buy_qty_units,
+                    warrant_codes=[warrant_code],
+                )
         else:
-            for warrant_code, _ in parse_warrant_items_from_text(warrant_text):
-                if warrant_code:
-                    counted_warrant_keys.add((broker, warrant_code))
+            warrant_codes = [warrant_code for warrant_code, _ in parse_warrant_items_from_text(warrant_text) if warrant_code]
+            if warrant_codes:
+                register_position_lot(
+                    broker=broker,
+                    underlying_code=code,
+                    event_code=event_code,
+                    event_date=event_date,
+                    amount=amount,
+                    buy_qty_units=buy_qty_units,
+                    warrant_codes=warrant_codes,
+                )
 
     def add_sell_row(row, event_date, amount):
-        if not event_date or event_date not in date_set:
-            return
-
-        broker = str(row.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            return
-
-        amount = safe_float(amount)
-        if amount <= 0:
-            return
-
-        warrant_text = row.get("權證名稱") or row.get("權證清單") or ""
-        code = normalize_underlying(row.get("標的股"), warrant_text)
-        if not code or code not in agg:
-            return
-
-        agg[code]["net_amount"] -= amount
-        agg[code]["broker_net_amounts"][broker] -= amount
+        """
+        保留舊函式名稱避免未來擴充時找不到；目前 TOP15 賣方扣減統一由
+        apply_sell_deduction_from_df() 依張數換算原始成本處理。
+        """
+        return
 
     # A：買超與賣方
     try:
@@ -2010,7 +2262,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         for _, r in A.iterrows():
             add_buy_row(SHEET_A, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
 
-        # 賣方扣減改由「每日賣出明細」統一處理，避免 A 類部分減碼被整筆買進張數放大。
+        # 賣方扣減改由「快取_分點歷史 / 每日賣出明細」統一處理，並依賣出張數扣原始成本。
     except Exception:
         pass
 
@@ -2025,7 +2277,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         try:
             df = read_gsheet_table(
                 sheet_name,
-                ["分點", "標的股", date_col, "買超金額",
+                ["分點", "標的股", date_col, "買超金額", "買超張數",
                  "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
             )
         except Exception:
@@ -2034,22 +2286,21 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         for _, r in df.iterrows():
             add_buy_row(sheet_name, event_code, r, parse_date_value(r.get(date_col)), r.get("買超金額"))
 
-        # 賣方扣減改由「每日賣出明細」統一處理，避免群組事件中單檔實際賣出被漏算或誤估。
+        # 賣方扣減改由「快取_分點歷史 / 每日賣出明細」統一處理，並依賣出張數扣原始成本。
 
-    # 使用「快取_分點歷史」扣減近 N 個有效交易日內的實際賣出金額。
+    # 使用「快取_分點歷史」扣減近 N 個有效交易日內的實際賣出張數對應成本。
     # 注意：每日賣出明細通常只輸出最近幾天，不能拿來做近一個月 TOP15，
     # 否則會只扣到最近幾天的賣出，造成 TOP15 跟過去版本差很多。
     #
     # 扣減規則：
     # 1. 原本有被 A/B/C/D 買超事件納入的「分點 + 權證代號」照常扣減。
     # 2. 若不在 A/B/C/D 白名單，但同一天 + 同分點 + 同標的賣出合計 >= 100 萬，
-    #    也一併扣減，讓 RUN_MODE=1 精選 5 分點全市場補抓到的大額賣單
-    #    能正確反映到近一個月 TOP15 淨買超。
+    #    也一併扣減，但實際扣掉的是該賣出張數對應的原始成本。
     sell_rows_loaded = False
     try:
         sell_df = read_gsheet_table_optional(
             SHEET_HISTORY,
-            ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出金額"]
+            ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出股數", "賣出金額"]
         )
 
         if not sell_df.empty:
@@ -2064,7 +2315,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         try:
             sell_df = read_gsheet_table_optional(
                 SHEET_DAILY_SELL,
-                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出金額"]
+                ["日期", "分點", "標的股", "權證代號", "權證名稱", "賣出張數", "賣出股數", "賣出金額"]
             )
 
             if not sell_df.empty:
@@ -2074,7 +2325,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
     rows = []
     for item in agg.values():
-        # 共識淨買超榜只保留目前仍為正淨買超的標的
+        # 共識淨買超成本榜只保留目前仍為正淨買超成本的標的
         if item["net_amount"] <= 0:
             continue
 
@@ -2108,10 +2359,9 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
     return rows[:15], trading_dates
 
-
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
     """
-    第二張圖：近一個月交易日｜五大分點共識淨買超 TOP15
+    第二張圖：近一個月交易日｜五大分點共識淨買超成本 TOP15
     """
     rows, trading_dates = collect_consensus_buy_top10(target, lookback_days)
     n = len(rows)
@@ -2226,7 +2476,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超 TOP15", 28, NAVY, BOLD)
+    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超成本 TOP15", 28, NAVY, BOLD)
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
@@ -2237,7 +2487,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     legend_y = y - legend_h
     rounded(margin_x, legend_y, content_w, legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
 
-    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨累積買超：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
+    text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨買超成本：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
 
     legend_items = [
         ("A", "單檔權證單日大買"),
@@ -2259,9 +2509,9 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     table_top = y
     rounded(margin_x, table_top - table_h, content_w, table_h, fc=WHITE, ec=NAVY, lw=1.2, r=0.08)
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
-    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超 TOP15", 19, WHITE, BOLD)
+    text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨累積買超", "分點數", "事件", "參與分點"]
+    headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點"]
     col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
 
     header_y_top = table_top - section_title_h
@@ -2277,7 +2527,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     data_y = header_y_top - header_h
     if not rows:
         rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨累積買超為正的標的", 13, MUTED, BOLD, ha="center")
+        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨買超成本為正的標的", 13, MUTED, BOLD, ha="center")
     else:
         for i, r in enumerate(rows):
             ry = data_y - (i + 1) * row_h
@@ -2339,7 +2589,7 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超TOP15.png"
+    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
 
     history = read_history_stats_from_gsheet()
     buys, sells = extract_actions_from_gsheet(target)
