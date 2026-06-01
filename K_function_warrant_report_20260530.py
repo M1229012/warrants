@@ -2271,6 +2271,65 @@ def draw_card(ax, x, y, w, h, label, value, sub="", value_color=GOLD):
             zorder=4,
         )
 
+def draw_rounded_panel_with_top_band(ax, x, y, w, h, band_h=0.035, rounding=0.02, linewidth=1.25):
+    """畫出與摘要卡片一致的圓角面板，並讓上方藏青色條跟著圓角完整貼齊。"""
+    # 先畫白底面板，確保下方仍是乾淨白底。
+    base = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor=PANEL2,
+        edgecolor="none",
+        linewidth=0,
+        zorder=1,
+        clip_on=False,
+    )
+    ax.add_patch(base)
+
+    # 深藍色先用完整圓角面板畫一次，再用白色遮住下半部；
+    # 這樣上方左右圓角會與外框完全貼齊，不會出現方角或縮短。
+    band_shape = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor=GOLD,
+        edgecolor="none",
+        linewidth=0,
+        alpha=0.96,
+        zorder=2,
+        clip_on=False,
+    )
+    ax.add_patch(band_shape)
+
+    body_cover = Rectangle(
+        (x, y),
+        w,
+        max(0.0, h - band_h),
+        transform=ax.transAxes,
+        facecolor=PANEL2,
+        edgecolor="none",
+        linewidth=0,
+        zorder=3,
+        clip_on=False,
+    )
+    body_cover.set_clip_path(base)
+    ax.add_patch(body_cover)
+
+    # 最後補外框，避免白色遮罩蓋掉邊線。
+    border = FancyBboxPatch(
+        (x, y), w, h,
+        transform=ax.transAxes,
+        boxstyle=f"round,pad=0.000,rounding_size={rounding}",
+        facecolor="none",
+        edgecolor=GOLD,
+        linewidth=linewidth,
+        zorder=4,
+        clip_on=False,
+    )
+    ax.add_patch(border)
+    return base
+
+
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
     width = 0.72
@@ -2610,26 +2669,27 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         (0.52, "本週淨賣超分點 TOP5", sell_top, GREEN),
     ]
     for x0, title, df_top, side_color in sections:
-        # 整個 TOP5 卡片略往下，避免貼太上方。
-        card_y = -0.015
+        # TOP5 卡片：上緣位置維持，底部往下拓一點，讓內容與外框更有呼吸感。
+        card_y = -0.045
         card_w = 0.46
-        card_h = 0.940
+        card_h = 0.970
         band_h = 0.035
-        box = FancyBboxPatch((x0, card_y), card_w, card_h, transform=ax_top.transAxes,
-                             boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35,
-                             zorder=1, clip_on=False)
-        ax_top.add_patch(box)
-        band = Rectangle((x0, card_y + card_h - band_h), card_w, band_h,
-                         transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95,
-                         zorder=2, clip_on=False)
-        band.set_clip_path(box)
-        ax_top.add_patch(band)
-        ax_top.text(x0 + 0.02, 0.825, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
-        ax_top.text(x0 + 0.02, 0.750, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
+        draw_rounded_panel_with_top_band(
+            ax_top,
+            x0,
+            card_y,
+            card_w,
+            card_h,
+            band_h=band_h,
+            rounding=0.02,
+            linewidth=1.35,
+        )
+        ax_top.text(x0 + 0.02, 0.845, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top", zorder=6)
+        ax_top.text(x0 + 0.02, 0.772, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top", zorder=6)
         if df_top.empty:
-            ax_top.text(x0 + 0.03, 0.56, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
+            ax_top.text(x0 + 0.03, 0.58, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center", zorder=6)
         else:
-            y = 0.635
+            y = 0.645
             row_gap = 0.142
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
@@ -2641,34 +2701,35 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 circ_x = x0 + 0.03
                 circ_y = y - 0.012
                 ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold",
-                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
+                           ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD), zorder=6)
                 branch_y = y + 0.002
                 rep_y = y - 0.047
-                amount_y = (branch_y + rep_y) / 2
-                ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
-                ax_top.text(x0 + card_w - 0.012, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
+                amount_y = (branch_y + rep_y) / 2 + 0.010
+                ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center", zorder=6)
+                ax_top.text(x0 + card_w - 0.012, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center", zorder=6)
                 rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
-                ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
-                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.100, y - 0.100], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
+                ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center", zorder=6)
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.100, y - 0.100], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65, zorder=5)
                 y -= row_gap
 
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
-        note_y = 0.025
+        note_y = 0.005
         note_w = 0.46
-        note_h = 0.955
+        note_h = 0.975
         note_band_h = 0.040
-        note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
-                                  boxstyle="round,pad=0.000,rounding_size=0.022", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
-                                  zorder=1, clip_on=False)
-        ax_notes.add_patch(note_box)
-        note_band = Rectangle((x0, note_y + note_h - note_band_h), note_w, note_band_h,
-                              transform=ax_notes.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95,
-                              zorder=2, clip_on=False)
-        note_band.set_clip_path(note_box)
-        ax_notes.add_patch(note_band)
-        ax_notes.text(x0 + 0.02, note_y + note_h - 0.120, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False)
+        draw_rounded_panel_with_top_band(
+            ax_notes,
+            x0,
+            note_y,
+            note_w,
+            note_h,
+            band_h=note_band_h,
+            rounding=0.022,
+            linewidth=1.25,
+        )
+        ax_notes.text(x0 + 0.02, note_y + note_h - 0.105, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False, zorder=6)
     notes_fontsize = 32
     notes_line_height = 0.058
     notes_item_gap = 0.036
