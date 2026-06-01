@@ -1913,7 +1913,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
         note_y = 0.035
-        note_w = 0.46
+        note_w = 0.43
         note_h = 0.93
         note_band_h = 0.035
         note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
@@ -1926,7 +1926,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
         ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top")
-    notes_wrap_width = 25
+    notes_wrap_width = 27
     notes_fontsize = 33
     notes_line_height = 0.062
     notes_item_gap = 0.045
