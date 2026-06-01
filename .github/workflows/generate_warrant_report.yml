@@ -27,6 +27,9 @@ jobs:
 
       # FinMind 設定：三大法人資料來源
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+      # Gemini API
+      WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
+
 
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
