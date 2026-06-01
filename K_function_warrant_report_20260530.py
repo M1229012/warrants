@@ -1932,7 +1932,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     notes_max_lines = 3
     notes_right_padding = 0.025
 
-    def wrap_text_by_pixel(ax, fig, text, max_width_axes=0.65, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
+    def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
         """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
         s = str(text or "").strip()
         if not s:
@@ -2015,8 +2015,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.43 - notes_right_padding, 0.79)
-    draw_note_items(news_points[:5], 0.54, 0.52 + 0.43 - notes_right_padding, 0.79)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.53 - notes_right_padding, 0.79)
+    draw_note_items(news_points[:5], 0.54, 0.52 + 0.53 - notes_right_padding, 0.79)
 
     # x ticks
     interval = max(1, len(x) // 12)
