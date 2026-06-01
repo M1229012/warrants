@@ -2624,12 +2624,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                          zorder=2, clip_on=False)
         band.set_clip_path(box)
         ax_top.add_patch(band)
-        ax_top.text(x0 + 0.02, 0.875, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
-        ax_top.text(x0 + 0.02, 0.800, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.855, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
+        ax_top.text(x0 + 0.02, 0.780, "分點｜本週淨額｜代表權證（該分點本週金額最大）", transform=ax_top.transAxes, color=MUTED, fontsize=29, ha="left", va="top")
         if df_top.empty:
             ax_top.text(x0 + 0.03, 0.56, "本週無符合資料", transform=ax_top.transAxes, color=MUTED, fontsize=25, ha="left", va="center")
         else:
-            y = 0.685
+            y = 0.660
             row_gap = 0.145
             for rank, (_, r) in enumerate(df_top.iterrows(), 1):
                 branch = str(r["branch"]) or "未知分點"
@@ -2639,17 +2639,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 wamt = float(r.get("max_warrant_amount", 0.0))
                 # rank circle
                 circ_x = x0 + 0.03
-                circ_y = y - 0.005
+                circ_y = y - 0.012
                 ax_top.text(circ_x, circ_y, str(rank), transform=ax_top.transAxes, color=WHITE, fontsize=29, fontweight="bold",
                            ha="center", va="center", bbox=dict(boxstyle="circle,pad=0.25", facecolor=GOLD, edgecolor=GOLD))
-                branch_y = y + 0.012
-                rep_y = y - 0.060
+                branch_y = y + 0.002
+                rep_y = y - 0.047
                 amount_y = (branch_y + rep_y) / 2
                 ax_top.text(x0 + 0.06, branch_y, branch[:12], transform=ax_top.transAxes, color=TEXT, fontsize=28, fontweight="bold", ha="left", va="center")
                 ax_top.text(x0 + card_w - 0.012, amount_y, fmt_money(amt), transform=ax_top.transAxes, color=side_color, fontsize=36, fontweight="bold", ha="right", va="center")
                 rep = f"代表權證：{wcode} {wname[:10]}｜{fmt_money(wamt)}"
                 ax_top.text(x0 + 0.06, rep_y, rep, transform=ax_top.transAxes, color=MUTED, fontsize=28, ha="left", va="center")
-                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.112, y - 0.112], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
+                ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.100, y - 0.100], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65)
                 y -= row_gap
 
     # Notes row
