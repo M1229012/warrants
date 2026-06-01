@@ -1326,12 +1326,120 @@ def _rule_based_key_points(ctx, stock_name: str):
     return points[:4]
 
 
+def _trim_weekly_point(text: str, max_len: int | None = None) -> str:
+    max_len = int(max_len or WEEKLY_KEYPOINT_POINT_MAX_LEN)
+    s = _normalize_news_text(text)
+    s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
+    s = re.sub(r"^(本週重點|重點|摘要)[:：]\s*", "", s).strip()
+    s = s.strip("。；;，, ")
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len]
+    last = max(cut.rfind("，"), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
+    if last >= 36:
+        cut = cut[:last]
+    return cut.rstrip("，、；; ") + "…"
+
+
+def _clean_weekly_key_points(raw_points: List[str]) -> List[str]:
+    points = []
+    for p in raw_points or []:
+        s = _trim_weekly_point(p, max_len=WEEKLY_KEYPOINT_POINT_MAX_LEN)
+        if not s:
+            continue
+        if s in points:
+            continue
+        points.append(s)
+        if len(points) >= WEEKLY_KEYPOINT_MAX_POINTS:
+            break
+    return points
+
+
+def _parse_weekly_gemini_points(output_text: str) -> List[str]:
+    return _clean_weekly_key_points(_parse_raw_points_from_llm(output_text))
+
+
+def _build_weekly_expansion_points(ctx: dict, stock_name: str) -> List[str]:
+    """Gemini 本週重點太短時，用同一份技術面 / 權證資料補足資訊量。"""
+    points = []
+    try:
+        df = ctx.get("plot_df", pd.DataFrame())
+        latest = df.iloc[-1] if df is not None and not df.empty else pd.Series(dtype=float)
+        close = _safe_float(latest.get("Close"))
+        ma5 = _safe_float(latest.get("MA5"))
+        ma20 = _safe_float(latest.get("MA20"))
+        ma60 = _safe_float(latest.get("MA60"))
+        vol = _safe_float(latest.get("Volume"))
+        mv20 = _safe_float(latest.get("MV20"))
+        vol_ratio = vol / mv20 if mv20 and np.isfinite(mv20) and mv20 > 0 else np.nan
+        ma_signal = get_ma_kline_signals(df) if df is not None and not df.empty else ""
+        kd_signal = get_kd_signals(df) if df is not None and not df.empty else ""
+        macd_signal = get_macd_signals(df) if df is not None and not df.empty else ""
+        if np.isfinite(close):
+            points.append(
+                f"股價本週 {fmt_pct(ctx.get('stock_ret', np.nan))}，最新收盤 {close:.0f}，目前與 5MA {ma5:.1f}、20MA {ma20:.1f}、60MA {ma60:.1f} 的相對位置，搭配 {ma_signal or '均線結構'} 判斷短中期趨勢。"
+            )
+        if np.isfinite(vol_ratio):
+            points.append(
+                f"量能面本週較前週 {fmt_pct(ctx.get('vol_change', np.nan))}，最新日約為月均量 {vol_ratio:.1f} 倍，需搭配 {kd_signal or 'KD'} 與 {macd_signal or 'MACD'} 觀察動能是否延續。"
+            )
+        total_net = float(ctx.get("total_net", 0) or 0)
+        total_buy = float(ctx.get("total_buy", 0) or 0)
+        total_sell = float(ctx.get("total_sell", 0) or 0)
+        points.append(
+            f"權證資金流本週買進 {fmt_money_abs(total_buy)}、賣出 {fmt_money(-abs(total_sell))}，合計淨流向 {fmt_money(total_net)}（{ctx.get('bias', '')}），可觀察資金是否與股價方向一致。"
+        )
+        e = ctx.get("week_events")
+        if e is not None and not e.empty:
+            by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
+            top_buy = str(by_branch.index[0]) if len(by_branch) else ""
+            top_buy_amt = float(by_branch.iloc[0]) if len(by_branch) else 0.0
+            top_sell = str(by_branch.index[-1]) if len(by_branch) else ""
+            top_sell_amt = float(by_branch.iloc[-1]) if len(by_branch) else 0.0
+            points.append(
+                f"分點結構以「{top_buy}」買超 {fmt_money(top_buy_amt)} 與「{top_sell}」賣超 {fmt_money(top_sell_amt)} 最明顯，若買賣集中度升高，代表籌碼方向更需要追蹤。"
+            )
+    except Exception:
+        pass
+    return _clean_weekly_key_points(points)
+
+
+def _ensure_weekly_keypoint_min_total(points: List[str], ctx: dict, stock_name: str) -> List[str]:
+    points = _clean_weekly_key_points(points)
+    if _count_summary_chars(points) >= WEEKLY_KEYPOINT_MIN_TOTAL_CHARS and len(points) >= min(WEEKLY_KEYPOINT_MIN_POINTS, WEEKLY_KEYPOINT_MAX_POINTS):
+        return points[:WEEKLY_KEYPOINT_MAX_POINTS]
+
+    expanded = points[:]
+    for p in _build_weekly_expansion_points(ctx, stock_name):
+        if len(expanded) >= WEEKLY_KEYPOINT_MAX_POINTS:
+            break
+        if p not in expanded:
+            expanded.append(p)
+        if _count_summary_chars(expanded) >= WEEKLY_KEYPOINT_MIN_TOTAL_CHARS and len(expanded) >= min(WEEKLY_KEYPOINT_MIN_POINTS, WEEKLY_KEYPOINT_MAX_POINTS):
+            break
+
+    if _count_summary_chars(expanded) >= WEEKLY_KEYPOINT_MIN_TOTAL_CHARS:
+        return expanded[:WEEKLY_KEYPOINT_MAX_POINTS]
+
+    # 如果點數已滿但仍太短，嘗試用較完整的規則式重點替換較短項目。
+    for cand in _build_weekly_expansion_points(ctx, stock_name):
+        if not expanded:
+            expanded.append(cand)
+        else:
+            shortest_idx = min(range(len(expanded)), key=lambda i: len(expanded[i]))
+            if len(cand) > len(expanded[shortest_idx]) and cand not in expanded:
+                expanded[shortest_idx] = cand
+        if _count_summary_chars(expanded) >= WEEKLY_KEYPOINT_MIN_TOTAL_CHARS:
+            break
+    return expanded[:WEEKLY_KEYPOINT_MAX_POINTS]
+
+
 def build_key_points(ctx, stock_name: str):
     """本週重點：優先交給 Gemini 讀取權證資金流與技術面資料後統整；失敗則走原本規則式重點。"""
     ai_points = _summarize_weekly_context_with_gemini(ctx, stock_name)
     if ai_points:
-        return ai_points[:NEWS_SUMMARY_MAX_POINTS]
-    return _rule_based_key_points(ctx, stock_name)
+        return _ensure_weekly_keypoint_min_total(ai_points, ctx, stock_name)
+    return _ensure_weekly_keypoint_min_total(_rule_based_key_points(ctx, stock_name), ctx, stock_name)
 
 
 # ============================================================
@@ -1344,7 +1452,7 @@ NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "90"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
-NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "3"))
+NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "2"))
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
 NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
@@ -1360,6 +1468,10 @@ GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
 NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+WEEKLY_KEYPOINT_MAX_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MAX_POINTS", "4"))
+WEEKLY_KEYPOINT_POINT_MAX_LEN = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_POINT_MAX_LEN", "90"))
+WEEKLY_KEYPOINT_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_TOTAL_CHARS", "150"))
+WEEKLY_KEYPOINT_MIN_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_POINTS", "3"))
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
 NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "8"))
 
@@ -1993,9 +2105,13 @@ def _is_bad_news_sentence(sentence: str) -> bool:
         "新聞標題", "點擊", "下載", "加入會員", "登入", "訂閱", "廣告", "版權",
         "看更多", "更多新聞", "延伸閱讀", "相關新聞", "Yahoo", "Facebook", "LINE分享",
         "焦點股", "優於大盤", "目標價曝光", "新目標價", "強勢股", "題材股",
+        "關鍵字", "標籤", "追蹤我們", "追蹤我", "追蹤", "分享給朋友", "分享給好友",
+        "分享本文", "本文", "※本文", "免責聲明", "投稿", "留言", "按讚",
         "SETN", "UDN", "自由財經", "中時新聞", "工商時報", "經濟日報", "鉅亨網", "MoneyDJ",
     ]
     if any(k in s for k in bad_keywords):
+        return True
+    if re.search(r"關鍵字[:：]|標籤[:：]|追蹤我們|分享給朋友|分享給好友|分享本文|※本文|免責聲明", s):
         return True
     if re.search(r"[》｜|【】]", s) and len(s) <= 100:
         return True
@@ -2605,10 +2721,12 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 10. 具體重點優先順序：法人目標價 / 評等 / 升降評、EPS / 每股純益、營收 / 毛利率 / 獲利、ASP / 報價 / 供需、接單 / 出貨 / 產能 / 長約、公司本身所屬產業趨勢。
 11. 若產業詞、目標價、EPS、營收、ASP、毛利率或獲利預估沒有在同一句或相鄰句明確連到「{stock_code} {display_name}」，不要寫進重點。
 12. 請最多輸出 3 點，建議 2～3 點；整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字，若只有 2 點，每點要更完整。
-13. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
-14. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～90 個中文字。
-15. 若不同文章報同一件事，合併成一點，並寫出共同核心。
-16. 請保留最關鍵的數字或事件，但不要塞滿數字。
+13. 若只有 2 個高品質重點且已達整體字數要求，可以只輸出 2 點；不要為了湊第 3 點而輸出關鍵字、標籤、追蹤文字或看不懂的摘要。
+14. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
+15. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～90 個中文字。
+16. 若不同文章報同一件事，合併成一點，並寫出共同核心。
+17. 請保留最關鍵的數字或事件，但不要塞滿數字。
+18. 嚴禁輸出「關鍵字：」、「追蹤我們」、「分享給朋友」、「本文」、「標籤」或任何社群導流、SEO 關鍵字內容。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
 格式：
@@ -2724,13 +2842,14 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 任務：根據技術面、三大法人與權證分點資金流，整理左下角「本週重點」。
 
 嚴格規則：
-1. 請輸出 3 到 4 點，每點 22 到 42 個中文字。
-2. 只寫重點中的重點，適合放在圖片小區塊。
+1. 請輸出 3 到 4 點，整體至少 {WEEKLY_KEYPOINT_MIN_TOTAL_CHARS} 個中文字，每點約 45 到 90 個中文字。
+2. 只寫重點中的重點，適合放在圖片小區塊，但資訊量要足夠。
 3. 必須整合技術面與權證資料，不要只複述單一數字。
 4. 可以描述偏多、偏弱、量能、分點集中、資金流向，但不要寫投資建議。
 5. 不要寫「建議買進」「可以進場」「目標價」。
 6. 數字可保留最關鍵者，不要每點塞太多數字。
 7. 若資料互相矛盾，請用「股價偏強但資金流需觀察」這種保守語氣。
+8. 不要輸出關鍵字、標籤、追蹤、分享或任何導流文字。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
 格式：
@@ -2745,9 +2864,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 {payload_json}
 """
         output_text = _call_gemini_with_retry(prompt)
-        points = _parse_gemini_points(output_text or "")
+        points = _parse_weekly_gemini_points(output_text or "")
         if points:
-            print(f"✅ Gemini 本週重點完成：{len(points)} 點")
+            print(f"✅ Gemini 本週重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
         return points
     except Exception as e:
         print(f"⚠️ Gemini 本週重點整理失敗，改用規則式重點：{e}")
