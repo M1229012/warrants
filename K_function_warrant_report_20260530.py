@@ -1332,12 +1332,12 @@ def build_key_points(ctx, stock_name: str):
 # 新聞抓取：抓一週內新聞內文並整理成真正重點
 # ============================================================
 
-NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "4500"))
+NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "42"))
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
-NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "120"))
+NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
 NEWS_REQUIRE_ARTICLE_BODY = os.getenv("WARRANT_NEWS_REQUIRE_BODY", "0").strip().lower() not in ("0", "false", "no", "off")
 NEWS_RSS_DESCRIPTION_FALLBACK = os.getenv("WARRANT_NEWS_RSS_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -1349,10 +1349,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-
 GEMINI_RETRY_TIMES = int(os.getenv("WARRANT_GEMINI_RETRY_TIMES", "5"))
 GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
 NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
-NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3000"))
+NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 NEWS_PTT_ENABLE = os.getenv("WARRANT_NEWS_PTT_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_PTT_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_PTT_MAX_ITEMS", "4"))
+NEWS_PTT_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_PTT_MAX_ITEMS", "5"))
 NEWS_PTT_SCAN_PAGES = int(os.getenv("WARRANT_NEWS_PTT_SCAN_PAGES", "8"))
 
 PTT_ALIAS_MAP = {
@@ -1578,49 +1578,104 @@ def _extract_meta_descriptions_from_html(page_html: str) -> List[str]:
 
 
 def _extract_article_text_from_html(page_html: str) -> str:
-    """從新聞頁 HTML 取出最像內文的文字。"""
+    """從新聞頁 HTML 取出最像內文的文字；優先使用 JSON-LD 與 BeautifulSoup，邏輯接近獨立 Gemini 新聞測試程式。"""
     if not page_html:
         return ""
 
     json_body = _extract_json_ld_article_body(page_html)
-    if len(json_body) >= 100:
+    if len(json_body) >= NEWS_MIN_BODY_CHARS:
         return json_body[:NEWS_BODY_MAX_CHARS]
 
     candidates = []
+
+    # 優先用 BeautifulSoup / lxml 解析，抓 article、main、常見新聞內容容器與 p 段落。
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(page_html, "lxml")
+
+            for tag in soup(["script", "style", "noscript", "svg", "iframe", "header", "footer", "nav"]):
+                tag.decompose()
+
+            selectors = [
+                "article",
+                "main",
+                '[data-test-locator="articleBody"]',
+                '[class*="article"]',
+                '[class*="content"]',
+                '[class*="story"]',
+                '[class*="news"]',
+                '[class*="post"]',
+                '[class*="entry"]',
+                '[class*="body"]',
+                '[class*="text"]',
+                '[class*="paragraph"]',
+                '[id*="article"]',
+                '[id*="content"]',
+                '[id*="story"]',
+                '[id*="news"]',
+                '[id*="body"]',
+            ]
+
+            for selector in selectors:
+                for node in soup.select(selector)[:12]:
+                    txt = _normalize_news_text(node.get_text(" "))
+                    if len(txt) >= NEWS_MIN_BODY_CHARS:
+                        candidates.append(txt)
+
+            paragraphs = []
+            for p_tag in soup.find_all("p"):
+                txt = _normalize_news_text(p_tag.get_text(" "))
+                if 24 <= len(txt) <= 450 and not _is_bad_news_sentence(txt):
+                    paragraphs.append(txt)
+            if len(paragraphs) >= 3:
+                candidates.append("。".join(paragraphs))
+
+            meta_attrs = [
+                {"property": "og:description"},
+                {"name": "description"},
+                {"name": "twitter:description"},
+            ]
+            for attr in meta_attrs:
+                meta = soup.find("meta", attrs=attr)
+                if meta and meta.get("content"):
+                    txt = _normalize_news_text(meta.get("content"))
+                    if len(txt) >= 120:
+                        candidates.append(txt)
+        except Exception as e:
+            print(f"⚠️ BeautifulSoup 解析新聞內文失敗，改用正則備援：{e}")
+
+    # 備援：不依賴 BeautifulSoup 的粗略解析，避免環境缺套件時完全抓不到。
     for tag in ["article", "main"]:
         for m in re.finditer(rf"(?is)<{tag}[^>]*>(.*?)</{tag}>", page_html):
             txt = _normalize_news_text(_html_to_readable_text(m.group(1)))
-            if len(txt) >= 100:
+            if len(txt) >= NEWS_MIN_BODY_CHARS:
                 candidates.append(txt)
 
-    # 常見新聞內文容器 class/id 關鍵字，抓不到 article/main 時再嘗試。
     for m in re.finditer(r'(?is)<(?:div|section)[^>]+(?:class|id)=["\'][^"\']*(?:article|content|story|news|post|entry|text|paragraph|body|main|cnt|article-body|article_content)[^"\']*["\'][^>]*>(.*?)</(?:div|section)>', page_html):
         txt = _normalize_news_text(_html_to_readable_text(m.group(1)))
-        if len(txt) >= 100:
+        if len(txt) >= NEWS_MIN_BODY_CHARS:
             candidates.append(txt)
 
-    # 有些新聞頁把內文拆在多個 <p>，外層沒有 article/main；這裡把段落集合起來。
     paragraphs = []
     for m in re.finditer(r"(?is)<p[^>]*>(.*?)</p>", page_html):
         txt = _normalize_news_text(_html_to_readable_text(m.group(1)))
-        if 18 <= len(txt) <= 260 and not _is_bad_news_sentence(txt):
+        if 24 <= len(txt) <= 450 and not _is_bad_news_sentence(txt):
             paragraphs.append(txt)
-    if len(paragraphs) >= 2:
+    if len(paragraphs) >= 3:
         candidates.append("。".join(paragraphs))
 
-    # 原文被擋時，meta description 至少比標題更接近內文摘要；後續仍會再改寫成重點。
+    # 原文被擋時，meta description 至少比標題更接近內文摘要；後續只作備援，不直接當正式內文。
     for meta_txt in _extract_meta_descriptions_from_html(page_html):
-        if len(meta_txt) >= 60:
+        if len(meta_txt) >= 120:
             candidates.append(meta_txt)
 
     if candidates:
         return max(candidates, key=len)[:NEWS_BODY_MAX_CHARS]
 
     fallback = _normalize_news_text(_html_to_readable_text(page_html))
-    if len(fallback) >= 120:
+    if len(fallback) >= NEWS_MIN_BODY_CHARS:
         return fallback[:NEWS_BODY_MAX_CHARS]
     return ""
-
 
 def _decode_google_news_url_from_path(url: str) -> str:
     """先嘗試從 Google News RSS encoded path 直接解出原始新聞網址。"""
@@ -1866,7 +1921,7 @@ def _fetch_ptt_stock_news_articles(stock_code: str, stock_name: str, max_items: 
     return posts
 
 
-def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
+def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
     """
     抓取最近一週 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
     回傳 dict 格式，讓後續 build_news_points 可以根據內文整理重點。
@@ -2264,12 +2319,12 @@ def _parse_gemini_points(output_text: str) -> List[str]:
 
 
 def _build_gemini_news_articles(records: List[dict]) -> List[dict]:
+    """只把「有足夠內文」的文章送給 Gemini，避免 Gemini 根據標題或短摘要硬湊。"""
     usable = []
-    # 優先送真正原文；若原文被擋，再補 RSS description 備援素材。
-    ordered = [r for r in records if r.get("body_ok")] + [r for r in records if not r.get("body_ok") and r.get("fallback_ok")]
+    ordered = [r for r in records if r.get("body_ok")]
     for rec in ordered:
         content = _normalize_news_text(rec.get("content", ""))
-        if len(content) < 50:
+        if len(content) < NEWS_MIN_BODY_CHARS:
             continue
         title = _clean_news_title(rec.get("title", ""))
         usable.append({
@@ -2277,6 +2332,7 @@ def _build_gemini_news_articles(records: List[dict]) -> List[dict]:
             "source": rec.get("source", ""),
             "title": title,
             "published": rec.get("published", ""),
+            "url": rec.get("url", ""),
             "content_source": rec.get("content_source", ""),
             "body": content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
         })
@@ -2284,32 +2340,41 @@ def _build_gemini_news_articles(records: List[dict]) -> List[dict]:
             break
     return usable
 
-
 def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """依照新聞內文讓 Gemini 統整成圖片可用的短重點；不直接釋放新聞標題。"""
+    """依照新聞原文讓 Gemini 統整成圖片可用的短重點；邏輯接近獨立 Gemini 新聞測試程式。"""
     usable_articles = _build_gemini_news_articles(records)
     if not usable_articles:
+        print("⚠️ 沒有足夠新聞原文可送入 Gemini；不使用標題硬湊新聞重點")
         return []
 
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
     prompt = f"""
-你是台股新聞重點整理助手，只能根據我提供的新聞內文整理，不可以使用外部知識，不可以自行補充。
+你是台股新聞重點整理助手。
+你只能根據我提供的新聞內文整理，不可以使用外部知識，不可以自行補充。
 請使用繁體中文。
 
 股票：{stock_code} {display_name}
 
-任務：整理近 7 天的「本週新聞重點」，輸出給圖片週報右下角使用。
+任務：
+整理近 7 天的「本週新聞重點」，輸出給圖片週報右下角使用。
 
 嚴格規則：
-1. 不要直接複製新聞標題，不要輸出新聞網站名稱，不要寫「完整看」。
-2. 不要把股價漲停、亮燈、創高、焦點股這類市場標題當重點。
-3. 每點必須來自新聞內文，不能幻想。
-4. 優先整理具體事實：法人目標價/評等、營收/EPS/毛利、接單/出貨/產能、報價/供需、AI/伺服器/記憶體等。
-5. 圖片區塊很小，請只輸出「重點中的重點」。
-6. 請輸出 3 到 4 點，每點 22 到 42 個中文字。
-7. 不要投資建議，不要寫可以買進或建議進場。
-8. 若不同文章講同一件事，合併成一點。
+1. 不要直接複製新聞標題。
+2. 不要輸出新聞網站名稱、作者、網址、完整看、看更多、延伸閱讀。
+3. 不要把只有股價漲停、亮燈、強漲、創高、焦點股這類描述當成重點。
+4. 每一點必須來自新聞內文，不可以幻想。
+5. 優先整理具體事實，例如：
+   - 外資或法人目標價、評等、升評、降評
+   - EPS、營收、毛利率、獲利
+   - 接單、出貨、產能、長約
+   - 產品報價、供需、漲價幅度
+   - AI、伺服器、ASIC、TPU、記憶體、DRAM、半導體需求
+6. 如果沒有具體內文，寧可少於 4 點，不要硬湊。
+7. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
+8. 圖片區塊很小，請只寫重點中的重點，每點 24～46 個中文字。
+9. 若不同文章報同一件事，合併成一點。
+10. 請保留最關鍵的數字或事件，但不要塞滿數字。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
 格式：
@@ -2317,18 +2382,23 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
   "points": [
     "第一點",
     "第二點"
-  ]
+  ],
+  "note": "資料是否充足的簡短說明"
 }}
 
 以下是新聞內文 JSON：
 {article_json}
 """
+    print("=" * 100)
+    print("開始呼叫 Gemini 統整新聞重點")
+    print(f"模型：{GEMINI_MODEL}")
+    print(f"送入 Gemini 的文章數：{len(usable_articles)}")
+    print("=" * 100)
     output_text = _call_gemini_with_retry(prompt)
     points = _parse_gemini_points(output_text or "")
     if points:
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點")
     return points
-
 
 def _safe_float(v, default=np.nan):
     try:
@@ -2524,36 +2594,20 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
 
 
 def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: str) -> str:
-    """把抓到的新聞句子改寫成觀察重點，避免直接貼新聞標題或來源文字。"""
-    s = _trim_news_point(sentence, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 18)
-    if not s:
+    """規則式備援：保留內文中的具體事實，避免改成空泛模板。"""
+    s = _normalize_news_text(sentence)
+    s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
+    s = s.strip("。；;，, ")
+    if not s or _is_bad_news_sentence(s):
         return ""
-    subject = stock_name or stock_code or "個股"
 
-    # 先尊重分類標籤，避免每一句都因為含有「記憶體」而被改成同一種產業面文字。
-    if label == "業績面":
-        return f"業績面：近期消息關注營收與獲利修復，重點在產業行情回升能否反映到{subject}財報"
-    if label == "產業面":
-        return f"產業面：新聞聚焦記憶體報價與供需變化，後續觀察是否帶動{subject}營收與毛利改善"
-    if label == "展望面":
-        return f"展望面：後續觀察需求、出貨與產能配置，若報價續強，基本面支撐力道可望提高"
-    if label == "法人面":
-        return f"法人面：市場看法圍繞評價調整與產業復甦預期，短線仍需留意股價是否已先反映題材"
-
-    if any(k in s for k in ["記憶體", "DRAM", "NAND", "HBM", "報價", "漲價", "缺貨", "美光", "半導體"]):
-        return f"產業面：新聞聚焦記憶體報價與供需變化，後續觀察是否帶動{subject}營收與毛利改善"
-    if any(k in s for k in ["營收", "財報", "獲利", "EPS", "毛利", "毛利率", "虧損", "轉盈", "業績"]):
-        return f"業績面：近期消息關注營收與獲利修復，重點在產業行情回升能否反映到{subject}財報"
-    if any(k in s for k in ["法說", "展望", "接單", "出貨", "產能", "需求", "客戶", "擴產", "投資", "合作", "布局"]):
-        return f"展望面：後續觀察需求、出貨與產能配置，若報價續強，基本面支撐力道可望提高"
-    if any(k in s for k in ["法人", "外資", "投信", "券商", "評等", "目標價", "調升", "調降", "買進", "中立"]):
-        return f"法人面：市場看法圍繞評價調整與產業復甦預期，短線仍需留意股價是否已先反映題材"
-
-    cleaned = _trim_news_point(s, max_len=48)
-    if cleaned and not _is_bad_news_sentence(cleaned):
-        return f"{label}：{cleaned}"
-    return ""
-
+    # 移除過度像標題的前綴，保留真正資訊。
+    s = re.sub(r"^(焦點股|個股|台股|盤中|盤後)[:：]?", "", s).strip()
+    max_body_len = max(24, NEWS_SUMMARY_POINT_MAX_LEN - len(label) - 1)
+    body = _trim_news_point(s, max_len=max_body_len)
+    if not body or _is_bad_news_sentence(body):
+        return ""
+    return f"{label}：{body}"
 
 def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     candidates = _collect_news_sentences(records)
@@ -2611,29 +2665,30 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
 
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """根據最近一週新聞內文整理重點；不再直接把新聞標題放進圖表。"""
+    """根據最近一週新聞內文整理重點；優先只用足夠新聞原文交給 Gemini，不直接把新聞標題放進圖表。"""
     records = _news_items_to_records(news_items)
-    body_records = [r for r in records if r.get("body_ok") and _normalize_news_text(r.get("content", ""))]
+    body_records = [
+        r for r in records
+        if r.get("body_ok") and len(_normalize_news_text(r.get("content", ""))) >= NEWS_MIN_BODY_CHARS
+    ]
     fallback_records = [r for r in records if r.get("fallback_ok") and _normalize_news_text(r.get("content", ""))]
 
     if not records:
         return ["本週未抓到可整理的新聞素材；可用 WEEKLY_NEWS_TEXT 手動填入新聞重點。"]
 
-    if NEWS_REQUIRE_ARTICLE_BODY and not body_records:
-        return ["本週新聞原文未成功抓到可摘要內文；可將 WARRANT_NEWS_REQUIRE_BODY 設為 0 啟用摘要備援。"]
-
-    usable_records = body_records if body_records else fallback_records
-    if not usable_records:
-        usable_records = records if not NEWS_REQUIRE_ARTICLE_BODY else body_records
-
-    ai_points = _summarize_news_with_gemini(usable_records, stock_code, stock_name)
+    # 依照獨立 Gemini 測試程式邏輯：只把「有足夠內文」的文章送給 Gemini。
+    ai_points = _summarize_news_with_gemini(body_records, stock_code, stock_name)
     if ai_points:
         return ai_points[:NEWS_SUMMARY_MAX_POINTS]
 
-    rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
+    # Gemini 不可用或失敗時，仍優先從真正內文抽重點；最後才用 RSS 摘要作為備援素材。
+    rule_source = body_records if body_records else fallback_records
+    rule_points = _rule_based_news_summary(rule_source, stock_code, stock_name)
     if rule_points:
         return rule_points[:NEWS_SUMMARY_MAX_POINTS]
 
+    if not body_records:
+        return ["本週新聞多為標題或摘要，未抓到足夠原文可統整；可稍後重跑或補手動新聞重點。"]
     return ["本週新聞內文有效句不足，未輸出標題式內容；可用 WEEKLY_NEWS_TEXT 手動補重點。"]
 
 
@@ -3375,7 +3430,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         print(f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，資料區間 {start_date.date()} ~ {end_date.date()}")
         warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
-        news_items = fetch_google_news_articles(stock_code, stock_name, max_items=8)
+        news_items = fetch_google_news_articles(stock_code, stock_name, max_items=10)
 
         fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
         buf = io.BytesIO()
