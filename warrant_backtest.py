@@ -1058,7 +1058,7 @@ def get_price_nearest(prices, date):
 # Google Sheet 快取 / 結果同步工具（GitHub Actions 部署用）
 # ══════════════════════════════════════════════════════════════════════
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼_2")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
