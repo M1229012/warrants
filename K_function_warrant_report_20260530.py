@@ -1666,7 +1666,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
     ax_header.text(0.01, 0.50, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
     ax_header.text(0.01, -0.10, f"週報區間：{period}｜資訊僅供教育參考", color=MUTED, fontsize=32, ha="left", va="center")
-    ax_header.text(0.99, 0.62, "By 股市艾斯出品  轉傳請註明", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
+    ax_header.text(0.99, 0.62, "By 股市艾斯出品  請勿轉傳", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
     ax_cards = fig.add_subplot(gs[1, :])
@@ -1926,16 +1926,31 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
         ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top")
-    notes_wrap_width = 29
+    notes_wrap_width = 21
     notes_fontsize = 33
-    y = 0.79
-    for p in key_points[:4]:
-        ax_notes.text(0.04, y, "• " + wrap_text(p, width=notes_wrap_width, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=notes_fontsize, ha="left", va="top")
-        y -= 0.165
-    y = 0.79
-    for p in news_points[:5]:
-        ax_notes.text(0.54, y, "• " + wrap_text(p, width=notes_wrap_width, max_lines=2), transform=ax_notes.transAxes, color=TEXT, fontsize=notes_fontsize, ha="left", va="top")
-        y -= 0.165
+    notes_line_height = 0.062
+    notes_item_gap = 0.045
+
+    def draw_note_items(items, x_left, y_start):
+        y = y_start
+        for p in items:
+            body = wrap_text(p, width=notes_wrap_width, max_lines=3)
+            note_text = "• " + body.replace("\n", "\n  ")
+            line_count = note_text.count("\n") + 1
+            ax_notes.text(
+                x_left, y, note_text,
+                transform=ax_notes.transAxes,
+                color=TEXT,
+                fontsize=notes_fontsize,
+                ha="left",
+                va="top",
+                linespacing=1.12,
+                clip_on=True,
+            )
+            y -= notes_line_height * line_count + notes_item_gap
+
+    draw_note_items(key_points[:4], 0.04, 0.79)
+    draw_note_items(news_points[:5], 0.54, 0.79)
 
     # x ticks
     interval = max(1, len(x) // 12)
