@@ -1351,11 +1351,10 @@ GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
 NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_PTT_ENABLE = os.getenv("WARRANT_NEWS_PTT_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_PTT_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_PTT_MAX_ITEMS", "5"))
-NEWS_PTT_SCAN_PAGES = int(os.getenv("WARRANT_NEWS_PTT_SCAN_PAGES", "8"))
+# 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "6"))
 
-PTT_ALIAS_MAP = {
+STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
     "2317": ["鴻海", "海公公"],
     "2408": ["南亞科", "牙科"],
@@ -1768,7 +1767,7 @@ def _get_news_aliases(stock_code: str, stock_name: str) -> List[str]:
         a = str(a or "").strip()
         if a and a not in aliases:
             aliases.append(a)
-    for a in PTT_ALIAS_MAP.get(str(stock_code).strip(), []):
+    for a in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
         a = str(a or "").strip()
         if a and a not in aliases:
             aliases.append(a)
@@ -1792,133 +1791,6 @@ def _is_within_recent_days_from_rss(pub_date: str, days: int = 7) -> bool:
         return True
     return dt >= datetime.now() - timedelta(days=days)
 
-
-def _parse_ptt_date_to_datetime(ptt_date: str):
-    try:
-        s = _normalize_news_text(ptt_date)
-        m = re.search(r"(\d{1,2})/(\d{1,2})", s)
-        if not m:
-            return None
-        month = int(m.group(1))
-        day = int(m.group(2))
-        year = datetime.now().year
-        dt = datetime(year, month, day)
-        if dt > datetime.now() + timedelta(days=3):
-            dt = datetime(year - 1, month, day)
-        return dt
-    except Exception:
-        return None
-
-
-def _is_ptt_within_recent_days(ptt_date: str, days: int = 7) -> bool:
-    dt = _parse_ptt_date_to_datetime(ptt_date)
-    if dt is None:
-        return True
-    return dt >= datetime.now() - timedelta(days=days)
-
-
-def _fetch_ptt_stock_news_articles(stock_code: str, stock_name: str, max_items: int = NEWS_PTT_MAX_ITEMS, scan_pages: int = NEWS_PTT_SCAN_PAGES) -> List[dict]:
-    """抓 PTT Stock 近 7 天相關 [新聞] 文，並移除心得/評論。"""
-    if not NEWS_PTT_ENABLE:
-        return []
-    if BeautifulSoup is None:
-        print("⚠️ 未安裝 beautifulsoup4，略過 PTT Stock 新聞抓取")
-        return []
-
-    aliases = _get_news_aliases(stock_code, stock_name)
-    posts = []
-    seen = set()
-    url = "https://www.ptt.cc/bbs/Stock/index.html"
-    headers = {
-        "User-Agent": HDR["User-Agent"],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-    cookies = {"over18": "1"}
-
-    for page_no in range(1, max(1, scan_pages) + 1):
-        try:
-            resp = get_thread_session().get(url, headers=headers, cookies=cookies, timeout=(5, NEWS_FETCH_TIMEOUT))
-            if resp.status_code != 200:
-                break
-            soup = BeautifulSoup(resp.text, "html.parser")
-            page_has_recent = False
-
-            for ent in soup.select(".r-ent"):
-                title_node = ent.select_one(".title a")
-                date_node = ent.select_one(".date")
-                if not title_node:
-                    continue
-                title = _clean_news_title(title_node.get_text(" "))
-                href = title_node.get("href", "")
-                published = _normalize_news_text(date_node.get_text(" ")) if date_node else ""
-
-                if _is_ptt_within_recent_days(published, days=7):
-                    page_has_recent = True
-                else:
-                    continue
-
-                if not title or not href or "[新聞]" not in title:
-                    continue
-                if not any(a and a in title for a in aliases):
-                    continue
-
-                article_url = urllib.parse.urljoin("https://www.ptt.cc", href)
-                if article_url in seen:
-                    continue
-                seen.add(article_url)
-
-                article_resp = get_thread_session().get(article_url, headers=headers, cookies=cookies, timeout=(5, NEWS_FETCH_TIMEOUT))
-                if article_resp.status_code != 200:
-                    continue
-                article_soup = BeautifulSoup(article_resp.text, "html.parser")
-                main = article_soup.select_one("#main-content")
-                if not main:
-                    continue
-                for push in main.select(".push"):
-                    push.decompose()
-                body = main.get_text("\n")
-                body = re.sub(r"作者\s+.*", " ", body)
-                body = re.sub(r"標題\s+.*", " ", body)
-                body = re.sub(r"時間\s+.*", " ", body)
-                body = re.split(r"心得/評論[:：]?|心得[:：]?|評論[:：]?", body)[0]
-                body = body.split("--")[0]
-                body = re.sub(r"※ 發信站.*", " ", body)
-                body = re.sub(r"※ 文章網址.*", " ", body)
-                body = _normalize_news_text(body)
-                body_ok = _is_valid_article_body(body, title=title, description="")
-                if not body_ok:
-                    continue
-
-                posts.append({
-                    "title": title,
-                    "url": article_url,
-                    "source": "PTT Stock",
-                    "published": published,
-                    "description": "",
-                    "content": body,
-                    "body_ok": True,
-                    "fallback_ok": False,
-                    "content_source": "ptt_news_body",
-                    "body_length": len(body),
-                })
-                print(f"📰 PTT 新聞抓取：{title[:36]}｜原文 {len(body):,} 字｜原文可摘要")
-                if len(posts) >= max_items:
-                    return posts
-
-            prev_url = ""
-            for a in soup.select(".btn-group-paging a"):
-                if "上頁" in _normalize_news_text(a.get_text(" ")) and a.get("href"):
-                    prev_url = urllib.parse.urljoin("https://www.ptt.cc", a.get("href"))
-                    break
-            if not prev_url or not page_has_recent:
-                break
-            url = prev_url
-            time.sleep(0.4)
-        except Exception as e:
-            print(f"⚠️ PTT Stock 新聞抓取失敗：{e}")
-            break
-    return posts
 
 
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
@@ -1948,7 +1820,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     query = (
         f'({strict_part}) '
         f'(營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR 目標價) '
-        f'-三大法人 -買賣超 -排行 -完整看 when:7d'
+        f'-三大法人 -買賣超 -排行 -完整看 -焦點股 -漲停 -亮燈 -強漲 -飆漲 -創高 when:7d'
     )
     url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": query,
@@ -2014,13 +1886,10 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             if scanned >= max_items * 4:
                 break
 
-        ptt_articles = _fetch_ptt_stock_news_articles(stock_code, stock_name, max_items=NEWS_PTT_MAX_ITEMS, scan_pages=NEWS_PTT_SCAN_PAGES)
-        if ptt_articles:
-            articles.extend(ptt_articles)
         return articles
     except Exception as e:
         print(f"⚠️ Google News RSS 抓取失敗：{e}")
-        return _fetch_ptt_stock_news_articles(stock_code, stock_name, max_items=NEWS_PTT_MAX_ITEMS, scan_pages=NEWS_PTT_SCAN_PAGES)
+        return []
 
 
 def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
@@ -3430,7 +3299,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         print(f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，資料區間 {start_date.date()} ~ {end_date.date()}")
         warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
-        news_items = fetch_google_news_articles(stock_code, stock_name, max_items=10)
+        news_items = fetch_google_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
 
         fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
         buf = io.BytesIO()
