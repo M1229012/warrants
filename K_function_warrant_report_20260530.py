@@ -19,6 +19,21 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+try:
+    from google import genai
+except Exception:
+    genai = None
+
+try:
+    from googlenewsdecoder import gnewsdecoder
+except Exception:
+    gnewsdecoder = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1271,7 +1286,7 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     return add_max_warrant(buy_br, positive=True), add_max_warrant(sell_br, positive=False)
 
 
-def build_key_points(ctx, stock_name: str):
+def _rule_based_key_points(ctx, stock_name: str):
     points = []
     df = ctx["plot_df"]
     latest = df.iloc[-1]
@@ -1305,6 +1320,14 @@ def build_key_points(ctx, stock_name: str):
     return points[:4]
 
 
+def build_key_points(ctx, stock_name: str):
+    """本週重點：優先交給 Gemini 讀取權證資金流與技術面資料後統整；失敗則走原本規則式重點。"""
+    ai_points = _summarize_weekly_context_with_gemini(ctx, stock_name)
+    if ai_points:
+        return ai_points[:NEWS_SUMMARY_MAX_POINTS]
+    return _rule_based_key_points(ctx, stock_name)
+
+
 # ============================================================
 # 新聞抓取：抓一週內新聞內文並整理成真正重點
 # ============================================================
@@ -1312,7 +1335,7 @@ def build_key_points(ctx, stock_name: str):
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "4500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "58"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "42"))
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
 NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "120"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
@@ -1320,6 +1343,35 @@ NEWS_REQUIRE_ARTICLE_BODY = os.getenv("WARRANT_NEWS_REQUIRE_BODY", "0").strip().
 NEWS_RSS_DESCRIPTION_FALLBACK = os.getenv("WARRANT_NEWS_RSS_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
 NEWS_OPENAI_ENABLE = os.getenv("WARRANT_NEWS_OPENAI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 NEWS_OPENAI_MODEL = os.getenv("WARRANT_NEWS_OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
+# Gemini / LLM 設定：GitHub Actions 請設定 Repository Secret / Variable：WARRANTS_API_KEY
+GEMINI_ENABLE = os.getenv("WARRANT_GEMINI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_RETRY_TIMES = int(os.getenv("WARRANT_GEMINI_RETRY_TIMES", "5"))
+GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
+NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
+NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3000"))
+WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+NEWS_PTT_ENABLE = os.getenv("WARRANT_NEWS_PTT_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+NEWS_PTT_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_PTT_MAX_ITEMS", "4"))
+NEWS_PTT_SCAN_PAGES = int(os.getenv("WARRANT_NEWS_PTT_SCAN_PAGES", "8"))
+
+PTT_ALIAS_MAP = {
+    "2330": ["台積電", "GG", "護國神山"],
+    "2317": ["鴻海", "海公公"],
+    "2408": ["南亞科", "牙科"],
+    "2344": ["華邦電", "華崩"],
+    "2454": ["聯發科", "發哥", "MTK"],
+    "2303": ["聯電", "UMC"],
+    "2308": ["台達電"],
+    "2412": ["中華電"],
+    "2357": ["華碩"],
+    "2382": ["廣達"],
+    "3231": ["緯創"],
+    "6669": ["緯穎"],
+    "3661": ["世芯", "世芯-KY"],
+    "3037": ["欣興"],
+    "3260": ["威剛"],
+}
 
 
 def _clean_news_title(title: str) -> str:
@@ -1598,6 +1650,17 @@ def _maybe_resolve_google_news_link(url: str) -> str:
     decoded_url = _decode_google_news_url_from_path(url)
     if decoded_url:
         return decoded_url
+    if gnewsdecoder is not None:
+        try:
+            decoded = gnewsdecoder(url, interval=1)
+            if isinstance(decoded, dict):
+                real = decoded.get("decoded_url", "")
+                if real and str(real).startswith("http"):
+                    return str(real).strip()
+            elif isinstance(decoded, str) and decoded.startswith("http"):
+                return decoded.strip()
+        except Exception as e:
+            print(f"⚠️ googlenewsdecoder 解碼失敗：{e}")
     try:
         headers = {
             "User-Agent": HDR["User-Agent"],
@@ -1644,6 +1707,165 @@ def _fetch_article_body(url: str) -> str:
     return ""
 
 
+def _get_news_aliases(stock_code: str, stock_name: str) -> List[str]:
+    aliases = []
+    for a in [stock_code, stock_name]:
+        a = str(a or "").strip()
+        if a and a not in aliases:
+            aliases.append(a)
+    for a in PTT_ALIAS_MAP.get(str(stock_code).strip(), []):
+        a = str(a or "").strip()
+        if a and a not in aliases:
+            aliases.append(a)
+    return aliases
+
+
+def _parse_rss_pub_date(pub_date: str):
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(pub_date)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _is_within_recent_days_from_rss(pub_date: str, days: int = 7) -> bool:
+    dt = _parse_rss_pub_date(pub_date)
+    if dt is None:
+        return True
+    return dt >= datetime.now() - timedelta(days=days)
+
+
+def _parse_ptt_date_to_datetime(ptt_date: str):
+    try:
+        s = _normalize_news_text(ptt_date)
+        m = re.search(r"(\d{1,2})/(\d{1,2})", s)
+        if not m:
+            return None
+        month = int(m.group(1))
+        day = int(m.group(2))
+        year = datetime.now().year
+        dt = datetime(year, month, day)
+        if dt > datetime.now() + timedelta(days=3):
+            dt = datetime(year - 1, month, day)
+        return dt
+    except Exception:
+        return None
+
+
+def _is_ptt_within_recent_days(ptt_date: str, days: int = 7) -> bool:
+    dt = _parse_ptt_date_to_datetime(ptt_date)
+    if dt is None:
+        return True
+    return dt >= datetime.now() - timedelta(days=days)
+
+
+def _fetch_ptt_stock_news_articles(stock_code: str, stock_name: str, max_items: int = NEWS_PTT_MAX_ITEMS, scan_pages: int = NEWS_PTT_SCAN_PAGES) -> List[dict]:
+    """抓 PTT Stock 近 7 天相關 [新聞] 文，並移除心得/評論。"""
+    if not NEWS_PTT_ENABLE:
+        return []
+    if BeautifulSoup is None:
+        print("⚠️ 未安裝 beautifulsoup4，略過 PTT Stock 新聞抓取")
+        return []
+
+    aliases = _get_news_aliases(stock_code, stock_name)
+    posts = []
+    seen = set()
+    url = "https://www.ptt.cc/bbs/Stock/index.html"
+    headers = {
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    cookies = {"over18": "1"}
+
+    for page_no in range(1, max(1, scan_pages) + 1):
+        try:
+            resp = get_thread_session().get(url, headers=headers, cookies=cookies, timeout=(5, NEWS_FETCH_TIMEOUT))
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            page_has_recent = False
+
+            for ent in soup.select(".r-ent"):
+                title_node = ent.select_one(".title a")
+                date_node = ent.select_one(".date")
+                if not title_node:
+                    continue
+                title = _clean_news_title(title_node.get_text(" "))
+                href = title_node.get("href", "")
+                published = _normalize_news_text(date_node.get_text(" ")) if date_node else ""
+
+                if _is_ptt_within_recent_days(published, days=7):
+                    page_has_recent = True
+                else:
+                    continue
+
+                if not title or not href or "[新聞]" not in title:
+                    continue
+                if not any(a and a in title for a in aliases):
+                    continue
+
+                article_url = urllib.parse.urljoin("https://www.ptt.cc", href)
+                if article_url in seen:
+                    continue
+                seen.add(article_url)
+
+                article_resp = get_thread_session().get(article_url, headers=headers, cookies=cookies, timeout=(5, NEWS_FETCH_TIMEOUT))
+                if article_resp.status_code != 200:
+                    continue
+                article_soup = BeautifulSoup(article_resp.text, "html.parser")
+                main = article_soup.select_one("#main-content")
+                if not main:
+                    continue
+                for push in main.select(".push"):
+                    push.decompose()
+                body = main.get_text("\n")
+                body = re.sub(r"作者\s+.*", " ", body)
+                body = re.sub(r"標題\s+.*", " ", body)
+                body = re.sub(r"時間\s+.*", " ", body)
+                body = re.split(r"心得/評論[:：]?|心得[:：]?|評論[:：]?", body)[0]
+                body = body.split("--")[0]
+                body = re.sub(r"※ 發信站.*", " ", body)
+                body = re.sub(r"※ 文章網址.*", " ", body)
+                body = _normalize_news_text(body)
+                body_ok = _is_valid_article_body(body, title=title, description="")
+                if not body_ok:
+                    continue
+
+                posts.append({
+                    "title": title,
+                    "url": article_url,
+                    "source": "PTT Stock",
+                    "published": published,
+                    "description": "",
+                    "content": body,
+                    "body_ok": True,
+                    "fallback_ok": False,
+                    "content_source": "ptt_news_body",
+                    "body_length": len(body),
+                })
+                print(f"📰 PTT 新聞抓取：{title[:36]}｜原文 {len(body):,} 字｜原文可摘要")
+                if len(posts) >= max_items:
+                    return posts
+
+            prev_url = ""
+            for a in soup.select(".btn-group-paging a"):
+                if "上頁" in _normalize_news_text(a.get_text(" ")) and a.get("href"):
+                    prev_url = urllib.parse.urljoin("https://www.ptt.cc", a.get("href"))
+                    break
+            if not prev_url or not page_has_recent:
+                break
+            url = prev_url
+            time.sleep(0.4)
+        except Exception as e:
+            print(f"⚠️ PTT Stock 新聞抓取失敗：{e}")
+            break
+    return posts
+
+
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
     """
     抓取最近一週 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
@@ -1666,8 +1888,10 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     if not NEWS_ENABLE:
         return []
 
+    aliases = _get_news_aliases(stock_code, stock_name)
+    strict_part = " OR ".join([f'"{a}"' for a in aliases[:5]]) if aliases else f'"{stock_code}"'
     query = (
-        f'("{stock_code}" OR "{stock_name}") '
+        f'({strict_part}) '
         f'(營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR 目標價) '
         f'-三大法人 -買賣超 -排行 -完整看 when:7d'
     )
@@ -1695,6 +1919,8 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             source = (source_el.text if source_el is not None and source_el.text else "").strip()
             description = _normalize_news_text(_html_to_readable_text(item.findtext("description") or ""))
 
+            if not _is_within_recent_days_from_rss(published, days=7):
+                continue
             if not title or title in seen_titles:
                 continue
             seen_titles.add(title)
@@ -1733,10 +1959,13 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             if scanned >= max_items * 4:
                 break
 
+        ptt_articles = _fetch_ptt_stock_news_articles(stock_code, stock_name, max_items=NEWS_PTT_MAX_ITEMS, scan_pages=NEWS_PTT_SCAN_PAGES)
+        if ptt_articles:
+            articles.extend(ptt_articles)
         return articles
     except Exception as e:
         print(f"⚠️ Google News RSS 抓取失敗：{e}")
-        return []
+        return _fetch_ptt_stock_news_articles(stock_code, stock_name, max_items=NEWS_PTT_MAX_ITEMS, scan_pages=NEWS_PTT_SCAN_PAGES)
 
 
 def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
@@ -1944,6 +2173,283 @@ def _clean_summary_points(raw_points: List[str]) -> List[str]:
     return points
 
 
+def _get_warrants_api_key() -> str:
+    """讀取 Gemini API Key；GitHub Actions 使用 WARRANTS_API_KEY。"""
+    return (
+        os.getenv("WARRANTS_API_KEY", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+    )
+
+
+def _extract_json_from_text(text: str):
+    if not text:
+        return None
+    s = str(text).strip()
+    s = re.sub(r"^```json\s*", "", s)
+    s = re.sub(r"^```\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+
+def _is_retryable_gemini_error(err) -> bool:
+    err_text = str(err)
+    retry_keywords = [
+        "503", "UNAVAILABLE", "high demand", "temporarily unavailable", "429",
+        "RESOURCE_EXHAUSTED", "rate limit", "quota", "timeout", "Deadline", "deadline",
+    ]
+    return any(k in err_text for k in retry_keywords)
+
+
+def _call_gemini_with_retry(prompt: str):
+    if not GEMINI_ENABLE:
+        return None
+    if genai is None:
+        print("⚠️ 未安裝 google-genai，無法使用 Gemini 摘要；將改用規則式摘要")
+        return None
+    api_key = _get_warrants_api_key()
+    if not api_key:
+        print("⚠️ 未設定 WARRANTS_API_KEY，無法使用 Gemini 摘要；將改用規則式摘要")
+        return None
+
+    client = genai.Client(api_key=api_key)
+    last_error = None
+    for attempt in range(1, GEMINI_RETRY_TIMES + 1):
+        try:
+            print(f"Gemini 呼叫第 {attempt}/{GEMINI_RETRY_TIMES} 次，模型：{GEMINI_MODEL}")
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text or ""
+        except Exception as e:
+            last_error = e
+            if _is_retryable_gemini_error(e) and attempt < GEMINI_RETRY_TIMES:
+                wait_sec = GEMINI_RETRY_BASE_WAIT * attempt
+                print(f"⚠️ Gemini 暫時忙碌或限流，{wait_sec:.0f} 秒後重試：{str(e)[:180]}")
+                time.sleep(wait_sec)
+                continue
+            print(f"⚠️ Gemini 呼叫失敗：{e}")
+            return None
+    if last_error:
+        print(f"⚠️ Gemini 呼叫失敗：{last_error}")
+    return None
+
+
+def _parse_gemini_points(output_text: str) -> List[str]:
+    parsed = _extract_json_from_text(output_text)
+    raw_points = []
+    if isinstance(parsed, dict):
+        raw_points = parsed.get("points", []) or []
+    elif isinstance(parsed, list):
+        raw_points = parsed
+
+    if not raw_points:
+        for line in str(output_text or "").splitlines():
+            line = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", line).strip()
+            if line:
+                raw_points.append(line)
+
+    return _clean_summary_points([str(p) for p in raw_points])
+
+
+def _build_gemini_news_articles(records: List[dict]) -> List[dict]:
+    usable = []
+    # 優先送真正原文；若原文被擋，再補 RSS description 備援素材。
+    ordered = [r for r in records if r.get("body_ok")] + [r for r in records if not r.get("body_ok") and r.get("fallback_ok")]
+    for rec in ordered:
+        content = _normalize_news_text(rec.get("content", ""))
+        if len(content) < 50:
+            continue
+        title = _clean_news_title(rec.get("title", ""))
+        usable.append({
+            "id": f"A{len(usable) + 1}",
+            "source": rec.get("source", ""),
+            "title": title,
+            "published": rec.get("published", ""),
+            "content_source": rec.get("content_source", ""),
+            "body": content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
+        })
+        if len(usable) >= NEWS_MAX_ARTICLES_TO_GEMINI:
+            break
+    return usable
+
+
+def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
+    """依照新聞內文讓 Gemini 統整成圖片可用的短重點；不直接釋放新聞標題。"""
+    usable_articles = _build_gemini_news_articles(records)
+    if not usable_articles:
+        return []
+
+    display_name = stock_name if stock_name else stock_code
+    article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
+    prompt = f"""
+你是台股新聞重點整理助手，只能根據我提供的新聞內文整理，不可以使用外部知識，不可以自行補充。
+請使用繁體中文。
+
+股票：{stock_code} {display_name}
+
+任務：整理近 7 天的「本週新聞重點」，輸出給圖片週報右下角使用。
+
+嚴格規則：
+1. 不要直接複製新聞標題，不要輸出新聞網站名稱，不要寫「完整看」。
+2. 不要把股價漲停、亮燈、創高、焦點股這類市場標題當重點。
+3. 每點必須來自新聞內文，不能幻想。
+4. 優先整理具體事實：法人目標價/評等、營收/EPS/毛利、接單/出貨/產能、報價/供需、AI/伺服器/記憶體等。
+5. 圖片區塊很小，請只輸出「重點中的重點」。
+6. 請輸出 3 到 4 點，每點 22 到 42 個中文字。
+7. 不要投資建議，不要寫可以買進或建議進場。
+8. 若不同文章講同一件事，合併成一點。
+
+請只回傳 JSON，不要 markdown，不要多餘說明。
+格式：
+{{
+  "points": [
+    "第一點",
+    "第二點"
+  ]
+}}
+
+以下是新聞內文 JSON：
+{article_json}
+"""
+    output_text = _call_gemini_with_retry(prompt)
+    points = _parse_gemini_points(output_text or "")
+    if points:
+        print(f"✅ Gemini 新聞重點完成：{len(points)} 點")
+    return points
+
+
+def _safe_float(v, default=np.nan):
+    try:
+        if v is None or pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
+    df = ctx.get("plot_df", pd.DataFrame())
+    latest = df.iloc[-1] if df is not None and not df.empty else pd.Series(dtype=float)
+    prev = df.iloc[-2] if df is not None and len(df) >= 2 else latest
+    stock_code = str(ctx.get("stock_code", "") or "")
+
+    close = _safe_float(latest.get("Close"))
+    prev_close = _safe_float(prev.get("Close"))
+    latest_pct = (close / prev_close - 1) * 100 if prev_close and np.isfinite(prev_close) and prev_close != 0 else np.nan
+    vol = _safe_float(latest.get("Volume"))
+    mv20 = _safe_float(latest.get("MV20"))
+    vol_ratio = vol / mv20 if mv20 and np.isfinite(mv20) and mv20 > 0 else np.nan
+
+    week_events = ctx.get("week_events")
+    branch_rows = []
+    warrant_rows = []
+    if week_events is not None and not week_events.empty:
+        e = week_events.copy()
+        e["branch"] = e["branch"].replace("", "未知分點")
+        by_branch = e.groupby("branch", as_index=False)["net_amount"].sum().sort_values("net_amount", ascending=False)
+        for _, r in by_branch.head(5).iterrows():
+            branch_rows.append({"branch": str(r["branch"]), "net": fmt_money(float(r["net_amount"]))})
+        for _, r in by_branch.tail(5).sort_values("net_amount", ascending=True).iterrows():
+            branch_rows.append({"branch": str(r["branch"]), "net": fmt_money(float(r["net_amount"]))})
+
+        wg = e.groupby(["warrant_code", "warrant_name"], as_index=False)["net_amount"].sum()
+        for _, r in wg.reindex(wg["net_amount"].abs().sort_values(ascending=False).index).head(6).iterrows():
+            warrant_rows.append({
+                "warrant": f"{r.get('warrant_code', '')} {str(r.get('warrant_name', ''))[:10]}",
+                "net": fmt_money(float(r.get("net_amount", 0))),
+            })
+
+    payload = {
+        "stock": f"{stock_code} {stock_name}",
+        "period": f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx.get("week_start")) else "",
+        "technical": {
+            "weekly_return": fmt_pct(ctx.get("stock_ret", np.nan)),
+            "latest_close": f"{close:.2f}" if np.isfinite(close) else "-",
+            "latest_day_return": fmt_pct(latest_pct),
+            "ma5": f"{_safe_float(latest.get('MA5')):.2f}" if np.isfinite(_safe_float(latest.get('MA5'))) else "-",
+            "ma10": f"{_safe_float(latest.get('MA10')):.2f}" if np.isfinite(_safe_float(latest.get('MA10'))) else "-",
+            "ma20": f"{_safe_float(latest.get('MA20')):.2f}" if np.isfinite(_safe_float(latest.get('MA20'))) else "-",
+            "ma60": f"{_safe_float(latest.get('MA60')):.2f}" if np.isfinite(_safe_float(latest.get('MA60'))) else "-",
+            "ma_signal": get_ma_kline_signals(df) if df is not None and not df.empty else "",
+            "kd_signal": get_kd_signals(df) if df is not None and not df.empty else "",
+            "macd_signal": get_macd_signals(df) if df is not None and not df.empty else "",
+            "volume_change_vs_prev_week": fmt_pct(ctx.get("vol_change", np.nan)),
+            "latest_volume_vs_mv20": f"{vol_ratio:.2f} 倍" if np.isfinite(vol_ratio) else "-",
+        },
+        "institutional_latest": {
+            "foreign": f"{_safe_float(latest.get('foreign'), 0):+,.0f}張",
+            "invest": f"{_safe_float(latest.get('invest'), 0):+,.0f}張",
+            "dealer": f"{_safe_float(latest.get('dealer'), 0):+,.0f}張",
+            "total": f"{_safe_float(latest.get('total'), 0):+,.0f}張",
+        },
+        "warrant_flow": {
+            "weekly_buy": fmt_money_abs(ctx.get("total_buy", 0)),
+            "weekly_sell": fmt_money(-abs(float(ctx.get("total_sell", 0) or 0))),
+            "weekly_net": fmt_money(ctx.get("total_net", 0)),
+            "bias": ctx.get("bias", ""),
+            "top_branches_and_sellers": branch_rows,
+            "major_warrants": warrant_rows,
+        },
+    }
+    return payload
+
+
+def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
+    """讓 Gemini 讀取技術面、法人與權證資金流資料，產生左下角本週重點。"""
+    if not WEEKLY_KEYPOINT_LLM_ENABLE:
+        return []
+    try:
+        payload = _build_weekly_llm_payload(ctx, stock_name)
+        payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        prompt = f"""
+你是台股權證週報分析助手，只能根據我提供的資料整理，不可以使用外部知識，不可以自行補充。
+請使用繁體中文。
+
+任務：根據技術面、三大法人與權證分點資金流，整理左下角「本週重點」。
+
+嚴格規則：
+1. 請輸出 3 到 4 點，每點 22 到 42 個中文字。
+2. 只寫重點中的重點，適合放在圖片小區塊。
+3. 必須整合技術面與權證資料，不要只複述單一數字。
+4. 可以描述偏多、偏弱、量能、分點集中、資金流向，但不要寫投資建議。
+5. 不要寫「建議買進」「可以進場」「目標價」。
+6. 數字可保留最關鍵者，不要每點塞太多數字。
+7. 若資料互相矛盾，請用「股價偏強但資金流需觀察」這種保守語氣。
+
+請只回傳 JSON，不要 markdown，不要多餘說明。
+格式：
+{{
+  "points": [
+    "第一點",
+    "第二點"
+  ]
+}}
+
+以下是本週資料 JSON：
+{payload_json}
+"""
+        output_text = _call_gemini_with_retry(prompt)
+        points = _parse_gemini_points(output_text or "")
+        if points:
+            print(f"✅ Gemini 本週重點完成：{len(points)} 點")
+        return points
+    except Exception as e:
+        print(f"⚠️ Gemini 本週重點整理失敗，改用規則式重點：{e}")
+        return []
+
+
 def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     """若有 OPENAI_API_KEY，優先用新聞內文整理成真正重點；失敗則自動走規則式摘要。"""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -2120,7 +2626,7 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     if not usable_records:
         usable_records = records if not NEWS_REQUIRE_ARTICLE_BODY else body_records
 
-    ai_points = _summarize_news_with_openai(usable_records, stock_code, stock_name)
+    ai_points = _summarize_news_with_gemini(usable_records, stock_code, stock_name)
     if ai_points:
         return ai_points[:NEWS_SUMMARY_MAX_POINTS]
 
