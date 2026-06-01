@@ -1871,13 +1871,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         card_y = 0.02
         card_w = 0.46
         card_h = 0.965
-        card_pad = 0.014
         band_h = 0.035
         box = FancyBboxPatch((x0, card_y), card_w, card_h, transform=ax_top.transAxes,
-                             boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35)
+                             boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.35,
+                             zorder=1)
         ax_top.add_patch(box)
-        band = Rectangle((x0 - card_pad, card_y + card_h - band_h), card_w + card_pad * 2, band_h,
-                         transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95)
+        band = Rectangle((x0, card_y + card_h - band_h), card_w, band_h,
+                         transform=ax_top.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95,
+                         zorder=2)
         band.set_clip_path(box)
         ax_top.add_patch(band)
         ax_top.text(x0 + 0.02, 0.90, title, transform=ax_top.transAxes, color=side_color, fontsize=42, fontweight="bold", ha="left", va="top")
@@ -1911,9 +1912,19 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
-        ax_notes.add_patch(FancyBboxPatch((x0, 0.035), 0.46, 0.93, transform=ax_notes.transAxes,
-                                          boxstyle="round,pad=0.014,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25))
-        ax_notes.add_patch(Rectangle((x0, 0.92), 0.46, 0.03, transform=ax_notes.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95))
+        note_y = 0.035
+        note_w = 0.46
+        note_h = 0.93
+        note_band_h = 0.035
+        note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
+                                  boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
+                                  zorder=1)
+        ax_notes.add_patch(note_box)
+        note_band = Rectangle((x0, note_y + note_h - note_band_h), note_w, note_band_h,
+                              transform=ax_notes.transAxes, facecolor=GOLD, edgecolor=GOLD, linewidth=0, alpha=0.95,
+                              zorder=2)
+        note_band.set_clip_path(note_box)
+        ax_notes.add_patch(note_band)
         ax_notes.text(x0 + 0.02, 0.89, title, transform=ax_notes.transAxes, color=GOLD, fontsize=42, fontweight="bold", ha="left", va="top")
     y = 0.79
     for p in key_points[:4]:
