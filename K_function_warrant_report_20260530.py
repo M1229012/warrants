@@ -1300,11 +1300,6 @@ def build_key_points(ctx, stock_name: str):
         pos_sum = by_branch.clip(lower=0).sum()
         share = by_branch.head(3).clip(lower=0).sum() / max(1.0, pos_sum) * 100 if pos_sum > 0 else 0.0
         points.append(f"權證淨流向 {fmt_money(net)}（{ctx['bias']}），由「{top_branch}」領軍 {fmt_money(top_amt)}，前三大分點佔買超 {share:.0f}%。")
-
-    if ctx.get("hedge_removed", 0) > 0:
-        points.append(f"本週已過濾疑似造市 / 避險紀錄 {ctx['hedge_removed']} 筆，降低發行商自營單干擾。")
-    elif ctx.get("hedge_candidates", 0) > 0:
-        points.append(f"偵測到疑似買賣對沖紀錄 {ctx['hedge_candidates']} 筆；目前保留不刪除，避免誤刪大額主力單。")
     return points[:4]
 
 
