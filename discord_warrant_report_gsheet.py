@@ -82,6 +82,13 @@ NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
     os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
 )
 
+# TOP15 計算明細除錯輸出。
+# 預設會在 console 印出 2408 南亞科 / 元大南屯 的買進與扣減明細，
+# 用來確認 TOP15 金額與手算差異。正式部署若不想顯示，設定 DEBUG_TOP15_DETAIL=0。
+DEBUG_TOP15_DETAIL = os.getenv("DEBUG_TOP15_DETAIL", "1") == "1"
+DEBUG_TOP15_UNDERLYING = os.getenv("DEBUG_TOP15_UNDERLYING", "2408").strip()
+DEBUG_TOP15_BROKER = os.getenv("DEBUG_TOP15_BROKER", "元大南屯").strip()
+
 # 常見權證發行券商關鍵字，用來從權證名稱中反推標的股名。
 WARRANT_ISSUER_TOKENS = [
     "元大", "凱基", "群益", "富邦", "國泰", "永豐", "永豐金", "國票", "中信",
@@ -1849,6 +1856,20 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     position_lots_by_warrant: dict[tuple[str, str], list[dict]] = defaultdict(list)
     lot_seq = 0
 
+    debug_underlying_code = normalize_underlying(DEBUG_TOP15_UNDERLYING) if DEBUG_TOP15_UNDERLYING else ""
+    debug_broker = str(DEBUG_TOP15_BROKER).strip()
+    debug_buy_rows: list[dict] = []
+    debug_sell_rows: list[dict] = []
+
+    def is_debug_top15_target(broker: str, underlying_code: str) -> bool:
+        return (
+            DEBUG_TOP15_DETAIL
+            and debug_broker
+            and debug_underlying_code
+            and str(broker).strip() == debug_broker
+            and normalize_underlying(underlying_code) == debug_underlying_code
+        )
+
     def get_row_buy_qty_units(row, sheet_name: str) -> float:
         """取得買進數量，統一轉為權證單位數；表內張數 × 1000。"""
         if sheet_name == SHEET_A:
@@ -2067,6 +2088,62 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         return deducted_cost
 
+    def print_top15_debug_detail():
+        """印出指定分點 + 標的的 TOP15 買進與扣減明細，方便核對手算差異。"""
+        if not DEBUG_TOP15_DETAIL or not debug_broker or not debug_underlying_code:
+            return
+
+        item = agg.get(debug_underlying_code)
+        if not item and not debug_buy_rows and not debug_sell_rows:
+            return
+
+        buy_total = sum(safe_float(r.get("amount"), 0) for r in debug_buy_rows)
+        sell_cost_total = sum(safe_float(r.get("deduct_cost"), 0) for r in debug_sell_rows)
+        broker_net = safe_float(item.get("broker_net_amounts", {}).get(debug_broker, 0), 0) if item else 0.0
+        broker_raw = safe_float(item.get("broker_amounts", {}).get(debug_broker, 0), 0) if item else 0.0
+
+        print("\n" + "=" * 100)
+        print(f"TOP15 計算明細 DEBUG｜分點：{debug_broker}｜標的：{debug_underlying_code}")
+        if trading_dates:
+            print(f"統計期間：{min(trading_dates):%Y-%m-%d} ～ {max(trading_dates):%Y-%m-%d}｜有效交易日：{len(trading_dates)}")
+        print("-" * 100)
+        print(f"買進成本合計：{buy_total:,.0f} 元（{fmt_wan(buy_total)}）")
+        print(f"扣減成本合計：{sell_cost_total:,.0f} 元（{fmt_wan(sell_cost_total)}）")
+        print(f"分點原始買超成本 broker_amounts：{broker_raw:,.0f} 元（{fmt_wan(broker_raw)}）")
+        print(f"分點淨買超成本 broker_net_amounts：{broker_net:,.0f} 元（{fmt_wan(broker_net)}）")
+        print("-" * 100)
+
+        if debug_buy_rows:
+            print("【買進納入明細】")
+            for i, r in enumerate(sorted(debug_buy_rows, key=lambda x: (x.get("event_date") or date.min, x.get("event", ""), x.get("warrant_codes", ""))), 1):
+                d = r.get("event_date")
+                d_text = d.strftime("%Y-%m-%d") if d else "-"
+                print(
+                    f"{i:02d}. {d_text}｜事件 {r.get('event', '-')}｜"
+                    f"權證 {r.get('warrant_codes', '-')}｜"
+                    f"買進張數 {safe_float(r.get('buy_qty_units'), 0) / NTD_PER_WARRANT_POINT:,.0f}｜"
+                    f"買進金額 {safe_float(r.get('amount'), 0):,.0f} 元（{fmt_wan(r.get('amount', 0))}）"
+                )
+        else:
+            print("【買進納入明細】沒有資料")
+
+        print("-" * 100)
+        if debug_sell_rows:
+            print("【賣出扣減明細】")
+            for i, r in enumerate(sorted(debug_sell_rows, key=lambda x: (x.get("date") or date.min, x.get("warrant_code", ""))), 1):
+                d = r.get("date")
+                d_text = d.strftime("%Y-%m-%d") if d else "-"
+                print(
+                    f"{i:02d}. {d_text}｜權證 {r.get('warrant_code', '-')}｜"
+                    f"賣出張數 {safe_float(r.get('sell_qty_units'), 0) / NTD_PER_WARRANT_POINT:,.0f}｜"
+                    f"賣出金額 {safe_float(r.get('sell_amount'), 0):,.0f} 元｜"
+                    f"扣減原始成本 {safe_float(r.get('deduct_cost'), 0):,.0f} 元（{fmt_wan(r.get('deduct_cost', 0))}）"
+                )
+        else:
+            print("【賣出扣減明細】沒有扣減資料")
+
+        print("=" * 100 + "\n")
+
     def apply_sell_deduction_from_df(sell_df: pd.DataFrame, code_col_candidates: list[str]):
         """
         TOP15 賣方扣減規則：
@@ -2169,6 +2246,15 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             if sell_cost <= 0:
                 continue
 
+            if is_debug_top15_target(broker, code):
+                debug_sell_rows.append({
+                    "date": d,
+                    "warrant_code": warrant_code,
+                    "sell_qty_units": sell_qty_units,
+                    "sell_amount": safe_float(row.get("sell_amount"), 0),
+                    "deduct_cost": sell_cost,
+                })
+
             agg[code]["net_amount"] -= sell_cost
             agg[code]["broker_net_amounts"][broker] -= sell_cost
 
@@ -2233,10 +2319,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         # 建立本次 TOP15 統計範圍內的買進成本批次。
         # A 表通常是一檔權證；B/C/D 則從權證清單拆出多檔權證。
         buy_qty_units = get_row_buy_qty_units(row, sheet_name)
+        debug_warrant_codes: list[str] = []
 
         if sheet_name == SHEET_A:
             warrant_code = normalize_warrant_code(row.get("權證代碼") or row.get("權證代號"))
             if warrant_code:
+                debug_warrant_codes = [warrant_code]
                 register_position_lot(
                     broker=broker,
                     underlying_code=code,
@@ -2249,6 +2337,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         else:
             warrant_codes = [warrant_code for warrant_code, _ in parse_warrant_items_from_text(warrant_text) if warrant_code]
             if warrant_codes:
+                debug_warrant_codes = warrant_codes[:]
                 register_position_lot(
                     broker=broker,
                     underlying_code=code,
@@ -2258,6 +2347,16 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                     buy_qty_units=buy_qty_units,
                     warrant_codes=warrant_codes,
                 )
+
+        if is_debug_top15_target(broker, code):
+            debug_buy_rows.append({
+                "event_date": event_date,
+                "event": event_code,
+                "warrant_codes": ",".join(debug_warrant_codes) if debug_warrant_codes else "-",
+                "amount": amount,
+                "buy_qty_units": buy_qty_units,
+                "sheet_name": sheet_name,
+            })
 
     def add_sell_row(row, event_date, amount):
         """
@@ -2374,6 +2473,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         })
 
     rows.sort(key=lambda x: (x["net_amount"], x["amount"], x["broker_count"]), reverse=True)
+    print_top15_debug_detail()
     return rows[:15], trading_dates
 
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
