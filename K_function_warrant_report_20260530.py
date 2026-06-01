@@ -120,6 +120,12 @@ LIME = "#2E8B57"
 PURPLE = "#6F5BD8"
 WHITE = "#FFFFFF"
 
+# 中央浮水印設定：圖片偏長，因此上下各放一個淡浮水印
+CENTER_WATERMARK_TEXT = "股市艾斯\n台股DC討論群"
+CENTER_WATERMARK_ALPHA = 0.06
+CENTER_WATERMARK_FONT_SIZE = 108
+CENTER_WATERMARK_ROTATION = 18
+
 # 字型：GitHub Actions 建議安裝 fonts-noto-cjk
 available_fonts = [f.name for f in fm.fontManager.ttflist]
 for font_name in ["Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans TC", "Microsoft JhengHei", "SimHei"]:
@@ -3359,6 +3365,31 @@ def adjust_institutional_ylim(ax, plot_df: pd.DataFrame):
     ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
 
 
+
+def add_center_watermarks(fig):
+    """在長圖中央區域加入上下兩個淡浮水印。"""
+    try:
+        if not CENTER_WATERMARK_TEXT:
+            return
+
+        for y in (0.66, 0.31):
+            fig.text(
+                0.5,
+                y,
+                CENTER_WATERMARK_TEXT,
+                ha="center",
+                va="center",
+                fontsize=CENTER_WATERMARK_FONT_SIZE,
+                fontweight="bold",
+                color=GOLD,
+                alpha=CENTER_WATERMARK_ALPHA,
+                rotation=CENTER_WATERMARK_ROTATION,
+                linespacing=1.12,
+                zorder=1000,
+            )
+    except Exception:
+        pass
+
 def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict]):
     ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
@@ -3746,6 +3777,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=26)
     for ax in [candle_ax, vol_ax, inst_ax]:
         plt.setp(ax.get_xticklabels(), visible=False)
+
+    add_center_watermarks(fig)
 
     fig.subplots_adjust(left=0.035, right=0.965, top=0.975, bottom=0.03)
     return fig
