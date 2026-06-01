@@ -1340,7 +1340,7 @@ def build_key_points(ctx, stock_name: str):
 
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
-NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
+NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "90"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
@@ -1361,7 +1361,7 @@ NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
-NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "6"))
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "8"))
 
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
@@ -1846,8 +1846,10 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     strict_part = " OR ".join([f'"{a}"' for a in aliases[:5]]) if aliases else f'"{stock_code}"'
     query = (
         f'({strict_part}) '
-        f'(營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR 目標價) '
-        f'-三大法人 -買賣超 -排行 -完整看 -焦點股 -漲停 -亮燈 -強漲 -飆漲 -創高 when:7d'
+        f'(營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR 目標價 OR 評等 OR EPS OR ASP) '
+        # 不再排除「焦點股 / 漲停 / 強漲」等字眼，因為很多重要新聞標題會包含這些詞；
+        # 後續會用內文與本股票關聯性過濾，不會直接把標題放進重點。
+        f'-三大法人 -買賣超 -排行 -完整看 when:7d'
     )
     url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": query,
@@ -2076,13 +2078,49 @@ def _split_news_clauses(sentence: str) -> List[str]:
     return out
 
 
+def _strip_target_news_label(sentence: str) -> str:
+    """移除會影響判斷的標題式前綴，但保留後面的真正內文。"""
+    s = _normalize_news_text(sentence)
+    s = re.sub(r"^(焦點股|個股|強勢股|題材股|盤中|盤後|台股)[:：｜|]?\s*", "", s).strip()
+    return s
+
+
+def _has_company_value_terms(text: str) -> bool:
+    """判斷句子是否含有與公司基本面或股價可能有關的資訊。"""
+    s = _normalize_news_text(text)
+    return bool(re.search(
+        r"目標價|評等|升評|降評|調升|調降|EPS|每股純益|營收|月增|年增|毛利|毛利率|獲利|虧損|轉盈|ASP|報價|漲價|供需|需求|接單|出貨|產能|長約|法說|展望|AI|伺服器|半導體|記憶體|DRAM|HBM|NAND|測試|探針卡|載板|PCB|先進封裝|CoWoS|客戶|訂單",
+        s,
+    ))
+
+
+def _is_safe_target_context_sentence(text: str, stock_code: str, stock_name: str) -> bool:
+    """判斷沒有明確股票名稱的承接句是否可安全保留為本股票上下文。"""
+    s = _strip_target_news_label(text)
+    if not s:
+        return False
+    if _is_cross_company_target_value_sentence(s, stock_code, stock_name):
+        return False
+    # 若承接句同時出現其他公司與容易混用的數字 / 題材，直接排除。
+    if _contains_non_target_stock_alias(s, stock_code, stock_name) and re.search(
+        r"目標價|評等|EPS|每股純益|營收|毛利|獲利|預估|上看|調升|調降|ASP|報價|記憶體|DRAM|HBM|PCB|載板|伺服器|AI",
+        s,
+    ):
+        return False
+    if _is_bad_news_sentence(s) and not _has_company_value_terms(s):
+        return False
+    return _has_company_value_terms(s) or bool(re.search(r"^(該公司|公司|其|法人|市場|報告|預估|預期|因此|由於|受惠|展望)", s))
+
+
 def _extract_target_focused_news_body(content: str, stock_code: str, stock_name: str) -> str:
     """
     多家公司新聞常同時提到台積電、聯發科、瑞昱、記憶體股等不同主題。
     送入 Gemini 前先壓成「本股票明確相關片段」。
 
-    重要原則：若文章有提到本股票，但可萃取出的本股票片段很少，也不要退回整篇全文，
-    否則 AI 很容易把同一篇裡其他股票的記憶體、目標價、EPS、營收等重點寫成本股票重點。
+    這版改成「嚴格防混用，但不要過度嚴格到完全抓不到」：
+    1. 明確提到本股票的句子會保留。
+    2. 本股票句子的前後承接句，若沒有其他公司名且含基本面 / 產業關鍵資訊，也會保留。
+    3. 目標價、EPS、營收、ASP、報價、產業題材若出現其他公司名稱，仍會排除。
     """
     aliases = [a for a in _get_news_aliases(stock_code, stock_name) if a]
     content = _normalize_news_text(content)
@@ -2092,51 +2130,77 @@ def _extract_target_focused_news_body(content: str, stock_code: str, stock_name:
     sentences = _split_news_sentences(content)
     selected = []
     seen = set()
+    context_window = 0
+
+    def add_sentence(raw_sent: str):
+        sent = _strip_target_news_label(raw_sent)
+        sent = sent.strip("。；;，, ")
+        if not sent or sent in seen:
+            return
+        if _is_cross_company_target_value_sentence(sent, stock_code, stock_name):
+            return
+        if _contains_non_target_stock_alias(sent, stock_code, stock_name) and re.search(
+            r"目標價|評等|EPS|每股純益|營收|毛利|獲利|預估|上看|調升|調降|ASP|報價|記憶體|DRAM|HBM|PCB|載板|伺服器|AI",
+            sent,
+        ):
+            return
+        if _is_bad_news_sentence(sent) and not any(alias in sent for alias in aliases) and not _has_company_value_terms(sent):
+            return
+        selected.append(sent)
+        seen.add(sent)
+
     for i, sent in enumerate(sentences):
         if not sent:
             continue
+        sent = _strip_target_news_label(sent)
         has_target = any(alias in sent for alias in aliases)
         has_non_target = _contains_non_target_stock_alias(sent, stock_code, stock_name)
         has_cross_risk = _is_cross_company_target_value_sentence(sent, stock_code, stock_name)
 
         if has_target:
+            # 先嘗試拆分句，避免「A 公司目標價、B 公司目標價」混在同一句。
             clauses = []
             for clause in _split_news_clauses(sent):
-                clause = clause.strip("，,；;、 ")
-                if not clause or _is_bad_news_sentence(clause):
+                clause = _strip_target_news_label(clause).strip("，,；;、 ")
+                if not clause:
                     continue
                 clause_has_target = any(alias in clause for alias in aliases)
                 clause_has_non_target = _contains_non_target_stock_alias(clause, stock_code, stock_name)
                 clause_has_value_risk = _is_cross_company_target_value_sentence(clause, stock_code, stock_name)
-                # 只留下明確提到本股票的分句；若同一分句同時混入其他公司與目標價/評等，寧可排除。
                 if clause_has_target and not clause_has_value_risk:
-                    if clause_has_non_target and re.search(r"目標價|評等|EPS|每股純益|營收|毛利|獲利|預估|上看|調升|調降", clause):
+                    if clause_has_non_target and re.search(
+                        r"目標價|評等|EPS|每股純益|營收|毛利|獲利|預估|上看|調升|調降|ASP|報價|記憶體|DRAM|HBM|PCB|載板|伺服器|AI",
+                        clause,
+                    ):
                         continue
                     clauses.append(clause)
-            sent = "，".join(clauses).strip("，,；;、 ") if clauses else sent
-            if has_cross_risk and _contains_non_target_stock_alias(sent, stock_code, stock_name):
-                continue
-            if sent and sent not in seen and not _is_bad_news_sentence(sent):
-                selected.append(sent)
-                seen.add(sent)
+
+            target_sentence = "，".join(clauses).strip("，,；;、 ") if clauses else sent
+            if not has_cross_risk:
+                add_sentence(target_sentence)
+                # 保留後面 2 句承接句，避免正文後續用「該公司 / 其 / 法人指出」而不再重複公司名導致抓不到。
+                context_window = 2
             continue
 
-        # 若前一句已明確提到本股票，下一句使用「該公司 / 公司 / 其」承接且沒有其他公司名，可保留。
-        prev_has_target = i > 0 and any(alias in sentences[i - 1] for alias in aliases)
-        if prev_has_target and re.search(r"^(該公司|公司|其|法人|市場|報告|預估|預期|因此|由於)", sent):
-            if not has_non_target and sent not in seen and not _is_bad_news_sentence(sent):
-                selected.append(sent)
-                seen.add(sent)
+        if context_window > 0:
+            if _is_safe_target_context_sentence(sent, stock_code, stock_name):
+                add_sentence(sent)
+                context_window -= 1
+                continue
+            # 遇到其他公司或明顯無關內容，就結束本股票上下文。
+            if has_non_target:
+                context_window = 0
 
     focused = "。".join(selected)
-
-    # 如果文章完全沒有本股票相關句，回傳空字串，後面會直接略過，不用整篇全文硬湊。
-    if focused:
+    if len(_normalize_news_text(focused)) >= 40:
         return focused
 
-    if any(alias in content for alias in aliases):
-        return ""
-    return ""
+    # 若全文沒有其他公司名，代表不是多股混雜新聞；可保守保留含公司名附近的前段內容，避免完全抓不到。
+    if any(alias in content for alias in aliases) and not _contains_non_target_stock_alias(content, stock_code, stock_name):
+        cleaned = _normalize_news_text(content)
+        return cleaned[: min(len(cleaned), NEWS_MAX_ARTICLE_CHARS_TO_GEMINI)]
+
+    return focused
 
 def _split_news_sentences(text: str) -> List[str]:
     s = _normalize_news_text(text)
@@ -2484,14 +2548,14 @@ def _parse_gemini_points(output_text: str) -> List[str]:
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
     """只把「有足夠內文」的文章送給 Gemini，並先萃取本股票相關片段，避免多家公司新聞數字混用。"""
     usable = []
-    ordered = [r for r in records if r.get("body_ok")]
+    ordered = [r for r in records if r.get("body_ok") or r.get("fallback_ok")]
     for rec in ordered:
         content = _normalize_news_text(rec.get("content", ""))
-        if len(content) < NEWS_MIN_BODY_CHARS:
+        if len(content) < 80:
             continue
         title = _clean_news_title(rec.get("title", ""))
         focused_content = _extract_target_focused_news_body(content, stock_code, stock_name)
-        if len(_normalize_news_text(focused_content)) < 60:
+        if len(_normalize_news_text(focused_content)) < 40:
             print(f"⚠️ 略過多股混雜新聞：{title[:36]}｜找不到足夠的 {stock_code} {stock_name} 明確片段")
             continue
         usable.append({
@@ -2847,8 +2911,9 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     if not records:
         return ["本週未抓到可整理的新聞素材；可用 WEEKLY_NEWS_TEXT 手動填入新聞重點。"]
 
-    # 依照獨立 Gemini 測試程式邏輯：只把「有足夠內文」的文章送給 Gemini。
-    ai_points = _summarize_news_with_gemini(body_records, stock_code, stock_name)
+    # 優先用足夠新聞原文；若原文抓不到或本股票片段太短，允許使用已驗證相關的 RSS 摘要作為 AI 改寫素材，避免完全沒有新聞。
+    ai_source_records = body_records if body_records else fallback_records
+    ai_points = _summarize_news_with_gemini(ai_source_records, stock_code, stock_name)
     if ai_points:
         return _ensure_news_summary_min_total(ai_points, body_records, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
 
