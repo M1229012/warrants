@@ -1,5 +1,6 @@
 import io
 import json
+import html
 import math
 import os
 import re
@@ -1304,16 +1305,175 @@ def build_key_points(ctx, stock_name: str):
 
 
 # ============================================================
-# 新聞抓取：先做可用版，後續可再換 MOPS / OpenAI 摘要
+# 新聞抓取：抓一週內新聞內文並整理成重點
 # ============================================================
 
-def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
+NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "4500"))
+NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
+
+
+def _clean_news_title(title: str) -> str:
+    s = html.unescape(str(title or "")).strip()
+    s = re.sub(r"\s+", " ", s)
+    # Google News RSS 常見格式為「標題 - 來源」，這裡移除最後來源字樣，避免圖片右下角太冗長。
+    s = re.sub(r"\s+-\s+[^-]{1,40}$", "", s).strip()
+    return s
+
+
+def _html_to_readable_text(raw_html: str) -> str:
+    """將 HTML 粗略轉成可讀文字；不依賴 BeautifulSoup，避免 GitHub Actions 缺套件。"""
+    if not raw_html:
+        return ""
+    text = str(raw_html)
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
+    text = re.sub(r"(?is)<svg[^>]*>.*?</svg>", " ", text)
+    text = re.sub(r"(?is)<(br|/p|/div|/li|/h[1-6]|/article|/section|/main)\b[^>]*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _walk_json_objects(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json_objects(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json_objects(v)
+
+
+def _extract_json_ld_article_body(page_html: str) -> str:
+    """優先從 JSON-LD 的 articleBody / description 擷取新聞內文。"""
+    if not page_html:
+        return ""
+    bodies = []
+    pattern = r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+    for m in re.finditer(pattern, page_html):
+        raw = html.unescape(m.group(1)).strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for obj in _walk_json_objects(data):
+            body = obj.get("articleBody") or obj.get("description") or ""
+            if isinstance(body, str):
+                body = _normalize_news_text(body)
+                if len(body) >= 80:
+                    bodies.append(body)
+    if not bodies:
+        return ""
+    return max(bodies, key=len)
+
+
+def _normalize_news_text(text: str) -> str:
+    if not text:
+        return ""
+    s = html.unescape(str(text))
+    s = s.replace("\u3000", " ")
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    boilerplates = [
+        "請繼續往下閱讀", "延伸閱讀", "相關新聞", "熱門新聞", "推薦閱讀", "更多新聞",
+        "廣告", "ADVERTISEMENT", "Copyright", "版權所有", "不得轉載", "登入", "訂閱",
+        "Facebook", "LINE", "Telegram", "分享", "下載APP", "APP下載", "加入會員",
+        "Yahoo奇摩", "Google News", "新聞中心", "看更多", "點我看更多",
+    ]
+    for bp in boilerplates:
+        s = s.replace(bp, " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _extract_article_text_from_html(page_html: str) -> str:
+    """從新聞頁 HTML 取出最像內文的文字。"""
+    if not page_html:
+        return ""
+
+    json_body = _extract_json_ld_article_body(page_html)
+    if len(json_body) >= 120:
+        return json_body[:NEWS_BODY_MAX_CHARS]
+
+    candidates = []
+    for tag in ["article", "main"]:
+        for m in re.finditer(rf"(?is)<{tag}[^>]*>(.*?)</{tag}>", page_html):
+            txt = _normalize_news_text(_html_to_readable_text(m.group(1)))
+            if len(txt) >= 120:
+                candidates.append(txt)
+
+    # 常見新聞內文容器 class/id 關鍵字，抓不到 article/main 時再嘗試。
+    for m in re.finditer(r'(?is)<div[^>]+(?:class|id)=["\'][^"\']*(?:article|content|story|news|post|entry|text)[^"\']*["\'][^>]*>(.*?)</div>', page_html):
+        txt = _normalize_news_text(_html_to_readable_text(m.group(1)))
+        if len(txt) >= 120:
+            candidates.append(txt)
+
+    if candidates:
+        return max(candidates, key=len)[:NEWS_BODY_MAX_CHARS]
+
+    fallback = _normalize_news_text(_html_to_readable_text(page_html))
+    if len(fallback) >= 120:
+        return fallback[:NEWS_BODY_MAX_CHARS]
+    return ""
+
+
+def _fetch_article_body(url: str) -> str:
+    """嘗試進入新聞原文頁抓內文；失敗時回傳空字串。"""
+    if not url:
+        return ""
+    try:
+        headers = {
+            "User-Agent": HDR["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://news.google.com/",
+        }
+        r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT), allow_redirects=True)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if "text/html" not in content_type and "application/xhtml" not in content_type and not r.text.lstrip().startswith("<"):
+            return ""
+        body = _extract_article_text_from_html(r.text)
+        # 若仍停在 Google News 跳轉頁，通常文字會很短或包含大量 Google 導覽字樣，這裡讓它走 RSS 摘要備援。
+        if body and len(body) >= 80:
+            return body
+    except Exception as e:
+        print(f"⚠️ 新聞內文抓取失敗：{url}｜{e}")
+    return ""
+
+
+def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 5) -> List[dict]:
+    """
+    抓取最近一週 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
+    回傳 dict 格式，讓後續 build_news_points 可以根據內文整理重點。
+    """
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
         parts = [x.strip() for x in re.split(r"[\n；;]+", manual) if x.strip()]
-        return parts[:max_items]
+        return [{
+            "title": "手動新聞重點",
+            "url": "",
+            "source": "manual",
+            "published": "",
+            "description": "",
+            "content": p,
+        } for p in parts[:max_items]]
+
     if not NEWS_ENABLE:
         return []
+
     query = f'("{stock_code}" OR "{stock_name}") (營收 OR 轉型 OR 題材 OR AI OR 記憶體 OR DRAM OR 半導體 OR 報價 OR 法說 OR 外資 OR 投信) when:7d'
     url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": query,
@@ -1321,66 +1481,252 @@ def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 
         "gl": "TW",
         "ceid": "TW:zh-Hant",
     })
+
     try:
         r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
         r.raise_for_status()
         root = ET.fromstring(r.content)
-        titles = []
+        articles = []
+        seen_titles = set()
+
         for item in root.findall(".//item"):
-            title = (item.findtext("title") or "").strip()
-            title = re.sub(r"\s+-\s+[^-]+$", "", title)
-            if title and title not in titles:
-                titles.append(title)
-            if len(titles) >= max_items:
+            title = _clean_news_title(item.findtext("title") or "")
+            link = (item.findtext("link") or "").strip()
+            published = (item.findtext("pubDate") or "").strip()
+            source_el = item.find("source")
+            source = (source_el.text if source_el is not None and source_el.text else "").strip()
+            description = _normalize_news_text(_html_to_readable_text(item.findtext("description") or ""))
+
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+
+            content = _fetch_article_body(link)
+            if len(content) < 80:
+                content = description
+
+            articles.append({
+                "title": title,
+                "url": link,
+                "source": source,
+                "published": published,
+                "description": description,
+                "content": content,
+            })
+            print(f"📰 新聞抓取：{title[:36]}｜內文 {len(content):,} 字")
+
+            if len(articles) >= max_items:
                 break
-        return titles
+
+        return articles
     except Exception as e:
         print(f"⚠️ Google News RSS 抓取失敗：{e}")
         return []
 
 
-def build_news_points(stock_code: str, stock_name: str, news_titles: List[str], ctx: dict | None = None) -> List[str]:
-    """整理最近一週新聞，優先抓營收、轉型、題材、產業熱點。"""
+def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
+    """保留舊函式相容性；新流程請優先使用 fetch_google_news_articles。"""
+    articles = fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
     titles = []
-    seen = set()
-    for t in news_titles or []:
-        s = re.sub(r"\s+", " ", str(t or "").strip())
-        if not s or s in seen:
+    for a in articles:
+        if isinstance(a, dict):
+            title = _clean_news_title(a.get("title", ""))
+            if title:
+                titles.append(title)
+        else:
+            title = _clean_news_title(str(a))
+            if title:
+                titles.append(title)
+    return titles[:max_items]
+
+
+def _news_items_to_records(news_items) -> List[dict]:
+    records = []
+    for item in news_items or []:
+        if isinstance(item, dict):
+            title = _clean_news_title(item.get("title", ""))
+            content = _normalize_news_text(item.get("content", "") or item.get("description", ""))
+            source = str(item.get("source", "") or "").strip()
+            published = str(item.get("published", "") or "").strip()
+            url = str(item.get("url", "") or "").strip()
+        else:
+            title = _clean_news_title(str(item))
+            content = ""
+            source = ""
+            published = ""
+            url = ""
+        if not title and not content:
             continue
-        seen.add(s)
-        titles.append(s)
+        records.append({
+            "title": title,
+            "content": content,
+            "source": source,
+            "published": published,
+            "url": url,
+        })
+    return records
 
-    def pick(keywords, used):
-        for tt in titles:
-            if tt in used:
+
+def _split_news_sentences(text: str) -> List[str]:
+    s = _normalize_news_text(text)
+    if not s:
+        return []
+    # 新聞內文常會用句號、分號、驚嘆號或換行分段。
+    parts = re.split(r"(?<=[。！？!?；;])\s*|[\r\n]+", s)
+    out = []
+    for p in parts:
+        p = _normalize_news_text(p)
+        p = re.sub(r"^[,，、。\s]+", "", p).strip()
+        if not p:
+            continue
+        if len(p) < 14:
+            continue
+        if len(p) > 120:
+            # 避免整段太長，先用逗號切開；若仍太長，後續會再截斷。
+            sub_parts = re.split(r"(?<=[，,])\s*", p)
+            buf = ""
+            for sp in sub_parts:
+                if len(buf + sp) <= 90:
+                    buf += sp
+                else:
+                    if len(buf) >= 14:
+                        out.append(buf.strip("，, "))
+                    buf = sp
+            if len(buf) >= 14:
+                out.append(buf.strip("，, "))
+        else:
+            out.append(p.strip("，, "))
+    return out
+
+
+def _trim_news_point(text: str, max_len: int = 76) -> str:
+    s = _normalize_news_text(text)
+    s = re.sub(r"\s+-\s+[^-]{1,40}$", "", s).strip()
+    s = s.strip("。；;，, ")
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len]
+    # 優先在逗號或頓號處截斷，避免句子突然斷掉。
+    last = max(cut.rfind("，"), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
+    if last >= 28:
+        cut = cut[:last]
+    return cut.rstrip("，、；; ") + "…"
+
+
+def _score_news_sentence(sentence: str, keywords: List[str], stock_code: str, stock_name: str) -> int:
+    s = str(sentence or "")
+    score = 0
+    for k in keywords:
+        if k and k in s:
+            score += 5
+    if stock_code and stock_code in s:
+        score += 2
+    if stock_name and stock_name in s:
+        score += 2
+    for k in ["本週", "近期", "今年", "明年", "上半年", "下半年", "第1季", "第2季", "第3季", "第4季", "Q1", "Q2", "Q3", "Q4"]:
+        if k in s:
+            score += 1
+    for bad in ["點擊", "下載", "加入會員", "登入", "訂閱", "廣告", "版權", "更多", "看更多"]:
+        if bad in s:
+            score -= 6
+    if 18 <= len(s) <= 90:
+        score += 1
+    return score
+
+
+def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
+    """根據最近一週新聞內文整理重點；若抓不到內文，才退回標題線索。"""
+    records = _news_items_to_records(news_items)
+
+    if not records:
+        return ["本週未抓到明確新聞題材；可用 WEEKLY_NEWS_TEXT 手動填入營收、轉型或題材重點。"]
+
+    # 建立候選句：標題也納入，但內文句子會更優先成為重點來源。
+    candidates = []
+    seen_sentence = set()
+    for rec in records:
+        title = rec.get("title", "")
+        content = rec.get("content", "")
+        source = rec.get("source", "")
+
+        if title:
+            t = _trim_news_point(title, max_len=76)
+            if t and t not in seen_sentence:
+                candidates.append({"text": t, "from_title": True, "source": source})
+                seen_sentence.add(t)
+
+        for sent in _split_news_sentences(content):
+            sent = _trim_news_point(sent, max_len=82)
+            if not sent or sent in seen_sentence:
                 continue
-            if any(k in tt for k in keywords):
-                used.add(tt)
-                return tt
-        return ""
+            candidates.append({"text": sent, "from_title": False, "source": source})
+            seen_sentence.add(sent)
 
-    used = set()
-    revenue = pick(["營收", "月增", "年增", "業績", "財報", "獲利", "EPS"], used)
-    theme = pick(["題材", "AI", "伺服器", "記憶體", "DRAM", "半導體", "報價", "HBM", "漲價", "缺貨"], used)
-    transform = pick(["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望"], used)
-    broker = pick(["外資", "投信", "券商", "評等", "目標價", "調升", "調降"], used)
-    company = pick([stock_name, stock_code], used)
+    categories = [
+        ("營收 / 財報", ["營收", "月增", "年增", "業績", "財報", "獲利", "EPS", "毛利", "毛利率", "每股盈餘", "虧損", "轉盈"]),
+        ("產業 / 題材", ["題材", "AI", "伺服器", "記憶體", "DRAM", "NAND", "半導體", "報價", "HBM", "漲價", "缺貨", "先進封裝", "CoWoS", "ASIC", "散熱"]),
+        ("展望 / 布局", ["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望", "接單", "出貨", "產能", "需求", "訂單", "客戶"]),
+        ("法人觀點", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "買進", "中立", "賣出"]),
+    ]
 
     points = []
-    if revenue:
-        points.append(f"營收 / 財報：{revenue}")
-    if theme:
-        points.append(f"本週題材：{theme}")
-    if transform:
-        points.append(f"轉型 / 展望：{transform}")
-    if broker:
-        points.append(f"法人觀點：{broker}")
-    if company and len(points) < 4:
-        points.append(f"公司消息：{company}")
-    if not points and titles:
+    used_text = set()
+
+    for label, keywords in categories:
+        scored = []
+        for c in candidates:
+            text = c["text"]
+            if text in used_text:
+                continue
+            score = _score_news_sentence(text, keywords, stock_code, stock_name)
+            # 內文句比標題更接近使用者要的「新聞內文重點」。
+            if not c.get("from_title"):
+                score += 2
+            if score > 0:
+                scored.append((score, text))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            pick = scored[0][1]
+            used_text.add(pick)
+            points.append(f"{label}：{pick}")
+
+    # 若分類後不到 4 點，用剩餘高分句補足。
+    if len(points) < 4:
+        broad_keywords = [
+            stock_code, stock_name, "營收", "AI", "伺服器", "半導體", "記憶體", "DRAM", "HBM", "法說", "展望",
+            "外資", "投信", "報價", "獲利", "接單", "出貨", "擴產", "合作", "題材",
+        ]
+        scored = []
+        for c in candidates:
+            text = c["text"]
+            if text in used_text:
+                continue
+            score = _score_news_sentence(text, broad_keywords, stock_code, stock_name)
+            if not c.get("from_title"):
+                score += 2
+            scored.append((score, text, c.get("from_title")))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for score, text, from_title in scored:
+            if len(points) >= 4:
+                break
+            if score <= 0 and from_title:
+                continue
+            used_text.add(text)
+            prefix = "新聞重點" if not from_title else "新聞線索"
+            points.append(f"{prefix}：{text}")
+
+    # 真的抓不到可用內文時，最後才退回標題。
+    if not points:
+        titles = []
+        for rec in records:
+            title = _trim_news_point(rec.get("title", ""), max_len=76)
+            if title and title not in titles:
+                titles.append(title)
         points = [f"新聞線索：{t}" for t in titles[:4]]
+
     if not points:
         points = ["本週未抓到明確新聞題材；可用 WEEKLY_NEWS_TEXT 手動填入營收、轉型或題材重點。"]
+
     return points[:4]
 
 
@@ -1637,7 +1983,7 @@ def adjust_institutional_ylim(ax, plot_df: pd.DataFrame):
     ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
 
 
-def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_titles: List[str]):
+def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict]):
     ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
     plot_df = ctx["plot_df"].copy()
@@ -1648,7 +1994,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     daily_net = daily_warrant_net(plot_df, plot_events)
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
     key_points = build_key_points(ctx, stock_name)
-    news_points = build_news_points(stock_code, stock_name, news_titles, ctx)
+    news_points = build_news_points(stock_code, stock_name, news_items, ctx)
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
@@ -2060,9 +2406,9 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         print(f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，資料區間 {start_date.date()} ~ {end_date.date()}")
         warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
-        news_titles = fetch_google_news_titles(stock_code, stock_name, max_items=5)
+        news_items = fetch_google_news_articles(stock_code, stock_name, max_items=5)
 
-        fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_titles)
+        fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", pad_inches=0.18, facecolor=fig.get_facecolor())
         plt.close(fig)
