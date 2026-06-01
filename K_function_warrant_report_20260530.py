@@ -1,6 +1,7 @@
 import io
 import json
 import html
+import base64
 import math
 import os
 import re
@@ -1311,7 +1312,10 @@ def build_key_points(ctx, stock_name: str):
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "4500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "4"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "62"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "58"))
+# 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
+NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "180"))
+NEWS_REQUIRE_ARTICLE_BODY = os.getenv("WARRANT_NEWS_REQUIRE_BODY", "1").strip().lower() not in ("0", "false", "no", "off")
 NEWS_OPENAI_ENABLE = os.getenv("WARRANT_NEWS_OPENAI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 NEWS_OPENAI_MODEL = os.getenv("WARRANT_NEWS_OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
 
@@ -1392,6 +1396,62 @@ def _normalize_news_text(text: str) -> str:
     return s
 
 
+def _title_compare_text(text: str) -> str:
+    s = _normalize_news_text(text)
+    s = re.sub(r'''[\s，。！？；：、,.!?;:()（）\[\]【】《》〈〉『』「」"\'’‘“”|｜\-–—_]+''', "", s)
+    return s
+
+
+def _char_overlap_ratio(a: str, b: str) -> float:
+    aa = set(_title_compare_text(a))
+    bb = set(_title_compare_text(b))
+    if not aa or not bb:
+        return 0.0
+    return len(aa & bb) / max(1, min(len(aa), len(bb)))
+
+
+def _looks_like_news_headline(text: str, title: str = "") -> bool:
+    """判斷句子是否比較像新聞標題或導流摘要，而不是可整理的內文。"""
+    s = _normalize_news_text(text)
+    if not s:
+        return True
+    headline_marks = ["焦點股", "個股", "優於大盤", "新目標價", "目標價曝光", "上看", "爆漲", "飆漲", "強勢股", "題材股"]
+    if any(k in s for k in headline_marks) and len(s) <= 70:
+        return True
+    if any(mark in s for mark in ["》", "｜", "|", "【", "】"] ) and len(s) <= 90:
+        return True
+    if title:
+        tc = _title_compare_text(title)
+        sc = _title_compare_text(s)
+        if tc and sc:
+            # 短句與標題高度相似才視為標題；完整內文常會包含標題，不能因此整篇丟掉。
+            if len(s) <= 120 and (sc in tc or tc in sc):
+                return True
+            if len(s) <= 90 and _char_overlap_ratio(s, title) >= 0.72:
+                return True
+    return False
+
+
+def _is_valid_article_body(body: str, title: str = "", description: str = "") -> bool:
+    """確認抓到的是新聞內文，而不是 RSS 標題、摘要或網站導流文字。"""
+    body = _normalize_news_text(body)
+    title = _clean_news_title(title)
+    description = _normalize_news_text(description)
+    if len(body) < NEWS_MIN_BODY_CHARS:
+        return False
+    if _looks_like_news_headline(body, title):
+        return False
+    if description and len(body) <= max(len(description) + 40, 260) and _char_overlap_ratio(body, description) >= 0.80:
+        return False
+    sentence_count = len(re.findall(r"[。！？!?；;]", body))
+    if sentence_count < 2 and len(body) < 320:
+        return False
+    bad_ratio_hits = len(re.findall(r"完整看|看更多|延伸閱讀|相關新聞|熱門新聞|三大法人買賣超|買超排行|賣超排行", body))
+    if bad_ratio_hits >= 2 and len(body) < 500:
+        return False
+    return True
+
+
 def _walk_json_objects(obj):
     if isinstance(obj, dict):
         yield obj
@@ -1458,10 +1518,34 @@ def _extract_article_text_from_html(page_html: str) -> str:
     return ""
 
 
+def _decode_google_news_url_from_path(url: str) -> str:
+    """先嘗試從 Google News RSS encoded path 直接解出原始新聞網址。"""
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+        if "news.google.com" not in parsed.netloc or "/articles/" not in parsed.path:
+            return ""
+        encoded = parsed.path.split("/articles/", 1)[1].split("/", 1)[0]
+        encoded = encoded.split("?", 1)[0]
+        if not encoded:
+            return ""
+        padded = encoded + "=" * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        text = raw.decode("latin1", errors="ignore")
+        m = re.search(r"https?://[^\x00-\x20\"'<>]+", text)
+        if m:
+            return html.unescape(m.group(0)).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _maybe_resolve_google_news_link(url: str) -> str:
     """Google News RSS 有時是跳轉頁；這裡嘗試解析成原始新聞網址。"""
     if not url or "news.google.com" not in url:
         return url or ""
+    decoded_url = _decode_google_news_url_from_path(url)
+    if decoded_url:
+        return decoded_url
     try:
         headers = {
             "User-Agent": HDR["User-Agent"],
@@ -1523,6 +1607,8 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             "published": "",
             "description": "",
             "content": p,
+            "body_ok": True,
+            "body_length": len(p),
         } for p in parts[:max_items]]
 
     if not NEWS_ENABLE:
@@ -1546,8 +1632,10 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         root = ET.fromstring(r.content)
         articles = []
         seen_titles = set()
+        scanned = 0
 
         for item in root.findall(".//item"):
+            scanned += 1
             title = _clean_news_title(item.findtext("title") or "")
             link = (item.findtext("link") or "").strip()
             published = (item.findtext("pubDate") or "").strip()
@@ -1559,9 +1647,12 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                 continue
             seen_titles.add(title)
 
-            content = _fetch_article_body(link)
-            if len(content) < 80:
-                content = description
+            article_body = _fetch_article_body(link)
+            body_ok = _is_valid_article_body(article_body, title=title, description=description)
+
+            # 重點：不要把 RSS description 或新聞標題塞進 content。
+            # 若原文內文抓不到，就保留 description 作為除錯資訊，但不拿來產生新聞重點。
+            content = article_body if body_ok else ""
 
             articles.append({
                 "title": title,
@@ -1570,10 +1661,16 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                 "published": published,
                 "description": description,
                 "content": content,
+                "body_ok": body_ok,
+                "body_length": len(article_body or ""),
             })
-            print(f"📰 新聞抓取：{title[:36]}｜內文 {len(content):,} 字")
+            status = "可摘要" if body_ok else "略過標題/摘要"
+            print(f"📰 新聞抓取：{title[:36]}｜原文 {len(article_body or ''):,} 字｜{status}")
 
-            if len(articles) >= max_items:
+            # 為了避免前面幾篇都抓不到內文，RSS 可以多掃一些；只用可摘要內文做重點。
+            if len(articles) >= max_items and sum(1 for a in articles if a.get("body_ok")) >= max(2, min(4, NEWS_SUMMARY_MAX_POINTS)):
+                break
+            if scanned >= max_items * 4:
                 break
 
         return articles
@@ -1603,18 +1700,22 @@ def _news_items_to_records(news_items) -> List[dict]:
     for item in news_items or []:
         if isinstance(item, dict):
             title = _clean_news_title(item.get("title", ""))
-            content = _normalize_news_text(item.get("content", "") or item.get("description", ""))
             description = _normalize_news_text(item.get("description", ""))
             source = str(item.get("source", "") or "").strip()
             published = str(item.get("published", "") or "").strip()
             url = str(item.get("url", "") or "").strip()
+            body_ok = bool(item.get("body_ok"))
+            raw_content = _normalize_news_text(item.get("content", ""))
+            content = raw_content if body_ok else ""
         else:
+            # 舊版相容：純字串只當標題，不拿來產生新聞重點。
             title = _clean_news_title(str(item))
             content = ""
             description = ""
             source = ""
             published = ""
             url = ""
+            body_ok = False
         if not title and not content and not description:
             continue
         records.append({
@@ -1624,6 +1725,7 @@ def _news_items_to_records(news_items) -> List[dict]:
             "source": source,
             "published": published,
             "url": url,
+            "body_ok": body_ok,
         })
     return records
 
@@ -1638,8 +1740,12 @@ def _is_bad_news_sentence(sentence: str) -> bool:
         "自營商買超", "自營商賣超", "買超排行", "賣超排行", "熱門股", "熱門新聞",
         "新聞標題", "點擊", "下載", "加入會員", "登入", "訂閱", "廣告", "版權",
         "看更多", "更多新聞", "延伸閱讀", "相關新聞", "Yahoo", "Facebook", "LINE分享",
+        "焦點股", "優於大盤", "目標價曝光", "新目標價", "強勢股", "題材股",
+        "SETN", "UDN", "自由財經", "中時新聞", "工商時報", "經濟日報", "鉅亨網", "MoneyDJ",
     ]
     if any(k in s for k in bad_keywords):
+        return True
+    if re.search(r"[》｜|【】]", s) and len(s) <= 100:
         return True
     code_count = len(re.findall(r"\(?\d{4}\)?", s))
     if code_count >= 3:
@@ -1733,16 +1839,24 @@ def _collect_news_sentences(records: List[dict]) -> List[dict]:
     candidates = []
     seen = set()
     for rec in records:
-        content = rec.get("content", "") or rec.get("description", "")
-        # 這裡刻意不把 title 當候選句，避免輸出變成新聞標題。
+        if NEWS_REQUIRE_ARTICLE_BODY and not rec.get("body_ok"):
+            continue
+        content = rec.get("content", "")
+        title = rec.get("title", "")
+        source = str(rec.get("source", "") or "").strip()
+        # 這裡刻意不把 title / RSS description 當候選句，避免輸出變成新聞標題。
         for sent in _split_news_sentences(content):
-            sent = _trim_news_point(sent, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 10)
+            sent = _trim_news_point(sent, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 12)
             if not sent or sent in seen or _is_bad_news_sentence(sent):
+                continue
+            if _looks_like_news_headline(sent, title):
+                continue
+            if source and source in sent and len(sent) <= 90:
                 continue
             candidates.append({
                 "text": sent,
-                "source": rec.get("source", ""),
-                "title": rec.get("title", ""),
+                "source": source,
+                "title": title,
             })
             seen.add(sent)
     return candidates
@@ -1770,8 +1884,9 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
 
     blocks = []
     total_len = 0
-    for idx, rec in enumerate(records, 1):
-        content = _normalize_news_text(rec.get("content", "") or rec.get("description", ""))
+    body_records = [r for r in records if r.get("body_ok") and _normalize_news_text(r.get("content", ""))]
+    for idx, rec in enumerate(body_records, 1):
+        content = _normalize_news_text(rec.get("content", ""))
         sentences = _split_news_sentences(content)
         if not sentences:
             continue
@@ -1792,10 +1907,11 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         f"請根據以下一週內新聞內文，整理 {stock_code} {stock_name} 的新聞重點。\n"
         "要求：\n"
         "1. 請輸出 4 點，每點 35 到 60 個中文字。\n"
-        "2. 只能整理內文重點，不要直接複製新聞標題。\n"
-        "3. 不要出現『完整看』、『新聞線索』、『來源』或新聞網站名稱。\n"
-        "4. 優先聚焦營收/財報、產業題材、展望布局、法人觀點或風險。\n"
-        "5. 若資料不足，寧可保守，不要臆測。\n\n"
+        "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
+        "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
+        "4. 每點要像研究摘要，說明原因、影響或觀察方向，不要寫成聳動標題。\n"
+        "5. 優先聚焦營收/財報、產業題材、展望布局、法人觀點或風險。\n"
+        "6. 若資料不足，寧可保守，不要臆測。\n\n"
         + "\n\n".join(blocks)
     )
 
@@ -1891,19 +2007,25 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
     """根據最近一週新聞內文整理重點；不再直接把新聞標題放進圖表。"""
     records = _news_items_to_records(news_items)
+    body_records = [r for r in records if r.get("body_ok") and _normalize_news_text(r.get("content", ""))]
 
     if not records:
         return ["本週未抓到可整理的新聞內文；可用 WEEKLY_NEWS_TEXT 手動填入新聞重點。"]
 
-    ai_points = _summarize_news_with_openai(records, stock_code, stock_name)
+    if NEWS_REQUIRE_ARTICLE_BODY and not body_records:
+        return ["本週新聞原文未成功抓到可摘要內文；已避免把標題當重點輸出。"]
+
+    usable_records = body_records if NEWS_REQUIRE_ARTICLE_BODY else records
+
+    ai_points = _summarize_news_with_openai(usable_records, stock_code, stock_name)
     if ai_points:
         return ai_points[:NEWS_SUMMARY_MAX_POINTS]
 
-    rule_points = _rule_based_news_summary(records, stock_code, stock_name)
+    rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
     if rule_points:
         return rule_points[:NEWS_SUMMARY_MAX_POINTS]
 
-    return ["本週新聞多為標題或導流摘要，未抓到足夠內文；建議用 WEEKLY_NEWS_TEXT 手動填入重點。"]
+    return ["本週新聞內文有效句不足，未輸出標題式內容；可用 WEEKLY_NEWS_TEXT 手動補重點。"]
 
 
 # ============================================================
@@ -2174,8 +2296,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     fig = plt.figure(figsize=(28, 54), facecolor=BG)
     gs = GridSpec(8, 12, figure=fig,
-                  height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 9.85, 8.75],
-                  hspace=0.18, wspace=0.25)
+                  height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 9.55, 9.05],
+                  hspace=0.14, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -2429,12 +2551,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # Notes row
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
-        note_y = 0.00
+        note_y = 0.025
         note_w = 0.46
-        note_h = 1.04
-        note_band_h = 0.035
+        note_h = 0.955
+        note_band_h = 0.040
         note_box = FancyBboxPatch((x0, note_y), note_w, note_h, transform=ax_notes.transAxes,
-                                  boxstyle="round,pad=0.000,rounding_size=0.02", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
+                                  boxstyle="round,pad=0.000,rounding_size=0.022", facecolor=PANEL2, edgecolor=GOLD, linewidth=1.25,
                                   zorder=1, clip_on=False)
         ax_notes.add_patch(note_box)
         note_band = Rectangle((x0, note_y + note_h - note_band_h), note_w, note_band_h,
@@ -2442,7 +2564,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                               zorder=2, clip_on=False)
         note_band.set_clip_path(note_box)
         ax_notes.add_patch(note_band)
-        ax_notes.text(x0 + 0.02, 0.95, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False)
+        ax_notes.text(x0 + 0.02, note_y + note_h - 0.075, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False)
     notes_fontsize = 32
     notes_line_height = 0.058
     notes_item_gap = 0.036
@@ -2532,8 +2654,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.85)
-    draw_note_items(news_points[:5], 0.54, 0.52 + 0.55 - notes_right_padding, 0.85)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.82)
+    draw_note_items(news_points[:5], 0.54, 0.52 + 0.55 - notes_right_padding, 0.82)
 
     # x ticks
     interval = max(1, len(x) // 12)
