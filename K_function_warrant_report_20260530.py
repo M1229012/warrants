@@ -2,6 +2,7 @@ import io
 import json
 import html
 import base64
+import hashlib
 import math
 import os
 import re
@@ -113,7 +114,39 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 
+# 權證快取設定：優先把完整 live 抓取結果寫入 Google Sheet；本機快照僅保留相容舊流程，預設關閉。
+WARRANT_CACHE_FORCE_REFRESH = os.getenv(
+    "WARRANT_CACHE_FORCE_REFRESH",
+    os.getenv("WARRANT_LOCAL_CACHE_FORCE_REFRESH", "0"),
+).strip().lower() in ("1", "true", "yes", "on")
+GSHEET_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_WARRANT_HISTORY_SHEET = os.getenv("WARRANT_GSHEET_HISTORY_SHEET", "快取_分點歷史").strip() or "快取_分點歷史"
+GSHEET_WARRANT_STATUS_SHEET = os.getenv("WARRANT_GSHEET_STATUS_SHEET", "快取_分點歷史_狀態").strip() or "快取_分點歷史_狀態"
+
+# 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
+LOCAL_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip().lower() not in ("0", "false", "no", "off")
+LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").strip() or "warrant_cache"
+LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH
+
+# API 重試與完整度檢查：預設要求 100% 完整，只要 API4/API5 有任何 failed 就中止，不輸出半套資料。
+API_RETRY_TIMES = int(os.getenv("WARRANT_API_RETRY_TIMES", "3"))
+API_RETRY_BASE_WAIT = float(os.getenv("WARRANT_API_RETRY_BASE_WAIT", "1.5"))
+API_FAILURE_ABORT_RATIO = float(os.getenv("WARRANT_API_FAILURE_ABORT_RATIO", "0"))
+API_FAILURE_ABORT_MIN_REQUESTS = int(os.getenv("WARRANT_API_FAILURE_ABORT_MIN_REQUESTS", "1"))
+API_REQUIRE_FULL_SUCCESS = os.getenv("WARRANT_API_REQUIRE_FULL_SUCCESS", "1").strip().lower() not in ("0", "false", "no", "off")
+API_EMPTY_AS_FAILURE = os.getenv("WARRANT_API_EMPTY_AS_FAILURE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
+LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_cache"
+# Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
+GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
+LLM_CACHE_FORCE_REFRESH = os.getenv("WARRANT_LLM_CACHE_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes", "on")
+
 _THREAD_LOCAL = threading.local()
+_FETCH_STATS_LOCK = threading.Lock()
+_FETCH_STATS = {}
 
 # 視覺風格：淺背景 + Apple 風格藏青色元素
 BG = "#F5F5F7"        # 淺灰白背景，不使用整片深藍底
@@ -168,6 +201,24 @@ def _clean_code(v) -> str:
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
     return s.strip()
+
+
+def normalize_branch_name(branch_name: str) -> str:
+    """將分點名稱做全域標準化，避免同分點因空白、短橫線、全形符號或台/臺差異被拆成不同分點。"""
+    if branch_name is None or (isinstance(branch_name, float) and pd.isna(branch_name)):
+        return ""
+    s = str(branch_name).strip()
+    if not s or s in ("-", "--", "nan", "None"):
+        return ""
+    s = html.unescape(s)
+    s = s.replace("臺", "台")
+    s = s.replace("（", "(").replace("）", ")")
+    s = s.replace("／", "/").replace("﹣", "-").replace("－", "-").replace("–", "-").replace("—", "-").replace("―", "-")
+    # 只移除格式用分隔符，不移除券商或地名本身，避免把不同分點誤合併。
+    s = re.sub(r"[\s　\-_\u2010-\u2015/\\|｜·．・•]+", "", s)
+    s = re.sub(r"[()（）［］\[\]{}｛｝]+", "", s)
+    s = s.strip()
+    return s
 
 
 def normalize_openapi_warrant_code(code) -> str:
@@ -276,6 +327,339 @@ def wrap_text(s: str, width: int = 18, max_lines: int = 2) -> str:
     if len("".join(lines)) < len(s):
         lines[-1] = lines[-1][: max(0, width - 1)] + "…"
     return "\n".join(lines)
+
+
+def _safe_cache_part(v) -> str:
+    s = str(v or "").strip()
+    s = re.sub(r"[^0-9A-Za-z_\-]+", "_", s)
+    return s.strip("_") or "unknown"
+
+
+def _cache_date_part(v) -> str:
+    dt = parse_date(v)
+    if dt:
+        return dt.strftime("%Y%m%d")
+    try:
+        return pd.Timestamp(v).strftime("%Y%m%d")
+    except Exception:
+        return _safe_cache_part(v)
+
+
+def _ensure_dir(path: str):
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def _local_warrant_cache_path(stock_code: str, start_date=None, end_date=None) -> str:
+    start_s = _cache_date_part(start_date) if start_date is not None else "start"
+    end_s = _cache_date_part(end_date) if end_date is not None else "end"
+    filename = f"warrant_events_{_safe_cache_part(stock_code)}_{start_s}_{end_s}.json"
+    return os.path.join(LOCAL_WARRANT_CACHE_DIR, filename)
+
+
+def _normalize_warrant_events_for_cache(events_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df is None or events_df.empty:
+        return pd.DataFrame()
+    out = events_df.copy().fillna("")
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
+        out = out.dropna(subset=["Date"])
+        out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
+    for c in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    for c in ["warrant_code", "underlying_code", "broker_code", "branch", "warrant_name", "underlying_name", "side"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str).str.strip()
+    if "branch" in out.columns:
+        out["branch"] = out["branch"].map(normalize_branch_name)
+    return out
+
+
+def load_local_warrant_events_snapshot(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
+    if not LOCAL_WARRANT_CACHE_ENABLE or LOCAL_WARRANT_CACHE_FORCE_REFRESH:
+        return pd.DataFrame()
+    path = _local_warrant_cache_path(stock_code, start_date=start_date, end_date=end_date)
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        records = payload.get("records", []) if isinstance(payload, dict) else []
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records).fillna("")
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+            df = df.dropna(subset=["Date"])
+        for c in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        if "side" not in df.columns and "net_amount" in df.columns:
+            df["side"] = np.where(df["net_amount"] >= 0, "買超", "賣超")
+        print(f"📦 本機權證快照命中：{path}｜{len(df):,} 筆")
+        return df.reset_index(drop=True)
+    except Exception as e:
+        print(f"⚠️ 本機權證快照讀取失敗，改走原本資料流程：{path}｜{e}")
+        return pd.DataFrame()
+
+
+def save_local_warrant_events_snapshot(stock_code: str, events_df: pd.DataFrame, start_date=None, end_date=None):
+    if not LOCAL_WARRANT_CACHE_ENABLE or events_df is None or events_df.empty:
+        return
+    path = _local_warrant_cache_path(stock_code, start_date=start_date, end_date=end_date)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        out = _normalize_warrant_events_for_cache(events_df)
+        payload = {
+            "stock_code": str(stock_code),
+            "start_date": _cache_date_part(start_date),
+            "end_date": _cache_date_part(end_date),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "rows": int(len(out)),
+            "records": out.to_dict(orient="records"),
+        }
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+        print(f"💾 已寫入本機權證快照：{path}｜{len(out):,} 筆")
+    except Exception as e:
+        print(f"⚠️ 本機權證快照寫入失敗：{path}｜{e}")
+
+
+def reset_api_fetch_stats(scope: str):
+    with _FETCH_STATS_LOCK:
+        _FETCH_STATS[scope] = {
+            "total": 0,
+            "success": 0,
+            "empty": 0,
+            "failed": 0,
+            "retry": 0,
+            "errors": [],
+        }
+
+
+def _record_api_fetch(scope: str, status: str, error: str = "", retry_count: int = 0):
+    with _FETCH_STATS_LOCK:
+        st = _FETCH_STATS.setdefault(scope, {
+            "total": 0,
+            "success": 0,
+            "empty": 0,
+            "failed": 0,
+            "retry": 0,
+            "errors": [],
+        })
+        st["total"] += 1
+        if status not in ("success", "empty", "failed"):
+            status = "failed"
+        st[status] += 1
+        st["retry"] += int(retry_count or 0)
+        if error:
+            errors = st.setdefault("errors", [])
+            if len(errors) < 8:
+                errors.append(str(error)[:220])
+
+
+def get_api_fetch_stats(scope: str) -> dict:
+    with _FETCH_STATS_LOCK:
+        return dict(_FETCH_STATS.get(scope, {}))
+
+
+def print_api_fetch_stats(scope: str, label: str):
+    st = get_api_fetch_stats(scope)
+    total = int(st.get("total", 0) or 0)
+    failed = int(st.get("failed", 0) or 0)
+    success = int(st.get("success", 0) or 0)
+    empty = int(st.get("empty", 0) or 0)
+    retry = int(st.get("retry", 0) or 0)
+    fail_ratio = failed / total if total else 0.0
+    print(f"📊 {label} 完整度：total={total:,}｜success={success:,}｜empty={empty:,}｜failed={failed:,}｜retry={retry:,}｜fail_ratio={fail_ratio:.1%}")
+    for err in st.get("errors", [])[:5]:
+        print(f"   ⚠️ {label} 錯誤樣本：{err}")
+
+
+def abort_if_api_failure_too_high(scope: str, label: str):
+    st = get_api_fetch_stats(scope)
+    total = int(st.get("total", 0) or 0)
+    failed = int(st.get("failed", 0) or 0)
+    empty = int(st.get("empty", 0) or 0)
+    if total < API_FAILURE_ABORT_MIN_REQUESTS:
+        return
+
+    if API_REQUIRE_FULL_SUCCESS:
+        bad_count = failed + (empty if API_EMPTY_AS_FAILURE else 0)
+        if bad_count > 0:
+            empty_msg = f"，empty={empty:,}" if API_EMPTY_AS_FAILURE else f"，empty={empty:,}（不列入失敗）"
+            raise RuntimeError(
+                f"{label} 完整度未達 100%：total={total:,}，failed={failed:,}{empty_msg}。"
+                f"本次資料已中止輸出，避免產生錯誤資金流圖。"
+            )
+        return
+
+    fail_ratio = failed / total if total else 0.0
+    if fail_ratio > API_FAILURE_ABORT_RATIO:
+        raise RuntimeError(
+            f"{label} 失敗比例過高：{failed:,}/{total:,} = {fail_ratio:.1%}，"
+            f"超過門檻 {API_FAILURE_ABORT_RATIO:.0%}。本次資料可能嚴重不完整，已中止輸出，避免產生錯誤資金流圖。"
+        )
+
+
+def _moneydj_get_json_with_retry(url: str, scope: str):
+    last_error = None
+    retry_count = 0
+    max_times = max(1, int(API_RETRY_TIMES))
+    for attempt in range(1, max_times + 1):
+        try:
+            r = get_thread_session().get(url, headers=HDR, timeout=(5, 15))
+            r.raise_for_status()
+            text = r.content.decode("utf-8", errors="replace")
+            return json.loads(text), retry_count
+        except Exception as e:
+            last_error = e
+            if attempt < max_times:
+                retry_count += 1
+                wait_sec = API_RETRY_BASE_WAIT * attempt
+                time.sleep(wait_sec)
+                continue
+    raise RuntimeError(str(last_error))
+
+
+def _llm_cache_path(prompt: str) -> str:
+    digest = hashlib.sha256((GEMINI_MODEL + "\n" + str(prompt or "")).encode("utf-8")).hexdigest()
+    return os.path.join(LLM_CACHE_DIR, f"gemini_{digest}.txt")
+
+
+def load_llm_cache(prompt: str) -> str:
+    if not LLM_CACHE_ENABLE:
+        return ""
+    path = _llm_cache_path(prompt)
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        if text.strip():
+            print(f"📦 Gemini 快取命中：{path}")
+            return text
+    except Exception as e:
+        print(f"⚠️ Gemini 快取讀取失敗：{e}")
+    return ""
+
+
+def save_llm_cache(prompt: str, output_text: str):
+    if not LLM_CACHE_ENABLE or not output_text:
+        return
+    path = _llm_cache_path(prompt)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(output_text))
+        print(f"💾 Gemini 結果已快取：{path}")
+    except Exception as e:
+        print(f"⚠️ Gemini 快取寫入失敗：{e}")
+
+
+GSHEET_LLM_CACHE_HEADERS = [
+    "快取鍵", "日期", "任務", "標的股", "標的名稱",
+    "模型", "PromptHash", "Gemini輸出", "更新時間",
+]
+
+
+def _taipei_today_str() -> str:
+    """GitHub runner 預設常是 UTC；這裡固定用台北日期判斷「當天」。"""
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y/%m/%d")
+
+
+def _compact_date_key(date_str: str) -> str:
+    return re.sub(r"[^0-9]", "", str(date_str or ""))
+
+
+def _llm_prompt_hash(prompt: str) -> str:
+    return hashlib.sha256((GEMINI_MODEL + "\n" + str(prompt or "")).encode("utf-8")).hexdigest()
+
+
+def _gsheet_llm_cache_key(task: str, stock_code: str, cache_date: str | None = None) -> str:
+    date_key = _compact_date_key(cache_date or _taipei_today_str())
+    task_key = re.sub(r"[^A-Za-z0-9_一-鿿-]", "_", str(task or "gemini")).strip("_") or "gemini"
+    stock_key = _clean_code(stock_code) or "UNKNOWN"
+    model_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(GEMINI_MODEL or "gemini"))
+    return f"{date_key}_{stock_key}_{task_key}_{model_key}"
+
+
+def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prompt: str = "") -> str:
+    """讀取 Google Sheet Gemini 每日快取。
+
+    設計原則：同股票、同任務、同模型、同一個台北日期，只要跑過一次，
+    當天再跑就直接使用該輸出，不再呼叫 Gemini。PromptHash 只保留作檢查紀錄，
+    不拿來阻擋當日快取命中。
+    """
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or LLM_CACHE_FORCE_REFRESH:
+        return ""
+    if not task or not stock_code:
+        return ""
+    key = _gsheet_llm_cache_key(task, stock_code)
+    try:
+        df = read_gsheet_worksheet(GSHEET_LLM_CACHE_SHEET)
+        if df is None or df.empty or "快取鍵" not in df.columns or "Gemini輸出" not in df.columns:
+            return ""
+        matched = df[df["快取鍵"].astype(str) == key].copy()
+        if matched.empty:
+            return ""
+        row = matched.tail(1).iloc[0]
+        output_text = str(row.get("Gemini輸出", "") or "").strip()
+        if output_text:
+            prompt_hash = _llm_prompt_hash(prompt) if prompt else ""
+            old_hash = str(row.get("PromptHash", "") or "").strip()
+            if prompt_hash and old_hash and prompt_hash != old_hash:
+                print(f"📦 Google Sheet Gemini 當日快取命中：{key}｜PromptHash 不同，但依當日快取規則直接重用")
+            else:
+                print(f"📦 Google Sheet Gemini 當日快取命中：{key}")
+            return output_text
+    except Exception as e:
+        print(f"⚠️ Google Sheet Gemini 快取讀取失敗：{key}｜{e}")
+    return ""
+
+
+def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: str, output_text: str):
+    """將 Gemini 原始輸出寫回 Google Sheet，供同日重跑直接重用。"""
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or not output_text:
+        return
+    if not task or not stock_code:
+        return
+    sh = _open_gsheet()
+    if sh is None:
+        print("⚠️ Google Sheet 無法開啟，略過 Gemini 快取寫回")
+        return
+
+    cache_date = _taipei_today_str()
+    key = _gsheet_llm_cache_key(task, stock_code, cache_date=cache_date)
+    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+    try:
+        ws = _get_or_create_worksheet(sh, GSHEET_LLM_CACHE_SHEET, rows=300, cols=len(GSHEET_LLM_CACHE_HEADERS))
+        old_df = _worksheet_to_df(ws)
+        if old_df is not None and not old_df.empty and "快取鍵" in old_df.columns:
+            old_df = old_df[old_df["快取鍵"].astype(str) != key].copy()
+        else:
+            old_df = pd.DataFrame(columns=GSHEET_LLM_CACHE_HEADERS)
+
+        new_df = pd.DataFrame([{
+            "快取鍵": key,
+            "日期": cache_date,
+            "任務": str(task or ""),
+            "標的股": _clean_code(stock_code),
+            "標的名稱": str(stock_name or ""),
+            "模型": GEMINI_MODEL,
+            "PromptHash": _llm_prompt_hash(prompt),
+            "Gemini輸出": str(output_text or ""),
+            "更新時間": updated_at,
+        }])
+        all_df = pd.concat([old_df, new_df], ignore_index=True, sort=False).fillna("")
+        _update_worksheet_from_df(ws, all_df, GSHEET_LLM_CACHE_HEADERS)
+        print(f"💾 Gemini 結果已寫入 Google Sheet 快取：{key}")
+    except Exception as e:
+        print(f"⚠️ Google Sheet Gemini 快取寫入失敗：{key}｜{e}")
 
 
 # ============================================================
@@ -765,12 +1149,14 @@ def normalize_history_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     out["branch"] = out["branch"].astype(str).str.strip()
     out["broker_name"] = out["broker_name"].astype(str).str.strip()
     out["branch"] = np.where(out["branch"].str.len() > 0, out["branch"], out["broker_name"])
+    out["branch"] = pd.Series(out["branch"]).map(normalize_branch_name).values
+    out["broker_name"] = out["broker_name"].map(normalize_branch_name)
     out["side"] = np.where(out["net_amount"] >= 0, "買超", "賣超")
     return out
 
 
 def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    raw = read_gsheet_worksheet("快取_分點歷史")
+    raw = read_gsheet_worksheet(GSHEET_WARRANT_HISTORY_SHEET)
     events = normalize_history_cache_df(raw)
     if events.empty:
         return pd.DataFrame()
@@ -781,6 +1167,231 @@ def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None)
     if end_date is not None:
         events = events[events["Date"] <= pd.Timestamp(end_date).normalize()]
     return events.reset_index(drop=True)
+
+
+GSHEET_WARRANT_HISTORY_HEADERS = [
+    "日期", "權證代號", "權證名稱", "標的股", "標的名稱",
+    "分點", "分點名稱", "券商代號", "買進金額", "賣出金額", "買超金額",
+    "買進張數", "賣出張數", "資料來源", "快取起日", "快取迄日", "更新時間",
+]
+
+GSHEET_WARRANT_STATUS_HEADERS = [
+    "快取鍵", "標的股", "標的名稱", "快取起日", "快取迄日", "完整度狀態",
+    "API4總請求", "API4成功", "API4空回應", "API4失敗",
+    "API5總請求", "API5成功", "API5空回應", "API5失敗",
+    "資料筆數", "更新時間",
+]
+
+
+def _gsheet_cache_date_str(v) -> str:
+    dt = parse_date(v)
+    if not dt:
+        try:
+            dt = pd.Timestamp(v).to_pydatetime()
+        except Exception:
+            dt = None
+    return dt.strftime("%Y/%m/%d") if dt else str(v or "").strip()
+
+
+def _gsheet_cache_key(stock_code: str, start_date=None, end_date=None) -> str:
+    return f"{_clean_code(stock_code)}_{_cache_date_part(start_date)}_{_cache_date_part(end_date)}"
+
+
+def _get_or_create_worksheet(sh, title: str, rows: int = 1000, cols: int = 20):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        return sh.add_worksheet(title=title, rows=max(1, rows), cols=max(1, cols))
+
+
+def _worksheet_to_df(ws) -> pd.DataFrame:
+    try:
+        records = ws.get_all_records(empty2zero=False, head=1)
+        return pd.DataFrame(records).fillna("") if records else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _update_worksheet_from_df(ws, df: pd.DataFrame, headers: List[str]):
+    cols = list(headers)
+    if df is not None and not df.empty:
+        for c in df.columns:
+            if c not in cols:
+                cols.append(c)
+        out = df.copy().fillna("")
+        for c in cols:
+            if c not in out.columns:
+                out[c] = ""
+        out = out[cols]
+        values = [cols] + out.astype(str).values.tolist()
+    else:
+        values = [cols]
+
+    ws.clear()
+    ws.resize(rows=max(len(values), 1), cols=max(len(cols), 1))
+    ws.update(values, value_input_option="USER_ENTERED")
+
+
+def _events_to_gsheet_history_df(events_df: pd.DataFrame, stock_code: str, stock_name: str, start_date=None, end_date=None) -> pd.DataFrame:
+    if events_df is None or events_df.empty:
+        return pd.DataFrame(columns=GSHEET_WARRANT_HISTORY_HEADERS)
+    e = events_df.copy().fillna("")
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    out = pd.DataFrame()
+    out["日期"] = e["Date"].dt.strftime("%Y/%m/%d")
+    out["權證代號"] = e.get("warrant_code", "").map(normalize_openapi_warrant_code) if "warrant_code" in e.columns else ""
+    out["權證名稱"] = e.get("warrant_name", "").astype(str).str.strip() if "warrant_name" in e.columns else ""
+    out["標的股"] = e.get("underlying_code", str(stock_code)).astype(str).str.strip() if "underlying_code" in e.columns else str(stock_code)
+    out["標的股"] = out["標的股"].replace("", str(stock_code))
+    out["標的名稱"] = e.get("underlying_name", str(stock_name)).astype(str).str.strip() if "underlying_name" in e.columns else str(stock_name)
+    out["標的名稱"] = out["標的名稱"].replace("", str(stock_name))
+    out["分點"] = e.get("branch", "").astype(str).str.strip() if "branch" in e.columns else ""
+    out["分點"] = out["分點"].map(normalize_branch_name)
+    out["分點名稱"] = out["分點"]
+    out["券商代號"] = e.get("broker_code", "").astype(str).str.strip() if "broker_code" in e.columns else ""
+    out["買進金額"] = pd.to_numeric(e.get("buy_amount", 0), errors="coerce").fillna(0).astype(float)
+    out["賣出金額"] = pd.to_numeric(e.get("sell_amount", 0), errors="coerce").fillna(0).astype(float)
+    out["買超金額"] = pd.to_numeric(e.get("net_amount", 0), errors="coerce").fillna(0).astype(float)
+    out["買進張數"] = pd.to_numeric(e.get("buy_shares", 0), errors="coerce").fillna(0).astype(float) if "buy_shares" in e.columns else 0
+    out["賣出張數"] = pd.to_numeric(e.get("sell_shares", 0), errors="coerce").fillna(0).astype(float) if "sell_shares" in e.columns else 0
+    out["資料來源"] = "MoneyDJ_API4_API5_100pct"
+    out["快取起日"] = _gsheet_cache_date_str(start_date)
+    out["快取迄日"] = _gsheet_cache_date_str(end_date)
+    out["更新時間"] = updated_at
+    return out[GSHEET_WARRANT_HISTORY_HEADERS]
+
+
+def _remove_same_stock_range_rows(raw_df: pd.DataFrame, stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    df = raw_df.copy().fillna("")
+    if "標的股" not in df.columns or "日期" not in df.columns:
+        return df
+    start_ts = pd.Timestamp(start_date).normalize() if start_date is not None else pd.Timestamp.min
+    end_ts = pd.Timestamp(end_date).normalize() if end_date is not None else pd.Timestamp.max
+    date_s = df["日期"].map(parse_date)
+    date_s = pd.to_datetime(date_s, errors="coerce").dt.normalize()
+    stock_s = df["標的股"].map(_clean_code).astype(str)
+    mask = (stock_s == _clean_code(stock_code)) & (date_s >= start_ts) & (date_s <= end_ts)
+    return df.loc[~mask].copy()
+
+
+def _read_gsheet_warrant_status() -> pd.DataFrame:
+    if not GSHEET_WARRANT_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE:
+        return pd.DataFrame()
+    return read_gsheet_worksheet(GSHEET_WARRANT_STATUS_SHEET)
+
+
+def load_gsheet_warrant_events_snapshot(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
+    if not GSHEET_WARRANT_CACHE_ENABLE or WARRANT_CACHE_FORCE_REFRESH:
+        return pd.DataFrame()
+    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
+    status_df = _read_gsheet_warrant_status()
+    if status_df is None or status_df.empty or "快取鍵" not in status_df.columns:
+        return pd.DataFrame()
+
+    matched = status_df[status_df["快取鍵"].astype(str) == key].copy()
+    if matched.empty:
+        return pd.DataFrame()
+    matched = matched.tail(1)
+    row = matched.iloc[0]
+    if str(row.get("完整度狀態", "")).strip().lower() != "complete":
+        print(f"⚠️ Google Sheet 快取狀態不是 complete：{key}，改走 live 抓取")
+        return pd.DataFrame()
+
+    def _safe_int_from_status(value, default=0):
+        try:
+            v = pd.to_numeric(value, errors="coerce")
+            if pd.isna(v):
+                return int(default)
+            return int(v)
+        except Exception:
+            return int(default)
+
+    api4_failed = _safe_int_from_status(row.get("API4失敗", 0))
+    api5_failed = _safe_int_from_status(row.get("API5失敗", 0))
+    expected_rows = _safe_int_from_status(row.get("資料筆數", 0))
+    if api4_failed != 0 or api5_failed != 0 or expected_rows <= 0:
+        print(f"⚠️ Google Sheet 快取完整度紀錄不合格：{key}，改走 live 抓取")
+        return pd.DataFrame()
+
+    events = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
+    if events.empty:
+        print(f"⚠️ Google Sheet 快取狀態存在，但 {GSHEET_WARRANT_HISTORY_SHEET} 找不到資料：{key}，改走 live 抓取")
+        return pd.DataFrame()
+
+    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    if len(events) != expected_rows:
+        print(f"⚠️ Google Sheet 快取筆數不一致：狀態 {expected_rows:,} 筆，實際 {len(events):,} 筆；改走 live 抓取")
+        return pd.DataFrame()
+
+    print(f"☁️ Google Sheet 完整快照命中：{key}｜{len(events):,} 筆")
+    return events
+
+
+def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events_df: pd.DataFrame, start_date=None, end_date=None):
+    if not GSHEET_WARRANT_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or events_df is None or events_df.empty:
+        return
+
+    api4_stats = get_api_fetch_stats("api4")
+    api5_stats = get_api_fetch_stats("api5")
+    api4_failed = int(api4_stats.get("failed", 0) or 0)
+    api5_failed = int(api5_stats.get("failed", 0) or 0)
+    if api4_failed != 0 or api5_failed != 0:
+        print(f"⚠️ API 未達 100%，不寫入 Google Sheet 快取：API4 failed={api4_failed}｜API5 failed={api5_failed}")
+        return
+
+    sh = _open_gsheet()
+    if sh is None:
+        print("⚠️ Google Sheet 無法開啟，略過權證快取寫回")
+        return
+
+    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
+    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    new_history = _events_to_gsheet_history_df(events_df, stock_code, stock_name, start_date=start_date, end_date=end_date)
+    if new_history.empty:
+        return
+
+    try:
+        history_ws = _get_or_create_worksheet(sh, GSHEET_WARRANT_HISTORY_SHEET, rows=max(len(new_history) + 10, 1000), cols=len(GSHEET_WARRANT_HISTORY_HEADERS))
+        old_history = _worksheet_to_df(history_ws)
+        kept_history = _remove_same_stock_range_rows(old_history, stock_code, start_date=start_date, end_date=end_date)
+        all_history = pd.concat([kept_history, new_history], ignore_index=True, sort=False).fillna("")
+        _update_worksheet_from_df(history_ws, all_history, GSHEET_WARRANT_HISTORY_HEADERS)
+        print(f"💾 已寫入 Google Sheet {GSHEET_WARRANT_HISTORY_SHEET}：{key}｜{len(new_history):,} 筆")
+
+        status_ws = _get_or_create_worksheet(sh, GSHEET_WARRANT_STATUS_SHEET, rows=200, cols=len(GSHEET_WARRANT_STATUS_HEADERS))
+        old_status = _worksheet_to_df(status_ws)
+        if old_status is not None and not old_status.empty and "快取鍵" in old_status.columns:
+            old_status = old_status[old_status["快取鍵"].astype(str) != key].copy()
+        else:
+            old_status = pd.DataFrame(columns=GSHEET_WARRANT_STATUS_HEADERS)
+
+        new_status = pd.DataFrame([{
+            "快取鍵": key,
+            "標的股": _clean_code(stock_code),
+            "標的名稱": str(stock_name or ""),
+            "快取起日": _gsheet_cache_date_str(start_date),
+            "快取迄日": _gsheet_cache_date_str(end_date),
+            "完整度狀態": "complete",
+            "API4總請求": int(api4_stats.get("total", 0) or 0),
+            "API4成功": int(api4_stats.get("success", 0) or 0),
+            "API4空回應": int(api4_stats.get("empty", 0) or 0),
+            "API4失敗": api4_failed,
+            "API5總請求": int(api5_stats.get("total", 0) or 0),
+            "API5成功": int(api5_stats.get("success", 0) or 0),
+            "API5空回應": int(api5_stats.get("empty", 0) or 0),
+            "API5失敗": api5_failed,
+            "資料筆數": int(len(new_history)),
+            "更新時間": updated_at,
+        }])
+        all_status = pd.concat([old_status, new_status], ignore_index=True, sort=False).fillna("")
+        _update_worksheet_from_df(status_ws, all_status, GSHEET_WARRANT_STATUS_HEADERS)
+        print(f"✅ Google Sheet 快取狀態已更新：{key}｜complete")
+    except Exception as e:
+        print(f"⚠️ Google Sheet 權證快取寫入失敗：{key}｜{e}")
 
 
 def load_warrant_underlying_lookup() -> Dict[str, dict]:
@@ -919,25 +1530,32 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
 
 
 def api4_get(code, start, end):
+    retry_count = 0
     try:
-        r = get_thread_session().get(API4.format(code=code, start=start, end=end), headers=HDR, timeout=(5, 15))
-        data = json.loads(r.content.decode("utf-8"))
+        url = API4.format(code=code, start=start, end=end)
+        data, retry_count = _moneydj_get_json_with_retry(url, scope="api4")
         rows = []
         for item in (data if isinstance(data, list) else [data]):
             rows.extend(item.get("ResultSet", {}).get("Result", []))
+        _record_api_fetch("api4", "success" if rows else "empty", retry_count=retry_count)
         return rows
-    except Exception:
+    except Exception as e:
+        _record_api_fetch("api4", "failed", error=f"{code}｜{e}", retry_count=retry_count)
         return []
 
 
 def api5_get(warrant, broker, days=None):
+    retry_count = 0
     try:
         days = int(days if days is not None else API5_DAYS)
-        r = get_thread_session().get(API5.format(warrant=warrant, broker=broker, days=days), headers=HDR, timeout=(5, 15))
-        data = json.loads(r.content.decode("utf-8"))
+        url = API5.format(warrant=warrant, broker=broker, days=days)
+        data, retry_count = _moneydj_get_json_with_retry(url, scope="api5")
         rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
-        return rs.get("Result", [])
-    except Exception:
+        rows = rs.get("Result", [])
+        _record_api_fetch("api5", "success" if rows else "empty", retry_count=retry_count)
+        return rows
+    except Exception as e:
+        _record_api_fetch("api5", "failed", error=f"{warrant}/{broker}｜{e}", retry_count=retry_count)
         return []
 
 
@@ -950,7 +1568,7 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
         out = []
         for row in api4_get(w["代號"], start_s, end_s):
             broker_code = str(row.get("V2", "")).strip()
-            broker_name = str(row.get("V3", "")).strip()
+            broker_name = normalize_branch_name(row.get("V3", ""))
             if not broker_code:
                 continue
             out.append({
@@ -963,17 +1581,21 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
             })
         return out
 
+    reset_api_fetch_stats("api4")
     print(f"🔎 API4 掃描全部分點：{len(warrants):,} 支權證，workers={API4_WORKERS}")
     with ThreadPoolExecutor(max_workers=max(1, API4_WORKERS)) as ex:
         futures = {ex.submit(scan_one, w): w for w in warrants}
         for i, fut in enumerate(as_completed(futures), 1):
+            w = futures.get(fut, {})
             try:
                 for rec in fut.result():
                     pairs[(rec["warrant_code"], rec["broker_code"])] = rec
-            except Exception:
-                pass
+            except Exception as e:
+                _record_api_fetch("api4", "failed", error=f"future {w.get('代號', '')}｜{e}")
             if i % 100 == 0:
                 print(f"  API4 {i:,}/{len(warrants):,}，pairs={len(pairs):,}")
+    print_api_fetch_stats("api4", "API4")
+    abort_if_api_failure_too_high("api4", "API4")
     pair_list = list(pairs.values())
     if MAX_PAIRS > 0:
         pair_list = pair_list[:MAX_PAIRS]
@@ -1002,7 +1624,7 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
                 continue
             out.append({
                 "Date": pd.Timestamp(dt).normalize(),
-                "branch": p["branch"],
+                "branch": normalize_branch_name(p.get("branch", "")),
                 "broker_code": p["broker_code"],
                 "warrant_code": p["warrant_code"],
                 "warrant_name": p["warrant_name"],
@@ -1016,16 +1638,20 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
             })
         return out
 
+    reset_api_fetch_stats("api5")
     print(f"💰 API5 回查買賣金額：{len(pair_list):,} 組，workers={API5_WORKERS}")
     with ThreadPoolExecutor(max_workers=max(1, API5_WORKERS)) as ex:
         futures = {ex.submit(fetch_one, p): p for p in pair_list}
         for i, fut in enumerate(as_completed(futures), 1):
+            p = futures.get(fut, {})
             try:
                 rows.extend(fut.result())
-            except Exception:
-                pass
+            except Exception as e:
+                _record_api_fetch("api5", "failed", error=f"future {p.get('warrant_code', '')}/{p.get('broker_code', '')}｜{e}")
             if i % 200 == 0:
                 print(f"  API5 {i:,}/{len(pair_list):,}，events={len(rows):,}")
+    print_api_fetch_stats("api5", "API5")
+    abort_if_api_failure_too_high("api5", "API5")
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -1038,13 +1664,24 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
 
 
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
-    # 先讀既有快取，速度最快；再用 live 補足最新全分點資料。
+    # 優先讀 Google Sheet 完整快照；只有狀態表標記 complete 且 API4/API5 失敗數為 0 才會直接使用。
+    gsheet_snapshot = load_gsheet_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
+    if gsheet_snapshot is not None and not gsheet_snapshot.empty:
+        return gsheet_snapshot
+
+    # 保留本機快照相容舊流程，但預設關閉；若使用，仍排在 Google Sheet 完整快照之後。
+    local_snapshot = load_local_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
+    if local_snapshot is not None and not local_snapshot.empty:
+        return local_snapshot
+
+    # 既有 Google Sheet 歷史列只作 live 合併備援；沒有完整狀態紀錄時，不會直接當作完整快照。
     cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
     frames = []
     if not cached.empty:
         frames.append(cached)
-        print(f"☁️ Google Sheet 快取_分點歷史命中：{len(cached):,} 筆")
+        print(f"☁️ Google Sheet {GSHEET_WARRANT_HISTORY_SHEET} 既有歷史列命中：{len(cached):,} 筆，將與 100% live 資料合併去重")
 
+    live_fetched = False
     if LIVE_FETCH_ENABLE:
         end_dt = pd.Timestamp(end_date).to_pydatetime()
         start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
@@ -1052,6 +1689,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         warrants = get_all_active_call_warrants(stock_code, stock_name)
         pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
         live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
+        live_fetched = True
         if not live.empty:
             frames.append(live)
             print(f"🌐 Live 權證全分點資料：{len(live):,} 筆")
@@ -1064,7 +1702,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         events[c] = pd.to_numeric(events[c], errors="coerce").fillna(0.0)
     events["Date"] = pd.to_datetime(events["Date"]).dt.normalize()
     events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
-    events["branch"] = events["branch"].astype(str).str.strip()
+    events["branch"] = events["branch"].map(normalize_branch_name)
     events["broker_code"] = events["broker_code"].astype(str).str.strip()
     # 合併 live/cache 重複資料
     group_cols = ["Date", "broker_code", "branch", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]
@@ -1075,7 +1713,14 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     })
     events = events[(events["buy_amount"] > 0) | (events["sell_amount"] > 0) | (events["net_amount"].abs() > 0)].copy()
     events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
-    return events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    # 只有本次真的完成 live 抓取，且 API4/API5 皆 100% 無 failed，才寫回 Google Sheet 完整快照。
+    if live_fetched:
+        save_gsheet_warrant_events_snapshot(stock_code, stock_name, events, start_date=start_date, end_date=end_date)
+        save_local_warrant_events_snapshot(stock_code, events, start_date=start_date, end_date=end_date)
+
+    return events
 
 
 # ============================================================
@@ -1165,7 +1810,7 @@ def filter_out_cross_broker_offset_trades(
     e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
     e["net_amount"] = pd.to_numeric(e["net_amount"], errors="coerce").fillna(0.0).astype(float)
     e["broker_code"] = e["broker_code"].astype(str).str.strip()
-    e["branch"] = e["branch"].astype(str).str.strip()
+    e["branch"] = e["branch"].map(normalize_branch_name)
     e["warrant_code"] = e["warrant_code"].astype(str).str.strip()
 
     remove_idx = set()
@@ -1228,9 +1873,7 @@ def filter_out_cross_broker_offset_trades(
 
 def _normalize_branch_for_head_office_check(branch_name: str) -> str:
     """將分點名稱正規化，用於判斷是否為券商總公司型分點。"""
-    s = str(branch_name or "").strip()
-    s = s.replace("（", "(").replace("）", ")")
-    s = re.sub(r"[\s　\-_－—–]+", "", s)
+    s = normalize_branch_name(branch_name)
     s = s.replace("股份有限公司", "").replace("有限公司", "")
     return s
 
@@ -1414,6 +2057,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         plot_events = week_events.copy()
     else:
         e = warrant_events.copy()
+        if "branch" in e.columns:
+            e["branch"] = e["branch"].map(normalize_branch_name)
         e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
         # 預設只偵測疑似造市 / 避險對沖，不直接刪除，避免把大額主力單誤刪。
         # 標記門檻：8%；若主動啟用刪除，才用更嚴格的 3%。
@@ -1477,6 +2122,8 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     if week_events is None or week_events.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
     e = week_events.copy()
+    if "branch" in e.columns:
+        e["branch"] = e["branch"].map(normalize_branch_name)
     if CROSS_BROKER_OFFSET_FILTER_ENABLE:
         e, offset_removed = filter_out_cross_broker_offset_trades(
             e,
@@ -1487,7 +2134,7 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
         if offset_removed > 0:
             print(f"🧹 TOP5 已排除疑似對手單 / 換手單：{offset_removed:,} 筆")
 
-    e["branch"] = e["branch"].replace("", "未知分點")
+    e["branch"] = e["branch"].map(normalize_branch_name).replace("", "未知分點")
 
     if TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE and not e.empty:
         head_office_mask = e["branch"].map(is_top5_head_office_branch)
@@ -2859,9 +3506,26 @@ def _is_retryable_gemini_error(err) -> bool:
     return any(k in err_text for k in retry_keywords)
 
 
-def _call_gemini_with_retry(prompt: str):
+def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str = "", stock_name: str = ""):
     if not GEMINI_ENABLE:
+        print("ℹ️ Gemini 已關閉，改用規則式摘要 / 既有資料流程")
         return None
+
+    # 第一優先：Google Sheet 每日快取。
+    # 同股票、同任務、同模型、同一天只要跑過一次，當天再跑就不會重打 Gemini。
+    cached_text = load_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt) if cache_task and stock_code else ""
+    if cached_text:
+        save_llm_cache(prompt, cached_text)
+        return cached_text
+
+    # 第二優先：本機 prompt hash 快取。
+    # 若本機命中，也順便補寫 Google Sheet，讓下次不同 runner 也能直接命中。
+    cached_text = load_llm_cache(prompt)
+    if cached_text:
+        if cache_task and stock_code:
+            save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, cached_text)
+        return cached_text
+
     if genai is None:
         print("⚠️ 未安裝 google-genai，無法使用 Gemini 摘要；將改用規則式摘要")
         return None
@@ -2879,7 +3543,11 @@ def _call_gemini_with_retry(prompt: str):
                 model=GEMINI_MODEL,
                 contents=prompt,
             )
-            return response.text or ""
+            output_text = response.text or ""
+            save_llm_cache(prompt, output_text)
+            if cache_task and stock_code:
+                save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, output_text)
+            return output_text
         except Exception as e:
             last_error = e
             if _is_retryable_gemini_error(e) and attempt < GEMINI_RETRY_TIMES:
@@ -2983,7 +3651,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     print(f"模型：{GEMINI_MODEL}")
     print(f"送入 Gemini 的文章數：{len(usable_articles)}")
     print("=" * 100)
-    output_text = _call_gemini_with_retry(prompt)
+    output_text = _call_gemini_with_retry(prompt, cache_task="news_points", stock_code=stock_code, stock_name=stock_name)
     points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
     if points:
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
@@ -3016,7 +3684,7 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
     warrant_rows = []
     if week_events is not None and not week_events.empty:
         e = week_events.copy()
-        e["branch"] = e["branch"].replace("", "未知分點")
+        e["branch"] = e["branch"].map(normalize_branch_name).replace("", "未知分點")
         by_branch = e.groupby("branch", as_index=False)["net_amount"].sum().sort_values("net_amount", ascending=False)
         for _, r in by_branch.head(5).iterrows():
             branch_rows.append({"branch": str(r["branch"]), "net": fmt_money(float(r["net_amount"]))})
@@ -3100,7 +3768,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 以下是本週資料 JSON：
 {payload_json}
 """
-        output_text = _call_gemini_with_retry(prompt)
+        output_text = _call_gemini_with_retry(prompt, cache_task="weekly_keypoints", stock_code=str(ctx.get("stock_code", "") or ""), stock_name=stock_name)
         points = _parse_weekly_gemini_points(output_text or "")
         if points:
             print(f"✅ Gemini 本週重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
@@ -4067,3 +4735,56 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
 def generate_k_chart(stock_code: str) -> io.BytesIO:
     """保留相容舊呼叫。"""
     return generate_warrant_report(stock_code)
+
+# ============================================================
+# GitHub Actions 手動執行入口
+# ============================================================
+
+def _send_discord_file(webhook_url: str, file_path: str, content: str = ""):
+    if not webhook_url or not file_path or not os.path.exists(file_path):
+        return
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "image/png")}
+            data = {"content": content or os.path.basename(file_path)}
+            resp = requests.post(webhook_url, data=data, files=files, timeout=(8, 40))
+            resp.raise_for_status()
+        print(f"✅ Discord 測試頻道已送出：{file_path}")
+    except Exception as e:
+        print(f"⚠️ Discord 測試頻道送出失敗：{e}")
+
+
+def main():
+    output_dir = os.getenv("OUTPUT_DIR", "output").strip() or "output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw_codes = os.getenv("STOCK_CODES", "2408").strip() or "2408"
+    stock_codes = [c.strip() for c in re.split(r"[,，\s]+", raw_codes) if c.strip()]
+    if not stock_codes:
+        stock_codes = ["2408"]
+
+    print(f"📌 本次執行股票：{', '.join(stock_codes)}")
+    print(f"📌 Gemini 開關：WARRANT_GEMINI_ENABLE={os.getenv('WARRANT_GEMINI_ENABLE', '')}")
+    print(f"📌 新聞開關：WARRANT_NEWS_ENABLE={os.getenv('WARRANT_NEWS_ENABLE', '')}")
+    print(f"📌 權證快照：enable={os.getenv('WARRANT_LOCAL_CACHE_ENABLE', '')}｜force_refresh={os.getenv('WARRANT_LOCAL_CACHE_FORCE_REFRESH', '')}｜dir={LOCAL_WARRANT_CACHE_DIR}")
+
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "").strip()
+    ok_count = 0
+    for stock_code in stock_codes:
+        buf = generate_warrant_report(stock_code)
+        if buf is None:
+            print(f"❌ {stock_code} 報告產生失敗")
+            continue
+        out_path = os.path.join(output_dir, f"{stock_code}_warrant_report.png")
+        with open(out_path, "wb") as f:
+            f.write(buf.getvalue())
+        ok_count += 1
+        print(f"✅ 已輸出圖片：{out_path}")
+        _send_discord_file(webhook_url, out_path, content=f"{stock_code} 權證資金流週報測試")
+
+    if ok_count <= 0:
+        raise SystemExit("沒有任何報告成功產生")
+
+
+if __name__ == "__main__":
+    main()
