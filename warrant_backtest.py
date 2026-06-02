@@ -5241,39 +5241,69 @@ def _top15_return_event_date(ev, is_a=False):
     return normalize_date_str(ev.get("事件日") or ev.get("結束日") or ev.get("起始日") or "")
 
 
-def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, recent_dates):
+def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, recent_dates, item_map=None):
     """
     將近 N 個有效事件交易日內的 A/B/C/D 買超事件轉成可計算未實現報酬率的 lot。
 
-    注意：
-    - A 是單檔權證事件。
-    - B/C/D 是同標的群組事件，因此拆成每一檔權證 lot。
-    - 後續會再依原始分點歷史資料扣掉事件日之後的賣出股數，得到目前剩餘部位。
+    定義：
+    - 這裡只看「近 N 個有效事件交易日內」被 A/B/C/D 納入的權證部位。
+    - 報酬率要表達的是：這批近 N 日買進後，持有到目前的帳面報酬。
+    - A 直接使用原本單檔買進毛額。
+    - B/C/D 優先回到 item_map 的原始逐日資料抓「毛買進金額 / 毛買進股數」建立 lot；
+      後續賣出一律交給 apply_sales_to_top15_return_lots() 統一扣減。
+      這樣報酬率就是「當時實際買進均價 vs 目前權證價格」，不會用淨額先扣一次又再扣賣出。
     """
     date_set = set(recent_dates or [])
     lots = []
+    item_map = item_map or {}
+
+    def _find_item(broker_code, warrant_code):
+        broker_code = str(broker_code or "").strip()
+        warrant_code = str(warrant_code or "").strip()
+
+        if not broker_code or not warrant_code:
+            return None
+
+        candidates = []
+        for wc in [
+            warrant_code,
+            normalize_warrant_code_for_unique(warrant_code),
+            normalize_price_code(warrant_code),
+        ]:
+            wc = str(wc or "").strip()
+            if wc and wc not in candidates:
+                candidates.append(wc)
+
+        for wc in candidates:
+            item = item_map.get((broker_code, wc))
+            if item:
+                return item
+
+        return None
 
     def add_lot(
         event_code, event_type, broker_label, broker_name, broker_code,
-        underlying_code, underlying_name, event_date, warrant_code, warrant_name,
-        buy_amount, buy_qty, source_text
+        underlying_code, underlying_name, event_date, buy_date,
+        warrant_code, warrant_name, buy_amount, buy_qty, source_text
     ):
         event_date = normalize_date_str(event_date)
+        buy_date = normalize_date_str(buy_date or event_date)
 
         if not event_date or event_date not in date_set:
-            return
+            return False
 
         warrant_code = normalize_warrant_code_for_unique(warrant_code)
         buy_amount = float(buy_amount or 0)
         buy_qty = float(buy_qty or 0)
 
         if not warrant_code or buy_amount <= 0 or buy_qty <= 0:
-            return
+            return False
 
         lots.append({
             "事件": event_code,
             "事件類型": event_type,
             "事件日": event_date,
+            "買進日": buy_date,
             "分點": str(broker_label or "").strip(),
             "分點名稱": str(broker_name or "").strip(),
             "券商代號": str(broker_code or "").strip(),
@@ -5287,6 +5317,68 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
             "剩餘成本": buy_amount,
             "來源": source_text,
         })
+        return True
+
+    def add_group_lots_from_history(event_code, event_type, ev, lot, event_date, start_date, end_date):
+        """
+        B/C/D TOP15 報酬率用毛買進資料建立 lot。
+        回傳 True 代表已成功用原始流水建立；False 則外層可退回舊欄位資料。
+        """
+        event_date = normalize_date_str(event_date)
+        if not event_date or event_date not in date_set:
+            return False
+
+        warrant_code = normalize_warrant_code_for_unique(lot.get("權證代號", ""))
+        if not warrant_code:
+            return False
+
+        start_date = normalize_date_str(start_date or event_date)
+        end_date = normalize_date_str(end_date or start_date)
+
+        item = _find_item(ev.get("券商代號", ""), warrant_code)
+        if not item:
+            return False
+
+        df = item.get("df", pd.DataFrame())
+        if df is None or df.empty:
+            return False
+
+        added = False
+        df2 = df.copy()
+        df2["日期"] = df2["日期"].map(normalize_date_str)
+        df2 = df2.sort_values("日期").reset_index(drop=True)
+
+        for row in df2.itertuples(index=False):
+            row_dict = row._asdict()
+            buy_date = normalize_date_str(row_dict.get("日期", ""))
+
+            if not buy_date or buy_date < start_date or buy_date > end_date:
+                continue
+
+            buy_qty = float(row_dict.get("買進股數", 0) or 0)
+            buy_amount = float(row_dict.get("買進金額", 0) or 0)
+
+            if buy_qty <= 0 or buy_amount <= 0:
+                continue
+
+            added = add_lot(
+                event_code,
+                event_type,
+                ev.get("分點", ""),
+                ev.get("分點名稱", ""),
+                ev.get("券商代號", ""),
+                ev.get("標的股", ""),
+                ev.get("標的名稱", ""),
+                event_date,
+                buy_date,
+                warrant_code,
+                lot.get("權證名稱", ""),
+                buy_amount,
+                buy_qty,
+                f'{event_code} | {buy_date} | {warrant_code} {lot.get("權證名稱", "")}',
+            ) or added
+
+        return added
 
     for ev in a_events:
         event_date = _top15_return_event_date(ev, is_a=True)
@@ -5298,6 +5390,7 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
             ev.get("券商代號", ""),
             ev.get("標的股", ""),
             ev.get("標的名稱", ""),
+            event_date,
             event_date,
             ev.get("權證代號", ""),
             ev.get("權證名稱", ""),
@@ -5312,6 +5405,30 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
             event_type = ev.get("事件類型", f"{event_code}-事件")
 
             for lot in ev.get("lots", []):
+                if event_code == "D":
+                    # D 是近 N 日累積事件，報酬率要用該 D 視窗內的實際毛買進流水。
+                    buy_start_date = ev.get("起始日") or lot.get("買進日") or event_date
+                    buy_end_date = ev.get("結束日") or event_date
+                else:
+                    # B/C 的 lot 本身已有實際買進日，直接抓該日毛買進流水。
+                    buy_start_date = lot.get("買進日") or ev.get("事件日") or ev.get("結束日") or event_date
+                    buy_end_date = buy_start_date
+
+                used_history = add_group_lots_from_history(
+                    event_code,
+                    event_type,
+                    ev,
+                    lot,
+                    event_date,
+                    buy_start_date,
+                    buy_end_date,
+                )
+
+                if used_history:
+                    continue
+
+                # 備援：若 item_map 找不到原始流水，才沿用事件內既有 lot 金額。
+                # 這個分支正常情況很少用到，保留是避免舊快取缺資料時整批報酬率消失。
                 add_lot(
                     event_code,
                     event_type,
@@ -5321,6 +5438,7 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
                     ev.get("標的股", ""),
                     ev.get("標的名稱", ""),
                     event_date,
+                    lot.get("買進日") or event_date,
                     lot.get("權證代號", ""),
                     lot.get("權證名稱", ""),
                     lot.get("金額", 0),
@@ -5331,14 +5449,16 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
     return lots
 
 
+
 def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
     """
-    依照原始分點歷史資料，把事件日之後的賣出股數扣掉，得到目前剩餘部位。
+    依照原始分點歷史資料，把近 N 日事件 lot 買進日之後的賣出股數扣掉，得到目前剩餘部位。
 
     扣減邏輯：
-    - 同一分點 + 同一權證代號的 lot 依事件日 FIFO 扣。
-    - 只扣「賣出日 > 事件日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
+    - 同一分點 + 同一權證代號的 lot 依「買進日」FIFO 扣。
+    - 只扣「賣出日 > 買進日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
     - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
+    - 這裡不回溯計算 22 日以前舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
     """
     if not position_lots:
         return position_lots
@@ -5357,13 +5477,16 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
         item = item_map.get((broker_code, warrant_code))
 
         if not item:
+            item = item_map.get((broker_code, normalize_price_code(warrant_code)))
+
+        if not item:
             continue
 
         df = item.get("df", pd.DataFrame())
         if df is None or df.empty:
             continue
 
-        lots.sort(key=lambda x: (x.get("事件日", ""), x.get("權證代號", "")))
+        lots.sort(key=lambda x: (x.get("買進日", "") or x.get("事件日", ""), x.get("事件日", ""), x.get("權證代號", "")))
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
         df2 = df2.sort_values("日期").reset_index(drop=True)
@@ -5384,8 +5507,8 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
                 if sell_qty_left <= 0:
                     break
 
-                event_dt = parse_date(lot.get("事件日", ""))
-                if not event_dt or sell_dt <= event_dt:
+                buy_dt = parse_date(lot.get("買進日") or lot.get("事件日", ""))
+                if not buy_dt or sell_dt <= buy_dt:
                     continue
 
                 remaining_qty = float(lot.get("剩餘股數", 0) or 0)
@@ -5405,6 +5528,7 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
                 sell_qty_left -= alloc_qty
 
     return position_lots
+
 
 
 def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
@@ -5514,11 +5638,13 @@ def build_top15_return_cache_rows(a_events, b_events, c_events, d_events, item_m
         print("  ⚠️ TOP15分點報酬率快取：沒有可用事件日期")
         return []
 
-    target_date = max(recent_dates)
+    # 統計期間仍以近 N 個有效事件交易日為準；
+    # 但估值日改用執行程式當天，讓報酬率代表「當時買進 → 目前執行當下」的帳面報酬。
+    target_date = normalize_date_str(datetime.today().strftime("%Y/%m/%d"))
     period_text = f"{min(recent_dates)} ～ {max(recent_dates)}"
 
     position_lots = collect_top15_return_position_lots(
-        a_events, b_events, c_events, d_events, recent_dates
+        a_events, b_events, c_events, d_events, recent_dates, item_map=item_map
     )
 
     if not position_lots:
