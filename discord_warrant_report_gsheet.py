@@ -430,20 +430,77 @@ def fmt_return_pct(v) -> str:
         return "-"
 
 
-def fmt_optional_return_pct(v) -> str:
+def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tuple[str, str], float]:
     """
-    TOP15 分點報酬率顯示用。
-    None 代表快取沒有資料，直接顯示 -，避免誤導成 0%。
+    讀取 Google Sheet「快取_TOP15分點報酬率」，回傳：
+        {(標的代號, 分點): 報酬率百分比數值}
+
+    支援欄位（主程式快取版）：
+    - 統計日期 / 日期 / 目標日期
+    - 分點
+    - 標的股 或 標的
+    - 報酬率 或 報酬率文字
     """
-    try:
-        if v is None or v == "":
-            return "-"
-        pct = safe_float(v, None)
+    needed_cols = [
+        "統計日期", "日期", "目標日期",
+        "分點", "標的股", "標的",
+        "報酬率", "報酬率文字",
+    ]
+
+    df = read_gsheet_table_optional(SHEET_TOP15_RETURN_CACHE, needed_cols)
+    if df.empty:
+        return {}
+
+    def pick_cache_date(row):
+        for col in ["統計日期", "日期", "目標日期"]:
+            d = parse_date_value(row.get(col))
+            if d:
+                return d
+        return None
+
+    available_dates = []
+    for _, r in df.iterrows():
+        d = pick_cache_date(r)
+        if d:
+            available_dates.append(d)
+
+    chosen_date = None
+    if available_dates:
+        if target is not None:
+            valid = [d for d in available_dates if d <= target]
+            chosen_date = max(valid) if valid else max(available_dates)
+        else:
+            chosen_date = max(available_dates)
+
+    result: dict[tuple[str, str], float] = {}
+    for _, r in df.iterrows():
+        row_date = pick_cache_date(r)
+        if chosen_date and row_date and row_date != chosen_date:
+            continue
+
+        broker = str(r.get("分點", "")).strip()
+        if broker not in TRACKED_BROKERS:
+            continue
+
+        underlying = normalize_underlying(r.get("標的股", ""), r.get("標的", ""))
+        if not underlying:
+            target_text = strip_gsheet_text_prefix(r.get("標的", ""))
+            m = re.match(r"^(\d{1,4})", target_text)
+            if m:
+                underlying = normalize_underlying(m.group(1), target_text)
+
+        if not underlying:
+            continue
+
+        pct = normalize_return_pct(r.get("報酬率"))
         if pct is None:
-            return "-"
-        return f"{pct:+.1f}%"
-    except Exception:
-        return "-"
+            pct = normalize_return_pct(r.get("報酬率文字"))
+        if pct is None:
+            continue
+
+        result[(underlying, broker)] = pct
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -608,107 +665,6 @@ def read_history_stats_from_gsheet() -> dict:
             }
 
     return result
-
-
-def read_top15_return_cache_from_gsheet(target: date) -> dict[str, dict[str, dict]]:
-    """
-    讀取主程式已經算好並寫入 Google Sheet 的「快取_TOP15分點報酬率」。
-
-    圖片程式只負責讀快取，不再重新抓權證現價或自行重算報酬率。
-    """
-    needed_cols = [
-        "統計日期", "日期", "統計期間",
-        "分點", "標的股", "標的", "標的代號", "標的股代號",
-        "淨買超成本", "可估成本", "缺價格成本", "目前市值", "未實現損益",
-        "報酬率", "報酬率文字", "價格覆蓋率", "權證檔數", "最新價格日期", "權證清單",
-    ]
-
-    df = read_gsheet_table_optional(SHEET_TOP15_RETURN_CACHE, needed_cols)
-    if df.empty:
-        print(f"  ⚠️ 找不到或讀不到 TOP15 分點報酬率快取：{SHEET_TOP15_RETURN_CACHE}")
-        return {}
-
-    if "分點" not in df.columns:
-        print("  ⚠️ TOP15 分點報酬率快取缺少欄位：分點")
-        return {}
-
-    # 優先使用與 target 相同或小於 target 的最新統計日期。
-    date_col = "統計日期" if "統計日期" in df.columns else "日期" if "日期" in df.columns else ""
-    if date_col:
-        df = df.copy()
-        df["__cache_date"] = df[date_col].map(parse_date_value)
-        valid_dates = sorted({d for d in df["__cache_date"].tolist() if d and d <= target})
-
-        if valid_dates:
-            use_date = valid_dates[-1]
-            df = df[df["__cache_date"] == use_date].copy()
-            if use_date != target:
-                print(
-                    f"  ⚠️ TOP15 分點報酬率快取日期為 {use_date:%Y-%m-%d}，"
-                    f"目標日期為 {target:%Y-%m-%d}，將使用最新可用快取。"
-                )
-        else:
-            parsed_count = sum(1 for d in df["__cache_date"].tolist() if d)
-            if parsed_count > 0:
-                print("  ⚠️ TOP15 分點報酬率快取沒有 <= 目標日期的資料，將嘗試使用整張快取表。")
-
-    def get_first_existing(row, candidates):
-        for c in candidates:
-            if c in row.index:
-                v = strip_gsheet_text_prefix(row.get(c, ""))
-                if str(v).strip() not in ("", "-"):
-                    return v
-        return ""
-
-    result: dict[str, dict[str, dict]] = defaultdict(dict)
-
-    for _, r in df.iterrows():
-        broker = str(r.get("分點", "")).strip()
-        if broker not in TRACKED_BROKERS:
-            continue
-
-        underlying_raw = get_first_existing(r, ["標的股", "標的股代號", "標的代號", "標的"])
-        warrant_text = r.get("權證清單", "") if "權證清單" in r.index else ""
-
-        # 快取表的標的欄位可能是「2376」也可能是「2376 技嘉」，
-        # 這裡先把開頭代號取出來，避免圖片 TOP15 的 item["underlying"] 對不到快取。
-        underlying_text = str(underlying_raw).strip()
-        m = re.match(r"^'?([0-9]{4,6})(?:\.0)?(?:\s|　|$)", underlying_text)
-        if m:
-            underlying_raw = m.group(1)
-
-        underlying = normalize_underlying(underlying_raw, warrant_text)
-        if not underlying:
-            continue
-
-        return_text = get_first_existing(r, ["報酬率文字"])
-        return_pct = None
-        if "報酬率" in r.index:
-            return_pct = normalize_return_pct(r.get("報酬率"))
-        if return_pct is None and return_text:
-            return_pct = normalize_return_pct(return_text)
-
-        if return_text in ("", "-") and return_pct is not None:
-            return_text = fmt_optional_return_pct(return_pct)
-
-        cost = safe_float(get_first_existing(r, ["淨買超成本", "可估成本"]), 0)
-        coverage = get_first_existing(r, ["價格覆蓋率"])
-
-        old = result[underlying].get(broker)
-        # 若同一分點 + 標的在快取表中重複，保留淨買超成本較大的那筆。
-        if old and safe_float(old.get("cost"), 0) > cost:
-            continue
-
-        result[underlying][broker] = {
-            "return_pct": return_pct,
-            "return_text": return_text if return_text else "-",
-            "cost": cost,
-            "coverage": coverage,
-        }
-
-    total_rows = sum(len(v) for v in result.values())
-    print(f"  ✅ 已讀取 TOP15 分點報酬率快取：{SHEET_TOP15_RETURN_CACHE}，可用 {total_rows:,} 筆")
-    return dict(result)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2557,7 +2513,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         except Exception:
             pass
 
-    broker_return_cache_by_underlying = read_top15_return_cache_from_gsheet(target)
+    top15_return_cache = read_top15_return_cache_from_gsheet(target)
 
     rows = []
     for item in agg.values():
@@ -2571,12 +2527,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
 
         participant_brokers = [
-            (
-                broker,
-                amount,
-                broker_return_cache_by_underlying.get(item["underlying"], {}).get(broker, {}).get("return_pct"),
-                broker_return_cache_by_underlying.get(item["underlying"], {}).get(broker, {}).get("return_text", "-"),
-            )
+            (broker, amount, top15_return_cache.get((item["underlying"], broker)))
             for broker, amount in item["broker_net_amounts"].items()
             if amount > 0
         ]
@@ -2682,33 +2633,75 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
-    def fmt_participant_brokers(row, limit=4):
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def measure_text_width(s, size=14, fp=None):
+        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
+        bb = ghost.get_window_extent(renderer=renderer)
+        ghost.remove()
+        x0_disp, y0_disp = ax.transData.transform((0, 0))
+        x1_disp = x0_disp + bb.width
+        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
+        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
+        return x1_data - x0_data
+
+    def build_participant_broker_items(row, limit=5):
         """
-        顯示參與分點的淨累積買超金額與快取中的目前報酬率。
-        格式：分點 淨成本 / 報酬率。
+        顯示所有參與分點的淨累積買超金額與快取報酬率。
+        回傳 [(broker, amount, return_pct), ...]。
         """
         items = row.get("participant_brokers", [])
         if not items:
             top_broker = row.get("top_broker", "")
             top_amount = row.get("top_broker_amount", 0)
-            return fit(f"{top_broker} {fmt_wan(top_amount)} / -", 30)
+            return [(top_broker, top_amount, None)], False
 
         shown = items[:limit]
-        text_items = []
-        for item in shown:
+        has_more = len(items) > limit
+        return shown, has_more
+
+    def draw_participant_brokers_cell(x_left, y_center, row, cell_w, size=14):
+        items, has_more = build_participant_broker_items(row, limit=5)
+        cur_x = x_left + 0.12
+        max_x = x_left + cell_w - 0.12
+
+        def draw_piece(piece_text, piece_color):
+            nonlocal cur_x
+            piece_text = str(piece_text)
+            if not piece_text:
+                return True
+            w = measure_text_width(piece_text, size=size, fp=BOLD)
+            if cur_x + w > max_x:
+                ellipsis = "…"
+                ell_w = measure_text_width(ellipsis, size=size, fp=BOLD)
+                if cur_x + ell_w <= max_x:
+                    text(cur_x, y_center, ellipsis, size, TEXT, BOLD, ha="left")
+                return False
+            text(cur_x, y_center, piece_text, size, piece_color, BOLD, ha="left")
+            cur_x += w
+            return True
+
+        for idx, item in enumerate(items):
             broker = item[0]
             amount = item[1] if len(item) > 1 else 0
             return_pct = item[2] if len(item) > 2 else None
-            return_text = item[3] if len(item) > 3 else ""
-            if return_text and str(return_text).strip() not in ("", "-"):
-                ret_display = str(return_text).strip()
-            else:
-                ret_display = fmt_optional_return_pct(return_pct)
-            text_items.append(f"{broker} {fmt_wan(amount)} / {ret_display}")
 
-        if len(items) > limit:
-            text_items.append(f"等{len(items)}家")
-        return fit("、".join(text_items), 42)
+            prefix = f"{broker} {fmt_wan(amount)} / "
+            if not draw_piece(prefix, TEXT):
+                return
+
+            ret_text = fmt_return_pct(return_pct)
+            ret_color = RED if safe_float(return_pct, 0) > 0 else GREEN if safe_float(return_pct, 0) < 0 else TEXT
+            if not draw_piece(ret_text, ret_color):
+                return
+
+            if idx < len(items) - 1:
+                if not draw_piece("、", TEXT):
+                    return
+
+        if has_more:
+            draw_piece(f"、等{len(row.get('participant_brokers', []))}家", TEXT)
 
     # 中央浮水印
     try:
@@ -2733,7 +2726,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率讀取快取", 12.5, TEXT, BOLD)
+    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率讀取快取", 13, TEXT, BOLD)
 
     # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
     y -= 0.28
@@ -2764,8 +2757,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨買成本", "家數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.65, 1.85, 1.75, 0.70, 0.95, 6.30]
+    headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
+    col_w = [0.70, 2.15, 1.95, 0.90, 1.00, 5.50]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -2793,7 +2786,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
                 r["events"],
-                fmt_participant_brokers(r),
+                None,
             ]
 
             colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
@@ -2801,7 +2794,12 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             bolds = [True, True, True, True, True, True]
 
             x = margin_x
-            for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
+            for col_idx, (val, w, c, a, is_bold) in enumerate(zip(values, col_w, colors, aligns, bolds)):
+                if col_idx == len(values) - 1:
+                    draw_participant_brokers_cell(x, ry + row_h / 2, r, w, size=14)
+                    x += w
+                    continue
+
                 px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                 text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
