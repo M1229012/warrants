@@ -855,30 +855,76 @@ def get_macd_signals(df):
 
 def _to_lots(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
-    # FinMind 有時是股數、有時是張；若數值明顯偏大，轉成張。
+    # 舊版相容函式：只用在單一欄位備援。三大法人主流程請使用 _convert_inst_amounts_to_lots，
+    # 避免外資 / 投信被轉成張，但數值較小的自營商仍停留在股。
     if s.abs().median(skipna=True) > 50000:
         return s / 1000.0
     return s
 
 
-def _classify_finmind_inst_name(name) -> str:
-    """將 FinMind 三大法人分類名稱統一成 foreign / invest / dealer。
+def _convert_inst_amounts_to_lots(amount_df: pd.DataFrame, source_label: str = "三大法人") -> pd.DataFrame:
+    """將外資 / 投信 / 自營商統一轉成張。
 
-    注意：FinMind 的資料常會把自營商拆成 Dealer_self / Dealer_Hedging。
-    圖表右上角三大法人要對齊一般網站的「外資、投信、自營商自行買賣」口徑，
-    因此這裡排除 Dealer_Hedging / 自營商避險，避免權證或衍生性商品避險部位被誤算成自營商大買。
+    FinMind TaiwanStockInstitutionalInvestorsBuySell 的買賣超常以「股」為單位。
+    若逐欄判斷，外資 / 投信通常會因量級大而 /1000，但自營商自行買賣量級小，
+    可能沒有被 /1000，導致圖上自營商被放大 1000 倍。
+
+    因此這裡改用同一份資料中三類法人的最大量級決定單位倍率，
+    再讓 foreign / invest / dealer 三欄套用同一倍率。
+    """
+    if amount_df is None or amount_df.empty:
+        return pd.DataFrame()
+
+    out = amount_df.copy()
+    cols = [c for c in ["foreign", "invest", "dealer"] if c in out.columns]
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
+
+    medians = {}
+    for c in cols:
+        non_zero = out[c].abs().replace(0, np.nan)
+        medians[c] = non_zero.median(skipna=True)
+
+    valid_medians = [float(v) for v in medians.values() if pd.notna(v)]
+    ref_median = max(valid_medians) if valid_medians else 0.0
+    unit_div = 1000.0 if ref_median > 50000 else 1.0
+
+    for c in cols:
+        out[c] = out[c] / unit_div
+
+    print(f"🔎 {source_label} 單位換算：ref_median={ref_median:,.0f}｜unit_div={unit_div:.0f}")
+    return out
+
+
+def _classify_finmind_inst_name(name) -> str:
+    """將 FinMind / X_function 長表法人名稱分類。
+
+    自營商特別採保守口徑：
+    - Dealer_self / 自營商自行買賣：視為圖表要顯示的自營商。
+    - Dealer_Hedging / 自營商避險：另外標記，不能直接併入自營商。
+    - Dealer / 自營商 這種泛稱：先視為可能的自營商合計或不明口徑，
+      必須在 _standardize_institutional_long_df 內確認是否能扣掉避險，不能在這裡直接當成自行買賣。
     """
     s = str(name or "").strip().lower()
     if not s:
         return ""
-    if "hedging" in s or "hedge" in s or "避險" in s:
-        return ""
-    if "investment_trust" in s or "投信" in s:
+    compact = _normalize_inst_column_key(s)
+
+    if "investment_trust" in s or "investmenttrust" in compact or "投信" in compact:
         return "invest"
-    if "dealer" in s or "自營" in s:
-        return "dealer"
-    if "foreign" in s or "外資" in s or "陸資" in s:
+    if "foreign" in s or "foreigninvestor" in compact or "外資" in compact or "陸資" in compact:
         return "foreign"
+
+    if "hedging" in s or "hedge" in s or "hedg" in compact or "避險" in compact:
+        if "dealer" in s or "dealer" in compact or "自營" in compact:
+            return "dealer_hedge"
+        return ""
+    if "dealer_self" in s or "dealerself" in compact or "self_dealer" in s or "selfdealer" in compact:
+        return "dealer_self"
+    if ("dealer" in s or "dealer" in compact or "自營" in compact) and ("自行" in compact or "self" in compact):
+        return "dealer_self"
+    if "dealer" in s or "dealer" in compact or "自營" in compact:
+        return "dealer_total"
     return ""
 
 def _pick_existing_col(df: pd.DataFrame, candidates: List[str]) -> str:
@@ -888,15 +934,258 @@ def _pick_existing_col(df: pd.DataFrame, candidates: List[str]) -> str:
     return ""
 
 
+def _normalize_inst_column_key(col) -> str:
+    s = str(col or "").strip().lower()
+    s = html.unescape(s)
+    s = s.replace("臺", "台")
+    s = re.sub(r"[\s　_\-－—–/\\|｜:：,，.。()（）\[\]【】{}｛｝]+", "", s)
+    return s
+
+
+def _pick_existing_col_loose(df: pd.DataFrame, candidates: List[str]) -> str:
+    """比 _pick_existing_col 更寬鬆的欄位尋找，處理括號、空白、全形符號差異。"""
+    exact = _pick_existing_col(df, candidates)
+    if exact:
+        return exact
+    norm_map = {_normalize_inst_column_key(c): c for c in df.columns}
+    for cand in candidates:
+        key = _normalize_inst_column_key(cand)
+        if key in norm_map:
+            return norm_map[key]
+    return ""
+
+
+def _find_institutional_col_by_keywords(
+    df: pd.DataFrame,
+    include_groups: List[List[str]],
+    exclude_keywords: List[str] | None = None,
+) -> str:
+    """依欄位名稱關鍵字尋找法人欄位；include_groups 任一組全命中即符合。"""
+    exclude_keys = [_normalize_inst_column_key(k) for k in (exclude_keywords or []) if str(k or "").strip()]
+    include_keys = [
+        [_normalize_inst_column_key(k) for k in group if str(k or "").strip()]
+        for group in include_groups
+    ]
+    for col in df.columns:
+        key = _normalize_inst_column_key(col)
+        if not key:
+            continue
+        if any(ex and ex in key for ex in exclude_keys):
+            continue
+        for group in include_keys:
+            if group and all(k in key for k in group):
+                return col
+    return ""
+
+
+def _find_dealer_total_col(df: pd.DataFrame) -> str:
+    """只找自營商合計欄位；排除自行買賣與避險欄位。"""
+    exact_candidates = [
+        "自營商", "自營商買賣超", "自營商買賣超股數", "自營商買賣超張數",
+        "dealer", "Dealer", "Dealer買賣超", "Dealer_BuySell",
+    ]
+    col = _pick_existing_col_loose(df, exact_candidates)
+    if col:
+        key = _normalize_inst_column_key(col)
+        if not any(k in key for k in ["自行", "self", "避險", "hedg"]):
+            return col
+    return _find_institutional_col_by_keywords(
+        df,
+        include_groups=[["自營商", "買賣超"], ["dealer"]],
+        exclude_keywords=["自行", "self", "避險", "hedg"],
+    )
+
+
+def _standardize_institutional_long_df(raw: pd.DataFrame, stock_code: str, days: int, source_label: str) -> pd.DataFrame:
+    """處理 FinMind / X_function 原始長表格式。
+
+    自營商採最保守口徑：
+    1. 有 Dealer_self / 自營商自行買賣，就直接採用。
+    2. 若只有 Dealer / 自營商泛稱，但同時有 Dealer_Hedging / 自營商避險，則用「泛稱欄位 - 避險」還原自行買賣。
+    3. 若只有 Dealer / 自營商泛稱，且無法判斷是否含避險，預設不採用該自營商數值，避免再次出現把避險誤算進圖表的問題。
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    date_col = _pick_existing_col_loose(raw, ["date", "Date", "日期"])
+    name_col = _pick_existing_col_loose(raw, [
+        "name", "institutional_investor", "institutional_investors", "investor",
+        "type", "category", "法人", "身份別", "投資人類別",
+    ])
+    net_col = _pick_existing_col_loose(raw, [
+        "net", "buy_sell", "buy_sell_amount", "buy_sell_volume",
+        "買賣超", "買賣超股數", "買賣超張數",
+    ])
+    buy_col = _pick_existing_col_loose(raw, [
+        "buy", "buy_amount", "buy_volume", "買進", "買進股數", "買進張數",
+    ])
+    sell_col = _pick_existing_col_loose(raw, [
+        "sell", "sell_amount", "sell_volume", "賣出", "賣出股數", "賣出張數",
+    ])
+
+    if not date_col or not name_col:
+        return pd.DataFrame()
+
+    tmp = raw.copy()
+    tmp["Date"] = tmp[date_col].map(parse_date)
+    tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+    if tmp["Date"].isna().any():
+        fallback_date = pd.to_datetime(tmp.loc[tmp["Date"].isna(), date_col], errors="coerce")
+        tmp.loc[tmp["Date"].isna(), "Date"] = fallback_date
+    tmp = tmp.dropna(subset=["Date"])
+    tmp["inst_group"] = tmp[name_col].map(_classify_finmind_inst_name)
+    tmp = tmp[tmp["inst_group"].isin(["foreign", "invest", "dealer_self", "dealer_total", "dealer_hedge"])]
+    if tmp.empty:
+        print(f"⚠️ {source_label} 三大法人分類不到外資/投信/自營商：{stock_code}")
+        return pd.DataFrame()
+
+    if net_col:
+        tmp["net_value"] = pd.to_numeric(tmp[net_col], errors="coerce").fillna(0.0)
+    elif buy_col and sell_col:
+        tmp["net_value"] = (
+            pd.to_numeric(tmp[buy_col], errors="coerce").fillna(0.0)
+            - pd.to_numeric(tmp[sell_col], errors="coerce").fillna(0.0)
+        )
+    else:
+        print(f"⚠️ {source_label} 三大法人找不到買賣超或買進/賣出欄位：{raw.columns.tolist()}")
+        return pd.DataFrame()
+
+    grouped = tmp.groupby(["Date", "inst_group"], as_index=False)["net_value"].sum()
+    pivot = grouped.pivot(index="Date", columns="inst_group", values="net_value").fillna(0.0)
+
+    foreign_raw = pivot["foreign"] if "foreign" in pivot.columns else pd.Series(0.0, index=pivot.index)
+    invest_raw = pivot["invest"] if "invest" in pivot.columns else pd.Series(0.0, index=pivot.index)
+
+    if "dealer_self" in pivot.columns:
+        dealer_raw = pivot["dealer_self"]
+        dealer_note = "自營商採用 Dealer_self / 自營商自行買賣"
+    elif "dealer_total" in pivot.columns and "dealer_hedge" in pivot.columns:
+        dealer_raw = pivot["dealer_total"] - pivot["dealer_hedge"]
+        dealer_note = "自營商採用 Dealer / 自營商泛稱扣除 Dealer_Hedging / 自營商避險"
+    elif "dealer_total" in pivot.columns:
+        allow_aggregate = os.getenv("WARRANT_ALLOW_AGGREGATE_DEALER_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+        if allow_aggregate:
+            dealer_raw = pivot["dealer_total"]
+            dealer_note = "⚠️ 自營商使用 Dealer / 自營商泛稱欄位（未確認是否含避險）"
+        else:
+            dealer_raw = pd.Series(0.0, index=pivot.index)
+            dealer_note = "⚠️ 只有 Dealer / 自營商泛稱，無法確認是否含避險；自營商以 0 顯示，避免誤算避險"
+            print(f"⚠️ {source_label} {stock_code} {dealer_note}")
+    else:
+        dealer_raw = pd.Series(0.0, index=pivot.index)
+        dealer_note = "未取得自營商自行買賣資料，自營商以 0 顯示"
+        print(f"⚠️ {source_label} {stock_code} {dealer_note}")
+
+    out = pd.DataFrame(index=pivot.index)
+    out["Date"] = out.index
+    out["foreign"] = pd.to_numeric(foreign_raw, errors="coerce").fillna(0.0).astype(float).values
+    out["invest"] = pd.to_numeric(invest_raw, errors="coerce").fillna(0.0).astype(float).values
+    out["dealer"] = pd.to_numeric(dealer_raw, errors="coerce").fillna(0.0).astype(float).values
+    out = _convert_inst_amounts_to_lots(out, source_label=f"{source_label} 三大法人")
+    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
+    out = out.reset_index(drop=True).sort_values("Date").tail(days).reset_index(drop=True)
+    print(f"✅ {source_label} 三大法人資料：{stock_code}，{len(out):,} 筆｜{dealer_note}")
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
+
+def _standardize_institutional_wide_df(raw: pd.DataFrame, stock_code: str, days: int, source_label: str) -> pd.DataFrame:
+    """處理 X_function 可能回傳的寬表格式；自營商只採自行買賣，不採避險。"""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    date_col = _pick_existing_col_loose(raw, ["date", "Date", "日期"])
+    foreign_col = _pick_existing_col_loose(raw, [
+        "外資", "外資買賣超", "外資買賣超股數", "外資及陸資", "外資及陸資買賣超股數",
+        "foreign", "Foreign", "Foreign_Investor",
+    ]) or _find_institutional_col_by_keywords(
+        raw,
+        include_groups=[["外資"], ["foreign"]],
+        exclude_keywords=["自營", "dealer", "投信", "trust", "避險", "hedg"],
+    )
+    invest_col = _pick_existing_col_loose(raw, [
+        "投信", "投信買賣超", "投信買賣超股數", "investment_trust", "Investment_Trust",
+    ]) or _find_institutional_col_by_keywords(
+        raw,
+        include_groups=[["投信"], ["investment", "trust"]],
+        exclude_keywords=["自營", "dealer", "外資", "foreign", "避險", "hedg"],
+    )
+    dealer_self_col = _pick_existing_col_loose(raw, [
+        "自營商自行買賣", "自營商自行買賣買賣超", "自營商自行買賣買賣超股數",
+        "自營商買賣超股數自行買賣", "自營商(自行買賣)", "自營商-自行買賣",
+        "Dealer_self", "dealer_self", "DealerSelf", "self_dealer",
+    ]) or _find_institutional_col_by_keywords(
+        raw,
+        include_groups=[["自營", "自行"], ["dealer", "self"]],
+        exclude_keywords=["避險", "hedg"],
+    )
+    dealer_hedge_col = _pick_existing_col_loose(raw, [
+        "自營商避險", "自營商避險買賣超", "自營商避險買賣超股數",
+        "自營商買賣超股數避險", "自營商(避險)", "自營商-避險",
+        "Dealer_Hedging", "dealer_hedging", "DealerHedging",
+    ]) or _find_institutional_col_by_keywords(
+        raw,
+        include_groups=[["自營", "避險"], ["dealer", "hedg"]],
+    )
+    dealer_total_col = _find_dealer_total_col(raw)
+
+    if not date_col or not foreign_col or not invest_col:
+        print(f"⚠️ {source_label} 法人資料欄位不符：{raw.columns.tolist()}")
+        return pd.DataFrame()
+
+    if dealer_self_col:
+        dealer_raw = pd.to_numeric(raw[dealer_self_col], errors="coerce").fillna(0.0)
+        dealer_note = f"自營商採用自行買賣欄位：{dealer_self_col}"
+    elif dealer_total_col and dealer_hedge_col:
+        dealer_raw = (
+            pd.to_numeric(raw[dealer_total_col], errors="coerce").fillna(0.0)
+            - pd.to_numeric(raw[dealer_hedge_col], errors="coerce").fillna(0.0)
+        )
+        dealer_note = f"自營商合計扣除避險：{dealer_total_col} - {dealer_hedge_col}"
+    elif dealer_total_col:
+        allow_aggregate = os.getenv("WARRANT_ALLOW_AGGREGATE_DEALER_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+        if allow_aggregate:
+            dealer_raw = pd.to_numeric(raw[dealer_total_col], errors="coerce").fillna(0.0)
+            dealer_note = f"⚠️ 自營商使用合計欄位：{dealer_total_col}（未排除避險）"
+        else:
+            print(
+                f"⚠️ {source_label} 只有自營商合計欄位「{dealer_total_col}」，無法確認是否含避險；"
+                "本次略過 X_function 三大法人備援，避免把 Dealer_Hedging 算進圖表。"
+            )
+            return pd.DataFrame()
+    else:
+        print(f"⚠️ {source_label} 找不到自營商自行買賣欄位，略過三大法人備援：{raw.columns.tolist()}")
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["Date"] = raw[date_col].map(parse_date)
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    if out["Date"].isna().any():
+        fallback_date = pd.to_datetime(raw.loc[out["Date"].isna(), date_col], errors="coerce")
+        out.loc[out["Date"].isna(), "Date"] = fallback_date
+    out = out.dropna(subset=["Date"])
+    if out.empty:
+        print(f"⚠️ {source_label} 日期欄位無法解析：{date_col}")
+        return pd.DataFrame()
+
+    raw2 = raw.loc[out.index].copy()
+    out["foreign"] = pd.to_numeric(raw2[foreign_col], errors="coerce").fillna(0.0).astype(float).values
+    out["invest"] = pd.to_numeric(raw2[invest_col], errors="coerce").fillna(0.0).astype(float).values
+    out["dealer"] = pd.to_numeric(dealer_raw.loc[out.index], errors="coerce").fillna(0.0).astype(float).values
+    out = _convert_inst_amounts_to_lots(out, source_label=f"{source_label} 三大法人備援")
+    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
+    out = out.sort_values("Date").tail(days).reset_index(drop=True)
+    print(f"✅ {source_label} 三大法人備援資料：{stock_code}，{len(out):,} 筆｜{dealer_note}")
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
+
+
 def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
     """
-    直接使用 FINMIND_API_TOKEN 從 FinMind API 抓三大法人買賣超。
+    直接使用 FinMind API 抓三大法人買賣超。
+    若有 FINMIND_API_TOKEN 會帶 token；若沒有 token，仍先嘗試 FinMind 公開 API。
     回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
     """
     token = os.getenv("FINMIND_API_TOKEN", "").strip()
     if not token:
-        print("⚠️ 未設定 FINMIND_API_TOKEN，略過 FinMind 三大法人資料")
-        return pd.DataFrame()
+        print("⚠️ 未設定 FINMIND_API_TOKEN，先嘗試 FinMind 公開 API；若失敗再走 X_function 安全備援")
 
     try:
         end_dt = datetime.today()
@@ -907,12 +1196,14 @@ def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.Dat
             "data_id": str(stock_code).strip(),
             "start_date": start_dt.strftime("%Y-%m-%d"),
             "end_date": end_dt.strftime("%Y-%m-%d"),
-            "token": token,
         }
         headers = {
-            "Authorization": f"Bearer {token}",
             "User-Agent": HDR["User-Agent"],
         }
+        if token:
+            params["token"] = token
+            headers["Authorization"] = f"Bearer {token}"
+
         resp = requests.get(url, params=params, headers=headers, timeout=(8, 30))
         resp.raise_for_status()
         payload = resp.json()
@@ -923,50 +1214,11 @@ def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.Dat
             return pd.DataFrame()
 
         raw = pd.DataFrame(data).fillna(0)
-        date_col = _pick_existing_col(raw, ["date", "Date", "日期"])
-        name_col = _pick_existing_col(raw, ["name", "institutional_investor", "investor", "type", "category", "法人"])
-        net_col = _pick_existing_col(raw, ["net", "buy_sell", "buy_sell_amount", "買賣超", "買賣超股數"])
-        buy_col = _pick_existing_col(raw, ["buy", "buy_amount", "buy_volume", "買進", "買進股數"])
-        sell_col = _pick_existing_col(raw, ["sell", "sell_amount", "sell_volume", "賣出", "賣出股數"])
-
-        if not date_col or not name_col:
+        out = _standardize_institutional_long_df(raw, stock_code, days, "FinMind")
+        if out is None or out.empty:
             print(f"⚠️ FinMind 三大法人欄位不符：{raw.columns.tolist()}")
             return pd.DataFrame()
-
-        tmp = raw.copy()
-        tmp["Date"] = pd.to_datetime(tmp[date_col], errors="coerce")
-        tmp = tmp.dropna(subset=["Date"])
-        tmp["inst_group"] = tmp[name_col].map(_classify_finmind_inst_name)
-        tmp = tmp[tmp["inst_group"].isin(["foreign", "invest", "dealer"])]
-        if tmp.empty:
-            print(f"⚠️ FinMind 三大法人分類不到外資/投信/自營商：{stock_code}")
-            return pd.DataFrame()
-
-        if net_col:
-            tmp["net_value"] = pd.to_numeric(tmp[net_col], errors="coerce").fillna(0.0)
-        elif buy_col and sell_col:
-            tmp["net_value"] = (
-                pd.to_numeric(tmp[buy_col], errors="coerce").fillna(0.0)
-                - pd.to_numeric(tmp[sell_col], errors="coerce").fillna(0.0)
-            )
-        else:
-            print(f"⚠️ FinMind 三大法人找不到買賣超或買進/賣出欄位：{raw.columns.tolist()}")
-            return pd.DataFrame()
-
-        grouped = tmp.groupby(["Date", "inst_group"], as_index=False)["net_value"].sum()
-        pivot = grouped.pivot(index="Date", columns="inst_group", values="net_value").fillna(0.0)
-        for c in ["foreign", "invest", "dealer"]:
-            if c not in pivot.columns:
-                pivot[c] = 0.0
-
-        out = pivot.reset_index()[["Date", "foreign", "invest", "dealer"]].copy()
-        out["foreign"] = _to_lots(out["foreign"])
-        out["invest"] = _to_lots(out["invest"])
-        out["dealer"] = _to_lots(out["dealer"])
-        out["total"] = out["foreign"] + out["invest"] + out["dealer"]
-        out = out.sort_values("Date").tail(days).reset_index(drop=True)
-        print(f"✅ FinMind 三大法人資料：{stock_code}，{len(out):,} 筆")
-        return out[["Date", "foreign", "invest", "dealer", "total"]]
+        return out
     except Exception as e:
         print(f"⚠️ FinMind 三大法人資料抓取失敗：{e}")
         return pd.DataFrame()
@@ -974,8 +1226,9 @@ def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.Dat
 
 def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
     """
-    優先使用 FINMIND_API_TOKEN 直接從 FinMind API 抓三大法人資料。
-    若環境變數未設定或 API 失敗，才使用 X_function 備援。
+    優先使用 FinMind API 抓三大法人資料，並排除 Dealer_Hedging / 自營商避險。
+    若 FinMind API 失敗，才使用 X_function 備援；備援也必須能拆出自營商自行買賣，
+    否則直接略過，避免把權證或衍生性商品避險部位誤算進自營商。
     回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
     """
     out = fetch_inst_60d_from_finmind_token(stock_code, days=days)
@@ -992,21 +1245,19 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
         return pd.DataFrame()
     if inst is None or inst.empty:
         return pd.DataFrame()
-    need_cols = {"date", "外資", "投信", "自營商"}
-    if not need_cols.issubset(inst.columns):
-        print(f"⚠️ X_function 法人資料欄位不符：{inst.columns.tolist()}")
-        return pd.DataFrame()
-    out = inst.copy()
-    out["Date"] = pd.to_datetime(out["date"], errors="coerce")
-    out = out.dropna(subset=["Date"])
-    out["foreign"] = _to_lots(out["外資"])
-    out["invest"] = _to_lots(out["投信"])
-    out["dealer"] = _to_lots(out["自營商"])
-    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
-    out = out.sort_values("Date").tail(days).reset_index(drop=True)
-    print(f"✅ X_function 三大法人備援資料：{stock_code}，{len(out):,} 筆")
-    return out[["Date", "foreign", "invest", "dealer", "total"]]
 
+    # 若 X_function 回傳的是 FinMind 長表格式，使用同一套分類邏輯，會排除 Dealer_Hedging。
+    maybe_name_col = _pick_existing_col_loose(inst, [
+        "name", "institutional_investor", "institutional_investors", "investor",
+        "type", "category", "法人", "身份別", "投資人類別",
+    ])
+    if maybe_name_col:
+        out = _standardize_institutional_long_df(inst, stock_code, days, "X_function")
+        if out is not None and not out.empty:
+            return out
+
+    # 若 X_function 回傳的是外資 / 投信 / 自營商寬表，必須確認自營商是「自行買賣」口徑。
+    return _standardize_institutional_wide_df(inst, stock_code, days, "X_function")
 
 def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
     """三大法人買賣超（正負堆疊柱狀圖），單位：張。"""
@@ -1488,61 +1739,30 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
             frames.append(f)
     if not frames:
         return []
-
     all_df = pd.concat(frames, ignore_index=True).fillna("")
     trade_dates = sorted([d for d in all_df["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
     if not trade_dates:
         return []
-
     latest_trade_date = trade_dates[-1]
-    latest_df = all_df[all_df["交易日期"] == latest_trade_date].copy()
-    if latest_df.empty:
-        return []
-
-    latest_df["成交量_num"] = pd.to_numeric(latest_df["成交量"], errors="coerce").fillna(0).astype(float)
-    latest_df["成交金額_num"] = pd.to_numeric(latest_df["成交金額"], errors="coerce").fillna(0).astype(float)
-
-    # 這裡只用 OpenAPI 找「目前仍存在的認購權證母體」，不再用最新日成交量 > 0 當入場門檻。
-    # 原本用最新日成交量 > 0 會造成：最新日剛好沒成交，但週報 70 天內其實有分點買賣的權證被整批漏掉。
-    # 真正 70 天內有沒有買賣資料，交給後面的 API4 / API5 歷史分點資料判斷。
-    call_df = latest_df[
-        (latest_df["名稱"].astype(str).str.contains("購", na=False))
-        & (~latest_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
-        & (latest_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
+    active_df = all_df[
+        (all_df["交易日期"] == latest_trade_date)
+        & (all_df["名稱"].astype(str).str.contains("購", na=False))
+        & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
+        & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
     ].copy()
-
     lookup = load_warrant_underlying_lookup()
     aliases = make_stock_aliases(stock_name)
     warrants = []
     seen = set()
-
-    print(
-        f"🔎 OpenAPI 權證母體：最新交易日={latest_trade_date}｜"
-        f"全部={len(latest_df):,}｜認購候選={len(call_df):,}｜"
-        f"認購有成交={(call_df['成交量_num'] > 0).sum():,}｜認購0成交={(call_df['成交量_num'] <= 0).sum():,}"
-    )
-    if aliases:
-        print(f"🔎 {stock_code} {stock_name} 權證名稱比對別名：{', '.join(aliases)}")
-
-    # 排序時仍把最新日有成交、成交金額大的權證排前面，但不刪除最新日 0 成交的同標的權證。
-    call_df["has_volume"] = call_df["成交量_num"] > 0
-    sorted_df = call_df.sort_values(
-        ["has_volume", "成交金額_num", "成交量_num"],
-        ascending=[False, False, False],
-    )
-
-    for _, r in sorted_df.iterrows():
+    for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
         code = normalize_openapi_warrant_code(r.get("代號"))
         name = str(r.get("名稱", "")).strip()
         if not code or code in seen:
             continue
-
         cached = lookup.get(code, {})
         ucode = _clean_code(cached.get("underlying_code", ""))
         uname = str(cached.get("underlying_name", "")).strip()
-        clean_name = name.replace(" ", "")
-        name_match = any(clean_name.startswith(a) for a in aliases if a)
-
+        name_match = any(name.replace(" ", "").startswith(a) for a in aliases if a)
         if ucode == str(stock_code) or name_match:
             seen.add(code)
             warrants.append({
@@ -1550,36 +1770,14 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
                 "名稱": name,
                 "標的股": str(stock_code),
                 "標的名稱": uname or stock_name,
-                "成交金額": int(float(r.get("成交金額_num", 0) or 0)),
-                "成交量": int(float(r.get("成交量_num", 0) or 0)),
+                "成交金額": int(r.get("成交金額", 0) or 0),
+                "成交量": int(r.get("成交量", 0) or 0),
             })
-
-    raw_match_count = len(warrants)
-    raw_with_volume = sum(1 for w in warrants if float(w.get("成交量", 0) or 0) > 0)
-    raw_zero_volume = raw_match_count - raw_with_volume
-
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-        print(f"⚠️ 已依 WARRANT_REPORT_MAX_WARRANTS 限制候選權證數：{raw_match_count:,} → {len(warrants):,}")
-
-    with_volume = sum(1 for w in warrants if float(w.get("成交量", 0) or 0) > 0)
-    zero_volume = len(warrants) - with_volume
-    print(
-        f"✅ {stock_code} 相關認購權證候選：{len(warrants):,} 支｜"
-        f"最新日有成交={with_volume:,}｜最新日0成交={zero_volume:,}"
-    )
-    if raw_match_count > 0 and raw_with_volume == 0:
-        print(
-            f"ℹ️ {stock_code} 最新日沒有成交量 > 0 的相關認購權證，但仍保留0成交候選，"
-            "交由 API4 / API5 回查歷史分點資料。"
-        )
-    if not warrants:
-        print(
-            f"⚠️ {stock_code} OpenAPI 最新交易日找不到相關認購權證候選；"
-            "若你確認有權證，請檢查權證名稱是否不是以股票名稱開頭，或標的對照資料是否缺漏。"
-        )
-
+    print(f"✅ {stock_code} 相關認購權證：{len(warrants):,} 支")
     return warrants
+
 
 def api4_get(code, start, end):
     retry_count = 0
@@ -3559,12 +3757,9 @@ def _is_retryable_gemini_error(err) -> bool:
 
 
 def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str = "", stock_name: str = ""):
-    if not GEMINI_ENABLE:
-        print("ℹ️ Gemini 已關閉，改用規則式摘要 / 既有資料流程")
-        return None
-
     # 第一優先：Google Sheet 每日快取。
     # 同股票、同任務、同模型、同一天只要跑過一次，當天再跑就不會重打 Gemini。
+    # 這段必須放在 GEMINI_ENABLE 判斷前面，避免關閉 Gemini 時連當日快取也讀不到。
     cached_text = load_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt) if cache_task and stock_code else ""
     if cached_text:
         save_llm_cache(prompt, cached_text)
@@ -3577,6 +3772,10 @@ def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str =
         if cache_task and stock_code:
             save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, cached_text)
         return cached_text
+
+    if not GEMINI_ENABLE:
+        print("ℹ️ Gemini 已關閉，且沒有命中當日快取，改用規則式摘要 / 既有資料流程")
+        return None
 
     if genai is None:
         print("⚠️ 未安裝 google-genai，無法使用 Gemini 摘要；將改用規則式摘要")
@@ -3975,8 +4174,76 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
     return _ensure_news_summary_min_total(points, records, stock_code, stock_name)
 
 
+
+def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str, allow_stale: bool = False) -> List[str]:
+    """直接讀取 Google Sheet 的 news_points 快取，供新聞區塊顯示使用。
+
+    原本快取只在 _call_gemini_with_retry() 內讀取；如果 Google News 沒抓到素材，
+    流程會在 build_news_points() 提早 return，導致永遠不會讀到 Google Sheet 快取。
+    這個函式放在 build_news_points() 前面直接查快取，確保當天跑過的新聞摘要能直接被圖片使用。
+    """
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or LLM_CACHE_FORCE_REFRESH:
+        return []
+    stock_key = _clean_code(stock_code)
+    if not stock_key:
+        return []
+
+    cached_text = load_gsheet_llm_cache("news_points", stock_key, stock_name, prompt="")
+    if cached_text:
+        points = _clean_news_summary_points_for_stock(_parse_raw_points_from_llm(cached_text), stock_key, stock_name)
+        if points:
+            print(f"📦 直接使用 Google Sheet 當日新聞快取：{stock_key}｜{len(points)} 點")
+            return points[:NEWS_DISPLAY_MAX_POINTS]
+
+    if not allow_stale:
+        return []
+
+    try:
+        df = read_gsheet_worksheet(GSHEET_LLM_CACHE_SHEET)
+        if df is None or df.empty or "Gemini輸出" not in df.columns:
+            return []
+
+        work = df.copy().fillna("")
+        if "任務" in work.columns:
+            work = work[work["任務"].astype(str).str.strip() == "news_points"].copy()
+        else:
+            work = work[work.get("快取鍵", "").astype(str).str.contains("news_points", na=False)].copy()
+
+        if "標的股" in work.columns:
+            work = work[work["標的股"].map(_clean_code).astype(str) == stock_key].copy()
+        elif "快取鍵" in work.columns:
+            work = work[work["快取鍵"].astype(str).str.contains(f"_{stock_key}_", na=False)].copy()
+
+        if work.empty:
+            return []
+
+        if "模型" in work.columns:
+            same_model = work[work["模型"].astype(str).str.strip() == GEMINI_MODEL].copy()
+            if not same_model.empty:
+                work = same_model
+
+        sort_cols = [c for c in ["日期", "更新時間"] if c in work.columns]
+        if sort_cols:
+            work = work.sort_values(sort_cols)
+        row = work.tail(1).iloc[0]
+        cached_text = str(row.get("Gemini輸出", "") or "").strip()
+        points = _clean_news_summary_points_for_stock(_parse_raw_points_from_llm(cached_text), stock_key, stock_name)
+        if points:
+            cache_date = str(row.get("日期", "") or "")
+            print(f"📦 Google Sheet 舊新聞快取備援命中：{stock_key}｜{cache_date}｜{len(points)} 點")
+            return points[:NEWS_DISPLAY_MAX_POINTS]
+    except Exception as e:
+        print(f"⚠️ Google Sheet 舊新聞快取讀取失敗：{stock_key}｜{e}")
+    return []
+
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """根據最近一週新聞內文整理重點；優先只用足夠新聞原文交給 Gemini，不直接把新聞標題放進圖表。"""
+    """根據最近一週新聞內文整理重點；優先讀 Google Sheet 快取，再使用新聞原文整理。"""
+    # 先讀 Google Sheet news_points 快取。
+    # 這一步必須放在 records 判斷之前，否則 Google News 沒抓到素材時會提早 return，導致明明有快取也不會被使用。
+    cached_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
+    if cached_points:
+        return cached_points[:NEWS_DISPLAY_MAX_POINTS]
+
     records = _news_items_to_records(news_items)
     body_records = [
         r for r in records
@@ -3985,6 +4252,9 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     fallback_records = [r for r in records if r.get("fallback_ok") and _normalize_news_text(r.get("content", ""))]
 
     if not records:
+        stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
+        if stale_points:
+            return stale_points[:NEWS_DISPLAY_MAX_POINTS]
         return ["本週未抓到可整理的新聞素材；可用 WEEKLY_NEWS_TEXT 手動填入新聞重點。"]
 
     # 優先用足夠新聞原文；若原文抓不到或本股票片段太短，允許使用已驗證相關的 RSS 摘要作為 AI 改寫素材，避免完全沒有新聞。
@@ -3998,6 +4268,10 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     rule_points = _rule_based_news_summary(rule_source, stock_code, stock_name)
     if rule_points:
         return _ensure_news_summary_min_total(rule_points, rule_source, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
+
+    stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
+    if stale_points:
+        return stale_points[:NEWS_DISPLAY_MAX_POINTS]
 
     if not body_records:
         return ["本週近7天新聞多為標題或短摘要，未取得足夠原文可統整；目前不輸出標題式內容，建議稍後重跑或補手動新聞重點。"]
