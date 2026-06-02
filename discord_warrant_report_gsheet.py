@@ -2661,7 +2661,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         has_more = len(items) > limit
         return shown, has_more
 
-    def draw_participant_brokers_cell(x_left, y_center, row, cell_w, size=14):
+    def draw_participant_brokers_cell(x_left, y_center, row, cell_w, size=13):
         items, has_more = build_participant_broker_items(row, limit=5)
         cur_x = x_left + 0.12
         max_x = x_left + cell_w - 0.12
@@ -2758,7 +2758,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.70, 2.15, 1.95, 0.90, 1.00, 5.50]
+    col_w = [0.70, 2.15, 1.45, 0.65, 0.85, 6.40]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -2796,7 +2796,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             x = margin_x
             for col_idx, (val, w, c, a, is_bold) in enumerate(zip(values, col_w, colors, aligns, bolds)):
                 if col_idx == len(values) - 1:
-                    draw_participant_brokers_cell(x, ry + row_h / 2, r, w, size=14)
+                    draw_participant_brokers_cell(x, ry + row_h / 2, r, w, size=13)
                     x += w
                     continue
 
