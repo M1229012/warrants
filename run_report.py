@@ -40,8 +40,7 @@ def _send_to_discord(image_path: Path, stock_code: str) -> None:
         return
 
     content = (
-        f"📊 {stock_code} 權證技術報告測試圖\n"
-        f"目前用於確認報告內容與格式。"
+        f""
     )
 
     with image_path.open("rb") as f:
