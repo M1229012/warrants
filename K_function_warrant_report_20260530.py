@@ -98,6 +98,12 @@ HEDGE_FILTER_ENABLE = os.getenv("WARRANT_HEDGE_FILTER_ENABLE", "0").strip().lowe
 HEDGE_MIN_GROSS_AMOUNT = float(os.getenv("WARRANT_HEDGE_MIN_GROSS_AMOUNT", "3000000"))
 HEDGE_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_HEDGE_MIN_SIDE_AMOUNT", "1000000"))
 
+# TOP5 專用：同一天、同一檔權證，若不同券商 / 分點一買一賣金額高度接近，視為疑似對手單並排除。
+# 預設啟用：單邊至少 100 萬，買賣金額差距 3% 以內。
+CROSS_BROKER_OFFSET_FILTER_ENABLE = os.getenv("WARRANT_CROSS_BROKER_OFFSET_FILTER_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+CROSS_BROKER_OFFSET_THRESHOLD = float(os.getenv("WARRANT_CROSS_BROKER_OFFSET_THRESHOLD", "0.03"))
+CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT", "1000000"))
+
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 
@@ -1124,6 +1130,96 @@ def filter_out_market_maker_hedges(
     return e, n_rows
 
 
+
+
+def filter_out_cross_broker_offset_trades(
+    events_df: pd.DataFrame,
+    amount_diff_threshold: float = CROSS_BROKER_OFFSET_THRESHOLD,
+    min_side_amount: float = CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT,
+    do_filter: bool = True,
+):
+    """
+    TOP5 專用：偵測 / 過濾同日同權證的疑似對手單。
+
+    判斷條件：
+    1. 同一天、同一檔權證。
+    2. 一個不同券商 / 分點為買超，另一個不同券商 / 分點為賣超。
+    3. 買超與賣超單邊金額皆大於等於 min_side_amount。
+    4. 兩邊絕對金額差距 / 較大金額 <= amount_diff_threshold。
+
+    這個函式只建議用在 TOP5 分點排名，不改動整體權證資金流柱狀圖與累計線。
+    """
+    if events_df is None or events_df.empty:
+        return events_df, 0
+    need_cols = {"Date", "warrant_code", "broker_code", "branch", "net_amount"}
+    if not need_cols.issubset(events_df.columns):
+        return events_df, 0
+
+    e = events_df.copy().reset_index(drop=True)
+    e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+    e["net_amount"] = pd.to_numeric(e["net_amount"], errors="coerce").fillna(0.0).astype(float)
+    e["broker_code"] = e["broker_code"].astype(str).str.strip()
+    e["branch"] = e["branch"].astype(str).str.strip()
+    e["warrant_code"] = e["warrant_code"].astype(str).str.strip()
+
+    remove_idx = set()
+
+    for _, sub in e.groupby(["Date", "warrant_code"], dropna=False):
+        buys = sub[sub["net_amount"] >= float(min_side_amount)].copy()
+        sells = sub[sub["net_amount"] <= -float(min_side_amount)].copy()
+        if buys.empty or sells.empty:
+            continue
+
+        buys = buys.reindex(buys["net_amount"].abs().sort_values(ascending=False).index)
+        sells = sells.reindex(sells["net_amount"].abs().sort_values(ascending=False).index)
+        used_sells = set()
+
+        for buy_idx, buy_row in buys.iterrows():
+            if buy_idx in remove_idx:
+                continue
+
+            buy_amt = abs(float(buy_row.get("net_amount", 0) or 0))
+            if buy_amt < float(min_side_amount):
+                continue
+
+            buy_broker = str(buy_row.get("broker_code", "") or "").strip()
+            buy_branch = str(buy_row.get("branch", "") or "").strip()
+            candidates = []
+
+            for sell_idx, sell_row in sells.iterrows():
+                if sell_idx in used_sells or sell_idx in remove_idx:
+                    continue
+
+                sell_amt = abs(float(sell_row.get("net_amount", 0) or 0))
+                if sell_amt < float(min_side_amount):
+                    continue
+
+                sell_broker = str(sell_row.get("broker_code", "") or "").strip()
+                sell_branch = str(sell_row.get("branch", "") or "").strip()
+
+                same_broker = bool(buy_broker and sell_broker and buy_broker == sell_broker)
+                same_branch = bool(buy_branch and sell_branch and buy_branch == sell_branch)
+                if same_broker or same_branch:
+                    continue
+
+                diff_ratio = abs(buy_amt - sell_amt) / max(buy_amt, sell_amt, 1.0)
+                if diff_ratio <= float(amount_diff_threshold):
+                    candidates.append((diff_ratio, -max(buy_amt, sell_amt), sell_idx))
+
+            if candidates:
+                candidates.sort()
+                _, _, matched_sell_idx = candidates[0]
+                remove_idx.add(buy_idx)
+                remove_idx.add(matched_sell_idx)
+                used_sells.add(matched_sell_idx)
+
+    n_rows = len(remove_idx)
+    if do_filter and n_rows > 0:
+        e = e.drop(index=sorted(remove_idx)).reset_index(drop=True)
+
+    return e, n_rows
+
+
 def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
     points = []
     df = ctx["plot_df"]
@@ -1270,7 +1366,18 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     if week_events is None or week_events.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
     e = week_events.copy()
+    if CROSS_BROKER_OFFSET_FILTER_ENABLE:
+        e, offset_removed = filter_out_cross_broker_offset_trades(
+            e,
+            amount_diff_threshold=CROSS_BROKER_OFFSET_THRESHOLD,
+            min_side_amount=CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT,
+            do_filter=True,
+        )
+        if offset_removed > 0:
+            print(f"🧹 TOP5 已排除疑似對手單 / 換手單：{offset_removed:,} 筆")
     e["branch"] = e["branch"].replace("", "未知分點")
+    if e.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
     branch_sum = e.groupby("branch", as_index=False).agg({"net_amount": "sum", "buy_amount": "sum", "sell_amount": "sum"})
 
     def add_max_warrant(df, positive=True):
