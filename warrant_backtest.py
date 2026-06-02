@@ -84,6 +84,16 @@ CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_sele
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
+# TOP15 圖片用分點報酬率快取：
+# 主程式在 RUN_MODE=1 精選五分點執行時，會計算近 N 個有效交易日內
+# A/B/C/D 事件目前仍持有部位的分點報酬率，並寫入 Google Sheet。
+# 圖片程式之後只需要讀這張快取表，不需要重新抓權證現價。
+TOP15_RETURN_CACHE_ENABLED = os.getenv("TOP15_RETURN_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+TOP15_RETURN_CACHE_SHEET = os.getenv("TOP15_RETURN_CACHE_SHEET", "快取_TOP15分點報酬率")
+TOP15_RETURN_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", os.getenv("LOOKBACK_TRADING_DAYS", "22")))
+TOP15_RETURN_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75"))
+TOP15_RETURN_PRICE_STALE_DAYS = int(os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10"))
+
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
 #             讓今日買賣超明細盡量完整，例如元大南屯今日賣南亞科所有相關認購權證。
@@ -1571,6 +1581,9 @@ GSHEET_COMMA_NUMBER_HEADER_KEYWORDS = (
     "涵蓋權證數",
     "持有天數",
     "價格筆數",
+    "成本",
+    "市值",
+    "損益",
 )
 
 GSHEET_COMMA_NUMBER_EXCLUDE_KEYWORDS = (
@@ -5157,6 +5170,555 @@ def get_ma_status_cells(price_cache, underlying_code, base_date):
     return fmt_price_value(current_price), ma5_mark, ma20_mark
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# TOP15 圖片用：分點目前報酬率快取
+# ══════════════════════════════════════════════════════════════════════
+
+def get_latest_price_info_on_or_before(price_cache, code, target_date):
+    """
+    取得指定代號在 target_date 當天或之前最近一筆有效收盤價。
+
+    回傳：
+    - (價格, 日期字串)
+    - 找不到則回傳 (None, "")
+    """
+    prices = get_price_series_from_cache(price_cache, code)
+
+    if not prices:
+        return None, ""
+
+    target_str = normalize_date_str(target_date)
+    valid = []
+
+    for d, p in prices.items():
+        dt = parse_date(d)
+        price = safe_price_float(p)
+
+        if not dt or price is None:
+            continue
+
+        d_norm = normalize_date_str(d)
+        if d_norm <= target_str:
+            valid.append((d_norm, price))
+
+    if not valid:
+        return None, ""
+
+    valid.sort(key=lambda x: x[0])
+    return valid[-1][1], valid[-1][0]
+
+
+def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, lookback_days=None):
+    """
+    從 A/B/C/D 事件抓近 N 個有效事件交易日。
+
+    這個範圍要和 TOP15 圖的「近一個月交易日」概念一致，
+    讓報酬率快取可以直接對應圖片中的 TOP15 參與分點。
+    """
+    if lookback_days is None:
+        lookback_days = TOP15_RETURN_LOOKBACK_TRADING_DAYS
+
+    dates = set()
+
+    for ev in a_events:
+        d = parse_date(ev.get("買進日") or ev.get("事件日"))
+        if d:
+            dates.add(normalize_date_str(d.strftime("%Y/%m/%d")))
+
+    for ev in b_events + c_events + d_events:
+        d = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日"))
+        if d:
+            dates.add(normalize_date_str(d.strftime("%Y/%m/%d")))
+
+    recent_dates = sorted(dates, reverse=True)[:max(int(lookback_days), 1)]
+    return recent_dates
+
+
+def _top15_return_event_date(ev, is_a=False):
+    if is_a:
+        return normalize_date_str(ev.get("買進日") or ev.get("事件日") or "")
+    return normalize_date_str(ev.get("事件日") or ev.get("結束日") or ev.get("起始日") or "")
+
+
+def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, recent_dates):
+    """
+    將近 N 個有效事件交易日內的 A/B/C/D 買超事件轉成可計算未實現報酬率的 lot。
+
+    注意：
+    - A 是單檔權證事件。
+    - B/C/D 是同標的群組事件，因此拆成每一檔權證 lot。
+    - 後續會再依原始分點歷史資料扣掉事件日之後的賣出股數，得到目前剩餘部位。
+    """
+    date_set = set(recent_dates or [])
+    lots = []
+
+    def add_lot(
+        event_code, event_type, broker_label, broker_name, broker_code,
+        underlying_code, underlying_name, event_date, warrant_code, warrant_name,
+        buy_amount, buy_qty, source_text
+    ):
+        event_date = normalize_date_str(event_date)
+
+        if not event_date or event_date not in date_set:
+            return
+
+        warrant_code = normalize_warrant_code_for_unique(warrant_code)
+        buy_amount = float(buy_amount or 0)
+        buy_qty = float(buy_qty or 0)
+
+        if not warrant_code or buy_amount <= 0 or buy_qty <= 0:
+            return
+
+        lots.append({
+            "事件": event_code,
+            "事件類型": event_type,
+            "事件日": event_date,
+            "分點": str(broker_label or "").strip(),
+            "分點名稱": str(broker_name or "").strip(),
+            "券商代號": str(broker_code or "").strip(),
+            "標的股": str(underlying_code or "").strip(),
+            "標的名稱": str(underlying_name or "").strip(),
+            "權證代號": warrant_code,
+            "權證名稱": str(warrant_name or "").strip(),
+            "原始股數": buy_qty,
+            "原始成本": buy_amount,
+            "剩餘股數": buy_qty,
+            "剩餘成本": buy_amount,
+            "來源": source_text,
+        })
+
+    for ev in a_events:
+        event_date = _top15_return_event_date(ev, is_a=True)
+        add_lot(
+            "A",
+            ev.get("事件類型", "A-單檔權證大買"),
+            ev.get("分點", ""),
+            ev.get("分點名稱", ""),
+            ev.get("券商代號", ""),
+            ev.get("標的股", ""),
+            ev.get("標的名稱", ""),
+            event_date,
+            ev.get("權證代號", ""),
+            ev.get("權證名稱", ""),
+            ev.get("買進金額", 0),
+            ev.get("買進股數", 0),
+            f'A | {ev.get("權證代號", "")} {ev.get("權證名稱", "")}',
+        )
+
+    for event_code, events in [("B", b_events), ("C", c_events), ("D", d_events)]:
+        for ev in events:
+            event_date = _top15_return_event_date(ev, is_a=False)
+            event_type = ev.get("事件類型", f"{event_code}-事件")
+
+            for lot in ev.get("lots", []):
+                add_lot(
+                    event_code,
+                    event_type,
+                    ev.get("分點", ""),
+                    ev.get("分點名稱", ""),
+                    ev.get("券商代號", ""),
+                    ev.get("標的股", ""),
+                    ev.get("標的名稱", ""),
+                    event_date,
+                    lot.get("權證代號", ""),
+                    lot.get("權證名稱", ""),
+                    lot.get("金額", 0),
+                    lot.get("股數", 0),
+                    f'{event_code} | {lot.get("權證代號", "")} {lot.get("權證名稱", "")}',
+                )
+
+    return lots
+
+
+def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
+    """
+    依照原始分點歷史資料，把事件日之後的賣出股數扣掉，得到目前剩餘部位。
+
+    扣減邏輯：
+    - 同一分點 + 同一權證代號的 lot 依事件日 FIFO 扣。
+    - 只扣「賣出日 > 事件日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
+    - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
+    """
+    if not position_lots:
+        return position_lots
+
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        target_dt = datetime.today()
+
+    lots_by_key = {}
+    for lot in position_lots:
+        key = (str(lot.get("券商代號", "")).strip(), str(lot.get("權證代號", "")).strip())
+        lots_by_key.setdefault(key, []).append(lot)
+
+    for key, lots in lots_by_key.items():
+        broker_code, warrant_code = key
+        item = item_map.get((broker_code, warrant_code))
+
+        if not item:
+            continue
+
+        df = item.get("df", pd.DataFrame())
+        if df is None or df.empty:
+            continue
+
+        lots.sort(key=lambda x: (x.get("事件日", ""), x.get("權證代號", "")))
+        df2 = df.copy()
+        df2["日期"] = df2["日期"].map(normalize_date_str)
+        df2 = df2.sort_values("日期").reset_index(drop=True)
+
+        for row in df2.itertuples(index=False):
+            row_dict = row._asdict()
+            sell_date = normalize_date_str(row_dict.get("日期", ""))
+            sell_dt = parse_date(sell_date)
+
+            if not sell_dt or sell_dt > target_dt:
+                continue
+
+            sell_qty_left = float(row_dict.get("賣出股數", 0) or 0)
+            if sell_qty_left <= 0:
+                continue
+
+            for lot in lots:
+                if sell_qty_left <= 0:
+                    break
+
+                event_dt = parse_date(lot.get("事件日", ""))
+                if not event_dt or sell_dt <= event_dt:
+                    continue
+
+                remaining_qty = float(lot.get("剩餘股數", 0) or 0)
+                remaining_cost = float(lot.get("剩餘成本", 0) or 0)
+                original_qty = float(lot.get("原始股數", 0) or 0)
+                original_cost = float(lot.get("原始成本", 0) or 0)
+
+                if remaining_qty <= 0 or remaining_cost <= 0 or original_qty <= 0 or original_cost <= 0:
+                    continue
+
+                avg_cost = original_cost / original_qty
+                alloc_qty = min(sell_qty_left, remaining_qty)
+                alloc_cost = min(remaining_cost, alloc_qty * avg_cost)
+
+                lot["剩餘股數"] = max(remaining_qty - alloc_qty, 0)
+                lot["剩餘成本"] = max(remaining_cost - alloc_cost, 0)
+                sell_qty_left -= alloc_qty
+
+    return position_lots
+
+
+def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
+    """
+    TOP15 分點報酬率需要權證目前價格。
+
+    原本 fetch_all_prices() 為了加速，B/C/D 預設只抓標的股價格，
+    因此這裡會針對目前仍有剩餘部位的權證補抓最新價格，並同步回 price_cache.csv / Google Sheet。
+    """
+    if not position_lots:
+        return price_cache
+
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        target_dt = datetime.today()
+
+    target_dt = min(target_dt, datetime.today())
+    start_dt = target_dt - timedelta(days=max(TOP15_RETURN_PRICE_LOOKBACK_DAYS, 10))
+
+    needed_codes = sorted({
+        normalize_price_code(lot.get("權證代號", ""))
+        for lot in position_lots
+        if float(lot.get("剩餘成本", 0) or 0) > 0
+        and normalize_price_code(lot.get("權證代號", ""))
+    })
+
+    if not needed_codes:
+        return price_cache
+
+    persistent_price_cache = load_price_cache()
+    fetch_plan = []
+
+    for code in needed_codes:
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
+        current_prices = get_price_series_from_cache(price_cache, code)
+        merged_prices = merge_price_dicts(cached_prices, current_prices)
+
+        if merged_prices:
+            add_price_aliases(price_cache, code, merged_prices)
+            persistent_price_cache[normalize_price_code(code)] = merged_prices
+
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_dt.strftime("%Y/%m/%d"))
+        latest_dt = parse_date(latest_date) if latest_date else None
+
+        need_fetch = latest_price is None
+        if latest_dt and (target_dt - latest_dt).days > TOP15_RETURN_PRICE_STALE_DAYS:
+            need_fetch = True
+
+        if need_fetch:
+            fetch_plan.append(code)
+
+    print(f"  TOP15分點報酬率需檢查權證價格：{len(needed_codes):,} 檔")
+    print(f"  TOP15分點報酬率需補抓權證價格：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        return price_cache
+
+    def fetch_one(code):
+        return code, fetch_twse_prices(code, start_dt, target_dt)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
+        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
+
+        for future in as_completed(futures):
+            done += 1
+            code = futures[future]
+
+            try:
+                code, fetched_prices = future.result()
+            except Exception:
+                fetched_prices = {}
+
+            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+            merged_prices = merge_price_dicts(old_prices, fetched_prices)
+
+            if merged_prices:
+                norm_code = normalize_price_code(code)
+                if norm_code:
+                    persistent_price_cache[norm_code] = merged_prices
+                add_price_aliases(price_cache, code, merged_prices)
+
+            if done % 20 == 0:
+                print(f"  [{done}/{len(fetch_plan)}] TOP15報酬率權證價格補抓中...")
+
+    save_price_cache(persistent_price_cache)
+    return price_cache
+
+
+def build_top15_return_cache_rows(a_events, b_events, c_events, d_events, item_map, price_cache):
+    """
+    建立 Google Sheet 快取用的「分點目前報酬率」資料列。
+
+    這張快取表的目的不是取代 TOP15 排名，而是讓圖片程式在畫 TOP15 時，
+    可以用「標的股 + 分點」直接查到目前剩餘部位報酬率，不需要每次畫圖再抓權證現價。
+    """
+    if not TOP15_RETURN_CACHE_ENABLED:
+        return []
+
+    print("【Step 4b】計算 TOP15 圖片用分點報酬率快取...")
+
+    recent_dates = collect_top15_return_recent_dates(
+        a_events, b_events, c_events, d_events, TOP15_RETURN_LOOKBACK_TRADING_DAYS
+    )
+
+    if not recent_dates:
+        print("  ⚠️ TOP15分點報酬率快取：沒有可用事件日期")
+        return []
+
+    target_date = max(recent_dates)
+    period_text = f"{min(recent_dates)} ～ {max(recent_dates)}"
+
+    position_lots = collect_top15_return_position_lots(
+        a_events, b_events, c_events, d_events, recent_dates
+    )
+
+    if not position_lots:
+        print("  ⚠️ TOP15分點報酬率快取：沒有可用買超 lot")
+        return []
+
+    position_lots = apply_sales_to_top15_return_lots(position_lots, item_map, target_date)
+    position_lots = [lot for lot in position_lots if float(lot.get("剩餘成本", 0) or 0) > 0 and float(lot.get("剩餘股數", 0) or 0) > 0]
+
+    if not position_lots:
+        print("  ⚠️ TOP15分點報酬率快取：扣除賣出後沒有剩餘部位")
+        return []
+
+    ensure_top15_return_warrant_prices(price_cache, position_lots, target_date)
+
+    agg = {}
+
+    for lot in position_lots:
+        broker = str(lot.get("分點", "")).strip()
+        underlying = str(lot.get("標的股", "")).strip()
+        key = (broker, underlying)
+
+        if not broker or not underlying:
+            continue
+
+        if key not in agg:
+            agg[key] = {
+                "統計日期": target_date,
+                "統計期間": period_text,
+                "有效交易日數": len(recent_dates),
+                "分點": broker,
+                "分點名稱": str(lot.get("分點名稱", "")).strip(),
+                "券商代號": str(lot.get("券商代號", "")).strip(),
+                "標的股": underlying,
+                "標的名稱": str(lot.get("標的名稱", "")).strip(),
+                "事件集合": set(),
+                "權證集合": set(),
+                "權證清單": [],
+                "淨買超成本": 0.0,
+                "可估成本": 0.0,
+                "缺價格成本": 0.0,
+                "目前市值": 0.0,
+                "有價格權證": set(),
+                "缺價格權證": set(),
+                "最新價格日期集合": set(),
+            }
+
+        rec = agg[key]
+        remaining_cost = float(lot.get("剩餘成本", 0) or 0)
+        remaining_qty = float(lot.get("剩餘股數", 0) or 0)
+        warrant_code = str(lot.get("權證代號", "")).strip()
+        warrant_name = str(lot.get("權證名稱", "")).strip()
+        event_code = str(lot.get("事件", "")).strip()
+
+        rec["淨買超成本"] += remaining_cost
+        rec["事件集合"].add(event_code)
+        rec["權證集合"].add(warrant_code)
+
+        warrant_label = f"{warrant_code} {warrant_name}".strip()
+        if warrant_label and warrant_label not in rec["權證清單"]:
+            rec["權證清單"].append(warrant_label)
+
+        latest_price, latest_price_date = get_latest_price_info_on_or_before(price_cache, warrant_code, target_date)
+
+        latest_dt = parse_date(latest_price_date) if latest_price_date else None
+        target_dt = parse_date(target_date)
+        if latest_dt and target_dt and (target_dt - latest_dt).days > TOP15_RETURN_PRICE_STALE_DAYS:
+            # 價格太舊時不拿來估目前報酬率，避免已到期 / 停止交易權證用舊價誤算。
+            latest_price = None
+            latest_price_date = ""
+
+        if latest_price is not None:
+            market_value = remaining_qty * latest_price
+            rec["可估成本"] += remaining_cost
+            rec["目前市值"] += market_value
+            rec["有價格權證"].add(warrant_code)
+            if latest_price_date:
+                rec["最新價格日期集合"].add(latest_price_date)
+        else:
+            rec["缺價格成本"] += remaining_cost
+            rec["缺價格權證"].add(warrant_code)
+
+    rows = []
+
+    for rec in agg.values():
+        estimated_cost = float(rec.get("可估成本", 0) or 0)
+        market_value = float(rec.get("目前市值", 0) or 0)
+        total_cost = float(rec.get("淨買超成本", 0) or 0)
+        unrealized_pnl = market_value - estimated_cost if estimated_cost > 0 else None
+        return_pct = round(unrealized_pnl / estimated_cost * 100, 2) if estimated_cost > 0 else None
+        coverage_pct = round(estimated_cost / total_cost * 100, 2) if total_cost > 0 else None
+
+        rows.append({
+            "統計日期": rec["統計日期"],
+            "統計期間": rec["統計期間"],
+            "有效交易日數": rec["有效交易日數"],
+            "分點": rec["分點"],
+            "分點名稱": rec["分點名稱"],
+            "券商代號": rec["券商代號"],
+            "標的股": rec["標的股"],
+            "標的名稱": rec["標的名稱"],
+            "事件": "/".join(sorted(x for x in rec["事件集合"] if x)),
+            "淨買超成本": round(total_cost, 0),
+            "可估成本": round(estimated_cost, 0),
+            "缺價格成本": round(float(rec.get("缺價格成本", 0) or 0), 0),
+            "目前市值": round(market_value, 0),
+            "未實現損益": "" if unrealized_pnl is None else round(unrealized_pnl, 0),
+            "報酬率": "" if return_pct is None else return_pct,
+            "報酬率文字": "-" if return_pct is None else f"{return_pct:+.2f}%",
+            "價格覆蓋率": "" if coverage_pct is None else coverage_pct,
+            "價格覆蓋率文字": "-" if coverage_pct is None else f"{coverage_pct:.2f}%",
+            "權證檔數": len(rec["權證集合"]),
+            "有價格檔數": len(rec["有價格權證"]),
+            "缺價格檔數": len(rec["缺價格權證"]),
+            "最新價格日期": max(rec["最新價格日期集合"]) if rec["最新價格日期集合"] else "",
+            "權證清單": "；".join(rec["權證清單"]),
+        })
+
+    rows.sort(key=lambda r: (float(r.get("淨買超成本", 0) or 0), float(r.get("可估成本", 0) or 0)), reverse=True)
+    print(f"  ✅ TOP15分點報酬率快取完成：{len(rows):,} 筆分點標的資料")
+    return rows
+
+
+def write_top15_return_cache_sheet(wb, top15_return_rows):
+    """
+    寫入 Google Sheet 圖片程式可直接讀取的 TOP15 分點報酬率快取。
+    """
+    ws = wb.create_sheet(TOP15_RETURN_CACHE_SHEET)
+
+    headers = [
+        "統計日期",
+        "統計期間",
+        "有效交易日數",
+        "分點",
+        "分點名稱",
+        "券商代號",
+        "標的股",
+        "標的名稱",
+        "事件",
+        "淨買超成本",
+        "可估成本",
+        "缺價格成本",
+        "目前市值",
+        "未實現損益",
+        "報酬率",
+        "報酬率文字",
+        "價格覆蓋率",
+        "價格覆蓋率文字",
+        "權證檔數",
+        "有價格檔數",
+        "缺價格檔數",
+        "最新價格日期",
+        "權證清單",
+    ]
+
+    ws.append(headers)
+
+    for row in top15_return_rows or []:
+        ws.append([row.get(h, "") for h in headers])
+
+    col_widths = [12, 24, 12, 14, 18, 12, 10, 12, 10, 14, 14, 14, 14, 14, 10, 12, 12, 14, 10, 10, 10, 12, 60]
+
+    thin_gray = Side(style="thin", color="B7B7B7")
+    normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = YELLOW
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = normal_border
+
+    ws.row_dimensions[1].height = 24
+
+    for row in ws.iter_rows(min_row=2):
+        return_value = row[14].value
+        try:
+            pct = float(return_value)
+        except Exception:
+            pct = None
+
+        if pct is not None and pct > 0:
+            row_fill = RED
+        elif pct is not None and pct < 0:
+            row_fill = GREEN
+        else:
+            row_fill = WHITE
+
+        for cell in row:
+            cell.font = Font(color="000000")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = normal_border
+            cell.fill = row_fill
+
+        ws.row_dimensions[row[0].row].height = 28
+
+    ws.freeze_panes = "A2"
+
 # ══════════════════════════════════════════════════════════════════════
 # Excel 樣式
 # ══════════════════════════════════════════════════════════════════════
@@ -7131,7 +7693,7 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     ws.freeze_panes = "A2"
 
-def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path):
+def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, top15_return_rows=None):
     print("【Step 5】建立 Excel...")
 
     wb = Workbook()
@@ -7143,6 +7705,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
     write_group_sheet(wb, f"D_近{D_WINDOW_DAYS}日累積淨買進", d_events, price_cache, is_c=True)
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
+    write_top15_return_cache_sheet(wb, top15_return_rows or [])
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
@@ -7329,8 +7892,9 @@ def main():
         return
 
     price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
+    top15_return_rows = build_top15_return_cache_rows(a_events, b_events, c_events, d_events, item_map, price_cache)
 
-    build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path)
+    build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, top15_return_rows)
     upload_excel_to_google_sheet(output_path)
 
     elapsed = time.time() - program_start
