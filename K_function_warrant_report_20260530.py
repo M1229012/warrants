@@ -3725,7 +3725,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     for x0, title, df_top, side_color in sections:
         # TOP5 卡片：上緣位置維持，底部往下拓一點，讓內容與外框更有呼吸感。
         card_y = -0.045
-        card_w = 0.46
+        card_w = 0.52
         card_h = 0.970
         band_h = 0.035
         draw_rounded_panel_with_top_band(
@@ -3770,7 +3770,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
         note_y = 0.005
-        note_w = 0.46
+        note_w = 0.52
         note_h = 0.975
         note_band_h = 0.040
         draw_rounded_panel_with_top_band(
