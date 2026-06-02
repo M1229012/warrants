@@ -429,6 +429,22 @@ def fmt_return_pct(v) -> str:
         return "-"
 
 
+def fmt_optional_return_pct(v) -> str:
+    """
+    TOP15 分點報酬率顯示用。
+    None 代表資料不足，直接顯示 -，避免誤導成 0%。
+    """
+    try:
+        if v is None or v == "":
+            return "-"
+        pct = safe_float(v, None)
+        if pct is None:
+            return "-"
+        return f"{pct:+.1f}%"
+    except Exception:
+        return "-"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 日期推斷 / 勝率統計
 # ══════════════════════════════════════════════════════════════════════
@@ -1969,6 +1985,111 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         return dict(result)
 
+    def build_latest_warrant_price_lookup(price_until: date) -> dict[str, float]:
+        """
+        從「快取_分點歷史」抓每檔權證截至目標日的最新價格。
+
+        這裡支援多種可能欄位名稱，因為不同版本主程式可能寫入：
+        現價、即時價、最新價、收盤價、權證現價、權證收盤價等。
+        若工作表沒有任何價格欄位，TOP15 分點報酬率會顯示 -。
+        """
+        price_col_candidates = [
+            "現價", "即時價", "最新價", "成交價", "收盤價", "收盤",
+            "權證現價", "權證即時價", "權證最新價", "權證收盤價", "權證收盤",
+            "當日收盤價", "今日收盤價", "close", "Close", "price", "Price",
+        ]
+        needed_cols = ["日期", "分點", "權證代號", "權證代碼"] + price_col_candidates
+        hist_df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+        if hist_df.empty:
+            return {}
+
+        price_col = ""
+        for c in price_col_candidates:
+            if c in hist_df.columns:
+                price_col = c
+                break
+
+        if not price_col:
+            return {}
+
+        latest: dict[str, tuple[date, float]] = {}
+        for _, r in hist_df.iterrows():
+            d = parse_date_value(r.get("日期"))
+            if not d or d > price_until:
+                continue
+
+            warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+            if not warrant_code:
+                continue
+
+            price = safe_float(r.get(price_col), 0)
+            if price <= 0:
+                continue
+
+            old = latest.get(warrant_code)
+            if old is None or d >= old[0]:
+                latest[warrant_code] = (d, price)
+
+        return {warrant_code: price for warrant_code, (_, price) in latest.items()}
+
+    def build_broker_return_map_by_underlying(price_lookup: dict[str, float]) -> dict[str, dict[str, float]]:
+        """
+        依目前剩餘部位估算 TOP15 每個「分點 + 標的」的未實現報酬率。
+
+        計算方式：
+        - 剩餘成本：沿用 TOP15 淨買超成本扣減後的 position lot。
+        - 目前市值：剩餘張數 × 該權證最新價格。
+        - 報酬率：(目前市值 - 剩餘成本) / 剩餘成本。
+
+        注意：B/C/D 事件有時是多檔權證合計，原表未必保留每一檔的實際分配成本，
+        因此多檔群組會用可取得價格的平均值估算，沒有價格則顯示 -。
+        """
+        if not price_lookup:
+            return {}
+
+        unique_lots: dict[int, dict] = {}
+        for lots in position_lots_by_warrant.values():
+            for lot in lots:
+                lot_id = safe_int(lot.get("lot_id"), 0)
+                if lot_id and lot_id not in unique_lots:
+                    unique_lots[lot_id] = lot
+
+        tmp: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {
+            "cost": 0.0,
+            "market_value": 0.0,
+        }))
+
+        for lot in unique_lots.values():
+            broker = str(lot.get("broker", "")).strip()
+            underlying = normalize_underlying(lot.get("underlying", ""))
+            remaining_cost = safe_float(lot.get("remaining_cost"), 0)
+            remaining_qty_units = safe_float(lot.get("remaining_qty_units"), 0)
+
+            if not broker or not underlying or remaining_cost <= 0 or remaining_qty_units <= 0:
+                continue
+
+            warrant_codes = [normalize_warrant_code(w) for w in lot.get("warrant_codes", set())]
+            prices = [safe_float(price_lookup.get(w), 0) for w in warrant_codes if safe_float(price_lookup.get(w), 0) > 0]
+
+            if not prices:
+                continue
+
+            current_price = sum(prices) / len(prices)
+            market_value = remaining_qty_units * current_price
+
+            tmp[underlying][broker]["cost"] += remaining_cost
+            tmp[underlying][broker]["market_value"] += market_value
+
+        result: dict[str, dict[str, float]] = defaultdict(dict)
+        for underlying, broker_map in tmp.items():
+            for broker, values in broker_map.items():
+                cost = safe_float(values.get("cost"), 0)
+                market_value = safe_float(values.get("market_value"), 0)
+                if cost > 0 and market_value > 0:
+                    result[underlying][broker] = ((market_value - cost) / cost) * 100.0
+
+        return dict(result)
+
     def register_position_lot(
         broker: str,
         underlying_code: str,
@@ -2439,6 +2560,9 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         except Exception:
             pass
 
+    latest_warrant_price_lookup = build_latest_warrant_price_lookup(target)
+    broker_return_map_by_underlying = build_broker_return_map_by_underlying(latest_warrant_price_lookup)
+
     rows = []
     for item in agg.values():
         # 共識淨買超成本榜只保留目前仍為正淨買超成本的標的
@@ -2451,7 +2575,11 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
 
         participant_brokers = [
-            (broker, amount)
+            (
+                broker,
+                amount,
+                broker_return_map_by_underlying.get(item["underlying"], {}).get(broker),
+            )
             for broker, amount in item["broker_net_amounts"].items()
             if amount > 0
         ]
@@ -2557,22 +2685,28 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
-    def fmt_participant_brokers(row, limit=5):
+    def fmt_participant_brokers(row, limit=4):
         """
-        顯示所有參與分點的淨累積買超金額。
-        多數情況只有 1 家；若有多家共識買超，會完整列出。
+        顯示參與分點的淨累積買超金額與目前未實現報酬率。
+        格式：分點 淨成本 / 報酬率。
         """
         items = row.get("participant_brokers", [])
         if not items:
             top_broker = row.get("top_broker", "")
             top_amount = row.get("top_broker_amount", 0)
-            return fit(f"{top_broker} {fmt_wan(top_amount)}", 24)
+            return fit(f"{top_broker} {fmt_wan(top_amount)} / -", 30)
 
         shown = items[:limit]
-        text_items = [f"{broker} {fmt_wan(amount)}" for broker, amount in shown]
+        text_items = []
+        for item in shown:
+            broker = item[0]
+            amount = item[1] if len(item) > 1 else 0
+            return_pct = item[2] if len(item) > 2 else None
+            text_items.append(f"{broker} {fmt_wan(amount)} / {fmt_optional_return_pct(return_pct)}")
+
         if len(items) > limit:
             text_items.append(f"等{len(items)}家")
-        return fit("、".join(text_items), 30)
+        return fit("、".join(text_items), 42)
 
     # 中央浮水印
     try:
@@ -2597,7 +2731,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
+    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率為剩餘部位概算", 12.5, TEXT, BOLD)
 
     # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
     y -= 0.28
@@ -2628,8 +2762,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點"]
-    col_w = [0.70, 2.25, 2.05, 1.00, 1.15, 5.05]
+    headers = ["排名", "標的", "淨買成本", "家數", "事件", "參與分點 / 報酬率"]
+    col_w = [0.65, 1.85, 1.75, 0.70, 0.95, 6.30]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
