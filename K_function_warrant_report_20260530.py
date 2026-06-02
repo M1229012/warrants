@@ -104,6 +104,12 @@ CROSS_BROKER_OFFSET_FILTER_ENABLE = os.getenv("WARRANT_CROSS_BROKER_OFFSET_FILTE
 CROSS_BROKER_OFFSET_THRESHOLD = float(os.getenv("WARRANT_CROSS_BROKER_OFFSET_THRESHOLD", "0.03"))
 CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT", "1000000"))
 
+# TOP5 專用：排除券商總公司型分點。
+# 只排除「總公司本身」或明確含總公司 / 總部 / 本部 / 自營等字樣的分點，
+# 不排除地方分點，例如富邦公益、元大南屯、群益金鼎某分點。
+TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv("WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRANCHES", "").strip()
+
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 
@@ -1220,6 +1226,111 @@ def filter_out_cross_broker_offset_trades(
     return e, n_rows
 
 
+def _normalize_branch_for_head_office_check(branch_name: str) -> str:
+    """將分點名稱正規化，用於判斷是否為券商總公司型分點。"""
+    s = str(branch_name or "").strip()
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"[\s　\-_－—–]+", "", s)
+    s = s.replace("股份有限公司", "").replace("有限公司", "")
+    return s
+
+
+_DEFAULT_TOP5_HEAD_OFFICE_BRANCHES = {
+    # 本土主要權證 / 經紀券商總公司常見顯示名稱
+    "元大", "元大證券",
+    "富邦", "富邦證券",
+    "凱基", "凱基證券",
+    "群益", "群益證券", "群益金鼎", "群益金鼎證券",
+    "國泰", "國泰證券",
+    "永豐", "永豐證券", "永豐金", "永豐金證券",
+    "統一", "統一證券",
+    "台新", "台新證券",
+    "元富", "元富證券",
+    "兆豐", "兆豐證券",
+    "玉山", "玉山證券",
+    "華南永昌", "華南永昌證券",
+    "中國信託", "中國信託證券", "中信", "中信證券",
+    "第一金", "第一金證券",
+    "合庫", "合庫證券", "合作金庫", "合作金庫證券",
+    "國票", "國票證券",
+    "康和", "康和證券",
+    "宏遠", "宏遠證券",
+    "新光", "新光證券",
+    "日盛", "日盛證券",
+    "臺銀", "臺銀證券", "台銀", "台銀證券",
+    "土銀", "土銀證券",
+    "彰銀", "彰銀證券",
+    "大昌", "大昌證券",
+    "大展", "大展證券",
+    "大慶", "大慶證券",
+    "福邦", "福邦證券",
+    "犇亞", "犇亞證券",
+    "高橋", "高橋證券",
+    "光和", "光和證券",
+    "美好", "美好證券",
+    "陽信", "陽信證券",
+    "致和", "致和證券",
+    "遠智", "遠智證券",
+    "安泰", "安泰證券",
+    "台中銀", "台中銀證券",
+    "三信", "三信證券",
+    "聯邦", "聯邦證券",
+    "亞東", "亞東證券",
+    "大和國泰", "大和國泰證券",
+    "上海商銀", "上海商銀證券",
+    # 外資 / 發行或造市常見總公司名稱
+    "美林", "美林證券", "美商美林", "美商美林證券",
+    "摩根士丹利", "台灣摩根士丹利", "台灣摩根士丹利證券",
+    "摩根大通", "摩根大通證券", "摩根大通證券台北",
+    "高盛", "高盛證券", "美商高盛", "美商高盛證券",
+    "瑞銀", "瑞銀證券", "新加坡商瑞銀", "新加坡商瑞銀證券",
+    "麥格理", "麥格理證券", "港商麥格理", "港商麥格理證券",
+    "花旗", "花旗環球", "花旗環球證券",
+    "法銀巴黎", "法銀巴黎證券", "巴黎證券",
+    "野村", "野村證券", "香港商野村", "香港商野村證券",
+    "里昂", "里昂證券", "港商里昂", "港商里昂證券",
+    "滙豐", "滙豐證券", "匯豐", "匯豐證券", "香港上海滙豐", "香港上海匯豐",
+    "德意志", "德意志證券",
+    "渣打", "渣打證券",
+    "瑞士信貸", "瑞信", "瑞信證券",
+}
+
+
+def _get_top5_head_office_branch_set() -> set:
+    """取得 TOP5 要排除的總公司型分點名稱集合，可用環境變數額外補充。"""
+    names = set(_DEFAULT_TOP5_HEAD_OFFICE_BRANCHES)
+    if TOP5_EXTRA_HEAD_OFFICE_BRANCHES:
+        for item in re.split(r"[,，;；\n\r]+", TOP5_EXTRA_HEAD_OFFICE_BRANCHES):
+            item = _normalize_branch_for_head_office_check(item)
+            if item:
+                names.add(item)
+    return {_normalize_branch_for_head_office_check(x) for x in names if _normalize_branch_for_head_office_check(x)}
+
+
+def is_top5_head_office_branch(branch_name: str) -> bool:
+    """
+    判斷是否為券商總公司型分點。
+
+    原則：
+    1. 分點名稱「完全等於」券商總公司名稱才排除。
+    2. 分點名稱明確含總公司、總部、本部、自營等字樣才排除。
+    3. 不用 startswith 排除，避免富邦公益、元大南屯、群益金鼎某分點被誤刪。
+    """
+    s = _normalize_branch_for_head_office_check(branch_name)
+    if not s or s == "未知分點":
+        return False
+
+    explicit_head_office_keywords = [
+        "總公司", "證券總公司", "總部", "證券總部", "總管理處",
+        "證券本部", "本部", "自營部", "自營", "承銷部", "金融交易部",
+        "衍生性商品部", "衍商部", "權證部", "權證交易部", "金融商品部",
+    ]
+    if any(k in s for k in explicit_head_office_keywords):
+        return True
+
+    return s in _get_top5_head_office_branch_set()
+
+
 def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
     points = []
     df = ctx["plot_df"]
@@ -1375,7 +1486,20 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
         )
         if offset_removed > 0:
             print(f"🧹 TOP5 已排除疑似對手單 / 換手單：{offset_removed:,} 筆")
+
     e["branch"] = e["branch"].replace("", "未知分點")
+
+    if TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE and not e.empty:
+        head_office_mask = e["branch"].map(is_top5_head_office_branch)
+        head_office_removed = int(head_office_mask.sum())
+        if head_office_removed > 0:
+            removed_branches = sorted(set(e.loc[head_office_mask, "branch"].astype(str)))
+            preview = "、".join(removed_branches[:10])
+            if len(removed_branches) > 10:
+                preview += "…"
+            print(f"🏢 TOP5 已排除券商總公司型分點：{head_office_removed:,} 筆｜{preview}")
+        e = e.loc[~head_office_mask].copy()
+
     if e.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
     branch_sum = e.groupby("branch", as_index=False).agg({"net_amount": "sum", "buy_amount": "sum", "sell_amount": "sum"})
@@ -3725,7 +3849,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     for x0, title, df_top, side_color in sections:
         # TOP5 卡片：上緣位置維持，底部往下拓一點，讓內容與外框更有呼吸感。
         card_y = -0.045
-        card_w = 0.48
+        card_w = 0.46
         card_h = 0.970
         band_h = 0.035
         draw_rounded_panel_with_top_band(
@@ -3770,7 +3894,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_notes = fig.add_subplot(gs[7, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
     for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
         note_y = 0.005
-        note_w = 0.48
+        note_w = 0.46
         note_h = 0.975
         note_band_h = 0.040
         draw_rounded_panel_with_top_band(
@@ -3873,7 +3997,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.57 - notes_right_padding, 0.775)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.775)
     draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.55 - notes_right_padding, 0.775)
 
     # x ticks
