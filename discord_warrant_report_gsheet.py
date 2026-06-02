@@ -75,6 +75,7 @@ SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
 SHEET_TOP15_RETURN_CACHE = os.getenv("SHEET_TOP15_RETURN_CACHE", "快取_TOP15分點報酬率")
+TOP15_FILTER_BY_RETURN_CACHE = os.getenv("TOP15_FILTER_BY_RETURN_CACHE", "1").strip().lower() not in ("0", "false", "no")
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
 # 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
@@ -430,21 +431,29 @@ def fmt_return_pct(v) -> str:
         return "-"
 
 
-def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tuple[str, str], float]:
+def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tuple[str, str], dict]:
     """
-    讀取 Google Sheet「快取_TOP15分點報酬率」，回傳：
-        {(標的代號, 分點): 報酬率百分比數值}
+    讀取 Google Sheet「快取_TOP15分點報酬率」。
 
-    支援欄位（主程式快取版）：
-    - 統計日期 / 日期 / 目標日期
-    - 分點
-    - 標的股 或 標的
-    - 報酬率 或 報酬率文字
+    回傳格式：
+        {(標的股代號, 分點): {
+            "return_pct": 報酬率百分比數值或 None,
+            "active_cost": 仍有剩餘部位的成本，
+            "estimated_cost": 可估價格的成本,
+            "coverage_pct": 價格覆蓋率,
+            "date": 統計日期,
+        }}
+
+    用途：
+    - TOP15 排名仍由原本 A/B/C/D + 快取_分點歷史邏輯計算。
+    - 這張快取只用來補上分點報酬率，並過濾已經沒有剩餘部位的分點/標的。
     """
     needed_cols = [
         "統計日期", "日期", "目標日期",
         "分點", "標的股", "標的",
+        "淨買超成本", "可估成本", "缺價格成本",
         "報酬率", "報酬率文字",
+        "價格覆蓋率", "價格覆蓋率文字",
     ]
 
     df = read_gsheet_table_optional(SHEET_TOP15_RETURN_CACHE, needed_cols)
@@ -464,15 +473,13 @@ def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tupl
         if d:
             available_dates.append(d)
 
-    chosen_date = None
-    if available_dates:
-        if target is not None:
-            valid = [d for d in available_dates if d <= target]
-            chosen_date = max(valid) if valid else max(available_dates)
-        else:
-            chosen_date = max(available_dates)
+    # 報酬率快取有時會用「執行程式當天」作統計日期，
+    # 而 TOP15 圖的 target 可能是最近一個交易日。
+    # 因此這裡優先取快取表最新日期，避免因 target 較早一天而讀不到報酬率。
+    chosen_date = max(available_dates) if available_dates else None
 
-    result: dict[tuple[str, str], float] = {}
+    result: dict[tuple[str, str], dict] = {}
+
     for _, r in df.iterrows():
         row_date = pick_cache_date(r)
         if chosen_date and row_date and row_date != chosen_date:
@@ -492,13 +499,28 @@ def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tupl
         if not underlying:
             continue
 
-        pct = normalize_return_pct(r.get("報酬率"))
-        if pct is None:
-            pct = normalize_return_pct(r.get("報酬率文字"))
-        if pct is None:
-            continue
+        active_cost = safe_float(r.get("淨買超成本"), 0)
+        estimated_cost = safe_float(r.get("可估成本"), 0)
 
-        result[(underlying, broker)] = pct
+        # 若舊版快取沒有淨買超成本，就用可估成本判斷是否仍有部位。
+        if active_cost <= 0 and estimated_cost > 0:
+            active_cost = estimated_cost
+
+        return_pct = normalize_return_pct(r.get("報酬率"))
+        if return_pct is None:
+            return_pct = normalize_return_pct(r.get("報酬率文字"))
+
+        coverage_pct = normalize_return_pct(r.get("價格覆蓋率"))
+        if coverage_pct is None:
+            coverage_pct = normalize_return_pct(r.get("價格覆蓋率文字"))
+
+        result[(underlying, broker)] = {
+            "return_pct": return_pct,
+            "active_cost": active_cost,
+            "estimated_cost": estimated_cost,
+            "coverage_pct": coverage_pct,
+            "date": row_date,
+        }
 
     return result
 
@@ -1917,6 +1939,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     if not trading_dates:
         return [], []
 
+    top15_return_cache = read_top15_return_cache_from_gsheet(target)
+
     agg = {}
 
     # 只記錄本次近 N 個有效交易日內，真正被 A/B/C/D 買超事件納入統計的
@@ -2513,9 +2537,9 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         except Exception:
             pass
 
-    top15_return_cache = read_top15_return_cache_from_gsheet(target)
-
     rows = []
+    has_return_cache = bool(top15_return_cache)
+
     for item in agg.values():
         # 共識淨買超成本榜只保留目前仍為正淨買超成本的標的
         if item["net_amount"] <= 0:
@@ -2526,17 +2550,36 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if item["broker_amounts"]:
             top_broker, top_amount = max(item["broker_amounts"].items(), key=lambda kv: kv[1])
 
-        participant_brokers = [
-            (broker, amount, top15_return_cache.get((item["underlying"], broker)))
-            for broker, amount in item["broker_net_amounts"].items()
-            if amount > 0
-        ]
+        participant_brokers = []
+        for broker, amount in item["broker_net_amounts"].items():
+            amount = safe_float(amount, 0)
+            if amount <= 0:
+                continue
+
+            return_info = top15_return_cache.get((item["underlying"], broker)) if has_return_cache else None
+
+            # 若快取表已存在，且該分點+標的在報酬率快取中沒有剩餘部位，
+            # 代表主程式判斷該分點這批近 22 日權證已出清，圖片排名不再顯示它。
+            if TOP15_FILTER_BY_RETURN_CACHE and has_return_cache:
+                if not return_info or safe_float(return_info.get("active_cost"), 0) <= 0:
+                    continue
+
+            return_pct = return_info.get("return_pct") if return_info else None
+            participant_brokers.append((broker, amount, return_pct))
+
         participant_brokers.sort(key=lambda kv: kv[1], reverse=True)
+
+        if TOP15_FILTER_BY_RETURN_CACHE and has_return_cache:
+            filtered_net_amount = sum(safe_float(x[1], 0) for x in participant_brokers)
+            if filtered_net_amount <= 0:
+                continue
+        else:
+            filtered_net_amount = item["net_amount"]
 
         rows.append({
             "target": item["target"],
             "amount": item["amount"],
-            "net_amount": item["net_amount"],
+            "net_amount": filtered_net_amount,
             "count": item["count"],
             "broker_count": len(participant_brokers) if participant_brokers else len(item["brokers"]),
             "brokers": sorted(item["brokers"]),
@@ -2636,7 +2679,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
 
-    def measure_text_width(s, size=14, fp=None):
+    def measure_text_width(s, size=13, fp=None):
         ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
         bb = ghost.get_window_extent(renderer=renderer)
         ghost.remove()
@@ -2648,7 +2691,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     def build_participant_broker_items(row, limit=5):
         """
-        顯示所有參與分點的淨累積買超金額與快取報酬率。
+        顯示所有參與分點的淨累積買超金額與報酬率。
         回傳 [(broker, amount, return_pct), ...]。
         """
         items = row.get("participant_brokers", [])
@@ -2692,7 +2735,8 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 return
 
             ret_text = fmt_return_pct(return_pct)
-            ret_color = RED if safe_float(return_pct, 0) > 0 else GREEN if safe_float(return_pct, 0) < 0 else TEXT
+            ret_value = safe_float(return_pct, None)
+            ret_color = RED if ret_value is not None and ret_value > 0 else GREEN if ret_value is not None and ret_value < 0 else TEXT
             if not draw_piece(ret_text, ret_color):
                 return
 
@@ -2757,7 +2801,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
+    headers = ["排名", "標的", "淨買成本", "分點數", "事件", "參與分點 / 報酬率"]
     col_w = [0.70, 2.15, 1.45, 0.65, 0.85, 6.40]
 
     header_y_top = table_top - section_title_h
