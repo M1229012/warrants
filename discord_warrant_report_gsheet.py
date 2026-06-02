@@ -74,6 +74,7 @@ SHEET_D = "D_近10日累積淨買進"
 SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
+SHEET_TOP15_RETURN_CACHE = os.getenv("SHEET_TOP15_RETURN_CACHE", "快取_TOP15分點報酬率")
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
 # 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
@@ -432,7 +433,7 @@ def fmt_return_pct(v) -> str:
 def fmt_optional_return_pct(v) -> str:
     """
     TOP15 分點報酬率顯示用。
-    None 代表資料不足，直接顯示 -，避免誤導成 0%。
+    None 代表快取沒有資料，直接顯示 -，避免誤導成 0%。
     """
     try:
         if v is None or v == "":
@@ -607,6 +608,107 @@ def read_history_stats_from_gsheet() -> dict:
             }
 
     return result
+
+
+def read_top15_return_cache_from_gsheet(target: date) -> dict[str, dict[str, dict]]:
+    """
+    讀取主程式已經算好並寫入 Google Sheet 的「快取_TOP15分點報酬率」。
+
+    圖片程式只負責讀快取，不再重新抓權證現價或自行重算報酬率。
+    """
+    needed_cols = [
+        "統計日期", "日期", "統計期間",
+        "分點", "標的股", "標的", "標的代號", "標的股代號",
+        "淨買超成本", "可估成本", "缺價格成本", "目前市值", "未實現損益",
+        "報酬率", "報酬率文字", "價格覆蓋率", "權證檔數", "最新價格日期", "權證清單",
+    ]
+
+    df = read_gsheet_table_optional(SHEET_TOP15_RETURN_CACHE, needed_cols)
+    if df.empty:
+        print(f"  ⚠️ 找不到或讀不到 TOP15 分點報酬率快取：{SHEET_TOP15_RETURN_CACHE}")
+        return {}
+
+    if "分點" not in df.columns:
+        print("  ⚠️ TOP15 分點報酬率快取缺少欄位：分點")
+        return {}
+
+    # 優先使用與 target 相同或小於 target 的最新統計日期。
+    date_col = "統計日期" if "統計日期" in df.columns else "日期" if "日期" in df.columns else ""
+    if date_col:
+        df = df.copy()
+        df["__cache_date"] = df[date_col].map(parse_date_value)
+        valid_dates = sorted({d for d in df["__cache_date"].tolist() if d and d <= target})
+
+        if valid_dates:
+            use_date = valid_dates[-1]
+            df = df[df["__cache_date"] == use_date].copy()
+            if use_date != target:
+                print(
+                    f"  ⚠️ TOP15 分點報酬率快取日期為 {use_date:%Y-%m-%d}，"
+                    f"目標日期為 {target:%Y-%m-%d}，將使用最新可用快取。"
+                )
+        else:
+            parsed_count = sum(1 for d in df["__cache_date"].tolist() if d)
+            if parsed_count > 0:
+                print("  ⚠️ TOP15 分點報酬率快取沒有 <= 目標日期的資料，將嘗試使用整張快取表。")
+
+    def get_first_existing(row, candidates):
+        for c in candidates:
+            if c in row.index:
+                v = strip_gsheet_text_prefix(row.get(c, ""))
+                if str(v).strip() not in ("", "-"):
+                    return v
+        return ""
+
+    result: dict[str, dict[str, dict]] = defaultdict(dict)
+
+    for _, r in df.iterrows():
+        broker = str(r.get("分點", "")).strip()
+        if broker not in TRACKED_BROKERS:
+            continue
+
+        underlying_raw = get_first_existing(r, ["標的股", "標的股代號", "標的代號", "標的"])
+        warrant_text = r.get("權證清單", "") if "權證清單" in r.index else ""
+
+        # 快取表的標的欄位可能是「2376」也可能是「2376 技嘉」，
+        # 這裡先把開頭代號取出來，避免圖片 TOP15 的 item["underlying"] 對不到快取。
+        underlying_text = str(underlying_raw).strip()
+        m = re.match(r"^'?([0-9]{4,6})(?:\.0)?(?:\s|　|$)", underlying_text)
+        if m:
+            underlying_raw = m.group(1)
+
+        underlying = normalize_underlying(underlying_raw, warrant_text)
+        if not underlying:
+            continue
+
+        return_text = get_first_existing(r, ["報酬率文字"])
+        return_pct = None
+        if "報酬率" in r.index:
+            return_pct = normalize_return_pct(r.get("報酬率"))
+        if return_pct is None and return_text:
+            return_pct = normalize_return_pct(return_text)
+
+        if return_text in ("", "-") and return_pct is not None:
+            return_text = fmt_optional_return_pct(return_pct)
+
+        cost = safe_float(get_first_existing(r, ["淨買超成本", "可估成本"]), 0)
+        coverage = get_first_existing(r, ["價格覆蓋率"])
+
+        old = result[underlying].get(broker)
+        # 若同一分點 + 標的在快取表中重複，保留淨買超成本較大的那筆。
+        if old and safe_float(old.get("cost"), 0) > cost:
+            continue
+
+        result[underlying][broker] = {
+            "return_pct": return_pct,
+            "return_text": return_text if return_text else "-",
+            "cost": cost,
+            "coverage": coverage,
+        }
+
+    total_rows = sum(len(v) for v in result.values())
+    print(f"  ✅ 已讀取 TOP15 分點報酬率快取：{SHEET_TOP15_RETURN_CACHE}，可用 {total_rows:,} 筆")
+    return dict(result)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1985,111 +2087,6 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
         return dict(result)
 
-    def build_latest_warrant_price_lookup(price_until: date) -> dict[str, float]:
-        """
-        從「快取_分點歷史」抓每檔權證截至目標日的最新價格。
-
-        這裡支援多種可能欄位名稱，因為不同版本主程式可能寫入：
-        現價、即時價、最新價、收盤價、權證現價、權證收盤價等。
-        若工作表沒有任何價格欄位，TOP15 分點報酬率會顯示 -。
-        """
-        price_col_candidates = [
-            "現價", "即時價", "最新價", "成交價", "收盤價", "收盤",
-            "權證現價", "權證即時價", "權證最新價", "權證收盤價", "權證收盤",
-            "當日收盤價", "今日收盤價", "close", "Close", "price", "Price",
-        ]
-        needed_cols = ["日期", "分點", "權證代號", "權證代碼"] + price_col_candidates
-        hist_df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
-        if hist_df.empty:
-            return {}
-
-        price_col = ""
-        for c in price_col_candidates:
-            if c in hist_df.columns:
-                price_col = c
-                break
-
-        if not price_col:
-            return {}
-
-        latest: dict[str, tuple[date, float]] = {}
-        for _, r in hist_df.iterrows():
-            d = parse_date_value(r.get("日期"))
-            if not d or d > price_until:
-                continue
-
-            warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-            if not warrant_code:
-                continue
-
-            price = safe_float(r.get(price_col), 0)
-            if price <= 0:
-                continue
-
-            old = latest.get(warrant_code)
-            if old is None or d >= old[0]:
-                latest[warrant_code] = (d, price)
-
-        return {warrant_code: price for warrant_code, (_, price) in latest.items()}
-
-    def build_broker_return_map_by_underlying(price_lookup: dict[str, float]) -> dict[str, dict[str, float]]:
-        """
-        依目前剩餘部位估算 TOP15 每個「分點 + 標的」的未實現報酬率。
-
-        計算方式：
-        - 剩餘成本：沿用 TOP15 淨買超成本扣減後的 position lot。
-        - 目前市值：剩餘張數 × 該權證最新價格。
-        - 報酬率：(目前市值 - 剩餘成本) / 剩餘成本。
-
-        注意：B/C/D 事件有時是多檔權證合計，原表未必保留每一檔的實際分配成本，
-        因此多檔群組會用可取得價格的平均值估算，沒有價格則顯示 -。
-        """
-        if not price_lookup:
-            return {}
-
-        unique_lots: dict[int, dict] = {}
-        for lots in position_lots_by_warrant.values():
-            for lot in lots:
-                lot_id = safe_int(lot.get("lot_id"), 0)
-                if lot_id and lot_id not in unique_lots:
-                    unique_lots[lot_id] = lot
-
-        tmp: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {
-            "cost": 0.0,
-            "market_value": 0.0,
-        }))
-
-        for lot in unique_lots.values():
-            broker = str(lot.get("broker", "")).strip()
-            underlying = normalize_underlying(lot.get("underlying", ""))
-            remaining_cost = safe_float(lot.get("remaining_cost"), 0)
-            remaining_qty_units = safe_float(lot.get("remaining_qty_units"), 0)
-
-            if not broker or not underlying or remaining_cost <= 0 or remaining_qty_units <= 0:
-                continue
-
-            warrant_codes = [normalize_warrant_code(w) for w in lot.get("warrant_codes", set())]
-            prices = [safe_float(price_lookup.get(w), 0) for w in warrant_codes if safe_float(price_lookup.get(w), 0) > 0]
-
-            if not prices:
-                continue
-
-            current_price = sum(prices) / len(prices)
-            market_value = remaining_qty_units * current_price
-
-            tmp[underlying][broker]["cost"] += remaining_cost
-            tmp[underlying][broker]["market_value"] += market_value
-
-        result: dict[str, dict[str, float]] = defaultdict(dict)
-        for underlying, broker_map in tmp.items():
-            for broker, values in broker_map.items():
-                cost = safe_float(values.get("cost"), 0)
-                market_value = safe_float(values.get("market_value"), 0)
-                if cost > 0 and market_value > 0:
-                    result[underlying][broker] = ((market_value - cost) / cost) * 100.0
-
-        return dict(result)
-
     def register_position_lot(
         broker: str,
         underlying_code: str,
@@ -2560,8 +2557,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         except Exception:
             pass
 
-    latest_warrant_price_lookup = build_latest_warrant_price_lookup(target)
-    broker_return_map_by_underlying = build_broker_return_map_by_underlying(latest_warrant_price_lookup)
+    broker_return_cache_by_underlying = read_top15_return_cache_from_gsheet(target)
 
     rows = []
     for item in agg.values():
@@ -2578,7 +2574,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             (
                 broker,
                 amount,
-                broker_return_map_by_underlying.get(item["underlying"], {}).get(broker),
+                broker_return_cache_by_underlying.get(item["underlying"], {}).get(broker, {}).get("return_pct"),
+                broker_return_cache_by_underlying.get(item["underlying"], {}).get(broker, {}).get("return_text", "-"),
             )
             for broker, amount in item["broker_net_amounts"].items()
             if amount > 0
@@ -2687,7 +2684,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     def fmt_participant_brokers(row, limit=4):
         """
-        顯示參與分點的淨累積買超金額與目前未實現報酬率。
+        顯示參與分點的淨累積買超金額與快取中的目前報酬率。
         格式：分點 淨成本 / 報酬率。
         """
         items = row.get("participant_brokers", [])
@@ -2702,7 +2699,12 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             broker = item[0]
             amount = item[1] if len(item) > 1 else 0
             return_pct = item[2] if len(item) > 2 else None
-            text_items.append(f"{broker} {fmt_wan(amount)} / {fmt_optional_return_pct(return_pct)}")
+            return_text = item[3] if len(item) > 3 else ""
+            if return_text and str(return_text).strip() not in ("", "-"):
+                ret_display = str(return_text).strip()
+            else:
+                ret_display = fmt_optional_return_pct(return_pct)
+            text_items.append(f"{broker} {fmt_wan(amount)} / {ret_display}")
 
         if len(items) > limit:
             text_items.append(f"等{len(items)}家")
@@ -2731,7 +2733,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率為剩餘部位概算", 12.5, TEXT, BOLD)
+    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率讀取快取", 12.5, TEXT, BOLD)
 
     # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
     y -= 0.28
