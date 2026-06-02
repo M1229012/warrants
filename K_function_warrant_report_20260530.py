@@ -1732,28 +1732,47 @@ def make_stock_aliases(stock_name: str) -> List[str]:
     return [a for a in aliases if a]
 
 
+def _normalize_warrant_match_text(text: str) -> str:
+    """權證名稱 / 股票別名比對用正規化，避免空白、符號、台臺差異造成名稱比對失敗。"""
+    s = html.unescape(str(text or "")).strip()
+    s = s.replace("臺", "台")
+    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
+    return s.strip()
+
+
 def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
     frames = []
-    for f in [fetch_twse_openapi_warrant_daily_df(), fetch_tpex_openapi_warrant_daily_df()]:
-        if f is not None and not f.empty:
-            frames.append(f)
+    for source_label, f in [("TWSE", fetch_twse_openapi_warrant_daily_df()), ("TPEx", fetch_tpex_openapi_warrant_daily_df())]:
+        if f is None or f.empty:
+            continue
+        trade_dates = sorted([d for d in f["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
+        if not trade_dates:
+            continue
+        latest_trade_date = trade_dates[-1]
+        latest_df = f[f["交易日期"] == latest_trade_date].copy()
+        frames.append(latest_df)
+        print(f"🔎 {source_label} OpenAPI 最新交易日：{latest_trade_date}｜當日權證：{len(latest_df):,} 支")
+
     if not frames:
         return []
+
     all_df = pd.concat(frames, ignore_index=True).fillna("")
-    trade_dates = sorted([d for d in all_df["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
-    if not trade_dates:
-        return []
-    latest_trade_date = trade_dates[-1]
     active_df = all_df[
-        (all_df["交易日期"] == latest_trade_date)
-        & (all_df["名稱"].astype(str).str.contains("購", na=False))
+        (all_df["名稱"].astype(str).str.contains("購", na=False))
         & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
         & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
     ].copy()
+    print(f"🔎 OpenAPI 認購候選（不限制成交量）：{len(active_df):,} 支")
+
     lookup = load_warrant_underlying_lookup()
     aliases = make_stock_aliases(stock_name)
+    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
+    stock_code_clean = _clean_code(stock_code)
     warrants = []
     seen = set()
+    name_match_count = 0
+    lookup_match_count = 0
+
     for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
         code = normalize_openapi_warrant_code(r.get("代號"))
         name = str(r.get("名稱", "")).strip()
@@ -1762,20 +1781,33 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
         cached = lookup.get(code, {})
         ucode = _clean_code(cached.get("underlying_code", ""))
         uname = str(cached.get("underlying_name", "")).strip()
-        name_match = any(name.replace(" ", "").startswith(a) for a in aliases if a)
-        if ucode == str(stock_code) or name_match:
+
+        name_key = _normalize_warrant_match_text(name)
+        # 權證名稱通常格式為「標的 + 發行券商 + 到期年月 + 購xx」，但不同來源可能有空白或符號。
+        # 這裡改成檢查股票別名是否出現在名稱前段，而不是硬性 startswith。
+        name_front = name_key[:16]
+        name_match = any(alias and alias in name_front for alias in aliases_norm)
+        lookup_match = bool(ucode and ucode == stock_code_clean)
+
+        if lookup_match or name_match:
+            if lookup_match:
+                lookup_match_count += 1
+            if name_match:
+                name_match_count += 1
             seen.add(code)
             warrants.append({
                 "代號": code,
                 "名稱": name,
-                "標的股": str(stock_code),
+                "標的股": str(stock_code_clean),
                 "標的名稱": uname or stock_name,
                 "成交金額": int(r.get("成交金額", 0) or 0),
                 "成交量": int(r.get("成交量", 0) or 0),
             })
+
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-    print(f"✅ {stock_code} 相關認購權證：{len(warrants):,} 支")
+    print(f"🔎 {stock_code_clean} {stock_name} 權證比對：lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支")
+    print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
     return warrants
 
 
