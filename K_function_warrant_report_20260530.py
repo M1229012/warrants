@@ -3997,8 +3997,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             )
             y -= notes_line_height * line_count + notes_item_gap
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.55 - notes_right_padding, 0.775)
-    draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.55 - notes_right_padding, 0.775)
+    draw_note_items(key_points[:4], 0.04, 0.02 + 0.57 - notes_right_padding, 0.775)
+    draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.57 - notes_right_padding, 0.775)
 
     # x ticks
     interval = max(1, len(x) // 12)
