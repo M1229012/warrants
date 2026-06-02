@@ -1758,11 +1758,12 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
 
     all_df = pd.concat(frames, ignore_index=True).fillna("")
     active_df = all_df[
-        (all_df["名稱"].astype(str).str.contains("購", na=False))
+        (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
+        & (all_df["名稱"].astype(str).str.contains("購", na=False))
         & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
         & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
     ].copy()
-    print(f"🔎 OpenAPI 認購候選（不限制成交量）：{len(active_df):,} 支")
+    print(f"🔎 OpenAPI 認購候選（成交量 > 0）：{len(active_df):,} 支")
 
     lookup = load_warrant_underlying_lookup()
     aliases = make_stock_aliases(stock_name)
