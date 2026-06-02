@@ -1,153 +1,142 @@
 name: Warrant Report Manual Test
 
-
-
 on:
-
   workflow_dispatch:
-
     inputs:
-
       stock_codes:
-
         description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
-
         required: false
-
         default: "2408"
-
-
+      enable_gemini:
+        description: "是否開啟 Gemini / LLM 摘要（1=開啟，0=關閉；debug 資料時建議 0）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
+      enable_news:
+        description: "是否抓取本週新聞 / 題材（1=開啟，0=關閉；debug 資料時建議 0）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
+      force_warrant_cache_refresh:
+        description: "是否強制重抓權證 live 資料並覆蓋 Google Sheet 快取（1=重抓，0=優先用快取）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
 
 jobs:
-
   run-warrant-report-test:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
 
-
-
     env:
-
       OUTPUT_DIR: output
-
       STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
 
-
-
       # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
-
       MPLBACKEND: Agg
 
-
-
       # Google Sheet 設定
-
       WARRANT_GSHEET_ENABLE: "1"
-
       GSHEET_NAME: "權證分點籌碼"
-
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-
+      # 權證快取設定：直接寫入 Google Sheet，不依賴 GitHub runner 本機快取。
+      WARRANT_GSHEET_CACHE_ENABLE: "1"
+      WARRANT_GSHEET_HISTORY_SHEET: "快取_分點歷史"
+      WARRANT_GSHEET_STATUS_SHEET: "快取_分點歷史_狀態"
+      WARRANT_CACHE_FORCE_REFRESH: ${{ inputs.force_warrant_cache_refresh }}
+      WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # FinMind 設定：三大法人資料來源
-
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
 
-
-
       # Gemini / LLM 新聞與本週重點摘要設定
-
+      # enable_gemini=0 時，不會呼叫 Gemini，會改用規則式摘要 / 既有資料流程。
+      WARRANT_GEMINI_ENABLE: ${{ inputs.enable_gemini }}
+      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: ${{ inputs.enable_gemini }}
+      WARRANT_LLM_CACHE_ENABLE: "1"
+      WARRANT_LLM_CACHE_DIR: llm_cache
       WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
-
       GEMINI_MODEL: gemini-2.5-flash
 
+      # 新聞抓取開關：debug 權證資金流時建議先關閉，避免浪費時間與額度。
+      WARRANT_NEWS_ENABLE: ${{ inputs.enable_news }}
 
+      # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
+      # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
+      WARRANT_API_RETRY_TIMES: "3"
+      WARRANT_API_RETRY_BASE_WAIT: "1.5"
+      WARRANT_API_REQUIRE_FULL_SUCCESS: "1"
+      WARRANT_API_FAILURE_ABORT_RATIO: "0"
+      WARRANT_API_FAILURE_ABORT_MIN_REQUESTS: "1"
+      WARRANT_API_EMPTY_AS_FAILURE: "0"
 
       # 權證分點報告設定
-
       WARRANT_EVENT_MIN_AMOUNT: "0"
-
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
-
       WARRANT_REPORT_MAX_ROWS: "8"
 
-
-
       # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
-
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
-
-
     steps:
-
       - name: Checkout repository
-
         uses: actions/checkout@v4
 
+      - name: Restore LLM cache
+        uses: actions/cache@v4
+        with:
+          path: llm_cache
+          key: warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-
+            warrant-report-llm-cache-${{ runner.os }}-
 
+      - name: Prepare output and cache folders
+        run: |
+          mkdir -p output llm_cache
 
       - name: Install system fonts
-
         run: |
-
           sudo apt-get update
-
           sudo apt-get install -y fonts-noto-cjk
 
       - name: Set up Python
-
         uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.11"
-
           cache: "pip"
 
-
-
       - name: Install Python dependencies
-
         run: |
-
           python -m pip install --upgrade pip
-
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
           pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2 beautifulsoup4 lxml google-genai googlenewsdecoder
 
       - name: Check FinMind token
-
         run: |
-
           python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
 
-      - name: Check Gemini API key
-
+      - name: Check Gemini and cache setting
         run: |
-
-          python -c "import os; print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY')"
+          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY')"
 
       - name: Run warrant report test
-
         run: python run_report.py
 
-
-
       - name: Upload report artifact
-
         uses: actions/upload-artifact@v4
-
         if: always()
-
         with:
-
           name: warrant-report-test-output
-
           path: output/*.png
-
           if-no-files-found: warn
