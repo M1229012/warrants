@@ -385,7 +385,7 @@ def normalize_return_pct(v):
     """
     將 Google Sheet 權證報酬率統一轉成「百分比數值」。
 
-    例：
+    這個函式保留舊邏輯，給每日賣出明細 / A/B/C/D 獲利% 使用：
     - "11.67%" -> 11.67
     - 11.67    -> 11.67
     - 0.1167   -> 11.67
@@ -418,6 +418,39 @@ def normalize_return_pct(v):
         return None
 
 
+def normalize_top15_cache_return_pct(v):
+    """
+    將「快取_TOP15分點報酬率」的報酬率欄位轉成百分比數值。
+
+    重要：
+    TOP15 快取表的「報酬率」欄位已經是百分比口徑，例如：
+    - -1.87 代表 -1.87%，不可再乘以 100。
+    - -3.31 代表 -3.31%，不可再變成 -331%。
+    - "12.34%" 代表 12.34%。
+
+    權證剩餘部位報酬率最低只能到 -100%，因此低於 -100 的異常值會限制為 -100。
+    """
+    try:
+        if v is None:
+            return None
+
+        raw = strip_gsheet_text_prefix(v)
+        if raw == "" or raw == "-":
+            return None
+
+        pct = safe_float(raw, None)
+        if pct is None:
+            return None
+
+        if pct < -100.0:
+            pct = -100.0
+
+        return pct
+
+    except Exception:
+        return None
+
+
 def fmt_return_pct(v) -> str:
     try:
         if v is None or v == "":
@@ -425,6 +458,8 @@ def fmt_return_pct(v) -> str:
         pct = safe_float(v, None)
         if pct is None:
             return "-"
+        if pct < -100.0:
+            pct = -100.0
         return f"{pct:+.1f}%"
     except Exception:
         return "-"
@@ -518,9 +553,9 @@ def read_top15_return_cache_from_gsheet(target: date | None = None) -> dict[tupl
         if remaining_cost <= 0:
             continue
 
-        pct = normalize_return_pct(r.get("報酬率"))
+        pct = normalize_top15_cache_return_pct(r.get("報酬率"))
         if pct is None:
-            pct = normalize_return_pct(r.get("報酬率文字"))
+            pct = normalize_top15_cache_return_pct(r.get("報酬率文字"))
 
         result[(underlying, broker)] = {
             "return_pct": pct,
