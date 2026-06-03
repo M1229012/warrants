@@ -86,7 +86,7 @@ jobs:
       WARRANT_REPORT_MAX_ROWS: "8"
 
       # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
-      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
     steps:
       - name: Checkout repository
