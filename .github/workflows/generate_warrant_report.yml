@@ -73,7 +73,7 @@ jobs:
 
       # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
       # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
-      WARRANT_API_RETRY_TIMES: "3"
+      WARRANT_API_RETRY_TIMES: "5"
       WARRANT_API_RETRY_BASE_WAIT: "1.5"
       WARRANT_API_REQUIRE_FULL_SUCCESS: "1"
       WARRANT_API_FAILURE_ABORT_RATIO: "0"
