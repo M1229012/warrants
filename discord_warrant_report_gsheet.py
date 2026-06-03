@@ -385,11 +385,15 @@ def normalize_return_pct(v):
     """
     將 Google Sheet 權證報酬率統一轉成「百分比數值」。
 
-    這個函式保留舊邏輯，給每日賣出明細 / A/B/C/D 獲利% 使用：
+    重要：
     - "11.67%" -> 11.67
     - 11.67    -> 11.67
-    - 0.1167   -> 11.67
-    - 1.6508   -> 165.08
+    - -3       -> -3
+
+    不再用「-5 < pct < 5 就乘以 100」的啟發式判斷，
+    避免 Google Sheet 裸百分比數值 3 被誤判成 300%。
+    若未來某個來源真的使用 0.03 代表 3%，應針對該來源另外轉換，
+    不應放在通用函式中猜測。
     """
     try:
         if v is None:
@@ -399,19 +403,10 @@ def normalize_return_pct(v):
         if raw == "" or raw == "-":
             return None
 
-        has_percent = "%" in str(raw)
         pct = safe_float(raw, None)
         if pct is None:
             return None
 
-        if has_percent:
-            return pct
-
-        # 無 % 符號且落在 -5~5，視為小數報酬率
-        if -5 < pct < 5:
-            return pct * 100.0
-
-        # 其他視為已經是百分比
         return pct
 
     except Exception:
@@ -1376,21 +1371,36 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         warrant_count = len(items)
 
         # 賣方報酬率合計邏輯：
-        # 你希望同一天 A/B/C/D 若有同一標的賣方動作，直接加總概算。
-        # 因此優先使用：
-        #   報酬率 = (合計賣出金額 - 合計買進金額) / 合計買進金額
-        # 這樣能和「買進金額都有，直接加在一起算」的邏輯一致。
-        total_buy_amount = sum(safe_float(i.get("buy_amount"), 0) for i in items)
+        # 同一天同分點同標的可能會把 A/B/C/D 權證與「單一賣超」合併。
+        # 因此報酬率計算時，分子與分母必須限定在同一批「有成本」的項目，
+        # 避免分子含全部賣出金額、分母只含部分買進成本，造成報酬率被高估。
+        costed_items = [
+            i for i in items
+            if safe_float(i.get("buy_amount"), 0) > 0 and safe_float(i.get("amount"), 0) > 0
+        ]
+        total_buy_amount = sum(safe_float(i.get("buy_amount"), 0) for i in costed_items)
+        costed_sell_amount = sum(safe_float(i.get("amount"), 0) for i in costed_items)
 
-        if kind == "sell" and total_buy_amount > 0:
-            return_pct = ((amount - total_buy_amount) / total_buy_amount) * 100.0
+        if kind == "sell" and total_buy_amount > 0 and costed_sell_amount > 0:
+            return_pct = ((costed_sell_amount - total_buy_amount) / total_buy_amount) * 100.0
         else:
             # fallback：若沒有買進金額，才用個別報酬率反推成本。
-            valid_returns = [
-                (i.get("return_pct"), i.get("amount", 0))
-                for i in items
-                if i.get("return_pct") is not None and float(i.get("amount", 0) or 0) > 0
-            ]
+            # 接近 -100% 的報酬率會讓反推成本被極端放大，直接排除避免扭曲合計報酬率。
+            valid_returns = []
+            for i in items:
+                pct = i.get("return_pct")
+                sell_amount = safe_float(i.get("amount", 0), 0)
+                if pct is None or sell_amount <= 0:
+                    continue
+
+                pct = safe_float(pct, None)
+                if pct is None:
+                    continue
+
+                if pct <= -95.0:
+                    continue
+
+                valid_returns.append((pct, sell_amount))
 
             if valid_returns:
                 total_sell_amount = 0.0
@@ -1506,6 +1516,58 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     return result
 
 
+def read_actual_daily_net_from_history(target: date) -> dict:
+    """
+    從「快取_分點歷史」計算指定日期五大追蹤分點的實際買賣超。
+
+    用途：
+    - 第一張圖 KPI 的「實際淨買超」必須用同一個資料來源計算。
+    - 不再用 A/B/C/D 買超事件金額去扣「每日賣出明細」的實際賣出金額，
+      避免買方與賣方來源集合不同，造成數學口徑不一致。
+
+    回傳：
+        {
+            "buy_amount": 今日實際買進金額,
+            "sell_amount": 今日實際賣出金額,
+            "net_amount": 今日實際買進金額 - 今日實際賣出金額,
+            "has_data": 是否有讀到該日快取_分點歷史資料,
+        }
+    """
+    needed_cols = ["日期", "分點", "買進金額", "賣出金額"]
+    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+
+    buy_amount = 0.0
+    sell_amount = 0.0
+    has_data = False
+
+    if df.empty:
+        return {
+            "buy_amount": buy_amount,
+            "sell_amount": sell_amount,
+            "net_amount": buy_amount - sell_amount,
+            "has_data": False,
+        }
+
+    for _, r in df.iterrows():
+        if parse_date_value(r.get("日期")) != target:
+            continue
+
+        broker = str(r.get("分點", "")).strip()
+        if broker not in TRACKED_BROKERS:
+            continue
+
+        has_data = True
+        buy_amount += safe_float(r.get("買進金額"), 0)
+        sell_amount += safe_float(r.get("賣出金額"), 0)
+
+    return {
+        "buy_amount": buy_amount,
+        "sell_amount": sell_amount,
+        "net_amount": buy_amount - sell_amount,
+        "has_data": has_data,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 繪圖
 # ══════════════════════════════════════════════════════════════════════
@@ -1550,7 +1612,13 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
     buy_total = sum(x["amount"] for x in buys)
     sell_total = sum(x["amount"] for x in sells)
-    net = buy_total - sell_total
+
+    # KPI 的「實際淨買超」改用同一個資料來源「快取_分點歷史」計算：
+    # 今日實際買進金額 - 今日實際賣出金額。
+    # 不再混用 A/B/C/D 買超事件金額與每日賣出明細成交金額。
+    actual_daily_flow = read_actual_daily_net_from_history(target)
+    has_actual_daily_flow = bool(actual_daily_flow.get("has_data"))
+    actual_net = safe_float(actual_daily_flow.get("net_amount"), 0)
 
     broker_summary = {}
     for b in TRACKED_BROKERS:
@@ -1719,10 +1787,14 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     kpi_y = y - kpi_h
     kpi_gap = 0.30
     kpi_w = (content_w - 2 * kpi_gap) / 3
+    actual_net_text = fmt_wan(actual_net) if has_actual_daily_flow else "-"
+    actual_net_color = RED if actual_net >= 0 else GREEN
+    actual_net_bg = PINK if actual_net >= 0 else MINT
+
     kpis = [
         ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK, "↗"),
         ("今日賣超", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
-        ("淨買超", "", fmt_wan(net), RED if net >= 0 else GREEN, PINK if net >= 0 else MINT, "◎"),
+        ("實際淨買超", "", actual_net_text, actual_net_color, actual_net_bg, "◎"),
     ]
     for i, (title, mid, val, color, bg, icon) in enumerate(kpis):
         x = margin_x + i * (kpi_w + kpi_gap)
