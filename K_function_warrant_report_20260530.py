@@ -5470,22 +5470,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
-    selected_branch_label = "、".join(_get_selected_branch_flow_list())
-    if selected_branch_label:
-        selected_wnet_ax.text(
-            0.001, 1.005,
-            f"分點：{selected_branch_label}",
-            transform=selected_wnet_ax.transAxes,
-            color=MUTED,
-            fontsize=20,
-            fontweight="bold",
-            ha="left",
-            va="bottom",
-            alpha=0.92,
-            clip_on=False,
-            zorder=12,
-        )
-
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, selected_latest_bar_color, gap_px=8)
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"最新日 {fmt_money(selected_latest_net)}", selected_latest_bar_color, gap_px=22)
@@ -5497,6 +5481,23 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
     draw_header_text_and_advance(selected_wnet_ax, xpos, f"累計 {fmt_money(selected_latest_cum)}", BLUE, gap_px=0)
+
+    selected_branch_label = "、".join(_get_selected_branch_flow_list())
+    if selected_branch_label:
+        selected_wnet_ax.text(
+            0.001, 0.985,
+            f"分點：{selected_branch_label}",
+            transform=selected_wnet_ax.transAxes,
+            color=MUTED,
+            fontsize=18,
+            fontweight="bold",
+            ha="left",
+            va="top",
+            alpha=0.92,
+            clip_on=True,
+            zorder=12,
+            bbox=dict(facecolor=PANEL, edgecolor="none", boxstyle="round,pad=0.12", alpha=0.82),
+        )
 
     selected_wnet_ax.bar(x, selected_vals, color=[RED if v >= 0 else GREEN for v in selected_vals], width=0.75, alpha=0.85)
     selected_wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
