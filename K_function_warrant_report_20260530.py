@@ -132,14 +132,20 @@ LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").
 LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH
 
 # API 重試與完整度檢查：預設仍保守，但允許極少數硬失敗，避免大母體請求因單筆 timeout 整張中止。
-API_RETRY_TIMES = int(os.getenv("WARRANT_API_RETRY_TIMES", "3"))
-API_RETRY_BASE_WAIT = float(os.getenv("WARRANT_API_RETRY_BASE_WAIT", "1.5"))
+# MoneyDJ 偶爾會短暫回 500，因此預設重試次數拉高，並在 API4 第一輪失敗後做第二輪低併發補抓。
+API_RETRY_TIMES = int(os.getenv("WARRANT_API_RETRY_TIMES", "6"))
+API_RETRY_BASE_WAIT = float(os.getenv("WARRANT_API_RETRY_BASE_WAIT", "2.0"))
 API_FAILURE_ABORT_RATIO = float(os.getenv("WARRANT_API_FAILURE_ABORT_RATIO", "0.005"))
 API_FAILURE_ABORT_ABS_COUNT = int(os.getenv("WARRANT_API_FAILURE_ABORT_ABS_COUNT", "3"))
 API_FAILURE_ABORT_MIN_REQUESTS = int(os.getenv("WARRANT_API_FAILURE_ABORT_MIN_REQUESTS", "1"))
 API_REQUIRE_FULL_SUCCESS = os.getenv("WARRANT_API_REQUIRE_FULL_SUCCESS", "1").strip().lower() not in ("0", "false", "no", "off")
 API_ALLOW_TINY_FAILURE = os.getenv("WARRANT_API_ALLOW_TINY_FAILURE", "1").strip().lower() in ("1", "true", "yes", "on")
 API_EMPTY_AS_FAILURE = os.getenv("WARRANT_API_EMPTY_AS_FAILURE", "0").strip().lower() in ("1", "true", "yes", "on")
+API4_SECOND_PASS_ENABLE = os.getenv("WARRANT_API4_SECOND_PASS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+API4_SECOND_PASS_WORKERS = int(os.getenv("WARRANT_API4_SECOND_PASS_WORKERS", "6"))
+API4_SECOND_PASS_WAIT = float(os.getenv("WARRANT_API4_SECOND_PASS_WAIT", "5"))
+# 由 Google Sheet 歷史快取補進來的權證，若 API4 仍查不到，保留既有快取資料，不讓已到期 / 已下市權證拖垮整張圖。
+API4_HISTORY_FAILURE_AS_EMPTY = os.getenv("WARRANT_API4_HISTORY_FAILURE_AS_EMPTY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
 LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -525,6 +531,13 @@ def abort_if_api_failure_too_high(scope: str, label: str):
         )
 
 
+class ApiFetchRetryError(RuntimeError):
+    """保留 MoneyDJ API 最終失敗前實際重試次數，避免 log 顯示 retry=0。"""
+    def __init__(self, message: str, retry_count: int = 0):
+        super().__init__(message)
+        self.retry_count = int(retry_count or 0)
+
+
 def _moneydj_get_json_with_retry(url: str, scope: str):
     last_error = None
     retry_count = 0
@@ -542,7 +555,7 @@ def _moneydj_get_json_with_retry(url: str, scope: str):
                 wait_sec = API_RETRY_BASE_WAIT * attempt
                 time.sleep(wait_sec)
                 continue
-    raise RuntimeError(str(last_error))
+    raise ApiFetchRetryError(str(last_error), retry_count=retry_count)
 
 
 def _llm_cache_path(prompt: str) -> str:
@@ -2197,6 +2210,7 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
                 "標的名稱": uname or stock_name,
                 "成交金額": int(r.get("成交金額", 0) or 0),
                 "成交量": int(r.get("成交量", 0) or 0),
+                "母體來源": "OpenAPI",
             })
 
     historical_warrants = load_historical_call_warrants_from_cache(
@@ -2219,6 +2233,7 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
             "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
             "成交金額": int(rec.get("成交金額", 0) or 0),
             "成交量": int(rec.get("成交量", 0) or 0),
+            "母體來源": "GoogleSheetHistory",
         })
 
     if MAX_WARRANTS > 0:
@@ -2228,7 +2243,8 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
     return warrants
 
 
-def api4_get(code, start, end):
+def _api4_fetch_raw(code, start, end):
+    """API4 原始抓取，不直接寫入統計；由呼叫端決定第一輪/第二輪後的最終狀態。"""
     retry_count = 0
     try:
         url = API4.format(code=code, start=start, end=end)
@@ -2236,11 +2252,16 @@ def api4_get(code, start, end):
         rows = []
         for item in (data if isinstance(data, list) else [data]):
             rows.extend(item.get("ResultSet", {}).get("Result", []))
-        _record_api_fetch("api4", "success" if rows else "empty", retry_count=retry_count)
-        return rows
+        return rows, ("success" if rows else "empty"), "", retry_count
     except Exception as e:
-        _record_api_fetch("api4", "failed", error=f"{code}｜{e}", retry_count=retry_count)
-        return []
+        retry_count = int(getattr(e, "retry_count", retry_count) or 0)
+        return [], "failed", str(e), retry_count
+
+
+def api4_get(code, start, end):
+    rows, status, error, retry_count = _api4_fetch_raw(code, start, end)
+    _record_api_fetch("api4", status, error=f"{code}｜{error}" if error else "", retry_count=retry_count)
+    return rows
 
 
 def api5_get(warrant, broker, days=None):
@@ -2254,6 +2275,7 @@ def api5_get(warrant, broker, days=None):
         _record_api_fetch("api5", "success" if rows else "empty", retry_count=retry_count)
         return rows
     except Exception as e:
+        retry_count = int(getattr(e, "retry_count", retry_count) or 0)
         _record_api_fetch("api5", "failed", error=f"{warrant}/{broker}｜{e}", retry_count=retry_count)
         return []
 
@@ -2263,9 +2285,9 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
     if not warrants:
         return []
 
-    def scan_one(w):
+    def rows_to_pair_records(w, rows):
         out = []
-        for row in api4_get(w["代號"], start_s, end_s):
+        for row in rows or []:
             broker_code = str(row.get("V2", "")).strip()
             broker_name = normalize_branch_name(row.get("V3", ""))
             if not broker_code:
@@ -2280,19 +2302,110 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
             })
         return out
 
+    def scan_one(w):
+        rows, status, error, retry_count = _api4_fetch_raw(w["代號"], start_s, end_s)
+        return {
+            "warrant": w,
+            "rows": rows,
+            "status": status,
+            "error": error,
+            "retry_count": retry_count,
+        }
+
+    def record_final_result(result, second_pass: bool = False):
+        w = result.get("warrant", {})
+        code = str(w.get("代號", "") or "").strip()
+        source = str(w.get("母體來源", "") or "").strip()
+        status = result.get("status", "failed")
+        error = result.get("error", "")
+        retry_count = int(result.get("retry_count", 0) or 0)
+
+        # 歷史快取補進來的權證，若第二輪仍查不到 API4，代表 live 無法補齊；
+        # 但既有快取資料已在 fetch_warrant_events_full_market 前段合併，不把它列為硬失敗。
+        if (
+            second_pass
+            and API4_HISTORY_FAILURE_AS_EMPTY
+            and status == "failed"
+            and source == "GoogleSheetHistory"
+        ):
+            _record_api_fetch(
+                "api4",
+                "empty",
+                error=f"{code}｜歷史補充權證 API4 二次補抓仍失敗，保留既有快取資料：{error}",
+                retry_count=retry_count,
+            )
+            return
+
+        _record_api_fetch(
+            "api4",
+            status,
+            error=f"{code}｜{error}" if error and status == "failed" else "",
+            retry_count=retry_count,
+        )
+
     reset_api_fetch_stats("api4")
     print(f"🔎 API4 掃描全部分點：{len(warrants):,} 支權證，workers={API4_WORKERS}")
+
+    failed_results = []
     with ThreadPoolExecutor(max_workers=max(1, API4_WORKERS)) as ex:
         futures = {ex.submit(scan_one, w): w for w in warrants}
         for i, fut in enumerate(as_completed(futures), 1):
             w = futures.get(fut, {})
             try:
-                for rec in fut.result():
-                    pairs[(rec["warrant_code"], rec["broker_code"])] = rec
+                result = fut.result()
+                if result.get("status") == "failed":
+                    failed_results.append(result)
+                else:
+                    record_final_result(result, second_pass=False)
+                    for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
+                        pairs[(rec["warrant_code"], rec["broker_code"])] = rec
             except Exception as e:
-                _record_api_fetch("api4", "failed", error=f"future {w.get('代號', '')}｜{e}")
+                failed_results.append({
+                    "warrant": w,
+                    "rows": [],
+                    "status": "failed",
+                    "error": f"future {w.get('代號', '')}｜{e}",
+                    "retry_count": 0,
+                })
             if i % 100 == 0:
-                print(f"  API4 {i:,}/{len(warrants):,}，pairs={len(pairs):,}")
+                print(f"  API4 {i:,}/{len(warrants):,}，pairs={len(pairs):,}，待補抓={len(failed_results):,}")
+
+    if failed_results and API4_SECOND_PASS_ENABLE:
+        retry_warrants = [r.get("warrant", {}) for r in failed_results]
+        print(
+            f"🔁 API4 第一輪仍有 {len(retry_warrants):,} 支失敗，"
+            f"{API4_SECOND_PASS_WAIT:g} 秒後進行第二輪低併發補抓，workers={API4_SECOND_PASS_WORKERS}"
+        )
+        time.sleep(max(0.0, float(API4_SECOND_PASS_WAIT)))
+        second_failed = []
+        with ThreadPoolExecutor(max_workers=max(1, API4_SECOND_PASS_WORKERS)) as ex:
+            futures = {ex.submit(scan_one, w): w for w in retry_warrants}
+            for i, fut in enumerate(as_completed(futures), 1):
+                w = futures.get(fut, {})
+                try:
+                    result = fut.result()
+                    if result.get("status") == "failed":
+                        second_failed.append(result)
+                    record_final_result(result, second_pass=True)
+                    if result.get("status") != "failed":
+                        for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
+                            pairs[(rec["warrant_code"], rec["broker_code"])] = rec
+                except Exception as e:
+                    result = {
+                        "warrant": w,
+                        "rows": [],
+                        "status": "failed",
+                        "error": f"second future {w.get('代號', '')}｜{e}",
+                        "retry_count": 0,
+                    }
+                    second_failed.append(result)
+                    record_final_result(result, second_pass=True)
+        if second_failed:
+            print(f"⚠️ API4 第二輪後仍失敗：{len(second_failed):,} 支")
+    else:
+        for result in failed_results:
+            record_final_result(result, second_pass=False)
+
     print_api_fetch_stats("api4", "API4")
     abort_if_api_failure_too_high("api4", "API4")
     pair_list = list(pairs.values())
@@ -2300,7 +2413,6 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
         pair_list = pair_list[:MAX_PAIRS]
     print(f"✅ API4 完成：{len(pair_list):,} 組 權證×分點")
     return pair_list
-
 
 def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date=None) -> pd.DataFrame:
     rows = []
