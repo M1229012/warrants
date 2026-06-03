@@ -5244,6 +5244,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in plot_df.index]
     daily_net = daily_warrant_net(plot_df, plot_events)
     selected_branch_events = filter_selected_branch_flow_events(plot_events)
+    selected_branch_week_events = filter_selected_branch_flow_events(week_events)
     selected_branch_daily_net = daily_warrant_net(plot_df, selected_branch_events)
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
     key_points = build_key_points(ctx, stock_name)
@@ -5453,20 +5454,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         spine.set_visible(False)
     wnet_ax2.grid(False)
 
-    # 精選5分點資金流：只統計指定分點的權證買賣金額。
+    # 精選五分點資金流：只統計指定分點的權證買賣金額。
     selected_wnet_ax = fig.add_subplot(gs[6, :], sharex=candle_ax)
     style_ax(selected_wnet_ax)
     selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
     selected_cum_vals = np.cumsum(selected_vals)
     selected_latest_net = selected_vals[-1] if len(selected_vals) else 0.0
     selected_latest_cum = selected_cum_vals[-1] if len(selected_cum_vals) else 0.0
-    selected_total_net = float(selected_vals.sum()) if len(selected_vals) else 0.0
+    selected_total_net = float(selected_branch_week_events["net_amount"].sum()) if selected_branch_week_events is not None and not selected_branch_week_events.empty else 0.0
     selected_latest_bar_color = RED if selected_latest_net >= 0 else GREEN
     selected_total_color = RED if selected_total_net >= 0 else GREEN
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, "精選5分點資金流", GOLD,
+        selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
@@ -5476,7 +5477,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, selected_total_color, gap_px=10)
-    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"70日合計 {fmt_money(selected_total_net)}", selected_total_color, gap_px=22)
+    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"本週合計 {fmt_money(selected_total_net)}", selected_total_color, gap_px=22)
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
