@@ -2826,7 +2826,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元｜分點報酬率讀取快取", 13, TEXT, BOLD)
+    text(margin_x + 0.18, y, f"統計期間：近 {len(trading_dates)} 個有效交易日｜{period_text}　｜　同標的合併計算　｜　單位：萬元", 13, TEXT, BOLD)
 
     # 小型事件註解列：取代原本三個大 KPI 方框，避免版面過重
     y -= 0.28
