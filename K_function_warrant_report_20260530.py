@@ -2939,15 +2939,20 @@ def daily_warrant_net(plot_df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def _get_selected_branch_flow_set() -> set:
-    """取得精選分點名單，會先做與主程式一致的分點標準化。"""
+def _get_selected_branch_flow_list() -> List[str]:
+    """取得精選分點名單，保留設定順序，並做與主程式一致的分點標準化。"""
     names = []
     raw = SELECTED_BRANCH_FLOW_BRANCHES or ""
     for item in re.split(r"[,，;；\n\r]+", raw):
         name = normalize_branch_name(item)
         if name and name not in names:
             names.append(name)
-    return set(names)
+    return names
+
+
+def _get_selected_branch_flow_set() -> set:
+    """取得精選分點名單，會先做與主程式一致的分點標準化。"""
+    return set(_get_selected_branch_flow_list())
 
 
 def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -5448,7 +5453,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         spine.set_visible(False)
     wnet_ax2.grid(False)
 
-    # 精選五分點資金流：只統計指定分點的權證買賣金額。
+    # 精選5分點資金流：只統計指定分點的權證買賣金額。
     selected_wnet_ax = fig.add_subplot(gs[6, :], sharex=candle_ax)
     style_ax(selected_wnet_ax)
     selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
@@ -5461,9 +5466,25 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
+        selected_wnet_ax, xpos, "精選5分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
+
+    selected_branch_label = "、".join(_get_selected_branch_flow_list())
+    if selected_branch_label:
+        selected_wnet_ax.text(
+            0.001, 1.005,
+            f"分點：{selected_branch_label}",
+            transform=selected_wnet_ax.transAxes,
+            color=MUTED,
+            fontsize=20,
+            fontweight="bold",
+            ha="left",
+            va="bottom",
+            alpha=0.92,
+            clip_on=False,
+            zorder=12,
+        )
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, selected_latest_bar_color, gap_px=8)
