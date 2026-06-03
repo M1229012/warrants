@@ -2256,12 +2256,16 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     events["branch"] = events["branch"].map(normalize_branch_name)
     events["broker_code"] = events["broker_code"].astype(str).str.strip()
     # 合併 live/cache 重複資料
+    # 注意：net_amount 是有正負號的欄位，不能直接用 max。
+    # 若賣超資料為負數，max 會選到絕對值較小、較接近 0 的那筆，造成賣超被低估。
+    # 因此只對買進 / 賣出金額取 max，最後再重新計算 net_amount，確保：
+    # net_amount = buy_amount - sell_amount。
     group_cols = ["Date", "broker_code", "branch", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]
     events = events.groupby(group_cols, as_index=False, dropna=False).agg({
         "buy_amount": "max",
         "sell_amount": "max",
-        "net_amount": "max",
     })
+    events["net_amount"] = events["buy_amount"] - events["sell_amount"]
     events = events[(events["buy_amount"] > 0) | (events["sell_amount"] > 0) | (events["net_amount"].abs() > 0)].copy()
     events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
     events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
