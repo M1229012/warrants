@@ -2008,7 +2008,133 @@ def _normalize_warrant_match_text(text: str) -> str:
     return s.strip()
 
 
-def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]:
+def _row_date_in_range_for_warrant_cache(row: dict, start_date=None, end_date=None) -> bool:
+    """判斷 Google Sheet 權證快取列是否落在指定區間；沒有日期欄位時視為可用。"""
+    date_value = _pick_row_value(row, ["日期", "Date", "交易日期", "出表日期", "date", "trade_date"])
+    if not str(date_value or "").strip():
+        return True
+    dt = parse_date(date_value)
+    if dt is None:
+        return True
+    ts = pd.Timestamp(dt).normalize()
+    if start_date is not None and ts < pd.Timestamp(start_date).normalize():
+        return False
+    if end_date is not None and ts > pd.Timestamp(end_date).normalize():
+        return False
+    return True
+
+
+def _is_call_warrant_name(name: str) -> bool:
+    """保守判斷是否為認購權證；名稱空白時不在這裡否決，交由標的對照判斷。"""
+    s = str(name or "").strip()
+    if not s:
+        return True
+    if re.search(r"售|牛|熊", s):
+        return False
+    return "購" in s
+
+
+def load_historical_call_warrants_from_cache(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
+    """從 Google Sheet 歷史 / 候選快取補權證母體。
+
+    OpenAPI 只能取得最新交易日仍有量的權證，若某檔權證在圖表期間內曾爆量，
+    但最新交易日無量或已不在最新清單，原本就不會被 API4/API5 回查。
+    這裡改從既有 Google Sheet 快取補回同標的、區間內曾出現過的認購權證代號，
+    再與 OpenAPI 母體合併去重。
+    """
+    if not GSHEET_FALLBACK_ENABLE:
+        return []
+
+    stock_code_clean = _clean_code(stock_code)
+    aliases = make_stock_aliases(stock_name)
+    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
+    records = {}
+
+    sheet_names = [
+        "快取_分點歷史",
+        "快取_權證清單",
+        "快取_候選組合_OpenAPI精選5",
+        "快取_候選組合",
+        "快取_候選組合_精選5",
+    ]
+
+    for sheet_name in sheet_names:
+        df = read_gsheet_worksheet(sheet_name)
+        if df is None or df.empty:
+            continue
+
+        sheet_hit = 0
+        for _, r in df.iterrows():
+            row = r.to_dict()
+            if not _row_date_in_range_for_warrant_cache(row, start_date=start_date, end_date=end_date):
+                continue
+
+            code = normalize_openapi_warrant_code(_pick_row_value(row, [
+                "代號", "權證代號", "warrant_code", "WarrantCode",
+            ]))
+            if not code or not re.fullmatch(r"\d{6}", code):
+                continue
+
+            name = str(_pick_row_value(row, [
+                "名稱", "權證名稱", "warrant_name", "WarrantName",
+            ]) or "").strip()
+            if not _is_call_warrant_name(name):
+                continue
+
+            ucode = _clean_code(_pick_row_value(row, [
+                "標的股", "標的代號", "underlying_code", "UnderlyingCode",
+            ]))
+            uname = str(_pick_row_value(row, [
+                "標的名稱", "underlying_name", "UnderlyingName",
+            ]) or "").strip()
+
+            name_key = _normalize_warrant_match_text(name)
+            name_front = name_key[:16]
+            name_match = bool(name_front and any(alias and alias in name_front for alias in aliases_norm))
+            lookup_match = bool(ucode and ucode == stock_code_clean)
+            underlying_name_match = bool(uname and any(alias and alias in _normalize_warrant_match_text(uname) for alias in aliases_norm))
+
+            if not (lookup_match or name_match or underlying_name_match):
+                continue
+
+            rec = records.setdefault(code, {
+                "代號": code,
+                "名稱": "",
+                "標的股": str(stock_code_clean),
+                "標的名稱": stock_name,
+                "成交金額": 0,
+                "成交量": 0,
+                "資料來源": set(),
+            })
+            if name and not rec["名稱"]:
+                rec["名稱"] = name
+            if ucode and not rec["標的股"]:
+                rec["標的股"] = ucode
+            if uname and (not rec["標的名稱"] or rec["標的名稱"] == stock_name):
+                rec["標的名稱"] = uname
+            rec["成交金額"] = max(int(rec.get("成交金額", 0) or 0), clean_openapi_number(_pick_row_value(row, ["成交金額", "成交金額(元)"])))
+            rec["成交量"] = max(int(rec.get("成交量", 0) or 0), clean_openapi_number(_pick_row_value(row, ["成交量", "成交張數", "成交數量"])))
+            rec["資料來源"].add(sheet_name)
+            sheet_hit += 1
+
+        if sheet_hit > 0:
+            print(f"☁️ 權證歷史母體快取命中：{sheet_name}｜{sheet_hit:,} 筆")
+
+    out = []
+    for rec in records.values():
+        rec = dict(rec)
+        rec["資料來源"] = "+".join(sorted(rec.get("資料來源", [])))
+        if not rec.get("名稱"):
+            rec["名稱"] = rec["代號"]
+        out.append(rec)
+
+    out = sorted(out, key=lambda x: (int(x.get("成交金額", 0) or 0), int(x.get("成交量", 0) or 0)), reverse=True)
+    if out:
+        print(f"☁️ Google Sheet 歷史母體補充候選：{len(out):,} 支")
+    return out
+
+
+def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
     frames = []
     for source_label, f in [("TWSE", fetch_twse_openapi_warrant_daily_df()), ("TPEx", fetch_tpex_openapi_warrant_daily_df())]:
         if f is None or f.empty:
@@ -2021,17 +2147,17 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
         frames.append(latest_df)
         print(f"🔎 {source_label} OpenAPI 最新交易日：{latest_trade_date}｜當日權證：{len(latest_df):,} 支")
 
-    if not frames:
-        return []
-
-    all_df = pd.concat(frames, ignore_index=True).fillna("")
-    active_df = all_df[
-        (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
-        & (all_df["名稱"].astype(str).str.contains("購", na=False))
-        & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
-        & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
-    ].copy()
-    print(f"🔎 OpenAPI 認購候選（成交量 > 0）：{len(active_df):,} 支")
+    if frames:
+        all_df = pd.concat(frames, ignore_index=True).fillna("")
+        active_df = all_df[
+            (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
+            & (all_df["名稱"].astype(str).str.contains("購", na=False))
+            & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
+            & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
+        ].copy()
+    else:
+        active_df = pd.DataFrame(columns=["代號", "名稱", "成交金額", "成交量"])
+    print(f"🔎 OpenAPI 認購候選（最新交易日成交量 > 0）：{len(active_df):,} 支")
 
     lookup = load_warrant_underlying_lookup()
     aliases = make_stock_aliases(stock_name)
@@ -2073,9 +2199,31 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str) -> List[dict]
                 "成交量": int(r.get("成交量", 0) or 0),
             })
 
+    historical_warrants = load_historical_call_warrants_from_cache(
+        stock_code,
+        stock_name,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    historical_added = 0
+    for rec in historical_warrants:
+        code = normalize_openapi_warrant_code(rec.get("代號"))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        historical_added += 1
+        warrants.append({
+            "代號": code,
+            "名稱": str(rec.get("名稱", "") or code).strip(),
+            "標的股": str(stock_code_clean),
+            "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
+            "成交金額": int(rec.get("成交金額", 0) or 0),
+            "成交量": int(rec.get("成交量", 0) or 0),
+        })
+
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-    print(f"🔎 {stock_code_clean} {stock_name} 權證比對：lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支")
+    print(f"🔎 {stock_code_clean} {stock_name} 權證比對：lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜歷史補充新增 {historical_added:,} 支")
     print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
     return warrants
 
@@ -2237,7 +2385,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         end_dt = pd.Timestamp(end_date).to_pydatetime()
         start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
         end_s = end_dt.strftime("%Y/%m/%d")
-        warrants = get_all_active_call_warrants(stock_code, stock_name)
+        warrants = get_all_active_call_warrants(stock_code, stock_name, start_date=start_date, end_date=end_date)
         pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
         live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
         live_fetched = True
