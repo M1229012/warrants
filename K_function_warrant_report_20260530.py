@@ -111,9 +111,8 @@ CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_CROSS_BROKER_OFFS
 TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv("WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRANCHES", "").strip()
 
-# 精選分點資金流：只統計指定分點，且單筆權證分點日買賣超金額絕對值達門檻才納入。
+# 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-SELECTED_BRANCH_FLOW_MIN_ABS_NET = float(os.getenv("WARRANT_SELECTED_BRANCH_FLOW_MIN_ABS_NET", "500000"))
 SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
     "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
     "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
@@ -2956,7 +2955,6 @@ def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
 
     條件：
     1. 分點名稱屬於 SELECTED_BRANCH_FLOW_BRANCHES。
-    2. 單筆「權證 × 分點 × 日期」買賣超金額絕對值 >= SELECTED_BRANCH_FLOW_MIN_ABS_NET。
 
     回傳後可直接丟給 daily_warrant_net()，產生每日淨額柱狀圖與累計折線圖。
     """
@@ -2979,8 +2977,7 @@ def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
     for c in ["buy_amount", "sell_amount", "net_amount"]:
         e[c] = pd.to_numeric(e[c], errors="coerce").fillna(0.0).astype(float)
 
-    threshold = float(SELECTED_BRANCH_FLOW_MIN_ABS_NET or 0.0)
-    mask = e["branch"].isin(selected_branches) & (e["net_amount"].abs() >= threshold)
+    mask = e["branch"].isin(selected_branches)
     return e.loc[mask].copy().reset_index(drop=True)
 
 
@@ -5451,7 +5448,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         spine.set_visible(False)
     wnet_ax2.grid(False)
 
-    # 精選五分點資金流：只統計指定分點且單筆權證分點日買賣超金額達門檻的資料。
+    # 精選五分點資金流：只統計指定分點的權證買賣金額。
     selected_wnet_ax = fig.add_subplot(gs[6, :], sharex=candle_ax)
     style_ax(selected_wnet_ax)
     selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
@@ -5467,9 +5464,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
-
-    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
-    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"單筆≥{fmt_money_abs(SELECTED_BRANCH_FLOW_MIN_ABS_NET)}", MUTED, fontsize=22, fontweight="bold", gap_px=22, alpha=0.96)
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, selected_latest_bar_color, gap_px=8)
@@ -5519,7 +5513,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     if selected_branch_events.empty:
         selected_wnet_ax.text(
             0.5, 0.48,
-            "70日內無精選分點單筆買賣超達門檻資料",
+            "70日內無精選分點權證買賣資料",
             transform=selected_wnet_ax.transAxes,
             color=MUTED,
             fontsize=27,
