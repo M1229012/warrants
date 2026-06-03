@@ -131,12 +131,14 @@ LOCAL_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip(
 LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").strip() or "warrant_cache"
 LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH
 
-# API 重試與完整度檢查：預設要求 100% 完整，只要 API4/API5 有任何 failed 就中止，不輸出半套資料。
+# API 重試與完整度檢查：預設仍保守，但允許極少數硬失敗，避免大母體請求因單筆 timeout 整張中止。
 API_RETRY_TIMES = int(os.getenv("WARRANT_API_RETRY_TIMES", "3"))
 API_RETRY_BASE_WAIT = float(os.getenv("WARRANT_API_RETRY_BASE_WAIT", "1.5"))
-API_FAILURE_ABORT_RATIO = float(os.getenv("WARRANT_API_FAILURE_ABORT_RATIO", "0"))
+API_FAILURE_ABORT_RATIO = float(os.getenv("WARRANT_API_FAILURE_ABORT_RATIO", "0.005"))
+API_FAILURE_ABORT_ABS_COUNT = int(os.getenv("WARRANT_API_FAILURE_ABORT_ABS_COUNT", "3"))
 API_FAILURE_ABORT_MIN_REQUESTS = int(os.getenv("WARRANT_API_FAILURE_ABORT_MIN_REQUESTS", "1"))
 API_REQUIRE_FULL_SUCCESS = os.getenv("WARRANT_API_REQUIRE_FULL_SUCCESS", "1").strip().lower() not in ("0", "false", "no", "off")
+API_ALLOW_TINY_FAILURE = os.getenv("WARRANT_API_ALLOW_TINY_FAILURE", "1").strip().lower() in ("1", "true", "yes", "on")
 API_EMPTY_AS_FAILURE = os.getenv("WARRANT_API_EMPTY_AS_FAILURE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
@@ -173,6 +175,9 @@ CENTER_WATERMARK_TEXT = "股市艾斯\n台股DC討論群"
 CENTER_WATERMARK_ALPHA = 0.06
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
+
+# Supertrend 目前圖表沒有繪製，預設不計算；若未來要畫再用環境變數打開。
+ENABLE_SUPERTREND = os.getenv("WARRANT_ENABLE_SUPERTREND", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # 字型：GitHub Actions 建議安裝 fonts-noto-cjk
 available_fonts = [f.name for f in fm.fontManager.ttflist]
@@ -492,19 +497,31 @@ def abort_if_api_failure_too_high(scope: str, label: str):
 
     if API_REQUIRE_FULL_SUCCESS:
         bad_count = failed + (empty if API_EMPTY_AS_FAILURE else 0)
-        if bad_count > 0:
-            empty_msg = f"，empty={empty:,}" if API_EMPTY_AS_FAILURE else f"，empty={empty:,}（不列入失敗）"
-            raise RuntimeError(
-                f"{label} 完整度未達 100%：total={total:,}，failed={failed:,}{empty_msg}。"
-                f"本次資料已中止輸出，避免產生錯誤資金流圖。"
+        if bad_count <= 0:
+            return
+
+        bad_ratio = bad_count / total if total else 0.0
+        empty_msg = f"，empty={empty:,}" if API_EMPTY_AS_FAILURE else f"，empty={empty:,}（不列入失敗）"
+
+        if API_ALLOW_TINY_FAILURE and bad_count <= API_FAILURE_ABORT_ABS_COUNT and bad_ratio <= API_FAILURE_ABORT_RATIO:
+            print(
+                f"⚠️ {label} 有極少數請求失敗但低於容許門檻，仍繼續輸出："
+                f"total={total:,}，failed={failed:,}{empty_msg}，"
+                f"bad_ratio={bad_ratio:.2%}，門檻={API_FAILURE_ABORT_ABS_COUNT}筆 / {API_FAILURE_ABORT_RATIO:.2%}"
             )
-        return
+            return
+
+        raise RuntimeError(
+            f"{label} 完整度未達輸出門檻：total={total:,}，failed={failed:,}{empty_msg}，"
+            f"bad_ratio={bad_ratio:.2%}，容許門檻={API_FAILURE_ABORT_ABS_COUNT}筆 / {API_FAILURE_ABORT_RATIO:.2%}。"
+            f"本次資料已中止輸出，避免產生錯誤資金流圖。"
+        )
 
     fail_ratio = failed / total if total else 0.0
     if fail_ratio > API_FAILURE_ABORT_RATIO:
         raise RuntimeError(
-            f"{label} 失敗比例過高：{failed:,}/{total:,} = {fail_ratio:.1%}，"
-            f"超過門檻 {API_FAILURE_ABORT_RATIO:.0%}。本次資料可能嚴重不完整，已中止輸出，避免產生錯誤資金流圖。"
+            f"{label} 失敗比例過高：{failed:,}/{total:,} = {fail_ratio:.2%}，"
+            f"超過門檻 {API_FAILURE_ABORT_RATIO:.2%}。本次資料可能嚴重不完整，已中止輸出，避免產生錯誤資金流圖。"
         )
 
 
@@ -852,7 +869,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_UPPER"] = df["BB_MID"] + 2 * df["BB_STD"]
     df["BB_LOWER"] = df["BB_MID"] - 2 * df["BB_STD"]
     df["BB_WIDTH"] = df["BB_UPPER"] - df["BB_LOWER"]
-    df[["Supertrend", "Supertrend_Trend", "Supertrend_Buy", "Supertrend_Sell"]] = add_supertrend(df)
+    if ENABLE_SUPERTREND:
+        df[["Supertrend", "Supertrend_Trend", "Supertrend_Buy", "Supertrend_Sell"]] = add_supertrend(df)
     return df
 
 
@@ -944,12 +962,11 @@ def _to_lots(series: pd.Series) -> pd.Series:
 def _convert_inst_amounts_to_lots(amount_df: pd.DataFrame, source_label: str = "三大法人") -> pd.DataFrame:
     """將外資 / 投信 / 自營商統一轉成張。
 
-    FinMind TaiwanStockInstitutionalInvestorsBuySell 的買賣超常以「股」為單位。
-    若逐欄判斷，外資 / 投信通常會因量級大而 /1000，但自營商自行買賣量級小，
-    可能沒有被 /1000，導致圖上自營商被放大 1000 倍。
+    FinMind TaiwanStockInstitutionalInvestorsBuySell 的買賣超資料以「股」為單位，
+    因此只要來源標籤是 FinMind，就固定 /1000 轉成「張」，不再用買賣超淨額中位數猜單位。
 
-    因此這裡改用同一份資料中三類法人的最大量級決定單位倍率，
-    再讓 foreign / invest / dealer 三欄套用同一倍率。
+    X_function 備援來源的單位不一定已知，仍保留原本「三類法人最大量級」判斷，
+    避免備援資料若已經是張時被再次除以 1000。
     """
     if amount_df is None or amount_df.empty:
         return pd.DataFrame()
@@ -959,21 +976,26 @@ def _convert_inst_amounts_to_lots(amount_df: pd.DataFrame, source_label: str = "
     for c in cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
 
-    medians = {}
-    for c in cols:
-        non_zero = out[c].abs().replace(0, np.nan)
-        medians[c] = non_zero.median(skipna=True)
+    source_text = str(source_label or "").strip()
+    if source_text.lower().startswith("finmind"):
+        ref_label = "FinMind固定股轉張"
+        unit_div = 1000.0
+    else:
+        medians = {}
+        for c in cols:
+            non_zero = out[c].abs().replace(0, np.nan)
+            medians[c] = non_zero.median(skipna=True)
 
-    valid_medians = [float(v) for v in medians.values() if pd.notna(v)]
-    ref_median = max(valid_medians) if valid_medians else 0.0
-    unit_div = 1000.0 if ref_median > 50000 else 1.0
+        valid_medians = [float(v) for v in medians.values() if pd.notna(v)]
+        ref_median = max(valid_medians) if valid_medians else 0.0
+        ref_label = f"{ref_median:,.0f}"
+        unit_div = 1000.0 if ref_median > 50000 else 1.0
 
     for c in cols:
         out[c] = out[c] / unit_div
 
-    print(f"🔎 {source_label} 單位換算：ref_median={ref_median:,.0f}｜unit_div={unit_div:.0f}")
+    print(f"🔎 {source_label} 單位換算：ref_basis={ref_label}｜unit_div={unit_div:.0f}")
     return out
-
 
 def _classify_finmind_inst_name(name) -> str:
     """將 FinMind / X_function 長表法人名稱分類。
