@@ -666,28 +666,462 @@ def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: s
 # 股價 / 指標
 # ============================================================
 
-def get_tw_stock_name(stock_code: str) -> str:
-    stock_code = str(stock_code).strip()
-    # TWSE
+# 股票名稱查詢設定：使用官方基本資料 / 每日行情 / ISIN / Google Sheet / yfinance 多層備援，避免標題出現「未知公司」。
+STOCK_NAME_CACHE_ENABLE = os.getenv("WARRANT_STOCK_NAME_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+STOCK_NAME_CACHE_DIR = os.getenv("WARRANT_STOCK_NAME_CACHE_DIR", "stock_name_cache").strip() or "stock_name_cache"
+STOCK_NAME_CACHE_FILE = os.getenv("WARRANT_STOCK_NAME_CACHE_FILE", os.path.join(STOCK_NAME_CACHE_DIR, "tw_stock_name_lookup.json")).strip()
+STOCK_NAME_CACHE_TTL_HOURS = int(os.getenv("WARRANT_STOCK_NAME_CACHE_TTL_HOURS", "24"))
+# 嚴格模式預設開啟：若所有來源都抓不到名稱，就中止報表，避免產出「未知公司」圖片。
+STOCK_NAME_STRICT = os.getenv("WARRANT_STOCK_NAME_STRICT", "1").strip().lower() not in ("0", "false", "no", "off")
+_STOCK_NAME_LOOKUP_CACHE = None
+_STOCK_NAME_LOOKUP_CACHE_TIME = None
+
+
+STOCK_NAME_OFFICIAL_JSON_SOURCES = [
+    {
+        "name": "TWSE上市公司基本資料",
+        "url": "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+    },
+    {
+        "name": "TPEx上櫃公司基本資料",
+        "url": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+    },
+]
+
+
+STOCK_NAME_GSHEET_SHEETS = [
+    "快取_權證清單",
+    "快取_分點歷史",
+    "快取_候選組合_OpenAPI精選5",
+    "快取_候選組合",
+    "快取_候選組合_精選5",
+]
+
+
+_STOCK_CODE_KEYS = [
+    "公司代號", "股票代號", "有價證券代號", "證券代號", "代號",
+    "標的股", "標的代號", "stock_code", "code", "Code", "公司代碼",
+]
+
+
+_STOCK_NAME_KEYS = [
+    "公司簡稱", "股票名稱", "有價證券名稱", "證券名稱", "名稱", "簡稱",
+    "標的名稱", "公司名稱", "stock_name", "name", "Name",
+]
+
+
+def _clean_stock_name(name) -> str:
+    """整理股票名稱，優先保留台股常用簡稱。"""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = html.unescape(str(name)).strip()
+    s = s.replace("臺", "台")
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip("'\"，,。；;：:｜|/")
+    if not s or s in ("-", "--", "nan", "None", "NULL"):
+        return ""
+    # ISIN 頁面第一欄常見格式：3324　雙鴻
+    m = re.match(r"^\s*\d{4,6}\s+(.+?)\s*$", s)
+    if m:
+        s = m.group(1).strip()
+    # 若抓到完整法定名稱，去掉公司型態字樣，但不硬寫任何個股手動表。
+    s = re.sub(r"股份有限公司$", "", s).strip()
+    s = re.sub(r"有限公司$", "", s).strip()
+    s = re.sub(r"公司$", "", s).strip()
+    return s
+
+
+def _prefer_stock_name(old_name: str, new_name: str) -> str:
+    old_name = _clean_stock_name(old_name)
+    new_name = _clean_stock_name(new_name)
+    if not old_name:
+        return new_name
+    if not new_name:
+        return old_name
+    if old_name == new_name:
+        return old_name
+    # 常用簡稱通常比完整公司名短；優先保留 2~8 字的名稱。
+    old_good = 2 <= len(old_name) <= 8
+    new_good = 2 <= len(new_name) <= 8
+    if new_good and not old_good:
+        return new_name
+    if old_good and not new_good:
+        return old_name
+    if new_good and old_good and len(new_name) < len(old_name):
+        return new_name
+    return old_name
+
+
+def _extract_stock_code_name_from_dict(row: dict) -> Tuple[str, str]:
+    if not isinstance(row, dict):
+        return "", ""
+    code = ""
+    name = ""
+    for k in _STOCK_CODE_KEYS:
+        if k in row and str(row.get(k, "")).strip():
+            code = _clean_code(row.get(k, ""))
+            break
+    for k in _STOCK_NAME_KEYS:
+        if k in row and str(row.get(k, "")).strip():
+            name = _clean_stock_name(row.get(k, ""))
+            break
+    return code, name
+
+
+def _merge_stock_name(lookup: Dict[str, str], code, name, source_name: str = ""):
+    code = _clean_code(code)
+    name = _clean_stock_name(name)
+    if not code or not name or not re.fullmatch(r"\d{4,6}", code):
+        return
+    lookup[code] = _prefer_stock_name(lookup.get(code, ""), name)
+
+
+def _fetch_stock_name_json_records(url: str, source_name: str):
+    try:
+        resp = get_thread_session().get(
+            url,
+            headers={
+                "User-Agent": HDR["User-Agent"],
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            timeout=(6, 18),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ["data", "result", "records", "items"]:
+                data = payload.get(key)
+                if isinstance(data, list):
+                    return data
+    except Exception as e:
+        print(f"⚠️ {source_name} 股票名稱資料抓取失敗：{e}")
+    return []
+
+
+def _load_stock_name_cache_file() -> Tuple[Dict[str, str], bool]:
+    """回傳 (lookup, fresh)。若快取過期仍會回傳 lookup，供官方來源失敗時備援。"""
+    if not STOCK_NAME_CACHE_ENABLE or not STOCK_NAME_CACHE_FILE or not os.path.exists(STOCK_NAME_CACHE_FILE):
+        return {}, False
+    try:
+        with open(STOCK_NAME_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        lookup = payload.get("lookup", {}) if isinstance(payload, dict) else {}
+        if not isinstance(lookup, dict):
+            return {}, False
+        lookup = {_clean_code(k): _clean_stock_name(v) for k, v in lookup.items() if _clean_code(k) and _clean_stock_name(v)}
+        updated_at = str(payload.get("updated_at", "") if isinstance(payload, dict) else "")
+        fresh = False
+        try:
+            ts = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+            age_hours = (datetime.now() - ts).total_seconds() / 3600
+            fresh = age_hours <= max(1, STOCK_NAME_CACHE_TTL_HOURS)
+        except Exception:
+            fresh = False
+        if lookup:
+            status = "新鮮" if fresh else "過期但可備援"
+            print(f"📦 股票名稱快取讀取成功：{len(lookup):,} 筆｜{status}")
+        return lookup, fresh
+    except Exception as e:
+        print(f"⚠️ 股票名稱快取讀取失敗：{e}")
+        return {}, False
+
+
+def _save_stock_name_cache_file(lookup: Dict[str, str]):
+    if not STOCK_NAME_CACHE_ENABLE or not STOCK_NAME_CACHE_FILE or not lookup:
+        return
+    try:
+        _ensure_dir(os.path.dirname(STOCK_NAME_CACHE_FILE))
+        payload = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "rows": int(len(lookup)),
+            "lookup": dict(sorted(lookup.items())),
+        }
+        tmp_path = STOCK_NAME_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, STOCK_NAME_CACHE_FILE)
+        print(f"💾 股票名稱快取已更新：{STOCK_NAME_CACHE_FILE}｜{len(lookup):,} 筆")
+    except Exception as e:
+        print(f"⚠️ 股票名稱快取寫入失敗：{e}")
+
+
+def _update_lookup_from_official_json_sources(lookup: Dict[str, str]):
+    for src in STOCK_NAME_OFFICIAL_JSON_SOURCES:
+        records = _fetch_stock_name_json_records(src["url"], src["name"])
+        hit = 0
+        for row in records:
+            code, name = _extract_stock_code_name_from_dict(row)
+            if code and name:
+                _merge_stock_name(lookup, code, name, src["name"])
+                hit += 1
+        if hit:
+            print(f"✅ {src['name']} 股票名稱載入：{hit:,} 筆")
+
+
+def _update_lookup_from_twse_daily(lookup: Dict[str, str]):
     try:
         url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json"
-        resp = requests.get(url, timeout=8)
-        for item in resp.json().get("data", []):
-            if str(item[0]).strip() == stock_code:
-                return str(item[1]).strip()
-    except Exception:
-        pass
-    # TPEx
+        resp = get_thread_session().get(
+            url,
+            headers={
+                "User-Agent": HDR["User-Agent"],
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            timeout=(6, 18),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        hit = 0
+        for item in rows:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                code = _clean_code(item[0])
+                name = _clean_stock_name(item[1])
+                if code and name:
+                    _merge_stock_name(lookup, code, name, "TWSE每日收盤行情")
+                    hit += 1
+        if hit:
+            print(f"✅ TWSE每日收盤行情股票名稱載入：{hit:,} 筆")
+    except Exception as e:
+        print(f"⚠️ TWSE每日收盤行情股票名稱查詢失敗：{e}")
+
+
+def _update_lookup_from_tpex_daily(lookup: Dict[str, str]):
     try:
         url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=json"
-        resp = requests.get(url, timeout=8)
-        tables = resp.json().get("tables", [])
-        if tables:
-            for item in tables[0].get("data", []):
-                if str(item[0]).strip() == stock_code:
-                    return str(item[1]).strip()
-    except Exception:
-        pass
+        resp = get_thread_session().get(
+            url,
+            headers={
+                "User-Agent": HDR["User-Agent"],
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            timeout=(6, 18),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        tables = payload.get("tables", []) if isinstance(payload, dict) else []
+        hit = 0
+        for table in tables:
+            for item in table.get("data", []) if isinstance(table, dict) else []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    code = _clean_code(item[0])
+                    name = _clean_stock_name(item[1])
+                    if code and name:
+                        _merge_stock_name(lookup, code, name, "TPEx每日收盤行情")
+                        hit += 1
+        if hit:
+            print(f"✅ TPEx每日收盤行情股票名稱載入：{hit:,} 筆")
+    except Exception as e:
+        print(f"⚠️ TPEx每日收盤行情股票名稱查詢失敗：{e}")
+
+
+def _update_lookup_from_isin(lookup: Dict[str, str]):
+    """從證交所 ISIN 公開資料補強名稱；此來源常可抓到中文簡稱，作為官方資料備援。"""
+    for mode, source_name in [("2", "TWSE ISIN上市有價證券"), ("4", "TPEx ISIN上櫃有價證券")]:
+        try:
+            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+            resp = get_thread_session().get(
+                url,
+                headers={
+                    "User-Agent": HDR["User-Agent"],
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+                timeout=(6, 18),
+            )
+            resp.raise_for_status()
+            try:
+                text = resp.content.decode("big5", errors="ignore")
+            except Exception:
+                text = resp.text or ""
+            hit = 0
+            if BeautifulSoup is not None:
+                soup = BeautifulSoup(text, "html.parser")
+                for tr in soup.find_all("tr"):
+                    cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                    if not cells:
+                        continue
+                    m = re.match(r"^(\d{4,6})\s+(.+?)\s*$", cells[0])
+                    if not m:
+                        continue
+                    code = _clean_code(m.group(1))
+                    name = _clean_stock_name(m.group(2))
+                    if code and name:
+                        _merge_stock_name(lookup, code, name, source_name)
+                        hit += 1
+            else:
+                plain = _html_to_readable_text(text)
+                for m in re.finditer(r"\b(\d{4,6})\s+([^\s]+)", plain):
+                    code = _clean_code(m.group(1))
+                    name = _clean_stock_name(m.group(2))
+                    if code and name:
+                        _merge_stock_name(lookup, code, name, source_name)
+                        hit += 1
+            if hit:
+                print(f"✅ {source_name} 股票名稱載入：{hit:,} 筆")
+        except Exception as e:
+            print(f"⚠️ {source_name} 股票名稱查詢失敗：{e}")
+
+
+def _build_stock_name_lookup_from_sources() -> Dict[str, str]:
+    lookup = {}
+    _update_lookup_from_official_json_sources(lookup)
+    _update_lookup_from_twse_daily(lookup)
+    _update_lookup_from_tpex_daily(lookup)
+    _update_lookup_from_isin(lookup)
+    lookup = {k: v for k, v in lookup.items() if k and v}
+    if lookup:
+        print(f"✅ 股票名稱對照表建立完成：{len(lookup):,} 筆")
+    return lookup
+
+
+def _get_stock_name_lookup(force_refresh: bool = False) -> Dict[str, str]:
+    global _STOCK_NAME_LOOKUP_CACHE, _STOCK_NAME_LOOKUP_CACHE_TIME
+
+    if not force_refresh and _STOCK_NAME_LOOKUP_CACHE is not None:
+        return _STOCK_NAME_LOOKUP_CACHE
+
+    cached_lookup, fresh = _load_stock_name_cache_file()
+    if cached_lookup and fresh and not force_refresh:
+        _STOCK_NAME_LOOKUP_CACHE = cached_lookup
+        _STOCK_NAME_LOOKUP_CACHE_TIME = datetime.now()
+        return _STOCK_NAME_LOOKUP_CACHE
+
+    official_lookup = _build_stock_name_lookup_from_sources()
+    if official_lookup:
+        # 若官方來源部分失敗，保留舊快取中官方本次沒抓到的代號。
+        for code, name in cached_lookup.items():
+            if code not in official_lookup:
+                official_lookup[code] = name
+        _STOCK_NAME_LOOKUP_CACHE = official_lookup
+        _STOCK_NAME_LOOKUP_CACHE_TIME = datetime.now()
+        _save_stock_name_cache_file(_STOCK_NAME_LOOKUP_CACHE)
+        return _STOCK_NAME_LOOKUP_CACHE
+
+    if cached_lookup:
+        print("⚠️ 官方股票名稱來源全部失敗，改用過期快取備援")
+        _STOCK_NAME_LOOKUP_CACHE = cached_lookup
+        _STOCK_NAME_LOOKUP_CACHE_TIME = datetime.now()
+        return _STOCK_NAME_LOOKUP_CACHE
+
+    _STOCK_NAME_LOOKUP_CACHE = {}
+    _STOCK_NAME_LOOKUP_CACHE_TIME = datetime.now()
+    return _STOCK_NAME_LOOKUP_CACHE
+
+
+def _pick_stock_name_column_local(df: pd.DataFrame, candidates: List[str]) -> str:
+    if df is None or df.empty:
+        return ""
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    norm_map = {re.sub(r"[\s　_\-－—–/\\|｜:：,，.。()（）\[\]【】{}｛｝]+", "", str(c)).lower(): c for c in cols}
+    for c in candidates:
+        key = re.sub(r"[\s　_\-－—–/\\|｜:：,，.。()（）\[\]【】{}｛｝]+", "", str(c)).lower()
+        if key in norm_map:
+            return norm_map[key]
+    return ""
+
+
+def _fetch_stock_name_from_gsheet_cache(stock_code: str) -> str:
+    """從既有 Google Sheet 快取補名稱；這不是手動表，而是你程式之前寫入過的資料。"""
+    stock_code = _clean_code(stock_code)
+    if not stock_code or "read_gsheet_worksheet" not in globals():
+        return ""
+    for sheet_name in STOCK_NAME_GSHEET_SHEETS:
+        try:
+            df = read_gsheet_worksheet(sheet_name)
+            if df is None or df.empty:
+                continue
+            code_col = _pick_stock_name_column_local(df, _STOCK_CODE_KEYS)
+            name_col = _pick_stock_name_column_local(df, _STOCK_NAME_KEYS)
+            if not code_col or not name_col:
+                continue
+            tmp = df.copy().fillna("")
+            matched = tmp[tmp[code_col].map(_clean_code).astype(str) == stock_code]
+            if matched.empty:
+                continue
+            for _, row in matched.iterrows():
+                name = _clean_stock_name(row.get(name_col, ""))
+                if name:
+                    print(f"☁️ Google Sheet 快取補到股票名稱：{stock_code} {name}｜{sheet_name}")
+                    return name
+        except Exception as e:
+            print(f"⚠️ Google Sheet 股票名稱備援讀取失敗：{sheet_name}｜{e}")
+    return ""
+
+
+def _fetch_stock_name_from_yfinance(stock_code: str) -> str:
+    """最後備援：用 yfinance metadata 補名稱。可能是英文名稱，所以只放在最後。"""
+    stock_code = _clean_code(stock_code)
+    if not stock_code:
+        return ""
+    for suffix in ["TW", "TWO"]:
+        yf_symbol = f"{stock_code}.{suffix}"
+        try:
+            ticker = yf.Ticker(yf_symbol)
+            info = {}
+            try:
+                info = ticker.get_info()
+            except Exception:
+                info = getattr(ticker, "info", {}) or {}
+            for key in ["shortName", "longName", "displayName"]:
+                name = _clean_stock_name(info.get(key, "") if isinstance(info, dict) else "")
+                if name and not re.fullmatch(r"\d{4,6}(\.(TW|TWO))?", name, flags=re.IGNORECASE):
+                    print(f"🟡 yfinance 備援補到股票名稱：{stock_code} {name}｜{yf_symbol}")
+                    return name
+        except Exception as e:
+            print(f"⚠️ yfinance 股票名稱備援失敗：{yf_symbol}｜{e}")
+    return ""
+
+
+def get_tw_stock_name(stock_code: str) -> str:
+    stock_code = _clean_code(stock_code)
+    if not stock_code:
+        msg = "股票代號為空，無法查詢公司名稱"
+        if STOCK_NAME_STRICT:
+            raise RuntimeError(msg)
+        print(f"⚠️ {msg}")
+        return "未知公司"
+
+    # 第一層：官方資料整合後的快取 / 對照表。
+    lookup = _get_stock_name_lookup(force_refresh=False)
+    name = _clean_stock_name(lookup.get(stock_code, ""))
+    if name:
+        print(f"✅ 股票名稱查詢成功：{stock_code} {name}｜股票名稱對照表")
+        return name
+
+    # 第二層：強制刷新一次官方資料，避免舊快取漏掉新上市櫃或前次抓取不完整。
+    lookup = _get_stock_name_lookup(force_refresh=True)
+    name = _clean_stock_name(lookup.get(stock_code, ""))
+    if name:
+        print(f"✅ 股票名稱查詢成功：{stock_code} {name}｜官方資料刷新")
+        return name
+
+    # 第三層：從你自己的 Google Sheet 歷史快取補標的名稱。
+    name = _fetch_stock_name_from_gsheet_cache(stock_code)
+    if name:
+        return name
+
+    # 第四層：yfinance metadata 備援，避免官方來源短暫失效時完全無名稱。
+    name = _fetch_stock_name_from_yfinance(stock_code)
+    if name:
+        return name
+
+    msg = (
+        f"股票名稱查詢失敗：{stock_code}。已嘗試官方基本資料、每日行情、ISIN、Google Sheet 快取與 yfinance，"
+        "仍無法取得名稱。為避免圖片標題出現『未知公司』，本次中止輸出。"
+    )
+    if STOCK_NAME_STRICT:
+        raise RuntimeError(msg)
+    print(f"⚠️ {msg}")
     return "未知公司"
 
 
