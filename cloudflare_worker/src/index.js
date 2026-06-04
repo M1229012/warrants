@@ -241,7 +241,7 @@ export default {
       return text("Missing Discord signature headers or DISCORD_PUBLIC_KEY.", 401);
     }
 
-    const valid = verifyKey(body, signature, timestamp, env.DISCORD_PUBLIC_KEY);
+    const valid = await verifyKey(body, signature, timestamp, env.DISCORD_PUBLIC_KEY);
     if (!valid) return text("Bad request signature.", 401);
 
     let interaction;
