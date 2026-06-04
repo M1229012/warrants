@@ -7,6 +7,14 @@ on:
         description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
         required: false
         default: "2408"
+      refresh_news_summary:
+        description: "是否重新抓當日新聞並重新產生本週重點（0=使用當日快取，1=強制重跑）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
 
 jobs:
   run-warrant-report-test:
@@ -38,15 +46,15 @@ jobs:
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
 
       # Gemini / LLM 新聞與本週重點摘要設定
-      # 程式會先檢查 Google Sheet 當日快取；
-      # 若當天已有快取，直接使用快取，不會重打 Gemini API。
+      # refresh_news_summary=0：程式會先檢查 Google Sheet 當日快取；若當天已有快取，直接使用快取，不會重打 Gemini API。
+      # refresh_news_summary=1：略過當日快取，重新抓新聞並重新產生本週重點，完成後會覆蓋寫回 Google Sheet 快取。
       WARRANT_GEMINI_ENABLE: "1"
       WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
-      WARRANT_LLM_CACHE_ENABLE: "1"
+      WARRANT_LLM_CACHE_ENABLE: ${{ inputs.refresh_news_summary == '1' && '0' || '1' }}
       WARRANT_LLM_CACHE_DIR: llm_cache
       WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
       WARRANT_GSHEET_LLM_CACHE_SHEET: "快取_Gemini結果"
-      WARRANT_LLM_CACHE_FORCE_REFRESH: "0"
+      WARRANT_LLM_CACHE_FORCE_REFRESH: ${{ inputs.refresh_news_summary }}
 
       # Gemini API Key 與備用 Key：
       # 第一組失敗、限流或 quota 滿時，程式會自動改用第 2、3 組。
@@ -56,8 +64,7 @@ jobs:
       GEMINI_MODEL: gemini-2.5-flash
 
       # 新聞抓取開關：
-      # 程式會先檢查當日新聞快取；
-      # 若當天已有快取，直接使用快取，不會重新抓新聞或呼叫 Gemini。
+      # 預設開啟；是否使用快取或強制重抓，由 refresh_news_summary 控制。
       WARRANT_NEWS_ENABLE: "1"
 
       # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
@@ -117,7 +124,7 @@ jobs:
 
       - name: Check Gemini and cache setting
         run: |
-          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
+          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_ENABLE =', os.getenv('WARRANT_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
 
       - name: Run warrant report test
         run: python run_report.py
