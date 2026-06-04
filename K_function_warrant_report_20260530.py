@@ -3233,6 +3233,8 @@ NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
 NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "8"))
 NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
 NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
+# 新聞原文頁抓取 workers：只影響 Google News 內文抓取速度，不改摘要邏輯。
+NEWS_ARTICLE_FETCH_WORKERS = int(os.getenv("WARRANT_NEWS_ARTICLE_FETCH_WORKERS", "8"))
 
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
@@ -3797,15 +3799,54 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
 
     max_items = max(int(max_items or NEWS_GOOGLE_MAX_ITEMS), NEWS_SUMMARY_MAX_POINTS)
     scan_limit_per_query = max(max_items, int(max_items * max(1, NEWS_GOOGLE_SCAN_MULTIPLIER)))
+    article_workers = max(1, int(NEWS_ARTICLE_FETCH_WORKERS))
     aliases = _get_news_aliases(stock_code, stock_name)
     all_articles = []
     seen_keys = set()
     total_scanned = 0
 
+    def build_article_from_candidate(candidate: dict) -> dict:
+        title = candidate.get("title", "")
+        link = candidate.get("url", "")
+        description = candidate.get("description", "")
+        days = int(candidate.get("search_days", 0) or 0)
+        stage_label = candidate.get("query_stage", "")
+
+        article_body = _fetch_article_body(link)
+        body_ok = _is_valid_article_body(article_body, title=title, description=description)
+
+        # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
+        fallback_ok = False
+        content_source = "article" if body_ok else ""
+        if body_ok:
+            content = article_body
+        else:
+            fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
+            content = description if fallback_ok else ""
+            content_source = "rss_description" if fallback_ok else ""
+
+        article = {
+            "title": title,
+            "url": link,
+            "source": candidate.get("source", ""),
+            "published": candidate.get("published", ""),
+            "description": description,
+            "content": content,
+            "body_ok": body_ok,
+            "fallback_ok": fallback_ok,
+            "content_source": content_source,
+            "body_length": len(article_body or ""),
+            "search_days": days,
+            "query_stage": stage_label,
+        }
+        status = "原文可摘要" if body_ok else "RSS摘要改寫" if fallback_ok else "略過標題"
+        print(f"📰 新聞抓取：{title[:36]}｜近 {days} 天｜{stage_label}｜原文 {len(article_body or ''):,} 字｜{status}")
+        return article
+
     for days in _get_news_search_day_list():
         for stage_label, query in _build_google_news_queries(stock_code, stock_name, days):
             url = _make_google_news_rss_url(query)
-            print(f"📰 Google News 搜尋：{stock_code} {stock_name}｜{stage_label}｜近 {days} 天｜max_items={max_items}")
+            print(f"📰 Google News 搜尋：{stock_code} {stock_name}｜{stage_label}｜近 {days} 天｜max_items={max_items}｜article_workers={article_workers}")
             try:
                 r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
                 r.raise_for_status()
@@ -3815,6 +3856,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                 continue
 
             scanned_this_query = 0
+            candidates = []
             for item in root.findall(".//item"):
                 scanned_this_query += 1
                 total_scanned += 1
@@ -3842,44 +3884,39 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                     # Google News 搜尋有時會回傳同產業但非本股票的多股新聞；先擋掉標題/摘要完全沒有本股票的項目。
                     continue
 
-                article_body = _fetch_article_body(link)
-                body_ok = _is_valid_article_body(article_body, title=title, description=description)
-
-                # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
-                fallback_ok = False
-                content_source = "article" if body_ok else ""
-                if body_ok:
-                    content = article_body
-                else:
-                    fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
-                    content = description if fallback_ok else ""
-                    content_source = "rss_description" if fallback_ok else ""
-
                 if seen_key:
                     seen_keys.add(seen_key)
 
-                article = {
+                candidates.append({
                     "title": title,
                     "url": link,
                     "source": source,
                     "published": published,
                     "description": description,
-                    "content": content,
-                    "body_ok": body_ok,
-                    "fallback_ok": fallback_ok,
-                    "content_source": content_source,
-                    "body_length": len(article_body or ""),
                     "search_days": int(days),
                     "query_stage": stage_label,
-                }
-                all_articles.append(article)
+                })
 
-                status = "原文可摘要" if body_ok else "RSS摘要改寫" if fallback_ok else "略過標題"
-                print(f"📰 新聞抓取：{title[:36]}｜近 {days} 天｜{stage_label}｜原文 {len(article_body or ''):,} 字｜{status}")
+            if candidates:
+                # 分批平行抓原文，避免一次丟太多新聞頁造成網站限流，也保留原本「足夠就停止」的邏輯。
+                chunk_size = max(max_items, article_workers * 2)
+                for chunk_start in range(0, len(candidates), chunk_size):
+                    chunk = candidates[chunk_start: chunk_start + chunk_size]
+                    with ThreadPoolExecutor(max_workers=article_workers) as ex:
+                        futures = {ex.submit(build_article_from_candidate, candidate): candidate for candidate in chunk}
+                        for fut in as_completed(futures):
+                            candidate = futures.get(fut, {})
+                            try:
+                                article = fut.result()
+                            except Exception as e:
+                                title = candidate.get("title", "")
+                                print(f"⚠️ 新聞平行抓取失敗：{title[:36]}｜{e}")
+                                continue
+                            all_articles.append(article)
 
-                # 已經有足夠可用新聞時，先停止目前查詢；若數量還不夠，下一階段會繼續補。
-                if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
-                    break
+                    # 已經有足夠可用新聞時，先停止目前查詢；若數量還不夠，下一階段會繼續補。
+                    if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
+                        break
 
             if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
                 break
@@ -5065,11 +5102,13 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
             return stale_points[:NEWS_DISPLAY_MAX_POINTS]
         return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
 
-    # 優先用足夠新聞原文；若原文抓不到或本股票片段太短，允許使用已驗證相關的 RSS 摘要作為 AI 改寫素材，避免完全沒有新聞。
-    ai_source_records = body_records if body_records else fallback_records
+    # 優先把「所有可用新聞」一次交給 Gemini 統整。
+    # 這裡不要逐篇呼叫 Gemini；_summarize_news_with_gemini() 會將多篇原文 / RSS 摘要合併成同一份 article_json，
+    # 並透過單一次 _call_gemini_with_retry(cache_task="news_points") 產生最多 3 點新聞重點。
+    ai_source_records = records
     ai_points = _summarize_news_with_gemini(ai_source_records, stock_code, stock_name)
     if ai_points:
-        return _ensure_news_summary_min_total(ai_points, body_records, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
+        return _ensure_news_summary_min_total(ai_points, ai_source_records, stock_code, stock_name)[:NEWS_DISPLAY_MAX_POINTS]
 
     # Gemini 不可用或失敗時，仍優先從真正內文抽重點；最後才用 RSS 摘要作為備援素材。
     rule_source = body_records if body_records else fallback_records
