@@ -11,7 +11,7 @@ import time
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
@@ -3233,8 +3233,27 @@ NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
 NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "8"))
 NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
 NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
-# 新聞原文頁抓取 workers：只影響 Google News 內文抓取速度，不改摘要邏輯。
+# 極速新聞模式：預設開啟。只使用 Google News RSS 的標題 / 摘要 / URL，不進新聞網站抓原文。
+# 若想回到高品質原文抓取模式，可在 GitHub Actions 設 WARRANT_NEWS_FAST_MODE=0。
+NEWS_FAST_MODE = os.getenv("WARRANT_NEWS_FAST_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+# 極速模式最多建立幾篇 RSS 新聞素材；預設等於真正會送進 Gemini 的篇數，避免掃太多新聞拖慢速度。
+NEWS_FAST_FETCH_MAX_ARTICLES = int(os.getenv(
+    "WARRANT_NEWS_FAST_FETCH_MAX_ARTICLES",
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI, NEWS_GOOGLE_MIN_USABLE_ARTICLES, NEWS_SUMMARY_MAX_POINTS)),
+))
+# 慢速原文模式最多真的進站抓幾篇；避免 Google News 搜到很多篇時，逐站爬文卡住整個 pipeline。
+NEWS_SLOW_FETCH_MAX_ARTICLES = int(os.getenv(
+    "WARRANT_NEWS_SLOW_FETCH_MAX_ARTICLES",
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI, NEWS_GOOGLE_MIN_USABLE_ARTICLES, NEWS_SUMMARY_MAX_POINTS)),
+))
+# 新聞原文頁抓取 workers：只在 NEWS_FAST_MODE=0 時使用；極速模式會完全跳過原文抓取。
 NEWS_ARTICLE_FETCH_WORKERS = int(os.getenv("WARRANT_NEWS_ARTICLE_FETCH_WORKERS", "8"))
+# 慢速原文模式防卡死設定：future / batch 都有硬性時間上限，逾時就取消剩餘新聞。
+NEWS_ARTICLE_FUTURE_TIMEOUT = float(os.getenv("WARRANT_NEWS_ARTICLE_FUTURE_TIMEOUT", str(max(12.0, NEWS_FETCH_TIMEOUT + 5.0))))
+NEWS_ARTICLE_BATCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_ARTICLE_BATCH_TIMEOUT", str(max(18.0, NEWS_ARTICLE_FUTURE_TIMEOUT + 5.0))))
+# gnewsdecoder 只在慢速原文模式可能用到；若它卡住，超過秒數就放棄解碼，不拖住整份報告。
+NEWS_GNEWSDECODER_ENABLE = os.getenv("WARRANT_NEWS_GNEWSDECODER_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+NEWS_GNEWSDECODER_TIMEOUT = float(os.getenv("WARRANT_NEWS_GNEWSDECODER_TIMEOUT", "3"))
 
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
@@ -3597,6 +3616,31 @@ def _decode_google_news_url_from_path(url: str) -> str:
     return ""
 
 
+def _run_gnewsdecoder_with_timeout(url: str) -> str:
+    """以硬 timeout 包住 googlenewsdecoder，避免單一 Google News 解碼卡死整份報告。"""
+    if not NEWS_GNEWSDECODER_ENABLE or gnewsdecoder is None or NEWS_GNEWSDECODER_TIMEOUT <= 0:
+        return ""
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(gnewsdecoder, url, interval=1)
+    try:
+        decoded = fut.result(timeout=NEWS_GNEWSDECODER_TIMEOUT)
+        if isinstance(decoded, dict):
+            real = decoded.get("decoded_url", "")
+            if real and str(real).startswith("http"):
+                return str(real).strip()
+        elif isinstance(decoded, str) and decoded.startswith("http"):
+            return decoded.strip()
+    except FuturesTimeoutError:
+        fut.cancel()
+        print(f"⚠️ googlenewsdecoder 超過 {NEWS_GNEWSDECODER_TIMEOUT:g} 秒未回應，已略過：{str(url)[:120]}")
+    except Exception as e:
+        print(f"⚠️ googlenewsdecoder 解碼失敗：{e}")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return ""
+
+
 def _maybe_resolve_google_news_link(url: str) -> str:
     """Google News RSS 有時是跳轉頁；這裡嘗試解析成原始新聞網址。"""
     if not url or "news.google.com" not in url:
@@ -3604,17 +3648,11 @@ def _maybe_resolve_google_news_link(url: str) -> str:
     decoded_url = _decode_google_news_url_from_path(url)
     if decoded_url:
         return decoded_url
-    if gnewsdecoder is not None:
-        try:
-            decoded = gnewsdecoder(url, interval=1)
-            if isinstance(decoded, dict):
-                real = decoded.get("decoded_url", "")
-                if real and str(real).startswith("http"):
-                    return str(real).strip()
-            elif isinstance(decoded, str) and decoded.startswith("http"):
-                return decoded.strip()
-        except Exception as e:
-            print(f"⚠️ googlenewsdecoder 解碼失敗：{e}")
+
+    decoded_url = _run_gnewsdecoder_with_timeout(url)
+    if decoded_url:
+        return decoded_url
+
     try:
         headers = {
             "User-Agent": HDR["User-Agent"],
@@ -3769,12 +3807,65 @@ def _article_seen_key(title: str, link: str) -> str:
     return str(link or "").strip()
 
 
+def _build_fast_rss_news_content(title: str, description: str, source: str = "", published: str = "") -> str:
+    """極速模式用：把 Google News RSS 可取得的欄位組成可送 Gemini 的素材，不抓原文。"""
+    title = _clean_news_title(title)
+    description = _normalize_news_text(description)
+    source = str(source or "").strip()
+    published = str(published or "").strip()
+
+    parts = []
+    if title:
+        parts.append(f"標題：{title}")
+    if description:
+        # Google News RSS 的 description 有時會重複標題；仍保留，讓 Gemini 至少知道 RSS 摘要 / 導流文字。
+        parts.append(f"摘要：{description}")
+    if source:
+        parts.append(f"來源：{source}")
+    if published:
+        parts.append(f"日期：{published}")
+    return _normalize_news_text("。".join(parts))
+
+
+def _is_valid_fast_rss_news_item(title: str, description: str, stock_code: str = "", stock_name: str = "") -> bool:
+    """極速模式用：RSS 沒有原文時，放寬判斷，只要標題 / 摘要明確與本股票或公司題材相關即可。"""
+    combined = _normalize_news_text(f"{title} {description}")
+    if len(_title_compare_text(combined)) < 12:
+        return False
+
+    aliases = _get_news_aliases(stock_code, stock_name)
+    if aliases and not any(alias and alias in combined for alias in aliases):
+        return False
+
+    # 排除明顯無效導流，但不要過度排除，否則 RSS 模式會因摘要偏短而完全抓不到新聞。
+    bad_hits = [
+        "三大法人買賣超", "買超排行", "賣超排行", "完整看", "看更多",
+        "延伸閱讀", "相關新聞", "熱門新聞", "追蹤我們", "分享給朋友",
+    ]
+    if any(k in combined for k in bad_hits) and not _has_company_value_terms(combined):
+        return False
+
+    topic_keywords = [
+        "營收", "財報", "獲利", "EPS", "毛利", "法說", "展望", "接單", "出貨", "產能",
+        "AI", "伺服器", "記憶體", "DRAM", "NAND", "半導體", "報價", "HBM", "法人",
+        "目標價", "評等", "需求", "漲價", "降價", "ASP", "供需", "訂單", "客戶",
+    ]
+    if any(k in combined for k in topic_keywords):
+        return True
+
+    # 若沒有明確基本面關鍵字，但標題 / 摘要有本股票名稱，仍保留給 Gemini 判斷，避免冷門股完全無新聞。
+    return True
+
+
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
     """
-    多階段抓取 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
+    多階段抓取 Google News RSS 新聞。
+
+    預設 NEWS_FAST_MODE=1：只使用 RSS 標題 / 摘要 / URL，不進新聞網站抓原文，速度最快。
+    若設 NEWS_FAST_MODE=0：才會嘗試進入原文頁擷取內文，品質較高但速度較慢。
 
     先抓 7 天嚴格新聞；若有效新聞不足，會自動放寬關鍵字與天數到 14 / 30 天。
-    回傳 dict 格式，讓後續 build_news_points 可以根據內文或 RSS 摘要整理重點。
+    回傳 dict 格式，讓後續 build_news_points 可以根據 RSS 摘要或新聞原文整理重點。
     """
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
@@ -3800,10 +3891,28 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     max_items = max(int(max_items or NEWS_GOOGLE_MAX_ITEMS), NEWS_SUMMARY_MAX_POINTS)
     scan_limit_per_query = max(max_items, int(max_items * max(1, NEWS_GOOGLE_SCAN_MULTIPLIER)))
     article_workers = max(1, int(NEWS_ARTICLE_FETCH_WORKERS))
+    fast_mode = bool(NEWS_FAST_MODE)
+
+    # 這裡用「真正會送進 Gemini 的篇數」當作抓取上限，避免為了 max_items=24 去爬大量新聞。
+    mode_fetch_limit = NEWS_FAST_FETCH_MAX_ARTICLES if fast_mode else NEWS_SLOW_FETCH_MAX_ARTICLES
+    fetch_limit = max(
+        NEWS_SUMMARY_MAX_POINTS,
+        NEWS_GOOGLE_MIN_USABLE_ARTICLES,
+        min(max_items, max(1, int(mode_fetch_limit))),
+    )
+    # RSS 掃描仍可略大於 fetch_limit，避免前幾筆被標題 / 導流過濾後完全無新聞；但慢速原文模式只抓前 N 篇候選。
+    candidate_limit_per_query = max(fetch_limit, fetch_limit * 2) if fast_mode else fetch_limit
+
     aliases = _get_news_aliases(stock_code, stock_name)
     all_articles = []
     seen_keys = set()
     total_scanned = 0
+
+    def usable_count_now() -> int:
+        return sum(1 for a in all_articles if a.get("body_ok") or a.get("fallback_ok"))
+
+    def enough_articles() -> bool:
+        return usable_count_now() >= fetch_limit
 
     def build_article_from_candidate(candidate: dict) -> dict:
         title = candidate.get("title", "")
@@ -3812,18 +3921,36 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         days = int(candidate.get("search_days", 0) or 0)
         stage_label = candidate.get("query_stage", "")
 
-        article_body = _fetch_article_body(link)
-        body_ok = _is_valid_article_body(article_body, title=title, description=description)
-
-        # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
-        fallback_ok = False
-        content_source = "article" if body_ok else ""
-        if body_ok:
-            content = article_body
+        if fast_mode:
+            # 極速模式：完全跳過 _fetch_article_body，不進新聞網站、不碰 gnewsdecoder，直接用 RSS 標題 / 摘要 / URL 給 Gemini 統整。
+            article_body = ""
+            body_ok = False
+            fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_fast_rss_news_item(
+                title,
+                description,
+                stock_code,
+                stock_name,
+            )
+            content = _build_fast_rss_news_content(
+                title,
+                description,
+                source=candidate.get("source", ""),
+                published=candidate.get("published", ""),
+            ) if fallback_ok else ""
+            content_source = "google_news_rss_fast" if fallback_ok else ""
         else:
-            fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
-            content = description if fallback_ok else ""
-            content_source = "rss_description" if fallback_ok else ""
+            article_body = _fetch_article_body(link)
+            body_ok = _is_valid_article_body(article_body, title=title, description=description)
+
+            # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
+            fallback_ok = False
+            content_source = "article" if body_ok else ""
+            if body_ok:
+                content = article_body
+            else:
+                fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
+                content = description if fallback_ok else ""
+                content_source = "rss_description" if fallback_ok else ""
 
         article = {
             "title": title,
@@ -3839,14 +3966,78 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             "search_days": days,
             "query_stage": stage_label,
         }
-        status = "原文可摘要" if body_ok else "RSS摘要改寫" if fallback_ok else "略過標題"
+        if body_ok:
+            status = "原文可摘要"
+        elif fallback_ok and fast_mode:
+            status = "極速RSS摘要"
+        elif fallback_ok:
+            status = "RSS摘要改寫"
+        else:
+            status = "略過標題"
         print(f"📰 新聞抓取：{title[:36]}｜近 {days} 天｜{stage_label}｜原文 {len(article_body or ''):,} 字｜{status}")
         return article
 
+    def collect_slow_articles_with_timeout(chunk: List[dict]):
+        """慢速原文模式專用：每批 future 有硬性批次 timeout，足夠就提早取消剩餘任務。"""
+        if not chunk or enough_articles():
+            return
+
+        ex = ThreadPoolExecutor(max_workers=article_workers)
+        futures = {ex.submit(build_article_from_candidate, candidate): candidate for candidate in chunk}
+        pending = set(futures.keys())
+        deadline = time.monotonic() + max(1.0, float(NEWS_ARTICLE_BATCH_TIMEOUT))
+
+        try:
+            while pending and not enough_articles():
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    print(f"⚠️ 新聞原文批次抓取超過 {NEWS_ARTICLE_BATCH_TIMEOUT:g} 秒，取消剩餘 {len(pending)} 篇")
+                    break
+
+                done, pending = wait(
+                    pending,
+                    timeout=min(0.5, max(0.05, remain)),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+
+                for fut in done:
+                    candidate = futures.get(fut, {})
+                    try:
+                        # fut 已完成，這裡再給 result(timeout=...) 是保險，避免極端狀況卡住。
+                        article = fut.result(timeout=max(0.1, min(float(NEWS_ARTICLE_FUTURE_TIMEOUT), 1.0)))
+                    except FuturesTimeoutError:
+                        title = candidate.get("title", "")
+                        fut.cancel()
+                        print(f"⚠️ 新聞 future 超過 {NEWS_ARTICLE_FUTURE_TIMEOUT:g} 秒未回傳，已略過：{title[:36]}")
+                        continue
+                    except Exception as e:
+                        title = candidate.get("title", "")
+                        print(f"⚠️ 新聞平行抓取失敗：{title[:36]}｜{e}")
+                        continue
+
+                    all_articles.append(article)
+                    if enough_articles():
+                        break
+        finally:
+            if pending:
+                for fut in pending:
+                    fut.cancel()
+                print(f"🧹 已取消未完成新聞原文任務：{len(pending)} 篇")
+            ex.shutdown(wait=False, cancel_futures=True)
+
     for days in _get_news_search_day_list():
         for stage_label, query in _build_google_news_queries(stock_code, stock_name, days):
+            if enough_articles():
+                break
+
             url = _make_google_news_rss_url(query)
-            print(f"📰 Google News 搜尋：{stock_code} {stock_name}｜{stage_label}｜近 {days} 天｜max_items={max_items}｜article_workers={article_workers}")
+            mode_label = "極速RSS" if fast_mode else f"原文抓取 workers={article_workers} / limit={fetch_limit}"
+            print(
+                f"📰 Google News 搜尋：{stock_code} {stock_name}｜{stage_label}｜近 {days} 天｜"
+                f"fetch_limit={fetch_limit}｜mode={mode_label}"
+            )
             try:
                 r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
                 r.raise_for_status()
@@ -3897,36 +4088,41 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                     "query_stage": stage_label,
                 })
 
+                # 慢速模式只拿前 N 篇真的進站抓原文；極速模式也不建立過量素材。
+                if len(candidates) >= candidate_limit_per_query:
+                    break
+
             if candidates:
-                # 分批平行抓原文，避免一次丟太多新聞頁造成網站限流，也保留原本「足夠就停止」的邏輯。
-                chunk_size = max(max_items, article_workers * 2)
-                for chunk_start in range(0, len(candidates), chunk_size):
-                    chunk = candidates[chunk_start: chunk_start + chunk_size]
-                    with ThreadPoolExecutor(max_workers=article_workers) as ex:
-                        futures = {ex.submit(build_article_from_candidate, candidate): candidate for candidate in chunk}
-                        for fut in as_completed(futures):
-                            candidate = futures.get(fut, {})
-                            try:
-                                article = fut.result()
-                            except Exception as e:
-                                title = candidate.get("title", "")
-                                print(f"⚠️ 新聞平行抓取失敗：{title[:36]}｜{e}")
-                                continue
-                            all_articles.append(article)
+                if fast_mode:
+                    # 極速模式不需要 ThreadPoolExecutor，因為不抓原文；逐筆用 RSS 摘要建立素材即可。
+                    for candidate in candidates:
+                        if enough_articles():
+                            break
+                        try:
+                            article = build_article_from_candidate(candidate)
+                        except Exception as e:
+                            title = candidate.get("title", "")
+                            print(f"⚠️ 新聞 RSS 素材建立失敗：{title[:36]}｜{e}")
+                            continue
+                        all_articles.append(article)
+                else:
+                    # 慢速模式只抓前 N 篇候選，並且有 batch timeout；足夠就提早取消剩餘任務。
+                    chunk_size = max(1, min(fetch_limit, article_workers * 2))
+                    for chunk_start in range(0, len(candidates), chunk_size):
+                        if enough_articles():
+                            break
+                        chunk = candidates[chunk_start: chunk_start + chunk_size]
+                        collect_slow_articles_with_timeout(chunk)
 
-                    # 已經有足夠可用新聞時，先停止目前查詢；若數量還不夠，下一階段會繼續補。
-                    if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
-                        break
-
-            if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
+            if enough_articles():
                 break
-        if _is_enough_usable_news(all_articles):
+        if enough_articles():
             break
 
     usable_count = sum(1 for a in all_articles if a.get("body_ok") or a.get("fallback_ok"))
     print(f"📰 Google News 搜尋完成：掃描約 {total_scanned:,} 筆 RSS｜保留 {len(all_articles):,} 筆｜可摘要 {usable_count:,} 筆")
 
-    # 排序：原文優先，其次 RSS 摘要；同類別中越近越前，最後保留 max_items 筆。
+    # 排序：原文優先，其次 RSS 摘要；同類別中越近越前，最後保留真正要送 Gemini 的篇數。
     def _sort_key(article: dict):
         published_dt = _parse_rss_pub_date(article.get("published", "")) or datetime.min
         usable_rank = 0 if article.get("body_ok") else 1 if article.get("fallback_ok") else 2
@@ -3934,8 +4130,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         return (usable_rank, days_rank, -published_dt.timestamp() if published_dt != datetime.min else 0)
 
     all_articles = sorted(all_articles, key=_sort_key)
-    return all_articles[:max_items]
-
+    return all_articles[:fetch_limit]
 
 def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
     """保留舊函式相容性；新流程請優先使用 fetch_google_news_articles。"""
@@ -4645,12 +4840,14 @@ def _parse_gemini_points(output_text: str) -> List[str]:
 
 
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
-    """只把「有足夠內文」的文章送給 Gemini，並先萃取本股票相關片段，避免多家公司新聞數字混用。"""
+    """只把可用的新聞素材送給 Gemini，並先萃取本股票相關片段，避免多家公司新聞數字混用。"""
     usable = []
     ordered = [r for r in records if r.get("body_ok") or r.get("fallback_ok")]
     for rec in ordered:
         content = _normalize_news_text(rec.get("content", ""))
-        if len(content) < 80:
+        # 極速 RSS 模式本來就只有標題 / 摘要，門檻需比原文模式低；原文模式仍維持較高門檻。
+        min_content_len = 40 if str(rec.get("content_source", "")) in ("google_news_rss_fast", "rss_description", "manual") else 80
+        if len(content) < min_content_len:
             continue
         title = _clean_news_title(rec.get("title", ""))
         focused_content = _extract_target_focused_news_body(content, stock_code, stock_name)
@@ -4723,7 +4920,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
   "note": "資料是否充足的簡短說明"
 }}
 
-以下是新聞內文 JSON：
+以下是新聞素材 JSON（可能是原文，也可能是 Google News RSS 的標題 / 摘要 / URL）：
 {article_json}
 """
     print("=" * 100)
