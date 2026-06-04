@@ -7,30 +7,6 @@ on:
         description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
         required: false
         default: "2408"
-      enable_gemini:
-        description: "是否開啟 Gemini / LLM 摘要（1=開啟，0=關閉；建議保持 1，程式會自動先讀當日快取）"
-        required: false
-        type: choice
-        options:
-          - "0"
-          - "1"
-        default: "1"
-      enable_news:
-        description: "是否抓取本週新聞 / 題材（1=開啟，0=關閉；建議保持 1，程式會自動先讀當日快取）"
-        required: false
-        type: choice
-        options:
-          - "0"
-          - "1"
-        default: "1"
-      force_warrant_cache_refresh:
-        description: "權證籌碼已固定每次重抓 live；此欄位保留但流程會固定重抓"
-        required: false
-        type: choice
-        options:
-          - "0"
-          - "1"
-        default: "1"
 
 jobs:
   run-warrant-report-test:
@@ -62,10 +38,10 @@ jobs:
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
 
       # Gemini / LLM 新聞與本週重點摘要設定
-      # enable_gemini=1 時，程式會先檢查 Google Sheet 當日快取；
+      # 程式會先檢查 Google Sheet 當日快取；
       # 若當天已有快取，直接使用快取，不會重打 Gemini API。
-      WARRANT_GEMINI_ENABLE: ${{ inputs.enable_gemini }}
-      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: ${{ inputs.enable_gemini }}
+      WARRANT_GEMINI_ENABLE: "1"
+      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
       WARRANT_LLM_CACHE_ENABLE: "1"
       WARRANT_LLM_CACHE_DIR: llm_cache
       WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
@@ -80,9 +56,9 @@ jobs:
       GEMINI_MODEL: gemini-2.5-flash
 
       # 新聞抓取開關：
-      # enable_news=1 時，程式會先檢查當日新聞快取；
+      # 程式會先檢查當日新聞快取；
       # 若當天已有快取，直接使用快取，不會重新抓新聞或呼叫 Gemini。
-      WARRANT_NEWS_ENABLE: ${{ inputs.enable_news }}
+      WARRANT_NEWS_ENABLE: "1"
 
       # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
       # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
