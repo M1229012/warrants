@@ -3228,7 +3228,11 @@ WEEKLY_KEYPOINT_POINT_MAX_LEN = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_POINT_MAX
 WEEKLY_KEYPOINT_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_TOTAL_CHARS", "150"))
 WEEKLY_KEYPOINT_MIN_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_POINTS", "3"))
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
-NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "8"))
+# 預設提高搜尋母體，避免部分冷門股因前幾篇原文被擋或 RSS 摘要太短而沒有新聞輸出。
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
+NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "8"))
+NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
+NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
 
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
@@ -3404,7 +3408,7 @@ def _is_valid_news_fallback_text(text: str, title: str = "", stock_code: str = "
     """當原文頁擋爬蟲時，判斷 RSS 摘要是否可作為改寫素材；不直接輸出這段文字。"""
     s = _normalize_news_text(text)
     title = _clean_news_title(title)
-    if len(s) < 42:
+    if len(s) < 34:
         return False
     if _is_bad_news_sentence(s):
         return False
@@ -3687,10 +3691,88 @@ def _is_within_recent_days_from_rss(pub_date: str, days: int = 7) -> bool:
 
 
 
+def _get_news_search_day_list() -> List[int]:
+    """新聞搜尋天數：先抓 7 天，不足時自動放寬到 14 / 30 天。"""
+    days = []
+    for part in re.split(r"[,，;；\s]+", str(NEWS_GOOGLE_FALLBACK_DAYS or "7,14,30")):
+        part = str(part or "").strip()
+        if not part:
+            continue
+        try:
+            d = int(float(part))
+        except Exception:
+            continue
+        if d > 0 and d not in days:
+            days.append(d)
+    return days or [7, 14, 30]
+
+
+def _build_google_news_queries(stock_code: str, stock_name: str, days: int) -> List[tuple]:
+    """建立多階段 Google News RSS 查詢。
+
+    查詢策略：
+    1. 嚴格：股票別名 + 基本面 / 產業 / 法人關鍵字。
+    2. 放寬：股票別名 + 新聞 / 題材 / 展望等較廣關鍵字。
+    3. 最寬：股票別名本身，讓冷門股也有機會抓到少量近期新聞。
+    """
+    aliases = _get_news_aliases(stock_code, stock_name)
+    quoted_aliases = [f'"{a}"' for a in aliases[:6] if str(a or "").strip()]
+    strict_part = " OR ".join(quoted_aliases) if quoted_aliases else f'"{stock_code}"'
+    safe_excludes = "-三大法人 -買賣超 -排行 -完整看"
+
+    strict_topics = (
+        "營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR "
+        "AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR "
+        "目標價 OR 評等 OR EPS OR ASP OR 毛利 OR 毛利率 OR 供需 OR 漲價"
+    )
+    broad_topics = (
+        "新聞 OR 題材 OR 法人 OR 展望 OR 營運 OR 產業 OR 報價 OR 需求 OR "
+        "接單 OR 出貨 OR 財報 OR 營收 OR 法說 OR 目標價 OR 評等"
+    )
+
+    queries = [
+        ("嚴格基本面", f"({strict_part}) ({strict_topics}) {safe_excludes} when:{days}d"),
+        ("放寬題材", f"({strict_part}) ({broad_topics}) {safe_excludes} when:{days}d"),
+        ("股票別名", f"({strict_part}) {safe_excludes} when:{days}d"),
+    ]
+    # 去重但保留順序
+    out = []
+    seen = set()
+    for label, q in queries:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q not in seen:
+            out.append((label, q))
+            seen.add(q)
+    return out
+
+
+def _is_enough_usable_news(articles: List[dict]) -> bool:
+    usable = sum(1 for a in articles if a.get("body_ok") or a.get("fallback_ok"))
+    return usable >= max(1, int(NEWS_GOOGLE_MIN_USABLE_ARTICLES))
+
+
+def _make_google_news_rss_url(query: str) -> str:
+    return "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": query,
+        "hl": "zh-TW",
+        "gl": "TW",
+        "ceid": "TW:zh-Hant",
+    })
+
+
+def _article_seen_key(title: str, link: str) -> str:
+    title_key = _title_compare_text(title)
+    if title_key:
+        return title_key
+    return str(link or "").strip()
+
+
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
     """
-    抓取最近一週 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
-    回傳 dict 格式，讓後續 build_news_points 可以根據內文整理重點。
+    多階段抓取 Google News RSS 新聞，再嘗試進入原文頁擷取內文。
+
+    先抓 7 天嚴格新聞；若有效新聞不足，會自動放寬關鍵字與天數到 14 / 30 天。
+    回傳 dict 格式，讓後續 build_news_points 可以根據內文或 RSS 摘要整理重點。
     """
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
@@ -3703,93 +3785,119 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             "description": "",
             "content": p,
             "body_ok": True,
+            "fallback_ok": False,
+            "content_source": "manual",
             "body_length": len(p),
+            "search_days": 0,
+            "query_stage": "manual",
         } for p in parts[:max_items]]
 
     if not NEWS_ENABLE:
         return []
 
+    max_items = max(int(max_items or NEWS_GOOGLE_MAX_ITEMS), NEWS_SUMMARY_MAX_POINTS)
+    scan_limit_per_query = max(max_items, int(max_items * max(1, NEWS_GOOGLE_SCAN_MULTIPLIER)))
     aliases = _get_news_aliases(stock_code, stock_name)
-    strict_part = " OR ".join([f'"{a}"' for a in aliases[:5]]) if aliases else f'"{stock_code}"'
-    query = (
-        f'({strict_part}) '
-        f'(營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR 目標價 OR 評等 OR EPS OR ASP) '
-        # 不再排除「焦點股 / 漲停 / 強漲」等字眼，因為很多重要新聞標題會包含這些詞；
-        # 後續會用內文與本股票關聯性過濾，不會直接把標題放進重點。
-        f'-三大法人 -買賣超 -排行 -完整看 when:7d'
-    )
-    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
-        "q": query,
-        "hl": "zh-TW",
-        "gl": "TW",
-        "ceid": "TW:zh-Hant",
-    })
+    all_articles = []
+    seen_keys = set()
+    total_scanned = 0
 
-    try:
-        r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        articles = []
-        seen_titles = set()
-        scanned = 0
-
-        for item in root.findall(".//item"):
-            scanned += 1
-            title = _clean_news_title(item.findtext("title") or "")
-            link = (item.findtext("link") or "").strip()
-            published = (item.findtext("pubDate") or "").strip()
-            source_el = item.find("source")
-            source = (source_el.text if source_el is not None and source_el.text else "").strip()
-            description = _normalize_news_text(_html_to_readable_text(item.findtext("description") or ""))
-
-            if not _is_within_recent_days_from_rss(published, days=7):
+    for days in _get_news_search_day_list():
+        for stage_label, query in _build_google_news_queries(stock_code, stock_name, days):
+            url = _make_google_news_rss_url(query)
+            print(f"📰 Google News 搜尋：{stock_code} {stock_name}｜{stage_label}｜近 {days} 天｜max_items={max_items}")
+            try:
+                r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
+                r.raise_for_status()
+                root = ET.fromstring(r.content)
+            except Exception as e:
+                print(f"⚠️ Google News RSS 抓取失敗：{stage_label}｜近 {days} 天｜{e}")
                 continue
-            if not title or title in seen_titles:
-                continue
-            combined_for_target_check = f"{title} {description}"
-            if aliases and not any(alias in combined_for_target_check for alias in aliases):
-                # Google News 搜尋有時會回傳同產業但非本股票的多股新聞；先擋掉標題/摘要完全沒有本股票的項目。
-                continue
-            seen_titles.add(title)
 
-            article_body = _fetch_article_body(link)
-            body_ok = _is_valid_article_body(article_body, title=title, description=description)
+            scanned_this_query = 0
+            for item in root.findall(".//item"):
+                scanned_this_query += 1
+                total_scanned += 1
+                if scanned_this_query > scan_limit_per_query:
+                    break
 
-            # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
-            fallback_ok = False
-            content_source = "article" if body_ok else ""
-            if body_ok:
-                content = article_body
-            else:
-                fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
-                content = description if fallback_ok else ""
-                content_source = "rss_description" if fallback_ok else ""
+                title = _clean_news_title(item.findtext("title") or "")
+                link = (item.findtext("link") or "").strip()
+                published = (item.findtext("pubDate") or "").strip()
+                source_el = item.find("source")
+                source = (source_el.text if source_el is not None and source_el.text else "").strip()
+                description = _normalize_news_text(_html_to_readable_text(item.findtext("description") or ""))
 
-            articles.append({
-                "title": title,
-                "url": link,
-                "source": source,
-                "published": published,
-                "description": description,
-                "content": content,
-                "body_ok": body_ok,
-                "fallback_ok": fallback_ok,
-                "content_source": content_source,
-                "body_length": len(article_body or ""),
-            })
-            status = "原文可摘要" if body_ok else "RSS摘要改寫" if fallback_ok else "略過標題"
-            print(f"📰 新聞抓取：{title[:36]}｜原文 {len(article_body or ''):,} 字｜{status}")
+                if not _is_within_recent_days_from_rss(published, days=days):
+                    continue
+                if not title:
+                    continue
 
-            # 為了避免前面幾篇都抓不到內文，RSS 可以多掃一些；只用可摘要內文做重點。
-            if len(articles) >= max_items and sum(1 for a in articles if a.get("body_ok") or a.get("fallback_ok")) >= max(2, min(4, NEWS_SUMMARY_MAX_POINTS)):
+                seen_key = _article_seen_key(title, link)
+                if seen_key and seen_key in seen_keys:
+                    continue
+
+                combined_for_target_check = f"{title} {description}"
+                if aliases and not any(alias in combined_for_target_check for alias in aliases):
+                    # Google News 搜尋有時會回傳同產業但非本股票的多股新聞；先擋掉標題/摘要完全沒有本股票的項目。
+                    continue
+
+                article_body = _fetch_article_body(link)
+                body_ok = _is_valid_article_body(article_body, title=title, description=description)
+
+                # 重點：優先使用原文內文；若新聞站擋爬蟲，才用 RSS 摘要當「改寫素材」，不直接輸出標題。
+                fallback_ok = False
+                content_source = "article" if body_ok else ""
+                if body_ok:
+                    content = article_body
+                else:
+                    fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_news_fallback_text(description, title, stock_code, stock_name)
+                    content = description if fallback_ok else ""
+                    content_source = "rss_description" if fallback_ok else ""
+
+                if seen_key:
+                    seen_keys.add(seen_key)
+
+                article = {
+                    "title": title,
+                    "url": link,
+                    "source": source,
+                    "published": published,
+                    "description": description,
+                    "content": content,
+                    "body_ok": body_ok,
+                    "fallback_ok": fallback_ok,
+                    "content_source": content_source,
+                    "body_length": len(article_body or ""),
+                    "search_days": int(days),
+                    "query_stage": stage_label,
+                }
+                all_articles.append(article)
+
+                status = "原文可摘要" if body_ok else "RSS摘要改寫" if fallback_ok else "略過標題"
+                print(f"📰 新聞抓取：{title[:36]}｜近 {days} 天｜{stage_label}｜原文 {len(article_body or ''):,} 字｜{status}")
+
+                # 已經有足夠可用新聞時，先停止目前查詢；若數量還不夠，下一階段會繼續補。
+                if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
+                    break
+
+            if len(all_articles) >= max_items and _is_enough_usable_news(all_articles):
                 break
-            if scanned >= max_items * 4:
-                break
+        if _is_enough_usable_news(all_articles):
+            break
 
-        return articles
-    except Exception as e:
-        print(f"⚠️ Google News RSS 抓取失敗：{e}")
-        return []
+    usable_count = sum(1 for a in all_articles if a.get("body_ok") or a.get("fallback_ok"))
+    print(f"📰 Google News 搜尋完成：掃描約 {total_scanned:,} 筆 RSS｜保留 {len(all_articles):,} 筆｜可摘要 {usable_count:,} 筆")
+
+    # 排序：原文優先，其次 RSS 摘要；同類別中越近越前，最後保留 max_items 筆。
+    def _sort_key(article: dict):
+        published_dt = _parse_rss_pub_date(article.get("published", "")) or datetime.min
+        usable_rank = 0 if article.get("body_ok") else 1 if article.get("fallback_ok") else 2
+        days_rank = int(article.get("search_days", 999) or 999)
+        return (usable_rank, days_rank, -published_dt.timestamp() if published_dt != datetime.min else 0)
+
+    all_articles = sorted(all_articles, key=_sort_key)
+    return all_articles[:max_items]
 
 
 def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
@@ -4266,7 +4374,7 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
 
 
 def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
-    """Gemini 輸出太短時，從 7 天內原文候選句補足重點字數；不使用新聞標題硬湊。"""
+    """Gemini 輸出太短時，從近期原文 / RSS 摘要候選句補足重點字數；不使用新聞標題硬湊。"""
     used_points = used_points or []
     candidates = _collect_news_sentences(records, stock_code, stock_name)
     if not candidates:
@@ -4310,7 +4418,7 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
 
 
 def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """確保新聞區塊至少約 150 字；資料不足時仍只從 7 天內新聞素材補充。"""
+    """確保新聞區塊至少約 150 字；資料不足時仍只從近期新聞素材補充。"""
     points = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
     if _count_summary_chars(points) >= NEWS_SUMMARY_MIN_TOTAL_CHARS and len(points) >= min(NEWS_SUMMARY_MIN_POINTS, NEWS_SUMMARY_MAX_POINTS):
         return points[:NEWS_SUMMARY_MAX_POINTS]
@@ -4530,7 +4638,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     """依照新聞原文讓 Gemini 統整成圖片可用的短重點；邏輯接近獨立 Gemini 新聞測試程式。"""
     usable_articles = _build_gemini_news_articles(records, stock_code, stock_name)
     if not usable_articles:
-        print("⚠️ 沒有足夠新聞原文可送入 Gemini；不使用標題硬湊新聞重點")
+        print("⚠️ 沒有足夠新聞原文 / RSS 摘要可送入 Gemini；不使用標題硬湊新聞重點")
         return []
 
     display_name = stock_name if stock_name else stock_code
@@ -4543,14 +4651,14 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 股票：{stock_code} {display_name}
 
 任務：
-整理近 7 天的「本週新聞重點」，輸出給圖片週報右下角使用。
+整理「近期新聞重點」，輸出給圖片週報右下角使用；優先近 7 天，若本週素材不足，允許使用 14～30 天內仍具時效的公司新聞。
 請綜合多篇新聞內文與媒體 / 法人說法，統整出重點中的重點，不要逐篇列標題。
 
 嚴格規則：
 1. 不要直接複製新聞標題。
 2. 不要輸出新聞網站名稱、作者、網址、完整看、看更多、延伸閱讀。
 3. 不要把只有股價漲停、亮燈、強漲、創高、焦點股這類描述當成重點。
-4. 每一點必須來自近 7 天新聞內文，不可以幻想，不可以使用外部知識。
+4. 每一點必須來自我提供的近期新聞內文，不可以幻想，不可以使用外部知識；若素材來自 14～30 天內舊新聞，請避免寫成「本週宣布」。
 5. 如果新聞同時提到多家公司，所有目標價、評等、EPS、營收、獲利預估等數字，必須確認該數字在同一句或同一分句中明確指向「{stock_code} {display_name}」。
 6. 嚴禁把台積電、瑞昱、聯詠或其他公司的目標價 / EPS / 營收預估寫成「{display_name}」的重點；若無法判斷數字屬於哪家公司，就不要使用該數字。
 7. 若句子格式像「A 公司目標價 3000 元、B 公司目標價 5922 元」，整理 {display_name} 時只能保留 B 公司明確對應的數字，不可混用 A 公司數字。
@@ -4922,6 +5030,20 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
         print(f"⚠️ Google Sheet 舊新聞快取讀取失敗：{stock_key}｜{e}")
     return []
 
+def _build_no_news_fallback_point(stock_code: str, stock_name: str, ctx: dict | None = None) -> str:
+    """新聞抓不到時的中性備援文字，避免圖片新聞區塊空白，也避免亂編新聞。"""
+    display_name = str(stock_name or stock_code or "該股").strip()
+    try:
+        if ctx:
+            total_net = float(ctx.get("total_net", 0) or 0)
+            bias = str(ctx.get("bias", "") or "中性")
+            if total_net != 0:
+                return f"近期待追蹤：本次未抓到足夠明確的 {display_name} 公司新聞，先以權證資金流 {fmt_money(total_net)}（{bias}）、分點籌碼與技術面變化作為觀察重點。"
+    except Exception:
+        pass
+    return f"近期待追蹤：本次未抓到足夠明確的 {display_name} 公司新聞，先以權證資金流、分點籌碼與技術面變化作為觀察重點。"
+
+
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
     """根據最近一週新聞內文整理重點；優先讀 Google Sheet 快取，再使用新聞原文整理。"""
     # 先讀 Google Sheet news_points 快取。
@@ -4941,7 +5063,7 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
         if stale_points:
             return stale_points[:NEWS_DISPLAY_MAX_POINTS]
-        return ["本週未抓到可整理的新聞素材；可用 WEEKLY_NEWS_TEXT 手動填入新聞重點。"]
+        return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
 
     # 優先用足夠新聞原文；若原文抓不到或本股票片段太短，允許使用已驗證相關的 RSS 摘要作為 AI 改寫素材，避免完全沒有新聞。
     ai_source_records = body_records if body_records else fallback_records
@@ -4960,8 +5082,8 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         return stale_points[:NEWS_DISPLAY_MAX_POINTS]
 
     if not body_records:
-        return ["本週近7天新聞多為標題或短摘要，未取得足夠原文可統整；目前不輸出標題式內容，建議稍後重跑或補手動新聞重點。"]
-    return ["本週近7天新聞雖有原文素材，但有效句不足以整理成完整重點；目前不輸出標題式內容，可用 WEEKLY_NEWS_TEXT 手動補充。"]
+        return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
+    return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
 
 
 # ============================================================
