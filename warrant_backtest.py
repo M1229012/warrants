@@ -97,6 +97,9 @@ TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.ge
 TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75")))
 TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10")))
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
+# 若 TOP15 剩餘部位因多日未造市 / 無成交而缺少有效權證價格，
+# 預設不讓 RUN 失敗，而是保留淨買超成本，但該筆部位不納入報酬率估算。
+TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
 
 # 執行模式：
@@ -5664,8 +5667,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
     2. 快取_TOP15共識淨買超：由部位明細加總而成，一列代表一檔標的股，圖片程式可直接讀取排名。
 
     嚴格規則：
-    - 只要剩餘部位沒有有效權證價格，且 TOP15_FAIL_ON_MISSING_PRICE=1，就讓本次 RUN 失敗。
     - 價格日期若距離估值日超過 TOP15_PRICE_STALE_DAYS，視為缺價格。
+    - 若剩餘部位缺少有效權證價格，預設保留淨買超成本，但該筆部位不納入報酬率估算。
     - TOP15 總表完全由部位明細加總，不再另外重算。
     """
     if not TOP15_CACHE_ENABLED:
@@ -5710,6 +5713,7 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
 
     detail_rows = []
     validation_errors = []
+    missing_price_rows = []
 
     for lot in position_lots:
         original_qty = top15_safe_float(lot.get("原始股數", 0))
@@ -5756,9 +5760,19 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             unrealized_pnl = ""
             return_pct = ""
             return_text = "-"
-            validation_errors.append(
-                f"TOP15剩餘部位缺價格：{lot.get('分點')} {lot.get('標的股')} {lot.get('權證代號')} {lot.get('權證名稱')}，剩餘成本={round(remaining_cost, 0)}"
+            if price_status == "缺價格":
+                price_status = "未造市不計報酬率"
+            elif price_status == "價格過舊":
+                price_status = "價格過舊不計報酬率"
+
+            missing_price_rows.append(
+                f"TOP15剩餘部位不計報酬率：{lot.get('分點')} {lot.get('標的股')} {lot.get('權證代號')} {lot.get('權證名稱')}，剩餘成本={round(remaining_cost, 0)}，原因={price_status}"
             )
+
+            if not TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN:
+                validation_errors.append(
+                    f"TOP15剩餘部位缺價格：{lot.get('分點')} {lot.get('標的股')} {lot.get('權證代號')} {lot.get('權證名稱')}，剩餘成本={round(remaining_cost, 0)}"
+                )
         else:
             market_value_float = remaining_qty * latest_price
             unrealized_pnl_float = market_value_float - remaining_cost
@@ -5798,17 +5812,26 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             "報酬率": return_pct,
             "報酬率文字": return_text,
             "價格狀態": price_status,
-            "完成狀態": "DONE" if price_status == "OK" else "ERROR",
+            "完成狀態": "DONE",
             "來源": str(lot.get("來源", "")).strip(),
             "run_id": run_id,
             "更新時間": update_time,
         })
 
+    if missing_price_rows:
+        preview = "\n".join(missing_price_rows[:20])
+        extra = "" if len(missing_price_rows) <= 20 else f"\n... 其餘 {len(missing_price_rows) - 20} 筆略"
+        print(
+            "  ⚠️ TOP15固定資料集：部分權證因多日未造市 / 無有效價格，不納入報酬率估算，但仍保留淨買超成本：\n"
+            + preview
+            + extra
+        )
+
     if validation_errors and TOP15_FAIL_ON_MISSING_PRICE:
         preview = "\n".join(validation_errors[:20])
         extra = "" if len(validation_errors) <= 20 else f"\n... 其餘 {len(validation_errors) - 20} 筆略"
         raise RuntimeError(
-            "TOP15固定資料集驗證失敗，為避免報酬率或淨買超成本錯誤，本次 RUN 已中止：\n"
+            "TOP15固定資料集驗證失敗，為避免淨買超成本錯誤，本次 RUN 已中止：\n"
             + preview
             + extra
         )
@@ -5877,7 +5900,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             rec["未實現損益"] += pnl
         else:
             rec["缺價格成本"] += remaining_cost
-            rec["資料狀態"] = "ERROR"
+            rec["資料狀態"] = "部分報酬率未估"
 
         if event_code:
             rec["事件集合"].add(event_code)
@@ -5943,8 +5966,13 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             b_warrant_count = len(broker_rec["權證集合"])
             b_return_text = "-" if b_return_pct is None else f"{b_return_pct:+.2f}%"
 
+            b_missing_cost = float(broker_rec.get("缺價格成本", 0) or 0)
+            b_coverage_text = ""
+            if b_missing_cost > 0 and b_cost > 0:
+                b_coverage_text = f"｜估值{b_estimated_cost / b_cost * 100:.0f}%"
+
             broker_rows.append(
-                f"{broker_rec['分點']} {top15_fmt_amount_wan(b_cost)}（{b_return_text}｜{b_events}｜{b_warrant_count}檔）"
+                f"{broker_rec['分點']} {top15_fmt_amount_wan(b_cost)}（{b_return_text}{b_coverage_text}｜{b_events}｜{b_warrant_count}檔）"
             )
             broker_json.append({
                 "分點": broker_rec["分點"],
@@ -5973,7 +6001,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "目前市值": round(market_value, 0),
             "未實現損益": round(pnl, 0),
             "報酬率": "" if return_pct is None else return_pct,
-            "報酬率文字": "-" if return_pct is None else f"{return_pct:+.2f}%",
+            "報酬率文字": "-" if return_pct is None else (f"{return_pct:+.2f}%" if missing_cost <= 0 else f"{return_pct:+.2f}%（部分估）"),
             "價格覆蓋率": "" if coverage_pct is None else coverage_pct,
             "價格覆蓋率文字": "-" if coverage_pct is None else f"{coverage_pct:.2f}%",
             "參與分點數": len(rec["分點"]),
@@ -5983,7 +6011,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "權證清單": "；".join(rec["權證清單"]),
             "最新價格日期": max(rec["最新價格日期集合"]) if rec["最新價格日期集合"] else "",
             "資料狀態": rec.get("資料狀態", "OK"),
-            "完成狀態": "DONE" if rec.get("資料狀態", "OK") == "OK" else "ERROR",
+            "完成狀態": "DONE",
             "更新時間": update_time,
             "run_id": run_id,
             "分點明細_JSON": json.dumps(broker_json, ensure_ascii=False),
