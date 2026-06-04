@@ -1,0 +1,17 @@
+name = "warrant-discord-worker"
+main = "src/index.js"
+compatibility_date = "2026-06-04"
+
+[vars]
+GITHUB_REPO = "M1229012/warrants"
+GITHUB_WORKFLOW_FILE = "warrant_report_manual_test.yml"
+GITHUB_BRANCH = "main"
+
+# 如果 workflow 有 refresh_news_summary input，設 1；沒有就設 0
+WORKFLOW_HAS_REFRESH_INPUT = "1"
+
+# Google Sheet「快取_股票名稱」CSV URL
+# 注意：這裡必須是 export?format=csv，不可以用 edit 頁面網址。
+# 建議只公開一張只有「代號、名稱」的工作表，不要公開整份權證資料庫。
+STOCK_CSV_URL = "https://docs.google.com/spreadsheets/d/1_lZrRXpcajSanJPPajft38E7P2C5eQaxqQ-s5ikwohA/export?format=csv&gid=1586527896"
+STOCK_CSV_CACHE_TTL_SECONDS = "300"
