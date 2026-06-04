@@ -346,9 +346,8 @@ async function handleCommand(interaction, env) {
   const active = await hasActiveWorkflowRun(env);
 
   if (active.active) {
-    const url = active.run?.html_url || "";
     return reply(
-      `⏳ 目前已有週報產生中，請等上一檔完成後再查下一檔。${url ? `\n${url}` : ""}`,
+      "⏳ 目前已有週報產生中，請等上一檔完成後再查下一檔。",
       true
     );
   }
