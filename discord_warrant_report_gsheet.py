@@ -27,6 +27,7 @@ import math
 import re
 import json
 import argparse
+import time
 from pathlib import Path
 from collections import defaultdict, Counter
 from datetime import datetime, date, timedelta
@@ -66,6 +67,10 @@ DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點籌碼")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+
+# Google Sheet 讀取重試設定：讀不到最多重試 5 次，仍失敗就讓本次 RUN 失敗。
+GSHEET_READ_MAX_RETRIES = int(os.getenv("GSHEET_READ_MAX_RETRIES", "5"))
+GSHEET_READ_RETRY_BASE_SECONDS = float(os.getenv("GSHEET_READ_RETRY_BASE_SECONDS", "3"))
 
 SHEET_A = "A_單檔大買"
 SHEET_B = "B_同標的單日合計"
@@ -168,10 +173,51 @@ def strip_gsheet_text_prefix(v):
     return s[1:] if s.startswith("'") else s
 
 
+def is_gsheet_missing_worksheet_error(exc: Exception) -> bool:
+    """判斷是否為工作表不存在；這類錯誤不重試，避免可選工作表拖慢。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "worksheetnotfound" in text
+        or "worksheet not found" in text
+        or "worksheetnotfound" in text.replace(" ", "")
+    )
+
+
 def worksheet_values(sheet_name: str) -> list[list[str]]:
-    sh = get_gsheet()
-    ws = sh.worksheet(sheet_name)
-    return ws.get_all_values()
+    """
+    讀取 Google Sheet 工作表內容。
+
+    重要：
+    - Google Sheet API 偶發失敗時，最多重試 GSHEET_READ_MAX_RETRIES 次。
+    - 每次失敗會等待 3、6、12、24、48 秒。
+    - 5 次都失敗就 raise RuntimeError，讓本次 GitHub Action / RUN 失敗，避免產出漏資料圖片。
+    - 工作表不存在通常不是暫時錯誤，因此不重試，交由 optional reader 判斷是否可忽略。
+    """
+    last_exc = None
+
+    for attempt in range(1, GSHEET_READ_MAX_RETRIES + 1):
+        try:
+            sh = get_gsheet()
+            ws = sh.worksheet(sheet_name)
+            return ws.get_all_values()
+        except Exception as exc:
+            if is_gsheet_missing_worksheet_error(exc):
+                raise
+
+            last_exc = exc
+            if attempt >= GSHEET_READ_MAX_RETRIES:
+                break
+
+            wait_seconds = GSHEET_READ_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            print(
+                f"⚠️ Google Sheet 讀取失敗，準備重試 {attempt}/{GSHEET_READ_MAX_RETRIES}｜"
+                f"工作表：{sheet_name}｜等待 {wait_seconds:.0f} 秒｜錯誤：{exc}"
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"Google Sheet 工作表讀取失敗，已重試 {GSHEET_READ_MAX_RETRIES} 次仍失敗：{sheet_name}｜最後錯誤：{last_exc}"
+    )
 
 
 def read_gsheet_table(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
@@ -232,11 +278,18 @@ def read_gsheet_table_optional(sheet_name: str, needed_cols: list[str] | None = 
     """
     讀取可能不存在的工作表。
     主要用於「每日賣出明細」：若舊版主程式尚未產生該表，圖片程式不應直接中斷。
+
+    注意：
+    - 只有「工作表不存在」會回傳空表。
+    - 若是 Google Sheet API 讀取失敗，會先由 worksheet_values() 重試 5 次；
+      5 次仍失敗就繼續往外 raise，讓本次 RUN 失敗，避免產出漏資料圖片。
     """
     try:
         return read_gsheet_table(sheet_name, needed_cols)
-    except Exception:
-        return pd.DataFrame()
+    except Exception as exc:
+        if is_gsheet_missing_worksheet_error(exc):
+            return pd.DataFrame()
+        raise
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2026,8 +2079,8 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
     for sheet_name, cols in plans:
         try:
             df = read_gsheet_table(sheet_name, cols)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"TOP15 統計必要工作表讀取失敗：{sheet_name}") from exc
 
         for _, r in df.iterrows():
             d = get_buy_event_date(r, sheet_name)
@@ -2122,9 +2175,13 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             "日期", "分點", "權證代號", "權證代碼",
             "買進股數", "賣出股數", "買進金額", "賣出金額"
         ]
-        hist_df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols)
+        try:
+            hist_df = read_gsheet_table(SHEET_HISTORY, needed_cols)
+        except Exception as exc:
+            raise RuntimeError(f"TOP15 扣減成本必要工作表讀取失敗：{SHEET_HISTORY}") from exc
+
         if hist_df.empty:
-            return {}
+            raise RuntimeError(f"TOP15 扣減成本必要工作表沒有資料：{SHEET_HISTORY}")
 
         grouped: dict[tuple[str, str], dict] = defaultdict(lambda: defaultdict(lambda: {
             "buy_qty": 0.0,
@@ -2595,8 +2652,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
             add_buy_row(SHEET_A, "A", r, parse_date_value(r.get("買進日")), r.get("買進金額"))
 
         # 賣方扣減改由「快取_分點歷史 / 每日賣出明細」統一處理，並依賣出張數扣原始成本。
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(f"TOP15 統計必要工作表讀取失敗：{SHEET_A}") from exc
 
     # B/C/D：買超與賣方
     plans = [
@@ -2612,8 +2669,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
                 ["分點", "標的股", date_col, "買超金額", "買超張數",
                  "減碼日", "減碼賣出金額", "出清日", "出清賣出金額", "權證清單"]
             )
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"TOP15 統計必要工作表讀取失敗：{sheet_name}") from exc
 
         for _, r in df.iterrows():
             add_buy_row(sheet_name, event_code, r, parse_date_value(r.get(date_col)), r.get("買超金額"))
@@ -2631,7 +2688,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     #    誤扣本次 TOP15 的淨買超成本。
     sell_rows_loaded = False
     try:
-        sell_df = read_gsheet_table_optional(
+        sell_df = read_gsheet_table(
             SHEET_HISTORY,
             ["日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱", "賣出股數", "賣出金額"]
         )
@@ -2639,8 +2696,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
         if not sell_df.empty:
             sell_rows_loaded = True
             apply_sell_deduction_from_df(sell_df, ["權證代號", "權證代碼"])
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(f"TOP15 扣減成本必要工作表讀取失敗：{SHEET_HISTORY}") from exc
 
     # 舊版主程式若尚未同步「快取_分點歷史」到 Google Sheet，才退回每日賣出明細。
     # 但每日賣出明細可能只含最近幾天，因此只作備援，不作主要來源。
@@ -2653,8 +2710,8 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
             if not sell_df.empty:
                 apply_sell_deduction_from_df(sell_df, ["權證代號"])
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"TOP15 備援賣出明細讀取失敗：{SHEET_DAILY_SELL}") from exc
 
     top15_return_cache = read_top15_return_cache_from_gsheet(target)
     has_return_cache = bool(top15_return_cache)
