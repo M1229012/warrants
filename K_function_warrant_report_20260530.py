@@ -3208,6 +3208,15 @@ NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "90"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "2"))
+# 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v2_newslike").strip() or "v2_newslike"
+NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _news_points_cache_task() -> str:
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v2_newslike"))
+    return f"news_points_{safe_version}"
+
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
 NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
@@ -4205,6 +4214,7 @@ def _is_bad_news_sentence(sentence: str) -> bool:
         "SETN", "UDN", "自由財經", "中時新聞", "工商時報", "經濟日報", "鉅亨網", "MoneyDJ",
         "以下為您", "以下是", "為您整理", "整理如下", "統整如下", "重點如下",
         "根據您提供", "根據提供", "結合您提供", "結合全新", "深度預判", "深度預測",
+        "市場觀察到", "重新評價機會", "重新評價的機會", "成長動能與市場關注度",
         "資料是否充足", "新聞內文 JSON", "本週資料 JSON", "markdown", "JSON格式", "請只回傳",
         "第一點", "第二點", "第三點", "圖中", "如圖", "第三張", "符號", "問號",
     ]
@@ -4462,6 +4472,12 @@ def _trim_news_point(text: str, max_len: int | None = None) -> str:
     s = re.sub(r"^(根據您提供的資料|根據提供的資料|根據新聞內文|根據本週資料)[，,：:\s]*", "", s).strip()
     s = re.sub(r"\s+-\s+[^-]{1,40}$", "", s).strip()
     s = _remove_news_boilerplate(s)
+    # 將 LLM 常見的空泛分析語氣改成較像財經新聞摘要的說法，避免「市場觀察到、重新評價」這類字眼太像 AI 分析。
+    s = re.sub(r"^市場觀察到", "", s).strip()
+    s = s.replace("可能因", "受")
+    s = s.replace("而獲得重新評價的機會", "，使市場關注度升溫")
+    s = s.replace("重新評價的機會", "市場關注度升溫")
+    s = s.replace("相關成長動能與市場關注度", "相關訂單、營收與市場關注度")
     s = s.strip("。；;，, ")
     if len(s) <= max_len:
         return s
@@ -4878,44 +4894,52 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
     prompt = f"""
-你是台股新聞重點整理助手。
-你只能根據我提供的新聞內文整理，不可以使用外部知識，不可以自行補充。
+你是台股財經新聞編輯，負責把新聞素材整理成圖片週報右下角的「新聞 / 題材觀察」。
+你只能根據我提供的新聞素材整理，不可以使用外部知識，不可以自行補充。
 請使用繁體中文。
 
 股票：{stock_code} {display_name}
 
 任務：
-整理「近期新聞重點」，輸出給圖片週報右下角使用；優先近 7 天，若本週素材不足，允許使用 14～30 天內仍具時效的公司新聞。
-請綜合多篇新聞內文與媒體 / 法人說法，統整出重點中的重點，不要逐篇列標題。
+把近期新聞素材改寫成「像財經新聞摘要」的 2～3 點重點，給圖片週報右下角使用。
+寫法要像新聞編輯整理，不要像投資研究報告，也不要像 AI 分析。
+每一點都要清楚呈現：事件主軸 → 具體新聞內容 / 市場消息 → 對公司或產業的影響。
 
-嚴格規則：
+寫作風格要求：
+1. 每點開頭請用 4～8 個字的短標籤，後面接全形冒號，例如「業績更新：」、「法人觀點：」、「AI 題材：」、「報價動向：」、「公司動態：」。
+2. 句子要像財經新聞摘要，優先寫「誰發生什麼事、關鍵數字或事件、對公司可能影響」。
+3. 優先使用具體新聞元素：營收、月增 / 年增、EPS、毛利率、法說、法人報告、目標價、評等、接單、出貨、報價、產能、供需、產品布局、公司公告。
+4. 如果素材只有 Google News RSS 標題 / 摘要，不能硬說「本週宣布」或「公司證實」，請改成「市場關注」、「近期題材」、「媒體報導指出」等保守新聞語氣。
+5. 避免空泛分析語氣，不要使用「市場觀察到」、「可能因」、「重新評價機會」、「成長動能與市場關注度」、「投資人可關注」這類句子。
+6. 不要寫成純技術分析，不要提權證資金流、分點籌碼、K 線、均線或圖表內容；新聞區塊只整理新聞與題材。
+7. 不要寫投資建議，不要寫「可以買進」「建議進場」「不追高」。
+
+嚴格事實規則：
 1. 不要直接複製新聞標題。
 2. 不要輸出新聞網站名稱、作者、網址、完整看、看更多、延伸閱讀。
 3. 不要把只有股價漲停、亮燈、強漲、創高、焦點股這類描述當成重點。
-4. 每一點必須來自我提供的近期新聞內文，不可以幻想，不可以使用外部知識；若素材來自 14～30 天內舊新聞，請避免寫成「本週宣布」。
+4. 每一點必須來自我提供的近期新聞素材，不可以幻想；若素材來自 14～30 天內舊新聞，請避免寫成「本週宣布」。
 5. 如果新聞同時提到多家公司，所有目標價、評等、EPS、營收、獲利預估等數字，必須確認該數字在同一句或同一分句中明確指向「{stock_code} {display_name}」。
 6. 嚴禁把台積電、瑞昱、聯詠或其他公司的目標價 / EPS / 營收預估寫成「{display_name}」的重點；若無法判斷數字屬於哪家公司，就不要使用該數字。
 7. 若句子格式像「A 公司目標價 3000 元、B 公司目標價 5922 元」，整理 {display_name} 時只能保留 B 公司明確對應的數字，不可混用 A 公司數字。
 8. 若新聞片段出現記憶體、DRAM、HBM、伺服器、PCB、載板等產業詞，必須確認該產業詞在同一句或相鄰句明確連到「{stock_code} {display_name}」；不能把同篇文章中其他股票的產業題材寫成本股票重點。
 9. 優先整理與「{stock_code} {display_name}」公司本身產業、基本面或股價可能受影響的消息，不要整理同篇文章中其他公司的題材。
-10. 具體重點優先順序：法人目標價 / 評等 / 升降評、EPS / 每股純益、營收 / 毛利率 / 獲利、ASP / 報價 / 供需、接單 / 出貨 / 產能 / 長約、公司本身所屬產業趨勢。
-11. 若產業詞、目標價、EPS、營收、ASP、毛利率或獲利預估沒有在同一句或相鄰句明確連到「{stock_code} {display_name}」，不要寫進重點。
-12. 請最多輸出 3 點，建議 2～3 點；整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字，若只有 2 點，每點要更完整。
-13. 若只有 2 個高品質重點且已達整體字數要求，可以只輸出 2 點；不要為了湊第 3 點而輸出關鍵字、標籤、追蹤文字或看不懂的摘要。
-14. 不要輸出投資建議，不要寫「可以買進」「建議進場」。
-15. 圖片區塊不大，但新聞內容必須有資訊量；每點約 42～90 個中文字。
-16. 若不同文章報同一件事，合併成一點，並寫出共同核心。
-17. 請保留最關鍵的數字或事件，但不要塞滿數字。
-18. 嚴禁輸出「關鍵字：」、「追蹤我們」、「分享給朋友」、「本文」、「標籤」或任何社群導流、SEO 關鍵字內容。
-19. 嚴禁輸出「以下為您」、「根據提供資料」、「結合資料整理」這類 AI 助理語氣；每一點都必須直接像新聞摘要。
-20. 嚴禁輸出問號、奇怪符號、圖表說明、圖片說明或「圖中顯示」這類文字。
+10. 若產業詞、目標價、EPS、營收、ASP、毛利率或獲利預估沒有在同一句或相鄰句明確連到「{stock_code} {display_name}」，不要寫進重點。
+11. 最多輸出 3 點，建議 2～3 點；整體至少 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 個中文字，若只有 2 點，每點要更完整。
+12. 若只有 2 個高品質重點且已達整體字數要求，可以只輸出 2 點；不要為了湊第 3 點而輸出關鍵字、標籤、追蹤文字或看不懂的摘要。
+13. 圖片區塊不大，但新聞內容必須有資訊量；每點約 45～90 個中文字。
+14. 若不同文章報同一件事，合併成一點，並寫出共同核心。
+15. 請保留最關鍵的數字或事件，但不要塞滿數字。
+16. 嚴禁輸出「關鍵字：」、「追蹤我們」、「分享給朋友」、「本文」、「標籤」或任何社群導流、SEO 關鍵字內容。
+17. 嚴禁輸出「以下為您」、「根據提供資料」、「結合資料整理」這類 AI 助理語氣；每一點都必須直接像新聞摘要。
+18. 嚴禁輸出問號、奇怪符號、圖表說明、圖片說明或「圖中顯示」這類文字。
 
 請只回傳 JSON，不要 markdown，不要多餘說明。
 格式：
 {{
   "points": [
-    "第一點",
-    "第二點"
+    "業績更新：第一點",
+    "法人觀點：第二點"
   ],
   "note": "資料是否充足的簡短說明"
 }}
@@ -4928,7 +4952,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     print(f"模型：{GEMINI_MODEL}")
     print(f"送入 Gemini 的文章數：{len(usable_articles)}")
     print("=" * 100)
-    output_text = _call_gemini_with_retry(prompt, cache_task="news_points", stock_code=stock_code, stock_name=stock_name)
+    output_text = _call_gemini_with_retry(prompt, cache_task=_news_points_cache_task(), stock_code=stock_code, stock_name=stock_name)
     points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
     if points:
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
@@ -5090,7 +5114,7 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         "1. 最多輸出 3 點，每點 45 到 90 個中文字。\n"
         "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
         "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
-        "4. 每點要像研究摘要，說明原因、影響或觀察方向，不要寫成聳動標題。\n"
+        "4. 每點要像財經新聞摘要，格式盡量為「短標籤：具體事件／數字／市場消息 + 對公司或產業的影響」，不要寫成空泛研究報告。\n"
         "5. 只聚焦公司本身可能影響股價的消息：公司產業、法人目標價/評等、EPS/每股純益、營收、毛利率、獲利、ASP/報價、接單出貨、產能與供需。\n"
         "6. 若目標價、EPS、營收、ASP、毛利率或產業題材沒有明確指向本公司，請不要使用。\n"
         "7. 若資料不足，寧可保守，不要臆測。\n\n"
@@ -5101,7 +5125,7 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         payload = {
             "model": NEWS_OPENAI_MODEL,
             "messages": [
-                {"role": "system", "content": "你是台股產業新聞摘要助理，輸出繁體中文、重點清楚、避免標題式內容。"},
+                {"role": "system", "content": "你是台股財經新聞編輯，輸出繁體中文、重點清楚、像新聞摘要，避免空泛分析語氣。"},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -5153,10 +5177,10 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
         return []
 
     categories = [
-        ("業績面", ["營收", "月增", "年增", "業績", "財報", "獲利", "EPS", "毛利", "毛利率", "每股盈餘", "虧損", "轉盈"]),
-        ("產業面", ["AI", "伺服器", "記憶體", "DRAM", "NAND", "半導體", "報價", "HBM", "漲價", "缺貨", "先進封裝", "CoWoS", "ASIC", "散熱"]),
-        ("展望面", ["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望", "接單", "出貨", "產能", "需求", "訂單", "客戶"]),
-        ("法人面", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "買進", "中立", "賣出", "大摩", "摩根士丹利", "高盛", "里昂"]),
+        ("業績更新", ["營收", "月增", "年增", "業績", "財報", "獲利", "EPS", "毛利", "毛利率", "每股盈餘", "虧損", "轉盈"]),
+        ("產業題材", ["AI", "伺服器", "記憶體", "DRAM", "NAND", "半導體", "報價", "HBM", "漲價", "缺貨", "先進封裝", "CoWoS", "ASIC", "散熱"]),
+        ("公司動態", ["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望", "接單", "出貨", "產能", "需求", "訂單", "客戶"]),
+        ("法人觀點", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "買進", "中立", "賣出", "大摩", "摩根士丹利", "高盛", "里昂"]),
     ]
 
     points = []
@@ -5194,7 +5218,7 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
         for score, text in scored:
             if len(points) >= NEWS_SUMMARY_MAX_POINTS:
                 break
-            pick = _make_news_keypoint("新聞面", text, stock_code, stock_name)
+            pick = _make_news_keypoint("新聞焦點", text, stock_code, stock_name)
             if pick and not _is_bad_news_sentence(pick):
                 points.append(pick)
                 used.add(text)
@@ -5216,7 +5240,7 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     if not stock_key:
         return []
 
-    cached_text = load_gsheet_llm_cache("news_points", stock_key, stock_name, prompt="")
+    cached_text = load_gsheet_llm_cache(_news_points_cache_task(), stock_key, stock_name, prompt="")
     if cached_text:
         points = _clean_news_summary_points_for_stock(_parse_raw_points_from_llm(cached_text), stock_key, stock_name)
         if points:
@@ -5232,10 +5256,15 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
             return []
 
         work = df.copy().fillna("")
+        task_candidates = [_news_points_cache_task()]
+        if NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK:
+            task_candidates.append("news_points")
+
         if "任務" in work.columns:
-            work = work[work["任務"].astype(str).str.strip() == "news_points"].copy()
+            work = work[work["任務"].astype(str).str.strip().isin(task_candidates)].copy()
         else:
-            work = work[work.get("快取鍵", "").astype(str).str.contains("news_points", na=False)].copy()
+            pattern = "|".join(re.escape(t) for t in task_candidates)
+            work = work[work.get("快取鍵", "").astype(str).str.contains(pattern, na=False)].copy()
 
         if "標的股" in work.columns:
             work = work[work["標的股"].map(_clean_code).astype(str) == stock_key].copy()
@@ -5301,7 +5330,7 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
 
     # 優先把「所有可用新聞」一次交給 Gemini 統整。
     # 這裡不要逐篇呼叫 Gemini；_summarize_news_with_gemini() 會將多篇原文 / RSS 摘要合併成同一份 article_json，
-    # 並透過單一次 _call_gemini_with_retry(cache_task="news_points") 產生最多 3 點新聞重點。
+    # 並透過單一次 _call_gemini_with_retry(cache_task=_news_points_cache_task()) 產生最多 3 點新聞重點。
     ai_source_records = records
     ai_points = _summarize_news_with_gemini(ai_source_records, stock_code, stock_name)
     if ai_points:
@@ -6024,7 +6053,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # Notes row
     ax_notes = fig.add_subplot(gs[8, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
-    for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材")]:
+    for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材觀察")]:
         note_y = 0.005
         note_w = 0.48
         note_h = 0.975
