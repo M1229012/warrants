@@ -4,7 +4,7 @@ compatibility_date = "2026-06-04"
 
 [vars]
 GITHUB_REPO = "M1229012/warrants"
-GITHUB_WORKFLOW_FILE = "warrant_report_manual_test.yml"
+GITHUB_WORKFLOW_FILE = "generate_warrant_report.yml"
 GITHUB_BRANCH = "main"
 
 # 如果 workflow 有 refresh_news_summary input，設 1；沒有就設 0
