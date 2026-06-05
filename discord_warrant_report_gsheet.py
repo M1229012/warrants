@@ -3456,7 +3456,7 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     margin_x = 0.40
     content_w = fig_w - 2 * margin_x
 
-    top_h = 1.60
+    top_h = 1.30
     summary_h = 0.55
     gap = 0.20
     section_title_h = 0.55
