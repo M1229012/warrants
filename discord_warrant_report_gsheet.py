@@ -17,6 +17,7 @@
 - GOOGLE_SHEET_ID：建議使用，最穩
 - GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟，預設「權證分點籌碼」
 - TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
+- IMAGE_ACTION / ACTION / RUN_PLAN：圖片產生選項，用於 GitHub Actions workflow_dispatch 區別要跑哪張圖
 - ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
 """
 
@@ -75,6 +76,8 @@ SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
 SHEET_TOP15_RETURN_CACHE = os.getenv("SHEET_TOP15_RETURN_CACHE", "快取_TOP15分點報酬率")
+SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近7日權證分點共識TOP15")
+
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
 # 若某權證不在 A/B/C/D 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
@@ -3113,6 +3116,320 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     plt.close(fig)
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 本週｜全市場分點權證共識買賣超金額 TOP15
+# ══════════════════════════════════════════════════════════════════════
+
+IMAGE_ACTION_DAILY_BUNDLE = "精選五分點每日圖"
+IMAGE_ACTION_CONSENSUS_BUY = "近一個月共識淨買超TOP15"
+IMAGE_ACTION_WEEKLY_WARRANT = "本週權證共識買賣超TOP15"
+IMAGE_ACTION_ALL = "全部圖片"
+
+
+def normalize_image_action(action_text: str) -> str:
+    """
+    將 GitHub Actions / CLI 傳進來的選項轉成程式內部動作。
+
+    支援常見名稱：
+    - 精選五分點每日圖 / 精選5分點當日買賣超產圖 / 每日精選分點買賣超追蹤
+    - 近一個月共識淨買超TOP15
+    - 本週權證共識買賣超TOP15 / 本週買賣超金額各TOP15 / 近7日權證分點共識TOP15
+    - 全部圖片
+    """
+    raw = str(action_text or "").strip()
+    key = re.sub(r"[\s_\-｜|/\\]+", "", raw).lower()
+
+    if not key:
+        return IMAGE_ACTION_DAILY_BUNDLE
+
+    if "全部" in raw or key in {"all", "全部圖片", "全部產圖"}:
+        return IMAGE_ACTION_ALL
+
+    if (
+        "本週" in raw
+        or "近7" in raw
+        or "7日" in raw
+        or "買賣超金額各" in raw
+        or "權證分點共識" in raw
+        or "weekly" in key
+        or "warrantconsensus" in key
+    ):
+        return IMAGE_ACTION_WEEKLY_WARRANT
+
+    if "近一個月" in raw or "共識淨買超成本" in raw or "五大分點共識" in raw or "consensus" in key:
+        return IMAGE_ACTION_CONSENSUS_BUY
+
+    return IMAGE_ACTION_DAILY_BUNDLE
+
+
+def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
+    """
+    讀取主程式 RUN_MODE=2 才會更新的「快取_近7日權證分點共識TOP15」。
+
+    回傳：
+    - 共識買超 rows
+    - 共識賣超 rows
+    - 統計期間文字
+    - 實際採用的統計日期
+    """
+    needed_cols = [
+        "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
+        "排名類型", "排名",
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "排名金額", "買進金額", "賣出金額", "淨買超金額", "淨賣超金額",
+        "買進股數", "賣出股數",
+        "參與分點數", "同向分點數", "反向分點數", "主要同向分點",
+        "完成狀態", "更新時間", "run_id", "分點明細_JSON",
+    ]
+
+    df = read_gsheet_table_optional(SHEET_WARRANT_CONSENSUS_7D, needed_cols)
+    if df.empty:
+        return [], [], "無資料", None
+
+    available_dates = []
+    for _, r in df.iterrows():
+        d = parse_date_value(r.get("統計日期"))
+        if d:
+            available_dates.append(d)
+
+    chosen_date = None
+    if available_dates:
+        if target is not None:
+            valid_dates = [d for d in available_dates if d <= target]
+            chosen_date = max(valid_dates) if valid_dates else max(available_dates)
+        else:
+            chosen_date = max(available_dates)
+
+    rows = []
+    for _, r in df.iterrows():
+        row_date = parse_date_value(r.get("統計日期"))
+        if chosen_date and row_date and row_date != chosen_date:
+            continue
+
+        rank_type = strip_gsheet_text_prefix(r.get("排名類型", ""))
+        if rank_type not in {"共識買超", "共識賣超"}:
+            continue
+
+        warrant_code = normalize_warrant_code(r.get("權證代號", ""))
+        warrant_name = strip_gsheet_text_prefix(r.get("權證名稱", ""))
+        underlying = normalize_underlying(r.get("標的股", ""), warrant_name)
+        underlying_name = strip_gsheet_text_prefix(r.get("標的名稱", ""))
+
+        rows.append({
+            "stat_date": row_date,
+            "period": strip_gsheet_text_prefix(r.get("統計期間", "")),
+            "rank_type": rank_type,
+            "rank": safe_int(r.get("排名"), 0),
+            "warrant_code": warrant_code,
+            "warrant_name": warrant_name,
+            "underlying": underlying,
+            "underlying_name": underlying_name,
+            "target": f"{underlying} {underlying_name}".strip(),
+            "rank_amount": safe_float(r.get("排名金額"), 0),
+            "buy_amount": safe_float(r.get("買進金額"), 0),
+            "sell_amount": safe_float(r.get("賣出金額"), 0),
+            "net_buy_amount": safe_float(r.get("淨買超金額"), 0),
+            "net_sell_amount": safe_float(r.get("淨賣超金額"), 0),
+            "broker_count": safe_int(r.get("參與分點數"), 0),
+            "same_direction_count": safe_int(r.get("同向分點數"), 0),
+            "opposite_direction_count": safe_int(r.get("反向分點數"), 0),
+            "main_brokers": strip_gsheet_text_prefix(r.get("主要同向分點", "")),
+        })
+
+    buy_rows = [r for r in rows if r["rank_type"] == "共識買超"]
+    sell_rows = [r for r in rows if r["rank_type"] == "共識賣超"]
+
+    buy_rows.sort(key=lambda x: (x.get("rank", 999), -safe_float(x.get("rank_amount"), 0)))
+    sell_rows.sort(key=lambda x: (x.get("rank", 999), -safe_float(x.get("rank_amount"), 0)))
+
+    period_text = ""
+    for row in buy_rows + sell_rows:
+        if row.get("period"):
+            period_text = row["period"]
+            break
+    if not period_text:
+        period_text = "無資料" if not rows else "未標示期間"
+
+    return buy_rows[:15], sell_rows[:15], period_text, chosen_date
+
+
+def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
+    """
+    新增圖片：本週權證分點共識買賣超金額各 TOP15。
+
+    資料來源只讀「快取_近7日權證分點共識TOP15」，
+    不在圖片端重新計算快取_分點歷史，避免和主程式統計口徑不一致。
+    """
+    buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target)
+
+    total_buy_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in buy_rows)
+    total_sell_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in sell_rows)
+    cache_date_text = cache_date.strftime("%Y/%m/%d") if cache_date else target.strftime("%Y/%m/%d")
+
+    fig_w = 13.0
+    margin_x = 0.40
+    content_w = fig_w - 2 * margin_x
+
+    top_h = 1.60
+    summary_h = 0.55
+    gap = 0.20
+    section_title_h = 0.55
+    header_h = 0.42
+    row_h = 0.48
+    footer_h = 0.45
+
+    buy_table_h = section_title_h + header_h + max(1, len(buy_rows)) * row_h
+    sell_table_h = section_title_h + header_h + max(1, len(sell_rows)) * row_h
+
+    fig_h = top_h + summary_h + gap + buy_table_h + gap + sell_table_h + footer_h
+    fig_h = max(fig_h, 9.5)
+
+    BG = "#F6F8FB"
+    WHITE = "#FFFFFF"
+    NAVY = "#061D3D"
+    NAVY2 = "#0B2E5B"
+    RED = "#D92323"
+    GREEN = "#16803C"
+    TEXT = "#111827"
+    MUTED = "#64748B"
+    BORDER = "#C9D5E3"
+    ROW_ALT = "#FAFCFF"
+    HEADER_BG = "#F3F7FC"
+
+    font_path = get_font_path(False)
+    bold_path = get_font_path(True)
+    FONT = font_manager.FontProperties(fname=font_path)
+    BOLD = font_manager.FontProperties(fname=bold_path)
+
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
+    ax.set_xlim(0, fig_w)
+    ax.set_ylim(0, fig_h)
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
+        patch = patches.FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle=f"round,pad=0,rounding_size={r}",
+            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z
+        )
+        ax.add_patch(patch)
+        return patch
+
+    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
+        patch = patches.Rectangle((x, y), w, h, linewidth=lw if ec else 0,
+                                  edgecolor=ec, facecolor=fc, zorder=z)
+        ax.add_patch(patch)
+        return patch
+
+    def text(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5):
+        ax.text(x, y, str(s), fontsize=size, color=color, fontproperties=fp or FONT,
+                ha=ha, va=va, zorder=z)
+
+    def fit(s, n_chars):
+        s = str(s)
+        return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
+
+    try:
+        ax.text(
+            0.5, 0.50, CENTER_WATERMARK_TEXT,
+            transform=ax.transAxes,
+            ha="center", va="center",
+            fontsize=CENTER_WATERMARK_FONT_SIZE,
+            fontproperties=BOLD,
+            color="#2C3440",
+            alpha=CENTER_WATERMARK_ALPHA,
+            rotation=CENTER_WATERMARK_ROTATION,
+            linespacing=1.18,
+            zorder=50,
+        )
+    except Exception:
+        pass
+
+    # Header
+    y = fig_h - 0.45
+    text(margin_x + 0.15, y, "本週權證分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
+    y -= 0.45
+    text(margin_x + 0.18, y, f"資料來源：{SHEET_WARRANT_CONSENSUS_7D}｜統計日期：{cache_date_text}", 14, NAVY2, BOLD)
+    y -= 0.30
+    text(margin_x + 0.18, y, f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元", 13, TEXT, BOLD)
+
+    # Summary row
+    y -= 0.28
+    summary_y = y - summary_h
+    rounded(margin_x, summary_y, content_w, summary_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+    text(margin_x + 0.25, summary_y + summary_h / 2, f"共識買超TOP15合計：{fmt_wan(total_buy_rank_amount)}", 13.5, RED, BOLD)
+    text(margin_x + 3.90, summary_y + summary_h / 2, f"共識賣超TOP15合計：{fmt_wan(total_sell_rank_amount)}", 13.5, GREEN, BOLD)
+    text(margin_x + 7.55, summary_y + summary_h / 2, "排名金額＝同一權證近7日買賣互抵後的同向金額", 12.5, TEXT, FONT)
+    y = summary_y - gap
+
+    def draw_top15_table(title: str, rows: list[dict], y_top: float, theme_color: str, amount_label: str) -> float:
+        table_h = section_title_h + header_h + max(1, len(rows)) * row_h
+        rounded(margin_x, y_top - table_h, content_w, table_h, fc=WHITE, ec=theme_color, lw=1.2, r=0.08)
+        rect(margin_x, y_top - section_title_h, content_w, section_title_h, fc=theme_color)
+        text(margin_x + 0.30, y_top - section_title_h / 2, title, 19, WHITE, BOLD)
+
+        headers = ["排名", "權證", "標的", amount_label, "買進", "賣出", "分點", "主要同向分點"]
+        col_w = [0.55, 2.35, 1.55, 1.35, 1.25, 1.25, 0.65, 3.25]
+
+        header_y_top = y_top - section_title_h
+        rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
+
+        x = margin_x
+        for h, w in zip(headers, col_w):
+            text(x + w / 2, header_y_top - header_h / 2, h, 12, NAVY, BOLD, ha="center")
+            ax.plot([x, x], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
+            x += w
+        ax.plot([margin_x + content_w, margin_x + content_w], [y_top - table_h, header_y_top], color=BORDER, linewidth=0.6)
+
+        data_y = header_y_top - header_h
+        if not rows:
+            rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
+            text(margin_x + content_w / 2, data_y - row_h / 2, "目前沒有可顯示資料", 13, MUTED, BOLD, ha="center")
+        else:
+            for i, r in enumerate(rows):
+                ry = data_y - (i + 1) * row_h
+                rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
+
+                warrant_label = f"{r.get('warrant_code', '')} {r.get('warrant_name', '')}".strip()
+                target_label = r.get("target", "") or r.get("underlying", "")
+                main_brokers = r.get("main_brokers", "")
+
+                values = [
+                    str(safe_int(r.get("rank"), i + 1)),
+                    fit(warrant_label, 17),
+                    fit(target_label, 11),
+                    fmt_wan(r.get("rank_amount", 0)),
+                    fmt_wan(r.get("buy_amount", 0)),
+                    fmt_wan(r.get("sell_amount", 0)),
+                    str(safe_int(r.get("same_direction_count"), 0)),
+                    fit(main_brokers, 28),
+                ]
+                colors = [TEXT, TEXT, TEXT, theme_color, RED, GREEN, TEXT, TEXT]
+                aligns = ["center", "left", "left", "right", "right", "right", "center", "left"]
+                bolds = [True, True, True, True, True, True, True, False]
+
+                x = margin_x
+                for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
+                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
+                    text(px, ry + row_h / 2, val, 13.5, c, BOLD if is_bold else FONT, ha=a)
+                    x += w
+
+        return y_top - table_h
+
+    y = draw_top15_table("本週共識買超金額 TOP15", buy_rows, y, RED, "買超金額")
+    y -= gap
+    y = draw_top15_table("本週共識賣超金額 TOP15", sell_rows, y, GREEN, "賣超金額")
+
+    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
+    plt.close(fig)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Discord
 # ══════════════════════════════════════════════════════════════════════
@@ -3133,8 +3450,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=os.getenv("TARGET_DATE", ""))
     parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
+    parser.add_argument("--consensus-output", default=os.getenv("CONSENSUS_OUTPUT_IMAGE", ""))
+    parser.add_argument("--weekly-output", default=os.getenv("WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
+    parser.add_argument(
+        "--action",
+        default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
+        help=(
+            "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
+            "本週權證共識買賣超TOP15 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
+        ),
+    )
     parser.add_argument("--no-discord", action="store_true")
     args = parser.parse_args()
+
+    action = normalize_image_action(args.action)
 
     if args.date:
         target = datetime.strptime(args.date, "%Y-%m-%d").date()
@@ -3142,23 +3471,47 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
+    consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
+    weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
 
-    history = read_history_stats_from_gsheet()
-    buys, sells = extract_actions_from_gsheet(target)
+    image_paths: list[Path] = []
 
     print(
         f"Google Sheet：{GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME}\n"
         f"目標日期：{target:%Y-%m-%d}\n"
-        f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
+        f"Action選項：{args.action or '(預設)'}\n"
+        f"實際執行：{action}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
-        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日\n"
-        f"輸出圖檔1：{output_path}\n"
-        f"輸出圖檔2：{consensus_output_path}"
+        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日"
     )
 
-    draw_report_image(target, buys, sells, history, output_path)
-    draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
+    if action in [IMAGE_ACTION_DAILY_BUNDLE, IMAGE_ACTION_ALL]:
+        history = read_history_stats_from_gsheet()
+        buys, sells = extract_actions_from_gsheet(target)
+
+        print(
+            f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
+            f"輸出圖檔1：{output_path}\n"
+            f"輸出圖檔2：{consensus_output_path}"
+        )
+
+        draw_report_image(target, buys, sells, history, output_path)
+        draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
+        image_paths.append(output_path)
+        image_paths.append(consensus_output_path)
+
+    elif action == IMAGE_ACTION_CONSENSUS_BUY:
+        print(f"輸出圖檔：{consensus_output_path}")
+        draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
+        image_paths.append(consensus_output_path)
+
+    if action in [IMAGE_ACTION_WEEKLY_WARRANT, IMAGE_ACTION_ALL]:
+        print(f"輸出圖檔：{weekly_output_path}")
+        draw_weekly_warrant_consensus_image(target, weekly_output_path)
+        image_paths.append(weekly_output_path)
+
+    if not image_paths:
+        raise RuntimeError(f"無法辨識或沒有產生任何圖片：{args.action}")
 
     if args.no_discord:
         print("已設定 --no-discord，只輸出圖片，不發送 Discord。")
@@ -3168,11 +3521,10 @@ def main():
     if not webhook_url:
         raise RuntimeError("找不到 DISCORD_WEBHOOK_URL_TEST，請先在 GitHub Secrets 設定。")
 
-    send_to_discord(webhook_url, output_path, target)
-    send_to_discord(webhook_url, consensus_output_path, target)
+    for image_path in image_paths:
+        send_to_discord(webhook_url, image_path, target)
 
-    print("Discord 已發送 2 張圖片。")
-
+    print(f"Discord 已發送 {len(image_paths)} 張圖片。")
 
 if __name__ == "__main__":
     main()
