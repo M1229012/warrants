@@ -177,14 +177,18 @@ def worksheet_values(sheet_name: str) -> list[list[str]]:
     return ws.get_all_values()
 
 
-def read_gsheet_table(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
+def read_gsheet_table(
+    sheet_name: str,
+    needed_cols: list[str] | None = None,
+    filter_tracked_brokers: bool = True,
+) -> pd.DataFrame:
     """
     讀取一般工作表：
     - 第 1 列是表頭
     - 後面是資料
     - 自動補齊欄位數
     - 只保留 needed_cols 交集
-    - 篩選 TRACKED_BROKERS
+    - 預設只保留 TRACKED_BROKERS；若要讀全分點資料，可傳 filter_tracked_brokers=False
     """
     values = worksheet_values(sheet_name)
     if not values:
@@ -210,7 +214,7 @@ def read_gsheet_table(sheet_name: str, needed_cols: list[str] | None = None) -> 
         keep_cols = [c for c in needed_cols if c in df.columns]
         df = df[keep_cols].copy()
 
-    if "分點" in df.columns:
+    if filter_tracked_brokers and "分點" in df.columns:
         df = df[df["分點"].isin(TRACKED_BROKERS)].copy()
 
     return df
@@ -231,13 +235,17 @@ def read_gsheet_stat_raw() -> pd.DataFrame:
     return pd.DataFrame(fixed).fillna("")
 
 
-def read_gsheet_table_optional(sheet_name: str, needed_cols: list[str] | None = None) -> pd.DataFrame:
+def read_gsheet_table_optional(
+    sheet_name: str,
+    needed_cols: list[str] | None = None,
+    filter_tracked_brokers: bool = True,
+) -> pd.DataFrame:
     """
     讀取可能不存在的工作表。
     主要用於「每日賣出明細」：若舊版主程式尚未產生該表，圖片程式不應直接中斷。
     """
     try:
-        return read_gsheet_table(sheet_name, needed_cols)
+        return read_gsheet_table(sheet_name, needed_cols, filter_tracked_brokers=filter_tracked_brokers)
     except Exception:
         return pd.DataFrame()
 
@@ -3165,343 +3173,201 @@ def normalize_image_action(action_text: str) -> str:
 
 def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
     """
-    讀取主程式 RUN_MODE=2 才會更新的「快取_近7日權證分點共識TOP15」。
+    直接從「快取_分點歷史」計算近 7 天全分點標的共識買賣超 TOP15。
 
-    圖片端顯示邏輯：
-    - Google Sheet 原始資料仍維持「單一權證」列。
-    - 這裡只在圖片端依「排名類型 + 標的股」合併。
-    - 同一個標的底下的所有權證買進 / 賣出 / 淨額會加總後重新排名。
+    重要：
+    - 不再讀取「快取_近7日權證分點共識TOP15」作為最終排名來源。
+    - 會直接讀完整的「快取_分點歷史」全分點資料。
+    - 先把同一標的底下所有權證合併，再排序買超 / 賣超 TOP15。
 
     回傳：
     - 共識買超標的 rows
     - 共識賣超標的 rows
     - 統計期間文字
-    - 實際採用的統計日期
+    - 實際採用的統計日期（期末日）
     """
     needed_cols = [
-        "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
-        "排名類型", "排名",
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "排名金額", "買進金額", "賣出金額", "淨買超金額", "淨賣超金額",
-        "買進股數", "賣出股數",
-        "參與分點數", "同向分點數", "反向分點數", "主要同向分點",
-        "完成狀態", "更新時間", "run_id", "分點明細_JSON",
+        "日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱",
+        "買進金額", "賣出金額", "買進股數", "賣出股數",
     ]
 
-    df = read_gsheet_table_optional(SHEET_WARRANT_CONSENSUS_7D, needed_cols)
+    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols, filter_tracked_brokers=False)
     if df.empty:
         return [], [], "無資料", None
 
     available_dates = []
     for _, r in df.iterrows():
-        d = parse_date_value(r.get("統計日期"))
+        d = parse_date_value(r.get("日期"))
         if d:
             available_dates.append(d)
 
-    chosen_date = None
-    if available_dates:
-        if target is not None:
-            valid_dates = [d for d in available_dates if d <= target]
-            chosen_date = max(valid_dates) if valid_dates else max(available_dates)
-        else:
-            chosen_date = max(available_dates)
+    if not available_dates:
+        return [], [], "無資料", None
 
-    raw_rows = []
+    if target is not None:
+        valid_dates = [d for d in available_dates if d <= target]
+        chosen_date = max(valid_dates) if valid_dates else max(available_dates)
+    else:
+        chosen_date = max(available_dates)
+
+    period_start = chosen_date - timedelta(days=6)
+    period_text = f"{period_start:%Y/%m/%d} ～ {chosen_date:%Y/%m/%d}"
+
+    stock_name_map = get_stock_name_map()
+    grouped: dict[str, dict] = {}
+
     for _, r in df.iterrows():
-        row_date = parse_date_value(r.get("統計日期"))
-        if chosen_date and row_date and row_date != chosen_date:
+        d = parse_date_value(r.get("日期"))
+        if not d or d < period_start or d > chosen_date:
             continue
 
-        rank_type = strip_gsheet_text_prefix(r.get("排名類型", ""))
-        if rank_type not in {"共識買超", "共識賣超"}:
+        broker = str(r.get("分點", "")).strip()
+        if not broker:
             continue
 
-        warrant_code = normalize_warrant_code(r.get("權證代號", ""))
         warrant_name = strip_gsheet_text_prefix(r.get("權證名稱", ""))
         underlying = normalize_underlying(r.get("標的股", ""), warrant_name)
-        underlying_name = strip_gsheet_text_prefix(r.get("標的名稱", ""))
-
         if not underlying:
             continue
 
-        raw_rows.append({
-            "stat_date": row_date,
-            "period": strip_gsheet_text_prefix(r.get("統計期間", "")),
-            "rank_type": rank_type,
-            "rank": safe_int(r.get("排名"), 0),
-            "warrant_code": warrant_code,
-            "warrant_name": warrant_name,
-            "underlying": underlying,
-            "underlying_name": underlying_name,
-            "target": f"{underlying} {underlying_name}".strip(),
-            "rank_amount": safe_float(r.get("排名金額"), 0),
-            "buy_amount": safe_float(r.get("買進金額"), 0),
-            "sell_amount": safe_float(r.get("賣出金額"), 0),
-            "net_buy_amount": safe_float(r.get("淨買超金額"), 0),
-            "net_sell_amount": safe_float(r.get("淨賣超金額"), 0),
-            "buy_qty": safe_float(r.get("買進股數"), 0),
-            "sell_qty": safe_float(r.get("賣出股數"), 0),
-            "broker_count": safe_int(r.get("參與分點數"), 0),
-            "same_direction_count": safe_int(r.get("同向分點數"), 0),
-            "opposite_direction_count": safe_int(r.get("反向分點數"), 0),
-            "main_brokers": strip_gsheet_text_prefix(r.get("主要同向分點", "")),
-            "broker_detail_json": strip_gsheet_text_prefix(r.get("分點明細_JSON", "")),
-        })
+        buy_amount = safe_float(r.get("買進金額"), 0)
+        sell_amount = safe_float(r.get("賣出金額"), 0)
+        buy_qty = safe_float(r.get("買進股數"), 0)
+        sell_qty = safe_float(r.get("賣出股數"), 0)
+        if buy_amount <= 0 and sell_amount <= 0 and buy_qty <= 0 and sell_qty <= 0:
+            continue
 
-    def parse_broker_detail_items(raw_json):
-        """
-        盡量解析「分點明細_JSON」。
-        若主程式輸出的 JSON 格式未來有調整，解析失敗時會自動退回主要同向分點文字。
-        """
-        s = strip_gsheet_text_prefix(raw_json)
-        if not s or s == "-":
-            return []
+        underlying_name = stock_name_map.get(underlying, "")
+        if not underlying_name:
+            underlying_name = extract_stock_name_from_warrant_text(warrant_name)
 
-        try:
-            data = json.loads(s)
-        except Exception:
-            return []
+        item = grouped.setdefault(
+            underlying,
+            {
+                "underlying": underlying,
+                "underlying_name": underlying_name,
+                "target": f"{underlying} {underlying_name}".strip(),
+                "buy_amount": 0.0,
+                "sell_amount": 0.0,
+                "buy_qty": 0.0,
+                "sell_qty": 0.0,
+                "warrant_codes": set(),
+                "warrant_names": set(),
+                "broker_buy": defaultdict(float),
+                "broker_sell": defaultdict(float),
+            },
+        )
 
-        if isinstance(data, dict):
-            if isinstance(data.get("items"), list):
-                data = data.get("items")
-            elif isinstance(data.get("details"), list):
-                data = data.get("details")
-            elif isinstance(data.get("明細"), list):
-                data = data.get("明細")
-            else:
-                data = [data]
+        if not item.get("underlying_name") and underlying_name:
+            item["underlying_name"] = underlying_name
+            item["target"] = f"{underlying} {underlying_name}".strip()
 
-        if not isinstance(data, list):
-            return []
+        item["buy_amount"] += buy_amount
+        item["sell_amount"] += sell_amount
+        item["buy_qty"] += buy_qty
+        item["sell_qty"] += sell_qty
 
-        items = []
-        for item in data:
-            if not isinstance(item, dict):
+        warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
+        if warrant_code:
+            item["warrant_codes"].add(warrant_code)
+        if warrant_name:
+            item["warrant_names"].add(warrant_name)
+
+        item["broker_buy"][broker] += buy_amount
+        item["broker_sell"][broker] += sell_amount
+
+    def build_direction_rows(direction: str) -> list[dict]:
+        rows = []
+        for item in grouped.values():
+            buy_amount = safe_float(item.get("buy_amount"), 0)
+            sell_amount = safe_float(item.get("sell_amount"), 0)
+            net_buy_amount = max(buy_amount - sell_amount, 0.0)
+            net_sell_amount = max(sell_amount - buy_amount, 0.0)
+            rank_amount = net_buy_amount if direction == "buy" else net_sell_amount
+            if rank_amount <= 0:
                 continue
 
-            broker = (
-                item.get("分點")
-                or item.get("分點名稱")
-                or item.get("broker")
-                or item.get("broker_name")
-                or item.get("券商分點")
-                or ""
-            )
-            broker = str(broker).strip()
-            if not broker:
-                continue
+            same_direction_brokers = []
+            opposite_direction_count = 0
+            all_brokers = set(item.get("broker_buy", {}).keys()) | set(item.get("broker_sell", {}).keys())
+            for broker in all_brokers:
+                broker_buy = safe_float(item.get("broker_buy", {}).get(broker), 0)
+                broker_sell = safe_float(item.get("broker_sell", {}).get(broker), 0)
+                net = broker_buy - broker_sell
+                if direction == "buy":
+                    if net > 0:
+                        same_direction_brokers.append((broker, net))
+                    elif net < 0:
+                        opposite_direction_count += 1
+                else:
+                    if net < 0:
+                        same_direction_brokers.append((broker, -net))
+                    elif net > 0:
+                        opposite_direction_count += 1
 
-            buy_amount = safe_float(
-                item.get("買進金額")
-                or item.get("buy_amount")
-                or item.get("buy")
-                or 0
+            same_direction_brokers.sort(key=lambda kv: kv[1], reverse=True)
+            same_direction_count = len(same_direction_brokers)
+            main_brokers = "、".join(
+                f"{broker} {fmt_wan(amount)}"
+                for broker, amount in same_direction_brokers[:5]
             )
-            sell_amount = safe_float(
-                item.get("賣出金額")
-                or item.get("sell_amount")
-                or item.get("sell")
-                or 0
-            )
-            net_buy_amount = safe_float(
-                item.get("淨買超金額")
-                or item.get("net_buy_amount")
-                or item.get("net_buy")
-                or 0
-            )
-            net_sell_amount = safe_float(
-                item.get("淨賣超金額")
-                or item.get("net_sell_amount")
-                or item.get("net_sell")
-                or 0
-            )
+            if len(same_direction_brokers) > 5:
+                main_brokers += f"、等{len(same_direction_brokers)}家"
 
-            items.append({
-                "broker": broker,
+            warrant_count = len(item.get("warrant_codes", set()))
+            if warrant_count <= 0:
+                warrant_count = len(item.get("warrant_names", set()))
+            if warrant_count <= 0:
+                warrant_count = 1
+
+            rows.append({
+                "stat_date": chosen_date,
+                "period": period_text,
+                "rank_type": "共識買超" if direction == "buy" else "共識賣超",
+                "rank": 0,
+                "underlying": item.get("underlying", ""),
+                "underlying_name": item.get("underlying_name", ""),
+                "target": item.get("target", "") or item.get("underlying", ""),
+                "rank_amount": rank_amount,
                 "buy_amount": buy_amount,
                 "sell_amount": sell_amount,
                 "net_buy_amount": net_buy_amount,
                 "net_sell_amount": net_sell_amount,
+                "buy_qty": safe_float(item.get("buy_qty"), 0),
+                "sell_qty": safe_float(item.get("sell_qty"), 0),
+                "warrant_count": warrant_count,
+                "same_direction_count": same_direction_count,
+                "opposite_direction_count": opposite_direction_count,
+                "broker_count": same_direction_count,
+                "main_brokers": main_brokers,
             })
 
-        return items
+        rows.sort(
+            key=lambda x: (
+                safe_float(x.get("rank_amount"), 0),
+                safe_float(x.get("buy_amount"), 0) + safe_float(x.get("sell_amount"), 0),
+                safe_int(x.get("warrant_count"), 0),
+                safe_int(x.get("same_direction_count"), 0),
+            ),
+            reverse=True,
+        )
 
-    def split_main_brokers_text(text_value: str) -> list[str]:
-        s = strip_gsheet_text_prefix(text_value)
-        if not s or s == "-":
-            return []
-        parts = []
-        for part in re.split(r"[、,，；;]+", s):
-            part = part.strip()
-            if part:
-                parts.append(part)
-        return parts
-
-    def aggregate_by_underlying(rows: list[dict], rank_type: str) -> list[dict]:
-        grouped = {}
-
-        for row in rows:
-            if row.get("rank_type") != rank_type:
-                continue
-
-            key = row.get("underlying", "")
-            if not key:
-                continue
-
-            if key not in grouped:
-                grouped[key] = {
-                    "stat_date": row.get("stat_date"),
-                    "period": row.get("period", ""),
-                    "rank_type": rank_type,
-                    "rank": 0,
-                    "warrant_code": "",
-                    "warrant_name": "",
-                    "underlying": row.get("underlying", ""),
-                    "underlying_name": row.get("underlying_name", ""),
-                    "target": row.get("target", "") or row.get("underlying", ""),
-                    "rank_amount": 0.0,
-                    "buy_amount": 0.0,
-                    "sell_amount": 0.0,
-                    "net_buy_amount": 0.0,
-                    "net_sell_amount": 0.0,
-                    "buy_qty": 0.0,
-                    "sell_qty": 0.0,
-                    "broker_count": 0,
-                    "same_direction_count": 0,
-                    "opposite_direction_count": 0,
-                    "main_brokers": "",
-                    "warrant_count": 0,
-                    "warrant_codes": set(),
-                    "warrant_names": set(),
-                    "_broker_amounts": defaultdict(float),
-                    "_broker_names": set(),
-                    "_main_broker_texts": [],
-                }
-
-            item = grouped[key]
-
-            item["buy_amount"] += safe_float(row.get("buy_amount"), 0)
-            item["sell_amount"] += safe_float(row.get("sell_amount"), 0)
-            item["net_buy_amount"] += safe_float(row.get("net_buy_amount"), 0)
-            item["net_sell_amount"] += safe_float(row.get("net_sell_amount"), 0)
-            item["buy_qty"] += safe_float(row.get("buy_qty"), 0)
-            item["sell_qty"] += safe_float(row.get("sell_qty"), 0)
-            item["opposite_direction_count"] += safe_int(row.get("opposite_direction_count"), 0)
-
-            warrant_code = normalize_warrant_code(row.get("warrant_code", ""))
-            warrant_name = strip_gsheet_text_prefix(row.get("warrant_name", ""))
-            if warrant_code:
-                item["warrant_codes"].add(warrant_code)
-            if warrant_name:
-                item["warrant_names"].add(warrant_name)
-
-            # 排名金額以標的層級重新計算，避免只沿用單一權證原排名。
-            if rank_type == "共識買超":
-                directional_amount = safe_float(row.get("net_buy_amount"), 0)
-            else:
-                directional_amount = safe_float(row.get("net_sell_amount"), 0)
-
-            if directional_amount <= 0:
-                directional_amount = safe_float(row.get("rank_amount"), 0)
-
-            item["rank_amount"] += directional_amount
-
-            # 優先用 JSON 的分點明細去合併同向分點，避免同一分點跨多檔權證被重複計數。
-            detail_items = parse_broker_detail_items(row.get("broker_detail_json", ""))
-            if detail_items:
-                for broker_item in detail_items:
-                    broker = broker_item.get("broker", "")
-                    if not broker:
-                        continue
-
-                    if rank_type == "共識買超":
-                        broker_amount = safe_float(broker_item.get("net_buy_amount"), 0)
-                        if broker_amount <= 0:
-                            broker_amount = safe_float(broker_item.get("buy_amount"), 0) - safe_float(broker_item.get("sell_amount"), 0)
-                    else:
-                        broker_amount = safe_float(broker_item.get("net_sell_amount"), 0)
-                        if broker_amount <= 0:
-                            broker_amount = safe_float(broker_item.get("sell_amount"), 0) - safe_float(broker_item.get("buy_amount"), 0)
-
-                    if broker_amount > 0:
-                        item["_broker_amounts"][broker] += broker_amount
-                        item["_broker_names"].add(broker)
-            else:
-                # 無法解析 JSON 時，保留原本的主要同向分點文字，至少圖片上仍可看出主要來源。
-                for broker_text in split_main_brokers_text(row.get("main_brokers", "")):
-                    if broker_text not in item["_main_broker_texts"]:
-                        item["_main_broker_texts"].append(broker_text)
-
-        result = []
-        for item in grouped.values():
-            if item["rank_amount"] <= 0:
-                continue
-
-            warrant_count = len(item["warrant_codes"]) if item["warrant_codes"] else len(item["warrant_names"])
-            if warrant_count <= 0:
-                warrant_count = 1
-
-            item["warrant_count"] = warrant_count
-
-            if item["_broker_amounts"]:
-                sorted_brokers = sorted(item["_broker_amounts"].items(), key=lambda kv: kv[1], reverse=True)
-                item["same_direction_count"] = len(sorted_brokers)
-                item["broker_count"] = len(sorted_brokers)
-                item["main_brokers"] = "、".join(
-                    f"{broker} {fmt_wan(amount)}"
-                    for broker, amount in sorted_brokers[:5]
-                )
-                if len(sorted_brokers) > 5:
-                    item["main_brokers"] += f"、等{len(sorted_brokers)}家"
-            else:
-                item["same_direction_count"] = max(
-                    safe_int(item.get("same_direction_count"), 0),
-                    len(item["_main_broker_texts"]),
-                    safe_int(item.get("broker_count"), 0),
-                )
-                item["broker_count"] = item["same_direction_count"]
-                item["main_brokers"] = "、".join(item["_main_broker_texts"][:5])
-                if len(item["_main_broker_texts"]) > 5:
-                    item["main_brokers"] += f"、等{len(item['_main_broker_texts'])}家"
-
-            # 清掉內部暫存欄位，避免後面誤用或輸出時出現 set / defaultdict。
-            item.pop("warrant_codes", None)
-            item.pop("warrant_names", None)
-            item.pop("_broker_amounts", None)
-            item.pop("_broker_names", None)
-            item.pop("_main_broker_texts", None)
-
-            result.append(item)
-
-        result.sort(key=lambda x: (safe_float(x.get("rank_amount"), 0), safe_float(x.get("buy_amount"), 0) + safe_float(x.get("sell_amount"), 0), safe_int(x.get("warrant_count"), 0)), reverse=True)
-
-        for idx, row in enumerate(result, 1):
+        for idx, row in enumerate(rows, 1):
             row["rank"] = idx
 
-        return result[:15]
+        return rows[:15]
 
-    buy_rows = aggregate_by_underlying(raw_rows, "共識買超")
-    sell_rows = aggregate_by_underlying(raw_rows, "共識賣超")
-
-    period_text = ""
-    for row in raw_rows:
-        if row.get("period"):
-            period_text = row["period"]
-            break
-    if not period_text:
-        period_text = "無資料" if not raw_rows else "未標示期間"
-
+    buy_rows = build_direction_rows("buy")
+    sell_rows = build_direction_rows("sell")
     return buy_rows, sell_rows, period_text, chosen_date
-
 
 
 def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     """
     新增圖片：本週標的分點共識買賣超金額各 TOP15。
 
-    資料來源只讀「快取_近7日權證分點共識TOP15」，
-    不在圖片端重新計算快取_分點歷史，避免和主程式統計口徑不一致。
+    資料來源改為直接讀取「快取_分點歷史」全分點資料，
+    並在圖片端先依標的合併所有權證後再重新排序。
     """
     buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target)
 
@@ -3574,6 +3440,55 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
         s = str(s)
         return s if len(s) <= n_chars else s[:n_chars - 1] + "…"
 
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def measure_text_width(s, size=13.0, fp=None):
+        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
+        bb = ghost.get_window_extent(renderer=renderer)
+        ghost.remove()
+        x0_disp, y0_disp = ax.transData.transform((0, 0))
+        x1_disp = x0_disp + bb.width
+        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
+        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
+        return x1_data - x0_data
+
+    def fit_to_cell_width(s, cell_w, size=13.0, fp=None):
+        s = str(s or "")
+        if not s:
+            return ""
+        max_w = max(float(cell_w), 0.1)
+        if measure_text_width(s, size=size, fp=fp) <= max_w:
+            return s
+
+        ellipsis = "…"
+        ell_w = measure_text_width(ellipsis, size=size, fp=fp)
+        if ell_w >= max_w:
+            return ellipsis
+
+        low, high = 0, len(s)
+        best = ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = s[:mid] + ellipsis
+            if measure_text_width(candidate, size=size, fp=fp) <= max_w:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best or ellipsis
+
+    def draw_clipped_text(x_left, y_center, cell_w, text_value, size=13.2, color=TEXT, fp=None, padding_left=0.12, padding_right=0.12):
+        display_text = fit_to_cell_width(text_value, cell_w - padding_left - padding_right, size=size, fp=fp)
+        clip_rect = patches.Rectangle((x_left, y_center - row_h / 2 + 0.02), cell_w, row_h - 0.04, linewidth=0, facecolor="none")
+        ax.add_patch(clip_rect)
+        t = ax.text(
+            x_left + padding_left, y_center, display_text,
+            fontsize=size, color=color, fontproperties=fp or FONT,
+            ha="left", va="center", zorder=5, clip_on=True
+        )
+        t.set_clip_path(clip_rect)
+
     try:
         ax.text(
             0.5, 0.50, CENTER_WATERMARK_TEXT,
@@ -3594,7 +3509,7 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     y = fig_h - 0.45
     text(margin_x + 0.15, y, "本週標的分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
     y -= 0.45
-    text(margin_x + 0.18, y, f"資料來源：{SHEET_WARRANT_CONSENSUS_7D}｜統計日期：{cache_date_text}", 14, NAVY2, BOLD)
+    text(margin_x + 0.18, y, f"資料來源：{SHEET_HISTORY}（全分點）｜統計日期：{cache_date_text}", 14, NAVY2, BOLD)
     y -= 0.30
     text(margin_x + 0.18, y, f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元", 13, TEXT, BOLD)
 
@@ -3653,7 +3568,13 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
                 bolds = [True, True, True, True, True, True, True, False]
 
                 x = margin_x
-                for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
+                last_idx = len(values) - 1
+                for col_idx, (val, w, c, a, is_bold) in enumerate(zip(values, col_w, colors, aligns, bolds)):
+                    if col_idx == last_idx:
+                        draw_clipped_text(x, ry + row_h / 2, w, val, size=13.2, color=c, fp=BOLD if is_bold else FONT)
+                        x += w
+                        continue
+
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                     text(px, ry + row_h / 2, val, 13.5, c, BOLD if is_bold else FONT, ha=a)
                     x += w
