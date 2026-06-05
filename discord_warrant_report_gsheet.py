@@ -370,7 +370,22 @@ def money_to_wan(v: float) -> float:
 
 
 def fmt_wan(v: float) -> str:
-    return f"{money_to_wan(v):.1f} 萬"
+    """
+    金額顯示：
+    - 未滿 1 億：維持「萬」
+    - 達 1 億以上：自動換算成「億」，避免圖卡欄位出現五位數以上的萬而太長
+    """
+    try:
+        value = float(v or 0)
+    except Exception:
+        value = 0.0
+
+    if abs(value) >= 100000000:
+        yi = value / 100000000
+        txt = f"{yi:.2f}".rstrip("0").rstrip(".")
+        return f"{txt} 億"
+
+    return f"{money_to_wan(value):.1f} 萬"
 
 
 def count_warrants_in_text(text: str) -> int:
@@ -1885,6 +1900,43 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         s = str(s)
         return s if len(s) <= n else s[:n - 1] + "…"
 
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def measure_text_width(s, size=14, fp=None):
+        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
+        bb = ghost.get_window_extent(renderer=renderer)
+        ghost.remove()
+        x0_disp, y0_disp = ax.transData.transform((0, 0))
+        x1_disp = x0_disp + bb.width
+        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
+        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
+        return x1_data - x0_data
+
+    def fit_to_cell_width(s, cell_w, size=14, fp=None):
+        s = str(s or "")
+        if not s:
+            return ""
+        max_w = max(float(cell_w), 0.08)
+        if measure_text_width(s, size=size, fp=fp) <= max_w:
+            return s
+
+        ellipsis = "…"
+        if measure_text_width(ellipsis, size=size, fp=fp) >= max_w:
+            return ellipsis
+
+        low, high = 0, len(s)
+        best = ellipsis
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = s[:mid] + ellipsis
+            if measure_text_width(candidate, size=size, fp=fp) <= max_w:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
     def draw_center_watermark():
         try:
             ax.text(
@@ -2038,7 +2090,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
                 x = margin_x
                 for val, w, c, a, is_bold, h in zip(values, col_widths, colors, aligns, bolds, headers):
                     px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    display_val = fit(val, max(5, int(w * 6.0)))
+                    display_val = fit_to_cell_width(val, max(0.2, w - 0.24), size=14, fp=BOLD if is_bold else FONT)
 
                     # 只針對買超明細「內容」欄，把「加碼N｜」前綴獨立畫成粗體。
                     # 後面的權證名稱維持原本一般字體，避免整格都變粗。
@@ -2959,6 +3011,30 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
         return x1_data - x0_data
 
+    def fit_to_cell_width(s, cell_w, size=14, fp=None):
+        s = str(s or "")
+        if not s:
+            return ""
+        max_w = max(float(cell_w), 0.08)
+        if measure_text_width(s, size=size, fp=fp) <= max_w:
+            return s
+
+        ellipsis = "…"
+        if measure_text_width(ellipsis, size=size, fp=fp) >= max_w:
+            return ellipsis
+
+        low, high = 0, len(s)
+        best = ellipsis
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = s[:mid] + ellipsis
+            if measure_text_width(candidate, size=size, fp=fp) <= max_w:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
     def build_participant_broker_items(row, limit=5):
         """
         顯示所有參與分點的淨累積買超金額與快取報酬率。
@@ -3113,8 +3189,9 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                     x += w
                     continue
 
+                display_val = fit_to_cell_width(val, max(0.2, w - 0.24), size=14, fp=BOLD if is_bold else FONT)
                 px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                text(px, ry + row_h / 2, val, 14, c, BOLD if is_bold else FONT, ha=a)
+                text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
 
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
@@ -3517,9 +3594,9 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     y -= 0.28
     summary_y = y - summary_h
     rounded(margin_x, summary_y, content_w, summary_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
-    text(margin_x + 0.25, summary_y + summary_h / 2, f"共識買超TOP15合計：{fmt_wan(total_buy_rank_amount)}", 13.5, RED, BOLD)
-    text(margin_x + 3.90, summary_y + summary_h / 2, f"共識賣超TOP15合計：{fmt_wan(total_sell_rank_amount)}", 13.5, GREEN, BOLD)
-    text(margin_x + 7.55, summary_y + summary_h / 2, "排名金額＝同一標的底下所有權證近7日買賣互抵後的同向金額", 12.5, TEXT, FONT)
+    text(margin_x + 0.25, summary_y + summary_h / 2, f"共識買超TOP15合計：{fmt_wan(total_buy_rank_amount)}", 13.5, NAVY, BOLD)
+    text(margin_x + 3.90, summary_y + summary_h / 2, f"共識賣超TOP15合計：{fmt_wan(total_sell_rank_amount)}", 13.5, NAVY2, BOLD)
+    text(margin_x + 7.55, summary_y + summary_h / 2, "排名金額＝同標的所有權證近7日買賣互抵後金額", 12.5, TEXT, FONT)
     y = summary_y - gap
 
     def draw_top15_table(title: str, rows: list[dict], y_top: float, theme_color: str, amount_label: str) -> float:
@@ -3568,22 +3645,21 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
                 bolds = [True, True, True, True, True, True, True, False]
 
                 x = margin_x
-                last_idx = len(values) - 1
                 for col_idx, (val, w, c, a, is_bold) in enumerate(zip(values, col_w, colors, aligns, bolds)):
-                    if col_idx == last_idx:
-                        draw_clipped_text(x, ry + row_h / 2, w, val, size=13.2, color=c, fp=BOLD if is_bold else FONT)
-                        x += w
-                        continue
-
-                    px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
-                    text(px, ry + row_h / 2, val, 13.5, c, BOLD if is_bold else FONT, ha=a)
+                    fp = BOLD if is_bold else FONT
+                    if a == "left":
+                        draw_clipped_text(x, ry + row_h / 2, w, val, size=13.2, color=c, fp=fp)
+                    else:
+                        display_val = fit_to_cell_width(val, max(0.2, w - 0.24), size=13.2, fp=fp)
+                        px = x + (w / 2 if a == "center" else w - 0.12)
+                        text(px, ry + row_h / 2, display_val, 13.2, c, fp, ha=a)
                     x += w
 
         return y_top - table_h
 
-    y = draw_top15_table("本週共識買超金額 TOP15", buy_rows, y, RED, "買超金額")
+    y = draw_top15_table("本週共識買超金額 TOP15", buy_rows, y, NAVY, "買超金額")
     y -= gap
-    y = draw_top15_table("本週共識賣超金額 TOP15", sell_rows, y, GREEN, "賣超金額")
+    y = draw_top15_table("本週共識賣超金額 TOP15", sell_rows, y, NAVY, "賣超金額")
 
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
 
