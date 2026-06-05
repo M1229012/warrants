@@ -75,8 +75,10 @@ SHEET_D = "D_近10日累積淨買進"
 SHEET_STAT = "勝率統計"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
+SHEET_PUT_HISTORY = os.getenv("SHEET_PUT_HISTORY", "快取_認售分點歷史")
 SHEET_TOP15_RETURN_CACHE = os.getenv("SHEET_TOP15_RETURN_CACHE", "快取_TOP15分點報酬率")
 SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近7日權證分點共識TOP15")
+SHEET_PUT_WARRANT_CONSENSUS_7D = os.getenv("SHEET_PUT_WARRANT_CONSENSUS_7D", "快取_近7日認售權證分點共識TOP15")
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
@@ -3248,13 +3250,13 @@ def normalize_image_action(action_text: str) -> str:
     return IMAGE_ACTION_DAILY_BUNDLE
 
 
-def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
+def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None, history_sheet: str = SHEET_HISTORY) -> tuple[list[dict], list[dict], str, date | None]:
     """
-    直接從「快取_分點歷史」計算近 7 天全分點標的共識買賣超 TOP15。
+    直接從指定的分點歷史快取工作表計算近 7 天全分點標的共識買賣超 TOP15。
 
     重要：
-    - 不再讀取「快取_近7日權證分點共識TOP15」作為最終排名來源。
-    - 會直接讀完整的「快取_分點歷史」全分點資料。
+    - 不再讀取 TOP15 快取工作表作為最終排名來源。
+    - 認購預設讀「快取_分點歷史」；認售會讀「快取_認售分點歷史」。
     - 先把同一標的底下所有權證合併，再排序買超 / 賣超 TOP15。
 
     回傳：
@@ -3268,7 +3270,7 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
         "買進金額", "賣出金額", "買進股數", "賣出股數",
     ]
 
-    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols, filter_tracked_brokers=False)
+    df = read_gsheet_table_optional(history_sheet, needed_cols, filter_tracked_brokers=False)
     if df.empty:
         return [], [], "無資料", None
 
@@ -3439,14 +3441,15 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
     return buy_rows, sell_rows, period_text, chosen_date
 
 
-def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
+def draw_weekly_warrant_consensus_image(target: date, output_path: Path, history_sheet: str = SHEET_HISTORY, title_prefix: str = "本週標的"):
     """
     新增圖片：本週標的分點共識買賣超金額各 TOP15。
 
-    資料來源改為直接讀取「快取_分點歷史」全分點資料，
+    資料來源會直接讀指定的分點歷史快取工作表，
+    認購預設使用「快取_分點歷史」，認售使用「快取_認售分點歷史」，
     並在圖片端先依標的合併所有權證後再重新排序。
     """
-    buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target)
+    buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target, history_sheet=history_sheet)
 
     total_buy_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in buy_rows)
     total_sell_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in sell_rows)
@@ -3584,12 +3587,12 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "本週標的分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
+    text(margin_x + 0.15, y, f"{title_prefix}分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
     y -= 0.45
     text(
         margin_x + 0.18,
         y,
-        f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元｜統計日期：{cache_date_text}",
+        f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元｜統計日期：{cache_date_text}｜來源：{history_sheet}",
         13,
         TEXT,
         BOLD
@@ -3695,12 +3698,13 @@ def main():
     parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
     parser.add_argument("--consensus-output", default=os.getenv("CONSENSUS_OUTPUT_IMAGE", ""))
     parser.add_argument("--weekly-output", default=os.getenv("WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
+    parser.add_argument("--weekly-put-output", default=os.getenv("WEEKLY_PUT_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
     parser.add_argument(
         "--action",
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
             "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
-            "本週權證共識買賣超TOP15 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
+            "本週權證共識買賣超TOP15 / 全部圖片。選本週時會同時輸出認購與認售。也支援 GitHub Actions 的 RUN_PLAN。"
         ),
     )
     parser.add_argument("--no-discord", action="store_true")
@@ -3716,6 +3720,7 @@ def main():
     output_path = Path(args.output)
     consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
     weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
+    weekly_put_output_path = Path(args.weekly_put_output) if args.weekly_put_output else output_path.parent / "本週認售權證分點共識買賣超TOP15.png"
 
     image_paths: list[Path] = []
 
@@ -3749,9 +3754,23 @@ def main():
         image_paths.append(consensus_output_path)
 
     if action in [IMAGE_ACTION_WEEKLY_WARRANT, IMAGE_ACTION_ALL]:
-        print(f"輸出圖檔：{weekly_output_path}")
-        draw_weekly_warrant_consensus_image(target, weekly_output_path)
+        print(f"輸出認購圖檔：{weekly_output_path}")
+        draw_weekly_warrant_consensus_image(
+            target,
+            weekly_output_path,
+            history_sheet=SHEET_HISTORY,
+            title_prefix="本週認購標的",
+        )
         image_paths.append(weekly_output_path)
+
+        print(f"輸出認售圖檔：{weekly_put_output_path}")
+        draw_weekly_warrant_consensus_image(
+            target,
+            weekly_put_output_path,
+            history_sheet=SHEET_PUT_HISTORY,
+            title_prefix="本週認售標的",
+        )
+        image_paths.append(weekly_put_output_path)
 
     if not image_paths:
         raise RuntimeError(f"無法辨識或沒有產生任何圖片：{args.action}")
