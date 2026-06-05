@@ -7,6 +7,17 @@ on:
         description: "指定圖卡日期，例如 2026-05-18。留空則自動抓 Google Sheet 內最新日期"
         required: false
         default: ""
+      run_plan:
+        description: "執行方案"
+        required: true
+        default: "精選五分點每日圖"
+        type: choice
+        options:
+          - "精選五分點每日圖"
+          - "近一個月共識淨買超TOP15"
+          - "本週權證共識買賣超TOP15"
+          - "全部圖片"
+
   schedule:
     # 台灣時間 17:30 = UTC 09:30
     - cron: "30 09 * * 1-5"
@@ -30,6 +41,9 @@ jobs:
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
 
+      # 排程預設執行原本的每日圖流程
+      RUN_PLAN: "精選五分點每日圖"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,10 +65,19 @@ jobs:
 
       - name: Generate image from Google Sheet and send to Discord
         run: |
+          ACTION_VALUE="${RUN_PLAN}"
+
+          if [ -n "${{ github.event.inputs.run_plan }}" ]; then
+            ACTION_VALUE="${{ github.event.inputs.run_plan }}"
+          fi
+
           if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            python discord_warrant_report_gsheet.py --date "${{ github.event.inputs.target_date }}"
+            python "精選分點圖卡_整合Action_本週權證共識TOP15.py" \
+              --date "${{ github.event.inputs.target_date }}" \
+              --action "${ACTION_VALUE}"
           else
-            python discord_warrant_report_gsheet.py
+            python "精選分點圖卡_整合Action_本週權證共識TOP15.py" \
+              --action "${ACTION_VALUE}"
           fi
 
       - name: Upload generated image artifact
