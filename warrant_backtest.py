@@ -87,12 +87,10 @@ CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_sele
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 
-# 認售權證專用快取：
-# 這一組只服務「本週認售權證分點共識買賣超 TOP15」，不會影響原本認購 ABCD 與認購 TOP15。
-PUT_WARRANTS_CACHE_PATH = os.path.join(CACHE_DIR, "put_warrants_cache.csv")
+# 認售 TOP15 專用快取：只新增認售資料來源，不影響原本認購快取。
+PUT_WARRANTS_CACHE_PATH   = os.path.join(CACHE_DIR, "put_warrants_cache.csv")
 PUT_CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "put_candidates_cache.csv")
-PUT_HISTORY_CACHE_PATH = os.path.join(CACHE_DIR, "put_broker_warrant_history_cache.csv")
-PUT_PRESCAN_REFRESH_KEYS = set()
+PUT_HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "put_broker_warrant_history_cache.csv")
 
 # TOP15 圖片用固定資料集：
 # 主程式在同一次 RUN 內，會把 TOP15 所需的所有部位明細、賣出扣減、價格快照與報酬率
@@ -118,8 +116,8 @@ WARRANT_CONSENSUS_7D_SHEET = os.getenv("WARRANT_CONSENSUS_7D_SHEET", "快取_近
 WARRANT_CONSENSUS_7D_DAYS = int(os.getenv("WARRANT_CONSENSUS_7D_DAYS", "7"))
 WARRANT_CONSENSUS_7D_TOP_N = int(os.getenv("WARRANT_CONSENSUS_7D_TOP_N", "15"))
 
-# 認售權證近 7 日「所有追蹤分點」共識買賣超 TOP15。
-# 這張表會在 RUN_MODE=2 完整分點清單模式建立 / 更新，圖片程式會用它對應輸出認售圖。
+# 認售近 7 日「所有追蹤分點」權證共識買賣超 TOP15：
+# 規則與認購 TOP15 相同，但排名單位改為「標的」累積金額。
 PUT_WARRANT_CONSENSUS_7D_ENABLED = os.getenv("PUT_WARRANT_CONSENSUS_7D_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 PUT_WARRANT_CONSENSUS_7D_SHEET = os.getenv("PUT_WARRANT_CONSENSUS_7D_SHEET", "快取_近7日認售權證分點共識TOP15")
 
@@ -1136,10 +1134,10 @@ CACHE_SHEET_NAME_MAP = {
     "candidates_cache.csv": "快取_候選組合",
     "candidates_cache_selected5.csv": "快取_候選組合_精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
-    "price_cache.csv": "快取_價格",
     "put_warrants_cache.csv": "快取_認售權證清單",
     "put_candidates_cache.csv": "快取_認售候選組合",
     "put_broker_warrant_history_cache.csv": "快取_認售分點歷史",
+    "price_cache.csv": "快取_價格",
 }
 
 
@@ -2892,6 +2890,54 @@ def load_warrants_cache():
     return warrants
 
 
+
+
+def save_warrants_cache_to_path(warrants, path, label_text="權證清單"):
+    """寫入指定權證清單快取。用於新增認售快取，不影響原本認購快取。"""
+    if not USE_CACHE or not warrants:
+        return
+
+    df = pd.DataFrame(warrants)
+
+    wanted_cols = ["代號", "名稱", "標的股", "標的名稱"]
+    for col in wanted_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    write_cache_csv(df[wanted_cols], path)
+    print(f"  💾 已更新{label_text}快取：{path}")
+
+
+def load_warrants_cache_from_path(path):
+    """讀取指定權證清單快取。用於新增認售快取，不影響原本認購快取。"""
+    df = read_cache_csv(path)
+
+    if df.empty:
+        return []
+
+    required_cols = ["代號", "名稱", "標的股", "標的名稱"]
+    for col in required_cols:
+        if col not in df.columns:
+            return []
+
+    warrants = []
+    for row in df.itertuples(index=False):
+        row = row._asdict()
+        code = str(row["代號"]).strip()
+        name = str(row["名稱"]).strip()
+
+        if not code or not name:
+            continue
+
+        warrants.append({
+            "代號": code,
+            "名稱": name,
+            "標的股": str(row.get("標的股", "")).strip(),
+            "標的名稱": str(row.get("標的名稱", "")).strip(),
+        })
+
+    return warrants
+
 def save_broker_map_cache(broker_map):
     if not USE_CACHE or not broker_map:
         return
@@ -2995,6 +3041,65 @@ def load_candidates_cache():
     return candidates
 
 
+
+
+def save_candidates_cache_to_path(candidates, path, label_text="候選組合"):
+    """寫入指定候選組合快取。用於新增認售快取，不影響原本認購快取。"""
+    if not USE_CACHE or not candidates:
+        return
+
+    rows = []
+
+    for c in candidates:
+        rows.append({
+            "權證代號": c[0],
+            "權證名稱": c[1],
+            "標的股": c[2],
+            "標的名稱": c[3],
+            "分點": c[4],
+            "分點名稱": c[5],
+            "券商代號": c[6],
+        })
+
+    df = pd.DataFrame(rows)
+    write_cache_csv(df, path)
+    print(f"  💾 已更新{label_text}快取：{path}")
+
+
+def load_candidates_cache_from_path(path):
+    """讀取指定候選組合快取。用於新增認售快取，不影響原本認購快取。"""
+    df = read_cache_csv(path)
+
+    if df.empty:
+        return []
+
+    required_cols = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號"]
+    for col in required_cols:
+        if col not in df.columns:
+            return []
+
+    candidates = []
+
+    for row in df.itertuples(index=False):
+        row = row._asdict()
+        warrant_code = str(row["權證代號"]).strip()
+        broker_code = str(row["券商代號"]).strip()
+
+        if not warrant_code or not broker_code:
+            continue
+
+        candidates.append((
+            warrant_code,
+            str(row["權證名稱"]).strip(),
+            str(row["標的股"]).strip(),
+            str(row["標的名稱"]).strip(),
+            str(row["分點"]).strip(),
+            str(row["分點名稱"]).strip(),
+            broker_code,
+        ))
+
+    return candidates
+
 def merge_candidates(old_candidates, new_candidates):
     merged = {}
 
@@ -3027,6 +3132,38 @@ def load_history_cache():
 
     return df[required_cols].copy()
 
+
+
+
+def load_history_cache_from_path(path, label_text="原始分點資料"):
+    """讀取指定分點歷史快取。用於新增認售快取，不影響原本認購快取。"""
+    df = read_cache_csv(path)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    required_cols = [
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    ]
+
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"  ⚠️ {label_text}快取欄位不完整，缺少：{col}")
+            return pd.DataFrame()
+
+    return df[required_cols].copy()
+
+
+def save_history_cache_to_path(history_df, path, label_text="原始分點資料"):
+    """寫入指定分點歷史快取。用於新增認售快取，不影響原本認購快取。"""
+    if not USE_CACHE or history_df is None or history_df.empty:
+        return
+
+    write_cache_csv(history_df, path)
+    print(f"  💾 已更新{label_text}快取：{path}")
 
 def history_cache_keys(history_df):
     keys = set()
@@ -3475,60 +3612,19 @@ def get_all_call_warrants():
     return warrants
 
 
+
+
 # ══════════════════════════════════════════════════════════════════════
-# Step 1b：取所有認售權證 + 標的股代號（本週認售 TOP15 專用）
+# 認售新增：取所有認售權證 + 標的股代號
 # ══════════════════════════════════════════════════════════════════════
-
-def save_put_warrants_cache(warrants):
-    if not USE_CACHE or not warrants:
-        return
-
-    df = pd.DataFrame(warrants)
-    wanted_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    for col in wanted_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    write_cache_csv(df[wanted_cols], PUT_WARRANTS_CACHE_PATH)
-    print(f"  💾 已更新認售權證清單快取：{PUT_WARRANTS_CACHE_PATH}")
-
-
-def load_put_warrants_cache():
-    df = read_cache_csv(PUT_WARRANTS_CACHE_PATH)
-
-    if df.empty:
-        return []
-
-    required_cols = ["代號", "名稱", "標的股", "標的名稱"]
-    for col in required_cols:
-        if col not in df.columns:
-            return []
-
-    warrants = []
-    for row in df.itertuples(index=False):
-        row = row._asdict()
-        code = str(row["代號"]).strip()
-        name = str(row["名稱"]).strip()
-
-        if not code or not name:
-            continue
-
-        warrants.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": str(row.get("標的股", "")).strip(),
-            "標的名稱": str(row.get("標的名稱", "")).strip(),
-        })
-
-    return warrants
-
 
 def get_all_put_warrants_live():
-    print("【Step 1b】取所有認售權證清單...")
+    print("【Put Step 1】取所有認售權證清單...")
     warrants = []
 
-    # strMode=2：上市有價證券；strMode=4：上櫃有價證券。
-    # 認售權證也需要兩邊都抓，避免漏掉 70xxxx 類型權證。
+    # strMode=2：上市有價證券
+    # strMode=4：上櫃有價證券
+    # 兩邊都要抓，否則上櫃標的的權證，例如 70xxxx 權證會漏掉。
     isin_modes = [
         ("上市", "2"),
         ("上櫃", "4"),
@@ -3558,7 +3654,9 @@ def get_all_put_warrants_live():
         except Exception as e:
             print(f"  ⚠️ {market_name} ISIN 清單取得失敗：{e}")
 
+    # 只建立一次 resolver，避免每檔權證都重新掃全部股票與 alias，保持執行速度。
     underlying_resolver = build_underlying_resolver(stock_map)
+
     seen_warrants = set()
 
     for market_name, df in all_dfs:
@@ -3586,7 +3684,7 @@ def get_all_put_warrants_live():
                     "代號": code,
                     "名稱": name,
                     "標的股": underlying,
-                    "標的名稱": underlying_name,
+                    "標的名稱": underlying_name
                 })
 
     print(f"  ✅ 共 {len(warrants)} 支認售權證")
@@ -3594,12 +3692,13 @@ def get_all_put_warrants_live():
 
 
 def get_all_put_warrants():
-    cached_warrants = load_put_warrants_cache()
+    cached_warrants = load_warrants_cache_from_path(PUT_WARRANTS_CACHE_PATH)
 
     if cached_warrants:
-        print("【Step 1b】讀取認售權證清單快取...")
+        print("【Put Step 1】讀取認售權證清單快取...")
         print(f"  ✅ 已讀取認售權證清單快取：{len(cached_warrants)} 支")
 
+        # 每日執行仍要即時更新權證清單，避免新上市 / 新出現的認售權證不在快取。
         print("  🔄 即時更新今日認售權證清單，並與快取合併...")
         live_warrants = get_all_put_warrants_live()
 
@@ -3624,10 +3723,11 @@ def get_all_put_warrants():
             if code not in merged:
                 new_count += 1
 
+            # 以即時清單為準更新名稱、標的股與標的名稱，避免舊快取資訊不完整或過期。
             merged[code] = w
 
         warrants = list(merged.values())
-        save_put_warrants_cache(warrants)
+        save_warrants_cache_to_path(warrants, PUT_WARRANTS_CACHE_PATH, "認售權證清單")
 
         print(
             f"  ✅ 認售權證清單更新完成：原快取 {old_count:,} 支，"
@@ -3637,7 +3737,7 @@ def get_all_put_warrants():
         return warrants
 
     warrants = get_all_put_warrants_live()
-    save_put_warrants_cache(warrants)
+    save_warrants_cache_to_path(warrants, PUT_WARRANTS_CACHE_PATH, "認售權證清單")
     return warrants
 
 
@@ -3913,6 +4013,152 @@ def prescan_all(warrants, broker_map):
     PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
     save_candidates_cache(candidates)
     return candidates
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 認售新增：候選組合預篩與歷史資料更新
+# ══════════════════════════════════════════════════════════════════════
+
+def prescan_all_put(warrants, broker_map):
+    """
+    認售候選組合預篩。
+
+    只新增認售專用候選快取，不影響原本認購 prescan_all() 與 candidates_cache.csv。
+    回傳：
+    - merged_candidates：認售候選組合
+    - refresh_keys：本次需要用 API5 更新的認售候選 key
+    """
+    broker_map = filter_broker_map_for_active_targets(broker_map)
+    cached_candidates = filter_candidates_by_broker_map(
+        load_candidates_cache_from_path(PUT_CANDIDATES_CACHE_PATH),
+        broker_map
+    )
+
+    if cached_candidates:
+        print("【Put Step 3a】讀取認售候選組合快取...")
+        print(f"  ✅ 已讀取認售候選組合快取：{len(cached_candidates):,} 組")
+
+        scan_days = CACHE_RECENT_SCAN_DAYS
+        print(f"  🔄 補掃全市場最近 {scan_days} 天，用來發現新認售權證 / 新候選組合...")
+
+        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+        recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
+        refresh_keys = {candidate_key_from_tuple(c) for c in recent_candidates}
+
+        merged_candidates = merge_candidates(cached_candidates, recent_candidates)
+        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+        save_candidates_cache_to_path(merged_candidates, PUT_CANDIDATES_CACHE_PATH, "認售候選組合")
+
+        print(
+            f"  ✅ 認售候選組合快取合併完成：舊 {len(cached_candidates):,} 組，"
+            f"最近掃到 {len(recent_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
+        )
+        print(f"  ✅ 本次需用 API5 檢查更新的認售候選組合：{len(refresh_keys):,} 組")
+
+        return merged_candidates, refresh_keys
+
+    initial_scan_days = 40
+    print(f"【Put Step 3a】建立認售候選組合快取，預掃最近 {initial_scan_days} 天...")
+    candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
+    candidates = filter_candidates_by_broker_map(candidates, broker_map)
+    refresh_keys = {candidate_key_from_tuple(c) for c in candidates}
+    save_candidates_cache_to_path(candidates, PUT_CANDIDATES_CACHE_PATH, "認售候選組合")
+    return candidates, refresh_keys
+
+
+def build_put_items_for_consensus(broker_map):
+    """
+    建立認售 TOP15 所需 items。
+
+    規則：
+    - 僅 RUN_MODE=2 完整分點清單模式更新。
+    - 只新增認售快取，不影響原本認購 A/B/C/D 與認購快取。
+    """
+    if not PUT_WARRANT_CONSENSUS_7D_ENABLED:
+        return None
+
+    if RUN_MODE != 2:
+        print("  ✅ RUN_MODE=1 精選分點模式：略過認售近7日權證分點共識TOP15工作表，避免動到 Google Sheet 既有資料。")
+        return None
+
+    put_warrants = get_all_put_warrants()
+
+    if not put_warrants:
+        print("  ⚠️ 認售 TOP15：沒有認售權證清單")
+        return []
+
+    put_candidates, put_refresh_keys = prescan_all_put(put_warrants, broker_map)
+
+    if not put_candidates:
+        print("  ⚠️ 認售 TOP15：預篩後無候選")
+        return []
+
+    print(f"\n【Put Step 3b】處理 {len(put_candidates):,} 組認售候選...")
+
+    put_candidate_keys = {candidate_key_from_tuple(c) for c in put_candidates}
+    put_history_cache_df = load_history_cache_from_path(PUT_HISTORY_CACHE_PATH, "認售原始分點資料")
+    put_history_keys = history_cache_keys(put_history_cache_df)
+
+    put_cached_items = items_from_history_cache(put_history_cache_df, candidate_filter=put_candidate_keys)
+
+    if put_cached_items:
+        print(f"  ✅ 已從認售原始分點資料快取還原 {len(put_cached_items):,} 組資料")
+
+    put_candidates_to_fetch = []
+
+    for c in put_candidates:
+        key = candidate_key_from_tuple(c)
+
+        # 沒有歷史快取：一定要抓
+        # 最近 prescan 有看到目標分點：重新抓 API5，補進最新資料
+        if key not in put_history_keys or key in put_refresh_keys:
+            put_candidates_to_fetch.append(c)
+
+    print(f"  ✅ 認售快取已有候選：{len(put_history_keys & put_candidate_keys):,} 組")
+    print(f"  ✅ 本次需要 API5 更新認售：{len(put_candidates_to_fetch):,} 組")
+
+    put_fetched_items = []
+    done = 0
+
+    if put_candidates_to_fetch:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {
+                ex.submit(process_candidate, *c): c
+                for c in put_candidates_to_fetch
+            }
+
+            for future in as_completed(futures):
+                done += 1
+
+                try:
+                    item = future.result()
+                except:
+                    item = None
+
+                if item:
+                    put_fetched_items.append(item)
+
+                if done % 100 == 0:
+                    print(f"  [{done:,}/{len(put_candidates_to_fetch):,}] 認售已更新，成功取得 {len(put_fetched_items):,} 組資料")
+    else:
+        print("  ✅ 所有認售候選組合皆可使用快取，略過 API5 歷史資料重抓")
+
+    if put_fetched_items:
+        put_history_cache_df = merge_items_into_history_cache(put_history_cache_df, put_fetched_items)
+        save_history_cache_to_path(put_history_cache_df, PUT_HISTORY_CACHE_PATH, "認售原始分點資料")
+
+    put_items = items_from_history_cache(put_history_cache_df, candidate_filter=put_candidate_keys)
+
+    if not put_items and put_fetched_items:
+        put_items = put_fetched_items
+
+    if not put_items:
+        print("  ⚠️ 認售 TOP15：無任何候選資料")
+        return []
+
+    return put_items
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -8316,267 +8562,6 @@ def _fmt_wan_text(value):
         return "0.0萬"
 
 
-
-
-def save_put_candidates_cache(candidates):
-    if not USE_CACHE or not candidates:
-        return
-
-    rows = []
-    for c in candidates:
-        rows.append({
-            "權證代號": c[0],
-            "權證名稱": c[1],
-            "標的股": c[2],
-            "標的名稱": c[3],
-            "分點": c[4],
-            "分點名稱": c[5],
-            "券商代號": c[6],
-        })
-
-    df = pd.DataFrame(rows)
-    write_cache_csv(df, PUT_CANDIDATES_CACHE_PATH)
-    print(f"  💾 已更新認售候選組合快取：{PUT_CANDIDATES_CACHE_PATH}")
-
-
-def load_put_candidates_cache():
-    df = read_cache_csv(PUT_CANDIDATES_CACHE_PATH)
-
-    if df.empty:
-        return []
-
-    required_cols = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號"]
-    for col in required_cols:
-        if col not in df.columns:
-            return []
-
-    candidates = []
-    for row in df.itertuples(index=False):
-        row = row._asdict()
-        warrant_code = str(row["權證代號"]).strip()
-        broker_code = str(row["券商代號"]).strip()
-
-        if not warrant_code or not broker_code:
-            continue
-
-        candidates.append((
-            warrant_code,
-            str(row["權證名稱"]).strip(),
-            str(row["標的股"]).strip(),
-            str(row["標的名稱"]).strip(),
-            str(row["分點"]).strip(),
-            str(row["分點名稱"]).strip(),
-            broker_code,
-        ))
-
-    return candidates
-
-
-def load_history_cache_from_path(path):
-    df = read_cache_csv(path)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    required_cols = [
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數", "買進金額", "賣出金額",
-        "買超股數", "買超金額",
-    ]
-
-    for col in required_cols:
-        if col not in df.columns:
-            print(f"  ⚠️ 認售原始分點資料快取欄位不完整，缺少：{col}")
-            return pd.DataFrame()
-
-    return df[required_cols].copy()
-
-
-def save_history_cache_to_path(history_df, path, label="原始分點資料"):
-    if not USE_CACHE or history_df is None or history_df.empty:
-        return
-
-    write_cache_csv(history_df, path)
-    print(f"  💾 已更新{label}快取：{path}")
-
-
-def prescan_put_all_live(warrants, broker_map, scan_days=40):
-    print("【Step 4b-1】預篩：找有目標分點的認售權證...")
-
-    today = datetime.today()
-    end_s = today.strftime("%Y/%m/%d")
-    start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
-
-    broker_codes_set = {code for _, code in broker_map.values()}
-    code_to_label = {code: label for label, (_, code) in broker_map.items()}
-
-    candidates = []
-    done = 0
-
-    def prescan_one(w):
-        hits = []
-
-        for row in api4_get(w["代號"], start_s, end_s):
-            bcode = row.get("V2", "")
-
-            if bcode in broker_codes_set:
-                label = code_to_label.get(bcode, "")
-
-                if label:
-                    bname = next((n for l, (n, c) in broker_map.items() if c == bcode), bcode)
-                    hits.append((w["代號"], w["名稱"], w["標的股"], w.get("標的名稱", ""), label, bname, bcode))
-
-        return hits
-
-    with ThreadPoolExecutor(max_workers=PRESCAN_WORKERS) as ex:
-        futures = {ex.submit(prescan_one, w): w for w in warrants}
-
-        for future in as_completed(futures):
-            done += 1
-
-            try:
-                result = future.result()
-            except Exception:
-                result = []
-
-            for hit in result:
-                candidates.append(hit)
-
-            if done % 1000 == 0:
-                print(f"  [{done:,}/{len(warrants):,}] 認售預篩中，候選 {len(candidates)} 組...")
-
-    unique_candidates = []
-    seen = set()
-
-    for c in candidates:
-        key = (c[0], c[6])
-        if key not in seen:
-            seen.add(key)
-            unique_candidates.append(c)
-
-    print(f"  ✅ 認售預篩完成：{len(warrants)} 支 → {len(candidates)} 組候選，去重後 {len(unique_candidates)} 組")
-    return unique_candidates
-
-
-def prescan_put_all(warrants, broker_map):
-    global PUT_PRESCAN_REFRESH_KEYS
-
-    broker_map = filter_broker_map_for_active_targets(broker_map)
-    cached_candidates = filter_candidates_by_broker_map(load_put_candidates_cache(), broker_map)
-
-    if cached_candidates and not FORCE_FULL_CACHE_REFRESH:
-        print("【Step 4b-1】讀取認售候選組合快取，並補掃最近資料...")
-        print(f"  ✅ 已讀取認售候選組合快取：{len(cached_candidates):,} 組")
-
-        recent_candidates = prescan_put_all_live(
-            warrants,
-            broker_map,
-            scan_days=max(int(CACHE_RECENT_SCAN_DAYS), 1),
-        )
-        PUT_PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
-
-        merged = merge_candidates(cached_candidates, recent_candidates)
-        save_put_candidates_cache(merged)
-        print(f"  ✅ 認售候選組合合併完成：快取 {len(cached_candidates):,} 組，最近掃描 {len(recent_candidates):,} 組，合併後 {len(merged):,} 組")
-        return merged
-
-    scan_days = max(int(SELECTED_INITIAL_SCAN_DAYS), int(CACHE_RECENT_SCAN_DAYS), 40)
-    candidates = prescan_put_all_live(warrants, broker_map, scan_days=scan_days)
-    PUT_PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
-    save_put_candidates_cache(candidates)
-    return candidates
-
-
-def build_put_7d_warrant_consensus_top15_rows(broker_map, target_date=None):
-    """
-    建立認售權證近 7 日所有追蹤分點共識買賣超 TOP15。\n
-    只在 RUN_MODE=2 完整分點清單模式執行，避免精選五分點模式誤抓全市場資料。
-    原本認購資料完全不動；認售資料會寫入：
-    - 快取_認售權證清單
-    - 快取_認售候選組合
-    - 快取_認售分點歷史
-    - 快取_近7日認售權證分點共識TOP15
-    """
-    if not PUT_WARRANT_CONSENSUS_7D_ENABLED:
-        return None
-
-    if RUN_MODE != 2:
-        print("  ✅ RUN_MODE=1 精選分點模式：略過認售權證分點共識TOP15，避免變成抓全資料。")
-        return None
-
-    print("【Step 4b】建立近7日認售權證分點共識買賣超 TOP15（RUN_MODE=2 專用）...")
-
-    put_warrants = get_all_put_warrants()
-    if not put_warrants:
-        print("  ⚠️ 認售權證清單為空，略過認售 TOP15。")
-        return []
-
-    broker_map = filter_broker_map_for_active_targets(broker_map)
-    if not broker_map:
-        print("  ⚠️ 認售 TOP15 找不到有效分點代號，略過。")
-        return []
-
-    put_candidates = prescan_put_all(put_warrants, broker_map)
-    if not put_candidates:
-        print("  ⚠️ 認售預篩後無候選，略過認售 TOP15。")
-        return []
-
-    candidate_keys = {candidate_key_from_tuple(c) for c in put_candidates}
-    history_cache_df = load_history_cache_from_path(PUT_HISTORY_CACHE_PATH)
-    history_keys = history_cache_keys(history_cache_df)
-
-    cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
-    if cached_items:
-        print(f"  ✅ 已從認售分點資料快取還原 {len(cached_items)} 組資料")
-
-    candidates_to_fetch = []
-    for c in put_candidates:
-        key = candidate_key_from_tuple(c)
-        if key not in history_keys or key in PUT_PRESCAN_REFRESH_KEYS:
-            candidates_to_fetch.append(c)
-
-    print(f"  ✅ 認售快取已有候選：{len(history_keys & candidate_keys)} 組")
-    print(f"  ✅ 本次認售需要 API5 更新：{len(candidates_to_fetch)} 組")
-
-    fetched_items = []
-    done = 0
-
-    if candidates_to_fetch:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(process_candidate, *c): c for c in candidates_to_fetch}
-
-            for future in as_completed(futures):
-                done += 1
-
-                try:
-                    item = future.result()
-                except Exception:
-                    item = None
-
-                if item:
-                    fetched_items.append(item)
-
-                if done % 100 == 0:
-                    print(f"  [{done:,}/{len(candidates_to_fetch):,}] 認售已更新，成功取得 {len(fetched_items)} 組資料")
-    else:
-        print("  ✅ 認售所有候選組合皆可使用快取，略過 API5 歷史資料重抓")
-
-    if fetched_items:
-        history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
-        save_history_cache_to_path(history_cache_df, PUT_HISTORY_CACHE_PATH, label="認售原始分點資料")
-
-    put_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
-
-    if not put_items and fetched_items:
-        put_items = fetched_items
-
-    if not put_items:
-        print("  ⚠️ 認售無任何候選資料，略過認售 TOP15。")
-        return []
-
-    return build_7d_warrant_consensus_top15_rows(put_items, target_date=target_date)
-
 def build_7d_warrant_consensus_top15_rows(items, target_date=None):
     """
     建立「快取_近7日權證分點共識TOP15」。
@@ -8883,8 +8868,304 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
 
 
 
-def write_put_7d_warrant_consensus_top15_sheet(wb, rows):
-    """寫入認售近 7 日權證分點共識買賣超 TOP15。rows=None 代表不建立工作表。"""
+def build_7d_put_warrant_consensus_top15_rows(put_items, target_date=None):
+    """
+    建立「快取_近7日認售權證分點共識TOP15」。
+
+    認售規則：
+    1. 只在 RUN_MODE=2 完整分點清單模式執行。
+    2. 統計來源為認售專用快取「快取_認售分點歷史」。
+    3. 近 7 天以 target_date 含當日往前推 WARRANT_CONSENSUS_7D_DAYS 天計算。
+    4. 排名單位為「標的」，同一標的底下所有認售權證、所有追蹤分點的買進金額與賣出金額一起累積。
+    5. 共識買超 TOP15：買進金額 - 賣出金額 > 0，依淨買超金額排序。
+    6. 共識賣超 TOP15：賣出金額 - 買進金額 > 0，依淨賣超金額排序。
+    """
+    if not PUT_WARRANT_CONSENSUS_7D_ENABLED:
+        return None
+
+    if RUN_MODE != 2:
+        return None
+
+    print("【Put Step 4c】建立近7日認售權證分點共識買賣超 TOP15（以標的累積金額排名）...")
+
+    if put_items is None:
+        return None
+
+    if not put_items:
+        print("  ⚠️ 認售近7日權證分點共識TOP15：沒有 items 資料")
+        return []
+
+    target_date = normalize_top15_target_date(target_date)
+    target_dt = parse_date(target_date)
+
+    if not target_dt:
+        target_dt = datetime.today()
+        target_date = target_dt.strftime("%Y/%m/%d")
+
+    window_days = max(int(WARRANT_CONSENSUS_7D_DAYS), 1)
+    top_n = max(int(WARRANT_CONSENSUS_7D_TOP_N), 1)
+    start_dt = target_dt - timedelta(days=window_days - 1)
+    start_date = start_dt.strftime("%Y/%m/%d")
+    period_text = f"{start_date} ～ {target_date}"
+    update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    agg = {}
+
+    for item in put_items:
+        df = item.get("df", pd.DataFrame())
+
+        if df is None or df.empty:
+            continue
+
+        warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
+
+        if not warrant_code:
+            continue
+
+        warrant_name = str(item.get("warrant_name", "")).strip()
+        underlying_code = str(item.get("underlying_code", "")).strip()
+        underlying_name = str(item.get("underlying_name", "")).strip()
+        broker_label = str(item.get("broker_label", "")).strip()
+        broker_name = str(item.get("broker_name", "")).strip()
+        broker_code = str(item.get("broker_code", "")).strip()
+
+        # 認售排名是以標的累積金額排名；沒有標的代號就無法歸到標的，直接略過。
+        if not underlying_code:
+            continue
+
+        rec = agg.setdefault(underlying_code, {
+            "標的股": underlying_code,
+            "標的名稱": underlying_name,
+            "買進金額": 0.0,
+            "賣出金額": 0.0,
+            "買進股數": 0.0,
+            "賣出股數": 0.0,
+            "權證": {},
+            "分點": {},
+            "日期集合": set(),
+        })
+
+        if underlying_name and not rec.get("標的名稱"):
+            rec["標的名稱"] = underlying_name
+
+        warrant_rec = rec["權證"].setdefault(warrant_code, {
+            "權證代號": warrant_code,
+            "權證名稱": warrant_name,
+            "買進金額": 0.0,
+            "賣出金額": 0.0,
+            "買進股數": 0.0,
+            "賣出股數": 0.0,
+            "日期集合": set(),
+        })
+
+        if warrant_name and not warrant_rec.get("權證名稱"):
+            warrant_rec["權證名稱"] = warrant_name
+
+        broker_key = (broker_label, broker_name, broker_code)
+        broker_rec = rec["分點"].setdefault(broker_key, {
+            "分點": broker_label,
+            "分點名稱": broker_name,
+            "券商代號": broker_code,
+            "買進金額": 0.0,
+            "賣出金額": 0.0,
+            "買進股數": 0.0,
+            "賣出股數": 0.0,
+            "日期集合": set(),
+        })
+
+        for row in df.itertuples(index=False):
+            row_dict = row._asdict()
+            date_str = normalize_date_str(row_dict.get("日期", ""))
+            dt = parse_date(date_str)
+
+            if not dt or dt < start_dt or dt > target_dt:
+                continue
+
+            buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+            sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+            buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+            sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+
+            if buy_amount <= 0 and sell_amount <= 0 and buy_qty <= 0 and sell_qty <= 0:
+                continue
+
+            rec["日期集合"].add(date_str)
+            rec["買進金額"] += buy_amount
+            rec["賣出金額"] += sell_amount
+            rec["買進股數"] += buy_qty
+            rec["賣出股數"] += sell_qty
+
+            warrant_rec["日期集合"].add(date_str)
+            warrant_rec["買進金額"] += buy_amount
+            warrant_rec["賣出金額"] += sell_amount
+            warrant_rec["買進股數"] += buy_qty
+            warrant_rec["賣出股數"] += sell_qty
+
+            broker_rec["日期集合"].add(date_str)
+            broker_rec["買進金額"] += buy_amount
+            broker_rec["賣出金額"] += sell_amount
+            broker_rec["買進股數"] += buy_qty
+            broker_rec["賣出股數"] += sell_qty
+
+    records = []
+
+    for rec in agg.values():
+        buy_amount = float(rec.get("買進金額", 0) or 0)
+        sell_amount = float(rec.get("賣出金額", 0) or 0)
+        buy_qty = float(rec.get("買進股數", 0) or 0)
+        sell_qty = float(rec.get("賣出股數", 0) or 0)
+        net_buy = buy_amount - sell_amount
+        net_sell = sell_amount - buy_amount
+
+        if buy_amount <= 0 and sell_amount <= 0:
+            continue
+
+        records.append({
+            **rec,
+            "買進金額": buy_amount,
+            "賣出金額": sell_amount,
+            "買進股數": buy_qty,
+            "賣出股數": sell_qty,
+            "淨買超金額": net_buy,
+            "淨賣超金額": net_sell,
+        })
+
+    buy_top = [r for r in records if float(r.get("淨買超金額", 0) or 0) > 0]
+    sell_top = [r for r in records if float(r.get("淨賣超金額", 0) or 0) > 0]
+
+    buy_top = sorted(
+        buy_top,
+        key=lambda r: (float(r.get("淨買超金額", 0) or 0), float(r.get("買進金額", 0) or 0)),
+        reverse=True,
+    )[:top_n]
+    sell_top = sorted(
+        sell_top,
+        key=lambda r: (float(r.get("淨賣超金額", 0) or 0), float(r.get("賣出金額", 0) or 0)),
+        reverse=True,
+    )[:top_n]
+
+    def make_rank_rows(rank_type, records_for_rank):
+        rows = []
+        is_buy = rank_type == "共識買超"
+
+        for rank, rec in enumerate(records_for_rank, 1):
+            broker_rows = []
+            broker_json = []
+            same_direction_count = 0
+            opposite_direction_count = 0
+
+            for broker_rec in sorted(
+                rec["分點"].values(),
+                key=lambda x: (
+                    (float(x.get("買進金額", 0) or 0) - float(x.get("賣出金額", 0) or 0))
+                    if is_buy else
+                    (float(x.get("賣出金額", 0) or 0) - float(x.get("買進金額", 0) or 0))
+                ),
+                reverse=True,
+            ):
+                b_buy = float(broker_rec.get("買進金額", 0) or 0)
+                b_sell = float(broker_rec.get("賣出金額", 0) or 0)
+                b_net_buy = b_buy - b_sell
+                b_net_sell = b_sell - b_buy
+                direction_amount = b_net_buy if is_buy else b_net_sell
+
+                if direction_amount > 0:
+                    same_direction_count += 1
+                    broker_rows.append(f"{broker_rec['分點']} {_fmt_wan_text(direction_amount)}")
+                elif direction_amount < 0:
+                    opposite_direction_count += 1
+
+                broker_json.append({
+                    "分點": broker_rec["分點"],
+                    "分點名稱": broker_rec["分點名稱"],
+                    "券商代號": broker_rec["券商代號"],
+                    "買進金額": round(b_buy, 0),
+                    "賣出金額": round(b_sell, 0),
+                    "淨買超金額": round(b_net_buy, 0),
+                    "淨賣超金額": round(b_net_sell, 0),
+                    "日期數": len(broker_rec.get("日期集合", set())),
+                })
+
+            rank_amount = float(rec.get("淨買超金額", 0) or 0) if is_buy else float(rec.get("淨賣超金額", 0) or 0)
+            dates = sorted(rec.get("日期集合", set()))
+            warrant_values = list(rec.get("權證", {}).values())
+            warrant_count = len(warrant_values)
+            warrant_json = []
+
+            for warrant_rec in sorted(
+                warrant_values,
+                key=lambda x: (
+                    (float(x.get("買進金額", 0) or 0) - float(x.get("賣出金額", 0) or 0))
+                    if is_buy else
+                    (float(x.get("賣出金額", 0) or 0) - float(x.get("買進金額", 0) or 0))
+                ),
+                reverse=True,
+            ):
+                w_buy = float(warrant_rec.get("買進金額", 0) or 0)
+                w_sell = float(warrant_rec.get("賣出金額", 0) or 0)
+                warrant_json.append({
+                    "權證代號": warrant_rec.get("權證代號", ""),
+                    "權證名稱": warrant_rec.get("權證名稱", ""),
+                    "買進金額": round(w_buy, 0),
+                    "賣出金額": round(w_sell, 0),
+                    "淨買超金額": round(w_buy - w_sell, 0),
+                    "淨賣超金額": round(w_sell - w_buy, 0),
+                    "日期數": len(warrant_rec.get("日期集合", set())),
+                })
+
+            rows.append({
+                "統計日期": target_date,
+                "統計期間": period_text,
+                "統計天數": window_days,
+                "有效日期數": len(dates),
+                "第一筆日期": dates[0] if dates else "",
+                "最後筆日期": dates[-1] if dates else "",
+                "排名類型": rank_type,
+                "排名": rank,
+                "權證代號": "",
+                "權證名稱": f"{warrant_count}檔認售權證",
+                "標的股": rec.get("標的股", ""),
+                "標的名稱": rec.get("標的名稱", ""),
+                "排名金額": round(rank_amount, 0),
+                "買進金額": round(float(rec.get("買進金額", 0) or 0), 0),
+                "賣出金額": round(float(rec.get("賣出金額", 0) or 0), 0),
+                "淨買超金額": round(float(rec.get("淨買超金額", 0) or 0), 0),
+                "淨賣超金額": round(float(rec.get("淨賣超金額", 0) or 0), 0),
+                "買進股數": round(float(rec.get("買進股數", 0) or 0), 0),
+                "賣出股數": round(float(rec.get("賣出股數", 0) or 0), 0),
+                "參與分點數": len(rec.get("分點", {})),
+                "同向分點數": same_direction_count,
+                "反向分點數": opposite_direction_count,
+                "主要同向分點": "；".join(broker_rows[:8]),
+                "完成狀態": "DONE",
+                "更新時間": update_time,
+                "run_id": run_id,
+                "分點明細_JSON": json.dumps({
+                    "分點": broker_json,
+                    "權證": warrant_json,
+                    "權證數": warrant_count,
+                    "排名單位": "標的",
+                    "權證類型": "認售",
+                }, ensure_ascii=False),
+            })
+
+        return rows
+
+    rows = []
+    rows.extend(make_rank_rows("共識買超", buy_top))
+    rows.extend(make_rank_rows("共識賣超", sell_top))
+
+    print(
+        f"  ✅ 認售近7日標的分點共識TOP15完成："
+        f"共識買超 {len(buy_top):,} 筆，共識賣超 {len(sell_top):,} 筆，"
+        f"統計期間 {period_text}"
+    )
+    return rows
+
+
+def write_7d_put_warrant_consensus_top15_sheet(wb, rows):
+    """寫入近 7 日認售權證分點共識買賣超 TOP15。rows=None 代表不建立工作表。"""
     if rows is None:
         return
 
@@ -8952,7 +9233,7 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_top15_consensus_cache_sheet(wb, top15_consensus_rows or [])
     write_top15_position_detail_sheet(wb, top15_detail_rows or [])
     write_7d_warrant_consensus_top15_sheet(wb, warrant_consensus_7d_rows)
-    write_put_7d_warrant_consensus_top15_sheet(wb, put_warrant_consensus_7d_rows)
+    write_7d_put_warrant_consensus_top15_sheet(wb, put_warrant_consensus_7d_rows)
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
@@ -9143,13 +9424,14 @@ def main():
         a_events, b_events, c_events, d_events, item_map, price_cache
     )
     warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
-    put_warrant_consensus_7d_rows = build_put_7d_warrant_consensus_top15_rows(broker_map)
+
+    put_items = build_put_items_for_consensus(broker_map)
+    put_warrant_consensus_7d_rows = build_7d_put_warrant_consensus_top15_rows(put_items)
 
     build_excel(
         a_events, b_events, c_events, d_events,
         item_map, price_cache, items, output_path,
-        top15_detail_rows, top15_consensus_rows, warrant_consensus_7d_rows,
-        put_warrant_consensus_7d_rows
+        top15_detail_rows, top15_consensus_rows, warrant_consensus_7d_rows, put_warrant_consensus_7d_rows
     )
     upload_excel_to_google_sheet(output_path)
 
