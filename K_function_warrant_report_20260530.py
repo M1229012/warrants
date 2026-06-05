@@ -2928,6 +2928,18 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
 
 def daily_warrant_net(plot_df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     dates = pd.to_datetime(plot_df.index).normalize()
+    return daily_warrant_net_from_dates(dates, events)
+
+
+def daily_warrant_net_from_dates(dates, events: pd.DataFrame) -> pd.DataFrame:
+    """依指定日期軸彙總每日權證淨額。
+
+    原本 daily_warrant_net() 只會使用股價 K 線日期作為日期軸，因此若權證分點資料已經更新到
+    最新交易日，但 yfinance 股價還停在前一個交易日，最新一日的權證資金流就會被圖表日期軸排除。
+    這個函式保留原本欄位格式，但允許呼叫端傳入「股價日期 + 權證事件日期」合併後的日期軸。
+    """
+    dates = pd.to_datetime(pd.Index(list(dates)), errors="coerce").dropna().normalize()
+    dates = pd.Index(sorted(pd.unique(dates)))
     out = pd.DataFrame({"Date": dates})
     if events is None or events.empty:
         out["net_amount"] = 0.0
@@ -2935,10 +2947,55 @@ def daily_warrant_net(plot_df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFra
         out["sell_amount"] = 0.0
         return out
     e = events.copy()
-    e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    if e.empty:
+        out["net_amount"] = 0.0
+        out["buy_amount"] = 0.0
+        out["sell_amount"] = 0.0
+        return out
     g = e.groupby("Date", as_index=False).agg({"net_amount": "sum", "buy_amount": "sum", "sell_amount": "sum"})
     out = out.merge(g, on="Date", how="left").fillna(0.0)
     return out
+
+
+def build_flow_axis_dates(plot_df: pd.DataFrame, events: pd.DataFrame) -> List[pd.Timestamp]:
+    """建立資金流專用日期軸。
+
+    會以股價 K 線日期為基礎，再補上同區間後方已出現的權證事件日期。
+    這樣可避免股價來源晚一天更新時，精選分點當日買賣超被排除在圖外。
+    """
+    stock_dates = pd.to_datetime(plot_df.index, errors="coerce").dropna().normalize()
+    if len(stock_dates) == 0:
+        return []
+
+    min_date = pd.Timestamp(stock_dates.min()).normalize()
+    dates = set(pd.Timestamp(d).normalize() for d in stock_dates)
+
+    if events is not None and not events.empty and "Date" in events.columns:
+        event_dates = pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
+        for d in event_dates:
+            d = pd.Timestamp(d).normalize()
+            if d >= min_date:
+                dates.add(d)
+
+    return sorted(dates)
+
+
+def filter_events_by_date_range(events_df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    """依日期區間篩選事件，保留原本欄位。"""
+    if events_df is None or events_df.empty:
+        return pd.DataFrame()
+    if pd.isna(start_date) or pd.isna(end_date):
+        return events_df.copy()
+    e = events_df.copy()
+    if "Date" not in e.columns:
+        return pd.DataFrame()
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    return e[(e["Date"] >= start_ts) & (e["Date"] <= end_ts)].copy().reset_index(drop=True)
 
 
 def _get_selected_branch_flow_list() -> List[str]:
@@ -5697,9 +5754,32 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     x = list(range(len(plot_df)))
     date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in plot_df.index]
     daily_net = daily_warrant_net(plot_df, plot_events)
-    selected_branch_events = filter_selected_branch_flow_events(plot_events)
-    selected_branch_week_events = filter_selected_branch_flow_events(week_events)
-    selected_branch_daily_net = daily_warrant_net(plot_df, selected_branch_events)
+
+    # 精選五分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
+    # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
+    # 今日精選分點大買 / 大賣被 plot_df.index.max() 擋掉。
+    selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
+    selected_flow_dates = build_flow_axis_dates(plot_df, selected_branch_events_all)
+    selected_x = list(range(len(selected_flow_dates)))
+    selected_date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in selected_flow_dates]
+    if selected_flow_dates:
+        selected_branch_events = filter_events_by_date_range(
+            selected_branch_events_all,
+            selected_flow_dates[0],
+            selected_flow_dates[-1],
+        )
+        selected_week_dates = selected_flow_dates[-WEEK_TRADING_DAYS:]
+        selected_week_start = selected_week_dates[0]
+        selected_week_end = selected_week_dates[-1]
+        selected_branch_week_events = filter_events_by_date_range(
+            selected_branch_events,
+            selected_week_start,
+            selected_week_end,
+        )
+    else:
+        selected_branch_events = pd.DataFrame()
+        selected_branch_week_events = pd.DataFrame()
+    selected_branch_daily_net = daily_warrant_net_from_dates(selected_flow_dates, selected_branch_events)
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
     key_points = build_key_points(ctx, stock_name)
     news_points = build_news_points(stock_code, stock_name, news_items, ctx)
@@ -5909,7 +5989,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax2.grid(False)
 
     # 精選五分點資金流：只統計指定分點的權證買賣金額。
-    selected_wnet_ax = fig.add_subplot(gs[6, :], sharex=candle_ax)
+    selected_wnet_ax = fig.add_subplot(gs[6, :])
     style_ax(selected_wnet_ax)
     selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
     selected_cum_vals = np.cumsum(selected_vals)
@@ -5954,7 +6034,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             bbox=dict(facecolor=PANEL, edgecolor="none", boxstyle="round,pad=0.12", alpha=0.82),
         )
 
-    selected_wnet_ax.bar(x, selected_vals, color=[RED if v >= 0 else GREEN for v in selected_vals], width=0.75, alpha=0.85)
+    selected_wnet_ax.bar(selected_x, selected_vals, color=[RED if v >= 0 else GREEN for v in selected_vals], width=0.75, alpha=0.85)
     selected_wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
 
     if len(selected_vals):
@@ -5968,7 +6048,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_wnet_ax.yaxis.tick_right()
     selected_wnet_ax.tick_params(axis="y", labelsize=22)
     selected_wnet_ax2 = selected_wnet_ax.twinx()
-    selected_wnet_ax2.plot(x, selected_cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
+    selected_wnet_ax2.plot(selected_x, selected_cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
 
     if len(selected_cum_vals):
         scmax = max(float(np.nanmax(selected_cum_vals)), 0.0)
@@ -6163,10 +6243,19 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # x ticks
     interval = max(1, len(x) // 12)
-    for ax in [candle_ax, vol_ax, inst_ax, wnet_ax, selected_wnet_ax]:
+    for ax in [candle_ax, vol_ax, inst_ax, wnet_ax]:
         ax.set_xlim(-1, len(x))
-    selected_wnet_ax.set_xticks(x[::interval])
-    selected_wnet_ax.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), interval)], rotation=30, ha="right", color=MUTED, fontsize=26)
+
+    selected_interval = max(1, len(selected_x) // 12)
+    selected_wnet_ax.set_xlim(-1, len(selected_x))
+    selected_wnet_ax.set_xticks(selected_x[::selected_interval])
+    selected_wnet_ax.set_xticklabels(
+        [selected_date_labels[i] for i in range(0, len(selected_date_labels), selected_interval)],
+        rotation=30,
+        ha="right",
+        color=MUTED,
+        fontsize=26,
+    )
     for ax in [candle_ax, vol_ax, inst_ax, wnet_ax]:
         plt.setp(ax.get_xticklabels(), visible=False)
 
