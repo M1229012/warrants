@@ -3586,9 +3586,14 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     y = fig_h - 0.45
     text(margin_x + 0.15, y, "本週標的分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
     y -= 0.45
-    text(margin_x + 0.18, y, f"資料來源：{SHEET_HISTORY}（全分點）｜統計日期：{cache_date_text}", 14, NAVY2, BOLD)
-    y -= 0.30
-    text(margin_x + 0.18, y, f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元", 13, TEXT, BOLD)
+    text(
+        margin_x + 0.18,
+        y,
+        f"統計期間：{period_text}｜上半部買超、下半部賣超｜單位：萬元｜統計日期：{cache_date_text}",
+        13,
+        TEXT,
+        BOLD
+    )
 
     # Summary row
     y -= 0.28
