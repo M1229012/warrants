@@ -2860,13 +2860,40 @@ def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
 
 def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, week_days: int = WEEK_TRADING_DAYS):
     plot_df = stock_df.tail(CHART_LOOKBACK).copy()
-    trading_dates = list(plot_df.index)
-    week_dates = trading_dates[-week_days:] if len(trading_dates) >= week_days else trading_dates
+    trading_dates = [pd.Timestamp(d).normalize() for d in list(plot_df.index)]
+
+    # 週報的權證統計區間改用「股價日期 + 權證事件日期」合併日期軸。
+    # 原本只用股價 K 線最新日當週報結束日，若 yfinance 晚一天更新，
+    # TOP5 買賣超與本週權證淨流向就會漏掉 MoneyDJ / Google Sheet 已經更新的今日分點資料。
+    if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns and trading_dates:
+        report_dates = build_flow_axis_dates(plot_df, warrant_events)
+    else:
+        report_dates = trading_dates
+
+    report_dates = [pd.Timestamp(d).normalize() for d in report_dates]
+    week_dates = report_dates[-week_days:] if len(report_dates) >= week_days else report_dates
     week_start = pd.Timestamp(week_dates[0]).normalize() if week_dates else pd.NaT
     week_end = pd.Timestamp(week_dates[-1]).normalize() if week_dates else pd.NaT
 
-    week_stock = plot_df.loc[week_dates].copy() if week_dates else plot_df.tail(0)
-    prev_stock = plot_df.iloc[max(0, len(plot_df) - week_days * 2): max(0, len(plot_df) - week_days)].copy()
+    if pd.notna(week_start) and pd.notna(week_end):
+        stock_week_dates = [d for d in trading_dates if pd.Timestamp(d).normalize() >= week_start and pd.Timestamp(d).normalize() <= week_end]
+    else:
+        stock_week_dates = []
+    if not stock_week_dates:
+        stock_week_dates = trading_dates[-week_days:] if len(trading_dates) >= week_days else trading_dates
+
+    week_stock = plot_df.loc[stock_week_dates].copy() if stock_week_dates else plot_df.tail(0)
+
+    if stock_week_dates:
+        prev_end_pos = plot_df.index.get_loc(stock_week_dates[0])
+        if isinstance(prev_end_pos, slice):
+            prev_end_pos = prev_end_pos.start or 0
+        elif isinstance(prev_end_pos, np.ndarray):
+            prev_end_pos = int(np.where(prev_end_pos)[0][0]) if prev_end_pos.any() else 0
+        prev_start_pos = max(0, int(prev_end_pos) - week_days)
+        prev_stock = plot_df.iloc[prev_start_pos:int(prev_end_pos)].copy()
+    else:
+        prev_stock = plot_df.iloc[max(0, len(plot_df) - week_days * 2): max(0, len(plot_df) - week_days)].copy()
 
     start_close = float(week_stock["Close"].iloc[0]) if not week_stock.empty else np.nan
     end_close = float(week_stock["Close"].iloc[-1]) if not week_stock.empty else np.nan
@@ -2883,7 +2910,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         e = warrant_events.copy()
         if "branch" in e.columns:
             e["branch"] = e["branch"].map(normalize_branch_name)
-        e["Date"] = pd.to_datetime(e["Date"]).dt.normalize()
+        e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+        e = e.dropna(subset=["Date"])
         # 預設只偵測疑似造市 / 避險對沖，不直接刪除，避免把大額主力單誤刪。
         # 標記門檻：8%；若主動啟用刪除，才用更嚴格的 3%。
         hedge_candidates = 0
@@ -2900,8 +2928,18 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
                 do_filter=False,
             )
             hedge_removed = 0
-        week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
-        plot_events = e[(e["Date"] >= pd.Timestamp(plot_df.index.min()).normalize()) & (e["Date"] <= pd.Timestamp(plot_df.index.max()).normalize())].copy()
+
+        if pd.notna(week_start) and pd.notna(week_end):
+            week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
+        else:
+            week_events = e.iloc[0:0].copy()
+
+        if trading_dates:
+            plot_start = pd.Timestamp(plot_df.index.min()).normalize()
+            plot_end = pd.Timestamp(report_dates[-1]).normalize() if report_dates else pd.Timestamp(plot_df.index.max()).normalize()
+            plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
+        else:
+            plot_events = e.copy()
 
     total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
     total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
@@ -2914,6 +2952,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         "week_events": week_events,
         "week_start": week_start,
         "week_end": week_end,
+        "report_dates": report_dates,
+        "stock_week_dates": stock_week_dates,
         "stock_ret": stock_ret,
         "week_vol": week_vol,
         "vol_change": vol_change,
@@ -2960,7 +3000,7 @@ def daily_warrant_net_from_dates(dates, events: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_flow_axis_dates(plot_df: pd.DataFrame, events: pd.DataFrame) -> List[pd.Timestamp]:
-    """建立資金流專用日期軸。
+    """建立精選分點資金流專用日期軸。
 
     會以股價 K 線日期為基礎，再補上同區間後方已出現的權證事件日期。
     這樣可避免股價來源晚一天更新時，精選分點當日買賣超被排除在圖外。
@@ -2996,6 +3036,15 @@ def filter_events_by_date_range(events_df: pd.DataFrame, start_date, end_date) -
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
     return e[(e["Date"] >= start_ts) & (e["Date"] <= end_ts)].copy().reset_index(drop=True)
+
+
+def get_taipei_today_ts() -> pd.Timestamp:
+    """取得台北日期的今日 00:00。
+
+    GitHub Actions runner 常用 UTC，若直接 datetime.today() 可能在台灣盤後仍停在前一天；
+    權證分點資料抓取區間應以台北日期為準。
+    """
+    return pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
 
 
 def _get_selected_branch_flow_list() -> List[str]:
@@ -5721,6 +5770,81 @@ def adjust_institutional_ylim(ax, plot_df: pd.DataFrame):
 
 
 
+
+def build_institutional_axis_df(plot_df: pd.DataFrame, stock_df: pd.DataFrame) -> pd.DataFrame:
+    """建立三大法人圖專用日期軸。
+
+    股價資料來源（yfinance）有時會比 FinMind 三大法人晚一天，原本三大法人圖完全綁定
+    plot_df.index，因此即使 FinMind 已經更新最新一日，也會被股價日期軸排除。
+    這裡會保留原本股價日期，再補上 stock_df.attrs["institutional_df"] 中較新的法人日期，
+    讓三大法人資料能更新就先顯示。
+    """
+    if plot_df is None or plot_df.empty:
+        return pd.DataFrame(columns=["foreign", "invest", "dealer", "total"])
+
+    stock_dates = pd.to_datetime(plot_df.index, errors="coerce").dropna().normalize()
+    if len(stock_dates) == 0:
+        return pd.DataFrame(columns=["foreign", "invest", "dealer", "total"])
+
+    min_date = pd.Timestamp(stock_dates.min()).normalize()
+    dates = set(pd.Timestamp(d).normalize() for d in stock_dates)
+
+    inst_raw = None
+    try:
+        inst_raw = stock_df.attrs.get("institutional_df")
+    except Exception:
+        inst_raw = None
+
+    if inst_raw is not None and not inst_raw.empty:
+        inst_tmp = inst_raw.copy()
+        if "Date" in inst_tmp.columns:
+            inst_tmp["Date"] = pd.to_datetime(inst_tmp["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+            inst_tmp = inst_tmp.dropna(subset=["Date"])
+            for d in inst_tmp["Date"]:
+                d = pd.Timestamp(d).normalize()
+                if d >= min_date:
+                    dates.add(d)
+
+    axis_dates = sorted(dates)
+    out = pd.DataFrame(index=pd.DatetimeIndex(axis_dates))
+
+    base_cols = [c for c in ["foreign", "invest", "dealer", "total"] if c in plot_df.columns]
+    if base_cols:
+        base = plot_df[base_cols].copy()
+        base.index = pd.to_datetime(base.index, errors="coerce").normalize()
+        out = out.join(base, how="left")
+
+    if inst_raw is not None and not inst_raw.empty:
+        inst_tmp = inst_raw.copy()
+        if "Date" in inst_tmp.columns:
+            inst_tmp["Date"] = pd.to_datetime(inst_tmp["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+            inst_tmp = inst_tmp.dropna(subset=["Date"])
+            inst_tmp = inst_tmp.set_index("Date").sort_index()
+        else:
+            inst_tmp.index = pd.to_datetime(inst_tmp.index, errors="coerce").normalize()
+            inst_tmp = inst_tmp[~inst_tmp.index.isna()].sort_index()
+        for c in ["foreign", "invest", "dealer", "total"]:
+            if c in inst_tmp.columns:
+                inst_tmp[c] = pd.to_numeric(inst_tmp[c], errors="coerce").fillna(0.0).astype(float)
+        inst_cols = [c for c in ["foreign", "invest", "dealer", "total"] if c in inst_tmp.columns]
+        if inst_cols:
+            inst_tmp = inst_tmp[inst_cols]
+            inst_tmp = inst_tmp[inst_tmp.index >= min_date]
+            # 法人資料以 FinMind 原始日期為準覆蓋同日資料，並補上股價尚未更新但法人已更新的新日期。
+            out.update(inst_tmp)
+            missing_dates = [d for d in inst_tmp.index if d not in out.index]
+            if missing_dates:
+                out = pd.concat([out, inst_tmp.loc[missing_dates]], axis=0, sort=False)
+                out = out[~out.index.duplicated(keep="last")].sort_index()
+
+    for c in ["foreign", "invest", "dealer", "total"]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
+
+    return out[["foreign", "invest", "dealer", "total"]]
+
+
 def add_center_watermarks(fig):
     """在長圖中央區域加入上下兩個淡浮水印。"""
     try:
@@ -5753,7 +5877,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     week_events = ctx["week_events"]
     x = list(range(len(plot_df)))
     date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in plot_df.index]
-    daily_net = daily_warrant_net(plot_df, plot_events)
+
+    # 權證資金流改用「股價日期 + 權證事件日期」合併日期軸。
+    # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
+    # 今日權證資金流被 plot_df.index.max() 擋掉。
+    warrant_flow_dates = build_flow_axis_dates(plot_df, plot_events)
+    warrant_x = list(range(len(warrant_flow_dates)))
+    warrant_date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in warrant_flow_dates]
+    daily_net = daily_warrant_net_from_dates(warrant_flow_dates, plot_events)
+
+    # 三大法人圖允許使用 FinMind 已更新、但 yfinance 股價尚未更新的最新法人日期。
+    inst_plot_df = build_institutional_axis_df(plot_df, stock_df)
+    x_inst = list(range(len(inst_plot_df)))
 
     # 精選五分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
     # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
@@ -5780,6 +5915,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         selected_branch_events = pd.DataFrame()
         selected_branch_week_events = pd.DataFrame()
     selected_branch_daily_net = daily_warrant_net_from_dates(selected_flow_dates, selected_branch_events)
+
+    # TOP5 買賣超使用 build_weekly_context 產生的 week_events；
+    # week_events 已改用「股價日期 + 權證事件日期」的最新週區間，因此會納入今日已更新的權證分點資料。
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
     key_points = build_key_points(ctx, stock_name)
     news_points = build_news_points(stock_code, stock_name, news_items, ctx)
@@ -5856,15 +5994,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_ax.yaxis.tick_right()
 
     # 三大法人買賣超（取代 KD）
-    inst_ax = fig.add_subplot(gs[4, :], sharex=candle_ax)
+    # 不再與 K 線共用 x 軸，避免法人資料已更新但股價資料尚未更新時被股價日期排除。
+    inst_ax = fig.add_subplot(gs[4, :])
     style_ax(inst_ax, "三大法人買賣超")
-    plot_institutional_stacked_bars(inst_ax, plot_df, x)
-    adjust_institutional_ylim(inst_ax, plot_df)
-    draw_inst_header_like_legend(inst_ax, plot_df)
+    plot_institutional_stacked_bars(inst_ax, inst_plot_df, x_inst)
+    adjust_institutional_ylim(inst_ax, inst_plot_df)
+    draw_inst_header_like_legend(inst_ax, inst_plot_df)
     inst_ax.yaxis.tick_right()
 
     # Warrant daily net bars + cumulative line
-    wnet_ax = fig.add_subplot(gs[5, :], sharex=candle_ax)
+    # 不再與 K 線共用 x 軸，讓今日已更新的權證事件可以先出現在資金流圖。
+    wnet_ax = fig.add_subplot(gs[5, :])
     style_ax(wnet_ax)
     vals = daily_net["net_amount"].astype(float).values
     cum_vals = np.cumsum(vals)
@@ -5947,7 +6087,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     xpos = draw_header_line_and_advance(wnet_ax, xpos, BLUE, gap_px=10)
     draw_header_text_and_advance(wnet_ax, xpos, f"累計 {fmt_money(latest_cum)}", BLUE, gap_px=0)
 
-    wnet_ax.bar(x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
+    wnet_ax.bar(warrant_x, vals, color=[RED if v >= 0 else GREEN for v in vals], width=0.75, alpha=0.85)
     wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
 
     # 柱狀圖 Y 軸自動貼合資料，但一定包含 0
@@ -5961,7 +6101,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax.yaxis.set_major_formatter(FuncFormatter(money_tick))
     wnet_ax.yaxis.tick_right()
     wnet_ax2 = wnet_ax.twinx()
-    wnet_ax2.plot(x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
+    wnet_ax2.plot(warrant_x, cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
     wnet_ax.tick_params(axis="y", labelsize=22)
 
     if len(cum_vals):
@@ -5989,6 +6129,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     wnet_ax2.grid(False)
 
     # 精選五分點資金流：只統計指定分點的權證買賣金額。
+    # 不再與 K 線共用 x 軸，讓今日已更新的精選分點事件可以先出現在資金流圖。
     selected_wnet_ax = fig.add_subplot(gs[6, :])
     style_ax(selected_wnet_ax)
     selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
@@ -6243,8 +6384,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # x ticks
     interval = max(1, len(x) // 12)
-    for ax in [candle_ax, vol_ax, inst_ax, wnet_ax]:
+    for ax in [candle_ax, vol_ax]:
         ax.set_xlim(-1, len(x))
+    inst_ax.set_xlim(-1, len(x_inst))
+    wnet_ax.set_xlim(-1, len(warrant_x))
+
+    warrant_interval = max(1, len(warrant_x) // 12)
+    wnet_ax.set_xticks(warrant_x[::warrant_interval])
+    wnet_ax.set_xticklabels(
+        [warrant_date_labels[i] for i in range(0, len(warrant_date_labels), warrant_interval)],
+        rotation=30,
+        ha="right",
+        color=MUTED,
+        fontsize=26,
+    )
 
     selected_interval = max(1, len(selected_x) // 12)
     selected_wnet_ax.set_xlim(-1, len(selected_x))
@@ -6281,12 +6434,20 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         stock_df["Close_prev"] = stock_df["Close"].shift(1)
 
         # 三大法人資料：對齊股價日期，讓週報可顯示三大法人買賣超。
+        # 另外保留原始 FinMind 日期到 stock_df.attrs["institutional_df"]，讓三大法人圖可先顯示
+        # 股價尚未更新、但 FinMind 已更新的最新法人買賣超。
         inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
         if inst_df is not None and not inst_df.empty:
             inst_df = inst_df.copy()
-            inst_df["Date"] = pd.to_datetime(inst_df["Date"]).dt.tz_localize(None)
-            inst_df = inst_df.set_index("Date").sort_index()
-            stock_df = stock_df.join(inst_df[["foreign", "invest", "dealer", "total"]], how="left")
+            inst_df["Date"] = pd.to_datetime(inst_df["Date"], errors="coerce").dt.tz_localize(None)
+            inst_df = inst_df.dropna(subset=["Date"]).sort_values("Date")
+            stock_df.attrs["institutional_df"] = inst_df.copy()
+            latest_inst_date = inst_df["Date"].max()
+            if pd.notna(latest_inst_date):
+                print(f"🔎 三大法人資料最新日期：{pd.Timestamp(latest_inst_date).date()}")
+            inst_join = inst_df.set_index("Date").sort_index()
+            stock_df = stock_df.join(inst_join[["foreign", "invest", "dealer", "total"]], how="left")
+            stock_df.attrs["institutional_df"] = inst_df.copy()
         for c in ["foreign", "invest", "dealer", "total"]:
             if c not in stock_df.columns:
                 stock_df[c] = 0.0
@@ -6294,11 +6455,44 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
 
         plot_df = stock_df.tail(CHART_LOOKBACK)
         start_date = pd.Timestamp(plot_df.index.min()).normalize()
-        end_date = pd.Timestamp(plot_df.index.max()).normalize()
+        stock_end_date = pd.Timestamp(plot_df.index.max()).normalize()
+        taipei_today = get_taipei_today_ts()
+        # 權證分點資料的更新時間可能比 yfinance 股價更快。
+        # 因此抓權證資料時，結束日不能只用股價最新日，否則盤後會漏掉今日分點買賣超。
+        end_date = max(stock_end_date, taipei_today)
 
-        print(f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，資料區間 {start_date.date()} ~ {end_date.date()}")
+        print(
+            f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，"
+            f"股價最新日 {stock_end_date.date()}｜權證資料區間 {start_date.date()} ~ {end_date.date()}"
+        )
         warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
+        if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
+            latest_event_date = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna().max()
+            if pd.notna(latest_event_date):
+                print(f"🔎 權證分點事件最新日期：{pd.Timestamp(latest_event_date).date()}")
+            selected_debug = filter_selected_branch_flow_events(warrant_events)
+            if selected_debug is not None and not selected_debug.empty:
+                selected_debug = selected_debug.copy()
+                selected_debug["Date"] = pd.to_datetime(selected_debug["Date"], errors="coerce").dt.normalize()
+                selected_debug = selected_debug.dropna(subset=["Date"])
+                if not selected_debug.empty:
+                    latest_selected_date = selected_debug["Date"].max()
+                    latest_selected = selected_debug[selected_debug["Date"] == latest_selected_date]
+                    latest_selected_sum = float(pd.to_numeric(latest_selected["net_amount"], errors="coerce").fillna(0.0).sum())
+                    print(f"🔎 精選五分點最新日期：{pd.Timestamp(latest_selected_date).date()}｜合計 {fmt_money(latest_selected_sum)}")
+        if warrant_events is not None and not warrant_events.empty:
+            try:
+                debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+                debug_week_events = debug_ctx.get("week_events", pd.DataFrame())
+                if debug_week_events is not None and not debug_week_events.empty:
+                    debug_buy_top, debug_sell_top = top_branch_tables(debug_week_events, topn=5)
+                    print(
+                        f"🔎 TOP5統計區間：{pd.Timestamp(debug_ctx['week_start']).date()} ~ {pd.Timestamp(debug_ctx['week_end']).date()}｜"
+                        f"週事件 {len(debug_week_events):,} 筆｜買超TOP5 {len(debug_buy_top):,} 筆｜賣超TOP5 {len(debug_sell_top):,} 筆"
+                    )
+            except Exception as e:
+                print(f"⚠️ TOP5統計區間檢查失敗：{e}")
         cached_news_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
         if cached_news_points:
             print(f"📦 今日新聞快取已存在，略過 Google News 抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
