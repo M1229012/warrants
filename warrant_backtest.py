@@ -112,9 +112,10 @@ WARRANT_CONSENSUS_7D_DAYS = int(os.getenv("WARRANT_CONSENSUS_7D_DAYS", "7"))
 WARRANT_CONSENSUS_7D_TOP_N = int(os.getenv("WARRANT_CONSENSUS_7D_TOP_N", "15"))
 
 # 執行模式：
-# RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
-#             讓今日買賣超明細盡量完整，例如元大南屯今日賣南亞科所有相關認購權證。
-# RUN_MODE=2：完整清單模式。使用目前 TARGET_PATTERNS 內所有分點，維持原本完整分點清單邏輯。
+# RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS 內的 5 間分點，
+#             並且只用 API4 最近資料預篩候選，再針對候選組合用 API5 更新。
+#             不會建立「所有認購權證 × 精選分點」完整候選池，避免精選五分點模式變成抓全資料。
+# RUN_MODE=2：完整清單模式。使用目前 TARGET_PATTERNS 內所有分點，維持完整分點清單邏輯。
 RUN_MODE = int(os.getenv("RUN_MODE", os.getenv("BROKER_RUN_MODE", "1")) or "1")
 SELECTED_TARGET_LABELS_DEFAULT = [
     "華南永昌台中",
@@ -122,18 +123,16 @@ SELECTED_TARGET_LABELS_DEFAULT = [
     "富邦敦南",
     "永豐金內湖",
     "永豐金竹北",
-    "第一金中壢",
-    "第一金",
-    "群益東大",
 ]
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
-# RUN_MODE=1 精選 5 分點完整追蹤設定：
-# SELECTED_FORCE_ALL_WARRANTS=1：不再只靠 API4 prescan 候選，而是直接建立「所有認購權證 × 精選分點」候選池。
-# SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
-SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
-SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+# RUN_MODE=1 精選 5 分點速度優先設定：
+# SELECTED_FORCE_ALL_WARRANTS 預設為 0。精選五分點模式不建立「所有認購權證 × 精選分點」候選池。
+# SELECTED_REFRESH_ALL_WARRANTS 預設為 0。精選五分點模式不每次重抓所有精選分點完整候選。
+# 若要跑完整資料，請使用 RUN_MODE=2，而不是在精選五分點模式強制全市場刷新。
+SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "0").strip().lower() not in ("0", "false", "no")
+SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "0").strip().lower() not in ("0", "false", "no")
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -233,8 +232,9 @@ def configure_run_mode():
     依 RUN_MODE 切換分點範圍與候選快取。
 
     RUN_MODE=1：
-    - 只保留 SELECTED_TARGET_LABELS 指定的精選分點。
+    - 只保留 SELECTED_TARGET_LABELS 指定的精選五分點。
     - 候選快取使用 candidates_cache_selected5.csv，避免與完整清單模式混在一起。
+    - 精選五分點模式不允許強制建立「所有認購權證 × 精選分點」完整候選池，避免誤變成全資料。
     - 歷史分點快取仍共用 broker_warrant_history_cache.csv，因為 key 是權證代號 + 券商代號 + 日期，
       可讓精選模式抓到的新資料補強整體歷史資料。
 
@@ -243,6 +243,7 @@ def configure_run_mode():
     - 候選快取使用原本 candidates_cache.csv。
     """
     global RUN_MODE, TARGET_PATTERNS, FALLBACK, CANDIDATES_CACHE_PATH
+    global SELECTED_FORCE_ALL_WARRANTS, SELECTED_REFRESH_ALL_WARRANTS
 
     try:
         RUN_MODE = int(os.getenv("RUN_MODE", os.getenv("BROKER_RUN_MODE", str(RUN_MODE))) or "1")
@@ -254,6 +255,13 @@ def configure_run_mode():
         RUN_MODE = 1
 
     if RUN_MODE == 1:
+        # 精選五分點模式就是五分點模式：即使環境變數殘留 SELECTED_FORCE_ALL_WARRANTS=1，
+        # 也不要在這個模式建立「所有認購權證 × 精選分點」完整候選池。
+        if SELECTED_FORCE_ALL_WARRANTS or SELECTED_REFRESH_ALL_WARRANTS:
+            print("  ⚠️ RUN_MODE=1 精選五分點模式已關閉 SELECTED_FORCE_ALL_WARRANTS / SELECTED_REFRESH_ALL_WARRANTS，避免抓全資料。")
+        SELECTED_FORCE_ALL_WARRANTS = False
+        SELECTED_REFRESH_ALL_WARRANTS = False
+
         selected_labels = parse_selected_target_labels()
         missing = [label for label in selected_labels if label not in FULL_TARGET_PATTERNS]
 
@@ -279,7 +287,7 @@ def configure_run_mode():
             if label in FULL_FALLBACK
         }
         CANDIDATES_CACHE_PATH = CANDIDATES_CACHE_SELECTED5_PATH
-        print("  ✅ RUN_MODE=1：精選分點全市場追蹤模式")
+        print("  ✅ RUN_MODE=1：精選五分點快速追蹤模式")
         print(f"  ✅ 精選分點：{', '.join(TARGET_PATTERNS.keys())}")
         print(f"  ✅ 候選快取：{CANDIDATES_CACHE_PATH}")
     else:
@@ -3651,10 +3659,10 @@ def prescan_all(warrants, broker_map):
     broker_map = filter_broker_map_for_active_targets(broker_map)
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
 
-    # RUN_MODE=1 的核心修正：
-    # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
-    # 因為 API4 prescan 可能只回傳部分排行 / 區間資料，會造成今天大額賣超分散在多檔權證時漏抓。
-    # 這裡直接建立「所有認購權證 × 精選分點」候選池，再由 API5 抓完整歷史。
+    # RUN_MODE=1 預設不會進入此區塊。
+    # 精選五分點模式應使用下方一般候選快取 + 最近 API4 預掃邏輯，
+    # 只有在程式外明確強制且未被 configure_run_mode() 關閉時，才會建立完整候選池。
+    # 目前 configure_run_mode() 會在 RUN_MODE=1 主動關閉這兩個旗標，確保五分點不會誤抓全資料。
     if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS:
         if cached_candidates:
             print("【Step 3a】讀取精選分點候選組合快取...")
@@ -8486,7 +8494,7 @@ def main():
     print(f"B：同分點 + 同標的 + 單日多檔權證合計買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"C：同分點 + 同標的 + 連續3交易日多檔權證累積買超 >= {AMOUNT_THRESH // 10000}萬")
     print(f"D：同分點 + 同標的 + 近{D_WINDOW_DAYS}交易日累積淨買進 >= {AMOUNT_THRESH // 10000}萬")
-    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點全市場追蹤，2=完整分點清單）")
+    print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選五分點快速追蹤，2=完整分點清單）")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
     print(f"加速模式：FAST_SKIP_RECENT_PRESCAN={FAST_SKIP_RECENT_PRESCAN}，FETCH_GROUP_WARRANT_PRICES={FETCH_GROUP_WARRANT_PRICES}")
