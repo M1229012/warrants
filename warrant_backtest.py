@@ -92,6 +92,12 @@ PUT_WARRANTS_CACHE_PATH   = os.path.join(CACHE_DIR, "put_warrants_cache.csv")
 PUT_CANDIDATES_CACHE_PATH = os.path.join(CACHE_DIR, "put_candidates_cache.csv")
 PUT_HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "put_broker_warrant_history_cache.csv")
 
+# API5 歷史資料分批儲存快取：
+# 避免一次需要更新大量「權證 × 分點」組合時，中途卡住或被 GitHub Actions 取消，
+# 導致前面已抓到的資料全部白跑。預設每 1000 組完成後先寫入快取與 Google Sheet。
+# 若要關閉分批儲存，可設定 HISTORY_BATCH_SAVE_EVERY=0。
+HISTORY_BATCH_SAVE_EVERY = int(os.getenv("HISTORY_BATCH_SAVE_EVERY", "1000"))
+
 # TOP15 圖片用固定資料集：
 # 主程式在同一次 RUN 內，會把 TOP15 所需的所有部位明細、賣出扣減、價格快照與報酬率
 # 一次整理成「快取_TOP15部位明細」與「快取_TOP15共識淨買超」。
@@ -3618,6 +3624,32 @@ def get_all_call_warrants():
 # 認售新增：取所有認售權證 + 標的股代號
 # ══════════════════════════════════════════════════════════════════════
 
+def is_put_warrant_code(code):
+    """
+    判斷是否為認售權證代號。
+
+    台灣認售權證代號不是純 6 碼數字，而是「5 碼數字 + 英文字母」。
+    常見格式：03001P、03001U、03001T；外國標的認售權證為 03001Q。
+    因此不能沿用認購權證的 code.isdigit() 判斷，否則會全部被排除。
+    """
+    s = str(code or "").strip().upper()
+    return bool(re.fullmatch(r"\d{5}[PUTQ]", s))
+
+
+def is_put_warrant_name(name):
+    """
+    用名稱輔助判斷認售權證。
+
+    主要仍以代號規則為準；名稱中的「售」只作為備援，避免特殊資料源仍可被納入。
+    """
+    s = str(name or "").strip().upper()
+    if not s:
+        return False
+    if "購" in s:
+        return False
+    return "售" in s
+
+
 def get_all_put_warrants_live():
     print("【Put Step 1】取所有認售權證清單...")
     warrants = []
@@ -3673,7 +3705,12 @@ def get_all_put_warrants_live():
                 else:
                     continue
 
-            if len(code) == 6 and code.isdigit() and "售" in name:
+            code = str(code).strip().upper()
+
+            # 認售權證代號為「5 碼數字 + P/U/T/Q」，不是純 6 碼數字。
+            # 舊版使用 len(code) == 6 and code.isdigit() 會把 03001P 這類認售權證全部排除，
+            # 導致認售權證清單永遠為 0。
+            if is_put_warrant_code(code) or is_put_warrant_name(name):
                 if code in seen_warrants:
                     continue
 
@@ -4120,7 +4157,23 @@ def build_put_items_for_consensus(broker_map):
     print(f"  ✅ 本次需要 API5 更新認售：{len(put_candidates_to_fetch):,} 組")
 
     put_fetched_items = []
+    put_pending_save_items = []
     done = 0
+
+    def flush_put_history_cache(reason_text):
+        nonlocal put_history_cache_df, put_pending_save_items, put_history_keys
+
+        if not put_pending_save_items:
+            return
+
+        put_history_cache_df = merge_items_into_history_cache(put_history_cache_df, put_pending_save_items)
+        save_history_cache_to_path(put_history_cache_df, PUT_HISTORY_CACHE_PATH, "認售原始分點資料")
+        put_history_keys = history_cache_keys(put_history_cache_df)
+        print(
+            f"  💾 認售分批快取已儲存（{reason_text}）："
+            f"本批 {len(put_pending_save_items):,} 組，累計成功 {len(put_fetched_items):,} 組"
+        )
+        put_pending_save_items = []
 
     if put_candidates_to_fetch:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -4139,13 +4192,19 @@ def build_put_items_for_consensus(broker_map):
 
                 if item:
                     put_fetched_items.append(item)
+                    put_pending_save_items.append(item)
 
                 if done % 100 == 0:
                     print(f"  [{done:,}/{len(put_candidates_to_fetch):,}] 認售已更新，成功取得 {len(put_fetched_items):,} 組資料")
+
+                if HISTORY_BATCH_SAVE_EVERY > 0 and done % HISTORY_BATCH_SAVE_EVERY == 0:
+                    flush_put_history_cache(f"已處理 {done:,}/{len(put_candidates_to_fetch):,} 組")
+
+        flush_put_history_cache("認售 API5 更新完成")
     else:
         print("  ✅ 所有認售候選組合皆可使用快取，略過 API5 歷史資料重抓")
 
-    if put_fetched_items:
+    if put_fetched_items and HISTORY_BATCH_SAVE_EVERY <= 0:
         put_history_cache_df = merge_items_into_history_cache(put_history_cache_df, put_fetched_items)
         save_history_cache_to_path(put_history_cache_df, PUT_HISTORY_CACHE_PATH, "認售原始分點資料")
 
@@ -9327,7 +9386,23 @@ def main():
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
     fetched_items = []
+    pending_save_items = []
     done = 0
+
+    def flush_history_cache(reason_text):
+        nonlocal history_cache_df, pending_save_items, history_keys
+
+        if not pending_save_items:
+            return
+
+        history_cache_df = merge_items_into_history_cache(history_cache_df, pending_save_items)
+        save_history_cache(history_cache_df)
+        history_keys = history_cache_keys(history_cache_df)
+        print(
+            f"  💾 分批快取已儲存（{reason_text}）："
+            f"本批 {len(pending_save_items):,} 組，累計成功 {len(fetched_items):,} 組"
+        )
+        pending_save_items = []
 
     if candidates_to_fetch:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -9346,13 +9421,19 @@ def main():
 
                 if item:
                     fetched_items.append(item)
+                    pending_save_items.append(item)
 
                 if done % 100 == 0:
                     print(f"  [{done:,}/{len(candidates_to_fetch):,}] 已更新，成功取得 {len(fetched_items)} 組資料")
+
+                if HISTORY_BATCH_SAVE_EVERY > 0 and done % HISTORY_BATCH_SAVE_EVERY == 0:
+                    flush_history_cache(f"已處理 {done:,}/{len(candidates_to_fetch):,} 組")
+
+        flush_history_cache("API5 更新完成")
     else:
         print("  ✅ 所有候選組合皆可使用快取，略過 API5 歷史資料重抓")
 
-    if fetched_items:
+    if fetched_items and HISTORY_BATCH_SAVE_EVERY <= 0:
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         save_history_cache(history_cache_df)
 
