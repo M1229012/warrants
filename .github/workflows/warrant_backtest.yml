@@ -11,6 +11,7 @@ on:
         options:
           - "精選5分點當日買賣超產圖"
           - "完整資料回補與回測"
+          - "不使用快取重新抓完整資料"
 
   schedule:
     # Asia/Taipei 17:10 = UTC 09:10
@@ -34,32 +35,39 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
 
-      # 只保留兩種方案：
+      # 只保留三種方案：
       # 1. 精選5分點當日買賣超產圖：只跑精選 5 分點，但資料一定抓完整，確保 TOP15 正確。
-      # 2. 完整資料回補與回測：跑全資料。
+      # 2. 完整資料回補與回測：跑全資料，使用既有快取補更新。
+      # 3. 不使用快取重新抓完整資料：跑全資料，不讀舊快取，重新建立快取。
       #
       # 觸發規則：
       # - 手動選「完整資料回補與回測」 => full_report
+      # - 手動選「不使用快取重新抓完整資料」 => full_report
       # - 每日 17:10 排程 => full_report
       # - 其他情況 => daily_signal
-      RUN_PLAN: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full_report' || 'daily_signal' }}
+      RUN_PLAN: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full_report' || 'daily_signal' }}
 
       # 基本快取設定
+      # FORCE_FULL_CACHE_REFRESH=1：
+      # 不讀舊快取，但跑完仍會重建並寫入新快取。
       USE_CACHE: "1"
-      FORCE_FULL_CACHE_REFRESH: "0"
+      FORCE_FULL_CACHE_REFRESH: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '不使用快取重新抓完整資料') && '1' || '0' }}
+
+      # 分批儲存快取，避免程式跑一半失敗後下次又全部重抓。
+      HISTORY_BATCH_SAVE_EVERY: "1000"
 
       OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
       OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
 
       # 分點模式
       # 每日產圖 = 精選5分點 RUN_MODE=1
-      # 完整回補 = 完整分點清單 RUN_MODE=2
-      RUN_MODE: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '2' || '1' }}
+      # 完整回補 / 不使用快取完整重抓 = 完整分點清單 RUN_MODE=2
+      RUN_MODE: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '2' || '1' }}
 
       # OpenAPI 今日有成交權證預篩天數
       # 每日產圖雖然只跑 5 分點，但因為已強制全候選完整追蹤，所以這裡維持較小值即可；
       # 完整回補用最近 3 天提高完整性。
-      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '3' || '1' }}
+      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '3' || '1' }}
 
       # 每次都重新抓 OpenAPI + API4，避免錯過今天新權證。
       ACTIVE_WARRANT_FORCE_REFRESH: "1"
@@ -69,8 +77,8 @@ jobs:
       DAILY_SIGNAL_API5_DAYS: "250"
 
       # 完整回補模式：新候選抓完整歷史；既有候選補最近 5 筆。
-      INITIAL_HISTORY_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '750' || '250' }}
-      DAILY_UPDATE_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '5' || '3' }}
+      INITIAL_HISTORY_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '750' || '250' }}
+      DAILY_UPDATE_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '5' || '3' }}
 
       # 歷史快取 append / merge 保護，一定要保留，避免 Google Sheet 舊資料被洗掉。
       HISTORY_CACHE_APPEND_ONLY: "1"
@@ -80,10 +88,10 @@ jobs:
       SKIP_PRICE_FETCH: "0"
 
       # 每日產圖只補 今日_* 需要的價格；完整回補補完整歷史缺價。
-      PRICE_FETCH_SCOPE: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full' || 'today' }}
+      PRICE_FETCH_SCOPE: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full' || 'today' }}
 
       # 主程式仍保留完整歷史主表邏輯；每日產圖模式會提前只輸出 今日_*，不重算主表。
-      REPORT_FULL_HISTORY: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '1' || '0' }}
+      REPORT_FULL_HISTORY: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '1' || '0' }}
       TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
       DATA_UPDATE_ONLY: "0"
 
@@ -112,9 +120,9 @@ jobs:
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
       # 執行緒設定
-      MAX_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
+      MAX_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
       PRICE_WORKERS: "60"
-      PRESCAN_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測') || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
+      PRESCAN_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
       FIND_BROKER_WORKERS: "40"
 
     steps:
