@@ -3228,6 +3228,9 @@ def normalize_image_action(action_text: str) -> str:
     if not key:
         return IMAGE_ACTION_DAILY_BUNDLE
 
+    if "不使用快取" in raw or "重新抓完整資料" in raw or "強制重抓" in raw:
+        return IMAGE_ACTION_ALL
+
     if "全部" in raw or key in {"all", "全部圖片", "全部產圖"}:
         return IMAGE_ACTION_ALL
 
@@ -3248,33 +3251,60 @@ def normalize_image_action(action_text: str) -> str:
     return IMAGE_ACTION_DAILY_BUNDLE
 
 
+def _warrant_consensus_warrant_count(value) -> int:
+    """從快取欄位「權證代號」推回同標的涵蓋權證檔數。"""
+    s = strip_gsheet_text_prefix(value).strip()
+    if not s:
+        return 0
+
+    m = re.search(r"共\s*(\d+)\s*檔", s)
+    if m:
+        return safe_int(m.group(1), 0)
+
+    parts = [p.strip() for p in re.split(r"[；;、,\s]+", s) if p.strip()]
+    if parts:
+        return len(parts)
+
+    return 1
+
+
 def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
     """
-    直接從「快取_分點歷史」計算近 7 天全分點標的共識買賣超 TOP15。
+    直接讀取「快取_近7日權證分點共識TOP15」。
 
     重要：
-    - 不再讀取「快取_近7日權證分點共識TOP15」作為最終排名來源。
-    - 會直接讀完整的「快取_分點歷史」全分點資料。
-    - 先把同一標的底下所有權證合併，再排序買超 / 賣超 TOP15。
+    - 最終排名來源以 warrant_backtest.py 產生的快取工作表為準。
+    - 不再從「快取_分點歷史」於圖片端重新計算，避免圖片端與主程式快取口徑不一致。
+    - 這張快取表已在主程式端依「同標的所有認購權證金額加總」完成排名。
 
     回傳：
     - 共識買超標的 rows
     - 共識賣超標的 rows
     - 統計期間文字
-    - 實際採用的統計日期（期末日）
+    - 實際採用的統計日期
     """
     needed_cols = [
-        "日期", "分點", "標的股", "權證代號", "權證代碼", "權證名稱",
-        "買進金額", "賣出金額", "買進股數", "賣出股數",
+        "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
+        "排名類型", "排名",
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "排名金額", "買進金額", "賣出金額", "淨買超金額", "淨賣超金額",
+        "買進股數", "賣出股數",
+        "參與分點數", "同向分點數", "反向分點數", "主要同向分點",
+        "完成狀態", "更新時間", "run_id", "分點明細_JSON",
     ]
 
-    df = read_gsheet_table_optional(SHEET_HISTORY, needed_cols, filter_tracked_brokers=False)
+    df = read_gsheet_table_optional(
+        SHEET_WARRANT_CONSENSUS_7D,
+        needed_cols,
+        filter_tracked_brokers=False,
+    )
+
     if df.empty:
         return [], [], "無資料", None
 
     available_dates = []
     for _, r in df.iterrows():
-        d = parse_date_value(r.get("日期"))
+        d = parse_date_value(r.get("統計日期"))
         if d:
             available_dates.append(d)
 
@@ -3287,164 +3317,64 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
     else:
         chosen_date = max(available_dates)
 
-    period_start = chosen_date - timedelta(days=6)
-    period_text = f"{period_start:%Y/%m/%d} ～ {chosen_date:%Y/%m/%d}"
+    df = df[df.apply(lambda r: parse_date_value(r.get("統計日期")) == chosen_date, axis=1)].copy()
 
-    stock_name_map = get_stock_name_map()
-    grouped: dict[str, dict] = {}
+    if df.empty:
+        return [], [], "無資料", chosen_date
 
-    for _, r in df.iterrows():
-        d = parse_date_value(r.get("日期"))
-        if not d or d < period_start or d > chosen_date:
-            continue
+    period_values = [strip_gsheet_text_prefix(v) for v in df.get("統計期間", []) if strip_gsheet_text_prefix(v)]
+    period_text = period_values[0] if period_values else "無資料"
 
-        broker = str(r.get("分點", "")).strip()
-        if not broker:
-            continue
-
-        warrant_name = strip_gsheet_text_prefix(r.get("權證名稱", ""))
-        underlying = normalize_underlying(r.get("標的股", ""), warrant_name)
-        if not underlying:
-            continue
-
-        buy_amount = safe_float(r.get("買進金額"), 0)
-        sell_amount = safe_float(r.get("賣出金額"), 0)
-        buy_qty = safe_float(r.get("買進股數"), 0)
-        sell_qty = safe_float(r.get("賣出股數"), 0)
-        if buy_amount <= 0 and sell_amount <= 0 and buy_qty <= 0 and sell_qty <= 0:
-            continue
-
-        underlying_name = stock_name_map.get(underlying, "")
-        if not underlying_name:
-            underlying_name = extract_stock_name_from_warrant_text(warrant_name)
-
-        item = grouped.setdefault(
-            underlying,
-            {
-                "underlying": underlying,
-                "underlying_name": underlying_name,
-                "target": f"{underlying} {underlying_name}".strip(),
-                "buy_amount": 0.0,
-                "sell_amount": 0.0,
-                "buy_qty": 0.0,
-                "sell_qty": 0.0,
-                "warrant_codes": set(),
-                "warrant_names": set(),
-                "broker_buy": defaultdict(float),
-                "broker_sell": defaultdict(float),
-            },
-        )
-
-        if not item.get("underlying_name") and underlying_name:
-            item["underlying_name"] = underlying_name
-            item["target"] = f"{underlying} {underlying_name}".strip()
-
-        item["buy_amount"] += buy_amount
-        item["sell_amount"] += sell_amount
-        item["buy_qty"] += buy_qty
-        item["sell_qty"] += sell_qty
-
-        warrant_code = normalize_warrant_code(r.get("權證代號") or r.get("權證代碼"))
-        if warrant_code:
-            item["warrant_codes"].add(warrant_code)
-        if warrant_name:
-            item["warrant_names"].add(warrant_name)
-
-        item["broker_buy"][broker] += buy_amount
-        item["broker_sell"][broker] += sell_amount
-
-    def build_direction_rows(direction: str) -> list[dict]:
+    def build_rows(rank_type: str) -> list[dict]:
+        part = df[df["排名類型"].astype(str).str.strip() == rank_type].copy()
         rows = []
-        for item in grouped.values():
-            buy_amount = safe_float(item.get("buy_amount"), 0)
-            sell_amount = safe_float(item.get("sell_amount"), 0)
-            net_buy_amount = max(buy_amount - sell_amount, 0.0)
-            net_sell_amount = max(sell_amount - buy_amount, 0.0)
-            rank_amount = net_buy_amount if direction == "buy" else net_sell_amount
-            if rank_amount <= 0:
-                continue
 
-            same_direction_brokers = []
-            opposite_direction_count = 0
-            all_brokers = set(item.get("broker_buy", {}).keys()) | set(item.get("broker_sell", {}).keys())
-            for broker in all_brokers:
-                broker_buy = safe_float(item.get("broker_buy", {}).get(broker), 0)
-                broker_sell = safe_float(item.get("broker_sell", {}).get(broker), 0)
-                net = broker_buy - broker_sell
-                if direction == "buy":
-                    if net > 0:
-                        same_direction_brokers.append((broker, net))
-                    elif net < 0:
-                        opposite_direction_count += 1
-                else:
-                    if net < 0:
-                        same_direction_brokers.append((broker, -net))
-                    elif net > 0:
-                        opposite_direction_count += 1
+        for _, r in part.iterrows():
+            underlying = normalize_underlying(r.get("標的股", ""), r.get("權證名稱", ""))
+            underlying_name = strip_gsheet_text_prefix(r.get("標的名稱", ""))
+            target_label = f"{underlying} {underlying_name}".strip() if underlying else underlying_name
 
-            same_direction_brokers.sort(key=lambda kv: kv[1], reverse=True)
-            same_direction_count = len(same_direction_brokers)
-            main_brokers = "、".join(
-                f"{broker} {fmt_wan(amount)}"
-                for broker, amount in same_direction_brokers[:5]
-            )
-            if len(same_direction_brokers) > 5:
-                main_brokers += f"、等{len(same_direction_brokers)}家"
-
-            warrant_count = len(item.get("warrant_codes", set()))
-            if warrant_count <= 0:
-                warrant_count = len(item.get("warrant_names", set()))
-            if warrant_count <= 0:
-                warrant_count = 1
+            rank_amount = safe_float(r.get("排名金額"), 0)
+            buy_amount = safe_float(r.get("買進金額"), 0)
+            sell_amount = safe_float(r.get("賣出金額"), 0)
+            net_buy_amount = safe_float(r.get("淨買超金額"), buy_amount - sell_amount)
+            net_sell_amount = safe_float(r.get("淨賣超金額"), sell_amount - buy_amount)
 
             rows.append({
                 "stat_date": chosen_date,
                 "period": period_text,
-                "rank_type": "共識買超" if direction == "buy" else "共識賣超",
-                "rank": 0,
-                "underlying": item.get("underlying", ""),
-                "underlying_name": item.get("underlying_name", ""),
-                "target": item.get("target", "") or item.get("underlying", ""),
+                "rank_type": rank_type,
+                "rank": safe_int(r.get("排名"), 0),
+                "underlying": underlying,
+                "underlying_name": underlying_name,
+                "target": target_label or underlying,
                 "rank_amount": rank_amount,
                 "buy_amount": buy_amount,
                 "sell_amount": sell_amount,
                 "net_buy_amount": net_buy_amount,
                 "net_sell_amount": net_sell_amount,
-                "buy_qty": safe_float(item.get("buy_qty"), 0),
-                "sell_qty": safe_float(item.get("sell_qty"), 0),
-                "warrant_count": warrant_count,
-                "same_direction_count": same_direction_count,
-                "opposite_direction_count": opposite_direction_count,
-                "broker_count": same_direction_count,
-                "main_brokers": main_brokers,
+                "buy_qty": safe_float(r.get("買進股數"), 0),
+                "sell_qty": safe_float(r.get("賣出股數"), 0),
+                "warrant_count": _warrant_consensus_warrant_count(r.get("權證代號", "")),
+                "same_direction_count": safe_int(r.get("同向分點數"), 0),
+                "opposite_direction_count": safe_int(r.get("反向分點數"), 0),
+                "broker_count": safe_int(r.get("同向分點數"), safe_int(r.get("參與分點數"), 0)),
+                "main_brokers": strip_gsheet_text_prefix(r.get("主要同向分點", "")).replace("；", "、"),
             })
 
-        rows.sort(
-            key=lambda x: (
-                safe_float(x.get("rank_amount"), 0),
-                safe_float(x.get("buy_amount"), 0) + safe_float(x.get("sell_amount"), 0),
-                safe_int(x.get("warrant_count"), 0),
-                safe_int(x.get("same_direction_count"), 0),
-            ),
-            reverse=True,
-        )
-
-        for idx, row in enumerate(rows, 1):
-            row["rank"] = idx
-
+        rows.sort(key=lambda x: safe_int(x.get("rank"), 999999))
         return rows[:15]
 
-    buy_rows = build_direction_rows("buy")
-    sell_rows = build_direction_rows("sell")
+    buy_rows = build_rows("共識買超")
+    sell_rows = build_rows("共識賣超")
     return buy_rows, sell_rows, period_text, chosen_date
-
 
 def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     """
     新增圖片：本週標的分點共識買賣超金額各 TOP15。
 
-    資料來源改為直接讀取「快取_分點歷史」全分點資料，
-    並在圖片端先依標的合併所有權證後再重新排序。
+    資料來源改為直接讀取「快取_近7日權證分點共識TOP15」。
+    排名口徑以主程式快取為準：同標的所有認購權證金額加總後排名。
     """
     buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target)
 
