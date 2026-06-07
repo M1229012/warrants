@@ -1,4 +1,4 @@
-name: Stock Branch Backtest Google Sheet
+name: Stock Branch Backtest Google Sheet(現股)
 
 on:
   workflow_dispatch:
