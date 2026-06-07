@@ -1,0 +1,66 @@
+name: Stock Branch Backtest Google Sheet
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "開始日期，例如 2026/05/07。留空則自動抓最近一個月"
+        required: false
+        default: ""
+      end_date:
+        description: "結束日期，例如 2026/06/07。留空則使用今天"
+        required: false
+        default: ""
+      stock_limit:
+        description: "測試用，只掃前 N 檔股票。0 代表全市場"
+        required: false
+        default: "0"
+      workers:
+        description: "同時抓取執行緒數"
+        required: false
+        default: "18"
+
+  schedule:
+    # 台灣時間 18:05 = UTC 10:05，週一到週五執行
+    - cron: "5 10 * * 1-5"
+
+jobs:
+  stock-branch-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas openpyxl gspread google-auth lxml html5lib
+
+      - name: Run stock branch backtest
+        env:
+          GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          STOCK_LIMIT: ${{ github.event.inputs.stock_limit || '0' }}
+          MAX_WORKERS: ${{ github.event.inputs.workers || '18' }}
+          OUTPUT_DIR: output
+          USE_CACHE: "1"
+          GSHEET_CACHE_ENABLED: "1"
+          GSHEET_RESULT_ENABLED: "1"
+          CAPTURE_ALL_TOP15: "0"
+        run: |
+          python stock_branch_backtest.py
+
+      - name: Upload output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-branch-output
+          path: output/
+          if-no-files-found: ignore
