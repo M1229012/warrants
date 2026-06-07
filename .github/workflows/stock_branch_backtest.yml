@@ -50,6 +50,8 @@ jobs:
           END_DATE: ${{ github.event.inputs.end_date }}
           STOCK_LIMIT: ${{ github.event.inputs.stock_limit || '0' }}
           MAX_WORKERS: ${{ github.event.inputs.workers || '18' }}
+          GOOGLE_SHEET_ID: "1hLa8JA8QIsszkewDSwuqkLz2XA8UXE_kYYcpb7njuEo"
+          GOOGLE_SHEET_NAME: "股票現貨籌碼"
           OUTPUT_DIR: output
           USE_CACHE: "1"
           GSHEET_CACHE_ENABLED: "1"
