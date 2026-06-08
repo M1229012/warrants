@@ -6,7 +6,8 @@ MoneyDJ 現股分點籌碼回測 / 排名系統
 目前追蹤分點：
 1. 富邦-新店    9661
 2. 永豐金-板新  9A9J
-3. 康和-永和    845B 
+3. 康和-永和    845B
+4. 凱基-信義    9216
 
 資料來源：MoneyDJ 現股籌碼頁 stock-chip0002-5
 功能：
@@ -83,7 +84,7 @@ REFRESH_STOCK_LIST = os.getenv("REFRESH_STOCK_LIST", "1").strip().lower() not in
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 CAPTURE_ALL_TOP15 = os.getenv("CAPTURE_ALL_TOP15", "0").strip().lower() in ("1", "true", "yes")
 
-# 目前只追蹤兩個現股分點
+# 目前只追蹤兩個現股分點  
 TARGET_BROKERS = {
     "富邦新店": {
         "分點名稱": "富邦-新店",
@@ -96,6 +97,10 @@ TARGET_BROKERS = {
     "康和永和": {
         "分點名稱": "康和-永和",
         "券商代號": "845B",
+    },
+    "凱基信義": {
+        "分點名稱": "凱基-信義",
+        "券商代號": "9216",
     },
 }
 
