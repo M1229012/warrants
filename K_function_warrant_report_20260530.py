@@ -79,6 +79,11 @@ API5 = (
     "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
 )
 
+# MoneyDJ 權證搜尋備援：當 TWSE / TPEx OpenAPI 沒抓到權證母體時，
+# 改用 MoneyDJ Search.xdjhtm 背後的 ProxyXQ.xdjjs 依標的股抓全部權證。
+MONEYDJ_WARRANT_SEARCH_PAGE = "https://www.moneydj.com/warrant/xdjhtm/Search.xdjhtm"
+MONEYDJ_WARRANT_PROXY_URL = "https://www.moneydj.com/warrant/xdjjs/ProxyXQ.xdjjs"
+
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
@@ -2156,6 +2161,216 @@ def load_historical_call_warrants_from_cache(stock_code: str, stock_name: str, s
     return out
 
 
+
+def _moneydj_fix_mojibake(value) -> str:
+    """修正 MoneyDJ ProxyXQ 回傳中偶爾出現的 UTF-8 / latin1 亂碼。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value)
+    try:
+        return s.encode("latin1").decode("utf-8")
+    except Exception:
+        return s
+
+
+def _moneydj_clean_text(value) -> str:
+    s = _moneydj_fix_mojibake(value)
+    s = html.unescape(str(s or ""))
+    s = s.replace("\ufeff", "")
+    s = s.replace("\xa0", " ")
+    s = s.replace("\u3000", " ")
+    s = s.replace("臺", "台")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _moneydj_safe_int(value, default=0) -> int:
+    try:
+        s = str(value or "").replace(",", "").strip()
+        if not s:
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
+
+
+def _moneydj_build_warrant_search_param(target: str) -> str:
+    """建立 MoneyDJ 權證搜尋 ProxyXQ 參數。
+
+    關鍵條件：
+    - C-csv2：要求回傳 rows 結構。
+    - P-S1[3]B2[xxxx.TW/TWO]：以標的股代碼查詢。
+    """
+    target = str(target or "").strip().upper()
+    return (
+        "A-57"
+        "^B-7"
+        "^C-csv2"
+        "^P-S1[3]"
+        f"B2[{target}]"
+        "C1[]"
+        "C2[]"
+        "E1[]"
+        "E2[]"
+        "S5[]"
+        "S6[]"
+        "S7[]"
+        "S2[]"
+        "S3[]"
+        "S4[]"
+        "H1[]"
+        "H2["
+    )
+
+
+def fetch_moneydj_warrant_search_raw(target: str) -> str:
+    """直接呼叫 MoneyDJ 權證搜尋備援 API，回傳原始文字。"""
+    target = str(target or "").strip().upper()
+    if not target:
+        return ""
+
+    session = get_thread_session()
+    headers_page = {
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.moneydj.com/",
+    }
+    headers_api = {
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "text/html, */*; q=0.01",
+        "Accept-Language": headers_page["Accept-Language"],
+        "Referer": MONEYDJ_WARRANT_SEARCH_PAGE,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    try:
+        # 先進搜尋頁建立 Cookie / Session，再打 ProxyXQ。
+        try:
+            session.get(MONEYDJ_WARRANT_SEARCH_PAGE, headers=headers_page, timeout=(8, 20))
+        except Exception as e:
+            print(f"⚠️ MoneyDJ 權證搜尋頁預載失敗，仍嘗試直接查詢：{target}｜{e}")
+
+        param = _moneydj_build_warrant_search_param(target)
+        url = MONEYDJ_WARRANT_PROXY_URL + "?param=" + urllib.parse.quote(param, safe="")
+        resp = session.get(url, headers=headers_api, timeout=(8, 30))
+        resp.raise_for_status()
+        text = resp.content.decode("utf-8", errors="replace")
+        print(f"✅ MoneyDJ 權證搜尋備援：{target}｜回傳長度 {len(text):,}")
+        return text
+    except Exception as e:
+        print(f"⚠️ MoneyDJ 權證搜尋備援失敗：{target}｜{e}")
+        return ""
+
+
+def parse_moneydj_warrant_search_rows(raw_text: str, stock_code: str, target: str, stock_name: str = "") -> List[dict]:
+    """解析 MoneyDJ ProxyXQ 權證搜尋 rows，回傳認購權證母體。
+
+    注意：此備援刻意不過濾成交量為 0 的權證，避免 MoneyDJ 搜尋頁成交量欄位尚未更新時漏掉權證。
+    """
+    if not raw_text:
+        return []
+
+    try:
+        payload = json.loads(raw_text)
+    except Exception as e:
+        print(f"⚠️ MoneyDJ 權證搜尋備援 JSON 解析失敗：{target}｜{e}")
+        return []
+
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    if not rows:
+        print(f"⚠️ MoneyDJ 權證搜尋備援 rows 為空：{target}")
+        return []
+
+    stock_code_clean = _clean_code(stock_code)
+    target = str(target or "").strip().upper()
+    out = []
+    seen = set()
+
+    for item in rows:
+        row = item.get("Row", []) if isinstance(item, dict) else []
+        if not row or len(row) < 58:
+            continue
+
+        full_code = _moneydj_clean_text(row[0]).upper()
+        code = normalize_openapi_warrant_code(full_code.replace(".TW", "").replace(".TWO", ""))
+        warrant_name = _moneydj_clean_text(row[1])
+        display_name = _moneydj_clean_text(row[48]) if len(row) > 48 else ""
+        underlying_code = _moneydj_clean_text(row[29]).upper() if len(row) > 29 else ""
+        underlying_name = _moneydj_clean_text(row[30]) if len(row) > 30 else ""
+        full_type = _moneydj_clean_text(row[8]) if len(row) > 8 else ""
+        display_type = _moneydj_clean_text(row[51]) if len(row) > 51 else ""
+
+        # 僅取指定標的；MoneyDJ 對上市通常是 xxxx.TW，上櫃可能是 xxxx.TWO。
+        if underlying_code != target:
+            continue
+
+        # 只取認購，不取認售 / 牛熊。
+        if display_type != "認購" and "認購" not in full_type:
+            continue
+
+        if not code or not re.fullmatch(r"\d{6}", code):
+            continue
+
+        if code in seen:
+            continue
+        seen.add(code)
+
+        name = display_name or warrant_name or code
+        out.append({
+            "代號": code,
+            "名稱": name,
+            "標的股": str(stock_code_clean),
+            "標的名稱": underlying_name or stock_name,
+            "成交金額": 0,
+            "成交量": _moneydj_safe_int(row[28]) if len(row) > 28 else 0,
+            "母體來源": "MoneyDJSearch",
+        })
+
+    out = sorted(out, key=lambda x: (int(x.get("成交量", 0) or 0), x.get("代號", "")), reverse=True)
+    print(f"🔎 MoneyDJ 權證搜尋備援解析：{target}｜認購 {len(out):,} 支（未過濾成交量=0）")
+    return out
+
+
+def fetch_moneydj_call_warrants_fallback(stock_code: str, stock_name: str) -> List[dict]:
+    """OpenAPI 沒抓到權證母體時，改用 MoneyDJ 依標的股代碼抓認購權證。
+
+    會依序嘗試：
+    1. xxxx.TW
+    2. xxxx.TWO
+
+    並合併去重。此備援不過濾成交量為 0。
+    """
+    stock_code_clean = _clean_code(stock_code)
+    if not stock_code_clean:
+        return []
+
+    records = {}
+    for suffix in ["TW", "TWO"]:
+        target = f"{stock_code_clean}.{suffix}"
+        raw = fetch_moneydj_warrant_search_raw(target)
+        rows = parse_moneydj_warrant_search_rows(raw, stock_code_clean, target, stock_name=stock_name)
+        for rec in rows:
+            code = normalize_openapi_warrant_code(rec.get("代號"))
+            if not code:
+                continue
+            old = records.get(code)
+            if old is None:
+                records[code] = rec
+            else:
+                # 若兩個市場來源重複，保留成交量較大的資料。
+                if int(rec.get("成交量", 0) or 0) > int(old.get("成交量", 0) or 0):
+                    records[code] = rec
+
+    out = list(records.values())
+    out = sorted(out, key=lambda x: (int(x.get("成交量", 0) or 0), x.get("代號", "")), reverse=True)
+    if out:
+        print(f"✅ MoneyDJ 權證搜尋備援完成：{stock_code_clean} {stock_name}｜認購 {len(out):,} 支（未過濾成交量=0）")
+    else:
+        print(f"⚠️ MoneyDJ 權證搜尋備援沒有取得認購權證：{stock_code_clean} {stock_name}")
+    return out
+
+
 def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
     frames = []
     for source_label, f in [("TWSE", fetch_twse_openapi_warrant_daily_df()), ("TPEx", fetch_tpex_openapi_warrant_daily_df())]:
@@ -2189,6 +2404,7 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
     seen = set()
     name_match_count = 0
     lookup_match_count = 0
+    moneydj_added = 0
 
     for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
         code = normalize_openapi_warrant_code(r.get("代號"))
@@ -2222,6 +2438,28 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
                 "母體來源": "OpenAPI",
             })
 
+    # MoneyDJ 權證搜尋備援：
+    # 只有當 OpenAPI 沒有提供可用母體，或 OpenAPI 比對後沒有任何相關認購權證時才啟用。
+    # 備援資料不過濾成交量 = 0，避免 MoneyDJ 搜尋頁成交量欄位尚未更新時漏抓權證。
+    if not warrants:
+        print("⚠️ OpenAPI 未取得可用認購權證母體或比對後為 0，啟用 MoneyDJ 權證搜尋備援（不過濾成交量=0）")
+        moneydj_warrants = fetch_moneydj_call_warrants_fallback(stock_code_clean, stock_name)
+        for rec in moneydj_warrants:
+            code = normalize_openapi_warrant_code(rec.get("代號"))
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            moneydj_added += 1
+            warrants.append({
+                "代號": code,
+                "名稱": str(rec.get("名稱", "") or code).strip(),
+                "標的股": str(stock_code_clean),
+                "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
+                "成交金額": int(rec.get("成交金額", 0) or 0),
+                "成交量": int(rec.get("成交量", 0) or 0),
+                "母體來源": "MoneyDJSearch",
+            })
+
     historical_warrants = load_historical_call_warrants_from_cache(
         stock_code,
         stock_name,
@@ -2247,10 +2485,13 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
 
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
-    print(f"🔎 {stock_code_clean} {stock_name} 權證比對：lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜歷史補充新增 {historical_added:,} 支")
+    print(
+        f"🔎 {stock_code_clean} {stock_name} 權證比對："
+        f"lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜"
+        f"MoneyDJ備援新增 {moneydj_added:,} 支｜歷史補充新增 {historical_added:,} 支"
+    )
     print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
     return warrants
-
 
 def _api4_fetch_raw(code, start, end):
     """API4 原始抓取，不直接寫入統計；由呼叫端決定第一輪/第二輪後的最終狀態。"""
