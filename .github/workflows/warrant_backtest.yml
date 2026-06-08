@@ -1,4 +1,4 @@
-name: Stock Branch Backtest Google Sheet(權證)
+name: Warrant Backtest Google Sheet
 
 on:
   workflow_dispatch:
@@ -6,54 +6,124 @@ on:
       run_plan:
         description: "執行方案"
         required: true
-        default: "精選2分點近一月買賣超"
+        default: "精選5分點當日買賣超產圖"
         type: choice
         options:
-          - "精選2分點近一月買賣超"
-          - "完整資料回補與統計"
+          - "精選5分點當日買賣超產圖"
+          - "完整資料回補與回測"
           - "不使用快取重新抓完整資料"
 
   schedule:
-    # 台灣時間 18:05 = UTC 10:05，週一到週五執行
-    - cron: "5 10 * * 1-5"
+    # Asia/Taipei 17:10 = UTC 09:10
+    # 這次排程改為：完整資料回補與回測
+    - cron: "10 9 * * 1-5"
+
+    # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
+    # 這兩次排程維持：精選5分點當日買賣超產圖
+    - cron: "5,35 13 * * 1-5"
 
 concurrency:
-  group: stock-branch-backtest-google-sheet
+  group: warrant-backtest-google-sheet
   cancel-in-progress: false
 
 jobs:
-  stock-branch-backtest:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     env:
       OUTPUT_DIR: output
-      CACHE_DIR: stock_branch_cache
+      CACHE_DIR: warrant_cache
 
-      RUN_PLAN: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && 'full_report' || 'daily_signal' }}
+      # 只保留三種方案：
+      # 1. 精選5分點當日買賣超產圖：只跑精選 5 分點，但資料一定抓完整，確保 TOP15 正確。
+      # 2. 完整資料回補與回測：跑全資料，使用既有快取補更新。
+      # 3. 不使用快取重新抓完整資料：跑全資料，不讀舊快取，重新建立快取。
+      #
+      # 觸發規則：
+      # - 手動選「完整資料回補與回測」 => full_report
+      # - 手動選「不使用快取重新抓完整資料」 => full_report
+      # - 每日 17:10 排程 => full_report
+      # - 其他情況 => daily_signal
+      RUN_PLAN: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full_report' || 'daily_signal' }}
 
-      # 精選2分點 / 排程：近 31 天；完整回補 / 重新抓：近 90 天
-      STOCK_LOOKBACK_DAYS: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && '90' || '31' }}
-      LOOKBACK_DAYS: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && '90' || '31' }}
-
+      # 基本快取設定
+      # FORCE_FULL_CACHE_REFRESH=1：
+      # 不讀舊快取，但跑完仍會重建並寫入新快取。
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '不使用快取重新抓完整資料') && '1' || '0' }}
 
-      # 固定追蹤：9661 富邦-新店、9A9J 永豐金-板新
-      STOCK_LIMIT: "0"
-      INCLUDE_ETF: "0"
-      REFRESH_STOCK_LIST: "1"
+      # 分批儲存快取，避免程式跑一半失敗後下次又全部重抓。
+      HISTORY_BATCH_SAVE_EVERY: "1000"
 
-      CAPTURE_ALL_TOP15: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && '1' || '0' }}
+      OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
+      OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
 
-      # Google Sheet：直接寫入「股票現貨籌碼」，不讀 GOOGLE_SHEET_ID / GOOGLE_SHEET_NAME secret
+      # 分點模式
+      # 每日產圖 = 精選5分點 RUN_MODE=1
+      # 完整回補 / 不使用快取完整重抓 = 完整分點清單 RUN_MODE=2
+      RUN_MODE: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '2' || '1' }}
+
+      # OpenAPI 今日有成交權證預篩天數
+      # 每日產圖雖然只跑 5 分點，但因為已強制全候選完整追蹤，所以這裡維持較小值即可；
+      # 完整回補用最近 3 天提高完整性。
+      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '3' || '1' }}
+
+      # 每次都重新抓 OpenAPI + API4，避免錯過今天新權證。
+      ACTIVE_WARRANT_FORCE_REFRESH: "1"
+
+      # 關鍵修正：
+      # 精選5分點模式也抓完整 API5 歷史，避免 TOP15 因資料不足而少算。
+      DAILY_SIGNAL_API5_DAYS: "250"
+
+      # 完整回補模式：新候選抓完整歷史；既有候選補最近 5 筆。
+      INITIAL_HISTORY_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '750' || '250' }}
+      DAILY_UPDATE_DAYS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '5' || '3' }}
+
+      # 歷史快取 append / merge 保護，一定要保留，避免 Google Sheet 舊資料被洗掉。
+      HISTORY_CACHE_APPEND_ONLY: "1"
+      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+
+      # 每日產圖也要抓圖片需要的價格；完整回補也抓完整價格。
+      SKIP_PRICE_FETCH: "0"
+
+      # 每日產圖只補 今日_* 需要的價格；完整回補補完整歷史缺價。
+      PRICE_FETCH_SCOPE: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && 'full' || 'today' }}
+
+      # 主程式仍保留完整歷史主表邏輯；每日產圖模式會提前只輸出 今日_*，不重算主表。
+      REPORT_FULL_HISTORY: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '1' || '0' }}
+      TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
+      DATA_UPDATE_ONLY: "0"
+
+      # 關鍵修正：
+      # 精選5分點模式必須絕對完整，不能只靠 prescan 候選。
+      # 啟用後會建立「所有認購權證 × 精選5分點」候選池，
+      # 並每次都對這些候選用 API5 更新，確保 TOP15 不少算。
+      SELECTED_FORCE_ALL_WARRANTS: "1"
+      SELECTED_REFRESH_ALL_WARRANTS: "1"
+
+      # 不抓群組事件每一檔權證價格，只看標的股價格。
+      FETCH_GROUP_WARRANT_PRICES: "0"
+
+      # 保留相容舊設定，不作為主要跳過依據。
+      FAST_SKIP_RECENT_PRESCAN: "0"
+      CACHE_RECENT_SCAN_DAYS: "3"
+
+      # Google Sheet 設定
+      GSHEET_ENABLE: "1"
+      GSHEET_UPLOAD_RESULTS: "1"
+      GSHEET_NAME: "權證分點籌碼"
+      GOOGLE_SHEET_NAME: "權證分點籌碼"
       GSHEET_CACHE_ENABLED: "1"
       GSHEET_RESULT_ENABLED: "1"
-      GOOGLE_SHEET_NAME: "股票現貨籌碼"
+
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      MAX_WORKERS: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && '30' || '18' }}
-      STOCK_BRANCH_WORKERS: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與統計' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) && '30' || '18' }}
+      # 執行緒設定
+      MAX_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
+      PRICE_WORKERS: "60"
+      PRESCAN_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '10 9 * * 1-5')) && '60' || '80' }}
+      FIND_BROKER_WORKERS: "40"
 
     steps:
       - name: Checkout repository
@@ -68,25 +138,25 @@ jobs:
       - name: Restore local cache backup
         uses: actions/cache@v4
         with:
-          path: stock_branch_cache
-          key: stock-branch-cache-${{ runner.os }}-${{ github.run_id }}
+          path: warrant_cache
+          key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            stock-branch-cache-${{ runner.os }}-
+            warrant-cache-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas openpyxl gspread google-auth lxml html5lib
+          pip install -r requirements.txt
 
-      - name: Run stock branch backtest
+      - name: Run warrant backtest
         run: |
           mkdir -p output
-          python stock_branch_backtest.py
+          python warrant_backtest.py
 
       - name: Upload Excel artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-branch-output
+          name: warrant-backtest-excel
           path: output/*.xlsx
           if-no-files-found: ignore
