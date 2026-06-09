@@ -122,9 +122,6 @@ SELECTED_TARGET_LABELS_DEFAULT = [
     "富邦敦南",
     "永豐金內湖",
     "永豐金竹北",
-    "第一金中壢",
-    "第一金",
-    "群益東大",
 ]
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
