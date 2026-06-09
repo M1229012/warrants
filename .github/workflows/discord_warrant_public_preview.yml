@@ -12,9 +12,9 @@ on:
         default: ""
 
   schedule:
-    # 台灣時間週一～週五 17:45
+    # 台灣時間週一～週五 14:45
     # UTC = 台灣時間 - 8 小時
-    - cron: "45 09 * * 1-5"
+    - cron: "45 06 * * 1-5"
 
 jobs:
   send-public-preview-report:
