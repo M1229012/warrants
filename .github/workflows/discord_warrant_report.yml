@@ -19,8 +19,8 @@ on:
           - "全部圖片"
 
   schedule:
-    # 台灣時間 17:30 = UTC 09:30
-    - cron: "30 09 * * 1-5"
+    # 台灣時間 14:30 = UTC 06:30
+    - cron: "30 06 * * 1-5"
 
 jobs:
   send-discord-report:
