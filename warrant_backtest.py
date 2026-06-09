@@ -2527,6 +2527,296 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
     _gsheet_batch_update(requests)
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# Google Sheet 結果同步：補充 / 更新模式
+# ══════════════════════════════════════════════════════════════════════
+
+GSHEET_RESULT_UPSERT_ENABLED = os.getenv("GSHEET_RESULT_UPSERT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_LEGACY_SCOPE_LABEL = os.getenv("GSHEET_LEGACY_SCOPE_LABEL", "未標記舊資料").strip() or "未標記舊資料"
+
+GSHEET_RESULT_UPSERT_TITLES = {
+    "A_單檔大買",
+    "B_同標的單日合計",
+    "C_同標的3日累積",
+    "每日賣出明細",
+    "近兩月買賣金額排行",
+    "近兩月分點數排行",
+    TOP15_POSITION_DETAIL_SHEET,
+    TOP15_CONSENSUS_SHEET,
+    WARRANT_CONSENSUS_7D_SHEET,
+}
+
+GSHEET_RESULT_OVERWRITE_TITLES = {
+    "券商查詢",
+    "券商查詢資料",
+    "價格抓取狀態",
+    "顏色說明",
+}
+
+
+def get_result_data_scope():
+    """
+    Google Sheet 結果同步用的資料範圍標籤。
+
+    目的：
+    - RUN_MODE=1 跑精選五分點時，只更新「資料範圍=精選五分點」的資料。
+    - RUN_MODE=2 跑完整分點時，只更新「資料範圍=全分點」的資料。
+    - 同一張 Google Sheet 內不同資料範圍可以並存，避免五分點覆蓋全分點資料。
+    """
+    return "精選五分點" if RUN_MODE == 1 else "全分點"
+
+
+def should_upsert_result_sheet(title):
+    title = safe_worksheet_title(title)
+
+    if not GSHEET_RESULT_UPSERT_ENABLED:
+        return False
+
+    if title in GSHEET_RESULT_OVERWRITE_TITLES:
+        return False
+
+    if title in GSHEET_RESULT_UPSERT_TITLES:
+        return True
+
+    if title.startswith("D_近") and "日累積淨買進" in title:
+        return True
+
+    return False
+
+
+def read_existing_worksheet_values(title):
+    try:
+        sh = get_gsheet_spreadsheet()
+        if sh is None:
+            return []
+        ws = sh.worksheet(safe_worksheet_title(title))
+        values = ws.get_all_values()
+        return values or []
+    except Exception:
+        return []
+
+
+def _find_simple_header_row(values):
+    if not values:
+        return None
+
+    scan_limit = min(len(values), 10)
+    key_headers = {
+        "統計日期", "事件類型", "日期", "排名", "權證代號", "標的股", "分點",
+        "買進金額", "賣出金額", "淨買超成本", "排名類型",
+    }
+
+    for idx in range(scan_limit):
+        row = [str(x).strip() for x in values[idx]]
+        non_empty = [x for x in row if x]
+        if not non_empty:
+            continue
+        if len(set(row) & key_headers) >= 2:
+            return idx
+
+    return 0 if values and any(str(x).strip() for x in values[0]) else None
+
+
+def _values_to_records(values, header_row_idx=0, default_scope=None):
+    if not values or header_row_idx is None or header_row_idx >= len(values):
+        return [], []
+
+    headers = [str(h).strip() for h in values[header_row_idx]]
+    if not headers or all(h == "" for h in headers):
+        return [], []
+
+    # 去掉尾端完全空白表頭，避免 Google Sheet 舊資料多出空欄造成 key 錯亂。
+    while headers and headers[-1] == "":
+        headers.pop()
+
+    records = []
+    for raw_row in values[header_row_idx + 1:]:
+        row = list(raw_row)
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
+        elif len(row) > len(headers):
+            row = row[:len(headers)]
+
+        if not any(str(v).strip() for v in row):
+            continue
+
+        rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(headers)}
+        if default_scope is not None:
+            rec["資料範圍"] = str(rec.get("資料範圍", "") or default_scope).strip()
+        records.append(rec)
+
+    return headers, records
+
+
+def _records_to_values(headers, records):
+    out = [list(headers)]
+    for rec in records:
+        out.append([rec.get(h, "") for h in headers])
+    return out
+
+
+def _ensure_scope_header(headers):
+    headers = [str(h).strip() for h in headers]
+    if "資料範圍" not in headers:
+        return ["資料範圍"] + headers
+    return headers
+
+
+def _sheet_upsert_key_columns(title, headers):
+    title = safe_worksheet_title(title)
+    hset = set(headers)
+
+    def keep(cols):
+        return [c for c in cols if c in hset]
+
+    if title == TOP15_CONSENSUS_SHEET:
+        return keep(["資料範圍", "統計日期", "標的股"])
+
+    if title == TOP15_POSITION_DETAIL_SHEET:
+        return keep(["資料範圍", "統計日期", "分點", "券商代號", "標的股", "權證代號", "事件", "事件日", "買進日"])
+
+    if title == WARRANT_CONSENSUS_7D_SHEET:
+        return keep(["資料範圍", "統計日期", "排名類型", "權證代號", "標的股"])
+
+    if title == "A_單檔大買":
+        return keep(["資料範圍", "事件類型", "分點", "權證代號", "買進日"])
+
+    if title == "B_同標的單日合計":
+        return keep(["資料範圍", "事件類型", "分點", "標的股", "事件日", "權證清單"])
+
+    if title == "C_同標的3日累積":
+        return keep(["資料範圍", "事件類型", "分點", "標的股", "起始日", "結束日", "權證清單"])
+
+    if title.startswith("D_近") and "日累積淨買進" in title:
+        return keep(["資料範圍", "事件類型", "分點", "標的股", "起始日", "結束日", "權證清單"])
+
+    if title == "每日賣出明細":
+        return keep(["資料範圍", "日期", "分點", "券商代號", "標的股", "權證代號", "事件", "狀態", "事件日"])
+
+    if title == "近兩月買賣金額排行":
+        return keep(["資料範圍", "權證代號", "買進分點"])
+
+    if title == "近兩月分點數排行":
+        return keep(["資料範圍", "標的股", "買進分點清單"])
+
+    # 通用備援：至少要有資料範圍，加上一些穩定欄位。
+    cols = keep([
+        "資料範圍", "統計日期", "日期", "事件類型", "分點", "券商代號",
+        "標的股", "權證代號", "買進日", "事件日", "起始日", "結束日",
+        "排名類型",
+    ])
+    return cols if len(cols) >= 2 else []
+
+
+def _record_key(rec, key_cols):
+    parts = []
+    for col in key_cols:
+        value = rec.get(col, "")
+        if col in ("日期", "統計日期", "買進日", "事件日", "起始日", "結束日", "第一筆日期", "最後筆日期"):
+            value = normalize_date_str(strip_gsheet_text_prefix(value))
+        else:
+            value = strip_gsheet_text_prefix(value)
+        parts.append(str(value).strip())
+    return tuple(parts)
+
+
+def merge_result_values_for_gsheet(title, new_values):
+    """
+    將本次 Excel 結果與 Google Sheet 既有結果做 upsert 合併。
+
+    規則：
+    - 本次資料會加上「資料範圍」：精選五分點 / 全分點。
+    - 舊資料若沒有「資料範圍」，會保留為「未標記舊資料」，不會被本次資料誤覆蓋。
+    - key 重複時，以本次新資料為準。
+    - key 不重複時，舊資料保留在工作表中。
+    """
+    if not should_upsert_result_sheet(title):
+        return new_values
+
+    header_row_idx = _find_simple_header_row(new_values)
+    if header_row_idx is None:
+        return new_values
+
+    if header_row_idx != 0:
+        # 目前只對第一列就是表頭的資料表啟用 upsert。
+        # 多段式報表例如勝率統計、ABCD組合勝率，仍維持原本覆蓋模式，避免破壞版面與公式。
+        return new_values
+
+    current_scope = get_result_data_scope()
+    new_headers, new_records = _values_to_records(new_values, header_row_idx=0, default_scope=current_scope)
+    if not new_headers:
+        return new_values
+
+    new_headers = _ensure_scope_header(new_headers)
+    for rec in new_records:
+        rec["資料範圍"] = current_scope
+
+    old_values = read_existing_worksheet_values(title)
+    old_headers, old_records = _values_to_records(old_values, header_row_idx=0, default_scope=GSHEET_LEGACY_SCOPE_LABEL)
+    old_headers = _ensure_scope_header(old_headers) if old_headers else []
+
+    headers = []
+    for h in new_headers + old_headers:
+        h = str(h).strip()
+        if h and h not in headers:
+            headers.append(h)
+
+    if not headers:
+        return new_values
+
+    key_cols = _sheet_upsert_key_columns(title, headers)
+    if not key_cols or "資料範圍" not in key_cols:
+        return new_values
+
+    old_map = {}
+    old_order = []
+    for rec in old_records:
+        if not rec.get("資料範圍"):
+            rec["資料範圍"] = GSHEET_LEGACY_SCOPE_LABEL
+        key = _record_key(rec, key_cols)
+        if not any(key):
+            continue
+        if key not in old_map:
+            old_order.append(key)
+        old_map[key] = rec
+
+    new_map = {}
+    new_order = []
+    for rec in new_records:
+        rec["資料範圍"] = current_scope
+        key = _record_key(rec, key_cols)
+        if not any(key):
+            continue
+        if key not in new_map:
+            new_order.append(key)
+        new_map[key] = rec
+
+    merged_records = []
+    used_keys = set()
+
+    # 本次資料排在最前面，畫面上可以優先看到最新結果。
+    for key in new_order:
+        merged_records.append(new_map[key])
+        used_keys.add(key)
+
+    # 舊資料中沒有被本次 key 覆蓋的保留下來，避免五分點覆蓋全分點。
+    for key in old_order:
+        if key in used_keys:
+            continue
+        merged_records.append(old_map[key])
+        used_keys.add(key)
+
+    merged_values = _records_to_values(headers, merged_records)
+
+    print(
+        f"  ☁️ Google Sheet upsert：{safe_worksheet_title(title)}｜"
+        f"資料範圍={current_scope}｜本次 {len(new_records):,} 筆｜舊資料 {len(old_records):,} 筆｜合併後 {len(merged_records):,} 筆"
+    )
+
+    return merged_values
+
+
 def upload_excel_to_google_sheet(xlsx_path):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -2552,6 +2842,7 @@ def upload_excel_to_google_sheet(xlsx_path):
             if not values:
                 values = [[""]]
 
+            values = merge_result_values_for_gsheet(title, values)
             values = normalize_result_values_for_comma_numbers(values)
 
             max_cols = max(max((len(row) for row in values), default=1), 1)
@@ -2574,6 +2865,7 @@ def upload_excel_to_google_sheet(xlsx_path):
 
     except Exception as e:
         print(f"  ⚠️ Excel 同步 Google Sheet 失敗：{type(e).__name__}: {e}")
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -5796,6 +6088,7 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             return_text = "-" if return_pct_float is None else f"{return_pct_float:+.2f}%"
 
         detail_rows.append({
+            "資料範圍": get_result_data_scope(),
             "統計日期": target_date,
             "統計期間": period_text,
             "有效交易日數": len(recent_dates),
@@ -5875,6 +6168,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
 
         key = underlying
         rec = agg.setdefault(key, {
+            "資料範圍": row.get("資料範圍", get_result_data_scope()),
             "統計日期": row.get("統計日期", ""),
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
@@ -6002,6 +6296,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             })
 
         rows.append({
+            "資料範圍": rec.get("資料範圍", get_result_data_scope()),
             "統計日期": rec.get("統計日期", ""),
             "統計期間": rec.get("統計期間", ""),
             "有效交易日數": rec.get("有效交易日數", ""),
@@ -6038,7 +6333,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
     ws = wb.create_sheet(TOP15_POSITION_DETAIL_SHEET)
 
     headers = [
-        "統計日期", "統計期間", "有效交易日數",
+        "資料範圍", "統計日期", "統計期間", "有效交易日數",
         "分點", "分點名稱", "券商代號",
         "標的股", "標的名稱",
         "事件", "事件類型", "事件日", "買進日",
@@ -6056,7 +6351,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
     for row in detail_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 24, 12, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 14, 14, 10, 12, 10, 10, 44, 16, 20]
+    col_widths = [12, 12, 24, 12, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 14, 14, 10, 12, 10, 10, 44, 16, 20]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="價格狀態")
 
 
@@ -6065,7 +6360,7 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     ws = wb.create_sheet(TOP15_CONSENSUS_SHEET)
 
     headers = [
-        "統計日期", "統計期間", "有效交易日數", "排名",
+        "資料範圍", "統計日期", "統計期間", "有效交易日數", "排名",
         "標的股", "標的名稱",
         "淨買超成本", "可估成本", "缺價格成本",
         "目前市值", "未實現損益", "報酬率", "報酬率文字",
@@ -6081,7 +6376,7 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     for row in consensus_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 24, 12, 8, 10, 12, 14, 14, 14, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60, 12, 10, 10, 20, 16, 80]
+    col_widths = [12, 12, 24, 12, 8, 10, 12, 14, 14, 14, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60, 12, 10, 10, 20, 16, 80]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="資料狀態")
 
 
@@ -8331,6 +8626,7 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             dates = sorted(rec.get("日期集合", set()))
 
             rows.append({
+                "資料範圍": get_result_data_scope(),
                 "統計日期": target_date,
                 "統計期間": period_text,
                 "統計天數": window_days,
@@ -8382,7 +8678,7 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
     ws = wb.create_sheet(WARRANT_CONSENSUS_7D_SHEET)
 
     headers = [
-        "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
+        "資料範圍", "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "排名類型", "排名",
         "權證代號", "權證名稱", "標的股", "標的名稱",
         "排名金額", "買進金額", "賣出金額", "淨買超金額", "淨賣超金額",
@@ -8396,7 +8692,7 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
     for row in rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 24, 10, 12, 12, 12, 12, 8, 12, 24, 10, 12, 14, 14, 14, 14, 14, 14, 14, 12, 12, 12, 56, 10, 20, 16, 90]
+    col_widths = [12, 12, 24, 10, 12, 12, 12, 12, 8, 12, 24, 10, 12, 14, 14, 14, 14, 14, 14, 14, 12, 12, 12, 56, 10, 20, 16, 90]
     thin_gray = Side(style="thin", color="B7B7B7")
     normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
 
