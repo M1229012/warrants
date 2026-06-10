@@ -3065,7 +3065,7 @@ def normalize_image_action(action_text: str) -> str:
     - 全部圖片
     """
     raw = str(action_text or "").strip()
-    key = re.sub(r"[\s_\-｜|/\]+", "", raw).lower()
+    key = re.sub(r"[\s_\-｜|/\\]+", "", raw).lower()
 
     if not key:
         return IMAGE_ACTION_DAILY_BUNDLE
