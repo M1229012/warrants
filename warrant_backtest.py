@@ -9372,7 +9372,8 @@ def _recent_buy_position_summary_for_item(item, start_dt, target_dt, latest_pric
     這個函式用完整歷史跑到統計日：
     - 每天先賣出扣 FIFO 舊庫存，再加入當天買進。
     - 只把「買進日落在近10日視窗內」且統計日尚未被賣掉的剩餘 lot 納入買超持倉報酬。
-    - 買超報酬 = (剩餘股數 × 最新權證價格 - 剩餘成本) / 剩餘成本。
+    - 買超報酬 = (有最新價格的剩餘股數 × 最新權證價格 - 有最新價格的剩餘成本) / 有最新價格的剩餘成本。
+    - 缺最新權證價格的剩餘部位不納入報酬率，改在明細備註統計省略檔數。
     """
     df = item.get("df", pd.DataFrame())
     if df is None or df.empty:
@@ -9534,6 +9535,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "買超目前市值": 0.0,
             "買超報酬有效權證數": 0,
             "買超報酬缺價權證數": 0,
+            "買超缺價省略權證清單": [],
             "賣超實現賣出金額": 0.0,
             "賣超實現成本": 0.0,
             "賣超成本不足金額": 0.0,
@@ -9616,15 +9618,18 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             market_value = top15_safe_float(position_summary.get("market_value", 0.0))
 
             if remaining_cost > 0:
-                rec["買超剩餘成本"] += remaining_cost
-                rec["買超剩餘股數"] += remaining_qty
-                rec["買超目前市值"] += market_value
-                rec["買超報酬權重"] += remaining_cost
-                rec["買超報酬加權分子"] += market_value - remaining_cost
-
                 if position_summary.get("missing_price"):
+                    # 缺最新權證價格的部位直接從買超平均報酬分子 / 分母排除，
+                    # 避免用 0 市值把整體報酬率不合理壓低。
                     rec["買超報酬缺價權證數"] += 1
+                    rec.setdefault("買超缺價省略權證清單", []).append(f"{warrant_code} {warrant_name}".strip())
+                    warrant_rec["買超報酬省略原因"] = "缺最新權證價格，未納入買超平均報酬"
                 else:
+                    rec["買超剩餘成本"] += remaining_cost
+                    rec["買超剩餘股數"] += remaining_qty
+                    rec["買超目前市值"] += market_value
+                    rec["買超報酬權重"] += remaining_cost
+                    rec["買超報酬加權分子"] += market_value - remaining_cost
                     rec["買超報酬有效權證數"] += 1
 
             warrant_rec["近10日買進剩餘股數"] = remaining_qty
@@ -9660,12 +9665,25 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         net_sell_qty = sell_qty - buy_qty
 
         buy_return_pct = None
-        if rec.get("買超剩餘成本", 0) > 0 and rec.get("買超目前市值", 0) > 0:
-            buy_return_pct = (rec["買超目前市值"] - rec["買超剩餘成本"]) / rec["買超剩餘成本"] * 100
+        buy_return_weight = float(rec.get("買超報酬權重", 0) or 0)
+        buy_return_numerator = float(rec.get("買超報酬加權分子", 0) or 0)
+
+        if buy_return_weight > 0:
+            # 買超平均報酬只使用「有最新價格」的剩餘部位；缺價部位已在上方省略。
+            buy_return_pct = buy_return_numerator / buy_return_weight * 100
+        elif buy_amount > 0:
+            # 近10日有買進但沒有任何可估剩餘部位時，仍給出 0.00%，避免勝率報酬空白。
+            buy_return_pct = 0.0
 
         sell_return_pct = None
-        if rec.get("賣超實現成本", 0) > 0:
-            sell_return_pct = (rec["賣超實現賣出金額"] - rec["賣超實現成本"]) / rec["賣超實現成本"] * 100
+        sell_realized_cost = float(rec.get("賣超實現成本", 0) or 0)
+        sell_realized_revenue = float(rec.get("賣超實現賣出金額", 0) or 0)
+
+        if sell_realized_cost > 0:
+            sell_return_pct = (sell_realized_revenue - sell_realized_cost) / sell_realized_cost * 100
+        elif sell_amount > 0:
+            # API 賣出資料異常或成本仍不足時，保守帶入 0.00%，確保賣超報酬率一定有值。
+            sell_return_pct = 0.0
 
         if net_buy_amount > 0:
             direction = "買超"
@@ -9678,12 +9696,30 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             win_return_pct = buy_return_pct if buy_return_pct is not None else sell_return_pct
 
         if win_return_pct is None:
-            result = "無法判定"
-        elif win_return_pct > 0:
+            win_return_pct = 0.0
+
+        if win_return_pct > 0:
             result = "勝"
         else:
             # 使用者指定 0% 要算賠錢，所以 <= 0 都是敗。
             result = "敗"
+
+        notes = []
+        missing_price_count = int(rec.get("買超報酬缺價權證數", 0) or 0)
+
+        if missing_price_count > 0:
+            notes.append(f"買超報酬已省略缺價權證 {missing_price_count} 檔")
+
+        if buy_amount > 0 and buy_return_weight <= 0:
+            if missing_price_count > 0:
+                notes.append("買超剩餘部位全數缺價或無可估價格，買超報酬以 0.00% 保守帶入")
+            else:
+                notes.append("近10日買進目前無可估剩餘部位，買超報酬以 0.00% 帶入")
+
+        if sell_amount > 0 and sell_realized_cost <= 0:
+            notes.append("賣超成本不足，賣超報酬以 0.00% 帶入")
+
+        note_text = "；".join(notes)
 
         warrant_rows = []
         warrant_json = []
@@ -9708,6 +9744,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
                 "近10日買進剩餘股數": round(float(w.get("近10日買進剩餘股數", 0) or 0), 0),
                 "近10日買進剩餘成本": round(float(w.get("近10日買進剩餘成本", 0) or 0), 0),
                 "近10日買進目前市值": round(float(w.get("近10日買進目前市值", 0) or 0), 0),
+                "買超報酬省略原因": w.get("買超報酬省略原因", ""),
                 "日期數": len(w.get("日期集合", set())),
             })
 
@@ -9747,6 +9784,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "賣超成本不足金額": round(float(rec.get("賣超成本不足金額", 0) or 0), 0),
             "用於勝率報酬%": _fmt_pct_text(win_return_pct, signed=True),
             "判定": result,
+            "備註": note_text,
             "分點近10日勝率": "-",
             "分點近10日勝筆數": 0,
             "分點近10日敗筆數": 0,
@@ -9800,7 +9838,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         "涉及權證檔數", "權證清單",
         "買超平均報酬%", "買超剩餘股數", "買超剩餘成本", "買超目前市值", "買超報酬有效權證數", "買超報酬缺價權證數",
         "賣超平均報酬%", "賣超實現賣出金額", "賣超實現成本", "賣超成本不足金額",
-        "用於勝率報酬%", "判定", "分點近10日勝率", "分點近10日勝筆數", "分點近10日敗筆數",
+        "用於勝率報酬%", "判定", "備註", "分點近10日勝率", "分點近10日勝筆數", "分點近10日敗筆數",
         "更新時間", "run_id", "權證明細_JSON",
     ]
 
@@ -9817,7 +9855,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         12, 72,
         14, 14, 16, 16, 14, 14,
         14, 16, 16, 16,
-        14, 10, 14, 14, 14,
+        14, 10, 36, 14, 14, 14,
         20, 18, 90,
     ]
 
