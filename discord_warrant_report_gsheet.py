@@ -58,7 +58,9 @@ TRACKED_BROKERS = [
 # 近10日分點買賣明細圖，只輸出指定四個分點。
 BROKER_10D_IMAGE_BROKERS = [
     "元大南屯",
-
+    "永豐金內湖",
+    "華南永昌台中",
+    "富邦敦南",
 ]
 
 DATA_SCOPE_SELECTED5 = os.getenv("DATA_SCOPE_SELECTED5", "精選五分點")
@@ -4254,6 +4256,9 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
             return GREEN
         return TEXT
 
+    def fmt_amount_wan(v):
+        return f"{safe_float(v, 0) / 10000:,.1f}"
+
     try:
         ax.text(
             0.5, 0.50, CENTER_WATERMARK_TEXT,
@@ -4280,7 +4285,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     text_draw(
         margin_x + 0.18,
         y,
-        f"統計期間：{period_text}｜單位：元",
+        f"統計期間：{period_text}｜統計日期：{cache_date_text}｜同標的全部權證合併統計｜顯示：買超TOP10、賣超TOP10｜單位：萬元",
         11.2,
         TEXT,
         BOLD,
@@ -4292,9 +4297,9 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     card_w = (summary_w - card_gap_x * 2) / 3
     card_y1 = y - 0.28 - summary_card_h
     summary_cards1 = [
-        ("買超TOP10合計", f"{display_buy_total:,.0f}", RED, None),
-        ("賣超TOP10合計", f"{display_sell_total:,.0f}", GREEN, None),
-        ("淨額(買超-賣超)", f"{display_net_total:,.0f}", NAVY2, None),
+        ("買超TOP10合計", fmt_amount_wan(display_buy_total), RED, None),
+        ("賣超TOP10合計", fmt_amount_wan(display_sell_total), GREEN, None),
+        ("淨額(買超-賣超)", fmt_amount_wan(display_net_total), NAVY2, None),
     ]
     for i, (label, value, color, extra) in enumerate(summary_cards1):
         x = summary_left + i * (card_w + card_gap_x)
@@ -4360,9 +4365,9 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 values = [
                     str(i),
                     r.get("target", ""),
-                    f"{safe_float(r.get('buy_amount'), 0):,.0f}",
-                    f"{safe_float(r.get('sell_amount'), 0):,.0f}",
-                    f"{net_value:,.0f}",
+                    fmt_amount_wan(r.get("buy_amount", 0)),
+                    fmt_amount_wan(r.get("sell_amount", 0)),
+                    fmt_amount_wan(net_value),
                     fmt_pct_plain(ret_val),
                 ]
                 colors = [TEXT, TEXT, RED, GREEN, net_color, ret_color]
