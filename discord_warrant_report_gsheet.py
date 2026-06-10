@@ -3382,11 +3382,13 @@ def merge_broker_10d_rows_by_underlying(rows: list[dict]) -> list[dict]:
         sell_amount = sum(safe_float(i.get("sell_amount"), 0) for i in items)
         net_amount = buy_amount - sell_amount
 
-        def weighted_return(return_key: str, amount_key: str):
+        def weighted_return(return_key: str, amount_key: str, direction_name: str):
             weighted_sum = 0.0
             weighted_amount = 0.0
             for item in items:
                 ret = normalize_return_pct(item.get(return_key))
+                if ret is None and str(item.get("direction", "")).strip() == direction_name:
+                    ret = normalize_return_pct(item.get("primary_return"))
                 amount = safe_float(item.get(amount_key), 0)
                 if ret is None or amount <= 0:
                     continue
@@ -3394,8 +3396,8 @@ def merge_broker_10d_rows_by_underlying(rows: list[dict]) -> list[dict]:
                 weighted_amount += amount
             return round(weighted_sum / weighted_amount, 2) if weighted_amount > 0 else None
 
-        buy_return = weighted_return("buy_return", "buy_amount")
-        sell_return = weighted_return("sell_return", "sell_amount")
+        buy_return = weighted_return("buy_return", "buy_amount", "買超")
+        sell_return = weighted_return("sell_return", "sell_amount", "賣超")
 
         warrant_parts = []
         warrant_seen = set()
@@ -3861,7 +3863,11 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "近10日淨賣超金額", "淨賣超金額",
         "買賣方向", "方向",
         "涉及權證檔數", "權證檔數", "權證清單",
-        "買超平均報酬%", "賣超平均報酬%",
+        "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率", "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
+        "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率", "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
+        "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+        "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+        "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
         "分點近10日敗筆數", "近10日敗筆數", "敗筆數",
@@ -3965,8 +3971,23 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             else:
                 direction = "持平"
 
-        buy_ret = normalize_return_pct(_pick_first_existing_value(row, ["買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超平均損益%"]))
-        sell_ret = normalize_return_pct(_pick_first_existing_value(row, ["賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超平均損益%"]))
+        buy_ret = normalize_return_pct(_pick_first_existing_value(row, [
+            "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率",
+            "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
+            "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+        ]))
+        sell_ret = normalize_return_pct(_pick_first_existing_value(row, [
+            "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率",
+            "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
+            "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+        ]))
+        generic_ret = normalize_return_pct(_pick_first_existing_value(row, [
+            "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
+        ]))
+        if buy_ret is None and direction == "買超":
+            buy_ret = generic_ret
+        if sell_ret is None and direction == "賣超":
+            sell_ret = generic_ret
         warrant_count = safe_int(_pick_first_existing_value(row, ["涉及權證檔數", "權證檔數"]), 0)
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"]))
@@ -4098,15 +4119,17 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     display_valid_count = display_win_count + display_loss_count
     display_win_rate = round(display_win_count / display_valid_count * 100, 2) if display_valid_count > 0 else None
 
-    fig_w = 14.2
-    margin_x = 0.36
-    content_w = fig_w - 2 * margin_x
-
-    # 近10日表格寬度集中管理。
-    # 上方兩排統計卡片會使用相同 left / width，避免與下方 TOP10 表格左右寬度不一致。
-    broker10d_table_col_w = [0.60, 3.15, 2.20, 2.20, 2.10, 1.60]
+    # 近10日圖片的重點不是只縮欄位，而是整個輸出畫布要跟表格寬度貼近。
+    # 否則即使表格本身不寬，只要 fig_w 太大，左右留白仍會非常巨大。
+    # 這裡改成先決定表格寬度，再反推整張圖寬度，讓表格約佔整體寬度 90% 左右。
+    broker10d_table_col_w = [0.52, 2.35, 1.62, 1.62, 1.55, 1.12]
     broker10d_table_w = sum(broker10d_table_col_w)
-    broker10d_table_left = margin_x + (content_w - broker10d_table_w) / 2
+
+    outer_pad_x = 0.32
+    fig_w = broker10d_table_w + outer_pad_x * 2
+    margin_x = outer_pad_x
+    content_w = fig_w - 2 * margin_x
+    broker10d_table_left = outer_pad_x
 
     top_h = 1.35
     summary_card_h = 0.88
@@ -4260,7 +4283,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
         margin_x + 0.18,
         y,
         f"統計期間：{period_text}｜統計日期：{cache_date_text}｜同標的全部權證合併統計｜顯示：買超TOP10、賣超TOP10｜單位：元",
-        12.6,
+        11.2,
         TEXT,
         BOLD,
     )
@@ -4315,7 +4338,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
         rect(left, header_y_top - header_h, table_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
         x = left
         for h, w in zip(headers, col_w):
-            text_draw(x + w / 2, header_y_top - header_h / 2, h, 11.6, NAVY, BOLD, ha="center")
+            text_draw(x + w / 2, header_y_top - header_h / 2, h, 11.0, NAVY, BOLD, ha="center")
             ax.plot([x, x], [y_top - sec_h, header_y_top], color=BORDER, linewidth=0.6)
             x += w
         ax.plot([left + table_w, left + table_w], [y_top - sec_h, header_y_top], color=BORDER, linewidth=0.6)
@@ -4351,11 +4374,11 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
                     fp = BOLD if is_bold else FONT
                     if a == "left":
-                        draw_clipped_text(x, ry + row_h / 2, w, val, size=12.5, color=c, fp=fp)
+                        draw_clipped_text(x, ry + row_h / 2, w, val, size=11.8, color=c, fp=fp)
                     else:
-                        display_val = fit_to_cell_width(val, max(0.2, w - 0.24), size=12.4, fp=fp)
-                        px = x + (w / 2 if a == "center" else w - 0.12)
-                        text_draw(px, ry + row_h / 2, display_val, 12.4, c, fp, ha=a)
+                        display_val = fit_to_cell_width(val, max(0.2, w - 0.20), size=11.8, fp=fp)
+                        px = x + (w / 2 if a == "center" else w - 0.10)
+                        text_draw(px, ry + row_h / 2, display_val, 11.8, c, fp, ha=a)
                     x += w
         return y_top - sec_h - section_gap
 
