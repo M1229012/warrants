@@ -49,7 +49,6 @@ DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower()
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
 MAX_WORKERS   = 50
-DAYS_HISTORY  = 250
 RECENT_RANKING_DAYS = 62
 SELL_DETAIL_DAYS = int(os.getenv("SELL_DETAIL_DAYS", "3"))
 D_WINDOW_DAYS = 10
@@ -125,7 +124,6 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 ]
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
-SELECTED_INITIAL_SCAN_DAYS = int(os.getenv("SELECTED_INITIAL_SCAN_DAYS", "40"))
 # RUN_MODE=1 精選 5 分點完整追蹤設定：
 # SELECTED_FORCE_ALL_WARRANTS=1：不再只靠 API4 prescan 候選，而是直接建立「所有認購權證 × 精選分點」候選池。
 # SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
@@ -3146,6 +3144,330 @@ def clear_all_number_formats_for_written_range(gws, values=None):
     # 後續 TEXT / DATE / NUMBER 專用函式會依實際表頭重新套正確格式。
     _gsheet_batch_update(requests)
 
+
+
+def _openpyxl_border_to_gsheet(cell):
+    """
+    只把 Excel 裡真正有設定的外框轉到 Google Sheet。
+
+    用途：保留「減碼獲利% / 出清獲利%」的粗紅 / 粗綠外框。
+    一般沒有外框的儲存格不處理，避免新增資料範圍欄位後破壞既有版面。
+    """
+    try:
+        border = cell.border
+    except Exception:
+        return None
+
+    if border is None:
+        return None
+
+    def side_to_gsheet(side):
+        try:
+            style = str(side.style or "").strip()
+        except Exception:
+            style = ""
+
+        if not style:
+            return None
+
+        style_map = {
+            "hair": "DOTTED",
+            "dotted": "DOTTED",
+            "dashDot": "DASHED",
+            "dashDotDot": "DASHED",
+            "dashed": "DASHED",
+            "mediumDashDot": "DASHED",
+            "mediumDashDotDot": "DASHED",
+            "mediumDashed": "DASHED",
+            "thin": "SOLID",
+            "medium": "SOLID_MEDIUM",
+            "thick": "SOLID_THICK",
+            "double": "DOUBLE",
+        }
+
+        out = {"style": style_map.get(style, "SOLID")}
+        color = _openpyxl_color_to_gsheet(getattr(side, "color", None))
+        if color:
+            out["color"] = color
+        return out
+
+    out = {}
+    for attr, gname in [
+        ("top", "top"),
+        ("bottom", "bottom"),
+        ("left", "left"),
+        ("right", "right"),
+    ]:
+        side_fmt = side_to_gsheet(getattr(border, attr, None))
+        if side_fmt:
+            out[gname] = side_fmt
+
+    return out or None
+
+
+def _cell_gsheet_visual_format(cell):
+    """
+    只同步視覺樣式，不同步 numberFormat。
+
+    目的：
+    1. 保留 A/B/C/D 原本 D+1～D+20 的紅綠藍橘配色。
+    2. 保留獲利欄位的粗紅 / 粗綠外框。
+    3. 不把 Excel 舊欄位位置的日期格式帶進 Google Sheet，避免「買進均價」再次變成 1899/12/30。
+    """
+    fmt = {}
+
+    bg = _openpyxl_fill_to_gsheet(cell)
+    if bg:
+        fmt["backgroundColor"] = bg
+
+    text_format = _openpyxl_font_to_gsheet(cell)
+    if text_format:
+        fmt["textFormat"] = text_format
+
+    align_format = _openpyxl_alignment_to_gsheet(cell)
+    fmt.update(align_format)
+
+    borders = _openpyxl_border_to_gsheet(cell)
+    if borders:
+        fmt["borders"] = borders
+
+    return fmt
+
+
+def _format_fields_visual(fmt):
+    fields = []
+
+    if "backgroundColor" in fmt:
+        fields.append("userEnteredFormat.backgroundColor")
+    if "textFormat" in fmt:
+        for key in fmt["textFormat"].keys():
+            fields.append(f"userEnteredFormat.textFormat.{key}")
+    if "horizontalAlignment" in fmt:
+        fields.append("userEnteredFormat.horizontalAlignment")
+    if "verticalAlignment" in fmt:
+        fields.append("userEnteredFormat.verticalAlignment")
+    if "wrapStrategy" in fmt:
+        fields.append("userEnteredFormat.wrapStrategy")
+    if "borders" in fmt:
+        fields.append("userEnteredFormat.borders")
+
+    return ",".join(fields)
+
+
+def _source_record_key_to_excel_row_map(title, source_values, final_headers):
+    """
+    建立 upsert 後資料列 key -> 原 Excel row number 對照。
+
+    upsert 會把「資料範圍」插到最左邊，但原本 Excel 沒有這欄。
+    這個 mapping 用 key 找回原 Excel 列，讓 Google Sheet 可以照原 Excel 的狀態色套回去，
+    而不是用錯位的欄位位置硬套樣式。
+    """
+    header_row_idx = _find_simple_header_row(source_values)
+    if header_row_idx is None:
+        return {}, []
+
+    source_headers = [str(h).strip() for h in source_values[header_row_idx]]
+    while source_headers and source_headers[-1] == "":
+        source_headers.pop()
+
+    key_cols = _sheet_upsert_key_columns(title, final_headers)
+    if not key_cols:
+        return {}, source_headers
+
+    current_scope = get_result_data_scope()
+    out = {}
+
+    for offset, raw_row in enumerate(source_values[header_row_idx + 1:], start=header_row_idx + 2):
+        row = list(raw_row)
+        if len(row) < len(source_headers):
+            row = row + [""] * (len(source_headers) - len(row))
+        elif len(row) > len(source_headers):
+            row = row[:len(source_headers)]
+
+        if not any(str(v).strip() for v in row):
+            continue
+
+        rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(source_headers)}
+        rec["資料範圍"] = str(rec.get("資料範圍", "") or current_scope).strip()
+        key = _record_key(rec, key_cols)
+        if any(key):
+            out[key] = offset
+
+    return out, source_headers
+
+
+def _dplus_status_format_from_text(value):
+    """
+    依 D+ 欄位文字補回基本紅綠色。
+
+    這只是保護機制：
+    - 本次新資料會優先從原 Excel 樣式精準套回紅 / 綠 / 藍 / 橘。
+    - 舊資料沒有原 Excel 樣式可參照時，至少依文字中的正負報酬補回紅綠底色。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+
+    nums = []
+    for m in re.finditer(r"([+-]?\d+(?:\.\d+)?)%", s):
+        try:
+            nums.append(float(m.group(1)))
+        except Exception:
+            pass
+
+    if not nums:
+        return None
+
+    # 只要有正報酬，就以台股習慣用紅色；否則用綠色。
+    fill = RED if any(v > 0 for v in nums) else GREEN
+    color = _openpyxl_color_to_gsheet(fill.fgColor)
+    if not color:
+        return None
+
+    return {
+        "backgroundColor": color,
+        "horizontalAlignment": "CENTER",
+        "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "WRAP",
+        "textFormat": {"foregroundColor": {"red": 0, "green": 0, "blue": 0}},
+    }
+
+
+def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_values=None, final_values=None, title=""):
+    """
+    upsert 工作表專用：在不套錯日期 / 數字格式的前提下，把原本 Excel 的配色套回 Google Sheet。
+
+    修正重點：
+    - 不再因為新增「資料範圍」欄位而放棄原本配色。
+    - 透過表頭名稱與 upsert key 對齊原 Excel 列，避免欄位位移。
+    - 只套背景色、字型、對齊與外框；numberFormat 仍交給後面的日期 / 數字專用函式處理。
+    """
+    if gws is None or ws_xlsx is None or not source_values or not final_values:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    title = safe_worksheet_title(title)
+    final_header_row_idx = _find_simple_header_row(final_values)
+    if final_header_row_idx is None:
+        return
+
+    final_headers = [str(h).strip() for h in final_values[final_header_row_idx]]
+    while final_headers and final_headers[-1] == "":
+        final_headers.pop()
+
+    source_key_to_row, source_headers = _source_record_key_to_excel_row_map(title, source_values, final_headers)
+    if not final_headers:
+        return
+
+    source_col_by_header = {h: idx + 1 for idx, h in enumerate(source_headers) if h}
+    key_cols = _sheet_upsert_key_columns(title, final_headers)
+    if not key_cols:
+        return
+
+    current_scope = get_result_data_scope()
+    requests = []
+
+    # 先處理表頭：如果原 Excel 表頭有黃底等樣式，依欄名套回；資料範圍欄則維持安全樣式。
+    for final_col_idx, header in enumerate(final_headers, start=1):
+        source_col_idx = source_col_by_header.get(header)
+        if not source_col_idx:
+            continue
+
+        src_cell = ws_xlsx.cell(1, source_col_idx)
+        fmt = _cell_gsheet_visual_format(src_cell)
+        fields = _format_fields_visual(fmt)
+        if fmt and fields:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": final_header_row_idx,
+                        "endRowIndex": final_header_row_idx + 1,
+                        "startColumnIndex": final_col_idx - 1,
+                        "endColumnIndex": final_col_idx,
+                    },
+                    "cell": {"userEnteredFormat": fmt},
+                    "fields": fields,
+                }
+            })
+
+    final_records = []
+    for raw_row in final_values[final_header_row_idx + 1:]:
+        row = list(raw_row)
+        if len(row) < len(final_headers):
+            row = row + [""] * (len(final_headers) - len(row))
+        elif len(row) > len(final_headers):
+            row = row[:len(final_headers)]
+
+        rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(final_headers)}
+        final_records.append((row, rec))
+
+    import json as _json
+
+    for row_offset, (row_values, rec) in enumerate(final_records, start=final_header_row_idx + 2):
+        rec_scope = str(strip_gsheet_text_prefix(rec.get("資料範圍", ""))).strip()
+        key = _record_key(rec, key_cols)
+        src_excel_row = source_key_to_row.get(key)
+
+        run_start = None
+        run_fmt = None
+        run_key = None
+
+        for final_col_idx in range(1, len(final_headers) + 2):
+            fmt = None
+            if final_col_idx <= len(final_headers):
+                header = final_headers[final_col_idx - 1]
+                source_col_idx = source_col_by_header.get(header)
+
+                if src_excel_row and source_col_idx and rec_scope == current_scope:
+                    src_cell = ws_xlsx.cell(src_excel_row, source_col_idx)
+                    fmt = _cell_gsheet_visual_format(src_cell)
+                elif str(header).startswith("D+"):
+                    # 舊資料或沒有對到原 Excel key 的資料，至少補回 D+ 欄位紅綠底色。
+                    cell_value = row_values[final_col_idx - 1] if final_col_idx - 1 < len(row_values) else ""
+                    fmt = _dplus_status_format_from_text(cell_value)
+
+            key_json = _json.dumps(fmt, sort_keys=True, ensure_ascii=False) if fmt else None
+
+            if key_json and run_key is None:
+                run_start = final_col_idx
+                run_fmt = fmt
+                run_key = key_json
+            elif key_json and key_json == run_key:
+                continue
+            else:
+                if run_key and run_start is not None and run_fmt:
+                    fields = _format_fields_visual(run_fmt)
+                    if fields:
+                        requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": row_offset - 1,
+                                    "endRowIndex": row_offset,
+                                    "startColumnIndex": run_start - 1,
+                                    "endColumnIndex": final_col_idx - 1,
+                                },
+                                "cell": {"userEnteredFormat": run_fmt},
+                                "fields": fields,
+                            }
+                        })
+
+                if key_json:
+                    run_start = final_col_idx
+                    run_fmt = fmt
+                    run_key = key_json
+                else:
+                    run_start = None
+                    run_fmt = None
+                    run_key = None
+
+    _gsheet_batch_update(requests)
+
 def upload_excel_to_google_sheet(xlsx_path):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -3171,6 +3493,7 @@ def upload_excel_to_google_sheet(xlsx_path):
             if not values:
                 values = [[""]]
 
+            source_values = [list(row) for row in values]
             values = merge_result_values_for_gsheet(title, values)
             values = normalize_result_values_for_comma_numbers(values)
 
@@ -3179,10 +3502,21 @@ def upload_excel_to_google_sheet(xlsx_path):
 
             if write_values_to_worksheet(gws, values):
                 if should_upsert_result_sheet(title):
-                    # upsert 表會新增「資料範圍」欄，不能再照原 Excel 欄位位置套樣式，
-                    # 否則買進均價 / 出清獲利% 等欄位會被錯套成日期。
+                    # upsert 表會新增「資料範圍」欄，不能再照原 Excel 欄位位置硬套 numberFormat。
+                    # 但原本 A/B/C/D 的 D+ 紅綠藍橘配色必須保留，所以改成：
+                    # 1. 先清掉舊錯誤 numberFormat
+                    # 2. 套基本表格樣式
+                    # 3. 依 upsert key 與表頭名稱，把原 Excel 視覺配色精準套回來
+                    # 4. 最後再依實際 Google Sheet 表頭重套文字 / 數字 / 日期格式
                     clear_all_number_formats_for_written_range(gws, values=values)
                     apply_safe_result_table_style_to_gsheet(gws, values=values)
+                    apply_upsert_original_excel_visual_style_to_gsheet(
+                        ws_xlsx,
+                        gws,
+                        source_values=source_values,
+                        final_values=values,
+                        title=title,
+                    )
                     apply_text_format_to_gsheet(gws, values)
                     apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
                     apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
@@ -3949,9 +4283,6 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
     return "", ""
 
 
-def find_underlying(warrant_name, stock_map):
-    code, _ = find_underlying_info(warrant_name, stock_map)
-    return code
 
 
 def get_all_call_warrants_live():
@@ -4561,69 +4892,10 @@ def make_daily_key(broker_code, underlying_code, date, warrant_code):
     )
 
 
-def make_a_exclude_keys(a_events):
-    """
-    A > B > C 去重：
-    已經被 A 單檔大買抓到的「券商分點 + 標的股 + 日期 + 權證」
-    不再進入 B / C 的同標的合計買超判斷。
-    """
-    keys = set()
-
-    for ev in a_events:
-        if not ev.get("標的股"):
-            continue
-
-        keys.add(make_daily_key(
-            ev.get("券商代號"),
-            ev.get("標的股"),
-            ev.get("買進日"),
-            ev.get("權證代號"),
-        ))
-
-    return keys
 
 
-def make_b_exclude_keys(b_events):
-    """
-    A > B > C 去重：
-    已經被 B 同標的單日合計買超抓到的資料，
-    不再進入 C 的 3 日累積買超判斷。
-    """
-    keys = set()
-
-    for ev in b_events:
-        broker_code = ev.get("券商代號")
-        underlying_code = ev.get("標的股")
-
-        for lot in ev.get("lots", []):
-            keys.add(make_daily_key(
-                broker_code,
-                underlying_code,
-                lot.get("買進日"),
-                lot.get("權證代號"),
-            ))
-
-    return keys
 
 
-def filter_daily_records(daily_records, exclude_keys):
-    if not exclude_keys:
-        return daily_records
-
-    filtered = []
-
-    for row in daily_records:
-        key = make_daily_key(
-            row.get("券商代號"),
-            row.get("標的股"),
-            row.get("日期"),
-            row.get("權證代號"),
-        )
-
-        if key not in exclude_keys:
-            filtered.append(row)
-
-    return filtered
 
 
 
@@ -5174,13 +5446,6 @@ def build_c_events(daily_records, item_map):
     return events
 
 
-def make_c_exclude_keys(c_events):
-    """
-    A > B > C > D 去重：
-    已經被 C 同標的 3 日累積買超抓到的資料，
-    不再進入 D 的近 N 日累積淨買進判斷。
-    """
-    return make_b_exclude_keys(c_events)
 
 
 # ══════════════════════════════════════════════════════════════════════
