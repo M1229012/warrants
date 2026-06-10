@@ -3120,6 +3120,241 @@ def _warrant_consensus_warrant_count(value) -> int:
     return 1
 
 
+def _parse_cache_update_datetime(value):
+    """解析快取工作表的更新時間，供同一統計日期挑選最新快照使用。"""
+    raw = strip_gsheet_text_prefix(value)
+    if not raw or raw == "-":
+        return None
+
+    try:
+        ts = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def filter_latest_cache_snapshot(df: pd.DataFrame, cache_name: str = "快取") -> pd.DataFrame:
+    """
+    同一個統計日期的快取表可能因為 GitHub Action 重跑而累積多個 run_id。
+
+    圖片端若只用「統計日期」過濾，會把舊 run 與新 run 一起讀進來，
+    造成 TOP15 / TOP10 出現同標的重複列。
+
+    處理方式：
+    1. 優先用 run_id 挑出最新一批快照。
+    2. 最新 run_id 的判斷以「更新時間」最大者為準；沒有可解析更新時間時，
+       用 run_id 字串排序作為備援。
+    3. 若工作表沒有 run_id，則不硬切更新時間，避免同一批資料各列更新秒數不同時誤刪。
+       後續仍會再用標的層級去重 / 合併。
+    """
+    if df is None or df.empty or "run_id" not in df.columns:
+        return df
+
+    best_run_id = ""
+    best_score = None
+
+    for _, row in df.iterrows():
+        run_id = strip_gsheet_text_prefix(row.get("run_id", "")).strip()
+        if not run_id:
+            continue
+
+        update_dt = _parse_cache_update_datetime(row.get("更新時間", "")) if "更新時間" in df.columns else None
+        update_score = update_dt.timestamp() if update_dt else float("-inf")
+        score = (update_score, run_id)
+
+        if best_score is None or score > best_score:
+            best_score = score
+            best_run_id = run_id
+
+    if not best_run_id:
+        return df
+
+    filtered = df[df["run_id"].astype(str).map(strip_gsheet_text_prefix).str.strip() == best_run_id].copy()
+    if not filtered.empty and len(filtered) != len(df):
+        print(f"  ✅ {cache_name} 已套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
+        return filtered
+
+    return df
+
+
+def dedupe_ranked_rows_by_underlying(rows: list[dict], label: str = "") -> list[dict]:
+    """
+    排名圖最後一道保護：同一標的只保留一列。
+
+    正常情況快取端已完成同標的合併；若工作表殘留重複快照或重複列，
+    圖片端不能再把同一標的畫兩次，也不能讓合計金額被重複計入。
+    """
+    if not rows:
+        return []
+
+    ordered = sorted(rows, key=lambda x: (safe_int(x.get("rank"), 999999), -safe_float(x.get("rank_amount"), 0)))
+    seen = set()
+    out = []
+    removed = 0
+
+    for row in ordered:
+        key = str(row.get("underlying") or row.get("target") or "").strip()
+        if not key:
+            key = str(row.get("target", "")).strip()
+
+        if key in seen:
+            removed += 1
+            continue
+
+        seen.add(key)
+        out.append(row)
+
+    if removed > 0:
+        prefix = f"{label}：" if label else ""
+        print(f"  ⚠️ {prefix}已移除同標的重複列 {removed:,} 筆，避免 TOP 排名重複顯示。")
+
+    return out
+
+
+def merge_broker_10d_rows_by_underlying(rows: list[dict]) -> list[dict]:
+    """
+    近10日分點買賣明細以「分點 + 標的」作為唯一顯示單位。
+
+    - 先移除完全相同的列，避免同一批快取重複同步時金額被加倍。
+    - 再把同一分點、同一標的的不同列合併，確保 TOP10 不會出現重複標的。
+    - 若合併後買進 > 賣出，歸為買超；賣出 > 買進，歸為賣超。
+    """
+    if not rows:
+        return []
+
+    unique_rows = []
+    fingerprints = set()
+    exact_removed = 0
+
+    for row in rows:
+        fp = (
+            str(row.get("broker", "")).strip(),
+            str(row.get("underlying") or row.get("target") or "").strip(),
+            str(row.get("direction", "")).strip(),
+            round(safe_float(row.get("buy_amount"), 0), 4),
+            round(safe_float(row.get("sell_amount"), 0), 4),
+            round(safe_float(row.get("net_buy_amount"), 0), 4),
+            round(safe_float(row.get("net_sell_amount"), 0), 4),
+            str(row.get("buy_return", "")),
+            str(row.get("sell_return", "")),
+            str(row.get("warrant_list", "")),
+        )
+        if fp in fingerprints:
+            exact_removed += 1
+            continue
+        fingerprints.add(fp)
+        unique_rows.append(row)
+
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in unique_rows:
+        key = (
+            str(row.get("broker", "")).strip(),
+            str(row.get("underlying") or row.get("target") or "").strip(),
+        )
+        grouped[key].append(row)
+
+    merged_rows = []
+    merged_group_count = 0
+
+    for (_, _), items in grouped.items():
+        if len(items) == 1:
+            merged_rows.append(items[0])
+            continue
+
+        merged_group_count += 1
+        base = dict(items[0])
+
+        buy_qty = sum(safe_float(i.get("buy_qty"), 0) for i in items)
+        sell_qty = sum(safe_float(i.get("sell_qty"), 0) for i in items)
+        buy_amount = sum(safe_float(i.get("buy_amount"), 0) for i in items)
+        sell_amount = sum(safe_float(i.get("sell_amount"), 0) for i in items)
+        net_amount = buy_amount - sell_amount
+
+        def weighted_return(return_key: str, amount_key: str):
+            weighted_sum = 0.0
+            weighted_amount = 0.0
+            for item in items:
+                ret = normalize_return_pct(item.get(return_key))
+                amount = safe_float(item.get(amount_key), 0)
+                if ret is None or amount <= 0:
+                    continue
+                weighted_sum += ret * amount
+                weighted_amount += amount
+            return round(weighted_sum / weighted_amount, 2) if weighted_amount > 0 else None
+
+        buy_return = weighted_return("buy_return", "buy_amount")
+        sell_return = weighted_return("sell_return", "sell_amount")
+
+        warrant_parts = []
+        warrant_seen = set()
+        for item in items:
+            raw_list = strip_gsheet_text_prefix(item.get("warrant_list", ""))
+            if raw_list:
+                for part in re.split(r"[；;]", raw_list):
+                    part = part.strip()
+                    if part and part not in warrant_seen:
+                        warrant_seen.add(part)
+                        warrant_parts.append(part)
+
+        if net_amount > 0:
+            direction = "買超"
+            net_buy_amount = net_amount
+            net_sell_amount = 0.0
+            primary_return = buy_return
+        elif net_amount < 0:
+            direction = "賣超"
+            net_buy_amount = 0.0
+            net_sell_amount = abs(net_amount)
+            primary_return = sell_return
+        else:
+            direction = "持平"
+            net_buy_amount = 0.0
+            net_sell_amount = 0.0
+            primary_return = None
+
+        outcome = "-"
+        if primary_return is not None:
+            outcome = "勝" if safe_float(primary_return, 0) > 0 else "敗"
+
+        base.update({
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "buy_amount": buy_amount,
+            "sell_amount": sell_amount,
+            "net_buy_amount": net_buy_amount,
+            "net_sell_amount": net_sell_amount,
+            "direction": direction,
+            "buy_return": buy_return,
+            "sell_return": sell_return,
+            "primary_return": primary_return,
+            "outcome": outcome,
+            "warrant_count": len(warrant_seen) if warrant_seen else sum(safe_int(i.get("warrant_count"), 0) for i in items),
+            "warrant_list": "；".join(warrant_parts) if warrant_parts else strip_gsheet_text_prefix(base.get("warrant_list", "")),
+        })
+        merged_rows.append(base)
+
+    removed_total = exact_removed + max(0, len(unique_rows) - len(merged_rows))
+    if exact_removed > 0 or merged_group_count > 0:
+        print(
+            f"  ⚠️ 近10日分點明細已按標的去重合併："
+            f"完全重複移除 {exact_removed:,} 筆，合併同標的群組 {merged_group_count:,} 組，"
+            f"{len(rows):,} 筆 → {len(merged_rows):,} 筆。"
+        )
+
+    merged_rows.sort(
+        key=lambda x: max(
+            safe_float(x.get("buy_amount"), 0),
+            safe_float(x.get("sell_amount"), 0),
+            safe_float(x.get("net_buy_amount"), 0),
+            safe_float(x.get("net_sell_amount"), 0),
+        ),
+        reverse=True,
+    )
+    return merged_rows
+
+
 def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
     """
     直接讀取「快取_近7日權證分點共識TOP15」。
@@ -3177,6 +3412,7 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
+    df = filter_latest_cache_snapshot(df, SHEET_WARRANT_CONSENSUS_7D)
 
     if df.empty:
         return [], [], "無資料", chosen_date
@@ -3255,6 +3491,7 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
                 "main_brokers": main_brokers,
             })
 
+        rows = dedupe_ranked_rows_by_underlying(rows, label=rank_type)
         rows.sort(key=lambda x: (safe_int(x.get("rank"), 999999), -safe_float(x.get("rank_amount"), 0)))
         return rows[:15]
 
@@ -3564,6 +3801,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
+    df = filter_latest_cache_snapshot(df, SHEET_BROKER_10D_DETAIL)
     if broker:
         broker_series = df.apply(lambda r: strip_gsheet_text_prefix(_pick_first_existing_value(r, ["分點", "分點名稱"])).strip(), axis=1)
         df = df[broker_series == broker].copy()
@@ -3662,7 +3900,26 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             "warrant_list": strip_gsheet_text_prefix(_pick_first_existing_value(row, ["權證清單"])),
         })
 
-    rows.sort(key=lambda x: (max(safe_float(x.get("buy_amount"), 0), safe_float(x.get("sell_amount"), 0), safe_float(x.get("net_buy_amount"), 0), safe_float(x.get("net_sell_amount"), 0))), reverse=True)
+    rows = merge_broker_10d_rows_by_underlying(rows)
+
+    buy_total = sum(safe_float(r.get("buy_amount"), 0) for r in rows)
+    sell_total = sum(safe_float(r.get("sell_amount"), 0) for r in rows)
+
+    weighted_buy_ret = 0.0
+    weighted_buy_amt = 0.0
+    weighted_sell_ret = 0.0
+    weighted_sell_amt = 0.0
+    for r in rows:
+        buy_ret = normalize_return_pct(r.get("buy_return"))
+        sell_ret = normalize_return_pct(r.get("sell_return"))
+        buy_amount = safe_float(r.get("buy_amount"), 0)
+        sell_amount = safe_float(r.get("sell_amount"), 0)
+        if buy_ret is not None and buy_amount > 0:
+            weighted_buy_ret += buy_ret * buy_amount
+            weighted_buy_amt += buy_amount
+        if sell_ret is not None and sell_amount > 0:
+            weighted_sell_ret += sell_ret * sell_amount
+            weighted_sell_amt += sell_amount
 
     win_count = sum(1 for r in rows if r.get("primary_return") is not None and safe_float(r.get("primary_return"), 0) > 0)
     loss_count = sum(1 for r in rows if r.get("primary_return") is not None and safe_float(r.get("primary_return"), 0) <= 0)
@@ -3739,6 +3996,12 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     fig_w = 14.2
     margin_x = 0.36
     content_w = fig_w - 2 * margin_x
+
+    # 近10日表格寬度集中管理。
+    # 上方兩排統計卡片會使用相同 left / width，避免與下方 TOP10 表格左右寬度不一致。
+    broker10d_table_col_w = [0.60, 3.15, 2.20, 2.20, 2.10, 1.60]
+    broker10d_table_w = sum(broker10d_table_col_w)
+    broker10d_table_left = margin_x + (content_w - broker10d_table_w) / 2
 
     top_h = 1.35
     summary_card_h = 0.88
@@ -3898,7 +4161,9 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     )
 
     card_gap_x = 0.16
-    card_w = (content_w - card_gap_x * 2) / 3
+    summary_left = broker10d_table_left
+    summary_w = broker10d_table_w
+    card_w = (summary_w - card_gap_x * 2) / 3
     card_y1 = y - 0.28 - summary_card_h
     summary_cards1 = [
         ("買超TOP10合計", f"{display_buy_total:,.0f}", RED, None),
@@ -3906,7 +4171,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
         ("淨額(買超-賣超)", f"{display_net_total:,.0f}", NAVY2, None),
     ]
     for i, (label, value, color, extra) in enumerate(summary_cards1):
-        x = margin_x + i * (card_w + card_gap_x)
+        x = summary_left + i * (card_w + card_gap_x)
         rounded(x, card_y1, card_w, summary_card_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
         text_draw(x + 0.18, card_y1 + summary_card_h - 0.18, label, 12.5, MUTED, BOLD, va="top")
         text_draw(x + 0.18, card_y1 + 0.20, value, 17.2, color, BOLD, va="bottom")
@@ -3920,7 +4185,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
         ("前10勝率", fmt_pct_plain(display_win_rate), ORANGE, f"勝 {display_win_count} / 敗 {display_loss_count}"),
     ]
     for i, (label, value, color, extra) in enumerate(summary_cards2):
-        x = margin_x + i * (card_w + card_gap_x)
+        x = summary_left + i * (card_w + card_gap_x)
         rounded(x, card_y2, card_w, summary_card_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
         text_draw(x + 0.18, card_y2 + summary_card_h - 0.18, label, 12.5, MUTED, BOLD, va="top")
         text_draw(x + 0.18, card_y2 + 0.20, value, 17.2, color, BOLD, va="bottom")
@@ -3931,9 +4196,9 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
 
     def draw_section(title, section_rows, y_top, title_bg, section_type):
         headers = ["排名", "標的", "買進金額", "賣出金額", "淨額", "報酬率"]
-        col_w = [0.60, 3.15, 2.20, 2.20, 2.10, 1.60]
-        table_w = sum(col_w)
-        left = margin_x + (content_w - table_w) / 2
+        col_w = broker10d_table_col_w
+        table_w = broker10d_table_w
+        left = broker10d_table_left
         sec_rows = max(len(section_rows), 1)
         sec_h = table_title_h + header_h + sec_rows * row_h
 
