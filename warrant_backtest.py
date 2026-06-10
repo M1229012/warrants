@@ -1622,6 +1622,76 @@ GSHEET_COMMA_NUMBER_EXCLUDE_KEYWORDS = (
     "獲利%",
 )
 
+GSHEET_DECIMAL_NUMBER_HEADER_KEYWORDS = (
+    "均價",
+    "收盤價",
+    "最新權證價格",
+    "權證價格",
+    "股價",
+    "報酬率",
+    "報酬%",
+    "獲利%",
+    "勝率",
+    "占比",
+    "比例",
+    "平均",
+)
+
+GSHEET_DECIMAL_NUMBER_EXCLUDE_KEYWORDS = (
+    "日期",
+    "代號",
+    "名稱",
+    "清單",
+    "類型",
+    "狀態",
+    "文字",
+    "說明",
+    "來源",
+)
+
+
+def is_gsheet_percent_header(header):
+    header = str(header).strip()
+
+    if not header:
+        return False
+
+    if "文字" in header or "日期" in header or "代號" in header:
+        return False
+
+    return ("%" in header) or ("勝率" in header) or ("占比" in header) or ("比例" in header)
+
+
+def is_gsheet_decimal_number_header(header):
+    """
+    判斷 Google Sheet 中需要數字格式但不一定要整數千分位的欄位。
+
+    主要修正：
+    1. 買進均價 / 減碼均價 / 出清均價不可被誤套日期格式。
+    2. 減碼獲利% / 出清獲利% 不可被誤套日期格式。
+    3. 報酬率、勝率、占比等欄位要保持數字或百分比顯示。
+    """
+    header = str(header).strip()
+
+    if not header:
+        return False
+
+    if header.startswith("D+"):
+        return False
+
+    if is_gsheet_text_header(header):
+        return False
+
+    for keyword in GSHEET_DECIMAL_NUMBER_EXCLUDE_KEYWORDS:
+        if keyword in header:
+            return False
+
+    return any(keyword in header for keyword in GSHEET_DECIMAL_NUMBER_HEADER_KEYWORDS)
+
+
+def is_gsheet_numeric_format_header(header):
+    return is_gsheet_comma_number_header(header) or is_gsheet_decimal_number_header(header)
+
 
 def is_gsheet_comma_number_header(header):
     """
@@ -1724,7 +1794,7 @@ def normalize_result_values_for_comma_numbers(values):
         number_cols = []
 
         for col_idx, header in enumerate(row):
-            if is_gsheet_comma_number_header(header):
+            if is_gsheet_numeric_format_header(header):
                 number_cols.append(col_idx)
 
         if number_cols:
@@ -1750,17 +1820,52 @@ def normalize_result_values_for_comma_numbers(values):
 def _gsheet_number_pattern_for_header(header):
     header = str(header).strip()
 
-    if "平均" in header or "收盤價" in header:
+    # 注意：程式內的「獲利% / 報酬率 / 勝率」多數已經是 70.3 這種百分點數值，
+    # 不是 0.703 這種小數比例。
+    # 因此不能使用 Google Sheets 的 PERCENT 格式，否則 70.3 會被顯示成 7030%。
+    # 這裡統一用 NUMBER 格式，欄名本身已有 %，畫面仍可清楚判讀。
+    if is_gsheet_percent_header(header):
+        return "+0.00;-0.00;0.00"
+
+    if is_gsheet_decimal_number_header(header):
         return "#,##0.00"
 
     return "#,##0"
 
 
-def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
+def _format_source_rows_from_values_or_xlsx(ws_xlsx, values=None):
     """
-    將結果工作表的金額 / 股數 / 張數 / 筆數等欄位套用 Google Sheets 千分位格式。
+    Google Sheet 格式套用時的表頭來源。
 
-    這裡只補 Google Sheet 顯示格式，不改原本 Excel 產生邏輯，也不影響快取讀寫。
+    upsert 模式會在 Google Sheet 寫入前新增「資料範圍」欄位，
+    因此不能再只看原本 Excel 的欄位位置，否則日期格式會往左/往右套錯，
+    造成買進均價、買超張數、獲利% 被顯示成 1900 年代日期。
+    """
+    if values:
+        rows = [list(row) for row in values]
+        max_row = max(len(rows), 1)
+        max_col = max(max((len(row) for row in rows), default=1), 1)
+        return rows, max_row, max_col
+
+    rows = []
+    if ws_xlsx is not None:
+        scan_limit = min(ws_xlsx.max_row, 10)
+        for row_idx in range(1, scan_limit + 1):
+            rows.append([ws_xlsx.cell(row_idx, col_idx).value for col_idx in range(1, ws_xlsx.max_column + 1)])
+        return rows, ws_xlsx.max_row, ws_xlsx.max_column
+
+    return [], 1, 1
+
+
+def apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=None):
+    """
+    將 Google Sheet 結果工作表的金額 / 股數 / 張數 / 成本 / 均價 / 獲利% 等欄位套用正確數字格式。
+
+    重點修正：
+    - upsert 後的實際 Google Sheet 表頭可能比原 Excel 多「資料範圍」欄。
+    - 這裡改用實際寫入的 values 找欄位位置，避免格式位移。
+    - 所有金額 / 成本 / 市值 / 損益使用千分位逗號顯示。
+    - 均價、報酬率、獲利%、勝率等欄位也強制套數字/百分比格式，避免被日期格式污染。
     """
     if gws is None:
         return
@@ -1770,16 +1875,18 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
     except Exception:
         return
 
+    source_rows, max_row, max_col = _format_source_rows_from_values_or_xlsx(ws_xlsx, values)
     header_rows = []
-    scan_limit = min(ws_xlsx.max_row, 10)
+    scan_limit = min(len(source_rows), 10)
 
     for row_idx in range(1, scan_limit + 1):
+        row = source_rows[row_idx - 1]
         number_cols = []
 
-        for col_idx in range(1, ws_xlsx.max_column + 1):
-            header = ws_xlsx.cell(row_idx, col_idx).value
+        for col_idx in range(1, max_col + 1):
+            header = row[col_idx - 1] if col_idx - 1 < len(row) else ""
 
-            if is_gsheet_comma_number_header(header):
+            if is_gsheet_numeric_format_header(header):
                 number_cols.append((col_idx, _gsheet_number_pattern_for_header(header)))
 
         if number_cols:
@@ -1794,7 +1901,7 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
         if idx + 1 < len(header_rows):
             end_row = header_rows[idx + 1][0] - 1
         else:
-            end_row = ws_xlsx.max_row
+            end_row = max_row
 
         start_data_row = header_row_idx + 1
 
@@ -1814,6 +1921,8 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws):
                     "cell": {
                         "userEnteredFormat": {
                             "numberFormat": {
+                                # 所有數值欄都用 NUMBER。
+                                # 獲利% / 報酬率等欄位本身存的是百分點數值，不可套 PERCENT。
                                 "type": "NUMBER",
                                 "pattern": pattern,
                             }
@@ -1860,12 +1969,12 @@ def is_gsheet_date_header(header):
     return any(keyword in header for keyword in GSHEET_DATE_HEADER_KEYWORDS)
 
 
-def apply_date_format_to_gsheet(ws_xlsx, gws):
+def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
     """
     將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd。
 
-    這裡只修正 Google Sheet 顯示格式，不改原本 Excel 產生邏輯，
-    也不改快取內容。尤其可避免「最近買進日」顯示成 46160 這類日期序號。
+    upsert 模式會新增「資料範圍」欄位，因此日期欄位置必須以實際寫入 values 的表頭判斷，
+    不可只看原本 Excel 欄位位置。這可避免買進均價 / 張數 / 獲利% 被誤套成日期格式。
     """
     if gws is None:
         return
@@ -1875,14 +1984,16 @@ def apply_date_format_to_gsheet(ws_xlsx, gws):
     except Exception:
         return
 
+    source_rows, max_row, max_col = _format_source_rows_from_values_or_xlsx(ws_xlsx, values)
     header_rows = []
-    scan_limit = min(ws_xlsx.max_row, 10)
+    scan_limit = min(len(source_rows), 10)
 
     for row_idx in range(1, scan_limit + 1):
+        row = source_rows[row_idx - 1]
         date_cols = []
 
-        for col_idx in range(1, ws_xlsx.max_column + 1):
-            header = ws_xlsx.cell(row_idx, col_idx).value
+        for col_idx in range(1, max_col + 1):
+            header = row[col_idx - 1] if col_idx - 1 < len(row) else ""
 
             if is_gsheet_date_header(header):
                 date_cols.append(col_idx)
@@ -1899,7 +2010,7 @@ def apply_date_format_to_gsheet(ws_xlsx, gws):
         if idx + 1 < len(header_rows):
             end_row = header_rows[idx + 1][0] - 1
         else:
-            end_row = ws_xlsx.max_row
+            end_row = max_row
 
         start_data_row = header_row_idx + 1
 
@@ -1927,6 +2038,96 @@ def apply_date_format_to_gsheet(ws_xlsx, gws):
                     "fields": "userEnteredFormat.numberFormat",
                 }
             })
+
+    _gsheet_batch_update(requests)
+
+
+def _gsheet_pixel_width_for_header(header):
+    header = str(header).strip()
+
+    if not header:
+        return None
+
+    if header == "資料範圍":
+        return 105
+
+    # 有權證資訊的欄位加寬，避免新增「資料範圍」後欄寬位移造成內容被擠在一起。
+    if "權證清單" in header or "權證集合" in header:
+        return 520
+    if "分點明細_JSON" in header:
+        return 700
+    if "權證名稱" in header:
+        return 190
+    if "權證代號" in header or "權證代碼" in header:
+        return 105
+    if "權證檔數" in header:
+        return 95
+
+    if "標的名稱" in header or header == "股票名稱":
+        return 140
+    if "標的股" in header or "標的代號" in header:
+        return 95
+    if "分點名稱" in header or header == "分點":
+        return 140
+    if "券商代號" in header:
+        return 95
+
+    if "日期" in header or header in ("買進日", "事件日", "起始日", "結束日", "減碼日", "出清日"):
+        return 105
+
+    if any(k in header for k in ("金額", "成本", "市值", "損益")):
+        return 125
+
+    if any(k in header for k in ("均價", "報酬率", "獲利%", "勝率", "占比", "比例")):
+        return 105
+
+    if any(k in header for k in ("股數", "張數", "筆數", "天數", "排名")):
+        return 85
+
+    return None
+
+
+def apply_header_widths_to_gsheet(gws, values=None):
+    """
+    依照實際 Google Sheet 表頭重新調整欄寬。
+
+    因為 upsert 會新增「資料範圍」欄位，不能只沿用原 Excel 欄寬；
+    否則有權證名稱 / 權證清單的欄位會被擠到太窄。
+    """
+    if gws is None or not values:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    header_row_idx = _find_simple_header_row(values)
+    if header_row_idx is None or header_row_idx >= len(values):
+        return
+
+    headers = list(values[header_row_idx])
+    requests = []
+
+    for col_idx, header in enumerate(headers):
+        pixel_size = _gsheet_pixel_width_for_header(header)
+        if not pixel_size:
+            continue
+
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": col_idx,
+                    "endIndex": col_idx + 1,
+                },
+                "properties": {
+                    "pixelSize": pixel_size,
+                },
+                "fields": "pixelSize",
+            }
+        })
 
     _gsheet_batch_update(requests)
 
@@ -2817,6 +3018,134 @@ def merge_result_values_for_gsheet(title, new_values):
     return merged_values
 
 
+
+
+def apply_safe_result_table_style_to_gsheet(gws, values=None):
+    """
+    針對 upsert 結果表套用安全版基本樣式。
+
+    為什麼不用 apply_excel_style_to_gsheet：
+    upsert 會在最左邊新增「資料範圍」欄位，而且會把舊資料與本次資料合併。
+    如果繼續照原 Excel 欄位位置套樣式，日期格式會套到錯欄，
+    例如「買進均價」會被顯示成 1899/12/30。
+
+    這個函式只根據實際寫入 Google Sheet 的 values 表頭套安全樣式：
+    - 凍結表頭列
+    - 表頭粗體、淡黃色底、置中
+    - 資料列垂直置中、換行
+    - 不套任何日期或數字格式；日期 / 數字格式由後面的專用函式處理
+    """
+    if gws is None or not values:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    header_row_idx = _find_simple_header_row(values)
+    if header_row_idx is None:
+        return
+
+    max_cols = max(max((len(row) for row in values), default=1), 1)
+    max_rows = max(len(values), 1)
+
+    requests = [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {
+                        "frozenRowCount": header_row_idx + 1,
+                    },
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": header_row_idx,
+                    "endRowIndex": header_row_idx + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max_cols,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 1.0, "green": 0.949, "blue": 0.8},
+                        "textFormat": {"bold": True},
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
+            }
+        },
+    ]
+
+    if max_rows > header_row_idx + 1:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": header_row_idx + 1,
+                    "endRowIndex": max_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max_cols,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
+            }
+        })
+
+    _gsheet_batch_update(requests)
+
+
+def clear_all_number_formats_for_written_range(gws, values=None):
+    """
+    寫入結果後，先把實際資料範圍內的 numberFormat 全部清掉。
+
+    這是為了處理舊版已經把「買進均價 / 減碼均價 / 出清獲利%」誤套成日期格式的工作表。
+    單純寫入值不一定會移除舊格式，因此必須先清 numberFormat，再由日期 / 數字專用函式重套。
+    """
+    if gws is None or not values:
+        return
+
+    try:
+        sheet_id = int(gws.id)
+    except Exception:
+        return
+
+    max_rows = max(len(values), 1)
+    max_cols = max(max((len(row) for row in values), default=1), 1)
+
+    requests = [{
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": max_rows,
+                "startColumnIndex": 0,
+                "endColumnIndex": max_cols,
+            },
+            "cell": {
+                "userEnteredFormat": {}
+            },
+            "fields": "userEnteredFormat.numberFormat",
+        }
+    }]
+
+    # 這裡只清 numberFormat，不動其他樣式。
+    # 後續 TEXT / DATE / NUMBER 專用函式會依實際表頭重新套正確格式。
+    _gsheet_batch_update(requests)
+
 def upload_excel_to_google_sheet(xlsx_path):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -2849,9 +3178,20 @@ def upload_excel_to_google_sheet(xlsx_path):
             gws = get_or_recreate_result_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
 
             if write_values_to_worksheet(gws, values):
-                apply_excel_style_to_gsheet(ws_xlsx, gws)
-                apply_comma_number_format_to_gsheet(ws_xlsx, gws)
-                apply_date_format_to_gsheet(ws_xlsx, gws)
+                if should_upsert_result_sheet(title):
+                    # upsert 表會新增「資料範圍」欄，不能再照原 Excel 欄位位置套樣式，
+                    # 否則買進均價 / 出清獲利% 等欄位會被錯套成日期。
+                    clear_all_number_formats_for_written_range(gws, values=values)
+                    apply_safe_result_table_style_to_gsheet(gws, values=values)
+                    apply_text_format_to_gsheet(gws, values)
+                    apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
+                    apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
+                    apply_header_widths_to_gsheet(gws, values=values)
+                else:
+                    apply_excel_style_to_gsheet(ws_xlsx, gws)
+                    apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
+                    apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
+                    apply_header_widths_to_gsheet(gws, values=values)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
 
         try:
