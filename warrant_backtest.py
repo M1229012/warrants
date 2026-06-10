@@ -1815,22 +1815,36 @@ def normalize_result_values_for_comma_numbers(values):
     return out
 
 
-def _gsheet_number_pattern_for_header(header):
+def _gsheet_number_format_for_header(header):
     header = str(header).strip()
 
-    # 注意：程式內的「獲利% / 報酬率 / 勝率」多數已經是 70.3 這種百分點數值，
-    # 不是 0.703 這種小數比例。
-    # 因此不能使用 Google Sheets 的 PERCENT 格式，否則 70.3 會被顯示成 7030%。
-    # 這裡統一用 NUMBER 格式，欄名本身已有 %，畫面仍可清楚判讀。
+    # 重要：Excel / Google Sheet 用 USER_ENTERED 寫入「+7.00%」這種字串時，
+    # 儲存格底層值會變成 0.07。這類欄位必須套用真正的 PERCENT 格式，
+    # 才會顯示成 +7.00%，不能用 NUMBER + 文字百分號，否則會被顯示成 +0.07%。
+    #
+    # 但「報酬率」這種沒有 % 符號的 TOP15 快取欄位，程式內多為 70.30 這種百分點數值，
+    # 所以不歸類為 PERCENT，仍以一般數字顯示，避免變成 7,030%。
     if is_gsheet_percent_header(header):
-        # 程式內的獲利% / 報酬率 / 勝率多數已經是「百分點數值」，例如 0.09 代表 +0.09%。
-        # Google Sheets 的真正 PERCENT 格式會把 0.09 顯示成 9.00%，因此這裡用 NUMBER + 文字百分號。
-        return '+0.00"%";-0.00"%";0.00"%"'
+        return {
+            "type": "PERCENT",
+            "pattern": '+0.00%;-0.00%;0.00%',
+        }
 
     if is_gsheet_decimal_number_header(header):
-        return "#,##0.00"
+        return {
+            "type": "NUMBER",
+            "pattern": "#,##0.00",
+        }
 
-    return "#,##0"
+    return {
+        "type": "NUMBER",
+        "pattern": "#,##0",
+    }
+
+
+def _gsheet_number_pattern_for_header(header):
+    # 保留舊函式名稱供既有呼叫相容；實際格式型別請用 _gsheet_number_format_for_header()。
+    return _gsheet_number_format_for_header(header).get("pattern", "#,##0")
 
 
 def _format_source_rows_from_values_or_xlsx(ws_xlsx, values=None):
@@ -1909,6 +1923,15 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=None):
             continue
 
         for col_idx, pattern in number_cols:
+            header = ""
+            try:
+                row = source_rows[header_row_idx - 1]
+                header = row[col_idx - 1] if col_idx - 1 < len(row) else ""
+            except Exception:
+                header = ""
+
+            number_format = _gsheet_number_format_for_header(header)
+
             requests.append({
                 "repeatCell": {
                     "range": {
@@ -1920,12 +1943,7 @@ def apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=None):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": {
-                                # 所有數值欄都用 NUMBER。
-                                # 獲利% / 報酬率等欄位本身存的是百分點數值，不可套 PERCENT。
-                                "type": "NUMBER",
-                                "pattern": pattern,
-                            }
+                            "numberFormat": number_format
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
