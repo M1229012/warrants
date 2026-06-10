@@ -55,12 +55,9 @@ TRACKED_BROKERS = [
     "富邦敦南",
 ]
 
-# 近10日分點買賣明細圖，只輸出指定四個分點。
+# 近10日分點買賣明細圖，只輸出元大南屯。
 BROKER_10D_IMAGE_BROKERS = [
     "元大南屯",
-    "永豐金內湖",
-    "華南永昌台中",
-    "富邦敦南",
 ]
 
 DATA_SCOPE_SELECTED5 = os.getenv("DATA_SCOPE_SELECTED5", "精選五分點")
@@ -4257,7 +4254,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
         return TEXT
 
     def fmt_amount_wan(v):
-        return f"{safe_float(v, 0) / 10000:,.1f}"
+        return f"{safe_float(v, 0) / 10000:,.1f}萬"
 
     try:
         ax.text(
@@ -4285,7 +4282,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     text_draw(
         margin_x + 0.18,
         y,
-        f"統計期間：{period_text}｜統計日期：{cache_date_text}｜同標的全部權證合併統計｜顯示：買超TOP10、賣超TOP10｜單位：萬元",
+        f"統計期間：{period_text}｜單位：萬元",
         11.2,
         TEXT,
         BOLD,
