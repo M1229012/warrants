@@ -1823,7 +1823,9 @@ def _gsheet_number_pattern_for_header(header):
     # 因此不能使用 Google Sheets 的 PERCENT 格式，否則 70.3 會被顯示成 7030%。
     # 這裡統一用 NUMBER 格式，欄名本身已有 %，畫面仍可清楚判讀。
     if is_gsheet_percent_header(header):
-        return "+0.00;-0.00;0.00"
+        # 程式內的獲利% / 報酬率 / 勝率多數已經是「百分點數值」，例如 0.09 代表 +0.09%。
+        # Google Sheets 的真正 PERCENT 格式會把 0.09 顯示成 9.00%，因此這裡用 NUMBER + 文字百分號。
+        return '+0.00"%";-0.00"%";0.00"%"'
 
     if is_gsheet_decimal_number_header(header):
         return "#,##0.00"
