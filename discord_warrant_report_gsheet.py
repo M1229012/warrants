@@ -4280,7 +4280,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     text_draw(
         margin_x + 0.18,
         y,
-        f"統計期間：{period_text}｜統計日期：{cache_date_text}｜同標的全部權證合併統計｜顯示：買超TOP10、賣超TOP10｜單位：元",
+        f"統計期間：{period_text}｜單位：元",
         11.2,
         TEXT,
         BOLD,
