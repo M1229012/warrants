@@ -2950,12 +2950,51 @@ def _sheet_upsert_key_columns(title, headers):
     return cols if len(cols) >= 2 else []
 
 
+
+def normalize_underlying_code_for_group(value, fallback_text=""):
+    """
+    近7日共識與 Google Sheet upsert 用的標的股代號正規化。
+
+    修正目的：
+    同一標的可能因 Google Sheet / pandas 讀寫變成 2408、'2408、2408.0，
+    若直接拿原字串當 group key，就會造成本週 TOP15 同標的重複出現。
+    這裡統一轉成穩定代號後再合併與排序。
+    """
+    candidates = []
+    for raw in (value, fallback_text):
+        if raw is None:
+            continue
+        s = strip_gsheet_text_prefix(str(raw)).strip()
+        if not s:
+            continue
+        candidates.append(s)
+
+    for s in candidates:
+        s = s.replace("，", ",").replace(",", "").strip()
+        if s.endswith(".0") and s[:-2].isdigit():
+            s = s[:-2]
+
+        m = re.match(r"^(\d{4,6})(?:\s|$)", s)
+        if m:
+            return m.group(1)
+
+        if s.isdigit() and 4 <= len(s) <= 6:
+            return s
+
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if 4 <= len(digits) <= 6:
+            return digits
+
+    return ""
+
 def _record_key(rec, key_cols):
     parts = []
     for col in key_cols:
         value = rec.get(col, "")
         if col in ("日期", "統計日期", "買進日", "事件日", "起始日", "結束日", "第一筆日期", "最後筆日期"):
             value = normalize_date_str(strip_gsheet_text_prefix(value))
+        elif col in ("標的股", "標的代號", "標的代碼"):
+            value = normalize_underlying_code_for_group(value)
         else:
             value = strip_gsheet_text_prefix(value)
         parts.append(str(value).strip())
@@ -9194,14 +9233,17 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     return price_cache
 
 
-def _sell_return_summary_for_item(item, start_dt, target_dt):
+def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None):
     """
     用同一分點 + 同一權證的 API5 歷史資料估算近10日賣出實現報酬。
 
     規則：
     - 權證不可當沖：同一天先賣舊庫存，再把當日買進加入庫存。
-    - 賣出成本用 FIFO 持倉成本估算。
-    - 若近10日賣出找不到足夠舊庫存成本，該不足部分不納入報酬率分母，避免亂算。
+    - 賣出成本優先用 FIFO 持倉成本估算。
+    - 若近10日賣出找不到足夠舊庫存成本，改用可取得的成本備援估算，避免賣超報酬率空白：
+      1. 優先用該權證歷史已出現買進均價
+      2. 其次用最新權證價格
+      3. 最後用當筆賣出均價，讓報酬率保守落在 0%
     """
     df = item.get("df", pd.DataFrame())
     if df is None or df.empty:
@@ -9230,6 +9272,26 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
     unmatched_amount = 0.0
     unmatched_qty = 0.0
 
+    historical_buy_amount = 0.0
+    historical_buy_qty = 0.0
+
+    try:
+        fallback_price = float(fallback_price) if fallback_price is not None else None
+    except Exception:
+        fallback_price = None
+
+    if fallback_price is not None and fallback_price <= 0:
+        fallback_price = None
+
+    def fallback_unit_cost(sell_price):
+        if historical_buy_qty > 0 and historical_buy_amount > 0:
+            return historical_buy_amount / historical_buy_qty
+        if fallback_price is not None and fallback_price > 0:
+            return fallback_price
+        if sell_price and sell_price > 0:
+            return sell_price
+        return None
+
     for row in df.itertuples(index=False):
         row_dict = row._asdict()
         dt = row_dict.get("_dt")
@@ -9241,12 +9303,113 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
 
         in_window = bool(dt and start_dt <= dt <= target_dt)
 
-        if sell_qty > 0 and sell_amount > 0:
-            sell_price = sell_amount / sell_qty
-            sell_left = sell_qty
-            allocated_revenue = 0.0
-            allocated_cost = 0.0
+        # 權證不能當沖：同一天先處理賣出，只能扣舊庫存。
+        if sell_amount > 0:
+            if sell_qty <= 0:
+                # API 異常時仍保留數據，不讓近10日賣超報酬率變空白。
+                if in_window:
+                    revenue += sell_amount
+                    cost += sell_amount
+                sell_qty = 0
+            else:
+                sell_price = sell_amount / sell_qty
+                sell_left = sell_qty
+                allocated_revenue = 0.0
+                allocated_cost = 0.0
 
+                for lot in lots:
+                    if sell_left <= 0:
+                        break
+                    if lot.get("剩餘股數", 0) <= 0:
+                        continue
+
+                    alloc = min(sell_left, lot["剩餘股數"])
+                    if alloc <= 0:
+                        continue
+
+                    lot["剩餘股數"] -= alloc
+                    sell_left -= alloc
+                    allocated_revenue += alloc * sell_price
+                    allocated_cost += alloc * lot["均價"]
+
+                if sell_left > 0:
+                    fallback_cost_price = fallback_unit_cost(sell_price)
+                    if fallback_cost_price is not None and fallback_cost_price > 0:
+                        allocated_revenue += sell_left * sell_price
+                        allocated_cost += sell_left * fallback_cost_price
+                    else:
+                        unmatched_qty += sell_left
+                        unmatched_amount += sell_left * sell_price
+
+                if in_window:
+                    revenue += allocated_revenue
+                    cost += allocated_cost
+
+        # 同日買進放到賣出後面，避免當沖錯扣。
+        if buy_qty > 0 and buy_amount > 0:
+            lots.append({
+                "買進日": date_str,
+                "股數": buy_qty,
+                "剩餘股數": buy_qty,
+                "金額": buy_amount,
+                "均價": buy_amount / buy_qty if buy_qty else 0,
+            })
+            historical_buy_qty += buy_qty
+            historical_buy_amount += buy_amount
+
+    return {
+        "revenue": revenue,
+        "cost": cost,
+        "unmatched_amount": unmatched_amount,
+        "unmatched_qty": unmatched_qty,
+    }
+
+
+def _recent_buy_position_summary_for_item(item, start_dt, target_dt, latest_price=None):
+    """
+    計算近10日買進 lot 在統計日仍然留下的真實 FIFO 持倉。
+
+    這個函式用完整歷史跑到統計日：
+    - 每天先賣出扣 FIFO 舊庫存，再加入當天買進。
+    - 只把「買進日落在近10日視窗內」且統計日尚未被賣掉的剩餘 lot 納入買超持倉報酬。
+    - 買超報酬 = (剩餘股數 × 最新權證價格 - 剩餘成本) / 剩餘成本。
+    """
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty:
+        return {
+            "remaining_qty": 0.0,
+            "remaining_cost": 0.0,
+            "market_value": 0.0,
+            "missing_price": False,
+        }
+
+    df = df.copy()
+    if "日期" not in df.columns:
+        return {
+            "remaining_qty": 0.0,
+            "remaining_cost": 0.0,
+            "market_value": 0.0,
+            "missing_price": False,
+        }
+
+    df["_dt"] = df["日期"].map(parse_date)
+    df = df.dropna(subset=["_dt"])
+    df = df[df["_dt"] <= target_dt].sort_values(["_dt", "日期"]).reset_index(drop=True)
+
+    lots = []
+
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
+        dt = row_dict.get("_dt")
+        date_str = normalize_date_str(row_dict.get("日期", ""))
+        buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+        buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+        sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+
+        # 權證不能當沖：同一天先賣出，只扣舊庫存。
+        if sell_qty > 0 and sell_amount > 0:
+            sell_left = sell_qty
             for lot in lots:
                 if sell_left <= 0:
                     break
@@ -9259,16 +9422,6 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
 
                 lot["剩餘股數"] -= alloc
                 sell_left -= alloc
-                allocated_revenue += alloc * sell_price
-                allocated_cost += alloc * lot["均價"]
-
-            if in_window:
-                revenue += allocated_revenue
-                cost += allocated_cost
-
-                if sell_left > 0:
-                    unmatched_qty += sell_left
-                    unmatched_amount += sell_left * sell_price
 
         if buy_qty > 0 and buy_amount > 0:
             lots.append({
@@ -9277,13 +9430,39 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
                 "剩餘股數": buy_qty,
                 "金額": buy_amount,
                 "均價": buy_amount / buy_qty if buy_qty else 0,
+                "近10日買進": bool(dt and start_dt <= dt <= target_dt),
             })
 
+    remaining_qty = 0.0
+    remaining_cost = 0.0
+
+    for lot in lots:
+        if not lot.get("近10日買進"):
+            continue
+        qty = top15_safe_float(lot.get("剩餘股數", 0))
+        avg = top15_safe_float(lot.get("均價", 0))
+        if qty <= 0 or avg <= 0:
+            continue
+        remaining_qty += qty
+        remaining_cost += qty * avg
+
+    try:
+        latest_price = float(latest_price) if latest_price is not None else None
+    except Exception:
+        latest_price = None
+
+    if latest_price is not None and latest_price > 0 and remaining_qty > 0:
+        market_value = remaining_qty * latest_price
+        missing_price = False
+    else:
+        market_value = 0.0
+        missing_price = remaining_cost > 0
+
     return {
-        "revenue": revenue,
-        "cost": cost,
-        "unmatched_amount": unmatched_amount,
-        "unmatched_qty": unmatched_qty,
+        "remaining_qty": remaining_qty,
+        "remaining_cost": remaining_cost,
+        "market_value": market_value,
+        "missing_price": missing_price,
     }
 
 
@@ -9350,6 +9529,9 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "權證": {},
             "買超報酬加權分子": 0.0,
             "買超報酬權重": 0.0,
+            "買超剩餘股數": 0.0,
+            "買超剩餘成本": 0.0,
+            "買超目前市值": 0.0,
             "買超報酬有效權證數": 0,
             "買超報酬缺價權證數": 0,
             "賣超實現賣出金額": 0.0,
@@ -9423,17 +9605,39 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             warrant_rec["最新權證價格日"] = latest_price_date
 
         if item_buy_qty > 0 and item_buy_amount > 0:
-            buy_avg = item_buy_amount / item_buy_qty
-            if latest_price is not None and buy_avg > 0:
-                buy_return_pct = (float(latest_price) - buy_avg) / buy_avg * 100
-                rec["買超報酬加權分子"] += buy_return_pct * item_buy_amount
-                rec["買超報酬權重"] += item_buy_amount
-                rec["買超報酬有效權證數"] += 1
-            else:
-                rec["買超報酬缺價權證數"] += 1
+            position_summary = _recent_buy_position_summary_for_item(
+                item,
+                start_dt,
+                target_dt,
+                latest_price=latest_price,
+            )
+            remaining_cost = top15_safe_float(position_summary.get("remaining_cost", 0.0))
+            remaining_qty = top15_safe_float(position_summary.get("remaining_qty", 0.0))
+            market_value = top15_safe_float(position_summary.get("market_value", 0.0))
+
+            if remaining_cost > 0:
+                rec["買超剩餘成本"] += remaining_cost
+                rec["買超剩餘股數"] += remaining_qty
+                rec["買超目前市值"] += market_value
+                rec["買超報酬權重"] += remaining_cost
+                rec["買超報酬加權分子"] += market_value - remaining_cost
+
+                if position_summary.get("missing_price"):
+                    rec["買超報酬缺價權證數"] += 1
+                else:
+                    rec["買超報酬有效權證數"] += 1
+
+            warrant_rec["近10日買進剩餘股數"] = remaining_qty
+            warrant_rec["近10日買進剩餘成本"] = remaining_cost
+            warrant_rec["近10日買進目前市值"] = market_value
 
         if item_sell_qty > 0 and item_sell_amount > 0:
-            sell_summary = _sell_return_summary_for_item(item, start_dt, target_dt)
+            sell_summary = _sell_return_summary_for_item(
+                item,
+                start_dt,
+                target_dt,
+                fallback_price=latest_price,
+            )
             rec["賣超實現賣出金額"] += sell_summary.get("revenue", 0.0)
             rec["賣超實現成本"] += sell_summary.get("cost", 0.0)
             rec["賣超成本不足金額"] += sell_summary.get("unmatched_amount", 0.0)
@@ -9456,8 +9660,8 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         net_sell_qty = sell_qty - buy_qty
 
         buy_return_pct = None
-        if rec.get("買超報酬權重", 0) > 0:
-            buy_return_pct = rec["買超報酬加權分子"] / rec["買超報酬權重"]
+        if rec.get("買超剩餘成本", 0) > 0 and rec.get("買超目前市值", 0) > 0:
+            buy_return_pct = (rec["買超目前市值"] - rec["買超剩餘成本"]) / rec["買超剩餘成本"] * 100
 
         sell_return_pct = None
         if rec.get("賣超實現成本", 0) > 0:
@@ -9501,6 +9705,9 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
                 "賣出股數": round(float(w.get("賣出股數", 0) or 0), 0),
                 "最新權證價格": w.get("最新權證價格"),
                 "最新權證價格日": w.get("最新權證價格日", ""),
+                "近10日買進剩餘股數": round(float(w.get("近10日買進剩餘股數", 0) or 0), 0),
+                "近10日買進剩餘成本": round(float(w.get("近10日買進剩餘成本", 0) or 0), 0),
+                "近10日買進目前市值": round(float(w.get("近10日買進目前市值", 0) or 0), 0),
                 "日期數": len(w.get("日期集合", set())),
             })
 
@@ -9529,6 +9736,9 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "涉及權證檔數": len(rec.get("權證", {})),
             "權證清單": "；".join(warrant_rows),
             "買超平均報酬%": _fmt_pct_text(buy_return_pct, signed=True),
+            "買超剩餘股數": round(float(rec.get("買超剩餘股數", 0) or 0), 0),
+            "買超剩餘成本": round(float(rec.get("買超剩餘成本", 0) or 0), 0),
+            "買超目前市值": round(float(rec.get("買超目前市值", 0) or 0), 0),
             "買超報酬有效權證數": int(rec.get("買超報酬有效權證數", 0) or 0),
             "買超報酬缺價權證數": int(rec.get("買超報酬缺價權證數", 0) or 0),
             "賣超平均報酬%": _fmt_pct_text(sell_return_pct, signed=True),
@@ -9588,7 +9798,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         "近10日買進股數", "近10日買進金額", "近10日賣出股數", "近10日賣出金額",
         "近10日淨買超股數", "近10日淨買超金額", "近10日淨賣超股數", "近10日淨賣超金額",
         "涉及權證檔數", "權證清單",
-        "買超平均報酬%", "買超報酬有效權證數", "買超報酬缺價權證數",
+        "買超平均報酬%", "買超剩餘股數", "買超剩餘成本", "買超目前市值", "買超報酬有效權證數", "買超報酬缺價權證數",
         "賣超平均報酬%", "賣超實現賣出金額", "賣超實現成本", "賣超成本不足金額",
         "用於勝率報酬%", "判定", "分點近10日勝率", "分點近10日勝筆數", "分點近10日敗筆數",
         "更新時間", "run_id", "權證明細_JSON",
@@ -9605,7 +9815,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         14, 16, 14, 16,
         16, 18, 16, 18,
         12, 72,
-        14, 14, 14,
+        14, 14, 16, 16, 14, 14,
         14, 16, 16, 16,
         14, 10, 14, 14, 14,
         20, 18, 90,
@@ -9711,8 +9921,9 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code = str(item.get("underlying_code", "")).strip()
+        raw_underlying_code = str(item.get("underlying_code", "")).strip()
         underlying_name = str(item.get("underlying_name", "")).strip()
+        underlying_code = normalize_underlying_code_for_group(raw_underlying_code, underlying_name or warrant_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
@@ -9831,6 +10042,57 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             "淨買超金額": net_buy,
             "淨賣超金額": net_sell,
         })
+
+    # 最後再做一次標的層級保護性合併。
+    # 若舊快取或資料來源仍出現 2408 / '2408 / 2408.0 這種不同寫法，
+    # 這裡會再收斂成同一檔標的，確保排序前同標的只剩一筆。
+    merged_records = {}
+    for rec in records:
+        key = normalize_underlying_code_for_group(rec.get("標的股", ""), rec.get("標的名稱", ""))
+        if not key:
+            continue
+
+        if key not in merged_records:
+            rec["標的股"] = key
+            merged_records[key] = rec
+            continue
+
+        dst = merged_records[key]
+        for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "淨買超金額", "淨賣超金額"]:
+            dst[numeric_col] = float(dst.get(numeric_col, 0) or 0) + float(rec.get(numeric_col, 0) or 0)
+
+        if not dst.get("標的名稱") and rec.get("標的名稱"):
+            dst["標的名稱"] = rec.get("標的名稱")
+
+        dst.setdefault("日期集合", set()).update(rec.get("日期集合", set()))
+
+        for warrant_code, warrant_rec in rec.get("權證", {}).items():
+            if warrant_code in dst.get("權證", {}):
+                dw = dst["權證"][warrant_code]
+                for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                    dw[numeric_col] = float(dw.get(numeric_col, 0) or 0) + float(warrant_rec.get(numeric_col, 0) or 0)
+                dw.setdefault("日期集合", set()).update(warrant_rec.get("日期集合", set()))
+            else:
+                dst.setdefault("權證", {})[warrant_code] = warrant_rec
+
+        for broker_key, broker_rec in rec.get("分點", {}).items():
+            if broker_key not in dst.get("分點", {}):
+                dst.setdefault("分點", {})[broker_key] = broker_rec
+                continue
+            db = dst["分點"][broker_key]
+            for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                db[numeric_col] = float(db.get(numeric_col, 0) or 0) + float(broker_rec.get(numeric_col, 0) or 0)
+            db.setdefault("日期集合", set()).update(broker_rec.get("日期集合", set()))
+            for warrant_code, bw in broker_rec.get("權證", {}).items():
+                if warrant_code in db.get("權證", {}):
+                    dbw = db["權證"][warrant_code]
+                    for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                        dbw[numeric_col] = float(dbw.get(numeric_col, 0) or 0) + float(bw.get(numeric_col, 0) or 0)
+                    dbw.setdefault("日期集合", set()).update(bw.get("日期集合", set()))
+                else:
+                    db.setdefault("權證", {})[warrant_code] = bw
+
+    records = list(merged_records.values())
 
     buy_top = [r for r in records if float(r.get("淨買超金額", 0) or 0) > 0]
     sell_top = [r for r in records if float(r.get("淨賣超金額", 0) or 0) > 0]
