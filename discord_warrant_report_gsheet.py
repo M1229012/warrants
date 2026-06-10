@@ -126,6 +126,7 @@ KNOWN_UNDERLYING_NAME_CODE_MAP = {
 
 
 _STOCK_NAME_MAP = None
+_STOCK_CODE_BY_NAME_MAP = None
 
 # 浮水印設定
 WATERMARK_TEXT = "By 股市艾斯出品-轉傳請註明\n資訊分享非投資建議 投資請自行評估風險"
@@ -1201,6 +1202,115 @@ def get_stock_name_map() -> dict[str, str]:
     if _STOCK_NAME_MAP is None:
         _STOCK_NAME_MAP = build_stock_name_map_from_gsheet()
     return _STOCK_NAME_MAP
+
+def get_stock_code_by_name_map() -> dict[str, str]:
+    global _STOCK_CODE_BY_NAME_MAP
+    if _STOCK_CODE_BY_NAME_MAP is None:
+        code_map: dict[str, str] = {}
+
+        for code, name in get_stock_name_map().items():
+            nm = strip_gsheet_text_prefix(name).strip()
+            if nm and nm not in code_map:
+                code_map[nm] = code
+
+        for nm, code in KNOWN_UNDERLYING_NAME_CODE_MAP.items():
+            nm = strip_gsheet_text_prefix(nm).strip()
+            code = normalize_underlying(code, nm)
+            if nm and code and nm not in code_map:
+                code_map[nm] = code
+
+        _STOCK_CODE_BY_NAME_MAP = code_map
+    return _STOCK_CODE_BY_NAME_MAP
+
+
+def get_stock_code_by_name(name: str) -> str:
+    nm = strip_gsheet_text_prefix(name).strip()
+    if not nm:
+        return ""
+
+    direct = get_stock_code_by_name_map().get(nm, "")
+    if direct:
+        return direct
+
+    nm2 = nm.replace("臺", "台").replace(" ", "")
+    for key, code in get_stock_code_by_name_map().items():
+        key2 = str(key).replace("臺", "台").replace(" ", "")
+        if key2 == nm2:
+            return code
+    return ""
+
+
+def looks_like_warrant_code(code_value) -> bool:
+    s = normalize_code(code_value)
+    if not s or not s.isdigit():
+        return False
+
+    # 台股標的股通常為 4 碼；ETF 代號常見為 00 開頭。
+    # 若是 5~6 碼且不是 00 開頭，極可能是權證代號而不是標的股代號。
+    return len(s) in (5, 6) and not s.startswith("00")
+
+
+def resolve_target_identity(
+    row: dict,
+    code_cols: list[str],
+    name_cols: list[str],
+    raw_target_cols: list[str],
+    warrant_text_cols: list[str] | None = None,
+) -> tuple[str, str, str]:
+    """
+    從快取列中盡量解析出正確的「標的代號、標的名稱、顯示文字」。
+
+    主要是修正某些快取欄位把「權證代號」誤塞進標的欄位，
+    導致圖卡顯示成 501504 這種權證代碼，而不是正確標的名稱。
+    """
+    warrant_text_cols = warrant_text_cols or []
+
+    raw_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, name_cols)).strip()
+    raw_target = strip_gsheet_text_prefix(_pick_first_existing_value(row, raw_target_cols)).strip()
+    warrant_text = strip_gsheet_text_prefix(_pick_first_existing_value(row, warrant_text_cols + raw_target_cols + name_cols)).strip()
+
+    underlying = normalize_underlying(_pick_first_existing_value(row, code_cols), raw_name or raw_target or warrant_text)
+    underlying_name = raw_name
+
+    parsed_target_code = ""
+    parsed_target_name = ""
+    m_target = re.match(r"^(\d{4})(?:\s+|[-_])?(.*)$", raw_target)
+    if m_target:
+        parsed_target_code = normalize_underlying(m_target.group(1), raw_target)
+        parsed_target_name = m_target.group(2).strip()
+
+    inferred_name = extract_stock_name_from_warrant_text(warrant_text)
+
+    if not underlying_name and parsed_target_name:
+        underlying_name = parsed_target_name
+    if not underlying_name and inferred_name:
+        underlying_name = inferred_name
+
+    if (not underlying or looks_like_warrant_code(underlying)) and parsed_target_code and not looks_like_warrant_code(parsed_target_code):
+        underlying = parsed_target_code
+
+    if underlying and not looks_like_warrant_code(underlying):
+        mapped_name = get_stock_name_map().get(underlying, "")
+        if not underlying_name and mapped_name:
+            underlying_name = mapped_name
+
+    if underlying_name and (not underlying or looks_like_warrant_code(underlying)):
+        mapped_code = get_stock_code_by_name(underlying_name)
+        if mapped_code:
+            underlying = mapped_code
+
+    if looks_like_warrant_code(underlying) and underlying_name:
+        mapped_code = get_stock_code_by_name(underlying_name)
+        underlying = mapped_code or ""
+
+    if underlying_name and underlying:
+        target_label = f"{underlying} {underlying_name}".strip()
+    elif underlying_name:
+        target_label = underlying_name
+    else:
+        target_label = raw_target or underlying
+
+    return underlying, underlying_name, target_label
 
 
 def infer_latest_date_from_gsheet() -> date:
@@ -3442,13 +3552,13 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
             if row_rank_type != rank_type:
                 continue
 
-            warrant_text = _pick_first_existing_value(r, ["權證名稱", "權證清單", "標的名稱", "股票名稱", "標的"])
-            underlying = normalize_underlying(_pick_first_existing_value(r, ["標的股", "標的代號", "標的"]), warrant_text)
-            underlying_name = strip_gsheet_text_prefix(_pick_first_existing_value(r, ["標的名稱", "股票名稱"]))
-            if not underlying_name:
-                underlying_name = get_stock_name_map().get(underlying, "")
-            raw_target = strip_gsheet_text_prefix(_pick_first_existing_value(r, ["標的", "標的名稱", "股票名稱"]))
-            target_label = f"{underlying} {underlying_name}".strip() if underlying_name else (raw_target or underlying)
+            underlying, underlying_name, target_label = resolve_target_identity(
+                r,
+                code_cols=["標的股", "標的代號", "標的"],
+                name_cols=["標的名稱", "股票名稱"],
+                raw_target_cols=["標的", "標的名稱", "股票名稱"],
+                warrant_text_cols=["權證名稱", "權證清單", "權證代號"],
+            )
 
             buy_amount = safe_float(_pick_first_existing_value(r, ["買進金額"]), 0)
             sell_amount = safe_float(_pick_first_existing_value(r, ["賣出金額"]), 0)
@@ -3832,18 +3942,13 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     for _, r in df.iterrows():
         row = r.to_dict()
         broker_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["分點", "分點名稱"])).strip() or broker
-        underlying_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["標的名稱", "股票名稱"]))
-        target_text = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["標的", "標的名稱", "股票名稱"]))
-        underlying = normalize_underlying(_pick_first_existing_value(row, ["標的股", "標的代號", "標的"]), underlying_name or target_text)
-        if not underlying and target_text:
-            m = re.match(r"^(\d{1,4})\s*(.*)$", target_text)
-            if m:
-                underlying = normalize_underlying(m.group(1), target_text)
-                if not underlying_name:
-                    underlying_name = m.group(2).strip()
-        if not underlying_name and underlying:
-            underlying_name = get_stock_name_map().get(underlying, "")
-        target_label = f"{underlying} {underlying_name}".strip() if underlying_name else (target_text or underlying)
+        underlying, underlying_name, target_label = resolve_target_identity(
+            row,
+            code_cols=["標的股", "標的代號", "標的"],
+            name_cols=["標的名稱", "股票名稱"],
+            raw_target_cols=["標的", "標的名稱", "股票名稱"],
+            warrant_text_cols=["權證清單"],
+        )
 
         buy_qty = safe_float(_pick_first_existing_value(row, ["近10日買進股數", "買進股數"]), 0)
         sell_qty = safe_float(_pick_first_existing_value(row, ["近10日賣出股數", "賣出股數"]), 0)
