@@ -3868,6 +3868,8 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
         "分點近10日敗筆數", "近10日敗筆數", "敗筆數",
+        "用於勝率報酬%", "用於勝率報酬率",
+        "判定",
         "更新時間", "run_id",
     ]
 
@@ -3981,18 +3983,27 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         generic_ret = normalize_return_pct(_pick_first_existing_value(row, [
             "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
         ]))
+        win_ret = normalize_return_pct(_pick_first_existing_value(row, [
+            "用於勝率報酬%", "用於勝率報酬率",
+        ]))
         if buy_ret is None and direction == "買超":
             buy_ret = generic_ret
         if sell_ret is None and direction == "賣超":
             sell_ret = generic_ret
+        if buy_ret is None and direction == "買超" and win_ret is not None:
+            buy_ret = win_ret
+        if sell_ret is None and direction == "賣超" and win_ret is not None:
+            sell_ret = win_ret
         warrant_count = safe_int(_pick_first_existing_value(row, ["涉及權證檔數", "權證檔數"]), 0)
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"]))
 
-        primary_ret = buy_ret if direction == "買超" else sell_ret if direction == "賣超" else None
-        outcome = "-"
-        if primary_ret is not None:
-            outcome = "勝" if primary_ret > 0 else "敗"
+        primary_ret = win_ret if win_ret is not None else (buy_ret if direction == "買超" else sell_ret if direction == "賣超" else None)
+        outcome = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["判定"])).strip()
+        if outcome not in {"勝", "敗"}:
+            outcome = "-"
+            if primary_ret is not None:
+                outcome = "勝" if primary_ret > 0 else "敗"
 
         buy_total += buy_amount
         sell_total += sell_amount
