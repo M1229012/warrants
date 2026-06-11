@@ -88,6 +88,9 @@ SHEET_TOP15_CONSENSUS_CACHE = os.getenv("SHEET_TOP15_CONSENSUS_CACHE", "快取_T
 SHEET_TOP15_POSITION_DETAIL = os.getenv("SHEET_TOP15_POSITION_DETAIL", "快取_TOP15部位明細")
 SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近7日權證分點共識TOP15")
 SHEET_BROKER_10D_DETAIL = os.getenv("SHEET_BROKER_10D_DETAIL", "快取_近10日分點買賣明細")
+# 近10日分點圖若 Google Sheet 同一天有多批 run_id，可用此環境變數指定要讀哪一批。
+# 例如：BROKER_10D_FORCE_RUN_ID=20260611_061357
+BROKER_10D_FORCE_RUN_ID = os.getenv("BROKER_10D_FORCE_RUN_ID", os.getenv("BROKER_10D_RUN_ID", "")).strip()
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
@@ -3299,22 +3302,51 @@ def _parse_cache_update_datetime(value):
         return None
 
 
-def filter_latest_cache_snapshot(df: pd.DataFrame, cache_name: str = "快取") -> pd.DataFrame:
+def filter_latest_cache_snapshot(
+    df: pd.DataFrame,
+    cache_name: str = "快取",
+    prefer_sheet_order: bool = False,
+    force_run_id: str = "",
+) -> pd.DataFrame:
     """
     同一個統計日期的快取表可能因為 GitHub Action 重跑而累積多個 run_id。
 
     圖片端若只用「統計日期」過濾，會把舊 run 與新 run 一起讀進來，
-    造成 TOP15 / TOP10 出現同標的重複列。
+    造成 TOP15 / TOP10 出現同標的重複列，或賣超報酬率抓到舊資料。
 
     處理方式：
-    1. 優先用 run_id 挑出最新一批快照。
-    2. 最新 run_id 的判斷以「更新時間」最大者為準；沒有可解析更新時間時，
-       用 run_id 字串排序作為備援。
-    3. 若工作表沒有 run_id，則不硬切更新時間，避免同一批資料各列更新秒數不同時誤刪。
-       後續仍會再用標的層級去重 / 合併。
+    1. 若有 force_run_id，優先讀指定批次。
+    2. 若 prefer_sheet_order=True，優先用 Google Sheet 畫面上的第一個非空 run_id。
+       這是給「快取_近10日分點買賣明細」使用，因為你的 Sheet 最新資料會插在最上面。
+    3. 其他情況才用「更新時間最大」與 run_id 字串排序作為備援。
     """
     if df is None or df.empty or "run_id" not in df.columns:
         return df
+
+    run_series = df["run_id"].astype(str).map(strip_gsheet_text_prefix).str.strip()
+
+    force_run_id = strip_gsheet_text_prefix(force_run_id).strip()
+    if force_run_id:
+        forced = df[run_series == force_run_id].copy()
+        if not forced.empty:
+            if len(forced) != len(df):
+                print(f"  ✅ {cache_name} 已套用指定快照：run_id={force_run_id}｜{len(df):,} 筆 → {len(forced):,} 筆")
+            return forced
+        print(f"  ⚠️ {cache_name} 找不到指定 run_id={force_run_id}，改用自動挑選最新快照。")
+
+    if prefer_sheet_order:
+        best_run_id = ""
+        for run_id in run_series.tolist():
+            if run_id:
+                best_run_id = run_id
+                break
+
+        if best_run_id:
+            filtered = df[run_series == best_run_id].copy()
+            if not filtered.empty:
+                if len(filtered) != len(df):
+                    print(f"  ✅ {cache_name} 已依 Sheet 最上方資料套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
+                return filtered
 
     best_run_id = ""
     best_score = None
@@ -3335,13 +3367,12 @@ def filter_latest_cache_snapshot(df: pd.DataFrame, cache_name: str = "快取") -
     if not best_run_id:
         return df
 
-    filtered = df[df["run_id"].astype(str).map(strip_gsheet_text_prefix).str.strip() == best_run_id].copy()
+    filtered = df[run_series == best_run_id].copy()
     if not filtered.empty and len(filtered) != len(df):
         print(f"  ✅ {cache_name} 已套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
         return filtered
 
     return df
-
 
 def dedupe_ranked_rows_by_underlying(rows: list[dict], label: str = "") -> list[dict]:
     """
@@ -3964,6 +3995,15 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     def pick_date(row):
         return _pick_first_existing_date(row, ["統計日期", "日期", "目標日期"])
 
+    # 若使用者明確指定 run_id，就先依 run_id 鎖定快照，再從該批資料推統計日期。
+    # 這可避免 target date / 統計日期欄位與實際最新 run_id 不一致時，圖片吃到舊資料。
+    if BROKER_10D_FORCE_RUN_ID:
+        df = filter_latest_cache_snapshot(
+            df,
+            SHEET_BROKER_10D_DETAIL,
+            force_run_id=BROKER_10D_FORCE_RUN_ID,
+        )
+
     available_dates = []
     for _, r in df.iterrows():
         d = pick_date(r)
@@ -3973,14 +4013,23 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     if not available_dates:
         return [], empty_meta
 
-    if target is not None:
+    if BROKER_10D_FORCE_RUN_ID:
+        chosen_date = max(available_dates)
+    elif target is not None:
         valid_dates = [d for d in available_dates if d <= target]
         chosen_date = max(valid_dates) if valid_dates else max(available_dates)
     else:
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
-    df = filter_latest_cache_snapshot(df, SHEET_BROKER_10D_DETAIL)
+    # 近10日分點明細的 Google Sheet 最新資料會在最上方，所以這裡不要再單純用更新時間猜。
+    # 直接以 Sheet 最上方的 run_id 作為最新快照；若要手動指定，可設定 BROKER_10D_FORCE_RUN_ID。
+    df = filter_latest_cache_snapshot(
+        df,
+        SHEET_BROKER_10D_DETAIL,
+        prefer_sheet_order=True,
+        force_run_id=BROKER_10D_FORCE_RUN_ID,
+    )
     if broker:
         broker_series = df.apply(lambda r: strip_gsheet_text_prefix(_pick_first_existing_value(r, ["分點", "分點名稱"])).strip(), axis=1)
         df = df[broker_series == broker].copy()
