@@ -83,7 +83,7 @@ jobs:
               --date "${{ github.event.inputs.target_date }}" \
               --action "${ACTION_VALUE}"
           else
-            python "discord_warrant_branch_report_fixed_v5.py" \
+            python "discord_warrant_report_gsheet.py" \
               --action "${ACTION_VALUE}"
           fi
 
