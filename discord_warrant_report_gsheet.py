@@ -3348,8 +3348,10 @@ def filter_latest_cache_snapshot(
 
     處理方式：
     1. 若有 force_run_id，優先讀指定批次。
-    2. 若 prefer_sheet_order=True，優先用 Google Sheet 畫面上的第一個非空 run_id。
-       這是給「快取_近10日分點買賣明細」使用，因為你的 Sheet 最新資料會插在最上面。
+    2. 若 prefer_sheet_order=True：
+       - 優先用 run_id 字串最大的批次，例如 20260611_061357。
+       - 這比更新時間更穩，因為 Google Sheet 顯示的新資料可能統計日期仍是前一交易日。
+       - 若 run_id 不是 YYYYMMDD_HHMMSS 格式，才退回 Sheet 最上方第一個 run_id。
     3. 其他情況才用「更新時間最大」與 run_id 字串排序作為備援。
     """
     if df is None or df.empty or "run_id" not in df.columns:
@@ -3367,17 +3369,28 @@ def filter_latest_cache_snapshot(
         print(f"  ⚠️ {cache_name} 找不到指定 run_id={force_run_id}，改用自動挑選最新快照。")
 
     if prefer_sheet_order:
-        best_run_id = ""
-        for run_id in run_series.tolist():
-            if run_id:
-                best_run_id = run_id
-                break
+        # 近10日分點明細專用：直接選 run_id 最大的批次。
+        # 例如 20260611_061357 會明確大於 20260610_xxxxxx，
+        # 避免圖片吃到舊快照。
+        valid_run_ids = [
+            run_id for run_id in run_series.tolist()
+            if re.fullmatch(r"\d{8}_\d{6}", str(run_id).strip())
+        ]
+        best_run_id = max(valid_run_ids) if valid_run_ids else ""
+
+        if not best_run_id:
+            for run_id in run_series.tolist():
+                if run_id:
+                    best_run_id = run_id
+                    break
 
         if best_run_id:
             filtered = df[run_series == best_run_id].copy()
             if not filtered.empty:
                 if len(filtered) != len(df):
-                    print(f"  ✅ {cache_name} 已依 Sheet 最上方資料套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
+                    print(f"  ✅ {cache_name} 已依最大 run_id 套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
+                else:
+                    print(f"  ✅ {cache_name} 採用 run_id={best_run_id}｜{len(filtered):,} 筆")
                 return filtered
 
     best_run_id = ""
@@ -3405,6 +3418,7 @@ def filter_latest_cache_snapshot(
         return filtered
 
     return df
+
 
 def dedupe_ranked_rows_by_underlying(rows: list[dict], label: str = "") -> list[dict]:
     """
@@ -4090,6 +4104,29 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         empty_meta["chosen_date"] = chosen_date
         return [], empty_meta
 
+    # 這段固定印出來，因為近10日圖最容易因 run_id 或欄位被讀錯而顯示「-」。
+    # 只要 GitHub Actions log 沒看到這幾行，就代表 YML 根本沒有跑到這份程式。
+    try:
+        selected_run_ids = sorted({
+            strip_gsheet_text_prefix(x).strip()
+            for x in df.get("run_id", [])
+            if strip_gsheet_text_prefix(x).strip()
+        }, reverse=True)
+        exact_sell_col_exists = "賣超平均報酬%" in df.columns
+        exact_sell_nonempty = 0
+        if exact_sell_col_exists:
+            exact_sell_nonempty = int(df["賣超平均報酬%"].astype(str).map(strip_gsheet_text_prefix).str.strip().replace("-", "").astype(bool).sum())
+        print(
+            f"  ✅ 近10日分點明細實際採用 run_id：{selected_run_ids[0] if selected_run_ids else '-'}｜"
+            f"分點：{broker or '-'}｜筆數：{len(df):,}"
+        )
+        print(
+            f"  ✅ 精確欄位「賣超平均報酬%」存在：{exact_sell_col_exists}｜"
+            f"非空筆數：{exact_sell_nonempty:,}"
+        )
+    except Exception as e:
+        print(f"  ⚠️ 近10日分點明細除錯輸出失敗：{type(e).__name__}: {e}")
+
     if os.getenv("DEBUG_BROKER_10D_DETAIL", "0").strip().lower() in ("1", "true", "yes"):
         debug_cols = []
         for c in [
@@ -4713,7 +4750,7 @@ def main():
         draw_weekly_warrant_consensus_image(target, weekly_output_path)
         image_paths.append(weekly_output_path)
 
-    if action == IMAGE_ACTION_BROKER_10D:
+    if action in [IMAGE_ACTION_BROKER_10D, IMAGE_ACTION_ALL]:
         print(f"輸出資料來源：{SHEET_BROKER_10D_DETAIL}｜指定分點：{'、'.join(BROKER_10D_IMAGE_BROKERS)}")
         for broker in BROKER_10D_IMAGE_BROKERS:
             broker_path = broker10d_output_dir / f"近10日分點買賣明細_{broker}.png"
