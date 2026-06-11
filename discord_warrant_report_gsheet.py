@@ -57,10 +57,11 @@ TRACKED_BROKERS = [
 
 # 近10日分點買賣明細圖，只輸出元大南屯。
 BROKER_10D_IMAGE_BROKERS = [
-    "華南永昌台中",
-    "永豐金竹北",
-    "永豐金內湖",
-    "富邦敦南",
+    "第一金中壢",
+    "永豐金竹科",
+    "新光",
+    "元大內湖民權",
+    "國票敦北法人",
 ]
 
 DATA_SCOPE_SELECTED5 = os.getenv("DATA_SCOPE_SELECTED5", "精選五分點")
