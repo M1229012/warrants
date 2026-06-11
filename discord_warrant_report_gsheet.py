@@ -332,8 +332,16 @@ def safe_float(v, default=0.0) -> float:
         if s == "" or s == "-":
             return default
 
-        # Google Sheet 可能讀到 1,003,600 或 +30.36%
-        s = s.replace(",", "").replace("%", "").replace("＋", "+").strip()
+        # Google Sheet 可能讀到 1,003,600、1，003，600、+30.36% 或 +30.36％
+        s = (
+            s.replace(",", "")
+             .replace("，", "")
+             .replace("%", "")
+             .replace("％", "")
+             .replace("﹪", "")
+             .replace("＋", "+")
+             .strip()
+        )
         if s.startswith("+"):
             s = s[1:]
 
@@ -644,7 +652,16 @@ def _pick_first_existing_value(row, candidates: list[str]):
 def _normalize_gsheet_col_name(name: str) -> str:
     s = strip_gsheet_text_prefix(name)
     s = str(s).strip()
-    return s.replace("％", "%").replace(" ", "")
+    # Google Sheet 表頭有時會因手動換行 / 全形符號 / 多餘空白造成精確欄名對不到。
+    # 這裡統一移除所有空白字元，並把全形百分比轉成半形百分比。
+    s = re.sub(r"\s+", "", s)
+    return (
+        s.replace("％", "%")
+         .replace("﹪", "%")
+         .replace("＋", "+")
+         .replace("（", "(")
+         .replace("）", ")")
+    )
 
 
 def _pick_first_existing_value_fuzzy(row, candidates: list[str]):
@@ -3916,9 +3933,13 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "更新時間", "run_id",
     ]
 
+    # 這裡刻意讀取全部欄位，不再傳 needed_cols。
+    # 原因：Google Sheet 表頭可能出現全形％、換行或微小空白，
+    # 若先用 needed_cols 精確過濾，真正有值的「賣超平均報酬％ / 用於勝率報酬％」欄位會被提前丟掉，
+    # 後面的 fuzzy 欄名比對與成本回推就完全看不到資料，圖片仍會顯示「-」。
     df = read_gsheet_table_optional(
         SHEET_BROKER_10D_DETAIL,
-        needed_cols,
+        None,
         filter_tracked_brokers=False,
     )
     df = filter_df_by_data_scope(df, DATA_SCOPE_ALL)
@@ -3967,6 +3988,29 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     if df.empty:
         empty_meta["chosen_date"] = chosen_date
         return [], empty_meta
+
+    if os.getenv("DEBUG_BROKER_10D_DETAIL", "0").strip().lower() in ("1", "true", "yes"):
+        debug_cols = []
+        for c in [
+            "資料範圍", "統計日期", "分點", "標的股", "標的名稱", "買賣方向",
+            "近10日買進金額", "近10日賣出金額", "近10日淨賣超金額",
+            "賣超平均報酬%", "賣超平均報酬％", "用於勝率報酬%", "用於勝率報酬％",
+            "賣超實現賣出金額", "賣超實現成本", "更新時間", "run_id",
+        ]:
+            real_col = None
+            if c in df.columns:
+                real_col = c
+            else:
+                norm_c = _normalize_gsheet_col_name(c)
+                for existing_col in df.columns:
+                    if _normalize_gsheet_col_name(existing_col) == norm_c:
+                        real_col = existing_col
+                        break
+            if real_col and real_col not in debug_cols:
+                debug_cols.append(real_col)
+        print("近10日產圖實際讀到欄位：", list(df.columns))
+        if debug_cols:
+            print(df[debug_cols].to_string(index=False))
 
     first_row = df.iloc[0].to_dict()
     period_text = strip_gsheet_text_prefix(_pick_first_existing_value(first_row, ["統計期間"]))
