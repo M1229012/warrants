@@ -701,6 +701,38 @@ def _pick_first_existing_value_fuzzy(row, candidates: list[str]):
     return direct
 
 
+def _ensure_exact_column_aliases(df, exact_columns: list[str]):
+    """
+    將 Google Sheet 可能帶有空白 / 換行 / 全形％ 的實際欄名，
+    映射成程式內要用的「精確欄名」。
+
+    例如若 Sheet 實際欄名是「賣超平均報酬％」或「賣超平均報酬%
+」，
+    這裡會複製成一個真正叫做「賣超平均報酬%」的欄位。
+    之後其他邏輯就能用 row.get("賣超平均報酬%") 一字不變地抓值。
+    """
+    try:
+        if df is None or df.empty:
+            return df
+
+        norm_to_real = {}
+        for col in df.columns:
+            norm_col = _normalize_gsheet_col_name(col)
+            if norm_col and norm_col not in norm_to_real:
+                norm_to_real[norm_col] = col
+
+        for exact_col in exact_columns:
+            norm_exact = _normalize_gsheet_col_name(exact_col)
+            real_col = norm_to_real.get(norm_exact)
+            if real_col and real_col != exact_col:
+                # 無論 exact_col 是否存在，都以實際欄位內容覆蓋，確保後續精確抓值一定吃到最新正確資料。
+                df[exact_col] = df[real_col]
+
+        return df
+    except Exception:
+        return df
+
+
 def _pick_first_existing_date(row, candidates: list[str]) -> date | None:
     """
     從同一列依序挑第一個可解析的日期欄位。
@@ -3973,6 +4005,26 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         None,
         filter_tracked_brokers=False,
     )
+    # 近10日分點明細這裡先把關鍵欄位統一成「精確欄名」，
+    # 特別是使用者要求務必直接抓「賣超平均報酬%」這個欄位名稱一字不變。
+    df = _ensure_exact_column_aliases(df, [
+        "賣超平均報酬%",
+        "買超平均報酬%",
+        "用於勝率報酬%",
+        "統計日期",
+        "分點",
+        "標的股",
+        "標的名稱",
+        "買賣方向",
+        "近10日買進金額",
+        "近10日賣出金額",
+        "近10日淨買超金額",
+        "近10日淨賣超金額",
+        "賣超實現賣出金額",
+        "賣超實現成本",
+        "更新時間",
+        "run_id",
+    ])
     df = filter_df_by_data_scope(df, DATA_SCOPE_ALL)
 
     empty_meta = {
@@ -4125,26 +4177,39 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             else:
                 direction = "持平"
 
-        buy_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%",
-            "買超報酬%", "買超報酬率", "買超報酬率%",
-            "買超平均損益%", "買超平均損益率", "買超平均損益率%",
-            "買超損益%", "買超損益率", "買超損益率%",
-            "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%",
-            "買進報酬%", "買進報酬率", "買進報酬率%",
-        ]))
-        sell_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%",
-            "賣超報酬%", "賣超報酬率", "賣超報酬率%",
-            "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%",
-            "賣超損益%", "賣超損益率", "賣超損益率%",
-            "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%",
-            "賣出報酬%", "賣出報酬率", "賣出報酬率%",
-        ]))
-        generic_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "用於勝率報酬%", "用於勝率報酬率",
-            "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
-        ]))
+        # 先直接抓精確欄名：
+        # - 買超一定先抓「買超平均報酬%」
+        # - 賣超一定先抓「賣超平均報酬%」
+        # 使用者要求此欄位名稱必須一字不變，因此這裡先做 direct get，
+        # 只有 exact 欄位真的空白時，才退回其他別名與 fuzzy 比對。
+        buy_ret = normalize_return_pct(row.get("買超平均報酬%"))
+        if buy_ret is None:
+            buy_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+                "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%",
+                "買超報酬%", "買超報酬率", "買超報酬率%",
+                "買超平均損益%", "買超平均損益率", "買超平均損益率%",
+                "買超損益%", "買超損益率", "買超損益率%",
+                "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%",
+                "買進報酬%", "買進報酬率", "買進報酬率%",
+            ]))
+
+        sell_ret = normalize_return_pct(row.get("賣超平均報酬%"))
+        if sell_ret is None:
+            sell_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+                "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%",
+                "賣超報酬%", "賣超報酬率", "賣超報酬率%",
+                "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%",
+                "賣超損益%", "賣超損益率", "賣超損益率%",
+                "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%",
+                "賣出報酬%", "賣出報酬率", "賣出報酬率%",
+            ]))
+
+        generic_ret = normalize_return_pct(row.get("用於勝率報酬%"))
+        if generic_ret is None:
+            generic_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+                "用於勝率報酬%", "用於勝率報酬率",
+                "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
+            ]))
 
         if buy_ret is None and direction == "買超":
             buy_ret = generic_ret
