@@ -3177,10 +3177,24 @@ def apply_safe_result_table_style_to_gsheet(gws, values=None):
                 "cell": {
                     "userEnteredFormat": {
                         "verticalAlignment": "MIDDLE",
-                        "wrapStrategy": "WRAP",
+                        "wrapStrategy": "CLIP",
                     }
                 },
                 "fields": "userEnteredFormat.verticalAlignment,userEnteredFormat.wrapStrategy",
+            }
+        })
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": header_row_idx + 1,
+                    "endIndex": max_rows,
+                },
+                "properties": {
+                    "pixelSize": 30,
+                },
+                "fields": "pixelSize",
             }
         })
 
@@ -9263,8 +9277,8 @@ def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None
             "unmatched_qty": 0.0,
         }
 
-    df["_dt"] = df["日期"].map(parse_date)
-    df = df.dropna(subset=["_dt"]).sort_values(["_dt", "日期"]).reset_index(drop=True)
+    df["dt_parsed"] = df["日期"].map(parse_date)
+    df = df.dropna(subset=["dt_parsed"]).sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
 
     lots = []
     revenue = 0.0
@@ -9294,7 +9308,7 @@ def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None
 
     for row in df.itertuples(index=False):
         row_dict = row._asdict()
-        dt = row_dict.get("_dt")
+        dt = row_dict.get("dt_parsed")
         date_str = normalize_date_str(row_dict.get("日期", ""))
         buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
         sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
@@ -9393,15 +9407,15 @@ def _recent_buy_position_summary_for_item(item, start_dt, target_dt, latest_pric
             "missing_price": False,
         }
 
-    df["_dt"] = df["日期"].map(parse_date)
-    df = df.dropna(subset=["_dt"])
-    df = df[df["_dt"] <= target_dt].sort_values(["_dt", "日期"]).reset_index(drop=True)
+    df["dt_parsed"] = df["日期"].map(parse_date)
+    df = df.dropna(subset=["dt_parsed"])
+    df = df[df["dt_parsed"] <= target_dt].sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
 
     lots = []
 
     for row in df.itertuples(index=False):
         row_dict = row._asdict()
-        dt = row_dict.get("_dt")
+        dt = row_dict.get("dt_parsed")
         date_str = normalize_date_str(row_dict.get("日期", ""))
         buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
         sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
@@ -9512,7 +9526,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         key = (broker_label, broker_name, broker_code, underlying_code)
         rec = agg.setdefault(key, {
             "資料範圍": scope,
-            "統計日期": target_date,
+            "統計日期": add_gsheet_text_prefix(target_date),
             "統計期間": period_text,
             "統計天數": window_days,
             "第一筆日期": "",
@@ -9750,12 +9764,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
 
         rows.append({
             "資料範圍": rec.get("資料範圍", scope),
-            "統計日期": target_date,
+            "統計日期": add_gsheet_text_prefix(target_date),
             "統計期間": period_text,
             "統計天數": window_days,
             "有效日期數": len(dates),
-            "第一筆日期": dates[0],
-            "最後筆日期": dates[-1],
+            "第一筆日期": add_gsheet_text_prefix(dates[0]),
+            "最後筆日期": add_gsheet_text_prefix(dates[-1]),
             "分點": rec.get("分點", ""),
             "分點名稱": rec.get("分點名稱", ""),
             "券商代號": rec.get("券商代號", ""),
