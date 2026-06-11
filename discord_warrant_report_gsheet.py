@@ -3868,14 +3868,17 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
         "分點近10日敗筆數", "近10日敗筆數", "敗筆數",
-        "用於勝率報酬%", "用於勝率報酬率",
+        "用於勝率報酬%", "用於勝率報酬率", "用於勝率報酬％",
         "判定",
         "更新時間", "run_id",
     ]
 
+    # 近10日明細有些欄位是上游後續新增，例如「用於勝率報酬% / 判定」。
+    # 這裡改成整張表讀入，避免 needed_cols 與 Sheet 實際欄名有微小差異時，
+    # 報酬率欄位被提前裁掉，導致圖片賣超報酬率顯示為「-」。
     df = read_gsheet_table_optional(
         SHEET_BROKER_10D_DETAIL,
-        needed_cols,
+        None,
         filter_tracked_brokers=False,
     )
     df = filter_df_by_data_scope(df, DATA_SCOPE_ALL)
@@ -3944,6 +3947,30 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     weighted_sell_ret = 0.0
     weighted_sell_amt = 0.0
 
+    def _norm_broker10d_col_name(name) -> str:
+        s = strip_gsheet_text_prefix(name)
+        s = str(s).strip().replace("％", "%")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    def pick_broker10d_value(row: dict, candidates: list[str]):
+        # 先用原本精準欄名挑值。
+        value = _pick_first_existing_value(row, candidates)
+        if strip_gsheet_text_prefix(value) and strip_gsheet_text_prefix(value) != "-":
+            return value
+
+        # 再用去空白 / 全形百分號轉半形後的欄名做備援。
+        norm_map = {_norm_broker10d_col_name(k): k for k in row.keys()}
+        for col in candidates:
+            real_col = norm_map.get(_norm_broker10d_col_name(col))
+            if not real_col:
+                continue
+            raw = row.get(real_col)
+            s = strip_gsheet_text_prefix(raw)
+            if s and s != "-":
+                return raw
+        return ""
+
     for _, r in df.iterrows():
         row = r.to_dict()
         broker_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["分點", "分點名稱"])).strip() or broker
@@ -3970,22 +3997,23 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             else:
                 direction = "持平"
 
-        buy_ret = normalize_return_pct(_pick_first_existing_value(row, [
-            "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率",
-            "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
-            "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+        buy_ret = normalize_return_pct(pick_broker10d_value(row, [
+            "買超平均報酬%", "買超平均報酬％", "買超平均報酬率", "買超報酬%", "買超報酬％", "買超報酬率",
+            "買超平均損益%", "買超平均損益％", "買超平均損益率", "買超損益%", "買超損益％", "買超損益率",
+            "買進平均報酬%", "買進平均報酬％", "買進平均報酬率", "買進報酬%", "買進報酬％", "買進報酬率",
         ]))
-        sell_ret = normalize_return_pct(_pick_first_existing_value(row, [
-            "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率",
-            "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
-            "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+        sell_ret = normalize_return_pct(pick_broker10d_value(row, [
+            "賣超平均報酬%", "賣超平均報酬％", "賣超平均報酬率", "賣超報酬%", "賣超報酬％", "賣超報酬率",
+            "賣超平均損益%", "賣超平均損益％", "賣超平均損益率", "賣超損益%", "賣超損益％", "賣超損益率",
+            "賣出平均報酬%", "賣出平均報酬％", "賣出平均報酬率", "賣出報酬%", "賣出報酬％", "賣出報酬率",
         ]))
-        generic_ret = normalize_return_pct(_pick_first_existing_value(row, [
-            "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
+        generic_ret = normalize_return_pct(pick_broker10d_value(row, [
+            "平均報酬%", "平均報酬％", "平均報酬率", "報酬率", "報酬率%", "報酬率％", "primary_return", "主要報酬率",
         ]))
-        win_ret = normalize_return_pct(_pick_first_existing_value(row, [
-            "用於勝率報酬%", "用於勝率報酬率",
+        win_ret = normalize_return_pct(pick_broker10d_value(row, [
+            "用於勝率報酬%", "用於勝率報酬％", "用於勝率報酬率",
         ]))
+
         if buy_ret is None and direction == "買超":
             buy_ret = generic_ret
         if sell_ret is None and direction == "賣超":
@@ -3994,12 +4022,14 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             buy_ret = win_ret
         if sell_ret is None and direction == "賣超" and win_ret is not None:
             sell_ret = win_ret
+
         warrant_count = safe_int(_pick_first_existing_value(row, ["涉及權證檔數", "權證檔數"]), 0)
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"]))
 
+        # 上游已經算好的「用於勝率報酬%」是最終應顯示口徑，優先採用。
         primary_ret = win_ret if win_ret is not None else (buy_ret if direction == "買超" else sell_ret if direction == "賣超" else None)
-        outcome = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["判定"])).strip()
+        outcome = strip_gsheet_text_prefix(pick_broker10d_value(row, ["判定"])).strip()
         if outcome not in {"勝", "敗"}:
             outcome = "-"
             if primary_ret is not None:
@@ -4106,24 +4136,33 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     display_sell_total = sum(safe_float(r.get("net_sell_amount"), 0) for r in sell_rows)
     display_net_total = display_buy_total - display_sell_total
 
-    def weighted_avg_return(display_rows, amount_key, return_key):
+    def row_display_return(r, section_type: str):
+        ret = normalize_return_pct(r.get("primary_return"))
+        if ret is None:
+            ret = normalize_return_pct(r.get("buy_return" if section_type == "buy" else "sell_return"))
+        return ret
+
+    def weighted_avg_return(display_rows, amount_key, return_key, section_type):
         weighted_sum = 0.0
         weighted_amt = 0.0
         for r in display_rows:
             amt = safe_float(r.get(amount_key), 0)
             ret = normalize_return_pct(r.get(return_key))
+            if ret is None:
+                ret = row_display_return(r, section_type)
             if ret is None or amt <= 0:
                 continue
             weighted_sum += ret * amt
             weighted_amt += amt
         return round(weighted_sum / weighted_amt, 2) if weighted_amt > 0 else None
 
-    buy_avg_return = weighted_avg_return(buy_rows, "net_buy_amount", "buy_return")
-    sell_avg_return = weighted_avg_return(sell_rows, "net_sell_amount", "sell_return")
+    buy_avg_return = weighted_avg_return(buy_rows, "net_buy_amount", "buy_return", "buy")
+    sell_avg_return = weighted_avg_return(sell_rows, "net_sell_amount", "sell_return", "sell")
 
     shown_rows = buy_rows + sell_rows
-    display_win_count = sum(1 for r in shown_rows if normalize_return_pct(r.get("primary_return")) is not None and safe_float(r.get("primary_return"), 0) > 0)
-    display_loss_count = sum(1 for r in shown_rows if normalize_return_pct(r.get("primary_return")) is not None and safe_float(r.get("primary_return"), 0) <= 0)
+    display_returns = [row_display_return(r, "buy" if r in buy_rows else "sell") for r in shown_rows]
+    display_win_count = sum(1 for ret in display_returns if ret is not None and safe_float(ret, 0) > 0)
+    display_loss_count = sum(1 for ret in display_returns if ret is not None and safe_float(ret, 0) <= 0)
     display_valid_count = display_win_count + display_loss_count
     display_win_rate = round(display_win_count / display_valid_count * 100, 2) if display_valid_count > 0 else None
 
@@ -4368,7 +4407,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 else:
                     net_value = safe_float(r.get("net_sell_amount"), 0)
                     net_color = GREEN
-                ret_val = r.get("primary_return")
+                ret_val = row_display_return(r, section_type)
                 ret_color = return_color(ret_val)
                 values = [
                     str(i),
