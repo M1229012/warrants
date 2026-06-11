@@ -88,9 +88,6 @@ SHEET_TOP15_CONSENSUS_CACHE = os.getenv("SHEET_TOP15_CONSENSUS_CACHE", "快取_T
 SHEET_TOP15_POSITION_DETAIL = os.getenv("SHEET_TOP15_POSITION_DETAIL", "快取_TOP15部位明細")
 SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近7日權證分點共識TOP15")
 SHEET_BROKER_10D_DETAIL = os.getenv("SHEET_BROKER_10D_DETAIL", "快取_近10日分點買賣明細")
-# 近10日分點圖若 Google Sheet 同一天有多批 run_id，可用此環境變數指定要讀哪一批。
-# 例如：BROKER_10D_FORCE_RUN_ID=20260611_061357
-BROKER_10D_FORCE_RUN_ID = os.getenv("BROKER_10D_FORCE_RUN_ID", os.getenv("BROKER_10D_RUN_ID", "")).strip()
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
@@ -335,16 +332,8 @@ def safe_float(v, default=0.0) -> float:
         if s == "" or s == "-":
             return default
 
-        # Google Sheet 可能讀到 1,003,600、1，003，600、+30.36% 或 +30.36％
-        s = (
-            s.replace(",", "")
-             .replace("，", "")
-             .replace("%", "")
-             .replace("％", "")
-             .replace("﹪", "")
-             .replace("＋", "+")
-             .strip()
-        )
+        # Google Sheet 可能讀到 1,003,600 或 +30.36%
+        s = s.replace(",", "").replace("%", "").replace("＋", "+").strip()
         if s.startswith("+"):
             s = s[1:]
 
@@ -655,16 +644,7 @@ def _pick_first_existing_value(row, candidates: list[str]):
 def _normalize_gsheet_col_name(name: str) -> str:
     s = strip_gsheet_text_prefix(name)
     s = str(s).strip()
-    # Google Sheet 表頭有時會因手動換行 / 全形符號 / 多餘空白造成精確欄名對不到。
-    # 這裡統一移除所有空白字元，並把全形百分比轉成半形百分比。
-    s = re.sub(r"\s+", "", s)
-    return (
-        s.replace("％", "%")
-         .replace("﹪", "%")
-         .replace("＋", "+")
-         .replace("（", "(")
-         .replace("）", ")")
-    )
+    return s.replace("％", "%").replace(" ", "")
 
 
 def _pick_first_existing_value_fuzzy(row, candidates: list[str]):
@@ -699,38 +679,6 @@ def _pick_first_existing_value_fuzzy(row, candidates: list[str]):
         if s and s != "-":
             return raw
     return direct
-
-
-def _ensure_exact_column_aliases(df, exact_columns: list[str]):
-    """
-    將 Google Sheet 可能帶有空白 / 換行 / 全形％ 的實際欄名，
-    映射成程式內要用的「精確欄名」。
-
-    例如若 Sheet 實際欄名是「賣超平均報酬％」或「賣超平均報酬%
-」，
-    這裡會複製成一個真正叫做「賣超平均報酬%」的欄位。
-    之後其他邏輯就能用 row.get("賣超平均報酬%") 一字不變地抓值。
-    """
-    try:
-        if df is None or df.empty:
-            return df
-
-        norm_to_real = {}
-        for col in df.columns:
-            norm_col = _normalize_gsheet_col_name(col)
-            if norm_col and norm_col not in norm_to_real:
-                norm_to_real[norm_col] = col
-
-        for exact_col in exact_columns:
-            norm_exact = _normalize_gsheet_col_name(exact_col)
-            real_col = norm_to_real.get(norm_exact)
-            if real_col and real_col != exact_col:
-                # 無論 exact_col 是否存在，都以實際欄位內容覆蓋，確保後續精確抓值一定吃到最新正確資料。
-                df[exact_col] = df[real_col]
-
-        return df
-    except Exception:
-        return df
 
 
 def _pick_first_existing_date(row, candidates: list[str]) -> date | None:
@@ -3337,61 +3285,45 @@ def _parse_cache_update_datetime(value):
 def filter_latest_cache_snapshot(
     df: pd.DataFrame,
     cache_name: str = "快取",
-    prefer_sheet_order: bool = False,
-    force_run_id: str = "",
+    prefer_max_run_id: bool = False,
 ) -> pd.DataFrame:
     """
     同一個統計日期的快取表可能因為 GitHub Action 重跑而累積多個 run_id。
 
     圖片端若只用「統計日期」過濾，會把舊 run 與新 run 一起讀進來，
-    造成 TOP15 / TOP10 出現同標的重複列，或賣超報酬率抓到舊資料。
+    造成 TOP15 / TOP10 出現同標的重複列。
 
     處理方式：
-    1. 若有 force_run_id，優先讀指定批次。
-    2. 若 prefer_sheet_order=True：
-       - 優先用 run_id 字串最大的批次，例如 20260611_061357。
-       - 這比更新時間更穩，因為 Google Sheet 顯示的新資料可能統計日期仍是前一交易日。
-       - 若 run_id 不是 YYYYMMDD_HHMMSS 格式，才退回 Sheet 最上方第一個 run_id。
-    3. 其他情況才用「更新時間最大」與 run_id 字串排序作為備援。
+    1. 預設仍沿用原本邏輯：優先用「更新時間」最大者挑最新 run_id；
+       沒有可解析更新時間時，用 run_id 字串排序作為備援。
+    2. 若 prefer_max_run_id=True，則直接用 run_id 字串最大者作為最新快照。
+       這是給「快取_近10日分點買賣明細」使用，避免指定圖卡日期仍是前一交易日時，
+       先被統計日期卡住而吃到舊 run_id。
+    3. 若工作表沒有 run_id，則不硬切更新時間，避免同一批資料各列更新秒數不同時誤刪。
+       後續仍會再用標的層級去重 / 合併。
     """
     if df is None or df.empty or "run_id" not in df.columns:
         return df
 
     run_series = df["run_id"].astype(str).map(strip_gsheet_text_prefix).str.strip()
 
-    force_run_id = strip_gsheet_text_prefix(force_run_id).strip()
-    if force_run_id:
-        forced = df[run_series == force_run_id].copy()
-        if not forced.empty:
-            if len(forced) != len(df):
-                print(f"  ✅ {cache_name} 已套用指定快照：run_id={force_run_id}｜{len(df):,} 筆 → {len(forced):,} 筆")
-            return forced
-        print(f"  ⚠️ {cache_name} 找不到指定 run_id={force_run_id}，改用自動挑選最新快照。")
-
-    if prefer_sheet_order:
-        # 近10日分點明細專用：直接選 run_id 最大的批次。
-        # 例如 20260611_061357 會明確大於 20260610_xxxxxx，
-        # 避免圖片吃到舊快照。
-        valid_run_ids = [
-            run_id for run_id in run_series.tolist()
-            if re.fullmatch(r"\d{8}_\d{6}", str(run_id).strip())
-        ]
-        best_run_id = max(valid_run_ids) if valid_run_ids else ""
+    if prefer_max_run_id:
+        run_ids = [str(x).strip() for x in run_series.tolist() if str(x).strip()]
+        valid_run_ids = [x for x in run_ids if re.fullmatch(r"\d{8}_\d{6}", x)]
+        best_run_id = max(valid_run_ids) if valid_run_ids else (max(run_ids) if run_ids else "")
 
         if not best_run_id:
-            for run_id in run_series.tolist():
-                if run_id:
-                    best_run_id = run_id
-                    break
+            return df
 
-        if best_run_id:
-            filtered = df[run_series == best_run_id].copy()
-            if not filtered.empty:
-                if len(filtered) != len(df):
-                    print(f"  ✅ {cache_name} 已依最大 run_id 套用最新快照：run_id={best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
-                else:
-                    print(f"  ✅ {cache_name} 採用 run_id={best_run_id}｜{len(filtered):,} 筆")
-                return filtered
+        filtered = df[run_series == best_run_id].copy()
+        if not filtered.empty:
+            if len(filtered) != len(df):
+                print(f"  ✅ {cache_name} 已自動套用最新 run_id：{best_run_id}｜{len(df):,} 筆 → {len(filtered):,} 筆")
+            else:
+                print(f"  ✅ {cache_name} 採用最新 run_id：{best_run_id}｜{len(filtered):,} 筆")
+            return filtered
+
+        return df
 
     best_run_id = ""
     best_score = None
@@ -3994,15 +3926,10 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "近10日淨賣超金額", "淨賣超金額",
         "買賣方向", "方向",
         "涉及權證檔數", "權證檔數", "權證清單",
-        # 近10日快取表的新欄位：圖片端也要讀進來，否則雖然 Sheet 有資料，
-        # 但 read_gsheet_table() 會因 needed_cols 沒列到而提前丟掉，導致賣超報酬率顯示成「-」。
-        "買超剩餘股數", "買超剩餘成本", "買超目前市值", "買超報酬有效權證數", "買超報酬缺價權證數",
-        "賣超實現賣出金額", "賣超實現成本", "賣超成本不足金額",
-        "用於勝率報酬%", "用於勝率報酬率", "判定", "備註",
-        "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%", "買超報酬%", "買超報酬率", "買超報酬率%", "買超平均損益%", "買超平均損益率", "買超平均損益率%", "買超損益%", "買超損益率", "買超損益率%",
-        "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%", "賣超報酬%", "賣超報酬率", "賣超報酬率%", "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%", "賣超損益%", "賣超損益率", "賣超損益率%",
-        "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%", "買進報酬%", "買進報酬率", "買進報酬率%",
-        "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%", "賣出報酬%", "賣出報酬率", "賣出報酬率%",
+        "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率", "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
+        "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率", "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
+        "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+        "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
         "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
@@ -4010,35 +3937,11 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "更新時間", "run_id",
     ]
 
-    # 這裡刻意讀取全部欄位，不再傳 needed_cols。
-    # 原因：Google Sheet 表頭可能出現全形％、換行或微小空白，
-    # 若先用 needed_cols 精確過濾，真正有值的「賣超平均報酬％ / 用於勝率報酬％」欄位會被提前丟掉，
-    # 後面的 fuzzy 欄名比對與成本回推就完全看不到資料，圖片仍會顯示「-」。
     df = read_gsheet_table_optional(
         SHEET_BROKER_10D_DETAIL,
-        None,
+        needed_cols,
         filter_tracked_brokers=False,
     )
-    # 近10日分點明細這裡先把關鍵欄位統一成「精確欄名」，
-    # 特別是使用者要求務必直接抓「賣超平均報酬%」這個欄位名稱一字不變。
-    df = _ensure_exact_column_aliases(df, [
-        "賣超平均報酬%",
-        "買超平均報酬%",
-        "用於勝率報酬%",
-        "統計日期",
-        "分點",
-        "標的股",
-        "標的名稱",
-        "買賣方向",
-        "近10日買進金額",
-        "近10日賣出金額",
-        "近10日淨買超金額",
-        "近10日淨賣超金額",
-        "賣超實現賣出金額",
-        "賣超實現成本",
-        "更新時間",
-        "run_id",
-    ])
     df = filter_df_by_data_scope(df, DATA_SCOPE_ALL)
 
     empty_meta = {
@@ -4061,14 +3964,13 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     def pick_date(row):
         return _pick_first_existing_date(row, ["統計日期", "日期", "目標日期"])
 
-    # 若使用者明確指定 run_id，就先依 run_id 鎖定快照，再從該批資料推統計日期。
-    # 這可避免 target date / 統計日期欄位與實際最新 run_id 不一致時，圖片吃到舊資料。
-    if BROKER_10D_FORCE_RUN_ID:
-        df = filter_latest_cache_snapshot(
-            df,
-            SHEET_BROKER_10D_DETAIL,
-            force_run_id=BROKER_10D_FORCE_RUN_ID,
-        )
+    # 近10日分點買賣明細要先鎖定最新 run_id，再從該批資料推統計日期。
+    # 這樣即使圖卡 target_date 仍是前一個交易日，也不會先被統計日期卡住而吃到舊快照。
+    df = filter_latest_cache_snapshot(
+        df,
+        SHEET_BROKER_10D_DETAIL,
+        prefer_max_run_id=True,
+    )
 
     available_dates = []
     for _, r in df.iterrows():
@@ -4079,23 +3981,13 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     if not available_dates:
         return [], empty_meta
 
-    if BROKER_10D_FORCE_RUN_ID:
-        chosen_date = max(available_dates)
-    elif target is not None:
+    if target is not None:
         valid_dates = [d for d in available_dates if d <= target]
         chosen_date = max(valid_dates) if valid_dates else max(available_dates)
     else:
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
-    # 近10日分點明細的 Google Sheet 最新資料會在最上方，所以這裡不要再單純用更新時間猜。
-    # 直接以 Sheet 最上方的 run_id 作為最新快照；若要手動指定，可設定 BROKER_10D_FORCE_RUN_ID。
-    df = filter_latest_cache_snapshot(
-        df,
-        SHEET_BROKER_10D_DETAIL,
-        prefer_sheet_order=True,
-        force_run_id=BROKER_10D_FORCE_RUN_ID,
-    )
     if broker:
         broker_series = df.apply(lambda r: strip_gsheet_text_prefix(_pick_first_existing_value(r, ["分點", "分點名稱"])).strip(), axis=1)
         df = df[broker_series == broker].copy()
@@ -4104,51 +3996,18 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         empty_meta["chosen_date"] = chosen_date
         return [], empty_meta
 
-    # 這段固定印出來，因為近10日圖最容易因 run_id 或欄位被讀錯而顯示「-」。
-    # 只要 GitHub Actions log 沒看到這幾行，就代表 YML 根本沒有跑到這份程式。
     try:
         selected_run_ids = sorted({
             strip_gsheet_text_prefix(x).strip()
             for x in df.get("run_id", [])
             if strip_gsheet_text_prefix(x).strip()
         }, reverse=True)
-        exact_sell_col_exists = "賣超平均報酬%" in df.columns
-        exact_sell_nonempty = 0
-        if exact_sell_col_exists:
-            exact_sell_nonempty = int(df["賣超平均報酬%"].astype(str).map(strip_gsheet_text_prefix).str.strip().replace("-", "").astype(bool).sum())
         print(
             f"  ✅ 近10日分點明細實際採用 run_id：{selected_run_ids[0] if selected_run_ids else '-'}｜"
             f"分點：{broker or '-'}｜筆數：{len(df):,}"
         )
-        print(
-            f"  ✅ 精確欄位「賣超平均報酬%」存在：{exact_sell_col_exists}｜"
-            f"非空筆數：{exact_sell_nonempty:,}"
-        )
-    except Exception as e:
-        print(f"  ⚠️ 近10日分點明細除錯輸出失敗：{type(e).__name__}: {e}")
-
-    if os.getenv("DEBUG_BROKER_10D_DETAIL", "0").strip().lower() in ("1", "true", "yes"):
-        debug_cols = []
-        for c in [
-            "資料範圍", "統計日期", "分點", "標的股", "標的名稱", "買賣方向",
-            "近10日買進金額", "近10日賣出金額", "近10日淨賣超金額",
-            "賣超平均報酬%", "賣超平均報酬％", "用於勝率報酬%", "用於勝率報酬％",
-            "賣超實現賣出金額", "賣超實現成本", "更新時間", "run_id",
-        ]:
-            real_col = None
-            if c in df.columns:
-                real_col = c
-            else:
-                norm_c = _normalize_gsheet_col_name(c)
-                for existing_col in df.columns:
-                    if _normalize_gsheet_col_name(existing_col) == norm_c:
-                        real_col = existing_col
-                        break
-            if real_col and real_col not in debug_cols:
-                debug_cols.append(real_col)
-        print("近10日產圖實際讀到欄位：", list(df.columns))
-        if debug_cols:
-            print(df[debug_cols].to_string(index=False))
+    except Exception:
+        pass
 
     first_row = df.iloc[0].to_dict()
     period_text = strip_gsheet_text_prefix(_pick_first_existing_value(first_row, ["統計期間"]))
@@ -4168,25 +4027,6 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     weighted_buy_amt = 0.0
     weighted_sell_ret = 0.0
     weighted_sell_amt = 0.0
-
-    def calc_return_pct_from_sell_cost(row_data: dict) -> float | None:
-        """
-        近10日快取若沒有直接提供「賣超平均報酬%」欄位，
-        就用主程式已寫入 Sheet 的「賣超實現賣出金額 / 賣超實現成本」回推報酬率。
-
-        報酬率 = (賣超實現賣出金額 - 賣超實現成本) / 賣超實現成本 * 100
-        """
-        realized_sell_amount = safe_float(_pick_first_existing_value_fuzzy(row_data, [
-            "賣超實現賣出金額", "賣超實現金額", "實現賣出金額",
-        ]), 0)
-        realized_cost = safe_float(_pick_first_existing_value_fuzzy(row_data, [
-            "賣超實現成本", "賣超成本", "實現成本",
-        ]), 0)
-
-        if realized_sell_amount > 0 and realized_cost > 0:
-            return round((realized_sell_amount - realized_cost) / realized_cost * 100.0, 2)
-
-        return None
 
     for _, r in df.iterrows():
         row = r.to_dict()
@@ -4214,50 +4054,23 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             else:
                 direction = "持平"
 
-        # 先直接抓精確欄名：
-        # - 買超一定先抓「買超平均報酬%」
-        # - 賣超一定先抓「賣超平均報酬%」
-        # 使用者要求此欄位名稱必須一字不變，因此這裡先做 direct get，
-        # 只有 exact 欄位真的空白時，才退回其他別名與 fuzzy 比對。
-        buy_ret = normalize_return_pct(row.get("買超平均報酬%"))
-        if buy_ret is None:
-            buy_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-                "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%",
-                "買超報酬%", "買超報酬率", "買超報酬率%",
-                "買超平均損益%", "買超平均損益率", "買超平均損益率%",
-                "買超損益%", "買超損益率", "買超損益率%",
-                "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%",
-                "買進報酬%", "買進報酬率", "買進報酬率%",
-            ]))
-
-        sell_ret = normalize_return_pct(row.get("賣超平均報酬%"))
-        if sell_ret is None:
-            sell_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-                "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%",
-                "賣超報酬%", "賣超報酬率", "賣超報酬率%",
-                "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%",
-                "賣超損益%", "賣超損益率", "賣超損益率%",
-                "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%",
-                "賣出報酬%", "賣出報酬率", "賣出報酬率%",
-            ]))
-
-        generic_ret = normalize_return_pct(row.get("用於勝率報酬%"))
-        if generic_ret is None:
-            generic_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-                "用於勝率報酬%", "用於勝率報酬率",
-                "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
-            ]))
-
+        buy_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+            "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率",
+            "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
+            "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+        ]))
+        sell_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+            "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率",
+            "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
+            "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+        ]))
+        generic_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+            "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
+        ]))
         if buy_ret is None and direction == "買超":
             buy_ret = generic_ret
-
         if sell_ret is None and direction == "賣超":
             sell_ret = generic_ret
-
-        # 最後備援：Sheet 明明有「賣超實現賣出金額 / 賣超實現成本」時，
-        # 即使沒有任何賣超報酬率欄位，也要能回推出賣超報酬率，避免圖卡顯示「-」。
-        if sell_ret is None and direction == "賣超":
-            sell_ret = calc_return_pct_from_sell_cost(row)
         warrant_count = safe_int(_pick_first_existing_value(row, ["涉及權證檔數", "權證檔數"]), 0)
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"]))
@@ -4660,7 +4473,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     y = draw_section("近10日買超 TOP10", buy_rows, y, NAVY, "buy")
     y = draw_section("近10日賣超 TOP10", sell_rows, y, NAVY, "sell")
 
-    text_draw(fig_w / 2, 0.18, "勝率僅以本圖顯示之買超TOP10與賣超TOP10報酬率計算；報酬率 > 0 視為勝，<= 0 視為敗。", 10.8, MUTED, FONT, ha="center")
+    text_draw(fig_w / 2, 0.18, "本圖資料僅供籌碼觀察參考，不構成投資建議；交易請自行評估風險。", 10.8, MUTED, FONT, ha="center")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
@@ -4750,7 +4563,7 @@ def main():
         draw_weekly_warrant_consensus_image(target, weekly_output_path)
         image_paths.append(weekly_output_path)
 
-    if action in [IMAGE_ACTION_BROKER_10D, IMAGE_ACTION_ALL]:
+    if action == IMAGE_ACTION_BROKER_10D:
         print(f"輸出資料來源：{SHEET_BROKER_10D_DETAIL}｜指定分點：{'、'.join(BROKER_10D_IMAGE_BROKERS)}")
         for broker in BROKER_10D_IMAGE_BROKERS:
             broker_path = broker10d_output_dir / f"近10日分點買賣明細_{broker}.png"
