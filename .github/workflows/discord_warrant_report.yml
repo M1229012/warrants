@@ -45,11 +45,8 @@ jobs:
       # 排程預設執行原本的每日圖流程
       RUN_PLAN: "精選五分點每日圖"
 
-      # 近10日分點明細：先強制指定你確認有資料的最新 run_id
-      BROKER_10D_FORCE_RUN_ID: "20260611_061357"
-
-      # 打開除錯，讓 Actions log 直接印出實際採用的 run_id 與欄位狀態
-      DEBUG_BROKER_10D_DETAIL: "1"
+      # 正式執行關閉除錯；若之後要確認近10日圖實際採用 run_id，可暫時改成 "1"
+      DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
       - name: Checkout repository
@@ -79,7 +76,7 @@ jobs:
           fi
 
           if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            python "discord_warrant_branch_report_fixed_v5.py" \
+            python "discord_warrant_report_gsheet.py" \
               --date "${{ github.event.inputs.target_date }}" \
               --action "${ACTION_VALUE}"
           else
