@@ -3900,10 +3900,15 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "近10日淨賣超金額", "淨賣超金額",
         "買賣方向", "方向",
         "涉及權證檔數", "權證檔數", "權證清單",
-        "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率", "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
-        "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率", "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
-        "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
-        "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+        # 近10日快取表的新欄位：圖片端也要讀進來，否則雖然 Sheet 有資料，
+        # 但 read_gsheet_table() 會因 needed_cols 沒列到而提前丟掉，導致賣超報酬率顯示成「-」。
+        "買超剩餘股數", "買超剩餘成本", "買超目前市值", "買超報酬有效權證數", "買超報酬缺價權證數",
+        "賣超實現賣出金額", "賣超實現成本", "賣超成本不足金額",
+        "用於勝率報酬%", "用於勝率報酬率", "判定", "備註",
+        "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%", "買超報酬%", "買超報酬率", "買超報酬率%", "買超平均損益%", "買超平均損益率", "買超平均損益率%", "買超損益%", "買超損益率", "買超損益率%",
+        "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%", "賣超報酬%", "賣超報酬率", "賣超報酬率%", "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%", "賣超損益%", "賣超損益率", "賣超損益率%",
+        "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%", "買進報酬%", "買進報酬率", "買進報酬率%",
+        "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%", "賣出報酬%", "賣出報酬率", "賣出報酬率%",
         "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
@@ -3982,6 +3987,25 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     weighted_sell_ret = 0.0
     weighted_sell_amt = 0.0
 
+    def calc_return_pct_from_sell_cost(row_data: dict) -> float | None:
+        """
+        近10日快取若沒有直接提供「賣超平均報酬%」欄位，
+        就用主程式已寫入 Sheet 的「賣超實現賣出金額 / 賣超實現成本」回推報酬率。
+
+        報酬率 = (賣超實現賣出金額 - 賣超實現成本) / 賣超實現成本 * 100
+        """
+        realized_sell_amount = safe_float(_pick_first_existing_value_fuzzy(row_data, [
+            "賣超實現賣出金額", "賣超實現金額", "實現賣出金額",
+        ]), 0)
+        realized_cost = safe_float(_pick_first_existing_value_fuzzy(row_data, [
+            "賣超實現成本", "賣超成本", "實現成本",
+        ]), 0)
+
+        if realized_sell_amount > 0 and realized_cost > 0:
+            return round((realized_sell_amount - realized_cost) / realized_cost * 100.0, 2)
+
+        return None
+
     for _, r in df.iterrows():
         row = r.to_dict()
         broker_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["分點", "分點名稱"])).strip() or broker
@@ -4009,22 +4033,36 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
                 direction = "持平"
 
         buy_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "買超平均報酬%", "買超平均報酬率", "買超報酬%", "買超報酬率",
-            "買超平均損益%", "買超平均損益率", "買超損益%", "買超損益率",
-            "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
+            "買超平均報酬%", "買超平均報酬率", "買超平均報酬率%",
+            "買超報酬%", "買超報酬率", "買超報酬率%",
+            "買超平均損益%", "買超平均損益率", "買超平均損益率%",
+            "買超損益%", "買超損益率", "買超損益率%",
+            "買進平均報酬%", "買進平均報酬率", "買進平均報酬率%",
+            "買進報酬%", "買進報酬率", "買進報酬率%",
         ]))
         sell_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "賣超平均報酬%", "賣超平均報酬率", "賣超報酬%", "賣超報酬率",
-            "賣超平均損益%", "賣超平均損益率", "賣超損益%", "賣超損益率",
-            "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
+            "賣超平均報酬%", "賣超平均報酬率", "賣超平均報酬率%",
+            "賣超報酬%", "賣超報酬率", "賣超報酬率%",
+            "賣超平均損益%", "賣超平均損益率", "賣超平均損益率%",
+            "賣超損益%", "賣超損益率", "賣超損益率%",
+            "賣出平均報酬%", "賣出平均報酬率", "賣出平均報酬率%",
+            "賣出報酬%", "賣出報酬率", "賣出報酬率%",
         ]))
         generic_ret = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+            "用於勝率報酬%", "用於勝率報酬率",
             "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
         ]))
+
         if buy_ret is None and direction == "買超":
             buy_ret = generic_ret
+
         if sell_ret is None and direction == "賣超":
             sell_ret = generic_ret
+
+        # 最後備援：Sheet 明明有「賣超實現賣出金額 / 賣超實現成本」時，
+        # 即使沒有任何賣超報酬率欄位，也要能回推出賣超報酬率，避免圖卡顯示「-」。
+        if sell_ret is None and direction == "賣超":
+            sell_ret = calc_return_pct_from_sell_cost(row)
         warrant_count = safe_int(_pick_first_existing_value(row, ["涉及權證檔數", "權證檔數"]), 0)
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"]))
