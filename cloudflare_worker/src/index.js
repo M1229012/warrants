@@ -479,23 +479,27 @@ function getBrokerCategory(categoryKey) {
 }
 
 function buildBrokerCategoryButtonsData() {
-  const rows = [];
-
-  for (let i = 0; i < BROKER_CATEGORIES.length; i += 5) {
-    rows.push({
-      type: COMPONENT.ACTION_ROW,
-      components: BROKER_CATEGORIES.slice(i, i + 5).map((cat) => ({
-        type: COMPONENT.BUTTON,
-        style: BUTTON_STYLE.PRIMARY,
-        label: cat.label,
-        custom_id: `ww_cat:${cat.key}:0`,
-      })),
-    });
-  }
-
   return {
     content: "請選擇要查詢的分點分類：",
-    components: rows,
+    components: [
+      {
+        type: COMPONENT.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT.STRING_SELECT,
+            custom_id: "ww_category",
+            placeholder: "選擇分點分類",
+            min_values: 1,
+            max_values: 1,
+            options: BROKER_CATEGORIES.map((cat) => ({
+              label: cat.label,
+              value: cat.key,
+              description: `查看${cat.label}分點`,
+            })),
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -674,6 +678,12 @@ async function handleComponent(interaction, env) {
 
   if (customId === "ww_back") {
     return updateMessageData(buildBrokerCategoryButtonsData());
+  }
+
+  if (customId === "ww_category") {
+    const categoryKey = String(interaction?.data?.values?.[0] || "").trim();
+
+    return updateMessageData(buildBrokerSelectData(categoryKey, 0));
   }
 
   if (customId.startsWith("ww_cat:")) {
