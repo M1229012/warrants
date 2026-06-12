@@ -10592,6 +10592,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "標的股": rec.get("標的股", ""),
             "標的名稱": rec.get("標的名稱", ""),
             "標的10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
+            "現股10日報酬率%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
             "標的10日起始價": round(float(underlying_start_price), 4) if underlying_start_price is not None else "",
             "標的10日收盤價": round(float(underlying_end_price), 4) if underlying_end_price is not None else "",
             "標的10日起始價格日": add_gsheet_text_prefix(underlying_start_price_date) if underlying_start_price_date else "",
@@ -10785,7 +10786,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     headers = [
         "資料範圍", "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "分點", "分點名稱", "券商代號", "標的股", "標的名稱",
-        "標的10日漲跌幅%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
+        "標的10日漲跌幅%", "現股10日報酬率%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
         "買賣方向",
         "近10日買進股數", "近10日買進金額", "近10日賣出股數", "近10日賣出金額",
         "近10日淨買超股數", "近10日淨買超金額", "近10日淨賣超股數", "近10日淨賣超金額",
@@ -10807,7 +10808,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     col_widths = [
         12, 12, 24, 10, 12, 12, 12,
         14, 18, 12, 10, 14,
-        16, 14, 14, 14, 14,
+        16, 16, 14, 14, 14, 14,
         10,
         14, 16, 14, 16,
         16, 18, 16, 18,
