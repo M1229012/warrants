@@ -60,7 +60,7 @@ D_WINDOW_DAYS = 10
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 CACHE_RECENT_SCAN_DAYS = int(os.getenv("CACHE_RECENT_SCAN_DAYS", "3"))
-PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "60"))
+PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "80"))
 PRESCAN_WORKERS = int(os.getenv("PRESCAN_WORKERS", "60"))
 FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
 
@@ -86,6 +86,12 @@ CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
 CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
+
+# 價格快取同步加速：
+# 價格快取筆數很大時，若每次都整張重寫 Google Sheet 會拖慢整體執行。
+# 本機 CSV 仍會完整保存；Google Sheet 則在快取很大且本次只有部分代號更新時，改用增量 append。
+PRICE_CACHE_GSHEET_INCREMENTAL_APPEND = os.getenv("PRICE_CACHE_GSHEET_INCREMENTAL_APPEND", "1").strip().lower() not in ("0", "false", "no")
+PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS = int(os.getenv("PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS", "80000"))
 
 # TOP15 圖片用固定資料集：
 # 主程式在同一次 RUN 內，會把 TOP15 所需的所有部位明細、賣出扣減、價格快照與報酬率
@@ -119,6 +125,13 @@ BROKER_10D_DETAIL_ENABLED = os.getenv("BROKER_10D_DETAIL_ENABLED", "1").strip().
 BROKER_10D_DETAIL_SHEET = os.getenv("BROKER_10D_DETAIL_SHEET", "快取_近10日分點買賣明細")
 BROKER_10D_DETAIL_DAYS = int(os.getenv("BROKER_10D_DETAIL_DAYS", "10"))
 BROKER_10D_PRICE_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_PRICE_LOOKBACK_DAYS", "90"))
+# 近10日明細價格補抓加速：先抓較短區間；完全沒有價格時才補抓完整區間。
+BROKER_10D_PRICE_FAST_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_PRICE_FAST_LOOKBACK_DAYS", "30"))
+BROKER_10D_PRICE_STALE_DAYS = int(os.getenv("BROKER_10D_PRICE_STALE_DAYS", "10"))
+# 預設不再為所有純賣超權證補抓最新價；賣超報酬優先使用 API5 歷史 FIFO 成本。
+# 若賣超完全找不到歷史買進成本，仍會補抓最新價作為備援成本，避免報酬率空白。
+BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES = os.getenv("BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
+BROKER_10D_FETCH_SELL_FALLBACK_PRICES = os.getenv("BROKER_10D_FETCH_SELL_FALLBACK_PRICES", "1").strip().lower() not in ("0", "false", "no")
 
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
@@ -612,7 +625,8 @@ def fetch_twse_stock_day_prices(code, start_dt=None, end_dt=None):
 
     for month_dt in iter_month_starts(start_dt, end_dt):
         try:
-            rp = requests.get(
+            session = get_thread_session()
+            rp = session.get(
                 f"https://www.twse.com.tw/exchangeReport/STOCK_DAY"
                 f"?response=json&date={month_dt}&stockNo={code}",
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -673,7 +687,8 @@ def fetch_tpex_new_trading_stock_prices(code, start_dt=None, end_dt=None):
 
             for url in urls:
                 try:
-                    rp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                    session = get_thread_session()
+                    rp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
                     data = rp.json()
 
                     rows = []
@@ -763,7 +778,8 @@ def fetch_tpex_old_st43_prices(code, start_dt=None, end_dt=None):
                 f"st43_result.php?l=zh-tw&d={roc_month}&stkno={code}"
             )
 
-            rp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            session = get_thread_session()
+            rp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
             data = rp.json()
 
             rows = data.get("aaData", []) if isinstance(data, dict) else []
@@ -830,7 +846,8 @@ def fetch_yahoo_chart_prices(symbol, start_dt=None, end_dt=None, host="query1"):
     )
 
     try:
-        rp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        session = get_thread_session()
+        rp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         data = rp.json()
 
         result = data.get("chart", {}).get("result", [])
@@ -868,7 +885,8 @@ def fetch_yahoo_range_prices(symbol):
         )
 
         try:
-            rp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            session = get_thread_session()
+            rp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
             data = rp.json()
 
             result = data.get("chart", {}).get("result", [])
@@ -922,7 +940,8 @@ def fetch_yahoo_download_prices(symbol, start_dt=None, end_dt=None):
     )
 
     try:
-        rp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        session = get_thread_session()
+        rp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
 
         if rp.status_code != 200 or "Date" not in rp.text:
             return prices
@@ -3786,11 +3805,105 @@ def load_price_cache():
     return price_cache
 
 
-def save_price_cache(price_cache):
+def append_price_cache_rows_to_gsheet(canonical_price_cache, changed_codes):
+    """
+    將本次新增 / 更新的價格資料增量 append 到 Google Sheet「快取_價格」。
+
+    本機 price_cache.csv 仍會完整保存，因此不會遺失舊價格資料；
+    Google Sheet 端改用 append 可避免每次把十幾萬筆價格快取整張重寫。
+    讀回時 load_price_cache() 仍會依「代號 + 日期」覆蓋同日價格，因此少量重複列不會影響計算正確性。
+    """
+    if not PRICE_CACHE_GSHEET_INCREMENTAL_APPEND:
+        return False
+
+    if not GSHEET_CACHE_ENABLED or not gsheet_enabled():
+        return False
+
+    if not canonical_price_cache or not changed_codes:
+        return False
+
+    changed_codes = {
+        normalize_price_code(code)
+        for code in changed_codes
+        if normalize_price_code(code)
+    }
+
+    if not changed_codes:
+        return False
+
+    rows = []
+    for code in sorted(changed_codes):
+        prices = canonical_price_cache.get(code, {})
+        if not prices:
+            continue
+
+        for date_str in sorted(prices.keys()):
+            dt = parse_date(date_str)
+            price = safe_price_float(prices.get(date_str))
+
+            if not dt or price is None:
+                continue
+
+            rows.append({
+                "代號": code,
+                "日期": dt.strftime("%Y/%m/%d"),
+                "收盤價": price,
+            })
+
+    if not rows:
+        return False
+
+    try:
+        title = cache_sheet_name_from_path(PRICE_CACHE_PATH)
+        headers = ["代號", "日期", "收盤價"]
+        ws = get_or_create_worksheet(title, rows=max(len(rows) + 1, 100), cols=len(headers))
+        if ws is None:
+            return False
+
+        try:
+            existing_headers = ws.row_values(1)
+        except Exception:
+            existing_headers = []
+
+        if not existing_headers or all(str(x).strip() == "" for x in existing_headers):
+            header_values = normalize_gsheet_values_for_text_columns([headers])
+            gsheet_api_call(
+                f"寫入價格快取表頭 {title}",
+                ws.update,
+                values=header_values,
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
+
+        values = [[row.get(h, "") for h in headers] for row in rows]
+        normalized = normalize_gsheet_values_for_text_columns([headers] + values)[1:]
+
+        for start in range(0, len(normalized), GSHEET_CHUNK_ROWS):
+            chunk = normalized[start:start + GSHEET_CHUNK_ROWS]
+            gsheet_api_call(
+                f"增量追加價格快取 {title} {start + 1}-{start + len(chunk)}",
+                ws.append_rows,
+                chunk,
+                value_input_option="USER_ENTERED",
+            )
+
+        print(f"  ☁️ 已增量追加價格快取到 Google Sheet：{title}，本次 {len(rows):,} 筆")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 價格快取增量追加到 Google Sheet 失敗：{type(e).__name__}: {e}")
+        return False
+
+
+def save_price_cache(price_cache, changed_codes=None):
     """
     寫入價格持久化快取。
 
     寫入前會再做一次代號正規化，避免 064390 / 64390 之類別名重複存檔。
+
+    加速修正：
+    - 本機 CSV 一律完整保存，確保舊價格資料不遺失。
+    - Google Sheet「快取_價格」在資料量很大且本次只更新部分代號時，改用增量 append，
+      避免每次重新寫入整張價格快取造成執行時間大幅增加。
     """
     if not USE_CACHE or not price_cache:
         return
@@ -3826,9 +3939,28 @@ def save_price_cache(price_cache):
         return
 
     df = pd.DataFrame(rows, columns=["代號", "日期", "收盤價"])
-    write_cache_csv(df, PRICE_CACHE_PATH)
-    print(f"  💾 已更新價格快取：{PRICE_CACHE_PATH}，共 {len(df):,} 筆")
 
+    normalized_changed_codes = {
+        normalize_price_code(code)
+        for code in (changed_codes or [])
+        if normalize_price_code(code)
+    }
+
+    use_incremental_gsheet = (
+        PRICE_CACHE_GSHEET_INCREMENTAL_APPEND
+        and bool(normalized_changed_codes)
+        and len(df) >= PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS
+    )
+
+    if use_incremental_gsheet:
+        write_cache_csv(df, PRICE_CACHE_PATH, sync_gsheet=False)
+        if not append_price_cache_rows_to_gsheet(canonical, normalized_changed_codes):
+            # 增量 append 失敗時退回原本整張同步，避免雲端價格快取落後。
+            write_cache_to_gsheet(df, PRICE_CACHE_PATH)
+    else:
+        write_cache_csv(df, PRICE_CACHE_PATH)
+
+    print(f"  💾 已更新價格快取：{PRICE_CACHE_PATH}，共 {len(df):,} 筆")
 
 def get_cached_prices_for_code(price_cache, code):
     """
@@ -6224,6 +6356,7 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
     print(f"  價格抓取執行緒：{price_workers}")
 
     done = 0
+    changed_price_codes = set()
 
     with ThreadPoolExecutor(max_workers=price_workers) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
@@ -6240,6 +6373,8 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
 
                 if norm_code:
                     persistent_price_cache[norm_code] = merged_prices
+                    if fetched_prices:
+                        changed_price_codes.add(norm_code)
 
                 add_price_aliases(price_cache, code, merged_prices)
 
@@ -6251,7 +6386,7 @@ def fetch_all_prices(a_events, b_events, c_events, d_events):
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 收盤價補抓中...")
 
-    save_price_cache(persistent_price_cache)
+    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
 
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
     return price_cache
@@ -6945,6 +7080,7 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
         return code, fetch_twse_prices(code, start_dt, target_dt)
 
     done = 0
+    changed_price_codes = set()
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -6964,12 +7100,14 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
                 norm_code = normalize_price_code(code)
                 if norm_code:
                     persistent_price_cache[norm_code] = merged_prices
+                    if fetched_prices:
+                        changed_price_codes.add(norm_code)
                 add_price_aliases(price_cache, code, merged_prices)
 
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] TOP15固定資料集權證價格補抓中...")
 
-    save_price_cache(persistent_price_cache)
+    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
 
 
@@ -9483,9 +9621,52 @@ def _near10_window_dates(target_date=None, window_days=None):
     return target_date, target_dt, start_date, start_dt, window_days, period_text
 
 
+def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
+    """
+    判斷近10日賣超是否真的需要最新權證價格作為成本備援。
+
+    若 API5 歷史中已有賣出前的買進成本，賣超報酬可用 FIFO / 歷史均價估算，
+    不需要再補抓最新權證價格；只有在賣出時完全沒有歷史買進成本可參考時，
+    才補抓最新價作為備援，避免報酬率空白。
+    """
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty or "日期" not in df.columns:
+        return False
+
+    df = df.copy()
+    df["dt_parsed"] = df["日期"].map(parse_date)
+    df = df.dropna(subset=["dt_parsed"]).sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
+
+    historical_buy_qty = 0.0
+    historical_buy_amount = 0.0
+
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
+        dt = row_dict.get("dt_parsed")
+        buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+        buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+        sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+
+        in_window = bool(dt and start_dt <= dt <= target_dt)
+
+        # 權證不可當沖：同一天先賣舊庫存，因此這裡要在加入當日買進前先判斷賣出。
+        if in_window and (sell_qty > 0 or sell_amount > 0):
+            if historical_buy_qty <= 0 or historical_buy_amount <= 0:
+                return True
+
+        if buy_qty > 0 and buy_amount > 0:
+            historical_buy_qty += buy_qty
+            historical_buy_amount += buy_amount
+
+    return False
+
+
 def _collect_recent_warrant_codes_for_10d(items, target_date=None):
     target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
+    skipped_no_remaining_position = 0
+    skipped_sell_has_cost = 0
 
     for item in items or []:
         df = item.get("df", pd.DataFrame())
@@ -9495,6 +9676,11 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None):
         warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
         if not warrant_code:
             continue
+
+        recent_buy_amount = 0.0
+        recent_sell_amount = 0.0
+        recent_buy_qty = 0.0
+        recent_sell_qty = 0.0
 
         for row in df.itertuples(index=False):
             row_dict = row._asdict()
@@ -9509,17 +9695,60 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None):
             buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
             sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
 
-            if buy_amount > 0 or sell_amount > 0 or buy_qty > 0 or sell_qty > 0:
+            recent_buy_amount += buy_amount
+            recent_sell_amount += sell_amount
+            recent_buy_qty += buy_qty
+            recent_sell_qty += sell_qty
+
+        if recent_buy_amount <= 0 and recent_sell_amount <= 0 and recent_buy_qty <= 0 and recent_sell_qty <= 0:
+            continue
+
+        if BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES:
+            codes.add(warrant_code)
+            continue
+
+        # 買超報酬需要「近10日買進後仍未賣掉的部位」目前市值，這類權證一定要補最新價。
+        if recent_buy_amount > 0 or recent_buy_qty > 0:
+            position_summary = _recent_buy_position_summary_for_item(
+                item,
+                start_dt,
+                target_dt,
+                latest_price=None,
+            )
+            remaining_cost = top15_safe_float(position_summary.get("remaining_cost", 0.0))
+            if remaining_cost > 0:
                 codes.add(warrant_code)
-                break
+            else:
+                skipped_no_remaining_position += 1
+            continue
+
+        # 純賣超通常可用 API5 歷史 FIFO 成本估報酬，不需要市場最新價。
+        # 只有完全找不到賣出前買進成本時，才補抓最新價作為備援。
+        if recent_sell_amount > 0 or recent_sell_qty > 0:
+            if BROKER_10D_FETCH_SELL_FALLBACK_PRICES and _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
+                codes.add(warrant_code)
+            else:
+                skipped_sell_has_cost += 1
+
+    print(
+        f"  近10日分點明細價格篩選：需最新價 {len(codes):,} 檔｜"
+        f"已排除無剩餘買超部位 {skipped_no_remaining_position:,} 檔｜"
+        f"已排除可用歷史成本計算的純賣超 {skipped_sell_has_cost:,} 檔"
+    )
 
     return codes
-
 
 def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     """
     近10日分點買賣明細需要用「最新權證價格」估算買超部位放到現在的報酬。
-    這裡只補抓近10日有買賣的權證，不改原本 A/B/C/D 價格抓取邏輯。
+
+    加速修正：
+    1. 不再對近10日所有有買賣的權證一律抓價。
+       - 近10日買進後仍有剩餘部位：一定補最新價。
+       - 純賣超且 API5 歷史已有成本：不補最新價，直接用 FIFO / 歷史成本算報酬。
+       - 純賣超但完全沒有歷史成本：才補最新價作為備援。
+    2. 價格補抓採兩段式：先抓 BROKER_10D_PRICE_FAST_LOOKBACK_DAYS，完全沒價格才補抓完整 BROKER_10D_PRICE_LOOKBACK_DAYS。
+    3. 本機價格快取完整保存；Google Sheet 價格快取可增量 append，避免整張重寫拖慢。
     """
     if not BROKER_10D_DETAIL_ENABLED:
         return price_cache
@@ -9530,8 +9759,15 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
 
     target_date = normalize_top15_target_date(target_date)
     target_dt = parse_date(target_date) or datetime.today()
-    start_dt = target_dt - timedelta(days=max(int(BROKER_10D_PRICE_LOOKBACK_DAYS), 1))
     end_dt = min(target_dt, datetime.today())
+
+    full_lookback_days = max(int(BROKER_10D_PRICE_LOOKBACK_DAYS), 1)
+    fast_lookback_days = max(int(BROKER_10D_PRICE_FAST_LOOKBACK_DAYS), 1)
+    fast_lookback_days = min(fast_lookback_days, full_lookback_days)
+    stale_days = max(int(BROKER_10D_PRICE_STALE_DAYS), 0)
+
+    fast_start_dt = target_dt - timedelta(days=fast_lookback_days)
+    full_start_dt = target_dt - timedelta(days=full_lookback_days)
 
     persistent_price_cache = load_price_cache()
     fetch_plan = {}
@@ -9547,20 +9783,36 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
         latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
         latest_dt = parse_date(latest_date) if latest_date else None
 
-        if latest_price is None or latest_dt is None or (target_dt - latest_dt).days > 10:
-            fetch_plan[code] = (start_dt, end_dt)
+        if latest_price is None or latest_dt is None or (target_dt - latest_dt).days > stale_days:
+            fetch_plan[code] = (fast_start_dt, end_dt, full_start_dt)
 
     print(f"【Step 4d】近10日分點明細需檢查權證價格：{len(codes):,} 檔")
     print(f"  近10日分點明細需補抓權證價格：{len(fetch_plan):,} 檔")
+    print(f"  近10日分點明細價格補抓策略：先抓近 {fast_lookback_days} 天，完全無價格才補抓近 {full_lookback_days} 天")
 
     if not fetch_plan:
         return price_cache
 
     def fetch_one(code):
-        sdt, edt = fetch_plan[code]
-        return code, fetch_twse_prices(code, sdt, edt)
+        fast_sdt, edt, full_sdt = fetch_plan[code]
+        fetched_prices = fetch_twse_prices(code, fast_sdt, edt)
+
+        # 若短區間完全沒有價格，而且本地快取也沒有任何可用價格，再補抓完整區間。
+        old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+        merged_after_fast = merge_price_dicts(old_prices, fetched_prices)
+        has_any_price = any(
+            p is not None and p > 0
+            for p in merged_after_fast.values()
+        )
+
+        if not has_any_price and full_sdt < fast_sdt:
+            full_prices = fetch_twse_prices(code, full_sdt, edt)
+            fetched_prices = merge_price_dicts(fetched_prices, full_prices)
+
+        return code, fetched_prices
 
     done = 0
+    changed_price_codes = set()
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -9580,14 +9832,15 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
                 norm_code = normalize_price_code(code)
                 if norm_code:
                     persistent_price_cache[norm_code] = merged_prices
+                    if fetched_prices:
+                        changed_price_codes.add(norm_code)
                 add_price_aliases(price_cache, code, merged_prices)
 
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 近10日分點明細權證價格補抓中...")
 
-    save_price_cache(persistent_price_cache)
+    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
-
 
 def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None):
     """
@@ -10054,6 +10307,18 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         if win_return_pct is None:
             win_return_pct = 0.0
 
+        # 分點層級加權報酬使用「主要方向淨額」作為權重：
+        # - 買超標的：使用近10日淨買超金額
+        # - 賣超標的：使用近10日淨賣超金額
+        # - 買賣平衡：退回使用買進 / 賣出金額較大者
+        # 這樣可以避免單純平均讓小金額標的過度影響整體分點表現。
+        primary_return_weight = net_buy_amount if direction == "買超" else net_sell_amount if direction == "賣超" else max(buy_amount, sell_amount)
+        if primary_return_weight <= 0:
+            primary_return_weight = max(buy_amount, sell_amount, 0.0)
+
+        broker_buy_return_weight = net_buy_amount if net_buy_amount > 0 else 0.0
+        broker_sell_return_weight = net_sell_amount if net_sell_amount > 0 else 0.0
+
         if win_return_pct > 0:
             result = "勝"
         else:
@@ -10144,27 +10409,144 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "分點近10日勝率": "-",
             "分點近10日勝筆數": 0,
             "分點近10日敗筆數": 0,
+            "分點近10日加權平均報酬%": "-",
+            "分點近10日買超加權平均報酬%": "-",
+            "分點近10日賣超加權平均報酬%": "-",
+            "分點近10日加權平均勝報酬%": "-",
+            "分點近10日加權平均敗報酬%": "-",
+            "分點近10日盈虧比": "-",
+            "分點近10日加權期望值%": "-",
+            "分點近10日加權報酬權重金額": 0,
             "更新時間": rec.get("更新時間", update_time),
             "run_id": rec.get("run_id", run_id),
             "權證明細_JSON": json.dumps(warrant_json, ensure_ascii=False),
+            "_分點統計報酬率數值": win_return_pct,
+            "_分點統計權重": primary_return_weight,
+            "_分點統計買超報酬率數值": buy_return_pct,
+            "_分點統計買超權重": broker_buy_return_weight,
+            "_分點統計賣超報酬率數值": sell_return_pct,
+            "_分點統計賣超權重": broker_sell_return_weight,
         })
 
     broker_stats = {}
     for row in rows:
         broker_key = (row.get("分點", ""), row.get("券商代號", ""))
-        stat = broker_stats.setdefault(broker_key, {"win": 0, "loss": 0})
+        stat = broker_stats.setdefault(broker_key, {
+            "win": 0,
+            "loss": 0,
+            "return_weighted_numerator": 0.0,
+            "return_weight": 0.0,
+            "buy_return_weighted_numerator": 0.0,
+            "buy_return_weight": 0.0,
+            "sell_return_weighted_numerator": 0.0,
+            "sell_return_weight": 0.0,
+            "win_return_weighted_numerator": 0.0,
+            "win_return_weight": 0.0,
+            "loss_return_weighted_numerator": 0.0,
+            "loss_return_weight": 0.0,
+        })
+
         if row.get("判定") == "勝":
             stat["win"] += 1
         elif row.get("判定") == "敗":
             stat["loss"] += 1
 
+        ret = row.get("_分點統計報酬率數值")
+        weight = top15_safe_float(row.get("_分點統計權重", 0), 0.0)
+
+        if ret is not None and weight > 0:
+            ret = top15_safe_float(ret, None)
+            if ret is not None:
+                stat["return_weighted_numerator"] += ret * weight
+                stat["return_weight"] += weight
+
+                if ret > 0:
+                    stat["win_return_weighted_numerator"] += ret * weight
+                    stat["win_return_weight"] += weight
+                else:
+                    stat["loss_return_weighted_numerator"] += ret * weight
+                    stat["loss_return_weight"] += weight
+
+        buy_ret = row.get("_分點統計買超報酬率數值")
+        buy_weight = top15_safe_float(row.get("_分點統計買超權重", 0), 0.0)
+        if buy_ret is not None and buy_weight > 0:
+            buy_ret = top15_safe_float(buy_ret, None)
+            if buy_ret is not None:
+                stat["buy_return_weighted_numerator"] += buy_ret * buy_weight
+                stat["buy_return_weight"] += buy_weight
+
+        sell_ret = row.get("_分點統計賣超報酬率數值")
+        sell_weight = top15_safe_float(row.get("_分點統計賣超權重", 0), 0.0)
+        if sell_ret is not None and sell_weight > 0:
+            sell_ret = top15_safe_float(sell_ret, None)
+            if sell_ret is not None:
+                stat["sell_return_weighted_numerator"] += sell_ret * sell_weight
+                stat["sell_return_weight"] += sell_weight
+
     for row in rows:
         broker_key = (row.get("分點", ""), row.get("券商代號", ""))
-        stat = broker_stats.get(broker_key, {"win": 0, "loss": 0})
+        stat = broker_stats.get(broker_key, {
+            "win": 0,
+            "loss": 0,
+            "return_weighted_numerator": 0.0,
+            "return_weight": 0.0,
+            "buy_return_weighted_numerator": 0.0,
+            "buy_return_weight": 0.0,
+            "sell_return_weighted_numerator": 0.0,
+            "sell_return_weight": 0.0,
+            "win_return_weighted_numerator": 0.0,
+            "win_return_weight": 0.0,
+            "loss_return_weighted_numerator": 0.0,
+            "loss_return_weight": 0.0,
+        })
+
         total = stat["win"] + stat["loss"]
+        win_rate_value = stat["win"] / total * 100 if total else None
+
+        avg_return = (
+            stat["return_weighted_numerator"] / stat["return_weight"]
+            if stat["return_weight"] > 0 else None
+        )
+        avg_buy_return = (
+            stat["buy_return_weighted_numerator"] / stat["buy_return_weight"]
+            if stat["buy_return_weight"] > 0 else None
+        )
+        avg_sell_return = (
+            stat["sell_return_weighted_numerator"] / stat["sell_return_weight"]
+            if stat["sell_return_weight"] > 0 else None
+        )
+        avg_win_return = (
+            stat["win_return_weighted_numerator"] / stat["win_return_weight"]
+            if stat["win_return_weight"] > 0 else None
+        )
+        avg_loss_return = (
+            stat["loss_return_weighted_numerator"] / stat["loss_return_weight"]
+            if stat["loss_return_weight"] > 0 else None
+        )
+
+        profit_loss_ratio = None
+        if avg_win_return is not None and avg_win_return > 0 and avg_loss_return is not None and avg_loss_return < 0:
+            profit_loss_ratio = avg_win_return / abs(avg_loss_return)
+
+        expectancy = None
+        if total > 0 and (avg_win_return is not None or avg_loss_return is not None):
+            win_rate_decimal = stat["win"] / total
+            loss_rate_decimal = stat["loss"] / total
+            expectancy = win_rate_decimal * (avg_win_return or 0.0) + loss_rate_decimal * (avg_loss_return or 0.0)
+        elif avg_return is not None:
+            expectancy = avg_return
+
         row["分點近10日勝筆數"] = stat["win"]
         row["分點近10日敗筆數"] = stat["loss"]
-        row["分點近10日勝率"] = _fmt_pct_text(stat["win"] / total * 100, signed=False) if total else "-"
+        row["分點近10日勝率"] = _fmt_pct_text(win_rate_value, signed=False) if win_rate_value is not None else "-"
+        row["分點近10日加權平均報酬%"] = _fmt_pct_text(avg_return, signed=True)
+        row["分點近10日買超加權平均報酬%"] = _fmt_pct_text(avg_buy_return, signed=True)
+        row["分點近10日賣超加權平均報酬%"] = _fmt_pct_text(avg_sell_return, signed=True)
+        row["分點近10日加權平均勝報酬%"] = _fmt_pct_text(avg_win_return, signed=True)
+        row["分點近10日加權平均敗報酬%"] = _fmt_pct_text(avg_loss_return, signed=True)
+        row["分點近10日盈虧比"] = f"{profit_loss_ratio:.2f}" if profit_loss_ratio is not None else "-"
+        row["分點近10日加權期望值%"] = _fmt_pct_text(expectancy, signed=True)
+        row["分點近10日加權報酬權重金額"] = round(float(stat.get("return_weight", 0.0) or 0.0), 0)
 
     rows = sorted(
         rows,
@@ -10195,6 +10577,9 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         "買超平均報酬%", "買超剩餘股數", "買超剩餘成本", "買超目前市值", "買超報酬有效權證數", "買超報酬缺價權證數",
         "賣超平均報酬%", "賣超實現賣出金額", "賣超實現成本", "賣超成本不足金額",
         "用於勝率報酬%", "判定", "備註", "分點近10日勝率", "分點近10日勝筆數", "分點近10日敗筆數",
+        "分點近10日加權平均報酬%", "分點近10日買超加權平均報酬%", "分點近10日賣超加權平均報酬%",
+        "分點近10日加權平均勝報酬%", "分點近10日加權平均敗報酬%", "分點近10日盈虧比",
+        "分點近10日加權期望值%", "分點近10日加權報酬權重金額",
         "更新時間", "run_id", "權證明細_JSON",
     ]
 
@@ -10212,6 +10597,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
         14, 14, 16, 16, 14, 14,
         14, 16, 16, 16,
         14, 10, 36, 14, 14, 14,
+        16, 20, 20, 18, 18, 12, 16, 18,
         20, 18, 90,
     ]
 
