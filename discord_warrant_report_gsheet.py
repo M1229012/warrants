@@ -49,20 +49,72 @@ from matplotlib import font_manager
 
 TRACKED_BROKERS = [
     "華南永昌台中",
-    "元大南屯",
+    "",
     "永豐金竹北",
     "永豐金內湖",
     "富邦敦南",
 ]
 
-# 近10日分點買賣明細圖，只輸出元大南屯。
+# 近10日分點買賣明細圖預設輸出清單。
+# 若由 Discord 指令 / GitHub Actions 指定 broker_name，會在 main() 內覆蓋為單一分點。
 BROKER_10D_IMAGE_BROKERS = [
-    "第一金中壢",
-    "永豐金竹科",
-    "新光",
-    "元大內湖民權",
-    "國票敦北法人",
+    "元大南屯",
 ]
+
+
+def split_broker_names(value: str) -> list[str]:
+    """
+    將 CLI / GitHub Actions / 環境變數傳進來的分點字串轉成清單。
+
+    支援：
+    - 元大南屯
+    - 元大南屯,華南永昌台中
+    - 元大南屯、華南永昌台中
+    - 元大南屯；華南永昌台中
+    - 多行分點清單
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    parts = [
+        x.strip()
+        for x in re.split(r"[,，;；、\n\r\t]+", raw)
+        if x.strip()
+    ]
+
+    out = []
+    for broker in parts:
+        if broker not in out:
+            out.append(broker)
+    return out
+
+
+def resolve_broker_10d_image_brokers(cli_broker: str = "") -> list[str]:
+    """
+    決定近10日分點買賣明細圖要輸出的分點。
+
+    優先順序：
+    1. CLI --broker / --broker-name
+    2. GitHub Actions / Discord 傳入的 BROKER_NAME
+    3. 環境變數 BROKER_10D_BROKER
+    4. 環境變數 BROKER_10D_IMAGE_BROKERS
+    5. 程式原本的 BROKER_10D_IMAGE_BROKERS 預設清單
+
+    這樣 Discord 指令選到單一分點時，只會產生該分點的圖；
+    排程或手動沒有指定分點時，仍維持原本固定清單。
+    """
+    for source in [
+        cli_broker,
+        os.getenv("BROKER_NAME", ""),
+        os.getenv("BROKER_10D_BROKER", ""),
+        os.getenv("BROKER_10D_IMAGE_BROKERS", ""),
+    ]:
+        brokers = split_broker_names(source)
+        if brokers:
+            return brokers
+
+    return list(BROKER_10D_IMAGE_BROKERS)
 
 DATA_SCOPE_SELECTED5 = os.getenv("DATA_SCOPE_SELECTED5", "精選五分點")
 DATA_SCOPE_ALL = os.getenv("DATA_SCOPE_ALL", "全分點")
@@ -4509,6 +4561,13 @@ def main():
     parser.add_argument("--weekly-output", default=os.getenv("WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
     parser.add_argument("--broker10d-output-dir", default=os.getenv("BROKER_10D_OUTPUT_DIR", ""))
     parser.add_argument(
+        "--broker",
+        "--broker-name",
+        dest="broker",
+        default=os.getenv("BROKER_NAME", os.getenv("BROKER_10D_BROKER", "")),
+        help="指定近10日分點買賣明細圖的分點名稱，例如：元大南屯。可由 Discord/GitHub Actions 的 broker_name 傳入。",
+    )
+    parser.add_argument(
         "--action",
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
@@ -4532,6 +4591,7 @@ def main():
     broker10d_output_dir = Path(args.broker10d_output_dir) if args.broker10d_output_dir else output_path.parent
 
     image_paths: list[Path] = []
+    broker_10d_image_brokers = resolve_broker_10d_image_brokers(args.broker)
 
     print(
         f"Google Sheet：{GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME}\n"
@@ -4539,7 +4599,8 @@ def main():
         f"Action選項：{args.action or '(預設)'}\n"
         f"實際執行：{action}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
-        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日"
+        f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日\n"
+        f"近10日分點圖指定分點：{'、'.join(broker_10d_image_brokers) if broker_10d_image_brokers else '-'}"
     )
 
     if action in [IMAGE_ACTION_DAILY_BUNDLE, IMAGE_ACTION_ALL]:
@@ -4568,8 +4629,11 @@ def main():
         image_paths.append(weekly_output_path)
 
     if action == IMAGE_ACTION_BROKER_10D:
-        print(f"輸出資料來源：{SHEET_BROKER_10D_DETAIL}｜指定分點：{'、'.join(BROKER_10D_IMAGE_BROKERS)}")
-        for broker in BROKER_10D_IMAGE_BROKERS:
+        if not broker_10d_image_brokers:
+            raise RuntimeError("近10日分點買賣明細圖沒有指定任何分點。")
+
+        print(f"輸出資料來源：{SHEET_BROKER_10D_DETAIL}｜指定分點：{'、'.join(broker_10d_image_brokers)}")
+        for broker in broker_10d_image_brokers:
             broker_path = broker10d_output_dir / f"近10日分點買賣明細_{broker}.png"
             print(f"輸出圖檔：{broker_path}")
             draw_broker_10d_detail_image(target, broker, broker_path)
