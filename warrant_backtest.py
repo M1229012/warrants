@@ -582,20 +582,111 @@ def merge_price_dicts(*dicts):
     return merged
 
 
+# 已知 ETF / 特殊標的對照表
+#
+# 用途：
+# 1. 權證名稱常用簡稱，例如 T50正2、T50反1，不一定會出現在 ISIN 的完整名稱中。
+# 2. 主動式 ETF 可能含英文字尾，例如 00981A，若只用純數字解析會被截斷。
+# 3. TOP15 / 近7日共識 / 近10日明細等標的分組都需要穩定的「標的代號 + 正式名稱」。
+def normalize_known_underlying_text(value):
+    s = str(value or "").strip()
+
+    if s.startswith("'"):
+        s = s[1:]
+
+    # 全形英數轉半形，避免 Google Sheet / 網頁來源混用全形字元。
+    s = "".join(
+        chr(ord(ch) - 0xFEE0) if 0xFF01 <= ord(ch) <= 0xFF5E else ch
+        for ch in s
+    )
+
+    s = s.upper()
+    s = s.replace("　", " ")
+    s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
+    s = re.sub(r"[\s\-－_＿、，,。．.()（）\[\]【】]+", "", s)
+    return s
+
+
+KNOWN_UNDERLYING_CODE_NAME_MAP = {
+    "00632R": "元大台灣50反1",
+    "00631L": "元大台灣50正2",
+    "00981A": "主動統一台股增長",
+}
+
+_KNOWN_UNDERLYING_ALIAS_RAW_MAP = {
+    "00632R": "00632R",
+    "T50反1": "00632R",
+    "T50反一": "00632R",
+    "元大台灣50反1": "00632R",
+    "台灣50反1": "00632R",
+    "00631L": "00631L",
+    "T50正2": "00631L",
+    "T50正二": "00631L",
+    "元大台灣50正2": "00631L",
+    "台灣50正2": "00631L",
+    "00981A": "00981A",
+    "統一台股增長": "00981A",
+    "主動統一台股增長": "00981A",
+    "台股增長": "00981A",
+}
+
+KNOWN_UNDERLYING_NAME_CODE_MAP = {
+    normalize_known_underlying_text(name): code
+    for name, code in _KNOWN_UNDERLYING_ALIAS_RAW_MAP.items()
+}
+
+
+def get_known_underlying_name_by_code(code):
+    s = normalize_known_underlying_text(code)
+    return KNOWN_UNDERLYING_CODE_NAME_MAP.get(s, "")
+
+
+def resolve_known_underlying_from_text(text):
+    s = normalize_known_underlying_text(text)
+
+    if not s:
+        return "", ""
+
+    # 先處理代號本身或文字中帶代號的情況，例如 00981A 主動統一台股增長。
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        if code in s:
+            return code, name
+
+    # 再處理權證常用簡稱，採最長別名優先，避免「台股增長」搶在完整名稱前面。
+    for alias in sorted(KNOWN_UNDERLYING_NAME_CODE_MAP.keys(), key=len, reverse=True):
+        code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(alias, "")
+
+        if alias and code and alias in s:
+            return code, KNOWN_UNDERLYING_CODE_NAME_MAP.get(code, "")
+
+    return "", ""
+
+
 def normalize_price_code(code):
     s = str(code).strip()
 
-    if s.endswith(".0"):
+    if s.startswith("'"):
+        s = s[1:]
+
+    s = s.upper()
+    s = s.replace("　", " ").strip()
+
+    # 支援從 Yahoo / Google Sheet 讀回來的 00981A.TW、00631L.TW 這類格式。
+    s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
+
+    if s.endswith(".0") and s[:-2].isdigit():
         s = s[:-2]
 
-    s = "".join(ch for ch in s if ch.isdigit())
+    # 保留 ETF / 標的代號的英文字尾，例如 00631L、00632R、00981A。
+    s = re.sub(r"[^0-9A-Z]", "", s)
 
     if not s:
         return ""
 
     # 權證通常為 6 碼；股票通常為 4 碼。
     # 若是 5 碼權證，很可能是 Excel / pandas 吃掉前導 0，補回 6 碼。
-    if len(s) == 5:
+    # 但 00 開頭的 5 碼純數字常見於 ETF / ETN，例如 00919，不能補成 000919。
+    if re.fullmatch(r"\d{5}", s) and not s.startswith("00"):
         return s.zfill(6)
 
     return s
@@ -3029,6 +3120,9 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
     同一標的可能因 Google Sheet / pandas 讀寫變成 2408、'2408、2408.0，
     若直接拿原字串當 group key，就會造成本週 TOP15 同標的重複出現。
     這裡統一轉成穩定代號後再合併與排序。
+
+    ETF 修正：
+    支援 00631L、00632R、00981A 這種含英文字尾標的，避免分組時被截成 00631 / 00632 / 00981。
     """
     candidates = []
     for raw in (value, fallback_text):
@@ -3040,20 +3134,29 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
         candidates.append(s)
 
     for s in candidates:
-        s = s.replace("，", ",").replace(",", "").strip()
+        known_code, _ = resolve_known_underlying_from_text(s)
+        if known_code:
+            return known_code
+
+        s = s.replace("，", ",").replace(",", "").strip().upper()
+        s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
+
         if s.endswith(".0") and s[:-2].isdigit():
             s = s[:-2]
 
-        m = re.match(r"^(\d{4,6})(?:\s|$)", s)
+        m = re.match(r"^([0-9]{4,6}[A-Z]?)(?=\s|　|$|[^0-9A-Z])", s, flags=re.I)
         if m:
-            return m.group(1)
+            return m.group(1).upper()
 
-        if s.isdigit() and 4 <= len(s) <= 6:
-            return s
+        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", s, flags=re.I):
+            return s.upper()
 
-        digits = "".join(ch for ch in s if ch.isdigit())
-        if 4 <= len(digits) <= 6:
-            return digits
+        # 只有完全沒有英文字母時，才退回舊版純數字抽取邏輯。
+        # 這可以避免 00631L / 00981A 被錯誤抽成 00631 / 00981。
+        if not re.search(r"[A-Z]", s, flags=re.I):
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if 4 <= len(digits) <= 6:
+                return digits
 
     return ""
 
@@ -4555,14 +4658,25 @@ def build_stock_map(df):
             parts = cell.split("　", 1)
             code, name = parts[0].strip(), parts[1].strip()
         else:
-            m = re.match(r"^(\d{4})\s+(.+)$", cell)
+            m = re.match(r"^([0-9]{4,6}[A-Z]?)\s+(.+)$", cell, flags=re.I)
             if m:
                 code, name = m.group(1), m.group(2)
             else:
                 continue
 
-        if len(code) == 4 and code.isdigit():
+        code = str(code).strip().upper()
+        name = str(name).strip()
+
+        # 支援：
+        # 1. 4 碼股票：2408
+        # 2. 5 / 6 碼 ETF：00919、006208
+        # 3. 含英文字尾 ETF：00631L、00632R、00981A
+        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", code, flags=re.I):
             stock_map[name] = code
+
+    # 即使 ISIN 名稱或簡稱不一致，也把已知特殊 ETF 正式名稱補進 stock_map。
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        stock_map.setdefault(name, code)
 
     return stock_map
 
@@ -4698,6 +4812,11 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
 
     if not wname:
         return "", ""
+
+    # 先處理權證名稱中的 ETF 特殊簡稱，避免 T50正2 / T50反1 / 台股增長找不到標的。
+    known_code, known_name = resolve_known_underlying_from_text(wname)
+    if known_code:
+        return known_code, known_name
 
     if resolver is None:
         resolver = build_underlying_resolver(stock_map)
