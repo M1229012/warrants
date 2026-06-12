@@ -3987,6 +3987,11 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "買進平均報酬%", "買進平均報酬率", "買進報酬%", "買進報酬率",
         "賣出平均報酬%", "賣出平均報酬率", "賣出報酬%", "賣出報酬率",
         "平均報酬%", "平均報酬率", "報酬率", "報酬率%", "primary_return", "主要報酬率",
+        # 主程式新增的分點層級加權報酬欄位。
+        # 近10日圖卡上方摘要會優先使用這些快取欄位，避免圖片端只用 TOP10 重新估算而與主程式統計口徑不一致。
+        "分點近10日加權平均報酬%", "分點近10日買超加權平均報酬%", "分點近10日賣超加權平均報酬%",
+        "分點近10日加權平均勝報酬%", "分點近10日加權平均敗報酬%", "分點近10日盈虧比",
+        "分點近10日加權期望值%", "分點近10日加權報酬權重金額",
         "分點近10日勝率", "近10日勝率", "勝率",
         "分點近10日勝筆數", "近10日勝筆數", "勝筆數",
         "分點近10日敗筆數", "近10日敗筆數", "敗筆數",
@@ -4012,6 +4017,14 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "net_total": 0.0,
         "avg_buy_return": None,
         "avg_sell_return": None,
+        "weighted_avg_return": None,
+        "weighted_buy_return": None,
+        "weighted_sell_return": None,
+        "weighted_win_return": None,
+        "weighted_loss_return": None,
+        "profit_loss_ratio": None,
+        "weighted_expectancy": None,
+        "weighted_return_amount": 0.0,
     }
 
     if df.empty:
@@ -4205,6 +4218,57 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     avg_buy_return = round(weighted_buy_ret / weighted_buy_amt, 2) if weighted_buy_amt > 0 else None
     avg_sell_return = round(weighted_sell_ret / weighted_sell_amt, 2) if weighted_sell_amt > 0 else None
 
+    def pick_broker_metric(candidates: list[str]):
+        """
+        從近10日分點明細快取中讀取「分點層級」統計值。
+
+        主程式會把同一分點的勝率、加權報酬、加權期望值等欄位重複寫在每一列標的資料中。
+        圖卡端優先讀第一列；若第一列剛好是空值，再往同一批資料其他列找第一個有效值。
+        """
+        raw = _pick_first_existing_value_fuzzy(first_row, candidates)
+        if strip_gsheet_text_prefix(raw) not in ("", "-"):
+            return raw
+
+        for _, rr in df.iterrows():
+            raw = _pick_first_existing_value_fuzzy(rr.to_dict(), candidates)
+            if strip_gsheet_text_prefix(raw) not in ("", "-"):
+                return raw
+
+        return ""
+
+    weighted_avg_return = normalize_return_pct(pick_broker_metric(["分點近10日加權平均報酬%", "分點近10日加權平均報酬率", "分點加權平均報酬%", "加權平均報酬%"]))
+    weighted_buy_return = normalize_return_pct(pick_broker_metric(["分點近10日買超加權平均報酬%", "分點近10日買超加權平均報酬率", "買超加權平均報酬%", "買超加權報酬%"]))
+    weighted_sell_return = normalize_return_pct(pick_broker_metric(["分點近10日賣超加權平均報酬%", "分點近10日賣超加權平均報酬率", "賣超加權平均報酬%", "賣超加權報酬%"]))
+    weighted_win_return = normalize_return_pct(pick_broker_metric(["分點近10日加權平均勝報酬%", "分點近10日加權平均勝報酬率", "加權平均勝報酬%", "加權勝報酬%"]))
+    weighted_loss_return = normalize_return_pct(pick_broker_metric(["分點近10日加權平均敗報酬%", "分點近10日加權平均敗報酬率", "加權平均敗報酬%", "加權敗報酬%"]))
+    weighted_expectancy = normalize_return_pct(pick_broker_metric(["分點近10日加權期望值%", "分點近10日加權期望值", "加權期望值%", "期望值%"]))
+    profit_loss_ratio_raw = pick_broker_metric(["分點近10日盈虧比", "近10日盈虧比", "盈虧比"])
+    profit_loss_ratio = None if strip_gsheet_text_prefix(profit_loss_ratio_raw) in ("", "-") else safe_float(profit_loss_ratio_raw, None)
+    weighted_return_amount = safe_float(pick_broker_metric(["分點近10日加權報酬權重金額", "加權報酬權重金額", "報酬權重金額"]), 0)
+
+    # 舊版主程式尚未產生加權快取欄位時，維持原本圖片端依明細金額加權的備援邏輯。
+    if weighted_buy_return is None:
+        weighted_buy_return = avg_buy_return
+    if weighted_sell_return is None:
+        weighted_sell_return = avg_sell_return
+    if weighted_avg_return is None:
+        primary_weighted_sum = 0.0
+        primary_weighted_amt = 0.0
+        for r in rows:
+            primary_ret = normalize_return_pct(r.get("primary_return"))
+            direction = str(r.get("direction", "")).strip()
+            if direction == "買超":
+                amt = safe_float(r.get("net_buy_amount"), 0)
+            elif direction == "賣超":
+                amt = safe_float(r.get("net_sell_amount"), 0)
+            else:
+                amt = max(safe_float(r.get("buy_amount"), 0), safe_float(r.get("sell_amount"), 0))
+            if primary_ret is None or amt <= 0:
+                continue
+            primary_weighted_sum += primary_ret * amt
+            primary_weighted_amt += amt
+        weighted_avg_return = round(primary_weighted_sum / primary_weighted_amt, 2) if primary_weighted_amt > 0 else None
+
     meta = {
         "broker": broker or strip_gsheet_text_prefix(_pick_first_existing_value(first_row, ["分點", "分點名稱"])),
         "period_text": period_text,
@@ -4217,6 +4281,14 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "net_total": buy_total - sell_total,
         "avg_buy_return": avg_buy_return,
         "avg_sell_return": avg_sell_return,
+        "weighted_avg_return": weighted_avg_return,
+        "weighted_buy_return": weighted_buy_return,
+        "weighted_sell_return": weighted_sell_return,
+        "weighted_win_return": weighted_win_return,
+        "weighted_loss_return": weighted_loss_return,
+        "profit_loss_ratio": profit_loss_ratio,
+        "weighted_expectancy": weighted_expectancy,
+        "weighted_return_amount": weighted_return_amount,
     }
     return rows, meta
 
@@ -4249,8 +4321,18 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
             weighted_amt += amt
         return round(weighted_sum / weighted_amt, 2) if weighted_amt > 0 else None
 
-    buy_avg_return = weighted_avg_return(buy_rows, "net_buy_amount", "buy_return")
-    sell_avg_return = weighted_avg_return(sell_rows, "net_sell_amount", "sell_return")
+    # 圖卡摘要優先使用主程式寫入「快取_近10日分點買賣明細」的分點層級加權報酬。
+    # 若舊版快取尚未有這些欄位，才退回圖片端依 TOP10 金額自行加權估算。
+    buy_avg_return = normalize_return_pct(meta.get("weighted_buy_return"))
+    if buy_avg_return is None:
+        buy_avg_return = weighted_avg_return(buy_rows, "net_buy_amount", "buy_return")
+
+    sell_avg_return = normalize_return_pct(meta.get("weighted_sell_return"))
+    if sell_avg_return is None:
+        sell_avg_return = weighted_avg_return(sell_rows, "net_sell_amount", "sell_return")
+
+    overall_weighted_return = normalize_return_pct(meta.get("weighted_avg_return"))
+    weighted_expectancy = normalize_return_pct(meta.get("weighted_expectancy"))
 
     shown_rows = buy_rows + sell_rows
     display_win_count = sum(1 for r in shown_rows if normalize_return_pct(r.get("primary_return")) is not None and safe_float(r.get("primary_return"), 0) > 0)
@@ -4261,7 +4343,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     # 近10日圖片的重點不是只縮欄位，而是整個輸出畫布要跟表格寬度貼近。
     # 否則即使表格本身不寬，只要 fig_w 太大，左右留白仍會非常巨大。
     # 這裡改成先決定表格寬度，再反推整張圖寬度，讓表格約佔整體寬度 90% 左右。
-    broker10d_table_col_w = [0.52, 2.35, 1.62, 1.62, 1.55, 1.12]
+    broker10d_table_col_w = [0.56, 2.55, 1.70, 1.28, 1.05]
     broker10d_table_w = sum(broker10d_table_col_w)
 
     outer_pad_x = 0.32
@@ -4449,10 +4531,16 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
             text_draw(x + card_w - 0.18, card_y1 + 0.18, extra, 10.8, TEXT, FONT, ha="right", va="bottom")
 
     card_y2 = card_y1 - summary_gap - summary_card_h
+    win_rate_for_card = display_win_rate
+    if win_rate_for_card is None:
+        win_rate_for_card = normalize_return_pct(meta.get("win_rate"))
+    win_count_for_card = display_win_count
+    loss_count_for_card = display_loss_count
+
     summary_cards2 = [
-        ("買超TOP10平均報酬", fmt_pct_plain(buy_avg_return), return_color(buy_avg_return), None),
-        ("賣超TOP10平均報酬", fmt_pct_plain(sell_avg_return), return_color(sell_avg_return), None),
-        ("前10勝率", fmt_pct_plain(display_win_rate), ORANGE, f"勝 {display_win_count} / 敗 {display_loss_count}"),
+        ("近10日加權報酬", fmt_pct_plain(overall_weighted_return), return_color(overall_weighted_return), None),
+        ("前10勝率", fmt_pct_plain(win_rate_for_card), ORANGE, None),
+        ("勝敗筆數", f"勝 {win_count_for_card} / 敗 {loss_count_for_card}", NAVY2, None),
     ]
     for i, (label, value, color, extra) in enumerate(summary_cards2):
         x = summary_left + i * (card_w + card_gap_x)
@@ -4465,7 +4553,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     y = card_y2 - section_gap
 
     def draw_section(title, section_rows, y_top, title_bg, section_type):
-        headers = ["排名", "標的", "買進金額", "賣出金額", "淨額", "報酬率"]
+        headers = ["排名", "標的", "淨額", "加權報酬", "權證數"]
         col_w = broker10d_table_col_w
         table_w = broker10d_table_w
         left = broker10d_table_left
@@ -4503,17 +4591,18 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 if ret_val is None:
                     ret_val = r.get("primary_return")
                 ret_color = return_color(ret_val)
+                warrant_count = safe_int(r.get("warrant_count"), 0)
+                warrant_text = f"{warrant_count}檔" if warrant_count > 0 else "-"
                 values = [
                     str(i),
                     r.get("target", ""),
-                    fmt_amount_wan(r.get("buy_amount", 0)),
-                    fmt_amount_wan(r.get("sell_amount", 0)),
                     fmt_amount_wan(net_value),
                     fmt_pct_plain(ret_val),
+                    warrant_text,
                 ]
-                colors = [TEXT, TEXT, RED, GREEN, net_color, ret_color]
-                aligns = ["center", "left", "right", "right", "right", "right"]
-                bolds = [True, True, True, True, True, True]
+                colors = [TEXT, TEXT, net_color, ret_color, TEXT]
+                aligns = ["center", "left", "right", "right", "center"]
+                bolds = [True, True, True, True, True]
                 x = left
                 for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
                     fp = BOLD if is_bold else FONT
