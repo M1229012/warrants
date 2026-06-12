@@ -3,13 +3,95 @@ import { verifyKey } from "discord-interactions";
 const TYPE = {
   PING: 1,
   APPLICATION_COMMAND: 2,
+  MESSAGE_COMPONENT: 3,
 };
 
 const RESP = {
   PONG: 1,
   CHANNEL_MESSAGE_WITH_SOURCE: 4,
   DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: 5,
+  DEFERRED_UPDATE_MESSAGE: 6,
+  UPDATE_MESSAGE: 7,
 };
+
+const COMPONENT = {
+  ACTION_ROW: 1,
+  BUTTON: 2,
+  STRING_SELECT: 3,
+};
+
+const BUTTON_STYLE = {
+  PRIMARY: 1,
+  SECONDARY: 2,
+  SUCCESS: 3,
+  DANGER: 4,
+};
+
+const BROKER_SELECT_PAGE_SIZE = 25;
+
+const BROKER_CATEGORIES = [
+  {
+    key: "yuanta",
+    label: "元大",
+    brokers: [
+      "元大內湖民權",
+      "元大南屯",
+      "元大善化",
+      "元大敦化",
+      "元大雙和",
+    ],
+  },
+  {
+    key: "sinopac",
+    label: "永豐金",
+    brokers: [
+      "永豐金內湖",
+      "永豐金竹北",
+      "永豐金竹科",
+      "永豐金萬盛",
+      "永豐金潮州",
+    ],
+  },
+  {
+    key: "huanan",
+    label: "華南永昌",
+    brokers: [
+      "華南永昌世貿",
+      "華南永昌台中",
+      "華南永昌岡山",
+    ],
+  },
+  {
+    key: "fubon",
+    label: "富邦",
+    brokers: [
+      "富邦公益",
+      "富邦北高雄",
+      "富邦台北",
+      "富邦敦南",
+    ],
+  },
+  {
+    key: "other",
+    label: "其他",
+    brokers: [
+      "新光",
+      "福邦",
+      "第一金",
+      "第一金中壢",
+      "第一金安和",
+      "群益東大",
+      "群益金鼎中壢",
+      "群益金鼎北高雄",
+      "群益金鼎古亭",
+      "兆豐小港",
+      "凱基士林",
+      "凱基科園",
+      "國票中正",
+      "國票敦北法人",
+    ],
+  },
+];
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -39,12 +121,35 @@ function reply(content, ephemeral = false) {
   });
 }
 
+function replyData(data, ephemeral = false) {
+  return json({
+    type: RESP.CHANNEL_MESSAGE_WITH_SOURCE,
+    data: {
+      ...data,
+      flags: ephemeral ? 64 : data?.flags || 0,
+    },
+  });
+}
+
+function updateMessageData(data) {
+  return json({
+    type: RESP.UPDATE_MESSAGE,
+    data,
+  });
+}
+
 function deferReply(ephemeral = false) {
   return json({
     type: RESP.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
     data: {
       flags: ephemeral ? 64 : 0,
     },
+  });
+}
+
+function deferUpdateMessage() {
+  return json({
+    type: RESP.DEFERRED_UPDATE_MESSAGE,
   });
 }
 
@@ -59,6 +164,23 @@ async function editOriginalResponse(interaction, content) {
     body: JSON.stringify({
       content,
     }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    console.error(`編輯 Discord 原始回應失敗：HTTP ${resp.status}｜${body}`);
+  }
+}
+
+async function editOriginalResponseData(interaction, data) {
+  const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
+
+  const resp = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(data),
   });
 
   if (!resp.ok) {
@@ -240,8 +362,8 @@ async function githubFetch(env, path, options = {}) {
   return data;
 }
 
-async function hasActiveWorkflowRun(env) {
-  const workflow = encodeURIComponent(env.GITHUB_WORKFLOW_FILE);
+async function hasActiveWorkflowRunByFile(env, workflowFile) {
+  const workflow = encodeURIComponent(workflowFile);
   const branch = encodeURIComponent(env.GITHUB_BRANCH || "main");
 
   for (const status of ["queued", "in_progress"]) {
@@ -271,6 +393,18 @@ async function hasActiveWorkflowRun(env) {
   };
 }
 
+async function hasActiveWorkflowRun(env) {
+  return hasActiveWorkflowRunByFile(env, env.GITHUB_WORKFLOW_FILE);
+}
+
+function getBroker10DWorkflowFile(env) {
+  return (
+    env.BROKER_10D_WORKFLOW_FILE ||
+    env.DISCORD_REPORT_WORKFLOW_FILE ||
+    "discord_warrant_report.yml"
+  );
+}
+
 async function triggerWorkflow(env, stockCode, refreshNewsSummary) {
   const workflow = encodeURIComponent(env.GITHUB_WORKFLOW_FILE);
 
@@ -291,10 +425,151 @@ async function triggerWorkflow(env, stockCode, refreshNewsSummary) {
   });
 }
 
+async function triggerBroker10DWorkflow(env, brokerName) {
+  const workflowFile = getBroker10DWorkflowFile(env);
+  const workflow = encodeURIComponent(workflowFile);
+
+  const inputs = {
+    run_plan: env.BROKER_10D_RUN_PLAN || "近10日分點買賣明細圖",
+    broker_name: brokerName,
+  };
+
+  if (env.BROKER_10D_TARGET_DATE) {
+    inputs.target_date = env.BROKER_10D_TARGET_DATE;
+  }
+
+  await githubFetch(env, `/actions/workflows/${workflow}/dispatches`, {
+    method: "POST",
+    body: JSON.stringify({
+      ref: env.GITHUB_BRANCH || "main",
+      inputs,
+    }),
+  });
+}
+
 function option(interaction, name) {
   const options = interaction?.data?.options || [];
   const found = options.find((o) => o.name === name);
   return found ? found.value : undefined;
+}
+
+function getBrokerCategory(categoryKey) {
+  return BROKER_CATEGORIES.find((cat) => cat.key === categoryKey) || null;
+}
+
+function buildBrokerCategoryButtonsData() {
+  return {
+    content: "請選擇要查詢的分點分類：",
+    components: [
+      {
+        type: COMPONENT.ACTION_ROW,
+        components: BROKER_CATEGORIES.map((cat) => ({
+          type: COMPONENT.BUTTON,
+          style: BUTTON_STYLE.PRIMARY,
+          label: cat.label,
+          custom_id: `ww_cat:${cat.key}:0`,
+        })),
+      },
+    ],
+  };
+}
+
+function clampPage(page, totalPages) {
+  const n = Number(page);
+
+  if (!Number.isFinite(n)) {
+    return 0;
+  }
+
+  if (n < 0) {
+    return 0;
+  }
+
+  if (n >= totalPages) {
+    return Math.max(totalPages - 1, 0);
+  }
+
+  return Math.floor(n);
+}
+
+function buildBrokerSelectData(categoryKey, page = 0) {
+  const category = getBrokerCategory(categoryKey);
+
+  if (!category) {
+    return {
+      content: "❌ 找不到這個分點分類，請重新輸入 `/ww`。",
+      components: [],
+    };
+  }
+
+  const brokers = category.brokers || [];
+  const totalPages = Math.max(
+    Math.ceil(brokers.length / BROKER_SELECT_PAGE_SIZE),
+    1
+  );
+
+  const currentPage = clampPage(page, totalPages);
+  const start = currentPage * BROKER_SELECT_PAGE_SIZE;
+  const pageBrokers = brokers.slice(start, start + BROKER_SELECT_PAGE_SIZE);
+
+  const components = [];
+
+  if (pageBrokers.length > 0) {
+    components.push({
+      type: COMPONENT.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT.STRING_SELECT,
+          custom_id: `ww_broker:${category.key}:${currentPage}`,
+          placeholder: `選擇${category.label}分點`,
+          min_values: 1,
+          max_values: 1,
+          options: pageBrokers.map((broker) => ({
+            label: broker,
+            value: broker,
+            description: "產生近10日分點買賣明細圖",
+          })),
+        },
+      ],
+    });
+  }
+
+  const buttons = [
+    {
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "返回分類",
+      custom_id: "ww_back",
+    },
+  ];
+
+  if (totalPages > 1) {
+    buttons.push({
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "上一頁",
+      custom_id: `ww_page:${category.key}:${currentPage - 1}`,
+      disabled: currentPage <= 0,
+    });
+
+    buttons.push({
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "下一頁",
+      custom_id: `ww_page:${category.key}:${currentPage + 1}`,
+      disabled: currentPage >= totalPages - 1,
+    });
+  }
+
+  components.push({
+    type: COMPONENT.ACTION_ROW,
+    components: buttons,
+  });
+
+  return {
+    content: `請選擇要產生近10日買賣明細圖的分點：\n分類：${category.label}｜第 ${currentPage + 1}/${totalPages} 頁`,
+    components,
+  };
 }
 
 async function handleCommand(interaction, env) {
@@ -304,11 +579,16 @@ async function handleCommand(interaction, env) {
     return reply("❌ 不支援的指令。", true);
   }
 
-  const stockRaw = option(interaction, "stock");
+  if (commandName === "ww") {
+    return replyData(buildBrokerCategoryButtonsData(), true);
+  }
 
-  // /w：新聞與本週重點優先使用當日快取
-  // /ww：強制重新抓新聞並重新產生本週重點
-  const refreshNewsSummary = commandName === "ww";
+  const stockRaw = option(interaction, "stock");
+  const refreshRaw = option(interaction, "refresh");
+
+  // /w：新聞與本週重點優先使用當日快取；refresh:true 時重新抓新聞並重新產生本週重點
+  const refreshNewsSummary =
+    refreshRaw === true || String(refreshRaw || "").toLowerCase() === "true";
 
   if (!stockRaw) {
     return reply(
@@ -362,6 +642,85 @@ async function handleCommand(interaction, env) {
     `✅ 已確認：\`${stockCode} ${stockName}\`\n🚀 已觸發 GitHub Actions 產生權證週報。${refreshText}`,
     false
   );
+}
+
+async function handleComponent(interaction, env) {
+  const customId = String(interaction?.data?.custom_id || "");
+
+  if (customId === "ww_back") {
+    return updateMessageData(buildBrokerCategoryButtonsData());
+  }
+
+  if (customId.startsWith("ww_cat:")) {
+    const parts = customId.split(":");
+    const categoryKey = parts[1] || "";
+    const page = parts[2] || "0";
+
+    return updateMessageData(buildBrokerSelectData(categoryKey, page));
+  }
+
+  if (customId.startsWith("ww_page:")) {
+    const parts = customId.split(":");
+    const categoryKey = parts[1] || "";
+    const page = parts[2] || "0";
+
+    return updateMessageData(buildBrokerSelectData(categoryKey, page));
+  }
+
+  if (customId.startsWith("ww_broker:")) {
+    return deferUpdateMessage();
+  }
+
+  return reply("❌ 不支援的互動元件。", true);
+}
+
+async function handleBrokerSelectionAndEdit(interaction, env) {
+  try {
+    const customId = String(interaction?.data?.custom_id || "");
+
+    if (!customId.startsWith("ww_broker:")) {
+      await editOriginalResponseData(interaction, {
+        content: "❌ 不支援的分點選單。",
+        components: [],
+      });
+      return;
+    }
+
+    const brokerName = String(interaction?.data?.values?.[0] || "").trim();
+
+    if (!brokerName) {
+      await editOriginalResponseData(interaction, {
+        content: "❌ 沒有選到分點，請重新輸入 `/ww`。",
+        components: [],
+      });
+      return;
+    }
+
+    const workflowFile = getBroker10DWorkflowFile(env);
+    const active = await hasActiveWorkflowRunByFile(env, workflowFile);
+
+    if (active.active) {
+      await editOriginalResponseData(interaction, {
+        content: "⏳ 目前已有分點圖產生中，請等上一個完成後再查下一個分點。",
+        components: [],
+      });
+      return;
+    }
+
+    await triggerBroker10DWorkflow(env, brokerName);
+
+    await editOriginalResponseData(interaction, {
+      content:
+        `✅ 已確認分點：\`${brokerName}\`\n` +
+        "🚀 已觸發 GitHub Actions 產生「近10日分點買賣明細圖」。",
+      components: [],
+    });
+  } catch (err) {
+    await editOriginalResponseData(interaction, {
+      content: `❌ 執行失敗：${err.message || err}`,
+      components: [],
+    });
+  }
 }
 
 async function runCommandAndEdit(interaction, env) {
@@ -422,8 +781,25 @@ export default {
     }
 
     if (interaction.type === TYPE.APPLICATION_COMMAND) {
+      const commandName = interaction?.data?.name;
+
+      if (commandName === "ww") {
+        return handleCommand(interaction, env);
+      }
+
       ctx.waitUntil(runCommandAndEdit(interaction, env));
       return deferReply(false);
+    }
+
+    if (interaction.type === TYPE.MESSAGE_COMPONENT) {
+      const customId = String(interaction?.data?.custom_id || "");
+
+      if (customId.startsWith("ww_broker:")) {
+        ctx.waitUntil(handleBrokerSelectionAndEdit(interaction, env));
+        return handleComponent(interaction, env);
+      }
+
+      return handleComponent(interaction, env);
     }
 
     return reply("❌ 不支援的 Discord interaction type。", true);
