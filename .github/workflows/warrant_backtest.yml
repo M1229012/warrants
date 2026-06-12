@@ -95,6 +95,15 @@ jobs:
       TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
       DATA_UPDATE_ONLY: "0"
 
+      AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING: "1"
+      PRICE_PREFETCH_STATE_ENABLED: "1"
+      PRICE_PREFETCH_SKIP_IF_DONE_TODAY: "1"
+      PRICE_PREFETCH_FORCE: "0"
+      PRICE_PREFETCH_LOOKBACK_DAYS: "30"
+      PRICE_PREFETCH_TARGET_DATE: ""
+
+      
+
       # 關鍵修正：
       # 精選5分點模式必須絕對完整，不能只靠 prescan 候選。
       # 啟用後會建立「所有認購權證 × 精選5分點」候選池，
