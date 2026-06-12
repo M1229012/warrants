@@ -134,11 +134,16 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 ]
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
-# RUN_MODE=1 精選 5 分點完整追蹤設定：
-# SELECTED_FORCE_ALL_WARRANTS=1：不再只靠 API4 prescan 候選，而是直接建立「所有認購權證 × 精選分點」候選池。
-# SELECTED_REFRESH_ALL_WARRANTS=1：每次執行都對上述候選池用 API5 更新，確保今日大額賣超不會因候選池漏掉而少抓。
+# RUN_MODE=1 / RUN_MODE=2 加速追蹤設定：
+# 以前 RUN_MODE=1 會建立「所有認購權證 × 精選分點」並全量刷新 API5，速度很慢。
+# 這版改成先用 API4 掃最近有目標分點活動的標的股，再展開成「該標的所有認購權證 × 追蹤分點」。
+# 這樣仍可抓到同一標的底下多檔權證分散式買賣超，但不再每天對全市場無差別打 API5。
+# 下列兩個舊環境變數保留相容，但預設流程已改為「活動標的擴展 + 增量刷新」。
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+# 是否把 API4 最近掃到的標的股，展開成同標的所有認購權證 × 追蹤分點。
+# RUN_MODE=1 / 2 都套用，這是目前主要加速來源。
+EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
 PRESCAN_REFRESH_KEYS = set()
@@ -4642,19 +4647,125 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
 
 
+def collect_underlying_codes_from_candidates(candidates):
+    """
+    從 API4 prescan 掃到的候選組合中整理出標的股代號。
+
+    用途：
+    - 先用 API4 找到「最近真的有目標分點活動」的標的股。
+    - 後續只展開這些標的底下的所有認購權證，不再全市場無差別展開。
+    """
+    underlying_codes = set()
+
+    if not candidates:
+        return underlying_codes
+
+    for c in candidates:
+        try:
+            underlying_code = str(c[2]).strip()
+        except Exception:
+            underlying_code = ""
+
+        if not underlying_code:
+            continue
+
+        norm_code = normalize_underlying_code_for_group(underlying_code)
+        underlying_codes.add(norm_code or underlying_code)
+
+    return {code for code in underlying_codes if str(code).strip()}
+
+
+def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes, source_label=""):
+    """
+    依近期有活動的標的股建立候選池。
+
+    核心邏輯：
+    1. API4 只負責找出最近有目標分點活動的標的股。
+    2. 找到標的股後，將該標的底下所有認購權證都展開。
+    3. 再與目前 RUN_MODE 的追蹤分點組合。
+
+    這可以保留「同一標的多檔權證分散式買賣超」的完整性，
+    但避免舊版 RUN_MODE=1 每天打「全市場權證 × 精選分點」API5。
+    """
+    if not warrants or not broker_map or not underlying_codes:
+        return []
+
+    normalized_underlyings = set()
+    for code in underlying_codes:
+        norm_code = normalize_underlying_code_for_group(code)
+        if norm_code:
+            normalized_underlyings.add(norm_code)
+        elif str(code).strip():
+            normalized_underlyings.add(str(code).strip())
+
+    if not normalized_underlyings:
+        return []
+
+    title = source_label.strip() or "活動標的"
+    print(
+        f"【Step 3a】{title} 候選池擴展：近期活動標的 {len(normalized_underlyings):,} 檔 "
+        f"→ 同標的所有認購權證 × 追蹤分點..."
+    )
+
+    candidates = []
+    seen = set()
+    matched_warrants = 0
+
+    for w in warrants:
+        warrant_code = str(w.get("代號", "")).strip()
+        warrant_name = str(w.get("名稱", "")).strip()
+        underlying_code = str(w.get("標的股", "")).strip()
+        underlying_name = str(w.get("標的名稱", "")).strip()
+
+        if not warrant_code or not warrant_name or not underlying_code:
+            continue
+
+        norm_underlying = normalize_underlying_code_for_group(underlying_code) or underlying_code
+
+        if norm_underlying not in normalized_underlyings:
+            continue
+
+        matched_warrants += 1
+
+        for label, (broker_name, broker_code) in broker_map.items():
+            broker_code = str(broker_code).strip()
+            if not broker_code:
+                continue
+
+            c = (
+                warrant_code,
+                warrant_name,
+                norm_underlying,
+                underlying_name,
+                label,
+                str(broker_name).strip(),
+                broker_code,
+            )
+            key = candidate_key_from_tuple(c)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            candidates.append(c)
+
+    print(
+        f"  ✅ {title} 候選池擴展完成：命中權證 {matched_warrants:,} 支 × 分點 {len(broker_map):,} 間 "
+        f"→ {len(candidates):,} 組候選"
+    )
+    return candidates
+
+
 def build_selected_full_market_candidates(warrants, broker_map):
     """
-    RUN_MODE=1 精選分點完整追蹤候選池。
+    保留舊函式名稱供相容。
 
-    目的：
-    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
-    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
-
-    這裡改成針對精選分點建立「所有認購權證 × 精選分點」候選組合，
-    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
-    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
+    注意：
+    舊版這裡會建立「所有認購權證 × 精選分點」，是 RUN_MODE=1 最大時間瓶頸。
+    新版主流程 prescan_all() 已改用「近期活動標的擴展」，不會再預設呼叫這個全市場候選池。
+    若外部程式仍直接呼叫此函式，才會回傳完整候選池。
     """
-    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：所有認購權證 × 精選分點...")
+    print("【Step 3a】相容模式：建立所有認購權證 × 目前追蹤分點候選池...")
 
     if not warrants or not broker_map:
         return []
@@ -4694,11 +4805,10 @@ def build_selected_full_market_candidates(warrants, broker_map):
             candidates.append(c)
 
     print(
-        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
+        f"  ✅ 相容候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
         f"→ {len(candidates):,} 組候選"
     )
     return candidates
-
 
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS
@@ -4706,79 +4816,80 @@ def prescan_all(warrants, broker_map):
     broker_map = filter_broker_map_for_active_targets(broker_map)
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
 
-    # RUN_MODE=1 的核心修正：
-    # 精選 5 分點要「全方面抓資料」，不能再只依賴 API4 prescan 回傳的候選組合。
-    # 因為 API4 prescan 可能只回傳部分排行 / 區間資料，會造成今天大額賣超分散在多檔權證時漏抓。
-    # 這裡直接建立「所有認購權證 × 精選分點」候選池，再由 API5 抓完整歷史。
-    if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS:
-        if cached_candidates:
+    if cached_candidates:
+        if RUN_MODE == 1:
             print("【Step 3a】讀取精選分點候選組合快取...")
             print(f"  ✅ 已讀取精選候選組合快取：{len(cached_candidates):,} 組")
-
-        full_selected_candidates = build_selected_full_market_candidates(warrants, broker_map)
-        full_selected_candidates = filter_candidates_by_broker_map(full_selected_candidates, broker_map)
-
-        merged_candidates = merge_candidates(cached_candidates, full_selected_candidates)
-        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-
-        if SELECTED_REFRESH_ALL_WARRANTS:
-            # 每次都更新所有精選分點 × 全市場權證，確保今日賣超完整。
-            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in full_selected_candidates}
-            print("  ✅ SELECTED_REFRESH_ALL_WARRANTS=1：本次將用 API5 更新所有精選分點完整候選組合。")
         else:
-            # 若使用者日後想加速，可改成 0，退回只更新 API4 最近掃到的候選；但可能再次漏掉分散式大額賣超。
-            scan_days = SELECTED_FULL_SCAN_DAYS
-            print(f"  🔄 SELECTED_REFRESH_ALL_WARRANTS=0：僅補掃最近 {scan_days} 天 API4 候選，用於加速但完整性較低。")
-            recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
-            recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-            PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
-            merged_candidates = merge_candidates(merged_candidates, recent_candidates)
-            merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+            print("【Step 3a】讀取候選組合快取...")
+            print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates):,} 組")
 
-        save_candidates_cache(merged_candidates)
+    if FAST_SKIP_RECENT_PRESCAN:
+        print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前仍會補掃最近資料，避免漏掉新權證 / 新候選組合。")
 
-        print(
-            f"  ✅ 精選分點候選組合完成：快取 {len(cached_candidates):,} 組，"
-            f"完整候選 {len(full_selected_candidates):,} 組，合併後 {len(merged_candidates):,} 組"
-        )
-        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
-
-        return merged_candidates
-
+    # 新版 RUN_MODE=1 / 2 共用流程：
+    # 1. 先用 API4 掃最近幾天，找出目標分點近期真的有活動的權證與標的。
+    # 2. 再把這些標的底下所有認購權證展開成候選池。
+    # 3. 只有這批近期活動標的候選池需要重新打 API5；舊候選優先讀快取。
     if cached_candidates:
-        print("【Step 3a】讀取候選組合快取...")
-        print(f"  ✅ 已讀取候選組合快取：{len(cached_candidates)} 組")
+        scan_days = SELECTED_FULL_SCAN_DAYS if RUN_MODE == 1 else CACHE_RECENT_SCAN_DAYS
+    else:
+        # 第一次沒有候選快取時，掃長一點建立初始候選池。
+        scan_days = max(40, SELECTED_FULL_SCAN_DAYS if RUN_MODE == 1 else CACHE_RECENT_SCAN_DAYS)
 
-        if FAST_SKIP_RECENT_PRESCAN:
-            print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前每日主流程仍會補掃全市場最近資料，避免漏掉新權證 / 新候選組合。")
-
-        # RUN_MODE=2 維持原本完整分點清單邏輯：
-        # 先保留候選組合快取，再用 API4 補掃最近幾天的新候選組合。
-        scan_days = CACHE_RECENT_SCAN_DAYS
-        print(f"  🔄 補掃全市場最近 {scan_days} 天，用來發現新權證 / 新候選組合...")
-
-        recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
-        recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
-        PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
-
-        merged_candidates = merge_candidates(cached_candidates, recent_candidates)
-        merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-        save_candidates_cache(merged_candidates)
-
+    if RUN_MODE == 1:
         print(
-            f"  ✅ 候選組合快取合併完成：舊 {len(cached_candidates)} 組，"
-            f"最近掃到 {len(recent_candidates)} 組，合併後 {len(merged_candidates)} 組"
+            f"  🔄 RUN_MODE=1：補掃全市場最近 {scan_days} 天，"
+            "先鎖定精選分點有活動的標的，再展開同標的所有權證。"
         )
-        print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS)} 組")
+    else:
+        print(
+            f"  🔄 RUN_MODE=2：補掃全市場最近 {scan_days} 天，"
+            "先鎖定完整分點清單有活動的標的，再展開同標的所有權證。"
+        )
 
-        return merged_candidates
+    recent_candidates = prescan_all_live(warrants, broker_map, scan_days=scan_days)
+    recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
 
-    initial_scan_days = 40
-    candidates = prescan_all_live(warrants, broker_map, scan_days=initial_scan_days)
-    candidates = filter_candidates_by_broker_map(candidates, broker_map)
-    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in candidates}
-    save_candidates_cache(candidates)
-    return candidates
+    active_underlyings = collect_underlying_codes_from_candidates(recent_candidates)
+
+    if EXPAND_ACTIVE_UNDERLYING_WARRANTS and active_underlyings:
+        mode_label = "精選分點活動標的" if RUN_MODE == 1 else "全分點活動標的"
+        expanded_candidates = build_underlying_expanded_candidates(
+            warrants,
+            broker_map,
+            active_underlyings,
+            source_label=mode_label,
+        )
+        expanded_candidates = filter_candidates_by_broker_map(expanded_candidates, broker_map)
+    else:
+        expanded_candidates = []
+        if not active_underlyings:
+            print("  ⚠️ 最近 API4 未掃到可展開的活動標的，本次只使用既有候選快取或 API4 直接候選。")
+        else:
+            print("  ⚠️ EXPAND_ACTIVE_UNDERLYING_WARRANTS=0，略過活動標的候選池擴展。")
+
+    refresh_candidates = merge_candidates(recent_candidates, expanded_candidates)
+    refresh_candidates = filter_candidates_by_broker_map(refresh_candidates, broker_map)
+
+    # 只有最近 API4 掃到的候選，以及由近期活動標的展開出的候選，需要重新打 API5。
+    # 舊候選如果快取已有資料，就不再每天重抓 250 天歷史。
+    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in refresh_candidates}
+
+    merged_candidates = merge_candidates(cached_candidates, refresh_candidates)
+    merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+
+    save_candidates_cache(merged_candidates)
+
+    print(
+        f"  ✅ 候選組合完成：快取 {len(cached_candidates):,} 組，"
+        f"API4直接候選 {len(recent_candidates):,} 組，"
+        f"活動標的擴展 {len(expanded_candidates):,} 組，"
+        f"合併後 {len(merged_candidates):,} 組"
+    )
+    print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
+
+    return merged_candidates
 
 
 # ══════════════════════════════════════════════════════════════════════
