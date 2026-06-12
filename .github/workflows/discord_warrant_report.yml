@@ -18,6 +18,10 @@ on:
           - "本週權證共識買賣超TOP15"
           - "近10日分點買賣明細圖"
           - "全部圖片"
+      broker_name:
+        description: "指定分點名稱，例如 元大南屯。只有執行近10日分點買賣明細圖時使用"
+        required: false
+        default: ""
 
   schedule:
     # 台灣時間 14:30 = UTC 06:30
@@ -70,19 +74,24 @@ jobs:
       - name: Generate image from Google Sheet and send to Discord
         run: |
           ACTION_VALUE="${RUN_PLAN}"
+          TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
+          BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
 
           if [ -n "${{ github.event.inputs.run_plan }}" ]; then
             ACTION_VALUE="${{ github.event.inputs.run_plan }}"
           fi
 
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            python "discord_warrant_report_gsheet.py" \
-              --date "${{ github.event.inputs.target_date }}" \
-              --action "${ACTION_VALUE}"
-          else
-            python "discord_warrant_report_gsheet.py" \
-              --action "${ACTION_VALUE}"
+          CMD=(python "discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
+
+          if [ -n "${TARGET_DATE_VALUE}" ]; then
+            CMD+=(--date "${TARGET_DATE_VALUE}")
           fi
+
+          if [ -n "${BROKER_NAME_VALUE}" ]; then
+            CMD+=(--broker "${BROKER_NAME_VALUE}")
+          fi
+
+          "${CMD[@]}"
 
       - name: Upload generated image artifact
         uses: actions/upload-artifact@v4
