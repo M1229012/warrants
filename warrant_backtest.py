@@ -4832,12 +4832,47 @@ def collect_underlying_codes_from_candidates(candidates):
     return {code for code in underlying_codes if str(code).strip()}
 
 
-def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes, source_label=""):
+def collect_underlying_broker_pairs_from_candidates(candidates):
+    """
+    從 API4 prescan 候選整理出「標的股 + 券商代號」活動配對。
+
+    舊版只要某標的近期有活動，就展開成「該標的所有認購權證 × 所有追蹤分點」，
+    RUN_MODE=2 會膨脹到百萬組候選。
+
+    新版只展開同標的 + 同一個近期真的有活動的分點。
+    例如 API4 掃到「元大南屯 × 南亞科」，才展開：
+    南亞科所有認購權證 × 元大南屯。
+    """
+    pairs = set()
+
+    if not candidates:
+        return pairs
+
+    for c in candidates:
+        try:
+            underlying_code = normalize_underlying_code_for_group(c[2]) or str(c[2]).strip()
+            broker_code = str(c[6]).strip()
+        except Exception:
+            underlying_code = ""
+            broker_code = ""
+
+        if underlying_code and broker_code:
+            pairs.add((underlying_code, broker_code))
+
+    return pairs
+
+
+def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes, source_label="", active_pairs=None):
     """
     依近期有活動的標的股建立候選池。
 
-    只要某標的近期被追蹤分點碰到，就展開該標的底下所有認購權證 × 追蹤分點。
-    這樣可以保留同標的多檔權證分散式買賣超完整性，但不再每天全市場無差別 API5。
+    核心邏輯：
+    1. API4 先找出最近有活動的「標的股 + 分點」。
+    2. 只對同一個活動配對展開：同標的所有認購權證 × 同分點。
+    3. 若 active_pairs 沒有傳入，才退回舊的「標的 × 追蹤分點」相容模式。
+
+    這樣仍可抓到「同一分點在同一標的多檔權證分散式買賣超」，
+    但不會在 RUN_MODE=2 膨脹成全市場權證 × 全部分點。
     """
     if not warrants or not broker_map or not underlying_codes:
         return []
@@ -4853,15 +4888,37 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
     if not normalized_underlyings:
         return []
 
+    active_pairs = active_pairs or set()
+    active_pairs = {
+        (normalize_underlying_code_for_group(u) or str(u).strip(), str(b).strip())
+        for u, b in active_pairs
+        if str(u).strip() and str(b).strip()
+    }
+
+    broker_code_to_info = {}
+    for label, (broker_name, broker_code) in broker_map.items():
+        broker_code = str(broker_code).strip()
+        if broker_code:
+            broker_code_to_info[broker_code] = (label, str(broker_name).strip(), broker_code)
+
     title = source_label.strip() or "活動標的"
-    print(
-        f"【Step 3a】{title} 候選池擴展：近期活動標的 {len(normalized_underlyings):,} 檔 "
-        f"→ 同標的所有認購權證 × 追蹤分點..."
-    )
+
+    if active_pairs:
+        print(
+            f"【Step 3a】{title} 候選池擴展：近期活動標的 {len(normalized_underlyings):,} 檔，"
+            f"活動標的×分點配對 {len(active_pairs):,} 組 "
+            f"→ 同標的所有認購權證 × 同活動分點..."
+        )
+    else:
+        print(
+            f"【Step 3a】{title} 候選池擴展：近期活動標的 {len(normalized_underlyings):,} 檔 "
+            f"→ 同標的所有認購權證 × 追蹤分點 [相容模式]..."
+        )
 
     candidates = []
     seen = set()
     matched_warrants = 0
+    matched_pairs = set()
 
     for w in warrants:
         warrant_code = str(w.get("代號", "")).strip()
@@ -4877,20 +4934,33 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
         if norm_underlying not in normalized_underlyings:
             continue
 
+        if active_pairs:
+            active_broker_codes = [
+                broker_code
+                for u, broker_code in active_pairs
+                if u == norm_underlying and broker_code in broker_code_to_info
+            ]
+            broker_infos = [broker_code_to_info[broker_code] for broker_code in active_broker_codes]
+        else:
+            broker_infos = [
+                (label, str(broker_name).strip(), str(broker_code).strip())
+                for label, (broker_name, broker_code) in broker_map.items()
+                if str(broker_code).strip()
+            ]
+
+        if not broker_infos:
+            continue
+
         matched_warrants += 1
 
-        for label, (broker_name, broker_code) in broker_map.items():
-            broker_code = str(broker_code).strip()
-            if not broker_code:
-                continue
-
+        for label, broker_name, broker_code in broker_infos:
             c = (
                 warrant_code,
                 warrant_name,
                 norm_underlying,
                 underlying_name,
                 label,
-                str(broker_name).strip(),
+                broker_name,
                 broker_code,
             )
             key = candidate_key_from_tuple(c)
@@ -4899,14 +4969,14 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
                 continue
 
             seen.add(key)
+            matched_pairs.add((norm_underlying, broker_code))
             candidates.append(c)
 
     print(
-        f"  ✅ {title} 候選池擴展完成：命中權證 {matched_warrants:,} 支 × 分點 {len(broker_map):,} 間 "
-        f"→ {len(candidates):,} 組候選"
+        f"  ✅ {title} 候選池擴展完成：命中權證 {matched_warrants:,} 支，"
+        f"命中活動配對 {len(matched_pairs):,} 組 → {len(candidates):,} 組候選"
     )
     return candidates
-
 
 def build_selected_full_market_candidates(warrants, broker_map):
     """
@@ -5008,6 +5078,7 @@ def prescan_all(warrants, broker_map):
     recent_candidates = filter_candidates_by_broker_map(recent_candidates, broker_map)
 
     active_underlyings = collect_underlying_codes_from_candidates(recent_candidates)
+    active_underlying_broker_pairs = collect_underlying_broker_pairs_from_candidates(recent_candidates)
 
     if EXPAND_ACTIVE_UNDERLYING_WARRANTS and active_underlyings:
         mode_label = "精選分點活動標的" if RUN_MODE == 1 else "全分點活動標的"
@@ -5016,6 +5087,7 @@ def prescan_all(warrants, broker_map):
             broker_map,
             active_underlyings,
             source_label=mode_label,
+            active_pairs=active_underlying_broker_pairs,
         )
         expanded_candidates = filter_candidates_by_broker_map(expanded_candidates, broker_map)
     else:
@@ -5042,6 +5114,7 @@ def prescan_all(warrants, broker_map):
     print(
         f"  ✅ 候選組合完成：快取 {len(cached_candidates):,} 組，"
         f"API4直接候選 {len(recent_candidates):,} 組，"
+        f"活動標的×分點配對 {len(active_underlying_broker_pairs):,} 組，"
         f"活動標的擴展 {len(expanded_candidates):,} 組，"
         f"合併後 {len(merged_candidates):,} 組"
     )
