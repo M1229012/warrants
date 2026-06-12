@@ -29,6 +29,10 @@ const BUTTON_STYLE = {
 
 const BROKER_SELECT_PAGE_SIZE = 25;
 
+const BROKER_DISPLAY_NAMES = {
+  群益東大: "群益金鼎東大",
+};
+
 const BROKER_CATEGORIES = [
   {
     key: "yuanta",
@@ -72,6 +76,16 @@ const BROKER_CATEGORIES = [
     ],
   },
   {
+    key: "capital",
+    label: "群益金鼎",
+    brokers: [
+      "群益東大",
+      "群益金鼎中壢",
+      "群益金鼎北高雄",
+      "群益金鼎古亭",
+    ],
+  },
+  {
     key: "other",
     label: "其他",
     brokers: [
@@ -80,10 +94,6 @@ const BROKER_CATEGORIES = [
       "第一金",
       "第一金中壢",
       "第一金安和",
-      "群益東大",
-      "群益金鼎中壢",
-      "群益金鼎北高雄",
-      "群益金鼎古亭",
       "兆豐小港",
       "凱基士林",
       "凱基科園",
@@ -92,6 +102,11 @@ const BROKER_CATEGORIES = [
     ],
   },
 ];
+
+function displayBrokerName(brokerName) {
+  const name = String(brokerName || "").trim();
+  return BROKER_DISPLAY_NAMES[name] || name;
+}
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -525,7 +540,7 @@ function buildBrokerSelectData(categoryKey, page = 0) {
           min_values: 1,
           max_values: 1,
           options: pageBrokers.map((broker) => ({
-            label: broker,
+            label: displayBrokerName(broker),
             value: broker,
             description: "產生近10日分點買賣明細圖",
           })),
@@ -639,7 +654,7 @@ async function handleCommand(interaction, env) {
     : "\n📦 本次會優先使用當日快取；沒有快取才重新產生。";
 
   return reply(
-    `✅ 已確認：\`${stockCode} ${stockName}\`\n🚀 已觸發 GitHub Actions 產生權證週報。${refreshText}`,
+    `✅ 已確認：\`${stockCode} ${stockName}\`\n🔎 已成功送出查詢，權證週報正在產生中。${refreshText}`,
     false
   );
 }
@@ -711,8 +726,8 @@ async function handleBrokerSelectionAndEdit(interaction, env) {
 
     await editOriginalResponseData(interaction, {
       content:
-        `✅ 已確認分點：\`${brokerName}\`\n` +
-        "🚀 已觸發 GitHub Actions 產生「近10日分點買賣明細圖」。",
+        `✅ 已確認分點：\`${displayBrokerName(brokerName)}\`\n` +
+        "📊 已成功送出查詢，「近10日分點買賣明細圖」正在產生中。",
       components: [],
     });
   } catch (err) {
