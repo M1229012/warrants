@@ -146,8 +146,11 @@ SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近
 SHEET_BROKER_10D_DETAIL = os.getenv("SHEET_BROKER_10D_DETAIL", "快取_近10日分點買賣明細")
 # 近10日分點明細圖的「共識訊號」判斷門檻。
 # 會以同一批「快取_近10日分點買賣明細」內所有分點一起判斷，而不是只看目前圖片的單一分點。
+# 分歧 / 逆向不只看有沒有反方向分點，也會看反方向金額占比，避免同一標的只要有人買、有人賣就被判成分歧。
 BROKER_10D_CONSENSUS_MIN_SAME_BROKERS = int(os.getenv("BROKER_10D_CONSENSUS_MIN_SAME_BROKERS", "2"))
 BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS = int(os.getenv("BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS", "2"))
+BROKER_10D_CONSENSUS_DIVERGENCE_AMOUNT_RATIO = float(os.getenv("BROKER_10D_CONSENSUS_DIVERGENCE_AMOUNT_RATIO", "0.5"))
+BROKER_10D_CONSENSUS_REVERSE_AMOUNT_RATIO = float(os.getenv("BROKER_10D_CONSENSUS_REVERSE_AMOUNT_RATIO", "1.0"))
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
@@ -4067,7 +4070,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     consensus_source_df = df.copy()
 
     def build_broker_10d_consensus_map(source_df: pd.DataFrame):
-        consensus = defaultdict(lambda: {"buy": set(), "sell": set()})
+        consensus = defaultdict(lambda: {"buy": defaultdict(float), "sell": defaultdict(float)})
 
         for _, rr in source_df.iterrows():
             row = rr.to_dict()
@@ -4100,13 +4103,13 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
                     direction = "持平"
 
             if direction == "買超" and net_buy_amount > 0:
-                consensus[key]["buy"].add(broker_name)
+                consensus[key]["buy"][broker_name] += net_buy_amount
             elif direction == "賣超" and net_sell_amount > 0:
-                consensus[key]["sell"].add(broker_name)
+                consensus[key]["sell"][broker_name] += net_sell_amount
             elif net_buy_amount > net_sell_amount and net_buy_amount > 0:
-                consensus[key]["buy"].add(broker_name)
+                consensus[key]["buy"][broker_name] += net_buy_amount
             elif net_sell_amount > net_buy_amount and net_sell_amount > 0:
-                consensus[key]["sell"].add(broker_name)
+                consensus[key]["sell"][broker_name] += net_sell_amount
 
         return consensus
 
@@ -4115,27 +4118,50 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         if not info:
             return "-"
 
-        buy_count = len(info.get("buy", set()))
-        sell_count = len(info.get("sell", set()))
+        buy_amount_by_broker = info.get("buy", {}) or {}
+        sell_amount_by_broker = info.get("sell", {}) or {}
+        buy_count = len(buy_amount_by_broker)
+        sell_count = len(sell_amount_by_broker)
+        buy_total = sum(safe_float(v, 0) for v in buy_amount_by_broker.values())
+        sell_total = sum(safe_float(v, 0) for v in sell_amount_by_broker.values())
         direction = str(direction or "").strip()
 
         if direction == "買超":
             same_count = buy_count
             opposite_count = sell_count
+            same_amount = buy_total
+            opposite_amount = sell_total
             same_word = "買"
         elif direction == "賣超":
             same_count = sell_count
             opposite_count = buy_count
+            same_amount = sell_total
+            opposite_amount = buy_total
             same_word = "賣"
         else:
             return "-"
 
-        if same_count <= 0:
+        if same_count <= 0 or same_amount <= 0:
             return "-"
-        if same_count == 1 and opposite_count >= BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS:
+
+        opposite_ratio = opposite_amount / same_amount if same_amount > 0 else 0.0
+
+        # 逆向：反方向金額已經大於同方向，且反方向分點數也不輸同方向，才視為真正逆向。
+        if (
+            opposite_ratio >= BROKER_10D_CONSENSUS_REVERSE_AMOUNT_RATIO
+            and opposite_count >= same_count
+        ):
             return "逆向"
-        if same_count >= BROKER_10D_CONSENSUS_MIN_SAME_BROKERS and opposite_count >= BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS:
+
+        # 分歧：同向、反向都至少有一定分點數，而且反方向金額至少達同方向的一半，才視為分歧。
+        # 這樣可以避免同一標的只要有人買、有人賣，就被過度判成分歧。
+        if (
+            same_count >= BROKER_10D_CONSENSUS_MIN_SAME_BROKERS
+            and opposite_count >= BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS
+            and opposite_ratio >= BROKER_10D_CONSENSUS_DIVERGENCE_AMOUNT_RATIO
+        ):
             return "分歧"
+
         if same_count >= BROKER_10D_CONSENSUS_MIN_SAME_BROKERS:
             return f"{same_count}點同{same_word}"
         return f"單點{same_word}"
