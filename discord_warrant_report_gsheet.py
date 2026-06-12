@@ -3556,7 +3556,14 @@ def merge_broker_10d_rows_by_underlying(rows: list[dict]) -> list[dict]:
         if primary_return is not None:
             outcome = "勝" if safe_float(primary_return, 0) > 0 else "敗"
 
+        underlying_10d_return = None
+        for item in items:
+            underlying_10d_return = normalize_return_pct(item.get("underlying_10d_return"))
+            if underlying_10d_return is not None:
+                break
+
         base.update({
+            "underlying_10d_return": underlying_10d_return,
             "buy_qty": buy_qty,
             "sell_qty": sell_qty,
             "buy_amount": buy_amount,
@@ -3980,6 +3987,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "統計日期", "日期", "目標日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "分點", "分點名稱", "券商代號",
         "標的股", "標的代號", "標的", "標的名稱", "股票名稱",
+        "標的10日漲跌幅%", "現股10日漲跌幅%", "標的10日漲跌幅", "現股10日漲跌幅",
         "近10日買進股數", "買進股數",
         "近10日買進金額", "買進金額",
         "近10日賣出股數", "賣出股數",
@@ -4283,6 +4291,9 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
 
         consensus_key = str(underlying or target_label or "").strip()
         consensus_signal = broker_10d_consensus_signal(consensus_map, consensus_key, direction)
+        underlying_10d_return = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
+            "標的10日漲跌幅%", "現股10日漲跌幅%", "標的10日漲跌幅", "現股10日漲跌幅",
+        ]))
 
         rows.append({
             "broker": broker_name,
@@ -4301,6 +4312,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             "primary_return": primary_ret,
             "outcome": outcome,
             "warrant_count": warrant_count,
+            "underlying_10d_return": underlying_10d_return,
             "consensus_signal": consensus_signal,
             "warrant_list": strip_gsheet_text_prefix(_pick_first_existing_value(row, ["權證清單"])),
         })
@@ -4686,7 +4698,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     y = card_y2 - section_gap
 
     def draw_section(title, section_rows, y_top, title_bg, section_type):
-        headers = ["排名", "標的", "淨額", "加權報酬", "共識訊號"]
+        headers = ["排名", "標的", "10日淨額", "現股10日", "權證報酬"]
         col_w = broker10d_table_col_w
         table_w = broker10d_table_w
         left = broker10d_table_left
@@ -4724,17 +4736,17 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 if ret_val is None:
                     ret_val = r.get("primary_return")
                 ret_color = return_color(ret_val)
-                consensus_signal = strip_gsheet_text_prefix(r.get("consensus_signal", "")) or "-"
+                underlying_ret_val = r.get("underlying_10d_return")
+                underlying_ret_color = return_color(underlying_ret_val)
                 values = [
                     str(i),
                     r.get("target", ""),
                     fmt_amount_wan(net_value),
+                    fmt_pct_plain(underlying_ret_val),
                     fmt_pct_plain(ret_val),
-                    consensus_signal,
                 ]
-                signal_color = ORANGE if consensus_signal in ("分歧", "逆向") else NAVY2
-                colors = [TEXT, TEXT, net_color, ret_color, signal_color]
-                aligns = ["center", "left", "right", "right", "center"]
+                colors = [TEXT, TEXT, net_color, underlying_ret_color, ret_color]
+                aligns = ["center", "left", "right", "right", "right"]
                 bolds = [True, True, True, True, True]
                 x = left
                 for val, w, c, a, is_bold in zip(values, col_w, colors, aligns, bolds):
