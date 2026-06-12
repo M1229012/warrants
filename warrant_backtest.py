@@ -135,18 +135,31 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 # RUN_MODE=1 / RUN_MODE=2 加速追蹤設定：
-# 以前 RUN_MODE=1 會建立「所有認購權證 × 精選分點」並全量刷新 API5，速度很慢。
-# 這版改成先用 API4 掃最近有目標分點活動的標的股，再展開成「該標的所有認購權證 × 追蹤分點」。
-# 這樣仍可抓到同一標的底下多檔權證分散式買賣超，但不再每天對全市場無差別打 API5。
-# 下列兩個舊環境變數保留相容，但預設流程已改為「活動標的擴展 + 增量刷新」。
+# 舊版 RUN_MODE=1 會建立「所有認購權證 × 精選分點」，再用 SELECTED_REFRESH_ALL_WARRANTS
+# 每次全部重打 API5，速度會非常慢。新版改成：
+# 1. 先用 API4 掃最近有目標分點活動的標的股。
+# 2. 再展開成「該標的所有認購權證 × 追蹤分點」。
+# 3. 若歷史快取已有該候選資料，就走增量判斷，不再每天重抓 250 日 API5。
+# 下列兩個舊環境變數保留相容，但預設流程已改成「活動標的擴展 + 快取增量」。
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
-# 是否把 API4 最近掃到的標的股，展開成同標的所有認購權證 × 追蹤分點。
-# RUN_MODE=1 / 2 都套用，這是目前主要加速來源。
 EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
+# 全面增量更新設定：
+# 只要快取已有該「權證代號 + 券商代號」，就不再無差別重抓。
+# API4 近期直接掃到有活動的候選，只有在快取最後日期落後時才補抓。
+CACHE_INCREMENTAL_UPDATE_ENABLED = os.getenv("CACHE_INCREMENTAL_UPDATE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+CACHE_INCREMENTAL_REFRESH_LAG_DAYS = int(os.getenv("CACHE_INCREMENTAL_REFRESH_LAG_DAYS", "0"))
+HISTORY_GSHEET_INCREMENTAL_APPEND = os.getenv("HISTORY_GSHEET_INCREMENTAL_APPEND", "1").strip().lower() not in ("0", "false", "no")
+HISTORY_CACHE_FULL_SYNC_THRESHOLD_ROWS = int(os.getenv("HISTORY_CACHE_FULL_SYNC_THRESHOLD_ROWS", "200000"))
+
 # prescan_all() 會更新這個集合，主流程用它判斷哪些候選組合需要重新 api5_get。
+# 注意：新版只把「API4 直接掃到近期有活動」的 key 放進來。
+# 活動標的擴展出的 key 若已有快取，不再強制刷新，避免 RUN_MODE=2 候選爆量。
 PRESCAN_REFRESH_KEYS = set()
+# 這個集合是「本次 API4 直接候選 + 活動標的擴展候選」。
+# 若某候選沒有歷史快取，只有在這個集合內才補抓；避免舊候選快取裡的全市場空候選全部打 API5。
+PRESCAN_MISSING_FETCH_KEYS = set()
 
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
@@ -3690,7 +3703,7 @@ def read_cache_csv(path):
         return pd.DataFrame()
 
 
-def write_cache_csv(df, path):
+def write_cache_csv(df, path, sync_gsheet=True):
     if not USE_CACHE:
         return
 
@@ -3721,7 +3734,8 @@ def write_cache_csv(df, path):
         print(f"  ⚠️ 快取寫入失敗：{path}，原因：{e}")
         return
 
-    write_cache_to_gsheet(df, path)
+    if sync_gsheet:
+        write_cache_to_gsheet(df, path)
 
 
 def load_price_cache():
@@ -4065,7 +4079,14 @@ def load_history_cache():
             print(f"  ⚠️ 原始分點資料快取欄位不完整，缺少：{col}")
             return pd.DataFrame()
 
-    return df[required_cols].copy()
+    out_df = df[required_cols].copy()
+    out_df["日期"] = out_df["日期"].map(normalize_date_str)
+    out_df = out_df.drop_duplicates(
+        subset=["權證代號", "券商代號", "日期"],
+        keep="last"
+    ).reset_index(drop=True)
+
+    return out_df
 
 
 def history_cache_keys(history_df):
@@ -4079,6 +4100,70 @@ def history_cache_keys(history_df):
         keys.add(candidate_key_from_values(row_dict["權證代號"], row_dict["券商代號"]))
 
     return keys
+
+
+def history_cache_latest_dates(history_df):
+    """
+    回傳每組「權證代號 + 券商代號」在歷史快取中的最後日期。
+    有快取且最後日期夠新時，就不用重打 API5。
+    """
+    latest = {}
+
+    if history_df is None or history_df.empty:
+        return latest
+
+    needed = {"權證代號", "券商代號", "日期"}
+    if not needed.issubset(set(history_df.columns)):
+        return latest
+
+    df = history_df[["權證代號", "券商代號", "日期"]].copy().fillna("")
+    df["日期"] = df["日期"].map(normalize_date_str)
+
+    for (warrant_code, broker_code), g in df.groupby(["權證代號", "券商代號"], dropna=False):
+        dates = []
+        for d in g["日期"].tolist():
+            dt = parse_date(d)
+            if dt:
+                dates.append(dt)
+        if dates:
+            latest[candidate_key_from_values(warrant_code, broker_code)] = max(dates)
+
+    return latest
+
+
+def get_incremental_refresh_target_dt():
+    lag_days = max(int(CACHE_INCREMENTAL_REFRESH_LAG_DAYS or 0), 0)
+    return datetime.today() - timedelta(days=lag_days)
+
+
+def should_fetch_candidate_incremental(key, history_keys, history_latest_map, direct_refresh_keys, missing_fetch_keys=None):
+    """
+    增量抓取判斷：
+    1. 沒快取：只有本次近期活動候選 / 活動標的擴展候選才抓。
+       這可以清掉舊候選快取裡大量從未成交的空候選。
+    2. 關閉增量：維持舊邏輯，direct refresh 命中就抓。
+    3. 有快取但不是 API4 直接近期活動候選：不抓，直接用快取。
+    4. 有快取且 API4 直接近期活動候選：只有快取最後日期落後目標日期才抓。
+    """
+    missing_fetch_keys = missing_fetch_keys or set()
+
+    if key not in history_keys:
+        if not CACHE_INCREMENTAL_UPDATE_ENABLED:
+            return True
+        return key in missing_fetch_keys
+
+    if not CACHE_INCREMENTAL_UPDATE_ENABLED:
+        return key in direct_refresh_keys
+
+    if key not in direct_refresh_keys:
+        return False
+
+    latest_dt = history_latest_map.get(key)
+    if latest_dt is None:
+        return True
+
+    target_dt = get_incremental_refresh_target_dt()
+    return latest_dt.date() < target_dt.date()
 
 
 def item_to_history_rows(item):
@@ -4152,12 +4237,90 @@ def merge_items_into_history_cache(history_df, new_items):
     return combined
 
 
-def save_history_cache(history_df):
+def append_history_rows_to_gsheet(new_rows):
+    """
+    將本次 API5 新增 / 更新的原始分點資料增量 append 到 Google Sheet。
+    下次讀回時 load_history_cache() 會用 權證代號 + 券商代號 + 日期 去重，保留最後一筆。
+    """
+    if not HISTORY_GSHEET_INCREMENTAL_APPEND:
+        return False
+
+    if not GSHEET_CACHE_ENABLED or not gsheet_enabled():
+        return False
+
+    if not new_rows:
+        return False
+
+    try:
+        title = cache_sheet_name_from_path(HISTORY_CACHE_PATH)
+        headers = [
+            "權證代號", "權證名稱", "標的股", "標的名稱",
+            "分點", "分點名稱", "券商代號", "日期",
+            "買進股數", "賣出股數", "買進金額", "賣出金額",
+            "買超股數", "買超金額",
+        ]
+
+        ws = get_or_create_worksheet(title, rows=max(len(new_rows) + 1, 100), cols=len(headers))
+        if ws is None:
+            return False
+
+        try:
+            existing_headers = ws.row_values(1)
+        except Exception:
+            existing_headers = []
+
+        if not existing_headers or all(str(x).strip() == "" for x in existing_headers):
+            header_values = normalize_gsheet_values_for_text_columns([headers])
+            gsheet_api_call(
+                f"寫入原始分點歷史快取表頭 {title}",
+                ws.update,
+                values=header_values,
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
+
+        values = []
+        for row in new_rows:
+            values.append([row.get(h, "") for h in headers])
+
+        normalized = normalize_gsheet_values_for_text_columns([headers] + values)[1:]
+
+        for start in range(0, len(normalized), GSHEET_CHUNK_ROWS):
+            chunk = normalized[start:start + GSHEET_CHUNK_ROWS]
+            gsheet_api_call(
+                f"增量追加原始分點歷史 {title} {start + 1}-{start + len(chunk)}",
+                ws.append_rows,
+                chunk,
+                value_input_option="USER_ENTERED",
+            )
+
+        print(f"  ☁️ 已增量追加快取到 Google Sheet：{title}，本次 {len(new_rows):,} 筆")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 原始分點資料快取增量追加到 Google Sheet 失敗：{type(e).__name__}: {e}")
+        return False
+
+
+def save_history_cache(history_df, fetched_items=None, previous_history_empty=False):
     if not USE_CACHE or history_df is None or history_df.empty:
         return
 
-    write_cache_csv(history_df, HISTORY_CACHE_PATH)
-    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}")
+    # 本地 / runner 內仍寫完整 CSV，讓同一次執行後續計算使用完整資料。
+    # Google Sheet 若已經有大型歷史快取，改成只 append 本次更新 rows，避免百萬筆整表重寫。
+    do_full_gsheet_sync = True
+
+    if HISTORY_GSHEET_INCREMENTAL_APPEND and not previous_history_empty and len(history_df) > HISTORY_CACHE_FULL_SYNC_THRESHOLD_ROWS:
+        do_full_gsheet_sync = False
+
+    write_cache_csv(history_df, HISTORY_CACHE_PATH, sync_gsheet=do_full_gsheet_sync)
+
+    if not do_full_gsheet_sync:
+        delta_rows = []
+        for item in (fetched_items or []):
+            delta_rows.extend(item_to_history_rows(item))
+        append_history_rows_to_gsheet(delta_rows)
+
+    print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}，共 {len(history_df):,} 筆")
 
 
 def items_from_history_cache(history_df, candidate_filter=None):
@@ -4648,13 +4811,7 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
 
 def collect_underlying_codes_from_candidates(candidates):
-    """
-    從 API4 prescan 掃到的候選組合中整理出標的股代號。
-
-    用途：
-    - 先用 API4 找到「最近真的有目標分點活動」的標的股。
-    - 後續只展開這些標的底下的所有認購權證，不再全市場無差別展開。
-    """
+    """從 API4 prescan 掃到的候選中取得近期有活動的標的股。"""
     underlying_codes = set()
 
     if not candidates:
@@ -4679,13 +4836,8 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
     """
     依近期有活動的標的股建立候選池。
 
-    核心邏輯：
-    1. API4 只負責找出最近有目標分點活動的標的股。
-    2. 找到標的股後，將該標的底下所有認購權證都展開。
-    3. 再與目前 RUN_MODE 的追蹤分點組合。
-
-    這可以保留「同一標的多檔權證分散式買賣超」的完整性，
-    但避免舊版 RUN_MODE=1 每天打「全市場權證 × 精選分點」API5。
+    只要某標的近期被追蹤分點碰到，就展開該標的底下所有認購權證 × 追蹤分點。
+    這樣可以保留同標的多檔權證分散式買賣超完整性，但不再每天全市場無差別 API5。
     """
     if not warrants or not broker_map or not underlying_codes:
         return []
@@ -4758,14 +4910,17 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
 
 def build_selected_full_market_candidates(warrants, broker_map):
     """
-    保留舊函式名稱供相容。
+    RUN_MODE=1 精選分點完整追蹤候選池。
 
-    注意：
-    舊版這裡會建立「所有認購權證 × 精選分點」，是 RUN_MODE=1 最大時間瓶頸。
-    新版主流程 prescan_all() 已改用「近期活動標的擴展」，不會再預設呼叫這個全市場候選池。
-    若外部程式仍直接呼叫此函式，才會回傳完整候選池。
+    目的：
+    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
+    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
+
+    這裡改成針對精選分點建立「所有認購權證 × 精選分點」候選組合，
+    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
+    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
     """
-    print("【Step 3a】相容模式：建立所有認購權證 × 目前追蹤分點候選池...")
+    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：所有認購權證 × 精選分點...")
 
     if not warrants or not broker_map:
         return []
@@ -4805,13 +4960,14 @@ def build_selected_full_market_candidates(warrants, broker_map):
             candidates.append(c)
 
     print(
-        f"  ✅ 相容候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
+        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
         f"→ {len(candidates):,} 組候選"
     )
     return candidates
 
+
 def prescan_all(warrants, broker_map):
-    global PRESCAN_REFRESH_KEYS
+    global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
@@ -4827,14 +4983,14 @@ def prescan_all(warrants, broker_map):
     if FAST_SKIP_RECENT_PRESCAN:
         print("  ⚠️ 偵測到 FAST_SKIP_RECENT_PRESCAN=1，但目前仍會補掃最近資料，避免漏掉新權證 / 新候選組合。")
 
-    # 新版 RUN_MODE=1 / 2 共用流程：
-    # 1. 先用 API4 掃最近幾天，找出目標分點近期真的有活動的權證與標的。
-    # 2. 再把這些標的底下所有認購權證展開成候選池。
-    # 3. 只有這批近期活動標的候選池需要重新打 API5；舊候選優先讀快取。
+    # 新版 RUN_MODE=1 / RUN_MODE=2 共用增量流程：
+    # 1. 用 API4 補掃最近資料，找出追蹤分點近期有活動的權證與標的。
+    # 2. 將活動標的展開成「同標的所有認購權證 × 追蹤分點」。
+    # 3. 只有 API4 直接掃到的 key 會放入 PRESCAN_REFRESH_KEYS；
+    #    擴展出的 key 若快取已有資料就不強制 API5，只在缺快取時補抓。
     if cached_candidates:
         scan_days = SELECTED_FULL_SCAN_DAYS if RUN_MODE == 1 else CACHE_RECENT_SCAN_DAYS
     else:
-        # 第一次沒有候選快取時，掃長一點建立初始候選池。
         scan_days = max(40, SELECTED_FULL_SCAN_DAYS if RUN_MODE == 1 else CACHE_RECENT_SCAN_DAYS)
 
     if RUN_MODE == 1:
@@ -4872,9 +5028,11 @@ def prescan_all(warrants, broker_map):
     refresh_candidates = merge_candidates(recent_candidates, expanded_candidates)
     refresh_candidates = filter_candidates_by_broker_map(refresh_candidates, broker_map)
 
-    # 只有最近 API4 掃到的候選，以及由近期活動標的展開出的候選，需要重新打 API5。
-    # 舊候選如果快取已有資料，就不再每天重抓 250 天歷史。
-    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in refresh_candidates}
+    # 只有 API4 直接掃到的候選才需要檢查是否更新；擴展候選若快取已有資料不強制刷新。
+    PRESCAN_REFRESH_KEYS = {candidate_key_from_tuple(c) for c in recent_candidates}
+    # 若候選沒有歷史快取，只有本次近期活動標的相關候選才需要補抓。
+    # 這可避免舊版留下的「全市場權證 × 分點」空候選在有候選快取時仍全部打 API5。
+    PRESCAN_MISSING_FETCH_KEYS = {candidate_key_from_tuple(c) for c in refresh_candidates}
 
     merged_candidates = merge_candidates(cached_candidates, refresh_candidates)
     merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
@@ -4887,7 +5045,7 @@ def prescan_all(warrants, broker_map):
         f"活動標的擴展 {len(expanded_candidates):,} 組，"
         f"合併後 {len(merged_candidates):,} 組"
     )
-    print(f"  ✅ 本次需用 API5 檢查更新的候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
+    print(f"  ✅ 本次需用 API5 檢查更新的直接候選組合：{len(PRESCAN_REFRESH_KEYS):,} 組")
 
     return merged_candidates
 
@@ -10535,7 +10693,18 @@ def main():
 
     candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
     history_cache_df = load_history_cache()
+    history_was_empty = history_cache_df is None or history_cache_df.empty
     history_keys = history_cache_keys(history_cache_df)
+    history_latest_map = history_cache_latest_dates(history_cache_df)
+
+    if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty:
+        before_prune_count = len(candidates)
+        keep_keys = (history_keys & candidate_keys) | PRESCAN_MISSING_FETCH_KEYS
+        candidates = [c for c in candidates if candidate_key_from_tuple(c) in keep_keys]
+        candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
+        pruned_count = before_prune_count - len(candidates)
+        if pruned_count > 0:
+            print(f"  ✅ 增量模式已略過舊候選快取中的無歷史資料空候選：{pruned_count:,} 組")
 
     cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
@@ -10547,12 +10716,13 @@ def main():
     for c in candidates:
         key = candidate_key_from_tuple(c)
 
-        # 沒有歷史快取：一定要抓
-        # 最近 prescan 有看到目標分點：重新抓 API5，補進最新資料
-        if key not in history_keys or key in PRESCAN_REFRESH_KEYS:
+        if should_fetch_candidate_incremental(key, history_keys, history_latest_map, PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS):
             candidates_to_fetch.append(c)
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
+    print(f"  ✅ API4 直接近期活動候選：{len(PRESCAN_REFRESH_KEYS & candidate_keys)} 組")
+    print(f"  ✅ 本次允許缺快取補抓候選：{len(PRESCAN_MISSING_FETCH_KEYS & candidate_keys)} 組")
+    print(f"  ✅ 增量更新模式：CACHE_INCREMENTAL_UPDATE_ENABLED={CACHE_INCREMENTAL_UPDATE_ENABLED}，目標日期={get_incremental_refresh_target_dt().strftime('%Y/%m/%d')}")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
     fetched_items = []
@@ -10583,7 +10753,7 @@ def main():
 
     if fetched_items:
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
-        save_history_cache(history_cache_df)
+        save_history_cache(history_cache_df, fetched_items=fetched_items, previous_history_empty=history_was_empty)
 
     items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
