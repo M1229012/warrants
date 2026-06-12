@@ -86,6 +86,18 @@ CANDIDATES_CACHE_ALL_PATH = CANDIDATES_CACHE_PATH
 CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_selected5.csv")
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
+PRICE_PREFETCH_STATE_PATH = os.path.join(CACHE_DIR, "price_prefetch_state.csv")
+
+# 自動價格預抓：
+# 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
+# 改成只用既有快取資料把所有可能需要的價格先補進 price_cache。
+# 同一天已經預抓過且分點資料仍未出來時，下一次執行會快速結束，不再重複抓價格。
+AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING = os.getenv("AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING", "1").strip().lower() not in ("0", "false", "no")
+PRICE_PREFETCH_STATE_ENABLED = os.getenv("PRICE_PREFETCH_STATE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+PRICE_PREFETCH_SKIP_IF_DONE_TODAY = os.getenv("PRICE_PREFETCH_SKIP_IF_DONE_TODAY", "1").strip().lower() not in ("0", "false", "no")
+PRICE_PREFETCH_FORCE = os.getenv("PRICE_PREFETCH_FORCE", "0").strip().lower() in ("1", "true", "yes")
+PRICE_PREFETCH_LOOKBACK_DAYS = int(os.getenv("PRICE_PREFETCH_LOOKBACK_DAYS", "30"))
+PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
 
 # 價格快取同步加速：
 # 價格快取筆數很大時，若每次都整張重寫 Google Sheet 會拖慢整體執行。
@@ -173,6 +185,10 @@ PRESCAN_REFRESH_KEYS = set()
 # 這個集合是「本次 API4 直接候選 + 活動標的擴展候選」。
 # 若某候選沒有歷史快取，只有在這個集合內才補抓；避免舊候選快取裡的全市場空候選全部打 API5。
 PRESCAN_MISSING_FETCH_KEYS = set()
+# API4 預掃描觀察到的目標分點最新活動日期。
+# 這用來判斷「今天分點資料是否已經出來」。若尚未出來，主流程會自動改成價格預抓模式。
+PRESCAN_LATEST_ACTIVITY_DATE = None
+PRESCAN_TODAY_ACTIVITY_FOUND = False
 
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
@@ -1159,6 +1175,7 @@ CACHE_SHEET_NAME_MAP = {
     "candidates_cache_selected5.csv": "快取_候選組合_精選5",
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
+    "price_prefetch_state.csv": "快取_價格預抓狀態",
 }
 
 
@@ -4883,11 +4900,17 @@ def find_broker_codes(warrants):
 # ══════════════════════════════════════════════════════════════════════
 
 def prescan_all_live(warrants, broker_map, scan_days=40):
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND
+
     print("【Step 3a】預篩：找有目標分點的權證...")
 
     today = datetime.today()
+    today_s = today.strftime("%Y/%m/%d")
     end_s   = today.strftime("%Y/%m/%d")
     start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
+
+    PRESCAN_LATEST_ACTIVITY_DATE = None
+    PRESCAN_TODAY_ACTIVITY_FOUND = False
 
     broker_codes_set = {code for _, code in broker_map.values()}
     code_to_label    = {code: label for label, (_, code) in broker_map.items()}
@@ -4897,6 +4920,8 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
     def prescan_one(w):
         hits = []
+        latest_dt = None
+        today_found = False
 
         for row in api4_get(w["代號"], start_s, end_s):
             bcode = row.get("V2", "")
@@ -4905,10 +4930,17 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
                 label = code_to_label.get(bcode, "")
 
                 if label:
+                    row_date = normalize_date_str(row.get("V1", ""))
+                    row_dt = parse_date(row_date)
+                    if row_dt and (latest_dt is None or row_dt > latest_dt):
+                        latest_dt = row_dt
+                    if row_date == today_s:
+                        today_found = True
+
                     bname = next((n for l, (n, c) in broker_map.items() if c == bcode), bcode)
                     hits.append((w["代號"], w["名稱"], w["標的股"], w.get("標的名稱", ""), label, bname, bcode))
 
-        return hits
+        return hits, latest_dt, today_found
 
     with ThreadPoolExecutor(max_workers=PRESCAN_WORKERS) as ex:
         futures = {ex.submit(prescan_one, w): w for w in warrants}
@@ -4917,9 +4949,14 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
             done += 1
 
             try:
-                result = future.result()
+                result, latest_dt, today_found = future.result()
             except:
-                result = []
+                result, latest_dt, today_found = [], None, False
+
+            if latest_dt and (PRESCAN_LATEST_ACTIVITY_DATE is None or latest_dt > PRESCAN_LATEST_ACTIVITY_DATE):
+                PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
+            if today_found:
+                PRESCAN_TODAY_ACTIVITY_FOUND = True
 
             for hit in result:
                 candidates.append(hit)
@@ -4936,7 +4973,9 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
             seen.add(key)
             unique_candidates.append(c)
 
+    latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") if PRESCAN_LATEST_ACTIVITY_DATE else "-"
     print(f"  ✅ 預篩完成：{len(warrants)} 支 → {len(candidates)} 組候選，去重後 {len(unique_candidates)} 組")
+    print(f"  ✅ API4 目標分點最新活動日：{latest_label}｜今日資料：{'已出現' if PRESCAN_TODAY_ACTIVITY_FOUND else '尚未出現'}")
     return unique_candidates
 
 
@@ -11102,6 +11141,297 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     )
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 自動價格預抓：今日分點資料未出現時，只更新價格快取並快速結束
+# ══════════════════════════════════════════════════════════════════════
+
+def normalize_price_prefetch_target_date(target_date=None):
+    raw = str(target_date or PRICE_PREFETCH_TARGET_DATE or TOP15_TARGET_DATE or "").strip()
+
+    if raw:
+        dt = parse_date(raw)
+        if dt:
+            return dt.strftime("%Y/%m/%d")
+
+    return datetime.today().strftime("%Y/%m/%d")
+
+
+def load_price_prefetch_state():
+    if not PRICE_PREFETCH_STATE_ENABLED:
+        return pd.DataFrame()
+
+    df = read_cache_csv(PRICE_PREFETCH_STATE_PATH)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required_cols = ["日期", "資料範圍", "模式", "狀態"]
+    for col in required_cols:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    return df.fillna("")
+
+
+def is_price_prefetch_done_for_today(target_date=None):
+    if not PRICE_PREFETCH_STATE_ENABLED:
+        return False
+
+    if PRICE_PREFETCH_FORCE:
+        return False
+
+    target_date = normalize_price_prefetch_target_date(target_date)
+    scope = get_result_data_scope()
+    df = load_price_prefetch_state()
+
+    if df.empty:
+        return False
+
+    for row in df.itertuples(index=False):
+        rd = row._asdict()
+        if normalize_date_str(rd.get("日期", "")) != target_date:
+            continue
+        if str(rd.get("資料範圍", "")).strip() != scope:
+            continue
+        if str(rd.get("模式", "")).strip() != "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING":
+            continue
+        if str(rd.get("狀態", "")).strip().lower() in ("done", "success", "no_items", "skipped"):
+            return True
+
+    return False
+
+
+def write_price_prefetch_state(record):
+    if not PRICE_PREFETCH_STATE_ENABLED or not USE_CACHE:
+        return
+
+    headers = [
+        "日期", "資料範圍", "模式", "狀態", "原因",
+        "候選組合數", "快取歷史筆數", "還原項目數", "A事件數", "B事件數", "C事件數", "D事件數",
+        "價格快取代號數", "執行時間", "更新時間",
+    ]
+
+    old_df = read_cache_csv(PRICE_PREFETCH_STATE_PATH)
+    rows = []
+
+    if old_df is not None and not old_df.empty:
+        for _, old_row in old_df.fillna("").iterrows():
+            rows.append({h: old_row.get(h, "") for h in headers})
+
+    rec = {h: record.get(h, "") for h in headers}
+    rec["更新時間"] = rec.get("更新時間") or datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    rows.append(rec)
+
+    df = pd.DataFrame(rows, columns=headers).fillna("")
+    df = df.drop_duplicates(
+        subset=["日期", "資料範圍", "模式"],
+        keep="last"
+    ).reset_index(drop=True)
+
+    write_cache_csv(df, PRICE_PREFETCH_STATE_PATH)
+
+
+def has_today_broker_data_from_prescan(target_date=None):
+    target_date = normalize_price_prefetch_target_date(target_date)
+
+    if PRESCAN_TODAY_ACTIVITY_FOUND:
+        return True
+
+    if PRESCAN_LATEST_ACTIVITY_DATE:
+        return PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") >= target_date
+
+    return False
+
+
+def build_price_prefetch_context_from_items(items):
+    """
+    用既有分點歷史快取重建正式流程會用到的事件，僅供價格預抓使用。
+
+    注意：這裡不寫入任何結果工作表，只重用正式流程的 A/B/C/D 建立邏輯，
+    讓價格預抓覆蓋正式流程真正會用到的標的股價格、A 類權證價格、TOP15 剩餘部位權證價格，
+    以及 RUN_MODE=2 的近10日分點明細權證價格。
+    """
+    item_map = {}
+    a_events = []
+
+    for item in items:
+        item_map[(item["broker_code"], item["warrant_code"])] = item
+        a_events.extend(item.get("events_a", []))
+
+    a_events = filter_a_events_unique_warrants(a_events)
+
+    daily_records = build_daily_records(items)
+    a_warrant_codes = collect_event_warrant_codes(a_events)
+    daily_records_for_b = filter_daily_records_by_warrant_codes(daily_records, a_warrant_codes)
+
+    b_events = build_b_events(daily_records_for_b, item_map)
+
+    b_warrant_codes = collect_event_warrant_codes(b_events)
+    daily_records_for_c = filter_daily_records_by_warrant_codes(
+        daily_records_for_b,
+        b_warrant_codes,
+    )
+
+    c_events = build_c_events(daily_records_for_c, item_map)
+
+    c_warrant_codes = collect_event_warrant_codes(c_events)
+    daily_records_for_d = filter_daily_records_by_warrant_codes(
+        daily_records_for_c,
+        c_warrant_codes,
+    )
+
+    d_events = build_d_events(daily_records_for_d, item_map, window_days=D_WINDOW_DAYS)
+
+    return item_map, a_events, b_events, c_events, d_events
+
+
+def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, target_date=None, reason="今日分點資料尚未出現"):
+    """
+    當 API4 預掃描沒有看到今日目標分點資料時，自動改跑價格預抓。
+
+    這個模式只會：
+    1. 讀既有分點歷史快取
+    2. 重建正式流程會用到的事件集合
+    3. 呼叫所有正式流程需要抓價格的函式
+    4. 更新 price_cache.csv / 快取_價格
+    5. 寫入 price_prefetch_state.csv，避免同一天重複慢抓
+
+    不會建立 Excel、不會同步 A/B/C/D、TOP15、近10日分點明細結果，因此不會把尚未完整的當日分點資料寫到結果表。
+    """
+    target_date = normalize_price_prefetch_target_date(target_date)
+    start_ts = time.time()
+    scope = get_result_data_scope()
+
+    if history_cache_df is None or history_cache_df.empty:
+        print("  ⚠️ 尚無原始分點歷史快取，無法進行價格預抓。")
+        write_price_prefetch_state({
+            "日期": target_date,
+            "資料範圍": scope,
+            "模式": "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING",
+            "狀態": "no_items",
+            "原因": "尚無原始分點歷史快取",
+            "候選組合數": len(candidate_keys or []),
+            "快取歷史筆數": 0,
+            "還原項目數": 0,
+            "執行時間": f"{time.time() - start_ts:.2f}",
+        })
+        return True
+
+    if candidate_keys:
+        items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    else:
+        items = items_from_history_cache(history_cache_df)
+
+    if not items:
+        print("  ⚠️ 原始分點歷史快取中沒有可還原的候選項目，無法進行價格預抓。")
+        write_price_prefetch_state({
+            "日期": target_date,
+            "資料範圍": scope,
+            "模式": "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING",
+            "狀態": "no_items",
+            "原因": "無可還原項目",
+            "候選組合數": len(candidate_keys or []),
+            "快取歷史筆數": len(history_cache_df),
+            "還原項目數": 0,
+            "執行時間": f"{time.time() - start_ts:.2f}",
+        })
+        return True
+
+    print(f"【價格預抓】使用既有分點歷史快取還原 {len(items):,} 組資料，只更新價格快取，不建立結果報表。")
+
+    item_map, a_events, b_events, c_events, d_events = build_price_prefetch_context_from_items(items)
+
+    print(
+        f"  ✅ 價格預抓事件重建完成："
+        f"A:{len(a_events):,}｜B:{len(b_events):,}｜C:{len(c_events):,}｜D:{len(d_events):,}"
+    )
+
+    if a_events or b_events or c_events or d_events:
+        price_cache = fetch_all_prices(a_events, b_events, c_events, d_events)
+        # TOP15 固定資料集會在內部補抓仍有剩餘部位的權證最新價。
+        build_top15_position_detail_and_consensus_rows(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            item_map,
+            price_cache,
+            target_date=target_date,
+        )
+    else:
+        price_cache = load_price_cache()
+        print("  ⚠️ 快取資料目前無 A/B/C/D 事件，略過事件價格預抓，只檢查其他價格需求。")
+
+    if RUN_MODE == 2:
+        price_cache = ensure_broker_10d_warrant_prices(price_cache, items, target_date=target_date)
+    else:
+        print("  ✅ RUN_MODE=1：近10日分點明細工作表不更新，因此價格預抓略過該表權證價。")
+
+    elapsed = time.time() - start_ts
+    write_price_prefetch_state({
+        "日期": target_date,
+        "資料範圍": scope,
+        "模式": "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING",
+        "狀態": "done",
+        "原因": reason,
+        "候選組合數": len(candidate_keys or []),
+        "快取歷史筆數": len(history_cache_df),
+        "還原項目數": len(items),
+        "A事件數": len(a_events),
+        "B事件數": len(b_events),
+        "C事件數": len(c_events),
+        "D事件數": len(d_events),
+        "價格快取代號數": len(price_cache or {}),
+        "執行時間": f"{elapsed:.2f}",
+    })
+
+    print(f"  ✅ 價格預抓完成，已記錄今日狀態，下次今日分點資料仍未出現時會快速略過。耗時 {elapsed:.2f} 秒")
+    return True
+
+
+def maybe_auto_price_prefetch_before_api5(candidates, program_start):
+    """
+    在正式 API5 大量更新前判斷是否要改跑價格預抓。
+
+    判斷依據使用剛剛 API4 預掃描結果：
+    - 若 API4 已看到今日目標分點資料 → 正常跑正式流程。
+    - 若 API4 尚未看到今日目標分點資料 → 不產生報表，改成價格預抓。
+    - 若今日已經預抓過且 API4 仍未看到今日資料 → 快速結束。
+    """
+    if not AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING:
+        return False
+
+    target_date = normalize_price_prefetch_target_date()
+
+    if has_today_broker_data_from_prescan(target_date):
+        return False
+
+    latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") if PRESCAN_LATEST_ACTIVITY_DATE else "-"
+    print(
+        f"  ⚠️ API4 尚未看到 {target_date} 的目標分點資料｜"
+        f"目前最新活動日：{latest_label}。"
+    )
+
+    if PRICE_PREFETCH_SKIP_IF_DONE_TODAY and is_price_prefetch_done_for_today(target_date):
+        print("  ✅ 今日已完成價格預抓，且分點資料仍未出現；略過正式報表與價格重抓，快速結束。")
+        elapsed = time.time() - program_start
+        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        return True
+
+    print("  🔄 自動進入價格預抓模式：只更新 price_cache，不寫入今日結果表。")
+    history_cache_df = load_history_cache()
+    candidate_keys = {candidate_key_from_tuple(c) for c in candidates} if candidates else None
+    run_auto_price_prefetch_from_history(
+        history_cache_df,
+        candidate_keys=candidate_keys,
+        target_date=target_date,
+        reason="API4 尚未看到今日目標分點資料",
+    )
+    elapsed = time.time() - program_start
+    print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+    return True
+
 # ══════════════════════════════════════════════════════════════════════
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
@@ -11141,6 +11471,9 @@ def main():
         return
 
     candidates = prescan_all(warrants, broker_map)
+
+    if maybe_auto_price_prefetch_before_api5(candidates, program_start):
+        return
 
     if not candidates:
         print("⚠️ 預篩後無候選")
