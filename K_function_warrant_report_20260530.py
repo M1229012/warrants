@@ -104,8 +104,12 @@ NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0",
 # 截圖式輸出設定：先用原本高解析度產圖，再等比例縮小後輸出，模擬「截圖後送出」以降低檔案大小。
 SCREENSHOT_OUTPUT_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 SCREENSHOT_OUTPUT_SCALE = float(os.getenv("WARRANT_SCREENSHOT_OUTPUT_SCALE", "0.6"))
+# 截圖式輸出改用最大寬度限制，讓實際效果更接近「螢幕截圖」；0 代表不限制。
+SCREENSHOT_OUTPUT_MAX_WIDTH = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH", "2400"))
 SCREENSHOT_OUTPUT_FORMAT = os.getenv("WARRANT_SCREENSHOT_OUTPUT_FORMAT", "PNG").strip().upper() or "PNG"
 SCREENSHOT_OUTPUT_JPEG_QUALITY = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY", "88"))
+# PNG 仍是無損格式，長圖可能很大；轉成 256 色調色盤 PNG 可大幅縮檔，文字線條通常仍清楚。
+SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # 疑似造市 / 避險對沖設定
 # 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
@@ -398,11 +402,14 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
     3. 透過等比例縮小像素與重新壓縮，降低 Discord 圖片檔案大小。
 
     預設仍輸出 PNG，避免長圖大量文字在 JPEG 下出現明顯壓縮雜訊。
+    但會把輸出寬度限制在 WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH，讓效果更接近螢幕截圖。
     可用環境變數調整：
     - WARRANT_SCREENSHOT_OUTPUT_ENABLE=0：關閉二次輸出。
-    - WARRANT_SCREENSHOT_OUTPUT_SCALE=0.6：縮放倍率。
+    - WARRANT_SCREENSHOT_OUTPUT_SCALE=0.6：縮放倍率上限。
+    - WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH=2400：輸出最大寬度，0 代表不限制。
     - WARRANT_SCREENSHOT_OUTPUT_FORMAT=PNG/JPEG：輸出格式。
     - WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY=88：JPEG 品質。
+    - WARRANT_SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE=1：PNG 轉 256 色調色盤以縮小檔案。
     """
     if not SCREENSHOT_OUTPUT_ENABLE:
         buf.seek(0)
@@ -422,6 +429,11 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
         if scale <= 0:
             scale = 1.0
 
+        max_width = int(SCREENSHOT_OUTPUT_MAX_WIDTH or 0)
+        if max_width > 0 and old_w * scale > max_width:
+            # 真正模擬截圖：不要只固定縮 60%，而是限制成比較像螢幕寬度的圖片。
+            scale = max_width / max(old_w, 1)
+
         if scale != 1.0:
             new_w = max(1, int(old_w * scale))
             new_h = max(1, int(old_h * scale))
@@ -432,6 +444,7 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
 
         out = io.BytesIO()
         output_format = SCREENSHOT_OUTPUT_FORMAT if SCREENSHOT_OUTPUT_FORMAT in ("PNG", "JPEG", "JPG") else "PNG"
+        palette_used = False
 
         if output_format in ("JPEG", "JPG"):
             img.save(
@@ -442,12 +455,22 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
                 progressive=True,
             )
         else:
-            img.save(out, format="PNG", optimize=True, compress_level=9)
+            save_img = img
+            if SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE:
+                try:
+                    palette_mode = getattr(getattr(Image, "Palette", Image), "ADAPTIVE", Image.ADAPTIVE)
+                    save_img = img.convert("P", palette=palette_mode, colors=256)
+                    palette_used = True
+                except Exception as e:
+                    print(f"⚠️ PNG 調色盤縮檔失敗，改用 RGB PNG：{e}")
+                    save_img = img
+            save_img.save(out, format="PNG", optimize=True, compress_level=9)
 
         out.seek(0)
         print(
             f"🖼️ 截圖式二次輸出：{old_w}x{old_h} → {new_w}x{new_h}｜"
-            f"scale={scale:g}｜format={output_format}｜size={out.getbuffer().nbytes / 1024 / 1024:.2f} MB"
+            f"scale={scale:g}｜max_width={max_width}｜format={output_format}｜"
+            f"palette={1 if palette_used else 0}｜size={out.getbuffer().nbytes / 1024 / 1024:.2f} MB"
         )
         return out
     except Exception as e:
