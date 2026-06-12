@@ -4070,7 +4070,16 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
     consensus_source_df = df.copy()
 
     def build_broker_10d_consensus_map(source_df: pd.DataFrame):
-        consensus = defaultdict(lambda: {"buy": defaultdict(float), "sell": defaultdict(float)})
+        """
+        建立近10日「同標的、同分點」的共識統計表。
+
+        重要：
+        - 先用「標的 + 分點」彙總近10日買進 / 賣出金額。
+        - 同一個分點在同一檔標的，即使原始快取出現多列，也只能被算成一個分點。
+        - 彙總後再依該分點的最終淨方向判定：淨買超算 1 個買方分點，淨賣超算 1 個賣方分點。
+        - 避免同一分點同時出現在買方、賣方，造成「幾點同買 / 同賣」被買單或賣單列數放大。
+        """
+        broker_target_totals = defaultdict(lambda: defaultdict(lambda: {"buy": 0.0, "sell": 0.0}))
 
         for _, rr in source_df.iterrows():
             row = rr.to_dict()
@@ -4091,25 +4100,28 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
 
             buy_amount = safe_float(_pick_first_existing_value(row, ["近10日買進金額", "買進金額"]), 0)
             sell_amount = safe_float(_pick_first_existing_value(row, ["近10日賣出金額", "賣出金額"]), 0)
-            net_buy_amount = safe_float(_pick_first_existing_value(row, ["近10日淨買超金額", "淨買超金額"]), buy_amount - sell_amount)
-            net_sell_amount = safe_float(_pick_first_existing_value(row, ["近10日淨賣超金額", "淨賣超金額"]), sell_amount - buy_amount)
-            direction = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["買賣方向", "方向"])).strip()
-            if not direction:
-                if buy_amount > sell_amount:
-                    direction = "買超"
-                elif sell_amount > buy_amount:
-                    direction = "賣超"
-                else:
-                    direction = "持平"
+            net_buy_amount = safe_float(_pick_first_existing_value(row, ["近10日淨買超金額", "淨買超金額"]), 0)
+            net_sell_amount = safe_float(_pick_first_existing_value(row, ["近10日淨賣超金額", "淨賣超金額"]), 0)
 
-            if direction == "買超" and net_buy_amount > 0:
-                consensus[key]["buy"][broker_name] += net_buy_amount
-            elif direction == "賣超" and net_sell_amount > 0:
-                consensus[key]["sell"][broker_name] += net_sell_amount
-            elif net_buy_amount > net_sell_amount and net_buy_amount > 0:
-                consensus[key]["buy"][broker_name] += net_buy_amount
-            elif net_sell_amount > net_buy_amount and net_sell_amount > 0:
-                consensus[key]["sell"][broker_name] += net_sell_amount
+            # 正常新版快取會有買進 / 賣出金額，優先用它們彙總出同分點同標的的最終淨方向。
+            # 若遇到舊版快取只有淨買超 / 淨賣超欄位，才退回使用淨額欄位補算。
+            if buy_amount > 0 or sell_amount > 0:
+                broker_target_totals[key][broker_name]["buy"] += max(buy_amount, 0.0)
+                broker_target_totals[key][broker_name]["sell"] += max(sell_amount, 0.0)
+            else:
+                broker_target_totals[key][broker_name]["buy"] += max(net_buy_amount, 0.0)
+                broker_target_totals[key][broker_name]["sell"] += max(net_sell_amount, 0.0)
+
+        consensus = defaultdict(lambda: {"buy": defaultdict(float), "sell": defaultdict(float)})
+        for key, broker_map in broker_target_totals.items():
+            for broker_name, amounts in broker_map.items():
+                buy_total = safe_float(amounts.get("buy"), 0)
+                sell_total = safe_float(amounts.get("sell"), 0)
+                net_amount = buy_total - sell_total
+                if net_amount > 0:
+                    consensus[key]["buy"][broker_name] = net_amount
+                elif net_amount < 0:
+                    consensus[key]["sell"][broker_name] = abs(net_amount)
 
         return consensus
 
@@ -4294,6 +4306,12 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         })
 
     rows = merge_broker_10d_rows_by_underlying(rows)
+
+    # 合併同分點同標的資料後，再用最終淨方向重算一次共識訊號。
+    # 避免合併前同一標的多列資料的方向不同，導致圖卡顯示的共識訊號與最終列方向不一致。
+    for r in rows:
+        consensus_key = str(r.get("underlying") or r.get("target") or "").strip()
+        r["consensus_signal"] = broker_10d_consensus_signal(consensus_map, consensus_key, str(r.get("direction", "")).strip())
 
     buy_total = sum(safe_float(r.get("buy_amount"), 0) for r in rows)
     sell_total = sum(safe_float(r.get("sell_amount"), 0) for r in rows)
