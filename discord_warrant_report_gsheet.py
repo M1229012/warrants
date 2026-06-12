@@ -144,6 +144,10 @@ SHEET_TOP15_CONSENSUS_CACHE = os.getenv("SHEET_TOP15_CONSENSUS_CACHE", "快取_T
 SHEET_TOP15_POSITION_DETAIL = os.getenv("SHEET_TOP15_POSITION_DETAIL", "快取_TOP15部位明細")
 SHEET_WARRANT_CONSENSUS_7D = os.getenv("SHEET_WARRANT_CONSENSUS_7D", "快取_近7日權證分點共識TOP15")
 SHEET_BROKER_10D_DETAIL = os.getenv("SHEET_BROKER_10D_DETAIL", "快取_近10日分點買賣明細")
+# 近10日分點明細圖的「共識訊號」判斷門檻。
+# 會以同一批「快取_近10日分點買賣明細」內所有分點一起判斷，而不是只看目前圖片的單一分點。
+BROKER_10D_CONSENSUS_MIN_SAME_BROKERS = int(os.getenv("BROKER_10D_CONSENSUS_MIN_SAME_BROKERS", "2"))
+BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS = int(os.getenv("BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS", "2"))
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
@@ -4057,6 +4061,87 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
+
+    # 共識訊號要用同一批快取、同一統計日期的「所有分點」一起判斷，
+    # 不能先篩成單一分點，否則永遠只會看到單點買 / 單點賣。
+    consensus_source_df = df.copy()
+
+    def build_broker_10d_consensus_map(source_df: pd.DataFrame):
+        consensus = defaultdict(lambda: {"buy": set(), "sell": set()})
+
+        for _, rr in source_df.iterrows():
+            row = rr.to_dict()
+            broker_name = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["分點", "分點名稱"])).strip()
+            if not broker_name:
+                continue
+
+            underlying, _, target_label = resolve_target_identity(
+                row,
+                code_cols=["標的股", "標的代號", "標的"],
+                name_cols=["標的名稱", "股票名稱"],
+                raw_target_cols=["標的", "標的名稱", "股票名稱"],
+                warrant_text_cols=["權證清單"],
+            )
+            key = str(underlying or target_label or "").strip()
+            if not key:
+                continue
+
+            buy_amount = safe_float(_pick_first_existing_value(row, ["近10日買進金額", "買進金額"]), 0)
+            sell_amount = safe_float(_pick_first_existing_value(row, ["近10日賣出金額", "賣出金額"]), 0)
+            net_buy_amount = safe_float(_pick_first_existing_value(row, ["近10日淨買超金額", "淨買超金額"]), buy_amount - sell_amount)
+            net_sell_amount = safe_float(_pick_first_existing_value(row, ["近10日淨賣超金額", "淨賣超金額"]), sell_amount - buy_amount)
+            direction = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["買賣方向", "方向"])).strip()
+            if not direction:
+                if buy_amount > sell_amount:
+                    direction = "買超"
+                elif sell_amount > buy_amount:
+                    direction = "賣超"
+                else:
+                    direction = "持平"
+
+            if direction == "買超" and net_buy_amount > 0:
+                consensus[key]["buy"].add(broker_name)
+            elif direction == "賣超" and net_sell_amount > 0:
+                consensus[key]["sell"].add(broker_name)
+            elif net_buy_amount > net_sell_amount and net_buy_amount > 0:
+                consensus[key]["buy"].add(broker_name)
+            elif net_sell_amount > net_buy_amount and net_sell_amount > 0:
+                consensus[key]["sell"].add(broker_name)
+
+        return consensus
+
+    def broker_10d_consensus_signal(consensus_map, key: str, direction: str) -> str:
+        info = consensus_map.get(str(key or "").strip())
+        if not info:
+            return "-"
+
+        buy_count = len(info.get("buy", set()))
+        sell_count = len(info.get("sell", set()))
+        direction = str(direction or "").strip()
+
+        if direction == "買超":
+            same_count = buy_count
+            opposite_count = sell_count
+            same_word = "買"
+        elif direction == "賣超":
+            same_count = sell_count
+            opposite_count = buy_count
+            same_word = "賣"
+        else:
+            return "-"
+
+        if same_count <= 0:
+            return "-"
+        if same_count == 1 and opposite_count >= BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS:
+            return "逆向"
+        if same_count >= BROKER_10D_CONSENSUS_MIN_SAME_BROKERS and opposite_count >= BROKER_10D_CONSENSUS_OPPOSITE_WARNING_BROKERS:
+            return "分歧"
+        if same_count >= BROKER_10D_CONSENSUS_MIN_SAME_BROKERS:
+            return f"{same_count}點同{same_word}"
+        return f"單點{same_word}"
+
+    consensus_map = build_broker_10d_consensus_map(consensus_source_df)
+
     if broker:
         broker_series = df.apply(lambda r: strip_gsheet_text_prefix(_pick_first_existing_value(r, ["分點", "分點名稱"])).strip(), axis=1)
         df = df[broker_series == broker].copy()
@@ -4158,6 +4243,9 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             weighted_sell_ret += sell_ret * sell_amount
             weighted_sell_amt += sell_amount
 
+        consensus_key = str(underlying or target_label or "").strip()
+        consensus_signal = broker_10d_consensus_signal(consensus_map, consensus_key, direction)
+
         rows.append({
             "broker": broker_name,
             "underlying": underlying,
@@ -4175,6 +4263,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
             "primary_return": primary_ret,
             "outcome": outcome,
             "warrant_count": warrant_count,
+            "consensus_signal": consensus_signal,
             "warrant_list": strip_gsheet_text_prefix(_pick_first_existing_value(row, ["權證清單"])),
         })
 
@@ -4343,7 +4432,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     # 近10日圖片的重點不是只縮欄位，而是整個輸出畫布要跟表格寬度貼近。
     # 否則即使表格本身不寬，只要 fig_w 太大，左右留白仍會非常巨大。
     # 這裡改成先決定表格寬度，再反推整張圖寬度，讓表格約佔整體寬度 90% 左右。
-    broker10d_table_col_w = [0.56, 2.55, 1.70, 1.28, 1.05]
+    broker10d_table_col_w = [0.56, 2.50, 1.55, 1.25, 1.45]
     broker10d_table_w = sum(broker10d_table_col_w)
 
     outer_pad_x = 0.32
@@ -4553,7 +4642,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     y = card_y2 - section_gap
 
     def draw_section(title, section_rows, y_top, title_bg, section_type):
-        headers = ["排名", "標的", "淨額", "加權報酬", "權證數"]
+        headers = ["排名", "標的", "淨額", "加權報酬", "共識訊號"]
         col_w = broker10d_table_col_w
         table_w = broker10d_table_w
         left = broker10d_table_left
@@ -4591,16 +4680,16 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
                 if ret_val is None:
                     ret_val = r.get("primary_return")
                 ret_color = return_color(ret_val)
-                warrant_count = safe_int(r.get("warrant_count"), 0)
-                warrant_text = f"{warrant_count}檔" if warrant_count > 0 else "-"
+                consensus_signal = strip_gsheet_text_prefix(r.get("consensus_signal", "")) or "-"
                 values = [
                     str(i),
                     r.get("target", ""),
                     fmt_amount_wan(net_value),
                     fmt_pct_plain(ret_val),
-                    warrant_text,
+                    consensus_signal,
                 ]
-                colors = [TEXT, TEXT, net_color, ret_color, TEXT]
+                signal_color = ORANGE if consensus_signal in ("分歧", "逆向") else NAVY2
+                colors = [TEXT, TEXT, net_color, ret_color, signal_color]
                 aligns = ["center", "left", "right", "right", "center"]
                 bolds = [True, True, True, True, True]
                 x = left
