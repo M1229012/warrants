@@ -35,6 +35,11 @@ try:
 except Exception:
     BeautifulSoup = None
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -96,6 +101,12 @@ MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_FALLBACK_ENABLE = os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+# 截圖式輸出設定：先用原本高解析度產圖，再等比例縮小後輸出，模擬「截圖後送出」以降低檔案大小。
+SCREENSHOT_OUTPUT_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+SCREENSHOT_OUTPUT_SCALE = float(os.getenv("WARRANT_SCREENSHOT_OUTPUT_SCALE", "0.6"))
+SCREENSHOT_OUTPUT_FORMAT = os.getenv("WARRANT_SCREENSHOT_OUTPUT_FORMAT", "PNG").strip().upper() or "PNG"
+SCREENSHOT_OUTPUT_JPEG_QUALITY = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY", "88"))
+
 # 疑似造市 / 避險對沖設定
 # 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
 HEDGE_MARK_THRESHOLD = float(os.getenv("WARRANT_HEDGE_MARK_THRESHOLD", os.getenv("WARRANT_HEDGE_THRESHOLD", "0.08")))
@@ -376,6 +387,73 @@ def _cache_date_part(v) -> str:
 def _ensure_dir(path: str):
     if path:
         os.makedirs(path, exist_ok=True)
+
+
+def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
+    """將 matplotlib 原始高解析 PNG 做一次「截圖式」二次輸出。
+
+    目的：
+    1. 保留原本圖表排版與繪圖邏輯。
+    2. 模擬使用者把大圖縮放到螢幕後再截圖的效果。
+    3. 透過等比例縮小像素與重新壓縮，降低 Discord 圖片檔案大小。
+
+    預設仍輸出 PNG，避免長圖大量文字在 JPEG 下出現明顯壓縮雜訊。
+    可用環境變數調整：
+    - WARRANT_SCREENSHOT_OUTPUT_ENABLE=0：關閉二次輸出。
+    - WARRANT_SCREENSHOT_OUTPUT_SCALE=0.6：縮放倍率。
+    - WARRANT_SCREENSHOT_OUTPUT_FORMAT=PNG/JPEG：輸出格式。
+    - WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY=88：JPEG 品質。
+    """
+    if not SCREENSHOT_OUTPUT_ENABLE:
+        buf.seek(0)
+        return buf
+
+    if Image is None:
+        print("⚠️ Pillow 未安裝，略過截圖式二次輸出")
+        buf.seek(0)
+        return buf
+
+    try:
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+        old_w, old_h = img.size
+
+        scale = float(SCREENSHOT_OUTPUT_SCALE)
+        if scale <= 0:
+            scale = 1.0
+
+        if scale != 1.0:
+            new_w = max(1, int(old_w * scale))
+            new_h = max(1, int(old_h * scale))
+            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+            img = img.resize((new_w, new_h), resample_filter)
+        else:
+            new_w, new_h = old_w, old_h
+
+        out = io.BytesIO()
+        output_format = SCREENSHOT_OUTPUT_FORMAT if SCREENSHOT_OUTPUT_FORMAT in ("PNG", "JPEG", "JPG") else "PNG"
+
+        if output_format in ("JPEG", "JPG"):
+            img.save(
+                out,
+                format="JPEG",
+                quality=max(1, min(100, int(SCREENSHOT_OUTPUT_JPEG_QUALITY))),
+                optimize=True,
+                progressive=True,
+            )
+        else:
+            img.save(out, format="PNG", optimize=True, compress_level=9)
+
+        out.seek(0)
+        print(
+            f"🖼️ 截圖式二次輸出：{old_w}x{old_h} → {new_w}x{new_h}｜"
+            f"scale={scale:g}｜format={output_format}｜size={out.getbuffer().nbytes / 1024 / 1024:.2f} MB"
+        )
+        return out
+    except Exception as e:
+        print(f"⚠️ 截圖式二次輸出失敗，改用原始圖片：{e}")
+        buf.seek(0)
+        return buf
 
 
 def _local_warrant_cache_path(stock_code: str, start_date=None, end_date=None) -> str:
@@ -6745,7 +6823,9 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", pad_inches=0.18, facecolor=fig.get_facecolor())
         plt.close(fig)
-        buf.seek(0)
+
+        # 模擬「截圖後輸出」：先保留原本高解析產圖，再等比例縮小並重新壓縮，降低檔案大小。
+        buf = screenshot_like_output_buffer(buf)
         return buf
     except Exception as e:
         import traceback
