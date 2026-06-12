@@ -98,6 +98,11 @@ PRICE_PREFETCH_SKIP_IF_DONE_TODAY = os.getenv("PRICE_PREFETCH_SKIP_IF_DONE_TODAY
 PRICE_PREFETCH_FORCE = os.getenv("PRICE_PREFETCH_FORCE", "0").strip().lower() in ("1", "true", "yes")
 PRICE_PREFETCH_LOOKBACK_DAYS = int(os.getenv("PRICE_PREFETCH_LOOKBACK_DAYS", "30"))
 PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
+# 價格預抓防呆：
+# 盤後價格可能比分點 API4 更早更新；若今天分點資料尚未出現，但今天價格也尚未寫進快取，
+# 即使 price_prefetch_state 已記錄 done，也會再嘗試預抓，避免早盤/盤中先跑過後，盤後價格不再更新。
+PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE = os.getenv("PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE", "1").strip().lower() not in ("0", "false", "no")
+PRICE_PREFETCH_MIN_TARGET_PRICE_CODES = int(os.getenv("PRICE_PREFETCH_MIN_TARGET_PRICE_CODES", "1"))
 
 # 價格快取同步加速：
 # 價格快取筆數很大時，若每次都整張重寫 Google Sheet 會拖慢整體執行。
@@ -140,6 +145,17 @@ BROKER_10D_PRICE_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_PRICE_LOOKBACK_DAYS",
 # 近10日明細價格補抓加速：先抓較短區間；完全沒有價格時才補抓完整區間。
 BROKER_10D_PRICE_FAST_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_PRICE_FAST_LOOKBACK_DAYS", "30"))
 BROKER_10D_PRICE_STALE_DAYS = int(os.getenv("BROKER_10D_PRICE_STALE_DAYS", "10"))
+# 近10日分點圖卡新增「現股10日」欄位後，需同步預抓標的股最新收盤價。
+# 這裡抓較短區間即可涵蓋 10 日漲跌幅起訖價，避免只更新權證價卻讓現股10日停在前一交易日。
+BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS", "35"))
+# 價格預抓完整模式：
+# 當分點資料尚未更新到今天時，預抓模式不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
+# 也會把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
+# 這樣盤後重跑時，所有可能被後續報表 / 圖卡用到的價格都會先準備好。
+PRICE_PREFETCH_ALL_ITEM_PRICES = os.getenv("PRICE_PREFETCH_ALL_ITEM_PRICES", "1").strip().lower() not in ("0", "false", "no")
+PRICE_PREFETCH_ALL_WARRANT_PRICE_LOOKBACK_DAYS = int(os.getenv("PRICE_PREFETCH_ALL_WARRANT_PRICE_LOOKBACK_DAYS", str(BROKER_10D_PRICE_LOOKBACK_DAYS)))
+PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS = int(os.getenv("PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS", str(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS)))
+PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE = os.getenv("PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE", "1").strip().lower() not in ("0", "false", "no")
 # 預設不再為所有純賣超權證補抓最新價；賣超報酬優先使用 API5 歷史 FIFO 成本。
 # 若賣超完全找不到歷史買進成本，仍會補抓最新價作為備援成本，避免報酬率空白。
 BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES = os.getenv("BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
@@ -9660,6 +9676,130 @@ def _near10_window_dates(target_date=None, window_days=None):
     return target_date, target_dt, start_date, start_dt, window_days, period_text
 
 
+def _collect_recent_underlying_codes_for_10d(items, target_date=None):
+    """
+    收集近10日分點買賣明細會用到的標的股代號。
+
+    圖卡新增「現股10日」後，不能只補權證最新價；
+    若分點資料仍停在前一交易日，但盤後現股價格已更新，這裡會先把近10日有買賣的標的股最新收盤價補進快取。
+    """
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
+    codes = set()
+
+    for item in items or []:
+        df = item.get("df", pd.DataFrame())
+        if df is None or df.empty:
+            continue
+
+        underlying_code = normalize_underlying_code_for_group(item.get("underlying_code", "")) or normalize_price_code(item.get("underlying_code", ""))
+        if not underlying_code:
+            continue
+
+        has_recent_activity = False
+        for row in df.itertuples(index=False):
+            row_dict = row._asdict()
+            date_str = normalize_date_str(row_dict.get("日期", ""))
+            dt = parse_date(date_str)
+
+            if not dt or dt < start_dt or dt > target_dt:
+                continue
+
+            buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+            sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+            buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+            sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+
+            if buy_amount > 0 or sell_amount > 0 or buy_qty > 0 or sell_qty > 0:
+                has_recent_activity = True
+                break
+
+        if has_recent_activity:
+            codes.add(underlying_code)
+
+    return codes
+
+
+def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
+    """
+    近10日分點明細的「現股10日」需要標的股起始價與最新收盤價。
+
+    當 API4 分點資料尚未更新到今天，但今天已盤後時，仍應先把標的股最新價格補進 price_cache，
+    讓之後分點資料一出來，圖卡可以直接使用今天的現股收盤價，不會停在前一交易日。
+    """
+    if not BROKER_10D_DETAIL_ENABLED:
+        return price_cache
+
+    codes = _collect_recent_underlying_codes_for_10d(items, target_date)
+    if not codes:
+        print("  ✅ 近10日分點明細沒有需要預抓的標的股價格。")
+        return price_cache
+
+    target_date = normalize_top15_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
+    end_dt = min(target_dt, datetime.today())
+    lookback_days = max(int(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
+    start_dt = target_dt - timedelta(days=lookback_days)
+
+    persistent_price_cache = load_price_cache()
+    fetch_plan = {}
+
+    for code in sorted(codes):
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
+        in_memory_prices = get_price_series_from_cache(price_cache, code)
+        merged_cached = merge_price_dicts(cached_prices, in_memory_prices)
+
+        if merged_cached:
+            add_price_aliases(price_cache, code, merged_cached)
+
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
+        latest_dt = parse_date(latest_date) if latest_date else None
+
+        if latest_price is None or latest_dt is None or latest_dt.date() < target_dt.date():
+            fetch_plan[code] = (start_dt, end_dt)
+
+    print(f"【Step 4c】近10日分點明細需檢查標的股價格：{len(codes):,} 檔")
+    print(f"  近10日分點明細需補抓標的股價格：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        return price_cache
+
+    def fetch_one(code):
+        sdt, edt = fetch_plan[code]
+        return code, fetch_twse_prices(code, sdt, edt)
+
+    done = 0
+    changed_price_codes = set()
+
+    with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
+        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
+
+        for future in as_completed(futures):
+            done += 1
+            code = futures[future]
+
+            try:
+                _, fetched_prices = future.result()
+            except Exception:
+                fetched_prices = {}
+
+            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+            merged_prices = merge_price_dicts(old_prices, fetched_prices)
+
+            norm_code = normalize_price_code(code)
+            if norm_code:
+                persistent_price_cache[norm_code] = merged_prices
+                if fetched_prices:
+                    changed_price_codes.add(norm_code)
+
+            add_price_aliases(price_cache, code, merged_prices)
+
+            if done % 20 == 0:
+                print(f"  [{done}/{len(fetch_plan)}] 近10日標的股價格補抓中...")
+
+    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+    return price_cache
+
+
 def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
     """
     判斷近10日賣超是否真的需要最新權證價格作為成本備援。
@@ -11181,6 +11321,150 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
 
 
 
+def _collect_all_item_price_codes_for_prefetch(items):
+    """
+    收集價格預抓完整模式要補的所有代號。
+
+    來源是既有「快取_分點歷史」還原出的 items：
+    - 權證代號：所有有分點歷史資料的權證都納入
+    - 標的股代號：所有有分點歷史資料的標的股都納入
+
+    注意：這裡只負責收集代號，不改 A/B/C/D、TOP15、近10日明細的判斷邏輯。
+    """
+    warrant_codes = set()
+    underlying_codes = set()
+
+    for item in items or []:
+        warrant_code = normalize_price_code(item.get("warrant_code", ""))
+        if warrant_code:
+            warrant_codes.add(warrant_code)
+
+        underlying_code = normalize_underlying_code_for_group(item.get("underlying_code", "")) or normalize_price_code(item.get("underlying_code", ""))
+        if underlying_code:
+            underlying_codes.add(underlying_code)
+
+    return warrant_codes, underlying_codes
+
+
+def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
+    """
+    價格預抓完整模式：補抓所有既有分點歷史項目會牽涉到的價格。
+
+    目的：
+    分點資料可能最新只到前一交易日，但盤後價格已經更新到今天。
+    這時候預抓模式應該先把所有可能會被後續報表 / 圖卡使用的價格都補進 price_cache，
+    不只補目前事件清單、TOP15 或近10日圖卡剛好需要的少數代號。
+
+    判斷：
+    - 同一個代號若 price_cache 已有 target_date 當天價格，略過。
+    - 若沒有 target_date 當天價格，或完全沒有價格，才補抓。
+    - 權證與標的股分開使用不同 lookback，避免權證太久沒成交時完全抓不到價格。
+    """
+    if not PRICE_PREFETCH_ALL_ITEM_PRICES:
+        return price_cache
+
+    warrant_codes, underlying_codes = _collect_all_item_price_codes_for_prefetch(items)
+
+    if not warrant_codes and not underlying_codes:
+        print("  ✅ 價格預抓完整模式：沒有可預抓的權證 / 標的股代號。")
+        return price_cache
+
+    target_date = normalize_price_prefetch_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
+    end_dt = min(target_dt, datetime.today())
+
+    warrant_lookback_days = max(int(PRICE_PREFETCH_ALL_WARRANT_PRICE_LOOKBACK_DAYS), 1)
+    underlying_lookback_days = max(int(PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
+
+    persistent_price_cache = load_price_cache()
+    fetch_plan = {}
+
+    def add_to_fetch_plan(code, code_type):
+        norm_code = normalize_price_code(code)
+        if not norm_code:
+            return
+
+        lookback_days = warrant_lookback_days if code_type == "warrant" else underlying_lookback_days
+        start_dt = target_dt - timedelta(days=lookback_days)
+
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, norm_code)
+        in_memory_prices = get_price_series_from_cache(price_cache, norm_code)
+        merged_cached = merge_price_dicts(cached_prices, in_memory_prices)
+
+        if merged_cached:
+            add_price_aliases(price_cache, norm_code, merged_cached)
+            persistent_price_cache[norm_code] = merged_cached
+
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, norm_code, target_date)
+        latest_dt = parse_date(latest_date) if latest_date else None
+
+        need_fetch = latest_price is None or latest_dt is None
+        if not need_fetch and PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE:
+            need_fetch = latest_dt.date() < target_dt.date()
+
+        if need_fetch:
+            old_plan = fetch_plan.get(norm_code)
+            if old_plan:
+                old_start_dt, old_end_dt, old_type = old_plan
+                fetch_plan[norm_code] = (min(old_start_dt, start_dt), max(old_end_dt, end_dt), old_type if old_type == "warrant" else code_type)
+            else:
+                fetch_plan[norm_code] = (start_dt, end_dt, code_type)
+
+    for code in sorted(underlying_codes):
+        add_to_fetch_plan(code, "underlying")
+
+    for code in sorted(warrant_codes):
+        add_to_fetch_plan(code, "warrant")
+
+    print(
+        f"【價格預抓】完整價格預抓：標的股 {len(underlying_codes):,} 檔｜權證 {len(warrant_codes):,} 檔｜"
+        f"需補抓 {len(fetch_plan):,} 檔"
+    )
+    print(
+        f"  完整價格預抓 lookback：標的股近 {underlying_lookback_days} 天｜"
+        f"權證近 {warrant_lookback_days} 天｜目標日：{target_date}"
+    )
+
+    if not fetch_plan:
+        return price_cache
+
+    def fetch_one(code):
+        start_dt, end_dt, code_type = fetch_plan[code]
+        return code, fetch_twse_prices(code, start_dt, end_dt)
+
+    done = 0
+    changed_price_codes = set()
+
+    with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
+        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
+
+        for future in as_completed(futures):
+            done += 1
+            code = futures[future]
+
+            try:
+                _, fetched_prices = future.result()
+            except Exception:
+                fetched_prices = {}
+
+            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+            merged_prices = merge_price_dicts(old_prices, fetched_prices)
+
+            norm_code = normalize_price_code(code)
+            if norm_code:
+                persistent_price_cache[norm_code] = merged_prices
+                if fetched_prices:
+                    changed_price_codes.add(norm_code)
+
+            add_price_aliases(price_cache, code, merged_prices)
+
+            if done % 50 == 0:
+                print(f"  [{done}/{len(fetch_plan)}] 完整價格預抓中...")
+
+    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+    return price_cache
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 自動價格預抓：今日分點資料未出現時，只更新價格快取並快速結束
 # ══════════════════════════════════════════════════════════════════════
@@ -11248,7 +11532,7 @@ def write_price_prefetch_state(record):
     headers = [
         "日期", "資料範圍", "模式", "狀態", "原因",
         "候選組合數", "快取歷史筆數", "還原項目數", "A事件數", "B事件數", "C事件數", "D事件數",
-        "價格快取代號數", "執行時間", "更新時間",
+        "價格快取代號數", "價格最新日期", "目標日價格代號數", "執行時間", "更新時間",
     ]
 
     old_df = read_cache_csv(PRICE_PREFETCH_STATE_PATH)
@@ -11269,6 +11553,72 @@ def write_price_prefetch_state(record):
     ).reset_index(drop=True)
 
     write_cache_csv(df, PRICE_PREFETCH_STATE_PATH)
+
+
+def price_cache_target_date_summary(price_cache, target_date=None):
+    """
+    統計價格快取是否已經有 target_date 的收盤價。
+
+    目的：
+    盤後價格有時會比 API4 分點資料更早更新。若早盤/盤中已執行過價格預抓，
+    price_prefetch_state 可能已是 done，但當時 price_cache 還沒有今天收盤價。
+    這個函式用來判斷是否應該在盤後再預抓一次最新價格。
+    """
+    target_date = normalize_price_prefetch_target_date(target_date)
+    target_key = normalize_date_str(target_date)
+
+    latest_dt = None
+    latest_date = ""
+    target_date_code_count = 0
+
+    if not price_cache:
+        return {
+            "target_date": target_key,
+            "target_date_code_count": 0,
+            "latest_date": "",
+        }
+
+    counted_codes = set()
+
+    for code, prices in price_cache.items():
+        norm_code = normalize_price_code(code)
+        if not norm_code or not isinstance(prices, dict):
+            continue
+
+        has_target_price = False
+
+        for d, p in prices.items():
+            dt = parse_date(d)
+            price = safe_price_float(p)
+            if not dt or price is None:
+                continue
+
+            d_norm = dt.strftime("%Y/%m/%d")
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
+                latest_date = d_norm
+
+            if d_norm == target_key:
+                has_target_price = True
+
+        if has_target_price and norm_code not in counted_codes:
+            counted_codes.add(norm_code)
+            target_date_code_count += 1
+
+    return {
+        "target_date": target_key,
+        "target_date_code_count": target_date_code_count,
+        "latest_date": latest_date,
+    }
+
+
+def price_cache_has_target_date_prices(target_date=None, min_codes=None):
+    if min_codes is None:
+        min_codes = PRICE_PREFETCH_MIN_TARGET_PRICE_CODES
+
+    price_cache = load_price_cache()
+    summary = price_cache_target_date_summary(price_cache, target_date)
+    return int(summary.get("target_date_code_count", 0) or 0) >= max(int(min_codes or 1), 1), summary
 
 
 def has_today_broker_data_from_prescan(target_date=None):
@@ -11402,11 +11752,20 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         price_cache = load_price_cache()
         print("  ⚠️ 快取資料目前無 A/B/C/D 事件，略過事件價格預抓，只檢查其他價格需求。")
 
+    # 不論 RUN_MODE 為何，價格預抓都先補近10日分點明細會用到的標的股價格。
+    # 這是為了讓盤後現股收盤價可以先進 price_cache，避免之後分點資料更新時「現股10日」仍停在前一交易日。
+    price_cache = ensure_broker_10d_underlying_prices(price_cache, items, target_date=target_date)
+
     if RUN_MODE == 2:
         price_cache = ensure_broker_10d_warrant_prices(price_cache, items, target_date=target_date)
     else:
         print("  ✅ RUN_MODE=1：近10日分點明細工作表不更新，因此價格預抓略過該表權證價。")
 
+    # 完整價格預抓：不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
+    # 也把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
+    price_cache = ensure_price_prefetch_all_item_prices(price_cache, items, target_date=target_date)
+
+    price_summary = price_cache_target_date_summary(price_cache, target_date)
     elapsed = time.time() - start_ts
     write_price_prefetch_state({
         "日期": target_date,
@@ -11422,6 +11781,8 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         "C事件數": len(c_events),
         "D事件數": len(d_events),
         "價格快取代號數": len(price_cache or {}),
+        "價格最新日期": price_summary.get("latest_date", ""),
+        "目標日價格代號數": price_summary.get("target_date_code_count", 0),
         "執行時間": f"{elapsed:.2f}",
     })
 
@@ -11453,10 +11814,27 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
     )
 
     if PRICE_PREFETCH_SKIP_IF_DONE_TODAY and is_price_prefetch_done_for_today(target_date):
-        print("  ✅ 今日已完成價格預抓，且分點資料仍未出現；略過正式報表與價格重抓，快速結束。")
-        elapsed = time.time() - program_start
-        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
-        return True
+        if PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE:
+            has_target_price, price_summary = price_cache_has_target_date_prices(target_date)
+            if has_target_price:
+                print(
+                    "  ✅ 今日已完成價格預抓，且價格快取已有目標日收盤價；"
+                    "分點資料仍未出現，略過正式報表與價格重抓，快速結束。"
+                )
+                elapsed = time.time() - program_start
+                print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+                return True
+            print(
+                f"  🔄 今日曾完成價格預抓，但 price_cache 尚無 {target_date} 收盤價 "
+                f"（價格最新日期：{price_summary.get('latest_date', '-') or '-'}｜"
+                f"目標日代號數：{price_summary.get('target_date_code_count', 0)}），"
+                "本次再嘗試預抓盤後最新價格。"
+            )
+        else:
+            print("  ✅ 今日已完成價格預抓，且分點資料仍未出現；略過正式報表與價格重抓，快速結束。")
+            elapsed = time.time() - program_start
+            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+            return True
 
     print("  🔄 自動進入價格預抓模式：只更新 price_cache，不寫入今日結果表。")
     history_cache_df = load_history_cache()
@@ -11656,6 +12034,7 @@ def main():
     warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
 
     if RUN_MODE == 2:
+        price_cache = ensure_broker_10d_underlying_prices(price_cache, items)
         price_cache = ensure_broker_10d_warrant_prices(price_cache, items)
         broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache)
     else:
