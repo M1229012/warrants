@@ -121,7 +121,7 @@ jobs:
 
       # 執行緒設定
       MAX_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '30 13 * * 1-5')) && '60' || '80' }}
-      PRICE_WORKERS: "60"
+      PRICE_WORKERS: "80"
       PRESCAN_WORKERS: ${{ ((github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整資料回補與回測' || github.event.inputs.run_plan == '不使用快取重新抓完整資料')) || (github.event_name == 'schedule' && github.event.schedule == '30 13 * * 1-5')) && '60' || '80' }}
       FIND_BROKER_WORKERS: "40"
 
