@@ -49,7 +49,7 @@ from matplotlib import font_manager
 
 TRACKED_BROKERS = [
     "華南永昌台中",
-    "",
+    "元大南屯",
     "永豐金竹北",
     "永豐金內湖",
     "富邦敦南",
