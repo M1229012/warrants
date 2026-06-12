@@ -7,26 +7,32 @@ if (!DISCORD_APPLICATION_ID || !DISCORD_BOT_TOKEN) {
   process.exit(1);
 }
 
-const command = {
-  name: "w",
-  description: "產生單一股票的權證週報",
-  options: [
-    { type: 3, name: "stock", description: "股票代號，例如 2408", required: true },
-    { type: 5, name: "refresh", description: "是否重新抓新聞並重新產生本週重點", required: false },
-  ],
-};
+const commands = [
+  {
+    name: "w",
+    description: "產生單一股票的權證週報",
+    options: [
+      { type: 3, name: "stock", description: "股票代號，例如 2408", required: true },
+      { type: 5, name: "refresh", description: "是否重新抓新聞並重新產生本週重點", required: false },
+    ],
+  },
+  {
+    name: "ww",
+    description: "產生單一分點近10日權證買賣超明細圖",
+  },
+];
 
 const endpoint = DISCORD_GUILD_ID
   ? `https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/guilds/${DISCORD_GUILD_ID}/commands`
   : `https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/commands`;
 
 const resp = await fetch(endpoint, {
-  method: "POST",
+  method: "PUT",
   headers: {
     Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
     "Content-Type": "application/json",
   },
-  body: JSON.stringify(command),
+  body: JSON.stringify(commands),
 });
 
 const text = await resp.text();
@@ -37,5 +43,5 @@ if (!resp.ok) {
   process.exit(1);
 }
 
-console.log("Slash Command 註冊成功：");
+console.log("Slash Commands 註冊成功：");
 console.log(text);
