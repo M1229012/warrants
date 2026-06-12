@@ -11622,6 +11622,105 @@ def price_cache_has_target_date_prices(target_date=None, min_codes=None):
     return int(summary.get("target_date_code_count", 0) or 0) >= max(int(min_codes or 1), 1), summary
 
 
+def price_cache_has_exact_target_date_price_for_code(price_cache, code, target_date):
+    target_key = normalize_date_str(target_date)
+    prices = get_cached_prices_for_code(price_cache, code)
+
+    if not prices:
+        return False
+
+    for d, p in prices.items():
+        dt = parse_date(d)
+        price = safe_price_float(p)
+
+        if not dt or price is None:
+            continue
+
+        if dt.strftime("%Y/%m/%d") == target_key:
+            return True
+
+    return False
+
+
+def price_cache_has_required_10d_underlying_target_prices(history_cache_df, candidate_keys=None, target_date=None):
+    """
+    檢查近10日圖卡「現股10日」會用到的標的股，是否都已經有目標日收盤價。
+
+    修正重點：
+    舊版只要 price_cache 裡任一代號有今天價格，就會因 price_prefetch_state=done 而快速結束，
+    導致近10日現股標的仍停在前一交易日。這裡改成必須檢查近10日實際需要的標的股。
+    """
+    target_date = normalize_price_prefetch_target_date(target_date)
+
+    summary = {
+        "target_date": target_date,
+        "required_underlying_count": 0,
+        "target_date_underlying_count": 0,
+        "missing_underlying_count": 0,
+        "latest_date": "",
+        "missing_sample": "",
+    }
+
+    if history_cache_df is None or history_cache_df.empty:
+        return False, summary
+
+    try:
+        if candidate_keys:
+            items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+        else:
+            items = items_from_history_cache(history_cache_df)
+    except Exception:
+        items = []
+
+    required_codes = _collect_recent_underlying_codes_for_10d(items, target_date)
+    required_codes = {normalize_underlying_code_for_group(c) or normalize_price_code(c) for c in required_codes if str(c).strip()}
+    required_codes = {c for c in required_codes if c}
+
+    summary["required_underlying_count"] = len(required_codes)
+
+    if not required_codes:
+        generic_has_target, generic_summary = price_cache_has_target_date_prices(target_date)
+        summary["latest_date"] = generic_summary.get("latest_date", "")
+        return generic_has_target, summary
+
+    price_cache = load_price_cache()
+    target_ok_codes = set()
+    missing_codes = []
+    latest_dt = None
+    latest_date = ""
+
+    for code in sorted(required_codes):
+        prices = get_cached_prices_for_code(price_cache, code)
+        has_target = False
+
+        for d, p in prices.items():
+            dt = parse_date(d)
+            price = safe_price_float(p)
+
+            if not dt or price is None:
+                continue
+
+            d_norm = dt.strftime("%Y/%m/%d")
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
+                latest_date = d_norm
+
+            if d_norm == target_date:
+                has_target = True
+
+        if has_target:
+            target_ok_codes.add(code)
+        else:
+            missing_codes.append(code)
+
+    summary["target_date_underlying_count"] = len(target_ok_codes)
+    summary["missing_underlying_count"] = len(missing_codes)
+    summary["latest_date"] = latest_date
+    summary["missing_sample"] = ", ".join(missing_codes[:10])
+
+    return len(missing_codes) == 0, summary
+
+
 def has_today_broker_data_from_prescan(target_date=None):
     target_date = normalize_price_prefetch_target_date(target_date)
 
@@ -11814,21 +11913,41 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
         f"目前最新活動日：{latest_label}。"
     )
 
+    candidate_keys = {candidate_key_from_tuple(c) for c in candidates} if candidates else None
+    history_cache_df = None
+
     if PRICE_PREFETCH_SKIP_IF_DONE_TODAY and is_price_prefetch_done_for_today(target_date):
         if PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE:
-            has_target_price, price_summary = price_cache_has_target_date_prices(target_date)
-            if has_target_price:
+            history_cache_df = load_history_cache()
+            has_required_10d_underlying_prices, price_summary = price_cache_has_required_10d_underlying_target_prices(
+                history_cache_df,
+                candidate_keys=candidate_keys,
+                target_date=target_date,
+            )
+
+            print(
+                f"  🔎 檢查近10日現股價格：需 {price_summary.get('required_underlying_count', 0):,} 檔｜"
+                f"已有目標日 {price_summary.get('target_date_underlying_count', 0):,} 檔｜"
+                f"缺 {price_summary.get('missing_underlying_count', 0):,} 檔"
+            )
+
+            if has_required_10d_underlying_prices:
                 print(
-                    "  ✅ 今日已完成價格預抓，且價格快取已有目標日收盤價；"
+                    "  ✅ 今日已完成價格預抓，且近10日現股所需標的股已有目標日收盤價；"
                     "分點資料仍未出現，略過正式報表與價格重抓，快速結束。"
                 )
                 elapsed = time.time() - program_start
                 print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
                 return True
+
+            missing_sample = str(price_summary.get("missing_sample", "") or "").strip()
+            if missing_sample:
+                missing_sample = f"｜缺少樣本：{missing_sample}"
+
             print(
-                f"  🔄 今日曾完成價格預抓，但 price_cache 尚無 {target_date} 收盤價 "
+                f"  🔄 今日曾完成價格預抓，但近10日現股所需標的股尚未全數取得 {target_date} 收盤價 "
                 f"（價格最新日期：{price_summary.get('latest_date', '-') or '-'}｜"
-                f"目標日代號數：{price_summary.get('target_date_code_count', 0)}），"
+                f"缺少標的數：{price_summary.get('missing_underlying_count', 0)}{missing_sample}），"
                 "本次再嘗試預抓盤後最新價格。"
             )
         else:
@@ -11838,8 +11957,8 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
             return True
 
     print("  🔄 自動進入價格預抓模式：只更新 price_cache，不寫入今日結果表。")
-    history_cache_df = load_history_cache()
-    candidate_keys = {candidate_key_from_tuple(c) for c in candidates} if candidates else None
+    if history_cache_df is None:
+        history_cache_df = load_history_cache()
     run_auto_price_prefetch_from_history(
         history_cache_df,
         candidate_keys=candidate_keys,
