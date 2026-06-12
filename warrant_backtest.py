@@ -10381,6 +10381,36 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
 
         note_text = "；".join(notes)
 
+        underlying_10d_return_pct = None
+        underlying_start_price = None
+        underlying_end_price = None
+        underlying_start_price_date = ""
+        underlying_end_price_date = ""
+        underlying_code_for_price = str(rec.get("標的股", "") or "").strip()
+
+        if underlying_code_for_price:
+            underlying_start_price, underlying_start_price_date = get_latest_price_info_on_or_before(
+                price_cache,
+                underlying_code_for_price,
+                start_date,
+            )
+            underlying_end_price, underlying_end_price_date = get_latest_price_info_on_or_before(
+                price_cache,
+                underlying_code_for_price,
+                target_date,
+            )
+
+            try:
+                if (
+                    underlying_start_price is not None
+                    and underlying_end_price is not None
+                    and float(underlying_start_price) > 0
+                    and float(underlying_end_price) > 0
+                ):
+                    underlying_10d_return_pct = (float(underlying_end_price) - float(underlying_start_price)) / float(underlying_start_price) * 100
+            except Exception:
+                underlying_10d_return_pct = None
+
         warrant_rows = []
         warrant_json = []
         for w in sorted(
@@ -10421,6 +10451,11 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "券商代號": rec.get("券商代號", ""),
             "標的股": rec.get("標的股", ""),
             "標的名稱": rec.get("標的名稱", ""),
+            "標的10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
+            "標的10日起始價": round(float(underlying_start_price), 4) if underlying_start_price is not None else "",
+            "標的10日收盤價": round(float(underlying_end_price), 4) if underlying_end_price is not None else "",
+            "標的10日起始價格日": add_gsheet_text_prefix(underlying_start_price_date) if underlying_start_price_date else "",
+            "標的10日收盤價格日": add_gsheet_text_prefix(underlying_end_price_date) if underlying_end_price_date else "",
             "買賣方向": direction,
             "近10日買進股數": round(buy_qty, 0),
             "近10日買進金額": round(buy_amount, 0),
@@ -10609,7 +10644,9 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
 
     headers = [
         "資料範圍", "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
-        "分點", "分點名稱", "券商代號", "標的股", "標的名稱", "買賣方向",
+        "分點", "分點名稱", "券商代號", "標的股", "標的名稱",
+        "標的10日漲跌幅%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
+        "買賣方向",
         "近10日買進股數", "近10日買進金額", "近10日賣出股數", "近10日賣出金額",
         "近10日淨買超股數", "近10日淨買超金額", "近10日淨賣超股數", "近10日淨賣超金額",
         "涉及權證檔數", "權證清單",
@@ -10629,7 +10666,9 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
 
     col_widths = [
         12, 12, 24, 10, 12, 12, 12,
-        14, 18, 12, 10, 14, 10,
+        14, 18, 12, 10, 14,
+        16, 14, 14, 14, 14,
+        10,
         14, 16, 14, 16,
         16, 18, 16, 18,
         12, 72,
