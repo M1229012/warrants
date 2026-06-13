@@ -135,7 +135,7 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
     "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
-    "新光",
+    "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
 ).strip()
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
