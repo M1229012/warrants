@@ -2146,6 +2146,23 @@ GSHEET_DATE_HEADER_KEYWORDS = (
 )
 
 
+def is_gsheet_datetime_header(header):
+    """
+    判斷 Google Sheet 中哪些欄位應該以日期時間格式顯示。
+
+    Google Sheet 使用 USER_ENTERED 寫入「2026/06/12 14:40:00」時，
+    底層會轉成日期序號，例如 46185.27799。
+    若沒有另外套日期時間格式，就會直接顯示序號。
+    目前只把「更新時間」視為日期時間欄位，避免把「執行時間」這種耗時欄位誤套格式。
+    """
+    header = str(header).strip()
+
+    if not header:
+        return False
+
+    return header == "更新時間" or header.endswith("更新時間")
+
+
 def is_gsheet_date_header(header):
     """
     判斷 Google Sheet 中哪些欄位應該以日期格式顯示。
@@ -2159,6 +2176,9 @@ def is_gsheet_date_header(header):
     if not header:
         return False
 
+    if is_gsheet_datetime_header(header):
+        return False
+
     if "天數" in header:
         return False
 
@@ -2167,10 +2187,12 @@ def is_gsheet_date_header(header):
 
 def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
     """
-    將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd。
+    將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd，
+    並將「更新時間」套用日期時間格式 yyyy/mm/dd hh:mm:ss。
 
     upsert 模式會新增「資料範圍」欄位，因此日期欄位置必須以實際寫入 values 的表頭判斷，
-    不可只看原本 Excel 欄位位置。這可避免買進均價 / 張數 / 獲利% 被誤套成日期格式。
+    不可只看原本 Excel 欄位位置。這可避免買進均價 / 張數 / 獲利% 被誤套成日期格式，
+    也可避免「更新時間」顯示成 46185.27799 這類日期序號。
     """
     if gws is None:
         return
@@ -2186,23 +2208,31 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
 
     for row_idx in range(1, scan_limit + 1):
         row = source_rows[row_idx - 1]
-        date_cols = []
+        format_cols = []
 
         for col_idx in range(1, max_col + 1):
             header = row[col_idx - 1] if col_idx - 1 < len(row) else ""
 
-            if is_gsheet_date_header(header):
-                date_cols.append(col_idx)
+            if is_gsheet_datetime_header(header):
+                format_cols.append((col_idx, {
+                    "type": "DATE_TIME",
+                    "pattern": "yyyy/mm/dd hh:mm:ss",
+                }))
+            elif is_gsheet_date_header(header):
+                format_cols.append((col_idx, {
+                    "type": "DATE",
+                    "pattern": "yyyy/mm/dd",
+                }))
 
-        if date_cols:
-            header_rows.append((row_idx, date_cols))
+        if format_cols:
+            header_rows.append((row_idx, format_cols))
 
     if not header_rows:
         return
 
     requests = []
 
-    for idx, (header_row_idx, date_cols) in enumerate(header_rows):
+    for idx, (header_row_idx, format_cols) in enumerate(header_rows):
         if idx + 1 < len(header_rows):
             end_row = header_rows[idx + 1][0] - 1
         else:
@@ -2213,7 +2243,7 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
         if start_data_row > end_row:
             continue
 
-        for col_idx in date_cols:
+        for col_idx, number_format in format_cols:
             requests.append({
                 "repeatCell": {
                     "range": {
@@ -2225,10 +2255,7 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": {
-                                "type": "DATE",
-                                "pattern": "yyyy/mm/dd",
-                            }
+                            "numberFormat": number_format
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -3159,6 +3186,39 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
                 return digits
 
     return ""
+
+
+
+def normalize_underlying_for_display(value, fallback_text=""):
+    """
+    將標的股欄位統一成穩定代號，供所有圖片快取排名先合併同標的後再排序。
+
+    可處理：
+    - 2408 / '2408 / 2408.0
+    - 00631L、00632R、00981A 這類 ETF / 主動式 ETF 英文字尾
+    - 權證名稱或標的名稱中含特殊 ETF 簡稱時的對照
+    """
+    normalized = normalize_underlying_code_for_group(value, fallback_text)
+
+    if normalized:
+        return normalized
+
+    raw = strip_gsheet_text_prefix(str(value or "")).strip().upper()
+    raw = re.sub(r"\.(TW|TWO)$", "", raw, flags=re.I)
+
+    if raw.endswith(".0") and raw[:-2].isdigit():
+        raw = raw[:-2]
+
+    return raw
+
+
+def fill_known_underlying_name_if_missing(underlying_code, underlying_name=""):
+    underlying_name = str(underlying_name or "").strip()
+
+    if underlying_name:
+        return underlying_name
+
+    return get_known_underlying_name_by_code(underlying_code) or underlying_name
 
 def _record_key(rec, key_cols):
     parts = []
@@ -7516,10 +7576,13 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     agg = {}
 
     for row in detail_rows:
-        underlying = str(row.get("標的股", "")).strip()
+        raw_underlying = str(row.get("標的股", "")).strip()
+        underlying_name = str(row.get("標的名稱", "")).strip()
+        underlying = normalize_underlying_for_display(raw_underlying, underlying_name or row.get("權證名稱", ""))
         if not underlying:
             continue
 
+        underlying_name = fill_known_underlying_name_if_missing(underlying, underlying_name)
         key = underlying
         rec = agg.setdefault(key, {
             "資料範圍": row.get("資料範圍", get_result_data_scope()),
@@ -7527,7 +7590,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
             "標的股": underlying,
-            "標的名稱": str(row.get("標的名稱", "")).strip(),
+            "標的名稱": underlying_name,
             "淨買超成本": 0.0,
             "可估成本": 0.0,
             "缺價格成本": 0.0,
@@ -10407,8 +10470,10 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code = str(item.get("underlying_code", "")).strip()
+        raw_underlying_code = str(item.get("underlying_code", "")).strip()
         underlying_name = str(item.get("underlying_name", "")).strip()
+        underlying_code = normalize_underlying_for_display(raw_underlying_code, underlying_name or warrant_name)
+        underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
@@ -11041,7 +11106,8 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
         warrant_name = str(item.get("warrant_name", "")).strip()
         raw_underlying_code = str(item.get("underlying_code", "")).strip()
         underlying_name = str(item.get("underlying_name", "")).strip()
-        underlying_code = normalize_underlying_code_for_group(raw_underlying_code, underlying_name or warrant_name)
+        underlying_code = normalize_underlying_for_display(raw_underlying_code, underlying_name or warrant_name)
+        underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
