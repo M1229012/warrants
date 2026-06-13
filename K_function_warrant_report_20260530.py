@@ -133,9 +133,10 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-# 本版專用：精選分點資金流固定只顯示「新光」。
-# 這裡不再讀取 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES，避免 GitHub Actions YAML 舊五分點名單覆蓋掉新光設定。
-SELECTED_BRANCH_FLOW_BRANCHES = "新光"
+SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
+    "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
+    "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
+).strip()
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
@@ -3439,18 +3440,31 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     cols = ["branch", "net_amount", "max_warrant_code", "max_warrant_name", "max_warrant_amount"]
     if week_events is None or week_events.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
-
-    # TOP5 不做任何限制：
-    # 1. 不排除疑似對手單 / 換手單。
-    # 2. 不排除券商總公司型分點。
-    # 3. 不套用精選分點名單。
-    # 這裡一律使用本週完整權證分點資料排名，精選分點資金流則另外由
-    # filter_selected_branch_flow_events() 控制，只顯示指定分點。
     e = week_events.copy()
     if "branch" in e.columns:
         e["branch"] = e["branch"].map(normalize_branch_name)
+    if CROSS_BROKER_OFFSET_FILTER_ENABLE:
+        e, offset_removed = filter_out_cross_broker_offset_trades(
+            e,
+            amount_diff_threshold=CROSS_BROKER_OFFSET_THRESHOLD,
+            min_side_amount=CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT,
+            do_filter=True,
+        )
+        if offset_removed > 0:
+            print(f"🧹 TOP5 已排除疑似對手單 / 換手單：{offset_removed:,} 筆")
 
     e["branch"] = e["branch"].map(normalize_branch_name).replace("", "未知分點")
+
+    if TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE and not e.empty:
+        head_office_mask = e["branch"].map(is_top5_head_office_branch)
+        head_office_removed = int(head_office_mask.sum())
+        if head_office_removed > 0:
+            removed_branches = sorted(set(e.loc[head_office_mask, "branch"].astype(str)))
+            preview = "、".join(removed_branches[:10])
+            if len(removed_branches) > 10:
+                preview += "…"
+            print(f"🏢 TOP5 已排除券商總公司型分點：{head_office_removed:,} 筆｜{preview}")
+        e = e.loc[~head_office_mask].copy()
 
     if e.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
@@ -6468,13 +6482,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_latest_bar_color = RED if selected_latest_net >= 0 else GREEN
     selected_total_color = RED if selected_total_net >= 0 else GREEN
 
-    selected_branch_list = _get_selected_branch_flow_list()
-    selected_branch_label = "、".join(selected_branch_list)
-    selected_flow_title = f"{selected_branch_label}資金流" if len(selected_branch_list) == 1 and selected_branch_label else "精選分點資金流"
-
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, selected_flow_title, GOLD,
+        selected_wnet_ax, xpos, "精選分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
@@ -6490,6 +6500,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
     draw_header_text_and_advance(selected_wnet_ax, xpos, f"累計 {fmt_money(selected_latest_cum)}", BLUE, gap_px=0)
 
+    selected_branch_label = "、".join(_get_selected_branch_flow_list())
     if selected_branch_label:
         selected_wnet_ax.text(
             0.001, 0.985,
@@ -6542,7 +6553,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     if selected_branch_events.empty:
         selected_wnet_ax.text(
             0.5, 0.48,
-            f"70日內無{selected_branch_label or '精選分點'}權證買賣資料",
+            "70日內無精選分點權證買賣資料",
             transform=selected_wnet_ax.transAxes,
             color=MUTED,
             fontsize=27,
