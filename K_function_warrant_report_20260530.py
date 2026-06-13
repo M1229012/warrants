@@ -135,7 +135,7 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
     "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
-    "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
+    "新光",
 ).strip()
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
@@ -6484,7 +6484,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
+        selected_wnet_ax, xpos, "精選分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
