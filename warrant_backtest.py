@@ -176,14 +176,10 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 # RUN_MODE=1 / RUN_MODE=2 加速追蹤設定：
-# 舊版 RUN_MODE=1 會建立「所有認購權證 × 精選分點」，再用 SELECTED_REFRESH_ALL_WARRANTS
-# 每次全部重打 API5，速度會非常慢。新版改成：
+# 舊版 RUN_MODE=1 曾使用全市場權證 × 精選分點的大候選池，速度很慢。新版改成：
 # 1. 先用 API4 掃最近有目標分點活動的標的股。
 # 2. 再展開成「該標的所有認購權證 × 追蹤分點」。
 # 3. 若歷史快取已有該候選資料，就走增量判斷，不再每天重抓 250 日 API5。
-# 下列兩個舊環境變數保留相容，但預設流程已改成「活動標的擴展 + 快取增量」。
-SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
-SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # 全面增量更新設定：
@@ -3269,6 +3265,31 @@ def merge_result_values_for_gsheet(title, new_values):
     old_headers, old_records = _values_to_records(old_values, header_row_idx=0, default_scope=GSHEET_LEGACY_SCOPE_LABEL)
     old_headers = _ensure_scope_header(old_headers) if old_headers else []
 
+    # 近10日分點明細是「同日期完整快照」。
+    # 若只用 upsert，舊版權證層級資料因 key 不同會被保留下來，圖片端會同時讀到舊權證列與新標的列。
+    # 因此同一資料範圍 + 統計日期改採快照替換，確保每次都是最新的標的層級資料。
+    if safe_worksheet_title(title) == BROKER_10D_DETAIL_SHEET:
+        replace_scope_dates = set()
+        for rec in new_records:
+            scope_value = str(rec.get("資料範圍", current_scope) or current_scope).strip()
+            stat_date = normalize_date_str(strip_gsheet_text_prefix(rec.get("統計日期", "")))
+            if scope_value and stat_date:
+                replace_scope_dates.add((scope_value, stat_date))
+
+        if replace_scope_dates and old_records:
+            before_count = len(old_records)
+            filtered_old_records = []
+            for rec in old_records:
+                scope_value = str(rec.get("資料範圍", GSHEET_LEGACY_SCOPE_LABEL) or GSHEET_LEGACY_SCOPE_LABEL).strip()
+                stat_date = normalize_date_str(strip_gsheet_text_prefix(rec.get("統計日期", "")))
+                if (scope_value, stat_date) in replace_scope_dates:
+                    continue
+                filtered_old_records.append(rec)
+            old_records = filtered_old_records
+            removed_count = before_count - len(old_records)
+            if removed_count > 0:
+                print(f"  ☁️ 已清除同日期舊版近10日分點明細：{removed_count:,} 筆，改用本次標的層級快照。")
+
     headers = []
     for h in new_headers + old_headers:
         h = str(h).strip()
@@ -4274,6 +4295,173 @@ def load_warrants_cache():
     return warrants
 
 
+_WARRANT_UNDERLYING_LOOKUP_CACHE = None
+_STOCK_NAME_CODE_LOOKUP_CACHE = None
+_STOCK_NAME_RESOLVER_CACHE = None
+
+
+def is_probably_warrant_code_for_underlying(value):
+    """
+    判斷「標的股」欄位是否疑似被錯塞成權證代號。
+
+    修正近10日分點明細時很重要：
+    如果舊快取把 064390、701234 這類權證代號放在標的股欄位，
+    後續就會變成一檔權證一列，無法合併成同標的統計。
+    """
+    s = normalize_price_code(value)
+
+    if not s:
+        return False
+
+    if s in KNOWN_UNDERLYING_CODE_NAME_MAP:
+        return False
+
+    # ETF / ETN / 主動式 ETF 常見 00 開頭，包含 00631L、00632R、00981A，不可視為權證。
+    if s.startswith("00"):
+        return False
+
+    # 4 碼股票不是權證。
+    if re.fullmatch(r"\d{4}", s):
+        return False
+
+    # 台股權證常見 5 碼被吃掉前導 0，或正常 6 碼。
+    if re.fullmatch(r"\d{5,6}", s):
+        return True
+
+    return False
+
+
+def build_warrant_underlying_lookup_from_cache():
+    """
+    從權證清單快取建立：
+    1. 權證代號 -> 正確標的股 / 標的名稱
+    2. 標的名稱 -> 標的股
+    3. 權證名稱前綴解析器
+
+    用途：修復舊候選快取 / 舊歷史快取裡標的股欄位錯誤或空白的資料。
+    """
+    global _WARRANT_UNDERLYING_LOOKUP_CACHE, _STOCK_NAME_CODE_LOOKUP_CACHE, _STOCK_NAME_RESOLVER_CACHE
+
+    if _WARRANT_UNDERLYING_LOOKUP_CACHE is not None:
+        return _WARRANT_UNDERLYING_LOOKUP_CACHE
+
+    warrant_lookup = {}
+    stock_name_code = {}
+
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        stock_name_code[normalize_stock_name_text(name)] = code
+
+    for w in load_warrants_cache() or []:
+        warrant_code = normalize_warrant_code_for_unique(w.get("代號", ""))
+        warrant_name = str(w.get("名稱", "")).strip()
+        underlying_code = normalize_underlying_for_display(w.get("標的股", ""), w.get("標的名稱", "") or warrant_name)
+        underlying_name = str(w.get("標的名稱", "")).strip()
+        underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
+
+        if not warrant_code:
+            continue
+
+        if underlying_code and not is_probably_warrant_code_for_underlying(underlying_code):
+            warrant_lookup[warrant_code] = {
+                "標的股": underlying_code,
+                "標的名稱": underlying_name,
+                "權證名稱": warrant_name,
+            }
+
+            if underlying_name:
+                stock_name_code[normalize_stock_name_text(underlying_name)] = underlying_code
+
+    stock_map = {
+        name: code
+        for name, code in stock_name_code.items()
+        if name and code
+    }
+
+    try:
+        resolver = build_underlying_resolver(stock_map)
+    except Exception:
+        resolver = None
+
+    _WARRANT_UNDERLYING_LOOKUP_CACHE = warrant_lookup
+    _STOCK_NAME_CODE_LOOKUP_CACHE = stock_name_code
+    _STOCK_NAME_RESOLVER_CACHE = resolver
+    return _WARRANT_UNDERLYING_LOOKUP_CACHE
+
+
+def resolve_item_underlying_identity(item, warrant_lookup=None):
+    """
+    回傳 item 的正確標的股代號與標的名稱。
+
+    優先順序：
+    1. 權證清單快取中的權證代號對應標的
+    2. item 內原本的標的股，但必須不像權證代號
+    3. item 內標的名稱對照代號
+    4. 權證名稱前綴反推標的
+    """
+    warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
+
+    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
+    warrant_name = str(item.get("warrant_name", "")).strip()
+    raw_underlying_code = str(item.get("underlying_code", "")).strip()
+    raw_underlying_name = str(item.get("underlying_name", "")).strip()
+
+    cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
+    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached.get("標的名稱", "") or warrant_name)
+    cached_name = str(cached.get("標的名稱", "")).strip()
+
+    if cached_code and not is_probably_warrant_code_for_underlying(cached_code):
+        return cached_code, fill_known_underlying_name_if_missing(cached_code, cached_name or raw_underlying_name)
+
+    normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name or warrant_name)
+    normalized_raw_name = fill_known_underlying_name_if_missing(normalized_raw_code, raw_underlying_name)
+
+    if normalized_raw_code and not is_probably_warrant_code_for_underlying(normalized_raw_code):
+        return normalized_raw_code, normalized_raw_name
+
+    name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
+    for name_candidate in [raw_underlying_name, cached_name]:
+        name_key = normalize_stock_name_text(name_candidate)
+        mapped_code = name_lookup.get(name_key, "")
+        if mapped_code:
+            return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
+
+    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name, warrant_name]))
+    if known_code:
+        return known_code, known_name
+
+    try:
+        stock_map = {
+            name: code
+            for name, code in (name_lookup or {}).items()
+            if name and code
+        }
+        if stock_map:
+            inferred_code, inferred_name = find_underlying_info(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
+            if inferred_code:
+                return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
+    except Exception:
+        pass
+
+    return "", raw_underlying_name or cached_name
+
+
+def repair_item_underlying_identity(item, warrant_lookup=None):
+    """
+    直接修正 item 內的標的股 / 標的名稱，避免後續 A/B/C/D、近10日快取沿用舊錯誤欄位。
+    """
+    if item is None:
+        return item
+
+    underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_lookup)
+
+    if underlying_code:
+        item["underlying_code"] = underlying_code
+    if underlying_name:
+        item["underlying_name"] = underlying_name
+
+    return item
+
+
 def save_broker_map_cache(broker_map):
     if not USE_CACHE or not broker_map:
         return
@@ -4674,6 +4862,7 @@ def items_from_history_cache(history_df, candidate_filter=None):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     group_cols = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號"]
+    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for key, g in df.groupby(group_cols, dropna=False):
         warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = key
@@ -4697,6 +4886,7 @@ def items_from_history_cache(history_df, candidate_filter=None):
             "df": item_df,
         }
 
+        item = repair_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
         item["events_a"] = build_a_events_from_df(item)
         items.append(item)
 
@@ -5344,63 +5534,6 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
     )
     return candidates
 
-def build_selected_full_market_candidates(warrants, broker_map):
-    """
-    RUN_MODE=1 精選分點完整追蹤候選池。
-
-    目的：
-    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
-    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
-
-    這裡改成針對精選分點建立「所有認購權證 × 精選分點」候選組合，
-    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
-    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
-    """
-    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：所有認購權證 × 精選分點...")
-
-    if not warrants or not broker_map:
-        return []
-
-    candidates = []
-    seen = set()
-
-    for w in warrants:
-        warrant_code = str(w.get("代號", "")).strip()
-        warrant_name = str(w.get("名稱", "")).strip()
-        underlying_code = str(w.get("標的股", "")).strip()
-        underlying_name = str(w.get("標的名稱", "")).strip()
-
-        if not warrant_code or not warrant_name:
-            continue
-
-        for label, (broker_name, broker_code) in broker_map.items():
-            broker_code = str(broker_code).strip()
-            if not broker_code:
-                continue
-
-            c = (
-                warrant_code,
-                warrant_name,
-                underlying_code,
-                underlying_name,
-                label,
-                str(broker_name).strip(),
-                broker_code,
-            )
-            key = candidate_key_from_tuple(c)
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-            candidates.append(c)
-
-    print(
-        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
-        f"→ {len(candidates):,} 組候選"
-    )
-    return candidates
-
 
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
@@ -5649,6 +5782,7 @@ def process_candidate(warrant_code, warrant_name, underlying_code, underlying_na
         "df":              df,
     }
 
+    item = repair_item_underlying_identity(item)
     item["events_a"] = build_a_events_from_df(item)
     return item
 
@@ -9867,14 +10001,16 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     """
     target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
+    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for item in items or []:
         df = item.get("df", pd.DataFrame())
         if df is None or df.empty:
             continue
 
-        underlying_code = normalize_underlying_code_for_group(item.get("underlying_code", "")) or normalize_price_code(item.get("underlying_code", ""))
-        if not underlying_code:
+        underlying_code, _ = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
+        underlying_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
+        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
             continue
 
         has_recent_activity = False
@@ -10459,6 +10595,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
     scope = get_result_data_scope()
 
     agg = {}
+    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for item in items:
         df = item.get("df", pd.DataFrame())
@@ -10470,18 +10607,19 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        raw_underlying_code = str(item.get("underlying_code", "")).strip()
-        underlying_name = str(item.get("underlying_name", "")).strip()
-        underlying_code = normalize_underlying_for_display(raw_underlying_code, underlying_name or warrant_name)
+        underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
+        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name or warrant_name)
         underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
 
-        if not underlying_code or not broker_label:
+        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code) or not broker_label:
             continue
 
-        key = (broker_label, broker_name, broker_code, underlying_code)
+        # 統計單位固定為：分點 + 券商代號 + 標的股。
+        # 不把 broker_name 放進 key，避免同一分點名稱格式不同時被切成多列。
+        key = (broker_label, broker_code, underlying_code)
         rec = agg.setdefault(key, {
             "資料範圍": scope,
             "統計日期": add_gsheet_text_prefix(target_date),
@@ -10777,6 +10915,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "標的名稱": rec.get("標的名稱", ""),
             "標的10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
             "現股10日報酬率%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
+            "現股10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
             "標的10日起始價": round(float(underlying_start_price), 4) if underlying_start_price is not None else "",
             "標的10日收盤價": round(float(underlying_end_price), 4) if underlying_end_price is not None else "",
             "標的10日起始價格日": add_gsheet_text_prefix(underlying_start_price_date) if underlying_start_price_date else "",
@@ -10970,7 +11109,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     headers = [
         "資料範圍", "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "分點", "分點名稱", "券商代號", "標的股", "標的名稱",
-        "標的10日漲跌幅%", "現股10日報酬率%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
+        "標的10日漲跌幅%", "現股10日報酬率%", "現股10日漲跌幅%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
         "買賣方向",
         "近10日買進股數", "近10日買進金額", "近10日賣出股數", "近10日賣出金額",
         "近10日淨買超股數", "近10日淨買超金額", "近10日淨賣超股數", "近10日淨賣超金額",
@@ -10992,7 +11131,7 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     col_widths = [
         12, 12, 24, 10, 12, 12, 12,
         14, 18, 12, 10, 14,
-        16, 16, 14, 14, 14, 14,
+        16, 16, 16, 14, 14, 14, 14,
         10,
         14, 16, 14, 16,
         16, 18, 16, 18,
