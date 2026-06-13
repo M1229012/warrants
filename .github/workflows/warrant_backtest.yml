@@ -105,7 +105,6 @@ jobs:
       PRICE_PREFETCH_ALL_WARRANT_PRICE_LOOKBACK_DAYS: "90"
       PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS: "35"
       PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE: "1"
-      
 
       # 關鍵修正：
       # 精選5分點模式必須絕對完整，不能只靠 prescan 候選。
@@ -161,14 +160,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run warrant backtest
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
+          set -o pipefail
           mkdir -p output
-          python warrant_backtest.py
+          python -u warrant_backtest.py 2>&1 | tee output/warrant_backtest.log
 
       - name: Upload Excel artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: warrant-backtest-excel
-          path: output/*.xlsx
+          path: |
+            output/*.xlsx
+            output/*.log
           if-no-files-found: ignore
