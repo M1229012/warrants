@@ -132,11 +132,26 @@ TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv("WARRANT_TOP5_EXCLUDE_HEAD_OF
 TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRANCHES", "").strip()
 
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
+# 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
+# 若明確設定 WARRANT_SELECTED_BRANCH_FLOW_MODE=default / five / 五分點，會強制使用預設五分點。
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
-    "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
+DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
+    "WARRANT_SELECTED_BRANCH_FLOW_DEFAULT_BRANCHES",
     "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
-).strip()
+).strip() or "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南"
+SELECTED_BRANCH_FLOW_MODE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_MODE", "").strip().lower()
+_SELECTED_BRANCH_FLOW_BRANCHES_RAW = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_BRANCHES", "").strip()
+_SELECTED_BRANCH_FLOW_DEFAULT_MODE_ALIASES = {
+    "default", "preset", "five", "five_points", "fivepoints",
+    "5", "5points", "五分點", "預設", "預設五分點",
+}
+if (
+    SELECTED_BRANCH_FLOW_MODE in _SELECTED_BRANCH_FLOW_DEFAULT_MODE_ALIASES
+    or _SELECTED_BRANCH_FLOW_BRANCHES_RAW.strip().lower() in _SELECTED_BRANCH_FLOW_DEFAULT_MODE_ALIASES
+):
+    SELECTED_BRANCH_FLOW_BRANCHES = DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES
+else:
+    SELECTED_BRANCH_FLOW_BRANCHES = _SELECTED_BRANCH_FLOW_BRANCHES_RAW or DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
@@ -3389,15 +3404,34 @@ def get_taipei_today_ts() -> pd.Timestamp:
     return pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
 
 
-def _get_selected_branch_flow_list() -> List[str]:
-    """取得精選分點名單，保留設定順序，並做與主程式一致的分點標準化。"""
+def _parse_selected_branch_flow_names(raw: str) -> List[str]:
+    """解析精選分點字串，支援逗號、分號、換行與直線分隔，並保留設定順序。"""
     names = []
-    raw = SELECTED_BRANCH_FLOW_BRANCHES or ""
-    for item in re.split(r"[,，;；\n\r]+", raw):
+    raw = str(raw or "")
+    for item in re.split(r"[,，;；\n\r|｜]+", raw):
         name = normalize_branch_name(item)
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _get_default_selected_branch_flow_list() -> List[str]:
+    """取得預設五分點名單。"""
+    return _parse_selected_branch_flow_names(DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES)
+
+
+def _get_selected_branch_flow_list() -> List[str]:
+    """取得精選分點名單，保留設定順序，並做與主程式一致的分點標準化。"""
+    return _parse_selected_branch_flow_names(SELECTED_BRANCH_FLOW_BRANCHES)
+
+
+def get_selected_branch_flow_mode_label() -> str:
+    """取得精選分點資金流模式顯示文字。"""
+    selected = _get_selected_branch_flow_list()
+    default_selected = _get_default_selected_branch_flow_list()
+    if selected and selected == default_selected:
+        return "預設五分點"
+    return "自訂分點"
 
 
 def _get_selected_branch_flow_set() -> set:
@@ -6232,7 +6266,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     inst_plot_df = build_institutional_axis_df(plot_df, stock_df)
     x_inst = list(range(len(inst_plot_df)))
 
-    # 精選五分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
+    # 精選分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
     # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
     # 今日精選分點大買 / 大賣被 plot_df.index.max() 擋掉。
     selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
@@ -6470,7 +6504,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         spine.set_visible(False)
     wnet_ax2.grid(False)
 
-    # 精選五分點資金流：只統計指定分點的權證買賣金額。
+    # 精選分點資金流：只統計指定分點的權證買賣金額。
     # 不再與 K 線共用 x 軸，讓今日已更新的精選分點事件可以先出現在資金流圖。
     selected_wnet_ax = fig.add_subplot(gs[6, :])
     style_ax(selected_wnet_ax)
@@ -6484,7 +6518,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, "精選分點資金流", GOLD,
+        selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
@@ -6822,7 +6856,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                     latest_selected_date = selected_debug["Date"].max()
                     latest_selected = selected_debug[selected_debug["Date"] == latest_selected_date]
                     latest_selected_sum = float(pd.to_numeric(latest_selected["net_amount"], errors="coerce").fillna(0.0).sum())
-                    print(f"🔎 精選五分點最新日期：{pd.Timestamp(latest_selected_date).date()}｜合計 {fmt_money(latest_selected_sum)}")
+                    print(f"🔎 精選分點最新日期：{pd.Timestamp(latest_selected_date).date()}｜合計 {fmt_money(latest_selected_sum)}")
         if warrant_events is not None and not warrant_events.empty:
             try:
                 debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
@@ -6892,6 +6926,8 @@ def main():
     print(f"📌 Gemini 開關：WARRANT_GEMINI_ENABLE={os.getenv('WARRANT_GEMINI_ENABLE', '')}")
     print(f"📌 Gemini API Key 組數：{len(_get_warrants_api_keys())}")
     print(f"📌 新聞開關：WARRANT_NEWS_ENABLE={os.getenv('WARRANT_NEWS_ENABLE', '')}")
+    selected_branch_label = "、".join(_get_selected_branch_flow_list()) or "未設定"
+    print(f"📌 精選分點資金流：{get_selected_branch_flow_mode_label()}｜{selected_branch_label}")
     print(f"📌 權證快照：enable={os.getenv('WARRANT_LOCAL_CACHE_ENABLE', '')}｜force_refresh={WARRANT_CACHE_FORCE_REFRESH}｜dir={LOCAL_WARRANT_CACHE_DIR}")
 
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "").strip()
