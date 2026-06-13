@@ -10,10 +10,20 @@ if (!DISCORD_APPLICATION_ID || !DISCORD_BOT_TOKEN) {
 const commands = [
   {
     name: "w",
-    description: "產生單一股票的權證週報",
+    description: "產生單一股票的權證週報，可選擇精選分點資金流",
     options: [
-      { type: 3, name: "stock", description: "股票代號，例如 2408", required: true },
-      { type: 5, name: "refresh", description: "是否重新抓新聞並重新產生本週重點", required: false },
+      {
+        type: 3,
+        name: "stock",
+        description: "股票代號，例如 2408；送出後可選擇預設五分點或自訂分點",
+        required: true,
+      },
+      {
+        type: 5,
+        name: "refresh",
+        description: "是否重新抓新聞並重新產生本週重點",
+        required: false,
+      },
     ],
   },
   {
