@@ -6537,7 +6537,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        selected_wnet_ax, xpos, "精選五分點資金流", GOLD,
+        selected_wnet_ax, xpos, "精選分點資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
