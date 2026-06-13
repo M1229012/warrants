@@ -109,6 +109,26 @@ const BROKER_CATEGORIES = [
   },
 ];
 
+const DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES = [
+  "華南永昌台中",
+  "元大南屯",
+  "永豐金竹北",
+  "永豐金內湖",
+  "富邦敦南",
+];
+
+const ALL_BRANCH_FLOW_BROKERS = [];
+const BRANCH_FLOW_BROKER_INDEX = new Map();
+
+for (const category of BROKER_CATEGORIES) {
+  for (const broker of category.brokers || []) {
+    if (!BRANCH_FLOW_BROKER_INDEX.has(broker)) {
+      BRANCH_FLOW_BROKER_INDEX.set(broker, ALL_BRANCH_FLOW_BROKERS.length);
+      ALL_BRANCH_FLOW_BROKERS.push(broker);
+    }
+  }
+}
+
 function displayBrokerName(brokerName) {
   const name = String(brokerName || "").trim();
   return BROKER_DISPLAY_NAMES[name] || name;
@@ -426,7 +446,13 @@ function getBroker10DWorkflowFile(env) {
   );
 }
 
-async function triggerWorkflow(env, stockCode, refreshNewsSummary) {
+async function triggerWorkflow(
+  env,
+  stockCode,
+  refreshNewsSummary,
+  selectedBranchFlowMode = "five",
+  selectedBranchFlowBranches = "五分點"
+) {
   const workflow = encodeURIComponent(env.GITHUB_WORKFLOW_FILE);
 
   const inputs = {
@@ -435,6 +461,11 @@ async function triggerWorkflow(env, stockCode, refreshNewsSummary) {
 
   if (String(env.WORKFLOW_HAS_REFRESH_INPUT || "1") !== "0") {
     inputs.refresh_news_summary = refreshNewsSummary ? "1" : "0";
+  }
+
+  if (String(env.WORKFLOW_HAS_SELECTED_BRANCH_INPUT || "1") !== "0") {
+    inputs.selected_branch_flow_mode = selectedBranchFlowMode || "five";
+    inputs.selected_branch_flow_branches = selectedBranchFlowBranches || "五分點";
   }
 
   await githubFetch(env, `/actions/workflows/${workflow}/dispatches`, {
@@ -476,6 +507,320 @@ function option(interaction, name) {
 
 function getBrokerCategory(categoryKey) {
   return BROKER_CATEGORIES.find((cat) => cat.key === categoryKey) || null;
+}
+
+function getInteractionUserId(interaction) {
+  return (
+    interaction?.member?.user?.id ||
+    interaction?.user?.id ||
+    ""
+  );
+}
+
+function parseBoolFlag(value) {
+  return String(value || "0") === "1";
+}
+
+function selectedKeysFromBrokerNames(brokers) {
+  const keys = [];
+  const seen = new Set();
+
+  for (const broker of brokers || []) {
+    const idx = BRANCH_FLOW_BROKER_INDEX.get(broker);
+
+    if (idx === undefined) {
+      continue;
+    }
+
+    const key = idx.toString(36);
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      keys.push(key);
+    }
+  }
+
+  return keys;
+}
+
+function selectedKeysToBrokerNames(keys) {
+  const names = [];
+  const seen = new Set();
+
+  for (const key of keys || []) {
+    const idx = parseInt(String(key || ""), 36);
+
+    if (!Number.isInteger(idx) || idx < 0 || idx >= ALL_BRANCH_FLOW_BROKERS.length) {
+      continue;
+    }
+
+    const broker = ALL_BRANCH_FLOW_BROKERS[idx];
+
+    if (broker && !seen.has(broker)) {
+      seen.add(broker);
+      names.push(broker);
+    }
+  }
+
+  return names;
+}
+
+function encodeSelectedKeys(keys) {
+  return selectedKeysFromBrokerNames(selectedKeysToBrokerNames(keys)).join(".");
+}
+
+function decodeSelectedKeys(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) {
+    return [];
+  }
+
+  return encodeSelectedKeys(raw.split(".").filter(Boolean)).split(".").filter(Boolean);
+}
+
+function makeWCustomId(prefix, userId, stockCode, refreshFlag, ...parts) {
+  return [prefix, userId, stockCode, refreshFlag ? "1" : "0", ...parts].join("|");
+}
+
+function parseWCustomId(customId) {
+  const parts = String(customId || "").split("|");
+
+  return {
+    prefix: parts[0] || "",
+    userId: parts[1] || "",
+    stockCode: parts[2] || "",
+    refreshFlag: parts[3] === "1",
+    parts: parts.slice(4),
+  };
+}
+
+function isComponentOwner(interaction, parsed) {
+  const actualUserId = getInteractionUserId(interaction);
+  return Boolean(parsed?.userId && actualUserId && parsed.userId === actualUserId);
+}
+
+function selectedBranchSummary(selectedKeys) {
+  const names = selectedKeysToBrokerNames(selectedKeys).map(displayBrokerName);
+
+  if (names.length === 0) {
+    return "尚未選擇自訂分點";
+  }
+
+  return names.join("、");
+}
+
+function buildWarrantBranchModeData(stockCode, stockName, refreshNewsSummary, userId) {
+  const refreshText = refreshNewsSummary
+    ? "\n🔄 本次會重新抓新聞並重新產生本週重點。"
+    : "\n📦 本次會優先使用當日快取；沒有快取才重新產生。";
+
+  return {
+    content:
+      `✅ 已確認：\`${stockCode} ${stockName}\`\n` +
+      "請選擇本次週報的精選分點資金流模式：\n" +
+      `預設五分點：${DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES.join("、")}${refreshText}`,
+    components: [
+      {
+        type: COMPONENT.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SUCCESS,
+            label: "產生預設五分點週報",
+            custom_id: makeWCustomId("w5", userId, stockCode, refreshNewsSummary),
+          },
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.PRIMARY,
+            label: "改選分點",
+            custom_id: makeWCustomId("wc", userId, stockCode, refreshNewsSummary),
+          },
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SECONDARY,
+            label: "取消",
+            custom_id: makeWCustomId("wx", userId, stockCode, refreshNewsSummary),
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildWarrantBranchCategoryData(stockCode, refreshNewsSummary, userId, selectedKeys = []) {
+  const state = encodeSelectedKeys(selectedKeys);
+
+  return {
+    content:
+      `股票：\`${stockCode}\`\n` +
+      "請選擇分點分類，再複選要納入「精選分點資金流」的分點。\n" +
+      `目前選擇：${selectedBranchSummary(selectedKeys)}`,
+    components: [
+      {
+        type: COMPONENT.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT.STRING_SELECT,
+            custom_id: makeWCustomId("wcat", userId, stockCode, refreshNewsSummary, state),
+            placeholder: "選擇分點分類",
+            min_values: 1,
+            max_values: 1,
+            options: BROKER_CATEGORIES.map((cat) => ({
+              label: cat.label,
+              value: cat.key,
+              description: `查看${cat.label}分點`,
+            })),
+          },
+        ],
+      },
+      {
+        type: COMPONENT.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SUCCESS,
+            label: "確認產生週報",
+            custom_id: makeWCustomId("wgo", userId, stockCode, refreshNewsSummary, state),
+            disabled: selectedKeysToBrokerNames(selectedKeys).length === 0,
+          },
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SECONDARY,
+            label: "返回模式選擇",
+            custom_id: makeWCustomId("wback", userId, stockCode, refreshNewsSummary),
+          },
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SECONDARY,
+            label: "清空選擇",
+            custom_id: makeWCustomId("wclear", userId, stockCode, refreshNewsSummary),
+            disabled: selectedKeysToBrokerNames(selectedKeys).length === 0,
+          },
+          {
+            type: COMPONENT.BUTTON,
+            style: BUTTON_STYLE.SECONDARY,
+            label: "取消",
+            custom_id: makeWCustomId("wx", userId, stockCode, refreshNewsSummary),
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildWarrantBranchSelectData(categoryKey, page, stockCode, refreshNewsSummary, userId, selectedKeys = []) {
+  const category = getBrokerCategory(categoryKey);
+
+  if (!category) {
+    return buildWarrantBranchCategoryData(stockCode, refreshNewsSummary, userId, selectedKeys);
+  }
+
+  const brokers = category.brokers || [];
+  const totalPages = Math.max(
+    Math.ceil(brokers.length / BROKER_SELECT_PAGE_SIZE),
+    1
+  );
+
+  const currentPage = clampPage(page, totalPages);
+  const start = currentPage * BROKER_SELECT_PAGE_SIZE;
+  const pageBrokers = brokers.slice(start, start + BROKER_SELECT_PAGE_SIZE);
+  const selectedNames = new Set(selectedKeysToBrokerNames(selectedKeys));
+  const state = encodeSelectedKeys(selectedKeys);
+
+  const components = [];
+
+  if (pageBrokers.length > 0) {
+    components.push({
+      type: COMPONENT.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT.STRING_SELECT,
+          custom_id: makeWCustomId("wbr", userId, stockCode, refreshNewsSummary, category.key, String(currentPage), state),
+          placeholder: `複選${category.label}分點`,
+          min_values: 0,
+          max_values: Math.min(pageBrokers.length, 25),
+          options: pageBrokers.map((broker) => ({
+            label: displayBrokerName(broker),
+            value: broker,
+            description: "加入精選分點資金流",
+            default: selectedNames.has(broker),
+          })),
+        },
+      ],
+    });
+  }
+
+  const navButtons = [
+    {
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "返回分類",
+      custom_id: makeWCustomId("wcats", userId, stockCode, refreshNewsSummary, state),
+    },
+  ];
+
+  if (totalPages > 1) {
+    navButtons.push({
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "上一頁",
+      custom_id: makeWCustomId("wpage", userId, stockCode, refreshNewsSummary, category.key, String(currentPage - 1), state),
+      disabled: currentPage <= 0,
+    });
+
+    navButtons.push({
+      type: COMPONENT.BUTTON,
+      style: BUTTON_STYLE.SECONDARY,
+      label: "下一頁",
+      custom_id: makeWCustomId("wpage", userId, stockCode, refreshNewsSummary, category.key, String(currentPage + 1), state),
+      disabled: currentPage >= totalPages - 1,
+    });
+  }
+
+  components.push({
+    type: COMPONENT.ACTION_ROW,
+    components: navButtons,
+  });
+
+  components.push({
+    type: COMPONENT.ACTION_ROW,
+    components: [
+      {
+        type: COMPONENT.BUTTON,
+        style: BUTTON_STYLE.SUCCESS,
+        label: "確認產生週報",
+        custom_id: makeWCustomId("wgo", userId, stockCode, refreshNewsSummary, state),
+        disabled: selectedKeysToBrokerNames(selectedKeys).length === 0,
+      },
+      {
+        type: COMPONENT.BUTTON,
+        style: BUTTON_STYLE.SECONDARY,
+        label: "清空選擇",
+        custom_id: makeWCustomId("wclear", userId, stockCode, refreshNewsSummary),
+        disabled: selectedKeysToBrokerNames(selectedKeys).length === 0,
+      },
+      {
+        type: COMPONENT.BUTTON,
+        style: BUTTON_STYLE.SECONDARY,
+        label: "取消",
+        custom_id: makeWCustomId("wx", userId, stockCode, refreshNewsSummary),
+      },
+    ],
+  });
+
+  return {
+    content:
+      `股票：\`${stockCode}\`\n` +
+      `分類：${category.label}｜第 ${currentPage + 1}/${totalPages} 頁\n` +
+      `目前選擇：${selectedBranchSummary(selectedKeys)}`,
+    components,
+  };
+}
+
+function isWarrantRunCustomId(customId) {
+  const prefix = String(customId || "").split("|")[0] || "";
+  return prefix === "w5" || prefix === "wgo";
 }
 
 function buildBrokerCategoryButtonsData() {
@@ -661,14 +1006,14 @@ async function handleCommand(interaction, env) {
     );
   }
 
-  await triggerWorkflow(env, stockCode, refreshNewsSummary);
+  const userId = getInteractionUserId(interaction);
 
-  const refreshText = refreshNewsSummary
-    ? "\n🔄 本次會重新抓新聞並重新產生本週重點。"
-    : "\n📦 本次會優先使用當日快取；沒有快取才重新產生。";
+  if (!userId) {
+    return reply("❌ 無法確認操作使用者，請重新輸入 `/w`。", true);
+  }
 
-  return reply(
-    `✅ 已確認：\`${stockCode} ${stockName}\`\n🔎 已成功送出查詢，權證週報正在產生中。${refreshText}`,
+  return replyData(
+    buildWarrantBranchModeData(stockCode, stockName, refreshNewsSummary, userId),
     false
   );
 }
@@ -706,7 +1051,231 @@ async function handleComponent(interaction, env) {
     return deferUpdateMessage();
   }
 
+  const parsed = parseWCustomId(customId);
+
+  if (["w5", "wc", "wcat", "wbr", "wgo", "wback", "wcats", "wpage", "wclear", "wx"].includes(parsed.prefix)) {
+    if (!isComponentOwner(interaction, parsed)) {
+      return reply("❌ 這個週報選單不是你建立的，請重新輸入 `/w`。", true);
+    }
+  }
+
+  if (parsed.prefix === "w5" || parsed.prefix === "wgo") {
+    return deferUpdateMessage();
+  }
+
+  if (parsed.prefix === "wc") {
+    return updateMessageData(
+      buildWarrantBranchCategoryData(parsed.stockCode, parsed.refreshFlag, parsed.userId, [])
+    );
+  }
+
+  if (parsed.prefix === "wcat") {
+    const selectedKeys = decodeSelectedKeys(parsed.parts[0] || "");
+    const categoryKey = String(interaction?.data?.values?.[0] || "").trim();
+
+    return updateMessageData(
+      buildWarrantBranchSelectData(
+        categoryKey,
+        0,
+        parsed.stockCode,
+        parsed.refreshFlag,
+        parsed.userId,
+        selectedKeys
+      )
+    );
+  }
+
+  if (parsed.prefix === "wbr") {
+    const categoryKey = parsed.parts[0] || "";
+    const page = parsed.parts[1] || "0";
+    const oldSelectedKeys = decodeSelectedKeys(parsed.parts[2] || "");
+    const selectedValues = Array.isArray(interaction?.data?.values)
+      ? interaction.data.values.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    const category = getBrokerCategory(categoryKey);
+
+    if (!category) {
+      return updateMessageData(
+        buildWarrantBranchCategoryData(parsed.stockCode, parsed.refreshFlag, parsed.userId, oldSelectedKeys)
+      );
+    }
+
+    const brokers = category.brokers || [];
+    const totalPages = Math.max(
+      Math.ceil(brokers.length / BROKER_SELECT_PAGE_SIZE),
+      1
+    );
+    const currentPage = clampPage(page, totalPages);
+    const start = currentPage * BROKER_SELECT_PAGE_SIZE;
+    const pageBrokers = brokers.slice(start, start + BROKER_SELECT_PAGE_SIZE);
+    const pageBrokerSet = new Set(pageBrokers);
+    const oldSelectedNames = selectedKeysToBrokerNames(oldSelectedKeys);
+    const nextSelectedNames = oldSelectedNames.filter((name) => !pageBrokerSet.has(name));
+
+    for (const name of selectedValues) {
+      if (!nextSelectedNames.includes(name)) {
+        nextSelectedNames.push(name);
+      }
+    }
+
+    const nextSelectedKeys = selectedKeysFromBrokerNames(nextSelectedNames);
+
+    return updateMessageData(
+      buildWarrantBranchSelectData(
+        categoryKey,
+        currentPage,
+        parsed.stockCode,
+        parsed.refreshFlag,
+        parsed.userId,
+        nextSelectedKeys
+      )
+    );
+  }
+
+  if (parsed.prefix === "wback") {
+    const stockMap = await loadStockMap(env);
+    const stockName = stockMap.get(parsed.stockCode) || parsed.stockCode;
+
+    return updateMessageData(
+      buildWarrantBranchModeData(parsed.stockCode, stockName, parsed.refreshFlag, parsed.userId)
+    );
+  }
+
+  if (parsed.prefix === "wcats") {
+    const selectedKeys = decodeSelectedKeys(parsed.parts[0] || "");
+
+    return updateMessageData(
+      buildWarrantBranchCategoryData(
+        parsed.stockCode,
+        parsed.refreshFlag,
+        parsed.userId,
+        selectedKeys
+      )
+    );
+  }
+
+  if (parsed.prefix === "wpage") {
+    const categoryKey = parsed.parts[0] || "";
+    const page = parsed.parts[1] || "0";
+    const selectedKeys = decodeSelectedKeys(parsed.parts[2] || "");
+
+    return updateMessageData(
+      buildWarrantBranchSelectData(
+        categoryKey,
+        page,
+        parsed.stockCode,
+        parsed.refreshFlag,
+        parsed.userId,
+        selectedKeys
+      )
+    );
+  }
+
+  if (parsed.prefix === "wclear") {
+    return updateMessageData(
+      buildWarrantBranchCategoryData(parsed.stockCode, parsed.refreshFlag, parsed.userId, [])
+    );
+  }
+
+  if (parsed.prefix === "wx") {
+    return updateMessageData({
+      content: "已取消產生權證週報。",
+      components: [],
+    });
+  }
+
   return reply("❌ 不支援的互動元件。", true);
+}
+
+async function handleWarrantFlowSelectionAndEdit(interaction, env) {
+  try {
+    const parsed = parseWCustomId(interaction?.data?.custom_id || "");
+
+    if (!isComponentOwner(interaction, parsed)) {
+      await editOriginalResponseData(interaction, {
+        content: "❌ 這個週報選單不是你建立的，請重新輸入 `/w`。",
+        components: [],
+      });
+      return;
+    }
+
+    const stockCode = normalizeStockCode(parsed.stockCode);
+
+    if (!isSingleStockCode(stockCode)) {
+      await editOriginalResponseData(interaction, {
+        content: "❌ 股票代號格式錯誤，請重新輸入 `/w`。",
+        components: [],
+      });
+      return;
+    }
+
+    const stockMap = await loadStockMap(env);
+    const stockName = stockMap.get(stockCode);
+
+    if (!stockName) {
+      await editOriginalResponseData(interaction, {
+        content: `❌ 查無股票代號 \`${stockCode}\`，未執行週報。請確認 Google Sheet「快取_股票名稱」是否有此代號。`,
+        components: [],
+      });
+      return;
+    }
+
+    const active = await hasActiveWorkflowRun(env);
+
+    if (active.active) {
+      await editOriginalResponseData(interaction, {
+        content: "⏳ 目前已有週報產生中，請等上一檔完成後再查下一檔。",
+        components: [],
+      });
+      return;
+    }
+
+    let selectedBranchFlowMode = "five";
+    let selectedBranchFlowBranches = "五分點";
+    let selectedText = DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES.join("、");
+
+    if (parsed.prefix === "wgo") {
+      const selectedKeys = decodeSelectedKeys(parsed.parts[0] || "");
+      const selectedNames = selectedKeysToBrokerNames(selectedKeys);
+
+      if (selectedNames.length === 0) {
+        await editOriginalResponseData(interaction, {
+          content: "❌ 尚未選擇自訂分點，請重新輸入 `/w`。",
+          components: [],
+        });
+        return;
+      }
+
+      selectedBranchFlowMode = "custom";
+      selectedBranchFlowBranches = selectedNames.join(",");
+      selectedText = selectedNames.map(displayBrokerName).join("、");
+    }
+
+    await triggerWorkflow(
+      env,
+      stockCode,
+      parsed.refreshFlag,
+      selectedBranchFlowMode,
+      selectedBranchFlowBranches
+    );
+
+    const refreshText = parsed.refreshFlag
+      ? "\n🔄 本次會重新抓新聞並重新產生本週重點。"
+      : "\n📦 本次會優先使用當日快取；沒有快取才重新產生。";
+
+    await editOriginalResponseData(interaction, {
+      content:
+        `✅ 已確認：\`${stockCode} ${stockName}\`\n` +
+        `📌 精選分點資金流：${selectedText}\n` +
+        `🔎 已成功送出查詢，權證週報正在產生中。${refreshText}`,
+      components: [],
+    });
+  } catch (err) {
+    await editOriginalResponseData(interaction, {
+      content: `❌ 執行失敗：${err.message || err}`,
+      components: [],
+    });
+  }
 }
 
 async function handleBrokerSelectionAndEdit(interaction, env) {
@@ -762,14 +1331,18 @@ async function runCommandAndEdit(interaction, env) {
   try {
     const response = await handleCommand(interaction, env);
     const data = await response.json();
-    const content = data?.data?.content || "✅ 指令已處理完成。";
+    const responseData = data?.data || {
+      content: "✅ 指令已處理完成。",
+      components: [],
+    };
+    const { flags, ...editableData } = responseData;
 
-    await editOriginalResponse(interaction, content);
+    await editOriginalResponseData(interaction, editableData);
   } catch (err) {
-    await editOriginalResponse(
-      interaction,
-      `❌ 執行失敗：${err.message || err}`
-    );
+    await editOriginalResponseData(interaction, {
+      content: `❌ 執行失敗：${err.message || err}`,
+      components: [],
+    });
   }
 }
 
@@ -828,6 +1401,16 @@ export default {
 
     if (interaction.type === TYPE.MESSAGE_COMPONENT) {
       const customId = String(interaction?.data?.custom_id || "");
+
+      if (isWarrantRunCustomId(customId)) {
+        const parsed = parseWCustomId(customId);
+
+        if (isComponentOwner(interaction, parsed)) {
+          ctx.waitUntil(handleWarrantFlowSelectionAndEdit(interaction, env));
+        }
+
+        return handleComponent(interaction, env);
+      }
 
       if (customId.startsWith("ww_broker:")) {
         ctx.waitUntil(handleBrokerSelectionAndEdit(interaction, env));
