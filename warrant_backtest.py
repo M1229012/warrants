@@ -11805,6 +11805,71 @@ def normalize_price_prefetch_target_date(target_date=None):
     return datetime.today().strftime("%Y/%m/%d")
 
 
+def is_weekend_date(date_value=None):
+    """
+    判斷指定日期是否為週末非交易日。
+
+    用途：
+    API4 目標分點資料在週六、週日不會有當日資料。
+    若今天是週末，不能因為「API4 沒有今天」就提早進入價格預抓模式，
+    否則完整回補 / 不使用快取重抓會被錯誤中斷。
+    """
+    if date_value is None:
+        dt = datetime.today()
+    elif isinstance(date_value, datetime):
+        dt = date_value
+    else:
+        dt = parse_date(date_value)
+
+    if not dt:
+        return False
+
+    return dt.weekday() >= 5
+
+
+def previous_weekday_date(date_value=None):
+    """
+    回傳指定日期之前最近的平日。
+
+    例：
+    - 週六 2026/06/13 → 週五 2026/06/12
+    - 週日 2026/06/14 → 週五 2026/06/12
+
+    這裡只處理週末，避免平日盤中資料尚未出來時被誤判為假日。
+    """
+    if date_value is None:
+        dt = datetime.today()
+    elif isinstance(date_value, datetime):
+        dt = date_value
+    else:
+        dt = parse_date(date_value)
+
+    if not dt:
+        dt = datetime.today()
+
+    cur = dt - timedelta(days=1)
+    while cur.weekday() >= 5:
+        cur -= timedelta(days=1)
+
+    return cur
+
+
+def expected_prescan_activity_date_for_target(target_date=None):
+    """
+    回傳 API4 預掃描在指定日期應該看到的最低有效活動日。
+
+    - 一般交易日：應該看到 target_date 當天。
+    - 週末非交易日：只要看到前一個平日即可，不要求週末本身有資料。
+    """
+    target_date = normalize_price_prefetch_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
+
+    if is_weekend_date(target_dt):
+        return previous_weekday_date(target_dt)
+
+    return target_dt
+
+
 def load_price_prefetch_state():
     if not PRICE_PREFETCH_STATE_ENABLED:
         return pd.DataFrame()
@@ -12047,12 +12112,33 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
 
 def has_today_broker_data_from_prescan(target_date=None):
     target_date = normalize_price_prefetch_target_date(target_date)
+    expected_dt = expected_prescan_activity_date_for_target(target_date)
+    expected_date = expected_dt.strftime("%Y/%m/%d") if expected_dt else target_date
 
     if PRESCAN_TODAY_ACTIVITY_FOUND:
         return True
 
     if PRESCAN_LATEST_ACTIVITY_DATE:
-        return PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") >= target_date
+        latest_date = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d")
+
+        if latest_date >= target_date:
+            return True
+
+        if is_weekend_date(target_date) and latest_date >= expected_date:
+            print(
+                f"  ✅ {target_date} 為週末非交易日，"
+                f"API4 最新活動日 {latest_date} 已達預期交易日 {expected_date}，"
+                "略過今日資料等待，繼續正式流程。"
+            )
+            return True
+
+        return False
+
+    if is_weekend_date(target_date):
+        print(
+            f"  ⚠️ {target_date} 為週末非交易日，但 API4 未掃到可用活動日，"
+            "仍保留價格預抓保護。"
+        )
 
     return False
 
