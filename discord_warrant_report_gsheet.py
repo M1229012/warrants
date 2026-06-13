@@ -3987,6 +3987,7 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         "統計日期", "日期", "目標日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "分點", "分點名稱", "券商代號",
         "標的股", "標的代號", "標的", "標的名稱", "股票名稱",
+        "現股10日報酬率%", "標的10日報酬率%", "現股10日報酬率", "標的10日報酬率",
         "標的10日漲跌幅%", "現股10日漲跌幅%", "標的10日漲跌幅", "現股10日漲跌幅",
         "近10日買進股數", "買進股數",
         "近10日買進金額", "買進金額",
@@ -4292,7 +4293,10 @@ def read_broker_10d_detail_rows_from_gsheet(target: date | None = None, broker: 
         consensus_key = str(underlying or target_label or "").strip()
         consensus_signal = broker_10d_consensus_signal(consensus_map, consensus_key, direction)
         underlying_10d_return = normalize_return_pct(_pick_first_existing_value_fuzzy(row, [
-            "標的10日漲跌幅%", "現股10日漲跌幅%", "標的10日漲跌幅", "現股10日漲跌幅",
+            "現股10日報酬率%", "標的10日報酬率%",
+            "現股10日報酬率", "標的10日報酬率",
+            "標的10日漲跌幅%", "現股10日漲跌幅%",
+            "標的10日漲跌幅", "現股10日漲跌幅",
         ]))
 
         rows.append({
