@@ -130,6 +130,9 @@ CROSS_BROKER_OFFSET_MIN_SIDE_AMOUNT = float(os.getenv("WARRANT_CROSS_BROKER_OFFS
 # 不排除地方分點，例如富邦公益、元大南屯、群益金鼎某分點。
 TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv("WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRANCHES", "").strip()
+# TOP5 總公司型分點白名單：
+# 預設仍過濾總公司型分點，但「新光」與「第一金」這兩個分點保留，不列入總公司過濾。
+TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金").strip()
 
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 # 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
@@ -3131,6 +3134,17 @@ def _get_top5_head_office_branch_set() -> set:
     return {_normalize_branch_for_head_office_check(x) for x in names if _normalize_branch_for_head_office_check(x)}
 
 
+def _get_top5_head_office_branch_allowlist() -> set:
+    """取得 TOP5 總公司型分點白名單，名單內分點即使像總公司名稱也保留。"""
+    names = set()
+    if TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST:
+        for item in re.split(r"[,，;；\n\r]+", TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST):
+            item = _normalize_branch_for_head_office_check(item)
+            if item:
+                names.add(item)
+    return names
+
+
 def is_top5_head_office_branch(branch_name: str) -> bool:
     """
     判斷是否為券商總公司型分點。
@@ -3142,6 +3156,11 @@ def is_top5_head_office_branch(branch_name: str) -> bool:
     """
     s = _normalize_branch_for_head_office_check(branch_name)
     if not s or s == "未知分點":
+        return False
+
+    # 白名單優先：新光、第一金雖然名稱看起來像總公司型分點，
+    # 但依需求保留在 TOP5 排名，不做總公司過濾。
+    if s in _get_top5_head_office_branch_allowlist():
         return False
 
     explicit_head_office_keywords = [
