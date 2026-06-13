@@ -15,6 +15,18 @@ on:
           - "0"
           - "1"
         default: "0"
+      selected_branch_flow_mode:
+        description: "精選分點資金流模式（five=預設五分點，custom=自訂分點）"
+        required: false
+        type: choice
+        options:
+          - "five"
+          - "custom"
+        default: "five"
+      selected_branch_flow_branches:
+        description: "自訂精選分點，多個用逗號分隔，例如 新光,第一金"
+        required: false
+        default: ""
 
 jobs:
   run-warrant-report-test:
@@ -86,6 +98,12 @@ jobs:
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
       WARRANT_REPORT_MAX_ROWS: "8"
 
+      # 精選分點資金流設定
+      # five = 預設五分點；custom = 使用 selected_branch_flow_branches
+      WARRANT_SELECTED_BRANCH_FLOW_ENABLE: "1"
+      WARRANT_SELECTED_BRANCH_FLOW_MODE: ${{ inputs.selected_branch_flow_mode || 'five' }}
+      WARRANT_SELECTED_BRANCH_FLOW_BRANCHES: ${{ inputs.selected_branch_flow_branches || '五分點' }}
+
       # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
@@ -129,7 +147,7 @@ jobs:
 
       - name: Check Gemini and cache setting
         run: |
-          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_NEWS_GOOGLE_MAX_ITEMS =', os.getenv('WARRANT_NEWS_GOOGLE_MAX_ITEMS')); print('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER =', os.getenv('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_ENABLE =', os.getenv('WARRANT_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
+          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_NEWS_GOOGLE_MAX_ITEMS =', os.getenv('WARRANT_NEWS_GOOGLE_MAX_ITEMS')); print('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER =', os.getenv('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_ENABLE =', os.getenv('WARRANT_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANT_SELECTED_BRANCH_FLOW_ENABLE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_ENABLE')); print('WARRANT_SELECTED_BRANCH_FLOW_MODE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_MODE')); print('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
 
       - name: Run warrant report test
         run: |
@@ -140,6 +158,9 @@ jobs:
           echo "WARRANT_CACHE_FORCE_REFRESH=$WARRANT_CACHE_FORCE_REFRESH"
           echo "WARRANT_NEWS_GOOGLE_MAX_ITEMS=$WARRANT_NEWS_GOOGLE_MAX_ITEMS"
           echo "WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER=$WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER"
+          echo "WARRANT_SELECTED_BRANCH_FLOW_ENABLE=$WARRANT_SELECTED_BRANCH_FLOW_ENABLE"
+          echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
+          echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
           python -u run_report.py
 
       - name: Upload report artifact
