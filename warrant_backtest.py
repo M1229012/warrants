@@ -87,6 +87,8 @@ CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_sele
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 PRICE_PREFETCH_STATE_PATH = os.path.join(CACHE_DIR, "price_prefetch_state.csv")
+STOCK_NAME_CACHE_PATH = os.path.join(CACHE_DIR, "stock_name_cache.csv")
+STOCK_NAME_CACHE_SHEET = "快取_股票名稱"
 
 # 自動價格預抓：
 # 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
@@ -1278,6 +1280,7 @@ CACHE_SHEET_NAME_MAP = {
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
     "price_prefetch_state.csv": "快取_價格預抓狀態",
+    "stock_name_cache.csv": "快取_股票名稱",
 }
 
 
@@ -1507,7 +1510,18 @@ def clean_gsheet_value(value):
 
 def is_gsheet_text_header(header):
     header = str(header).strip()
-    return any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS)
+    if any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS):
+        return True
+
+    # 結果快取中的百分比 / 勝率欄位一律用文字寫入 Google Sheet。
+    # 原因：若 USER_ENTERED 寫入 +51.30% 且後續格式沒有完整套到所有列，
+    # Google Sheet 可能出現同欄位有些列顯示 51.30%、有些列顯示 0.513 的混亂狀況。
+    # 這些欄位主要給圖卡與人工檢查使用，不需要在 Sheet 內做公式計算，
+    # 因此改成純文字最穩定。
+    if is_gsheet_percent_display_header(header):
+        return True
+
+    return False
 
 
 def _strip_trailing_excel_decimal_for_code(s):
@@ -1659,7 +1673,10 @@ def normalize_gsheet_values_for_text_columns(values):
                     continue
 
                 header = out[header_row_idx][col_idx] if col_idx < len(out[header_row_idx]) else ""
-                cell_value = normalize_gsheet_code_text_value(header, cell_value)
+                if is_gsheet_percent_display_header(header):
+                    cell_value = _format_percent_display_value_for_gsheet(header, cell_value)
+                else:
+                    cell_value = normalize_gsheet_code_text_value(header, cell_value)
                 out[row_idx][col_idx] = add_gsheet_text_prefix(cell_value)
 
     return out
@@ -1824,6 +1841,92 @@ def is_gsheet_percent_header(header):
         return False
 
     return ("%" in header) or ("勝率" in header) or ("占比" in header) or ("比例" in header)
+
+
+def is_gsheet_percent_display_header(header):
+    """
+    判斷哪些欄位在 Google Sheet 上必須以「xx.xx%」文字顯示。
+
+    這裡比 is_gsheet_percent_header 更廣，除了欄名有 %，也包含勝率、占比、比例、
+    報酬率、獲利、漲跌幅、覆蓋率等語意上屬於百分比的欄位。
+    目標是避免 Google Sheet 把 51.30% 解析成底層 0.513，或把 0.513 直接顯示成小數。
+    """
+    header = str(header or "").strip()
+
+    if not header:
+        return False
+
+    if "文字" in header or "日期" in header or "代號" in header or "代碼" in header:
+        return False
+
+    keywords = (
+        "%",
+        "勝率",
+        "占比",
+        "比例",
+        "報酬率",
+        "獲利",
+        "漲跌幅",
+        "覆蓋率",
+    )
+    return any(k in header for k in keywords)
+
+
+def _format_percent_display_value_for_gsheet(header, value):
+    """
+    將百分比語意欄位統一轉成 Google Sheet 文字顯示值。
+
+    支援情境：
+    1. 程式本身輸出 +5.28% / 51.30%：原樣保留。
+    2. 數值是 5.28：顯示成 +5.28% 或 5.28%。
+    3. Google Sheet 舊資料曾被解析成 0.513：勝率 / 占比 / 比例會顯示成 51.30%。
+    """
+    if value is None:
+        return ""
+
+    header = str(header or "").strip()
+    s = str(value).strip()
+
+    if s == "" or s == "-":
+        return s
+
+    if s.startswith("="):
+        return s
+
+    if s.startswith("'"):
+        s = s[1:].strip()
+
+    if "%" in s:
+        return s
+
+    raw = s.replace(",", "").strip()
+    if raw.startswith("+"):
+        raw_num = raw[1:]
+        explicit_plus = True
+    else:
+        raw_num = raw
+        explicit_plus = False
+
+    try:
+        v = float(raw_num)
+    except Exception:
+        return s
+
+    unsigned_header = any(k in header for k in ("勝率", "占比", "比例", "覆蓋率"))
+
+    # 勝率 / 占比 / 比例若是 0~1 小數，多半是 Google Sheet 的百分比底層值，轉回百分點。
+    # 一般報酬 / 漲跌幅若是 0.0089，也通常代表舊 Sheet 解析後的 0.89%。
+    if abs(v) <= 1:
+        v = v * 100
+
+    if unsigned_header:
+        return f"{v:.2f}%"
+
+    if v > 0 or explicit_plus:
+        return f"+{v:.2f}%"
+    if v < 0:
+        return f"{v:.2f}%"
+    return "0.00%"
 
 
 def is_gsheet_decimal_number_header(header):
@@ -2418,6 +2521,15 @@ def write_values_to_worksheet(ws, values):
             rows=max(row_count, 1),
             cols=max(col_count, 1),
         )
+
+        # 先清除整張工作表的舊值，避免新版列數變少時，舊列殘留在下方。
+        # 這次近10日明細欄位與列數都有調整，如果只 update A1:...，
+        # Google Sheet 可能保留上一版多出來的列，造成看起來同一天資料重複、
+        # 百分比欄位有些列是 51.30%、有些列是 0.513。
+        try:
+            gsheet_api_call(f"清除工作表舊值 {ws.title}", ws.clear)
+        except Exception:
+            pass
 
         reset_worksheet_before_value_write(ws, row_count, col_count)
 
@@ -3203,10 +3315,18 @@ def normalize_underlying_for_display(value, fallback_text=""):
 def fill_known_underlying_name_if_missing(underlying_code, underlying_name=""):
     underlying_name = str(underlying_name or "").strip()
 
-    if underlying_name:
+    if underlying_name and not is_probably_warrant_name_text(underlying_name):
         return underlying_name
 
-    return get_known_underlying_name_by_code(underlying_code) or underlying_name
+    known_name = get_known_underlying_name_by_code(underlying_code)
+    if known_name:
+        return known_name
+
+    mapped_name = get_stock_name_by_code_for_underlying_resolution(underlying_code)
+    if mapped_name:
+        return mapped_name
+
+    return ""
 
 def _record_key(rec, key_cols):
     parts = []
@@ -4292,6 +4412,8 @@ _WARRANT_UNDERLYING_LOOKUP_CACHE = None
 _STOCK_NAME_CODE_LOOKUP_CACHE = None
 _STOCK_NAME_RESOLVER_CACHE = None
 _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = None
+_STOCK_CODE_NAME_LOOKUP_CACHE = None
+_STOCK_NAME_SHEET_CACHE = None
 
 
 def is_probably_warrant_code_for_underlying(value):
@@ -4336,6 +4458,115 @@ def is_probably_warrant_name_text(value):
     return ("購" in s) or ("售" in s)
 
 
+def _normalize_stock_cache_header(header):
+    return str(header or "").strip().replace(" ", "").replace("　", "")
+
+
+def _pick_stock_cache_column(headers, candidates):
+    normalized = [_normalize_stock_cache_header(h) for h in headers]
+    for cand in candidates:
+        cand_norm = _normalize_stock_cache_header(cand)
+        for idx, h in enumerate(normalized):
+            if h == cand_norm:
+                return idx
+    for cand in candidates:
+        cand_norm = _normalize_stock_cache_header(cand)
+        for idx, h in enumerate(normalized):
+            if cand_norm and cand_norm in h:
+                return idx
+    return None
+
+
+def load_stock_name_cache_map():
+    """
+    從 Google Sheet「快取_股票名稱」讀取股票 / ETF 代號與名稱。
+
+    回傳：
+    {
+        "code_to_name": {"2330": "台積電", ...},
+        "name_to_code": {"台積電": "2330", ...},
+    }
+
+    這張表由使用者維護時優先度最高，可避免 ISIN 即時抓取失敗，或權證快取舊資料污染時
+    造成標的股代號與股名對不起來。
+    """
+    global _STOCK_NAME_SHEET_CACHE
+
+    if _STOCK_NAME_SHEET_CACHE is not None:
+        return _STOCK_NAME_SHEET_CACHE
+
+    code_to_name = {}
+    name_to_code = {}
+
+    def add_pair(code, name):
+        code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
+        name = str(name or "").strip()
+
+        if not code or not name:
+            return
+        if is_probably_warrant_code_for_underlying(code):
+            return
+        if is_probably_warrant_name_text(name):
+            return
+        if name == code:
+            return
+
+        code_to_name[code] = name
+        name_to_code[name] = code
+
+    # 先讀本機備援 CSV；如果 GitHub Actions 同步過這份檔案，即使暫時讀不到 Sheet 也可用。
+    try:
+        local_df = read_cache_csv(STOCK_NAME_CACHE_PATH)
+    except Exception:
+        local_df = pd.DataFrame()
+
+    if local_df is not None and not local_df.empty:
+        headers = list(local_df.columns)
+        code_col = _pick_stock_cache_column(headers, ["代號", "股票代號", "證券代號", "標的股", "商品代號", "code"])
+        name_col = _pick_stock_cache_column(headers, ["名稱", "股票名稱", "證券名稱", "標的名稱", "商品名稱", "name"])
+        if code_col is not None and name_col is not None:
+            code_header = headers[code_col]
+            name_header = headers[name_col]
+            for _, row in local_df.iterrows():
+                add_pair(row.get(code_header, ""), row.get(name_header, ""))
+
+    # 再讀 Google Sheet 的快取_股票名稱，並以 Sheet 為準覆蓋本機快取。
+    if GSHEET_CACHE_ENABLED and gsheet_enabled():
+        try:
+            sh = get_gsheet_spreadsheet()
+            ws = sh.worksheet(safe_worksheet_title(STOCK_NAME_CACHE_SHEET)) if sh is not None else None
+            values = ws.get_all_values() if ws is not None else []
+
+            if values and len(values) >= 2:
+                headers = [str(h).strip() for h in values[0]]
+                code_col = _pick_stock_cache_column(headers, ["代號", "股票代號", "證券代號", "標的股", "商品代號", "code"])
+                name_col = _pick_stock_cache_column(headers, ["名稱", "股票名稱", "證券名稱", "標的名稱", "商品名稱", "name"])
+
+                if code_col is not None and name_col is not None:
+                    for row in values[1:]:
+                        code = row[code_col] if code_col < len(row) else ""
+                        name = row[name_col] if name_col < len(row) else ""
+                        add_pair(strip_gsheet_text_prefix(code), strip_gsheet_text_prefix(name))
+
+                    try:
+                        df = pd.DataFrame([
+                            {"代號": code, "名稱": name}
+                            for code, name in sorted(code_to_name.items())
+                        ])
+                        if not df.empty:
+                            df.to_csv(STOCK_NAME_CACHE_PATH, index=False, encoding=CACHE_ENCODING)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  ⚠️ 讀取 {STOCK_NAME_CACHE_SHEET} 失敗，改用 ISIN / 既有快取：{type(e).__name__}: {e}")
+
+    _STOCK_NAME_SHEET_CACHE = {
+        "code_to_name": code_to_name,
+        "name_to_code": name_to_code,
+    }
+    return _STOCK_NAME_SHEET_CACHE
+
+
 def get_stock_map_for_underlying_resolution():
     """
     建立更穩定的「標的名稱 -> 標的代號」對照表。
@@ -4352,6 +4583,11 @@ def get_stock_map_for_underlying_resolution():
         return _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE
 
     stock_map = {}
+
+    stock_name_cache = load_stock_name_cache_map()
+    for name, code in (stock_name_cache.get("name_to_code", {}) or {}).items():
+        if name and code:
+            stock_map[str(name).strip()] = str(code).strip()
 
     for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
         if name and code:
@@ -4385,12 +4621,77 @@ def get_stock_map_for_underlying_resolution():
 
         stock_map.setdefault(raw_name, raw_code)
 
+    # 最後再次以「快取_股票名稱」為準，避免 ISIN 名稱過長或舊權證快取覆蓋使用者維護的股名。
+    for name, code in (stock_name_cache.get("name_to_code", {}) or {}).items():
+        if name and code:
+            stock_map[str(name).strip()] = str(code).strip()
+
     _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = {
         str(name).strip(): str(code).strip()
         for name, code in stock_map.items()
         if str(name).strip() and str(code).strip()
     }
     return _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE
+
+
+def get_stock_name_by_code_for_underlying_resolution(code):
+    """
+    由標的代號反查標的名稱。
+
+    近10日明細合併時，如果權證快取只有標的股代號、標的名稱空白，
+    原本 Sheet 會出現 6106 / 5905 但名稱空白。這裡用 ISIN / 已知 ETF /
+    既有正常快取建立 code -> name 對照，讓輸出欄位能補回標的名稱。
+    """
+    global _STOCK_CODE_NAME_LOOKUP_CACHE
+
+    norm_code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
+    if not norm_code:
+        return ""
+
+    if _STOCK_CODE_NAME_LOOKUP_CACHE is None:
+        code_name = {}
+
+        # 使用者維護的 Google Sheet「快取_股票名稱」優先。
+        try:
+            stock_name_cache = load_stock_name_cache_map()
+        except Exception:
+            stock_name_cache = {"code_to_name": {}}
+
+        for cached_code, cached_name in (stock_name_cache.get("code_to_name", {}) or {}).items():
+            k = normalize_underlying_code_for_group(cached_code) or normalize_price_code(cached_code)
+            if k and cached_name:
+                code_name[k] = str(cached_name).strip()
+
+        # 已知 ETF / 指數型標的補強。
+        for known_code, known_name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+            k = normalize_underlying_code_for_group(known_code)
+            if k and known_name and k not in code_name:
+                code_name[k] = str(known_name).strip()
+
+        try:
+            stock_map = get_stock_map_for_underlying_resolution()
+        except Exception:
+            stock_map = {}
+
+        for name, mapped_code in (stock_map or {}).items():
+            display_name = str(name or "").strip()
+            mapped_code_norm = normalize_underlying_code_for_group(mapped_code) or normalize_price_code(mapped_code)
+
+            if not display_name or not mapped_code_norm:
+                continue
+            if display_name == mapped_code_norm:
+                continue
+            if is_probably_warrant_name_text(display_name):
+                continue
+
+            current = code_name.get(mapped_code_norm, "")
+            # 若快取_股票名稱已有名稱，優先保留；否則才用 ISIN / 其他快取補名稱。
+            if not current or (mapped_code_norm not in (stock_name_cache.get("code_to_name", {}) or {}) and len(display_name) < len(current)):
+                code_name[mapped_code_norm] = display_name
+
+        _STOCK_CODE_NAME_LOOKUP_CACHE = code_name
+
+    return _STOCK_CODE_NAME_LOOKUP_CACHE.get(norm_code, "")
 
 
 def infer_underlying_from_warrant_name(warrant_name, stock_map=None, resolver=None):
