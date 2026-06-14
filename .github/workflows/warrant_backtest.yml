@@ -106,6 +106,10 @@ jobs:
       PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS: "35"
       PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE: "1"
 
+      BROKER_10D_PRICE_FAST_LOOKBACK_DAYS: "12"
+      BROKER_10D_PRICE_LOOKBACK_DAYS: "30"
+      BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS: "20"
+
       # 關鍵修正：
       # 精選5分點模式必須絕對完整，不能只靠 prescan 候選。
       # 啟用後會建立「所有認購權證 × 精選5分點」候選池，
