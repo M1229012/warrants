@@ -160,6 +160,12 @@ PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE = os.getenv("PRICE_PREFETCH_ALL_REQUIRE_T
 # 若賣超完全找不到歷史買進成本，仍會補抓最新價作為備援成本，避免報酬率空白。
 BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES = os.getenv("BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
 BROKER_10D_FETCH_SELL_FALLBACK_PRICES = os.getenv("BROKER_10D_FETCH_SELL_FALLBACK_PRICES", "1").strip().lower() not in ("0", "false", "no")
+# 近10日圖卡價格加速：預設先用 Yahoo Spark / Quote 批次抓價格，避免 1 檔權證打 1 次官方 API。
+# 批次抓不到的少量代號才退回逐檔官方 / Yahoo 備援，避免又跑回 1～2 小時。
+BROKER_10D_BATCH_PRICE_ENABLED = os.getenv("BROKER_10D_BATCH_PRICE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+BROKER_10D_BATCH_PRICE_CHUNK_SIZE = int(os.getenv("BROKER_10D_BATCH_PRICE_CHUNK_SIZE", "120"))
+BROKER_10D_BATCH_PRICE_FALLBACK_PER_CODE = os.getenv("BROKER_10D_BATCH_PRICE_FALLBACK_PER_CODE", "1").strip().lower() not in ("0", "false", "no")
+BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES = int(os.getenv("BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES", "300"))
 
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
@@ -1116,6 +1122,280 @@ def fetch_yahoo_prices(code, start_dt=None, end_dt=None):
 
     return prices
 
+
+
+
+def _yahoo_batch_range_value(start_dt=None, end_dt=None):
+    """依查價區間轉成 Yahoo Spark 支援的 range。"""
+    try:
+        if start_dt is not None and end_dt is not None:
+            days = max((end_dt - start_dt).days + 3, 1)
+        else:
+            days = 35
+    except Exception:
+        days = 35
+
+    if days <= 30:
+        return "1mo"
+    if days <= 90:
+        return "3mo"
+    if days <= 180:
+        return "6mo"
+    if days <= 365:
+        return "1y"
+    if days <= 730:
+        return "2y"
+    return "5y"
+
+
+def _yahoo_batch_symbol_code_map(codes):
+    """
+    建立 Yahoo 批次查價用 symbol -> 原代號 對照。
+
+    同時丟：
+    - 補零版 .TW / .TWO
+    - 去零版 .TW / .TWO
+
+    因為台股權證 / 上櫃權證在 Yahoo 的代號格式有時會吃掉前導 0，
+    批次查價時一次送出所有可能 symbol，再用第一個有資料的結果回填原代號。
+    """
+    symbol_to_code = {}
+    ordered_symbols = []
+
+    for raw_code in sorted({str(c).strip() for c in (codes or []) if str(c).strip()}):
+        norm_code = normalize_price_code(raw_code)
+        if not norm_code:
+            continue
+
+        for symbol in yahoo_symbol_variants(norm_code):
+            if symbol not in symbol_to_code:
+                symbol_to_code[symbol] = norm_code
+                ordered_symbols.append(symbol)
+
+    return ordered_symbols, symbol_to_code
+
+
+def _merge_batch_price_result(out, code, prices):
+    code = normalize_price_code(code)
+    if not code or not prices:
+        return
+
+    cleaned = {}
+    for d, p in prices.items():
+        dt = parse_date(d)
+        price = safe_price_float(p)
+        if dt and price is not None:
+            cleaned[dt.strftime("%Y/%m/%d")] = price
+
+    if not cleaned:
+        return
+
+    if code in out:
+        out[code] = merge_price_dicts(out[code], cleaned)
+    else:
+        out[code] = cleaned
+
+
+def fetch_yahoo_spark_batch_prices(codes, start_dt=None, end_dt=None):
+    """
+    Yahoo Spark 批次抓日線價格。
+
+    回傳：{代號: {YYYY/MM/DD: close}}
+    這是近10日圖卡大量權證 / 標的股價格的主要加速來源，
+    避免一檔一檔呼叫 fetch_twse_prices()。
+    """
+    codes = [normalize_price_code(c) for c in (codes or []) if normalize_price_code(c)]
+    if not codes:
+        return {}
+
+    symbols, symbol_to_code = _yahoo_batch_symbol_code_map(codes)
+    if not symbols:
+        return {}
+
+    chunk_size = max(int(BROKER_10D_BATCH_PRICE_CHUNK_SIZE or 120), 20)
+    range_value = _yahoo_batch_range_value(start_dt, end_dt)
+    out = {}
+
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start:start + chunk_size]
+        try:
+            session = get_thread_session()
+            rp = session.get(
+                "https://query1.finance.yahoo.com/v7/finance/spark",
+                params={
+                    "symbols": ",".join(chunk),
+                    "range": range_value,
+                    "interval": "1d",
+                    "indicators": "close",
+                    "includePrePost": "false",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=12,
+            )
+            data = rp.json()
+        except Exception:
+            continue
+
+        results = data.get("spark", {}).get("result", []) if isinstance(data, dict) else []
+        if not isinstance(results, list):
+            continue
+
+        for rec in results:
+            if not isinstance(rec, dict):
+                continue
+
+            symbol = str(rec.get("symbol", "")).strip()
+            code = symbol_to_code.get(symbol)
+            if not code:
+                continue
+
+            responses = rec.get("response", [])
+            if isinstance(responses, dict):
+                responses = [responses]
+            if not responses:
+                continue
+
+            resp0 = responses[0] if isinstance(responses[0], dict) else {}
+            timestamps = resp0.get("timestamp", []) or rec.get("timestamp", [])
+            indicators = resp0.get("indicators", {}) or rec.get("indicators", {})
+            quote = {}
+            try:
+                quote = indicators.get("quote", [{}])[0]
+            except Exception:
+                quote = {}
+            closes = quote.get("close", []) or resp0.get("close", []) or rec.get("close", [])
+
+            prices = {}
+            for ts, close_price in zip(timestamps, closes):
+                price = safe_price_float(close_price)
+                if price is None:
+                    continue
+                try:
+                    dt = datetime.fromtimestamp(int(ts))
+                except Exception:
+                    continue
+                prices[dt.strftime("%Y/%m/%d")] = price
+
+            _merge_batch_price_result(out, code, prices)
+
+    return out
+
+
+def fetch_yahoo_quote_batch_prices(codes):
+    """
+    Yahoo Quote 批次抓最新價格，作為 Spark 無資料時的補強。
+
+    這只能提供最新一筆價格，不適合歷史回測；但近10日圖卡的權證報酬主要需要最新價，
+    因此可大幅降低逐檔補抓需求。
+    """
+    codes = [normalize_price_code(c) for c in (codes or []) if normalize_price_code(c)]
+    if not codes:
+        return {}
+
+    symbols, symbol_to_code = _yahoo_batch_symbol_code_map(codes)
+    if not symbols:
+        return {}
+
+    chunk_size = max(int(BROKER_10D_BATCH_PRICE_CHUNK_SIZE or 120), 20)
+    out = {}
+
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start:start + chunk_size]
+        try:
+            session = get_thread_session()
+            rp = session.get(
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                params={"symbols": ",".join(chunk)},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=12,
+            )
+            data = rp.json()
+        except Exception:
+            continue
+
+        results = data.get("quoteResponse", {}).get("result", []) if isinstance(data, dict) else []
+        if not isinstance(results, list):
+            continue
+
+        for rec in results:
+            if not isinstance(rec, dict):
+                continue
+
+            symbol = str(rec.get("symbol", "")).strip()
+            code = symbol_to_code.get(symbol)
+            if not code:
+                continue
+
+            price = safe_price_float(
+                rec.get("regularMarketPrice")
+                or rec.get("postMarketPrice")
+                or rec.get("preMarketPrice")
+                or rec.get("regularMarketPreviousClose")
+            )
+            if price is None:
+                continue
+
+            ts = rec.get("regularMarketTime") or rec.get("postMarketTime") or rec.get("preMarketTime")
+            try:
+                dt = datetime.fromtimestamp(int(ts)) if ts else datetime.today()
+            except Exception:
+                dt = datetime.today()
+
+            _merge_batch_price_result(out, code, {dt.strftime("%Y/%m/%d"): price})
+
+    return out
+
+
+def fetch_yahoo_batch_prices(codes, start_dt=None, end_dt=None):
+    """
+    近10日圖卡批次查價入口。
+
+    先用 Spark 批次抓日線；若某些代號沒有回資料，再用 Quote 批次補最新價。
+    """
+    codes = sorted({normalize_price_code(c) for c in (codes or []) if normalize_price_code(c)})
+    if not codes:
+        return {}
+
+    spark_prices = fetch_yahoo_spark_batch_prices(codes, start_dt=start_dt, end_dt=end_dt)
+    missing_codes = [code for code in codes if code not in spark_prices or not spark_prices.get(code)]
+
+    if missing_codes:
+        quote_prices = fetch_yahoo_quote_batch_prices(missing_codes)
+    else:
+        quote_prices = {}
+
+    out = {}
+    for code in codes:
+        out[code] = merge_price_dicts(spark_prices.get(code, {}), quote_prices.get(code, {}))
+        if not out[code]:
+            out.pop(code, None)
+
+    return out
+
+
+def merge_batch_prices_into_caches(price_cache, persistent_price_cache, fetched_map, changed_price_codes=None):
+    """
+    將批次查到的價格同步進記憶體 price_cache 與持久化 persistent_price_cache。
+    """
+    changed_price_codes = changed_price_codes if changed_price_codes is not None else set()
+
+    for code, fetched_prices in (fetched_map or {}).items():
+        norm_code = normalize_price_code(code)
+        if not norm_code or not fetched_prices:
+            continue
+
+        old_prices = get_cached_prices_for_code(persistent_price_cache, norm_code)
+        in_memory_prices = get_price_series_from_cache(price_cache, norm_code)
+        merged_prices = merge_price_dicts(old_prices, in_memory_prices, fetched_prices)
+
+        if not merged_prices:
+            continue
+
+        persistent_price_cache[norm_code] = merged_prices
+        add_price_aliases(price_cache, norm_code, merged_prices)
+        changed_price_codes.add(norm_code)
+
+    return changed_price_codes
 
 def prices_need_yahoo_fallback(prices, start_dt=None, end_dt=None):
     """
@@ -4351,11 +4631,10 @@ def build_warrant_underlying_lookup_from_cache():
     2. 標的名稱 -> 標的股
     3. 權證名稱前綴解析器
 
-    用途：修復舊候選快取 / 舊歷史快取裡標的股欄位錯誤或空白的資料。
-
-    重要修正：
-    權證清單快取如果沒有正確標的股，不可以再用權證名稱當 fallback 抽數字；
-    否則會把洋華統一64購01誤判成 6401。
+    修正重點：
+    - 不再從權證名稱尾碼抽數字當標的代號。
+    - 若快取內出現「6102 晶豪科」這種股號與股名對不起來的資料，改用股票名稱反查正確代號。
+    - 若快取標的欄位空白，才用權證名稱前綴比對股票名稱，不抽權證尾碼數字。
     """
     global _WARRANT_UNDERLYING_LOOKUP_CACHE, _STOCK_NAME_CODE_LOOKUP_CACHE, _STOCK_NAME_RESOLVER_CACHE
 
@@ -4365,8 +4644,16 @@ def build_warrant_underlying_lookup_from_cache():
     warrant_lookup = {}
     stock_name_code = {}
 
+    master_name_code = get_stock_master_name_code_lookup()
+    master_resolver = get_stock_master_resolver()
+
     for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
         stock_name_code[normalize_stock_name_text(name)] = code
+
+    # 先把正確股票名稱代號對照放進來，之後任何標的名稱都可以優先反查正確股號。
+    for name_key, code in (master_name_code or {}).items():
+        if name_key and code:
+            stock_name_code[name_key] = code
 
     for w in load_warrants_cache() or []:
         warrant_code = normalize_warrant_code_for_unique(w.get("代號", ""))
@@ -4374,17 +4661,43 @@ def build_warrant_underlying_lookup_from_cache():
         raw_underlying_code = str(w.get("標的股", "")).strip()
         raw_underlying_name = str(w.get("標的名稱", "")).strip()
 
-        # 標的名稱若其實是權證名稱，不可拿來做標的分組。
+        if not warrant_code:
+            continue
+
         if is_probably_warrant_name_text(raw_underlying_name):
             raw_underlying_name = ""
 
-        # 重要：這裡不要再用 warrant_name 當 fallback_text。
-        underlying_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
+        underlying_code = ""
         underlying_name = raw_underlying_name
-        underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
 
-        if not warrant_code:
-            continue
+        # 1. 標的名稱存在時，優先用正確股票名稱對照反查代號。
+        mapped_code = resolve_underlying_by_stock_name(raw_underlying_name)
+        if mapped_code:
+            underlying_code = mapped_code
+
+        # 2. 若標的名稱無法反查，再用快取原本標的股；但不可接受疑似權證代號。
+        if not underlying_code:
+            candidate_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
+            if candidate_code and not is_probably_warrant_code_for_underlying(candidate_code):
+                underlying_code = candidate_code
+
+        # 3. 若仍無法確認，才用權證名稱前綴反推標的。
+        if not underlying_code:
+            inferred_code, inferred_name = resolve_underlying_from_warrant_prefix(warrant_name)
+            if inferred_code:
+                underlying_code = inferred_code
+                if inferred_name:
+                    underlying_name = inferred_name
+
+        # 4. 若權證名稱前綴可推回正確標的，且與既有 4 碼代號衝突，採用權證名稱前綴結果。
+        #    這是修正「晶豪科統一61購02 → 6102 晶豪科」這類舊錯誤的關鍵。
+        inferred_code, inferred_name = resolve_underlying_from_warrant_prefix(warrant_name)
+        if inferred_code and underlying_code and inferred_code != underlying_code:
+            underlying_code = inferred_code
+            if inferred_name:
+                underlying_name = inferred_name
+
+        underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
 
         if underlying_code and not is_probably_warrant_code_for_underlying(underlying_code):
             warrant_lookup[warrant_code] = {
@@ -4393,7 +4706,7 @@ def build_warrant_underlying_lookup_from_cache():
                 "權證名稱": warrant_name,
             }
 
-            if underlying_name:
+            if underlying_name and not is_probably_warrant_name_text(underlying_name):
                 stock_name_code[normalize_stock_name_text(underlying_name)] = underlying_code
 
     stock_map = {
@@ -4405,26 +4718,23 @@ def build_warrant_underlying_lookup_from_cache():
     try:
         resolver = build_underlying_resolver(stock_map)
     except Exception:
-        resolver = None
+        resolver = master_resolver
 
     _WARRANT_UNDERLYING_LOOKUP_CACHE = warrant_lookup
     _STOCK_NAME_CODE_LOOKUP_CACHE = stock_name_code
     _STOCK_NAME_RESOLVER_CACHE = resolver
     return _WARRANT_UNDERLYING_LOOKUP_CACHE
-
 def resolve_item_underlying_identity(item, warrant_lookup=None):
     """
     回傳 item 的正確標的股代號與標的名稱。
 
     優先順序：
-    1. 權證清單快取中的權證代號對應標的
-    2. item 內原本的標的股，但必須不像權證代號，且標的名稱不能像權證名稱
-    3. item 內標的名稱對照代號
-    4. 權證名稱前綴反推標的
+    1. 權證代號查權證清單 lookup。
+    2. 標的名稱反查正確股號。
+    3. 權證名稱前綴反推標的。
+    4. 最後才使用 item 原本標的股欄位。
 
-    重要修正：
-    不再把 warrant_name 丟給 normalize_underlying_for_display() 當 fallback，
-    避免權證名稱尾碼 64購01 / 59購31 被錯抽成 6401 / 5931。
+    不再把 warrant_name 丟進 normalize_underlying_for_display() 抽數字，避免 64購01 -> 6401。
     """
     warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
 
@@ -4437,17 +4747,33 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
         raw_underlying_name = ""
 
     cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
+    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached.get("標的名稱", ""))
     cached_name = str(cached.get("標的名稱", "")).strip()
 
     if is_probably_warrant_name_text(cached_name):
         cached_name = ""
 
-    # 1. 優先用權證清單 lookup，且不可用 warrant_name 當 fallback。
-    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached_name)
+    # 1. 權證 lookup 已經在 build_warrant_underlying_lookup_from_cache() 中做過股名校正，優先採用。
     if cached_code and not is_probably_warrant_code_for_underlying(cached_code):
         return cached_code, fill_known_underlying_name_if_missing(cached_code, cached_name or raw_underlying_name)
 
-    # 2. 再用 item 原始標的，但標的名稱不能是權證名稱。
+    # 2. 標的名稱反查正確股號。若 raw code 是 6102 但 name 是晶豪科，這裡會修成晶豪科正確代號。
+    for name_candidate in [raw_underlying_name, cached_name]:
+        mapped_code = resolve_underlying_by_stock_name(name_candidate)
+        if mapped_code:
+            return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
+
+    # 3. 用權證名稱前綴反推標的；這裡只比對股票名稱，不抽尾碼數字。
+    inferred_code, inferred_name = resolve_underlying_from_warrant_prefix(warrant_name)
+    if inferred_code:
+        return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
+
+    # 4. ETF / 特殊標的名稱。這裡不放 warrant_name，避免權證名稱尾碼干擾。
+    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name]))
+    if known_code:
+        return known_code, known_name
+
+    # 5. 最後才用 item 原始標的股，但標的名稱不能是權證名稱，代號也不能像權證代號。
     normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
     normalized_raw_name = fill_known_underlying_name_if_missing(normalized_raw_code, raw_underlying_name)
 
@@ -4458,38 +4784,7 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
     ):
         return normalized_raw_code, normalized_raw_name
 
-    # 3. 用標的名稱對照。
-    name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
-    for name_candidate in [raw_underlying_name, cached_name]:
-        if is_probably_warrant_name_text(name_candidate):
-            continue
-
-        name_key = normalize_stock_name_text(name_candidate)
-        mapped_code = name_lookup.get(name_key, "")
-        if mapped_code:
-            return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
-
-    # 4. ETF / 特殊標的名稱。這裡不放 warrant_name，避免權證名稱尾碼干擾。
-    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name]))
-    if known_code:
-        return known_code, known_name
-
-    # 5. 最後才從權證名稱前綴反推標的；這裡是用 stock_map 前綴比對，不是抽數字。
-    try:
-        stock_map = {
-            name: code
-            for name, code in (name_lookup or {}).items()
-            if name and code
-        }
-        if stock_map:
-            inferred_code, inferred_name = find_underlying_info(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
-            if inferred_code:
-                return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
-    except Exception:
-        pass
-
     return "", raw_underlying_name or cached_name
-
 def repair_item_underlying_identity(item, warrant_lookup=None):
     """
     直接修正 item 內的標的股 / 標的名稱，避免後續 A/B/C/D、近10日快取沿用舊錯誤欄位。
@@ -5123,6 +5418,135 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
             return rec["stock_code"], rec["stock_name"]
 
     return "", ""
+
+
+
+_STOCK_MASTER_NAME_CODE_LOOKUP_CACHE = None
+_STOCK_MASTER_RESOLVER_CACHE = None
+
+
+def build_stock_master_lookup_live():
+    """
+    從 TWSE ISIN 上市 / 上櫃清單建立「股票名稱 -> 正確代號」對照。
+
+    用途：修正舊權證快取曾經把權證到期年月數字誤當標的代號的情況。
+    例如：晶豪科統一61購02 不可被寫成 6102 晶豪科，應用股名晶豪科反查正確標的代號。
+    """
+    stock_map = {}
+
+    for market_name, mode in [("上市", "2"), ("上櫃", "4")]:
+        try:
+            resp = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            resp.encoding = "cp950"
+            tables = pd.read_html(StringIO(resp.text))
+            df = tables[0].iloc[2:].reset_index(drop=True)
+            stock_map.update(build_stock_map(df))
+        except Exception as e:
+            print(f"  ⚠️ {market_name} 股票名稱代號對照取得失敗：{type(e).__name__}: {e}")
+
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        stock_map.setdefault(name, code)
+
+    return stock_map
+
+
+def get_stock_master_name_code_lookup():
+    """
+    回傳 normalize_stock_name_text(name) -> 正確標的代號。
+
+    先抓 TWSE ISIN 建立正確股名對照；若失敗，再用權證清單快取中的可信資料與已知 ETF 對照備援。
+    """
+    global _STOCK_MASTER_NAME_CODE_LOOKUP_CACHE
+
+    if _STOCK_MASTER_NAME_CODE_LOOKUP_CACHE is not None:
+        return _STOCK_MASTER_NAME_CODE_LOOKUP_CACHE
+
+    lookup = {}
+
+    try:
+        stock_map = build_stock_master_lookup_live()
+        for name, code in stock_map.items():
+            name_key = normalize_stock_name_text(name)
+            norm_code = normalize_underlying_code_for_group(code)
+            if name_key and norm_code:
+                lookup[name_key] = norm_code
+    except Exception:
+        pass
+
+    # 備援：從權證快取補上看起來可信的標的名稱對照。
+    try:
+        for w in load_warrants_cache() or []:
+            name = str(w.get("標的名稱", "")).strip()
+            code = normalize_underlying_code_for_group(w.get("標的股", ""))
+            if not name or not code:
+                continue
+            if is_probably_warrant_name_text(name) or is_probably_warrant_code_for_underlying(code):
+                continue
+            lookup.setdefault(normalize_stock_name_text(name), code)
+    except Exception:
+        pass
+
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        lookup[normalize_stock_name_text(name)] = code
+
+    _STOCK_MASTER_NAME_CODE_LOOKUP_CACHE = lookup
+    return _STOCK_MASTER_NAME_CODE_LOOKUP_CACHE
+
+
+def get_stock_master_resolver():
+    """回傳以正確股票名稱代號對照建立的權證名稱前綴解析器。"""
+    global _STOCK_MASTER_RESOLVER_CACHE
+
+    if _STOCK_MASTER_RESOLVER_CACHE is not None:
+        return _STOCK_MASTER_RESOLVER_CACHE
+
+    lookup = get_stock_master_name_code_lookup()
+    stock_map = {name: code for name, code in lookup.items() if name and code}
+
+    try:
+        _STOCK_MASTER_RESOLVER_CACHE = build_underlying_resolver(stock_map)
+    except Exception:
+        _STOCK_MASTER_RESOLVER_CACHE = None
+
+    return _STOCK_MASTER_RESOLVER_CACHE
+
+
+def resolve_underlying_by_stock_name(name):
+    """用標的名稱反查正確標的代號。"""
+    if is_probably_warrant_name_text(name):
+        return ""
+
+    name_key = normalize_stock_name_text(name)
+    if not name_key:
+        return ""
+
+    return get_stock_master_name_code_lookup().get(name_key, "")
+
+
+def resolve_underlying_from_warrant_prefix(warrant_name):
+    """
+    用權證名稱前綴反推正確標的。
+
+    這裡只做「股票名稱前綴」比對，不抽取權證名稱尾碼數字，因此不會把 64購01 誤判成 6401。
+    """
+    if not warrant_name:
+        return "", ""
+
+    try:
+        resolver = get_stock_master_resolver()
+        stock_map = {name: code for name, code in get_stock_master_name_code_lookup().items() if name and code}
+        if resolver:
+            return find_underlying_info(warrant_name, stock_map, resolver)
+    except Exception:
+        pass
+
+    return "", ""
+
 
 
 
@@ -10086,8 +10510,9 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     """
     近10日分點明細的「現股10日」需要標的股起始價與最新收盤價。
 
-    當 API4 分點資料尚未更新到今天，但今天已盤後時，仍應先把標的股最新價格補進 price_cache，
-    讓之後分點資料一出來，圖卡可以直接使用今天的現股收盤價，不會停在前一交易日。
+    加速修正：
+    1. 先用 Yahoo Spark 批次抓所有標的股近一段時間日線。
+    2. 批次仍缺起始價或收盤價的少量標的，才退回逐檔官方 / Yahoo 備援。
     """
     if not BROKER_10D_DETAIL_ENABLED:
         return price_cache
@@ -10102,9 +10527,21 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     end_dt = min(target_dt, datetime.today())
     lookback_days = max(int(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
     start_dt = target_dt - timedelta(days=lookback_days)
+    start_date = (target_dt - timedelta(days=max(int(BROKER_10D_DETAIL_DAYS), 1) - 1)).strftime("%Y/%m/%d")
 
     persistent_price_cache = load_price_cache()
     fetch_plan = {}
+
+    def has_needed_underlying_prices(code):
+        start_price, _ = get_latest_price_info_on_or_before(price_cache, code, start_date)
+        end_price, end_price_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
+        end_price_dt = parse_date(end_price_date) if end_price_date else None
+        return (
+            start_price is not None
+            and end_price is not None
+            and end_price_dt is not None
+            and (target_dt - end_price_dt).days <= max(3, int(BROKER_10D_PRICE_STALE_DAYS))
+        )
 
     for code in sorted(codes):
         cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
@@ -10114,10 +10551,7 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
         if merged_cached:
             add_price_aliases(price_cache, code, merged_cached)
 
-        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
-        latest_dt = parse_date(latest_date) if latest_date else None
-
-        if latest_price is None or latest_dt is None or latest_dt.date() < target_dt.date():
+        if not has_needed_underlying_prices(code):
             fetch_plan[code] = (start_dt, end_dt)
 
     print(f"【Step 4c】近10日分點明細需檢查標的股價格：{len(codes):,} 檔")
@@ -10126,13 +10560,49 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     if not fetch_plan:
         return price_cache
 
+    changed_price_codes = set()
+
+    if BROKER_10D_BATCH_PRICE_ENABLED:
+        print(f"  ⚡ 使用批次模式補抓標的股價格：{len(fetch_plan):,} 檔")
+        batch_prices = fetch_yahoo_batch_prices(fetch_plan.keys(), start_dt=start_dt, end_dt=end_dt)
+        changed_price_codes = merge_batch_prices_into_caches(
+            price_cache,
+            persistent_price_cache,
+            batch_prices,
+            changed_price_codes,
+        )
+        print(f"  ✅ 批次標的股價格回補完成：{len(batch_prices):,} 檔有資料")
+
+        # 批次後重新檢查，剩下缺資料的才進逐檔備援。
+        fetch_plan = {
+            code: plan
+            for code, plan in fetch_plan.items()
+            if not has_needed_underlying_prices(code)
+        }
+        print(f"  近10日分點明細批次後仍需逐檔補標的股價格：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    if not BROKER_10D_BATCH_PRICE_FALLBACK_PER_CODE:
+        print("  ⚠️ 已關閉逐檔標的股價格備援，略過批次仍缺價的標的股。")
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    if len(fetch_plan) > max(int(BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES), 0):
+        print(
+            f"  ⚠️ 批次後仍缺標的股價格 {len(fetch_plan):,} 檔，超過逐檔備援上限 "
+            f"{BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES:,}，為避免超時已略過。"
+        )
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
     def fetch_one(code):
         sdt, edt = fetch_plan[code]
         return code, fetch_twse_prices(code, sdt, edt)
 
     done = 0
-    changed_price_codes = set()
-
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -10157,12 +10627,10 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
             add_price_aliases(price_cache, code, merged_prices)
 
             if done % 20 == 0:
-                print(f"  [{done}/{len(fetch_plan)}] 近10日標的股價格補抓中...")
+                print(f"  [{done}/{len(fetch_plan)}] 近10日標的股價格逐檔補抓中...")
 
     save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
-
-
 def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
     """
     判斷近10日賣超是否真的需要最新權證價格作為成本備援。
@@ -10285,12 +10753,9 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     近10日分點買賣明細需要用「最新權證價格」估算買超部位放到現在的報酬。
 
     加速修正：
-    1. 不再對近10日所有有買賣的權證一律抓價。
-       - 近10日買進後仍有剩餘部位：一定補最新價。
-       - 純賣超且 API5 歷史已有成本：不補最新價，直接用 FIFO / 歷史成本算報酬。
-       - 純賣超但完全沒有歷史成本：才補最新價作為備援。
-    2. 價格補抓採兩段式：先抓 BROKER_10D_PRICE_FAST_LOOKBACK_DAYS，完全沒價格才補抓完整 BROKER_10D_PRICE_LOOKBACK_DAYS。
-    3. 本機價格快取完整保存；Google Sheet 價格快取可增量 append，避免整張重寫拖慢。
+    1. 先用 Yahoo Spark / Quote 批次抓全部需要最新價的權證。
+    2. 批次抓不到的少量權證，才退回逐檔 fetch_twse_prices()。
+    3. 避免 1,000 多檔權證逐檔打官方 / Yahoo API 造成 GitHub Actions 跑 1～2 小時。
     """
     if not BROKER_10D_DETAIL_ENABLED:
         return price_cache
@@ -10314,6 +10779,11 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     persistent_price_cache = load_price_cache()
     fetch_plan = {}
 
+    def has_fresh_warrant_price(code):
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
+        latest_dt = parse_date(latest_date) if latest_date else None
+        return latest_price is not None and latest_dt is not None and (target_dt - latest_dt).days <= stale_days
+
     for code in sorted(codes):
         cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
         in_memory_prices = get_price_series_from_cache(price_cache, code)
@@ -10322,24 +10792,58 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
         if merged_cached:
             add_price_aliases(price_cache, code, merged_cached)
 
-        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
-        latest_dt = parse_date(latest_date) if latest_date else None
-
-        if latest_price is None or latest_dt is None or (target_dt - latest_dt).days > stale_days:
+        if not has_fresh_warrant_price(code):
             fetch_plan[code] = (fast_start_dt, end_dt, full_start_dt)
 
     print(f"【Step 4d】近10日分點明細需檢查權證價格：{len(codes):,} 檔")
     print(f"  近10日分點明細需補抓權證價格：{len(fetch_plan):,} 檔")
-    print(f"  近10日分點明細價格補抓策略：先抓近 {fast_lookback_days} 天，完全無價格才補抓近 {full_lookback_days} 天")
+    print(f"  近10日分點明細價格補抓策略：批次先抓近 {full_lookback_days} 天；批次缺資料才逐檔備援")
 
     if not fetch_plan:
+        return price_cache
+
+    changed_price_codes = set()
+
+    if BROKER_10D_BATCH_PRICE_ENABLED:
+        print(f"  ⚡ 使用批次模式補抓權證價格：{len(fetch_plan):,} 檔")
+        batch_prices = fetch_yahoo_batch_prices(fetch_plan.keys(), start_dt=full_start_dt, end_dt=end_dt)
+        changed_price_codes = merge_batch_prices_into_caches(
+            price_cache,
+            persistent_price_cache,
+            batch_prices,
+            changed_price_codes,
+        )
+        print(f"  ✅ 批次權證價格回補完成：{len(batch_prices):,} 檔有資料")
+
+        fetch_plan = {
+            code: plan
+            for code, plan in fetch_plan.items()
+            if not has_fresh_warrant_price(code)
+        }
+        print(f"  近10日分點明細批次後仍需逐檔補權證價格：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    if not BROKER_10D_BATCH_PRICE_FALLBACK_PER_CODE:
+        print("  ⚠️ 已關閉逐檔權證價格備援，略過批次仍缺價的權證。")
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    fallback_max = max(int(BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES), 0)
+    if len(fetch_plan) > fallback_max:
+        print(
+            f"  ⚠️ 批次後仍缺權證價格 {len(fetch_plan):,} 檔，超過逐檔備援上限 "
+            f"{fallback_max:,}，為避免超時已略過；缺價權證會在報酬欄備註省略。"
+        )
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
         return price_cache
 
     def fetch_one(code):
         fast_sdt, edt, full_sdt = fetch_plan[code]
         fetched_prices = fetch_twse_prices(code, fast_sdt, edt)
 
-        # 若短區間完全沒有價格，而且本地快取也沒有任何可用價格，再補抓完整區間。
         old_prices = get_cached_prices_for_code(persistent_price_cache, code)
         merged_after_fast = merge_price_dicts(old_prices, fetched_prices)
         has_any_price = any(
@@ -10354,7 +10858,6 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
         return code, fetched_prices
 
     done = 0
-    changed_price_codes = set()
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -10379,11 +10882,10 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
                 add_price_aliases(price_cache, code, merged_prices)
 
             if done % 20 == 0:
-                print(f"  [{done}/{len(fetch_plan)}] 近10日分點明細權證價格補抓中...")
+                print(f"  [{done}/{len(fetch_plan)}] 近10日分點明細權證價格逐檔補抓中...")
 
     save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
-
 def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None):
     """
     用同一分點 + 同一權證的 API5 歷史資料估算近10日賣出實現報酬。
@@ -10653,7 +11155,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
 
         warrant_name = str(item.get("warrant_name", "")).strip()
         underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
-        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name or warrant_name)
+        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name)
         underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
@@ -11724,15 +12226,9 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
     """
     價格預抓完整模式：補抓所有既有分點歷史項目會牽涉到的價格。
 
-    目的：
-    分點資料可能最新只到前一交易日，但盤後價格已經更新到今天。
-    這時候預抓模式應該先把所有可能會被後續報表 / 圖卡使用的價格都補進 price_cache，
-    不只補目前事件清單、TOP15 或近10日圖卡剛好需要的少數代號。
-
-    判斷：
-    - 同一個代號若 price_cache 已有 target_date 當天價格，略過。
-    - 若沒有 target_date 當天價格，或完全沒有價格，才補抓。
-    - 權證與標的股分開使用不同 lookback，避免權證太久沒成交時完全抓不到價格。
+    加速修正：
+    先用 Yahoo 批次模式補價格；批次後仍缺價的代號如果數量過大，就不再全部逐檔打 API，
+    避免價格預抓把 GitHub Actions 拖到 1～2 小時。
     """
     if not PRICE_PREFETCH_ALL_ITEM_PRICES:
         return price_cache
@@ -11802,12 +12298,54 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
     if not fetch_plan:
         return price_cache
 
+    changed_price_codes = set()
+
+    if BROKER_10D_BATCH_PRICE_ENABLED:
+        print(f"  ⚡ 完整價格預抓使用批次模式：{len(fetch_plan):,} 檔")
+        batch_prices = fetch_yahoo_batch_prices(fetch_plan.keys(), start_dt=min(v[0] for v in fetch_plan.values()), end_dt=end_dt)
+        changed_price_codes = merge_batch_prices_into_caches(
+            price_cache,
+            persistent_price_cache,
+            batch_prices,
+            changed_price_codes,
+        )
+        print(f"  ✅ 完整價格預抓批次回補完成：{len(batch_prices):,} 檔有資料")
+
+        remaining_fetch_plan = {}
+        for code, plan in fetch_plan.items():
+            latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
+            latest_dt = parse_date(latest_date) if latest_date else None
+            need_fetch = latest_price is None or latest_dt is None
+            if not need_fetch and PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE:
+                need_fetch = latest_dt.date() < target_dt.date()
+            if need_fetch:
+                remaining_fetch_plan[code] = plan
+        fetch_plan = remaining_fetch_plan
+        print(f"  完整價格預抓批次後仍需逐檔補抓：{len(fetch_plan):,} 檔")
+
+    if not fetch_plan:
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    if not BROKER_10D_BATCH_PRICE_FALLBACK_PER_CODE:
+        print("  ⚠️ 已關閉完整價格預抓逐檔備援，略過批次仍缺價代號。")
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
+    fallback_max = max(int(BROKER_10D_BATCH_PRICE_FALLBACK_MAX_CODES), 0)
+    if len(fetch_plan) > fallback_max:
+        print(
+            f"  ⚠️ 完整價格預抓批次後仍缺 {len(fetch_plan):,} 檔，超過逐檔備援上限 {fallback_max:,}，"
+            "為避免超時已略過。"
+        )
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+        return price_cache
+
     def fetch_one(code):
         start_dt, end_dt, code_type = fetch_plan[code]
         return code, fetch_twse_prices(code, start_dt, end_dt)
 
     done = 0
-    changed_price_codes = set()
 
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
@@ -11833,7 +12371,7 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
             add_price_aliases(price_cache, code, merged_prices)
 
             if done % 50 == 0:
-                print(f"  [{done}/{len(fetch_plan)}] 完整價格預抓中...")
+                print(f"  [{done}/{len(fetch_plan)}] 完整價格預抓逐檔補抓中...")
 
     save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
