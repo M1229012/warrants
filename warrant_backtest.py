@@ -3144,6 +3144,11 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
     若直接拿原字串當 group key，就會造成本週 TOP15 同標的重複出現。
     這裡統一轉成穩定代號後再合併與排序。
 
+    重要修正：
+    這個函式只接受「明確代號」或「開頭就是代號」的文字，例如 2408、00632R、00981A、
+    2408 南亞科。不能從權證名稱中抽數字，避免把洋華統一64購01誤判成 6401、
+    臺股指華益59購31誤判成 5931。
+
     ETF 修正：
     支援 00631L、00632R、00981A 這種含英文字尾標的，避免分組時被截成 00631 / 00632 / 00981。
     """
@@ -3167,23 +3172,16 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
         if s.endswith(".0") and s[:-2].isdigit():
             s = s[:-2]
 
+        # 只接受「開頭就是標的代號」的格式，例如 2408 南亞科、00632R 元大台灣50反1。
         m = re.match(r"^([0-9]{4,6}[A-Z]?)(?=\s|　|$|[^0-9A-Z])", s, flags=re.I)
         if m:
             return m.group(1).upper()
 
+        # 或整格就是代號。
         if re.fullmatch(r"[0-9]{4,6}[A-Z]?", s, flags=re.I):
             return s.upper()
 
-        # 只有完全沒有英文字母時，才退回舊版純數字抽取邏輯。
-        # 這可以避免 00631L / 00981A 被錯誤抽成 00631 / 00981。
-        if not re.search(r"[A-Z]", s, flags=re.I):
-            digits = "".join(ch for ch in s if ch.isdigit())
-            if 4 <= len(digits) <= 6:
-                return digits
-
     return ""
-
-
 
 def normalize_underlying_for_display(value, fallback_text=""):
     """
@@ -3268,7 +3266,7 @@ def merge_result_values_for_gsheet(title, new_values):
     # 近10日分點明細是「同日期完整快照」。
     # 若只用 upsert，舊版權證層級資料因 key 不同會被保留下來，圖片端會同時讀到舊權證列與新標的列。
     # 因此同一資料範圍 + 統計日期改採快照替換，確保每次都是最新的標的層級資料。
-    if safe_worksheet_title(title) == BROKER_10D_DETAIL_SHEET:
+    if safe_worksheet_title(title) in (BROKER_10D_DETAIL_SHEET, WARRANT_CONSENSUS_7D_SHEET):
         replace_scope_dates = set()
         for rec in new_records:
             scope_value = str(rec.get("資料範圍", current_scope) or current_scope).strip()
@@ -3288,7 +3286,7 @@ def merge_result_values_for_gsheet(title, new_values):
             old_records = filtered_old_records
             removed_count = before_count - len(old_records)
             if removed_count > 0:
-                print(f"  ☁️ 已清除同日期舊版近10日分點明細：{removed_count:,} 筆，改用本次標的層級快照。")
+                print(f"  ☁️ 已清除同日期舊版標的層級快照：{removed_count:,} 筆，改用本次重新產生資料。")
 
     headers = []
     for h in new_headers + old_headers:
@@ -4331,6 +4329,21 @@ def is_probably_warrant_code_for_underlying(value):
     return False
 
 
+def is_probably_warrant_name_text(value):
+    """
+    判斷文字是否看起來像權證名稱，而不是標的名稱。
+
+    目的：
+    防止舊快取或錯誤解析把「洋華統一64購01」、「臺股指華益59購31」
+    放到標的名稱欄，後續又從名稱尾碼抽出 6401 / 5931 這種假標的代號。
+    """
+    s = str(value or "").strip()
+
+    if not s:
+        return False
+
+    return "購" in s or "售" in s
+
 def build_warrant_underlying_lookup_from_cache():
     """
     從權證清單快取建立：
@@ -4339,6 +4352,10 @@ def build_warrant_underlying_lookup_from_cache():
     3. 權證名稱前綴解析器
 
     用途：修復舊候選快取 / 舊歷史快取裡標的股欄位錯誤或空白的資料。
+
+    重要修正：
+    權證清單快取如果沒有正確標的股，不可以再用權證名稱當 fallback 抽數字；
+    否則會把洋華統一64購01誤判成 6401。
     """
     global _WARRANT_UNDERLYING_LOOKUP_CACHE, _STOCK_NAME_CODE_LOOKUP_CACHE, _STOCK_NAME_RESOLVER_CACHE
 
@@ -4354,8 +4371,16 @@ def build_warrant_underlying_lookup_from_cache():
     for w in load_warrants_cache() or []:
         warrant_code = normalize_warrant_code_for_unique(w.get("代號", ""))
         warrant_name = str(w.get("名稱", "")).strip()
-        underlying_code = normalize_underlying_for_display(w.get("標的股", ""), w.get("標的名稱", "") or warrant_name)
-        underlying_name = str(w.get("標的名稱", "")).strip()
+        raw_underlying_code = str(w.get("標的股", "")).strip()
+        raw_underlying_name = str(w.get("標的名稱", "")).strip()
+
+        # 標的名稱若其實是權證名稱，不可拿來做標的分組。
+        if is_probably_warrant_name_text(raw_underlying_name):
+            raw_underlying_name = ""
+
+        # 重要：這裡不要再用 warrant_name 當 fallback_text。
+        underlying_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
+        underlying_name = raw_underlying_name
         underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
 
         if not warrant_code:
@@ -4387,16 +4412,19 @@ def build_warrant_underlying_lookup_from_cache():
     _STOCK_NAME_RESOLVER_CACHE = resolver
     return _WARRANT_UNDERLYING_LOOKUP_CACHE
 
-
 def resolve_item_underlying_identity(item, warrant_lookup=None):
     """
     回傳 item 的正確標的股代號與標的名稱。
 
     優先順序：
     1. 權證清單快取中的權證代號對應標的
-    2. item 內原本的標的股，但必須不像權證代號
+    2. item 內原本的標的股，但必須不像權證代號，且標的名稱不能像權證名稱
     3. item 內標的名稱對照代號
     4. 權證名稱前綴反推標的
+
+    重要修正：
+    不再把 warrant_name 丟給 normalize_underlying_for_display() 當 fallback，
+    避免權證名稱尾碼 64購01 / 59購31 被錯抽成 6401 / 5931。
     """
     warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
 
@@ -4405,30 +4433,48 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
     raw_underlying_code = str(item.get("underlying_code", "")).strip()
     raw_underlying_name = str(item.get("underlying_name", "")).strip()
 
+    if is_probably_warrant_name_text(raw_underlying_name):
+        raw_underlying_name = ""
+
     cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
-    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached.get("標的名稱", "") or warrant_name)
     cached_name = str(cached.get("標的名稱", "")).strip()
 
+    if is_probably_warrant_name_text(cached_name):
+        cached_name = ""
+
+    # 1. 優先用權證清單 lookup，且不可用 warrant_name 當 fallback。
+    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached_name)
     if cached_code and not is_probably_warrant_code_for_underlying(cached_code):
         return cached_code, fill_known_underlying_name_if_missing(cached_code, cached_name or raw_underlying_name)
 
-    normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name or warrant_name)
+    # 2. 再用 item 原始標的，但標的名稱不能是權證名稱。
+    normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
     normalized_raw_name = fill_known_underlying_name_if_missing(normalized_raw_code, raw_underlying_name)
 
-    if normalized_raw_code and not is_probably_warrant_code_for_underlying(normalized_raw_code):
+    if (
+        normalized_raw_code
+        and not is_probably_warrant_code_for_underlying(normalized_raw_code)
+        and not is_probably_warrant_name_text(normalized_raw_name)
+    ):
         return normalized_raw_code, normalized_raw_name
 
+    # 3. 用標的名稱對照。
     name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
     for name_candidate in [raw_underlying_name, cached_name]:
+        if is_probably_warrant_name_text(name_candidate):
+            continue
+
         name_key = normalize_stock_name_text(name_candidate)
         mapped_code = name_lookup.get(name_key, "")
         if mapped_code:
             return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
 
-    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name, warrant_name]))
+    # 4. ETF / 特殊標的名稱。這裡不放 warrant_name，避免權證名稱尾碼干擾。
+    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name]))
     if known_code:
         return known_code, known_name
 
+    # 5. 最後才從權證名稱前綴反推標的；這裡是用 stock_map 前綴比對，不是抽數字。
     try:
         stock_map = {
             name: code
@@ -4443,7 +4489,6 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
         pass
 
     return "", raw_underlying_name or cached_name
-
 
 def repair_item_underlying_identity(item, warrant_lookup=None):
     """
@@ -11230,6 +11275,8 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
 
     # 核心修正：group_key = 標的股。
     # 同標的底下所有權證、所有追蹤分點先完整加總，再做 TOP15 排名。
+    # 先建立權證代號 -> 正確標的 lookup，避免舊快取把權證名稱尾碼誤當成標的代號。
+    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
     agg = {}
 
     for item in items:
@@ -11243,15 +11290,17 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        raw_underlying_code = str(item.get("underlying_code", "")).strip()
-        underlying_name = str(item.get("underlying_name", "")).strip()
-        underlying_code = normalize_underlying_for_display(raw_underlying_code, underlying_name or warrant_name)
+        underlying_code, underlying_name = resolve_item_underlying_identity(
+            item,
+            warrant_lookup=warrant_underlying_lookup,
+        )
+        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name)
         underlying_name = fill_known_underlying_name_if_missing(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
 
-        if not underlying_code:
+        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
             continue
 
         rec = agg.setdefault(underlying_code, {
