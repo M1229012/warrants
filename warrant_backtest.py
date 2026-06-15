@@ -89,6 +89,9 @@ PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 PRICE_PREFETCH_STATE_PATH = os.path.join(CACHE_DIR, "price_prefetch_state.csv")
 STOCK_NAME_CACHE_PATH = os.path.join(CACHE_DIR, "stock_name_cache.csv")
 STOCK_NAME_CACHE_SHEET = "快取_股票名稱"
+# 啟動時重建乾淨的股票名稱快取，排除權證名稱/權證代號污染。
+# 只影響「快取_股票名稱」與近10日/標的名稱補齊，不改 A/B/C/D 的事件篩選規則。
+REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START = os.getenv("REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START", "1").strip().lower() not in ("0", "false", "no")
 
 # 自動價格預抓：
 # 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
@@ -141,7 +144,7 @@ WARRANT_CONSENSUS_7D_TOP_N = int(os.getenv("WARRANT_CONSENSUS_7D_TOP_N", "15"))
 # RUN_MODE=1 精選分點模式不會建立這張 sheet，因此同步到 Google Sheet 時也不會動到既有工作表。
 # 不分類 A/B/C/D，只要 API5 / 快取_分點歷史有抓到資料，就依分點與標的股合併統計。
 BROKER_10D_DETAIL_ENABLED = os.getenv("BROKER_10D_DETAIL_ENABLED", "1").strip().lower() not in ("0", "false", "no")
-BROKER_10D_DETAIL_SHEET = os.getenv("BROKER_10D_DETAIL_SHEET", "快取_近10日分點買賣明細_1")
+BROKER_10D_DETAIL_SHEET = os.getenv("BROKER_10D_DETAIL_SHEET", "快取_近10日分點買賣明細")
 BROKER_10D_DETAIL_DAYS = int(os.getenv("BROKER_10D_DETAIL_DAYS", "10"))
 BROKER_10D_PRICE_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_PRICE_LOOKBACK_DAYS", "90"))
 # 近10日明細價格補抓加速：先抓較短區間；完全沒有價格時才補抓完整區間。
@@ -4776,6 +4779,97 @@ def infer_underlying_from_warrant_name(warrant_name, stock_map=None, resolver=No
     return "", ""
 
 
+def _is_clean_stock_name_pair(code, name):
+    code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
+    name = str(name or "").strip()
+
+    if not code or not name:
+        return False
+    if is_probably_warrant_code_for_underlying(code):
+        return False
+    if is_probably_warrant_name_text(name):
+        return False
+    if name == code:
+        return False
+    return True
+
+
+def rebuild_clean_stock_name_cache(force=False):
+    """
+    重建乾淨的「快取_股票名稱」。
+
+    目的：
+    - 快取_股票名稱只能放股票 / ETF / 特別股 / 指數型標的。
+    - 排除權證代號與名稱，避免近10日標的名稱被權證污染。
+    - 保留使用者原本 sheet 中乾淨的代號名稱，再用 TWSE/TPEX ISIN 補齊不完整股票名稱。
+    """
+    global _STOCK_NAME_SHEET_CACHE, _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE, _STOCK_CODE_NAME_LOOKUP_CACHE
+
+    if not force and not REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START:
+        return False
+
+    code_to_name = {}
+
+    def add_pair(code, name):
+        code_norm = normalize_underlying_code_for_group(code) or normalize_price_code(code)
+        name_norm = str(name or "").strip()
+        if not _is_clean_stock_name_pair(code_norm, name_norm):
+            return
+        code_to_name[code_norm] = name_norm
+
+    # 先讀使用者既有快取，保留乾淨資料。
+    try:
+        stock_cache = load_stock_name_cache_map()
+        for code, name in (stock_cache.get("code_to_name", {}) or {}).items():
+            add_pair(code, name)
+    except Exception:
+        pass
+
+    # 已知 ETF / 特殊標的補強。
+    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
+        add_pair(code, name)
+
+    # 再抓上市 / 上櫃 ISIN 補齊股票與 ETF 名稱。
+    for market_name, mode in [("上市", "2"), ("上櫃", "4")]:
+        try:
+            resp = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            resp.encoding = "cp950"
+            tables = pd.read_html(StringIO(resp.text))
+            df = tables[0].iloc[2:].reset_index(drop=True)
+            stock_map = build_stock_map(df)  # name -> code
+            for name, code in (stock_map or {}).items():
+                add_pair(code, name)
+        except Exception as e:
+            print(f"  ⚠️ {market_name} ISIN 股票名稱補齊失敗：{type(e).__name__}: {e}")
+
+    if not code_to_name:
+        print("  ⚠️ 快取_股票名稱重建略過：沒有可用乾淨資料。")
+        return False
+
+    # 清掉記憶體快取，避免用到重建前的污染資料。
+    _STOCK_NAME_SHEET_CACHE = None
+    _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = None
+    _STOCK_CODE_NAME_LOOKUP_CACHE = None
+
+    df = pd.DataFrame([
+        {"代號": add_gsheet_text_prefix(code), "名稱": name}
+        for code, name in sorted(code_to_name.items(), key=lambda kv: kv[0])
+    ])
+
+    write_cache_csv(df, STOCK_NAME_CACHE_PATH, sync_gsheet=True)
+
+    # 重新載入乾淨快取到記憶體。
+    _STOCK_NAME_SHEET_CACHE = None
+    load_stock_name_cache_map()
+    print(f"  ✅ 已重建乾淨 {STOCK_NAME_CACHE_SHEET}：{len(code_to_name):,} 筆，已排除權證資料。")
+    return True
+
+
 def build_warrant_underlying_lookup_from_cache():
     """
     從權證清單快取建立：
@@ -4874,16 +4968,16 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
     """
     回傳 item 的正確標的股代號與標的名稱。
 
-    優先順序：
-    1. 權證名稱前綴 + ISIN 標的對照反查結果。
-    2. 權證清單快取中的權證代號對應標的。
-    3. item 內原本的標的股，但必須不像權證代號，且標的名稱不能像權證名稱。
-    4. item 內標的名稱對照代號。
+    這是 A/B/C/D 與一般事件共用的穩定解析邏輯，順序刻意保守：
+    1. 權證清單快取中的權證代號對應標的。
+    2. item 內原本的標的股，但必須不像權證代號，且不能等於權證代號。
+    3. item / 權證快取的標的名稱對照代號。
+    4. 已知 ETF / 特殊標的名稱。
+    5. 最後才用權證名稱前綴反推標的。
 
-    重要修正：
-    - 不再從權證名稱尾碼抽數字當標的。
-    - 標的名稱若含「購 / 售」，視為權證名稱，不可當標的名稱。
-    - 若舊快取股號與權證名稱前綴反查結果衝突，優先採用前綴反查，避免同標的被拆列。
+    重點：不再從權證名稱尾碼抽數字，也不保留疑似權證代號的標的股。
+    近10日需要更強的名稱覆蓋時，使用 resolve_10d_item_underlying_identity()，
+    避免近10日修正污染 A/B/C/D 原本流程。
     """
     warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
 
@@ -4895,68 +4989,178 @@ def resolve_item_underlying_identity(item, warrant_lookup=None):
     if is_probably_warrant_name_text(raw_underlying_name):
         raw_underlying_name = ""
 
-    name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
-    stock_map = {
-        name: code
-        for name, code in (name_lookup or {}).items()
-        if name and code
-    }
-
-    inferred_code, inferred_name = infer_underlying_from_warrant_name(
-        warrant_name,
-        stock_map or get_stock_map_for_underlying_resolution(),
-        _STOCK_NAME_RESOLVER_CACHE,
-    )
-    if inferred_code:
-        return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
-
     cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
     cached_name = str(cached.get("標的名稱", "")).strip()
     if is_probably_warrant_name_text(cached_name):
         cached_name = ""
 
+    # 1. 權證清單 lookup：只接受不像權證代號、且不等於權證代號的標的股。
     cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached_name)
-    if cached_code and not is_probably_warrant_code_for_underlying(cached_code):
+    if (
+        cached_code
+        and not is_probably_warrant_code_for_underlying(cached_code)
+        and normalize_warrant_code_for_unique(cached_code) != warrant_code
+    ):
         return cached_code, fill_known_underlying_name_if_missing(cached_code, cached_name or raw_underlying_name)
 
+    # 2. item 原始標的：只接受乾淨標的股，不拿 warrant_name 當 fallback，避免 64購01 → 6401。
     normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
     normalized_raw_name = fill_known_underlying_name_if_missing(normalized_raw_code, raw_underlying_name)
 
     if (
         normalized_raw_code
         and not is_probably_warrant_code_for_underlying(normalized_raw_code)
+        and normalize_warrant_code_for_unique(normalized_raw_code) != warrant_code
         and not is_probably_warrant_name_text(normalized_raw_name)
     ):
         return normalized_raw_code, normalized_raw_name
 
+    # 3. 用標的名稱對照。
+    name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
     for name_candidate in [raw_underlying_name, cached_name]:
         if is_probably_warrant_name_text(name_candidate):
             continue
         name_key = normalize_stock_name_text(name_candidate)
         mapped_code = name_lookup.get(name_key, "")
-        if mapped_code:
+        if (
+            mapped_code
+            and not is_probably_warrant_code_for_underlying(mapped_code)
+            and normalize_warrant_code_for_unique(mapped_code) != warrant_code
+        ):
             return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
 
-    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name, warrant_name]))
+    # 4. 已知 ETF / 指數型標的名稱。這裡不放 warrant_name，避免權證名稱尾碼干擾。
+    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name]))
     if known_code:
         return known_code, known_name
+
+    # 5. 最後才從權證名稱前綴反推標的；這裡用股票名稱 resolver，不抽尾碼數字。
+    try:
+        stock_map = get_stock_map_for_underlying_resolution()
+        if stock_map:
+            inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
+            if (
+                inferred_code
+                and not is_probably_warrant_code_for_underlying(inferred_code)
+                and normalize_warrant_code_for_unique(inferred_code) != warrant_code
+            ):
+                return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
+    except Exception:
+        pass
 
     return "", raw_underlying_name or cached_name
 
 def repair_item_underlying_identity(item, warrant_lookup=None):
     """
-    直接修正 item 內的標的股 / 標的名稱，避免後續 A/B/C/D、近10日快取沿用舊錯誤欄位。
+    修正 item 內的標的股 / 標的名稱。
+
+    重要防呆：如果解析不到正確標的，且原本欄位疑似是權證代號或等於權證代號，
+    會主動清空，不讓 56630 這種權證代號流進 A/B/C/D 後續價格計算。
     """
     if item is None:
         return item
 
+    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
+    old_code = normalize_underlying_for_display(item.get("underlying_code", ""), item.get("underlying_name", ""))
+    old_name = str(item.get("underlying_name", "") or "").strip()
+
     underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_lookup)
 
-    if underlying_code:
+    if underlying_code and not is_probably_warrant_code_for_underlying(underlying_code) and normalize_warrant_code_for_unique(underlying_code) != warrant_code:
         item["underlying_code"] = underlying_code
-    if underlying_name:
-        item["underlying_name"] = underlying_name
+        item["underlying_name"] = underlying_name or fill_known_underlying_name_if_missing(underlying_code, old_name)
+    else:
+        # 舊資料若把權證代號塞進標的股，必須清掉，避免權證與標的報酬抓同一檔。
+        if old_code and (is_probably_warrant_code_for_underlying(old_code) or normalize_warrant_code_for_unique(old_code) == warrant_code):
+            item["underlying_code"] = ""
+            if is_probably_warrant_name_text(old_name) or not old_name:
+                item["underlying_name"] = ""
+        elif underlying_name and not is_probably_warrant_name_text(underlying_name):
+            item["underlying_name"] = underlying_name
 
+    return item
+
+
+def resolve_10d_item_underlying_identity(item, warrant_lookup=None):
+    """
+    近10日專用標的解析。
+
+    近10日要做同標的合併與圖卡排名，因此這裡把「快取_股票名稱」視為
+    代號 -> 名稱的第一優先來源；只要代號查得到，就覆蓋任何非空但可能錯的舊名稱。
+    這個函式只給近10日 / 近7日標的層級統計使用，不再反向污染 ABCD。
+    """
+    warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
+
+    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
+    warrant_name = str(item.get("warrant_name", "") or "").strip()
+    raw_code = normalize_underlying_for_display(item.get("underlying_code", ""), item.get("underlying_name", ""))
+    raw_name = str(item.get("underlying_name", "") or "").strip()
+    if is_probably_warrant_name_text(raw_name):
+        raw_name = ""
+
+    stock_cache = load_stock_name_cache_map()
+    code_to_name = stock_cache.get("code_to_name", {}) or {}
+    name_to_code = stock_cache.get("name_to_code", {}) or {}
+
+    def clean_return(code, name=""):
+        code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
+        if not code:
+            return "", ""
+        if is_probably_warrant_code_for_underlying(code) or normalize_warrant_code_for_unique(code) == warrant_code:
+            return "", ""
+        # 使用者維護的快取_股票名稱第一優先，直接覆蓋非空舊名稱。
+        sheet_name = get_stock_name_cache_name_by_code(code)
+        if sheet_name:
+            return code, sheet_name
+        name = fill_known_underlying_name_if_missing(code, name)
+        if is_probably_warrant_name_text(name):
+            name = ""
+        return code, name
+
+    # 1. 若原始標的代號本身乾淨，先用代號查快取_股票名稱覆蓋名稱。
+    code, name = clean_return(raw_code, raw_name)
+    if code:
+        return code, name
+
+    # 2. 權證清單 lookup。
+    cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
+    cached_name = str(cached.get("標的名稱", "") or "").strip()
+    if is_probably_warrant_name_text(cached_name):
+        cached_name = ""
+    code, name = clean_return(cached.get("標的股", ""), cached_name or raw_name)
+    if code:
+        return code, name
+
+    # 3. 乾淨名稱反查代號。
+    for name_candidate in [raw_name, cached_name]:
+        if not name_candidate or is_probably_warrant_name_text(name_candidate):
+            continue
+        mapped = name_to_code.get(str(name_candidate).strip()) or name_to_code.get(normalize_stock_name_text(name_candidate))
+        code, name = clean_return(mapped, name_candidate)
+        if code:
+            return code, name
+
+    # 4. 權證名稱前綴反推，僅用乾淨的股票名稱表 / ISIN 對照。
+    try:
+        stock_map = get_stock_map_for_underlying_resolution()
+        code, name = infer_underlying_from_warrant_name(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
+        code, name = clean_return(code, name)
+        if code:
+            return code, name
+    except Exception:
+        pass
+
+    return "", ""
+
+
+def repair_10d_item_underlying_identity(item, warrant_lookup=None):
+    """近10日專用修正，不動 ABCD 共用 item 的原始解析規則。"""
+    if item is None:
+        return item
+    code, name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_lookup)
+    item = dict(item)
+    item["underlying_code"] = code
+    item["underlying_name"] = name
     return item
 
 
@@ -10769,7 +10973,7 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None, price_cach
         if df is None or df.empty:
             continue
 
-        underlying_code, _ = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
+        underlying_code, _ = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
         underlying_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
         if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
             continue
@@ -10820,7 +11024,7 @@ def _collect_ranked_underlying_codes_for_10d(items, target_date=None, price_cach
         if not broker_label:
             continue
 
-        underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
+        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
         underlying_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
         if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
             continue
@@ -11374,7 +11578,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
+        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
         underlying_code = normalize_underlying_for_display(underlying_code, underlying_name or warrant_name)
         underlying_name = fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
@@ -12079,7 +12283,7 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=build_warrant_underlying_lookup_from_cache())
+        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=build_warrant_underlying_lookup_from_cache())
         underlying_code = normalize_underlying_for_display(underlying_code, underlying_name)
         underlying_name = fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name)
         broker_label = str(item.get("broker_label", "")).strip()
@@ -13239,6 +13443,10 @@ def main():
     print("=" * 70)
 
     warrants = get_all_call_warrants()
+
+    # 先重建乾淨的股票/ETF名稱對照，避免快取_股票名稱被權證污染後，
+    # 近10日標的名稱補齊與同標的合併繼續卡舊錯值。
+    rebuild_clean_stock_name_cache(force=REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START)
 
     if not warrants:
         elapsed = time.time() - program_start
