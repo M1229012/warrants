@@ -3593,12 +3593,119 @@ def build_local_underlying_name_map_from_rows(rows):
     return out
 
 
-def finalize_underlying_names_for_rows(rows, source_sheet):
+
+def resolve_underlying_name_for_preserved_top15_code(
+    underlying_code,
+    underlying_name="",
+    warrant_code="",
+    warrant_name="",
+    source_sheet="",
+    context_date="",
+    local_code_name_map=None,
+):
+    """
+    TOP15 專用顯示名稱補齊。
+
+    重點：
+    - 不回寫、不修正、不正規化「標的股」欄位。
+    - 只用原本 TOP15 計算出來的標的股作為查名線索。
+    - 若原本代號因舊口徑保留成 00981 / 00631 / 00632 這類不完整代號，
+      仍可從權證名稱、已知 ETF、權證清單快取推回顯示名稱。
+    - 補不到時只輸出「名稱待補(原標的股)」，避免標的名稱空白。
+    """
+    raw_code = strip_gsheet_text_prefix(str(underlying_code or "")).strip()
+    lookup_code = (
+        normalize_underlying_code_for_group(raw_code, underlying_name)
+        or normalize_underlying_code_for_group(raw_code)
+        or normalize_price_code(raw_code)
+    )
+    raw_name = str(underlying_name or "").strip()
+    local_code_name_map = local_code_name_map or {}
+
+    # 1. 本次輸出內同代號已存在的乾淨名稱。
+    for key in [raw_code, lookup_code]:
+        key_norm = normalize_underlying_code_for_group(key) or normalize_price_code(key)
+        local_name = str(local_code_name_map.get(key_norm, "") or "").strip()
+        if is_clean_underlying_display_name(local_name, key_norm):
+            return local_name
+
+    # 2. 原 row 內已經有乾淨標的名稱時直接保留。
+    if is_clean_underlying_display_name(raw_name, lookup_code or raw_code):
+        return raw_name
+
+    # 3. 用原代號 / 查名代號直接查已知 ETF、快取_股票名稱、ISIN 對照。
+    for key in [raw_code, lookup_code]:
+        key_norm = normalize_underlying_code_for_group(key) or normalize_price_code(key)
+        if not key_norm:
+            continue
+
+        known_name = get_known_underlying_name_by_code(key_norm)
+        if is_clean_underlying_display_name(known_name, key_norm):
+            return known_name
+
+        sheet_name = get_stock_name_cache_name_by_code(key_norm)
+        if is_clean_underlying_display_name(sheet_name, key_norm):
+            return sheet_name
+
+        mapped_name = get_stock_name_by_code_for_underlying_resolution(key_norm)
+        if is_clean_underlying_display_name(mapped_name, key_norm):
+            return mapped_name
+
+        warrant_cache_name = _lookup_underlying_name_from_warrant_cache_by_code(key_norm)
+        if is_clean_underlying_display_name(warrant_cache_name, key_norm):
+            return warrant_cache_name
+
+    # 4. 用權證代號對照表查標的名稱。這裡只拿名稱，不改 TOP15 原本標的股。
+    try:
+        warrant_lookup = build_warrant_underlying_lookup_from_cache()
+        cached = warrant_lookup.get(normalize_warrant_code_for_unique(warrant_code), {}) if warrant_code else {}
+        cached_name = str(cached.get("標的名稱", "") or "").strip()
+        cached_code = normalize_underlying_code_for_group(cached.get("標的股", "")) or normalize_price_code(cached.get("標的股", ""))
+        if cached_code and is_clean_underlying_display_name(cached_name, cached_code):
+            return cached_name
+    except Exception:
+        pass
+
+    # 5. 從原標的名稱 / 權證名稱辨識已知 ETF 或特殊標的。只回傳名稱，不改標的股。
+    try:
+        _, known_name = resolve_known_underlying_from_text(" ".join([raw_code, raw_name, str(warrant_name or "")]))
+        if is_clean_underlying_display_name(known_name, lookup_code or raw_code):
+            return known_name
+    except Exception:
+        pass
+
+    # 6. 從權證名稱前綴反推標的名稱。只回傳名稱，不改標的股。
+    try:
+        inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name)
+        if inferred_code and is_clean_underlying_display_name(inferred_name, inferred_code):
+            return inferred_name
+    except Exception:
+        pass
+
+    display_code = raw_code or lookup_code
+    if display_code:
+        register_underlying_name_missing(
+            display_code,
+            raw_name,
+            warrant_code=warrant_code,
+            warrant_name=warrant_name,
+            source_sheet=source_sheet,
+            context_date=context_date,
+            note="TOP15採舊程式碼標的股口徑，不改標的股，只補標的名稱；此代號仍無法解析正式名稱，請人工補進快取_股票名稱。",
+        )
+        return f"名稱待補({display_code})"
+
+    return raw_name if is_clean_underlying_display_name(raw_name, display_code) else ""
+
+def finalize_underlying_names_for_rows(rows, source_sheet, preserve_underlying_code=False):
     """
     在寫出 TOP15 / 近10日結果表前，強制補齊標的名稱。
 
     保證：只要有標的股代號，標的名稱欄位不會空白；真的補不到會顯示「名稱待補(代號)」，
     並同步寫入缺失清單，方便人工補正快取_股票名稱。
+
+    preserve_underlying_code=True 時只拿正規化後代號查名稱，但不回寫「標的股」。
+    這是給 TOP15 使用，避免補標的名稱時改到舊程式碼的 TOP15 分組與排名口徑。
     """
     if rows is None:
         return rows
@@ -3616,16 +3723,29 @@ def finalize_underlying_names_for_rows(rows, source_sheet):
         raw_code = row.get("標的股", "")
         code = normalize_underlying_code_for_group(raw_code, row.get("標的名稱", "")) or normalize_underlying_code_for_group(raw_code) or normalize_price_code(raw_code)
         if code:
-            row["標的股"] = code
-            row["標的名稱"] = resolve_underlying_name_final(
-                code,
-                row.get("標的名稱", ""),
-                warrant_code=row.get("權證代號", ""),
-                warrant_name=row.get("權證名稱", ""),
-                source_sheet=source_sheet,
-                context_date=row.get("統計日期", ""),
-                local_code_name_map=local_map,
-            )
+            if preserve_underlying_code:
+                # TOP15 排名、分組、金額必須完全沿用舊程式碼口徑。
+                # 因此這裡只補「標的名稱」，絕對不回寫「標的股」。
+                row["標的名稱"] = resolve_underlying_name_for_preserved_top15_code(
+                    raw_code,
+                    row.get("標的名稱", ""),
+                    warrant_code=row.get("權證代號", ""),
+                    warrant_name=row.get("權證名稱", ""),
+                    source_sheet=source_sheet,
+                    context_date=row.get("統計日期", ""),
+                    local_code_name_map=local_map,
+                )
+            else:
+                row["標的股"] = code
+                row["標的名稱"] = resolve_underlying_name_final(
+                    code,
+                    row.get("標的名稱", ""),
+                    warrant_code=row.get("權證代號", ""),
+                    warrant_name=row.get("權證名稱", ""),
+                    source_sheet=source_sheet,
+                    context_date=row.get("統計日期", ""),
+                    local_code_name_map=local_map,
+                )
 
     return rows
 
@@ -8181,9 +8301,6 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
         if not warrant_code or buy_amount <= 0 or buy_qty <= 0:
             return False
 
-        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name or warrant_name)
-        underlying_name = fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name)
-
         lots.append({
             "事件": event_code,
             "事件類型": event_type,
@@ -8337,13 +8454,13 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
 
 def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
     """
-    依照舊程式 TOP15 邏輯扣減賣出，讓「快取_TOP15共識淨買超」回到舊版排名口徑。
+    依照原始分點歷史資料，把近 N 日事件 lot 買進日之後的賣出股數扣掉，得到目前剩餘部位。
 
     扣減邏輯：
     - 同一分點 + 同一權證代號的 lot 依「買進日」FIFO 扣。
     - 只扣「賣出日 > 買進日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
     - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
-    - 不回溯近 N 日以前舊庫存；TOP15 定義回到舊程式的近 N 日事件部位口徑。
+    - 這裡不回溯計算 22 日以前舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
     """
     if not position_lots:
         return position_lots
@@ -8670,15 +8787,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             "分點": str(lot.get("分點", "")).strip(),
             "分點名稱": str(lot.get("分點名稱", "")).strip(),
             "券商代號": str(lot.get("券商代號", "")).strip(),
-            "標的股": normalize_underlying_for_display(lot.get("標的股", ""), lot.get("標的名稱", "") or lot.get("權證名稱", "")),
-            "標的名稱": resolve_underlying_name_final(
-                normalize_underlying_for_display(lot.get("標的股", ""), lot.get("標的名稱", "") or lot.get("權證名稱", "")),
-                lot.get("標的名稱", ""),
-                warrant_code=lot.get("權證代號", ""),
-                warrant_name=lot.get("權證名稱", ""),
-                source_sheet=TOP15_POSITION_DETAIL_SHEET,
-                context_date=target_date,
-            ),
+            "標的股": str(lot.get("標的股", "")).strip(),
+            "標的名稱": str(lot.get("標的名稱", "")).strip(),
             "事件": str(lot.get("事件", "")).strip(),
             "事件類型": str(lot.get("事件類型", "")).strip(),
             "事件日": normalize_date_str(lot.get("事件日", "")),
@@ -8744,20 +8854,10 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     agg = {}
 
     for row in detail_rows:
-        raw_underlying = str(row.get("標的股", "")).strip()
-        underlying_name = str(row.get("標的名稱", "")).strip()
-        underlying = normalize_underlying_for_display(raw_underlying, underlying_name or row.get("權證名稱", ""))
+        underlying = str(row.get("標的股", "")).strip()
         if not underlying:
             continue
 
-        underlying_name = resolve_underlying_name_final(
-            underlying,
-            underlying_name,
-            warrant_code=row.get("權證代號", ""),
-            warrant_name=row.get("權證名稱", ""),
-            source_sheet=TOP15_CONSENSUS_SHEET,
-            context_date=row.get("統計日期", ""),
-        )
         key = underlying
         rec = agg.setdefault(key, {
             "資料範圍": row.get("資料範圍", get_result_data_scope()),
@@ -8765,7 +8865,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
             "標的股": underlying,
-            "標的名稱": underlying_name,
+            "標的名稱": str(row.get("標的名稱", "")).strip(),
             "淨買超成本": 0.0,
             "可估成本": 0.0,
             "缺價格成本": 0.0,
@@ -8894,12 +8994,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "有效交易日數": rec.get("有效交易日數", ""),
             "排名": rank,
             "標的股": rec.get("標的股", ""),
-            "標的名稱": resolve_underlying_name_final(
-                rec.get("標的股", ""),
-                rec.get("標的名稱", ""),
-                source_sheet=TOP15_CONSENSUS_SHEET,
-                context_date=rec.get("統計日期", ""),
-            ),
+            "標的名稱": rec.get("標的名稱", ""),
             "淨買超成本": round(total_cost, 0),
             "可估成本": round(estimated_cost, 0),
             "缺價格成本": round(missing_cost, 0),
@@ -8923,54 +9018,6 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         })
 
     return rows
-
-
-
-def write_underlying_name_missing_sheet(wb):
-    """寫入標的名稱缺失清單，讓有股號但補不到名稱的資料可以人工補正。"""
-    ws = wb.create_sheet(UNDERLYING_NAME_MISSING_SHEET)
-
-    headers = [
-        "統計日期", "標的股", "原標的名稱", "權證代號", "權證名稱",
-        "來源表", "備註", "更新時間",
-    ]
-    ws.append(headers)
-
-    rows = sorted(
-        get_underlying_name_missing_rows(),
-        key=lambda r: (
-            str(r.get("來源表", "")),
-            str(r.get("統計日期", "")),
-            str(r.get("標的股", "")),
-            str(r.get("權證代號", "")),
-        )
-    )
-
-    for row in rows:
-        ws.append([row.get(h, "") for h in headers])
-
-    col_widths = [12, 10, 16, 12, 26, 24, 78, 20]
-    thin_gray = Side(style="thin", color="B7B7B7")
-    normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
-
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="000000")
-        cell.fill = YELLOW
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = normal_border
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = Font(color="000000")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = normal_border
-            cell.fill = ORANGE
-        ws.row_dimensions[row[0].row].height = 36
-
-    ws.freeze_panes = "A2"
 
 
 def write_top15_position_detail_sheet(wb, detail_rows):
@@ -12918,8 +12965,9 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     print("【Step 5】建立 Excel...")
 
     reset_underlying_name_missing_rows()
-    top15_detail_rows = finalize_underlying_names_for_rows(top15_detail_rows or [], TOP15_POSITION_DETAIL_SHEET)
-    top15_consensus_rows = finalize_underlying_names_for_rows(top15_consensus_rows or [], TOP15_CONSENSUS_SHEET)
+    # TOP15 排名邏輯必須完全沿用舊程式碼；這裡只補標的名稱，不改標的股代號。
+    top15_detail_rows = finalize_underlying_names_for_rows(top15_detail_rows or [], TOP15_POSITION_DETAIL_SHEET, preserve_underlying_code=True)
+    top15_consensus_rows = finalize_underlying_names_for_rows(top15_consensus_rows or [], TOP15_CONSENSUS_SHEET, preserve_underlying_code=True)
     broker_10d_detail_rows = finalize_underlying_names_for_rows(broker_10d_detail_rows, BROKER_10D_DETAIL_SHEET)
 
     wb = Workbook()
