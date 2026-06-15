@@ -4841,20 +4841,19 @@ def main():
         f"近10日分點圖指定分點：{'、'.join(broker_10d_image_brokers) if broker_10d_image_brokers else '-'}"
     )
 
+
     if action in [IMAGE_ACTION_DAILY_BUNDLE, IMAGE_ACTION_ALL]:
         history = read_history_stats_from_gsheet()
         buys, sells = extract_actions_from_gsheet(target)
 
         print(
             f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
-            f"輸出圖檔1：{output_path}\n"
-            f"輸出圖檔2：{consensus_output_path}"
+            f"輸出圖檔：{output_path}"
         )
 
         draw_report_image(target, buys, sells, history, output_path)
-        draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
         image_paths.append(output_path)
-        image_paths.append(consensus_output_path)
+    
 
     elif action == IMAGE_ACTION_CONSENSUS_BUY:
         print(f"輸出圖檔：{consensus_output_path}")
