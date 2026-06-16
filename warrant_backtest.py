@@ -8121,6 +8121,71 @@ def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, lo
     return recent_dates
 
 
+def collect_top15_recent_trading_dates_from_price_cache(price_cache, target_date=None, lookback_days=None, fallback_event_dates=None):
+    """
+    取得 TOP15 使用的近 N 個市場交易日。
+
+    修正重點：
+    TOP15 的「近一個月 / 近 22 個有效交易日」應該用市場交易日切區間，
+    不能只用 A/B/C/D 有事件的日期。若只用事件日期，五分點事件較少時會一路往前補到
+    4 月底，導致 6 月中統計期間變成 2026/04/28 ～ 2026/06/15。
+
+    這個函式只決定 TOP15 的日期窗口，不改買進 lot、賣出扣減、剩餘成本、排序與報酬率算法。
+    """
+    if lookback_days is None:
+        lookback_days = TOP15_LOOKBACK_TRADING_DAYS
+
+    try:
+        lookback_days = max(int(lookback_days), 1)
+    except Exception:
+        lookback_days = TOP15_LOOKBACK_TRADING_DAYS
+
+    target_dt = parse_date(target_date) if target_date else datetime.today()
+    if target_dt is None:
+        target_dt = datetime.today()
+
+    dates = set()
+
+    if isinstance(price_cache, dict):
+        for prices in price_cache.values():
+            if not isinstance(prices, dict):
+                continue
+
+            for date_str, price in prices.items():
+                dt = parse_date(date_str)
+                if not dt or dt > target_dt:
+                    continue
+
+                if safe_price_float(price) is None:
+                    continue
+
+                dates.add(dt.strftime("%Y/%m/%d"))
+
+    if dates:
+        sorted_dates = sorted(dates, reverse=True)
+        if len(sorted_dates) >= lookback_days:
+            return sorted_dates[:lookback_days]
+
+        # 價格快取日期不足時，以最後一個有價格的日期為錨點補週一～週五，
+        # 避免直接用 target_date 把尚未收盤 / 尚未有價格的今天放進統計期間。
+        anchor_dt = parse_date(sorted_dates[0]) or target_dt
+        cur = anchor_dt
+        while len(dates) < lookback_days and (anchor_dt - cur).days <= 120:
+            if cur.weekday() < 5:
+                dates.add(cur.strftime("%Y/%m/%d"))
+            cur -= timedelta(days=1)
+
+        return sorted(dates, reverse=True)[:lookback_days]
+
+    # 若價格快取完全沒有可用交易日，才退回舊版事件日期邏輯，避免無資料時 TOP15 整張空白。
+    fallback_event_dates = list(fallback_event_dates or [])
+    if fallback_event_dates:
+        return sorted(set(fallback_event_dates), reverse=True)[:lookback_days]
+
+    return []
+
+
+
 def _top15_return_event_date(ev, is_a=False):
     if is_a:
         return normalize_date_str(ev.get("買進日") or ev.get("事件日") or "")
@@ -8562,8 +8627,14 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    recent_dates = collect_top15_return_recent_dates(
+    fallback_recent_dates = collect_top15_return_recent_dates(
         a_events, b_events, c_events, d_events, TOP15_LOOKBACK_TRADING_DAYS
+    )
+    recent_dates = collect_top15_recent_trading_dates_from_price_cache(
+        price_cache,
+        target_date=target_date,
+        lookback_days=TOP15_LOOKBACK_TRADING_DAYS,
+        fallback_event_dates=fallback_recent_dates,
     )
 
     if not recent_dates:
