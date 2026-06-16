@@ -3593,110 +3593,6 @@ def build_local_underlying_name_map_from_rows(rows):
     return out
 
 
-
-def resolve_underlying_name_for_preserved_top15_code(
-    underlying_code,
-    underlying_name="",
-    warrant_code="",
-    warrant_name="",
-    source_sheet="",
-    context_date="",
-    local_code_name_map=None,
-):
-    """
-    TOP15 專用顯示名稱補齊。
-
-    重點：
-    - 不回寫、不修正、不正規化「標的股」欄位。
-    - 只用原本 TOP15 計算出來的標的股作為查名線索。
-    - 若原本代號因舊口徑保留成 00981 / 00631 / 00632 這類不完整代號，
-      仍可從權證名稱、已知 ETF、權證清單快取推回顯示名稱。
-    - 補不到時只輸出「名稱待補(原標的股)」，避免標的名稱空白。
-    """
-    raw_code = strip_gsheet_text_prefix(str(underlying_code or "")).strip()
-    lookup_code = (
-        normalize_underlying_code_for_group(raw_code, underlying_name)
-        or normalize_underlying_code_for_group(raw_code)
-        or normalize_price_code(raw_code)
-    )
-    raw_name = str(underlying_name or "").strip()
-    local_code_name_map = local_code_name_map or {}
-
-    # 1. 本次輸出內同代號已存在的乾淨名稱。
-    for key in [raw_code, lookup_code]:
-        key_norm = normalize_underlying_code_for_group(key) or normalize_price_code(key)
-        local_name = str(local_code_name_map.get(key_norm, "") or "").strip()
-        if is_clean_underlying_display_name(local_name, key_norm):
-            return local_name
-
-    # 2. 原 row 內已經有乾淨標的名稱時直接保留。
-    if is_clean_underlying_display_name(raw_name, lookup_code or raw_code):
-        return raw_name
-
-    # 3. 用原代號 / 查名代號直接查已知 ETF、快取_股票名稱、ISIN 對照。
-    for key in [raw_code, lookup_code]:
-        key_norm = normalize_underlying_code_for_group(key) or normalize_price_code(key)
-        if not key_norm:
-            continue
-
-        known_name = get_known_underlying_name_by_code(key_norm)
-        if is_clean_underlying_display_name(known_name, key_norm):
-            return known_name
-
-        sheet_name = get_stock_name_cache_name_by_code(key_norm)
-        if is_clean_underlying_display_name(sheet_name, key_norm):
-            return sheet_name
-
-        mapped_name = get_stock_name_by_code_for_underlying_resolution(key_norm)
-        if is_clean_underlying_display_name(mapped_name, key_norm):
-            return mapped_name
-
-        warrant_cache_name = _lookup_underlying_name_from_warrant_cache_by_code(key_norm)
-        if is_clean_underlying_display_name(warrant_cache_name, key_norm):
-            return warrant_cache_name
-
-    # 4. 用權證代號對照表查標的名稱。這裡只拿名稱，不改 TOP15 原本標的股。
-    try:
-        warrant_lookup = build_warrant_underlying_lookup_from_cache()
-        cached = warrant_lookup.get(normalize_warrant_code_for_unique(warrant_code), {}) if warrant_code else {}
-        cached_name = str(cached.get("標的名稱", "") or "").strip()
-        cached_code = normalize_underlying_code_for_group(cached.get("標的股", "")) or normalize_price_code(cached.get("標的股", ""))
-        if cached_code and is_clean_underlying_display_name(cached_name, cached_code):
-            return cached_name
-    except Exception:
-        pass
-
-    # 5. 從原標的名稱 / 權證名稱辨識已知 ETF 或特殊標的。只回傳名稱，不改標的股。
-    try:
-        _, known_name = resolve_known_underlying_from_text(" ".join([raw_code, raw_name, str(warrant_name or "")]))
-        if is_clean_underlying_display_name(known_name, lookup_code or raw_code):
-            return known_name
-    except Exception:
-        pass
-
-    # 6. 從權證名稱前綴反推標的名稱。只回傳名稱，不改標的股。
-    try:
-        inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name)
-        if inferred_code and is_clean_underlying_display_name(inferred_name, inferred_code):
-            return inferred_name
-    except Exception:
-        pass
-
-    display_code = raw_code or lookup_code
-    if display_code:
-        register_underlying_name_missing(
-            display_code,
-            raw_name,
-            warrant_code=warrant_code,
-            warrant_name=warrant_name,
-            source_sheet=source_sheet,
-            context_date=context_date,
-            note="TOP15採舊程式碼標的股口徑，不改標的股，只補標的名稱；此代號仍無法解析正式名稱，請人工補進快取_股票名稱。",
-        )
-        return f"名稱待補({display_code})"
-
-    return raw_name if is_clean_underlying_display_name(raw_name, display_code) else ""
-
 def finalize_underlying_names_for_rows(rows, source_sheet, preserve_underlying_code=False):
     """
     在寫出 TOP15 / 近10日結果表前，強制補齊標的名稱。
@@ -3723,29 +3619,17 @@ def finalize_underlying_names_for_rows(rows, source_sheet, preserve_underlying_c
         raw_code = row.get("標的股", "")
         code = normalize_underlying_code_for_group(raw_code, row.get("標的名稱", "")) or normalize_underlying_code_for_group(raw_code) or normalize_price_code(raw_code)
         if code:
-            if preserve_underlying_code:
-                # TOP15 排名、分組、金額必須完全沿用舊程式碼口徑。
-                # 因此這裡只補「標的名稱」，絕對不回寫「標的股」。
-                row["標的名稱"] = resolve_underlying_name_for_preserved_top15_code(
-                    raw_code,
-                    row.get("標的名稱", ""),
-                    warrant_code=row.get("權證代號", ""),
-                    warrant_name=row.get("權證名稱", ""),
-                    source_sheet=source_sheet,
-                    context_date=row.get("統計日期", ""),
-                    local_code_name_map=local_map,
-                )
-            else:
+            if not preserve_underlying_code:
                 row["標的股"] = code
-                row["標的名稱"] = resolve_underlying_name_final(
-                    code,
-                    row.get("標的名稱", ""),
-                    warrant_code=row.get("權證代號", ""),
-                    warrant_name=row.get("權證名稱", ""),
-                    source_sheet=source_sheet,
-                    context_date=row.get("統計日期", ""),
-                    local_code_name_map=local_map,
-                )
+            row["標的名稱"] = resolve_underlying_name_final(
+                code,
+                row.get("標的名稱", ""),
+                warrant_code=row.get("權證代號", ""),
+                warrant_name=row.get("權證名稱", ""),
+                source_sheet=source_sheet,
+                context_date=row.get("統計日期", ""),
+                local_code_name_map=local_map,
+            )
 
     return rows
 
@@ -12960,6 +12844,90 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
         ws.row_dimensions[row[0].row].height = 30
 
     ws.freeze_panes = "A2"
+
+
+def write_underlying_name_missing_sheet(wb):
+    """
+    寫出標的名稱缺失清單。
+
+    這張表只用來記錄：有標的股代號，但程式最後仍補不到正式標的名稱的資料。
+    不影響 TOP15 排名、不影響 A/B/C/D 計算。
+    """
+    sheet_name = safe_worksheet_title(UNDERLYING_NAME_MISSING_SHEET)
+
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+
+    ws = wb.create_sheet(sheet_name)
+
+    headers = [
+        "統計日期",
+        "標的股",
+        "原標的名稱",
+        "權證代號",
+        "權證名稱",
+        "來源表",
+        "備註",
+        "更新時間",
+    ]
+
+    ws.append(headers)
+
+    rows = get_underlying_name_missing_rows()
+
+    for row in rows:
+        ws.append([
+            row.get("統計日期", ""),
+            row.get("標的股", ""),
+            row.get("原標的名稱", ""),
+            row.get("權證代號", ""),
+            row.get("權證名稱", ""),
+            row.get("來源表", ""),
+            row.get("備註", ""),
+            row.get("更新時間", ""),
+        ])
+
+    header_fill = PatternFill("solid", fgColor="FFF2CC")
+    header_font = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    for row_cells in ws.iter_rows(min_row=2):
+        for cell in row_cells:
+            cell.alignment = left
+
+    widths = {
+        "A": 12,
+        "B": 12,
+        "C": 18,
+        "D": 12,
+        "E": 24,
+        "F": 22,
+        "G": 70,
+        "H": 20,
+    }
+
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    ws.freeze_panes = "A2"
+
+    if not rows:
+        ws.append([
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "目前沒有標的名稱缺失資料。",
+            datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+        ])
 
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, top15_detail_rows=None, top15_consensus_rows=None, warrant_consensus_7d_rows=None, broker_10d_detail_rows=None):
     print("【Step 5】建立 Excel...")
