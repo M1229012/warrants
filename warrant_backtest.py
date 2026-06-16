@@ -125,6 +125,10 @@ TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").stri
 # 預設不讓 RUN 失敗，而是保留淨買超成本，但該筆部位不納入報酬率估算。
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
+# 股票名稱對照表：
+# 若 Google Sheet 內已有「快取_股票名稱」，TOP15固定資料集會優先用這張表
+# 依「標的股 / 股票代號」補上「標的名稱」。若這張表不完整，會再退回快取_權證清單與 ISIN 即時清單。
+STOCK_NAME_SHEET = os.getenv("STOCK_NAME_SHEET", "快取_股票名稱").strip() or "快取_股票名稱"
 
 # 近 7 日「所有追蹤分點」權證共識買賣超 TOP15：
 # 這張工作表只會在 RUN_MODE=2 完整分點清單模式建立 / 更新。
@@ -1903,7 +1907,20 @@ def _gsheet_number_format_for_header(header):
     # 才會顯示成 +7.00%，不能用 NUMBER + 文字百分號，否則會被顯示成 +0.07%。
     #
     # 但「報酬率」這種沒有 % 符號的 TOP15 快取欄位，程式內多為 70.30 這種百分點數值，
-    # 所以不歸類為 PERCENT，仍以一般數字顯示，避免變成 7,030%。
+    # 所以不歸類為 PERCENT，否則會變成 7,030%。
+    # 這類欄位底層維持 70.30，畫面用 NUMBER + 文字百分號顯示成 +70.30%。
+    if header == "報酬率":
+        return {
+            "type": "NUMBER",
+            "pattern": '+0.00"%";-0.00"%";0.00"%"',
+        }
+
+    if header == "價格覆蓋率":
+        return {
+            "type": "NUMBER",
+            "pattern": '0.00"%"',
+        }
+
     if is_gsheet_percent_header(header):
         # 勝率 / 占比 / 比例不是報酬率，不應該顯示 + 號。
         if "勝率" in header or "占比" in header or "比例" in header:
@@ -2052,6 +2069,7 @@ GSHEET_DATE_HEADER_KEYWORDS = (
     "最近買進日",
     "第一筆日期",
     "最後筆日期",
+    "更新時間",
 )
 
 
@@ -2123,6 +2141,24 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
             continue
 
         for col_idx in date_cols:
+            header = ""
+            try:
+                row = source_rows[header_row_idx - 1]
+                header = str(row[col_idx - 1] if col_idx - 1 < len(row) else "").strip()
+            except Exception:
+                header = ""
+
+            if "時間" in header:
+                number_format = {
+                    "type": "DATE_TIME",
+                    "pattern": "yyyy/mm/dd hh:mm:ss",
+                }
+            else:
+                number_format = {
+                    "type": "DATE",
+                    "pattern": "yyyy/mm/dd",
+                }
+
             requests.append({
                 "repeatCell": {
                     "range": {
@@ -2134,10 +2170,7 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": {
-                                "type": "DATE",
-                                "pattern": "yyyy/mm/dd",
-                            }
+                            "numberFormat": number_format
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -6716,6 +6749,282 @@ def get_ma_status_cells(price_cache, underlying_code, base_date):
 
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 股票名稱對照工具：TOP15固定資料集補標的名稱用
+# ══════════════════════════════════════════════════════════════════════
+
+_UNDERLYING_NAME_MAP_CACHE = None
+_LIVE_UNDERLYING_NAME_MAP_CACHE = None
+
+
+def normalize_underlying_code_for_name_lookup(value):
+    """
+    股票 / ETF 代號查名稱用正規化。
+
+    和 normalize_underlying_code_for_group() 不同，這裡支援 00981A 這類含英文字母的 ETF 代號。
+    """
+    s = strip_gsheet_text_prefix(value)
+    s = str(s or "").strip().upper()
+
+    if not s:
+        return ""
+
+    s = s.replace("，", ",").replace(",", "").strip()
+
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+
+    m = re.match(r"^([0-9A-Z]{4,8})(?:\s|$)", s)
+    if m:
+        return m.group(1)
+
+    if re.fullmatch(r"[0-9A-Z]{4,8}", s):
+        return s
+
+    m = re.search(r"([0-9A-Z]{4,8})", s)
+    if m:
+        return m.group(1)
+
+    return normalize_underlying_code_for_group(s) or s
+
+
+def _is_stock_code_header_for_name_map(header):
+    header = str(header or "").strip()
+    if not header:
+        return False
+
+    return any(k in header for k in [
+        "股票代號", "股票代碼", "標的股", "標的代號", "標的代碼",
+        "證券代號", "證券代碼", "商品代號", "商品代碼", "代號", "代碼",
+    ])
+
+
+def _is_stock_name_header_for_name_map(header):
+    header = str(header or "").strip()
+    if not header:
+        return False
+
+    return any(k in header for k in [
+        "股票名稱", "股票名", "標的名稱", "證券名稱", "商品名稱", "名稱", "股名",
+    ])
+
+
+def _add_underlying_name_to_map(name_map, code, name, overwrite=False):
+    code_norm = normalize_underlying_code_for_name_lookup(code)
+    name = str(name or "").strip()
+
+    if not code_norm or not name:
+        return
+
+    if overwrite or code_norm not in name_map or not str(name_map.get(code_norm, "")).strip():
+        name_map[code_norm] = name
+
+
+def _rows_to_underlying_name_map(values, source_label=""):
+    name_map = {}
+
+    if not values:
+        return name_map
+
+    header_row_idx = None
+    code_col_idx = None
+    name_col_idx = None
+
+    scan_limit = min(len(values), 10)
+    for idx in range(scan_limit):
+        row = [str(x or "").strip() for x in values[idx]]
+        code_candidates = [i for i, h in enumerate(row) if _is_stock_code_header_for_name_map(h)]
+        name_candidates = [i for i, h in enumerate(row) if _is_stock_name_header_for_name_map(h)]
+
+        if code_candidates and name_candidates:
+            # 避免「代號」和「名稱」都抓到同一欄，優先選不同欄位。
+            for c_idx in code_candidates:
+                for n_idx in name_candidates:
+                    if c_idx != n_idx:
+                        header_row_idx = idx
+                        code_col_idx = c_idx
+                        name_col_idx = n_idx
+                        break
+                if header_row_idx is not None:
+                    break
+
+        if header_row_idx is not None:
+            break
+
+    # 若沒有表頭，退回前兩欄：代號、名稱。
+    if header_row_idx is None:
+        header_row_idx = -1
+        code_col_idx = 0
+        name_col_idx = 1
+
+    for raw_row in values[header_row_idx + 1:]:
+        row = list(raw_row)
+        if max(code_col_idx, name_col_idx) >= len(row):
+            continue
+
+        code = row[code_col_idx]
+        name = row[name_col_idx]
+        _add_underlying_name_to_map(name_map, code, name, overwrite=True)
+
+    if source_label and name_map:
+        print(f"  ✅ 已建立股票名稱對照：{source_label}，共 {len(name_map):,} 筆")
+
+    return name_map
+
+
+def load_stock_name_map_from_gsheet():
+    """從 Google Sheet 的「快取_股票名稱」讀取股號股名對照。"""
+    if not STOCK_NAME_SHEET:
+        return {}
+
+    if not gsheet_enabled():
+        return {}
+
+    try:
+        sh = get_gsheet_spreadsheet()
+        if sh is None:
+            return {}
+
+        ws = sh.worksheet(safe_worksheet_title(STOCK_NAME_SHEET))
+        values = ws.get_all_values()
+        name_map = _rows_to_underlying_name_map(values, source_label=STOCK_NAME_SHEET)
+        return name_map
+    except Exception:
+        return {}
+
+
+def build_underlying_name_map_from_warrants_cache():
+    """從快取_權證清單的「標的股 → 標的名稱」建立備援對照。"""
+    name_map = {}
+    warrants = load_warrants_cache()
+
+    for w in warrants or []:
+        _add_underlying_name_to_map(
+            name_map,
+            w.get("標的股", ""),
+            w.get("標的名稱", ""),
+            overwrite=False,
+        )
+
+    if name_map:
+        print(f"  ✅ 已建立股票名稱備援：快取_權證清單，共 {len(name_map):,} 筆")
+
+    return name_map
+
+
+def fetch_underlying_name_map_from_isin_live():
+    """從上市 / 上櫃 ISIN 即時清單建立最低優先備援股號股名對照。"""
+    name_map = {}
+    isin_modes = [
+        ("上市", "2"),
+        ("上櫃", "4"),
+    ]
+
+    for market_name, mode in isin_modes:
+        try:
+            resp = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            resp.encoding = "cp950"
+            tables = pd.read_html(StringIO(resp.text))
+            df = tables[0].iloc[2:].reset_index(drop=True)
+
+            for row in df.itertuples(index=False, name=None):
+                cell = str(row[0]).strip()
+
+                if "　" in cell:
+                    parts = cell.split("　", 1)
+                    code, name = parts[0].strip(), parts[1].strip()
+                else:
+                    m = re.match(r"^([0-9A-Z]{4,8})\s+(.+)$", cell, flags=re.I)
+                    if not m:
+                        continue
+                    code, name = m.group(1).strip(), m.group(2).strip()
+
+                _add_underlying_name_to_map(name_map, code, name, overwrite=False)
+
+        except Exception as e:
+            print(f"  ⚠️ {market_name} ISIN 股票名稱備援取得失敗：{type(e).__name__}: {e}")
+
+    if name_map:
+        print(f"  ✅ 已建立股票名稱備援：上市 / 上櫃 ISIN 即時清單，共 {len(name_map):,} 筆")
+
+    return name_map
+
+
+def get_underlying_name_map(load_live=False):
+    """
+    TOP15固定資料集用的標的名稱對照表。
+
+    優先順序：
+    1. 快取_股票名稱
+    2. 快取_權證清單
+    3. 上市 / 上櫃 ISIN 即時清單
+    """
+    global _UNDERLYING_NAME_MAP_CACHE, _LIVE_UNDERLYING_NAME_MAP_CACHE
+
+    if _UNDERLYING_NAME_MAP_CACHE is None:
+        merged = {}
+
+        # 低優先來源先放，高優先來源後覆蓋。
+        for code, name in build_underlying_name_map_from_warrants_cache().items():
+            _add_underlying_name_to_map(merged, code, name, overwrite=False)
+
+        for code, name in load_stock_name_map_from_gsheet().items():
+            _add_underlying_name_to_map(merged, code, name, overwrite=True)
+
+        _UNDERLYING_NAME_MAP_CACHE = merged
+
+    if load_live:
+        if _LIVE_UNDERLYING_NAME_MAP_CACHE is None:
+            _LIVE_UNDERLYING_NAME_MAP_CACHE = fetch_underlying_name_map_from_isin_live()
+
+        for code, name in (_LIVE_UNDERLYING_NAME_MAP_CACHE or {}).items():
+            _add_underlying_name_to_map(_UNDERLYING_NAME_MAP_CACHE, code, name, overwrite=False)
+
+    return _UNDERLYING_NAME_MAP_CACHE or {}
+
+
+def resolve_underlying_name(underlying_code, existing_name="", warrant_name="", allow_live_fallback=True):
+    """
+    依標的股代號補標的名稱。
+
+    existing_name 有值時優先保留；沒有值才依序查：
+    快取_股票名稱 → 快取_權證清單 → 上市 / 上櫃 ISIN。
+    """
+    existing_name = str(existing_name or "").strip()
+    if existing_name:
+        return existing_name
+
+    code_norm = normalize_underlying_code_for_name_lookup(underlying_code)
+    if not code_norm:
+        return ""
+
+    name_map = get_underlying_name_map(load_live=False)
+    name = str(name_map.get(code_norm, "") or "").strip()
+    if name:
+        return name
+
+    if allow_live_fallback:
+        name_map = get_underlying_name_map(load_live=True)
+        name = str(name_map.get(code_norm, "") or "").strip()
+        if name:
+            return name
+
+    # 最後保護：有些權證名稱以標的簡稱開頭，例如「台積電元大...購」。
+    # 若外部對照表仍缺資料，至少嘗試從權證名稱取出購之前的前綴，但不硬猜代號。
+    warrant_name = normalize_stock_name_text(warrant_name)
+    if warrant_name and "購" in warrant_name:
+        prefix = warrant_name.split("購", 1)[0].strip()
+        if 2 <= len(prefix) <= 8:
+            return prefix
+
+    return ""
+
 # ══════════════════════════════════════════════════════════════════════
 # TOP15 圖片用：固定部位明細與共識淨買超資料集
 # ══════════════════════════════════════════════════════════════════════
@@ -7322,6 +7631,13 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             return_pct = "" if return_pct_float is None else round(return_pct_float, 2)
             return_text = "-" if return_pct_float is None else f"{return_pct_float:+.2f}%"
 
+        underlying_code_for_row = str(lot.get("標的股", "")).strip()
+        underlying_name_for_row = resolve_underlying_name(
+            underlying_code_for_row,
+            lot.get("標的名稱", ""),
+            lot.get("權證名稱", ""),
+        )
+
         detail_rows.append({
             "資料範圍": get_result_data_scope(),
             "統計日期": target_date,
@@ -7330,8 +7646,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             "分點": str(lot.get("分點", "")).strip(),
             "分點名稱": str(lot.get("分點名稱", "")).strip(),
             "券商代號": str(lot.get("券商代號", "")).strip(),
-            "標的股": str(lot.get("標的股", "")).strip(),
-            "標的名稱": str(lot.get("標的名稱", "")).strip(),
+            "標的股": underlying_code_for_row,
+            "標的名稱": underlying_name_for_row,
             "事件": str(lot.get("事件", "")).strip(),
             "事件類型": str(lot.get("事件類型", "")).strip(),
             "事件日": normalize_date_str(lot.get("事件日", "")),
@@ -7402,13 +7718,19 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             continue
 
         key = underlying
+        row_underlying_name = resolve_underlying_name(
+            underlying,
+            row.get("標的名稱", ""),
+            row.get("權證名稱", ""),
+        )
+
         rec = agg.setdefault(key, {
             "資料範圍": row.get("資料範圍", get_result_data_scope()),
             "統計日期": row.get("統計日期", ""),
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
             "標的股": underlying,
-            "標的名稱": str(row.get("標的名稱", "")).strip(),
+            "標的名稱": row_underlying_name,
             "淨買超成本": 0.0,
             "可估成本": 0.0,
             "缺價格成本": 0.0,
@@ -7421,6 +7743,9 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "最新價格日期集合": set(),
             "資料狀態": "OK",
         })
+
+        if not str(rec.get("標的名稱", "")).strip() and row_underlying_name:
+            rec["標的名稱"] = row_underlying_name
 
         remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
         market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
@@ -7537,7 +7862,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "有效交易日數": rec.get("有效交易日數", ""),
             "排名": rank,
             "標的股": rec.get("標的股", ""),
-            "標的名稱": rec.get("標的名稱", ""),
+            "標的名稱": resolve_underlying_name(rec.get("標的股", ""), rec.get("標的名稱", "")),
             "淨買超成本": round(total_cost, 0),
             "可估成本": round(estimated_cost, 0),
             "缺價格成本": round(missing_cost, 0),
@@ -7633,6 +7958,8 @@ def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status
     header_map = {str(cell.value).strip(): idx + 1 for idx, cell in enumerate(ws[1])}
     return_col_idx = header_map.get(return_col_name)
     status_col_idx = header_map.get(status_col_name)
+    coverage_col_idx = header_map.get("價格覆蓋率")
+    update_time_col_idx = header_map.get("更新時間")
 
     for row in ws.iter_rows(min_row=2):
         pct = None
@@ -7663,6 +7990,13 @@ def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = normal_border
             cell.fill = row_fill
+
+        if return_col_idx:
+            row[return_col_idx - 1].number_format = '+0.00"%";-0.00"%";0.00"%"'
+        if coverage_col_idx:
+            row[coverage_col_idx - 1].number_format = '0.00"%"'
+        if update_time_col_idx:
+            row[update_time_col_idx - 1].number_format = 'yyyy/mm/dd hh:mm:ss'
 
         ws.row_dimensions[row[0].row].height = 30
 
