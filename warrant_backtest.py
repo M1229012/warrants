@@ -188,6 +188,14 @@ SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_REC
 # 下列兩個舊環境變數保留相容，但預設流程已改成「活動標的擴展 + 快取增量」。
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+# RUN_MODE=1 歷史快取修復：
+# 若「快取_分點歷史」被清空、只剩少數標的，或與精選候選池覆蓋率過低，
+# TOP15 會因為還原不到舊買進事件而漏算仍在近一個月內的部位。
+# 這時自動啟用「所有認購權證 × 精選分點」候選池，補抓缺少的 API5 歷史。
+SELECTED_HISTORY_REPAIR_ENABLED = os.getenv("SELECTED_HISTORY_REPAIR_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+SELECTED_HISTORY_REPAIR_MIN_KEYS = int(os.getenv("SELECTED_HISTORY_REPAIR_MIN_KEYS", "30"))
+SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS = int(os.getenv("SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS", "3"))
+SELECTED_HISTORY_REPAIR_COVERAGE_MIN = float(os.getenv("SELECTED_HISTORY_REPAIR_COVERAGE_MIN", "0.05"))
 EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # 全面增量更新設定：
@@ -5256,6 +5264,121 @@ def build_selected_full_market_candidates(warrants, broker_map):
     return candidates
 
 
+def selected_history_cache_repair_reason(history_df, broker_map, candidate_keys=None):
+    """
+    判斷 RUN_MODE=1 的「快取_分點歷史」是否需要完整精選候選池修復。
+
+    問題背景：
+    RUN_MODE=1 為了加速，平常只補抓 API4 近期活動標的。
+    如果歷史快取被清掉、只剩某一檔標的，或覆蓋率太低，
+    TOP15 就無法還原一個月內仍有效的舊 A/B/C/D 買進事件。
+
+    回傳：
+    - ""：不需要修復
+    - 非空字串：需要修復的原因
+    """
+    if RUN_MODE != 1:
+        return ""
+
+    if not SELECTED_HISTORY_REPAIR_ENABLED:
+        return ""
+
+    if not SELECTED_FORCE_ALL_WARRANTS:
+        return ""
+
+    if history_df is None or history_df.empty:
+        return "快取_分點歷史為空"
+
+    if not broker_map:
+        return ""
+
+    required_cols = {"權證代號", "券商代號", "標的股"}
+    if not required_cols.issubset(set(history_df.columns)):
+        return "快取_分點歷史欄位不完整"
+
+    allowed_codes = {str(code).strip() for _, code in broker_map.values() if str(code).strip()}
+    allowed_labels = {str(label).strip() for label in broker_map.keys() if str(label).strip()}
+
+    df = history_df.copy().fillna("")
+    if "分點" in df.columns:
+        mask = df["券商代號"].astype(str).str.strip().isin(allowed_codes) | df["分點"].astype(str).str.strip().isin(allowed_labels)
+    else:
+        mask = df["券商代號"].astype(str).str.strip().isin(allowed_codes)
+
+    df = df[mask].copy()
+
+    if df.empty:
+        return "快取_分點歷史沒有精選分點資料"
+
+    history_key_set = {
+        candidate_key_from_values(w, b)
+        for w, b in zip(df["權證代號"], df["券商代號"])
+    }
+    history_key_set = {key for key in history_key_set if key[0] and key[1]}
+
+    underlying_set = {
+        normalize_underlying_code_for_group(v) or str(v).strip()
+        for v in df["標的股"].tolist()
+        if str(v).strip()
+    }
+    underlying_set = {v for v in underlying_set if v}
+
+    if len(history_key_set) < max(int(SELECTED_HISTORY_REPAIR_MIN_KEYS or 0), 1):
+        return f"精選分點歷史候選過少：{len(history_key_set)} 組"
+
+    if len(underlying_set) < max(int(SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS or 0), 1):
+        return f"精選分點歷史標的過少：{len(underlying_set)} 檔"
+
+    if candidate_keys:
+        overlap = len(history_key_set & set(candidate_keys))
+        coverage = overlap / max(len(candidate_keys), 1)
+        if coverage < float(SELECTED_HISTORY_REPAIR_COVERAGE_MIN or 0):
+            return f"精選候選覆蓋率過低：{coverage:.2%}（{overlap:,}/{len(candidate_keys):,}）"
+
+    return ""
+
+
+def expand_run_mode1_candidates_for_history_repair(candidates, warrants, broker_map, history_df):
+    """
+    在 RUN_MODE=1 歷史快取不完整時，補上「所有認購權證 × 精選分點」候選。
+
+    只負責補候選與把缺歷史的 key 放入 PRESCAN_MISSING_FETCH_KEYS，
+    讓後續既有 Step 3b API5 流程自然補抓，不改 A/B/C/D 或 TOP15 計算邏輯。
+    """
+    global PRESCAN_MISSING_FETCH_KEYS
+
+    candidates = candidates or []
+    candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
+    reason = selected_history_cache_repair_reason(history_df, broker_map, candidate_keys=candidate_keys)
+
+    if not reason:
+        return candidates, False, ""
+
+    print(f"  ⚠️ 偵測到 RUN_MODE=1 歷史快取不完整：{reason}")
+    print("  🔄 啟用精選分點完整候選池修復，補抓缺少的 API5 歷史資料。")
+
+    full_candidates = build_selected_full_market_candidates(warrants, broker_map)
+    full_candidates = filter_candidates_by_broker_map(full_candidates, broker_map)
+
+    merged_candidates = merge_candidates(candidates, full_candidates)
+    merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
+
+    history_keys = history_cache_keys(history_df)
+    merged_keys = {candidate_key_from_tuple(c) for c in merged_candidates}
+    missing_keys = merged_keys - history_keys
+
+    PRESCAN_MISSING_FETCH_KEYS = set(PRESCAN_MISSING_FETCH_KEYS) | missing_keys
+
+    print(
+        f"  ✅ 歷史修復候選：原候選 {len(candidate_keys):,} 組｜"
+        f"完整精選候選 {len(full_candidates):,} 組｜"
+        f"合併後 {len(merged_candidates):,} 組｜"
+        f"缺歷史待補 {len(missing_keys):,} 組"
+    )
+
+    return merged_candidates, True, reason
+
+
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
 
@@ -5317,7 +5440,15 @@ def prescan_all(warrants, broker_map):
         else:
             print("  ⚠️ EXPAND_ACTIVE_UNDERLYING_WARRANTS=0，略過活動標的候選池擴展。")
 
+    selected_full_market_candidates = []
+    if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS and SELECTED_HISTORY_REPAIR_ENABLED and not cached_candidates:
+        # 第一次沒有精選候選快取時，直接建立完整精選候選池。
+        # 否則只靠 API4 近期活動標的，會讓初始的「快取_分點歷史」只包含少數近期熱門標的。
+        selected_full_market_candidates = build_selected_full_market_candidates(warrants, broker_map)
+        selected_full_market_candidates = filter_candidates_by_broker_map(selected_full_market_candidates, broker_map)
+
     refresh_candidates = merge_candidates(recent_candidates, expanded_candidates)
+    refresh_candidates = merge_candidates(refresh_candidates, selected_full_market_candidates)
     refresh_candidates = filter_candidates_by_broker_map(refresh_candidates, broker_map)
 
     # 只有 API4 直接掃到的候選才需要檢查是否更新；擴展候選若快取已有資料不強制刷新。
@@ -12356,11 +12487,20 @@ def main():
 
     candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
     history_cache_df = load_history_cache()
+
+    candidates, history_repair_enabled, history_repair_reason = expand_run_mode1_candidates_for_history_repair(
+        candidates,
+        warrants,
+        broker_map,
+        history_cache_df,
+    )
+    candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
+
     history_was_empty = history_cache_df is None or history_cache_df.empty
     history_keys = history_cache_keys(history_cache_df)
     history_latest_map = history_cache_latest_dates(history_cache_df)
 
-    if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty:
+    if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty and not history_repair_enabled:
         before_prune_count = len(candidates)
         keep_keys = (history_keys & candidate_keys) | PRESCAN_MISSING_FETCH_KEYS
         candidates = [c for c in candidates if candidate_key_from_tuple(c) in keep_keys]
