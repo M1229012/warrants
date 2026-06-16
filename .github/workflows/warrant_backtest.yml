@@ -35,6 +35,12 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
 
+      # Supabase 快取設定
+      # 這兩個只是把 Supabase 連線資訊傳進 GitHub Actions。
+      # 之後主程式 warrant_backtest.py 還需要改成讀寫 Supabase，才會真正生效。
+      SUPABASE_CACHE_ENABLED: "1"
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
       # 只保留三種方案：
       # 1. 精選5分點當日買賣超產圖：只跑精選 5 分點，但資料一定抓完整，確保 TOP15 正確。
       # 2. 完整資料回補與回測：跑全資料，使用既有快取補更新。
@@ -163,6 +169,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "psycopg[binary]"
 
       - name: Run warrant backtest
         shell: bash
