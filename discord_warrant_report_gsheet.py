@@ -1509,6 +1509,49 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
     })
 
 
+def dedupe_buy_actions(actions: list[dict]) -> list[dict]:
+    """
+    清理 A/B/C/D 買超事件可能重複列，避免今日買超明細金額被重複加總。
+
+    設計原則：
+    - 同一分點、同一事件、同一標的、同一權證 / 權證清單、同一來源工作表、同一金額與張數，視為重複同步資料。
+    - 只移除完全相同的重複事件，不合併不同金額，避免誤刪真正不同的買超事件。
+    """
+    if not actions:
+        return actions
+
+    seen = set()
+    out = []
+    removed = 0
+
+    for item in actions:
+        warrant_key = str(item.get("warrant_code") or item.get("warrant") or "").strip()
+        key = (
+            str(item.get("broker", "")).strip(),
+            str(item.get("event", "")).strip(),
+            str(item.get("underlying", "")).strip(),
+            warrant_key,
+            str(item.get("sheet", "")).strip(),
+            round(safe_float(item.get("amount"), 0), 4),
+            round(safe_float(item.get("qty"), 0), 4),
+        )
+
+        if key in seen:
+            removed += 1
+            continue
+
+        seen.add(key)
+        out.append(item)
+
+    if removed > 0:
+        print(
+            f"  ⚠️ 今日買超明細已去重：原始 {len(actions):,} 筆 → {len(out):,} 筆，"
+            f"移除重複買超事件 {removed:,} 筆。"
+        )
+
+    return out
+
+
 def append_sell(sells: list[dict], broker: str, status: str, event: str, underlying, warrant_name: str,
                 amount: float, qty: int, sheet_name: str, return_pct=None, buy_amount=None,
                 warrant_code: str = "", force_include: bool = False, defer_threshold: bool = False):
@@ -1592,7 +1635,8 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     # A：單檔權證大買
     try:
-        A = read_gsheet_table(SHEET_A, ["分點", "標的股", "買進日", "買進金額", "出清日"])
+        A = read_gsheet_table(SHEET_A, ["資料範圍", "分點", "標的股", "買進日", "買進金額", "出清日"])
+        A = filter_df_by_data_scope(A, DATA_SCOPE_SELECTED5)
         for _, r in A.iterrows():
             add_count_event(r, parse_date_value(r.get("買進日")), r.get("買進金額"))
     except Exception:
@@ -1607,7 +1651,8 @@ def collect_broker_underlying_add_count_map(target: date, lookback_days: int = A
 
     for sheet_name, date_col in plans:
         try:
-            df = read_gsheet_table(sheet_name, ["分點", "標的股", date_col, "買超金額", "出清日"])
+            df = read_gsheet_table(sheet_name, ["資料範圍", "分點", "標的股", date_col, "買超金額", "出清日"])
+            df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
@@ -1704,10 +1749,11 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
         A = read_gsheet_table(
             SHEET_A,
             [
-                "分點", "權證代碼", "權證代號", "權證名稱", "標的股",
+                "資料範圍", "分點", "權證代碼", "權證代號", "權證名稱", "標的股",
                 "買進日", "買進張數", "買進金額", "減碼日", "減碼獲利%", "出清日", "出清獲利%"
             ]
         )
+        A = filter_df_by_data_scope(A, DATA_SCOPE_SELECTED5)
 
         for _, r in A.iterrows():
             broker = r.get("分點", "")
@@ -1749,11 +1795,12 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
             df = read_gsheet_table(
                 sheet_name,
                 [
-                    "分點", "標的股", date_col, "權證清單",
+                    "資料範圍", "分點", "標的股", date_col, "權證清單",
                     "買超金額", "買超張數", "減碼日", "減碼獲利%",
                     "出清日", "出清獲利%"
                 ]
             )
+            df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
@@ -2173,10 +2220,11 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
     # 注意：買超明細仍維持原本 A/B/C/D 事件邏輯；
     # 賣超明細改由「每日賣出明細」讀取實際賣出金額，避免部分減碼被整筆買進張數放大。
     a_cols = [
-        "事件類型", "分點", "權證代碼", "權證代號", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
+        "資料範圍", "事件類型", "分點", "權證代碼", "權證代號", "權證名稱", "標的股", "買進日", "買進張數", "買進金額",
         "減碼日", "減碼均價", "減碼獲利%", "出清日", "出清均價", "出清獲利%"
     ]
     A = read_gsheet_table(SHEET_A, a_cols)
+    A = filter_df_by_data_scope(A, DATA_SCOPE_SELECTED5)
 
     for _, r in A.iterrows():
         broker = r.get("分點", "")
@@ -2197,13 +2245,14 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
     ]
 
     common_cols = [
-        "事件類型", "分點", "標的股", "事件日", "起始日", "結束日", "涵蓋權證數", "權證清單",
+        "資料範圍", "事件類型", "分點", "標的股", "事件日", "起始日", "結束日", "涵蓋權證數", "權證清單",
         "買超金額", "買超張數", "減碼日", "減碼賣出金額", "減碼獲利%",
         "出清日", "出清賣出金額", "出清獲利%"
     ]
 
     for sheet_name, event_date_col, event in plans:
         df = read_gsheet_table(sheet_name, common_cols)
+        df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
 
         for _, r in df.iterrows():
             broker = r.get("分點", "")
@@ -2213,6 +2262,8 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
                     buys, broker, event, r.get("標的股"), r.get("權證清單"),
                     safe_float(r.get("買超金額")), safe_int(r.get("買超張數")), sheet_name
                 )
+
+    buys = dedupe_buy_actions(buys)
 
     # 今日賣超明細一律讀取主程式產生的「每日賣出明細」。
     append_daily_sell_rows_from_gsheet(sells, target)
@@ -2931,15 +2982,16 @@ def collect_recent_buy_trading_dates(target: date, lookback_days: int = LOOKBACK
     dates = set()
 
     plans = [
-        (SHEET_A, ["分點", "買進日"]),
-        (SHEET_B, ["分點", "事件日"]),
-        (SHEET_C, ["分點", "結束日"]),
-        (SHEET_D, ["分點", "結束日"]),
+        (SHEET_A, ["資料範圍", "分點", "買進日"]),
+        (SHEET_B, ["資料範圍", "分點", "事件日"]),
+        (SHEET_C, ["資料範圍", "分點", "結束日"]),
+        (SHEET_D, ["資料範圍", "分點", "結束日"]),
     ]
 
     for sheet_name, cols in plans:
         try:
             df = read_gsheet_table(sheet_name, cols)
+            df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
