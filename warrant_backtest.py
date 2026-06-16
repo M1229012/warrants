@@ -125,10 +125,6 @@ TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").stri
 # 預設不讓 RUN 失敗，而是保留淨買超成本，但該筆部位不納入報酬率估算。
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
-# 股票名稱對照表：
-# 若 Google Sheet 內已有「快取_股票名稱」，TOP15固定資料集會優先用這張表
-# 依「標的股 / 股票代號」補上「標的名稱」。若這張表不完整，會再退回快取_權證清單與 ISIN 即時清單。
-STOCK_NAME_SHEET = os.getenv("STOCK_NAME_SHEET", "快取_股票名稱").strip() or "快取_股票名稱"
 
 # 近 7 日「所有追蹤分點」權證共識買賣超 TOP15：
 # 這張工作表只會在 RUN_MODE=2 完整分點清單模式建立 / 更新。
@@ -188,14 +184,6 @@ SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_REC
 # 下列兩個舊環境變數保留相容，但預設流程已改成「活動標的擴展 + 快取增量」。
 SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
-# RUN_MODE=1 歷史快取修復：
-# 若「快取_分點歷史」被清空、只剩少數標的，或與精選候選池覆蓋率過低，
-# TOP15 會因為還原不到舊買進事件而漏算仍在近一個月內的部位。
-# 這時自動啟用「所有認購權證 × 精選分點」候選池，補抓缺少的 API5 歷史。
-SELECTED_HISTORY_REPAIR_ENABLED = os.getenv("SELECTED_HISTORY_REPAIR_ENABLED", "1").strip().lower() not in ("0", "false", "no")
-SELECTED_HISTORY_REPAIR_MIN_KEYS = int(os.getenv("SELECTED_HISTORY_REPAIR_MIN_KEYS", "30"))
-SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS = int(os.getenv("SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS", "3"))
-SELECTED_HISTORY_REPAIR_COVERAGE_MIN = float(os.getenv("SELECTED_HISTORY_REPAIR_COVERAGE_MIN", "0.05"))
 EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # 全面增量更新設定：
@@ -1207,6 +1195,450 @@ CACHE_SHEET_NAME_MAP = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Supabase 快取同步工具（大型快取分流用）
+# ══════════════════════════════════════════════════════════════════════
+
+SUPABASE_CACHE_ENABLED = os.getenv("SUPABASE_CACHE_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+SUPABASE_SCHEMA = os.getenv("SUPABASE_SCHEMA", "warrant_cache").strip() or "warrant_cache"
+SUPABASE_BATCH_SIZE = int(os.getenv("SUPABASE_BATCH_SIZE", "5000"))
+# 啟用 Supabase 後，大型快取預設不再同步到 Google Sheet，避免 1,000 萬格上限。
+# Excel / Google Sheet 結果表仍照原本流程同步，不受影響。
+SUPABASE_CACHE_SKIP_GSHEET_SYNC = os.getenv("SUPABASE_CACHE_SKIP_GSHEET_SYNC", "1").strip().lower() not in ("0", "false", "no")
+
+_SUPABASE_AVAILABLE = None
+_SUPABASE_EMPTY_CACHE_KEYS = set()
+
+
+def supabase_enabled():
+    return bool(SUPABASE_CACHE_ENABLED and SUPABASE_DB_URL)
+
+
+def supabase_import_psycopg():
+    global _SUPABASE_AVAILABLE
+
+    if not supabase_enabled():
+        return None
+
+    if _SUPABASE_AVAILABLE is False:
+        return None
+
+    try:
+        import psycopg
+        _SUPABASE_AVAILABLE = True
+        return psycopg
+    except Exception as e:
+        _SUPABASE_AVAILABLE = False
+        print(f"  ⚠️ Supabase 快取停用：無法載入 psycopg，原因：{type(e).__name__}: {e}")
+        return None
+
+
+def get_supabase_conn():
+    psycopg = supabase_import_psycopg()
+    if psycopg is None:
+        return None
+
+    try:
+        return psycopg.connect(SUPABASE_DB_URL, connect_timeout=20)
+    except Exception as e:
+        print(f"  ⚠️ Supabase 連線失敗：{type(e).__name__}: {e}")
+        return None
+
+
+def supabase_cache_kind_and_scope(path):
+    base = os.path.basename(str(path))
+
+    if base == "price_cache.csv":
+        return "price", ""
+    if base == "broker_warrant_history_cache.csv":
+        return "history", ""
+    if base == "candidates_cache.csv":
+        return "candidates", "all"
+    if base == "candidates_cache_selected5.csv":
+        return "candidates", "selected5"
+    if base == "warrants_cache.csv":
+        return "warrants", ""
+    if base == "broker_map_cache.csv":
+        return "broker_map", "selected5" if RUN_MODE == 1 else "all"
+
+    return "", ""
+
+
+def supabase_cache_supported(path):
+    kind, _ = supabase_cache_kind_and_scope(path)
+    return bool(kind)
+
+
+def supabase_cache_identifier(path):
+    kind, scope = supabase_cache_kind_and_scope(path)
+    return f"{kind}:{scope}" if scope else kind
+
+
+def supabase_should_skip_gsheet_cache(path):
+    return bool(supabase_enabled() and SUPABASE_CACHE_SKIP_GSHEET_SYNC and supabase_cache_supported(path))
+
+
+def _supabase_date_for_db(value):
+    dt = parse_date(value)
+    return dt.strftime("%Y-%m-%d") if dt else None
+
+
+def _supabase_date_for_cache(value):
+    if value is None:
+        return ""
+    try:
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y/%m/%d")
+    except Exception:
+        pass
+    return normalize_date_str(value)
+
+
+def _supabase_int(value):
+    try:
+        if value is None:
+            return 0
+        s = str(value).replace(",", "").strip()
+        if not s or s in ("-", "None", "nan", "null"):
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def _supabase_float(value):
+    try:
+        if value is None:
+            return None
+        s = str(value).replace(",", "").strip()
+        if not s or s in ("-", "None", "nan", "null"):
+            return None
+        v = float(s)
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def _supabase_text(value):
+    if value is None:
+        return ""
+    return strip_gsheet_text_prefix(str(value)).strip()
+
+
+def _supabase_table(name):
+    # schema 與 table 名稱由程式固定產生，不吃使用者輸入值。
+    return f"{SUPABASE_SCHEMA}.{name}"
+
+
+def _supabase_fetch_dataframe(sql, params=None):
+    conn = get_supabase_conn()
+    if conn is None:
+        return pd.DataFrame()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                rows = cur.fetchall()
+                headers = [getattr(desc, "name", desc[0]) for desc in cur.description] if cur.description else []
+        if not rows or not headers:
+            return pd.DataFrame()
+        return pd.DataFrame(rows, columns=headers).fillna("")
+    except Exception as e:
+        print(f"  ⚠️ Supabase 快取讀取失敗：{type(e).__name__}: {e}")
+        return pd.DataFrame()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _supabase_executemany(sql, rows, label=""):
+    if not rows:
+        return False
+
+    conn = get_supabase_conn()
+    if conn is None:
+        return False
+
+    try:
+        total = len(rows)
+        batch_size = max(int(SUPABASE_BATCH_SIZE or 5000), 1)
+        with conn:
+            with conn.cursor() as cur:
+                for start in range(0, total, batch_size):
+                    batch = rows[start:start + batch_size]
+                    cur.executemany(sql, batch)
+                    if total >= batch_size * 2:
+                        print(f"  🗄️ Supabase 寫入中：{label} {min(start + len(batch), total):,}/{total:,}")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Supabase 快取寫入失敗：{label}，原因：{type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def read_cache_from_supabase(path):
+    if not supabase_enabled() or not supabase_cache_supported(path):
+        return pd.DataFrame()
+
+    kind, scope = supabase_cache_kind_and_scope(path)
+    cache_id = supabase_cache_identifier(path)
+
+    if kind == "price":
+        df = _supabase_fetch_dataframe(
+            f"""
+            select code as "代號",
+                   to_char(trade_date, 'YYYY/MM/DD') as "日期",
+                   close_price as "收盤價"
+            from {_supabase_table('price_cache')}
+            order by code, trade_date
+            """
+        )
+    elif kind == "history":
+        df = _supabase_fetch_dataframe(
+            f"""
+            select warrant_code as "權證代號",
+                   warrant_name as "權證名稱",
+                   underlying_code as "標的股",
+                   underlying_name as "標的名稱",
+                   broker_label as "分點",
+                   broker_name as "分點名稱",
+                   broker_code as "券商代號",
+                   to_char(trade_date, 'YYYY/MM/DD') as "日期",
+                   buy_shares as "買進股數",
+                   sell_shares as "賣出股數",
+                   buy_amount as "買進金額",
+                   sell_amount as "賣出金額",
+                   net_buy_shares as "買超股數",
+                   net_buy_amount as "買超金額"
+            from {_supabase_table('broker_warrant_history')}
+            order by warrant_code, broker_code, trade_date
+            """
+        )
+    elif kind == "candidates":
+        df = _supabase_fetch_dataframe(
+            f"""
+            select warrant_code as "權證代號",
+                   warrant_name as "權證名稱",
+                   underlying_code as "標的股",
+                   underlying_name as "標的名稱",
+                   broker_label as "分點",
+                   broker_name as "分點名稱",
+                   broker_code as "券商代號"
+            from {_supabase_table('candidates')}
+            where scope = %s
+            order by warrant_code, broker_code
+            """,
+            (scope,)
+        )
+    elif kind == "warrants":
+        df = _supabase_fetch_dataframe(
+            f"""
+            select warrant_code as "代號",
+                   warrant_name as "名稱",
+                   underlying_code as "標的股",
+                   underlying_name as "標的名稱"
+            from {_supabase_table('warrants')}
+            order by warrant_code
+            """
+        )
+    elif kind == "broker_map":
+        df = _supabase_fetch_dataframe(
+            f"""
+            select broker_label as "分點",
+                   broker_name as "分點名稱",
+                   broker_code as "券商代號"
+            from {_supabase_table('broker_map')}
+            where scope = %s
+            order by broker_label
+            """,
+            (scope,)
+        )
+    else:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        _SUPABASE_EMPTY_CACHE_KEYS.add(cache_id)
+        return pd.DataFrame()
+
+    print(f"  🗄️ 已從 Supabase 讀取快取：{cache_sheet_name_from_path(path)}，共 {len(df):,} 筆")
+    return df.fillna("")
+
+
+def write_cache_to_supabase(df, path):
+    if not supabase_enabled() or not supabase_cache_supported(path):
+        return False
+
+    if df is None or df.empty:
+        return False
+
+    kind, scope = supabase_cache_kind_and_scope(path)
+    cache_id = supabase_cache_identifier(path)
+    df2 = df.copy().fillna("")
+
+    if kind == "price":
+        rows = []
+        for row in df2.itertuples(index=False):
+            row = row._asdict()
+            code = normalize_price_code(row.get("代號", ""))
+            trade_date = _supabase_date_for_db(row.get("日期", ""))
+            close_price = _supabase_float(row.get("收盤價", ""))
+            if code and trade_date and close_price is not None:
+                rows.append((code, trade_date, close_price))
+        sql = f"""
+            insert into {_supabase_table('price_cache')} (code, trade_date, close_price, updated_at)
+            values (%s, %s, %s, now())
+            on conflict (code, trade_date) do update set
+                close_price = excluded.close_price,
+                updated_at = now()
+        """
+        label = "快取_價格"
+    elif kind == "history":
+        rows = []
+        for row in df2.itertuples(index=False):
+            row = row._asdict()
+            warrant_code = _supabase_text(row.get("權證代號", ""))
+            broker_code = _supabase_text(row.get("券商代號", ""))
+            trade_date = _supabase_date_for_db(row.get("日期", ""))
+            if not warrant_code or not broker_code or not trade_date:
+                continue
+            rows.append((
+                warrant_code,
+                _supabase_text(row.get("權證名稱", "")),
+                normalize_underlying_code_for_group(row.get("標的股", "")) or _supabase_text(row.get("標的股", "")),
+                _supabase_text(row.get("標的名稱", "")),
+                _supabase_text(row.get("分點", "")),
+                _supabase_text(row.get("分點名稱", "")),
+                broker_code,
+                trade_date,
+                _supabase_int(row.get("買進股數", 0)),
+                _supabase_int(row.get("賣出股數", 0)),
+                _supabase_int(row.get("買進金額", 0)),
+                _supabase_int(row.get("賣出金額", 0)),
+                _supabase_int(row.get("買超股數", 0)),
+                _supabase_int(row.get("買超金額", 0)),
+            ))
+        sql = f"""
+            insert into {_supabase_table('broker_warrant_history')}
+            (warrant_code, warrant_name, underlying_code, underlying_name,
+             broker_label, broker_name, broker_code, trade_date,
+             buy_shares, sell_shares, buy_amount, sell_amount,
+             net_buy_shares, net_buy_amount, updated_at)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            on conflict (warrant_code, broker_code, trade_date) do update set
+                warrant_name = excluded.warrant_name,
+                underlying_code = excluded.underlying_code,
+                underlying_name = excluded.underlying_name,
+                broker_label = excluded.broker_label,
+                broker_name = excluded.broker_name,
+                buy_shares = excluded.buy_shares,
+                sell_shares = excluded.sell_shares,
+                buy_amount = excluded.buy_amount,
+                sell_amount = excluded.sell_amount,
+                net_buy_shares = excluded.net_buy_shares,
+                net_buy_amount = excluded.net_buy_amount,
+                updated_at = now()
+        """
+        label = "快取_分點歷史"
+    elif kind == "candidates":
+        rows = []
+        for row in df2.itertuples(index=False):
+            row = row._asdict()
+            warrant_code = _supabase_text(row.get("權證代號", ""))
+            broker_code = _supabase_text(row.get("券商代號", ""))
+            if not warrant_code or not broker_code:
+                continue
+            rows.append((
+                scope,
+                warrant_code,
+                _supabase_text(row.get("權證名稱", "")),
+                normalize_underlying_code_for_group(row.get("標的股", "")) or _supabase_text(row.get("標的股", "")),
+                _supabase_text(row.get("標的名稱", "")),
+                _supabase_text(row.get("分點", "")),
+                _supabase_text(row.get("分點名稱", "")),
+                broker_code,
+            ))
+        sql = f"""
+            insert into {_supabase_table('candidates')}
+            (scope, warrant_code, warrant_name, underlying_code, underlying_name,
+             broker_label, broker_name, broker_code, updated_at)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, now())
+            on conflict (scope, warrant_code, broker_code) do update set
+                warrant_name = excluded.warrant_name,
+                underlying_code = excluded.underlying_code,
+                underlying_name = excluded.underlying_name,
+                broker_label = excluded.broker_label,
+                broker_name = excluded.broker_name,
+                updated_at = now()
+        """
+        label = f"快取_候選組合({scope})"
+    elif kind == "warrants":
+        rows = []
+        for row in df2.itertuples(index=False):
+            row = row._asdict()
+            warrant_code = _supabase_text(row.get("代號", ""))
+            if not warrant_code:
+                continue
+            rows.append((
+                warrant_code,
+                _supabase_text(row.get("名稱", "")),
+                normalize_underlying_code_for_group(row.get("標的股", "")) or _supabase_text(row.get("標的股", "")),
+                _supabase_text(row.get("標的名稱", "")),
+            ))
+        sql = f"""
+            insert into {_supabase_table('warrants')}
+            (warrant_code, warrant_name, underlying_code, underlying_name, updated_at)
+            values (%s, %s, %s, %s, now())
+            on conflict (warrant_code) do update set
+                warrant_name = excluded.warrant_name,
+                underlying_code = excluded.underlying_code,
+                underlying_name = excluded.underlying_name,
+                updated_at = now()
+        """
+        label = "快取_權證清單"
+    elif kind == "broker_map":
+        rows = []
+        for row in df2.itertuples(index=False):
+            row = row._asdict()
+            broker_label = _supabase_text(row.get("分點", ""))
+            if not broker_label:
+                continue
+            rows.append((
+                scope,
+                broker_label,
+                _supabase_text(row.get("分點名稱", "")),
+                _supabase_text(row.get("券商代號", "")),
+            ))
+        sql = f"""
+            insert into {_supabase_table('broker_map')}
+            (scope, broker_label, broker_name, broker_code, updated_at)
+            values (%s, %s, %s, %s, now())
+            on conflict (scope, broker_label) do update set
+                broker_name = excluded.broker_name,
+                broker_code = excluded.broker_code,
+                updated_at = now()
+        """
+        label = f"快取_分點代號({scope})"
+    else:
+        return False
+
+    if not rows:
+        return False
+
+    ok = _supabase_executemany(sql, rows, label=label)
+    if ok:
+        _SUPABASE_EMPTY_CACHE_KEYS.discard(cache_id)
+        print(f"  🗄️ 已同步快取到 Supabase：{label}，共 {len(rows):,} 筆")
+    return ok
+
+
 def gsheet_enabled():
     return bool(os.getenv("GCP_SERVICE_KEY", "").strip())
 
@@ -1915,20 +2347,7 @@ def _gsheet_number_format_for_header(header):
     # 才會顯示成 +7.00%，不能用 NUMBER + 文字百分號，否則會被顯示成 +0.07%。
     #
     # 但「報酬率」這種沒有 % 符號的 TOP15 快取欄位，程式內多為 70.30 這種百分點數值，
-    # 所以不歸類為 PERCENT，否則會變成 7,030%。
-    # 這類欄位底層維持 70.30，畫面用 NUMBER + 文字百分號顯示成 +70.30%。
-    if header == "報酬率":
-        return {
-            "type": "NUMBER",
-            "pattern": '+0.00"%";-0.00"%";0.00"%"',
-        }
-
-    if header == "價格覆蓋率":
-        return {
-            "type": "NUMBER",
-            "pattern": '0.00"%"',
-        }
-
+    # 所以不歸類為 PERCENT，仍以一般數字顯示，避免變成 7,030%。
     if is_gsheet_percent_header(header):
         # 勝率 / 占比 / 比例不是報酬率，不應該顯示 + 號。
         if "勝率" in header or "占比" in header or "比例" in header:
@@ -2077,7 +2496,6 @@ GSHEET_DATE_HEADER_KEYWORDS = (
     "最近買進日",
     "第一筆日期",
     "最後筆日期",
-    "更新時間",
 )
 
 
@@ -2149,24 +2567,6 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
             continue
 
         for col_idx in date_cols:
-            header = ""
-            try:
-                row = source_rows[header_row_idx - 1]
-                header = str(row[col_idx - 1] if col_idx - 1 < len(row) else "").strip()
-            except Exception:
-                header = ""
-
-            if "時間" in header:
-                number_format = {
-                    "type": "DATE_TIME",
-                    "pattern": "yyyy/mm/dd hh:mm:ss",
-                }
-            else:
-                number_format = {
-                    "type": "DATE",
-                    "pattern": "yyyy/mm/dd",
-                }
-
             requests.append({
                 "repeatCell": {
                     "range": {
@@ -2178,7 +2578,10 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": number_format
+                            "numberFormat": {
+                                "type": "DATE",
+                                "pattern": "yyyy/mm/dd",
+                            }
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -3760,6 +4163,18 @@ def read_cache_csv(path):
     if not cache_enabled():
         return pd.DataFrame()
 
+    # Supabase 啟用時，大型快取優先從 Supabase 讀取。
+    # 若 Supabase 尚未有資料，才退回原本 Google Sheet / 本機 CSV，方便第一次遷移。
+    df_from_supabase = read_cache_from_supabase(path)
+
+    if df_from_supabase is not None and not df_from_supabase.empty:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            df_from_supabase.to_csv(path, index=False, encoding=CACHE_ENCODING)
+        except Exception:
+            pass
+        return df_from_supabase
+
     # 本機執行時：優先讀本機快取，並順手上傳到 Google Sheet，方便先把本機快取種到雲端。
     # GitHub Actions 執行時：優先讀 Google Sheet 快取，因為 runner 通常是乾淨環境。
     local_first = os.getenv("GITHUB_ACTIONS", "").strip().lower() != "true"
@@ -3767,7 +4182,7 @@ def read_cache_csv(path):
     if local_first and os.path.exists(path):
         try:
             df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
-            if GSHEET_SYNC_CACHE_ON_READ:
+            if GSHEET_SYNC_CACHE_ON_READ and not supabase_should_skip_gsheet_cache(path):
                 write_cache_to_gsheet(df, path)
             return df
         except Exception as e:
@@ -3788,7 +4203,7 @@ def read_cache_csv(path):
 
     try:
         df = pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
-        if GSHEET_SYNC_CACHE_ON_READ:
+        if GSHEET_SYNC_CACHE_ON_READ and not supabase_should_skip_gsheet_cache(path):
             write_cache_to_gsheet(df, path)
         return df
     except Exception as e:
@@ -3821,14 +4236,27 @@ def write_cache_csv(df, path, sync_gsheet=True):
             with open(path, "wb") as f:
                 f.write(new_csv_bytes)
         else:
-            print(f"  ✅ 快取內容未變動，略過寫入與 Google Sheet 同步：{path}")
-            return
+            print(f"  ✅ 快取內容未變動：{path}")
     except Exception as e:
         print(f"  ⚠️ 快取寫入失敗：{path}，原因：{e}")
         return
 
+    cache_id = supabase_cache_identifier(path)
+    need_supabase_seed = cache_id in _SUPABASE_EMPTY_CACHE_KEYS
+
+    # Supabase 啟用時，大型快取寫入 Supabase。
+    # 若本機 CSV 沒變，但本次讀取時判定 Supabase 是空表，仍會補寫一次，用於第一次遷移。
+    if cache_changed or need_supabase_seed:
+        write_cache_to_supabase(df, path)
+
     if sync_gsheet:
-        write_cache_to_gsheet(df, path)
+        if supabase_should_skip_gsheet_cache(path):
+            print(f"  🗄️ 已啟用 Supabase 快取，略過大型快取同步到 Google Sheet：{cache_sheet_name_from_path(path)}")
+        else:
+            if cache_changed:
+                write_cache_to_gsheet(df, path)
+            else:
+                print(f"  ✅ 快取內容未變動，略過 Google Sheet 同步：{path}")
 
 
 def load_price_cache():
@@ -4028,7 +4456,9 @@ def save_price_cache(price_cache, changed_codes=None):
 
     if use_incremental_gsheet:
         write_cache_csv(df, PRICE_CACHE_PATH, sync_gsheet=False)
-        if not append_price_cache_rows_to_gsheet(canonical, normalized_changed_codes):
+        if supabase_should_skip_gsheet_cache(PRICE_CACHE_PATH):
+            print("  🗄️ 已啟用 Supabase 快取，略過價格快取增量同步到 Google Sheet。")
+        elif not append_price_cache_rows_to_gsheet(canonical, normalized_changed_codes):
             # 增量 append 失敗時退回原本整張同步，避免雲端價格快取落後。
             write_cache_to_gsheet(df, PRICE_CACHE_PATH)
     else:
@@ -4521,10 +4951,13 @@ def save_history_cache(history_df, fetched_items=None, previous_history_empty=Fa
     write_cache_csv(history_df, HISTORY_CACHE_PATH, sync_gsheet=do_full_gsheet_sync)
 
     if not do_full_gsheet_sync:
-        delta_rows = []
-        for item in (fetched_items or []):
-            delta_rows.extend(item_to_history_rows(item))
-        append_history_rows_to_gsheet(delta_rows)
+        if supabase_should_skip_gsheet_cache(HISTORY_CACHE_PATH):
+            print("  🗄️ 已啟用 Supabase 快取，略過原始分點歷史增量同步到 Google Sheet。")
+        else:
+            delta_rows = []
+            for item in (fetched_items or []):
+                delta_rows.extend(item_to_history_rows(item))
+            append_history_rows_to_gsheet(delta_rows)
 
     print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}，共 {len(history_df):,} 筆")
 
@@ -5264,121 +5697,6 @@ def build_selected_full_market_candidates(warrants, broker_map):
     return candidates
 
 
-def selected_history_cache_repair_reason(history_df, broker_map, candidate_keys=None):
-    """
-    判斷 RUN_MODE=1 的「快取_分點歷史」是否需要完整精選候選池修復。
-
-    問題背景：
-    RUN_MODE=1 為了加速，平常只補抓 API4 近期活動標的。
-    如果歷史快取被清掉、只剩某一檔標的，或覆蓋率太低，
-    TOP15 就無法還原一個月內仍有效的舊 A/B/C/D 買進事件。
-
-    回傳：
-    - ""：不需要修復
-    - 非空字串：需要修復的原因
-    """
-    if RUN_MODE != 1:
-        return ""
-
-    if not SELECTED_HISTORY_REPAIR_ENABLED:
-        return ""
-
-    if not SELECTED_FORCE_ALL_WARRANTS:
-        return ""
-
-    if history_df is None or history_df.empty:
-        return "快取_分點歷史為空"
-
-    if not broker_map:
-        return ""
-
-    required_cols = {"權證代號", "券商代號", "標的股"}
-    if not required_cols.issubset(set(history_df.columns)):
-        return "快取_分點歷史欄位不完整"
-
-    allowed_codes = {str(code).strip() for _, code in broker_map.values() if str(code).strip()}
-    allowed_labels = {str(label).strip() for label in broker_map.keys() if str(label).strip()}
-
-    df = history_df.copy().fillna("")
-    if "分點" in df.columns:
-        mask = df["券商代號"].astype(str).str.strip().isin(allowed_codes) | df["分點"].astype(str).str.strip().isin(allowed_labels)
-    else:
-        mask = df["券商代號"].astype(str).str.strip().isin(allowed_codes)
-
-    df = df[mask].copy()
-
-    if df.empty:
-        return "快取_分點歷史沒有精選分點資料"
-
-    history_key_set = {
-        candidate_key_from_values(w, b)
-        for w, b in zip(df["權證代號"], df["券商代號"])
-    }
-    history_key_set = {key for key in history_key_set if key[0] and key[1]}
-
-    underlying_set = {
-        normalize_underlying_code_for_group(v) or str(v).strip()
-        for v in df["標的股"].tolist()
-        if str(v).strip()
-    }
-    underlying_set = {v for v in underlying_set if v}
-
-    if len(history_key_set) < max(int(SELECTED_HISTORY_REPAIR_MIN_KEYS or 0), 1):
-        return f"精選分點歷史候選過少：{len(history_key_set)} 組"
-
-    if len(underlying_set) < max(int(SELECTED_HISTORY_REPAIR_MIN_UNDERLYINGS or 0), 1):
-        return f"精選分點歷史標的過少：{len(underlying_set)} 檔"
-
-    if candidate_keys:
-        overlap = len(history_key_set & set(candidate_keys))
-        coverage = overlap / max(len(candidate_keys), 1)
-        if coverage < float(SELECTED_HISTORY_REPAIR_COVERAGE_MIN or 0):
-            return f"精選候選覆蓋率過低：{coverage:.2%}（{overlap:,}/{len(candidate_keys):,}）"
-
-    return ""
-
-
-def expand_run_mode1_candidates_for_history_repair(candidates, warrants, broker_map, history_df):
-    """
-    在 RUN_MODE=1 歷史快取不完整時，補上「所有認購權證 × 精選分點」候選。
-
-    只負責補候選與把缺歷史的 key 放入 PRESCAN_MISSING_FETCH_KEYS，
-    讓後續既有 Step 3b API5 流程自然補抓，不改 A/B/C/D 或 TOP15 計算邏輯。
-    """
-    global PRESCAN_MISSING_FETCH_KEYS
-
-    candidates = candidates or []
-    candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
-    reason = selected_history_cache_repair_reason(history_df, broker_map, candidate_keys=candidate_keys)
-
-    if not reason:
-        return candidates, False, ""
-
-    print(f"  ⚠️ 偵測到 RUN_MODE=1 歷史快取不完整：{reason}")
-    print("  🔄 啟用精選分點完整候選池修復，補抓缺少的 API5 歷史資料。")
-
-    full_candidates = build_selected_full_market_candidates(warrants, broker_map)
-    full_candidates = filter_candidates_by_broker_map(full_candidates, broker_map)
-
-    merged_candidates = merge_candidates(candidates, full_candidates)
-    merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
-
-    history_keys = history_cache_keys(history_df)
-    merged_keys = {candidate_key_from_tuple(c) for c in merged_candidates}
-    missing_keys = merged_keys - history_keys
-
-    PRESCAN_MISSING_FETCH_KEYS = set(PRESCAN_MISSING_FETCH_KEYS) | missing_keys
-
-    print(
-        f"  ✅ 歷史修復候選：原候選 {len(candidate_keys):,} 組｜"
-        f"完整精選候選 {len(full_candidates):,} 組｜"
-        f"合併後 {len(merged_candidates):,} 組｜"
-        f"缺歷史待補 {len(missing_keys):,} 組"
-    )
-
-    return merged_candidates, True, reason
-
-
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
 
@@ -5440,15 +5758,7 @@ def prescan_all(warrants, broker_map):
         else:
             print("  ⚠️ EXPAND_ACTIVE_UNDERLYING_WARRANTS=0，略過活動標的候選池擴展。")
 
-    selected_full_market_candidates = []
-    if RUN_MODE == 1 and SELECTED_FORCE_ALL_WARRANTS and SELECTED_HISTORY_REPAIR_ENABLED and not cached_candidates:
-        # 第一次沒有精選候選快取時，直接建立完整精選候選池。
-        # 否則只靠 API4 近期活動標的，會讓初始的「快取_分點歷史」只包含少數近期熱門標的。
-        selected_full_market_candidates = build_selected_full_market_candidates(warrants, broker_map)
-        selected_full_market_candidates = filter_candidates_by_broker_map(selected_full_market_candidates, broker_map)
-
     refresh_candidates = merge_candidates(recent_candidates, expanded_candidates)
-    refresh_candidates = merge_candidates(refresh_candidates, selected_full_market_candidates)
     refresh_candidates = filter_candidates_by_broker_map(refresh_candidates, broker_map)
 
     # 只有 API4 直接掃到的候選才需要檢查是否更新；擴展候選若快取已有資料不強制刷新。
@@ -6880,282 +7190,6 @@ def get_ma_status_cells(price_cache, underlying_code, base_date):
 
 
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 股票名稱對照工具：TOP15固定資料集補標的名稱用
-# ══════════════════════════════════════════════════════════════════════
-
-_UNDERLYING_NAME_MAP_CACHE = None
-_LIVE_UNDERLYING_NAME_MAP_CACHE = None
-
-
-def normalize_underlying_code_for_name_lookup(value):
-    """
-    股票 / ETF 代號查名稱用正規化。
-
-    和 normalize_underlying_code_for_group() 不同，這裡支援 00981A 這類含英文字母的 ETF 代號。
-    """
-    s = strip_gsheet_text_prefix(value)
-    s = str(s or "").strip().upper()
-
-    if not s:
-        return ""
-
-    s = s.replace("，", ",").replace(",", "").strip()
-
-    if s.endswith(".0") and s[:-2].isdigit():
-        s = s[:-2]
-
-    m = re.match(r"^([0-9A-Z]{4,8})(?:\s|$)", s)
-    if m:
-        return m.group(1)
-
-    if re.fullmatch(r"[0-9A-Z]{4,8}", s):
-        return s
-
-    m = re.search(r"([0-9A-Z]{4,8})", s)
-    if m:
-        return m.group(1)
-
-    return normalize_underlying_code_for_group(s) or s
-
-
-def _is_stock_code_header_for_name_map(header):
-    header = str(header or "").strip()
-    if not header:
-        return False
-
-    return any(k in header for k in [
-        "股票代號", "股票代碼", "標的股", "標的代號", "標的代碼",
-        "證券代號", "證券代碼", "商品代號", "商品代碼", "代號", "代碼",
-    ])
-
-
-def _is_stock_name_header_for_name_map(header):
-    header = str(header or "").strip()
-    if not header:
-        return False
-
-    return any(k in header for k in [
-        "股票名稱", "股票名", "標的名稱", "證券名稱", "商品名稱", "名稱", "股名",
-    ])
-
-
-def _add_underlying_name_to_map(name_map, code, name, overwrite=False):
-    code_norm = normalize_underlying_code_for_name_lookup(code)
-    name = str(name or "").strip()
-
-    if not code_norm or not name:
-        return
-
-    if overwrite or code_norm not in name_map or not str(name_map.get(code_norm, "")).strip():
-        name_map[code_norm] = name
-
-
-def _rows_to_underlying_name_map(values, source_label=""):
-    name_map = {}
-
-    if not values:
-        return name_map
-
-    header_row_idx = None
-    code_col_idx = None
-    name_col_idx = None
-
-    scan_limit = min(len(values), 10)
-    for idx in range(scan_limit):
-        row = [str(x or "").strip() for x in values[idx]]
-        code_candidates = [i for i, h in enumerate(row) if _is_stock_code_header_for_name_map(h)]
-        name_candidates = [i for i, h in enumerate(row) if _is_stock_name_header_for_name_map(h)]
-
-        if code_candidates and name_candidates:
-            # 避免「代號」和「名稱」都抓到同一欄，優先選不同欄位。
-            for c_idx in code_candidates:
-                for n_idx in name_candidates:
-                    if c_idx != n_idx:
-                        header_row_idx = idx
-                        code_col_idx = c_idx
-                        name_col_idx = n_idx
-                        break
-                if header_row_idx is not None:
-                    break
-
-        if header_row_idx is not None:
-            break
-
-    # 若沒有表頭，退回前兩欄：代號、名稱。
-    if header_row_idx is None:
-        header_row_idx = -1
-        code_col_idx = 0
-        name_col_idx = 1
-
-    for raw_row in values[header_row_idx + 1:]:
-        row = list(raw_row)
-        if max(code_col_idx, name_col_idx) >= len(row):
-            continue
-
-        code = row[code_col_idx]
-        name = row[name_col_idx]
-        _add_underlying_name_to_map(name_map, code, name, overwrite=True)
-
-    if source_label and name_map:
-        print(f"  ✅ 已建立股票名稱對照：{source_label}，共 {len(name_map):,} 筆")
-
-    return name_map
-
-
-def load_stock_name_map_from_gsheet():
-    """從 Google Sheet 的「快取_股票名稱」讀取股號股名對照。"""
-    if not STOCK_NAME_SHEET:
-        return {}
-
-    if not gsheet_enabled():
-        return {}
-
-    try:
-        sh = get_gsheet_spreadsheet()
-        if sh is None:
-            return {}
-
-        ws = sh.worksheet(safe_worksheet_title(STOCK_NAME_SHEET))
-        values = ws.get_all_values()
-        name_map = _rows_to_underlying_name_map(values, source_label=STOCK_NAME_SHEET)
-        return name_map
-    except Exception:
-        return {}
-
-
-def build_underlying_name_map_from_warrants_cache():
-    """從快取_權證清單的「標的股 → 標的名稱」建立備援對照。"""
-    name_map = {}
-    warrants = load_warrants_cache()
-
-    for w in warrants or []:
-        _add_underlying_name_to_map(
-            name_map,
-            w.get("標的股", ""),
-            w.get("標的名稱", ""),
-            overwrite=False,
-        )
-
-    if name_map:
-        print(f"  ✅ 已建立股票名稱備援：快取_權證清單，共 {len(name_map):,} 筆")
-
-    return name_map
-
-
-def fetch_underlying_name_map_from_isin_live():
-    """從上市 / 上櫃 ISIN 即時清單建立最低優先備援股號股名對照。"""
-    name_map = {}
-    isin_modes = [
-        ("上市", "2"),
-        ("上櫃", "4"),
-    ]
-
-    for market_name, mode in isin_modes:
-        try:
-            resp = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            resp.encoding = "cp950"
-            tables = pd.read_html(StringIO(resp.text))
-            df = tables[0].iloc[2:].reset_index(drop=True)
-
-            for row in df.itertuples(index=False, name=None):
-                cell = str(row[0]).strip()
-
-                if "　" in cell:
-                    parts = cell.split("　", 1)
-                    code, name = parts[0].strip(), parts[1].strip()
-                else:
-                    m = re.match(r"^([0-9A-Z]{4,8})\s+(.+)$", cell, flags=re.I)
-                    if not m:
-                        continue
-                    code, name = m.group(1).strip(), m.group(2).strip()
-
-                _add_underlying_name_to_map(name_map, code, name, overwrite=False)
-
-        except Exception as e:
-            print(f"  ⚠️ {market_name} ISIN 股票名稱備援取得失敗：{type(e).__name__}: {e}")
-
-    if name_map:
-        print(f"  ✅ 已建立股票名稱備援：上市 / 上櫃 ISIN 即時清單，共 {len(name_map):,} 筆")
-
-    return name_map
-
-
-def get_underlying_name_map(load_live=False):
-    """
-    TOP15固定資料集用的標的名稱對照表。
-
-    優先順序：
-    1. 快取_股票名稱
-    2. 快取_權證清單
-    3. 上市 / 上櫃 ISIN 即時清單
-    """
-    global _UNDERLYING_NAME_MAP_CACHE, _LIVE_UNDERLYING_NAME_MAP_CACHE
-
-    if _UNDERLYING_NAME_MAP_CACHE is None:
-        merged = {}
-
-        # 低優先來源先放，高優先來源後覆蓋。
-        for code, name in build_underlying_name_map_from_warrants_cache().items():
-            _add_underlying_name_to_map(merged, code, name, overwrite=False)
-
-        for code, name in load_stock_name_map_from_gsheet().items():
-            _add_underlying_name_to_map(merged, code, name, overwrite=True)
-
-        _UNDERLYING_NAME_MAP_CACHE = merged
-
-    if load_live:
-        if _LIVE_UNDERLYING_NAME_MAP_CACHE is None:
-            _LIVE_UNDERLYING_NAME_MAP_CACHE = fetch_underlying_name_map_from_isin_live()
-
-        for code, name in (_LIVE_UNDERLYING_NAME_MAP_CACHE or {}).items():
-            _add_underlying_name_to_map(_UNDERLYING_NAME_MAP_CACHE, code, name, overwrite=False)
-
-    return _UNDERLYING_NAME_MAP_CACHE or {}
-
-
-def resolve_underlying_name(underlying_code, existing_name="", warrant_name="", allow_live_fallback=True):
-    """
-    依標的股代號補標的名稱。
-
-    existing_name 有值時優先保留；沒有值才依序查：
-    快取_股票名稱 → 快取_權證清單 → 上市 / 上櫃 ISIN。
-    """
-    existing_name = str(existing_name or "").strip()
-    if existing_name:
-        return existing_name
-
-    code_norm = normalize_underlying_code_for_name_lookup(underlying_code)
-    if not code_norm:
-        return ""
-
-    name_map = get_underlying_name_map(load_live=False)
-    name = str(name_map.get(code_norm, "") or "").strip()
-    if name:
-        return name
-
-    if allow_live_fallback:
-        name_map = get_underlying_name_map(load_live=True)
-        name = str(name_map.get(code_norm, "") or "").strip()
-        if name:
-            return name
-
-    # 最後保護：有些權證名稱以標的簡稱開頭，例如「台積電元大...購」。
-    # 若外部對照表仍缺資料，至少嘗試從權證名稱取出購之前的前綴，但不硬猜代號。
-    warrant_name = normalize_stock_name_text(warrant_name)
-    if warrant_name and "購" in warrant_name:
-        prefix = warrant_name.split("購", 1)[0].strip()
-        if 2 <= len(prefix) <= 8:
-            return prefix
-
-    return ""
-
 # ══════════════════════════════════════════════════════════════════════
 # TOP15 圖片用：固定部位明細與共識淨買超資料集
 # ══════════════════════════════════════════════════════════════════════
@@ -7762,13 +7796,6 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             return_pct = "" if return_pct_float is None else round(return_pct_float, 2)
             return_text = "-" if return_pct_float is None else f"{return_pct_float:+.2f}%"
 
-        underlying_code_for_row = str(lot.get("標的股", "")).strip()
-        underlying_name_for_row = resolve_underlying_name(
-            underlying_code_for_row,
-            lot.get("標的名稱", ""),
-            lot.get("權證名稱", ""),
-        )
-
         detail_rows.append({
             "資料範圍": get_result_data_scope(),
             "統計日期": target_date,
@@ -7777,8 +7804,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             "分點": str(lot.get("分點", "")).strip(),
             "分點名稱": str(lot.get("分點名稱", "")).strip(),
             "券商代號": str(lot.get("券商代號", "")).strip(),
-            "標的股": underlying_code_for_row,
-            "標的名稱": underlying_name_for_row,
+            "標的股": str(lot.get("標的股", "")).strip(),
+            "標的名稱": str(lot.get("標的名稱", "")).strip(),
             "事件": str(lot.get("事件", "")).strip(),
             "事件類型": str(lot.get("事件類型", "")).strip(),
             "事件日": normalize_date_str(lot.get("事件日", "")),
@@ -7849,19 +7876,13 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             continue
 
         key = underlying
-        row_underlying_name = resolve_underlying_name(
-            underlying,
-            row.get("標的名稱", ""),
-            row.get("權證名稱", ""),
-        )
-
         rec = agg.setdefault(key, {
             "資料範圍": row.get("資料範圍", get_result_data_scope()),
             "統計日期": row.get("統計日期", ""),
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
             "標的股": underlying,
-            "標的名稱": row_underlying_name,
+            "標的名稱": str(row.get("標的名稱", "")).strip(),
             "淨買超成本": 0.0,
             "可估成本": 0.0,
             "缺價格成本": 0.0,
@@ -7874,9 +7895,6 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "最新價格日期集合": set(),
             "資料狀態": "OK",
         })
-
-        if not str(rec.get("標的名稱", "")).strip() and row_underlying_name:
-            rec["標的名稱"] = row_underlying_name
 
         remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
         market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
@@ -7993,7 +8011,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "有效交易日數": rec.get("有效交易日數", ""),
             "排名": rank,
             "標的股": rec.get("標的股", ""),
-            "標的名稱": resolve_underlying_name(rec.get("標的股", ""), rec.get("標的名稱", "")),
+            "標的名稱": rec.get("標的名稱", ""),
             "淨買超成本": round(total_cost, 0),
             "可估成本": round(estimated_cost, 0),
             "缺價格成本": round(missing_cost, 0),
@@ -8089,8 +8107,6 @@ def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status
     header_map = {str(cell.value).strip(): idx + 1 for idx, cell in enumerate(ws[1])}
     return_col_idx = header_map.get(return_col_name)
     status_col_idx = header_map.get(status_col_name)
-    coverage_col_idx = header_map.get("價格覆蓋率")
-    update_time_col_idx = header_map.get("更新時間")
 
     for row in ws.iter_rows(min_row=2):
         pct = None
@@ -8121,13 +8137,6 @@ def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = normal_border
             cell.fill = row_fill
-
-        if return_col_idx:
-            row[return_col_idx - 1].number_format = '+0.00"%";-0.00"%";0.00"%"'
-        if coverage_col_idx:
-            row[coverage_col_idx - 1].number_format = '0.00"%"'
-        if update_time_col_idx:
-            row[update_time_col_idx - 1].number_format = 'yyyy/mm/dd hh:mm:ss'
 
         ws.row_dimensions[row[0].row].height = 30
 
@@ -10141,76 +10150,6 @@ def _near10_window_dates(target_date=None, window_days=None):
     return target_date, target_dt, start_date, start_dt, window_days, period_text
 
 
-def _collect_item_trade_dates_for_10d(items, target_dt):
-    """
-    從 API5 / 快取_分點歷史還原出的 items 收集實際交易日。
-
-    近10日分點買賣明細的「近10日」必須使用最近 N 個交易日，
-    不可再用 target_date 往前推 N 個日曆天。
-    這裡以權證分點歷史資料中的日期作為交易日來源；API5 通常會回傳交易日序列，
-    因此買賣統計、權證篩選與母股10日漲跌幅會共用同一組交易日。
-    """
-    trade_dates = set()
-
-    for item in items or []:
-        df = item.get("df", pd.DataFrame())
-        if df is None or df.empty or "日期" not in df.columns:
-            continue
-
-        for raw_date in df["日期"].tolist():
-            date_str = normalize_date_str(raw_date)
-            dt = parse_date(date_str)
-            if not dt:
-                continue
-            if target_dt and dt > target_dt:
-                continue
-            trade_dates.add(dt.strftime("%Y/%m/%d"))
-
-    return sorted(trade_dates)
-
-
-def _near10_trading_window_dates(items, target_date=None, window_days=None, effective_target_from_data=False):
-    """
-    近10日分點買賣明細專用日期視窗。
-
-    回傳最近 N 個「交易日」而不是 N 個日曆天。
-    - items 有交易日資料時：取 target_date 以前最近 N 個交易日。
-    - items 暫時沒有交易日資料時：退回舊的日曆天視窗，避免流程中斷。
-    - effective_target_from_data=True 時，統計日期會改成資料內最後一個交易日，
-      避免週末 / 分點資料尚未更新時把統計日期誤標成沒有交易資料的日期。
-    """
-    target_date = normalize_top15_target_date(target_date)
-    target_dt = parse_date(target_date)
-
-    if not target_dt:
-        target_dt = datetime.today()
-        target_date = target_dt.strftime("%Y/%m/%d")
-
-    if window_days is None:
-        window_days = BROKER_10D_DETAIL_DAYS
-
-    window_days = max(int(window_days), 1)
-    trade_dates = _collect_item_trade_dates_for_10d(items, target_dt)
-
-    if not trade_dates:
-        fallback = _near10_window_dates(target_date, window_days)
-        return (*fallback, set())
-
-    recent_dates = trade_dates[-window_days:]
-    start_date = recent_dates[0]
-    period_end_date = recent_dates[-1]
-
-    if effective_target_from_data:
-        target_date = period_end_date
-        target_dt = parse_date(target_date) or target_dt
-
-    start_dt = parse_date(start_date) or target_dt
-    actual_window_days = len(recent_dates)
-    period_text = f"{start_date} ～ {period_end_date}"
-
-    return target_date, target_dt, start_date, start_dt, actual_window_days, period_text, set(recent_dates)
-
-
 def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     """
     收集近10日分點買賣明細會用到的標的股代號。
@@ -10218,7 +10157,7 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     圖卡新增「現股10日」後，不能只補權證最新價；
     若分點資料仍停在前一交易日，但盤後現股價格已更新，這裡會先把近10日有買賣的標的股最新收盤價補進快取。
     """
-    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
 
     for item in items or []:
@@ -10236,7 +10175,7 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or date_str not in trading_date_set:
+            if not dt or dt < start_dt or dt > target_dt:
                 continue
 
             buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
@@ -10269,10 +10208,11 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
         print("  ✅ 近10日分點明細沒有需要預抓的標的股價格。")
         return price_cache
 
-    target_date, target_dt, near10_start_date, near10_start_dt, near10_window_days, near10_period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
+    target_date = normalize_top15_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
     end_dt = min(target_dt, datetime.today())
     lookback_days = max(int(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
-    start_dt = min(near10_start_dt, target_dt - timedelta(days=lookback_days))
+    start_dt = target_dt - timedelta(days=lookback_days)
 
     persistent_price_cache = load_price_cache()
     fetch_plan = {}
@@ -10376,7 +10316,7 @@ def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
 
 
 def _collect_recent_warrant_codes_for_10d(items, target_date=None):
-    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
     skipped_no_remaining_position = 0
     skipped_sell_has_cost = 0
@@ -10400,7 +10340,7 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None):
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or date_str not in trading_date_set:
+            if not dt or dt < start_dt or dt > target_dt:
                 continue
 
             buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
@@ -10470,7 +10410,8 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     if not codes:
         return price_cache
 
-    target_date, target_dt, near10_start_date, near10_start_dt, near10_window_days, near10_period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
+    target_date = normalize_top15_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
     end_dt = min(target_dt, datetime.today())
 
     full_lookback_days = max(int(BROKER_10D_PRICE_LOOKBACK_DAYS), 1)
@@ -10804,7 +10745,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         print("  ⚠️ 近10日分點買賣明細：沒有 items 資料")
         return []
 
-    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date, effective_target_from_data=True)
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     scope = get_result_data_scope()
@@ -10879,7 +10820,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or date_str not in trading_date_set:
+            if not dt or dt < start_dt or dt > target_dt:
                 continue
 
             buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
@@ -11300,7 +11241,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         rows,
         key=lambda r: (
             str(r.get("分點", "")),
-            -float(r.get("近10日淨買超金額", 0) or 0),
+            -abs(float(r.get("近10日淨買超金額", 0) or 0)),
             str(r.get("標的股", "")),
         )
     )
@@ -12555,20 +12496,11 @@ def main():
 
     candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
     history_cache_df = load_history_cache()
-
-    candidates, history_repair_enabled, history_repair_reason = expand_run_mode1_candidates_for_history_repair(
-        candidates,
-        warrants,
-        broker_map,
-        history_cache_df,
-    )
-    candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
-
     history_was_empty = history_cache_df is None or history_cache_df.empty
     history_keys = history_cache_keys(history_cache_df)
     history_latest_map = history_cache_latest_dates(history_cache_df)
 
-    if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty and not history_repair_enabled:
+    if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty:
         before_prune_count = len(candidates)
         keep_keys = (history_keys & candidate_keys) | PRESCAN_MISSING_FETCH_KEYS
         candidates = [c for c in candidates if candidate_key_from_tuple(c) in keep_keys]
