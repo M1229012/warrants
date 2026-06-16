@@ -79,6 +79,7 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("STOCK_BRANCH_WORKERS", "18
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 REQUEST_RETRY = int(os.getenv("REQUEST_RETRY", "2"))
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", os.getenv("STOCK_LOOKBACK_DAYS", "31")))
+WEEK_LOOKBACK_DAYS = int(os.getenv("WEEK_LOOKBACK_DAYS", os.getenv("STOCK_WEEK_LOOKBACK_DAYS", "7")))
 STOCK_LIMIT = int(os.getenv("STOCK_LIMIT", "0"))
 INCLUDE_ETF = os.getenv("INCLUDE_ETF", "0").strip().lower() in ("1", "true", "yes")
 REFRESH_STOCK_LIST = os.getenv("REFRESH_STOCK_LIST", "1").strip().lower() not in ("0", "false", "no")
@@ -948,7 +949,273 @@ def build_color_note():
         {"類別": "賣超", "說明": "買賣超股數 < 0，Excel/Google Sheet 排名以賣超由大到小。"},
         {"類別": "估算金額", "說明": "MoneyDJ 此 API 回傳股數與收盤價，本程式使用 股數 × 收盤價 估算金額，不是逐筆成交均價。"},
         {"類別": "資料限制", "說明": "目前 API 回傳 TOP15 + TOP15，不等於所有分點完整資料。"},
+        {"類別": "新增統計", "說明": "近1月追蹤分點TOP20、近1月個別分點TOP15使用追蹤分點命中資料；近1週股票買超TOP20使用所有分點進入買超榜的資料彙總成股票排名，不列出個別分點。"},
     ])
+
+
+def get_start_date_by_lookback(end_date, days):
+    end_dt = parse_date(end_date)
+    if end_dt is None:
+        end_dt = datetime.today()
+    return fmt_date(end_dt - timedelta(days=int(days)))
+
+
+def normalize_ranking_numeric_columns(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df2 = df.copy()
+    numeric_cols = [
+        "買進股數", "賣出股數", "買進張數", "賣出張數", "買賣超股數", "買賣超張數",
+        "收盤價", "估算買進金額", "估算賣出金額", "估算買賣超金額", "成交比重%", "區間總成交股數",
+    ]
+    for col in numeric_cols:
+        if col in df2.columns:
+            df2[col] = pd.to_numeric(df2[col], errors="coerce").fillna(0)
+    return df2
+
+
+def join_unique_text(values):
+    seen = []
+    for value in values:
+        s = str(value).strip()
+        if not s or s == "nan":
+            continue
+        if s not in seen:
+            seen.append(s)
+    return "、".join(seen)
+
+
+def first_non_empty(values):
+    for value in values:
+        s = str(value).strip()
+        if s and s != "nan":
+            return s
+    return ""
+
+
+def build_target_broker_month_stock_top20(hit_df):
+    """
+    近1個月這些追蹤分點的買超 / 賣超 TOP20。
+    這張表會先把同一檔股票、不同追蹤分點的金額合併，再分成買超TOP20與賣超TOP20。
+    """
+    if hit_df is None or hit_df.empty:
+        return pd.DataFrame()
+
+    df = normalize_ranking_numeric_columns(hit_df)
+    if df.empty:
+        return pd.DataFrame()
+
+    required_cols = ["市場", "股票代號", "股票名稱", "分點標籤", "分點代號", "分點名稱"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    grouped_rows = []
+    group_cols = ["市場", "股票代號", "股票名稱"]
+
+    for keys, g in df.groupby(group_cols, dropna=False):
+        market, stock_code, stock_name = keys
+        net_amount = g["估算買賣超金額"].sum()
+        net_shares = g["買賣超股數"].sum()
+        net_lots = g["買賣超張數"].sum()
+
+        direction = "買超" if net_amount > 0 else "賣超" if net_amount < 0 else "平盤"
+
+        grouped_rows.append({
+            "市場": market,
+            "股票代號": stock_code,
+            "股票名稱": stock_name,
+            "方向": direction,
+            "命中分點數": g["分點代號"].astype(str).str.strip().replace("", pd.NA).dropna().nunique(),
+            "命中分點": join_unique_text(g["分點名稱"].tolist()),
+            "買進股數": int(round(g["買進股數"].sum())),
+            "賣出股數": int(round(g["賣出股數"].sum())),
+            "買賣超股數": int(round(net_shares)),
+            "買進張數": round(g["買進張數"].sum(), 3),
+            "賣出張數": round(g["賣出張數"].sum(), 3),
+            "買賣超張數": round(net_lots, 3),
+            "估算買進金額": int(round(g["估算買進金額"].sum())),
+            "估算賣出金額": int(round(g["估算賣出金額"].sum())),
+            "估算買賣超金額": int(round(net_amount)),
+            "資料筆數": len(g),
+        })
+
+    summary = pd.DataFrame(grouped_rows)
+    if summary.empty:
+        return summary
+
+    buy = summary[summary["估算買賣超金額"] > 0].copy()
+    buy = buy.sort_values(["估算買賣超金額", "買賣超張數"], ascending=[False, False]).head(20).reset_index(drop=True)
+    if not buy.empty:
+        buy.insert(0, "榜別", "買超TOP20")
+        buy.insert(1, "排名", range(1, len(buy) + 1))
+
+    sell = summary[summary["估算買賣超金額"] < 0].copy()
+    sell = sell.sort_values(["估算買賣超金額", "買賣超張數"], ascending=[True, True]).head(20).reset_index(drop=True)
+    if not sell.empty:
+        sell.insert(0, "榜別", "賣超TOP20")
+        sell.insert(1, "排名", range(1, len(sell) + 1))
+
+    result = pd.concat([buy, sell], ignore_index=True)
+    return result.fillna("") if not result.empty else pd.DataFrame()
+
+
+def build_individual_broker_month_stock_top15(hit_df):
+    """
+    個別追蹤分點近1個月買超 / 賣超 TOP15。
+    每個分點各自統計，不會把不同分點混在一起排名。
+    """
+    if hit_df is None or hit_df.empty:
+        return pd.DataFrame()
+
+    df = normalize_ranking_numeric_columns(hit_df)
+    if df.empty:
+        return pd.DataFrame()
+
+    required_cols = ["分點標籤", "分點代號", "分點名稱", "市場", "股票代號", "股票名稱"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    group_cols = ["分點標籤", "分點代號", "分點名稱", "市場", "股票代號", "股票名稱"]
+    summary = df.groupby(group_cols, dropna=False).agg({
+        "買進股數": "sum",
+        "賣出股數": "sum",
+        "買賣超股數": "sum",
+        "買進張數": "sum",
+        "賣出張數": "sum",
+        "買賣超張數": "sum",
+        "估算買進金額": "sum",
+        "估算賣出金額": "sum",
+        "估算買賣超金額": "sum",
+    }).reset_index()
+
+    if summary.empty:
+        return pd.DataFrame()
+
+    summary["方向"] = summary["估算買賣超金額"].map(lambda x: "買超" if x > 0 else "賣超" if x < 0 else "平盤")
+
+    result_parts = []
+    broker_order = list(TARGET_BROKERS.keys())
+
+    for broker_label in broker_order:
+        broker_df = summary[summary["分點標籤"] == broker_label].copy()
+        if broker_df.empty:
+            continue
+
+        buy = broker_df[broker_df["估算買賣超金額"] > 0].copy()
+        buy = buy.sort_values(["估算買賣超金額", "買賣超張數"], ascending=[False, False]).head(15).reset_index(drop=True)
+        if not buy.empty:
+            buy.insert(0, "榜別", "買超TOP15")
+            buy.insert(1, "排名", range(1, len(buy) + 1))
+            result_parts.append(buy)
+
+        sell = broker_df[broker_df["估算買賣超金額"] < 0].copy()
+        sell = sell.sort_values(["估算買賣超金額", "買賣超張數"], ascending=[True, True]).head(15).reset_index(drop=True)
+        if not sell.empty:
+            sell.insert(0, "榜別", "賣超TOP15")
+            sell.insert(1, "排名", range(1, len(sell) + 1))
+            result_parts.append(sell)
+
+    if not result_parts:
+        return pd.DataFrame()
+
+    result = pd.concat(result_parts, ignore_index=True)
+    column_order = [
+        "榜別", "排名", "分點標籤", "分點代號", "分點名稱", "市場", "股票代號", "股票名稱", "方向",
+        "買進張數", "賣出張數", "買賣超張數", "買進股數", "賣出股數", "買賣超股數",
+        "估算買進金額", "估算賣出金額", "估算買賣超金額",
+    ]
+    column_order = [col for col in column_order if col in result.columns]
+    result = result[column_order]
+    return result.fillna("")
+
+
+def build_all_branch_weekly_stock_buy_top20(weekly_all_top15_df):
+    """
+    所有分點近一週股票買超金額 TOP20。
+    重點是「股票」排名，不列出哪一個分點；只保留進買超榜的分點數與資料筆數。
+    """
+    if weekly_all_top15_df is None or weekly_all_top15_df.empty:
+        return pd.DataFrame()
+
+    df = normalize_ranking_numeric_columns(weekly_all_top15_df)
+    if df.empty:
+        return pd.DataFrame()
+
+    required_cols = ["市場", "股票代號", "股票名稱", "分點代號"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    buy_df = df[df["買賣超股數"] > 0].copy()
+    if "API榜別" in buy_df.columns:
+        buy_df = buy_df[buy_df["API榜別"] == "買超榜"].copy()
+
+    if buy_df.empty:
+        return pd.DataFrame()
+
+    grouped_rows = []
+    group_cols = ["市場", "股票代號", "股票名稱"]
+
+    for keys, g in buy_df.groupby(group_cols, dropna=False):
+        market, stock_code, stock_name = keys
+        grouped_rows.append({
+            "方向": "買超",
+            "市場": market,
+            "股票代號": stock_code,
+            "股票名稱": stock_name,
+            "買超榜分點數": g["分點代號"].astype(str).str.strip().replace("", pd.NA).dropna().nunique(),
+            "買超榜資料筆數": len(g),
+            "買進股數": int(round(g["買進股數"].sum())),
+            "賣出股數": int(round(g["賣出股數"].sum())),
+            "買賣超股數": int(round(g["買賣超股數"].sum())),
+            "買進張數": round(g["買進張數"].sum(), 3),
+            "賣出張數": round(g["賣出張數"].sum(), 3),
+            "買賣超張數": round(g["買賣超張數"].sum(), 3),
+            "估算買進金額": int(round(g["估算買進金額"].sum())),
+            "估算賣出金額": int(round(g["估算賣出金額"].sum())),
+            "估算買賣超金額": int(round(g["估算買賣超金額"].sum())),
+        })
+
+    result = pd.DataFrame(grouped_rows)
+    if result.empty:
+        return result
+
+    result = result.sort_values(["估算買賣超金額", "買賣超張數"], ascending=[False, False]).head(20).reset_index(drop=True)
+    result.insert(0, "排名", range(1, len(result) + 1))
+    return result.fillna("")
+
+
+def fetch_weekly_all_branch_top15(stocks, week_start_date, end_date, run_id, update_time, workers):
+    print(f"\n【Step 2b】逐檔股票掃描近一週所有分點 TOP15（{week_start_date} ~ {end_date}）...")
+
+    weekly_all_top15_rows = []
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(fetch_stock_chip5, stock, week_start_date, end_date, run_id, update_time): stock
+            for stock in stocks
+        }
+
+        for future in as_completed(futures):
+            done += 1
+
+            try:
+                _, top15_rows = future.result()
+            except Exception:
+                top15_rows = []
+
+            if top15_rows:
+                weekly_all_top15_rows.extend(top15_rows)
+
+            if done % 100 == 0:
+                print(f"  進度：{done:,}/{len(stocks):,}，目前近一週全分點TOP15資料 {len(weekly_all_top15_rows):,} 筆")
+
+    print(f"  ✅ 近一週所有分點 TOP15 掃描完成，共 {len(weekly_all_top15_rows):,} 筆")
+    return pd.DataFrame(weekly_all_top15_rows)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1080,6 +1347,16 @@ def run(start_date=None, end_date=None, stock_limit=0, workers=None):
             if done % 100 == 0:
                 print(f"  進度：{done:,}/{len(stocks):,}，目前命中 {len(all_hits):,} 筆")
 
+    week_start_date = get_start_date_by_lookback(end_date, WEEK_LOOKBACK_DAYS)
+    weekly_all_top15_df = fetch_weekly_all_branch_top15(
+        stocks=stocks,
+        week_start_date=week_start_date,
+        end_date=end_date,
+        run_id=run_id,
+        update_time=update_time,
+        workers=workers,
+    )
+
     print("\n【Step 3】整理排名...")
 
     hit_df = pd.DataFrame(all_hits)
@@ -1095,7 +1372,21 @@ def run(start_date=None, end_date=None, stock_limit=0, workers=None):
         print(f"  ✅ 命中資料：{len(hit_df):,} 筆")
 
     buy_rank, sell_rank, abs_rank, summary_df = build_rankings(hit_df)
+    target_month_top20_df = build_target_broker_month_stock_top20(hit_df)
+    individual_broker_month_top15_df = build_individual_broker_month_stock_top15(hit_df)
+    weekly_stock_buy_top20_df = build_all_branch_weekly_stock_buy_top20(weekly_all_top15_df)
+
     run_info_df = build_run_info(start_date, end_date, len(stocks), len(hit_df), len(all_top15_df), run_id, update_time)
+    extra_info_df = pd.DataFrame([
+        {"項目": "近1週統計起日", "內容": week_start_date},
+        {"項目": "近1週統計迄日", "內容": end_date},
+        {"項目": "近1週所有分點TOP15筆數", "內容": len(weekly_all_top15_df)},
+        {"項目": "新增工作表1", "內容": "近1月追蹤分點TOP20：把追蹤分點命中資料依股票合併後，分成買超TOP20與賣超TOP20。"},
+        {"項目": "新增工作表2", "內容": "近1月個別分點TOP15：每一個追蹤分點各自統計買超TOP15與賣超TOP15。"},
+        {"項目": "新增工作表3", "內容": "近1週股票買超TOP20：使用所有分點買超榜資料依股票彙總，只排名股票，不列出分點名稱。"},
+    ])
+    run_info_df = pd.concat([run_info_df, extra_info_df], ignore_index=True)
+
     color_note_df = build_color_note()
 
     # 合併命中快取
@@ -1115,6 +1406,9 @@ def run(start_date=None, end_date=None, stock_limit=0, workers=None):
     result_sheets = {
         "執行資訊": run_info_df,
         "全部命中": hit_df,
+        "近1月追蹤分點TOP20": target_month_top20_df,
+        "近1月個別分點TOP15": individual_broker_month_top15_df,
+        "近1週股票買超TOP20": weekly_stock_buy_top20_df,
         "買超排名": buy_rank,
         "賣超排名": sell_rank,
         "買賣超絕對值排名": abs_rank,
@@ -1138,6 +1432,9 @@ def run(start_date=None, end_date=None, stock_limit=0, workers=None):
     print(f"命中總筆數：{len(hit_df):,}")
     print(f"買超筆數：{len(buy_rank):,}")
     print(f"賣超筆數：{len(sell_rank):,}")
+    print(f"近1月追蹤分點TOP20筆數：{len(target_month_top20_df):,}")
+    print(f"近1月個別分點TOP15筆數：{len(individual_broker_month_top15_df):,}")
+    print(f"近1週股票買超TOP20筆數：{len(weekly_stock_buy_top20_df):,}")
     print(f"Excel：{output_xlsx}")
 
     if not buy_rank.empty:
@@ -1151,6 +1448,12 @@ def run(start_date=None, end_date=None, stock_limit=0, workers=None):
         cols = ["排名", "股票代號", "股票名稱", "分點代號", "分點名稱", "買進張數", "賣出張數", "買賣超張數", "成交比重%", "收盤價", "估算買賣超金額"]
         cols = [c for c in cols if c in sell_rank.columns]
         print(sell_rank[cols].head(20).to_string(index=False))
+
+    if not weekly_stock_buy_top20_df.empty:
+        print("\n【近1週所有分點股票買超金額 TOP20】")
+        cols = ["排名", "股票代號", "股票名稱", "買超榜分點數", "買賣超張數", "估算買賣超金額"]
+        cols = [c for c in cols if c in weekly_stock_buy_top20_df.columns]
+        print(weekly_stock_buy_top20_df[cols].head(20).to_string(index=False))
 
     return output_xlsx
 
