@@ -10141,6 +10141,76 @@ def _near10_window_dates(target_date=None, window_days=None):
     return target_date, target_dt, start_date, start_dt, window_days, period_text
 
 
+def _collect_item_trade_dates_for_10d(items, target_dt):
+    """
+    從 API5 / 快取_分點歷史還原出的 items 收集實際交易日。
+
+    近10日分點買賣明細的「近10日」必須使用最近 N 個交易日，
+    不可再用 target_date 往前推 N 個日曆天。
+    這裡以權證分點歷史資料中的日期作為交易日來源；API5 通常會回傳交易日序列，
+    因此買賣統計、權證篩選與母股10日漲跌幅會共用同一組交易日。
+    """
+    trade_dates = set()
+
+    for item in items or []:
+        df = item.get("df", pd.DataFrame())
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        for raw_date in df["日期"].tolist():
+            date_str = normalize_date_str(raw_date)
+            dt = parse_date(date_str)
+            if not dt:
+                continue
+            if target_dt and dt > target_dt:
+                continue
+            trade_dates.add(dt.strftime("%Y/%m/%d"))
+
+    return sorted(trade_dates)
+
+
+def _near10_trading_window_dates(items, target_date=None, window_days=None, effective_target_from_data=False):
+    """
+    近10日分點買賣明細專用日期視窗。
+
+    回傳最近 N 個「交易日」而不是 N 個日曆天。
+    - items 有交易日資料時：取 target_date 以前最近 N 個交易日。
+    - items 暫時沒有交易日資料時：退回舊的日曆天視窗，避免流程中斷。
+    - effective_target_from_data=True 時，統計日期會改成資料內最後一個交易日，
+      避免週末 / 分點資料尚未更新時把統計日期誤標成沒有交易資料的日期。
+    """
+    target_date = normalize_top15_target_date(target_date)
+    target_dt = parse_date(target_date)
+
+    if not target_dt:
+        target_dt = datetime.today()
+        target_date = target_dt.strftime("%Y/%m/%d")
+
+    if window_days is None:
+        window_days = BROKER_10D_DETAIL_DAYS
+
+    window_days = max(int(window_days), 1)
+    trade_dates = _collect_item_trade_dates_for_10d(items, target_dt)
+
+    if not trade_dates:
+        fallback = _near10_window_dates(target_date, window_days)
+        return (*fallback, set())
+
+    recent_dates = trade_dates[-window_days:]
+    start_date = recent_dates[0]
+    period_end_date = recent_dates[-1]
+
+    if effective_target_from_data:
+        target_date = period_end_date
+        target_dt = parse_date(target_date) or target_dt
+
+    start_dt = parse_date(start_date) or target_dt
+    actual_window_days = len(recent_dates)
+    period_text = f"{start_date} ～ {period_end_date}"
+
+    return target_date, target_dt, start_date, start_dt, actual_window_days, period_text, set(recent_dates)
+
+
 def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     """
     收集近10日分點買賣明細會用到的標的股代號。
@@ -10148,7 +10218,7 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     圖卡新增「現股10日」後，不能只補權證最新價；
     若分點資料仍停在前一交易日，但盤後現股價格已更新，這裡會先把近10日有買賣的標的股最新收盤價補進快取。
     """
-    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
+    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
     codes = set()
 
     for item in items or []:
@@ -10166,7 +10236,7 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or dt < start_dt or dt > target_dt:
+            if not dt or date_str not in trading_date_set:
                 continue
 
             buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
@@ -10199,11 +10269,10 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
         print("  ✅ 近10日分點明細沒有需要預抓的標的股價格。")
         return price_cache
 
-    target_date = normalize_top15_target_date(target_date)
-    target_dt = parse_date(target_date) or datetime.today()
+    target_date, target_dt, near10_start_date, near10_start_dt, near10_window_days, near10_period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
     end_dt = min(target_dt, datetime.today())
     lookback_days = max(int(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
-    start_dt = target_dt - timedelta(days=lookback_days)
+    start_dt = min(near10_start_dt, target_dt - timedelta(days=lookback_days))
 
     persistent_price_cache = load_price_cache()
     fetch_plan = {}
@@ -10307,7 +10376,7 @@ def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
 
 
 def _collect_recent_warrant_codes_for_10d(items, target_date=None):
-    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
+    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
     codes = set()
     skipped_no_remaining_position = 0
     skipped_sell_has_cost = 0
@@ -10331,7 +10400,7 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None):
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or dt < start_dt or dt > target_dt:
+            if not dt or date_str not in trading_date_set:
                 continue
 
             buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
@@ -10401,8 +10470,7 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     if not codes:
         return price_cache
 
-    target_date = normalize_top15_target_date(target_date)
-    target_dt = parse_date(target_date) or datetime.today()
+    target_date, target_dt, near10_start_date, near10_start_dt, near10_window_days, near10_period_text, trading_date_set = _near10_trading_window_dates(items, target_date)
     end_dt = min(target_dt, datetime.today())
 
     full_lookback_days = max(int(BROKER_10D_PRICE_LOOKBACK_DAYS), 1)
@@ -10736,7 +10804,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         print("  ⚠️ 近10日分點買賣明細：沒有 items 資料")
         return []
 
-    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
+    target_date, target_dt, start_date, start_dt, window_days, period_text, trading_date_set = _near10_trading_window_dates(items, target_date, effective_target_from_data=True)
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     scope = get_result_data_scope()
@@ -10811,7 +10879,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             date_str = normalize_date_str(row_dict.get("日期", ""))
             dt = parse_date(date_str)
 
-            if not dt or dt < start_dt or dt > target_dt:
+            if not dt or date_str not in trading_date_set:
                 continue
 
             buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
@@ -11232,7 +11300,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         rows,
         key=lambda r: (
             str(r.get("分點", "")),
-            -abs(float(r.get("近10日淨買超金額", 0) or 0)),
+            -float(r.get("近10日淨買超金額", 0) or 0),
             str(r.get("標的股", "")),
         )
     )
