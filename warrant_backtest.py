@@ -87,12 +87,6 @@ CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_sele
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 PRICE_PREFETCH_STATE_PATH = os.path.join(CACHE_DIR, "price_prefetch_state.csv")
-STOCK_NAME_CACHE_PATH = os.path.join(CACHE_DIR, "stock_name_cache.csv")
-STOCK_NAME_CACHE_SHEET = "快取_股票名稱"
-UNDERLYING_NAME_MISSING_SHEET = os.getenv("UNDERLYING_NAME_MISSING_SHEET", "快取_標的名稱缺失清單")
-# 啟動時重建乾淨的股票名稱快取，排除權證名稱/權證代號污染。
-# 只影響「快取_股票名稱」與近10日/標的名稱補齊，不改 A/B/C/D 的事件篩選規則。
-REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START = os.getenv("REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START", "1").strip().lower() not in ("0", "false", "no")
 
 # 自動價格預抓：
 # 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
@@ -119,7 +113,6 @@ PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS = int(os.getenv("PRICE_CACHE_FULL_SYNC_THRE
 # TOP15 圖片用固定資料集：
 # 主程式在同一次 RUN 內，會把 TOP15 所需的所有部位明細、賣出扣減、價格快照與報酬率
 # 一次整理成「快取_TOP15部位明細」與「快取_TOP15共識淨買超」。
-# TOP15 賣出扣減採舊程式口徑：只扣近 N 日事件 lot 買進日之後的賣出，不回溯舊庫存。
 # 圖片程式之後應只讀這兩張固定資料集，不要再從 A/B/C/D 或快取歷史即時計算。
 TOP15_CACHE_ENABLED = os.getenv("TOP15_CACHE_ENABLED", os.getenv("TOP15_RETURN_CACHE_ENABLED", "1")).strip().lower() not in ("0", "false", "no")
 TOP15_POSITION_DETAIL_SHEET = os.getenv("TOP15_POSITION_DETAIL_SHEET", "快取_TOP15部位明細")
@@ -166,6 +159,7 @@ PRICE_PREFETCH_ALL_REQUIRE_TARGET_DATE = os.getenv("PRICE_PREFETCH_ALL_REQUIRE_T
 # 預設不再為所有純賣超權證補抓最新價；賣超報酬優先使用 API5 歷史 FIFO 成本。
 # 若賣超完全找不到歷史買進成本，仍會補抓最新價作為備援成本，避免報酬率空白。
 BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES = os.getenv("BROKER_10D_FETCH_ALL_TRADED_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
+BROKER_10D_FETCH_SELL_FALLBACK_PRICES = os.getenv("BROKER_10D_FETCH_SELL_FALLBACK_PRICES", "1").strip().lower() not in ("0", "false", "no")
 
 # 執行模式：
 # RUN_MODE=1：精選 5 分點模式。只追蹤 SELECTED_TARGET_LABELS，但會對這 5 間分點做全市場最近資料補掃，
@@ -182,10 +176,14 @@ SELECTED_TARGET_LABELS_DEFAULT = [
 SELECTED_TARGET_LABELS_ENV = os.getenv("SELECTED_TARGET_LABELS", "").strip()
 SELECTED_FULL_SCAN_DAYS = int(os.getenv("SELECTED_FULL_SCAN_DAYS", str(CACHE_RECENT_SCAN_DAYS)))
 # RUN_MODE=1 / RUN_MODE=2 加速追蹤設定：
-# 舊版 RUN_MODE=1 曾使用全市場權證 × 精選分點的大候選池，速度很慢。新版改成：
+# 舊版 RUN_MODE=1 會建立「所有認購權證 × 精選分點」，再用 SELECTED_REFRESH_ALL_WARRANTS
+# 每次全部重打 API5，速度會非常慢。新版改成：
 # 1. 先用 API4 掃最近有目標分點活動的標的股。
 # 2. 再展開成「該標的所有認購權證 × 追蹤分點」。
 # 3. 若歷史快取已有該候選資料，就走增量判斷，不再每天重抓 250 日 API5。
+# 下列兩個舊環境變數保留相容，但預設流程已改成「活動標的擴展 + 快取增量」。
+SELECTED_FORCE_ALL_WARRANTS = os.getenv("SELECTED_FORCE_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
+SELECTED_REFRESH_ALL_WARRANTS = os.getenv("SELECTED_REFRESH_ALL_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 EXPAND_ACTIVE_UNDERLYING_WARRANTS = os.getenv("EXPAND_ACTIVE_UNDERLYING_WARRANTS", "1").strip().lower() not in ("0", "false", "no")
 
 # 全面增量更新設定：
@@ -584,111 +582,20 @@ def merge_price_dicts(*dicts):
     return merged
 
 
-# 已知 ETF / 特殊標的對照表
-#
-# 用途：
-# 1. 權證名稱常用簡稱，例如 T50正2、T50反1，不一定會出現在 ISIN 的完整名稱中。
-# 2. 主動式 ETF 可能含英文字尾，例如 00981A，若只用純數字解析會被截斷。
-# 3. TOP15 / 近7日共識 / 近10日明細等標的分組都需要穩定的「標的代號 + 正式名稱」。
-def normalize_known_underlying_text(value):
-    s = str(value or "").strip()
-
-    if s.startswith("'"):
-        s = s[1:]
-
-    # 全形英數轉半形，避免 Google Sheet / 網頁來源混用全形字元。
-    s = "".join(
-        chr(ord(ch) - 0xFEE0) if 0xFF01 <= ord(ch) <= 0xFF5E else ch
-        for ch in s
-    )
-
-    s = s.upper()
-    s = s.replace("　", " ")
-    s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
-    s = re.sub(r"[\s\-－_＿、，,。．.()（）\[\]【】]+", "", s)
-    return s
-
-
-KNOWN_UNDERLYING_CODE_NAME_MAP = {
-    "00632R": "元大台灣50反1",
-    "00631L": "元大台灣50正2",
-    "00981A": "主動統一台股增長",
-}
-
-_KNOWN_UNDERLYING_ALIAS_RAW_MAP = {
-    "00632R": "00632R",
-    "T50反1": "00632R",
-    "T50反一": "00632R",
-    "元大台灣50反1": "00632R",
-    "台灣50反1": "00632R",
-    "00631L": "00631L",
-    "T50正2": "00631L",
-    "T50正二": "00631L",
-    "元大台灣50正2": "00631L",
-    "台灣50正2": "00631L",
-    "00981A": "00981A",
-    "統一台股增長": "00981A",
-    "主動統一台股增長": "00981A",
-    "台股增長": "00981A",
-}
-
-KNOWN_UNDERLYING_NAME_CODE_MAP = {
-    normalize_known_underlying_text(name): code
-    for name, code in _KNOWN_UNDERLYING_ALIAS_RAW_MAP.items()
-}
-
-
-def get_known_underlying_name_by_code(code):
-    s = normalize_known_underlying_text(code)
-    return KNOWN_UNDERLYING_CODE_NAME_MAP.get(s, "")
-
-
-def resolve_known_underlying_from_text(text):
-    s = normalize_known_underlying_text(text)
-
-    if not s:
-        return "", ""
-
-    # 先處理代號本身或文字中帶代號的情況，例如 00981A 主動統一台股增長。
-    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-        if code in s:
-            return code, name
-
-    # 再處理權證常用簡稱，採最長別名優先，避免「台股增長」搶在完整名稱前面。
-    for alias in sorted(KNOWN_UNDERLYING_NAME_CODE_MAP.keys(), key=len, reverse=True):
-        code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(alias, "")
-
-        if alias and code and alias in s:
-            return code, KNOWN_UNDERLYING_CODE_NAME_MAP.get(code, "")
-
-    return "", ""
-
-
 def normalize_price_code(code):
     s = str(code).strip()
 
-    if s.startswith("'"):
-        s = s[1:]
-
-    s = s.upper()
-    s = s.replace("　", " ").strip()
-
-    # 支援從 Yahoo / Google Sheet 讀回來的 00981A.TW、00631L.TW 這類格式。
-    s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
-
-    if s.endswith(".0") and s[:-2].isdigit():
+    if s.endswith(".0"):
         s = s[:-2]
 
-    # 保留 ETF / 標的代號的英文字尾，例如 00631L、00632R、00981A。
-    s = re.sub(r"[^0-9A-Z]", "", s)
+    s = "".join(ch for ch in s if ch.isdigit())
 
     if not s:
         return ""
 
     # 權證通常為 6 碼；股票通常為 4 碼。
     # 若是 5 碼權證，很可能是 Excel / pandas 吃掉前導 0，補回 6 碼。
-    # 但 00 開頭的 5 碼純數字常見於 ETF / ETN，例如 00919，不能補成 000919。
-    if re.fullmatch(r"\d{5}", s) and not s.startswith("00"):
+    if len(s) == 5:
         return s.zfill(6)
 
     return s
@@ -1285,7 +1192,6 @@ CACHE_SHEET_NAME_MAP = {
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
     "price_prefetch_state.csv": "快取_價格預抓狀態",
-    "stock_name_cache.csv": "快取_股票名稱",
 }
 
 
@@ -1515,18 +1421,7 @@ def clean_gsheet_value(value):
 
 def is_gsheet_text_header(header):
     header = str(header).strip()
-    if any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS):
-        return True
-
-    # 結果快取中的百分比 / 勝率欄位一律用文字寫入 Google Sheet。
-    # 原因：若 USER_ENTERED 寫入 +51.30% 且後續格式沒有完整套到所有列，
-    # Google Sheet 可能出現同欄位有些列顯示 51.30%、有些列顯示 0.513 的混亂狀況。
-    # 這些欄位主要給圖卡與人工檢查使用，不需要在 Sheet 內做公式計算，
-    # 因此改成純文字最穩定。
-    if is_gsheet_percent_display_header(header):
-        return True
-
-    return False
+    return any(keyword in header for keyword in GSHEET_TEXT_HEADER_KEYWORDS)
 
 
 def _strip_trailing_excel_decimal_for_code(s):
@@ -1678,10 +1573,7 @@ def normalize_gsheet_values_for_text_columns(values):
                     continue
 
                 header = out[header_row_idx][col_idx] if col_idx < len(out[header_row_idx]) else ""
-                if is_gsheet_percent_display_header(header):
-                    cell_value = _format_percent_display_value_for_gsheet(header, cell_value)
-                else:
-                    cell_value = normalize_gsheet_code_text_value(header, cell_value)
+                cell_value = normalize_gsheet_code_text_value(header, cell_value)
                 out[row_idx][col_idx] = add_gsheet_text_prefix(cell_value)
 
     return out
@@ -1846,92 +1738,6 @@ def is_gsheet_percent_header(header):
         return False
 
     return ("%" in header) or ("勝率" in header) or ("占比" in header) or ("比例" in header)
-
-
-def is_gsheet_percent_display_header(header):
-    """
-    判斷哪些欄位在 Google Sheet 上必須以「xx.xx%」文字顯示。
-
-    這裡比 is_gsheet_percent_header 更廣，除了欄名有 %，也包含勝率、占比、比例、
-    報酬率、獲利、漲跌幅、覆蓋率等語意上屬於百分比的欄位。
-    目標是避免 Google Sheet 把 51.30% 解析成底層 0.513，或把 0.513 直接顯示成小數。
-    """
-    header = str(header or "").strip()
-
-    if not header:
-        return False
-
-    if "文字" in header or "日期" in header or "代號" in header or "代碼" in header:
-        return False
-
-    keywords = (
-        "%",
-        "勝率",
-        "占比",
-        "比例",
-        "報酬率",
-        "獲利",
-        "漲跌幅",
-        "覆蓋率",
-    )
-    return any(k in header for k in keywords)
-
-
-def _format_percent_display_value_for_gsheet(header, value):
-    """
-    將百分比語意欄位統一轉成 Google Sheet 文字顯示值。
-
-    支援情境：
-    1. 程式本身輸出 +5.28% / 51.30%：原樣保留。
-    2. 數值是 5.28：顯示成 +5.28% 或 5.28%。
-    3. Google Sheet 舊資料曾被解析成 0.513：勝率 / 占比 / 比例會顯示成 51.30%。
-    """
-    if value is None:
-        return ""
-
-    header = str(header or "").strip()
-    s = str(value).strip()
-
-    if s == "" or s == "-":
-        return s
-
-    if s.startswith("="):
-        return s
-
-    if s.startswith("'"):
-        s = s[1:].strip()
-
-    if "%" in s:
-        return s
-
-    raw = s.replace(",", "").strip()
-    if raw.startswith("+"):
-        raw_num = raw[1:]
-        explicit_plus = True
-    else:
-        raw_num = raw
-        explicit_plus = False
-
-    try:
-        v = float(raw_num)
-    except Exception:
-        return s
-
-    unsigned_header = any(k in header for k in ("勝率", "占比", "比例", "覆蓋率"))
-
-    # 勝率 / 占比 / 比例若是 0~1 小數，多半是 Google Sheet 的百分比底層值，轉回百分點。
-    # 一般報酬 / 漲跌幅若是 0.0089，也通常代表舊 Sheet 解析後的 0.89%。
-    if abs(v) <= 1:
-        v = v * 100
-
-    if unsigned_header:
-        return f"{v:.2f}%"
-
-    if v > 0 or explicit_plus:
-        return f"+{v:.2f}%"
-    if v < 0:
-        return f"{v:.2f}%"
-    return "0.00%"
 
 
 def is_gsheet_decimal_number_header(header):
@@ -2249,23 +2055,6 @@ GSHEET_DATE_HEADER_KEYWORDS = (
 )
 
 
-def is_gsheet_datetime_header(header):
-    """
-    判斷 Google Sheet 中哪些欄位應該以日期時間格式顯示。
-
-    Google Sheet 使用 USER_ENTERED 寫入「2026/06/12 14:40:00」時，
-    底層會轉成日期序號，例如 46185.27799。
-    若沒有另外套日期時間格式，就會直接顯示序號。
-    目前只把「更新時間」視為日期時間欄位，避免把「執行時間」這種耗時欄位誤套格式。
-    """
-    header = str(header).strip()
-
-    if not header:
-        return False
-
-    return header == "更新時間" or header.endswith("更新時間")
-
-
 def is_gsheet_date_header(header):
     """
     判斷 Google Sheet 中哪些欄位應該以日期格式顯示。
@@ -2279,9 +2068,6 @@ def is_gsheet_date_header(header):
     if not header:
         return False
 
-    if is_gsheet_datetime_header(header):
-        return False
-
     if "天數" in header:
         return False
 
@@ -2290,12 +2076,10 @@ def is_gsheet_date_header(header):
 
 def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
     """
-    將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd，
-    並將「更新時間」套用日期時間格式 yyyy/mm/dd hh:mm:ss。
+    將日期相關欄位套用 Google Sheets 日期格式 yyyy/mm/dd。
 
     upsert 模式會新增「資料範圍」欄位，因此日期欄位置必須以實際寫入 values 的表頭判斷，
-    不可只看原本 Excel 欄位位置。這可避免買進均價 / 張數 / 獲利% 被誤套成日期格式，
-    也可避免「更新時間」顯示成 46185.27799 這類日期序號。
+    不可只看原本 Excel 欄位位置。這可避免買進均價 / 張數 / 獲利% 被誤套成日期格式。
     """
     if gws is None:
         return
@@ -2311,31 +2095,23 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
 
     for row_idx in range(1, scan_limit + 1):
         row = source_rows[row_idx - 1]
-        format_cols = []
+        date_cols = []
 
         for col_idx in range(1, max_col + 1):
             header = row[col_idx - 1] if col_idx - 1 < len(row) else ""
 
-            if is_gsheet_datetime_header(header):
-                format_cols.append((col_idx, {
-                    "type": "DATE_TIME",
-                    "pattern": "yyyy/mm/dd hh:mm:ss",
-                }))
-            elif is_gsheet_date_header(header):
-                format_cols.append((col_idx, {
-                    "type": "DATE",
-                    "pattern": "yyyy/mm/dd",
-                }))
+            if is_gsheet_date_header(header):
+                date_cols.append(col_idx)
 
-        if format_cols:
-            header_rows.append((row_idx, format_cols))
+        if date_cols:
+            header_rows.append((row_idx, date_cols))
 
     if not header_rows:
         return
 
     requests = []
 
-    for idx, (header_row_idx, format_cols) in enumerate(header_rows):
+    for idx, (header_row_idx, date_cols) in enumerate(header_rows):
         if idx + 1 < len(header_rows):
             end_row = header_rows[idx + 1][0] - 1
         else:
@@ -2346,7 +2122,7 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
         if start_data_row > end_row:
             continue
 
-        for col_idx, number_format in format_cols:
+        for col_idx in date_cols:
             requests.append({
                 "repeatCell": {
                     "range": {
@@ -2358,7 +2134,10 @@ def apply_date_format_to_gsheet(ws_xlsx, gws, values=None):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": number_format
+                            "numberFormat": {
+                                "type": "DATE",
+                                "pattern": "yyyy/mm/dd",
+                            }
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -2526,15 +2305,6 @@ def write_values_to_worksheet(ws, values):
             rows=max(row_count, 1),
             cols=max(col_count, 1),
         )
-
-        # 先清除整張工作表的舊值，避免新版列數變少時，舊列殘留在下方。
-        # 這次近10日明細欄位與列數都有調整，如果只 update A1:...，
-        # Google Sheet 可能保留上一版多出來的列，造成看起來同一天資料重複、
-        # 百分比欄位有些列是 51.30%、有些列是 0.513。
-        try:
-            gsheet_api_call(f"清除工作表舊值 {ws.title}", ws.clear)
-        except Exception:
-            pass
 
         reset_worksheet_before_value_write(ws, row_count, col_count)
 
@@ -3082,7 +2852,6 @@ GSHEET_RESULT_UPSERT_TITLES = {
     TOP15_CONSENSUS_SHEET,
     WARRANT_CONSENSUS_7D_SHEET,
     BROKER_10D_DETAIL_SHEET,
-    UNDERLYING_NAME_MISSING_SHEET,
 }
 
 GSHEET_RESULT_OVERWRITE_TITLES = {
@@ -3260,9 +3029,6 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
     同一標的可能因 Google Sheet / pandas 讀寫變成 2408、'2408、2408.0，
     若直接拿原字串當 group key，就會造成本週 TOP15 同標的重複出現。
     這裡統一轉成穩定代號後再合併與排序。
-
-    ETF 修正：
-    支援 00631L、00632R、00981A 這種含英文字尾標的，避免分組時被截成 00631 / 00632 / 00981。
     """
     candidates = []
     for raw in (value, fallback_text):
@@ -3274,364 +3040,22 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
         candidates.append(s)
 
     for s in candidates:
-        known_code, _ = resolve_known_underlying_from_text(s)
-        if known_code:
-            return known_code
-
-        s = s.replace("，", ",").replace(",", "").strip().upper()
-        s = re.sub(r"\.(TW|TWO)$", "", s, flags=re.I)
-
+        s = s.replace("，", ",").replace(",", "").strip()
         if s.endswith(".0") and s[:-2].isdigit():
             s = s[:-2]
 
-        m = re.match(r"^([0-9]{4,6}[A-Z]?)(?=\s|　|$|[^0-9A-Z])", s, flags=re.I)
+        m = re.match(r"^(\d{4,6})(?:\s|$)", s)
         if m:
-            return m.group(1).upper()
+            return m.group(1)
 
-        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", s, flags=re.I):
-            return s.upper()
+        if s.isdigit() and 4 <= len(s) <= 6:
+            return s
 
-    return ""
-
-
-
-def normalize_underlying_for_display(value, fallback_text=""):
-    """
-    將標的股欄位統一成穩定代號，供所有圖片快取排名先合併同標的後再排序。
-
-    可處理：
-    - 2408 / '2408 / 2408.0
-    - 00631L、00632R、00981A 這類 ETF / 主動式 ETF 英文字尾
-    - 權證名稱或標的名稱中含特殊 ETF 簡稱時的對照
-    """
-    normalized = normalize_underlying_code_for_group(value, fallback_text)
-
-    if normalized:
-        return normalized
-
-    raw = strip_gsheet_text_prefix(str(value or "")).strip().upper()
-    raw = re.sub(r"\.(TW|TWO)$", "", raw, flags=re.I)
-
-    if raw.endswith(".0") and raw[:-2].isdigit():
-        raw = raw[:-2]
-
-    return raw
-
-
-def fill_known_underlying_name_if_missing(underlying_code, underlying_name=""):
-    underlying_name = str(underlying_name or "").strip()
-
-    if underlying_name and not is_probably_warrant_name_text(underlying_name):
-        return underlying_name
-
-    known_name = get_known_underlying_name_by_code(underlying_code)
-    if known_name:
-        return known_name
-
-    mapped_name = get_stock_name_by_code_for_underlying_resolution(underlying_code)
-    if mapped_name:
-        return mapped_name
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if 4 <= len(digits) <= 6:
+            return digits
 
     return ""
-
-
-def get_stock_name_cache_name_by_code(underlying_code):
-    """
-    直接用 Google Sheet / 本機「快取_股票名稱」的代號反查名稱。
-
-    這張表由使用者維護，優先度最高；只要代號存在，就應覆蓋
-    ISIN / 權證清單快取 / item 歷史資料中可能已污染的非空舊名稱。
-    """
-    norm_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-    if not norm_code:
-        return ""
-
-    try:
-        stock_name_cache = load_stock_name_cache_map()
-    except Exception:
-        stock_name_cache = {"code_to_name": {}}
-
-    for cached_code, cached_name in (stock_name_cache.get("code_to_name", {}) or {}).items():
-        cached_code_norm = normalize_underlying_code_for_group(cached_code) or normalize_price_code(cached_code)
-        cached_name = str(cached_name or "").strip()
-
-        if cached_code_norm == norm_code and cached_name and not is_probably_warrant_name_text(cached_name):
-            return cached_name
-
-    return ""
-
-
-def fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name=""):
-    """
-    以「快取_股票名稱」作為代號 -> 名稱的第一優先來源。
-
-    修正重點：原本 fill_known_underlying_name_if_missing() 只有在名稱空白時才查表；
-    如果舊快取先回傳一個非空但錯的名稱，就會被保留下來。
-    近10日 / TOP 類快取需要只要標的代號查得到，就直接用快取_股票名稱覆蓋。
-    """
-    norm_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-
-    sheet_name = get_stock_name_cache_name_by_code(norm_code or underlying_code)
-    if sheet_name:
-        return sheet_name
-
-    mapped_name = get_stock_name_by_code_for_underlying_resolution(norm_code or underlying_code)
-    if mapped_name and not is_probably_warrant_name_text(mapped_name):
-        return mapped_name
-
-    return fill_known_underlying_name_if_missing(norm_code or underlying_code, underlying_name)
-
-
-_UNDERLYING_NAME_MISSING_ROWS = []
-_UNDERLYING_NAME_MISSING_KEYS = set()
-
-
-def is_clean_underlying_display_name(name, underlying_code=""):
-    """
-    判斷輸出用標的名稱是否可信。
-
-    這個函式是最後輸出前的保護層，避免 TOP15 / 近10日結果表出現：
-    1. 空白標的名稱
-    2. 權證名稱被誤當標的名稱
-    3. 標的名稱只剩股號
-    4. 舊版自動產生的「名稱待補(...)」被當成有效名稱
-    """
-    name = str(name or "").strip()
-    code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-
-    if not name:
-        return False
-    if name.startswith("名稱待補("):
-        return False
-    if is_probably_warrant_name_text(name):
-        return False
-
-    name_norm = normalize_known_underlying_text(name)
-    code_norm = normalize_known_underlying_text(code)
-    if code_norm and name_norm == code_norm:
-        return False
-
-    # 如果名稱本身看起來就是一個代號，也不要當成標的名稱。
-    if re.fullmatch(r"[0-9]{4,6}[A-Z]?", name_norm, flags=re.I):
-        return False
-
-    return True
-
-
-def reset_underlying_name_missing_rows():
-    global _UNDERLYING_NAME_MISSING_ROWS, _UNDERLYING_NAME_MISSING_KEYS
-    _UNDERLYING_NAME_MISSING_ROWS = []
-    _UNDERLYING_NAME_MISSING_KEYS = set()
-
-
-def register_underlying_name_missing(
-    underlying_code,
-    underlying_name="",
-    warrant_code="",
-    warrant_name="",
-    source_sheet="",
-    context_date="",
-    note="",
-):
-    """記錄最後仍無法解析標的名稱的代號，供人工補進快取_股票名稱。"""
-    code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-    if not code:
-        return
-
-    key = (
-        str(source_sheet or "").strip(),
-        normalize_date_str(context_date) if context_date else "",
-        code,
-        normalize_warrant_code_for_unique(warrant_code),
-        str(warrant_name or "").strip(),
-    )
-    if key in _UNDERLYING_NAME_MISSING_KEYS:
-        return
-
-    _UNDERLYING_NAME_MISSING_KEYS.add(key)
-    _UNDERLYING_NAME_MISSING_ROWS.append({
-        "統計日期": normalize_date_str(context_date) if context_date else "",
-        "標的股": code,
-        "原標的名稱": str(underlying_name or "").strip(),
-        "權證代號": normalize_warrant_code_for_unique(warrant_code),
-        "權證名稱": str(warrant_name or "").strip(),
-        "來源表": str(source_sheet or "").strip(),
-        "備註": str(note or "標的股有代號，但程式無法由快取_股票名稱 / 已知ETF / ISIN / 權證清單 / 權證名稱前綴補到正式名稱，請人工補進快取_股票名稱。").strip(),
-        "更新時間": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
-    })
-
-
-def get_underlying_name_missing_rows():
-    return list(_UNDERLYING_NAME_MISSING_ROWS)
-
-
-def _lookup_underlying_name_from_warrant_cache_by_code(underlying_code):
-    """從快取_權證清單中找同一標的代號曾經出現過的乾淨標的名稱。"""
-    code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-    if not code:
-        return ""
-
-    try:
-        for w in load_warrants_cache() or []:
-            w_code = normalize_underlying_code_for_group(w.get("標的股", "")) or normalize_price_code(w.get("標的股", ""))
-            w_name = str(w.get("標的名稱", "") or "").strip()
-            if w_code == code and is_clean_underlying_display_name(w_name, code):
-                return w_name
-    except Exception:
-        pass
-
-    return ""
-
-
-def resolve_underlying_name_final(
-    underlying_code,
-    underlying_name="",
-    warrant_code="",
-    warrant_name="",
-    source_sheet="",
-    context_date="",
-    local_code_name_map=None,
-):
-    """
-    TOP15 / 近10日輸出前的最後標的名稱補齊保護層。
-
-    這個函式不只依賴「快取_股票名稱」。只要已經有標的股代號，就依序嘗試：
-    1. 本次輸出資料內同代號已存在的乾淨名稱
-    2. 原 row 內乾淨名稱
-    3. 已知 ETF / 特殊標的對照
-    4. 快取_股票名稱
-    5. ISIN / 股名 resolver 反查
-    6. 快取_權證清單中同標的代號的乾淨名稱
-    7. 權證代號對照表
-    8. 權證名稱前綴反推
-
-    若仍補不到，標的名稱不再留空，直接輸出「名稱待補(股號)」，
-    並寫入「快取_標的名稱缺失清單」。
-    """
-    code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-    raw_name = str(underlying_name or "").strip()
-
-    if not code:
-        return raw_name if is_clean_underlying_display_name(raw_name, code) else ""
-
-    # 標的股如果本身疑似是權證代號，不能硬補名稱，避免把錯標的寫成看似正常。
-    if is_probably_warrant_code_for_underlying(code):
-        register_underlying_name_missing(
-            code,
-            raw_name,
-            warrant_code=warrant_code,
-            warrant_name=warrant_name,
-            source_sheet=source_sheet,
-            context_date=context_date,
-            note="標的股欄位疑似為權證代號，已列入缺失清單，請檢查上游快取。",
-        )
-        return f"名稱待補({code})"
-
-    local_code_name_map = local_code_name_map or {}
-    local_name = str(local_code_name_map.get(code, "") or "").strip()
-    if is_clean_underlying_display_name(local_name, code):
-        return local_name
-
-    if is_clean_underlying_display_name(raw_name, code):
-        return raw_name
-
-    known_name = get_known_underlying_name_by_code(code)
-    if is_clean_underlying_display_name(known_name, code):
-        return known_name
-
-    sheet_name = get_stock_name_cache_name_by_code(code)
-    if is_clean_underlying_display_name(sheet_name, code):
-        return sheet_name
-
-    mapped_name = get_stock_name_by_code_for_underlying_resolution(code)
-    if is_clean_underlying_display_name(mapped_name, code):
-        return mapped_name
-
-    warrant_cache_name = _lookup_underlying_name_from_warrant_cache_by_code(code)
-    if is_clean_underlying_display_name(warrant_cache_name, code):
-        return warrant_cache_name
-
-    try:
-        warrant_lookup = build_warrant_underlying_lookup_from_cache()
-        cached = warrant_lookup.get(normalize_warrant_code_for_unique(warrant_code), {}) if warrant_code else {}
-        cached_code = normalize_underlying_code_for_group(cached.get("標的股", "")) or normalize_price_code(cached.get("標的股", ""))
-        cached_name = str(cached.get("標的名稱", "") or "").strip()
-        if cached_code == code and is_clean_underlying_display_name(cached_name, code):
-            return cached_name
-    except Exception:
-        pass
-
-    try:
-        inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name)
-        inferred_code = normalize_underlying_code_for_group(inferred_code) or normalize_price_code(inferred_code)
-        if inferred_code == code and is_clean_underlying_display_name(inferred_name, code):
-            return inferred_name
-    except Exception:
-        pass
-
-    register_underlying_name_missing(
-        code,
-        raw_name,
-        warrant_code=warrant_code,
-        warrant_name=warrant_name,
-        source_sheet=source_sheet,
-        context_date=context_date,
-    )
-    return f"名稱待補({code})"
-
-
-def build_local_underlying_name_map_from_rows(rows):
-    """從本次即將輸出的資料列中，先建立同代號乾淨名稱對照。"""
-    out = {}
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        code = normalize_underlying_code_for_group(row.get("標的股", "")) or normalize_price_code(row.get("標的股", ""))
-        name = str(row.get("標的名稱", "") or "").strip()
-        if code and code not in out and is_clean_underlying_display_name(name, code):
-            out[code] = name
-    return out
-
-
-def finalize_underlying_names_for_rows(rows, source_sheet, preserve_underlying_code=False):
-    """
-    在寫出 TOP15 / 近10日結果表前，強制補齊標的名稱。
-
-    保證：只要有標的股代號，標的名稱欄位不會空白；真的補不到會顯示「名稱待補(代號)」，
-    並同步寫入缺失清單，方便人工補正快取_股票名稱。
-
-    preserve_underlying_code=True 時只拿正規化後代號查名稱，但不回寫「標的股」。
-    這是給 TOP15 使用，避免補標的名稱時改到舊程式碼的 TOP15 分組與排名口徑。
-    """
-    if rows is None:
-        return rows
-
-    rows = list(rows or [])
-    local_map = build_local_underlying_name_map_from_rows(rows)
-
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-
-        if "標的股" not in row:
-            continue
-
-        raw_code = row.get("標的股", "")
-        code = normalize_underlying_code_for_group(raw_code, row.get("標的名稱", "")) or normalize_underlying_code_for_group(raw_code) or normalize_price_code(raw_code)
-        if code:
-            if not preserve_underlying_code:
-                row["標的股"] = code
-            row["標的名稱"] = resolve_underlying_name_final(
-                code,
-                row.get("標的名稱", ""),
-                warrant_code=row.get("權證代號", ""),
-                warrant_name=row.get("權證名稱", ""),
-                source_sheet=source_sheet,
-                context_date=row.get("統計日期", ""),
-                local_code_name_map=local_map,
-            )
-
-    return rows
 
 def _record_key(rec, key_cols):
     parts = []
@@ -3678,45 +3102,12 @@ def merge_result_values_for_gsheet(title, new_values):
     for rec in new_records:
         rec["資料範圍"] = current_scope
 
-    # 近10日分點明細是獨立資料集，只能使用本次 RUN 重新計算出的完整快照。
-    # 不和 TOP15 / 近7日 / A/B/C/D 結果共用舊列，也不保留任何舊日期、舊欄位、舊格式或舊 key。
-    # 目的：避免舊版權證層級資料、其他資料範圍或歷史殘留混進近10日分點 TOP10 排名。
-    if safe_worksheet_title(title) == BROKER_10D_DETAIL_SHEET:
-        print("  ☁️ 近10日分點買賣明細採獨立完整快照覆蓋：不讀舊資料、不合併舊資料。")
-        return new_values
-
     old_values = read_existing_worksheet_values(title)
     old_headers, old_records = _values_to_records(old_values, header_row_idx=0, default_scope=GSHEET_LEGACY_SCOPE_LABEL)
     old_headers = _ensure_scope_header(old_headers) if old_headers else []
 
-    # 近10日分點明細是「同日期完整快照」。
-    # 若只用 upsert，舊版權證層級資料因 key 不同會被保留下來，圖片端會同時讀到舊權證列與新標的列。
-    # 因此同一資料範圍 + 統計日期改採快照替換，確保每次都是最新的標的層級資料。
-    if safe_worksheet_title(title) in (BROKER_10D_DETAIL_SHEET, WARRANT_CONSENSUS_7D_SHEET, TOP15_POSITION_DETAIL_SHEET, TOP15_CONSENSUS_SHEET):
-        replace_scope_dates = set()
-        for rec in new_records:
-            scope_value = str(rec.get("資料範圍", current_scope) or current_scope).strip()
-            stat_date = normalize_date_str(strip_gsheet_text_prefix(rec.get("統計日期", "")))
-            if scope_value and stat_date:
-                replace_scope_dates.add((scope_value, stat_date))
-
-        if replace_scope_dates and old_records:
-            before_count = len(old_records)
-            filtered_old_records = []
-            for rec in old_records:
-                scope_value = str(rec.get("資料範圍", GSHEET_LEGACY_SCOPE_LABEL) or GSHEET_LEGACY_SCOPE_LABEL).strip()
-                stat_date = normalize_date_str(strip_gsheet_text_prefix(rec.get("統計日期", "")))
-                if (scope_value, stat_date) in replace_scope_dates:
-                    continue
-                filtered_old_records.append(rec)
-            old_records = filtered_old_records
-            removed_count = before_count - len(old_records)
-            if removed_count > 0:
-                print(f"  ☁️ 已清除同日期舊版快照資料：{removed_count:,} 筆，改用本次標的層級快照。")
-
     headers = []
-    header_source = new_headers if safe_worksheet_title(title) == BROKER_10D_DETAIL_SHEET else (new_headers + old_headers)
-    for h in header_source:
+    for h in new_headers + old_headers:
         h = str(h).strip()
         if h and h not in headers:
             headers.append(h)
@@ -4720,704 +4111,6 @@ def load_warrants_cache():
     return warrants
 
 
-_WARRANT_UNDERLYING_LOOKUP_CACHE = None
-_STOCK_NAME_CODE_LOOKUP_CACHE = None
-_STOCK_NAME_RESOLVER_CACHE = None
-_STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = None
-_STOCK_CODE_NAME_LOOKUP_CACHE = None
-_STOCK_NAME_SHEET_CACHE = None
-
-
-def is_probably_warrant_code_for_underlying(value):
-    """
-    判斷「標的股」欄位是否疑似被錯塞成權證代號。
-
-    修正近10日分點明細時很重要：
-    如果舊快取把 064390、701234 這類權證代號放在標的股欄位，
-    後續就會變成一檔權證一列，無法合併成同標的統計。
-    """
-    s = normalize_price_code(value)
-
-    if not s:
-        return False
-
-    if s in KNOWN_UNDERLYING_CODE_NAME_MAP:
-        return False
-
-    # ETF / ETN / 主動式 ETF 常見 00 開頭，包含 00631L、00632R、00981A，不可視為權證。
-    if s.startswith("00"):
-        return False
-
-    # 4 碼股票不是權證。
-    if re.fullmatch(r"\d{4}", s):
-        return False
-
-    # 台股權證常見 5 碼被吃掉前導 0，或正常 6 碼。
-    if re.fullmatch(r"\d{5,6}", s):
-        return True
-
-    return False
-
-
-def is_probably_warrant_name_text(value):
-    """判斷某個名稱欄位是否其實是權證名稱，而不是標的名稱。"""
-    s = str(value or "").strip()
-    if not s:
-        return False
-
-    # 台股權證名稱常見格式：台積電元大63購11、洋華統一64購01。
-    # 這類字串不可再拿去解析成標的代號，避免 64購01 被誤抓成 6401。
-    return ("購" in s) or ("售" in s)
-
-
-def _normalize_stock_cache_header(header):
-    return str(header or "").strip().replace(" ", "").replace("　", "")
-
-
-def _pick_stock_cache_column(headers, candidates):
-    normalized = [_normalize_stock_cache_header(h) for h in headers]
-    for cand in candidates:
-        cand_norm = _normalize_stock_cache_header(cand)
-        for idx, h in enumerate(normalized):
-            if h == cand_norm:
-                return idx
-    for cand in candidates:
-        cand_norm = _normalize_stock_cache_header(cand)
-        for idx, h in enumerate(normalized):
-            if cand_norm and cand_norm in h:
-                return idx
-    return None
-
-
-def load_stock_name_cache_map():
-    """
-    從 Google Sheet「快取_股票名稱」讀取股票 / ETF 代號與名稱。
-
-    回傳：
-    {
-        "code_to_name": {"2330": "台積電", ...},
-        "name_to_code": {"台積電": "2330", ...},
-    }
-
-    這張表由使用者維護時優先度最高，可避免 ISIN 即時抓取失敗，或權證快取舊資料污染時
-    造成標的股代號與股名對不起來。
-    """
-    global _STOCK_NAME_SHEET_CACHE
-
-    if _STOCK_NAME_SHEET_CACHE is not None:
-        return _STOCK_NAME_SHEET_CACHE
-
-    code_to_name = {}
-    name_to_code = {}
-
-    def add_pair(code, name):
-        code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
-        name = str(name or "").strip()
-
-        if not code or not name:
-            return
-        if is_probably_warrant_code_for_underlying(code):
-            return
-        if is_probably_warrant_name_text(name):
-            return
-        if name == code:
-            return
-
-        code_to_name[code] = name
-        name_to_code[name] = code
-
-    # 先讀本機備援 CSV；如果 GitHub Actions 同步過這份檔案，即使暫時讀不到 Sheet 也可用。
-    try:
-        local_df = read_cache_csv(STOCK_NAME_CACHE_PATH)
-    except Exception:
-        local_df = pd.DataFrame()
-
-    if local_df is not None and not local_df.empty:
-        headers = list(local_df.columns)
-        code_col = _pick_stock_cache_column(headers, ["代號", "股票代號", "證券代號", "標的股", "商品代號", "code"])
-        name_col = _pick_stock_cache_column(headers, ["名稱", "股票名稱", "證券名稱", "標的名稱", "商品名稱", "name"])
-        if code_col is not None and name_col is not None:
-            code_header = headers[code_col]
-            name_header = headers[name_col]
-            for _, row in local_df.iterrows():
-                add_pair(row.get(code_header, ""), row.get(name_header, ""))
-
-    # 再讀 Google Sheet 的快取_股票名稱，並以 Sheet 為準覆蓋本機快取。
-    if GSHEET_CACHE_ENABLED and gsheet_enabled():
-        try:
-            sh = get_gsheet_spreadsheet()
-            ws = sh.worksheet(safe_worksheet_title(STOCK_NAME_CACHE_SHEET)) if sh is not None else None
-            values = ws.get_all_values() if ws is not None else []
-
-            if values and len(values) >= 2:
-                headers = [str(h).strip() for h in values[0]]
-                code_col = _pick_stock_cache_column(headers, ["代號", "股票代號", "證券代號", "標的股", "商品代號", "code"])
-                name_col = _pick_stock_cache_column(headers, ["名稱", "股票名稱", "證券名稱", "標的名稱", "商品名稱", "name"])
-
-                if code_col is not None and name_col is not None:
-                    for row in values[1:]:
-                        code = row[code_col] if code_col < len(row) else ""
-                        name = row[name_col] if name_col < len(row) else ""
-                        add_pair(strip_gsheet_text_prefix(code), strip_gsheet_text_prefix(name))
-
-                    try:
-                        df = pd.DataFrame([
-                            {"代號": code, "名稱": name}
-                            for code, name in sorted(code_to_name.items())
-                        ])
-                        if not df.empty:
-                            df.to_csv(STOCK_NAME_CACHE_PATH, index=False, encoding=CACHE_ENCODING)
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"  ⚠️ 讀取 {STOCK_NAME_CACHE_SHEET} 失敗，改用 ISIN / 既有快取：{type(e).__name__}: {e}")
-
-    _STOCK_NAME_SHEET_CACHE = {
-        "code_to_name": code_to_name,
-        "name_to_code": name_to_code,
-    }
-    return _STOCK_NAME_SHEET_CACHE
-
-
-def get_stock_map_for_underlying_resolution():
-    """
-    建立更穩定的「標的名稱 -> 標的代號」對照表。
-
-    用途：
-    1. 權證清單快取若曾被舊版程式污染，例如把 64購01 誤寫成 6401，
-       可以用權證名稱前綴重新反查正確標的。
-    2. ISIN 即時抓取失敗時，仍保留已知 ETF 與既有快取中看起來正常的標的名稱。
-    3. 同標的合併時優先用股名 resolver 驗證，降低股號名稱對不起來造成 TOP10 拆列的機率。
-    """
-    global _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE
-
-    if _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE is not None:
-        return _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE
-
-    stock_map = {}
-
-    stock_name_cache = load_stock_name_cache_map()
-    for name, code in (stock_name_cache.get("name_to_code", {}) or {}).items():
-        if name and code:
-            stock_map[str(name).strip()] = str(code).strip()
-
-    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-        if name and code:
-            stock_map[str(name).strip()] = str(code).strip()
-
-    # 優先即時抓上市 / 上櫃 ISIN，這是權證名稱前綴反查最可靠的來源。
-    for market_name, mode in [("上市", "2"), ("上櫃", "4")]:
-        try:
-            resp = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=20,
-            )
-            resp.raise_for_status()
-            resp.encoding = "cp950"
-            tables = pd.read_html(StringIO(resp.text))
-            df = tables[0].iloc[2:].reset_index(drop=True)
-            stock_map.update(build_stock_map(df))
-        except Exception as e:
-            print(f"  ⚠️ {market_name} ISIN 標的對照表取得失敗，改用既有權證快取輔助：{type(e).__name__}: {e}")
-
-    # ISIN 失敗時，用既有權證快取中「看起來正常」的標的欄位補強。
-    for w in load_warrants_cache() or []:
-        raw_code = normalize_underlying_for_display(w.get("標的股", ""), "")
-        raw_name = str(w.get("標的名稱", "")).strip()
-
-        if not raw_code or is_probably_warrant_code_for_underlying(raw_code):
-            continue
-        if not raw_name or is_probably_warrant_name_text(raw_name):
-            continue
-
-        stock_map.setdefault(raw_name, raw_code)
-
-    # 最後再次以「快取_股票名稱」為準，避免 ISIN 名稱過長或舊權證快取覆蓋使用者維護的股名。
-    for name, code in (stock_name_cache.get("name_to_code", {}) or {}).items():
-        if name and code:
-            stock_map[str(name).strip()] = str(code).strip()
-
-    _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = {
-        str(name).strip(): str(code).strip()
-        for name, code in stock_map.items()
-        if str(name).strip() and str(code).strip()
-    }
-    return _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE
-
-
-def get_stock_name_by_code_for_underlying_resolution(code):
-    """
-    由標的代號反查標的名稱。
-
-    近10日明細合併時，如果權證快取只有標的股代號、標的名稱空白，
-    原本 Sheet 會出現 6106 / 5905 但名稱空白。這裡用 ISIN / 已知 ETF /
-    既有正常快取建立 code -> name 對照，讓輸出欄位能補回標的名稱。
-    """
-    global _STOCK_CODE_NAME_LOOKUP_CACHE
-
-    norm_code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
-    if not norm_code:
-        return ""
-
-    if _STOCK_CODE_NAME_LOOKUP_CACHE is None:
-        code_name = {}
-
-        # 使用者維護的 Google Sheet「快取_股票名稱」優先。
-        try:
-            stock_name_cache = load_stock_name_cache_map()
-        except Exception:
-            stock_name_cache = {"code_to_name": {}}
-
-        for cached_code, cached_name in (stock_name_cache.get("code_to_name", {}) or {}).items():
-            k = normalize_underlying_code_for_group(cached_code) or normalize_price_code(cached_code)
-            if k and cached_name:
-                code_name[k] = str(cached_name).strip()
-
-        # 已知 ETF / 指數型標的補強。
-        for known_code, known_name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-            k = normalize_underlying_code_for_group(known_code)
-            if k and known_name and k not in code_name:
-                code_name[k] = str(known_name).strip()
-
-        try:
-            stock_map = get_stock_map_for_underlying_resolution()
-        except Exception:
-            stock_map = {}
-
-        for name, mapped_code in (stock_map or {}).items():
-            display_name = str(name or "").strip()
-            mapped_code_norm = normalize_underlying_code_for_group(mapped_code) or normalize_price_code(mapped_code)
-
-            if not display_name or not mapped_code_norm:
-                continue
-            if display_name == mapped_code_norm:
-                continue
-            if is_probably_warrant_name_text(display_name):
-                continue
-
-            current = code_name.get(mapped_code_norm, "")
-            # 若快取_股票名稱已有名稱，優先保留；否則才用 ISIN / 其他快取補名稱。
-            if not current or (mapped_code_norm not in (stock_name_cache.get("code_to_name", {}) or {}) and len(display_name) < len(current)):
-                code_name[mapped_code_norm] = display_name
-
-        _STOCK_CODE_NAME_LOOKUP_CACHE = code_name
-
-    return _STOCK_CODE_NAME_LOOKUP_CACHE.get(norm_code, "")
-
-
-def infer_underlying_from_warrant_name(warrant_name, stock_map=None, resolver=None):
-    """
-    從權證名稱前綴反查標的，僅使用股票名稱 resolver，不從尾碼數字硬抽代號。
-    """
-    warrant_name = str(warrant_name or "").strip()
-    if not warrant_name:
-        return "", ""
-
-    if stock_map is None:
-        stock_map = get_stock_map_for_underlying_resolution()
-
-    if not stock_map:
-        return "", ""
-
-    try:
-        if resolver is None:
-            resolver = build_underlying_resolver(stock_map)
-        code, name = find_underlying_info(warrant_name, stock_map, resolver)
-        code = normalize_underlying_for_display(code, name)
-        if code and not is_probably_warrant_code_for_underlying(code):
-            return code, fill_known_underlying_name_if_missing(code, name)
-    except Exception:
-        pass
-
-    return "", ""
-
-
-def _is_clean_stock_name_pair(code, name):
-    code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
-    name = str(name or "").strip()
-
-    if not code or not name:
-        return False
-    if is_probably_warrant_code_for_underlying(code):
-        return False
-    if is_probably_warrant_name_text(name):
-        return False
-    if name == code:
-        return False
-    return True
-
-
-def rebuild_clean_stock_name_cache(force=False):
-    """
-    重建乾淨的「快取_股票名稱」。
-
-    目的：
-    - 快取_股票名稱只能放股票 / ETF / 特別股 / 指數型標的。
-    - 排除權證代號與名稱，避免近10日標的名稱被權證污染。
-    - 保留使用者原本 sheet 中乾淨的代號名稱，再用 TWSE/TPEX ISIN 補齊不完整股票名稱。
-    """
-    global _STOCK_NAME_SHEET_CACHE, _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE, _STOCK_CODE_NAME_LOOKUP_CACHE
-
-    if not force and not REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START:
-        return False
-
-    code_to_name = {}
-
-    def add_pair(code, name):
-        code_norm = normalize_underlying_code_for_group(code) or normalize_price_code(code)
-        name_norm = str(name or "").strip()
-        if not _is_clean_stock_name_pair(code_norm, name_norm):
-            return
-        code_to_name[code_norm] = name_norm
-
-    # 先讀使用者既有快取，保留乾淨資料。
-    try:
-        stock_cache = load_stock_name_cache_map()
-        for code, name in (stock_cache.get("code_to_name", {}) or {}).items():
-            add_pair(code, name)
-    except Exception:
-        pass
-
-    # 已知 ETF / 特殊標的補強。
-    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-        add_pair(code, name)
-
-    # 再抓上市 / 上櫃 ISIN 補齊股票與 ETF 名稱。
-    for market_name, mode in [("上市", "2"), ("上櫃", "4")]:
-        try:
-            resp = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=20,
-            )
-            resp.raise_for_status()
-            resp.encoding = "cp950"
-            tables = pd.read_html(StringIO(resp.text))
-            df = tables[0].iloc[2:].reset_index(drop=True)
-            stock_map = build_stock_map(df)  # name -> code
-            for name, code in (stock_map or {}).items():
-                add_pair(code, name)
-        except Exception as e:
-            print(f"  ⚠️ {market_name} ISIN 股票名稱補齊失敗：{type(e).__name__}: {e}")
-
-    if not code_to_name:
-        print("  ⚠️ 快取_股票名稱重建略過：沒有可用乾淨資料。")
-        return False
-
-    # 清掉記憶體快取，避免用到重建前的污染資料。
-    _STOCK_NAME_SHEET_CACHE = None
-    _STOCK_MAP_FOR_UNDERLYING_RESOLUTION_CACHE = None
-    _STOCK_CODE_NAME_LOOKUP_CACHE = None
-
-    df = pd.DataFrame([
-        {"代號": add_gsheet_text_prefix(code), "名稱": name}
-        for code, name in sorted(code_to_name.items(), key=lambda kv: kv[0])
-    ])
-
-    write_cache_csv(df, STOCK_NAME_CACHE_PATH, sync_gsheet=True)
-
-    # 重新載入乾淨快取到記憶體。
-    _STOCK_NAME_SHEET_CACHE = None
-    load_stock_name_cache_map()
-    print(f"  ✅ 已重建乾淨 {STOCK_NAME_CACHE_SHEET}：{len(code_to_name):,} 筆，已排除權證資料。")
-    return True
-
-
-def build_warrant_underlying_lookup_from_cache():
-    """
-    從權證清單快取建立：
-    1. 權證代號 -> 正確標的股 / 標的名稱
-    2. 標的名稱 -> 標的股
-    3. 權證名稱前綴解析器
-
-    用途：修復舊候選快取 / 舊歷史快取裡標的股欄位錯誤或空白的資料。
-
-    重要修正：
-    - 不再用權證名稱尾碼數字當標的代號。
-    - 權證清單快取若被舊版污染，會優先用「權證名稱前綴 + ISIN 標的名稱」重新反查。
-    - 標的名稱若看起來像權證名稱，會直接視為無效標的名稱。
-    """
-    global _WARRANT_UNDERLYING_LOOKUP_CACHE, _STOCK_NAME_CODE_LOOKUP_CACHE, _STOCK_NAME_RESOLVER_CACHE
-
-    if _WARRANT_UNDERLYING_LOOKUP_CACHE is not None:
-        return _WARRANT_UNDERLYING_LOOKUP_CACHE
-
-    warrant_lookup = {}
-    stock_name_code = {}
-
-    stock_map = get_stock_map_for_underlying_resolution()
-    for stock_name, stock_code in stock_map.items():
-        stock_name_norm = normalize_stock_name_text(stock_name)
-        stock_code_norm = normalize_underlying_for_display(stock_code, stock_name)
-        if stock_name_norm and stock_code_norm:
-            stock_name_code[stock_name_norm] = stock_code_norm
-
-    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-        stock_name_code[normalize_stock_name_text(name)] = code
-        stock_map.setdefault(name, code)
-
-    try:
-        resolver = build_underlying_resolver(stock_map)
-    except Exception:
-        resolver = None
-
-    for w in load_warrants_cache() or []:
-        warrant_code = normalize_warrant_code_for_unique(w.get("代號", ""))
-        warrant_name = str(w.get("名稱", "")).strip()
-        raw_underlying_code = str(w.get("標的股", "")).strip()
-        raw_underlying_name = str(w.get("標的名稱", "")).strip()
-
-        if is_probably_warrant_name_text(raw_underlying_name):
-            raw_underlying_name = ""
-
-        inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name, stock_map, resolver)
-
-        raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
-        raw_name = fill_known_underlying_name_if_missing(raw_code, raw_underlying_name)
-
-        # 若能從權證名稱前綴明確反查，優先用反查結果。
-        # 這可以修正舊快取把「64購01」誤寫成 6401 的情況。
-        if inferred_code:
-            underlying_code = inferred_code
-            underlying_name = inferred_name
-        elif raw_code and not is_probably_warrant_code_for_underlying(raw_code):
-            # 只有在無法從權證名稱反查時，才退回快取既有標的欄位。
-            underlying_code = raw_code
-            underlying_name = raw_name
-        else:
-            underlying_code = ""
-            underlying_name = raw_name
-
-        if not warrant_code:
-            continue
-
-        if underlying_code and not is_probably_warrant_code_for_underlying(underlying_code):
-            warrant_lookup[warrant_code] = {
-                "標的股": underlying_code,
-                "標的名稱": underlying_name,
-                "權證名稱": warrant_name,
-            }
-
-            if underlying_name and not is_probably_warrant_name_text(underlying_name):
-                stock_name_code[normalize_stock_name_text(underlying_name)] = underlying_code
-
-    # resolver 必須用最新 stock_name_code 重建一次，讓後續 resolve_item_underlying_identity 可直接查名稱。
-    stock_map_for_resolver = {
-        name: code
-        for name, code in stock_name_code.items()
-        if name and code
-    }
-    try:
-        resolver = build_underlying_resolver(stock_map_for_resolver)
-    except Exception:
-        resolver = None
-
-    _WARRANT_UNDERLYING_LOOKUP_CACHE = warrant_lookup
-    _STOCK_NAME_CODE_LOOKUP_CACHE = stock_name_code
-    _STOCK_NAME_RESOLVER_CACHE = resolver
-    return _WARRANT_UNDERLYING_LOOKUP_CACHE
-
-def resolve_item_underlying_identity(item, warrant_lookup=None):
-    """
-    回傳 item 的正確標的股代號與標的名稱。
-
-    這是 A/B/C/D 與一般事件共用的穩定解析邏輯，順序刻意保守：
-    1. 權證清單快取中的權證代號對應標的。
-    2. item 內原本的標的股，但必須不像權證代號，且不能等於權證代號。
-    3. item / 權證快取的標的名稱對照代號。
-    4. 已知 ETF / 特殊標的名稱。
-    5. 最後才用權證名稱前綴反推標的。
-
-    重點：不再從權證名稱尾碼抽數字，也不保留疑似權證代號的標的股。
-    近10日需要更強的名稱覆蓋時，使用 resolve_10d_item_underlying_identity()，
-    避免近10日修正污染 A/B/C/D 原本流程。
-    """
-    warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
-
-    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-    warrant_name = str(item.get("warrant_name", "")).strip()
-    raw_underlying_code = str(item.get("underlying_code", "")).strip()
-    raw_underlying_name = str(item.get("underlying_name", "")).strip()
-
-    if is_probably_warrant_name_text(raw_underlying_name):
-        raw_underlying_name = ""
-
-    cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
-    cached_name = str(cached.get("標的名稱", "")).strip()
-    if is_probably_warrant_name_text(cached_name):
-        cached_name = ""
-
-    # 1. 權證清單 lookup：只接受不像權證代號、且不等於權證代號的標的股。
-    cached_code = normalize_underlying_for_display(cached.get("標的股", ""), cached_name)
-    if (
-        cached_code
-        and not is_probably_warrant_code_for_underlying(cached_code)
-        and normalize_warrant_code_for_unique(cached_code) != warrant_code
-    ):
-        return cached_code, fill_known_underlying_name_if_missing(cached_code, cached_name or raw_underlying_name)
-
-    # 2. item 原始標的：只接受乾淨標的股，不拿 warrant_name 當 fallback，避免 64購01 → 6401。
-    normalized_raw_code = normalize_underlying_for_display(raw_underlying_code, raw_underlying_name)
-    normalized_raw_name = fill_known_underlying_name_if_missing(normalized_raw_code, raw_underlying_name)
-
-    if (
-        normalized_raw_code
-        and not is_probably_warrant_code_for_underlying(normalized_raw_code)
-        and normalize_warrant_code_for_unique(normalized_raw_code) != warrant_code
-        and not is_probably_warrant_name_text(normalized_raw_name)
-    ):
-        return normalized_raw_code, normalized_raw_name
-
-    # 3. 用標的名稱對照。
-    name_lookup = _STOCK_NAME_CODE_LOOKUP_CACHE or {}
-    for name_candidate in [raw_underlying_name, cached_name]:
-        if is_probably_warrant_name_text(name_candidate):
-            continue
-        name_key = normalize_stock_name_text(name_candidate)
-        mapped_code = name_lookup.get(name_key, "")
-        if (
-            mapped_code
-            and not is_probably_warrant_code_for_underlying(mapped_code)
-            and normalize_warrant_code_for_unique(mapped_code) != warrant_code
-        ):
-            return mapped_code, fill_known_underlying_name_if_missing(mapped_code, name_candidate)
-
-    # 4. 已知 ETF / 指數型標的名稱。這裡不放 warrant_name，避免權證名稱尾碼干擾。
-    known_code, known_name = resolve_known_underlying_from_text(" ".join([raw_underlying_name, cached_name]))
-    if known_code:
-        return known_code, known_name
-
-    # 5. 最後才從權證名稱前綴反推標的；這裡用股票名稱 resolver，不抽尾碼數字。
-    try:
-        stock_map = get_stock_map_for_underlying_resolution()
-        if stock_map:
-            inferred_code, inferred_name = infer_underlying_from_warrant_name(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
-            if (
-                inferred_code
-                and not is_probably_warrant_code_for_underlying(inferred_code)
-                and normalize_warrant_code_for_unique(inferred_code) != warrant_code
-            ):
-                return inferred_code, fill_known_underlying_name_if_missing(inferred_code, inferred_name)
-    except Exception:
-        pass
-
-    return "", raw_underlying_name or cached_name
-
-def repair_item_underlying_identity(item, warrant_lookup=None):
-    """
-    修正 item 內的標的股 / 標的名稱。
-
-    重要防呆：如果解析不到正確標的，且原本欄位疑似是權證代號或等於權證代號，
-    會主動清空，不讓 56630 這種權證代號流進 A/B/C/D 後續價格計算。
-    """
-    if item is None:
-        return item
-
-    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-    old_code = normalize_underlying_for_display(item.get("underlying_code", ""), item.get("underlying_name", ""))
-    old_name = str(item.get("underlying_name", "") or "").strip()
-
-    underlying_code, underlying_name = resolve_item_underlying_identity(item, warrant_lookup=warrant_lookup)
-
-    if underlying_code and not is_probably_warrant_code_for_underlying(underlying_code) and normalize_warrant_code_for_unique(underlying_code) != warrant_code:
-        item["underlying_code"] = underlying_code
-        item["underlying_name"] = underlying_name or fill_known_underlying_name_if_missing(underlying_code, old_name)
-    else:
-        # 舊資料若把權證代號塞進標的股，必須清掉，避免權證與標的報酬抓同一檔。
-        if old_code and (is_probably_warrant_code_for_underlying(old_code) or normalize_warrant_code_for_unique(old_code) == warrant_code):
-            item["underlying_code"] = ""
-            if is_probably_warrant_name_text(old_name) or not old_name:
-                item["underlying_name"] = ""
-        elif underlying_name and not is_probably_warrant_name_text(underlying_name):
-            item["underlying_name"] = underlying_name
-
-    return item
-
-
-def resolve_10d_item_underlying_identity(item, warrant_lookup=None):
-    """
-    近10日專用標的解析。
-
-    近10日要做同標的合併與圖卡排名，因此這裡把「快取_股票名稱」視為
-    代號 -> 名稱的第一優先來源；只要代號查得到，就覆蓋任何非空但可能錯的舊名稱。
-    這個函式只給近10日 / 近7日標的層級統計使用，不再反向污染 ABCD。
-    """
-    warrant_lookup = warrant_lookup if warrant_lookup is not None else build_warrant_underlying_lookup_from_cache()
-
-    warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-    warrant_name = str(item.get("warrant_name", "") or "").strip()
-    raw_code = normalize_underlying_for_display(item.get("underlying_code", ""), item.get("underlying_name", ""))
-    raw_name = str(item.get("underlying_name", "") or "").strip()
-    if is_probably_warrant_name_text(raw_name):
-        raw_name = ""
-
-    stock_cache = load_stock_name_cache_map()
-    code_to_name = stock_cache.get("code_to_name", {}) or {}
-    name_to_code = stock_cache.get("name_to_code", {}) or {}
-
-    def clean_return(code, name=""):
-        code = normalize_underlying_code_for_group(code) or normalize_price_code(code)
-        if not code:
-            return "", ""
-        if is_probably_warrant_code_for_underlying(code) or normalize_warrant_code_for_unique(code) == warrant_code:
-            return "", ""
-        # 使用者維護的快取_股票名稱第一優先，直接覆蓋非空舊名稱。
-        sheet_name = get_stock_name_cache_name_by_code(code)
-        if sheet_name:
-            return code, sheet_name
-        name = fill_known_underlying_name_if_missing(code, name)
-        if is_probably_warrant_name_text(name):
-            name = ""
-        return code, name
-
-    # 1. 若原始標的代號本身乾淨，先用代號查快取_股票名稱覆蓋名稱。
-    code, name = clean_return(raw_code, raw_name)
-    if code:
-        return code, name
-
-    # 2. 權證清單 lookup。
-    cached = warrant_lookup.get(warrant_code, {}) if warrant_code else {}
-    cached_name = str(cached.get("標的名稱", "") or "").strip()
-    if is_probably_warrant_name_text(cached_name):
-        cached_name = ""
-    code, name = clean_return(cached.get("標的股", ""), cached_name or raw_name)
-    if code:
-        return code, name
-
-    # 3. 乾淨名稱反查代號。
-    for name_candidate in [raw_name, cached_name]:
-        if not name_candidate or is_probably_warrant_name_text(name_candidate):
-            continue
-        mapped = name_to_code.get(str(name_candidate).strip()) or name_to_code.get(normalize_stock_name_text(name_candidate))
-        code, name = clean_return(mapped, name_candidate)
-        if code:
-            return code, name
-
-    # 4. 權證名稱前綴反推，僅用乾淨的股票名稱表 / ISIN 對照。
-    try:
-        stock_map = get_stock_map_for_underlying_resolution()
-        code, name = infer_underlying_from_warrant_name(warrant_name, stock_map, _STOCK_NAME_RESOLVER_CACHE)
-        code, name = clean_return(code, name)
-        if code:
-            return code, name
-    except Exception:
-        pass
-
-    return "", ""
-
-
-def repair_10d_item_underlying_identity(item, warrant_lookup=None):
-    """近10日專用修正，不動 ABCD 共用 item 的原始解析規則。"""
-    if item is None:
-        return item
-    code, name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_lookup)
-    item = dict(item)
-    item["underlying_code"] = code
-    item["underlying_name"] = name
-    return item
-
-
 def save_broker_map_cache(broker_map):
     if not USE_CACHE or not broker_map:
         return
@@ -5818,7 +4511,6 @@ def items_from_history_cache(history_df, candidate_filter=None):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     group_cols = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號"]
-    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for key, g in df.groupby(group_cols, dropna=False):
         warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = key
@@ -5842,7 +4534,6 @@ def items_from_history_cache(history_df, candidate_filter=None):
             "df": item_df,
         }
 
-        item = repair_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
         item["events_a"] = build_a_events_from_df(item)
         items.append(item)
 
@@ -5864,25 +4555,14 @@ def build_stock_map(df):
             parts = cell.split("　", 1)
             code, name = parts[0].strip(), parts[1].strip()
         else:
-            m = re.match(r"^([0-9]{4,6}[A-Z]?)\s+(.+)$", cell, flags=re.I)
+            m = re.match(r"^(\d{4})\s+(.+)$", cell)
             if m:
                 code, name = m.group(1), m.group(2)
             else:
                 continue
 
-        code = str(code).strip().upper()
-        name = str(name).strip()
-
-        # 支援：
-        # 1. 4 碼股票：2408
-        # 2. 5 / 6 碼 ETF：00919、006208
-        # 3. 含英文字尾 ETF：00631L、00632R、00981A
-        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", code, flags=re.I):
+        if len(code) == 4 and code.isdigit():
             stock_map[name] = code
-
-    # 即使 ISIN 名稱或簡稱不一致，也把已知特殊 ETF 正式名稱補進 stock_map。
-    for code, name in KNOWN_UNDERLYING_CODE_NAME_MAP.items():
-        stock_map.setdefault(name, code)
 
     return stock_map
 
@@ -6018,11 +4698,6 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
 
     if not wname:
         return "", ""
-
-    # 先處理權證名稱中的 ETF 特殊簡稱，避免 T50正2 / T50反1 / 台股增長找不到標的。
-    known_code, known_name = resolve_known_underlying_from_text(wname)
-    if known_code:
-        return known_code, known_name
 
     if resolver is None:
         resolver = build_underlying_resolver(stock_map)
@@ -6490,6 +5165,63 @@ def build_underlying_expanded_candidates(warrants, broker_map, underlying_codes,
     )
     return candidates
 
+def build_selected_full_market_candidates(warrants, broker_map):
+    """
+    RUN_MODE=1 精選分點完整追蹤候選池。
+
+    目的：
+    原本候選池依賴 api4 prescan，若某檔權證的分點資料沒有在 api4 回傳清單中出現，
+    即使該分點今天實際有大額賣出，後續也不會進入 API5 歷史抓取與每日賣出明細。
+
+    這裡改成針對精選分點建立「所有認購權證 × 精選分點」候選組合，
+    再由 API5 抓該分點該權證完整 250 天歷史，確保像「元大南屯賣南亞科」這類
+    分散在多檔權證的大額賣超不會因候選池漏抓而少算。
+    """
+    print("【Step 3a】RUN_MODE=1 精選分點完整候選池：所有認購權證 × 精選分點...")
+
+    if not warrants or not broker_map:
+        return []
+
+    candidates = []
+    seen = set()
+
+    for w in warrants:
+        warrant_code = str(w.get("代號", "")).strip()
+        warrant_name = str(w.get("名稱", "")).strip()
+        underlying_code = str(w.get("標的股", "")).strip()
+        underlying_name = str(w.get("標的名稱", "")).strip()
+
+        if not warrant_code or not warrant_name:
+            continue
+
+        for label, (broker_name, broker_code) in broker_map.items():
+            broker_code = str(broker_code).strip()
+            if not broker_code:
+                continue
+
+            c = (
+                warrant_code,
+                warrant_name,
+                underlying_code,
+                underlying_name,
+                label,
+                str(broker_name).strip(),
+                broker_code,
+            )
+            key = candidate_key_from_tuple(c)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            candidates.append(c)
+
+    print(
+        f"  ✅ 精選分點完整候選池建立完成：權證 {len(warrants):,} 支 × 分點 {len(broker_map):,} 間 "
+        f"→ {len(candidates):,} 組候選"
+    )
+    return candidates
+
 
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
@@ -6738,7 +5470,6 @@ def process_candidate(warrant_code, warrant_name, underlying_code, underlying_na
         "df":              df,
     }
 
-    item = repair_item_underlying_identity(item)
     item["events_a"] = build_a_events_from_df(item)
     return item
 
@@ -7053,138 +5784,6 @@ def simulate_group_outcome(event, item_map):
     return event
 
 
-
-def find_item_for_event_lot(item_map, broker_code, warrant_code):
-    broker_code = str(broker_code or "").strip()
-    warrant_code = str(warrant_code or "").strip()
-    if not broker_code or not warrant_code:
-        return None
-
-    candidates = []
-    for wc in [warrant_code, normalize_warrant_code_for_unique(warrant_code), normalize_price_code(warrant_code)]:
-        wc = str(wc or "").strip()
-        if wc and wc not in candidates:
-            candidates.append(wc)
-
-    for wc in candidates:
-        item = item_map.get((broker_code, wc))
-        if item:
-            return item
-
-    return None
-
-
-def build_remaining_buy_lots_from_history_for_window(item, start_date, end_date):
-    """
-    用完整 API5 歷史 FIFO 算出指定視窗內買進、到 end_date 仍留下的真實 lot。
-
-    這修正 B/C/D 群組事件用淨額 / 淨股數當均價造成的報酬失真，也讓視窗內賣出優先扣舊庫存。
-    """
-    df = item.get("df", pd.DataFrame()) if item else pd.DataFrame()
-    if df is None or df.empty or "日期" not in df.columns:
-        return []
-
-    start_dt = parse_date(start_date)
-    end_dt = parse_date(end_date)
-    if not start_dt or not end_dt:
-        return []
-
-    df2 = df.copy()
-    df2["dt_parsed"] = df2["日期"].map(parse_date)
-    df2 = df2.dropna(subset=["dt_parsed"])
-    df2 = df2[df2["dt_parsed"] <= end_dt].sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
-
-    lots = []
-
-    for row in df2.itertuples(index=False):
-        row_dict = row._asdict()
-        dt = row_dict.get("dt_parsed")
-        date_str = normalize_date_str(row_dict.get("日期", ""))
-        buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
-        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
-        buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
-
-        # 權證不可當沖：同一天先賣出，只扣舊庫存。
-        if sell_qty > 0:
-            sell_left = sell_qty
-            for lot in lots:
-                if sell_left <= 0:
-                    break
-                if lot.get("剩餘股數", 0) <= 0:
-                    continue
-                alloc = min(sell_left, lot["剩餘股數"])
-                lot["剩餘股數"] -= alloc
-                sell_left -= alloc
-
-        if buy_qty > 0 and buy_amount > 0:
-            lots.append({
-                "買進日": date_str,
-                "股數": buy_qty,
-                "剩餘股數": buy_qty,
-                "金額": buy_amount,
-                "均價": buy_amount / buy_qty if buy_qty else 0,
-                "視窗買進": bool(dt and start_dt <= dt <= end_dt),
-            })
-
-    out = []
-    for lot in lots:
-        if not lot.get("視窗買進"):
-            continue
-        qty = top15_safe_float(lot.get("剩餘股數", 0))
-        avg = top15_safe_float(lot.get("均價", 0))
-        if qty <= 0 or avg <= 0:
-            continue
-        out.append({
-            "買進日": lot.get("買進日", ""),
-            "金額": qty * avg,
-            "股數": qty,
-        })
-    return out
-
-
-def build_event_lots_from_history_or_fallback(item_map, broker_code, warrant_summaries, start_date, end_date):
-    """
-    建立 B/C/D 群組事件使用的 lots。
-
-    threshold 仍用同標的全部權證的淨買進合計判斷；但報酬 lot 改用完整歷史 FIFO 後，
-    只留下視窗內買進且到事件日仍未被賣掉的部位。
-    """
-    lots = []
-    for rec in warrant_summaries:
-        warrant_code = normalize_warrant_code_for_unique(rec.get("權證代號", ""))
-        warrant_name = str(rec.get("權證名稱", "")).strip()
-        if not warrant_code:
-            continue
-
-        item = find_item_for_event_lot(item_map, broker_code, warrant_code)
-        history_lots = build_remaining_buy_lots_from_history_for_window(item, start_date, end_date) if item else []
-
-        if history_lots:
-            for hlot in history_lots:
-                lots.append({
-                    "買進日": hlot.get("買進日") or end_date,
-                    "權證代號": warrant_code,
-                    "權證名稱": warrant_name,
-                    "金額": int(round(top15_safe_float(hlot.get("金額", 0)))),
-                    "股數": int(round(top15_safe_float(hlot.get("股數", 0)))),
-                })
-            continue
-
-        # 備援：沒有 item_map 原始流水時才用正淨買資料。
-        net_amount = top15_safe_float(rec.get("淨買超金額", 0))
-        net_shares = top15_safe_float(rec.get("淨買超股數", 0))
-        if net_amount > 0 and net_shares > 0:
-            lots.append({
-                "買進日": end_date,
-                "權證代號": warrant_code,
-                "權證名稱": warrant_name,
-                "金額": int(round(net_amount)),
-                "股數": int(round(net_shares)),
-            })
-
-    return [lot for lot in lots if int(lot.get("金額", 0) or 0) > 0 and int(lot.get("股數", 0) or 0) > 0]
-
-
 # ══════════════════════════════════════════════════════════════════════
 # B：同分點 + 同標的 + 同一天，多檔權證合計買超 >= 100萬
 # ══════════════════════════════════════════════════════════════════════
@@ -7197,64 +5796,51 @@ def build_b_events(daily_records, item_map):
         return events
 
     df = pd.DataFrame(daily_records)
-    if df.empty:
-        return events
+    df = df[(df["買超金額"] > 0) & (df["買超股數"] > 0)]
 
-    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0) | (df["買進股數"] > 0) | (df["賣出股數"] > 0)].copy()
     if df.empty:
         return events
 
     group_cols = ["分點", "分點名稱", "券商代號", "標的股", "日期"]
 
-    for key, g in df.groupby(group_cols, sort=False):
+    for key, g in df.groupby(group_cols):
         broker_label, broker_name, broker_code, underlying_code, date = key
 
-        warrant_rows = g.groupby(["權證代號", "權證名稱"], as_index=False).agg({
-            "買進金額": "sum",
-            "賣出金額": "sum",
-            "買進股數": "sum",
-            "賣出股數": "sum",
-        })
+        lots = []
 
-        summaries = []
-        total_amount = 0.0
-        total_shares = 0.0
-        active_warrants = set()
+        warrant_rows = g.groupby(["權證代號", "權證名稱"], as_index=False).agg({
+            "買超金額": "sum",
+            "買超股數": "sum",
+        })
 
         for wr in warrant_rows.itertuples(index=False):
             wr = wr._asdict()
             warrant_code = normalize_warrant_code_for_unique(wr["權證代號"])
-            if not warrant_code or warrant_code in used_b_warrant_codes:
+
+            # B 類內部已經使用過的權證，不再進入後續 B 事件。
+            if warrant_code in used_b_warrant_codes:
                 continue
 
-            buy_amount = top15_safe_float(wr.get("買進金額", 0))
-            sell_amount = top15_safe_float(wr.get("賣出金額", 0))
-            buy_shares = top15_safe_float(wr.get("買進股數", 0))
-            sell_shares = top15_safe_float(wr.get("賣出股數", 0))
-            net_amount = buy_amount - sell_amount
-            net_shares = buy_shares - sell_shares
+            if int(wr["買超金額"]) <= 0 or int(wr["買超股數"]) <= 0:
+                continue
 
-            if buy_amount > 0 or sell_amount > 0 or buy_shares > 0 or sell_shares > 0:
-                active_warrants.add(warrant_code)
-
-            total_amount += net_amount
-            total_shares += net_shares
-            summaries.append({
+            lots.append({
+                "買進日": date,
                 "權證代號": wr["權證代號"],
                 "權證名稱": wr["權證名稱"],
-                "淨買超金額": net_amount,
-                "淨買超股數": net_shares,
+                "金額": int(wr["買超金額"]),
+                "股數": int(wr["買超股數"]),
             })
 
-        if len(active_warrants) < 2:
+        warrant_count = len(set(normalize_warrant_code_for_unique(lot["權證代號"]) for lot in lots))
+        total_amount = int(sum(lot["金額"] for lot in lots))
+        total_shares = int(sum(lot["股數"] for lot in lots))
+
+        if warrant_count < 2:
             continue
         if total_amount < AMOUNT_THRESH:
             continue
         if total_shares <= 0:
-            continue
-
-        lots = build_event_lots_from_history_or_fallback(item_map, broker_code, summaries, date, date)
-        if not lots:
             continue
 
         event = {
@@ -7267,11 +5853,11 @@ def build_b_events(daily_records, item_map):
             "起始日": date,
             "結束日": date,
             "事件日": date,
-            "涵蓋權證數": len(active_warrants),
+            "涵蓋權證數": warrant_count,
             "權證清單": "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in lots]),
-            "買超金額": int(round(total_amount)),
-            "買超股數": int(round(total_shares)),
-            "買超張數": int(round(total_shares)) // 1000,
+            "買超金額": total_amount,
+            "買超股數": total_shares,
+            "買超張數": total_shares // 1000,
             "lots": lots,
         }
 
@@ -7299,22 +5885,24 @@ def build_c_events(daily_records, item_map):
         return events
 
     df = pd.DataFrame(daily_records)
+    df = df[(df["買超金額"] > 0) & (df["買超股數"] > 0)].copy()
+
     if df.empty:
         return events
 
-    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0) | (df["買進股數"] > 0) | (df["賣出股數"] > 0)].copy()
-    if df.empty:
+    # C 類必須使用「連續 3 個交易日」視窗。
+    # 速度優化：同一群組內改用滑動視窗累加 / 扣除，避免每個視窗重複 isin + groupby。
+    trade_dates = sorted(df["日期"].dropna().unique())
+
+    if len(trade_dates) < 3:
         return events
 
     window_days = 3
-    trade_dates = sorted(df["日期"].dropna().unique())
-    if len(trade_dates) < window_days:
-        return events
-
     date_to_idx = {d: i for i, d in enumerate(trade_dates)}
     df["日期序號"] = df["日期"].map(date_to_idx)
     df = df.dropna(subset=["日期序號"]).copy()
     df["日期序號"] = df["日期序號"].astype(int)
+
     if df.empty:
         return events
 
@@ -7322,96 +5910,136 @@ def build_c_events(daily_records, item_map):
 
     for key, g in df.groupby(main_group_cols, sort=False):
         broker_label, broker_name, broker_code, underlying_code = key
+
         if g.empty:
             continue
 
         g = g.sort_values(["日期序號", "權證代號"]).reset_index(drop=True)
         rows_by_idx = {}
+
         for row in g[[
-            "日期序號", "日期", "券商代號", "標的股", "權證代號", "權證名稱",
-            "買進金額", "賣出金額", "買進股數", "賣出股數"
+            "日期序號", "日期", "券商代號", "標的股", "權證代號", "權證名稱", "買超金額", "買超股數"
         ]].itertuples(index=False, name=None):
-            rows_by_idx.setdefault(int(row[0]), []).append(row)
+            idx = int(row[0])
+            rows_by_idx.setdefault(idx, []).append(row)
 
         if not rows_by_idx:
             continue
 
         min_idx = min(rows_by_idx.keys())
         max_idx = max(rows_by_idx.keys())
+
         start_i_min = max(0, min_idx - window_days + 1)
         start_i_max = min(max_idx, len(trade_dates) - window_days)
+
         if start_i_max < start_i_min:
             continue
 
+        window_lot_map = {}
+        window_keys = set()
+
+        def add_row_to_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, buy_shares = row
+            lot_key = (date, normalize_warrant_code_for_unique(warrant_code), warrant_name)
+
+            rec = window_lot_map.setdefault(lot_key, {
+                "買進日": date,
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "金額": 0,
+                "股數": 0,
+            })
+
+            rec["金額"] += int(buy_amount)
+            rec["股數"] += int(buy_shares)
+
+            window_keys.add(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        def remove_row_from_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, buy_shares = row
+            lot_key = (date, normalize_warrant_code_for_unique(warrant_code), warrant_name)
+            rec = window_lot_map.get(lot_key)
+
+            if rec:
+                rec["金額"] -= int(buy_amount)
+                rec["股數"] -= int(buy_shares)
+
+                if rec["金額"] == 0 and rec["股數"] == 0:
+                    window_lot_map.pop(lot_key, None)
+
+            window_keys.discard(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        first_start = start_i_min
+        first_end = first_start + window_days - 1
+
+        for idx in range(first_start, first_end + 1):
+            for row in rows_by_idx.get(idx, []):
+                add_row_to_window(row)
+
         for start_idx in range(start_i_min, start_i_max + 1):
             end_idx = start_idx + window_days - 1
-            window_dates = trade_dates[start_idx:end_idx + 1]
-            window_rows = []
-            for idx in range(start_idx, end_idx + 1):
-                window_rows.extend(rows_by_idx.get(idx, []))
 
-            if not window_rows:
+            if start_idx > start_i_min:
+                remove_idx = start_idx - 1
+                add_idx = end_idx
+
+                for row in rows_by_idx.get(remove_idx, []):
+                    remove_row_from_window(row)
+
+                for row in rows_by_idx.get(add_idx, []):
+                    add_row_to_window(row)
+
+            if not window_lot_map:
                 continue
 
-            window_keys = set()
-            warrant_map = {}
+            if window_keys & used_c_keys:
+                continue
 
-            for row in window_rows:
-                _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
-                warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
-                if not warrant_code_norm or warrant_code_norm in used_c_warrant_codes:
+            lots = []
+
+            for lot_key in sorted(window_lot_map.keys()):
+                rec = window_lot_map[lot_key]
+                warrant_code = normalize_warrant_code_for_unique(rec["權證代號"])
+
+                if warrant_code in used_c_warrant_codes:
                     continue
 
-                rec = warrant_map.setdefault(warrant_code_norm, {
-                    "權證代號": warrant_code,
-                    "權證名稱": warrant_name,
-                    "買進金額": 0.0,
-                    "賣出金額": 0.0,
-                    "買進股數": 0.0,
-                    "賣出股數": 0.0,
-                })
-                rec["買進金額"] += top15_safe_float(buy_amount)
-                rec["賣出金額"] += top15_safe_float(sell_amount)
-                rec["買進股數"] += top15_safe_float(buy_shares)
-                rec["賣出股數"] += top15_safe_float(sell_shares)
-                window_keys.add(make_daily_key(row_broker_code, row_underlying_code, date, warrant_code))
+                lot_amount = int(rec["金額"])
+                lot_shares = int(rec["股數"])
 
-            if not warrant_map or (window_keys & used_c_keys):
-                continue
+                if lot_amount <= 0 or lot_shares <= 0:
+                    continue
 
-            summaries = []
-            total_amount = 0.0
-            total_shares = 0.0
-            active_warrants = set()
-
-            for warrant_code_norm, rec in warrant_map.items():
-                buy_amount = rec["買進金額"]
-                sell_amount = rec["賣出金額"]
-                buy_shares = rec["買進股數"]
-                sell_shares = rec["賣出股數"]
-                net_amount = buy_amount - sell_amount
-                net_shares = buy_shares - sell_shares
-                if buy_amount > 0 or sell_amount > 0 or buy_shares > 0 or sell_shares > 0:
-                    active_warrants.add(warrant_code_norm)
-                total_amount += net_amount
-                total_shares += net_shares
-                summaries.append({
+                lots.append({
+                    "買進日": rec["買進日"],
                     "權證代號": rec["權證代號"],
                     "權證名稱": rec["權證名稱"],
-                    "淨買超金額": net_amount,
-                    "淨買超股數": net_shares,
+                    "金額": lot_amount,
+                    "股數": lot_shares,
                 })
 
-            if len(active_warrants) < 2:
+            warrant_count = len(set(normalize_warrant_code_for_unique(lot["權證代號"]) for lot in lots))
+            total_amount = int(sum(lot["金額"] for lot in lots))
+            total_shares = int(sum(lot["股數"] for lot in lots))
+
+            if warrant_count < 2:
                 continue
             if total_amount < AMOUNT_THRESH:
                 continue
             if total_shares <= 0:
                 continue
 
-            lots = build_event_lots_from_history_or_fallback(item_map, broker_code, summaries, window_dates[0], window_dates[-1])
-            if not lots:
-                continue
+            window_dates = trade_dates[start_idx:end_idx + 1]
 
             event = {
                 "事件類型": "C-同標的3日累積買超",
@@ -7423,11 +6051,11 @@ def build_c_events(daily_records, item_map):
                 "起始日": window_dates[0],
                 "結束日": window_dates[-1],
                 "事件日": window_dates[-1],
-                "涵蓋權證數": len(active_warrants),
+                "涵蓋權證數": warrant_count,
                 "權證清單": "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in lots]),
-                "買超金額": int(round(total_amount)),
-                "買超股數": int(round(total_shares)),
-                "買超張數": int(round(total_shares)) // 1000,
+                "買超金額": total_amount,
+                "買超股數": total_shares,
+                "買超張數": total_shares // 1000,
                 "lots": lots,
             }
 
@@ -7442,6 +6070,8 @@ def build_c_events(daily_records, item_map):
     return events
 
 
+
+
 # ══════════════════════════════════════════════════════════════════════
 # D：同分點 + 同標的，近 N 個交易日累積淨買進 >= 100萬
 # ══════════════════════════════════════════════════════════════════════
@@ -7449,12 +6079,19 @@ def build_c_events(daily_records, item_map):
 
 def build_d_events(daily_records, item_map, window_days=None):
     """
-    D 類補強慢慢買 / 分批買情境。
+    D 類補強慢慢買 / 分批買情境：
 
-    修正重點：
-    - 視窗門檻用同分點 + 同標的 + 所有相關權證的真實淨額：買進金額 - 賣出金額。
-    - 淨賣出的權證不再被整檔排除後才加總，避免高估 D 事件。
-    - 事件 lot 不再用淨額 / 淨股數當均價，改用完整歷史 FIFO 留下的視窗買進部位。
+    條件：
+    1. 同一分點 + 同一標的
+    2. 近 N 個交易日內，所有相關認購權證合計
+    3. 累積淨買進金額 >= AMOUNT_THRESH
+    4. 累積淨買進股數 > 0
+    5. A / B / C 已使用過的權證代號不再重複進 D
+
+    速度優化版：
+    原本每個群組、每個視窗都重新做 DataFrame isin + groupby，
+    會非常慢。這版改成同一群組內用滑動視窗累加 / 扣除，
+    避免大量重複篩選與 groupby。
     """
     if window_days is None:
         window_days = D_WINDOW_DAYS
@@ -7467,14 +6104,17 @@ def build_d_events(daily_records, item_map, window_days=None):
         return events
 
     df = pd.DataFrame(daily_records)
+
     if df.empty:
         return events
 
-    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0) | (df["買進股數"] > 0) | (df["賣出股數"] > 0)].copy()
+    df = df[(df["買進金額"] > 0) | (df["賣出金額"] > 0)].copy()
+
     if df.empty:
         return events
 
     trade_dates = sorted(df["日期"].dropna().unique())
+
     if len(trade_dates) < window_days:
         return events
 
@@ -7482,6 +6122,7 @@ def build_d_events(daily_records, item_map, window_days=None):
     df["日期序號"] = df["日期"].map(date_to_idx)
     df = df.dropna(subset=["日期序號"]).copy()
     df["日期序號"] = df["日期序號"].astype(int)
+
     if df.empty:
         return events
 
@@ -7489,92 +6130,144 @@ def build_d_events(daily_records, item_map, window_days=None):
 
     for key, g in df.groupby(main_group_cols, sort=False):
         broker_label, broker_name, broker_code, underlying_code = key
+
         if g.empty:
             continue
 
         g = g.sort_values(["日期序號", "權證代號"]).reset_index(drop=True)
         rows_by_idx = {}
+
         for row in g[[
             "日期序號", "日期", "券商代號", "標的股", "權證代號", "權證名稱",
             "買進金額", "賣出金額", "買進股數", "賣出股數"
         ]].itertuples(index=False, name=None):
-            rows_by_idx.setdefault(int(row[0]), []).append(row)
+            idx = int(row[0])
+            rows_by_idx.setdefault(idx, []).append(row)
 
         if not rows_by_idx:
             continue
 
         min_idx = min(rows_by_idx.keys())
         max_idx = max(rows_by_idx.keys())
+
         start_i_min = max(0, min_idx - window_days + 1)
         start_i_max = min(max_idx, len(trade_dates) - window_days)
+
         if start_i_max < start_i_min:
             continue
 
+        window_warrant_map = {}
+        window_keys = set()
+
+        def add_row_to_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
+            warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
+
+            net_amount = int(buy_amount) - int(sell_amount)
+            net_shares = int(buy_shares) - int(sell_shares)
+
+            rec = window_warrant_map.setdefault(warrant_code_norm, {
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "買超金額": 0,
+                "買超股數": 0,
+            })
+
+            rec["買超金額"] += net_amount
+            rec["買超股數"] += net_shares
+
+            window_keys.add(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        def remove_row_from_window(row):
+            _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
+            warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
+
+            net_amount = int(buy_amount) - int(sell_amount)
+            net_shares = int(buy_shares) - int(sell_shares)
+
+            rec = window_warrant_map.get(warrant_code_norm)
+
+            if rec:
+                rec["買超金額"] -= net_amount
+                rec["買超股數"] -= net_shares
+
+                if rec["買超金額"] == 0 and rec["買超股數"] == 0:
+                    window_warrant_map.pop(warrant_code_norm, None)
+
+            window_keys.discard(make_daily_key(
+                row_broker_code,
+                row_underlying_code,
+                date,
+                warrant_code,
+            ))
+
+        first_start = start_i_min
+        first_end = first_start + window_days - 1
+
+        for idx in range(first_start, first_end + 1):
+            for row in rows_by_idx.get(idx, []):
+                add_row_to_window(row)
+
         for start_idx in range(start_i_min, start_i_max + 1):
             end_idx = start_idx + window_days - 1
-            window_dates = trade_dates[start_idx:end_idx + 1]
-            window_rows = []
-            for idx in range(start_idx, end_idx + 1):
-                window_rows.extend(rows_by_idx.get(idx, []))
 
-            if not window_rows:
+            if start_idx > start_i_min:
+                remove_idx = start_idx - 1
+                add_idx = end_idx
+
+                for row in rows_by_idx.get(remove_idx, []):
+                    remove_row_from_window(row)
+
+                for row in rows_by_idx.get(add_idx, []):
+                    add_row_to_window(row)
+
+            if not window_warrant_map:
                 continue
 
-            window_keys = set()
-            warrant_map = {}
+            # 避免 D 類滑動視窗彼此重複使用同一批資料
+            if window_keys & used_d_keys:
+                continue
 
-            for row in window_rows:
-                _, date, row_broker_code, row_underlying_code, warrant_code, warrant_name, buy_amount, sell_amount, buy_shares, sell_shares = row
+            start_date = trade_dates[start_idx]
+            end_date = trade_dates[end_idx]
+            lots = []
+
+            for warrant_code in sorted(window_warrant_map.keys()):
+                rec = window_warrant_map[warrant_code]
                 warrant_code_norm = normalize_warrant_code_for_unique(warrant_code)
-                if not warrant_code_norm or warrant_code_norm in used_d_warrant_codes:
+
+                # D 類內部已經使用過的權證，不再進入後續 D 事件。
+                if warrant_code_norm in used_d_warrant_codes:
                     continue
 
-                rec = warrant_map.setdefault(warrant_code_norm, {
-                    "權證代號": warrant_code,
-                    "權證名稱": warrant_name,
-                    "買進金額": 0.0,
-                    "賣出金額": 0.0,
-                    "買進股數": 0.0,
-                    "賣出股數": 0.0,
-                })
-                rec["買進金額"] += top15_safe_float(buy_amount)
-                rec["賣出金額"] += top15_safe_float(sell_amount)
-                rec["買進股數"] += top15_safe_float(buy_shares)
-                rec["賣出股數"] += top15_safe_float(sell_shares)
-                window_keys.add(make_daily_key(row_broker_code, row_underlying_code, date, warrant_code))
+                lot_amount = int(rec["買超金額"])
+                lot_shares = int(rec["買超股數"])
 
-            if not warrant_map or (window_keys & used_d_keys):
-                continue
+                if lot_amount <= 0 or lot_shares <= 0:
+                    continue
 
-            summaries = []
-            total_amount = 0.0
-            total_shares = 0.0
-            active_warrants = set()
-
-            for warrant_code_norm, rec in warrant_map.items():
-                buy_amount = rec["買進金額"]
-                sell_amount = rec["賣出金額"]
-                buy_shares = rec["買進股數"]
-                sell_shares = rec["賣出股數"]
-                net_amount = buy_amount - sell_amount
-                net_shares = buy_shares - sell_shares
-                if buy_amount > 0 or sell_amount > 0 or buy_shares > 0 or sell_shares > 0:
-                    active_warrants.add(warrant_code_norm)
-                total_amount += net_amount
-                total_shares += net_shares
-                summaries.append({
+                lots.append({
+                    "買進日": end_date,
                     "權證代號": rec["權證代號"],
                     "權證名稱": rec["權證名稱"],
-                    "淨買超金額": net_amount,
-                    "淨買超股數": net_shares,
+                    "金額": lot_amount,
+                    "股數": lot_shares,
                 })
+
+            total_amount = int(sum(lot["金額"] for lot in lots))
+            total_shares = int(sum(lot["股數"] for lot in lots))
 
             if total_amount < AMOUNT_THRESH:
                 continue
+
             if total_shares <= 0:
                 continue
 
-            lots = build_event_lots_from_history_or_fallback(item_map, broker_code, summaries, window_dates[0], window_dates[-1])
             if not lots:
                 continue
 
@@ -7585,14 +6278,14 @@ def build_d_events(daily_records, item_map, window_days=None):
                 "分點名稱": broker_name,
                 "券商代號": broker_code,
                 "標的股": underlying_code,
-                "起始日": window_dates[0],
-                "結束日": window_dates[-1],
-                "事件日": window_dates[-1],
-                "涵蓋權證數": len(active_warrants),
+                "起始日": start_date,
+                "結束日": end_date,
+                "事件日": end_date,
+                "涵蓋權證數": len(set(lot["權證代號"] for lot in lots)),
                 "權證清單": "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in lots]),
-                "買超金額": int(round(total_amount)),
-                "買超股數": int(round(total_shares)),
-                "買超張數": int(round(total_shares)) // 1000,
+                "買超金額": total_amount,
+                "買超股數": total_shares,
+                "買超張數": total_shares // 1000,
                 "lots": lots,
             }
 
@@ -8061,40 +6754,6 @@ def get_latest_price_info_on_or_before(price_cache, code, target_date):
     return valid[-1][1], valid[-1][0]
 
 
-def get_latest_price_info_before(price_cache, code, target_date):
-    """
-    取得指定代號在 target_date 之前最近一筆有效收盤價。
-
-    用途：
-    近10日現股漲跌幅若統計視窗包含 10 個交易日，起算價要取視窗第一個交易日前一個交易日的收盤，
-    才是一般認知的「近10個交易日漲跌幅」，而不是視窗首日收盤到今天的 9 個跳動。
-    """
-    prices = get_price_series_from_cache(price_cache, code)
-
-    if not prices:
-        return None, ""
-
-    target_str = normalize_date_str(target_date)
-    valid = []
-
-    for d, p in prices.items():
-        dt = parse_date(d)
-        price = safe_price_float(p)
-
-        if not dt or price is None:
-            continue
-
-        d_norm = normalize_date_str(d)
-        if d_norm < target_str:
-            valid.append((d_norm, price))
-
-    if not valid:
-        return None, ""
-
-    valid.sort(key=lambda x: x[0])
-    return valid[-1][1], valid[-1][0]
-
-
 def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, lookback_days=None):
     """
     從 A/B/C/D 事件抓近 N 個有效事件交易日。
@@ -8119,71 +6778,6 @@ def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, lo
 
     recent_dates = sorted(dates, reverse=True)[:max(int(lookback_days), 1)]
     return recent_dates
-
-
-def collect_top15_recent_trading_dates_from_price_cache(price_cache, target_date=None, lookback_days=None, fallback_event_dates=None):
-    """
-    取得 TOP15 使用的近 N 個市場交易日。
-
-    修正重點：
-    TOP15 的「近一個月 / 近 22 個有效交易日」應該用市場交易日切區間，
-    不能只用 A/B/C/D 有事件的日期。若只用事件日期，五分點事件較少時會一路往前補到
-    4 月底，導致 6 月中統計期間變成 2026/04/28 ～ 2026/06/15。
-
-    這個函式只決定 TOP15 的日期窗口，不改買進 lot、賣出扣減、剩餘成本、排序與報酬率算法。
-    """
-    if lookback_days is None:
-        lookback_days = TOP15_LOOKBACK_TRADING_DAYS
-
-    try:
-        lookback_days = max(int(lookback_days), 1)
-    except Exception:
-        lookback_days = TOP15_LOOKBACK_TRADING_DAYS
-
-    target_dt = parse_date(target_date) if target_date else datetime.today()
-    if target_dt is None:
-        target_dt = datetime.today()
-
-    dates = set()
-
-    if isinstance(price_cache, dict):
-        for prices in price_cache.values():
-            if not isinstance(prices, dict):
-                continue
-
-            for date_str, price in prices.items():
-                dt = parse_date(date_str)
-                if not dt or dt > target_dt:
-                    continue
-
-                if safe_price_float(price) is None:
-                    continue
-
-                dates.add(dt.strftime("%Y/%m/%d"))
-
-    if dates:
-        sorted_dates = sorted(dates, reverse=True)
-        if len(sorted_dates) >= lookback_days:
-            return sorted_dates[:lookback_days]
-
-        # 價格快取日期不足時，以最後一個有價格的日期為錨點補週一～週五，
-        # 避免直接用 target_date 把尚未收盤 / 尚未有價格的今天放進統計期間。
-        anchor_dt = parse_date(sorted_dates[0]) or target_dt
-        cur = anchor_dt
-        while len(dates) < lookback_days and (anchor_dt - cur).days <= 120:
-            if cur.weekday() < 5:
-                dates.add(cur.strftime("%Y/%m/%d"))
-            cur -= timedelta(days=1)
-
-        return sorted(dates, reverse=True)[:lookback_days]
-
-    # 若價格快取完全沒有可用交易日，才退回舊版事件日期邏輯，避免無資料時 TOP15 整張空白。
-    fallback_event_dates = list(fallback_event_dates or [])
-    if fallback_event_dates:
-        return sorted(set(fallback_event_dates), reverse=True)[:lookback_days]
-
-    return []
-
 
 
 def _top15_return_event_date(ev, is_a=False):
@@ -8627,14 +7221,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    fallback_recent_dates = collect_top15_return_recent_dates(
+    recent_dates = collect_top15_return_recent_dates(
         a_events, b_events, c_events, d_events, TOP15_LOOKBACK_TRADING_DAYS
-    )
-    recent_dates = collect_top15_recent_trading_dates_from_price_cache(
-        price_cache,
-        target_date=target_date,
-        lookback_days=TOP15_LOOKBACK_TRADING_DAYS,
-        fallback_event_dates=fallback_recent_dates,
     )
 
     if not recent_dates:
@@ -11088,163 +9676,23 @@ def _near10_window_dates(target_date=None, window_days=None):
     return target_date, target_dt, start_date, start_dt, window_days, period_text
 
 
-_MARKET_TRADING_WINDOW_CACHE = {}
-
-
-def _collect_price_cache_dates_for_market_calendar(price_cache, target_dt):
-    dates = set()
-
-    for source_cache in [price_cache or {}, load_price_cache() or {}]:
-        if not source_cache:
-            continue
-
-        for prices in source_cache.values():
-            if not isinstance(prices, dict):
-                continue
-
-            for d, p in prices.items():
-                dt = parse_date(d)
-                price = safe_price_float(p)
-
-                if not dt or price is None:
-                    continue
-
-                if dt <= target_dt:
-                    dates.add(dt.strftime("%Y/%m/%d"))
-
-    return dates
-
-
-def _fetch_market_calendar_dates_from_reference(target_dt, window_days):
+def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     """
-    取得市場交易日備援日曆。
+    收集近10日分點買賣明細會用到的標的股代號。
 
-    近10日明細不能用「分點有活動的日期」推算視窗，否則分點中間沒交易時會把區間拉太長。
-    這裡用台股代表標的的價格日期建立市場交易日；只作為交易日曆，不參與標的報酬計算。
+    圖卡新增「現股10日」後，不能只補權證最新價；
+    若分點資料仍停在前一交易日，但盤後現股價格已更新，這裡會先把近10日有買賣的標的股最新收盤價補進快取。
     """
-    dates = set()
-    lookback_days = max(int(window_days) * 5 + 20, 60)
-    start_dt = target_dt - timedelta(days=lookback_days)
-    end_dt = min(target_dt, datetime.today())
-
-    for ref_code in ["0050", "2330", "^TWII"]:
-        try:
-            prices = fetch_twse_prices(ref_code, start_dt, end_dt)
-        except Exception:
-            prices = {}
-
-        for d, p in (prices or {}).items():
-            dt = parse_date(d)
-            price = safe_price_float(p)
-
-            if not dt or price is None:
-                continue
-
-            if dt <= target_dt:
-                dates.add(dt.strftime("%Y/%m/%d"))
-
-        if len(dates) >= max(int(window_days) + 1, 2):
-            break
-
-    return dates
-
-
-def _market_trading_window_dates(price_cache=None, target_date=None, window_days=None):
-    target_date, target_dt, fallback_start_date, fallback_start_dt, window_days, _ = _near10_window_dates(target_date, window_days)
-    window_days = max(int(window_days), 1)
-    cache_key = (target_date, window_days)
-
-    if cache_key in _MARKET_TRADING_WINDOW_CACHE:
-        return _MARKET_TRADING_WINDOW_CACHE[cache_key]
-
-    dates = _collect_price_cache_dates_for_market_calendar(price_cache, target_dt)
-
-    # 若快取交易日不足，或最新交易日離統計日太遠，就用代表標的補抓市場交易日。
-    sorted_dates = sorted(dates)
-    latest_dt = parse_date(sorted_dates[-1]) if sorted_dates else None
-    need_fetch_calendar = len(sorted_dates) < max(window_days + 1, 2)
-
-    if latest_dt is None or (target_dt - latest_dt).days > 5:
-        need_fetch_calendar = True
-
-    if need_fetch_calendar:
-        dates.update(_fetch_market_calendar_dates_from_reference(target_dt, window_days))
-
-    sorted_dates = sorted(dates)
-
-    if not sorted_dates:
-        period_text = f"{fallback_start_date} ～ {target_date}"
-        result = (target_date, target_dt, fallback_start_date, fallback_start_dt, window_days, period_text, [])
-        _MARKET_TRADING_WINDOW_CACHE[cache_key] = result
-        return result
-
-    recent_dates = sorted_dates[-window_days:]
-    start_date = recent_dates[0]
-    start_dt = parse_date(start_date) or fallback_start_dt
-    period_text = f"{start_date} ～ {target_date}"
-    result = (target_date, target_dt, start_date, start_dt, len(recent_dates), period_text, recent_dates)
-    _MARKET_TRADING_WINDOW_CACHE[cache_key] = result
-    return result
-
-
-def _near10_trading_window_from_items(items, target_date=None, window_days=None, price_cache=None):
-    """
-    近10日分點明細使用真正的「近 N 個市場交易日」，不是 N 個日曆天，也不是分點有活動的日期。
-    交易日來源優先使用價格快取中的市場收盤日期；不足時用代表標的補抓市場交易日。
-    """
-    return _market_trading_window_dates(price_cache=price_cache, target_date=target_date, window_days=window_days)
-
-
-def _active_broker_labels_and_codes():
-    labels = {str(label).strip() for label in TARGET_PATTERNS.keys() if str(label).strip()}
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
-
-    for value in FALLBACK.values():
-        try:
-            if isinstance(value, (list, tuple)) and len(value) >= 2:
-                code = str(value[1]).strip()
-                if code:
-                    codes.add(code)
-        except Exception:
-            continue
-
-    return labels, codes
-
-
-def _filter_items_for_active_brokers(items):
-    """只保留目前 RUN_MODE 作用中的分點，避免舊快取其他分點混進近10日表。"""
-    labels, codes = _active_broker_labels_and_codes()
-    out = []
-
-    for item in items or []:
-        broker_label = str(item.get("broker_label", "") or "").strip()
-        broker_code = str(item.get("broker_code", "") or "").strip()
-
-        if broker_label in labels or broker_code in codes:
-            out.append(item)
-
-    return out
-
-
-def _collect_recent_underlying_codes_for_10d(items, target_date=None, price_cache=None):
-    """
-    收集近10日分點買賣明細有活動的標的股代號。
-
-    這個函式保留作為備援；實際價格補抓優先使用
-    _collect_ranked_underlying_codes_for_10d()，只抓會進每個分點買超 / 賣超 TOP10 的標的股，避免全表補價太慢。
-    """
-    target_date, target_dt, start_date, start_dt, window_days, period_text, recent_dates = _near10_trading_window_from_items(items, target_date, price_cache=price_cache)
-    codes = set()
-    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for item in items or []:
         df = item.get("df", pd.DataFrame())
         if df is None or df.empty:
             continue
 
-        underlying_code, _ = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
-        underlying_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
+        underlying_code = normalize_underlying_code_for_group(item.get("underlying_code", "")) or normalize_price_code(item.get("underlying_code", ""))
+        if not underlying_code:
             continue
 
         has_recent_activity = False
@@ -11271,81 +9719,6 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None, price_cach
     return codes
 
 
-def _collect_ranked_underlying_codes_for_10d(items, target_date=None, price_cache=None, top_n=10):
-    """
-    近10日現股價格只補「每個分點買超 TOP N / 賣超 TOP N」會用到的標的。
-
-    統計方式與快取_近10日分點買賣明細一致：
-    同一分點 + 同一標的底下所有權證先加總，買超依淨買超金額排序、賣超依淨賣超金額排序。
-    """
-    target_date, target_dt, start_date, start_dt, window_days, period_text, recent_dates = _near10_trading_window_from_items(items, target_date, price_cache=price_cache)
-    top_n = max(int(top_n or 10), 1)
-    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
-    agg = {}
-
-    for item in items or []:
-        df = item.get("df", pd.DataFrame())
-        if df is None or df.empty:
-            continue
-
-        broker_label = str(item.get("broker_label", "") or "").strip()
-        broker_code = str(item.get("broker_code", "") or "").strip()
-        if not broker_label:
-            continue
-
-        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
-        underlying_code = normalize_underlying_code_for_group(underlying_code) or normalize_price_code(underlying_code)
-        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
-            continue
-
-        key = (broker_label, broker_code, underlying_code)
-        rec = agg.setdefault(key, {
-            "broker_label": broker_label,
-            "broker_code": broker_code,
-            "underlying_code": underlying_code,
-            "buy_amount": 0.0,
-            "sell_amount": 0.0,
-        })
-
-        for row in df.itertuples(index=False):
-            row_dict = row._asdict()
-            date_str = normalize_date_str(row_dict.get("日期", ""))
-            dt = parse_date(date_str)
-            if not dt or dt < start_dt or dt > target_dt:
-                continue
-
-            rec["buy_amount"] += top15_safe_float(row_dict.get("買進金額", 0))
-            rec["sell_amount"] += top15_safe_float(row_dict.get("賣出金額", 0))
-
-    by_broker = {}
-    for rec in agg.values():
-        by_broker.setdefault((rec["broker_label"], rec["broker_code"]), []).append(rec)
-
-    codes = set()
-    for broker_key, records in by_broker.items():
-        buy_ranked = [r for r in records if float(r.get("buy_amount", 0) or 0) - float(r.get("sell_amount", 0) or 0) > 0]
-        sell_ranked = [r for r in records if float(r.get("sell_amount", 0) or 0) - float(r.get("buy_amount", 0) or 0) > 0]
-
-        buy_ranked = sorted(
-            buy_ranked,
-            key=lambda r: float(r.get("buy_amount", 0) or 0) - float(r.get("sell_amount", 0) or 0),
-            reverse=True,
-        )[:top_n]
-        sell_ranked = sorted(
-            sell_ranked,
-            key=lambda r: float(r.get("sell_amount", 0) or 0) - float(r.get("buy_amount", 0) or 0),
-            reverse=True,
-        )[:top_n]
-
-        for r in buy_ranked + sell_ranked:
-            code = normalize_underlying_code_for_group(r.get("underlying_code", "")) or normalize_price_code(r.get("underlying_code", ""))
-            if code and not is_probably_warrant_code_for_underlying(code):
-                codes.add(code)
-
-    print(f"  ✅ 近10日現股價格僅補排名標的：{len(codes):,} 檔（每分點買超TOP{top_n}+賣超TOP{top_n}）")
-    return codes
-
-
 def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     """
     近10日分點明細的「現股10日」需要標的股起始價與最新收盤價。
@@ -11356,11 +9729,9 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     if not BROKER_10D_DETAIL_ENABLED:
         return price_cache
 
-    # 使用者需求：近10日現股標的只需要抓會進每個分點買超TOP10 / 賣超TOP10排名的股票。
-    # 不再對近10日全表所有標的補價，避免完整回補時為大量非排名標的浪費時間。
-    codes = _collect_ranked_underlying_codes_for_10d(items, target_date, price_cache=price_cache, top_n=10)
+    codes = _collect_recent_underlying_codes_for_10d(items, target_date)
     if not codes:
-        print("  ✅ 近10日分點明細沒有需要預抓的排名標的股價格。")
+        print("  ✅ 近10日分點明細沒有需要預抓的標的股價格。")
         return price_cache
 
     target_date = normalize_top15_target_date(target_date)
@@ -11429,8 +9800,49 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     return price_cache
 
 
-def _collect_recent_warrant_codes_for_10d(items, target_date=None, price_cache=None):
-    target_date, target_dt, start_date, start_dt, window_days, period_text, recent_dates = _near10_trading_window_from_items(items, target_date, price_cache=price_cache)
+def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
+    """
+    判斷近10日賣超是否真的需要最新權證價格作為成本備援。
+
+    若 API5 歷史中已有賣出前的買進成本，賣超報酬可用 FIFO / 歷史均價估算，
+    不需要再補抓最新權證價格；只有在賣出時完全沒有歷史買進成本可參考時，
+    才補抓最新價作為備援，避免報酬率空白。
+    """
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty or "日期" not in df.columns:
+        return False
+
+    df = df.copy()
+    df["dt_parsed"] = df["日期"].map(parse_date)
+    df = df.dropna(subset=["dt_parsed"]).sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
+
+    historical_buy_qty = 0.0
+    historical_buy_amount = 0.0
+
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
+        dt = row_dict.get("dt_parsed")
+        buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+        buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+        sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+
+        in_window = bool(dt and start_dt <= dt <= target_dt)
+
+        # 權證不可當沖：同一天先賣舊庫存，因此這裡要在加入當日買進前先判斷賣出。
+        if in_window and (sell_qty > 0 or sell_amount > 0):
+            if historical_buy_qty <= 0 or historical_buy_amount <= 0:
+                return True
+
+        if buy_qty > 0 and buy_amount > 0:
+            historical_buy_qty += buy_qty
+            historical_buy_amount += buy_amount
+
+    return False
+
+
+def _collect_recent_warrant_codes_for_10d(items, target_date=None):
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     codes = set()
     skipped_no_remaining_position = 0
     skipped_sell_has_cost = 0
@@ -11489,15 +9901,18 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None, price_cache=N
                 skipped_no_remaining_position += 1
             continue
 
-        # 純賣超報酬只用歷史 FIFO 成本估算。若查無成本，會標示成本不足並排除勝敗，
-        # 不再補抓最新價當成本，避免把無法估算的賣超報酬寫成 0%。
+        # 純賣超通常可用 API5 歷史 FIFO 成本估報酬，不需要市場最新價。
+        # 只有完全找不到賣出前買進成本時，才補抓最新價作為備援。
         if recent_sell_amount > 0 or recent_sell_qty > 0:
-            skipped_sell_has_cost += 1
+            if BROKER_10D_FETCH_SELL_FALLBACK_PRICES and _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
+                codes.add(warrant_code)
+            else:
+                skipped_sell_has_cost += 1
 
     print(
         f"  近10日分點明細價格篩選：需最新價 {len(codes):,} 檔｜"
         f"已排除無剩餘買超部位 {skipped_no_remaining_position:,} 檔｜"
-        f"已排除純賣超最新價補抓 {skipped_sell_has_cost:,} 檔"
+        f"已排除可用歷史成本計算的純賣超 {skipped_sell_has_cost:,} 檔"
     )
 
     return codes
@@ -11509,14 +9924,15 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     加速修正：
     1. 不再對近10日所有有買賣的權證一律抓價。
        - 近10日買進後仍有剩餘部位：一定補最新價。
-       - 純賣超：不補最新價，直接用 FIFO 歷史成本估算；成本不足則標示並排除勝敗。
+       - 純賣超且 API5 歷史已有成本：不補最新價，直接用 FIFO / 歷史成本算報酬。
+       - 純賣超但完全沒有歷史成本：才補最新價作為備援。
     2. 價格補抓採兩段式：先抓 BROKER_10D_PRICE_FAST_LOOKBACK_DAYS，完全沒價格才補抓完整 BROKER_10D_PRICE_LOOKBACK_DAYS。
     3. 本機價格快取完整保存；Google Sheet 價格快取可增量 append，避免整張重寫拖慢。
     """
     if not BROKER_10D_DETAIL_ENABLED:
         return price_cache
 
-    codes = _collect_recent_warrant_codes_for_10d(items, target_date, price_cache=price_cache)
+    codes = _collect_recent_warrant_codes_for_10d(items, target_date)
     if not codes:
         return price_cache
 
@@ -11605,14 +10021,17 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
     return price_cache
 
-def _sell_return_summary_for_item(item, start_dt, target_dt):
+def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None):
     """
     用同一分點 + 同一權證的 API5 歷史資料估算近10日賣出實現報酬。
 
     規則：
     - 權證不可當沖：同一天先賣舊庫存，再把當日買進加入庫存。
-    - 賣出成本只使用 FIFO 可配對到的歷史持倉成本。
-    - 若近10日賣出找不到足夠舊庫存成本，超出部分列為成本不足，不再用歷史總均價、最新價或賣出價硬補 0%。
+    - 賣出成本優先用 FIFO 持倉成本估算。
+    - 若近10日賣出找不到足夠舊庫存成本，改用可取得的成本備援估算，避免賣超報酬率空白：
+      1. 優先用該權證歷史已出現買進均價
+      2. 其次用最新權證價格
+      3. 最後用當筆賣出均價，讓報酬率保守落在 0%
     """
     df = item.get("df", pd.DataFrame())
     if df is None or df.empty:
@@ -11641,8 +10060,25 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
     unmatched_amount = 0.0
     unmatched_qty = 0.0
 
-    # 賣超報酬只使用可被 FIFO lots 實際配對到的歷史買進成本。
-    # 若賣出數量超過可配對庫存，超出部分列為成本不足，不再用歷史總均價、最新價或賣出價硬補。
+    historical_buy_amount = 0.0
+    historical_buy_qty = 0.0
+
+    try:
+        fallback_price = float(fallback_price) if fallback_price is not None else None
+    except Exception:
+        fallback_price = None
+
+    if fallback_price is not None and fallback_price <= 0:
+        fallback_price = None
+
+    def fallback_unit_cost(sell_price):
+        if historical_buy_qty > 0 and historical_buy_amount > 0:
+            return historical_buy_amount / historical_buy_qty
+        if fallback_price is not None and fallback_price > 0:
+            return fallback_price
+        if sell_price and sell_price > 0:
+            return sell_price
+        return None
 
     for row in df.itertuples(index=False):
         row_dict = row._asdict()
@@ -11658,10 +10094,10 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
         # 權證不能當沖：同一天先處理賣出，只能扣舊庫存。
         if sell_amount > 0:
             if sell_qty <= 0:
-                # API 異常：只有賣出金額、沒有賣出股數時，無法配對成本。
-                # 保留為成本不足，不再用賣出價硬補 0%。
+                # API 異常時仍保留數據，不讓近10日賣超報酬率變空白。
                 if in_window:
-                    unmatched_amount += sell_amount
+                    revenue += sell_amount
+                    cost += sell_amount
                 sell_qty = 0
             else:
                 sell_price = sell_amount / sell_qty
@@ -11685,8 +10121,13 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
                     allocated_cost += alloc * lot["均價"]
 
                 if sell_left > 0:
-                    unmatched_qty += sell_left
-                    unmatched_amount += sell_left * sell_price
+                    fallback_cost_price = fallback_unit_cost(sell_price)
+                    if fallback_cost_price is not None and fallback_cost_price > 0:
+                        allocated_revenue += sell_left * sell_price
+                        allocated_cost += sell_left * fallback_cost_price
+                    else:
+                        unmatched_qty += sell_left
+                        unmatched_amount += sell_left * sell_price
 
                 if in_window:
                     revenue += allocated_revenue
@@ -11701,6 +10142,8 @@ def _sell_return_summary_for_item(item, start_dt, target_dt):
                 "金額": buy_amount,
                 "均價": buy_amount / buy_qty if buy_qty else 0,
             })
+            historical_buy_qty += buy_qty
+            historical_buy_amount += buy_amount
 
     return {
         "revenue": revenue,
@@ -11817,8 +10260,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
     建立「快取_近10日分點買賣明細」。
 
     統計單位：資料範圍 + 統計日期 + 單一分點 + 標的股。
-    同一分點同一標的底下的所有權證會先完整合併，再依淨買超 / 淨賣超分別排序取 TOP10。
-    分點層級勝率、加權報酬、期望值與盈虧比只用進榜的 TOP10 + TOP10 重新計算。
+    同一分點同一標的底下的所有權證會先完整合併，再計算買賣金額、買超 / 賣超報酬與勝率。
     """
     if not BROKER_10D_DETAIL_ENABLED:
         return None
@@ -11829,13 +10271,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         print("  ⚠️ 近10日分點買賣明細：沒有 items 資料")
         return []
 
-    target_date, target_dt, start_date, start_dt, window_days, period_text, recent_dates = _near10_trading_window_from_items(items, target_date, price_cache=price_cache)
+    target_date, target_dt, start_date, start_dt, window_days, period_text = _near10_window_dates(target_date)
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     scope = get_result_data_scope()
 
     agg = {}
-    warrant_underlying_lookup = build_warrant_underlying_lookup_from_cache()
 
     for item in items:
         df = item.get("df", pd.DataFrame())
@@ -11847,19 +10288,16 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=warrant_underlying_lookup)
-        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name or warrant_name)
-        underlying_name = fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name)
+        underlying_code = str(item.get("underlying_code", "")).strip()
+        underlying_name = str(item.get("underlying_name", "")).strip()
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
 
-        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code) or not broker_label:
+        if not underlying_code or not broker_label:
             continue
 
-        # 統計單位固定為：分點 + 券商代號 + 標的股。
-        # 不把 broker_name 放進 key，避免同一分點名稱格式不同時被切成多列。
-        key = (broker_label, broker_code, underlying_code)
+        key = (broker_label, broker_name, broker_code, underlying_code)
         rec = agg.setdefault(key, {
             "資料範圍": scope,
             "統計日期": add_gsheet_text_prefix(target_date),
@@ -11894,8 +10332,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "run_id": run_id,
         })
 
-        if underlying_name and rec.get("標的名稱") != underlying_name:
-            # 快取_股票名稱優先，只要代號查得到名稱，就覆蓋舊快取的非空錯名。
+        if underlying_name and not rec.get("標的名稱"):
             rec["標的名稱"] = underlying_name
 
         item_buy_qty = 0.0
@@ -11992,6 +10429,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
                 item,
                 start_dt,
                 target_dt,
+                fallback_price=latest_price,
             )
             rec["賣超實現賣出金額"] += sell_summary.get("revenue", 0.0)
             rec["賣超實現成本"] += sell_summary.get("cost", 0.0)
@@ -12022,9 +10460,8 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             # 買超平均報酬只使用「有最新價格」的剩餘部位；缺價部位已在上方省略。
             buy_return_pct = buy_return_numerator / buy_return_weight * 100
         elif buy_amount > 0:
-            # 有買進但完全沒有可估價格 / 剩餘部位時，不再塞 0%。
-            # 後面會標示未判定，並排除勝率與加權報酬。
-            buy_return_pct = None
+            # 近10日有買進但沒有任何可估剩餘部位時，仍給出 0.00%，避免勝率報酬空白。
+            buy_return_pct = 0.0
 
         sell_return_pct = None
         sell_realized_cost = float(rec.get("賣超實現成本", 0) or 0)
@@ -12033,9 +10470,8 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         if sell_realized_cost > 0:
             sell_return_pct = (sell_realized_revenue - sell_realized_cost) / sell_realized_cost * 100
         elif sell_amount > 0:
-            # 查無歷史買進成本時，不再塞 0%。
-            # 後面會標示成本不足 / 未判定，並排除勝率與加權報酬。
-            sell_return_pct = None
+            # API 賣出資料異常或成本仍不足時，保守帶入 0.00%，確保賣超報酬率一定有值。
+            sell_return_pct = 0.0
 
         if net_buy_amount > 0:
             direction = "買超"
@@ -12047,33 +10483,25 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             direction = "買賣平衡"
             win_return_pct = buy_return_pct if buy_return_pct is not None else sell_return_pct
 
-        # 分點層級加權報酬的權重必須和各標的報酬率基準一致：
-        # 買超報酬用剩餘成本加權；賣超報酬用已實現成本加權。
-        if direction == "買超":
-            primary_return_weight = buy_return_weight
-        elif direction == "賣超":
-            primary_return_weight = sell_realized_cost
-        else:
-            if buy_return_pct is not None and buy_return_weight > 0:
-                primary_return_weight = buy_return_weight
-            elif sell_return_pct is not None and sell_realized_cost > 0:
-                primary_return_weight = sell_realized_cost
-            else:
-                primary_return_weight = 0.0
-
-        # 報酬率無法估算時，權重歸零，避免污染勝率與加權報酬。
         if win_return_pct is None:
-            primary_return_weight = 0.0
+            win_return_pct = 0.0
 
-        broker_buy_return_weight = buy_return_weight if (buy_return_pct is not None and buy_return_weight > 0) else 0.0
-        broker_sell_return_weight = sell_realized_cost if (sell_return_pct is not None and sell_realized_cost > 0) else 0.0
+        # 分點層級加權報酬使用「主要方向淨額」作為權重：
+        # - 買超標的：使用近10日淨買超金額
+        # - 賣超標的：使用近10日淨賣超金額
+        # - 買賣平衡：退回使用買進 / 賣出金額較大者
+        # 這樣可以避免單純平均讓小金額標的過度影響整體分點表現。
+        primary_return_weight = net_buy_amount if direction == "買超" else net_sell_amount if direction == "賣超" else max(buy_amount, sell_amount)
+        if primary_return_weight <= 0:
+            primary_return_weight = max(buy_amount, sell_amount, 0.0)
 
-        if win_return_pct is None:
-            result = "未判定"
-        elif win_return_pct > 0:
+        broker_buy_return_weight = net_buy_amount if net_buy_amount > 0 else 0.0
+        broker_sell_return_weight = net_sell_amount if net_sell_amount > 0 else 0.0
+
+        if win_return_pct > 0:
             result = "勝"
         else:
-            # 使用者指定 0% 要算賠錢，所以有實際可估報酬時 <= 0 都是敗。
+            # 使用者指定 0% 要算賠錢，所以 <= 0 都是敗。
             result = "敗"
 
         notes = []
@@ -12084,12 +10512,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
 
         if buy_amount > 0 and buy_return_weight <= 0:
             if missing_price_count > 0:
-                notes.append("買超剩餘部位全數缺價或無可估價格，已排除勝率")
+                notes.append("買超剩餘部位全數缺價或無可估價格，買超報酬以 0.00% 保守帶入")
             else:
-                notes.append("近10日買進目前無可估剩餘部位，已排除勝率")
+                notes.append("近10日買進目前無可估剩餘部位，買超報酬以 0.00% 帶入")
 
         if sell_amount > 0 and sell_realized_cost <= 0:
-            notes.append("賣超成本不足，已排除勝率")
+            notes.append("賣超成本不足，賣超報酬以 0.00% 帶入")
 
         note_text = "；".join(notes)
 
@@ -12101,9 +10529,7 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         underlying_code_for_price = str(rec.get("標的股", "") or "").strip()
 
         if underlying_code_for_price:
-            # 近10日現股漲跌幅使用「視窗第一個交易日前一個交易日」作為起算價，
-            # 才是 10 個交易日的完整漲跌幅，不是視窗首日收盤到今天的 9 個跳動。
-            underlying_start_price, underlying_start_price_date = get_latest_price_info_before(
+            underlying_start_price, underlying_start_price_date = get_latest_price_info_on_or_before(
                 price_cache,
                 underlying_code_for_price,
                 start_date,
@@ -12165,17 +10591,13 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "券商代號": rec.get("券商代號", ""),
             "標的股": rec.get("標的股", ""),
             "標的名稱": rec.get("標的名稱", ""),
-            "現股10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
+            "標的10日漲跌幅%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
+            "現股10日報酬率%": _fmt_pct_text(underlying_10d_return_pct, signed=True) if underlying_10d_return_pct is not None else "-",
             "標的10日起始價": round(float(underlying_start_price), 4) if underlying_start_price is not None else "",
             "標的10日收盤價": round(float(underlying_end_price), 4) if underlying_end_price is not None else "",
             "標的10日起始價格日": add_gsheet_text_prefix(underlying_start_price_date) if underlying_start_price_date else "",
             "標的10日收盤價格日": add_gsheet_text_prefix(underlying_end_price_date) if underlying_end_price_date else "",
             "買賣方向": direction,
-            "排名類型": "",
-            "排名": "",
-            "買超TOP10合計": 0,
-            "賣超TOP10合計": 0,
-            "TOP10淨額": 0,
             "近10日買進股數": round(buy_qty, 0),
             "近10日買進金額": round(buy_amount, 0),
             "近10日賣出股數": round(sell_qty, 0),
@@ -12220,58 +10642,6 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             "_分點統計賣超報酬率數值": sell_return_pct,
             "_分點統計賣超權重": broker_sell_return_weight,
         })
-
-    # 使用者需求：近10日明細表只輸出每個分點的買超TOP10與賣超TOP10。
-    # 排名基準：先把同一分點 + 同一標的底下所有權證完整合併，
-    # 買超依「近10日淨買超金額」由大到小取前10；賣超依「近10日淨賣超金額」由大到小取前10。
-    # 上方統計欄位也必須只用進榜的 10 + 10 檔重算，不能用該分點全部母股。
-    top_n = max(int(os.getenv("BROKER_10D_TOP_N", "10") or "10"), 1)
-    rows_by_broker = {}
-    for row in rows:
-        broker_key = (str(row.get("分點", "") or "").strip(), str(row.get("券商代號", "") or "").strip())
-        rows_by_broker.setdefault(broker_key, []).append(row)
-
-    ranked_rows = []
-    for broker_key in sorted(rows_by_broker.keys(), key=lambda k: (k[0], k[1])):
-        broker_rows = rows_by_broker.get(broker_key, [])
-
-        buy_ranked = sorted(
-            [r for r in broker_rows if top15_safe_float(r.get("近10日淨買超金額", 0), 0.0) > 0],
-            key=lambda r: top15_safe_float(r.get("近10日淨買超金額", 0), 0.0),
-            reverse=True,
-        )[:top_n]
-
-        sell_ranked = sorted(
-            [r for r in broker_rows if top15_safe_float(r.get("近10日淨賣超金額", 0), 0.0) > 0],
-            key=lambda r: top15_safe_float(r.get("近10日淨賣超金額", 0), 0.0),
-            reverse=True,
-        )[:top_n]
-
-        buy_top_total = sum(top15_safe_float(r.get("近10日淨買超金額", 0), 0.0) for r in buy_ranked)
-        sell_top_total = sum(top15_safe_float(r.get("近10日淨賣超金額", 0), 0.0) for r in sell_ranked)
-        top_net_total = buy_top_total - sell_top_total
-
-        for rank, row in enumerate(buy_ranked, start=1):
-            row["排名類型"] = "買超"
-            row["排名"] = rank
-            row["買賣方向"] = "買超"
-            row["買超TOP10合計"] = round(buy_top_total, 0)
-            row["賣超TOP10合計"] = round(sell_top_total, 0)
-            row["TOP10淨額"] = round(top_net_total, 0)
-            ranked_rows.append(row)
-
-        for rank, row in enumerate(sell_ranked, start=1):
-            row["排名類型"] = "賣超"
-            row["排名"] = rank
-            row["買賣方向"] = "賣超"
-            row["買超TOP10合計"] = round(buy_top_total, 0)
-            row["賣超TOP10合計"] = round(sell_top_total, 0)
-            row["TOP10淨額"] = round(top_net_total, 0)
-            ranked_rows.append(row)
-
-    before_rank_count = len(rows)
-    rows = ranked_rows
-    print(f"  ✅ 近10日分點明細已切榜：原始標的列 {before_rank_count:,} 筆 → TOP{top_n} 買超/賣超列 {len(rows):,} 筆")
 
     broker_stats = {}
     for row in rows:
@@ -12397,14 +10767,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
         rows,
         key=lambda r: (
             str(r.get("分點", "")),
-            str(r.get("券商代號", "")),
-            0 if str(r.get("排名類型", "")) == "買超" else 1,
-            int(top15_safe_float(r.get("排名", 999999), 999999)),
+            -abs(float(r.get("近10日淨買超金額", 0) or 0)),
             str(r.get("標的股", "")),
         )
     )
 
-    print(f"  ✅ 近10日分點買賣明細完成：{len(rows):,} 筆（每分點買超TOP{top_n}+賣超TOP{top_n}），統計期間 {period_text}")
+    print(f"  ✅ 近10日分點買賣明細完成：{len(rows):,} 筆，統計期間 {period_text}")
     return rows
 
 
@@ -12418,8 +10786,8 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     headers = [
         "資料範圍", "統計日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
         "分點", "分點名稱", "券商代號", "標的股", "標的名稱",
-        "現股10日漲跌幅%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
-        "買賣方向", "排名類型", "排名", "買超TOP10合計", "賣超TOP10合計", "TOP10淨額",
+        "標的10日漲跌幅%", "現股10日報酬率%", "標的10日起始價", "標的10日收盤價", "標的10日起始價格日", "標的10日收盤價格日",
+        "買賣方向",
         "近10日買進股數", "近10日買進金額", "近10日賣出股數", "近10日賣出金額",
         "近10日淨買超股數", "近10日淨買超金額", "近10日淨賣超股數", "近10日淨賣超金額",
         "涉及權證檔數", "權證清單",
@@ -12440,8 +10808,8 @@ def write_10d_broker_underlying_detail_sheet(wb, rows):
     col_widths = [
         12, 12, 24, 10, 12, 12, 12,
         14, 18, 12, 10, 14,
-        16, 14, 14, 14, 14,
-        10, 10, 8, 16, 16, 16,
+        16, 16, 14, 14, 14, 14,
+        10,
         14, 16, 14, 16,
         16, 18, 16, 18,
         12, 72,
@@ -12552,14 +10920,14 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             continue
 
         warrant_name = str(item.get("warrant_name", "")).strip()
-        underlying_code, underlying_name = resolve_10d_item_underlying_identity(item, warrant_lookup=build_warrant_underlying_lookup_from_cache())
-        underlying_code = normalize_underlying_for_display(underlying_code, underlying_name)
-        underlying_name = fill_underlying_name_prefer_stock_cache(underlying_code, underlying_name)
+        raw_underlying_code = str(item.get("underlying_code", "")).strip()
+        underlying_name = str(item.get("underlying_name", "")).strip()
+        underlying_code = normalize_underlying_code_for_group(raw_underlying_code, underlying_name or warrant_name)
         broker_label = str(item.get("broker_label", "")).strip()
         broker_name = str(item.get("broker_name", "")).strip()
         broker_code = str(item.get("broker_code", "")).strip()
 
-        if not underlying_code or is_probably_warrant_code_for_underlying(underlying_code):
+        if not underlying_code:
             continue
 
         rec = agg.setdefault(underlying_code, {
@@ -12574,8 +10942,7 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
             "日期集合": set(),
         })
 
-        if underlying_name and rec.get("標的名稱") != underlying_name:
-            # 快取_股票名稱優先，只要代號查得到名稱，就覆蓋舊快取的非空錯名。
+        if underlying_name and not rec.get("標的名稱"):
             rec["標的名稱"] = underlying_name
 
         warrant_rec = rec["權證"].setdefault(warrant_code, {
@@ -12916,98 +11283,8 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
 
     ws.freeze_panes = "A2"
 
-
-def write_underlying_name_missing_sheet(wb):
-    """
-    寫出標的名稱缺失清單。
-
-    這張表只用來記錄：有標的股代號，但程式最後仍補不到正式標的名稱的資料。
-    不影響 TOP15 排名、不影響 A/B/C/D 計算。
-    """
-    sheet_name = safe_worksheet_title(UNDERLYING_NAME_MISSING_SHEET)
-
-    if sheet_name in wb.sheetnames:
-        del wb[sheet_name]
-
-    ws = wb.create_sheet(sheet_name)
-
-    headers = [
-        "統計日期",
-        "標的股",
-        "原標的名稱",
-        "權證代號",
-        "權證名稱",
-        "來源表",
-        "備註",
-        "更新時間",
-    ]
-
-    ws.append(headers)
-
-    rows = get_underlying_name_missing_rows()
-
-    for row in rows:
-        ws.append([
-            row.get("統計日期", ""),
-            row.get("標的股", ""),
-            row.get("原標的名稱", ""),
-            row.get("權證代號", ""),
-            row.get("權證名稱", ""),
-            row.get("來源表", ""),
-            row.get("備註", ""),
-            row.get("更新時間", ""),
-        ])
-
-    header_fill = PatternFill("solid", fgColor="FFF2CC")
-    header_font = Font(bold=True)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left = Alignment(horizontal="left", vertical="top", wrap_text=True)
-
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center
-
-    for row_cells in ws.iter_rows(min_row=2):
-        for cell in row_cells:
-            cell.alignment = left
-
-    widths = {
-        "A": 12,
-        "B": 12,
-        "C": 18,
-        "D": 12,
-        "E": 24,
-        "F": 22,
-        "G": 70,
-        "H": 20,
-    }
-
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-    ws.freeze_panes = "A2"
-
-    if not rows:
-        ws.append([
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "目前沒有標的名稱缺失資料。",
-            datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
-        ])
-
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, top15_detail_rows=None, top15_consensus_rows=None, warrant_consensus_7d_rows=None, broker_10d_detail_rows=None):
     print("【Step 5】建立 Excel...")
-
-    reset_underlying_name_missing_rows()
-    # TOP15 排名邏輯必須完全沿用舊程式碼；這裡只補標的名稱，不改標的股代號。
-    top15_detail_rows = finalize_underlying_names_for_rows(top15_detail_rows or [], TOP15_POSITION_DETAIL_SHEET, preserve_underlying_code=True)
-    top15_consensus_rows = finalize_underlying_names_for_rows(top15_consensus_rows or [], TOP15_CONSENSUS_SHEET, preserve_underlying_code=True)
-    broker_10d_detail_rows = finalize_underlying_names_for_rows(broker_10d_detail_rows, BROKER_10D_DETAIL_SHEET)
 
     wb = Workbook()
     default_ws = wb.active
@@ -13022,7 +11299,6 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_top15_position_detail_sheet(wb, top15_detail_rows or [])
     write_7d_warrant_consensus_top15_sheet(wb, warrant_consensus_7d_rows)
     write_10d_broker_underlying_detail_sheet(wb, broker_10d_detail_rows)
-    write_underlying_name_missing_sheet(wb)
     write_stats_sheet(wb, a_events, b_events, c_events, d_events)
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
@@ -13203,71 +11479,6 @@ def normalize_price_prefetch_target_date(target_date=None):
             return dt.strftime("%Y/%m/%d")
 
     return datetime.today().strftime("%Y/%m/%d")
-
-
-def is_weekend_date(date_value=None):
-    """
-    判斷指定日期是否為週末非交易日。
-
-    用途：
-    API4 目標分點資料在週六、週日不會有當日資料。
-    若今天是週末，不能因為「API4 沒有今天」就提早進入價格預抓模式，
-    否則完整回補 / 不使用快取重抓會被錯誤中斷。
-    """
-    if date_value is None:
-        dt = datetime.today()
-    elif isinstance(date_value, datetime):
-        dt = date_value
-    else:
-        dt = parse_date(date_value)
-
-    if not dt:
-        return False
-
-    return dt.weekday() >= 5
-
-
-def previous_weekday_date(date_value=None):
-    """
-    回傳指定日期之前最近的平日。
-
-    例：
-    - 週六 2026/06/13 → 週五 2026/06/12
-    - 週日 2026/06/14 → 週五 2026/06/12
-
-    這裡只處理週末，避免平日盤中資料尚未出來時被誤判為假日。
-    """
-    if date_value is None:
-        dt = datetime.today()
-    elif isinstance(date_value, datetime):
-        dt = date_value
-    else:
-        dt = parse_date(date_value)
-
-    if not dt:
-        dt = datetime.today()
-
-    cur = dt - timedelta(days=1)
-    while cur.weekday() >= 5:
-        cur -= timedelta(days=1)
-
-    return cur
-
-
-def expected_prescan_activity_date_for_target(target_date=None):
-    """
-    回傳 API4 預掃描在指定日期應該看到的最低有效活動日。
-
-    - 一般交易日：應該看到 target_date 當天。
-    - 週末非交易日：只要看到前一個平日即可，不要求週末本身有資料。
-    """
-    target_date = normalize_price_prefetch_target_date(target_date)
-    target_dt = parse_date(target_date) or datetime.today()
-
-    if is_weekend_date(target_dt):
-        return previous_weekday_date(target_dt)
-
-    return target_dt
 
 
 def load_price_prefetch_state():
@@ -13454,14 +11665,14 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
         return False, summary
 
     try:
-        # 近10日現股價格檢查必須用完整歷史快取，而不是本次 API4 candidate_keys，
-        # 否則完整回補時仍可能只檢查到少數候選分點 / 權證。
-        items = _filter_items_for_active_brokers(items_from_history_cache(history_cache_df))
+        if candidate_keys:
+            items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+        else:
+            items = items_from_history_cache(history_cache_df)
     except Exception:
         items = []
 
-    price_cache = load_price_cache()
-    required_codes = _collect_ranked_underlying_codes_for_10d(items, target_date, price_cache=price_cache, top_n=10)
+    required_codes = _collect_recent_underlying_codes_for_10d(items, target_date)
     required_codes = {normalize_underlying_code_for_group(c) or normalize_price_code(c) for c in required_codes if str(c).strip()}
     required_codes = {c for c in required_codes if c}
 
@@ -13472,6 +11683,7 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
         summary["latest_date"] = generic_summary.get("latest_date", "")
         return generic_has_target, summary
 
+    price_cache = load_price_cache()
     target_ok_codes = set()
     missing_codes = []
     latest_dt = None
@@ -13511,33 +11723,12 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
 
 def has_today_broker_data_from_prescan(target_date=None):
     target_date = normalize_price_prefetch_target_date(target_date)
-    expected_dt = expected_prescan_activity_date_for_target(target_date)
-    expected_date = expected_dt.strftime("%Y/%m/%d") if expected_dt else target_date
 
     if PRESCAN_TODAY_ACTIVITY_FOUND:
         return True
 
     if PRESCAN_LATEST_ACTIVITY_DATE:
-        latest_date = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d")
-
-        if latest_date >= target_date:
-            return True
-
-        if is_weekend_date(target_date) and latest_date >= expected_date:
-            print(
-                f"  ✅ {target_date} 為週末非交易日，"
-                f"API4 最新活動日 {latest_date} 已達預期交易日 {expected_date}，"
-                "略過今日資料等待，繼續正式流程。"
-            )
-            return True
-
-        return False
-
-    if is_weekend_date(target_date):
-        print(
-            f"  ⚠️ {target_date} 為週末非交易日，但 API4 未掃到可用活動日，"
-            "仍保留價格預抓保護。"
-        )
+        return PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") >= target_date
 
     return False
 
@@ -13804,10 +11995,6 @@ def main():
 
     warrants = get_all_call_warrants()
 
-    # 先重建乾淨的股票/ETF名稱對照，避免快取_股票名稱被權證污染後，
-    # 近10日標的名稱補齊與同標的合併繼續卡舊錯值。
-    rebuild_clean_stock_name_cache(force=REBUILD_CLEAN_STOCK_NAME_CACHE_ON_START)
-
     if not warrants:
         elapsed = time.time() - program_start
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
@@ -13967,20 +12154,9 @@ def main():
     warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
 
     if RUN_MODE == 2:
-        # 近10日分點明細不能使用本次 API4 candidate_keys 過濾後的 items。
-        # 使用者要的是目前追蹤分點「近10日所有權證買賣明細」，再把同標的所有權證合併後排名，
-        # 所以這裡必須從完整 快取_分點歷史 還原所有作用中的分點資料。
-        broker_10d_items = _filter_items_for_active_brokers(items_from_history_cache(history_cache_df))
-        if not broker_10d_items:
-            print("  ⚠️ 近10日完整歷史快取無資料，暫時退回本次候選 items。")
-            broker_10d_items = items
-        print(f"  ✅ 近10日分點明細使用完整歷史快取：{len(broker_10d_items):,} 組分點權證資料")
-
-        # 現股10日價格只補每個分點買超TOP10 / 賣超TOP10會用到的標的股；
-        # 權證價格仍只補近10日買進後仍有剩餘部位的權證，用於買超報酬。
-        price_cache = ensure_broker_10d_underlying_prices(price_cache, broker_10d_items)
-        price_cache = ensure_broker_10d_warrant_prices(price_cache, broker_10d_items)
-        broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(broker_10d_items, price_cache)
+        price_cache = ensure_broker_10d_underlying_prices(price_cache, items)
+        price_cache = ensure_broker_10d_warrant_prices(price_cache, items)
+        broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache)
     else:
         print("  ✅ RUN_MODE=1 精選分點模式：略過近10日分點買賣明細工作表，避免動到 Google Sheet 既有資料。")
         broker_10d_detail_rows = None
