@@ -84,10 +84,15 @@ API5 = (
     "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
 )
 
-# MoneyDJ 權證搜尋備援：當 TWSE / TPEx OpenAPI 沒抓到權證母體時，
-# 改用 MoneyDJ Search.xdjhtm 背後的 ProxyXQ.xdjjs 依標的股抓全部權證。
+# MoneyDJ 權證搜尋備援 / 補漏：
+# 1. OpenAPI 抓不到任何權證母體時，仍維持原本備援：MoneyDJ Search 全部補進，不過濾成交量 0。
+# 2. OpenAPI 已抓到部分權證時，也會額外跑 MoneyDJ Search 補漏；
+#    預設只補 MoneyDJ Search 顯示成交量 >= 1 的漏網認購權證，避免把同標的全部 0 量權證都丟進 API4/API5 拖慢。
+# 3. 若要完全不看 MoneyDJ 成交量、全部補漏，可設 WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_MIN_VOLUME=0。
 MONEYDJ_WARRANT_SEARCH_PAGE = "https://www.moneydj.com/warrant/xdjhtm/Search.xdjhtm"
 MONEYDJ_WARRANT_PROXY_URL = "https://www.moneydj.com/warrant/xdjjs/ProxyXQ.xdjjs"
+MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_ENABLE = os.getenv("WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME = int(os.getenv("WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_MIN_VOLUME", "1"))
 
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
@@ -2557,16 +2562,42 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
                 "母體來源": "OpenAPI",
             })
 
-    # MoneyDJ 權證搜尋備援：
-    # 只有當 OpenAPI 沒有提供可用母體，或 OpenAPI 比對後沒有任何相關認購權證時才啟用。
-    # 備援資料不過濾成交量 = 0，避免 MoneyDJ 搜尋頁成交量欄位尚未更新時漏抓權證。
-    if not warrants:
-        print("⚠️ OpenAPI 未取得可用認購權證母體或比對後為 0，啟用 MoneyDJ 權證搜尋備援（不過濾成交量=0）")
+    # MoneyDJ 權證搜尋補漏：
+    # 原本只有在 OpenAPI 完全抓不到母體時才啟用 MoneyDJ Search。
+    # 這會造成 OpenAPI 已有部分權證、但漏掉 MoneyDJ 當天已有成交量的權證時，後續 API4/API5 完全不會查該檔。
+    # 這版改成：
+    # - OpenAPI 有抓到權證：MoneyDJ Search 也跑一次，只補「OpenAPI 沒有、且 MoneyDJ Search 成交量達門檻」的漏網權證。
+    # - OpenAPI 完全沒有權證：維持原本備援行為，MoneyDJ Search 找到的認購權證全部補進，不過濾成交量 0。
+    moneydj_skipped_low_volume = 0
+    if MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_ENABLE or not warrants:
+        if warrants:
+            print(
+                f"🔁 MoneyDJ 權證搜尋補漏啟用：OpenAPI 已命中 {len(warrants):,} 支，"
+                f"額外補 MoneyDJ Search 成交量 >= {MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME:,} 的漏網權證"
+            )
+        else:
+            print("⚠️ OpenAPI 未取得可用認購權證母體或比對後為 0，啟用 MoneyDJ 權證搜尋備援（不過濾成交量=0）")
+
         moneydj_warrants = fetch_moneydj_call_warrants_fallback(stock_code_clean, stock_name)
+        had_openapi_warrants = bool(warrants)
+
         for rec in moneydj_warrants:
             code = normalize_openapi_warrant_code(rec.get("代號"))
             if not code or code in seen:
                 continue
+
+            mdj_volume = int(rec.get("成交量", 0) or 0)
+
+            # OpenAPI 已有母體時只補 MoneyDJ 有量的漏網權證，避免把全部 0 量權證都丟進 API4/API5。
+            # OpenAPI 完全沒有母體時維持原本備援：不過濾成交量 0。
+            if (
+                had_openapi_warrants
+                and MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME > 0
+                and mdj_volume < MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME
+            ):
+                moneydj_skipped_low_volume += 1
+                continue
+
             seen.add(code)
             moneydj_added += 1
             warrants.append({
@@ -2575,9 +2606,15 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
                 "標的股": str(stock_code_clean),
                 "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
                 "成交金額": int(rec.get("成交金額", 0) or 0),
-                "成交量": int(rec.get("成交量", 0) or 0),
-                "母體來源": "MoneyDJSearch",
+                "成交量": mdj_volume,
+                "母體來源": "MoneyDJSearchSupplement" if had_openapi_warrants else "MoneyDJSearch",
             })
+
+        if had_openapi_warrants:
+            print(
+                f"🔁 MoneyDJ Search 補漏完成：新增 {moneydj_added:,} 支｜"
+                f"低於成交量門檻略過 {moneydj_skipped_low_volume:,} 支"
+            )
 
     historical_warrants = load_historical_call_warrants_from_cache(
         stock_code,
@@ -2607,7 +2644,7 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
     print(
         f"🔎 {stock_code_clean} {stock_name} 權證比對："
         f"lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜"
-        f"MoneyDJ備援新增 {moneydj_added:,} 支｜歷史補充新增 {historical_added:,} 支"
+        f"MoneyDJ補漏/備援新增 {moneydj_added:,} 支｜歷史補充新增 {historical_added:,} 支"
     )
     print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
     return warrants
