@@ -1503,6 +1503,13 @@ def write_cache_to_supabase(df, path):
     cache_id = supabase_cache_identifier(path)
     df2 = df.copy().fillna("")
 
+    if kind == "history":
+        df2 = fix_known_underlying_info_dataframe(df2, "權證名稱", "標的股", "標的名稱")
+    elif kind == "candidates":
+        df2 = fix_known_underlying_info_dataframe(df2, "權證名稱", "標的股", "標的名稱")
+    elif kind == "warrants":
+        df2 = fix_known_underlying_info_dataframe(df2, "名稱", "標的股", "標的名稱")
+
     if kind == "price":
         rows = []
         for row in df2.itertuples(index=False):
@@ -4591,6 +4598,8 @@ def save_warrants_cache(warrants):
         if col not in df.columns:
             df[col] = ""
 
+    df = fix_known_underlying_info_dataframe(df, "名稱", "標的股", "標的名稱")
+
     write_cache_csv(df[wanted_cols], WARRANTS_CACHE_PATH)
     print(f"  💾 已更新權證清單快取：{WARRANTS_CACHE_PATH}")
 
@@ -4615,11 +4624,17 @@ def load_warrants_cache():
         if not code or not name:
             continue
 
+        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
+            name,
+            row.get("標的股", ""),
+            row.get("標的名稱", ""),
+        )
+
         warrants.append({
             "代號": code,
             "名稱": name,
-            "標的股": str(row.get("標的股", "")).strip(),
-            "標的名稱": str(row.get("標的名稱", "")).strip(),
+            "標的股": underlying_code,
+            "標的名稱": underlying_name,
         })
 
     return warrants
@@ -4679,11 +4694,13 @@ def save_candidates_cache(candidates):
     rows = []
 
     for c in candidates:
+        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(c[1], c[2], c[3])
+
         rows.append({
             "權證代號": c[0],
             "權證名稱": c[1],
-            "標的股": c[2],
-            "標的名稱": c[3],
+            "標的股": underlying_code,
+            "標的名稱": underlying_name,
             "分點": c[4],
             "分點名稱": c[5],
             "券商代號": c[6],
@@ -4715,11 +4732,18 @@ def load_candidates_cache():
         if not warrant_code or not broker_code:
             continue
 
+        warrant_name = str(row["權證名稱"]).strip()
+        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
+            warrant_name,
+            row.get("標的股", ""),
+            row.get("標的名稱", ""),
+        )
+
         candidates.append((
             warrant_code,
-            str(row["權證名稱"]).strip(),
-            str(row["標的股"]).strip(),
-            str(row["標的名稱"]).strip(),
+            warrant_name,
+            underlying_code,
+            underlying_name,
             str(row["分點"]).strip(),
             str(row["分點名稱"]).strip(),
             broker_code,
@@ -4759,6 +4783,7 @@ def load_history_cache():
             return pd.DataFrame()
 
     out_df = df[required_cols].copy()
+    out_df = fix_known_underlying_info_dataframe(out_df, "權證名稱", "標的股", "標的名稱")
     out_df["日期"] = out_df["日期"].map(normalize_date_str)
     out_df = out_df.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
@@ -4849,13 +4874,19 @@ def item_to_history_rows(item):
     rows = []
     df = item["df"]
 
+    underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
+        item.get("warrant_name", ""),
+        item.get("underlying_code", ""),
+        item.get("underlying_name", ""),
+    )
+
     for row in df.itertuples(index=False):
         row_dict = row._asdict()
         rows.append({
             "權證代號": item["warrant_code"],
             "權證名稱": item["warrant_name"],
-            "標的股": item["underlying_code"],
-            "標的名稱": item.get("underlying_name", ""),
+            "標的股": underlying_code,
+            "標的名稱": underlying_name,
             "分點": item["broker_label"],
             "分點名稱": item["broker_name"],
             "券商代號": item["broker_code"],
@@ -5088,6 +5119,101 @@ def normalize_stock_name_text(s):
     return str(s).strip().replace(" ", "").replace("　", "")
 
 
+# 特殊標的優先對照：
+# 有些 ETF 權證名稱會使用市場慣用簡稱，例如「台灣50台新5B購17」。
+# 若直接丟進一般股票名稱 alias，比對時可能被「台灣大哥大」的短 alias「台灣」吃到，
+# 導致 0050 台灣50 被誤判成 3045 台灣大哥大。
+# 因此這裡先處理已知 ETF / 特殊標的，且一定要放在一般 resolver 比對前面。
+SPECIAL_UNDERLYING_PREFIX_RULES = [
+    {
+        "prefixes": [
+            "台灣50",
+            "臺灣50",
+            "元大台灣50",
+            "元大臺灣50",
+        ],
+        "exclude_prefixes": [
+            "台灣50正",
+            "臺灣50正",
+            "元大台灣50正",
+            "元大臺灣50正",
+            "台灣50反",
+            "臺灣50反",
+            "元大台灣50反",
+            "元大臺灣50反",
+        ],
+        "code": "0050",
+        "name": "元大台灣50",
+    },
+]
+
+
+def get_special_underlying_info_from_warrant_name(warrant_name):
+    wname = normalize_stock_name_text(warrant_name)
+
+    if not wname:
+        return "", ""
+
+    for rule in SPECIAL_UNDERLYING_PREFIX_RULES:
+        prefixes = [normalize_stock_name_text(x) for x in rule.get("prefixes", []) if str(x).strip()]
+        exclude_prefixes = [normalize_stock_name_text(x) for x in rule.get("exclude_prefixes", []) if str(x).strip()]
+
+        if exclude_prefixes and any(wname.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+
+        if prefixes and any(wname.startswith(prefix) for prefix in prefixes):
+            return str(rule.get("code", "")).strip(), str(rule.get("name", "")).strip()
+
+    return "", ""
+
+
+def correct_underlying_info_by_warrant_name(warrant_name, underlying_code="", underlying_name=""):
+    special_code, special_name = get_special_underlying_info_from_warrant_name(warrant_name)
+
+    if special_code:
+        return special_code, special_name
+
+    return str(underlying_code or "").strip(), str(underlying_name or "").strip()
+
+
+def fix_known_underlying_info_dataframe(df, warrant_name_col, underlying_code_col, underlying_name_col):
+    """
+    針對已知 ETF / 特殊標的修正既有快取中的標的股代號。
+
+    這裡只處理明確命中的特殊規則，不改一般股票 / 權證辨識邏輯。
+    目的：避免舊快取或 Supabase 讀回的「台灣50 → 3045」繼續污染後續候選與歷史資料。
+    """
+    if df is None or df.empty:
+        return df
+
+    needed = {warrant_name_col, underlying_code_col, underlying_name_col}
+    if not needed.issubset(set(df.columns)):
+        return df
+
+    out = df.copy()
+    names = out[warrant_name_col].astype(str).map(normalize_stock_name_text)
+
+    for rule in SPECIAL_UNDERLYING_PREFIX_RULES:
+        prefixes = [normalize_stock_name_text(x) for x in rule.get("prefixes", []) if str(x).strip()]
+        exclude_prefixes = [normalize_stock_name_text(x) for x in rule.get("exclude_prefixes", []) if str(x).strip()]
+
+        if not prefixes:
+            continue
+
+        mask = False
+        for prefix in prefixes:
+            mask = mask | names.str.startswith(prefix, na=False)
+
+        for prefix in exclude_prefixes:
+            mask = mask & ~names.str.startswith(prefix, na=False)
+
+        if mask.any():
+            out.loc[mask, underlying_code_col] = str(rule.get("code", "")).strip()
+            out.loc[mask, underlying_name_col] = str(rule.get("name", "")).strip()
+
+    return out
+
+
 def make_stock_aliases(stock_name, exact_stock_names=None):
     """
     建立股票名稱候選別名，但避免把某一檔股票的簡稱撞到另一檔真實股票名稱。
@@ -5141,7 +5267,11 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
 
         aliases.add(candidate)
 
-    return {a for a in aliases if len(a) >= 2}
+    # 「台灣 / 臺灣」這類過短且常見的前綴不適合作為標的辨識 alias。
+    # 例如台灣大哥大若產生「台灣」alias，會誤吃「台灣50」ETF 權證。
+    dangerous_aliases = {"台灣", "臺灣"}
+
+    return {a for a in aliases if len(a) >= 2 and a not in dangerous_aliases}
 
 
 def build_underlying_resolver(stock_map):
@@ -5215,6 +5345,11 @@ def find_underlying_info(warrant_name, stock_map, resolver=None):
 
     if not wname:
         return "", ""
+
+    # 特殊標的優先處理，避免「台灣50」被一般股票短 alias「台灣」誤判成 3045 台灣大哥大。
+    special_code, special_name = get_special_underlying_info_from_warrant_name(warrant_name)
+    if special_code:
+        return special_code, special_name
 
     if resolver is None:
         resolver = build_underlying_resolver(stock_map)
