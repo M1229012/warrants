@@ -206,6 +206,21 @@ PRESCAN_MISSING_FETCH_KEYS = set()
 PRESCAN_LATEST_ACTIVITY_DATE = None
 PRESCAN_TODAY_ACTIVITY_FOUND = False
 
+# MoneyDJ Search 自動補漏模式：
+# 當 OpenAPI / API4 最新交易日落後本次報表目標日時，不再只做價格預抓後結束，
+# 而是自動啟用 MoneyDJ Search 補漏模式，強制用 MoneyDJ API5 補抓可能漏掉的候選組合。
+# 這個模式同時適用 RUN_MODE=1 精選五分點與 RUN_MODE=2 全分點。
+MONEYDJ_SEARCH_REPAIR_ENABLED = os.getenv("MONEYDJ_SEARCH_REPAIR_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS = int(os.getenv("MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS", "45"))
+MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION = os.getenv("MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION", "1").strip().lower() not in ("0", "false", "no")
+MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL = os.getenv("MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL", "1").strip().lower() not in ("0", "false", "no")
+MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS = int(os.getenv("MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS", "0"))
+MONEYDJ_SEARCH_REPAIR_ACTIVE = False
+MONEYDJ_SEARCH_REPAIR_TARGET_DATE = ""
+MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE = ""
+MONEYDJ_SEARCH_REPAIR_FETCH_KEYS = set()
+MONEYDJ_SEARCH_REPAIR_REASON = ""
+
 TARGET_PATTERNS = {
     "富邦公益":       r"富邦.*公益",
     "富邦北高雄":     r"富邦.*北高雄",
@@ -12284,6 +12299,250 @@ def has_today_broker_data_from_prescan(target_date=None):
     return False
 
 
+def normalize_moneydj_search_repair_target_date(target_date=None):
+    """
+    MoneyDJ Search 補漏模式使用的報表目標日。
+
+    優先順序沿用既有價格預抓 / TOP15 目標日設定，避免新增一套日期邏輯：
+    1. 函式傳入 target_date
+    2. PRICE_PREFETCH_TARGET_DATE
+    3. TOP15_TARGET_DATE
+    4. 今天
+    """
+    return normalize_price_prefetch_target_date(target_date)
+
+
+def get_openapi_latest_activity_date_str():
+    if PRESCAN_LATEST_ACTIVITY_DATE:
+        return PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d")
+    return ""
+
+
+def should_activate_moneydj_search_repair(target_date=None):
+    """
+    判斷是否啟用 MoneyDJ Search 自動補漏。
+
+    條件：
+    - MONEYDJ_SEARCH_REPAIR_ENABLED=1
+    - OpenAPI / API4 預掃描最新交易日 < 本次報表目標日
+
+    只要落後，就不讓流程停在價格預抓，而是繼續進入正式報表流程，
+    並強制用 MoneyDJ API5 補抓可能漏掉的候選組合。
+    """
+    if not MONEYDJ_SEARCH_REPAIR_ENABLED:
+        return False
+
+    target_date = normalize_moneydj_search_repair_target_date(target_date)
+    target_dt = parse_date(target_date)
+
+    if not target_dt:
+        return False
+
+    if PRESCAN_LATEST_ACTIVITY_DATE is None:
+        return True
+
+    return PRESCAN_LATEST_ACTIVITY_DATE.date() < target_dt.date()
+
+
+def activate_moneydj_search_repair_if_needed(target_date=None):
+    global MONEYDJ_SEARCH_REPAIR_ACTIVE
+    global MONEYDJ_SEARCH_REPAIR_TARGET_DATE
+    global MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE
+    global MONEYDJ_SEARCH_REPAIR_REASON
+
+    target_date = normalize_moneydj_search_repair_target_date(target_date)
+    latest_date = get_openapi_latest_activity_date_str() or "-"
+
+    if not should_activate_moneydj_search_repair(target_date):
+        MONEYDJ_SEARCH_REPAIR_ACTIVE = False
+        MONEYDJ_SEARCH_REPAIR_TARGET_DATE = target_date
+        MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE = latest_date
+        MONEYDJ_SEARCH_REPAIR_REASON = ""
+        return False
+
+    MONEYDJ_SEARCH_REPAIR_ACTIVE = True
+    MONEYDJ_SEARCH_REPAIR_TARGET_DATE = target_date
+    MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE = latest_date
+    MONEYDJ_SEARCH_REPAIR_REASON = f"OpenAPI最新交易日 {latest_date} < 報表目標日 {target_date}"
+
+    print(
+        "  🔄 自動啟用 MoneyDJ Search 補漏模式："
+        f"{MONEYDJ_SEARCH_REPAIR_REASON}。"
+    )
+    print(
+        "  🔄 本次不會停在價格預抓，會繼續用 MoneyDJ API5 補抓可能漏掉的分點資料。"
+    )
+    return True
+
+
+def moneydj_search_repair_is_active():
+    return bool(MONEYDJ_SEARCH_REPAIR_ACTIVE and MONEYDJ_SEARCH_REPAIR_ENABLED)
+
+
+def _history_latest_and_net_by_candidate(history_cache_df, candidate_keys=None):
+    """
+    從既有分點歷史快取整理每一個「權證代號 + 券商代號」的：
+    1. 最後資料日期
+    2. 淨庫存股數
+    3. 最後日期買賣金額
+
+    MoneyDJ Search 補漏模式用這個結果挑出最需要強制 API5 補抓的候選：
+    - 目前仍有淨庫存者
+    - 最近一段時間有活動者
+    - API4 直接掃到 / 活動標的擴展出的候選
+    """
+    out = {}
+
+    if history_cache_df is None or history_cache_df.empty:
+        return out
+
+    required_cols = {"權證代號", "券商代號", "日期", "買進股數", "賣出股數", "買進金額", "賣出金額"}
+    if not required_cols.issubset(set(history_cache_df.columns)):
+        return out
+
+    candidate_keys = candidate_keys or None
+
+    df = history_cache_df[["權證代號", "券商代號", "日期", "買進股數", "賣出股數", "買進金額", "賣出金額"]].copy().fillna("")
+
+    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    for (warrant_code, broker_code), g in df.groupby(["權證代號", "券商代號"], dropna=False):
+        key = candidate_key_from_values(warrant_code, broker_code)
+
+        if candidate_keys is not None and key not in candidate_keys:
+            continue
+
+        latest_dt = None
+        latest_buy_amount = 0
+        latest_sell_amount = 0
+        net_shares = 0
+
+        for row in g.itertuples(index=False):
+            rd = row._asdict()
+            dt = parse_date(rd.get("日期", ""))
+            buy_shares = _supabase_int(rd.get("買進股數", 0)) if "_supabase_int" in globals() else int(rd.get("買進股數", 0) or 0)
+            sell_shares = _supabase_int(rd.get("賣出股數", 0)) if "_supabase_int" in globals() else int(rd.get("賣出股數", 0) or 0)
+            buy_amount = _supabase_int(rd.get("買進金額", 0)) if "_supabase_int" in globals() else int(rd.get("買進金額", 0) or 0)
+            sell_amount = _supabase_int(rd.get("賣出金額", 0)) if "_supabase_int" in globals() else int(rd.get("賣出金額", 0) or 0)
+
+            net_shares += buy_shares - sell_shares
+
+            if dt and (latest_dt is None or dt > latest_dt):
+                latest_dt = dt
+                latest_buy_amount = buy_amount
+                latest_sell_amount = sell_amount
+
+        if latest_dt:
+            out[key] = {
+                "latest_dt": latest_dt,
+                "latest_date": latest_dt.strftime("%Y/%m/%d"),
+                "net_shares": net_shares,
+                "has_open_position": net_shares > 0,
+                "latest_buy_amount": latest_buy_amount,
+                "latest_sell_amount": latest_sell_amount,
+                "latest_total_amount": abs(latest_buy_amount) + abs(latest_sell_amount),
+            }
+
+    return out
+
+
+def build_moneydj_search_repair_fetch_keys(history_cache_df, candidates, target_date=None):
+    """
+    MoneyDJ Search 補漏候選挑選邏輯。
+
+    不做手動指定分點 / 手動指定權證；只要偵測到 OpenAPI 落後，
+    依本次 RUN_MODE 的追蹤分點候選池自動挑出需要補抓的 key。
+
+    補抓優先序：
+    1. API4 直接近期活動候選與活動標的擴展候選
+    2. 快取中仍有淨庫存的候選
+    3. 快取中最近 MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS 天有活動的候選
+
+    這樣可避免全市場無差別重打 API5，同時會補到五分點與全分點範圍內最容易漏掉的資料。
+    """
+    global MONEYDJ_SEARCH_REPAIR_FETCH_KEYS
+
+    MONEYDJ_SEARCH_REPAIR_FETCH_KEYS = set()
+
+    if not moneydj_search_repair_is_active():
+        return set()
+
+    target_date = normalize_moneydj_search_repair_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
+    recent_days = max(int(MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS or 0), 0)
+    recent_floor_dt = target_dt - timedelta(days=recent_days)
+    max_fetch = int(MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS or 0)
+
+    candidate_keys = {candidate_key_from_tuple(c) for c in candidates} if candidates else set()
+
+    if not candidate_keys:
+        return set()
+
+    history_info = _history_latest_and_net_by_candidate(history_cache_df, candidate_keys=candidate_keys)
+    priority_rows = []
+
+    direct_or_expanded_keys = (PRESCAN_REFRESH_KEYS | PRESCAN_MISSING_FETCH_KEYS) & candidate_keys
+
+    for key in direct_or_expanded_keys:
+        info = history_info.get(key, {})
+        latest_dt = info.get("latest_dt")
+        latest_ord = latest_dt.toordinal() if latest_dt else 0
+        priority_rows.append((0, -latest_ord, -int(info.get("latest_total_amount", 0) or 0), key, "API4直接/活動標的候選"))
+
+    for key, info in history_info.items():
+        latest_dt = info.get("latest_dt")
+        if not latest_dt:
+            continue
+
+        # 若快取已經有報表目標日，不需要補漏。
+        if latest_dt.date() >= target_dt.date():
+            continue
+
+        if MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION and info.get("has_open_position"):
+            priority_rows.append((1, -latest_dt.toordinal(), -abs(int(info.get("net_shares", 0) or 0)), key, "尚有淨庫存"))
+            continue
+
+        if recent_days > 0 and latest_dt.date() >= recent_floor_dt.date():
+            priority_rows.append((2, -latest_dt.toordinal(), -int(info.get("latest_total_amount", 0) or 0), key, "近期有歷史活動"))
+
+    priority_rows = sorted(priority_rows, key=lambda x: (x[0], x[1], x[2], str(x[3])))
+
+    selected = []
+    seen = set()
+    reason_count = {}
+
+    for _, _, _, key, reason in priority_rows:
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(key)
+        reason_count[reason] = reason_count.get(reason, 0) + 1
+        if max_fetch > 0 and len(selected) >= max_fetch:
+            break
+
+    MONEYDJ_SEARCH_REPAIR_FETCH_KEYS = set(selected)
+
+    reason_text = "，".join(f"{k}:{v:,}" for k, v in reason_count.items()) or "-"
+    cap_text = f"｜上限 {max_fetch:,} 組" if max_fetch > 0 else ""
+    print(
+        f"  🔎 MoneyDJ Search 補漏候選：本次候選 {len(candidate_keys):,} 組｜"
+        f"需強制補抓 {len(MONEYDJ_SEARCH_REPAIR_FETCH_KEYS):,} 組{cap_text}｜{reason_text}"
+    )
+
+    if MONEYDJ_SEARCH_REPAIR_FETCH_KEYS:
+        print(
+            "  ✅ MoneyDJ Search 補漏模式已套用：這些候選會略過一般增量判斷，強制重抓 API5。"
+        )
+    else:
+        print(
+            "  ⚠️ MoneyDJ Search 補漏模式已啟用，但目前沒有符合條件的補漏候選；"
+            "流程會照一般增量資料繼續。"
+        )
+
+    return MONEYDJ_SEARCH_REPAIR_FETCH_KEYS
+
+
 def build_price_prefetch_context_from_items(items):
     """
     用既有分點歷史快取重建正式流程會用到的事件，僅供價格預抓使用。
@@ -12455,6 +12714,13 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
 
     target_date = normalize_price_prefetch_target_date()
 
+    if moneydj_search_repair_is_active():
+        print(
+            "  ✅ 已啟用 MoneyDJ Search 補漏模式：略過價格預抓快速結束，"
+            "繼續進入 API5 補漏與正式報表流程。"
+        )
+        return False
+
     if has_today_broker_data_from_prescan(target_date):
         return False
 
@@ -12560,6 +12826,21 @@ def main():
 
     candidates = prescan_all(warrants, broker_map)
 
+    activate_moneydj_search_repair_if_needed()
+
+    # OpenAPI / API4 落後時，RUN_MODE=1 額外把「所有認購權證 × 精選分點」放入候選池。
+    # 後面仍會用歷史快取 / 淨庫存 / 近期活動條件挑出要強制補抓的 key，
+    # 不會因為候選池擴大就全部無差別重打 API5。
+    if moneydj_search_repair_is_active() and RUN_MODE == 1 and MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL:
+        selected_repair_candidates = build_selected_full_market_candidates(warrants, broker_map)
+        before_count = len(candidates or [])
+        candidates = merge_candidates(candidates or [], selected_repair_candidates)
+        candidates = filter_candidates_by_broker_map(candidates, broker_map)
+        print(
+            f"  🔎 MoneyDJ Search 補漏：RUN_MODE=1 候選池擴充 "
+            f"{before_count:,} → {len(candidates):,} 組"
+        )
+
     if maybe_auto_price_prefetch_before_api5(candidates, program_start):
         return
 
@@ -12577,9 +12858,16 @@ def main():
     history_keys = history_cache_keys(history_cache_df)
     history_latest_map = history_cache_latest_dates(history_cache_df)
 
+    if moneydj_search_repair_is_active():
+        build_moneydj_search_repair_fetch_keys(
+            history_cache_df,
+            candidates,
+            target_date=MONEYDJ_SEARCH_REPAIR_TARGET_DATE,
+        )
+
     if CACHE_INCREMENTAL_UPDATE_ENABLED and not history_was_empty:
         before_prune_count = len(candidates)
-        keep_keys = (history_keys & candidate_keys) | PRESCAN_MISSING_FETCH_KEYS
+        keep_keys = (history_keys & candidate_keys) | PRESCAN_MISSING_FETCH_KEYS | MONEYDJ_SEARCH_REPAIR_FETCH_KEYS
         candidates = [c for c in candidates if candidate_key_from_tuple(c) in keep_keys]
         candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
         pruned_count = before_prune_count - len(candidates)
@@ -12596,12 +12884,18 @@ def main():
     for c in candidates:
         key = candidate_key_from_tuple(c)
 
+        if key in MONEYDJ_SEARCH_REPAIR_FETCH_KEYS:
+            candidates_to_fetch.append(c)
+            continue
+
         if should_fetch_candidate_incremental(key, history_keys, history_latest_map, PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS):
             candidates_to_fetch.append(c)
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
     print(f"  ✅ API4 直接近期活動候選：{len(PRESCAN_REFRESH_KEYS & candidate_keys)} 組")
     print(f"  ✅ 本次允許缺快取補抓候選：{len(PRESCAN_MISSING_FETCH_KEYS & candidate_keys)} 組")
+    if moneydj_search_repair_is_active():
+        print(f"  ✅ MoneyDJ Search 強制補漏候選：{len(MONEYDJ_SEARCH_REPAIR_FETCH_KEYS & candidate_keys)} 組")
     print(f"  ✅ 增量更新模式：CACHE_INCREMENTAL_UPDATE_ENABLED={CACHE_INCREMENTAL_UPDATE_ENABLED}，目標日期={get_incremental_refresh_target_dt().strftime('%Y/%m/%d')}")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
 
