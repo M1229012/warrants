@@ -1233,14 +1233,18 @@ def supabase_import_psycopg():
         print(f"  ⚠️ Supabase 快取停用：無法載入 psycopg，原因：{type(e).__name__}: {e}")
         return None
 
-
 def get_supabase_conn():
     psycopg = supabase_import_psycopg()
     if psycopg is None:
         return None
 
     try:
-        return psycopg.connect(SUPABASE_DB_URL, connect_timeout=20)
+        return psycopg.connect(
+            SUPABASE_DB_URL,
+            connect_timeout=20,
+            autocommit=True,
+            prepare_threshold=None,
+        )
     except Exception as e:
         print(f"  ⚠️ Supabase 連線失敗：{type(e).__name__}: {e}")
         return None
