@@ -4754,7 +4754,7 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     y = card_y2 - section_gap
 
     def draw_section(title, section_rows, y_top, title_bg, section_type):
-        headers = ["排名", "標的", "10日淨額", "現股10日", "權證報酬"]
+        headers = ["排名", "標的", "10日淨額", "現股10日漲跌", "權證報酬"]
         col_w = broker10d_table_col_w
         table_w = broker10d_table_w
         left = broker10d_table_left
