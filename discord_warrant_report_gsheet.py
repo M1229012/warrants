@@ -2018,9 +2018,16 @@ def dedupe_daily_sell_rows(df: pd.DataFrame) -> pd.DataFrame:
             keep["_dedupe_sell_qty_lots"] = sell_qty_lots
 
         # 文字資訊補強：保留非空值，事件代號優先保留可解析的 A/B/C/D。
+        # 新版每日賣出明細若已由主程式算好 FIFO 報酬 / 成本，這些欄位也要保留下來，
+        # 否則同日同分點同權證去重後，圖片端可能又退回顯示「-」。
         for col in [
             "分點名稱", "券商代號", "標的股", "標的名稱", "權證代號", "權證名稱",
-            "狀態", "事件日"
+            "狀態", "事件日",
+            "報酬率", "報酬率%", "賣出報酬率", "賣出報酬%",
+            "已實現報酬率", "已實現報酬%", "FIFO報酬率", "FIFO報酬%",
+            "賣出成本", "對應買進成本", "買進成本", "已實現成本", "FIFO成本",
+            "賣出損益", "已實現損益", "FIFO損益",
+            "歷史買進張數", "歷史買進股數", "歷史買進金額", "歷史平均成本", "成本狀態",
         ]:
             if not strip_gsheet_text_prefix(keep.get(col, "")) and strip_gsheet_text_prefix(row.get(col, "")):
                 keep[col] = row.get(col, "")
@@ -2068,6 +2075,11 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         "標的股", "標的名稱",
         "權證代號", "權證名稱",
         "賣出張數", "賣出股數", "賣出金額", "賣出均價",
+        "報酬率", "報酬率%", "賣出報酬率", "賣出報酬%",
+        "已實現報酬率", "已實現報酬%", "FIFO報酬率", "FIFO報酬%",
+        "賣出成本", "對應買進成本", "買進成本", "已實現成本", "FIFO成本",
+        "賣出損益", "已實現損益", "FIFO損益",
+        "歷史買進張數", "歷史買進股數", "歷史買進金額", "歷史平均成本", "成本狀態",
         "事件日", "事件來源",
     ]
 
@@ -2137,6 +2149,17 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         lookup_info = event_lookup.get((broker, warrant_code))
         hist_info = history_return_lookup.get((broker, warrant_code), {})
 
+        # 主程式新版「每日賣出明細」若已經寫入 FIFO 報酬率 / 賣出成本，
+        # 圖片端優先採用這張表的結果。
+        # 只有每日賣出明細沒有報酬 / 成本時，才退回 A/B/C/D 或快取_分點歷史估算。
+        daily_return_pct = normalize_return_pct(_pick_first_existing_value_fuzzy(r, [
+            "報酬率", "報酬率%", "賣出報酬率", "賣出報酬%",
+            "已實現報酬率", "已實現報酬%", "FIFO報酬率", "FIFO報酬%",
+        ]))
+        daily_buy_amount = safe_float(_pick_first_existing_value_fuzzy(r, [
+            "賣出成本", "對應買進成本", "買進成本", "已實現成本", "FIFO成本",
+        ]), 0)
+
         if lookup_info:
             if is_unclassified_event(event):
                 event = lookup_info.get("event", event)
@@ -2147,8 +2170,10 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             if not warrant_name:
                 warrant_name = lookup_info.get("warrant_name", warrant_name)
 
-            return_pct = normalize_return_pct(lookup_info.get("return_pct"))
-            buy_amount = 0.0
+            return_pct = daily_return_pct
+            if return_pct is None:
+                return_pct = normalize_return_pct(lookup_info.get("return_pct"))
+            buy_amount = daily_buy_amount
 
             if is_unclassified_event(event):
                 # 權證雖可對到 A/B/C/D 白名單，但事件代號仍無法解析時，
@@ -2158,11 +2183,11 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             buy_avg = safe_float(lookup_info.get("buy_avg"), 0)
             sell_avg = safe_float(r.get("賣出均價"), 0)
 
-            if buy_avg > 0 and sell_qty > 0:
+            if buy_avg > 0 and sell_qty > 0 and safe_float(buy_amount, 0) <= 0:
                 buy_amount = buy_avg * sell_qty * NTD_PER_WARRANT_POINT
                 if return_pct is None and sell_avg > 0:
                     return_pct = ((sell_avg - buy_avg) / buy_avg) * 100.0
-            else:
+            elif safe_float(buy_amount, 0) <= 0:
                 buy_amount = safe_float(lookup_info.get("buy_amount"), 0)
 
             # 若事件表本身沒有足夠資訊，再用快取_分點歷史補估
@@ -2193,6 +2218,9 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         if (broker, underlying) not in qualifying_non_abcd_underlyings:
             continue
 
+        non_abcd_return_pct = daily_return_pct if daily_return_pct is not None else hist_info.get("return_pct")
+        non_abcd_buy_amount = daily_buy_amount if safe_float(daily_buy_amount, 0) > 0 else safe_float(hist_info.get("buy_amount"), 0)
+
         append_sell(
             sells,
             broker,
@@ -2203,8 +2231,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             sell_amount,
             sell_qty,
             SHEET_DAILY_SELL,
-            hist_info.get("return_pct"),
-            safe_float(hist_info.get("buy_amount"), 0),
+            non_abcd_return_pct,
+            non_abcd_buy_amount,
             warrant_code=warrant_code,
             force_include=True,
             defer_threshold=True,
