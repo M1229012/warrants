@@ -215,10 +215,19 @@ MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS = int(os.getenv("MONEYDJ_SEARCH_REPAIR
 MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION = os.getenv("MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION", "1").strip().lower() not in ("0", "false", "no")
 MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL = os.getenv("MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL", "1").strip().lower() not in ("0", "false", "no")
 MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS = int(os.getenv("MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS", "0"))
+# API4 / OpenAPI 尚未更新到報表目標日時，額外用「近期有動作 / 尚有庫存的標的股」
+# 展開成同標的所有認購權證 × 同分點，並用 API5 強制檢查今天是否已有新買賣。
+# 這不是全市場無差別掃描，而是先從分點歷史快取找出高機率有動作的標的股，再補抓該標的權證池。
+MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED = os.getenv("MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH = os.getenv("MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH", "1").strip().lower() not in ("0", "false", "no")
+# 若真的要 100% 不漏 API4 未更新時的全新陌生標的，可手動開啟下列設定；預設關閉，避免全市場掃描太慢。
+MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH = os.getenv("MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH", "0").strip().lower() in ("1", "true", "yes")
+MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH = int(os.getenv("MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH", "0"))
 MONEYDJ_SEARCH_REPAIR_ACTIVE = False
 MONEYDJ_SEARCH_REPAIR_TARGET_DATE = ""
 MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE = ""
 MONEYDJ_SEARCH_REPAIR_FETCH_KEYS = set()
+MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS = set()
 MONEYDJ_SEARCH_REPAIR_REASON = ""
 
 TARGET_PATTERNS = {
@@ -12641,6 +12650,154 @@ def _history_latest_and_net_by_candidate(history_cache_df, candidate_keys=None):
     return out
 
 
+def _safe_int_for_repair(value):
+    try:
+        if value is None:
+            return 0
+        s = str(value).replace(",", "").strip()
+        if not s or s in ("-", "None", "nan", "null"):
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def collect_moneydj_search_repair_underlying_broker_pairs_from_history(history_cache_df, target_date=None):
+    """
+    API4 / OpenAPI 落後時，用既有分點歷史快取整理「標的股 + 分點」補漏池。
+
+    目的：
+    1. 先找出這個分點最近對哪些標的股的權證有動作。
+    2. 再把這些標的股展開成「同標的所有認購權證 × 同分點」。
+    3. 後續用 API5 檢查今天是否有新買超 / 賣超，避免只抓到昨天持倉的隔日衝。
+
+    注意：
+    如果某個標的是今天第一次完全陌生出現，且 API4 也沒有更新，
+    任何非全市場掃描都無法事先知道它；這裡處理的是「近期有動作 / 尚有庫存」的高機率標的池。
+    """
+    pairs = set()
+    reason_count = {"尚有淨庫存": 0, "近期有歷史活動": 0}
+
+    if history_cache_df is None or history_cache_df.empty:
+        return pairs, reason_count
+
+    required_cols = {
+        "標的股", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+    }
+    if not required_cols.issubset(set(history_cache_df.columns)):
+        return pairs, reason_count
+
+    target_date = normalize_moneydj_search_repair_target_date(target_date)
+    target_dt = parse_date(target_date) or datetime.today()
+    recent_days = max(int(MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS or 0), 0)
+    recent_floor_dt = target_dt - timedelta(days=recent_days)
+
+    df = history_cache_df[[
+        "標的股", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+    ]].copy().fillna("")
+
+    df["標的股"] = df["標的股"].map(lambda x: normalize_underlying_code_for_group(x) or str(x).strip())
+    df["券商代號"] = df["券商代號"].astype(str).str.strip()
+
+    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
+        df[col] = df[col].map(_safe_int_for_repair)
+
+    df = df[(df["標的股"] != "") & (df["券商代號"] != "")].copy()
+
+    if df.empty:
+        return pairs, reason_count
+
+    active_target_broker_codes = {str(code).strip() for _, code in TARGET_PATTERNS.items()}
+    broker_codes_in_scope = {str(code).strip() for _, code in FALLBACK.values()}
+    if broker_codes_in_scope:
+        df = df[df["券商代號"].isin(broker_codes_in_scope)].copy()
+
+    if df.empty:
+        return pairs, reason_count
+
+    for (underlying_code, broker_code), g in df.groupby(["標的股", "券商代號"], dropna=False):
+        latest_dt = None
+        net_shares = 0
+        latest_total_amount = 0
+
+        for row in g.itertuples(index=False):
+            rd = row._asdict()
+            dt = parse_date(rd.get("日期", ""))
+            buy_shares = _safe_int_for_repair(rd.get("買進股數", 0))
+            sell_shares = _safe_int_for_repair(rd.get("賣出股數", 0))
+            buy_amount = _safe_int_for_repair(rd.get("買進金額", 0))
+            sell_amount = _safe_int_for_repair(rd.get("賣出金額", 0))
+
+            net_shares += buy_shares - sell_shares
+
+            if dt and (latest_dt is None or dt > latest_dt):
+                latest_dt = dt
+                latest_total_amount = abs(buy_amount) + abs(sell_amount)
+
+        if not latest_dt:
+            continue
+
+        if MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION and net_shares > 0:
+            pairs.add((str(underlying_code).strip(), str(broker_code).strip()))
+            reason_count["尚有淨庫存"] += 1
+            continue
+
+        if recent_days > 0 and latest_dt.date() >= recent_floor_dt.date() and latest_total_amount > 0:
+            pairs.add((str(underlying_code).strip(), str(broker_code).strip()))
+            reason_count["近期有歷史活動"] += 1
+
+    return pairs, reason_count
+
+
+def build_moneydj_search_repair_discovery_candidates(warrants, broker_map, history_cache_df, target_date=None):
+    """
+    MoneyDJ Search 補漏用的「先找標的，再展開權證」候選池。
+
+    當 API4 還停在昨天時，API5 無法用「分點 + 日期」直接反查今日新標的，
+    所以這裡先從歷史快取找出該分點近期 / 有庫存的標的股，
+    再展開該標的所有認購權證給 API5 檢查今天是否有新資料。
+    """
+    if not moneydj_search_repair_is_active():
+        return []
+
+    if not MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED:
+        print("  ⚠️ MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED=0，略過歷史活動標的補漏池。")
+        return []
+
+    pairs, reason_count = collect_moneydj_search_repair_underlying_broker_pairs_from_history(
+        history_cache_df,
+        target_date=target_date,
+    )
+
+    if not pairs:
+        print("  ⚠️ MoneyDJ Search 補漏：歷史快取沒有可展開的近期活動 / 淨庫存標的。")
+        return []
+
+    underlying_codes = {u for u, _ in pairs if str(u).strip()}
+    reason_text = "，".join(f"{k}:{v:,}" for k, v in reason_count.items() if v) or "-"
+
+    print(
+        f"  🔎 MoneyDJ Search 補漏：從歷史快取找出可能今日有動作的標的 "
+        f"{len(underlying_codes):,} 檔｜標的×分點 {len(pairs):,} 組｜{reason_text}"
+    )
+
+    candidates = build_underlying_expanded_candidates(
+        warrants,
+        broker_map,
+        underlying_codes,
+        source_label="MoneyDJ補漏：歷史活動標的",
+        active_pairs=pairs,
+    )
+    candidates = filter_candidates_by_broker_map(candidates, broker_map)
+
+    print(
+        f"  ✅ MoneyDJ Search 補漏：歷史活動標的展開候選 {len(candidates):,} 組"
+    )
+    return candidates
+
+
 def build_moneydj_search_repair_fetch_keys(history_cache_df, candidates, target_date=None):
     """
     MoneyDJ Search 補漏候選挑選邏輯。
@@ -12677,12 +12834,22 @@ def build_moneydj_search_repair_fetch_keys(history_cache_df, candidates, target_
     priority_rows = []
 
     direct_or_expanded_keys = (PRESCAN_REFRESH_KEYS | PRESCAN_MISSING_FETCH_KEYS) & candidate_keys
+    discovery_keys = MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS & candidate_keys
 
     for key in direct_or_expanded_keys:
         info = history_info.get(key, {})
         latest_dt = info.get("latest_dt")
         latest_ord = latest_dt.toordinal() if latest_dt else 0
         priority_rows.append((0, -latest_ord, -int(info.get("latest_total_amount", 0) or 0), key, "API4直接/活動標的候選"))
+
+    # API4 停在前一日時，這批 key 來自「歷史近期有動作 / 尚有庫存標的」展開。
+    # 即使某檔權證以前完全沒有快取，也要強制打 API5，才能補到今天新買超。
+    if MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH:
+        for key in discovery_keys:
+            info = history_info.get(key, {})
+            latest_dt = info.get("latest_dt")
+            latest_ord = latest_dt.toordinal() if latest_dt else 0
+            priority_rows.append((1, -latest_ord, -int(info.get("latest_total_amount", 0) or 0), key, "歷史活動標的展開候選"))
 
     for key, info in history_info.items():
         latest_dt = info.get("latest_dt")
@@ -12694,11 +12861,22 @@ def build_moneydj_search_repair_fetch_keys(history_cache_df, candidates, target_
             continue
 
         if MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION and info.get("has_open_position"):
-            priority_rows.append((1, -latest_dt.toordinal(), -abs(int(info.get("net_shares", 0) or 0)), key, "尚有淨庫存"))
+            priority_rows.append((2, -latest_dt.toordinal(), -abs(int(info.get("net_shares", 0) or 0)), key, "尚有淨庫存"))
             continue
 
         if recent_days > 0 and latest_dt.date() >= recent_floor_dt.date():
-            priority_rows.append((2, -latest_dt.toordinal(), -int(info.get("latest_total_amount", 0) or 0), key, "近期有歷史活動"))
+            priority_rows.append((3, -latest_dt.toordinal(), -int(info.get("latest_total_amount", 0) or 0), key, "近期有歷史活動"))
+
+    if MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH:
+        full_pool_keys = sorted(candidate_keys, key=lambda x: (str(x[1]), str(x[0])))
+        full_pool_max = max(int(MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH or 0), 0)
+        if full_pool_max > 0:
+            full_pool_keys = full_pool_keys[:full_pool_max]
+        for key in full_pool_keys:
+            info = history_info.get(key, {})
+            latest_dt = info.get("latest_dt")
+            latest_ord = latest_dt.toordinal() if latest_dt else 0
+            priority_rows.append((4, -latest_ord, -int(info.get("latest_total_amount", 0) or 0), key, "全候選池強制掃描"))
 
     priority_rows = sorted(priority_rows, key=lambda x: (x[0], x[1], x[2], str(x[3])))
 
@@ -12986,6 +13164,7 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
 
 def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
+    MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS.clear()
     program_start = time.time()
 
     configure_run_mode()
@@ -13021,6 +13200,7 @@ def main():
     candidates = prescan_all(warrants, broker_map)
 
     activate_moneydj_search_repair_if_needed()
+    history_cache_for_repair_pool = None
 
     # OpenAPI / API4 落後時，RUN_MODE=1 額外把「所有認購權證 × 精選分點」放入候選池。
     # 後面仍會用歷史快取 / 淨庫存 / 近期活動條件挑出要強制補抓的 key，
@@ -13035,6 +13215,30 @@ def main():
             f"{before_count:,} → {len(candidates):,} 組"
         )
 
+    # API4 / OpenAPI 落後時，不能直接用「分點 + 日期」查今日新標的。
+    # 因此先從歷史快取找出近期有動作 / 尚有庫存的標的股，
+    # 再展開同標的所有權證，讓 API5 去檢查今天是否有新買賣。
+    if moneydj_search_repair_is_active() and MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED:
+        history_cache_for_repair_pool = load_history_cache()
+        repair_discovery_candidates = build_moneydj_search_repair_discovery_candidates(
+            warrants,
+            broker_map,
+            history_cache_for_repair_pool,
+            target_date=MONEYDJ_SEARCH_REPAIR_TARGET_DATE,
+        )
+        if repair_discovery_candidates:
+            before_count = len(candidates or [])
+            candidates = merge_candidates(candidates or [], repair_discovery_candidates)
+            candidates = filter_candidates_by_broker_map(candidates, broker_map)
+            MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS.update(
+                candidate_key_from_tuple(c) for c in repair_discovery_candidates
+            )
+            print(
+                f"  🔎 MoneyDJ Search 補漏：歷史活動標的候選池合併 "
+                f"{before_count:,} → {len(candidates):,} 組｜"
+                f"強制 API5 檢查 {len(MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS):,} 組"
+            )
+
     if maybe_auto_price_prefetch_before_api5(candidates, program_start):
         return
 
@@ -13047,7 +13251,7 @@ def main():
     print(f"\n【Step 3b】處理 {len(candidates)} 組候選...")
 
     candidate_keys = {candidate_key_from_tuple(c) for c in candidates}
-    history_cache_df = load_history_cache()
+    history_cache_df = history_cache_for_repair_pool if history_cache_for_repair_pool is not None else load_history_cache()
     history_was_empty = history_cache_df is None or history_cache_df.empty
     history_keys = history_cache_keys(history_cache_df)
     history_latest_map = history_cache_latest_dates(history_cache_df)
