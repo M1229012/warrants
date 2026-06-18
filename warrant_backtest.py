@@ -7612,6 +7612,7 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, r
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
         df2 = df2.sort_values("日期").reset_index(drop=True)
+        sell_return_map = _daily_sell_fifo_return_map_for_item(item)
 
         for row in df2.itertuples(index=False):
             row_dict = row._asdict()
@@ -10317,6 +10318,139 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events):
     return source_map
 
 
+
+
+def _fmt_daily_sell_return_pct(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):+.2f}%"
+    except Exception:
+        return "-"
+
+
+def _daily_sell_fifo_return_map_for_item(item):
+    """
+    用同一分點 + 同一權證的 API5 歷史資料，替每日賣出明細計算賣出報酬率。
+
+    重點：
+    1. 不再只依賴 A/B/C/D 事件，未歸類權證也能從快取_分點歷史回頭找買進成本。
+    2. 權證不可當沖，同一天先扣舊庫存賣出，再加入當日買進。
+    3. 成本優先使用 FIFO；若歷史快取缺少足夠庫存，才用賣出前所有歷史買進均價估算不足部分。
+    4. 若完全沒有歷史買進成本，報酬率維持 '-'，並標示「缺歷史買進成本」。
+    """
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty or "日期" not in df.columns:
+        return {}
+
+    df2 = df.copy()
+    df2["日期"] = df2["日期"].map(normalize_date_str)
+    df2["dt_parsed"] = df2["日期"].map(parse_date)
+    df2 = df2.dropna(subset=["dt_parsed"]).sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
+
+    lots = []
+    out = {}
+    historical_buy_qty = 0.0
+    historical_buy_amount = 0.0
+
+    for row in df2.itertuples(index=False):
+        row_dict = row._asdict()
+        date_str = normalize_date_str(row_dict.get("日期", ""))
+        buy_qty = top15_safe_float(row_dict.get("買進股數", 0), 0.0)
+        buy_amount = top15_safe_float(row_dict.get("買進金額", 0), 0.0)
+        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0), 0.0)
+        sell_amount = top15_safe_float(row_dict.get("賣出金額", 0), 0.0)
+
+        # 權證不能當沖：同一天賣出先扣舊庫存，不吃同日買進。
+        if sell_amount > 0:
+            hist_avg_cost = historical_buy_amount / historical_buy_qty if historical_buy_qty > 0 and historical_buy_amount > 0 else None
+            sell_price = sell_amount / sell_qty if sell_qty > 0 else None
+
+            matched_qty = 0.0
+            matched_cost = 0.0
+            estimated_qty = 0.0
+            estimated_cost = 0.0
+            unmatched_qty = 0.0
+            unmatched_amount = 0.0
+
+            if sell_qty > 0 and sell_price is not None:
+                sell_left = sell_qty
+
+                for lot in lots:
+                    if sell_left <= 0:
+                        break
+
+                    remain_qty = top15_safe_float(lot.get("剩餘股數", 0), 0.0)
+                    if remain_qty <= 0:
+                        continue
+
+                    alloc_qty = min(sell_left, remain_qty)
+                    lot_avg = top15_safe_float(lot.get("均價", 0), 0.0)
+                    if alloc_qty <= 0 or lot_avg <= 0:
+                        continue
+
+                    lot["剩餘股數"] = remain_qty - alloc_qty
+                    sell_left -= alloc_qty
+                    matched_qty += alloc_qty
+                    matched_cost += alloc_qty * lot_avg
+
+                if sell_left > 0:
+                    if hist_avg_cost is not None and hist_avg_cost > 0:
+                        estimated_qty = sell_left
+                        estimated_cost = sell_left * hist_avg_cost
+                    else:
+                        unmatched_qty = sell_left
+                        unmatched_amount = sell_left * sell_price
+
+                total_cost = matched_cost + estimated_cost
+                pnl = sell_amount - total_cost if total_cost > 0 else None
+                return_pct = pnl / total_cost * 100 if total_cost > 0 else None
+
+                if total_cost > 0:
+                    if estimated_qty > 0 and matched_qty > 0:
+                        cost_status = "部分FIFO＋歷史均價估"
+                    elif estimated_qty > 0:
+                        cost_status = "歷史均價估"
+                    elif unmatched_qty > 0:
+                        cost_status = "部分成本不足"
+                    else:
+                        cost_status = "FIFO"
+                else:
+                    cost_status = "缺歷史買進成本"
+            else:
+                total_cost = None
+                pnl = None
+                return_pct = None
+                cost_status = "賣出股數異常"
+
+            out[date_str] = {
+                "歷史買進股數": round(historical_buy_qty, 0),
+                "歷史買進金額": round(historical_buy_amount, 0),
+                "歷史平均成本": round(hist_avg_cost, 4) if hist_avg_cost is not None else "",
+                "FIFO對應股數": round(matched_qty, 0),
+                "估算對應股數": round(estimated_qty, 0),
+                "成本不足股數": round(unmatched_qty, 0),
+                "成本不足金額": round(unmatched_amount, 0),
+                "賣出成本": round(total_cost, 0) if total_cost is not None else "",
+                "賣出損益": round(pnl, 0) if pnl is not None else "",
+                "報酬率": return_pct,
+                "報酬率文字": _fmt_daily_sell_return_pct(return_pct),
+                "成本狀態": cost_status,
+            }
+
+        if buy_qty > 0 and buy_amount > 0:
+            lots.append({
+                "買進日": date_str,
+                "股數": buy_qty,
+                "剩餘股數": buy_qty,
+                "金額": buy_amount,
+                "均價": buy_amount / buy_qty if buy_qty else 0,
+            })
+            historical_buy_qty += buy_qty
+            historical_buy_amount += buy_amount
+
+    return out
+
 def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events):
     """
     新增「每日賣出明細」工作表。
@@ -10332,6 +10466,8 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
        因此會與官方分點資料一致。
     3. B / C / D 事件中的其中一檔權證若發生賣出，也會被列出，不會被群組事件的
        第一個減碼日 / 出清日限制而漏掉。
+    4. 賣出報酬率不再只依賴 A/B/C/D 事件；未歸類權證會回到同分點 + 同權證歷史買進資料，
+       用 FIFO 成本估算賣出損益與報酬率。
     """
     ws = wb.create_sheet("每日賣出明細")
 
@@ -10350,6 +10486,14 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
         "賣出股數",
         "賣出金額",
         "賣出均價",
+        "報酬率",
+        "賣出成本",
+        "賣出損益",
+        "歷史買進張數",
+        "歷史買進股數",
+        "歷史買進金額",
+        "歷史平均成本",
+        "成本狀態",
         "事件日",
         "事件來源",
     ]
@@ -10393,6 +10537,8 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
                 warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
                 source = source_map.get(warrant_code, {})
                 sell_avg = round(sell_a / sell_s, 4) if sell_s > 0 else ""
+                sell_return = sell_return_map.get(date, {})
+                hist_buy_qty = top15_safe_float(sell_return.get("歷史買進股數", 0), 0.0)
 
                 rows.append({
                     "日期": date,
@@ -10409,6 +10555,14 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
                     "賣出股數": sell_s,
                     "賣出金額": sell_a,
                     "賣出均價": sell_avg,
+                    "報酬率": sell_return.get("報酬率文字", "-"),
+                    "賣出成本": sell_return.get("賣出成本", ""),
+                    "賣出損益": sell_return.get("賣出損益", ""),
+                    "歷史買進張數": int(hist_buy_qty // 1000) if hist_buy_qty > 0 else 0,
+                    "歷史買進股數": sell_return.get("歷史買進股數", 0),
+                    "歷史買進金額": sell_return.get("歷史買進金額", 0),
+                    "歷史平均成本": sell_return.get("歷史平均成本", ""),
+                    "成本狀態": sell_return.get("成本狀態", "缺歷史買進成本"),
                     "事件日": source.get("事件日", ""),
                     "事件來源": source.get("事件來源", ""),
                 })
@@ -10433,7 +10587,7 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
     for r in rows:
         ws.append([r.get(h, "") for h in headers])
 
-    col_widths = [12, 14, 18, 12, 8, 8, 10, 12, 12, 24, 10, 12, 16, 10, 12, 40]
+    col_widths = [12, 14, 18, 12, 8, 8, 10, 12, 12, 24, 10, 12, 16, 10, 10, 14, 14, 12, 14, 16, 12, 20, 12, 40]
 
     thin_gray = Side(style="thin", color="B7B7B7")
     normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
