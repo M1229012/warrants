@@ -8659,6 +8659,18 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
         apply_exit_profit_result_outline(ws, row_idx, col_idx, return_pct)
 
 
+def _safe_stat_amount(value):
+    try:
+        if value is None:
+            return 0
+        s = str(value).replace(",", "").strip()
+        if not s or s in ("-", "None", "nan", "null"):
+            return 0
+        return int(round(float(s)))
+    except Exception:
+        return 0
+
+
 def collect_stat_records(a_events, b_events, c_events, d_events):
     records = []
 
@@ -8674,6 +8686,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
+            "買進金額": _safe_stat_amount(ev.get("買進金額", 0)),
         })
 
     for ev in b_events:
@@ -8688,6 +8701,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
+            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
         })
 
     for ev in c_events:
@@ -8702,6 +8716,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
+            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
         })
 
     for ev in d_events:
@@ -8716,6 +8731,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
+            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
         })
 
     return records
@@ -8737,20 +8753,42 @@ def calc_summary_for_group(g, broker, event_type):
 
     avg_holding_days = None
     if closed_count > 0:
-        holding_series = closed_g["持有天數"].dropna()
+        holding_series = pd.to_numeric(closed_g["持有天數"], errors="coerce").dropna()
         if len(holding_series) > 0:
             avg_holding_days = round(float(holding_series.mean()), 2)
 
     avg_return = None
+    weighted_return = None
     max_return = None
     min_return = None
+    total_entry_amount = 0
+    closed_entry_amount = 0
+    estimated_pnl_amount = None
+    avg_entry_amount = None
+
+    if "買進金額" in g.columns:
+        total_entry_amount = int(pd.to_numeric(g["買進金額"], errors="coerce").fillna(0).sum())
 
     if closed_count > 0:
-        return_series = closed_g["報酬%"].dropna()
+        return_series = pd.to_numeric(closed_g["報酬%"], errors="coerce").dropna()
         if len(return_series) > 0:
             avg_return = round(float(return_series.mean()), 2)
             max_return = round(float(return_series.max()), 2)
             min_return = round(float(return_series.min()), 2)
+
+        if "買進金額" in closed_g.columns:
+            weighted_df = closed_g.copy()
+            weighted_df["報酬%"] = pd.to_numeric(weighted_df["報酬%"], errors="coerce")
+            weighted_df["買進金額"] = pd.to_numeric(weighted_df["買進金額"], errors="coerce").fillna(0)
+            weighted_df = weighted_df.dropna(subset=["報酬%"] )
+            weighted_df = weighted_df[weighted_df["買進金額"] > 0]
+
+            if not weighted_df.empty:
+                closed_entry_amount = int(round(float(weighted_df["買進金額"].sum())))
+                weighted_pnl = float((weighted_df["買進金額"] * weighted_df["報酬%"] / 100.0).sum())
+                estimated_pnl_amount = int(round(weighted_pnl))
+                weighted_return = round(weighted_pnl / closed_entry_amount * 100.0, 2) if closed_entry_amount > 0 else None
+                avg_entry_amount = int(round(closed_entry_amount / len(weighted_df))) if len(weighted_df) > 0 else None
 
     return {
         "分點": broker,
@@ -8764,6 +8802,11 @@ def calc_summary_for_group(g, broker, event_type):
         "勝率": win_rate,
         "平均持有天數": avg_holding_days,
         "平均報酬%": avg_return,
+        "加權報酬%": weighted_return,
+        "總買進金額": total_entry_amount,
+        "已出清買進金額": closed_entry_amount,
+        "估算損益金額": estimated_pnl_amount,
+        "平均單筆買進金額": avg_entry_amount,
         "最高報酬%": max_return,
         "最低報酬%": min_return,
     }
@@ -8782,6 +8825,11 @@ def calc_empty_summary(broker, event_type):
         "勝率": None,
         "平均持有天數": None,
         "平均報酬%": None,
+        "加權報酬%": None,
+        "總買進金額": 0,
+        "已出清買進金額": 0,
+        "估算損益金額": None,
+        "平均單筆買進金額": None,
         "最高報酬%": None,
         "最低報酬%": None,
     }
@@ -8836,7 +8884,7 @@ def sort_brokers_by_winrate_summary(summary_map, broker_order):
 
 def make_summary_map(stat_records):
     if not stat_records:
-        stat_df = pd.DataFrame(columns=["分點", "事件代碼", "事件類型", "是否出清", "結果", "持有天數", "報酬%"])
+        stat_df = pd.DataFrame(columns=["分點", "事件代碼", "事件類型", "是否出清", "結果", "持有天數", "報酬%", "買進金額"])
     else:
         stat_df = pd.DataFrame(stat_records)
 
@@ -8898,6 +8946,11 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events):
         "勝率",
         "平均持有天數",
         "平均報酬%",
+        "加權報酬%",
+        "總買進金額",
+        "已出清買進金額",
+        "估算損益金額",
+        "平均單筆買進金額",
         "最高報酬%",
         "最低報酬%",
     ]
@@ -8955,6 +9008,11 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events):
                 "-" if row["勝率"] is None else f'{row["勝率"]:.2f}%',
                 "-" if row["平均持有天數"] is None else row["平均持有天數"],
                 "-" if row["平均報酬%"] is None else f'{row["平均報酬%"]:+.2f}%',
+                "-" if row["加權報酬%"] is None else f'{row["加權報酬%"]:+.2f}%',
+                fmt_amount(row.get("總買進金額")),
+                fmt_amount(row.get("已出清買進金額")),
+                "-" if row.get("估算損益金額") is None else fmt_amount(row.get("估算損益金額")),
+                "-" if row.get("平均單筆買進金額") is None else fmt_amount(row.get("平均單筆買進金額")),
                 "-" if row["最高報酬%"] is None else f'{row["最高報酬%"]:+.2f}%',
                 "-" if row["最低報酬%"] is None else f'{row["最低報酬%"]:+.2f}%',
             ]
@@ -8976,7 +9034,7 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events):
 
         current_row += 1
 
-    col_widths = [16, 24, 10, 12, 12, 10, 10, 10, 10, 14, 12, 12, 12]
+    col_widths = [16, 24, 10, 12, 12, 10, 10, 10, 10, 14, 12, 12, 14, 16, 14, 16, 12, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -9025,7 +9083,7 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events):
     if not stat_records:
         stat_df = pd.DataFrame(columns=[
             "分點", "事件代碼", "事件類型", "是否出清",
-            "結果", "持有天數", "報酬%"
+            "結果", "持有天數", "報酬%", "買進金額"
         ])
     else:
         stat_df = pd.DataFrame(stat_records)
