@@ -10514,6 +10514,7 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
         df2 = df2.sort_values("日期").reset_index(drop=True)
+        sell_return_map = _daily_sell_fifo_return_map_for_item(item)
 
         for row in df2.itertuples(index=False):
             row_dict = row._asdict()
