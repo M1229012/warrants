@@ -79,7 +79,7 @@ const BROKER_CATEGORIES = [
     key: "capital",
     label: "群益金鼎",
     brokers: [
-      "群益東大",
+      "群益金鼎東大",
       "群益金鼎中壢",
       "群益金鼎北高雄",
       "群益金鼎古亭",
@@ -99,7 +99,7 @@ const BROKER_CATEGORIES = [
     label: "其他",
     brokers: [
       "新光",
-      "福邦",
+      "福邦證券",
       "兆豐小港",
       "凱基士林",
       "凱基科園",
