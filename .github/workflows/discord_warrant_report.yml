@@ -22,6 +22,14 @@ on:
         description: "指定分點名稱，例如 元大南屯。只有執行近10日分點買賣明細圖時使用"
         required: false
         default: ""
+      notification_mode:
+        description: "選擇 Discord 推播模式"
+        required: true
+        default: "測試推播"
+        type: choice
+        options:
+          - "測試推播"
+          - "正式推播"
 
   schedule:
     # 台灣時間 14:30 = UTC 06:30
@@ -38,7 +46,10 @@ jobs:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
-      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+
+      # 手動選擇「正式推播」時使用正式 Webhook。
+      # 選擇「測試推播」或排程自動執行時使用測試 Webhook。
+      DISCORD_WEBHOOK_URL_TEST: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.notification_mode == '正式推播' && secrets.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL_TEST }}
 
       BUY_THRESHOLD: "1000000"
       SELL_THRESHOLD_RATIO: "0.2"
