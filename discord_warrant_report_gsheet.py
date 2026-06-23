@@ -2569,12 +2569,9 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     buy_total = sum(x["amount"] for x in buys)
     sell_total = sum(x["amount"] for x in sells)
 
-    # KPI 的「實際淨買超」改用同一個資料來源「快取_分點歷史」計算：
-    # 今日實際買進金額 - 今日實際賣出金額。
-    # 不再混用 A/B/C/D 買超事件金額與每日賣出明細成交金額。
-    actual_daily_flow = read_actual_daily_net_from_history(target)
-    has_actual_daily_flow = bool(actual_daily_flow.get("has_data"))
-    actual_net = safe_float(actual_daily_flow.get("net_amount"), 0)
+    # KPI 的「今日淨額」直接使用圖卡目前顯示的買超與賣超金額計算，
+    # 確保第三個 KPI 可直接由前兩個 KPI 驗算。
+    actual_net = buy_total - sell_total
 
     broker_summary = {}
     for b in TRACKED_BROKERS:
@@ -2780,14 +2777,14 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     kpi_y = y - kpi_h
     kpi_gap = 0.30
     kpi_w = (content_w - 2 * kpi_gap) / 3
-    actual_net_text = fmt_wan(actual_net) if has_actual_daily_flow else "-"
+    actual_net_text = fmt_wan(actual_net)
     actual_net_color = RED if actual_net >= 0 else GREEN
     actual_net_bg = PINK if actual_net >= 0 else MINT
 
     kpis = [
         ("今日買超", f"{sum(x['count'] for x in buys)} 筆", fmt_wan(buy_total), RED, PINK, "↗"),
         ("今日賣超", f"{sum(x['count'] for x in sells)} 筆", fmt_wan(sell_total), GREEN, MINT, "−"),
-        ("實際淨買超", "", actual_net_text, actual_net_color, actual_net_bg, "◎"),
+        ("今日淨額", "", actual_net_text, actual_net_color, actual_net_bg, "◎"),
     ]
     for i, (title, mid, val, color, bg, icon) in enumerate(kpis):
         x = margin_x + i * (kpi_w + kpi_gap)
