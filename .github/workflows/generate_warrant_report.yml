@@ -74,7 +74,7 @@ jobs:
       WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
       WARRANTS_API_KEY_2: ${{ secrets.WARRANTS_API_KEY_2 }}
       WARRANTS_API_KEY_3: ${{ secrets.WARRANTS_API_KEY_3 }}
-      GEMINI_MODEL: Gemini 3 Flash
+      GEMINI_MODEL: gemini-3.1-flash-lite
 
       # 新聞抓取開關：
       # 預設開啟；是否使用快取或強制重抓，由 refresh_news_summary 控制。
