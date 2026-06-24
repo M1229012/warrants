@@ -16,11 +16,11 @@ on:
   schedule:
     # Asia/Taipei 18:30 = UTC 10:30
     # 下午 6:30 跑：精選5分點當日買賣超產圖
-    - cron: "30 10 * * 1-5"
+    - cron: "30 07 * * 1-5"
 
     # Asia/Taipei 21:30 = UTC 13:30
     # 晚上 9:30 跑：完整資料回補與回測
-    - cron: "30 13 * * 1-5"
+    - cron: "30 10 * * 1-5"
 
 concurrency:
   group: warrant-backtest-google-sheet
