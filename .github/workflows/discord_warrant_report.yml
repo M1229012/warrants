@@ -7,6 +7,7 @@ on:
         description: "指定圖卡日期，例如 2026-05-18。留空則自動抓 Google Sheet 內最新日期"
         required: false
         default: ""
+
       run_plan:
         description: "執行方案"
         required: true
@@ -17,11 +18,14 @@ on:
           - "近一個月共識淨買超TOP15"
           - "本週權證共識買賣超TOP15"
           - "近10日分點買賣明細圖"
+          - "所有分點勝率統計圖"
           - "全部圖片"
+
       broker_name:
         description: "指定分點名稱，例如 元大南屯。只有執行近10日分點買賣明細圖時使用"
         required: false
         default: ""
+
       notification_mode:
         description: "選擇 Discord 推播模式"
         required: true
@@ -32,7 +36,7 @@ on:
           - "正式推播"
 
   schedule:
-    # 台灣時間 14:30 = UTC 06:30
+    # 台灣時間 16:00 = UTC 08:00
     - cron: "00 08 * * 1-5"
 
 jobs:
@@ -42,7 +46,8 @@ jobs:
 
     env:
       GOOGLE_SHEET_NAME: "權證分點籌碼"
-      # 建議你用 GOOGLE_SHEET_ID，比名稱更穩；若不用可刪掉這行或留空。
+
+      # 建議使用 GOOGLE_SHEET_ID，比名稱開啟更穩定。
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
@@ -57,10 +62,11 @@ jobs:
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
 
-      # 排程預設執行原本的每日圖流程
+      # 排程自動執行時，仍只執行原本的每日圖流程。
       RUN_PLAN: "精選五分點每日圖"
 
-      # 正式執行關閉除錯；若之後要確認近10日圖實際採用 run_id，可暫時改成 "1"
+      # 正式執行關閉除錯。
+      # 若要確認近10日圖實際採用的 run_id，可暫時改成 "1"。
       DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
