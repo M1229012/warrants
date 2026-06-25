@@ -50,7 +50,7 @@ from matplotlib import font_manager
 TRACKED_BROKERS = [
     "華南永昌台中",
     "元大南屯",
-    "永豐金竹北",
+    "新光",
     "永豐金內湖",
     "富邦敦南",
 ]
@@ -2747,7 +2747,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     y = fig_h - 0.45
     text(margin_x + 0.15, y, f"{date_label} 精選分點買賣超追蹤", 31, NAVY, BOLD)
     y -= 0.42
-    text(margin_x + 0.18, y, f"精選 5 家分點｜華南永昌台中、元大南屯、富邦敦南、永豐金內湖、永豐金竹北", 15, NAVY2, BOLD)
+    text(margin_x + 0.18, y, f"精選 5 家分點｜華南永昌台中、元大南屯、富邦敦南、永豐金內湖、新光", 15, NAVY2, BOLD)
     y -= 0.32
     text(margin_x + 0.18, y, "紅色＝買超　綠色＝賣超　單位：萬元", 13, TEXT, BOLD)
 
