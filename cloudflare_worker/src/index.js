@@ -110,7 +110,7 @@ const BROKER_CATEGORIES = [
 const DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES = [
   "華南永昌台中",
   "元大南屯",
-  "永豐金竹北",
+  "新光",
   "永豐金內湖",
   "富邦敦南",
 ];
