@@ -5714,105 +5714,6 @@ def items_from_history_cache(history_df, candidate_filter=None):
     return items
 
 
-def build_open_position_candidates_from_history(history_df, broker_map):
-    """
-    從原始分點歷史快取補回「目前仍有淨持倉」的候選組合。
-
-    修正目的：
-    - candidates_cache 會依當次有效權證清單 / API4 預掃描結果清理候選。
-    - 但 TOP15 是部位報表；只要歷史快取顯示該分點對該權證仍有剩餘股數，
-      即使該權證本次沒有出現在候選快取，也不能從 TOP15 計算池消失。
-    - 只補回目前 RUN_MODE 實際追蹤的分點，避免 RUN_MODE=1 混入其他分點。
-
-    回傳格式與 candidates 相同：
-        (權證代號, 權證名稱, 標的股, 標的名稱, 分點, 分點名稱, 券商代號)
-    """
-    if history_df is None or history_df.empty:
-        return []
-
-    df = history_df.copy().fillna("")
-
-    required_cols = {
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數",
-    }
-    if not required_cols.issubset(set(df.columns)):
-        return []
-
-    active_labels = set((broker_map or {}).keys()) or set(TARGET_PATTERNS.keys())
-    active_codes = {
-        str(code).strip()
-        for _, code in (broker_map or {}).values()
-        if str(code).strip()
-    }
-    if not active_codes:
-        active_codes = {
-            str(FALLBACK[label][1]).strip()
-            for label in active_labels
-            if label in FALLBACK and str(FALLBACK[label][1]).strip()
-        }
-
-    label_mask = df["分點"].astype(str).str.strip().isin(active_labels)
-    code_mask = df["券商代號"].astype(str).str.strip().isin(active_codes)
-    df = df[label_mask | code_mask].copy()
-
-    if df.empty:
-        return []
-
-    df["買進股數"] = pd.to_numeric(df["買進股數"], errors="coerce").fillna(0)
-    df["賣出股數"] = pd.to_numeric(df["賣出股數"], errors="coerce").fillna(0)
-    df["_日期排序"] = pd.to_datetime(
-        df["日期"].astype(str).str.replace("/", "-", regex=False),
-        errors="coerce",
-    )
-
-    candidates = []
-
-    for (warrant_code, broker_code), g in df.groupby(
-        ["權證代號", "券商代號"],
-        dropna=False,
-    ):
-        warrant_code = str(warrant_code).strip()
-        broker_code = str(broker_code).strip()
-
-        if not warrant_code or not broker_code:
-            continue
-
-        remaining_shares = float(g["買進股數"].sum() - g["賣出股數"].sum())
-        if remaining_shares <= 0:
-            continue
-
-        g = g.sort_values("_日期排序", na_position="first")
-        row = g.iloc[-1]
-
-        broker_label = str(row.get("分點", "")).strip()
-        broker_name = str(row.get("分點名稱", "")).strip()
-
-        # 以 broker_map 為準補正顯示名稱與券商代號，避免歷史文字格式差異。
-        if broker_label in (broker_map or {}):
-            mapped_name, mapped_code = broker_map[broker_label]
-            broker_name = str(mapped_name).strip() or broker_name
-            broker_code = str(mapped_code).strip() or broker_code
-
-        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
-            row.get("權證名稱", ""),
-            row.get("標的股", ""),
-            row.get("標的名稱", ""),
-        )
-
-        candidates.append((
-            warrant_code,
-            str(row.get("權證名稱", "")).strip(),
-            underlying_code,
-            underlying_name,
-            broker_label,
-            broker_name,
-            broker_code,
-        ))
-
-    return candidates
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 1：取所有認購權證 + 標的股代號
@@ -14659,26 +14560,6 @@ def main():
                 f"{before_count:,} → {len(candidates):,} 組｜"
                 f"強制 API5 檢查 {len(MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS):,} 組"
             )
-
-    # TOP15 是「部位」報表，不能只依當次候選快取決定哪些歷史部位可參與計算。
-    # 若某權證本次沒有出現在有效權證清單 / API4 候選中，但歷史快取仍顯示有淨持倉，
-    # 必須把該「權證代號 + 券商代號」補回本次候選池，否則部位會無故從 TOP15 消失。
-    if history_cache_for_repair_pool is None:
-        history_cache_for_repair_pool = load_history_cache()
-
-    open_position_candidates = build_open_position_candidates_from_history(
-        history_cache_for_repair_pool,
-        broker_map,
-    )
-    if open_position_candidates:
-        before_count = len(candidates or [])
-        candidates = merge_candidates(candidates or [], open_position_candidates)
-        candidates = filter_candidates_by_broker_map(candidates, broker_map)
-        added_count = max(len(candidates) - before_count, 0)
-        print(
-            f"  ✅ 已從分點歷史補回未出清候選：{len(open_position_candidates):,} 組｜"
-            f"本次候選池新增 {added_count:,} 組｜合計 {len(candidates):,} 組"
-        )
 
     if maybe_auto_price_prefetch_before_api5(candidates, program_start):
         return
