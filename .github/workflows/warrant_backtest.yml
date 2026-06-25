@@ -129,7 +129,7 @@ jobs:
 
       # 保留相容舊設定，不作為主要跳過依據。
       FAST_SKIP_RECENT_PRESCAN: "0"
-      CACHE_RECENT_SCAN_DAYS: "3"
+      CACHE_RECENT_SCAN_DAYS: "10"
 
       # Google Sheet 設定
       GSHEET_ENABLE: "1"
