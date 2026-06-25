@@ -59,7 +59,7 @@ D_WINDOW_DAYS = 10
 # 第二次之後會優先讀取快取，只針對最近有出現目標分點的候選組合補抓新資料。
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
-CACHE_RECENT_SCAN_DAYS = int(os.getenv("CACHE_RECENT_SCAN_DAYS", "10"))
+CACHE_RECENT_SCAN_DAYS = int(os.getenv("CACHE_RECENT_SCAN_DAYS", "22"))
 PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "80"))
 PRESCAN_WORKERS = int(os.getenv("PRESCAN_WORKERS", "60"))
 FIND_BROKER_WORKERS = int(os.getenv("FIND_BROKER_WORKERS", "40"))
