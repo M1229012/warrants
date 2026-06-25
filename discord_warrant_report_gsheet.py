@@ -7,6 +7,7 @@
 - 直接讀取 Google Sheet「權證分點籌碼」內的 A/B/C/D 與勝率統計工作表
 - 不需要本機 Excel
 - 產生一頁式 PNG
+- 可產生「所有分點勝率統計圖」，列出 A 勝率、總勝率、平均持有天數與加權報酬率
 - 發送到 DISCORD_WEBHOOK_URL_TEST
 
 必要 GitHub Secrets：
@@ -19,6 +20,7 @@
 - TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
 - IMAGE_ACTION / ACTION / RUN_PLAN：圖片產生選項，用於 GitHub Actions workflow_dispatch 區別要跑哪張圖
 - ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
+- WIN_RATE_STATS_OUTPUT_IMAGE：所有分點勝率統計圖輸出路徑
 """
 
 from __future__ import annotations
@@ -1478,6 +1480,217 @@ def read_history_stats_from_gsheet() -> dict:
             }
 
     return result
+
+
+
+def _normalize_stat_header_name(value) -> str:
+    """統一勝率統計表欄名，忽略空白、全半形百分比與常見符號差異。"""
+    s = strip_gsheet_text_prefix(value)
+    s = str(s).strip().replace("％", "%")
+    s = re.sub(r"[\s\n\r\t_\-－—:：｜|/\\()（）\[\]【】%]+", "", s)
+    return s
+
+
+def _build_stat_header_map(values: list) -> dict[str, int]:
+    """
+    從勝率統計表的一列辨識欄位位置。
+
+    勝率統計可能包含標題列、空白列或多層表頭，因此不依賴固定的單一表頭列。
+    """
+    result: dict[str, int] = {}
+
+    for idx, value in enumerate(values):
+        name = _normalize_stat_header_name(value)
+        if not name:
+            continue
+
+        if name in {"資料範圍", "範圍", "模式"}:
+            result.setdefault("scope", idx)
+        elif name in {"分點", "分點名稱", "券商分點", "券商名稱"}:
+            result.setdefault("broker", idx)
+        elif name in {"事件類型", "事件", "統計類型", "訊號類型"}:
+            result.setdefault("event", idx)
+        elif "加權" in name and ("報酬" in name or "損益" in name):
+            result.setdefault("weighted_return", idx)
+        elif "平均持有" in name and ("天" in name or "日" in name):
+            result.setdefault("avg_hold_days", idx)
+        elif name in {"勝率", "總勝率", "勝率百分比"} or name.endswith("勝率"):
+            result.setdefault("win_rate", idx)
+
+    return result
+
+
+def _parse_stat_win_rate(value):
+    """將勝率欄位統一轉成百分比數值，例如 72.5% -> 72.5、0.725 -> 72.5。"""
+    raw = strip_gsheet_text_prefix(value)
+    if raw in ("", "-"):
+        return None
+
+    number = safe_float(raw, None)
+    if number is None:
+        return None
+
+    # get_all_values 通常會讀到格式化後的 72.5%；若來源是 0.725，才轉成 72.5。
+    if "%" not in raw and "％" not in raw and 0 < abs(number) <= 1:
+        number *= 100.0
+
+    return number
+
+
+def _parse_stat_plain_number(value):
+    """解析平均持有天數或加權報酬率；空白回傳 None。"""
+    raw = strip_gsheet_text_prefix(value)
+    if raw in ("", "-"):
+        return None
+    return safe_float(raw, None)
+
+
+def _classify_stat_event(value) -> str:
+    """將勝率統計表事件名稱分類成 A 或 total；其他事件不納入本圖。"""
+    raw = strip_gsheet_text_prefix(value).strip()
+    compact = re.sub(r"[\s_－—｜|/\\]+", "", raw)
+    upper = compact.upper()
+
+    if not compact:
+        return ""
+
+    if (
+        "全部" in compact
+        or "總計" in compact
+        or "合併" in compact
+        or "ABCD" in upper
+        or "A+B+C+D" in upper
+    ):
+        return "total"
+
+    if upper == "A" or (upper.startswith("A") and "單檔" in compact):
+        return "A"
+
+    return ""
+
+
+def _stat_scope_priority(value) -> int:
+    """同一分點若同時存在精選五分點與全分點資料，優先採用全分點列。"""
+    raw = strip_gsheet_text_prefix(value).strip()
+    if raw == DATA_SCOPE_ALL or "全分點" in raw:
+        return 3
+    if not raw:
+        return 2
+    if raw == DATA_SCOPE_SELECTED5 or "精選五分點" in raw or "五分點" in raw:
+        return 1
+    return 2
+
+
+def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
+    """
+    讀取 Google Sheet「勝率統計」，整理所有分點的：
+    - A：單檔權證大買勝率
+    - 總勝率：全部 A+B+C+D 合併
+    - 平均持有天數：採總計列，總計缺值時才用 A 列備援
+    - 加權報酬率：採總計列，總計缺值時才用 A 列備援
+
+    表頭採名稱辨識，不把欄位位置寫死；若舊版工作表沒有可辨識表頭，
+    才沿用既有欄位位置：勝率第 9 欄、平均持有天數第 10 欄、加權報酬率第 11 欄。
+    """
+    try:
+        stat = read_gsheet_stat_raw()
+    except Exception as exc:
+        print(f"  ⚠️ 讀取 {SHEET_STAT} 失敗：{exc}")
+        return []
+
+    if stat.empty:
+        return []
+
+    # 勝率統計可能是多層表頭，先掃過整張表，合併所有可辨識欄位位置。
+    global_header_map: dict[str, int] = {}
+    for _, row in stat.iterrows():
+        row_map = _build_stat_header_map(row.tolist())
+        for key, idx in row_map.items():
+            global_header_map.setdefault(key, idx)
+
+    broker_idx = global_header_map.get("broker", 0)
+    event_idx = global_header_map.get("event", 1)
+    scope_idx = global_header_map.get("scope")
+    win_rate_idx = global_header_map.get("win_rate", 8)
+    avg_hold_idx = global_header_map.get("avg_hold_days", 9)
+    weighted_return_idx = global_header_map.get("weighted_return", 10)
+
+    broker_order: list[str] = []
+    by_broker: dict[str, dict] = {}
+    current_scope = ""
+
+    def get_value(values: list, idx: int | None):
+        if idx is None or idx < 0 or idx >= len(values):
+            return ""
+        return values[idx]
+
+    for _, row in stat.iterrows():
+        values = [strip_gsheet_text_prefix(x) for x in row.tolist()]
+        joined = " ".join(str(x) for x in values if str(x).strip())
+
+        # 支援以獨立標題列區分「精選五分點 / 全分點」的工作表格式。
+        if "全分點" in joined and _classify_stat_event(get_value(values, event_idx)) == "":
+            current_scope = DATA_SCOPE_ALL
+        elif ("精選五分點" in joined or "五分點" in joined) and _classify_stat_event(get_value(values, event_idx)) == "":
+            current_scope = DATA_SCOPE_SELECTED5
+
+        broker = str(get_value(values, broker_idx)).strip()
+        event_kind = _classify_stat_event(get_value(values, event_idx))
+        if not broker or broker in {"分點", "分點名稱", "券商分點"} or not event_kind:
+            continue
+
+        row_scope = str(get_value(values, scope_idx)).strip() if scope_idx is not None else current_scope
+        priority = _stat_scope_priority(row_scope)
+
+        metric = {
+            "win_rate": _parse_stat_win_rate(get_value(values, win_rate_idx)),
+            "avg_hold_days": _parse_stat_plain_number(get_value(values, avg_hold_idx)),
+            "weighted_return": _parse_stat_plain_number(get_value(values, weighted_return_idx)),
+            "scope": row_scope,
+            "priority": priority,
+        }
+
+        if broker not in by_broker:
+            by_broker[broker] = {"A": None, "total": None}
+            broker_order.append(broker)
+
+        old = by_broker[broker].get(event_kind)
+        if old is None or priority > safe_int(old.get("priority"), 0):
+            by_broker[broker][event_kind] = metric
+        elif priority == safe_int(old.get("priority"), 0):
+            # 同一優先層級重複時，保留資訊較完整的列。
+            old_score = sum(old.get(k) is not None for k in ["win_rate", "avg_hold_days", "weighted_return"])
+            new_score = sum(metric.get(k) is not None for k in ["win_rate", "avg_hold_days", "weighted_return"])
+            if new_score > old_score:
+                by_broker[broker][event_kind] = metric
+
+    rows: list[dict] = []
+    for broker in broker_order:
+        a_metric = by_broker[broker].get("A") or {}
+        total_metric = by_broker[broker].get("total") or {}
+
+        avg_hold_days = total_metric.get("avg_hold_days")
+        if avg_hold_days is None:
+            avg_hold_days = a_metric.get("avg_hold_days")
+
+        weighted_return = total_metric.get("weighted_return")
+        if weighted_return is None:
+            weighted_return = a_metric.get("weighted_return")
+
+        rows.append({
+            "broker": broker,
+            "a_win_rate": a_metric.get("win_rate"),
+            "total_win_rate": total_metric.get("win_rate"),
+            "avg_hold_days": avg_hold_days,
+            "weighted_return": weighted_return,
+        })
+
+    print(
+        f"  ✅ 已讀取 {SHEET_STAT} 全分點統計：{len(rows):,} 個分點｜"
+        f"A 勝率有效 {sum(r.get('a_win_rate') is not None for r in rows):,} 個｜"
+        f"總勝率有效 {sum(r.get('total_win_rate') is not None for r in rows):,} 個"
+    )
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3334,10 +3547,269 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 # 本週｜全市場分點標的共識買賣超金額 TOP15
 # ══════════════════════════════════════════════════════════════════════
 
+
+
+def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
+    """
+    新增圖片：所有分點勝率統計。
+
+    一張圖直接顯示 Google Sheet「勝率統計」內所有分點，版面與既有圖卡一致：
+    深藍標題、白底表格、交錯列、中央淡色浮水印與風險提醒。
+    """
+    rows = read_all_broker_win_rate_stats_from_gsheet()
+    n = len(rows)
+
+    fig_w = 13.0
+    margin_x = 0.40
+    content_w = fig_w - 2 * margin_x
+    panel_gap = 0.18
+    panel_w = (content_w - panel_gap) / 2
+
+    top_h = 1.28
+    summary_h = 0.55
+    gap = 0.18
+    section_title_h = 0.55
+    header_h = 0.46
+    row_h = 0.46 if n <= 120 else 0.42
+    footer_h = 0.45
+
+    rows_per_panel = max(1, math.ceil(max(n, 1) / 2))
+    table_h = header_h + rows_per_panel * row_h
+    fig_h = top_h + summary_h + gap + section_title_h + table_h + footer_h
+    fig_h = max(fig_h, 8.5)
+
+    BG = "#F6F8FB"
+    WHITE = "#FFFFFF"
+    NAVY = "#061D3D"
+    NAVY2 = "#0B2E5B"
+    RED = "#D92323"
+    GREEN = "#16803C"
+    TEXT = "#111827"
+    MUTED = "#64748B"
+    BORDER = "#C9D5E3"
+    ROW_ALT = "#FAFCFF"
+    HEADER_BG = "#F3F7FC"
+
+    font_path = get_font_path(False)
+    bold_path = get_font_path(True)
+    FONT = font_manager.FontProperties(fname=font_path)
+    BOLD = font_manager.FontProperties(fname=bold_path)
+
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG)
+    ax.set_xlim(0, fig_w)
+    ax.set_ylim(0, fig_h)
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    def rounded(x, y, w, h, fc=WHITE, ec=BORDER, lw=1.2, r=0.12, z=1):
+        patch = patches.FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle=f"round,pad=0,rounding_size={r}",
+            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z,
+        )
+        ax.add_patch(patch)
+        return patch
+
+    def rect(x, y, w, h, fc=WHITE, ec=None, lw=0.8, z=1):
+        patch = patches.Rectangle(
+            (x, y), w, h,
+            linewidth=lw if ec else 0,
+            edgecolor=ec, facecolor=fc, zorder=z,
+        )
+        ax.add_patch(patch)
+        return patch
+
+    def text_draw(x, y, s, size=12, color=TEXT, fp=None, ha="left", va="center", z=5):
+        ax.text(
+            x, y, str(s), fontsize=size, color=color,
+            fontproperties=fp or FONT, ha=ha, va=va, zorder=z,
+        )
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def measure_text_width(s, size=11.5, fp=None):
+        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
+        bb = ghost.get_window_extent(renderer=renderer)
+        ghost.remove()
+        x0_disp, y0_disp = ax.transData.transform((0, 0))
+        x1_disp = x0_disp + bb.width
+        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
+        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
+        return x1_data - x0_data
+
+    def fit_to_cell_width(s, cell_w, size=11.5, fp=None):
+        s = str(s or "")
+        if not s:
+            return ""
+        max_w = max(float(cell_w), 0.08)
+        if measure_text_width(s, size=size, fp=fp) <= max_w:
+            return s
+
+        ellipsis = "…"
+        low, high = 0, len(s)
+        best = ellipsis
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = s[:mid] + ellipsis
+            if measure_text_width(candidate, size=size, fp=fp) <= max_w:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
+    def fmt_rate(value, signed=False):
+        if value is None:
+            return "-"
+        number = safe_float(value, None)
+        if number is None:
+            return "-"
+        return f"{number:+.1f}%" if signed else f"{number:.1f}%"
+
+    def fmt_hold_days(value):
+        if value is None:
+            return "-"
+        number = safe_float(value, None)
+        if number is None:
+            return "-"
+        return f"{number:.1f} 天"
+
+    def rate_color(value, threshold=None):
+        if value is None:
+            return TEXT
+        number = safe_float(value, 0)
+        if threshold is not None:
+            return RED if number >= threshold else GREEN
+        return RED if number > 0 else GREEN if number < 0 else TEXT
+
+    # 中央淡色浮水印，與其他圖片維持一致。
+    try:
+        ax.text(
+            0.5, 0.50, CENTER_WATERMARK_TEXT,
+            transform=ax.transAxes,
+            ha="center", va="center",
+            fontsize=CENTER_WATERMARK_FONT_SIZE,
+            fontproperties=BOLD,
+            color="#2C3440",
+            alpha=CENTER_WATERMARK_ALPHA,
+            rotation=CENTER_WATERMARK_ROTATION,
+            linespacing=1.18,
+            zorder=50,
+        )
+    except Exception:
+        pass
+
+    y = fig_h - 0.45
+    text_draw(margin_x + 0.15, y, "所有分點勝率統計", 30, NAVY, BOLD)
+    y -= 0.46
+    text_draw(
+        margin_x + 0.18,
+        y,
+        "A勝率＝單檔權證單日大買｜總勝率＝全部 A+B+C+D 合併｜平均持有天數與加權報酬率採總計資料",
+        13,
+        TEXT,
+        BOLD,
+    )
+
+    y -= 0.28
+    summary_y = y - summary_h
+    rounded(margin_x, summary_y, content_w, summary_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
+    text_draw(margin_x + 0.25, summary_y + summary_h / 2, f"資料來源：{SHEET_STAT}", 13.5, NAVY2, BOLD)
+    text_draw(margin_x + 3.15, summary_y + summary_h / 2, f"共 {n} 個分點", 13.5, NAVY, BOLD)
+    text_draw(
+        margin_x + 5.15,
+        summary_y + summary_h / 2,
+        f"統計基準日：{target:%Y/%m/%d}｜依 Google Sheet 分點順序排列",
+        12.5,
+        TEXT,
+        FONT,
+    )
+
+    y = summary_y - gap
+    rounded(margin_x, y - section_title_h, content_w, section_title_h, fc=NAVY, ec=NAVY, lw=1.0, r=0.08)
+    text_draw(margin_x + 0.30, y - section_title_h / 2, "全分點 A 勝率、總勝率、持有天數與加權報酬", 19, WHITE, BOLD)
+    table_top = y - section_title_h
+
+    headers = ["序號", "分點", "A勝率", "總勝率", "持有天數", "加權報酬"]
+    col_w = [0.48, 1.74, 0.86, 0.86, 0.94, 1.13]
+
+    def draw_panel(panel_x: float, panel_rows: list[dict], global_start_index: int):
+        rounded(panel_x, table_top - table_h, panel_w, table_h, fc=WHITE, ec=NAVY, lw=1.0, r=0.06)
+        rect(panel_x, table_top - header_h, panel_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
+
+        x = panel_x
+        for header, width in zip(headers, col_w):
+            text_draw(x + width / 2, table_top - header_h / 2, header, 11.0, NAVY, BOLD, ha="center")
+            ax.plot([x, x], [table_top - table_h, table_top], color=BORDER, linewidth=0.55)
+            x += width
+        ax.plot([panel_x + panel_w, panel_x + panel_w], [table_top - table_h, table_top], color=BORDER, linewidth=0.55)
+
+        if not panel_rows:
+            ry = table_top - header_h - row_h
+            rect(panel_x, ry, panel_w, row_h, fc=WHITE, ec=BORDER, lw=0.5)
+            text_draw(panel_x + panel_w / 2, ry + row_h / 2, "無資料", 11.5, MUTED, BOLD, ha="center")
+            return
+
+        for local_idx, row in enumerate(panel_rows):
+            ry = table_top - header_h - (local_idx + 1) * row_h
+            rect(panel_x, ry, panel_w, row_h, fc=WHITE if local_idx % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.45)
+
+            a_rate = row.get("a_win_rate")
+            total_rate = row.get("total_win_rate")
+            weighted_return = row.get("weighted_return")
+            values = [
+                str(global_start_index + local_idx + 1),
+                row.get("broker", ""),
+                fmt_rate(a_rate),
+                fmt_rate(total_rate),
+                fmt_hold_days(row.get("avg_hold_days")),
+                fmt_rate(weighted_return, signed=True),
+            ]
+            colors = [
+                TEXT,
+                TEXT,
+                rate_color(a_rate, 50),
+                rate_color(total_rate, 50),
+                TEXT,
+                rate_color(weighted_return),
+            ]
+            aligns = ["center", "left", "right", "right", "right", "right"]
+            bolds = [True, True, True, True, False, True]
+
+            x = panel_x
+            for value, width, color, align, is_bold in zip(values, col_w, colors, aligns, bolds):
+                fp = BOLD if is_bold else FONT
+                display_value = fit_to_cell_width(value, max(0.16, width - 0.16), size=11.4, fp=fp)
+                px = x + (width / 2 if align == "center" else 0.08 if align == "left" else width - 0.08)
+                text_draw(px, ry + row_h / 2, display_value, 11.4, color, fp, ha=align)
+                x += width
+
+    left_rows = rows[:rows_per_panel]
+    right_rows = rows[rows_per_panel:]
+    draw_panel(margin_x, left_rows, 0)
+    draw_panel(margin_x + panel_w + panel_gap, right_rows, rows_per_panel)
+
+    text_draw(
+        fig_w / 2,
+        0.18,
+        "本圖為歷史勝率統計整理，不構成投資建議；歷史績效不代表未來結果。",
+        10.8,
+        MUTED,
+        FONT,
+        ha="center",
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
+    plt.close(fig)
+
 IMAGE_ACTION_DAILY_BUNDLE = "精選五分點每日圖"
 IMAGE_ACTION_CONSENSUS_BUY = "近一個月共識淨買超TOP15"
 IMAGE_ACTION_WEEKLY_WARRANT = "本週權證共識買賣超TOP15"
 IMAGE_ACTION_BROKER_10D = "近10日分點買賣明細圖"
+IMAGE_ACTION_WIN_RATE_STATS = "所有分點勝率統計圖"
 IMAGE_ACTION_ALL = "全部圖片"
 
 
@@ -3350,6 +3822,7 @@ def normalize_image_action(action_text: str) -> str:
     - 近一個月共識淨買超TOP15
     - 本週權證共識買賣超TOP15 / 本週買賣超金額各TOP15 / 近7日權證分點共識TOP15
     - 近10日分點買賣明細圖 / 近10日分點明細 / 近10日分點買賣明細
+    - 所有分點勝率統計圖 / 全分點勝率統計
     - 全部圖片
     """
     raw = str(action_text or "").strip()
@@ -3360,6 +3833,14 @@ def normalize_image_action(action_text: str) -> str:
 
     if "不使用快取" in raw or "重新抓完整資料" in raw or "強制重抓" in raw:
         return IMAGE_ACTION_ALL
+
+    if (
+        "勝率統計" in raw
+        or ("勝率" in raw and "分點" in raw)
+        or "winrate" in key
+        or "brokerstats" in key
+    ):
+        return IMAGE_ACTION_WIN_RATE_STATS
 
     if "全部" in raw or key in {"all", "全部圖片", "全部產圖"}:
         return IMAGE_ACTION_ALL
@@ -4874,6 +5355,7 @@ def main():
     parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
     parser.add_argument("--consensus-output", default=os.getenv("CONSENSUS_OUTPUT_IMAGE", ""))
     parser.add_argument("--weekly-output", default=os.getenv("WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
+    parser.add_argument("--win-rate-output", default=os.getenv("WIN_RATE_STATS_OUTPUT_IMAGE", ""))
     parser.add_argument("--broker10d-output-dir", default=os.getenv("BROKER_10D_OUTPUT_DIR", ""))
     parser.add_argument(
         "--broker",
@@ -4887,7 +5369,8 @@ def main():
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
             "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
-            "本週權證共識買賣超TOP15 / 近10日分點買賣明細圖 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
+            "本週權證共識買賣超TOP15 / 近10日分點買賣明細圖 / "
+            "所有分點勝率統計圖 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
         ),
     )
     parser.add_argument("--no-discord", action="store_true")
@@ -4903,6 +5386,7 @@ def main():
     output_path = Path(args.output)
     consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
     weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
+    win_rate_output_path = Path(args.win_rate_output) if args.win_rate_output else output_path.parent / "所有分點勝率統計.png"
     broker10d_output_dir = Path(args.broker10d_output_dir) if args.broker10d_output_dir else output_path.parent
 
     image_paths: list[Path] = []
@@ -4941,6 +5425,11 @@ def main():
         print(f"輸出圖檔：{weekly_output_path}")
         draw_weekly_warrant_consensus_image(target, weekly_output_path)
         image_paths.append(weekly_output_path)
+
+    if action in [IMAGE_ACTION_WIN_RATE_STATS, IMAGE_ACTION_ALL]:
+        print(f"輸出圖檔：{win_rate_output_path}")
+        draw_all_broker_win_rate_stats_image(target, win_rate_output_path)
+        image_paths.append(win_rate_output_path)
 
     if action == IMAGE_ACTION_BROKER_10D:
         if not broker_10d_image_brokers:
