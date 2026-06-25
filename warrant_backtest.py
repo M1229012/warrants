@@ -215,8 +215,6 @@ API5_HISTORY_LIMIT = max(int(os.getenv("API5_HISTORY_LIMIT", str(HISTORY_RETENTI
 # 注意：新版只把「API4 直接掃到近期有活動」的 key 放進來。
 # 活動標的擴展出的 key 若已有快取，不再強制刷新，避免 RUN_MODE=2 候選爆量。
 PRESCAN_REFRESH_KEYS = set()
-# RUN_MODE=1 會額外繼承「全分點候選快取」中屬於精選五分點的候選。
-# 候選快取只負責 API 更新與加速；A/B/C/D 與 TOP15 事件重建不再受候選快取限制。
 # 這個集合是「本次 API4 直接候選 + 活動標的擴展候選」。
 # 若某候選沒有歷史快取，只有在這個集合內才補抓；避免舊候選快取裡的全市場空候選全部打 API5。
 PRESCAN_MISSING_FETCH_KEYS = set()
@@ -412,17 +410,6 @@ def filter_broker_map_for_active_targets(broker_map):
         for label, value in broker_map.items()
         if label in active_labels
     }
-
-
-def get_active_broker_filter_map():
-    """取得目前 RUN_MODE 實際允許的分點，用於共用歷史事件篩選。"""
-    out = {}
-    for label in TARGET_PATTERNS.keys():
-        if label in FALLBACK:
-            out[label] = FALLBACK[label]
-        elif label in FULL_FALLBACK:
-            out[label] = FULL_FALLBACK[label]
-    return out
 
 
 def filter_candidates_by_broker_map(candidates, broker_map):
@@ -5309,16 +5296,8 @@ def save_candidates_cache(candidates):
     print(f"  💾 已更新候選組合快取：{CANDIDATES_CACHE_PATH}，共 {len(df):,} 組")
 
 
-def load_candidates_cache(path=None):
-    """
-    讀取指定範圍的候選快取。
-
-    path 未指定時維持原本行為，使用目前 RUN_MODE 的 CANDIDATES_CACHE_PATH。
-    RUN_MODE=1 會另外指定 CANDIDATES_CACHE_ALL_PATH，繼承全分點模式已發現、
-    且屬於五個精選分點的候選，避免兩套候選快取造成事件不一致。
-    """
-    path = path or CANDIDATES_CACHE_PATH
-    df = read_cache_csv(path)
+def load_candidates_cache():
+    df = read_cache_csv(CANDIDATES_CACHE_PATH)
 
     if df.empty:
         return []
@@ -5331,7 +5310,7 @@ def load_candidates_cache(path=None):
     valid_codes = CURRENT_LIVE_WARRANT_CODES if LIVE_WARRANT_SNAPSHOT_READY else None
     df, prune_stats = prune_candidates_dataframe(
         df,
-        path=path,
+        path=CANDIDATES_CACHE_PATH,
         valid_warrant_codes=valid_codes,
     )
     if prune_stats.get("removed", 0) > 0:
@@ -5683,32 +5662,13 @@ def save_history_cache(history_df, fetched_items=None, previous_history_empty=Fa
     print(f"  💾 已更新原始分點資料快取：{HISTORY_CACHE_PATH}，共 {len(history_df):,} 筆")
     return history_df
 
-def items_from_history_cache(history_df, candidate_filter=None, broker_filter=None):
-    """
-    從共用分點歷史快取重建事件項目。
-
-    candidate_filter 僅保留給舊呼叫相容；正式 A/B/C/D 與 TOP15 流程改用 broker_filter，
-    只依目前模式允許的分點篩選，不再要求權證必須存在於當次候選快取。
-    因此 RUN_MODE=1 與 RUN_MODE=2 使用相同歷史事件來源，差別只在最後允許的分點範圍。
-    """
+def items_from_history_cache(history_df, candidate_filter=None):
     items = []
 
     if history_df is None or history_df.empty:
         return items
 
     df = history_df.copy().fillna("")
-
-    if broker_filter:
-        allowed_labels = {str(label).strip() for label in broker_filter.keys() if str(label).strip()}
-        allowed_codes = {
-            str(value[1]).strip()
-            for value in broker_filter.values()
-            if isinstance(value, (list, tuple)) and len(value) >= 2 and str(value[1]).strip()
-        }
-
-        label_mask = df["分點"].astype(str).str.strip().isin(allowed_labels)
-        code_mask = df["券商代號"].astype(str).str.strip().isin(allowed_codes)
-        df = df[label_mask | code_mask].copy()
 
     if candidate_filter:
         mask = pd.Series(
@@ -5753,105 +5713,6 @@ def items_from_history_cache(history_df, candidate_filter=None, broker_filter=No
 
     return items
 
-
-def build_open_position_candidates_from_history(history_df, broker_map):
-    """
-    從原始分點歷史快取補回「目前仍有淨持倉」的候選組合。
-
-    修正目的：
-    - candidates_cache 會依當次有效權證清單 / API4 預掃描結果清理候選。
-    - 但 TOP15 是部位報表；只要歷史快取顯示該分點對該權證仍有剩餘股數，
-      即使該權證本次沒有出現在候選快取，也不能從 TOP15 計算池消失。
-    - 只補回目前 RUN_MODE 實際追蹤的分點，避免 RUN_MODE=1 混入其他分點。
-
-    回傳格式與 candidates 相同：
-        (權證代號, 權證名稱, 標的股, 標的名稱, 分點, 分點名稱, 券商代號)
-    """
-    if history_df is None or history_df.empty:
-        return []
-
-    df = history_df.copy().fillna("")
-
-    required_cols = {
-        "權證代號", "權證名稱", "標的股", "標的名稱",
-        "分點", "分點名稱", "券商代號", "日期",
-        "買進股數", "賣出股數",
-    }
-    if not required_cols.issubset(set(df.columns)):
-        return []
-
-    active_labels = set((broker_map or {}).keys()) or set(TARGET_PATTERNS.keys())
-    active_codes = {
-        str(code).strip()
-        for _, code in (broker_map or {}).values()
-        if str(code).strip()
-    }
-    if not active_codes:
-        active_codes = {
-            str(FALLBACK[label][1]).strip()
-            for label in active_labels
-            if label in FALLBACK and str(FALLBACK[label][1]).strip()
-        }
-
-    label_mask = df["分點"].astype(str).str.strip().isin(active_labels)
-    code_mask = df["券商代號"].astype(str).str.strip().isin(active_codes)
-    df = df[label_mask | code_mask].copy()
-
-    if df.empty:
-        return []
-
-    df["買進股數"] = pd.to_numeric(df["買進股數"], errors="coerce").fillna(0)
-    df["賣出股數"] = pd.to_numeric(df["賣出股數"], errors="coerce").fillna(0)
-    df["_日期排序"] = pd.to_datetime(
-        df["日期"].astype(str).str.replace("/", "-", regex=False),
-        errors="coerce",
-    )
-
-    candidates = []
-
-    for (warrant_code, broker_code), g in df.groupby(
-        ["權證代號", "券商代號"],
-        dropna=False,
-    ):
-        warrant_code = str(warrant_code).strip()
-        broker_code = str(broker_code).strip()
-
-        if not warrant_code or not broker_code:
-            continue
-
-        remaining_shares = float(g["買進股數"].sum() - g["賣出股數"].sum())
-        if remaining_shares <= 0:
-            continue
-
-        g = g.sort_values("_日期排序", na_position="first")
-        row = g.iloc[-1]
-
-        broker_label = str(row.get("分點", "")).strip()
-        broker_name = str(row.get("分點名稱", "")).strip()
-
-        # 以 broker_map 為準補正顯示名稱與券商代號，避免歷史文字格式差異。
-        if broker_label in (broker_map or {}):
-            mapped_name, mapped_code = broker_map[broker_label]
-            broker_name = str(mapped_name).strip() or broker_name
-            broker_code = str(mapped_code).strip() or broker_code
-
-        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
-            row.get("權證名稱", ""),
-            row.get("標的股", ""),
-            row.get("標的名稱", ""),
-        )
-
-        candidates.append((
-            warrant_code,
-            str(row.get("權證名稱", "")).strip(),
-            underlying_code,
-            underlying_name,
-            broker_label,
-            broker_name,
-            broker_code,
-        ))
-
-    return candidates
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -6665,28 +6526,124 @@ def build_selected_full_market_candidates(warrants, broker_map):
     return candidates
 
 
+
+def build_candidates_from_history_cache(warrants, broker_map, history_df):
+    """
+    從共用的 API5 分點歷史快取，自動補回目前執行模式應該擁有的候選組合。
+
+    修正目的：
+    - candidates_cache.csv 與 candidates_cache_selected5.csv 雖然分開保存，
+      但 broker_warrant_history_cache.csv 是兩種模式共用。
+    - 若某組「權證代號 + 券商代號」已經存在共用歷史快取，且該券商屬於目前
+      RUN_MODE 的追蹤分點，就不應再因為目前模式的候選快取缺少該組合而被
+      items_from_history_cache(..., candidate_filter=...) 濾掉。
+    - 候選池只補目前仍上市的認購權證與目前追蹤中的分點，不會把其他分點或
+      已失效權證帶入本次結果。
+
+    這個補回動作只使用既有共用歷史資料，不會額外呼叫 API5。
+    """
+    if not warrants or not broker_map or history_df is None or history_df.empty:
+        return []
+
+    required_cols = {
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號",
+    }
+    if not required_cols.issubset(set(history_df.columns)):
+        return []
+
+    broker_code_to_info = {}
+    for label, (broker_name, broker_code) in broker_map.items():
+        broker_code = str(broker_code).strip()
+        if not broker_code:
+            continue
+        broker_code_to_info[broker_code] = (
+            str(label).strip(),
+            str(broker_name).strip(),
+            broker_code,
+        )
+
+    if not broker_code_to_info:
+        return []
+
+    warrant_by_code = {}
+    for warrant in warrants:
+        warrant_code = str(warrant.get("代號", "")).strip()
+        if not warrant_code:
+            continue
+        warrant_by_code[warrant_code] = warrant
+
+    if not warrant_by_code:
+        return []
+
+    df = history_df[[
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號",
+    ]].copy().fillna("")
+
+    df["權證代號"] = df["權證代號"].astype(str).str.strip()
+    df["券商代號"] = df["券商代號"].astype(str).str.strip()
+    df = df[
+        df["券商代號"].isin(set(broker_code_to_info.keys()))
+        & df["權證代號"].isin(set(warrant_by_code.keys()))
+    ].copy()
+
+    if df.empty:
+        return []
+
+    df = df.drop_duplicates(subset=["權證代號", "券商代號"], keep="last")
+
+    candidates = []
+    seen = set()
+
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
+        warrant_code = str(row_dict.get("權證代號", "")).strip()
+        broker_code = str(row_dict.get("券商代號", "")).strip()
+
+        warrant = warrant_by_code.get(warrant_code)
+        broker_info = broker_code_to_info.get(broker_code)
+        if not warrant or not broker_info:
+            continue
+
+        broker_label, broker_name, broker_code = broker_info
+        warrant_name = str(warrant.get("名稱", "") or row_dict.get("權證名稱", "")).strip()
+        underlying_code = str(warrant.get("標的股", "") or row_dict.get("標的股", "")).strip()
+        underlying_name = str(warrant.get("標的名稱", "") or row_dict.get("標的名稱", "")).strip()
+
+        if not warrant_name:
+            continue
+
+        underlying_code, underlying_name = correct_underlying_info_by_warrant_name(
+            warrant_name,
+            underlying_code,
+            underlying_name,
+        )
+
+        candidate = (
+            warrant_code,
+            warrant_name,
+            underlying_code,
+            underlying_name,
+            broker_label,
+            broker_name,
+            broker_code,
+        )
+        key = candidate_key_from_tuple(candidate)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        candidates.append(candidate)
+
+    return candidates
+
 def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-
-    # RUN_MODE=1 不再只依賴獨立的精選五分點候選快取。
-    # 同時讀取全分點候選快取，僅保留目前五個精選分點，再與精選快取合併。
-    # 這讓五分點與全分點共用相同的已發現候選集合，差別只剩分點範圍。
-    if RUN_MODE == 1:
-        all_scope_candidates = filter_candidates_by_broker_map(
-            load_candidates_cache(CANDIDATES_CACHE_ALL_PATH),
-            broker_map,
-        )
-        before_merge_count = len(cached_candidates)
-        cached_candidates = merge_candidates(all_scope_candidates, cached_candidates)
-        cached_candidates = filter_candidates_by_broker_map(cached_candidates, broker_map)
-        inherited_added = max(len(cached_candidates) - before_merge_count, 0)
-        print(
-            f"  ✅ RUN_MODE=1 已繼承全分點候選：{len(all_scope_candidates):,} 組｜"
-            f"新增到五分點候選 {inherited_added:,} 組｜合併後 {len(cached_candidates):,} 組"
-        )
 
     if cached_candidates:
         if RUN_MODE == 1:
@@ -13818,10 +13775,10 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
         return False, summary
 
     try:
-        items = items_from_history_cache(
-            history_cache_df,
-            broker_filter=get_active_broker_filter_map(),
-        )
+        if candidate_keys:
+            items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+        else:
+            items = items_from_history_cache(history_cache_df)
     except Exception:
         items = []
 
@@ -14373,10 +14330,10 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         })
         return True
 
-    items = items_from_history_cache(
-        history_cache_df,
-        broker_filter=get_active_broker_filter_map(),
-    )
+    if candidate_keys:
+        items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    else:
+        items = items_from_history_cache(history_cache_df)
 
     if not items:
         print("  ⚠️ 原始分點歷史快取中沒有可還原的候選項目，無法進行價格預抓。")
@@ -14717,25 +14674,39 @@ def main():
                 f"強制 API5 檢查 {len(MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS):,} 組"
             )
 
-    # TOP15 是「部位」報表，不能只依當次候選快取決定哪些歷史部位可參與計算。
-    # 若某權證本次沒有出現在有效權證清單 / API4 候選中，但歷史快取仍顯示有淨持倉，
-    # 必須把該「權證代號 + 券商代號」補回本次候選池，否則部位會無故從 TOP15 消失。
+    # 候選快取分模式保存，但 API5 歷史快取是共用的。
+    # 因此在正式使用 candidate_keys 過濾歷史資料之前，先把共用歷史中屬於目前追蹤分點、
+    # 且仍在上市清單內的「權證代號 + 券商代號」補回目前模式候選池。
+    # 這可直接修正：全分點已抓到資料，但精選五分點因 candidates_cache_selected5.csv 缺 key，
+    # 導致 A/B/C/D 事件無法從共用歷史重建的問題。
     if history_cache_for_repair_pool is None:
         history_cache_for_repair_pool = load_history_cache()
 
-    open_position_candidates = build_open_position_candidates_from_history(
-        history_cache_for_repair_pool,
+    history_backfill_candidates = build_candidates_from_history_cache(
+        warrants,
         broker_map,
+        history_cache_for_repair_pool,
     )
-    if open_position_candidates:
-        before_count = len(candidates or [])
-        candidates = merge_candidates(candidates or [], open_position_candidates)
+
+    if history_backfill_candidates:
+        before_keys = {
+            candidate_key_from_tuple(c)
+            for c in (candidates or [])
+        }
+        candidates = merge_candidates(candidates or [], history_backfill_candidates)
         candidates = filter_candidates_by_broker_map(candidates, broker_map)
-        added_count = max(len(candidates) - before_count, 0)
-        print(
-            f"  ✅ 已從分點歷史補回未出清候選：{len(open_position_candidates):,} 組｜"
-            f"本次候選池新增 {added_count:,} 組｜合計 {len(candidates):,} 組"
-        )
+        after_keys = {
+            candidate_key_from_tuple(c)
+            for c in candidates
+        }
+        added_count = len(after_keys - before_keys)
+
+        if added_count > 0:
+            save_candidates_cache(candidates)
+            print(
+                f"  ✅ 已從共用分點歷史補回目前模式候選：新增 {added_count:,} 組｜"
+                f"候選池 {len(before_keys):,} → {len(after_keys):,} 組"
+            )
 
     if maybe_auto_price_prefetch_before_api5(candidates, program_start):
         return
@@ -14770,13 +14741,10 @@ def main():
         if pruned_count > 0:
             print(f"  ✅ 增量模式已略過舊候選快取中的無歷史資料空候選：{pruned_count:,} 組")
 
-    cached_items = items_from_history_cache(history_cache_df, broker_filter=broker_map)
+    cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
     if cached_items:
-        print(
-            f"  ✅ 已從共用分點歷史快取還原 {len(cached_items)} 組資料｜"
-            "只依目前分點範圍篩選，不再受候選快取限制"
-        )
+        print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
 
     candidates_to_fetch = []
 
@@ -14828,7 +14796,7 @@ def main():
         history_cache_df = merge_items_into_history_cache(history_cache_df, fetched_items)
         history_cache_df = save_history_cache(history_cache_df, fetched_items=fetched_items, previous_history_empty=history_was_empty)
 
-    items = items_from_history_cache(history_cache_df, broker_filter=broker_map)
+    items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
 
     if not items and fetched_items:
         items = fetched_items
