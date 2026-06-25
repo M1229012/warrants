@@ -7,7 +7,7 @@
 - 直接讀取 Google Sheet「權證分點籌碼」內的 A/B/C/D 與勝率統計工作表
 - 不需要本機 Excel
 - 產生一頁式 PNG
-- 可產生「所有分點勝率統計圖」，列出 A 勝率、總勝率、事件數、平均持有天數與加權報酬率
+- 可產生「所有分點勝率統計圖」，列出 A 勝率、A 事件數、總勝率、總事件數、平均持有天數與加權報酬率
 - 發送到 DISCORD_WEBHOOK_URL_TEST
 
 必要 GitHub Secrets：
@@ -139,6 +139,7 @@ SHEET_B = "B_同標的單日合計"
 SHEET_C = "C_同標的3日累積"
 SHEET_D = "D_近10日累積淨買進"
 SHEET_STAT = "勝率統計"
+WIN_RATE_STATS_LAYOUT_VERSION = "dual-event-count-v2"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
 SHEET_TOP15_RETURN_CACHE = os.getenv("SHEET_TOP15_RETURN_CACHE", "快取_TOP15分點報酬率")
@@ -1588,7 +1589,8 @@ def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
     讀取 Google Sheet「勝率統計」，整理所有分點的：
     - A：單檔權證大買勝率
     - 總勝率：全部 A+B+C+D 合併
-    - 事件數：採總計列，總計缺值時才用 A 列備援
+    - A 事件數：採 A 列
+    - 總事件數：採全部 A+B+C+D 合併列
     - 平均持有天數：採總計列，總計缺值時才用 A 列備援
     - 加權報酬率：採總計列，總計缺值時才用 A 列備援
 
@@ -1674,9 +1676,8 @@ def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
         a_metric = by_broker[broker].get("A") or {}
         total_metric = by_broker[broker].get("total") or {}
 
-        event_count = safe_int(total_metric.get("event_count"), 0)
-        if event_count <= 0:
-            event_count = safe_int(a_metric.get("event_count"), 0)
+        a_event_count = safe_int(a_metric.get("event_count"), 0)
+        total_event_count = safe_int(total_metric.get("event_count"), 0)
 
         avg_hold_days = total_metric.get("avg_hold_days")
         if avg_hold_days is None:
@@ -1689,8 +1690,11 @@ def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
         rows.append({
             "broker": broker,
             "a_win_rate": a_metric.get("win_rate"),
+            "a_event_count": a_event_count,
             "total_win_rate": total_metric.get("win_rate"),
-            "event_count": event_count,
+            "total_event_count": total_event_count,
+            # 保留舊欄位名稱供其他既有呼叫相容；其內容仍代表全部 A+B+C+D 合併事件數。
+            "event_count": total_event_count,
             "avg_hold_days": avg_hold_days,
             "weighted_return": weighted_return,
         })
@@ -3569,7 +3573,13 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
     rows = read_all_broker_win_rate_stats_from_gsheet()
     n = len(rows)
 
-    fig_w = 13.0
+    print(
+        f"  ✅ 勝率統計圖版面：{WIN_RATE_STATS_LAYOUT_VERSION}｜"
+        "欄位：A勝率、A事件數、總勝率、總事件數、持有天數、加權報酬"
+    )
+
+    # 新增 A／總事件數兩欄後，勝率統計圖加寬，避免勝率與事件數被截斷。
+    fig_w = 15.0
     margin_x = 0.40
     content_w = fig_w - 2 * margin_x
     panel_gap = 0.18
@@ -3717,7 +3727,7 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
     text_draw(
         margin_x + 0.18,
         y,
-        "A勝率＝單檔權證單日大買｜事件數、總勝率、平均持有天數與加權報酬率＝全部 A+B+C+D 合併",
+        "A勝率、A事件數＝單檔權證單日大買｜總勝率、總事件數、平均持有天數與加權報酬率＝全部 A+B+C+D 合併",
         13,
         TEXT,
         BOLD,
@@ -3739,11 +3749,12 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
 
     y = summary_y - gap
     rounded(margin_x, y - section_title_h, content_w, section_title_h, fc=NAVY, ec=NAVY, lw=1.0, r=0.08)
-    text_draw(margin_x + 0.30, y - section_title_h / 2, "全分點 A 勝率、總勝率、事件數、持有天數與加權報酬", 19, WHITE, BOLD)
+    text_draw(margin_x + 0.30, y - section_title_h / 2, "全分點 A／總勝率、A／總事件數、持有天數與加權報酬", 19, WHITE, BOLD)
     table_top = y - section_title_h
 
-    headers = ["序號", "分點", "A勝率", "總勝率", "事件數", "持有天數", "加權報酬"]
-    col_w = [0.43, 1.43, 0.74, 0.74, 0.75, 0.82, 1.10]
+    headers = ["序號", "分點", "A勝率", "A事件數", "總勝率", "總事件數", "持有天數", "加權報酬"]
+    # 每個左右分欄寬度固定為 7.01，讓兩組勝率與事件數都能完整顯示。
+    col_w = [0.42, 1.45, 0.75, 0.80, 0.75, 0.84, 0.88, 1.12]
 
     def draw_panel(panel_x: float, panel_rows: list[dict], global_start_index: int):
         rounded(panel_x, table_top - table_h, panel_w, table_h, fc=WHITE, ec=NAVY, lw=1.0, r=0.06)
@@ -3773,8 +3784,9 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
                 str(global_start_index + local_idx + 1),
                 row.get("broker", ""),
                 fmt_rate(a_rate),
+                f"{safe_int(row.get('a_event_count'), 0):,}",
                 fmt_rate(total_rate),
-                f"{safe_int(row.get('event_count'), 0):,}",
+                f"{safe_int(row.get('total_event_count'), 0):,}",
                 fmt_hold_days(row.get("avg_hold_days")),
                 fmt_rate(weighted_return, signed=True),
             ]
@@ -3782,13 +3794,14 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
                 TEXT,
                 TEXT,
                 rate_color(a_rate, 50),
+                NAVY2,
                 rate_color(total_rate, 50),
                 NAVY2,
                 TEXT,
                 rate_color(weighted_return),
             ]
-            aligns = ["center", "left", "right", "right", "right", "right", "right"]
-            bolds = [True, True, True, True, True, False, True]
+            aligns = ["center", "left", "right", "right", "right", "right", "right", "right"]
+            bolds = [True, True, True, True, True, True, False, True]
 
             x = panel_x
             for value, width, color, align, is_bold in zip(values, col_w, colors, aligns, bolds):
