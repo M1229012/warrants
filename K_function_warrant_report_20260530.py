@@ -145,8 +145,8 @@ TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_A
 SELECTED_BRANCH_FLOW_ENABLE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES = os.getenv(
     "WARRANT_SELECTED_BRANCH_FLOW_DEFAULT_BRANCHES",
-    "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南",
-).strip() or "華南永昌台中,元大南屯,永豐金竹北,永豐金內湖,富邦敦南"
+    "華南永昌台中,元大南屯,新光,永豐金內湖,富邦敦南",
+).strip() or "華南永昌台中,元大南屯,新光,永豐金內湖,富邦敦南"
 SELECTED_BRANCH_FLOW_MODE = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_MODE", "").strip().lower()
 _SELECTED_BRANCH_FLOW_BRANCHES_RAW = os.getenv("WARRANT_SELECTED_BRANCH_FLOW_BRANCHES", "").strip()
 _SELECTED_BRANCH_FLOW_DEFAULT_MODE_ALIASES = {
