@@ -37,7 +37,7 @@ on:
 
   schedule:
     # 台灣時間 16:00 = UTC 08:00
-    - cron: "00 08 * * 1-5"
+    - cron: "20 08 * * 1-5"
 
 jobs:
   send-discord-report:
