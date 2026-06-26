@@ -57,7 +57,7 @@ jobs:
       DISCORD_WEBHOOK_URL_TEST: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.notification_mode == '正式推播' && secrets.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL_TEST }}
 
       BUY_THRESHOLD: "1000000"
-      SELL_THRESHOLD_RATIO: "0.2"
+      SELL_THRESHOLD_RATIO: "0.5"
       DISPLAY_EXIT_ALWAYS: "0"
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
