@@ -2684,6 +2684,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             "broker": broker,
             "status": status,
             "event": event,
+            "underlying": underlying,
             "target": display_target,
             "content": content,
             "amount": amount,
@@ -2695,7 +2696,35 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
             "add_count_label": add_count_label,
         })
 
-    result.sort(key=lambda x: x["amount"], reverse=True)
+    # 每日精選分點買賣超追蹤排序：
+    # 1. 先依 TRACKED_BROKERS 的分點順序分組
+    # 2. 同一分點內依金額由大到小
+    # 3. 同一分點且金額相同時，依標的代號數字由小到大
+    broker_order = {
+        broker_name: index
+        for index, broker_name in enumerate(TRACKED_BROKERS)
+    }
+
+    def underlying_sort_key(item: dict):
+        code = normalize_underlying(item.get("underlying", ""), item.get("target", ""))
+        if code.isdigit():
+            return (0, int(code), code)
+
+        target_text = str(item.get("target", "")).strip()
+        match = re.match(r"^(\d+)", target_text)
+        if match:
+            matched_code = match.group(1)
+            return (0, int(matched_code), matched_code)
+
+        return (1, 999999999, target_text)
+
+    result.sort(
+        key=lambda x: (
+            broker_order.get(str(x.get("broker", "")).strip(), len(TRACKED_BROKERS)),
+            -safe_float(x.get("amount"), 0),
+            underlying_sort_key(x),
+        )
+    )
     return result
 
 
