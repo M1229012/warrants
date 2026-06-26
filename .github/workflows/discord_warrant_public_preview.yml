@@ -27,7 +27,7 @@ jobs:
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
       BUY_THRESHOLD: "1000000"
-      SELL_THRESHOLD_RATIO: "0.2"
+      SELL_THRESHOLD_RATIO: "0.5"
       LOOKBACK_TRADING_DAYS: "22"
 
       OUTPUT_IMAGE: "output/精選分點買賣超追蹤_公開預覽版.png"
