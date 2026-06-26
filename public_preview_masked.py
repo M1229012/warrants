@@ -120,7 +120,7 @@ DATA_SCOPE_SELECTED5 = os.getenv("DATA_SCOPE_SELECTED5", "精選五分點")
 DATA_SCOPE_ALL = os.getenv("DATA_SCOPE_ALL", "全分點")
 
 BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
-SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.2"))
+SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.5"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
 LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "22"))
 # 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
