@@ -6748,120 +6748,531 @@ def prescan_all(warrants, broker_map):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# A / B / C / D 共用 FIFO 持倉引擎
+# ══════════════════════════════════════════════════════════════════════
+
+_FIFO_INVENTORY_TIMELINE_CACHE = {}
+
+
+def _event_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        s = str(value).replace(",", "").strip()
+        if s in ("", "-", "None", "nan", "null"):
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def _find_item_for_fifo(item_map, broker_code, warrant_code):
+    """以券商代號 + 權證代號尋找原始逐日資料，並兼容前導 0 代號。"""
+    broker_code = str(broker_code or "").strip()
+    warrant_code = str(warrant_code or "").strip()
+
+    candidates = []
+    for code in [
+        warrant_code,
+        normalize_warrant_code_for_unique(warrant_code) if "normalize_warrant_code_for_unique" in globals() else warrant_code,
+        normalize_price_code(warrant_code),
+    ]:
+        code = str(code or "").strip()
+        if code and code not in candidates:
+            candidates.append(code)
+
+    for code in candidates:
+        item = item_map.get((broker_code, code))
+        if item:
+            return item
+
+    return None
+
+
+def build_fifo_inventory_timeline(item):
+    """
+    建立單一「分點 + 權證」的完整 FIFO 持倉時間軸。
+
+    規則：
+    1. 權證不可當沖，因此同一天一律先用賣出扣除舊 FIFO lot，再加入當日買進 lot。
+    2. 每日是否仍持有，以當日期末的 FIFO 剩餘股數判斷。
+    3. 同一天舊 lot 全部賣完、但當日又買進且期末仍有庫存時，
+       在日資料口徑下仍視為同一段連續持倉，不會誤判整體出清。
+    4. 若歷史資料一開始就有賣出、但缺少更早買進資料，會建立必要的推估期初 lot，
+       只為避免持倉股數被錯算成負數；其成本以第一筆可用買進均價估算。
+    """
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty or "日期" not in df.columns:
+        return {
+            "daily": [],
+            "by_date": {},
+            "dates": [],
+            "opening_qty": 0.0,
+            "opening_cost_estimated": False,
+        }
+
+    cache_key = (
+        str(item.get("broker_code", "")).strip(),
+        str(item.get("warrant_code", "")).strip(),
+        id(df),
+    )
+    cached = _FIFO_INVENTORY_TIMELINE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    df2 = df.copy()
+    df2["日期"] = df2["日期"].map(normalize_date_str)
+    df2["_dt"] = df2["日期"].map(parse_date)
+    df2 = df2.dropna(subset=["_dt"]).sort_values(["_dt", "日期"]).reset_index(drop=True)
+
+    if df2.empty:
+        result = {
+            "daily": [],
+            "by_date": {},
+            "dates": [],
+            "opening_qty": 0.0,
+            "opening_cost_estimated": False,
+        }
+        _FIFO_INVENTORY_TIMELINE_CACHE[cache_key] = result
+        return result
+
+    rows = []
+    first_valid_buy_price = None
+    first_valid_sell_price = None
+
+    for row in df2.itertuples(index=False):
+        rd = row._asdict()
+        date_str = normalize_date_str(rd.get("日期", ""))
+        buy_qty = max(_event_float(rd.get("買進股數", 0)), 0.0)
+        sell_qty = max(_event_float(rd.get("賣出股數", 0)), 0.0)
+        buy_amount = max(_event_float(rd.get("買進金額", 0)), 0.0)
+        sell_amount = max(_event_float(rd.get("賣出金額", 0)), 0.0)
+        buy_price = buy_amount / buy_qty if buy_qty > 0 and buy_amount > 0 else None
+        sell_price = sell_amount / sell_qty if sell_qty > 0 and sell_amount > 0 else None
+
+        if first_valid_buy_price is None and buy_price is not None and buy_price > 0:
+            first_valid_buy_price = buy_price
+        if first_valid_sell_price is None and sell_price is not None and sell_price > 0:
+            first_valid_sell_price = sell_price
+
+        rows.append({
+            "日期": date_str,
+            "買進股數": buy_qty,
+            "賣出股數": sell_qty,
+            "買進金額": buy_amount,
+            "賣出金額": sell_amount,
+            "買進均價": buy_price,
+            "賣出均價": sell_price,
+        })
+
+    # 推估資料起點前至少必須存在多少股，才能覆蓋「同日先賣、後買」的歷史流水。
+    cumulative_previous_buys = 0.0
+    cumulative_sells = 0.0
+    required_opening_qty = 0.0
+
+    for rd in rows:
+        required_opening_qty = max(
+            required_opening_qty,
+            cumulative_sells + rd["賣出股數"] - cumulative_previous_buys,
+        )
+        cumulative_sells += rd["賣出股數"]
+        cumulative_previous_buys += rd["買進股數"]
+
+    required_opening_qty = max(required_opening_qty, 0.0)
+    opening_avg = first_valid_buy_price or first_valid_sell_price or 0.0
+    opening_cost_estimated = required_opening_qty > 0
+
+    lots = []
+    if required_opening_qty > 0:
+        first_dt = parse_date(rows[0]["日期"])
+        opening_date = (
+            first_dt - timedelta(days=1)
+        ).strftime("%Y/%m/%d") if first_dt else rows[0]["日期"]
+
+        lots.append({
+            "買進日": opening_date,
+            "原始股數": required_opening_qty,
+            "剩餘股數": required_opening_qty,
+            "原始成本": required_opening_qty * opening_avg,
+            "均價": opening_avg,
+            "推估期初": True,
+        })
+
+    daily = []
+    by_date = {}
+    active_cycle_id = None
+    next_cycle_id = 1
+    previous_end_qty = sum(lot["剩餘股數"] for lot in lots)
+
+    # 若存在推估期初庫存，視為資料起點前已進入一段持倉週期。
+    if previous_end_qty > 0:
+        active_cycle_id = next_cycle_id
+        next_cycle_id += 1
+
+    for rd in rows:
+        date_str = rd["日期"]
+        start_qty = sum(max(_event_float(lot.get("剩餘股數", 0)), 0.0) for lot in lots)
+        start_cost = sum(
+            max(_event_float(lot.get("剩餘股數", 0)), 0.0) * max(_event_float(lot.get("均價", 0)), 0.0)
+            for lot in lots
+        )
+
+        sell_qty = rd["賣出股數"]
+        sell_amount = rd["賣出金額"]
+        sell_price = rd["賣出均價"]
+        sell_left = sell_qty
+        matched_sell_qty = 0.0
+        matched_sell_cost = 0.0
+        matched_sell_revenue = 0.0
+
+        # 同一天先賣出舊庫存，嚴格 FIFO。
+        if sell_left > 0:
+            for lot in lots:
+                if sell_left <= 0:
+                    break
+
+                remain_qty = max(_event_float(lot.get("剩餘股數", 0)), 0.0)
+                if remain_qty <= 0:
+                    continue
+
+                alloc_qty = min(sell_left, remain_qty)
+                if alloc_qty <= 0:
+                    continue
+
+                lot_avg = max(_event_float(lot.get("均價", 0)), 0.0)
+                lot["剩餘股數"] = remain_qty - alloc_qty
+                sell_left -= alloc_qty
+                matched_sell_qty += alloc_qty
+                matched_sell_cost += alloc_qty * lot_avg
+
+                if sell_price is not None and sell_price > 0:
+                    matched_sell_revenue += alloc_qty * sell_price
+
+        unmatched_sell_qty = max(sell_left, 0.0)
+
+        buy_qty = rd["買進股數"]
+        buy_amount = rd["買進金額"]
+        buy_price = rd["買進均價"]
+
+        # 以「期末庫存」判斷持倉週期；同日先賣完再買回、期末仍有持倉，不切斷週期。
+        provisional_end_qty = sum(max(_event_float(lot.get("剩餘股數", 0)), 0.0) for lot in lots) + buy_qty
+
+        if active_cycle_id is None and provisional_end_qty > 0:
+            active_cycle_id = next_cycle_id
+            next_cycle_id += 1
+
+        if buy_qty > 0 and buy_amount > 0:
+            lots.append({
+                "買進日": date_str,
+                "原始股數": buy_qty,
+                "剩餘股數": buy_qty,
+                "原始成本": buy_amount,
+                "均價": buy_price or 0.0,
+                "推估期初": False,
+                "持倉週期ID": active_cycle_id,
+            })
+
+        end_qty = sum(max(_event_float(lot.get("剩餘股數", 0)), 0.0) for lot in lots)
+        end_cost = sum(
+            max(_event_float(lot.get("剩餘股數", 0)), 0.0) * max(_event_float(lot.get("均價", 0)), 0.0)
+            for lot in lots
+        )
+        end_avg = end_cost / end_qty if end_qty > 0 else None
+        cycle_id_for_day = active_cycle_id if end_qty > 0 else None
+
+        entry = {
+            "日期": date_str,
+            "起始持有股數": start_qty,
+            "起始持有成本": start_cost,
+            "買進股數": buy_qty,
+            "賣出股數": sell_qty,
+            "買進金額": buy_amount,
+            "賣出金額": sell_amount,
+            "買進均價": buy_price,
+            "賣出均價": sell_price,
+            "FIFO賣出對應股數": matched_sell_qty,
+            "FIFO賣出成本": matched_sell_cost,
+            "FIFO賣出收入": matched_sell_revenue,
+            "FIFO未對應賣出股數": unmatched_sell_qty,
+            "期末持有股數": end_qty,
+            "期末持有成本": end_cost,
+            "期末持有均價": end_avg,
+            "淨變動股數": end_qty - start_qty,
+            "持倉週期ID": cycle_id_for_day,
+        }
+
+        daily.append(entry)
+        by_date[date_str] = entry
+
+        if end_qty <= 0:
+            active_cycle_id = None
+
+        previous_end_qty = end_qty
+
+    result = {
+        "daily": daily,
+        "by_date": by_date,
+        "dates": [x["日期"] for x in daily],
+        "opening_qty": required_opening_qty,
+        "opening_cost_estimated": opening_cost_estimated,
+    }
+    _FIFO_INVENTORY_TIMELINE_CACHE[cache_key] = result
+    return result
+
+
+def _fifo_snapshot_on_or_before(timeline, date):
+    date = normalize_date_str(date)
+    if not date:
+        return None
+
+    exact = timeline.get("by_date", {}).get(date)
+    if exact is not None:
+        return exact
+
+    valid_dates = [d for d in timeline.get("dates", []) if d <= date]
+    if not valid_dates:
+        return None
+    return timeline.get("by_date", {}).get(valid_dates[-1])
+
+
+def _simulate_position_outcome(event, item_map, warrant_codes, event_end_date, event_start_date=None, is_a=False):
+    """
+    以完整 FIFO 庫存判斷事件後的減碼、出清與持有成本。
+
+    - 出清：所有事件相關權證的「期末總持有股數」第一次降為 0。
+    - 減碼：期末總持有股數較前一交易日下降、但仍大於 0。
+    - 後續新買進會加入同一段尚未出清的持倉，避免事件 lot 已賣完就誤判完全出清。
+    - 成本與已實現損益均取自完整 FIFO lot；同日仍維持先賣舊庫存、再加入新買進。
+    """
+    broker_code = str(event.get("券商代號", "")).strip()
+    event_end_date = normalize_date_str(event_end_date)
+    event_start_date = normalize_date_str(event_start_date or event_end_date)
+
+    timelines = {}
+    normalized_codes = []
+
+    for warrant_code in warrant_codes:
+        code = str(warrant_code or "").strip()
+        if not code or code in normalized_codes:
+            continue
+
+        item = _find_item_for_fifo(item_map, broker_code, code)
+        if not item:
+            continue
+
+        normalized_code = str(item.get("warrant_code", code)).strip()
+        if normalized_code in timelines:
+            continue
+
+        timelines[normalized_code] = build_fifo_inventory_timeline(item)
+        normalized_codes.append(normalized_code)
+
+    # 初始化輸出欄位，維持原本工作表欄位相容。
+    event["減碼日"] = None
+    event["減碼獲利%"] = None
+    event["出清日"] = None
+    event["出清獲利%"] = None
+    event["持有天數"] = None
+    event["狀態"] = "持有"
+    event["目前持有股數"] = 0
+    event["目前持有成本"] = 0
+    event["目前持有均價"] = None
+    event["總投入成本"] = 0
+    event["FIFO成本狀態"] = "FIFO"
+
+    if is_a:
+        event["減碼均價"] = None
+        event["出清均價"] = None
+        event["已實現賣出金額"] = 0
+    else:
+        event["減碼賣出金額"] = None
+        event["出清賣出金額"] = None
+
+    if not timelines:
+        return event
+
+    baseline_qty = 0.0
+    baseline_cost = 0.0
+
+    for timeline in timelines.values():
+        snap = _fifo_snapshot_on_or_before(timeline, event_end_date)
+        if snap:
+            baseline_qty += max(_event_float(snap.get("期末持有股數", 0)), 0.0)
+            baseline_cost += max(_event_float(snap.get("期末持有成本", 0)), 0.0)
+            if timeline.get("opening_cost_estimated"):
+                event["FIFO成本狀態"] = "含推估期初成本"
+
+    event["事件起始持有股數"] = baseline_qty
+    event["事件起始持有成本"] = baseline_cost
+    event["總投入成本"] = baseline_cost
+    event["目前持有股數"] = baseline_qty
+    event["目前持有成本"] = baseline_cost
+    event["目前持有均價"] = baseline_cost / baseline_qty if baseline_qty > 0 else None
+
+    if is_a:
+        event["剩餘股數"] = baseline_qty
+
+    future_dates = sorted({
+        date
+        for timeline in timelines.values()
+        for date in timeline.get("dates", [])
+        if date > event_end_date
+    })
+
+    previous_total_qty = baseline_qty
+    cumulative_revenue = 0.0
+    cumulative_sold_qty = 0.0
+    cumulative_realized_cost = 0.0
+
+    for date in future_dates:
+        day_buy_amount = 0.0
+        day_sell_revenue = 0.0
+        day_sell_cost = 0.0
+        day_sold_qty = 0.0
+        total_qty = 0.0
+        total_cost = 0.0
+
+        for timeline in timelines.values():
+            day = timeline.get("by_date", {}).get(date)
+            if day:
+                day_buy_amount += max(_event_float(day.get("買進金額", 0)), 0.0)
+                day_sell_revenue += max(_event_float(day.get("FIFO賣出收入", 0)), 0.0)
+                day_sell_cost += max(_event_float(day.get("FIFO賣出成本", 0)), 0.0)
+                day_sold_qty += max(_event_float(day.get("FIFO賣出對應股數", 0)), 0.0)
+                if _event_float(day.get("FIFO未對應賣出股數", 0)) > 0:
+                    event["FIFO成本狀態"] = "部分缺歷史成本"
+
+            snap = _fifo_snapshot_on_or_before(timeline, date)
+            if snap:
+                total_qty += max(_event_float(snap.get("期末持有股數", 0)), 0.0)
+                total_cost += max(_event_float(snap.get("期末持有成本", 0)), 0.0)
+
+        event["總投入成本"] += day_buy_amount
+        cumulative_revenue += day_sell_revenue
+        cumulative_sold_qty += day_sold_qty
+        cumulative_realized_cost += day_sell_cost
+        event["目前持有股數"] = total_qty
+        event["目前持有成本"] = total_cost
+        event["目前持有均價"] = total_cost / total_qty if total_qty > 0 else None
+
+        if is_a:
+            event["剩餘股數"] = total_qty
+            event["已實現賣出金額"] = cumulative_revenue
+
+        if total_qty < previous_total_qty and total_qty > 0 and event["減碼日"] is None:
+            event["減碼日"] = date
+            event["減碼獲利%"] = (
+                round((day_sell_revenue - day_sell_cost) / day_sell_cost * 100, 2)
+                if day_sell_cost > 0 else None
+            )
+            event["狀態"] = "減碼"
+
+            if is_a:
+                event["減碼均價"] = (
+                    round(day_sell_revenue / day_sold_qty, 4)
+                    if day_sold_qty > 0 else None
+                )
+            else:
+                event["減碼賣出金額"] = round(day_sell_revenue, 0)
+
+        if previous_total_qty > 0 and total_qty <= 0:
+            event["出清日"] = date
+            event["狀態"] = "出清"
+            event["出清獲利%"] = (
+                round((cumulative_revenue - event["總投入成本"]) / event["總投入成本"] * 100, 2)
+                if event["總投入成本"] > 0 else None
+            )
+
+            if is_a:
+                event["出清均價"] = (
+                    round(cumulative_revenue / cumulative_sold_qty, 4)
+                    if cumulative_sold_qty > 0 else None
+                )
+            else:
+                event["出清賣出金額"] = round(cumulative_revenue, 0)
+
+            start_dt = parse_date(event_start_date)
+            exit_dt = parse_date(date)
+            if start_dt and exit_dt:
+                event["持有天數"] = (exit_dt - start_dt).days
+            break
+
+        previous_total_qty = total_qty
+
+    return event
+
+
+# ══════════════════════════════════════════════════════════════════════
 # A 事件：單檔權證單日買進金額 >= 100萬
 # ══════════════════════════════════════════════════════════════════════
 
 def build_a_events_from_df(item):
-    df = item["df"]
+    """
+    A 類仍以「單日毛買進金額 >= 100 萬」觸發，但同一段期末庫存未歸零的持倉週期
+    只建立一筆 A 事件。後續加碼、減碼都回到完整 FIFO 庫存更新，不再把同日毛買與毛賣
+    拆成多筆彼此出清的新事件。
+    """
+    timeline = build_fifo_inventory_timeline(item)
     events = []
+    created_cycle_ids = set()
 
-    for row in df.itertuples(index=False):
-        row_dict = row._asdict()
-        date   = row_dict["日期"]
-        buy_s  = int(row_dict["買進股數"])
-        sell_s = int(row_dict["賣出股數"])
-        buy_a  = int(row_dict["買進金額"])
-        sell_a = int(row_dict["賣出金額"])
+    single_item_map = {
+        (str(item.get("broker_code", "")).strip(), str(item.get("warrant_code", "")).strip()): item
+    }
 
-        # 權證不可當沖：
-        # 同一天若同時有買進與賣出，當日賣出視為賣之前庫存，
-        # 不能拿來扣當天新建立的買進事件。
-        # 因此每日處理順序改為：
-        # 1. 先處理當日賣出，只扣買進日早於賣出日的舊事件
-        # 2. 再建立當日買進事件
-        if sell_s > 0 and events:
-            sell_p = round(sell_a / sell_s, 4) if sell_s > 0 else 0
-            sell_left = sell_s
-            sell_dt = parse_date(date)
+    for day in timeline.get("daily", []):
+        cycle_id = day.get("持倉週期ID")
+        buy_s = int(round(_event_float(day.get("買進股數", 0))))
+        buy_a = int(round(_event_float(day.get("買進金額", 0))))
+        date = normalize_date_str(day.get("日期", ""))
 
-            for ev in events:
-                if ev["剩餘股數"] <= 0:
-                    continue
+        if cycle_id is None or cycle_id in created_cycle_ids:
+            continue
 
-                ev_buy_dt = parse_date(ev["買進日"])
-                if ev_buy_dt and sell_dt and ev_buy_dt >= sell_dt:
-                    continue
+        if buy_a < AMOUNT_THRESH or buy_s <= 0:
+            continue
 
-                alloc = min(sell_left, ev["剩餘股數"])
+        buy_p = round(buy_a / buy_s, 4) if buy_s > 0 else 0
 
-                if alloc <= 0:
-                    continue
+        event = {
+            "事件類型": "A-單檔權證大買",
+            "事件代碼": "A",
+            "分點": item["broker_label"],
+            "分點名稱": item["broker_name"],
+            "券商代號": item["broker_code"],
+            "權證代號": item["warrant_code"],
+            "權證名稱": item["warrant_name"],
+            "標的股": item["underlying_code"],
+            "標的名稱": item.get("underlying_name", ""),
+            "買進日": date,
+            "事件日": date,
+            "買進股數": buy_s,
+            "買進張數": buy_s // 1000,
+            "買進金額": buy_a,
+            "買進均價": buy_p,
+            "剩餘股數": day.get("期末持有股數", buy_s),
+            "已實現賣出金額": 0,
+            "狀態": "持有",
+            "減碼日": None,
+            "減碼均價": None,
+            "減碼獲利%": None,
+            "出清日": None,
+            "出清均價": None,
+            "出清獲利%": None,
+            "持有天數": None,
+            "持倉週期ID": cycle_id,
+        }
 
-                ev["剩餘股數"] -= alloc
-                sell_left -= alloc
-
-                # ★ 新增：累計這個事件「已實現賣出金額」（依每批實際賣價加權）。
-                #   出清時用此累計值對原始買進成本算報酬，
-                #   才不會只用最後一筆賣價，與 B/C/D 的累積實現報酬一致。
-                ev["已實現賣出金額"] += alloc * sell_p
-
-                if ev["剩餘股數"] > 0:
-                    if ev["減碼日"] is None:
-                        ev["減碼日"] = date
-                        ev["減碼均價"] = sell_p
-                        ev["減碼獲利%"] = round((sell_p - ev["買進均價"]) / ev["買進均價"] * 100, 2) if ev["買進均價"] else None
-                    ev["狀態"] = "減碼"
-                else:
-                    ev["狀態"] = "出清"
-                    ev["出清日"] = date
-
-                    # ★ 修改：出清均價改用「加權平均賣出價」= 累計賣出金額 / 原始買進股數，
-                    #   出清獲利% 改用「累計賣出金額 vs 原始買進金額」。
-                    #   注意成本基準必須用 ev["買進金額"]，不是迴圈中的 buy_a。
-                    cost_basis = ev["買進金額"]
-                    total_sold_shares = ev["買進股數"]
-
-                    if total_sold_shares > 0:
-                        ev["出清均價"] = round(ev["已實現賣出金額"] / total_sold_shares, 4)
-                    else:
-                        ev["出清均價"] = sell_p
-
-                    if cost_basis:
-                        ev["出清獲利%"] = round(
-                            (ev["已實現賣出金額"] - cost_basis) / cost_basis * 100, 2
-                        )
-                    else:
-                        ev["出清獲利%"] = None
-
-                    buy_dt = parse_date(ev["買進日"])
-                    exit_dt = parse_date(date)
-                    if buy_dt and exit_dt:
-                        ev["持有天數"] = (exit_dt - buy_dt).days
-
-                if sell_left <= 0:
-                    break
-
-        # A：買進金額 >= 100萬，不扣賣出金額
-        # 當日買進事件在當日賣出處理後才建立，避免出現買進日當天減碼/出清。
-        if buy_a >= AMOUNT_THRESH and buy_s > 0:
-            buy_p = round(buy_a / buy_s, 4)
-
-            events.append({
-                "事件類型": "A-單檔權證大買",
-                "事件代碼": "A",
-                "分點": item["broker_label"],
-                "分點名稱": item["broker_name"],
-                "券商代號": item["broker_code"],
-                "權證代號": item["warrant_code"],
-                "權證名稱": item["warrant_name"],
-                "標的股": item["underlying_code"],
-                "買進日": date,
-                "事件日": date,
-                "買進股數": buy_s,
-                "買進張數": buy_s // 1000,
-                "買進金額": buy_a,
-                "買進均價": buy_p,
-                "剩餘股數": buy_s,
-                "已實現賣出金額": 0,   # ★ 新增：累計已賣出金額，供出清時加權計算報酬
-                "狀態": "持有",
-                "減碼日": None,
-                "減碼均價": None,
-                "減碼獲利%": None,
-                "出清日": None,
-                "出清均價": None,
-                "出清獲利%": None,
-                "持有天數": None,
-            })
+        event = _simulate_position_outcome(
+            event,
+            single_item_map,
+            [item["warrant_code"]],
+            event_end_date=date,
+            event_start_date=date,
+            is_a=True,
+        )
+        events.append(event)
+        created_cycle_ids.add(cycle_id)
 
     return events
 
@@ -7154,115 +7565,27 @@ def get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
 
 
 def simulate_group_outcome(event, item_map):
-    lots = []
+    """
+    B / C / D 共用完整 FIFO 持倉結果。
 
-    for lot in event["lots"]:
-        if lot["股數"] <= 0 or lot["金額"] <= 0:
-            continue
+    事件成立條件與原本完全相同；只把後續「減碼／出清／成本」改成讀取
+    同一分點、同一權證的完整逐日 FIFO 庫存。後續新買進會繼續加入尚未
+    出清的持倉，只有所有事件相關權證的期末持有股數都歸零，才判定出清。
+    """
+    warrant_codes = [
+        lot.get("權證代號", "")
+        for lot in event.get("lots", [])
+        if str(lot.get("權證代號", "")).strip()
+    ]
 
-        lots.append({
-            "權證代號": lot["權證代號"],
-            "買進日": lot["買進日"],
-            "股數": lot["股數"],
-            "金額": lot["金額"],
-            "均價": lot["金額"] / lot["股數"] if lot["股數"] else 0,
-            "剩餘股數": lot["股數"],
-        })
-
-    total_cost = sum(lot["金額"] for lot in lots)
-
-    event["減碼日"] = None
-    event["減碼賣出金額"] = None
-    event["減碼獲利%"] = None
-    event["出清日"] = None
-    event["出清賣出金額"] = None
-    event["出清獲利%"] = None
-    event["持有天數"] = None
-    event["狀態"] = "持有"
-
-    if total_cost <= 0 or not lots:
-        return event
-
-    future_sales = []
-    event_end_date = normalize_date_str(event["結束日"])
-    broker_code = str(event["券商代號"]).strip()
-
-    for warrant_code in sorted(set(lot["權證代號"] for lot in lots)):
-        for sale in get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
-            if sale["日期"] > event_end_date:
-                future_sales.append(sale)
-
-    future_sales = sorted(future_sales, key=lambda x: (x["日期"], x["權證代號"]))
-
-    realized_revenue = 0
-    realized_cost = 0
-
-    def remaining_total():
-        return sum(lot["剩餘股數"] for lot in lots)
-
-    for sale in future_sales:
-        sell_s = sale["賣出股數"]
-        sell_a = sale["賣出金額"]
-
-        if sell_s <= 0 or sell_a <= 0:
-            continue
-
-        sell_price = sell_a / sell_s
-        sell_left = sell_s
-
-        before_remaining = remaining_total()
-        sale_revenue = 0
-        sale_cost = 0
-
-        for lot in lots:
-            if lot["權證代號"] != sale["權證代號"]:
-                continue
-            if lot["剩餘股數"] <= 0:
-                continue
-
-            alloc = min(sell_left, lot["剩餘股數"])
-
-            if alloc <= 0:
-                continue
-
-            revenue = alloc * sell_price
-            cost = alloc * lot["均價"]
-
-            lot["剩餘股數"] -= alloc
-            sell_left -= alloc
-
-            realized_revenue += revenue
-            realized_cost += cost
-
-            sale_revenue += revenue
-            sale_cost += cost
-
-            if sell_left <= 0:
-                break
-
-        after_remaining = remaining_total()
-
-        if before_remaining > after_remaining:
-            if event["減碼日"] is None and after_remaining > 0:
-                event["減碼日"] = sale["日期"]
-                event["減碼賣出金額"] = round(sale_revenue, 0)
-                event["減碼獲利%"] = round((sale_revenue - sale_cost) / sale_cost * 100, 2) if sale_cost else None
-                event["狀態"] = "減碼"
-
-            if after_remaining <= 0:
-                event["出清日"] = sale["日期"]
-                event["出清賣出金額"] = round(realized_revenue, 0)
-                event["出清獲利%"] = round((realized_revenue - total_cost) / total_cost * 100, 2)
-                event["狀態"] = "出清"
-
-                start_dt = parse_date(event["起始日"])
-                exit_dt = parse_date(event["出清日"])
-                if start_dt and exit_dt:
-                    event["持有天數"] = (exit_dt - start_dt).days
-
-                break
-
-    return event
+    return _simulate_position_outcome(
+        event,
+        item_map,
+        warrant_codes,
+        event_end_date=event.get("結束日") or event.get("事件日"),
+        event_start_date=event.get("起始日") or event.get("事件日"),
+        is_a=False,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -9460,7 +9783,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
-            "買進金額": _safe_stat_amount(ev.get("買進金額", 0)),
+            "買進金額": _safe_stat_amount(ev.get("總投入成本", ev.get("買進金額", 0))),
         })
 
     for ev in b_events:
@@ -9475,7 +9798,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
-            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
+            "買進金額": _safe_stat_amount(ev.get("總投入成本", ev.get("買超金額", 0))),
         })
 
     for ev in c_events:
@@ -9490,7 +9813,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
-            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
+            "買進金額": _safe_stat_amount(ev.get("總投入成本", ev.get("買超金額", 0))),
         })
 
     for ev in d_events:
@@ -9505,7 +9828,7 @@ def collect_stat_records(a_events, b_events, c_events, d_events):
             "結果": calc_result_tag(return_pct),
             "持有天數": ev["持有天數"],
             "報酬%": return_pct,
-            "買進金額": _safe_stat_amount(ev.get("買超金額", 0)),
+            "買進金額": _safe_stat_amount(ev.get("總投入成本", ev.get("買超金額", 0))),
         })
 
     return records
