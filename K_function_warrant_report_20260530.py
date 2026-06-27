@@ -106,6 +106,28 @@ MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_FALLBACK_ENABLE = os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+
+# 週報輸出模式：
+# - full：完整週報，維持原本所有區塊。
+# - compact：精簡週報，移除「本週重點」與「本週新聞 / 題材觀察」兩個區塊，
+#   並直接縮短畫布高度，不保留空白；同時略過新聞抓取與相關 Gemini 統整。
+# GitHub Actions 可將 workflow_dispatch 的選項值傳入 WARRANT_REPORT_MODE。
+REPORT_MODE_RAW = os.getenv("WARRANT_REPORT_MODE", "full").strip() or "full"
+_REPORT_MODE_KEY = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", REPORT_MODE_RAW.lower())
+_REPORT_MODE_COMPACT_ALIASES = {
+    "compact", "simple", "lite", "short", "nonews", "withoutnews", "chartsonly",
+    "精簡", "精簡模式", "精簡週報", "不含本週重點與本週新聞",
+    "精簡週報不含本週重點與本週新聞",
+}
+REPORT_MODE = "compact" if _REPORT_MODE_KEY in _REPORT_MODE_COMPACT_ALIASES else "full"
+
+
+def is_compact_report_mode() -> bool:
+    return REPORT_MODE == "compact"
+
+
+def get_report_mode_label() -> str:
+    return "精簡週報（不含本週重點與本週新聞）" if is_compact_report_mode() else "完整週報"
 # 截圖式輸出設定：先用原本高解析度產圖，再等比例縮小後輸出，模擬「截圖後送出」以降低檔案大小。
 SCREENSHOT_OUTPUT_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 SCREENSHOT_OUTPUT_SCALE = float(os.getenv("WARRANT_SCREENSHOT_OUTPUT_SCALE", "0.6"))
@@ -6351,13 +6373,22 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # TOP5 買賣超使用 build_weekly_context 產生的 week_events；
     # week_events 已改用「股價日期 + 權證事件日期」的最新週區間，因此會納入今日已更新的權證分點資料。
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
-    key_points = build_key_points(ctx, stock_name)
-    news_points = build_news_points(stock_code, stock_name, news_items, ctx)
-
-    fig = plt.figure(figsize=(28, 59), facecolor=BG)
-    gs = GridSpec(9, 12, figure=fig,
-                  height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
-                  hspace=0.20, wspace=0.25)
+    compact_mode = is_compact_report_mode()
+    if compact_mode:
+        # 精簡模式不建立本週重點與新聞內容，避免不必要的新聞抓取 / Gemini 呼叫。
+        key_points = []
+        news_points = []
+        fig = plt.figure(figsize=(28, 47.7), facecolor=BG)
+        gs = GridSpec(8, 12, figure=fig,
+                      height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55],
+                      hspace=0.20, wspace=0.25)
+    else:
+        key_points = build_key_points(ctx, stock_name)
+        news_points = build_news_points(stock_code, stock_name, news_items, ctx)
+        fig = plt.figure(figsize=(28, 59), facecolor=BG)
+        gs = GridSpec(9, 12, figure=fig,
+                      height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
+                      hspace=0.20, wspace=0.25)
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -6704,115 +6735,116 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 ax_top.plot([x0 + 0.02, x0 + 0.44], [y - 0.100, y - 0.100], transform=ax_top.transAxes, color=GRID, linewidth=0.8, alpha=0.65, zorder=5)
                 y -= row_gap
 
-    # Notes row
-    ax_notes = fig.add_subplot(gs[8, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
-    for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材觀察")]:
-        note_y = 0.005
-        note_w = 0.48
-        note_h = 0.975
-        note_band_h = 0.040
-        draw_rounded_panel_with_top_band(
-            ax_notes,
-            x0,
-            note_y,
-            note_w,
-            note_h,
-            band_h=note_band_h,
-            rounding=0.022,
-            linewidth=1.25,
-        )
-        ax_notes.text(x0 + 0.02, note_y + note_h - 0.105, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False, zorder=6)
-    notes_fontsize = 32
-    notes_line_height = 0.058
-    notes_item_gap = 0.036
-    notes_max_lines = 5
-    notes_right_padding = 0.025
-
-    def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
-        """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
-        s = str(text or "").strip()
-        if not s:
-            return ""
-
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        ax_bbox = ax.get_window_extent(renderer=renderer)
-        max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width
-
-        width_cache = {}
-
-        def measure_px(candidate: str) -> float:
-            if candidate in width_cache:
-                return width_cache[candidate]
-            tmp = ax.text(
-                0, 0, candidate,
-                transform=ax.transAxes,
-                fontsize=fontsize,
-                fontweight=fontweight,
-                ha="left",
-                va="top",
-                alpha=0,
-            )
-            bbox = tmp.get_window_extent(renderer=renderer)
-            tmp.remove()
-            width_cache[candidate] = bbox.width
-            return bbox.width
-
-        lines = []
-        current = ""
-        for ch in s:
-            prefix = first_prefix if not lines else next_prefix
-            candidate = current + ch
-            if measure_px(prefix + candidate) <= max_width_px or not current:
-                current = candidate
-            else:
-                lines.append(current.rstrip())
-                current = ch.lstrip()
-
-        if current:
-            lines.append(current.rstrip())
-
-        if max_lines and len(lines) > max_lines:
-            lines = lines[:max_lines]
-            last_prefix = first_prefix if max_lines == 1 else next_prefix
-            last = lines[-1].rstrip()
-            while last and measure_px(last_prefix + last + "…") > max_width_px:
-                last = last[:-1].rstrip()
-            lines[-1] = (last + "…") if last else "…"
-
-        return "\n".join(lines)
-
-    def draw_note_items(items, x_left, x_right, y_start):
-        y = y_start
-        max_width_axes = max(0.05, x_right - x_left)
-        for p in items:
-            body = wrap_text_by_pixel(
+    if not compact_mode:
+        # Notes row
+        ax_notes = fig.add_subplot(gs[8, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
+        for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材觀察")]:
+            note_y = 0.005
+            note_w = 0.48
+            note_h = 0.975
+            note_band_h = 0.040
+            draw_rounded_panel_with_top_band(
                 ax_notes,
-                fig,
-                p,
-                max_width_axes=max_width_axes,
-                fontsize=notes_fontsize,
-                fontweight="normal",
-                max_lines=notes_max_lines,
-                first_prefix="• ",
-                next_prefix="  ",
+                x0,
+                note_y,
+                note_w,
+                note_h,
+                band_h=note_band_h,
+                rounding=0.022,
+                linewidth=1.25,
             )
-            note_text = "• " + body.replace("\n", "\n  ")
-            line_count = note_text.count("\n") + 1
-            ax_notes.text(
-                x_left, y, note_text,
-                transform=ax_notes.transAxes,
-                color=TEXT,
-                fontsize=notes_fontsize,
-                ha="left",
-                va="top",
-                linespacing=1.12,
-                clip_on=True,
-            )
-            y -= notes_line_height * line_count + notes_item_gap
+            ax_notes.text(x0 + 0.02, note_y + note_h - 0.105, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False, zorder=6)
+        notes_fontsize = 32
+        notes_line_height = 0.058
+        notes_item_gap = 0.036
+        notes_max_lines = 5
+        notes_right_padding = 0.025
 
-    draw_note_items(key_points[:4], 0.04, 0.02 + 0.57 - notes_right_padding, 0.775)
-    draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.57 - notes_right_padding, 0.775)
+        def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
+            """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
+            s = str(text or "").strip()
+            if not s:
+                return ""
+
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            ax_bbox = ax.get_window_extent(renderer=renderer)
+            max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width
+
+            width_cache = {}
+
+            def measure_px(candidate: str) -> float:
+                if candidate in width_cache:
+                    return width_cache[candidate]
+                tmp = ax.text(
+                    0, 0, candidate,
+                    transform=ax.transAxes,
+                    fontsize=fontsize,
+                    fontweight=fontweight,
+                    ha="left",
+                    va="top",
+                    alpha=0,
+                )
+                bbox = tmp.get_window_extent(renderer=renderer)
+                tmp.remove()
+                width_cache[candidate] = bbox.width
+                return bbox.width
+
+            lines = []
+            current = ""
+            for ch in s:
+                prefix = first_prefix if not lines else next_prefix
+                candidate = current + ch
+                if measure_px(prefix + candidate) <= max_width_px or not current:
+                    current = candidate
+                else:
+                    lines.append(current.rstrip())
+                    current = ch.lstrip()
+
+            if current:
+                lines.append(current.rstrip())
+
+            if max_lines and len(lines) > max_lines:
+                lines = lines[:max_lines]
+                last_prefix = first_prefix if max_lines == 1 else next_prefix
+                last = lines[-1].rstrip()
+                while last and measure_px(last_prefix + last + "…") > max_width_px:
+                    last = last[:-1].rstrip()
+                lines[-1] = (last + "…") if last else "…"
+
+            return "\n".join(lines)
+
+        def draw_note_items(items, x_left, x_right, y_start):
+            y = y_start
+            max_width_axes = max(0.05, x_right - x_left)
+            for p in items:
+                body = wrap_text_by_pixel(
+                    ax_notes,
+                    fig,
+                    p,
+                    max_width_axes=max_width_axes,
+                    fontsize=notes_fontsize,
+                    fontweight="normal",
+                    max_lines=notes_max_lines,
+                    first_prefix="• ",
+                    next_prefix="  ",
+                )
+                note_text = "• " + body.replace("\n", "\n  ")
+                line_count = note_text.count("\n") + 1
+                ax_notes.text(
+                    x_left, y, note_text,
+                    transform=ax_notes.transAxes,
+                    color=TEXT,
+                    fontsize=notes_fontsize,
+                    ha="left",
+                    va="top",
+                    linespacing=1.12,
+                    clip_on=True,
+                )
+                y -= notes_line_height * line_count + notes_item_gap
+
+        draw_note_items(key_points[:4], 0.04, 0.02 + 0.57 - notes_right_padding, 0.775)
+        draw_note_items(news_points[:NEWS_DISPLAY_MAX_POINTS], 0.54, 0.52 + 0.57 - notes_right_padding, 0.775)
 
     # x ticks
     interval = max(1, len(x) // 12)
@@ -6925,12 +6957,16 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                     )
             except Exception as e:
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
-        cached_news_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
-        if cached_news_points:
-            print(f"📦 今日新聞快取已存在，略過 Google News 抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
+        if is_compact_report_mode():
+            print("📄 精簡週報模式：略過本週重點、Google News 抓取與 Gemini 新聞統整")
             news_items = []
         else:
-            news_items = fetch_google_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
+            cached_news_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
+            if cached_news_points:
+                print(f"📦 今日新聞快取已存在，略過 Google News 抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
+                news_items = []
+            else:
+                news_items = fetch_google_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
 
         fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
         buf = io.BytesIO()
@@ -6979,6 +7015,7 @@ def main():
         stock_codes = ["2408"]
 
     print(f"📌 本次執行股票：{', '.join(stock_codes)}")
+    print(f"📌 週報模式：{get_report_mode_label()}｜WARRANT_REPORT_MODE={REPORT_MODE_RAW}")
     print(f"📌 Gemini 開關：WARRANT_GEMINI_ENABLE={os.getenv('WARRANT_GEMINI_ENABLE', '')}")
     print(f"📌 Gemini API Key 組數：{len(_get_warrants_api_keys())}")
     print(f"📌 新聞開關：WARRANT_NEWS_ENABLE={os.getenv('WARRANT_NEWS_ENABLE', '')}")
