@@ -4046,20 +4046,58 @@ def _rule_based_key_points(ctx, stock_name: str):
     return points[:4]
 
 
+def _finish_complete_summary_point(text: str, max_len: int, min_cut_len: int = 30) -> str:
+    """將週報重點整理成獨立完整句，不用省略號，也不在句子中間硬切。"""
+    s = _normalize_news_text(text)
+    s = re.sub(r"(?:\.{3,}|…+)$", "", s).strip()
+    s = s.strip("；;，, ")
+    if not s:
+        return ""
+
+    max_len = max(1, int(max_len or len(s)))
+    if len(s) > max_len:
+        end_positions = [s.rfind(p, 0, max_len + 1) for p in ["。", "！", "？"]]
+        end_idx = max(end_positions)
+        if end_idx >= min_cut_len:
+            s = s[:end_idx + 1].strip()
+        else:
+            clause_positions = [s.rfind(p, 0, max_len + 1) for p in ["；", ";", "，", ","]]
+            clause_idx = max(clause_positions)
+            if clause_idx >= min_cut_len:
+                s = s[:clause_idx].rstrip("；;，, ") + "。"
+            # 找不到合理斷點時保留完整原句，避免半句或省略號。
+
+    s = re.sub(r"(?:\.{3,}|…+)$", "", s).strip()
+    if s and s[-1] not in "。！？":
+        s = s.rstrip("；;，, ") + "。"
+    return s
+
+
+def _points_are_independent_and_complete(points: List[str]) -> bool:
+    """檢查每點是否可獨立閱讀，避免上一點講一半、下一點接續。"""
+    if not points:
+        return False
+    dependent_starts = (
+        "此外", "另外", "再者", "承上", "延續前述", "延續上述",
+        "前述", "上述", "另一方面", "相較之下", "相對地",
+    )
+    for p in points:
+        s = str(p or "").strip()
+        if not s or s.startswith(dependent_starts):
+            return False
+        if "…" in s or "..." in s:
+            return False
+        if s[-1] not in "。！？":
+            return False
+    return True
+
+
 def _trim_weekly_point(text: str, max_len: int | None = None) -> str:
     max_len = int(max_len or WEEKLY_KEYPOINT_POINT_MAX_LEN)
     s = _normalize_news_text(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = re.sub(r"^(本週重點|重點|摘要)[:：]\s*", "", s).strip()
-    s = s.strip("。；;，, ")
-    if len(s) <= max_len:
-        return s
-    cut = s[:max_len]
-    last = max(cut.rfind("，"), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
-    if last >= 36:
-        cut = cut[:last]
-    return cut.rstrip("，、；; ") + "…"
-
+    return _finish_complete_summary_point(s, max_len=max_len, min_cut_len=36)
 
 def _clean_weekly_key_points(raw_points: List[str]) -> List[str]:
     points = []
@@ -4736,15 +4774,21 @@ def _build_google_news_queries(stock_code: str, stock_name: str, days: int) -> L
     strict_topics = (
         "營收 OR 財報 OR 獲利 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR "
         "AI OR 伺服器 OR 記憶體 OR DRAM OR 半導體 OR 報價 OR HBM OR 法人 OR "
-        "目標價 OR 評等 OR EPS OR ASP OR 毛利 OR 毛利率 OR 供需 OR 漲價"
+        "目標價 OR 評等 OR EPS OR ASP OR 毛利 OR 毛利率 OR 供需 OR 漲價 OR "
+        "ETF OR 成分股 OR 指數調整 OR 權重調整 OR 被動資金"
     )
     broad_topics = (
         "新聞 OR 題材 OR 法人 OR 展望 OR 營運 OR 產業 OR 報價 OR 需求 OR "
         "接單 OR 出貨 OR 財報 OR 營收 OR 法說 OR 目標價 OR 評等"
     )
 
+    etf_topics = (
+        "ETF OR 成分股 OR 成分證券 OR 納入 OR 剔除 OR 換股 OR 指數調整 OR "
+        "權重調整 OR 被動資金 OR 加碼 OR 減碼 OR 增持 OR 減持"
+    )
     queries = [
         ("嚴格基本面", f"({strict_part}) ({strict_topics}) {safe_excludes} when:{days}d"),
+        ("ETF與指數", f"({strict_part}) ({etf_topics}) {safe_excludes} when:{days}d"),
         ("放寬題材", f"({strict_part}) ({broad_topics}) {safe_excludes} when:{days}d"),
         ("股票別名", f"({strict_part}) {safe_excludes} when:{days}d"),
     ]
@@ -4800,11 +4844,49 @@ def _build_fast_rss_news_content(title: str, description: str, source: str = "",
     return _normalize_news_text("。".join(parts))
 
 
+def _has_representative_etf_or_index_event(text: str) -> bool:
+    """只接受真正涉及 ETF／指數成分調整或被動資金變動的代表性事件。"""
+    s = _normalize_news_text(text)
+    if not s:
+        return False
+    has_vehicle = bool(re.search(r"ETF|指數|成分股|成分證券|被動資金|追蹤指數", s, re.I))
+    has_event = bool(re.search(
+        r"納入|剔除|新增|刪除|換股|定期調整|成分調整|權重調整|權重升降|調升權重|調降權重|"
+        r"加碼|減碼|增持|減持|買進|賣出|持股增加|持股減少|季度審核|定期審核|審核結果",
+        s,
+    ))
+    return bool(has_vehicle and has_event)
+
+
+def _score_news_article_relevance(article: dict, stock_code: str, stock_name: str) -> int:
+    """新聞候選排序：公司直接相關、具體數字與 ETF／指數事件優先。"""
+    title = _clean_news_title(article.get("title", ""))
+    content = _normalize_news_text(article.get("content", article.get("description", "")))
+    combined = _normalize_news_text(f"{title} {content}")
+    aliases = _get_news_aliases(stock_code, stock_name)
+    score = 0
+    if any(a and a in title for a in aliases):
+        score += 12
+    elif any(a and a in combined for a in aliases):
+        score += 5
+    if _has_representative_etf_or_index_event(combined):
+        score += 7
+    if re.search(r"營收|EPS|每股純益|毛利率|獲利|法說|財測|接單|出貨|產能|目標價|評等|報價|供需", combined, re.I):
+        score += 5
+    if re.search(r"\d+(?:\.\d+)?\s*(%|％|元|億元|萬|倍|張|股)", combined):
+        score += 3
+    if _is_low_value_market_news(combined):
+        score -= 8
+    return score
+
+
 def _has_substantive_company_news(text: str) -> bool:
     """判斷內容是否包含公司基本面、營運、法人觀點或具體產業供需事件。"""
     s = _normalize_news_text(text)
     if not s:
         return False
+    if _has_representative_etf_or_index_event(s):
+        return True
 
     direct_terms = re.search(
         r"營收|財報|獲利|虧損|轉盈|EPS|每股純益|毛利|毛利率|法說|財測|展望|"
@@ -4828,6 +4910,8 @@ def _is_low_value_market_news(text: str) -> bool:
     s = _normalize_news_text(text)
     if not s:
         return True
+    if _has_representative_etf_or_index_event(s):
+        return False
     low_value_terms = [
         "焦點股", "強勢股", "熱門股", "飆股", "漲停股", "亮燈", "盤中焦點", "今日焦點",
         "多檔", "名單", "排行", "選股", "存股", "高股息", "值得關注", "完整看", "看更多",
@@ -4918,8 +5002,9 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     def usable_count_now() -> int:
         return sum(1 for a in all_articles if a.get("body_ok") or a.get("fallback_ok"))
 
-    # 7 天內只要已有足夠的 2～3 篇高品質新聞就停止；不足才擴大到 14 / 30 天。
-    required_usable_count = max(1, min(2, int(NEWS_SUMMARY_MAX_POINTS), int(NEWS_GOOGLE_MIN_USABLE_ARTICLES)))
+    # 快速 RSS 模式先建立較完整候選池，避免前兩篇普通新聞使後面更具代表性的公司／ETF新聞被漏掉。
+    # 慢速原文模式仍保守限制篇數，避免抓取時間過長。
+    required_usable_count = fetch_limit if fast_mode else max(3, min(fetch_limit, int(NEWS_GOOGLE_MIN_USABLE_ARTICLES)))
 
     def enough_articles() -> bool:
         return usable_count_now() >= required_usable_count
@@ -4979,6 +5064,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             "search_days": days,
             "query_stage": stage_label,
         }
+        article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
         if body_ok:
             status = "原文可摘要"
         elif fallback_ok and fast_mode:
@@ -5143,7 +5229,8 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         published_dt = _parse_rss_pub_date(article.get("published", "")) or datetime.min
         usable_rank = 0 if article.get("body_ok") else 1 if article.get("fallback_ok") else 2
         days_rank = int(article.get("search_days", 999) or 999)
-        return (usable_rank, days_rank, -published_dt.timestamp() if published_dt != datetime.min else 0)
+        relevance_rank = -int(article.get("relevance_score", 0) or 0)
+        return (usable_rank, days_rank, relevance_rank, -published_dt.timestamp() if published_dt != datetime.min else 0)
 
     all_articles = sorted(all_articles, key=_sort_key)
     return all_articles[:fetch_limit]
@@ -5479,22 +5566,12 @@ def _trim_news_point(text: str, max_len: int | None = None) -> str:
     s = re.sub(r"^(根據您提供的資料|根據提供的資料|根據新聞內文|根據本週資料)[，,：:\s]*", "", s).strip()
     s = re.sub(r"\s+-\s+[^-]{1,40}$", "", s).strip()
     s = _remove_news_boilerplate(s)
-    # 將 LLM 常見的空泛分析語氣改成較像財經新聞摘要的說法，避免「市場觀察到、重新評價」這類字眼太像 AI 分析。
     s = re.sub(r"^市場觀察到", "", s).strip()
     s = s.replace("可能因", "受")
     s = s.replace("而獲得重新評價的機會", "，使市場關注度升溫")
     s = s.replace("重新評價的機會", "市場關注度升溫")
     s = s.replace("相關成長動能與市場關注度", "相關訂單、營收與市場關注度")
-    s = s.strip("。；;，, ")
-    if len(s) <= max_len:
-        return s
-    cut = s[:max_len]
-    # 優先在逗號或頓號處截斷，避免句子突然斷掉。
-    last = max(cut.rfind("，"), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
-    if last >= 28:
-        cut = cut[:last]
-    return cut.rstrip("，、；; ") + "…"
-
+    return _finish_complete_summary_point(s, max_len=max_len, min_cut_len=32)
 
 def _score_news_sentence(sentence: str, keywords: List[str], stock_code: str, stock_name: str) -> int:
     s = str(sentence or "")
@@ -5903,16 +5980,20 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 1. 每點開頭使用 4～8 個字短標籤與全形冒號，例如「業績更新：」「法人觀點：」「公司動態：」「報價動向：」。
 2. 每點約 50～100 個中文字，呈現「具體事件或數字 → 對公司營運或產業的可能影響」。
 3. 優先整理營收、EPS、毛利率、獲利、法說、財測、目標價與評等、接單、出貨、產能、產品、客戶、合作、報價與供需。
-4. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-5. 不得為了填滿欄位而輸出空泛句子；沒有第二或第三個具體事件就不要硬寫。
-6. 不同文章若是同一事件，合併為一點，不要重複。
-7. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
-8. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
-9. 不得把其他公司的數字或題材套用到 {display_name}。
-10. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-11. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-12. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-13. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+4. ETF 納入／剔除成分股、定期換股、指數權重調整、被動資金加減碼或具體持股變化，若明確對應本公司，可視為代表性籌碼新聞。
+5. 單純介紹 ETF、推薦高股息 ETF、羅列多檔持股或沒有實際調整事件的內容，不得列為重點。
+6. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
+7. 不得為了填滿欄位而輸出空泛句子；沒有第二或第三個具體事件就不要硬寫。
+8. 不同文章若是同一事件，合併為一點，不要重複。
+9. 每一點必須是一則獨立完整的新聞摘要，不得把同一事件拆成兩點，也不得讓後一點接續前一點未完成的句意。
+10. 每點必須以完整句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
+11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
+12. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
+13. 不得把其他公司的數字或題材套用到 {display_name}。
+14. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+15. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+16. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+17. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
@@ -5937,6 +6018,9 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         stock_name=stock_name,
     )
     points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
+    if points and not _points_are_independent_and_complete(points):
+        print("⚠️ Gemini 新聞重點出現承接句、半句或省略號，改用規則式新聞摘要")
+        return []
     if points:
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
     return points
@@ -5951,7 +6035,7 @@ def _safe_float(v, default=np.nan):
 
 
 def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
-    """整理實際顯示的買超 / 賣超 TOP5，並附上可取得的歷史分點統計供 AI 比較。"""
+    """整理實際顯示的 TOP5，並提供金額代表性與歷史統計供 AI 判斷。"""
     week_events = ctx.get("week_events")
     if week_events is None or week_events.empty:
         return []
@@ -5966,21 +6050,51 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
             if str(r.get("branch", "") or "")
         }
 
+    all_amounts = []
+    for df_top in [buy_top, sell_top]:
+        if df_top is not None and not df_top.empty:
+            all_amounts.extend(pd.to_numeric(df_top["net_amount"], errors="coerce").fillna(0.0).abs().tolist())
+    overall_largest_abs = max(all_amounts) if all_amounts else 0.0
     rows = []
 
     def append_rows(df_top: pd.DataFrame, side: str):
+        if df_top is None or df_top.empty:
+            return
+        side_amounts = pd.to_numeric(df_top["net_amount"], errors="coerce").fillna(0.0).abs()
+        same_side_total_abs = float(side_amounts.sum())
+        same_side_largest_abs = float(side_amounts.max()) if len(side_amounts) else 0.0
+
         for rank, (_, r) in enumerate(df_top.iterrows(), 1):
             branch = str(r.get("branch", "") or "").strip()
             branch_norm = normalize_branch_name(branch)
             perf = perf_map.get(branch_norm)
             net_value = pd.to_numeric(r.get("net_amount", 0), errors="coerce")
             net_amount = 0.0 if pd.isna(net_value) else float(net_value)
+            abs_amount = abs(net_amount)
+            overall_ratio = abs_amount / overall_largest_abs if overall_largest_abs > 0 else 0.0
+            side_share = abs_amount / same_side_total_abs if same_side_total_abs > 0 else 0.0
+            side_ratio = abs_amount / same_side_largest_abs if same_side_largest_abs > 0 else 0.0
+
+            amount_representative = bool(rank <= 2 or overall_ratio >= 0.25)
+            if amount_representative:
+                amount_significance = "主要代表"
+            elif rank <= 3 or overall_ratio >= 0.15:
+                amount_significance = "次要參考"
+            else:
+                amount_significance = "金額偏小"
 
             row = {
                 "side": "買超" if side == "buy" else "賣超",
                 "rank": int(rank),
                 "branch": branch,
                 "weekly_net": fmt_money(net_amount),
+                "weekly_net_value": net_amount,
+                "absolute_amount": abs_amount,
+                "relative_to_overall_largest_pct": round(overall_ratio * 100, 2),
+                "relative_to_same_side_largest_pct": round(side_ratio * 100, 2),
+                "share_of_same_side_top5_pct": round(side_share * 100, 2),
+                "amount_significance": amount_significance,
+                "amount_representative": amount_representative,
                 "representative_warrant": f"{str(r.get('max_warrant_code', '') or '')} {str(r.get('max_warrant_name', '') or '')[:12]}".strip(),
                 "representative_warrant_net": fmt_money(float(r.get("max_warrant_amount", 0) or 0)),
                 "historical_statistics_available": bool(perf is not None),
@@ -5996,15 +6110,14 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
                     "historical_weighted_return": fmt_pct(weighted_return) if np.isfinite(weighted_return) else "-",
                     "average_holding_days": _format_avg_holding_days(avg_holding_days),
                     "holding_period_interpretation": _describe_branch_holding_style(avg_holding_days),
-                    # 事件數只提供 AI 判斷樣本背景，不要求一定寫進圖片。
                     "event_count": int(round(event_count)) if np.isfinite(event_count) else None,
+                    "historical_analysis_priority": bool(amount_representative),
                 })
             rows.append(row)
 
     append_rows(buy_top, "buy")
     append_rows(sell_top, "sell")
     return rows
-
 
 def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
     """將股價、均線、量能、法人、權證與 TOP5 分點完整整理給 AI。"""
@@ -6108,22 +6221,26 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 任務：完整閱讀股價漲跌、均線、量能、三大法人、權證週買賣超、買超與賣超 TOP5，以及可取得的分點歷史勝率、歷史加權報酬率與平均持有天數，從中自行挑選「最有分析價值的 3 個關聯重點」。
 
 分析原則：
-1. 必須輸出剛好 3 點，每點約 45～90 個中文字。
-2. 每一點優先比較至少兩類資料之間的關係，不要只是逐項抄寫數字。
-3. 可分析但不限於：
+1. 必須輸出剛好 3 點，每點約 45～90 個中文字，而且每一點都必須是可獨立閱讀的完整分析。
+2. 禁止把同一項分析拆成兩點；第二點或第三點不能接續上一點未完成的句意。
+3. 每點必須有明確主題、資料關係與結論，並以完整句號結束；不得使用「…」或「...」結尾。
+4. 每一點優先比較至少兩類資料之間的關係，不要只是逐項抄寫數字。
+5. 分點分析必須先看本週金額代表性，再看歷史勝率、加權報酬率與平均持有天數。
+6. amount_significance 為「金額偏小」或 amount_representative=false 的分點，不得只因歷史勝率高就單獨列為主要重點；除非多個小額分點同方向形成明確共識，否則應忽略。
+7. 若主要分點與小額高勝率分點方向不同，應以主要分點的金額影響為優先，不要把兩者當成同等重要。
+8. 可分析但不限於：
    - 股價方向與權證週淨流向是否同向或背離。
    - 三大法人與權證分點方向是否一致或衝突。
-   - 歷史勝率較高、歷史加權報酬率為正的分點，本週位於買超還是賣超 TOP5。
+   - 具金額代表性的高勝率、高加權報酬分點，本週位於買超或賣超前段。
    - 勝率高但歷史加權報酬率偏低或為負，代表命中穩定度與實際獲利幅度不一致。
-   - 平均持有約 2 天的分點可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，訊號時間尺度較短。
-4. 上述只是分析方向，不是每次都必須全部提到；只有資料真的形成有意義的關聯時才寫。
-5. 不一定要列出所有勝率、報酬率或分點。請自行選擇最能解釋本週狀況的關鍵數字。
-6. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
-7. 不可把平均持有約 2 天武斷寫成「一定是隔日沖」，只能寫成「接近隔日沖」「偏快速進出」等保守描述。
-8. 若資料方向互相矛盾，應明確指出「同向」「背離」「分歧」或「訊號時間尺度不同」，不要勉強下單一多空結論。
-9. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
-10. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；直接寫成週報分析。
-11. 不得輸出問號、導流文字、標籤或未提供的新聞題材。
+   - 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段。
+9. 上述只是分析方向，不是每次都必須全部提到；只有資料真的形成有意義的關聯時才寫。
+10. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
+11. 不可把平均持有約 2 天武斷寫成「一定是隔日沖」，只能使用保守描述。
+12. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
+13. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
+14. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
+15. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
 
 輸出前請自行檢查：每個數字都必須能在 JSON 中找到；每一點都必須是資料之間的分析關係，而不是單純列數字。
 
@@ -6141,7 +6258,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v4",
+            cache_task="weekly_keypoints_ai_analysis_v5",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -6153,6 +6270,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
             return []
         if any(_count_summary_chars([p]) < 24 for p in points) or _count_summary_chars(points) < 100:
             print("⚠️ Gemini 本週重點內容過短，改用規則式固定格式")
+            return []
+        if not _points_are_independent_and_complete(points):
+            print("⚠️ Gemini 本週重點出現承接句、半句或省略號，改用規則式固定格式")
             return []
 
         print(f"✅ Gemini 自主分析本週重點完成：3 點，總字數約 {_count_summary_chars(points)} 字")
@@ -6373,26 +6493,10 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
         print(f"⚠️ Google Sheet 舊新聞快取讀取失敗：{stock_key}｜{e}")
     return []
 
-def _build_no_news_fallback_point(stock_code: str, stock_name: str, ctx: dict | None = None) -> str:
-    """沒有高品質公司新聞時，明確說明資料不足，不拿盤勢或權證內容冒充新聞。"""
-    display_name = str(stock_name or stock_code or "該股").strip()
-    return (
-        f"新聞篩選：近 7 日不足時已擴大檢查至 14／30 日，仍未取得足夠具體且能明確對應 {display_name} "
-        "公司營運的重要消息；本期不納入大盤盤勢、熱門股排行或僅描述股價漲跌的內容。"
-    )
-
-
 def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_name: str, ctx: dict | None = None) -> List[str]:
-    """依高品質新聞數量動態整理顯示內容；一則時補充誠實的資訊完整度說明。"""
+    """只顯示真正通過品質門檻的新聞，不用「沒有新聞」或字數不足說明填版面。"""
     cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
-    if not cleaned:
-        return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
-    if len(cleaned) == 1:
-        display_name = str(stock_name or stock_code or "該股").strip()
-        cleaned.append(
-            f"近期資訊：除上述事件外，近 30 日未取得其他足夠具體且能明確對應 {display_name} 的重要公司新聞，"
-            "因此不以盤勢整理或多股排行補滿欄位。"
-        )
+    cleaned = [p for p in cleaned if _points_are_independent_and_complete([p])]
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
@@ -6420,24 +6524,22 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
         if stale_points:
             return _finalize_news_points_for_display(stale_points, stock_code, stock_name, ctx)
-        return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
+        return []
 
     # 所有合格新聞一次交給 Gemini 統整；Gemini 不需要湊滿 3 點或固定字數。
     ai_points = _summarize_news_with_gemini(usable_records, stock_code, stock_name)
     if ai_points:
-        ai_points = _ensure_news_summary_min_total(ai_points, usable_records, stock_code, stock_name)
         return _finalize_news_points_for_display(ai_points, stock_code, stock_name, ctx)
 
     # Gemini 不可用或失敗時，只從同一批合格素材做規則式摘要。
     rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
     if rule_points:
-        rule_points = _ensure_news_summary_min_total(rule_points, usable_records, stock_code, stock_name)
         return _finalize_news_points_for_display(rule_points, stock_code, stock_name, ctx)
 
     stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
     if stale_points:
         return _finalize_news_points_for_display(stale_points, stock_code, stock_name, ctx)
-    return [_build_no_news_fallback_point(stock_code, stock_name, ctx)]
+    return []
 
 # ============================================================
 # 繪圖工具
@@ -7332,14 +7434,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             if current:
                 lines.append(current.rstrip())
 
-            if max_lines and len(lines) > max_lines:
-                lines = lines[:max_lines]
-                last_prefix = first_prefix if max_lines == 1 else next_prefix
-                last = lines[-1].rstrip()
-                while last and measure_px(last_prefix + last + "…") > max_width_px:
-                    last = last[:-1].rstrip()
-                lines[-1] = (last + "…") if last else "…"
-
+            # 不在圖片端硬切文字或補省略號；上游已限制字數並確保每點為完整句。
+            # 保留完整換行結果，避免第二點被截斷後由第三點接續。
             return "\n".join(lines)
 
         def draw_note_items(
