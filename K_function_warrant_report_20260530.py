@@ -202,7 +202,7 @@ BRANCH_PERF_MAX_MATCHES = int(os.getenv("WARRANT_BRANCH_PERF_MAX_MATCHES", "3"))
 # 本週重點個別分點的最低金額代表性：以買賣超 TOP5 全體最大絕對金額為基準。
 # 低於此比例的分點，即使歷史勝率很高，也不提供給 AI 作為可點名的個別分析候選。
 WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO = float(
-    os.getenv("WARRANT_WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO", "0.35")
+    os.getenv("WARRANT_WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO", "0.25")
 )
 _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
@@ -6552,6 +6552,17 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         r for r in top5_rows
         if r.get("side") == "賣超" and bool(r.get("amount_representative"))
     ]
+    representative_history_candidates = [
+        r for r in (representative_buy_rows + representative_sell_rows)
+        if bool(r.get("historical_statistics_available"))
+    ]
+    representative_history_candidates = sorted(
+        representative_history_candidates,
+        key=lambda r: -abs(float(r.get("weekly_net_value", 0) or 0)),
+    )
+    required_representative_branch_analysis = (
+        dict(representative_history_candidates[0]) if representative_history_candidates else None
+    )
     small_rows = [r for r in top5_rows if not bool(r.get("amount_representative"))]
     small_amount_summary = {
         "count": len(small_rows),
@@ -6618,6 +6629,7 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         },
         "representative_buy_top5_with_history": representative_buy_rows,
         "representative_sell_top5_with_history": representative_sell_rows,
+        "required_representative_branch_analysis": required_representative_branch_analysis,
         "non_representative_top5_summary": small_amount_summary,
     }
     return payload
@@ -6638,6 +6650,106 @@ def _weekly_points_mention_nonrepresentative_branch(points: List[str], ctx: dict
     return forbidden
 
 
+def _get_required_representative_branch_analysis(ctx: dict) -> dict | None:
+    """取得本週金額最具代表性，且有完整歷史績效資料的分點。"""
+    rows = _build_weekly_top5_ai_rows(ctx)
+    candidates = [
+        r for r in rows
+        if bool(r.get("amount_representative"))
+        and bool(r.get("historical_statistics_available"))
+    ]
+    if not candidates:
+        return None
+    candidates = sorted(
+        candidates,
+        key=lambda r: -abs(float(r.get("weekly_net_value", 0) or 0)),
+    )
+    return dict(candidates[0])
+
+
+def _normalize_metric_text_for_check(v) -> str:
+    s = str(v or "").strip()
+    s = s.replace("＋", "+").replace("％", "%")
+    s = re.sub(r"[\s,，]", "", s)
+    return s
+
+
+def _weekly_points_cover_required_representative_analysis(points: List[str], ctx: dict) -> bool:
+    """確認 AI 有完整分析代表性分點，而不是只寫金額或集中度。"""
+    required = _get_required_representative_branch_analysis(ctx)
+    if not required:
+        return True
+
+    merged = _normalize_metric_text_for_check("\n".join(str(p or "") for p in points))
+    branch = _normalize_metric_text_for_check(required.get("branch", ""))
+    win_rate = _normalize_metric_text_for_check(required.get("historical_win_rate", ""))
+    weighted_return = _normalize_metric_text_for_check(required.get("historical_weighted_return", ""))
+    avg_holding_days = _normalize_metric_text_for_check(required.get("average_holding_days", ""))
+
+    if not branch or branch not in merged:
+        return False
+    if "勝率" not in merged or "加權報酬率" not in merged:
+        return False
+    if win_rate and win_rate != "-" and win_rate not in merged:
+        return False
+    if weighted_return and weighted_return != "-" and weighted_return not in merged:
+        return False
+    if avg_holding_days and avg_holding_days != "-":
+        if avg_holding_days not in merged or "持有" not in merged:
+            return False
+    return True
+
+
+def _repair_weekly_points_with_required_branch(
+    points: List[str],
+    payload: dict,
+    ctx: dict,
+    stock_name: str,
+) -> List[str]:
+    """AI 漏掉代表性分點歷史資料時，要求它重新整理一次完整三點。"""
+    required = payload.get("required_representative_branch_analysis")
+    if not required:
+        return points
+
+    original_points = [str(p or "").strip() for p in points if str(p or "").strip()]
+    repair_payload = {
+        "required_representative_branch_analysis": required,
+        "original_points": original_points,
+        "full_weekly_data": payload,
+    }
+    repair_prompt = f"""
+你是台股權證週報分析助手。上一版三個本週重點漏掉了必須分析的代表性分點歷史資料，請重新整理。
+你只能使用下方 JSON，不可自行補數字、不可使用外部知識。
+
+請輸出剛好 3 點繁體中文重點，並遵守：
+1. 其中剛好一點必須完整分析 required_representative_branch_analysis，必須同時寫出該分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並解讀其籌碼品質與操作時間尺度。
+2. 分點分析不得只寫買賣超金額或集中度，也不得省略勝率、歷史加權報酬率、平均持有天數。
+3. 另外兩點必須是不同面向的中立交叉分析，可從股價與均線量能、三大法人與權證資金方向、資金流連續性中選擇；不得重複同一個背離結論。
+4. 每一點都必須獨立完整，約 45～90 個中文字，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
+5. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
+6. 所有數字必須與 JSON 完全一致。
+
+請只回傳 JSON：
+{{
+  "points": [
+    "第一點",
+    "第二點",
+    "第三點"
+  ]
+}}
+
+修正資料 JSON：
+{json.dumps(repair_payload, ensure_ascii=False, indent=2)}
+"""
+    output_text = _call_gemini_with_retry(
+        repair_prompt,
+        cache_task="weekly_keypoints_ai_analysis_v6_repair",
+        stock_code=str(ctx.get("stock_code", "") or ""),
+        stock_name=stock_name,
+    )
+    return _parse_weekly_gemini_points(output_text or "")
+
+
 def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
     """讓 Gemini 比較完整資料後，自行挑選最有意義的三個本週重點。"""
     if not WEEKLY_KEYPOINT_LLM_ENABLE:
@@ -6656,22 +6768,24 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 2. 禁止把同一項分析拆成兩點；第二點或第三點不能接續上一點未完成的句意。
 3. 每點必須有明確主題、資料關係與結論，並以完整句號結束；不得使用「…」或「...」結尾。
 4. 每一點優先比較至少兩類資料之間的關係，不要只是逐項抄寫數字。
-5. 個別分點只能從 representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這兩個陣列內的分點不得點名、不得引用其勝率或歷史績效。
-6. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱。
-7. 分點分析必須先看本週金額代表性，再看歷史勝率、加權報酬率與平均持有天數；小額高勝率分點不得與主要大額分點對等比較。
-8. 可分析但不限於：
-   - 股價方向與權證週淨流向是否同向或背離。
-   - 三大法人與權證分點方向是否一致或衝突。
-   - 具金額代表性的高勝率、高加權報酬分點，本週位於買超或賣超前段。
-   - 勝率高但歷史加權報酬率偏低或為負，代表命中穩定度與實際獲利幅度不一致。
-   - 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段。
-9. 上述只是分析方向，不是每次都必須全部提到；只有資料真的形成有意義的關聯時才寫。
-10. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
-11. 不可把平均持有約 2 天武斷寫成「一定是隔日沖」，只能使用保守描述。
-12. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
-13. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
-14. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
-15. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
+5. 若 required_representative_branch_analysis 不是 null，三點中必須有且只有一點完整分析該分點；必須同時寫出分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並分析籌碼品質與操作時間尺度。
+6. 代表性分點那一點不得只寫金額或買盤集中度，也不得省略勝率、歷史加權報酬率、平均持有天數；若三項歷史資料均已提供，就必須全部使用。
+7. 個別分點只能從 required_representative_branch_analysis、representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這些資料內的分點不得點名、不得引用其歷史績效。
+8. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱；小額高勝率分點不得與主要大額分點對等比較。
+9. 另外兩點必須選擇兩個不同的中立分析面向，例如：
+   - 股價漲跌、均線與量能之間的技術結構。
+   - 三大法人與權證週資金方向是否一致或衝突。
+   - 權證資金流與股價方向是否同向或背離。
+   - 資金流的集中度、連續性或時間尺度。
+10. 另外兩點不得重複描述同一個「背離」或「分歧」結論；每點必須提供不同資訊價值。
+11. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
+12. 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，但不可武斷寫成一定是隔日沖。
+13. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
+14. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
+15. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
+16. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
+17. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
+18. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
 
 輸出前請自行檢查：每個數字都必須能在 JSON 中找到；每一點都必須是資料之間的分析關係，而不是單純列數字。
 
@@ -6689,7 +6803,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v5",
+            cache_task="weekly_keypoints_ai_analysis_v6",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -6713,6 +6827,34 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
                 + "，改用規則式固定格式"
             )
             return []
+
+        if not _weekly_points_cover_required_representative_analysis(points, ctx):
+            required = _get_required_representative_branch_analysis(ctx)
+            required_name = str((required or {}).get("branch", "") or "")
+            print(
+                f"⚠️ Gemini 本週重點未完整使用代表性分點「{required_name}」的勝率、"
+                "歷史加權報酬率與平均持有天數，啟動一次修正生成"
+            )
+            repaired_points = _repair_weekly_points_with_required_branch(
+                points,
+                payload,
+                ctx,
+                stock_name,
+            )
+            repaired_forbidden = _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx)
+            if (
+                len(repaired_points) == 3
+                and _count_summary_chars(repaired_points) >= 100
+                and all(_count_summary_chars([p]) >= 24 for p in repaired_points)
+                and _points_are_independent_and_complete(repaired_points)
+                and not repaired_forbidden
+                and _weekly_points_cover_required_representative_analysis(repaired_points, ctx)
+            ):
+                points = repaired_points
+                print("✅ Gemini 本週重點修正完成：已納入代表性分點完整歷史分析")
+            else:
+                print("⚠️ Gemini 本週重點修正後仍未完整涵蓋代表性分點歷史資料，改用規則式固定格式")
+                return []
 
         print(f"✅ Gemini 自主分析本週重點完成：3 點，總字數約 {_count_summary_chars(points)} 字")
         return points[:3]
