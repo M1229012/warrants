@@ -6339,11 +6339,11 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 10. 每點必須以完整句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
 11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
 12. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
-13. 不得把其他公司的數字或題材套用到 {display_name}。
-14. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-15. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-16. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-17. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+14. 不得把其他公司的數字或題材套用到 {display_name}。
+15. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+16. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+17. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+18. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
@@ -6684,26 +6684,51 @@ def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 38) -> dict:
         zone_centers.append(float(centers[second_idx]))
     lower_center, upper_center = min(zone_centers), max(zone_centers)
     if latest_close > upper_center:
-        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區的較高價格上方"
+        relative_to_two_zones = "最新收盤位於第一大量區與第二大量區之上"
+        neutral_zone_interpretation = "兩個主要成交成本區位於股價下方，可作為下方支撐觀察，但仍需配合近期價量與資金方向判斷是否有效"
     elif latest_close < lower_center:
-        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區的較低價格下方"
+        relative_to_two_zones = "最新收盤位於第一大量區與第二大量區之下"
+        neutral_zone_interpretation = "兩個主要成交成本區位於股價上方，型態上較接近上方壓力，尚未重新站回前不宜直接視為轉強"
     else:
-        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區之間"
+        relative_to_two_zones = "最新收盤位於第一大量區與第二大量區之間"
+        neutral_zone_interpretation = "股價位於兩個主要成交成本區之間，型態較接近成本區整理，上下方向仍需等待價量與資金進一步確認"
+
+    if event_volume_ratio is None:
+        crossing_volume_character = "近期沒有明確穿越第一大量區的事件，或穿越日量能資料不足"
+    elif event_volume_ratio >= 1.5:
+        crossing_volume_character = "穿越第一大量區時量能明顯高於近20日平均"
+    elif event_volume_ratio >= 1.1:
+        crossing_volume_character = "穿越第一大量區時量能略高於近20日平均"
+    elif event_volume_ratio <= 0.8:
+        crossing_volume_character = "穿越第一大量區時量能低於近20日平均"
+    else:
+        crossing_volume_character = "穿越第一大量區時量能接近近20日平均"
+
+    # 只提供型態分類與相對位置給 AI，不提供大量區實際價格、中心價或距離百分比，
+    # 避免本週重點變成數字播報。實際量區價格仍保留在繪圖算法內，不影響圖表。
+    maximum_volume_zone_for_ai = {
+        "label": "第一大量區（最大量區）",
+        "chart_color": "紅色",
+        "latest_close_relation": str(max_zone.get("latest_close_relation", "") or ""),
+    }
+    second_volume_zone_for_ai = {
+        "label": "第二大量區",
+        "chart_color": "橘色",
+        "latest_close_relation": str(second_zone.get("latest_close_relation", "") or ""),
+    } if second_zone else {}
 
     return {
         "available": True,
-        "chart_definition": "價量累積圖中紅色代表最大量區，橘色代表第二大量區",
-        "latest_close": _format_price_level(latest_close),
-        "maximum_volume_zone": max_zone,
-        "second_largest_volume_zone": second_zone,
+        "chart_definition": "價量累積圖中紅色代表第一大量區（最大量區），橘色代表第二大量區",
+        "maximum_volume_zone": maximum_volume_zone_for_ai,
+        "second_largest_volume_zone": second_volume_zone_for_ai,
         "latest_position_relative_to_two_zones": relative_to_two_zones,
         "recent_maximum_zone_pattern": recent_event,
-        "crossing_day_volume_vs_prior_20day_average": (
-            f"{event_volume_ratio:.2f}倍" if event_volume_ratio is not None else "無近期穿越事件或無法計算"
-        ),
+        "crossing_volume_character": crossing_volume_character,
         "recent_swing_structure": swing_structure,
         "weekly_price_volume_relationship": price_volume_relation,
-        "analysis_scope": "量區是成交成本密集區的客觀參考，只能描述支撐、壓力、突破、跌破或整理，不可直接視為買賣訊號",
+        "neutral_zone_interpretation": neutral_zone_interpretation,
+        "analysis_scope": "只可使用相對位置、突破或跌破、回踩、價量配合與高低點結構做中立分析；不得輸出第一大量區或第二大量區的實際價格、中心價、距離百分比，也不可直接視為買賣訊號",
     }
 
 
@@ -6711,14 +6736,11 @@ def _build_rule_based_pattern_point(ctx: dict) -> str:
     pattern = _build_price_volume_pattern_payload(ctx)
     if not pattern.get("available"):
         return ""
-    max_zone = pattern.get("maximum_volume_zone", {})
-    second_zone = pattern.get("second_largest_volume_zone", {})
-    max_center = str(max_zone.get("center_price", "-") or "-")
-    second_center = str(second_zone.get("center_price", "-") or "-")
     return (
-        f"型態面：最新收盤相對紅色最大量區約 {max_center} 與橘色第二大量區約 {second_center} 的位置為"
-        f"「{pattern.get('latest_position_relative_to_two_zones', '')}」，{pattern.get('recent_maximum_zone_pattern', '')}；"
-        f"{pattern.get('recent_swing_structure', '')}，且{pattern.get('weekly_price_volume_relationship', '')}。"
+        f"型態面：{pattern.get('latest_position_relative_to_two_zones', '')}，"
+        f"{pattern.get('recent_maximum_zone_pattern', '')}；{pattern.get('recent_swing_structure', '')}，"
+        f"且{pattern.get('weekly_price_volume_relationship', '')}。"
+        f"{pattern.get('neutral_zone_interpretation', '')}。"
     )
 
 
@@ -6938,9 +6960,11 @@ def _weekly_points_cover_required_pattern_analysis(points: List[str], ctx: dict)
         return True
     merged = "\n".join(str(p or "") for p in points)
     has_zone = any(k in merged for k in ["最大量區", "第一大量", "第二大量區", "價量累積", "大量區", "成本區"])
-    has_pattern_meaning = any(k in merged for k in ["突破", "跌破", "回踩", "站回", "支撐", "壓力", "整理", "量區上方", "量區下方", "量區內"])
+    has_pattern_meaning = any(k in merged for k in ["突破", "跌破", "回踩", "站回", "支撐", "壓力", "整理", "量區上方", "量區下方", "量區內", "兩個主要成交成本區之間", "兩個主要成交成本區之上", "兩個主要成交成本區之下"])
     has_price_volume = any(k in merged for k in ["價漲量增", "價漲量縮", "價跌量增", "價跌量縮", "放量", "量縮", "價量"])
-    return bool(has_zone and has_pattern_meaning and has_price_volume)
+    # 大量區只允許相對位置與型態判讀，不應出現「大量區約 4,xxx」或「量區價格 4,xxx」等明確價位。
+    explicit_zone_price = bool(re.search(r"(?:第一大量區|第二大量區|最大量區|大量區|成本區)[^。；，]{0,12}(?:約|為|落在|位於)?\s*[0-9][0-9,]*(?:\.[0-9]+)?", merged))
+    return bool(has_zone and has_pattern_meaning and has_price_volume and not explicit_zone_price)
 
 
 def _weekly_points_low_value_technical_reasons(points: List[str]) -> List[str]:
@@ -6987,12 +7011,12 @@ def _repair_weekly_points_with_required_branch(
 
 請輸出剛好 3 點繁體中文重點，並遵守：
 1. 其中剛好一點必須完整分析 required_representative_branch_analysis，必須同時寫出該分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並解讀其籌碼品質與操作時間尺度。
-2. 其中剛好一點必須分析 required_price_volume_pattern_analysis：使用紅色最大量區、橘色第二大量區、最新收盤相對位置、近期突破／跌破／回踩狀態與價量關係，說明目前型態屬支撐、壓力、整理或突破未站穩；不得只列量區價格。
+2. 其中剛好一點必須分析 required_price_volume_pattern_analysis：只使用第一大量區、第二大量區的相對位置、近期突破／跌破／回踩狀態、高低點結構與價量關係，統整成中立的型態重點。不得輸出兩個大量區的實際價格、中心價、距離百分比，也不得逐項抄寫欄位。
 3. 最後一點應比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或時間尺度差異。
 4. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。均線、KD、MACD只能作為型態佐證。
 5. 每一點都必須獨立完整，約 45～90 個中文字，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
 6. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
-7. 所有數字必須與 JSON 完全一致。
+7. 所有需要使用的數字必須與 JSON 完全一致；但價量型態那一點不得輸出第一大量區或第二大量區的明確價位，只能描述在其上方、下方、量區內或兩者之間。
 
 請只回傳 JSON：
 {{
@@ -7008,7 +7032,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v7_pattern_repair",
+        cache_task="weekly_keypoints_ai_analysis_v8_qualitative_pattern_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -7038,20 +7062,22 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 7. 個別分點只能從 required_representative_branch_analysis、representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這些資料內的分點不得點名、不得引用其歷史績效。
 8. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱；小額高勝率分點不得與主要大額分點對等比較。
 9. 若 price_volume_pattern.available 為 true，三點中必須有且只有一點進行價量型態分析：
-   - 紅色 maximum_volume_zone 是最大量區，橘色 second_largest_volume_zone 是第二大量區。
-   - 必須分析最新收盤相對兩個量區的位置、近期突破／跌破／回踩狀態、近期高低點結構與價量關係。
-   - 必須說明量區目前較接近支撐、壓力、成本整理區或突破尚未站穩，不得只列量區價格。
+   - 紅色 maximum_volume_zone 是第一大量區（最大量區），橘色 second_largest_volume_zone 是第二大量區。
+   - 只分析最新收盤位於兩個大量區之上、之下、量區內或兩者之間，以及近期突破／跌破／回踩、高低點結構與價量關係。
+   - 將上述資訊統整成一個中立的型態結論，例如支撐觀察、上方壓力、成本區整理或突破尚未站穩；不得逐項抄寫欄位。
+   - 嚴禁輸出第一大量區、第二大量區的實際價格、中心價、距離百分比或「約多少元」等明確價位。
 10. 第三點優先比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或不同資金時間尺度；不得與型態點重複同一結論。
 11. 禁止單純羅列 MA5、MA10、MA20、MA60 的價格；禁止只寫「搭配 KD／MACD 觀察」「需觀察動能是否延續」「判斷短中期趨勢」等可套用於任何股票的空泛句。
 12. 均線、KD、MACD只能用來佐證具體型態，例如確認突破、跌破、回踩或趨勢結構，不能單獨構成一點。每一點必須至少比較兩類資料並說明代表意義。
-13. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
-14. 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，但不可武斷寫成一定是隔日沖。
-15. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
-16. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
-17. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
-18. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
-19. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
-20. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
+13. 價量型態重點必須是統整後的中立分析，不可寫成「最大量區為多少、第二大量區為多少」的數值報告；大量區只描述相對位置與可能扮演的支撐、壓力或成本整理角色。
+14. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
+15. 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，但不可武斷寫成一定是隔日沖。
+16. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
+17. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
+18. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
+19. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
+20. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
+21. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
 
 輸出前請自行檢查：每個數字都必須能在 JSON 中找到；每一點都必須是資料之間的分析關係，而不是單純列數字。
 
@@ -7069,7 +7095,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v7_pattern",
+            cache_task="weekly_keypoints_ai_analysis_v8_qualitative_pattern",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
