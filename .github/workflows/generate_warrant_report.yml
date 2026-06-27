@@ -1,172 +1,184 @@
 name: Warrant Report Manual Test
 
 on:
-  workflow_dispatch:
-    inputs:
-      stock_codes:
-        description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
-        required: false
-        default: "2408"
-      refresh_news_summary:
-        description: "是否重新抓當日新聞並重新產生本週重點（0=使用當日快取，1=強制重跑）"
-        required: false
-        type: choice
-        options:
-          - "0"
-          - "1"
-        default: "0"
-      selected_branch_flow_mode:
-        description: "精選分點資金流模式（five=預設五分點，custom=自訂分點）"
-        required: false
-        type: choice
-        options:
-          - "five"
-          - "custom"
-        default: "five"
-      selected_branch_flow_branches:
-        description: "自訂精選分點，多個用逗號分隔，例如 新光,第一金"
-        required: false
-        default: ""
+workflow_dispatch:
+inputs:
+stock_codes:
+description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330"
+required: false
+default: "2408"
+report_mode:
+description: "週報輸出模式"
+required: false
+type: choice
+options:
+- "完整週報"
+- "精簡週報（不含本週重點與本週新聞）"
+default: "完整週報"
+refresh_news_summary:
+description: "是否重新抓當日新聞並重新產生本週重點（0=使用當日快取，1=強制重跑）"
+required: false
+type: choice
+options:
+- "0"
+- "1"
+default: "0"
+selected_branch_flow_mode:
+description: "精選分點資金流模式（five=預設五分點，custom=自訂分點）"
+required: false
+type: choice
+options:
+- "five"
+- "custom"
+default: "five"
+selected_branch_flow_branches:
+description: "自訂精選分點，多個用逗號分隔，例如 新光,第一金"
+required: false
+default: ""
 
 jobs:
-  run-warrant-report-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+run-warrant-report-test:
+runs-on: ubuntu-latest
+timeout-minutes: 60
 
-    env:
-      OUTPUT_DIR: output
-      STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
-      PYTHONUNBUFFERED: "1"
+```
+env:
+  OUTPUT_DIR: output
+  STOCK_CODES: ${{ inputs.stock_codes || '2408' }}
+  WARRANT_REPORT_MODE: ${{ inputs.report_mode || '完整週報' }}
+  PYTHONUNBUFFERED: "1"
 
-      # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
-      MPLBACKEND: Agg
+  # 讓 matplotlib 在 GitHub runner 無視窗環境也能產圖
+  MPLBACKEND: Agg
 
-      # Google Sheet 設定
-      WARRANT_GSHEET_ENABLE: "1"
-      GSHEET_NAME: "權證分點籌碼"
-      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+  # Google Sheet 設定
+  WARRANT_GSHEET_ENABLE: "1"
+  GSHEET_NAME: "權證分點籌碼"
+  GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      # 權證快取設定：直接寫入 Google Sheet，不依賴 GitHub runner 本機快取。
-      # 權證籌碼每次都重新抓 live，避免吃到舊快取。
-      WARRANT_GSHEET_CACHE_ENABLE: "1"
-      WARRANT_GSHEET_HISTORY_SHEET: "快取_分點歷史"
-      WARRANT_GSHEET_STATUS_SHEET: "快取_分點歷史_狀態"
-      WARRANT_ALWAYS_REFRESH_WARRANT_FLOW: "1"
-      WARRANT_CACHE_FORCE_REFRESH: "1"
-      WARRANT_LOCAL_CACHE_ENABLE: "0"
+  # 權證快取設定：直接寫入 Google Sheet，不依賴 GitHub runner 本機快取。
+  # 權證籌碼每次都重新抓 live，避免吃到舊快取。
+  WARRANT_GSHEET_CACHE_ENABLE: "1"
+  WARRANT_GSHEET_HISTORY_SHEET: "快取_分點歷史"
+  WARRANT_GSHEET_STATUS_SHEET: "快取_分點歷史_狀態"
+  WARRANT_ALWAYS_REFRESH_WARRANT_FLOW: "1"
+  WARRANT_CACHE_FORCE_REFRESH: "1"
+  WARRANT_LOCAL_CACHE_ENABLE: "0"
 
-      # FinMind 設定：三大法人資料來源
-      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+  # FinMind 設定：三大法人資料來源
+  FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
 
-      # Gemini / LLM 新聞與本週重點摘要設定
-      # refresh_news_summary=0：程式會先檢查 Google Sheet 當日快取；若當天已有快取，直接使用快取，不會重打 Gemini API。
-      # refresh_news_summary=1：略過當日快取，重新抓新聞並重新產生本週重點，完成後會覆蓋寫回 Google Sheet 快取。
-      WARRANT_GEMINI_ENABLE: "1"
-      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
-      WARRANT_LLM_CACHE_ENABLE: ${{ inputs.refresh_news_summary == '1' && '0' || '1' }}
-      WARRANT_LLM_CACHE_DIR: llm_cache
-      WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
-      WARRANT_GSHEET_LLM_CACHE_SHEET: "快取_Gemini結果"
-      WARRANT_LLM_CACHE_FORCE_REFRESH: ${{ inputs.refresh_news_summary }}
+  # Gemini / LLM 新聞與本週重點摘要設定
+  # refresh_news_summary=0：程式會先檢查 Google Sheet 當日快取；若當天已有快取，直接使用快取，不會重打 Gemini API。
+  # refresh_news_summary=1：略過當日快取，重新抓新聞並重新產生本週重點，完成後會覆蓋寫回 Google Sheet 快取。
+  WARRANT_GEMINI_ENABLE: "1"
+  WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
+  WARRANT_LLM_CACHE_ENABLE: ${{ inputs.refresh_news_summary == '1' && '0' || '1' }}
+  WARRANT_LLM_CACHE_DIR: llm_cache
+  WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
+  WARRANT_GSHEET_LLM_CACHE_SHEET: "快取_Gemini結果"
+  WARRANT_LLM_CACHE_FORCE_REFRESH: ${{ inputs.refresh_news_summary }}
 
-      # Gemini API Key 與備用 Key：
-      # 第一組失敗、限流或 quota 滿時，程式會自動改用第 2、3 組。
-      WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
-      WARRANTS_API_KEY_2: ${{ secrets.WARRANTS_API_KEY_2 }}
-      WARRANTS_API_KEY_3: ${{ secrets.WARRANTS_API_KEY_3 }}
-      GEMINI_MODEL: gemini-3.1-flash-lite
+  # Gemini API Key 與備用 Key：
+  # 第一組失敗、限流或 quota 滿時，程式會自動改用第 2、3 組。
+  WARRANTS_API_KEY: ${{ secrets.WARRANTS_API_KEY }}
+  WARRANTS_API_KEY_2: ${{ secrets.WARRANTS_API_KEY_2 }}
+  WARRANTS_API_KEY_3: ${{ secrets.WARRANTS_API_KEY_3 }}
+  GEMINI_MODEL: gemini-3.1-flash-lite
 
-      # 新聞抓取開關：
-      # 預設開啟；是否使用快取或強制重抓，由 refresh_news_summary 控制。
-      # 為避免熱門股新聞過多導致執行時間過長，Discord 查詢版限制新聞抓取量。
-      WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_GOOGLE_MAX_ITEMS: "8"
-      WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "3"
+  # 新聞抓取開關：
+  # 預設開啟；是否使用快取或強制重抓，由 refresh_news_summary 控制。
+  # 為避免熱門股新聞過多導致執行時間過長，Discord 查詢版限制新聞抓取量。
+  WARRANT_NEWS_ENABLE: "1"
+  WARRANT_NEWS_GOOGLE_MAX_ITEMS: "8"
+  WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "3"
 
-      # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
-      # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
-      WARRANT_API_RETRY_TIMES: "5"
-      WARRANT_API_RETRY_BASE_WAIT: "1.5"
-      WARRANT_API_REQUIRE_FULL_SUCCESS: "1"
-      WARRANT_API_ALLOW_TINY_FAILURE: "1"
-      WARRANT_API_FAILURE_ABORT_RATIO: "0.03"
-      WARRANT_API_FAILURE_ABORT_ABS_COUNT: "6"
-      WARRANT_API_EMPTY_AS_FAILURE: "0"
+  # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
+  # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
+  WARRANT_API_RETRY_TIMES: "5"
+  WARRANT_API_RETRY_BASE_WAIT: "1.5"
+  WARRANT_API_REQUIRE_FULL_SUCCESS: "1"
+  WARRANT_API_ALLOW_TINY_FAILURE: "1"
+  WARRANT_API_FAILURE_ABORT_RATIO: "0.03"
+  WARRANT_API_FAILURE_ABORT_ABS_COUNT: "6"
+  WARRANT_API_EMPTY_AS_FAILURE: "0"
 
-      # 權證分點報告設定
-      WARRANT_EVENT_MIN_AMOUNT: "0"
-      WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
-      WARRANT_REPORT_MAX_ROWS: "8"
+  # 權證分點報告設定
+  WARRANT_EVENT_MIN_AMOUNT: "0"
+  WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
+  WARRANT_REPORT_MAX_ROWS: "8"
 
-      # 精選分點資金流設定
-      # five = 預設五分點；custom = 使用 selected_branch_flow_branches
-      WARRANT_SELECTED_BRANCH_FLOW_ENABLE: "1"
-      WARRANT_SELECTED_BRANCH_FLOW_MODE: ${{ inputs.selected_branch_flow_mode || 'five' }}
-      WARRANT_SELECTED_BRANCH_FLOW_BRANCHES: ${{ inputs.selected_branch_flow_branches || '五分點' }}
+  # 精選分點資金流設定
+  # five = 預設五分點；custom = 使用 selected_branch_flow_branches
+  WARRANT_SELECTED_BRANCH_FLOW_ENABLE: "1"
+  WARRANT_SELECTED_BRANCH_FLOW_MODE: ${{ inputs.selected_branch_flow_mode || 'five' }}
+  WARRANT_SELECTED_BRANCH_FLOW_BRANCHES: ${{ inputs.selected_branch_flow_branches || '五分點' }}
 
-      # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
-      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+  # 可選：若你想順便推到 Discord 測試頻道，就設定這個 Secret
+  DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Restore LLM cache
-        uses: actions/cache@v4
-        with:
-          path: llm_cache
-          key: warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-${{ github.run_id }}
-          restore-keys: |
-            warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-
-            warrant-report-llm-cache-${{ runner.os }}-
+  - name: Restore LLM cache
+    uses: actions/cache@v4
+    with:
+      path: llm_cache
+      key: warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-${{ github.run_id }}
+      restore-keys: |
+        warrant-report-llm-cache-${{ runner.os }}-${{ inputs.stock_codes }}-
+        warrant-report-llm-cache-${{ runner.os }}-
 
-      - name: Prepare output and cache folders
-        run: |
-          mkdir -p output llm_cache
+  - name: Prepare output and cache folders
+    run: |
+      mkdir -p output llm_cache
 
-      - name: Install system fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
+  - name: Install system fonts
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y fonts-noto-cjk
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
+      cache: "pip"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2 beautifulsoup4 lxml google-genai googlenewsdecoder
+  - name: Install Python dependencies
+    run: |
+      python -m pip install --upgrade pip
+      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      pip install pandas requests matplotlib numpy yfinance gspread oauth2client google-auth google-auth-oauthlib google-auth-httplib2 beautifulsoup4 lxml google-genai googlenewsdecoder
 
-      - name: Check FinMind token
-        run: |
-          python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
+  - name: Check FinMind token
+    run: |
+      python -c "import os; print('FINMIND_API_TOKEN =', 'SET' if os.getenv('FINMIND_API_TOKEN') else 'EMPTY')"
 
-      - name: Check Gemini and cache setting
-        run: |
-          python -c "import os; print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_NEWS_GOOGLE_MAX_ITEMS =', os.getenv('WARRANT_NEWS_GOOGLE_MAX_ITEMS')); print('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER =', os.getenv('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_ENABLE =', os.getenv('WARRANT_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANT_SELECTED_BRANCH_FLOW_ENABLE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_ENABLE')); print('WARRANT_SELECTED_BRANCH_FLOW_MODE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_MODE')); print('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
+  - name: Check Gemini and cache setting
+    run: |
+      python -c "import os; print('WARRANT_REPORT_MODE =', os.getenv('WARRANT_REPORT_MODE')); print('WARRANT_GEMINI_ENABLE =', os.getenv('WARRANT_GEMINI_ENABLE')); print('WARRANT_NEWS_ENABLE =', os.getenv('WARRANT_NEWS_ENABLE')); print('WARRANT_NEWS_GOOGLE_MAX_ITEMS =', os.getenv('WARRANT_NEWS_GOOGLE_MAX_ITEMS')); print('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER =', os.getenv('WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER')); print('WARRANT_GSHEET_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_CACHE_ENABLE')); print('WARRANT_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_CACHE_FORCE_REFRESH')); print('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW =', os.getenv('WARRANT_ALWAYS_REFRESH_WARRANT_FLOW')); print('WARRANT_GSHEET_LLM_CACHE_ENABLE =', os.getenv('WARRANT_GSHEET_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_ENABLE =', os.getenv('WARRANT_LLM_CACHE_ENABLE')); print('WARRANT_LLM_CACHE_FORCE_REFRESH =', os.getenv('WARRANT_LLM_CACHE_FORCE_REFRESH')); print('WARRANT_API_REQUIRE_FULL_SUCCESS =', os.getenv('WARRANT_API_REQUIRE_FULL_SUCCESS')); print('WARRANT_SELECTED_BRANCH_FLOW_ENABLE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_ENABLE')); print('WARRANT_SELECTED_BRANCH_FLOW_MODE =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_MODE')); print('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES =', os.getenv('WARRANT_SELECTED_BRANCH_FLOW_BRANCHES')); print('WARRANTS_API_KEY =', 'SET' if os.getenv('WARRANTS_API_KEY') else 'EMPTY'); print('WARRANTS_API_KEY_2 =', 'SET' if os.getenv('WARRANTS_API_KEY_2') else 'EMPTY'); print('WARRANTS_API_KEY_3 =', 'SET' if os.getenv('WARRANTS_API_KEY_3') else 'EMPTY')"
 
-      - name: Run warrant report test
-        run: |
-          echo "========== 開始執行 run_report.py =========="
-          echo "STOCK_CODES=$STOCK_CODES"
-          echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
-          echo "WARRANT_ALWAYS_REFRESH_WARRANT_FLOW=$WARRANT_ALWAYS_REFRESH_WARRANT_FLOW"
-          echo "WARRANT_CACHE_FORCE_REFRESH=$WARRANT_CACHE_FORCE_REFRESH"
-          echo "WARRANT_NEWS_GOOGLE_MAX_ITEMS=$WARRANT_NEWS_GOOGLE_MAX_ITEMS"
-          echo "WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER=$WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER"
-          echo "WARRANT_SELECTED_BRANCH_FLOW_ENABLE=$WARRANT_SELECTED_BRANCH_FLOW_ENABLE"
-          echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
-          echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
-          python -u run_report.py
+  - name: Run warrant report test
+    run: |
+      echo "========== 開始執行 run_report.py =========="
+      echo "STOCK_CODES=$STOCK_CODES"
+      echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
+      echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
+      echo "WARRANT_ALWAYS_REFRESH_WARRANT_FLOW=$WARRANT_ALWAYS_REFRESH_WARRANT_FLOW"
+      echo "WARRANT_CACHE_FORCE_REFRESH=$WARRANT_CACHE_FORCE_REFRESH"
+      echo "WARRANT_NEWS_GOOGLE_MAX_ITEMS=$WARRANT_NEWS_GOOGLE_MAX_ITEMS"
+      echo "WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER=$WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER"
+      echo "WARRANT_SELECTED_BRANCH_FLOW_ENABLE=$WARRANT_SELECTED_BRANCH_FLOW_ENABLE"
+      echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
+      echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
+      python -u run_report.py
 
-      - name: Upload report artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: warrant-report-test-output
-          path: output/*.png
-          if-no-files-found: warn
+  - name: Upload report artifact
+    uses: actions/upload-artifact@v4
+    if: always()
+    with:
+      name: warrant-report-test-output
+      path: output/*.png
+      if-no-files-found: warn
+
