@@ -19,7 +19,7 @@ D：同一分點 + 同一標的，近10個交易日累積淨買進金額 >= 100�
 8. 券商查詢
 9. 快取_TOP15共識淨買超
 10. 快取_TOP15部位明細
-11. 快取_近7日權證分點共識TOP15（僅 RUN_MODE=2 全市場分點模式更新）
+11. 快取_近7日權證分點共識TOP15（近7／14／21日精選13分點排名；僅 RUN_MODE=2 更新）
 12. 快取_近10日分點買賣明細（僅 RUN_MODE=2 全市場分點模式更新）
 13. 顏色說明
 
@@ -126,13 +126,32 @@ TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").stri
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
 
-# 近 7 日「所有追蹤分點」權證共識買賣超 TOP15：
-# 這張工作表只會在 RUN_MODE=2 完整分點清單模式建立 / 更新。
+# 近 7／14／21 日「指定精選分點」權證共識買賣超 TOP15：
+# 這張工作表只會在 RUN_MODE=2 完整分點清單模式建立 / 更新，
+# 但實際排名只統計 WARRANT_CONSENSUS_SELECTED_BROKERS_DEFAULT 指定的 13 個精選分點。
 # RUN_MODE=1 精選分點模式不會建立這張 sheet，因此同步到 Google Sheet 時也不會動到既有工作表。
 WARRANT_CONSENSUS_7D_ENABLED = os.getenv("WARRANT_CONSENSUS_7D_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 WARRANT_CONSENSUS_7D_SHEET = os.getenv("WARRANT_CONSENSUS_7D_SHEET", "快取_近7日權證分點共識TOP15")
 WARRANT_CONSENSUS_7D_DAYS = int(os.getenv("WARRANT_CONSENSUS_7D_DAYS", "7"))
+WARRANT_CONSENSUS_14D_DAYS = int(os.getenv("WARRANT_CONSENSUS_14D_DAYS", "14"))
+WARRANT_CONSENSUS_21D_DAYS = int(os.getenv("WARRANT_CONSENSUS_21D_DAYS", "21"))
 WARRANT_CONSENSUS_7D_TOP_N = int(os.getenv("WARRANT_CONSENSUS_7D_TOP_N", "15"))
+WARRANT_CONSENSUS_SELECTED_BROKERS_DEFAULT = [
+    "元大南屯",
+    "華南永昌台中",
+    "新光",
+    "統一三多",
+    "永豐金竹科",
+    "福邦證券",
+    "群益金鼎新竹",
+    "凱基士林",
+    "元大內湖民權",
+    "群益金鼎古亭",
+    "兆豐板橋",
+    "富邦敦南",
+    "永豐金內湖",
+]
+WARRANT_CONSENSUS_SELECTED_BROKERS_ENV = os.getenv("WARRANT_CONSENSUS_SELECTED_BROKERS", "").strip()
 
 # 近 10 日「單一分點 + 標的股」買賣明細快取：
 # 這張工作表只會在 RUN_MODE=2 完整分點清單模式建立 / 更新。
@@ -3859,12 +3878,12 @@ GSHEET_RESULT_UPSERT_TITLES = {
     "近兩月分點數排行",
     TOP15_POSITION_DETAIL_SHEET,
     TOP15_CONSENSUS_SHEET,
-    WARRANT_CONSENSUS_7D_SHEET,
     BROKER_10D_DETAIL_SHEET,
     BROKER_10D_WINRATE_RANK_SHEET,
 }
 
 GSHEET_RESULT_OVERWRITE_TITLES = {
+    WARRANT_CONSENSUS_7D_SHEET,
     "券商查詢",
     "券商查詢資料",
     "價格抓取狀態",
@@ -4009,8 +4028,8 @@ def _sheet_upsert_key_columns(title, headers):
         return keep(["資料範圍", "統計日期", "分點", "券商代號", "標的股", "權證代號", "事件", "事件日", "買進日"])
 
     if title == WARRANT_CONSENSUS_7D_SHEET:
-        # 近7日共識已改為「標的層級」先合併再排名，key 不再包含單一權證代號。
-        return keep(["資料範圍", "統計日期", "排名類型", "標的股"])
+        # 近7／14／21日共識皆為「標的層級」排名；統計天數必須納入 key，避免三個期間互相覆蓋。
+        return keep(["資料範圍", "統計日期", "統計天數", "排名類型", "標的股"])
 
     if title == BROKER_10D_DETAIL_SHEET:
         return keep(["資料範圍", "統計日期", "分點", "券商代號", "標的股"])
@@ -12964,7 +12983,7 @@ def write_10d_broker_winrate_rank_sheet(wb, rows):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 近 7 日權證分點共識買賣超 TOP15（僅 RUN_MODE=2 更新）
+# 近 7／14／21 日精選分點權證共識買賣超 TOP15（僅 RUN_MODE=2 更新）
 # ══════════════════════════════════════════════════════════════════════
 
 def _fmt_wan_text(value):
@@ -12974,30 +12993,61 @@ def _fmt_wan_text(value):
         return "0.0萬"
 
 
+def parse_warrant_consensus_selected_brokers():
+    """取得近 7／14／21 日共識排名專用的精選分點清單。"""
+    if WARRANT_CONSENSUS_SELECTED_BROKERS_ENV:
+        labels = [
+            x.strip()
+            for x in re.split(r"[,;；、\n\r\t]+", WARRANT_CONSENSUS_SELECTED_BROKERS_ENV)
+            if x.strip()
+        ]
+    else:
+        labels = list(WARRANT_CONSENSUS_SELECTED_BROKERS_DEFAULT)
+
+    out = []
+    for label in labels:
+        if label in FULL_TARGET_PATTERNS and label not in out:
+            out.append(label)
+
+    return out
+
+
 def build_7d_warrant_consensus_top15_rows(items, target_date=None):
     """
     建立「快取_近7日權證分點共識TOP15」。
 
     重要規則：
-    1. 只在 RUN_MODE=2 完整分點清單模式執行。
-    2. RUN_MODE=1 精選分點模式直接回傳 None，build_excel 不會建立該工作表，
-       因此 upload_excel_to_google_sheet() 也不會更新 / 清空 Google Sheet 上原本的同名工作表。
-    3. 統計來源為本次已抓到並還原的 items 分點歷史資料。
-    4. 主程式先用「標的股」層級完整合併同標的全部權證，再排序取 TOP15。
+    1. 只在 RUN_MODE=2 完整分點清單模式執行，確保 13 個指定分點的歷史資料都有被更新。
+    2. 實際排名只統計 parse_warrant_consensus_selected_brokers() 回傳的精選分點。
+    3. 同一張工作表依序放入近 7 日、近 14 日、近 21 日三組排名資料。
+    4. 各期間都以「標的股」層級完整合併同標的全部權證，再各自排序取 TOP15。
     5. 共識買超 TOP15：買進金額 - 賣出金額 > 0，依淨買超金額排序。
     6. 共識賣超 TOP15：賣出金額 - 買進金額 > 0，依淨賣超金額排序。
+    7. 近 7／14／21 日沿用原本邏輯，皆以日曆日區間計算。
     """
     if not WARRANT_CONSENSUS_7D_ENABLED:
         return None
 
     if RUN_MODE != 2:
-        print("  ✅ RUN_MODE=1 精選分點模式：略過近7日權證分點共識TOP15工作表，避免動到 Google Sheet 既有資料。")
+        print("  ✅ RUN_MODE=1 精選分點模式：略過近7／14／21日精選分點共識TOP15工作表，避免動到 Google Sheet 既有資料。")
         return None
 
-    print("【Step 4c】建立近7日權證分點共識買賣超 TOP15（標的層級，RUN_MODE=2 專用）...")
+    selected_brokers = parse_warrant_consensus_selected_brokers()
+    selected_broker_set = set(selected_brokers)
+    selected_broker_codes = {
+        str(FULL_FALLBACK[label][1]).strip().lower()
+        for label in selected_brokers
+        if label in FULL_FALLBACK
+    }
+
+    print(
+        "【Step 4c】建立近7／14／21日精選分點共識買賣超 TOP15"
+        f"（標的層級，共 {len(selected_brokers)} 個分點）..."
+    )
+    print(f"  ✅ 統計分點：{', '.join(selected_brokers)}")
 
     if not items:
-        print("  ⚠️ 近7日權證分點共識TOP15：沒有 items 資料")
+        print("  ⚠️ 近7／14／21日精選分點共識TOP15：沒有 items 資料")
         return []
 
     target_date = normalize_top15_target_date(target_date)
@@ -13007,341 +13057,368 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
         target_dt = datetime.today()
         target_date = target_dt.strftime("%Y/%m/%d")
 
-    window_days = max(int(WARRANT_CONSENSUS_7D_DAYS), 1)
+    window_days_list = []
+    for days in [
+        WARRANT_CONSENSUS_7D_DAYS,
+        WARRANT_CONSENSUS_14D_DAYS,
+        WARRANT_CONSENSUS_21D_DAYS,
+    ]:
+        days = max(int(days), 1)
+        if days not in window_days_list:
+            window_days_list.append(days)
+
     top_n = max(int(WARRANT_CONSENSUS_7D_TOP_N), 1)
-    start_dt = target_dt - timedelta(days=window_days - 1)
-    start_date = start_dt.strftime("%Y/%m/%d")
-    period_text = f"{start_date} ～ {target_date}"
     update_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    scope = get_result_data_scope()
+    scope = f"精選{len(selected_brokers)}分點"
 
-    # 核心修正：group_key = 標的股。
-    # 同標的底下所有權證、所有追蹤分點先完整加總，再做 TOP15 排名。
-    agg = {}
+    def build_rows_for_window(window_days):
+        start_dt = target_dt - timedelta(days=window_days - 1)
+        start_date = start_dt.strftime("%Y/%m/%d")
+        period_text = f"{start_date} ～ {target_date}"
 
-    for item in items:
-        df = item.get("df", pd.DataFrame())
+        # group_key = 標的股。
+        # 同標的底下所有權證、所有指定精選分點先完整加總，再做 TOP15 排名。
+        agg = {}
 
-        if df is None or df.empty:
-            continue
+        for item in items:
+            broker_label = str(item.get("broker_label", "")).strip()
+            broker_code = str(item.get("broker_code", "")).strip()
+            broker_code_key = broker_code.lower()
 
-        warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-        if not warrant_code:
-            continue
-
-        warrant_name = str(item.get("warrant_name", "")).strip()
-        raw_underlying_code = str(item.get("underlying_code", "")).strip()
-        underlying_name = str(item.get("underlying_name", "")).strip()
-        underlying_code = normalize_underlying_code_for_group(raw_underlying_code, underlying_name or warrant_name)
-        broker_label = str(item.get("broker_label", "")).strip()
-        broker_name = str(item.get("broker_name", "")).strip()
-        broker_code = str(item.get("broker_code", "")).strip()
-
-        if not underlying_code:
-            continue
-
-        rec = agg.setdefault(underlying_code, {
-            "標的股": underlying_code,
-            "標的名稱": underlying_name,
-            "買進金額": 0.0,
-            "賣出金額": 0.0,
-            "買進股數": 0.0,
-            "賣出股數": 0.0,
-            "分點": {},
-            "權證": {},
-            "日期集合": set(),
-        })
-
-        if underlying_name and not rec.get("標的名稱"):
-            rec["標的名稱"] = underlying_name
-
-        warrant_rec = rec["權證"].setdefault(warrant_code, {
-            "權證代號": warrant_code,
-            "權證名稱": warrant_name,
-            "買進金額": 0.0,
-            "賣出金額": 0.0,
-            "買進股數": 0.0,
-            "賣出股數": 0.0,
-            "日期集合": set(),
-        })
-        if warrant_name and not warrant_rec.get("權證名稱"):
-            warrant_rec["權證名稱"] = warrant_name
-
-        broker_key = (broker_label, broker_name, broker_code)
-        broker_rec = rec["分點"].setdefault(broker_key, {
-            "分點": broker_label,
-            "分點名稱": broker_name,
-            "券商代號": broker_code,
-            "買進金額": 0.0,
-            "賣出金額": 0.0,
-            "買進股數": 0.0,
-            "賣出股數": 0.0,
-            "權證": {},
-            "日期集合": set(),
-        })
-        broker_warrant_rec = broker_rec["權證"].setdefault(warrant_code, {
-            "權證代號": warrant_code,
-            "權證名稱": warrant_name,
-            "買進金額": 0.0,
-            "賣出金額": 0.0,
-            "買進股數": 0.0,
-            "賣出股數": 0.0,
-            "日期集合": set(),
-        })
-
-        for row in df.itertuples(index=False):
-            row_dict = row._asdict()
-            date_str = normalize_date_str(row_dict.get("日期", ""))
-            dt = parse_date(date_str)
-
-            if not dt or dt < start_dt or dt > target_dt:
+            if broker_label not in selected_broker_set and broker_code_key not in selected_broker_codes:
                 continue
 
-            buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
-            sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
-            buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
-            sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+            df = item.get("df", pd.DataFrame())
 
-            if buy_amount <= 0 and sell_amount <= 0 and buy_qty <= 0 and sell_qty <= 0:
+            if df is None or df.empty:
                 continue
 
-            rec["日期集合"].add(date_str)
-            rec["買進金額"] += buy_amount
-            rec["賣出金額"] += sell_amount
-            rec["買進股數"] += buy_qty
-            rec["賣出股數"] += sell_qty
-
-            warrant_rec["日期集合"].add(date_str)
-            warrant_rec["買進金額"] += buy_amount
-            warrant_rec["賣出金額"] += sell_amount
-            warrant_rec["買進股數"] += buy_qty
-            warrant_rec["賣出股數"] += sell_qty
-
-            broker_rec["日期集合"].add(date_str)
-            broker_rec["買進金額"] += buy_amount
-            broker_rec["賣出金額"] += sell_amount
-            broker_rec["買進股數"] += buy_qty
-            broker_rec["賣出股數"] += sell_qty
-
-            broker_warrant_rec["日期集合"].add(date_str)
-            broker_warrant_rec["買進金額"] += buy_amount
-            broker_warrant_rec["賣出金額"] += sell_amount
-            broker_warrant_rec["買進股數"] += buy_qty
-            broker_warrant_rec["賣出股數"] += sell_qty
-
-    records = []
-
-    for rec in agg.values():
-        buy_amount = float(rec.get("買進金額", 0) or 0)
-        sell_amount = float(rec.get("賣出金額", 0) or 0)
-        buy_qty = float(rec.get("買進股數", 0) or 0)
-        sell_qty = float(rec.get("賣出股數", 0) or 0)
-        net_buy = buy_amount - sell_amount
-        net_sell = sell_amount - buy_amount
-
-        if buy_amount <= 0 and sell_amount <= 0:
-            continue
-
-        records.append({
-            **rec,
-            "買進金額": buy_amount,
-            "賣出金額": sell_amount,
-            "買進股數": buy_qty,
-            "賣出股數": sell_qty,
-            "淨買超金額": net_buy,
-            "淨賣超金額": net_sell,
-        })
-
-    # 最後再做一次標的層級保護性合併。
-    # 若舊快取或資料來源仍出現 2408 / '2408 / 2408.0 這種不同寫法，
-    # 這裡會再收斂成同一檔標的，確保排序前同標的只剩一筆。
-    merged_records = {}
-    for rec in records:
-        key = normalize_underlying_code_for_group(rec.get("標的股", ""), rec.get("標的名稱", ""))
-        if not key:
-            continue
-
-        if key not in merged_records:
-            rec["標的股"] = key
-            merged_records[key] = rec
-            continue
-
-        dst = merged_records[key]
-        for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "淨買超金額", "淨賣超金額"]:
-            dst[numeric_col] = float(dst.get(numeric_col, 0) or 0) + float(rec.get(numeric_col, 0) or 0)
-
-        if not dst.get("標的名稱") and rec.get("標的名稱"):
-            dst["標的名稱"] = rec.get("標的名稱")
-
-        dst.setdefault("日期集合", set()).update(rec.get("日期集合", set()))
-
-        for warrant_code, warrant_rec in rec.get("權證", {}).items():
-            if warrant_code in dst.get("權證", {}):
-                dw = dst["權證"][warrant_code]
-                for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
-                    dw[numeric_col] = float(dw.get(numeric_col, 0) or 0) + float(warrant_rec.get(numeric_col, 0) or 0)
-                dw.setdefault("日期集合", set()).update(warrant_rec.get("日期集合", set()))
-            else:
-                dst.setdefault("權證", {})[warrant_code] = warrant_rec
-
-        for broker_key, broker_rec in rec.get("分點", {}).items():
-            if broker_key not in dst.get("分點", {}):
-                dst.setdefault("分點", {})[broker_key] = broker_rec
+            warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
+            if not warrant_code:
                 continue
-            db = dst["分點"][broker_key]
-            for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
-                db[numeric_col] = float(db.get(numeric_col, 0) or 0) + float(broker_rec.get(numeric_col, 0) or 0)
-            db.setdefault("日期集合", set()).update(broker_rec.get("日期集合", set()))
-            for warrant_code, bw in broker_rec.get("權證", {}).items():
-                if warrant_code in db.get("權證", {}):
-                    dbw = db["權證"][warrant_code]
-                    for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
-                        dbw[numeric_col] = float(dbw.get(numeric_col, 0) or 0) + float(bw.get(numeric_col, 0) or 0)
-                    dbw.setdefault("日期集合", set()).update(bw.get("日期集合", set()))
-                else:
-                    db.setdefault("權證", {})[warrant_code] = bw
 
-    records = list(merged_records.values())
+            warrant_name = str(item.get("warrant_name", "")).strip()
+            raw_underlying_code = str(item.get("underlying_code", "")).strip()
+            underlying_name = str(item.get("underlying_name", "")).strip()
+            underlying_code = normalize_underlying_code_for_group(raw_underlying_code, underlying_name or warrant_name)
+            broker_name = str(item.get("broker_name", "")).strip()
 
-    buy_top = [r for r in records if float(r.get("淨買超金額", 0) or 0) > 0]
-    sell_top = [r for r in records if float(r.get("淨賣超金額", 0) or 0) > 0]
+            if not underlying_code:
+                continue
 
-    buy_top = sorted(
-        buy_top,
-        key=lambda r: (float(r.get("淨買超金額", 0) or 0), float(r.get("買進金額", 0) or 0)),
-        reverse=True,
-    )[:top_n]
-    sell_top = sorted(
-        sell_top,
-        key=lambda r: (float(r.get("淨賣超金額", 0) or 0), float(r.get("賣出金額", 0) or 0)),
-        reverse=True,
-    )[:top_n]
-
-    def make_rank_rows(rank_type, records_for_rank):
-        rows = []
-        is_buy = rank_type == "共識買超"
-
-        for rank, rec in enumerate(records_for_rank, 1):
-            broker_rows = []
-            broker_json = []
-            same_direction_count = 0
-            opposite_direction_count = 0
-
-            for broker_rec in sorted(
-                rec["分點"].values(),
-                key=lambda x: (
-                    (float(x.get("買進金額", 0) or 0) - float(x.get("賣出金額", 0) or 0))
-                    if is_buy else
-                    (float(x.get("賣出金額", 0) or 0) - float(x.get("買進金額", 0) or 0))
-                ),
-                reverse=True,
-            ):
-                b_buy = float(broker_rec.get("買進金額", 0) or 0)
-                b_sell = float(broker_rec.get("賣出金額", 0) or 0)
-                b_net_buy = b_buy - b_sell
-                b_net_sell = b_sell - b_buy
-                direction_amount = b_net_buy if is_buy else b_net_sell
-
-                if direction_amount > 0:
-                    same_direction_count += 1
-                    broker_rows.append(f"{broker_rec['分點']} {_fmt_wan_text(direction_amount)}")
-                elif direction_amount < 0:
-                    opposite_direction_count += 1
-
-                broker_warrants = []
-                for bw in sorted(
-                    broker_rec.get("權證", {}).values(),
-                    key=lambda x: (float(x.get("買進金額", 0) or 0) + float(x.get("賣出金額", 0) or 0)),
-                    reverse=True,
-                ):
-                    broker_warrants.append({
-                        "權證代號": bw.get("權證代號", ""),
-                        "權證名稱": bw.get("權證名稱", ""),
-                        "買進金額": round(float(bw.get("買進金額", 0) or 0), 0),
-                        "賣出金額": round(float(bw.get("賣出金額", 0) or 0), 0),
-                        "買進股數": round(float(bw.get("買進股數", 0) or 0), 0),
-                        "賣出股數": round(float(bw.get("賣出股數", 0) or 0), 0),
-                        "日期數": len(bw.get("日期集合", set())),
-                    })
-
-                broker_json.append({
-                    "分點": broker_rec["分點"],
-                    "分點名稱": broker_rec["分點名稱"],
-                    "券商代號": broker_rec["券商代號"],
-                    "買進金額": round(b_buy, 0),
-                    "賣出金額": round(b_sell, 0),
-                    "淨買超金額": round(b_net_buy, 0),
-                    "淨賣超金額": round(b_net_sell, 0),
-                    "權證檔數": len(broker_rec.get("權證", {})),
-                    "日期數": len(broker_rec.get("日期集合", set())),
-                    "權證明細": broker_warrants,
-                })
-
-            rank_amount = float(rec.get("淨買超金額", 0) or 0) if is_buy else float(rec.get("淨賣超金額", 0) or 0)
-            dates = sorted(rec.get("日期集合", set()))
-            warrant_values = sorted(
-                rec.get("權證", {}).values(),
-                key=lambda x: (float(x.get("買進金額", 0) or 0) + float(x.get("賣出金額", 0) or 0)),
-                reverse=True,
-            )
-            warrant_list = "；".join([
-                f"{w.get('權證代號', '')} {w.get('權證名稱', '')}"
-                f"｜買{_fmt_wan_text(w.get('買進金額', 0))}／賣{_fmt_wan_text(w.get('賣出金額', 0))}"
-                for w in warrant_values
-            ])
-            top_warrant = warrant_values[0] if warrant_values else {}
-
-            rows.append({
-                "資料範圍": scope,
-                "統計日期": target_date,
-                "統計期間": period_text,
-                "統計天數": window_days,
-                "有效日期數": len(dates),
-                "第一筆日期": dates[0] if dates else "",
-                "最後筆日期": dates[-1] if dates else "",
-                "排名類型": rank_type,
-                "排名": rank,
-                # 保留舊欄位，避免圖片端或舊公式依欄名讀取時壞掉；但實際排名已是標的層級。
-                "權證代號": top_warrant.get("權證代號", ""),
-                "權證名稱": top_warrant.get("權證名稱", "同標的合計"),
-                "標的股": rec.get("標的股", ""),
-                "標的名稱": rec.get("標的名稱", ""),
-                "權證檔數": len(rec.get("權證", {})),
-                "權證清單": warrant_list,
-                "排名金額": round(rank_amount, 0),
-                "買進金額": round(float(rec.get("買進金額", 0) or 0), 0),
-                "賣出金額": round(float(rec.get("賣出金額", 0) or 0), 0),
-                "淨買超金額": round(float(rec.get("淨買超金額", 0) or 0), 0),
-                "淨賣超金額": round(float(rec.get("淨賣超金額", 0) or 0), 0),
-                "買進股數": round(float(rec.get("買進股數", 0) or 0), 0),
-                "賣出股數": round(float(rec.get("賣出股數", 0) or 0), 0),
-                "參與分點數": len(rec.get("分點", {})),
-                "同向分點數": same_direction_count,
-                "反向分點數": opposite_direction_count,
-                "主要同向分點": "；".join(broker_rows[:8]),
-                "完成狀態": "DONE",
-                "更新時間": update_time,
-                "run_id": run_id,
-                "分點明細_JSON": json.dumps(broker_json, ensure_ascii=False),
+            rec = agg.setdefault(underlying_code, {
+                "標的股": underlying_code,
+                "標的名稱": underlying_name,
+                "買進金額": 0.0,
+                "賣出金額": 0.0,
+                "買進股數": 0.0,
+                "賣出股數": 0.0,
+                "分點": {},
+                "權證": {},
+                "日期集合": set(),
             })
 
+            if underlying_name and not rec.get("標的名稱"):
+                rec["標的名稱"] = underlying_name
+
+            warrant_rec = rec["權證"].setdefault(warrant_code, {
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "買進金額": 0.0,
+                "賣出金額": 0.0,
+                "買進股數": 0.0,
+                "賣出股數": 0.0,
+                "日期集合": set(),
+            })
+            if warrant_name and not warrant_rec.get("權證名稱"):
+                warrant_rec["權證名稱"] = warrant_name
+
+            broker_key = (broker_label, broker_name, broker_code)
+            broker_rec = rec["分點"].setdefault(broker_key, {
+                "分點": broker_label,
+                "分點名稱": broker_name,
+                "券商代號": broker_code,
+                "買進金額": 0.0,
+                "賣出金額": 0.0,
+                "買進股數": 0.0,
+                "賣出股數": 0.0,
+                "權證": {},
+                "日期集合": set(),
+            })
+            broker_warrant_rec = broker_rec["權證"].setdefault(warrant_code, {
+                "權證代號": warrant_code,
+                "權證名稱": warrant_name,
+                "買進金額": 0.0,
+                "賣出金額": 0.0,
+                "買進股數": 0.0,
+                "賣出股數": 0.0,
+                "日期集合": set(),
+            })
+
+            for row in df.itertuples(index=False):
+                row_dict = row._asdict()
+                date_str = normalize_date_str(row_dict.get("日期", ""))
+                dt = parse_date(date_str)
+
+                if not dt or dt < start_dt or dt > target_dt:
+                    continue
+
+                buy_amount = top15_safe_float(row_dict.get("買進金額", 0))
+                sell_amount = top15_safe_float(row_dict.get("賣出金額", 0))
+                buy_qty = top15_safe_float(row_dict.get("買進股數", 0))
+                sell_qty = top15_safe_float(row_dict.get("賣出股數", 0))
+
+                if buy_amount <= 0 and sell_amount <= 0 and buy_qty <= 0 and sell_qty <= 0:
+                    continue
+
+                rec["日期集合"].add(date_str)
+                rec["買進金額"] += buy_amount
+                rec["賣出金額"] += sell_amount
+                rec["買進股數"] += buy_qty
+                rec["賣出股數"] += sell_qty
+
+                warrant_rec["日期集合"].add(date_str)
+                warrant_rec["買進金額"] += buy_amount
+                warrant_rec["賣出金額"] += sell_amount
+                warrant_rec["買進股數"] += buy_qty
+                warrant_rec["賣出股數"] += sell_qty
+
+                broker_rec["日期集合"].add(date_str)
+                broker_rec["買進金額"] += buy_amount
+                broker_rec["賣出金額"] += sell_amount
+                broker_rec["買進股數"] += buy_qty
+                broker_rec["賣出股數"] += sell_qty
+
+                broker_warrant_rec["日期集合"].add(date_str)
+                broker_warrant_rec["買進金額"] += buy_amount
+                broker_warrant_rec["賣出金額"] += sell_amount
+                broker_warrant_rec["買進股數"] += buy_qty
+                broker_warrant_rec["賣出股數"] += sell_qty
+
+        records = []
+
+        for rec in agg.values():
+            buy_amount = float(rec.get("買進金額", 0) or 0)
+            sell_amount = float(rec.get("賣出金額", 0) or 0)
+            buy_qty = float(rec.get("買進股數", 0) or 0)
+            sell_qty = float(rec.get("賣出股數", 0) or 0)
+            net_buy = buy_amount - sell_amount
+            net_sell = sell_amount - buy_amount
+
+            if buy_amount <= 0 and sell_amount <= 0:
+                continue
+
+            records.append({
+                **rec,
+                "買進金額": buy_amount,
+                "賣出金額": sell_amount,
+                "買進股數": buy_qty,
+                "賣出股數": sell_qty,
+                "淨買超金額": net_buy,
+                "淨賣超金額": net_sell,
+            })
+
+        # 排名前再做一次標的層級保護性合併。
+        merged_records = {}
+        for rec in records:
+            key = normalize_underlying_code_for_group(rec.get("標的股", ""), rec.get("標的名稱", ""))
+            if not key:
+                continue
+
+            if key not in merged_records:
+                rec["標的股"] = key
+                merged_records[key] = rec
+                continue
+
+            dst = merged_records[key]
+            for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數", "淨買超金額", "淨賣超金額"]:
+                dst[numeric_col] = float(dst.get(numeric_col, 0) or 0) + float(rec.get(numeric_col, 0) or 0)
+
+            if not dst.get("標的名稱") and rec.get("標的名稱"):
+                dst["標的名稱"] = rec.get("標的名稱")
+
+            dst.setdefault("日期集合", set()).update(rec.get("日期集合", set()))
+
+            for warrant_code, warrant_rec in rec.get("權證", {}).items():
+                if warrant_code in dst.get("權證", {}):
+                    dw = dst["權證"][warrant_code]
+                    for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                        dw[numeric_col] = float(dw.get(numeric_col, 0) or 0) + float(warrant_rec.get(numeric_col, 0) or 0)
+                    dw.setdefault("日期集合", set()).update(warrant_rec.get("日期集合", set()))
+                else:
+                    dst.setdefault("權證", {})[warrant_code] = warrant_rec
+
+            for broker_key, broker_rec in rec.get("分點", {}).items():
+                if broker_key not in dst.get("分點", {}):
+                    dst.setdefault("分點", {})[broker_key] = broker_rec
+                    continue
+
+                db = dst["分點"][broker_key]
+                for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                    db[numeric_col] = float(db.get(numeric_col, 0) or 0) + float(broker_rec.get(numeric_col, 0) or 0)
+                db.setdefault("日期集合", set()).update(broker_rec.get("日期集合", set()))
+
+                for warrant_code, bw in broker_rec.get("權證", {}).items():
+                    if warrant_code in db.get("權證", {}):
+                        dbw = db["權證"][warrant_code]
+                        for numeric_col in ["買進金額", "賣出金額", "買進股數", "賣出股數"]:
+                            dbw[numeric_col] = float(dbw.get(numeric_col, 0) or 0) + float(bw.get(numeric_col, 0) or 0)
+                        dbw.setdefault("日期集合", set()).update(bw.get("日期集合", set()))
+                    else:
+                        db.setdefault("權證", {})[warrant_code] = bw
+
+        records = list(merged_records.values())
+
+        buy_top = [r for r in records if float(r.get("淨買超金額", 0) or 0) > 0]
+        sell_top = [r for r in records if float(r.get("淨賣超金額", 0) or 0) > 0]
+
+        buy_top = sorted(
+            buy_top,
+            key=lambda r: (float(r.get("淨買超金額", 0) or 0), float(r.get("買進金額", 0) or 0)),
+            reverse=True,
+        )[:top_n]
+        sell_top = sorted(
+            sell_top,
+            key=lambda r: (float(r.get("淨賣超金額", 0) or 0), float(r.get("賣出金額", 0) or 0)),
+            reverse=True,
+        )[:top_n]
+
+        def make_rank_rows(rank_type, records_for_rank):
+            rows = []
+            is_buy = rank_type == "共識買超"
+
+            for rank, rec in enumerate(records_for_rank, 1):
+                broker_rows = []
+                broker_json = []
+                same_direction_count = 0
+                opposite_direction_count = 0
+
+                for broker_rec in sorted(
+                    rec["分點"].values(),
+                    key=lambda x: (
+                        (float(x.get("買進金額", 0) or 0) - float(x.get("賣出金額", 0) or 0))
+                        if is_buy else
+                        (float(x.get("賣出金額", 0) or 0) - float(x.get("買進金額", 0) or 0))
+                    ),
+                    reverse=True,
+                ):
+                    b_buy = float(broker_rec.get("買進金額", 0) or 0)
+                    b_sell = float(broker_rec.get("賣出金額", 0) or 0)
+                    b_net_buy = b_buy - b_sell
+                    b_net_sell = b_sell - b_buy
+                    direction_amount = b_net_buy if is_buy else b_net_sell
+
+                    if direction_amount > 0:
+                        same_direction_count += 1
+                        broker_rows.append(f"{broker_rec['分點']} {_fmt_wan_text(direction_amount)}")
+                    elif direction_amount < 0:
+                        opposite_direction_count += 1
+
+                    broker_warrants = []
+                    for bw in sorted(
+                        broker_rec.get("權證", {}).values(),
+                        key=lambda x: (float(x.get("買進金額", 0) or 0) + float(x.get("賣出金額", 0) or 0)),
+                        reverse=True,
+                    ):
+                        broker_warrants.append({
+                            "權證代號": bw.get("權證代號", ""),
+                            "權證名稱": bw.get("權證名稱", ""),
+                            "買進金額": round(float(bw.get("買進金額", 0) or 0), 0),
+                            "賣出金額": round(float(bw.get("賣出金額", 0) or 0), 0),
+                            "買進股數": round(float(bw.get("買進股數", 0) or 0), 0),
+                            "賣出股數": round(float(bw.get("賣出股數", 0) or 0), 0),
+                            "日期數": len(bw.get("日期集合", set())),
+                        })
+
+                    broker_json.append({
+                        "分點": broker_rec["分點"],
+                        "分點名稱": broker_rec["分點名稱"],
+                        "券商代號": broker_rec["券商代號"],
+                        "買進金額": round(b_buy, 0),
+                        "賣出金額": round(b_sell, 0),
+                        "淨買超金額": round(b_net_buy, 0),
+                        "淨賣超金額": round(b_net_sell, 0),
+                        "權證檔數": len(broker_rec.get("權證", {})),
+                        "日期數": len(broker_rec.get("日期集合", set())),
+                        "權證明細": broker_warrants,
+                    })
+
+                rank_amount = float(rec.get("淨買超金額", 0) or 0) if is_buy else float(rec.get("淨賣超金額", 0) or 0)
+                dates = sorted(rec.get("日期集合", set()))
+                warrant_values = sorted(
+                    rec.get("權證", {}).values(),
+                    key=lambda x: (float(x.get("買進金額", 0) or 0) + float(x.get("賣出金額", 0) or 0)),
+                    reverse=True,
+                )
+                warrant_list = "；".join([
+                    f"{w.get('權證代號', '')} {w.get('權證名稱', '')}"
+                    f"｜買{_fmt_wan_text(w.get('買進金額', 0))}／賣{_fmt_wan_text(w.get('賣出金額', 0))}"
+                    for w in warrant_values
+                ])
+                top_warrant = warrant_values[0] if warrant_values else {}
+
+                rows.append({
+                    "資料範圍": scope,
+                    "統計日期": target_date,
+                    "統計期間": period_text,
+                    "統計天數": window_days,
+                    "有效日期數": len(dates),
+                    "第一筆日期": dates[0] if dates else "",
+                    "最後筆日期": dates[-1] if dates else "",
+                    "排名類型": rank_type,
+                    "排名": rank,
+                    # 保留舊欄位，避免圖片端或舊公式依欄名讀取時壞掉；但實際排名已是標的層級。
+                    "權證代號": top_warrant.get("權證代號", ""),
+                    "權證名稱": top_warrant.get("權證名稱", "同標的合計"),
+                    "標的股": rec.get("標的股", ""),
+                    "標的名稱": rec.get("標的名稱", ""),
+                    "權證檔數": len(rec.get("權證", {})),
+                    "權證清單": warrant_list,
+                    "排名金額": round(rank_amount, 0),
+                    "買進金額": round(float(rec.get("買進金額", 0) or 0), 0),
+                    "賣出金額": round(float(rec.get("賣出金額", 0) or 0), 0),
+                    "淨買超金額": round(float(rec.get("淨買超金額", 0) or 0), 0),
+                    "淨賣超金額": round(float(rec.get("淨賣超金額", 0) or 0), 0),
+                    "買進股數": round(float(rec.get("買進股數", 0) or 0), 0),
+                    "賣出股數": round(float(rec.get("賣出股數", 0) or 0), 0),
+                    "參與分點數": len(rec.get("分點", {})),
+                    "同向分點數": same_direction_count,
+                    "反向分點數": opposite_direction_count,
+                    "主要同向分點": "；".join(broker_rows[:8]),
+                    "完成狀態": "DONE",
+                    "更新時間": update_time,
+                    "run_id": run_id,
+                    "分點明細_JSON": json.dumps(broker_json, ensure_ascii=False),
+                })
+
+            return rows
+
+        rows = []
+        rows.extend(make_rank_rows("共識買超", buy_top))
+        rows.extend(make_rank_rows("共識賣超", sell_top))
+
+        print(
+            f"  ✅ 近{window_days}日精選分點共識TOP15完成："
+            f"共識買超 {len(buy_top):,} 檔標的，共識賣超 {len(sell_top):,} 檔標的，"
+            f"統計期間 {period_text}"
+        )
         return rows
 
-    rows = []
-    rows.extend(make_rank_rows("共識買超", buy_top))
-    rows.extend(make_rank_rows("共識賣超", sell_top))
+    all_rows = []
+    for window_days in window_days_list:
+        all_rows.extend(build_rows_for_window(window_days))
 
-    print(
-        f"  ✅ 近7日權證分點共識TOP15完成："
-        f"共識買超 {len(buy_top):,} 檔標的，共識賣超 {len(sell_top):,} 檔標的，"
-        f"統計期間 {period_text}"
-    )
-    return rows
+    return all_rows
 
 
 def write_7d_warrant_consensus_top15_sheet(wb, rows):
-    """寫入近 7 日權證分點共識買賣超 TOP15。rows=None 代表不建立工作表。"""
+    """
+    寫入近 7／14／21 日精選分點共識買賣超 TOP15。
+
+    rows=None 代表不建立工作表；同一張工作表內由上往下建立三張獨立排名表：
+    近 7 日、近 14 日、近 21 日。每張排名表都有自己的標題、統計期間與欄位表頭。
+    """
     if rows is None:
         return
 
@@ -13357,42 +13434,124 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
         "完成狀態", "更新時間", "run_id", "分點明細_JSON",
     ]
 
-    ws.append(headers)
+    window_order = []
+    for days in [
+        WARRANT_CONSENSUS_7D_DAYS,
+        WARRANT_CONSENSUS_14D_DAYS,
+        WARRANT_CONSENSUS_21D_DAYS,
+    ]:
+        days = max(int(days), 1)
+        if days not in window_order:
+            window_order.append(days)
 
+    rows_by_window = {days: [] for days in window_order}
     for row in rows or []:
-        ws.append([row.get(h, "") for h in headers])
+        try:
+            days = int(float(row.get("統計天數", 0) or 0))
+        except Exception:
+            days = 0
+        rows_by_window.setdefault(days, []).append(row)
 
     col_widths = [12, 12, 24, 10, 12, 12, 12, 12, 8, 12, 24, 10, 12, 10, 72, 14, 14, 14, 14, 14, 14, 14, 12, 12, 12, 56, 10, 20, 16, 90]
     thin_gray = Side(style="thin", color="B7B7B7")
+    medium_brown = Side(style="medium", color="7F6000")
     normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    section_top_border = Border(left=thin_gray, right=thin_gray, top=medium_brown, bottom=thin_gray)
 
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="000000")
-        cell.fill = YELLOW
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = normal_border
+    selected_brokers = parse_warrant_consensus_selected_brokers()
+    selected_brokers_text = "、".join(selected_brokers)
+    max_col = len(headers)
+    first_header_row = None
 
-    ws.row_dimensions[1].height = 24
+    for section_index, days in enumerate(window_order):
+        section_rows = rows_by_window.get(days, [])
 
-    header_map = {str(cell.value).strip(): idx + 1 for idx, cell in enumerate(ws[1])}
-    rank_type_col = header_map.get("排名類型")
+        if section_index > 0:
+            ws.append([""] * max_col)
+            ws.row_dimensions[ws.max_row].height = 9
 
-    for row in ws.iter_rows(min_row=2):
-        rank_type = str(row[rank_type_col - 1].value or "").strip() if rank_type_col else ""
-        row_fill = RED if rank_type == "共識買超" else GREEN if rank_type == "共識賣超" else WHITE
+        title_row = 1 if section_index == 0 else ws.max_row + 1
+        ws.cell(title_row, 1, f"近{days}日精選{len(selected_brokers)}分點權證共識買賣超 TOP15")
+        ws.merge_cells(start_row=title_row, start_column=1, end_row=title_row, end_column=max_col)
+        title_cell = ws.cell(title_row, 1)
+        title_cell.font = Font(bold=True, size=14, color="000000")
+        title_cell.fill = YELLOW
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        title_cell.border = Border(top=medium_brown, bottom=medium_brown)
+        ws.row_dimensions[title_row].height = 28
 
-        for cell in row:
-            cell.font = Font(color="000000")
+        period_text = str(section_rows[0].get("統計期間", "")).strip() if section_rows else ""
+        subtitle_parts = []
+        if period_text:
+            subtitle_parts.append(f"統計期間：{period_text}")
+        subtitle_parts.append(f"統計分點：{selected_brokers_text}")
+
+        subtitle_row = ws.max_row + 1
+        ws.cell(subtitle_row, 1, "｜".join(subtitle_parts))
+        ws.merge_cells(start_row=subtitle_row, start_column=1, end_row=subtitle_row, end_column=max_col)
+        subtitle_cell = ws.cell(subtitle_row, 1)
+        subtitle_cell.font = Font(color="000000")
+        subtitle_cell.fill = BLUE
+        subtitle_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        subtitle_cell.border = normal_border
+        ws.row_dimensions[subtitle_row].height = 32
+
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        if first_header_row is None:
+            first_header_row = header_row
+
+        for cell in ws[header_row]:
+            cell.font = Font(bold=True, color="000000")
+            cell.fill = YELLOW
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = normal_border
-            cell.fill = row_fill
+        ws.row_dimensions[header_row].height = 24
 
-        ws.row_dimensions[row[0].row].height = 30
+        if not section_rows:
+            empty_row = ws.max_row + 1
+            ws.cell(empty_row, 1, f"近{days}日無符合排名資料")
+            ws.merge_cells(start_row=empty_row, start_column=1, end_row=empty_row, end_column=max_col)
+            empty_cell = ws.cell(empty_row, 1)
+            empty_cell.font = Font(color="666666")
+            empty_cell.fill = WHITE
+            empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+            empty_cell.border = normal_border
+            ws.row_dimensions[empty_row].height = 24
+            continue
 
-    ws.freeze_panes = "A2"
+        previous_rank_type = None
+        for record in section_rows:
+            ws.append([record.get(h, "") for h in headers])
+            current_row = ws.max_row
+            rank_type = str(record.get("排名類型", "")).strip()
+            row_fill = RED if rank_type == "共識買超" else GREEN if rank_type == "共識賣超" else WHITE
+            use_section_top = rank_type != previous_rank_type
+
+            for cell in ws[current_row]:
+                cell.font = Font(
+                    bold=use_section_top,
+                    color="000000",
+                )
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = section_top_border if use_section_top else normal_border
+                cell.fill = row_fill
+
+            # 金額與股數欄使用千分位，維持原本報表的閱讀格式。
+            for col_name in [
+                "排名金額", "買進金額", "賣出金額", "淨買超金額", "淨賣超金額",
+                "買進股數", "賣出股數",
+            ]:
+                col_idx = headers.index(col_name) + 1
+                ws.cell(current_row, col_idx).number_format = '#,##0'
+
+            ws.row_dimensions[current_row].height = 30
+            previous_rank_type = rank_type
+
+    ws.freeze_panes = f"A{(first_header_row or 1) + 1}"
 
 def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, items, output_path, top15_detail_rows=None, top15_consensus_rows=None, warrant_consensus_7d_rows=None, broker_10d_detail_rows=None, broker_10d_winrate_rank_rows=None):
     print("【Step 5】建立 Excel...")
