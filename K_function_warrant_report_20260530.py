@@ -199,6 +199,11 @@ BRANCH_PERF_SHEETS_RAW = os.getenv(
     "勝率統計",
 ).strip() or "勝率統計"
 BRANCH_PERF_MAX_MATCHES = int(os.getenv("WARRANT_BRANCH_PERF_MAX_MATCHES", "3"))
+# 本週重點個別分點的最低金額代表性：以買賣超 TOP5 全體最大絕對金額為基準。
+# 低於此比例的分點，即使歷史勝率很高，也不提供給 AI 作為可點名的個別分析候選。
+WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO = float(
+    os.getenv("WARRANT_WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO", "0.35")
+)
 _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
 
@@ -1907,6 +1912,11 @@ def _format_avg_holding_days(avg_holding_days) -> str:
 
 
 def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
+    """只保留本週金額具代表性的 TOP5 分點，再比對歷史勝率統計。
+
+    代表性採買超與賣超 TOP5 的全體最大絕對金額為基準，不因為分點在賣超側排名靠前
+    就自動視為重要。這可避免小額高勝率分點被拿來與主要大額分點對等比較。
+    """
     cache_key = "_branch_perf_matches_cache"
     if cache_key in ctx:
         return list(ctx.get(cache_key) or [])
@@ -1923,6 +1933,15 @@ def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
         if str(r.get("branch", "") or "")
     }
     buy_top, sell_top = top_branch_tables(week_events, topn=5)
+
+    all_abs_amounts = []
+    for df_top in [buy_top, sell_top]:
+        if df_top is not None and not df_top.empty:
+            all_abs_amounts.extend(
+                pd.to_numeric(df_top["net_amount"], errors="coerce").fillna(0.0).abs().tolist()
+            )
+    overall_largest_abs = max(all_abs_amounts) if all_abs_amounts else 0.0
+    min_ratio = max(0.0, float(WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO))
     matches = []
 
     def collect(df_top: pd.DataFrame, side: str):
@@ -1931,12 +1950,20 @@ def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
             branch_norm = normalize_branch_name(branch_display)
             if not branch_norm:
                 continue
+
+            net_value = pd.to_numeric(r.get("net_amount", 0), errors="coerce")
+            net_amount = 0.0 if pd.isna(net_value) else float(net_value)
+            abs_amount = abs(net_amount)
+            overall_ratio = abs_amount / overall_largest_abs if overall_largest_abs > 0 else 0.0
+
+            # 金額不具代表性時，直接不進入個別歷史績效分析候選。
+            if overall_ratio < min_ratio:
+                continue
+
             perf_row = perf_map.get(branch_norm)
             if perf_row is None:
                 continue
 
-            net_value = pd.to_numeric(r.get("net_amount", 0), errors="coerce")
-            net_amount = 0.0 if pd.isna(net_value) else float(net_value)
             win_rate = _parse_percent_like_value(perf_row.get("win_rate"), ratio_if_small=True)
             weighted_return = _parse_percent_like_value(perf_row.get("weighted_return"), ratio_if_small=True)
             event_count = _parse_number_like_value(perf_row.get("event_count"))
@@ -1950,6 +1977,7 @@ def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
                 "branch": branch_display or str(perf_row.get("branch_display", "") or branch_norm),
                 "branch_norm": branch_norm,
                 "weekly_net_amount": net_amount,
+                "relative_to_overall_largest_pct": round(overall_ratio * 100, 2),
                 "win_rate": win_rate,
                 "weighted_return": weighted_return,
                 "event_count": event_count,
@@ -1960,21 +1988,22 @@ def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
 
     collect(buy_top, "buy")
     collect(sell_top, "sell")
-    side_order = {"buy": 0, "sell": 1}
-    matches = sorted(matches, key=lambda x: (side_order.get(x.get("side", ""), 9), int(x.get("rank", 999))))
+    matches = sorted(
+        matches,
+        key=lambda x: (-abs(float(x.get("weekly_net_amount", 0) or 0)), int(x.get("rank", 999))),
+    )
     if BRANCH_PERF_MAX_MATCHES > 0:
         matches = matches[:BRANCH_PERF_MAX_MATCHES]
 
     if matches:
         preview = "、".join(
-            f"{m['branch']}({('買' if m['side'] == 'buy' else '賣')}TOP{m['rank']})"
+            f"{m['branch']}({('買' if m['side'] == 'buy' else '賣')}TOP{m['rank']}，最大分點比{m['relative_to_overall_largest_pct']:.0f}%)"
             for m in matches
         )
-        print(f"📈 TOP5 命中勝率統計：{preview}")
+        print(f"📈 金額具代表性且命中勝率統計：{preview}")
 
     ctx[cache_key] = matches
     return matches
-
 
 def _format_branch_perf_focus_point(match: dict) -> str:
     side = str(match.get("side", "") or "")
@@ -4271,6 +4300,19 @@ NEWS_ARTICLE_BATCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_ARTICLE_BATCH_TIMEOUT
 NEWS_GNEWSDECODER_ENABLE = os.getenv("WARRANT_NEWS_GNEWSDECODER_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
 NEWS_GNEWSDECODER_TIMEOUT = float(os.getenv("WARRANT_NEWS_GNEWSDECODER_TIMEOUT", "3"))
 
+# 多來源新聞：Google News 之外，再從 Yahoo 股市 RSS、Bing News RSS 與 MoneyDJ 新聞搜尋補充。
+# 任一來源失敗時只略過該來源，不影響其他來源或週報產生。
+NEWS_MULTI_SOURCE_ENABLE = os.getenv("WARRANT_NEWS_MULTI_SOURCE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_YAHOO_RSS_ENABLE = os.getenv("WARRANT_NEWS_YAHOO_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_BING_RSS_ENABLE = os.getenv("WARRANT_NEWS_BING_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_MONEYDJ_SEARCH_ENABLE = os.getenv("WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "8"))
+NEWS_MONEYDJ_BODY_FETCH_LIMIT = int(os.getenv("WARRANT_NEWS_MONEYDJ_BODY_FETCH_LIMIT", "5"))
+NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
+    "WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT",
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 12)),
+))
+
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
     "2317": ["鴻海", "海公公"],
@@ -4948,6 +4990,360 @@ def _is_valid_fast_rss_news_item(title: str, description: str, stock_code: str =
     """極速 RSS 模式只保留明確對應公司且含具體資訊的新聞，不再因只有股票名稱就放行。"""
     return _passes_news_quality_gate(title, description, stock_code, stock_name)
 
+def _read_rss_items(url: str, source_family: str, max_items: int = 40) -> List[dict]:
+    """讀取一般 RSS 2.0 新聞來源，失敗時回傳空陣列。"""
+    try:
+        headers = {
+            "User-Agent": HDR["User-Agent"],
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        rows = []
+        for item in root.findall(".//item")[:max(1, int(max_items))]:
+            title = _clean_news_title(item.findtext("title") or "")
+            link = str(item.findtext("link") or "").strip()
+            published = str(item.findtext("pubDate") or item.findtext("date") or "").strip()
+            description = _normalize_news_text(_html_to_readable_text(item.findtext("description") or ""))
+            source_el = item.find("source")
+            source = (source_el.text if source_el is not None and source_el.text else source_family).strip()
+            rows.append({
+                "title": title,
+                "url": link,
+                "source": source or source_family,
+                "source_family": source_family,
+                "published": published,
+                "description": description,
+            })
+        return rows
+    except Exception as e:
+        print(f"⚠️ {source_family} RSS 讀取失敗：{e}")
+        return []
+
+
+def _build_external_rss_article(item: dict, stock_code: str, stock_name: str, search_days: int, source_tag: str) -> dict | None:
+    title = _clean_news_title(item.get("title", ""))
+    description = _normalize_news_text(item.get("description", ""))
+    link = str(item.get("url", "") or "").strip()
+    published = str(item.get("published", "") or "").strip()
+    if not title or not _is_within_recent_days_from_rss(published, days=search_days):
+        return None
+    if not _passes_news_quality_gate(title, description, stock_code, stock_name):
+        return None
+
+    body = ""
+    body_ok = False
+    if not NEWS_FAST_MODE and link:
+        body = _fetch_article_body(link)
+        body_ok = (
+            _is_valid_article_body(body, title=title, description=description)
+            and _passes_news_quality_gate(title, body, stock_code, stock_name)
+        )
+
+    fallback_ok = False
+    if body_ok:
+        content = body
+        content_source = f"{source_tag}_article"
+    else:
+        fallback_ok = NEWS_RSS_DESCRIPTION_FALLBACK and _is_valid_fast_rss_news_item(
+            title, description, stock_code, stock_name
+        )
+        if not fallback_ok:
+            return None
+        content = _build_fast_rss_news_content(
+            title,
+            description,
+            source=item.get("source", source_tag),
+            published=published,
+        )
+        content_source = f"{source_tag}_rss"
+
+    article = {
+        "title": title,
+        "url": link,
+        "source": str(item.get("source", source_tag) or source_tag),
+        "source_family": str(item.get("source_family", source_tag) or source_tag),
+        "published": published,
+        "description": description,
+        "content": content,
+        "body_ok": bool(body_ok),
+        "fallback_ok": bool(fallback_ok),
+        "content_source": content_source,
+        "body_length": len(content),
+        "search_days": int(search_days),
+        "query_stage": source_tag,
+    }
+    article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
+    return article
+
+
+def fetch_yahoo_finance_rss_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
+    if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_YAHOO_RSS_ENABLE:
+        return []
+    urls = [
+        ("Yahoo最新新聞", "https://tw.stock.yahoo.com/rss?category=news"),
+        ("Yahoo台股動態", "https://tw.stock.yahoo.com/rss?category=tw-market"),
+        ("Yahoo基金ETF", "https://tw.stock.yahoo.com/rss?category=funds-news"),
+    ]
+    max_days = max(_get_news_search_day_list())
+    aliases = _get_news_aliases(stock_code, stock_name)
+    articles = []
+    seen = set()
+    for family, url in urls:
+        for item in _read_rss_items(url, family, max_items=max(30, max_items * 5)):
+            combined = f"{item.get('title', '')} {item.get('description', '')}"
+            if aliases and not any(a and a in combined for a in aliases):
+                continue
+            key = _article_seen_key(item.get("title", ""), item.get("url", ""))
+            if key and key in seen:
+                continue
+            article = _build_external_rss_article(item, stock_code, stock_name, max_days, "yahoo_finance")
+            if article is None:
+                continue
+            if key:
+                seen.add(key)
+            articles.append(article)
+    articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
+    print(f"📰 Yahoo 股市 RSS：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    return articles[:max(1, int(max_items))]
+
+
+def fetch_bing_news_rss_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
+    if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_BING_RSS_ENABLE:
+        return []
+    aliases = _get_news_aliases(stock_code, stock_name)
+    quoted = [f'"{a}"' for a in aliases[:5] if a]
+    target = " OR ".join(quoted) if quoted else f'"{stock_code}"'
+    topics = (
+        "營收 OR 獲利 OR 財報 OR 法說 OR 展望 OR 接單 OR 出貨 OR 產能 OR "
+        "產品 OR AI OR ASIC OR 半導體 OR 目標價 OR 評等 OR ETF OR 成分股 OR 指數調整"
+    )
+    query = f"({target}) ({topics})"
+    url = "https://www.bing.com/news/search?" + urllib.parse.urlencode({
+        "q": query,
+        "format": "rss",
+        "mkt": "zh-TW",
+        "setlang": "zh-hant",
+    })
+    max_days = max(_get_news_search_day_list())
+    items = _read_rss_items(url, "BingNews", max_items=max(30, max_items * 5))
+    articles = []
+    seen = set()
+    for item in items:
+        combined = f"{item.get('title', '')} {item.get('description', '')}"
+        if aliases and not any(a and a in combined for a in aliases):
+            continue
+        key = _article_seen_key(item.get("title", ""), item.get("url", ""))
+        if key and key in seen:
+            continue
+        article = _build_external_rss_article(item, stock_code, stock_name, max_days, "bing_news")
+        if article is None:
+            continue
+        if key:
+            seen.add(key)
+        articles.append(article)
+    articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
+    print(f"📰 Bing News RSS：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    return articles[:max(1, int(max_items))]
+
+
+def _extract_moneydj_search_candidates(page_html: str, stock_code: str, stock_name: str) -> List[dict]:
+    aliases = _get_news_aliases(stock_code, stock_name)
+    base_url = "https://www.moneydj.com/"
+    candidates = []
+    seen = set()
+
+    def add_candidate(title: str, href: str, context: str = ""):
+        title = _clean_news_title(title)
+        href = html.unescape(str(href or "").strip())
+        if not title or len(title) < 8 or not href:
+            return
+        combined = f"{title} {context}"
+        if aliases and not any(a and a in combined for a in aliases):
+            return
+        low_href = href.lower()
+        if not any(k in low_href for k in ["newsviewer", "/news/", "newsv", "newsv.aspx"]):
+            return
+        url = urllib.parse.urljoin(base_url, href)
+        key = _article_seen_key(title, url)
+        if key in seen:
+            return
+        seen.add(key)
+        date_match = re.search(r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?", context)
+        published = date_match.group(0) if date_match else ""
+        candidates.append({
+            "title": title,
+            "url": url,
+            "source": "MoneyDJ",
+            "source_family": "MoneyDJ",
+            "published": published,
+            "description": _normalize_news_text(context),
+        })
+
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(page_html, "lxml")
+            for a in soup.find_all("a", href=True):
+                title = a.get_text(" ", strip=True)
+                parent_text = a.parent.get_text(" ", strip=True) if a.parent else title
+                add_candidate(title, a.get("href", ""), parent_text)
+        except Exception:
+            pass
+
+    if not candidates:
+        for m in re.finditer(r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', page_html or ""):
+            href = m.group(1)
+            title = _normalize_news_text(_html_to_readable_text(m.group(2)))
+            around = _normalize_news_text(_html_to_readable_text((page_html or "")[max(0, m.start()-120):m.end()+160]))
+            add_candidate(title, href, around)
+    return candidates
+
+
+def fetch_moneydj_news_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
+    if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MONEYDJ_SEARCH_ENABLE:
+        return []
+    queries = []
+    for q in [stock_name, stock_code]:
+        q = str(q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+    candidates = []
+    seen = set()
+    headers = {
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    for q in queries:
+        url = "https://www.moneydj.com/kmdj/search/list.aspx?" + urllib.parse.urlencode({
+            "_QueryType_": "NW",
+            "_Query_": q,
+        })
+        try:
+            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
+            r.raise_for_status()
+            for c in _extract_moneydj_search_candidates(r.text, stock_code, stock_name):
+                key = _article_seen_key(c.get("title", ""), c.get("url", ""))
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                candidates.append(c)
+        except Exception as e:
+            print(f"⚠️ MoneyDJ 新聞搜尋失敗：{q}｜{e}")
+
+    articles = []
+    max_days = max(_get_news_search_day_list())
+    for candidate in candidates[:max(1, int(NEWS_MONEYDJ_BODY_FETCH_LIMIT))]:
+        title = candidate.get("title", "")
+        body = _fetch_article_body(candidate.get("url", ""))
+        body_ok = (
+            _is_valid_article_body(body, title=title, description=candidate.get("description", ""))
+            and _passes_news_quality_gate(title, body, stock_code, stock_name)
+        )
+        if body_ok:
+            content = body
+            fallback_ok = False
+            content_source = "moneydj_article"
+        else:
+            description = candidate.get("description", "")
+            fallback_ok = _passes_news_quality_gate(title, description, stock_code, stock_name)
+            if not fallback_ok:
+                continue
+            content = _build_fast_rss_news_content(title, description, source="MoneyDJ", published=candidate.get("published", ""))
+            content_source = "moneydj_search"
+        article = {
+            **candidate,
+            "content": content,
+            "body_ok": bool(body_ok),
+            "fallback_ok": bool(fallback_ok),
+            "content_source": content_source,
+            "body_length": len(content),
+            "search_days": int(max_days),
+            "query_stage": "MoneyDJ關鍵字搜尋",
+        }
+        article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
+        articles.append(article)
+    articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
+    print(f"📰 MoneyDJ 新聞搜尋：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    return articles[:max(1, int(max_items))]
+
+
+def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: str, stock_name: str, limit: int) -> List[dict]:
+    merged = []
+    seen = set()
+    for group in article_groups:
+        for article in group or []:
+            key = _article_seen_key(article.get("title", ""), article.get("url", ""))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            article = dict(article)
+            article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
+            merged.append(article)
+
+    def sort_key(a: dict):
+        dt = _parse_rss_pub_date(a.get("published", "")) or datetime.min
+        body_rank = 0 if a.get("body_ok") else 1 if a.get("fallback_ok") else 2
+        return (-int(a.get("relevance_score", 0) or 0), body_rank, -dt.timestamp() if dt != datetime.min else 0)
+
+    merged = sorted(merged, key=sort_key)
+
+    # 先取各來源的第一篇，避免最後又全部只剩單一聚合來源；再依總分補滿。
+    selected = []
+    selected_ids = set()
+    used_families = set()
+    for article in merged:
+        family = str(article.get("source_family", article.get("source", "unknown")) or "unknown")
+        if family in used_families:
+            continue
+        selected.append(article)
+        selected_ids.add(id(article))
+        used_families.add(family)
+        if len(selected) >= limit:
+            return selected[:limit]
+    for article in merged:
+        if id(article) in selected_ids:
+            continue
+        selected.append(article)
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
+    """合併 Google、Yahoo 股市、Bing News 與 MoneyDJ 新聞，統一去重與品質排序。"""
+    manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
+    if manual:
+        return fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
+    if not NEWS_ENABLE:
+        return []
+
+    per_source = max(3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
+    groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max_items)]
+    if NEWS_MULTI_SOURCE_ENABLE:
+        groups.append(fetch_yahoo_finance_rss_articles(stock_code, stock_name, max_items=per_source))
+        groups.append(fetch_bing_news_rss_articles(stock_code, stock_name, max_items=per_source))
+        groups.append(fetch_moneydj_news_articles(stock_code, stock_name, max_items=per_source))
+
+    limit = max(
+        NEWS_SUMMARY_MAX_POINTS,
+        NEWS_GOOGLE_MIN_USABLE_ARTICLES,
+        min(max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT)), max(1, int(max_items))),
+    )
+    articles = _merge_and_rank_news_articles(groups, stock_code, stock_name, limit=limit)
+    source_counts = {}
+    for article in articles:
+        family = str(article.get("source_family", article.get("source", "unknown")) or "unknown")
+        source_counts[family] = source_counts.get(family, 0) + 1
+    source_text = "、".join(f"{k}:{v}" for k, v in source_counts.items()) or "無"
+    print(f"📰 多來源新聞完成：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜來源 {source_text}")
+    return articles
+
+
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
     """
     多階段抓取 Google News RSS 新聞。
@@ -5054,6 +5450,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
             "title": title,
             "url": link,
             "source": candidate.get("source", ""),
+            "source_family": "GoogleNews",
             "published": candidate.get("published", ""),
             "description": description,
             "content": content,
@@ -6075,7 +6472,7 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
             side_share = abs_amount / same_side_total_abs if same_side_total_abs > 0 else 0.0
             side_ratio = abs_amount / same_side_largest_abs if same_side_largest_abs > 0 else 0.0
 
-            amount_representative = bool(rank <= 2 or overall_ratio >= 0.25)
+            amount_representative = bool(overall_ratio >= max(0.0, float(WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO)))
             if amount_representative:
                 amount_significance = "主要代表"
             elif rank <= 3 or overall_ratio >= 0.15:
@@ -6097,10 +6494,11 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
                 "amount_representative": amount_representative,
                 "representative_warrant": f"{str(r.get('max_warrant_code', '') or '')} {str(r.get('max_warrant_name', '') or '')[:12]}".strip(),
                 "representative_warrant_net": fmt_money(float(r.get("max_warrant_amount", 0) or 0)),
-                "historical_statistics_available": bool(perf is not None),
+                "historical_statistics_available": bool(perf is not None and amount_representative),
+                "eligible_for_individual_analysis": bool(amount_representative),
             }
 
-            if perf is not None:
+            if perf is not None and amount_representative:
                 win_rate = _parse_percent_like_value(perf.get("win_rate"), ratio_if_small=True)
                 weighted_return = _parse_percent_like_value(perf.get("weighted_return"), ratio_if_small=True)
                 avg_holding_days = _parse_number_like_value(perf.get("avg_holding_days"))
@@ -6146,8 +6544,24 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
             })
 
     top5_rows = _build_weekly_top5_ai_rows(ctx)
-    buy_top5_rows = [r for r in top5_rows if r.get("side") == "買超"]
-    sell_top5_rows = [r for r in top5_rows if r.get("side") == "賣超"]
+    representative_buy_rows = [
+        r for r in top5_rows
+        if r.get("side") == "買超" and bool(r.get("amount_representative"))
+    ]
+    representative_sell_rows = [
+        r for r in top5_rows
+        if r.get("side") == "賣超" and bool(r.get("amount_representative"))
+    ]
+    small_rows = [r for r in top5_rows if not bool(r.get("amount_representative"))]
+    small_amount_summary = {
+        "count": len(small_rows),
+        "combined_absolute_amount": fmt_money_abs(sum(abs(float(r.get("weekly_net_value", 0) or 0)) for r in small_rows)),
+        "rule": (
+            f"低於全體最大分點絕對金額的 "
+            f"{max(0.0, float(WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO)) * 100:.0f}% 時，"
+            "不提供分點名稱與歷史績效供個別分析"
+        ),
+    }
 
     # 三大法人除最新日外，再提供本週合計，讓 AI 能比較法人與權證方向是否一致。
     inst_week = pd.DataFrame()
@@ -6202,10 +6616,27 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
             "bias": ctx.get("bias", ""),
             "major_warrants": warrant_rows,
         },
-        "buy_top5_with_history": buy_top5_rows,
-        "sell_top5_with_history": sell_top5_rows,
+        "representative_buy_top5_with_history": representative_buy_rows,
+        "representative_sell_top5_with_history": representative_sell_rows,
+        "non_representative_top5_summary": small_amount_summary,
     }
     return payload
+
+def _weekly_points_mention_nonrepresentative_branch(points: List[str], ctx: dict) -> List[str]:
+    """回傳 AI 不應點名、但實際出現在重點中的小額分點名稱。"""
+    merged = "\n".join(str(p or "") for p in points)
+    if not merged:
+        return []
+    rows = _build_weekly_top5_ai_rows(ctx)
+    forbidden = []
+    for row in rows:
+        if bool(row.get("amount_representative")):
+            continue
+        branch = str(row.get("branch", "") or "").strip()
+        if branch and branch in merged and branch not in forbidden:
+            forbidden.append(branch)
+    return forbidden
+
 
 def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
     """讓 Gemini 比較完整資料後，自行挑選最有意義的三個本週重點。"""
@@ -6225,9 +6656,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 2. 禁止把同一項分析拆成兩點；第二點或第三點不能接續上一點未完成的句意。
 3. 每點必須有明確主題、資料關係與結論，並以完整句號結束；不得使用「…」或「...」結尾。
 4. 每一點優先比較至少兩類資料之間的關係，不要只是逐項抄寫數字。
-5. 分點分析必須先看本週金額代表性，再看歷史勝率、加權報酬率與平均持有天數。
-6. amount_significance 為「金額偏小」或 amount_representative=false 的分點，不得只因歷史勝率高就單獨列為主要重點；除非多個小額分點同方向形成明確共識，否則應忽略。
-7. 若主要分點與小額高勝率分點方向不同，應以主要分點的金額影響為優先，不要把兩者當成同等重要。
+5. 個別分點只能從 representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這兩個陣列內的分點不得點名、不得引用其勝率或歷史績效。
+6. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱。
+7. 分點分析必須先看本週金額代表性，再看歷史勝率、加權報酬率與平均持有天數；小額高勝率分點不得與主要大額分點對等比較。
 8. 可分析但不限於：
    - 股價方向與權證週淨流向是否同向或背離。
    - 三大法人與權證分點方向是否一致或衝突。
@@ -6273,6 +6704,14 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
             return []
         if not _points_are_independent_and_complete(points):
             print("⚠️ Gemini 本週重點出現承接句、半句或省略號，改用規則式固定格式")
+            return []
+        forbidden_branches = _weekly_points_mention_nonrepresentative_branch(points, ctx)
+        if forbidden_branches:
+            print(
+                "⚠️ Gemini 本週重點點名金額不具代表性的分點："
+                + "、".join(forbidden_branches)
+                + "，改用規則式固定格式"
+            )
             return []
 
         print(f"✅ Gemini 自主分析本週重點完成：3 點，總字數約 {_count_summary_chars(points)} 字")
@@ -7599,15 +8038,15 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             except Exception as e:
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
         if is_compact_report_mode():
-            print("📄 精簡週報模式：略過本週重點、Google News 抓取與 Gemini 新聞統整")
+            print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
             news_items = []
         else:
             cached_news_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
             if cached_news_points:
-                print(f"📦 今日新聞快取已存在，略過 Google News 抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
+                print(f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
                 news_items = []
             else:
-                news_items = fetch_google_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
+                news_items = fetch_multi_source_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
 
         fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
         buf = io.BytesIO()
