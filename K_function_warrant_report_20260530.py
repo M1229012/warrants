@@ -4042,37 +4042,30 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
 
 
 def _rule_based_key_points(ctx, stock_name: str):
-    points = _build_branch_perf_focus_points(ctx, limit=1)
-    df = ctx["plot_df"]
-    latest = df.iloc[-1]
-    net = ctx["total_net"]
+    """AI 失敗時的固定備援：代表性分點、價量型態、法人與權證資金交叉。"""
+    points = []
+    points.extend(_build_branch_perf_focus_points(ctx, limit=1))
 
-    close = float(latest["Close"])
-    ma20 = float(latest["MA20"])
-    ma60 = float(latest["MA60"])
-    ma_state = get_ma_kline_signals(df)
-    if close > ma20 and close > ma60:
-        pos = "站穩月線、季線之上"
-    elif close > ma60:
-        pos = "回到季線之上、月線之下"
-    else:
-        pos = "跌破月線或季線"
-    points.append(f"股價本週 {fmt_pct(ctx['stock_ret'])}，最新收盤 {close:.0f}，{pos}" + (f"，{ma_state}" if ma_state else "") + "。")
+    pattern_point = _build_rule_based_pattern_point(ctx)
+    if pattern_point:
+        points.append(pattern_point)
 
-    vol_ratio = latest["Volume"] / latest["MV20"] if latest.get("MV20", np.nan) and not pd.isna(latest.get("MV20", np.nan)) else np.nan
-    if not pd.isna(vol_ratio):
-        tag = "爆量" if vol_ratio >= 2 else "增溫" if vol_ratio >= 1.2 else "量縮"
-        points.append(f"本週量能較前週 {fmt_pct(ctx['vol_change'])}，最新日約為月均量 {vol_ratio:.1f} 倍（{tag}）。")
+    crossflow_point = _build_rule_based_crossflow_point(ctx)
+    if crossflow_point:
+        points.append(crossflow_point)
 
-    e = ctx["week_events"]
-    if e is not None and not e.empty:
-        by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
-        top_branch = str(by_branch.index[0])
-        top_amt = float(by_branch.iloc[0])
-        pos_sum = by_branch.clip(lower=0).sum()
-        share = by_branch.head(3).clip(lower=0).sum() / max(1.0, pos_sum) * 100 if pos_sum > 0 else 0.0
-        points.append(f"權證淨流向 {fmt_money(net)}（{ctx['bias']}），由「{top_branch}」領軍 {fmt_money(top_amt)}，前三大分點佔買超 {share:.0f}%。")
-    return points[:4]
+    if len(points) < 3:
+        e = ctx.get("week_events")
+        if e is not None and not e.empty:
+            by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
+            positive = by_branch[by_branch > 0]
+            if not positive.empty:
+                top_share = float(positive.iloc[0] / max(positive.sum(), 1.0) * 100)
+                points.append(
+                    f"籌碼集中度：本週最大買超分點占全部正買超約 {top_share:.1f}%，"
+                    "若買盤集中於少數分點，代表籌碼廣度仍需與後續連續性一併判斷。"
+                )
+    return _clean_weekly_key_points(points)[:3]
 
 
 def _finish_complete_summary_point(text: str, max_len: int, min_cut_len: int = 30) -> str:
@@ -4147,48 +4140,8 @@ def _parse_weekly_gemini_points(output_text: str) -> List[str]:
 
 
 def _build_weekly_expansion_points(ctx: dict, stock_name: str) -> List[str]:
-    """Gemini 本週重點太短時，用同一份技術面 / 權證資料補足資訊量。"""
-    points = _build_branch_perf_focus_points(ctx, limit=1)
-    try:
-        df = ctx.get("plot_df", pd.DataFrame())
-        latest = df.iloc[-1] if df is not None and not df.empty else pd.Series(dtype=float)
-        close = _safe_float(latest.get("Close"))
-        ma5 = _safe_float(latest.get("MA5"))
-        ma20 = _safe_float(latest.get("MA20"))
-        ma60 = _safe_float(latest.get("MA60"))
-        vol = _safe_float(latest.get("Volume"))
-        mv20 = _safe_float(latest.get("MV20"))
-        vol_ratio = vol / mv20 if mv20 and np.isfinite(mv20) and mv20 > 0 else np.nan
-        ma_signal = get_ma_kline_signals(df) if df is not None and not df.empty else ""
-        kd_signal = get_kd_signals(df) if df is not None and not df.empty else ""
-        macd_signal = get_macd_signals(df) if df is not None and not df.empty else ""
-        if np.isfinite(close):
-            points.append(
-                f"股價本週 {fmt_pct(ctx.get('stock_ret', np.nan))}，最新收盤 {close:.0f}，目前與 5MA {ma5:.1f}、20MA {ma20:.1f}、60MA {ma60:.1f} 的相對位置，搭配 {ma_signal or '均線結構'} 判斷短中期趨勢。"
-            )
-        if np.isfinite(vol_ratio):
-            points.append(
-                f"量能面本週較前週 {fmt_pct(ctx.get('vol_change', np.nan))}，最新日約為月均量 {vol_ratio:.1f} 倍，需搭配 {kd_signal or 'KD'} 與 {macd_signal or 'MACD'} 觀察動能是否延續。"
-            )
-        total_net = float(ctx.get("total_net", 0) or 0)
-        total_buy = float(ctx.get("total_buy", 0) or 0)
-        total_sell = float(ctx.get("total_sell", 0) or 0)
-        points.append(
-            f"權證資金流本週買進 {fmt_money_abs(total_buy)}、賣出 {fmt_money(-abs(total_sell))}，合計淨流向 {fmt_money(total_net)}（{ctx.get('bias', '')}），可觀察資金是否與股價方向一致。"
-        )
-        e = ctx.get("week_events")
-        if e is not None and not e.empty:
-            by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
-            top_buy = str(by_branch.index[0]) if len(by_branch) else ""
-            top_buy_amt = float(by_branch.iloc[0]) if len(by_branch) else 0.0
-            top_sell = str(by_branch.index[-1]) if len(by_branch) else ""
-            top_sell_amt = float(by_branch.iloc[-1]) if len(by_branch) else 0.0
-            points.append(
-                f"分點結構以「{top_buy}」買超 {fmt_money(top_buy_amt)} 與「{top_sell}」賣超 {fmt_money(top_sell_amt)} 最明顯，若買賣集中度升高，代表籌碼方向更需要追蹤。"
-            )
-    except Exception:
-        pass
-    return _clean_weekly_key_points(points)
+    """Gemini 本週重點太短時，只用具分析意義的固定備援補足。"""
+    return _rule_based_key_points(ctx, stock_name)
 
 
 def _ensure_weekly_keypoint_min_total(points: List[str], ctx: dict, stock_name: str) -> List[str]:
@@ -6517,6 +6470,281 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
     append_rows(sell_top, "sell")
     return rows
 
+
+def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 38) -> dict:
+    """使用與 K 線價量累積圖完全相同的算法，計算最大量區與第二大量區。"""
+    required_cols = {"Low", "High", "Open", "Close", "Volume"}
+    if df is None or df.empty or not required_cols.issubset(df.columns):
+        return {}
+
+    work = df[["Low", "High", "Open", "Close", "Volume"]].copy()
+    for col in work.columns:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["Low", "High", "Open", "Close", "Volume"])
+    if work.empty:
+        return {}
+
+    price_min = float(work["Low"].min())
+    price_max = float(work["High"].max())
+    if not np.isfinite(price_min) or not np.isfinite(price_max) or price_max <= price_min:
+        return {}
+
+    n_bins = max(5, int(n_bins or 38))
+    bins = np.linspace(price_min, price_max, n_bins + 1)
+    centers = (bins[:-1] + bins[1:]) / 2
+    height = float(bins[1] - bins[0])
+    profile = np.zeros(n_bins, dtype=float)
+
+    for _, row in work.iterrows():
+        vol = float(row["Volume"])
+        low = float(row["Low"])
+        high = float(row["High"])
+        open_ = float(row["Open"])
+        close = float(row["Close"])
+        body_min, body_max = min(open_, close), max(open_, close)
+        ranges = [((low, body_min), 0.2), ((body_min, body_max), 0.6), ((body_max, high), 0.2)]
+        for (start, end), weight in ranges:
+            if end - start < 1e-6:
+                continue
+            idxs = np.where((centers >= start) & (centers <= end))[0]
+            if len(idxs):
+                profile[idxs] += vol * weight / len(idxs)
+
+    if len(profile) == 0 or float(profile.max()) <= 0:
+        return {}
+
+    sorted_idx = np.argsort(profile)[::-1]
+    max_idx = int(sorted_idx[0]) if len(sorted_idx) else -1
+    second_idx = int(sorted_idx[1]) if len(sorted_idx) > 1 else -1
+    if max_idx < 0:
+        return {}
+
+    return {
+        "work": work,
+        "bins": bins,
+        "centers": centers,
+        "height": height,
+        "profile": profile,
+        "max_idx": max_idx,
+        "second_idx": second_idx,
+    }
+
+
+def _price_zone_relation(close: float, zone_low: float, zone_high: float) -> str:
+    if not np.isfinite(close):
+        return "未知"
+    if close > zone_high:
+        return "位於量區上方"
+    if close < zone_low:
+        return "位於量區下方"
+    return "位於量區內"
+
+
+def _format_price_level(v) -> str:
+    try:
+        value = float(v)
+    except Exception:
+        return "-"
+    if not np.isfinite(value):
+        return "-"
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 38) -> dict:
+    """整理紅色最大量區、橘色第二大量區與近期型態，供 AI 做客觀型態分析。"""
+    df = ctx.get("plot_df", pd.DataFrame())
+    stats = _calculate_weighted_volume_profile_stats(df, n_bins=n_bins)
+    if not stats:
+        return {"available": False}
+
+    work = stats["work"]
+    bins = stats["bins"]
+    centers = stats["centers"]
+    profile = stats["profile"]
+    max_idx = int(stats["max_idx"])
+    second_idx = int(stats["second_idx"])
+
+    latest_close = float(work["Close"].iloc[-1])
+
+    def zone_record(idx: int, label: str, chart_color: str) -> dict:
+        if idx < 0 or idx >= len(centers):
+            return {}
+        zone_low = float(bins[idx])
+        zone_high = float(bins[idx + 1])
+        center = float(centers[idx])
+        distance_pct = (latest_close / center - 1) * 100 if center else np.nan
+        return {
+            "label": label,
+            "chart_color": chart_color,
+            "zone_low": _format_price_level(zone_low),
+            "zone_high": _format_price_level(zone_high),
+            "center_price": _format_price_level(center),
+            "latest_close_relation": _price_zone_relation(latest_close, zone_low, zone_high),
+            "latest_close_distance_from_center_pct": round(float(distance_pct), 2) if np.isfinite(distance_pct) else None,
+            "relative_profile_strength_pct": round(float(profile[idx] / profile[max_idx] * 100), 2) if profile[max_idx] > 0 else None,
+        }
+
+    max_zone = zone_record(max_idx, "最大量區", "紅色")
+    second_zone = zone_record(second_idx, "第二大量區", "橘色") if second_idx >= 0 else {}
+
+    max_low = float(bins[max_idx])
+    max_high = float(bins[max_idx + 1])
+    closes = work["Close"].astype(float).reset_index(drop=True)
+    lows = work["Low"].astype(float).reset_index(drop=True)
+    highs = work["High"].astype(float).reset_index(drop=True)
+    volumes = work["Volume"].astype(float).reset_index(drop=True)
+
+    recent_start = max(1, len(work) - 15)
+    events = []
+    for i in range(recent_start, len(work)):
+        prev_close = float(closes.iloc[i - 1])
+        curr_close = float(closes.iloc[i])
+        if prev_close <= max_high and curr_close > max_high:
+            events.append((i, "向上突破最大量區"))
+        if prev_close >= max_low and curr_close < max_low:
+            events.append((i, "向下跌破最大量區"))
+
+    recent_event = "近15個交易日未出現明確穿越最大量區"
+    event_volume_ratio = None
+    if events:
+        event_idx, event_type = events[-1]
+        subsequent_lows = lows.iloc[event_idx:]
+        subsequent_highs = highs.iloc[event_idx:]
+        prior_vol = volumes.iloc[max(0, event_idx - 20):event_idx]
+        prior_vol_mean = float(prior_vol.mean()) if len(prior_vol) else np.nan
+        if prior_vol_mean > 0:
+            event_volume_ratio = round(float(volumes.iloc[event_idx] / prior_vol_mean), 2)
+
+        if event_type == "向上突破最大量區":
+            retested = bool(len(subsequent_lows) and float(subsequent_lows.min()) <= max_high * 1.01)
+            if latest_close > max_high and retested:
+                recent_event = "突破最大量區後曾回踩，目前仍守在量區上方"
+            elif latest_close > max_high:
+                recent_event = "突破最大量區後維持在量區上方"
+            elif latest_close >= max_low:
+                recent_event = "突破最大量區後回到量區內整理"
+            else:
+                recent_event = "突破最大量區後跌回量區下方，突破尚未站穩"
+        else:
+            rebounded = bool(len(subsequent_highs) and float(subsequent_highs.max()) >= max_low * 0.99)
+            if latest_close < max_low and rebounded:
+                recent_event = "跌破最大量區後曾反彈測試，目前仍未站回量區"
+            elif latest_close < max_low:
+                recent_event = "跌破最大量區後仍位於量區下方"
+            elif latest_close <= max_high:
+                recent_event = "跌破最大量區後重新回到量區內"
+            else:
+                recent_event = "跌破最大量區後已重新站回量區上方"
+
+    # 以最近 20 個交易日的前後半段高低點比較，提供中立的波段結構。
+    structure_window = work.tail(min(20, len(work))).copy()
+    swing_structure = "資料不足"
+    if len(structure_window) >= 8:
+        split = max(4, len(structure_window) // 2)
+        first = structure_window.iloc[:split]
+        second = structure_window.iloc[split:]
+        first_high = float(first["High"].max())
+        first_low = float(first["Low"].min())
+        second_high = float(second["High"].max())
+        second_low = float(second["Low"].min())
+        tol = 0.005
+        high_up = second_high > first_high * (1 + tol)
+        high_down = second_high < first_high * (1 - tol)
+        low_up = second_low > first_low * (1 + tol)
+        low_down = second_low < first_low * (1 - tol)
+        if high_up and low_up:
+            swing_structure = "近期高點與低點同步墊高"
+        elif high_down and low_down:
+            swing_structure = "近期高點與低點同步下移"
+        elif not high_up and low_up:
+            swing_structure = "近期低點墊高，但高點尚未有效突破"
+        elif high_down and not low_down:
+            swing_structure = "近期高點下移，但低點尚未明顯跌破"
+        else:
+            swing_structure = "近期高低點呈區間整理或方向不一致"
+
+    weekly_return = _safe_float(ctx.get("stock_ret"))
+    volume_change = _safe_float(ctx.get("vol_change"))
+    if np.isfinite(weekly_return) and np.isfinite(volume_change):
+        if weekly_return > 0 and volume_change > 0:
+            price_volume_relation = "本週價漲量增"
+        elif weekly_return > 0 and volume_change <= 0:
+            price_volume_relation = "本週價漲量縮"
+        elif weekly_return < 0 and volume_change > 0:
+            price_volume_relation = "本週價跌量增"
+        elif weekly_return < 0 and volume_change <= 0:
+            price_volume_relation = "本週價跌量縮"
+        else:
+            price_volume_relation = "本週價格變化有限"
+    else:
+        price_volume_relation = "資料不足"
+
+    zone_centers = [float(centers[max_idx])]
+    if second_idx >= 0:
+        zone_centers.append(float(centers[second_idx]))
+    lower_center, upper_center = min(zone_centers), max(zone_centers)
+    if latest_close > upper_center:
+        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區的較高價格上方"
+    elif latest_close < lower_center:
+        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區的較低價格下方"
+    else:
+        relative_to_two_zones = "最新收盤位於紅色最大量區與橘色第二大量區之間"
+
+    return {
+        "available": True,
+        "chart_definition": "價量累積圖中紅色代表最大量區，橘色代表第二大量區",
+        "latest_close": _format_price_level(latest_close),
+        "maximum_volume_zone": max_zone,
+        "second_largest_volume_zone": second_zone,
+        "latest_position_relative_to_two_zones": relative_to_two_zones,
+        "recent_maximum_zone_pattern": recent_event,
+        "crossing_day_volume_vs_prior_20day_average": (
+            f"{event_volume_ratio:.2f}倍" if event_volume_ratio is not None else "無近期穿越事件或無法計算"
+        ),
+        "recent_swing_structure": swing_structure,
+        "weekly_price_volume_relationship": price_volume_relation,
+        "analysis_scope": "量區是成交成本密集區的客觀參考，只能描述支撐、壓力、突破、跌破或整理，不可直接視為買賣訊號",
+    }
+
+
+def _build_rule_based_pattern_point(ctx: dict) -> str:
+    pattern = _build_price_volume_pattern_payload(ctx)
+    if not pattern.get("available"):
+        return ""
+    max_zone = pattern.get("maximum_volume_zone", {})
+    second_zone = pattern.get("second_largest_volume_zone", {})
+    max_center = str(max_zone.get("center_price", "-") or "-")
+    second_center = str(second_zone.get("center_price", "-") or "-")
+    return (
+        f"型態面：最新收盤相對紅色最大量區約 {max_center} 與橘色第二大量區約 {second_center} 的位置為"
+        f"「{pattern.get('latest_position_relative_to_two_zones', '')}」，{pattern.get('recent_maximum_zone_pattern', '')}；"
+        f"{pattern.get('recent_swing_structure', '')}，且{pattern.get('weekly_price_volume_relationship', '')}。"
+    )
+
+
+def _build_rule_based_crossflow_point(ctx: dict) -> str:
+    df = ctx.get("plot_df", pd.DataFrame())
+    week_dates = [pd.Timestamp(d) for d in (ctx.get("stock_week_dates") or [])]
+    valid_week_dates = [d for d in week_dates if df is not None and not df.empty and d in df.index]
+    inst_week = df.loc[valid_week_dates].copy() if valid_week_dates else (df.tail(WEEK_TRADING_DAYS).copy() if df is not None else pd.DataFrame())
+    inst_total = 0.0
+    if inst_week is not None and not inst_week.empty and "total" in inst_week.columns:
+        inst_total = float(pd.to_numeric(inst_week["total"], errors="coerce").fillna(0.0).sum())
+    warrant_net = float(ctx.get("total_net", 0) or 0)
+    stock_ret = _safe_float(ctx.get("stock_ret"))
+
+    if inst_total > 0 and warrant_net > 0:
+        relation = "三大法人與權證資金同向偏多"
+    elif inst_total < 0 and warrant_net < 0:
+        relation = "三大法人與權證資金同向偏空"
+    else:
+        relation = "三大法人與權證資金方向分歧"
+
+    return (
+        f"資金交叉：股價本週 {fmt_pct(stock_ret)}，三大法人本週合計 {inst_total:+,.0f} 張，"
+        f"權證週淨流向 {fmt_money(warrant_net)}，目前呈現{relation}，應以不同資金的時間尺度解讀。"
+    )
+
 def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
     """將股價、均線、量能、法人、權證與 TOP5 分點完整整理給 AI。"""
     df = ctx.get("plot_df", pd.DataFrame())
@@ -6574,6 +6802,8 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         ),
     }
 
+    price_volume_pattern = _build_price_volume_pattern_payload(ctx)
+
     # 三大法人除最新日外，再提供本週合計，讓 AI 能比較法人與權證方向是否一致。
     inst_week = pd.DataFrame()
     if df is not None and not df.empty:
@@ -6606,6 +6836,7 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
             "weekly_volume_change_vs_previous_week": fmt_pct(ctx.get("vol_change", np.nan)),
             "latest_volume_vs_20day_average": f"{vol_ratio:.2f} 倍" if np.isfinite(vol_ratio) else "-",
         },
+        "price_volume_pattern": price_volume_pattern,
         "institutional": {
             "latest_day": {
                 "foreign": f"{_safe_float(latest.get('foreign'), 0):+,.0f}張",
@@ -6700,6 +6931,38 @@ def _weekly_points_cover_required_representative_analysis(points: List[str], ctx
     return True
 
 
+
+def _weekly_points_cover_required_pattern_analysis(points: List[str], ctx: dict) -> bool:
+    pattern = _build_price_volume_pattern_payload(ctx)
+    if not pattern.get("available"):
+        return True
+    merged = "\n".join(str(p or "") for p in points)
+    has_zone = any(k in merged for k in ["最大量區", "第一大量", "第二大量區", "價量累積", "大量區", "成本區"])
+    has_pattern_meaning = any(k in merged for k in ["突破", "跌破", "回踩", "站回", "支撐", "壓力", "整理", "量區上方", "量區下方", "量區內"])
+    has_price_volume = any(k in merged for k in ["價漲量增", "價漲量縮", "價跌量增", "價跌量縮", "放量", "量縮", "價量"])
+    return bool(has_zone and has_pattern_meaning and has_price_volume)
+
+
+def _weekly_points_low_value_technical_reasons(points: List[str]) -> List[str]:
+    """抓出只列均線或用空泛技術語句湊數的重點。"""
+    reasons = []
+    bad_phrases = [
+        "搭配KD", "搭配 KD", "搭配MACD", "搭配 MACD",
+        "需觀察動能是否延續", "觀察動能是否延續", "判斷短中期趨勢",
+        "需搭配量能", "等待KD", "等待 KD", "MACD觀察", "MACD 觀察",
+    ]
+    for idx, point in enumerate(points, 1):
+        s = str(point or "")
+        for phrase in bad_phrases:
+            if phrase in s:
+                reasons.append(f"第{idx}點含空泛技術語句「{phrase}」")
+                break
+        ma_mentions = len(re.findall(r"(?:5|10|20|60)MA", s, flags=re.I))
+        ma_price_mentions = len(re.findall(r"(?:5|10|20|60)MA\s*[-+]?\d", s, flags=re.I))
+        if ma_mentions >= 2 or ma_price_mentions >= 1:
+            reasons.append(f"第{idx}點單純羅列多條均線或均線價格")
+    return list(dict.fromkeys(reasons))
+
 def _repair_weekly_points_with_required_branch(
     points: List[str],
     payload: dict,
@@ -6714,6 +6977,7 @@ def _repair_weekly_points_with_required_branch(
     original_points = [str(p or "").strip() for p in points if str(p or "").strip()]
     repair_payload = {
         "required_representative_branch_analysis": required,
+        "required_price_volume_pattern_analysis": payload.get("price_volume_pattern", {}),
         "original_points": original_points,
         "full_weekly_data": payload,
     }
@@ -6723,11 +6987,12 @@ def _repair_weekly_points_with_required_branch(
 
 請輸出剛好 3 點繁體中文重點，並遵守：
 1. 其中剛好一點必須完整分析 required_representative_branch_analysis，必須同時寫出該分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並解讀其籌碼品質與操作時間尺度。
-2. 分點分析不得只寫買賣超金額或集中度，也不得省略勝率、歷史加權報酬率、平均持有天數。
-3. 另外兩點必須是不同面向的中立交叉分析，可從股價與均線量能、三大法人與權證資金方向、資金流連續性中選擇；不得重複同一個背離結論。
-4. 每一點都必須獨立完整，約 45～90 個中文字，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
-5. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
-6. 所有數字必須與 JSON 完全一致。
+2. 其中剛好一點必須分析 required_price_volume_pattern_analysis：使用紅色最大量區、橘色第二大量區、最新收盤相對位置、近期突破／跌破／回踩狀態與價量關係，說明目前型態屬支撐、壓力、整理或突破未站穩；不得只列量區價格。
+3. 最後一點應比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或時間尺度差異。
+4. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。均線、KD、MACD只能作為型態佐證。
+5. 每一點都必須獨立完整，約 45～90 個中文字，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
+6. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
+7. 所有數字必須與 JSON 完全一致。
 
 請只回傳 JSON：
 {{
@@ -6743,7 +7008,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v6_repair",
+        cache_task="weekly_keypoints_ai_analysis_v7_pattern_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -6772,20 +7037,21 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 6. 代表性分點那一點不得只寫金額或買盤集中度，也不得省略勝率、歷史加權報酬率、平均持有天數；若三項歷史資料均已提供，就必須全部使用。
 7. 個別分點只能從 required_representative_branch_analysis、representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這些資料內的分點不得點名、不得引用其歷史績效。
 8. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱；小額高勝率分點不得與主要大額分點對等比較。
-9. 另外兩點必須選擇兩個不同的中立分析面向，例如：
-   - 股價漲跌、均線與量能之間的技術結構。
-   - 三大法人與權證週資金方向是否一致或衝突。
-   - 權證資金流與股價方向是否同向或背離。
-   - 資金流的集中度、連續性或時間尺度。
-10. 另外兩點不得重複描述同一個「背離」或「分歧」結論；每點必須提供不同資訊價值。
-11. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
-12. 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，但不可武斷寫成一定是隔日沖。
-13. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
-14. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
-15. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
-16. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
-17. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
-18. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
+9. 若 price_volume_pattern.available 為 true，三點中必須有且只有一點進行價量型態分析：
+   - 紅色 maximum_volume_zone 是最大量區，橘色 second_largest_volume_zone 是第二大量區。
+   - 必須分析最新收盤相對兩個量區的位置、近期突破／跌破／回踩狀態、近期高低點結構與價量關係。
+   - 必須說明量區目前較接近支撐、壓力、成本整理區或突破尚未站穩，不得只列量區價格。
+10. 第三點優先比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或不同資金時間尺度；不得與型態點重複同一結論。
+11. 禁止單純羅列 MA5、MA10、MA20、MA60 的價格；禁止只寫「搭配 KD／MACD 觀察」「需觀察動能是否延續」「判斷短中期趨勢」等可套用於任何股票的空泛句。
+12. 均線、KD、MACD只能用來佐證具體型態，例如確認突破、跌破、回踩或趨勢結構，不能單獨構成一點。每一點必須至少比較兩類資料並說明代表意義。
+13. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
+14. 平均持有約 2 天可保守解讀為操作週期偏短、接近隔日沖或快速進出；約 3～4 天可解讀為短線波段，但不可武斷寫成一定是隔日沖。
+15. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
+16. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
+17. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
+18. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
+19. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
+20. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
 
 輸出前請自行檢查：每個數字都必須能在 JSON 中找到；每一點都必須是資料之間的分析關係，而不是單純列數字。
 
@@ -6803,7 +7069,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v6",
+            cache_task="weekly_keypoints_ai_analysis_v7_pattern",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -6828,13 +7094,21 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
             )
             return []
 
-        if not _weekly_points_cover_required_representative_analysis(points, ctx):
+        branch_ok = _weekly_points_cover_required_representative_analysis(points, ctx)
+        pattern_ok = _weekly_points_cover_required_pattern_analysis(points, ctx)
+        low_value_reasons = _weekly_points_low_value_technical_reasons(points)
+
+        if not branch_ok or not pattern_ok or low_value_reasons:
             required = _get_required_representative_branch_analysis(ctx)
             required_name = str((required or {}).get("branch", "") or "")
-            print(
-                f"⚠️ Gemini 本週重點未完整使用代表性分點「{required_name}」的勝率、"
-                "歷史加權報酬率與平均持有天數，啟動一次修正生成"
-            )
+            problems = []
+            if not branch_ok:
+                problems.append(f"未完整分析代表性分點「{required_name}」的歷史績效與持有天數")
+            if not pattern_ok:
+                problems.append("未使用紅色最大量區、橘色第二大量區與價量關係完成型態分析")
+            problems.extend(low_value_reasons)
+            print("⚠️ Gemini 本週重點需要修正：" + "；".join(problems))
+
             repaired_points = _repair_weekly_points_with_required_branch(
                 points,
                 payload,
@@ -6842,18 +7116,21 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
                 stock_name,
             )
             repaired_forbidden = _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx)
+            repaired_low_value = _weekly_points_low_value_technical_reasons(repaired_points)
             if (
                 len(repaired_points) == 3
                 and _count_summary_chars(repaired_points) >= 100
                 and all(_count_summary_chars([p]) >= 24 for p in repaired_points)
                 and _points_are_independent_and_complete(repaired_points)
                 and not repaired_forbidden
+                and not repaired_low_value
                 and _weekly_points_cover_required_representative_analysis(repaired_points, ctx)
+                and _weekly_points_cover_required_pattern_analysis(repaired_points, ctx)
             ):
                 points = repaired_points
-                print("✅ Gemini 本週重點修正完成：已納入代表性分點完整歷史分析")
+                print("✅ Gemini 本週重點修正完成：已納入代表性分點、價量型態與資金交叉分析")
             else:
-                print("⚠️ Gemini 本週重點修正後仍未完整涵蓋代表性分點歷史資料，改用規則式固定格式")
+                print("⚠️ Gemini 本週重點修正後仍未達分析品質要求，改用規則式固定格式")
                 return []
 
         print(f"✅ Gemini 自主分析本週重點完成：3 點，總字數約 {_count_summary_chars(points)} 字")
@@ -7146,35 +7423,20 @@ def add_panel_title(ax, title, subtitle=""):
 
 
 def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.15, scale=1.08):
-    if df is None or df.empty:
+    stats = _calculate_weighted_volume_profile_stats(df, n_bins=n_bins)
+    if not stats:
         return
-    lows, highs, opens, closes, volumes = df["Low"], df["High"], df["Open"], df["Close"], df["Volume"]
-    price_min, price_max = lows.min(), highs.max()
-    if price_max <= price_min:
-        return
-    bins = np.linspace(price_min, price_max, n_bins + 1)
-    centers = (bins[:-1] + bins[1:]) / 2
-    height = bins[1] - bins[0]
-    profile = np.zeros(n_bins)
-    for i in range(len(df)):
-        vol, low, high, open_, close = volumes.iloc[i], lows.iloc[i], highs.iloc[i], opens.iloc[i], closes.iloc[i]
-        body_min, body_max = min(open_, close), max(open_, close)
-        ranges = [((low, body_min), 0.2), ((body_min, body_max), 0.6), ((body_max, high), 0.2)]
-        for (start, end), weight in ranges:
-            if end - start < 1e-6:
-                continue
-            idxs = np.where((centers >= start) & (centers <= end))[0]
-            if len(idxs):
-                profile[idxs] += vol * weight / len(idxs)
-    if profile.max() <= 0:
+    centers = stats["centers"]
+    height = float(stats["height"])
+    profile = stats["profile"]
+    max_idx = int(stats["max_idx"])
+    second_idx = int(stats["second_idx"])
+    if len(profile) == 0 or float(profile.max()) <= 0:
         return
     scaled = profile / profile.max()
     x_min, x_max = ax.get_xlim()
     width_max = (x_max - x_min) / scale
-    sorted_idx = np.argsort(profile)[::-1]
-    max_idx = int(sorted_idx[0]) if len(sorted_idx) else -1
-    second_idx = int(sorted_idx[1]) if len(sorted_idx) > 1 else -1
-    for i in range(n_bins):
+    for i in range(len(profile)):
         w = scaled[i] * width_max
         if i == max_idx:
             rect_color = "#DC2626"   # 第一大量：紅色
