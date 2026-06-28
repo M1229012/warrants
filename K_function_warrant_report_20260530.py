@@ -4056,32 +4056,86 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     return add_max_warrant(buy_br, positive=True), add_max_warrant(sell_br, positive=False)
 
 
+def _build_rule_based_next_week_watch(ctx: dict) -> str:
+    """AI 失敗時的條件式下週觀察，不預測漲跌，也不提供買賣建議。"""
+    pattern = _build_price_volume_pattern_payload(ctx)
+    pattern_label = str(pattern.get("current_pattern_label", "") or "").strip()
+    position = str(pattern.get("latest_position_relative_to_two_zones", "") or "").strip()
+    recent_event = str(pattern.get("recent_maximum_zone_pattern", "") or "").strip()
+    price_volume = str(pattern.get("weekly_price_volume_relationship", "") or "").strip()
+    warrant_net = float(ctx.get("total_net", 0) or 0)
+    inst_ctx = _get_weekly_institutional_context(ctx)
+    inst_class = str(inst_ctx.get("classification", "") or "")
+
+    if pattern.get("available"):
+        if any(k in pattern_label for k in ["區間", "整理", "震盪"]):
+            return (
+                f"下週觀察：目前屬於{pattern_label}，可留意股價能否脫離主要成交成本區，"
+                f"以及突破或回測時量能是否配合；若仍在區間內反覆，代表方向尚未明確。"
+            )
+        if "突破" in pattern_label:
+            return (
+                f"下週觀察：目前屬於{pattern_label}，重點在突破後能否守住主要成交成本區，"
+                f"並觀察量能與權證資金是否持續，避免突破後快速回落。"
+            )
+        if "跌破" in pattern_label or "轉弱" in pattern_label:
+            return (
+                f"下週觀察：目前屬於{pattern_label}，可留意股價能否重新站回主要成交成本區；"
+                f"若反彈量能不足且權證資金轉弱，型態修復力道仍有限。"
+            )
+        return (
+            f"下週觀察：目前型態為{pattern_label or '整理格局'}，{position}；"
+            f"後續可追蹤{recent_event or '主要成交成本區的突破與回測'}，並確認{price_volume or '價量是否配合'}。"
+        )
+
+    if warrant_net > 0:
+        flow_text = "權證資金能否延續淨買超"
+    elif warrant_net < 0:
+        flow_text = "權證資金是否持續調節"
+    else:
+        flow_text = "權證資金能否形成明確方向"
+    inst_text = "法人是否由中性轉為明確方向" if inst_class == "接近中性" else "法人與權證資金是否維持同向"
+    return f"下週觀察：可追蹤{flow_text}，以及{inst_text}；若價格與資金方向開始同步，訊號的延續性會較具參考價值。"
+
+
 def _rule_based_key_points(ctx, stock_name: str):
-    """AI 失敗時的固定備援：代表性分點、價量型態、法人與權證資金交叉。"""
-    points = []
-    points.extend(_build_branch_perf_focus_points(ctx, limit=1))
+    """AI 失敗時的備援：保留兩個本週分析，再加入一個條件式下週觀察。"""
+    candidates = []
+
+    branch_points = _build_branch_perf_focus_points(ctx, limit=1)
+    candidates.extend(branch_points)
 
     pattern_point = _build_rule_based_pattern_point(ctx)
     if pattern_point:
-        points.append(pattern_point)
+        candidates.append(pattern_point)
 
     crossflow_point = _build_rule_based_crossflow_point(ctx)
     if crossflow_point:
-        points.append(crossflow_point)
+        candidates.append(crossflow_point)
 
-    if len(points) < 3:
+    if len(candidates) < 2:
         e = ctx.get("week_events")
         if e is not None and not e.empty:
             by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
             positive = by_branch[by_branch > 0]
             if not positive.empty:
                 top_share = float(positive.iloc[0] / max(positive.sum(), 1.0) * 100)
-                points.append(
+                candidates.append(
                     f"籌碼集中度：本週最大買超分點占全部正買超約 {top_share:.1f}%，"
-                    "若買盤集中於少數分點，代表籌碼廣度仍需與後續連續性一併判斷。"
+                    "買盤集中度偏高時，需與後續分點連續性一併判斷，不能只看單週金額。"
                 )
-    return _clean_weekly_key_points(points)[:3]
 
+    points = []
+    for p in candidates:
+        if p and p not in points:
+            points.append(p)
+        if len(points) >= 2:
+            break
+
+    watch = _build_rule_based_next_week_watch(ctx)
+    if watch:
+        points.append(watch)
+    return _clean_weekly_key_points(points)[:3]
 
 def _finish_complete_summary_point(text: str, max_len: int, min_cut_len: int = 30) -> str:
     """將週報重點整理成獨立完整句，不用省略號，也不在句子中間硬切。"""
@@ -4190,14 +4244,14 @@ def _ensure_weekly_keypoint_min_total(points: List[str], ctx: dict, stock_name: 
 
 
 def build_key_points(ctx, stock_name: str):
-    """本週重點：AI 先讀取完整資料自行挑選 3 個關聯重點；AI 失敗才走原本固定格式。"""
+    """本週重點與下週觀察：AI 自主挑選重要訊號；AI 失敗才走條件式備援。"""
     ai_points = _summarize_weekly_context_with_gemini(ctx, stock_name)
     if ai_points:
         # AI 成功時不再強制插入固定勝率句型，也不使用規則式文字補字數；
         # 讓 AI 依完整資料自行判斷最值得呈現的三個重點。
         return _clean_weekly_key_points(ai_points)[:3]
 
-    # AI 不可用、呼叫失敗、格式不合格或內容過短時，才回到目前既有固定格式。
+    # AI 不可用、呼叫失敗、格式不合格或內容過短時，才回到條件式備援。
     rule_points = _ensure_branch_perf_point(_rule_based_key_points(ctx, stock_name), ctx)
     return _ensure_weekly_keypoint_min_total(rule_points, ctx, stock_name)
 
@@ -7223,6 +7277,11 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         "representative_sell_top5_with_history": representative_sell_rows,
         "required_representative_branch_analysis": required_representative_branch_analysis,
         "non_representative_top5_summary": small_amount_summary,
+        "recent_news_summary": [
+            str(x or "").strip()
+            for x in (ctx.get("weekly_news_points") or [])
+            if str(x or "").strip()
+        ][:NEWS_DISPLAY_MAX_POINTS],
     }
     return payload
 
@@ -7342,6 +7401,91 @@ def _weekly_points_low_value_technical_reasons(points: List[str]) -> List[str]:
             reasons.append(f"第{idx}點單純羅列多條均線或均線價格")
     return list(dict.fromkeys(reasons))
 
+def _weekly_points_watch_count(points: List[str]) -> int:
+    prefixes = ("下週觀察：", "下週觀察:", "下週留意：", "下週留意:", "下週焦點：", "下週焦點:")
+    return sum(1 for p in points if str(p or "").strip().startswith(prefixes))
+
+
+def _weekly_points_have_current_week_analysis(points: List[str]) -> bool:
+    prefixes = ("下週觀察：", "下週觀察:", "下週留意：", "下週留意:", "下週焦點：", "下週焦點:")
+    return any(not str(p or "").strip().startswith(prefixes) for p in points)
+
+
+def _weekly_points_conditionally_cover_branch(points: List[str], ctx: dict) -> bool:
+    """未選擇分點時不強制；若點名代表性分點，需完整使用其歷史資料。"""
+    required = _get_required_representative_branch_analysis(ctx)
+    if not required:
+        return True
+    branch = str(required.get("branch", "") or "").strip()
+    merged = "\n".join(str(p or "") for p in points)
+    if not branch or branch not in merged:
+        return True
+    return _weekly_points_cover_required_representative_analysis(points, ctx)
+
+
+def _weekly_points_conditionally_cover_pattern(points: List[str], ctx: dict) -> bool:
+    """未選擇型態面時不強制；若談型態或大量區，必須使用程式判定的型態標籤。"""
+    pattern = _build_price_volume_pattern_payload(ctx)
+    if not pattern.get("available"):
+        return True
+    merged = "\n".join(str(p or "") for p in points)
+    # 單純在「下週觀察」中寫能否突破，不代表 AI 已選擇完整型態分析；
+    # 只有明確談到型態、量區或程式型態標籤時，才要求使用完整價量型態依據。
+    pattern_terms = ["型態", "大量區", "成本區", "價量累積"]
+    required_label = str(pattern.get("current_pattern_label", "") or "").strip()
+    if not any(k in merged for k in pattern_terms) and not (required_label and required_label in merged):
+        return True
+    return _weekly_points_cover_required_pattern_analysis(points, ctx)
+
+
+def _repair_weekly_expert_points(
+    points: List[str],
+    payload: dict,
+    ctx: dict,
+    stock_name: str,
+    problems: List[str],
+) -> List[str]:
+    """保留 AI 自主選題，只修正缺少下週觀察、空泛內容或資料誤讀。"""
+    repair_payload = {
+        "problems_to_fix": [str(x) for x in problems if str(x).strip()],
+        "original_points": [str(p or "").strip() for p in points if str(p or "").strip()],
+        "full_weekly_data": payload,
+    }
+    repair_prompt = f"""
+你是台股股票研究員，請修正上一版的「本週重點與下週觀察」。只能使用下方 JSON，不可使用外部知識或自行補數字。
+
+請重新輸出剛好 3 點，規則如下：
+1. 由你依資料重要性自行決定本週要分析什麼，不得固定套用分點、型態、法人三段式；應挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
+2. 3 點中至少 1 點、最多 2 點必須以「下週觀察：」開頭；其餘為本週已發生的重點分析。
+3. 下週觀察只能寫條件式追蹤，例如能否守穩、突破、回測、量能是否配合、法人或權證資金是否延續，不得預測一定上漲或下跌，也不得給買賣建議。
+4. 若選擇分析代表性分點，必須使用該分點本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並說明其籌碼品質及時間尺度；沒有選擇分點則不必硬寫。
+5. 若選擇分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
+6. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
+7. 禁止單純羅列均線價格、KD或MACD；每點必須有比較、判斷與中立結論。
+8. 每點約45至90個中文字，獨立完整並以句號結束，不得使用省略號或承接上一點的半句。
+9. 不得點名非代表性小額分點，不得放大解讀接近中性的法人數據。
+
+請只回傳 JSON：
+{{
+  "points": [
+    "第一點",
+    "第二點",
+    "第三點"
+  ]
+}}
+
+修正資料 JSON：
+{json.dumps(repair_payload, ensure_ascii=False, indent=2)}
+"""
+    output_text = _call_gemini_with_retry(
+        repair_prompt,
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v11_repair",
+        stock_code=str(ctx.get("stock_code", "") or ""),
+        stock_name=stock_name,
+    )
+    return _parse_weekly_gemini_points(output_text or "")
+
+
 def _repair_weekly_points_with_required_branch(
     points: List[str],
     payload: dict,
@@ -7395,54 +7539,39 @@ def _repair_weekly_points_with_required_branch(
 
 
 def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
-    """讓 Gemini 比較完整資料後，自行挑選最有意義的三個本週重點。"""
+    """讓 Gemini 以股票研究員角度，自主整理本週重點與下週條件式觀察。"""
     if not WEEKLY_KEYPOINT_LLM_ENABLE:
         return []
     try:
         payload = _build_weekly_llm_payload(ctx, stock_name)
         payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
         prompt = f"""
-你是台股權證週報分析助手。你只能使用我提供的 JSON 資料，不可使用外部知識、不可自行補數字或推測不存在的事件。
+你是一位專業且中立的台股股票研究員。你只能使用我提供的 JSON 資料，不可使用外部知識、不可自行補數字或推測不存在的事件。
 請使用繁體中文。
 
-任務：完整閱讀股價漲跌、均線、量能、三大法人、權證週買賣超、買超與賣超 TOP5，以及可取得的分點歷史勝率、歷史加權報酬率與平均持有天數，從中自行挑選「最有分析價值的 3 個關聯重點」。
+任務：完整閱讀股價與量能、價量型態、三大法人、權證資金流、買賣超 TOP5、具代表性分點的歷史勝率／歷史加權報酬率／平均持有天數，以及 recent_news_summary，整理「本週重點與下週觀察」。
 
-分析原則：
-1. 必須輸出剛好 3 點，每點約 45～90 個中文字，而且每一點都必須是可獨立閱讀的完整分析。
-2. 禁止把同一項分析拆成兩點；第二點或第三點不能接續上一點未完成的句意。
-3. 每點必須有明確主題、資料關係與結論，並以完整句號結束；不得使用「…」或「...」結尾。
-4. 每一點優先比較至少兩類資料之間的關係，不要只是逐項抄寫數字。
-5. 若 required_representative_branch_analysis 不是 null，三點中必須有且只有一點完整分析該分點；必須同時寫出分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並分析籌碼品質與操作時間尺度。
-6. 代表性分點那一點不得只寫金額或買盤集中度，也不得省略勝率、歷史加權報酬率、平均持有天數；若三項歷史資料均已提供，就必須全部使用。
-7. 個別分點只能從 required_representative_branch_analysis、representative_buy_top5_with_history 或 representative_sell_top5_with_history 中挑選；不在這些資料內的分點不得點名、不得引用其歷史績效。
-8. non_representative_top5_summary 只用來理解仍有其他小額分點，不得自行推測或描述其中任何分點名稱；小額高勝率分點不得與主要大額分點對等比較。
-9. 若 price_volume_pattern.available 為 true，三點中必須有且只有一點進行價量型態分析：
-   - 必須直接寫出 price_volume_pattern.current_pattern_label 所提供的明確型態名稱，例如區間盤整、低點墊高的區間盤整、高檔震盪、突破後回踩整理或跌破轉弱；不得只列出判斷條件卻不說目前屬於哪一種型態。
-   - 紅色 maximum_volume_zone 是第一大量區（最大量區），橘色 second_largest_volume_zone 是第二大量區。
-   - 再使用最新收盤位於兩個大量區之上、之下、量區內或兩者之間，以及近期突破／跌破／回踩、高低點結構與價量關係，解釋該型態標籤的原因。
-   - 不得把 current_pattern_label 擅自改成不同型態，也不得只用模糊的「整理中」「方向不明」取代明確型態名稱。
-   - 嚴禁輸出第一大量區、第二大量區的實際價格、中心價、距離百分比或「約多少元」等明確價位。
-10. 第三點優先比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須說明法人本週買賣幅度有限、尚未形成明確方向，不得放大解讀為明顯分歧、偏空或法人賣壓；只有超過 neutral_threshold 時，才能描述法人與權證同向或分歧。不得與型態點重複同一結論。
-11. 禁止單純羅列 MA5、MA10、MA20、MA60 的價格；禁止只寫「搭配 KD／MACD 觀察」「需觀察動能是否延續」「判斷短中期趨勢」等可套用於任何股票的空泛句。
-12. 均線、KD、MACD只能用來佐證具體型態，例如確認突破、跌破、回踩或趨勢結構，不能單獨構成一點。每一點必須至少比較兩類資料並說明代表意義。
-13. 價量型態重點必須是統整後的中立分析，不可寫成「最大量區為多少、第二大量區為多少」的數值報告；大量區只描述相對位置與可能扮演的支撐、壓力或成本整理角色。
-14. 勝率高但歷史加權報酬率偏低或為負時，可分析命中穩定度與實際獲利幅度不一致；兩者皆高時，可分析歷史表現兼具穩定度與報酬效果。
-15. 平均持有天數必須依實際時間尺度描述：2.5天以下為極短線、接近隔日沖或快速進出；2.5至5天為短線波段；5至10天為短線至中期；10至20天為中期波段；超過20天為中期至中長波段。超過5天後不得再使用「隔日沖」作為比較語句。
-16. 若 required_representative_branch_analysis 為 null，才不強制寫分點歷史績效，改由其他客觀面向補足三點。
-17. 若分點沒有 historical_statistics_available，不能自行補上勝率、報酬率或持有天數。
-18. 若資料方向互相矛盾，應明確指出同向、背離、分歧或訊號時間尺度不同。
-19. 不得直接給買賣建議，不得寫建議買進、可以進場、目標價、停損或停利。
-20. 不得使用「此外」「另外」「延續前述」「上述」「相對地」等依賴上一點的承接開頭。
-21. 不要使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣；不得輸出問號、導流文字、標籤或未提供的新聞題材。
-
-輸出前請自行檢查：每個數字都必須能在 JSON 中找到；每一點都必須是資料之間的分析關係，而不是單純列數字。
+核心要求：
+1. 請輸出剛好 3 點，但不要固定套用「分點、型態、法人」三段式。你要像股票研究員一樣，自行判斷這檔股票本週最值得說明的訊號。
+2. 優先挑選以下類型的內容：本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、可能影響下週的重要事件或條件。
+3. 3 點中至少 1 點、最多 2 點必須以「下週觀察：」開頭；其餘點描述本週已經發生的重點。
+4. 下週觀察必須採條件式語氣，例如「若量縮守穩」「若放量突破」「需觀察代表性分點是否延續」「法人是否由中性轉為明確方向」。不得預測一定上漲或下跌，也不得給買進、賣出、停損、停利或目標價建議。
+5. 不必每張週報都寫分點歷史績效。只有代表性分點的本週金額與歷史資料真的具有分析價值時才使用；若選擇寫分點，必須同時使用其本週買超或賣超方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並解釋籌碼品質與操作時間尺度。
+6. 不必每張週報都寫價量型態。若選擇寫型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、高低點、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
+7. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊，也不要為了湊點數硬寫新聞。
+8. 三大法人、權證資金與股價方向可用來分析同向、背離或不同時間尺度；若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
+9. 個別分點只能從 representative_buy_top5_with_history、representative_sell_top5_with_history 或 required_representative_branch_analysis 中挑選；不得點名 non_representative_top5_summary 所代表的小額分點。
+10. 禁止單純羅列 MA5、MA10、MA20、MA60 價格，禁止只寫 KD、MACD 或「觀察動能是否延續」等可套用任何股票的空泛文字。均線與技術指標只能用來佐證具體型態或資金關係。
+11. 每一點都必須包含明確主題、資料關係與中立結論；三點不得重複相同結論，也不得把同一分析拆成兩點。
+12. 每點約 45～90 個中文字，必須獨立完整並以句號結束；不得使用省略號，不得以「此外」「另外」「前述」「相對地」等承接上一點的方式開頭。
+13. 所有數字都必須能在 JSON 中找到。若資料不足，就使用其他有根據的面向，不得自行創造內容。
 
 請只回傳 JSON，不要 markdown，不要其他說明：
 {{
   "points": [
-    "第一個關聯重點",
-    "第二個關聯重點",
-    "第三個關聯重點"
+    "第一個本週重點或下週觀察",
+    "第二個本週重點或下週觀察",
+    "第三個本週重點或下週觀察"
   ]
 }}
 
@@ -7451,79 +7580,77 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v10_pattern_label_holding_scale",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v11",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
         points = _parse_weekly_gemini_points(output_text or "")
 
-        # 只有真正產出三個具一定資訊量的重點才視為 AI 成功；否則由 build_key_points 回到原固定格式。
+        problems = []
         if len(points) != 3:
-            print(f"⚠️ Gemini 本週重點數量不合格：取得 {len(points)} 點，改用規則式固定格式")
-            return []
+            problems.append(f"重點數量為 {len(points)}，應為 3 點")
         if any(_count_summary_chars([p]) < 24 for p in points) or _count_summary_chars(points) < 100:
-            print("⚠️ Gemini 本週重點內容過短，改用規則式固定格式")
-            return []
-        if not _points_are_independent_and_complete(points):
-            print("⚠️ Gemini 本週重點出現承接句、半句或省略號，改用規則式固定格式")
-            return []
+            problems.append("內容過短")
+        if points and not _points_are_independent_and_complete(points):
+            problems.append("出現承接句、半句或省略號")
+        watch_count = _weekly_points_watch_count(points)
+        if watch_count < 1 or watch_count > 2:
+            problems.append("下週觀察應為 1 至 2 點，且需以『下週觀察：』開頭")
+        if points and not _weekly_points_have_current_week_analysis(points):
+            problems.append("缺少本週已發生的重點分析")
+
         forbidden_branches = _weekly_points_mention_nonrepresentative_branch(points, ctx)
         if forbidden_branches:
-            print(
-                "⚠️ Gemini 本週重點點名金額不具代表性的分點："
-                + "、".join(forbidden_branches)
-                + "，改用規則式固定格式"
-            )
-            return []
-
-        branch_ok = _weekly_points_cover_required_representative_analysis(points, ctx)
-        pattern_ok = _weekly_points_cover_required_pattern_analysis(points, ctx)
+            problems.append("點名金額不具代表性的分點：" + "、".join(forbidden_branches))
         low_value_reasons = _weekly_points_low_value_technical_reasons(points)
-        neutral_overstated = _weekly_points_overstate_neutral_institutional(points, ctx)
+        problems.extend(low_value_reasons)
+        if _weekly_points_overstate_neutral_institutional(points, ctx):
+            problems.append("法人接近中性卻被放大解讀")
+        if not _weekly_points_conditionally_cover_branch(points, ctx):
+            problems.append("既然選擇分析代表性分點，就必須完整使用勝率、加權報酬率與平均持有天數")
+        if not _weekly_points_conditionally_cover_pattern(points, ctx):
+            problems.append("既然選擇分析型態，就必須使用程式判定的型態標籤與價量依據")
 
-        if not branch_ok or not pattern_ok or low_value_reasons or neutral_overstated:
-            required = _get_required_representative_branch_analysis(ctx)
-            required_name = str((required or {}).get("branch", "") or "")
-            problems = []
-            if not branch_ok:
-                problems.append(f"未完整分析代表性分點「{required_name}」的歷史績效與持有天數")
-            if not pattern_ok:
-                problems.append("未直接使用程式判定的明確型態標籤，或未結合大量區相對位置與價量關係完成分析")
-            if neutral_overstated:
-                problems.append("三大法人接近中性，卻被放大解讀為明顯分歧或法人賣壓")
-            problems.extend(low_value_reasons)
-            print("⚠️ Gemini 本週重點需要修正：" + "；".join(problems))
+        if problems:
+            print("⚠️ Gemini 本週重點與下週觀察需要修正：" + "；".join(problems))
+            repaired_points = _repair_weekly_expert_points(points, payload, ctx, stock_name, problems)
+            repaired_problems = []
+            if len(repaired_points) != 3:
+                repaired_problems.append("數量不合格")
+            if repaired_points and not _points_are_independent_and_complete(repaired_points):
+                repaired_problems.append("句子不完整")
+            repaired_watch_count = _weekly_points_watch_count(repaired_points)
+            if repaired_watch_count < 1 or repaired_watch_count > 2:
+                repaired_problems.append("下週觀察數量不合格")
+            if repaired_points and not _weekly_points_have_current_week_analysis(repaired_points):
+                repaired_problems.append("缺少本週分析")
+            if _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx):
+                repaired_problems.append("仍點名小額分點")
+            if _weekly_points_low_value_technical_reasons(repaired_points):
+                repaired_problems.append("仍有空泛技術內容")
+            if _weekly_points_overstate_neutral_institutional(repaired_points, ctx):
+                repaired_problems.append("仍放大法人中性訊號")
+            if not _weekly_points_conditionally_cover_branch(repaired_points, ctx):
+                repaired_problems.append("分點歷史分析不完整")
+            if not _weekly_points_conditionally_cover_pattern(repaired_points, ctx):
+                repaired_problems.append("型態分析未使用程式判定")
+            if any(_count_summary_chars([p]) < 24 for p in repaired_points) or _count_summary_chars(repaired_points) < 100:
+                repaired_problems.append("內容仍過短")
 
-            repaired_points = _repair_weekly_points_with_required_branch(
-                points,
-                payload,
-                ctx,
-                stock_name,
-            )
-            repaired_forbidden = _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx)
-            repaired_low_value = _weekly_points_low_value_technical_reasons(repaired_points)
-            repaired_neutral_overstated = _weekly_points_overstate_neutral_institutional(repaired_points, ctx)
-            if (
-                len(repaired_points) == 3
-                and _count_summary_chars(repaired_points) >= 100
-                and all(_count_summary_chars([p]) >= 24 for p in repaired_points)
-                and _points_are_independent_and_complete(repaired_points)
-                and not repaired_forbidden
-                and not repaired_low_value
-                and not repaired_neutral_overstated
-                and _weekly_points_cover_required_representative_analysis(repaired_points, ctx)
-                and _weekly_points_cover_required_pattern_analysis(repaired_points, ctx)
-            ):
-                points = repaired_points
-                print("✅ Gemini 本週重點修正完成：已納入代表性分點、價量型態與資金交叉分析")
-            else:
-                print("⚠️ Gemini 本週重點修正後仍未達分析品質要求，改用規則式固定格式")
+            if repaired_problems:
+                print("⚠️ Gemini 修正後仍未達要求，改用條件式備援：" + "；".join(repaired_problems))
                 return []
+            points = repaired_points
+            print("✅ Gemini 本週重點與下週觀察修正完成")
 
-        print(f"✅ Gemini 自主分析本週重點完成：3 點，總字數約 {_count_summary_chars(points)} 字")
+        print(
+            f"✅ Gemini 股票研究員分析完成：{len(points)} 點｜"
+            f"下週觀察 { _weekly_points_watch_count(points) } 點｜"
+            f"總字數約 {_count_summary_chars(points)} 字"
+        )
         return points[:3]
     except Exception as e:
-        print(f"⚠️ Gemini 本週重點整理失敗，改用規則式固定格式：{e}")
+        print(f"⚠️ Gemini 本週重點與下週觀察整理失敗，改用條件式備援：{e}")
         return []
 
 def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
@@ -8266,8 +8393,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                       height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55],
                       hspace=0.20, wspace=0.25)
     else:
-        key_points = build_key_points(ctx, stock_name)
         news_points = build_news_points(stock_code, stock_name, news_items, ctx)
+        ctx["weekly_news_points"] = list(news_points or [])
+        key_points = build_key_points(ctx, stock_name)
         fig = plt.figure(figsize=(28, 59), facecolor=BG)
         gs = GridSpec(9, 12, figure=fig,
                       height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
@@ -8621,7 +8749,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     if not compact_mode:
         # Notes row
         ax_notes = fig.add_subplot(gs[8, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
-        for x0, title in [(0.02, "本週重點"), (0.52, "本週新聞 / 題材觀察")]:
+        for x0, title in [(0.02, "本週重點與下週觀察"), (0.52, "本週新聞 / 題材觀察")]:
             note_y = 0.005
             note_w = 0.48
             note_h = 0.975
