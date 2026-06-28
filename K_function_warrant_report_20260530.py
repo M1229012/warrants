@@ -204,6 +204,14 @@ BRANCH_PERF_MAX_MATCHES = int(os.getenv("WARRANT_BRANCH_PERF_MAX_MATCHES", "3"))
 WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO = float(
     os.getenv("WARRANT_WEEKLY_KEYPOINT_BRANCH_MIN_OVERALL_RATIO", "0.25")
 )
+# 三大法人本週合計接近中性時，不放大解讀為明顯多空或與權證資金分歧。
+# 門檻取「至少固定張數」與「20日均量一定比例」兩者較大值。
+WEEKLY_KEYPOINT_INST_NEUTRAL_MIN_SHARES = float(
+    os.getenv("WARRANT_WEEKLY_KEYPOINT_INST_NEUTRAL_MIN_SHARES", "100")
+)
+WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO = float(
+    os.getenv("WARRANT_WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO", "0.05")
+)
 _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
 
@@ -1901,7 +1909,7 @@ def _describe_branch_holding_style(avg_holding_days) -> str:
         return "持有週期偏短，操作節奏接近隔日沖或短線快速進出"
     if days <= 4.5:
         return "以約3至4個交易日的短線波段操作為主"
-    return ""
+    return "持有週期相對較長，並非純隔日沖型操作"
 
 
 def _format_avg_holding_days(avg_holding_days) -> str:
@@ -2022,8 +2030,11 @@ def _format_branch_perf_focus_point(match: dict) -> str:
         ending = "具歷史績效的分點本週轉為調節，籌碼方向值得持續追蹤。"
 
     holding_text = ""
-    if holding_style and np.isfinite(_parse_number_like_value(avg_holding_days)):
-        holding_text = f"，平均持有約 {_format_avg_holding_days(avg_holding_days)}，{holding_style}"
+    parsed_holding_days = _parse_number_like_value(avg_holding_days)
+    if np.isfinite(parsed_holding_days) and parsed_holding_days > 0:
+        holding_text = f"，平均持有約 {_format_avg_holding_days(avg_holding_days)}"
+        if holding_style:
+            holding_text += f"，{holding_style}"
 
     return (
         f"{side_label}TOP{rank} 分點「{branch}」本週淨流向 {fmt_money(net_amount)}，"
@@ -6122,7 +6133,17 @@ def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock
     return _clean_news_summary_points_for_stock(expanded, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
 def _parse_gemini_news_points(output_text: str, records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    raw_points = _parse_raw_points_from_llm(output_text)
+    """只讀取 Gemini JSON 的 points；note 僅供內部說明，絕不可畫進新聞區。"""
+    parsed = _extract_json_from_text(output_text)
+    if isinstance(parsed, dict):
+        raw_points = parsed.get("points", []) or []
+    elif isinstance(parsed, list):
+        raw_points = parsed
+    else:
+        # 只有非 JSON 回覆才允許退回逐行解析；避免 {"points": [], "note": ...}
+        # 被當成一般文字後將 note 誤畫進圖片。
+        raw_points = _parse_raw_points_from_llm(output_text)
+    raw_points = [str(p) for p in raw_points if str(p or "").strip()]
     return _ensure_news_summary_min_total(raw_points, records, stock_code, stock_name)
 
 def _get_warrants_api_keys() -> List[str]:
@@ -6744,27 +6765,76 @@ def _build_rule_based_pattern_point(ctx: dict) -> str:
     )
 
 
-def _build_rule_based_crossflow_point(ctx: dict) -> str:
+def _get_weekly_institutional_context(ctx: dict) -> dict:
+    """計算三大法人本週合計及其中性門檻，避免極小買賣超被放大解讀。"""
     df = ctx.get("plot_df", pd.DataFrame())
     week_dates = [pd.Timestamp(d) for d in (ctx.get("stock_week_dates") or [])]
     valid_week_dates = [d for d in week_dates if df is not None and not df.empty and d in df.index]
-    inst_week = df.loc[valid_week_dates].copy() if valid_week_dates else (df.tail(WEEK_TRADING_DAYS).copy() if df is not None else pd.DataFrame())
+    inst_week = (
+        df.loc[valid_week_dates].copy()
+        if valid_week_dates
+        else (df.tail(WEEK_TRADING_DAYS).copy() if df is not None and not df.empty else pd.DataFrame())
+    )
     inst_total = 0.0
     if inst_week is not None and not inst_week.empty and "total" in inst_week.columns:
         inst_total = float(pd.to_numeric(inst_week["total"], errors="coerce").fillna(0.0).sum())
+
+    latest_mv20 = np.nan
+    if df is not None and not df.empty:
+        latest_mv20 = _safe_float(df.iloc[-1].get("MV20"))
+    volume_based_threshold = (
+        abs(float(latest_mv20)) * max(0.0, float(WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO))
+        if np.isfinite(latest_mv20)
+        else 0.0
+    )
+    neutral_threshold = max(
+        0.0,
+        float(WEEKLY_KEYPOINT_INST_NEUTRAL_MIN_SHARES),
+        volume_based_threshold,
+    )
+
+    if abs(inst_total) <= neutral_threshold:
+        classification = "接近中性"
+        interpretation = "三大法人本週買賣幅度有限，尚未形成明確法人方向"
+    elif inst_total > 0:
+        classification = "偏多"
+        interpretation = "三大法人本週呈現具一定幅度的淨買超"
+    else:
+        classification = "偏空"
+        interpretation = "三大法人本週呈現具一定幅度的淨賣超"
+
+    return {
+        "weekly_total": inst_total,
+        "neutral_threshold": neutral_threshold,
+        "classification": classification,
+        "interpretation": interpretation,
+    }
+
+
+def _build_rule_based_crossflow_point(ctx: dict) -> str:
+    inst_ctx = _get_weekly_institutional_context(ctx)
+    inst_total = float(inst_ctx.get("weekly_total", 0) or 0)
+    inst_class = str(inst_ctx.get("classification", "") or "")
     warrant_net = float(ctx.get("total_net", 0) or 0)
     stock_ret = _safe_float(ctx.get("stock_ret"))
 
-    if inst_total > 0 and warrant_net > 0:
+    if inst_class == "接近中性":
+        if warrant_net > 0:
+            relation = "三大法人方向接近中性，權證資金則偏向淨買超，短線權證買盤尚未獲得法人資金明確呼應"
+        elif warrant_net < 0:
+            relation = "三大法人方向接近中性，權證資金則偏向淨賣超，短線權證調節尚未形成法人同步賣壓"
+        else:
+            relation = "三大法人與權證資金變化皆有限，整體籌碼方向尚未明確"
+    elif inst_total > 0 and warrant_net > 0:
         relation = "三大法人與權證資金同向偏多"
     elif inst_total < 0 and warrant_net < 0:
         relation = "三大法人與權證資金同向偏空"
     else:
-        relation = "三大法人與權證資金方向分歧"
+        relation = "三大法人與權證資金方向分歧，反映不同資金的操作時間尺度可能不一致"
 
     return (
         f"資金交叉：股價本週 {fmt_pct(stock_ret)}，三大法人本週合計 {inst_total:+,.0f} 張，"
-        f"權證週淨流向 {fmt_money(warrant_net)}，目前呈現{relation}，應以不同資金的時間尺度解讀。"
+        f"權證週淨流向 {fmt_money(warrant_net)}；{relation}。"
     )
 
 def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
@@ -6841,6 +6911,8 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
             return 0.0
         return float(pd.to_numeric(inst_week[col], errors="coerce").fillna(0.0).sum())
 
+    institutional_context = _get_weekly_institutional_context(ctx)
+
     payload = {
         "stock": f"{stock_code} {stock_name}",
         "period": f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx.get("week_start")) else "",
@@ -6871,6 +6943,9 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
                 "investment_trust": f"{inst_sum('invest'):+,.0f}張",
                 "dealer_self_trading": f"{inst_sum('dealer'):+,.0f}張",
                 "total": f"{inst_sum('total'):+,.0f}張",
+                "classification": str(institutional_context.get("classification", "") or ""),
+                "neutral_threshold": f"{float(institutional_context.get('neutral_threshold', 0) or 0):,.0f}張",
+                "interpretation": str(institutional_context.get("interpretation", "") or ""),
             },
         },
         "warrant_weekly_flow": {
@@ -6967,6 +7042,20 @@ def _weekly_points_cover_required_pattern_analysis(points: List[str], ctx: dict)
     return bool(has_zone and has_pattern_meaning and has_price_volume and not explicit_zone_price)
 
 
+def _weekly_points_overstate_neutral_institutional(points: List[str], ctx: dict) -> bool:
+    """法人接近中性時，不允許 AI 放大成明顯分歧、偏空或法人賣壓。"""
+    inst_ctx = _get_weekly_institutional_context(ctx)
+    if str(inst_ctx.get("classification", "") or "") != "接近中性":
+        return False
+    merged = "\n".join(str(p or "") for p in points)
+    overstated_phrases = [
+        "三大法人與權證資金方向分歧", "法人與權證資金方向分歧",
+        "法人賣壓", "法人明顯偏空", "法人同步賣超", "法人資金偏空",
+        "法人籌碼轉弱", "法人全面賣超", "法人明顯賣超",
+    ]
+    return any(phrase in merged for phrase in overstated_phrases)
+
+
 def _weekly_points_low_value_technical_reasons(points: List[str]) -> List[str]:
     """抓出只列均線或用空泛技術語句湊數的重點。"""
     reasons = []
@@ -7012,7 +7101,7 @@ def _repair_weekly_points_with_required_branch(
 請輸出剛好 3 點繁體中文重點，並遵守：
 1. 其中剛好一點必須完整分析 required_representative_branch_analysis，必須同時寫出該分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並解讀其籌碼品質與操作時間尺度。
 2. 其中剛好一點必須分析 required_price_volume_pattern_analysis：只使用第一大量區、第二大量區的相對位置、近期突破／跌破／回踩狀態、高低點結構與價量關係，統整成中立的型態重點。不得輸出兩個大量區的實際價格、中心價、距離百分比，也不得逐項抄寫欄位。
-3. 最後一點應比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或時間尺度差異。
+3. 最後一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須明確寫成法人方向接近中性或買賣幅度有限，不得放大解讀為明顯分歧、偏空或法人賣壓；只有超過中性門檻時，才能描述同向或分歧。
 4. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。均線、KD、MACD只能作為型態佐證。
 5. 每一點都必須獨立完整，約 45～90 個中文字，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
 6. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
@@ -7032,7 +7121,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v8_qualitative_pattern_repair",
+        cache_task="weekly_keypoints_ai_analysis_v9_holding_neutral_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -7066,7 +7155,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
    - 只分析最新收盤位於兩個大量區之上、之下、量區內或兩者之間，以及近期突破／跌破／回踩、高低點結構與價量關係。
    - 將上述資訊統整成一個中立的型態結論，例如支撐觀察、上方壓力、成本區整理或突破尚未站穩；不得逐項抄寫欄位。
    - 嚴禁輸出第一大量區、第二大量區的實際價格、中心價、距離百分比或「約多少元」等明確價位。
-10. 第三點優先比較三大法人、權證週資金與股價方向，說明同向、背離、分歧或不同資金時間尺度；不得與型態點重複同一結論。
+10. 第三點優先比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須說明法人本週買賣幅度有限、尚未形成明確方向，不得放大解讀為明顯分歧、偏空或法人賣壓；只有超過 neutral_threshold 時，才能描述法人與權證同向或分歧。不得與型態點重複同一結論。
 11. 禁止單純羅列 MA5、MA10、MA20、MA60 的價格；禁止只寫「搭配 KD／MACD 觀察」「需觀察動能是否延續」「判斷短中期趨勢」等可套用於任何股票的空泛句。
 12. 均線、KD、MACD只能用來佐證具體型態，例如確認突破、跌破、回踩或趨勢結構，不能單獨構成一點。每一點必須至少比較兩類資料並說明代表意義。
 13. 價量型態重點必須是統整後的中立分析，不可寫成「最大量區為多少、第二大量區為多少」的數值報告；大量區只描述相對位置與可能扮演的支撐、壓力或成本整理角色。
@@ -7095,7 +7184,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_ai_analysis_v8_qualitative_pattern",
+            cache_task="weekly_keypoints_ai_analysis_v9_holding_neutral",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -7123,8 +7212,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
         branch_ok = _weekly_points_cover_required_representative_analysis(points, ctx)
         pattern_ok = _weekly_points_cover_required_pattern_analysis(points, ctx)
         low_value_reasons = _weekly_points_low_value_technical_reasons(points)
+        neutral_overstated = _weekly_points_overstate_neutral_institutional(points, ctx)
 
-        if not branch_ok or not pattern_ok or low_value_reasons:
+        if not branch_ok or not pattern_ok or low_value_reasons or neutral_overstated:
             required = _get_required_representative_branch_analysis(ctx)
             required_name = str((required or {}).get("branch", "") or "")
             problems = []
@@ -7132,6 +7222,8 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
                 problems.append(f"未完整分析代表性分點「{required_name}」的歷史績效與持有天數")
             if not pattern_ok:
                 problems.append("未使用紅色最大量區、橘色第二大量區與價量關係完成型態分析")
+            if neutral_overstated:
+                problems.append("三大法人接近中性，卻被放大解讀為明顯分歧或法人賣壓")
             problems.extend(low_value_reasons)
             print("⚠️ Gemini 本週重點需要修正：" + "；".join(problems))
 
@@ -7143,6 +7235,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
             )
             repaired_forbidden = _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx)
             repaired_low_value = _weekly_points_low_value_technical_reasons(repaired_points)
+            repaired_neutral_overstated = _weekly_points_overstate_neutral_institutional(repaired_points, ctx)
             if (
                 len(repaired_points) == 3
                 and _count_summary_chars(repaired_points) >= 100
@@ -7150,6 +7243,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
                 and _points_are_independent_and_complete(repaired_points)
                 and not repaired_forbidden
                 and not repaired_low_value
+                and not repaired_neutral_overstated
                 and _weekly_points_cover_required_representative_analysis(repaired_points, ctx)
                 and _weekly_points_cover_required_pattern_analysis(repaired_points, ctx)
             ):
