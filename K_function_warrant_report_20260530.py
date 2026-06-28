@@ -4280,6 +4280,16 @@ NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
     "WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT",
     str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 12)),
 ))
+# 新聞最低素材／顯示目標：正常情況至少整理 2 則不同事件；
+# 只有所有來源與 7/14/30 日範圍都查完後仍只有一個事件，才允許只顯示 1 則。
+NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "2")))
+# 公開資訊觀測站重大訊息補強：使用證交所 OpenAPI 的上市／上櫃每日重大訊息。
+NEWS_MOPS_ENABLE = os.getenv("WARRANT_NEWS_MOPS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "8")))
+NEWS_MOPS_ENDPOINTS = [
+    ("上市重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"),
+    ("上櫃重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_O"),
+]
 
 STOCK_NEWS_ALIAS_MAP = {
     "2330": ["台積電", "GG", "護國神山"],
@@ -5239,6 +5249,144 @@ def fetch_moneydj_news_articles(stock_code: str, stock_name: str, max_items: int
     return articles[:max(1, int(max_items))]
 
 
+
+def _news_article_usable(article: dict) -> bool:
+    return bool(article and (article.get("body_ok") or article.get("fallback_ok")))
+
+
+def _count_distinct_usable_news_articles(articles: List[dict]) -> int:
+    seen = set()
+    for article in articles or []:
+        if not _news_article_usable(article):
+            continue
+        key = _article_seen_key(article.get("title", ""), article.get("url", ""))
+        if not key:
+            key = _normalize_news_text(article.get("content", ""))[:120]
+        if key:
+            seen.add(key)
+    return len(seen)
+
+
+def _parse_mops_date(value):
+    """解析 MOPS 常見民國日期（1150626、115/06/26）或西元日期。"""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = parse_date(s)
+        if dt:
+            return dt
+    except Exception:
+        pass
+    digits = re.sub(r"\D", "", s)
+    try:
+        if len(digits) == 7:
+            return datetime(int(digits[:3]) + 1911, int(digits[3:5]), int(digits[5:7]))
+        if len(digits) == 8:
+            return datetime(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    except Exception:
+        return None
+    return None
+
+
+def _mops_announcement_has_information_value(title: str, detail: str) -> bool:
+    """排除只有例行格式、沒有可讀事件內容的公告；保留具體公司營運／財務／治理事件。"""
+    combined = _normalize_news_text(f"{title} {detail}")
+    if not combined:
+        return False
+    useful_keywords = [
+        "營收", "財報", "獲利", "盈餘", "每股", "股利", "法說", "展望", "財測",
+        "董事會", "投資", "擴產", "產能", "接單", "出貨", "產品", "合作", "合約",
+        "取得", "處分", "資產", "增資", "減資", "庫藏股", "買回", "現金增資",
+        "澄清", "媒體報導", "訴訟", "停工", "復工", "重大訊息", "組織重整",
+        "供需", "價格", "報價", "客戶", "子公司", "併購", "股東會", "除權息",
+    ]
+    if any(k in combined for k in useful_keywords):
+        return True
+    # 說明欄夠長且有數字，通常代表確實有具體事件內容。
+    return len(_normalize_news_text(detail)) >= 140 and bool(re.search(r"\d", combined))
+
+
+def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
+    """從公開資訊觀測站每日重大訊息補充公司直接公告；來源失敗不影響週報。"""
+    if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MOPS_ENABLE:
+        return []
+    stock_key = _clean_code(stock_code)
+    max_days = max(_get_news_search_day_list())
+    cutoff = datetime.now() - timedelta(days=max_days)
+    articles = []
+    seen = set()
+    headers = {
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-TW,zh;q=0.9",
+    }
+    for market_name, url in NEWS_MOPS_ENDPOINTS:
+        try:
+            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+        except Exception as e:
+            print(f"⚠️ MOPS {market_name}讀取失敗：{e}")
+            continue
+
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            row_code = _clean_code(row.get("公司代號", row.get("公司代碼", "")))
+            if row_code != stock_key:
+                continue
+            title = _clean_news_title(row.get("主旨", row.get("公告主旨", "")))
+            detail = _normalize_news_text(row.get("說明", row.get("公告內容", "")))
+            speech_date = row.get("發言日期", row.get("公告日期", row.get("事實發生日", "")))
+            dt = _parse_mops_date(speech_date)
+            if dt is not None and dt < cutoff:
+                continue
+            if not title or not _mops_announcement_has_information_value(title, detail):
+                continue
+            content = _normalize_news_text(
+                f"公司公告：{title}。{detail}" if detail else f"公司公告：{title}。"
+            )
+            key = _article_seen_key(title, f"mops:{market_name}:{speech_date}:{title}")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            published = dt.strftime("%Y-%m-%d") if dt else str(speech_date or "")
+            article = {
+                "title": title,
+                "url": "",
+                "source": "公開資訊觀測站",
+                "source_family": "MOPS",
+                "published": published,
+                "description": detail,
+                "content": content,
+                "body_ok": True,
+                "fallback_ok": False,
+                "content_source": "mops_openapi",
+                "body_length": len(content),
+                "search_days": int(max_days),
+                "query_stage": market_name,
+            }
+            article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name) + 8
+            articles.append(article)
+
+    def sort_key(article: dict):
+        dt = _parse_rss_pub_date(article.get("published", ""))
+        if dt is None:
+            try:
+                dt = pd.Timestamp(article.get("published", "")).to_pydatetime()
+            except Exception:
+                dt = datetime.min
+        return (-int(article.get("relevance_score", 0) or 0), -dt.timestamp() if dt != datetime.min else 0)
+
+    articles = sorted(articles, key=sort_key)
+    print(f"📰 MOPS 重大訊息：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    return articles[:max(1, int(max_items))]
+
+
 def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: str, stock_name: str, limit: int) -> List[dict]:
     merged = []
     seen = set()
@@ -5283,32 +5431,49 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
 
 
 def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """合併 Google、Yahoo 股市、Bing News 與 MoneyDJ 新聞，統一去重與品質排序。"""
+    """合併多來源新聞；至少蒐集 2 則不同合格事件後才視為素材充足。"""
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
         return fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
     if not NEWS_ENABLE:
         return []
 
-    per_source = max(3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
-    groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max_items)]
+    minimum_needed = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
+    per_source = max(minimum_needed, 3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
+
+    # 所有來源都會實際查詢，不因 Google 先找到一篇就停止。
+    groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max(max_items, minimum_needed))]
     if NEWS_MULTI_SOURCE_ENABLE:
         groups.append(fetch_yahoo_finance_rss_articles(stock_code, stock_name, max_items=per_source))
         groups.append(fetch_bing_news_rss_articles(stock_code, stock_name, max_items=per_source))
         groups.append(fetch_moneydj_news_articles(stock_code, stock_name, max_items=per_source))
+        groups.append(fetch_mops_material_info_articles(stock_code, stock_name, max_items=max(NEWS_MOPS_MAX_ITEMS, per_source)))
 
     limit = max(
+        minimum_needed,
         NEWS_SUMMARY_MAX_POINTS,
         NEWS_GOOGLE_MIN_USABLE_ARTICLES,
-        min(max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT)), max(1, int(max_items))),
+        min(max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT)), max(minimum_needed, int(max_items))),
     )
     articles = _merge_and_rank_news_articles(groups, stock_code, stock_name, limit=limit)
+    distinct_count = _count_distinct_usable_news_articles(articles)
+
     source_counts = {}
     for article in articles:
         family = str(article.get("source_family", article.get("source", "unknown")) or "unknown")
         source_counts[family] = source_counts.get(family, 0) + 1
     source_text = "、".join(f"{k}:{v}" for k, v in source_counts.items()) or "無"
-    print(f"📰 多來源新聞完成：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜來源 {source_text}")
+
+    if distinct_count >= minimum_needed:
+        print(
+            f"📰 多來源新聞完成：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜"
+            f"不同合格事件 {distinct_count:,} 則｜來源 {source_text}"
+        )
+    else:
+        print(
+            f"⚠️ 多來源與最長 {max(_get_news_search_day_list())} 日範圍均已查完："
+            f"{stock_code} {stock_name} 僅取得 {distinct_count:,} 則不同合格事件；允許單則輸出｜來源 {source_text}"
+        )
     return articles
 
 
@@ -6332,12 +6497,13 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
     return usable
 
 def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """只將通過品質門檻的新聞素材交給 Gemini，依內容量輸出 1～3 個重點。"""
+    """將合格新聞交給 Gemini；素材有 2 則以上時，輸出不得只剩 1 點。"""
     usable_articles = _build_gemini_news_articles(records, stock_code, stock_name)
     if not usable_articles:
         print("⚠️ 沒有足夠且具體的公司新聞可送入 Gemini；不使用標題或盤勢新聞硬湊")
         return []
 
+    minimum_points = 2 if len(usable_articles) >= max(2, NEWS_MIN_DISTINCT_ARTICLES) else 1
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
     prompt = f"""
@@ -6348,27 +6514,28 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 股票：{stock_code} {display_name}
 
 任務：
-從通過篩選的近期新聞中，整理 1～3 個真正具有公司資訊價值的新聞重點。
-新聞品質優先，不必湊滿 3 點，也不必湊固定總字數；若只有 1～2 個具體事件，就只輸出 1～2 點。
+從通過篩選的近期新聞中，整理 {minimum_points}～3 個真正具有公司資訊價值、彼此不同事件的新聞重點。
+本次提供 {len(usable_articles)} 則不同新聞素材，因此不得只輸出少於 {minimum_points} 點。
+只有原始素材實際只有一個事件時才允許輸出一點；不同來源報導同一事件應合併，但必須繼續使用下一個不同事件補足。
 
 寫作要求：
 1. 每點開頭使用 4～8 個字短標籤與全形冒號，例如「業績更新：」「法人觀點：」「公司動態：」「報價動向：」。
 2. 每點約 50～100 個中文字，呈現「具體事件或數字 → 對公司營運或產業的可能影響」。
 3. 優先整理營收、EPS、毛利率、獲利、法說、財測、目標價與評等、接單、出貨、產能、產品、客戶、合作、報價與供需。
-4. ETF 納入／剔除成分股、定期換股、指數權重調整、被動資金加減碼或具體持股變化，若明確對應本公司，可視為代表性籌碼新聞。
-5. 單純介紹 ETF、推薦高股息 ETF、羅列多檔持股或沒有實際調整事件的內容，不得列為重點。
-6. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-7. 不得為了填滿欄位而輸出空泛句子；沒有第二或第三個具體事件就不要硬寫。
-8. 不同文章若是同一事件，合併為一點，不要重複。
-9. 每一點必須是一則獨立完整的新聞摘要，不得把同一事件拆成兩點，也不得讓後一點接續前一點未完成的句意。
+4. 公開資訊觀測站的公司重大訊息可作為公司公告重點，但必須說明事件本身，不得只寫「公司發布公告」。
+5. ETF 納入／剔除成分股、定期換股、指數權重調整、被動資金加減碼或具體持股變化，若明確對應本公司，可視為代表性籌碼新聞。
+6. 單純介紹 ETF、推薦高股息 ETF、羅列多檔持股或沒有實際調整事件的內容，不得列為重點。
+7. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
+8. 不得為了補足點數而拆分同一事件；應從下一則不同事件取材。
+9. 每一點必須是一則獨立完整的新聞摘要，不得讓後一點接續前一點未完成的句意。
 10. 每點必須以完整句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
 11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
 12. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
-14. 不得把其他公司的數字或題材套用到 {display_name}。
-15. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-16. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-17. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-18. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+13. 不得把其他公司的數字或題材套用到 {display_name}。
+14. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+15. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+16. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+17. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
@@ -6384,7 +6551,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     print("=" * 100)
     print("開始呼叫 Gemini 統整高品質新聞重點")
     print(f"模型：{GEMINI_MODEL}")
-    print(f"送入 Gemini 的文章數：{len(usable_articles)}")
+    print(f"送入 Gemini 的文章數：{len(usable_articles)}｜最低輸出：{minimum_points} 點")
     print("=" * 100)
     output_text = _call_gemini_with_retry(
         prompt,
@@ -6396,9 +6563,34 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     if points and not _points_are_independent_and_complete(points):
         print("⚠️ Gemini 新聞重點出現承接句、半句或省略號，改用規則式新聞摘要")
         return []
+
+    if len(points) < minimum_points:
+        print(f"⚠️ Gemini 新聞只輸出 {len(points)} 點，低於素材可支援的最低 {minimum_points} 點，啟動補正")
+        repair_prompt = f"""
+你剛才替 {stock_code} {display_name} 整理的新聞重點不足。
+目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 3 點。
+每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
+每點 50～100 個中文字、完整句號結尾、不得使用省略號，也不得寫技術分析或買賣建議。
+請只回傳 JSON：{{"points":["第一點","第二點"]}}
+
+新聞素材 JSON：
+{article_json}
+"""
+        repaired_text = _call_gemini_with_retry(
+            repair_prompt,
+            cache_task=f"{_news_points_cache_task()}_min{minimum_points}_repair",
+            stock_code=stock_code,
+            stock_name=stock_name,
+        )
+        repaired = _parse_gemini_news_points(repaired_text or "", records, stock_code, stock_name)
+        if len(repaired) >= minimum_points and _points_are_independent_and_complete(repaired):
+            points = repaired
+            print(f"✅ Gemini 新聞補正完成：{len(points)} 點")
+
     if points:
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
     return points
+
 
 def _safe_float(v, default=np.nan):
     try:
@@ -7553,10 +7745,13 @@ def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """整理高品質公司新聞；不足時誠實說明，不以無意義內容填滿欄位。"""
+    """整理高品質公司新聞；有兩則以上不同素材時，盡量確保至少顯示兩個不同事件。"""
+    minimum_target = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
     cached_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
-    if cached_points:
+    if cached_points and len(cached_points) >= minimum_target:
         return _finalize_news_points_for_display(cached_points, stock_code, stock_name, ctx)
+    if cached_points:
+        print(f"ℹ️ 當日新聞快取僅 {len(cached_points)} 點，低於最低目標 {minimum_target} 點，繼續搜尋其他來源")
 
     records = _news_items_to_records(news_items)
     body_records = [
@@ -7572,6 +7767,8 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         and _passes_news_quality_gate(r.get("title", ""), r.get("content", ""), stock_code, stock_name)
     ]
     usable_records = body_records + [r for r in fallback_records if r not in body_records]
+    available_count = _count_distinct_usable_news_articles(usable_records)
+    required_points = minimum_target if available_count >= minimum_target else 1
 
     if not usable_records:
         stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
@@ -7579,15 +7776,33 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
             return _finalize_news_points_for_display(stale_points, stock_code, stock_name, ctx)
         return []
 
-    # 所有合格新聞一次交給 Gemini 統整；Gemini 不需要湊滿 3 點或固定字數。
     ai_points = _summarize_news_with_gemini(usable_records, stock_code, stock_name)
-    if ai_points:
-        return _finalize_news_points_for_display(ai_points, stock_code, stock_name, ctx)
+    final_points = _finalize_news_points_for_display(ai_points, stock_code, stock_name, ctx) if ai_points else []
 
-    # Gemini 不可用或失敗時，只從同一批合格素材做規則式摘要。
-    rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
-    if rule_points:
-        return _finalize_news_points_for_display(rule_points, stock_code, stock_name, ctx)
+    # 已有至少兩個不同事件，AI卻仍只留下1點時，用同一批合格素材的規則式摘要補足，
+    # 不創造新聞、不拆分同一事件。
+    if len(final_points) < required_points:
+        rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
+        combined = list(final_points)
+        for point in _finalize_news_points_for_display(rule_points, stock_code, stock_name, ctx):
+            if point in combined:
+                continue
+            # 避免文字高度相似的同一事件重複顯示。
+            point_key = _title_compare_text(point)
+            if any(_title_compare_text(existing) == point_key for existing in combined):
+                continue
+            combined.append(point)
+            if len(combined) >= required_points:
+                break
+        final_points = combined[:NEWS_DISPLAY_MAX_POINTS]
+
+    if final_points:
+        if len(final_points) < required_points:
+            print(
+                f"⚠️ 所有來源與規則式補充完成後仍只有 {len(final_points)} 個可獨立呈現的新聞事件；"
+                "為避免垃圾新聞或重複事件，保留現有內容"
+            )
+        return final_points
 
     stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
     if stale_points:
