@@ -59,6 +59,8 @@ jobs:
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '不使用快取重新抓完整資料') && '1' || '0' }}
 
+
+      GSHEET_ARCHIVE_SPREADSHEET_ID: ${{ secrets.GSHEET_ARCHIVE_SPREADSHEET_ID }}
       # 分批儲存快取，避免程式跑一半失敗後下次又全部重抓。
       HISTORY_BATCH_SAVE_EVERY: "1000"
 
