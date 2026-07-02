@@ -1432,6 +1432,22 @@ GSHEET_ARCHIVE_NAME_PREFIX = os.getenv(
 GSHEET_ARCHIVE_SHARE_EMAILS = os.getenv("GSHEET_ARCHIVE_SHARE_EMAILS", "").strip()
 # 若服務帳號需要在指定的 Shared Drive / 資料夾內建立封存檔，可填 Google Drive 資料夾 ID。
 GSHEET_ARCHIVE_FOLDER_ID = os.getenv("GSHEET_ARCHIVE_FOLDER_ID", "").strip()
+# 服務帳號通常沒有可用的個人 Drive 儲存空間；若 gc.create() 回傳
+#「The user's Drive storage quota has been exceeded」，請先用自己的 Google 帳號建立一份
+# 封存試算表並分享給服務帳號，再把試算表 ID 填入下列環境變數。
+# 可填單一 ID，也可用逗號 / 分號分隔多個 ID；第一份接近格數上限時會自動換到下一份。
+GSHEET_ARCHIVE_SPREADSHEET_IDS_RAW = os.getenv(
+    "GSHEET_ARCHIVE_SPREADSHEET_IDS",
+    os.getenv("GSHEET_ARCHIVE_SPREADSHEET_ID", ""),
+).strip()
+GSHEET_ARCHIVE_SPREADSHEET_IDS = [
+    item.strip()
+    for item in re.split(r"[,;；、\n\r\t]+", GSHEET_ARCHIVE_SPREADSHEET_IDS_RAW)
+    if item.strip()
+]
+# 未提供既有封存試算表 ID 時，是否允許服務帳號自行建立新檔。
+# 若 Drive quota 不足，程式會在第一次 403 後自動停用本次執行的建立動作，不再連續嘗試 _02～_99。
+GSHEET_ARCHIVE_ALLOW_CREATE = os.getenv("GSHEET_ARCHIVE_ALLOW_CREATE", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_ARCHIVE_MAX_CELLS = max(int(os.getenv("GSHEET_ARCHIVE_MAX_CELLS", "8500000")), 100000)
 GSHEET_ARCHIVE_YEARLY_SPLIT = os.getenv("GSHEET_ARCHIVE_YEARLY_SPLIT", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_TOP15_KEEP_STAT_DATES = max(int(os.getenv("GSHEET_TOP15_KEEP_STAT_DATES", "5")), 1)
@@ -1452,6 +1468,9 @@ _GSHEET_SPREADSHEET = None
 _GSHEET_LAST_WRITE_TS = 0.0
 _GSHEET_ARCHIVE_SPREADSHEETS = {}
 _GSHEET_ARCHIVE_PERMISSION_SYNCED = set()
+_GSHEET_ARCHIVE_CREATE_BLOCKED = False
+_GSHEET_ARCHIVE_CREATE_BLOCK_REASON = ""
+_GSHEET_ARCHIVE_CREATE_BLOCK_LOGGED = False
 
 CACHE_SHEET_NAME_MAP = {
     "warrants_cache.csv": "快取_權證清單",
@@ -4422,6 +4441,55 @@ def _sync_archive_permissions(archive_sh):
         _GSHEET_ARCHIVE_PERMISSION_SYNCED.add(archive_id)
 
 
+def is_gsheet_drive_storage_quota_error(exc):
+    """判斷是否為 Google Drive 永久性儲存空間不足，而不是可藉由換檔名重試的錯誤。"""
+    msg = str(exc or "").strip().lower()
+    return (
+        "drive storage quota has been exceeded" in msg
+        or "storage quota has been exceeded" in msg
+        or "storagequota" in msg
+        or ("403" in msg and "drive" in msg and "quota" in msg)
+    )
+
+
+def _configured_archive_spreadsheet_id(part_no):
+    try:
+        idx = int(part_no) - 1
+    except Exception:
+        return ""
+
+    if 0 <= idx < len(GSHEET_ARCHIVE_SPREADSHEET_IDS):
+        return str(GSHEET_ARCHIVE_SPREADSHEET_IDS[idx]).strip()
+    return ""
+
+
+def _archive_worksheet_title(title, year_label):
+    """
+    使用固定封存試算表 ID 時，同一份檔案可能保存多個年度，
+    因此把年度放進工作表名稱，避免 2026 與 2027 資料混在同一張分頁。
+    """
+    if GSHEET_ARCHIVE_SPREADSHEET_IDS:
+        return safe_worksheet_title(f"{title}_{year_label}")
+    return safe_worksheet_title(title)
+
+
+def _mark_archive_create_blocked(exc):
+    global _GSHEET_ARCHIVE_CREATE_BLOCKED
+    global _GSHEET_ARCHIVE_CREATE_BLOCK_REASON
+    global _GSHEET_ARCHIVE_CREATE_BLOCK_LOGGED
+
+    _GSHEET_ARCHIVE_CREATE_BLOCKED = True
+    _GSHEET_ARCHIVE_CREATE_BLOCK_REASON = str(exc or "Google Drive storage quota exceeded").strip()
+
+    if not _GSHEET_ARCHIVE_CREATE_BLOCK_LOGGED:
+        print(
+            "  ⚠️ Google Drive 儲存空間不足，本次執行已停止自動建立新的封存試算表；"
+            "不會再嘗試 _02、_03……。請先用自己的 Google 帳號建立封存試算表、"
+            "分享給服務帳號，並設定 GSHEET_ARCHIVE_SPREADSHEET_ID。"
+        )
+        _GSHEET_ARCHIVE_CREATE_BLOCK_LOGGED = True
+
+
 def _open_archive_spreadsheet(year_label, part_no=1, create_if_missing=False):
     key = (str(year_label), int(part_no))
     if key in _GSHEET_ARCHIVE_SPREADSHEETS:
@@ -4431,13 +4499,37 @@ def _open_archive_spreadsheet(year_label, part_no=1, create_if_missing=False):
     if gc is None:
         return None
 
+    # 優先使用使用者自行建立、由使用者帳號持有的封存試算表。
+    # 這不會消耗服務帳號的個人 Drive 配額。
+    configured_id = _configured_archive_spreadsheet_id(part_no)
+    if configured_id:
+        try:
+            sh = gc.open_by_key(configured_id)
+            _GSHEET_ARCHIVE_SPREADSHEETS[key] = sh
+            _sync_archive_permissions(sh)
+            return sh
+        except Exception as e:
+            print(
+                f"  ⚠️ 開啟指定 Google Sheet 封存檔失敗：分卷={int(part_no):02d}｜"
+                f"ID={configured_id}｜原因：{type(e).__name__}: {e}"
+            )
+            return None
+
+    # 已設定固定封存檔清單時，只使用清單內的檔案；不再由服務帳號另外建立新檔。
+    if GSHEET_ARCHIVE_SPREADSHEET_IDS:
+        return None
+
     name = _archive_spreadsheet_name(year_label, part_no)
     sh = None
 
     try:
         sh = gc.open(name)
     except Exception:
-        if not create_if_missing:
+        if not create_if_missing or not GSHEET_ARCHIVE_ALLOW_CREATE:
+            return None
+
+        # Drive quota 屬於永久性錯誤，本次執行第一次遇到後便停止建立，避免連續刷出 _02～_99。
+        if _GSHEET_ARCHIVE_CREATE_BLOCKED:
             return None
 
         try:
@@ -4451,7 +4543,10 @@ def _open_archive_spreadsheet(year_label, part_no=1, create_if_missing=False):
                 sh = gc.create(name)
             print(f"  📦 已建立 Google Sheet 年度封存檔：{name}")
         except Exception as e:
-            print(f"  ⚠️ 建立 Google Sheet 封存檔失敗：{name}，原因：{type(e).__name__}: {e}")
+            if is_gsheet_drive_storage_quota_error(e):
+                _mark_archive_create_blocked(e)
+            else:
+                print(f"  ⚠️ 建立 Google Sheet 封存檔失敗：{name}，原因：{type(e).__name__}: {e}")
             return None
 
     _GSHEET_ARCHIVE_SPREADSHEETS[key] = sh
@@ -4631,29 +4726,32 @@ def _write_values_to_archive_worksheet(ws, values):
 
 
 def _archive_records_to_year_part(title, headers, records, year_label):
-    """把同一年度資料寫入可容納的封存分卷，必要時自動切換 _02、_03...。"""
+    """
+    把同一年度資料寫入可容納的封存分卷。
+
+    - 有設定 GSHEET_ARCHIVE_SPREADSHEET_IDS：依序使用既有試算表 ID。
+    - 未設定 ID：沿用原本依名稱開啟 / 建立年度封存檔。
+    - 一旦確認 Drive quota 不足，立即停止，不再嘗試 _02～_99。
+    """
     if not records:
         return True
 
-    for part_no in range(1, 100):
+    max_parts = len(GSHEET_ARCHIVE_SPREADSHEET_IDS) if GSHEET_ARCHIVE_SPREADSHEET_IDS else 99
+    archive_ws_title = _archive_worksheet_title(title, year_label)
+
+    for part_no in range(1, max_parts + 1):
         archive_sh = _open_archive_spreadsheet(
             year_label,
             part_no=part_no,
-            create_if_missing=(part_no == 1),
+            create_if_missing=True,
         )
 
         if archive_sh is None:
-            # 第一卷不存在時會建立；後續卷不存在代表前一卷可能已滿，現在建立新卷。
-            archive_sh = _open_archive_spreadsheet(
-                year_label,
-                part_no=part_no,
-                create_if_missing=True,
-            )
-
-        if archive_sh is None:
+            if _GSHEET_ARCHIVE_CREATE_BLOCKED:
+                break
             continue
 
-        old_values = _read_archive_worksheet_values(archive_sh, title)
+        old_values = _read_archive_worksheet_values(archive_sh, archive_ws_title)
         merged_headers, merged_records = _merge_records_for_archive(
             title,
             headers,
@@ -4666,25 +4764,31 @@ def _archive_records_to_year_part(title, headers, records, year_label):
 
         ws = _prepare_archive_target_worksheet(
             archive_sh,
-            title,
+            archive_ws_title,
             target_rows=target_rows,
             target_cols=target_cols,
         )
         if ws is None:
-            # 這一卷預估超過安全格數，改試下一卷。
+            # 這一卷預估超過安全格數，改試下一個既有 ID 或下一個可建立分卷。
             continue
 
         if _write_values_to_archive_worksheet(ws, merged_values):
-            # 封存工作表已在寫入函式中 resize 成實際大小，不再重讀整份年度封存檔。
             archive_url = str(getattr(archive_sh, "url", "") or "").strip()
             print(
                 f"  📦 Google Sheet 舊資料封存完成：{title}｜年度={year_label}｜"
-                f"分卷={part_no:02d}｜本次 {len(records):,} 筆｜封存表合計 {len(merged_records):,} 筆"
+                f"分卷={part_no:02d}｜工作表={archive_ws_title}｜本次 {len(records):,} 筆｜"
+                f"封存表合計 {len(merged_records):,} 筆"
                 + (f"｜{archive_url}" if archive_url else "")
             )
             return True
 
-    print(f"  ⚠️ Google Sheet 舊資料封存失敗：{title}｜年度={year_label}，找不到可用封存分卷。")
+    if GSHEET_ARCHIVE_SPREADSHEET_IDS:
+        print(
+            f"  ⚠️ Google Sheet 舊資料封存失敗：{title}｜年度={year_label}，"
+            "已設定的封存試算表 ID 均無法使用或已達安全格數。"
+        )
+    elif not _GSHEET_ARCHIVE_CREATE_BLOCKED:
+        print(f"  ⚠️ Google Sheet 舊資料封存失敗：{title}｜年度={year_label}，找不到可用封存分卷。")
     return False
 
 
