@@ -1418,6 +1418,28 @@ GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() 
 GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 GSHEET_SYNC_CACHE_ON_READ = os.getenv("GSHEET_SYNC_CACHE_ON_READ", "0").strip().lower() in ("1", "true", "yes")
 
+# Google Sheet 結果表自動封存 / 保留設定：
+# 1. 每日賣出明細預設只在主試算表保留最近 60 個實際交易日，可改成 30 / 60 / 90 或其他正整數。
+# 2. TOP15 兩張快取表預設各資料範圍保留最近 5 個統計日期。
+# 3. 超出保留範圍的舊資料會先寫入獨立的年度封存試算表，封存成功後才從主表移除。
+# 4. 封存試算表依年份自動建立；單一年度封存檔接近儲存格上限時，會自動切換到 _02、_03...。
+# 5. 同步前會把所有工作表縮到實際有內容的列數 / 欄數；後續每張寫入表也會直接 resize 成實際大小。
+GSHEET_RESULT_ARCHIVE_ENABLED = os.getenv("GSHEET_RESULT_ARCHIVE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_ARCHIVE_NAME_PREFIX = os.getenv(
+    "GSHEET_ARCHIVE_NAME_PREFIX",
+    f"{GOOGLE_SHEET_NAME}_歷史封存",
+).strip() or f"{GOOGLE_SHEET_NAME}_歷史封存"
+GSHEET_ARCHIVE_SHARE_EMAILS = os.getenv("GSHEET_ARCHIVE_SHARE_EMAILS", "").strip()
+# 若服務帳號需要在指定的 Shared Drive / 資料夾內建立封存檔，可填 Google Drive 資料夾 ID。
+GSHEET_ARCHIVE_FOLDER_ID = os.getenv("GSHEET_ARCHIVE_FOLDER_ID", "").strip()
+GSHEET_ARCHIVE_MAX_CELLS = max(int(os.getenv("GSHEET_ARCHIVE_MAX_CELLS", "8500000")), 100000)
+GSHEET_ARCHIVE_YEARLY_SPLIT = os.getenv("GSHEET_ARCHIVE_YEARLY_SPLIT", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_TOP15_KEEP_STAT_DATES = max(int(os.getenv("GSHEET_TOP15_KEEP_STAT_DATES", "5")), 1)
+GSHEET_DAILY_SELL_KEEP_TRADING_DAYS = max(int(os.getenv("GSHEET_DAILY_SELL_KEEP_TRADING_DAYS", "60")), 1)
+GSHEET_COMPACT_BLANK_GRID_ENABLED = os.getenv("GSHEET_COMPACT_BLANK_GRID_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_COMPACT_MIN_ROWS = max(int(os.getenv("GSHEET_COMPACT_MIN_ROWS", "1")), 1)
+GSHEET_COMPACT_MIN_COLS = max(int(os.getenv("GSHEET_COMPACT_MIN_COLS", "1")), 1)
+
 # Google Sheets API 有「每分鐘寫入請求」限制。
 # 結果工作表很多、又要同步格式時，如果沒有節流與 429 重試，
 # 會出現後面工作表建立 / 寫入失敗，甚至因先刪後建導致工作表消失。
@@ -1428,6 +1450,8 @@ GSHEET_RETRY_BASE_SECONDS = float(os.getenv("GSHEET_RETRY_BASE_SECONDS", "12"))
 _GSHEET_CLIENT = None
 _GSHEET_SPREADSHEET = None
 _GSHEET_LAST_WRITE_TS = 0.0
+_GSHEET_ARCHIVE_SPREADSHEETS = {}
+_GSHEET_ARCHIVE_PERMISSION_SYNCED = set()
 
 CACHE_SHEET_NAME_MAP = {
     "warrants_cache.csv": "快取_權證清單",
@@ -2341,6 +2365,125 @@ def get_gsheet_spreadsheet():
             print(f"  ⚠️ Google Sheet 開啟/建立失敗：{type(e).__name__}: {e} / {type(e2).__name__}: {e2}")
             return None
 
+
+
+def spreadsheet_grid_cell_count(spreadsheet):
+    """計算整份 Google 試算表目前配置的格數（包含空白格）。"""
+    if spreadsheet is None:
+        return 0
+
+    total = 0
+    try:
+        for ws in spreadsheet.worksheets():
+            total += max(int(getattr(ws, "row_count", 1) or 1), 1) * max(
+                int(getattr(ws, "col_count", 1) or 1),
+                1,
+            )
+    except Exception:
+        return total
+
+    return total
+
+
+def _worksheet_values_with_formulas(ws):
+    """
+    讀取工作表實際內容，優先保留公式字串。
+
+    使用 FORMULA 可避免公式結果剛好是空字串時，被誤判成多餘空白列而刪除。
+    """
+    if ws is None:
+        return []
+
+    try:
+        return ws.get_all_values(value_render_option="FORMULA") or []
+    except TypeError:
+        try:
+            return ws.get_all_values() or []
+        except Exception:
+            return []
+    except Exception:
+        try:
+            return ws.get_all_values() or []
+        except Exception:
+            return []
+
+
+def worksheet_used_grid_size(ws):
+    """回傳工作表最後一個有值或有公式的實際列數 / 欄數。"""
+    values = _worksheet_values_with_formulas(ws)
+    last_row = 0
+    last_col = 0
+
+    for row_idx, row in enumerate(values, start=1):
+        row_last_col = 0
+        for col_idx, value in enumerate(list(row), start=1):
+            if str(value).strip() != "":
+                row_last_col = col_idx
+
+        if row_last_col > 0:
+            last_row = row_idx
+            last_col = max(last_col, row_last_col)
+
+    return (
+        max(last_row, GSHEET_COMPACT_MIN_ROWS),
+        max(last_col, GSHEET_COMPACT_MIN_COLS),
+    )
+
+
+def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表"):
+    """
+    把每張工作表縮到實際有內容 / 公式的列數與欄數。
+
+    Google Sheets 的 1,000 萬格上限會把空白預留列與欄也算進去，因此不能只 clear，
+    必須真的 resize 才能釋放格數。
+    """
+    if not GSHEET_COMPACT_BLANK_GRID_ENABLED:
+        return False
+
+    spreadsheet = spreadsheet or get_gsheet_spreadsheet()
+    if spreadsheet is None:
+        return False
+
+    before_cells = spreadsheet_grid_cell_count(spreadsheet)
+    changed_count = 0
+
+    try:
+        worksheets = spreadsheet.worksheets()
+    except Exception as e:
+        print(f"  ⚠️ Google Sheet 空白格清理失敗：{label}，原因：{type(e).__name__}: {e}")
+        return False
+
+    for ws in worksheets:
+        try:
+            used_rows, used_cols = worksheet_used_grid_size(ws)
+            current_rows = max(int(getattr(ws, "row_count", 1) or 1), 1)
+            current_cols = max(int(getattr(ws, "col_count", 1) or 1), 1)
+
+            if current_rows == used_rows and current_cols == used_cols:
+                continue
+
+            gsheet_api_call(
+                f"縮減空白列欄 {label}/{ws.title}",
+                ws.resize,
+                rows=used_rows,
+                cols=used_cols,
+            )
+            changed_count += 1
+            print(
+                f"  🧹 已縮減工作表空白格：{ws.title}｜"
+                f"{current_rows:,}×{current_cols:,} → {used_rows:,}×{used_cols:,}"
+            )
+        except Exception as e:
+            print(f"  ⚠️ 工作表空白格縮減失敗：{getattr(ws, 'title', '-')}，原因：{type(e).__name__}: {e}")
+
+    after_cells = spreadsheet_grid_cell_count(spreadsheet)
+    if changed_count > 0:
+        print(
+            f"  🧹 Google Sheet 空白列欄清理完成：{label}｜"
+            f"{before_cells:,} 格 → {after_cells:,} 格｜釋放 {max(before_cells - after_cells, 0):,} 格"
+        )
+
+    return changed_count > 0
 
 def safe_worksheet_title(title):
     title = str(title).strip()
@@ -4118,6 +4261,500 @@ def _record_key(rec, key_cols):
     return tuple(parts)
 
 
+
+def _result_retention_policy(title):
+    """回傳需要裁切的日期欄與保留的不同日期數。"""
+    title = safe_worksheet_title(title)
+
+    if title == "每日賣出明細":
+        return {
+            "date_col": "日期",
+            "keep_count": GSHEET_DAILY_SELL_KEEP_TRADING_DAYS,
+            "label": "交易日",
+        }
+
+    if title in (TOP15_POSITION_DETAIL_SHEET, TOP15_CONSENSUS_SHEET):
+        return {
+            "date_col": "統計日期",
+            "keep_count": GSHEET_TOP15_KEEP_STAT_DATES,
+            "label": "統計日期",
+        }
+
+    return None
+
+
+def _parse_result_record_date(value):
+    """解析結果表日期；同時支援 yyyy/mm/dd 與 Google Sheet 日期序號。"""
+    raw = strip_gsheet_text_prefix(value)
+    dt = parse_date(raw)
+    if dt is not None:
+        return dt
+
+    try:
+        serial = float(str(raw).replace(",", "").strip())
+        if 20000 <= serial <= 100000:
+            return datetime(1899, 12, 30) + timedelta(days=serial)
+    except Exception:
+        pass
+
+    return None
+
+
+def _split_records_by_recent_dates(records, date_col, keep_count):
+    """
+    依「資料範圍」分開保留最近 N 個不同日期。
+
+    精選五分點與全分點可能不是同一天更新，因此不能用全表共同日期裁切，
+    否則更新較頻繁的一邊會把另一邊的日期提前擠出主表。
+    """
+    keep_count = max(int(keep_count or 1), 1)
+    dates_by_scope = {}
+
+    for rec in records:
+        scope = str(strip_gsheet_text_prefix(rec.get("資料範圍", ""))).strip() or GSHEET_LEGACY_SCOPE_LABEL
+        dt = _parse_result_record_date(rec.get(date_col, ""))
+        if dt:
+            dates_by_scope.setdefault(scope, set()).add(dt.date())
+
+    keep_dates_by_scope = {
+        scope: set(sorted(date_set, reverse=True)[:keep_count])
+        for scope, date_set in dates_by_scope.items()
+    }
+
+    retained = []
+    archive = []
+
+    for rec in records:
+        scope = str(strip_gsheet_text_prefix(rec.get("資料範圍", ""))).strip() or GSHEET_LEGACY_SCOPE_LABEL
+        dt = _parse_result_record_date(rec.get(date_col, ""))
+
+        # 日期無法辨識時留在主表，避免誤刪舊版或人工資料。
+        if dt is None:
+            retained.append(rec)
+            continue
+
+        if dt.date() in keep_dates_by_scope.get(scope, set()):
+            retained.append(rec)
+        else:
+            archive.append(rec)
+
+    return retained, archive
+
+
+def _archive_year_label(rec, date_col):
+    if not GSHEET_ARCHIVE_YEARLY_SPLIT:
+        return "全部"
+
+    dt = _parse_result_record_date(rec.get(date_col, ""))
+    return str(dt.year) if dt else "未分類"
+
+
+def _archive_spreadsheet_name(year_label, part_no=1):
+    base = f"{GSHEET_ARCHIVE_NAME_PREFIX}_{year_label}"
+    return base if int(part_no) <= 1 else f"{base}_{int(part_no):02d}"
+
+
+def _explicit_archive_share_emails():
+    if not GSHEET_ARCHIVE_SHARE_EMAILS:
+        return []
+
+    out = []
+    for email in re.split(r"[,;；、\n\r\t]+", GSHEET_ARCHIVE_SHARE_EMAILS):
+        email = str(email).strip()
+        if email and "@" in email and email not in out:
+            out.append(email)
+    return out
+
+
+def _sync_archive_permissions(archive_sh):
+    """
+    新建立的封存檔由服務帳號擁有時，盡量複製主試算表既有使用者 / 群組權限；
+    也可透過 GSHEET_ARCHIVE_SHARE_EMAILS 明確指定要分享的信箱。
+    """
+    if archive_sh is None:
+        return
+
+    archive_id = str(getattr(archive_sh, "id", "") or "")
+    if archive_id and archive_id in _GSHEET_ARCHIVE_PERMISSION_SYNCED:
+        return
+
+    share_targets = {}
+
+    try:
+        primary_sh = get_gsheet_spreadsheet()
+        if primary_sh is not None and hasattr(primary_sh, "list_permissions"):
+            for permission in primary_sh.list_permissions() or []:
+                ptype = str(permission.get("type", "")).strip()
+                role = str(permission.get("role", "")).strip()
+                email = str(permission.get("emailAddress", "")).strip()
+
+                if ptype not in ("user", "group") or not email:
+                    continue
+                if role not in ("owner", "reader", "writer", "commenter"):
+                    continue
+
+                # 主檔 owner 在封存檔改授予 writer；commenter 則降成 reader。
+                if role == "owner":
+                    mapped_role = "writer"
+                elif role == "commenter":
+                    mapped_role = "reader"
+                else:
+                    mapped_role = role
+                share_targets[(ptype, email)] = mapped_role
+    except Exception:
+        pass
+
+    for email in _explicit_archive_share_emails():
+        share_targets[("user", email)] = "writer"
+
+    for (ptype, email), role in share_targets.items():
+        try:
+            archive_sh.share(
+                email,
+                perm_type=ptype,
+                role=role,
+                notify=False,
+            )
+        except Exception:
+            pass
+
+    if archive_id:
+        _GSHEET_ARCHIVE_PERMISSION_SYNCED.add(archive_id)
+
+
+def _open_archive_spreadsheet(year_label, part_no=1, create_if_missing=False):
+    key = (str(year_label), int(part_no))
+    if key in _GSHEET_ARCHIVE_SPREADSHEETS:
+        return _GSHEET_ARCHIVE_SPREADSHEETS[key]
+
+    gc = get_gsheet_client()
+    if gc is None:
+        return None
+
+    name = _archive_spreadsheet_name(year_label, part_no)
+    sh = None
+
+    try:
+        sh = gc.open(name)
+    except Exception:
+        if not create_if_missing:
+            return None
+
+        try:
+            if GSHEET_ARCHIVE_FOLDER_ID:
+                try:
+                    sh = gc.create(name, folder_id=GSHEET_ARCHIVE_FOLDER_ID)
+                except TypeError:
+                    # 相容較舊版 gspread；舊版 create() 沒有 folder_id 參數。
+                    sh = gc.create(name)
+            else:
+                sh = gc.create(name)
+            print(f"  📦 已建立 Google Sheet 年度封存檔：{name}")
+        except Exception as e:
+            print(f"  ⚠️ 建立 Google Sheet 封存檔失敗：{name}，原因：{type(e).__name__}: {e}")
+            return None
+
+    _GSHEET_ARCHIVE_SPREADSHEETS[key] = sh
+    _sync_archive_permissions(sh)
+    return sh
+
+
+def _is_blank_archive_worksheet(ws):
+    try:
+        values = _worksheet_values_with_formulas(ws)
+        return not any(str(v).strip() for row in values for v in row)
+    except Exception:
+        return False
+
+
+def _prepare_archive_target_worksheet(archive_sh, title, target_rows, target_cols):
+    """
+    檢查指定封存檔是否還容得下這張工作表；若可容納，回傳可寫入的 worksheet。
+    """
+    if archive_sh is None:
+        return None
+
+    title = safe_worksheet_title(title)
+    target_rows = max(int(target_rows), 1)
+    target_cols = max(int(target_cols), 1)
+
+    existing_ws = None
+    try:
+        existing_ws = archive_sh.worksheet(title)
+    except Exception:
+        existing_ws = None
+
+    total_cells = spreadsheet_grid_cell_count(archive_sh)
+    current_target_cells = 0
+    blank_default_ws = None
+
+    if existing_ws is not None:
+        current_target_cells = max(int(existing_ws.row_count), 1) * max(int(existing_ws.col_count), 1)
+    else:
+        try:
+            sheets = archive_sh.worksheets()
+            if len(sheets) == 1 and _is_blank_archive_worksheet(sheets[0]):
+                blank_default_ws = sheets[0]
+                current_target_cells = max(int(blank_default_ws.row_count), 1) * max(int(blank_default_ws.col_count), 1)
+        except Exception:
+            blank_default_ws = None
+
+    projected_cells = total_cells - current_target_cells + target_rows * target_cols
+    if projected_cells > GSHEET_ARCHIVE_MAX_CELLS:
+        return None
+
+    if existing_ws is not None:
+        return existing_ws
+
+    if blank_default_ws is not None:
+        try:
+            gsheet_api_call(
+                f"重新命名封存工作表 {title}",
+                blank_default_ws.update_title,
+                title,
+            )
+            return blank_default_ws
+        except Exception:
+            pass
+
+    try:
+        return gsheet_api_call(
+            f"建立封存工作表 {title}",
+            archive_sh.add_worksheet,
+            title=title,
+            rows=target_rows,
+            cols=target_cols,
+        )
+    except Exception as e:
+        print(f"  ⚠️ 建立封存工作表失敗：{title}，原因：{type(e).__name__}: {e}")
+        return None
+
+
+def _read_archive_worksheet_values(archive_sh, title):
+    if archive_sh is None:
+        return []
+
+    try:
+        ws = archive_sh.worksheet(safe_worksheet_title(title))
+        return ws.get_all_values() or []
+    except Exception:
+        return []
+
+
+def _merge_records_for_archive(title, incoming_headers, incoming_records, old_values):
+    old_headers, old_records = _values_to_records(
+        old_values,
+        header_row_idx=0,
+        default_scope=GSHEET_LEGACY_SCOPE_LABEL,
+    )
+    old_headers = _ensure_scope_header(old_headers) if old_headers else []
+
+    headers = []
+    for h in list(incoming_headers) + list(old_headers):
+        h = str(h).strip()
+        if h and h not in headers:
+            headers.append(h)
+
+    key_cols = _sheet_upsert_key_columns(title, headers)
+    if not key_cols or "資料範圍" not in key_cols:
+        # 理論上目前三張封存表一定有穩定 key；若未來欄位改名，至少保留原順序追加。
+        return headers, old_records + list(incoming_records)
+
+    merged_map = {}
+    order = []
+
+    for rec in list(old_records) + list(incoming_records):
+        if not rec.get("資料範圍"):
+            rec["資料範圍"] = GSHEET_LEGACY_SCOPE_LABEL
+
+        key = _record_key(rec, key_cols)
+        if not any(key):
+            continue
+
+        if key not in merged_map:
+            order.append(key)
+        merged_map[key] = rec
+
+    return headers, [merged_map[key] for key in order]
+
+
+def _write_values_to_archive_worksheet(ws, values):
+    """封存檔使用的精簡寫入：完整覆蓋、保留代號前導 0，並把格數縮到實際大小。"""
+    if ws is None:
+        return False
+
+    if not values:
+        values = [[""]]
+
+    row_count = max(len(values), 1)
+    col_count = max(max((len(row) for row in values), default=1), 1)
+    normalized_values = []
+
+    for row in values:
+        row = list(row)
+        if len(row) < col_count:
+            row += [""] * (col_count - len(row))
+        normalized_values.append([clean_gsheet_value(v) for v in row])
+
+    normalized_values = normalize_gsheet_values_for_text_columns(normalized_values)
+
+    try:
+        gsheet_api_call(
+            f"調整封存工作表大小 {ws.title}",
+            ws.resize,
+            rows=row_count,
+            cols=col_count,
+        )
+        gsheet_api_call(f"清除封存工作表 {ws.title}", ws.clear)
+
+        for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
+            chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
+            gsheet_api_call(
+                f"寫入封存工作表 {ws.title} A{start + 1}",
+                ws.update,
+                values=chunk,
+                range_name=f"A{start + 1}",
+                value_input_option="USER_ENTERED",
+            )
+
+        # 再 resize 一次，確保 clear / update 後沒有殘留多餘空白列欄。
+        gsheet_api_call(
+            f"最終縮減封存工作表 {ws.title}",
+            ws.resize,
+            rows=row_count,
+            cols=col_count,
+        )
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Google Sheet 封存寫入失敗：{ws.title}，原因：{type(e).__name__}: {e}")
+        return False
+
+
+def _archive_records_to_year_part(title, headers, records, year_label):
+    """把同一年度資料寫入可容納的封存分卷，必要時自動切換 _02、_03...。"""
+    if not records:
+        return True
+
+    for part_no in range(1, 100):
+        archive_sh = _open_archive_spreadsheet(
+            year_label,
+            part_no=part_no,
+            create_if_missing=(part_no == 1),
+        )
+
+        if archive_sh is None:
+            # 第一卷不存在時會建立；後續卷不存在代表前一卷可能已滿，現在建立新卷。
+            archive_sh = _open_archive_spreadsheet(
+                year_label,
+                part_no=part_no,
+                create_if_missing=True,
+            )
+
+        if archive_sh is None:
+            continue
+
+        old_values = _read_archive_worksheet_values(archive_sh, title)
+        merged_headers, merged_records = _merge_records_for_archive(
+            title,
+            headers,
+            records,
+            old_values,
+        )
+        merged_values = _records_to_values(merged_headers, merged_records)
+        target_rows = max(len(merged_values), 1)
+        target_cols = max(max((len(row) for row in merged_values), default=1), 1)
+
+        ws = _prepare_archive_target_worksheet(
+            archive_sh,
+            title,
+            target_rows=target_rows,
+            target_cols=target_cols,
+        )
+        if ws is None:
+            # 這一卷預估超過安全格數，改試下一卷。
+            continue
+
+        if _write_values_to_archive_worksheet(ws, merged_values):
+            # 封存工作表已在寫入函式中 resize 成實際大小，不再重讀整份年度封存檔。
+            archive_url = str(getattr(archive_sh, "url", "") or "").strip()
+            print(
+                f"  📦 Google Sheet 舊資料封存完成：{title}｜年度={year_label}｜"
+                f"分卷={part_no:02d}｜本次 {len(records):,} 筆｜封存表合計 {len(merged_records):,} 筆"
+                + (f"｜{archive_url}" if archive_url else "")
+            )
+            return True
+
+    print(f"  ⚠️ Google Sheet 舊資料封存失敗：{title}｜年度={year_label}，找不到可用封存分卷。")
+    return False
+
+
+def archive_result_records(title, headers, records, date_col):
+    """
+    將主表裁切出的舊資料依年度寫入獨立 Google Sheet。
+
+    只有全部年度都封存成功時才回傳 True；任一年度失敗時，主表會保留全部資料避免遺失。
+    """
+    if not records:
+        return True
+
+    if not GSHEET_RESULT_ARCHIVE_ENABLED:
+        print(f"  ⚠️ 已停用 Google Sheet 自動封存，{title} 舊資料暫不從主表移除。")
+        return False
+
+    grouped = {}
+    for rec in records:
+        year_label = _archive_year_label(rec, date_col)
+        grouped.setdefault(year_label, []).append(rec)
+
+    all_ok = True
+    for year_label in sorted(grouped.keys()):
+        ok = _archive_records_to_year_part(
+            title,
+            headers,
+            grouped[year_label],
+            year_label,
+        )
+        all_ok = all_ok and ok
+
+    return all_ok
+
+
+def apply_result_retention_and_archive(title, headers, merged_records):
+    policy = _result_retention_policy(title)
+    if not policy:
+        return merged_records, 0
+
+    retained_records, archive_records = _split_records_by_recent_dates(
+        merged_records,
+        date_col=policy["date_col"],
+        keep_count=policy["keep_count"],
+    )
+
+    if not archive_records:
+        return retained_records, 0
+
+    archive_ok = archive_result_records(
+        title,
+        headers,
+        archive_records,
+        date_col=policy["date_col"],
+    )
+
+    if not archive_ok:
+        print(
+            f"  ⚠️ {title} 有 {len(archive_records):,} 筆舊資料尚未完成封存，"
+            "本次仍保留在主試算表，避免資料遺失。"
+        )
+        return merged_records, 0
+
+    print(
+        f"  🧹 Google Sheet 主表保留策略：{title}｜"
+        f"每個資料範圍保留最近 {policy['keep_count']} 個{policy['label']}｜"
+        f"主表 {len(retained_records):,} 筆｜已移至封存 {len(archive_records):,} 筆"
+    )
+    return retained_records, len(archive_records)
+
+
 def merge_result_values_for_gsheet(title, new_values):
     """
     將本次 Excel 結果與 Google Sheet 既有結果做 upsert 合併。
@@ -4126,7 +4763,9 @@ def merge_result_values_for_gsheet(title, new_values):
     - 本次資料會加上「資料範圍」：精選五分點 / 全分點。
     - 舊資料若沒有「資料範圍」，會保留為「未標記舊資料」，不會被本次資料誤覆蓋。
     - key 重複時，以本次新資料為準。
-    - key 不重複時，舊資料保留在工作表中。
+    - key 不重複時，舊資料保留。
+    - 每日賣出明細與 TOP15 快取超過主表保留日期的資料，會先封存到獨立 Google Sheet；
+      封存成功後才從主表移除。
     """
     if not should_upsert_result_sheet(title):
         return new_values
@@ -4150,7 +4789,11 @@ def merge_result_values_for_gsheet(title, new_values):
         rec["資料範圍"] = current_scope
 
     old_values = read_existing_worksheet_values(title)
-    old_headers, old_records = _values_to_records(old_values, header_row_idx=0, default_scope=GSHEET_LEGACY_SCOPE_LABEL)
+    old_headers, old_records = _values_to_records(
+        old_values,
+        header_row_idx=0,
+        default_scope=GSHEET_LEGACY_SCOPE_LABEL,
+    )
     old_headers = _ensure_scope_header(old_headers) if old_headers else []
 
     headers = []
@@ -4204,11 +4847,17 @@ def merge_result_values_for_gsheet(title, new_values):
         merged_records.append(old_map[key])
         used_keys.add(key)
 
-    merged_values = _records_to_values(headers, merged_records)
+    retained_records, archived_count = apply_result_retention_and_archive(
+        title,
+        headers,
+        merged_records,
+    )
+    merged_values = _records_to_values(headers, retained_records)
 
     print(
         f"  ☁️ Google Sheet upsert：{safe_worksheet_title(title)}｜"
-        f"資料範圍={current_scope}｜本次 {len(new_records):,} 筆｜舊資料 {len(old_records):,} 筆｜合併後 {len(merged_records):,} 筆"
+        f"資料範圍={current_scope}｜本次 {len(new_records):,} 筆｜舊資料 {len(old_records):,} 筆｜"
+        f"合併後 {len(merged_records):,} 筆｜主表保留 {len(retained_records):,} 筆｜封存 {archived_count:,} 筆"
     )
 
     return merged_values
@@ -4690,6 +5339,16 @@ def upload_excel_to_google_sheet(xlsx_path):
 
         wb = load_workbook(xlsx_path, data_only=False)
 
+        primary_sh = get_gsheet_spreadsheet()
+        if primary_sh is not None:
+            print(
+                "  ⚙️ Google Sheet 主表保留設定："
+                f"每日賣出明細最近 {GSHEET_DAILY_SELL_KEEP_TRADING_DAYS} 個交易日｜"
+                f"TOP15 最近 {GSHEET_TOP15_KEEP_STAT_DATES} 個統計日期｜"
+                f"自動封存={'開啟' if GSHEET_RESULT_ARCHIVE_ENABLED else '關閉'}"
+            )
+            compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
+
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
 
@@ -4718,7 +5377,12 @@ def upload_excel_to_google_sheet(xlsx_path):
             values = normalize_result_values_for_comma_numbers(values)
 
             max_cols = max(max((len(row) for row in values), default=1), 1)
-            gws = get_or_recreate_result_worksheet(title, rows=max(len(values), 100), cols=max(max_cols, 20))
+            # 只配置實際需要的格數，避免建立工作表時先多占 100 列 / 20 欄。
+            gws = get_or_recreate_result_worksheet(
+                title,
+                rows=max(len(values), 1),
+                cols=max(max_cols, 1),
+            )
 
             if write_values_to_worksheet(gws, values):
                 if should_upsert_result_sheet(title):
@@ -4747,6 +5411,11 @@ def upload_excel_to_google_sheet(xlsx_path):
                     apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
                     apply_header_widths_to_gsheet(gws, values=values)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
+
+        # 每張已寫入的工作表都已由 write_values_to_worksheet() resize 成實際大小；
+        # 這裡只回報同步後配置格數，不再重讀全部工作表，避免大型試算表多做一次完整掃描。
+        if primary_sh is not None:
+            print(f"  🧮 Google Sheet 主試算表同步後配置格數：{spreadsheet_grid_cell_count(primary_sh):,}")
 
         try:
             sh = get_gsheet_spreadsheet()
