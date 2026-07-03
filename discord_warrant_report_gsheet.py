@@ -20,6 +20,9 @@
 - TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
 - IMAGE_ACTION / ACTION / RUN_PLAN：圖片產生選項，用於 GitHub Actions workflow_dispatch 區別要跑哪張圖
 - ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
+- WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE：近7日權證共識圖輸出路徑
+- WARRANT_CONSENSUS_14D_OUTPUT_IMAGE：近14日權證共識圖輸出路徑
+- WARRANT_CONSENSUS_21D_OUTPUT_IMAGE：近21日權證共識圖輸出路徑
 - WIN_RATE_STATS_OUTPUT_IMAGE：所有分點勝率統計圖輸出路徑
 """
 
@@ -3874,7 +3877,7 @@ def normalize_image_action(action_text: str) -> str:
     支援常見名稱：
     - 精選五分點每日圖 / 精選5分點當日買賣超產圖 / 每日精選分點買賣超追蹤
     - 近一個月共識淨買超TOP15
-    - 本週權證共識買賣超TOP15 / 本週買賣超金額各TOP15 / 近7日權證分點共識TOP15
+    - 本週權證共識買賣超TOP15 / 近7／14／21日權證分點共識TOP15
     - 近10日分點買賣明細圖 / 近10日分點明細 / 近10日分點買賣明細
     - 所有分點勝率統計圖 / 全分點勝率統計
     - 全部圖片
@@ -3912,6 +3915,10 @@ def normalize_image_action(action_text: str) -> str:
         "本週" in raw
         or "近7" in raw
         or "7日" in raw
+        or "近14" in raw
+        or "14日" in raw
+        or "近21" in raw
+        or "21日" in raw
         or "買賣超金額各" in raw
         or "權證分點共識" in raw
         or "weekly" in key
@@ -4212,15 +4219,177 @@ def merge_broker_10d_rows_by_underlying(rows: list[dict]) -> list[dict]:
     return merged_rows
 
 
-def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tuple[list[dict], list[dict], str, date | None]:
+def read_warrant_consensus_multi_section_table(
+    sheet_name: str,
+    needed_cols: list[str] | None = None,
+) -> pd.DataFrame:
     """
-    直接讀取「快取_近7日權證分點共識TOP15」。
+    讀取「近7／14／21日權證共識」這種多區塊工作表。
+
+    主程式目前會在同一張工作表由上往下放入三個區塊：
+    - 標題列
+    - 統計期間／統計分點說明列
+    - 欄位表頭列
+    - 排名資料列
+
+    因此不能使用 read_gsheet_table() 把第 1 列固定當成表頭。
+    本函式會逐列偵測每個區塊的真正表頭，再把三個區塊資料合併成同一個 DataFrame。
+    同時相容舊版「第 1 列就是表頭」的平面工作表。
+    """
+    try:
+        values = worksheet_values(sheet_name)
+    except Exception as exc:
+        print(f"  ⚠️ 讀取工作表失敗：{sheet_name}｜{type(exc).__name__}: {exc}")
+        return pd.DataFrame()
+
+    if not values:
+        return pd.DataFrame()
+
+    normalized_rows = [
+        [strip_gsheet_text_prefix(cell) for cell in list(row)]
+        for row in values
+    ]
+
+    header_required = {
+        "資料範圍",
+        "統計日期",
+        "統計天數",
+        "排名類型",
+        "排名",
+        "標的股",
+        "排名金額",
+    }
+
+    current_headers: list[str] | None = None
+    records: list[dict] = []
+    detected_header_count = 0
+
+    for raw_row in normalized_rows:
+        row = [str(cell).strip() for cell in raw_row]
+        row_set = {cell for cell in row if cell}
+
+        # 每個 7／14／21 日區塊都會重複出現完整表頭。
+        # 只要關鍵欄位大多存在，就視為新的表頭列。
+        if (
+            "統計天數" in row_set
+            and "排名類型" in row_set
+            and "排名" in row_set
+            and len(header_required & row_set) >= 6
+        ):
+            current_headers = row[:]
+            while current_headers and current_headers[-1] == "":
+                current_headers.pop()
+            detected_header_count += 1
+            continue
+
+        if not current_headers:
+            continue
+
+        row_values = list(raw_row)
+        if len(row_values) < len(current_headers):
+            row_values += [""] * (len(current_headers) - len(row_values))
+        elif len(row_values) > len(current_headers):
+            row_values = row_values[:len(current_headers)]
+
+        rec = {
+            header: strip_gsheet_text_prefix(row_values[idx])
+            for idx, header in enumerate(current_headers)
+            if header
+        }
+
+        stat_days = safe_int(rec.get("統計天數"), 0)
+        rank_type = strip_gsheet_text_prefix(rec.get("排名類型", "")).strip()
+        stat_date = _pick_first_existing_date(rec, ["統計日期", "日期", "目標日期"])
+
+        # 標題列、說明列、空白列與「無符合排名資料」列都不會同時具備這三項。
+        if stat_days <= 0 or not rank_type or stat_date is None:
+            continue
+
+        records.append(rec)
+
+    if not records:
+        print(
+            f"  ⚠️ {sheet_name} 未辨識到有效排名資料。"
+            f"偵測到表頭區塊 {detected_header_count} 個。"
+        )
+        return pd.DataFrame()
+
+    all_headers: list[str] = []
+    for rec in records:
+        for header in rec.keys():
+            if header and header not in all_headers:
+                all_headers.append(header)
+
+    df = pd.DataFrame(
+        [{header: rec.get(header, "") for header in all_headers} for rec in records],
+        columns=all_headers,
+    ).fillna("")
+
+    if needed_cols is not None:
+        keep_cols = [col for col in needed_cols if col in df.columns]
+        df = df[keep_cols].copy()
+
+    print(
+        f"  ✅ 已解析多區塊工作表：{sheet_name}｜"
+        f"表頭區塊 {detected_header_count} 個｜有效資料 {len(df):,} 筆"
+    )
+    return df
+
+
+def filter_warrant_consensus_selected_scope(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    近7／14／21日共識表雖然只在 RUN_MODE=2 更新，
+    實際排名內容是指定精選分點，因此「資料範圍」會寫成「精選13分點」
+    （數字會依主程式設定變動），不是「全分點」。
+
+    優先讀取「精選N分點」；若是舊版資料只有「全分點」，才退回全分點。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    if "資料範圍" not in df.columns:
+        return df
+
+    scope_series = df["資料範圍"].astype(str).map(strip_gsheet_text_prefix).str.strip()
+    unique_scopes = [scope for scope in scope_series.drop_duplicates().tolist() if scope]
+
+    selected_scopes = [
+        scope
+        for scope in unique_scopes
+        if re.fullmatch(r"精選\d+分點", scope)
+        or ("精選" in scope and "分點" in scope)
+    ]
+
+    if selected_scopes:
+        part = df[scope_series.isin(selected_scopes)].copy()
+        print(f"  ✅ 權證共識資料範圍：{'、'.join(selected_scopes)}｜{len(part):,} 筆")
+        return part
+
+    if DATA_SCOPE_ALL in unique_scopes:
+        part = df[scope_series == DATA_SCOPE_ALL].copy()
+        print(f"  ✅ 權證共識沿用舊版資料範圍：{DATA_SCOPE_ALL}｜{len(part):,} 筆")
+        return part
+
+    print(
+        f"  ⚠️ 權證共識工作表找不到「精選N分點」或「{DATA_SCOPE_ALL}」資料，"
+        f"現有資料範圍：{'、'.join(unique_scopes) if unique_scopes else '-'}"
+    )
+    return pd.DataFrame(columns=df.columns)
+
+
+def read_warrant_consensus_7d_rows_from_gsheet(
+    target: date | None = None,
+    window_days: int = 7,
+) -> tuple[list[dict], list[dict], str, date | None]:
+    """
+    直接讀取「快取_近7日權證分點共識TOP15」內指定期間資料。
 
     重要：
-    - 最終排名來源以 warrant_backtest.py 產生的快取工作表為準。
-    - 不再從「快取_分點歷史」於圖片端重新計算，避免圖片端與主程式快取口徑不一致。
-    - 這張快取表已在主程式端依「同標的所有認購權證金額加總」完成排名。
-    - 本圖固定只讀 資料範圍=全分點。
+    - 工作表同時包含近 7／14／21 日三個獨立區塊。
+    - 自動辨識每個區塊真正的表頭，不再把第 1 列標題誤當表頭。
+    - 實際排名是指定精選分點，因此讀取「資料範圍=精選N分點」。
+    - 依 window_days 固定切出 7、14 或 21 日資料，三個期間不會混在一起。
+    - 最終排名來源仍完全以 warrant_backtest.py 寫入的快取為準。
 
     回傳：
     - 共識買超標的 rows
@@ -4228,6 +4397,8 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
     - 統計期間文字
     - 實際採用的統計日期
     """
+    window_days = max(safe_int(window_days, 7), 1)
+
     needed_cols = [
         "資料範圍",
         "統計日期", "日期", "目標日期", "統計期間", "統計天數", "有效日期數", "第一筆日期", "最後筆日期",
@@ -4240,97 +4411,161 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
         "完成狀態", "更新時間", "run_id", "分點明細_JSON",
     ]
 
-    df = read_gsheet_table_optional(
+    df = read_warrant_consensus_multi_section_table(
         SHEET_WARRANT_CONSENSUS_7D,
         needed_cols,
-        filter_tracked_brokers=False,
     )
-    df = filter_df_by_data_scope(df, DATA_SCOPE_ALL)
+    df = filter_warrant_consensus_selected_scope(df)
 
     if df.empty:
+        return [], [], "無資料", None
+
+    if "統計天數" not in df.columns:
+        print(f"  ⚠️ {SHEET_WARRANT_CONSENSUS_7D} 找不到「統計天數」欄位。")
+        return [], [], "無資料", None
+
+    stat_days_series = df["統計天數"].map(lambda value: safe_int(value, 0))
+    df = df[stat_days_series == window_days].copy()
+
+    if df.empty:
+        print(f"  ⚠️ {SHEET_WARRANT_CONSENSUS_7D} 找不到近{window_days}日資料。")
         return [], [], "無資料", None
 
     def pick_date(row):
         return _pick_first_existing_date(row, ["統計日期", "日期", "目標日期"])
 
     available_dates = []
-    for _, r in df.iterrows():
-        d = pick_date(r)
-        if d:
-            available_dates.append(d)
+    for _, row in df.iterrows():
+        stat_date = pick_date(row)
+        if stat_date:
+            available_dates.append(stat_date)
 
     if not available_dates:
         return [], [], "無資料", None
 
     if target is not None:
-        valid_dates = [d for d in available_dates if d <= target]
+        valid_dates = [stat_date for stat_date in available_dates if stat_date <= target]
         chosen_date = max(valid_dates) if valid_dates else max(available_dates)
     else:
         chosen_date = max(available_dates)
 
-    df = df[df.apply(lambda r: pick_date(r) == chosen_date, axis=1)].copy()
-    df = filter_latest_cache_snapshot(df, SHEET_WARRANT_CONSENSUS_7D)
+    df = df[df.apply(lambda row: pick_date(row) == chosen_date, axis=1)].copy()
+    df = filter_latest_cache_snapshot(
+        df,
+        f"{SHEET_WARRANT_CONSENSUS_7D}（近{window_days}日）",
+    )
 
     if df.empty:
         return [], [], "無資料", chosen_date
 
-    period_values = [strip_gsheet_text_prefix(v) for v in df.get("統計期間", []) if strip_gsheet_text_prefix(v)]
+    period_values = [
+        strip_gsheet_text_prefix(value)
+        for value in df.get("統計期間", [])
+        if strip_gsheet_text_prefix(value)
+    ]
     period_text = period_values[0] if period_values else ""
+
     if not period_text:
-        first_dates = [parse_date_value(v) for v in df.get("第一筆日期", []) if parse_date_value(v)]
-        last_dates = [parse_date_value(v) for v in df.get("最後筆日期", []) if parse_date_value(v)]
+        first_dates = [
+            parse_date_value(value)
+            for value in df.get("第一筆日期", [])
+            if parse_date_value(value)
+        ]
+        last_dates = [
+            parse_date_value(value)
+            for value in df.get("最後筆日期", [])
+            if parse_date_value(value)
+        ]
         if first_dates and last_dates:
             period_text = f"{min(first_dates):%Y/%m/%d} ～ {max(last_dates):%Y/%m/%d}"
         else:
             period_text = "無資料"
 
     def normalize_rank_type(raw_value: str) -> str:
-        s = strip_gsheet_text_prefix(raw_value).strip()
-        if s in {"共識買超", "買超", "buy", "BUY"}:
+        value = strip_gsheet_text_prefix(raw_value).strip()
+        if value in {"共識買超", "買超", "buy", "BUY"}:
             return "共識買超"
-        if s in {"共識賣超", "賣超", "sell", "SELL"}:
+        if value in {"共識賣超", "賣超", "sell", "SELL"}:
             return "共識賣超"
-        return s
+        return value
 
     def build_rows(rank_type: str) -> list[dict]:
         rows = []
-        for _, r in df.iterrows():
-            row_rank_type = normalize_rank_type(_pick_first_existing_value(r, ["排名類型", "方向"]))
+
+        for _, row in df.iterrows():
+            row_rank_type = normalize_rank_type(
+                _pick_first_existing_value(row, ["排名類型", "方向"])
+            )
             if row_rank_type != rank_type:
                 continue
 
             underlying, underlying_name, target_label = resolve_target_identity(
-                r,
+                row,
                 code_cols=["標的股", "標的代號", "標的"],
                 name_cols=["標的名稱", "股票名稱"],
                 raw_target_cols=["標的", "標的名稱", "股票名稱"],
                 warrant_text_cols=["權證名稱", "權證清單", "權證代號"],
             )
 
-            buy_amount = safe_float(_pick_first_existing_value(r, ["買進金額"]), 0)
-            sell_amount = safe_float(_pick_first_existing_value(r, ["賣出金額"]), 0)
-            net_buy_amount = safe_float(_pick_first_existing_value(r, ["淨買超金額"]), buy_amount - sell_amount)
-            net_sell_amount = safe_float(_pick_first_existing_value(r, ["淨賣超金額"]), sell_amount - buy_amount)
+            buy_amount = safe_float(
+                _pick_first_existing_value(row, ["買進金額"]),
+                0,
+            )
+            sell_amount = safe_float(
+                _pick_first_existing_value(row, ["賣出金額"]),
+                0,
+            )
+            net_buy_amount = safe_float(
+                _pick_first_existing_value(row, ["淨買超金額"]),
+                buy_amount - sell_amount,
+            )
+            net_sell_amount = safe_float(
+                _pick_first_existing_value(row, ["淨賣超金額"]),
+                sell_amount - buy_amount,
+            )
 
-            rank_amount = safe_float(_pick_first_existing_value(r, ["排名金額"]), 0)
+            rank_amount = safe_float(
+                _pick_first_existing_value(row, ["排名金額"]),
+                0,
+            )
             if rank_amount == 0:
-                rank_amount = net_buy_amount if rank_type == "共識買超" else net_sell_amount
+                rank_amount = (
+                    net_buy_amount
+                    if rank_type == "共識買超"
+                    else net_sell_amount
+                )
 
-            warrant_count = safe_int(_pick_first_existing_value(r, ["權證檔數"]), 0)
+            warrant_count = safe_int(
+                _pick_first_existing_value(row, ["權證檔數"]),
+                0,
+            )
             if warrant_count <= 0:
-                warrant_count = _warrant_consensus_warrant_count(_pick_first_existing_value(r, ["權證清單", "權證代號"]))
+                warrant_count = _warrant_consensus_warrant_count(
+                    _pick_first_existing_value(row, ["權證清單", "權證代號"])
+                )
 
-            same_direction_count = safe_int(_pick_first_existing_value(r, ["同向分點數", "參與分點數"]), 0)
-            opposite_direction_count = safe_int(_pick_first_existing_value(r, ["反向分點數"]), 0)
-            broker_count = safe_int(_pick_first_existing_value(r, ["參與分點數", "同向分點數"]), 0)
-            main_brokers = strip_gsheet_text_prefix(_pick_first_existing_value(r, ["主要同向分點", "參與分點"]))
-            main_brokers = main_brokers.replace("；", "、")
+            same_direction_count = safe_int(
+                _pick_first_existing_value(row, ["同向分點數", "參與分點數"]),
+                0,
+            )
+            opposite_direction_count = safe_int(
+                _pick_first_existing_value(row, ["反向分點數"]),
+                0,
+            )
+            broker_count = safe_int(
+                _pick_first_existing_value(row, ["參與分點數", "同向分點數"]),
+                0,
+            )
+            main_brokers = strip_gsheet_text_prefix(
+                _pick_first_existing_value(row, ["主要同向分點", "參與分點"])
+            ).replace("；", "、")
 
             rows.append({
                 "stat_date": chosen_date,
+                "window_days": window_days,
                 "period": period_text,
                 "rank_type": rank_type,
-                "rank": safe_int(_pick_first_existing_value(r, ["排名"]), 0),
+                "rank": safe_int(_pick_first_existing_value(row, ["排名"]), 0),
                 "underlying": underlying,
                 "underlying_name": underlying_name,
                 "target": target_label or underlying,
@@ -4339,8 +4574,8 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
                 "sell_amount": sell_amount,
                 "net_buy_amount": net_buy_amount,
                 "net_sell_amount": net_sell_amount,
-                "buy_qty": safe_float(_pick_first_existing_value(r, ["買進股數"]), 0),
-                "sell_qty": safe_float(_pick_first_existing_value(r, ["賣出股數"]), 0),
+                "buy_qty": safe_float(_pick_first_existing_value(row, ["買進股數"]), 0),
+                "sell_qty": safe_float(_pick_first_existing_value(row, ["賣出股數"]), 0),
                 "warrant_count": warrant_count,
                 "same_direction_count": same_direction_count,
                 "opposite_direction_count": opposite_direction_count,
@@ -4348,21 +4583,42 @@ def read_warrant_consensus_7d_rows_from_gsheet(target: date | None = None) -> tu
                 "main_brokers": main_brokers,
             })
 
-        rows = dedupe_ranked_rows_by_underlying(rows, label=rank_type)
-        rows.sort(key=lambda x: (safe_int(x.get("rank"), 999999), -safe_float(x.get("rank_amount"), 0)))
+        rows = dedupe_ranked_rows_by_underlying(
+            rows,
+            label=f"近{window_days}日{rank_type}",
+        )
+        rows.sort(
+            key=lambda item: (
+                safe_int(item.get("rank"), 999999),
+                -safe_float(item.get("rank_amount"), 0),
+            )
+        )
         return rows[:15]
 
     buy_rows = build_rows("共識買超")
     sell_rows = build_rows("共識賣超")
-    return buy_rows, sell_rows, period_text or "無資料", chosen_date
-def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
-    """
-    新增圖片：本週標的分點共識買賣超金額各 TOP15。
 
-    資料來源改為直接讀取「快取_近7日權證分點共識TOP15」。
+    print(
+        f"  ✅ 近{window_days}日權證共識圖資料完成："
+        f"統計日期={chosen_date:%Y-%m-%d}｜"
+        f"買超 {len(buy_rows)} 筆｜賣超 {len(sell_rows)} 筆｜"
+        f"期間={period_text or '無資料'}"
+    )
+
+    return buy_rows, sell_rows, period_text or "無資料", chosen_date
+
+def draw_weekly_warrant_consensus_image(target: date, output_path: Path, window_days: int = 7):
+    """
+    產生近 7／14／21 日指定期間的標的分點共識買賣超金額各 TOP15。
+
+    資料來源直接讀取「快取_近7日權證分點共識TOP15」內對應期間區塊。
     排名口徑以主程式快取為準：同標的所有認購權證金額加總後排名。
     """
-    buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(target)
+    window_days = max(safe_int(window_days, 7), 1)
+    buy_rows, sell_rows, period_text, cache_date = read_warrant_consensus_7d_rows_from_gsheet(
+        target,
+        window_days=window_days,
+    )
 
     total_buy_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in buy_rows)
     total_sell_rank_amount = sum(safe_float(r.get("rank_amount"), 0) for r in sell_rows)
@@ -4500,7 +4756,7 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "本週標的分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
+    text(margin_x + 0.15, y, f"近{window_days}日標的分點共識買賣超金額 TOP15", 30, NAVY, BOLD)
     y -= 0.45
     text(
         margin_x + 0.18,
@@ -4517,7 +4773,7 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
     rounded(margin_x, summary_y, content_w, summary_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
     text(margin_x + 0.25, summary_y + summary_h / 2, f"共識買超TOP15合計：{fmt_wan(total_buy_rank_amount)}", 13.5, NAVY, BOLD)
     text(margin_x + 3.90, summary_y + summary_h / 2, f"共識賣超TOP15合計：{fmt_wan(total_sell_rank_amount)}", 13.5, NAVY2, BOLD)
-    text(margin_x + 7.55, summary_y + summary_h / 2, "排名金額＝同標的所有權證近7日買賣互抵後金額", 12.5, TEXT, FONT)
+    text(margin_x + 7.55, summary_y + summary_h / 2, f"排名金額＝同標的所有權證近{window_days}日買賣互抵後金額", 12.5, TEXT, FONT)
     y = summary_y - gap
 
     def draw_top15_table(title: str, rows: list[dict], y_top: float, theme_color: str, amount_label: str) -> float:
@@ -4578,9 +4834,9 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path):
 
         return y_top - table_h
 
-    y = draw_top15_table("本週共識買超金額 TOP15", buy_rows, y, NAVY, "買超金額")
+    y = draw_top15_table(f"近{window_days}日共識買超金額 TOP15", buy_rows, y, NAVY, "買超金額")
     y -= gap
-    y = draw_top15_table("本週共識賣超金額 TOP15", sell_rows, y, NAVY, "賣超金額")
+    y = draw_top15_table(f"近{window_days}日共識賣超金額 TOP15", sell_rows, y, NAVY, "賣超金額")
 
     text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
 
@@ -5409,6 +5665,8 @@ def main():
     parser.add_argument("--output", default=os.getenv("OUTPUT_IMAGE", "output/精選分點買賣超追蹤.png"))
     parser.add_argument("--consensus-output", default=os.getenv("CONSENSUS_OUTPUT_IMAGE", ""))
     parser.add_argument("--weekly-output", default=os.getenv("WEEKLY_WARRANT_CONSENSUS_OUTPUT_IMAGE", ""))
+    parser.add_argument("--weekly14-output", default=os.getenv("WARRANT_CONSENSUS_14D_OUTPUT_IMAGE", ""))
+    parser.add_argument("--weekly21-output", default=os.getenv("WARRANT_CONSENSUS_21D_OUTPUT_IMAGE", ""))
     parser.add_argument("--win-rate-output", default=os.getenv("WIN_RATE_STATS_OUTPUT_IMAGE", ""))
     parser.add_argument("--broker10d-output-dir", default=os.getenv("BROKER_10D_OUTPUT_DIR", ""))
     parser.add_argument(
@@ -5423,7 +5681,7 @@ def main():
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
             "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
-            "本週權證共識買賣超TOP15 / 近10日分點買賣明細圖 / "
+            "本週權證共識買賣超TOP15（輸出近7／14／21日三張圖） / 近10日分點買賣明細圖 / "
             "所有分點勝率統計圖 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
         ),
     )
@@ -5440,6 +5698,8 @@ def main():
     output_path = Path(args.output)
     consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
     weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
+    weekly14_output_path = Path(args.weekly14_output) if args.weekly14_output else weekly_output_path.parent / "近14日權證分點共識買賣超TOP15.png"
+    weekly21_output_path = Path(args.weekly21_output) if args.weekly21_output else weekly_output_path.parent / "近21日權證分點共識買賣超TOP15.png"
     win_rate_output_path = Path(args.win_rate_output) if args.win_rate_output else output_path.parent / "所有分點勝率統計.png"
     broker10d_output_dir = Path(args.broker10d_output_dir) if args.broker10d_output_dir else output_path.parent
 
@@ -5476,9 +5736,20 @@ def main():
         image_paths.append(consensus_output_path)
 
     if action in [IMAGE_ACTION_WEEKLY_WARRANT, IMAGE_ACTION_ALL]:
-        print(f"輸出圖檔：{weekly_output_path}")
-        draw_weekly_warrant_consensus_image(target, weekly_output_path)
-        image_paths.append(weekly_output_path)
+        warrant_consensus_outputs = [
+            (7, weekly_output_path),
+            (14, weekly14_output_path),
+            (21, weekly21_output_path),
+        ]
+
+        for window_days, image_path in warrant_consensus_outputs:
+            print(f"輸出近{window_days}日權證共識圖：{image_path}")
+            draw_weekly_warrant_consensus_image(
+                target,
+                image_path,
+                window_days=window_days,
+            )
+            image_paths.append(image_path)
 
     if action in [IMAGE_ACTION_WIN_RATE_STATS, IMAGE_ACTION_ALL]:
         print(f"輸出圖檔：{win_rate_output_path}")
