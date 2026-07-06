@@ -267,6 +267,23 @@ HISTORICAL_BRANCH_DETAIL_SHEETS_RAW = os.getenv(
 # 可用環境變數補入代號，程式仍會透過 API4 / API5 即時回查，不讀 Google Sheet。
 # 格式支援：062599 或 062599:晶技國票5B購01，多筆用逗號分隔。
 EXTRA_LIVE_WARRANTS_RAW = os.getenv("WARRANT_EXTRA_LIVE_WARRANTS", os.getenv("WARRANT_EXTRA_WARRANT_CODES", "")).strip()
+# 純 Live 指定 pair 補抓：
+# 當 MoneyDJ Search 有權證，但 API4 沒有回傳某分點清單時，可直接把 權證×券商代號×分點 丟給 API5 回查。
+# 格式支援：
+#   062599:9A9g:永豐金內湖
+#   062599:9A9g:永豐金內湖:晶技國票5B購01
+# 多筆用逗號、分號或換行分隔。
+EXTRA_LIVE_PAIRS_RAW = os.getenv("WARRANT_EXTRA_LIVE_PAIRS", "").strip()
+# API4 空回應 / 指定權證補查：
+# 預設啟用。若 API4 對某支權證回 empty，會用本次 API4 已知的精選分點券商代號，
+# 自動補出該權證 × 精選分點 pair，再交給 API5 純 Live 回查。
+AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE = os.getenv(
+    "WARRANT_AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+# 權證追蹤 Debug：預設追蹤本次問題權證 062599；可設空字串關閉，或用逗號追蹤多檔。
+DEBUG_WARRANT_CODES_RAW = os.getenv("WARRANT_DEBUG_WARRANT_CODES", "062599").strip()
+DEBUG_API5_ROWS_ENABLE = os.getenv("WARRANT_DEBUG_API5_ROWS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
 LOCAL_WARRANT_CACHE_ENABLE = (
@@ -1792,6 +1809,210 @@ def parse_extra_live_warrants(stock_code: str, stock_name: str) -> List[dict]:
             preview += "…"
         print(f"🔁 指定權證純 Live 補抓：{len(out):,} 支｜{preview}")
     return out
+
+
+def get_debug_warrant_codes() -> set:
+    """取得要追蹤的權證代號集合。預設追蹤 062599，方便確認是否進入 MoneyDJ / API4 / API5 流程。"""
+    raw = str(DEBUG_WARRANT_CODES_RAW or "").strip()
+    codes = set()
+    if raw:
+        for item in re.split(r"[,，;；\n\r|｜]+", raw):
+            code = normalize_openapi_warrant_code(str(item or "").strip())
+            if code and re.fullmatch(r"\d{6}", code):
+                codes.add(code)
+
+    # 使用者若有指定純 Live 權證，也一併納入 debug。
+    for item in re.split(r"[,，;；\n\r]+", str(EXTRA_LIVE_WARRANTS_RAW or "")):
+        parts = [p.strip() for p in re.split(r"[:：|｜]", str(item or "")) if p.strip()]
+        if parts:
+            code = normalize_openapi_warrant_code(parts[0])
+            if code and re.fullmatch(r"\d{6}", code):
+                codes.add(code)
+
+    # 使用者若有指定純 Live pair，也一併納入 debug。
+    for item in re.split(r"[,，;；\n\r]+", str(EXTRA_LIVE_PAIRS_RAW or "")):
+        parts = [p.strip() for p in re.split(r"[:：|｜]", str(item or "")) if p.strip()]
+        if parts:
+            code = normalize_openapi_warrant_code(parts[0])
+            if code and re.fullmatch(r"\d{6}", code):
+                codes.add(code)
+
+    return codes
+
+
+def parse_extra_live_pairs(stock_code: str, stock_name: str, warrant_lookup: dict | None = None) -> List[dict]:
+    """解析手動指定的純 Live 補抓 pair。
+
+    這不是 Google Sheet 快取；只是讓使用者在完全純 Live 模式下，
+    直接指定「權證代號 × 券商代號 × 分點」，再由 API5 即時回查買賣金額。
+    """
+    raw = str(EXTRA_LIVE_PAIRS_RAW or "").strip()
+    if not raw:
+        return []
+
+    warrant_lookup = warrant_lookup or {}
+    stock_code_clean = _clean_code(stock_code)
+    out = []
+    seen = set()
+
+    for item in re.split(r"[,，;；\n\r]+", raw):
+        item = str(item or "").strip()
+        if not item:
+            continue
+
+        parts = [p.strip() for p in re.split(r"[:：|｜]", item) if p.strip()]
+        if len(parts) < 3:
+            print(f"⚠️ 指定 pair 格式不足，略過：{item}｜格式：權證代號:券商代號:分點[:權證名稱]")
+            continue
+
+        code = normalize_openapi_warrant_code(parts[0])
+        broker_code = str(parts[1] or "").strip()
+        branch = normalize_branch_name(parts[2])
+        if not code or not re.fullmatch(r"\d{6}", code) or not broker_code or not branch:
+            print(f"⚠️ 指定 pair 欄位不完整，略過：{item}")
+            continue
+
+        key = (code, broker_code)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        w = warrant_lookup.get(code, {}) if isinstance(warrant_lookup, dict) else {}
+        warrant_name = parts[3] if len(parts) >= 4 else str(w.get("名稱", "") or w.get("warrant_name", "") or code).strip()
+        out.append({
+            "warrant_code": code,
+            "warrant_name": warrant_name,
+            "underlying_code": str(w.get("標的股", "") or stock_code_clean),
+            "underlying_name": str(w.get("標的名稱", "") or stock_name),
+            "broker_code": broker_code,
+            "branch": branch,
+            "pair_source": "ExtraLivePair",
+        })
+
+    if out:
+        preview = "、".join([
+            f"{p['warrant_code']}×{p['broker_code']}×{p['branch']}"
+            for p in out[:12]
+        ])
+        if len(out) > 12:
+            preview += "…"
+        print(f"🔁 指定 權證×分點 純 Live pair 補抓：{len(out):,} 組｜{preview}")
+    return out
+
+
+def _build_selected_branch_broker_code_map(pair_values: List[dict]) -> dict:
+    """從本次 API4 成功回傳的 pair 中推回分點對應券商代號。"""
+    branch_to_brokers = {}
+    for p in pair_values or []:
+        branch = normalize_branch_name(p.get("branch", ""))
+        broker_code = str(p.get("broker_code", "") or "").strip()
+        if not branch or not broker_code:
+            continue
+        branch_to_brokers.setdefault(branch, set()).add(broker_code)
+
+    out = {}
+    for branch, brokers in branch_to_brokers.items():
+        if len(brokers) == 1:
+            out[branch] = sorted(brokers)[0]
+        elif len(brokers) > 1:
+            # 理論上同一分點應該只會對應一個券商代號；若有多個，保守取排序第一個並印出提醒。
+            chosen = sorted(brokers)[0]
+            out[branch] = chosen
+            print(f"⚠️ 分點 {branch} 對應多個券商代號：{sorted(brokers)}，暫用 {chosen}")
+    return out
+
+
+def build_auto_selected_branch_backfill_pairs(
+    warrants: List[dict],
+    existing_pairs: List[dict],
+    api4_status_by_code: dict,
+    stock_code: str,
+    stock_name: str,
+) -> List[dict]:
+    """API4 掃不到指定權證分點時，自動補出「權證 × 精選分點」pair 給 API5 回查。
+
+    解決情境：
+    - MoneyDJ Search 母體有 062599。
+    - 但 API4 對 062599 回 empty，導致拿不到永豐金內湖這個 pair。
+    - 本次其他權證已經知道「永豐金內湖」的券商代號是 9A9g。
+    - 因此可直接補 062599 × 9A9g × 永豐金內湖，讓 API5 純 Live 回查歷史買賣金額。
+    """
+    if not AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE:
+        return []
+    if not warrants:
+        return []
+
+    selected_branches = _get_selected_branch_flow_list()
+    selected_branches = [normalize_branch_name(x) for x in selected_branches if normalize_branch_name(x)]
+    if not selected_branches:
+        return []
+
+    branch_code_map = _build_selected_branch_broker_code_map(existing_pairs)
+    missing_branch_codes = [b for b in selected_branches if b not in branch_code_map]
+    if missing_branch_codes:
+        print(f"⚠️ API4 pair 中找不到精選分點券商代號，無法自動補查：{', '.join(missing_branch_codes)}")
+
+    debug_codes = get_debug_warrant_codes()
+    extra_warrant_codes = {
+        normalize_openapi_warrant_code(x.get("代號", ""))
+        for x in parse_extra_live_warrants(stock_code, stock_name)
+        if normalize_openapi_warrant_code(x.get("代號", ""))
+    }
+
+    existing_keys = {
+        (normalize_openapi_warrant_code(p.get("warrant_code", "")), str(p.get("broker_code", "") or "").strip())
+        for p in existing_pairs or []
+    }
+
+    out = []
+    for w in warrants:
+        code = normalize_openapi_warrant_code(w.get("代號", ""))
+        if not code:
+            continue
+
+        status = str(api4_status_by_code.get(code, "") or "").strip()
+        # 自動補查條件：
+        # 1. API4 對該權證回 empty。
+        # 2. 或使用者指定要 debug / extra live 的權證，例如 062599。
+        should_backfill = (status == "empty") or (code in debug_codes) or (code in extra_warrant_codes)
+        if not should_backfill:
+            continue
+
+        for branch in selected_branches:
+            broker_code = branch_code_map.get(branch, "")
+            if not broker_code:
+                continue
+
+            key = (code, broker_code)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+
+            out.append({
+                "warrant_code": code,
+                "warrant_name": str(w.get("名稱", "") or code).strip(),
+                "underlying_code": str(w.get("標的股", "") or _clean_code(stock_code)),
+                "underlying_name": str(w.get("標的名稱", "") or stock_name),
+                "broker_code": broker_code,
+                "branch": branch,
+                "pair_source": "AutoSelectedBranchBackfill",
+            })
+
+    if out:
+        preview = "、".join([
+            f"{p['warrant_code']}×{p['broker_code']}×{p['branch']}"
+            for p in out[:12]
+        ])
+        if len(out) > 12:
+            preview += "…"
+        empty_count = sum(1 for w in warrants if str(api4_status_by_code.get(normalize_openapi_warrant_code(w.get("代號", "")), "")) == "empty")
+        print(
+            f"🔁 API4 空回應 / 指定權證精選分點 pair 自動補查："
+            f"API4 empty權證 {empty_count:,} 支｜新增 {len(out):,} 組｜{preview}"
+        )
+
+    return out
+
 
 def _normalize_perf_header(v) -> str:
     s = html.unescape(str(v or "")).strip()
@@ -3444,6 +3665,16 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
 
     if MAX_WARRANTS > 0:
         warrants = warrants[:MAX_WARRANTS]
+
+    debug_codes = get_debug_warrant_codes()
+    if debug_codes:
+        warrant_map_for_debug = {normalize_openapi_warrant_code(w.get("代號", "")): w for w in warrants}
+        for debug_code in sorted(debug_codes):
+            if debug_code in warrant_map_for_debug:
+                print(f"✅ Debug 權證母體包含 {debug_code}：{warrant_map_for_debug[debug_code]}")
+            else:
+                print(f"⚠️ Debug 權證母體不包含 {debug_code}，後續 API4/API5 不會查到這檔")
+
     print(
         f"🔎 {stock_code_clean} {stock_name} 權證比對："
         f"lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜"
@@ -3491,6 +3722,16 @@ def api5_get(warrant, broker, days=None):
 
 def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_s: str) -> List[dict]:
     pairs = {}
+    api4_status_by_code = {}
+    api4_rows_count_by_code = {}
+    api4_error_by_code = {}
+    debug_codes = get_debug_warrant_codes()
+    warrant_lookup = {
+        normalize_openapi_warrant_code(w.get("代號", "")): w
+        for w in warrants or []
+        if normalize_openapi_warrant_code(w.get("代號", ""))
+    }
+
     if not warrants:
         return []
 
@@ -3520,6 +3761,34 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
             "error": error,
             "retry_count": retry_count,
         }
+
+    def remember_api4_result(result):
+        w = result.get("warrant", {})
+        code = normalize_openapi_warrant_code(w.get("代號", ""))
+        if not code:
+            return
+        api4_status_by_code[code] = str(result.get("status", "") or "")
+        api4_rows_count_by_code[code] = len(result.get("rows", []) or [])
+        api4_error_by_code[code] = str(result.get("error", "") or "")
+
+    def print_api4_debug(result, stage: str = "第一輪"):
+        w = result.get("warrant", {})
+        code = normalize_openapi_warrant_code(w.get("代號", ""))
+        if code not in debug_codes:
+            return
+
+        rows = result.get("rows", []) or []
+        status = result.get("status", "")
+        error = result.get("error", "")
+        print("========== API4 指定權證 Debug ==========")
+        print(f"權證：{code}｜名稱：{w.get('名稱', '')}｜來源：{w.get('母體來源', '')}｜階段：{stage}")
+        print(f"API4 status={status}｜rows={len(rows):,}｜error={error}")
+        if rows:
+            for row in rows[:20]:
+                print(row)
+            if len(rows) > 20:
+                print(f"... API4 rows 尚有 {len(rows) - 20:,} 筆未列印")
+        print("========== API4 指定權證 Debug 結束 ==========")
 
     def record_final_result(result, second_pass: bool = False):
         w = result.get("warrant", {})
@@ -3562,6 +3831,8 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
             w = futures.get(fut, {})
             try:
                 result = fut.result()
+                remember_api4_result(result)
+                print_api4_debug(result, stage="第一輪")
                 if result.get("status") == "failed":
                     failed_results.append(result)
                 else:
@@ -3569,6 +3840,11 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
                     for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
                         pairs[(rec["warrant_code"], rec["broker_code"])] = rec
             except Exception as e:
+                code = normalize_openapi_warrant_code(w.get("代號", ""))
+                if code:
+                    api4_status_by_code[code] = "failed"
+                    api4_rows_count_by_code[code] = 0
+                    api4_error_by_code[code] = f"future {w.get('代號', '')}｜{e}"
                 failed_results.append({
                     "warrant": w,
                     "rows": [],
@@ -3593,6 +3869,8 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
                 w = futures.get(fut, {})
                 try:
                     result = fut.result()
+                    remember_api4_result(result)
+                    print_api4_debug(result, stage="第二輪")
                     if result.get("status") == "failed":
                         second_failed.append(result)
                     record_final_result(result, second_pass=True)
@@ -3600,6 +3878,11 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
                         for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
                             pairs[(rec["warrant_code"], rec["broker_code"])] = rec
                 except Exception as e:
+                    code = normalize_openapi_warrant_code(w.get("代號", ""))
+                    if code:
+                        api4_status_by_code[code] = "failed"
+                        api4_rows_count_by_code[code] = 0
+                        api4_error_by_code[code] = f"second future {w.get('代號', '')}｜{e}"
                     result = {
                         "warrant": w,
                         "rows": [],
@@ -3613,7 +3896,58 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
             print(f"⚠️ API4 第二輪後仍失敗：{len(second_failed):,} 支")
     else:
         for result in failed_results:
+            remember_api4_result(result)
             record_final_result(result, second_pass=False)
+
+    if debug_codes:
+        for debug_code in sorted(debug_codes):
+            if debug_code in warrant_lookup:
+                status = api4_status_by_code.get(debug_code, "未執行")
+                rows_count = api4_rows_count_by_code.get(debug_code, 0)
+                err = api4_error_by_code.get(debug_code, "")
+                print(f"🔎 API4 指定權證總結：{debug_code}｜status={status}｜rows={rows_count:,}｜error={err}")
+            else:
+                print(f"⚠️ API4 指定權證總結：{debug_code} 不在本次權證母體，所以 API4 未執行")
+
+    # 完全純 Live 的 pair 補查：
+    # 1. 使用者手動指定的 權證×券商代號×分點。
+    # 2. API4 對某權證回 empty，或指定 debug 權證時，自動用本次已知精選分點券商代號補 pair。
+    pair_values_before_backfill = list(pairs.values())
+    extra_pairs = parse_extra_live_pairs(
+        warrants[0].get("標的股", "") if warrants else "",
+        warrants[0].get("標的名稱", "") if warrants else "",
+        warrant_lookup=warrant_lookup,
+    )
+    auto_pairs = build_auto_selected_branch_backfill_pairs(
+        warrants,
+        pair_values_before_backfill,
+        api4_status_by_code,
+        warrants[0].get("標的股", "") if warrants else "",
+        warrants[0].get("標的名稱", "") if warrants else "",
+    )
+
+    backfill_pairs = extra_pairs + auto_pairs
+    if backfill_pairs:
+        before = len(pairs)
+        for p in backfill_pairs:
+            code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
+            broker_code = str(p.get("broker_code", "") or "").strip()
+            branch = normalize_branch_name(p.get("branch", ""))
+            if not code or not broker_code:
+                continue
+            p = dict(p)
+            p["warrant_code"] = code
+            p["branch"] = branch
+            p.setdefault("warrant_name", str(warrant_lookup.get(code, {}).get("名稱", "") or code))
+            p.setdefault("underlying_code", str(warrant_lookup.get(code, {}).get("標的股", "") or ""))
+            p.setdefault("underlying_name", str(warrant_lookup.get(code, {}).get("標的名稱", "") or ""))
+            pairs[(code, broker_code)] = p
+
+        added = len(pairs) - before
+        print(
+            f"🔁 純 Live API5 pair 補查合併完成：原始 {before:,} 組｜"
+            f"補查候選 {len(backfill_pairs):,} 組｜實際新增 {added:,} 組｜合併後 {len(pairs):,} 組"
+        )
 
     print_api_fetch_stats("api4", "API4")
     abort_if_api_failure_too_high("api4", "API4")
@@ -3623,20 +3957,68 @@ def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_
     print(f"✅ API4 完成：{len(pair_list):,} 組 權證×分點")
     return pair_list
 
+
 def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date=None) -> pd.DataFrame:
     rows = []
     if not pair_list:
         return pd.DataFrame()
 
+    debug_codes = get_debug_warrant_codes()
+    selected_branches_for_debug = set(_get_selected_branch_flow_list()) if SELECTED_BRANCH_FLOW_ENABLE else set()
+    selected_branches_for_debug = {normalize_branch_name(x) for x in selected_branches_for_debug if normalize_branch_name(x)}
+
+    if debug_codes:
+        debug_pairs = [
+            p for p in pair_list
+            if normalize_openapi_warrant_code(p.get("warrant_code", "")) in debug_codes
+        ]
+        if debug_pairs:
+            print("========== API5 指定權證 pair Debug ==========")
+            print(f"指定權證：{', '.join(sorted(debug_codes))}｜pair 數：{len(debug_pairs):,}")
+            for p in debug_pairs[:30]:
+                print(
+                    f"{normalize_openapi_warrant_code(p.get('warrant_code', ''))}｜"
+                    f"{p.get('warrant_name', '')}｜broker={p.get('broker_code', '')}｜"
+                    f"branch={normalize_branch_name(p.get('branch', ''))}｜source={p.get('pair_source', 'API4')}"
+                )
+            if len(debug_pairs) > 30:
+                print(f"... 指定權證 pair 尚有 {len(debug_pairs) - 30:,} 組未列印")
+            print("========== API5 指定權證 pair Debug 結束 ==========")
+        else:
+            print(f"⚠️ API5 指定權證沒有任何 pair：{', '.join(sorted(debug_codes))}")
+
     def fetch_one(p):
         out = []
+        code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
+        branch = normalize_branch_name(p.get("branch", ""))
+        broker_code = str(p.get("broker_code", "") or "").strip()
         api_rows = api5_get(p["warrant_code"], p["broker_code"], days=API5_DAYS)
+
+        debug_this_pair = code in debug_codes and (
+            not selected_branches_for_debug or branch in selected_branches_for_debug
+        )
+        if debug_this_pair:
+            print(
+                f"🔎 API5 指定權證回查：{code}｜{p.get('warrant_name', '')}｜"
+                f"broker={broker_code}｜branch={branch}｜raw_rows={len(api_rows or []):,}｜source={p.get('pair_source', 'API4')}"
+            )
+
+        debug_nonzero_rows = []
         for row in api_rows or []:
             buy_s = int(float(row.get("V2", 0) or 0))
             sell_s = int(float(row.get("V3", 0) or 0))
             buy_a = int(float(row.get("V4", 0) or 0) * 1000)
             sell_a = int(float(row.get("V5", 0) or 0) * 1000)
             net_a = buy_a - sell_a
+            if debug_this_pair and (buy_a != 0 or sell_a != 0):
+                debug_nonzero_rows.append({
+                    "Date": row.get("V1", ""),
+                    "buy_shares": buy_s,
+                    "sell_shares": sell_s,
+                    "buy_amount": buy_a,
+                    "sell_amount": sell_a,
+                    "net_amount": net_a,
+                })
             if buy_a == 0 and sell_a == 0:
                 continue
             dt = parse_date(row.get("V1", ""))
@@ -3644,8 +4026,8 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
                 continue
             out.append({
                 "Date": pd.Timestamp(dt).normalize(),
-                "branch": normalize_branch_name(p.get("branch", "")),
-                "broker_code": p["broker_code"],
+                "branch": branch,
+                "broker_code": broker_code,
                 "warrant_code": p["warrant_code"],
                 "warrant_name": p["warrant_name"],
                 "underlying_code": p.get("underlying_code", ""),
@@ -3656,6 +4038,20 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
                 "buy_shares": buy_s,
                 "sell_shares": sell_s,
             })
+
+        if debug_this_pair and DEBUG_API5_ROWS_ENABLE:
+            if debug_nonzero_rows:
+                print(f"------ API5 指定權證非零買賣明細：{code} × {branch} ------")
+                for r in debug_nonzero_rows[:30]:
+                    print(
+                        f"{r['Date']}｜買金額 {r['buy_amount']:,}｜賣金額 {r['sell_amount']:,}｜"
+                        f"淨額 {r['net_amount']:,}｜買張 {r['buy_shares']:,}｜賣張 {r['sell_shares']:,}"
+                    )
+                if len(debug_nonzero_rows) > 30:
+                    print(f"... 非零明細尚有 {len(debug_nonzero_rows) - 30:,} 筆未列印")
+            else:
+                print(f"⚠️ API5 指定權證沒有非零買賣明細：{code} × {branch}")
+
         return out
 
     reset_api_fetch_stats("api5")
@@ -3681,6 +4077,7 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
         df = df[df["Date"] <= pd.Timestamp(end_date).normalize()]
     df["side"] = np.where(df["net_amount"] >= 0, "買超", "賣超")
     return df.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
 
 
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
