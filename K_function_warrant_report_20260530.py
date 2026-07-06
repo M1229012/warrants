@@ -200,9 +200,9 @@ else:
 
 # 指定分點權證明細 Debug：
 # 用來確認特定分點在近 N 天與本週區間內，到底有沒有被 warrant_events 抓進來。
-# 預設針對永豐金內湖檢查近 20 個日曆天；可用環境變數調整。
+# 預設跟隨 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES；若要另外指定 Debug 分點，可用 WARRANT_DEBUG_BRANCH_FLOW_BRANCHES 覆蓋。
 DEBUG_BRANCH_WARRANT_FLOW_ENABLE = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-DEBUG_BRANCH_WARRANT_FLOW_BRANCHES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_BRANCHES", "永豐金內湖").strip()
+DEBUG_BRANCH_WARRANT_FLOW_BRANCHES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_BRANCHES", SELECTED_BRANCH_FLOW_BRANCHES).strip()
 DEBUG_BRANCH_WARRANT_FLOW_DAYS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_DAYS", "20"))
 DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_MAX_ROWS", "300"))
 DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_WARRANT_CODES", "").strip()
@@ -282,7 +282,7 @@ AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE = os.getenv(
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
 # 權證追蹤 Debug：預設追蹤本次問題權證 062599；可設空字串關閉，或用逗號追蹤多檔。
-DEBUG_WARRANT_CODES_RAW = os.getenv("WARRANT_DEBUG_WARRANT_CODES", "062599").strip()
+DEBUG_WARRANT_CODES_RAW = os.getenv("WARRANT_DEBUG_WARRANT_CODES", "").strip()
 DEBUG_API5_ROWS_ENABLE = os.getenv("WARRANT_DEBUG_API5_ROWS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
@@ -1812,7 +1812,7 @@ def parse_extra_live_warrants(stock_code: str, stock_name: str) -> List[dict]:
 
 
 def get_debug_warrant_codes() -> set:
-    """取得要追蹤的權證代號集合。預設追蹤 062599，方便確認是否進入 MoneyDJ / API4 / API5 流程。"""
+    """取得要追蹤的權證代號集合；預設不指定，避免跨股票時固定追蹤舊案例。"""
     raw = str(DEBUG_WARRANT_CODES_RAW or "").strip()
     codes = set()
     if raw:
@@ -1929,13 +1929,13 @@ def build_auto_selected_branch_backfill_pairs(
     stock_code: str,
     stock_name: str,
 ) -> List[dict]:
-    """API4 掃不到指定權證分點時，自動補出「權證 × 精選分點」pair 給 API5 回查。
+    """替所有精選分點補齊「權證 × 分點」pair，讓 API5 直接回查歷史買賣金額。
 
-    解決情境：
-    - MoneyDJ Search 母體有 062599。
-    - 但 API4 對 062599 回 empty，導致拿不到永豐金內湖這個 pair。
-    - 本次其他權證已經知道「永豐金內湖」的券商代號是 9A9g。
-    - 因此可直接補 062599 × 9A9g × 永豐金內湖，讓 API5 純 Live 回查歷史買賣金額。
+    MoneyDJ API4 回傳的分點清單可能只包含最新日或目前頁面中的部分分點，
+    不一定會列出近 N 天曾經交易過該權證的所有分點。
+    因此這裡只要能從本次 API4 其他權證結果推回精選分點的券商代號，
+    就會把所有本次權證母體中尚未存在的「權證 × 精選分點」pair 補進 API5。
+    這樣使用者選哪個精選分點，就會針對那個分點做完整補查。
     """
     if not AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE:
         return []
@@ -1952,13 +1952,6 @@ def build_auto_selected_branch_backfill_pairs(
     if missing_branch_codes:
         print(f"⚠️ API4 pair 中找不到精選分點券商代號，無法自動補查：{', '.join(missing_branch_codes)}")
 
-    debug_codes = get_debug_warrant_codes()
-    extra_warrant_codes = {
-        normalize_openapi_warrant_code(x.get("代號", ""))
-        for x in parse_extra_live_warrants(stock_code, stock_name)
-        if normalize_openapi_warrant_code(x.get("代號", ""))
-    }
-
     existing_keys = {
         (normalize_openapi_warrant_code(p.get("warrant_code", "")), str(p.get("broker_code", "") or "").strip())
         for p in existing_pairs or []
@@ -1968,14 +1961,6 @@ def build_auto_selected_branch_backfill_pairs(
     for w in warrants:
         code = normalize_openapi_warrant_code(w.get("代號", ""))
         if not code:
-            continue
-
-        status = str(api4_status_by_code.get(code, "") or "").strip()
-        # 自動補查條件：
-        # 1. API4 對該權證回 empty。
-        # 2. 或使用者指定要 debug / extra live 的權證，例如 062599。
-        should_backfill = (status == "empty") or (code in debug_codes) or (code in extra_warrant_codes)
-        if not should_backfill:
             continue
 
         for branch in selected_branches:
@@ -2005,10 +1990,15 @@ def build_auto_selected_branch_backfill_pairs(
         ])
         if len(out) > 12:
             preview += "…"
-        empty_count = sum(1 for w in warrants if str(api4_status_by_code.get(normalize_openapi_warrant_code(w.get("代號", "")), "")) == "empty")
+        empty_count = sum(
+            1
+            for w in warrants
+            if str(api4_status_by_code.get(normalize_openapi_warrant_code(w.get("代號", "")), "")) == "empty"
+        )
         print(
-            f"🔁 API4 空回應 / 指定權證精選分點 pair 自動補查："
-            f"API4 empty權證 {empty_count:,} 支｜新增 {len(out):,} 組｜{preview}"
+            f"🔁 精選分點 pair 完整補查："
+            f"精選分點 {len(selected_branches):,} 個｜API4 empty權證 {empty_count:,} 支｜"
+            f"新增 {len(out):,} 組｜{preview}"
         )
 
     return out
