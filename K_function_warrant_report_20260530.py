@@ -104,7 +104,15 @@ API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
-GSHEET_FALLBACK_ENABLE = os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+# 純 Live 週報模式：圖片內容不讀取、不合併、不寫入 Google Sheet 或本機快取。
+# 目的：避免權證分點、權證母體、股票名稱、勝率統計、LLM 快取等內容受到舊快取影響。
+# 設為 1 時，本次週報只使用 yfinance / FinMind / TWSE / TPEx / MoneyDJ 等即時來源。
+# 若未來需要恢復 Google Sheet 快取輔助，可設 WARRANT_REPORT_LIVE_ONLY=0。
+REPORT_LIVE_ONLY = os.getenv("WARRANT_REPORT_LIVE_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+GSHEET_FALLBACK_ENABLE = (
+    os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+    and not REPORT_LIVE_ONLY
+)
 NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 
 # 週報輸出模式：
@@ -255,11 +263,18 @@ HISTORICAL_BRANCH_DETAIL_SHEETS_RAW = os.getenv(
     "WARRANT_HISTORICAL_BRANCH_DETAIL_SHEETS",
     "快取_近10日分點買賣明細,快取_近20日分點買賣明細,快取_近30日分點買賣明細,快取_近60日分點買賣明細,快取_近90日分點買賣明細,快取_權證分點買賣明細,快取_分點買賣明細",
 ).strip()
+# 純 Live 模式下，若使用者明確知道某些仍有效但 MoneyDJ Search / OpenAPI 沒列出的權證，
+# 可用環境變數補入代號，程式仍會透過 API4 / API5 即時回查，不讀 Google Sheet。
+# 格式支援：062599 或 062599:晶技國票5B購01，多筆用逗號分隔。
+EXTRA_LIVE_WARRANTS_RAW = os.getenv("WARRANT_EXTRA_LIVE_WARRANTS", os.getenv("WARRANT_EXTRA_WARRANT_CODES", "")).strip()
 
 # 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
-LOCAL_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip().lower() not in ("0", "false", "no", "off")
+LOCAL_WARRANT_CACHE_ENABLE = (
+    os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip().lower() not in ("0", "false", "no", "off")
+    and not REPORT_LIVE_ONLY
+)
 LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").strip() or "warrant_cache"
-LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH
+LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH or REPORT_LIVE_ONLY
 
 # API 重試與完整度檢查：預設仍保守，但允許極少數硬失敗，避免大母體請求因單筆 timeout 整張中止。
 # MoneyDJ 偶爾會短暫回 500，因此預設重試次數拉高，並在 API4 第一輪失敗後做第二輪低併發補抓。
@@ -278,10 +293,16 @@ API4_SECOND_PASS_WAIT = float(os.getenv("WARRANT_API4_SECOND_PASS_WAIT", "5"))
 API4_HISTORY_FAILURE_AS_EMPTY = os.getenv("WARRANT_API4_HISTORY_FAILURE_AS_EMPTY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
-LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+LLM_CACHE_ENABLE = (
+    os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+    and not REPORT_LIVE_ONLY
+)
 LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_cache"
 # Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
-GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_ENABLE = (
+    os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+    and not REPORT_LIVE_ONLY
+)
 GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
 LLM_CACHE_FORCE_REFRESH = os.getenv("WARRANT_LLM_CACHE_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -920,16 +941,19 @@ def get_tw_stock_name(stock_code: str) -> str:
     if not stock_code:
         return "未知公司"
 
-    # 1) 優先讀取 Google Sheet「快取_股票名稱」對照表。
+    # 1) 一般模式可優先讀取 Google Sheet「快取_股票名稱」對照表；純 Live 模式則完全略過。
     #    這張表建議欄位為：代號｜名稱。
-    try:
-        name_map = read_gsheet_stock_name_map()
-        cached_name = str(name_map.get(stock_code, "") or "").strip()
-        if cached_name and cached_name != "未知公司":
-            print(f"✅ 股票名稱快取命中：{stock_code} {cached_name}｜來源：{GSHEET_STOCK_NAME_SHEET}")
-            return cached_name
-    except Exception as e:
-        print(f"⚠️ Google Sheet 股票名稱快取讀取失敗：{stock_code}｜{e}")
+    if not REPORT_LIVE_ONLY:
+        try:
+            name_map = read_gsheet_stock_name_map()
+            cached_name = str(name_map.get(stock_code, "") or "").strip()
+            if cached_name and cached_name != "未知公司":
+                print(f"✅ 股票名稱快取命中：{stock_code} {cached_name}｜來源：{GSHEET_STOCK_NAME_SHEET}")
+                return cached_name
+        except Exception as e:
+            print(f"⚠️ Google Sheet 股票名稱快取讀取失敗：{stock_code}｜{e}")
+    else:
+        print(f"🔴 純 Live 模式：略過 Google Sheet 股票名稱快取，改查官方即時資料源：{stock_code}")
 
     # 2) 快取沒有時，改查上市 / 上櫃公司基本資料。
     basic_sources = [
@@ -1727,6 +1751,47 @@ def _get_historical_branch_detail_sheet_names() -> List[str]:
                 names.append(item)
     return names
 
+
+
+def parse_extra_live_warrants(stock_code: str, stock_name: str) -> List[dict]:
+    """解析手動指定的純 Live 補抓權證代號。
+
+    這不是 Google Sheet 快取；只是把使用者指定的權證代號補進本次 live API4/API5 查詢母體。
+    若不設定 WARRANT_EXTRA_LIVE_WARRANTS / WARRANT_EXTRA_WARRANT_CODES，預設不會新增任何權證。
+    """
+    raw = str(EXTRA_LIVE_WARRANTS_RAW or "").strip()
+    if not raw:
+        return []
+
+    stock_code_clean = _clean_code(stock_code)
+    out = []
+    seen = set()
+    for item in re.split(r"[,，;；\n\r]+", raw):
+        item = str(item or "").strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in re.split(r"[:：|｜]", item) if p.strip()]
+        code = normalize_openapi_warrant_code(parts[0] if parts else item)
+        if not code or not re.fullmatch(r"\d{6}", code) or code in seen:
+            continue
+        name = parts[1] if len(parts) >= 2 else code
+        seen.add(code)
+        out.append({
+            "代號": code,
+            "名稱": name,
+            "標的股": str(stock_code_clean),
+            "標的名稱": stock_name,
+            "成交金額": 0,
+            "成交量": 0,
+            "母體來源": "ExtraLiveWarrant",
+        })
+
+    if out:
+        preview = "、".join([f"{x['代號']} {x['名稱']}" for x in out[:12]])
+        if len(out) > 12:
+            preview += "…"
+        print(f"🔁 指定權證純 Live 補抓：{len(out):,} 支｜{preview}")
+    return out
 
 def _normalize_perf_header(v) -> str:
     s = html.unescape(str(v or "")).strip()
@@ -2576,6 +2641,8 @@ def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events
 
 
 def load_warrant_underlying_lookup() -> Dict[str, dict]:
+    if REPORT_LIVE_ONLY:
+        return {}
     lookup = {}
     for sheet_name in ["快取_權證清單", "快取_分點歷史", "快取_候選組合_OpenAPI精選5", "快取_候選組合", "快取_候選組合_精選5"]:
         df = read_gsheet_worksheet(sheet_name)
@@ -3335,6 +3402,23 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
                 f"低於成交量門檻略過 {moneydj_skipped_low_volume:,} 支"
             )
 
+    extra_live_added = 0
+    for rec in parse_extra_live_warrants(stock_code_clean, stock_name):
+        code = normalize_openapi_warrant_code(rec.get("代號"))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        extra_live_added += 1
+        warrants.append({
+            "代號": code,
+            "名稱": str(rec.get("名稱", "") or code).strip(),
+            "標的股": str(stock_code_clean),
+            "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
+            "成交金額": int(rec.get("成交金額", 0) or 0),
+            "成交量": int(rec.get("成交量", 0) or 0),
+            "母體來源": "ExtraLiveWarrant",
+        })
+
     historical_warrants = load_historical_call_warrants_from_cache(
         stock_code,
         stock_name,
@@ -3363,7 +3447,7 @@ def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=No
     print(
         f"🔎 {stock_code_clean} {stock_name} 權證比對："
         f"lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜"
-        f"MoneyDJ補漏/備援新增 {moneydj_added:,} 支｜歷史補充新增 {historical_added:,} 支"
+        f"MoneyDJ補漏/備援新增 {moneydj_added:,} 支｜指定Live新增 {extra_live_added:,} 支｜歷史補充新增 {historical_added:,} 支"
     )
     print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
     return warrants
@@ -3600,22 +3684,26 @@ def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date
 
 
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
-    # 優先讀 Google Sheet 完整快照；只有狀態表標記 complete 且 API4/API5 失敗數為 0 才會直接使用。
-    gsheet_snapshot = load_gsheet_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
-    if gsheet_snapshot is not None and not gsheet_snapshot.empty:
-        return gsheet_snapshot
-
-    # 保留本機快照相容舊流程，但預設關閉；若使用，仍排在 Google Sheet 完整快照之後。
-    local_snapshot = load_local_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
-    if local_snapshot is not None and not local_snapshot.empty:
-        return local_snapshot
-
-    # 既有 Google Sheet 歷史列只作 live 合併備援；沒有完整狀態紀錄時，不會直接當作完整快照。
-    cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
     frames = []
-    if not cached.empty:
-        frames.append(cached)
-        print(f"☁️ Google Sheet {GSHEET_WARRANT_HISTORY_SHEET} 既有歷史列命中：{len(cached):,} 筆，將與 100% live 資料合併去重")
+
+    if REPORT_LIVE_ONLY:
+        print("🔴 純 Live 模式：權證分點資料不讀取 Google Sheet 快照、不合併 Google Sheet 歷史列、不讀本機快取")
+    else:
+        # 優先讀 Google Sheet 完整快照；只有狀態表標記 complete 且 API4/API5 失敗數為 0 才會直接使用。
+        gsheet_snapshot = load_gsheet_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
+        if gsheet_snapshot is not None and not gsheet_snapshot.empty:
+            return gsheet_snapshot
+
+        # 保留本機快照相容舊流程，但預設關閉；若使用，仍排在 Google Sheet 完整快照之後。
+        local_snapshot = load_local_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
+        if local_snapshot is not None and not local_snapshot.empty:
+            return local_snapshot
+
+        # 既有 Google Sheet 歷史列只作 live 合併備援；沒有完整狀態紀錄時，不會直接當作完整快照。
+        cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
+        if not cached.empty:
+            frames.append(cached)
+            print(f"☁️ Google Sheet {GSHEET_WARRANT_HISTORY_SHEET} 既有歷史列命中：{len(cached):,} 筆，將與 100% live 資料合併去重")
 
     live_fetched = False
     if LIVE_FETCH_ENABLE:
@@ -3677,8 +3765,8 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
     events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
 
-    # 只有本次真的完成 live 抓取，且 API4/API5 皆 100% 無 failed，才寫回 Google Sheet 完整快照。
-    if live_fetched:
+    # 只有本次真的完成 live 抓取，且 API4/API5 皆 100% 無 failed，才寫回快取；純 Live 模式不寫回任何快取。
+    if live_fetched and not REPORT_LIVE_ONLY:
         save_gsheet_warrant_events_snapshot(stock_code, stock_name, events, start_date=start_date, end_date=end_date)
         save_local_warrant_events_snapshot(stock_code, events, start_date=start_date, end_date=end_date)
 
@@ -9360,6 +9448,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 def generate_warrant_report(stock_code: str) -> io.BytesIO:
     try:
         stock_code = str(stock_code).strip()
+        if REPORT_LIVE_ONLY:
+            print("🔴 本次啟用純 Live 週報模式：圖片內容不使用 Google Sheet / 本機快取資料")
         stock_name = get_tw_stock_name(stock_code)
         stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
         if stock_df is None or stock_df.empty:
