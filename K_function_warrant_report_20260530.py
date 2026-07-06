@@ -243,6 +243,19 @@ GSHEET_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_CACHE_ENABLE", "1").stri
 GSHEET_WARRANT_HISTORY_SHEET = os.getenv("WARRANT_GSHEET_HISTORY_SHEET", "快取_分點歷史").strip() or "快取_分點歷史"
 GSHEET_WARRANT_STATUS_SHEET = os.getenv("WARRANT_GSHEET_STATUS_SHEET", "快取_分點歷史_狀態").strip() or "快取_分點歷史_狀態"
 
+# 歷史分點買賣明細補漏：
+# OpenAPI / MoneyDJ Search 只能建立「目前可取得」的權證母體，若某檔權證近 90 天曾有分點買賣超，
+# 但最新權證清單或 MoneyDJ Search 已經找不到，就會漏掉，例如 062599 這類已在明細表出現過的權證。
+# 這裡會從既有「分點買賣明細」工作表補進：
+# 1. 歷史權證代號，讓 API4 可以掃這檔權證。
+# 2. 歷史 權證×分點 pair，若 API4 掃不到，也能直接交給 API5 回查近 110 天金額。
+HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE = os.getenv("WARRANT_HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS = int(os.getenv("WARRANT_HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS", "90"))
+HISTORICAL_BRANCH_DETAIL_SHEETS_RAW = os.getenv(
+    "WARRANT_HISTORICAL_BRANCH_DETAIL_SHEETS",
+    "快取_近10日分點買賣明細,快取_近20日分點買賣明細,快取_近30日分點買賣明細,快取_近60日分點買賣明細,快取_近90日分點買賣明細,快取_權證分點買賣明細,快取_分點買賣明細",
+).strip()
+
 # 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
 LOCAL_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip().lower() not in ("0", "false", "no", "off")
 LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").strip() or "warrant_cache"
@@ -1704,6 +1717,17 @@ def _split_env_csv(raw: str) -> List[str]:
     return [x.strip() for x in re.split(r"[,，;；\n\r]+", str(raw or "")) if str(x or "").strip()]
 
 
+def _get_historical_branch_detail_sheet_names() -> List[str]:
+    """取得用來補漏歷史權證 / 歷史權證×分點 pair 的分點買賣明細工作表清單。"""
+    names = []
+    if HISTORICAL_BRANCH_DETAIL_SHEETS_RAW:
+        for item in re.split(r"[,，;；\n\r]+", HISTORICAL_BRANCH_DETAIL_SHEETS_RAW):
+            item = str(item or "").strip()
+            if item and item not in names:
+                names.append(item)
+    return names
+
+
 def _normalize_perf_header(v) -> str:
     s = html.unescape(str(v or "")).strip()
     s = s.replace("臺", "台")
@@ -2695,6 +2719,10 @@ def load_historical_call_warrants_from_cache(stock_code: str, stock_name: str, s
         "快取_候選組合",
         "快取_候選組合_精選5",
     ]
+    if HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE:
+        for detail_sheet in _get_historical_branch_detail_sheet_names():
+            if detail_sheet not in sheet_names:
+                sheet_names.append(detail_sheet)
 
     for sheet_name in sheet_names:
         df = read_gsheet_worksheet(sheet_name)
@@ -2770,6 +2798,210 @@ def load_historical_call_warrants_from_cache(stock_code: str, stock_name: str, s
     if out:
         print(f"☁️ Google Sheet 歷史母體補充候選：{len(out):,} 支")
     return out
+
+
+
+def _historical_detail_effective_start(start_date=None, end_date=None):
+    """取得歷史分點明細補漏的起始日期。"""
+    starts = []
+    if start_date is not None:
+        try:
+            starts.append(pd.Timestamp(start_date).normalize())
+        except Exception:
+            pass
+    if end_date is not None and HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS > 0:
+        try:
+            starts.append(pd.Timestamp(end_date).normalize() - pd.Timedelta(days=int(HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS)))
+        except Exception:
+            pass
+    if not starts:
+        return None
+    return max(starts)
+
+
+def _row_date_in_historical_detail_range(row: dict, start_date=None, end_date=None) -> bool:
+    """歷史分點買賣明細補漏用日期範圍。
+
+    與一般權證母體快取不同，這裡預設額外限制近 HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS 日，
+    避免太舊的明細把已經完全失效的權證大量塞進 API4/API5。
+    """
+    date_value = _pick_row_value(row, ["日期", "Date", "交易日期", "出表日期", "date", "trade_date"])
+    if not str(date_value or "").strip():
+        return False
+    dt = parse_date(date_value)
+    if dt is None:
+        return False
+    ts = pd.Timestamp(dt).normalize()
+    effective_start = _historical_detail_effective_start(start_date=start_date, end_date=end_date)
+    if effective_start is not None and ts < effective_start:
+        return False
+    if end_date is not None and ts > pd.Timestamp(end_date).normalize():
+        return False
+    return True
+
+
+def _row_matches_stock_for_historical_detail(row: dict, stock_code: str, stock_name: str) -> bool:
+    stock_code_clean = _clean_code(stock_code)
+    aliases = make_stock_aliases(stock_name)
+    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
+
+    ucode = _clean_code(_pick_row_value(row, [
+        "標的股", "標的代號", "股票代號", "underlying_code", "UnderlyingCode",
+    ]))
+    uname = str(_pick_row_value(row, [
+        "標的名稱", "股票名稱", "underlying_name", "UnderlyingName",
+    ]) or "").strip()
+    wname = str(_pick_row_value(row, [
+        "權證名稱", "名稱", "warrant_name", "WarrantName",
+    ]) or "").strip()
+
+    if ucode and ucode == stock_code_clean:
+        return True
+    if uname and any(alias and alias in _normalize_warrant_match_text(uname) for alias in aliases_norm):
+        return True
+    name_front = _normalize_warrant_match_text(wname)[:16]
+    if name_front and any(alias and alias in name_front for alias in aliases_norm):
+        return True
+    return False
+
+
+def _row_has_historical_detail_amount(row: dict) -> bool:
+    amount_keys = [
+        "買進金額", "賣出金額", "買超金額", "淨買超金額", "淨額", "成交金額",
+        "buy_amount", "sell_amount", "net_amount",
+        "買進張數", "賣出張數", "賣出股數", "買進股數",
+    ]
+    for key in amount_keys:
+        if key in row and abs(clean_openapi_number(row.get(key))) > 0:
+            return True
+    return False
+
+
+def _build_historical_detail_pair_record(row: dict, stock_code: str, stock_name: str, source_sheet: str) -> dict:
+    code = normalize_openapi_warrant_code(_pick_row_value(row, [
+        "權證代號", "代號", "warrant_code", "WarrantCode",
+    ]))
+    if not code or not re.fullmatch(r"\d{6}", code):
+        return {}
+
+    name = str(_pick_row_value(row, [
+        "權證名稱", "名稱", "warrant_name", "WarrantName",
+    ]) or "").strip()
+    if not _is_call_warrant_name(name):
+        return {}
+
+    broker_code = str(_pick_row_value(row, [
+        "券商代號", "broker_code", "BrokerCode", "分點代號",
+    ]) or "").strip()
+    branch = normalize_branch_name(_pick_row_value(row, [
+        "分點", "分點名稱", "券商分點", "branch", "broker_name", "BrokerName",
+    ]))
+
+    if not broker_code or not branch:
+        return {}
+
+    ucode = _clean_code(_pick_row_value(row, [
+        "標的股", "標的代號", "股票代號", "underlying_code", "UnderlyingCode",
+    ])) or _clean_code(stock_code)
+    uname = str(_pick_row_value(row, [
+        "標的名稱", "股票名稱", "underlying_name", "UnderlyingName",
+    ]) or stock_name).strip()
+
+    return {
+        "warrant_code": code,
+        "warrant_name": name or code,
+        "underlying_code": ucode or _clean_code(stock_code),
+        "underlying_name": uname or stock_name,
+        "broker_code": broker_code,
+        "branch": branch,
+        "pair_source": source_sheet,
+    }
+
+
+def load_historical_branch_detail_pairs_from_cache(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
+    """從近 90 天分點買賣明細補進歷史 權證×分點 pair。
+
+    目的：如果某檔權證近 90 天有分點買賣超，但 OpenAPI / MoneyDJ Search 最新母體沒列入，
+    或 API4 掃不到該檔已知分點，仍可直接把「權證代號 × 券商代號 × 分點」交給 API5 回查，
+    避免 062599 這類有實際買賣超的權證漏出週報統計。
+    """
+    if not HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE or not GSHEET_FALLBACK_ENABLE:
+        return []
+
+    pair_map = {}
+    sheet_names = _get_historical_branch_detail_sheet_names()
+    if not sheet_names:
+        return []
+
+    total_hit_rows = 0
+    sheet_summaries = []
+
+    for sheet_name in sheet_names:
+        df = read_gsheet_worksheet(sheet_name)
+        if df is None or df.empty:
+            continue
+
+        sheet_hit_rows = 0
+        sheet_pair_added = 0
+        for _, r in df.iterrows():
+            row = r.to_dict()
+            if not _row_date_in_historical_detail_range(row, start_date=start_date, end_date=end_date):
+                continue
+            if not _row_matches_stock_for_historical_detail(row, stock_code, stock_name):
+                continue
+            if not _row_has_historical_detail_amount(row):
+                continue
+
+            pair = _build_historical_detail_pair_record(row, stock_code, stock_name, sheet_name)
+            if not pair:
+                continue
+
+            key = (pair["warrant_code"], pair["broker_code"])
+            if key not in pair_map:
+                pair_map[key] = pair
+                sheet_pair_added += 1
+            sheet_hit_rows += 1
+
+        if sheet_hit_rows > 0:
+            total_hit_rows += sheet_hit_rows
+            sheet_summaries.append(f"{sheet_name} {sheet_hit_rows:,}列/{sheet_pair_added:,}組")
+
+    pairs = list(pair_map.values())
+    if pairs:
+        preview_codes = sorted({p.get("warrant_code", "") for p in pairs if p.get("warrant_code")})[:12]
+        preview = "、".join(preview_codes)
+        if len(preview_codes) < len({p.get("warrant_code", "") for p in pairs if p.get("warrant_code")}):
+            preview += "…"
+        print(
+            f"☁️ 歷史分點買賣明細補 pair：近 {HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS} 日｜"
+            f"命中 {total_hit_rows:,} 列｜新增候選 {len(pairs):,} 組 權證×分點｜權證 {preview}"
+        )
+        if sheet_summaries:
+            print(f"   來源：{'；'.join(sheet_summaries[:8])}")
+    return pairs
+
+
+def merge_pair_lists(primary_pairs: List[dict], supplement_pairs: List[dict]) -> List[dict]:
+    """合併 API4 掃出的 pair 與歷史明細補進的 pair。"""
+    merged = {}
+    for p in list(primary_pairs or []) + list(supplement_pairs or []):
+        code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
+        broker_code = str(p.get("broker_code", "") or "").strip()
+        if not code or not broker_code:
+            continue
+        p = dict(p)
+        p["warrant_code"] = code
+        p["branch"] = normalize_branch_name(p.get("branch", ""))
+        key = (code, broker_code)
+        if key not in merged:
+            merged[key] = p
+        else:
+            # 優先保留 API4 的權證 / 分點名稱；若原資料缺漏，再用補充 pair 補上。
+            old = merged[key]
+            for col in ["warrant_name", "underlying_code", "underlying_name", "branch"]:
+                if not str(old.get(col, "") or "").strip() and str(p.get(col, "") or "").strip():
+                    old[col] = p.get(col, "")
+    return list(merged.values())
 
 
 
@@ -3392,6 +3624,28 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         end_s = end_dt.strftime("%Y/%m/%d")
         warrants = get_all_active_call_warrants(stock_code, stock_name, start_date=start_date, end_date=end_date)
         pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
+
+        # 歷史分點買賣明細補漏：
+        # 若某檔權證近 90 天在明細表已出現買賣超，但 OpenAPI / MoneyDJ 最新母體或 API4 沒掃到，
+        # 這裡直接把已知的「權證×分點」補進 API5 回查清單。
+        supplement_pairs = load_historical_branch_detail_pairs_from_cache(
+            stock_code,
+            stock_name,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if supplement_pairs:
+            before_pairs = len(pairs)
+            pairs = merge_pair_lists(pairs, supplement_pairs)
+            added_pairs = len(pairs) - before_pairs
+            print(
+                f"🔁 API5 pair 補漏合併完成：API4原始 {before_pairs:,} 組｜"
+                f"歷史明細候選 {len(supplement_pairs):,} 組｜實際新增 {added_pairs:,} 組｜合併後 {len(pairs):,} 組"
+            )
+            if MAX_PAIRS > 0 and len(pairs) > MAX_PAIRS:
+                pairs = pairs[:MAX_PAIRS]
+                print(f"⚠️ MAX_PAIRS 限制啟用，合併後 pair 截斷為 {len(pairs):,} 組")
+
         live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
         live_fetched = True
         if not live.empty:
