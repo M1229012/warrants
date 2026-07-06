@@ -138,6 +138,13 @@ SCREENSHOT_OUTPUT_JPEG_QUALITY = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_JPEG_Q
 # PNG 仍是無損格式，長圖可能很大；轉成 256 色調色盤 PNG 可大幅縮檔，文字線條通常仍清楚。
 SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 
+# K 線圖 Y 軸留白設定：避免價格已經很集中時，上下空白仍過大。
+# 調小後會讓股價區更貼近實際波動範圍，但仍保留少量空間給均線、布林與文字標註。
+CANDLE_Y_PAD_LOWER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_RATIO", "0.06"))
+CANDLE_Y_PAD_UPPER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_RATIO", "0.12"))
+CANDLE_Y_PAD_LOWER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_MIN_PCT", "0.008"))
+CANDLE_Y_PAD_UPPER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_MIN_PCT", "0.015"))
+
 # 疑似造市 / 避險對沖設定
 # 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
 HEDGE_MARK_THRESHOLD = float(os.getenv("WARRANT_HEDGE_MARK_THRESHOLD", os.getenv("WARRANT_HEDGE_THRESHOLD", "0.08")))
@@ -182,6 +189,15 @@ if (
     SELECTED_BRANCH_FLOW_BRANCHES = DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES
 else:
     SELECTED_BRANCH_FLOW_BRANCHES = _SELECTED_BRANCH_FLOW_BRANCHES_RAW or DEFAULT_SELECTED_BRANCH_FLOW_BRANCHES
+
+# 指定分點權證明細 Debug：
+# 用來確認特定分點在近 N 天與本週區間內，到底有沒有被 warrant_events 抓進來。
+# 預設針對永豐金內湖檢查近 20 個日曆天；可用環境變數調整。
+DEBUG_BRANCH_WARRANT_FLOW_ENABLE = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+DEBUG_BRANCH_WARRANT_FLOW_BRANCHES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_BRANCHES", "永豐金內湖").strip()
+DEBUG_BRANCH_WARRANT_FLOW_DAYS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_DAYS", "20"))
+DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_MAX_ROWS", "300"))
+DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_WARRANT_CODES", "").strip()
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
@@ -3964,6 +3980,168 @@ def get_selected_branch_flow_mode_label() -> str:
 def _get_selected_branch_flow_set() -> set:
     """取得精選分點名單，會先做與主程式一致的分點標準化。"""
     return set(_get_selected_branch_flow_list())
+
+
+def _get_debug_branch_warrant_flow_branches() -> List[str]:
+    """取得指定分點權證明細 Debug 的分點清單，保留設定順序。"""
+    branches = _parse_selected_branch_flow_names(DEBUG_BRANCH_WARRANT_FLOW_BRANCHES)
+    return branches
+
+
+def _get_debug_branch_warrant_flow_warrant_codes() -> set:
+    """取得指定分點權證明細 Debug 的權證代號篩選清單；空白代表不篩權證。"""
+    codes = set()
+    raw = str(DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES or "")
+    for item in re.split(r"[,，;；\n\r|｜\s]+", raw):
+        code = normalize_openapi_warrant_code(item)
+        if code:
+            codes.add(code)
+    return codes
+
+
+def _format_debug_branch_flow_rows(df: pd.DataFrame, max_rows: int = DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS) -> str:
+    """將指定分點 Debug 明細轉成較容易閱讀的表格文字。"""
+    if df is None or df.empty:
+        return ""
+    show_cols = [
+        "Date", "branch", "warrant_code", "warrant_name",
+        "buy_amount", "sell_amount", "net_amount",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    out = df.copy()
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for c in ["buy_amount", "sell_amount", "net_amount"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).map(lambda x: f"{float(x):,.0f}")
+    out = out[show_cols].copy()
+    max_rows = max(1, int(max_rows or 1))
+    if len(out) > max_rows:
+        out = out.head(max_rows)
+        return out.to_string(index=False) + f"\n... 已截斷顯示前 {max_rows:,} 筆，完整符合筆數請看上方統計"
+    return out.to_string(index=False)
+
+
+def print_debug_branch_warrant_flow(
+    stock_code: str,
+    stock_name: str,
+    stock_df: pd.DataFrame,
+    warrant_events: pd.DataFrame,
+    start_date=None,
+    end_date=None,
+):
+    """輸出指定分點近 N 天與本週區間的權證買賣超明細。
+
+    這段只印 log，不改變原本圖片、排行、權證資金流與任何計算結果。
+    目的：
+    1. 確認指定分點是否有進入本次 warrant_events。
+    2. 區分「近 N 天有資料」與「本週 TOP5 區間有資料」。
+    3. 區分「有賣出但被買進抵銷」與「權證母體漏抓」。
+    """
+    if not DEBUG_BRANCH_WARRANT_FLOW_ENABLE:
+        return
+    branches = _get_debug_branch_warrant_flow_branches()
+    if not branches:
+        return
+
+    print("========== 指定分點權證明細 Debug ==========")
+    print(
+        f"🔎 Debug 標的：{_clean_code(stock_code)} {stock_name}｜"
+        f"分點：{'、'.join(branches)}｜近 {DEBUG_BRANCH_WARRANT_FLOW_DAYS} 日曆天"
+    )
+
+    if warrant_events is None or warrant_events.empty:
+        print("⚠️ warrant_events 為空，無法檢查指定分點")
+        print("========== 指定分點權證明細 Debug 結束 ==========")
+        return
+
+    need_cols = {"Date", "branch", "warrant_code", "buy_amount", "sell_amount", "net_amount"}
+    if not need_cols.issubset(warrant_events.columns):
+        print(f"⚠️ warrant_events 缺少必要欄位：{sorted(need_cols - set(warrant_events.columns))}")
+        print("========== 指定分點權證明細 Debug 結束 ==========")
+        return
+
+    e = warrant_events.copy()
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    e["branch"] = e["branch"].map(normalize_branch_name)
+    e["warrant_code"] = e["warrant_code"].map(normalize_openapi_warrant_code)
+    for c in ["buy_amount", "sell_amount", "net_amount"]:
+        e[c] = pd.to_numeric(e[c], errors="coerce").fillna(0.0).astype(float)
+
+    warrant_code_filter = _get_debug_branch_warrant_flow_warrant_codes()
+    if warrant_code_filter:
+        print(f"🔎 Debug 只檢查指定權證：{', '.join(sorted(warrant_code_filter))}")
+        e = e[e["warrant_code"].isin(warrant_code_filter)].copy()
+
+    event_end = pd.Timestamp(end_date).normalize() if end_date is not None else e["Date"].max()
+    lookback_days = max(0, int(DEBUG_BRANCH_WARRANT_FLOW_DAYS or 0))
+    lookback_start = pd.Timestamp(event_end).normalize() - pd.Timedelta(days=lookback_days)
+
+    branch_set = set(branches)
+    debug_lookback = e[
+        (e["branch"].isin(branch_set))
+        & (e["Date"] >= lookback_start)
+        & (e["Date"] <= pd.Timestamp(event_end).normalize())
+    ].copy()
+
+    print(f"🔎 指定分點近 {lookback_days} 日檢查區間：{lookback_start.date()} ~ {pd.Timestamp(event_end).date()}")
+    if debug_lookback.empty:
+        print("⚠️ 近 N 天 warrant_events 內沒有指定分點資料")
+    else:
+        total_buy = float(debug_lookback["buy_amount"].sum())
+        total_sell = float(debug_lookback["sell_amount"].sum())
+        total_net = float(debug_lookback["net_amount"].sum())
+        print(
+            f"✅ 近 N 天指定分點資料：{len(debug_lookback):,} 筆｜"
+            f"買進 {fmt_money(total_buy)}｜賣出 {fmt_money(-total_sell)}｜淨額 {fmt_money(total_net)}"
+        )
+
+        by_warrant = (
+            debug_lookback.groupby(["branch", "warrant_code", "warrant_name"], as_index=False, dropna=False)
+            .agg({"buy_amount": "sum", "sell_amount": "sum", "net_amount": "sum"})
+        )
+        by_warrant["_abs_net"] = by_warrant["net_amount"].abs()
+        by_warrant = by_warrant.sort_values(["_abs_net", "sell_amount", "buy_amount"], ascending=[False, False, False]).drop(columns=["_abs_net"])
+        print("------ 近 N 天指定分點依權證彙總 ------")
+        print(_format_debug_branch_flow_rows(by_warrant, max_rows=DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS))
+        print("------ 近 N 天指定分點逐日明細 ------")
+        detail = debug_lookback.sort_values(["Date", "warrant_code", "net_amount"], ascending=[True, True, True])
+        print(_format_debug_branch_flow_rows(detail, max_rows=DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS))
+
+    if stock_df is not None and not stock_df.empty:
+        try:
+            debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+            week_start = pd.Timestamp(debug_ctx.get("week_start")).normalize()
+            week_end = pd.Timestamp(debug_ctx.get("week_end")).normalize()
+            debug_week = e[
+                (e["branch"].isin(branch_set))
+                & (e["Date"] >= week_start)
+                & (e["Date"] <= week_end)
+            ].copy()
+            print(f"🔎 指定分點本週 TOP5 統計區間：{week_start.date()} ~ {week_end.date()}")
+            if debug_week.empty:
+                print("⚠️ 本週 TOP5 區間內沒有指定分點資料")
+            else:
+                week_buy = float(debug_week["buy_amount"].sum())
+                week_sell = float(debug_week["sell_amount"].sum())
+                week_net = float(debug_week["net_amount"].sum())
+                print(
+                    f"✅ 本週指定分點資料：{len(debug_week):,} 筆｜"
+                    f"買進 {fmt_money(week_buy)}｜賣出 {fmt_money(-week_sell)}｜淨額 {fmt_money(week_net)}"
+                )
+                week_by_warrant = (
+                    debug_week.groupby(["branch", "warrant_code", "warrant_name"], as_index=False, dropna=False)
+                    .agg({"buy_amount": "sum", "sell_amount": "sum", "net_amount": "sum"})
+                )
+                week_by_warrant["_abs_net"] = week_by_warrant["net_amount"].abs()
+                week_by_warrant = week_by_warrant.sort_values(["_abs_net", "sell_amount", "buy_amount"], ascending=[False, False, False]).drop(columns=["_abs_net"])
+                print("------ 本週指定分點依權證彙總 ------")
+                print(_format_debug_branch_flow_rows(week_by_warrant, max_rows=DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS))
+        except Exception as e_debug:
+            print(f"⚠️ 指定分點本週區間 Debug 失敗：{e_debug}")
+
+    print("========== 指定分點權證明細 Debug 結束 ==========")
 
 
 def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -8137,7 +8315,15 @@ def plot_candles(ax, plot_df: pd.DataFrame, x: list):
 
 
 def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
-    """放大 K 線圖 Y 軸顯示範圍，並增加上方留白，避免股價飆高時貼近圖框。"""
+    """調整 K 線圖 Y 軸範圍，縮小不必要的上下空白。
+
+    以前的留白比例較大，當股價已經集中在某一段區間時，
+    雖然 K 棒本身都看得到，但上下會保留過多空間，看起來像圖沒有撐滿。
+    這裡改成較緊的動態留白：
+    1. 仍把 K 棒高低點、均線、布林上下軌都納入範圍。
+    2. 上方留白保留得比下方稍多，避免最新價格與文字標註貼邊。
+    3. 留白比例改小，讓價格區域更聚焦。
+    """
     if plot_df is None or plot_df.empty:
         return
 
@@ -8163,16 +8349,25 @@ def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
     if not np.isfinite(y_min) or not np.isfinite(y_max):
         return
 
+    close_series = pd.to_numeric(plot_df.get("Close", pd.Series(dtype=float)), errors="coerce").dropna()
+    latest_close = float(close_series.iloc[-1]) if not close_series.empty else 1.0
     span = y_max - y_min
-    latest_close = float(pd.to_numeric(plot_df["Close"], errors="coerce").dropna().iloc[-1]) if "Close" in plot_df.columns and not pd.to_numeric(plot_df["Close"], errors="coerce").dropna().empty else 1.0
     if span <= 0:
-        span = max(abs(latest_close) * 0.08, 1.0)
+        span = max(abs(latest_close) * 0.05, 1.0)
 
-    # 上方留白刻意比下方大，讓高檔 K 線不會貼到圖框，看起來會往下一點。
-    lower_pad = max(span * 0.12, abs(latest_close) * 0.015, 1.0)
-    upper_pad = max(span * 0.26, abs(latest_close) * 0.035, 1.0)
+    # 改成較緊的留白，避免上下空間過大。
+    lower_ratio = max(0.0, float(CANDLE_Y_PAD_LOWER_RATIO))
+    upper_ratio = max(0.0, float(CANDLE_Y_PAD_UPPER_RATIO))
+    lower_min_pct = max(0.0, float(CANDLE_Y_PAD_LOWER_MIN_PCT))
+    upper_min_pct = max(0.0, float(CANDLE_Y_PAD_UPPER_MIN_PCT))
 
-    ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
+    lower_pad = max(span * lower_ratio, abs(latest_close) * lower_min_pct, 0.5)
+    upper_pad = max(span * upper_ratio, abs(latest_close) * upper_min_pct, 0.8)
+
+    new_y_min = y_min - lower_pad
+    new_y_max = y_max + upper_pad
+    if np.isfinite(new_y_min) and np.isfinite(new_y_max) and new_y_max > new_y_min:
+        ax.set_ylim(new_y_min, new_y_max)
 
 
 def adjust_volume_ylim(ax, plot_df: pd.DataFrame):
@@ -8967,6 +9162,14 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                     latest_selected = selected_debug[selected_debug["Date"] == latest_selected_date]
                     latest_selected_sum = float(pd.to_numeric(latest_selected["net_amount"], errors="coerce").fillna(0.0).sum())
                     print(f"🔎 精選分點最新日期：{pd.Timestamp(latest_selected_date).date()}｜合計 {fmt_money(latest_selected_sum)}")
+            print_debug_branch_warrant_flow(
+                stock_code,
+                stock_name,
+                stock_df,
+                warrant_events,
+                start_date=start_date,
+                end_date=end_date,
+            )
         if warrant_events is not None and not warrant_events.empty:
             try:
                 debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
