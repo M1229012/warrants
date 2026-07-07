@@ -7763,7 +7763,7 @@ def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 40)
     if not np.isfinite(price_min) or not np.isfinite(price_max) or price_max <= price_min:
         return {}
 
-    n_bins = max(5, int(n_bins or 38))
+    n_bins = max(5, int(n_bins or 40))
     bins = np.linspace(price_min, price_max, n_bins + 1)
     centers = (bins[:-1] + bins[1:]) / 2
     height = float(bins[1] - bins[0])
@@ -7883,7 +7883,7 @@ def _classify_price_volume_pattern(
     return label, evidence
 
 
-def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 38) -> dict:
+def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 40) -> dict:
     """整理紅色最大量區、橘色第二大量區與近期型態，供 AI 做客觀型態分析。"""
     df = ctx.get("plot_df", pd.DataFrame())
     stats = _calculate_weighted_volume_profile_stats(df, n_bins=n_bins)
@@ -8962,7 +8962,7 @@ def add_panel_title(ax, title, subtitle=""):
         ax.text(0.01, 0.86, subtitle, transform=ax.transAxes, ha="left", va="top", color=MUTED, fontsize=11)
 
 
-def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 38, color="#38BDF8", alpha=0.15, scale=1.08):
+def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 40, color="#38BDF8", alpha=0.15, scale=1.08):
     stats = _calculate_weighted_volume_profile_stats(df, n_bins=n_bins)
     if not stats:
         return
