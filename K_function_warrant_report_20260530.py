@@ -9453,7 +9453,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                    bbox=dict(facecolor=PANEL2, edgecolor=GRID, boxstyle="round,pad=0.30", alpha=0.95))
     ma_note = get_ma_kline_signals(plot_df)
     if ma_note:
-        candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=31, fontweight="bold", ha="center", va="center",
+        candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=34, fontweight="bold", ha="center", va="center",
                        bbox=dict(facecolor="#F6F8FB", edgecolor=GOLD, boxstyle="round,pad=0.28", alpha=0.95))
 
     # Volume
@@ -9466,7 +9466,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
     vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
     adjust_volume_ylim(vol_ax, plot_df)
-    vol_ax.legend(loc="upper left", frameon=False, fontsize=26, labelcolor=TEXT)
+    vol_ax.legend(
+    loc="upper left",
+    bbox_to_anchor=(0.13, 1.18),
+    ncol=2,
+    frameon=False,
+    fontsize=26,
+    labelcolor=TEXT,
+    handlelength=2.2,
+    handletextpad=0.55,
+    columnspacing=1.4,
+    borderaxespad=0.0,
+)
     vol_ax.yaxis.tick_right()
 
     # 三大法人買賣超（取代 KD）
@@ -9641,7 +9652,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             f"分點：{selected_branch_label}",
             transform=selected_wnet_ax.transAxes,
             color=MUTED,
-            fontsize=18,
+            fontsize=22,
             fontweight="bold",
             ha="left",
             va="top",
