@@ -9142,60 +9142,36 @@ def plot_candles(ax, plot_df: pd.DataFrame, x: list):
 
 
 def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
-    """調整 K 線圖 Y 軸範圍，縮小不必要的上下空白。
+    """讓週報 K 線 Y 軸顯示方式接近 K_function。
 
-    以前的留白比例較大，當股價已經集中在某一段區間時，
-    雖然 K 棒本身都看得到，但上下會保留過多空間，看起來像圖沒有撐滿。
-    這裡改成較緊的動態留白：
-    1. 仍把 K 棒高低點、均線、布林上下軌都納入範圍。
-    2. 上方留白保留得比下方稍多，避免最新價格與文字標註貼邊。
-    3. 留白比例改小，讓價格區域更聚焦。
+    重點：
+    1. Y 軸主要只依照 K 棒 Low / High 決定。
+    2. 不再把 MA60、BB_LOWER 納入最低範圍。
+    3. 因此早期 MA60 / 布林下軌若低於 K 棒區間，會自然被底部裁切。
+    4. 不改 GridSpec，不壓縮 K 棒，只改視窗裁切範圍。
     """
     if plot_df is None or plot_df.empty:
         return
 
-    price_cols = [
-        "Low", "High",
-        "MA5", "MA10", "MA20", "MA60",
-        "BB_UPPER", "BB_LOWER",
-    ]
+    low_s = pd.to_numeric(plot_df["Low"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    high_s = pd.to_numeric(plot_df["High"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
 
-    values = []
-    for col in price_cols:
-        if col in plot_df.columns:
-            s = pd.to_numeric(plot_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            if not s.empty:
-                values.append(s)
-
-    if not values:
+    if low_s.empty or high_s.empty:
         return
 
-    all_values = pd.concat(values, ignore_index=True)
-    y_min = float(all_values.min())
-    y_max = float(all_values.max())
+    y_min = float(low_s.min())
+    y_max = float(high_s.max())
+
     if not np.isfinite(y_min) or not np.isfinite(y_max):
         return
 
-    close_series = pd.to_numeric(plot_df.get("Close", pd.Series(dtype=float)), errors="coerce").dropna()
-    latest_close = float(close_series.iloc[-1]) if not close_series.empty else 1.0
-    span = y_max - y_min
-    if span <= 0:
-        span = max(abs(latest_close) * 0.05, 1.0)
+    y_span = max(y_max - y_min, 1e-6)
 
-    # 改成較緊的留白，避免上下空間過大。
-    lower_ratio = max(0.0, float(CANDLE_Y_PAD_LOWER_RATIO))
-    upper_ratio = max(0.0, float(CANDLE_Y_PAD_UPPER_RATIO))
-    lower_min_pct = max(0.0, float(CANDLE_Y_PAD_LOWER_MIN_PCT))
-    upper_min_pct = max(0.0, float(CANDLE_Y_PAD_UPPER_MIN_PCT))
+    # 模仿 K_function：下方保留一點空間，但不為 MA60 / BB_LOWER 額外拉低 Y 軸。
+    lower_pad = y_span * 0.11
+    upper_pad = y_span * 0.05
 
-    lower_pad = max(span * lower_ratio, abs(latest_close) * lower_min_pct, 0.5)
-    upper_pad = max(span * upper_ratio, abs(latest_close) * upper_min_pct, 0.8)
-
-    new_y_min = y_min - lower_pad
-    new_y_max = y_max + upper_pad
-    if np.isfinite(new_y_min) and np.isfinite(new_y_max) and new_y_max > new_y_min:
-        ax.set_ylim(new_y_min, new_y_max)
-
+    ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
 
 def adjust_volume_ylim(ax, plot_df: pd.DataFrame):
     """增加成交量圖上方留白，避免大量柱狀或均量線貼到 legend / 圖框。"""
@@ -9412,9 +9388,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         news_points = []
         # K 線區塊改為實際放大：同步增加整張圖高度與 K 線 row ratio，
         # 避免只是壓縮下方指標或單純縮小 Y 軸上下留白。
-        fig = plt.figure(figsize=(28, 48.2), facecolor=BG)
+        fig = plt.figure(figsize=(28, 51.0), facecolor=BG)
         gs = GridSpec(8, 12, figure=fig,
-                      height_ratios=[1.45, 2.05, 10.8, 2.45, 3.1, 5.0, 4.7, 9.55],
+                      height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55],
                       hspace=0.20, wspace=0.25)
     else:
         news_points = build_news_points(stock_code, stock_name, news_items, ctx)
