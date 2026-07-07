@@ -9458,26 +9458,66 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # Volume
     vol_ax = fig.add_subplot(gs[3, :], sharex=candle_ax)
-    style_ax(vol_ax, "成交量")
+    style_ax(vol_ax)
     up = plot_df["Close"] >= plot_df["Open"]
     vol_lots = plot_df["Volume"] / 1000
+
     vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
     vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
-    vol_ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1, label=f"MV5 {plot_df['MV5'].iloc[-1] / 1000:,.0f}張")
-    vol_ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1, label=f"MV20 {plot_df['MV20'].iloc[-1] / 1000:,.0f}張")
+
+    mv5_lots = plot_df["MV5"] / 1000
+    mv20_lots = plot_df["MV20"] / 1000
+    vol_ax.plot(x, mv5_lots, color=BLUE, linewidth=2.1)
+    vol_ax.plot(x, mv20_lots, color=PURPLE, linewidth=2.1)
+
+    latest_vol = float(vol_lots.iloc[-1]) if len(vol_lots) else 0.0
+    latest_mv5 = float(mv5_lots.iloc[-1]) if len(mv5_lots) else 0.0
+    latest_mv20 = float(mv20_lots.iloc[-1]) if len(mv20_lots) else 0.0
+    latest_vol_color = RED if up.iloc[-1] else GREEN
+
+    xpos = 0.001
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "成交量", GOLD,
+        fontsize=34, fontweight="bold", gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_bar_and_advance(
+        vol_ax, xpos, latest_vol_color, gap_px=8,
+    )
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, f"成交量 {latest_vol:,.0f}張",
+        latest_vol_color, gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_line_and_advance(
+        vol_ax, xpos, BLUE, gap_px=10,
+    )
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, f"MV5 {latest_mv5:,.0f}張",
+        BLUE, gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_line_and_advance(
+        vol_ax, xpos, PURPLE, gap_px=10,
+    )
+    draw_header_text_and_advance(
+        vol_ax, xpos, f"MV20 {latest_mv20:,.0f}張",
+        PURPLE, gap_px=0,
+    )
+
     adjust_volume_ylim(vol_ax, plot_df)
-    vol_ax.legend(
-    loc="upper left",
-    bbox_to_anchor=(0.13, 1.18),
-    ncol=2,
-    frameon=False,
-    fontsize=26,
-    labelcolor=TEXT,
-    handlelength=2.2,
-    handletextpad=0.55,
-    columnspacing=1.4,
-    borderaxespad=0.0,
-)
     vol_ax.yaxis.tick_right()
 
     # 三大法人買賣超（取代 KD）
