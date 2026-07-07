@@ -9412,9 +9412,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         news_points = []
         # K 線區塊改為實際放大：同步增加整張圖高度與 K 線 row ratio，
         # 避免只是壓縮下方指標或單純縮小 Y 軸上下留白。
-        fig = plt.figure(figsize=(28, 51.0), facecolor=BG)
+        fig = plt.figure(figsize=(28, 48.2), facecolor=BG)
         gs = GridSpec(8, 12, figure=fig,
-                      height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55],
+                      height_ratios=[1.45, 2.05, 10.8, 2.45, 3.1, 5.0, 4.7, 9.55],
                       hspace=0.20, wspace=0.25)
     else:
         news_points = build_news_points(stock_code, stock_name, news_items, ctx)
