@@ -9536,7 +9536,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     latest_mv5 = float(mv5_lots.iloc[-1]) if len(mv5_lots) else 0.0
     latest_mv20 = float(mv20_lots.iloc[-1]) if len(mv20_lots) else 0.0
     latest_vol_color = NAVY
-    vol_header_y = 1.09
+    vol_header_y = 1.14
     
     xpos = 0.001
     xpos = draw_header_text_and_advance(
