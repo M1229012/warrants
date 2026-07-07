@@ -9456,93 +9456,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         candle_ax.text(0.5, 0.08, ma_note, transform=candle_ax.transAxes, color=GOLD, fontsize=34, fontweight="bold", ha="center", va="center",
                        bbox=dict(facecolor="#F6F8FB", edgecolor=GOLD, boxstyle="round,pad=0.28", alpha=0.95))
 
-    # Volume
-    vol_ax = fig.add_subplot(gs[3, :], sharex=candle_ax)
-    style_ax(vol_ax)
-    up = plot_df["Close"] >= plot_df["Open"]
-    vol_lots = plot_df["Volume"] / 1000
-
-    vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
-    vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
-
-    mv5_lots = plot_df["MV5"] / 1000
-    mv20_lots = plot_df["MV20"] / 1000
-    vol_ax.plot(x, mv5_lots, color=BLUE, linewidth=2.1)
-    vol_ax.plot(x, mv20_lots, color=PURPLE, linewidth=2.1)
-
-    latest_vol = float(vol_lots.iloc[-1]) if len(vol_lots) else 0.0
-    latest_mv5 = float(mv5_lots.iloc[-1]) if len(mv5_lots) else 0.0
-    latest_mv20 = float(mv20_lots.iloc[-1]) if len(mv20_lots) else 0.0
-    latest_vol_color = RED if up.iloc[-1] else GREEN
-
-    xpos = 0.001
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, "成交量", GOLD,
-        fontsize=34, fontweight="bold", gap_px=22,
-    )
-
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
-    )
-    xpos = draw_header_bar_and_advance(
-        vol_ax, xpos, latest_vol_color, gap_px=8,
-    )
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, f"成交量 {latest_vol:,.0f}張",
-        latest_vol_color, gap_px=22,
-    )
-
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
-    )
-    xpos = draw_header_line_and_advance(
-        vol_ax, xpos, BLUE, gap_px=10,
-    )
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, f"MV5 {latest_mv5:,.0f}張",
-        BLUE, gap_px=22,
-    )
-
-    xpos = draw_header_text_and_advance(
-        vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
-    )
-    xpos = draw_header_line_and_advance(
-        vol_ax, xpos, PURPLE, gap_px=10,
-    )
-    draw_header_text_and_advance(
-        vol_ax, xpos, f"MV20 {latest_mv20:,.0f}張",
-        PURPLE, gap_px=0,
-    )
-
-    adjust_volume_ylim(vol_ax, plot_df)
-    vol_ax.yaxis.tick_right()
-
-    # 三大法人買賣超（取代 KD）
-    # 不再與 K 線共用 x 軸，避免法人資料已更新但股價資料尚未更新時被股價日期排除。
-    inst_ax = fig.add_subplot(gs[4, :])
-    style_ax(inst_ax, "三大法人買賣超")
-    plot_institutional_stacked_bars(inst_ax, inst_plot_df, x_inst)
-    adjust_institutional_ylim(inst_ax, inst_plot_df)
-    draw_inst_header_like_legend(inst_ax, inst_plot_df)
-    inst_ax.yaxis.tick_right()
-
-    # Warrant daily net bars + cumulative line
-    # 不再與 K 線共用 x 軸，讓今日已更新的權證事件可以先出現在資金流圖。
-    wnet_ax = fig.add_subplot(gs[5, :])
-    style_ax(wnet_ax)
-    vals = daily_net["net_amount"].astype(float).values
-    cum_vals = np.cumsum(vals)
-    latest_net = vals[-1] if len(vals) else 0.0
-    latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
-    latest_bar_color = RED if latest_net >= 0 else GREEN
-    week_color = RED if ctx["total_net"] >= 0 else GREEN
-
-    # 權證資金流標題列：用小圖示與分隔線接在標題後方，不使用 legend / 膠囊，避免擋住圖表本體。
-    # 這裡改成「動態接續排列」：每一段畫完後，依照實際文字寬度自動接下一段，
-    # 避免遇到幾十萬、幾千萬或億級數字時，固定 x 座標造成間距忽大忽小。
+        # 權證資金流 / 成交量標題列共用 helper
+    # 這段一定要放在 Volume 前面，因為成交量區塊會先用到這幾個函式。
     header_y = 1.062
 
     def advance_x_by_px(ax, x0, gap_px):
@@ -9595,6 +9510,94 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             zorder=12,
         )
         return advance_x_by_px(ax, x0 + line_w, gap_px)
+
+    # Volume
+    vol_ax = fig.add_subplot(gs[3, :], sharex=candle_ax)
+    style_ax(vol_ax)
+    up = plot_df["Close"] >= plot_df["Open"]
+    vol_lots = plot_df["Volume"] / 1000
+
+    vol_ax.bar([i for i in x if up.iloc[i]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
+    vol_ax.bar([i for i in x if not up.iloc[i]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
+
+    mv5_lots = plot_df["MV5"] / 1000
+    mv20_lots = plot_df["MV20"] / 1000
+    vol_ax.plot(x, mv5_lots, color=BLUE, linewidth=2.1)
+    vol_ax.plot(x, mv20_lots, color=PURPLE, linewidth=2.1)
+
+    latest_vol = float(vol_lots.iloc[-1]) if len(vol_lots) else 0.0
+    latest_mv5 = float(mv5_lots.iloc[-1]) if len(mv5_lots) else 0.0
+    latest_mv20 = float(mv20_lots.iloc[-1]) if len(mv20_lots) else 0.0
+    latest_vol_color = RED if up.iloc[-1] else GREEN
+
+    xpos = 0.001
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "成交量", GOLD,
+        fontsize=34, fontweight="bold", gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_bar_and_advance(
+        vol_ax, xpos, latest_vol_color, gap_px=8,
+    )
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, f"成交量 {latest_vol:,.0f}張",
+        latest_vol_color, fontsize=22, fontweight="bold", gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_line_and_advance(
+        vol_ax, xpos, BLUE, gap_px=10,
+    )
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, f"MV5 {latest_mv5:,.0f}張",
+        BLUE, fontsize=22, fontweight="bold", gap_px=22,
+    )
+
+    xpos = draw_header_text_and_advance(
+        vol_ax, xpos, "|", MUTED,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+    )
+    xpos = draw_header_line_and_advance(
+        vol_ax, xpos, PURPLE, gap_px=10,
+    )
+    draw_header_text_and_advance(
+        vol_ax, xpos, f"MV20 {latest_mv20:,.0f}張",
+        PURPLE, fontsize=22, fontweight="bold", gap_px=0,
+    )
+
+    adjust_volume_ylim(vol_ax, plot_df)
+    vol_ax.yaxis.tick_right()
+
+    # 三大法人買賣超（取代 KD）
+    # 不再與 K 線共用 x 軸，避免法人資料已更新但股價資料尚未更新時被股價日期排除。
+    inst_ax = fig.add_subplot(gs[4, :])
+    style_ax(inst_ax, "三大法人買賣超")
+    plot_institutional_stacked_bars(inst_ax, inst_plot_df, x_inst)
+    adjust_institutional_ylim(inst_ax, inst_plot_df)
+    draw_inst_header_like_legend(inst_ax, inst_plot_df)
+    inst_ax.yaxis.tick_right()
+
+    # Warrant daily net bars + cumulative line
+    # 不再與 K 線共用 x 軸，讓今日已更新的權證事件可以先出現在資金流圖。
+    wnet_ax = fig.add_subplot(gs[5, :])
+    style_ax(wnet_ax)
+    vals = daily_net["net_amount"].astype(float).values
+    cum_vals = np.cumsum(vals)
+    latest_net = vals[-1] if len(vals) else 0.0
+    latest_cum = cum_vals[-1] if len(cum_vals) else 0.0
+    latest_bar_color = RED if latest_net >= 0 else GREEN
+    week_color = RED if ctx["total_net"] >= 0 else GREEN
+
+    # 權證資金流標題列：用小圖示與分隔線接在標題後方，不使用 legend / 膠囊，避免擋住圖表本體。
+    # 這裡改成「動態接續排列」：每一段畫完後，依照實際文字寬度自動接下一段，
+    # 避免遇到幾十萬、幾千萬或億級數字時，固定 x 座標造成間距忽大忽小。
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
