@@ -210,6 +210,10 @@ DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_W
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 GSHEET_STOCK_NAME_SHEET = os.getenv("WARRANT_STOCK_NAME_SHEET", "快取_股票名稱").strip() or "快取_股票名稱"
+# 股票名稱快取只作為「代號 → 名稱」對照，不屬於交易資料快取。
+# 因此即使 REPORT_LIVE_ONLY=1，也允許讀取這張表，避免官方名稱來源短暫失敗時，
+# 後續新聞搜尋變成「未知公司」而把明確公司新聞全部過濾掉。
+STOCK_NAME_GSHEET_ENABLE = os.getenv("WARRANT_STOCK_NAME_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 _STOCK_NAME_MAP_CACHE = None
 _STOCK_NAME_MAP_CACHE_LOCK = threading.Lock()
 
@@ -958,19 +962,21 @@ def get_tw_stock_name(stock_code: str) -> str:
     if not stock_code:
         return "未知公司"
 
-    # 1) 一般模式可優先讀取 Google Sheet「快取_股票名稱」對照表；純 Live 模式則完全略過。
-    #    這張表建議欄位為：代號｜名稱。
-    if not REPORT_LIVE_ONLY:
+    # 1) 優先讀取 Google Sheet「快取_股票名稱」對照表。
+    #    這張表只提供名稱對照，不是交易資料快取；純 Live 模式仍可讀取，避免官方名稱來源短暫失敗時，
+    #    後續新聞搜尋變成「未知公司」而把明確公司新聞全部過濾掉。
+    if STOCK_NAME_GSHEET_ENABLE:
         try:
             name_map = read_gsheet_stock_name_map()
             cached_name = str(name_map.get(stock_code, "") or "").strip()
             if cached_name and cached_name != "未知公司":
-                print(f"✅ 股票名稱快取命中：{stock_code} {cached_name}｜來源：{GSHEET_STOCK_NAME_SHEET}")
+                mode_note = "純 Live 名稱對照" if REPORT_LIVE_ONLY else "名稱快取"
+                print(f"✅ 股票名稱{mode_note}命中：{stock_code} {cached_name}｜來源：{GSHEET_STOCK_NAME_SHEET}")
                 return cached_name
         except Exception as e:
-            print(f"⚠️ Google Sheet 股票名稱快取讀取失敗：{stock_code}｜{e}")
-    else:
-        print(f"🔴 純 Live 模式：略過 Google Sheet 股票名稱快取，改查官方即時資料源：{stock_code}")
+            print(f"⚠️ Google Sheet 股票名稱對照讀取失敗：{stock_code}｜{e}")
+    elif REPORT_LIVE_ONLY:
+        print(f"🔴 純 Live 模式：股票名稱對照已關閉，改查官方即時資料源：{stock_code}")
 
     # 2) 快取沒有時，改查上市 / 上櫃公司基本資料。
     basic_sources = [
@@ -2446,7 +2452,7 @@ def read_gsheet_stock_name_map(force_refresh: bool = False) -> Dict[str, str]:
     """
     global _STOCK_NAME_MAP_CACHE
 
-    if not GSHEET_FALLBACK_ENABLE:
+    if not STOCK_NAME_GSHEET_ENABLE:
         return {}
 
     with _STOCK_NAME_MAP_CACHE_LOCK:
@@ -2496,7 +2502,7 @@ def save_gsheet_stock_name_cache(stock_code: str, stock_name: str, market: str =
     """
     global _STOCK_NAME_MAP_CACHE
 
-    if not GSHEET_FALLBACK_ENABLE:
+    if not STOCK_NAME_GSHEET_ENABLE:
         return
 
     code = _normalize_stock_name_code_key(stock_code)
@@ -5286,6 +5292,8 @@ STOCK_NEWS_ALIAS_MAP = {
     "6531": ["愛普"],
     "2337": ["旺宏"],
     "8299": ["群聯"],
+    "3583": ["辛耘"],
+    "6285": ["啟碁"],
 }
 
 
@@ -5691,13 +5699,50 @@ def _fetch_article_body(url: str) -> str:
     return ""
 
 
+def _is_unknown_stock_name(stock_name: str) -> bool:
+    s = str(stock_name or "").strip()
+    return (not s) or s in ("未知公司", "未知", "-", "--", "nan", "None")
+
+
+def _extract_company_name_near_code(text: str, stock_code: str) -> str:
+    """從新聞標題 / 摘要中擷取「公司名(代號)」或「代號 公司名」格式，供名稱失敗時補別名。"""
+    code = str(stock_code or "").strip()
+    s = _normalize_news_text(text)
+    if not code or not s:
+        return ""
+
+    patterns = [
+        rf"([一-鿿A-Za-z][一-鿿A-Za-z0-9\-]{1,14})\s*[（(]\s*{re.escape(code)}\s*[）)]",
+        rf"{re.escape(code)}\s*[）)]?\s*([一-鿿A-Za-z][一-鿿A-Za-z0-9\-]{{1,14}})",
+        rf"([一-鿿A-Za-z][一-鿿A-Za-z0-9\-]{{1,14}})\s*{re.escape(code)}",
+    ]
+    bad_prefixes = ("營收", "公告", "新聞", "焦點股", "個股", "台股", "本週", "近期", "市場")
+    for pattern in patterns:
+        m = re.search(pattern, s)
+        if not m:
+            continue
+        name = str(m.group(1) or "").strip(" ：:，,。；;｜|()（）[]【】")
+        name = re.sub(r"^(營收|公告|新聞|焦點股|個股|台股)", "", name).strip()
+        if len(name) < 2 or name.startswith(bad_prefixes):
+            continue
+        if re.fullmatch(r"\d+", name):
+            continue
+        return name
+    return ""
+
+
 def _get_news_aliases(stock_code: str, stock_name: str) -> List[str]:
     aliases = []
-    for a in [stock_code, stock_name]:
+    code = str(stock_code or "").strip()
+    name = str(stock_name or "").strip()
+
+    for a in [code, name]:
         a = str(a or "").strip()
-        if a and a not in aliases:
+        if not a or a in ("未知公司", "未知", "-", "--", "nan", "None"):
+            continue
+        if a not in aliases:
             aliases.append(a)
-    for a in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
+    for a in STOCK_NEWS_ALIAS_MAP.get(code, []):
         a = str(a or "").strip()
         if a and a not in aliases:
             aliases.append(a)
@@ -5917,6 +5962,13 @@ def _passes_news_quality_gate(title: str, description_or_body: str, stock_code: 
     aliases = _get_news_aliases(stock_code, stock_name)
     if aliases and not any(alias and alias in combined for alias in aliases):
         return False
+
+    # 股票名稱若暫時查不到，Google News 常仍會以「公司名(代號)」呈現；
+    # 只要代號明確出現，且能從標題 / 摘要反推公司名，就視為明確對應本股票。
+    if _is_unknown_stock_name(stock_name) and stock_code:
+        inferred_name = _extract_company_name_near_code(combined, stock_code)
+        if inferred_name and inferred_name not in aliases:
+            aliases.append(inferred_name)
 
     if _is_low_value_market_news(combined):
         return False
@@ -6505,6 +6557,13 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         description = candidate.get("description", "")
         days = int(candidate.get("search_days", 0) or 0)
         stage_label = candidate.get("query_stage", "")
+
+        # 官方股票名稱短暫查不到時，從 RSS 標題 / 摘要的「公司名(代號)」反推別名，
+        # 避免後續多股過濾把「辛耘(3583)」這類明確新聞誤判成非目標公司。
+        inferred_name = _extract_company_name_near_code(f"{title} {description}", stock_code)
+        if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
+            STOCK_NEWS_ALIAS_MAP.setdefault(str(stock_code).strip(), []).append(inferred_name)
+            print(f"📰 新聞別名自動補充：{stock_code} → {inferred_name}")
 
         if fast_mode:
             # 極速模式：完全跳過 _fetch_article_body，不進新聞網站、不碰 gnewsdecoder，直接用 RSS 標題 / 摘要 / URL 給 Gemini 統整。
@@ -7429,28 +7488,65 @@ def _parse_gemini_points(output_text: str) -> List[str]:
 
 
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
-    """只把可用的新聞素材送給 Gemini，並先萃取本股票相關片段，避免多家公司新聞數字混用。"""
+    """只把可用的新聞素材送給 Gemini，並先萃取本股票相關片段，避免多家公司新聞數字混用。
+
+    修正重點：
+    1. 極速 RSS 模式本來只有標題 / 摘要，不能用原文模式的 40～80 字門檻硬擋。
+    2. 若官方名稱暫時查不到，從「公司名(代號)」格式自動補別名。
+    3. 標題或摘要明確包含本股票代號 / 名稱，且有營收、法說、接單、目標價等公司資訊時，允許短素材進 Gemini。
+    """
     usable = []
     ordered = [r for r in records if r.get("body_ok") or r.get("fallback_ok")]
     for rec in ordered:
-        content = _normalize_news_text(rec.get("content", ""))
-        # 極速 RSS 模式本來就只有標題 / 摘要，門檻需比原文模式低；原文模式仍維持較高門檻。
-        min_content_len = 40 if str(rec.get("content_source", "")) in ("google_news_rss_fast", "rss_description", "manual") else 80
-        if len(content) < min_content_len:
-            continue
         title = _clean_news_title(rec.get("title", ""))
-        focused_content = _extract_target_focused_news_body(content, stock_code, stock_name)
-        if len(_normalize_news_text(focused_content)) < 40:
+        raw_content = _normalize_news_text(rec.get("content", ""))
+        description = _normalize_news_text(rec.get("description", ""))
+        content_source = str(rec.get("content_source", ""))
+        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "manual")
+
+        inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
+        if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
+            STOCK_NEWS_ALIAS_MAP.setdefault(str(stock_code).strip(), []).append(inferred_name)
+            print(f"📰 新聞別名自動補充：{stock_code} → {inferred_name}")
+
+        aliases = _get_news_aliases(stock_code, stock_name)
+        combined_for_check = _normalize_news_text("。".join([title, description, raw_content]))
+        has_target = any(alias and alias in combined_for_check for alias in aliases)
+        has_value = _has_company_value_terms(combined_for_check) or _has_substantive_company_news(combined_for_check)
+
+        # 極速 RSS 模式至少保留標題 + 摘要，不因摘要短就直接跳過。
+        if not raw_content and is_fast_rss:
+            raw_content = _build_fast_rss_news_content(
+                title,
+                description,
+                source=rec.get("source", ""),
+                published=rec.get("published", ""),
+            )
+
+        min_content_len = 18 if is_fast_rss else 80
+        if len(raw_content) < min_content_len and not (is_fast_rss and has_target and has_value):
+            continue
+
+        focused_content = _extract_target_focused_news_body(raw_content, stock_code, stock_name)
+        focused_norm = _normalize_news_text(focused_content)
+
+        # 對 RSS 短素材做保守 fallback：標題 / 摘要已明確包含本股票與公司資訊時，保留原素材。
+        if len(focused_norm) < 40 and is_fast_rss and has_target and has_value:
+            focused_content = raw_content
+            focused_norm = _normalize_news_text(focused_content)
+
+        if len(focused_norm) < (20 if is_fast_rss else 40):
             print(f"⚠️ 略過多股混雜新聞：{title[:36]}｜找不到足夠的 {stock_code} {stock_name} 明確片段")
             continue
+
         usable.append({
             "id": f"A{len(usable) + 1}",
             "source": rec.get("source", ""),
             "title": title,
             "published": rec.get("published", ""),
             "url": rec.get("url", ""),
-            "content_source": rec.get("content_source", ""),
-            "target_aliases": _get_news_aliases(stock_code, stock_name),
+            "content_source": content_source,
+            "target_aliases": aliases,
             "body": focused_content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
         })
         if len(usable) >= NEWS_MAX_ARTICLES_TO_GEMINI:
@@ -9029,18 +9125,20 @@ def draw_rounded_panel_with_top_band(ax, x, y, w, h, band_h=0.035, rounding=0.02
 
 def plot_candles(ax, plot_df: pd.DataFrame, x: list):
     up = plot_df["Close"] >= plot_df["Open"]
-    width = 0.72
+    # K 棒本體略放大，搭配 K 線區塊高度提高後，顯示效果更接近技術分析圖，
+    # 不是只靠縮小 Y 軸留白來「假性放大」。
+    width = 0.82
     for i in x:
         color = RED if up.iloc[i] else GREEN
         op, cl = float(plot_df["Open"].iloc[i]), float(plot_df["Close"].iloc[i])
         hi, lo = float(plot_df["High"].iloc[i]), float(plot_df["Low"].iloc[i])
-        ax.plot([i, i], [lo, hi], color=color, linewidth=1.3, zorder=3)
+        ax.plot([i, i], [lo, hi], color=color, linewidth=1.65, zorder=3)
         body_low = min(op, cl)
         body_h = abs(cl - op)
         if body_h < max(0.01, cl * 0.0005):
-            ax.plot([i - width / 2, i + width / 2], [cl, cl], color=color, linewidth=2.5, zorder=4)
+            ax.plot([i - width / 2, i + width / 2], [cl, cl], color=color, linewidth=3.0, zorder=4)
         else:
-            ax.bar(i, body_h, bottom=body_low, width=width, color=color, edgecolor=color, align="center", zorder=4)
+            ax.bar(i, body_h, bottom=body_low, width=width, color=color, edgecolor=color, linewidth=0.8, align="center", zorder=4)
 
 
 def adjust_candle_price_ylim(ax, plot_df: pd.DataFrame):
@@ -9312,17 +9410,21 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         # 精簡模式不建立本週重點與新聞內容，避免不必要的新聞抓取 / Gemini 呼叫。
         key_points = []
         news_points = []
-        fig = plt.figure(figsize=(28, 47.7), facecolor=BG)
+        # K 線區塊改為實際放大：同步增加整張圖高度與 K 線 row ratio，
+        # 避免只是壓縮下方指標或單純縮小 Y 軸上下留白。
+        fig = plt.figure(figsize=(28, 51.0), facecolor=BG)
         gs = GridSpec(8, 12, figure=fig,
-                      height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55],
+                      height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55],
                       hspace=0.20, wspace=0.25)
     else:
         news_points = build_news_points(stock_code, stock_name, news_items, ctx)
         ctx["weekly_news_points"] = list(news_points or [])
         key_points = build_key_points(ctx, stock_name)
-        fig = plt.figure(figsize=(28, 59), facecolor=BG)
+        # K 線區塊改為實際放大：同步增加整張圖高度與 K 線 row ratio，
+        # 避免只是壓縮下方指標或單純縮小 Y 軸上下留白。
+        fig = plt.figure(figsize=(28, 62.3), facecolor=BG)
         gs = GridSpec(9, 12, figure=fig,
-                      height_ratios=[1.45, 2.05, 9.8, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
+                      height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
                       hspace=0.20, wspace=0.25)
 
     # Header
