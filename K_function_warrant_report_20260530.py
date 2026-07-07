@@ -9461,9 +9461,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     header_y = 1.062
 
     def advance_x_by_px(ax, x0, gap_px, y=None):
-    y = header_y if y is None else y
-    base_xy = ax.transAxes.transform((x0, y))
-    return ax.transAxes.inverted().transform((base_xy[0] + gap_px, base_xy[1]))[0]
+        y = header_y if y is None else y
+        base_xy = ax.transAxes.transform((x0, y))
+        return ax.transAxes.inverted().transform((base_xy[0] + gap_px, base_xy[1]))[0]
 
     def draw_header_text_and_advance(
         ax, x0, text, color,
