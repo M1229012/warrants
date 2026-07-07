@@ -9460,13 +9460,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # 這段一定要放在 Volume 前面，因為成交量區塊會先用到這幾個函式。
     header_y = 1.062
 
-    def advance_x_by_px(ax, x0, gap_px):
-        base_xy = ax.transAxes.transform((x0, header_y))
-        return ax.transAxes.inverted().transform((base_xy[0] + gap_px, base_xy[1]))[0]
+    def advance_x_by_px(ax, x0, gap_px, y=None):
+    y = header_y if y is None else y
+    base_xy = ax.transAxes.transform((x0, y))
+    return ax.transAxes.inverted().transform((base_xy[0] + gap_px, base_xy[1]))[0]
 
-    def draw_header_text_and_advance(ax, x0, text, color, fontsize=22, fontweight="bold", gap_px=16, alpha=1.0):
+    def draw_header_text_and_advance(
+        ax, x0, text, color,
+        fontsize=22, fontweight="bold", gap_px=16, alpha=1.0, y=None
+    ):
+        y = header_y if y is None else y
         t = ax.text(
-            x0, header_y, text,
+            x0, y, text,
             transform=ax.transAxes,
             color=color,
             fontsize=fontsize,
@@ -9480,13 +9485,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         bbox = t.get_window_extent(renderer=renderer)
-        y_disp = ax.transAxes.transform((0, header_y))[1]
+        y_disp = ax.transAxes.transform((0, y))[1]
         return ax.transAxes.inverted().transform((bbox.x1 + gap_px, y_disp))[0]
 
-    def draw_header_bar_and_advance(ax, x0, color, gap_px=8):
+    def draw_header_bar_and_advance(ax, x0, color, gap_px=8, y=None):
+        y = header_y if y is None else y
         bar_w = 0.013
         ax.add_patch(Rectangle(
-            (x0, header_y - 0.012), bar_w, 0.024,
+            (x0, y - 0.012), bar_w, 0.024,
             transform=ax.transAxes,
             facecolor=color,
             edgecolor=color,
@@ -9495,12 +9501,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             clip_on=False,
             zorder=12,
         ))
-        return advance_x_by_px(ax, x0 + bar_w, gap_px)
+        return advance_x_by_px(ax, x0 + bar_w, gap_px, y=y)
 
-    def draw_header_line_and_advance(ax, x0, color, gap_px=10):
+    def draw_header_line_and_advance(ax, x0, color, gap_px=10, y=None):
+        y = header_y if y is None else y
         line_w = 0.030
         ax.plot(
-            [x0, x0 + line_w], [header_y, header_y],
+            [x0, x0 + line_w], [y, y],
             transform=ax.transAxes,
             color=color,
             linewidth=2.6,
@@ -9509,7 +9516,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             clip_on=False,
             zorder=12,
         )
-        return advance_x_by_px(ax, x0 + line_w, gap_px)
+        return advance_x_by_px(ax, x0 + line_w, gap_px, y=y)
 
     # Volume
     vol_ax = fig.add_subplot(gs[3, :], sharex=candle_ax)
@@ -9528,50 +9535,50 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     latest_vol = float(vol_lots.iloc[-1]) if len(vol_lots) else 0.0
     latest_mv5 = float(mv5_lots.iloc[-1]) if len(mv5_lots) else 0.0
     latest_mv20 = float(mv20_lots.iloc[-1]) if len(mv20_lots) else 0.0
-    latest_vol_color = RED if up.iloc[-1] else GREEN
-
+    latest_vol_color = NAVY
+    vol_header_y = 1.09
+    
     xpos = 0.001
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, "成交量", GOLD,
-        fontsize=34, fontweight="bold", gap_px=22,
+        fontsize=34, fontweight="bold", gap_px=22, y=vol_header_y,
     )
 
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82, y=vol_header_y,
     )
     xpos = draw_header_bar_and_advance(
-        vol_ax, xpos, latest_vol_color, gap_px=8,
+        vol_ax, xpos, latest_vol_color, gap_px=8, y=vol_header_y,
     )
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, f"成交量 {latest_vol:,.0f}張",
-        latest_vol_color, fontsize=22, fontweight="bold", gap_px=22,
+        latest_vol_color, gap_px=22, y=vol_header_y,
     )
 
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82, y=vol_header_y,
     )
     xpos = draw_header_line_and_advance(
-        vol_ax, xpos, BLUE, gap_px=10,
+        vol_ax, xpos, BLUE, gap_px=10, y=vol_header_y,
     )
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, f"MV5 {latest_mv5:,.0f}張",
-        BLUE, fontsize=22, fontweight="bold", gap_px=22,
+        BLUE, gap_px=22, y=vol_header_y,
     )
 
     xpos = draw_header_text_and_advance(
         vol_ax, xpos, "|", MUTED,
-        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82,
+        fontsize=25, fontweight="bold", gap_px=14, alpha=0.82, y=vol_header_y,
     )
     xpos = draw_header_line_and_advance(
-        vol_ax, xpos, PURPLE, gap_px=10,
+        vol_ax, xpos, PURPLE, gap_px=10, y=vol_header_y,
     )
     draw_header_text_and_advance(
         vol_ax, xpos, f"MV20 {latest_mv20:,.0f}張",
-        PURPLE, fontsize=22, fontweight="bold", gap_px=0,
+        PURPLE, gap_px=0, y=vol_header_y,
     )
-
     adjust_volume_ylim(vol_ax, plot_df)
     vol_ax.yaxis.tick_right()
 
