@@ -7745,7 +7745,7 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
     return rows
 
 
-def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 38) -> dict:
+def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 40) -> dict:
     """使用與 K 線價量累積圖完全相同的算法，計算最大量區與第二大量區。"""
     required_cols = {"Low", "High", "Open", "Close", "Volume"}
     if df is None or df.empty or not required_cols.issubset(df.columns):
