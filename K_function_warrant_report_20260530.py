@@ -396,6 +396,67 @@ def _has_neutral_target_price_or_rating(text: str) -> bool:
     return any(re.search(p, t) for p in patterns)
 
 
+
+def _report_branch_positive_color_allowed(text: str):
+    """判斷「分點偏買 / 積極偏買」類結果是否允許顯示紅色。
+
+    原則：
+    1. 精選五分點出現積極買超 / 偏買，可顯示紅色。
+    2. 非精選分點必須在勝率統計中事件數 > 50 且勝率 >= 80%，才可顯示紅色。
+    3. 若文字是分點偏買語意但不符合上述條件，回傳 False，後續改用中性深藍色。
+    4. 若文字不是分點偏買語意，回傳 None，不干涉一般正負面判斷。
+    """
+    raw = str(text or "")
+    s = _normalize_news_text(raw)
+    norm = normalize_branch_name(raw)
+    if not s or not norm:
+        return None
+
+    positive_terms = [
+        "積極偏買", "積極買", "偏買", "買超", "加碼", "買盤", "承接",
+        "淨流入", "資金流入", "買方", "偏多",
+    ]
+    if not any(k in s for k in positive_terms):
+        return None
+
+    try:
+        selected_branches = [normalize_branch_name(x) for x in _get_selected_branch_flow_list()]
+    except Exception:
+        selected_branches = []
+    selected_branches = [b for b in selected_branches if b]
+
+    # 精選五分點允許紅色。
+    for branch in selected_branches:
+        if branch and branch in norm:
+            return True
+
+    candidate_rows = []
+    try:
+        perf_df = read_gsheet_branch_perf_df(force_refresh=False)
+        if perf_df is not None and not perf_df.empty:
+            for _, r in perf_df.iterrows():
+                branch_norm = normalize_branch_name(r.get("branch", "") or r.get("branch_display", ""))
+                if branch_norm:
+                    candidate_rows.append((branch_norm, r.to_dict()))
+    except Exception:
+        candidate_rows = []
+
+    # 長分點名優先，避免短名稱誤配。
+    for branch_norm, row in sorted(candidate_rows, key=lambda x: len(x[0]), reverse=True):
+        if not branch_norm or branch_norm not in norm:
+            continue
+        event_count = _parse_number_like_value(row.get("event_count", np.nan))
+        win_rate = _parse_percent_like_value(row.get("win_rate", np.nan), ratio_if_small=True)
+        if np.isfinite(event_count) and np.isfinite(win_rate) and event_count > 50 and win_rate >= 80:
+            return True
+        return False
+
+    # 文字有分點語意但沒有可驗證分點績效時，不用紅色，避免把一般分點買超誤標成高品質訊號。
+    if "分點" in s or any(k in norm for k in ["元大", "富邦", "凱基", "國票", "群益", "第一金", "台新", "永豐", "華南", "新光", "兆豐", "統一"]):
+        return False
+
+    return None
+
 def get_report_status_color(status_text: str) -> str:
     """依台股閱讀習慣回傳結論文字顏色。
 
@@ -419,6 +480,14 @@ def get_report_status_color(status_text: str) -> str:
     if _has_neutral_target_price_or_rating(s):
         return STATUS_NEUTRAL_COLOR
 
+    # 分點偏買 / 積極偏買的紅色標示要更嚴格：
+    # 只有精選五分點，或勝率統計事件數 > 50 且勝率 >= 80% 的分點，才允許用紅色。
+    branch_positive_allowed = _report_branch_positive_color_allowed(s)
+    if branch_positive_allowed is True:
+        return STATUS_BULL_COLOR
+    if branch_positive_allowed is False:
+        return STATUS_NEUTRAL_COLOR
+
     bull_keywords = [
         "偏多", "轉強", "強勢", "多頭", "多頭排列", "買方", "買超", "偏買", "積極偏買", "積極買", "買盤", "承接", "加碼",
         "資金流入", "淨流入", "站回", "突破", "支撐", "上修", "調升", "上調", "年增", "月增",
@@ -430,13 +499,13 @@ def get_report_status_color(status_text: str) -> str:
     bear_keywords = [
         "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節", "偏賣", "減碼",
         "資金流出", "淨流出", "跌破", "失守", "壓力", "下修", "調降", "下調", "年減", "負向", "利空",
-        "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
+        "死亡交叉", "死叉", "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
     ]
 
     # 先處理明確負面；但月減若伴隨年增，前面已視為偏正向。
     if any(k in s for k in bear_keywords) or ("月減" in s and "年增" not in s):
         # 若同一句同時有明確利多與負面字，除非是跌破/賣壓/調降這類強負面，否則讓正面主題優先。
-        strong_bear = any(k in s for k in ["跌破", "失守", "賣壓", "資金流出", "淨流出", "調降", "下修", "利空", "年減"])
+        strong_bear = any(k in s for k in ["跌破", "失守", "賣壓", "資金流出", "淨流出", "調降", "下修", "利空", "年減", "死亡交叉", "死叉"])
         if strong_bear or not any(k in s for k in bull_keywords):
             return STATUS_BEAR_COLOR
     if any(k in s for k in bull_keywords):
@@ -8814,7 +8883,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v20_technical_ma_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v21_branch_color_rule_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8869,7 +8938,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v20_technical_ma_representative_repair",
+        cache_task="weekly_keypoints_ai_analysis_v21_branch_color_rule_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8892,12 +8961,12 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 核心要求：
 1. 請輸出剛好 3 點：前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每一點都必須先給「面向」與「結果」，但「結果」要寫具體結論短句，不可只寫偏多、偏弱、中性觀察。
-3. 本週重點固定使用：「面向：技術面/權證面/法人面/新聞面｜結果：6～12字具體結論短句｜說明：一句具體資料依據」。若寫精選五分點或代表性分點買超，結果可直接寫「元大南屯積極偏買」這類分點結論，不要只寫權證資金流入。
+3. 本週重點固定使用：「面向：技術面/權證面/法人面/新聞面｜結果：6～12字具體結論短句｜說明：一句具體資料依據」。若寫精選五分點，或事件數超過50筆且歷史勝率80%以上的代表性分點買超，結果可直接寫「元大南屯積極偏買」這類分點結論；其他分點請用「權證資金流入」等中性結果，不要用積極偏買。
 4. 下週觀察固定使用：「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：下週需要確認的條件」。
 5. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，不可寫成長篇段落。
 6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並、上方存在、是否」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述，保留完整句子。
 7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
-8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；沒有代表性就不要硬寫。
+8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；只有精選五分點或事件數超過50筆且歷史勝率80%以上者，才可使用積極偏買語氣；沒有代表性就不要硬寫。
 9. 技術面必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 price_volume_pattern.current_pattern_label；若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
 10. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
 11. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
@@ -8920,7 +8989,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v20_technical_ma",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v21_branch_color_rule",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -10710,7 +10779,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             ]):
                 return "偏多"
             if _has_negative_target_price_or_rating(s) or any(k in s for k in [
-                "轉弱", "賣壓", "跌破", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
+                "轉弱", "賣壓", "跌破", "死亡交叉", "死叉", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
             ]):
                 return "偏弱"
             if "月減" in s and "年增" not in s:
