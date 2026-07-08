@@ -5378,7 +5378,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v15_inst_volume_news_fix"
+    internal_version = "validated_v16_stock_code_identity_guard"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -6274,9 +6274,11 @@ def _passes_news_quality_gate(title: str, description_or_body: str, stock_code: 
     combined = _normalize_news_text(f"{title} {content}")
     if len(_title_compare_text(combined)) < 16:
         return False
+    if _has_conflicting_similar_company_name(combined, stock_code, stock_name):
+        return False
 
     aliases = _get_news_aliases(stock_code, stock_name)
-    if aliases and not any(alias and alias in combined for alias in aliases):
+    if aliases and not _news_text_matches_target_stock(combined, stock_code, stock_name):
         return False
 
     # 股票名稱若暫時查不到，Google News 常仍會以「公司名(代號)」呈現；
@@ -7036,8 +7038,8 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                     continue
 
                 combined_for_target_check = f"{title} {description}"
-                if aliases and not any(alias in combined_for_target_check for alias in aliases):
-                    # Google News 搜尋有時會回傳同產業但非本股票的多股新聞；先擋掉標題/摘要完全沒有本股票的項目。
+                if aliases and not _news_text_matches_target_stock(combined_for_target_check, stock_code, stock_name):
+                    # Google News 搜尋有時會回傳同產業但非本股票的多股新聞；先擋掉標題/摘要沒有明確對應本股票的項目。
                     continue
                 if not _passes_news_quality_gate(title, description, stock_code, stock_name):
                     # 排除只有漲跌、熱門股清單、大盤盤勢或缺乏具體公司資訊的新聞。
@@ -7237,6 +7239,76 @@ def _contains_non_target_stock_alias(text: str, stock_code: str, stock_name: str
     return any(alias and alias in s for alias in _get_non_target_stock_aliases(stock_code, stock_name))
 
 
+_SIMILAR_COMPANY_NAME_SUFFIXES = (
+    "生技", "生醫", "醫療", "製藥", "藥品", "醫材",
+    "科技", "電子", "精密", "材料", "光電", "半導體",
+    "國際", "控股", "投控", "建設", "營造", "工程",
+    "化學", "電機", "機械", "工業", "資訊", "資通", "通訊",
+)
+
+
+def _has_target_stock_code_in_news(text: str, stock_code: str) -> bool:
+    code = _clean_code(stock_code)
+    if not code:
+        return False
+    return bool(re.search(rf"(?<!\d){re.escape(code)}(?!\d)", str(text or "")))
+
+
+def _has_conflicting_similar_company_name(text: str, stock_code: str, stock_name: str) -> bool:
+    """排除名稱相近但不是同一檔股票的新聞。
+
+    例如 3033 威健 與「威健生技」是不同公司；如果新聞沒有明確出現
+    3033，不能只因為包含「威健」兩字就當成 3033 的新聞。
+    """
+    s = _normalize_news_text(text)
+    if not s:
+        return False
+    if _has_target_stock_code_in_news(s, stock_code):
+        return False
+
+    code = _clean_code(stock_code)
+    explicit_codes = set(re.findall(r"[（(]\s*(\d{4})\s*[)）]", s))
+    if explicit_codes and code and code not in explicit_codes:
+        # 同句有其他股票代號，且沒有本股票代號，保守視為非目標股票。
+        return True
+
+    aliases = [a for a in _get_news_aliases(stock_code, stock_name) if a]
+    for alias in aliases:
+        alias = str(alias or "").strip()
+        if not alias or alias == code or re.fullmatch(r"\d+", alias):
+            continue
+        # 只處理短中文股票名被接成另一家公司名的情境，避免誤擋一般句子。
+        if len(alias) < 2:
+            continue
+        for suffix in _SIMILAR_COMPANY_NAME_SUFFIXES:
+            if re.search(rf"{re.escape(alias)}{re.escape(suffix)}", s):
+                return True
+    return False
+
+
+def _news_text_matches_target_stock(text: str, stock_code: str, stock_name: str) -> bool:
+    """判斷新聞文字是否明確對應目標股票。
+
+    優先相信股票代號；若只有公司名，需排除「公司名 + 生技/科技/電子...」
+    這類容易誤抓相似公司的情況。
+    """
+    s = _normalize_news_text(text)
+    if not s:
+        return False
+    if _has_target_stock_code_in_news(s, stock_code):
+        return True
+    if _has_conflicting_similar_company_name(s, stock_code, stock_name):
+        return False
+    code = _clean_code(stock_code)
+    for alias in _get_news_aliases(stock_code, stock_name):
+        alias = str(alias or "").strip()
+        if not alias or alias == code or re.fullmatch(r"\d+", alias):
+            continue
+        if alias in s:
+            return True
+    return False
+
+
 def _is_cross_company_target_value_sentence(text: str, stock_code: str, stock_name: str) -> bool:
     """
     避免多家公司新聞中，將其他公司的目標價 / 評等數字誤歸給本股票。
@@ -7342,7 +7414,7 @@ def _extract_target_focused_news_body(content: str, stock_code: str, stock_name:
         if not sent:
             continue
         sent = _strip_target_news_label(sent)
-        has_target = any(alias in sent for alias in aliases)
+        has_target = _news_text_matches_target_stock(sent, stock_code, stock_name)
         has_non_target = _contains_non_target_stock_alias(sent, stock_code, stock_name)
         has_cross_risk = _is_cross_company_target_value_sentence(sent, stock_code, stock_name)
 
@@ -7353,7 +7425,7 @@ def _extract_target_focused_news_body(content: str, stock_code: str, stock_name:
                 clause = _strip_target_news_label(clause).strip("，,；;、 ")
                 if not clause:
                     continue
-                clause_has_target = any(alias in clause for alias in aliases)
+                clause_has_target = _news_text_matches_target_stock(clause, stock_code, stock_name)
                 clause_has_non_target = _contains_non_target_stock_alias(clause, stock_code, stock_name)
                 clause_has_value_risk = _is_cross_company_target_value_sentence(clause, stock_code, stock_name)
                 if clause_has_target and not clause_has_value_risk:
@@ -7385,7 +7457,7 @@ def _extract_target_focused_news_body(content: str, stock_code: str, stock_name:
         return focused
 
     # 若全文沒有其他公司名，代表不是多股混雜新聞；可保守保留含公司名附近的前段內容，避免完全抓不到。
-    if any(alias in content for alias in aliases) and not _contains_non_target_stock_alias(content, stock_code, stock_name):
+    if _news_text_matches_target_stock(content, stock_code, stock_name) and not _contains_non_target_stock_alias(content, stock_code, stock_name):
         cleaned = _normalize_news_text(content)
         return cleaned[: min(len(cleaned), NEWS_MAX_ARTICLE_CHARS_TO_GEMINI)]
 
@@ -7486,8 +7558,8 @@ def _collect_news_sentences(records: List[dict], stock_code: str = "", stock_nam
             sent = _trim_news_point(sent, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 12)
             if not sent or sent in seen or _is_bad_news_sentence(sent):
                 continue
-            if aliases and not any(alias in sent for alias in aliases):
-                # 規則式補字數時也必須明確指向本股票，避免拿同篇新聞其他公司的題材來補。
+            if aliases and not _news_text_matches_target_stock(sent, stock_code, stock_name):
+                # 規則式補字數時也必須明確指向本股票，避免拿相似公司或同篇新聞其他公司的題材來補。
                 continue
             if aliases and _contains_non_target_stock_alias(sent, stock_code, stock_name) and re.search(r"目標價|評等|EPS|每股純益|營收|毛利|獲利|預估|上看|調升|調降|記憶體|DRAM|HBM", sent):
                 continue
@@ -7561,6 +7633,9 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
     for p in raw_points or []:
         s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
         if not s or _is_bad_news_sentence(s):
+            continue
+        if _has_conflicting_similar_company_name(s, stock_code, stock_name):
+            print(f"⚠️ 略過疑似相似公司名稱誤植的新聞重點：{s}")
             continue
         if _is_cross_company_target_value_sentence(s, stock_code, stock_name):
             print(f"⚠️ 略過疑似跨公司目標價 / 評等重點：{s}")
@@ -7847,7 +7922,10 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
 
         aliases = _get_news_aliases(stock_code, stock_name)
         combined_for_check = _normalize_news_text("。".join([title, description, raw_content]))
-        has_target = any(alias and alias in combined_for_check for alias in aliases)
+        if _has_conflicting_similar_company_name(combined_for_check, stock_code, stock_name):
+            print(f"⚠️ 略過相似公司新聞：{title[:36]}｜未明確對應 {stock_code} {stock_name}")
+            continue
+        has_target = _news_text_matches_target_stock(combined_for_check, stock_code, stock_name)
         has_value = _has_company_value_terms(combined_for_check) or _has_substantive_company_news(combined_for_check)
 
         # 極速 RSS 模式至少保留標題 + 摘要，不因摘要短就直接跳過。
@@ -7959,6 +8037,8 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 13. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
 14. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
 15. 不得把其他公司的數字或題材套用到 {display_name}。
+15-1. 必須確認新聞明確對應股票代號 {stock_code} 或公司名稱 {display_name}；若公司名稱相近，例如「威健」與「威健生技」這種不同公司，沒有明確出現股票代號 {stock_code} 時一律不得使用。
+15-2. 若素材標題或內文出現「{display_name}生技」「{display_name}科技」「{display_name}電子」等較長公司名，但沒有同時出現股票代號 {stock_code}，視為相似公司，必須排除。
 16. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
 17. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
 18. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
@@ -8003,6 +8083,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 「說明」限一句完整短句，約 28～48 個中文字，必須自然收尾並以句號結束；不得使用省略號，也不得留下看起來尚未說完的結尾。
 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材出現傳捷報、接單、訂單、券商看好、法說看好、目標價調升/上修、評等調升或上修，結果要寫成正面具體結論；若只是提到目標價但沒有明確調升、上修、買進或看好，不得判定為正面；「說明」講新聞事實、可能影響與後續追蹤項目。
 不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
+必須確認每則新聞明確對應股票代號 {stock_code} 或公司名稱 {display_name}；若出現相似公司名，例如「{display_name}生技」「{display_name}科技」「{display_name}電子」，但沒有同時出現股票代號 {stock_code}，一律不得使用。
 請只回傳 JSON：{{"points":["分類｜結果：具體結論短句｜說明：新聞事實、影響與後續觀察"]}}
 
 新聞素材 JSON：
@@ -9249,6 +9330,7 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         "4-1. 不得輸出「法人尚未表態」「法人消息不足」「法人看法待確認」這類沒有資訊量的法人觀點；沒有具體券商、評等、目標價、EPS上修/下修或法人買賣超，就改寫其他有內容的新聞或直接少輸出。\n"
         "5. 只聚焦公司本身可能影響股價的消息：公司產業、法人目標價/評等、EPS/每股純益、營收、毛利率、獲利、ASP/報價、接單出貨、產能與供需。\n"
         "6. 若目標價、EPS、營收、ASP、毛利率或產業題材沒有明確指向本公司，請不要使用。\n"
+        "6-1. 必須確認新聞明確對應目標股票代號或公司名；若公司名稱相近，例如威健與威健生技這種不同公司，沒有目標股票代號就不得使用。\n"
         "7. 若資料不足，寧可保守，不要臆測。\n\n"
         + "\n\n".join(blocks)
     )
@@ -9298,7 +9380,7 @@ def _collect_news_title_candidates(records: List[dict], stock_code: str = "", st
         if not title:
             continue
         combined = _normalize_news_text(f"{title}。{content}")
-        if aliases and not any(alias and alias in combined for alias in aliases):
+        if aliases and not _news_text_matches_target_stock(combined, stock_code, stock_name):
             continue
         if not _passes_news_quality_gate(title, content or title, stock_code, stock_name):
             continue
