@@ -351,14 +351,14 @@ WHITE = "#FFFFFF"
 # 週報結論標籤顏色：只使用三種，方便讀者理解，也符合台股紅漲綠跌習慣。
 STATUS_BULL_COLOR = RED       # 紅色：偏多 / 買方有利 / 資金流入
 STATUS_BEAR_COLOR = GREEN     # 綠色：偏弱 / 賣方有利 / 資金流出
-STATUS_NEUTRAL_COLOR = MUTED  # 灰色：中性 / 觀望 / 尚未確認方向
+STATUS_NEUTRAL_COLOR = GOLD   # 深藍色：中性 / 觀望 / 尚未確認方向，與標題主色一致
 
 
 def get_report_status_color(status_text: str) -> str:
     """依台股閱讀習慣回傳結論文字顏色。
 
     只讓「結果文字」上色，底下詳細說明維持原本 TEXT / MUTED 顏色。
-    顏色規則固定三種：紅色=偏多、綠色=偏弱、灰色=中性。
+    顏色規則固定三種：紅色=偏多、綠色=偏弱、深藍=中性。
     """
     s = str(status_text or "").strip()
     if not s:
@@ -9996,6 +9996,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     if not compact_mode:
         # Notes row
+        # 版面恢復接近原始大字級文字區塊：卡片、標題與內文空間維持原本配置；
+        # 只在每個面向第一行拆出「面向 + 結果」，並只讓結果文字依台股習慣上紅 / 綠 / 灰。
         ax_notes = fig.add_subplot(gs[8, :]); ax_notes.set_axis_off(); ax_notes.set_facecolor(BG)
         for x0, title in [(0.02, "本週重點與下週觀察"), (0.52, "本週新聞 / 題材觀察")]:
             note_y = 0.005
@@ -10012,18 +10014,27 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rounding=0.022,
                 linewidth=1.25,
             )
-            ax_notes.text(x0 + 0.02, note_y + note_h - 0.105, title, transform=ax_notes.transAxes, color=GOLD, fontsize=46, fontweight="bold", ha="left", va="top", clip_on=False, zorder=6)
-        notes_fontsize = 30
-        notes_line_height = 0.052
-        notes_item_gap = 0.026
-        notes_max_lines = 4
+            ax_notes.text(
+                x0 + 0.02,
+                note_y + note_h - 0.105,
+                title,
+                transform=ax_notes.transAxes,
+                color=GOLD,
+                fontsize=46,
+                fontweight="bold",
+                ha="left",
+                va="top",
+                clip_on=False,
+                zorder=6,
+            )
+
         notes_right_padding = 0.025
 
-        def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=3, first_prefix="", next_prefix=""):
+        def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=0, first_prefix="", next_prefix=""):
             """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
             s = str(text or "").strip()
             if not s:
-                return ""
+                return []
 
             fig.canvas.draw()
             renderer = fig.canvas.get_renderer()
@@ -10059,244 +10070,144 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 else:
                     lines.append(current.rstrip())
                     current = ch.lstrip()
-
             if current:
                 lines.append(current.rstrip())
 
-            # 最後防呆：若外部快取或舊版 AI 輸出仍過長，限制在卡片可容納行數內，避免文字超出範圍。
-            # 正常情況上游 prompt 已要求精簡，這裡不會觸發；觸發時以完整句號收尾，不使用省略號。
             max_lines_int = int(max_lines or 0)
             if max_lines_int > 0 and len(lines) > max_lines_int:
                 lines = lines[:max_lines_int]
                 lines[-1] = lines[-1].rstrip("；;，,、｜:： ")
                 if lines[-1] and lines[-1][-1] not in "。！？":
                     lines[-1] += "。"
+            return lines
 
-            return "\n".join(lines)
-
-        def _parse_structured_card_fields(text):
-            """解析 AI 輸出的「面向｜結果｜說明」或舊版「分類｜結論｜重點｜觀察」欄位。"""
+        def _normalize_card_text(text: str) -> str:
             s = _normalize_news_text(text)
+            s = s.replace("|", "｜")
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def _parse_status_fields(text):
+            """解析新版「面向｜結果｜說明」與舊版「分類｜結論｜重點｜觀察」。"""
+            s = _normalize_card_text(text)
             if not s:
                 return {}
-            s = s.replace("|", "｜")
+
             fields = {}
-            # 讓「下週觀察：面向：...」或舊版「下週觀察：結論：...」也能被切成欄位。
             if re.match(r"^下週觀察[:：]", s):
                 fields["面向"] = "下週觀察"
                 s = re.sub(r"^下週觀察[:：]\s*", "", s)
-            s = re.sub(r"^結論[:：]", "結論：", s)
+
             parts = [p.strip() for p in re.split(r"｜+", s) if p.strip()]
-            known_labels = {
-                "面向", "結果", "說明", "分類", "結論", "依據", "重點", "觀察", "條件", "追蹤",
-                "下週觀察", "本週結論", "關鍵依據", "新聞重點", "影響",
+            known_keys = {
+                "面向", "結果", "說明", "分類", "結論", "依據", "重點", "觀察", "條件", "追蹤", "影響", "狀態",
             }
+
+            # 新版最理想格式：技術面｜偏弱整理｜說明文字
+            if len(parts) >= 3:
+                p0 = re.sub(r"[：:。；;，,、\s]+", "", parts[0])
+                p1 = parts[1].strip()
+                if p0 and p0 not in known_keys and not re.match(r"^[^:：]{2,8}[:：]", parts[0]) and not re.match(r"^[^:：]{2,8}[:：]", parts[1]):
+                    if len(p0) <= 6:
+                        fields.setdefault("面向", p0)
+                        fields.setdefault("結果", p1)
+                        fields.setdefault("說明", "；".join(parts[2:]).strip())
+
             for idx, part in enumerate(parts):
                 m = re.match(r"^([^:：]{2,8})[:：]\s*(.+)$", part)
                 if m:
                     key = m.group(1).strip()
                     val = m.group(2).strip()
-                    # 分類通常是第一段短標籤，例如「業績更新｜結論：...」。
-                    if idx == 0 and key not in known_labels and "分類" not in fields:
-                        fields["分類"] = key
-                        if val:
-                            fields.setdefault("重點", val)
-                    else:
+                    if key in known_keys:
                         fields[key] = val
+                    elif idx == 0:
+                        fields.setdefault("分類", key)
+                        fields.setdefault("重點", val)
+                    else:
+                        fields.setdefault("重點", part)
                 else:
-                    clean_part = part.strip("。；;，, ")
-                    if clean_part in ("結論", "重點", "依據", "觀察", "條件", "追蹤"):
+                    clean_part = part.strip("。；;，,、 ")
+                    if not clean_part or clean_part in known_keys:
                         continue
-                    if idx == 0 and "分類" not in fields and len(clean_part) <= 8 and not clean_part.startswith("下週觀察"):
-                        fields["分類"] = clean_part
-                    elif clean_part.startswith("下週觀察"):
-                        fields.setdefault("下週觀察", clean_part)
+                    if idx == 0 and len(clean_part) <= 8:
+                        if any(k in clean_part for k in ["技術", "權證", "法人", "新聞", "業績", "產業", "公司", "題材", "下週"]):
+                            fields.setdefault("面向", clean_part if clean_part != "下週" else "下週觀察")
+                        else:
+                            fields.setdefault("分類", clean_part)
                     elif "重點" not in fields:
                         fields["重點"] = clean_part
                     elif "觀察" not in fields:
                         fields["觀察"] = clean_part
+
             return fields
 
-        def _strip_card_labels(text):
-            s = _normalize_news_text(text)
-            s = s.replace("|", "｜")
+        def _strip_status_labels(text):
+            s = _normalize_card_text(text)
             s = re.sub(r"^下週觀察[:：]\s*", "", s)
-            s = re.sub(r"^(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響)[:：]", "", s)
-            s = re.sub(r"｜\s*(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響)[:：]", "。", s)
+            s = re.sub(r"^(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態)[:：]", "", s)
+            s = re.sub(r"｜\s*(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態)[:：]", "。", s)
+            s = re.sub(r"^[^｜:：]{2,8}｜[^｜:：]{1,12}｜", "", s)
             s = re.sub(r"^[^｜:：]{2,8}｜", "", s)
             s = re.sub(r"\s+", " ", s).strip(" ｜")
             return s.strip()
 
-        def _compact_sentence_for_card(text, max_chars=74):
-            s = _normalize_news_text(text)
-            s = re.sub(r"\s+", " ", s).strip()
+        def _compact_card_sentence(text, max_chars=92):
+            s = _normalize_card_text(text)
             if not s:
                 return ""
             if len(s) <= max_chars:
                 return s if s[-1] in "。！？" else s + "。"
             cut = s[:max_chars].rstrip("；;，,、｜:： ")
-            # 優先切在前面的完整句號，避免一行被截得太突兀。
             sentence_positions = [m.end() for m in re.finditer(r"[。！？]", cut)]
-            if sentence_positions and sentence_positions[-1] >= max(28, int(max_chars * 0.58)):
+            if sentence_positions and sentence_positions[-1] >= max(28, int(max_chars * 0.55)):
                 cut = cut[:sentence_positions[-1]].strip()
             if cut and cut[-1] not in "。！？":
                 cut += "。"
             return cut
 
-        def _format_key_sections(items):
-            current = []
-            watches = []
-            for p in items or []:
-                s = str(p or "").strip()
-                if not s:
-                    continue
-                if s.startswith(("下週觀察：", "下週觀察:", "下週留意：", "下週留意:", "下週焦點：", "下週焦點:")):
-                    watches.append(s)
-                else:
-                    current.append(s)
-
-            sections = []
-            if current:
-                f0 = _parse_structured_card_fields(current[0])
-                conclusion = f0.get("結論", "")
-                if conclusion.startswith(("依據：", "依據:")):
-                    conclusion = ""
-                if not conclusion:
-                    conclusion = _strip_card_labels(current[0])
-                sections.append(("本週結論", _compact_sentence_for_card(conclusion, 58), 2))
-
-            evidence_lines = []
-            for p in current[:2]:
-                f = _parse_structured_card_fields(p)
-                evidence = f.get("依據") or f.get("重點") or f.get("影響") or ""
-                if not evidence:
-                    evidence = _strip_card_labels(p)
-                evidence = _compact_sentence_for_card(evidence, 62).rstrip("。")
-                if evidence and evidence not in evidence_lines:
-                    evidence_lines.append(evidence)
-            if evidence_lines:
-                body = "\n".join([f"・{x}" for x in evidence_lines[:2]])
-                sections.append(("關鍵依據", body, 4))
-
-            watch_source = watches[0] if watches else (items[-1] if items else "")
-            if watch_source:
-                f = _parse_structured_card_fields(watch_source)
-                watch_parts = []
-                if f.get("結論"):
-                    watch_parts.append(_compact_sentence_for_card(f.get("結論"), 42).rstrip("。"))
-                if f.get("條件"):
-                    watch_parts.append("條件：" + _compact_sentence_for_card(f.get("條件"), 44).rstrip("。"))
-                if f.get("追蹤"):
-                    watch_parts.append("追蹤：" + _compact_sentence_for_card(f.get("追蹤"), 42).rstrip("。"))
-                elif f.get("觀察"):
-                    watch_parts.append("追蹤：" + _compact_sentence_for_card(f.get("觀察"), 42).rstrip("。"))
-                if not watch_parts:
-                    watch_parts.append(_compact_sentence_for_card(_strip_card_labels(watch_source), 86).rstrip("。"))
-                sections.append(("下週觀察", "。".join([x for x in watch_parts if x]).strip("。") + "。", 3))
-
-            if not sections:
-                sections.append(("本週結論", "本週暫無足夠明確資料可整理成重點。", 2))
-            return sections[:3]
-
-        def _format_news_sections(items):
-            sections = []
-            for p in (items or [])[:NEWS_DISPLAY_MAX_POINTS]:
-                f = _parse_structured_card_fields(p)
-                label = f.get("分類") or "新聞重點"
-                label = re.sub(r"[：:。；;，,、｜\s]+", "", str(label or "新聞重點"))[:8] or "新聞重點"
-
-                body_parts = []
-                if f.get("結論"):
-                    body_parts.append(_compact_sentence_for_card(f.get("結論"), 46).rstrip("。"))
-                if f.get("重點"):
-                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("重點"), 52).rstrip("。"))
-                elif f.get("依據"):
-                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("依據"), 52).rstrip("。"))
-                if f.get("觀察"):
-                    body_parts.append("觀察：" + _compact_sentence_for_card(f.get("觀察"), 46).rstrip("。"))
-                elif f.get("影響"):
-                    body_parts.append("影響：" + _compact_sentence_for_card(f.get("影響"), 46).rstrip("。"))
-
-                if body_parts:
-                    body = "。".join([x for x in body_parts if x]).strip("。") + "。"
-                else:
-                    body = _compact_sentence_for_card(_strip_card_labels(p), 92)
-                sections.append((label, body, 3))
-
-            if not sections:
-                sections.append(("新聞重點", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
-            return sections[:2]
-
-        def _wrap_card_body_lines(body, x_left, x_right, fontsize, max_lines):
-            max_width_axes = max(0.05, x_right - x_left)
-            out_lines = []
-            for raw in str(body or "").split("\n"):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                first_prefix = ""
-                next_prefix = ""
-                if raw.startswith(("・", "-", "•")):
-                    raw = raw[1:].strip()
-                    first_prefix = "・"
-                    next_prefix = "  "
-                wrapped = wrap_text_by_pixel(
-                    ax_notes,
-                    fig,
-                    raw,
-                    max_width_axes=max_width_axes,
-                    fontsize=fontsize,
-                    fontweight="normal",
-                    max_lines=max(1, int(max_lines or 1) - len(out_lines)),
-                    first_prefix=first_prefix,
-                    next_prefix=next_prefix,
-                )
-                wrapped_lines = [x for x in wrapped.split("\n") if x.strip()]
-                for i, line in enumerate(wrapped_lines):
-                    prefix = first_prefix if i == 0 else next_prefix
-                    out_lines.append(prefix + line)
-                    if max_lines and len(out_lines) >= max_lines:
-                        return out_lines[:max_lines]
-            return out_lines[:max_lines] if max_lines else out_lines
-
-        def _compact_status_text(text, max_chars=12, fallback="中性觀察"):
-            s = _normalize_news_text(text)
-            s = re.sub(r"^(結果|結論|狀態|面向)[:：]", "", s).strip()
-            s = s.replace("。", "，")
-            s = re.split(r"[，；;。！？]", s)[0].strip(" ｜:：")
-            if not s:
-                return fallback
-            if len(s) > max_chars:
-                s = s[:max_chars].rstrip("，、:：｜ ")
-            return s or fallback
-
         def _infer_face_label_from_text(text, fallback="重點面"):
             s = str(text or "")
-            if s.startswith(("下週觀察：", "下週觀察:", "下週留意：", "下週焦點：")):
-                return "下週觀察"
-            if any(k in s for k in ["權證", "分點", "買超", "賣超", "淨流入", "淨流出", "資金流", "加碼", "調節"]):
-                return "權證面"
-            if any(k in s for k in ["三大法人", "外資", "投信", "自營商", "法人"]):
-                return "法人面"
-            if any(k in s for k in ["新聞", "營收", "法說", "產業", "題材", "接單", "出貨", "報價", "EPS", "毛利"]):
-                return "新聞面"
-            if any(k in s for k in ["技術", "股價", "均線", "型態", "量區", "大量區", "突破", "跌破", "回踩", "價量", "收盤"]):
+            if any(k in s for k in ["技術", "均線", "K線", "布林", "跌破", "站回", "量能", "型態", "價量"]):
                 return "技術面"
+            if any(k in s for k in ["權證", "分點", "資金流", "買超", "賣超", "淨流入", "淨流出"]):
+                return "權證面"
+            if any(k in s for k in ["法人", "外資", "投信", "自營", "三大法人"]):
+                return "法人面"
+            if any(k in s for k in ["新聞", "營收", "產業", "題材", "法說", "訂單", "毛利"]):
+                return "新聞面"
+            if any(k in s for k in ["下週", "觀察", "追蹤", "留意"]):
+                return "下週觀察"
             return fallback
+
+        def _compact_status_text(status_text, max_chars=12, fallback="中性觀察"):
+            s = _normalize_card_text(status_text)
+            s = re.sub(r"^(結論|結果|狀態)[:：]\s*", "", s).strip("。；;，,、 ")
+            if not s:
+                return fallback
+            if any(k in s for k in ["中性偏弱", "偏弱整理", "偏弱觀察", "偏弱"]):
+                for k in ["中性偏弱", "偏弱整理", "偏弱觀察", "偏弱"]:
+                    if k in s:
+                        return k
+            if any(k in s for k in ["中性偏多", "偏多觀察", "偏多"]):
+                for k in ["中性偏多", "偏多觀察", "偏多"]:
+                    if k in s:
+                        return k
+            if any(k in s for k in ["中性", "觀望", "待確認"]):
+                return "中性觀察"
+            if any(k in s for k in ["轉強", "買方", "買超", "資金流入", "年增", "月增", "正向"]):
+                return "偏多"
+            if any(k in s for k in ["轉弱", "賣方", "賣壓", "賣超", "資金流出", "跌破", "年減", "月減"]):
+                return "偏弱"
+            if len(s) > max_chars:
+                s = s[:max_chars].rstrip("。；;，,、 ")
+            return s or fallback
 
         def _infer_status_from_text(text, fallback="中性觀察"):
             s = str(text or "")
             if any(k in s for k in ["中性偏弱", "偏弱整理", "偏弱", "轉弱", "賣壓", "跌破", "資金流出", "賣超", "月減", "年減"]):
-                # 優先保留原本文字中的較完整結果詞。
-                for k in ["中性偏弱", "偏弱整理", "偏弱觀察", "偏弱"]:
-                    if k in s:
-                        return k
-                return "偏弱"
+                return _compact_status_text(s, fallback="偏弱")
             if any(k in s for k in ["中性偏多", "偏多", "轉強", "買超", "資金流入", "站回", "突破", "月增", "年增", "正向"]):
-                for k in ["中性偏多", "偏多觀察", "偏多"]:
-                    if k in s:
-                        return k
-                return "偏多"
+                return _compact_status_text(s, fallback="偏多")
             if any(k in s for k in ["中性", "觀望", "待確認", "有限", "接近中性"]):
                 return "中性觀察"
             return fallback
@@ -10307,13 +10218,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 s = str(p or "").strip()
                 if not s:
                     continue
-                f = _parse_structured_card_fields(s)
+                f = _parse_status_fields(s)
                 label = f.get("面向") or _infer_face_label_from_text(s, fallback="重點面")
-                label = str(label or "重點面").strip()[:6]
+                label = re.sub(r"[：:。；;，,、｜\s]+", "", str(label or "重點面"))[:6] or "重點面"
 
-                status_source = f.get("結果") or f.get("結論") or f.get("狀態") or s
+                status_source = f.get("結果") or f.get("狀態") or f.get("結論") or s
                 status = _compact_status_text(
-                    f.get("結果") or _infer_status_from_text(status_source, fallback="中性觀察"),
+                    f.get("結果") or f.get("狀態") or _infer_status_from_text(status_source, fallback="中性觀察"),
                     max_chars=12,
                     fallback="中性觀察",
                 )
@@ -10331,8 +10242,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     elif f.get("條件") or f.get("追蹤"):
                         body = "；".join([x for x in [f.get("條件"), f.get("追蹤")] if x])
                     else:
-                        body = _strip_card_labels(s)
-                body = _compact_sentence_for_card(body, 92)
+                        body = _strip_status_labels(s)
+                body = _compact_card_sentence(body, 112)
                 rows.append((label, status, body, 3 if label == "下週觀察" else 2))
                 if len(rows) >= 3:
                     break
@@ -10346,61 +10257,74 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 s = str(p or "").strip()
                 if not s:
                     continue
-                f = _parse_structured_card_fields(s)
-                label = f.get("面向") or f.get("分類") or "新聞面"
+                f = _parse_status_fields(s)
+                label = f.get("面向") or f.get("分類") or _infer_face_label_from_text(s, fallback="新聞面")
                 label = re.sub(r"[：:。；;，,、｜\s]+", "", str(label or "新聞面"))[:6] or "新聞面"
-                status_source = f.get("結果") or f.get("結論") or s
+
+                status_source = f.get("結果") or f.get("狀態") or f.get("結論") or s
                 status = _compact_status_text(status_source, max_chars=12, fallback="中性觀察")
 
                 body_parts = []
-                if f.get("重點"):
-                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("重點"), 52).rstrip("。"))
-                elif f.get("依據"):
-                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("依據"), 52).rstrip("。"))
-                if f.get("觀察"):
-                    body_parts.append("觀察：" + _compact_sentence_for_card(f.get("觀察"), 46).rstrip("。"))
-                elif f.get("影響"):
-                    body_parts.append("影響：" + _compact_sentence_for_card(f.get("影響"), 46).rstrip("。"))
-                body = "。".join([x for x in body_parts if x]).strip("。") + "。" if body_parts else _compact_sentence_for_card(_strip_card_labels(s), 92)
+                if f.get("說明"):
+                    body_parts.append(f.get("說明"))
+                else:
+                    if f.get("重點"):
+                        body_parts.append(f.get("重點"))
+                    elif f.get("依據"):
+                        body_parts.append(f.get("依據"))
+                    if f.get("觀察"):
+                        body_parts.append("觀察：" + f.get("觀察"))
+                    elif f.get("影響"):
+                        body_parts.append("影響：" + f.get("影響"))
+                body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
+                body = _compact_card_sentence(body, 118)
                 rows.append((label, status, body, 3))
             if not rows:
                 rows.append(("新聞面", "中性觀察", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
             return rows[:2]
 
-        def draw_status_card_sections(
-            sections, x_left, x_right, y_start,
-            label_color=GOLD,
-            body_fontsize=28,
-            label_fontsize=31,
-            status_fontsize=34,
-            header_gap=0.046,
-            line_height=0.043,
-            section_gap=0.036,
-            y_min=0.055,
-            status_offset=0.135,
+        def draw_status_note_items(
+            sections,
+            x_left,
+            x_right,
+            y_start,
+            body_fontsize=32,
+            label_fontsize=35,
+            status_fontsize=38,
+            header_gap=0.060,
+            line_height=0.052,
+            section_gap=0.038,
+            status_offset=0.140,
+            y_min=0.060,
         ):
             y = y_start
+            max_width_axes = max(0.05, x_right - x_left)
             status_x = x_left + status_offset
-            for label, status, body, max_lines in sections:
+            for idx, (label, status, body, max_lines) in enumerate(sections):
                 if y <= y_min:
                     break
                 label = str(label or "重點面").strip()
                 status = str(status or "中性觀察").strip()
-                body_lines = _wrap_card_body_lines(
+                body_lines = wrap_text_by_pixel(
+                    ax_notes,
+                    fig,
                     body,
-                    x_left,
-                    x_right,
+                    max_width_axes=max_width_axes,
                     fontsize=body_fontsize,
+                    fontweight="normal",
                     max_lines=max_lines,
+                    first_prefix="",
+                    next_prefix="",
                 )
                 if not body_lines:
                     continue
+
                 ax_notes.text(
                     x_left,
                     y,
                     label,
                     transform=ax_notes.transAxes,
-                    color=label_color,
+                    color=GOLD,
                     fontsize=label_fontsize,
                     fontweight="bold",
                     ha="left",
@@ -10431,95 +10355,49 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     fontsize=body_fontsize,
                     ha="left",
                     va="top",
-                    linespacing=1.13,
+                    linespacing=1.12,
                     clip_on=True,
                     zorder=6,
                 )
                 y -= line_height * len(body_lines) + section_gap
+                if idx < len(sections) - 1 and y > y_min + 0.012:
+                    ax_notes.plot(
+                        [x_left, x_right],
+                        [y + 0.010, y + 0.010],
+                        transform=ax_notes.transAxes,
+                        color=GRID,
+                        linewidth=0.9,
+                        alpha=0.50,
+                        zorder=5,
+                    )
 
-        def draw_structured_card_sections(
-            sections, x_left, x_right, y_start,
-            label_color=GOLD,
-            body_fontsize=28,
-            label_fontsize=30,
-            line_height=0.044,
-            label_gap=0.038,
-            section_gap=0.022,
-            y_min=0.055,
-        ):
-            y = y_start
-            for label, body, max_lines in sections:
-                if y <= y_min:
-                    break
-                label = str(label or "重點").strip()
-                body_lines = _wrap_card_body_lines(
-                    body,
-                    x_left,
-                    x_right,
-                    fontsize=body_fontsize,
-                    max_lines=max_lines,
-                )
-                if not body_lines:
-                    continue
-                ax_notes.text(
-                    x_left,
-                    y,
-                    f"【{label}】",
-                    transform=ax_notes.transAxes,
-                    color=label_color,
-                    fontsize=label_fontsize,
-                    fontweight="bold",
-                    ha="left",
-                    va="top",
-                    clip_on=True,
-                    zorder=6,
-                )
-                y -= label_gap
-                ax_notes.text(
-                    x_left,
-                    y,
-                    "\n".join(body_lines),
-                    transform=ax_notes.transAxes,
-                    color=TEXT,
-                    fontsize=body_fontsize,
-                    ha="left",
-                    va="top",
-                    linespacing=1.13,
-                    clip_on=True,
-                    zorder=6,
-                )
-                y -= line_height * len(body_lines) + section_gap
-
-        # 下方兩張文字卡改成「面向 + 結果 + 詳細說明」。
-        # 只有結果文字使用紅 / 綠 / 灰三色，底下說明維持原本 TEXT 顏色。
-        draw_status_card_sections(
+        # 下方兩張文字卡：恢復原本大字級閱讀感，只把第一行「結果」做紅 / 綠 / 灰標示；詳細說明維持原本 TEXT 顏色。
+        draw_status_note_items(
             _format_key_status_sections(key_points[:3]),
             0.04,
             0.485,
-            0.765,
-            label_color=GOLD,
-            body_fontsize=28,
-            label_fontsize=31,
-            status_fontsize=34,
-            header_gap=0.046,
-            line_height=0.043,
-            section_gap=0.037,
-            status_offset=0.140,
+            0.775,
+            body_fontsize=32,
+            label_fontsize=35,
+            status_fontsize=39,
+            header_gap=0.062,
+            line_height=0.053,
+            section_gap=0.040,
+            status_offset=0.145,
         )
 
-        draw_status_card_sections(
+        draw_status_note_items(
             _format_news_status_sections(news_points[:NEWS_DISPLAY_MAX_POINTS]),
             0.54,
             0.975,
-            0.765,
-            label_color=GOLD,
-            body_fontsize=28,
-            label_fontsize=31,
-            status_fontsize=34,
-            header_gap=0.046,
-            line_height=0.043,
-            section_gap=0.039,
-            status_offset=0.130,
+            0.775,
+            body_fontsize=32,
+            label_fontsize=35,
+            status_fontsize=39,
+            header_gap=0.062,
+            line_height=0.053,
+            section_gap=0.046,
+            status_offset=0.145,
         )
 
     # x ticks
