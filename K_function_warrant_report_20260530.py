@@ -420,7 +420,7 @@ def get_report_status_color(status_text: str) -> str:
         return STATUS_NEUTRAL_COLOR
 
     bull_keywords = [
-        "偏多", "轉強", "強勢", "買方", "買超", "偏買", "積極偏買", "積極買", "買盤", "承接", "加碼",
+        "偏多", "轉強", "強勢", "多頭", "多頭排列", "買方", "買超", "偏買", "積極偏買", "積極買", "買盤", "承接", "加碼",
         "資金流入", "淨流入", "站回", "突破", "支撐", "上修", "調升", "上調", "年增", "月增",
         "正向", "利多", "傳捷報", "捷報", "看好", "看旺", "樂觀", "受惠", "成長", "增長", "推升",
         "需求強勁", "需求延續", "需求強", "題材強", "訂單", "接單", "出貨增", "擴產", "新產能",
@@ -8265,6 +8265,145 @@ def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 40) -> dict:
     }
 
 
+
+
+def _build_technical_card_summary(ctx: dict) -> dict:
+    """依圖上已計算的均線 / 價量型態，產生下方技術面卡片文字。
+
+    目的：避免下方技術面只寫「重點待確認」，或與上方 K 線圖顯示的
+    「均線多頭排列 / 均線空頭排列 / 全面跌破均線」等訊號矛盾。
+    此函式只整理圖卡文字，不改變任何股價、權證或法人計算邏輯。
+    """
+    df = ctx.get("plot_df", pd.DataFrame())
+    if df is None or df.empty:
+        return {}
+
+    latest = df.iloc[-1]
+    close = _safe_float(latest.get("Close"))
+    ma5 = _safe_float(latest.get("MA5"))
+    ma10 = _safe_float(latest.get("MA10"))
+    ma20 = _safe_float(latest.get("MA20"))
+    ma60 = _safe_float(latest.get("MA60"))
+    if not np.isfinite(close):
+        return {}
+
+    def _finite(v):
+        return np.isfinite(_safe_float(v))
+
+    ma_values = {
+        "5MA": ma5,
+        "10MA": ma10,
+        "20MA": ma20,
+        "60MA": ma60,
+    }
+    above = [name for name, value in ma_values.items() if _finite(value) and close >= float(value)]
+    below = [name for name, value in ma_values.items() if _finite(value) and close < float(value)]
+
+    ma_signal = get_ma_kline_signals(df) if df is not None and not df.empty else ""
+    ma_signal_main = str(ma_signal or "").split("．")[0].strip()
+    pattern = _build_price_volume_pattern_payload(ctx)
+    pattern_label = str(pattern.get("current_pattern_label", "") or "").strip()
+    price_volume_relation = str(pattern.get("weekly_price_volume_relationship", "") or "").strip()
+
+    ma_all_available = all(_finite(v) for v in [ma5, ma10, ma20, ma60])
+    ma_bull = ma_all_available and ma5 > ma10 > ma20 > ma60
+    ma_bear = ma_all_available and ma5 < ma10 < ma20 < ma60
+
+    below_set = set(below)
+    above_set = set(above)
+
+    if ma_bull:
+        if close >= ma5 and close >= ma10:
+            headline = "均線多頭排列延續"
+            detail = "上方訊號為均線多頭排列，收盤仍站在短中長期均線之上。"
+        elif {"5MA", "10MA"}.issubset(below_set) and {"20MA", "60MA"}.issubset(above_set):
+            headline = "多頭排列下短線拉回"
+            detail = "上方仍是均線多頭排列，但收盤跌破5MA與10MA。"
+        elif "20MA" in below_set and "60MA" in above_set:
+            headline = "多頭結構轉為修正"
+            detail = "均線結構仍偏多，但收盤跌破20MA，短線修正壓力升高。"
+        elif "60MA" in below_set:
+            headline = "跌破中長均線轉弱"
+            detail = "原本多頭結構遭破壞，收盤已跌破60MA，趨勢需要重新修復。"
+        else:
+            headline = "多頭排列震盪整理"
+            detail = "上方訊號為均線多頭排列，但短線位置轉為整理。"
+    elif ma_bear:
+        if all(name in below_set for name in ["5MA", "10MA", "20MA", "60MA"]):
+            headline = "均線空頭排列延續"
+            detail = "上方訊號偏弱，收盤仍落在主要均線下方。"
+        elif close >= ma5 or close >= ma10:
+            headline = "空頭排列下反彈"
+            detail = "均線結構仍偏弱，但短線嘗試站回短均，仍需確認延續性。"
+        else:
+            headline = "均線空頭排列整理"
+            detail = "均線結構偏空，短線仍以整理與修復觀察為主。"
+    else:
+        if ma_signal_main:
+            if "全面跌破均線" in ma_signal_main:
+                headline = "全面跌破均線轉弱"
+                detail = "上方訊號顯示全面跌破均線，短線仍以修復主要均線為重點。"
+            elif "強勢站上均線" in ma_signal_main:
+                headline = "站上均線偏強"
+                detail = "上方訊號顯示強勢站上均線，短線仍需搭配量能確認。"
+            elif "均線多頭排列" in ma_signal_main:
+                headline = "均線多頭排列延續"
+                detail = "上方訊號為均線多頭排列，趨勢結構仍偏正向。"
+            elif "均線空頭排列" in ma_signal_main:
+                headline = "均線空頭排列延續"
+                detail = "上方訊號為均線空頭排列，短線仍以修復均線為主。"
+            elif "黃金交叉" in ma_signal_main:
+                headline = "均線黃金交叉"
+                detail = "上方訊號出現均線黃金交叉，後續需確認量能是否配合。"
+            elif "死亡交叉" in ma_signal_main:
+                headline = "均線死亡交叉"
+                detail = "上方訊號出現均線死亡交叉，短線轉弱風險升高。"
+            else:
+                headline = ma_signal_main[:16]
+                detail = f"上方技術訊號為{ma_signal_main}，短線仍需搭配價量確認。"
+        elif pattern_label:
+            headline = f"價量結構{pattern_label}"[:16]
+            detail = f"價量型態顯示{pattern_label}，短線仍需觀察量能與收盤位置。"
+        else:
+            headline = "技術訊號待確認"
+            detail = "目前均線與價量訊號未形成明確方向，短線以確認收盤位置為主。"
+
+    # 若價量型態提供的是明確「本週價跌量縮 / 價跌量增」等關係，補到說明後段；
+    # 但避免句子過長，僅在不會造成擁擠時加入。
+    if price_volume_relation and price_volume_relation != "資料不足" and price_volume_relation not in detail:
+        extra = f"並呈現{price_volume_relation}。"
+        if len(detail.rstrip("。") + "，" + extra) <= 46:
+            detail = detail.rstrip("。") + f"，並呈現{price_volume_relation}。"
+
+    return {
+        "label": "技術面",
+        "headline": _compact_text_for_card_headline(headline, max_chars=16),
+        "detail": _compact_text_for_card_detail(detail, max_chars=58),
+        "ma_signal": ma_signal_main,
+        "pattern_label": pattern_label,
+    }
+
+
+def _compact_text_for_card_headline(text: str, max_chars: int = 16) -> str:
+    s = str(text or "").strip("。；;，,、 ")
+    return s[:max_chars].rstrip("。；;，,、 ")
+
+
+def _compact_text_for_card_detail(text: str, max_chars: int = 58) -> str:
+    s = str(text or "").strip()
+    s = re.sub(r"(?:\.\.\.|…+)", "", s).strip("；;，,、 ")
+    if len(s) <= max_chars:
+        return s if s.endswith("。") else s + "。"
+    prefix = s[:max_chars]
+    ends = [m.end() for m in re.finditer(r"[。！？]", prefix)]
+    if ends and ends[-1] >= max(24, int(max_chars * 0.5)):
+        return prefix[:ends[-1]]
+    cut = max([prefix.rfind(p) for p in ["；", ";", "，", ",", "、"]])
+    if cut >= max(24, int(max_chars * 0.5)):
+        prefix = prefix[:cut]
+    prefix = prefix.rstrip("；;，,、 ")
+    return prefix + ("。" if prefix and prefix[-1] not in "。！？" else "")
+
 def _build_rule_based_pattern_point(ctx: dict) -> str:
     pattern = _build_price_volume_pattern_payload(ctx)
     if not pattern.get("available"):
@@ -8656,7 +8795,7 @@ def _repair_weekly_expert_points(
 5. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
 6. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
 7. 若分析代表性分點、精選五分點，或結果短句點名分點，必須使用本週方向、金額、歷史勝率、平均持有天數與歷史加權報酬率；沒有選擇分點則不必硬寫。
-8. 若分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
+8. 技術面必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 price_volume_pattern.current_pattern_label；若分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
 10. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
 10. 禁止單純羅列均線價格、KD或MACD；每點必須有比較、判斷與中立結論。
 11. 不得點名非代表性小額分點，不得放大解讀接近中性的法人數據。
@@ -8675,7 +8814,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v19_branch_perf_spacing_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v20_technical_ma_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8710,7 +8849,7 @@ def _repair_weekly_points_with_required_branch(
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
 4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
 5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、平均持有天數、歷史加權報酬率，並依實際天數描述時間尺度；若是精選五分點積極買超，結果短句請直接寫「分點名稱＋積極偏買」。
-6. 其中一點必須分析 required_price_volume_pattern_analysis：必須直接寫出 current_pattern_label，再用第一大量區、第二大量區的相對位置、突破／跌破／回踩狀態、高低點結構與價量關係解釋原因；不得輸出兩個大量區的實際價格。
+6. 其中一點必須分析技術面：必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 required_price_volume_pattern_analysis.current_pattern_label；若使用大量區，只能描述相對位置、突破／跌破／回踩狀態、高低點結構與價量關係，不得輸出兩個大量區的實際價格。
 7. 另一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須寫成法人方向接近中性或買賣幅度有限，不得放大解讀。
 8. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。
 9. 每一點都必須獨立完整，以完整句號結束，不得使用省略號，不得讓下一點接續上一點，不得留下「上方存在、仍存在、是否、以及、並」這類看起來尚未說完的結尾。
@@ -8730,7 +8869,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v19_branch_perf_spacing_representative_repair",
+        cache_task="weekly_keypoints_ai_analysis_v20_technical_ma_representative_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8759,7 +8898,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並、上方存在、是否」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述，保留完整句子。
 7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
 8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；沒有代表性就不要硬寫。
-9. 若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
+9. 技術面必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 price_volume_pattern.current_pattern_label；若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
 10. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
 11. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
 12. 個別分點只能從 representative_buy_top5_with_history、representative_sell_top5_with_history 或 required_representative_branch_analysis 中挑選；不得點名 non_representative_top5_summary 所代表的小額分點。
@@ -8781,7 +8920,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v19_branch_perf_spacing",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v20_technical_ma",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -10697,13 +10836,37 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     label=label,
                     body=body,
                 )
+                if label == "技術面":
+                    # 技術面優先參考上方 K 線圖已計算出的均線 / 價量訊號，
+                    # 避免下方文字出現「重點待確認」或與「均線多頭排列」等圖上訊號矛盾。
+                    tech_card = _build_technical_card_summary(ctx)
+                    if tech_card:
+                        status = str(tech_card.get("headline", status) or status)
+                        body = str(tech_card.get("detail", body) or body)
                 body = _inject_branch_perf_into_warrant_body(label, status, body, s)
                 rows.append((label, status, body, 3))
                 if len(rows) >= 3:
                     break
+            tech_card = _build_technical_card_summary(ctx)
+            if tech_card and not any(str(r[0]) == "技術面" for r in rows):
+                tech_row = (
+                    "技術面",
+                    str(tech_card.get("headline", "技術訊號待確認") or "技術訊號待確認"),
+                    str(tech_card.get("detail", "目前技術訊號仍需確認。") or "目前技術訊號仍需確認。"),
+                    3,
+                )
+                if len(rows) < 3:
+                    rows.insert(0, tech_row)
+                else:
+                    replace_idx = 0
+                    for i, r in enumerate(rows):
+                        if str(r[0]) in ("新聞面", "重點面"):
+                            replace_idx = i
+                            break
+                    rows[replace_idx] = tech_row
             if not rows:
                 rows.append(("重點面", "重點待確認", "本週暫無足夠明確資料可整理成重點。", 2))
-            return rows
+            return rows[:3]
 
         def _format_news_status_sections(items):
             rows = []
