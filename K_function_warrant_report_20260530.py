@@ -10512,6 +10512,29 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rows.append(("新聞面", "題材仍待確認", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
             return rows[:2]
 
+        def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
+            """量測文字在目前 notes 軸中的寬度，讓「面向：結果」用冒號自然銜接，不再靠固定空格對齊。"""
+            try:
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+                ax_bbox = ax.get_window_extent(renderer=renderer)
+                if ax_bbox.width <= 0:
+                    return 0.0
+                tmp = ax.text(
+                    0, 0, str(text or ""),
+                    transform=ax.transAxes,
+                    fontsize=fontsize,
+                    fontweight=fontweight,
+                    ha="left",
+                    va="top",
+                    alpha=0,
+                )
+                bbox = tmp.get_window_extent(renderer=renderer)
+                tmp.remove()
+                return max(0.0, bbox.width / ax_bbox.width)
+            except Exception:
+                return 0.0
+
         def draw_status_note_items(
             sections,
             x_left,
@@ -10529,7 +10552,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ):
             y = y_start
             max_width_axes = max(0.05, x_right - x_left)
-            status_x = x_left + status_offset
             for idx, (label, status, body, max_lines) in enumerate(sections):
                 if y <= y_min:
                     break
@@ -10550,10 +10572,25 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 if not body_lines:
                     continue
 
+                # 改成「技術面：跌破轉弱趨勢明確」這種冒號式排列。
+                # 面向與冒號維持深藍，只有結果短句上色；底下說明維持原本文字色。
+                label_text = f"{label}："
+                label_width = _measure_text_width_axes(
+                    ax_notes,
+                    fig,
+                    label_text,
+                    fontsize=label_fontsize,
+                    fontweight="bold",
+                )
+                dynamic_status_x = x_left + label_width + 0.004
+                # 若量測失敗，才退回舊的 offset，避免圖片中斷。
+                if dynamic_status_x <= x_left + 0.010:
+                    dynamic_status_x = x_left + status_offset
+
                 ax_notes.text(
                     x_left,
                     y,
-                    label,
+                    label_text,
                     transform=ax_notes.transAxes,
                     color=GOLD,
                     fontsize=label_fontsize,
@@ -10564,7 +10601,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     zorder=6,
                 )
                 ax_notes.text(
-                    status_x,
+                    dynamic_status_x,
                     y,
                     status,
                     transform=ax_notes.transAxes,
