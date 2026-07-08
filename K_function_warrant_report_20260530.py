@@ -5176,16 +5176,16 @@ NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "90"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "160"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "150"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "2"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v2_newslike").strip() or "v2_newslike"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v3_report_structured").strip() or "v3_report_structured"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v2_newslike"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v3_report_structured"))
     return f"news_points_{safe_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -5200,7 +5200,7 @@ GEMINI_ENABLE = os.getenv("WARRANT_GEMINI_ENABLE", "1").strip().lower() not in (
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 GEMINI_RETRY_TIMES = int(os.getenv("WARRANT_GEMINI_RETRY_TIMES", "5"))
 GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
-NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
+NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "12"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 WEEKLY_KEYPOINT_MAX_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MAX_POINTS", "3"))
@@ -5209,8 +5209,8 @@ WEEKLY_KEYPOINT_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_TOT
 WEEKLY_KEYPOINT_MIN_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_POINTS", "3"))
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
 # 預設提高搜尋母體，避免部分冷門股因前幾篇原文被擋或 RSS 摘要太短而沒有新聞輸出。
-NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
-NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "8"))
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "36"))
+NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "10"))
 NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
 NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
 # 極速新聞模式：預設開啟。只使用 Google News RSS 的標題 / 摘要 / URL，不進新聞網站抓原文。
@@ -5241,18 +5241,18 @@ NEWS_MULTI_SOURCE_ENABLE = os.getenv("WARRANT_NEWS_MULTI_SOURCE_ENABLE", "1").st
 NEWS_YAHOO_RSS_ENABLE = os.getenv("WARRANT_NEWS_YAHOO_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_BING_RSS_ENABLE = os.getenv("WARRANT_NEWS_BING_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_MONEYDJ_SEARCH_ENABLE = os.getenv("WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "8"))
+NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "12"))
 NEWS_MONEYDJ_BODY_FETCH_LIMIT = int(os.getenv("WARRANT_NEWS_MONEYDJ_BODY_FETCH_LIMIT", "5"))
 NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
     "WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT",
-    str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 12)),
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 24)),
 ))
 # 新聞最低素材／顯示目標：正常情況至少整理 2 則不同事件；
 # 只有所有來源與 7/14/30 日範圍都查完後仍只有一個事件，才允許只顯示 1 則。
-NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "2")))
+NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "3")))
 # 公開資訊觀測站重大訊息補強：使用證交所 OpenAPI 的上市／上櫃每日重大訊息。
 NEWS_MOPS_ENABLE = os.getenv("WARRANT_NEWS_MOPS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "8")))
+NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "12")))
 NEWS_MOPS_ENDPOINTS = [
     ("上市重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"),
     ("上櫃重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_O"),
@@ -7560,7 +7560,11 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         print("⚠️ 沒有足夠且具體的公司新聞可送入 Gemini；不使用標題或盤勢新聞硬湊")
         return []
 
-    minimum_points = 2 if len(usable_articles) >= max(2, NEWS_MIN_DISTINCT_ARTICLES) else 1
+    minimum_points = min(
+        NEWS_SUMMARY_MAX_POINTS,
+        max(1, NEWS_MIN_DISTINCT_ARTICLES),
+        max(1, len(usable_articles)),
+    )
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
     prompt = f"""
@@ -7576,28 +7580,34 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 只有原始素材實際只有一個事件時才允許輸出一點；不同來源報導同一事件應合併，但必須繼續使用下一個不同事件補足。
 
 寫作要求：
-1. 每點開頭使用 4～8 個字短標籤與全形冒號，例如「業績更新：」「法人觀點：」「公司動態：」「報價動向：」。
-2. 每點約 50～100 個中文字，呈現「具體事件或數字 → 對公司營運或產業的可能影響」。
-3. 優先整理營收、EPS、毛利率、獲利、法說、財測、目標價與評等、接單、出貨、產能、產品、客戶、合作、報價與供需。
-4. 公開資訊觀測站的公司重大訊息可作為公司公告重點，但必須說明事件本身，不得只寫「公司發布公告」。
-5. ETF 納入／剔除成分股、定期換股、指數權重調整、被動資金加減碼或具體持股變化，若明確對應本公司，可視為代表性籌碼新聞。
-6. 單純介紹 ETF、推薦高股息 ETF、羅列多檔持股或沒有實際調整事件的內容，不得列為重點。
-7. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-8. 不得為了補足點數而拆分同一事件；應從下一則不同事件取材。
-9. 每一點必須是一則獨立完整的新聞摘要，不得讓後一點接續前一點未完成的句意。
-10. 每點必須以完整句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
-11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
-12. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
-13. 不得把其他公司的數字或題材套用到 {display_name}。
-14. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-15. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-16. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-17. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+1. 每點必須使用固定結構：「分類｜結論：...｜重點：...｜影響：...｜觀察：...」。
+2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」。
+3. 「結論」要放在最前面，讓讀者一眼看出這則新聞偏多、偏空、中性，或只是題材發酵。
+4. 「重點」必須寫出具體事件、數字、公告、法人觀點、報價、接單、出貨、產能、營收、EPS、毛利率、法說或產業供需。
+5. 「影響」要說明這件事對公司營運、產業位置、需求、報價、訂單或市場預期的可能影響。
+6. 「觀察」只能寫後續應追蹤的公開資訊，例如營收延續性、法說內容、報價變化、訂單能見度、公告後續，不得寫買賣建議。
+7. 每點 90～140 個中文字，資訊要完整，不要只寫一句空泛摘要。
+8. 最多輸出 3 點；若至少有 3 則不同合格事件，必須輸出 3 點。
+9. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
+10. 每一點必須是一則獨立完整的新聞觀察，不得讓後一點接續前一點未完成的句意。
+11. 每點必須以完整句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
+12. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
+13. 優先整理營收、EPS、毛利率、獲利、法說、財測、目標價與評等、接單、出貨、產能、產品、客戶、合作、報價與供需。
+14. 公開資訊觀測站的公司重大訊息可作為公司公告重點，但必須說明事件本身，不得只寫「公司發布公告」。
+15. ETF 納入／剔除成分股、定期換股、指數權重調整、被動資金加減碼或具體持股變化，若明確對應本公司，可視為代表性籌碼新聞。
+16. 單純介紹 ETF、推薦高股息 ETF、羅列多檔持股或沒有實際調整事件的內容，不得列為重點。
+17. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
+18. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須在同一句或相鄰句明確指向 {stock_code} {display_name}；無法確認就不要使用。
+19. 不得把其他公司的數字或題材套用到 {display_name}。
+20. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+21. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+22. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+23. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
   "points": [
-    "業績更新：具體新聞重點"
+    "業績更新｜結論：營運動能偏正向。｜重點：公司近期營收或獲利數字出現明確變化。｜影響：市場可能重新評估公司後續成長性。｜觀察：後續追蹤月營收延續性與法說會展望。"
   ],
   "note": "資料充足度的簡短內部說明"
 }}
@@ -7627,8 +7637,10 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你剛才替 {stock_code} {display_name} 整理的新聞重點不足。
 目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 3 點。
 每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
-每點 50～100 個中文字、完整句號結尾、不得使用省略號，也不得寫技術分析或買賣建議。
-請只回傳 JSON：{{"points":["第一點","第二點"]}}
+每點 90～140 個中文字，固定使用「分類｜結論：...｜重點：...｜影響：...｜觀察：...」格式。
+「結論」要先講結果，「重點」講新聞事實，「影響」講對公司或產業的可能影響，「觀察」講後續追蹤項目。
+不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
+請只回傳 JSON：{{"points":["分類｜結論：...｜重點：...｜影響：...｜觀察：..."]}}
 
 新聞素材 JSON：
 {article_json}
@@ -9924,7 +9936,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         elif len(news_show) == 2:
             news_fontsize, news_line_height, news_item_gap, news_max_lines = 33, 0.060, 0.040, 7
         else:
-            news_fontsize, news_line_height, news_item_gap, news_max_lines = notes_fontsize, notes_line_height, notes_item_gap, notes_max_lines
+            news_fontsize, news_line_height, news_item_gap, news_max_lines = 30, 0.054, 0.030, 7
         draw_note_items(
             news_show, 0.54, 0.52 + 0.57 - notes_right_padding, 0.775,
             fontsize=news_fontsize, line_height=news_line_height,
