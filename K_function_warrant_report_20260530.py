@@ -5237,12 +5237,12 @@ NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN",
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v9_cache_stable_headline_news").strip() or "v9_cache_stable_headline_news"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v10_colon_wrap_fix_news").strip() or "v10_colon_wrap_fix_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v9_cache_stable_headline_news"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v10_colon_wrap_fix_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
     internal_version = "validated_v10"
@@ -7693,18 +7693,19 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求延續」「法人看法仍分歧」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒。
 4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
 5. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
-6. 每點 50～82 個中文字，結果要明確，說明要精簡但有資料，不得寫成長篇段落。
-7. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點；即使有 3 則以上素材，也只挑最重要的 {NEWS_SUMMARY_MAX_POINTS} 點。
-8. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
-9. 每點必須獨立完整並以句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
-10. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
-11. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-12. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
-13. 不得把其他公司的數字或題材套用到 {display_name}。
-14. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-15. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-16. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-17. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+6. 每點 42～82 個中文字，結果要明確，說明限一句完整短句，約 34～58 個中文字，不得寫成長篇段落。
+7. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述。
+8. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點；即使有 3 則以上素材，也只挑最重要的 {NEWS_SUMMARY_MAX_POINTS} 點。
+9. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
+10. 每點必須獨立完整並以句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
+11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
+12. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
+13. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
+14. 不得把其他公司的數字或題材套用到 {display_name}。
+15. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+16. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+17. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+18. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
@@ -7740,7 +7741,8 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你剛才替 {stock_code} {display_name} 整理的新聞重點不足。
 目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 {NEWS_SUMMARY_MAX_POINTS} 點。
 每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
-每點 50～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
+每點 42～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
+「說明」限一句完整短句，約 34～58 個中文字，必須自然收尾並以句號結束；不得使用省略號，也不得留下看起來尚未說完的結尾。
 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；「說明」講新聞事實、可能影響與後續追蹤項目。
 不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
 請只回傳 JSON：{{"points":["分類｜結果：具體結論短句｜說明：新聞事實、影響與後續觀察"]}}
@@ -8587,12 +8589,12 @@ def _repair_weekly_expert_points(
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 50～92 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明要精簡但有資料依據，避免長篇段落超出圖片範圍。
+4. 每點 42～78 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 32～52 個中文字，避免長篇段落超出圖片範圍。
 5. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
 6. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
 7. 若分析代表性分點，必須使用本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數；沒有選擇分點則不必硬寫。
 8. 若分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
-9. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
+10. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
 10. 禁止單純羅列均線價格、KD或MACD；每點必須有比較、判斷與中立結論。
 11. 不得點名非代表性小額分點，不得放大解讀接近中性的法人數據。
 
@@ -8610,7 +8612,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v16_cache_layout_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v17_colon_wrap_fix_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8643,12 +8645,12 @@ def _repair_weekly_points_with_required_branch(
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 50～92 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明要精簡但有資料依據，避免長篇段落超出圖片範圍。
+4. 每點 42～78 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 32～52 個中文字，避免長篇段落超出圖片範圍。
 5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並依實際天數描述時間尺度。
 6. 其中一點必須分析 required_price_volume_pattern_analysis：必須直接寫出 current_pattern_label，再用第一大量區、第二大量區的相對位置、突破／跌破／回踩狀態、高低點結構與價量關係解釋原因；不得輸出兩個大量區的實際價格。
 7. 另一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須寫成法人方向接近中性或買賣幅度有限，不得放大解讀。
 8. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。
-9. 每一點都必須獨立完整，以完整句號結束，不得使用省略號，不得讓下一點接續上一點。
+9. 每一點都必須獨立完整，以完整句號結束，不得使用省略號，不得讓下一點接續上一點，不得留下看起來尚未說完的結尾。
 10. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
 
 請只回傳 JSON：
@@ -8665,7 +8667,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v16_cache_layout_representative_repair",
+        cache_task="weekly_keypoints_ai_analysis_v17_colon_wrap_fix_representative_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8690,16 +8692,17 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 2. 每一點都必須先給「面向」與「結果」，但「結果」要寫具體結論短句，不可只寫偏多、偏弱、中性觀察。
 3. 本週重點固定使用：「面向：技術面/權證面/法人面/新聞面｜結果：6～12字具體結論短句｜說明：一句具體資料依據」。
 4. 下週觀察固定使用：「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：下週需要確認的條件」。
-5. 每點 50～92 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明要具體但不可寫成長篇段落。
-6. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
-7. 若選擇寫代表性分點，必須使用該分點本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並說明籌碼品質或時間尺度；沒有代表性就不要硬寫。
-8. 若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
-9. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
-10. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
-11. 個別分點只能從 representative_buy_top5_with_history、representative_sell_top5_with_history 或 required_representative_branch_analysis 中挑選；不得點名 non_representative_top5_summary 所代表的小額分點。
-12. 禁止單純羅列 MA5、MA10、MA20、MA60 價格，禁止只寫 KD、MACD 或「觀察動能是否延續」等可套用任何股票的空泛文字。
-13. 每點必須獨立完整並以句號結束；不得使用省略號，不得以「此外」「另外」「前述」「相對地」等承接上一點的方式開頭。
-14. 所有數字都必須能在 JSON 中找到。若資料不足，就使用其他有根據的面向，不得自行創造內容。
+5. 每點 42～78 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 32～52 個中文字，不可寫成長篇段落。
+6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述。
+7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
+8. 若選擇寫代表性分點，必須使用該分點本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並說明籌碼品質或時間尺度；沒有代表性就不要硬寫。
+9. 若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
+10. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
+11. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
+12. 個別分點只能從 representative_buy_top5_with_history、representative_sell_top5_with_history 或 required_representative_branch_analysis 中挑選；不得點名 non_representative_top5_summary 所代表的小額分點。
+13. 禁止單純羅列 MA5、MA10、MA20、MA60 價格，禁止只寫 KD、MACD 或「觀察動能是否延續」等可套用任何股票的空泛文字。
+14. 每點必須獨立完整並以句號結束；不得使用省略號，不得以「此外」「另外」「前述」「相對地」等承接上一點的方式開頭。
+15. 所有數字都必須能在 JSON 中找到。若資料不足，就使用其他有根據的面向，不得自行創造內容。
 
 請只回傳 JSON，不要 markdown，不要其他說明：
 {{
@@ -8715,7 +8718,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v16_cache_layout",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v17_colon_wrap_fix",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -8818,7 +8821,7 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
     prompt = (
         f"請根據以下一週內新聞內文，整理 {stock_code} {stock_name} 的新聞重點。\n"
         "要求：\n"
-        "1. 最多輸出 3 點，每點 45 到 90 個中文字。\n"
+        "1. 最多輸出 3 點，每點 42 到 78 個中文字，說明必須是一句完整短句。\n"
         "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
         "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
         "4. 每點要像財經新聞摘要，格式盡量為「短標籤：具體事件／數字／市場消息 + 對公司或產業的影響」，不要寫成空泛研究報告。\n"
@@ -10190,7 +10193,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             fig.canvas.draw()
             renderer = fig.canvas.get_renderer()
             ax_bbox = ax.get_window_extent(renderer=renderer)
-            max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width * max(1.0, float(width_boost or 1.0))
+            # width_boost 只允許縮小有效寬度，避免文字量測寬度大於卡片實際寬度，造成右側被 clip 掉、看起來像句子沒寫完。
+            # 若需要每行少一點字，可傳入 0.95～0.99；不再使用 >1 的放大值。
+            safe_width_boost = float(width_boost or 1.0)
+            safe_width_boost = min(1.0, max(0.70, safe_width_boost))
+            max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width * safe_width_boost
 
             width_cache = {}
 
@@ -10226,6 +10233,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
             max_lines_int = int(max_lines or 0)
             if max_lines_int > 0 and len(lines) > max_lines_int:
+                # 超過可顯示行數時，只保留可完整呈現的行，並用句號收尾；不使用省略號。
+                # 主要的防線仍是在 Gemini prompt 與 _compact_card_sentence 先把內容壓短，避免畫面出現「句子被截斷」的感覺。
                 lines = lines[:max_lines_int]
                 lines[-1] = lines[-1].rstrip("；;，,、｜:： ")
                 if lines[-1] and lines[-1][-1] not in "。！？":
@@ -10456,7 +10465,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     else:
                         body = _strip_status_labels(s)
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
-                body = _compact_card_sentence(body, 150)
+                body = _compact_card_sentence(body, 112)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="重點待確認")
                 status = _compact_status_text(
@@ -10497,7 +10506,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         body_parts.append("影響：" + f.get("影響"))
                 body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
-                body = _compact_card_sentence(body, 168)
+                body = _compact_card_sentence(body, 132)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="題材仍待確認")
                 status = _compact_status_text(
@@ -10652,7 +10661,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             line_height=0.052,
             section_gap=0.038,
             status_offset=0.125,
-            body_width_boost=1.18,
+            body_width_boost=0.98,  # 避免右側被截斷，本週重點略保守換行
         )
 
         draw_status_note_items(
@@ -10667,7 +10676,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             line_height=0.052,
             section_gap=0.044,
             status_offset=0.125,
-            body_width_boost=1.22,
+            body_width_boost=0.95,  # 本週新聞每行略少一點字，避免貼邊或截斷
         )
 
     # x ticks
