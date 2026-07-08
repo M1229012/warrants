@@ -351,35 +351,96 @@ STATUS_BEAR_COLOR = GREEN     # 綠色：偏弱 / 賣方有利 / 資金流出
 STATUS_NEUTRAL_COLOR = GOLD   # 深藍色：中性 / 觀望 / 尚未確認方向，與標題主色一致
 
 
+def _has_negative_target_price_or_rating(text: str) -> bool:
+    """只在目標價 / 評等有明確負向語意時，才判定為負面。"""
+    t = _normalize_news_text(str(text or ""))
+    if not t:
+        return False
+    patterns = [
+        r"(調降|下修|下調|降低).{0,8}(目標價|評等|EPS|獲利預估|財測)",
+        r"(目標價|評等|EPS|獲利預估|財測).{0,8}(調降|下修|下調|降低)",
+        r"(降評|評等調降|賣出評等|減碼評等|劣於大盤|中立以下|目標價低於現價|低於現價|下看)",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+
+def _has_positive_target_price_or_rating(text: str) -> bool:
+    """只在目標價 / 評等有明確正向語意時，才判定為正面；單獨出現「目標價」不算。"""
+    t = _normalize_news_text(str(text or ""))
+    if not t:
+        return False
+    if _has_negative_target_price_or_rating(t):
+        return False
+    patterns = [
+        r"(調升|上修|上調|提高).{0,8}(目標價|評等|EPS|獲利預估|財測)",
+        r"(目標價|評等|EPS|獲利預估|財測).{0,8}(調升|上修|上調|提高)",
+        r"(升評|評等調升|買進評等|維持買進|重申買進|維持加碼|重申加碼|優於大盤)",
+        r"(券商看好|法人看好|法說看好)",
+        r"(上看|喊到|喊出)\s*\d",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+
+def _has_neutral_target_price_or_rating(text: str) -> bool:
+    """目標價 / 評等只有維持或不變時，維持中性，不染成紅色。"""
+    t = _normalize_news_text(str(text or ""))
+    if not t:
+        return False
+    if _has_positive_target_price_or_rating(t) or _has_negative_target_price_or_rating(t):
+        return False
+    patterns = [
+        r"(維持|持平|不變).{0,8}(目標價|評等)",
+        r"(目標價|評等).{0,8}(維持|持平|不變)",
+        r"(維持中立|維持持有|中立評等|持有評等)",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+
 def get_report_status_color(status_text: str) -> str:
     """依台股閱讀習慣回傳結論文字顏色。
 
     只讓「結果文字」上色，底下詳細說明維持原本 TEXT / MUTED 顏色。
-    顏色規則固定三種：紅色=偏多、綠色=偏弱、深藍=中性。
+    顏色規則固定三種：紅色=正面/偏多，綠色=負面/偏弱，深藍=中性。
     """
-    s = str(status_text or "").strip()
+    s = _normalize_news_text(str(status_text or "")).strip()
     if not s:
         return STATUS_NEUTRAL_COLOR
 
     # 台股週報閱讀邏輯：營收「年增但月減」代表基本面仍有成長，
-    # 圖卡結論先視為偏正向；月減放在說明文字提醒即可，不把結果染成綠色。
+    # 圖卡結論先視為偏正向；月減只放在說明文字提醒。
     if "營收" in s and "年增" in s and "月減" in s:
         return STATUS_BULL_COLOR
 
-    bear_keywords = [
-        "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節", "偏賣",
-        "資金流出", "跌破", "壓力", "下修", "年減", "負向",
-    ]
+    # 目標價 / 評等要看前後語意，不能因為單獨出現「目標價」就判紅色。
+    if _has_negative_target_price_or_rating(s):
+        return STATUS_BEAR_COLOR
+    if _has_positive_target_price_or_rating(s):
+        return STATUS_BULL_COLOR
+    if _has_neutral_target_price_or_rating(s):
+        return STATUS_NEUTRAL_COLOR
+
     bull_keywords = [
         "偏多", "轉強", "強勢", "買方", "買超", "偏買", "積極偏買", "積極買", "買盤", "承接", "加碼",
-        "資金流入", "站回", "突破", "支撐", "上修", "年增", "月增",
-        "正向", "發酵", "看旺", "受惠", "成長", "需求強勁", "需求延續", "需求強", "題材強",
+        "資金流入", "淨流入", "站回", "突破", "支撐", "上修", "調升", "上調", "年增", "月增",
+        "正向", "利多", "傳捷報", "捷報", "看好", "看旺", "樂觀", "受惠", "成長", "增長", "推升",
+        "需求強勁", "需求延續", "需求強", "題材強", "訂單", "接單", "出貨增", "擴產", "新產能",
+        "評等調升", "買進評等", "營運看旺", "展望正向", "獲利成長", "EPS上修", "毛利率改善",
+        "AI散熱需求強勁", "AI散熱需求延續", "液冷需求", "營收表現偏正向", "公司動態偏正向", "市場預期上修",
+    ]
+    bear_keywords = [
+        "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節", "偏賣", "減碼",
+        "資金流出", "淨流出", "跌破", "失守", "壓力", "下修", "調降", "下調", "年減", "負向", "利空",
+        "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
     ]
 
+    # 先處理明確負面；但月減若伴隨年增，前面已視為偏正向。
+    if any(k in s for k in bear_keywords) or ("月減" in s and "年增" not in s):
+        # 若同一句同時有明確利多與負面字，除非是跌破/賣壓/調降這類強負面，否則讓正面主題優先。
+        strong_bear = any(k in s for k in ["跌破", "失守", "賣壓", "資金流出", "淨流出", "調降", "下修", "利空", "年減"])
+        if strong_bear or not any(k in s for k in bull_keywords):
+            return STATUS_BEAR_COLOR
     if any(k in s for k in bull_keywords):
         return STATUS_BULL_COLOR
-    if any(k in s for k in bear_keywords) or ("月減" in s and "年增" not in s):
-        return STATUS_BEAR_COLOR
     return STATUS_NEUTRAL_COLOR
 
 # 中央浮水印設定：圖片偏長，因此上下各放一個淡浮水印
@@ -5239,15 +5300,15 @@ NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN",
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v11_final_text_fix_news").strip() or "v11_final_text_fix_news"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v13_target_price_careful_news").strip() or "v13_target_price_careful_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v11_final_text_fix_news"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v13_target_price_careful_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v11_final_text_fix"
+    internal_version = "validated_v13_target_price_careful"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -7692,7 +7753,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 寫作要求：
 1. 每點必須使用固定結構：「分類｜結果：...｜說明：...」。
 2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」。
-3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求強勁」「法人看法仍分歧」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材明確指出 AI 散熱需求強、需求延續或營運看旺，結果請寫「AI散熱需求強勁」。
+3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求強勁」「公司動態偏正向」「市場預期偏正向」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材明確指出 AI 散熱需求強、需求延續或營運看旺，結果請寫「AI散熱需求強勁」；若素材出現傳捷報、接單、訂單、取得新案，結果請寫「公司動態偏正向」；若素材出現券商看好、法說看好、目標價調升/上修、評等調升或上修，結果請寫「市場預期偏正向」；若只是提到目標價但沒有調升、上修、買進或看好等正向語意，不得判定為正面。
 4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
 5. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
 6. 每點 40～76 個中文字，結果要明確，說明限一句完整短句，約 28～48 個中文字，不得寫成長篇段落。
@@ -7745,7 +7806,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
 每點 42～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
 「說明」限一句完整短句，約 28～48 個中文字，必須自然收尾並以句號結束；不得使用省略號，也不得留下看起來尚未說完的結尾。
-「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；「說明」講新聞事實、可能影響與後續追蹤項目。
+「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材出現傳捷報、接單、訂單、券商看好、法說看好、目標價調升/上修、評等調升或上修，結果要寫成正面具體結論；若只是提到目標價但沒有明確調升、上修、買進或看好，不得判定為正面；「說明」講新聞事實、可能影響與後續追蹤項目。
 不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
 請只回傳 JSON：{{"points":["分類｜結果：具體結論短句｜說明：新聞事實、影響與後續觀察"]}}
 
@@ -8987,6 +9048,20 @@ def _infer_news_headline(label: str, text: str) -> str:
     """新聞卡第一行的具體短結論；避免只顯示偏多/偏弱或被月減誤判成綠色。"""
     s = _normalize_news_text(text)
     label_s = str(label or "")
+    if _has_negative_target_price_or_rating(s):
+        return "市場預期轉弱"
+    if _has_positive_target_price_or_rating(s):
+        return "市場預期偏正向"
+    if _has_neutral_target_price_or_rating(s):
+        return "法人看法待確認"
+    if any(k in s for k in ["傳捷報", "捷報", "接單", "訂單", "新加坡", "取得訂單", "新增訂單"]):
+        return "公司動態偏正向"
+    if any(k in s for k in ["看好", "看旺", "評等調升", "上修", "調升", "法說看好", "未來展望"]):
+        return "市場預期偏正向"
+    if any(k in s for k in ["利多", "受惠", "需求強勁", "需求延續", "AI散熱", "液冷"]):
+        return "AI散熱需求強勁"
+    if _has_negative_target_price_or_rating(s) or any(k in s for k in ["調降", "下修", "看壞", "利空", "需求疲弱"]):
+        return "市場預期轉弱"
     if "營收" in s:
         if "年增" in s and "月減" in s:
             return "營收表現偏正向"
@@ -8998,7 +9073,7 @@ def _infer_news_headline(label: str, text: str) -> str:
     if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
         return "AI散熱需求強勁"
     if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
-        if any(k in s for k in ["調升", "上修", "看旺", "目標價"]):
+        if _has_positive_target_price_or_rating(s) or any(k in s for k in ["調升", "上修", "看旺"]):
             return "市場預期偏正向"
         return "法人看法待確認"
     if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|接單|出貨|客戶", s):
@@ -10368,6 +10443,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         GENERIC_STATUS_WORDS = {
             "偏多", "中性偏多", "偏多觀察", "偏弱", "中性偏弱", "偏弱整理", "偏弱觀察",
             "中性", "中性觀察", "觀望", "待確認", "方向未明", "仍待確認", "偏正向", "偏負向", "正向", "負向",
+            "題材仍待確認", "重點待確認", "新聞重點待確認", "公司動態待驗證", "法人看法待確認",
+            "法說展望待確認", "業績表現待確認", "產業題材待確認", "題材熱度待確認", "公司動態待確認",
         }
 
         def _is_generic_status_phrase(text: str) -> bool:
@@ -10391,6 +10468,18 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             merged = label_s + "｜" + s
             if not s:
                 return fallback
+
+            # 正負面新聞與公司事件優先轉成具體重點短句，避免只顯示「題材仍待確認」。
+            if any(k in merged for k in ["傳捷報", "捷報", "接單", "訂單", "新加坡", "取得訂單", "新增訂單"]):
+                return "公司動態偏正向"
+            if _has_positive_target_price_or_rating(merged) or any(k in merged for k in ["看好", "看旺", "評等調升", "調升", "上修", "法說看好", "未來展望"]):
+                return "市場預期偏正向"
+            if _has_neutral_target_price_or_rating(merged):
+                return "法人看法待確認"
+            if any(k in merged for k in ["AI散熱", "散熱需求", "液冷", "需求強勁", "需求延續", "營運看旺"]):
+                return "AI散熱需求強勁"
+            if _has_negative_target_price_or_rating(merged) or any(k in merged for k in ["利空", "調降", "下修", "看壞", "需求疲弱", "年減", "衰退"]):
+                return "市場預期轉弱"
 
             if "下週" in label_s or "下週" in merged:
                 if any(k in merged for k in ["站回", "突破", "轉強"]):
@@ -10469,9 +10558,21 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             s = str(text or "")
             if "營收" in s and "年增" in s and "月減" in s:
                 return "偏多"
-            if any(k in s for k in ["轉強", "買超", "資金流入", "站回", "突破", "月增", "年增", "正向"]):
+            if _has_negative_target_price_or_rating(s):
+                return "偏弱"
+            if _has_positive_target_price_or_rating(s):
                 return "偏多"
-            if any(k in s for k in ["轉弱", "賣壓", "跌破", "資金流出", "賣超", "年減"]):
+            if _has_neutral_target_price_or_rating(s):
+                return "中性觀察"
+            if any(k in s for k in [
+                "轉強", "買超", "資金流入", "淨流入", "站回", "突破", "月增", "年增", "正向",
+                "利多", "傳捷報", "捷報", "看好", "看旺", "調升", "上修", "評等調升",
+                "接單", "訂單", "受惠", "成長", "需求強勁", "需求延續", "AI散熱", "液冷", "營運看旺",
+            ]):
+                return "偏多"
+            if _has_negative_target_price_or_rating(s) or any(k in s for k in [
+                "轉弱", "賣壓", "跌破", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
+            ]):
                 return "偏弱"
             if "月減" in s and "年增" not in s:
                 return "偏弱"
