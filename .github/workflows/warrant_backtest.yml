@@ -29,8 +29,8 @@ jobs:
       CACHE_DIR: warrant_cache
 
       # 只保留兩種方案：
-      # 1. 精選5分點當日買賣超產圖：每日盤後快速模式，只抓最新資料、產生 今日_A/B/C/D 給圖片使用。
-      # 2. 完整資料回補與回測：其他時間手動完整補歷史、重算 A/B/C/D、勝率、排行與完整價格。
+      # 1. 精選5分點當日買賣超產圖：每日盤後快速模式，只抓最新資料、產生 今日_A/B/C/D/E 給圖片使用。
+      # 2. 完整資料回補與回測：其他時間手動完整補歷史、重算 A/B/C/D/E、勝率、排行與完整價格。
       RUN_PLAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && 'full_report' || 'daily_signal' }}
 
       # 基本快取設定
@@ -53,7 +53,7 @@ jobs:
       # 每次都重新抓 OpenAPI + API4，避免錯過今天新權證。
       ACTIVE_WARRANT_FORCE_REFRESH: "1"
 
-      # 每日產圖模式：每組候選只抓最近 12 筆 API5，足夠判斷 A/B/C/D 今日訊號。
+      # 每日產圖模式：每組候選只抓最近 12 筆 API5，足夠判斷 A/B/C/D/E 今日訊號。
       DAILY_SIGNAL_API5_DAYS: "12"
 
       # 完整回補模式：新候選抓完整歷史；既有候選補最近 5 筆。
@@ -89,12 +89,15 @@ jobs:
       # Google Sheet 設定
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
-      GSHEET_NAME: "權證分點籌碼"
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
+      GSHEET_NAME: "權證分點資料_NEW"
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW"
       GSHEET_CACHE_ENABLED: "1"
       GSHEET_RESULT_ENABLED: "1"
 
-      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
+
+      # Supabase 設定
+      SUPABASE_CACHE_ENABLED: "0"
 
       # 執行緒設定
       MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '60' || '80' }}
