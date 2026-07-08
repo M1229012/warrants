@@ -314,16 +314,13 @@ API4_SECOND_PASS_WAIT = float(os.getenv("WARRANT_API4_SECOND_PASS_WAIT", "5"))
 API4_HISTORY_FAILURE_AS_EMPTY = os.getenv("WARRANT_API4_HISTORY_FAILURE_AS_EMPTY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
-LLM_CACHE_ENABLE = (
-    os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-    and not REPORT_LIVE_ONLY
-)
+# 注意：純 Live 模式只禁止交易資料快取；Gemini 文字快取仍應依 ACTION 參數運作。
+# 因此當 WARRANT_LLM_CACHE_FORCE_REFRESH=0 時，同股票同任務同一天會優先使用當日快取；
+# 設為 1 時才會跳過快取並重新呼叫 Gemini。
+LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_cache"
 # Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
-GSHEET_LLM_CACHE_ENABLE = (
-    os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-    and not REPORT_LIVE_ONLY
-)
+GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
 LLM_CACHE_FORCE_REFRESH = os.getenv("WARRANT_LLM_CACHE_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -364,20 +361,25 @@ def get_report_status_color(status_text: str) -> str:
     if not s:
         return STATUS_NEUTRAL_COLOR
 
+    # 台股週報閱讀邏輯：營收「年增但月減」代表基本面仍有成長，
+    # 圖卡結論先視為偏正向；月減放在說明文字提醒即可，不把結果染成綠色。
+    if "營收" in s and "年增" in s and "月減" in s:
+        return STATUS_BULL_COLOR
+
     bear_keywords = [
         "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節",
-        "資金流出", "跌破", "壓力", "下修", "月減", "年減", "負向",
+        "資金流出", "跌破", "壓力", "下修", "年減", "負向",
     ]
     bull_keywords = [
         "偏多", "轉強", "強勢", "買方", "買超", "加碼",
         "資金流入", "站回", "突破", "支撐", "上修", "年增", "月增",
-        "正向", "發酵", "看旺", "受惠",
+        "正向", "發酵", "看旺", "受惠", "成長",
     ]
 
-    if any(k in s for k in bear_keywords):
-        return STATUS_BEAR_COLOR
     if any(k in s for k in bull_keywords):
         return STATUS_BULL_COLOR
+    if any(k in s for k in bear_keywords) or ("月減" in s and "年增" not in s):
+        return STATUS_BEAR_COLOR
     return STATUS_NEUTRAL_COLOR
 
 # 中央浮水印設定：圖片偏長，因此上下各放一個淡浮水印
@@ -917,13 +919,21 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
     當天再跑就直接使用該輸出，不再呼叫 Gemini。PromptHash 只保留作檢查紀錄，
     不拿來阻擋當日快取命中。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
         return ""
     if not task or not stock_code:
         return ""
     key = _gsheet_llm_cache_key(task, stock_code)
     try:
-        df = read_gsheet_worksheet(GSHEET_LLM_CACHE_SHEET)
+        sh = _open_gsheet()
+        if sh is None:
+            return ""
+        try:
+            ws = sh.worksheet(GSHEET_LLM_CACHE_SHEET)
+        except Exception:
+            return ""
+        records = ws.get_all_records(empty2zero=False, head=1)
+        df = pd.DataFrame(records).fillna("") if records else pd.DataFrame()
         if df is None or df.empty or "快取鍵" not in df.columns or "Gemini輸出" not in df.columns:
             return ""
         matched = df[df["快取鍵"].astype(str) == key].copy()
@@ -946,7 +956,7 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
 
 def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: str, output_text: str):
     """將 Gemini 原始輸出寫回 Google Sheet，供同日重跑直接重用。"""
-    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or not output_text:
+    if not GSHEET_LLM_CACHE_ENABLE or not output_text:
         return
     if not task or not stock_code:
         return
@@ -5223,16 +5233,16 @@ NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "2"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "2"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "110"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "125"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v8_headline_detail_news").strip() or "v8_headline_detail_news"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v9_cache_stable_headline_news").strip() or "v9_cache_stable_headline_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v8_headline_detail_news"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v9_cache_stable_headline_news"))
     return f"news_points_{safe_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -7634,7 +7644,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 寫作要求：
 1. 每點必須使用固定結構：「分類｜結果：...｜說明：...」。
 2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」。
-3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「營收年增但月減」「AI散熱需求延續」「法人看法仍分歧」。
+3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求延續」「法人看法仍分歧」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒。
 4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
 5. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
 6. 每點 50～82 個中文字，結果要明確，說明要精簡但有資料，不得寫成長篇段落。
@@ -7684,7 +7694,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 {NEWS_SUMMARY_MAX_POINTS} 點。
 每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
 每點 50～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
-「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；「說明」講新聞事實、可能影響與後續追蹤項目。
+「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；「說明」講新聞事實、可能影響與後續追蹤項目。
 不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
 請只回傳 JSON：{{"points":["分類｜結果：具體結論短句｜說明：新聞事實、影響與後續觀察"]}}
 
@@ -8542,7 +8552,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v15_headline_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v16_cache_layout_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8597,7 +8607,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v15_headline_representative_repair",
+        cache_task="weekly_keypoints_ai_analysis_v16_cache_layout_representative_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8647,7 +8657,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v15_headline",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v16_cache_layout",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -8854,9 +8864,9 @@ def _infer_news_conclusion(label: str, text: str) -> str:
         has_month_down = re.search(r"月減|月衰退|月增率-|-\d+(?:\.\d+)?%", s)
         has_month_up = re.search(r"月增|月成長", s) and not has_month_down
         if has_year_up and has_month_down:
-            return "營收年增但月減，短線解讀偏中性。"
+            return "營收表現偏正向，月減留待後續觀察。"
         if has_year_up or has_month_up:
-            return "營收動能仍偏正向。"
+            return "營收表現偏正向。"
         return "營收變化是本週主要基本面訊息。"
     if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
         return "AI散熱題材仍是市場焦點。"
@@ -8880,10 +8890,11 @@ def _infer_news_watch(label: str, text: str) -> str:
     return "追蹤後續公告與營運數字驗證。"
 
 
-def _compact_news_fact_text(text: str, max_len: int = 42) -> str:
+def _compact_news_fact_text(text: str, max_len: int = 54) -> str:
     s = _normalize_news_text(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip("。；;，, ")
-    s = re.sub(r"^(焦點股|個股|台股|盤中|盤後)[:：]?", "", s).strip()
+    s = re.sub(r"^(焦點股|個股|台股|盤中|盤後|標題)[:：]?", "", s).strip()
+    s = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", s).strip()
     # 優先保留含數字或基本面關鍵字的片段。
     parts = _split_news_sentences(s) or [s]
     scored = []
@@ -8909,6 +8920,33 @@ def _compact_news_fact_text(text: str, max_len: int = 42) -> str:
     return s.strip("。；;，, ")
 
 
+def _infer_news_headline(label: str, text: str) -> str:
+    """新聞卡第一行的具體短結論；避免只顯示偏多/偏弱或被月減誤判成綠色。"""
+    s = _normalize_news_text(text)
+    label_s = str(label or "")
+    if "營收" in s:
+        if "年增" in s and "月減" in s:
+            return "營收表現偏正向"
+        if any(k in s for k in ["年增", "月增", "成長", "創高", "同期高"]):
+            return "營收表現偏正向"
+        if any(k in s for k in ["年減", "月減", "衰退"]):
+            return "營收動能轉弱"
+        return "營收變化待追蹤"
+    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
+        return "AI散熱需求延續"
+    if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
+        if any(k in s for k in ["調升", "上修", "看旺", "目標價"]):
+            return "市場預期偏正向"
+        return "法人看法待確認"
+    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|接單|出貨|客戶", s):
+        return "公司動態待驗證"
+    if "業績" in label_s:
+        return "業績表現待確認"
+    if "產業" in label_s or "題材" in label_s:
+        return "題材熱度待確認"
+    return "新聞重點待確認"
+
+
 def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: str) -> str:
     """規則式備援：輸出可直接放入圖片的「分類｜結論｜重點｜觀察」短格式。"""
     s = _normalize_news_text(sentence)
@@ -8918,12 +8956,13 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
         return ""
 
     label = _infer_news_label_from_text(s, fallback_label=label)
-    fact = _compact_news_fact_text(s, max_len=42)
+    fact = _compact_news_fact_text(s, max_len=54)
     if not fact:
         return ""
-    conclusion = _infer_news_conclusion(label, s)
-    watch = _infer_news_watch(label, s)
-    point = f"{label}｜結論：{conclusion}｜重點：{fact}。｜觀察：{watch}"
+    headline = _infer_news_headline(label, s)
+    watch = _infer_news_watch(label, s).replace("追蹤", "後續看", 1)
+    detail = f"{fact}；{watch}"
+    point = f"{label}｜結果：{headline}｜說明：{detail}"
     point = _trim_news_point(point, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
     if not point or _is_bad_news_sentence(point):
         return ""
@@ -8994,7 +9033,7 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     流程會在 build_news_points() 提早 return，導致永遠不會讀到 Google Sheet 快取。
     這個函式放在 build_news_points() 前面直接查快取，確保當天跑過的新聞摘要能直接被圖片使用。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_FALLBACK_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
         return []
     stock_key = _clean_code(stock_code)
     if not stock_key:
@@ -9011,7 +9050,15 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
         return []
 
     try:
-        df = read_gsheet_worksheet(GSHEET_LLM_CACHE_SHEET)
+        sh = _open_gsheet()
+        if sh is None:
+            return []
+        try:
+            ws = sh.worksheet(GSHEET_LLM_CACHE_SHEET)
+        except Exception:
+            return []
+        records = ws.get_all_records(empty2zero=False, head=1)
+        df = pd.DataFrame(records).fillna("") if records else pd.DataFrame()
         if df is None or df.empty or "Gemini輸出" not in df.columns:
             return []
 
@@ -10030,7 +10077,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
         notes_right_padding = 0.025
 
-        def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=0, first_prefix="", next_prefix=""):
+        def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=0, first_prefix="", next_prefix="", width_boost=1.0):
             """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
             s = str(text or "").strip()
             if not s:
@@ -10039,7 +10086,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             fig.canvas.draw()
             renderer = fig.canvas.get_renderer()
             ax_bbox = ax.get_window_extent(renderer=renderer)
-            max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width
+            max_width_px = max(float(max_width_axes), 0.01) * ax_bbox.width * max(1.0, float(width_boost or 1.0))
 
             width_cache = {}
 
@@ -10244,7 +10291,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
             if any(k in label_s for k in ["業績", "新聞", "產業", "題材", "公司", "法人觀點"]):
                 if "營收" in merged and "年增" in merged and "月減" in merged:
-                    return "營收年增但月減"
+                    return "營收表現偏正向"
                 if "營收" in merged and any(k in merged for k in ["年增", "月增", "成長"]):
                     return "營收表現偏正向"
                 if any(k in merged for k in ["AI", "散熱", "液冷"]):
@@ -10268,10 +10315,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         def _infer_status_from_text(text, fallback="重點待確認"):
             # 保留舊呼叫相容性；實際顯示時會再由 _compact_status_text 轉成具體短句。
             s = str(text or "")
-            if any(k in s for k in ["轉弱", "賣壓", "跌破", "資金流出", "賣超", "月減", "年減"]):
-                return "偏弱"
+            if "營收" in s and "年增" in s and "月減" in s:
+                return "偏多"
             if any(k in s for k in ["轉強", "買超", "資金流入", "站回", "突破", "月增", "年增", "正向"]):
                 return "偏多"
+            if any(k in s for k in ["轉弱", "賣壓", "跌破", "資金流出", "賣超", "年減"]):
+                return "偏弱"
+            if "月減" in s and "年增" not in s:
+                return "偏弱"
             if any(k in s for k in ["中性", "觀望", "待確認", "有限", "接近中性"]):
                 return "中性觀察"
             return fallback
@@ -10300,12 +10351,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         body = "；".join([x for x in [f.get("條件"), f.get("追蹤")] if x])
                     else:
                         body = _strip_status_labels(s)
-                body = _compact_card_sentence(body, 132)
+                body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
+                body = _compact_card_sentence(body, 150)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="重點待確認")
                 status = _compact_status_text(
                     raw_status,
-                    max_chars=13,
+                    max_chars=16,
                     fallback="重點待確認" if label != "下週觀察" else "先看止跌訊號",
                     label=label,
                     body=body,
@@ -10340,12 +10392,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     elif f.get("影響"):
                         body_parts.append("影響：" + f.get("影響"))
                 body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
-                body = _compact_card_sentence(body, 140)
+                body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
+                body = _compact_card_sentence(body, 152)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="題材仍待確認")
                 status = _compact_status_text(
                     raw_status,
-                    max_chars=13,
+                    max_chars=16,
                     fallback="題材仍待確認",
                     label=label,
                     body=body,
@@ -10368,6 +10421,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             section_gap=0.038,
             status_offset=0.140,
             y_min=0.060,
+            body_width_boost=1.0,
         ):
             y = y_start
             max_width_axes = max(0.05, x_right - x_left)
@@ -10387,6 +10441,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     max_lines=max_lines,
                     first_prefix="",
                     next_prefix="",
+                    width_boost=body_width_boost,
                 )
                 if not body_lines:
                     continue
@@ -10449,13 +10504,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             0.04,
             0.500,
             0.775,
-            body_fontsize=32,
+            body_fontsize=31,
             label_fontsize=35,
-            status_fontsize=38,
-            header_gap=0.062,
-            line_height=0.053,
-            section_gap=0.040,
+            status_fontsize=36,
+            header_gap=0.060,
+            line_height=0.052,
+            section_gap=0.038,
             status_offset=0.125,
+            body_width_boost=1.10,
         )
 
         draw_status_note_items(
@@ -10463,13 +10519,14 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             0.54,
             0.995,
             0.775,
-            body_fontsize=32,
+            body_fontsize=31,
             label_fontsize=35,
-            status_fontsize=38,
-            header_gap=0.062,
-            line_height=0.053,
-            section_gap=0.046,
+            status_fontsize=36,
+            header_gap=0.060,
+            line_height=0.052,
+            section_gap=0.044,
             status_offset=0.125,
+            body_width_boost=1.12,
         )
 
     # x ticks
