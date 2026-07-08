@@ -5651,11 +5651,26 @@ def _normalize_chinese_numbers_for_news(text: str) -> str:
     )
 
     # 十二億元、六月、一百二十家 → 12億元、6月、120家。
+    # 注意：前一段會先把「十二點零六億元」轉成「12.06億元」。
+    # 這裡不能再把「億元」中的「億」當成中文數字轉成 0，
+    # 否則會誤變成「12.060元」，造成億元單位消失。
     s = re.sub(
-        rf"(?<!第)(?P<num>[{_CN_NUMERAL_CHARS}]+)(?=\s*{unit_pattern})",
+        rf"(?<![第0-9.])(?P<num>[{_CN_NUMERAL_CHARS}]+)(?=\s*{unit_pattern})",
         lambda m: _format_chinese_numeral_number(m.group("num")),
         s,
     )
+
+    # 舊快取若已被前一版誤轉成「12.060元 / 12.60元」，
+    # 且前文明確是營收、訂單、接單、合約、工程金額等金額語境，
+    # 顯示前補回「億元」，避免圖卡繼續出現單位消失的文字。
+    def _repair_bad_billion_unit(m):
+        start = m.start()
+        ctx = s[max(0, start - 22): start]
+        if any(k in ctx for k in ["營收", "收入", "訂單", "接單", "合約", "工程", "金額", "新台幣", "投資", "標案", "採購"]):
+            return f"{m.group('num')}億元"
+        return m.group(0)
+
+    s = re.sub(r"(?P<num>\d+\.\d{1,3})0元", _repair_bad_billion_unit, s)
     return s
 
 
