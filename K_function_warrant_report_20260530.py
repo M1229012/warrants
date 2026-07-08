@@ -499,13 +499,14 @@ def get_report_status_color(status_text: str) -> str:
     bear_keywords = [
         "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節", "偏賣", "減碼",
         "資金流出", "淨流出", "跌破", "失守", "壓力", "下修", "調降", "下調", "年減", "負向", "利空",
-        "死亡交叉", "死叉", "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
+        "空頭", "空頭排列", "均線空頭", "均線空頭排列", "均線空頭排列延續",
+        "死亡交叉", "均線死亡交叉", "死叉", "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
     ]
 
     # 先處理明確負面；但月減若伴隨年增，前面已視為偏正向。
     if any(k in s for k in bear_keywords) or ("月減" in s and "年增" not in s):
         # 若同一句同時有明確利多與負面字，除非是跌破/賣壓/調降這類強負面，否則讓正面主題優先。
-        strong_bear = any(k in s for k in ["跌破", "失守", "賣壓", "資金流出", "淨流出", "調降", "下修", "利空", "年減", "死亡交叉", "死叉"])
+        strong_bear = any(k in s for k in ["跌破", "失守", "賣壓", "資金流出", "淨流出", "調降", "下修", "利空", "年減", "空頭", "空頭排列", "均線空頭", "死亡交叉", "均線死亡交叉", "死叉"])
         if strong_bear or not any(k in s for k in bull_keywords):
             return STATUS_BEAR_COLOR
     if any(k in s for k in bull_keywords):
@@ -5369,15 +5370,15 @@ NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN",
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v13_target_price_careful_news").strip() or "v13_target_price_careful_news"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v14_bear_topic_fix_news").strip() or "v14_bear_topic_fix_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v13_target_price_careful_news"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v14_bear_topic_fix_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v13_target_price_careful"
+    internal_version = "validated_v14_bear_topic_fix"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -8860,7 +8861,7 @@ def _repair_weekly_expert_points(
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
+4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
 5. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
 6. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
 7. 若分析代表性分點、精選五分點，或結果短句點名分點，必須使用本週方向、金額、歷史勝率、平均持有天數與歷史加權報酬率；沒有選擇分點則不必硬寫。
@@ -8883,7 +8884,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v21_branch_color_rule_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v22_bear_topic_fix_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8916,7 +8917,7 @@ def _repair_weekly_points_with_required_branch(
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
+4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
 5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、平均持有天數、歷史加權報酬率，並依實際天數描述時間尺度；若是精選五分點積極買超，結果短句請直接寫「分點名稱＋積極偏買」。
 6. 其中一點必須分析技術面：必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 required_price_volume_pattern_analysis.current_pattern_label；若使用大量區，只能描述相對位置、突破／跌破／回踩狀態、高低點結構與價量關係，不得輸出兩個大量區的實際價格。
 7. 另一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須寫成法人方向接近中性或買賣幅度有限，不得放大解讀。
@@ -8938,7 +8939,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v21_branch_color_rule_repair",
+        cache_task="weekly_keypoints_ai_analysis_v22_bear_topic_fix_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8963,7 +8964,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 2. 每一點都必須先給「面向」與「結果」，但「結果」要寫具體結論短句，不可只寫偏多、偏弱、中性觀察。
 3. 本週重點固定使用：「面向：技術面/權證面/法人面/新聞面｜結果：6～12字具體結論短句｜說明：一句具體資料依據」。若寫精選五分點，或事件數超過50筆且歷史勝率80%以上的代表性分點買超，結果可直接寫「元大南屯積極偏買」這類分點結論；其他分點請用「權證資金流入」等中性結果，不要用積極偏買。
 4. 下週觀察固定使用：「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：下週需要確認的條件」。
-5. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，不可寫成長篇段落。
+5. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，不可寫成長篇段落。
 6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並、上方存在、是否」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述，保留完整句子。
 7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
 8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；只有精選五分點或事件數超過50筆且歷史勝率80%以上者，才可使用積極偏買語氣；沒有代表性就不要硬寫。
@@ -8989,7 +8990,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v21_branch_color_rule",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v22_bear_topic_fix",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -9278,19 +9279,23 @@ def _infer_news_headline(label: str, text: str) -> str:
         if any(k in s for k in ["年減", "月減", "衰退"]):
             return "營收動能轉弱"
         return "營收變化待追蹤"
-    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
+    if re.search(r"AI|伺服器|散熱|液冷|水冷|GPU|ASIC", s, re.I):
         return "AI散熱需求強勁"
+    if re.search(r"研發|平台|新應用|新產品|推出|開發", s):
+        return "產品布局待追蹤"
     if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
         if _has_positive_target_price_or_rating(s) or any(k in s for k in ["調升", "上修", "看旺"]):
             return "市場預期偏正向"
         return "法人看法待確認"
-    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|接單|出貨|客戶", s):
-        return "公司動態待驗證"
+    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|接單|出貨|客戶|研發|平台|新應用|新產品|推出|開發", s):
+        return "公司動態待追蹤"
     if "業績" in label_s:
-        return "業績表現待確認"
+        return "業績表現待觀察"
+    if "公司" in label_s:
+        return "公司動態待追蹤"
     if "產業" in label_s or "題材" in label_s:
-        return "題材熱度待確認"
-    return "新聞重點待確認"
+        return "題材熱度待觀察"
+    return "新聞事件待追蹤"
 
 
 def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: str) -> str:
@@ -10652,7 +10657,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             "偏多", "中性偏多", "偏多觀察", "偏弱", "中性偏弱", "偏弱整理", "偏弱觀察",
             "中性", "中性觀察", "觀望", "待確認", "方向未明", "仍待確認", "偏正向", "偏負向", "正向", "負向",
             "題材仍待確認", "重點待確認", "新聞重點待確認", "公司動態待驗證", "法人看法待確認",
-            "法說展望待確認", "業績表現待確認", "產業題材待確認", "題材熱度待確認", "公司動態待確認",
+            "法說展望待確認", "業績表現待確認", "產業題材待確認", "題材熱度待確認", "題材熱度待觀察", "公司動態待確認", "公司動態待追蹤", "新聞事件待追蹤",
         }
 
         def _is_generic_status_phrase(text: str) -> bool:
@@ -10684,7 +10689,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 return "市場預期偏正向"
             if _has_neutral_target_price_or_rating(merged):
                 return "法人看法待確認"
-            if any(k in merged for k in ["AI散熱", "散熱需求", "液冷", "需求強勁", "需求延續", "營運看旺"]):
+            if any(k in merged for k in ["AI散熱", "散熱需求", "液冷", "水冷", "需求強勁", "需求延續", "營運看旺"]):
                 return "AI散熱需求強勁"
             if _has_negative_target_price_or_rating(merged) or any(k in merged for k in ["利空", "調降", "下修", "看壞", "需求疲弱", "年減", "衰退"]):
                 return "市場預期轉弱"
@@ -10743,11 +10748,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     return "營收表現偏正向"
                 if "營收" in merged and any(k in merged for k in ["年增", "月增", "成長"]):
                     return "營收表現偏正向"
-                if any(k in merged for k in ["AI", "散熱", "液冷"]):
+                if any(k in merged for k in ["AI", "散熱", "液冷", "水冷"]):
                     return "AI散熱需求強勁"
+                if any(k in merged for k in ["研發", "平台", "新應用", "新產品", "推出", "開發"]):
+                    return "產品布局待追蹤"
                 if any(k in merged for k in ["上修", "調升", "看旺"]):
                     return "市場預期上修"
-                return "題材仍待確認"
+                if "公司" in label_s:
+                    return "公司動態待追蹤"
+                if "產業" in label_s or "題材" in label_s:
+                    return "題材熱度待觀察"
+                return "新聞事件待追蹤"
 
             return fallback
 
@@ -10779,7 +10790,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             ]):
                 return "偏多"
             if _has_negative_target_price_or_rating(s) or any(k in s for k in [
-                "轉弱", "賣壓", "跌破", "死亡交叉", "死叉", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
+                "轉弱", "賣壓", "跌破", "空頭", "空頭排列", "均線空頭", "死亡交叉", "均線死亡交叉", "死叉", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
             ]):
                 return "偏弱"
             if "月減" in s and "年增" not in s:
@@ -10963,17 +10974,17 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
                 body = _compact_card_sentence(body, 116)
 
-                raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="題材仍待確認")
+                raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="新聞事件待追蹤")
                 status = _compact_status_text(
                     raw_status,
                     max_chars=16,
-                    fallback="題材仍待確認",
+                    fallback="新聞事件待追蹤",
                     label=label,
                     body=body,
                 )
                 rows.append((label, status, body, 3))
             if not rows:
-                rows.append(("新聞面", "題材仍待確認", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
+                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
             return rows[:2]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
