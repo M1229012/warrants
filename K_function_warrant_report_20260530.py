@@ -2225,7 +2225,9 @@ def _extract_branch_perf_values(values: List[List[str]], source_sheet: str) -> p
 
 def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
     global _BRANCH_PERF_CACHE_DF
-    if not BRANCH_PERF_ENABLE or not GSHEET_FALLBACK_ENABLE:
+    # 勝率統計只提供「分點歷史績效」作為文字輔助，不屬於本次交易資料快取；
+    # 因此即使 REPORT_LIVE_ONLY=1，也允許讀取 Google Sheet 勝率統計。
+    if not BRANCH_PERF_ENABLE:
         return pd.DataFrame()
 
     with _BRANCH_PERF_CACHE_LOCK:
@@ -8592,7 +8594,7 @@ def _repair_weekly_expert_points(
 4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
 5. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
 6. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
-7. 若分析代表性分點，必須使用本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數；沒有選擇分點則不必硬寫。
+7. 若分析代表性分點、精選五分點，或結果短句點名分點，必須使用本週方向、金額、歷史勝率、平均持有天數與歷史加權報酬率；沒有選擇分點則不必硬寫。
 8. 若分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
 10. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
 10. 禁止單純羅列均線價格、KD或MACD；每點必須有比較、判斷與中立結論。
@@ -8612,7 +8614,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v18_final_text_fix_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v19_branch_perf_spacing_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8646,7 +8648,7 @@ def _repair_weekly_points_with_required_branch(
 2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
 3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
 4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
-5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並依實際天數描述時間尺度；若是精選五分點積極買超，結果短句請直接寫「分點名稱＋積極偏買」。
+5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、平均持有天數、歷史加權報酬率，並依實際天數描述時間尺度；若是精選五分點積極買超，結果短句請直接寫「分點名稱＋積極偏買」。
 6. 其中一點必須分析 required_price_volume_pattern_analysis：必須直接寫出 current_pattern_label，再用第一大量區、第二大量區的相對位置、突破／跌破／回踩狀態、高低點結構與價量關係解釋原因；不得輸出兩個大量區的實際價格。
 7. 另一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須寫成法人方向接近中性或買賣幅度有限，不得放大解讀。
 8. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。
@@ -8667,7 +8669,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v18_final_text_fix_representative_repair",
+        cache_task="weekly_keypoints_ai_analysis_v19_branch_perf_spacing_representative_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8695,7 +8697,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 5. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察；說明限一句完整短句，約 28～46 個中文字，不可寫成長篇段落。
 6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並、上方存在、是否」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述，保留完整句子。
 7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
-8. 若選擇寫代表性分點，必須使用該分點本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並說明籌碼品質或時間尺度；沒有代表性就不要硬寫。
+8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；沒有代表性就不要硬寫。
 9. 若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
 10. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
 11. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
@@ -8718,7 +8720,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v18_final_text_fix",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v19_branch_perf_spacing",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -10477,6 +10479,88 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 return "中性觀察"
             return fallback
 
+        def _format_note_pct_value(value, digits=0, force_sign=False):
+            try:
+                num = _parse_percent_like_value(value, ratio_if_small=True)
+                if not np.isfinite(num):
+                    return ""
+                sign = "+" if force_sign and num > 0 else ""
+                if digits <= 0:
+                    return f"{sign}{num:.0f}%"
+                return f"{sign}{num:.{digits}f}%"
+            except Exception:
+                return ""
+
+        def _format_branch_perf_note_suffix(perf_row) -> str:
+            """將 Google Sheet 勝率統計壓成圖卡可讀的一句績效補充。"""
+            if perf_row is None:
+                return ""
+            win_text = _format_note_pct_value(perf_row.get("win_rate", np.nan), digits=0, force_sign=False)
+            weighted_text = _format_note_pct_value(perf_row.get("weighted_return", np.nan), digits=0, force_sign=True)
+            holding_text = _format_avg_holding_days(perf_row.get("avg_holding_days", np.nan))
+            parts = []
+            if win_text:
+                parts.append(f"勝率{win_text}")
+            if holding_text and holding_text != "-":
+                parts.append(f"持有{holding_text}")
+            if weighted_text:
+                parts.append(f"加權{weighted_text}")
+            return "、".join(parts)
+
+        def _find_branch_perf_for_note_text(text_value):
+            """若文字點名精選分點或勝率統計表中的分點，回傳該分點的歷史績效。"""
+            target_text = normalize_branch_name(str(text_value or ""))
+            if not target_text:
+                return None
+
+            candidate_rows = []
+            try:
+                # 優先使用本週具代表性的 TOP5 分點績效，避免同名或小額分點誤配。
+                for m in _build_weekly_branch_perf_matches(ctx):
+                    branch_norm = normalize_branch_name(m.get("branch_norm", "") or m.get("branch", ""))
+                    if branch_norm:
+                        candidate_rows.append((branch_norm, m))
+            except Exception:
+                pass
+
+            try:
+                perf_df = read_gsheet_branch_perf_df(force_refresh=False)
+                if perf_df is not None and not perf_df.empty:
+                    for _, r in perf_df.iterrows():
+                        branch_norm = normalize_branch_name(r.get("branch", "") or r.get("branch_display", ""))
+                        if branch_norm:
+                            candidate_rows.append((branch_norm, r.to_dict()))
+            except Exception:
+                pass
+
+            # 分點名稱長的優先，避免「新光」這類短名稱先誤吃掉其他內容。
+            seen = set()
+            for branch_norm, row in sorted(candidate_rows, key=lambda x: len(x[0]), reverse=True):
+                if branch_norm in seen:
+                    continue
+                seen.add(branch_norm)
+                if branch_norm and branch_norm in target_text:
+                    return row
+            return None
+
+        def _inject_branch_perf_into_warrant_body(label, status, body, original_text):
+            """權證面若點名精選分點 / 勝率表分點，自動補上勝率、持有天數、加權報酬率。"""
+            merged = "｜".join([str(label or ""), str(status or ""), str(body or ""), str(original_text or "")])
+            if "權證" not in str(label or "") and not any(k in merged for k in ["分點", "元大", "新光", "富邦", "永豐", "華南", "勝率", "加權", "持有"]):
+                return body
+            if all(k in str(body or "") for k in ["勝率", "加權", "持有"]):
+                return body
+
+            perf_row = _find_branch_perf_for_note_text(merged)
+            suffix = _format_branch_perf_note_suffix(perf_row)
+            if not suffix:
+                return body
+
+            base = _compact_card_sentence(body, 58).rstrip("。")
+            if base:
+                return f"{base}；績效：{suffix}。"
+            return f"績效：{suffix}。"
+
         def _format_key_status_sections(items):
             rows = []
             for p in items or []:
@@ -10512,6 +10596,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     label=label,
                     body=body,
                 )
+                body = _inject_branch_perf_into_warrant_body(label, status, body, s)
                 rows.append((label, status, body, 3))
                 if len(rows) >= 3:
                     break
@@ -10595,6 +10680,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             status_offset=0.140,
             y_min=0.060,
             body_width_boost=1.0,
+            body_linespacing=1.12,
         ):
             y = y_start
             max_width_axes = max(0.05, x_right - x_left)
@@ -10671,7 +10757,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     fontsize=body_fontsize,
                     ha="left",
                     va="top",
-                    linespacing=1.12,
+                    linespacing=body_linespacing,
                     clip_on=True,
                     zorder=6,
                 )
@@ -10696,11 +10782,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             body_fontsize=31,
             label_fontsize=35,
             status_fontsize=36,
-            header_gap=0.060,
-            line_height=0.047,
-            section_gap=0.026,
+            header_gap=0.062,
+            line_height=0.050,
+            section_gap=0.034,
             status_offset=0.125,
-            body_width_boost=1.18
+            body_width_boost=1.18,
+            body_linespacing=1.22
         )
 
         draw_status_note_items(
@@ -10712,10 +10799,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             label_fontsize=35,
             status_fontsize=36,
             header_gap=0.060,
-            line_height=0.047,
+            line_height=0.048,
             section_gap=0.034,
             status_offset=0.125,
-            body_width_boost=1.22
+            body_width_boost=1.18,
+            body_linespacing=1.16
         )
 
     # x ticks
