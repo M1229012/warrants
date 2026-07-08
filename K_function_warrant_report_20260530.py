@@ -5126,7 +5126,7 @@ def _is_structured_report_point(text: str) -> bool:
         return False
     if "｜" not in s and "|" not in s:
         return False
-    required_terms = ["結論：", "結論:", "重點：", "重點:", "觀察：", "觀察:", "依據：", "依據:", "條件：", "條件:", "追蹤：", "追蹤:"]
+    required_terms = ["分類：", "分類:", "結果：", "結果:", "說明：", "說明:", "結論：", "結論:", "重點：", "重點:", "觀察：", "觀察:", "依據：", "依據:", "條件：", "條件:", "追蹤：", "追蹤:"]
     return any(k in s for k in required_terms)
 
 
@@ -5243,7 +5243,10 @@ NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CA
 
 def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v9_cache_stable_headline_news"))
-    return f"news_points_{safe_version}"
+    # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
+    # 繼續讀到先前 0 點或壞格式的新聞快取。
+    internal_version = "validated_v10"
+    return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
 NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
@@ -7320,9 +7323,15 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
 def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
     """Gemini 輸出太短時，從近期原文 / RSS 摘要候選句補足重點字數；不使用新聞標題硬湊。"""
     used_points = used_points or []
-    candidates = _collect_news_sentences(records, stock_code, stock_name)
-    if not candidates:
-        candidates = _collect_news_title_candidates(records, stock_code, stock_name)
+    sentence_candidates = _collect_news_sentences(records, stock_code, stock_name)
+    title_candidates = _collect_news_title_candidates(records, stock_code, stock_name)
+    candidates = list(sentence_candidates or [])
+    seen_candidate_keys = {_title_compare_text(c.get("text", "")) for c in candidates if c.get("text")}
+    for c in title_candidates or []:
+        key = _title_compare_text(c.get("text", ""))
+        if key and key not in seen_candidate_keys:
+            candidates.append(c)
+            seen_candidate_keys.add(key)
     if not candidates:
         return []
 
@@ -7463,7 +7472,13 @@ def _should_switch_gemini_key(err) -> bool:
     return any(k in err_text for k in switch_keywords)
 
 
-def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str = "", stock_name: str = ""):
+def _call_gemini_with_retry(
+    prompt: str,
+    cache_task: str = "",
+    stock_code: str = "",
+    stock_name: str = "",
+    write_cache: bool = True,
+):
     # 第一優先：Google Sheet 每日快取。
     # 同股票、同任務、同模型、同一天只要跑過一次，當天再跑就不會重打 Gemini。
     # 這段必須放在 GEMINI_ENABLE 判斷前面，避免關閉 Gemini 時連當日快取也讀不到。
@@ -7474,9 +7489,11 @@ def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str =
 
     # 第二優先：本機 prompt hash 快取。
     # 若本機命中，也順便補寫 Google Sheet，讓下次不同 runner 也能直接命中。
-    cached_text = load_llm_cache(prompt)
+    # 但當 Action 設定 WARRANT_LLM_CACHE_FORCE_REFRESH=1 時，必須連本機快取也跳過，
+    # 否則使用者選 1 仍可能吃到同 prompt 的舊壞結果。
+    cached_text = "" if LLM_CACHE_FORCE_REFRESH else load_llm_cache(prompt)
     if cached_text:
-        if cache_task and stock_code:
+        if write_cache and cache_task and stock_code:
             save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, cached_text)
         return cached_text
 
@@ -7514,9 +7531,10 @@ def _call_gemini_with_retry(prompt: str, cache_task: str = "", stock_code: str =
                     contents=prompt,
                 )
                 output_text = response.text or ""
-                save_llm_cache(prompt, output_text)
-                if cache_task and stock_code:
-                    save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, output_text)
+                if write_cache:
+                    save_llm_cache(prompt, output_text)
+                    if cache_task and stock_code:
+                        save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, output_text)
                 return output_text
             except Exception as e:
                 last_error = e
@@ -7615,6 +7633,34 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
             break
     return usable
 
+
+def _save_validated_news_points_cache(
+    task: str,
+    stock_code: str,
+    stock_name: str,
+    prompt: str,
+    points: List[str],
+    note: str = "validated",
+):
+    # 只把已通過解析與品質檢查的新聞重點寫入 Google Sheet 快取。
+    valid_points = _clean_news_summary_points_for_stock(points or [], stock_code, stock_name)
+    valid_points = [p for p in valid_points if _points_are_independent_and_complete([p])]
+    if not valid_points:
+        print("⚠️ 新聞重點未通過品質檢查，不寫入 Gemini 快取")
+        return
+    payload = {
+        "points": valid_points[:NEWS_DISPLAY_MAX_POINTS],
+        "note": note,
+    }
+    save_gsheet_llm_cache(
+        task,
+        stock_code,
+        stock_name,
+        prompt,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+
 def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     """將合格新聞交給 Gemini；素材有 2 則以上時，輸出不得只剩 1 點。"""
     usable_articles = _build_gemini_news_articles(records, stock_code, stock_name)
@@ -7681,6 +7727,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         cache_task=_news_points_cache_task(),
         stock_code=stock_code,
         stock_name=stock_name,
+        write_cache=False,
     )
     points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
     if points and not _points_are_independent_and_complete(points):
@@ -7706,14 +7753,25 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             cache_task=f"{_news_points_cache_task()}_min{minimum_points}_repair",
             stock_code=stock_code,
             stock_name=stock_name,
+            write_cache=False,
         )
         repaired = _parse_gemini_news_points(repaired_text or "", records, stock_code, stock_name)
         if len(repaired) >= minimum_points and _points_are_independent_and_complete(repaired):
             points = repaired
             print(f"✅ Gemini 新聞補正完成：{len(points)} 點")
 
-    if points:
+    if points and len(points) >= minimum_points and _points_are_independent_and_complete(points):
+        _save_validated_news_points_cache(
+            _news_points_cache_task(),
+            stock_code,
+            stock_name,
+            prompt,
+            points,
+            note=f"validated_news_points_{len(points)}",
+        )
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
+    elif points:
+        print(f"⚠️ Gemini 新聞重點只有 {len(points)} 點或未通過品質檢查，不寫入快取，交給規則式摘要補足")
     return points
 
 
@@ -8959,6 +9017,10 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
     fact = _compact_news_fact_text(s, max_len=54)
     if not fact:
         return ""
+    # 多家公司題材新聞若直接顯示原始標題，容易看起來像把其他公司內容混進來；
+    # 圖卡只保留本股票與題材的關係，避免右下角變成新聞標題列表。
+    if label == "產業題材" and stock_name and "、" in fact and re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", fact, re.I):
+        fact = f"{stock_name}仍被市場放在AI散熱需求題材中觀察"
     headline = _infer_news_headline(label, s)
     watch = _infer_news_watch(label, s).replace("追蹤", "後續看", 1)
     detail = f"{fact}；{watch}"
@@ -8969,61 +9031,92 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
     return point
 
 def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
+    """規則式新聞摘要備援。
+
+    Gemini 若輸出 0 點，仍優先從已通過新聞品質門檻的 RSS 標題 / 摘要整理，
+    但避免直接把原始標題丟進圖卡；輸出仍維持「分類｜結果：...｜說明：...」。
+    """
     candidates = _collect_news_sentences(records, stock_code, stock_name)
     if not candidates:
         candidates = _collect_news_title_candidates(records, stock_code, stock_name)
     if not candidates:
         return []
 
-    categories = [
-        ("業績更新", ["營收", "月增", "年增", "業績", "財報", "獲利", "EPS", "毛利", "毛利率", "每股盈餘", "虧損", "轉盈"]),
-        ("產業題材", ["AI", "伺服器", "記憶體", "DRAM", "NAND", "半導體", "報價", "HBM", "漲價", "缺貨", "先進封裝", "CoWoS", "ASIC", "散熱"]),
-        ("公司動態", ["轉型", "布局", "擴產", "合作", "投資", "新產品", "法說", "展望", "接單", "出貨", "產能", "需求", "訂單", "客戶"]),
-        ("法人觀點", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "買進", "中立", "賣出", "大摩", "摩根士丹利", "高盛", "里昂"]),
-    ]
+    def make_clean_point(label: str, text: str) -> str:
+        return _make_news_keypoint(label, text, stock_code, stock_name)
 
     points = []
-    used = set()
-    for label, keywords in categories:
-        scored = []
-        for c in candidates:
-            text = c["text"]
-            if text in used:
-                continue
-            score = _score_news_sentence(text, keywords, stock_code, stock_name)
-            if score > 0:
-                scored.append((score, text))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        if scored:
-            pick = _make_news_keypoint(label, scored[0][1], stock_code, stock_name)
-            if pick and not _is_bad_news_sentence(pick):
-                points.append(pick)
-                used.add(scored[0][1])
+    used_keys = set()
 
-    if len(points) < NEWS_SUMMARY_MAX_POINTS:
-        broad_keywords = [
-            stock_code, stock_name, "營收", "財報", "AI", "伺服器", "半導體", "記憶體", "DRAM", "HBM", "法說", "展望",
-            "外資", "投信", "法人", "報價", "獲利", "接單", "出貨", "擴產", "合作", "題材", "需求", "產能",
+    # 1) 業績更新：優先抓營收年增 / 月減 / 月增，雙鴻這類「年增但月減」要呈現偏正向但提醒月減。
+    revenue_candidates = []
+    for c in candidates:
+        text = c.get("text", "")
+        if not text:
+            continue
+        if re.search(r"營收|月增|月減|年增|業績|財報|EPS|毛利", text, re.I):
+            score = _score_news_sentence(text, ["營收", "年增", "月減", "月增", "業績", stock_code, stock_name], stock_code, stock_name)
+            # 同時有年增與月減者，應優先保留，避免被股價類標題蓋掉。
+            if "營收" in text and "年增" in text and "月減" in text:
+                score += 20
+            revenue_candidates.append((score, text))
+    revenue_candidates.sort(key=lambda x: x[0], reverse=True)
+    if revenue_candidates:
+        p = make_clean_point("業績更新", revenue_candidates[0][1])
+        if p:
+            points.append(p)
+            used_keys.add(_title_compare_text(revenue_candidates[0][1]))
+
+    # 2) 產業題材：AI / 散熱 / 液冷等題材，與營收事件分開顯示。
+    industry_candidates = []
+    for c in candidates:
+        text = c.get("text", "")
+        if not text:
+            continue
+        key = _title_compare_text(text)
+        if key in used_keys:
+            continue
+        if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC|需求|訂單|出貨|長約", text, re.I):
+            score = _score_news_sentence(text, ["AI", "伺服器", "散熱", "液冷", "需求", "訂單", "出貨", stock_code, stock_name], stock_code, stock_name)
+            industry_candidates.append((score, text))
+    industry_candidates.sort(key=lambda x: x[0], reverse=True)
+    if industry_candidates and len(points) < NEWS_SUMMARY_MAX_POINTS:
+        p = make_clean_point("產業題材", industry_candidates[0][1])
+        if p:
+            points.append(p)
+            used_keys.add(_title_compare_text(industry_candidates[0][1]))
+
+    # 3) 其他公司資訊：法人觀點 / 公司動態，僅在前兩類不足時補充。
+    if len(points) < min(2, NEWS_SUMMARY_MAX_POINTS):
+        other_categories = [
+            ("法人觀點", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "EPS"]),
+            ("公司動態", ["公告", "重大訊息", "董事會", "投資", "合作", "擴產", "產能", "接單", "出貨"]),
+            ("新聞焦點", [stock_code, stock_name, "營收", "AI", "散熱", "需求", "獲利", "毛利", "法說", "展望"]),
         ]
-        scored = []
-        for c in candidates:
-            text = c["text"]
-            if text in used:
-                continue
-            score = _score_news_sentence(text, broad_keywords, stock_code, stock_name)
-            if score > 0:
-                scored.append((score, text))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        for score, text in scored:
-            if len(points) >= NEWS_SUMMARY_MAX_POINTS:
+        for label, keywords in other_categories:
+            scored = []
+            for c in candidates:
+                text = c.get("text", "")
+                if not text:
+                    continue
+                key = _title_compare_text(text)
+                if key in used_keys:
+                    continue
+                score = _score_news_sentence(text, keywords, stock_code, stock_name)
+                if score > 0:
+                    scored.append((score, text))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for _, text in scored:
+                if len(points) >= min(2, NEWS_SUMMARY_MAX_POINTS):
+                    break
+                p = make_clean_point(label, text)
+                if p and not _is_bad_news_sentence(p):
+                    points.append(p)
+                    used_keys.add(_title_compare_text(text))
+            if len(points) >= min(2, NEWS_SUMMARY_MAX_POINTS):
                 break
-            pick = _make_news_keypoint("新聞焦點", text, stock_code, stock_name)
-            if pick and not _is_bad_news_sentence(pick):
-                points.append(pick)
-                used.add(text)
 
     return _ensure_news_summary_min_total(points, records, stock_code, stock_name)
-
 
 
 def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str, allow_stale: bool = False) -> List[str]:
@@ -9163,6 +9256,17 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
             print(
                 f"⚠️ 所有來源與規則式補充完成後仍只有 {len(final_points)} 個可獨立呈現的新聞事件；"
                 "為避免垃圾新聞或重複事件，保留現有內容"
+            )
+        else:
+            # Gemini 失敗但規則式摘要成功時，也要把通過品質檢查的最終顯示結果寫入當日快取；
+            # 下次 Action 選 0 才會固定使用同一份正常新聞，不會再重跑出不同文字。
+            _save_validated_news_points_cache(
+                _news_points_cache_task(),
+                stock_code,
+                stock_name,
+                f"rule_based_news_cache::{stock_code}::{_taipei_today_str()}",
+                final_points,
+                note="validated_rule_based_news_points",
             )
         return final_points
 
@@ -10393,7 +10497,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         body_parts.append("影響：" + f.get("影響"))
                 body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
-                body = _compact_card_sentence(body, 152)
+                body = _compact_card_sentence(body, 168)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="題材仍待確認")
                 status = _compact_status_text(
@@ -10511,7 +10615,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             line_height=0.052,
             section_gap=0.038,
             status_offset=0.125,
-            body_width_boost=1.10,
+            body_width_boost=1.18,
         )
 
         draw_status_note_items(
@@ -10526,7 +10630,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             line_height=0.052,
             section_gap=0.044,
             status_offset=0.125,
-            body_width_boost=1.12,
+            body_width_boost=1.22,
         )
 
     # x ticks
