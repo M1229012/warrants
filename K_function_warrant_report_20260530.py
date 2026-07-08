@@ -5077,6 +5077,17 @@ def _finish_complete_summary_point(text: str, max_len: int, min_cut_len: int = 3
     return s
 
 
+def _is_structured_report_point(text: str) -> bool:
+    """辨識已經被整理成週報格式的句子，避免被一般新聞標題過濾規則誤刪。"""
+    s = _normalize_news_text(text)
+    if not s:
+        return False
+    if "｜" not in s and "|" not in s:
+        return False
+    required_terms = ["結論：", "結論:", "重點：", "重點:", "觀察：", "觀察:", "依據：", "依據:", "條件：", "條件:", "追蹤：", "追蹤:"]
+    return any(k in s for k in required_terms)
+
+
 def _points_are_independent_and_complete(points: List[str]) -> bool:
     """檢查每點是否可獨立閱讀，避免上一點講一半、下一點接續。"""
     if not points:
@@ -5101,6 +5112,10 @@ def _trim_weekly_point(text: str, max_len: int | None = None) -> str:
     s = _normalize_news_text(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = re.sub(r"^(本週重點|重點|摘要)[:：]\s*", "", s).strip()
+    # 舊版 prompt 可能輸出「結論｜依據」；顯示時改成更容易一眼辨識的標籤。
+    s = re.sub(r"^結論[｜|]", "結論：", s)
+    s = re.sub(r"^下週觀察[:：]結論[｜|]", "下週觀察：結論：", s)
+    s = s.replace("｜依據：", "｜依據：").replace("｜觀察：", "｜觀察：")
     return _finish_complete_summary_point(s, max_len=max_len, min_cut_len=36)
 
 def _clean_weekly_key_points(raw_points: List[str]) -> List[str]:
@@ -5180,12 +5195,12 @@ NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN",
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v4_compact_structured").strip() or "v4_compact_structured"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v6_card_layout_news").strip() or "v6_card_layout_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v4_compact_structured"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v6_card_layout_news"))
     return f"news_points_{safe_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -6847,13 +6862,15 @@ def _is_bad_news_sentence(sentence: str) -> bool:
     s = _normalize_news_text(sentence)
     if not s or len(s) < 16:
         return True
+    # 已整理成「分類｜結論｜重點｜觀察」的週報句，不能再用一般標題分隔符規則誤刪。
+    structured_point = _is_structured_report_point(s)
     bad_keywords = [
         "完整看", "三大法人買賣超", "外資買超", "外資賣超", "投信買超", "投信賣超",
         "自營商買超", "自營商賣超", "買超排行", "賣超排行", "熱門股", "熱門新聞",
         "新聞標題", "點擊", "下載", "加入會員", "登入", "訂閱", "廣告", "版權",
         "看更多", "更多新聞", "延伸閱讀", "相關新聞", "Yahoo", "Facebook", "LINE分享",
         "焦點股", "優於大盤", "目標價曝光", "新目標價", "強勢股", "題材股",
-        "關鍵字", "標籤", "追蹤我們", "追蹤我", "追蹤", "分享給朋友", "分享給好友",
+        "關鍵字", "標籤", "追蹤我們", "追蹤我", "分享給朋友", "分享給好友",
         "分享本文", "本文", "※本文", "免責聲明", "投稿", "留言", "按讚",
         "SETN", "UDN", "自由財經", "中時新聞", "工商時報", "經濟日報", "鉅亨網", "MoneyDJ",
         "以下為您", "以下是", "為您整理", "整理如下", "統整如下", "重點如下",
@@ -6868,7 +6885,7 @@ def _is_bad_news_sentence(sentence: str) -> bool:
         return True
     if re.search(r"關鍵字[:：]|標籤[:：]|追蹤我們|分享給朋友|分享給好友|分享本文|※本文|免責聲明", s):
         return True
-    if re.search(r"[》｜|【】]", s) and len(s) <= 100:
+    if (not structured_point) and re.search(r"[》｜|【】]", s) and len(s) <= 100:
         return True
     code_count = len(re.findall(r"\(?\d{4}\)?", s))
     if code_count >= 3:
@@ -7263,6 +7280,8 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
     used_points = used_points or []
     candidates = _collect_news_sentences(records, stock_code, stock_name)
     if not candidates:
+        candidates = _collect_news_title_candidates(records, stock_code, stock_name)
+    if not candidates:
         return []
 
     broad_keywords = [
@@ -7291,7 +7310,8 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
 
     extra = []
     for _, text in scored:
-        point = _trim_news_point(text, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
+        label = _infer_news_label_from_text(text, fallback_label="新聞焦點")
+        point = _make_news_keypoint(label, text, stock_code, stock_name)
         if not point or _is_bad_news_sentence(point):
             continue
         cmp_point = _title_compare_text(point)
@@ -8465,7 +8485,7 @@ def _repair_weekly_expert_points(
 
 請重新輸出剛好 3 點，規則如下：
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
-2. 本週重點固定使用「結論｜依據：...｜觀察：...」；下週觀察固定使用「下週觀察：結論｜條件：...｜追蹤：...」。
+2. 本週重點固定使用「結論：一句話結果｜依據：資料依據｜觀察：後續追蹤」；下週觀察固定使用「下週觀察：結論：觀察方向｜條件：確認條件｜追蹤：追蹤項目」。
 3. 每點 55～90 個中文字，先寫結果，再寫資料依據或後續條件，避免長篇段落超出圖片範圍。
 4. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
 5. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
@@ -8478,9 +8498,9 @@ def _repair_weekly_expert_points(
 請只回傳 JSON：
 {{
   "points": [
-    "結論｜依據：本週最重要的資料變化。｜觀察：這個訊號代表的後續追蹤方向。",
-    "結論｜依據：第二個明確重點或矛盾訊號。｜觀察：後續需要確認的條件。",
-    "下週觀察：結論｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
+    "結論：本週最重要的資料變化。｜依據：主要資料來源與變化。｜觀察：這個訊號代表的後續追蹤方向。",
+    "結論：第二個明確重點或矛盾訊號。｜依據：對應的資金、法人或價量資料。｜觀察：後續需要確認的條件。",
+    "下週觀察：結論：下週最重要的觀察方向。｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
   ]
 }}
 
@@ -8489,7 +8509,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v12_compact_structured_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v13_card_layout_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8520,7 +8540,7 @@ def _repair_weekly_points_with_required_branch(
 
 請輸出剛好 3 點繁體中文重點，並遵守：
 1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
-2. 本週重點固定使用「結論｜依據：...｜觀察：...」；下週觀察固定使用「下週觀察：結論｜條件：...｜追蹤：...」。
+2. 本週重點固定使用「結論：一句話結果｜依據：資料依據｜觀察：後續追蹤」；下週觀察固定使用「下週觀察：結論：觀察方向｜條件：確認條件｜追蹤：追蹤項目」。
 3. 每點 55～90 個中文字，先寫結果，再寫資料依據或後續條件，避免長篇段落超出圖片範圍。
 4. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、歷史加權報酬率、平均持有天數，並依實際天數描述時間尺度。
 5. 其中一點必須分析 required_price_volume_pattern_analysis：必須直接寫出 current_pattern_label，再用第一大量區、第二大量區的相對位置、突破／跌破／回踩狀態、高低點結構與價量關係解釋原因；不得輸出兩個大量區的實際價格。
@@ -8532,9 +8552,9 @@ def _repair_weekly_points_with_required_branch(
 請只回傳 JSON：
 {{
   "points": [
-    "結論｜依據：代表性分點或型態的明確資料。｜觀察：後續需要確認的條件。",
-    "結論｜依據：第二個核心訊號與資料關係。｜觀察：後續追蹤方向。",
-    "下週觀察：結論｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
+    "結論：代表性分點或型態的明確結果。｜依據：代表性分點或型態的明確資料。｜觀察：後續需要確認的條件。",
+    "結論：第二個核心訊號的明確結果。｜依據：核心訊號與資料關係。｜觀察：後續追蹤方向。",
+    "下週觀察：結論：下週最重要的觀察方向。｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
   ]
 }}
 
@@ -8543,7 +8563,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v12_compact_structured_repair",
+        cache_task="weekly_keypoints_ai_analysis_v13_card_layout_representative_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -8566,8 +8586,8 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 核心要求：
 1. 請輸出剛好 3 點：前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
 2. 每一點都必須先寫結論，讓讀者一眼看出結果，再寫依據或條件。
-3. 本週重點固定使用：「結論｜依據：...｜觀察：...」。
-4. 下週觀察固定使用：「下週觀察：結論｜條件：...｜追蹤：...」。
+3. 本週重點固定使用：「結論：一句話結果｜依據：資料依據｜觀察：後續追蹤」。
+4. 下週觀察固定使用：「下週觀察：結論：觀察方向｜條件：確認條件｜追蹤：追蹤項目」。
 5. 每點 55～90 個中文字，必須精簡但有資料依據，避免長篇段落超出圖片範圍。
 6. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
 7. 若選擇寫代表性分點，必須使用該分點本週方向、金額、歷史勝率、歷史加權報酬率與平均持有天數，並說明籌碼品質或時間尺度；沒有代表性就不要硬寫。
@@ -8582,9 +8602,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 請只回傳 JSON，不要 markdown，不要其他說明：
 {{
   "points": [
-    "結論｜依據：本週最重要的資料變化。｜觀察：這個訊號代表的後續追蹤方向。",
-    "結論｜依據：第二個明確重點或矛盾訊號。｜觀察：後續需要確認的條件。",
-    "下週觀察：結論｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
+    "結論：本週最重要的資料變化。｜依據：主要資料來源與變化。｜觀察：這個訊號代表的後續追蹤方向。",
+    "結論：第二個明確重點或矛盾訊號。｜依據：對應的資金、法人或價量資料。｜觀察：後續需要確認的條件。",
+    "下週觀察：結論：下週最重要的觀察方向。｜條件：下週需要確認的價量或資金條件。｜追蹤：最重要的公開資訊或資金延續性。"
   ]
 }}
 
@@ -8593,7 +8613,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v12_compact_structured",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v13_card_layout",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -8740,24 +8760,145 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         return []
 
 
+def _collect_news_title_candidates(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
+    """極速 RSS 模式常只有標題與摘要；當原文句子不足時，用通過品質門檻的標題作備援。"""
+    candidates = []
+    seen = set()
+    aliases = [a for a in _get_news_aliases(stock_code, stock_name) if a] if (stock_code or stock_name) else []
+    for rec in records or []:
+        title = _clean_news_title(rec.get("title", ""))
+        content = _normalize_news_text(rec.get("content", ""))
+        if not title:
+            continue
+        combined = _normalize_news_text(f"{title}。{content}")
+        if aliases and not any(alias and alias in combined for alias in aliases):
+            continue
+        if not _passes_news_quality_gate(title, content or title, stock_code, stock_name):
+            continue
+        # 純股價標題仍排除；但若同句有營收、EPS、需求、訂單等基本面字眼則保留。
+        if _is_low_value_market_news(combined) and not _has_substantive_company_news(combined):
+            continue
+        # 避免 RSS title 與 description 完全相同時重複一次，造成代號 / 數字被過濾規則誤判。
+        if content and _title_compare_text(content) != _title_compare_text(title) and len(content) >= 18:
+            text = combined
+        else:
+            text = title
+        text = _trim_news_point(text, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 26)
+        if not text:
+            continue
+        if _is_bad_news_sentence(text) and not _has_substantive_company_news(text):
+            continue
+        key = _title_compare_text(text)
+        if not key or key in seen:
+            continue
+        candidates.append({
+            "text": text,
+            "source": str(rec.get("source", "") or ""),
+            "title": title,
+        })
+        seen.add(key)
+    return candidates
+
+
+def _infer_news_label_from_text(text: str, fallback_label: str = "新聞焦點") -> str:
+    s = _normalize_news_text(text)
+    if re.search(r"營收|月增|年增|財報|獲利|EPS|毛利|毛利率|每股", s, re.I):
+        return "業績更新"
+    if re.search(r"AI|伺服器|散熱|液冷|ASIC|GPU|供需|需求|報價|漲價|長約", s, re.I):
+        return "產業題材"
+    if re.search(r"法人|外資|投信|券商|評等|目標價|調升|調降", s):
+        return "法人觀點"
+    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|產能|接單|出貨|客戶", s):
+        return "公司動態"
+    return str(fallback_label or "新聞焦點").strip() or "新聞焦點"
+
+
+def _infer_news_conclusion(label: str, text: str) -> str:
+    s = _normalize_news_text(text)
+    if re.search(r"營收", s):
+        has_year_up = re.search(r"年增|年成長|YoY|同期高|創同期高|創高", s, re.I)
+        has_month_down = re.search(r"月減|月衰退|月增率-|-\d+(?:\.\d+)?%", s)
+        has_month_up = re.search(r"月增|月成長", s) and not has_month_down
+        if has_year_up and has_month_down:
+            return "營收年增但月減，短線解讀偏中性。"
+        if has_year_up or has_month_up:
+            return "營收動能仍偏正向。"
+        return "營收變化是本週主要基本面訊息。"
+    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
+        return "AI散熱題材仍是市場焦點。"
+    if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
+        return "市場預期仍在重新評估。"
+    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產", s):
+        return "公司事件需觀察後續落地。"
+    return "本週新聞提供後續追蹤線索。"
+
+
+def _infer_news_watch(label: str, text: str) -> str:
+    s = _normalize_news_text(text)
+    if re.search(r"營收|月增|年增|財報|獲利|EPS|毛利", s, re.I):
+        return "追蹤下月營收、毛利率與法說展望。"
+    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC|長約|需求", s, re.I):
+        return "追蹤AI散熱訂單與出貨延續性。"
+    if re.search(r"法人|評等|目標價|調升|調降", s):
+        return "追蹤EPS預估與法人看法是否延續。"
+    if re.search(r"公告|重大訊息|合作|投資|擴產", s):
+        return "追蹤公告後續進度與實際貢獻。"
+    return "追蹤後續公告與營運數字驗證。"
+
+
+def _compact_news_fact_text(text: str, max_len: int = 42) -> str:
+    s = _normalize_news_text(text)
+    s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip("。；;，, ")
+    s = re.sub(r"^(焦點股|個股|台股|盤中|盤後)[:：]?", "", s).strip()
+    # 優先保留含數字或基本面關鍵字的片段。
+    parts = _split_news_sentences(s) or [s]
+    scored = []
+    for part in parts:
+        part = _normalize_news_text(part).strip("。；;，, ")
+        if not part:
+            continue
+        score = 0
+        if re.search(r"\d+(?:\.\d+)?\s*(%|％|元|億元|萬|月|年)", part):
+            score += 4
+        if re.search(r"營收|年增|月增|月減|EPS|毛利|AI|伺服器|散熱|液冷|需求|訂單|出貨|法人|目標價|評等", part, re.I):
+            score += 3
+        scored.append((score, part))
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        s = scored[0][1]
+    if len(s) > max_len:
+        cut = max(s.rfind("，", 0, max_len + 1), s.rfind("、", 0, max_len + 1))
+        if cut >= 18:
+            s = s[:cut]
+        else:
+            s = s[:max_len]
+    return s.strip("。；;，, ")
+
+
 def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: str) -> str:
-    """規則式備援：保留內文中的具體事實，避免改成空泛模板。"""
+    """規則式備援：輸出可直接放入圖片的「分類｜結論｜重點｜觀察」短格式。"""
     s = _normalize_news_text(sentence)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = s.strip("。；;，, ")
-    if not s or _is_bad_news_sentence(s):
+    if not s:
         return ""
 
-    # 移除過度像標題的前綴，保留真正資訊。
-    s = re.sub(r"^(焦點股|個股|台股|盤中|盤後)[:：]?", "", s).strip()
-    max_body_len = max(24, NEWS_SUMMARY_POINT_MAX_LEN - len(label) - 1)
-    body = _trim_news_point(s, max_len=max_body_len)
-    if not body or _is_bad_news_sentence(body):
+    label = _infer_news_label_from_text(s, fallback_label=label)
+    fact = _compact_news_fact_text(s, max_len=42)
+    if not fact:
         return ""
-    return f"{label}｜重點：{body}"
+    conclusion = _infer_news_conclusion(label, s)
+    watch = _infer_news_watch(label, s)
+    point = f"{label}｜結論：{conclusion}｜重點：{fact}。｜觀察：{watch}"
+    point = _trim_news_point(point, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
+    if not point or _is_bad_news_sentence(point):
+        return ""
+    return point
 
 def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     candidates = _collect_news_sentences(records, stock_code, stock_name)
+    if not candidates:
+        candidates = _collect_news_title_candidates(records, stock_code, stock_name)
     if not candidates:
         return []
 
@@ -8879,7 +9020,7 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     return []
 
 def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_name: str, ctx: dict | None = None) -> List[str]:
-    """只顯示真正通過品質門檻的新聞，不用「沒有新聞」或字數不足說明填版面。"""
+    """只顯示真正通過品質門檻的新聞；結構化重點不得被一般標題分隔符誤刪。"""
     cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
     cleaned = [p for p in cleaned if _points_are_independent_and_complete([p])]
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
@@ -9899,51 +10040,266 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
             return "\n".join(lines)
 
-        def draw_note_items(
-            items, x_left, x_right, y_start,
-            fontsize=notes_fontsize, line_height=notes_line_height,
-            item_gap=notes_item_gap, max_lines=notes_max_lines,
-        ):
-            y = y_start
+        def _parse_structured_card_fields(text):
+            """解析 AI 輸出的「分類｜結論｜依據/重點｜觀察」欄位，供圖卡用小區塊顯示。"""
+            s = _normalize_news_text(text)
+            if not s:
+                return {}
+            s = s.replace("|", "｜")
+            # 讓「下週觀察：結論：...」也能被切成欄位，不會把整句塞進同一行。
+            s = re.sub(r"^下週觀察[:：]\s*結論[:：]", "下週觀察｜結論：", s)
+            parts = [p.strip() for p in re.split(r"｜+", s) if p.strip()]
+            fields = {}
+            known_labels = {
+                "分類", "結論", "依據", "重點", "觀察", "條件", "追蹤",
+                "下週觀察", "本週結論", "關鍵依據", "新聞重點", "影響",
+            }
+            for idx, part in enumerate(parts):
+                m = re.match(r"^([^:：]{2,8})[:：]\s*(.+)$", part)
+                if m:
+                    key = m.group(1).strip()
+                    val = m.group(2).strip()
+                    # 分類通常是第一段短標籤，例如「業績更新｜結論：...」。
+                    if idx == 0 and key not in known_labels and "分類" not in fields:
+                        fields["分類"] = key
+                        if val:
+                            fields.setdefault("重點", val)
+                    else:
+                        fields[key] = val
+                else:
+                    clean_part = part.strip("。；;，, ")
+                    if clean_part in ("結論", "重點", "依據", "觀察", "條件", "追蹤"):
+                        continue
+                    if idx == 0 and "分類" not in fields and len(clean_part) <= 8 and not clean_part.startswith("下週觀察"):
+                        fields["分類"] = clean_part
+                    elif clean_part.startswith("下週觀察"):
+                        fields.setdefault("下週觀察", clean_part)
+                    elif "重點" not in fields:
+                        fields["重點"] = clean_part
+                    elif "觀察" not in fields:
+                        fields["觀察"] = clean_part
+            return fields
+
+        def _strip_card_labels(text):
+            s = _normalize_news_text(text)
+            s = s.replace("|", "｜")
+            s = re.sub(r"^下週觀察[:：]\s*", "", s)
+            s = re.sub(r"^(結論|依據|重點|觀察|條件|追蹤|影響)[:：]", "", s)
+            s = re.sub(r"｜\s*(結論|依據|重點|觀察|條件|追蹤|影響)[:：]", "。", s)
+            s = re.sub(r"^[^｜:：]{2,8}｜", "", s)
+            s = re.sub(r"\s+", " ", s).strip(" ｜")
+            return s.strip()
+
+        def _compact_sentence_for_card(text, max_chars=74):
+            s = _normalize_news_text(text)
+            s = re.sub(r"\s+", " ", s).strip()
+            if not s:
+                return ""
+            if len(s) <= max_chars:
+                return s if s[-1] in "。！？" else s + "。"
+            cut = s[:max_chars].rstrip("；;，,、｜:： ")
+            # 優先切在前面的完整句號，避免一行被截得太突兀。
+            sentence_positions = [m.end() for m in re.finditer(r"[。！？]", cut)]
+            if sentence_positions and sentence_positions[-1] >= max(28, int(max_chars * 0.58)):
+                cut = cut[:sentence_positions[-1]].strip()
+            if cut and cut[-1] not in "。！？":
+                cut += "。"
+            return cut
+
+        def _format_key_sections(items):
+            current = []
+            watches = []
+            for p in items or []:
+                s = str(p or "").strip()
+                if not s:
+                    continue
+                if s.startswith(("下週觀察：", "下週觀察:", "下週留意：", "下週留意:", "下週焦點：", "下週焦點:")):
+                    watches.append(s)
+                else:
+                    current.append(s)
+
+            sections = []
+            if current:
+                f0 = _parse_structured_card_fields(current[0])
+                conclusion = f0.get("結論", "")
+                if conclusion.startswith(("依據：", "依據:")):
+                    conclusion = ""
+                if not conclusion:
+                    conclusion = _strip_card_labels(current[0])
+                sections.append(("本週結論", _compact_sentence_for_card(conclusion, 58), 2))
+
+            evidence_lines = []
+            for p in current[:2]:
+                f = _parse_structured_card_fields(p)
+                evidence = f.get("依據") or f.get("重點") or f.get("影響") or ""
+                if not evidence:
+                    evidence = _strip_card_labels(p)
+                evidence = _compact_sentence_for_card(evidence, 62).rstrip("。")
+                if evidence and evidence not in evidence_lines:
+                    evidence_lines.append(evidence)
+            if evidence_lines:
+                body = "\n".join([f"・{x}" for x in evidence_lines[:2]])
+                sections.append(("關鍵依據", body, 4))
+
+            watch_source = watches[0] if watches else (items[-1] if items else "")
+            if watch_source:
+                f = _parse_structured_card_fields(watch_source)
+                watch_parts = []
+                if f.get("結論"):
+                    watch_parts.append(_compact_sentence_for_card(f.get("結論"), 42).rstrip("。"))
+                if f.get("條件"):
+                    watch_parts.append("條件：" + _compact_sentence_for_card(f.get("條件"), 44).rstrip("。"))
+                if f.get("追蹤"):
+                    watch_parts.append("追蹤：" + _compact_sentence_for_card(f.get("追蹤"), 42).rstrip("。"))
+                elif f.get("觀察"):
+                    watch_parts.append("追蹤：" + _compact_sentence_for_card(f.get("觀察"), 42).rstrip("。"))
+                if not watch_parts:
+                    watch_parts.append(_compact_sentence_for_card(_strip_card_labels(watch_source), 86).rstrip("。"))
+                sections.append(("下週觀察", "。".join([x for x in watch_parts if x]).strip("。") + "。", 3))
+
+            if not sections:
+                sections.append(("本週結論", "本週暫無足夠明確資料可整理成重點。", 2))
+            return sections[:3]
+
+        def _format_news_sections(items):
+            sections = []
+            for p in (items or [])[:NEWS_DISPLAY_MAX_POINTS]:
+                f = _parse_structured_card_fields(p)
+                label = f.get("分類") or "新聞重點"
+                label = re.sub(r"[：:。；;，,、｜\s]+", "", str(label or "新聞重點"))[:8] or "新聞重點"
+
+                body_parts = []
+                if f.get("結論"):
+                    body_parts.append(_compact_sentence_for_card(f.get("結論"), 46).rstrip("。"))
+                if f.get("重點"):
+                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("重點"), 52).rstrip("。"))
+                elif f.get("依據"):
+                    body_parts.append("重點：" + _compact_sentence_for_card(f.get("依據"), 52).rstrip("。"))
+                if f.get("觀察"):
+                    body_parts.append("觀察：" + _compact_sentence_for_card(f.get("觀察"), 46).rstrip("。"))
+                elif f.get("影響"):
+                    body_parts.append("影響：" + _compact_sentence_for_card(f.get("影響"), 46).rstrip("。"))
+
+                if body_parts:
+                    body = "。".join([x for x in body_parts if x]).strip("。") + "。"
+                else:
+                    body = _compact_sentence_for_card(_strip_card_labels(p), 92)
+                sections.append((label, body, 3))
+
+            if not sections:
+                sections.append(("新聞重點", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
+            return sections[:2]
+
+        def _wrap_card_body_lines(body, x_left, x_right, fontsize, max_lines):
             max_width_axes = max(0.05, x_right - x_left)
-            for p in items:
-                body = wrap_text_by_pixel(
+            out_lines = []
+            for raw in str(body or "").split("\n"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                first_prefix = ""
+                next_prefix = ""
+                if raw.startswith(("・", "-", "•")):
+                    raw = raw[1:].strip()
+                    first_prefix = "・"
+                    next_prefix = "  "
+                wrapped = wrap_text_by_pixel(
                     ax_notes,
                     fig,
-                    p,
+                    raw,
                     max_width_axes=max_width_axes,
                     fontsize=fontsize,
                     fontweight="normal",
-                    max_lines=max_lines,
-                    first_prefix="• ",
-                    next_prefix="  ",
+                    max_lines=max(1, int(max_lines or 1) - len(out_lines)),
+                    first_prefix=first_prefix,
+                    next_prefix=next_prefix,
                 )
-                note_text = "• " + body.replace("\n", "\n  ")
-                line_count = note_text.count("\n") + 1
+                wrapped_lines = [x for x in wrapped.split("\n") if x.strip()]
+                for i, line in enumerate(wrapped_lines):
+                    prefix = first_prefix if i == 0 else next_prefix
+                    out_lines.append(prefix + line)
+                    if max_lines and len(out_lines) >= max_lines:
+                        return out_lines[:max_lines]
+            return out_lines[:max_lines] if max_lines else out_lines
+
+        def draw_structured_card_sections(
+            sections, x_left, x_right, y_start,
+            label_color=GOLD,
+            body_fontsize=28,
+            label_fontsize=30,
+            line_height=0.044,
+            label_gap=0.038,
+            section_gap=0.022,
+            y_min=0.055,
+        ):
+            y = y_start
+            for label, body, max_lines in sections:
+                if y <= y_min:
+                    break
+                label = str(label or "重點").strip()
+                body_lines = _wrap_card_body_lines(
+                    body,
+                    x_left,
+                    x_right,
+                    fontsize=body_fontsize,
+                    max_lines=max_lines,
+                )
+                if not body_lines:
+                    continue
                 ax_notes.text(
-                    x_left, y, note_text,
+                    x_left,
+                    y,
+                    f"【{label}】",
                     transform=ax_notes.transAxes,
-                    color=TEXT,
-                    fontsize=fontsize,
+                    color=label_color,
+                    fontsize=label_fontsize,
+                    fontweight="bold",
                     ha="left",
                     va="top",
-                    linespacing=1.12,
                     clip_on=True,
+                    zorder=6,
                 )
-                y -= line_height * line_count + item_gap
+                y -= label_gap
+                ax_notes.text(
+                    x_left,
+                    y,
+                    "\n".join(body_lines),
+                    transform=ax_notes.transAxes,
+                    color=TEXT,
+                    fontsize=body_fontsize,
+                    ha="left",
+                    va="top",
+                    linespacing=1.13,
+                    clip_on=True,
+                    zorder=6,
+                )
+                y -= line_height * len(body_lines) + section_gap
 
-        draw_note_items(key_points[:3], 0.04, 0.02 + 0.57 - notes_right_padding, 0.775)
+        # 下方兩張文字卡改成「小標題 + 內容」結構，不再把所有資訊用 ｜ 串在同一段。
+        draw_structured_card_sections(
+            _format_key_sections(key_points[:3]),
+            0.04,
+            0.485,
+            0.765,
+            label_color=GOLD,
+            body_fontsize=28,
+            label_fontsize=31,
+            line_height=0.043,
+            label_gap=0.039,
+            section_gap=0.024,
+        )
 
-        # 新聞區固定走精簡報告格式，避免右側卡片文字超出範圍。
-        news_show = news_points[:NEWS_DISPLAY_MAX_POINTS]
-        if len(news_show) <= 1:
-            news_fontsize, news_line_height, news_item_gap, news_max_lines = 33, 0.060, 0.038, 6
-        else:
-            news_fontsize, news_line_height, news_item_gap, news_max_lines = 31, 0.056, 0.034, 5
-        draw_note_items(
-            news_show, 0.54, 0.52 + 0.57 - notes_right_padding, 0.775,
-            fontsize=news_fontsize, line_height=news_line_height,
-            item_gap=news_item_gap, max_lines=news_max_lines,
+        draw_structured_card_sections(
+            _format_news_sections(news_points[:NEWS_DISPLAY_MAX_POINTS]),
+            0.54,
+            0.975,
+            0.765,
+            label_color=GOLD,
+            body_fontsize=28,
+            label_fontsize=31,
+            line_height=0.043,
+            label_gap=0.039,
+            section_gap=0.025,
         )
 
     # x ticks
