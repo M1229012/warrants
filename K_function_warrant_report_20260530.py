@@ -5370,12 +5370,12 @@ NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN",
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
-NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v14_bear_topic_fix_news").strip() or "v14_bear_topic_fix_news"
+NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v15_arabic_digits_news").strip() or "v15_arabic_digits_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _news_points_cache_task() -> str:
-    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v14_bear_topic_fix_news"))
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
     internal_version = "validated_v14_bear_topic_fix"
@@ -5552,6 +5552,113 @@ def _remove_news_boilerplate(text: str) -> str:
     return s
 
 
+
+_CN_NUMERAL_DIGITS = {
+    "零": 0, "〇": 0, "○": 0, "一": 1, "二": 2, "兩": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_NUMERAL_UNITS = {"十": 10, "百": 100, "千": 1000, "萬": 10000, "万": 10000, "億": 100000000, "亿": 100000000}
+_CN_NUMERAL_CHARS = "零〇○一二兩两三四五六七八九十百千萬万億亿"
+
+
+def _parse_chinese_numeral_to_int(token: str):
+    """將常見中文數字轉為整數；失敗時回傳 None。
+
+    用途只限新聞文字顯示，例如「十二點六億元」→「12.6億元」。
+    不處理模糊財經語意，只處理明確出現在數量單位前的中文數字。
+    """
+    t = str(token or "").strip()
+    if not t:
+        return None
+    if not all(ch in _CN_NUMERAL_DIGITS or ch in _CN_NUMERAL_UNITS for ch in t):
+        return None
+
+    # 二零二六、二〇二六 這種逐字年份寫法。
+    if not any(ch in _CN_NUMERAL_UNITS for ch in t):
+        digits = "".join(str(_CN_NUMERAL_DIGITS[ch]) for ch in t if ch in _CN_NUMERAL_DIGITS)
+        return int(digits) if digits else None
+
+    total = 0
+    section = 0
+    number = 0
+    for ch in t:
+        if ch in _CN_NUMERAL_DIGITS:
+            number = _CN_NUMERAL_DIGITS[ch]
+            continue
+        unit = _CN_NUMERAL_UNITS.get(ch)
+        if unit is None:
+            return None
+        if unit < 10000:
+            if number == 0:
+                number = 1
+            section += number * unit
+            number = 0
+        else:
+            section = (section + number) * unit
+            total += section
+            section = 0
+            number = 0
+    return total + section + number
+
+
+def _format_chinese_numeral_number(int_part: str, frac_part: str | None = None) -> str:
+    value = _parse_chinese_numeral_to_int(int_part)
+    if value is None:
+        return str(int_part or "") + (("點" + frac_part) if frac_part else "")
+    if frac_part:
+        frac_digits = "".join(str(_CN_NUMERAL_DIGITS.get(ch, "")) for ch in frac_part)
+        frac_digits = re.sub(r"[^0-9]", "", frac_digits)
+        if frac_digits:
+            return f"{value}.{frac_digits}"
+    return str(value)
+
+
+def _normalize_chinese_numbers_for_news(text: str) -> str:
+    """新聞區塊數字統一用阿拉伯數字。
+
+    只轉換明確接數量單位的中文數字，避免把券商分點名稱或一般中文詞誤改。
+    例：十二點六億元 → 12.6億元、第三季 → 第3季、六月 → 6月。
+    """
+    s = str(text or "")
+    if not s:
+        return ""
+
+    unit_pattern = r"(?:億元|萬元|元|億|萬|%|％|百分點|個百分點|倍|天|張|季|月|年|日|檔|筆|項|座|家|人|台|套)"
+
+    # 百分之十二點六 → 12.6%
+    def repl_percent(m):
+        num = _format_chinese_numeral_number(m.group("int"), m.groupdict().get("frac"))
+        return f"{num}%"
+
+    s = re.sub(
+        rf"百分之(?P<int>[{_CN_NUMERAL_CHARS}]+)(?:點(?P<frac>[零〇○一二兩两三四五六七八九]+))?",
+        repl_percent,
+        s,
+    )
+
+    # 第三季、第二季 → 第3季、第2季。
+    s = re.sub(
+        rf"第(?P<num>[{_CN_NUMERAL_CHARS}]+)(?P<unit>季|期|屆|次)",
+        lambda m: f"第{_format_chinese_numeral_number(m.group('num'))}{m.group('unit')}",
+        s,
+    )
+
+    # 十二點六億元 → 12.6億元。
+    s = re.sub(
+        rf"(?P<int>[{_CN_NUMERAL_CHARS}]+)點(?P<frac>[零〇○一二兩两三四五六七八九]+)(?=\s*{unit_pattern})",
+        lambda m: _format_chinese_numeral_number(m.group("int"), m.group("frac")),
+        s,
+    )
+
+    # 十二億元、六月、一百二十家 → 12億元、6月、120家。
+    s = re.sub(
+        rf"(?<!第)(?P<num>[{_CN_NUMERAL_CHARS}]+)(?=\s*{unit_pattern})",
+        lambda m: _format_chinese_numeral_number(m.group("num")),
+        s,
+    )
+    return s
+
+
 def _normalize_news_text(text: str) -> str:
     if not text:
         return ""
@@ -5562,6 +5669,7 @@ def _normalize_news_text(text: str) -> str:
     s = s.replace("\u200b", " ").replace("\ufeff", " ")
     s = re.sub(r"https?://\S+", " ", s)
     s = _remove_news_boilerplate(s)
+    s = _normalize_chinese_numbers_for_news(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -7825,20 +7933,21 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」。
 3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求強勁」「公司動態偏正向」「市場預期偏正向」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材明確指出 AI 散熱需求強、需求延續或營運看旺，結果請寫「AI散熱需求強勁」；若素材出現傳捷報、接單、訂單、取得新案，結果請寫「公司動態偏正向」；若素材出現券商看好、法說看好、目標價調升/上修、評等調升或上修，結果請寫「市場預期偏正向」；若只是提到目標價但沒有調升、上修、買進或看好等正向語意，不得判定為正面。
 4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
-5. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
-6. 每點 40～76 個中文字，結果要明確，說明限一句完整短句，約 28～48 個中文字，不得寫成長篇段落。
-7. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述。
-8. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點；即使有 3 則以上素材，也只挑最重要的 {NEWS_SUMMARY_MAX_POINTS} 點。
-9. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
-10. 每點必須獨立完整並以句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
-11. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
-12. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-13. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
-14. 不得把其他公司的數字或題材套用到 {display_name}。
-15. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-16. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-17. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-18. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+5. 所有數字必須使用阿拉伯數字，不得使用中文數字；例如「十二點六億元」要寫成「12.6億元」，「第三季」要寫成「第3季」。
+6. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
+7. 每點 40～76 個中文字，結果要明確，說明限一句完整短句，約 28～48 個中文字，不得寫成長篇段落。
+8. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述。
+9. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點；即使有 3 則以上素材，也只挑最重要的 {NEWS_SUMMARY_MAX_POINTS} 點。
+10. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
+11. 每點必須獨立完整並以句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
+12. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
+13. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
+14. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
+15. 不得把其他公司的數字或題材套用到 {display_name}。
+16. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
+17. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
+18. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
+19. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
 
 請只回傳 JSON，不要 markdown，不要多餘說明：
 {{
@@ -7875,6 +7984,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 {NEWS_SUMMARY_MAX_POINTS} 點。
 每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
 每點 42～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
+所有數字必須使用阿拉伯數字，不得使用中文數字；例如「十二點六億元」要寫成「12.6億元」。
 「說明」限一句完整短句，約 28～48 個中文字，必須自然收尾並以句號結束；不得使用省略號，也不得留下看起來尚未說完的結尾。
 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材出現傳捷報、接單、訂單、券商看好、法說看好、目標價調升/上修、評等調升或上修，結果要寫成正面具體結論；若只是提到目標價但沒有明確調升、上修、買進或看好，不得判定為正面；「說明」講新聞事實、可能影響與後續追蹤項目。
 不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
@@ -9318,6 +9428,7 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
     watch = _infer_news_watch(label, s).replace("追蹤", "後續看", 1)
     detail = f"{fact}；{watch}"
     point = f"{label}｜結果：{headline}｜說明：{detail}"
+    point = _normalize_chinese_numbers_for_news(point)
     point = _trim_news_point(point, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
     if not point or _is_bad_news_sentence(point):
         return ""
