@@ -5378,7 +5378,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v14_bear_topic_fix"
+    internal_version = "validated_v15_inst_volume_news_fix"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -7945,7 +7945,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 
 寫作要求：
 1. 每點必須使用固定結構：「分類｜結果：...｜說明：...」。
-2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」。
+2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」；只有新聞內有具體券商、評等、目標價調升/調降、EPS上修/下修或法人買賣超時，才可使用「法人觀點」。
 3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求強勁」「公司動態偏正向」「市場預期偏正向」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材明確指出 AI 散熱需求強、需求延續或營運看旺，結果請寫「AI散熱需求強勁」；若素材出現傳捷報、接單、訂單、取得新案，結果請寫「公司動態偏正向」；若素材出現券商看好、法說看好、目標價調升/上修、評等調升或上修，結果請寫「市場預期偏正向」；若只是提到目標價但沒有調升、上修、買進或看好等正向語意，不得判定為正面。
 4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
 5. 所有數字必須使用阿拉伯數字，不得使用中文數字；例如「十二點六億元」要寫成「12.6億元」，「第三季」要寫成「第3季」。
@@ -8499,6 +8499,20 @@ def _build_technical_card_summary(ctx: dict) -> dict:
     pattern = _build_price_volume_pattern_payload(ctx)
     pattern_label = str(pattern.get("current_pattern_label", "") or "").strip()
     price_volume_relation = str(pattern.get("weekly_price_volume_relationship", "") or "").strip()
+    zone_position = str(pattern.get("latest_position_relative_to_two_zones", "") or "").strip()
+
+    def _volume_zone_hint() -> str:
+        """把第一大量區 / 第二大量區相對位置納入技術面說明。"""
+        pos = zone_position
+        if not pos:
+            return ""
+        if "第一大量區與第二大量區之間" in pos:
+            return "仍在第一與第二大量區附近整理"
+        if "第一大量區與第二大量區之上" in pos:
+            return "仍站在第一與第二大量區上方"
+        if "第一大量區與第二大量區之下" in pos:
+            return "第一與第二大量區轉為上方壓力"
+        return ""
 
     ma_all_available = all(_finite(v) for v in [ma5, ma10, ma20, ma60])
     ma_bull = ma_all_available and ma5 > ma10 > ma20 > ma60
@@ -8563,19 +8577,29 @@ def _build_technical_card_summary(ctx: dict) -> dict:
             headline = "技術訊號待確認"
             detail = "目前均線與價量訊號未形成明確方向，短線以確認收盤位置為主。"
 
+    # 第一大量區 / 第二大量區是上方圖中已畫出的成本區，技術面說明需同步參考，
+    # 避免只看均線而忽略股價其實仍在主要量區附近。
+    zone_hint = _volume_zone_hint()
+    if zone_hint and zone_hint not in detail:
+        if any(k in headline for k in ["跌破", "修正", "轉弱", "拉回", "整理"]):
+            detail = f"{zone_hint}，{detail.lstrip('。')}"
+        elif len(detail.rstrip("。") + "，" + zone_hint + "。") <= 68:
+            detail = detail.rstrip("。") + f"，{zone_hint}。"
+
     # 若價量型態提供的是明確「本週價跌量縮 / 價跌量增」等關係，補到說明後段；
     # 但避免句子過長，僅在不會造成擁擠時加入。
     if price_volume_relation and price_volume_relation != "資料不足" and price_volume_relation not in detail:
         extra = f"並呈現{price_volume_relation}。"
-        if len(detail.rstrip("。") + "，" + extra) <= 46:
+        if len(detail.rstrip("。") + "，" + extra) <= 68:
             detail = detail.rstrip("。") + f"，並呈現{price_volume_relation}。"
 
     return {
         "label": "技術面",
         "headline": _compact_text_for_card_headline(headline, max_chars=16),
-        "detail": _compact_text_for_card_detail(detail, max_chars=58),
+        "detail": _compact_text_for_card_detail(detail, max_chars=68),
         "ma_signal": ma_signal_main,
         "pattern_label": pattern_label,
+        "zone_position": zone_position,
     }
 
 
@@ -9009,7 +9033,7 @@ def _repair_weekly_expert_points(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v22_bear_topic_fix_repair",
+        cache_task="weekly_keypoints_expert_weekly_next_watch_v23_inst_volume_technical_fix_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -9064,7 +9088,7 @@ def _repair_weekly_points_with_required_branch(
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v22_bear_topic_fix_repair",
+        cache_task="weekly_keypoints_ai_analysis_v23_inst_volume_technical_fix_repair",
         stock_code=str(ctx.get("stock_code", "") or ""),
         stock_name=stock_name,
     )
@@ -9115,7 +9139,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v22_bear_topic_fix",
+            cache_task="weekly_keypoints_expert_weekly_next_watch_v23_inst_volume_technical_fix",
             stock_code=str(ctx.get("stock_code", "") or ""),
             stock_name=stock_name,
         )
@@ -9222,6 +9246,7 @@ def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name
         "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
         "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
         "4. 每點要像財經新聞摘要，格式盡量為「短標籤：具體事件／數字／市場消息 + 對公司或產業的影響」，不要寫成空泛研究報告。\n"
+        "4-1. 不得輸出「法人尚未表態」「法人消息不足」「法人看法待確認」這類沒有資訊量的法人觀點；沒有具體券商、評等、目標價、EPS上修/下修或法人買賣超，就改寫其他有內容的新聞或直接少輸出。\n"
         "5. 只聚焦公司本身可能影響股價的消息：公司產業、法人目標價/評等、EPS/每股純益、營收、毛利率、獲利、ASP/報價、接單出貨、產能與供需。\n"
         "6. 若目標價、EPS、營收、ASP、毛利率或產業題材沒有明確指向本公司，請不要使用。\n"
         "7. 若資料不足，寧可保守，不要臆測。\n\n"
@@ -10867,7 +10892,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     return "法人偏向買超"
                 if any(k in merged for k in ["賣超", "調節", "偏賣"]):
                     return "法人偏向調節"
-                return "法人尚未表態"
+                return "法人消息不足"
 
             if any(k in label_s for k in ["業績", "新聞", "產業", "題材", "公司", "法人觀點"]):
                 if "營收" in merged and "年增" in merged and "月減" in merged:
@@ -11074,6 +11099,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rows.append(("重點面", "重點待確認", "本週暫無足夠明確資料可整理成重點。", 2))
             return rows[:3]
 
+        def _has_substantive_news_analyst_view(text: str) -> bool:
+            s = _normalize_card_text(text)
+            if _has_positive_target_price_or_rating(s) or _has_negative_target_price_or_rating(s) or _has_neutral_target_price_or_rating(s):
+                return True
+            return bool(re.search(r"券商看好|券商調升|券商調降|評等調升|評等調降|升評|降評|維持買進|重申買進|買進評等|賣出評等|EPS(?:預估)?(?:上修|下修)|法人(?:買超|賣超|回補|調節)", s))
+
+        def _is_useless_news_analyst_row(label: str, status: str, body: str, raw_text: str) -> bool:
+            merged = _normalize_card_text("｜".join([str(label or ""), str(status or ""), str(body or ""), str(raw_text or "")]))
+            if "法人" not in str(label or "") and "法人" not in merged:
+                return False
+            if _has_substantive_news_analyst_view(merged):
+                return False
+            return any(k in merged for k in ["法人尚未表態", "法人消息不足", "法人看法待確認", "尚未表態", "未表態", "待確認", "消息不足"])
+
         def _format_news_status_sections(items):
             rows = []
             for p in (items or [])[:NEWS_DISPLAY_MAX_POINTS]:
@@ -11108,6 +11147,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     label=label,
                     body=body,
                 )
+                if _is_useless_news_analyst_row(label, status, body, s):
+                    continue
                 rows.append((label, status, body, 3))
             if not rows:
                 rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
