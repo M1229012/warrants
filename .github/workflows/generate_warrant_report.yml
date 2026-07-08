@@ -89,8 +89,14 @@ jobs:
       # 預設開啟；是否使用快取或強制重抓，由 refresh_news_summary 控制。
       # 為避免熱門股新聞過多導致執行時間過長，Discord 查詢版限制新聞抓取量。
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_GOOGLE_MAX_ITEMS: "8"
-      WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "3"
+      WARRANT_NEWS_GOOGLE_MAX_ITEMS: "36"
+      WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "10"
+      WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI: "12"
+      WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT: "24"
+      WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE: "12"
+      WARRANT_NEWS_MOPS_MAX_ITEMS: "12"
+      WARRANT_NEWS_MIN_DISTINCT_ARTICLES: "3"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v3_report_structured"
 
       # MoneyDJ API 重試與完整度檢查：要求 100% 完整才輸出。
       # 只要 API4/API5 有任何 failed，程式會直接中止，不會產出半套錯誤圖片。
