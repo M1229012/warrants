@@ -99,7 +99,7 @@ jobs:
             ACTION_VALUE="${{ github.event.inputs.run_plan }}"
           fi
 
-          CMD=(python "notify_discord_新GoogleSheet_新制ABCDE.py" --action "${ACTION_VALUE}")
+          CMD=(python "discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
 
           if [ -n "${TARGET_DATE_VALUE}" ]; then
             CMD+=(--date "${TARGET_DATE_VALUE}")
