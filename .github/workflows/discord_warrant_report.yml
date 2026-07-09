@@ -7,9 +7,37 @@ on:
         description: "指定圖卡日期，例如 2026-05-18。留空則自動抓 Google Sheet 內最新日期"
         required: false
         default: ""
+
+      run_plan:
+        description: "執行方案"
+        required: true
+        default: "精選五分點每日圖"
+        type: choice
+        options:
+          - "精選五分點每日圖"
+          - "近一個月共識淨買超TOP15"
+          - "本週權證共識買賣超TOP15"
+          - "近10日分點買賣明細圖"
+          - "所有分點勝率統計圖"
+          - "全部圖片"
+
+      broker_name:
+        description: "指定分點名稱，例如 元大南屯。只有執行近10日分點買賣明細圖時使用"
+        required: false
+        default: ""
+
+      notification_mode:
+        description: "選擇 Discord 推播模式"
+        required: true
+        default: "測試推播"
+        type: choice
+        options:
+          - "測試推播"
+          - "正式推播"
+
   schedule:
-    # 台灣時間 17:30 = UTC 09:30
-    - cron: "30 09 * * 1-5"
+    # 台灣時間 16:20 = UTC 08:20
+    - cron: "20 08 * * 1-5"
 
 jobs:
   send-discord-report:
@@ -17,18 +45,30 @@ jobs:
     timeout-minutes: 30
 
     env:
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
-      # 建議你用 GOOGLE_SHEET_ID，比名稱更穩；若不用可刪掉這行或留空。
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW"
 
-      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
-      DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
+      # 建議使用 GOOGLE_SHEET_ID，比名稱開啟更穩定。
+      # 若沒有設定 GOOGLE_SHEET_ID_NEW，程式會自動改用 GOOGLE_SHEET_NAME 開啟。
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_NEW }}
+
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
+
+      # 手動選擇「正式推播」時使用正式 Webhook。
+      # 選擇「測試推播」或排程自動執行時使用測試 Webhook。
+      DISCORD_WEBHOOK_URL_TEST: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.notification_mode == '正式推播' && secrets.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL_TEST }}
 
       BUY_THRESHOLD: "1000000"
-      SELL_THRESHOLD_RATIO: "0.2"
+      SELL_THRESHOLD_RATIO: "0.5"
       DISPLAY_EXIT_ALWAYS: "0"
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
+
+      # 排程自動執行時，仍只執行原本的每日圖流程。
+      RUN_PLAN: "精選五分點每日圖"
+
+      # 正式執行關閉除錯。
+      # 若要確認近10日圖實際採用的 run_id，可暫時改成 "1"。
+      DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
       - name: Checkout repository
@@ -51,11 +91,25 @@ jobs:
 
       - name: Generate image from Google Sheet and send to Discord
         run: |
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            python discord_warrant_report_gsheet.py --date "${{ github.event.inputs.target_date }}"
-          else
-            python discord_warrant_report_gsheet.py
+          ACTION_VALUE="${RUN_PLAN}"
+          TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
+          BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
+
+          if [ -n "${{ github.event.inputs.run_plan }}" ]; then
+            ACTION_VALUE="${{ github.event.inputs.run_plan }}"
           fi
+
+          CMD=(python "notify_discord_新GoogleSheet_新制ABCDE.py" --action "${ACTION_VALUE}")
+
+          if [ -n "${TARGET_DATE_VALUE}" ]; then
+            CMD+=(--date "${TARGET_DATE_VALUE}")
+          fi
+
+          if [ -n "${BROKER_NAME_VALUE}" ]; then
+            CMD+=(--broker "${BROKER_NAME_VALUE}")
+          fi
+
+          "${CMD[@]}"
 
       - name: Upload generated image artifact
         uses: actions/upload-artifact@v4
