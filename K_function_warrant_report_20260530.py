@@ -104,12 +104,27 @@ API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
 API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
 MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
 MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
+
+# GitHub Actions 的 0 / 1 主控：
+# - 0：優先使用 Google Sheet 當日快取與完整權證快照；若快取不存在或不完整，才回退 Live 抓取。
+# - 1：跳過快取，強制重新抓 Live 權證資料並重新產生新聞 / 本週重點。
+# 為維持既有 workflow 相容，沿用 WARRANT_LLM_CACHE_FORCE_REFRESH 作為主控值。
+ACTION_FORCE_REFRESH = os.getenv(
+    "WARRANT_LLM_CACHE_FORCE_REFRESH",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+ACTION_REFRESH_CONTROLS_REPORT_DATA = os.getenv(
+    "WARRANT_ACTION_REFRESH_CONTROLS_REPORT_DATA",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+
 LIVE_FETCH_ENABLE = os.getenv("WARRANT_LIVE_FETCH_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 # 純 Live 週報模式：圖片內容不讀取、不合併、不寫入 Google Sheet 或本機快取。
-# 目的：避免權證分點、權證母體、股票名稱、勝率統計、LLM 快取等內容受到舊快取影響。
-# 設為 1 時，本次週報只使用 yfinance / FinMind / TWSE / TPEx / MoneyDJ 等即時來源。
-# 若未來需要恢復 Google Sheet 快取輔助，可設 WARRANT_REPORT_LIVE_ONLY=0。
-REPORT_LIVE_ONLY = os.getenv("WARRANT_REPORT_LIVE_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+# 當 ACTION 主控啟用時，Action=1 才進純 Live；Action=0 則優先讀 Google Sheet 快取。
+if ACTION_REFRESH_CONTROLS_REPORT_DATA:
+    REPORT_LIVE_ONLY = bool(ACTION_FORCE_REFRESH)
+else:
+    REPORT_LIVE_ONLY = os.getenv("WARRANT_REPORT_LIVE_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
 GSHEET_FALLBACK_ENABLE = (
     os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
     and not REPORT_LIVE_ONLY
@@ -267,13 +282,20 @@ _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
 
 
-# 權證快取設定：權證籌碼預設每次都重新抓 live，避免圖片使用舊籌碼；完整 live 結果仍會寫入 Google Sheet 當備援。
-# 這裡刻意不受舊版 Actions 的「0=優先用快取」影響；除非明確設定 WARRANT_ALWAYS_REFRESH_WARRANT_FLOW=0，否則籌碼每次都走 live。
-WARRANT_ALWAYS_REFRESH_WARRANT_FLOW = os.getenv("WARRANT_ALWAYS_REFRESH_WARRANT_FLOW", "1").strip().lower() not in ("0", "false", "no", "off")
-WARRANT_CACHE_FORCE_REFRESH = WARRANT_ALWAYS_REFRESH_WARRANT_FLOW or os.getenv(
-    "WARRANT_CACHE_FORCE_REFRESH",
-    os.getenv("WARRANT_LOCAL_CACHE_FORCE_REFRESH", "0"),
-).strip().lower() in ("1", "true", "yes", "on")
+# 權證快取設定：Action=0 時優先讀 Google Sheet 完整快照；Action=1 時才強制 Live。
+# 若停用 ACTION_REFRESH_CONTROLS_REPORT_DATA，才回到原本各環境變數獨立控制的方式。
+if ACTION_REFRESH_CONTROLS_REPORT_DATA:
+    WARRANT_ALWAYS_REFRESH_WARRANT_FLOW = bool(ACTION_FORCE_REFRESH)
+    WARRANT_CACHE_FORCE_REFRESH = bool(ACTION_FORCE_REFRESH)
+else:
+    WARRANT_ALWAYS_REFRESH_WARRANT_FLOW = os.getenv(
+        "WARRANT_ALWAYS_REFRESH_WARRANT_FLOW",
+        "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+    WARRANT_CACHE_FORCE_REFRESH = WARRANT_ALWAYS_REFRESH_WARRANT_FLOW or os.getenv(
+        "WARRANT_CACHE_FORCE_REFRESH",
+        os.getenv("WARRANT_LOCAL_CACHE_FORCE_REFRESH", "0"),
+    ).strip().lower() in ("1", "true", "yes", "on")
 GSHEET_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 GSHEET_WARRANT_HISTORY_SHEET = os.getenv("WARRANT_GSHEET_HISTORY_SHEET", "快取_分點歷史").strip() or "快取_分點歷史"
 GSHEET_WARRANT_STATUS_SHEET = os.getenv("WARRANT_GSHEET_STATUS_SHEET", "快取_分點歷史_狀態").strip() or "快取_分點歷史_狀態"
@@ -349,7 +371,7 @@ LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_
 # Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
 GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
-LLM_CACHE_FORCE_REFRESH = os.getenv("WARRANT_LLM_CACHE_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes", "on")
+LLM_CACHE_FORCE_REFRESH = bool(ACTION_FORCE_REFRESH)
 
 _THREAD_LOCAL = threading.local()
 _FETCH_STATS_LOCK = threading.Lock()
@@ -9975,6 +9997,72 @@ def _derive_technical_tone_from_ctx(ctx: dict) -> str:
     return "neutral"
 
 
+def _canonicalize_weekly_point_structure(point: str, ctx: dict) -> str:
+    """將舊版條件式備援文字轉成統一的面向／結果／說明格式，避免 tone 在備援路徑遺失。"""
+    s = _normalize_news_text(str(point or "")).replace("|", "｜").strip()
+    if not s:
+        return ""
+
+    fields = _parse_report_point_fields(s)
+    existing_label = str(fields.get("label", "") or "").strip()
+    existing_status = str(fields.get("status", "") or "").strip()
+    existing_detail = str(fields.get("detail", "") or "").strip()
+    if existing_label and existing_status:
+        detail = existing_detail or _strip_report_tone_metadata(s)
+        return (
+            f"面向：{existing_label}｜結果：{existing_status}｜"
+            f"說明：{detail}｜方向：{normalize_report_tone(fields.get('tone')) or 'neutral'}"
+        )
+
+    # 下週觀察固定為 watch，不依文字猜顏色。
+    if re.match(r"^下週觀察[:：]", s):
+        detail = re.sub(r"^下週觀察[:：]\s*", "", s).strip()
+        status = "確認價量與資金延續性"
+        pattern = _build_price_volume_pattern_payload(ctx)
+        label_text = str(pattern.get("current_pattern_label", "") or "").strip()
+        if label_text:
+            status = _compact_text_for_card_headline(f"確認{label_text}延續性", 16)
+        return f"面向：下週觀察｜結果：{status}｜說明：{detail}｜方向：watch"
+
+    # 型態面／技術面舊字串直接改用程式技術卡片，確保文字與 tone 同源。
+    if s.startswith("型態面") or s.startswith("技術面"):
+        card = _build_technical_card_summary(ctx) or {}
+        status = str(card.get("headline", "技術訊號待確認") or "技術訊號待確認")
+        detail = str(card.get("detail", s) or s)
+        return f"面向：技術面｜結果：{status}｜說明：{detail}｜方向：neutral"
+
+    # 代表性分點與籌碼集中度統一歸為權證面。
+    if re.match(r"^(買超|賣超)TOP\d+", s) or s.startswith("籌碼集中度"):
+        net_value = float(ctx.get("total_net", 0) or 0)
+        if net_value > 0:
+            status = "權證資金偏向流入"
+        elif net_value < 0:
+            status = "權證資金偏向流出"
+        else:
+            status = "權證資金方向有限"
+        return f"面向：權證面｜結果：{status}｜說明：{s}｜方向：neutral"
+
+    # 法人與權證資金交叉比較統一歸為法人面，tone 後續仍由實際法人數據覆蓋。
+    if s.startswith("資金交叉"):
+        inst_ctx = _get_weekly_institutional_context(ctx)
+        inst_class = str(inst_ctx.get("classification", "") or "")
+        warrant_net = float(ctx.get("total_net", 0) or 0)
+        if inst_class == "偏多" and warrant_net > 0:
+            status = "法人與權證資金同向偏多"
+        elif inst_class == "偏空" and warrant_net < 0:
+            status = "法人與權證資金同向偏空"
+        elif inst_class == "接近中性":
+            status = "法人買賣幅度有限"
+        else:
+            status = "法人與權證方向分歧"
+        detail = re.sub(r"^資金交叉[:：]\s*", "", s).strip()
+        return f"面向：法人面｜結果：{status}｜說明：{detail}｜方向：neutral"
+
+    inferred_label = _infer_face_label_from_text(s, fallback="重點面")
+    inferred_status = _infer_status_from_text(s, fallback="重點待確認")
+    return f"面向：{inferred_label}｜結果：{inferred_status}｜說明：{s}｜方向：neutral"
+
+
 def _derive_weekly_point_tone(point: str, ctx: dict) -> str:
     """技術／法人／權證由實際數據決定 tone；新聞保留 Gemini 結構化判斷。"""
     fields = _parse_report_point_fields(point)
@@ -10014,9 +10102,14 @@ def _derive_weekly_point_tone(point: str, ctx: dict) -> str:
 def _apply_programmatic_weekly_tones(points: List[str], ctx: dict) -> List[str]:
     out = []
     for point in points or []:
-        s = str(point or "").strip()
-        if s:
-            out.append(_replace_report_point_tone(s, _derive_weekly_point_tone(s, ctx)))
+        canonical = _canonicalize_weekly_point_structure(point, ctx)
+        if canonical:
+            out.append(
+                _replace_report_point_tone(
+                    canonical,
+                    _derive_weekly_point_tone(canonical, ctx),
+                )
+            )
     return out
 
 
@@ -12706,9 +12799,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         status = str(tech_card.get("headline", status) or status)
                         body = str(tech_card.get("detail", body) or body)
                 body = _inject_branch_perf_into_warrant_body(label, status, body, s)
-                tone = _extract_report_tone_from_point(s)
-                if not tone:
-                    tone = _derive_weekly_point_tone(s, ctx)
+                # 技術面、法人面與權證面一律由實際數據覆蓋 AI / 備援 tone；
+                # 新聞等其他面向才保留既有結構化 tone。
+                tone = _derive_weekly_point_tone(s, ctx)
                 rows.append((label, status, body, 3, tone))
                 if len(rows) >= 3:
                     break
@@ -13030,6 +13123,11 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
     try:
         if REPORT_LIVE_ONLY:
             print("🔴 本次啟用純 Live 週報模式：圖片內容不使用 Google Sheet / 本機快取資料")
+        else:
+            print(
+                "☁️ 本次啟用 Google Sheet 快取優先模式："
+                "先讀當日 Gemini 快取與完整權證快照，缺少或不完整時才回退 Live 抓取"
+            )
 
         with report_stage_timer(f"{stock_code}｜股票名稱查詢"):
             stock_name = get_tw_stock_name(stock_code)
