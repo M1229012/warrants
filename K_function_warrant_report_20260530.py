@@ -6155,6 +6155,93 @@ def _char_overlap_ratio(a: str, b: str) -> float:
     return len(aa & bb) / max(1, min(len(aa), len(bb)))
 
 
+def _strip_news_meta_noise(text: str) -> str:
+    """移除 RSS / 網站常見的來源、日期、標題等雜訊，避免被當成新聞事實。"""
+    s = _normalize_news_text(text)
+    if not s:
+        return ""
+    s = re.sub(r'https?://\S+', '', s)
+    s = re.sub(r'(?:^|[。；;])\s*(?:來源|source)[:：][^。；;]{0,80}', '。', s, flags=re.I)
+    s = re.sub(r'(?:^|[。；;])\s*(?:日期|date|published)[:：][^。；;]{0,120}', '。', s, flags=re.I)
+    s = re.sub(r'(?:^|[。；;])\s*標題[:：][^。；;]{0,160}', '。', s)
+    s = re.sub(r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}(?::\d{2})?\s+GMT', '', s, flags=re.I)
+    s = re.sub(r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b,?', '', s, flags=re.I)
+    s = re.sub(r'\s*GMT\b', '', s, flags=re.I)
+    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r'[。；;]{2,}', '。', s)
+    return _normalize_news_text(s).strip('。；;，, ')
+
+
+def _is_price_only_news_without_fundamentals(text: str) -> bool:
+    """排除只有股價漲跌、盤中變化的即時新聞；若同時含基本面資訊則保留。"""
+    s = _strip_news_meta_noise(text)
+    if not s:
+        return False
+    price_terms = [
+        '即時新聞', '股價走強', '股價上漲', '股價下跌', '股價走弱', '股價震盪', '急拉', '大漲', '重挫',
+        '站上', '衝上', '跌破', '漲停', '跌停', '漲幅', '跌幅', '盤中', '走強至', '上漲至'
+    ]
+    fundamental_terms = [
+        '營收', '獲利', 'EPS', '每股純益', '毛利', '毛利率', '法說', '接單', '訂單', '產能', '擴產',
+        '出貨', '評等', '目標價', '合作', '投資', '新產品', '需求', '法人', '客戶', '展望', '財報',
+        '先進封裝', '液冷', '散熱', 'ASIC', 'AI', 'CoWoS', '長約'
+    ]
+    return any(k in s for k in price_terms) and not any(k in s for k in fundamental_terms)
+
+
+def _can_use_news_title_as_fact(title: str) -> bool:
+    """只有標題本身就是具體營運／產業事件時，才允許作為規則式備援素材。"""
+    s = _strip_news_meta_noise(_clean_news_title(title))
+    if not s:
+        return False
+    if _is_price_only_news_without_fundamentals(s):
+        return False
+    if any(k in s for k in ['完整看', '看更多', '熱門股', '焦點股', '強勢股', '盤中']) and not _has_substantive_company_news(s):
+        return False
+    return bool(re.search(
+        r'營收|月增|月減|年增|年減|財報|獲利|EPS|毛利|毛利率|法說|接單|訂單|出貨|產能|擴產|'
+        r'評等|目標價|調升|調降|合作|投資|公告|AI|ASIC|伺服器|散熱|液冷|CoWoS|先進封裝|長約|需求|供需',
+        s,
+        re.I,
+    ))
+
+
+def _looks_like_title_copy_or_meta_noise(point: str, records: list[dict] | None = None) -> bool:
+    """過濾直接複製新聞標題或混入日期／來源等中繼資訊的重點。"""
+    s = _normalize_news_text(point)
+    if not s:
+        return True
+    meta_patterns = [
+        r'(^|[｜：:；;。])\s*(標題|來源|日期)[:：]',
+        r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\b',
+        r'\bGMT\b',
+        r'^【\d{1,2}:\d{2}[^】]*】',
+        r'即時新聞',
+    ]
+    if any(re.search(p, s, re.I) for p in meta_patterns):
+        return True
+    fields = _parse_status_fields(s) if '｜' in s or '：' in s else {}
+    body_parts = [
+        str(fields.get('結果', '') or ''),
+        str(fields.get('說明', '') or ''),
+        str(fields.get('重點', '') or ''),
+        str(fields.get('依據', '') or ''),
+        str(fields.get('觀察', '') or ''),
+    ]
+    content = _strip_news_meta_noise('。'.join([p for p in body_parts if p]) or s)
+    if not content:
+        return True
+    if records:
+        for rec in records or []:
+            title = _clean_news_title(rec.get('title', ''))
+            if not title:
+                continue
+            overlap = _char_overlap_ratio(content, title)
+            if overlap >= 0.68 and len(content) <= len(title) + 32:
+                return True
+    return False
+
+
 def _looks_like_news_headline(text: str, title: str = "") -> bool:
     """判斷句子是否比較像新聞標題或導流摘要，而不是可整理的內文。"""
     s = _normalize_news_text(text)
@@ -6200,7 +6287,7 @@ def _is_valid_article_body(body: str, title: str = "", description: str = "") ->
 
 def _is_valid_news_fallback_text(text: str, title: str = "", stock_code: str = "", stock_name: str = "") -> bool:
     """原文被擋時，RSS 摘要仍須通過公司相關性與實質內容門檻。"""
-    s = _normalize_news_text(text)
+    s = _strip_news_meta_noise(text)
     title = _clean_news_title(title)
     if len(s) < 34:
         return False
@@ -6671,23 +6758,15 @@ def _article_seen_key(title: str, link: str) -> str:
 
 
 def _build_fast_rss_news_content(title: str, description: str, source: str = "", published: str = "") -> str:
-    """極速模式用：把 Google News RSS 可取得的欄位組成可送 Gemini 的素材，不抓原文。"""
+    """極速模式用：只保留可讀摘要，不把標題／來源／日期混進內文，避免 Gemini 直接複製標題。"""
     title = _clean_news_title(title)
-    description = _normalize_news_text(description)
-    source = str(source or "").strip()
-    published = str(published or "").strip()
+    description = _strip_news_meta_noise(description)
 
-    parts = []
-    if title:
-        parts.append(f"標題：{title}")
-    if description:
-        # Google News RSS 的 description 有時會重複標題；仍保留，讓 Gemini 至少知道 RSS 摘要 / 導流文字。
-        parts.append(f"摘要：{description}")
-    if source:
-        parts.append(f"來源：{source}")
-    if published:
-        parts.append(f"日期：{published}")
-    return _normalize_news_text("。".join(parts))
+    if description and title and _char_overlap_ratio(description, title) >= 0.80:
+        description = ""
+    if description and _looks_like_news_headline(description, title):
+        description = ""
+    return _normalize_news_text(description)
 
 
 def _has_representative_etf_or_index_event(text: str) -> bool:
@@ -6792,6 +6871,8 @@ def _passes_news_quality_gate(title: str, description_or_body: str, stock_code: 
         if inferred_name and inferred_name not in aliases:
             aliases.append(inferred_name)
 
+    if _is_price_only_news_without_fundamentals(combined):
+        return False
     if _is_low_value_market_news(combined):
         return False
     if not _has_substantive_company_news(combined):
@@ -7681,7 +7762,7 @@ def _news_items_to_records(news_items) -> List[dict]:
 
 def _is_bad_news_sentence(sentence: str) -> bool:
     """過濾新聞標題、三大法人清單、導流文字與非內文內容。"""
-    s = _normalize_news_text(sentence)
+    s = _strip_news_meta_noise(sentence)
     if not s or len(s) < 16:
         return True
     # 已整理成「分類｜結論｜重點｜觀察」的週報句，不能再用一般標題分隔符規則誤刪。
@@ -8170,6 +8251,18 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
             break
     return points
 
+def _refine_news_points_with_records(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
+    """移除直接複製標題、含來源日期等中繼資訊的新聞點。"""
+    cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
+    refined = []
+    for p in cleaned:
+        if _looks_like_title_copy_or_meta_noise(p, records):
+            print(f"⚠️ 略過疑似直接複製標題或中繼資訊的新聞重點：{p}")
+            continue
+        refined.append(p)
+    return refined
+
+
 def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
     """Gemini 輸出太短時，從近期原文 / RSS 摘要候選句補足重點字數；不使用新聞標題硬湊。"""
     used_points = used_points or []
@@ -8227,7 +8320,7 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
 
 def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     """新聞品質優先：素材足夠時由程式端補到 3 點，不為字數硬塞無關內容。"""
-    points = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
+    points = _refine_news_points_with_records(points, records, stock_code, stock_name)
     target_points = max(1, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
 
     if len(points) >= target_points:
@@ -8240,7 +8333,7 @@ def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock
             break
         if p not in expanded:
             expanded.append(p)
-    return _clean_news_summary_points_for_stock(expanded, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
+    return _refine_news_points_with_records(expanded, records, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
 def _parse_gemini_news_points(output_text: str, records: List[dict], stock_code: str, stock_name: str) -> List[str]:
     """只讀取 Gemini JSON 的 points；note 僅供內部說明，絕不可畫進新聞區。"""
@@ -8828,7 +8921,7 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         has_target = _news_text_matches_target_stock(combined_for_check, stock_code, stock_name)
         has_value = _has_company_value_terms(combined_for_check) or _has_substantive_company_news(combined_for_check)
 
-        # 極速 RSS 模式至少保留標題 + 摘要，不因摘要短就直接跳過。
+        # 極速 RSS 模式只保留乾淨摘要，不再把標題、來源、日期混進 body。
         if not raw_content and is_fast_rss:
             raw_content = _build_fast_rss_news_content(
                 title,
@@ -8837,8 +8930,14 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
                 published=rec.get("published", ""),
             )
 
+        raw_content = _strip_news_meta_noise(raw_content)
+        if _is_price_only_news_without_fundamentals(f"{title} {raw_content}"):
+            continue
+        if is_fast_rss and not raw_content:
+            continue
+
         min_content_len = 18 if is_fast_rss else 80
-        if len(raw_content) < min_content_len and not (is_fast_rss and has_target and has_value):
+        if len(raw_content) < min_content_len and not (is_fast_rss and has_target and has_value and raw_content):
             continue
 
         focused_content = _extract_target_focused_news_body(raw_content, stock_code, stock_name)
@@ -10552,19 +10651,25 @@ def _collect_news_title_candidates(records: List[dict], stock_code: str = "", st
         content = _normalize_news_text(rec.get("content", ""))
         if not title:
             continue
+        content = _strip_news_meta_noise(content)
         combined = _normalize_news_text(f"{title}。{content}")
         if aliases and not _news_text_matches_target_stock(combined, stock_code, stock_name):
             continue
         if not _passes_news_quality_gate(title, content or title, stock_code, stock_name):
             continue
+        if _is_price_only_news_without_fundamentals(combined):
+            continue
         # 純股價標題仍排除；但若同句有營收、EPS、需求、訂單等基本面字眼則保留。
         if _is_low_value_market_news(combined) and not _has_substantive_company_news(combined):
             continue
-        # 避免 RSS title 與 description 完全相同時重複一次，造成代號 / 數字被過濾規則誤判。
+        # 避免 RSS title 與 description 完全相同時重複一次；只有標題本身具體時才允許當備援。
         if content and _title_compare_text(content) != _title_compare_text(title) and len(content) >= 18:
             text = combined
-        else:
+        elif _can_use_news_title_as_fact(title):
             text = title
+        else:
+            continue
+        text = _strip_news_meta_noise(text)
         text = _trim_news_point(text, max_len=NEWS_SUMMARY_POINT_MAX_LEN + 26)
         if not text:
             continue
@@ -10633,7 +10738,7 @@ def _infer_news_watch(label: str, text: str) -> str:
 
 
 def _compact_news_fact_text(text: str, max_len: int = 54) -> str:
-    s = _normalize_news_text(text)
+    s = _strip_news_meta_noise(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip("。；;，, ")
     s = re.sub(r"^(焦點股|個股|台股|盤中|盤後|標題)[:：]?", "", s).strip()
     s = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", s).strip()
@@ -10715,7 +10820,7 @@ def _infer_news_headline(label: str, text: str) -> str:
 
 def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: str) -> str:
     """規則式備援：輸出可直接放入圖片的「分類｜結論｜重點｜觀察」短格式。"""
-    s = _normalize_news_text(sentence)
+    s = _strip_news_meta_noise(sentence)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = s.strip("。；;，, ")
     if not s:
@@ -12454,9 +12559,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 )
                 if _is_useless_news_analyst_row(label, status, body, s):
                     continue
-                rows.append((label, status, body, 3))
+                rows.append((label, status, body, 2))
             if not rows:
-                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
+                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 2))
             return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
