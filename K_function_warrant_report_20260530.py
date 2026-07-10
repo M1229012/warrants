@@ -582,6 +582,136 @@ def get_report_status_color(status_text: str) -> str:
         return STATUS_BULL_COLOR
     return STATUS_NEUTRAL_COLOR
 
+
+REPORT_TONE_VALUES = {"positive", "negative", "neutral", "mixed", "watch"}
+REPORT_TONE_ALIASES = {
+    "positive": "positive", "bull": "positive", "bullish": "positive", "正向": "positive", "利多": "positive", "偏多": "positive",
+    "negative": "negative", "bear": "negative", "bearish": "negative", "負向": "negative", "利空": "negative", "偏空": "negative", "偏弱": "negative",
+    "neutral": "neutral", "中性": "neutral", "無方向": "neutral", "方向不明": "neutral",
+    "mixed": "mixed", "混合": "mixed", "正負並存": "mixed", "多空交錯": "mixed",
+    "watch": "watch", "觀察": "watch", "待觀察": "watch", "追蹤": "watch",
+}
+
+
+def normalize_report_tone(value: str) -> str:
+    raw_original = str(value or "").strip().strip("。；;，,、 ")
+    raw = raw_original.lower()
+    if not raw:
+        return ""
+    if raw in REPORT_TONE_VALUES:
+        return raw
+    return REPORT_TONE_ALIASES.get(raw, REPORT_TONE_ALIASES.get(raw_original, ""))
+
+
+def get_report_tone_color(tone: str, status_text: str = "") -> str:
+    """優先依結構化 tone 決定顏色；舊資料沒有 tone 時才退回舊關鍵字規則。"""
+    normalized = normalize_report_tone(tone)
+    if normalized == "positive":
+        return STATUS_BULL_COLOR
+    if normalized == "negative":
+        return STATUS_BEAR_COLOR
+    if normalized in {"neutral", "mixed", "watch"}:
+        return STATUS_NEUTRAL_COLOR
+    return get_report_status_color(status_text)
+
+
+def _parse_report_point_fields(point) -> dict:
+    """解析「面向／分類、結果、說明、方向」欄位，供 tone 與舊流程共用。"""
+    if isinstance(point, dict):
+        label = point.get("label") or point.get("面向") or point.get("分類") or ""
+        status = point.get("status") or point.get("結果") or point.get("結論") or ""
+        detail = point.get("detail") or point.get("說明") or point.get("重點") or point.get("依據") or ""
+        tone = normalize_report_tone(point.get("tone") or point.get("方向") or "")
+        return {"label": str(label or "").strip(), "status": str(status or "").strip(), "detail": str(detail or "").strip(), "tone": tone}
+
+    s = _normalize_news_text(str(point or "")).replace("|", "｜").strip()
+    if not s:
+        return {"label": "", "status": "", "detail": "", "tone": ""}
+    is_watch = bool(re.match(r"^下週觀察[:：]", s))
+    work = re.sub(r"^下週觀察[:：]\s*", "", s)
+    aliases = {
+        "面向": "label", "分類": "label", "結果": "status", "狀態": "status", "結論": "status",
+        "說明": "detail", "重點": "detail", "依據": "detail", "方向": "tone", "tone": "tone",
+    }
+    values = {}
+    parts = [p.strip() for p in re.split(r"｜+", work) if p.strip()]
+    for idx, part in enumerate(parts):
+        m = re.match(r"^([^:：]{1,10})[:：]\s*(.*)$", part, flags=re.DOTALL)
+        if m:
+            key = m.group(1).strip()
+            value = m.group(2).strip()
+            normalized_key = aliases.get(key) or aliases.get(key.lower())
+            if normalized_key and value:
+                values[normalized_key] = value
+                continue
+        if idx == 0 and "label" not in values and len(part) <= 10:
+            values["label"] = part
+        elif idx == 1 and "status" not in values:
+            values["status"] = part
+        elif "detail" not in values:
+            values["detail"] = part
+    if is_watch:
+        values["label"] = "下週觀察"
+        values["tone"] = "watch"
+    return {
+        "label": str(values.get("label", "") or "").strip(),
+        "status": str(values.get("status", "") or "").strip(),
+        "detail": str(values.get("detail", "") or "").strip(),
+        "tone": normalize_report_tone(values.get("tone", "")),
+    }
+
+
+def _point_item_to_canonical_text(item) -> str:
+    """將 Gemini 結構化物件轉回既有字串格式，保留舊驗證、快取與排版流程。"""
+    if not isinstance(item, dict):
+        return str(item or "").strip()
+    fields = _parse_report_point_fields(item)
+    label = fields.get("label") or "新聞面"
+    status = fields.get("status") or "事件待追蹤"
+    detail = fields.get("detail") or "後續觀察實際營運與資金變化。"
+    tone = normalize_report_tone(fields.get("tone")) or "neutral"
+    try:
+        confidence = float(item.get("confidence", 1.0))
+    except Exception:
+        confidence = 1.0
+    if tone in {"positive", "negative"} and confidence < 0.65:
+        tone = "neutral"
+    prefix = "下週觀察：" if label == "下週觀察" or tone == "watch" else ""
+    if prefix:
+        label = "下週觀察"
+        tone = "watch"
+    return f"{prefix}面向：{label}｜結果：{status}｜說明：{detail}｜方向：{tone}"
+
+
+def _extract_report_tone_from_point(point) -> str:
+    return normalize_report_tone(_parse_report_point_fields(point).get("tone", ""))
+
+
+def _replace_report_point_tone(point: str, tone: str) -> str:
+    """只替換 tone 欄位，不改面向、結果與說明。"""
+    s = _normalize_news_text(str(point or "")).replace("|", "｜").strip()
+    normalized = normalize_report_tone(tone) or "neutral"
+    if not s:
+        return s
+    s = re.sub(r"｜(?:方向|tone)[:：]\s*[^｜]+", "", s, flags=re.I)
+    if re.match(r"^下週觀察[:：]", s):
+        normalized = "watch"
+    return s.rstrip("｜ ") + f"｜方向：{normalized}"
+
+
+def _strip_report_tone_metadata(point: str) -> str:
+    s = _normalize_news_text(str(point or "")).replace("|", "｜").strip()
+    return re.sub(r"｜(?:方向|tone)[:：]\s*[^｜。]+(?=。?$)", "", s, flags=re.I).strip()
+
+
+def _fallback_tone_from_status(status_text: str) -> str:
+    color = get_report_status_color(status_text)
+    if color == STATUS_BULL_COLOR:
+        return "positive"
+    if color == STATUS_BEAR_COLOR:
+        return "negative"
+    return "neutral"
+
 # 中央浮水印設定：圖片偏長，因此上下各放一個淡浮水印
 CENTER_WATERMARK_TEXT = "股市艾斯\n台股DC討論群"
 CENTER_WATERMARK_ALPHA = 0.06
@@ -5674,7 +5804,7 @@ def _points_are_independent_and_complete(points: List[str]) -> bool:
         "前述", "上述", "另一方面", "相較之下", "相對地",
     )
     for p in points:
-        s = str(p or "").strip()
+        s = _strip_report_tone_metadata(str(p or "").strip())
         if not s or s.startswith(dependent_starts):
             return False
         if "…" in s or "..." in s:
@@ -5686,14 +5816,16 @@ def _points_are_independent_and_complete(points: List[str]) -> bool:
 
 def _trim_weekly_point(text: str, max_len: int | None = None) -> str:
     max_len = int(max_len or WEEKLY_KEYPOINT_POINT_MAX_LEN)
-    s = _normalize_news_text(text)
+    tone = _extract_report_tone_from_point(text)
+    s = _strip_report_tone_metadata(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = re.sub(r"^(本週重點|重點|摘要)[:：]\s*", "", s).strip()
     # 舊版 prompt 可能輸出「結論｜依據」；顯示時改成更容易一眼辨識的標籤。
     s = re.sub(r"^結論[｜|]", "結論：", s)
     s = re.sub(r"^下週觀察[:：]結論[｜|]", "下週觀察：結論：", s)
     s = s.replace("｜依據：", "｜依據：").replace("｜觀察：", "｜觀察：")
-    return _finish_complete_summary_point(s, max_len=max_len, min_cut_len=36)
+    trimmed = _finish_complete_summary_point(s, max_len=max_len, min_cut_len=36)
+    return _replace_report_point_tone(trimmed, tone) if trimmed and tone else trimmed
 
 def _clean_weekly_key_points(raw_points: List[str]) -> List[str]:
     points = []
@@ -5754,11 +5886,13 @@ def build_key_points(ctx, stock_name: str):
     if ai_points:
         # AI 成功時不再強制插入固定勝率句型，也不使用規則式文字補字數；
         # 讓 AI 依完整資料自行判斷最值得呈現的三個重點。
-        return _clean_weekly_key_points(ai_points)[:3]
+        cleaned = _clean_weekly_key_points(ai_points)[:3]
+        return _apply_programmatic_weekly_tones(cleaned, ctx)
 
     # AI 不可用、呼叫失敗、格式不合格或內容過短時，才回到條件式備援。
     rule_points = _ensure_branch_perf_point(_rule_based_key_points(ctx, stock_name), ctx)
-    return _ensure_weekly_keypoint_min_total(rule_points, ctx, stock_name)
+    ensured = _ensure_weekly_keypoint_min_total(rule_points, ctx, stock_name)
+    return _apply_programmatic_weekly_tones(ensured, ctx)
 
 # ============================================================
 # 新聞抓取：抓一週內新聞內文並整理成真正重點
@@ -5780,7 +5914,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v18_fast_three_points"
+    internal_version = "validated_v19_structured_tone"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -6228,7 +6362,7 @@ def _looks_like_title_copy_or_meta_noise(point: str, records: list[dict] | None 
     for field_name in field_names:
         pattern = (
             rf'(?:^|｜){field_name}[:：]'
-            rf'(.*?)(?=｜(?:結果|說明|重點|依據|觀察|影響|分類|面向)[:：]|$)'
+            rf'(.*?)(?=｜(?:結果|說明|重點|依據|觀察|影響|分類|面向|方向|tone)[:：]|$)'
         )
         match = re.search(pattern, s, flags=re.DOTALL)
         if match:
@@ -8107,7 +8241,8 @@ def _split_news_sentences(text: str) -> List[str]:
 
 def _trim_news_point(text: str, max_len: int | None = None) -> str:
     max_len = int(max_len or NEWS_SUMMARY_POINT_MAX_LEN)
-    s = _normalize_news_text(text)
+    tone = _extract_report_tone_from_point(text)
+    s = _strip_report_tone_metadata(text)
     s = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", s).strip()
     s = re.sub(r"^(新聞重點|新聞線索|本週新聞重點|本週重點|重點|摘要)[:：]\s*", "", s).strip()
     s = re.sub(r"^(以下為您|以下是|為您整理|整理如下|統整如下|重點如下)[：:，,。\s]*", "", s).strip()
@@ -8119,7 +8254,8 @@ def _trim_news_point(text: str, max_len: int | None = None) -> str:
     s = s.replace("而獲得重新評價的機會", "，使市場關注度升溫")
     s = s.replace("重新評價的機會", "市場關注度升溫")
     s = s.replace("相關成長動能與市場關注度", "相關訂單、營收與市場關注度")
-    return _finish_complete_summary_point(s, max_len=max_len, min_cut_len=32)
+    trimmed = _finish_complete_summary_point(s, max_len=max_len, min_cut_len=32)
+    return _replace_report_point_tone(trimmed, tone) if trimmed and tone else trimmed
 
 def _score_news_sentence(sentence: str, keywords: List[str], stock_code: str, stock_name: str) -> int:
     s = str(sentence or "")
@@ -8198,8 +8334,8 @@ def _clean_summary_points(raw_points: List[str]) -> List[str]:
 
 
 def _count_summary_chars(points: List[str]) -> int:
-    """計算新聞重點實際文字量；排除項目符號與空白，避免低於圖片需要的資訊密度。"""
-    joined = "".join(str(p or "") for p in points or [])
+    """計算重點實際文字量；tone 為控制欄位，不計入圖卡內容字數。"""
+    joined = "".join(_strip_report_tone_metadata(str(p or "")) for p in points or [])
     joined = re.sub(r"[\s•\-–—\d\.、\)）:：，,。；;]", "", joined)
     return len(joined)
 
@@ -8217,7 +8353,13 @@ def _parse_raw_points_from_llm(output_text: str) -> List[str]:
             line = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", line).strip()
             if line:
                 raw_points.append(line)
-    return [str(p) for p in raw_points]
+
+    points = []
+    for item in raw_points:
+        point = _point_item_to_canonical_text(item)
+        if point:
+            points.append(point)
+    return points
 
 
 def _clean_news_summary_points(raw_points: List[str]) -> List[str]:
@@ -8344,17 +8486,8 @@ def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock
     return _refine_news_points_with_records(expanded, records, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
 def _parse_gemini_news_points(output_text: str, records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """只讀取 Gemini JSON 的 points；note 僅供內部說明，絕不可畫進新聞區。"""
-    parsed = _extract_json_from_text(output_text)
-    if isinstance(parsed, dict):
-        raw_points = parsed.get("points", []) or []
-    elif isinstance(parsed, list):
-        raw_points = parsed
-    else:
-        # 只有非 JSON 回覆才允許退回逐行解析；避免 {"points": [], "note": ...}
-        # 被當成一般文字後將 note 誤畫進圖片。
-        raw_points = _parse_raw_points_from_llm(output_text)
-    raw_points = [str(p) for p in raw_points if str(p or "").strip()]
+    """讀取 Gemini 結構化 points；note 僅供內部說明，絕不可畫進新聞區。"""
+    raw_points = _parse_raw_points_from_llm(output_text)
     return _ensure_news_summary_min_total(raw_points, records, stock_code, stock_name)
 
 def _get_warrants_api_keys() -> List[str]:
@@ -8429,24 +8562,32 @@ def _build_gemini_points_response_schema(
     max_points: int = 3,
     include_note: bool = False,
 ) -> dict:
-    """建立新聞與本週重點共用的 Gemini JSON Schema。"""
+    """建立新聞與本週重點共用的結構化 Gemini JSON Schema。"""
     min_points = max(0, int(min_points or 0))
     max_points = max(min_points, int(max_points or min_points or 1))
+    point_schema = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string"},
+            "status": {"type": "string"},
+            "detail": {"type": "string"},
+            "tone": {"type": "string", "enum": ["positive", "negative", "neutral", "mixed", "watch"]},
+            "confidence": {"type": "number"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["label", "status", "detail", "tone", "confidence", "evidence"],
+    }
     properties = {
         "points": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": point_schema,
             "minItems": min_points,
             "maxItems": max_points,
         },
     }
     if include_note:
         properties["note"] = {"type": "string"}
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": ["points"],
-    }
+    return {"type": "object", "properties": properties, "required": ["points"]}
 
 
 _GROUNDED_NUMBER_RE = re.compile(
@@ -9028,19 +9169,22 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 
 分析原則：
 1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件；同一事件多來源合併，不得拿股價漲跌、熱門排行或大盤盤勢湊數。
-2. 每點固定為「分類｜結果：具體結論｜說明：關鍵事實與後續追蹤。」；結果不可寫「重點待確認」「題材待觀察」等空句。
+2. 每個 points item 必須回傳 label、status、detail、tone、confidence、evidence；status 不可寫「重點待確認」「題材待觀察」等空句。
+2-1. tone 只能是 positive、negative、neutral、mixed、watch：明確利多用 positive，明確利空用 negative，正負並存用 mixed，無明確方向用 neutral，單純後續觀察用 watch。
+2-2. 「受關注」不等於 positive；創新高必須確認是營收、獲利、毛利率、接單等正向指標，若是虧損、庫存、負債創高則為 negative。
+2-3. confidence 為 0 到 1；evidence 只列素材中直接支持判斷的短片段，不得自行補數字。
 3. 公司身分必須明確對應代號 {stock_code} 或名稱 {display_name}；相似公司名但沒有代號時排除，不得混用其他公司的營收、EPS、目標價或題材。
 4. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
 5. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。
 6. 每點需獨立完整、自然收尾並以句號結束；字數與過長內容由程式端清理，你只需優先保留最具體的事實。
 
 好範例：
-- 公司動態｜結果：新訂單提高能見度｜說明：公司取得新案，後續觀察出貨時程與營收認列進度。
-- 業績更新｜結果：營收成長仍待延續｜說明：營收維持年增但月減，後續看成長動能與毛利率變化。
+- {{"label":"公司動態","status":"新訂單提高能見度","detail":"公司取得新案，後續觀察出貨時程與營收認列進度。","tone":"positive","confidence":0.92,"evidence":["取得新案"]}}
+- {{"label":"業績更新","status":"營收年增但月減","detail":"營收維持年增但短期月減，後續看成長動能與毛利率變化。","tone":"mixed","confidence":0.90,"evidence":["年增","月減"]}}
 
 壞範例：
-- 題材觀察｜結果：題材仍待確認｜說明：後續持續關注。
-- 法人觀點｜結果：市場偏多｜說明：公司未來值得期待。
+- {{"label":"題材觀察","status":"題材仍待確認","detail":"後續持續關注。","tone":"positive","confidence":0.95,"evidence":[]}}
+- {{"label":"法人觀點","status":"市場偏多","detail":"公司未來值得期待。","tone":"positive","confidence":0.90,"evidence":[]}}
 
 只回傳符合 JSON Schema 的 JSON，不要 markdown 或其他說明。
 
@@ -9083,8 +9227,8 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你是台股財經新聞編輯。上一版輸出未通過檢查，請只依修正資料重新整理 {stock_code} {display_name}。
 
 修正原則：
-1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件，固定格式為「分類｜結果：具體結論｜說明：關鍵事實與後續追蹤。」。
-2. 每點必須獨立完整並以句號結束，不得使用空泛結果或承接上一點。
+1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件，每個 item 必須包含 label、status、detail、tone、confidence、evidence。
+2. 每點必須獨立完整；tone 只能是 positive、negative、neutral、mixed、watch，並依事件真正方向判斷，不得把「受關注」直接當利多。
 3. 公司必須明確對應 {stock_code} {display_name}，不得混入相似公司或其他公司的資料。
 4. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；找不到就刪除該數字或改寫該點。
 5. 不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
@@ -9816,6 +9960,66 @@ def _get_weekly_institutional_context(ctx: dict) -> dict:
     }
 
 
+
+def _derive_technical_tone_from_ctx(ctx: dict) -> str:
+    """技術面顏色只依程式已計算的技術卡片結果，不依 AI 新詞猜測。"""
+    try:
+        card = _build_technical_card_summary(ctx)
+        headline = str(card.get("headline", "") or "")
+    except Exception:
+        return "neutral"
+    if any(k in headline for k in ["跌破", "轉弱", "空頭", "死亡交叉", "修正壓力"]):
+        return "negative"
+    if any(k in headline for k in ["站上均線", "偏強", "多頭排列", "黃金交叉", "突破"]):
+        return "positive"
+    return "neutral"
+
+
+def _derive_weekly_point_tone(point: str, ctx: dict) -> str:
+    """技術／法人／權證由實際數據決定 tone；新聞保留 Gemini 結構化判斷。"""
+    fields = _parse_report_point_fields(point)
+    label = str(fields.get("label", "") or "")
+    current_tone = normalize_report_tone(fields.get("tone", ""))
+    full_text = str(point or "")
+    if label == "下週觀察" or re.match(r"^下週觀察[:：]", full_text):
+        return "watch"
+    if "技術" in label:
+        return _derive_technical_tone_from_ctx(ctx)
+    if "法人" in label:
+        classification = str(_get_weekly_institutional_context(ctx).get("classification", "") or "")
+        if classification == "偏多":
+            return "positive"
+        if classification == "偏空":
+            return "negative"
+        return "neutral"
+    if "權證" in label:
+        required = _get_required_representative_branch_analysis(ctx)
+        if required:
+            branch = str(required.get("branch", "") or "")
+            side = str(required.get("side", "") or "")
+            if branch and branch in full_text:
+                if "買" in side:
+                    return "positive"
+                if "賣" in side:
+                    return "negative"
+        net_value = float(ctx.get("total_net", 0) or 0)
+        if net_value > 0:
+            return "positive"
+        if net_value < 0:
+            return "negative"
+        return "neutral"
+    return current_tone or "neutral"
+
+
+def _apply_programmatic_weekly_tones(points: List[str], ctx: dict) -> List[str]:
+    out = []
+    for point in points or []:
+        s = str(point or "").strip()
+        if s:
+            out.append(_replace_report_point_tone(s, _derive_weekly_point_tone(s, ctx)))
+    return out
+
+
 def _build_rule_based_crossflow_point(ctx: dict) -> str:
     inst_ctx = _get_weekly_institutional_context(ctx)
     inst_total = float(inst_ctx.get("weekly_total", 0) or 0)
@@ -9849,7 +10053,7 @@ def _weekly_keypoints_cache_task() -> str:
         "_",
         str(WEEKLY_KEYPOINT_STYLE_VERSION or "validated_v24_json_grounded_previous_week"),
     )
-    return f"weekly_keypoints_{safe_version}"
+    return f"weekly_keypoints_{safe_version}_structured_tone_v25"
 
 
 def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
@@ -10398,20 +10602,21 @@ def _repair_weekly_expert_points(
 你是專業且中立的台股研究員。上一版重點未通過檢查，請只依修正資料重新輸出。
 
 修正原則：
-1. 剛好 3 點；前 2 點分析本週已發生事件，第 3 點以「下週觀察：」開頭。
-2. 固定格式為「面向：技術面/權證面/法人面/新聞面｜結果：具體結論｜說明：資料依據。」；下週點使用面向：下週觀察。
+1. 剛好 3 點；前 2 點分析本週已發生事件，第 3 點的 label 必須是「下週觀察」。
+2. 每個 item 必須包含 label、status、detail、tone、confidence、evidence；第 3 點 label 為「下週觀察」且 tone 為 watch。
+2-1. tone 只能是 positive、negative、neutral、mixed、watch，並依數據真正方向判斷；正負並存用 mixed，方向有限用 neutral。
 3. 優先指出 previous_week_comparison 與本週之間的延續、反轉或方向分歧，不要只播報本週單一數字。
 4. 點名分點時，只能使用代表性分點，並完整寫出本週方向與金額、歷史勝率、平均持有天數及歷史加權報酬率。
 5. 技術面使用 price_ma_volume.ma_signal 與 price_volume_pattern.current_pattern_label；法人接近中性時不得誇大。
 6. 每個數字都必須在 full_weekly_data 中找到；不得換算、推估、補數字或提供買賣建議。每點獨立完整並以句號結束。
 
 好範例：
-- 面向：權證面｜結果：分點買盤延續｜說明：代表性分點本週維持買超，並結合完整歷史績效說明時間尺度。
-- 下週觀察：面向：下週觀察｜結果：確認資金是否續強｜說明：若權證淨流向與法人方向同步改善，再觀察價量是否確認。
+- {{"label":"權證面","status":"分點買盤延續","detail":"代表性分點本週維持買超，並結合完整歷史績效說明時間尺度。","tone":"positive","confidence":0.95,"evidence":["代表性分點本週維持買超"]}}
+- {{"label":"下週觀察","status":"確認資金是否續強","detail":"若權證淨流向與法人方向同步改善，再觀察價量是否確認。","tone":"watch","confidence":0.90,"evidence":["權證淨流向與法人方向"]}}
 
 壞範例：
-- 面向：新聞面｜結果：重點待確認｜說明：後續持續觀察。
-- 面向：技術面｜結果：偏多｜說明：KD與MACD值得留意。
+- {{"label":"新聞面","status":"重點待確認","detail":"後續持續觀察。","tone":"positive","confidence":0.90,"evidence":[]}}
+- {{"label":"技術面","status":"偏多","detail":"KD與MACD值得留意。","tone":"positive","confidence":0.90,"evidence":[]}}
 
 只回傳符合 JSON Schema 的 JSON。
 
@@ -10457,8 +10662,9 @@ def _repair_weekly_points_with_required_branch(
 你是專業且中立的台股研究員。上一版漏掉必要的代表性分點資料，請只依修正資料重寫。
 
 原則：
-1. 剛好 3 點；前 2 點為本週分析，第 3 點以「下週觀察：」開頭。
-2. 每點使用「面向：...｜結果：具體結論｜說明：資料依據。」並以句號結束。
+1. 剛好 3 點；前 2 點為本週分析，第 3 點的 label 必須是「下週觀察」。
+2. 每個 item 必須包含 label、status、detail、tone、confidence、evidence；第 3 點 label 為「下週觀察」且 tone 為 watch。
+2-1. tone 只能是 positive、negative、neutral、mixed、watch，並依數據方向判斷。
 3. 其中 1 點完整使用 required_representative_branch_analysis，包含分點名稱、本週方向與金額、勝率、平均持有天數與歷史加權報酬率。
 4. 另 1 點使用均線訊號與程式判定價量型態；不得羅列均線價格或只寫 KD、MACD。
 5. 優先比較 previous_week_comparison，指出延續、反轉或分歧。
@@ -10499,20 +10705,22 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 你是專業且中立的台股研究員。只能使用下方 JSON，整理「本週重點與下週觀察」，使用繁體中文。
 
 分析原則：
-1. 剛好輸出 3 點：前 2 點分析本週已發生事件，第 3 點必須以「下週觀察：」開頭。
-2. 每點固定為「面向：技術面/權證面/法人面/新聞面｜結果：具體結論｜說明：資料依據。」；下週點使用面向：下週觀察。不得寫「重點待確認」「題材待觀察」等空句。
+1. 剛好輸出 3 點：前 2 點分析本週已發生事件，第 3 點的 label 必須是「下週觀察」。
+2. 每個 points item 必須回傳 label、status、detail、tone、confidence、evidence；第 3 點 label 必須是「下週觀察」且 tone 必須是 watch。不得寫「重點待確認」「題材待觀察」等空句。
+2-1. tone 只能是 positive、negative、neutral、mixed、watch。技術面、法人面與權證面的 tone 必須依 JSON 數據方向判斷；正負訊號並存使用 mixed，方向有限使用 neutral。
+2-2. confidence 為 0 到 1；evidence 只列 JSON 中直接支持判斷的資料片段。
 3. 優先比較 previous_week_comparison，指出權證淨流向、法人合計或 TOP5 分點的延續、反轉與方向分歧；不要只播報本週數字。
 4. 點名分點時，只能使用代表性分點，並完整使用本週方向與金額、歷史勝率、平均持有天數、歷史加權報酬率；小額分點不得點名。
 5. 技術面使用 price_ma_volume.ma_signal 與 price_volume_pattern.current_pattern_label；法人分類為接近中性時，只能描述方向有限或尚未明確。
 6. 所有數字都必須在 JSON 中找到，不得換算、推估或補充；不得提供買賣建議。每點需獨立完整並以句號結束。
 
 好範例：
-- 面向：權證面｜結果：權證買盤連續增強｜說明：本週淨流向較上週改善，代表性分點同步買超並有完整歷史績效支持。
-- 下週觀察：面向：下週觀察｜結果：確認價量能否轉強｜說明：若權證與法人方向同步改善，再觀察程式判定型態是否獲得量能確認。
+- {{"label":"權證面","status":"權證買盤連續增強","detail":"本週淨流向較上週改善，代表性分點同步買超並有完整歷史績效支持。","tone":"positive","confidence":0.95,"evidence":["本週淨流向較上週改善"]}}
+- {{"label":"下週觀察","status":"確認價量能否轉強","detail":"若權證與法人方向同步改善，再觀察程式判定型態是否獲得量能確認。","tone":"watch","confidence":0.90,"evidence":["權證與法人方向"]}}
 
 壞範例：
-- 面向：新聞面｜結果：題材仍待確認｜說明：後續持續關注。
-- 面向：技術面｜結果：偏多｜說明：KD、MACD與均線值得留意。
+- {{"label":"新聞面","status":"題材仍待確認","detail":"後續持續關注。","tone":"positive","confidence":0.90,"evidence":[]}}
+- {{"label":"技術面","status":"偏多","detail":"KD、MACD與均線值得留意。","tone":"positive","confidence":0.90,"evidence":[]}}
 
 只回傳符合 JSON Schema 的 JSON，不要 markdown 或其他說明。
 
@@ -10530,6 +10738,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
         )
         points = _parse_weekly_gemini_points(output_text or "")
         points = _supplement_weekly_branch_metrics_in_points(points, ctx)
+        points = _apply_programmatic_weekly_tones(points, ctx)
         problems = _validate_weekly_points(points, payload, ctx)
 
         if problems:
@@ -10541,6 +10750,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
                 stock_name,
                 problems,
             )
+            repaired_points = _apply_programmatic_weekly_tones(repaired_points, ctx)
             repaired_problems = _validate_weekly_points(
                 repaired_points,
                 payload,
@@ -10845,7 +11055,10 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
     headline = _infer_news_headline(label, s)
     watch = _infer_news_watch(label, s).replace("追蹤", "後續看", 1)
     detail = f"{fact}；{watch}"
-    point = f"{label}｜結果：{headline}｜說明：{detail}"
+    tone = _fallback_tone_from_status(headline)
+    if "年增" in s and "月減" in s:
+        tone = "mixed"
+    point = f"{label}｜結果：{headline}｜說明：{detail}｜方向：{tone}"
     point = _normalize_chinese_numbers_for_news(point)
     point = _trim_news_point(point, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
     if not point or _is_bad_news_sentence(point):
@@ -12118,7 +12331,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
             parts = [p.strip() for p in re.split(r"｜+", s) if p.strip()]
             known_keys = {
-                "面向", "結果", "說明", "分類", "結論", "依據", "重點", "觀察", "條件", "追蹤", "影響", "狀態",
+                "面向", "結果", "說明", "分類", "結論", "依據", "重點", "觀察", "條件", "追蹤", "影響", "狀態", "方向", "tone", "信心", "證據",
             }
 
             # 新版最理想格式：技術面｜偏弱整理｜說明文字
@@ -12162,8 +12375,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         def _strip_status_labels(text):
             s = _normalize_card_text(text)
             s = re.sub(r"^下週觀察[:：]\s*", "", s)
-            s = re.sub(r"^(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態)[:：]", "", s)
-            s = re.sub(r"｜\s*(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態)[:：]", "。", s)
+            s = re.sub(r"^(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態|方向|tone|信心|證據)[:：]", "", s)
+            s = re.sub(r"｜\s*(面向|結果|說明|結論|依據|重點|觀察|條件|追蹤|影響|狀態|方向|tone|信心|證據)[:：]", "。", s)
             s = re.sub(r"^[^｜:：]{2,8}｜[^｜:：]{1,12}｜", "", s)
             s = re.sub(r"^[^｜:：]{2,8}｜", "", s)
             s = re.sub(r"\s+", " ", s).strip(" ｜")
@@ -12493,7 +12706,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         status = str(tech_card.get("headline", status) or status)
                         body = str(tech_card.get("detail", body) or body)
                 body = _inject_branch_perf_into_warrant_body(label, status, body, s)
-                rows.append((label, status, body, 3))
+                tone = _extract_report_tone_from_point(s)
+                if not tone:
+                    tone = _derive_weekly_point_tone(s, ctx)
+                rows.append((label, status, body, 3, tone))
                 if len(rows) >= 3:
                     break
             tech_card = _build_technical_card_summary(ctx)
@@ -12503,6 +12719,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     str(tech_card.get("headline", "技術訊號待確認") or "技術訊號待確認"),
                     str(tech_card.get("detail", "目前技術訊號仍需確認。") or "目前技術訊號仍需確認。"),
                     3,
+                    _derive_technical_tone_from_ctx(ctx),
                 )
                 if len(rows) < 3:
                     rows.insert(0, tech_row)
@@ -12514,7 +12731,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                             break
                     rows[replace_idx] = tech_row
             if not rows:
-                rows.append(("重點面", "重點待確認", "本週暫無足夠明確資料可整理成重點。", 2))
+                rows.append(("重點面", "重點待確認", "本週暫無足夠明確資料可整理成重點。", 2, "neutral"))
             return rows[:3]
 
         def _has_substantive_news_analyst_view(text: str) -> bool:
@@ -12567,9 +12784,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 )
                 if _is_useless_news_analyst_row(label, status, body, s):
                     continue
-                rows.append((label, status, body, 2))
+                tone = _extract_report_tone_from_point(s) or "neutral"
+                rows.append((label, status, body, 2, tone))
             if not rows:
-                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 2))
+                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 2, "neutral"))
             return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
@@ -12612,7 +12830,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         ):
             y = y_start
             max_width_axes = max(0.05, x_right - x_left)
-            for idx, (label, status, body, max_lines) in enumerate(sections):
+            for idx, section in enumerate(sections):
+                if len(section) >= 5:
+                    label, status, body, max_lines, tone = section[:5]
+                else:
+                    label, status, body, max_lines = section[:4]
+                    tone = ""
                 if y <= y_min:
                     break
                 label = str(label or "重點面").strip()
@@ -12667,7 +12890,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     y,
                     status,
                     transform=ax_notes.transAxes,
-                    color=get_report_status_color(status),
+                    color=get_report_tone_color(tone, status),
                     fontsize=status_fontsize,
                     fontweight="bold",
                     ha="left",
