@@ -6,17 +6,20 @@ on:
       run_plan:
         description: "執行方案"
         required: true
-        default: "精選5分點當日買賣超產圖"
+        default: "每日自動流程"
         type: choice
         options:
-          - "精選5分點當日買賣超產圖"
-          - "完整資料回補與回測"
+          - "每日自動流程"
+          - "長期留單補價格"
+          - "完整修補模式"
 
   schedule:
     # Asia/Taipei 17:10 = UTC 09:10
+    # 太早跑時，daily 會先輕量探測；如果分點資料還沒出來，只補價格後停止。
     - cron: "10 9 * * 1-5"
 
     # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
+    # 分點資料出來後，daily 會正式產報表；同日已成功 prescan 則吃快取。
     - cron: "5,35 13 * * 1-5"
 
 jobs:
@@ -28,10 +31,16 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
 
-      # 只保留兩種方案：
-      # 1. 精選5分點當日買賣超產圖：每日盤後快速模式，只抓最新資料、產生 今日_A/B/C/D/E 給圖片使用。
-      # 2. 完整資料回補與回測：其他時間手動完整補歷史、重算 A/B/C/D/E、勝率、排行與完整價格。
-      RUN_PLAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && 'full_report' || 'daily_signal' }}
+      # ============================================================
+      # 新版統一模式
+      # daily    ：每日自動流程，平常排程與日常手動都用這個
+      # longterm ：長期留單補價格，目前程式先有入口防呆，之後接完整分析
+      # repair   ：完整修補模式，懷疑漏抓或快取異常時手動使用
+      # ============================================================
+      WORKFLOW_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '長期留單補價格' && 'longterm' || github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'repair' || 'daily' }}
+
+      # 保留相容舊 RUN_PLAN
+      RUN_PLAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'full_report' || github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '長期留單補價格' && 'longterm' || 'daily_signal' }}
 
       # 基本快取設定
       USE_CACHE: "1"
@@ -39,39 +48,67 @@ jobs:
 
       OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
       OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
-      
 
+      # ============================================================
       # 分點模式
-      # 每日產圖 = 精選5分點 RUN_MODE=1
-      # 完整回補 = 完整分點清單 RUN_MODE=2
-      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '2' || '1' }}
+      # daily    ：精選 5 分點，RUN_MODE=1
+      # longterm ：固定看全分點歷史，RUN_MODE=2
+      # repair   ：完整修補，全分點，RUN_MODE=2
+      # ============================================================
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整修補模式' || github.event.inputs.run_plan == '長期留單補價格') && '2' || '1' }}
 
       # OpenAPI 今日有成交權證預篩天數
-      # 每日產圖只看最新交易日；完整回補用最近 3 天提高完整性。
-      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '3' || '1' }}
+      # daily 用 1 天；repair 用 3 天提高完整性。
+      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '3' || '1' }}
 
-      # 每次都重新抓 OpenAPI + API4，避免錯過今天新權證。
+      # 每次都重新抓 OpenAPI 活動權證清單，避免錯過今天新權證。
       ACTIVE_WARRANT_FORCE_REFRESH: "1"
 
-      # 每日產圖模式：每組候選只抓最近 12 筆 API5，足夠判斷 A/B/C/D/E 今日訊號。
+      # ============================================================
+      # daily 輕量探測
+      # 先用最近 3~5 個交易日有活動的權證，探測今天分點資料是否已出來。
+      # 如果還沒出來，就只補價格後停止，不跑全市場 50 天 prescan。
+      # ============================================================
+      DAILY_LIGHT_PROBE_ENABLED: "1"
+      DAILY_LIGHT_PROBE_SAMPLE_SIZE: "300"
+      DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS: "5"
+      DAILY_LIGHT_PROBE_SCAN_DAYS: "2"
+      DAILY_LIGHT_PROBE_WORKERS: "80"
+
+      # ============================================================
+      # prescan 掃描天數
+      # 這裡不要改小。
+      # 50 天是為了避免漏抓較早出現過、但近期才進入條件的新候選。
+      # daily 第二次會靠 prescan_status 跳過，不是靠縮短天數加速。
+      # ============================================================
+      FAST_SKIP_RECENT_PRESCAN: "0"
+      CACHE_RECENT_SCAN_DAYS: "50"
+      SELECTED_FULL_SCAN_DAYS: "50"
+
+      # 每日訊號 API5 抓取天數
       DAILY_SIGNAL_API5_DAYS: "12"
 
-      # 完整回補模式：新候選抓完整歷史；既有候選補最近 5 筆。
-      INITIAL_HISTORY_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '750' || '250' }}
-      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '5' || '3' }}
+      # repair 模式抓完整歷史；daily 保持較輕量。
+      INITIAL_HISTORY_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '750' || '250' }}
+      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '5' || '3' }}
 
       # 歷史快取 append / merge 保護，一定要保留，避免 Google Sheet 舊資料被洗掉。
       HISTORY_CACHE_APPEND_ONLY: "1"
       HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
 
-      # 每日產圖也要抓圖片需要的價格；完整回補也抓完整價格。
+      # 價格設定
       SKIP_PRICE_FETCH: "0"
+      PRICE_FETCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'full' || 'today' }}
 
-      # 每日產圖只補 今日_* 需要的價格；完整回補補完整歷史缺價。
-      PRICE_FETCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && 'full' || 'today' }}
+      # 價格預抓狀態
+      # 保留盤後重試邏輯，避免太早跑過一次後，晚點價格出來卻不再補。
+      PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE: "1"
+      PRICE_PREFETCH_FORCE: "0"
+      PRICE_PREFETCH_ALL_ITEM_PRICES: "0"
+      AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING: "1"
 
-      # 主程式仍保留完整歷史主表邏輯；每日產圖模式會提前只輸出 今日_*，不重算主表。
-      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '1' || '0' }}
+      # 主程式仍保留完整歷史主表邏輯；daily 只輸出今日產圖需要資料。
+      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '1' || '0' }}
       TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
       DATA_UPDATE_ONLY: "0"
 
@@ -82,9 +119,20 @@ jobs:
       # 不抓群組事件每一檔權證價格，只看標的股價格。
       FETCH_GROUP_WARRANT_PRICES: "0"
 
-      # 保留相容舊設定，不作為主要跳過依據。
-      FAST_SKIP_RECENT_PRESCAN: "0"
-      CACHE_RECENT_SCAN_DAYS: "3"
+      # ============================================================
+      # MoneyDJ Search Repair
+      # daily：不啟用，資料沒出來就補價格後停止
+      # repair：啟用，完整補漏
+      # ============================================================
+      MONEYDJ_SEARCH_REPAIR_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '1' || '0' }}
+      MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS: "45"
+      MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION: "1"
+      MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL: "1"
+      MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS: "0"
+      MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED: "1"
+      MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH: "1"
+      MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH: "0"
+      MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH: "0"
 
       # Google Sheet 設定
       GSHEET_ENABLE: "1"
@@ -97,13 +145,19 @@ jobs:
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
 
       # Supabase 設定
+      # 目前 prescan_status / prescan_refresh_keys 走 Google Sheet 快取同步即可。
       SUPABASE_CACHE_ENABLED: "0"
 
       # 執行緒設定
-      MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '60' || '80' }}
+      # daily 可先用 80；repair 保守用 60。
+      MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
       PRICE_WORKERS: "60"
-      PRESCAN_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整資料回補與回測' && '60' || '80' }}
+      PRESCAN_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
       FIND_BROKER_WORKERS: "40"
+
+      # Google Sheet 寫入節流
+      # 先維持穩定值，確認新版流程穩定後再考慮降到 1.0 或 0.8。
+      GSHEET_WRITE_SLEEP_SECONDS: "1.25"
 
     steps:
       - name: Checkout repository
