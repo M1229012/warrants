@@ -15410,7 +15410,10 @@ def longterm_target_date_from_history(history_df):
         if activity_cols:
             activity_sum = pd.Series(0.0, index=df.index)
             for col in activity_cols:
-                activity_sum = activity_sum + pd.to_numeric(df[col], errors="coerce").fillna(0).abs()
+                # Google Sheet 讀回來的數字可能是 "1,234" 字串，
+                # 不能直接 pd.to_numeric，否則會變 NaN，導致誤判沒有活動。
+                activity_values = df[col].map(longterm_safe_float)
+                activity_sum = activity_sum + activity_values.fillna(0).abs()
             active_df = df[activity_sum > 0].copy()
         else:
             active_df = df
@@ -15469,15 +15472,18 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
     df = history_df.copy().fillna("")
     df = fix_known_underlying_info_dataframe(df, "權證名稱", "標的股", "標的名稱")
     df["日期"] = df["日期"].map(normalize_date_str)
-    df["_dt"] = pd.to_datetime(df["日期"].astype(str).str.replace("/", "-", regex=False), errors="coerce")
-    df = df[df["_dt"].notna()].copy()
-    df = df[df["_dt"].dt.date <= target_dt.date()].copy()
+    # 不使用底線開頭欄名，例如 _dt。pandas itertuples() 會把底線欄名改名，
+    # 導致 row._asdict().get("_dt") 取不到值，最後所有列都被跳過。
+    df["dt_parsed"] = pd.to_datetime(df["日期"].astype(str).str.replace("/", "-", regex=False), errors="coerce")
+    df = df[df["dt_parsed"].notna()].copy()
+    df = df[df["dt_parsed"].dt.date <= target_dt.date()].copy()
 
     if df.empty:
         return []
 
     for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        # Google Sheet 讀回可能含千分位逗號，直接 pd.to_numeric 會變 NaN。
+        df[col] = df[col].map(longterm_safe_float).fillna(0.0)
 
     open_lots = []
     group_cols = ["分點", "分點名稱", "券商代號", "權證代號", "權證名稱", "標的股", "標的名稱"]
@@ -15485,11 +15491,10 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
     for key, g in df.groupby(group_cols, dropna=False, sort=False):
         broker_label, broker_name, broker_code, warrant_code, warrant_name, underlying_code, underlying_name = key
         lots = []
-        g = g.sort_values(["_dt", "日期"]).reset_index(drop=True)
+        g = g.sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
 
-        for row in g.itertuples(index=False):
-            rd = row._asdict()
-            trade_dt = rd.get("_dt")
+        for rd in g.to_dict("records"):
+            trade_dt = rd.get("dt_parsed")
             if pd.isna(trade_dt):
                 continue
             trade_date = trade_dt.strftime("%Y/%m/%d")
@@ -15522,7 +15527,8 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
                 if sell_qty_left <= 0:
                     break
                 buy_dt = parse_date(lot.get("買進日"))
-                if not buy_dt or trade_dt.to_pydatetime().date() <= buy_dt.date():
+                trade_day = trade_dt.to_pydatetime().date() if hasattr(trade_dt, "to_pydatetime") else trade_dt.date()
+                if not buy_dt or trade_day <= buy_dt.date():
                     continue
 
                 remain_qty = float(lot.get("剩餘股數", 0) or 0)
@@ -15553,6 +15559,7 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
             lot["剩餘均價"] = remain_cost / remain_qty if remain_qty > 0 else None
             open_lots.append(lot)
 
+    print(f"  ✅ FIFO 未出清部位重建完成：{len(open_lots):,} 筆")
     return open_lots
 
 
