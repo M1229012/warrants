@@ -11,6 +11,7 @@ import time
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
@@ -136,15 +137,26 @@ def is_compact_report_mode() -> bool:
 
 def get_report_mode_label() -> str:
     return "精簡週報（不含本週重點與本週新聞）" if is_compact_report_mode() else "完整週報"
-# 截圖式輸出設定：先用原本高解析度產圖，再等比例縮小後輸出，模擬「截圖後送出」以降低檔案大小。
+# 截圖式輸出設定：先用合理的中間解析度產圖，再等比例縮小後輸出，模擬「截圖後送出」以降低檔案大小。
 SCREENSHOT_OUTPUT_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-SCREENSHOT_OUTPUT_SCALE = float(os.getenv("WARRANT_SCREENSHOT_OUTPUT_SCALE", "0.6"))
+SCREENSHOT_OUTPUT_SCALE = float(os.getenv("WARRANT_SCREENSHOT_OUTPUT_SCALE", "1.0"))
 # 截圖式輸出改用最大寬度限制，讓實際效果更接近「螢幕截圖」；0 代表不限制。
 SCREENSHOT_OUTPUT_MAX_WIDTH = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH", "2400"))
 SCREENSHOT_OUTPUT_FORMAT = os.getenv("WARRANT_SCREENSHOT_OUTPUT_FORMAT", "PNG").strip().upper() or "PNG"
 SCREENSHOT_OUTPUT_JPEG_QUALITY = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY", "88"))
 # PNG 仍是無損格式，長圖可能很大；轉成 256 色調色盤 PNG 可大幅縮檔，文字線條通常仍清楚。
 SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# 執行時間與圖片輸出效能設定：
+# 1. 原始週報會在 28 吋寬畫布上以 220 DPI 產生超大 PNG，之後又縮到 2400px 寬。
+#    預設改成 130 DPI，在明顯降低中間圖像素的同時，保留較佳的細線與小字抗鋸齒。
+# 2. 中間 PNG 只會立刻交給 Pillow 解碼與縮圖，不需要高壓縮；最終 PNG 再使用適度壓縮。
+# 3. 所有效能參數都保留環境變數，可在不改程式的情況下恢復原設定。
+REPORT_TIMING_ENABLE = os.getenv("WARRANT_REPORT_TIMING_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+REPORT_OUTPUT_DPI = int(os.getenv("WARRANT_REPORT_OUTPUT_DPI", "130"))
+REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL", "1"))
+SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL", "6"))
+SCREENSHOT_OUTPUT_PNG_OPTIMIZE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_OPTIMIZE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # K 線圖 Y 軸留白設定：避免價格已經很集中時，上下空白仍過大。
 # 調小後會讓股價區更貼近實際波動範圍，但仍保留少量空間給均線、布林與文字標註。
@@ -327,6 +339,12 @@ LLM_CACHE_FORCE_REFRESH = os.getenv("WARRANT_LLM_CACHE_FORCE_REFRESH", "0").stri
 _THREAD_LOCAL = threading.local()
 _FETCH_STATS_LOCK = threading.Lock()
 _FETCH_STATS = {}
+
+# 同一場程式執行中共用 Google Sheet 授權 client 與 spreadsheet handle，
+# 避免股票名稱、勝率統計、Gemini 快取等功能反覆重新授權與開啟同一份試算表。
+_GSPREAD_CLIENT_CACHE = None
+_GSHEET_HANDLE_CACHE = None
+_GSHEET_CONNECTION_LOCK = threading.RLock()
 
 # 視覺風格：淺背景 + Apple 風格藏青色元素
 BG = "#F5F5F7"        # 淺灰白背景，不使用整片深藍底
@@ -701,6 +719,18 @@ def _ensure_dir(path: str):
         os.makedirs(path, exist_ok=True)
 
 
+@contextmanager
+def report_stage_timer(label: str):
+    """量測單一週報階段耗時；關閉計時時不改變原本執行流程。"""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if REPORT_TIMING_ENABLE:
+            elapsed = time.perf_counter() - start
+            print(f"⏱️ {label}：{elapsed:.2f} 秒")
+
+
 def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
     """將 matplotlib 原始高解析 PNG 做一次「截圖式」二次輸出。
 
@@ -713,11 +743,13 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
     但會把輸出寬度限制在 WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH，讓效果更接近螢幕截圖。
     可用環境變數調整：
     - WARRANT_SCREENSHOT_OUTPUT_ENABLE=0：關閉二次輸出。
-    - WARRANT_SCREENSHOT_OUTPUT_SCALE=0.6：縮放倍率上限。
+    - WARRANT_SCREENSHOT_OUTPUT_SCALE=1.0：縮放倍率上限；預設由最大寬度 2400px 控制最終尺寸。
     - WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH=2400：輸出最大寬度，0 代表不限制。
     - WARRANT_SCREENSHOT_OUTPUT_FORMAT=PNG/JPEG：輸出格式。
     - WARRANT_SCREENSHOT_OUTPUT_JPEG_QUALITY=88：JPEG 品質。
     - WARRANT_SCREENSHOT_OUTPUT_PNG_PALETTE_ENABLE=1：PNG 轉 256 色調色盤以縮小檔案。
+    - WARRANT_SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL=6：最終 PNG 壓縮等級。
+    - WARRANT_SCREENSHOT_OUTPUT_PNG_OPTIMIZE=0：是否啟用 Pillow 額外最佳化。
     """
     if not SCREENSHOT_OUTPUT_ENABLE:
         buf.seek(0)
@@ -772,7 +804,12 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
                 except Exception as e:
                     print(f"⚠️ PNG 調色盤縮檔失敗，改用 RGB PNG：{e}")
                     save_img = img
-            save_img.save(out, format="PNG", optimize=True, compress_level=9)
+            save_img.save(
+                out,
+                format="PNG",
+                optimize=SCREENSHOT_OUTPUT_PNG_OPTIMIZE,
+                compress_level=max(0, min(9, int(SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL))),
+            )
 
         out.seek(0)
         print(
@@ -1063,14 +1100,26 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
             ws = sh.worksheet(GSHEET_LLM_CACHE_SHEET)
         except Exception:
             return ""
-        records = ws.get_all_records(empty2zero=False, head=1)
-        df = pd.DataFrame(records).fillna("") if records else pd.DataFrame()
-        if df is None or df.empty or "快取鍵" not in df.columns or "Gemini輸出" not in df.columns:
+        headers = [str(x or "").strip() for x in ws.row_values(1)]
+        if "快取鍵" not in headers or "Gemini輸出" not in headers:
             return ""
-        matched = df[df["快取鍵"].astype(str) == key].copy()
-        if matched.empty:
+
+        # 只讀第一欄尋找最後一筆相同快取鍵，再讀取該列；
+        # 避免每次命中檢查都下載整張包含長篇 Gemini 文字的工作表。
+        key_values = ws.col_values(1)
+        matched_row_numbers = [
+            row_number
+            for row_number, value in enumerate(key_values, start=1)
+            if row_number > 1 and str(value or "").strip() == key
+        ]
+        if not matched_row_numbers:
             return ""
-        row = matched.tail(1).iloc[0]
+
+        row_values = ws.row_values(matched_row_numbers[-1])
+        row = {
+            headers[i]: row_values[i] if i < len(row_values) else ""
+            for i in range(len(headers))
+        }
         output_text = str(row.get("Gemini輸出", "") or "").strip()
         if output_text:
             prompt_hash = _llm_prompt_hash(prompt) if prompt else ""
@@ -1101,27 +1150,30 @@ def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: s
     updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 
     try:
-        ws = _get_or_create_worksheet(sh, GSHEET_LLM_CACHE_SHEET, rows=300, cols=len(GSHEET_LLM_CACHE_HEADERS))
-        old_df = _worksheet_to_df(ws)
-        if old_df is not None and not old_df.empty and "快取鍵" in old_df.columns:
-            old_df = old_df[old_df["快取鍵"].astype(str) != key].copy()
-        else:
-            old_df = pd.DataFrame(columns=GSHEET_LLM_CACHE_HEADERS)
+        ws = _get_or_create_worksheet(
+            sh,
+            GSHEET_LLM_CACHE_SHEET,
+            rows=300,
+            cols=len(GSHEET_LLM_CACHE_HEADERS),
+        )
 
-        new_df = pd.DataFrame([{
-            "快取鍵": key,
-            "日期": cache_date,
-            "任務": str(task or ""),
-            "標的股": _clean_code(stock_code),
-            "標的名稱": str(stock_name or ""),
-            "模型": GEMINI_MODEL,
-            "PromptHash": _llm_prompt_hash(prompt),
-            "Gemini輸出": str(output_text or ""),
-            "更新時間": updated_at,
-        }])
-        all_df = pd.concat([old_df, new_df], ignore_index=True, sort=False).fillna("")
-        _update_worksheet_from_df(ws, all_df, GSHEET_LLM_CACHE_HEADERS)
-        print(f"💾 Gemini 結果已寫入 Google Sheet 快取：{key}")
+        current_headers = [str(x or "").strip() for x in ws.row_values(1)]
+        if current_headers != GSHEET_LLM_CACHE_HEADERS:
+            ws.update([GSHEET_LLM_CACHE_HEADERS], value_input_option="RAW")
+
+        row_values = [
+            key,
+            cache_date,
+            str(task or ""),
+            _clean_code(stock_code),
+            str(stock_name or ""),
+            GEMINI_MODEL,
+            _llm_prompt_hash(prompt),
+            str(output_text or ""),
+            updated_at,
+        ]
+        ws.append_row(row_values, value_input_option="RAW")
+        print(f"💾 Gemini 結果已追加至 Google Sheet 快取：{key}")
     except Exception as e:
         print(f"⚠️ Google Sheet Gemini 快取寫入失敗：{key}｜{e}")
 
@@ -1872,35 +1924,63 @@ def draw_inst_header_like_legend(inst_ax, plot_df: pd.DataFrame):
 # Google Sheet 快取讀取：用來回補「權證 → 標的」或直接取歷史分點快取
 # ============================================================
 
-def _build_gspread_client():
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-    except Exception as e:
-        print(f"⚠️ gspread/google-auth 未安裝，略過 Google Sheet 快取：{e}")
-        return None
-    raw_key = os.getenv("GCP_SERVICE_KEY", "").strip()
-    if not raw_key:
-        return None
-    try:
-        info = json.loads(raw_key)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"⚠️ GCP_SERVICE_KEY 解析失敗：{e}")
-        return None
+def _build_gspread_client(force_refresh: bool = False):
+    global _GSPREAD_CLIENT_CACHE
+
+    with _GSHEET_CONNECTION_LOCK:
+        if _GSPREAD_CLIENT_CACHE is not None and not force_refresh:
+            return _GSPREAD_CLIENT_CACHE
+
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+        except Exception as e:
+            print(f"⚠️ gspread/google-auth 未安裝，略過 Google Sheet 快取：{e}")
+            return None
+
+        raw_key = os.getenv("GCP_SERVICE_KEY", "").strip()
+        if not raw_key:
+            return None
+
+        try:
+            info = json.loads(raw_key)
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            _GSPREAD_CLIENT_CACHE = gspread.authorize(creds)
+            print("♻️ Google Sheet client 已建立並快取")
+            return _GSPREAD_CLIENT_CACHE
+        except Exception as e:
+            _GSPREAD_CLIENT_CACHE = None
+            print(f"⚠️ GCP_SERVICE_KEY 解析失敗：{e}")
+            return None
 
 
-def _open_gsheet():
-    gc = _build_gspread_client()
-    if gc is None:
-        return None
-    try:
-        return gc.open_by_key(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else gc.open(GOOGLE_SHEET_NAME)
-    except Exception as e:
-        print(f"⚠️ Google Sheet 開啟失敗：{e}")
-        return None
+def _open_gsheet(force_refresh: bool = False):
+    global _GSHEET_HANDLE_CACHE
+
+    with _GSHEET_CONNECTION_LOCK:
+        if _GSHEET_HANDLE_CACHE is not None and not force_refresh:
+            return _GSHEET_HANDLE_CACHE
+
+        gc = _build_gspread_client(force_refresh=force_refresh)
+        if gc is None:
+            return None
+
+        try:
+            _GSHEET_HANDLE_CACHE = (
+                gc.open_by_key(GOOGLE_SHEET_ID)
+                if GOOGLE_SHEET_ID
+                else gc.open(GOOGLE_SHEET_NAME)
+            )
+            print("♻️ Google Sheet 試算表連線已建立並快取")
+            return _GSHEET_HANDLE_CACHE
+        except Exception as e:
+            _GSHEET_HANDLE_CACHE = None
+            print(f"⚠️ Google Sheet 開啟失敗：{e}")
+            return None
 
 
 def read_gsheet_worksheet(title: str) -> pd.DataFrame:
@@ -4278,8 +4358,16 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         end_dt = pd.Timestamp(end_date).to_pydatetime()
         start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
         end_s = end_dt.strftime("%Y/%m/%d")
-        warrants = get_all_active_call_warrants(stock_code, stock_name, start_date=start_date, end_date=end_date)
-        pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
+        with report_stage_timer(f"{stock_code}｜權證母體建立"):
+            warrants = get_all_active_call_warrants(
+                stock_code,
+                stock_name,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        with report_stage_timer(f"{stock_code}｜API4 分點掃描"):
+            pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
 
         # 歷史分點買賣明細補漏：
         # 若某檔權證近 90 天在明細表已出現買賣超，但 OpenAPI / MoneyDJ 最新母體或 API4 沒掃到，
@@ -4302,7 +4390,12 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
                 pairs = pairs[:MAX_PAIRS]
                 print(f"⚠️ MAX_PAIRS 限制啟用，合併後 pair 截斷為 {len(pairs):,} 組")
 
-        live = fetch_api5_events_for_pairs(pairs, start_date=start_date, end_date=end_date)
+        with report_stage_timer(f"{stock_code}｜API5 買賣金額回查｜pairs={len(pairs):,}"):
+            live = fetch_api5_events_for_pairs(
+                pairs,
+                start_date=start_date,
+                end_date=end_date,
+            )
         live_fetched = True
         if not live.empty:
             frames.append(live)
@@ -5378,7 +5471,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v16_stock_code_identity_guard"
+    internal_version = "validated_v17_json_grounded_hybrid_body"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -5393,6 +5486,13 @@ GEMINI_ENABLE = os.getenv("WARRANT_GEMINI_ENABLE", "1").strip().lower() not in (
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 GEMINI_RETRY_TIMES = int(os.getenv("WARRANT_GEMINI_RETRY_TIMES", "5"))
 GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
+# 新聞統整與本週重點共用較低 temperature，降低格式漂移與無依據改寫。
+# 模型名稱維持 GEMINI_MODEL 原設定，不另外切換分析模型。
+GEMINI_ANALYSIS_TEMPERATURE = float(os.getenv("WARRANT_GEMINI_ANALYSIS_TEMPERATURE", "0.25"))
+GEMINI_STRUCTURED_OUTPUT_ENABLE = os.getenv(
+    "WARRANT_GEMINI_STRUCTURED_OUTPUT_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
 NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "12"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -5400,6 +5500,11 @@ WEEKLY_KEYPOINT_MAX_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MAX_POINTS",
 WEEKLY_KEYPOINT_POINT_MAX_LEN = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_POINT_MAX_LEN", "100"))
 WEEKLY_KEYPOINT_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_TOTAL_CHARS", "120"))
 WEEKLY_KEYPOINT_MIN_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_POINTS", "3"))
+# 本週重點快取版本：只有通過格式、內容與數字接地驗證的結果才會寫入。
+WEEKLY_KEYPOINT_STYLE_VERSION = os.getenv(
+    "WARRANT_WEEKLY_KEYPOINT_STYLE_VERSION",
+    "validated_v24_json_grounded_previous_week",
+).strip() or "validated_v24_json_grounded_previous_week"
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
 # 預設提高搜尋母體，避免部分冷門股因前幾篇原文被擋或 RSS 摘要太短而沒有新聞輸出。
 NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "36"))
@@ -5409,6 +5514,26 @@ NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").s
 # 極速新聞模式：預設開啟。只使用 Google News RSS 的標題 / 摘要 / URL，不進新聞網站抓原文。
 # 若想回到高品質原文抓取模式，可在 GitHub Actions 設 WARRANT_NEWS_FAST_MODE=0。
 NEWS_FAST_MODE = os.getenv("WARRANT_NEWS_FAST_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+# 混合新聞模式：先用 RSS 快速掃描與排序，再只替最高分的前 2～3 篇補抓原文。
+# 關閉時仍維持原本純 RSS 極速模式；NEWS_FAST_MODE=0 時則沿用既有完整原文模式。
+NEWS_FAST_HYBRID_BODY_FETCH_ENABLE = os.getenv(
+    "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+NEWS_FAST_HYBRID_BODY_FETCH_TOPK = max(
+    0,
+    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK", "3")),
+)
+NEWS_FAST_HYBRID_BODY_FETCH_WORKERS = max(
+    1,
+    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_WORKERS", "3")),
+)
+NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT = float(
+    os.getenv(
+        "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT",
+        str(max(12.0, NEWS_FETCH_TIMEOUT + 5.0)),
+    )
+)
 # 極速模式最多建立幾篇 RSS 新聞素材；預設等於真正會送進 Gemini 的篇數，避免掃太多新聞拖慢速度。
 NEWS_FAST_FETCH_MAX_ARTICLES = int(os.getenv(
     "WARRANT_NEWS_FAST_FETCH_MAX_ARTICLES",
@@ -7126,6 +7251,7 @@ def _news_items_to_records(news_items) -> List[dict]:
             title = _clean_news_title(item.get("title", ""))
             description = _normalize_news_text(item.get("description", ""))
             source = str(item.get("source", "") or "").strip()
+            source_family = str(item.get("source_family", "") or "").strip()
             published = str(item.get("published", "") or "").strip()
             url = str(item.get("url", "") or "").strip()
             body_ok = bool(item.get("body_ok"))
@@ -7133,17 +7259,26 @@ def _news_items_to_records(news_items) -> List[dict]:
             content_source = str(item.get("content_source", "") or "").strip()
             raw_content = _normalize_news_text(item.get("content", ""))
             content = raw_content if (body_ok or fallback_ok) else ""
+            search_days = int(item.get("search_days", 0) or 0)
+            query_stage = str(item.get("query_stage", "") or "").strip()
+            relevance_score = int(item.get("relevance_score", 0) or 0)
+            body_length = int(item.get("body_length", len(raw_content)) or 0)
         else:
             # 舊版相容：純字串只當標題，不拿來產生新聞重點。
             title = _clean_news_title(str(item))
             content = ""
             description = ""
             source = ""
+            source_family = ""
             published = ""
             url = ""
             body_ok = False
             fallback_ok = False
             content_source = ""
+            search_days = 0
+            query_stage = ""
+            relevance_score = 0
+            body_length = 0
         if not title and not content and not description:
             continue
         records.append({
@@ -7151,11 +7286,16 @@ def _news_items_to_records(news_items) -> List[dict]:
             "content": content,
             "description": description,
             "source": source,
+            "source_family": source_family,
             "published": published,
             "url": url,
             "body_ok": body_ok,
             "fallback_ok": fallback_ok,
             "content_source": content_source,
+            "search_days": search_days,
+            "query_stage": query_stage,
+            "relevance_score": relevance_score,
+            "body_length": body_length,
         })
     return records
 
@@ -7803,12 +7943,156 @@ def _should_switch_gemini_key(err) -> bool:
     return any(k in err_text for k in switch_keywords)
 
 
+
+def _build_gemini_points_response_schema(
+    min_points: int = 1,
+    max_points: int = 3,
+    include_note: bool = False,
+) -> dict:
+    """建立新聞與本週重點共用的 Gemini JSON Schema。"""
+    min_points = max(0, int(min_points or 0))
+    max_points = max(min_points, int(max_points or min_points or 1))
+    properties = {
+        "points": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": min_points,
+            "maxItems": max_points,
+        },
+    }
+    if include_note:
+        properties["note"] = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["points"],
+    }
+
+
+_GROUNDED_NUMBER_RE = re.compile(
+    r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+)
+
+
+def _canonical_grounded_number_token(value: str) -> str:
+    """將 1,200.00、+1200、01200 等數字統一成可比對格式。"""
+    raw = str(value or "").strip().replace(",", "")
+    if not raw:
+        return ""
+
+    sign = ""
+    if raw[0] in "+-":
+        sign = "-" if raw[0] == "-" else ""
+        raw = raw[1:]
+
+    if not raw or not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return ""
+
+    if "." in raw:
+        integer, decimal = raw.split(".", 1)
+        integer = integer.lstrip("0") or "0"
+        decimal = decimal.rstrip("0")
+        normalized = f"{integer}.{decimal}" if decimal else integer
+    else:
+        normalized = raw.lstrip("0") or "0"
+
+    if normalized == "0":
+        sign = ""
+    return sign + normalized
+
+
+def _extract_grounded_number_tokens(text_or_payload) -> List[str]:
+    """抽出文字或 JSON payload 中所有阿拉伯數字字串。"""
+    if isinstance(text_or_payload, (dict, list, tuple)):
+        source_text = json.dumps(text_or_payload, ensure_ascii=False, sort_keys=True)
+    else:
+        source_text = str(text_or_payload or "")
+    source_text = _normalize_chinese_numbers_for_news(source_text)
+
+    out = []
+    for matched in _GROUNDED_NUMBER_RE.findall(source_text):
+        token = _canonical_grounded_number_token(matched)
+        if token:
+            out.append(token)
+    return out
+
+
+def _build_grounded_number_source_set(source_text_or_payload) -> set:
+    """建立可接受數字集合；來源有正負號時，也允許輸出用文字表達方向後省略正號或負號。"""
+    source_tokens = set()
+    for token in _extract_grounded_number_tokens(source_text_or_payload):
+        source_tokens.add(token)
+        if token.startswith("-"):
+            source_tokens.add(token[1:])
+    return source_tokens
+
+
+def _find_ungrounded_number_tokens(
+    points: List[str],
+    source_text_or_payload,
+) -> Dict[int, List[str]]:
+    """找出 AI 輸出中沒有出現在輸入素材的數字。"""
+    allowed = _build_grounded_number_source_set(source_text_or_payload)
+    problems = {}
+    for idx, point in enumerate(points or []):
+        missing = []
+        for token in _extract_grounded_number_tokens(str(point or "")):
+            if token not in allowed and token not in missing:
+                missing.append(token)
+        if missing:
+            problems[idx] = missing
+    return problems
+
+
+def _format_ungrounded_number_problems(problems: Dict[int, List[str]]) -> str:
+    parts = []
+    for idx, tokens in sorted((problems or {}).items()):
+        parts.append(f"第{idx + 1}點：" + "、".join(tokens))
+    return "；".join(parts)
+
+
+def _filter_points_with_grounded_numbers(
+    points: List[str],
+    source_text_or_payload,
+    label: str,
+) -> List[str]:
+    problems = _find_ungrounded_number_tokens(points, source_text_or_payload)
+    if not problems:
+        return list(points or [])
+
+    for idx, tokens in sorted(problems.items()):
+        point_text = str((points or [""])[idx] or "")[:80]
+        print(
+            f"⚠️ {label}第 {idx + 1} 點含輸入素材找不到的數字 "
+            f"{'、'.join(tokens)}，已丟棄：{point_text}"
+        )
+    return [
+        point
+        for idx, point in enumerate(points or [])
+        if idx not in problems
+    ]
+
+
+def _build_news_number_grounding_source(usable_articles: List[dict]) -> str:
+    """數字接地只看實際送入 Gemini 的標題、日期與正文，不讓 A1/A2 文章 ID 誤放行。"""
+    chunks = []
+    for article in usable_articles or []:
+        chunks.extend([
+            str(article.get("title", "") or ""),
+            str(article.get("published", "") or ""),
+            str(article.get("body", "") or ""),
+        ])
+    return "\n".join(chunks)
+
+
 def _call_gemini_with_retry(
     prompt: str,
     cache_task: str = "",
     stock_code: str = "",
     stock_name: str = "",
     write_cache: bool = True,
+    response_schema: dict | None = None,
+    temperature: float | None = None,
 ):
     # 第一優先：Google Sheet 每日快取。
     # 同股票、同任務、同模型、同一天只要跑過一次，當天再跑就不會重打 Gemini。
@@ -7841,6 +8125,13 @@ def _call_gemini_with_retry(
         print("⚠️ 未設定 WARRANTS_API_KEY / WARRANTS_API_KEY_2 / WARRANTS_API_KEY_3，無法使用 Gemini 摘要；將改用規則式摘要")
         return None
 
+    generation_config = {}
+    use_temperature = GEMINI_ANALYSIS_TEMPERATURE if temperature is None else float(temperature)
+    generation_config["temperature"] = max(0.0, min(2.0, use_temperature))
+    if GEMINI_STRUCTURED_OUTPUT_ENABLE and response_schema:
+        generation_config["response_mime_type"] = "application/json"
+        generation_config["response_schema"] = response_schema
+
     last_error = None
     total_keys = len(api_keys)
     for key_idx, api_key in enumerate(api_keys, 1):
@@ -7856,10 +8147,15 @@ def _call_gemini_with_retry(
 
         for attempt in range(1, GEMINI_RETRY_TIMES + 1):
             try:
-                print(f"Gemini 呼叫第 {attempt}/{GEMINI_RETRY_TIMES} 次，模型：{GEMINI_MODEL}｜API Key {key_idx}/{total_keys}")
+                json_mode_label = "JSON Schema" if response_schema and GEMINI_STRUCTURED_OUTPUT_ENABLE else "文字模式"
+                print(
+                    f"Gemini 呼叫第 {attempt}/{GEMINI_RETRY_TIMES} 次，模型：{GEMINI_MODEL}｜"
+                    f"API Key {key_idx}/{total_keys}｜{json_mode_label}｜temperature={generation_config['temperature']:g}"
+                )
                 response = client.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=prompt,
+                    config=generation_config,
                 )
                 output_text = response.text or ""
                 if write_cache:
@@ -7896,6 +8192,142 @@ def _call_gemini_with_retry(
 
 def _parse_gemini_points(output_text: str) -> List[str]:
     return _clean_summary_points(_parse_raw_points_from_llm(output_text))
+
+
+
+def _enrich_fast_news_records_with_topk_bodies(
+    records: List[dict],
+    stock_code: str,
+    stock_name: str,
+) -> List[dict]:
+    """RSS 快掃後只替最高分的前幾篇補抓原文，兼顧速度與摘要具體度。"""
+    enriched = [dict(record) for record in (records or [])]
+    if (
+        not NEWS_FAST_MODE
+        or not NEWS_FAST_HYBRID_BODY_FETCH_ENABLE
+        or NEWS_FAST_HYBRID_BODY_FETCH_TOPK <= 0
+        or not enriched
+    ):
+        return enriched
+
+    candidates = []
+    for idx, record in enumerate(enriched):
+        if record.get("body_ok") or not record.get("fallback_ok"):
+            continue
+        if not str(record.get("url", "") or "").strip():
+            continue
+        if str(record.get("content_source", "") or "") == "manual":
+            continue
+
+        combined = _normalize_news_text(
+            f"{record.get('title', '')} {record.get('description', '')} {record.get('content', '')}"
+        )
+        if not _news_text_matches_target_stock(combined, stock_code, stock_name):
+            continue
+        if not _passes_news_quality_gate(
+            record.get("title", ""),
+            record.get("content", record.get("description", "")),
+            stock_code,
+            stock_name,
+        ):
+            continue
+
+        relevance = int(record.get("relevance_score", 0) or 0)
+        if relevance == 0:
+            relevance = _score_news_article_relevance(record, stock_code, stock_name)
+        published_dt = _parse_rss_pub_date(record.get("published", "")) or datetime.min
+        candidates.append((idx, relevance, published_dt))
+
+    if not candidates:
+        return enriched
+
+    candidates = sorted(
+        candidates,
+        key=lambda item: (
+            -item[1],
+            -(item[2].timestamp() if item[2] != datetime.min else 0),
+            item[0],
+        ),
+    )[:NEWS_FAST_HYBRID_BODY_FETCH_TOPK]
+
+    print(
+        f"📰 RSS 混合模式：從 {len(enriched):,} 筆素材中，"
+        f"替最高分 {len(candidates):,} 篇補抓原文"
+    )
+    fetch_started = time.perf_counter()
+
+    def fetch_one(idx: int):
+        record = enriched[idx]
+        body = _fetch_article_body(str(record.get("url", "") or "").strip())
+        return idx, body
+
+    workers = max(1, min(NEWS_FAST_HYBRID_BODY_FETCH_WORKERS, len(candidates)))
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {
+        executor.submit(fetch_one, idx): idx
+        for idx, _, _ in candidates
+    }
+    done, pending = wait(
+        futures,
+        timeout=max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT)),
+    )
+
+    upgraded = 0
+    try:
+        for future in done:
+            idx = futures[future]
+            record = enriched[idx]
+            try:
+                _, body = future.result()
+            except Exception as e:
+                print(f"⚠️ RSS 混合模式原文抓取失敗：{record.get('title', '')[:36]}｜{e}")
+                continue
+
+            body = _normalize_news_text(body)
+            body_ok = (
+                _is_valid_article_body(
+                    body,
+                    title=record.get("title", ""),
+                    description=record.get("description", ""),
+                )
+                and _passes_news_quality_gate(
+                    record.get("title", ""),
+                    body,
+                    stock_code,
+                    stock_name,
+                )
+            )
+            if not body_ok:
+                print(f"ℹ️ RSS 混合模式未取得可用原文，保留摘要：{record.get('title', '')[:36]}")
+                continue
+
+            record["content"] = body
+            record["body_ok"] = True
+            record["fallback_ok"] = False
+            record["content_source"] = "hybrid_article"
+            record["body_length"] = len(body)
+            record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
+            upgraded += 1
+            print(f"✅ RSS 混合模式補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
+    finally:
+        for future in pending:
+            future.cancel()
+        if pending:
+            print(f"⚠️ RSS 混合模式批次逾時，取消剩餘 {len(pending):,} 篇")
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # 原文優先，再依相關性排序；相同條件保留原始順序。
+    indexed = list(enumerate(enriched))
+    indexed.sort(
+        key=lambda item: (
+            0 if item[1].get("body_ok") else 1,
+            -int(item[1].get("relevance_score", 0) or 0),
+            item[0],
+        )
+    )
+    elapsed = time.perf_counter() - fetch_started
+    print(f"⏱️ RSS 混合模式原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{len(candidates)} 篇")
+    return [record for _, record in indexed]
 
 
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
@@ -7996,7 +8428,7 @@ def _save_validated_news_points_cache(
 
 
 def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """將合格新聞交給 Gemini；素材有 2 則以上時，輸出不得只剩 1 點。"""
+    """將合格新聞交給 Gemini；只快取格式、內容與數字接地皆通過的結果。"""
     usable_articles = _build_gemini_news_articles(records, stock_code, stock_name)
     if not usable_articles:
         print("⚠️ 沒有足夠且具體的公司新聞可送入 Gemini；不使用標題或盤勢新聞硬湊")
@@ -8009,50 +8441,35 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     )
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
+    number_grounding_source = _build_news_number_grounding_source(usable_articles)
+    response_schema = _build_gemini_points_response_schema(
+        min_points=minimum_points,
+        max_points=NEWS_SUMMARY_MAX_POINTS,
+        include_note=True,
+    )
+
     prompt = f"""
-你是台股財經新聞編輯，負責整理圖片週報右下角的「新聞 / 題材觀察」。
-你只能使用我提供的新聞素材，不可使用外部知識，不可自行補充。
-請使用繁體中文。
+你是台股財經新聞編輯。只能使用下方素材，整理 {stock_code} {display_name} 的新聞／題材重點，使用繁體中文。
 
-股票：{stock_code} {display_name}
+分析原則：
+1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件；同一事件多來源合併，不得拿股價漲跌、熱門排行或大盤盤勢湊數。
+2. 每點固定為「分類｜結果：具體結論｜說明：關鍵事實與後續追蹤。」；結果不可寫「重點待確認」「題材待觀察」等空句。
+3. 公司身分必須明確對應代號 {stock_code} 或名稱 {display_name}；相似公司名但沒有代號時排除，不得混用其他公司的營收、EPS、目標價或題材。
+4. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
+5. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。
+6. 每點需獨立完整、自然收尾並以句號結束；字數與過長內容由程式端清理，你只需優先保留最具體的事實。
 
-任務：
-從通過篩選的近期新聞中，整理 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 個真正具有公司資訊價值、彼此不同事件的新聞重點。
-本次提供 {len(usable_articles)} 則不同新聞素材，因此不得只輸出少於 {minimum_points} 點。
-只有原始素材實際只有一個事件時才允許輸出一點；不同來源報導同一事件應合併，不要重複寫成多點。
+好範例：
+- 公司動態｜結果：新訂單提高能見度｜說明：公司取得新案，後續觀察出貨時程與營收認列進度。
+- 業績更新｜結果：營收成長仍待延續｜說明：營收維持年增但月減，後續看成長動能與毛利率變化。
 
-寫作要求：
-1. 每點必須使用固定結構：「分類｜結果：...｜說明：...」。
-2. 「分類」使用 4～8 個字短標籤，例如「業績更新」「法人觀點」「公司動態」「報價動向」「產業題材」「重大訊息」；只有新聞內有具體券商、評等、目標價調升/調降、EPS上修/下修或法人買賣超時，才可使用「法人觀點」。
-3. 「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句，例如「營收表現偏正向」「AI散熱需求強勁」「公司動態偏正向」「市場預期偏正向」。若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材明確指出 AI 散熱需求強、需求延續或營運看旺，結果請寫「AI散熱需求強勁」；若素材出現傳捷報、接單、訂單、取得新案，結果請寫「公司動態偏正向」；若素材出現券商看好、法說看好、目標價調升/上修、評等調升或上修，結果請寫「市場預期偏正向」；若只是提到目標價但沒有調升、上修、買進或看好等正向語意，不得判定為正面。
-4. 「說明」只寫最關鍵的新聞事實、可能影響與後續觀察；有數字、公告、法人觀點、營收、EPS、毛利率、接單、出貨、產能或供需時優先寫出。
-5. 所有數字必須使用阿拉伯數字，不得使用中文數字；例如「十二點六億元」要寫成「12.6億元」，「第三季」要寫成「第3季」。
-6. 「說明」可以包含後續應追蹤的公開資訊，例如月營收延續性、法說內容、報價變化、訂單能見度或公告後續，但不得寫買賣建議。
-7. 每點 40～76 個中文字，結果要明確，說明限一句完整短句，約 28～48 個中文字，不得寫成長篇段落。
-8. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述。
-9. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點；即使有 3 則以上素材，也只挑最重要的 {NEWS_SUMMARY_MAX_POINTS} 點。
-10. 每一點必須取自不同事件，不得把同一事件拆成多點，也不得為了補足點數而重複同一事件。
-11. 每點必須獨立完整並以句號結束，不得使用「…」或「...」結尾，不得以「此外」「另外」「前述」「上述」「相對地」等承接詞開頭。
-12. search_days 為 14 或 30 的素材只能寫成「近期」「市場持續關注」等語氣，不可誤寫成「本週宣布」。
-13. 不得把只有股價上漲、漲停、創高、爆量、熱門股名單、大盤盤勢或多檔股票排行當成新聞重點。
-14. 若新聞同時提到多家公司，目標價、評等、EPS、營收、獲利預估、報價或產業題材必須明確指向 {stock_code} {display_name}；無法確認就不要使用。
-15. 不得把其他公司的數字或題材套用到 {display_name}。
-15-1. 必須確認新聞明確對應股票代號 {stock_code} 或公司名稱 {display_name}；若公司名稱相近，例如「威健」與「威健生技」這種不同公司，沒有明確出現股票代號 {stock_code} 時一律不得使用。
-15-2. 若素材標題或內文出現「{display_name}生技」「{display_name}科技」「{display_name}電子」等較長公司名，但沒有同時出現股票代號 {stock_code}，視為相似公司，必須排除。
-16. 新聞區塊不得寫權證資金流、分點籌碼、K 線、均線或技術分析。
-17. 不得提供買賣建議，不得寫建議進場、可以買進、不追高、目標操作價位。
-18. 不得輸出網址、媒體名稱、作者、完整看、看更多、關鍵字、追蹤或分享文字。
-19. 不得使用「以下為您」「根據提供資料」「圖中顯示」等 AI 助理語氣。
+壞範例：
+- 題材觀察｜結果：題材仍待確認｜說明：後續持續關注。
+- 法人觀點｜結果：市場偏多｜說明：公司未來值得期待。
 
-請只回傳 JSON，不要 markdown，不要多餘說明：
-{{
-  "points": [
-    "業績更新｜結果：營收表現偏正向｜說明：營收維持年增但月減，後續看月營收延續性與毛利率。"
-  ],
-  "note": "資料充足度的簡短內部說明"
-}}
+只回傳符合 JSON Schema 的 JSON，不要 markdown 或其他說明。
 
-以下是新聞素材 JSON：
+新聞素材：
 {article_json}
 """
     print("=" * 100)
@@ -8066,53 +8483,109 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         stock_code=stock_code,
         stock_name=stock_name,
         write_cache=False,
+        response_schema=response_schema,
+        temperature=GEMINI_ANALYSIS_TEMPERATURE,
     )
     points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
-    if points and not _points_are_independent_and_complete(points):
-        print("⚠️ Gemini 新聞重點出現承接句、半句或省略號，改用規則式新聞摘要")
-        return []
 
+    problems = []
     if len(points) < minimum_points:
-        print(f"⚠️ Gemini 新聞只輸出 {len(points)} 點，低於素材可支援的最低 {minimum_points} 點，啟動補正")
-        repair_prompt = f"""
-你剛才替 {stock_code} {display_name} 整理的新聞重點不足。
-目前有 {len(usable_articles)} 則不同合格素材，請重新整理成至少 {minimum_points} 點、最多 {NEWS_SUMMARY_MAX_POINTS} 點。
-每一點必須取自不同事件，不得拆分或重複同一事件；只能使用下方素材，不得補充外部資訊。
-每點 42～82 個中文字，固定使用「分類｜結果：...｜說明：...」格式。
-所有數字必須使用阿拉伯數字，不得使用中文數字；例如「十二點六億元」要寫成「12.6億元」。
-「說明」限一句完整短句，約 28～48 個中文字，必須自然收尾並以句號結束；不得使用省略號，也不得留下看起來尚未說完的結尾。
-「結果」不可只寫偏多、偏弱、中性觀察，必須寫成 6～12 個字的具體結論短句；若素材同時出現營收年增與月減，結果請寫「營收表現偏正向」，月減只放在說明中提醒；若素材出現傳捷報、接單、訂單、券商看好、法說看好、目標價調升/上修、評等調升或上修，結果要寫成正面具體結論；若只是提到目標價但沒有明確調升、上修、買進或看好，不得判定為正面；「說明」講新聞事實、可能影響與後續追蹤項目。
-不得使用省略號，不得寫技術分析、權證資金流、分點籌碼或買賣建議。
-必須確認每則新聞明確對應股票代號 {stock_code} 或公司名稱 {display_name}；若出現相似公司名，例如「{display_name}生技」「{display_name}科技」「{display_name}電子」，但沒有同時出現股票代號 {stock_code}，一律不得使用。
-請只回傳 JSON：{{"points":["分類｜結果：具體結論短句｜說明：新聞事實、影響與後續觀察"]}}
+        problems.append(f"只輸出 {len(points)} 點，至少需要 {minimum_points} 點")
+    if points and not _points_are_independent_and_complete(points):
+        problems.append("出現承接句、半句或省略號")
+    ungrounded = _find_ungrounded_number_tokens(points, number_grounding_source)
+    if ungrounded:
+        problems.append("含素材找不到的數字：" + _format_ungrounded_number_problems(ungrounded))
 
-新聞素材 JSON：
-{article_json}
+    if problems:
+        print("⚠️ Gemini 新聞重點需要補正：" + "；".join(problems))
+        repair_payload = {
+            "problems": problems,
+            "original_points": points,
+            "articles": usable_articles,
+        }
+        repair_prompt = f"""
+你是台股財經新聞編輯。上一版輸出未通過檢查，請只依修正資料重新整理 {stock_code} {display_name}。
+
+修正原則：
+1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件，固定格式為「分類｜結果：具體結論｜說明：關鍵事實與後續追蹤。」。
+2. 每點必須獨立完整並以句號結束，不得使用空泛結果或承接上一點。
+3. 公司必須明確對應 {stock_code} {display_name}，不得混入相似公司或其他公司的資料。
+4. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；找不到就刪除該數字或改寫該點。
+5. 不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
+6. 只回傳符合 JSON Schema 的 JSON。
+
+好範例：
+- 公司動態｜結果：新訂單提高能見度｜說明：公司取得新案，後續觀察出貨時程與營收認列進度。
+壞範例：
+- 題材觀察｜結果：重點待確認｜說明：後續持續關注。
+
+修正資料：
+{json.dumps(repair_payload, ensure_ascii=False, indent=2)}
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_min{minimum_points}_repair",
+            cache_task=f"{_news_points_cache_task()}_repair_v17",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
+            response_schema=response_schema,
+            temperature=GEMINI_ANALYSIS_TEMPERATURE,
         )
         repaired = _parse_gemini_news_points(repaired_text or "", records, stock_code, stock_name)
-        if len(repaired) >= minimum_points and _points_are_independent_and_complete(repaired):
+        repaired_ungrounded = _find_ungrounded_number_tokens(
+            repaired,
+            number_grounding_source,
+        )
+        repaired_ok = (
+            len(repaired) >= minimum_points
+            and _points_are_independent_and_complete(repaired)
+            and not repaired_ungrounded
+        )
+        if repaired_ok:
             points = repaired
+            problems = []
             print(f"✅ Gemini 新聞補正完成：{len(points)} 點")
+        else:
+            if repaired_ungrounded:
+                print(
+                    "⚠️ Gemini 新聞補正後仍有無依據數字："
+                    + _format_ungrounded_number_problems(repaired_ungrounded)
+                )
+            # 補正仍失敗時，先保留有接地且完整的點，其餘交給既有規則式摘要補足。
+            candidate_points = repaired if len(repaired) >= len(points) else points
+            points = _filter_points_with_grounded_numbers(
+                candidate_points,
+                number_grounding_source,
+                "新聞重點",
+            )
+            points = [
+                point
+                for point in points
+                if _points_are_independent_and_complete([point])
+            ]
 
-    if points and len(points) >= minimum_points and _points_are_independent_and_complete(points):
+    final_ungrounded = _find_ungrounded_number_tokens(
+        points,
+        number_grounding_source,
+    )
+    fully_valid = (
+        len(points) >= minimum_points
+        and _points_are_independent_and_complete(points)
+        and not final_ungrounded
+    )
+    if fully_valid:
         _save_validated_news_points_cache(
             _news_points_cache_task(),
             stock_code,
             stock_name,
             prompt,
             points,
-            note=f"validated_news_points_{len(points)}",
+            note=f"validated_news_points_json_grounded_{len(points)}",
         )
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
     elif points:
-        print(f"⚠️ Gemini 新聞重點只有 {len(points)} 點或未通過品質檢查，不寫入快取，交給規則式摘要補足")
+        print(f"⚠️ Gemini 新聞重點只有 {len(points)} 點或未通過完整驗證，不寫入快取，交給規則式摘要補足")
     return points
 
 
@@ -8788,6 +9261,16 @@ def _build_rule_based_crossflow_point(ctx: dict) -> str:
         f"權證週淨流向 {fmt_money(warrant_net)}；{relation}。"
     )
 
+
+def _weekly_keypoints_cache_task() -> str:
+    safe_version = re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "_",
+        str(WEEKLY_KEYPOINT_STYLE_VERSION or "validated_v24_json_grounded_previous_week"),
+    )
+    return f"weekly_keypoints_{safe_version}"
+
+
 def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
     """將股價、均線、量能、法人、權證與 TOP5 分點完整整理給 AI。"""
     df = ctx.get("plot_df", pd.DataFrame())
@@ -8864,6 +9347,119 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
 
     institutional_context = _get_weekly_institutional_context(ctx)
 
+    # 上週對照：使用既有日期軸、權證事件與法人欄位，不新增任何外部資料來源。
+    report_dates = sorted({
+        pd.Timestamp(d).normalize()
+        for d in (ctx.get("report_dates") or [])
+        if pd.notna(d)
+    })
+    current_report_dates = report_dates[-WEEK_TRADING_DAYS:] if report_dates else []
+    previous_report_dates = (
+        report_dates[-WEEK_TRADING_DAYS * 2:-WEEK_TRADING_DAYS]
+        if len(report_dates) > WEEK_TRADING_DAYS
+        else []
+    )
+    previous_week_start = previous_report_dates[0] if previous_report_dates else pd.NaT
+    previous_week_end = previous_report_dates[-1] if previous_report_dates else pd.NaT
+
+    plot_events = ctx.get("plot_events")
+    if (
+        plot_events is not None
+        and not plot_events.empty
+        and previous_report_dates
+        and "Date" in plot_events.columns
+    ):
+        previous_week_events = plot_events.copy()
+        previous_week_events["Date"] = pd.to_datetime(
+            previous_week_events["Date"],
+            errors="coerce",
+        ).dt.normalize()
+        previous_week_events = previous_week_events[
+            previous_week_events["Date"].isin(previous_report_dates)
+        ].copy()
+    else:
+        previous_week_events = pd.DataFrame(
+            columns=[
+                "Date", "branch", "warrant_code", "warrant_name",
+                "buy_amount", "sell_amount", "net_amount",
+            ]
+        )
+
+    previous_warrant_net = (
+        float(pd.to_numeric(
+            previous_week_events.get("net_amount", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0).sum())
+        if previous_week_events is not None and not previous_week_events.empty
+        else 0.0
+    )
+    previous_buy_top, previous_sell_top = top_branch_tables(
+        previous_week_events,
+        topn=5,
+    )
+
+    def previous_top5_rows(frame: pd.DataFrame, side: str) -> List[dict]:
+        rows = []
+        if frame is None or frame.empty:
+            return rows
+        for _, row in frame.iterrows():
+            rows.append({
+                "branch": str(row.get("branch", "") or ""),
+                "side": side,
+                "net": fmt_money(float(row.get("net_amount", 0) or 0)),
+            })
+        return rows
+
+    stock_week_dates = [
+        pd.Timestamp(d).normalize()
+        for d in (ctx.get("stock_week_dates") or [])
+        if pd.notna(d)
+    ]
+    previous_inst_week = pd.DataFrame()
+    if df is not None and not df.empty:
+        if stock_week_dates:
+            first_current_date = stock_week_dates[0]
+            earlier_positions = [
+                idx
+                for idx, date_value in enumerate(df.index)
+                if pd.Timestamp(date_value).normalize() < first_current_date
+            ]
+            current_start_pos = earlier_positions[-1] + 1 if earlier_positions else 0
+            previous_inst_week = df.iloc[
+                max(0, current_start_pos - WEEK_TRADING_DAYS):current_start_pos
+            ].copy()
+        elif len(df) > WEEK_TRADING_DAYS:
+            previous_inst_week = df.iloc[
+                max(0, len(df) - WEEK_TRADING_DAYS * 2):-WEEK_TRADING_DAYS
+            ].copy()
+
+    def previous_inst_sum(col: str) -> float:
+        if (
+            previous_inst_week is None
+            or previous_inst_week.empty
+            or col not in previous_inst_week.columns
+        ):
+            return 0.0
+        return float(
+            pd.to_numeric(
+                previous_inst_week[col],
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+
+    previous_week_comparison = {
+        "period": (
+            f"{previous_week_start.strftime('%Y/%m/%d')} - "
+            f"{previous_week_end.strftime('%Y/%m/%d')}"
+            if pd.notna(previous_week_start) and pd.notna(previous_week_end)
+            else ""
+        ),
+        "warrant_weekly_net": fmt_money(previous_warrant_net),
+        "institutional_weekly_total": f"{previous_inst_sum('total'):+,.0f}張",
+        "buy_top5_branches": previous_top5_rows(previous_buy_top, "買超"),
+        "sell_top5_branches": previous_top5_rows(previous_sell_top, "賣超"),
+    }
+
     payload = {
         "stock": f"{stock_code} {stock_name}",
         "period": f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx.get("week_start")) else "",
@@ -8910,6 +9506,7 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         "representative_sell_top5_with_history": representative_sell_rows,
         "required_representative_branch_analysis": required_representative_branch_analysis,
         "non_representative_top5_summary": small_amount_summary,
+        "previous_week_comparison": previous_week_comparison,
         "recent_news_summary": [
             str(x or "").strip()
             for x in (ctx.get("weekly_news_points") or [])
@@ -9071,6 +9668,76 @@ def _weekly_points_conditionally_cover_pattern(points: List[str], ctx: dict) -> 
     return _weekly_points_cover_required_pattern_analysis(points, ctx)
 
 
+
+def _validate_weekly_points(
+    points: List[str],
+    payload: dict,
+    ctx: dict,
+) -> List[str]:
+    """集中驗證本週重點，包含既有內容規則與新增的數字接地檢查。"""
+    problems = []
+    if len(points) != 3:
+        problems.append(f"重點數量為 {len(points)}，應為 3 點")
+    if any(_count_summary_chars([p]) < 24 for p in points) or _count_summary_chars(points) < 100:
+        problems.append("內容過短")
+    if points and not _points_are_independent_and_complete(points):
+        problems.append("出現承接句、半句或省略號")
+
+    watch_count = _weekly_points_watch_count(points)
+    if watch_count < 1 or watch_count > 2:
+        problems.append("下週觀察應為 1 至 2 點，且需以『下週觀察：』開頭")
+    if points and not _weekly_points_have_current_week_analysis(points):
+        problems.append("缺少本週已發生的重點分析")
+
+    forbidden_branches = _weekly_points_mention_nonrepresentative_branch(points, ctx)
+    if forbidden_branches:
+        problems.append("點名金額不具代表性的分點：" + "、".join(forbidden_branches))
+
+    problems.extend(_weekly_points_low_value_technical_reasons(points))
+
+    if _weekly_points_overstate_neutral_institutional(points, ctx):
+        problems.append("法人接近中性卻被放大解讀")
+    if not _weekly_points_conditionally_cover_branch(points, ctx):
+        problems.append("既然選擇分析代表性分點，就必須完整使用勝率、加權報酬率與平均持有天數")
+    if not _weekly_points_conditionally_cover_pattern(points, ctx):
+        problems.append("既然選擇分析型態，就必須使用程式判定的型態標籤與價量依據")
+
+    ungrounded = _find_ungrounded_number_tokens(points, payload)
+    if ungrounded:
+        problems.append("含輸入 JSON 找不到的數字：" + _format_ungrounded_number_problems(ungrounded))
+
+    return list(dict.fromkeys(problems))
+
+
+def _save_validated_weekly_points_cache(
+    task: str,
+    stock_code: str,
+    stock_name: str,
+    prompt: str,
+    points: List[str],
+    payload: dict,
+    ctx: dict,
+):
+    """本週重點僅在完整驗證通過後寫入每日快取。"""
+    valid_points = _clean_weekly_key_points(points or [])[:3]
+    problems = _validate_weekly_points(valid_points, payload, ctx)
+    if problems:
+        print("⚠️ 本週重點未通過完整驗證，不寫入 Gemini 快取：" + "；".join(problems))
+        return
+
+    cache_payload = {
+        "points": valid_points,
+        "note": "validated_weekly_points_json_grounded",
+    }
+    save_gsheet_llm_cache(
+        task,
+        stock_code,
+        stock_name,
+        prompt,
+        json.dumps(cache_payload, ensure_ascii=False),
+    )
+
+
 def _repair_weekly_expert_points(
     points: List[str],
     payload: dict,
@@ -9078,45 +9745,50 @@ def _repair_weekly_expert_points(
     stock_name: str,
     problems: List[str],
 ) -> List[str]:
-    """保留 AI 自主選題，只修正缺少下週觀察、空泛內容或資料誤讀。"""
+    """保留 AI 選題，只修正格式、內容誤讀與無依據數字。"""
+    stock_code = str(ctx.get("stock_code", "") or "")
     repair_payload = {
-        "problems_to_fix": [str(x) for x in problems if str(x).strip()],
+        "problems": list(problems or []),
         "original_points": [str(p or "").strip() for p in points if str(p or "").strip()],
         "full_weekly_data": payload,
     }
+    response_schema = _build_gemini_points_response_schema(
+        min_points=3,
+        max_points=3,
+        include_note=False,
+    )
     repair_prompt = f"""
-你是台股股票研究員，請修正上一版的「本週重點與下週觀察」。只能使用下方 JSON，不可使用外部知識或自行補數字。
+你是專業且中立的台股研究員。上一版重點未通過檢查，請只依修正資料重新輸出。
 
-請重新輸出剛好 3 點，規則如下：
-1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
-2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
-3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
-5. 由你依資料重要性挑選最異常、最具確認性、最具矛盾性或最可能影響下週的訊號。
-6. 下週觀察只能寫條件式追蹤，不得預測一定上漲或下跌，也不得給買賣建議。
-7. 若分析代表性分點、精選五分點，或結果短句點名分點，必須使用本週方向、金額、歷史勝率、平均持有天數與歷史加權報酬率；沒有選擇分點則不必硬寫。
-8. 技術面必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 price_volume_pattern.current_pattern_label；若分析型態，必須直接使用 price_volume_pattern.current_pattern_label，僅描述第一、第二大量區的相對位置，不得輸出量區實際價位。
-10. recent_news_summary 只有在確實構成本週重要事件或下週可追蹤催化因素時才使用，不得自行擴寫未提供內容。
-10. 禁止單純羅列均線價格、KD或MACD；每點必須有比較、判斷與中立結論。
-11. 不得點名非代表性小額分點，不得放大解讀接近中性的法人數據。
+修正原則：
+1. 剛好 3 點；前 2 點分析本週已發生事件，第 3 點以「下週觀察：」開頭。
+2. 固定格式為「面向：技術面/權證面/法人面/新聞面｜結果：具體結論｜說明：資料依據。」；下週點使用面向：下週觀察。
+3. 優先指出 previous_week_comparison 與本週之間的延續、反轉或方向分歧，不要只播報本週單一數字。
+4. 點名分點時，只能使用代表性分點，並完整寫出本週方向與金額、歷史勝率、平均持有天數及歷史加權報酬率。
+5. 技術面使用 price_ma_volume.ma_signal 與 price_volume_pattern.current_pattern_label；法人接近中性時不得誇大。
+6. 每個數字都必須在 full_weekly_data 中找到；不得換算、推估、補數字或提供買賣建議。每點獨立完整並以句號結束。
 
-請只回傳 JSON：
-{{
-  "points": [
-    "面向：技術面｜結果：股價跌破短均｜說明：本週最重要的價量或型態變化，以及後續需要確認的重點。",
-    "面向：權證面｜結果：權證資金流入｜說明：本週權證資金或代表性分點的主要變化與資料依據。",
-    "下週觀察：面向：下週觀察｜結果：先看止跌訊號｜說明：下週需要確認的價量、法人、權證資金或新聞條件。"
-  ]
-}}
+好範例：
+- 面向：權證面｜結果：分點買盤延續｜說明：代表性分點本週維持買超，並結合完整歷史績效說明時間尺度。
+- 下週觀察：面向：下週觀察｜結果：確認資金是否續強｜說明：若權證淨流向與法人方向同步改善，再觀察價量是否確認。
 
-修正資料 JSON：
+壞範例：
+- 面向：新聞面｜結果：重點待確認｜說明：後續持續觀察。
+- 面向：技術面｜結果：偏多｜說明：KD與MACD值得留意。
+
+只回傳符合 JSON Schema 的 JSON。
+
+修正資料：
 {json.dumps(repair_payload, ensure_ascii=False, indent=2)}
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_expert_weekly_next_watch_v23_inst_volume_technical_fix_repair",
-        stock_code=str(ctx.get("stock_code", "") or ""),
+        cache_task=f"{_weekly_keypoints_cache_task()}_repair",
+        stock_code=stock_code,
         stock_name=stock_name,
+        write_cache=False,
+        response_schema=response_schema,
+        temperature=GEMINI_ANALYSIS_TEMPERATURE,
     )
     return _parse_weekly_gemini_points(output_text or "")
 
@@ -9127,165 +9799,135 @@ def _repair_weekly_points_with_required_branch(
     ctx: dict,
     stock_name: str,
 ) -> List[str]:
-    """AI 漏掉代表性分點歷史資料時，要求它重新整理一次完整三點。"""
+    """相容舊流程：若需強制補充分點資料，仍使用同一套 JSON 與接地規則。"""
     required = payload.get("required_representative_branch_analysis")
     if not required:
         return points
 
-    original_points = [str(p or "").strip() for p in points if str(p or "").strip()]
+    stock_code = str(ctx.get("stock_code", "") or "")
     repair_payload = {
         "required_representative_branch_analysis": required,
         "required_price_volume_pattern_analysis": payload.get("price_volume_pattern", {}),
-        "original_points": original_points,
+        "original_points": [str(p or "").strip() for p in points if str(p or "").strip()],
         "full_weekly_data": payload,
     }
+    response_schema = _build_gemini_points_response_schema(
+        min_points=3,
+        max_points=3,
+        include_note=False,
+    )
     repair_prompt = f"""
-你是台股權證週報分析助手。上一版三個本週重點漏掉了必須分析的代表性分點歷史資料，請重新整理。
-你只能使用下方 JSON，不可自行補數字、不可使用外部知識。
+你是專業且中立的台股研究員。上一版漏掉必要的代表性分點資料，請只依修正資料重寫。
 
-請輸出剛好 3 點繁體中文重點，並遵守：
-1. 前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
-2. 每點固定使用「面向：技術面/權證面/法人面/新聞面/下週觀察｜結果：6～12字具體結論短句｜說明：一句具體依據或條件」。
-3. 第 3 點請使用「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：條件式追蹤內容」。
-4. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，避免長篇段落超出圖片範圍。
-5. 其中一點必須完整分析 required_representative_branch_analysis，需寫出分點名稱、本週買超或賣超金額、歷史勝率、平均持有天數、歷史加權報酬率，並依實際天數描述時間尺度；若是精選五分點積極買超，結果短句請直接寫「分點名稱＋積極偏買」。
-6. 其中一點必須分析技術面：必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 required_price_volume_pattern_analysis.current_pattern_label；若使用大量區，只能描述相對位置、突破／跌破／回踩狀態、高低點結構與價量關係，不得輸出兩個大量區的實際價格。
-7. 另一點應比較三大法人、權證週資金與股價方向。若 institutional.weekly_total.classification 為「接近中性」，必須寫成法人方向接近中性或買賣幅度有限，不得放大解讀。
-8. 禁止單純羅列 MA5、MA10、MA20、MA60 價格；禁止用「搭配KD／MACD觀察」「需觀察動能是否延續」等空泛文字湊一點。
-9. 每一點都必須獨立完整，以完整句號結束，不得使用省略號，不得讓下一點接續上一點，不得留下「上方存在、仍存在、是否、以及、並」這類看起來尚未說完的結尾。
-10. 不得點名 non_representative_top5_summary 所代表的小額分點，不得給買賣建議。
+原則：
+1. 剛好 3 點；前 2 點為本週分析，第 3 點以「下週觀察：」開頭。
+2. 每點使用「面向：...｜結果：具體結論｜說明：資料依據。」並以句號結束。
+3. 其中 1 點完整使用 required_representative_branch_analysis，包含分點名稱、本週方向與金額、勝率、平均持有天數與歷史加權報酬率。
+4. 另 1 點使用均線訊號與程式判定價量型態；不得羅列均線價格或只寫 KD、MACD。
+5. 優先比較 previous_week_comparison，指出延續、反轉或分歧。
+6. 每個數字都必須存在於 full_weekly_data；不得補數字、誇大法人中性訊號或提供買賣建議。
 
-請只回傳 JSON：
-{{
-  "points": [
-    "面向：權證面｜結果：權證資金流入｜說明：代表性分點或權證資金的明確結果與資料依據。",
-    "面向：技術面｜結果：股價跌破短均｜說明：價量型態、量區相對位置或股價方向的核心訊號。",
-    "下週觀察：面向：下週觀察｜結果：先看止跌訊號｜說明：下週需要確認的價量、法人、權證資金或新聞條件。"
-  ]
-}}
+只回傳符合 JSON Schema 的 JSON。
 
-修正資料 JSON：
+修正資料：
 {json.dumps(repair_payload, ensure_ascii=False, indent=2)}
 """
     output_text = _call_gemini_with_retry(
         repair_prompt,
-        cache_task="weekly_keypoints_ai_analysis_v23_inst_volume_technical_fix_repair",
-        stock_code=str(ctx.get("stock_code", "") or ""),
+        cache_task=f"{_weekly_keypoints_cache_task()}_required_branch_repair",
+        stock_code=stock_code,
         stock_name=stock_name,
+        write_cache=False,
+        response_schema=response_schema,
+        temperature=GEMINI_ANALYSIS_TEMPERATURE,
     )
     return _parse_weekly_gemini_points(output_text or "")
 
 
 def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
-    """讓 Gemini 以股票研究員角度，自主整理本週重點與下週條件式觀察。"""
+    """讓 Gemini 比較本週與上週，只快取完整驗證通過的三點結果。"""
     if not WEEKLY_KEYPOINT_LLM_ENABLE:
         return []
     try:
         payload = _build_weekly_llm_payload(ctx, stock_name)
         payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        stock_code = str(ctx.get("stock_code", "") or "")
+        response_schema = _build_gemini_points_response_schema(
+            min_points=3,
+            max_points=3,
+            include_note=False,
+        )
+
         prompt = f"""
-你是一位專業且中立的台股股票研究員。你只能使用我提供的 JSON 資料，不可使用外部知識、不可自行補數字或推測不存在的事件。
-請使用繁體中文。
+你是專業且中立的台股研究員。只能使用下方 JSON，整理「本週重點與下週觀察」，使用繁體中文。
 
-任務：完整閱讀股價與量能、價量型態、三大法人、權證資金流、買賣超 TOP5、具代表性分點的歷史勝率／歷史加權報酬率／平均持有天數，以及 recent_news_summary，整理「本週重點與下週觀察」。
+分析原則：
+1. 剛好輸出 3 點：前 2 點分析本週已發生事件，第 3 點必須以「下週觀察：」開頭。
+2. 每點固定為「面向：技術面/權證面/法人面/新聞面｜結果：具體結論｜說明：資料依據。」；下週點使用面向：下週觀察。不得寫「重點待確認」「題材待觀察」等空句。
+3. 優先比較 previous_week_comparison，指出權證淨流向、法人合計或 TOP5 分點的延續、反轉與方向分歧；不要只播報本週數字。
+4. 點名分點時，只能使用代表性分點，並完整使用本週方向與金額、歷史勝率、平均持有天數、歷史加權報酬率；小額分點不得點名。
+5. 技術面使用 price_ma_volume.ma_signal 與 price_volume_pattern.current_pattern_label；法人分類為接近中性時，只能描述方向有限或尚未明確。
+6. 所有數字都必須在 JSON 中找到，不得換算、推估或補充；不得提供買賣建議。每點需獨立完整並以句號結束。
 
-核心要求：
-1. 請輸出剛好 3 點：前 2 點為本週已發生的重點分析，第 3 點必須以「下週觀察：」開頭。
-2. 每一點都必須先給「面向」與「結果」，但「結果」要寫具體結論短句，不可只寫偏多、偏弱、中性觀察。
-3. 本週重點固定使用：「面向：技術面/權證面/法人面/新聞面｜結果：6～12字具體結論短句｜說明：一句具體資料依據」。若寫精選五分點，或事件數超過50筆且歷史勝率80%以上的代表性分點買超，結果可直接寫「元大南屯積極偏買」這類分點結論；其他分點請用「權證資金流入」等中性結果，不要用積極偏買。
-4. 下週觀察固定使用：「下週觀察：面向：下週觀察｜結果：6～12字具體觀察短句｜說明：下週需要確認的條件」。
-5. 每點 40～72 個中文字，結果必須是一眼看懂的具體重點，不可只寫偏多、偏弱、中性觀察，也不得寫「題材仍待確認」「重點待確認」；說明限一句完整短句，約 28～46 個中文字，不可寫成長篇段落。
-6. 說明文字必須自然收尾並以句號結束，不得使用省略號，不得留下「仍存在、持續、以及、並、上方存在、是否」這類看起來尚未說完的結尾；若內容太長，優先刪除次要描述，保留完整句子。
-7. 優先挑選本週最異常的變化、多項資料互相確認的訊號、資料彼此矛盾或時間尺度不同的訊號、以及可能影響下週的重要條件。
-8. 若選擇寫代表性分點、精選五分點，或結果短句點名分點，必須在說明中寫出該分點本週方向與金額，並同時包含歷史勝率、平均持有天數、歷史加權報酬率；只有精選五分點或事件數超過50筆且歷史勝率80%以上者，才可使用積極偏買語氣；沒有代表性就不要硬寫。
-9. 技術面必須優先參考 price_ma_volume.ma_signal，例如均線多頭排列、均線空頭排列、全面跌破均線，再結合收盤價相對5MA/10MA/20MA/60MA與 price_volume_pattern.current_pattern_label；若選擇寫價量型態，必須直接使用 price_volume_pattern.current_pattern_label，並用大量區相對位置、突破／跌破／回踩及價量關係解釋，不得輸出第一或第二大量區的實際價格。
-10. recent_news_summary 只有在能解釋本週行情、構成重要題材，或成為下週可追蹤催化因素時才引用；不得自行擴寫新聞中沒有的資訊。
-11. 若 institutional.weekly_total.classification 為「接近中性」，必須描述為法人方向有限或尚未明確，不得放大成明顯法人賣壓或強烈分歧。
-12. 個別分點只能從 representative_buy_top5_with_history、representative_sell_top5_with_history 或 required_representative_branch_analysis 中挑選；不得點名 non_representative_top5_summary 所代表的小額分點。
-13. 禁止單純羅列 MA5、MA10、MA20、MA60 價格，禁止只寫 KD、MACD 或「觀察動能是否延續」等可套用任何股票的空泛文字。
-14. 每點必須獨立完整並以句號結束；不得使用省略號，不得以「此外」「另外」「前述」「相對地」等承接上一點的方式開頭。
-15. 所有數字都必須能在 JSON 中找到。若資料不足，就使用其他有根據的面向，不得自行創造內容。
+好範例：
+- 面向：權證面｜結果：權證買盤連續增強｜說明：本週淨流向較上週改善，代表性分點同步買超並有完整歷史績效支持。
+- 下週觀察：面向：下週觀察｜結果：確認價量能否轉強｜說明：若權證與法人方向同步改善，再觀察程式判定型態是否獲得量能確認。
 
-請只回傳 JSON，不要 markdown，不要其他說明：
-{{
-  "points": [
-    "面向：技術面｜結果：股價跌破短均｜說明：本週最重要的價量或型態變化，以及後續需要確認的重點。",
-    "面向：權證面｜結果：權證資金流入｜說明：本週權證資金或代表性分點的主要變化與資料依據。",
-    "下週觀察：面向：下週觀察｜結果：先看止跌訊號｜說明：下週需要確認的價量、法人、權證資金或新聞條件。"
-  ]
-}}
+壞範例：
+- 面向：新聞面｜結果：題材仍待確認｜說明：後續持續關注。
+- 面向：技術面｜結果：偏多｜說明：KD、MACD與均線值得留意。
 
-以下是本週完整資料 JSON：
+只回傳符合 JSON Schema 的 JSON，不要 markdown 或其他說明。
+
+本週完整資料：
 {payload_json}
 """
         output_text = _call_gemini_with_retry(
             prompt,
-            cache_task="weekly_keypoints_expert_weekly_next_watch_v23_inst_volume_technical_fix",
-            stock_code=str(ctx.get("stock_code", "") or ""),
+            cache_task=_weekly_keypoints_cache_task(),
+            stock_code=stock_code,
             stock_name=stock_name,
+            write_cache=False,
+            response_schema=response_schema,
+            temperature=GEMINI_ANALYSIS_TEMPERATURE,
         )
         points = _parse_weekly_gemini_points(output_text or "")
-
-        problems = []
-        if len(points) != 3:
-            problems.append(f"重點數量為 {len(points)}，應為 3 點")
-        if any(_count_summary_chars([p]) < 24 for p in points) or _count_summary_chars(points) < 100:
-            problems.append("內容過短")
-        if points and not _points_are_independent_and_complete(points):
-            problems.append("出現承接句、半句或省略號")
-        watch_count = _weekly_points_watch_count(points)
-        if watch_count < 1 or watch_count > 2:
-            problems.append("下週觀察應為 1 至 2 點，且需以『下週觀察：』開頭")
-        if points and not _weekly_points_have_current_week_analysis(points):
-            problems.append("缺少本週已發生的重點分析")
-
-        forbidden_branches = _weekly_points_mention_nonrepresentative_branch(points, ctx)
-        if forbidden_branches:
-            problems.append("點名金額不具代表性的分點：" + "、".join(forbidden_branches))
-        low_value_reasons = _weekly_points_low_value_technical_reasons(points)
-        problems.extend(low_value_reasons)
-        if _weekly_points_overstate_neutral_institutional(points, ctx):
-            problems.append("法人接近中性卻被放大解讀")
-        if not _weekly_points_conditionally_cover_branch(points, ctx):
-            problems.append("既然選擇分析代表性分點，就必須完整使用勝率、加權報酬率與平均持有天數")
-        if not _weekly_points_conditionally_cover_pattern(points, ctx):
-            problems.append("既然選擇分析型態，就必須使用程式判定的型態標籤與價量依據")
+        problems = _validate_weekly_points(points, payload, ctx)
 
         if problems:
             print("⚠️ Gemini 本週重點與下週觀察需要修正：" + "；".join(problems))
-            repaired_points = _repair_weekly_expert_points(points, payload, ctx, stock_name, problems)
-            repaired_problems = []
-            if len(repaired_points) != 3:
-                repaired_problems.append("數量不合格")
-            if repaired_points and not _points_are_independent_and_complete(repaired_points):
-                repaired_problems.append("句子不完整")
-            repaired_watch_count = _weekly_points_watch_count(repaired_points)
-            if repaired_watch_count < 1 or repaired_watch_count > 2:
-                repaired_problems.append("下週觀察數量不合格")
-            if repaired_points and not _weekly_points_have_current_week_analysis(repaired_points):
-                repaired_problems.append("缺少本週分析")
-            if _weekly_points_mention_nonrepresentative_branch(repaired_points, ctx):
-                repaired_problems.append("仍點名小額分點")
-            if _weekly_points_low_value_technical_reasons(repaired_points):
-                repaired_problems.append("仍有空泛技術內容")
-            if _weekly_points_overstate_neutral_institutional(repaired_points, ctx):
-                repaired_problems.append("仍放大法人中性訊號")
-            if not _weekly_points_conditionally_cover_branch(repaired_points, ctx):
-                repaired_problems.append("分點歷史分析不完整")
-            if not _weekly_points_conditionally_cover_pattern(repaired_points, ctx):
-                repaired_problems.append("型態分析未使用程式判定")
-            if any(_count_summary_chars([p]) < 24 for p in repaired_points) or _count_summary_chars(repaired_points) < 100:
-                repaired_problems.append("內容仍過短")
+            repaired_points = _repair_weekly_expert_points(
+                points,
+                payload,
+                ctx,
+                stock_name,
+                problems,
+            )
+            repaired_problems = _validate_weekly_points(
+                repaired_points,
+                payload,
+                ctx,
+            )
 
             if repaired_problems:
                 print("⚠️ Gemini 修正後仍未達要求，改用條件式備援：" + "；".join(repaired_problems))
                 return []
+
             points = repaired_points
             print("✅ Gemini 本週重點與下週觀察修正完成")
 
+        _save_validated_weekly_points_cache(
+            _weekly_keypoints_cache_task(),
+            stock_code,
+            stock_name,
+            prompt,
+            points,
+            payload,
+            ctx,
+        )
         print(
             f"✅ Gemini 股票研究員分析完成：{len(points)} 點｜"
-            f"下週觀察 { _weekly_points_watch_count(points) } 點｜"
+            f"下週觀察 {_weekly_points_watch_count(points)} 點｜"
             f"總字數約 {_count_summary_chars(points)} 字"
         )
         return points[:3]
@@ -9735,6 +10377,11 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         print(f"ℹ️ 當日新聞快取僅 {len(cached_points)} 點，低於最低目標 {minimum_target} 點，繼續搜尋其他來源")
 
     records = _news_items_to_records(news_items)
+    records = _enrich_fast_news_records_with_topk_bodies(
+        records,
+        stock_code,
+        stock_name,
+    )
     body_records = [
         r for r in records
         if r.get("body_ok")
@@ -10255,15 +10902,34 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                       height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55],
                       hspace=0.20, wspace=0.25)
     else:
-        news_points = build_news_points(stock_code, stock_name, news_items, ctx)
+        with report_stage_timer(f"{stock_code}｜Gemini 新聞統整"):
+            news_points = build_news_points(stock_code, stock_name, news_items, ctx)
         ctx["weekly_news_points"] = list(news_points or [])
-        key_points = build_key_points(ctx, stock_name)
+        with report_stage_timer(f"{stock_code}｜Gemini 本週重點"):
+            key_points = build_key_points(ctx, stock_name)
         # K 線區塊改為實際放大：同步增加整張圖高度與 K 線 row ratio，
         # 避免只是壓縮下方指標或單純縮小 Y 軸上下留白。
         fig = plt.figure(figsize=(28, 62.3), facecolor=BG)
         gs = GridSpec(9, 12, figure=fig,
                       height_ratios=[1.45, 2.05, 13.1, 2.45, 3.1, 5.0, 4.7, 9.55, 9.05],
                       hspace=0.20, wspace=0.25)
+
+    # Matplotlib renderer 共用快取：
+    # 第一次需要量測文字時才完整 draw 一次，之後所有文字寬度量測都重用同一 renderer，
+    # 避免 draw_header_text_and_advance / wrap_text_by_pixel / _measure_text_width_axes
+    # 每次都重新繪製整張長圖。
+    renderer_cache = {"renderer": None}
+
+    def get_cached_renderer():
+        renderer = renderer_cache.get("renderer")
+        if renderer is None:
+            render_start = time.perf_counter()
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            renderer_cache["renderer"] = renderer
+            if REPORT_TIMING_ENABLE:
+                print(f"⏱️ {stock_code}｜Matplotlib 首次完整 render：{time.perf_counter() - render_start:.2f} 秒")
+        return renderer
 
     # Header
     ax_header = fig.add_subplot(gs[0, :])
@@ -10344,8 +11010,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             clip_on=False,
             zorder=12,
         )
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
+        renderer = get_cached_renderer()
         bbox = t.get_window_extent(renderer=renderer)
         y_disp = ax.transAxes.transform((0, y))[1]
         return ax.transAxes.inverted().transform((bbox.x1 + gap_px, y_disp))[0]
@@ -10713,8 +11378,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             if not s:
                 return []
 
-            fig.canvas.draw()
-            renderer = fig.canvas.get_renderer()
+            renderer = get_cached_renderer()
             ax_bbox = ax.get_window_extent(renderer=renderer)
             # width_boost 保留原本可放寬每行字數的行為；左下與右下文字卡會依不同區塊傳入放寬比例。
             safe_width_boost = float(width_boost or 1.0)
@@ -11239,8 +11903,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
             """量測文字在目前 notes 軸中的寬度，讓「面向：結果」用冒號自然銜接，不再靠固定空格對齊。"""
             try:
-                fig.canvas.draw()
-                renderer = fig.canvas.get_renderer()
+                renderer = get_cached_renderer()
                 ax_bbox = ax.get_window_extent(renderer=renderer)
                 if ax_bbox.width <= 0:
                     return 0.0
@@ -11440,37 +12103,48 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # ============================================================
 
 def generate_warrant_report(stock_code: str) -> io.BytesIO:
+    report_total_start = time.perf_counter()
+    stock_code = str(stock_code).strip()
+
     try:
-        stock_code = str(stock_code).strip()
         if REPORT_LIVE_ONLY:
             print("🔴 本次啟用純 Live 週報模式：圖片內容不使用 Google Sheet / 本機快取資料")
-        stock_name = get_tw_stock_name(stock_code)
-        stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
+
+        with report_stage_timer(f"{stock_code}｜股票名稱查詢"):
+            stock_name = get_tw_stock_name(stock_code)
+
+        with report_stage_timer(f"{stock_code}｜股價資料抓取"):
+            stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
+
         if stock_df is None or stock_df.empty:
             print(f"❌ 股價資料不足：{stock_code}")
             return None
-        stock_df = calculate_indicators(stock_df)
-        stock_df["Close_prev"] = stock_df["Close"].shift(1)
+
+        with report_stage_timer(f"{stock_code}｜技術指標計算"):
+            stock_df = calculate_indicators(stock_df)
+            stock_df["Close_prev"] = stock_df["Close"].shift(1)
 
         # 三大法人資料：對齊股價日期，讓週報可顯示三大法人買賣超。
         # 另外保留原始 FinMind 日期到 stock_df.attrs["institutional_df"]，讓三大法人圖可先顯示
         # 股價尚未更新、但 FinMind 已更新的最新法人買賣超。
-        inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
-        if inst_df is not None and not inst_df.empty:
-            inst_df = inst_df.copy()
-            inst_df["Date"] = pd.to_datetime(inst_df["Date"], errors="coerce").dt.tz_localize(None)
-            inst_df = inst_df.dropna(subset=["Date"]).sort_values("Date")
-            stock_df.attrs["institutional_df"] = inst_df.copy()
-            latest_inst_date = inst_df["Date"].max()
-            if pd.notna(latest_inst_date):
-                print(f"🔎 三大法人資料最新日期：{pd.Timestamp(latest_inst_date).date()}")
-            inst_join = inst_df.set_index("Date").sort_index()
-            stock_df = stock_df.join(inst_join[["foreign", "invest", "dealer", "total"]], how="left")
-            stock_df.attrs["institutional_df"] = inst_df.copy()
-        for c in ["foreign", "invest", "dealer", "total"]:
-            if c not in stock_df.columns:
-                stock_df[c] = 0.0
-        stock_df[["foreign", "invest", "dealer", "total"]] = stock_df[["foreign", "invest", "dealer", "total"]].fillna(0.0)
+        with report_stage_timer(f"{stock_code}｜三大法人資料"):
+            inst_df = fetch_inst_60d_from_x(stock_code, days=max(CHART_LOOKBACK + 10, 80))
+            if inst_df is not None and not inst_df.empty:
+                inst_df = inst_df.copy()
+                inst_df["Date"] = pd.to_datetime(inst_df["Date"], errors="coerce").dt.tz_localize(None)
+                inst_df = inst_df.dropna(subset=["Date"]).sort_values("Date")
+                stock_df.attrs["institutional_df"] = inst_df.copy()
+                latest_inst_date = inst_df["Date"].max()
+                if pd.notna(latest_inst_date):
+                    print(f"🔎 三大法人資料最新日期：{pd.Timestamp(latest_inst_date).date()}")
+                inst_join = inst_df.set_index("Date").sort_index()
+                stock_df = stock_df.join(inst_join[["foreign", "invest", "dealer", "total"]], how="left")
+                stock_df.attrs["institutional_df"] = inst_df.copy()
+
+            for c in ["foreign", "invest", "dealer", "total"]:
+                if c not in stock_df.columns:
+                    stock_df[c] = 0.0
+            stock_df[["foreign", "invest", "dealer", "total"]] = stock_df[["foreign", "invest", "dealer", "total"]].fillna(0.0)
 
         plot_df = stock_df.tail(CHART_LOOKBACK)
         start_date = pd.Timestamp(plot_df.index.min()).normalize()
@@ -11484,7 +12158,15 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             f"🚀 產生 {stock_code} {stock_name} 權證資金流週報，"
             f"股價最新日 {stock_end_date.date()}｜權證資料區間 {start_date.date()} ~ {end_date.date()}"
         )
-        warrant_events = fetch_warrant_events_full_market(stock_code, stock_name, start_date=start_date, end_date=end_date)
+
+        with report_stage_timer(f"{stock_code}｜權證完整流程"):
+            warrant_events = fetch_warrant_events_full_market(
+                stock_code,
+                stock_name,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
         if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
             latest_event_date = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna().max()
@@ -11508,6 +12190,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                 start_date=start_date,
                 end_date=end_date,
             )
+
         if warrant_events is not None and not warrant_events.empty:
             try:
                 debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
@@ -11520,30 +12203,84 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                     )
             except Exception as e:
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
-        if is_compact_report_mode():
-            print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
-            news_items = []
-        else:
-            cached_news_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
-            if cached_news_points:
-                print(f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
+
+        with report_stage_timer(f"{stock_code}｜新聞資料準備"):
+            if is_compact_report_mode():
+                print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
                 news_items = []
             else:
-                news_items = fetch_multi_source_news_articles(stock_code, stock_name, max_items=NEWS_GOOGLE_MAX_ITEMS)
+                cached_news_points = _load_gsheet_news_points_cache_for_display(
+                    stock_code,
+                    stock_name,
+                    allow_stale=False,
+                )
+                if cached_news_points:
+                    print(f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
+                    news_items = []
+                else:
+                    news_items = fetch_multi_source_news_articles(
+                        stock_code,
+                        stock_name,
+                        max_items=NEWS_GOOGLE_MAX_ITEMS,
+                    )
 
-        fig = plot_weekly_report(stock_code, stock_name, stock_df, warrant_events, news_items)
+        with report_stage_timer(f"{stock_code}｜週報建圖總流程"):
+            fig = plot_weekly_report(
+                stock_code,
+                stock_name,
+                stock_df,
+                warrant_events,
+                news_items,
+            )
+
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", pad_inches=0.18, facecolor=fig.get_facecolor())
-        plt.close(fig)
+        with report_stage_timer(f"{stock_code}｜Matplotlib PNG 輸出｜dpi={REPORT_OUTPUT_DPI}"):
+            try:
+                fig.savefig(
+                    buf,
+                    format="png",
+                    dpi=REPORT_OUTPUT_DPI,
+                    bbox_inches="tight",
+                    pad_inches=0.18,
+                    facecolor=fig.get_facecolor(),
+                    pil_kwargs={
+                        "compress_level": max(
+                            0,
+                            min(9, int(REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL)),
+                        ),
+                        "optimize": False,
+                    },
+                )
+            except TypeError as e:
+                # 相容較舊 Matplotlib：若不支援 pil_kwargs，保留相同 DPI 與版面設定重新輸出。
+                print(f"⚠️ Matplotlib 不支援 pil_kwargs，改用相容輸出：{e}")
+                buf.seek(0)
+                buf.truncate(0)
+                fig.savefig(
+                    buf,
+                    format="png",
+                    dpi=REPORT_OUTPUT_DPI,
+                    bbox_inches="tight",
+                    pad_inches=0.18,
+                    facecolor=fig.get_facecolor(),
+                )
+            finally:
+                plt.close(fig)
 
-        # 模擬「截圖後輸出」：先保留原本高解析產圖，再等比例縮小並重新壓縮，降低檔案大小。
-        buf = screenshot_like_output_buffer(buf)
+        # 模擬「截圖後輸出」：以較合理的中間解析度產圖，再等比例縮小並重新壓縮，降低檔案大小。
+        with report_stage_timer(f"{stock_code}｜Pillow 縮圖與最終壓縮"):
+            buf = screenshot_like_output_buffer(buf)
+
         return buf
+
     except Exception as e:
         import traceback
         print(f"❌ 產生權證週報錯誤：{e}")
         traceback.print_exc()
         return None
+    finally:
+        if REPORT_TIMING_ENABLE:
+            print(f"⏱️ {stock_code or 'UNKNOWN'}｜週報總時間：{time.perf_counter() - report_total_start:.2f} 秒")
 
 
 def generate_k_chart(stock_code: str) -> io.BytesIO:
