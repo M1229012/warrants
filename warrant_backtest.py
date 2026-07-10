@@ -129,6 +129,25 @@ PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
 PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE = os.getenv("PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE", "1").strip().lower() not in ("0", "false", "no")
 PRICE_PREFETCH_MIN_TARGET_PRICE_CODES = int(os.getenv("PRICE_PREFETCH_MIN_TARGET_PRICE_CODES", "1"))
 
+
+# 長期留單補價 / 修正勝率設定：
+# longterm 模式會直接從「快取_分點歷史」用 FIFO 重建未出清部位，
+# 篩選持有超過 120 / 150 / 180 天的留單，補最新可用價格，並輸出修正勝率。
+LONGTERM_OPEN_DAYS = [
+    int(x.strip())
+    for x in re.split(r"[,;；、\n\r\t]+", os.getenv("LONGTERM_OPEN_DAYS", "120,150,180"))
+    if x.strip().isdigit()
+]
+if not LONGTERM_OPEN_DAYS:
+    LONGTERM_OPEN_DAYS = [120, 150, 180]
+LONGTERM_OPEN_DAYS = sorted(set(max(int(x), 1) for x in LONGTERM_OPEN_DAYS))
+LONGTERM_PRICE_LOOKBACK_DAYS = int(os.getenv("LONGTERM_PRICE_LOOKBACK_DAYS", "420"))
+LONGTERM_PRICE_STALE_DAYS = int(os.getenv("LONGTERM_PRICE_STALE_DAYS", "10"))
+LONGTERM_ZERO_PRICE_THRESHOLD = float(os.getenv("LONGTERM_ZERO_PRICE_THRESHOLD", "0.05"))
+LONGTERM_TARGET_DATE = os.getenv("LONGTERM_TARGET_DATE", "").strip()
+LONGTERM_MAX_DETAIL_ROWS = int(os.getenv("LONGTERM_MAX_DETAIL_ROWS", "0"))
+LONGTERM_UPLOAD_TO_GSHEET = os.getenv("LONGTERM_UPLOAD_TO_GSHEET", "1").strip().lower() not in ("0", "false", "no")
+
 # 工作流模式：
 # daily：每日自動流程。先輕量探測，分點資料沒出來就只補價格並停止；不啟用 MoneyDJ Repair。
 # longterm：長期留單補價入口（保留模式，不影響每日流程）。
@@ -15359,6 +15378,594 @@ def run_automatic_cache_maintenance(warrants=None):
     print("  ✅ 快取自動維護完成")
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# WORKFLOW_MODE=longterm：長期留單補價格與修正勝率
+# ══════════════════════════════════════════════════════════════════════
+
+def longterm_safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        s = str(value).replace(",", "").strip()
+        if not s or s in ("-", "None", "nan", "null"):
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def longterm_target_date_from_history(history_df):
+    raw = str(LONGTERM_TARGET_DATE or PRICE_PREFETCH_TARGET_DATE or TOP15_TARGET_DATE or "").strip()
+    if raw:
+        dt = parse_date(raw)
+        if dt:
+            return dt.strftime("%Y/%m/%d")
+
+    if history_df is not None and not history_df.empty and "日期" in history_df.columns:
+        df = history_df.copy().fillna("")
+        # 優先使用有實際買賣活動的最新日期。
+        # 若假日或資料源異常產生 0 買 0 賣的日期列，不應拿它當 longterm 統計日期。
+        activity_cols = [c for c in ["買進股數", "賣出股數", "買進金額", "賣出金額"] if c in df.columns]
+        if activity_cols:
+            activity_sum = pd.Series(0.0, index=df.index)
+            for col in activity_cols:
+                activity_sum = activity_sum + pd.to_numeric(df[col], errors="coerce").fillna(0).abs()
+            active_df = df[activity_sum > 0].copy()
+        else:
+            active_df = df
+
+        dates = []
+        for value in active_df["日期"].tolist():
+            dt = parse_date(value)
+            if dt:
+                dates.append(dt)
+        if dates:
+            return max(dates).strftime("%Y/%m/%d")
+
+    return datetime.today().strftime("%Y/%m/%d")
+
+
+def longterm_history_range_info(history_df):
+    if history_df is None or history_df.empty or "日期" not in history_df.columns:
+        return "", "", 0
+
+    dates = []
+    for value in history_df["日期"].tolist():
+        dt = parse_date(value)
+        if dt:
+            dates.append(dt)
+
+    if not dates:
+        return "", "", 0
+
+    return min(dates).strftime("%Y/%m/%d"), max(dates).strftime("%Y/%m/%d"), len(set(d.date() for d in dates))
+
+
+def rebuild_longterm_open_lots_from_history(history_df, target_date):
+    """
+    從快取_分點歷史直接用 FIFO 重建目前未出清部位。
+
+    單位是「分點 × 權證」的實際買進批次，不依賴 A/B/C/D/E 事件，
+    因此可以抓出所有長期未賣出的留單。賣出依日期 FIFO 扣買進股數與成本，
+    同日買賣不互扣，避免把事件日內的買賣誤當出清。
+    """
+    if history_df is None or history_df.empty:
+        return []
+
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        target_dt = datetime.today()
+
+    needed_cols = {
+        "權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+    }
+    if not needed_cols.issubset(set(history_df.columns)):
+        missing = sorted(needed_cols - set(history_df.columns))
+        print(f"  ⚠️ 長期留單分析失敗：快取_分點歷史缺少欄位：{missing}")
+        return []
+
+    df = history_df.copy().fillna("")
+    df = fix_known_underlying_info_dataframe(df, "權證名稱", "標的股", "標的名稱")
+    df["日期"] = df["日期"].map(normalize_date_str)
+    df["_dt"] = pd.to_datetime(df["日期"].astype(str).str.replace("/", "-", regex=False), errors="coerce")
+    df = df[df["_dt"].notna()].copy()
+    df = df[df["_dt"].dt.date <= target_dt.date()].copy()
+
+    if df.empty:
+        return []
+
+    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    open_lots = []
+    group_cols = ["分點", "分點名稱", "券商代號", "權證代號", "權證名稱", "標的股", "標的名稱"]
+
+    for key, g in df.groupby(group_cols, dropna=False, sort=False):
+        broker_label, broker_name, broker_code, warrant_code, warrant_name, underlying_code, underlying_name = key
+        lots = []
+        g = g.sort_values(["_dt", "日期"]).reset_index(drop=True)
+
+        for row in g.itertuples(index=False):
+            rd = row._asdict()
+            trade_dt = rd.get("_dt")
+            if pd.isna(trade_dt):
+                continue
+            trade_date = trade_dt.strftime("%Y/%m/%d")
+
+            buy_qty = float(rd.get("買進股數", 0) or 0)
+            buy_amount = float(rd.get("買進金額", 0) or 0)
+            if buy_qty > 0 and buy_amount > 0:
+                lots.append({
+                    "分點": str(broker_label).strip(),
+                    "分點名稱": str(broker_name).strip(),
+                    "券商代號": str(broker_code).strip(),
+                    "權證代號": str(warrant_code).strip(),
+                    "權證名稱": str(warrant_name).strip(),
+                    "標的股": normalize_underlying_code_for_group(underlying_code),
+                    "標的名稱": str(underlying_name).strip(),
+                    "買進日": trade_date,
+                    "買進股數": buy_qty,
+                    "買進金額": buy_amount,
+                    "剩餘股數": buy_qty,
+                    "剩餘成本": buy_amount,
+                    "第一筆日期": trade_date,
+                    "最後筆日期": trade_date,
+                })
+
+            sell_qty_left = float(rd.get("賣出股數", 0) or 0)
+            if sell_qty_left <= 0:
+                continue
+
+            for lot in lots:
+                if sell_qty_left <= 0:
+                    break
+                buy_dt = parse_date(lot.get("買進日"))
+                if not buy_dt or trade_dt.to_pydatetime().date() <= buy_dt.date():
+                    continue
+
+                remain_qty = float(lot.get("剩餘股數", 0) or 0)
+                remain_cost = float(lot.get("剩餘成本", 0) or 0)
+                original_qty = float(lot.get("買進股數", 0) or 0)
+                original_cost = float(lot.get("買進金額", 0) or 0)
+                if remain_qty <= 0 or remain_cost <= 0 or original_qty <= 0 or original_cost <= 0:
+                    continue
+
+                avg_cost = original_cost / original_qty
+                alloc_qty = min(sell_qty_left, remain_qty)
+                alloc_cost = min(remain_cost, alloc_qty * avg_cost)
+                lot["剩餘股數"] = max(remain_qty - alloc_qty, 0)
+                lot["剩餘成本"] = max(remain_cost - alloc_cost, 0)
+                lot["最後筆日期"] = trade_date
+                sell_qty_left -= alloc_qty
+
+        for lot in lots:
+            remain_qty = float(lot.get("剩餘股數", 0) or 0)
+            remain_cost = float(lot.get("剩餘成本", 0) or 0)
+            if remain_qty <= 0 or remain_cost <= 0:
+                continue
+            buy_dt = parse_date(lot.get("買進日"))
+            if not buy_dt:
+                continue
+            holding_days = max((target_dt.date() - buy_dt.date()).days, 0)
+            lot["持有天數"] = holding_days
+            lot["剩餘均價"] = remain_cost / remain_qty if remain_qty > 0 else None
+            open_lots.append(lot)
+
+    return open_lots
+
+
+def ensure_longterm_warrant_prices(price_cache, open_lots, target_date):
+    """只針對長期未出清權證補最新可用價格，並同步回 price_cache。"""
+    if not open_lots:
+        return price_cache
+
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        target_dt = datetime.today()
+    target_dt = min(target_dt, datetime.today())
+    start_dt = target_dt - timedelta(days=max(int(LONGTERM_PRICE_LOOKBACK_DAYS or 420), 30))
+
+    needed_codes = sorted({
+        normalize_price_code(lot.get("權證代號", ""))
+        for lot in open_lots
+        if normalize_price_code(lot.get("權證代號", ""))
+    })
+
+    if not needed_codes:
+        return price_cache
+
+    persistent_price_cache = load_price_cache()
+    fetch_plan = []
+
+    for code in needed_codes:
+        cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
+        current_prices = get_price_series_from_cache(price_cache, code)
+        merged_prices = merge_price_dicts(cached_prices, current_prices)
+        if merged_prices:
+            add_price_aliases(price_cache, code, merged_prices)
+            persistent_price_cache[normalize_price_code(code)] = merged_prices
+
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_dt.strftime("%Y/%m/%d"))
+        latest_dt = parse_date(latest_date) if latest_date else None
+        need_fetch = latest_price is None
+        if latest_dt and (target_dt - latest_dt).days > LONGTERM_PRICE_STALE_DAYS:
+            need_fetch = True
+        if need_fetch:
+            fetch_plan.append(code)
+
+    print(f"  長期留單需檢查權證價格：{len(needed_codes):,} 檔")
+    print(f"  長期留單需補抓權證價格：{len(fetch_plan):,} 檔")
+
+    if fetch_plan:
+        changed_price_codes = set()
+
+        def fetch_one(code):
+            return code, fetch_twse_prices(code, start_dt, target_dt)
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
+            futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
+            for future in as_completed(futures):
+                done += 1
+                code = futures[future]
+                try:
+                    code, fetched_prices = future.result()
+                except Exception:
+                    fetched_prices = {}
+
+                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+                merged_prices = merge_price_dicts(old_prices, fetched_prices)
+                if merged_prices:
+                    norm_code = normalize_price_code(code)
+                    if norm_code:
+                        persistent_price_cache[norm_code] = merged_prices
+                        if fetched_prices:
+                            changed_price_codes.add(norm_code)
+                    add_price_aliases(price_cache, code, merged_prices)
+
+                if done % 50 == 0:
+                    print(f"  [{done:,}/{len(fetch_plan):,}] 長期留單權證價格補抓中...")
+
+        save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
+
+    return price_cache
+
+
+def attach_longterm_price_and_pnl(open_lots, price_cache, target_date):
+    rows = []
+    target_dt = parse_date(target_date) or datetime.today()
+
+    for lot in open_lots:
+        code = normalize_price_code(lot.get("權證代號", ""))
+        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_date)
+        remain_qty = longterm_safe_float(lot.get("剩餘股數"))
+        remain_cost = longterm_safe_float(lot.get("剩餘成本"))
+        buy_dt = parse_date(lot.get("買進日"))
+        holding_days = max((target_dt.date() - buy_dt.date()).days, 0) if buy_dt else int(lot.get("持有天數", 0) or 0)
+
+        market_value = None
+        pnl = None
+        return_pct = None
+        result = "缺價"
+        price_status = "缺最新權證價格"
+
+        if latest_price is not None and remain_qty > 0:
+            market_value = remain_qty * float(latest_price)
+            pnl = market_value - remain_cost
+            return_pct = (pnl / remain_cost * 100.0) if remain_cost > 0 else None
+            if float(latest_price) <= LONGTERM_ZERO_PRICE_THRESHOLD:
+                result = "疑似龜苓膏"
+                price_status = "價格接近歸零"
+            elif pnl > 0:
+                result = "賺錢"
+                price_status = "有價格"
+            elif pnl < 0:
+                result = "賠錢"
+                price_status = "有價格"
+            else:
+                result = "打平"
+                price_status = "有價格"
+
+        rows.append({
+            "統計日期": target_date,
+            "分點": lot.get("分點", ""),
+            "分點名稱": lot.get("分點名稱", ""),
+            "券商代號": lot.get("券商代號", ""),
+            "標的股": lot.get("標的股", ""),
+            "標的名稱": lot.get("標的名稱", ""),
+            "權證代號": lot.get("權證代號", ""),
+            "權證名稱": lot.get("權證名稱", ""),
+            "買進日": lot.get("買進日", ""),
+            "持有天數": holding_days,
+            "買進股數": round(longterm_safe_float(lot.get("買進股數")), 0),
+            "買進金額": round(longterm_safe_float(lot.get("買進金額")), 0),
+            "剩餘股數": round(remain_qty, 0),
+            "剩餘成本": round(remain_cost, 0),
+            "剩餘均價": "" if remain_qty <= 0 else round(remain_cost / remain_qty, 4),
+            "最新權證價格": "" if latest_price is None else latest_price,
+            "最新價格日期": latest_date or "",
+            "估算市值": "" if market_value is None else round(market_value, 0),
+            "估算損益": "" if pnl is None else round(pnl, 0),
+            "估算報酬%": "" if return_pct is None else round(return_pct, 2),
+            "結果": result,
+            "價格狀態": price_status,
+        })
+
+    return rows
+
+
+def filter_longterm_rows_by_days(rows, days):
+    return [row for row in rows if int(longterm_safe_float(row.get("持有天數"), 0)) >= int(days)]
+
+
+def summarize_longterm_rows(rows, days):
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows).fillna("")
+    numeric_cols = ["剩餘成本", "估算市值", "估算損益", "持有天數"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    summary_rows = []
+    for broker, g in df.groupby("分點", dropna=False, sort=False):
+        total = len(g)
+        priced = int((g["結果"].astype(str) != "缺價").sum())
+        missing = int((g["結果"].astype(str) == "缺價").sum())
+        win = int((g["結果"].astype(str) == "賺錢").sum())
+        loss = int((g["結果"].astype(str) == "賠錢").sum())
+        flat = int((g["結果"].astype(str) == "打平").sum())
+        zero = int((g["結果"].astype(str) == "疑似龜苓膏").sum())
+        known_risk = loss + zero
+        total_cost = float(g["剩餘成本"].fillna(0).sum()) if "剩餘成本" in g.columns else 0
+        missing_cost = float(g.loc[g["結果"].astype(str) == "缺價", "剩餘成本"].fillna(0).sum()) if "剩餘成本" in g.columns else 0
+        pnl_sum = float(g["估算損益"].fillna(0).sum()) if "估算損益" in g.columns else 0
+        avg_days = float(g["持有天數"].dropna().mean()) if "持有天數" in g.columns and not g["持有天數"].dropna().empty else 0
+
+        summary_rows.append({
+            "門檻天數": days,
+            "分點": broker,
+            "留單筆數": total,
+            "有價格筆數": priced,
+            "缺價筆數": missing,
+            "賺錢筆數": win,
+            "賠錢筆數": loss,
+            "打平筆數": flat,
+            "疑似龜苓膏筆數": zero,
+            "已知風險筆數": known_risk,
+            "有價格賠錢比例": "" if priced <= 0 else round(known_risk / priced * 100, 2),
+            "缺價比例": round(missing / total * 100, 2) if total else 0,
+            "留單成本": round(total_cost, 0),
+            "缺價成本": round(missing_cost, 0),
+            "缺價成本占比": "" if total_cost <= 0 else round(missing_cost / total_cost * 100, 2),
+            "已估損益合計": round(pnl_sum, 0),
+            "平均持有天數": round(avg_days, 2) if avg_days else "",
+        })
+
+    summary_rows.sort(key=lambda r: (-(longterm_safe_float(r.get("留單成本"))), str(r.get("分點", ""))))
+    return summary_rows
+
+
+def build_longterm_overview(threshold_rows_map, history_df, target_date):
+    hist_start, hist_end, hist_trade_days = longterm_history_range_info(history_df)
+    overview = []
+    for days in LONGTERM_OPEN_DAYS:
+        rows = threshold_rows_map.get(days, [])
+        total = len(rows)
+        priced = sum(1 for r in rows if str(r.get("結果", "")) != "缺價")
+        missing = sum(1 for r in rows if str(r.get("結果", "")) == "缺價")
+        win = sum(1 for r in rows if str(r.get("結果", "")) == "賺錢")
+        loss = sum(1 for r in rows if str(r.get("結果", "")) == "賠錢")
+        zero = sum(1 for r in rows if str(r.get("結果", "")) == "疑似龜苓膏")
+        flat = sum(1 for r in rows if str(r.get("結果", "")) == "打平")
+        total_cost = sum(longterm_safe_float(r.get("剩餘成本")) for r in rows)
+        missing_cost = sum(longterm_safe_float(r.get("剩餘成本")) for r in rows if str(r.get("結果", "")) == "缺價")
+        overview.append({
+            "統計日期": target_date,
+            "門檻天數": days,
+            "留單筆數": total,
+            "有價格筆數": priced,
+            "缺價筆數": missing,
+            "賺錢筆數": win,
+            "賠錢筆數": loss,
+            "打平筆數": flat,
+            "疑似龜苓膏筆數": zero,
+            "有價格賠錢比例": "" if priced <= 0 else round((loss + zero) / priced * 100, 2),
+            "缺價比例": "" if total <= 0 else round(missing / total * 100, 2),
+            "留單成本": round(total_cost, 0),
+            "缺價成本": round(missing_cost, 0),
+            "缺價成本占比": "" if total_cost <= 0 else round(missing_cost / total_cost * 100, 2),
+            "歷史快取起始日": hist_start,
+            "歷史快取最後日": hist_end,
+            "歷史快取交易日數": hist_trade_days,
+            "HISTORY_RETENTION_TRADING_DAYS": HISTORY_RETENTION_TRADING_DAYS,
+        })
+    return overview
+
+
+def build_longterm_adjusted_winrate_rows(summary_map, threshold_summary_map):
+    rows = []
+    for days in LONGTERM_OPEN_DAYS:
+        broker_risk = {
+            str(row.get("分點", "")).strip(): row
+            for row in threshold_summary_map.get(days, [])
+        }
+        brokers = list(TARGET_PATTERNS.keys())
+        for broker in sorted(set(list(brokers) + list(broker_risk.keys()))):
+            original = (summary_map.get(broker, {}) or {}).get("ALL", calc_empty_summary(broker, "全部-A+B+C+D+E合併"))
+            risk = broker_risk.get(broker, {})
+            closed_count = int(original.get("已出清筆數") or 0)
+            win_count = int(original.get("勝筆數") or 0)
+            loss_count = int(original.get("敗筆數") or 0)
+            flat_count = int(original.get("平手筆數") or 0)
+            long_loss = int(longterm_safe_float(risk.get("賠錢筆數"), 0)) + int(longterm_safe_float(risk.get("疑似龜苓膏筆數"), 0))
+            long_missing = int(longterm_safe_float(risk.get("缺價筆數"), 0))
+            revised_den = closed_count + long_loss
+            conservative_den = closed_count + long_loss + long_missing
+            rows.append({
+                "門檻天數": days,
+                "分點": broker,
+                "原始事件數": int(original.get("事件數") or 0),
+                "原始已出清筆數": closed_count,
+                "原始未出清筆數": int(original.get("未出清筆數") or 0),
+                "原始勝筆數": win_count,
+                "原始敗筆數": loss_count,
+                "原始平手筆數": flat_count,
+                "原始勝率": original.get("勝率"),
+                "長期留單筆數": int(longterm_safe_float(risk.get("留單筆數"), 0)),
+                "長期已知虧損/龜苓膏筆數": long_loss,
+                "長期缺價筆數": long_missing,
+                "修正勝率_已知虧損視為敗": "" if revised_den <= 0 else round(win_count / revised_den * 100, 2),
+                "保守勝率_已知虧損加缺價視為敗": "" if conservative_den <= 0 else round(win_count / conservative_den * 100, 2),
+                "說明": "修正勝率以長期留單已知虧損/龜苓膏視為額外敗筆；保守勝率再把缺價留單也視為風險敗筆。長期留單單位為未出清買進批次，非原始事件數。",
+            })
+    return rows
+
+
+def dataframe_to_sheet(wb, title, rows, freeze=True, max_rows=0):
+    ws = wb.create_sheet(safe_worksheet_title(title))
+    if max_rows and rows and len(rows) > max_rows:
+        rows = rows[:max_rows]
+    if not rows:
+        ws.append(["無資料"])
+        style_sheet(ws, [16])
+        return ws
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+    if freeze:
+        ws.freeze_panes = "A2"
+    widths = []
+    for h in headers:
+        if "名稱" in h or "說明" in h:
+            widths.append(28)
+        elif "權證代號" in h or "券商代號" in h or "標的股" in h:
+            widths.append(12)
+        elif "日期" in h:
+            widths.append(12)
+        elif "金額" in h or "成本" in h or "市值" in h or "損益" in h:
+            widths.append(16)
+        else:
+            widths.append(14)
+    style_sheet(ws, widths)
+    return ws
+
+
+def build_longterm_workbook(output_path, overview_rows, threshold_summary_map, threshold_rows_map, adjusted_rows):
+    wb = Workbook()
+    ws0 = wb.active
+    ws0.title = "長期留單總覽"
+    dataframe_to_sheet(wb, "_tmp_remove", [])
+    try:
+        del wb["_tmp_remove"]
+    except Exception:
+        pass
+    # 直接寫入 active sheet，避免 Workbook 預設空白表殘留。
+    if overview_rows:
+        headers = list(overview_rows[0].keys())
+        ws0.append(headers)
+        for row in overview_rows:
+            ws0.append([row.get(h, "") for h in headers])
+        ws0.freeze_panes = "A2"
+        style_sheet(ws0, [14] * len(headers))
+    else:
+        ws0.append(["無資料"])
+        style_sheet(ws0, [16])
+
+    dataframe_to_sheet(wb, "長期留單修正勝率", adjusted_rows)
+
+    for days in LONGTERM_OPEN_DAYS:
+        dataframe_to_sheet(wb, f"長期留單分點彙總_{days}日", threshold_summary_map.get(days, []))
+        detail_rows = threshold_rows_map.get(days, [])
+        detail_rows = sorted(
+            detail_rows,
+            key=lambda r: (-(longterm_safe_float(r.get("剩餘成本"))), str(r.get("分點", "")), str(r.get("權證代號", ""))),
+        )
+        dataframe_to_sheet(
+            wb,
+            f"長期留單明細_{days}日",
+            detail_rows,
+            max_rows=max(int(LONGTERM_MAX_DETAIL_ROWS or 0), 0),
+        )
+
+    wb.save(output_path)
+
+
+def run_longterm_workflow(warrants, broker_map, output_path, program_start):
+    print("\n【Longterm】長期留單補價格與修正勝率分析...")
+    history_df = load_history_cache()
+    if history_df is None or history_df.empty:
+        print("  ⚠️ 長期留單分析停止：快取_分點歷史為空。請先跑 daily 或 repair 建立歷史快取。")
+        elapsed = time.time() - program_start
+        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        return
+
+    target_date = longterm_target_date_from_history(history_df)
+    print(f"  ✅ 長期留單統計日期：{target_date}")
+    hist_start, hist_end, hist_trade_days = longterm_history_range_info(history_df)
+    print(f"  ✅ 歷史快取範圍：{hist_start or '-'} ～ {hist_end or '-'}｜交易日數 {hist_trade_days:,}｜保留設定 {HISTORY_RETENTION_TRADING_DAYS} 個交易日")
+
+    open_lots = rebuild_longterm_open_lots_from_history(history_df, target_date)
+    if not open_lots:
+        print("  ⚠️ 長期留單分析停止：沒有重建出未出清部位。")
+        elapsed = time.time() - program_start
+        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        return
+
+    min_days = min(LONGTERM_OPEN_DAYS)
+    long_open_lots = [lot for lot in open_lots if int(lot.get("持有天數", 0) or 0) >= min_days]
+    print(f"  ✅ 未出清買進批次：{len(open_lots):,} 筆｜{min_days} 日以上：{len(long_open_lots):,} 筆")
+
+    price_cache = load_price_cache()
+    price_cache = ensure_longterm_warrant_prices(price_cache, long_open_lots, target_date)
+    priced_rows_all = attach_longterm_price_and_pnl(long_open_lots, price_cache, target_date)
+
+    threshold_rows_map = {days: filter_longterm_rows_by_days(priced_rows_all, days) for days in LONGTERM_OPEN_DAYS}
+    threshold_summary_map = {days: summarize_longterm_rows(threshold_rows_map.get(days, []), days) for days in LONGTERM_OPEN_DAYS}
+    overview_rows = build_longterm_overview(threshold_rows_map, history_df, target_date)
+
+    # 用現有 A/B/C/D/E 事件統計提供「原始已出清勝率」基準，再把長期風險做修正勝率。
+    items = items_from_history_cache(history_df)
+    item_map = {(item["broker_code"], item["warrant_code"]): item for item in items}
+    daily_records = build_daily_records(items)
+    amount_events = build_amount_class_events(daily_records, item_map)
+    a_events, b_events, c_events, d_events, e_events = [amount_events.get(code, []) for code in AMOUNT_CLASS_CODES]
+    stat_records = collect_stat_records(a_events, b_events, c_events, d_events, e_events)
+    summary_map, _ = make_summary_map(stat_records)
+    adjusted_rows = build_longterm_adjusted_winrate_rows(summary_map, threshold_summary_map)
+
+    longterm_output_path = os.path.join(
+        OUTPUT_DIR,
+        f"warrant_longterm_open_positions_{datetime.today().strftime('%Y%m%d')}.xlsx",
+    )
+    build_longterm_workbook(
+        longterm_output_path,
+        overview_rows,
+        threshold_summary_map,
+        threshold_rows_map,
+        adjusted_rows,
+    )
+
+    if LONGTERM_UPLOAD_TO_GSHEET:
+        upload_excel_to_google_sheet(longterm_output_path)
+
+    for row in overview_rows:
+        print(
+            f"  ✅ {row.get('門檻天數')}日以上：留單 {int(row.get('留單筆數') or 0):,} 筆｜"
+            f"有價格 {int(row.get('有價格筆數') or 0):,}｜缺價 {int(row.get('缺價筆數') or 0):,}｜"
+            f"賠錢 {int(row.get('賠錢筆數') or 0):,}｜龜苓膏 {int(row.get('疑似龜苓膏筆數') or 0):,}"
+        )
+
+    elapsed = time.time() - program_start
+    print(f"\n{'=' * 70}")
+    print("✅ 長期留單分析完成！")
+    print(f"📄 {longterm_output_path}")
+    print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
+
 # ══════════════════════════════════════════════════════════════════════
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
@@ -15403,9 +16010,7 @@ def main():
         return
 
     if workflow_is_longterm():
-        print("  ⚠️ WORKFLOW_MODE=longterm：長期留單補價格模式尚未在本檔完成，先停止以避免誤跑每日報表。")
-        elapsed = time.time() - program_start
-        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        run_longterm_workflow(warrants, broker_map, output_path, program_start)
         return
 
     if workflow_is_daily():
