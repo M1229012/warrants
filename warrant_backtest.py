@@ -146,7 +146,12 @@ LONGTERM_PRICE_STALE_DAYS = int(os.getenv("LONGTERM_PRICE_STALE_DAYS", "10"))
 LONGTERM_ZERO_PRICE_THRESHOLD = float(os.getenv("LONGTERM_ZERO_PRICE_THRESHOLD", "0.05"))
 LONGTERM_TARGET_DATE = os.getenv("LONGTERM_TARGET_DATE", "").strip()
 LONGTERM_MAX_DETAIL_ROWS = int(os.getenv("LONGTERM_MAX_DETAIL_ROWS", "0"))
-LONGTERM_UPLOAD_TO_GSHEET = os.getenv("LONGTERM_UPLOAD_TO_GSHEET", "1").strip().lower() not in ("0", "false", "no")
+# longterm 的完整明細 / 分點彙總只輸出 Excel，避免占用 Google Sheet 格數。
+# Google Sheet 預設只更新既有「勝率統計」工作表底部的長期留單修正勝率區塊。
+LONGTERM_UPDATE_WINRATE_SHEET = os.getenv("LONGTERM_UPDATE_WINRATE_SHEET", os.getenv("LONGTERM_UPLOAD_TO_GSHEET", "1")).strip().lower() not in ("0", "false", "no")
+LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET = os.getenv("LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET", "0").strip().lower() in ("1", "true", "yes")
+LONGTERM_WINRATE_SHEET_DAYS = int(os.getenv("LONGTERM_WINRATE_SHEET_DAYS", str(LONGTERM_OPEN_DAYS[0] if LONGTERM_OPEN_DAYS else 120)) or "120")
+LONGTERM_WINRATE_SHEET_HEADER = os.getenv("LONGTERM_WINRATE_SHEET_HEADER", "修正勝率").strip() or "修正勝率"
 
 # 工作流模式：
 # daily：每日自動流程。先輕量探測，分點資料沒出來就只補價格並停止；不啟用 MoneyDJ Repair。
@@ -15445,6 +15450,69 @@ def longterm_history_range_info(history_df):
     return min(dates).strftime("%Y/%m/%d"), max(dates).strftime("%Y/%m/%d"), len(set(d.date() for d in dates))
 
 
+
+def longterm_event_class_from_amount(total_buy_amount, max_single_warrant_buy_amount):
+    """依 ABCDE 規則判斷 longterm 留單的原始事件類型。"""
+    try:
+        total_buy_amount = float(total_buy_amount or 0)
+        max_single_warrant_buy_amount = float(max_single_warrant_buy_amount or 0)
+    except Exception:
+        return ""
+
+    if max_single_warrant_buy_amount < AMOUNT_THRESH:
+        return ""
+
+    for code, _label, low, high in AMOUNT_CLASS_SPECS:
+        if total_buy_amount >= low and (high is None or total_buy_amount < high):
+            return code
+    return ""
+
+
+def build_longterm_event_code_map(df):
+    """
+    從快取_分點歷史重建「同一分點 × 同一標的 × 同一天」的 ABCDE 事件分類。
+
+    longterm 的未出清留單是以權證買進批次為單位；但修正勝率要對應原本勝率統計的
+    A/B/C/D/E 分類，因此這裡先把買進日當天同分點、同標的的買進金額合併分類，
+    再把每個未出清買進批次標上事件代碼。
+    """
+    if df is None or df.empty:
+        return {}
+
+    required = {"分點", "券商代號", "標的股", "日期", "買進股數", "買進金額"}
+    if not required.issubset(set(df.columns)):
+        return {}
+
+    work = df.copy().fillna("")
+    work["標的股_norm"] = work["標的股"].map(normalize_underlying_code_for_group)
+    work["買進股數_num"] = work["買進股數"].map(longterm_safe_float).fillna(0.0)
+    work["買進金額_num"] = work["買進金額"].map(longterm_safe_float).fillna(0.0)
+    work = work[(work["買進股數_num"] > 0) & (work["買進金額_num"] > 0)].copy()
+    if work.empty:
+        return {}
+
+    event_map = {}
+    group_cols = ["分點", "券商代號", "標的股_norm", "日期"]
+    for key, g in work.groupby(group_cols, dropna=False, sort=False):
+        broker_label, broker_code, underlying_code, trade_date = key
+        total_amount = float(g["買進金額_num"].sum())
+        max_amount = float(g["買進金額_num"].max())
+        code = longterm_event_class_from_amount(total_amount, max_amount)
+        if not code:
+            continue
+        event_map[(
+            str(broker_label).strip(),
+            str(broker_code).strip(),
+            str(underlying_code).strip(),
+            normalize_date_str(trade_date),
+        )] = {
+            "事件代碼": code,
+            "事件類型": f"{code}-{AMOUNT_CLASS_LABELS.get(code, '事件')}",
+            "事件總買進金額": total_amount,
+            "事件最大單檔買進金額": max_amount,
+        }
+    return event_map
+
 def rebuild_longterm_open_lots_from_history(history_df, target_date):
     """
     從快取_分點歷史直接用 FIFO 重建目前未出清部位。
@@ -15485,6 +15553,8 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
         # Google Sheet 讀回可能含千分位逗號，直接 pd.to_numeric 會變 NaN。
         df[col] = df[col].map(longterm_safe_float).fillna(0.0)
 
+    event_code_map = build_longterm_event_code_map(df)
+
     open_lots = []
     group_cols = ["分點", "分點名稱", "券商代號", "權證代號", "權證名稱", "標的股", "標的名稱"]
 
@@ -15502,14 +15572,25 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
             buy_qty = float(rd.get("買進股數", 0) or 0)
             buy_amount = float(rd.get("買進金額", 0) or 0)
             if buy_qty > 0 and buy_amount > 0:
+                underlying_norm = normalize_underlying_code_for_group(underlying_code)
+                event_info = event_code_map.get((
+                    str(broker_label).strip(),
+                    str(broker_code).strip(),
+                    str(underlying_norm).strip(),
+                    trade_date,
+                ), {})
                 lots.append({
                     "分點": str(broker_label).strip(),
                     "分點名稱": str(broker_name).strip(),
                     "券商代號": str(broker_code).strip(),
                     "權證代號": str(warrant_code).strip(),
                     "權證名稱": str(warrant_name).strip(),
-                    "標的股": normalize_underlying_code_for_group(underlying_code),
+                    "標的股": underlying_norm,
                     "標的名稱": str(underlying_name).strip(),
+                    "事件代碼": event_info.get("事件代碼", ""),
+                    "事件類型": event_info.get("事件類型", "未達ABCDE門檻"),
+                    "事件總買進金額": event_info.get("事件總買進金額", ""),
+                    "事件最大單檔買進金額": event_info.get("事件最大單檔買進金額", ""),
                     "買進日": trade_date,
                     "買進股數": buy_qty,
                     "買進金額": buy_amount,
@@ -15680,6 +15761,10 @@ def attach_longterm_price_and_pnl(open_lots, price_cache, target_date):
             "分點": lot.get("分點", ""),
             "分點名稱": lot.get("分點名稱", ""),
             "券商代號": lot.get("券商代號", ""),
+            "事件代碼": lot.get("事件代碼", ""),
+            "事件類型": lot.get("事件類型", ""),
+            "事件總買進金額": lot.get("事件總買進金額", ""),
+            "事件最大單檔買進金額": lot.get("事件最大單檔買進金額", ""),
             "標的股": lot.get("標的股", ""),
             "標的名稱": lot.get("標的名稱", ""),
             "權證代號": lot.get("權證代號", ""),
@@ -15793,44 +15878,114 @@ def build_longterm_overview(threshold_rows_map, history_df, target_date):
     return overview
 
 
-def build_longterm_adjusted_winrate_rows(summary_map, threshold_summary_map):
-    rows = []
-    for days in LONGTERM_OPEN_DAYS:
-        broker_risk = {
-            str(row.get("分點", "")).strip(): row
-            for row in threshold_summary_map.get(days, [])
-        }
-        brokers = list(TARGET_PATTERNS.keys())
-        for broker in sorted(set(list(brokers) + list(broker_risk.keys()))):
-            original = (summary_map.get(broker, {}) or {}).get("ALL", calc_empty_summary(broker, "全部-A+B+C+D+E合併"))
-            risk = broker_risk.get(broker, {})
-            closed_count = int(original.get("已出清筆數") or 0)
-            win_count = int(original.get("勝筆數") or 0)
-            loss_count = int(original.get("敗筆數") or 0)
-            flat_count = int(original.get("平手筆數") or 0)
-            long_loss = int(longterm_safe_float(risk.get("賠錢筆數"), 0)) + int(longterm_safe_float(risk.get("疑似龜苓膏筆數"), 0))
-            long_missing = int(longterm_safe_float(risk.get("缺價筆數"), 0))
-            revised_den = closed_count + long_loss
-            conservative_den = closed_count + long_loss + long_missing
-            rows.append({
-                "門檻天數": days,
-                "分點": broker,
-                "原始事件數": int(original.get("事件數") or 0),
-                "原始已出清筆數": closed_count,
-                "原始未出清筆數": int(original.get("未出清筆數") or 0),
-                "原始勝筆數": win_count,
-                "原始敗筆數": loss_count,
-                "原始平手筆數": flat_count,
-                "原始勝率": original.get("勝率"),
-                "長期留單筆數": int(longterm_safe_float(risk.get("留單筆數"), 0)),
-                "長期已知虧損/龜苓膏筆數": long_loss,
-                "長期缺價筆數": long_missing,
-                "修正勝率_已知虧損視為敗": "" if revised_den <= 0 else round(win_count / revised_den * 100, 2),
-                "保守勝率_已知虧損加缺價視為敗": "" if conservative_den <= 0 else round(win_count / conservative_den * 100, 2),
-                "說明": "修正勝率以長期留單已知虧損/龜苓膏視為額外敗筆；保守勝率再把缺價留單也視為風險敗筆。長期留單單位為未出清買進批次，非原始事件數。",
-            })
-    return rows
+def build_longterm_risk_summary_by_broker_event(rows):
+    """把 longterm 明細整理成 分點 × A/B/C/D/E/ALL 的風險筆數。"""
+    empty = {}
+    if not rows:
+        return empty
 
+    df = pd.DataFrame(rows).fillna("")
+    if df.empty or "分點" not in df.columns:
+        return empty
+
+    df["事件代碼"] = df.get("事件代碼", "").astype(str).str.strip()
+    df = df[df["事件代碼"].isin(AMOUNT_CLASS_CODES)].copy()
+    if df.empty:
+        return empty
+
+    out = {}
+
+    def summarize_group(g):
+        total = len(g)
+        result = g["結果"].astype(str) if "結果" in g.columns else pd.Series([], dtype=str)
+        loss = int((result == "賠錢").sum())
+        zero = int((result == "疑似龜苓膏").sum())
+        missing = int((result == "缺價").sum())
+        win = int((result == "賺錢").sum())
+        flat = int((result == "打平").sum())
+        cost = sum(longterm_safe_float(v) for v in g.get("剩餘成本", []))
+        missing_cost = sum(longterm_safe_float(v) for v in g.loc[result == "缺價", "剩餘成本"]) if "剩餘成本" in g.columns and len(result) else 0
+        return {
+            "長期留單筆數": int(total),
+            "長期賺錢筆數": int(win),
+            "長期賠錢筆數": int(loss),
+            "長期打平筆數": int(flat),
+            "長期疑似龜苓膏筆數": int(zero),
+            "長期已知虧損/龜苓膏筆數": int(loss + zero),
+            "長期缺價筆數": int(missing),
+            "長期留單成本": round(float(cost), 0),
+            "長期缺價成本": round(float(missing_cost), 0),
+        }
+
+    for (broker, code), g in df.groupby(["分點", "事件代碼"], dropna=False, sort=False):
+        out[(str(broker).strip(), str(code).strip())] = summarize_group(g)
+
+    for broker, g in df.groupby("分點", dropna=False, sort=False):
+        out[(str(broker).strip(), "ALL")] = summarize_group(g)
+
+    return out
+
+
+def build_longterm_adjusted_winrate_rows(summary_map, threshold_rows_map):
+    """
+    產生可放進「勝率統計」的長期留單修正勝率。
+
+    這裡會依 分點 × A/B/C/D/E/ALL 計算：
+    - 原始勝率：原本已出清勝率。
+    - 修正勝率：把長期留單中已知虧損與疑似龜苓膏視為額外敗筆。
+    - 保守勝率：再把長期缺價留單也視為風險敗筆。
+    """
+    rows = []
+    brokers = list(TARGET_PATTERNS.keys())
+    for broker in summary_map.keys():
+        if broker not in brokers:
+            brokers.append(broker)
+
+    event_type_names = {
+        code: f"{code}-{AMOUNT_CLASS_LABELS.get(code, '事件')}"
+        for code in AMOUNT_CLASS_CODES
+    }
+    event_type_names["ALL"] = "全部-A+B+C+D+E合併"
+
+    for days in LONGTERM_OPEN_DAYS:
+        risk_map = build_longterm_risk_summary_by_broker_event(threshold_rows_map.get(days, []))
+        for broker in sorted(set(brokers)):
+            for code in AMOUNT_CLASS_CODES + ["ALL"]:
+                original = (summary_map.get(broker, {}) or {}).get(code, calc_empty_summary(broker, event_type_names.get(code, code)))
+                risk = risk_map.get((broker, code), {})
+                closed_count = int(original.get("已出清筆數") or 0)
+                win_count = int(original.get("勝筆數") or 0)
+                loss_count = int(original.get("敗筆數") or 0)
+                flat_count = int(original.get("平手筆數") or 0)
+                long_loss = int(longterm_safe_float(risk.get("長期已知虧損/龜苓膏筆數"), 0))
+                long_missing = int(longterm_safe_float(risk.get("長期缺價筆數"), 0))
+                revised_den = closed_count + long_loss
+                conservative_den = closed_count + long_loss + long_missing
+                rows.append({
+                    "門檻天數": days,
+                    "分點": broker,
+                    "事件代碼": code,
+                    "事件類型": event_type_names.get(code, code),
+                    "原始事件數": int(original.get("事件數") or 0),
+                    "原始已出清筆數": closed_count,
+                    "原始未出清筆數": int(original.get("未出清筆數") or 0),
+                    "原始勝筆數": win_count,
+                    "原始敗筆數": loss_count,
+                    "原始平手筆數": flat_count,
+                    "原始勝率": original.get("勝率"),
+                    "長期留單筆數": int(longterm_safe_float(risk.get("長期留單筆數"), 0)),
+                    "長期賺錢筆數": int(longterm_safe_float(risk.get("長期賺錢筆數"), 0)),
+                    "長期賠錢筆數": int(longterm_safe_float(risk.get("長期賠錢筆數"), 0)),
+                    "長期疑似龜苓膏筆數": int(longterm_safe_float(risk.get("長期疑似龜苓膏筆數"), 0)),
+                    "長期已知虧損/龜苓膏筆數": long_loss,
+                    "長期缺價筆數": long_missing,
+                    "長期留單成本": risk.get("長期留單成本", 0),
+                    "長期缺價成本": risk.get("長期缺價成本", 0),
+                    "修正勝率_已知虧損視為敗": "" if revised_den <= 0 else round(win_count / revised_den * 100, 2),
+                    "保守勝率_已知虧損加缺價視為敗": "" if conservative_den <= 0 else round(win_count / conservative_den * 100, 2),
+                    "說明": "修正勝率以同分點同事件類型的長期留單已知虧損/龜苓膏視為額外敗筆；保守勝率再把缺價留單也視為風險敗筆。",
+                })
+    return rows
 
 def dataframe_to_sheet(wb, title, rows, freeze=True, max_rows=0):
     ws = wb.create_sheet(safe_worksheet_title(title))
@@ -15902,6 +16057,252 @@ def build_longterm_workbook(output_path, overview_rows, threshold_summary_map, t
     wb.save(output_path)
 
 
+
+def _longterm_pct_text(value):
+    if value is None or str(value).strip() == "":
+        return "-"
+    try:
+        return f"{float(value):.2f}%"
+    except Exception:
+        return str(value).strip() or "-"
+
+
+def _longterm_extract_event_code(event_type):
+    s = str(event_type or "").strip()
+    if not s:
+        return ""
+    if s.startswith("全部"):
+        return "ALL"
+    m = re.match(r"^([A-E])(?:[-－]|$)", s)
+    if m:
+        return m.group(1)
+    return "ALL" if "全部" in s else s
+
+
+def _longterm_build_inline_winrate_map(adjusted_rows):
+    """
+    取 LONGTERM_WINRATE_SHEET_DAYS 對應門檻的修正勝率，準備回填到勝率統計原表格。
+    Google Sheet 只放一個「修正勝率」欄位；完整 120 / 150 / 180 日明細仍保留在 Excel artifact。
+    """
+    selected_days = int(LONGTERM_WINRATE_SHEET_DAYS or (LONGTERM_OPEN_DAYS[0] if LONGTERM_OPEN_DAYS else 120))
+    rows = [r for r in (adjusted_rows or []) if int(longterm_safe_float(r.get("門檻天數"), -1)) == selected_days]
+    if not rows and adjusted_rows:
+        available_days = sorted({int(longterm_safe_float(r.get("門檻天數"), 0)) for r in adjusted_rows if longterm_safe_float(r.get("門檻天數"), 0) > 0})
+        if available_days:
+            selected_days = available_days[0]
+            rows = [r for r in adjusted_rows if int(longterm_safe_float(r.get("門檻天數"), -1)) == selected_days]
+
+    out = {}
+    for rec in rows:
+        broker = str(rec.get("分點", "")).strip()
+        code = str(rec.get("事件代碼", "")).strip() or _longterm_extract_event_code(rec.get("事件類型", ""))
+        if not broker or not code:
+            continue
+        out[(broker, code)] = _longterm_pct_text(rec.get("修正勝率_已知虧損視為敗"))
+    return out, selected_days
+
+
+def _longterm_find_winrate_header_info(values):
+    """找出勝率統計內既有的勝率欄位，並判斷旁邊是否已有修正勝率欄。"""
+    for row_idx, row in enumerate(values or [], start=1):
+        cells = [str(x).strip() for x in row]
+        if "分點" not in cells or "事件類型" not in cells or "勝率" not in cells:
+            continue
+        winrate_idx = cells.index("勝率")
+        has_adjusted_next = (winrate_idx + 1 < len(cells) and str(cells[winrate_idx + 1]).strip().startswith("修正勝率"))
+        return {
+            "header_row": row_idx,
+            "winrate_col_index0": winrate_idx,
+            "adjusted_col_index0": winrate_idx + 1,
+            "has_adjusted_next": has_adjusted_next,
+        }
+    return None
+
+
+def _longterm_clear_old_bottom_winrate_block(ws, values):
+    """清掉舊版曾寫在勝率統計底部的長期留單修正勝率區塊。"""
+    marker = "長期留單修正勝率"
+    marker_row = None
+    for idx, row in enumerate(values or [], start=1):
+        first = str(row[0]).strip() if row else ""
+        if first.startswith(marker):
+            marker_row = idx
+            break
+    if marker_row is None:
+        return False
+    try:
+        current_row_count = int(getattr(ws, "row_count", len(values)) or len(values))
+        clear_range = f"A{marker_row}:Z{current_row_count}"
+        gsheet_api_call("清除舊版勝率統計底部長期修正勝率區塊", ws.batch_clear, [clear_range])
+        print(f"  🧹 已清除舊版勝率統計底部長期修正勝率區塊：第 {marker_row} 列起")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 清除舊版勝率統計底部長期修正勝率區塊失敗：{type(e).__name__}: {e}")
+        return False
+
+
+def upload_longterm_adjusted_winrate_to_gsheet(adjusted_rows, target_date):
+    """
+    longterm 模式只把修正勝率回填到既有「勝率統計」表格的「勝率」旁邊。
+
+    不新增長期留單明細 / 分點彙總工作表，完整明細只保留在 Excel artifact。
+    若勝率旁邊尚未有修正勝率欄，第一次 longterm 會插入一欄；之後重跑只更新該欄。
+    """
+    if not LONGTERM_UPDATE_WINRATE_SHEET:
+        print("  ✅ LONGTERM_UPDATE_WINRATE_SHEET=0，略過更新 Google Sheet 勝率統計。")
+        return False
+    if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
+        print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 長期修正勝率同步。")
+        return False
+
+    title = "勝率統計"
+    ws = get_or_create_worksheet(title, rows=200, cols=30)
+    if ws is None:
+        print("  ⚠️ 找不到或無法建立 Google Sheet：勝率統計，略過長期修正勝率同步。")
+        return False
+
+    try:
+        existing_values = ws.get_all_values() or []
+    except Exception:
+        existing_values = []
+
+    if not existing_values:
+        print("  ⚠️ 勝率統計工作表目前沒有資料，無法回填修正勝率。")
+        return False
+
+    _longterm_clear_old_bottom_winrate_block(ws, existing_values)
+    try:
+        existing_values = ws.get_all_values() or []
+    except Exception:
+        existing_values = existing_values or []
+
+    info = _longterm_find_winrate_header_info(existing_values)
+    if not info:
+        print("  ⚠️ 找不到勝率統計表頭中的『勝率』欄，無法回填修正勝率。")
+        return False
+
+    winrate_idx0 = int(info["winrate_col_index0"])
+    adjusted_idx0 = int(info["adjusted_col_index0"])
+    adjusted_col_1based = adjusted_idx0 + 1
+
+    try:
+        sheet_id = int(ws.id)
+    except Exception:
+        sheet_id = None
+
+    if not info.get("has_adjusted_next"):
+        if sheet_id is None:
+            print("  ⚠️ 無法取得勝率統計 sheetId，無法插入修正勝率欄。")
+            return False
+        requests = [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": adjusted_idx0,
+                    "endIndex": adjusted_idx0 + 1,
+                },
+                "inheritFromBefore": True,
+            }
+        }]
+        _gsheet_batch_update(requests)
+        print(f"  ✅ 已在勝率欄旁新增欄位：{LONGTERM_WINRATE_SHEET_HEADER}")
+        try:
+            existing_values = ws.get_all_values() or []
+        except Exception:
+            existing_values = existing_values or []
+    else:
+        print(f"  ✅ 勝率欄旁已存在修正勝率欄，直接更新：{LONGTERM_WINRATE_SHEET_HEADER}")
+
+    winrate_map, selected_days = _longterm_build_inline_winrate_map(adjusted_rows)
+    if not winrate_map:
+        print("  ⚠️ 沒有可回填的長期修正勝率資料。")
+        return False
+
+    max_row = max(len(existing_values), 1)
+    column_values = [[""] for _ in range(max_row)]
+    updated_count = 0
+    header_count = 0
+    current_header = None
+
+    for row_idx, row in enumerate(existing_values, start=1):
+        cells = [str(x).strip() for x in row]
+        if "分點" in cells and "事件類型" in cells and "勝率" in cells:
+            # 每個分點區塊都有自己的表頭；同一欄都要顯示修正勝率。
+            current_header = {h: i for i, h in enumerate(cells) if h}
+            column_values[row_idx - 1] = [LONGTERM_WINRATE_SHEET_HEADER]
+            header_count += 1
+            continue
+
+        if not current_header:
+            continue
+
+        broker_col = current_header.get("分點")
+        event_col = current_header.get("事件類型")
+        if broker_col is None or event_col is None:
+            continue
+        if broker_col >= len(cells) or event_col >= len(cells):
+            continue
+
+        broker = str(cells[broker_col]).strip()
+        event_type = str(cells[event_col]).strip()
+        if not broker or broker.startswith("分點：") or not event_type:
+            continue
+        if broker == "分點" or event_type == "事件類型":
+            continue
+
+        event_code = _longterm_extract_event_code(event_type)
+        value = winrate_map.get((broker, event_code))
+        if value is None:
+            # 若某分點 / 類型沒有對應修正資料，維持空白，不改其他欄位。
+            continue
+        column_values[row_idx - 1] = [value]
+        updated_count += 1
+
+    col_letter = get_column_letter(adjusted_col_1based)
+    try:
+        gsheet_api_call(
+            "回填勝率統計修正勝率欄",
+            ws.update,
+            values=column_values,
+            range_name=f"{col_letter}1:{col_letter}{max_row}",
+            value_input_option="USER_ENTERED",
+        )
+
+        # 只針對新增 / 更新的修正勝率欄做最小格式處理，不重套整張表。
+        try:
+            requests = [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": max_row,
+                        "startColumnIndex": adjusted_idx0,
+                        "endColumnIndex": adjusted_idx0 + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": "userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+                }
+            }]
+            _gsheet_batch_update(requests)
+        except Exception:
+            pass
+
+        print(
+            f"  ☁️ 已更新 Google Sheet：勝率統計｜回填 {LONGTERM_WINRATE_SHEET_HEADER} "
+            f"{updated_count:,} 筆｜門檻 {selected_days} 日｜目標日期 {target_date}"
+        )
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 回填 Google Sheet 勝率統計修正勝率失敗：{type(e).__name__}: {e}")
+        return False
+
+
 def run_longterm_workflow(warrants, broker_map, output_path, program_start):
     print("\n【Longterm】長期留單補價格與修正勝率分析...")
     history_df = load_history_cache()
@@ -15943,7 +16344,7 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
     a_events, b_events, c_events, d_events, e_events = [amount_events.get(code, []) for code in AMOUNT_CLASS_CODES]
     stat_records = collect_stat_records(a_events, b_events, c_events, d_events, e_events)
     summary_map, _ = make_summary_map(stat_records)
-    adjusted_rows = build_longterm_adjusted_winrate_rows(summary_map, threshold_summary_map)
+    adjusted_rows = build_longterm_adjusted_winrate_rows(summary_map, threshold_rows_map)
 
     longterm_output_path = os.path.join(
         OUTPUT_DIR,
@@ -15957,8 +16358,13 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
         adjusted_rows,
     )
 
-    if LONGTERM_UPLOAD_TO_GSHEET:
+    if LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET:
+        print("  ⚠️ LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET=1：將完整長期留單 Excel 同步到 Google Sheet，可能占用大量格數。")
         upload_excel_to_google_sheet(longterm_output_path)
+    else:
+        print("  ✅ 長期留單明細 / 分點彙總僅輸出 Excel，不同步到 Google Sheet，避免占用格數。")
+
+    upload_longterm_adjusted_winrate_to_gsheet(adjusted_rows, target_date)
 
     for row in overview_rows:
         print(
