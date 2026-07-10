@@ -2521,7 +2521,7 @@ def _build_weekly_branch_perf_matches(ctx: dict) -> List[dict]:
         for _, r in perf_df.iterrows()
         if str(r.get("branch", "") or "")
     }
-    buy_top, sell_top = top_branch_tables(week_events, topn=5)
+    buy_top, sell_top = _get_cached_top_branch_tables(ctx, "current_week", week_events, topn=5)
 
     all_abs_amounts = []
     for df_top in [buy_top, sell_top]:
@@ -5235,6 +5235,28 @@ def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
     buy_br = branch_sum[branch_sum["net_amount"] > 0].sort_values("net_amount", ascending=False).head(topn)
     sell_br = branch_sum[branch_sum["net_amount"] < 0].sort_values("net_amount", ascending=True).head(topn)
     return add_max_warrant(buy_br, positive=True), add_max_warrant(sell_br, positive=False)
+
+
+def _get_cached_top_branch_tables(
+    ctx: dict,
+    scope: str,
+    events_df: pd.DataFrame,
+    topn: int = 5,
+):
+    """同一份週報內容中重用 TOP5 統計，避免重複過濾、分組與輸出相同 Debug log。"""
+    if not isinstance(ctx, dict):
+        return top_branch_tables(events_df, topn=topn)
+
+    cache = ctx.setdefault("_top_branch_tables_cache", {})
+    cache_key = (str(scope or "default"), int(topn or 5))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        buy_cached, sell_cached = cached
+        return buy_cached.copy(), sell_cached.copy()
+
+    buy_top, sell_top = top_branch_tables(events_df, topn=topn)
+    cache[cache_key] = (buy_top.copy(), sell_top.copy())
+    return buy_top, sell_top
 
 
 def _build_rule_based_next_week_watch(ctx: dict) -> str:
@@ -8195,6 +8217,55 @@ def _parse_gemini_points(output_text: str) -> List[str]:
 
 
 
+def _is_fetchable_news_article_url(url: str) -> bool:
+    """只把具備 http(s) scheme 與網域的網址送入原文抓取。"""
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def _hybrid_news_event_key(record: dict, stock_code: str = "", stock_name: str = "") -> str:
+    """建立混合模式用的事件鍵，避免同一營收或公司事件重複占滿 top-K。"""
+    text = _normalize_news_text(
+        f"{record.get('title', '')} {record.get('description', '')} {record.get('content', '')}"
+    )
+    compact = _title_compare_text(text)
+    if not compact:
+        return str(record.get("url", "") or "").strip()
+
+    # 月營收新聞常有多個來源與不同標題，但屬於同一事件。
+    if "營收" in text:
+        month_match = re.search(r"(?:20\d{2}[年/.-]?)?0?([1-9]|1[0-2])月", text)
+        month_key = month_match.group(1) if month_match else "unknown"
+        # 同一個月營收常有些標題帶年份、有些不帶；混合補抓時以月份視為同一事件。
+        return f"revenue:{month_key}"
+
+    event_families = [
+        ("board", ["董事會", "股東會", "決議"]),
+        ("dividend", ["股利", "配息", "除息", "除權"]),
+        ("earnings", ["財報", "獲利", "EPS", "每股盈餘"]),
+        ("guidance", ["法說", "展望", "財測"]),
+        ("capacity", ["擴產", "新產能", "量產", "新廠"]),
+        ("order", ["接單", "訂單", "出貨"]),
+        ("product", ["新品", "新產品", "新平台"]),
+        ("etf_index", ["ETF", "指數", "成分股", "被動資金"]),
+    ]
+    for family, keywords in event_families:
+        if any(keyword.lower() in text.lower() for keyword in keywords):
+            return f"{family}:{str(record.get('published', '') or '')[:10]}"
+
+    for removable in [stock_code, stock_name, "新聞", "即時", "公告", "MoneyDJ理財網"]:
+        if removable:
+            compact = compact.replace(_title_compare_text(removable), "")
+    compact = re.sub(r"\d+(?:\.\d+)?", "", compact)
+    return compact[:48] or str(record.get("url", "") or "").strip()
+
+
 def _enrich_fast_news_records_with_topk_bodies(
     records: List[dict],
     stock_code: str,
@@ -8210,11 +8281,12 @@ def _enrich_fast_news_records_with_topk_bodies(
     ):
         return enriched
 
-    candidates = []
+    candidates_by_event = {}
     for idx, record in enumerate(enriched):
         if record.get("body_ok") or not record.get("fallback_ok"):
             continue
-        if not str(record.get("url", "") or "").strip():
+        url = str(record.get("url", "") or "").strip()
+        if not _is_fetchable_news_article_url(url):
             continue
         if str(record.get("content_source", "") or "") == "manual":
             continue
@@ -8236,15 +8308,40 @@ def _enrich_fast_news_records_with_topk_bodies(
         if relevance == 0:
             relevance = _score_news_article_relevance(record, stock_code, stock_name)
         published_dt = _parse_rss_pub_date(record.get("published", "")) or datetime.min
-        candidates.append((idx, relevance, published_dt))
+        host = (urllib.parse.urlparse(url).netloc or "").lower()
+        direct_url_rank = 0 if "news.google." in host else 1
+        event_key = _hybrid_news_event_key(record, stock_code, stock_name) or f"row:{idx}"
+        candidate = (idx, relevance, published_dt, direct_url_rank, event_key)
 
-    if not candidates:
+        # 同一事件只保留一篇；有直接原文網址時優先於 Google News 導流網址。
+        previous = candidates_by_event.get(event_key)
+        candidate_quality = (
+            direct_url_rank,
+            relevance,
+            published_dt.timestamp() if published_dt != datetime.min else 0,
+            -idx,
+        )
+        if previous is None:
+            candidates_by_event[event_key] = candidate
+        else:
+            prev_idx, prev_relevance, prev_dt, prev_direct_rank, _ = previous
+            previous_quality = (
+                prev_direct_rank,
+                prev_relevance,
+                prev_dt.timestamp() if prev_dt != datetime.min else 0,
+                -prev_idx,
+            )
+            if candidate_quality > previous_quality:
+                candidates_by_event[event_key] = candidate
+
+    if not candidates_by_event:
         return enriched
 
     candidates = sorted(
-        candidates,
+        candidates_by_event.values(),
         key=lambda item: (
             -item[1],
+            -item[3],
             -(item[2].timestamp() if item[2] != datetime.min else 0),
             item[0],
         ),
@@ -8252,7 +8349,7 @@ def _enrich_fast_news_records_with_topk_bodies(
 
     print(
         f"📰 RSS 混合模式：從 {len(enriched):,} 筆素材中，"
-        f"替最高分 {len(candidates):,} 篇補抓原文"
+        f"事件去重後替最高分 {len(candidates):,} 篇補抓原文"
     )
     fetch_started = time.perf_counter()
 
@@ -8265,7 +8362,7 @@ def _enrich_fast_news_records_with_topk_bodies(
     executor = ThreadPoolExecutor(max_workers=workers)
     futures = {
         executor.submit(fetch_one, idx): idx
-        for idx, _, _ in candidates
+        for idx, _, _, _, _ in candidates
     }
     done, pending = wait(
         futures,
@@ -8600,11 +8697,16 @@ def _safe_float(v, default=np.nan):
 
 def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
     """整理實際顯示的 TOP5，並提供金額代表性與歷史統計供 AI 判斷。"""
+    cache_key = "_weekly_top5_ai_rows_cache"
+    if cache_key in ctx:
+        return [dict(row) for row in (ctx.get(cache_key) or [])]
+
     week_events = ctx.get("week_events")
     if week_events is None or week_events.empty:
+        ctx[cache_key] = []
         return []
 
-    buy_top, sell_top = top_branch_tables(week_events, topn=5)
+    buy_top, sell_top = _get_cached_top_branch_tables(ctx, "current_week", week_events, topn=5)
     perf_df = read_gsheet_branch_perf_df(force_refresh=False)
     perf_map = {}
     if perf_df is not None and not perf_df.empty:
@@ -8682,6 +8784,7 @@ def _build_weekly_top5_ai_rows(ctx: dict) -> List[dict]:
 
     append_rows(buy_top, "buy")
     append_rows(sell_top, "sell")
+    ctx[cache_key] = [dict(row) for row in rows]
     return rows
 
 
@@ -9393,7 +9496,9 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         if previous_week_events is not None and not previous_week_events.empty
         else 0.0
     )
-    previous_buy_top, previous_sell_top = top_branch_tables(
+    previous_buy_top, previous_sell_top = _get_cached_top_branch_tables(
+        ctx,
+        "previous_week",
         previous_week_events,
         topn=5,
     )
@@ -9653,6 +9758,60 @@ def _weekly_points_conditionally_cover_branch(points: List[str], ctx: dict) -> b
     return _weekly_points_cover_required_representative_analysis(points, ctx)
 
 
+def _supplement_weekly_branch_metrics_in_points(points: List[str], ctx: dict) -> List[str]:
+    """AI 已點名代表性分點但漏寫歷史欄位時，由程式以接地資料補齊，避免額外 repair 呼叫。"""
+    cleaned = _clean_weekly_key_points(points or [])[:3]
+    required = _get_required_representative_branch_analysis(ctx)
+    if not cleaned or not required:
+        return cleaned
+    if _weekly_points_cover_required_representative_analysis(cleaned, ctx):
+        return cleaned
+
+    branch = str(required.get("branch", "") or "").strip()
+    if not branch:
+        return cleaned
+
+    target_idx = None
+    for idx, point in enumerate(cleaned):
+        point_text = str(point or "")
+        if branch in point_text and not point_text.startswith(("下週觀察：", "下週觀察:")):
+            target_idx = idx
+            break
+    if target_idx is None:
+        return cleaned
+
+    side = str(required.get("side", "") or "").strip()
+    weekly_net = str(required.get("weekly_net", "") or "").strip()
+    win_rate = str(required.get("historical_win_rate", "") or "").strip()
+    weighted_return = str(required.get("historical_weighted_return", "") or "").strip()
+    avg_holding_days = str(required.get("average_holding_days", "") or "").strip()
+
+    if not all([side, weekly_net, win_rate, weighted_return, avg_holding_days]):
+        return cleaned
+    if "-" in [win_rate, weighted_return, avg_holding_days]:
+        return cleaned
+
+    replacement = (
+        f"面向：權證面｜結果：{branch}{side}具代表性｜說明："
+        f"本週淨流向{weekly_net}，歷史勝率{win_rate}、"
+        f"加權報酬率{weighted_return}，平均持有{avg_holding_days}。"
+    )
+    replacement = _trim_weekly_point(
+        replacement,
+        max_len=WEEKLY_KEYPOINT_POINT_MAX_LEN,
+    )
+    if not replacement:
+        return cleaned
+
+    updated = list(cleaned)
+    updated[target_idx] = replacement
+    updated = _clean_weekly_key_points(updated)[:3]
+    if _weekly_points_cover_required_representative_analysis(updated, ctx):
+        print(f"✅ 程式端已補齊代表性分點歷史績效：{branch}")
+        return updated
+    return cleaned
+
+
 def _weekly_points_conditionally_cover_pattern(points: List[str], ctx: dict) -> bool:
     """未選擇型態面時不強制；若談型態或大量區，必須使用程式判定的型態標籤。"""
     pattern = _build_price_volume_pattern_payload(ctx)
@@ -9892,6 +10051,7 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
             temperature=GEMINI_ANALYSIS_TEMPERATURE,
         )
         points = _parse_weekly_gemini_points(output_text or "")
+        points = _supplement_weekly_branch_metrics_in_points(points, ctx)
         problems = _validate_weekly_points(points, payload, ctx)
 
         if problems:
@@ -10889,7 +11049,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     # TOP5 買賣超使用 build_weekly_context 產生的 week_events；
     # week_events 已改用「股價日期 + 權證事件日期」的最新週區間，因此會納入今日已更新的權證分點資料。
-    buy_top, sell_top = top_branch_tables(week_events, topn=5)
+    buy_top, sell_top = _get_cached_top_branch_tables(ctx, "current_week", week_events, topn=5)
     compact_mode = is_compact_report_mode()
     if compact_mode:
         # 精簡模式不建立本週重點與新聞內容，避免不必要的新聞抓取 / Gemini 呼叫。
@@ -12102,6 +12262,32 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 對外入口
 # ============================================================
 
+def _prepare_report_news_items(stock_code: str, stock_name: str) -> List[dict]:
+    """準備週報新聞素材；可與權證 API 流程平行執行。"""
+    with report_stage_timer(f"{stock_code}｜新聞資料準備"):
+        if is_compact_report_mode():
+            print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
+            return []
+
+        cached_news_points = _load_gsheet_news_points_cache_for_display(
+            stock_code,
+            stock_name,
+            allow_stale=False,
+        )
+        if cached_news_points:
+            print(
+                f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整："
+                f"{stock_code}｜{len(cached_news_points)} 點"
+            )
+            return []
+
+        return fetch_multi_source_news_articles(
+            stock_code,
+            stock_name,
+            max_items=NEWS_GOOGLE_MAX_ITEMS,
+        )
+
+
 def generate_warrant_report(stock_code: str) -> io.BytesIO:
     report_total_start = time.perf_counter()
     stock_code = str(stock_code).strip()
@@ -12159,13 +12345,24 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             f"股價最新日 {stock_end_date.date()}｜權證資料區間 {start_date.date()} ~ {end_date.date()}"
         )
 
-        with report_stage_timer(f"{stock_code}｜權證完整流程"):
-            warrant_events = fetch_warrant_events_full_market(
+        # 權證 API 與新聞搜尋彼此沒有資料相依，平行準備可直接縮短等待時間。
+        with ThreadPoolExecutor(max_workers=2) as report_data_executor:
+            warrant_future = report_data_executor.submit(
+                fetch_warrant_events_full_market,
                 stock_code,
                 stock_name,
-                start_date=start_date,
-                end_date=end_date,
+                start_date,
+                end_date,
             )
+            news_future = report_data_executor.submit(
+                _prepare_report_news_items,
+                stock_code,
+                stock_name,
+            )
+
+            with report_stage_timer(f"{stock_code}｜權證完整流程"):
+                warrant_events = warrant_future.result()
+            news_items = news_future.result()
 
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
         if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
@@ -12204,27 +12401,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             except Exception as e:
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
 
-        with report_stage_timer(f"{stock_code}｜新聞資料準備"):
-            if is_compact_report_mode():
-                print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
-                news_items = []
-            else:
-                cached_news_points = _load_gsheet_news_points_cache_for_display(
-                    stock_code,
-                    stock_name,
-                    allow_stale=False,
-                )
-                if cached_news_points:
-                    print(f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整：{stock_code}｜{len(cached_news_points)} 點")
-                    news_items = []
-                else:
-                    news_items = fetch_multi_source_news_articles(
-                        stock_code,
-                        stock_name,
-                        max_items=NEWS_GOOGLE_MAX_ITEMS,
-                    )
-
-        with report_stage_timer(f"{stock_code}｜週報建圖總流程"):
+        with report_stage_timer(f"{stock_code}｜週報內容生成與建圖總流程"):
             fig = plot_weekly_report(
                 stock_code,
                 stock_name,
