@@ -12457,7 +12457,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 rows.append((label, status, body, 3))
             if not rows:
                 rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3))
-            return rows[:2]
+            return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
             """量測文字在目前 notes 軸中的寬度，讓「面向：結果」用冒號自然銜接，不再靠固定空格對齊。"""
