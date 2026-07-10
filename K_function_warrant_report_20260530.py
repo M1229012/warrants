@@ -6247,7 +6247,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v20_title_fact_cache_strict"
+    internal_version = "validated_v21_sentence_entity_grounded"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -7346,6 +7346,27 @@ def _passes_news_quality_gate(title: str, description_or_body: str, stock_code: 
         if inferred_name and inferred_name not in aliases:
             aliases.append(inferred_name)
 
+    # 公司名或代號必須出現在標題或正文前 200 字；只在文末順帶提到的不收。
+    head = _normalize_news_text(f"{title} {content[:200]}")
+    if not _news_text_matches_target_stock(head, stock_code, stock_name):
+        return False
+
+    # 正文出現 3 個以上其他四碼代號時，視為產業綜述候選；
+    # 除非標題明確包含本公司，否則排除。年份不列入代號計數。
+    target_code = _clean_code(stock_code)
+    other_codes = set()
+    for code in re.findall(r"(?<!\d)(\d{4})(?!\d)", content):
+        if code == target_code:
+            continue
+        try:
+            if 1900 <= int(code) <= 2099:
+                continue
+        except Exception:
+            pass
+        other_codes.add(code)
+    if len(other_codes) >= 3 and not _news_text_matches_target_stock(title, stock_code, stock_name):
+        return False
+
     if _is_price_only_news_without_fundamentals(combined):
         return False
     if _is_low_value_market_news(combined):
@@ -7353,6 +7374,7 @@ def _passes_news_quality_gate(title: str, description_or_body: str, stock_code: 
     if not _has_substantive_company_news(combined):
         return False
     return True
+
 
 
 def _is_valid_fast_rss_news_item(title: str, description: str, stock_code: str = "", stock_name: str = "") -> bool:
@@ -8826,26 +8848,93 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
 
 
 def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """新聞品質優先：素材足夠時由程式端補到 3 點，不為字數硬塞無關內容。"""
-    points = _refine_news_points_with_records(points, records, stock_code, stock_name)
-    target_points = max(1, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
+    """新聞允許 0 點；只清理現有內容，不再為點數或字數自動擴寫。"""
+    return _refine_news_points_with_records(
+        points,
+        records,
+        stock_code,
+        stock_name,
+    )[:NEWS_SUMMARY_MAX_POINTS]
 
-    if len(points) >= target_points:
-        return points[:NEWS_SUMMARY_MAX_POINTS]
 
-    # Gemini 只有 0～2 點時，從同批已通過品質門檻的素材補真正不同的事件。
-    expanded = points[:]
-    for p in _build_news_expansion_points(records, stock_code, stock_name, used_points=expanded):
-        if len(expanded) >= target_points:
+def _parse_gemini_news_points(
+    output_text: str,
+    usable_articles: List[dict],
+    stock_code: str,
+    stock_name: str,
+) -> Tuple[List[str], List[dict]]:
+    """解析 Gemini 新聞物件；先驗證 evidence，再送入既有清理流程。"""
+    parsed = _extract_json_from_text(output_text)
+    if isinstance(parsed, dict):
+        raw_items = parsed.get("points", [])
+    elif isinstance(parsed, list):
+        raw_items = parsed
+    else:
+        raw_items = None
+
+    # 合法空陣列代表本週沒有直接相關重大新聞，不算錯誤。
+    if raw_items == []:
+        return [], []
+    if not isinstance(raw_items, list):
+        rejected = []
+        if str(output_text or "").strip():
+            rejected.append(
+                _format_rejected_news_point(
+                    "",
+                    "Gemini 輸出不是合法的 points 物件陣列",
+                )
+            )
+        return [], rejected
+
+    points = []
+    rejected = []
+    seen = set()
+    for item in raw_items:
+        ok, reason = _validate_news_point_evidence(
+            item,
+            usable_articles,
+            stock_code,
+            stock_name,
+        )
+        if not ok:
+            rejected.append(_format_rejected_news_point(item, reason))
+            continue
+
+        canonical = _point_item_to_canonical_text(item)
+        cleaned = _clean_news_summary_points_for_stock(
+            [canonical],
+            stock_code,
+            stock_name,
+        )
+        if not cleaned:
+            rejected.append(
+                _format_rejected_news_point(
+                    item,
+                    "point 未通過既有新聞內容清理",
+                )
+            )
+            continue
+
+        point = cleaned[0]
+        if not _points_are_independent_and_complete([point]):
+            rejected.append(
+                _format_rejected_news_point(
+                    item,
+                    "point 不是可獨立閱讀的完整句",
+                )
+            )
+            continue
+
+        key = _title_compare_text(point)
+        if not key or key in seen:
+            continue
+        points.append(point)
+        seen.add(key)
+        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
             break
-        if p not in expanded:
-            expanded.append(p)
-    return _refine_news_points_with_records(expanded, records, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
-def _parse_gemini_news_points(output_text: str, records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """讀取 Gemini 結構化 points；note 僅供內部說明，絕不可畫進新聞區。"""
-    raw_points = _parse_raw_points_from_llm(output_text)
-    return _ensure_news_summary_min_total(raw_points, records, stock_code, stock_name)
+    return points, rejected
+
 
 def _get_warrants_api_keys() -> List[str]:
     """讀取 Gemini API Key 清單；GitHub Actions 可設定 WARRANTS_API_KEY、WARRANTS_API_KEY_2、WARRANTS_API_KEY_3。"""
@@ -8918,21 +9007,34 @@ def _build_gemini_points_response_schema(
     min_points: int = 1,
     max_points: int = 3,
     include_note: bool = False,
+    include_news_grounding: bool = False,
 ) -> dict:
     """建立新聞與本週重點共用的結構化 Gemini JSON Schema。"""
     min_points = max(0, int(min_points or 0))
     max_points = max(min_points, int(max_points or min_points or 1))
+
+    point_properties = {
+        "label": {"type": "string"},
+        "status": {"type": "string"},
+        "detail": {"type": "string"},
+        "tone": {"type": "string", "enum": ["positive", "negative", "neutral", "mixed", "watch"]},
+        "confidence": {"type": "number"},
+    }
+    required_fields = ["label", "status", "detail", "tone", "confidence"]
+
+    if include_news_grounding:
+        # 新聞任務新增來源文章與逐字原文；本週重點維持原有 evidence 陣列。
+        point_properties["source_id"] = {"type": "string"}
+        point_properties["evidence"] = {"type": "string"}
+        required_fields.extend(["source_id", "evidence"])
+    else:
+        point_properties["evidence"] = {"type": "array", "items": {"type": "string"}}
+        required_fields.append("evidence")
+
     point_schema = {
         "type": "object",
-        "properties": {
-            "label": {"type": "string"},
-            "status": {"type": "string"},
-            "detail": {"type": "string"},
-            "tone": {"type": "string", "enum": ["positive", "negative", "neutral", "mixed", "watch"]},
-            "confidence": {"type": "number"},
-            "evidence": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["label", "status", "detail", "tone", "confidence", "evidence"],
+        "properties": point_properties,
+        "required": required_fields,
     }
     properties = {
         "points": {
@@ -8945,6 +9047,94 @@ def _build_gemini_points_response_schema(
     if include_note:
         properties["note"] = {"type": "string"}
     return {"type": "object", "properties": properties, "required": ["points"]}
+
+
+
+_EVIDENCE_STRIP_RE = re.compile(
+    r"[\s，。、；：「」『』（）()\[\]【】,.;:'\"!?！？…\-—~～]+"
+)
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？\n；;]")
+
+
+def _normalize_for_evidence_match(text: str) -> str:
+    """只移除格式與標點，保留文字內容供 evidence 逐字比對。"""
+    return _EVIDENCE_STRIP_RE.sub("", str(text or "")).lower()
+
+
+def _find_article_by_source_id(usable_articles: List[dict], source_id: str):
+    """依實際送入 Gemini 的 A1、A2…文章編號尋找來源。"""
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        return None
+    for article in usable_articles or []:
+        if str(article.get("id", "") or "").strip() == source_id:
+            return article
+    return None
+
+
+def _validate_news_point_evidence(
+    point_obj: dict,
+    usable_articles: List[dict],
+    stock_code: str,
+    stock_name: str,
+) -> tuple[bool, str]:
+    """驗證來源文章、逐字原文與 evidence 句本身的公司主體。"""
+    if not isinstance(point_obj, dict):
+        return False, "points item 不是物件"
+
+    evidence = str(point_obj.get("evidence", "") or "").strip()
+    source_id = str(point_obj.get("source_id", "") or "").strip()
+    ev_norm = _normalize_for_evidence_match(evidence)
+    if len(ev_norm) < 8:
+        return False, "evidence 過短或缺漏"
+
+    article = _find_article_by_source_id(usable_articles, source_id)
+    if article is None:
+        return False, f"source_id {source_id or '(空白)'} 不存在"
+
+    raw_text = _normalize_news_text(
+        f"{article.get('title', '')}。{article.get('body', '')}"
+    )
+    sentences = [
+        str(sentence or "").strip()
+        for sentence in _SENTENCE_SPLIT_RE.split(raw_text)
+        if str(sentence or "").strip()
+    ]
+
+    matched_sentence = ""
+    for sentence in sentences:
+        sentence_norm = _normalize_for_evidence_match(sentence)
+        if sentence_norm and ev_norm in sentence_norm:
+            matched_sentence = sentence
+            break
+
+    if not matched_sentence:
+        return False, "evidence 無法在指定文章的單一原文句中找到（疑似改寫或編造）"
+
+    # 公司主體必須在 evidence 所在句本身，不使用任意前後句視窗。
+    if not _news_text_matches_target_stock(matched_sentence, stock_code, stock_name):
+        display_name = stock_name or stock_code
+        return False, f"evidence 句本身未出現 {display_name} 或 {stock_code}（疑似產業文誤植）"
+
+    return True, ""
+
+
+def _format_rejected_news_point(point_obj, reason: str) -> dict:
+    """整理 evidence 驗證刪除原因，供 repair payload 使用。"""
+    if isinstance(point_obj, dict):
+        point_text = _point_item_to_canonical_text(point_obj)
+        source_id = str(point_obj.get("source_id", "") or "").strip()
+        evidence = str(point_obj.get("evidence", "") or "").strip()
+    else:
+        point_text = str(point_obj or "").strip()
+        source_id = ""
+        evidence = ""
+    return {
+        "point": point_text,
+        "source_id": source_id,
+        "evidence": evidence,
+        "reason": str(reason or "未通過 evidence 驗證"),
+    }
 
 
 _GROUNDED_NUMBER_RE = re.compile(
@@ -9514,47 +9704,43 @@ def _save_validated_news_points_cache(
 
 
 def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """將合格新聞交給 Gemini；只快取格式、內容與數字接地皆通過的結果。"""
+    """將合格新聞交給 Gemini；每點都必須通過句級主體與數字接地驗證。"""
     usable_articles = _build_gemini_news_articles(records, stock_code, stock_name)
     if not usable_articles:
         print("⚠️ 沒有足夠且具體的公司新聞可送入 Gemini；不使用標題或盤勢新聞硬湊")
         return []
 
-    minimum_points = min(
-        NEWS_SUMMARY_MAX_POINTS,
-        max(1, NEWS_MIN_DISTINCT_ARTICLES),
-        max(1, len(usable_articles)),
-    )
     display_name = stock_name if stock_name else stock_code
     article_json = json.dumps(usable_articles, ensure_ascii=False, indent=2)
     number_grounding_source = _build_news_number_grounding_source(usable_articles)
     response_schema = _build_gemini_points_response_schema(
-        min_points=minimum_points,
+        min_points=0,
         max_points=NEWS_SUMMARY_MAX_POINTS,
         include_note=True,
+        include_news_grounding=True,
     )
 
     prompt = f"""
 你是台股財經新聞編輯。只能使用下方素材，整理 {stock_code} {display_name} 的新聞／題材重點，使用繁體中文。
 
 分析原則：
-1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件；同一事件多來源合併，不得拿股價漲跌、熱門排行或大盤盤勢湊數。
-2. 每個 points item 必須回傳 label、status、detail、tone、confidence、evidence；status 不可寫「重點待確認」「題材待觀察」等空句。
+1. 輸出 0～{NEWS_SUMMARY_MAX_POINTS} 點不同事件；同一事件多來源合併，不得拿股價漲跌、熱門排行或大盤盤勢湊數。
+2. 每個 points item 必須回傳 label、status、detail、tone、confidence、source_id、evidence；status 不可寫「重點待確認」「題材待觀察」等空句。
 2-1. tone 只能是 positive、negative、neutral、mixed、watch：明確利多用 positive，明確利空用 negative，正負並存用 mixed，無明確方向用 neutral，單純後續觀察用 watch。
 2-2. 「受關注」不等於 positive；創新高必須確認是營收、獲利、毛利率、接單等正向指標，若是虧損、庫存、負債創高則為 negative。
-2-3. confidence 為 0 到 1；evidence 只列素材中直接支持判斷的短片段，不得自行補數字。
-3. 公司身分必須明確對應代號 {stock_code} 或名稱 {display_name}；相似公司名但沒有代號時排除，不得混用其他公司的營收、EPS、目標價或題材。
-4. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
-5. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。
-6. 每點需獨立完整、自然收尾並以句號結束；字數與過長內容由程式端清理，你只需優先保留最具體的事實。
+2-3. confidence 為 0 到 1。
+3. 每點必須附 source_id（文章編號）與 evidence（逐字抄自該文章、能直接支持這個結論的一句原文，不可改寫）。evidence 那句話本身必須明確出現 {stock_code} 或 {display_name}；文章若只是順帶提到本公司、主體是產業或其他公司，不得使用。
+4. 若所有素材都沒有以 {display_name} 為主體的具體事件，points 回傳空陣列 []，這是正確行為，嚴禁硬湊。
+5. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
+6. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。每點需獨立完整、自然收尾並以句號結束。
 
 好範例：
-- {{"label":"公司動態","status":"新訂單提高能見度","detail":"公司取得新案，後續觀察出貨時程與營收認列進度。","tone":"positive","confidence":0.92,"evidence":["取得新案"]}}
-- {{"label":"業績更新","status":"營收年增但月減","detail":"營收維持年增但短期月減，後續看成長動能與毛利率變化。","tone":"mixed","confidence":0.90,"evidence":["年增","月減"]}}
+- {{"label":"公司動態","status":"新訂單提高能見度","detail":"公司取得新案，後續觀察出貨時程與營收認列進度。","tone":"positive","confidence":0.92,"source_id":"A1","evidence":"{display_name}取得新案並預計依時程出貨"}}
+- {{"label":"業績更新","status":"營收年增但月減","detail":"營收維持年增但短期月減，後續看成長動能與毛利率變化。","tone":"mixed","confidence":0.90,"source_id":"A2","evidence":"{display_name}本月營收年增但較上月減少"}}
 
 壞範例：
-- {{"label":"題材觀察","status":"題材仍待確認","detail":"後續持續關注。","tone":"positive","confidence":0.95,"evidence":[]}}
-- {{"label":"法人觀點","status":"市場偏多","detail":"公司未來值得期待。","tone":"positive","confidence":0.90,"evidence":[]}}
+- {{"label":"題材觀察","status":"題材仍待確認","detail":"後續持續關注。","tone":"positive","confidence":0.95,"source_id":"A3","evidence":"AI散熱需求持續強勁"}}
+- {{"label":"法人觀點","status":"市場偏多","detail":"公司未來值得期待。","tone":"positive","confidence":0.90,"source_id":"A1","evidence":"市場看好相關族群"}}
 
 只回傳符合 JSON Schema 的 JSON，不要 markdown 或其他說明。
 
@@ -9564,7 +9750,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     print("=" * 100)
     print("開始呼叫 Gemini 統整高品質新聞重點")
     print(f"模型：{GEMINI_MODEL}")
-    print(f"送入 Gemini 的文章數：{len(usable_articles)}｜最低輸出：{minimum_points} 點")
+    print(f"送入 Gemini 的文章數：{len(usable_articles)}｜允許輸出 0～{NEWS_SUMMARY_MAX_POINTS} 點")
     print("=" * 100)
     output_text = _call_gemini_with_retry(
         prompt,
@@ -9575,21 +9761,36 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         response_schema=response_schema,
         temperature=GEMINI_ANALYSIS_TEMPERATURE,
     )
-    points = _parse_gemini_news_points(output_text or "", records, stock_code, stock_name)
+    points, rejected_points = _parse_gemini_news_points(
+        output_text or "",
+        usable_articles,
+        stock_code,
+        stock_name,
+    )
 
     problems = []
-    if len(points) < minimum_points:
-        problems.append(f"只輸出 {len(points)} 點，至少需要 {minimum_points} 點")
     if points and not _points_are_independent_and_complete(points):
         problems.append("出現承接句、半句或省略號")
     ungrounded = _find_ungrounded_number_tokens(points, number_grounding_source)
     if ungrounded:
         problems.append("含素材找不到的數字：" + _format_ungrounded_number_problems(ungrounded))
 
-    if problems:
-        print("⚠️ Gemini 新聞重點需要補正：" + "；".join(problems))
+    for rejected in rejected_points:
+        print(
+            "⚠️ 新聞 evidence 驗證刪除："
+            f"{rejected.get('reason', '')}｜{str(rejected.get('point', ''))[:80]}"
+        )
+
+    # 0 點本身不算問題；只有格式、數字或 evidence 被刪除時才 repair。
+    if problems or rejected_points:
+        log_problems = list(problems)
+        log_problems.extend(
+            str(item.get("reason", "") or "evidence 驗證失敗")
+            for item in rejected_points
+        )
+        print("⚠️ Gemini 新聞重點需要補正：" + "；".join(log_problems))
         repair_payload = {
-            "problems": problems,
+            "problems": list(problems) + list(rejected_points),
             "original_points": points,
             "articles": usable_articles,
         }
@@ -9597,51 +9798,59 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你是台股財經新聞編輯。上一版輸出未通過檢查，請只依修正資料重新整理 {stock_code} {display_name}。
 
 修正原則：
-1. 輸出 {minimum_points}～{NEWS_SUMMARY_MAX_POINTS} 點不同事件，每個 item 必須包含 label、status、detail、tone、confidence、evidence。
+1. 輸出 0～{NEWS_SUMMARY_MAX_POINTS} 點不同事件，每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。
 2. 每點必須獨立完整；tone 只能是 positive、negative、neutral、mixed、watch，並依事件真正方向判斷，不得把「受關注」直接當利多。
-3. 公司必須明確對應 {stock_code} {display_name}，不得混入相似公司或其他公司的資料。
-4. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；找不到就刪除該數字或改寫該點。
-5. 不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
-6. 只回傳符合 JSON Schema 的 JSON。
+3. source_id 必須存在於 articles；evidence 必須逐字抄自該文章的一句原文，而且 evidence 句本身必須明確出現 {stock_code} 或 {display_name}。
+4. 上述被刪除的點及其題材，不得以換句話說、縮寫、改用其他分類或其他改寫形式重新出現；除非能提供另一句全新且通過規則的原文 evidence。
+5. 若沒有任何以 {display_name} 為主體的具體事件，回傳 points: []，不得硬湊。
+6. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
 
-好範例：
-- 公司動態｜結果：新訂單提高能見度｜說明：公司取得新案，後續觀察出貨時程與營收認列進度。
-壞範例：
-- 題材觀察｜結果：重點待確認｜說明：後續持續關注。
+只回傳符合 JSON Schema 的 JSON。
 
 修正資料：
 {json.dumps(repair_payload, ensure_ascii=False, indent=2)}
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v18",
+            cache_task=f"{_news_points_cache_task()}_repair_v21",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
             response_schema=response_schema,
             temperature=GEMINI_ANALYSIS_TEMPERATURE,
         )
-        repaired = _parse_gemini_news_points(repaired_text or "", records, stock_code, stock_name)
+        repaired, repaired_rejected = _parse_gemini_news_points(
+            repaired_text or "",
+            usable_articles,
+            stock_code,
+            stock_name,
+        )
         repaired_ungrounded = _find_ungrounded_number_tokens(
             repaired,
             number_grounding_source,
         )
         repaired_ok = (
-            len(repaired) >= minimum_points
-            and _points_are_independent_and_complete(repaired)
+            not repaired_rejected
+            and (not repaired or _points_are_independent_and_complete(repaired))
             and not repaired_ungrounded
         )
         if repaired_ok:
             points = repaired
             problems = []
+            rejected_points = []
             print(f"✅ Gemini 新聞補正完成：{len(points)} 點")
         else:
+            for rejected in repaired_rejected:
+                print(
+                    "⚠️ Gemini 新聞補正後 evidence 仍不合格："
+                    f"{rejected.get('reason', '')}｜{str(rejected.get('point', ''))[:80]}"
+                )
             if repaired_ungrounded:
                 print(
                     "⚠️ Gemini 新聞補正後仍有無依據數字："
                     + _format_ungrounded_number_problems(repaired_ungrounded)
                 )
-            # 補正仍失敗時，先保留有接地且完整的點，其餘交給既有規則式摘要補足。
+            # repair 仍失敗，只保留已通過 evidence、數字與完整句驗證的點。
             candidate_points = repaired if len(repaired) >= len(points) else points
             points = _filter_points_with_grounded_numbers(
                 candidate_points,
@@ -9659,23 +9868,25 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         number_grounding_source,
     )
     fully_valid = (
-        len(points) >= minimum_points
-        and _points_are_independent_and_complete(points)
+        (not points or _points_are_independent_and_complete(points))
         and not final_ungrounded
     )
-    if fully_valid:
+    if points and fully_valid:
         _save_validated_news_points_cache(
             _news_points_cache_task(),
             stock_code,
             stock_name,
             prompt,
             points,
-            note=f"validated_news_points_json_grounded_{len(points)}",
+            note=f"validated_news_points_sentence_grounded_{len(points)}",
         )
         print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
+    elif not points and fully_valid:
+        print(f"ℹ️ Gemini 判定本週無與 {display_name} 直接相關之重大新聞")
     elif points:
-        print(f"⚠️ Gemini 新聞重點只有 {len(points)} 點或未通過完整驗證，不寫入快取，交給規則式摘要補足")
+        print(f"⚠️ Gemini 新聞重點有 {len(points)} 點未通過完整驗證，不寫入快取")
     return points
+
 
 
 def _safe_float(v, default=np.nan):
@@ -11489,10 +11700,7 @@ def _make_news_keypoint(label: str, sentence: str, stock_code: str, stock_name: 
     fact = _compact_news_fact_text(s, max_len=54)
     if not fact:
         return ""
-    # 多家公司題材新聞若直接顯示原始標題，容易看起來像把其他公司內容混進來；
-    # 圖卡只保留本股票與題材的關係，避免右下角變成新聞標題列表。
-    if label == "產業題材" and stock_name and "、" in fact and re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", fact, re.I):
-        fact = f"{stock_name}仍被市場放在AI散熱需求題材中觀察"
+    # 不替產業綜述素材自行建立「目標公司 × 題材」關係；只保留原候選句內容。
     headline = _infer_news_headline(label, s)
     watch = _infer_news_watch(label, s).replace("追蹤", "後續看", 1)
     detail = f"{fact}；{watch}"
@@ -11515,6 +11723,16 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
     # 同時使用合格的摘要句與標題候選；原本只要摘要句不為空，就完全不看標題，
     # 容易讓法說、ASIC 進展或法人評等等獨立事件無法補成第 3 點。
     candidates = list(_collect_news_sentences(records, stock_code, stock_name) or [])
+    # 最後一道規則式出口也採嚴格主體閘門。
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _news_text_matches_target_stock(
+            str(candidate.get("text", "") or ""),
+            stock_code,
+            stock_name,
+        )
+    ]
     seen_candidate_keys = {
         _title_compare_text(candidate.get("text", ""))
         for candidate in candidates
@@ -11523,6 +11741,9 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
     for candidate in _collect_news_title_candidates(records, stock_code, stock_name) or []:
         candidate_key = _title_compare_text(candidate.get("text", ""))
         if not candidate_key or candidate_key in seen_candidate_keys:
+            continue
+        candidate_text = str(candidate.get("text", "") or "")
+        if not _news_text_matches_target_stock(candidate_text, stock_code, stock_name):
             continue
         candidates.append(candidate)
         seen_candidate_keys.add(candidate_key)
@@ -11534,7 +11755,7 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
 
     points = []
     used_keys = set()
-    target_points = max(1, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
+    target_points = max(0, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
 
     # 1) 業績更新：優先抓營收年增 / 月減 / 月增，雙鴻這類「年增但月減」要呈現偏正向但提醒月減。
     revenue_candidates = []
@@ -11604,7 +11825,7 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
             if len(points) >= target_points:
                 break
 
-    return _ensure_news_summary_min_total(points, records, stock_code, stock_name)
+    return _clean_news_summary_points_for_stock(points, stock_code, stock_name)[:NEWS_SUMMARY_MAX_POINTS]
 
 
 def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str, allow_stale: bool = False) -> List[str]:
@@ -11688,19 +11909,19 @@ def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """整理高品質公司新聞；素材足夠時顯示 3 個不同事件，不足時保留實際可用點數。"""
-    display_target = max(
-        1,
-        min(
-            int(NEWS_DISPLAY_MAX_POINTS),
-            int(NEWS_SUMMARY_MAX_POINTS),
-        ),
+    """整理高品質公司新聞；允許 0 點，寧缺勿濫，不再強制補足顯示數量。"""
+    cached_points = _load_gsheet_news_points_cache_for_display(
+        stock_code,
+        stock_name,
+        allow_stale=False,
     )
-    cached_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
-    if cached_points and len(cached_points) >= display_target:
-        return _finalize_news_points_for_display(cached_points, stock_code, stock_name, ctx)
     if cached_points:
-        print(f"ℹ️ 當日新聞快取僅 {len(cached_points)} 點，低於顯示目標 {display_target} 點，繼續搜尋其他來源")
+        return _finalize_news_points_for_display(
+            cached_points,
+            stock_code,
+            stock_name,
+            ctx,
+        )
 
     records = _news_items_to_records(news_items)
     records = _enrich_fast_news_records_with_topk_bodies(
@@ -11732,58 +11953,55 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         if content_ok or title_fact_ok:
             fallback_records.append(r)
     usable_records = body_records + [r for r in fallback_records if r not in body_records]
-    available_count = _count_distinct_usable_news_articles(usable_records)
-    required_points = min(display_target, max(1, available_count))
 
     if not usable_records:
-        stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
-        if stale_points:
-            return _finalize_news_points_for_display(stale_points, stock_code, stock_name, ctx)
+        # 沒有當期合格素材時直接回傳 0 點，不以舊日期新聞填補本週區塊。
         return []
 
-    ai_points = _summarize_news_with_gemini(usable_records, stock_code, stock_name)
-    final_points = _finalize_news_points_for_display(ai_points, stock_code, stock_name, ctx) if ai_points else []
-
-    # 已有至少兩個不同事件，AI卻仍只留下1點時，用同一批合格素材的規則式摘要補足，
-    # 不創造新聞、不拆分同一事件。
-    if len(final_points) < required_points:
-        rule_points = _rule_based_news_summary(usable_records, stock_code, stock_name)
-        combined = list(final_points)
-        for point in _finalize_news_points_for_display(rule_points, stock_code, stock_name, ctx):
-            if point in combined:
-                continue
-            # 避免文字高度相似的同一事件重複顯示。
-            point_key = _title_compare_text(point)
-            if any(_title_compare_text(existing) == point_key for existing in combined):
-                continue
-            combined.append(point)
-            if len(combined) >= required_points:
-                break
-        final_points = combined[:NEWS_DISPLAY_MAX_POINTS]
-
+    ai_points = _summarize_news_with_gemini(
+        usable_records,
+        stock_code,
+        stock_name,
+    )
+    final_points = (
+        _finalize_news_points_for_display(
+            ai_points,
+            stock_code,
+            stock_name,
+            ctx,
+        )
+        if ai_points
+        else []
+    )
     if final_points:
-        if len(final_points) < required_points:
-            print(
-                f"⚠️ 所有來源與規則式補充完成後仍只有 {len(final_points)} 個可獨立呈現的新聞事件；"
-                "為避免垃圾新聞或重複事件，保留現有內容"
-            )
-        else:
-            # Gemini 失敗但規則式摘要成功時，也要把通過品質檢查的最終顯示結果寫入當日快取；
-            # 下次 Action 選 0 才會固定使用同一份正常新聞，不會再重跑出不同文字。
-            _save_validated_news_points_cache(
-                _news_points_cache_task(),
-                stock_code,
-                stock_name,
-                f"rule_based_news_cache::{stock_code}::{_taipei_today_str()}",
-                final_points,
-                note="validated_rule_based_news_points",
-            )
         return final_points
 
-    stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
-    if stale_points:
-        return _finalize_news_points_for_display(stale_points, stock_code, stock_name, ctx)
+    # Gemini 合法回傳 0 點或驗證後全數刪除時，只允許句子本身含本公司的規則式備援。
+    rule_points = _rule_based_news_summary(
+        usable_records,
+        stock_code,
+        stock_name,
+    )
+    final_points = _finalize_news_points_for_display(
+        rule_points,
+        stock_code,
+        stock_name,
+        ctx,
+    )
+    if final_points:
+        _save_validated_news_points_cache(
+            _news_points_cache_task(),
+            stock_code,
+            stock_name,
+            f"rule_based_news_cache::{stock_code}::{_taipei_today_str()}",
+            final_points,
+            note="validated_rule_based_direct_subject_news_points",
+        )
+        return final_points
+
+    # Gemini 與嚴格規則式備援都沒有合格事件時，保留 0 點，讓圖卡顯示固定文案。
     return []
+
 
 # ============================================================
 # 繪圖工具
@@ -13224,7 +13442,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         body_parts.append("影響：" + f.get("影響"))
                 body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
-                body = _compact_card_sentence(body, 150)
+                body = _compact_card_sentence(body, 116)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="新聞事件待追蹤")
                 status = _compact_status_text(
@@ -13237,9 +13455,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 if _is_useless_news_analyst_row(label, status, body, s):
                     continue
                 tone = _extract_report_tone_from_point(s) or "neutral"
-                rows.append((label, status, body, 3, tone))
+                rows.append((label, status, body, 2, tone))
             if not rows:
-                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3, "neutral"))
+                rows.append(("新聞面", f"本週無與{stock_name}直接相關之重大新聞", "經公司主體與原文證據驗證後，本週未篩選到可直接支持的重大事件。", 2, "neutral"))
             return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
