@@ -520,6 +520,33 @@ def get_report_status_color(status_text: str) -> str:
     if _has_neutral_target_price_or_rating(s):
         return STATUS_NEUTRAL_COLOR
 
+    # 業績、營收與營運動能的明確方向判斷。
+    # 「第2季營收創13季新高」「營收動能維持強勁」等屬於正向結果，應顯示紅色；
+    # 若同句含低於預期、轉弱或衰退等明確負向語意，則不套用正向顏色。
+    performance_negative_terms = [
+        "營收動能轉弱", "營收動能降溫", "營收動能疲弱", "營收成長放緩",
+        "業績動能轉弱", "獲利動能轉弱", "營運動能轉弱", "低於預期",
+        "不如預期", "年減", "衰退", "下滑",
+    ]
+    performance_positive_terms = [
+        "營收創高", "營收創新高", "營收續創新高", "續創新高", "改寫新高",
+        "營收動能維持強勁", "營收動能強勁", "營收動能延續", "營收動能續強",
+        "營收維持強勁", "營收維持成長", "營收成長動能延續",
+        "業績動能維持強勁", "業績動能延續", "獲利動能向上",
+        "獲利動能維持強勁", "獲利動能延續", "營運動能向上",
+        "營運動能維持強勁", "營運動能延續",
+    ]
+    performance_positive_pattern = bool(
+        re.search(r"營收.{0,8}(?:創|續創|改寫).{0,8}(?:新高|同期高)", s)
+        or re.search(r"創\d+季新高", s)
+        or re.search(r"(?:營收|業績|獲利|營運)動能.{0,6}(?:向上|強勁|續強|延續)", s)
+    )
+    if (
+        (any(k in s for k in performance_positive_terms) or performance_positive_pattern)
+        and not any(k in s for k in performance_negative_terms)
+    ):
+        return STATUS_BULL_COLOR
+
     # 分點偏買 / 積極偏買的紅色標示要更嚴格：
     # 只有精選五分點，或勝率統計事件數 > 50 且勝率 >= 80% 的分點，才允許用紅色。
     branch_positive_allowed = _report_branch_positive_color_allowed(s)
@@ -535,12 +562,14 @@ def get_report_status_color(status_text: str) -> str:
         "需求強勁", "需求延續", "需求強", "題材強", "訂單", "接單", "出貨增", "擴產", "新產能",
         "評等調升", "買進評等", "營運看旺", "展望正向", "獲利成長", "EPS上修", "毛利率改善",
         "AI散熱需求強勁", "AI散熱需求延續", "液冷需求", "營收表現偏正向", "公司動態偏正向", "市場預期上修",
+        "營收創高", "營收創新高", "續創新高", "改寫新高", "營收動能強勁", "營收動能延續",
+        "業績動能延續", "獲利動能向上", "營運動能向上",
     ]
     bear_keywords = [
         "偏弱", "轉弱", "弱勢", "賣壓", "賣方", "賣超", "調節", "偏賣", "減碼",
         "資金流出", "淨流出", "跌破", "失守", "壓力", "下修", "調降", "下調", "年減", "負向", "利空",
         "空頭", "空頭排列", "均線空頭", "均線空頭排列", "均線空頭排列延續",
-        "死亡交叉", "均線死亡交叉", "死叉", "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱",
+        "死亡交叉", "均線死亡交叉", "死叉", "看壞", "保守", "衰退", "下滑", "減少", "出貨減", "需求疲弱", "需求降溫", "營收動能轉弱", "低於預期", "不如預期",
     ]
 
     # 先處理明確負面；但月減若伴隨年增，前面已視為偏正向。
@@ -5737,8 +5766,8 @@ def build_key_points(ctx, stock_name: str):
 
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
 NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
-NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "2"))
-NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "2"))
+NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
+NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "125"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "90"))
 NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
@@ -5751,7 +5780,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v17_json_grounded_hybrid_body"
+    internal_version = "validated_v18_fast_three_points"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -5795,10 +5824,11 @@ NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").s
 # 若想回到高品質原文抓取模式，可在 GitHub Actions 設 WARRANT_NEWS_FAST_MODE=0。
 NEWS_FAST_MODE = os.getenv("WARRANT_NEWS_FAST_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 # 混合新聞模式：先用 RSS 快速掃描與排序，再只替最高分的前 2～3 篇補抓原文。
-# 關閉時仍維持原本純 RSS 極速模式；NEWS_FAST_MODE=0 時則沿用既有完整原文模式。
+# 預設關閉，避免新聞網站持續慢速回應時拖住整份週報；需要測試原文補抓時可手動設為 1。
+# NEWS_FAST_MODE=0 時仍沿用既有完整原文模式。
 NEWS_FAST_HYBRID_BODY_FETCH_ENABLE = os.getenv(
     "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE",
-    "1",
+    "0",
 ).strip().lower() in ("1", "true", "yes", "on")
 NEWS_FAST_HYBRID_BODY_FETCH_TOPK = max(
     0,
@@ -5808,11 +5838,28 @@ NEWS_FAST_HYBRID_BODY_FETCH_WORKERS = max(
     1,
     int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_WORKERS", "3")),
 )
-NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT = float(
-    os.getenv(
-        "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT",
-        str(max(12.0, NEWS_FETCH_TIMEOUT + 5.0)),
-    )
+# 即使環境變數設得過大，混合補抓仍強制限制單篇最多 5 秒、整批最多 10 秒，
+# 並限制下載大小，避免慢速串流或超大網頁拖住 GitHub Actions 數分鐘。
+NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT = min(
+    5.0,
+    max(
+        1.0,
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT", "4")),
+    ),
+)
+NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT = min(
+    10.0,
+    max(
+        1.0,
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT", "8")),
+    ),
+)
+NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES = max(
+    32768,
+    min(
+        524288,
+        int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES", "196608")),
+    ),
 )
 # 極速模式最多建立幾篇 RSS 新聞素材；預設等於真正會送進 Gemini 的篇數，避免掃太多新聞拖慢速度。
 NEWS_FAST_FETCH_MAX_ARTICLES = int(os.getenv(
@@ -6395,8 +6442,17 @@ def _maybe_resolve_google_news_link(url: str) -> str:
     return url
 
 
-def _fetch_article_body(url: str) -> str:
-    """嘗試進入新聞原文頁抓內文；失敗時回傳空字串。"""
+def _fetch_article_body(
+    url: str,
+    request_timeout: float | None = None,
+    max_bytes: int | None = None,
+    hard_deadline_seconds: float | None = None,
+) -> str:
+    """嘗試進入新聞原文頁抓內文；失敗時回傳空字串。
+
+    一般慢速原文模式未傳入額外參數時，維持原本 NEWS_FETCH_TIMEOUT 與完整下載行為。
+    混合 RSS 補抓會傳入較短 timeout、最大下載量與硬截止時間，避免慢速串流拖住週報。
+    """
     if not url:
         return ""
     try:
@@ -6407,12 +6463,55 @@ def _fetch_article_body(url: str) -> str:
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://news.google.com/",
         }
-        r = get_thread_session().get(final_url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT), allow_redirects=True)
+
+        timeout_value = float(NEWS_FETCH_TIMEOUT if request_timeout is None else request_timeout)
+        timeout_value = max(1.0, timeout_value)
+        use_limited_stream = max_bytes is not None or hard_deadline_seconds is not None
+        r = get_thread_session().get(
+            final_url,
+            headers=headers,
+            timeout=(min(5.0, timeout_value), timeout_value),
+            allow_redirects=True,
+            stream=use_limited_stream,
+        )
         r.raise_for_status()
         content_type = r.headers.get("Content-Type", "")
-        if "text/html" not in content_type and "application/xhtml" not in content_type and not r.text.lstrip().startswith("<"):
+
+        if use_limited_stream:
+            byte_limit = max(32768, int(max_bytes or NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES))
+            deadline = (
+                time.perf_counter() + max(1.0, float(hard_deadline_seconds))
+                if hard_deadline_seconds is not None
+                else None
+            )
+            chunks = []
+            downloaded = 0
+            for chunk in r.iter_content(chunk_size=16384):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    return ""
+                if not chunk:
+                    continue
+                remaining = byte_limit - downloaded
+                if remaining <= 0:
+                    break
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+                chunks.append(chunk)
+                downloaded += len(chunk)
+                if downloaded >= byte_limit:
+                    break
+            encoding = r.encoding or "utf-8"
+            html_text = b"".join(chunks).decode(encoding, errors="replace")
+        else:
+            html_text = r.text
+
+        if (
+            "text/html" not in content_type
+            and "application/xhtml" not in content_type
+            and not html_text.lstrip().startswith("<")
+        ):
             return ""
-        body = _extract_article_text_from_html(r.text)
+        body = _extract_article_text_from_html(html_text)
         if body and len(body) >= 80:
             return body
     except Exception as e:
@@ -6648,7 +6747,7 @@ def _has_substantive_company_news(text: str) -> bool:
 
     # 產業名詞本身不夠；必須同時出現與公司影響有關的動詞或供需描述。
     industry_term = re.search(r"AI|伺服器|半導體|記憶體|DRAM|NAND|HBM|PCB|載板|CoWoS|先進封裝", s, re.I)
-    relation_term = re.search(r"受惠|受影響|帶動|推升|挹注|貢獻|需求|供需|報價|接單|出貨|產能|布局|導入|合作|量產", s)
+    relation_term = re.search(r"受惠|受影響|帶動|推升|挹注|貢獻|需求|供需|報價|接單|出貨|產能|布局|導入|合作|量產|進展|告捷|突破|開發", s)
     return bool(industry_term and relation_term)
 
 
@@ -8127,17 +8226,17 @@ def _build_news_expansion_points(records: List[dict], stock_code: str, stock_nam
 
 
 def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """新聞品質優先：只從合格素材補到最多 2～3 點，不再為最低字數硬塞內容。"""
+    """新聞品質優先：素材足夠時由程式端補到 3 點，不為字數硬塞無關內容。"""
     points = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
+    target_points = max(1, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
 
-    # 已有兩個以上高品質重點就直接使用，不因總字數不足而硬湊第三點。
-    if len(points) >= 2:
+    if len(points) >= target_points:
         return points[:NEWS_SUMMARY_MAX_POINTS]
 
-    # 只有 0～1 點時，嘗試從同批合格新聞素材再補真正有內容的候選句。
+    # Gemini 只有 0～2 點時，從同批已通過品質門檻的素材補真正不同的事件。
     expanded = points[:]
     for p in _build_news_expansion_points(records, stock_code, stock_name, used_points=expanded):
-        if len(expanded) >= min(2, NEWS_SUMMARY_MAX_POINTS):
+        if len(expanded) >= target_points:
             break
         if p not in expanded:
             expanded.append(p)
@@ -8626,66 +8725,64 @@ def _enrich_fast_news_records_with_topk_bodies(
         f"事件去重後替最高分 {len(candidates):,} 篇補抓原文"
     )
     fetch_started = time.perf_counter()
-
-    def fetch_one(idx: int):
-        record = enriched[idx]
-        body = _fetch_article_body(str(record.get("url", "") or "").strip())
-        return idx, body
-
-    workers = max(1, min(NEWS_FAST_HYBRID_BODY_FETCH_WORKERS, len(candidates)))
-    executor = ThreadPoolExecutor(max_workers=workers)
-    futures = {
-        executor.submit(fetch_one, idx): idx
-        for idx, _, _, _, _ in candidates
-    }
-    done, pending = wait(
-        futures,
-        timeout=max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT)),
-    )
-
+    batch_timeout = max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT))
+    batch_deadline = fetch_started + batch_timeout
     upgraded = 0
-    try:
-        for future in done:
-            idx = futures[future]
-            record = enriched[idx]
-            try:
-                _, body = future.result()
-            except Exception as e:
-                print(f"⚠️ RSS 混合模式原文抓取失敗：{record.get('title', '')[:36]}｜{e}")
-                continue
+    attempted = 0
 
-            body = _normalize_news_text(body)
-            body_ok = (
-                _is_valid_article_body(
-                    body,
-                    title=record.get("title", ""),
-                    description=record.get("description", ""),
-                )
-                and _passes_news_quality_gate(
-                    record.get("title", ""),
-                    body,
-                    stock_code,
-                    stock_name,
-                )
+    # 不再使用 ThreadPoolExecutor：requests 執行緒無法被安全強制終止，
+    # 即使 future.cancel() 成功印出，Python 仍可能在收尾時等待卡住的執行緒。
+    # 這裡改成最多 3 篇循序補抓，每篇與整批皆有硬上限，預設則完全不執行此功能。
+    for candidate_pos, (idx, _, _, _, _) in enumerate(candidates):
+        remaining_batch = batch_deadline - time.perf_counter()
+        if remaining_batch <= 0:
+            remaining_count = len(candidates) - candidate_pos
+            print(f"⚠️ RSS 混合模式批次逾時，略過剩餘 {remaining_count:,} 篇")
+            break
+
+        record = enriched[idx]
+        attempted += 1
+        per_request_timeout = min(
+            float(NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT),
+            max(1.0, remaining_batch),
+        )
+        try:
+            body = _fetch_article_body(
+                str(record.get("url", "") or "").strip(),
+                request_timeout=per_request_timeout,
+                max_bytes=NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES,
+                hard_deadline_seconds=remaining_batch,
             )
-            if not body_ok:
-                print(f"ℹ️ RSS 混合模式未取得可用原文，保留摘要：{record.get('title', '')[:36]}")
-                continue
+        except Exception as e:
+            print(f"⚠️ RSS 混合模式原文抓取失敗：{record.get('title', '')[:36]}｜{e}")
+            continue
 
-            record["content"] = body
-            record["body_ok"] = True
-            record["fallback_ok"] = False
-            record["content_source"] = "hybrid_article"
-            record["body_length"] = len(body)
-            record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
-            upgraded += 1
-            print(f"✅ RSS 混合模式補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
-    finally:
-        for future in pending:
-            future.cancel()
-        if pending:
-            print(f"⚠️ RSS 混合模式批次逾時，取消剩餘 {len(pending):,} 篇")
-        executor.shutdown(wait=False, cancel_futures=True)
+        body = _normalize_news_text(body)
+        body_ok = (
+            _is_valid_article_body(
+                body,
+                title=record.get("title", ""),
+                description=record.get("description", ""),
+            )
+            and _passes_news_quality_gate(
+                record.get("title", ""),
+                body,
+                stock_code,
+                stock_name,
+            )
+        )
+        if not body_ok:
+            print(f"ℹ️ RSS 混合模式未取得可用原文，保留摘要：{record.get('title', '')[:36]}")
+            continue
+
+        record["content"] = body
+        record["body_ok"] = True
+        record["fallback_ok"] = False
+        record["content_source"] = "hybrid_article"
+        record["body_length"] = len(body)
+        record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
+        upgraded += 1
+        print(f"✅ RSS 混合模式補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
 
     # 原文優先，再依相關性排序；相同條件保留原始順序。
     indexed = list(enumerate(enriched))
@@ -8697,7 +8794,7 @@ def _enrich_fast_news_records_with_topk_bodies(
         )
     )
     elapsed = time.perf_counter() - fetch_started
-    print(f"⏱️ RSS 混合模式原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{len(candidates)} 篇")
+    print(f"⏱️ RSS 混合模式原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{attempted} 篇")
     return [record for _, record in indexed]
 
 
@@ -8896,7 +8993,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v17",
+            cache_task=f"{_news_points_cache_task()}_repair_v18",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
@@ -10509,8 +10606,10 @@ def _infer_news_conclusion(label: str, text: str) -> str:
         if has_year_up or has_month_up:
             return "營收表現偏正向。"
         return "營收變化是本週主要基本面訊息。"
-    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC", s, re.I):
+    if re.search(r"散熱|液冷|水冷", s, re.I):
         return "AI散熱題材仍是市場焦點。"
+    if re.search(r"AI|伺服器|GPU|ASIC", s, re.I):
+        return "AI業務布局仍是市場焦點。"
     if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
         return "市場預期仍在重新評估。"
     if re.search(r"公告|重大訊息|董事會|投資|合作|擴產", s):
@@ -10522,8 +10621,10 @@ def _infer_news_watch(label: str, text: str) -> str:
     s = _normalize_news_text(text)
     if re.search(r"營收|月增|年增|財報|獲利|EPS|毛利", s, re.I):
         return "追蹤下月營收、毛利率與法說展望。"
-    if re.search(r"AI|伺服器|散熱|液冷|GPU|ASIC|長約|需求", s, re.I):
+    if re.search(r"散熱|液冷|水冷", s, re.I):
         return "追蹤AI散熱訂單與出貨延續性。"
+    if re.search(r"AI|伺服器|GPU|ASIC|長約|需求", s, re.I):
+        return "追蹤AI／ASIC業務進展與營收貢獻。"
     if re.search(r"法人|評等|目標價|調升|調降", s):
         return "追蹤EPS預估與法人看法是否延續。"
     if re.search(r"公告|重大訊息|合作|投資|擴產", s):
@@ -10582,13 +10683,19 @@ def _infer_news_headline(label: str, text: str) -> str:
     if "營收" in s:
         if "年增" in s and "月減" in s:
             return "營收表現偏正向"
-        if any(k in s for k in ["年增", "月增", "成長", "創高", "同期高"]):
+        if (
+            any(k in s for k in ["年增", "月增", "成長", "創高", "同期高", "續創新高", "改寫新高"])
+            or re.search(r"創\d+季新高", s)
+            or re.search(r"營收.{0,8}(?:創|續創|改寫).{0,8}新高", s)
+        ):
             return "營收表現偏正向"
         if any(k in s for k in ["年減", "月減", "衰退"]):
             return "營收動能轉弱"
         return "營收變化待追蹤"
-    if re.search(r"AI|伺服器|散熱|液冷|水冷|GPU|ASIC", s, re.I):
+    if re.search(r"散熱|液冷|水冷", s, re.I):
         return "AI散熱需求強勁"
+    if re.search(r"AI|伺服器|GPU|ASIC", s, re.I):
+        return "AI業務布局受關注"
     if re.search(r"研發|平台|新應用|新產品|推出|開發", s):
         return "產品布局待追蹤"
     if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
@@ -10638,9 +10745,20 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
     Gemini 若輸出 0 點，仍優先從已通過新聞品質門檻的 RSS 標題 / 摘要整理，
     但避免直接把原始標題丟進圖卡；輸出仍維持「分類｜結果：...｜說明：...」。
     """
-    candidates = _collect_news_sentences(records, stock_code, stock_name)
-    if not candidates:
-        candidates = _collect_news_title_candidates(records, stock_code, stock_name)
+    # 同時使用合格的摘要句與標題候選；原本只要摘要句不為空，就完全不看標題，
+    # 容易讓法說、ASIC 進展或法人評等等獨立事件無法補成第 3 點。
+    candidates = list(_collect_news_sentences(records, stock_code, stock_name) or [])
+    seen_candidate_keys = {
+        _title_compare_text(candidate.get("text", ""))
+        for candidate in candidates
+        if candidate.get("text")
+    }
+    for candidate in _collect_news_title_candidates(records, stock_code, stock_name) or []:
+        candidate_key = _title_compare_text(candidate.get("text", ""))
+        if not candidate_key or candidate_key in seen_candidate_keys:
+            continue
+        candidates.append(candidate)
+        seen_candidate_keys.add(candidate_key)
     if not candidates:
         return []
 
@@ -10649,6 +10767,7 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
 
     points = []
     used_keys = set()
+    target_points = max(1, min(3, int(NEWS_SUMMARY_MAX_POINTS)))
 
     # 1) 業績更新：優先抓營收年增 / 月減 / 月增，雙鴻這類「年增但月減」要呈現偏正向但提醒月減。
     revenue_candidates = []
@@ -10688,8 +10807,8 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
             points.append(p)
             used_keys.add(_title_compare_text(industry_candidates[0][1]))
 
-    # 3) 其他公司資訊：法人觀點 / 公司動態，僅在前兩類不足時補充。
-    if len(points) < min(2, NEWS_SUMMARY_MAX_POINTS):
+    # 3) 其他公司資訊：法人觀點 / 公司動態，用於補足第 3 個不同事件。
+    if len(points) < target_points:
         other_categories = [
             ("法人觀點", ["外資", "投信", "券商", "法人", "評等", "目標價", "調升", "調降", "EPS"]),
             ("公司動態", ["公告", "重大訊息", "董事會", "投資", "合作", "擴產", "產能", "接單", "出貨"]),
@@ -10709,13 +10828,13 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
                     scored.append((score, text))
             scored.sort(key=lambda x: x[0], reverse=True)
             for _, text in scored:
-                if len(points) >= min(2, NEWS_SUMMARY_MAX_POINTS):
+                if len(points) >= target_points:
                     break
                 p = make_clean_point(label, text)
                 if p and not _is_bad_news_sentence(p):
                     points.append(p)
                     used_keys.add(_title_compare_text(text))
-            if len(points) >= min(2, NEWS_SUMMARY_MAX_POINTS):
+            if len(points) >= target_points:
                 break
 
     return _ensure_news_summary_min_total(points, records, stock_code, stock_name)
@@ -10802,13 +10921,19 @@ def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """整理高品質公司新聞；有兩則以上不同素材時，盡量確保至少顯示兩個不同事件。"""
-    minimum_target = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
+    """整理高品質公司新聞；素材足夠時顯示 3 個不同事件，不足時保留實際可用點數。"""
+    display_target = max(
+        1,
+        min(
+            int(NEWS_DISPLAY_MAX_POINTS),
+            int(NEWS_SUMMARY_MAX_POINTS),
+        ),
+    )
     cached_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=False)
-    if cached_points and len(cached_points) >= minimum_target:
+    if cached_points and len(cached_points) >= display_target:
         return _finalize_news_points_for_display(cached_points, stock_code, stock_name, ctx)
     if cached_points:
-        print(f"ℹ️ 當日新聞快取僅 {len(cached_points)} 點，低於最低目標 {minimum_target} 點，繼續搜尋其他來源")
+        print(f"ℹ️ 當日新聞快取僅 {len(cached_points)} 點，低於顯示目標 {display_target} 點，繼續搜尋其他來源")
 
     records = _news_items_to_records(news_items)
     records = _enrich_fast_news_records_with_topk_bodies(
@@ -10830,7 +10955,7 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
     ]
     usable_records = body_records + [r for r in fallback_records if r not in body_records]
     available_count = _count_distinct_usable_news_articles(usable_records)
-    required_points = minimum_target if available_count >= minimum_target else 1
+    required_points = min(display_target, max(1, available_count))
 
     if not usable_records:
         stale_points = _load_gsheet_news_points_cache_for_display(stock_code, stock_name, allow_stale=True)
