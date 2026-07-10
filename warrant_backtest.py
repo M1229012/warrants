@@ -110,6 +110,8 @@ CANDIDATES_CACHE_SELECTED5_PATH = os.path.join(CACHE_DIR, "candidates_cache_sele
 HISTORY_CACHE_PATH    = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH      = os.path.join(CACHE_DIR, "price_cache.csv")
 PRICE_PREFETCH_STATE_PATH = os.path.join(CACHE_DIR, "price_prefetch_state.csv")
+PRESCAN_STATUS_PATH = os.path.join(CACHE_DIR, "prescan_status.csv")
+PRESCAN_REFRESH_KEYS_PATH = os.path.join(CACHE_DIR, "prescan_refresh_keys.csv")
 
 # 自動價格預抓：
 # 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
@@ -126,6 +128,22 @@ PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
 # 即使 price_prefetch_state 已記錄 done，也會再嘗試預抓，避免早盤/盤中先跑過後，盤後價格不再更新。
 PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE = os.getenv("PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE", "1").strip().lower() not in ("0", "false", "no")
 PRICE_PREFETCH_MIN_TARGET_PRICE_CODES = int(os.getenv("PRICE_PREFETCH_MIN_TARGET_PRICE_CODES", "1"))
+
+# 工作流模式：
+# daily：每日自動流程。先輕量探測，分點資料沒出來就只補價格並停止；不啟用 MoneyDJ Repair。
+# longterm：長期留單補價入口（保留模式，不影響每日流程）。
+# repair：完整修補模式。忽略 prescan 狀態、強制重掃並啟用 MoneyDJ Search Repair。
+WORKFLOW_MODE = os.getenv("WORKFLOW_MODE", "daily").strip().lower() or "daily"
+if WORKFLOW_MODE not in ("daily", "longterm", "repair"):
+    print(f"  ⚠️ WORKFLOW_MODE={WORKFLOW_MODE} 不支援，改用 daily。")
+    WORKFLOW_MODE = "daily"
+
+# daily 輕量探測：先用近期有活動的權證少量查 API4，避免分點資料尚未更新時白跑全市場 prescan。
+DAILY_LIGHT_PROBE_ENABLED = os.getenv("DAILY_LIGHT_PROBE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+DAILY_LIGHT_PROBE_SAMPLE_SIZE = int(os.getenv("DAILY_LIGHT_PROBE_SAMPLE_SIZE", "300"))
+DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS = int(os.getenv("DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS", "5"))
+DAILY_LIGHT_PROBE_SCAN_DAYS = int(os.getenv("DAILY_LIGHT_PROBE_SCAN_DAYS", "2"))
+DAILY_LIGHT_PROBE_WORKERS = int(os.getenv("DAILY_LIGHT_PROBE_WORKERS", str(min(PRESCAN_WORKERS, 80))))
 
 # 價格快取同步加速：
 # 價格快取筆數很大時，若每次都整張重寫 Google Sheet 會拖慢整體執行。
@@ -264,6 +282,7 @@ PRESCAN_MISSING_FETCH_KEYS = set()
 # 這用來判斷「今天分點資料是否已經出來」。若尚未出來，主流程會自動改成價格預抓模式。
 PRESCAN_LATEST_ACTIVITY_DATE = None
 PRESCAN_TODAY_ACTIVITY_FOUND = False
+PRESCAN_STATUS_LAST_RECORD = {}
 
 # MoneyDJ Search 自動補漏模式：
 # 當 OpenAPI / API4 最新交易日落後本次報表目標日時，不再只做價格預抓後結束，
@@ -1519,6 +1538,8 @@ CACHE_SHEET_NAME_MAP = {
     "broker_warrant_history_cache.csv": "快取_分點歷史",
     "price_cache.csv": "快取_價格",
     "price_prefetch_state.csv": "快取_價格預抓狀態",
+    "prescan_status.csv": "快取_候選掃描狀態",
+    "prescan_refresh_keys.csv": "快取_候選掃描Keys",
 }
 
 
@@ -6083,7 +6104,7 @@ def load_broker_map_cache():
 
 def save_candidates_cache(candidates):
     if not USE_CACHE or not candidates:
-        return
+        return False
 
     rows = []
 
@@ -6121,6 +6142,7 @@ def save_candidates_cache(candidates):
         force_supabase_sync=FORCE_FULL_CACHE_REFRESH,
     )
     print(f"  💾 已更新候選組合快取：{CANDIDATES_CACHE_PATH}，共 {len(df):,} 組")
+    return True
 
 
 def load_candidates_cache():
@@ -6170,7 +6192,385 @@ def load_candidates_cache():
             broker_code,
         ))
 
+
     return candidates
+
+
+# ══════════════════════════════════════════════════════════════════════
+# daily / repair 工作流：prescan 狀態與 refresh keys 快取
+# ══════════════════════════════════════════════════════════════════════
+
+def workflow_is_daily():
+    return WORKFLOW_MODE == "daily"
+
+
+def workflow_is_repair():
+    return WORKFLOW_MODE == "repair"
+
+
+def workflow_is_longterm():
+    return WORKFLOW_MODE == "longterm"
+
+
+def current_prescan_scope():
+    return "selected5" if RUN_MODE == 1 else "all"
+
+
+def current_prescan_target_date(target_date=None):
+    return normalize_price_prefetch_target_date(target_date)
+
+
+def load_prescan_status_df():
+    df = read_cache_csv(PRESCAN_STATUS_PATH)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.fillna("")
+
+
+def write_prescan_status(status, target_date=None, reason="", **extra):
+    """記錄今日 50 天候選掃描狀態；只有 status=success 才允許日內跳過 prescan。"""
+    if not USE_CACHE:
+        return
+
+    target_date = current_prescan_target_date(target_date)
+    scope = current_prescan_scope()
+    latest_label = ""
+    if PRESCAN_LATEST_ACTIVITY_DATE:
+        latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d")
+
+    headers = [
+        "日期", "資料範圍", "RUN_MODE", "狀態", "最新分點活動日", "今日分點資料是否出現",
+        "候選組合數", "API4直接候選數", "允許缺快取補抓數", "候選快取是否寫入成功",
+        "更新時間", "錯誤原因",
+    ]
+
+    old_df = read_cache_csv(PRESCAN_STATUS_PATH)
+    rows = []
+    if old_df is not None and not old_df.empty:
+        for _, old_row in old_df.fillna("").iterrows():
+            rows.append({h: old_row.get(h, "") for h in headers})
+
+    rec = {h: "" for h in headers}
+    rec.update({
+        "日期": target_date,
+        "資料範圍": scope,
+        "RUN_MODE": str(RUN_MODE),
+        "狀態": str(status or "").strip(),
+        "最新分點活動日": latest_label,
+        "今日分點資料是否出現": "1" if has_today_broker_data_from_prescan(target_date) else "0",
+        "候選組合數": extra.get("candidate_count", ""),
+        "API4直接候選數": extra.get("direct_candidate_count", len(PRESCAN_REFRESH_KEYS or [])),
+        "允許缺快取補抓數": extra.get("missing_fetch_key_count", len(PRESCAN_MISSING_FETCH_KEYS or [])),
+        "候選快取是否寫入成功": "1" if extra.get("candidate_cache_saved", False) else "0",
+        "更新時間": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+        "錯誤原因": reason,
+    })
+    rows.append(rec)
+
+    df = pd.DataFrame(rows, columns=headers).fillna("")
+    df = df.drop_duplicates(subset=["日期", "資料範圍", "RUN_MODE"], keep="last").reset_index(drop=True)
+    write_cache_csv(df, PRESCAN_STATUS_PATH)
+
+
+def find_valid_prescan_success_record(target_date=None):
+    """只接受同日、同 scope、同 RUN_MODE 且 status=success 的 prescan 狀態。"""
+    if workflow_is_repair():
+        return None
+
+    target_date = current_prescan_target_date(target_date)
+    scope = current_prescan_scope()
+    df = load_prescan_status_df()
+    if df.empty:
+        return None
+
+    for row in df.itertuples(index=False):
+        rd = row._asdict()
+        if normalize_date_str(rd.get("日期", "")) != target_date:
+            continue
+        if str(rd.get("資料範圍", "")).strip() != scope:
+            continue
+        if str(rd.get("RUN_MODE", "")).strip() != str(RUN_MODE):
+            continue
+        if str(rd.get("狀態", "")).strip().lower() != "success":
+            continue
+        return rd
+
+    return None
+
+
+def _split_candidate_key(key):
+    if isinstance(key, (tuple, list)) and len(key) >= 2:
+        return str(key[0]).strip(), str(key[1]).strip()
+    s = str(key or "").strip()
+    for sep in ("|", "::", ","):
+        if sep in s:
+            a, b = s.split(sep, 1)
+            return a.strip(), b.strip()
+    return "", ""
+
+
+def write_prescan_refresh_keys(refresh_keys=None, missing_fetch_keys=None, target_date=None):
+    """將 PRESCAN_REFRESH_KEYS / PRESCAN_MISSING_FETCH_KEYS 獨立保存，避免狀態表單格塞爆。"""
+    if not USE_CACHE:
+        return False
+
+    target_date = current_prescan_target_date(target_date)
+    scope = current_prescan_scope()
+    now_s = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    rows = []
+
+    def add_rows(keys, key_type):
+        for key in sorted(keys or []):
+            warrant_code, broker_code = _split_candidate_key(key)
+            if not warrant_code or not broker_code:
+                continue
+            rows.append({
+                "日期": target_date,
+                "資料範圍": scope,
+                "RUN_MODE": str(RUN_MODE),
+                "key類型": key_type,
+                "權證代號": warrant_code,
+                "券商代號": broker_code,
+                "更新時間": now_s,
+            })
+
+    add_rows(refresh_keys or set(), "refresh")
+    add_rows(missing_fetch_keys or set(), "missing_fetch")
+
+    headers = ["日期", "資料範圍", "RUN_MODE", "key類型", "權證代號", "券商代號", "更新時間"]
+    old_df = read_cache_csv(PRESCAN_REFRESH_KEYS_PATH)
+    keep_rows = []
+    if old_df is not None and not old_df.empty:
+        for _, old_row in old_df.fillna("").iterrows():
+            rd = {h: old_row.get(h, "") for h in headers}
+            same_scope = (
+                normalize_date_str(rd.get("日期", "")) == target_date
+                and str(rd.get("資料範圍", "")).strip() == scope
+                and str(rd.get("RUN_MODE", "")).strip() == str(RUN_MODE)
+            )
+            if not same_scope:
+                keep_rows.append(rd)
+
+    df = pd.DataFrame(keep_rows + rows, columns=headers).fillna("")
+    write_cache_csv(df, PRESCAN_REFRESH_KEYS_PATH)
+    print(f"  💾 已保存 prescan keys：refresh {len(refresh_keys or []):,} 組｜missing_fetch {len(missing_fetch_keys or []):,} 組")
+    return True
+
+
+def load_prescan_refresh_keys(target_date=None):
+    """讀回同日、同 scope、同 RUN_MODE 的 refresh keys；不符即視為無效。"""
+    target_date = current_prescan_target_date(target_date)
+    scope = current_prescan_scope()
+    df = read_cache_csv(PRESCAN_REFRESH_KEYS_PATH)
+    if df is None or df.empty:
+        return set(), set(), False
+
+    required_cols = {"日期", "資料範圍", "RUN_MODE", "key類型", "權證代號", "券商代號"}
+    if not required_cols.issubset(set(df.columns)):
+        return set(), set(), False
+
+    refresh_keys = set()
+    missing_keys = set()
+    for _, row in df.fillna("").iterrows():
+        if normalize_date_str(row.get("日期", "")) != target_date:
+            continue
+        if str(row.get("資料範圍", "")).strip() != scope:
+            continue
+        if str(row.get("RUN_MODE", "")).strip() != str(RUN_MODE):
+            continue
+        key = candidate_key_from_values(row.get("權證代號", ""), row.get("券商代號", ""))
+        if not key:
+            continue
+        key_type = str(row.get("key類型", "")).strip().lower()
+        if key_type == "refresh":
+            refresh_keys.add(key)
+        elif key_type == "missing_fetch":
+            missing_keys.add(key)
+
+    return refresh_keys, missing_keys, bool(refresh_keys or missing_keys)
+
+
+def try_load_prescan_success_cache(broker_map, target_date=None):
+    """daily 第二次執行時，若 prescan 狀態成功，直接讀候選快取與 keys。"""
+    global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND, PRESCAN_STATUS_LAST_RECORD
+
+    record = find_valid_prescan_success_record(target_date)
+    if not record:
+        return None
+
+    refresh_keys, missing_keys, keys_ok = load_prescan_refresh_keys(target_date)
+    if not keys_ok:
+        print("  ⚠️ 找到 prescan success，但找不到同日 / 同 scope 的 prescan keys；本次重新掃描，避免 API5 漏補。")
+        return None
+
+    cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
+    if not cached_candidates:
+        print("  ⚠️ 找到 prescan success，但候選快取為空；本次重新掃描。")
+        return None
+
+    PRESCAN_REFRESH_KEYS = refresh_keys
+    PRESCAN_MISSING_FETCH_KEYS = missing_keys
+    latest_dt = parse_date(record.get("最新分點活動日", ""))
+    PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
+    PRESCAN_TODAY_ACTIVITY_FOUND = str(record.get("今日分點資料是否出現", "")).strip() in ("1", "true", "True", "是", "已出現")
+    PRESCAN_STATUS_LAST_RECORD = dict(record)
+
+    print(
+        f"  ✅ 今日 prescan 已成功完成，跳過 50 天掃描："
+        f"候選 {len(cached_candidates):,} 組｜refresh keys {len(PRESCAN_REFRESH_KEYS):,}｜missing keys {len(PRESCAN_MISSING_FETCH_KEYS):,}"
+    )
+    return cached_candidates
+
+
+def _select_light_probe_warrants_from_history(warrants, broker_map):
+    """從最近 3~5 個交易日有活動的權證挑探測樣本；沒有樣本時回傳空列表。"""
+    history_df = load_history_cache()
+    if history_df is None or history_df.empty:
+        return []
+
+    required_cols = {"權證代號", "券商代號", "日期"}
+    if not required_cols.issubset(set(history_df.columns)):
+        return []
+
+    broker_codes = {str(code).strip() for _, code in broker_map.values() if str(code).strip()}
+    df = history_df[["權證代號", "券商代號", "日期"]].copy().fillna("")
+    df["日期_dt"] = df["日期"].apply(parse_date)
+    df = df[df["日期_dt"].notna()]
+    if broker_codes:
+        df = df[df["券商代號"].astype(str).str.strip().isin(broker_codes)]
+    if df.empty:
+        return []
+
+    unique_dates = sorted({d.date() for d in df["日期_dt"] if d})
+    recent_dates = set(unique_dates[-max(DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS, 1):])
+    df = df[df["日期_dt"].apply(lambda d: d.date() in recent_dates if d else False)]
+    if df.empty:
+        return []
+
+    # 依最近日期與出現次數排序，優先挑近期確定有活動的權證。
+    grouped = df.groupby("權證代號", dropna=False).agg(
+        latest_dt=("日期_dt", "max"),
+        count=("日期", "count"),
+    ).reset_index()
+    grouped["權證代號"] = grouped["權證代號"].astype(str).str.strip()
+    grouped = grouped[grouped["權證代號"] != ""]
+    grouped = grouped.sort_values(["latest_dt", "count"], ascending=[False, False])
+
+    warrant_map = {str(w.get("代號", "")).strip(): w for w in warrants or []}
+    sample = []
+    for code in grouped["權證代號"].tolist():
+        w = warrant_map.get(code)
+        if w:
+            sample.append(w)
+        if len(sample) >= max(DAILY_LIGHT_PROBE_SAMPLE_SIZE, 1):
+            break
+
+    return sample
+
+
+def light_probe_today_broker_data(warrants, broker_map, target_date=None):
+    """
+    daily 正式 prescan 前的輕量探測。
+    回傳：True=今日資料已出現；False=尚未出現；None=無樣本，應直接正式 prescan。
+    """
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND
+
+    if not workflow_is_daily() or not DAILY_LIGHT_PROBE_ENABLED:
+        return None
+
+    target_date = current_prescan_target_date(target_date)
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return None
+
+    sample_warrants = _select_light_probe_warrants_from_history(warrants, broker_map)
+    if not sample_warrants:
+        print("  ⚠️ 輕量探測：快取_分點歷史沒有可用樣本，跳過探測並進入正式 prescan。")
+        return None
+
+    broker_codes_set = {code for _, code in broker_map.values()}
+    start_s = (target_dt - timedelta(days=max(DAILY_LIGHT_PROBE_SCAN_DAYS, 1))).strftime("%Y/%m/%d")
+    end_s = target_dt.strftime("%Y/%m/%d")
+    target_s = target_dt.strftime("%Y/%m/%d")
+    found_today = False
+    latest_dt = None
+    done = 0
+    timeout_or_error = 0
+    empty_rows = 0
+
+    print(f"【Step 3a-0】輕量探測今日分點資料：樣本 {len(sample_warrants):,} 支，區間 {start_s}~{end_s}")
+
+    def probe_one(w):
+        local_latest = None
+        local_today = False
+        row_count = 0
+        try:
+            rows = api4_get(w["代號"], start_s, end_s)
+        except Exception:
+            return None, False, 0, True
+
+        for row in rows or []:
+            row_count += 1
+            bcode = row.get("V2", "")
+            if bcode not in broker_codes_set:
+                continue
+            row_date = normalize_date_str(row.get("V1", ""))
+            row_dt = parse_date(row_date)
+            if row_dt and (local_latest is None or row_dt > local_latest):
+                local_latest = row_dt
+            if row_date == target_s:
+                local_today = True
+        return local_latest, local_today, row_count, False
+
+    stop_probe_event = threading.Event()
+
+    def probe_one_with_stop(w):
+        if stop_probe_event.is_set():
+            return None, False, 0, False
+        return probe_one(w)
+
+    ex = ThreadPoolExecutor(max_workers=max(1, DAILY_LIGHT_PROBE_WORKERS))
+    futures = {ex.submit(probe_one_with_stop, w): w for w in sample_warrants}
+    try:
+        for future in as_completed(futures):
+            done += 1
+            try:
+                row_latest, row_today, row_count, had_error = future.result()
+            except Exception:
+                row_latest, row_today, row_count, had_error = None, False, 0, True
+
+            if had_error:
+                timeout_or_error += 1
+            if not row_count:
+                empty_rows += 1
+            if row_latest and (latest_dt is None or row_latest > latest_dt):
+                latest_dt = row_latest
+            if row_today:
+                found_today = True
+                stop_probe_event.set()
+                # 已確認今日資料出現，取消尚未開始的探測請求，避免探測階段打好打滿。
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    ex.shutdown(wait=False)
+                break
+    finally:
+        if not found_today:
+            ex.shutdown(wait=True)
+
+    if latest_dt and (PRESCAN_LATEST_ACTIVITY_DATE is None or latest_dt > PRESCAN_LATEST_ACTIVITY_DATE):
+        PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
+    if found_today:
+        PRESCAN_TODAY_ACTIVITY_FOUND = True
+
+    latest_label = latest_dt.strftime("%Y/%m/%d") if latest_dt else "-"
+    print(
+        f"  ✅ 輕量探測完成：今日資料 {'已出現' if found_today else '尚未出現'}｜"
+        f"最新活動日 {latest_label}｜錯誤/逾時 {timeout_or_error}｜空回應 {empty_rows}"
+    )
+    return bool(found_today)
+
 
 def merge_candidates(old_candidates, new_candidates):
     merged = {}
@@ -7469,6 +7869,14 @@ def prescan_all(warrants, broker_map):
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
 
     broker_map = filter_broker_map_for_active_targets(broker_map)
+
+    if workflow_is_daily():
+        cached_from_success = try_load_prescan_success_cache(broker_map)
+        if cached_from_success is not None:
+            return cached_from_success
+    elif workflow_is_repair():
+        print("  🔧 WORKFLOW_MODE=repair：忽略 prescan_status，強制重新掃描候選。")
+
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
 
     if cached_candidates:
@@ -7538,7 +7946,38 @@ def prescan_all(warrants, broker_map):
     merged_candidates = merge_candidates(cached_candidates, refresh_candidates)
     merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
 
-    save_candidates_cache(merged_candidates)
+    candidate_cache_saved = False
+    try:
+        candidate_cache_saved = bool(save_candidates_cache(merged_candidates))
+    except Exception as e:
+        candidate_cache_saved = False
+        print(f"  ⚠️ 候選組合快取寫入失敗：{type(e).__name__}: {e}")
+
+    target_date = current_prescan_target_date()
+    prescan_has_today = has_today_broker_data_from_prescan(target_date)
+
+    if candidate_cache_saved and prescan_has_today and merged_candidates:
+        write_prescan_refresh_keys(PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS, target_date=target_date)
+        write_prescan_status(
+            "success",
+            target_date=target_date,
+            candidate_count=len(merged_candidates),
+            direct_candidate_count=len(PRESCAN_REFRESH_KEYS),
+            missing_fetch_key_count=len(PRESCAN_MISSING_FETCH_KEYS),
+            candidate_cache_saved=True,
+        )
+    else:
+        status = "broker_data_not_ready" if not prescan_has_today else "failed"
+        reason = "API4 尚未看到今日目標分點資料" if not prescan_has_today else "候選快取未成功寫入或候選為空"
+        write_prescan_status(
+            status,
+            target_date=target_date,
+            reason=reason,
+            candidate_count=len(merged_candidates),
+            direct_candidate_count=len(PRESCAN_REFRESH_KEYS),
+            missing_fetch_key_count=len(PRESCAN_MISSING_FETCH_KEYS),
+            candidate_cache_saved=candidate_cache_saved,
+        )
 
     print(
         f"  ✅ 候選組合完成：快取 {len(cached_candidates):,} 組，"
@@ -14192,7 +14631,7 @@ def should_activate_moneydj_search_repair(target_date=None):
     只要落後，就不讓流程停在價格預抓，而是繼續進入正式報表流程，
     並強制用 MoneyDJ API5 補抓可能漏掉的候選組合。
     """
-    if not MONEYDJ_SEARCH_REPAIR_ENABLED:
+    if not MONEYDJ_SEARCH_REPAIR_ENABLED and not workflow_is_repair():
         return False
 
     target_date = normalize_moneydj_search_repair_target_date(target_date)
@@ -14212,6 +14651,15 @@ def activate_moneydj_search_repair_if_needed(target_date=None):
     global MONEYDJ_SEARCH_REPAIR_TARGET_DATE
     global MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE
     global MONEYDJ_SEARCH_REPAIR_REASON
+
+    if not workflow_is_repair():
+        MONEYDJ_SEARCH_REPAIR_ACTIVE = False
+        MONEYDJ_SEARCH_REPAIR_TARGET_DATE = normalize_moneydj_search_repair_target_date(target_date)
+        MONEYDJ_SEARCH_REPAIR_OPENAPI_LATEST_DATE = get_openapi_latest_activity_date_str() or "-"
+        MONEYDJ_SEARCH_REPAIR_REASON = ""
+        if WORKFLOW_MODE == "daily":
+            print("  ✅ WORKFLOW_MODE=daily：不啟用 MoneyDJ Search Repair；資料未出現時改走價格預抓並停止。")
+        return False
 
     target_date = normalize_moneydj_search_repair_target_date(target_date)
     latest_date = get_openapi_latest_activity_date_str() or "-"
@@ -14239,7 +14687,7 @@ def activate_moneydj_search_repair_if_needed(target_date=None):
 
 
 def moneydj_search_repair_is_active():
-    return bool(MONEYDJ_SEARCH_REPAIR_ACTIVE and MONEYDJ_SEARCH_REPAIR_ENABLED)
+    return bool(MONEYDJ_SEARCH_REPAIR_ACTIVE and (MONEYDJ_SEARCH_REPAIR_ENABLED or workflow_is_repair()))
 
 
 def _history_latest_and_net_by_candidate(history_cache_df, candidate_keys=None):
@@ -14766,6 +15214,13 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
                     "  ✅ 今日已完成價格預抓，且近10日現股所需標的股已有目標日收盤價；"
                     "分點資料仍未出現，略過正式報表與價格重抓，快速結束。"
                 )
+                write_prescan_status(
+                    "broker_data_not_ready",
+                    target_date=target_date,
+                    reason="分點資料尚未出現；價格預抓已完成，快速結束",
+                    candidate_count=len(candidates or []),
+                    candidate_cache_saved=False,
+                )
                 elapsed = time.time() - program_start
                 print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
                 return True
@@ -14782,6 +15237,13 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
             )
         else:
             print("  ✅ 今日已完成價格預抓，且分點資料仍未出現；略過正式報表與價格重抓，快速結束。")
+            write_prescan_status(
+                "broker_data_not_ready",
+                target_date=target_date,
+                reason="分點資料尚未出現；價格預抓已完成，快速結束",
+                candidate_count=len(candidates or []),
+                candidate_cache_saved=False,
+            )
             elapsed = time.time() - program_start
             print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
             return True
@@ -14794,6 +15256,13 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
         candidate_keys=candidate_keys,
         target_date=target_date,
         reason="API4 尚未看到今日目標分點資料",
+    )
+    write_prescan_status(
+        "broker_data_not_ready",
+        target_date=target_date,
+        reason="API4 尚未看到今日目標分點資料；已完成價格預抓",
+        candidate_count=len(candidates or []),
+        candidate_cache_saved=False,
     )
     elapsed = time.time() - program_start
     print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
@@ -14909,6 +15378,7 @@ def main():
     print(f"進入條件：事件內至少 1 檔權證單日買進金額 >= {AMOUNT_THRESH // 10000}萬")
     print("分類依據：同一事件內所有權證單日買進金額合計")
     print("A：100–159萬｜B：160–249萬｜C：250–499萬｜D：500–999萬｜E：1000萬以上")
+    print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}（daily=每日自動，longterm=長期留單，repair=完整修補）")
     print(f"執行模式：RUN_MODE={RUN_MODE}（1=精選分點全市場追蹤，2=完整分點清單）")
     print(f"分點數：{len(TARGET_PATTERNS)} 個")
     print(f"追蹤分點：{', '.join(TARGET_PATTERNS.keys())}")
@@ -14931,6 +15401,29 @@ def main():
         elapsed = time.time() - program_start
         print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
         return
+
+    if workflow_is_longterm():
+        print("  ⚠️ WORKFLOW_MODE=longterm：長期留單補價格模式尚未在本檔完成，先停止以避免誤跑每日報表。")
+        elapsed = time.time() - program_start
+        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+        return
+
+    if workflow_is_daily():
+        # 若今天已有 prescan success，直接交給 prescan_all() 驗證並讀回 keys；
+        # 避免輕量探測樣本剛好今日無交易而誤判停止。
+        if find_valid_prescan_success_record() is None:
+            probe_result = light_probe_today_broker_data(warrants, broker_map)
+            if probe_result is False:
+                print("  ⚠️ 輕量探測未看到今日分點資料：不跑全市場 prescan，改為價格預抓後停止。")
+                prefetch_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
+                if prefetch_candidates:
+                    print(f"  ✅ 價格預抓範圍改用既有候選快取：{len(prefetch_candidates):,} 組")
+                else:
+                    print("  ⚠️ 沒有既有候選快取可縮小範圍，價格預抓將回退使用歷史快取全範圍。")
+                if maybe_auto_price_prefetch_before_api5(prefetch_candidates, program_start):
+                    return
+        else:
+            print("  ✅ 已找到今日 prescan success 狀態，略過輕量探測，稍後直接驗證並讀取候選快取。")
 
     candidates = prescan_all(warrants, broker_map)
 
