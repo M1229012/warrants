@@ -13224,7 +13224,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         body_parts.append("影響：" + f.get("影響"))
                 body = "；".join([x for x in body_parts if x]) or _strip_status_labels(s)
                 body = re.sub(r"(?:^|[。；;])\s*標題[:：]\s*", "", body).strip()
-                body = _compact_card_sentence(body, 116)
+                body = _compact_card_sentence(body, 150)
 
                 raw_status = f.get("結果") or f.get("狀態") or f.get("結論") or _infer_status_from_text(s, fallback="新聞事件待追蹤")
                 status = _compact_status_text(
@@ -13237,9 +13237,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 if _is_useless_news_analyst_row(label, status, body, s):
                     continue
                 tone = _extract_report_tone_from_point(s) or "neutral"
-                rows.append((label, status, body, 2, tone))
+                rows.append((label, status, body, 3, tone))
             if not rows:
-                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 2, "neutral"))
+                rows.append(("新聞面", "新聞事件待追蹤", "本週未篩選到足夠明確的公司新聞，右側暫不硬湊摘要。", 3, "neutral"))
             return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
