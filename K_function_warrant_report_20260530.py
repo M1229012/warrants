@@ -6220,15 +6220,23 @@ def _looks_like_title_copy_or_meta_noise(point: str, records: list[dict] | None 
     ]
     if any(re.search(p, s, re.I) for p in meta_patterns):
         return True
-    fields = _parse_status_fields(s) if '｜' in s or '：' in s else {}
-    body_parts = [
-        str(fields.get('結果', '') or ''),
-        str(fields.get('說明', '') or ''),
-        str(fields.get('重點', '') or ''),
-        str(fields.get('依據', '') or ''),
-        str(fields.get('觀察', '') or ''),
-    ]
-    content = _strip_news_meta_noise('。'.join([p for p in body_parts if p]) or s)
+
+    # 此函式位於模組層級，不能呼叫 plot_weekly_report() 內部才定義的
+    # _parse_status_fields()。這裡只解析新聞重點會使用的欄位，避免 NameError。
+    field_names = ['結果', '說明', '重點', '依據', '觀察', '影響']
+    body_parts = []
+    for field_name in field_names:
+        pattern = (
+            rf'(?:^|｜){field_name}[:：]'
+            rf'(.*?)(?=｜(?:結果|說明|重點|依據|觀察|影響|分類|面向)[:：]|$)'
+        )
+        match = re.search(pattern, s, flags=re.DOTALL)
+        if match:
+            value = _normalize_news_text(match.group(1)).strip()
+            if value:
+                body_parts.append(value)
+
+    content = _strip_news_meta_noise('。'.join(body_parts) or s)
     if not content:
         return True
     if records:
