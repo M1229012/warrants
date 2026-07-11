@@ -6253,7 +6253,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v25_detail_two_sentences_three_lines_clause_fallback"
+    internal_version = "validated_v26_status_strip_company_and_derive_fallback"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -9917,7 +9917,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 2-1. tone 只能是 positive、negative、neutral、mixed、watch：明確利多用 positive，明確利空用 negative，正負並存用 mixed，無明確方向用 neutral，單純後續觀察用 watch。
 2-2. 「受關注」不等於 positive；創新高必須確認是營收、獲利、毛利率、接單等正向指標，若是虧損、庫存、負債創高則為 negative。
 2-3. confidence 為 0 到 1。
-2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向，例如「6月營收年增328%創新高」「DRAM供給緊縮推升報價」；不得只寫 2～4 字的詞，如「創新高」「供給緊縮」「需求強勁」。
+2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向，例如「6月營收年增328%創新高」「DRAM供給緊縮推升報價」；不得只寫 2～4 字的詞，如「創新高」「供給緊縮」「需求強勁」。status 不要以 {display_name} 或股票代號 {stock_code} 開頭（圖卡主體已是該公司）。
 3. 每點必須附 source_id（文章編號）與 evidence（逐字抄自該文章、能直接支持這個結論的一句原文，不可改寫）。evidence 所在句或其前一句必須明確出現 {stock_code} 或 {display_name}，可接受「公司名建立主體，下一句以公司承接」的寫法；文章若只是順帶提到本公司、主體是產業或其他公司，不得使用。
 4. 若所有素材都沒有以 {display_name} 為主體的具體事件，points 回傳空陣列 []，這是正確行為，嚴禁硬湊。
 5. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
@@ -10006,7 +10006,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 修正原則：
 1. 請盡量輸出 {NEWS_SUMMARY_MAX_POINTS} 點不同事件並涵蓋公司動態、業績、產業供需或法人觀點；素材不足時才減少，完全沒有直接相關事件時才輸出空陣列。每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。
 2. 每點必須獨立完整；tone 只能是 positive、negative、neutral、mixed、watch，並依事件真正方向判斷，不得把「受關注」直接當利多。
-2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向；不得只寫「創新高」「供給緊縮」「需求強勁」等 2～4 字詞語。
+2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向；不得只寫「創新高」「供給緊縮」「需求強勁」等 2～4 字詞語。status 不要以 {display_name} 或股票代號 {stock_code} 開頭（圖卡主體已是該公司）。
 3. source_id 必須存在於 articles；evidence 必須逐字抄自該文章的一句原文，而且 evidence 所在句或其前一句必須明確出現 {stock_code} 或 {display_name}。
 4. 只有 evidence_deleted_points 中因 evidence／公司主體驗證被刪除的點，其題材才不得換句話說重現；除非提供另一句全新且通過規則的原文 evidence。
 4-1. length_only_points_to_preserve 不是事實錯誤，題材必須保留；請沿用原本 source_id、evidence、數字與事件，只補足 detail 的營運意涵或後續觀察，不得因長度問題放棄該題材。
@@ -10021,7 +10021,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v25",
+            cache_task=f"{_news_points_cache_task()}_repair_v26",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
@@ -10133,7 +10133,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 補點規則：
 1. 只輸出新增的點，不要重寫 existing_points；最多補 {remaining_slots} 點，找不到就回傳空陣列。
 2. 優先使用 used_source_ids 以外的文章，且事件不得與 existing_points 重複；可涵蓋公司動態、業績、產業供需或具體法人觀點。
-3. 每點必須包含 label、status、detail、tone、confidence、source_id、evidence。detail 需包含具體事件內容（優先保留關鍵數字）與營運意涵或後續觀察，並寫成 2 個短句，以句號分隔事件事實與營運意涵；不得少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字，若超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。
+3. 每點必須包含 label、status、detail、tone、confidence、source_id、evidence。status 必須是 8～14 字的具體結論短句，且不要以 {display_name} 或股票代號 {stock_code} 開頭。detail 需包含具體事件內容（優先保留關鍵數字）與營運意涵或後續觀察，並寫成 2 個短句，以句號分隔事件事實與營運意涵；不得少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字，若超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。
 4. evidence 必須逐字抄自 source_id 對應文章的一句原文；evidence 所在句或前一句必須出現 {stock_code} 或 {display_name}。
 5. 所有阿拉伯數字必須原樣存在於素材；不得推估、換算、引用外部資料，不得寫權證、分點、技術分析或買賣建議。
 6. 無法找到另一個直接相關且具體的事件時，points 回傳 []，寧缺勿濫。
@@ -10149,7 +10149,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             )
             supplement_text = _call_gemini_with_retry(
                 supplement_prompt,
-                cache_task=f"{_news_points_cache_task()}_supplement_v25",
+                cache_task=f"{_news_points_cache_task()}_supplement_v26",
                 stock_code=stock_code,
                 stock_name=stock_name,
                 write_cache=False,
@@ -13613,16 +13613,26 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             return fallback
 
         def _compact_status_text(status_text, max_chars=15, fallback="重點待確認", label="", body=""):
-            """產生第一行上色的具體結論短句；過短時由說明補強，過長時優先依標點完整截斷。"""
+            """產生第一行上色的具體結論短句；過短時由說明補強，過長時先去除公司名，再依標點或內文提煉完整截斷。"""
             raw = _normalize_card_text(status_text)
             raw = re.sub(r"^(結論|結果|狀態)[:：]\s*", "", raw).strip("。；;，,、 ")
+            if len(raw) > max_chars:
+                for alias in (stock_name, stock_code):
+                    alias_text = _normalize_card_text(alias).strip("。；;，,、 ")
+                    if alias_text and raw.startswith(alias_text) and len(raw) - len(alias_text) >= 6:
+                        raw = raw[len(alias_text):].lstrip("：:，, ")
+                        break
             if (not raw) or _is_generic_status_phrase(raw) or len(raw) < 6:
                 derived = _derive_headline_from_body(label, body, fallback=raw or fallback)
                 if len(derived) > len(raw):
                     raw = derived
             if len(raw) > max_chars:
                 seg = re.split(r"[，、；;]", raw)[0].strip("。；;，,、 ")
-                raw = seg if 6 <= len(seg) <= max_chars else raw[:max_chars].rstrip("。；;，,、 ")
+                if 6 <= len(seg) <= max_chars:
+                    raw = seg
+                else:
+                    derived = _derive_headline_from_body(label, body, fallback="")
+                    raw = derived if 6 <= len(derived) <= max_chars else raw[:max_chars].rstrip("。；;，,、 ")
             return raw or fallback
 
         def _infer_status_from_text(text, fallback="重點待確認"):
