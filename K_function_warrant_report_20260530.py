@@ -6253,7 +6253,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v24_detail_program_trim_sentence_safe_parallel_news"
+    internal_version = "validated_v25_detail_two_sentences_three_lines_clause_fallback"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -9922,11 +9922,11 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 4. 若所有素材都沒有以 {display_name} 為主體的具體事件，points 回傳空陣列 []，這是正確行為，嚴禁硬湊。
 5. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
 6. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。每點需獨立完整、自然收尾並以句號結束。
-7. detail 必須包含事件具體內容（優先保留素材中的關鍵數字），以及對營運的意涵或後續觀察；少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄。超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可先保留完整事實，程式端會自動裁到最後一個完整句號；不得只寫「後續持續關注」等空泛句。
+7. detail 必須包含事件具體內容（優先保留素材中的關鍵數字），以及對營運的意涵或後續觀察；請寫成 2 個短句並以句號分隔：第一句講事件與關鍵數字，第二句講營運意涵或後續觀察。少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄。超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可先保留完整事實，程式端會自動裁到最後一個完整句號；不得只寫「後續持續關注」等空泛句。
 
 好範例：
-- {{"label":"公司動態","status":"取得12億元大單、下半年出貨","detail":"公司取得新客戶大單，金額約12億元、預計下半年開始出貨；後續觀察產能配置與營收認列時程，若如期放量將挹注第4季營運動能。","tone":"positive","confidence":0.92,"source_id":"A1","evidence":"{display_name}取得金額約12億元的新客戶大單，預計下半年開始出貨"}}
-- {{"label":"業績更新","status":"營收年增但月減、動能待確認","detail":"本月營收仍較去年同期成長，但較上月回落，顯示長期需求尚有支撐、短線出貨節奏轉弱；後續觀察新產品放量與毛利率能否改善。","tone":"mixed","confidence":0.90,"source_id":"A2","evidence":"{display_name}本月營收年增但較上月減少"}}
+- {{"label":"公司動態","status":"取得12億元大單、下半年出貨","detail":"公司取得新客戶大單，金額約12億元、預計下半年開始出貨。後續觀察產能配置與營收認列時程，若如期放量將挹注第4季營運動能。","tone":"positive","confidence":0.92,"source_id":"A1","evidence":"{display_name}取得金額約12億元的新客戶大單，預計下半年開始出貨"}}
+- {{"label":"業績更新","status":"營收年增但月減、動能待確認","detail":"本月營收仍較去年同期成長，但較上月回落，顯示長期需求尚有支撐、短線出貨節奏轉弱。後續觀察新產品放量與毛利率能否改善。","tone":"mixed","confidence":0.90,"source_id":"A2","evidence":"{display_name}本月營收年增但較上月減少"}}
 
 壞範例：
 - {{"label":"業績更新","status":"創新高","detail":"6月營收年增328%並創新高。","tone":"positive","confidence":0.95,"source_id":"A2","evidence":"{display_name}6月營收年增328%並創新高"}}（錯誤：status 太短且缺少事件主體）
@@ -10012,7 +10012,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 4-1. length_only_points_to_preserve 不是事實錯誤，題材必須保留；請沿用原本 source_id、evidence、數字與事件，只補足 detail 的營運意涵或後續觀察，不得因長度問題放棄該題材。
 5. 若沒有任何以 {display_name} 為主體的具體事件，回傳 points: []，不得硬湊。
 6. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
-7. detail 必須同時包含具體事件內容（優先保留素材中的關鍵數字）與營運意涵或後續觀察；少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄，超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。若有至少 2 個合格事件，全部 points 的有效總字數應達 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字以上。
+7. detail 必須同時包含具體事件內容（優先保留素材中的關鍵數字）與營運意涵或後續觀察；請寫成 2 個短句並以句號分隔：第一句講事件與關鍵數字，第二句講營運意涵或後續觀察。少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄，超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。若有至少 2 個合格事件，全部 points 的有效總字數應達 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字以上。
 
 只回傳符合 JSON Schema 的 JSON。
 
@@ -10021,7 +10021,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v24",
+            cache_task=f"{_news_points_cache_task()}_repair_v25",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
@@ -10133,7 +10133,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 補點規則：
 1. 只輸出新增的點，不要重寫 existing_points；最多補 {remaining_slots} 點，找不到就回傳空陣列。
 2. 優先使用 used_source_ids 以外的文章，且事件不得與 existing_points 重複；可涵蓋公司動態、業績、產業供需或具體法人觀點。
-3. 每點必須包含 label、status、detail、tone、confidence、source_id、evidence。detail 需包含具體事件內容（優先保留關鍵數字）與營運意涵或後續觀察；不得少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字，若超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。
+3. 每點必須包含 label、status、detail、tone、confidence、source_id、evidence。detail 需包含具體事件內容（優先保留關鍵數字）與營運意涵或後續觀察，並寫成 2 個短句，以句號分隔事件事實與營運意涵；不得少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字，若超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。
 4. evidence 必須逐字抄自 source_id 對應文章的一句原文；evidence 所在句或前一句必須出現 {stock_code} 或 {display_name}。
 5. 所有阿拉伯數字必須原樣存在於素材；不得推估、換算、引用外部資料，不得寫權證、分點、技術分析或買賣建議。
 6. 無法找到另一個直接相關且具體的事件時，points 回傳 []，寧缺勿濫。
@@ -10149,7 +10149,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             )
             supplement_text = _call_gemini_with_retry(
                 supplement_prompt,
-                cache_task=f"{_news_points_cache_task()}_supplement_v24",
+                cache_task=f"{_news_points_cache_task()}_supplement_v25",
                 stock_code=stock_code,
                 stock_name=stock_name,
                 write_cache=False,
@@ -13345,8 +13345,20 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     visible_text.rfind("！"),
                     visible_text.rfind("？"),
                 )
+                if sentence_idx < 0:
+                    # 一整句只有句尾句號、但句號落在行數預算外時，
+                    # 改在最後一個完整子句邊界收尾，避免硬切成「第2季。」「需留。」等殘句。
+                    sentence_idx = max(
+                        visible_text.rfind("；"),
+                        visible_text.rfind(";"),
+                        visible_text.rfind("，"),
+                        visible_text.rfind(","),
+                    )
                 if sentence_idx >= 0:
+                    boundary_char = visible_text[sentence_idx]
                     visible_text = visible_text[:sentence_idx + 1].strip()
+                    if boundary_char in "；;，,":
+                        visible_text = visible_text[:-1].rstrip() + "。"
                     rebuilt = []
                     current = ""
                     for ch in visible_text:
@@ -13844,9 +13856,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 if _is_useless_news_analyst_row(label, status, body, s):
                     continue
                 tone = _extract_report_tone_from_point(s) or "neutral"
-                rows.append((label, status, body, 2, tone))
+                rows.append((label, status, body, 3, tone))
             if not rows:
-                rows.append(("新聞面", f"本週無與{stock_name}直接相關之重大新聞", "經公司主體與原文證據驗證後，本週未篩選到可直接支持的重大事件。", 2, "neutral"))
+                rows.append(("新聞面", f"本週無與{stock_name}直接相關之重大新聞", "經公司主體與原文證據驗證後，本週未篩選到可直接支持的重大事件。", 3, "neutral"))
             return rows[:NEWS_DISPLAY_MAX_POINTS]
 
         def _measure_text_width_axes(ax, fig, text, fontsize=33, fontweight="normal") -> float:
