@@ -3388,14 +3388,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         scope_text = str(large_event_rows[0].get("selected_scope") or large_event_rows[0].get("scope") or "").strip()
         scope_prefix = "全分點" if scope_text == DATA_SCOPE_ALL else "五分點" if scope_text == DATA_SCOPE_SELECTED5 else ""
 
-        if large_codes == {"E"}:
-            large_title = f"{date_label} {scope_prefix}每日 E 超大額布局補充".replace("  ", " ")
-        elif large_codes == {"D"}:
-            large_title = f"{date_label} {scope_prefix}每日 D 大額布局補充".replace("  ", " ")
-        elif large_codes == {"C"}:
-            large_title = f"{date_label} {scope_prefix}每日 C 強勢買超補充".replace("  ", " ")
-        else:
-            large_title = f"{date_label} {scope_prefix}每日 C / D / E 補充事件（E優先，D次之，C補足）".replace("  ", " ")
+        large_title = f"{date_label} {scope_prefix}大額資金布局".replace("  ", " ")
 
         large_headers = ["排名", "分點", "事件", "標的", "內容", "累積買進"]
         large_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
@@ -3748,7 +3741,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.70, 2.15, 1.45, 0.65, 1.75, 5.50]
+    col_w = [0.70, 2.15, 1.45, 0.65, 0.85, 6.40]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -3775,7 +3768,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fit(r["target"], 14),
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
-                format_event_names(r["events"]),
+                r["events"],
                 None,
             ]
 
