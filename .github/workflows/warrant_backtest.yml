@@ -10,19 +10,17 @@ on:
         type: choice
         options:
           - "每日自動流程"
-          - "全分點每日流程"
           - "精選五分點新分類"
           - "長期留單補價格"
           - "完整修補模式"
 
   schedule:
-    # Asia/Taipei 17:10 = UTC 09:10
-    # 太早跑時，daily 會先輕量探測；如果分點資料還沒出來，只補價格後停止。
+    # Asia/Taipei 17:10
     - cron: "10 9 * * 1-5"
 
-    # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
-    # 分點資料出來後，daily 會正式產報表；同日已成功 prescan 則吃快取。
+    # Asia/Taipei 21:05、21:35
     - cron: "5,35 13 * * 1-5"
+
 
 jobs:
   run-backtest:
@@ -30,154 +28,106 @@ jobs:
     timeout-minutes: 360
 
     env:
+      # ============================================================
+      # 路徑
+      # ============================================================
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
-
-      # ============================================================
-      # 新版統一模式
-      # daily    ：每日自動流程與全分點每日流程都使用 daily，
-      #            固定抓一次全分點，再由主程式從全分點資料切出精選五分點結果。
-      # 精選五分點新分類：仍使用 daily 主流程，但固定 RUN_MODE=1，
-      #                   關閉輕量探測與「資料未出來就只補價格後停止」邏輯，
-      #                   直接使用既有快取重建精選五分點 A/B/C/D/E 新分類。
-      # longterm ：長期留單補價格
-      # repair   ：完整修補模式，懷疑漏抓或快取異常時手動使用
-      # ============================================================
-      WORKFLOW_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '長期留單補價格' && 'longterm' || github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'repair' || 'daily' }}
-
-      # 保留相容舊 RUN_PLAN
-      RUN_PLAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'full_report' || github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '長期留單補價格' && 'longterm' || 'daily_signal' }}
-
-      # 基本快取設定
-      USE_CACHE: "1"
-      FORCE_FULL_CACHE_REFRESH: "0"
 
       OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
       OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
 
       # ============================================================
-      # 分點模式
-      # 每日自動流程        ：全分點抓一次，RUN_MODE=2，
-      #                       主程式會再從全分點資料切出精選五分點結果。
-      # 全分點每日流程      ：全分點抓一次，RUN_MODE=2，
-      #                       功能與排程 daily 相同，供手動執行使用。
-      # 精選五分點新分類    ：只重建精選 5 分點，RUN_MODE=1。
-      # longterm            ：固定看全分點歷史，RUN_MODE=2。
-      # repair              ：完整修補，全分點，RUN_MODE=2。
-      # 排程執行            ：固定 RUN_MODE=2。
+      # 基本快取
       # ============================================================
-      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '精選五分點新分類' && '1' || '2' }}
+      USE_CACHE: "1"
+      FORCE_FULL_CACHE_REFRESH: "0"
 
-      # 明確固定精選五分點，避免未來程式預設清單改動時影響本工作流。
+      HISTORY_CACHE_APPEND_ONLY: "1"
+      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+
+      # ============================================================
+      # 精選五分點
+      # ============================================================
       SELECTED_TARGET_LABELS: "華南永昌台中,元大南屯,富邦敦南,永豐金內湖,新光"
 
-      # OpenAPI 今日有成交權證預篩天數
-      # daily 用 1 天；repair 用 3 天提高完整性。
-      OPENAPI_ACTIVE_PRESCAN_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '3' || '1' }}
-
-      # 每次都重新抓 OpenAPI 活動權證清單，避免錯過今天新權證。
-      # 手動「精選五分點新分類」是用既有快取重建分類，不強制刷新清單；
-      # 若本機快取不存在，主程式仍會自行下載所需清單。
-      ACTIVE_WARRANT_FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '精選五分點新分類' && '0' || '1' }}
+      SELECTED_FORCE_ALL_WARRANTS: "0"
+      SELECTED_REFRESH_ALL_WARRANTS: "0"
 
       # ============================================================
-      # daily 輕量探測
-      # 一般 daily：先用最近 3~5 個交易日有活動的權證，探測今天分點資料是否已出來。
-      # 精選五分點新分類：關閉探測，直接進入候選／快取重建流程，
-      #                    避免因探測不到「今天」資料而只補價格後提前停止。
+      # 預掃描與每日更新
       # ============================================================
-      DAILY_LIGHT_PROBE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '精選五分點新分類' && '0' || '1' }}
+      CACHE_RECENT_SCAN_DAYS: "50"
+      SELECTED_FULL_SCAN_DAYS: "50"
+      FAST_SKIP_RECENT_PRESCAN: "0"
+
       DAILY_LIGHT_PROBE_SAMPLE_SIZE: "300"
       DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS: "5"
       DAILY_LIGHT_PROBE_SCAN_DAYS: "2"
       DAILY_LIGHT_PROBE_WORKERS: "80"
 
-      # ============================================================
-      # prescan 掃描天數
-      # 這裡不要改小。
-      # 50 天是為了避免漏抓較早出現過、但近期才進入條件的新候選。
-      # daily 第二次會靠 prescan_status 跳過，不是靠縮短天數加速。
-      # ============================================================
-      FAST_SKIP_RECENT_PRESCAN: "0"
-      CACHE_RECENT_SCAN_DAYS: "50"
-      SELECTED_FULL_SCAN_DAYS: "50"
-
-      # 每日訊號 API5 抓取天數
       DAILY_SIGNAL_API5_DAYS: "12"
 
-      # repair 模式抓完整歷史；daily 與精選五分點新分類保持較輕量。
-      INITIAL_HISTORY_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '750' || '250' }}
-      DAILY_UPDATE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '5' || '3' }}
-
-      # 歷史快取 append / merge 保護，一定要保留，避免 Google Sheet 舊資料被洗掉。
-      HISTORY_CACHE_APPEND_ONLY: "1"
-      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
-
-      # 價格設定
+      # ============================================================
+      # 價格
+      # ============================================================
       SKIP_PRICE_FETCH: "0"
-      PRICE_FETCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && 'full' || 'today' }}
 
-      # 價格預抓狀態
-      # 一般 daily 保留盤後重試邏輯。
-      # 精選五分點新分類關閉「資料未出來就改成只補價格並停止」，
-      # 讓程式可以直接使用既有快取完成 A/B/C/D/E 重建與 Google Sheet upsert。
       PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE: "1"
       PRICE_PREFETCH_FORCE: "0"
       PRICE_PREFETCH_ALL_ITEM_PRICES: "0"
-      AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '精選五分點新分類' && '0' || '1' }}
 
-      # 主程式仍保留完整歷史主表邏輯；daily 與精選五分點新分類只輸出今日產圖需要資料。
-      REPORT_FULL_HISTORY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '1' || '0' }}
-      TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
-      DATA_UPDATE_ONLY: "0"
-
-      # 已停用的舊版暴力候選池
-      SELECTED_FORCE_ALL_WARRANTS: "0"
-      SELECTED_REFRESH_ALL_WARRANTS: "0"
-
-      # 不抓群組事件每一檔權證價格，只看標的股價格。
       FETCH_GROUP_WARRANT_PRICES: "0"
 
       # ============================================================
-      # MoneyDJ Search Repair
-      # daily／全分點每日流程／精選五分點新分類：不啟用
-      # repair：啟用，完整補漏
+      # 報表
       # ============================================================
-      MONEYDJ_SEARCH_REPAIR_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '1' || '0' }}
+      TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
+      DATA_UPDATE_ONLY: "0"
+
+      # ============================================================
+      # MoneyDJ Repair 固定設定
+      # 是否啟用會由執行方案決定
+      # ============================================================
       MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS: "45"
       MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION: "1"
       MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL: "1"
       MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS: "0"
+
       MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED: "1"
       MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH: "1"
+
       MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH: "0"
       MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH: "0"
 
-      # Google Sheet 設定
+      # ============================================================
+      # Google Sheet
+      # ============================================================
       GSHEET_ENABLE: "1"
       GSHEET_UPLOAD_RESULTS: "1"
+
       GSHEET_NAME: "權證分點資料_NEW"
       GOOGLE_SHEET_NAME: "權證分點資料_NEW"
+
       GSHEET_CACHE_ENABLED: "1"
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
 
+      GSHEET_WRITE_SLEEP_SECONDS: "1.25"
+
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
 
-      # Supabase 設定
-      # 目前 prescan_status / prescan_refresh_keys 走 Google Sheet 快取同步即可。
+      # ============================================================
+      # Supabase
+      # ============================================================
       SUPABASE_CACHE_ENABLED: "0"
 
-      # 執行緒設定
-      # daily、全分點每日流程與精選五分點新分類可先用 80；repair 保守用 60。
-      MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
+      # ============================================================
+      # 執行緒
+      # ============================================================
       PRICE_WORKERS: "60"
-      PRESCAN_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
       FIND_BROKER_WORKERS: "40"
 
-      # Google Sheet 寫入節流
-      # 先維持穩定值，確認新版流程穩定後再考慮降到 1.0 或 0.8。
-      GSHEET_WRITE_SLEEP_SECONDS: "1.25"
 
     steps:
       - name: Checkout repository
@@ -196,6 +146,125 @@ jobs:
           key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             warrant-cache-${{ runner.os }}-
+
+      - name: Resolve run settings
+        shell: bash
+        run: |
+          PLAN="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan || '每日自動流程' }}"
+
+          # ----------------------------------------------------------
+          # 預設值：每日自動流程
+          # 排程執行也會使用這組設定
+          # ----------------------------------------------------------
+          WORKFLOW_MODE="daily"
+          RUN_PLAN="daily_signal"
+          RUN_MODE="2"
+
+          OPENAPI_ACTIVE_PRESCAN_DAYS="1"
+          ACTIVE_WARRANT_FORCE_REFRESH="1"
+
+          DAILY_LIGHT_PROBE_ENABLED="1"
+
+          INITIAL_HISTORY_DAYS="250"
+          DAILY_UPDATE_DAYS="3"
+
+          PRICE_FETCH_SCOPE="today"
+          AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="1"
+
+          REPORT_FULL_HISTORY="0"
+
+          MONEYDJ_SEARCH_REPAIR_ENABLED="0"
+
+          MAX_WORKERS="80"
+          PRESCAN_WORKERS="80"
+
+          # ----------------------------------------------------------
+          # 各執行方案差異
+          # ----------------------------------------------------------
+          case "$PLAN" in
+            "每日自動流程")
+              ;;
+
+            "精選五分點新分類")
+              RUN_MODE="1"
+
+              ACTIVE_WARRANT_FORCE_REFRESH="0"
+              DAILY_LIGHT_PROBE_ENABLED="0"
+
+              AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="0"
+              ;;
+
+            "長期留單補價格")
+              WORKFLOW_MODE="longterm"
+              RUN_PLAN="longterm"
+              RUN_MODE="2"
+              ;;
+
+            "完整修補模式")
+              WORKFLOW_MODE="repair"
+              RUN_PLAN="full_report"
+              RUN_MODE="2"
+
+              OPENAPI_ACTIVE_PRESCAN_DAYS="3"
+              ACTIVE_WARRANT_FORCE_REFRESH="1"
+
+              DAILY_LIGHT_PROBE_ENABLED="1"
+
+              INITIAL_HISTORY_DAYS="750"
+              DAILY_UPDATE_DAYS="5"
+
+              PRICE_FETCH_SCOPE="full"
+              AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="1"
+
+              REPORT_FULL_HISTORY="1"
+
+              MONEYDJ_SEARCH_REPAIR_ENABLED="1"
+
+              MAX_WORKERS="60"
+              PRESCAN_WORKERS="60"
+              ;;
+
+            *)
+              echo "不支援的執行方案：$PLAN"
+              exit 1
+              ;;
+          esac
+
+          # ----------------------------------------------------------
+          # 寫入後續步驟使用的環境變數
+          # ----------------------------------------------------------
+          {
+            echo "WORKFLOW_MODE=$WORKFLOW_MODE"
+            echo "RUN_PLAN=$RUN_PLAN"
+            echo "RUN_MODE=$RUN_MODE"
+
+            echo "OPENAPI_ACTIVE_PRESCAN_DAYS=$OPENAPI_ACTIVE_PRESCAN_DAYS"
+            echo "ACTIVE_WARRANT_FORCE_REFRESH=$ACTIVE_WARRANT_FORCE_REFRESH"
+
+            echo "DAILY_LIGHT_PROBE_ENABLED=$DAILY_LIGHT_PROBE_ENABLED"
+
+            echo "INITIAL_HISTORY_DAYS=$INITIAL_HISTORY_DAYS"
+            echo "DAILY_UPDATE_DAYS=$DAILY_UPDATE_DAYS"
+
+            echo "PRICE_FETCH_SCOPE=$PRICE_FETCH_SCOPE"
+            echo "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING=$AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING"
+
+            echo "REPORT_FULL_HISTORY=$REPORT_FULL_HISTORY"
+
+            echo "MONEYDJ_SEARCH_REPAIR_ENABLED=$MONEYDJ_SEARCH_REPAIR_ENABLED"
+
+            echo "MAX_WORKERS=$MAX_WORKERS"
+            echo "PRESCAN_WORKERS=$PRESCAN_WORKERS"
+          } >> "$GITHUB_ENV"
+
+          echo "=========================================="
+          echo "執行方案：$PLAN"
+          echo "WORKFLOW_MODE：$WORKFLOW_MODE"
+          echo "RUN_MODE：$RUN_MODE"
+          echo "PRICE_FETCH_SCOPE：$PRICE_FETCH_SCOPE"
+          echo "REPORT_FULL_HISTORY：$REPORT_FULL_HISTORY"
+          echo "MONEYDJ_SEARCH_REPAIR_ENABLED：$MONEYDJ_SEARCH_REPAIR_ENABLED"
+          echo "=========================================="
 
       - name: Install dependencies
         run: |
