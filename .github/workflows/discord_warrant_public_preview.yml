@@ -11,6 +11,24 @@ on:
         required: false
         default: ""
 
+      run_plan:
+        description: "執行方案"
+        required: true
+        default: "精選五分點每日圖"
+        type: choice
+        options:
+          - "精選五分點每日圖"
+          - "近一個月共識淨買超TOP15"
+          - "本週權證共識買賣超TOP15"
+          - "近10日分點買賣明細圖"
+          - "所有分點勝率統計圖"
+          - "全部圖片"
+
+      broker_name:
+        description: "指定分點名稱，例如 元大南屯。只有執行近10日分點買賣明細圖時使用"
+        required: false
+        default: ""
+
   schedule:
     # 台灣時間週一～週五 17:45
     # UTC = 台灣時間 - 8 小時
@@ -51,7 +69,7 @@ jobs:
 
       OUTPUT_IMAGE: "output/精選分點買賣超追蹤_公開預覽版.png"
 
-      # 公開預覽排程固定只產生每日圖。
+      # 排程自動執行時，仍固定只跑每日圖。
       RUN_PLAN: "精選五分點每日圖"
 
       DEBUG_BROKER_10D_DETAIL: "0"
@@ -83,11 +101,22 @@ jobs:
 
       - name: Run public preview report
         run: |
+          ACTION_VALUE="${RUN_PLAN}"
           TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
-          CMD=(python "public_preview_masked.py" --action "${RUN_PLAN}")
+          BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
+
+          if [ -n "${{ github.event.inputs.run_plan }}" ]; then
+            ACTION_VALUE="${{ github.event.inputs.run_plan }}"
+          fi
+
+          CMD=(python "public_preview_masked.py" --action "${ACTION_VALUE}")
 
           if [ -n "${TARGET_DATE_VALUE}" ]; then
             CMD+=(--date "${TARGET_DATE_VALUE}")
+          fi
+
+          if [ -n "${BROKER_NAME_VALUE}" ]; then
+            CMD+=(--broker "${BROKER_NAME_VALUE}")
           fi
 
           "${CMD[@]}"
