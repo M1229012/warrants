@@ -22,15 +22,39 @@ jobs:
     timeout-minutes: 30
 
     env:
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
-      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      # 公開預覽版必須與正式版讀取相同的 Google Sheet，
+      # 才能確保顯示內容完全一致，差別只有馬賽克。
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW"
+
+      # 若沒有設定 GOOGLE_SHEET_ID_NEW，程式會自動改用 GOOGLE_SHEET_NAME 開啟。
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_NEW }}
+
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
+      # 與正式版使用完全相同的門檻及統計範圍。
       BUY_THRESHOLD: "1000000"
-      SELL_THRESHOLD_RATIO: "0.2"
+      SELL_THRESHOLD_RATIO: "0.5"
+      DISPLAY_EXIT_ALWAYS: "0"
       LOOKBACK_TRADING_DAYS: "22"
+      ADD_COUNT_LOOKBACK_TRADING_DAYS: "50"
+
+      # 每日五分點買賣超只顯示符合新制 A/B/C/D/E 的事件。
+      DAILY_REQUIRE_AMOUNT_CLASSIFIED: "1"
+
+      # 五分點主圖買超不足 7 筆時，由全分點依 E → D → C 補足。
+      # 與正式版設定完全一致，確保公開版只多馬賽克、不改資料內容。
+      DAILY_LARGE_EVENT_ENABLED: "1"
+      DAILY_LARGE_EVENT_TARGET_TOTAL_ROWS: "7"
+      DAILY_LARGE_EVENT_MIN_TOTAL_ROWS: "5"
+      DAILY_LARGE_EVENT_MAX_TOTAL_ROWS: "10"
 
       OUTPUT_IMAGE: "output/精選分點買賣超追蹤_公開預覽版.png"
+
+      # 公開預覽排程固定只產生每日圖。
+      RUN_PLAN: "精選五分點每日圖"
+
+      DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
       - name: Checkout repository
@@ -38,15 +62,15 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install system fonts
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk fonts-noto-color-emoji
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install Python dependencies
         run: |
@@ -58,14 +82,15 @@ jobs:
           mkdir -p output
 
       - name: Run public preview report
-        env:
-          TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: |
-          if [ -n "$TARGET_DATE" ]; then
-            python public_preview_masked.py --date "$TARGET_DATE"
-          else
-            python public_preview_masked.py
+          TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
+          CMD=(python "public_preview_masked.py" --action "${RUN_PLAN}")
+
+          if [ -n "${TARGET_DATE_VALUE}" ]; then
+            CMD+=(--date "${TARGET_DATE_VALUE}")
           fi
+
+          "${CMD[@]}"
 
       - name: Upload generated images as artifact
         uses: actions/upload-artifact@v4
@@ -73,3 +98,4 @@ jobs:
         with:
           name: warrant-public-preview-images
           path: output/*.png
+          if-no-files-found: ignore
