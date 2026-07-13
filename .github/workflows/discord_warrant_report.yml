@@ -61,6 +61,16 @@ jobs:
       SELL_THRESHOLD_RATIO: "0.5"
       DISPLAY_EXIT_ALWAYS: "0"
 
+      # 每日五分點買賣超只顯示符合新制 A/B/C/D/E 的事件。
+      DAILY_REQUIRE_AMOUNT_CLASSIFIED: "1"
+
+      # 五分點主圖買超不足 7 筆時，由全分點依 E → D → C 補足。
+      # 整體買超內容理想為 7 筆，最低期待 5 筆，最高上限 10 筆。
+      DAILY_LARGE_EVENT_ENABLED: "1"
+      DAILY_LARGE_EVENT_TARGET_TOTAL_ROWS: "7"
+      DAILY_LARGE_EVENT_MIN_TOTAL_ROWS: "5"
+      DAILY_LARGE_EVENT_MAX_TOTAL_ROWS: "10"
+
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
 
       # 排程自動執行時，仍只執行原本的每日圖流程。
