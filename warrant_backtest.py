@@ -119,7 +119,7 @@ PRESCAN_STATUS_PATH = os.path.join(CACHE_DIR, "prescan_status.csv")
 PRESCAN_REFRESH_KEYS_PATH = os.path.join(CACHE_DIR, "prescan_refresh_keys.csv")
 
 # 自動價格預抓：
-# 若當日分點資料尚未出現在 API4 預掃描結果中，正式報表流程會先停止，
+# 若 API4 尚未確認當日市場資料已更新，正式報表流程會先停止，
 # 改成只用既有快取資料把所有可能需要的價格先補進 price_cache。
 # 同一天已經預抓過且分點資料仍未出來時，下一次執行會快速結束，不再重複抓價格。
 AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING = os.getenv("AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING", "1").strip().lower() not in ("0", "false", "no")
@@ -129,7 +129,7 @@ PRICE_PREFETCH_FORCE = os.getenv("PRICE_PREFETCH_FORCE", "0").strip().lower() in
 PRICE_PREFETCH_LOOKBACK_DAYS = int(os.getenv("PRICE_PREFETCH_LOOKBACK_DAYS", "30"))
 PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
 # 價格預抓防呆：
-# 盤後價格可能比分點 API4 更早更新；若今天分點資料尚未出現，但今天價格也尚未寫進快取，
+# 盤後價格可能比 API4 市場資料更早更新；若今天市場資料尚未確認，但今天價格也尚未寫進快取，
 # 即使 price_prefetch_state 已記錄 done，也會再嘗試預抓，避免早盤/盤中先跑過後，盤後價格不再更新。
 PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE = os.getenv("PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE", "1").strip().lower() not in ("0", "false", "no")
 PRICE_PREFETCH_MIN_TARGET_PRICE_CODES = int(os.getenv("PRICE_PREFETCH_MIN_TARGET_PRICE_CODES", "1"))
@@ -167,7 +167,7 @@ if WORKFLOW_MODE not in ("daily", "longterm", "repair"):
     print(f"  ⚠️ WORKFLOW_MODE={WORKFLOW_MODE} 不支援，改用 daily。")
     WORKFLOW_MODE = "daily"
 
-# daily 輕量探測：先用近期有活動的權證少量查 API4，避免分點資料尚未更新時白跑全市場 prescan。
+# daily 輕量探測：先用近期有活動的權證少量查 API4；陰性結果仍須正式 prescan，避免把合法零交易誤判為未更新。
 DAILY_LIGHT_PROBE_ENABLED = os.getenv("DAILY_LIGHT_PROBE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 DAILY_LIGHT_PROBE_SAMPLE_SIZE = int(os.getenv("DAILY_LIGHT_PROBE_SAMPLE_SIZE", "300"))
 DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS = int(os.getenv("DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS", "5"))
@@ -243,7 +243,7 @@ BROKER_10D_PRICE_STALE_DAYS = int(os.getenv("BROKER_10D_PRICE_STALE_DAYS", "10")
 # 這裡抓較短區間即可涵蓋 10 日漲跌幅起訖價，避免只更新權證價卻讓現股10日停在前一交易日。
 BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS = int(os.getenv("BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS", "35"))
 # 價格預抓完整模式：
-# 當分點資料尚未更新到今天時，預抓模式不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
+# 當 API4 市場資料尚未確認更新到今天時，預抓模式不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
 # 也會把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
 # 這樣盤後重跑時，所有可能被後續報表 / 圖卡用到的價格都會先準備好。
 PRICE_PREFETCH_ALL_ITEM_PRICES = os.getenv("PRICE_PREFETCH_ALL_ITEM_PRICES", "1").strip().lower() not in ("0", "false", "no")
@@ -307,9 +307,12 @@ PRESCAN_REFRESH_KEYS = set()
 # 這個集合是「本次 API4 直接候選 + 活動標的擴展候選」。
 # 若某候選沒有歷史快取，只有在這個集合內才補抓；避免舊候選快取裡的全市場空候選全部打 API5。
 PRESCAN_MISSING_FETCH_KEYS = set()
-# API4 預掃描觀察到的目標分點最新活動日期。
-# 這用來判斷「今天分點資料是否已經出來」。若尚未出來，主流程會自動改成價格預抓模式。
+# API4 預掃描狀態拆成兩件事：
+# 1. PRESCAN_MARKET_TODAY_DATA_FOUND：API4 是否已有任一有效資料列更新到今天。
+# 2. PRESCAN_TODAY_ACTIVITY_FOUND：今天是否真的有命中目前追蹤的目標分點。
+# 兩者不可混用；合法零候選必須以「市場資料已更新」判斷，不能要求目標分點一定有交易。
 PRESCAN_LATEST_ACTIVITY_DATE = None
+PRESCAN_MARKET_TODAY_DATA_FOUND = False
 PRESCAN_TODAY_ACTIVITY_FOUND = False
 PRESCAN_STATUS_LAST_RECORD = {}
 
@@ -401,6 +404,17 @@ CURRENT_LIVE_WARRANT_CODES = set()
 LIVE_WARRANT_SNAPSHOT_READY = False
 LIVE_WARRANT_MARKET_SUCCESS_COUNT = 0
 LIVE_WARRANT_MARKET_EXPECTED_COUNT = 2
+
+# API4 / API5 請求完整性追蹤：只用來判斷「空結果是否能安全同步」。
+# 不改變候選篩選、API5 動態 limit 或歷史合併邏輯。
+API4_REQUEST_STATUS_LOCK = threading.Lock()
+API4_REQUEST_SUCCESS_CODES = set()
+API4_REQUEST_FAILED_CODES = set()
+API4_REQUESTS_COMPLETE = False
+
+API5_REQUEST_STATUS_LOCK = threading.Lock()
+API5_REQUEST_SUCCESS_KEYS = set()
+API5_REQUEST_FAILED_KEYS = set()
 
 
 def parse_selected_target_labels():
@@ -650,27 +664,159 @@ def match_target(name):
     return ""
 
 
+def _api4_request_status_code(code):
+    return str(code or "").strip()
+
+
+def reset_api4_request_status():
+    global API4_REQUESTS_COMPLETE
+
+    with API4_REQUEST_STATUS_LOCK:
+        API4_REQUEST_SUCCESS_CODES.clear()
+        API4_REQUEST_FAILED_CODES.clear()
+        API4_REQUESTS_COMPLETE = False
+
+
 def api4_get(code, start, end):
+    request_code = _api4_request_status_code(code)
+
     try:
         session = get_thread_session()
-        r = session.get(API4.format(code=code, start=start, end=end), headers=HDR, timeout=(5, 12))
+        r = session.get(
+            API4.format(code=code, start=start, end=end),
+            headers=HDR,
+            timeout=(5, 12),
+        )
+        r.raise_for_status()
+
         data = json.loads(r.content.decode("utf-8"))
+        if not isinstance(data, (list, dict)):
+            raise ValueError("API4 回傳格式異常")
+
         rows = []
-        for item in (data if isinstance(data, list) else [data]):
-            rows.extend(item.get("ResultSet", {}).get("Result", []))
+        items = data if isinstance(data, list) else [data]
+
+        # HTTP 200 + 合法 JSON 空列表代表「請求成功但沒有資料」，不是請求失敗。
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("API4 回傳項目不是物件")
+
+            result_set = item.get("ResultSet")
+            if not isinstance(result_set, dict) or "Result" not in result_set:
+                raise ValueError("API4 缺少 ResultSet.Result")
+
+            result_rows = result_set.get("Result")
+            if not isinstance(result_rows, list):
+                raise ValueError("API4 Result 不是列表")
+
+            rows.extend(result_rows)
+
+        with API4_REQUEST_STATUS_LOCK:
+            API4_REQUEST_SUCCESS_CODES.add(request_code)
+            API4_REQUEST_FAILED_CODES.discard(request_code)
+
         return rows
-    except Exception:
+
+    except Exception as exc:
+        with API4_REQUEST_STATUS_LOCK:
+            API4_REQUEST_FAILED_CODES.add(request_code)
+            API4_REQUEST_SUCCESS_CODES.discard(request_code)
+
+        print(
+            f"  ⚠️ API4 回應失敗：權證={code}｜"
+            f"{type(exc).__name__}: {exc}"
+        )
         return []
 
 
-def api5_get(warrant, broker):
+def api4_request_status_summary(expected_codes=None):
+    expected = {
+        _api4_request_status_code(code)
+        for code in (expected_codes or [])
+        if _api4_request_status_code(code)
+    }
+
+    with API4_REQUEST_STATUS_LOCK:
+        success_codes = set(API4_REQUEST_SUCCESS_CODES)
+        failed_codes = set(API4_REQUEST_FAILED_CODES)
+
+    if expected:
+        success_expected = expected & success_codes
+        failed_expected = expected & failed_codes
+        missing_codes = expected - success_codes - failed_codes
+        complete = not failed_expected and not missing_codes and success_expected == expected
+    else:
+        success_expected = success_codes
+        failed_expected = failed_codes
+        missing_codes = set()
+        complete = bool(success_codes) and not failed_codes
+
+    return {
+        "expected_codes": expected,
+        "success_codes": success_expected,
+        "failed_codes": failed_expected,
+        "missing_codes": missing_codes,
+        "complete": bool(complete),
+    }
+
+
+def _api5_request_status_key(warrant, broker):
+    return (str(warrant or "").strip(), str(broker or "").strip())
+
+
+def reset_api5_request_status():
+    with API5_REQUEST_STATUS_LOCK:
+        API5_REQUEST_SUCCESS_KEYS.clear()
+        API5_REQUEST_FAILED_KEYS.clear()
+
+
+def api5_get(warrant, broker, limit=None):
+    request_key = _api5_request_status_key(warrant, broker)
+
     try:
+        limit = int(limit or API5_HISTORY_LIMIT)
+        limit = min(max(limit, 1), API5_HISTORY_LIMIT)
+
         session = get_thread_session()
-        r = session.get(API5.format(warrant=warrant, broker=broker, limit=API5_HISTORY_LIMIT), headers=HDR, timeout=(5, 12))
+        r = session.get(
+            API5.format(warrant=warrant, broker=broker, limit=limit),
+            headers=HDR,
+            timeout=(5, 12),
+        )
+        r.raise_for_status()
+
         data = json.loads(r.content.decode("utf-8"))
-        rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
-        return rs.get("Result", [])
-    except Exception:
+
+        if isinstance(data, list):
+            if not data or not isinstance(data[0], dict):
+                raise ValueError("API5 回傳格式異常")
+            rs = data[0].get("ResultSet")
+        elif isinstance(data, dict):
+            rs = data.get("ResultSet")
+        else:
+            raise ValueError("API5 回傳格式異常")
+
+        if not isinstance(rs, dict) or "Result" not in rs:
+            raise ValueError("API5 缺少 ResultSet.Result")
+
+        rows = rs.get("Result")
+        if not isinstance(rows, list):
+            raise ValueError("API5 Result 不是列表")
+
+        with API5_REQUEST_STATUS_LOCK:
+            API5_REQUEST_SUCCESS_KEYS.add(request_key)
+            API5_REQUEST_FAILED_KEYS.discard(request_key)
+
+        return rows
+
+    except Exception as exc:
+        with API5_REQUEST_STATUS_LOCK:
+            API5_REQUEST_FAILED_KEYS.add(request_key)
+            API5_REQUEST_SUCCESS_KEYS.discard(request_key)
+        print(
+            f"  ⚠️ API5 回應失敗：權證={warrant}｜券商={broker}｜"
+            f"{type(exc).__name__}: {exc}"
+        )
         return []
 
 
@@ -726,6 +872,238 @@ def normalize_price_code(code):
     return s
 
 
+
+
+
+_MARKET_CLOSE_PRICE_CACHE = {}
+_MARKET_CLOSE_PRICE_LOCK = threading.Lock()
+
+
+def _normalize_market_table_header(value):
+    return re.sub(r"[\s　＊*()（）]", "", str(value or "").strip())
+
+
+def _extract_market_close_prices_from_payload(payload):
+    """從 TWSE / TPEx JSON 的各種表格格式抽出「代號 -> 收盤價」。"""
+    out = {}
+    visited = set()
+
+    def parse_table(fields, rows):
+        if not isinstance(fields, list) or not isinstance(rows, list):
+            return
+
+        normalized_fields = [_normalize_market_table_header(x) for x in fields]
+        code_idx = None
+        close_idx = None
+
+        for idx, name in enumerate(normalized_fields):
+            if code_idx is None and name in {"證券代號", "代號", "股票代號", "證券代碼", "股票代碼"}:
+                code_idx = idx
+            if close_idx is None and name in {"收盤價", "收市價", "收盤", "最後成交價"}:
+                close_idx = idx
+
+        if code_idx is None or close_idx is None:
+            return
+
+        for row in rows:
+            if isinstance(row, dict):
+                code_value = ""
+                close_value = ""
+                for key, value in row.items():
+                    normalized_key = _normalize_market_table_header(key)
+                    if normalized_key == normalized_fields[code_idx]:
+                        code_value = value
+                    elif normalized_key == normalized_fields[close_idx]:
+                        close_value = value
+            elif isinstance(row, (list, tuple)):
+                if code_idx >= len(row) or close_idx >= len(row):
+                    continue
+                code_value = row[code_idx]
+                close_value = row[close_idx]
+            else:
+                continue
+
+            code = normalize_price_code(code_value)
+            price = safe_price_float(close_value)
+            if code and price is not None:
+                out[code] = price
+
+    def walk(node):
+        node_id = id(node)
+        if node_id in visited:
+            return
+        visited.add(node_id)
+
+        if isinstance(node, dict):
+            fields = node.get("fields")
+            rows = node.get("data")
+            if isinstance(fields, list) and isinstance(rows, list):
+                parse_table(fields, rows)
+
+            # 相容 TWSE 舊版 fields9 / data9 等欄位。
+            for key, value in list(node.items()):
+                match = re.fullmatch(r"fields(\d*)", str(key), flags=re.IGNORECASE)
+                if not match or not isinstance(value, list):
+                    continue
+                suffix = match.group(1)
+                data_key_candidates = [f"data{suffix}", f"Data{suffix}"]
+                for data_key in data_key_candidates:
+                    if isinstance(node.get(data_key), list):
+                        parse_table(value, node.get(data_key))
+                        break
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+    walk(payload)
+    return out
+
+
+def fetch_market_close_prices_for_date(target_date):
+    """
+    一次抓指定日期的上市與上櫃全市場收盤價。
+
+    同一個程式執行期間，同一天只會真正呼叫一次 TWSE 與一次 TPEx；
+    後續三個價格預抓流程會共用記憶體快取。
+    """
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return {}
+
+    target_key = target_dt.strftime("%Y/%m/%d")
+
+    with _MARKET_CLOSE_PRICE_LOCK:
+        if target_key in _MARKET_CLOSE_PRICE_CACHE:
+            return dict(_MARKET_CLOSE_PRICE_CACHE[target_key])
+
+        session = get_thread_session()
+        all_prices = {}
+        market_results = []
+        successful_market_count = 0
+
+        endpoints = [
+            (
+                "TWSE",
+                "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                {
+                    "response": "json",
+                    "date": target_dt.strftime("%Y%m%d"),
+                    "type": "ALLBUT0999",
+                },
+            ),
+            (
+                "TPEx",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+                {
+                    "date": target_dt.strftime("%Y/%m/%d"),
+                    "response": "json",
+                },
+            ),
+        ]
+
+        for market_name, url, params in endpoints:
+            try:
+                response = session.get(
+                    url,
+                    params=params,
+                    headers=HDR,
+                    timeout=(5, 20),
+                )
+                response.raise_for_status()
+
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = json.loads(response.content.decode("utf-8"))
+
+                market_prices = _extract_market_close_prices_from_payload(payload)
+                all_prices.update(market_prices)
+                market_results.append(f"{market_name}:{len(market_prices):,}檔")
+
+                if market_prices:
+                    successful_market_count += 1
+            except Exception as exc:
+                market_results.append(f"{market_name}:失敗")
+                print(
+                    f"  ⚠️ {market_name} 全市場收盤價批次抓取失敗：{target_key}｜"
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        # 上市與上櫃兩個市場都成功取得有效資料，才建立同日記憶體快取。
+        # 任一市場失敗或回傳空資料時不快取，讓後續價格流程仍可再次嘗試缺少的市場。
+        if all_prices and successful_market_count == len(endpoints):
+            _MARKET_CLOSE_PRICE_CACHE[target_key] = dict(all_prices)
+        else:
+            print(
+                f"  ⚠️ 單日全市場收盤價資料不完整，"
+                f"本次不建立記憶體快取：{target_key}"
+            )
+
+        print(
+            f"  ✅ 單日全市場收盤價批次：{target_key}｜"
+            f"{'｜'.join(market_results)}｜合併 {len(all_prices):,} 檔"
+        )
+
+        return dict(all_prices)
+
+
+def merge_market_close_prices_into_cache(
+    price_cache,
+    persistent_price_cache,
+    target_date,
+    wanted_codes=None,
+):
+    """把單日全市場批次價合併進記憶體與持久價格快取。"""
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return set()
+
+    target_key = target_dt.strftime("%Y/%m/%d")
+    wanted = {
+        normalize_price_code(code)
+        for code in (wanted_codes or [])
+        if normalize_price_code(code)
+    }
+
+    market_prices = fetch_market_close_prices_for_date(target_key)
+    changed_codes = set()
+
+    for raw_code, raw_price in market_prices.items():
+        norm_code = normalize_price_code(raw_code)
+        price = safe_price_float(raw_price)
+        if not norm_code or price is None:
+            continue
+        if wanted and norm_code not in wanted:
+            continue
+
+        old_prices = get_cached_prices_for_code(persistent_price_cache, norm_code)
+        old_target_price = safe_price_float(old_prices.get(target_key)) if isinstance(old_prices, dict) else None
+        merged_prices = merge_price_dicts(old_prices, {target_key: price})
+
+        persistent_price_cache[norm_code] = merged_prices
+        add_price_aliases(price_cache, norm_code, merged_prices)
+
+        if old_target_price != price:
+            changed_codes.add(norm_code)
+
+    if wanted:
+        hit_count = sum(
+            1
+            for code in wanted
+            if get_latest_price_info_on_or_before(price_cache, code, target_key)[1] == target_key
+        )
+        print(
+            f"  ✅ 全市場批次價命中本段需求：{hit_count:,}/{len(wanted):,} 檔｜"
+            f"新增或更新 {len(changed_codes):,} 檔"
+        )
+
+    return changed_codes
 
 
 def configured_broker_labels_for_scope(scope="all"):
@@ -5023,55 +5401,94 @@ def apply_result_retention_and_archive(title, headers, merged_records):
     return retained_records, len(archive_records)
 
 
-def merge_result_values_for_gsheet(title, new_values, data_scope=None):
+def merge_result_values_for_gsheet(
+    title,
+    new_values,
+    data_scope=None,
+    extra_scope_values=None,
+):
     """
     將本次 Excel 結果與 Google Sheet 既有結果做 upsert 合併。
 
     規則：
-    - 本次資料會加上「資料範圍」：精選五分點 / 全分點。
-    - 舊資料若沒有「資料範圍」，會保留為「未標記舊資料」，不會被本次資料誤覆蓋。
-    - key 重複時，以本次新資料為準。
-    - key 不重複時，舊資料保留。
-    - 每日賣出明細與 TOP15 快取超過主表保留日期的資料，會先封存到獨立 Google Sheet；
-      封存成功後才從主表移除。
+    - 主 Excel 資料使用 data_scope；未指定時沿用目前 RUN_MODE。
+    - extra_scope_values 若提供有效表頭，固定以「精選五分點」併入同一次 upsert；即使資料列為空，也視為本次已更新。
+    - upsert key 本來就包含「資料範圍」，兩個 scope 不會互相覆蓋。
+    - 舊資料若沒有「資料範圍」，會保留為「未標記舊資料」。
+    - 每日賣出明細與 TOP15 快取超過主表保留日期的資料，會先封存。
     """
     if not should_upsert_result_sheet(title):
         return new_values
 
     header_row_idx = _find_simple_header_row(new_values)
-    if header_row_idx is None:
-        return new_values
-
-    if header_row_idx != 0:
-        # 目前只對第一列就是表頭的資料表啟用 upsert。
-        # 多段式報表例如勝率統計、ABCDE組合勝率，仍維持原本覆蓋模式，避免破壞版面與公式。
+    if header_row_idx is None or header_row_idx != 0:
+        # 多段式報表仍維持原本覆蓋模式，避免破壞版面與公式。
         return new_values
 
     current_scope = str(data_scope or get_result_data_scope()).strip()
-    new_headers, new_records = _values_to_records(new_values, header_row_idx=0, default_scope=current_scope)
+    extra_scope = "精選五分點"
+
+    new_headers, new_records = _values_to_records(
+        new_values,
+        header_row_idx=0,
+        default_scope=current_scope,
+    )
     if not new_headers:
         return new_values
 
     new_headers = _ensure_scope_header(new_headers)
 
-    # 本次剛產生的資料也先套用有效分點清單。
-    # 這可防止本機／Supabase 舊快取仍帶著已刪除分點時，又把舊分點重新寫回 Google Sheet。
-    cleaned_new_records = []
-    removed_new_deleted_broker_count = 0
-    for rec in new_records:
-        rec["資料範圍"] = current_scope
-        cleaned_rec = normalize_or_remove_deleted_broker_result_record(rec)
-        if cleaned_rec is None:
-            removed_new_deleted_broker_count += 1
-            continue
-        cleaned_new_records.append(cleaned_rec)
-    new_records = cleaned_new_records
+    def clean_incoming_records(records, scope, source_label):
+        cleaned = []
+        removed_count = 0
 
-    if removed_new_deleted_broker_count > 0:
-        print(
-            f"  🧹 本次結果已排除失效分點資料："
-            f"{safe_worksheet_title(title)}｜{removed_new_deleted_broker_count:,} 筆"
-        )
+        for rec in records:
+            rec = dict(rec)
+            rec["資料範圍"] = scope
+            cleaned_rec = normalize_or_remove_deleted_broker_result_record(rec)
+            if cleaned_rec is None:
+                removed_count += 1
+                continue
+            cleaned_rec["資料範圍"] = scope
+            cleaned.append(cleaned_rec)
+
+        if removed_count > 0:
+            print(
+                f"  🧹 {source_label}已排除失效分點資料："
+                f"{safe_worksheet_title(title)}｜{removed_count:,} 筆"
+            )
+
+        return cleaned
+
+    new_records = clean_incoming_records(new_records, current_scope, "本次主範圍結果")
+
+    extra_headers = []
+    extra_records = []
+    extra_scope_supplied = False
+
+    if extra_scope_values:
+        extra_header_row_idx = _find_simple_header_row(extra_scope_values)
+
+        if extra_header_row_idx == 0:
+            # 即使只有表頭、沒有資料列，也代表本次已更新精選五分點範圍。
+            extra_scope_supplied = True
+
+            extra_headers, parsed_extra_records = _values_to_records(
+                extra_scope_values,
+                header_row_idx=0,
+                default_scope=extra_scope,
+            )
+            extra_headers = _ensure_scope_header(extra_headers) if extra_headers else []
+            extra_records = clean_incoming_records(
+                parsed_extra_records,
+                extra_scope,
+                "本次精選五分點結果",
+            )
+
+    incoming_scopes = {current_scope}
+
+    if extra_scope_supplied:
+        incoming_scopes.add(extra_scope)
 
     old_values = read_existing_worksheet_values(title)
     old_headers, old_records = _values_to_records(
@@ -5081,9 +5498,6 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
     )
     old_headers = _ensure_scope_header(old_headers) if old_headers else []
 
-    # 先清理 Google Sheet 既有資料中的失效分點。
-    # 原本 upsert 會保留「本次未覆蓋到的舊列」，因此只從 TARGET_PATTERNS 刪除分點仍不夠；
-    # 這裡會在合併前直接移除已刪除分點，分點改名但券商代號相同時則改成新標籤。
     cleaned_old_records = []
     removed_deleted_broker_count = 0
 
@@ -5096,17 +5510,14 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
 
     old_records = cleaned_old_records
 
-    # 近兩月兩張排行是目前狀態快照，同一資料範圍不保留上一次排名列。
-    # 本次資料會完整補回目前仍有效的排名，已跌出排名或已移除的分點便不會殘留。
-    replaced_current_scope_count = 0
+    # 近兩月兩張排行是目前狀態快照；本次有帶入的所有 scope 都完整替換。
+    replaced_scope_counts = {}
     if safe_worksheet_title(title) in GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES:
         kept_old_records = []
         for rec in old_records:
-            rec_scope = str(
-                strip_gsheet_text_prefix(rec.get("資料範圍", ""))
-            ).strip()
-            if rec_scope == current_scope:
-                replaced_current_scope_count += 1
+            rec_scope = str(strip_gsheet_text_prefix(rec.get("資料範圍", ""))).strip()
+            if rec_scope in incoming_scopes:
+                replaced_scope_counts[rec_scope] = replaced_scope_counts.get(rec_scope, 0) + 1
                 continue
             kept_old_records.append(rec)
         old_records = kept_old_records
@@ -5117,15 +5528,15 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
             f"{safe_worksheet_title(title)}｜{removed_deleted_broker_count:,} 筆"
         )
 
-    if replaced_current_scope_count > 0:
+    for scope_name, replaced_count in sorted(replaced_scope_counts.items()):
         print(
             f"  ♻️ Google Sheet 排名快照完整替換："
-            f"{safe_worksheet_title(title)}｜資料範圍={current_scope}｜"
-            f"移除上次快照 {replaced_current_scope_count:,} 筆"
+            f"{safe_worksheet_title(title)}｜資料範圍={scope_name}｜"
+            f"移除上次快照 {replaced_count:,} 筆"
         )
 
     headers = []
-    for h in new_headers + old_headers:
+    for h in new_headers + extra_headers + old_headers:
         h = str(h).strip()
         if h and h not in headers:
             headers.append(h)
@@ -5151,8 +5562,8 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
 
     new_map = {}
     new_order = []
-    for rec in new_records:
-        rec["資料範圍"] = current_scope
+
+    for rec in list(new_records) + list(extra_records):
         key = _record_key(rec, key_cols)
         if not any(key):
             continue
@@ -5163,12 +5574,12 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
     merged_records = []
     used_keys = set()
 
-    # 本次資料排在最前面，畫面上可以優先看到最新結果。
+    # 本次全分點與精選五分點資料都排在前面。
     for key in new_order:
         merged_records.append(new_map[key])
         used_keys.add(key)
 
-    # 舊資料中沒有被本次 key 覆蓋的保留下來，避免五分點覆蓋全分點。
+    # 沒有被本次 key 覆蓋的歷史資料保留。
     for key in old_order:
         if key in used_keys:
             continue
@@ -5182,14 +5593,18 @@ def merge_result_values_for_gsheet(title, new_values, data_scope=None):
     )
     merged_values = _records_to_values(headers, retained_records)
 
+    scope_parts = [f"{current_scope}:{len(new_records):,}筆"]
+    if extra_scope_supplied:
+        scope_parts.append(f"{extra_scope}:{len(extra_records):,}筆")
+
     print(
         f"  ☁️ Google Sheet upsert：{safe_worksheet_title(title)}｜"
-        f"資料範圍={current_scope}｜本次 {len(new_records):,} 筆｜舊資料 {len(old_records):,} 筆｜"
-        f"合併後 {len(merged_records):,} 筆｜主表保留 {len(retained_records):,} 筆｜封存 {archived_count:,} 筆"
+        f"本次 {'｜'.join(scope_parts)}｜舊資料 {len(old_records):,} 筆｜"
+        f"合併後 {len(merged_records):,} 筆｜主表保留 {len(retained_records):,} 筆｜"
+        f"封存 {archived_count:,} 筆"
     )
 
     return merged_values
-
 
 
 
@@ -5443,7 +5858,7 @@ def _format_fields_visual(fmt):
     return ",".join(fields)
 
 
-def _source_record_key_to_excel_row_map(title, source_values, final_headers):
+def _source_record_key_to_excel_row_map(title, source_values, final_headers, data_scopes=None):
     """
     建立 upsert 後資料列 key -> 原 Excel row number 對照。
 
@@ -5463,7 +5878,9 @@ def _source_record_key_to_excel_row_map(title, source_values, final_headers):
     if not key_cols:
         return {}, source_headers
 
-    current_scope = get_result_data_scope()
+    scopes = [str(x).strip() for x in (data_scopes or [get_result_data_scope()]) if str(x).strip()]
+    if not scopes:
+        scopes = [get_result_data_scope()]
     out = {}
 
     for offset, raw_row in enumerate(source_values[header_row_idx + 1:], start=header_row_idx + 2):
@@ -5476,11 +5893,16 @@ def _source_record_key_to_excel_row_map(title, source_values, final_headers):
         if not any(str(v).strip() for v in row):
             continue
 
-        rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(source_headers)}
-        rec["資料範圍"] = str(rec.get("資料範圍", "") or current_scope).strip()
-        key = _record_key(rec, key_cols)
-        if any(key):
-            out[key] = offset
+        base_rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(source_headers)}
+
+        # 精選五分點資料是全分點資料的子集合；同一份完整 Excel 列即可同時作為
+        # 全分點與精選五分點列的視覺樣式來源，避免為了樣式再同步第二輪。
+        for scope in scopes:
+            rec = dict(base_rec)
+            rec["資料範圍"] = scope
+            key = _record_key(rec, key_cols)
+            if any(key):
+                out[key] = offset
 
     return out, source_headers
 
@@ -5522,7 +5944,15 @@ def _dplus_status_format_from_text(value):
     }
 
 
-def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_values=None, final_values=None, title=""):
+def apply_upsert_original_excel_visual_style_to_gsheet(
+    ws_xlsx,
+    gws,
+    source_values=None,
+    final_values=None,
+    title="",
+    data_scope=None,
+    extra_scopes=None,
+):
     """
     upsert 工作表專用：在不套錯日期 / 數字格式的前提下，把原本 Excel 的配色套回 Google Sheet。
 
@@ -5548,7 +5978,19 @@ def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_valu
     while final_headers and final_headers[-1] == "":
         final_headers.pop()
 
-    source_key_to_row, source_headers = _source_record_key_to_excel_row_map(title, source_values, final_headers)
+    current_scope = str(data_scope or get_result_data_scope()).strip()
+    source_scopes = [current_scope]
+    for scope in extra_scopes or []:
+        scope = str(scope).strip()
+        if scope and scope not in source_scopes:
+            source_scopes.append(scope)
+
+    source_key_to_row, source_headers = _source_record_key_to_excel_row_map(
+        title,
+        source_values,
+        final_headers,
+        data_scopes=source_scopes,
+    )
     if not final_headers:
         return
 
@@ -5557,7 +5999,6 @@ def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_valu
     if not key_cols:
         return
 
-    current_scope = get_result_data_scope()
     requests = []
 
     # 先處理表頭：如果原 Excel 表頭有黃底等樣式，依欄名套回；資料範圍欄則維持安全樣式。
@@ -5612,7 +6053,7 @@ def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_valu
                 header = final_headers[final_col_idx - 1]
                 source_col_idx = source_col_by_header.get(header)
 
-                if src_excel_row and source_col_idx and rec_scope == current_scope:
+                if src_excel_row and source_col_idx and rec_scope in source_scopes:
                     src_cell = ws_xlsx.cell(src_excel_row, source_col_idx)
                     fmt = _cell_gsheet_visual_format(src_cell)
                 elif str(header).startswith("D+"):
@@ -5657,13 +6098,57 @@ def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_valu
 
     _gsheet_batch_update(requests)
 
-def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None):
+def worksheet_values_for_gsheet(ws_xlsx):
+    values = []
+
+    for row in ws_xlsx.iter_rows(values_only=False):
+        row_values = []
+        for cell in row:
+            value = normalize_formula_for_gsheet(cell.value)
+            row_values.append(clean_gsheet_value(value))
+        values.append(row_values)
+
+    return values or [[""]]
+
+
+def read_excel_values_by_title(xlsx_path, allowed_titles=None):
+    """只讀本機 Excel，整理成 {工作表名稱: values}，不呼叫 Google Sheet API。"""
+    from openpyxl import load_workbook
+
+    allowed = None
+    if allowed_titles is not None:
+        allowed = {safe_worksheet_title(x) for x in allowed_titles}
+
+    wb = load_workbook(xlsx_path, data_only=False)
+    result = {}
+
+    for ws_xlsx in wb.worksheets:
+        title = safe_worksheet_title(ws_xlsx.title)
+        if allowed is not None and title not in allowed:
+            continue
+        result[title] = worksheet_values_for_gsheet(ws_xlsx)
+
+    return result
+
+
+def upload_excel_to_google_sheet(
+    xlsx_path,
+    data_scope=None,
+    allowed_titles=None,
+    extra_scope_values=None,
+):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
         return
 
     try:
         from openpyxl import load_workbook
+
+        current_scope = str(data_scope or get_result_data_scope()).strip()
+        allowed = None
+        if allowed_titles is not None:
+            allowed = {safe_worksheet_title(x) for x in allowed_titles}
+        extra_scope_values = extra_scope_values or {}
 
         wb = load_workbook(xlsx_path, data_only=False)
 
@@ -5678,14 +6163,17 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
                 f"TOP15 最近 {GSHEET_TOP15_KEEP_STAT_DATES} 個統計日期｜"
                 f"自動封存={'開啟' if GSHEET_RESULT_ARCHIVE_ENABLED else '關閉'}"
             )
+            if extra_scope_values:
+                print(
+                    f"  ⚡ Google Sheet 單次雙範圍同步：主範圍={current_scope}｜"
+                    f"額外範圍=精選五分點｜重疊工作表 {len(extra_scope_values):,} 張"
+                )
             compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
-
-        allowed_title_set = {safe_worksheet_title(x) for x in (allowed_titles or [])}
 
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
 
-            if allowed_title_set and title not in allowed_title_set:
+            if allowed is not None and title not in allowed:
                 continue
 
             if should_skip_result_sheet_in_run_mode(title):
@@ -5695,25 +6183,19 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
                 )
                 continue
 
-            values = []
-
-            for row in ws_xlsx.iter_rows(values_only=False):
-                row_values = []
-                for cell in row:
-                    value = cell.value
-                    value = normalize_formula_for_gsheet(value)
-                    row_values.append(clean_gsheet_value(value))
-                values.append(row_values)
-
-            if not values:
-                values = [[""]]
-
+            values = worksheet_values_for_gsheet(ws_xlsx)
             source_values = [list(row) for row in values]
-            values = merge_result_values_for_gsheet(title, values, data_scope=data_scope)
+            selected_values = extra_scope_values.get(title)
+
+            values = merge_result_values_for_gsheet(
+                title,
+                values,
+                data_scope=current_scope,
+                extra_scope_values=selected_values,
+            )
             values = normalize_result_values_for_comma_numbers(values)
 
             max_cols = max(max((len(row) for row in values), default=1), 1)
-            # 只配置實際需要的格數，避免建立工作表時先多占 100 列 / 20 欄。
             gws = get_or_recreate_result_worksheet(
                 title,
                 rows=max(len(values), 1),
@@ -5722,12 +6204,6 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
 
             if write_values_to_worksheet(gws, values):
                 if should_upsert_result_sheet(title):
-                    # upsert 表會新增「資料範圍」欄，不能再照原 Excel 欄位位置硬套 numberFormat。
-                    # 但原本 A/B/C/D/E 的 D+ 紅綠藍橘配色必須保留，所以改成：
-                    # 1. 先清掉舊錯誤 numberFormat
-                    # 2. 套基本表格樣式
-                    # 3. 依 upsert key 與表頭名稱，把原 Excel 視覺配色精準套回來
-                    # 4. 最後再依實際 Google Sheet 表頭重套文字 / 數字 / 日期格式
                     clear_all_number_formats_for_written_range(gws, values=values)
                     apply_safe_result_table_style_to_gsheet(gws, values=values)
                     apply_upsert_original_excel_visual_style_to_gsheet(
@@ -5736,6 +6212,8 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
                         source_values=source_values,
                         final_values=values,
                         title=title,
+                        data_scope=current_scope,
+                        extra_scopes=["精選五分點"] if selected_values else None,
                     )
                     apply_text_format_to_gsheet(gws, values)
                     apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
@@ -5748,8 +6226,6 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
                     apply_header_widths_to_gsheet(gws, values=values)
                 print(f"  ☁️ 已同步結果到 Google Sheet：{title}")
 
-        # 每張已寫入的工作表都已由 write_values_to_worksheet() resize 成實際大小；
-        # 這裡只回報同步後配置格數，不再重讀全部工作表，避免大型試算表多做一次完整掃描。
         if primary_sh is not None:
             print(f"  🧮 Google Sheet 主試算表同步後配置格數：{spreadsheet_grid_cell_count(primary_sh):,}")
 
@@ -5764,6 +6240,7 @@ def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None
 
     except Exception as e:
         print(f"  ⚠️ Excel 同步 Google Sheet 失敗：{type(e).__name__}: {e}")
+
 
 
 
@@ -6416,8 +6893,14 @@ def write_prescan_status(status, target_date=None, reason="", **extra):
     if PRESCAN_LATEST_ACTIVITY_DATE:
         latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d")
 
+    with API4_REQUEST_STATUS_LOCK:
+        api4_success_count = len(API4_REQUEST_SUCCESS_CODES)
+        api4_failed_count = len(API4_REQUEST_FAILED_CODES)
+
     headers = [
-        "日期", "資料範圍", "RUN_MODE", "狀態", "最新分點活動日", "今日分點資料是否出現",
+        "日期", "資料範圍", "RUN_MODE", "狀態", "最新分點活動日",
+        "API4市場今日資料是否出現", "今日分點資料是否出現", "API4請求是否完整",
+        "API4成功請求數", "API4失敗請求數",
         "候選組合數", "API4直接候選數", "允許缺快取補抓數", "候選快取是否寫入成功",
         "更新時間", "錯誤原因",
     ]
@@ -6435,7 +6918,11 @@ def write_prescan_status(status, target_date=None, reason="", **extra):
         "RUN_MODE": str(RUN_MODE),
         "狀態": str(status or "").strip(),
         "最新分點活動日": latest_label,
+        "API4市場今日資料是否出現": "1" if has_today_market_data_from_prescan(target_date) else "0",
         "今日分點資料是否出現": "1" if has_today_broker_data_from_prescan(target_date) else "0",
+        "API4請求是否完整": "1" if API4_REQUESTS_COMPLETE else "0",
+        "API4成功請求數": api4_success_count,
+        "API4失敗請求數": api4_failed_count,
         "候選組合數": extra.get("candidate_count", ""),
         "API4直接候選數": extra.get("direct_candidate_count", len(PRESCAN_REFRESH_KEYS or [])),
         "允許缺快取補抓數": extra.get("missing_fetch_key_count", len(PRESCAN_MISSING_FETCH_KEYS or [])),
@@ -6571,27 +7058,60 @@ def load_prescan_refresh_keys(target_date=None):
 def try_load_prescan_success_cache(broker_map, target_date=None):
     """daily 第二次執行時，若 prescan 狀態成功，直接讀候選快取與 keys。"""
     global PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS
-    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND, PRESCAN_STATUS_LAST_RECORD
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_MARKET_TODAY_DATA_FOUND
+    global PRESCAN_TODAY_ACTIVITY_FOUND, PRESCAN_STATUS_LAST_RECORD
+    global API4_REQUESTS_COMPLETE
 
     record = find_valid_prescan_success_record(target_date)
     if not record:
         return None
 
+    try:
+        expected_candidate_count = int(float(str(record.get("候選組合數", "")).strip()))
+    except Exception:
+        expected_candidate_count = -1
+    zero_candidate_success = expected_candidate_count == 0
+
+    record_market_today = str(record.get("API4市場今日資料是否出現", "")).strip() in (
+        "1", "true", "True", "是", "已出現"
+    )
+    record_api4_complete = str(record.get("API4請求是否完整", "")).strip() in (
+        "1", "true", "True", "是", "完整"
+    )
+
+    # 舊版 success 沒有獨立保存市場更新與 API4 完整性，不能直接信任。
+    # 第一次使用新版程式時會重新掃描一次，之後才允許日內跳過 prescan。
+    if not (record_market_today and record_api4_complete):
+        print(
+            "  ⚠️ 找到舊版 prescan success，但缺少 API4 市場今日資料／請求完整性證明；"
+            "本次重新掃描。"
+        )
+        return None
+
     refresh_keys, missing_keys, keys_ok = load_prescan_refresh_keys(target_date)
-    if not keys_ok:
+    if not keys_ok and not zero_candidate_success:
         print("  ⚠️ 找到 prescan success，但找不到同日 / 同 scope 的 prescan keys；本次重新掃描，避免 API5 漏補。")
         return None
 
     cached_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-    if not cached_candidates:
+    if not cached_candidates and not zero_candidate_success:
         print("  ⚠️ 找到 prescan success，但候選快取為空；本次重新掃描。")
         return None
+
+    if zero_candidate_success:
+        cached_candidates = []
+        refresh_keys = set()
+        missing_keys = set()
 
     PRESCAN_REFRESH_KEYS = refresh_keys
     PRESCAN_MISSING_FETCH_KEYS = missing_keys
     latest_dt = parse_date(record.get("最新分點活動日", ""))
     PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
-    PRESCAN_TODAY_ACTIVITY_FOUND = str(record.get("今日分點資料是否出現", "")).strip() in ("1", "true", "True", "是", "已出現")
+    PRESCAN_TODAY_ACTIVITY_FOUND = str(record.get("今日分點資料是否出現", "")).strip() in (
+        "1", "true", "True", "是", "已出現"
+    )
+    PRESCAN_MARKET_TODAY_DATA_FOUND = bool(record_market_today)
+    API4_REQUESTS_COMPLETE = bool(record_api4_complete)
     PRESCAN_STATUS_LAST_RECORD = dict(record)
 
     print(
@@ -6650,9 +7170,16 @@ def _select_light_probe_warrants_from_history(warrants, broker_map):
 def light_probe_today_broker_data(warrants, broker_map, target_date=None):
     """
     daily 正式 prescan 前的輕量探測。
-    回傳：True=今日資料已出現；False=尚未出現；None=無樣本，應直接正式 prescan。
+
+    回傳：
+    - True：樣本中已看到 API4 任一有效資料列更新到今天，可確認市場資料已出現。
+    - None：樣本未看到今天資料，結果不具排除力，仍應進入正式全市場 prescan。
+
+    注意：不能再用「目標分點今天有沒有交易」判斷整體 API4 是否更新，
+    否則追蹤分點今日剛好零交易時，會被誤判成資料尚未出現。
     """
-    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_MARKET_TODAY_DATA_FOUND
+    global PRESCAN_TODAY_ACTIVITY_FOUND
 
     if not workflow_is_daily() or not DAILY_LIGHT_PROBE_ENABLED:
         return None
@@ -6671,41 +7198,52 @@ def light_probe_today_broker_data(warrants, broker_map, target_date=None):
     start_s = (target_dt - timedelta(days=max(DAILY_LIGHT_PROBE_SCAN_DAYS, 1))).strftime("%Y/%m/%d")
     end_s = target_dt.strftime("%Y/%m/%d")
     target_s = target_dt.strftime("%Y/%m/%d")
-    found_today = False
+    market_today_found = False
+    target_today_found = False
     latest_dt = None
     done = 0
     timeout_or_error = 0
     empty_rows = 0
 
-    print(f"【Step 3a-0】輕量探測今日分點資料：樣本 {len(sample_warrants):,} 支，區間 {start_s}~{end_s}")
+    print(f"【Step 3a-0】輕量探測 API4 今日市場資料：樣本 {len(sample_warrants):,} 支，區間 {start_s}~{end_s}")
 
     def probe_one(w):
         local_latest = None
-        local_today = False
+        local_market_today = False
+        local_target_today = False
         row_count = 0
-        try:
-            rows = api4_get(w["代號"], start_s, end_s)
-        except Exception:
-            return None, False, 0, True
+
+        rows = api4_get(w["代號"], start_s, end_s)
 
         for row in rows or []:
             row_count += 1
+            row_date = normalize_date_str(row.get("V1", ""))
+            row_dt = parse_date(row_date)
+
+            # 任一分點的有效今天資料，都代表 API4 市場資料已更新到今天。
+            if row_dt and row_date == target_s:
+                local_market_today = True
+
             bcode = row.get("V2", "")
             if bcode not in broker_codes_set:
                 continue
-            row_date = normalize_date_str(row.get("V1", ""))
-            row_dt = parse_date(row_date)
+
             if row_dt and (local_latest is None or row_dt > local_latest):
                 local_latest = row_dt
             if row_date == target_s:
-                local_today = True
-        return local_latest, local_today, row_count, False
+                local_target_today = True
+
+        request_code = _api4_request_status_code(w.get("代號", ""))
+        with API4_REQUEST_STATUS_LOCK:
+            had_error = request_code in API4_REQUEST_FAILED_CODES
+
+        return local_latest, local_market_today, local_target_today, row_count, had_error
 
     stop_probe_event = threading.Event()
 
     def probe_one_with_stop(w):
         if stop_probe_event.is_set():
-            return None, False, 0, False
+            return None, False, False, 0, False
         return probe_one(w)
 
     ex = ThreadPoolExecutor(max_workers=max(1, DAILY_LIGHT_PROBE_WORKERS))
@@ -6714,9 +7252,9 @@ def light_probe_today_broker_data(warrants, broker_map, target_date=None):
         for future in as_completed(futures):
             done += 1
             try:
-                row_latest, row_today, row_count, had_error = future.result()
+                row_latest, row_market_today, row_target_today, row_count, had_error = future.result()
             except Exception:
-                row_latest, row_today, row_count, had_error = None, False, 0, True
+                row_latest, row_market_today, row_target_today, row_count, had_error = None, False, False, 0, True
 
             if had_error:
                 timeout_or_error += 1
@@ -6724,30 +7262,37 @@ def light_probe_today_broker_data(warrants, broker_map, target_date=None):
                 empty_rows += 1
             if row_latest and (latest_dt is None or row_latest > latest_dt):
                 latest_dt = row_latest
-            if row_today:
-                found_today = True
+            if row_target_today:
+                target_today_found = True
+            if row_market_today:
+                market_today_found = True
                 stop_probe_event.set()
-                # 已確認今日資料出現，取消尚未開始的探測請求，避免探測階段打好打滿。
+                # 已確認市場資料更新到今天，取消尚未開始的探測請求。
                 try:
                     ex.shutdown(wait=False, cancel_futures=True)
                 except TypeError:
                     ex.shutdown(wait=False)
                 break
     finally:
-        if not found_today:
+        if not market_today_found:
             ex.shutdown(wait=True)
 
     if latest_dt and (PRESCAN_LATEST_ACTIVITY_DATE is None or latest_dt > PRESCAN_LATEST_ACTIVITY_DATE):
         PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
-    if found_today:
+    if market_today_found:
+        PRESCAN_MARKET_TODAY_DATA_FOUND = True
+    if target_today_found:
         PRESCAN_TODAY_ACTIVITY_FOUND = True
 
     latest_label = latest_dt.strftime("%Y/%m/%d") if latest_dt else "-"
     print(
-        f"  ✅ 輕量探測完成：今日資料 {'已出現' if found_today else '尚未出現'}｜"
-        f"最新活動日 {latest_label}｜錯誤/逾時 {timeout_or_error}｜空回應 {empty_rows}"
+        f"  ✅ 輕量探測完成：API4市場今日資料 {'已出現' if market_today_found else '樣本未確認'}｜"
+        f"目標分點今日活動 {'有' if target_today_found else '未確認'}｜"
+        f"目標分點最新活動日 {latest_label}｜錯誤/逾時 {timeout_or_error}｜空回應 {empty_rows}"
     )
-    return bool(found_today)
+
+    # 樣本未看到今天資料只能視為不確定，不能直接判定 API4 尚未更新。
+    return True if market_today_found else None
 
 
 def merge_candidates(old_candidates, new_candidates):
@@ -6913,10 +7458,8 @@ def merge_items_into_history_cache(history_df, new_items):
         return history_df if history_df is not None else pd.DataFrame()
 
     new_rows = []
-    new_keys = set()
 
     for item in new_items:
-        new_keys.add(candidate_key_from_values(item["warrant_code"], item["broker_code"]))
         new_rows.extend(item_to_history_rows(item))
 
     new_df = pd.DataFrame(new_rows)
@@ -6927,13 +7470,10 @@ def merge_items_into_history_cache(history_df, new_items):
     if history_df is None or history_df.empty:
         combined = new_df
     else:
-        history_df = history_df.copy()
-        remove_mask = pd.Series(
-            [candidate_key_from_values(w, b) in new_keys for w, b in zip(history_df["權證代號"], history_df["券商代號"])],
-            index=history_df.index
-        )
-        old_keep_df = history_df[~remove_mask].copy()
-        combined = pd.concat([old_keep_df, new_df], ignore_index=True)
+        # API5 採動態 limit 後，新資料可能只涵蓋最近數日，不能再把同一候選的舊歷史整批刪除。
+        # 直接把新資料接在舊資料後面；下方 drop_duplicates(keep="last") 會讓同 key、同日期
+        # 以本次 API5 新資料覆蓋，同時保留本次抓取視窗以外的舊日期資料。
+        combined = pd.concat([history_df.copy(), new_df], ignore_index=True)
 
     numeric_cols = ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]
     for col in numeric_cols:
@@ -7623,69 +8163,110 @@ def find_broker_codes(warrants):
 # ══════════════════════════════════════════════════════════════════════
 
 def prescan_all_live(warrants, broker_map, scan_days=40):
-    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_TODAY_ACTIVITY_FOUND
+    global PRESCAN_LATEST_ACTIVITY_DATE, PRESCAN_MARKET_TODAY_DATA_FOUND
+    global PRESCAN_TODAY_ACTIVITY_FOUND, API4_REQUESTS_COMPLETE
 
     print("【Step 3a】預篩：找有目標分點的權證...")
 
     today = datetime.today()
     today_s = today.strftime("%Y/%m/%d")
-    end_s   = today.strftime("%Y/%m/%d")
+    end_s = today.strftime("%Y/%m/%d")
     start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
 
     PRESCAN_LATEST_ACTIVITY_DATE = None
+    PRESCAN_MARKET_TODAY_DATA_FOUND = False
     PRESCAN_TODAY_ACTIVITY_FOUND = False
+    reset_api4_request_status()
 
     broker_codes_set = {code for _, code in broker_map.values()}
-    code_to_label    = {code: label for label, (_, code) in broker_map.items()}
+    code_to_label = {code: label for label, (_, code) in broker_map.items()}
+    broker_name_by_code = {code: name for _, (name, code) in broker_map.items()}
 
     candidates = []
     done = 0
+    expected_codes = {
+        _api4_request_status_code(w.get("代號", ""))
+        for w in (warrants or [])
+        if _api4_request_status_code(w.get("代號", ""))
+    }
 
     def prescan_one(w):
         hits = []
         latest_dt = None
-        today_found = False
+        target_today_found = False
+        market_today_found = False
 
-        for row in api4_get(w["代號"], start_s, end_s):
+        rows = api4_get(w["代號"], start_s, end_s)
+
+        for row in rows or []:
+            row_date = normalize_date_str(row.get("V1", ""))
+            row_dt = parse_date(row_date)
+
+            # 市場更新狀態與目標分點候選必須分開判斷。
+            # 任一分點只要有有效今天資料，就代表 API4 市場資料已更新到今天。
+            if row_dt and row_date == today_s:
+                market_today_found = True
+
             bcode = row.get("V2", "")
+            if bcode not in broker_codes_set:
+                continue
 
-            if bcode in broker_codes_set:
-                label = code_to_label.get(bcode, "")
+            label = code_to_label.get(bcode, "")
+            if not label:
+                continue
 
-                if label:
-                    row_date = normalize_date_str(row.get("V1", ""))
-                    row_dt = parse_date(row_date)
-                    if row_dt and (latest_dt is None or row_dt > latest_dt):
-                        latest_dt = row_dt
-                    if row_date == today_s:
-                        today_found = True
+            if row_dt and (latest_dt is None or row_dt > latest_dt):
+                latest_dt = row_dt
+            if row_date == today_s:
+                target_today_found = True
 
-                    bname = next((n for l, (n, c) in broker_map.items() if c == bcode), bcode)
-                    hits.append((w["代號"], w["名稱"], w["標的股"], w.get("標的名稱", ""), label, bname, bcode))
+            bname = broker_name_by_code.get(bcode, bcode)
+            hits.append((
+                w["代號"],
+                w["名稱"],
+                w["標的股"],
+                w.get("標的名稱", ""),
+                label,
+                bname,
+                bcode,
+            ))
 
-        return hits, latest_dt, today_found
+        return hits, latest_dt, target_today_found, market_today_found
 
     with ThreadPoolExecutor(max_workers=PRESCAN_WORKERS) as ex:
         futures = {ex.submit(prescan_one, w): w for w in warrants}
 
         for future in as_completed(futures):
             done += 1
+            source_warrant = futures[future]
 
             try:
-                result, latest_dt, today_found = future.result()
-            except Exception:
-                result, latest_dt, today_found = [], None, False
+                result, latest_dt, target_today_found, market_today_found = future.result()
+            except Exception as exc:
+                result, latest_dt, target_today_found, market_today_found = [], None, False, False
+                request_code = _api4_request_status_code(source_warrant.get("代號", ""))
+                with API4_REQUEST_STATUS_LOCK:
+                    API4_REQUEST_FAILED_CODES.add(request_code)
+                    API4_REQUEST_SUCCESS_CODES.discard(request_code)
+                print(
+                    f"  ⚠️ API4 預掃描處理失敗：權證={request_code}｜"
+                    f"{type(exc).__name__}: {exc}"
+                )
 
             if latest_dt and (PRESCAN_LATEST_ACTIVITY_DATE is None or latest_dt > PRESCAN_LATEST_ACTIVITY_DATE):
                 PRESCAN_LATEST_ACTIVITY_DATE = latest_dt
-            if today_found:
+            if target_today_found:
                 PRESCAN_TODAY_ACTIVITY_FOUND = True
+            if market_today_found:
+                PRESCAN_MARKET_TODAY_DATA_FOUND = True
 
-            for hit in result:
-                candidates.append(hit)
+            candidates.extend(result)
 
             if done % 1000 == 0:
                 print(f"  [{done:,}/{len(warrants):,}] 預篩中，候選 {len(candidates)} 組...")
+
+    api4_summary = api4_request_status_summary(expected_codes)
+    API4_REQUESTS_COMPLETE = bool(api4_summary["complete"])
 
     unique_candidates = []
     seen = set()
@@ -7698,10 +8279,17 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
     latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") if PRESCAN_LATEST_ACTIVITY_DATE else "-"
     print(f"  ✅ 預篩完成：{len(warrants)} 支 → {len(candidates)} 組候選，去重後 {len(unique_candidates)} 組")
-    print(f"  ✅ API4 目標分點最新活動日：{latest_label}｜今日資料：{'已出現' if PRESCAN_TODAY_ACTIVITY_FOUND else '尚未出現'}")
+    print(
+        f"  ✅ API4 市場今日資料：{'已出現' if PRESCAN_MARKET_TODAY_DATA_FOUND else '尚未出現'}｜"
+        f"目標分點今日活動：{'有' if PRESCAN_TODAY_ACTIVITY_FOUND else '無'}｜"
+        f"目標分點最新活動日：{latest_label}"
+    )
+    print(
+        f"  ✅ API4 請求完整性：{'完整' if API4_REQUESTS_COMPLETE else '不完整'}｜"
+        f"成功 {len(api4_summary['success_codes']):,}/{len(api4_summary['expected_codes']):,}｜"
+        f"失敗 {len(api4_summary['failed_codes']):,}｜狀態不明 {len(api4_summary['missing_codes']):,}"
+    )
     return unique_candidates
-
-
 
 
 def collect_underlying_codes_from_candidates(candidates):
@@ -8124,17 +8712,33 @@ def prescan_all(warrants, broker_map):
     merged_candidates = merge_candidates(cached_candidates, refresh_candidates)
     merged_candidates = filter_candidates_by_broker_map(merged_candidates, broker_map)
 
+    target_date = current_prescan_target_date()
+    prescan_market_has_today = has_today_market_data_from_prescan(target_date)
+
     candidate_cache_saved = False
     try:
-        candidate_cache_saved = bool(save_candidates_cache(merged_candidates))
+        if merged_candidates:
+            candidate_cache_saved = bool(save_candidates_cache(merged_candidates))
     except Exception as e:
         candidate_cache_saved = False
         print(f"  ⚠️ 候選組合快取寫入失敗：{type(e).__name__}: {e}")
 
-    target_date = current_prescan_target_date()
-    prescan_has_today = has_today_broker_data_from_prescan(target_date)
+    zero_candidates_confirmed = bool(
+        not merged_candidates
+        and prescan_market_has_today
+        and API4_REQUESTS_COMPLETE
+        and LIVE_WARRANT_SNAPSHOT_READY
+    )
+    prescan_success = bool(
+        prescan_market_has_today
+        and API4_REQUESTS_COMPLETE
+        and (
+            (bool(merged_candidates) and candidate_cache_saved)
+            or zero_candidates_confirmed
+        )
+    )
 
-    if candidate_cache_saved and prescan_has_today and merged_candidates:
+    if prescan_success:
         write_prescan_refresh_keys(PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS, target_date=target_date)
         write_prescan_status(
             "success",
@@ -8142,11 +8746,23 @@ def prescan_all(warrants, broker_map):
             candidate_count=len(merged_candidates),
             direct_candidate_count=len(PRESCAN_REFRESH_KEYS),
             missing_fetch_key_count=len(PRESCAN_MISSING_FETCH_KEYS),
-            candidate_cache_saved=True,
+            candidate_cache_saved=candidate_cache_saved,
         )
+        if zero_candidates_confirmed:
+            print(
+                "  ✅ prescan 已確認今日來源完整，本次合法候選數為 0；"
+                "保留既有跨日候選快取，不以空資料覆蓋。"
+            )
     else:
-        status = "broker_data_not_ready" if not prescan_has_today else "failed"
-        reason = "API4 尚未看到今日目標分點資料" if not prescan_has_today else "候選快取未成功寫入或候選為空"
+        status = "broker_data_not_ready" if not prescan_market_has_today else "failed"
+        if not prescan_market_has_today:
+            reason = "API4 尚未看到今日市場資料"
+        elif not API4_REQUESTS_COMPLETE:
+            reason = "API4 請求不完整"
+        elif not LIVE_WARRANT_SNAPSHOT_READY:
+            reason = "上市／上櫃即時權證清單未完整取得"
+        else:
+            reason = "候選快取未成功寫入"
         write_prescan_status(
             status,
             target_date=target_date,
@@ -8178,8 +8794,8 @@ def prescan_all(warrants, broker_map):
 # Step 3b：抓候選組合歷史資料
 # ══════════════════════════════════════════════════════════════════════
 
-def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code):
-    rows = api5_get(warrant_code, broker_code)
+def process_candidate(warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code, limit=None):
+    rows = api5_get(warrant_code, broker_code, limit=limit)
 
     if not rows:
         return None
@@ -8732,7 +9348,15 @@ def simulate_group_outcome(event, item_map):
 # Step 4：抓收盤價
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
+def fetch_all_prices(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events=None,
+    persistent_price_cache=None,
+    defer_save=False,
+):
     print("【Step 4】抓收盤價...")
 
     code_ranges = {}
@@ -8772,13 +9396,20 @@ def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
     all_codes = list(code_ranges.keys())
     price_cache = {}
     total = len(all_codes)
+    changed_price_codes = set()
+
+    if persistent_price_cache is None:
+        persistent_price_cache = load_price_cache()
+        print(f"  價格快取讀取：{len(persistent_price_cache):,} 個代號")
 
     if total == 0:
         print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
-        return price_cache
-
-    persistent_price_cache = load_price_cache()
-    print(f"  價格快取讀取：{len(persistent_price_cache):,} 個代號")
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     today = datetime.today()
     fetch_plan = {}
@@ -8821,7 +9452,12 @@ def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
 
     if not fetch_plan:
         print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
-        return price_cache
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     def fetch_one(code):
         start_dt, end_dt = fetch_plan[code]
@@ -8831,7 +9467,6 @@ def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
     print(f"  價格抓取執行緒：{price_workers}")
 
     done = 0
-    changed_price_codes = set()
 
     with ThreadPoolExecutor(max_workers=price_workers) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
@@ -8861,10 +9496,13 @@ def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 收盤價補抓中...")
 
-    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
-
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
-    return price_cache
+    return _finish_price_ensure(
+        price_cache,
+        persistent_price_cache,
+        changed_price_codes,
+        defer_save=defer_save,
+    )
 
 # ══════════════════════════════════════════════════════════════════════
 # D+1 ~ D+20
@@ -9473,15 +10111,24 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
 
 
 
-def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
+def ensure_top15_return_warrant_prices(
+    price_cache,
+    position_lots,
+    target_date,
+    persistent_price_cache=None,
+    defer_save=False,
+):
     """
     TOP15 固定資料集需要權證目前價格。
 
     原本 fetch_all_prices() 為了加速，B/C/D 預設只抓標的股價格，
-    因此這裡會針對目前仍有剩餘部位的權證補抓最新價格，並同步回 price_cache.csv / Google Sheet。
+    因此這裡會針對目前仍有剩餘部位的權證補抓最新價格。
+    可由主流程傳入共用 persistent_price_cache 並延後儲存，確保整次流程只讀一次、只寫一次。
     """
     if not position_lots:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     target_dt = parse_date(target_date)
     if not target_dt:
@@ -9498,10 +10145,15 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
     })
 
     if not needed_codes:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
-    persistent_price_cache = load_price_cache()
+    if persistent_price_cache is None:
+        persistent_price_cache = load_price_cache()
+
     fetch_plan = []
+    changed_price_codes = set()
 
     for code in needed_codes:
         cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
@@ -9512,7 +10164,11 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
             add_price_aliases(price_cache, code, merged_prices)
             persistent_price_cache[normalize_price_code(code)] = merged_prices
 
-        latest_price, latest_date = get_latest_price_info_on_or_before(price_cache, code, target_dt.strftime("%Y/%m/%d"))
+        latest_price, latest_date = get_latest_price_info_on_or_before(
+            price_cache,
+            code,
+            target_dt.strftime("%Y/%m/%d"),
+        )
         latest_dt = parse_date(latest_date) if latest_date else None
 
         need_fetch = latest_price is None
@@ -9526,13 +10182,17 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
     print(f"  TOP15固定資料集需補抓權證價格：{len(fetch_plan):,} 檔")
 
     if not fetch_plan:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     def fetch_one(code):
         return code, fetch_twse_prices(code, start_dt, target_dt)
 
     done = 0
-    changed_price_codes = set()
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -9559,9 +10219,12 @@ def ensure_top15_return_warrant_prices(price_cache, position_lots, target_date):
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] TOP15固定資料集權證價格補抓中...")
 
-    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
-    return price_cache
-
+    return _finish_price_ensure(
+        price_cache,
+        persistent_price_cache,
+        changed_price_codes,
+        defer_save=defer_save,
+    )
 
 
 def normalize_top15_target_date(target_date=None):
@@ -9606,6 +10269,9 @@ def build_top15_position_detail_and_consensus_rows(
     target_date=None,
     data_scope=None,
     allow_price_fetch=True,
+    persistent_price_cache=None,
+    defer_price_save=False,
+    price_changed_codes=None,
 ):
     """
     建立 TOP15 圖片用固定資料集。
@@ -9620,7 +10286,9 @@ def build_top15_position_detail_and_consensus_rows(
     - TOP15 總表完全由部位明細加總，不再另外重算。
     """
     item_map = item_map or {}
-    price_cache = price_cache or {}
+    if price_cache is None:
+        price_cache = {}
+    scope = str(data_scope or get_result_data_scope()).strip()
 
     if not TOP15_CACHE_ENABLED:
         return [], []
@@ -9661,7 +10329,24 @@ def build_top15_position_detail_and_consensus_rows(
         return [], []
 
     if allow_price_fetch:
-        ensure_top15_return_warrant_prices(price_cache, position_lots, target_date)
+        if defer_price_save:
+            price_cache, changed_codes = ensure_top15_return_warrant_prices(
+                price_cache,
+                position_lots,
+                target_date,
+                persistent_price_cache=persistent_price_cache,
+                defer_save=True,
+            )
+            if price_changed_codes is not None:
+                price_changed_codes.update(changed_codes)
+        else:
+            ensure_top15_return_warrant_prices(
+                price_cache,
+                position_lots,
+                target_date,
+                persistent_price_cache=persistent_price_cache,
+                defer_save=False,
+            )
 
     detail_rows = []
     validation_errors = []
@@ -9735,7 +10420,7 @@ def build_top15_position_detail_and_consensus_rows(
             return_text = "-" if return_pct_float is None else f"{return_pct_float:+.2f}%"
 
         detail_rows.append({
-            "資料範圍": str(data_scope or get_result_data_scope()).strip(),
+            "資料範圍": scope,
             "統計日期": target_date,
             "統計期間": period_text,
             "有效交易日數": len(recent_dates),
@@ -9815,7 +10500,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
 
         key = underlying
         rec = agg.setdefault(key, {
-            "資料範圍": row.get("資料範圍", get_result_data_scope()),
+            "資料範圍": row.get("資料範圍", scope),
             "統計日期": row.get("統計日期", ""),
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
@@ -9943,7 +10628,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             })
 
         rows.append({
-            "資料範圍": rec.get("資料範圍", get_result_data_scope()),
+            "資料範圍": rec.get("資料範圍", scope),
             "統計日期": rec.get("統計日期", ""),
             "統計期間": rec.get("統計期間", ""),
             "有效交易日數": rec.get("有效交易日數", ""),
@@ -10480,7 +11165,7 @@ def make_summary_map(stat_records):
         code: f"{code}-{AMOUNT_CLASS_LABELS.get(code, '事件')}"
         for code in AMOUNT_CLASS_CODES
     }
-    event_types["ALL"] = "全部-A+B+C+D+E+E合併"
+    event_types["ALL"] = "全部-A+B+C+D+E合併"
 
     for broker in broker_order:
         summary_map[broker] = {}
@@ -12276,7 +12961,38 @@ def _collect_recent_underlying_codes_for_10d(items, target_date=None):
     return codes
 
 
-def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
+def _finish_price_ensure(
+    price_cache,
+    persistent_price_cache,
+    changed_codes,
+    defer_save=False,
+):
+    """統一處理三個價格補抓函式的回傳與延後儲存。"""
+    changed_codes = {
+        normalize_price_code(code)
+        for code in (changed_codes or set())
+        if normalize_price_code(code)
+    }
+
+    if not defer_save and persistent_price_cache is not None and changed_codes:
+        save_price_cache(
+            persistent_price_cache,
+            changed_codes=changed_codes,
+        )
+
+    if defer_save:
+        return price_cache, changed_codes
+
+    return price_cache
+
+
+def ensure_broker_10d_underlying_prices(
+    price_cache,
+    items,
+    target_date=None,
+    persistent_price_cache=None,
+    defer_save=False,
+):
     """
     近10日分點明細的「現股10日」需要標的股起始價與最新收盤價。
 
@@ -12284,12 +13000,16 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     讓之後分點資料一出來，圖卡可以直接使用今天的現股收盤價，不會停在前一交易日。
     """
     if not BROKER_10D_DETAIL_ENABLED:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     codes = _collect_recent_underlying_codes_for_10d(items, target_date)
     if not codes:
         print("  ✅ 近10日分點明細沒有需要預抓的標的股價格。")
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     target_date = normalize_top15_target_date(target_date)
     target_dt = parse_date(target_date) or datetime.today()
@@ -12297,7 +13017,15 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     lookback_days = max(int(BROKER_10D_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
     start_dt = target_dt - timedelta(days=lookback_days)
 
-    persistent_price_cache = load_price_cache()
+    if persistent_price_cache is None:
+        persistent_price_cache = load_price_cache()
+
+    changed_price_codes = merge_market_close_prices_into_cache(
+        price_cache,
+        persistent_price_cache,
+        target_date,
+        wanted_codes=codes,
+    )
     fetch_plan = {}
 
     for code in sorted(codes):
@@ -12318,14 +13046,18 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
     print(f"  近10日分點明細需補抓標的股價格：{len(fetch_plan):,} 檔")
 
     if not fetch_plan:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     def fetch_one(code):
         sdt, edt = fetch_plan[code]
         return code, fetch_twse_prices(code, sdt, edt)
 
     done = 0
-    changed_price_codes = set()
 
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
@@ -12353,8 +13085,12 @@ def ensure_broker_10d_underlying_prices(price_cache, items, target_date=None):
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 近10日標的股價格補抓中...")
 
-    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
-    return price_cache
+    return _finish_price_ensure(
+        price_cache,
+        persistent_price_cache,
+        changed_price_codes,
+        defer_save=defer_save,
+    )
 
 
 def _sell_needs_latest_price_fallback_for_item(item, start_dt, target_dt):
@@ -12474,7 +13210,13 @@ def _collect_recent_warrant_codes_for_10d(items, target_date=None):
 
     return codes
 
-def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
+def ensure_broker_10d_warrant_prices(
+    price_cache,
+    items,
+    target_date=None,
+    persistent_price_cache=None,
+    defer_save=False,
+):
     """
     近10日分點買賣明細需要用「最新權證價格」估算買超部位放到現在的報酬。
 
@@ -12487,11 +13229,15 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     3. 本機價格快取完整保存；Google Sheet 價格快取可增量 append，避免整張重寫拖慢。
     """
     if not BROKER_10D_DETAIL_ENABLED:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     codes = _collect_recent_warrant_codes_for_10d(items, target_date)
     if not codes:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     target_date = normalize_top15_target_date(target_date)
     target_dt = parse_date(target_date) or datetime.today()
@@ -12505,7 +13251,15 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     fast_start_dt = target_dt - timedelta(days=fast_lookback_days)
     full_start_dt = target_dt - timedelta(days=full_lookback_days)
 
-    persistent_price_cache = load_price_cache()
+    if persistent_price_cache is None:
+        persistent_price_cache = load_price_cache()
+
+    changed_price_codes = merge_market_close_prices_into_cache(
+        price_cache,
+        persistent_price_cache,
+        target_date,
+        wanted_codes=codes,
+    )
     fetch_plan = {}
 
     for code in sorted(codes):
@@ -12527,7 +13281,12 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
     print(f"  近10日分點明細價格補抓策略：先抓近 {fast_lookback_days} 天，完全無價格才補抓近 {full_lookback_days} 天")
 
     if not fetch_plan:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     def fetch_one(code):
         fast_sdt, edt, full_sdt = fetch_plan[code]
@@ -12548,7 +13307,6 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
         return code, fetched_prices
 
     done = 0
-    changed_price_codes = set()
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
 
@@ -12575,8 +13333,12 @@ def ensure_broker_10d_warrant_prices(price_cache, items, target_date=None):
             if done % 20 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 近10日分點明細權證價格補抓中...")
 
-    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
-    return price_cache
+    return _finish_price_ensure(
+        price_cache,
+        persistent_price_cache,
+        changed_price_codes,
+        defer_save=defer_save,
+    )
 
 def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None):
     """
@@ -14421,7 +15183,13 @@ def _collect_all_item_price_codes_for_prefetch(items):
     return warrant_codes, underlying_codes
 
 
-def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
+def ensure_price_prefetch_all_item_prices(
+    price_cache,
+    items,
+    target_date=None,
+    persistent_price_cache=None,
+    defer_save=False,
+):
     """
     價格預抓完整模式：補抓所有既有分點歷史項目會牽涉到的價格。
 
@@ -14436,13 +15204,17 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
     - 權證與標的股分開使用不同 lookback，避免權證太久沒成交時完全抓不到價格。
     """
     if not PRICE_PREFETCH_ALL_ITEM_PRICES:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     warrant_codes, underlying_codes = _collect_all_item_price_codes_for_prefetch(items)
 
     if not warrant_codes and not underlying_codes:
         print("  ✅ 價格預抓完整模式：沒有可預抓的權證 / 標的股代號。")
-        return price_cache
+        return _finish_price_ensure(
+            price_cache, persistent_price_cache, set(), defer_save=defer_save
+        )
 
     target_date = normalize_price_prefetch_target_date(target_date)
     target_dt = parse_date(target_date) or datetime.today()
@@ -14451,7 +15223,16 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
     warrant_lookback_days = max(int(PRICE_PREFETCH_ALL_WARRANT_PRICE_LOOKBACK_DAYS), 1)
     underlying_lookback_days = max(int(PRICE_PREFETCH_ALL_UNDERLYING_PRICE_LOOKBACK_DAYS), 1)
 
-    persistent_price_cache = load_price_cache()
+    if persistent_price_cache is None:
+        persistent_price_cache = load_price_cache()
+
+    all_prefetch_codes = set(warrant_codes) | set(underlying_codes)
+    changed_price_codes = merge_market_close_prices_into_cache(
+        price_cache,
+        persistent_price_cache,
+        target_date,
+        wanted_codes=all_prefetch_codes,
+    )
     fetch_plan = {}
 
     def add_to_fetch_plan(code, code_type):
@@ -14501,14 +15282,18 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
     )
 
     if not fetch_plan:
-        return price_cache
+        return _finish_price_ensure(
+            price_cache,
+            persistent_price_cache,
+            changed_price_codes,
+            defer_save=defer_save,
+        )
 
     def fetch_one(code):
         start_dt, end_dt, code_type = fetch_plan[code]
         return code, fetch_twse_prices(code, start_dt, end_dt)
 
     done = 0
-    changed_price_codes = set()
 
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
         futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
@@ -14536,12 +15321,16 @@ def ensure_price_prefetch_all_item_prices(price_cache, items, target_date=None):
             if done % 50 == 0:
                 print(f"  [{done}/{len(fetch_plan)}] 完整價格預抓中...")
 
-    save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
-    return price_cache
+    return _finish_price_ensure(
+        price_cache,
+        persistent_price_cache,
+        changed_price_codes,
+        defer_save=defer_save,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 自動價格預抓：今日分點資料未出現時，只更新價格快取並快速結束
+# 自動價格預抓：API4 今日市場資料尚未確認時，只更新價格快取並快速結束
 # ══════════════════════════════════════════════════════════════════════
 
 def normalize_price_prefetch_target_date(target_date=None):
@@ -14740,7 +15529,11 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
 
     try:
         if candidate_keys:
-            items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+            items = (
+        []
+        if confirmed_empty_candidates or not candidate_keys
+        else items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    )
         else:
             items = items_from_history_cache(history_cache_df)
     except Exception:
@@ -14795,7 +15588,20 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
     return len(missing_codes) == 0, summary
 
 
+def has_today_market_data_from_prescan(target_date=None):
+    """API4 是否已出現任一有效的今日市場資料列，不限定追蹤分點。"""
+    target_date = normalize_price_prefetch_target_date(target_date)
+    today_s = datetime.today().strftime("%Y/%m/%d")
+
+    if target_date != today_s:
+        # 目前 prescan 掃描的結束日固定為今天；自訂其他日期時不做錯誤推論。
+        return False
+
+    return bool(PRESCAN_MARKET_TODAY_DATA_FOUND)
+
+
 def has_today_broker_data_from_prescan(target_date=None):
+    """今天是否有命中目前追蹤的目標分點活動。"""
     target_date = normalize_price_prefetch_target_date(target_date)
 
     if PRESCAN_TODAY_ACTIVITY_FOUND:
@@ -15252,7 +16058,7 @@ def build_price_prefetch_context_from_items(items):
 
 
 def filter_items_for_selected_scope(items):
-    """從已抓好的全分點資料中篩出精選五分點，不重新呼叫 API。"""
+    """從已抓好的完整追蹤分點資料中篩出精選五分點，不重新呼叫 API。"""
     selected_labels = set(parse_selected_target_labels())
     return [
         item for item in (items or [])
@@ -15269,7 +16075,7 @@ def build_selected_scope_excel(
     top15_detail_rows=None,
     top15_consensus_rows=None,
 ):
-    """只建立產圖需要的精選五分點結果表；資料全部來自全分點已抓結果。"""
+    """只建立產圖需要的精選五分點結果表；資料全部來自同次完整追蹤分點結果。"""
     a_events, b_events, c_events, d_events, e_events = selected_events
     wb = Workbook()
     wb.remove(wb.active)
@@ -15293,23 +16099,9 @@ def build_selected_scope_excel(
     return output_path
 
 
-def build_top15_only_excel(detail_rows, consensus_rows, output_path):
-    """價格預抓模式專用：只建立兩張 TOP15 工作表。"""
-    wb = Workbook()
-    wb.remove(wb.active)
-    write_top15_consensus_cache_sheet(wb, consensus_rows or [])
-    write_top15_position_detail_sheet(wb, detail_rows or [])
-    apply_global_amount_comma_format(wb)
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    wb.save(output_path)
-    return output_path
-
-
-def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, target_date=None, reason="今日分點資料尚未出現"):
+def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, target_date=None, reason="API4 今日市場資料尚未確認"):
     """
-    當 API4 預掃描沒有看到今日目標分點資料時，自動改跑價格預抓。
+    當 API4 預掃描尚未確認今日市場資料已更新時，自動改跑價格預抓。
 
     這個模式只會：
     1. 讀既有分點歷史快取
@@ -15318,7 +16110,7 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
     4. 更新 price_cache.csv / 快取_價格
     5. 寫入 price_prefetch_state.csv，避免同一天重複慢抓
 
-    不會同步 A/B/C/D/E 或近10日結果；價格補完後只重算並同步兩張 TOP15 工作表。
+    不會建立 Excel、不會同步 A/B/C/D/E、TOP15、近10日分點明細結果，因此不會把尚未完整的當日分點資料寫到結果表。
     """
     target_date = normalize_price_prefetch_target_date(target_date)
     start_ts = time.time()
@@ -15368,56 +16160,87 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         f"A:{len(a_events):,}｜B:{len(b_events):,}｜C:{len(c_events):,}｜D:{len(d_events):,}｜E:{len(e_events):,}"
     )
 
+    # 整個價格預抓流程只在這裡讀取一次持久價格快取，所有價格函式共用同一個 dict。
+    persistent_price_cache = load_price_cache()
+    all_changed_price_codes = set()
+
     if a_events or b_events or c_events or d_events or e_events:
-        price_cache = fetch_all_prices(a_events, b_events, c_events, d_events, e_events)
+        price_cache, changed_codes = fetch_all_prices(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            e_events,
+            persistent_price_cache=persistent_price_cache,
+            defer_save=True,
+        )
+        all_changed_price_codes.update(changed_codes)
+
+        # TOP15 固定資料集共用同一份持久價格快取，僅回報變更代號，不在函式內儲存。
+        build_top15_position_detail_and_consensus_rows(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            e_events,
+            item_map,
+            price_cache,
+            target_date=target_date,
+            persistent_price_cache=persistent_price_cache,
+            defer_price_save=True,
+            price_changed_codes=all_changed_price_codes,
+        )
     else:
-        price_cache = load_price_cache()
+        price_cache = {}
+        for code, prices in persistent_price_cache.items():
+            add_price_aliases(price_cache, code, prices)
         print("  ⚠️ 快取資料目前無 A/B/C/D/E 事件，略過事件價格預抓，只檢查其他價格需求。")
 
     # 不論 RUN_MODE 為何，價格預抓都先補近10日分點明細會用到的標的股價格。
     # 這是為了讓盤後現股收盤價可以先進 price_cache，避免之後分點資料更新時「現股10日」仍停在前一交易日。
-    price_cache = ensure_broker_10d_underlying_prices(price_cache, items, target_date=target_date)
+    price_cache, changed_codes = ensure_broker_10d_underlying_prices(
+        price_cache,
+        items,
+        target_date=target_date,
+        persistent_price_cache=persistent_price_cache,
+        defer_save=True,
+    )
+    all_changed_price_codes.update(changed_codes)
 
     if RUN_MODE == 2:
-        price_cache = ensure_broker_10d_warrant_prices(price_cache, items, target_date=target_date)
+        price_cache, changed_codes = ensure_broker_10d_warrant_prices(
+            price_cache,
+            items,
+            target_date=target_date,
+            persistent_price_cache=persistent_price_cache,
+            defer_save=True,
+        )
+        all_changed_price_codes.update(changed_codes)
     else:
         print("  ✅ RUN_MODE=1：近10日分點明細工作表不更新，因此價格預抓略過該表權證價。")
 
     # 完整價格預抓：不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
     # 也把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
-    price_cache = ensure_price_prefetch_all_item_prices(price_cache, items, target_date=target_date)
+    price_cache, changed_codes = ensure_price_prefetch_all_item_prices(
+        price_cache,
+        items,
+        target_date=target_date,
+        persistent_price_cache=persistent_price_cache,
+        defer_save=True,
+    )
+    all_changed_price_codes.update(changed_codes)
 
-    top15_sync_ok = False
-    if a_events or b_events or c_events or d_events or e_events:
-        full_detail_rows, full_consensus_rows = build_top15_position_detail_and_consensus_rows(
-            a_events, b_events, c_events, d_events, e_events,
-            item_map, price_cache,
-            target_date=target_date,
-            data_scope="全分點",
-            allow_price_fetch=False,
+    if all_changed_price_codes:
+        save_price_cache(
+            persistent_price_cache,
+            changed_codes=all_changed_price_codes,
         )
-
-        selected_items = filter_items_for_selected_scope(items)
-        selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
-        selected_detail_rows, selected_consensus_rows = build_top15_position_detail_and_consensus_rows(
-            sa, sb, sc, sd, se,
-            selected_item_map, price_cache,
-            target_date=target_date,
-            data_scope="精選五分點",
-            allow_price_fetch=False,
+        print(
+            f"  💾 價格預抓快取已統一儲存："
+            f"本次更新 {len(all_changed_price_codes):,} 個代號"
         )
-
-        top15_titles = {TOP15_POSITION_DETAIL_SHEET, TOP15_CONSENSUS_SHEET}
-        full_top15_path = os.path.join(OUTPUT_DIR, f"top15_prefetch_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        selected_top15_path = os.path.join(OUTPUT_DIR, f"top15_prefetch_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        build_top15_only_excel(full_detail_rows, full_consensus_rows, full_top15_path)
-        upload_excel_to_google_sheet(full_top15_path, data_scope="全分點", allowed_titles=top15_titles)
-        build_top15_only_excel(selected_detail_rows, selected_consensus_rows, selected_top15_path)
-        upload_excel_to_google_sheet(selected_top15_path, data_scope="精選五分點", allowed_titles=top15_titles)
-        top15_sync_ok = True
-        print("  ✅ 價格預抓完成後，已同步全分點與精選五分點 TOP15。")
     else:
-        print("  ⚠️ 無事件可建立 TOP15，本次只更新價格快取。")
+        print("  ✅ 價格預抓快取沒有新增或更新，略過儲存。")
 
     price_summary = price_cache_target_date_summary(price_cache, target_date)
     elapsed = time.time() - start_ts
@@ -15425,8 +16248,7 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         "日期": target_date,
         "資料範圍": scope,
         "模式": "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING",
-        "狀態": "done" if top15_sync_ok else "price_done",
-        "TOP15同步狀態": "done" if top15_sync_ok else "skipped",
+        "狀態": "done",
         "原因": reason,
         "候選組合數": len(candidate_keys or []),
         "快取歷史筆數": len(history_cache_df),
@@ -15441,7 +16263,7 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
         "執行時間": f"{elapsed:.2f}",
     })
 
-    print(f"  ✅ 價格預抓完成，已記錄今日狀態，下次今日分點資料仍未出現時會快速略過。耗時 {elapsed:.2f} 秒")
+    print(f"  ✅ 價格預抓完成，已記錄今日狀態；下次 API4 今日市場資料仍未確認時會快速略過。耗時 {elapsed:.2f} 秒")
     return True
 
 
@@ -15450,9 +16272,9 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
     在正式 API5 大量更新前判斷是否要改跑價格預抓。
 
     判斷依據使用剛剛 API4 預掃描結果：
-    - 若 API4 已看到今日目標分點資料 → 正常跑正式流程。
-    - 若 API4 尚未看到今日目標分點資料 → 不產生報表，改成價格預抓。
-    - 若今日已經預抓過且 API4 仍未看到今日資料 → 快速結束。
+    - 若 API4 已看到任一有效的今日市場資料 → 正常跑正式流程，即使目標分點今天零交易。
+    - 若 API4 尚未確認今日市場資料 → 不產生報表，改成價格預抓。
+    - 若今日已經預抓過且 API4 市場資料仍未確認 → 快速結束。
     """
     if not AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING:
         return False
@@ -15466,13 +16288,13 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
         )
         return False
 
-    if has_today_broker_data_from_prescan(target_date):
+    if has_today_market_data_from_prescan(target_date):
         return False
 
     latest_label = PRESCAN_LATEST_ACTIVITY_DATE.strftime("%Y/%m/%d") if PRESCAN_LATEST_ACTIVITY_DATE else "-"
     print(
-        f"  ⚠️ API4 尚未看到 {target_date} 的目標分點資料｜"
-        f"目前最新活動日：{latest_label}。"
+        f"  ⚠️ API4 尚未確認 {target_date} 的市場資料已更新｜"
+        f"目標分點目前最新活動日：{latest_label}。"
     )
 
     candidate_keys = {candidate_key_from_tuple(c) for c in candidates} if candidates else None
@@ -15496,12 +16318,12 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
             if has_required_10d_underlying_prices:
                 print(
                     "  ✅ 今日已完成價格預抓，且近10日現股所需標的股已有目標日收盤價；"
-                    "分點資料仍未出現，略過正式報表與價格重抓，快速結束。"
+                    "API4 今日市場資料仍未確認，略過正式報表與價格重抓，快速結束。"
                 )
                 write_prescan_status(
                     "broker_data_not_ready",
                     target_date=target_date,
-                    reason="分點資料尚未出現；價格預抓已完成，快速結束",
+                    reason="API4 今日市場資料尚未確認；價格預抓已完成，快速結束",
                     candidate_count=len(candidates or []),
                     candidate_cache_saved=False,
                 )
@@ -15520,11 +16342,11 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
                 "本次再嘗試預抓盤後最新價格。"
             )
         else:
-            print("  ✅ 今日已完成價格預抓，且分點資料仍未出現；略過正式報表與價格重抓，快速結束。")
+            print("  ✅ 今日已完成價格預抓，且 API4 今日市場資料仍未確認；略過正式報表與價格重抓，快速結束。")
             write_prescan_status(
                 "broker_data_not_ready",
                 target_date=target_date,
-                reason="分點資料尚未出現；價格預抓已完成，快速結束",
+                reason="API4 今日市場資料尚未確認；價格預抓已完成，快速結束",
                 candidate_count=len(candidates or []),
                 candidate_cache_saved=False,
             )
@@ -15539,12 +16361,12 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
         history_cache_df,
         candidate_keys=candidate_keys,
         target_date=target_date,
-        reason="API4 尚未看到今日目標分點資料",
+        reason="API4 尚未確認今日市場資料已更新",
     )
     write_prescan_status(
         "broker_data_not_ready",
         target_date=target_date,
-        reason="API4 尚未看到今日目標分點資料；已完成價格預抓",
+        reason="API4 尚未確認今日市場資料已更新；已完成價格預抓",
         candidate_count=len(candidates or []),
         candidate_cache_saved=False,
     )
@@ -16639,12 +17461,90 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
 
 # ══════════════════════════════════════════════════════════════════════
+# 空結果安全同步判斷
+# ══════════════════════════════════════════════════════════════════════
+
+def evaluate_empty_result_source_completeness(
+    broker_map,
+    candidates,
+    candidates_to_fetch,
+    history_cache_df,
+    allow_empty_candidates=False,
+):
+    """
+    判斷本次來源是否完整到足以把「空結果」同步到 Google Sheet。
+
+    只有下列條件全部成立才允許：
+    1. 上市與上櫃即時權證清單都成功取得。
+    2. 所有目前設定的追蹤分點都有券商代號。
+    3. daily 模式下，prescan 已確認 API4 今日市場資料、API4 請求完整，並保存候選狀態。
+    4. 本次需要打 API5 的候選全部成功收到可解析回應；空 Result 也算成功。
+    5. 有候選但本次完全沒有 API5 請求時，必須已有可用歷史快取。
+    6. 候選為 0 時，只有 allow_empty_candidates=True 且 prescan／即時來源完整才可視為合法空結果。
+
+    回傳：(是否完整, 原因清單)
+    """
+    reasons = []
+
+    if not LIVE_WARRANT_SNAPSHOT_READY:
+        reasons.append("上市／上櫃即時權證清單未完整取得")
+
+    active_labels = set(TARGET_PATTERNS.keys())
+    broker_labels = set((broker_map or {}).keys())
+    missing_brokers = sorted(active_labels - broker_labels)
+    if missing_brokers:
+        reasons.append(f"追蹤分點代號不完整：缺少 {len(missing_brokers)} 個")
+
+    prescan_record = find_valid_prescan_success_record() if workflow_is_daily() else None
+
+    if not candidates:
+        if not allow_empty_candidates:
+            reasons.append("候選清單為空")
+        elif not workflow_is_daily() and not LIVE_WARRANT_SNAPSHOT_READY:
+            reasons.append("候選清單為空，且權證來源完整性未確認")
+
+    if workflow_is_daily():
+        if prescan_record is None:
+            reasons.append("尚未確認今日 prescan success")
+        elif allow_empty_candidates:
+            if not has_today_market_data_from_prescan():
+                reasons.append("API4 尚未確認今日市場資料已更新")
+            if not API4_REQUESTS_COMPLETE:
+                reasons.append("API4 請求不完整，無法證明零候選")
+
+    requested_keys = {
+        _api5_request_status_key(candidate[0], candidate[6])
+        for candidate, _fetch_limit in (candidates_to_fetch or [])
+    }
+
+    with API5_REQUEST_STATUS_LOCK:
+        success_keys = set(API5_REQUEST_SUCCESS_KEYS)
+        failed_keys = set(API5_REQUEST_FAILED_KEYS)
+
+    failed_requested = requested_keys & failed_keys
+    missing_status = requested_keys - success_keys - failed_keys
+
+    if failed_requested:
+        reasons.append(f"API5 請求失敗 {len(failed_requested)} 組")
+    if missing_status:
+        reasons.append(f"API5 請求狀態不明 {len(missing_status)} 組")
+
+    # 合法 0 候選不需要 API5 或舊歷史來證明資料完整；prescan success 就是空結果證明。
+    if candidates and not requested_keys and (history_cache_df is None or history_cache_df.empty):
+        reasons.append("沒有 API5 成功回應，也沒有可用歷史快取")
+
+    return not reasons, reasons
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     MONEYDJ_SEARCH_REPAIR_DISCOVERY_FETCH_KEYS.clear()
+    reset_api4_request_status()
+    reset_api5_request_status()
     program_start = time.time()
 
     configure_run_mode()
@@ -16686,19 +17586,15 @@ def main():
         return
 
     if workflow_is_daily():
-        # 若今天已有 prescan success，直接交給 prescan_all() 驗證並讀回 keys；
-        # 避免輕量探測樣本剛好今日無交易而誤判停止。
+        # 若今天已有 prescan success，直接交給 prescan_all() 驗證並讀回 keys。
+        # 輕量探測只提供正向訊號；樣本沒有今天資料時不能據此停止，
+        # 因為可能只是追蹤分點／樣本權證今天剛好零交易。
         if find_valid_prescan_success_record() is None:
             probe_result = light_probe_today_broker_data(warrants, broker_map)
-            if probe_result is False:
-                print("  ⚠️ 輕量探測未看到今日分點資料：不跑全市場 prescan，改為價格預抓後停止。")
-                prefetch_candidates = filter_candidates_by_broker_map(load_candidates_cache(), broker_map)
-                if prefetch_candidates:
-                    print(f"  ✅ 價格預抓範圍改用既有候選快取：{len(prefetch_candidates):,} 組")
-                else:
-                    print("  ⚠️ 沒有既有候選快取可縮小範圍，價格預抓將回退使用歷史快取全範圍。")
-                if maybe_auto_price_prefetch_before_api5(prefetch_candidates, program_start):
-                    return
+            if probe_result is True:
+                print("  ✅ 輕量探測已看到 API4 今日市場資料，繼續正式 prescan。")
+            else:
+                print("  ⚠️ 輕量探測無法確認 API4 今日市場資料，繼續正式 prescan 以區分尚未更新與合法零候選。")
         else:
             print("  ✅ 已找到今日 prescan success 狀態，略過輕量探測，稍後直接驗證並讀取候選快取。")
 
@@ -16781,11 +17677,34 @@ def main():
     if maybe_auto_price_prefetch_before_api5(candidates, program_start):
         return
 
+    confirmed_empty_candidates = False
+
     if not candidates:
-        print("⚠️ 預篩後無候選")
-        elapsed = time.time() - program_start
-        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
-        return
+        source_complete, source_incomplete_reasons = evaluate_empty_result_source_completeness(
+            broker_map,
+            candidates,
+            [],
+            history_cache_for_repair_pool,
+            allow_empty_candidates=True,
+        )
+
+        if source_complete:
+            confirmed_empty_candidates = True
+            candidates = []
+            print(
+                "  ✅ prescan 與來源完整性已確認，本次確實沒有候選組合；"
+                "將繼續建立空結果並同步 Google Sheet。"
+            )
+        else:
+            print(
+                "⚠️ 預篩後無候選，但來源完整性未確認；"
+                "為避免誤清空 Google Sheet，本次停止同步。"
+            )
+            for reason in source_incomplete_reasons:
+                print(f"  ⚠️ 完整性檢查：{reason}")
+            elapsed = time.time() - program_start
+            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+            return
 
     print(f"\n【Step 3b】處理 {len(candidates)} 組候選...")
 
@@ -16811,7 +17730,11 @@ def main():
         if pruned_count > 0:
             print(f"  ✅ 增量模式已略過舊候選快取中的無歷史資料空候選：{pruned_count:,} 組")
 
-    cached_items = items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    cached_items = (
+        []
+        if confirmed_empty_candidates or not candidate_keys
+        else items_from_history_cache(history_cache_df, candidate_filter=candidate_keys)
+    )
 
     if cached_items:
         print(f"  ✅ 已從原始分點資料快取還原 {len(cached_items)} 組資料")
@@ -16820,13 +17743,24 @@ def main():
 
     for c in candidates:
         key = candidate_key_from_tuple(c)
+        latest_dt = history_latest_map.get(key)
+
+        if latest_dt is not None and not isinstance(latest_dt, datetime):
+            latest_dt = parse_date(latest_dt)
+
+        if latest_dt:
+            lag = max((datetime.today().date() - latest_dt.date()).days, 0)
+            fetch_limit = min(max(lag + 10, 15), API5_HISTORY_LIMIT)
+        else:
+            # 全新候選沒有任何 API5 歷史快取，仍抓完整保留區間。
+            fetch_limit = API5_HISTORY_LIMIT
 
         if key in MONEYDJ_SEARCH_REPAIR_FETCH_KEYS:
-            candidates_to_fetch.append(c)
+            candidates_to_fetch.append((c, fetch_limit))
             continue
 
         if should_fetch_candidate_incremental(key, history_keys, history_latest_map, PRESCAN_REFRESH_KEYS, PRESCAN_MISSING_FETCH_KEYS):
-            candidates_to_fetch.append(c)
+            candidates_to_fetch.append((c, fetch_limit))
 
     print(f"  ✅ 快取已有候選：{len(history_keys & candidate_keys)} 組")
     print(f"  ✅ API4 直接近期活動候選：{len(PRESCAN_REFRESH_KEYS & candidate_keys)} 組")
@@ -16835,6 +17769,15 @@ def main():
         print(f"  ✅ MoneyDJ Search 強制補漏候選：{len(MONEYDJ_SEARCH_REPAIR_FETCH_KEYS & candidate_keys)} 組")
     print(f"  ✅ 增量更新模式：CACHE_INCREMENTAL_UPDATE_ENABLED={CACHE_INCREMENTAL_UPDATE_ENABLED}，目標日期={get_incremental_refresh_target_dt().strftime('%Y/%m/%d')}")
     print(f"  ✅ 本次需要 API5 更新：{len(candidates_to_fetch)} 組")
+    if candidates_to_fetch:
+        limit_counts = {}
+        for _, fetch_limit in candidates_to_fetch:
+            limit_counts[fetch_limit] = limit_counts.get(fetch_limit, 0) + 1
+        limit_summary = "、".join(
+            f"limit={limit_value}:{count:,}組"
+            for limit_value, count in sorted(limit_counts.items())
+        )
+        print(f"  ✅ API5 動態抓取範圍：{limit_summary}")
 
     fetched_items = []
     done = 0
@@ -16842,8 +17785,8 @@ def main():
     if candidates_to_fetch:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {
-                ex.submit(process_candidate, *c): c
-                for c in candidates_to_fetch
+                ex.submit(process_candidate, *candidate, limit=fetch_limit): (candidate, fetch_limit)
+                for candidate, fetch_limit in candidates_to_fetch
             }
 
             for future in as_completed(futures):
@@ -16876,11 +17819,28 @@ def main():
     if not items and fetched_items:
         items = fetched_items
 
+    source_complete, source_incomplete_reasons = evaluate_empty_result_source_completeness(
+        broker_map,
+        candidates,
+        candidates_to_fetch,
+        history_cache_df,
+        allow_empty_candidates=confirmed_empty_candidates,
+    )
+
     if not items:
-        print("⚠️ 無任何候選資料")
-        elapsed = time.time() - program_start
-        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
-        return
+        if source_complete:
+            print(
+                "  ✅ 已確認權證清單、今日 prescan 與 API5 請求完整；"
+                "本次確實沒有候選資料，將建立空結果並同步 Google Sheet，清除舊快照。"
+            )
+            items = []
+        else:
+            print("⚠️ 無任何候選資料，但來源完整性未確認；為避免誤清空 Google Sheet，本次停止同步。")
+            for reason in source_incomplete_reasons:
+                print(f"  ⚠️ 完整性檢查：{reason}")
+            elapsed = time.time() - program_start
+            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+            return
 
     item_map = {}
 
@@ -16902,17 +17862,47 @@ def main():
     )
 
     if not a_events and not b_events and not c_events and not d_events and not e_events:
-        print("⚠️ A/B/C/D/E 皆無事件")
-        elapsed = time.time() - program_start
-        print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
-        return
+        if source_complete:
+            print(
+                "  ✅ A/B/C/D/E 皆無事件，且來源完整性已確認；"
+                "將繼續建立空結果並同步 Google Sheet，清除目前快照型工作表的舊資料。"
+            )
+        else:
+            print("⚠️ A/B/C/D/E 皆無事件，但來源完整性未確認；為避免誤清空 Google Sheet，本次停止同步。")
+            for reason in source_incomplete_reasons:
+                print(f"  ⚠️ 完整性檢查：{reason}")
+            elapsed = time.time() - program_start
+            print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
+            return
 
-    price_cache = fetch_all_prices(a_events, b_events, c_events, d_events, e_events)
+    # 正式流程的所有價格需求共用同一份持久價格快取：只讀一次，最後只寫一次。
+    persistent_price_cache = load_price_cache()
+    all_changed_price_codes = set()
+
+    price_cache, changed_codes = fetch_all_prices(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        persistent_price_cache=persistent_price_cache,
+        defer_save=True,
+    )
+    all_changed_price_codes.update(changed_codes)
+
     top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
-        a_events, b_events, c_events, d_events, e_events,
-        item_map, price_cache,
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        item_map,
+        price_cache,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allow_price_fetch=True,
+        persistent_price_cache=persistent_price_cache,
+        defer_price_save=True,
+        price_changed_codes=all_changed_price_codes,
     )
 
     selected_items = []
@@ -16926,21 +17916,40 @@ def main():
         selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
         selected_events = (sa, sb, sc, sd, se)
         selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
-            sa, sb, sc, sd, se,
-            selected_item_map, price_cache,
+            sa,
+            sb,
+            sc,
+            sd,
+            se,
+            selected_item_map,
+            price_cache,
             data_scope="精選五分點",
             allow_price_fetch=False,
         )
         print(
-            f"  ✅ 已直接從全分點資料切出精選五分點：{len(selected_items):,} 組，"
+            f"  ✅ 已直接從完整追蹤分點資料切出精選五分點：{len(selected_items):,} 組，"
             "未重新呼叫 API4／API5／價格 API。"
         )
 
     warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
 
     if RUN_MODE == 2:
-        price_cache = ensure_broker_10d_underlying_prices(price_cache, items)
-        price_cache = ensure_broker_10d_warrant_prices(price_cache, items)
+        price_cache, changed_codes = ensure_broker_10d_underlying_prices(
+            price_cache,
+            items,
+            persistent_price_cache=persistent_price_cache,
+            defer_save=True,
+        )
+        all_changed_price_codes.update(changed_codes)
+
+        price_cache, changed_codes = ensure_broker_10d_warrant_prices(
+            price_cache,
+            items,
+            persistent_price_cache=persistent_price_cache,
+            defer_save=True,
+        )
+        all_changed_price_codes.update(changed_codes)
+
         broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache)
         broker_10d_winrate_rank_rows = build_10d_broker_winrate_rank_rows(broker_10d_detail_rows)
     else:
@@ -16948,17 +17957,26 @@ def main():
         broker_10d_detail_rows = None
         broker_10d_winrate_rank_rows = None
 
+    if all_changed_price_codes:
+        save_price_cache(
+            persistent_price_cache,
+            changed_codes=all_changed_price_codes,
+        )
+        print(
+            f"  💾 本次價格快取已統一儲存："
+            f"本次更新 {len(all_changed_price_codes):,} 個代號"
+        )
+    else:
+        print("  ✅ 本次價格快取沒有新增或更新，略過儲存。")
+
     build_excel(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache, items, output_path,
         top15_detail_rows, top15_consensus_rows, warrant_consensus_7d_rows, broker_10d_detail_rows, broker_10d_winrate_rank_rows
     )
-    upload_excel_to_google_sheet(
-        output_path,
-        data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
-    )
 
-    if RUN_MODE == 2 and selected_items:
+    extra_scope_values = None
+    if RUN_MODE == 2:
         selected_output_path = os.path.join(
             OUTPUT_DIR,
             f"warrant_backtest_ABCDE_selected5_{today_fn}.xlsx",
@@ -16980,11 +17998,20 @@ def main():
             "近兩月買賣金額排行",
             "近兩月分點數排行",
         }
-        upload_excel_to_google_sheet(
+        extra_scope_values = read_excel_values_by_title(
             selected_output_path,
-            data_scope="精選五分點",
             allowed_titles=selected_titles,
         )
+        print(
+            f"  ✅ 精選五分點結果已整理成單次同步資料："
+            f"{len(extra_scope_values):,} 張工作表，不再執行第二輪 Google Sheet 同步。"
+        )
+
+    upload_excel_to_google_sheet(
+        output_path,
+        data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
+        extra_scope_values=extra_scope_values,
+    )
 
     elapsed = time.time() - program_start
     minutes = int(elapsed // 60)
