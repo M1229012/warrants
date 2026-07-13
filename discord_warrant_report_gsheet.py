@@ -962,6 +962,7 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         "剩餘成本", "目前剩餘成本", "淨買超成本", "remaining_cost",
         "目前市值", "未實現損益", "可估成本", "缺價格成本",
         "報酬率", "報酬率文字", "價格狀態",
+        "最新價格日期", "更新時間", "run_id",
     ]
 
     df = read_gsheet_table_optional(
@@ -1002,6 +1003,38 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
             chosen_date = max(valid) if valid else max(available_dates)
         else:
             chosen_date = max(available_dates)
+
+    if chosen_date:
+        df = df[df.apply(lambda r: pick_cache_date(r) == chosen_date, axis=1)].copy()
+        df = filter_latest_cache_snapshot(
+            df,
+            SHEET_TOP15_POSITION_DETAIL,
+            prefer_max_run_id=True,
+        )
+
+        selected_run_ids = [
+            strip_gsheet_text_prefix(v).strip()
+            for v in df.get("run_id", [])
+            if strip_gsheet_text_prefix(v).strip()
+        ]
+        selected_run_id = selected_run_ids[0] if selected_run_ids else "-"
+
+        latest_price_dates = [
+            parse_date_value(v)
+            for v in df.get("最新價格日期", [])
+            if parse_date_value(v)
+        ]
+        latest_price_date_text = (
+            f"{max(latest_price_dates):%Y-%m-%d}"
+            if latest_price_dates
+            else "-"
+        )
+
+        print(
+            f"  ✅ TOP15 部位明細快照：統計日期={chosen_date:%Y-%m-%d}｜"
+            f"run_id={selected_run_id}｜最新權證價格日期={latest_price_date_text}｜"
+            f"筆數={len(df):,}"
+        )
 
     agg: dict[tuple[str, str], dict] = defaultdict(lambda: {
         "cost": 0.0,
@@ -1143,8 +1176,24 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         chosen_date = max(available_dates)
 
     df = df[df.apply(lambda r: pick_cache_date(r) == chosen_date, axis=1)].copy()
+    df = filter_latest_cache_snapshot(
+        df,
+        SHEET_TOP15_CONSENSUS_CACHE,
+        prefer_max_run_id=True,
+    )
     if df.empty:
         return [], empty_meta
+
+    selected_run_ids = [
+        strip_gsheet_text_prefix(v).strip()
+        for v in df.get("run_id", [])
+        if strip_gsheet_text_prefix(v).strip()
+    ]
+    selected_run_id = selected_run_ids[0] if selected_run_ids else "-"
+    print(
+        f"  ✅ TOP15 共識快取快照：統計日期={chosen_date:%Y-%m-%d}｜"
+        f"run_id={selected_run_id}｜筆數={len(df):,}"
+    )
 
     position_map = read_top15_position_detail_cache_from_gsheet(chosen_date)
 
@@ -1186,9 +1235,11 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
 
         target_label = f"{underlying} {stock_name}".strip() if stock_name else underlying
 
-        participant_brokers = _parse_top15_broker_json(row.get("分點明細_JSON", ""))
+        # 報酬率優先採用同一統計日期、最新 run_id 的部位明細；
+        # 共識快取 JSON 與文字欄位只作為舊版資料備援。
+        participant_brokers = position_map.get(underlying, [])
         if not participant_brokers:
-            participant_brokers = position_map.get(underlying, [])
+            participant_brokers = _parse_top15_broker_json(row.get("分點明細_JSON", ""))
         if not participant_brokers:
             participant_brokers = _parse_top15_broker_text(row.get("參與分點明細", ""))
 
@@ -1490,6 +1541,40 @@ def resolve_target_identity(
         target_label = raw_target or underlying
 
     return underlying, underlying_name, target_label
+
+
+def infer_latest_top15_cache_date() -> date:
+    """
+    從「快取_TOP15共識淨買超」取得近一個月 TOP15 最新統計日期。
+
+    TOP15 報酬率是由主程式的快取更新，不應受 A/B/C/D/E 當天是否有新事件影響。
+    若 TOP15 快取尚未建立，才退回原本 A/B/C/D/E 日期推斷。
+    """
+    needed_cols = ["資料範圍", "統計日期", "日期", "目標日期"]
+    df = read_gsheet_table_optional(
+        SHEET_TOP15_CONSENSUS_CACHE,
+        needed_cols,
+        filter_tracked_brokers=False,
+    )
+    df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
+
+    candidates = []
+    if not df.empty:
+        for _, row in df.iterrows():
+            d = _pick_first_existing_date(row, ["統計日期", "日期", "目標日期"])
+            if d:
+                candidates.append(d)
+
+    if candidates:
+        latest = max(candidates)
+        print(f"  ✅ TOP15 採用最新快取統計日期：{latest:%Y-%m-%d}")
+        return latest
+
+    print(
+        f"  ⚠️ {SHEET_TOP15_CONSENSUS_CACHE} 沒有可用統計日期，"
+        "改用 A/B/C/D/E 工作表推斷日期。"
+    )
+    return infer_latest_date_from_gsheet()
 
 
 def infer_latest_date_from_gsheet() -> date:
@@ -3388,7 +3473,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         scope_text = str(large_event_rows[0].get("selected_scope") or large_event_rows[0].get("scope") or "").strip()
         scope_prefix = "全分點" if scope_text == DATA_SCOPE_ALL else "五分點" if scope_text == DATA_SCOPE_SELECTED5 else ""
 
-        large_title = f"{date_label} {scope_prefix}大額資金布局".replace("  ", " ")
+        large_title = f"{date_label} 權證追蹤分點大額資金布局"
 
         large_headers = ["排名", "分點", "事件", "標的", "內容", "累積買進"]
         large_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
@@ -5899,6 +5984,8 @@ def main():
 
     if args.date:
         target = datetime.strptime(args.date, "%Y-%m-%d").date()
+    elif action == IMAGE_ACTION_CONSENSUS_BUY:
+        target = infer_latest_top15_cache_date()
     else:
         target = infer_latest_date_from_gsheet()
 
