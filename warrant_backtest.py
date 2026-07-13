@@ -47,6 +47,11 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
 
+os.environ.setdefault("TZ", "Asia/Taipei")
+if hasattr(time, "tzset"):
+    time.tzset()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 設定
 # ══════════════════════════════════════════════════════════════════════
@@ -585,7 +590,7 @@ def parse_date(date_str):
             return None
         y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
         return datetime(y, m, d)
-    except:
+    except Exception:
         return None
 
 
@@ -624,7 +629,7 @@ def fmt_amount(v):
         return "-"
     try:
         return f"{int(round(float(v))):,}"
-    except:
+    except Exception:
         return str(v)
 
 
@@ -654,7 +659,7 @@ def api4_get(code, start, end):
         for item in (data if isinstance(data, list) else [data]):
             rows.extend(item.get("ResultSet", {}).get("Result", []))
         return rows
-    except:
+    except Exception:
         return []
 
 
@@ -665,7 +670,7 @@ def api5_get(warrant, broker):
         data = json.loads(r.content.decode("utf-8"))
         rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
         return rs.get("Result", [])
-    except:
+    except Exception:
         return []
 
 
@@ -684,7 +689,7 @@ def safe_price_float(x):
             return None
 
         return v
-    except:
+    except Exception:
         return None
 
 
@@ -977,9 +982,9 @@ def fetch_twse_stock_day_prices(code, start_dt=None, end_dt=None):
 
                     if close_price is not None:
                         prices[dk] = close_price
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
 
     return prices
@@ -1072,13 +1077,13 @@ def fetch_tpex_new_trading_stock_prices(code, start_dt=None, end_dt=None):
 
                             if close_price is not None:
                                 prices[dk] = close_price
-                        except:
+                        except Exception:
                             pass
 
-                except:
+                except Exception:
                     pass
 
-        except:
+        except Exception:
             pass
 
     return prices
@@ -1149,9 +1154,9 @@ def fetch_tpex_old_st43_prices(code, start_dt=None, end_dt=None):
 
                     if close_price is not None:
                         prices[dk] = close_price
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
 
     return prices
@@ -1203,7 +1208,7 @@ def fetch_yahoo_chart_prices(symbol, start_dt=None, end_dt=None, host="query1"):
 
             dt = datetime.fromtimestamp(int(ts))
             prices[dt.strftime("%Y/%m/%d")] = v
-    except:
+    except Exception:
         pass
 
     return prices
@@ -1245,7 +1250,7 @@ def fetch_yahoo_range_prices(symbol):
 
             if prices:
                 break
-        except:
+        except Exception:
             pass
 
     return prices
@@ -1292,7 +1297,7 @@ def fetch_yahoo_download_prices(symbol, start_dt=None, end_dt=None):
 
             if dt and close_price is not None:
                 prices[dt.strftime("%Y/%m/%d")] = close_price
-    except:
+    except Exception:
         pass
 
     return prices
@@ -1354,7 +1359,7 @@ def prices_need_yahoo_fallback(prices, start_dt=None, end_dt=None):
             span_days = (end_dt - start_dt).days
             if span_days >= 30 and len(valid_dates) < 10:
                 return True
-        except:
+        except Exception:
             pass
 
     # 如果最後一筆價格離需要的結束日太遠，也要補 Yahoo。
@@ -1365,7 +1370,7 @@ def prices_need_yahoo_fallback(prices, start_dt=None, end_dt=None):
 
             if latest_dt and (target_end - latest_dt).days > 10:
                 return True
-        except:
+        except Exception:
             pass
 
     return False
@@ -3624,7 +3629,8 @@ def read_cache_from_gsheet(path):
 
         print(f"  ☁️ 已從 Google Sheet 讀取快取：{title}，共 {len(df):,} 筆")
         return df
-    except Exception:
+    except Exception as exc:
+        print(f"  ⚠️ Google Sheet 快取讀取失敗：{title}，原因：{type(exc).__name__}: {exc}")
         return pd.DataFrame()
 
 
@@ -4165,7 +4171,8 @@ def read_existing_worksheet_values(title):
         ws = sh.worksheet(safe_worksheet_title(title))
         values = ws.get_all_values()
         return values or []
-    except Exception:
+    except Exception as exc:
+        print(f"  ⚠️ Google Sheet 結果表讀取失敗：{safe_worksheet_title(title)}，原因：{type(exc).__name__}: {exc}")
         return []
 
 
@@ -7396,7 +7403,7 @@ def find_broker_codes_live(warrants):
         for future in as_completed(futures):
             try:
                 result = future.result()
-            except:
+            except Exception:
                 result = {}
 
             for label, (name, code) in result.items():
@@ -7495,7 +7502,7 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
             try:
                 result, latest_dt, today_found = future.result()
-            except:
+            except Exception:
                 result, latest_dt, today_found = [], None, False
 
             if latest_dt and (PRESCAN_LATEST_ACTIVITY_DATE is None or latest_dt > PRESCAN_LATEST_ACTIVITY_DATE):
@@ -8675,7 +8682,7 @@ def fetch_all_prices(a_events, b_events, c_events, d_events, e_events=None):
 
                 add_price_aliases(price_cache, code, merged_prices)
 
-            except:
+            except Exception:
                 code = futures[future]
                 old_prices = get_cached_prices_for_code(persistent_price_cache, code)
                 add_price_aliases(price_cache, code, old_prices)
@@ -8750,7 +8757,7 @@ def calc_pct_by_base(current_price, base_price):
             return None
 
         return round((current_price - base_price) / base_price * 100, 2)
-    except:
+    except Exception:
         return None
 
 
@@ -8758,7 +8765,7 @@ def get_buy_avg_as_base(ev):
     try:
         v = float(ev.get("買進均價"))
         return v if v > 0 else None
-    except:
+    except Exception:
         return None
 
 
@@ -8903,7 +8910,7 @@ def fmt_price_value(v):
         if v.is_integer():
             return int(v)
         return round(v, 2)
-    except:
+    except Exception:
         return "-"
 
 
@@ -9130,7 +9137,6 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
         df2 = df2.sort_values("日期").reset_index(drop=True)
-        sell_return_map = _daily_sell_fifo_return_map_for_item(item)
 
         for row in df2.itertuples(index=False):
             row_dict = row._asdict()
@@ -9944,7 +9950,7 @@ def apply_exit_profit_result_outline(ws, row_idx, col_idx, return_pct):
 
     try:
         pct = float(return_pct)
-    except:
+    except Exception:
         return
 
     if pct > 0:
@@ -10684,7 +10690,7 @@ def fmt_ratio_value(numerator, denominator):
         if denominator == 0:
             return "-"
         return f"{(numerator / denominator * 100):.2f}%"
-    except:
+    except Exception:
         return "-"
 
 
@@ -11359,7 +11365,7 @@ def write_broker_query_sheet(wb, items):
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
-    except:
+    except Exception:
         pass
 
 
@@ -11506,7 +11512,7 @@ def apply_global_amount_comma_format(wb):
                                 cell.value = num
                                 cell.number_format = '#,##0.00'
 
-                    except:
+                    except Exception:
                         pass
 
 
@@ -11650,7 +11656,7 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_eve
     用途：
     1. 每日賣出明細直接來自原始分點歷史資料 items，不再用 A/B/C/D/E 工作表的減碼日推估。
     2. 若賣出的權證屬於任一新制 A/B/C/D/E 金額強度事件，也能標示它原本歸屬哪一類事件。
-    3. 同一權證在不同分點互不混用；同一分點與權證有多次事件時，以事件日較新的事件為準。
+    3. 同一權證在不同分點互不混用；同一分點與權證有多次事件時，以事件日 ≤ 賣出日且尚未出清者中最舊的事件為準。
     4. 一併保存出清日，讓每日賣出明細可排除已在該筆賣出日前出清的舊事件。
     """
     source_map = {}
@@ -11658,27 +11664,15 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_eve
     def put_source(broker, warrant_code, event_code, event_type, event_date, exit_date, event_source):
         broker = str(broker).strip()
         warrant_code = normalize_warrant_code_for_unique(warrant_code)
-
         if not warrant_code:
             return
-
-        key = (broker, warrant_code)
-        new_source = {
+        source_map.setdefault((broker, warrant_code), []).append({
             "事件": event_code,
             "事件類型": event_type,
             "事件日": normalize_date_str(event_date),
-            "出清日": normalize_date_str(ev_exit) if (ev_exit := exit_date) else "",
+            "出清日": normalize_date_str(exit_date) if exit_date else "",
             "事件來源": event_source,
-        }
-
-        if key in source_map:
-            old_event_dt = parse_date(source_map[key].get("事件日", ""))
-            new_event_dt = parse_date(new_source.get("事件日", ""))
-
-            if old_event_dt and (not new_event_dt or new_event_dt <= old_event_dt):
-                return
-
-        source_map[key] = new_source
+        })
 
     for event_code, events in iter_amount_class_event_groups(a_events, b_events, c_events, d_events, e_events):
         for ev in events:
@@ -11917,13 +11911,23 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
                     status = "賣超"
 
                 warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-                source = source_map.get((str(item.get("broker_label", "")).strip(), warrant_code), {})
-
-                # 事件已在本筆賣出日之前出清，代表本筆屬於重新買進後的部位，不掛舊事件。
-                # 使用 < 保留出清日當天的賣出仍可對應原事件。
-                src_exit = parse_date(source.get("出清日", ""))
-                if src_exit and trade_dt and src_exit < trade_dt:
-                    source = {}
+                candidates_src = source_map.get(
+                    (str(item.get("broker_label", "")).strip(), warrant_code), []
+                )
+                # 挑選規則：事件日 <= 賣出日，且（未出清 或 出清日 >= 賣出日）。
+                # 符合多筆時取事件日最舊者，與 FIFO「舊事件先扣」的歸屬一致。
+                source = {}
+                best_dt = None
+                for cand in candidates_src:
+                    ev_dt = parse_date(cand.get("事件日", ""))
+                    ex_dt = parse_date(cand.get("出清日", ""))
+                    if not ev_dt or not trade_dt or ev_dt > trade_dt:
+                        continue
+                    if ex_dt and ex_dt < trade_dt:
+                        continue
+                    if best_dt is None or ev_dt < best_dt:
+                        best_dt = ev_dt
+                        source = cand
 
                 sell_avg = round(sell_a / sell_s, 4) if sell_s > 0 else ""
                 sell_return = sell_return_map.get(date, {})
@@ -14836,7 +14840,6 @@ def collect_moneydj_search_repair_underlying_broker_pairs_from_history(history_c
     if df.empty:
         return pairs, reason_count
 
-    active_target_broker_codes = {str(code).strip() for _, code in TARGET_PATTERNS.items()}
     broker_codes_in_scope = {str(code).strip() for _, code in FALLBACK.values()}
     if broker_codes_in_scope:
         df = df[df["券商代號"].isin(broker_codes_in_scope)].copy()
@@ -16176,7 +16179,6 @@ def upload_longterm_adjusted_winrate_to_gsheet(adjusted_rows, target_date):
         print("  ⚠️ 找不到勝率統計表頭中的『勝率』欄，無法回填修正勝率。")
         return False
 
-    winrate_idx0 = int(info["winrate_col_index0"])
     adjusted_idx0 = int(info["adjusted_col_index0"])
     adjusted_col_1based = adjusted_idx0 + 1
 
@@ -16587,7 +16589,12 @@ def main():
 
                 try:
                     item = future.result()
-                except:
+                except Exception as exc:
+                    failed_candidate = futures.get(future)
+                    print(
+                        f"  ⚠️ API5 候選處理失敗：{failed_candidate}｜"
+                        f"{type(exc).__name__}: {exc}"
+                    )
                     item = None
 
                 if item:
