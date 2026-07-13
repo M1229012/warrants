@@ -5023,7 +5023,7 @@ def apply_result_retention_and_archive(title, headers, merged_records):
     return retained_records, len(archive_records)
 
 
-def merge_result_values_for_gsheet(title, new_values):
+def merge_result_values_for_gsheet(title, new_values, data_scope=None):
     """
     將本次 Excel 結果與 Google Sheet 既有結果做 upsert 合併。
 
@@ -5047,7 +5047,7 @@ def merge_result_values_for_gsheet(title, new_values):
         # 多段式報表例如勝率統計、ABCDE組合勝率，仍維持原本覆蓋模式，避免破壞版面與公式。
         return new_values
 
-    current_scope = get_result_data_scope()
+    current_scope = str(data_scope or get_result_data_scope()).strip()
     new_headers, new_records = _values_to_records(new_values, header_row_idx=0, default_scope=current_scope)
     if not new_headers:
         return new_values
@@ -5657,7 +5657,7 @@ def apply_upsert_original_excel_visual_style_to_gsheet(ws_xlsx, gws, source_valu
 
     _gsheet_batch_update(requests)
 
-def upload_excel_to_google_sheet(xlsx_path):
+def upload_excel_to_google_sheet(xlsx_path, data_scope=None, allowed_titles=None):
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
         return
@@ -5680,8 +5680,13 @@ def upload_excel_to_google_sheet(xlsx_path):
             )
             compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
 
+        allowed_title_set = {safe_worksheet_title(x) for x in (allowed_titles or [])}
+
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
+
+            if allowed_title_set and title not in allowed_title_set:
+                continue
 
             if should_skip_result_sheet_in_run_mode(title):
                 print(
@@ -5704,7 +5709,7 @@ def upload_excel_to_google_sheet(xlsx_path):
                 values = [[""]]
 
             source_values = [list(row) for row in values]
-            values = merge_result_values_for_gsheet(title, values)
+            values = merge_result_values_for_gsheet(title, values, data_scope=data_scope)
             values = normalize_result_values_for_comma_numbers(values)
 
             max_cols = max(max((len(row) for row in values), default=1), 1)
@@ -9590,7 +9595,18 @@ def top15_fmt_amount_wan(value):
         return "0.0萬"
 
 
-def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events, d_events, e_events=None, item_map=None, price_cache=None, target_date=None):
+def build_top15_position_detail_and_consensus_rows(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events=None,
+    item_map=None,
+    price_cache=None,
+    target_date=None,
+    data_scope=None,
+    allow_price_fetch=True,
+):
     """
     建立 TOP15 圖片用固定資料集。
 
@@ -9644,7 +9660,8 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
         print("  ⚠️ TOP15固定資料集：扣除賣出後沒有剩餘部位")
         return [], []
 
-    ensure_top15_return_warrant_prices(price_cache, position_lots, target_date)
+    if allow_price_fetch:
+        ensure_top15_return_warrant_prices(price_cache, position_lots, target_date)
 
     detail_rows = []
     validation_errors = []
@@ -9718,7 +9735,7 @@ def build_top15_position_detail_and_consensus_rows(a_events, b_events, c_events,
             return_text = "-" if return_pct_float is None else f"{return_pct_float:+.2f}%"
 
         detail_rows.append({
-            "資料範圍": get_result_data_scope(),
+            "資料範圍": str(data_scope or get_result_data_scope()).strip(),
             "統計日期": target_date,
             "統計期間": period_text,
             "有效交易日數": len(recent_dates),
@@ -15233,6 +15250,63 @@ def build_price_prefetch_context_from_items(items):
 
     return item_map, a_events, b_events, c_events, d_events, e_events
 
+
+def filter_items_for_selected_scope(items):
+    """從已抓好的全分點資料中篩出精選五分點，不重新呼叫 API。"""
+    selected_labels = set(parse_selected_target_labels())
+    return [
+        item for item in (items or [])
+        if str(item.get("broker_label", "")).strip() in selected_labels
+    ]
+
+
+def build_selected_scope_excel(
+    selected_items,
+    selected_events,
+    selected_item_map,
+    price_cache,
+    output_path,
+    top15_detail_rows=None,
+    top15_consensus_rows=None,
+):
+    """只建立產圖需要的精選五分點結果表；資料全部來自全分點已抓結果。"""
+    a_events, b_events, c_events, d_events, e_events = selected_events
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    write_group_sheet(wb, "A_基礎買超", a_events, price_cache, is_c=False)
+    write_group_sheet(wb, "B_明顯買超", b_events, price_cache, is_c=False)
+    write_group_sheet(wb, "C_強勢買超", c_events, price_cache, is_c=False)
+    write_group_sheet(wb, "D_大額布局", d_events, price_cache, is_c=False)
+    write_group_sheet(wb, "E_超大額布局", e_events, price_cache, is_c=False)
+    write_daily_sell_detail_sheet(wb, selected_items, a_events, b_events, c_events, d_events, e_events)
+    write_top15_consensus_cache_sheet(wb, top15_consensus_rows or [])
+    write_top15_position_detail_sheet(wb, top15_detail_rows or [])
+    write_recent_warrant_amount_ranking_sheet(wb, selected_items)
+    write_underlying_broker_count_ranking_sheet(wb, selected_items)
+    apply_global_amount_comma_format(wb)
+
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def build_top15_only_excel(detail_rows, consensus_rows, output_path):
+    """價格預抓模式專用：只建立兩張 TOP15 工作表。"""
+    wb = Workbook()
+    wb.remove(wb.active)
+    write_top15_consensus_cache_sheet(wb, consensus_rows or [])
+    write_top15_position_detail_sheet(wb, detail_rows or [])
+    apply_global_amount_comma_format(wb)
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
 def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, target_date=None, reason="今日分點資料尚未出現"):
     """
     當 API4 預掃描沒有看到今日目標分點資料時，自動改跑價格預抓。
@@ -15244,7 +15318,7 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
     4. 更新 price_cache.csv / 快取_價格
     5. 寫入 price_prefetch_state.csv，避免同一天重複慢抓
 
-    不會建立 Excel、不會同步 A/B/C/D/E、TOP15、近10日分點明細結果，因此不會把尚未完整的當日分點資料寫到結果表。
+    不會同步 A/B/C/D/E 或近10日結果；價格補完後只重算並同步兩張 TOP15 工作表。
     """
     target_date = normalize_price_prefetch_target_date(target_date)
     start_ts = time.time()
@@ -15296,17 +15370,6 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
 
     if a_events or b_events or c_events or d_events or e_events:
         price_cache = fetch_all_prices(a_events, b_events, c_events, d_events, e_events)
-        # TOP15 固定資料集會在內部補抓仍有剩餘部位的權證最新價。
-        build_top15_position_detail_and_consensus_rows(
-            a_events,
-            b_events,
-            c_events,
-            d_events,
-            e_events,
-            item_map,
-            price_cache,
-            target_date=target_date,
-        )
     else:
         price_cache = load_price_cache()
         print("  ⚠️ 快取資料目前無 A/B/C/D/E 事件，略過事件價格預抓，只檢查其他價格需求。")
@@ -15324,13 +15387,46 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
     # 也把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
     price_cache = ensure_price_prefetch_all_item_prices(price_cache, items, target_date=target_date)
 
+    top15_sync_ok = False
+    if a_events or b_events or c_events or d_events or e_events:
+        full_detail_rows, full_consensus_rows = build_top15_position_detail_and_consensus_rows(
+            a_events, b_events, c_events, d_events, e_events,
+            item_map, price_cache,
+            target_date=target_date,
+            data_scope="全分點",
+            allow_price_fetch=False,
+        )
+
+        selected_items = filter_items_for_selected_scope(items)
+        selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
+        selected_detail_rows, selected_consensus_rows = build_top15_position_detail_and_consensus_rows(
+            sa, sb, sc, sd, se,
+            selected_item_map, price_cache,
+            target_date=target_date,
+            data_scope="精選五分點",
+            allow_price_fetch=False,
+        )
+
+        top15_titles = {TOP15_POSITION_DETAIL_SHEET, TOP15_CONSENSUS_SHEET}
+        full_top15_path = os.path.join(OUTPUT_DIR, f"top15_prefetch_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        selected_top15_path = os.path.join(OUTPUT_DIR, f"top15_prefetch_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        build_top15_only_excel(full_detail_rows, full_consensus_rows, full_top15_path)
+        upload_excel_to_google_sheet(full_top15_path, data_scope="全分點", allowed_titles=top15_titles)
+        build_top15_only_excel(selected_detail_rows, selected_consensus_rows, selected_top15_path)
+        upload_excel_to_google_sheet(selected_top15_path, data_scope="精選五分點", allowed_titles=top15_titles)
+        top15_sync_ok = True
+        print("  ✅ 價格預抓完成後，已同步全分點與精選五分點 TOP15。")
+    else:
+        print("  ⚠️ 無事件可建立 TOP15，本次只更新價格快取。")
+
     price_summary = price_cache_target_date_summary(price_cache, target_date)
     elapsed = time.time() - start_ts
     write_price_prefetch_state({
         "日期": target_date,
         "資料範圍": scope,
         "模式": "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING",
-        "狀態": "done",
+        "狀態": "done" if top15_sync_ok else "price_done",
+        "TOP15同步狀態": "done" if top15_sync_ok else "skipped",
         "原因": reason,
         "候選組合數": len(candidate_keys or []),
         "快取歷史筆數": len(history_cache_df),
@@ -16813,8 +16909,33 @@ def main():
 
     price_cache = fetch_all_prices(a_events, b_events, c_events, d_events, e_events)
     top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
-        a_events, b_events, c_events, d_events, e_events, item_map, price_cache
+        a_events, b_events, c_events, d_events, e_events,
+        item_map, price_cache,
+        data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
+        allow_price_fetch=True,
     )
+
+    selected_items = []
+    selected_item_map = {}
+    selected_events = ([], [], [], [], [])
+    selected_top15_detail_rows = []
+    selected_top15_consensus_rows = []
+
+    if RUN_MODE == 2:
+        selected_items = filter_items_for_selected_scope(items)
+        selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
+        selected_events = (sa, sb, sc, sd, se)
+        selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
+            sa, sb, sc, sd, se,
+            selected_item_map, price_cache,
+            data_scope="精選五分點",
+            allow_price_fetch=False,
+        )
+        print(
+            f"  ✅ 已直接從全分點資料切出精選五分點：{len(selected_items):,} 組，"
+            "未重新呼叫 API4／API5／價格 API。"
+        )
+
     warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
 
     if RUN_MODE == 2:
@@ -16832,7 +16953,38 @@ def main():
         item_map, price_cache, items, output_path,
         top15_detail_rows, top15_consensus_rows, warrant_consensus_7d_rows, broker_10d_detail_rows, broker_10d_winrate_rank_rows
     )
-    upload_excel_to_google_sheet(output_path)
+    upload_excel_to_google_sheet(
+        output_path,
+        data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
+    )
+
+    if RUN_MODE == 2 and selected_items:
+        selected_output_path = os.path.join(
+            OUTPUT_DIR,
+            f"warrant_backtest_ABCDE_selected5_{today_fn}.xlsx",
+        )
+        build_selected_scope_excel(
+            selected_items,
+            selected_events,
+            selected_item_map,
+            price_cache,
+            selected_output_path,
+            selected_top15_detail_rows,
+            selected_top15_consensus_rows,
+        )
+        selected_titles = {
+            *AMOUNT_CLASS_SHEET_NAMES,
+            "每日賣出明細",
+            TOP15_POSITION_DETAIL_SHEET,
+            TOP15_CONSENSUS_SHEET,
+            "近兩月買賣金額排行",
+            "近兩月分點數排行",
+        }
+        upload_excel_to_google_sheet(
+            selected_output_path,
+            data_scope="精選五分點",
+            allowed_titles=selected_titles,
+        )
 
     elapsed = time.time() - program_start
     minutes = int(elapsed // 60)
