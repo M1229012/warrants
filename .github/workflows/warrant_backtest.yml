@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - "每日自動流程"
+          - "全分點每日流程"
           - "精選五分點新分類"
           - "長期留單補價格"
           - "完整修補模式"
@@ -34,7 +35,8 @@ jobs:
 
       # ============================================================
       # 新版統一模式
-      # daily    ：每日自動流程，平常排程與日常手動都用這個
+      # daily    ：每日自動流程與全分點每日流程都使用 daily，
+      #            固定抓一次全分點，再由主程式從全分點資料切出精選五分點結果。
       # 精選五分點新分類：仍使用 daily 主流程，但固定 RUN_MODE=1，
       #                   關閉輕量探測與「資料未出來就只補價格後停止」邏輯，
       #                   直接使用既有快取重建精選五分點 A/B/C/D/E 新分類。
@@ -55,12 +57,16 @@ jobs:
 
       # ============================================================
       # 分點模式
-      # 每日自動流程        ：精選 5 分點，RUN_MODE=1
-      # 精選五分點新分類    ：精選 5 分點，RUN_MODE=1
-      # longterm            ：固定看全分點歷史，RUN_MODE=2
-      # repair              ：完整修補，全分點，RUN_MODE=2
+      # 每日自動流程        ：全分點抓一次，RUN_MODE=2，
+      #                       主程式會再從全分點資料切出精選五分點結果。
+      # 全分點每日流程      ：全分點抓一次，RUN_MODE=2，
+      #                       功能與排程 daily 相同，供手動執行使用。
+      # 精選五分點新分類    ：只重建精選 5 分點，RUN_MODE=1。
+      # longterm            ：固定看全分點歷史，RUN_MODE=2。
+      # repair              ：完整修補，全分點，RUN_MODE=2。
+      # 排程執行            ：固定 RUN_MODE=2。
       # ============================================================
-      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_plan == '完整修補模式' || github.event.inputs.run_plan == '長期留單補價格') && '2' || '1' }}
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '精選五分點新分類' && '1' || '2' }}
 
       # 明確固定精選五分點，避免未來程式預設清單改動時影響本工作流。
       SELECTED_TARGET_LABELS: "華南永昌台中,元大南屯,富邦敦南,永豐金內湖,新光"
@@ -134,7 +140,7 @@ jobs:
 
       # ============================================================
       # MoneyDJ Search Repair
-      # daily／精選五分點新分類：不啟用
+      # daily／全分點每日流程／精選五分點新分類：不啟用
       # repair：啟用，完整補漏
       # ============================================================
       MONEYDJ_SEARCH_REPAIR_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '1' || '0' }}
@@ -163,7 +169,7 @@ jobs:
       SUPABASE_CACHE_ENABLED: "0"
 
       # 執行緒設定
-      # daily 與精選五分點新分類可先用 80；repair 保守用 60。
+      # daily、全分點每日流程與精選五分點新分類可先用 80；repair 保守用 60。
       MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
       PRICE_WORKERS: "60"
       PRESCAN_WORKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan == '完整修補模式' && '60' || '80' }}
