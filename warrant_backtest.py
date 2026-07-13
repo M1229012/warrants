@@ -747,6 +747,39 @@ def configured_broker_codes_for_scope(scope="all"):
     }
 
 
+def normalize_broker_code_for_compare(value):
+    """將券商代號轉成穩定比較格式，避免大小寫或空白造成誤判。"""
+    return str(value or "").strip().upper()
+
+
+def configured_broker_pair_maps_for_scope(scope="all"):
+    """
+    回傳目前有效分點的名稱／券商代號雙向對照。
+
+    只有仍存在於 TARGET_PATTERNS 範圍內，且 FALLBACK 有券商代號的分點，
+    才會被視為有效分點。這可讓 Google Sheet 舊資料在分點被刪除後同步移除；
+    若只是分點標籤改名但券商代號相同，則會自動改成目前的新標籤。
+    """
+    labels = configured_broker_labels_for_scope(scope)
+    label_to_code = {}
+    code_to_label = {}
+
+    for label in labels:
+        if label not in FULL_FALLBACK:
+            continue
+
+        canonical_code = str(FULL_FALLBACK[label][1]).strip()
+        normalized_code = normalize_broker_code_for_compare(canonical_code)
+        if not normalized_code:
+            continue
+
+        canonical_label = str(label).strip()
+        label_to_code[canonical_label] = canonical_code
+        code_to_label[normalized_code] = (canonical_label, canonical_code)
+
+    return label_to_code, code_to_label
+
+
 def candidate_scope_from_path(path):
     base = os.path.basename(str(path))
     return "selected5" if base == "candidates_cache_selected5.csv" else "all"
@@ -4112,6 +4145,13 @@ GSHEET_RESULT_UPSERT_TITLES = {
     BROKER_10D_WINRATE_RANK_SHEET,
 }
 
+# 這兩張是「目前近兩月排名快照」，不是逐日歷史明細。
+# 同一資料範圍每次都應以本次結果完整替換，否則跌出排名或已刪除的分點會殘留。
+GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES = {
+    "近兩月買賣金額排行",
+    "近兩月分點數排行",
+}
+
 GSHEET_RESULT_OVERWRITE_TITLES = {
     WARRANT_CONSENSUS_7D_SHEET,
     "券商查詢",
@@ -4146,6 +4186,72 @@ def get_result_data_scope():
     - 同一張 Google Sheet 內不同資料範圍可以並存，避免五分點覆蓋全分點資料。
     """
     return "精選五分點" if RUN_MODE == 1 else "全分點"
+
+
+def result_record_broker_scope(record):
+    """依 Google Sheet 資料範圍判斷該列應套用哪一份有效分點清單。"""
+    data_scope = str(
+        strip_gsheet_text_prefix(record.get("資料範圍", ""))
+    ).strip()
+
+    if data_scope == "精選五分點":
+        return "selected5"
+
+    # 全分點與舊版未標記資料，都用完整分點清單清理。
+    return "all"
+
+
+def normalize_or_remove_deleted_broker_result_record(record):
+    """
+    清理 Google Sheet 已存在的結果列。
+
+    規則：
+    1. 有「分點／券商代號」的資料，若該分點已從目前設定移除，整列刪除。
+    2. 若只是分點標籤改名，但券商代號仍存在，自動改成目前的新標籤。
+    3. 「買進分點」為單一分點欄位時，也會套用相同清理。
+    4. 沒有任何分點識別欄位的彙總資料保持不變。
+    """
+    rec = dict(record)
+    scope = result_record_broker_scope(rec)
+    label_to_code, code_to_label = configured_broker_pair_maps_for_scope(scope)
+    active_labels = set(label_to_code.keys())
+
+    broker_label = str(
+        strip_gsheet_text_prefix(rec.get("分點", ""))
+    ).strip()
+    broker_code = normalize_broker_code_for_compare(
+        strip_gsheet_text_prefix(rec.get("券商代號", ""))
+    )
+
+    if broker_label or broker_code:
+        if broker_code:
+            canonical_identity = code_to_label.get(broker_code)
+            if canonical_identity is None:
+                return None
+
+            canonical_label, canonical_code = canonical_identity
+            if "分點" in rec:
+                rec["分點"] = canonical_label
+            if "券商代號" in rec:
+                rec["券商代號"] = canonical_code
+            return rec
+
+        if broker_label not in active_labels:
+            return None
+
+        if "券商代號" in rec:
+            rec["券商代號"] = label_to_code.get(broker_label, "")
+        return rec
+
+    buy_broker_label = str(
+        strip_gsheet_text_prefix(rec.get("買進分點", ""))
+    ).strip()
+    if buy_broker_label:
+        if buy_broker_label not in active_labels:
+            return None
+        return rec
+
+    return rec
 
 
 def should_upsert_result_sheet(title):
@@ -4947,8 +5053,25 @@ def merge_result_values_for_gsheet(title, new_values):
         return new_values
 
     new_headers = _ensure_scope_header(new_headers)
+
+    # 本次剛產生的資料也先套用有效分點清單。
+    # 這可防止本機／Supabase 舊快取仍帶著已刪除分點時，又把舊分點重新寫回 Google Sheet。
+    cleaned_new_records = []
+    removed_new_deleted_broker_count = 0
     for rec in new_records:
         rec["資料範圍"] = current_scope
+        cleaned_rec = normalize_or_remove_deleted_broker_result_record(rec)
+        if cleaned_rec is None:
+            removed_new_deleted_broker_count += 1
+            continue
+        cleaned_new_records.append(cleaned_rec)
+    new_records = cleaned_new_records
+
+    if removed_new_deleted_broker_count > 0:
+        print(
+            f"  🧹 本次結果已排除失效分點資料："
+            f"{safe_worksheet_title(title)}｜{removed_new_deleted_broker_count:,} 筆"
+        )
 
     old_values = read_existing_worksheet_values(title)
     old_headers, old_records = _values_to_records(
@@ -4957,6 +5080,49 @@ def merge_result_values_for_gsheet(title, new_values):
         default_scope=GSHEET_LEGACY_SCOPE_LABEL,
     )
     old_headers = _ensure_scope_header(old_headers) if old_headers else []
+
+    # 先清理 Google Sheet 既有資料中的失效分點。
+    # 原本 upsert 會保留「本次未覆蓋到的舊列」，因此只從 TARGET_PATTERNS 刪除分點仍不夠；
+    # 這裡會在合併前直接移除已刪除分點，分點改名但券商代號相同時則改成新標籤。
+    cleaned_old_records = []
+    removed_deleted_broker_count = 0
+
+    for rec in old_records:
+        cleaned_rec = normalize_or_remove_deleted_broker_result_record(rec)
+        if cleaned_rec is None:
+            removed_deleted_broker_count += 1
+            continue
+        cleaned_old_records.append(cleaned_rec)
+
+    old_records = cleaned_old_records
+
+    # 近兩月兩張排行是目前狀態快照，同一資料範圍不保留上一次排名列。
+    # 本次資料會完整補回目前仍有效的排名，已跌出排名或已移除的分點便不會殘留。
+    replaced_current_scope_count = 0
+    if safe_worksheet_title(title) in GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES:
+        kept_old_records = []
+        for rec in old_records:
+            rec_scope = str(
+                strip_gsheet_text_prefix(rec.get("資料範圍", ""))
+            ).strip()
+            if rec_scope == current_scope:
+                replaced_current_scope_count += 1
+                continue
+            kept_old_records.append(rec)
+        old_records = kept_old_records
+
+    if removed_deleted_broker_count > 0:
+        print(
+            f"  🧹 Google Sheet 已移除失效分點舊資料："
+            f"{safe_worksheet_title(title)}｜{removed_deleted_broker_count:,} 筆"
+        )
+
+    if replaced_current_scope_count > 0:
+        print(
+            f"  ♻️ Google Sheet 排名快照完整替換："
+            f"{safe_worksheet_title(title)}｜資料範圍={current_scope}｜"
+            f"移除上次快照 {replaced_current_scope_count:,} 筆"
+        )
 
     headers = []
     for h in new_headers + old_headers:
