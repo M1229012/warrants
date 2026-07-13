@@ -234,12 +234,53 @@ CENTER_WATERMARK_ROTATION = 18
 
 # 事件代號說明
 EVENT_LEGEND_ITEMS = [
-    ("A", "100–159萬"),
-    ("B", "160–249萬"),
-    ("C", "250–499萬"),
-    ("D", "500–999萬"),
-    ("E", "1000萬以上"),
+    ("A", "基礎買超"),
+    ("B", "明顯買超"),
+    ("C", "強勢買超"),
+    ("D", "大額布局"),
+    ("E", "超大額布局"),
 ]
+
+EVENT_NAME_MAP = {
+    "A": "基礎買超",
+    "B": "明顯買超",
+    "C": "強勢買超",
+    "D": "大額布局",
+    "E": "超大額布局",
+}
+
+
+def format_event_names(value) -> str:
+    """
+    將 TOP15 快取中的 A/B/C/D/E 事件代號轉成簡短中文名稱。
+
+    範例：
+    - A -> 基礎
+    - A/B -> 基礎/明顯
+    - D/E -> 大額/超大額
+    - E -> 超大額
+
+    若內容不是 A/B/C/D/E 代號格式，保留原文字，避免破壞舊資料。
+    """
+    raw = "" if value is None else str(value).strip()
+    if not raw or raw == "-":
+        return "-"
+
+    codes = []
+    for code in ["A", "B", "C", "D", "E"]:
+        if code in raw.upper() and code not in codes:
+            codes.append(code)
+
+    if not codes:
+        return raw
+
+    names = []
+    for code in codes:
+        full_name = EVENT_NAME_MAP.get(code, code)
+        short_name = full_name.replace("買超", "").replace("布局", "")
+        names.append(short_name)
+
+    return "/".join(names)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1478,12 +1519,11 @@ def infer_latest_date_from_gsheet() -> date:
 
 def read_history_stats_from_gsheet() -> dict:
     """
-    從「勝率統計」取得五大追蹤分點的全部 A+B+C+D+E 合併統計。
+    從 read_all_broker_win_rate_stats_from_gsheet() 共用解析結果，
+    取得每日圖卡需要的五大追蹤分點歷史統計。
 
-    相容規則：
-    - 新版總計列通常為「全部-A+B+C+D+E合併」。
-    - 舊版總計列仍可能是「全部-A+B+C+D+E合併」。
-    - 只要事件名稱包含「全部 / 總計 / 合併」，即可視為總計列。
+    這裡不再直接使用勝率統計表的固定欄位索引，避免工作表新增欄位、
+    調整欄位順序或使用多層表頭後，勝率與平均持有天數讀錯欄位。
     """
     result = {
         broker: {
@@ -1495,34 +1535,27 @@ def read_history_stats_from_gsheet() -> dict:
     }
 
     try:
-        stat = read_gsheet_stat_raw()
-    except Exception:
-        stat = pd.DataFrame()
-
-    if stat.empty or stat.shape[1] < 10:
+        all_broker_rows = read_all_broker_win_rate_stats_from_gsheet()
+    except Exception as exc:
+        print(f"  ⚠️ 讀取每日圖歷史統計失敗：{type(exc).__name__}: {exc}")
         return result
 
-    for broker in TRACKED_BROKERS:
-        broker_rows = stat[stat[0].astype(str).str.strip() == broker]
-        if broker_rows.empty:
+    for row in all_broker_rows:
+        broker = str(row.get("broker", "")).strip()
+        if broker not in result:
             continue
 
-        total_rows = broker_rows[
-            broker_rows[1].astype(str).map(
-                lambda value: any(
-                    token in strip_gsheet_text_prefix(value).replace(" ", "")
-                    for token in ["全部", "總計", "合併"]
-                )
-            )
-        ]
-        if total_rows.empty:
-            continue
+        total_events = safe_int(
+            row.get("total_event_count", row.get("event_count", 0)),
+            0,
+        )
+        total_win_rate = row.get("total_win_rate")
+        avg_hold_days = row.get("avg_hold_days")
 
-        r = total_rows.iloc[0]
         result[broker] = {
-            "total_events": safe_int(r[2]),
-            "win_rate": safe_float(r[8]),
-            "avg_hold_days": safe_float(r[9]),
+            "total_events": total_events,
+            "win_rate": safe_float(total_win_rate, 0.0),
+            "avg_hold_days": safe_float(avg_hold_days, 0.0),
         }
 
     return result
@@ -3369,7 +3402,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
         def large_builder(i, r):
             event_code = str(r.get("event", "")).strip()
-            event_color = RED if event_code == "E" else "#D97706" if event_code == "D" else NAVY
+            event_color = RED
             return (
                 [str(i + 1), r.get("broker", ""), event_code, r.get("target", ""), r.get("content", ""), fmt_wan(r.get("amount", 0))],
                 [TEXT, TEXT, event_color, TEXT, TEXT, event_color],
@@ -3691,18 +3724,20 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨買超成本：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
 
     legend_items = [
-        ("A", "單檔權證單日大買"),
-        ("B", "同標的單日合買"),
-        ("C", "同標的3日累積"),
-        ("D", "近10日累積淨買"),
+        ("A", "基礎買超"),
+        ("B", "明顯買超"),
+        ("C", "強勢買超"),
+        ("D", "大額布局"),
+        ("E", "超大額布局"),
     ]
 
     lx = margin_x + 3.40
+    legend_step = (content_w - 3.50) / max(len(legend_items), 1)
     for code_name, desc in legend_items:
         rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
         text(lx + 0.16, legend_y + legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
         text(lx + 0.40, legend_y + legend_h / 2, desc, 10.8, TEXT, FONT)
-        lx += 2.15 if code_name in {"A", "B"} else 1.95
+        lx += legend_step
 
     y = legend_y - gap
 
@@ -3713,7 +3748,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.70, 2.15, 1.45, 0.65, 0.85, 6.40]
+    col_w = [0.70, 2.15, 1.45, 0.65, 1.75, 5.50]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -3740,7 +3775,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 fit(r["target"], 14),
                 fmt_wan(r["net_amount"]),
                 str(r["broker_count"]),
-                r["events"],
+                format_event_names(r["events"]),
                 None,
             ]
 
