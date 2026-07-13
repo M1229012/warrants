@@ -11645,30 +11645,40 @@ def write_color_legend_sheet(wb):
 
 def build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_events=None):
     """
-    建立「權證代號 -> A/B/C/D/E 事件來源」對照表。
+    建立「分點 + 權證代號 -> A/B/C/D/E 事件來源」對照表。
 
     用途：
     1. 每日賣出明細直接來自原始分點歷史資料 items，不再用 A/B/C/D/E 工作表的減碼日推估。
     2. 若賣出的權證屬於任一新制 A/B/C/D/E 金額強度事件，也能標示它原本歸屬哪一類事件。
-    3. 新制事件已在 build_amount_class_events() 以同分點 × 同標的 × 同一天合併，這裡只做標記，不改事件判斷邏輯。
+    3. 同一權證在不同分點互不混用；同一分點與權證有多次事件時，以事件日較新的事件為準。
+    4. 一併保存出清日，讓每日賣出明細可排除已在該筆賣出日前出清的舊事件。
     """
     source_map = {}
 
-    def put_source(warrant_code, event_code, event_type, event_date, event_source):
+    def put_source(broker, warrant_code, event_code, event_type, event_date, exit_date, event_source):
+        broker = str(broker).strip()
         warrant_code = normalize_warrant_code_for_unique(warrant_code)
 
         if not warrant_code:
             return
 
-        if warrant_code in source_map:
-            return
-
-        source_map[warrant_code] = {
+        key = (broker, warrant_code)
+        new_source = {
             "事件": event_code,
             "事件類型": event_type,
             "事件日": normalize_date_str(event_date),
+            "出清日": normalize_date_str(ev_exit) if (ev_exit := exit_date) else "",
             "事件來源": event_source,
         }
+
+        if key in source_map:
+            old_event_dt = parse_date(source_map[key].get("事件日", ""))
+            new_event_dt = parse_date(new_source.get("事件日", ""))
+
+            if old_event_dt and (not new_event_dt or new_event_dt <= old_event_dt):
+                return
+
+        source_map[key] = new_source
 
     for event_code, events in iter_amount_class_event_groups(a_events, b_events, c_events, d_events, e_events):
         for ev in events:
@@ -11677,10 +11687,12 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_eve
 
             for lot in ev.get("lots", []):
                 put_source(
+                    ev.get("分點", ""),
                     lot.get("權證代號", ""),
                     event_code,
                     event_type,
                     event_date,
+                    ev.get("出清日"),
                     f'{event_code} | {lot.get("權證代號", "")} {lot.get("權證名稱", "")}',
                 )
 
@@ -11905,7 +11917,14 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
                     status = "賣超"
 
                 warrant_code = normalize_warrant_code_for_unique(item.get("warrant_code", ""))
-                source = source_map.get(warrant_code, {})
+                source = source_map.get((str(item.get("broker_label", "")).strip(), warrant_code), {})
+
+                # 事件已在本筆賣出日之前出清，代表本筆屬於重新買進後的部位，不掛舊事件。
+                # 使用 < 保留出清日當天的賣出仍可對應原事件。
+                src_exit = parse_date(source.get("出清日", ""))
+                if src_exit and trade_dt and src_exit < trade_dt:
+                    source = {}
+
                 sell_avg = round(sell_a / sell_s, 4) if sell_s > 0 else ""
                 sell_return = sell_return_map.get(date, {})
                 hist_buy_qty = top15_safe_float(sell_return.get("歷史買進股數", 0), 0.0)
