@@ -817,7 +817,21 @@ CENTER_WATERMARK_ROTATION = 18
 # Supertrend 目前圖表沒有繪製，預設不計算；若未來要畫再用環境變數打開。
 ENABLE_SUPERTREND = os.getenv("WARRANT_ENABLE_SUPERTREND", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# 字型：GitHub Actions 建議安裝 fonts-noto-cjk
+# 字型：優先註冊 Repository 內固定字型，避免每次 GitHub Actions 都 apt 安裝與重建字型快取。
+# 預期路徑：assets/fonts/NotoSansTC-Regular.otf、assets/fonts/NotoSansTC-Bold.otf
+_REPO_FONT_FILES = (
+    "assets/fonts/NotoSansTC-Regular.otf",
+    "assets/fonts/NotoSansTC-Bold.otf",
+)
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+for _font_rel_path in _REPO_FONT_FILES:
+    _font_path = os.path.join(_REPO_ROOT, _font_rel_path)
+    if os.path.exists(_font_path):
+        try:
+            fm.fontManager.addfont(_font_path)
+        except Exception as _font_exc:
+            print(f"⚠️ Repository 字型註冊失敗：{_font_path}｜{_font_exc}")
+
 available_fonts = [f.name for f in fm.fontManager.ttflist]
 for font_name in ["Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans TC", "Microsoft JhengHei", "SimHei"]:
     if font_name in available_fonts:
@@ -14805,7 +14819,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-timezone-news-400-v8"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-actions-cache-repo-font-v9"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
