@@ -58,7 +58,7 @@ on:
         options:
           - "0"
           - "1"
-        default: "1"
+        default: "0"
       finmind_current_day_guard:
         description: "FinMind 當日資料是否啟用官方成交量完整性驗證（1=通過才納入，0=不驗證直接納入）"
         required: false
@@ -66,7 +66,7 @@ on:
         options:
           - "0"
           - "1"
-        default: "1"
+        default: "0"
 
   # Asia/Taipei 21:20 = UTC 13:20。
   # 每個交易日晚間先建立全市場精簡權證事件快取，之後手動查任何新股票都直接走快速路徑。
