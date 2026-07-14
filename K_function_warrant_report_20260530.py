@@ -6203,12 +6203,13 @@ def filter_events_by_date_range(events_df: pd.DataFrame, start_date, end_date) -
 
 
 def get_taipei_today_ts() -> pd.Timestamp:
-    """取得台北日期的今日 00:00。
+    """取得台北日期的今日 00:00，並統一回傳 tz-naive Timestamp。
 
     GitHub Actions runner 常用 UTC，若直接 datetime.today() 可能在台灣盤後仍停在前一天；
-    權證分點資料抓取區間應以台北日期為準。
+    權證分點資料抓取區間應以台北日期為準。回傳 tz-naive 可避免與股價索引比較時
+    出現 Cannot compare tz-naive and tz-aware timestamps。
     """
-    return pd.Timestamp(datetime.now(timezone.utc) + timedelta(hours=8)).normalize()
+    return pd.Timestamp.now(tz="Asia/Taipei").normalize().tz_localize(None)
 
 
 def _parse_selected_branch_flow_names(raw: str) -> List[str]:
@@ -14804,7 +14805,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-quota-cache-batch-v7"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-timezone-news-400-v8"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -14997,6 +14998,10 @@ class FinMindRateLimitError(RuntimeError):
     """FinMind 每小時／短時間請求額度超限；已完成等待重試後仍失敗。"""
 
 
+class FinMindBadRequestError(RuntimeError):
+    """FinMind HTTP 400 或回傳狀態 400；相同參數重試不會改善，立即停止該請求。"""
+
+
 def _finmind_error_payload_from_response(resp) -> tuple[dict, str]:
     try:
         payload = resp.json()
@@ -15176,6 +15181,13 @@ def _finmind_get_data(
                 params=params,
                 timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
             )
+            if resp.status_code == 400:
+                payload, message = _finmind_error_payload_from_response(resp)
+                raise FinMindBadRequestError(
+                    f"FinMind 請求參數錯誤：HTTP 400｜dataset={dataset}｜"
+                    f"data_id={data_id}｜{message}"
+                )
+
             if resp.status_code in (401, 402, 403, 429):
                 payload, message = _finmind_error_payload_from_response(resp)
                 if _finmind_is_rate_limit(resp.status_code, message):
@@ -15204,6 +15216,15 @@ def _finmind_get_data(
                         message,
                     )
                     continue
+                try:
+                    status_code = int(status)
+                except Exception:
+                    status_code = 0
+                if status_code == 400:
+                    raise FinMindBadRequestError(
+                        f"FinMind 請求參數錯誤：status=400｜dataset={dataset}｜"
+                        f"data_id={data_id}｜{message}"
+                    )
                 raise RuntimeError(
                     f"FinMind API 回傳失敗：dataset={dataset}｜status={status}｜{message}"
                 )
@@ -15232,7 +15253,7 @@ def _finmind_get_data(
                     once_key=f"schema:{dataset}",
                 )
             return df
-        except (FinMindAuthorizationError, FinMindRateLimitError):
+        except (FinMindAuthorizationError, FinMindRateLimitError, FinMindBadRequestError):
             raise
         except Exception as exc:
             last_error = exc
@@ -16877,53 +16898,35 @@ def _finmind_fetch_news_day(stock_code: str, trade_date) -> pd.DataFrame:
         "TaiwanStockNews",
         data_id=_normalize_stock_name_code_key(stock_code),
         start_date=date_s,
-        end_date=date_s,
         allow_empty=True,
     )
 
 
 def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """新聞資料只取 FinMind TaiwanStockNews；優先一次查完整日期區間。"""
+    """新聞資料只取 FinMind TaiwanStockNews；依官方限制逐日平行查詢。"""
     if not NEWS_ENABLE:
         return []
     code = _normalize_stock_name_code_key(stock_code)
-    today = pd.Timestamp(datetime.now(timezone.utc) + timedelta(hours=8)).normalize()
-    start_day = today - pd.Timedelta(days=FINMIND_NEWS_LOOKBACK_DAYS - 1)
-
-    try:
-        raw = _finmind_get_data(
-            "TaiwanStockNews",
-            data_id=code,
-            start_date=start_day.strftime("%Y-%m-%d"),
-            end_date=today.strftime("%Y-%m-%d"),
-            allow_empty=True,
-        ).fillna("")
+    today = get_taipei_today_ts()
+    dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
+    frames = []
+    failures = []
+    with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
+        future_map = {executor.submit(_finmind_fetch_news_day, code, d): d for d in dates}
+        for future in as_completed(future_map):
+            day = future_map[future]
+            try:
+                df = future.result()
+                if df is not None and not df.empty:
+                    frames.append(df)
+            except Exception as exc:
+                failures.append((str(pd.Timestamp(day).date()), str(exc)))
+    if failures:
         print(
-            f"⚡ FinMind 新聞區間單次查詢：{code}｜"
-            f"{start_day.date()} ~ {today.date()}｜{len(raw):,} 筆"
+            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
+            + "；".join(f"{d}:{e[:80]}" for d, e in failures[:3])
         )
-    except Exception as range_exc:
-        # 少數 API 版本若不接受區間查詢，保留原本逐日平行備援，避免改動可靠性。
-        print(f"⚠️ FinMind 新聞區間查詢失敗，退回逐日平行查詢：{range_exc}")
-        dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
-        frames = []
-        failures = []
-        with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
-            future_map = {executor.submit(_finmind_fetch_news_day, code, d): d for d in dates}
-            for future in as_completed(future_map):
-                day = future_map[future]
-                try:
-                    df = future.result()
-                    if df is not None and not df.empty:
-                        frames.append(df)
-                except Exception as exc:
-                    failures.append((str(pd.Timestamp(day).date()), str(exc)))
-        if failures:
-            print(
-                f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
-                + "；".join(f"{d}:{e[:80]}" for d, e in failures[:3])
-            )
-        raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
+    raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
 
     if raw is None or raw.empty:
         print(f"ℹ️ FinMind TaiwanStockNews 無近期新聞：{code} {stock_name}")
@@ -17331,7 +17334,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+quota-wait+daily-parquet-cache+multi-stock-read-once+raw-selected-branch+single-range-news+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+quota-wait+daily-parquet-cache+multi-stock-read-once+raw-selected-branch+daily-parallel-news+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
