@@ -214,15 +214,6 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 # 預設仍過濾總公司型分點，但「新光」與「第一金」這兩個分點保留，不列入總公司過濾。
 TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金,福邦證券").strip()
 
-# FinMind 全市場權證分點包含每一筆交易的買方與賣方分點。
-# 若把所有分點直接相加，市場總買進金額必然等於總賣出金額，淨額會固定接近 0。
-# 因此「權證資金流」預設改採非券商總公司型分點，代表一般分點／投資人端的淨流向；
-# TOP5 與精選分點仍沿用原本邏輯。
-WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv(
-    "WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
-    "1",
-).strip().lower() in ("1", "true", "yes", "on")
-
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 # 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
 # 若明確設定 WARRANT_SELECTED_BRANCH_FLOW_MODE=default / five / 五分點，會強制使用預設五分點。
@@ -5456,42 +5447,6 @@ def is_top5_head_office_branch(branch_name: str) -> bool:
     return s in _get_top5_head_office_branch_set()
 
 
-def filter_warrant_flow_investor_branches(events_df: pd.DataFrame) -> pd.DataFrame:
-    """建立可解讀的權證資金流口徑。
-
-    FinMind sponsorpro 回傳的是全市場完整買賣雙邊資料，因此同一天把所有分點
-    的 buy_amount / sell_amount 相加後必然互相平衡，總 net_amount 會固定為 0。
-    週報的「權證資金流」改採非券商總公司型分點，觀察一般分點／投資人端
-    相對於發行、造市與總公司端的淨流向。
-    """
-    if events_df is None or events_df.empty:
-        return pd.DataFrame() if events_df is None else events_df.copy()
-
-    e = events_df.copy()
-    if "branch" not in e.columns:
-        return e
-    e["branch"] = e["branch"].map(normalize_branch_name)
-
-    if not WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE:
-        print("ℹ️ 權證資金流口徑：保留全市場所有分點；完整雙邊資料的淨額可能固定為 0")
-        return e
-
-    mask = e["branch"].map(is_top5_head_office_branch)
-    removed_rows = int(mask.sum())
-    removed_branches = sorted(set(e.loc[mask, "branch"].astype(str))) if removed_rows else []
-    filtered = e.loc[~mask].copy()
-
-    preview = "、".join(removed_branches[:10])
-    if len(removed_branches) > 10:
-        preview += "…"
-    print(
-        f"💰 權證資金流口徑：排除券商總公司／發行造市端 {removed_rows:,} 筆｜"
-        f"保留一般分點 {len(filtered):,} 筆"
-        + (f"｜排除：{preview}" if preview else "")
-    )
-    return filtered.reset_index(drop=True)
-
-
 def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
     points = []
     df = ctx["plot_df"]
@@ -5623,22 +5578,17 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             )
             hedge_removed = 0
 
-        # FinMind 全市場資料的買賣雙邊完整，若直接把所有分點相加，
-        # buy_amount 與 sell_amount 必然相等，淨額會固定為 0。
-        # 改採非總公司型分點作為週報「權證資金流」口徑。
-        flow_e = filter_warrant_flow_investor_branches(e)
-
         if pd.notna(week_start) and pd.notna(week_end):
-            week_events = flow_e[(flow_e["Date"] >= week_start) & (flow_e["Date"] <= week_end)].copy()
+            week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
         else:
-            week_events = flow_e.iloc[0:0].copy()
+            week_events = e.iloc[0:0].copy()
 
         if trading_dates:
             plot_start = pd.Timestamp(plot_df.index.min()).normalize()
             plot_end = pd.Timestamp(report_dates[-1]).normalize() if report_dates else pd.Timestamp(plot_df.index.max()).normalize()
-            plot_events = flow_e[(flow_e["Date"] >= plot_start) & (flow_e["Date"] <= plot_end)].copy()
+            plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
         else:
-            plot_events = flow_e.copy()
+            plot_events = e.copy()
 
     total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
     total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
@@ -5779,18 +5729,6 @@ def get_selected_branch_flow_mode_label() -> str:
 def _get_selected_branch_flow_set() -> set:
     """取得精選分點名單，會先做與主程式一致的分點標準化。"""
     return set(_get_selected_branch_flow_list())
-
-
-def _branch_flow_match_key(branch_name: str) -> str:
-    """建立 FinMind 分點名稱比對鍵。
-
-    FinMind 有時會回傳「第一金證券中壢」，使用者則輸入「第一金中壢」；
-    這裡只移除公司型字樣，不移除券商名稱與地名，避免不同分點誤合併。
-    """
-    s = normalize_branch_name(branch_name)
-    for token in ["證券股份有限公司", "股份有限公司", "證券", "分公司", "有限公司"]:
-        s = s.replace(token, "")
-    return s
 
 
 def _get_debug_branch_warrant_flow_branches() -> List[str]:
@@ -5982,28 +5920,8 @@ def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
     for c in ["buy_amount", "sell_amount", "net_amount"]:
         e[c] = pd.to_numeric(e[c], errors="coerce").fillna(0.0).astype(float)
 
-    # 先做完全一致比對；若 FinMind 名稱多了「證券／股份有限公司／分公司」等字樣，
-    # 再使用保守別名鍵比對。
-    exact_mask = e["branch"].isin(selected_branches)
-    selected_keys = {_branch_flow_match_key(x) for x in selected_branches if _branch_flow_match_key(x)}
-    alias_mask = e["branch"].map(_branch_flow_match_key).isin(selected_keys) if selected_keys else False
-    mask = exact_mask | alias_mask
-    matched = e.loc[mask].copy().reset_index(drop=True)
-
-    if matched.empty:
-        roots = {re.sub(r"(台北|台中|中壢|桃園|新竹|高雄|台南|板橋|中和|內湖|南屯|敦南|公益)$", "", _branch_flow_match_key(x)) for x in selected_branches}
-        roots = {r for r in roots if len(r) >= 2}
-        candidates = sorted({b for b in e["branch"].dropna().astype(str) if any(r and r in _branch_flow_match_key(b) for r in roots)})
-        preview = "、".join(candidates[:12])
-        print(
-            f"⚠️ 精選分點沒有權證交易：{'、'.join(sorted(selected_branches))}"
-            + (f"｜FinMind 同券商可見分點：{preview}" if preview else "")
-        )
-    else:
-        matched_names = "、".join(sorted(set(matched["branch"].astype(str))))
-        print(f"✅ 精選分點 FinMind 名稱比對成功：{matched_names}｜{len(matched):,} 筆")
-
-    return matched
+    mask = e["branch"].isin(selected_branches)
+    return e.loc[mask].copy().reset_index(drop=True)
 
 
 def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
@@ -9875,7 +9793,7 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         raw_content = _normalize_news_text(rec.get("content", ""))
         description = _normalize_news_text(rec.get("description", ""))
         content_source = str(rec.get("content_source", ""))
-        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "rss_title_fact", "manual")
+        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "manual")
 
         inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
         if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
@@ -13131,7 +13049,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
-        wnet_ax, xpos, "權證資金流（非總公司分點）", GOLD,
+        wnet_ax, xpos, "權證資金流", GOLD,
         fontsize=34, fontweight="bold", gap_px=22,
     )
 
@@ -15142,28 +15060,10 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
         return []
 
     raw = pd.concat(frames, ignore_index=True, sort=False).fillna("")
-    # 官方文件列有 description，但實際 API 在部分日期／版本可能只回傳
-    # date、stock_id、link、source、title，或將摘要改成 content／summary。
-    # 新聞標題本身仍是 FinMind 回傳資料，因此 description 改為可選欄位。
-    required = {"date", "stock_id", "link", "source", "title"}
+    required = {"date", "stock_id", "description", "link", "source", "title"}
     missing = required - set(raw.columns)
     if missing:
-        raise RuntimeError(
-            f"FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
-            f"實際欄位={raw.columns.tolist()}"
-        )
-    description_col = next(
-        (c for c in ["description", "content", "summary", "snippet", "text"] if c in raw.columns),
-        "",
-    )
-    if description_col:
-        print(f"📰 FinMind TaiwanStockNews 摘要欄位：{description_col}｜欄位={raw.columns.tolist()}")
-    else:
-        print(
-            "ℹ️ FinMind TaiwanStockNews 本次沒有 description／content／summary，"
-            "改用 FinMind title 作為新聞事實素材｜"
-            f"欄位={raw.columns.tolist()}"
-        )
+        raise RuntimeError(f"FinMind TaiwanStockNews 欄位不足：{sorted(missing)}")
     raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
     raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
 
@@ -15171,8 +15071,7 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
     seen = set()
     for _, row in raw.iterrows():
         title = _clean_news_title(row.get("title", ""))
-        raw_description = row.get(description_col, "") if description_col else ""
-        description = _normalize_news_text(_html_to_readable_text(raw_description))
+        description = _normalize_news_text(_html_to_readable_text(row.get("description", "")))
         url = str(row.get("link", "") or "").strip()
         source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
         if not title and not description:
@@ -15186,7 +15085,6 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
         # data_id 已由 FinMind 對應目標股票；補上主體前綴是為了讓原有嚴格新聞驗證可辨識公司。
         fact_text = _normalize_news_text(description or title)
         content = _normalize_news_text(f"{code} {stock_name}：{fact_text}")
-        has_description = bool(description)
         article = {
             "title": title or fact_text[:80],
             "url": url,
@@ -15195,10 +15093,10 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
             "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
             "description": content,
             "content": content,
-            # 有實際摘要且長度足夠才視為原文；只有 title 時仍保留為短事實素材。
-            "body_ok": bool(has_description and len(content) >= 80),
+            "body_ok": len(content) >= 80,
             "fallback_ok": True,
-            "content_source": "rss_description" if has_description else "rss_title_fact",
+            # 沿用既有短素材驗證規則，但資料本身來自 FinMind。
+            "content_source": "rss_description",
             "search_days": FINMIND_NEWS_LOOKBACK_DAYS,
             "query_stage": "FinMind TaiwanStockNews",
             "body_length": len(content),
