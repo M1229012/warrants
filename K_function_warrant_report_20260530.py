@@ -5961,7 +5961,27 @@ def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) 
     if "underlying_name" not in e.columns:
         e["underlying_name"] = ""
 
+    global _FINMIND_OFFICIAL_ISSUER_FORCE_REFRESH_ATTEMPTED
     official_map = _finmind_official_warrant_issuer_map()
+    event_warrant_codes = set(e["warrant_code"].astype(str))
+    official_hit_codes = event_warrant_codes.intersection(set(official_map.keys()))
+    initial_official_hit_count = len(official_hit_codes)
+    # 每日磁碟快取若是空結果、來源欄位變動，或只涵蓋極少數本次權證，強制重抓一次官方來源。
+    # 只有重新整理能增加命中數時才採用，避免較差結果覆蓋既有對照。
+    if FINMIND_OFFICIAL_ISSUER_ENABLE and event_warrant_codes and not _FINMIND_OFFICIAL_ISSUER_FORCE_REFRESH_ATTEMPTED and (
+        not official_hit_codes or len(official_hit_codes) / max(1, len(event_warrant_codes)) < 0.50
+    ):
+        _FINMIND_OFFICIAL_ISSUER_FORCE_REFRESH_ATTEMPTED = True
+        refreshed_map = _finmind_official_warrant_issuer_map(force_refresh=True)
+        refreshed_hits = event_warrant_codes.intersection(set(refreshed_map.keys()))
+        if len(refreshed_hits) > len(official_hit_codes):
+            official_map = refreshed_map
+            official_hit_codes = refreshed_hits
+        print(
+            "🔄 官方發行商對照重新整理："
+            f"本次權證={len(event_warrant_codes):,}｜原命中={initial_official_hit_count:,}｜"
+            f"採用命中={len(official_hit_codes):,}"
+        )
     issuer_keys = []
     issuer_sources = []
     official_issuer_names = []
@@ -6024,10 +6044,14 @@ def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) 
         "💰 FinMind 權證資金流口徑：逐檔排除官方辨識的發行造市端｜"
         f"權證辨識={parsed_warrants}/{total_warrants}｜排除={len(removed):,}筆｜保留={len(kept):,}筆"
     )
+    official_field_warrants = int(e.loc[e["_issuer_source"].astype(str).str.contains("official_field", na=False), "warrant_code"].nunique())
+    official_name_warrants = int(e.loc[e["_issuer_source"].astype(str).str.contains("official_name", na=False), "warrant_code"].nunique())
+    finmind_name_warrants = int(e.loc[e["_issuer_source"] == "FinMind權證名稱解析", "warrant_code"].nunique())
     print(
         "🔎 發行商辨識來源："
-        f"官方欄位列={official_field_count:,}｜官方名稱列={official_name_count:,}｜"
-        f"FinMind名稱備援列={finmind_name_count:,}"
+        f"官方欄位={official_field_warrants}支/{official_field_count:,}列｜"
+        f"官方名稱={official_name_warrants}支/{official_name_count:,}列｜"
+        f"FinMind名稱備援={finmind_name_warrants}支/{finmind_name_count:,}列"
     )
     print(
         f"💰 權證資金流檢查：原始買進={fmt_money(raw_buy)}｜原始賣出={fmt_money(-raw_sell)}｜原始淨額={fmt_money(raw_net)}｜"
@@ -6168,6 +6192,11 @@ def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
 def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, week_days: int = WEEK_TRADING_DAYS):
     plot_df = stock_df.tail(CHART_LOOKBACK).copy()
     trading_dates = [pd.Timestamp(d).normalize() for d in list(plot_df.index)]
+    warrant_data_end = pd.NaT
+    if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
+        warrant_dates_for_label = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna()
+        if not warrant_dates_for_label.empty:
+            warrant_data_end = pd.Timestamp(warrant_dates_for_label.max()).normalize()
 
     # 週報的權證統計區間改用「股價日期 + 權證事件日期」合併日期軸。
     # 原本只用股價 K 線最新日當週報結束日，若 yfinance 晚一天更新，
@@ -6274,7 +6303,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         f"📅 週報統計區間：{week_start.strftime('%Y/%m/%d') if pd.notna(week_start) else '-'} - "
         f"{week_end.strftime('%Y/%m/%d') if pd.notna(week_end) else '-'}｜"
         f"模式={WARRANT_WEEK_RANGE_MODE}｜實際股價日={len(stock_week_dates)}｜"
-        f"權證事件={len(week_events):,}"
+        f"權證事件={len(week_events):,}｜"
+        f"權證資料截至={warrant_data_end.strftime('%Y/%m/%d') if pd.notna(warrant_data_end) else '-'}"
     )
 
     return {
@@ -6286,6 +6316,7 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         "raw_week_events": raw_week_events,
         "week_start": week_start,
         "week_end": week_end,
+        "warrant_data_end": warrant_data_end,
         "report_dates": report_dates,
         "stock_week_dates": stock_week_dates,
         "stock_ret": stock_ret,
@@ -13843,8 +13874,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
+    warrant_data_end = ctx.get("warrant_data_end", pd.NaT)
+    warrant_period_note = ""
+    if pd.notna(warrant_data_end) and pd.notna(ctx.get("week_end")) and pd.Timestamp(warrant_data_end).normalize() < pd.Timestamp(ctx.get("week_end")).normalize():
+        warrant_period_note = f"｜權證資料至 {pd.Timestamp(warrant_data_end).strftime('%Y/%m/%d')}"
     ax_header.text(0.01, 0.50, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
-    ax_header.text(0.01, -0.10, f"週報區間：{period}｜資訊僅供參考", color=MUTED, fontsize=32, ha="left", va="center")
+    ax_header.text(0.01, -0.10, f"週報區間：{period}{warrant_period_note}｜資訊僅供參考", color=MUTED, fontsize=32, ha="left", va="center")
     ax_header.text(1.03, 0.62, "By 股市艾斯出品  請勿轉傳", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
@@ -15082,7 +15117,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-safe-day-allchart-compare-v15"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-dynamic-guard-equal-scope-v16"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15248,6 +15283,7 @@ _FINMIND_TRADING_DATE_CACHE = {}
 _FINMIND_WARRANT_SUMMARY_CACHE = {}
 _FINMIND_SELECTED_BRANCH_ID_CACHE = {}
 _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = None
+_FINMIND_OFFICIAL_ISSUER_FORCE_REFRESH_ATTEMPTED = False
 _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK = threading.RLock()
 _FINMIND_DEBUG_ONCE_KEYS = set()
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
@@ -17972,20 +18008,226 @@ WARRANT_COMPARE_DEBUG_SAVE_CSV = os.getenv(
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
 
-# FinMind 當日權證分點可能在盤後分批更新。正式報表預設只採用「已完整結束的前一日」；
-# 原始當日資料仍保留給對帳診斷，避免把尚未完整的當日列直接畫進資金流、TOP5 與精選分點。
+# FinMind 當日權證分點可能在盤後分批更新。新版不再「只要是今天就一律排除」，
+# 而是用 TWSE / TPEx 官方權證當日成交量逐檔核對 FinMind 分點買賣張數；
+# 驗證通過才納入正式圖，驗證失敗或官方當日資料尚未發布才退回前一完整交易日。
 FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE = os.getenv(
     "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE = os.getenv(
+    "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE = min(
+    1.0,
+    max(0.0, float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE", "1.0"))),
+)
+FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS", "1.0")),
+)
+FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT", "0.001")),
+)
+FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES = max(
+    1,
+    int(os.getenv("FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES", "1")),
+)
 WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE = os.getenv(
     "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _apply_finmind_current_day_safety_guard(events_df: pd.DataFrame, requested_end=None) -> pd.DataFrame:
-    """正式產圖排除尚未完成更新的台北當日權證分點；歷史日期完全不改。"""
+def _finmind_current_day_official_volume_audit(
+    events_df: pd.DataFrame,
+    stock_code: str,
+    stock_name: str,
+    target_date,
+) -> dict:
+    """用官方權證成交量驗證 FinMind 當日分點資料是否完整。
+
+    對每支當日有成交的認購權證，比較：
+    - TWSE / TPEx 官方成交量（張）
+    - FinMind 所有分點買進張數合計
+    - FinMind 所有分點賣出張數合計
+
+    完整的全市場分點資料，買進與賣出合計都應分別等於官方成交量。
+    """
+    result = {
+        "verified": False,
+        "reason": "尚未驗證",
+        "audit_df": pd.DataFrame(),
+        "official_codes": 0,
+        "matched_codes": 0,
+        "coverage": 0.0,
+        "official_total_lots": 0.0,
+        "finmind_buy_total_lots": 0.0,
+        "finmind_sell_total_lots": 0.0,
+    }
+    if not FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE:
+        result["reason"] = "官方成交量驗證已關閉"
+        return result
+    if events_df is None or events_df.empty:
+        result["reason"] = "FinMind 當日事件為空"
+        return result
+
+    target_ts = pd.Timestamp(target_date).normalize()
+    target_s = target_ts.strftime("%Y/%m/%d")
+    code = _normalize_stock_name_code_key(stock_code)
+
+    try:
+        summary = _finmind_get_warrant_summary(code, target_ts, target_ts)
+        active_codes = set(
+            summary.get("stock_id", pd.Series(dtype=str))
+            .astype(str)
+            .map(normalize_openapi_warrant_code)
+        )
+        active_codes.discard("")
+        if not active_codes:
+            result["reason"] = "FinMind 找不到當日有效認購權證母體"
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            twse_future = executor.submit(fetch_twse_openapi_warrant_daily_df)
+            tpex_future = executor.submit(fetch_tpex_openapi_warrant_daily_df)
+            try:
+                twse_df = twse_future.result()
+            except Exception as exc:
+                print(f"⚠️ 當日完整性驗證 TWSE OpenAPI 失敗：{exc}")
+                twse_df = pd.DataFrame()
+            try:
+                tpex_df = tpex_future.result()
+            except Exception as exc:
+                print(f"⚠️ 當日完整性驗證 TPEx OpenAPI 失敗：{exc}")
+                tpex_df = pd.DataFrame()
+
+        official_parts = [df for df in [twse_df, tpex_df] if isinstance(df, pd.DataFrame) and not df.empty]
+        if not official_parts:
+            result["reason"] = "TWSE / TPEx 官方權證當日資料皆無法取得"
+            return result
+        official = pd.concat(official_parts, ignore_index=True, sort=False)
+        for col in ["交易日期", "代號", "成交量", "市場", "名稱"]:
+            if col not in official.columns:
+                official[col] = "" if col not in {"成交量"} else 0
+        official["代號"] = official["代號"].map(normalize_openapi_warrant_code)
+        official["成交量"] = pd.to_numeric(official["成交量"], errors="coerce").fillna(0.0)
+        official = official[
+            (official["交易日期"].astype(str) == target_s)
+            & official["代號"].isin(active_codes)
+            & (official["成交量"] > 0)
+        ].copy()
+        if official.empty:
+            available_dates = sorted(
+                d for d in set(pd.concat(official_parts, ignore_index=True, sort=False).get("交易日期", pd.Series(dtype=str)).astype(str))
+                if d
+            )
+            latest_available = available_dates[-1] if available_dates else "-"
+            result["reason"] = f"官方權證資料尚未發布到 {target_s}（目前最新 {latest_available}）"
+            return result
+
+        official = (
+            official.sort_values("成交量")
+            .drop_duplicates(subset=["代號"], keep="last")
+            [["代號", "名稱", "市場", "成交量"]]
+            .rename(columns={"代號": "warrant_code", "名稱": "official_name", "市場": "official_market", "成交量": "official_volume_lots"})
+        )
+
+        current = events_df.copy()
+        current["Date"] = pd.to_datetime(current["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+        current = current[current["Date"] == target_ts].copy()
+        current["warrant_code"] = current["warrant_code"].map(normalize_openapi_warrant_code)
+        for col in ["buy_shares", "sell_shares"]:
+            if col not in current.columns:
+                current[col] = 0.0
+            current[col] = pd.to_numeric(current[col], errors="coerce").fillna(0.0)
+        fin = current.groupby("warrant_code", as_index=False).agg(
+            finmind_buy_lots=("buy_shares", "sum"),
+            finmind_sell_lots=("sell_shares", "sum"),
+            finmind_rows=("warrant_code", "size"),
+        )
+
+        audit = official.merge(fin, on="warrant_code", how="left")
+        for col in ["finmind_buy_lots", "finmind_sell_lots", "finmind_rows"]:
+            audit[col] = pd.to_numeric(audit[col], errors="coerce").fillna(0.0)
+        audit["buy_diff_lots"] = audit["finmind_buy_lots"] - audit["official_volume_lots"]
+        audit["sell_diff_lots"] = audit["finmind_sell_lots"] - audit["official_volume_lots"]
+        audit["allowed_diff_lots"] = np.maximum(
+            FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS,
+            audit["official_volume_lots"].abs() * FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT,
+        )
+        audit["buy_match"] = audit["buy_diff_lots"].abs() <= audit["allowed_diff_lots"]
+        audit["sell_match"] = audit["sell_diff_lots"].abs() <= audit["allowed_diff_lots"]
+        audit["matched"] = audit["buy_match"] & audit["sell_match"]
+        audit["abs_max_diff_lots"] = audit[["buy_diff_lots", "sell_diff_lots"]].abs().max(axis=1)
+        audit = audit.sort_values(["matched", "abs_max_diff_lots"], ascending=[True, False]).reset_index(drop=True)
+
+        official_codes = int(len(audit))
+        matched_codes = int(audit["matched"].sum())
+        coverage = matched_codes / official_codes if official_codes else 0.0
+        official_total = float(audit["official_volume_lots"].sum())
+        fin_buy_total = float(audit["finmind_buy_lots"].sum())
+        fin_sell_total = float(audit["finmind_sell_lots"].sum())
+        total_allowed = max(
+            FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS,
+            official_total * FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT,
+        )
+        total_match = (
+            abs(fin_buy_total - official_total) <= total_allowed
+            and abs(fin_sell_total - official_total) <= total_allowed
+        )
+        verified = (
+            official_codes >= FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES
+            and coverage >= FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE
+            and total_match
+        )
+
+        result.update({
+            "verified": bool(verified),
+            "reason": "逐檔與總量皆吻合" if verified else "逐檔或總量未通過官方成交量核對",
+            "audit_df": audit,
+            "official_codes": official_codes,
+            "matched_codes": matched_codes,
+            "coverage": float(coverage),
+            "official_total_lots": official_total,
+            "finmind_buy_total_lots": fin_buy_total,
+            "finmind_sell_total_lots": fin_sell_total,
+        })
+        print(
+            "🔬 FinMind 當日官方成交量核對："
+            f"{code} {stock_name}｜日期={target_ts.date()}｜"
+            f"通過權證={matched_codes}/{official_codes}（{coverage:.2%}）｜"
+            f"官方={official_total:,.0f}張｜FinMind買={fin_buy_total:,.0f}張｜FinMind賣={fin_sell_total:,.0f}張"
+        )
+        if not verified:
+            bad = audit[~audit["matched"]].head(20)
+            if not bad.empty:
+                print("⚠️ 當日完整性未通過的權證（前20筆）：")
+                print(bad[[
+                    "warrant_code", "official_name", "official_market", "official_volume_lots",
+                    "finmind_buy_lots", "finmind_sell_lots", "buy_diff_lots", "sell_diff_lots",
+                ]].to_string(index=False))
+        if WARRANT_COMPARE_DEBUG_SAVE_CSV:
+            try:
+                _compare_debug_save_csv(code, "current_day_completeness", audit)
+            except Exception:
+                pass
+        return result
+    except Exception as exc:
+        result["reason"] = f"官方成交量驗證例外：{exc}"
+        print(f"⚠️ FinMind 當日完整性驗證失敗：{exc}")
+        return result
+
+
+def _apply_finmind_current_day_safety_guard(
+    events_df: pd.DataFrame,
+    stock_code: str = "",
+    stock_name: str = "",
+    requested_end=None,
+) -> pd.DataFrame:
+    """動態判斷當日資料是否完整；完整則保留，不完整才退回前一交易日。"""
     if events_df is None or events_df.empty or "Date" not in events_df.columns:
         return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
     out = events_df.copy()
@@ -18002,24 +18244,51 @@ def _apply_finmind_current_day_safety_guard(events_df: pd.DataFrame, requested_e
     current_mask = out["Date"] == taipei_today
     current_rows = out.loc[current_mask].copy()
     kept = out.loc[~current_mask].copy()
-    if current_rows.empty or kept.empty:
+    if current_rows.empty:
         return out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    audit = _finmind_current_day_official_volume_audit(
+        out,
+        stock_code=stock_code,
+        stock_name=stock_name,
+        target_date=taipei_today,
+    )
+    if audit.get("verified"):
+        result = out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+        result.attrs["finmind_guard_status"] = "verified_keep"
+        result.attrs["finmind_guard_verified_date"] = taipei_today.strftime("%Y-%m-%d")
+        print(
+            "✅ FinMind 當日完整性驗證通過：正式圖納入當日權證分點｜"
+            f"日期={taipei_today.date()}｜事件={len(current_rows):,}筆｜原因={audit.get('reason', '')}"
+        )
+        return result
+
+    if kept.empty:
+        print(
+            "⚠️ FinMind 當日完整性未通過，但沒有較早資料可退回；保留當日並標記未驗證｜"
+            f"日期={taipei_today.date()}｜原因={audit.get('reason', '')}"
+        )
+        result = out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+        result.attrs["finmind_guard_status"] = "unverified_no_fallback"
+        return result
 
     for col in ["buy_amount", "sell_amount", "net_amount"]:
         if col not in current_rows.columns:
             current_rows[col] = 0.0
         current_rows[col] = pd.to_numeric(current_rows[col], errors="coerce").fillna(0.0)
     print(
-        "🛡️ FinMind 當日完整性保護：正式圖表暫不採用尚在更新中的當日權證分點｜"
+        "🛡️ FinMind 當日完整性保護：官方成交量核對未通過，正式圖退回前一完整交易日｜"
         f"日期={taipei_today.date()}｜排除={len(current_rows):,}筆｜"
         f"買進={fmt_money(float(current_rows['buy_amount'].sum()))}｜"
         f"賣出={fmt_money(-float(current_rows['sell_amount'].sum()))}｜"
         f"淨額={fmt_money(float(current_rows['net_amount'].sum()))}｜"
-        f"正式最新日={kept['Date'].max().date()}"
+        f"正式最新日={kept['Date'].max().date()}｜原因={audit.get('reason', '')}"
     )
-    kept.attrs["finmind_guard_excluded_date"] = taipei_today.strftime("%Y-%m-%d")
-    kept.attrs["finmind_guard_excluded_rows"] = int(len(current_rows))
-    return kept.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    result = kept.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    result.attrs["finmind_guard_status"] = "excluded_incomplete"
+    result.attrs["finmind_guard_excluded_date"] = taipei_today.strftime("%Y-%m-%d")
+    result.attrs["finmind_guard_excluded_rows"] = int(len(current_rows))
+    return result
 
 
 def _compare_debug_banner(title: str):
@@ -18692,6 +18961,72 @@ def _daily_cumulative_from_events(events: pd.DataFrame, prefix: str) -> pd.DataF
     return out.rename(columns={c: f"{prefix}_{c}" for c in out.columns if c != "Date"})
 
 
+def _build_moneydj_equal_scope_warrant_universe(
+    legacy_warrants: List[dict],
+    finmind_events: pd.DataFrame,
+    stock_code: str,
+    stock_name: str,
+) -> List[dict]:
+    """把舊 MoneyDJ 母體與 FinMind 實際出現的全部權證合併，供同母體對帳。"""
+    records = {}
+    for w in legacy_warrants or []:
+        code = normalize_openapi_warrant_code(w.get("代號", ""))
+        if not code:
+            continue
+        rec = dict(w)
+        rec["代號"] = code
+        rec.setdefault("名稱", code)
+        rec.setdefault("標的股", _normalize_stock_name_code_key(stock_code))
+        rec.setdefault("標的名稱", stock_name)
+        rec["對帳母體來源"] = "MoneyDJLegacy"
+        records[code] = rec
+
+    fin = _prepare_compare_event_df(finmind_events)
+    if not fin.empty:
+        for code, group in fin.groupby("warrant_code", sort=False):
+            code = normalize_openapi_warrant_code(code)
+            if not code:
+                continue
+            name_values = [str(x).strip() for x in group.get("warrant_name", pd.Series(dtype=str)) if str(x).strip()]
+            rec = records.get(code, {})
+            rec.update({
+                "代號": code,
+                "名稱": rec.get("名稱") or (name_values[0] if name_values else code),
+                "標的股": rec.get("標的股") or _normalize_stock_name_code_key(stock_code),
+                "標的名稱": rec.get("標的名稱") or stock_name,
+                "成交金額": rec.get("成交金額", 0),
+                "成交量": rec.get("成交量", 0),
+                "對帳母體來源": "MoneyDJLegacy+FinMindActual" if code in records else "FinMindActualSupplement",
+            })
+            records[code] = rec
+    return sorted(records.values(), key=lambda x: str(x.get("代號", "")))
+
+
+def _compare_restrict_events(
+    events: pd.DataFrame,
+    warrant_codes: set | None = None,
+    end_date=None,
+) -> pd.DataFrame:
+    out = _prepare_compare_event_df(events)
+    if out.empty:
+        return out
+    if warrant_codes is not None:
+        out = out[out["warrant_code"].isin(set(warrant_codes))].copy()
+    if end_date is not None:
+        out = out[out["Date"] <= pd.Timestamp(end_date).normalize()].copy()
+    return out.reset_index(drop=True)
+
+
+def _common_event_end_date(*frames: pd.DataFrame):
+    dates = []
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame) and not frame.empty and "Date" in frame.columns:
+            s = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+            if not s.empty:
+                dates.append(pd.Timestamp(s.max()).normalize())
+    return min(dates) if len(dates) == len(frames) and dates else (min(dates) if dates else pd.NaT)
+
+
 def _run_all_branch_moneydj_compare_debug(
     stock_code: str,
     stock_name: str,
@@ -18703,31 +19038,90 @@ def _run_all_branch_moneydj_compare_debug(
 ):
     if not WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE:
         return {}
-    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 全分點對帳開始")
+    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 同母體對帳開始")
     raw_fin = _prepare_compare_event_df(raw_finmind_events)
     formal_fin = _prepare_compare_event_df(formal_finmind_events)
-    # 上方舊圖要重現原本 MoneyDJ 母體，不補 FinMind 歷史權證，才能直接解釋舊圖差異。
-    warrants = get_all_active_call_warrants(
+
+    legacy_warrants = get_all_active_call_warrants(
         stock_code,
         stock_name,
         start_date=start_date,
         end_date=end_date,
     )
-    print(f"🧾 MoneyDJ 舊上方圖原始權證母體：{len(warrants or []):,} 支")
-    legacy_pairs = _moneydj_compare_discover_all_pairs(warrants, start_date, end_date)
-    mdj_legacy = _moneydj_compare_fetch_api5_pairs(
-        legacy_pairs, start_date, end_date, scope_label="全分點Legacy"
+    legacy_codes = {
+        normalize_openapi_warrant_code(w.get("代號", ""))
+        for w in legacy_warrants or []
+        if normalize_openapi_warrant_code(w.get("代號", ""))
+    }
+    equal_scope_warrants = _build_moneydj_equal_scope_warrant_universe(
+        legacy_warrants,
+        raw_fin,
+        stock_code,
+        stock_name,
     )
-    _compare_debug_save_csv(stock_code, "moneydj_all_branch_legacy_raw", mdj_legacy)
-
-    _compare_debug_banner("全分點原始事件共同鍵驗證")
-    detail = _compare_event_key_coverage(
-        stock_code, raw_fin, mdj_legacy, "all_branch_detail_outer_join"
+    equal_scope_codes = {
+        normalize_openapi_warrant_code(w.get("代號", ""))
+        for w in equal_scope_warrants
+        if normalize_openapi_warrant_code(w.get("代號", ""))
+    }
+    print(
+        f"🧾 權證母體：MoneyDJ舊母體={len(legacy_codes):,}支｜"
+        f"FinMind實際={raw_fin['warrant_code'].nunique() if not raw_fin.empty else 0:,}支｜"
+        f"同母體聯集={len(equal_scope_codes):,}支｜FinMind補入={len(equal_scope_codes-legacy_codes):,}支"
     )
 
-    # 用完全相同的新版發行商排除規則處理兩邊，再比較上方資金流實際畫圖口徑。
-    fin_flow = filter_warrant_flow_excluding_issuer_market_makers(formal_fin)
-    mdj_flow = filter_warrant_flow_excluding_issuer_market_makers(mdj_legacy)
+    all_pairs = _moneydj_compare_discover_all_pairs(equal_scope_warrants, start_date, end_date)
+    mdj_union = _moneydj_compare_fetch_api5_pairs(
+        all_pairs,
+        start_date,
+        end_date,
+        scope_label="全分點EqualScope",
+    )
+    _compare_debug_save_csv(stock_code, "moneydj_all_branch_equal_scope_raw", mdj_union)
+
+    # A. 舊 MoneyDJ 42 支（或當次實際舊母體）與 FinMind 限制為同一批權證、同一截止日。
+    fin_legacy = _compare_restrict_events(raw_fin, legacy_codes)
+    mdj_legacy = _compare_restrict_events(mdj_union, legacy_codes)
+    legacy_end = _common_event_end_date(fin_legacy, mdj_legacy)
+    fin_legacy = _compare_restrict_events(fin_legacy, end_date=legacy_end)
+    mdj_legacy = _compare_restrict_events(mdj_legacy, end_date=legacy_end)
+    _compare_debug_banner(
+        f"A. 舊 MoneyDJ 母體同權證同日期驗證｜權證={len(legacy_codes):,}｜截止={legacy_end.date() if pd.notna(legacy_end) else '-'}"
+    )
+    legacy_detail = _compare_event_key_coverage(
+        stock_code,
+        fin_legacy,
+        mdj_legacy,
+        "all_branch_legacy_equal_scope_detail",
+    )
+
+    # B. MoneyDJ 補查 FinMind 所有實際權證，雙方以聯集母體與共同截止日比較。
+    fin_union = _compare_restrict_events(raw_fin, equal_scope_codes)
+    mdj_union_common = _compare_restrict_events(mdj_union, equal_scope_codes)
+    union_end = _common_event_end_date(fin_union, mdj_union_common)
+    fin_union = _compare_restrict_events(fin_union, end_date=union_end)
+    mdj_union_common = _compare_restrict_events(mdj_union_common, end_date=union_end)
+    _compare_debug_banner(
+        f"B. FinMind 全部權證聯集同日期驗證｜權證={len(equal_scope_codes):,}｜截止={union_end.date() if pd.notna(union_end) else '-'}"
+    )
+    union_detail = _compare_event_key_coverage(
+        stock_code,
+        fin_union,
+        mdj_union_common,
+        "all_branch_union_equal_scope_detail",
+    )
+
+    # C. 正式圖口徑：雙方統一使用正式安全截止日與完整聯集母體，再套同一發行商排除。
+    formal_end = _common_event_end_date(formal_fin, mdj_union_common)
+    formal_fin_common = _compare_restrict_events(formal_fin, equal_scope_codes, formal_end)
+    mdj_formal_common = _compare_restrict_events(mdj_union_common, equal_scope_codes, formal_end)
+    print(
+        f"📌 正式圖同口徑截止日：{formal_end.date() if pd.notna(formal_end) else '-'}｜"
+        f"FinMind事件={len(formal_fin_common):,}｜MoneyDJ事件={len(mdj_formal_common):,}"
+    )
+
+    fin_flow = filter_warrant_flow_excluding_issuer_market_makers(formal_fin_common)
+    mdj_flow = filter_warrant_flow_excluding_issuer_market_makers(mdj_formal_common)
     daily = _daily_cumulative_from_events(fin_flow, "finmind").merge(
         _daily_cumulative_from_events(mdj_flow, "moneydj"),
         on="Date",
@@ -18739,21 +19133,27 @@ def _run_all_branch_moneydj_compare_debug(
             daily[fcol] = 0.0
         if mcol not in daily.columns:
             daily[mcol] = 0.0
-        daily[f"diff_{col}"] = pd.to_numeric(daily[fcol], errors="coerce").fillna(0) - pd.to_numeric(daily[mcol], errors="coerce").fillna(0)
+        daily[f"diff_{col}"] = (
+            pd.to_numeric(daily[fcol], errors="coerce").fillna(0)
+            - pd.to_numeric(daily[mcol], errors="coerce").fillna(0)
+        )
     daily_print = daily.copy()
     daily_print["Date"] = pd.to_datetime(daily_print["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
     _compare_debug_print_df(
-        "上方權證資金流每日／累計對帳（雙方套用同一發行商排除規則）",
+        "C. 上方權證資金流每日／累計對帳（同權證、同日期、同發行商排除）",
         daily_print,
         max_rows=max(WARRANT_COMPARE_DEBUG_MAX_ROWS, len(daily_print)),
     )
-    _compare_debug_save_csv(stock_code, "upper_flow_daily_cumulative", daily)
+    _compare_debug_save_csv(stock_code, "upper_flow_equal_scope_daily_cumulative", daily)
 
-    fin_ctx = build_weekly_context(stock_df, formal_fin, WEEK_TRADING_DAYS) if not formal_fin.empty else None
-    mdj_ctx = build_weekly_context(stock_df, mdj_legacy, WEEK_TRADING_DAYS) if mdj_legacy is not None and not mdj_legacy.empty else None
+    stock_df_compare = stock_df.copy()
+    if pd.notna(formal_end):
+        stock_df_compare = stock_df_compare[pd.to_datetime(stock_df_compare.index).normalize() <= pd.Timestamp(formal_end).normalize()].copy()
+    fin_ctx = build_weekly_context(stock_df_compare, formal_fin_common, WEEK_TRADING_DAYS) if not formal_fin_common.empty else None
+    mdj_ctx = build_weekly_context(stock_df_compare, mdj_formal_common, WEEK_TRADING_DAYS) if not mdj_formal_common.empty else None
     summary_rows = []
     top_rows = []
-    for source, ctx in [("FinMind正式圖", fin_ctx), ("MoneyDJ舊API4母體", mdj_ctx)]:
+    for source, ctx in [("FinMind同母體", fin_ctx), ("MoneyDJ同母體", mdj_ctx)]:
         if not ctx:
             continue
         week_events = ctx.get("week_events", pd.DataFrame())
@@ -18761,13 +19161,14 @@ def _run_all_branch_moneydj_compare_debug(
             "source": source,
             "week_start": ctx.get("week_start"),
             "week_end": ctx.get("week_end"),
+            "warrant_data_end": ctx.get("warrant_data_end"),
             "rows": len(week_events) if isinstance(week_events, pd.DataFrame) else 0,
             "buy_amount": float(ctx.get("total_buy", 0) or 0),
             "sell_amount": float(ctx.get("total_sell", 0) or 0),
             "net_amount": float(ctx.get("total_net", 0) or 0),
         })
         if isinstance(week_events, pd.DataFrame) and not week_events.empty:
-            buy_top, sell_top = _get_cached_top_branch_tables(ctx, "compare_current_week", week_events, topn=5)
+            buy_top, sell_top = _get_cached_top_branch_tables(ctx, "compare_equal_scope_week", week_events, topn=5)
             for side, table in [("買超TOP5", buy_top), ("賣超TOP5", sell_top)]:
                 if table is None or table.empty:
                     continue
@@ -18776,25 +19177,56 @@ def _run_all_branch_moneydj_compare_debug(
                 temp.insert(0, "source", source)
                 top_rows.append(temp)
     summary_df = pd.DataFrame(summary_rows)
-    _compare_debug_print_df("本週權證資金流總額對帳", summary_df, max_rows=20)
-    _compare_debug_save_csv(stock_code, "upper_flow_week_summary", summary_df)
+    _compare_debug_print_df("本週權證資金流總額同母體對帳", summary_df, max_rows=20)
+    _compare_debug_save_csv(stock_code, "upper_flow_equal_scope_week_summary", summary_df)
     top_df = pd.concat(top_rows, ignore_index=True, sort=False) if top_rows else pd.DataFrame()
-    _compare_debug_print_df("本週權分點 TOP5 對帳", top_df, max_rows=30)
-    _compare_debug_save_csv(stock_code, "upper_flow_top5_compare", top_df)
+    _compare_debug_print_df("本週權分點 TOP5 同母體對帳", top_df, max_rows=30)
+    _compare_debug_save_csv(stock_code, "upper_flow_equal_scope_top5_compare", top_df)
+
+    scope_summary = pd.DataFrame([
+        {
+            "scope": "Legacy同母體",
+            "warrants": len(legacy_codes),
+            "cutoff": legacy_end,
+            "finmind_rows": len(fin_legacy),
+            "moneydj_rows": len(mdj_legacy),
+            "common_keys": int((legacy_detail.get("_merge", pd.Series(dtype=str)) == "both").sum()) if not legacy_detail.empty else 0,
+            "finmind_only_keys": int((legacy_detail.get("_merge", pd.Series(dtype=str)) == "left_only").sum()) if not legacy_detail.empty else 0,
+            "moneydj_only_keys": int((legacy_detail.get("_merge", pd.Series(dtype=str)) == "right_only").sum()) if not legacy_detail.empty else 0,
+        },
+        {
+            "scope": "Union同母體",
+            "warrants": len(equal_scope_codes),
+            "cutoff": union_end,
+            "finmind_rows": len(fin_union),
+            "moneydj_rows": len(mdj_union_common),
+            "common_keys": int((union_detail.get("_merge", pd.Series(dtype=str)) == "both").sum()) if not union_detail.empty else 0,
+            "finmind_only_keys": int((union_detail.get("_merge", pd.Series(dtype=str)) == "left_only").sum()) if not union_detail.empty else 0,
+            "moneydj_only_keys": int((union_detail.get("_merge", pd.Series(dtype=str)) == "right_only").sum()) if not union_detail.empty else 0,
+        },
+    ])
+    _compare_debug_print_df("權證母體與覆蓋摘要", scope_summary, max_rows=10)
+    _compare_debug_save_csv(stock_code, "all_branch_scope_summary", scope_summary)
 
     print(
-        "📌 判讀方式：MoneyDJ舊API4母體重現舊圖覆蓋；FinMind正式圖使用全市場資料。"
-        "共同鍵金額若為0差異、但累計／TOP5仍不同，差異即來自API4歷史pair覆蓋，不是金額公式。"
+        "📌 判讀方式：A 驗證舊圖母體本身；B 驗證 MoneyDJ 補查 FinMind 全部權證後的完整母體；"
+        "C 再統一正式截止日與發行商排除。共同鍵金額差為 0 才能排除公式與方向問題。"
     )
-    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 全分點對帳結束")
+    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 同母體對帳結束")
+    legacy_pairs = [p for p in all_pairs if normalize_openapi_warrant_code(p.get("warrant_code", "")) in legacy_codes]
     return {
-        "warrants": warrants,
+        "warrants": equal_scope_warrants,
+        "legacy_warrants": legacy_warrants,
         "legacy_pairs": legacy_pairs,
+        "all_pairs": all_pairs,
         "moneydj_legacy": mdj_legacy,
-        "detail": detail,
+        "moneydj_equal_scope": mdj_union,
+        "legacy_detail": legacy_detail,
+        "union_detail": union_detail,
         "daily": daily,
         "summary": summary_df,
         "top5": top_df,
+        "formal_end": formal_end,
     }
 
 
@@ -19091,7 +19523,7 @@ def run_finmind_moneydj_compare_diagnostics(
             raw_warrant_events.copy() if raw_warrant_events is not None else pd.DataFrame(),
             start_date,
             end_date,
-            pre_discovered_all_pairs=all_branch_result.get("legacy_pairs", []),
+            pre_discovered_all_pairs=all_branch_result.get("all_pairs", all_branch_result.get("legacy_pairs", [])),
         ) or {}
         total_daily = selected_result.get("daily_total", pd.DataFrame())
         formal_dates = pd.to_datetime(
@@ -19102,7 +19534,7 @@ def run_finmind_moneydj_compare_diagnostics(
             cutoff = pd.Timestamp(formal_dates.max()).normalize()
             safe = total_daily[pd.to_datetime(total_daily["Date"], errors="coerce").dt.normalize() <= cutoff].copy()
             _compare_debug_banner("精選五分點正式安全截止日判定")
-            print(f"📌 正式圖最新權證日={cutoff.date()}｜當日完整性保護={'開啟' if FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE else '關閉'}")
+            print(f"📌 正式圖最新權證日={cutoff.date()}｜動態當日完整性保護={'開啟' if FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE else '關閉'}")
             if not safe.empty:
                 fin_total = float(safe["finmind_net_amount"].sum())
                 mdj_total = float(safe["moneydj_net_amount"].sum())
@@ -19214,7 +19646,12 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         with report_stage_timer(f"{stock_code}｜權證完整流程"):
             warrant_events = warrant_future.result()
         raw_warrant_events = warrant_events.copy() if isinstance(warrant_events, pd.DataFrame) else pd.DataFrame()
-        warrant_events = _apply_finmind_current_day_safety_guard(warrant_events, requested_end=end_date)
+        warrant_events = _apply_finmind_current_day_safety_guard(
+            warrant_events,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            requested_end=end_date,
+        )
         try:
             news_pipeline_result = news_future.result()
         except Exception as e:
@@ -19381,7 +19818,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+safe-current-day+market-compact-prewarm+strict-finmind-news+allchart-moneydj-compare+branch-perf-disk+single-context+uv-ready+calendar7"
+        "official-issuer-refresh+issuer-audit+dynamic-current-day-openapi-check+equal-universe-moneydj-compare+market-compact-prewarm+strict-finmind-news+branch-perf-disk+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
