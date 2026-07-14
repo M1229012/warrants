@@ -60,7 +60,7 @@ on:
           - "1"
         default: "1"
       finmind_current_day_guard:
-        description: "FinMind 當日資料尚在更新時是否排除當日權證分點（1=安全排除，0=仍納入）"
+        description: "FinMind 當日資料是否啟用官方成交量完整性驗證（1=通過才納入，0=不驗證直接納入）"
         required: false
         type: choice
         options:
@@ -210,15 +210,19 @@ jobs:
       # 任意新股票直接使用排程預熱的全市場精簡事件檔。
       FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
       FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
-      # FinMind 當日權證分點可能分批更新；正式圖預設只使用前一個完整交易日。
+      # FinMind 當日權證分點用 TWSE / TPEx 官方權證成交量逐檔驗證；通過才納入正式圖。
       FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE: ${{ inputs.finmind_current_day_guard || '1' }}
+      FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE: "1"
+      FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE: "1.0"
+      FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS: "1.0"
+      FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT: "0.001"
 
       # 上方權證資金流與 TOP5：逐檔排除該權證官方辨識的發行造市端。
       WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
       FINMIND_ISSUER_FLOW_ENABLE: "1"
       FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
       FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "0"
-      FINMIND_ISSUER_FLOW_DEBUG_ENABLE: "0"
+      FINMIND_ISSUER_FLOW_DEBUG_ENABLE: ${{ inputs.moneydj_compare_debug == '1' && inputs.moneydj_compare_all_branches == '1' && '1' || '0' }}
       WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
 
       # 正式產圖關閉大型成功 Debug；錯誤仍保留摘要與 traceback。
@@ -432,6 +436,7 @@ jobs:
           echo "WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE=$WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE"
           echo "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE=$WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
+          echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
           python -u run_report.py
 
       - name: Upload report artifact
