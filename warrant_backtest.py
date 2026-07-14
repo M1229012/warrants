@@ -117,7 +117,7 @@ PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS = int(os.getenv("PRICE_CACHE_FULL_SYNC_THRE
 TOP15_CACHE_ENABLED = os.getenv("TOP15_CACHE_ENABLED", os.getenv("TOP15_RETURN_CACHE_ENABLED", "1")).strip().lower() not in ("0", "false", "no")
 TOP15_POSITION_DETAIL_SHEET = os.getenv("TOP15_POSITION_DETAIL_SHEET", "快取_TOP15部位明細")
 TOP15_CONSENSUS_SHEET = os.getenv("TOP15_CONSENSUS_SHEET", "快取_TOP15共識淨買超")
-TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", os.getenv("LOOKBACK_TRADING_DAYS", "22"))))
+TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", os.getenv("LOOKBACK_TRADING_DAYS", "40"))))
 TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75")))
 TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10")))
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
@@ -2441,9 +2441,12 @@ def worksheet_used_grid_size(ws):
     )
 
 
-def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表"):
+def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表", allowed_titles=None):
     """
-    把每張工作表縮到實際有內容 / 公式的列數與欄數。
+    把指定工作表縮到實際有內容 / 公式的列數與欄數。
+
+    allowed_titles=None 時維持原本行為，清理全部工作表；
+    傳入工作表名稱集合時，只讀取與清理指定工作表，避免精選五分點模式掃描無關工作表。
 
     Google Sheets 的 1,000 萬格上限會把空白預留列與欄也算進去，因此不能只 clear，
     必須真的 resize 才能釋放格數。
@@ -2455,6 +2458,14 @@ def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表"):
     if spreadsheet is None:
         return False
 
+    allowed_title_set = None
+    if allowed_titles is not None:
+        allowed_title_set = {
+            safe_worksheet_title(title)
+            for title in allowed_titles
+            if str(title).strip()
+        }
+
     before_cells = spreadsheet_grid_cell_count(spreadsheet)
     changed_count = 0
 
@@ -2463,6 +2474,12 @@ def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表"):
     except Exception as e:
         print(f"  ⚠️ Google Sheet 空白格清理失敗：{label}，原因：{type(e).__name__}: {e}")
         return False
+
+    if allowed_title_set is not None:
+        worksheets = [
+            ws for ws in worksheets
+            if safe_worksheet_title(getattr(ws, "title", "")) in allowed_title_set
+        ]
 
     for ws in worksheets:
         try:
@@ -4044,20 +4061,23 @@ GSHEET_RESULT_OVERWRITE_TITLES = {
     "顏色說明",
 }
 
-# RUN_MODE=1 精選五分點模式只用來產出每日圖卡與精選資料，
-# 不應覆蓋全分點模式才需要維護的查詢頁與勝率統計頁。
-# 這些工作表只在 RUN_MODE=2 全分點模式同步到 Google Sheet。
-GSHEET_RUN_MODE1_SKIP_RESULT_TITLES = {
-    "券商查詢",
-    "券商查詢資料",
-    "勝率統計",
-    "ABCD組合勝率",
+# RUN_MODE=1 精選五分點模式只維護「精選五分點當日買賣超圖」會使用的 7 張工作表。
+# 其餘排行、查詢、勝率、價格狀態與說明頁只在 RUN_MODE=2 全分點模式建立 / 同步，
+# 避免精選模式讀取或寫入無關工作表，縮短單純產每日圖卡時的執行時間。
+GSHEET_RUN_MODE1_ALLOWED_RESULT_TITLES = {
+    "A_單檔大買",
+    "B_同標的單日合計",
+    "C_同標的3日累積",
+    f"D_近{D_WINDOW_DAYS}日累積淨買進",
+    "每日賣出明細",
+    TOP15_CONSENSUS_SHEET,
+    TOP15_POSITION_DETAIL_SHEET,
 }
 
 
 def should_skip_result_sheet_in_run_mode(title):
     title = safe_worksheet_title(title)
-    return RUN_MODE == 1 and title in GSHEET_RUN_MODE1_SKIP_RESULT_TITLES
+    return RUN_MODE == 1 and title not in GSHEET_RUN_MODE1_ALLOWED_RESULT_TITLES
 
 
 def get_result_data_scope():
@@ -5443,14 +5463,18 @@ def upload_excel_to_google_sheet(xlsx_path):
                 f"TOP15 最近 {GSHEET_TOP15_KEEP_STAT_DATES} 個統計日期｜"
                 f"自動封存={'開啟' if GSHEET_RESULT_ARCHIVE_ENABLED else '關閉'}"
             )
-            compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
+            compact_spreadsheet_blank_grid(
+                primary_sh,
+                label="主試算表（同步前）",
+                allowed_titles=(GSHEET_RUN_MODE1_ALLOWED_RESULT_TITLES if RUN_MODE == 1 else None),
+            )
 
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
 
             if should_skip_result_sheet_in_run_mode(title):
                 print(
-                    f"  ✅ RUN_MODE=1 精選五分點模式：略過同步結果到 Google Sheet：{title}，"
+                    f"  ✅ RUN_MODE=1 精選五分點模式：略過非每日圖卡必要工作表：{title}，"
                     "保留既有全分點資料。"
                 )
                 continue
@@ -9123,7 +9147,7 @@ def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, lo
     """
     從 A/B/C/D 事件抓近 N 個有效事件交易日。
 
-    這個範圍要和 TOP15 圖的「近一個月交易日」概念一致，
+    這個範圍要和 TOP15 圖的「近兩個月、40 個交易日」概念一致，
     讓報酬率快取可以直接對應圖片中的 TOP15 參與分點。
     """
     if lookback_days is None:
@@ -9369,7 +9393,8 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
     - 同一分點 + 同一權證代號的 lot 依「買進日」FIFO 扣。
     - 只扣「賣出日 > 買進日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
     - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
-    - 這裡不回溯計算 22 日以前舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
+    - 這裡不回溯計算近 N 個交易日以前的舊庫存；目前預設 N=40，
+      因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
     """
     if not position_lots:
         return position_lots
@@ -14432,6 +14457,8 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     default_ws = wb.active
     wb.remove(default_ws)
 
+    # RUN_MODE=1 精選五分點模式只建立每日圖卡實際會讀取的 7 張工作表。
+    # RUN_MODE=2 全分點模式則維持原本完整工作表輸出，不改動既有全分點功能。
     write_a_sheet(wb, a_events, item_map, price_cache)
     write_group_sheet(wb, "B_同標的單日合計", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_同標的3日累積", c_events, price_cache, is_c=True)
@@ -14439,16 +14466,23 @@ def build_excel(a_events, b_events, c_events, d_events, item_map, price_cache, i
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events)
     write_top15_consensus_cache_sheet(wb, top15_consensus_rows or [])
     write_top15_position_detail_sheet(wb, top15_detail_rows or [])
-    write_7d_warrant_consensus_top15_sheet(wb, warrant_consensus_7d_rows)
-    write_10d_broker_underlying_detail_sheet(wb, broker_10d_detail_rows)
-    write_10d_broker_winrate_rank_sheet(wb, broker_10d_winrate_rank_rows)
-    write_stats_sheet(wb, a_events, b_events, c_events, d_events)
-    write_recent_warrant_amount_ranking_sheet(wb, items)
-    write_underlying_broker_count_ranking_sheet(wb, items)
-    write_broker_query_sheet(wb, items)
-    write_price_status_sheet(wb, price_cache)
-    write_color_legend_sheet(wb)
-    write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
+
+    if RUN_MODE == 2:
+        write_7d_warrant_consensus_top15_sheet(wb, warrant_consensus_7d_rows)
+        write_10d_broker_underlying_detail_sheet(wb, broker_10d_detail_rows)
+        write_10d_broker_winrate_rank_sheet(wb, broker_10d_winrate_rank_rows)
+        write_stats_sheet(wb, a_events, b_events, c_events, d_events)
+        write_recent_warrant_amount_ranking_sheet(wb, items)
+        write_underlying_broker_count_ranking_sheet(wb, items)
+        write_broker_query_sheet(wb, items)
+        write_price_status_sheet(wb, price_cache)
+        write_color_legend_sheet(wb)
+        write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events)
+    else:
+        print(
+            "  ✅ RUN_MODE=1 精選五分點模式：Excel 僅建立 "
+            "A、B、C、D、每日賣出明細、快取_TOP15共識淨買超、快取_TOP15部位明細共 7 張工作表。"
+        )
 
     apply_global_amount_comma_format(wb)
 
