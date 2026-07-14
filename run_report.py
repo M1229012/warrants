@@ -15082,7 +15082,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-moneydj-compare-debug-v14"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-safe-day-allchart-compare-v15"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -17972,6 +17972,55 @@ WARRANT_COMPARE_DEBUG_SAVE_CSV = os.getenv(
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
 
+# FinMind 當日權證分點可能在盤後分批更新。正式報表預設只採用「已完整結束的前一日」；
+# 原始當日資料仍保留給對帳診斷，避免把尚未完整的當日列直接畫進資金流、TOP5 與精選分點。
+FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE = os.getenv(
+    "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE = os.getenv(
+    "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_finmind_current_day_safety_guard(events_df: pd.DataFrame, requested_end=None) -> pd.DataFrame:
+    """正式產圖排除尚未完成更新的台北當日權證分點；歷史日期完全不改。"""
+    if events_df is None or events_df.empty or "Date" not in events_df.columns:
+        return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
+    out = events_df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    out = out.dropna(subset=["Date"])
+    if not FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE or out.empty:
+        return out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    taipei_today = get_taipei_today_ts()
+    latest = out["Date"].max()
+    if pd.isna(latest) or pd.Timestamp(latest).normalize() != taipei_today:
+        return out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    current_mask = out["Date"] == taipei_today
+    current_rows = out.loc[current_mask].copy()
+    kept = out.loc[~current_mask].copy()
+    if current_rows.empty or kept.empty:
+        return out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    for col in ["buy_amount", "sell_amount", "net_amount"]:
+        if col not in current_rows.columns:
+            current_rows[col] = 0.0
+        current_rows[col] = pd.to_numeric(current_rows[col], errors="coerce").fillna(0.0)
+    print(
+        "🛡️ FinMind 當日完整性保護：正式圖表暫不採用尚在更新中的當日權證分點｜"
+        f"日期={taipei_today.date()}｜排除={len(current_rows):,}筆｜"
+        f"買進={fmt_money(float(current_rows['buy_amount'].sum()))}｜"
+        f"賣出={fmt_money(-float(current_rows['sell_amount'].sum()))}｜"
+        f"淨額={fmt_money(float(current_rows['net_amount'].sum()))}｜"
+        f"正式最新日={kept['Date'].max().date()}"
+    )
+    kept.attrs["finmind_guard_excluded_date"] = taipei_today.strftime("%Y-%m-%d")
+    kept.attrs["finmind_guard_excluded_rows"] = int(len(current_rows))
+    return kept.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
 
 def _compare_debug_banner(title: str):
     print("\n" + "=" * 140)
@@ -18121,6 +18170,8 @@ def _run_stock_volume_compare_debug(
     )
     fin_valid = merged.dropna(subset=["FinMind_Volume"]).sort_values("Date")
     yahoo_valid = merged.dropna(subset=["Yahoo_Volume"]).sort_values("Date")
+    fin_positive = fin_valid[pd.to_numeric(fin_valid["FinMind_Volume"], errors="coerce").fillna(0) > 0]
+    yahoo_positive = yahoo_valid[pd.to_numeric(yahoo_valid["Yahoo_Volume"], errors="coerce").fillna(0) > 0]
     if not fin_valid.empty:
         print(
             f"📊 FinMind 最新日={pd.Timestamp(fin_valid.iloc[-1]['Date']).date()}｜"
@@ -18140,6 +18191,15 @@ def _run_stock_volume_compare_debug(
             print(
                 f"📊 各來源自身最近{n}筆均量：FinMind={fin_avg:,.2f}張｜Yahoo={yahoo_avg:,.2f}張｜"
                 f"差={fin_avg-yahoo_avg:+,.2f}張"
+            )
+        fin_pos_tail = fin_positive.tail(n)
+        yahoo_pos_tail = yahoo_positive.tail(n)
+        if not fin_pos_tail.empty or not yahoo_pos_tail.empty:
+            fin_pos_avg = fin_pos_tail["FinMind_Volume"].mean() / 1000.0 if not fin_pos_tail.empty else np.nan
+            yahoo_pos_avg = yahoo_pos_tail["Yahoo_Volume"].mean() / 1000.0 if not yahoo_pos_tail.empty else np.nan
+            print(
+                f"📊 排除零成交列後最近{n}個有效交易日：FinMind={fin_pos_avg:,.2f}張｜"
+                f"Yahoo={yahoo_pos_avg:,.2f}張｜差={fin_pos_avg-yahoo_pos_avg:+,.2f}張"
             )
     if not common.empty:
         print(
@@ -18233,6 +18293,7 @@ def _moneydj_compare_discover_selected_pairs(
     selected_branch_code_map: Dict[str, set],
     start_date,
     end_date,
+    pre_discovered_all_pairs: List[dict] | None = None,
 ) -> List[dict]:
     """API4 先確認分點代碼，再用正式 FinMind ID 對所有權證補 direct API5 pair。"""
     if not warrants or not selected_branch_code_map:
@@ -18246,16 +18307,42 @@ def _moneydj_compare_discover_selected_pairs(
     status_counts = {"success": 0, "empty": 0, "failed": 0}
     errors = []
 
+    # 若全分點對帳已完成 API4，直接重用，不重複掃相同權證。
+    pre_pairs = list(pre_discovered_all_pairs or [])
+    pre_warrant_codes = set()
+    for pair in pre_pairs:
+        code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
+        broker_code = str(pair.get("broker_code", "") or "").strip()
+        branch_raw = normalize_branch_name(pair.get("branch", ""))
+        if code:
+            pre_warrant_codes.add(code)
+        matched_name = ""
+        for name, ids in selected_branch_code_map.items():
+            if broker_code in ids or branch_raw == name or _finmind_branch_lookup_key(branch_raw) == _finmind_branch_lookup_key(name):
+                matched_name = name
+                break
+        if not code or not broker_code or not matched_name:
+            continue
+        discovered_codes_by_branch.setdefault(matched_name, set()).add(broker_code)
+        rec = dict(pair)
+        rec["branch"] = matched_name
+        rec["pair_source"] = "MoneyDJ_API4_ReusedAllBranch"
+        discovered_pairs[(code, broker_code)] = rec
+
     def scan(w):
         rows, status, error, retry_count = _api4_fetch_raw(w.get("代號", ""), start_s, end_s)
         return w, rows, status, error, retry_count
 
+    remaining_warrants = [
+        w for w in warrants
+        if normalize_openapi_warrant_code(w.get("代號", "")) not in pre_warrant_codes
+    ]
     print(
-        f"🔍 MoneyDJ API4 對帳掃描：權證={len(warrants):,}｜"
-        f"區間={start_s}~{end_s}｜workers={WARRANT_COMPARE_DEBUG_API4_WORKERS}"
+        f"🔍 MoneyDJ API4 對帳掃描：權證={len(warrants):,}｜已重用={len(pre_warrant_codes):,}｜"
+        f"仍需掃描={len(remaining_warrants):,}｜區間={start_s}~{end_s}｜workers={WARRANT_COMPARE_DEBUG_API4_WORKERS}"
     )
     with ThreadPoolExecutor(max_workers=WARRANT_COMPARE_DEBUG_API4_WORKERS) as executor:
-        futures = {executor.submit(scan, w): w for w in warrants}
+        futures = {executor.submit(scan, w): w for w in remaining_warrants}
         for idx, future in enumerate(as_completed(futures), 1):
             w = futures[future]
             try:
@@ -18287,9 +18374,9 @@ def _moneydj_compare_discover_selected_pairs(
                         "branch": matched_name,
                         "pair_source": "MoneyDJ_API4",
                     }
-            if idx == 1 or idx % 50 == 0 or idx == len(warrants):
+            if idx == 1 or idx % 50 == 0 or idx == len(remaining_warrants):
                 print(
-                    f"📊 MoneyDJ API4 對帳進度：{idx}/{len(warrants)}｜"
+                    f"📊 MoneyDJ API4 對帳進度：{idx}/{len(remaining_warrants)}｜"
                     f"精選pair={len(discovered_pairs):,}｜狀態={status_counts}"
                 )
 
@@ -18334,6 +18421,7 @@ def _moneydj_compare_fetch_api5_pairs(
     pair_list: List[dict],
     start_date,
     end_date,
+    scope_label: str = "精選五分點",
 ) -> pd.DataFrame:
     if not pair_list:
         return pd.DataFrame()
@@ -18371,6 +18459,8 @@ def _moneydj_compare_fetch_api5_pairs(
                 "broker_code": broker_code,
                 "warrant_code": code,
                 "warrant_name": str(pair.get("warrant_name", "") or code),
+                "underlying_code": _normalize_stock_name_code_key(pair.get("underlying_code", "") or ""),
+                "underlying_name": str(pair.get("underlying_name", "") or ""),
                 "moneydj_v2_buy_raw": v2,
                 "moneydj_v3_sell_raw": v3,
                 "moneydj_v4_buy_thousand": v4,
@@ -18384,7 +18474,7 @@ def _moneydj_compare_fetch_api5_pairs(
 
     reset_api_fetch_stats("api5")
     print(
-        f"💰 MoneyDJ API5 精選五分點對帳：pairs={len(pair_list):,}｜days={days}｜"
+        f"💰 MoneyDJ API5 {scope_label}對帳：pairs={len(pair_list):,}｜days={days}｜"
         f"workers={WARRANT_COMPARE_DEBUG_API5_WORKERS}"
     )
     with ThreadPoolExecutor(max_workers=WARRANT_COMPARE_DEBUG_API5_WORKERS) as executor:
@@ -18412,7 +18502,7 @@ def _moneydj_compare_fetch_api5_pairs(
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
     out = out.dropna(subset=["Date"])
-    group_cols = ["Date", "branch", "broker_code", "warrant_code", "warrant_name"]
+    group_cols = ["Date", "branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]
     out = out.groupby(group_cols, as_index=False, dropna=False).agg({
         "moneydj_v2_buy_raw": "sum",
         "moneydj_v3_sell_raw": "sum",
@@ -18460,12 +18550,261 @@ def _prepare_finmind_selected_compare_df(selected: pd.DataFrame) -> pd.DataFrame
     return e.sort_values(["Date", "branch", "warrant_code"]).reset_index(drop=True)
 
 
+
+def _moneydj_compare_discover_all_pairs(
+    warrants: List[dict],
+    start_date,
+    end_date,
+) -> List[dict]:
+    """重現舊 MoneyDJ 上方圖的 API4 全分點 pair 母體，不額外臆造歷史 pair。"""
+    if not warrants:
+        return []
+    start_s = pd.Timestamp(start_date).strftime("%Y/%m/%d")
+    end_s = pd.Timestamp(end_date).strftime("%Y/%m/%d")
+    pairs = {}
+    status_counts = {"success": 0, "empty": 0, "failed": 0}
+    errors = []
+
+    def scan(w):
+        rows, status, error, retry_count = _api4_fetch_raw(w.get("代號", ""), start_s, end_s)
+        return w, rows, status, error, retry_count
+
+    print(
+        f"🔍 MoneyDJ API4 全分點對帳掃描：權證={len(warrants):,}｜"
+        f"區間={start_s}~{end_s}｜workers={WARRANT_COMPARE_DEBUG_API4_WORKERS}"
+    )
+    with ThreadPoolExecutor(max_workers=WARRANT_COMPARE_DEBUG_API4_WORKERS) as executor:
+        futures = {executor.submit(scan, w): w for w in warrants}
+        for idx, future in enumerate(as_completed(futures), 1):
+            w = futures[future]
+            try:
+                w, rows, status, error, retry_count = future.result()
+            except Exception as exc:
+                rows, status, error, retry_count = [], "failed", str(exc), 0
+            status_counts[status if status in status_counts else "failed"] += 1
+            if error and len(errors) < 20:
+                errors.append(f"{w.get('代號', '')}: {error}")
+            code = normalize_openapi_warrant_code(w.get("代號", ""))
+            for row in rows or []:
+                broker_code = str(row.get("V2", "") or "").strip()
+                branch = normalize_branch_name(row.get("V3", ""))
+                if not code or not broker_code:
+                    continue
+                pairs[(code, broker_code)] = {
+                    "warrant_code": code,
+                    "warrant_name": str(w.get("名稱", "") or code),
+                    "underlying_code": _normalize_stock_name_code_key(w.get("標的股", "") or ""),
+                    "underlying_name": str(w.get("標的名稱", "") or ""),
+                    "broker_code": broker_code,
+                    "branch": branch,
+                    "pair_source": "MoneyDJ_API4_LegacyAllBranch",
+                }
+            if idx == 1 or idx % 50 == 0 or idx == len(warrants):
+                print(
+                    f"📊 MoneyDJ API4 全分點進度：{idx}/{len(warrants)}｜"
+                    f"pairs={len(pairs):,}｜狀態={status_counts}"
+                )
+    if errors:
+        print("⚠️ MoneyDJ API4 全分點錯誤樣本：")
+        for error in errors:
+            print("  " + error)
+    result = list(pairs.values())
+    print(f"✅ MoneyDJ 舊上方圖 API4 全分點 pair：{len(result):,} 組")
+    return result
+
+
+def _prepare_compare_event_df(events: pd.DataFrame) -> pd.DataFrame:
+    if events is None or events.empty:
+        return pd.DataFrame()
+    e = events.copy()
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    e = e.dropna(subset=["Date"])
+    for col in ["branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]:
+        if col not in e.columns:
+            e[col] = ""
+    e["branch"] = e["branch"].map(normalize_branch_name)
+    e["broker_code"] = e["broker_code"].astype(str).str.strip()
+    e["warrant_code"] = e["warrant_code"].map(normalize_openapi_warrant_code)
+    for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+        if col not in e.columns:
+            e[col] = 0.0
+        e[col] = pd.to_numeric(e[col], errors="coerce").fillna(0.0)
+    return e
+
+
+def _compare_event_key_coverage(stock_code: str, fin_events: pd.DataFrame, mdj_events: pd.DataFrame, suffix: str):
+    def agg(df: pd.DataFrame, prefix: str):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Date", "branch", "warrant_code"])
+        x = _prepare_compare_event_df(df)
+        out = x.groupby(["Date", "branch", "warrant_code"], as_index=False).agg(
+            buy_amount=("buy_amount", "sum"),
+            sell_amount=("sell_amount", "sum"),
+            net_amount=("net_amount", "sum"),
+            broker_code=("broker_code", lambda s: ",".join(sorted(set(str(v) for v in s if str(v))))),
+        )
+        return out.rename(columns={c: f"{prefix}_{c}" for c in out.columns if c not in ["Date", "branch", "warrant_code"]})
+
+    detail = agg(fin_events, "finmind").merge(
+        agg(mdj_events, "moneydj"),
+        on=["Date", "branch", "warrant_code"],
+        how="outer",
+        indicator=True,
+    )
+    for side in ["buy_amount", "sell_amount", "net_amount"]:
+        for source in ["finmind", "moneydj"]:
+            col = f"{source}_{side}"
+            if col not in detail.columns:
+                detail[col] = 0.0
+            detail[col] = pd.to_numeric(detail[col], errors="coerce").fillna(0.0)
+        detail[f"diff_{side}"] = detail[f"finmind_{side}"] - detail[f"moneydj_{side}"]
+    detail["abs_diff_net_amount"] = detail["diff_net_amount"].abs()
+    detail = detail.sort_values("abs_diff_net_amount", ascending=False)
+    both = detail[detail["_merge"] == "both"]
+    print(
+        f"📊 {suffix} Date×分點×權證覆蓋：共同={len(both):,}｜"
+        f"只在FinMind={(detail['_merge'] == 'left_only').sum():,}｜"
+        f"只在MoneyDJ={(detail['_merge'] == 'right_only').sum():,}｜總鍵={len(detail):,}"
+    )
+    if not both.empty:
+        print(
+            f"📊 {suffix} 共同鍵淨額差：中位={both['abs_diff_net_amount'].median():,.0f}｜"
+            f"P95={both['abs_diff_net_amount'].quantile(0.95):,.0f}｜"
+            f"最大={both['abs_diff_net_amount'].max():,.0f}"
+        )
+    _compare_debug_save_csv(stock_code, suffix, detail)
+    return detail
+
+
+def _daily_cumulative_from_events(events: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    if events is None or events.empty:
+        return pd.DataFrame(columns=["Date"])
+    e = _prepare_compare_event_df(events)
+    out = e.groupby("Date", as_index=False).agg(
+        buy_amount=("buy_amount", "sum"),
+        sell_amount=("sell_amount", "sum"),
+        net_amount=("net_amount", "sum"),
+        rows=("net_amount", "size"),
+        branches=("branch", "nunique"),
+        warrants=("warrant_code", "nunique"),
+    ).sort_values("Date")
+    out["cumulative"] = out["net_amount"].cumsum()
+    return out.rename(columns={c: f"{prefix}_{c}" for c in out.columns if c != "Date"})
+
+
+def _run_all_branch_moneydj_compare_debug(
+    stock_code: str,
+    stock_name: str,
+    stock_df: pd.DataFrame,
+    raw_finmind_events: pd.DataFrame,
+    formal_finmind_events: pd.DataFrame,
+    start_date,
+    end_date,
+):
+    if not WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE:
+        return {}
+    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 全分點對帳開始")
+    raw_fin = _prepare_compare_event_df(raw_finmind_events)
+    formal_fin = _prepare_compare_event_df(formal_finmind_events)
+    # 上方舊圖要重現原本 MoneyDJ 母體，不補 FinMind 歷史權證，才能直接解釋舊圖差異。
+    warrants = get_all_active_call_warrants(
+        stock_code,
+        stock_name,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    print(f"🧾 MoneyDJ 舊上方圖原始權證母體：{len(warrants or []):,} 支")
+    legacy_pairs = _moneydj_compare_discover_all_pairs(warrants, start_date, end_date)
+    mdj_legacy = _moneydj_compare_fetch_api5_pairs(
+        legacy_pairs, start_date, end_date, scope_label="全分點Legacy"
+    )
+    _compare_debug_save_csv(stock_code, "moneydj_all_branch_legacy_raw", mdj_legacy)
+
+    _compare_debug_banner("全分點原始事件共同鍵驗證")
+    detail = _compare_event_key_coverage(
+        stock_code, raw_fin, mdj_legacy, "all_branch_detail_outer_join"
+    )
+
+    # 用完全相同的新版發行商排除規則處理兩邊，再比較上方資金流實際畫圖口徑。
+    fin_flow = filter_warrant_flow_excluding_issuer_market_makers(formal_fin)
+    mdj_flow = filter_warrant_flow_excluding_issuer_market_makers(mdj_legacy)
+    daily = _daily_cumulative_from_events(fin_flow, "finmind").merge(
+        _daily_cumulative_from_events(mdj_flow, "moneydj"),
+        on="Date",
+        how="outer",
+    ).fillna(0).sort_values("Date")
+    for col in ["net_amount", "cumulative", "buy_amount", "sell_amount"]:
+        fcol, mcol = f"finmind_{col}", f"moneydj_{col}"
+        if fcol not in daily.columns:
+            daily[fcol] = 0.0
+        if mcol not in daily.columns:
+            daily[mcol] = 0.0
+        daily[f"diff_{col}"] = pd.to_numeric(daily[fcol], errors="coerce").fillna(0) - pd.to_numeric(daily[mcol], errors="coerce").fillna(0)
+    daily_print = daily.copy()
+    daily_print["Date"] = pd.to_datetime(daily_print["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    _compare_debug_print_df(
+        "上方權證資金流每日／累計對帳（雙方套用同一發行商排除規則）",
+        daily_print,
+        max_rows=max(WARRANT_COMPARE_DEBUG_MAX_ROWS, len(daily_print)),
+    )
+    _compare_debug_save_csv(stock_code, "upper_flow_daily_cumulative", daily)
+
+    fin_ctx = build_weekly_context(stock_df, formal_fin, WEEK_TRADING_DAYS) if not formal_fin.empty else None
+    mdj_ctx = build_weekly_context(stock_df, mdj_legacy, WEEK_TRADING_DAYS) if mdj_legacy is not None and not mdj_legacy.empty else None
+    summary_rows = []
+    top_rows = []
+    for source, ctx in [("FinMind正式圖", fin_ctx), ("MoneyDJ舊API4母體", mdj_ctx)]:
+        if not ctx:
+            continue
+        week_events = ctx.get("week_events", pd.DataFrame())
+        summary_rows.append({
+            "source": source,
+            "week_start": ctx.get("week_start"),
+            "week_end": ctx.get("week_end"),
+            "rows": len(week_events) if isinstance(week_events, pd.DataFrame) else 0,
+            "buy_amount": float(ctx.get("total_buy", 0) or 0),
+            "sell_amount": float(ctx.get("total_sell", 0) or 0),
+            "net_amount": float(ctx.get("total_net", 0) or 0),
+        })
+        if isinstance(week_events, pd.DataFrame) and not week_events.empty:
+            buy_top, sell_top = _get_cached_top_branch_tables(ctx, "compare_current_week", week_events, topn=5)
+            for side, table in [("買超TOP5", buy_top), ("賣超TOP5", sell_top)]:
+                if table is None or table.empty:
+                    continue
+                temp = table.copy()
+                temp.insert(0, "side", side)
+                temp.insert(0, "source", source)
+                top_rows.append(temp)
+    summary_df = pd.DataFrame(summary_rows)
+    _compare_debug_print_df("本週權證資金流總額對帳", summary_df, max_rows=20)
+    _compare_debug_save_csv(stock_code, "upper_flow_week_summary", summary_df)
+    top_df = pd.concat(top_rows, ignore_index=True, sort=False) if top_rows else pd.DataFrame()
+    _compare_debug_print_df("本週權分點 TOP5 對帳", top_df, max_rows=30)
+    _compare_debug_save_csv(stock_code, "upper_flow_top5_compare", top_df)
+
+    print(
+        "📌 判讀方式：MoneyDJ舊API4母體重現舊圖覆蓋；FinMind正式圖使用全市場資料。"
+        "共同鍵金額若為0差異、但累計／TOP5仍不同，差異即來自API4歷史pair覆蓋，不是金額公式。"
+    )
+    _compare_debug_banner(f"{stock_code} {stock_name} 上方權證資金流／TOP5 全分點對帳結束")
+    return {
+        "warrants": warrants,
+        "legacy_pairs": legacy_pairs,
+        "moneydj_legacy": mdj_legacy,
+        "detail": detail,
+        "daily": daily,
+        "summary": summary_df,
+        "top5": top_df,
+    }
+
+
 def _run_selected_branch_moneydj_compare_debug(
     stock_code: str,
     stock_name: str,
     warrant_events: pd.DataFrame,
     start_date,
     end_date,
+    pre_discovered_all_pairs: List[dict] | None = None,
 ):
     _compare_debug_banner(f"{stock_code} {stock_name} 精選五分點 FinMind vs MoneyDJ 完整對帳開始")
     selected_names = _get_selected_branch_flow_list()
@@ -18491,8 +18830,9 @@ def _run_selected_branch_moneydj_compare_debug(
         selected_code_map,
         start_date,
         end_date,
+        pre_discovered_all_pairs=pre_discovered_all_pairs,
     )
-    mdj = _moneydj_compare_fetch_api5_pairs(pairs, start_date, end_date)
+    mdj = _moneydj_compare_fetch_api5_pairs(pairs, start_date, end_date, scope_label="精選五分點")
 
     _compare_debug_save_csv(stock_code, "finmind_selected_raw", fin)
     _compare_debug_save_csv(stock_code, "moneydj_selected_raw", mdj)
@@ -18696,35 +19036,87 @@ def _run_selected_branch_moneydj_compare_debug(
     print("4. 只存在 FinMind／只存在 MoneyDJ 的事件")
     print("5. 精選五分點每日總額與累計線對帳")
     print("6. 成交量 FinMind vs Yahoo 逐日對帳")
+    return {
+        "finmind": fin,
+        "moneydj": mdj,
+        "detail": detail,
+        "daily_branch": daily,
+        "daily_total": total_daily,
+        "warrants": warrants,
+        "pairs": pairs,
+    }
 
 
 def run_finmind_moneydj_compare_diagnostics(
     stock_code: str,
     stock_name: str,
     stock_df: pd.DataFrame,
-    warrant_events: pd.DataFrame,
+    raw_warrant_events: pd.DataFrame,
+    formal_warrant_events: pd.DataFrame,
     start_date,
     end_date,
 ):
-    """完整診斷入口。任何失敗都只印警告，不會修改正式產圖 DataFrame。"""
+    """完整診斷入口：同時比對原始當日、正式安全日期、上方資金流、TOP5 與精選五分點。"""
     if not WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE:
         return
     _compare_debug_banner(f"{stock_code} {stock_name} 全部對帳診斷啟動")
-    print("⚠️ 本模式只做額外查詢與列印，不會修改 FinMind 正式報表的任何計算結果。")
+    print("⚠️ 診斷只做額外查詢與列印；正式報表只受當日完整性保護影響，歷史資料與原公式不變。")
     try:
         _run_stock_volume_compare_debug(stock_code, stock_df, start_date, end_date)
     except Exception as exc:
         import traceback
         print(f"❌ 成交量對帳診斷失敗：{exc}")
         traceback.print_exc()
+
+    all_branch_result = {}
     try:
-        _run_selected_branch_moneydj_compare_debug(
+        all_branch_result = _run_all_branch_moneydj_compare_debug(
             stock_code,
             stock_name,
-            warrant_events.copy() if warrant_events is not None else pd.DataFrame(),
+            stock_df,
+            raw_warrant_events.copy() if raw_warrant_events is not None else pd.DataFrame(),
+            formal_warrant_events.copy() if formal_warrant_events is not None else pd.DataFrame(),
             start_date,
             end_date,
-        )
+        ) or {}
+    except Exception as exc:
+        import traceback
+        print(f"❌ 上方權證資金流／TOP5 全分點對帳失敗：{exc}")
+        traceback.print_exc()
+
+    try:
+        selected_result = _run_selected_branch_moneydj_compare_debug(
+            stock_code,
+            stock_name,
+            raw_warrant_events.copy() if raw_warrant_events is not None else pd.DataFrame(),
+            start_date,
+            end_date,
+            pre_discovered_all_pairs=all_branch_result.get("legacy_pairs", []),
+        ) or {}
+        total_daily = selected_result.get("daily_total", pd.DataFrame())
+        formal_dates = pd.to_datetime(
+            formal_warrant_events.get("Date", pd.Series(dtype="datetime64[ns]")),
+            errors="coerce",
+        ).dropna() if isinstance(formal_warrant_events, pd.DataFrame) else pd.Series(dtype="datetime64[ns]")
+        if not total_daily.empty and not formal_dates.empty:
+            cutoff = pd.Timestamp(formal_dates.max()).normalize()
+            safe = total_daily[pd.to_datetime(total_daily["Date"], errors="coerce").dt.normalize() <= cutoff].copy()
+            _compare_debug_banner("精選五分點正式安全截止日判定")
+            print(f"📌 正式圖最新權證日={cutoff.date()}｜當日完整性保護={'開啟' if FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE else '關閉'}")
+            if not safe.empty:
+                fin_total = float(safe["finmind_net_amount"].sum())
+                mdj_total = float(safe["moneydj_net_amount"].sum())
+                print(
+                    f"📊 截至正式安全日累計：FinMind={fmt_money(fin_total)}｜MoneyDJ完整五分點={fmt_money(mdj_total)}｜"
+                    f"差={fmt_money(fin_total-mdj_total)}"
+                )
+            later = total_daily[pd.to_datetime(total_daily["Date"], errors="coerce").dt.normalize() > cutoff]
+            if not later.empty:
+                print(
+                    f"📊 被正式圖排除的更新中日期：FinMind={fmt_money(float(later['finmind_net_amount'].sum()))}｜"
+                    f"MoneyDJ={fmt_money(float(later['moneydj_net_amount'].sum()))}｜"
+                    f"差={fmt_money(float(later['finmind_net_amount'].sum()-later['moneydj_net_amount'].sum()))}"
+                )
     except Exception as exc:
         import traceback
         print(f"❌ 精選五分點 MoneyDJ 對帳診斷失敗：{exc}")
@@ -18821,6 +19213,8 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
 
         with report_stage_timer(f"{stock_code}｜權證完整流程"):
             warrant_events = warrant_future.result()
+        raw_warrant_events = warrant_events.copy() if isinstance(warrant_events, pd.DataFrame) else pd.DataFrame()
+        warrant_events = _apply_finmind_current_day_safety_guard(warrant_events, requested_end=end_date)
         try:
             news_pipeline_result = news_future.result()
         except Exception as e:
@@ -18863,6 +19257,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                     stock_code,
                     stock_name,
                     stock_df,
+                    raw_warrant_events,
                     warrant_events,
                     start_date,
                     end_date,
@@ -18986,7 +19381,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+strict-finmind-news+title-rule-summary+branch-perf-disk+moneydj-compare-debug+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+safe-current-day+market-compact-prewarm+strict-finmind-news+allchart-moneydj-compare+branch-perf-disk+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
