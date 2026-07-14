@@ -49,6 +49,7 @@ jobs:
 
       # matplotlib 在 GitHub runner 無視窗環境產圖
       MPLBACKEND: Agg
+      WARRANT_REPORT_FONT_DIR: .cache/report-fonts
 
       # ========================================================
       # 唯一市場／新聞資料來源：FinMind
@@ -98,8 +99,6 @@ jobs:
       WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE: "0"
 
       # 權證分點每次都由 FinMind sponsorpro live 重抓。
-      # 純 Live 模式不讀取權證快照，也不把本次事件寫回「權證週報完整快取」；
-      # Google Sheet 仍保留 Gemini 快取、股票名稱與既有勝率統計用途。
       # 關閉「新聞刷新值同時控制權證快取」的舊邏輯，避免 refresh_news_summary=0 時誤讀舊 MoneyDJ 快照。
       WARRANT_ACTION_REFRESH_CONTROLS_REPORT_DATA: "0"
       WARRANT_REPORT_LIVE_ONLY: "1"
@@ -161,11 +160,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Build cache date
+        id: cache-date
+        shell: bash
+        run: |
+          echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
       - name: Restore LLM cache
         uses: actions/cache@v4
         with:
           path: llm_cache
-          key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ github.run_id }}
+          key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}
           restore-keys: |
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
@@ -173,27 +178,31 @@ jobs:
       - name: Restore FinMind parquet cache
         uses: actions/cache@v4
         with:
-          path: finmind_cache
-          key: warrant-finmind-parquet-${{ runner.os }}-${{ github.run_id }}
+          path: finmind_cache/warrant_daily
+          key: warrant-finmind-parquet-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
           restore-keys: |
             warrant-finmind-parquet-${{ runner.os }}-
 
+      - name: Restore report fonts cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/report-fonts
+          key: report-fonts-noto-cjk-tc-v2
+
       - name: Prepare folders
         run: |
-          mkdir -p output llm_cache finmind_cache/warrant_daily
+          mkdir -p output llm_cache finmind_cache/warrant_daily .cache/report-fonts
 
       - name: Refresh latest FinMind day files
         shell: bash
         run: |
           set -euo pipefail
-          # 為避免把尚未完整更新的最新日檔永久留在跨 run 快取，最近 2 個日曆日固定重抓。
-          cutoff=$(date -d '2 days ago' +%Y-%m-%d)
+          cutoff=$(TZ=Asia/Taipei date -d '2 days ago' +%Y-%m-%d)
           for f in finmind_cache/warrant_daily/*.parquet; do
             [ -e "$f" ] || continue
             d=$(basename "$f" .parquet)
             if [[ "$d" > "$cutoff" ]] || [[ "$d" == "$cutoff" ]]; then
               rm -f "$f"
-              echo "♻️ 移除最新日檔，正式執行時重新下載：$f"
             fi
           done
 
@@ -208,25 +217,46 @@ jobs:
           enable-cache: true
           cache-suffix: warrant-report-deps
 
-      - name: Install runtime dependencies
+      - name: Install runtime dependencies and prepare fonts
         shell: bash
         run: |
           set -euo pipefail
+
+          FONT_DIR=".cache/report-fonts"
+          REGULAR_FONT="${FONT_DIR}/NotoSansCJKtc-Regular.otf"
+          BOLD_FONT="${FONT_DIR}/NotoSansCJKtc-Bold.otf"
+          mkdir -p "${FONT_DIR}"
+
+          download_font() {
+            local target="$1"
+            local url="$2"
+            if [ -s "$target" ]; then
+              echo "✅ 字型已存在：$(basename "$target")"
+              return 0
+            fi
+            echo "⬇️ 下載字型：$(basename "$target")"
+            curl \
+              --fail \
+              --location \
+              --retry 4 \
+              --retry-delay 2 \
+              --connect-timeout 10 \
+              --max-time 120 \
+              --output "$target" \
+              "$url"
+            test -s "$target"
+          }
+
+          download_font "$REGULAR_FONT" "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf" &
+          FONT_PID_1=$!
+          download_font "$BOLD_FONT" "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Bold.otf" &
+          FONT_PID_2=$!
+
           uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4
 
-      - name: Verify repository fonts
-        shell: bash
-        run: |
-          set -euo pipefail
-          regular="assets/fonts/NotoSansTC-Regular.otf"
-          bold="assets/fonts/NotoSansTC-Bold.otf"
-          if [[ -f "$regular" && -f "$bold" ]]; then
-            echo "✅ 使用 Repository 內 Noto Sans TC 字型，不執行 apt-get"
-          else
-            echo "⚠️ Repository 尚未同時提供 $regular 與 $bold，為避免中文變方框，本次退回安裝 fonts-noto-cjk"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends fonts-noto-cjk
-          fi
+          wait "$FONT_PID_1"
+          wait "$FONT_PID_2"
+          echo "✅ 報表中文字型準備完成"
 
       - name: Validate Python syntax
         run: |
