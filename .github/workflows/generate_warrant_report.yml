@@ -67,8 +67,19 @@ jobs:
       FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
       FINMIND_CACHE_DIR: finmind_cache
 
-      # FinMind 全市場分點買賣雙邊會完全平衡；週報資金流改看非總公司分點。
+      # 上方權證資金流與 TOP5：逐檔排除該權證官方辨識的發行造市端。
+      # TOP5 再沿用原本「排除明確總公司／自營型分點」規則；精選分點使用完整原始資料。
       WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
+      FINMIND_ISSUER_FLOW_ENABLE: "1"
+      FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
+      FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "1"
+      FINMIND_ISSUER_FLOW_DEBUG_ENABLE: "0"
+      WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
+
+      # 正常命中只印摘要；欄位不足、發行商或分點無法辨識時仍輸出完整欄位供除錯。
+      FINMIND_DEBUG_SCHEMA_ENABLE: "1"
+      FINMIND_DEBUG_SELECTED_BRANCH_ENABLE: "1"
+      FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE: "0"
 
       # ========================================================
       # Google Sheet 只作結果快照、Gemini 快取與既有勝率統計。
@@ -161,21 +172,29 @@ jobs:
         run: |
           mkdir -p output llm_cache finmind_cache/warrant_daily
 
-      - name: Install system fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install Python dependencies
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: false
+
+      - name: Install runtime dependencies and fonts
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          set -euo pipefail
+
+          # Python 套件與系統字型平行安裝，避免先後等待。
+          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4 &
+          UV_PID=$!
+
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+          wait "$UV_PID"
 
       - name: Validate Python syntax
         run: |
@@ -220,6 +239,9 @@ jobs:
               "WARRANT_REPORT_LIVE_ONLY",
               "FINMIND_WARRANT_DOWNLOAD_WORKERS",
               "FINMIND_NEWS_LOOKBACK_DAYS",
+              "FINMIND_OFFICIAL_ISSUER_ENABLE",
+              "WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
+              "FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE",
               "WARRANT_NEWS_SUMMARY_STYLE_VERSION",
               "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE",
               "WARRANT_CACHE_FORCE_REFRESH",
