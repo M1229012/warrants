@@ -60,8 +60,8 @@ jobs:
       FINMIND_RETRY_BASE_WAIT: "1.5"
       FINMIND_CONNECT_TIMEOUT: "10"
       FINMIND_READ_TIMEOUT: "240"
-      FINMIND_WARRANT_DOWNLOAD_WORKERS: "4"
-      FINMIND_NEWS_WORKERS: "4"
+      FINMIND_WARRANT_DOWNLOAD_WORKERS: "8"
+      FINMIND_NEWS_WORKERS: "8"
       FINMIND_NEWS_LOOKBACK_DAYS: "30"
       FINMIND_WARRANT_LATEST_PROBE_DAYS: "7"
       FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
@@ -98,12 +98,14 @@ jobs:
       WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE: "0"
 
       # 權證分點每次都由 FinMind sponsorpro live 重抓。
+      # 純 Live 模式不讀取權證快照，也不把本次事件寫回「權證週報完整快取」；
+      # Google Sheet 仍保留 Gemini 快取、股票名稱與既有勝率統計用途。
       # 關閉「新聞刷新值同時控制權證快取」的舊邏輯，避免 refresh_news_summary=0 時誤讀舊 MoneyDJ 快照。
       WARRANT_ACTION_REFRESH_CONTROLS_REPORT_DATA: "0"
       WARRANT_REPORT_LIVE_ONLY: "1"
       WARRANT_LIVE_FETCH_ENABLE: "1"
-      WARRANT_ALWAYS_REFRESH_WARRANT_FLOW: "1"
-      WARRANT_CACHE_FORCE_REFRESH: "1"
+      WARRANT_ALWAYS_REFRESH_WARRANT_FLOW: "0"
+      WARRANT_CACHE_FORCE_REFRESH: "0"
       WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # ========================================================
@@ -168,9 +170,32 @@ jobs:
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
 
+      - name: Restore FinMind parquet cache
+        uses: actions/cache@v4
+        with:
+          path: finmind_cache
+          key: warrant-finmind-parquet-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-finmind-parquet-${{ runner.os }}-
+
       - name: Prepare folders
         run: |
           mkdir -p output llm_cache finmind_cache/warrant_daily
+
+      - name: Refresh latest FinMind day files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 為避免把尚未完整更新的最新日檔永久留在跨 run 快取，最近 2 個日曆日固定重抓。
+          cutoff=$(date -d '2 days ago' +%Y-%m-%d)
+          for f in finmind_cache/warrant_daily/*.parquet; do
+            [ -e "$f" ] || continue
+            d=$(basename "$f" .parquet)
+            if [[ "$d" > "$cutoff" ]] || [[ "$d" == "$cutoff" ]]; then
+              rm -f "$f"
+              echo "♻️ 移除最新日檔，正式執行時重新下載：$f"
+            fi
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -180,81 +205,32 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v8.3.2
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-suffix: warrant-report-deps
 
-      - name: Install runtime dependencies and fonts
+      - name: Install runtime dependencies
         shell: bash
         run: |
           set -euo pipefail
+          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4
 
-          # Python 套件與系統字型平行安裝，避免先後等待。
-          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4 &
-          UV_PID=$!
-
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
-
-          wait "$UV_PID"
+      - name: Verify repository fonts
+        shell: bash
+        run: |
+          set -euo pipefail
+          regular="assets/fonts/NotoSansTC-Regular.otf"
+          bold="assets/fonts/NotoSansTC-Bold.otf"
+          if [[ -f "$regular" && -f "$bold" ]]; then
+            echo "✅ 使用 Repository 內 Noto Sans TC 字型，不執行 apt-get"
+          else
+            echo "⚠️ Repository 尚未同時提供 $regular 與 $bold，為避免中文變方框，本次退回安裝 fonts-noto-cjk"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+          fi
 
       - name: Validate Python syntax
         run: |
           python -m py_compile run_report.py
-
-      - name: Check FinMind token and basic API
-        run: |
-          python - <<'PY'
-          import os
-          import requests
-
-          token = os.getenv("FINMIND_API_TOKEN", "").strip()
-          if token.lower().startswith("bearer "):
-              token = token[7:].strip()
-          if not token:
-              raise RuntimeError(
-                  "FINMIND_API_TOKEN 為空，請確認 Repository Secret FINMIND_API_0714"
-              )
-
-          response = requests.get(
-              "https://api.finmindtrade.com/api/v4/data",
-              headers={"Authorization": f"Bearer {token}"},
-              params={"dataset": "TaiwanStockInfo"},
-              timeout=(10, 60),
-          )
-          print("FinMind HTTP status =", response.status_code)
-          response.raise_for_status()
-          payload = response.json()
-          if str(payload.get("status", 200)) != "200":
-              raise RuntimeError(f"FinMind API 驗證失敗：{payload}")
-          print("✅ FinMind Token 可用｜TaiwanStockInfo rows =", len(payload.get("data", [])))
-          PY
-
-      - name: Check runtime settings
-        run: |
-          python - <<'PY'
-          import os
-
-          keys = [
-              "WARRANT_DATA_SOURCE_MODE",
-              "WARRANT_REPORT_MODE",
-              "WARRANT_REPORT_LIVE_ONLY",
-              "FINMIND_WARRANT_DOWNLOAD_WORKERS",
-              "FINMIND_NEWS_LOOKBACK_DAYS",
-              "FINMIND_OFFICIAL_ISSUER_ENABLE",
-              "WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
-              "FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE",
-              "WARRANT_NEWS_SUMMARY_STYLE_VERSION",
-              "WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE",
-              "WARRANT_CACHE_FORCE_REFRESH",
-              "WARRANT_SELECTED_BRANCH_FLOW_MODE",
-              "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES",
-          ]
-          for key in keys:
-              print(f"{key} = {os.getenv(key)}")
-          print("FINMIND_API_TOKEN =", "SET" if os.getenv("FINMIND_API_TOKEN") else "EMPTY")
-          print("WARRANTS_API_KEY =", "SET" if os.getenv("WARRANTS_API_KEY") else "EMPTY")
-          print("WARRANTS_API_KEY_2 =", "SET" if os.getenv("WARRANTS_API_KEY_2") else "EMPTY")
-          print("WARRANTS_API_KEY_3 =", "SET" if os.getenv("WARRANTS_API_KEY_3") else "EMPTY")
-          PY
 
       - name: Run warrant report test
         run: |
