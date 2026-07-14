@@ -3537,7 +3537,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 近40交易日交易日｜五大分點共識買超 TOP10
+# 近40個有效交易日｜五大分點共識淨買超 TOP15
 # ══════════════════════════════════════════════════════════════════════
 
 def get_buy_event_date(row, sheet_name: str) -> date | None:
@@ -3589,7 +3589,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
     """
-    第二張圖：近40交易日交易日｜五大分點共識淨買超成本 TOP15
+    第二張圖：近40個有效交易日｜五大分點共識淨買超成本 TOP15
     """
     rows, period_meta = collect_consensus_buy_top10(target, lookback_days)
     n = len(rows)
@@ -3597,6 +3597,11 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     period_start = period_meta.get("start_date")
     period_end = period_meta.get("end_date")
     effective_days = safe_int(period_meta.get("effective_days"), 0)
+    period_title = (
+        f"近{effective_days}個有效交易日"
+        if effective_days > 0
+        else "近40個交易日"
+    )
 
     if period_start and period_end:
         period_text = f"{period_start:%Y/%m/%d} ～ {period_end:%Y/%m/%d}"
@@ -3787,7 +3792,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近40個交易日｜五大分點共識淨買超成本 TOP15", 28, NAVY, BOLD)
+    text(margin_x + 0.15, y, f"{period_title}｜五大分點共識淨買超成本 TOP15", 28, NAVY, BOLD)
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
@@ -3841,7 +3846,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     data_y = header_y_top - header_h
     if not rows:
         rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近40個交易日沒有淨買超成本為正的標的", 13, MUTED, BOLD, ha="center")
+        text(margin_x + content_w / 2, data_y - row_h / 2, f"{period_title}沒有淨買超成本為正的標的", 13, MUTED, BOLD, ha="center")
     else:
         for i, r in enumerate(rows):
             ry = data_y - (i + 1) * row_h
@@ -4218,7 +4223,15 @@ def normalize_image_action(action_text: str) -> str:
     ):
         return IMAGE_ACTION_WEEKLY_WARRANT
 
-    if "進40交易日" in raw or "共識淨買超成本" in raw or "五大分點共識" in raw or "consensus" in key:
+    if (
+        "近40交易日" in raw
+        or "近40個交易日" in raw
+        or "近兩個月" in raw
+        or "近一個月" in raw
+        or "共識淨買超成本" in raw
+        or "五大分點共識" in raw
+        or "consensus" in key
+    ):
         return IMAGE_ACTION_CONSENSUS_BUY
 
     return IMAGE_ACTION_DAILY_BUNDLE
@@ -5990,7 +6003,11 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近40交易日交易日_五大分點共識淨買超成本TOP15.png"
+    consensus_output_path = (
+        Path(args.consensus_output)
+        if args.consensus_output
+        else output_path.parent / "近40交易日_五大分點共識淨買超成本TOP15.png"
+    )
     weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
     weekly14_output_path = Path(args.weekly14_output) if args.weekly14_output else weekly_output_path.parent / "近14日權證分點共識買賣超TOP15.png"
     weekly21_output_path = Path(args.weekly21_output) if args.weekly21_output else weekly_output_path.parent / "近21日權證分點共識買賣超TOP15.png"
