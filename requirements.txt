@@ -15,3 +15,4 @@ numpy
 google-genai
 googlenewsdecoder
 psycopg[binary]
+pyarrow
