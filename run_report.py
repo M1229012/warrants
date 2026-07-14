@@ -15369,7 +15369,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-15-finmind-event-dedup-integrity-v17"
+FINMIND_BUILD_VERSION = "2026-07-15-finmind-discord-image-only-v18"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -20105,7 +20105,10 @@ def _send_discord_file(webhook_url: str, file_path: str, content: str = ""):
     try:
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "image/png")}
-            data = {"content": content or os.path.basename(file_path)}
+            data = {}
+            clean_content = str(content or "").strip()
+            if clean_content:
+                data["content"] = clean_content
             resp = requests.post(webhook_url, data=data, files=files, timeout=(8, 40))
             resp.raise_for_status()
         print(f"✅ Discord 測試頻道已送出：{file_path}")
@@ -20119,7 +20122,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-refresh+unresolved-issuer-exclusion+market-aware-current-day-check+event-level-news-dedup+atomic-output+equal-universe-moneydj-compare+market-compact-prewarm+branch-perf-disk+single-context+uv-ready+calendar7"
+        "official-issuer-refresh+unresolved-issuer-exclusion+market-aware-current-day-check+event-level-news-dedup+discord-image-only+atomic-output+equal-universe-moneydj-compare+market-compact-prewarm+branch-perf-disk+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
@@ -20187,6 +20190,10 @@ def main():
         print(
             f"✅ 已原子輸出圖片：{out_path}｜sha256={image_sha}｜"
             f"精選分點={selected_branch_label}｜build={FINMIND_BUILD_VERSION}"
+        )
+        _send_discord_file(
+            webhook_url,
+            out_path,
         )
 
     if ok_count <= 0:
