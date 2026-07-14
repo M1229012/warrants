@@ -65,7 +65,7 @@ jobs:
       WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # FinMind 設定：三大法人資料來源
-      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
 
       # Gemini / LLM 新聞與本週重點摘要設定
       # refresh_news_summary=0：程式會先檢查 Google Sheet 當日快取；若當天已有快取，直接使用快取，不會重打 Gemini API。
