@@ -214,14 +214,26 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 # 預設仍過濾總公司型分點，但「新光」與「第一金」這兩個分點保留，不列入總公司過濾。
 TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金,福邦證券").strip()
 
-# FinMind 全市場權證分點包含每一筆交易的買方與賣方分點。
-# 若把所有分點直接相加，市場總買進金額必然等於總賣出金額，淨額會固定接近 0。
-# 因此「權證資金流」預設改採非券商總公司型分點，代表一般分點／投資人端的淨流向；
+# FinMind 全市場權證分點包含完整買賣雙邊，直接把所有分點加總時淨額會接近 0。
+# 週報上方「權證資金流」改為逐檔權證辨識發行券商，僅排除該檔權證的發行／造市總公司列；
+# 不再把其他券商總公司一併刪除，避免把正常投資人委託誤刪。
 # TOP5 與精選分點仍沿用原本邏輯。
 WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv(
     "WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_ISSUER_FLOW_ENABLE = os.getenv(
+    "FINMIND_ISSUER_FLOW_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_ISSUER_FLOW_DEBUG_ENABLE = os.getenv(
+    "FINMIND_ISSUER_FLOW_DEBUG_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS = max(
+    1,
+    int(os.getenv("FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS", "30")),
+)
 
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 # 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
@@ -5456,6 +5468,257 @@ def is_top5_head_office_branch(branch_name: str) -> bool:
     return s in _get_top5_head_office_branch_set()
 
 
+
+# 權證名稱中的發行券商簡稱，統一映射成券商根名稱。
+# 這份表只用來辨識「該檔權證的發行券商」，不會用來過濾其他券商。
+_FINMIND_WARRANT_ISSUER_ALIASES = {
+    "中國信託": ["中國信託", "中信"],
+    "華南永昌": ["華南永昌", "華南"],
+    "永豐金": ["永豐金", "永豐"],
+    "群益": ["群益金鼎", "群益"],
+    "第一金": ["第一金"],
+    "摩根士丹利": ["摩根士丹利", "大摩"],
+    "摩根大通": ["摩根大通", "小摩"],
+    "法銀巴黎": ["法銀巴黎", "法巴", "巴黎"],
+    "花旗": ["花旗環球", "花旗"],
+    "匯豐": ["香港上海滙豐", "香港上海匯豐", "滙豐", "匯豐"],
+    "麥格理": ["港商麥格理", "麥格理"],
+    "野村": ["香港商野村", "野村"],
+    "里昂": ["港商里昂", "里昂"],
+    "瑞銀": ["新加坡商瑞銀", "瑞銀"],
+    "高盛": ["美商高盛", "高盛"],
+    "美林": ["美商美林", "美林"],
+    "德意志": ["德意志"],
+    "元大": ["元大"],
+    "凱基": ["凱基"],
+    "國泰": ["國泰"],
+    "統一": ["統一"],
+    "元富": ["元富"],
+    "兆豐": ["兆豐"],
+    "富邦": ["富邦"],
+    "國票": ["國票綜合", "國票"],
+    "玉山": ["玉山"],
+    "台新": ["台新"],
+    "康和": ["康和"],
+    "新光": ["新光"],
+    "合庫": ["合作金庫", "合庫"],
+    "台中銀": ["台中銀"],
+    "大華銀": ["大華銀"],
+    "星展": ["星展"],
+}
+
+
+def _finmind_compact_issuer_text(value: str) -> str:
+    s = html.unescape(str(value or "")).strip().replace("臺", "台")
+    s = re.sub(r"(股份有限公司|有限公司|證券股份|證券公司|證券|分公司|營業處|營業部)", "", s)
+    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
+    return s.strip()
+
+
+def _finmind_canonical_issuer_key(value: str) -> str:
+    """將權證名稱或券商名稱轉成同一個發行券商鍵。"""
+    s = _finmind_compact_issuer_text(value)
+    if not s:
+        return ""
+    candidates = []
+    for canonical, aliases in _FINMIND_WARRANT_ISSUER_ALIASES.items():
+        for alias in aliases:
+            alias_key = _finmind_compact_issuer_text(alias)
+            if alias_key and alias_key in s:
+                candidates.append((len(alias_key), canonical))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0][1]
+
+
+def _finmind_extract_warrant_issuer_key(warrant_name: str, underlying_name: str = "") -> str:
+    """由權證名稱辨識發行券商，例如「松川國票5B購01」→「國票」。"""
+    name = _finmind_compact_issuer_text(warrant_name)
+    if not name:
+        return ""
+
+    # 先嘗試移除標的名稱及常見的前 2～4 字標的簡稱，降低標的名稱誤含券商字樣的機率。
+    underlying = _finmind_compact_issuer_text(underlying_name)
+    search_texts = []
+    if underlying and name.startswith(underlying):
+        search_texts.append(name[len(underlying):])
+    if underlying:
+        for n in range(min(4, len(underlying)), 1, -1):
+            prefix = underlying[:n]
+            if name.startswith(prefix):
+                search_texts.append(name[n:])
+    search_texts.append(name)
+
+    for candidate_text in search_texts:
+        key = _finmind_canonical_issuer_key(candidate_text)
+        if key:
+            return key
+    return ""
+
+
+def _finmind_is_issuer_hq_or_market_maker_branch(
+    branch: str,
+    broker_code: str,
+    issuer_key: str,
+) -> bool:
+    """只判斷「同一發行券商」中的總公司／自營／造市端，不刪地方分點。"""
+    if not issuer_key:
+        return False
+    branch_raw = str(branch or "").strip()
+    branch_key = _finmind_canonical_issuer_key(branch_raw)
+    if not branch_key or branch_key != issuer_key:
+        return False
+
+    compact = _finmind_compact_issuer_text(branch_raw)
+    broker_code = str(broker_code or "").strip().upper()
+
+    explicit_market_maker_terms = (
+        "總公司", "總部", "本部", "自營", "承銷", "權證", "衍生", "金融商品",
+        "金融交易", "綜合", "證券總公司",
+    )
+    if any(term in branch_raw for term in explicit_market_maker_terms):
+        return True
+
+    # 多數券商總公司代碼尾碼為 0；例如第一金 5380、國票 7790。
+    if broker_code.endswith("0"):
+        return True
+
+    # 分點名稱正好就是券商根名稱，亦視為總公司列。
+    issuer_compact = _finmind_compact_issuer_text(issuer_key)
+    if compact == issuer_compact:
+        return True
+
+    return False
+
+
+def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) -> pd.DataFrame:
+    """建立週報上方「權證資金流」的 FinMind 對應口徑。
+
+    FinMind SponsorPro 是完整成交雙邊資料；每檔權證的投資人買進，會同時對應發行券商
+    造市端賣出。若全部相加，淨額必然接近 0。這裡逐檔由 warrant_name 辨識發行券商，
+    只排除該檔權證的發行券商總公司／自營／造市列，保留所有其他一般分點。
+
+    精選分點與 TOP5 不直接呼叫本函式，因此不會被這個口徑改動。
+    """
+    if events_df is None or events_df.empty:
+        return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
+    if not FINMIND_ISSUER_FLOW_ENABLE:
+        print("ℹ️ FinMind 發行券商造市端排除已關閉；上方權證資金流將使用完整雙邊資料")
+        return events_df.copy()
+
+    required = {"warrant_code", "warrant_name", "branch", "broker_code", "buy_amount", "sell_amount", "net_amount"}
+    missing = required - set(events_df.columns)
+    if missing:
+        print(f"⚠️ 無法建立發行券商權證資金流，缺少欄位：{sorted(missing)}")
+        return events_df.copy()
+
+    e = events_df.copy().reset_index(drop=True)
+    for col in ["buy_amount", "sell_amount", "net_amount"]:
+        e[col] = pd.to_numeric(e[col], errors="coerce").fillna(0.0).astype(float)
+    e["branch"] = e["branch"].astype(str).map(normalize_branch_name)
+    e["broker_code"] = e["broker_code"].astype(str).str.strip()
+    e["warrant_name"] = e["warrant_name"].astype(str).str.strip()
+    if "underlying_name" not in e.columns:
+        e["underlying_name"] = ""
+
+    e["_issuer_key"] = [
+        _finmind_extract_warrant_issuer_key(wname, uname)
+        for wname, uname in zip(e["warrant_name"], e["underlying_name"])
+    ]
+    e["_branch_issuer_key"] = e["branch"].map(_finmind_canonical_issuer_key)
+    e["_issuer_same_broker"] = (
+        (e["_issuer_key"] != "")
+        & (e["_branch_issuer_key"] == e["_issuer_key"])
+    )
+    e["_issuer_market_maker"] = [
+        _finmind_is_issuer_hq_or_market_maker_branch(branch, broker, issuer)
+        for branch, broker, issuer in zip(e["branch"], e["broker_code"], e["_issuer_key"])
+    ]
+
+    remove_mask = e["_issuer_same_broker"] & e["_issuer_market_maker"]
+    removed = e.loc[remove_mask].copy()
+    kept = e.loc[~remove_mask].copy()
+
+    raw_buy = float(e["buy_amount"].sum())
+    raw_sell = float(e["sell_amount"].sum())
+    raw_net = float(e["net_amount"].sum())
+    kept_buy = float(kept["buy_amount"].sum())
+    kept_sell = float(kept["sell_amount"].sum())
+    kept_net = float(kept["net_amount"].sum())
+
+    parsed_warrants = int(e.loc[e["_issuer_key"] != "", "warrant_code"].nunique())
+    total_warrants = int(e["warrant_code"].nunique())
+    print(
+        "💰 FinMind 權證資金流口徑：逐檔排除發行券商總公司／自營／造市端｜"
+        f"權證辨識={parsed_warrants}/{total_warrants}｜排除={len(removed):,}筆｜保留={len(kept):,}筆"
+    )
+    print(
+        f"💰 權證資金流檢查：原始買進={fmt_money(raw_buy)}｜原始賣出={fmt_money(-raw_sell)}｜原始淨額={fmt_money(raw_net)}｜"
+        f"排除後買進={fmt_money(kept_buy)}｜排除後賣出={fmt_money(-kept_sell)}｜排除後淨額={fmt_money(kept_net)}"
+    )
+
+    if FINMIND_ISSUER_FLOW_DEBUG_ENABLE:
+        unknown = (
+            e.loc[e["_issuer_key"] == "", ["warrant_code", "warrant_name", "underlying_name"]]
+            .drop_duplicates()
+            .head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS)
+        )
+        if not unknown.empty:
+            print("🧪 FinMind 發行券商辨識失敗的權證名稱（請保留此區塊）：")
+            print(unknown.to_string(index=False))
+
+        if not removed.empty:
+            removed_summary = (
+                removed.groupby(
+                    ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch"],
+                    as_index=False,
+                    dropna=False,
+                )
+                .agg(
+                    rows=("net_amount", "size"),
+                    buy_amount=("buy_amount", "sum"),
+                    sell_amount=("sell_amount", "sum"),
+                    net_amount=("net_amount", "sum"),
+                )
+            )
+            removed_summary["abs_net"] = removed_summary["net_amount"].abs()
+            removed_summary = removed_summary.sort_values(
+                ["abs_net", "rows"], ascending=[False, False]
+            ).drop(columns=["abs_net"])
+            print("🧪 FinMind 逐檔排除的發行券商造市列（前幾筆）：")
+            print(removed_summary.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
+        else:
+            print("⚠️ FinMind 沒有辨識到任何發行券商造市列；上方資金流仍可能維持 0")
+
+        same_issuer_not_removed = e.loc[
+            e["_issuer_same_broker"] & ~e["_issuer_market_maker"],
+            ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch", "buy_amount", "sell_amount", "net_amount"],
+        ].copy()
+        if not same_issuer_not_removed.empty:
+            check = (
+                same_issuer_not_removed.groupby(
+                    ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch"],
+                    as_index=False,
+                    dropna=False,
+                )
+                .agg(
+                    rows=("net_amount", "size"),
+                    buy_amount=("buy_amount", "sum"),
+                    sell_amount=("sell_amount", "sum"),
+                    net_amount=("net_amount", "sum"),
+                )
+            )
+            check["gross"] = check["buy_amount"] + check["sell_amount"]
+            check = check.sort_values(["gross", "rows"], ascending=[False, False]).drop(columns=["gross"])
+            print("🧪 同發行券商但被保留的地方分點（確認未誤刪）：")
+            print(check.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
+
+    return kept.drop(columns=[
+        "_issuer_key", "_branch_issuer_key", "_issuer_same_broker", "_issuer_market_maker",
+    ], errors="ignore").reset_index(drop=True)
+
+
 def filter_warrant_flow_investor_branches(events_df: pd.DataFrame) -> pd.DataFrame:
     """建立可解讀的權證資金流口徑。
 
@@ -5629,19 +5892,9 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             )
             hedge_removed = 0
 
-        # 恢復第一張圖原本的「權證資金流」資料集合，不再以券商名稱硬刪總公司分點。
-        # FinMind 全市場資料若呈現完整雙邊平衡，程式會在下方印出診斷；不能用任意排除券商
-        # 的方式製造非零淨額。待使用者貼回實際欄位／分點 ID 後，再精準重建舊版事件口徑。
-        flow_e = e.copy()
-        if FINMIND_DEBUG_SCHEMA_ENABLE and not flow_e.empty:
-            raw_buy = float(pd.to_numeric(flow_e["buy_amount"], errors="coerce").fillna(0).sum())
-            raw_sell = float(pd.to_numeric(flow_e["sell_amount"], errors="coerce").fillna(0).sum())
-            raw_net = float(pd.to_numeric(flow_e["net_amount"], errors="coerce").fillna(0).sum())
-            print(
-                f"🧪 FinMind 全市場權證流向平衡檢查：買進={fmt_money(raw_buy)}｜"
-                f"賣出={fmt_money(-raw_sell)}｜淨額={fmt_money(raw_net)}｜"
-                "若淨額為 0，代表資料包含完整成交雙邊，並非沒抓到資料"
-            )
+        # FinMind 是完整成交雙邊資料。週報上方資金流必須逐檔排除「該檔權證」的
+        # 發行券商總公司／自營／造市端，不能把所有券商總公司一起刪除，也不能直接全市場相加。
+        flow_e = filter_warrant_flow_excluding_issuer_market_makers(e)
 
         if pd.notna(week_start) and pd.notna(week_end):
             week_events = flow_e[(flow_e["Date"] >= week_start) & (flow_e["Date"] <= week_end)].copy()
@@ -14362,7 +14615,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-branch-id-direct-v4"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-issuer-flow-v5"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
