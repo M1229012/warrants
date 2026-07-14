@@ -226,11 +226,11 @@ jobs:
       WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # ========================================================
-      # Gemini：第一次輸出若仍不符合本週重點格式，直接走既有條件式備援，
-      # 不再重打第 2 次模型；市場資料與圖片計算不受影響。
+      # Gemini：新聞有完整摘要／內文時才使用；FinMind 僅標題時改走嚴格規則式摘要。
+      # 本週重點直接使用既有條件式資料分析，避免每檔新股票固定等待一次 Gemini。
       # ========================================================
       WARRANT_GEMINI_ENABLE: "1"
-      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
+      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "0"
       WARRANT_WEEKLY_GEMINI_REPAIR_ENABLE: "0"
       WARRANT_LLM_CACHE_ENABLE: "1"
       WARRANT_LLM_CACHE_DIR: llm_cache
@@ -251,7 +251,7 @@ jobs:
       # 新聞只使用 FinMind TaiwanStockNews。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v16_finmind_only"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v17_finmind_direct_title_strict"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
       WARRANT_NEWS_GOOGLE_MAX_ITEMS: "24"
       WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI: "12"
@@ -265,6 +265,12 @@ jobs:
       WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE: "0"
       WARRANT_NEWS_MOPS_ENABLE: "0"
       WARRANT_NEWS_GNEWSDECODER_ENABLE: "0"
+      # FinMind 只有標題時：原始標題必須直接出現本公司名稱／代號，且以規則式摘要取代 Gemini 擴寫。
+      WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET: "1"
+      WARRANT_FINMIND_NEWS_TITLE_ONLY_RULE_BASED: "1"
+      # 第一輪模型若驗證失敗，只保留通過項目，不再為 repair／補點重打 Gemini。
+      WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "0"
+      WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "0"
 
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
