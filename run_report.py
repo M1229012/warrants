@@ -311,6 +311,16 @@ WEEKLY_KEYPOINT_INST_NEUTRAL_MIN_SHARES = float(
 WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO = float(
     os.getenv("WARRANT_WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO", "0.05")
 )
+BRANCH_PERF_DISK_CACHE_ENABLE = os.getenv(
+    "WARRANT_BRANCH_PERF_DISK_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+_BRANCH_PERF_DISK_CACHE_ROOT = os.path.join(
+    os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache",
+    "reference",
+)
+_BRANCH_PERF_DISK_CACHE_PATH = os.path.join(_BRANCH_PERF_DISK_CACHE_ROOT, "branch_performance.parquet")
+_BRANCH_PERF_DISK_META_PATH = os.path.join(_BRANCH_PERF_DISK_CACHE_ROOT, "branch_performance.meta.json")
 _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
 
@@ -441,6 +451,18 @@ LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() no
 LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_cache"
 # Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
 GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_READ_ENABLE = os.getenv(
+    "WARRANT_GSHEET_LLM_CACHE_READ_ENABLE",
+    "1" if GSHEET_LLM_CACHE_ENABLE else "0",
+).strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_WRITE_ENABLE = os.getenv(
+    "WARRANT_GSHEET_LLM_CACHE_WRITE_ENABLE",
+    "1" if GSHEET_LLM_CACHE_ENABLE else "0",
+).strip().lower() not in ("0", "false", "no", "off")
+LLM_DAILY_TASK_CACHE_ENABLE = os.getenv(
+    "WARRANT_LLM_DAILY_TASK_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
 LLM_CACHE_FORCE_REFRESH = bool(ACTION_FORCE_REFRESH)
 
@@ -457,6 +479,8 @@ _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN = False
 _WARRANT_FAST_FALLBACK_LIVE_ACTIVE = False
 _WARRANT_FAST_FALLBACK_LIVE_LOCK = threading.RLock()
 _GSHEET_CONNECTION_LOCK = threading.RLock()
+_DAILY_LLM_CACHE_MEM = {}
+_DAILY_LLM_CACHE_LOCK = threading.RLock()
 _STOCK_NAME_GSHEET_PRELOAD_THREAD = None
 _STOCK_NAME_GSHEET_PRELOAD_LOCK = threading.Lock()
 
@@ -1385,17 +1409,78 @@ def _gsheet_llm_cache_key(task: str, stock_code: str, cache_date: str | None = N
     return f"{date_key}_{stock_key}_{task_key}_{model_key}"
 
 
-def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prompt: str = "") -> str:
-    """讀取 Google Sheet Gemini 每日快取。
+def _daily_task_llm_cache_path(task: str, stock_code: str, cache_date: str | None = None) -> str:
+    key = _gsheet_llm_cache_key(task, stock_code, cache_date=cache_date)
+    safe_key = re.sub(r"[^A-Za-z0-9_.一-鿿-]", "_", key)
+    return os.path.join(LLM_CACHE_DIR, "daily", f"{safe_key}.txt")
 
-    設計原則：同股票、同任務、同模型、同一個台北日期，只要跑過一次，
-    當天再跑就直接使用該輸出，不再呼叫 Gemini。PromptHash 只保留作檢查紀錄，
-    不拿來阻擋當日快取命中。
+
+def load_daily_task_llm_cache(task: str, stock_code: str) -> str:
+    """同股票、同任務、同模型、同一台北日期的本機快取。
+
+    與 prompt hash 快取不同，這份快取可直接取代原本每次都要連線 Google Sheet
+    才能判斷「今天是否已產生摘要」的慢速路徑。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if not LLM_CACHE_ENABLE or not LLM_DAILY_TASK_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
         return ""
     if not task or not stock_code:
         return ""
+    key = _gsheet_llm_cache_key(task, stock_code)
+    with _DAILY_LLM_CACHE_LOCK:
+        if key in _DAILY_LLM_CACHE_MEM:
+            return str(_DAILY_LLM_CACHE_MEM.get(key, "") or "")
+
+    path = _daily_task_llm_cache_path(task, stock_code)
+    text = ""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+    except Exception as exc:
+        print(f"⚠️ Gemini 每日任務本機快取讀取失敗：{path}｜{exc}")
+        text = ""
+
+    with _DAILY_LLM_CACHE_LOCK:
+        _DAILY_LLM_CACHE_MEM[key] = text
+    if text:
+        print(f"⚡ Gemini 每日任務本機快取命中：{key}")
+    return text
+
+
+def save_daily_task_llm_cache(task: str, stock_code: str, output_text: str, cache_date: str | None = None):
+    if not LLM_CACHE_ENABLE or not LLM_DAILY_TASK_CACHE_ENABLE or not output_text:
+        return
+    if not task or not stock_code:
+        return
+    key = _gsheet_llm_cache_key(task, stock_code, cache_date=cache_date)
+    path = _daily_task_llm_cache_path(task, stock_code, cache_date=cache_date)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(output_text))
+        with _DAILY_LLM_CACHE_LOCK:
+            _DAILY_LLM_CACHE_MEM[key] = str(output_text)
+        print(f"💾 Gemini 每日任務結果已存本機：{key}")
+    except Exception as exc:
+        print(f"⚠️ Gemini 每日任務本機快取寫入失敗：{path}｜{exc}")
+
+
+def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prompt: str = "") -> str:
+    """本機每日任務快取優先；只有允許時才回退 Google Sheet。
+
+    正式產圖可停用 Google Sheet 讀取，避免一次快取命中仍等待十多秒；
+    預熱或舊資料相容模式仍可保留 Google Sheet 作為備援來源。
+    """
+    if LLM_CACHE_FORCE_REFRESH or not task or not stock_code:
+        return ""
+
+    local_text = load_daily_task_llm_cache(task, stock_code)
+    if local_text:
+        return local_text
+
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_LLM_CACHE_READ_ENABLE:
+        return ""
+
     key = _gsheet_llm_cache_key(task, stock_code)
     try:
         sh = _open_gsheet()
@@ -1409,8 +1494,6 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
         if "快取鍵" not in headers or "Gemini輸出" not in headers:
             return ""
 
-        # 只讀第一欄尋找最後一筆相同快取鍵，再讀取該列；
-        # 避免每次命中檢查都下載整張包含長篇 Gemini 文字的工作表。
         key_values = ws.col_values(1)
         matched_row_numbers = [
             row_number
@@ -1433,17 +1516,18 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
                 print(f"📦 Google Sheet Gemini 當日快取命中：{key}｜PromptHash 不同，但依當日快取規則直接重用")
             else:
                 print(f"📦 Google Sheet Gemini 當日快取命中：{key}")
+            save_daily_task_llm_cache(task, stock_code, output_text)
             return output_text
-    except Exception as e:
-        print(f"⚠️ Google Sheet Gemini 快取讀取失敗：{key}｜{e}")
+    except Exception as exc:
+        print(f"⚠️ Google Sheet Gemini 快取讀取失敗：{key}｜{exc}")
     return ""
 
-
 def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: str, output_text: str):
-    """將 Gemini 原始輸出寫回 Google Sheet，供同日重跑直接重用。"""
-    if not GSHEET_LLM_CACHE_ENABLE or not output_text:
+    """先寫本機每日快取；Google Sheet 寫入可獨立停用以縮短正式產圖時間。"""
+    if not output_text or not task or not stock_code:
         return
-    if not task or not stock_code:
+    save_daily_task_llm_cache(task, stock_code, output_text)
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_LLM_CACHE_WRITE_ENABLE:
         return
     sh = _open_gsheet()
     if sh is None:
@@ -3059,6 +3143,46 @@ def _extract_branch_perf_values(values: List[List[str]], source_sheet: str) -> p
     return out.drop(columns=["_event_sort"])
 
 
+def _load_branch_perf_disk_cache() -> pd.DataFrame:
+    if not BRANCH_PERF_DISK_CACHE_ENABLE:
+        return pd.DataFrame()
+    try:
+        if not os.path.exists(_BRANCH_PERF_DISK_CACHE_PATH) or not os.path.exists(_BRANCH_PERF_DISK_META_PATH):
+            return pd.DataFrame()
+        with open(_BRANCH_PERF_DISK_META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if str(meta.get("cache_date", "") or "") != _taipei_today_str():
+            return pd.DataFrame()
+        cached = pd.read_parquet(_BRANCH_PERF_DISK_CACHE_PATH)
+        if cached is not None and not cached.empty:
+            print(f"⚡ 分點勝率統計本機快取命中：{len(cached):,} 個分點")
+            return cached
+    except Exception as exc:
+        print(f"⚠️ 分點勝率統計本機快取讀取失敗：{exc}")
+    return pd.DataFrame()
+
+
+def _save_branch_perf_disk_cache(df: pd.DataFrame, source_sheet: str = ""):
+    if not BRANCH_PERF_DISK_CACHE_ENABLE or df is None or df.empty:
+        return
+    try:
+        _ensure_dir(_BRANCH_PERF_DISK_CACHE_ROOT)
+        tmp_path = _BRANCH_PERF_DISK_CACHE_PATH + ".tmp"
+        df.to_parquet(tmp_path, index=False, compression="zstd")
+        os.replace(tmp_path, _BRANCH_PERF_DISK_CACHE_PATH)
+        meta = {
+            "cache_date": _taipei_today_str(),
+            "source_sheet": str(source_sheet or ""),
+            "rows": int(len(df)),
+            "updated_at": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+        }
+        with open(_BRANCH_PERF_DISK_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"💾 分點勝率統計已存本機共用快取：{len(df):,} 個分點")
+    except Exception as exc:
+        print(f"⚠️ 分點勝率統計本機快取寫入失敗：{exc}")
+
+
 def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
     global _BRANCH_PERF_CACHE_DF
     # 勝率統計只提供「分點歷史績效」作為文字輔助，不屬於本次交易資料快取；
@@ -3069,6 +3193,13 @@ def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
     with _BRANCH_PERF_CACHE_LOCK:
         if _BRANCH_PERF_CACHE_DF is not None and not force_refresh:
             return _BRANCH_PERF_CACHE_DF.copy()
+
+    if not force_refresh:
+        disk_cached = _load_branch_perf_disk_cache()
+        if disk_cached is not None and not disk_cached.empty:
+            with _BRANCH_PERF_CACHE_LOCK:
+                _BRANCH_PERF_CACHE_DF = disk_cached.copy()
+            return disk_cached.copy()
 
     sh = _open_gsheet()
     if sh is None:
@@ -3089,6 +3220,7 @@ def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
                 f"✅ 讀取分點勝率統計：{ws.title}｜"
                 f"全部-A+B+C+D合併 {len(result):,} 個分點"
             )
+            _save_branch_perf_disk_cache(result, source_sheet=ws.title)
             with _BRANCH_PERF_CACHE_LOCK:
                 _BRANCH_PERF_CACHE_DF = result.copy()
             return result
@@ -10200,22 +10332,26 @@ def _call_gemini_with_retry(
     response_schema: dict | None = None,
     temperature: float | None = None,
 ):
-    # 第一優先：Google Sheet 每日快取。
-    # 同股票、同任務、同模型、同一天只要跑過一次，當天再跑就不會重打 Gemini。
-    # 這段必須放在 GEMINI_ENABLE 判斷前面，避免關閉 Gemini 時連當日快取也讀不到。
-    cached_text = load_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt) if cache_task and stock_code else ""
+    # 第一優先：本機每日任務快取。Actions cache 還原後只需讀小檔，不連 Google Sheet。
+    cached_text = (
+        load_daily_task_llm_cache(cache_task, stock_code)
+        if cache_task and stock_code
+        else ""
+    )
     if cached_text:
-        save_llm_cache(prompt, cached_text)
         return cached_text
 
     # 第二優先：本機 prompt hash 快取。
-    # 若本機命中，也順便補寫 Google Sheet，讓下次不同 runner 也能直接命中。
-    # 但當 Action 設定 WARRANT_LLM_CACHE_FORCE_REFRESH=1 時，必須連本機快取也跳過，
-    # 否則使用者選 1 仍可能吃到同 prompt 的舊壞結果。
     cached_text = "" if LLM_CACHE_FORCE_REFRESH else load_llm_cache(prompt)
     if cached_text:
-        if write_cache and cache_task and stock_code:
-            save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, cached_text)
+        if cache_task and stock_code:
+            save_daily_task_llm_cache(cache_task, stock_code, cached_text)
+        return cached_text
+
+    # 第三優先：可選的 Google Sheet 舊快取備援。正式最快模式可關閉此網路查詢。
+    cached_text = load_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt) if cache_task and stock_code else ""
+    if cached_text:
+        save_llm_cache(prompt, cached_text)
         return cached_text
 
     if ACTION_CACHE_ONLY_MODE:
@@ -10274,7 +10410,9 @@ def _call_gemini_with_retry(
                 if write_cache:
                     save_llm_cache(prompt, output_text)
                     if cache_task and stock_code:
-                        save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, output_text)
+                        save_daily_task_llm_cache(cache_task, stock_code, output_text)
+                        if GSHEET_LLM_CACHE_WRITE_ENABLE:
+                            save_gsheet_llm_cache(cache_task, stock_code, stock_name, prompt, output_text)
                 return output_text
             except Exception as e:
                 last_error = e
@@ -12951,17 +13089,19 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     流程會在 build_news_points() 提早 return，導致永遠不會讀到 Google Sheet 快取。
     這個函式放在 build_news_points() 前面直接查快取，確保當天跑過的新聞摘要能直接被圖片使用。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if LLM_CACHE_FORCE_REFRESH:
         return []
     stock_key = _clean_code(stock_code)
     if not stock_key:
         return []
 
-    cached_text = load_gsheet_llm_cache(_news_points_cache_task(), stock_key, stock_name, prompt="")
+    cached_text = load_daily_task_llm_cache(_news_points_cache_task(), stock_key)
+    if not cached_text and GSHEET_LLM_CACHE_ENABLE and GSHEET_LLM_CACHE_READ_ENABLE:
+        cached_text = load_gsheet_llm_cache(_news_points_cache_task(), stock_key, stock_name, prompt="")
     if cached_text:
         points = _clean_news_summary_points_for_stock(_parse_raw_points_from_llm(cached_text), stock_key, stock_name)
         if points:
-            print(f"📦 直接使用 Google Sheet 當日新聞快取：{stock_key}｜{len(points)} 點")
+            print(f"📦 直接使用當日新聞本機快取：{stock_key}｜{len(points)} 點")
             return points[:NEWS_DISPLAY_MAX_POINTS]
 
     if not allow_stale:
@@ -13024,20 +13164,21 @@ def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_
     cleaned = [p for p in cleaned if _points_are_independent_and_complete([p])]
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
-def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
+def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None, cache_lookup: bool = True) -> List[str]:
     """整理高品質公司新聞；允許 0 點，寧缺勿濫，不再強制補足顯示數量。"""
-    cached_points = _load_gsheet_news_points_cache_for_display(
-        stock_code,
-        stock_name,
-        allow_stale=False,
-    )
-    if cached_points:
-        return _finalize_news_points_for_display(
-            cached_points,
+    if cache_lookup:
+        cached_points = _load_gsheet_news_points_cache_for_display(
             stock_code,
             stock_name,
-            ctx,
+            allow_stale=False,
         )
+        if cached_points:
+            return _finalize_news_points_for_display(
+                cached_points,
+                stock_code,
+                stock_name,
+                ctx,
+            )
 
     records = _news_items_to_records(news_items)
     records = _enrich_fast_news_records_with_topk_bodies(
@@ -13535,7 +13676,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # 精選分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
     # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
     # 今日精選分點大買 / 大賣被 plot_df.index.max() 擋掉。
-    selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
+    selected_branch_events_all = ctx.get("_selected_branch_events_all_cache")
+    if selected_branch_events_all is None:
+        selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
+    else:
+        selected_branch_events_all = selected_branch_events_all.copy()
     selected_flow_dates = build_flow_axis_dates(plot_df, selected_branch_events_all)
     selected_x = list(range(len(selected_flow_dates)))
     selected_date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in selected_flow_dates]
@@ -14853,7 +14998,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-market-compact-prewarm-v11"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-fast-local-cache-v12"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15735,11 +15880,15 @@ def _finmind_prewarm_market_compact_cache():
     if not trader_name_map:
         raise RuntimeError("預熱失敗：TaiwanSecuritiesTraderInfo 無法建立分點對照")
 
-    reference_executor = ThreadPoolExecutor(max_workers=2)
+    reference_executor = ThreadPoolExecutor(max_workers=3)
     reference_futures = [
         reference_executor.submit(_finmind_load_stock_info_with_warrant, False),
         reference_executor.submit(_finmind_official_warrant_issuer_map, False),
     ]
+    if BRANCH_PERF_ENABLE:
+        reference_futures.append(
+            reference_executor.submit(read_gsheet_branch_perf_df, False)
+        )
 
     trading_dates = _finmind_get_trading_dates(start_date, today)
     if not trading_dates:
@@ -17625,31 +17774,17 @@ def _enrich_fast_news_records_with_topk_bodies(records: List[dict], stock_code: 
 # ============================================================
 
 def _prepare_report_news_items(stock_code: str, stock_name: str) -> List[dict]:
-    """準備週報新聞素材；可與權證 API 流程平行執行。"""
+    """準備週報新聞素材；快取檢查由完整新聞管線統一執行一次。"""
     with report_stage_timer(f"{stock_code}｜新聞資料準備"):
         if is_compact_report_mode():
             print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
             return []
-
-        cached_news_points = _load_gsheet_news_points_cache_for_display(
-            stock_code,
-            stock_name,
-            allow_stale=False,
-        )
-        if cached_news_points:
-            print(
-                f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整："
-                f"{stock_code}｜{len(cached_news_points)} 點"
-            )
-            return []
-
         if ACTION_CACHE_ONLY_MODE:
             print(
                 f"☁️ Action=0 嚴格快取模式未命中當日新聞快取：{stock_code}，"
-                "不執行 Google News／Yahoo／MoneyDJ 新聞搜尋"
+                "不執行新聞搜尋"
             )
             return []
-
         return fetch_multi_source_news_articles(
             stock_code,
             stock_name,
@@ -17658,26 +17793,38 @@ def _prepare_report_news_items(stock_code: str, stock_name: str) -> List[dict]:
 
 
 def _prepare_report_news_pipeline(stock_code: str, stock_name: str) -> dict:
-    """完整新聞管線：素材抓取、Top-K 原文補抓、Gemini 統整、repair／補點一次完成。
-
-    此流程不依賴 API4／API5 分點資料，可在背景執行；回傳的空 points 也是合法結果，
-    因此 plot 端以 None 區分「尚未預先計算」與「已計算但沒有合格新聞」。
-    """
+    """新聞快取只檢查一次；命中本機後不再連 Google Sheet或重進 build_news_points。"""
     with report_stage_timer(f"{stock_code}｜完整新聞管線"):
-        news_items = _prepare_report_news_items(stock_code, stock_name)
         if is_compact_report_mode():
-            return {"news_items": news_items, "news_points": []}
+            return {"news_items": [], "news_points": []}
+
+        cached_news_points = _load_gsheet_news_points_cache_for_display(
+            stock_code,
+            stock_name,
+            allow_stale=False,
+        )
+        if cached_news_points:
+            print(
+                f"⚡ 今日新聞本機快取已存在，略過 FinMind 新聞抓取與 Gemini："
+                f"{stock_code}｜{len(cached_news_points)} 點"
+            )
+            return {
+                "news_items": [],
+                "news_points": list(cached_news_points or []),
+            }
+
+        news_items = _prepare_report_news_items(stock_code, stock_name)
         news_points = build_news_points(
             stock_code,
             stock_name,
             news_items,
             ctx=None,
+            cache_lookup=False,
         )
         return {
             "news_items": news_items,
             "news_points": list(news_points or []),
         }
-
 
 def generate_warrant_report(stock_code: str) -> io.BytesIO:
     report_total_start = time.perf_counter()
@@ -17780,11 +17927,13 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         report_data_executor = None
 
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
+        selected_debug_cache = None
         if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
             latest_event_date = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna().max()
             if pd.notna(latest_event_date):
                 print(f"🔎 權證分點事件最新日期：{pd.Timestamp(latest_event_date).date()}")
             selected_debug = filter_selected_branch_flow_events(warrant_events)
+            selected_debug_cache = selected_debug.copy() if selected_debug is not None else pd.DataFrame()
             if selected_debug is not None and not selected_debug.empty:
                 selected_debug = selected_debug.copy()
                 selected_debug["Date"] = pd.to_datetime(selected_debug["Date"], errors="coerce").dt.normalize()
@@ -17807,9 +17956,16 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         if warrant_events is not None and not warrant_events.empty:
             try:
                 weekly_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+                if selected_debug_cache is not None:
+                    weekly_ctx["_selected_branch_events_all_cache"] = selected_debug_cache.copy()
                 debug_week_events = weekly_ctx.get("week_events", pd.DataFrame())
                 if debug_week_events is not None and not debug_week_events.empty:
-                    debug_buy_top, debug_sell_top = top_branch_tables(debug_week_events, topn=5)
+                    debug_buy_top, debug_sell_top = _get_cached_top_branch_tables(
+                        weekly_ctx,
+                        "current_week",
+                        debug_week_events,
+                        topn=5,
+                    )
                     print(
                         f"🔎 TOP5統計區間：{pd.Timestamp(weekly_ctx['week_start']).date()} ~ {pd.Timestamp(weekly_ctx['week_end']).date()}｜"
                         f"週事件 {len(debug_week_events):,} 筆｜買超TOP5 {len(debug_buy_top):,} 筆｜賣超TOP5 {len(debug_sell_top):,} 筆"
@@ -17914,7 +18070,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+reference-disk-cache+raw-selected-branch+daily-parallel-news+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+local-daily-llm+branch-perf-disk+single-news-cache-read+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
