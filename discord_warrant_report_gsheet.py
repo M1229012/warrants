@@ -217,6 +217,7 @@ EVENT_LEGEND_ITEMS = [
 # ══════════════════════════════════════════════════════════════════════
 
 _GSHEET = None
+_WORKSHEET_VALUES_CACHE: dict[str, list[list[str]]] = {}
 
 
 def get_gsheet():
@@ -253,9 +254,30 @@ def strip_gsheet_text_prefix(v):
 
 
 def worksheet_values(sheet_name: str) -> list[list[str]]:
+    if sheet_name in _WORKSHEET_VALUES_CACHE:
+        return [
+            list(row)
+            for row in _WORKSHEET_VALUES_CACHE[sheet_name]
+        ]
+
     sh = get_gsheet()
     ws = sh.worksheet(sheet_name)
-    return ws.get_all_values()
+    values = ws.get_all_values()
+
+    _WORKSHEET_VALUES_CACHE[sheet_name] = [
+        list(row)
+        for row in values
+    ]
+
+    print(
+        f"  📥 已讀取 Google Sheet：{sheet_name}｜"
+        f"{len(values):,} 列"
+    )
+
+    return [
+        list(row)
+        for row in values
+    ]
 
 
 def read_gsheet_table(
@@ -881,7 +903,8 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         {標的股: [(分點, 剩餘成本, 報酬率), ...]}
 
     近一個月 TOP15 圖固定只讀 資料範圍=精選五分點。
-    若新版工作表尚不存在，會 fallback 回舊版「快取_TOP15分點報酬率」。
+    若新版工作表不存在或沒有資料，直接回傳空結果，
+    不再讀取舊版「快取_TOP15分點報酬率」。
     """
     needed_cols = [
         "資料範圍",
@@ -901,19 +924,12 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
     df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
 
     if df.empty:
-        old_cache = read_top15_return_cache_from_gsheet(target)
-        by_underlying: dict[str, list[tuple[str, float, float | None]]] = defaultdict(list)
-
-        for (underlying, broker), info in old_cache.items():
-            amount = safe_float(info.get("remaining_cost"), 0)
-            if amount <= 0:
-                continue
-            by_underlying[underlying].append((broker, amount, info.get("return_pct")))
-
-        for underlying in by_underlying:
-            by_underlying[underlying].sort(key=lambda x: x[1], reverse=True)
-
-        return dict(by_underlying)
+        print(
+            f"  ⚠️ 找不到新版 TOP15 部位快取："
+            f"{SHEET_TOP15_POSITION_DETAIL}，"
+            "本次不再回退讀取舊版快取_TOP15分點報酬率。"
+        )
+        return {}
 
     def pick_cache_date(row):
         return _pick_first_existing_date(row, ["統計日期", "日期", "目標日期"])
@@ -1485,6 +1501,65 @@ def read_history_stats_from_gsheet() -> dict:
 
     return result
 
+
+
+def read_selected5_history_from_abcd() -> dict:
+    """
+    只使用 A/B/C/D 計算精選五分點的平均持有天數，
+    避免每日圖額外讀取「勝率統計」。
+    """
+    hold_days_map: dict[str, list[float]] = defaultdict(list)
+
+    for sheet_name in [SHEET_A, SHEET_B, SHEET_C, SHEET_D]:
+        try:
+            df = read_gsheet_table(
+                sheet_name,
+                ["資料範圍", "分點", "持有天數"],
+            )
+            df = filter_df_by_data_scope(
+                df,
+                DATA_SCOPE_SELECTED5,
+            )
+        except Exception:
+            continue
+
+        if df.empty or "持有天數" not in df.columns:
+            continue
+
+        for _, row in df.iterrows():
+            broker = str(row.get("分點", "")).strip()
+            if broker not in TRACKED_BROKERS:
+                continue
+
+            raw_hold_days = strip_gsheet_text_prefix(
+                row.get("持有天數", "")
+            )
+            if raw_hold_days in ("", "-"):
+                continue
+
+            hold_days = safe_float(raw_hold_days, None)
+            if hold_days is None or hold_days < 0:
+                continue
+
+            hold_days_map[broker].append(hold_days)
+
+    result = {}
+
+    for broker in TRACKED_BROKERS:
+        values = hold_days_map.get(broker, [])
+        avg_hold_days = (
+            sum(values) / len(values)
+            if values
+            else 0.0
+        )
+
+        result[broker] = {
+            "total_events": 0,
+            "win_rate": 0.0,
+            "avg_hold_days": avg_hold_days,
+        }
+
+    return result
 
 
 def _normalize_stat_header_name(value) -> str:
@@ -2296,8 +2371,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
     2. 若該權證未出現在 A/B/C/D，但同一分點今天對同一標的的賣出金額合計
        達 NON_ABCD_SELL_UNDERLYING_THRESHOLD，仍納入賣超明細。
        這類資料不標 A/B/C/D，直接顯示權證與賣出金額。
-    3. 非 A/B/C/D 的大額單標的賣超，會從「快取_分點歷史」估算該權證的
-       加權平均成本與賣出報酬率。
+    3. 非 A/B/C/D 的大額單標的賣超，直接使用「每日賣出明細」內
+       主程式已計算的 FIFO 成本與報酬率。
     """
     needed_cols = [
         "日期", "分點", "分點名稱", "券商代號",
@@ -2323,7 +2398,6 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         return
 
     event_lookup = build_sell_event_lookup_from_abcd(target)
-    history_return_lookup = build_warrant_sell_history_return_lookup(target)
 
     # 先統計「不在 A/B/C/D 白名單」的權證，在同一天 + 同分點 + 同標的的實際賣出合計。
     non_abcd_underlying_amounts: dict[tuple[str, str], float] = defaultdict(float)
@@ -2377,7 +2451,6 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             continue
 
         lookup_info = event_lookup.get((broker, warrant_code))
-        hist_info = history_return_lookup.get((broker, warrant_code), {})
 
         # 主程式新版「每日賣出明細」若已經寫入 FIFO 報酬率 / 賣出成本，
         # 圖片端優先採用這張表的結果。
@@ -2420,13 +2493,6 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             elif safe_float(buy_amount, 0) <= 0:
                 buy_amount = safe_float(lookup_info.get("buy_amount"), 0)
 
-            # 若事件表本身沒有足夠資訊，再用快取_分點歷史補估
-            if (return_pct is None or safe_float(buy_amount, 0) <= 0) and hist_info:
-                if return_pct is None:
-                    return_pct = hist_info.get("return_pct")
-                if safe_float(buy_amount, 0) <= 0:
-                    buy_amount = safe_float(hist_info.get("buy_amount"), 0)
-
             append_sell(
                 sells,
                 broker,
@@ -2448,8 +2514,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
         if (broker, underlying) not in qualifying_non_abcd_underlyings:
             continue
 
-        non_abcd_return_pct = daily_return_pct if daily_return_pct is not None else hist_info.get("return_pct")
-        non_abcd_buy_amount = daily_buy_amount if safe_float(daily_buy_amount, 0) > 0 else safe_float(hist_info.get("buy_amount"), 0)
+        non_abcd_return_pct = daily_return_pct
+        non_abcd_buy_amount = daily_buy_amount
 
         append_sell(
             sells,
@@ -3236,7 +3302,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 近40個交易日｜五大分點共識買超 TOP10
+# 近40個交易日｜五大分點共識買超 TOP15
 # ══════════════════════════════════════════════════════════════════════
 
 def get_buy_event_date(row, sheet_name: str) -> date | None:
@@ -5718,7 +5784,7 @@ def main():
 
 
     if action in [IMAGE_ACTION_DAILY_BUNDLE, IMAGE_ACTION_ALL]:
-        history = read_history_stats_from_gsheet()
+        history = read_selected5_history_from_abcd()
         buys, sells = extract_actions_from_gsheet(target)
 
         print(
