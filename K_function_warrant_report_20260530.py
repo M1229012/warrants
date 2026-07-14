@@ -6253,7 +6253,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v26_status_strip_company_and_derive_fallback"
+    internal_version = "validated_v27_event_level_dedup"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -7248,6 +7248,291 @@ def _article_seen_key(title: str, link: str) -> str:
     return str(link or "").strip()
 
 
+def _news_published_datetime(published: str):
+    """將 RSS／MOPS 日期轉成 datetime；失敗時回傳 None。"""
+    raw = str(published or "").strip()
+    if not raw:
+        return None
+    dt = _parse_rss_pub_date(raw)
+    if dt is not None:
+        return dt
+    try:
+        ts = pd.Timestamp(raw)
+        if pd.isna(ts):
+            return None
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_localize(None)
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _news_month_period_key(text: str, published: str = "") -> str:
+    """擷取新聞中的年月；只有月份時，使用發布年份補齊。"""
+    s = _normalize_news_text(text)
+    published_dt = _news_published_datetime(published)
+
+    # 西元年月，例如 2026年6月、2026/06、2026-06。
+    # 不允許 145.28 這類營收小數被誤判成民國年月。
+    m = re.search(
+        r"(?<!\d)(?P<year>20\d{2})\s*(?:年|[/\-])\s*0?(?P<month>1[0-2]|[1-9])(?:\s*月)?(?!\d)(?!\s*[/\-]\s*\d{1,2})",
+        s,
+    )
+    if m:
+        year = int(m.group("year"))
+        month = int(m.group("month"))
+        return f"{year:04d}-{month:02d}"
+
+    # 民國年月只接受明確的「115年6月」，避免三位數金額被誤判。
+    m = re.search(
+        r"(?<!\d)(?P<year>1\d{2})\s*年\s*0?(?P<month>1[0-2]|[1-9])\s*月",
+        s,
+    )
+    if m:
+        year = int(m.group("year")) + 1911
+        month = int(m.group("month"))
+        return f"{year:04d}-{month:02d}"
+
+    # 一般新聞最常見的「6月營收」。
+    m = re.search(r"(?<!\d)0?(?P<month>1[0-2]|[1-9])\s*月", s)
+    if m:
+        month = int(m.group("month"))
+        year = published_dt.year if published_dt is not None else 0
+        return f"{year:04d}-{month:02d}" if year else f"month-{month:02d}"
+
+    return ""
+
+
+def _news_quarter_period_key(text: str, published: str = "") -> str:
+    """擷取新聞中的年度季度，例如 2026年第2季、Q2。"""
+    s = _normalize_news_text(text)
+    published_dt = _news_published_datetime(published)
+
+    year_match = re.search(r"(?<!\d)(20\d{2}|1\d{2})\s*年", s)
+    year = 0
+    if year_match:
+        year = int(year_match.group(1))
+        if year < 1911:
+            year += 1911
+    elif published_dt is not None:
+        year = published_dt.year
+
+    quarter_match = re.search(r"第?\s*([1-4])\s*季", s)
+    if not quarter_match:
+        quarter_match = re.search(r"\bQ([1-4])\b", s, flags=re.I)
+    if not quarter_match:
+        return ""
+
+    quarter = int(quarter_match.group(1))
+    return f"{year:04d}-Q{quarter}" if year else f"Q{quarter}"
+
+
+def _news_event_numeric_signature(text: str, limit: int = 5) -> str:
+    """抽取事件中的主要數字，供非月營收事件做保守去重。"""
+    s = _normalize_news_text(text).replace("％", "%")
+    tokens = re.findall(
+        r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?:%|億元|億|萬元|萬|元|季|年|月)?",
+        s,
+    )
+    unique = []
+    for token in tokens:
+        token = str(token or "").strip()
+        if not token or token in unique:
+            continue
+        unique.append(token)
+        if len(unique) >= max(1, int(limit)):
+            break
+    return "|".join(unique)
+
+
+def _news_event_fingerprint(
+    text: str,
+    published: str = "",
+    stock_code: str = "",
+    stock_name: str = "",
+) -> str:
+    """建立新聞事件鍵。
+
+    這裡刻意把「同一月份營收」視為同一事件，不論新聞來源、標題、
+    status 或 detail 的寫法是否不同；其他題材採較保守鍵值，避免誤合併。
+    """
+    s = _normalize_news_text(text)
+    if not s:
+        return ""
+
+    lower = s.lower()
+    month_period = _news_month_period_key(s, published=published)
+    quarter_period = _news_quarter_period_key(s, published=published)
+    published_dt = _news_published_datetime(published)
+    published_day = published_dt.strftime("%Y-%m-%d") if published_dt is not None else "unknown"
+    numeric_sig = _news_event_numeric_signature(s)
+
+    # 最重要的修正：月營收多來源／多標題只能算一個事件。
+    if "營收" in s:
+        period = month_period or quarter_period
+        if period:
+            return f"revenue:{period}"
+        return f"revenue:{published_day}:{numeric_sig or 'no-number'}"
+
+    financial_terms = ["財報", "每股盈餘", "eps", "毛利率", "營業利益", "稅後淨利", "獲利"]
+    if any(term in lower for term in financial_terms):
+        period = quarter_period or month_period or published_day
+        return f"earnings:{period}:{numeric_sig or 'no-number'}"
+
+    if any(term in lower for term in ["目標價", "評等", "升評", "降評", "買進評等", "中立評等"]):
+        return f"rating:{published_day}:{numeric_sig or _title_compare_text(s)[:40]}"
+
+    event_families = [
+        ("dividend", ["股利", "配息", "除息", "除權"]),
+        ("board", ["董事會", "股東會", "決議"]),
+        ("guidance", ["法說", "展望", "財測"]),
+        ("capacity", ["擴產", "新產能", "量產", "新廠"]),
+        ("order", ["接單", "訂單", "合約", "標案"]),
+        ("product", ["新品", "新產品", "新平台"]),
+        ("etf_index", ["etf", "指數", "成分股", "被動資金"]),
+    ]
+    for family, keywords in event_families:
+        if any(keyword in lower for keyword in keywords):
+            compact = _title_compare_text(s)
+            for removable in [stock_code, stock_name, "新聞", "即時", "公告", "MoneyDJ理財網"]:
+                if removable:
+                    compact = compact.replace(_title_compare_text(removable), "")
+            anchor = re.sub(r"\d+(?:\.\d+)?", "", compact)[:36]
+            return f"{family}:{published_day}:{numeric_sig}:{anchor}"
+
+    compact = _title_compare_text(s)
+    for removable in [stock_code, stock_name, "新聞", "即時", "公告", "MoneyDJ理財網"]:
+        if removable:
+            compact = compact.replace(_title_compare_text(removable), "")
+    return f"text:{compact[:120]}" if compact else ""
+
+
+def _news_article_event_key(article: dict, stock_code: str = "", stock_name: str = "") -> str:
+    if not isinstance(article, dict):
+        return ""
+    existing = str(article.get("event_key", "") or "").strip()
+    if existing:
+        return existing
+    combined = _normalize_news_text(
+        "。".join([
+            str(article.get("title", "") or ""),
+            str(article.get("description", "") or ""),
+            str(article.get("content", article.get("body", "")) or ""),
+        ])
+    )
+    return _news_event_fingerprint(
+        combined,
+        published=str(article.get("published", "") or ""),
+        stock_code=stock_code,
+        stock_name=stock_name,
+    )
+
+
+def _dedupe_news_articles_by_event(
+    articles: List[dict],
+    stock_code: str = "",
+    stock_name: str = "",
+    limit: int = 0,
+    log_label: str = "新聞素材",
+) -> List[dict]:
+    """依事件去重並保留原排序中的最佳文章。"""
+    result = []
+    seen_events = set()
+    seen_titles = set()
+    removed = 0
+
+    for raw_article in articles or []:
+        article = dict(raw_article or {})
+        title_key = _article_seen_key(article.get("title", ""), article.get("url", ""))
+        event_key = _news_article_event_key(article, stock_code, stock_name)
+        if (title_key and title_key in seen_titles) or (event_key and event_key in seen_events):
+            removed += 1
+            continue
+        if title_key:
+            seen_titles.add(title_key)
+        if event_key:
+            seen_events.add(event_key)
+            article["event_key"] = event_key
+        result.append(article)
+        if limit > 0 and len(result) >= limit:
+            break
+
+    if removed > 0:
+        print(f"🧹 {log_label}事件去重：移除 {removed} 篇重複事件｜保留 {len(result)} 篇")
+    return result
+
+
+def _news_point_event_key(
+    point: str,
+    stock_code: str = "",
+    stock_name: str = "",
+    source_article: dict | None = None,
+) -> str:
+    """建立輸出新聞點的事件鍵；優先依 point 本身判斷，再參考來源文章。"""
+    fields = _parse_report_point_fields(point)
+    point_text = _normalize_news_text(
+        "。".join([
+            str(fields.get("label", "") or ""),
+            str(fields.get("status", "") or ""),
+            str(fields.get("detail", "") or ""),
+        ])
+    )
+    point_key = _news_event_fingerprint(
+        point_text,
+        stock_code=stock_code,
+        stock_name=stock_name,
+    )
+
+    source_key = ""
+    if isinstance(source_article, dict):
+        source_key = _news_article_event_key(source_article, stock_code, stock_name)
+
+    # point 常只有「6月」而沒有年份；來源文章帶有發布日期，可補成 2026-06。
+    # 只有事件家族一致時才採來源鍵，避免一篇多事件文章把不同題材誤合併。
+    if point_key and source_key:
+        point_family = point_key.split(":", 1)[0]
+        source_family = source_key.split(":", 1)[0]
+        if point_family == source_family and point_family != "text":
+            return source_key
+
+    if point_key and not point_key.startswith("text:"):
+        return point_key
+    if source_key:
+        return source_key
+    return point_key
+
+
+def _dedupe_news_points_by_event(
+    points: List[str],
+    stock_code: str = "",
+    stock_name: str = "",
+    log_label: str = "新聞重點",
+) -> List[str]:
+    """最終新聞顯示前的事件級防線；同月份營收最多保留一點。"""
+    result = []
+    seen_text = set()
+    seen_events = set()
+    removed = 0
+
+    for raw_point in points or []:
+        point = str(raw_point or "").strip()
+        text_key = _title_compare_text(point)
+        event_key = _news_point_event_key(point, stock_code, stock_name)
+        if not point or not text_key:
+            continue
+        if text_key in seen_text or (event_key and event_key in seen_events):
+            removed += 1
+            continue
+        seen_text.add(text_key)
+        if event_key:
+            seen_events.add(event_key)
+        result.append(point)
+
+    if removed > 0:
+        print(f"🧹 {log_label}事件去重：移除 {removed} 個重複事件｜保留 {len(result)} 點")
+    return result
+
+
 def _build_fast_rss_news_content(title: str, description: str, source: str = "", published: str = "") -> str:
     """極速模式用：只保留可讀摘要，不把標題／來源／日期混進內文，避免 Gemini 直接複製標題。"""
     title = _clean_news_title(title)
@@ -7683,12 +7968,18 @@ def _news_article_usable(article: dict) -> bool:
     return bool(article and (article.get("body_ok") or article.get("fallback_ok")))
 
 
-def _count_distinct_usable_news_articles(articles: List[dict]) -> int:
+def _count_distinct_usable_news_articles(
+    articles: List[dict],
+    stock_code: str = "",
+    stock_name: str = "",
+) -> int:
     seen = set()
     for article in articles or []:
         if not _news_article_usable(article):
             continue
-        key = _article_seen_key(article.get("title", ""), article.get("url", ""))
+        key = _news_article_event_key(article, stock_code, stock_name)
+        if not key:
+            key = _article_seen_key(article.get("title", ""), article.get("url", ""))
         if not key:
             key = _normalize_news_text(article.get("content", ""))[:120]
         if key:
@@ -7836,6 +8127,14 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
         return (-int(a.get("relevance_score", 0) or 0), body_rank, -dt.timestamp() if dt != datetime.min else 0)
 
     merged = sorted(merged, key=sort_key)
+    # 先依事件去重，再做來源多樣化；避免同一月份營收因來自 Google／Yahoo／MoneyDJ
+    # 而各占一個名額，最後送進 Gemini 的其實仍是同一件事。
+    merged = _dedupe_news_articles_by_event(
+        merged,
+        stock_code,
+        stock_name,
+        log_label="多來源新聞",
+    )
 
     # 先取各來源的第一篇，避免最後又全部只剩單一聚合來源；再依總分補滿。
     selected = []
@@ -7885,7 +8184,7 @@ def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items
         min(max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT)), max(minimum_needed, int(max_items))),
     )
     articles = _merge_and_rank_news_articles(groups, stock_code, stock_name, limit=limit)
-    distinct_count = _count_distinct_usable_news_articles(articles)
+    distinct_count = _count_distinct_usable_news_articles(articles, stock_code, stock_name)
 
     source_counts = {}
     for article in articles:
@@ -7965,7 +8264,17 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
     required_usable_count = fetch_limit if fast_mode else max(3, min(fetch_limit, int(NEWS_GOOGLE_MIN_USABLE_ARTICLES)))
 
     def enough_articles() -> bool:
-        return usable_count_now() >= required_usable_count
+        usable_count = usable_count_now()
+        distinct_needed = min(
+            max(1, int(NEWS_MIN_DISTINCT_ARTICLES)),
+            max(1, int(required_usable_count)),
+        )
+        distinct_count = _count_distinct_usable_news_articles(
+            all_articles,
+            stock_code,
+            stock_name,
+        )
+        return usable_count >= required_usable_count and distinct_count >= distinct_needed
 
     def build_article_from_candidate(candidate: dict) -> dict:
         title = candidate.get("title", "")
@@ -8199,6 +8508,13 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         return (usable_rank, days_rank, relevance_rank, -published_dt.timestamp() if published_dt != datetime.min else 0)
 
     all_articles = sorted(all_articles, key=_sort_key)
+    all_articles = _dedupe_news_articles_by_event(
+        all_articles,
+        stock_code,
+        stock_name,
+        limit=fetch_limit,
+        log_label="Google News",
+    )
     return all_articles[:fetch_limit]
 
 def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
@@ -8912,6 +9228,12 @@ def _parse_gemini_news_points(
     points = []
     rejected = []
     seen = set()
+    seen_events = set()
+    article_by_id = {
+        str(article.get("id", "") or "").strip(): article
+        for article in usable_articles or []
+        if str(article.get("id", "") or "").strip()
+    }
     for item in raw_items:
         ok, reason = _validate_news_point_evidence(
             item,
@@ -8949,10 +9271,25 @@ def _parse_gemini_news_points(
             continue
 
         key = _title_compare_text(point)
+        source_id = str(item.get("source_id", "") or "").strip() if isinstance(item, dict) else ""
+        event_key = _news_point_event_key(
+            point,
+            stock_code,
+            stock_name,
+            source_article=article_by_id.get(source_id),
+        )
         if not key or key in seen:
+            continue
+        if event_key and event_key in seen_events:
+            print(
+                f"🧹 Gemini 新聞事件去重：略過同一事件的重複點｜"
+                f"source_id={source_id or '-'}｜event_key={event_key}"
+            )
             continue
         points.append(point)
         seen.add(key)
+        if event_key:
+            seen_events.add(event_key)
         if len(points) >= NEWS_SUMMARY_MAX_POINTS:
             break
 
@@ -9103,20 +9440,20 @@ def _build_news_length_only_payload(points: List[str]) -> List[dict]:
     return payload
 
 
-def _merge_distinct_news_points(primary: List[str], supplements: List[str]) -> List[str]:
-    """合併補點，只保留不同文字事件，最多保留新聞點數上限。"""
-    merged = []
-    seen = set()
-    for point in list(primary or []) + list(supplements or []):
-        cleaned = str(point or "").strip()
-        key = _title_compare_text(cleaned)
-        if not cleaned or not key or key in seen:
-            continue
-        merged.append(cleaned)
-        seen.add(key)
-        if len(merged) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return merged
+def _merge_distinct_news_points(
+    primary: List[str],
+    supplements: List[str],
+    stock_code: str = "",
+    stock_name: str = "",
+) -> List[str]:
+    """合併補點並做事件級去重，最多保留新聞點數上限。"""
+    merged = _dedupe_news_points_by_event(
+        list(primary or []) + list(supplements or []),
+        stock_code,
+        stock_name,
+        log_label="新聞補點",
+    )
+    return merged[:NEWS_SUMMARY_MAX_POINTS]
 
 def _get_warrants_api_keys() -> List[str]:
     """讀取 Gemini API Key 清單；GitHub Actions 可設定 WARRANTS_API_KEY、WARRANTS_API_KEY_2、WARRANTS_API_KEY_3。"""
@@ -9585,40 +9922,8 @@ def _is_direct_fetchable_news_article_url(url: str) -> bool:
 
 
 def _hybrid_news_event_key(record: dict, stock_code: str = "", stock_name: str = "") -> str:
-    """建立混合模式用的事件鍵，避免同一營收或公司事件重複占滿 top-K。"""
-    text = _normalize_news_text(
-        f"{record.get('title', '')} {record.get('description', '')} {record.get('content', '')}"
-    )
-    compact = _title_compare_text(text)
-    if not compact:
-        return str(record.get("url", "") or "").strip()
-
-    # 月營收新聞常有多個來源與不同標題，但屬於同一事件。
-    if "營收" in text:
-        month_match = re.search(r"(?:20\d{2}[年/.-]?)?0?([1-9]|1[0-2])月", text)
-        month_key = month_match.group(1) if month_match else "unknown"
-        # 同一個月營收常有些標題帶年份、有些不帶；混合補抓時以月份視為同一事件。
-        return f"revenue:{month_key}"
-
-    event_families = [
-        ("board", ["董事會", "股東會", "決議"]),
-        ("dividend", ["股利", "配息", "除息", "除權"]),
-        ("earnings", ["財報", "獲利", "EPS", "每股盈餘"]),
-        ("guidance", ["法說", "展望", "財測"]),
-        ("capacity", ["擴產", "新產能", "量產", "新廠"]),
-        ("order", ["接單", "訂單", "出貨"]),
-        ("product", ["新品", "新產品", "新平台"]),
-        ("etf_index", ["ETF", "指數", "成分股", "被動資金"]),
-    ]
-    for family, keywords in event_families:
-        if any(keyword.lower() in text.lower() for keyword in keywords):
-            return f"{family}:{str(record.get('published', '') or '')[:10]}"
-
-    for removable in [stock_code, stock_name, "新聞", "即時", "公告", "MoneyDJ理財網"]:
-        if removable:
-            compact = compact.replace(_title_compare_text(removable), "")
-    compact = re.sub(r"\d+(?:\.\d+)?", "", compact)
-    return compact[:48] or str(record.get("url", "") or "").strip()
+    """建立混合模式用的事件鍵；與新聞素材／輸出點共用同一套事件去重規則。"""
+    return _news_article_event_key(record, stock_code, stock_name)
 
 
 def _enrich_fast_news_records_with_topk_bodies(
@@ -9791,6 +10096,7 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
     3. 標題或摘要明確包含本股票代號 / 名稱，且有營收、法說、接單、目標價等公司資訊時，允許短素材進 Gemini。
     """
     usable = []
+    seen_event_keys = set()
     ordered = [r for r in records if r.get("body_ok") or r.get("fallback_ok")]
     for rec in ordered:
         title = _clean_news_title(rec.get("title", ""))
@@ -9849,6 +10155,18 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
             print(f"⚠️ 略過多股混雜新聞：{title[:36]}｜找不到足夠的 {stock_code} {stock_name} 明確片段")
             continue
 
+        event_key = _news_event_fingerprint(
+            f"{title}。{focused_content}",
+            published=str(rec.get("published", "") or ""),
+            stock_code=stock_code,
+            stock_name=stock_name,
+        )
+        if event_key and event_key in seen_event_keys:
+            print(f"🧹 送入 Gemini 前事件去重：略過重複事件｜{event_key}｜{title[:36]}")
+            continue
+        if event_key:
+            seen_event_keys.add(event_key)
+
         usable.append({
             "id": f"A{len(usable) + 1}",
             "source": rec.get("source", ""),
@@ -9856,6 +10174,7 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
             "published": rec.get("published", ""),
             "url": rec.get("url", ""),
             "content_source": content_source,
+            "event_key": event_key,
             "target_aliases": aliases,
             "body": focused_content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
         })
@@ -9875,6 +10194,12 @@ def _save_validated_news_points_cache(
     # 只把已通過解析與品質檢查的新聞重點寫入 Google Sheet 快取。
     valid_points = _clean_news_summary_points_for_stock(points or [], stock_code, stock_name)
     valid_points = [p for p in valid_points if _points_are_independent_and_complete([p])]
+    valid_points = _dedupe_news_points_by_event(
+        valid_points,
+        stock_code,
+        stock_name,
+        log_label="新聞快取寫入前",
+    )
     if not valid_points:
         print("⚠️ 新聞重點未通過品質檢查，不寫入 Gemini 快取")
         return
@@ -9912,7 +10237,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你是台股財經新聞編輯。只能使用下方素材，整理 {stock_code} {display_name} 的新聞／題材重點，使用繁體中文。
 
 分析原則：
-1. 請盡量輸出 {NEWS_SUMMARY_MAX_POINTS} 點，並涵蓋不同面向（公司動態／業績／產業供需／法人觀點）；素材不足時才減少點數，完全沒有直接相關事件時回傳空陣列。同一事件多來源合併，不得拿股價漲跌、熱門排行或大盤盤勢湊數。
+1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，只有「不同事件」才能分成不同點；寧可只輸出 1 點，也不得為了湊點數拆分同一事件。同一月份營收、同一份財報、同一公告或同一法人報告，即使來源、標題、source_id 不同，也只能保留 1 點；不得拿股價漲跌、熱門排行或大盤盤勢湊數。
 2. 每個 points item 必須回傳 label、status、detail、tone、confidence、source_id、evidence；status 不可寫「重點待確認」「題材待觀察」等空句。
 2-1. tone 只能是 positive、negative、neutral、mixed、watch：明確利多用 positive，明確利空用 negative，正負並存用 mixed，無明確方向用 neutral，單純後續觀察用 watch。
 2-2. 「受關注」不等於 positive；創新高必須確認是營收、獲利、毛利率、接單等正向指標，若是虧損、庫存、負債創高則為 negative。
@@ -9973,7 +10298,10 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         content_problems.append("含素材找不到的數字：" + _format_ungrounded_number_problems(ungrounded))
     detail_length_problems = _find_news_detail_length_problems(points)
     length_only_points = _build_news_length_only_payload(points)
-    if points and _count_summary_chars(points) < NEWS_SUMMARY_MIN_TOTAL_CHARS:
+    if (
+        len(points) >= NEWS_SUPPLEMENT_TRIGGER_POINTS
+        and _count_summary_chars(points) < NEWS_SUMMARY_MIN_TOTAL_CHARS
+    ):
         content_problems.append(
             f"總字數約 {_count_summary_chars(points)} 字，低於 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字"
         )
@@ -10004,7 +10332,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你是台股財經新聞編輯。上一版輸出未通過檢查，請只依修正資料重新整理 {stock_code} {display_name}。
 
 修正原則：
-1. 請盡量輸出 {NEWS_SUMMARY_MAX_POINTS} 點不同事件並涵蓋公司動態、業績、產業供需或法人觀點；素材不足時才減少，完全沒有直接相關事件時才輸出空陣列。每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。
+1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，而且每點必須是不同事件；同一月份營收、同一份財報、同一公告或同一法人報告不論來源多少都只能保留 1 點。寧可只輸出 1 點，也不得湊滿。每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。
 2. 每點必須獨立完整；tone 只能是 positive、negative、neutral、mixed、watch，並依事件真正方向判斷，不得把「受關注」直接當利多。
 2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向；不得只寫「創新高」「供給緊縮」「需求強勁」等 2～4 字詞語。status 不要以 {display_name} 或股票代號 {stock_code} 開頭（圖卡主體已是該公司）。
 3. source_id 必須存在於 articles；evidence 必須逐字抄自該文章的一句原文，而且 evidence 所在句或其前一句必須明確出現 {stock_code} 或 {display_name}。
@@ -10021,7 +10349,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v26",
+            cache_task=f"{_news_points_cache_task()}_repair_v27",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
@@ -10149,7 +10477,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             )
             supplement_text = _call_gemini_with_retry(
                 supplement_prompt,
-                cache_task=f"{_news_points_cache_task()}_supplement_v26",
+                cache_task=f"{_news_points_cache_task()}_supplement_v27",
                 stock_code=stock_code,
                 stock_name=stock_name,
                 write_cache=False,
@@ -10192,7 +10520,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
                 valid_supplement_points.append(point)
 
             before_count = len(points)
-            points = _merge_distinct_news_points(points, valid_supplement_points)
+            points = _merge_distinct_news_points(points, valid_supplement_points, stock_code, stock_name)
             added_count = max(0, len(points) - before_count)
             if added_count > 0:
                 print(
@@ -10201,6 +10529,13 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
                 )
             else:
                 print("ℹ️ Gemini 新聞補點未找到另一個通過驗證的不同事件，保留原結果")
+
+    points = _dedupe_news_points_by_event(
+        points,
+        stock_code,
+        stock_name,
+        log_label="新聞最終輸出前",
+    )[:NEWS_SUMMARY_MAX_POINTS]
 
     final_ungrounded = _find_ungrounded_number_tokens(
         points,
@@ -12257,9 +12592,15 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     return []
 
 def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_name: str, ctx: dict | None = None) -> List[str]:
-    """只顯示真正通過品質門檻的新聞；結構化重點不得被一般標題分隔符誤刪。"""
+    """只顯示真正通過品質門檻的新聞，並在顯示前做最後一次事件級去重。"""
     cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
     cleaned = [p for p in cleaned if _points_are_independent_and_complete([p])]
+    cleaned = _dedupe_news_points_by_event(
+        cleaned,
+        stock_code,
+        stock_name,
+        log_label="新聞顯示前",
+    )
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
 def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
