@@ -215,9 +215,9 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金,福邦證券").strip()
 
 # FinMind 全市場權證分點包含完整買賣雙邊，直接把所有分點加總時淨額會接近 0。
-# 週報上方「權證資金流」改為逐檔權證辨識發行券商，僅排除該檔權證的發行／造市總公司列；
-# 不再把其他券商總公司一併刪除，避免把正常投資人委託誤刪。
-# TOP5 與精選分點仍沿用原本邏輯。
+# 上方「權證資金流」與 TOP5 先逐檔辨識發行商，只排除該權證的發行／造市總公司列；
+# TOP5 再沿用原本的總公司／自營型分點過濾，正常地方分點仍保留。
+# 下方精選分點固定使用完整原始資料，不受上述排除影響。
 WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv(
     "WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
     "1",
@@ -452,6 +452,7 @@ _FETCH_STATS = {}
 _GSPREAD_CLIENT_CACHE = None
 _GSHEET_HANDLE_CACHE = None
 _WARRANT_CACHE_GSHEET_HANDLE_CACHE = None
+_WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN = False
 _WARRANT_FAST_FALLBACK_LIVE_ACTIVE = False
 _WARRANT_FAST_FALLBACK_LIVE_LOCK = threading.RLock()
 _GSHEET_CONNECTION_LOCK = threading.RLock()
@@ -2498,8 +2499,11 @@ def _open_gsheet(force_refresh: bool = False):
 
 
 def _open_warrant_cache_gsheet(force_refresh: bool = False, create_if_missing: bool = True):
-    """開啟權證完整快照專用試算表；讀取快取時可禁止自動建立，避免無快取時先花時間建表。"""
-    global _WARRANT_CACHE_GSHEET_HANDLE_CACHE
+    """開啟權證完整快照專用試算表；同次執行遇到 Drive 配額錯誤後不再重試。"""
+    global _WARRANT_CACHE_GSHEET_HANDLE_CACHE, _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN
+
+    if _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN and not force_refresh:
+        return None
 
     if not WARRANT_CACHE_USE_SEPARATE_SHEET:
         return _open_gsheet(force_refresh=force_refresh)
@@ -2534,7 +2538,14 @@ def _open_warrant_cache_gsheet(force_refresh: bool = False, create_if_missing: b
             return sh
         except Exception as e:
             _WARRANT_CACHE_GSHEET_HANDLE_CACHE = None
-            print(f"⚠️ 權證快取試算表開啟失敗：{e}")
+            error_text = str(e or "")
+            if any(token in error_text.lower() for token in [
+                "storage quota", "quota has been exceeded", "drive storage quota", "insufficient storage",
+            ]):
+                _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN = True
+                print(f"⚠️ 權證快取試算表開啟失敗：{e}｜本次執行不再重試權證快取")
+            else:
+                print(f"⚠️ 權證快取試算表開啟失敗：{e}")
             return None
 
 
@@ -5592,19 +5603,176 @@ def _finmind_is_issuer_hq_or_market_maker_branch(
     return False
 
 
+
+def _official_row_value(row: dict, candidates: List[str]) -> str:
+    """以大小寫與符號寬鬆方式取得官方欄位值。"""
+    if not isinstance(row, dict):
+        return ""
+    for key in candidates:
+        if key in row and str(row.get(key, "") or "").strip():
+            return str(row.get(key, "") or "").strip()
+    normalized = {
+        re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(k or "").lower()): k
+        for k in row.keys()
+    }
+    for key in candidates:
+        nk = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(key or "").lower())
+        actual = normalized.get(nk)
+        if actual is not None and str(row.get(actual, "") or "").strip():
+            return str(row.get(actual, "") or "").strip()
+    return ""
+
+
+def _fetch_official_warrant_issuer_source(url: str, source_label: str) -> tuple[dict, pd.DataFrame]:
+    """讀取官方權證資料，建立「權證代號 → 發行商」對照；欄位未知時保留完整 Debug。"""
+    try:
+        response = get_thread_session().get(
+            url,
+            headers=OPENAPI_WARRANT_HEADERS,
+            timeout=(8, 45),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            rows = payload.get("data", payload.get("records", payload.get("result", [])))
+        else:
+            rows = payload
+        if not isinstance(rows, list):
+            raise RuntimeError(f"官方回應不是 list：type={type(rows).__name__}")
+        raw = pd.DataFrame(rows).fillna("")
+        if raw.empty:
+            print(f"ℹ️ {source_label} 無資料")
+            return {}, raw
+
+        code_fields = [
+            "權證代號", "證券代號", "代號", "warrant_code", "WarrantCode",
+            "SecuritiesCode", "SecurityCode", "stock_id", "StockId",
+        ]
+        name_fields = [
+            "權證名稱", "證券名稱", "名稱", "warrant_name", "WarrantName",
+            "SecuritiesName", "SecurityName", "stock_name", "StockName",
+        ]
+        issuer_code_fields = [
+            "發行人代號", "發行券商代號", "issuer_code", "IssuerCode",
+            "SecuritiesCompanyCode", "SecuritiesFirmCode", "BrokerCode",
+        ]
+        issuer_name_fields = [
+            "發行人名稱", "發行券商", "發行券商名稱", "issuer_name", "IssuerName",
+            "SecuritiesCompany", "SecuritiesCompanyName", "SecuritiesFirmName", "BrokerName",
+        ]
+        liquidity_fields = [
+            "流動量提供者", "流動量提供者證券商", "造市商", "造市券商",
+            "liquidity_provider", "LiquidityProvider", "LiquidityProviderName", "MarketMaker",
+        ]
+
+        result = {}
+        explicit_count = 0
+        name_fallback_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = normalize_openapi_warrant_code(_official_row_value(row, code_fields))
+            if not code:
+                continue
+            official_name = _official_row_value(row, name_fields)
+            issuer_code = _official_row_value(row, issuer_code_fields)
+            issuer_name = _official_row_value(row, issuer_name_fields)
+            liquidity_provider = _official_row_value(row, liquidity_fields)
+
+            issuer_key = (
+                _finmind_canonical_issuer_key(liquidity_provider)
+                or _finmind_canonical_issuer_key(issuer_name)
+            )
+            match_method = "official_field" if issuer_key else ""
+            if issuer_key:
+                explicit_count += 1
+            elif official_name:
+                issuer_key = _finmind_extract_warrant_issuer_key(official_name, "")
+                if issuer_key:
+                    name_fallback_count += 1
+                    match_method = "official_name"
+
+            if not issuer_key and not official_name and not issuer_name and not liquidity_provider:
+                continue
+
+            rec = {
+                "issuer_key": issuer_key,
+                "issuer_code": issuer_code,
+                "issuer_name": issuer_name,
+                "liquidity_provider": liquidity_provider,
+                "official_warrant_name": official_name,
+                "source": source_label,
+                "match_method": match_method or "unresolved",
+            }
+            old = result.get(code)
+            # 有官方發行人／流動量提供者欄位者優先於只靠權證名稱解析者。
+            if old is None or (old.get("match_method") != "official_field" and match_method == "official_field"):
+                result[code] = rec
+
+        print(
+            f"✅ {source_label} 發行商對照：權證={len(result):,}｜"
+            f"官方欄位={explicit_count:,}｜官方名稱解析={name_fallback_count:,}"
+        )
+        if FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE and not result:
+            _finmind_debug_print_df(
+                f"{source_label} 無法辨識發行商，實際欄位",
+                raw,
+                once_key=f"official-issuer-schema:{source_label}",
+            )
+        return result, raw
+    except Exception as exc:
+        print(f"⚠️ {source_label} 發行商資料讀取失敗，改用其他官方來源／權證名稱：{exc}")
+        return {}, pd.DataFrame()
+
+
+def _finmind_official_warrant_issuer_map(force_refresh: bool = False) -> dict:
+    """官方來源優先建立權證發行商對照，同一個 Python process 只下載一次。"""
+    global _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE
+    if not FINMIND_OFFICIAL_ISSUER_ENABLE:
+        return {}
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        if _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE is not None and not force_refresh:
+            return dict(_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE)
+
+    sources = [
+        (TWSE_WARRANT_ISSUER_OPENAPI_URL, "TWSE 官方權證資料"),
+        (TPEX_WARRANT_ISSUER_OPENAPI_URL, "TPEx 官方權證發行資料"),
+    ]
+    combined = {}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_map = {
+            executor.submit(_fetch_official_warrant_issuer_source, url, label): label
+            for url, label in sources
+        }
+        for future in as_completed(future_map):
+            try:
+                mapping, _ = future.result()
+            except Exception as exc:
+                print(f"⚠️ {future_map[future]} 發行商對照工作失敗：{exc}")
+                mapping = {}
+            for code, rec in mapping.items():
+                old = combined.get(code)
+                if old is None or (old.get("match_method") != "official_field" and rec.get("match_method") == "official_field"):
+                    combined[code] = rec
+
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = dict(combined)
+    print(f"📦 官方權證發行商合併對照：{len(combined):,} 支")
+    return combined
+
 def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) -> pd.DataFrame:
-    """建立週報上方「權證資金流」的 FinMind 對應口徑。
+    """建立上方權證資金流與 TOP5 的可解讀口徑。
 
-    FinMind SponsorPro 是完整成交雙邊資料；每檔權證的投資人買進，會同時對應發行券商
-    造市端賣出。若全部相加，淨額必然接近 0。這裡逐檔由 warrant_name 辨識發行券商，
-    只排除該檔權證的發行券商總公司／自營／造市列，保留所有其他一般分點。
+    先以官方權證資料辨識每支權證的發行商／流動量提供者；官方欄位缺少時，
+    才使用官方權證名稱，再不行才使用 FinMind 權證名稱。只排除「該支權證」
+    對應發行券商的總公司／自營／權證／造市端，保留同券商一般地方分點。
 
-    精選分點與 TOP5 不直接呼叫本函式，因此不會被這個口徑改動。
+    上方權證資金流與 TOP5 使用本函式結果；下方精選分點固定使用未排除的原始事件。
     """
     if events_df is None or events_df.empty:
         return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
     if not FINMIND_ISSUER_FLOW_ENABLE:
-        print("ℹ️ FinMind 發行券商造市端排除已關閉；上方權證資金流將使用完整雙邊資料")
+        print("ℹ️ FinMind 發行券商造市端排除已關閉；權證資金流將使用完整雙邊資料")
         return events_df.copy()
 
     required = {"warrant_code", "warrant_name", "branch", "broker_code", "buy_amount", "sell_amount", "net_amount"}
@@ -5618,14 +5786,47 @@ def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) 
         e[col] = pd.to_numeric(e[col], errors="coerce").fillna(0.0).astype(float)
     e["branch"] = e["branch"].astype(str).map(normalize_branch_name)
     e["broker_code"] = e["broker_code"].astype(str).str.strip()
+    e["warrant_code"] = e["warrant_code"].map(normalize_openapi_warrant_code)
     e["warrant_name"] = e["warrant_name"].astype(str).str.strip()
     if "underlying_name" not in e.columns:
         e["underlying_name"] = ""
 
-    e["_issuer_key"] = [
-        _finmind_extract_warrant_issuer_key(wname, uname)
-        for wname, uname in zip(e["warrant_name"], e["underlying_name"])
-    ]
+    official_map = _finmind_official_warrant_issuer_map()
+    issuer_keys = []
+    issuer_sources = []
+    official_issuer_names = []
+    official_liquidity_names = []
+    official_field_count = 0
+    official_name_count = 0
+    finmind_name_count = 0
+
+    for code, wname, uname in zip(e["warrant_code"], e["warrant_name"], e["underlying_name"]):
+        rec = official_map.get(str(code), {})
+        key = str(rec.get("issuer_key", "") or "").strip()
+        method = str(rec.get("match_method", "") or "").strip()
+        source = str(rec.get("source", "") or "").strip()
+        if key and method == "official_field":
+            official_field_count += 1
+            issuer_source = f"{source}:official_field"
+        elif key:
+            official_name_count += 1
+            issuer_source = f"{source}:official_name"
+        else:
+            key = _finmind_extract_warrant_issuer_key(wname, uname)
+            if key:
+                finmind_name_count += 1
+                issuer_source = "FinMind權證名稱解析"
+            else:
+                issuer_source = "unresolved"
+        issuer_keys.append(key)
+        issuer_sources.append(issuer_source)
+        official_issuer_names.append(str(rec.get("issuer_name", "") or ""))
+        official_liquidity_names.append(str(rec.get("liquidity_provider", "") or ""))
+
+    e["_issuer_key"] = issuer_keys
+    e["_issuer_source"] = issuer_sources
+    e["_official_issuer_name"] = official_issuer_names
+    e["_official_liquidity_provider"] = official_liquidity_names
     e["_branch_issuer_key"] = e["branch"].map(_finmind_canonical_issuer_key)
     e["_issuer_same_broker"] = (
         (e["_issuer_key"] != "")
@@ -5650,74 +5851,53 @@ def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) 
     parsed_warrants = int(e.loc[e["_issuer_key"] != "", "warrant_code"].nunique())
     total_warrants = int(e["warrant_code"].nunique())
     print(
-        "💰 FinMind 權證資金流口徑：逐檔排除發行券商總公司／自營／造市端｜"
+        "💰 FinMind 權證資金流口徑：逐檔排除官方辨識的發行造市端｜"
         f"權證辨識={parsed_warrants}/{total_warrants}｜排除={len(removed):,}筆｜保留={len(kept):,}筆"
+    )
+    print(
+        "🔎 發行商辨識來源："
+        f"官方欄位列={official_field_count:,}｜官方名稱列={official_name_count:,}｜"
+        f"FinMind名稱備援列={finmind_name_count:,}"
     )
     print(
         f"💰 權證資金流檢查：原始買進={fmt_money(raw_buy)}｜原始賣出={fmt_money(-raw_sell)}｜原始淨額={fmt_money(raw_net)}｜"
         f"排除後買進={fmt_money(kept_buy)}｜排除後賣出={fmt_money(-kept_sell)}｜排除後淨額={fmt_money(kept_net)}"
     )
 
-    if FINMIND_ISSUER_FLOW_DEBUG_ENABLE:
-        unknown = (
-            e.loc[e["_issuer_key"] == "", ["warrant_code", "warrant_name", "underlying_name"]]
-            .drop_duplicates()
-            .head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS)
+    unknown = e.loc[e["_issuer_key"] == ""].copy()
+    if not unknown.empty and FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE:
+        unknown_summary = unknown[[
+            "warrant_code", "warrant_name", "underlying_name", "_issuer_source",
+            "_official_issuer_name", "_official_liquidity_provider",
+        ]].drop_duplicates().head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS)
+        print("🧪 發行商仍無法辨識的權證（請複製此區塊）：")
+        print(unknown_summary.to_string(index=False))
+
+    if FINMIND_ISSUER_FLOW_DEBUG_ENABLE and not removed.empty:
+        removed_summary = (
+            removed.groupby(
+                ["warrant_code", "warrant_name", "_issuer_key", "_issuer_source", "broker_code", "branch"],
+                as_index=False,
+                dropna=False,
+            )
+            .agg(
+                rows=("net_amount", "size"),
+                buy_amount=("buy_amount", "sum"),
+                sell_amount=("sell_amount", "sum"),
+                net_amount=("net_amount", "sum"),
+            )
         )
-        if not unknown.empty:
-            print("🧪 FinMind 發行券商辨識失敗的權證名稱（請保留此區塊）：")
-            print(unknown.to_string(index=False))
-
-        if not removed.empty:
-            removed_summary = (
-                removed.groupby(
-                    ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch"],
-                    as_index=False,
-                    dropna=False,
-                )
-                .agg(
-                    rows=("net_amount", "size"),
-                    buy_amount=("buy_amount", "sum"),
-                    sell_amount=("sell_amount", "sum"),
-                    net_amount=("net_amount", "sum"),
-                )
-            )
-            removed_summary["abs_net"] = removed_summary["net_amount"].abs()
-            removed_summary = removed_summary.sort_values(
-                ["abs_net", "rows"], ascending=[False, False]
-            ).drop(columns=["abs_net"])
-            print("🧪 FinMind 逐檔排除的發行券商造市列（前幾筆）：")
-            print(removed_summary.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
-        else:
-            print("⚠️ FinMind 沒有辨識到任何發行券商造市列；上方資金流仍可能維持 0")
-
-        same_issuer_not_removed = e.loc[
-            e["_issuer_same_broker"] & ~e["_issuer_market_maker"],
-            ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch", "buy_amount", "sell_amount", "net_amount"],
-        ].copy()
-        if not same_issuer_not_removed.empty:
-            check = (
-                same_issuer_not_removed.groupby(
-                    ["warrant_code", "warrant_name", "_issuer_key", "broker_code", "branch"],
-                    as_index=False,
-                    dropna=False,
-                )
-                .agg(
-                    rows=("net_amount", "size"),
-                    buy_amount=("buy_amount", "sum"),
-                    sell_amount=("sell_amount", "sum"),
-                    net_amount=("net_amount", "sum"),
-                )
-            )
-            check["gross"] = check["buy_amount"] + check["sell_amount"]
-            check = check.sort_values(["gross", "rows"], ascending=[False, False]).drop(columns=["gross"])
-            print("🧪 同發行券商但被保留的地方分點（確認未誤刪）：")
-            print(check.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
+        removed_summary["abs_net"] = removed_summary["net_amount"].abs()
+        removed_summary = removed_summary.sort_values(
+            ["abs_net", "rows"], ascending=[False, False]
+        ).drop(columns=["abs_net"])
+        print("🧪 逐檔排除的發行券商造市列（前幾筆）：")
+        print(removed_summary.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
 
     return kept.drop(columns=[
-        "_issuer_key", "_branch_issuer_key", "_issuer_same_broker", "_issuer_market_maker",
+        "_issuer_key", "_issuer_source", "_official_issuer_name", "_official_liquidity_provider",
+        "_branch_issuer_key", "_issuer_same_broker", "_issuer_market_maker",
     ], errors="ignore").reset_index(drop=True)
-
 
 def filter_warrant_flow_investor_branches(events_df: pd.DataFrame) -> pd.DataFrame:
     """建立可解讀的權證資金流口徑。
@@ -5869,6 +6049,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
     if warrant_events is None or warrant_events.empty:
         week_events = pd.DataFrame(columns=["Date", "branch", "warrant_code", "warrant_name", "buy_amount", "sell_amount", "net_amount"])
         plot_events = week_events.copy()
+        raw_week_events = week_events.copy()
+        raw_plot_events = week_events.copy()
     else:
         e = warrant_events.copy()
         if "branch" in e.columns:
@@ -5892,21 +6074,26 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             )
             hedge_removed = 0
 
-        # FinMind 是完整成交雙邊資料。週報上方資金流必須逐檔排除「該檔權證」的
-        # 發行券商總公司／自營／造市端，不能把所有券商總公司一起刪除，也不能直接全市場相加。
+        # 三種口徑分開保存：
+        # 1. flow_e：上方權證資金流與 TOP5，逐檔排除該權證的發行造市端。
+        # 2. e：原始完整分點事件，供下方精選分點使用，不受發行商／TOP5 過濾影響。
         flow_e = filter_warrant_flow_excluding_issuer_market_makers(e)
 
         if pd.notna(week_start) and pd.notna(week_end):
             week_events = flow_e[(flow_e["Date"] >= week_start) & (flow_e["Date"] <= week_end)].copy()
+            raw_week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
         else:
             week_events = flow_e.iloc[0:0].copy()
+            raw_week_events = e.iloc[0:0].copy()
 
         if trading_dates:
             plot_start = pd.Timestamp(plot_df.index.min()).normalize()
             plot_end = pd.Timestamp(report_dates[-1]).normalize() if report_dates else pd.Timestamp(plot_df.index.max()).normalize()
             plot_events = flow_e[(flow_e["Date"] >= plot_start) & (flow_e["Date"] <= plot_end)].copy()
+            raw_plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
         else:
             plot_events = flow_e.copy()
+            raw_plot_events = e.copy()
 
     total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
     total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
@@ -5925,6 +6112,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
 
         "plot_events": plot_events,
         "week_events": week_events,
+        "raw_plot_events": raw_plot_events,
+        "raw_week_events": raw_week_events,
         "week_start": week_start,
         "week_end": week_end,
         "report_dates": report_dates,
@@ -13273,8 +13462,8 @@ def add_center_watermarks(fig):
     except Exception:
         pass
 
-def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict], precomputed_news_points: List[str] | None = None):
-    ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict], precomputed_news_points: List[str] | None = None, precomputed_ctx: dict | None = None):
+    ctx = precomputed_ctx if isinstance(precomputed_ctx, dict) else build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
     plot_df = ctx["plot_df"].copy()
     plot_events = ctx["plot_events"]
@@ -14615,7 +14804,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-issuer-flow-v5"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-official-issuer-flow-uv-v6"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -14651,6 +14840,28 @@ FINMIND_DEBUG_SELECTED_BRANCH_ENABLE = os.getenv(
     "FINMIND_DEBUG_SELECTED_BRANCH_ENABLE",
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE = os.getenv(
+    "FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+
+# 權證發行商辨識：官方資料優先，官方資料缺欄位時才退回官方權證名稱／FinMind 權證名稱解析。
+FINMIND_OFFICIAL_ISSUER_ENABLE = os.getenv(
+    "FINMIND_OFFICIAL_ISSUER_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE = os.getenv(
+    "FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+TWSE_WARRANT_ISSUER_OPENAPI_URL = os.getenv(
+    "TWSE_WARRANT_ISSUER_OPENAPI_URL",
+    TWSE_WARRANT_DAILY_OPENAPI_URL,
+).strip() or TWSE_WARRANT_DAILY_OPENAPI_URL
+TPEX_WARRANT_ISSUER_OPENAPI_URL = os.getenv(
+    "TPEX_WARRANT_ISSUER_OPENAPI_URL",
+    "https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue",
+).strip() or "https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue"
 
 # 精選分點雙重驗證：
 # 1. 全市場 Parquet 先用 securities_trader_id 篩選。
@@ -14695,6 +14906,8 @@ _FINMIND_SECURITIES_TRADER_INFO_CACHE = None
 _FINMIND_TRADING_DATE_CACHE = {}
 _FINMIND_WARRANT_SUMMARY_CACHE = {}
 _FINMIND_SELECTED_BRANCH_ID_CACHE = {}
+_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = None
+_FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK = threading.RLock()
 _FINMIND_DEBUG_ONCE_KEYS = set()
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
 _FINMIND_STORAGE_LOCKS = {}
@@ -14879,7 +15092,10 @@ def _finmind_get_data(
                     f"FinMind API 回傳空資料：dataset={dataset}｜data_id={data_id}｜"
                     f"start_date={start_date}｜end_date={end_date}"
                 )
-            if dataset in {"TaiwanSecuritiesTraderInfo", "TaiwanStockNews"}:
+            if (
+                FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE
+                and dataset in {"TaiwanSecuritiesTraderInfo", "TaiwanStockNews"}
+            ):
                 _finmind_debug_print_df(
                     f"{dataset} 實際回傳格式",
                     df,
@@ -15449,6 +15665,52 @@ def _finmind_warrant_name_map() -> Dict[str, str]:
     return dict(zip(work["stock_id"].astype(str), work["stock_name"].astype(str)))
 
 
+def _finmind_target_warrant_name_map(summary_df: pd.DataFrame) -> Dict[str, str]:
+    """只建立本次目標股票的權證名稱表；官方資料完整時不載入 19 萬筆全市場名稱。"""
+    if summary_df is None or summary_df.empty or "stock_id" not in summary_df.columns:
+        return {}
+
+    codes = set(summary_df["stock_id"].astype(str).map(normalize_openapi_warrant_code))
+    codes.discard("")
+    result = {}
+
+    # FinMind summary 若未來直接提供名稱，優先就地使用。
+    for name_col in ["stock_name", "warrant_name", "name", "證券名稱", "權證名稱"]:
+        if name_col not in summary_df.columns:
+            continue
+        for code, name in zip(summary_df["stock_id"], summary_df[name_col]):
+            normalized_code = normalize_openapi_warrant_code(code)
+            clean_name = str(name or "").strip()
+            if normalized_code and clean_name:
+                result[normalized_code] = clean_name
+        if result:
+            break
+
+    # 官方 TWSE／TPEx 權證資料通常已涵蓋目前有效權證，直接補名稱與發行商。
+    official_map = _finmind_official_warrant_issuer_map()
+    for code in codes:
+        if code in result:
+            continue
+        rec = official_map.get(code, {})
+        official_name = str(rec.get("official_warrant_name", "") or "").strip()
+        if official_name:
+            result[code] = official_name
+
+    missing = codes - set(result)
+    if not missing:
+        print(f"⚡ 目標權證名稱表：官方／Summary 已涵蓋 {len(result):,} 支，略過全市場 19 萬筆名稱總覽")
+        return result
+
+    # 官方資料暫時缺漏時才保留原本全市場 FinMind 名稱備援，避免圖卡顯示權證代號。
+    print(f"ℹ️ 目標權證名稱尚缺 {len(missing):,} 支，啟用 FinMind 全市場名稱備援")
+    full_map = _finmind_warrant_name_map()
+    for code in missing:
+        name = str(full_map.get(code, "") or "").strip()
+        if name:
+            result[code] = name
+    return result
+
+
 def _finmind_active_warrant_codes(summary_df: pd.DataFrame, trade_date) -> set:
     if summary_df is None or summary_df.empty:
         return set()
@@ -15974,7 +16236,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     summary = _finmind_get_warrant_summary(code, start_date, end_date)
     if summary.empty:
         return pd.DataFrame(columns=empty_columns)
-    warrant_name_map = _finmind_warrant_name_map()
+    warrant_name_map = _finmind_target_warrant_name_map(summary)
     trader_name_map, trader_info_df = _finmind_securities_trader_maps()
     if not trader_name_map:
         print("⚠️ FinMind 分點 ID 對照表為空；本次會保留 Parquet 券商簡稱並印出 Debug 欄位")
@@ -16101,9 +16363,6 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         trader_info_df,
     )
 
-    if FINMIND_DEBUG_SELECTED_BRANCH_ENABLE and SELECTED_BRANCH_FLOW_ENABLE:
-        _debug_selected_branch_candidates(_get_selected_branch_flow_list(), events)
-
     should_write_snapshot = bool(
         not failures
         and (
@@ -16133,35 +16392,51 @@ def _finmind_fetch_news_day(stock_code: str, trade_date) -> pd.DataFrame:
 
 
 def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """新聞資料只取 FinMind TaiwanStockNews，不再連線新聞聚合器或新聞網站。"""
+    """新聞資料只取 FinMind TaiwanStockNews；優先一次查完整日期區間。"""
     if not NEWS_ENABLE:
         return []
     code = _normalize_stock_name_code_key(stock_code)
     today = pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
-    dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
-    frames = []
-    failures = []
-    with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
-        future_map = {executor.submit(_finmind_fetch_news_day, code, d): d for d in dates}
-        for future in as_completed(future_map):
-            day = future_map[future]
-            try:
-                df = future.result()
-                if df is not None and not df.empty:
-                    frames.append(df)
-            except Exception as exc:
-                failures.append((str(pd.Timestamp(day).date()), str(exc)))
+    start_day = today - pd.Timedelta(days=FINMIND_NEWS_LOOKBACK_DAYS - 1)
 
-    if failures:
+    try:
+        raw = _finmind_get_data(
+            "TaiwanStockNews",
+            data_id=code,
+            start_date=start_day.strftime("%Y-%m-%d"),
+            end_date=today.strftime("%Y-%m-%d"),
+            allow_empty=True,
+        ).fillna("")
         print(
-            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
-            + "；".join(f"{d}:{e[:80]}" for d, e in failures[:3])
+            f"⚡ FinMind 新聞區間單次查詢：{code}｜"
+            f"{start_day.date()} ~ {today.date()}｜{len(raw):,} 筆"
         )
-    if not frames:
+    except Exception as range_exc:
+        # 少數 API 版本若不接受區間查詢，保留原本逐日平行備援，避免改動可靠性。
+        print(f"⚠️ FinMind 新聞區間查詢失敗，退回逐日平行查詢：{range_exc}")
+        dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
+        frames = []
+        failures = []
+        with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
+            future_map = {executor.submit(_finmind_fetch_news_day, code, d): d for d in dates}
+            for future in as_completed(future_map):
+                day = future_map[future]
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        frames.append(df)
+                except Exception as exc:
+                    failures.append((str(pd.Timestamp(day).date()), str(exc)))
+        if failures:
+            print(
+                f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
+                + "；".join(f"{d}:{e[:80]}" for d, e in failures[:3])
+            )
+        raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
+
+    if raw is None or raw.empty:
         print(f"ℹ️ FinMind TaiwanStockNews 無近期新聞：{code} {stock_name}")
         return []
-
-    raw = pd.concat(frames, ignore_index=True, sort=False).fillna("")
     # 官方文件列有 description，但實際 API 在部分日期／版本可能只回傳
     # date、stock_id、link、source、title，或將摘要改成 content／summary。
     # 新聞標題本身仍是 FinMind 回傳資料，因此 description 改為可選欄位。
@@ -16185,12 +16460,13 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
             "改用 FinMind title 作為新聞事實素材｜"
             f"欄位={raw.columns.tolist()}"
         )
-        preview_cols = [c for c in ["date", "stock_id", "source", "title", "link"] if c in raw.columns]
-        _finmind_debug_print_df(
-            f"TaiwanStockNews 僅標題模式｜{code}",
-            raw[preview_cols].copy() if preview_cols else raw,
-            once_key=f"news-title-only:{code}",
-        )
+        if FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE:
+            preview_cols = [c for c in ["date", "stock_id", "source", "title", "link"] if c in raw.columns]
+            _finmind_debug_print_df(
+                f"TaiwanStockNews 僅標題模式｜{code}",
+                raw[preview_cols].copy() if preview_cols else raw,
+                once_key=f"news-title-only:{code}",
+            )
     raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
     raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
 
@@ -16453,17 +16729,19 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                 end_date=end_date,
             )
 
+        weekly_ctx = None
         if warrant_events is not None and not warrant_events.empty:
             try:
-                debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
-                debug_week_events = debug_ctx.get("week_events", pd.DataFrame())
+                weekly_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+                debug_week_events = weekly_ctx.get("week_events", pd.DataFrame())
                 if debug_week_events is not None and not debug_week_events.empty:
                     debug_buy_top, debug_sell_top = top_branch_tables(debug_week_events, topn=5)
                     print(
-                        f"🔎 TOP5統計區間：{pd.Timestamp(debug_ctx['week_start']).date()} ~ {pd.Timestamp(debug_ctx['week_end']).date()}｜"
+                        f"🔎 TOP5統計區間：{pd.Timestamp(weekly_ctx['week_start']).date()} ~ {pd.Timestamp(weekly_ctx['week_end']).date()}｜"
                         f"週事件 {len(debug_week_events):,} 筆｜買超TOP5 {len(debug_buy_top):,} 筆｜賣超TOP5 {len(debug_sell_top):,} 筆"
                     )
             except Exception as e:
+                weekly_ctx = None
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
 
         with report_stage_timer(f"{stock_code}｜週報內容生成與建圖總流程"):
@@ -16474,6 +16752,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                 warrant_events,
                 news_items,
                 precomputed_news_points=precomputed_news_points,
+                precomputed_ctx=weekly_ctx,
             )
 
         buf = io.BytesIO()
@@ -16561,7 +16840,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "trader-id-map+direct-branch-fallback+news-title-fallback+calendar7"
+        "official-issuer-map+issuer-flow+raw-selected-branch+single-range-news+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
