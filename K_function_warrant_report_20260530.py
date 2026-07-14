@@ -214,6 +214,15 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 # 預設仍過濾總公司型分點，但「新光」與「第一金」這兩個分點保留，不列入總公司過濾。
 TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金,福邦證券").strip()
 
+# FinMind 全市場權證分點包含每一筆交易的買方與賣方分點。
+# 若把所有分點直接相加，市場總買進金額必然等於總賣出金額，淨額會固定接近 0。
+# 因此「權證資金流」預設改採非券商總公司型分點，代表一般分點／投資人端的淨流向；
+# TOP5 與精選分點仍沿用原本邏輯。
+WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE = os.getenv(
+    "WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 # 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
 # 若明確設定 WARRANT_SELECTED_BRANCH_FLOW_MODE=default / five / 五分點，會強制使用預設五分點。
@@ -5447,6 +5456,42 @@ def is_top5_head_office_branch(branch_name: str) -> bool:
     return s in _get_top5_head_office_branch_set()
 
 
+def filter_warrant_flow_investor_branches(events_df: pd.DataFrame) -> pd.DataFrame:
+    """建立可解讀的權證資金流口徑。
+
+    FinMind sponsorpro 回傳的是全市場完整買賣雙邊資料，因此同一天把所有分點
+    的 buy_amount / sell_amount 相加後必然互相平衡，總 net_amount 會固定為 0。
+    週報的「權證資金流」改採非券商總公司型分點，觀察一般分點／投資人端
+    相對於發行、造市與總公司端的淨流向。
+    """
+    if events_df is None or events_df.empty:
+        return pd.DataFrame() if events_df is None else events_df.copy()
+
+    e = events_df.copy()
+    if "branch" not in e.columns:
+        return e
+    e["branch"] = e["branch"].map(normalize_branch_name)
+
+    if not WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE:
+        print("ℹ️ 權證資金流口徑：保留全市場所有分點；完整雙邊資料的淨額可能固定為 0")
+        return e
+
+    mask = e["branch"].map(is_top5_head_office_branch)
+    removed_rows = int(mask.sum())
+    removed_branches = sorted(set(e.loc[mask, "branch"].astype(str))) if removed_rows else []
+    filtered = e.loc[~mask].copy()
+
+    preview = "、".join(removed_branches[:10])
+    if len(removed_branches) > 10:
+        preview += "…"
+    print(
+        f"💰 權證資金流口徑：排除券商總公司／發行造市端 {removed_rows:,} 筆｜"
+        f"保留一般分點 {len(filtered):,} 筆"
+        + (f"｜排除：{preview}" if preview else "")
+    )
+    return filtered.reset_index(drop=True)
+
+
 def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
     points = []
     df = ctx["plot_df"]
@@ -5520,9 +5565,7 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
         report_dates = trading_dates
 
     report_dates = [pd.Timestamp(d).normalize() for d in report_dates]
-    week_dates = report_dates[-week_days:] if len(report_dates) >= week_days else report_dates
-    week_start = pd.Timestamp(week_dates[0]).normalize() if week_dates else pd.NaT
-    week_end = pd.Timestamp(week_dates[-1]).normalize() if week_dates else pd.NaT
+    week_start, week_end, week_dates = _resolve_report_week_range(report_dates, fallback_count=week_days)
 
     if pd.notna(week_start) and pd.notna(week_end):
         stock_week_dates = [d for d in trading_dates if pd.Timestamp(d).normalize() >= week_start and pd.Timestamp(d).normalize() <= week_end]
@@ -5539,8 +5582,16 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             prev_end_pos = prev_end_pos.start or 0
         elif isinstance(prev_end_pos, np.ndarray):
             prev_end_pos = int(np.where(prev_end_pos)[0][0]) if prev_end_pos.any() else 0
-        prev_start_pos = max(0, int(prev_end_pos) - week_days)
-        prev_stock = plot_df.iloc[prev_start_pos:int(prev_end_pos)].copy()
+        if WARRANT_WEEK_RANGE_MODE in {"calendar7", "calendar", "7d", "seven_days"}:
+            prev_week_end = week_start - pd.Timedelta(days=1)
+            prev_week_start = prev_week_end - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+            prev_stock = plot_df[
+                (pd.to_datetime(plot_df.index).normalize() >= prev_week_start)
+                & (pd.to_datetime(plot_df.index).normalize() <= prev_week_end)
+            ].copy()
+        else:
+            prev_start_pos = max(0, int(prev_end_pos) - week_days)
+            prev_stock = plot_df.iloc[prev_start_pos:int(prev_end_pos)].copy()
     else:
         prev_stock = plot_df.iloc[max(0, len(plot_df) - week_days * 2): max(0, len(plot_df) - week_days)].copy()
 
@@ -5578,25 +5629,47 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             )
             hedge_removed = 0
 
+        # 恢復第一張圖原本的「權證資金流」資料集合，不再以券商名稱硬刪總公司分點。
+        # FinMind 全市場資料若呈現完整雙邊平衡，程式會在下方印出診斷；不能用任意排除券商
+        # 的方式製造非零淨額。待使用者貼回實際欄位／分點 ID 後，再精準重建舊版事件口徑。
+        flow_e = e.copy()
+        if FINMIND_DEBUG_SCHEMA_ENABLE and not flow_e.empty:
+            raw_buy = float(pd.to_numeric(flow_e["buy_amount"], errors="coerce").fillna(0).sum())
+            raw_sell = float(pd.to_numeric(flow_e["sell_amount"], errors="coerce").fillna(0).sum())
+            raw_net = float(pd.to_numeric(flow_e["net_amount"], errors="coerce").fillna(0).sum())
+            print(
+                f"🧪 FinMind 全市場權證流向平衡檢查：買進={fmt_money(raw_buy)}｜"
+                f"賣出={fmt_money(-raw_sell)}｜淨額={fmt_money(raw_net)}｜"
+                "若淨額為 0，代表資料包含完整成交雙邊，並非沒抓到資料"
+            )
+
         if pd.notna(week_start) and pd.notna(week_end):
-            week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
+            week_events = flow_e[(flow_e["Date"] >= week_start) & (flow_e["Date"] <= week_end)].copy()
         else:
-            week_events = e.iloc[0:0].copy()
+            week_events = flow_e.iloc[0:0].copy()
 
         if trading_dates:
             plot_start = pd.Timestamp(plot_df.index.min()).normalize()
             plot_end = pd.Timestamp(report_dates[-1]).normalize() if report_dates else pd.Timestamp(plot_df.index.max()).normalize()
-            plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
+            plot_events = flow_e[(flow_e["Date"] >= plot_start) & (flow_e["Date"] <= plot_end)].copy()
         else:
-            plot_events = e.copy()
+            plot_events = flow_e.copy()
 
     total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
     total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
     total_net = float(week_events["net_amount"].sum()) if not week_events.empty else 0.0
     bias = "偏買超" if total_net > 0 else "偏賣超" if total_net < 0 else "中性"
 
+    print(
+        f"📅 週報統計區間：{week_start.strftime('%Y/%m/%d') if pd.notna(week_start) else '-'} - "
+        f"{week_end.strftime('%Y/%m/%d') if pd.notna(week_end) else '-'}｜"
+        f"模式={WARRANT_WEEK_RANGE_MODE}｜實際股價日={len(stock_week_dates)}｜"
+        f"權證事件={len(week_events):,}"
+    )
+
     return {
         "plot_df": plot_df,
+
         "plot_events": plot_events,
         "week_events": week_events,
         "week_start": week_start,
@@ -5729,6 +5802,18 @@ def get_selected_branch_flow_mode_label() -> str:
 def _get_selected_branch_flow_set() -> set:
     """取得精選分點名單，會先做與主程式一致的分點標準化。"""
     return set(_get_selected_branch_flow_list())
+
+
+def _branch_flow_match_key(branch_name: str) -> str:
+    """建立 FinMind 分點名稱比對鍵。
+
+    FinMind 有時會回傳「第一金證券中壢」，使用者則輸入「第一金中壢」；
+    這裡只移除公司型字樣，不移除券商名稱與地名，避免不同分點誤合併。
+    """
+    s = normalize_branch_name(branch_name)
+    for token in ["證券股份有限公司", "股份有限公司", "證券", "分公司", "有限公司"]:
+        s = s.replace(token, "")
+    return s
 
 
 def _get_debug_branch_warrant_flow_branches() -> List[str]:
@@ -5893,20 +5978,156 @@ def print_debug_branch_warrant_flow(
     print("========== 指定分點權證明細 Debug 結束 ==========")
 
 
-def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
-    """篩出精選分點資金流事件。
 
-    條件：
-    1. 分點名稱屬於 SELECTED_BRANCH_FLOW_BRANCHES。
+def _parse_finmind_selected_branch_id_overrides() -> dict:
+    """解析 FINMIND_SELECTED_BRANCH_ID_OVERRIDES：分點名稱=代碼，多筆可逗號分隔。"""
+    out = {}
+    raw = str(FINMIND_SELECTED_BRANCH_ID_OVERRIDES_RAW or "").strip()
+    if not raw:
+        return out
+    for item in re.split(r"[,，;；\n\r]+", raw):
+        item = str(item or "").strip()
+        if not item:
+            continue
+        parts = re.split(r"[=:：]", item, maxsplit=1)
+        if len(parts) != 2:
+            print(f"⚠️ FINMIND_SELECTED_BRANCH_ID_OVERRIDES 格式錯誤，略過：{item}")
+            continue
+        name = normalize_branch_name(parts[0])
+        trader_id = str(parts[1] or "").strip()
+        if name and trader_id:
+            out.setdefault(name, set()).add(trader_id)
+    return out
 
-    回傳後可直接丟給 daily_warrant_net()，產生每日淨額柱狀圖與累計折線圖。
+
+def _branch_location_tokens(value: str) -> list:
+    """從使用者分點名稱取出可能的地名尾碼，僅用於候選排序，不直接猜 ID。"""
+    key = _finmind_branch_lookup_key(value)
+    locations = [
+        "台北", "台中", "中壢", "桃園", "新竹", "高雄", "台南", "板橋", "中和", "內湖",
+        "南屯", "敦南", "公益", "忠孝", "南京", "三重", "新店", "士林", "基隆", "彰化",
+        "員林", "竹北", "竹科", "市政", "信義", "淡水", "頭份", "內壢", "東大", "古亭",
+        "民權", "汐止", "虎尾", "東港", "苑裡", "民生", "三多", "土城", "建成", "溪湖",
+        "豐中", "忠明", "復興", "城中", "松山", "永和", "嘉義", "屏東", "羅東", "花蓮",
+    ]
+    return [loc for loc in locations if loc in key]
+
+
+def _rank_finmind_branch_candidates(info: pd.DataFrame, requested: str) -> pd.DataFrame:
+    """列出名稱最接近的官方分點；只提供 Debug，不在多解時自行亂選。"""
+    if info is None or info.empty:
+        return pd.DataFrame()
+    key = _finmind_branch_lookup_key(requested)
+    root = _finmind_branch_root_key(requested)
+    location_tokens = _branch_location_tokens(requested)
+    work = info.copy()
+    work["_score"] = 0
+    lookup = work["branch_lookup_key"].astype(str)
+    roots = work["branch_root_key"].astype(str)
+    work.loc[lookup.eq(key), "_score"] += 100
+    if key:
+        work.loc[lookup.str.contains(key, regex=False), "_score"] += 50
+        work.loc[lookup.map(lambda x: bool(x) and x in key), "_score"] += 35
+    if root:
+        work.loc[roots.eq(root), "_score"] += 30
+        work.loc[lookup.str.contains(root, regex=False), "_score"] += 15
+    for token in location_tokens:
+        work.loc[lookup.str.contains(token, regex=False), "_score"] += 25
+        if "address" in work.columns:
+            work.loc[work["address"].astype(str).str.contains(token, regex=False), "_score"] += 8
+    work = work[work["_score"] > 0].copy()
+    return work.sort_values(["_score", "securities_trader_id"], ascending=[False, True])
+
+
+def _resolve_selected_branch_ids(selected_branches: set) -> dict:
+    """將使用者分點名稱解析為 FinMind securities_trader_id；結果以輸入分點為 key。
+
+    僅在官方名稱正規化後唯一命中時自動採用。模糊候選只印出，不會亂選，避免
+    把「第一金中壢」錯配成第一金總公司或其他分點。
     """
+    cache_key = tuple(sorted(normalize_branch_name(x) for x in selected_branches if normalize_branch_name(x)))
+    with _FINMIND_DATA_CACHE_LOCK:
+        cached = _FINMIND_SELECTED_BRANCH_ID_CACHE.get(cache_key)
+        if cached is not None:
+            return {k: set(v) for k, v in cached.items()}
+
+    resolved = {}
+    overrides = _parse_finmind_selected_branch_id_overrides()
+    try:
+        info = _finmind_load_securities_trader_info()
+    except Exception as exc:
+        print(f"⚠️ 無法載入 TaiwanSecuritiesTraderInfo，精選分點無法使用正式 ID：{exc}")
+        for requested in cache_key:
+            resolved[requested] = set(overrides.get(requested, set()))
+        return resolved
+
+    print(
+        f"🧩 FinMind 分點解析啟動｜build={FINMIND_BUILD_VERSION}｜"
+        f"官方分點代碼={len(info):,}｜輸入={'、'.join(cache_key) or '無'}"
+    )
+
+    for requested in cache_key:
+        if requested in overrides and overrides[requested]:
+            ids = set(overrides[requested])
+            resolved[requested] = ids
+            print(f"✅ 精選分點使用手動 ID：{requested} → {sorted(ids)}")
+            continue
+
+        key = _finmind_branch_lookup_key(requested)
+        exact = info[info["branch_lookup_key"].astype(str) == key].copy()
+        exact_ids = sorted(set(exact["securities_trader_id"].astype(str))) if not exact.empty else []
+
+        if len(exact_ids) == 1:
+            resolved[requested] = {exact_ids[0]}
+            label_rows = exact[[c for c in [
+                "securities_trader_id", "securities_trader", "date", "address", "phone",
+                "branch_lookup_key",
+            ] if c in exact.columns]]
+            print(f"✅ 精選分點 ID 對照成功：{requested} → {exact_ids[0]}")
+            print(label_rows.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            continue
+
+        if len(exact_ids) > 1:
+            resolved[requested] = set()
+            print(f"⚠️ 精選分點名稱對應多個 ID，為避免誤配暫不自動選擇：{requested} → {exact_ids}")
+            print(exact.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            continue
+
+        ranked = _rank_finmind_branch_candidates(info, requested)
+        resolved[requested] = set()
+        print(
+            f"⚠️ 精選分點 ID 對照失敗：{requested}｜lookup_key={key}｜"
+            f"候選={len(ranked):,}"
+        )
+        if ranked.empty:
+            _finmind_debug_print_df(
+                f"TaiwanSecuritiesTraderInfo 無候選｜輸入={requested}",
+                info,
+                max_rows=FINMIND_DEBUG_MAX_ROWS,
+            )
+        else:
+            show_cols = [c for c in [
+                "_score", "securities_trader_id", "securities_trader", "date", "address", "phone",
+                "branch_lookup_key", "branch_root_key",
+            ] if c in ranked.columns]
+            print("🧪 請將以下候選完整複製回來：")
+            print(ranked[show_cols].head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_SELECTED_BRANCH_ID_CACHE[cache_key] = {k: set(v) for k, v in resolved.items()}
+    return resolved
+
+
+def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """篩出精選分點資金流事件；優先使用 securities_trader_id，不再只靠券商簡稱。"""
     if not SELECTED_BRANCH_FLOW_ENABLE:
         return pd.DataFrame()
     if events_df is None or events_df.empty:
         return pd.DataFrame()
-    need_cols = {"Date", "branch", "net_amount", "buy_amount", "sell_amount"}
+    need_cols = {"Date", "branch", "broker_code", "net_amount", "buy_amount", "sell_amount"}
     if not need_cols.issubset(events_df.columns):
+        _finmind_debug_print_df("精選分點事件欄位不足", events_df)
+        print(f"⚠️ 精選分點事件缺少欄位：{sorted(need_cols - set(events_df.columns))}")
         return pd.DataFrame()
 
     selected_branches = _get_selected_branch_flow_set()
@@ -5917,11 +6138,45 @@ def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
     e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
     e = e.dropna(subset=["Date"])
     e["branch"] = e["branch"].map(normalize_branch_name)
+    e["broker_code"] = e["broker_code"].astype(str).str.strip()
     for c in ["buy_amount", "sell_amount", "net_amount"]:
         e[c] = pd.to_numeric(e[c], errors="coerce").fillna(0.0).astype(float)
 
-    mask = e["branch"].isin(selected_branches)
-    return e.loc[mask].copy().reset_index(drop=True)
+    resolved_map = _resolve_selected_branch_ids(selected_branches)
+    selected_ids = set().union(*(ids for ids in resolved_map.values())) if resolved_map else set()
+
+    # 主要條件：正式分點 ID。名稱比對僅作為對照表失敗時的安全備援。
+    id_mask = e["broker_code"].isin(selected_ids) if selected_ids else pd.Series(False, index=e.index)
+    selected_names_normalized = {normalize_branch_name(x) for x in selected_branches}
+    selected_keys = {_finmind_branch_lookup_key(x) for x in selected_branches if _finmind_branch_lookup_key(x)}
+    exact_name_mask = e["branch"].isin(selected_names_normalized)
+    alias_name_mask = e["branch"].map(_finmind_branch_lookup_key).isin(selected_keys) if selected_keys else pd.Series(False, index=e.index)
+    mask = id_mask | exact_name_mask | alias_name_mask
+    matched = e.loc[mask].copy().reset_index(drop=True)
+
+    if matched.empty:
+        print(f"⚠️ 精選分點沒有權證交易：{'、'.join(sorted(selected_branches))}")
+        _debug_selected_branch_candidates(selected_branches, e)
+    else:
+        matched_names = "、".join(sorted(set(matched["branch"].astype(str))))
+        matched_ids = "、".join(sorted(set(matched["broker_code"].astype(str))))
+        print(
+            f"✅ 精選分點 FinMind ID 比對成功：{matched_names}｜"
+            f"ID={matched_ids}｜{len(matched):,} 筆"
+        )
+        if FINMIND_DEBUG_SELECTED_BRANCH_ENABLE:
+            summary = matched.groupby(["broker_code", "branch"], as_index=False).agg(
+                rows=("net_amount", "size"),
+                first_date=("Date", "min"),
+                last_date=("Date", "max"),
+                buy_amount=("buy_amount", "sum"),
+                sell_amount=("sell_amount", "sum"),
+                net_amount=("net_amount", "sum"),
+            )
+            print("🧪 精選分點命中彙總：")
+            print(summary.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+    return matched
 
 
 def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
@@ -7110,7 +7365,14 @@ def _extract_company_name_near_code(text: str, stock_code: str) -> str:
         rf"{re.escape(code)}\s*[）)]?\s*([一-鿿A-Za-z][一-鿿A-Za-z0-9\-]{{1,14}})",
         rf"([一-鿿A-Za-z][一-鿿A-Za-z0-9\-]{{1,14}})\s*{re.escape(code)}",
     ]
-    bad_prefixes = ("營收", "公告", "新聞", "焦點股", "個股", "台股", "本週", "近期", "市場")
+    bad_prefixes = (
+        "營收", "公告", "新聞", "焦點股", "個股", "台股", "本週", "近期", "市場",
+        "股價", "上漲", "下跌", "漲逾", "跌逾", "盤中", "今日", "法人", "外資",
+    )
+    bad_fragments = (
+        "股價上漲", "股價下跌", "上漲逾", "下跌逾", "漲幅", "跌幅", "漲停", "跌停",
+        "創新高", "創新低", "爆量", "盤中", "元大漲", "元下跌", "億元", "萬元",
+    )
     for pattern in patterns:
         m = re.search(pattern, s)
         if not m:
@@ -7120,6 +7382,12 @@ def _extract_company_name_near_code(text: str, stock_code: str) -> str:
         if len(name) < 2 or name.startswith(bad_prefixes):
             continue
         if re.fullmatch(r"\d+", name):
+            continue
+        if any(fragment in name for fragment in bad_fragments):
+            continue
+        if re.search(r"(?:逾|約|達|增|減|漲|跌)\d", name):
+            continue
+        if re.search(r"\d+(?:\.\d+)?(?:%|％|元|億|萬|張|家|日|月|季)$", name):
             continue
         return name
     return ""
@@ -9793,7 +10061,7 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         raw_content = _normalize_news_text(rec.get("content", ""))
         description = _normalize_news_text(rec.get("description", ""))
         content_source = str(rec.get("content_source", ""))
-        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "manual")
+        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "rss_title_fact", "manual")
 
         inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
         if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
@@ -11140,12 +11408,19 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         for d in (ctx.get("report_dates") or [])
         if pd.notna(d)
     })
-    current_report_dates = report_dates[-WEEK_TRADING_DAYS:] if report_dates else []
-    previous_report_dates = (
-        report_dates[-WEEK_TRADING_DAYS * 2:-WEEK_TRADING_DAYS]
-        if len(report_dates) > WEEK_TRADING_DAYS
-        else []
+    current_start, current_end, current_report_dates = _resolve_report_week_range(
+        report_dates,
+        fallback_count=WEEK_TRADING_DAYS,
     )
+    if report_dates and pd.notna(current_start):
+        previous_end_boundary = current_start - pd.Timedelta(days=1)
+        previous_start_boundary = previous_end_boundary - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+        previous_report_dates = [
+            d for d in report_dates
+            if previous_start_boundary <= d <= previous_end_boundary
+        ]
+    else:
+        previous_report_dates = []
     previous_week_start = previous_report_dates[0] if previous_report_dates else pd.NaT
     previous_week_end = previous_report_dates[-1] if previous_report_dates else pd.NaT
 
@@ -12779,14 +13054,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             selected_flow_dates[0],
             selected_flow_dates[-1],
         )
-        selected_week_dates = selected_flow_dates[-WEEK_TRADING_DAYS:]
-        selected_week_start = selected_week_dates[0]
-        selected_week_end = selected_week_dates[-1]
+        selected_week_start = ctx.get("week_start", pd.NaT)
+        selected_week_end = ctx.get("week_end", pd.NaT)
         selected_branch_week_events = filter_events_by_date_range(
             selected_branch_events,
             selected_week_start,
             selected_week_end,
-        )
+        ) if pd.notna(selected_week_start) and pd.notna(selected_week_end) else pd.DataFrame()
     else:
         selected_branch_events = pd.DataFrame()
         selected_branch_week_events = pd.DataFrame()
@@ -14088,8 +14362,10 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-branch-id-direct-v4"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
+FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
 FINMIND_REQUEST_RETRIES = max(1, int(os.getenv("FINMIND_REQUEST_RETRIES", "5")))
 FINMIND_RETRY_BASE_WAIT = max(0.2, float(os.getenv("FINMIND_RETRY_BASE_WAIT", "1.5")))
 FINMIND_CONNECT_TIMEOUT = max(3.0, float(os.getenv("FINMIND_CONNECT_TIMEOUT", "10")))
@@ -14110,10 +14386,63 @@ FINMIND_STRICT_WARRANT_COMPLETENESS = os.getenv(
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
 
+# FinMind 欄位／分點對照 Debug：
+# 預設開啟。遇到欄位不足、分點名稱無法對照或資料為空時，會把實際欄位、dtype、
+# 前幾筆資料與候選分點代碼印到 GitHub Actions log，方便直接複製回來檢查。
+FINMIND_DEBUG_SCHEMA_ENABLE = os.getenv(
+    "FINMIND_DEBUG_SCHEMA_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_DEBUG_MAX_ROWS = max(1, int(os.getenv("FINMIND_DEBUG_MAX_ROWS", "20")))
+FINMIND_DEBUG_SELECTED_BRANCH_ENABLE = os.getenv(
+    "FINMIND_DEBUG_SELECTED_BRANCH_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+
+# 精選分點雙重驗證：
+# 1. 全市場 Parquet 先用 securities_trader_id 篩選。
+# 2. 如果某個已解析 ID 在 Parquet 完全沒有資料，再直接呼叫 FinMind 的
+#    /taiwan_stock_warrant_trading_daily_report?securities_trader_id=...&date=...
+#    逐日驗證並回補。這能區分「分點 ID 對照錯誤」與「該分點真的沒有交易」。
+FINMIND_SELECTED_BRANCH_DIRECT_VERIFY_ENABLE = os.getenv(
+    "FINMIND_SELECTED_BRANCH_DIRECT_VERIFY_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_SELECTED_BRANCH_DIRECT_REPLACE_ENABLE = os.getenv(
+    "FINMIND_SELECTED_BRANCH_DIRECT_REPLACE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_SELECTED_BRANCH_DIRECT_WORKERS = max(
+    1,
+    int(os.getenv("FINMIND_SELECTED_BRANCH_DIRECT_WORKERS", "4")),
+)
+FINMIND_SELECTED_BRANCH_DIRECT_MAX_IDS = max(
+    1,
+    int(os.getenv("FINMIND_SELECTED_BRANCH_DIRECT_MAX_IDS", "10")),
+)
+# 可手動指定名稱到 ID，例如：第一金中壢=5380,華南永昌台中=9A9g
+# 正常情況不需要；只有 FinMind 對照表名稱真的無法辨識時才使用。
+FINMIND_SELECTED_BRANCH_ID_OVERRIDES_RAW = os.getenv(
+    "FINMIND_SELECTED_BRANCH_ID_OVERRIDES",
+    "",
+).strip()
+
+# 週報區間恢復成第一張圖的口徑：最新資料日往前含當日共 7 個日曆日。
+# 例如最新日 2026/07/14，週報區間即為 2026/07/08～2026/07/14；
+# 休市日不會產生資料列，但仍保留正確的日曆週邊界。
+WARRANT_WEEK_RANGE_MODE = os.getenv(
+    "WARRANT_WEEK_RANGE_MODE",
+    "calendar7",
+).strip().lower() or "calendar7"
+WARRANT_WEEK_CALENDAR_DAYS = max(1, int(os.getenv("WARRANT_WEEK_CALENDAR_DAYS", "7")))
+
 _FINMIND_STOCK_INFO_CACHE = None
 _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = None
+_FINMIND_SECURITIES_TRADER_INFO_CACHE = None
 _FINMIND_TRADING_DATE_CACHE = {}
 _FINMIND_WARRANT_SUMMARY_CACHE = {}
+_FINMIND_SELECTED_BRANCH_ID_CACHE = {}
+_FINMIND_DEBUG_ONCE_KEYS = set()
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
 _FINMIND_STORAGE_LOCKS = {}
 _FINMIND_STORAGE_LOCKS_GUARD = threading.Lock()
@@ -14159,6 +14488,84 @@ def _finmind_error_message(payload, fallback: str = "") -> str:
             or payload
         )
     return str(fallback or payload or "未知錯誤")
+
+
+def _finmind_debug_print_df(label: str, df: pd.DataFrame, max_rows: int | None = None, once_key: str = ""):
+    """將 FinMind 實際欄位、型別與資料樣本印到 Actions log。
+
+    once_key 有值時，同一執行只印一次，避免 60～70 個交易日重複洗版。
+    """
+    if not FINMIND_DEBUG_SCHEMA_ENABLE:
+        return
+    key = str(once_key or "").strip()
+    if key:
+        with _FINMIND_DATA_CACHE_LOCK:
+            if key in _FINMIND_DEBUG_ONCE_KEYS:
+                return
+            _FINMIND_DEBUG_ONCE_KEYS.add(key)
+    try:
+        rows = max(1, int(max_rows or FINMIND_DEBUG_MAX_ROWS))
+        if df is None:
+            print(f"🧪 FinMind Debug｜{label}｜DataFrame=None")
+            return
+        print("=" * 110)
+        print(f"🧪 FinMind Debug｜{label}")
+        print(f"資料筆數：{len(df):,}")
+        print(f"實際欄位：{list(df.columns)}")
+        try:
+            dtype_text = ", ".join(f"{c}={df[c].dtype}" for c in df.columns)
+            print(f"欄位型別：{dtype_text}")
+        except Exception:
+            pass
+        if not df.empty:
+            preview = df.head(rows).copy()
+            for col in preview.columns:
+                if preview[col].dtype == object:
+                    preview[col] = preview[col].astype(str).str.slice(0, 180)
+            print(f"前 {min(rows, len(preview))} 筆：")
+            print(preview.to_string(index=False))
+        print("=" * 110)
+    except Exception as exc:
+        print(f"⚠️ FinMind Debug 輸出失敗：{label}｜{exc}")
+
+
+def _finmind_branch_lookup_key(value: str) -> str:
+    """分點對照鍵：保留券商與地名，移除公司型態及格式符號。"""
+    s = html.unescape(str(value or "")).strip().replace("臺", "台")
+    s = re.sub(r"(股份有限公司|有限公司|證券股份|證券公司|證券|分公司|營業處|營業部|辦事處)", "", s)
+    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
+    return s.strip().lower()
+
+
+def _finmind_branch_root_key(value: str) -> str:
+    """只供失敗時列出同券商候選，不拿來直接決定分點。"""
+    key = _finmind_branch_lookup_key(value)
+    locations = (
+        "台北", "台中", "中壢", "桃園", "新竹", "高雄", "台南", "板橋", "中和", "內湖",
+        "南屯", "敦南", "公益", "忠孝", "南京", "三重", "新店", "士林", "基隆", "彰化",
+        "員林", "竹北", "竹科", "市政", "信義", "淡水", "頭份", "內壢", "東大", "古亭",
+        "民權", "汐止", "虎尾", "東港", "苑裡", "民生", "三多", "土城", "建成", "溪湖",
+    )
+    for suffix in sorted(locations, key=len, reverse=True):
+        if key.endswith(suffix) and len(key) > len(suffix):
+            return key[:-len(suffix)]
+    return key
+
+
+def _resolve_report_week_range(report_dates, fallback_count: int = WEEK_TRADING_DAYS):
+    """回傳週報邊界與落在邊界內的實際資料日期。"""
+    dates = sorted({pd.Timestamp(d).normalize() for d in (report_dates or []) if pd.notna(d)})
+    if not dates:
+        return pd.NaT, pd.NaT, []
+    week_end = dates[-1]
+    if WARRANT_WEEK_RANGE_MODE in {"calendar7", "calendar", "7d", "seven_days"}:
+        week_start = week_end - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+        week_dates = [d for d in dates if week_start <= d <= week_end]
+    else:
+        count = max(1, int(fallback_count or WEEK_TRADING_DAYS))
+        week_dates = dates[-count:]
+        week_start = week_dates[0]
+    return pd.Timestamp(week_start).normalize(), pd.Timestamp(week_end).normalize(), week_dates
 
 
 def _finmind_get_data(
@@ -14208,9 +14615,22 @@ def _finmind_get_data(
             data = payload.get("data", []) if isinstance(payload, dict) else []
             df = pd.DataFrame(data)
             if df.empty and not allow_empty:
+                _finmind_debug_print_df(
+                    f"{dataset} 空資料｜data_id={data_id}｜{start_date}～{end_date}",
+                    df,
+                )
+                if isinstance(payload, dict):
+                    print(f"🧪 FinMind Debug｜{dataset} 原始回應鍵：{list(payload.keys())}")
+                    print(f"🧪 FinMind Debug｜{dataset} msg：{_finmind_error_message(payload)}")
                 raise RuntimeError(
                     f"FinMind API 回傳空資料：dataset={dataset}｜data_id={data_id}｜"
                     f"start_date={start_date}｜end_date={end_date}"
+                )
+            if dataset in {"TaiwanSecuritiesTraderInfo", "TaiwanStockNews"}:
+                _finmind_debug_print_df(
+                    f"{dataset} 實際回傳格式",
+                    df,
+                    once_key=f"schema:{dataset}",
                 )
             return df
         except Exception as exc:
@@ -14393,7 +14813,8 @@ def _finmind_load_stock_info(force_refresh: bool = False) -> pd.DataFrame:
     required = {"stock_id", "stock_name", "type"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"FinMind TaiwanStockInfo 欄位不足：{sorted(missing)}")
+        _finmind_debug_print_df("TaiwanStockInfo 欄位不足", df)
+        raise RuntimeError(f"FinMind TaiwanStockInfo 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
     df["stock_id"] = df["stock_id"].astype(str).str.strip()
     df["stock_name"] = df["stock_name"].astype(str).str.strip()
     with _FINMIND_DATA_CACHE_LOCK:
@@ -14411,13 +14832,122 @@ def _finmind_load_stock_info_with_warrant(force_refresh: bool = False) -> pd.Dat
     required = {"stock_id", "stock_name"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"FinMind TaiwanStockInfoWithWarrant 欄位不足：{sorted(missing)}")
+        _finmind_debug_print_df("TaiwanStockInfoWithWarrant 欄位不足", df)
+        raise RuntimeError(f"FinMind TaiwanStockInfoWithWarrant 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
     df["stock_id"] = df["stock_id"].astype(str).map(normalize_openapi_warrant_code)
     df["stock_name"] = df["stock_name"].astype(str).str.strip()
     with _FINMIND_DATA_CACHE_LOCK:
         _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = df.copy()
     print(f"📦 FinMind 股票與權證名稱總覽載入：{len(df):,} 筆")
     return df
+
+
+def _finmind_load_securities_trader_info(force_refresh: bool = False) -> pd.DataFrame:
+    """讀取 FinMind 證券商資訊表，供 securities_trader_id 還原完整分點名稱。"""
+    global _FINMIND_SECURITIES_TRADER_INFO_CACHE
+    with _FINMIND_DATA_CACHE_LOCK:
+        if _FINMIND_SECURITIES_TRADER_INFO_CACHE is not None and not force_refresh:
+            return _FINMIND_SECURITIES_TRADER_INFO_CACHE.copy()
+
+    df = _finmind_get_data("TaiwanSecuritiesTraderInfo", allow_empty=False).fillna("")
+    required = {"securities_trader_id", "securities_trader"}
+    missing = required - set(df.columns)
+    if missing:
+        _finmind_debug_print_df("TaiwanSecuritiesTraderInfo 欄位不足", df)
+        raise RuntimeError(
+            f"FinMind TaiwanSecuritiesTraderInfo 欄位不足：{sorted(missing)}｜"
+            f"實際欄位={df.columns.tolist()}"
+        )
+
+    out = df.copy()
+    out["securities_trader_id"] = out["securities_trader_id"].astype(str).str.strip()
+    out["securities_trader"] = out["securities_trader"].astype(str).str.strip()
+    if "date" in out.columns:
+        out["_sort_date"] = pd.to_datetime(out["date"], errors="coerce")
+        out = out.sort_values(["securities_trader_id", "_sort_date"])
+    out = out[(out["securities_trader_id"] != "") & (out["securities_trader"] != "")]
+    out = out.drop_duplicates(subset=["securities_trader_id"], keep="last").copy()
+    out["branch"] = out["securities_trader"].map(normalize_branch_name)
+    out["branch_lookup_key"] = out["securities_trader"].map(_finmind_branch_lookup_key)
+    out["branch_root_key"] = out["securities_trader"].map(_finmind_branch_root_key)
+    out = out.drop(columns=["_sort_date"], errors="ignore")
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_SECURITIES_TRADER_INFO_CACHE = out.copy()
+    print(f"📦 FinMind 證券商分點對照載入：{len(out):,} 個代碼")
+    return out
+
+
+def _finmind_securities_trader_maps() -> tuple[Dict[str, str], pd.DataFrame]:
+    try:
+        info = _finmind_load_securities_trader_info()
+    except Exception as exc:
+        print(f"⚠️ FinMind 證券商分點對照讀取失敗，暫用 Parquet 券商簡稱：{exc}")
+        return {}, pd.DataFrame()
+    name_map = dict(zip(
+        info["securities_trader_id"].astype(str),
+        info["branch"].astype(str),
+    ))
+    return name_map, info
+
+
+def _debug_selected_branch_candidates(selected_names, events_df: pd.DataFrame | None = None):
+    """分點無法對照時，把官方對照表與權證事件候選完整印出。"""
+    if not FINMIND_DEBUG_SELECTED_BRANCH_ENABLE:
+        return
+    try:
+        selected = [normalize_branch_name(x) for x in (selected_names or []) if normalize_branch_name(x)]
+        info = _finmind_load_securities_trader_info()
+        for requested in selected:
+            requested_key = _finmind_branch_lookup_key(requested)
+            requested_root = _finmind_branch_root_key(requested)
+            print("=" * 110)
+            print(f"🧪 精選分點 Debug｜使用者輸入={requested}｜lookup_key={requested_key}｜root={requested_root}")
+            candidate_mask = (
+                info["branch_lookup_key"].astype(str).str.contains(requested_key, regex=False)
+                | info["branch_lookup_key"].astype(str).map(lambda x: requested_key in x if x else False)
+                | info["branch_root_key"].astype(str).eq(requested_root)
+            )
+            candidates = info.loc[candidate_mask].copy()
+            if candidates.empty and requested_root:
+                candidates = info[
+                    info["branch_lookup_key"].astype(str).str.contains(requested_root, regex=False)
+                ].copy()
+            show_cols = [c for c in [
+                "securities_trader_id", "securities_trader", "branch", "date", "address", "phone",
+                "branch_lookup_key", "branch_root_key",
+            ] if c in candidates.columns]
+            if candidates.empty:
+                print("官方 TaiwanSecuritiesTraderInfo 找不到候選分點。")
+            else:
+                print(f"官方候選共 {len(candidates):,} 筆：")
+                print(candidates[show_cols].head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+            if events_df is not None and not events_df.empty:
+                e = events_df.copy()
+                e["branch"] = e.get("branch", "").astype(str).map(normalize_branch_name)
+                e["broker_code"] = e.get("broker_code", "").astype(str).str.strip()
+                event_mask = e["branch"].map(_finmind_branch_root_key).eq(requested_root)
+                candidate_ids = set(candidates.get("securities_trader_id", pd.Series(dtype=str)).astype(str))
+                if candidate_ids:
+                    event_mask = event_mask | e["broker_code"].isin(candidate_ids)
+                event_candidates = e.loc[event_mask].copy()
+                if event_candidates.empty:
+                    print("本次權證事件中沒有相符候選。")
+                else:
+                    agg = event_candidates.groupby(["broker_code", "branch"], as_index=False).agg(
+                        rows=("net_amount", "size"),
+                        buy_amount=("buy_amount", "sum"),
+                        sell_amount=("sell_amount", "sum"),
+                        net_amount=("net_amount", "sum"),
+                    )
+                    agg["abs_net"] = agg["net_amount"].abs()
+                    agg = agg.sort_values(["abs_net", "rows"], ascending=[False, False]).drop(columns=["abs_net"])
+                    print(f"本次權證事件候選共 {len(agg):,} 組：")
+                    print(agg.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            print("=" * 110)
+    except Exception as exc:
+        print(f"⚠️ 精選分點 Debug 失敗：{exc}")
 
 
 def _finmind_market_label(raw_type: str) -> str:
@@ -14464,7 +14994,8 @@ def fetch_stock_data_yf(stock_code: str, period="160d"):
     required = {"date", "open", "max", "min", "close", "Trading_Volume"}
     missing = required - set(raw.columns)
     if missing:
-        raise RuntimeError(f"FinMind TaiwanStockPrice 欄位不足：{sorted(missing)}")
+        _finmind_debug_print_df(f"TaiwanStockPrice 欄位不足｜{code}", raw)
+        raise RuntimeError(f"FinMind TaiwanStockPrice 欄位不足：{sorted(missing)}｜實際欄位={raw.columns.tolist()}")
 
     df = raw.rename(columns={
         "date": "Date",
@@ -14616,7 +15147,11 @@ def _finmind_get_warrant_summary(stock_code: str, start_date, end_date) -> pd.Da
     required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
     missing = required - set(raw.columns)
     if missing:
-        raise RuntimeError(f"FinMind TaiwanStockInfoWithWarrantSummary 欄位不足：{sorted(missing)}")
+        _finmind_debug_print_df("TaiwanStockInfoWithWarrantSummary 欄位不足", raw)
+        raise RuntimeError(
+            f"FinMind TaiwanStockInfoWithWarrantSummary 欄位不足：{sorted(missing)}｜"
+            f"實際欄位={raw.columns.tolist()}"
+        )
 
     df = raw.copy()
     df["stock_id"] = df["stock_id"].astype(str).map(normalize_openapi_warrant_code)
@@ -14678,6 +15213,7 @@ def _finmind_process_warrant_day(
     warrant_name_map: Dict[str, str],
     stock_code: str,
     stock_name: str,
+    trader_name_map: Dict[str, str] | None = None,
 ) -> pd.DataFrame:
     date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
     if not active_codes:
@@ -14698,6 +15234,11 @@ def _finmind_process_warrant_day(
     if raw.empty:
         return pd.DataFrame()
     raw = raw.copy()
+    _finmind_debug_print_df(
+        f"權證分點 Parquet 實際格式｜{date_s}",
+        raw,
+        once_key="schema:TaiwanStockWarrantTradingDailyReport:parquet",
+    )
     raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
     raw = raw[raw["stock_id"].isin(active_codes)].copy()
     if raw.empty:
@@ -14708,8 +15249,30 @@ def _finmind_process_warrant_day(
     raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
     raw["buy_amount_row"] = raw["price"] * raw["buy"]
     raw["sell_amount_row"] = raw["price"] * raw["sell"]
-    raw["branch"] = raw["securities_trader"].astype(str).map(normalize_branch_name)
+    raw["raw_securities_trader"] = raw["securities_trader"].astype(str).str.strip()
     raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+
+    # 權證 Parquet 的 securities_trader 常只顯示券商簡稱（例如「第一金證」），
+    # 必須用 securities_trader_id 對照 TaiwanSecuritiesTraderInfo，才能還原「第一金-中壢」。
+    trader_name_map = trader_name_map or {}
+    raw["mapped_branch"] = raw["broker_code"].map(trader_name_map).fillna("").astype(str)
+    raw["branch"] = np.where(
+        raw["mapped_branch"].astype(str).str.strip() != "",
+        raw["mapped_branch"],
+        raw["raw_securities_trader"],
+    )
+    raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+
+    unresolved = raw[(raw["broker_code"] != "") & (raw["mapped_branch"].astype(str).str.strip() == "")]
+    if not unresolved.empty:
+        unresolved_sample = unresolved[[
+            "broker_code", "raw_securities_trader", "stock_id", "date"
+        ]].drop_duplicates().head(FINMIND_DEBUG_MAX_ROWS)
+        _finmind_debug_print_df(
+            f"權證分點代碼無法由 TaiwanSecuritiesTraderInfo 對照｜{date_s}",
+            unresolved_sample,
+            once_key="unresolved:TaiwanStockWarrantTradingDailyReport",
+        )
     raw = raw[(raw["branch"] != "") & (raw["broker_code"] != "")]
 
     grouped = raw.groupby(
@@ -14873,6 +15436,267 @@ def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events
     )
 
 
+
+def _finmind_fetch_warrant_branch_day_raw(securities_trader_id: str, trade_date) -> tuple[pd.DataFrame, dict]:
+    """直接以分點 ID 查詢單日所有權證明細，回傳 DataFrame 與診斷資訊。"""
+    trader_id = str(securities_trader_id or "").strip()
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    diagnostic = {
+        "securities_trader_id": trader_id,
+        "date": date_s,
+        "http_status": 0,
+        "payload_keys": [],
+        "message": "",
+        "rows": 0,
+    }
+    if not trader_id:
+        diagnostic["message"] = "empty securities_trader_id"
+        return pd.DataFrame(), diagnostic
+
+    last_error = None
+    for attempt in range(1, FINMIND_REQUEST_RETRIES + 1):
+        try:
+            resp = get_thread_session().get(
+                FINMIND_WARRANT_BRANCH_URL,
+                headers=_finmind_headers(),
+                params={"securities_trader_id": trader_id, "date": date_s},
+                timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+            )
+            diagnostic["http_status"] = int(resp.status_code)
+            if resp.status_code in (401, 402, 403):
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {}
+                raise RuntimeError(
+                    f"FinMind 單一權證分點授權失敗：HTTP {resp.status_code}｜"
+                    f"{_finmind_error_message(payload, resp.text[:300])}"
+                )
+            if resp.status_code == 404:
+                diagnostic["message"] = resp.text[:500]
+                return pd.DataFrame(), diagnostic
+            resp.raise_for_status()
+            payload = resp.json()
+            diagnostic["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else []
+            diagnostic["message"] = _finmind_error_message(payload)
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            df = pd.DataFrame(data)
+            diagnostic["rows"] = int(len(df))
+            _finmind_debug_print_df(
+                f"單一權證分點 API 實際格式｜ID={trader_id}｜{date_s}",
+                df,
+                once_key=f"schema:direct-warrant-branch:{trader_id}",
+            )
+            if df.empty and FINMIND_DEBUG_SELECTED_BRANCH_ENABLE:
+                print(
+                    f"🧪 單一權證分點 API 空資料｜ID={trader_id}｜date={date_s}｜"
+                    f"HTTP={resp.status_code}｜keys={diagnostic['payload_keys']}｜msg={diagnostic['message']}"
+                )
+            return df, diagnostic
+        except Exception as exc:
+            last_error = exc
+            if attempt >= FINMIND_REQUEST_RETRIES:
+                break
+            wait_sec = FINMIND_RETRY_BASE_WAIT * attempt
+            print(
+                f"⚠️ FinMind 單一權證分點重試 {attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                f"ID={trader_id}｜date={date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
+            )
+            time.sleep(wait_sec)
+    diagnostic["message"] = str(last_error or "unknown error")
+    raise RuntimeError(
+        f"FinMind 單一權證分點最終失敗：ID={trader_id}｜date={date_s}｜{last_error}"
+    )
+
+
+def _finmind_convert_direct_branch_rows(
+    raw: pd.DataFrame,
+    trade_date,
+    active_codes: set,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_id: str,
+    branch_name: str,
+) -> pd.DataFrame:
+    """把單一分點端點回傳轉成既有 warrant_events 格式。"""
+    output_cols = [
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=output_cols)
+    required = {"price", "buy", "sell", "stock_id"}
+    missing = required - set(raw.columns)
+    if missing:
+        _finmind_debug_print_df(
+            f"單一權證分點 API 欄位不足｜ID={trader_id}｜{pd.Timestamp(trade_date).date()}",
+            raw,
+        )
+        print(f"⚠️ 單一權證分點缺少欄位：{sorted(missing)}｜實際欄位={raw.columns.tolist()}")
+        return pd.DataFrame(columns=output_cols)
+
+    work = raw.copy().fillna("")
+    work["stock_id"] = work["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    work = work[work["stock_id"].isin(set(active_codes or set()))].copy()
+    if work.empty:
+        return pd.DataFrame(columns=output_cols)
+    work["price"] = pd.to_numeric(work["price"], errors="coerce").fillna(0.0)
+    work["buy"] = pd.to_numeric(work["buy"], errors="coerce").fillna(0.0)
+    work["sell"] = pd.to_numeric(work["sell"], errors="coerce").fillna(0.0)
+    work["buy_amount_row"] = work["price"] * work["buy"]
+    work["sell_amount_row"] = work["price"] * work["sell"]
+    grouped = work.groupby("stock_id", as_index=False).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount_row", "sum"),
+        sell_amount=("sell_amount_row", "sum"),
+    )
+    grouped = grouped.rename(columns={"stock_id": "warrant_code"})
+    grouped["Date"] = pd.Timestamp(trade_date).normalize()
+    grouped["broker_code"] = str(trader_id)
+    grouped["branch"] = normalize_branch_name(branch_name)
+    grouped["warrant_name"] = grouped["warrant_code"].map(warrant_name_map).fillna(grouped["warrant_code"])
+    grouped["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+    grouped["underlying_name"] = str(stock_name or "")
+    grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+    grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+    grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+    grouped["side"] = np.where(grouped["net_amount"] >= 0, "買超", "賣超")
+    grouped = grouped[(grouped["buy_amount"] != 0) | (grouped["sell_amount"] != 0)].copy()
+    return grouped[output_cols]
+
+
+def _finmind_direct_verify_and_backfill_selected_branches(
+    events: pd.DataFrame,
+    resolved_map: dict,
+    jobs: list,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_info_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Parquet 中完全沒有精選分點時，使用官方單一分點端點逐日驗證並回補。"""
+    if not FINMIND_SELECTED_BRANCH_DIRECT_VERIFY_ENABLE or not resolved_map:
+        return events
+    id_to_requested = {}
+    for requested, ids in resolved_map.items():
+        for trader_id in ids:
+            id_to_requested.setdefault(str(trader_id), []).append(str(requested))
+    if not id_to_requested:
+        print("⚠️ 精選分點沒有可用的 securities_trader_id，無法啟動單一分點 API 驗證")
+        return events
+
+    id_to_requested = dict(list(id_to_requested.items())[:FINMIND_SELECTED_BRANCH_DIRECT_MAX_IDS])
+    existing = events.copy() if events is not None else pd.DataFrame()
+    if not existing.empty and "broker_code" in existing.columns:
+        existing["broker_code"] = existing["broker_code"].astype(str).str.strip()
+
+    info_map = {}
+    if trader_info_df is not None and not trader_info_df.empty:
+        info_map = dict(zip(
+            trader_info_df["securities_trader_id"].astype(str),
+            trader_info_df["branch"].astype(str),
+        ))
+
+    fallback_ids = []
+    for trader_id, requested_names in id_to_requested.items():
+        storage_rows = int((existing.get("broker_code", pd.Series(dtype=str)) == trader_id).sum()) if not existing.empty else 0
+        print(
+            f"🔎 精選分點 Parquet 檢查｜{'、'.join(requested_names)}｜ID={trader_id}｜"
+            f"事件={storage_rows:,} 筆"
+        )
+        if storage_rows <= 0:
+            fallback_ids.append(trader_id)
+
+    if not fallback_ids:
+        print("✅ 所有精選分點皆已在全市場 Parquet 中命中，不需要單一分點 API 回補")
+        return events
+
+    print(
+        f"🚑 啟動 FinMind 單一權證分點 API 驗證／回補｜ID={fallback_ids}｜"
+        f"日期={len(jobs):,}｜workers={FINMIND_SELECTED_BRANCH_DIRECT_WORKERS}"
+    )
+    frames = []
+    diagnostics = []
+    failures = []
+    tasks = []
+    with ThreadPoolExecutor(max_workers=FINMIND_SELECTED_BRANCH_DIRECT_WORKERS) as executor:
+        for trader_id in fallback_ids:
+            for day, active_codes in jobs:
+                fut = executor.submit(_finmind_fetch_warrant_branch_day_raw, trader_id, day)
+                tasks.append((fut, trader_id, day, active_codes))
+        completed = 0
+        for fut, trader_id, day, active_codes in tasks:
+            completed += 1
+            try:
+                raw, diagnostic = fut.result()
+                diagnostics.append(diagnostic)
+                branch_name = info_map.get(trader_id) or "、".join(id_to_requested.get(trader_id, [])) or trader_id
+                converted = _finmind_convert_direct_branch_rows(
+                    raw,
+                    day,
+                    active_codes,
+                    warrant_name_map,
+                    stock_code,
+                    stock_name,
+                    trader_id,
+                    branch_name,
+                )
+                if not converted.empty:
+                    frames.append(converted)
+            except Exception as exc:
+                failures.append((trader_id, pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+            if completed == 1 or completed % 10 == 0 or completed == len(tasks):
+                print(
+                    f"📊 單一分點 API 進度：{completed}/{len(tasks)}｜"
+                    f"有目標權證資料={len(frames)}｜失敗={len(failures)}"
+                )
+
+    diagnostic_df = pd.DataFrame(diagnostics)
+    if not diagnostic_df.empty:
+        summary = diagnostic_df.groupby("securities_trader_id", as_index=False).agg(
+            request_days=("date", "count"),
+            endpoint_rows=("rows", "sum"),
+            http_statuses=("http_status", lambda s: ",".join(sorted(set(map(str, s))))),
+            messages=("message", lambda s: " | ".join(dict.fromkeys(str(x)[:120] for x in s if str(x).strip()))[:500]),
+        )
+        print("🧪 單一分點 API 診斷彙總：")
+        print(summary.to_string(index=False))
+    if failures:
+        print("🧪 單一分點 API 失敗樣本：")
+        print(pd.DataFrame(failures[:FINMIND_DEBUG_MAX_ROWS], columns=["ID", "date", "error"]).to_string(index=False))
+
+    if not frames:
+        print(
+            "⚠️ 單一分點 API 也沒有回傳該標的權證交易。"
+            "請複製上方『精選分點 ID 對照』『單一分點 API 診斷彙總』與欄位 Debug。"
+        )
+        return events
+
+    direct_events = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+    direct_events["broker_code"] = direct_events["broker_code"].astype(str).str.strip()
+    direct_events["Date"] = pd.to_datetime(direct_events["Date"], errors="coerce").dt.normalize()
+    direct_events = direct_events.dropna(subset=["Date"])
+    print(
+        f"✅ 單一分點 API 找到目標權證事件：{len(direct_events):,} 筆｜"
+        f"日期 {direct_events['Date'].min().date()} ~ {direct_events['Date'].max().date()}｜"
+        f"淨額 {fmt_money(pd.to_numeric(direct_events['net_amount'], errors='coerce').fillna(0).sum())}"
+    )
+
+    if not FINMIND_SELECTED_BRANCH_DIRECT_REPLACE_ENABLE:
+        return events
+    base = events.copy() if events is not None else pd.DataFrame()
+    if not base.empty:
+        base["broker_code"] = base["broker_code"].astype(str).str.strip()
+        base = base[~base["broker_code"].isin(set(fallback_ids))].copy()
+    merged = pd.concat([base, direct_events], ignore_index=True, sort=False).fillna("")
+    merged = merged.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    print(f"✅ 已用單一分點官方端點回補精選分點：ID={fallback_ids}｜合併後 {len(merged):,} 筆")
+    return merged
+
+
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
     """FinMind sponsorpro 全市場權證分點主流程。"""
     code = _normalize_stock_name_code_key(stock_code)
@@ -14898,6 +15722,15 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if summary.empty:
         return pd.DataFrame(columns=empty_columns)
     warrant_name_map = _finmind_warrant_name_map()
+    trader_name_map, trader_info_df = _finmind_securities_trader_maps()
+    if not trader_name_map:
+        print("⚠️ FinMind 分點 ID 對照表為空；本次會保留 Parquet 券商簡稱並印出 Debug 欄位")
+    selected_branch_names = _get_selected_branch_flow_set() if SELECTED_BRANCH_FLOW_ENABLE else set()
+    selected_branch_id_map = _resolve_selected_branch_ids(selected_branch_names) if selected_branch_names else {}
+    print(
+        f"🧩 精選分點正式 ID 結果："
+        f"{ {name: sorted(ids) for name, ids in selected_branch_id_map.items()} }"
+    )
     trading_dates = _finmind_get_trading_dates(start_date, end_date)
     if not trading_dates:
         return pd.DataFrame(columns=empty_columns)
@@ -14954,6 +15787,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
                 warrant_name_map,
                 code,
                 stock_name,
+                trader_name_map,
             ): day
             for day, active_codes in jobs
         }
@@ -14999,8 +15833,23 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0.0)
     events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
     events["branch"] = events["branch"].map(normalize_branch_name)
+    events["broker_code"] = events["broker_code"].astype(str).str.strip()
     events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
     events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    # 單一分點圖若在全市場 Parquet 無法命中，改走官方 query-by-broker 端點逐日驗證／回補。
+    events = _finmind_direct_verify_and_backfill_selected_branches(
+        events,
+        selected_branch_id_map,
+        jobs,
+        warrant_name_map,
+        code,
+        stock_name,
+        trader_info_df,
+    )
+
+    if FINMIND_DEBUG_SELECTED_BRANCH_ENABLE and SELECTED_BRANCH_FLOW_ENABLE:
+        _debug_selected_branch_candidates(_get_selected_branch_flow_list(), events)
 
     should_write_snapshot = bool(
         not failures
@@ -15060,10 +15909,35 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
         return []
 
     raw = pd.concat(frames, ignore_index=True, sort=False).fillna("")
-    required = {"date", "stock_id", "description", "link", "source", "title"}
+    # 官方文件列有 description，但實際 API 在部分日期／版本可能只回傳
+    # date、stock_id、link、source、title，或將摘要改成 content／summary。
+    # 新聞標題本身仍是 FinMind 回傳資料，因此 description 改為可選欄位。
+    required = {"date", "stock_id", "link", "source", "title"}
     missing = required - set(raw.columns)
     if missing:
-        raise RuntimeError(f"FinMind TaiwanStockNews 欄位不足：{sorted(missing)}")
+        _finmind_debug_print_df(f"TaiwanStockNews 必要欄位不足｜{code}", raw)
+        raise RuntimeError(
+            f"FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
+            f"實際欄位={raw.columns.tolist()}"
+        )
+    description_col = next(
+        (c for c in ["description", "content", "summary", "snippet", "text"] if c in raw.columns),
+        "",
+    )
+    if description_col:
+        print(f"📰 FinMind TaiwanStockNews 摘要欄位：{description_col}｜欄位={raw.columns.tolist()}")
+    else:
+        print(
+            "ℹ️ FinMind TaiwanStockNews 本次沒有 description／content／summary，"
+            "改用 FinMind title 作為新聞事實素材｜"
+            f"欄位={raw.columns.tolist()}"
+        )
+        preview_cols = [c for c in ["date", "stock_id", "source", "title", "link"] if c in raw.columns]
+        _finmind_debug_print_df(
+            f"TaiwanStockNews 僅標題模式｜{code}",
+            raw[preview_cols].copy() if preview_cols else raw,
+            once_key=f"news-title-only:{code}",
+        )
     raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
     raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
 
@@ -15071,7 +15945,8 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
     seen = set()
     for _, row in raw.iterrows():
         title = _clean_news_title(row.get("title", ""))
-        description = _normalize_news_text(_html_to_readable_text(row.get("description", "")))
+        raw_description = row.get(description_col, "") if description_col else ""
+        description = _normalize_news_text(_html_to_readable_text(raw_description))
         url = str(row.get("link", "") or "").strip()
         source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
         if not title and not description:
@@ -15085,6 +15960,7 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
         # data_id 已由 FinMind 對應目標股票；補上主體前綴是為了讓原有嚴格新聞驗證可辨識公司。
         fact_text = _normalize_news_text(description or title)
         content = _normalize_news_text(f"{code} {stock_name}：{fact_text}")
+        has_description = bool(description)
         article = {
             "title": title or fact_text[:80],
             "url": url,
@@ -15093,10 +15969,10 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
             "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
             "description": content,
             "content": content,
-            "body_ok": len(content) >= 80,
+            # 有實際摘要且長度足夠才視為原文；只有 title 時仍保留為短事實素材。
+            "body_ok": bool(has_description and len(content) >= 80),
             "fallback_ok": True,
-            # 沿用既有短素材驗證規則，但資料本身來自 FinMind。
-            "content_source": "rss_description",
+            "content_source": "rss_description" if has_description else "rss_title_fact",
             "search_days": FINMIND_NEWS_LOOKBACK_DAYS,
             "query_stage": "FinMind TaiwanStockNews",
             "body_length": len(content),
@@ -15427,6 +16303,20 @@ def _send_discord_file(webhook_url: str, file_path: str, content: str = ""):
 
 
 def main():
+    print("=" * 100)
+    print(f"🧩 FINMIND_BUILD_VERSION={FINMIND_BUILD_VERSION}")
+    print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
+    print(
+        "🧩 ACTIVE_FEATURES="
+        "trader-id-map+direct-branch-fallback+news-title-fallback+calendar7"
+    )
+    print(
+        f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
+        f"{fetch_warrant_events_full_market.__code__.co_firstlineno}｜"
+        f"fetch_multi_source_news_articles={fetch_multi_source_news_articles.__code__.co_firstlineno}｜"
+        f"filter_selected_branch_flow_events={filter_selected_branch_flow_events.__code__.co_firstlineno}"
+    )
+    print("=" * 100)
     output_dir = os.getenv("OUTPUT_DIR", "output").strip() or "output"
     os.makedirs(output_dir, exist_ok=True)
 
