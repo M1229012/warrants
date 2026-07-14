@@ -43,6 +43,14 @@ on:
           - "0"
           - "1"
         default: "0"
+      moneydj_compare_debug:
+        description: "FinMind 與舊 MoneyDJ 精選五分點／成交量完整對帳（0=關閉，1=開啟；會額外耗時）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
 
   # Asia/Taipei 21:20 = UTC 13:20。
   # 每個交易日晚間先建立全市場精簡權證事件快取，之後手動查任何新股票都直接走快速路徑。
@@ -288,6 +296,14 @@ jobs:
       WARRANT_SELECTED_BRANCH_FLOW_MODE: ${{ inputs.selected_branch_flow_mode || 'five' }}
       WARRANT_SELECTED_BRANCH_FLOW_BRANCHES: ${{ inputs.selected_branch_flow_branches || '五分點' }}
 
+      # FinMind vs 舊 MoneyDJ 一次性完整對帳：只列印與輸出 CSV，不改正式報表計算。
+      WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE: ${{ inputs.moneydj_compare_debug || '0' }}
+      WARRANT_COMPARE_DEBUG_MAX_ROWS: "120"
+      WARRANT_COMPARE_DEBUG_VOLUME_DAYS: "30"
+      WARRANT_COMPARE_DEBUG_API4_WORKERS: "30"
+      WARRANT_COMPARE_DEBUG_API5_WORKERS: "40"
+      WARRANT_COMPARE_DEBUG_SAVE_CSV: "1"
+
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
     steps:
@@ -394,6 +410,7 @@ jobs:
           echo "FINMIND_NEWS_LOOKBACK_DAYS=$FINMIND_NEWS_LOOKBACK_DAYS"
           echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
+          echo "WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE=$WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE"
           python -u run_report.py
 
       - name: Upload report artifact
@@ -401,6 +418,8 @@ jobs:
         if: always()
         with:
           name: warrant-report-finmind-test-output
-          path: output/*.png
+          path: |
+            output/*.png
+            output/debug_*.csv
           if-no-files-found: warn
           compression-level: 0
