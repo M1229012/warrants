@@ -192,7 +192,7 @@ DAILY_RESULT_SHEET_TITLES = {
     TOP15_POSITION_DETAIL_SHEET,
 }
 
-TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", os.getenv("LOOKBACK_TRADING_DAYS", "22"))))
+TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", "40")))
 TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75")))
 TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10")))
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
@@ -9831,7 +9831,7 @@ def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, e_
     """
     從 A/B/C/D/E 事件抓近 N 個有效事件交易日。
 
-    這個範圍要和 TOP15 圖的「近一個月交易日」概念一致，
+    這個範圍要和 TOP15 圖的「近兩個月、約 40 個交易日」概念一致，
     讓報酬率快取可以直接對應圖片中的 TOP15 參與分點。
     """
     if lookback_days is None:
@@ -10053,7 +10053,7 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
     - 同一分點 + 同一權證代號的 lot 依「買進日」FIFO 扣。
     - 只扣「賣出日 > 買進日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
     - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
-    - 這裡不回溯計算 22 日以前舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
+    - 這裡不回溯計算近 N 個交易日範圍以前的舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
     """
     if not position_lots:
         return position_lots
@@ -16260,7 +16260,7 @@ def build_price_prefetch_context_from_items(items):
     用既有分點歷史快取重建每日 8 張結果工作表會用到的事件，僅供價格預抓使用。
 
     注意：這裡不寫入任何結果工作表，只重用正式流程的 A/B/C/D/E 金額強度分類，
-    讓價格預抓覆蓋 A～E 與近一個月 TOP15 真正需要的標的股／權證價格。
+    讓價格預抓覆蓋 A～E 與近兩個月（約 40 個交易日）TOP15 真正需要的標的股／權證價格。
     """
     item_map = {}
 
@@ -16414,9 +16414,9 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
             add_price_aliases(price_cache, code, prices)
         print("  ⚠️ 快取資料目前無 A/B/C/D/E 事件，略過事件價格預抓，只檢查其他價格需求。")
 
-    # 每日流程只維護 A～E、每日賣出明細與近一個月 TOP15 所需價格。
+    # 每日流程只維護 A～E、每日賣出明細與近兩個月（約 40 個交易日）TOP15 所需價格。
     # 不再預抓近10日、近7／14／21日或完整歷史中所有代號的價格。
-    print("  ✅ 每日 8 表模式：價格預抓僅處理 A～E 與近一個月 TOP15 所需代號。")
+    print("  ✅ 每日 8 表模式：價格預抓僅處理 A～E 與近兩個月（約 40 個交易日）TOP15 所需代號。")
 
     if all_changed_price_codes:
         save_price_cache(
@@ -16515,7 +16515,7 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
 
             print(
                 f"  🔄 今日曾完成價格預抓，但價格快取尚未取得 {target_date} 收盤價，"
-                "本次再嘗試預抓 A～E 與近一個月 TOP15 所需價格。"
+                "本次再嘗試預抓 A～E 與近兩個月（約 40 個交易日）TOP15 所需價格。"
             )
         else:
             print("  ✅ 今日已完成每日 8 表價格預抓，且 API4 今日市場資料仍未確認；略過正式報表與價格重抓，快速結束。")
