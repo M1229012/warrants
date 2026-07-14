@@ -7111,13 +7111,34 @@ NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_SUPPLEMENT_MIN
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
 NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v15_arabic_digits_news").strip() or "v15_arabic_digits_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+# FinMind TaiwanStockNews 有時只回傳 title。僅標題模式若把目標公司名稱人工加在每篇素材前方，
+# 會讓錯標或產業綜述被誤認成目標公司新聞。正式模式預設要求原始標題／摘要本身直接出現公司名稱或代號。
+FINMIND_NEWS_REQUIRE_DIRECT_TARGET = os.getenv(
+    "WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 只有 FinMind 標題、沒有 description/content 時，不呼叫 Gemini 擴寫；直接以通過主體驗證的原始標題建立保守摘要。
+# 這同時避免模型補入素材不存在的獲利、毛利率與產業敘事，並大幅縮短新股票首次產圖時間。
+FINMIND_NEWS_TITLE_ONLY_RULE_BASED = os.getenv(
+    "WARRANT_FINMIND_NEWS_TITLE_ONLY_RULE_BASED",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 最快模式：第一輪 Gemini 只保留通過 evidence／數字接地驗證的內容，不再為格式問題重打 repair 或 supplement。
+NEWS_GEMINI_REPAIR_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_REPAIR_ENABLE",
+    "0",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_GEMINI_SUPPLEMENT_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE",
+    "0",
+).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v26_status_strip_company_and_derive_fallback"
+    internal_version = "validated_v27_finmind_direct_target_title_rule"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -8860,7 +8881,11 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         # 官方股票名稱短暫查不到時，從 RSS 標題 / 摘要的「公司名(代號)」反推別名，
         # 避免後續多股過濾把「辛耘(3583)」這類明確新聞誤判成非目標公司。
         inferred_name = _extract_company_name_near_code(f"{title} {description}", stock_code)
-        if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
+        if (
+            _is_unknown_stock_name(stock_name)
+            and inferred_name
+            and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), [])
+        ):
             STOCK_NEWS_ALIAS_MAP.setdefault(str(stock_code).strip(), []).append(inferred_name)
             print(f"📰 新聞別名自動補充：{stock_code} → {inferred_name}")
 
@@ -9119,6 +9144,8 @@ def _news_items_to_records(news_items) -> List[dict]:
             query_stage = str(item.get("query_stage", "") or "").strip()
             relevance_score = int(item.get("relevance_score", 0) or 0)
             body_length = int(item.get("body_length", len(raw_content)) or 0)
+            finmind_title_only = bool(item.get("finmind_title_only"))
+            finmind_target_verified = bool(item.get("finmind_target_verified"))
         else:
             # 舊版相容：純字串只當標題，不拿來產生新聞重點。
             title = _clean_news_title(str(item))
@@ -9135,6 +9162,8 @@ def _news_items_to_records(news_items) -> List[dict]:
             query_stage = ""
             relevance_score = 0
             body_length = 0
+            finmind_title_only = False
+            finmind_target_verified = False
         if not title and not content and not description:
             continue
         records.append({
@@ -9152,6 +9181,8 @@ def _news_items_to_records(news_items) -> List[dict]:
             "query_stage": query_stage,
             "relevance_score": relevance_score,
             "body_length": body_length,
+            "finmind_title_only": finmind_title_only,
+            "finmind_target_verified": finmind_target_verified,
         })
     return records
 
@@ -10689,7 +10720,11 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "rss_title_fact", "manual")
 
         inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
-        if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
+        if (
+            _is_unknown_stock_name(stock_name)
+            and inferred_name
+            and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), [])
+        ):
             STOCK_NEWS_ALIAS_MAP.setdefault(str(stock_code).strip(), []).append(inferred_name)
             print(f"📰 新聞別名自動補充：{stock_code} → {inferred_name}")
 
@@ -10875,7 +10910,9 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         )
 
     # 0 點本身不算問題；只有格式、數字或 evidence 被刪除時才 repair。
-    if problems or rejected_points:
+    if (problems or rejected_points) and not NEWS_GEMINI_REPAIR_ENABLE:
+        print("⚡ 新聞最快模式：略過 Gemini repair，只保留第一輪已通過 evidence 與數字接地驗證的內容")
+    if (problems or rejected_points) and NEWS_GEMINI_REPAIR_ENABLE:
         log_problems = list(problems)
         log_problems.extend(
             str(item.get("reason", "") or "evidence 驗證失敗")
@@ -11000,7 +11037,15 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         )
 
     if (
-        len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        not NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        and len(usable_articles) >= NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
+    ):
+        print("⚡ 新聞最快模式：略過 Gemini supplement，不為湊點數追加模型呼叫")
+
+    if (
+        NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
         and len(usable_articles) >= NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
     ):
         remaining_slots = max(0, NEWS_SUMMARY_MAX_POINTS - len(points))
@@ -13215,6 +13260,45 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         # 沒有當期合格素材時直接回傳 0 點，不以舊日期新聞填補本週區塊。
         return []
 
+    # FinMind 目前常只有 title，沒有 description/content。此時 Gemini 無法取得可驗證的完整語境，
+    # 容易把別家公司獲利、毛利率或產業敘事補進來；改用已通過直接主體驗證的原始標題做保守規則式摘要。
+    title_only_finmind = bool(
+        usable_records
+        and all(
+            str(r.get("content_source", "") or "") == "finmind_title_fact"
+            and bool(r.get("finmind_target_verified"))
+            for r in usable_records
+        )
+    )
+    if FINMIND_NEWS_TITLE_ONLY_RULE_BASED and title_only_finmind:
+        rule_points = _rule_based_news_summary(
+            usable_records,
+            stock_code,
+            stock_name,
+        )
+        final_points = _finalize_news_points_for_display(
+            rule_points,
+            stock_code,
+            stock_name,
+            ctx,
+        )
+        if final_points:
+            _save_validated_news_points_cache(
+                _news_points_cache_task(),
+                stock_code,
+                stock_name,
+                f"finmind_title_rule::{stock_code}::{_taipei_today_str()}",
+                final_points,
+                note="validated_finmind_direct_title_rule_points",
+            )
+            print(
+                f"⚡ FinMind 僅標題模式：略過 Gemini，"
+                f"直接使用嚴格主體驗證的規則式新聞重點｜{stock_code}｜{len(final_points)} 點"
+            )
+            return final_points
+        print(f"ℹ️ FinMind 僅標題模式沒有足夠的直接公司事件：{stock_code} {stock_name}")
+        return []
+
     ai_points = _summarize_news_with_gemini(
         usable_records,
         stock_code,
@@ -14998,7 +15082,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-fast-local-cache-v12"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-news-strict-fast-v13"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -17695,6 +17779,9 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
 
     articles = []
     seen = set()
+    skipped_not_target = 0
+    skipped_conflict = 0
+    skipped_stock_id = 0
     for _, row in raw.iterrows():
         title = _clean_news_title(row.get("title", ""))
         raw_description = row.get(description_col, "") if description_col else ""
@@ -17703,15 +17790,35 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
         source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
         if not title and not description:
             continue
+
+        row_stock_id = _normalize_stock_name_code_key(row.get("stock_id", ""))
+        if row_stock_id and row_stock_id != code:
+            skipped_stock_id += 1
+            continue
+
+        # 重要：不可再人工把「2408 南亞科」加到每一篇素材前面。
+        # FinMind 偶爾會把產業綜述或其他公司新聞掛到 data_id；只有原始標題／摘要本身直接提及目標公司才放行。
+        source_text = _normalize_news_text("。".join(x for x in [title, description] if x))
+        if _has_conflicting_similar_company_name(source_text, code, stock_name):
+            skipped_conflict += 1
+            continue
+        if FINMIND_NEWS_REQUIRE_DIRECT_TARGET and not _news_text_matches_target_stock(
+            source_text,
+            code,
+            stock_name,
+        ):
+            skipped_not_target += 1
+            continue
+
         key = _article_seen_key(title, url)
         if key and key in seen:
             continue
         if key:
             seen.add(key)
 
-        # data_id 已由 FinMind 對應目標股票；補上主體前綴是為了讓原有嚴格新聞驗證可辨識公司。
         fact_text = _normalize_news_text(description or title)
-        content = _normalize_news_text(f"{code} {stock_name}：{fact_text}")
+        if not fact_text:
+            continue
         has_description = bool(description)
         article = {
             "title": title or fact_text[:80],
@@ -17719,18 +17826,26 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
             "source": source,
             "source_family": "FinMind",
             "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
-            "description": content,
-            "content": content,
-            # 有實際摘要且長度足夠才視為原文；只有 title 時仍保留為短事實素材。
-            "body_ok": bool(has_description and len(content) >= 80),
+            "description": description,
+            "content": fact_text,
+            # 有實際摘要且長度足夠才視為原文；只有 title 時只作逐字事實素材，不交給模型擴寫。
+            "body_ok": bool(has_description and len(fact_text) >= 80),
             "fallback_ok": True,
-            "content_source": "rss_description" if has_description else "rss_title_fact",
+            "content_source": "finmind_description" if has_description else "finmind_title_fact",
+            "finmind_title_only": not has_description,
+            "finmind_target_verified": True,
             "search_days": FINMIND_NEWS_LOOKBACK_DAYS,
             "query_stage": "FinMind TaiwanStockNews",
-            "body_length": len(content),
+            "body_length": len(fact_text),
         }
         article["relevance_score"] = _score_news_article_relevance(article, code, stock_name)
         articles.append(article)
+
+    if skipped_not_target or skipped_conflict or skipped_stock_id:
+        print(
+            f"🛡️ FinMind 新聞嚴格主體過濾：{code} {stock_name}｜"
+            f"非直接主體={skipped_not_target}｜相似公司衝突={skipped_conflict}｜stock_id不符={skipped_stock_id}"
+        )
 
     def _finmind_news_sort_key(article: dict):
         dt = pd.to_datetime(article.get("published", ""), errors="coerce")
@@ -18070,7 +18185,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+local-daily-llm+branch-perf-disk+single-news-cache-read+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+strict-finmind-news+title-rule-summary+branch-perf-disk+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
