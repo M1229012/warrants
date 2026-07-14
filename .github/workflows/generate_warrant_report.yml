@@ -44,13 +44,29 @@ on:
           - "1"
         default: "0"
       moneydj_compare_debug:
-        description: "FinMind 與舊 MoneyDJ 精選五分點／成交量完整對帳（0=關閉，1=開啟；會額外耗時）"
+        description: "FinMind 與舊 MoneyDJ 完整對帳（成交量、上方權證資金流、TOP5、精選五分點；會額外耗時）"
         required: false
         type: choice
         options:
           - "0"
           - "1"
         default: "0"
+      moneydj_compare_all_branches:
+        description: "對帳時是否重現舊 MoneyDJ API4 全分點上方圖（1=是；建議本次比對選 1）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "1"
+      finmind_current_day_guard:
+        description: "FinMind 當日資料尚在更新時是否排除當日權證分點（1=安全排除，0=仍納入）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "1"
 
   # Asia/Taipei 21:20 = UTC 13:20。
   # 每個交易日晚間先建立全市場精簡權證事件快取，之後手動查任何新股票都直接走快速路徑。
@@ -163,7 +179,7 @@ jobs:
   run-warrant-report-test:
     if: github.event_name == 'workflow_dispatch' && inputs.prewarm_cache_only != '1'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     env:
       OUTPUT_DIR: output
@@ -194,6 +210,8 @@ jobs:
       # 任意新股票直接使用排程預熱的全市場精簡事件檔。
       FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
       FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
+      # FinMind 當日權證分點可能分批更新；正式圖預設只使用前一個完整交易日。
+      FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE: ${{ inputs.finmind_current_day_guard || '1' }}
 
       # 上方權證資金流與 TOP5：逐檔排除該權證官方辨識的發行造市端。
       WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
@@ -298,6 +316,7 @@ jobs:
 
       # FinMind vs 舊 MoneyDJ 一次性完整對帳：只列印與輸出 CSV，不改正式報表計算。
       WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE: ${{ inputs.moneydj_compare_debug || '0' }}
+      WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE: ${{ inputs.moneydj_compare_all_branches || '1' }}
       WARRANT_COMPARE_DEBUG_MAX_ROWS: "120"
       WARRANT_COMPARE_DEBUG_VOLUME_DAYS: "30"
       WARRANT_COMPARE_DEBUG_API4_WORKERS: "30"
@@ -411,6 +430,8 @@ jobs:
           echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
           echo "WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE=$WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE"
+          echo "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE=$WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE"
+          echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           python -u run_report.py
 
       - name: Upload report artifact
