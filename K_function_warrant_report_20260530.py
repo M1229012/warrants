@@ -13,7 +13,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -1338,7 +1338,7 @@ GSHEET_LLM_CACHE_HEADERS = [
 
 def _taipei_today_str() -> str:
     """GitHub runner 預設常是 UTC；這裡固定用台北日期判斷「當天」。"""
-    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y/%m/%d")
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y/%m/%d")
 
 
 def _compact_date_key(date_str: str) -> str:
@@ -6208,7 +6208,7 @@ def get_taipei_today_ts() -> pd.Timestamp:
     GitHub Actions runner 常用 UTC，若直接 datetime.today() 可能在台灣盤後仍停在前一天；
     權證分點資料抓取區間應以台北日期為準。
     """
-    return pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
+    return pd.Timestamp(datetime.now(timezone.utc) + timedelta(hours=8)).normalize()
 
 
 def _parse_selected_branch_flow_names(raw: str) -> List[str]:
@@ -14804,7 +14804,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-official-issuer-flow-uv-v6"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-quota-cache-batch-v7"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -14812,11 +14812,34 @@ FINMIND_REQUEST_RETRIES = max(1, int(os.getenv("FINMIND_REQUEST_RETRIES", "5")))
 FINMIND_RETRY_BASE_WAIT = max(0.2, float(os.getenv("FINMIND_RETRY_BASE_WAIT", "1.5")))
 FINMIND_CONNECT_TIMEOUT = max(3.0, float(os.getenv("FINMIND_CONNECT_TIMEOUT", "10")))
 FINMIND_READ_TIMEOUT = max(15.0, float(os.getenv("FINMIND_READ_TIMEOUT", "180")))
+# FinMind 額度超限與授權失敗分流：
+# - 401 / 403，以及不含額度關鍵字的 402：視為 Token／方案權限錯誤，立即中止。
+# - 402 / 429 且訊息包含 upper limit、reach、quota、rate limit 等：視為每小時額度超限，等待後重試。
+FINMIND_RATE_LIMIT_RETRIES = max(0, int(os.getenv("FINMIND_RATE_LIMIT_RETRIES", "4")))
+FINMIND_RATE_LIMIT_BASE_WAIT = max(1.0, float(os.getenv("FINMIND_RATE_LIMIT_BASE_WAIT", "60")))
+FINMIND_RATE_LIMIT_MAX_WAIT = max(
+    FINMIND_RATE_LIMIT_BASE_WAIT,
+    float(os.getenv("FINMIND_RATE_LIMIT_MAX_WAIT", "300")),
+)
 FINMIND_WARRANT_DOWNLOAD_WORKERS = max(1, int(os.getenv("FINMIND_WARRANT_DOWNLOAD_WORKERS", "4")))
 FINMIND_NEWS_WORKERS = max(1, int(os.getenv("FINMIND_NEWS_WORKERS", "4")))
 FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", "30")))
 FINMIND_CACHE_DIR = os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache"
 FINMIND_WARRANT_DAY_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "warrant_daily")
+# 多股票時，每個交易日的全市場 Parquet 只解析一次：
+# 先建立所有目標股票有效認購權證代號聯集，再一次讀取、聚合並依標的股拆分。
+FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE = os.getenv(
+    "FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS = max(2, int(os.getenv(
+    "FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS",
+    "2",
+)))
+FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS = max(90, int(os.getenv(
+    "FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS",
+    "150",
+)))
 FINMIND_WARRANT_LATEST_PROBE_DAYS = max(1, int(os.getenv("FINMIND_WARRANT_LATEST_PROBE_DAYS", "7")))
 # TaiwanStockTradingDate 可能尚未反映颱風等臨時休市；權證分點實際下載日期
 # 改以高流動性 ETF 的 TaiwanStockPrice 實際成交日期為準。
@@ -14912,7 +14935,17 @@ _FINMIND_DEBUG_ONCE_KEYS = set()
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
 _FINMIND_STORAGE_LOCKS = {}
 _FINMIND_STORAGE_LOCKS_GUARD = threading.Lock()
+_FINMIND_RATE_LIMIT_GATE_LOCK = threading.Lock()
+_FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = 0.0
 _FINMIND_WARRANT_RUN_STATS = {}
+_FINMIND_MULTI_STOCK_PREFETCH_READY = False
+_FINMIND_MULTI_STOCK_PREFETCH_RANGE = (pd.NaT, pd.NaT)
+_FINMIND_MULTI_STOCK_LATEST_AVAILABLE = pd.NaT
+_FINMIND_MULTI_STOCK_EVENT_CACHE = {}
+_FINMIND_MULTI_STOCK_SUMMARY_CACHE = {}
+_FINMIND_MULTI_STOCK_NAME_MAP_CACHE = {}
+_FINMIND_MULTI_STOCK_NAME_CACHE = {}
+_FINMIND_MULTI_STOCK_PREFETCH_LOCK = threading.RLock()
 
 FINMIND_WARRANT_SOURCE_LABEL = "FinMind_TaiwanStockWarrantTradingDailyReport"
 
@@ -14954,6 +14987,85 @@ def _finmind_error_message(payload, fallback: str = "") -> str:
             or payload
         )
     return str(fallback or payload or "未知錯誤")
+
+
+class FinMindAuthorizationError(RuntimeError):
+    """FinMind Token、方案或資料集權限錯誤；等待不會改善，必須立即中止。"""
+
+
+class FinMindRateLimitError(RuntimeError):
+    """FinMind 每小時／短時間請求額度超限；已完成等待重試後仍失敗。"""
+
+
+def _finmind_error_payload_from_response(resp) -> tuple[dict, str]:
+    try:
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    try:
+        fallback = str(resp.text or "")[:500]
+    except Exception:
+        fallback = ""
+    return payload, _finmind_error_message(payload, fallback)
+
+
+def _finmind_is_rate_limit(status_code, message: str) -> bool:
+    """只把明確的額度訊息視為可等待重試，避免把真正的 402 方案權限問題誤當限流。"""
+    try:
+        status = int(status_code)
+    except Exception:
+        status = 0
+    msg = str(message or "").strip().lower()
+    if status not in (402, 429):
+        return False
+    tokens = (
+        "upper limit", "reach", "reached", "rate limit", "request limit",
+        "too many request", "too many requests", "quota", "exceed", "exceeded",
+        "hourly limit", "per hour", "frequency limit", "額度", "上限",
+        "請求次數", "每小時", "超限", "超過",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _finmind_rate_limit_wait_seconds(quota_attempt: int, resp=None) -> float:
+    retry_after = 0.0
+    if resp is not None:
+        try:
+            retry_after = float(resp.headers.get("Retry-After", 0) or 0)
+        except Exception:
+            retry_after = 0.0
+    exponential = FINMIND_RATE_LIMIT_BASE_WAIT * (2 ** max(0, int(quota_attempt) - 1))
+    return min(FINMIND_RATE_LIMIT_MAX_WAIT, max(FINMIND_RATE_LIMIT_BASE_WAIT, retry_after, exponential))
+
+
+def _finmind_wait_for_rate_limit_gate():
+    """所有 FinMind worker 共用同一個限流閘門，避免多執行緒在等待期間繼續撞 API。"""
+    with _FINMIND_RATE_LIMIT_GATE_LOCK:
+        remaining = max(0.0, _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC - time.monotonic())
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _finmind_wait_after_rate_limit(label: str, quota_attempt: int, message: str, resp=None):
+    global _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC
+    if quota_attempt > FINMIND_RATE_LIMIT_RETRIES:
+        raise FinMindRateLimitError(
+            f"FinMind 額度超限，等待重試 {FINMIND_RATE_LIMIT_RETRIES} 次後仍未恢復："
+            f"{label}｜{str(message or '')[:300]}"
+        )
+    wait_sec = _finmind_rate_limit_wait_seconds(quota_attempt, resp=resp)
+    with _FINMIND_RATE_LIMIT_GATE_LOCK:
+        target = time.monotonic() + wait_sec
+        _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = max(_FINMIND_RATE_LIMIT_UNTIL_MONOTONIC, target)
+        remaining = max(0.0, _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC - time.monotonic())
+    print(
+        f"⏳ FinMind 額度超限，所有 worker 暫停後重試 {quota_attempt}/{FINMIND_RATE_LIMIT_RETRIES}｜"
+        f"{label}｜等待 {remaining:.0f} 秒｜{str(message or '')[:220]}"
+    )
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def _finmind_debug_print_df(label: str, df: pd.DataFrame, max_rows: int | None = None, once_key: str = ""):
@@ -15053,31 +15165,49 @@ def _finmind_get_data(
         params.update({k: v for k, v in extra_params.items() if v not in (None, "")})
 
     last_error = None
-    for attempt in range(1, FINMIND_REQUEST_RETRIES + 1):
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
         try:
+            _finmind_wait_for_rate_limit_gate()
             resp = get_thread_session().get(
                 FINMIND_API_URL,
                 headers=_finmind_headers(),
                 params=params,
                 timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
             )
-            if resp.status_code in (401, 402, 403):
-                try:
-                    payload = resp.json()
-                except Exception:
-                    payload = {}
-                raise RuntimeError(
-                    f"FinMind 授權或方案權限失敗：HTTP {resp.status_code}｜"
-                    f"{_finmind_error_message(payload, resp.text[:300])}"
+            if resp.status_code in (401, 402, 403, 429):
+                payload, message = _finmind_error_payload_from_response(resp)
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"dataset={dataset}｜data_id={data_id}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 授權或方案權限失敗：HTTP {resp.status_code}｜{message}"
                 )
+
             resp.raise_for_status()
             payload = resp.json()
             status = payload.get("status", 200) if isinstance(payload, dict) else 200
             if str(status) not in ("200", "success", "True", "true"):
+                message = _finmind_error_message(payload)
+                if _finmind_is_rate_limit(status, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"dataset={dataset}｜data_id={data_id}",
+                        quota_attempt,
+                        message,
+                    )
+                    continue
                 raise RuntimeError(
-                    f"FinMind API 回傳失敗：dataset={dataset}｜status={status}｜"
-                    f"{_finmind_error_message(payload)}"
+                    f"FinMind API 回傳失敗：dataset={dataset}｜status={status}｜{message}"
                 )
+
             data = payload.get("data", []) if isinstance(payload, dict) else []
             df = pd.DataFrame(data)
             if df.empty and not allow_empty:
@@ -15102,13 +15232,16 @@ def _finmind_get_data(
                     once_key=f"schema:{dataset}",
                 )
             return df
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
         except Exception as exc:
             last_error = exc
-            if attempt >= FINMIND_REQUEST_RETRIES:
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
                 break
-            wait_sec = FINMIND_RETRY_BASE_WAIT * attempt
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
             print(
-                f"⚠️ FinMind API 重試 {attempt}/{FINMIND_REQUEST_RETRIES - 1}："
+                f"⚠️ FinMind API 重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}："
                 f"dataset={dataset}｜{exc}｜等待 {wait_sec:.1f} 秒"
             )
             time.sleep(wait_sec)
@@ -15164,9 +15297,12 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                     pass
 
         last_error = None
-        for attempt in range(1, FINMIND_REQUEST_RETRIES + 1):
+        normal_attempt = 0
+        quota_attempt = 0
+        while normal_attempt < FINMIND_REQUEST_RETRIES:
             tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
             try:
+                _finmind_wait_for_rate_limit_gate()
                 resp = get_thread_session().get(
                     FINMIND_STORAGE_URL,
                     headers=_finmind_headers(),
@@ -15179,14 +15315,20 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                     allow_redirects=True,
                 )
 
-                if resp.status_code in (401, 402, 403):
-                    try:
-                        payload = resp.json()
-                    except Exception:
-                        payload = {}
-                    raise RuntimeError(
+                if resp.status_code in (401, 402, 403, 429):
+                    payload, message = _finmind_error_payload_from_response(resp)
+                    if _finmind_is_rate_limit(resp.status_code, message):
+                        quota_attempt += 1
+                        _finmind_wait_after_rate_limit(
+                            f"storage_objects｜date={date_s}",
+                            quota_attempt,
+                            message,
+                            resp=resp,
+                        )
+                        continue
+                    raise FinMindAuthorizationError(
                         "FinMind sponsorpro 權證分點權限失敗："
-                        f"HTTP {resp.status_code}｜{_finmind_error_message(payload, resp.text[:300])}"
+                        f"HTTP {resp.status_code}｜{message}"
                     )
 
                 if resp.status_code in (400, 404, 422):
@@ -15197,9 +15339,6 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                             f"HTTP {resp.status_code}｜{message[:160]}"
                         )
                         return None
-                    # 4xx 代表該日期沒有物件或參數不成立，重試不會改變結果。
-                    # 實際交易日清單已由 TaiwanStockPrice 過濾；若仍遇到 4xx，
-                    # 代表真實交易日資料缺檔，交由完整度檢查中止，不浪費時間重試。
                     raise FinMindStorageObjectUnavailable(
                         f"FinMind 權證分點物件不存在：{date_s}｜"
                         f"HTTP {resp.status_code}｜{message[:300]}"
@@ -15216,14 +15355,22 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
 
                 if _looks_like_json_or_html_file(tmp_path):
                     message = _read_small_error_file(tmp_path)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    if _finmind_is_rate_limit(402, message):
+                        quota_attempt += 1
+                        _finmind_wait_after_rate_limit(
+                            f"storage_objects｜date={date_s}",
+                            quota_attempt,
+                            message,
+                        )
+                        continue
                     if allow_not_ready and any(
                         token in message.lower()
                         for token in ["no data", "not found", "尚無", "查無", "empty"]
                     ):
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
                         print(f"ℹ️ FinMind 權證分點尚無 {date_s}：{message[:200]}")
                         return None
                     raise RuntimeError(f"FinMind storage_objects 未回傳 Parquet：{message[:500]}")
@@ -15243,7 +15390,7 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                     f"{os.path.getsize(path) / 1024 / 1024:.2f} MB"
                 )
                 return path
-            except FinMindStorageObjectUnavailable:
+            except (FinMindStorageObjectUnavailable, FinMindAuthorizationError, FinMindRateLimitError):
                 try:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
@@ -15257,19 +15404,15 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                         os.remove(tmp_path)
                 except Exception:
                     pass
-                if attempt >= FINMIND_REQUEST_RETRIES:
+                normal_attempt += 1
+                if normal_attempt >= FINMIND_REQUEST_RETRIES:
                     break
-                wait_sec = FINMIND_RETRY_BASE_WAIT * attempt
+                wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
                 print(
-                    f"⚠️ FinMind 權證 Parquet 重試 {attempt}/{FINMIND_REQUEST_RETRIES - 1}："
+                    f"⚠️ FinMind 權證分點下載重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
                     f"{date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
                 )
                 time.sleep(wait_sec)
-
-        if allow_not_ready:
-            # 只有最新日期探測允許回傳 None；但網路或解析錯誤仍會清楚印出。
-            print(f"⚠️ FinMind 最新權證日期探測失敗：{date_s}｜{last_error}")
-            return None
         raise RuntimeError(f"FinMind 權證分點下載最終失敗：{date_s}｜{last_error}")
 
 
@@ -15431,17 +15574,25 @@ def _finmind_market_label(raw_type: str) -> str:
 
 
 def get_tw_stock_name(stock_code: str) -> str:
-    """FinMind-only：股票名稱只讀 TaiwanStockInfo，不讀本機／Google Sheet／官方網站備援。"""
+    """FinMind-only：優先讀 TaiwanStockInfo；暫缺時以股票代號作名稱並保留警告。"""
     code = _normalize_stock_name_code_key(stock_code)
     if not code:
         raise ValueError("股票代號不可為空")
     df = _finmind_load_stock_info()
     hit = df[df["stock_id"].astype(str) == code]
     if hit.empty:
-        raise RuntimeError(f"FinMind TaiwanStockInfo 找不到股票代號：{code}")
+        print(
+            f"⚠️ FinMind TaiwanStockInfo 暫時找不到股票代號：{code}｜"
+            f"本次先以代號「{code}」作為名稱，股價資料仍會繼續驗證"
+        )
+        return code
     name = str(hit.iloc[-1].get("stock_name", "") or "").strip()
     if not name:
-        raise RuntimeError(f"FinMind TaiwanStockInfo 股票名稱為空：{code}")
+        print(
+            f"⚠️ FinMind TaiwanStockInfo 股票名稱為空：{code}｜"
+            f"本次先以代號「{code}」作為名稱"
+        )
+        return code
     print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：FinMind TaiwanStockInfo")
     return name
 
@@ -15451,7 +15602,7 @@ def fetch_stock_data_yf(stock_code: str, period="160d"):
     code = _normalize_stock_name_code_key(stock_code)
     match = re.search(r"(\d+)", str(period or "160d"))
     calendar_days = max(120, int(match.group(1)) if match else 160)
-    end_dt = datetime.utcnow() + timedelta(hours=8)
+    end_dt = datetime.now(timezone.utc) + timedelta(hours=8)
     start_dt = end_dt - timedelta(days=calendar_days)
     raw = _finmind_get_data(
         "TaiwanStockPrice",
@@ -15499,7 +15650,7 @@ def fetch_stock_data_yf(stock_code: str, period="160d"):
 def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
     """FinMind-only：三大法人不再使用公開模式或 X_function 備援。"""
     code = _normalize_stock_name_code_key(stock_code)
-    end_dt = datetime.utcnow() + timedelta(hours=8)
+    end_dt = datetime.now(timezone.utc) + timedelta(hours=8)
     start_dt = end_dt - timedelta(days=max(int(days * 3.0), 160))
     raw = _finmind_get_data(
         "TaiwanStockInstitutionalInvestorsBuySell",
@@ -15822,6 +15973,263 @@ def _finmind_process_warrant_day(
     ]]
 
 
+
+def _finmind_process_warrant_day_union(
+    trade_date,
+    active_codes_by_stock: Dict[str, set],
+    warrant_name_maps: Dict[str, Dict[str, str]],
+    stock_names: Dict[str, str],
+    trader_name_map: Dict[str, str],
+) -> Dict[str, pd.DataFrame]:
+    """多股票共用：單日全市場 Parquet 只讀一次，再依有效權證代號拆回各標的股。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    union_codes = set()
+    for codes in active_codes_by_stock.values():
+        union_codes.update(set(codes or set()))
+    if not union_codes:
+        return {}
+
+    path = _finmind_download_warrant_day(trade_date, allow_not_ready=False)
+    columns = [
+        "securities_trader", "price", "buy", "sell",
+        "securities_trader_id", "stock_id", "date",
+    ]
+    sorted_codes = sorted(union_codes)
+    try:
+        raw = pd.read_parquet(path, columns=columns, filters=[("stock_id", "in", sorted_codes)])
+    except Exception:
+        raw = pd.read_parquet(path, columns=columns)
+        raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        raw = raw[raw["stock_id"].isin(union_codes)].copy()
+    if raw.empty:
+        return {code: pd.DataFrame() for code in active_codes_by_stock}
+
+    raw = raw.copy()
+    _finmind_debug_print_df(
+        f"多股票聯集權證分點 Parquet 實際格式｜{date_s}",
+        raw,
+        once_key="schema:TaiwanStockWarrantTradingDailyReport:parquet",
+    )
+    raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    raw = raw[raw["stock_id"].isin(union_codes)].copy()
+    if raw.empty:
+        return {code: pd.DataFrame() for code in active_codes_by_stock}
+
+    raw["price"] = pd.to_numeric(raw["price"], errors="coerce").fillna(0.0)
+    raw["buy"] = pd.to_numeric(raw["buy"], errors="coerce").fillna(0.0)
+    raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
+    raw["buy_amount_row"] = raw["price"] * raw["buy"]
+    raw["sell_amount_row"] = raw["price"] * raw["sell"]
+    raw["raw_securities_trader"] = raw["securities_trader"].astype(str).str.strip()
+    raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+    raw["mapped_branch"] = raw["broker_code"].map(trader_name_map).fillna("").astype(str)
+    raw["branch"] = np.where(
+        raw["mapped_branch"].astype(str).str.strip() != "",
+        raw["mapped_branch"],
+        raw["raw_securities_trader"],
+    )
+    raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+    raw = raw[(raw["branch"] != "") & (raw["broker_code"] != "")]
+
+    grouped = raw.groupby(
+        ["broker_code", "branch", "stock_id"],
+        as_index=False,
+        dropna=False,
+    ).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount_row", "sum"),
+        sell_amount=("sell_amount_row", "sum"),
+    )
+
+    output = {}
+    for stock_code, active_codes in active_codes_by_stock.items():
+        code = _normalize_stock_name_code_key(stock_code)
+        part = grouped[grouped["stock_id"].isin(set(active_codes or set()))].copy()
+        if part.empty:
+            output[code] = pd.DataFrame()
+            continue
+        part = part.rename(columns={"stock_id": "warrant_code"})
+        part["Date"] = pd.Timestamp(date_s)
+        name_map = warrant_name_maps.get(code, {}) or {}
+        part["warrant_name"] = part["warrant_code"].map(name_map).fillna(part["warrant_code"])
+        part["underlying_code"] = code
+        part["underlying_name"] = str(stock_names.get(code, code) or code)
+        part["buy_shares"] = part["buy_shares_raw"] / 1000.0
+        part["sell_shares"] = part["sell_shares_raw"] / 1000.0
+        part["net_amount"] = part["buy_amount"] - part["sell_amount"]
+        part = part[
+            (part["buy_amount"] != 0)
+            | (part["sell_amount"] != 0)
+            | (part["net_amount"] != 0)
+        ].copy()
+        part["side"] = np.where(part["net_amount"] >= 0, "買超", "賣超")
+        output[code] = part[[
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+            "net_amount", "buy_shares", "sell_shares", "side",
+        ]]
+    return output
+
+
+def _finmind_prepare_multi_stock_warrant_events(stock_codes: List[str]):
+    """多股票預處理：每個交易日只解析一次全市場 Parquet，結果按股票保存在記憶體。"""
+    global _FINMIND_MULTI_STOCK_PREFETCH_READY
+    global _FINMIND_MULTI_STOCK_PREFETCH_RANGE
+    global _FINMIND_MULTI_STOCK_LATEST_AVAILABLE
+    global _FINMIND_MULTI_STOCK_EVENT_CACHE
+    global _FINMIND_MULTI_STOCK_SUMMARY_CACHE
+    global _FINMIND_MULTI_STOCK_NAME_MAP_CACHE
+    global _FINMIND_MULTI_STOCK_NAME_CACHE
+
+    codes = []
+    for raw_code in stock_codes or []:
+        code = _normalize_stock_name_code_key(raw_code)
+        if code and code not in codes:
+            codes.append(code)
+    if (
+        not FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE
+        or len(codes) < FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS
+    ):
+        return False
+
+    with _FINMIND_MULTI_STOCK_PREFETCH_LOCK:
+        if _FINMIND_MULTI_STOCK_PREFETCH_READY and set(codes).issubset(_FINMIND_MULTI_STOCK_EVENT_CACHE):
+            return True
+
+        end_ts = get_taipei_today_ts()
+        start_ts = end_ts - pd.Timedelta(days=FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS - 1)
+        print(
+            f"🚀 多股票權證聯集預處理：{len(codes)} 檔｜"
+            f"{start_ts.date()} ~ {end_ts.date()}｜每日 Parquet 只讀一次"
+        )
+
+        stock_names = {}
+        summaries = {}
+        name_maps = {}
+        for code in codes:
+            stock_names[code] = get_tw_stock_name(code)
+            summary = _finmind_get_warrant_summary(code, start_ts, end_ts)
+            summaries[code] = summary
+            name_maps[code] = _finmind_target_warrant_name_map(summary) if not summary.empty else {}
+
+        trading_dates = _finmind_get_trading_dates(start_ts, end_ts)
+        if not trading_dates:
+            return False
+
+        latest_available = None
+        for day in reversed(trading_dates[-FINMIND_WARRANT_LATEST_PROBE_DAYS:]):
+            probe_path = _finmind_download_warrant_day(day, allow_not_ready=True)
+            if probe_path:
+                latest_available = pd.Timestamp(day).normalize()
+                break
+        if latest_available is None:
+            raise RuntimeError("多股票預處理找不到最近可用的 FinMind 權證分點日檔")
+        trading_dates = [d for d in trading_dates if d <= latest_available]
+
+        trader_name_map, _ = _finmind_securities_trader_maps()
+        jobs = []
+        active_date_count = {code: 0 for code in codes}
+        for day in trading_dates:
+            active_by_stock = {}
+            for code in codes:
+                active_codes = _finmind_active_warrant_codes(summaries.get(code), day)
+                if active_codes:
+                    active_by_stock[code] = active_codes
+                    active_date_count[code] += 1
+            if active_by_stock:
+                jobs.append((day, active_by_stock))
+
+        frames_by_stock = {code: [] for code in codes}
+        failures = []
+        completed = 0
+        with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_DOWNLOAD_WORKERS) as executor:
+            future_map = {
+                executor.submit(
+                    _finmind_process_warrant_day_union,
+                    day,
+                    active_by_stock,
+                    name_maps,
+                    stock_names,
+                    trader_name_map,
+                ): day
+                for day, active_by_stock in jobs
+            }
+            for future in as_completed(future_map):
+                day = future_map[future]
+                completed += 1
+                try:
+                    day_map = future.result()
+                    for code, day_df in (day_map or {}).items():
+                        if day_df is not None and not day_df.empty:
+                            frames_by_stock.setdefault(code, []).append(day_df)
+                except Exception as exc:
+                    failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+                    print(f"❌ 多股票聯集 Parquet 日期失敗：{pd.Timestamp(day).date()}｜{exc}")
+                if completed == 1 or completed % 5 == 0 or completed == len(jobs):
+                    print(
+                        f"📊 多股票聯集進度：{completed}/{len(jobs)}｜"
+                        f"失敗={len(failures)}"
+                    )
+
+        if failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
+            samples = "；".join(f"{d}:{err[:120]}" for d, err in failures[:5])
+            raise RuntimeError(
+                f"多股票 FinMind 權證分點不完整：失敗 {len(failures)}/{len(jobs)} 日｜{samples}"
+            )
+
+        event_cache = {}
+        for code in codes:
+            frames = frames_by_stock.get(code, [])
+            if frames:
+                events = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+                events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+                events = events.dropna(subset=["Date"])
+                events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+            else:
+                events = pd.DataFrame()
+            event_cache[code] = events
+            _FINMIND_WARRANT_RUN_STATS[code] = {
+                "total_dates": int(active_date_count.get(code, 0)),
+                "success_dates": int(active_date_count.get(code, 0)),
+                "empty_dates": max(0, int(active_date_count.get(code, 0)) - int(events["Date"].nunique() if not events.empty else 0)),
+                "failed_dates": 0,
+                "latest_available_date": latest_available.strftime("%Y-%m-%d"),
+            }
+            print(f"✅ 多股票聯集拆分：{code} {stock_names.get(code, code)}｜{len(events):,} 筆")
+
+        _FINMIND_MULTI_STOCK_EVENT_CACHE = event_cache
+        _FINMIND_MULTI_STOCK_SUMMARY_CACHE = summaries
+        _FINMIND_MULTI_STOCK_NAME_MAP_CACHE = name_maps
+        _FINMIND_MULTI_STOCK_NAME_CACHE = stock_names
+        _FINMIND_MULTI_STOCK_PREFETCH_RANGE = (start_ts, end_ts)
+        _FINMIND_MULTI_STOCK_LATEST_AVAILABLE = latest_available
+        _FINMIND_MULTI_STOCK_PREFETCH_READY = True
+        print(
+            f"✅ 多股票權證聯集預處理完成：{len(codes)} 檔｜"
+            f"交易日 {len(jobs)} 日｜失敗 {len(failures)} 日"
+        )
+        return True
+
+
+def _finmind_get_multi_stock_prefetched_events(stock_code: str, start_date, end_date):
+    code = _normalize_stock_name_code_key(stock_code)
+    with _FINMIND_MULTI_STOCK_PREFETCH_LOCK:
+        if not _FINMIND_MULTI_STOCK_PREFETCH_READY or code not in _FINMIND_MULTI_STOCK_EVENT_CACHE:
+            return None
+        range_start, range_end = _FINMIND_MULTI_STOCK_PREFETCH_RANGE
+        start_ts = pd.Timestamp(start_date).normalize()
+        end_ts = pd.Timestamp(end_date).normalize()
+        if pd.isna(range_start) or pd.isna(range_end) or start_ts < range_start or end_ts > range_end:
+            return None
+        events = _FINMIND_MULTI_STOCK_EVENT_CACHE.get(code)
+        if events is None:
+            return pd.DataFrame()
+        out = events.copy()
+        if not out.empty:
+            out = out[(out["Date"] >= start_ts) & (out["Date"] <= end_ts)].copy()
+        return out.reset_index(drop=True)
+
 def _events_to_gsheet_history_df(events_df: pd.DataFrame, stock_code: str, stock_name: str, start_date=None, end_date=None) -> pd.DataFrame:
     if events_df is None or events_df.empty:
         return pd.DataFrame(columns=GSHEET_WARRANT_HISTORY_HEADERS)
@@ -15921,9 +16329,9 @@ def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events
         cols=len(GSHEET_WARRANT_STATUS_HEADERS),
     )
     old_status = _worksheet_to_df(status_ws)
-    if old_status is not None and not old_status.empty and "標的股" in old_status.columns:
-        stock_col = old_status["標的股"].map(_normalize_stock_name_code_key)
-        old_status = old_status[stock_col != _normalize_stock_name_code_key(stock_code)].copy()
+    if old_status is not None and not old_status.empty and "快取鍵" in old_status.columns:
+        # 只覆蓋完全相同的快取鍵；同一標的不同日期區間的快照狀態必須同時保留。
+        old_status = old_status[old_status["快取鍵"].astype(str) != str(key)].copy()
     else:
         old_status = pd.DataFrame(columns=GSHEET_WARRANT_STATUS_HEADERS)
 
@@ -15969,8 +16377,11 @@ def _finmind_fetch_warrant_branch_day_raw(securities_trader_id: str, trade_date)
         return pd.DataFrame(), diagnostic
 
     last_error = None
-    for attempt in range(1, FINMIND_REQUEST_RETRIES + 1):
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
         try:
+            _finmind_wait_for_rate_limit_gate()
             resp = get_thread_session().get(
                 FINMIND_WARRANT_BRANCH_URL,
                 headers=_finmind_headers(),
@@ -15978,14 +16389,20 @@ def _finmind_fetch_warrant_branch_day_raw(securities_trader_id: str, trade_date)
                 timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
             )
             diagnostic["http_status"] = int(resp.status_code)
-            if resp.status_code in (401, 402, 403):
-                try:
-                    payload = resp.json()
-                except Exception:
-                    payload = {}
-                raise RuntimeError(
-                    f"FinMind 單一權證分點授權失敗：HTTP {resp.status_code}｜"
-                    f"{_finmind_error_message(payload, resp.text[:300])}"
+            if resp.status_code in (401, 402, 403, 429):
+                payload, message = _finmind_error_payload_from_response(resp)
+                diagnostic["message"] = message
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"單一權證分點｜ID={trader_id}｜date={date_s}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 單一權證分點授權失敗：HTTP {resp.status_code}｜{message}"
                 )
             if resp.status_code == 404:
                 diagnostic["message"] = resp.text[:500]
@@ -15994,6 +16411,20 @@ def _finmind_fetch_warrant_branch_day_raw(securities_trader_id: str, trade_date)
             payload = resp.json()
             diagnostic["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else []
             diagnostic["message"] = _finmind_error_message(payload)
+            payload_status = payload.get("status", 200) if isinstance(payload, dict) else 200
+            if str(payload_status) not in ("200", "success", "True", "true"):
+                if _finmind_is_rate_limit(payload_status, diagnostic["message"]):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"單一權證分點｜ID={trader_id}｜date={date_s}",
+                        quota_attempt,
+                        diagnostic["message"],
+                    )
+                    continue
+                raise RuntimeError(
+                    f"FinMind 單一權證分點 API 回傳失敗：status={payload_status}｜"
+                    f"{diagnostic['message']}"
+                )
             data = payload.get("data", []) if isinstance(payload, dict) else []
             df = pd.DataFrame(data)
             diagnostic["rows"] = int(len(df))
@@ -16008,13 +16439,16 @@ def _finmind_fetch_warrant_branch_day_raw(securities_trader_id: str, trade_date)
                     f"HTTP={resp.status_code}｜keys={diagnostic['payload_keys']}｜msg={diagnostic['message']}"
                 )
             return df, diagnostic
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
         except Exception as exc:
             last_error = exc
-            if attempt >= FINMIND_REQUEST_RETRIES:
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
                 break
-            wait_sec = FINMIND_RETRY_BASE_WAIT * attempt
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
             print(
-                f"⚠️ FinMind 單一權證分點重試 {attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                f"⚠️ FinMind 單一權證分點重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
                 f"ID={trader_id}｜date={date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
             )
             time.sleep(wait_sec)
@@ -16161,6 +16595,9 @@ def _finmind_direct_verify_and_backfill_selected_branches(
                 )
                 if not converted.empty:
                     frames.append(converted)
+            except (FinMindAuthorizationError, FinMindRateLimitError):
+                # 授權錯誤或等待多次後仍未恢復的額度錯誤不能吞掉，避免把缺資料誤當成「分點無交易」。
+                raise
             except Exception as exc:
                 failures.append((trader_id, pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
             if completed == 1 or completed % 10 == 0 or completed == len(tasks):
@@ -16233,6 +16670,58 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if not LIVE_FETCH_ENABLE:
         return pd.DataFrame(columns=empty_columns)
 
+    prefetched_events = _finmind_get_multi_stock_prefetched_events(code, start_date, end_date)
+    if prefetched_events is not None:
+        summary = _FINMIND_MULTI_STOCK_SUMMARY_CACHE.get(code)
+        if summary is None:
+            summary = _finmind_get_warrant_summary(code, start_date, end_date)
+        warrant_name_map = _FINMIND_MULTI_STOCK_NAME_MAP_CACHE.get(code, {}) or _finmind_target_warrant_name_map(summary)
+        _, trader_info_df = _finmind_securities_trader_maps()
+        selected_branch_names = _get_selected_branch_flow_set() if SELECTED_BRANCH_FLOW_ENABLE else set()
+        selected_branch_id_map = _resolve_selected_branch_ids(selected_branch_names) if selected_branch_names else {}
+        latest_available = pd.Timestamp(_FINMIND_MULTI_STOCK_LATEST_AVAILABLE).normalize()
+        trading_dates = [
+            d for d in _finmind_get_trading_dates(start_date, end_date)
+            if d <= latest_available
+        ]
+        jobs = []
+        for day in trading_dates:
+            active_codes = _finmind_active_warrant_codes(summary, day)
+            if active_codes:
+                jobs.append((day, active_codes))
+        events = prefetched_events.copy()
+        if events.empty:
+            events = pd.DataFrame(columns=empty_columns)
+        events = _finmind_direct_verify_and_backfill_selected_branches(
+            events,
+            selected_branch_id_map,
+            jobs,
+            warrant_name_map,
+            code,
+            stock_name,
+            trader_info_df,
+        )
+        event_dates = int(events["Date"].nunique()) if not events.empty and "Date" in events.columns else 0
+        _FINMIND_WARRANT_RUN_STATS[code] = {
+            "total_dates": len(jobs),
+            "success_dates": len(jobs),
+            "empty_dates": max(0, len(jobs) - event_dates),
+            "failed_dates": 0,
+            "latest_available_date": latest_available.strftime("%Y-%m-%d"),
+        }
+        should_write_snapshot = bool(
+            not REPORT_LIVE_ONLY
+            or (ACTION_REFRESH_CONTROLS_REPORT_DATA and ACTION_FORCE_REFRESH)
+            or WARRANT_CACHE_FORCE_REFRESH
+        )
+        if should_write_snapshot and not events.empty:
+            save_gsheet_warrant_events_snapshot(code, stock_name, events, start_date, end_date)
+        print(
+            f"⚡ 使用多股票聯集預處理結果：{code}｜{len(events):,} 筆｜"
+            f"每日全市場 Parquet 未重複解析"
+        )
+        return events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True) if not events.empty else events
+
     summary = _finmind_get_warrant_summary(code, start_date, end_date)
     if summary.empty:
         return pd.DataFrame(columns=empty_columns)
@@ -16256,6 +16745,8 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     for day in reversed(probe_candidates):
         try:
             probe_path = _finmind_download_warrant_day(day, allow_not_ready=True)
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
         except Exception as exc:
             print(f"⚠️ FinMind 最新權證日期探測異常：{pd.Timestamp(day).date()}｜{exc}")
             probe_path = None
@@ -16396,7 +16887,7 @@ def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int
     if not NEWS_ENABLE:
         return []
     code = _normalize_stock_name_code_key(stock_code)
-    today = pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
+    today = pd.Timestamp(datetime.now(timezone.utc) + timedelta(hours=8)).normalize()
     start_day = today - pd.Timedelta(days=FINMIND_NEWS_LOOKBACK_DAYS - 1)
 
     try:
@@ -16840,7 +17331,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+raw-selected-branch+single-range-news+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+quota-wait+daily-parquet-cache+multi-stock-read-once+raw-selected-branch+single-range-news+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
@@ -16867,6 +17358,14 @@ def main():
     print(f"📌 權證快照：enable={os.getenv('WARRANT_LOCAL_CACHE_ENABLE', '')}｜force_refresh={WARRANT_CACHE_FORCE_REFRESH}｜dir={LOCAL_WARRANT_CACHE_DIR}")
 
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "").strip()
+
+    if len(stock_codes) >= FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS:
+        try:
+            _finmind_prepare_multi_stock_warrant_events(stock_codes)
+        except Exception as exc:
+            # 預處理失敗時保留原本逐股票流程，不讓效率功能改變既有可用性。
+            print(f"⚠️ 多股票權證聯集預處理失敗，退回逐股票處理：{exc}")
+
     ok_count = 0
     for stock_code in stock_codes:
         buf = generate_warrant_report(stock_code)
