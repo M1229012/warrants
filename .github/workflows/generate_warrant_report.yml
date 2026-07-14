@@ -81,8 +81,17 @@ jobs:
       FINMIND_DEBUG_SCHEMA_ENABLE: "0"
       FINMIND_DEBUG_SELECTED_BRANCH_ENABLE: "0"
       FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE: "0"
-      WARRANT_GSHEET_ENABLE: "0"
+      # 預熱時順便把勝率統計保存到 finmind_cache/reference，正式產圖不再等待 Google Sheet。
+      WARRANT_GSHEET_ENABLE: "1"
+      GSHEET_NAME: "權證分點籌碼"
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      WARRANT_STOCK_NAME_GSHEET_ENABLE: "0"
+      WARRANT_BRANCH_PERF_ENABLE: "1"
+      WARRANT_BRANCH_PERF_DISK_CACHE_ENABLE: "1"
       WARRANT_GSHEET_CACHE_ENABLE: "0"
+      WARRANT_GSHEET_LLM_CACHE_ENABLE: "0"
+      WARRANT_GSHEET_LLM_CACHE_READ_ENABLE: "0"
+      WARRANT_GSHEET_LLM_CACHE_WRITE_ENABLE: "0"
       WARRANT_GEMINI_ENABLE: "0"
       WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "0"
       WARRANT_NEWS_ENABLE: "0"
@@ -125,7 +134,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv pip install --system requests pandas Pillow matplotlib numpy pyarrow beautifulsoup4
+          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy pyarrow beautifulsoup4
 
       - name: Validate Python syntax
         run: |
@@ -197,6 +206,9 @@ jobs:
       WARRANT_GSHEET_ENABLE: "1"
       GSHEET_NAME: "權證分點籌碼"
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
+      WARRANT_STOCK_NAME_GSHEET_ENABLE: "0"
+      WARRANT_BRANCH_PERF_ENABLE: "1"
+      WARRANT_BRANCH_PERF_DISK_CACHE_ENABLE: "1"
 
       WARRANT_GSHEET_CACHE_ENABLE: "1"
       WARRANT_GSHEET_HISTORY_SHEET: "快取_分點歷史"
@@ -220,9 +232,13 @@ jobs:
       WARRANT_GEMINI_ENABLE: "1"
       WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
       WARRANT_WEEKLY_GEMINI_REPAIR_ENABLE: "0"
-      WARRANT_LLM_CACHE_ENABLE: ${{ inputs.refresh_news_summary == '1' && '0' || '1' }}
+      WARRANT_LLM_CACHE_ENABLE: "1"
       WARRANT_LLM_CACHE_DIR: llm_cache
-      WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
+      WARRANT_LLM_DAILY_TASK_CACHE_ENABLE: "1"
+      # 正式產圖完全移除 Google Sheet Gemini 快取的同步讀寫等待；跨 run 改由 Actions cache 保存 llm_cache。
+      WARRANT_GSHEET_LLM_CACHE_ENABLE: "0"
+      WARRANT_GSHEET_LLM_CACHE_READ_ENABLE: "0"
+      WARRANT_GSHEET_LLM_CACHE_WRITE_ENABLE: "0"
       WARRANT_GSHEET_LLM_CACHE_SHEET: "快取_Gemini結果"
       WARRANT_LLM_CACHE_FORCE_REFRESH: ${{ inputs.refresh_news_summary }}
 
@@ -254,6 +270,12 @@ jobs:
       WARRANT_EVENT_MIN_AMOUNT: "0"
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
       WARRANT_REPORT_MAX_ROWS: "8"
+
+      # 28 吋畫布直接以接近最終 2400px 的 DPI 輸出，避免先產 3800px 再大幅縮圖。
+      WARRANT_REPORT_OUTPUT_DPI: "84"
+      WARRANT_REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL: "0"
+      WARRANT_SCREENSHOT_OUTPUT_MAX_WIDTH: "2400"
+      WARRANT_SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL: "4"
 
       # 精選分點資金流設定
       WARRANT_SELECTED_BRANCH_FLOW_ENABLE: "1"
