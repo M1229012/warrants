@@ -35,9 +35,116 @@ on:
         description: "自訂精選分點，多個用逗號分隔，例如 新光,第一金"
         required: false
         default: ""
+      prewarm_cache_only:
+        description: "只預熱全市場共用快取，不產圖（平常請維持 0）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
+
+  # Asia/Taipei 21:20 = UTC 13:20。
+  # 每個交易日晚間先建立全市場精簡權證事件快取，之後手動查任何新股票都直接走快速路徑。
+  schedule:
+    - cron: "20 13 * * 1-5"
 
 jobs:
+  prewarm-finmind-market-cache:
+    if: github.event_name == 'schedule' || inputs.prewarm_cache_only == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+      OUTPUT_DIR: output
+      WARRANT_PREWARM_ONLY: "1"
+      WARRANT_DATA_SOURCE_MODE: "finmind_only"
+      FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
+      FINMIND_REQUEST_RETRIES: "5"
+      FINMIND_RETRY_BASE_WAIT: "1.5"
+      FINMIND_CONNECT_TIMEOUT: "10"
+      FINMIND_READ_TIMEOUT: "240"
+      FINMIND_CACHE_DIR: finmind_cache
+      FINMIND_WARRANT_DOWNLOAD_WORKERS: "8"
+      FINMIND_PREWARM_WORKERS: "4"
+      FINMIND_PREWARM_CALENDAR_DAYS: "150"
+      FINMIND_PREWARM_REFRESH_RECENT_DAYS: "2"
+      FINMIND_PREWARM_KEEP_RAW_DAYS: "7"
+      FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
+      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
+      FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
+      FINMIND_WARRANT_LATEST_PROBE_DAYS: "7"
+      FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
+      FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "0"
+      FINMIND_DEBUG_SCHEMA_ENABLE: "0"
+      FINMIND_DEBUG_SELECTED_BRANCH_ENABLE: "0"
+      FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE: "0"
+      WARRANT_GSHEET_ENABLE: "0"
+      WARRANT_GSHEET_CACHE_ENABLE: "0"
+      WARRANT_GEMINI_ENABLE: "0"
+      WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "0"
+      WARRANT_NEWS_ENABLE: "0"
+      WARRANT_SELECTED_BRANCH_FLOW_ENABLE: "0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build cache date
+        id: cache-date
+        shell: bash
+        run: |
+          echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore latest FinMind market cache
+        uses: actions/cache/restore@v4
+        with:
+          path: finmind_cache
+          key: warrant-finmind-market-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-finmind-market-${{ runner.os }}-
+
+      - name: Prepare folders
+        run: |
+          mkdir -p output finmind_cache/warrant_daily finmind_cache/reference
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          cache-suffix: warrant-report-deps
+
+      - name: Install prewarm dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv pip install --system requests pandas Pillow matplotlib numpy pyarrow beautifulsoup4
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile run_report.py
+
+      - name: Prewarm FinMind all-market cache
+        run: |
+          echo "========== 開始預熱 FinMind 全市場共用快取 =========="
+          python -u run_report.py
+
+      - name: Save refreshed FinMind market cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: finmind_cache
+          key: warrant-finmind-market-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+
   run-warrant-report-test:
+    if: github.event_name == 'workflow_dispatch' && inputs.prewarm_cache_only != '1'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -53,7 +160,6 @@ jobs:
 
       # ========================================================
       # 唯一市場／新聞資料來源：FinMind
-      # GitHub Secret 名稱是 FINMIND_API_0714，程式內統一讀 FINMIND_API_TOKEN。
       # ========================================================
       WARRANT_DATA_SOURCE_MODE: "finmind_only"
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
@@ -68,23 +174,25 @@ jobs:
       FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
       FINMIND_CACHE_DIR: finmind_cache
 
+      # 任意新股票直接使用排程預熱的全市場精簡事件檔。
+      FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
+      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
+
       # 上方權證資金流與 TOP5：逐檔排除該權證官方辨識的發行造市端。
-      # TOP5 再沿用原本「排除明確總公司／自營型分點」規則；精選分點使用完整原始資料。
       WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
       FINMIND_ISSUER_FLOW_ENABLE: "1"
       FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
-      FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "1"
+      FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "0"
       FINMIND_ISSUER_FLOW_DEBUG_ENABLE: "0"
       WARRANT_TOP5_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
 
-      # 正常命中只印摘要；欄位不足、發行商或分點無法辨識時仍輸出完整欄位供除錯。
-      FINMIND_DEBUG_SCHEMA_ENABLE: "1"
-      FINMIND_DEBUG_SELECTED_BRANCH_ENABLE: "1"
+      # 正式產圖關閉大型成功 Debug；錯誤仍保留摘要與 traceback。
+      FINMIND_DEBUG_SCHEMA_ENABLE: "0"
+      FINMIND_DEBUG_SELECTED_BRANCH_ENABLE: "0"
       FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE: "0"
 
       # ========================================================
-      # Google Sheet 只作結果快照、Gemini 快取與既有勝率統計。
-      # 不再作為股票名稱、權證母體或分點市場資料備援。
+      # Google Sheet 只作 Gemini 快取與既有勝率統計。
       # ========================================================
       WARRANT_GSHEET_ENABLE: "1"
       GSHEET_NAME: "權證分點籌碼"
@@ -98,8 +206,6 @@ jobs:
       WARRANT_CACHE_PER_SNAPSHOT_SHEET_ENABLE: "1"
       WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE: "0"
 
-      # 權證分點每次都由 FinMind sponsorpro live 重抓。
-      # 關閉「新聞刷新值同時控制權證快取」的舊邏輯，避免 refresh_news_summary=0 時誤讀舊 MoneyDJ 快照。
       WARRANT_ACTION_REFRESH_CONTROLS_REPORT_DATA: "0"
       WARRANT_REPORT_LIVE_ONLY: "1"
       WARRANT_LIVE_FETCH_ENABLE: "1"
@@ -108,10 +214,12 @@ jobs:
       WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # ========================================================
-      # Gemini：只負責整理 FinMind 新聞與週報結論，不是市場資料來源。
+      # Gemini：第一次輸出若仍不符合本週重點格式，直接走既有條件式備援，
+      # 不再重打第 2 次模型；市場資料與圖片計算不受影響。
       # ========================================================
       WARRANT_GEMINI_ENABLE: "1"
       WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "1"
+      WARRANT_WEEKLY_GEMINI_REPAIR_ENABLE: "0"
       WARRANT_LLM_CACHE_ENABLE: ${{ inputs.refresh_news_summary == '1' && '0' || '1' }}
       WARRANT_LLM_CACHE_DIR: llm_cache
       WARRANT_GSHEET_LLM_CACHE_ENABLE: "1"
@@ -125,7 +233,6 @@ jobs:
 
       # ========================================================
       # 新聞只使用 FinMind TaiwanStockNews。
-      # 舊的 Google／Yahoo／Bing／MoneyDJ／MOPS 與外部原文補抓全部關閉。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
       WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v16_finmind_only"
@@ -153,7 +260,6 @@ jobs:
       WARRANT_SELECTED_BRANCH_FLOW_MODE: ${{ inputs.selected_branch_flow_mode || 'five' }}
       WARRANT_SELECTED_BRANCH_FLOW_BRANCHES: ${{ inputs.selected_branch_flow_branches || '五分點' }}
 
-      # 可選：推送 Discord 測試頻道
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
     steps:
@@ -175,13 +281,14 @@ jobs:
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
 
-      - name: Restore FinMind parquet cache
-        uses: actions/cache@v4
+      # 報表工作只還原，不重新上傳大型全市場快取；每日排程專責更新與保存。
+      - name: Restore latest FinMind market cache
+        uses: actions/cache/restore@v4
         with:
-          path: finmind_cache/warrant_daily
-          key: warrant-finmind-parquet-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
+          path: finmind_cache
+          key: warrant-finmind-market-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
           restore-keys: |
-            warrant-finmind-parquet-${{ runner.os }}-
+            warrant-finmind-market-${{ runner.os }}-
 
       - name: Restore report fonts cache
         uses: actions/cache@v4
@@ -191,20 +298,7 @@ jobs:
 
       - name: Prepare folders
         run: |
-          mkdir -p output llm_cache finmind_cache/warrant_daily .cache/report-fonts
-
-      - name: Refresh latest FinMind day files
-        shell: bash
-        run: |
-          set -euo pipefail
-          cutoff=$(TZ=Asia/Taipei date -d '2 days ago' +%Y-%m-%d)
-          for f in finmind_cache/warrant_daily/*.parquet; do
-            [ -e "$f" ] || continue
-            d=$(basename "$f" .parquet)
-            if [[ "$d" > "$cutoff" ]] || [[ "$d" == "$cutoff" ]]; then
-              rm -f "$f"
-            fi
-          done
+          mkdir -p output llm_cache finmind_cache/warrant_daily finmind_cache/reference .cache/report-fonts
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -281,3 +375,4 @@ jobs:
           name: warrant-report-finmind-test-output
           path: output/*.png
           if-no-files-found: warn
+          compression-level: 0
