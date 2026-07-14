@@ -817,28 +817,41 @@ CENTER_WATERMARK_ROTATION = 18
 # Supertrend 目前圖表沒有繪製，預設不計算；若未來要畫再用環境變數打開。
 ENABLE_SUPERTREND = os.getenv("WARRANT_ENABLE_SUPERTREND", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# 字型：優先註冊 Repository 內固定字型，避免每次 GitHub Actions 都 apt 安裝與重建字型快取。
-# 預期路徑：assets/fonts/NotoSansTC-Regular.otf、assets/fonts/NotoSansTC-Bold.otf
-_REPO_FONT_FILES = (
-    "assets/fonts/NotoSansTC-Regular.otf",
-    "assets/fonts/NotoSansTC-Bold.otf",
-)
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-for _font_rel_path in _REPO_FONT_FILES:
-    _font_path = os.path.join(_REPO_ROOT, _font_rel_path)
-    if os.path.exists(_font_path):
-        try:
-            fm.fontManager.addfont(_font_path)
-        except Exception as _font_exc:
-            print(f"⚠️ Repository 字型註冊失敗：{_font_path}｜{_font_exc}")
+# 字型：優先使用 Workflow 自動下載並快取的 Noto Sans CJK TC 字型，避免每次 apt 安裝。
+REPORT_FONT_DIR = os.getenv("WARRANT_REPORT_FONT_DIR", ".cache/report-fonts").strip() or ".cache/report-fonts"
+_REPORT_FONT_FILES = [
+    os.path.join(REPORT_FONT_DIR, "NotoSansCJKtc-Regular.otf"),
+    os.path.join(REPORT_FONT_DIR, "NotoSansCJKtc-Bold.otf"),
+]
+_registered_report_fonts = []
+for _font_path in _REPORT_FONT_FILES:
+    if not os.path.isfile(_font_path):
+        continue
+    try:
+        fm.fontManager.addfont(_font_path)
+        _font_name = fm.FontProperties(fname=_font_path).get_name()
+        if _font_name:
+            _registered_report_fonts.append(_font_name)
+        print(f"✅ 已註冊報表字型：{os.path.basename(_font_path)}｜family={_font_name}")
+    except Exception as exc:
+        print(f"⚠️ 報表字型註冊失敗：{_font_path}｜{exc}")
 
-available_fonts = [f.name for f in fm.fontManager.ttflist]
-for font_name in ["Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans TC", "Microsoft JhengHei", "SimHei"]:
-    if font_name in available_fonts:
+available_fonts = {f.name for f in fm.fontManager.ttflist}
+font_candidates = _registered_report_fonts + [
+    "Noto Sans CJK TC",
+    "Noto Sans CJK JP",
+    "Noto Sans TC",
+    "Microsoft JhengHei",
+    "SimHei",
+]
+for font_name in font_candidates:
+    if font_name and font_name in available_fonts:
         plt.rcParams["font.family"] = font_name
+        print(f"✅ Matplotlib 中文字型：{font_name}")
         break
 else:
     plt.rcParams["font.family"] = "DejaVu Sans"
+    print("⚠️ 找不到中文字型，暫時使用 DejaVu Sans")
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -14819,7 +14832,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-actions-cache-repo-font-v9"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-actions-cache-font-auto-v10"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
