@@ -127,8 +127,8 @@ DATA_SCOPE_ALL = os.getenv("DATA_SCOPE_ALL", "全分點")
 BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
 SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.5"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
-LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "22"))
-# 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
+LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "40"))
+# 專門給「第幾次加碼」使用，不影響原本近40交易日共識買超圖。
 ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
 
 # 若你未來想讓「出清不管金額都顯示」，改成 "1"
@@ -951,7 +951,7 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
     讀取新版「快取_TOP15部位明細」，彙總成：
         {標的股: [(分點, 剩餘成本, 報酬率), ...]}
 
-    近一個月 TOP15 圖固定只讀 資料範圍=精選五分點。
+    近40交易日 TOP15 圖固定只讀 資料範圍=精選五分點。
     若新版工作表尚不存在，會 fallback 回舊版「快取_TOP15分點報酬率」。
     """
     needed_cols = [
@@ -1120,8 +1120,8 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     """
     直接讀取新版「快取_TOP15共識淨買超」。
 
-    這是近一個月 TOP15 圖的唯一排名來源；圖片端不再重新計算 A/B/C/D/E。
-    近一個月 TOP15 圖固定只讀 資料範圍=精選五分點。
+    這是近40交易日 TOP15 圖的唯一排名來源；圖片端不再重新計算 A/B/C/D/E。
+    近40交易日 TOP15 圖固定只讀 資料範圍=精選五分點。
     """
     needed_cols = [
         "資料範圍",
@@ -1328,7 +1328,7 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     }
 
     print(
-        f"  ✅ 近一個月 TOP15 直接讀取快取：{SHEET_TOP15_CONSENSUS_CACHE}｜"
+        f"  ✅ 近40交易日 TOP15 直接讀取快取：{SHEET_TOP15_CONSENSUS_CACHE}｜"
         f"資料範圍：{DATA_SCOPE_SELECTED5}｜統計日期：{chosen_date:%Y-%m-%d}｜筆數：{len(rows)}"
     )
 
@@ -1545,7 +1545,7 @@ def resolve_target_identity(
 
 def infer_latest_top15_cache_date() -> date:
     """
-    從「快取_TOP15共識淨買超」取得近一個月 TOP15 最新統計日期。
+    從「快取_TOP15共識淨買超」取得近40交易日 TOP15 最新統計日期。
 
     TOP15 報酬率是由主程式的快取更新，不應受 A/B/C/D/E 當天是否有新事件影響。
     若 TOP15 快取尚未建立，才退回原本 A/B/C/D/E 日期推斷。
@@ -3508,7 +3508,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
         y = draw_table(f"{date_label} 今日賣超明細", sell_rows, sell_headers, sell_col_w, sell_builder, GREEN, GREEN, y)
 
-    # Event legend：改成與近一個月圖相同的橫條式說明
+    # Event legend：改成與近40交易日圖相同的橫條式說明
     y -= gap
     legend_y = y - event_legend_h
     rounded(margin_x, legend_y, content_w, event_legend_h, fc=WHITE, ec=BORDER, lw=1.0, r=0.08)
@@ -3537,7 +3537,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 近一個月交易日｜五大分點共識買超 TOP10
+# 近40交易日交易日｜五大分點共識買超 TOP10
 # ══════════════════════════════════════════════════════════════════════
 
 def get_buy_event_date(row, sheet_name: str) -> date | None:
@@ -3581,7 +3581,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     """
     直接讀取 Google Sheet「快取_TOP15共識淨買超」。
 
-    這張近一個月 TOP15 圖不再由圖片端重新計算 A/B/C/D/E 或快取_分點歷史，
+    這張近40交易日 TOP15 圖不再由圖片端重新計算 A/B/C/D/E 或快取_分點歷史，
     lookback_days 只保留相容舊呼叫，實際期間與排名以主程式 Step 4b 產生的快取為準。
     """
     rows, meta = read_top15_consensus_cache_from_gsheet(target)
@@ -3589,7 +3589,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
 
 def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
     """
-    第二張圖：近一個月交易日｜五大分點共識淨買超成本 TOP15
+    第二張圖：近40交易日交易日｜五大分點共識淨買超成本 TOP15
     """
     rows, period_meta = collect_consensus_buy_top10(target, lookback_days)
     n = len(rows)
@@ -3787,7 +3787,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     # Header
     y = fig_h - 0.45
-    text(margin_x + 0.15, y, "近一個月交易日｜五大分點共識淨買超成本 TOP15", 28, NAVY, BOLD)
+    text(margin_x + 0.15, y, "近40個交易日｜五大分點共識淨買超成本 TOP15", 28, NAVY, BOLD)
     y -= 0.48
     text(margin_x + 0.18, y, f"追蹤分點：{'、'.join(TRACKED_BROKERS)}", 14, NAVY2, BOLD)
     y -= 0.30
@@ -3841,7 +3841,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     data_y = header_y_top - header_h
     if not rows:
         rect(margin_x, data_y - row_h, content_w, row_h, fc=WHITE, ec=BORDER, lw=0.6)
-        text(margin_x + content_w / 2, data_y - row_h / 2, "近一個月交易日沒有淨買超成本為正的標的", 13, MUTED, BOLD, ha="center")
+        text(margin_x + content_w / 2, data_y - row_h / 2, "近40個交易日沒有淨買超成本為正的標的", 13, MUTED, BOLD, ha="center")
     else:
         for i, r in enumerate(rows):
             ry = data_y - (i + 1) * row_h
@@ -4155,7 +4155,7 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
     plt.close(fig)
 
 IMAGE_ACTION_DAILY_BUNDLE = "精選五分點每日圖"
-IMAGE_ACTION_CONSENSUS_BUY = "近一個月共識淨買超TOP15"
+IMAGE_ACTION_CONSENSUS_BUY = "近40交易日共識淨買超TOP15"
 IMAGE_ACTION_WEEKLY_WARRANT = "本週權證共識買賣超TOP15"
 IMAGE_ACTION_BROKER_10D = "近10日分點買賣明細圖"
 IMAGE_ACTION_WIN_RATE_STATS = "所有分點勝率統計圖"
@@ -4168,7 +4168,7 @@ def normalize_image_action(action_text: str) -> str:
 
     支援常見名稱：
     - 精選五分點每日圖 / 精選5分點當日買賣超產圖 / 每日精選分點買賣超追蹤
-    - 近一個月共識淨買超TOP15
+    - 近40交易日共識淨買超TOP15
     - 本週權證共識買賣超TOP15 / 近7／14／21日權證分點共識TOP15
     - 近10日分點買賣明細圖 / 近10日分點明細 / 近10日分點買賣明細
     - 所有分點勝率統計圖 / 全分點勝率統計
@@ -4218,7 +4218,7 @@ def normalize_image_action(action_text: str) -> str:
     ):
         return IMAGE_ACTION_WEEKLY_WARRANT
 
-    if "近一個月" in raw or "共識淨買超成本" in raw or "五大分點共識" in raw or "consensus" in key:
+    if "進40交易日" in raw or "共識淨買超成本" in raw or "五大分點共識" in raw or "consensus" in key:
         return IMAGE_ACTION_CONSENSUS_BUY
 
     return IMAGE_ACTION_DAILY_BUNDLE
@@ -5972,7 +5972,7 @@ def main():
         "--action",
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
-            "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
+            "圖片產生選項：精選五分點每日圖 / 近40交易日共識淨買超TOP15 / "
             "本週權證共識買賣超TOP15（輸出近7／14／21日三張圖） / 近10日分點買賣明細圖 / "
             "所有分點勝率統計圖 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
         ),
@@ -5990,7 +5990,7 @@ def main():
         target = infer_latest_date_from_gsheet()
 
     output_path = Path(args.output)
-    consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近一個月交易日_五大分點共識淨買超成本TOP15.png"
+    consensus_output_path = Path(args.consensus_output) if args.consensus_output else output_path.parent / "近40交易日交易日_五大分點共識淨買超成本TOP15.png"
     weekly_output_path = Path(args.weekly_output) if args.weekly_output else output_path.parent / "本週權證分點共識買賣超TOP15.png"
     weekly14_output_path = Path(args.weekly14_output) if args.weekly14_output else weekly_output_path.parent / "近14日權證分點共識買賣超TOP15.png"
     weekly21_output_path = Path(args.weekly21_output) if args.weekly21_output else weekly_output_path.parent / "近21日權證分點共識買賣超TOP15.png"
