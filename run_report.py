@@ -20188,11 +20188,6 @@ def main():
             f"✅ 已原子輸出圖片：{out_path}｜sha256={image_sha}｜"
             f"精選分點={selected_branch_label}｜build={FINMIND_BUILD_VERSION}"
         )
-        _send_discord_file(
-            webhook_url,
-            out_path,
-            content=f"{stock_code} 權證資金流週報測試｜精選分點：{selected_branch_label}｜{FINMIND_BUILD_VERSION}",
-        )
 
     if ok_count <= 0:
         raise SystemExit("沒有任何報告成功產生")
