@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -5752,14 +5753,22 @@ def _fetch_official_warrant_issuer_source(url: str, source_label: str) -> tuple[
         return {}, pd.DataFrame()
 
 
+
 def _finmind_official_warrant_issuer_map(force_refresh: bool = False) -> dict:
-    """官方來源優先建立權證發行商對照，同一個 Python process 只下載一次。"""
+    """官方來源優先建立權證發行商對照；每日結果（包含空結果）跨 Actions run 共用。"""
     global _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE
     if not FINMIND_OFFICIAL_ISSUER_ENABLE:
         return {}
     with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
         if _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE is not None and not force_refresh:
             return dict(_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE)
+
+    if not force_refresh:
+        disk_mapping = _finmind_read_reference_json("official_warrant_issuer", max_age_days=1)
+        if isinstance(disk_mapping, dict):
+            with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+                _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = dict(disk_mapping)
+            return dict(disk_mapping)
 
     sources = [
         (TWSE_WARRANT_ISSUER_OPENAPI_URL, "TWSE 官方權證資料"),
@@ -5784,8 +5793,10 @@ def _finmind_official_warrant_issuer_map(force_refresh: bool = False) -> dict:
 
     with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
         _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = dict(combined)
+    _finmind_write_reference_json("official_warrant_issuer", combined)
     print(f"📦 官方權證發行商合併對照：{len(combined):,} 支")
     return combined
+
 
 def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) -> pd.DataFrame:
     """建立上方權證資金流與 TOP5 的可解讀口徑。
@@ -6992,6 +7003,12 @@ GEMINI_RETRY_BASE_WAIT = float(os.getenv("WARRANT_GEMINI_RETRY_BASE_WAIT", "4"))
 # 新聞統整與本週重點共用較低 temperature，降低格式漂移與無依據改寫。
 # 模型名稱維持 GEMINI_MODEL 原設定，不另外切換分析模型。
 GEMINI_ANALYSIS_TEMPERATURE = float(os.getenv("WARRANT_GEMINI_ANALYSIS_TEMPERATURE", "0.25"))
+# 最快模式下，Gemini 第一輪格式不合格時直接使用既有條件式備援，
+# 不再為相同資料啟動第二次模型呼叫。只影響文字 repair，不改任何市場計算。
+WEEKLY_GEMINI_REPAIR_ENABLE = os.getenv(
+    "WARRANT_WEEKLY_GEMINI_REPAIR_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 GEMINI_STRUCTURED_OUTPUT_ENABLE = os.getenv(
     "WARRANT_GEMINI_STRUCTURED_OUTPUT_ENABLE",
     "1",
@@ -9672,7 +9689,7 @@ def _parse_gemini_news_points(
             )
             continue
 
-        point = _trim_news_point_detail_to_max(cleaned[0], log_label="Gemini 新聞")
+        point = cleaned[0]
         if not _points_are_independent_and_complete([point]):
             rejected.append(
                 _format_rejected_news_point(
@@ -10952,16 +10969,17 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         and not final_detail_problems
         and final_total_ok
     )
+    display_points = _trim_news_point_details_to_max(points, log_label="Gemini 新聞顯示")
     if points and fully_valid:
         _save_validated_news_points_cache(
             _news_points_cache_task(),
             stock_code,
             stock_name,
             prompt,
-            points,
-            note=f"validated_news_points_sentence_grounded_{len(points)}",
+            display_points,
+            note=f"validated_news_points_sentence_grounded_{len(display_points)}",
         )
-        print(f"✅ Gemini 新聞重點完成：{len(points)} 點，總字數約 {_count_summary_chars(points)} 字")
+        print(f"✅ Gemini 新聞重點完成：{len(display_points)} 點，總字數約 {_count_summary_chars(points)} 字")
     elif not points and fully_valid:
         print(f"ℹ️ Gemini 判定本週無與 {display_name} 直接相關之重大新聞")
     elif points:
@@ -10973,7 +10991,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
                 f"低於 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字"
             )
         print(f"⚠️ Gemini 新聞重點有 {len(points)} 點未通過完整驗證，不寫入快取")
-    return points
+    return display_points
 
 
 
@@ -12490,6 +12508,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 
         if problems:
             print("⚠️ Gemini 本週重點與下週觀察需要修正：" + "；".join(problems))
+            if not WEEKLY_GEMINI_REPAIR_ENABLE:
+                print("⚡ 最快模式：略過第 2 次 Gemini repair，直接使用既有條件式備援")
+                return []
             repaired_points = _repair_weekly_expert_points(
                 points,
                 payload,
@@ -14832,7 +14853,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # 它不再作為市場資料或新聞資料來源。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-14-finmind-actions-cache-font-auto-v10"
+FINMIND_BUILD_VERSION = "2026-07-14-finmind-market-compact-prewarm-v11"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -14854,6 +14875,46 @@ FINMIND_NEWS_WORKERS = max(1, int(os.getenv("FINMIND_NEWS_WORKERS", "4")))
 FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", "30")))
 FINMIND_CACHE_DIR = os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache"
 FINMIND_WARRANT_DAY_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "warrant_daily")
+
+# 全市場共用精簡事件快取：每天只把原始全市場 Parquet 正規化與聚合一次。
+# 手動搜尋任何新股票時，只需以權證代號掃描這批共用小檔，不再重做 60～70 日全市場解析。
+FINMIND_MARKET_COMPACT_CACHE_ENABLE = os.getenv(
+    "FINMIND_MARKET_COMPACT_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_MARKET_COMPACT_CACHE_VERSION = os.getenv(
+    "FINMIND_MARKET_COMPACT_CACHE_VERSION",
+    "v1",
+).strip() or "v1"
+FINMIND_MARKET_COMPACT_CACHE_DIR = os.path.join(
+    FINMIND_CACHE_DIR,
+    f"warrant_market_compact_{FINMIND_MARKET_COMPACT_CACHE_VERSION}",
+)
+FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE = max(
+    1000,
+    int(os.getenv("FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE", "50000")),
+)
+FINMIND_REFERENCE_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "reference")
+FINMIND_PREWARM_ONLY = os.getenv(
+    "WARRANT_PREWARM_ONLY",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_PREWARM_CALENDAR_DAYS = max(
+    110,
+    int(os.getenv("FINMIND_PREWARM_CALENDAR_DAYS", "150")),
+)
+FINMIND_PREWARM_WORKERS = max(
+    1,
+    int(os.getenv("FINMIND_PREWARM_WORKERS", "4")),
+)
+FINMIND_PREWARM_REFRESH_RECENT_DAYS = max(
+    0,
+    int(os.getenv("FINMIND_PREWARM_REFRESH_RECENT_DAYS", "2")),
+)
+FINMIND_PREWARM_KEEP_RAW_DAYS = max(
+    0,
+    int(os.getenv("FINMIND_PREWARM_KEEP_RAW_DAYS", "7")),
+)
 # 多股票時，每個交易日的全市場 Parquet 只解析一次：
 # 先建立所有目標股票有效認購權證代號聯集，再一次讀取、聚合並依標的股拆分。
 FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE = os.getenv(
@@ -14963,6 +15024,9 @@ _FINMIND_DEBUG_ONCE_KEYS = set()
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
 _FINMIND_STORAGE_LOCKS = {}
 _FINMIND_STORAGE_LOCKS_GUARD = threading.Lock()
+_FINMIND_MARKET_COMPACT_LOCKS = {}
+_FINMIND_MARKET_COMPACT_LOCKS_GUARD = threading.Lock()
+_FINMIND_REFERENCE_CACHE_LOCK = threading.RLock()
 _FINMIND_RATE_LIMIT_GATE_LOCK = threading.Lock()
 _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = 0.0
 _FINMIND_WARRANT_RUN_STATS = {}
@@ -15310,6 +15374,454 @@ def _finmind_warrant_day_path(trade_date) -> str:
     return os.path.join(FINMIND_WARRANT_DAY_CACHE_DIR, f"{date_s}.parquet")
 
 
+def _finmind_market_compact_lock(date_s: str):
+    with _FINMIND_MARKET_COMPACT_LOCKS_GUARD:
+        return _FINMIND_MARKET_COMPACT_LOCKS.setdefault(date_s, threading.Lock())
+
+
+def _finmind_market_compact_day_path(trade_date) -> str:
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    return os.path.join(FINMIND_MARKET_COMPACT_CACHE_DIR, f"{date_s}.parquet")
+
+
+def _finmind_market_compact_meta_path(trade_date) -> str:
+    return _finmind_market_compact_day_path(trade_date) + ".meta.json"
+
+
+def _finmind_trader_map_hash(trader_name_map: Dict[str, str] | None) -> str:
+    payload = "\n".join(
+        f"{str(k)}={str(v)}"
+        for k, v in sorted((trader_name_map or {}).items())
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _finmind_reference_paths(cache_name: str) -> tuple[str, str]:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(cache_name or "reference")).strip("_") or "reference"
+    return (
+        os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.parquet"),
+        os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.meta.json"),
+    )
+
+
+def _finmind_read_reference_df(cache_name: str, max_age_days: int) -> pd.DataFrame | None:
+    data_path, meta_path = _finmind_reference_paths(cache_name)
+    if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        updated = pd.to_datetime(meta.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        age_days = int((get_taipei_today_ts() - updated).days)
+        if age_days < 0 or age_days > max(0, int(max_age_days)):
+            return None
+        df = pd.read_parquet(data_path)
+        print(f"⚡ FinMind 參考資料磁碟快取命中：{cache_name}｜{len(df):,} 筆｜age={age_days}日")
+        return df
+    except Exception as exc:
+        print(f"⚠️ FinMind 參考資料快取讀取失敗：{cache_name}｜{exc}")
+        return None
+
+
+def _finmind_write_reference_df(cache_name: str, df: pd.DataFrame):
+    if df is None:
+        return
+    data_path, meta_path = _finmind_reference_paths(cache_name)
+    _ensure_dir(FINMIND_REFERENCE_CACHE_DIR)
+    tmp_data = f"{data_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    tmp_meta = f"{meta_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        df.to_parquet(tmp_data, index=False, compression="zstd")
+        payload = {
+            "cache_name": cache_name,
+            "updated_at": get_taipei_today_ts().strftime("%Y-%m-%d"),
+            "rows": int(len(df)),
+            "build": FINMIND_BUILD_VERSION,
+        }
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_data, data_path)
+        os.replace(tmp_meta, meta_path)
+    except Exception as exc:
+        print(f"⚠️ FinMind 參考資料快取寫入失敗：{cache_name}｜{exc}")
+        for path in [tmp_data, tmp_meta]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
+def _finmind_reference_json_path(cache_name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(cache_name or "reference")).strip("_") or "reference"
+    return os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.json")
+
+
+def _finmind_read_reference_json(cache_name: str, max_age_days: int):
+    path = _finmind_reference_json_path(cache_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        updated = pd.to_datetime(payload.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        age_days = int((get_taipei_today_ts() - updated).days)
+        if age_days < 0 or age_days > max(0, int(max_age_days)):
+            return None
+        print(f"⚡ FinMind JSON 參考快取命中：{cache_name}｜age={age_days}日")
+        return payload.get("data")
+    except Exception as exc:
+        print(f"⚠️ FinMind JSON 參考快取讀取失敗：{cache_name}｜{exc}")
+        return None
+
+
+def _finmind_write_reference_json(cache_name: str, data):
+    path = _finmind_reference_json_path(cache_name)
+    _ensure_dir(FINMIND_REFERENCE_CACHE_DIR)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "updated_at": get_taipei_today_ts().strftime("%Y-%m-%d"),
+                "build": FINMIND_BUILD_VERSION,
+                "data": data,
+            }, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        print(f"⚠️ FinMind JSON 參考快取寫入失敗：{cache_name}｜{exc}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _finmind_market_compact_day_is_valid(
+    trade_date,
+    trader_name_map: Dict[str, str] | None = None,
+) -> bool:
+    if not FINMIND_MARKET_COMPACT_CACHE_ENABLE:
+        return False
+    path = _finmind_market_compact_day_path(trade_date)
+    meta_path = _finmind_market_compact_meta_path(trade_date)
+    if not os.path.exists(path) or os.path.getsize(path) <= 0 or not os.path.exists(meta_path):
+        return False
+    required = {
+        "Date", "branch", "broker_code", "warrant_code",
+        "buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares", "side",
+    }
+    try:
+        import pyarrow.parquet as pq
+        schema_names = set(pq.ParquetFile(path).schema.names)
+        if not required.issubset(schema_names):
+            return False
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if str(meta.get("cache_version", "")) != FINMIND_MARKET_COMPACT_CACHE_VERSION:
+            return False
+        if trader_name_map is not None:
+            expected_hash = _finmind_trader_map_hash(trader_name_map)
+            if str(meta.get("trader_map_hash", "")) != expected_hash:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _finmind_build_market_compact_day(
+    trade_date,
+    trader_name_map: Dict[str, str],
+    force_refresh: bool = False,
+    allow_not_ready: bool = False,
+) -> str | None:
+    """將單日全市場原始 Parquet 正規化、聚合成所有股票共用的精簡事件檔。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    path = _finmind_market_compact_day_path(date_s)
+    meta_path = _finmind_market_compact_meta_path(date_s)
+    _ensure_dir(FINMIND_MARKET_COMPACT_CACHE_DIR)
+
+    with _finmind_market_compact_lock(date_s):
+        if not force_refresh and _finmind_market_compact_day_is_valid(date_s, trader_name_map):
+            return path
+
+        raw_path = _finmind_download_warrant_day(date_s, allow_not_ready=allow_not_ready)
+        if not raw_path:
+            return None
+        columns = [
+            "securities_trader", "price", "buy", "sell",
+            "securities_trader_id", "stock_id", "date",
+        ]
+        raw = pd.read_parquet(raw_path, columns=columns)
+        if raw.empty:
+            return None
+
+        raw = raw.copy()
+        stock_ids = raw["stock_id"].astype(str).str.strip().str.upper().str.replace(r"\.0$", "", regex=True)
+        numeric_5 = stock_ids.str.fullmatch(r"\d{5}", na=False)
+        stock_ids.loc[numeric_5] = stock_ids.loc[numeric_5].str.zfill(6)
+        raw["warrant_code"] = stock_ids
+        raw["price"] = pd.to_numeric(raw["price"], errors="coerce").fillna(0.0)
+        raw["buy"] = pd.to_numeric(raw["buy"], errors="coerce").fillna(0.0)
+        raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
+        raw["buy_amount_row"] = raw["price"] * raw["buy"]
+        raw["sell_amount_row"] = raw["price"] * raw["sell"]
+        raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+        raw["raw_branch"] = raw["securities_trader"].astype(str).str.strip()
+        raw["mapped_branch"] = raw["broker_code"].map(trader_name_map or {}).fillna("").astype(str)
+        raw["branch"] = np.where(raw["mapped_branch"].str.strip() != "", raw["mapped_branch"], raw["raw_branch"])
+        raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+        raw = raw[(raw["warrant_code"] != "") & (raw["broker_code"] != "") & (raw["branch"] != "")]
+
+        grouped = raw.groupby(
+            ["warrant_code", "broker_code", "branch"],
+            as_index=False,
+            dropna=False,
+            sort=False,
+        ).agg(
+            buy_shares_raw=("buy", "sum"),
+            sell_shares_raw=("sell", "sum"),
+            buy_amount=("buy_amount_row", "sum"),
+            sell_amount=("sell_amount_row", "sum"),
+        )
+        grouped["Date"] = pd.Timestamp(date_s)
+        grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+        grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+        grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+        grouped = grouped[
+            (grouped["buy_amount"] != 0)
+            | (grouped["sell_amount"] != 0)
+            | (grouped["net_amount"] != 0)
+        ].copy()
+        grouped["side"] = np.where(grouped["net_amount"] >= 0, "買超", "賣超")
+        grouped = grouped[[
+            "Date", "branch", "broker_code", "warrant_code",
+            "buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares", "side",
+        ]].sort_values(["warrant_code", "broker_code"], kind="stable").reset_index(drop=True)
+
+        tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        tmp_meta = f"{meta_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            grouped.to_parquet(
+                tmp_path,
+                index=False,
+                engine="pyarrow",
+                compression="zstd",
+                row_group_size=FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE,
+            )
+            meta = {
+                "cache_version": FINMIND_MARKET_COMPACT_CACHE_VERSION,
+                "date": date_s,
+                "rows": int(len(grouped)),
+                "trader_map_hash": _finmind_trader_map_hash(trader_name_map),
+                "source_size": int(os.path.getsize(raw_path)),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "build": FINMIND_BUILD_VERSION,
+            }
+            with open(tmp_meta, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+            os.replace(tmp_meta, meta_path)
+            print(
+                f"✅ 全市場精簡權證事件快取：{date_s}｜{len(grouped):,} 筆｜"
+                f"{os.path.getsize(path) / 1024 / 1024:.2f} MB"
+            )
+            return path
+        except Exception:
+            for temp in [tmp_path, tmp_meta]:
+                try:
+                    if os.path.exists(temp):
+                        os.remove(temp)
+                except Exception:
+                    pass
+            raise
+
+
+def _finmind_load_target_events_from_market_compact(
+    summary_df: pd.DataFrame,
+    jobs: List[tuple],
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+) -> tuple[pd.DataFrame, set]:
+    """一次掃描所有已預熱精簡日檔，取得任意新股票的完整區間事件。"""
+    if not FINMIND_MARKET_COMPACT_CACHE_ENABLE or summary_df is None or summary_df.empty or not jobs:
+        return pd.DataFrame(), set()
+
+    valid_paths = []
+    compact_dates = set()
+    for day, _ in jobs:
+        day_ts = pd.Timestamp(day).normalize()
+        if _finmind_market_compact_day_is_valid(day_ts, trader_name_map):
+            valid_paths.append(_finmind_market_compact_day_path(day_ts))
+            compact_dates.add(day_ts)
+    if not valid_paths:
+        return pd.DataFrame(), set()
+
+    all_codes = sorted(set(summary_df["stock_id"].astype(str).map(normalize_openapi_warrant_code)) - {""})
+    if not all_codes:
+        return pd.DataFrame(), compact_dates
+
+    try:
+        import pyarrow.dataset as ds
+        dataset = ds.dataset(valid_paths, format="parquet")
+        min_date = min(compact_dates).to_datetime64()
+        max_date = max(compact_dates).to_datetime64()
+        filter_expr = (
+            ds.field("warrant_code").isin(all_codes)
+            & (ds.field("Date") >= min_date)
+            & (ds.field("Date") <= max_date)
+        )
+        table = dataset.to_table(filter=filter_expr)
+        compact = table.to_pandas()
+    except Exception as exc:
+        print(f"⚠️ 全市場精簡快取單次掃描失敗，退回逐日原始 Parquet：{exc}")
+        return pd.DataFrame(), set()
+
+    if compact.empty:
+        print(f"⚡ 全市場精簡快取命中：{stock_code}｜{len(compact_dates)} 日｜0 筆")
+        return pd.DataFrame(), compact_dates
+
+    compact["Date"] = pd.to_datetime(compact["Date"], errors="coerce").dt.normalize()
+    compact["warrant_code"] = compact["warrant_code"].astype(str).map(normalize_openapi_warrant_code)
+    intervals = summary_df[["stock_id", "listing_date", "last_trade_date"]].copy()
+    intervals["stock_id"] = intervals["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    intervals = intervals.dropna(subset=["listing_date", "last_trade_date"]).drop_duplicates()
+    merged = compact.merge(intervals, left_on="warrant_code", right_on="stock_id", how="inner")
+    merged = merged[
+        (merged["Date"] >= merged["listing_date"])
+        & (merged["Date"] <= merged["last_trade_date"])
+    ].copy()
+    merged = merged.drop(columns=["stock_id", "listing_date", "last_trade_date"], errors="ignore")
+    merged = merged.drop_duplicates(
+        subset=["Date", "broker_code", "branch", "warrant_code", "buy_amount", "sell_amount"],
+        keep="last",
+    )
+    merged["warrant_name"] = merged["warrant_code"].map(warrant_name_map).fillna(merged["warrant_code"])
+    merged["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+    merged["underlying_name"] = str(stock_name or "")
+    merged["side"] = np.where(pd.to_numeric(merged["net_amount"], errors="coerce").fillna(0.0) >= 0, "買超", "賣超")
+    output = merged[[
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]].sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    print(
+        f"⚡ 全市場精簡快取命中：{stock_code}｜{len(compact_dates)} 日｜"
+        f"{len(output):,} 筆｜單次 Dataset 掃描"
+    )
+    return output, compact_dates
+
+
+def _finmind_prewarm_market_compact_cache():
+    """排程預熱：更新全市場共用精簡事件與每日參考資料，不產圖。"""
+    start_clock = time.perf_counter()
+    today = get_taipei_today_ts()
+    start_date = today - pd.Timedelta(days=FINMIND_PREWARM_CALENDAR_DAYS - 1)
+    print(
+        f"🔥 開始預熱 FinMind 全市場快取｜{start_date.date()} ~ {today.date()}｜"
+        f"workers={FINMIND_PREWARM_WORKERS}"
+    )
+
+    # 參考資料在預熱流程先更新，手動查任何新股票時直接讀本機快取。
+    _finmind_load_stock_info(force_refresh=False)
+    trader_name_map, _ = _finmind_securities_trader_maps()
+    if not trader_name_map:
+        raise RuntimeError("預熱失敗：TaiwanSecuritiesTraderInfo 無法建立分點對照")
+
+    reference_executor = ThreadPoolExecutor(max_workers=2)
+    reference_futures = [
+        reference_executor.submit(_finmind_load_stock_info_with_warrant, False),
+        reference_executor.submit(_finmind_official_warrant_issuer_map, False),
+    ]
+
+    trading_dates = _finmind_get_trading_dates(start_date, today)
+    if not trading_dates:
+        raise RuntimeError("預熱失敗：找不到實際交易日")
+
+    if FINMIND_PREWARM_REFRESH_RECENT_DAYS > 0:
+        cutoff = today - pd.Timedelta(days=FINMIND_PREWARM_REFRESH_RECENT_DAYS - 1)
+        for day in trading_dates:
+            if day < cutoff:
+                continue
+            for path in [
+                _finmind_warrant_day_path(day),
+                _finmind_market_compact_day_path(day),
+                _finmind_market_compact_meta_path(day),
+            ]:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception as exc:
+                    print(f"⚠️ 預熱更新舊檔刪除失敗：{path}｜{exc}")
+
+    latest_available = None
+    for day in reversed(trading_dates[-FINMIND_WARRANT_LATEST_PROBE_DAYS:]):
+        probe = _finmind_download_warrant_day(day, allow_not_ready=True)
+        if probe:
+            latest_available = pd.Timestamp(day).normalize()
+            break
+    if latest_available is None:
+        raise RuntimeError("預熱失敗：最近交易日沒有可用權證分點日檔")
+    target_dates = [d for d in trading_dates if d <= latest_available]
+
+    failures = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=FINMIND_PREWARM_WORKERS) as executor:
+        future_map = {
+            executor.submit(
+                _finmind_build_market_compact_day,
+                day,
+                trader_name_map,
+                False,
+                False,
+            ): day
+            for day in target_dates
+        }
+        for future in as_completed(future_map):
+            day = future_map[future]
+            completed += 1
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+                print(f"❌ 全市場精簡快取預熱失敗：{pd.Timestamp(day).date()}｜{exc}")
+            if completed == 1 or completed % 10 == 0 or completed == len(target_dates):
+                print(f"📊 全市場快取預熱進度：{completed}/{len(target_dates)}｜失敗={len(failures)}")
+
+    for future in reference_futures:
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"⚠️ 預熱參考資料工作失敗：{exc}")
+    reference_executor.shutdown(wait=True)
+
+    # 全市場精簡檔已可服務任何股票；只保留最近幾天原始檔，降低 Actions cache 體積與還原時間。
+    if FINMIND_PREWARM_KEEP_RAW_DAYS >= 0:
+        raw_cutoff = latest_available - pd.Timedelta(days=FINMIND_PREWARM_KEEP_RAW_DAYS)
+        for raw_path in Path(FINMIND_WARRANT_DAY_CACHE_DIR).glob("*.parquet"):
+            try:
+                raw_date = pd.Timestamp(raw_path.stem).normalize()
+                if raw_date < raw_cutoff and _finmind_market_compact_day_is_valid(raw_date, trader_name_map):
+                    raw_path.unlink()
+            except Exception:
+                pass
+
+    if failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
+        sample = "；".join(f"{d}:{e[:100]}" for d, e in failures[:5])
+        raise RuntimeError(f"全市場快取預熱不完整：{len(failures)}/{len(target_dates)} 日｜{sample}")
+    print(
+        f"✅ 全市場快取預熱完成｜最新日={latest_available.date()}｜"
+        f"交易日={len(target_dates)}｜耗時={time.perf_counter() - start_clock:.2f}秒"
+    )
+
+
 def _looks_like_json_or_html_file(path: str) -> bool:
     try:
         with open(path, "rb") as f:
@@ -15464,17 +15976,24 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
         raise RuntimeError(f"FinMind 權證分點下載最終失敗：{date_s}｜{last_error}")
 
 
+
 def _finmind_load_stock_info(force_refresh: bool = False) -> pd.DataFrame:
     global _FINMIND_STOCK_INFO_CACHE
     with _FINMIND_DATA_CACHE_LOCK:
         if _FINMIND_STOCK_INFO_CACHE is not None and not force_refresh:
             return _FINMIND_STOCK_INFO_CACHE.copy()
-    df = _finmind_get_data("TaiwanStockInfo", allow_empty=False).fillna("")
+    df = None
+    if not force_refresh:
+        df = _finmind_read_reference_df("TaiwanStockInfo", max_age_days=1)
+    if df is None:
+        df = _finmind_get_data("TaiwanStockInfo", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanStockInfo", df)
     required = {"stock_id", "stock_name", "type"}
     missing = required - set(df.columns)
     if missing:
         _finmind_debug_print_df("TaiwanStockInfo 欄位不足", df)
         raise RuntimeError(f"FinMind TaiwanStockInfo 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
+    df = df.copy()
     df["stock_id"] = df["stock_id"].astype(str).str.strip()
     df["stock_name"] = df["stock_name"].astype(str).str.strip()
     with _FINMIND_DATA_CACHE_LOCK:
@@ -15483,23 +16002,33 @@ def _finmind_load_stock_info(force_refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+
+
 def _finmind_load_stock_info_with_warrant(force_refresh: bool = False) -> pd.DataFrame:
     global _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE
     with _FINMIND_DATA_CACHE_LOCK:
         if _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE is not None and not force_refresh:
             return _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE.copy()
-    df = _finmind_get_data("TaiwanStockInfoWithWarrant", allow_empty=False).fillna("")
+    df = None
+    if not force_refresh:
+        df = _finmind_read_reference_df("TaiwanStockInfoWithWarrant", max_age_days=1)
+    if df is None:
+        df = _finmind_get_data("TaiwanStockInfoWithWarrant", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanStockInfoWithWarrant", df)
     required = {"stock_id", "stock_name"}
     missing = required - set(df.columns)
     if missing:
         _finmind_debug_print_df("TaiwanStockInfoWithWarrant 欄位不足", df)
         raise RuntimeError(f"FinMind TaiwanStockInfoWithWarrant 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
+    df = df.copy()
     df["stock_id"] = df["stock_id"].astype(str).map(normalize_openapi_warrant_code)
     df["stock_name"] = df["stock_name"].astype(str).str.strip()
     with _FINMIND_DATA_CACHE_LOCK:
         _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = df.copy()
     print(f"📦 FinMind 股票與權證名稱總覽載入：{len(df):,} 筆")
     return df
+
+
 
 
 def _finmind_load_securities_trader_info(force_refresh: bool = False) -> pd.DataFrame:
@@ -15509,7 +16038,12 @@ def _finmind_load_securities_trader_info(force_refresh: bool = False) -> pd.Data
         if _FINMIND_SECURITIES_TRADER_INFO_CACHE is not None and not force_refresh:
             return _FINMIND_SECURITIES_TRADER_INFO_CACHE.copy()
 
-    df = _finmind_get_data("TaiwanSecuritiesTraderInfo", allow_empty=False).fillna("")
+    df = None
+    if not force_refresh:
+        df = _finmind_read_reference_df("TaiwanSecuritiesTraderInfo", max_age_days=7)
+    if df is None:
+        df = _finmind_get_data("TaiwanSecuritiesTraderInfo", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanSecuritiesTraderInfo", df)
     required = {"securities_trader_id", "securities_trader"}
     missing = required - set(df.columns)
     if missing:
@@ -15536,6 +16070,7 @@ def _finmind_load_securities_trader_info(force_refresh: bool = False) -> pd.Data
         _FINMIND_SECURITIES_TRADER_INFO_CACHE = out.copy()
     print(f"📦 FinMind 證券商分點對照載入：{len(out):,} 個代碼")
     return out
+
 
 
 def _finmind_securities_trader_maps() -> tuple[Dict[str, str], pd.DataFrame]:
@@ -16824,44 +17359,62 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if not jobs:
         return pd.DataFrame(columns=empty_columns)
 
-    print(
-        f"🚀 FinMind 全市場權證分點處理：{code} {stock_name}｜"
-        f"交易日 {len(jobs):,} 日｜workers={FINMIND_WARRANT_DOWNLOAD_WORKERS}"
+    compact_events, compact_dates = _finmind_load_target_events_from_market_compact(
+        summary,
+        jobs,
+        warrant_name_map,
+        code,
+        stock_name,
+        trader_name_map,
     )
-    frames = []
+    remaining_jobs = [
+        (day, active_codes)
+        for day, active_codes in jobs
+        if pd.Timestamp(day).normalize() not in compact_dates
+    ]
+    print(
+        f"🚀 FinMind 權證分點處理：{code} {stock_name}｜"
+        f"交易日 {len(jobs):,} 日｜精簡快取 {len(compact_dates):,} 日｜"
+        f"原始 Parquet 補處理 {len(remaining_jobs):,} 日｜workers={FINMIND_WARRANT_DOWNLOAD_WORKERS}"
+    )
+    frames = [compact_events] if compact_events is not None and not compact_events.empty else []
+    compact_event_dates = set(
+        pd.to_datetime(compact_events["Date"], errors="coerce").dropna().dt.normalize().tolist()
+    ) if compact_events is not None and not compact_events.empty else set()
     failures = []
-    empty_dates = 0
-    completed = 0
-    with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_DOWNLOAD_WORKERS) as executor:
-        future_map = {
-            executor.submit(
-                _finmind_process_warrant_day,
-                day,
-                active_codes,
-                warrant_name_map,
-                code,
-                stock_name,
-                trader_name_map,
-            ): day
-            for day, active_codes in jobs
-        }
-        for future in as_completed(future_map):
-            day = future_map[future]
-            completed += 1
-            try:
-                day_df = future.result()
-                if day_df is None or day_df.empty:
-                    empty_dates += 1
-                else:
-                    frames.append(day_df)
-            except Exception as exc:
-                failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
-                print(f"❌ FinMind 權證分點日期失敗：{pd.Timestamp(day).date()}｜{exc}")
-            if completed == 1 or completed % 5 == 0 or completed == len(jobs):
-                print(
-                    f"📊 FinMind 權證分點進度：{completed}/{len(jobs)}｜"
-                    f"有資料={len(frames)}｜空資料={empty_dates}｜失敗={len(failures)}"
-                )
+    empty_dates = max(0, len(compact_dates - compact_event_dates))
+    completed = len(compact_dates)
+    if remaining_jobs:
+        with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_DOWNLOAD_WORKERS) as executor:
+            future_map = {
+                executor.submit(
+                    _finmind_process_warrant_day,
+                    day,
+                    active_codes,
+                    warrant_name_map,
+                    code,
+                    stock_name,
+                    trader_name_map,
+                ): day
+                for day, active_codes in remaining_jobs
+            }
+            for future in as_completed(future_map):
+                day = future_map[future]
+                completed += 1
+                try:
+                    day_df = future.result()
+                    if day_df is None or day_df.empty:
+                        empty_dates += 1
+                    else:
+                        frames.append(day_df)
+                except Exception as exc:
+                    failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+                    print(f"❌ FinMind 權證分點日期失敗：{pd.Timestamp(day).date()}｜{exc}")
+                if completed == 1 or completed % 5 == 0 or completed == len(jobs):
+                    print(
+                        f"📊 FinMind 權證分點進度：{completed}/{len(jobs)}｜"
+                        f"資料區塊={len(frames)}｜空資料={empty_dates}｜失敗={len(failures)}"
+                    )
 
     stats = {
         "total_dates": len(jobs),
@@ -17361,7 +17914,7 @@ def main():
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
     print(
         "🧩 ACTIVE_FEATURES="
-        "official-issuer-map+issuer-flow+quota-wait+daily-parquet-cache+multi-stock-read-once+raw-selected-branch+daily-parallel-news+single-context+uv-ready+calendar7"
+        "official-issuer-map+issuer-flow+quota-wait+market-compact-prewarm+reference-disk-cache+raw-selected-branch+daily-parallel-news+single-context+uv-ready+calendar7"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
@@ -17372,6 +17925,11 @@ def main():
     print("=" * 100)
     output_dir = os.getenv("OUTPUT_DIR", "output").strip() or "output"
     os.makedirs(output_dir, exist_ok=True)
+
+    if FINMIND_PREWARM_ONLY:
+        print("🔥 WARRANT_PREWARM_ONLY=1：本次只建立全市場共用快取，不產圖、不呼叫 Gemini、不送 Discord")
+        _finmind_prewarm_market_compact_cache()
+        return
 
     raw_codes = os.getenv("STOCK_CODES", "2408").strip() or "2408"
     stock_codes = [c.strip() for c in re.split(r"[,，\s]+", raw_codes) if c.strip()]
