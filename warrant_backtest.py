@@ -4534,6 +4534,8 @@ GSHEET_RESULT_OVERWRITE_TITLES = {
     WARRANT_CONSENSUS_7D_SHEET,
     "券商查詢",
     "券商查詢資料",
+    "股票ABCDE查詢",
+    "股票ABCDE查詢資料",
     "價格抓取狀態",
     "顏色說明",
 }
@@ -4544,6 +4546,8 @@ GSHEET_RESULT_OVERWRITE_TITLES = {
 GSHEET_RUN_MODE1_SKIP_RESULT_TITLES = {
     "券商查詢",
     "券商查詢資料",
+    "股票ABCDE查詢",
+    "股票ABCDE查詢資料",
     "勝率統計",
     "ABCDE組合勝率",
 }
@@ -10491,6 +10495,11 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     if not detail_rows:
         return []
 
+    scope = str(
+        detail_rows[0].get("資料範圍", "")
+        or get_result_data_scope()
+    ).strip()
+
     agg = {}
 
     for row in detail_rows:
@@ -12229,6 +12238,216 @@ def write_broker_query_sheet(wb, items):
 
     ws.row_dimensions[2].height = 24
     ws.freeze_panes = "A6"
+
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+
+
+
+def collect_stock_abcde_query_rows(a_events, b_events, c_events, d_events, e_events=None):
+    """整理股票查詢頁使用的全部 A/B/C/D/E 事件紀錄。"""
+    rows = []
+
+    for event_code, events in iter_amount_class_event_groups(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+    ):
+        for ev in events or []:
+            event_date = normalize_date_str(
+                ev.get("事件日")
+                or ev.get("結束日")
+                or ev.get("起始日")
+                or ""
+            )
+            reduce_date = normalize_date_str(ev.get("減碼日", "")) if ev.get("減碼日") else ""
+            exit_date = normalize_date_str(ev.get("出清日", "")) if ev.get("出清日") else ""
+            exit_return = ev.get("出清獲利%")
+
+            if exit_date:
+                current_status = "已出清"
+            elif reduce_date:
+                current_status = "已減碼未出清"
+            else:
+                current_status = "目前持有"
+
+            rows.append({
+                "事件類型": ev.get(
+                    "事件類型",
+                    f"{event_code}-{AMOUNT_CLASS_LABELS.get(event_code, '事件')}",
+                ),
+                "事件代碼": event_code,
+                "標的股": str(ev.get("標的股", "")).strip(),
+                "標的名稱": str(ev.get("標的名稱", "")).strip(),
+                "分點": str(ev.get("分點", "")).strip(),
+                "分點名稱": str(ev.get("分點名稱", "")).strip(),
+                "券商代號": str(ev.get("券商代號", "")).strip(),
+                "事件日": event_date,
+                "目前狀態": current_status,
+                "結果": calc_result_tag(exit_return),
+                "單日累積買進金額": _safe_stat_amount(
+                    ev.get("單日累積買進金額", ev.get("買超金額", 0))
+                ),
+                "買超張數": ev.get("買超張數", 0),
+                "涵蓋權證數": ev.get("涵蓋權證數", 0),
+                "權證清單": ev.get("權證清單", ""),
+                "最大單筆金額": _safe_stat_amount(ev.get("最大單筆金額", 0)),
+                "最大單筆權證": ev.get("最大單筆權證", ""),
+                "減碼日": reduce_date or "-",
+                "減碼賣出金額": _safe_stat_amount(ev.get("減碼賣出金額", 0)) if ev.get("減碼賣出金額") is not None else "-",
+                "減碼獲利%": fmt_pct(ev.get("減碼獲利%")),
+                "出清日": exit_date or "-",
+                "出清賣出金額": _safe_stat_amount(ev.get("出清賣出金額", 0)) if ev.get("出清賣出金額") is not None else "-",
+                "出清獲利%": fmt_pct(exit_return),
+                "持有天數": fmt_num(ev.get("持有天數")),
+            })
+
+    rows.sort(
+        key=lambda row: (
+            -((parse_date(row.get("事件日", "")) or datetime.min).toordinal()),
+            str(row.get("標的股", "")),
+            str(row.get("事件代碼", "")),
+            str(row.get("分點", "")),
+        )
+    )
+    return rows
+
+
+def write_stock_abcde_query_sheet(wb, a_events, b_events, c_events, d_events, e_events=None):
+    """
+    建立股票 A/B/C/D/E 查詢頁。
+
+    使用方式：
+    - 在「股票ABCDE查詢」B2 輸入股號或股名。
+    - 查詢結果會列出目前快取保存範圍內，該標的曾出現過的全部 A/B/C/D/E 事件。
+    - RUN_MODE=1 不同步這兩張工作表，避免精選五分點結果覆蓋全分點查詢資料。
+    """
+    data_title = "股票ABCDE查詢資料"
+    query_title = "股票ABCDE查詢"
+    rows = collect_stock_abcde_query_rows(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+    )
+
+    headers = [
+        "事件類型",
+        "事件代碼",
+        "標的股",
+        "標的名稱",
+        "分點",
+        "分點名稱",
+        "券商代號",
+        "事件日",
+        "目前狀態",
+        "結果",
+        "單日累積買進金額",
+        "買超張數",
+        "涵蓋權證數",
+        "權證清單",
+        "最大單筆金額",
+        "最大單筆權證",
+        "減碼日",
+        "減碼賣出金額",
+        "減碼獲利%",
+        "出清日",
+        "出清賣出金額",
+        "出清獲利%",
+        "持有天數",
+    ]
+
+    data_ws = wb.create_sheet(data_title)
+    data_ws.append(headers)
+    for row in rows:
+        data_ws.append([row.get(header, "") for header in headers])
+
+    data_widths = [
+        18, 10, 10, 14, 16, 18, 12, 12, 14, 10,
+        18, 12, 12, 70, 16, 28, 12, 16, 14, 12,
+        16, 14, 12,
+    ]
+    style_sheet(data_ws, data_widths)
+    data_ws.freeze_panes = "A2"
+    data_ws.auto_filter.ref = data_ws.dimensions
+    data_ws.sheet_state = "hidden"
+
+    query_ws = wb.create_sheet(query_title)
+    query_ws["A1"] = "股票 A/B/C/D/E 現有與歷史事件查詢"
+    query_ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    query_ws["A1"].font = Font(bold=True, size=14, color="000000")
+    query_ws["A1"].fill = YELLOW
+    query_ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    query_ws.row_dimensions[1].height = 28
+
+    query_ws["A2"] = "輸入股名或股號"
+    query_ws["A2"].font = Font(bold=True, color="000000")
+    query_ws["A2"].fill = GRAY
+    query_ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+
+    query_ws["B2"] = ""
+    query_ws["B2"].font = Font(bold=True, color="000000")
+    query_ws["B2"].fill = PatternFill("solid", fgColor="FFF2CC")
+    query_ws["B2"].alignment = Alignment(horizontal="center", vertical="center")
+
+    query_ws["D2"] = (
+        "可輸入完整或部分股號／股名，例如 2330、台積電。"
+        "查詢範圍是目前程式快取仍保留並重建出的全部 A～E 事件，包含目前持有、已減碼與已出清紀錄。"
+    )
+    query_ws.merge_cells(start_row=2, start_column=4, end_row=2, end_column=len(headers))
+    query_ws["D2"].font = Font(color="666666")
+    query_ws["D2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    query_ws.row_dimensions[2].height = 34
+
+    header_row = 5
+    for col_idx, header in enumerate(headers, 1):
+        cell = query_ws.cell(header_row, col_idx)
+        cell.value = header
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = YELLOW
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    max_data_row = max(data_ws.max_row, 2)
+    last_col_letter = get_column_letter(len(headers))
+    stock_code_col = get_column_letter(headers.index("標的股") + 1)
+    stock_name_col = get_column_letter(headers.index("標的名稱") + 1)
+
+    query_ws["A6"] = (
+        f'=IF($B$2="","",IFERROR('
+        f'FILTER(\'{data_title}\'!$A$2:${last_col_letter}${max_data_row},'
+        f'(ISNUMBER(SEARCH($B$2,\'{data_title}\'!${stock_code_col}$2:${stock_code_col}${max_data_row})))+'
+        f'(ISNUMBER(SEARCH($B$2,\'{data_title}\'!${stock_name_col}$2:${stock_name_col}${max_data_row})))), '
+        f'"查無符合資料"))'
+    )
+
+    # 預留 FILTER 溢出空間：Google Sheet 同步時會依 Excel 實際尺寸 resize。
+    # 使用空字串而不是 None，確保工作簿儲存並重新 load_workbook() 後仍保留工作表尺寸；
+    # 同步到 Google Sheet 時仍會寫成空白值，不會阻擋 FILTER 陣列結果展開。
+    reserve_rows = max(data_ws.max_row + 10, 200)
+    for row_idx in range(7, 7 + reserve_rows):
+        query_ws.cell(row_idx, 1).value = ""
+    query_ws.cell(6 + reserve_rows, len(headers)).value = ""
+
+    thin_gray = Side(style="thin", color="B7B7B7")
+    normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+    for row_idx in [1, 2, header_row, 6]:
+        for col_idx in range(1, len(headers) + 1):
+            cell = query_ws.cell(row_idx, col_idx)
+            cell.border = normal_border
+            if row_idx in (header_row, 6):
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col_idx, width in enumerate(data_widths, 1):
+        query_ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    query_ws.freeze_panes = "A6"
 
     try:
         wb.calculation.fullCalcOnLoad = True
@@ -15139,6 +15358,7 @@ def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, pric
     write_recent_warrant_amount_ranking_sheet(wb, items)
     write_underlying_broker_count_ranking_sheet(wb, items)
     write_broker_query_sheet(wb, items)
+    write_stock_abcde_query_sheet(wb, a_events, b_events, c_events, d_events, e_events)
     write_price_status_sheet(wb, price_cache)
     write_color_legend_sheet(wb)
     write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_events)
