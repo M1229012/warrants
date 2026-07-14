@@ -67,6 +67,9 @@ jobs:
       FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
       FINMIND_CACHE_DIR: finmind_cache
 
+      # FinMind 全市場分點買賣雙邊會完全平衡；週報資金流改看非總公司分點。
+      WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
+
       # ========================================================
       # Google Sheet 只作結果快照、Gemini 快取與既有勝率統計。
       # 不再作為股票名稱、權證母體或分點市場資料備援。
