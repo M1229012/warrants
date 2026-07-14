@@ -12,21 +12,17 @@ E：單日累積買進金額 >= 1000萬
 
 事件規則：同一分點 + 同一標的 + 同一天只會產生 A / B / C / D / E 其中一類；不同分點交易同一標的互不排除。每次符合條件的事件各自成一筆，後續賣出依剩餘股數 FIFO 扣減；金額僅用於成本與損益。
 
-輸出 Excel：
+每日流程只輸出與同步以下 8 張工作表：
 1. A_基礎買超
 2. B_明顯買超
 3. C_強勢買超
 4. D_大額布局
 5. E_超大額布局
-6. 勝率統計
-7. 近兩月買賣金額排行
-8. 近兩月分點數排行
-9. 券商查詢
-10. 快取_TOP15共識淨買超
-11. 快取_TOP15部位明細
-12. 快取_近7日權證分點共識TOP15（近7／14／21日精選13分點排名；僅 RUN_MODE=2 更新）
-13. 快取_近10日分點買賣明細（僅 RUN_MODE=2 全市場分點模式更新）
-14. 顏色說明
+6. 每日賣出明細
+7. 快取_TOP15共識淨買超
+8. 快取_TOP15部位明細
+
+每日流程不再建立、計算或同步近 7／14／21 日、近 10 日、勝率統計、排行、查詢與顏色說明等其他結果工作表。
 
 執行：python warrant_backtest.py
 依賴：pip install requests pandas openpyxl
@@ -187,6 +183,15 @@ PRICE_CACHE_FULL_SYNC_THRESHOLD_ROWS = int(os.getenv("PRICE_CACHE_FULL_SYNC_THRE
 TOP15_CACHE_ENABLED = os.getenv("TOP15_CACHE_ENABLED", os.getenv("TOP15_RETURN_CACHE_ENABLED", "1")).strip().lower() not in ("0", "false", "no")
 TOP15_POSITION_DETAIL_SHEET = os.getenv("TOP15_POSITION_DETAIL_SHEET", "快取_TOP15部位明細")
 TOP15_CONSENSUS_SHEET = os.getenv("TOP15_CONSENSUS_SHEET", "快取_TOP15共識淨買超")
+
+# 每日流程唯一允許建立／同步的 8 張結果工作表。
+DAILY_RESULT_SHEET_TITLES = {
+    *AMOUNT_CLASS_SHEET_NAMES,
+    "每日賣出明細",
+    TOP15_CONSENSUS_SHEET,
+    TOP15_POSITION_DETAIL_SHEET,
+}
+
 TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", os.getenv("LOOKBACK_TRADING_DAYS", "22"))))
 TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75")))
 TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10")))
@@ -6172,7 +6177,13 @@ def upload_excel_to_google_sheet(
                     f"  ⚡ Google Sheet 單次雙範圍同步：主範圍={current_scope}｜"
                     f"額外範圍=精選五分點｜重疊工作表 {len(extra_scope_values):,} 張"
                 )
-            compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
+            if allowed is None:
+                compact_spreadsheet_blank_grid(primary_sh, label="主試算表（同步前）")
+            else:
+                print(
+                    f"  ✅ 限定同步 {len(allowed):,} 張工作表："
+                    "略過整份試算表空白格掃描，不讀取或改動其他工作表。"
+                )
 
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
@@ -15337,12 +15348,13 @@ def write_7d_warrant_consensus_top15_sheet(wb, rows):
     ws.freeze_panes = f"A{(first_header_row or 1) + 1}"
 
 def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, price_cache, items, output_path, top15_detail_rows=None, top15_consensus_rows=None, warrant_consensus_7d_rows=None, broker_10d_detail_rows=None, broker_10d_winrate_rank_rows=None):
-    print("【Step 5】建立 Excel...")
+    print("【Step 5】建立每日 8 張結果工作表...")
 
     wb = Workbook()
     default_ws = wb.active
     wb.remove(default_ws)
 
+    # 每日流程只建立以下 8 張工作表；其餘報表不計算、不建立，也不會同步到 Google Sheet。
     write_group_sheet(wb, "A_基礎買超", a_events, price_cache, is_c=False)
     write_group_sheet(wb, "B_明顯買超", b_events, price_cache, is_c=False)
     write_group_sheet(wb, "C_強勢買超", c_events, price_cache, is_c=False)
@@ -15351,17 +15363,6 @@ def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, pric
     write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_events, e_events)
     write_top15_consensus_cache_sheet(wb, top15_consensus_rows or [])
     write_top15_position_detail_sheet(wb, top15_detail_rows or [])
-    write_7d_warrant_consensus_top15_sheet(wb, warrant_consensus_7d_rows)
-    write_10d_broker_underlying_detail_sheet(wb, broker_10d_detail_rows)
-    write_10d_broker_winrate_rank_sheet(wb, broker_10d_winrate_rank_rows)
-    write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events)
-    write_recent_warrant_amount_ranking_sheet(wb, items)
-    write_underlying_broker_count_ranking_sheet(wb, items)
-    write_broker_query_sheet(wb, items)
-    write_stock_abcde_query_sheet(wb, a_events, b_events, c_events, d_events, e_events)
-    write_price_status_sheet(wb, price_cache)
-    write_color_legend_sheet(wb)
-    write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_events)
 
     apply_global_amount_comma_format(wb)
 
@@ -16256,11 +16257,10 @@ def build_moneydj_search_repair_fetch_keys(history_cache_df, candidates, target_
 
 def build_price_prefetch_context_from_items(items):
     """
-    用既有分點歷史快取重建正式流程會用到的事件，僅供價格預抓使用。
+    用既有分點歷史快取重建每日 8 張結果工作表會用到的事件，僅供價格預抓使用。
 
     注意：這裡不寫入任何結果工作表，只重用正式流程的 A/B/C/D/E 金額強度分類，
-    讓價格預抓覆蓋正式流程真正會用到的標的股價格、TOP15 剩餘部位權證價格，
-    以及 RUN_MODE=2 的近10日分點明細權證價格。
+    讓價格預抓覆蓋 A～E 與近一個月 TOP15 真正需要的標的股／權證價格。
     """
     item_map = {}
 
@@ -16295,7 +16295,7 @@ def build_selected_scope_excel(
     top15_detail_rows=None,
     top15_consensus_rows=None,
 ):
-    """只建立產圖需要的精選五分點結果表；資料全部來自同次完整追蹤分點結果。"""
+    """只建立每日流程需要的 8 張精選五分點結果表；資料全部來自同次完整追蹤分點結果。"""
     a_events, b_events, c_events, d_events, e_events = selected_events
     wb = Workbook()
     wb.remove(wb.active)
@@ -16308,8 +16308,6 @@ def build_selected_scope_excel(
     write_daily_sell_detail_sheet(wb, selected_items, a_events, b_events, c_events, d_events, e_events)
     write_top15_consensus_cache_sheet(wb, top15_consensus_rows or [])
     write_top15_position_detail_sheet(wb, top15_detail_rows or [])
-    write_recent_warrant_amount_ranking_sheet(wb, selected_items)
-    write_underlying_broker_count_ranking_sheet(wb, selected_items)
     apply_global_amount_comma_format(wb)
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
@@ -16416,39 +16414,9 @@ def run_auto_price_prefetch_from_history(history_cache_df, candidate_keys=None, 
             add_price_aliases(price_cache, code, prices)
         print("  ⚠️ 快取資料目前無 A/B/C/D/E 事件，略過事件價格預抓，只檢查其他價格需求。")
 
-    # 不論 RUN_MODE 為何，價格預抓都先補近10日分點明細會用到的標的股價格。
-    # 這是為了讓盤後現股收盤價可以先進 price_cache，避免之後分點資料更新時「現股10日」仍停在前一交易日。
-    price_cache, changed_codes = ensure_broker_10d_underlying_prices(
-        price_cache,
-        items,
-        target_date=target_date,
-        persistent_price_cache=persistent_price_cache,
-        defer_save=True,
-    )
-    all_changed_price_codes.update(changed_codes)
-
-    if RUN_MODE == 2:
-        price_cache, changed_codes = ensure_broker_10d_warrant_prices(
-            price_cache,
-            items,
-            target_date=target_date,
-            persistent_price_cache=persistent_price_cache,
-            defer_save=True,
-        )
-        all_changed_price_codes.update(changed_codes)
-    else:
-        print("  ✅ RUN_MODE=1：近10日分點明細工作表不更新，因此價格預抓略過該表權證價。")
-
-    # 完整價格預抓：不只補事件 / TOP15 / 近10日圖卡目前會用到的價格，
-    # 也把既有分點歷史快取中所有權證與標的股的最新價格先補進 price_cache。
-    price_cache, changed_codes = ensure_price_prefetch_all_item_prices(
-        price_cache,
-        items,
-        target_date=target_date,
-        persistent_price_cache=persistent_price_cache,
-        defer_save=True,
-    )
-    all_changed_price_codes.update(changed_codes)
+    # 每日流程只維護 A～E、每日賣出明細與近一個月 TOP15 所需價格。
+    # 不再預抓近10日、近7／14／21日或完整歷史中所有代號的價格。
+    print("  ✅ 每日 8 表模式：價格預抓僅處理 A～E 與近一個月 TOP15 所需代號。")
 
     if all_changed_price_codes:
         save_price_cache(
@@ -16522,28 +16490,22 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
 
     if PRICE_PREFETCH_SKIP_IF_DONE_TODAY and is_price_prefetch_done_for_today(target_date):
         if PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE:
-            history_cache_df = load_history_cache()
-            has_required_10d_underlying_prices, price_summary = price_cache_has_required_10d_underlying_target_prices(
-                history_cache_df,
-                candidate_keys=candidate_keys,
-                target_date=target_date,
-            )
-
+            has_target_prices, price_summary = price_cache_has_target_date_prices(target_date)
             print(
-                f"  🔎 檢查近10日現股價格：需 {price_summary.get('required_underlying_count', 0):,} 檔｜"
-                f"已有目標日 {price_summary.get('target_date_underlying_count', 0):,} 檔｜"
-                f"缺 {price_summary.get('missing_underlying_count', 0):,} 檔"
+                f"  🔎 檢查每日 8 表價格快取：{target_date} 已有 "
+                f"{price_summary.get('target_date_code_count', 0):,} 個代號收盤價｜"
+                f"價格最新日期：{price_summary.get('latest_date', '-') or '-'}"
             )
 
-            if has_required_10d_underlying_prices:
+            if has_target_prices:
                 print(
-                    "  ✅ 今日已完成價格預抓，且近10日現股所需標的股已有目標日收盤價；"
+                    "  ✅ 今日已完成價格預抓，且每日 8 表價格快取已有目標日收盤價；"
                     "API4 今日市場資料仍未確認，略過正式報表與價格重抓，快速結束。"
                 )
                 write_prescan_status(
                     "broker_data_not_ready",
                     target_date=target_date,
-                    reason="API4 今日市場資料尚未確認；價格預抓已完成，快速結束",
+                    reason="API4 今日市場資料尚未確認；每日 8 表價格預抓已完成，快速結束",
                     candidate_count=len(candidates or []),
                     candidate_cache_saved=False,
                 )
@@ -16551,22 +16513,16 @@ def maybe_auto_price_prefetch_before_api5(candidates, program_start):
                 print(f"\n⏱️ 總執行時間：{elapsed:.2f} 秒")
                 return True
 
-            missing_sample = str(price_summary.get("missing_sample", "") or "").strip()
-            if missing_sample:
-                missing_sample = f"｜缺少樣本：{missing_sample}"
-
             print(
-                f"  🔄 今日曾完成價格預抓，但近10日現股所需標的股尚未全數取得 {target_date} 收盤價 "
-                f"（價格最新日期：{price_summary.get('latest_date', '-') or '-'}｜"
-                f"缺少標的數：{price_summary.get('missing_underlying_count', 0)}{missing_sample}），"
-                "本次再嘗試預抓盤後最新價格。"
+                f"  🔄 今日曾完成價格預抓，但價格快取尚未取得 {target_date} 收盤價，"
+                "本次再嘗試預抓 A～E 與近一個月 TOP15 所需價格。"
             )
         else:
-            print("  ✅ 今日已完成價格預抓，且 API4 今日市場資料仍未確認；略過正式報表與價格重抓，快速結束。")
+            print("  ✅ 今日已完成每日 8 表價格預抓，且 API4 今日市場資料仍未確認；略過正式報表與價格重抓，快速結束。")
             write_prescan_status(
                 "broker_data_not_ready",
                 target_date=target_date,
-                reason="API4 今日市場資料尚未確認；價格預抓已完成，快速結束",
+                reason="API4 今日市場資料尚未確認；每日 8 表價格預抓已完成，快速結束",
                 candidate_count=len(candidates or []),
                 candidate_cache_saved=False,
             )
@@ -18151,31 +18107,12 @@ def main():
             "未重新呼叫 API4／API5／價格 API。"
         )
 
-    warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items)
-
-    if RUN_MODE == 2:
-        price_cache, changed_codes = ensure_broker_10d_underlying_prices(
-            price_cache,
-            items,
-            persistent_price_cache=persistent_price_cache,
-            defer_save=True,
-        )
-        all_changed_price_codes.update(changed_codes)
-
-        price_cache, changed_codes = ensure_broker_10d_warrant_prices(
-            price_cache,
-            items,
-            persistent_price_cache=persistent_price_cache,
-            defer_save=True,
-        )
-        all_changed_price_codes.update(changed_codes)
-
-        broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache)
-        broker_10d_winrate_rank_rows = build_10d_broker_winrate_rank_rows(broker_10d_detail_rows)
-    else:
-        print("  ✅ RUN_MODE=1 精選分點模式：略過近10日分點買賣明細與分點勝率排行工作表，避免動到 Google Sheet 既有資料。")
-        broker_10d_detail_rows = None
-        broker_10d_winrate_rank_rows = None
+    # 每日流程只需要 8 張工作表，因此不再計算近 7／14／21 日共識、
+    # 近 10 日分點買賣明細與近 10 日勝率排行，也不再為它們補抓價格。
+    warrant_consensus_7d_rows = None
+    broker_10d_detail_rows = None
+    broker_10d_winrate_rank_rows = None
+    print("  ✅ 每日 8 表模式：略過近7／14／21日、近10日與其他額外報表資料。")
 
     if all_changed_price_codes:
         save_price_cache(
@@ -18192,7 +18129,7 @@ def main():
     build_excel(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache, items, output_path,
-        top15_detail_rows, top15_consensus_rows, warrant_consensus_7d_rows, broker_10d_detail_rows, broker_10d_winrate_rank_rows
+        top15_detail_rows, top15_consensus_rows,
     )
 
     extra_scope_values = None
@@ -18210,14 +18147,7 @@ def main():
             selected_top15_detail_rows,
             selected_top15_consensus_rows,
         )
-        selected_titles = {
-            *AMOUNT_CLASS_SHEET_NAMES,
-            "每日賣出明細",
-            TOP15_POSITION_DETAIL_SHEET,
-            TOP15_CONSENSUS_SHEET,
-            "近兩月買賣金額排行",
-            "近兩月分點數排行",
-        }
+        selected_titles = set(DAILY_RESULT_SHEET_TITLES)
         extra_scope_values = read_excel_values_by_title(
             selected_output_path,
             allowed_titles=selected_titles,
@@ -18230,6 +18160,7 @@ def main():
     upload_excel_to_google_sheet(
         output_path,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
+        allowed_titles=DAILY_RESULT_SHEET_TITLES,
         extra_scope_values=extra_scope_values,
     )
 
