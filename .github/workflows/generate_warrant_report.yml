@@ -220,6 +220,7 @@ jobs:
       # 上方權證資金流與 TOP5：逐檔排除該權證官方辨識的發行造市端。
       WARRANT_FLOW_EXCLUDE_HEAD_OFFICE_BRANCH_ENABLE: "1"
       FINMIND_ISSUER_FLOW_ENABLE: "1"
+      FINMIND_ISSUER_FLOW_EXCLUDE_UNRESOLVED_ENABLE: "1"
       FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
       FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE: "0"
       FINMIND_ISSUER_FLOW_DEBUG_ENABLE: ${{ inputs.moneydj_compare_debug == '1' && inputs.moneydj_compare_all_branches == '1' && '1' || '0' }}
@@ -281,7 +282,7 @@ jobs:
       # 新聞只使用 FinMind TaiwanStockNews。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v17_finmind_direct_title_strict"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v18_finmind_event_level_dedup"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
       WARRANT_NEWS_GOOGLE_MAX_ITEMS: "24"
       WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI: "12"
@@ -340,11 +341,12 @@ jobs:
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: Restore LLM cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: llm_cache
-          key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}
+          key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
           restore-keys: |
+            warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
 
@@ -366,6 +368,7 @@ jobs:
       - name: Prepare folders
         run: |
           mkdir -p output llm_cache finmind_cache/warrant_daily finmind_cache/reference .cache/report-fonts
+          rm -f output/*_warrant_report.png output/debug_*.csv
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -438,6 +441,13 @@ jobs:
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
           python -u run_report.py
+
+      - name: Save refreshed LLM cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: llm_cache
+          key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
