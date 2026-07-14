@@ -14100,6 +14100,11 @@ FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", 
 FINMIND_CACHE_DIR = os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache"
 FINMIND_WARRANT_DAY_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "warrant_daily")
 FINMIND_WARRANT_LATEST_PROBE_DAYS = max(1, int(os.getenv("FINMIND_WARRANT_LATEST_PROBE_DAYS", "7")))
+# TaiwanStockTradingDate 可能尚未反映颱風等臨時休市；權證分點實際下載日期
+# 改以高流動性 ETF 的 TaiwanStockPrice 實際成交日期為準。
+FINMIND_TRADING_DATE_REFERENCE_STOCK = (
+    os.getenv("FINMIND_TRADING_DATE_REFERENCE_STOCK", "0050").strip() or "0050"
+)
 FINMIND_STRICT_WARRANT_COMPLETENESS = os.getenv(
     "FINMIND_STRICT_WARRANT_COMPLETENESS",
     "1",
@@ -14107,7 +14112,7 @@ FINMIND_STRICT_WARRANT_COMPLETENESS = os.getenv(
 
 _FINMIND_STOCK_INFO_CACHE = None
 _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = None
-_FINMIND_TRADING_DATE_CACHE = None
+_FINMIND_TRADING_DATE_CACHE = {}
 _FINMIND_WARRANT_SUMMARY_CACHE = {}
 _FINMIND_DATA_CACHE_LOCK = threading.RLock()
 _FINMIND_STORAGE_LOCKS = {}
@@ -14221,6 +14226,10 @@ def _finmind_get_data(
     raise RuntimeError(f"FinMind API 最終失敗：dataset={dataset}｜{last_error}")
 
 
+class FinMindStorageObjectUnavailable(RuntimeError):
+    """指定日期沒有 sponsorpro 全市場 Parquet；屬不可重試的 HTTP 4xx。"""
+
+
 def _finmind_storage_lock(date_s: str):
     with _FINMIND_STORAGE_LOCKS_GUARD:
         return _FINMIND_STORAGE_LOCKS.setdefault(date_s, threading.Lock())
@@ -14291,10 +14300,21 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                         f"HTTP {resp.status_code}｜{_finmind_error_message(payload, resp.text[:300])}"
                     )
 
-                if resp.status_code in (400, 404, 422) and allow_not_ready:
+                if resp.status_code in (400, 404, 422):
                     message = resp.text[:500]
-                    print(f"ℹ️ FinMind 權證分點尚無 {date_s}：HTTP {resp.status_code}｜{message[:160]}")
-                    return None
+                    if allow_not_ready:
+                        print(
+                            f"ℹ️ FinMind 權證分點尚無 {date_s}："
+                            f"HTTP {resp.status_code}｜{message[:160]}"
+                        )
+                        return None
+                    # 4xx 代表該日期沒有物件或參數不成立，重試不會改變結果。
+                    # 實際交易日清單已由 TaiwanStockPrice 過濾；若仍遇到 4xx，
+                    # 代表真實交易日資料缺檔，交由完整度檢查中止，不浪費時間重試。
+                    raise FinMindStorageObjectUnavailable(
+                        f"FinMind 權證分點物件不存在：{date_s}｜"
+                        f"HTTP {resp.status_code}｜{message[:300]}"
+                    )
 
                 resp.raise_for_status()
                 with open(tmp_path, "wb") as f:
@@ -14334,6 +14354,13 @@ def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> 
                     f"{os.path.getsize(path) / 1024 / 1024:.2f} MB"
                 )
                 return path
+            except FinMindStorageObjectUnavailable:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
             except Exception as exc:
                 last_error = exc
                 try:
@@ -14496,20 +14523,73 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
 
 
 def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
+    """取得市場實際有成交的日期。
+
+    不直接採用 TaiwanStockTradingDate，因為該表可能先列入原訂開市日，
+    但臨時颱風休市後未即時移除。改用 0050（可由環境變數調整）的
+    TaiwanStockPrice 實際成交日期，避免把臨時休市日送進 storage_objects。
+    """
     global _FINMIND_TRADING_DATE_CACHE
-    with _FINMIND_DATA_CACHE_LOCK:
-        cache = None if _FINMIND_TRADING_DATE_CACHE is None else _FINMIND_TRADING_DATE_CACHE.copy()
-    if cache is None:
-        raw = _finmind_get_data("TaiwanStockTradingDate", allow_empty=False)
-        if "date" not in raw.columns:
-            raise RuntimeError(f"FinMind TaiwanStockTradingDate 缺少 date 欄位：{raw.columns.tolist()}")
-        cache = pd.to_datetime(raw["date"], errors="coerce").dropna().dt.normalize().drop_duplicates().sort_values()
-        with _FINMIND_DATA_CACHE_LOCK:
-            _FINMIND_TRADING_DATE_CACHE = cache.copy()
-        print(f"📦 FinMind 台股交易日載入：{len(cache):,} 日")
+
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
-    return [pd.Timestamp(x).normalize() for x in cache[(cache >= start_ts) & (cache <= end_ts)].tolist()]
+    reference_stock = _normalize_stock_name_code_key(FINMIND_TRADING_DATE_REFERENCE_STOCK)
+    cache_key = (
+        reference_stock,
+        start_ts.strftime("%Y-%m-%d"),
+        end_ts.strftime("%Y-%m-%d"),
+    )
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        cache_store = (
+            _FINMIND_TRADING_DATE_CACHE
+            if isinstance(_FINMIND_TRADING_DATE_CACHE, dict)
+            else {}
+        )
+        cached = cache_store.get(cache_key)
+        if cached is not None:
+            return [pd.Timestamp(x).normalize() for x in cached]
+
+    raw = _finmind_get_data(
+        "TaiwanStockPrice",
+        data_id=reference_stock,
+        start_date=start_ts.strftime("%Y-%m-%d"),
+        end_date=end_ts.strftime("%Y-%m-%d"),
+        allow_empty=False,
+    )
+    if "date" not in raw.columns:
+        raise RuntimeError(
+            "FinMind TaiwanStockPrice 缺少 date 欄位，"
+            f"無法建立實際交易日：{raw.columns.tolist()}"
+        )
+
+    actual_dates = (
+        pd.to_datetime(raw["date"], errors="coerce")
+        .dropna()
+        .dt.normalize()
+        .drop_duplicates()
+        .sort_values()
+    )
+    actual_dates = actual_dates[
+        (actual_dates >= start_ts) & (actual_dates <= end_ts)
+    ]
+    dates = [pd.Timestamp(x).normalize() for x in actual_dates.tolist()]
+    if not dates:
+        raise RuntimeError(
+            f"FinMind TaiwanStockPrice 找不到 {reference_stock} 在 "
+            f"{start_ts.date()} ~ {end_ts.date()} 的實際成交日"
+        )
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        if not isinstance(_FINMIND_TRADING_DATE_CACHE, dict):
+            _FINMIND_TRADING_DATE_CACHE = {}
+        _FINMIND_TRADING_DATE_CACHE[cache_key] = list(dates)
+
+    print(
+        f"📅 FinMind 實際交易日：以 {reference_stock} TaiwanStockPrice 為準｜"
+        f"{len(dates):,} 日｜{dates[0].date()} ~ {dates[-1].date()}"
+    )
+    return dates
 
 
 def _finmind_get_warrant_summary(stock_code: str, start_date, end_date) -> pd.DataFrame:
