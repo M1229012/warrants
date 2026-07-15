@@ -104,7 +104,12 @@ jobs:
           FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
           FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
 
+          # 完整判定：所有分點成功＋三項資料量達歷史中位數 90%＋連續 4 次不變。
           STABLE_PROBES_REQUIRED: "4"
+          HISTORY_REFERENCE_DAYS: "20"
+          HISTORY_MIN_DAYS: "5"
+          COVERAGE_THRESHOLD: "0.90"
+
           REQUEST_INTERVAL_SECONDS: "0.30"
           REQUEST_TIMEOUT_SECONDS: "60"
           MAX_RETRIES: "3"
@@ -309,7 +314,12 @@ jobs:
           FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
           FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
 
+          # 完整判定：所有分點成功＋三項資料量達歷史中位數 90%＋連續 4 次不變。
           STABLE_PROBES_REQUIRED: "4"
+          HISTORY_REFERENCE_DAYS: "20"
+          HISTORY_MIN_DAYS: "5"
+          COVERAGE_THRESHOLD: "0.90"
+
           REQUEST_INTERVAL_SECONDS: "0.30"
           REQUEST_TIMEOUT_SECONDS: "60"
           MAX_RETRIES: "3"
