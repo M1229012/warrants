@@ -1,0 +1,2 @@
+﻿probe_time,target_date,status,configured_brokers,successful_queries,failed_queries,brokers_with_data,raw_rows,unique_warrants,buy_volume,sell_volume,net_volume,buy_amount,sell_amount,net_amount,snapshot_hash,stable_count,stable_required,is_complete,first_data_time,last_changed_time,complete_time,error_summary
+2026-07-15T16:19:53+08:00,2026-07-14,DATA_CHANGING,38,38,0,38,6009,3039,125000000,102113000,22887000,138687640.0,132970800.0,5716840.0,0521d9d6251397bee15f3e53ae5de86d8090938d8f3547a8b5a1662a868b1248,1,4,False,2026-07-15T16:19:53+08:00,2026-07-15T16:19:53+08:00,,

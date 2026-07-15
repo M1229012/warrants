@@ -1,0 +1,16 @@
+{
+  "target_date": "2026-07-14",
+  "completed": false,
+  "stable_count": 1,
+  "last_hash": "0521d9d6251397bee15f3e53ae5de86d8090938d8f3547a8b5a1662a868b1248",
+  "first_data_time": "2026-07-15T16:19:53+08:00",
+  "last_changed_time": "2026-07-15T16:19:53+08:00",
+  "complete_time": "",
+  "last_probe_time": "2026-07-15T16:19:53+08:00",
+  "stable_required": 4,
+  "last_raw_rows": 6009,
+  "last_unique_warrants": 3039,
+  "last_successful_queries": 38,
+  "last_failed_queries": 0,
+  "configured_brokers": 38
+}

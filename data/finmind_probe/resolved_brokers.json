@@ -1,0 +1,195 @@
+{
+  "resolved_at": "2026-07-15T16:19:53+08:00",
+  "brokers": [
+    {
+      "securities_trader_id": "961F",
+      "configured_name": "富邦公益",
+      "api_name": "富邦-公益"
+    },
+    {
+      "securities_trader_id": "9663",
+      "configured_name": "富邦敦南",
+      "api_name": "富邦-敦南"
+    },
+    {
+      "securities_trader_id": "9676",
+      "configured_name": "富邦仁愛",
+      "api_name": "富邦-仁愛"
+    },
+    {
+      "securities_trader_id": "8560",
+      "configured_name": "新光",
+      "api_name": "新光"
+    },
+    {
+      "securities_trader_id": "9A9g",
+      "configured_name": "永豐金內湖",
+      "api_name": "永豐金-內湖"
+    },
+    {
+      "securities_trader_id": "9A9P",
+      "configured_name": "永豐金竹北",
+      "api_name": "永豐金-竹北"
+    },
+    {
+      "securities_trader_id": "9A9X",
+      "configured_name": "永豐金竹科",
+      "api_name": "永豐金-竹科"
+    },
+    {
+      "securities_trader_id": "9A9W",
+      "configured_name": "永豐金市政",
+      "api_name": "永豐金-市政"
+    },
+    {
+      "securities_trader_id": "9A9R",
+      "configured_name": "永豐金信義",
+      "api_name": "永豐金-信義"
+    },
+    {
+      "securities_trader_id": "9302",
+      "configured_name": "華南永昌台中",
+      "api_name": "華南永昌-台中"
+    },
+    {
+      "securities_trader_id": "9316",
+      "configured_name": "華南永昌淡水",
+      "api_name": "華南永昌-淡水"
+    },
+    {
+      "securities_trader_id": "9343",
+      "configured_name": "華南永昌頭份",
+      "api_name": "華南永昌-頭份"
+    },
+    {
+      "securities_trader_id": "9337",
+      "configured_name": "華南永昌內壢",
+      "api_name": "華南永昌-內壢"
+    },
+    {
+      "securities_trader_id": "6480",
+      "configured_name": "福邦證券",
+      "api_name": "福邦"
+    },
+    {
+      "securities_trader_id": "9135",
+      "configured_name": "群益東大",
+      "api_name": "群益金鼎-東大"
+    },
+    {
+      "securities_trader_id": "918C",
+      "configured_name": "群益金鼎古亭",
+      "api_name": "群益金鼎-古亭"
+    },
+    {
+      "securities_trader_id": "9186",
+      "configured_name": "群益金鼎新竹",
+      "api_name": "群益金鼎-新竹"
+    },
+    {
+      "securities_trader_id": "9867",
+      "configured_name": "元大內湖民權",
+      "api_name": "元大-內湖民權"
+    },
+    {
+      "securities_trader_id": "9853",
+      "configured_name": "元大南屯",
+      "api_name": "元大-南屯"
+    },
+    {
+      "securities_trader_id": "989Q",
+      "configured_name": "元大汐止",
+      "api_name": "元大-汐止"
+    },
+    {
+      "securities_trader_id": "980l",
+      "configured_name": "元大虎尾",
+      "api_name": "元大-虎尾"
+    },
+    {
+      "securities_trader_id": "989f",
+      "configured_name": "元大東港",
+      "api_name": "元大-東港"
+    },
+    {
+      "securities_trader_id": "989a",
+      "configured_name": "元大苑裡",
+      "api_name": "元大-苑裡"
+    },
+    {
+      "securities_trader_id": "989J",
+      "configured_name": "元大彰化民生",
+      "api_name": "元大-彰化民生"
+    },
+    {
+      "securities_trader_id": "700B",
+      "configured_name": "兆豐板橋",
+      "api_name": "兆豐-板橋"
+    },
+    {
+      "securities_trader_id": "9238",
+      "configured_name": "凱基士林",
+      "api_name": "凱基-士林"
+    },
+    {
+      "securities_trader_id": "9237",
+      "configured_name": "凱基敦北",
+      "api_name": "凱基-敦北"
+    },
+    {
+      "securities_trader_id": "9229",
+      "configured_name": "凱基中山",
+      "api_name": "凱基-中山"
+    },
+    {
+      "securities_trader_id": "920H",
+      "configured_name": "凱基基隆",
+      "api_name": "凱基-基隆"
+    },
+    {
+      "securities_trader_id": "9211",
+      "configured_name": "凱基台南",
+      "api_name": "凱基-台南"
+    },
+    {
+      "securities_trader_id": "779c",
+      "configured_name": "國票敦北法人",
+      "api_name": "國票-敦北法人"
+    },
+    {
+      "securities_trader_id": "585Q",
+      "configured_name": "統一三多",
+      "api_name": "統一-三多"
+    },
+    {
+      "securities_trader_id": "585Y",
+      "configured_name": "統一土城",
+      "api_name": "統一-土城"
+    },
+    {
+      "securities_trader_id": "5853",
+      "configured_name": "統一中壢",
+      "api_name": "統一-中壢"
+    },
+    {
+      "securities_trader_id": "538Y",
+      "configured_name": "第一金中壢",
+      "api_name": "第一金-中壢"
+    },
+    {
+      "securities_trader_id": "6114",
+      "configured_name": "台中銀員林",
+      "api_name": "台中銀-員林"
+    },
+    {
+      "securities_trader_id": "6381",
+      "configured_name": "光和溪湖",
+      "api_name": "光和-溪湖"
+    },
+    {
+      "securities_trader_id": "111B",
+      "configured_name": "台灣企銀建成",
+      "api_name": "台灣企銀-建成"
+    }
+  ]
+}
