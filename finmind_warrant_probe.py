@@ -104,6 +104,19 @@ SUMMARY_FIELDS = [
     "snapshot_hash",
     "stable_count",
     "stable_required",
+    "history_days",
+    "history_reference_days",
+    "history_min_days",
+    "coverage_threshold",
+    "coverage_enforced",
+    "baseline_raw_rows",
+    "baseline_unique_warrants",
+    "baseline_brokers_with_data",
+    "raw_rows_coverage",
+    "unique_warrants_coverage",
+    "brokers_with_data_coverage",
+    "overall_coverage",
+    "coverage_pass",
     "is_complete",
     "first_data_time",
     "last_changed_time",
@@ -142,6 +155,9 @@ class BrokerTarget:
 class Config:
     token: str
     stable_required: int
+    history_reference_days: int
+    history_min_days: int
+    coverage_threshold: float
     request_interval_seconds: float
     request_timeout_seconds: int
     max_retries: int
@@ -181,9 +197,28 @@ def load_config() -> Config:
     if stable_required < 2:
         raise RuntimeError("STABLE_PROBES_REQUIRED 至少必須為 2。")
 
+    history_reference_days = int(os.getenv("HISTORY_REFERENCE_DAYS", "20"))
+    if history_reference_days < 1:
+        raise RuntimeError("HISTORY_REFERENCE_DAYS 至少必須為 1。")
+
+    history_min_days = int(os.getenv("HISTORY_MIN_DAYS", "5"))
+    if history_min_days < 1:
+        raise RuntimeError("HISTORY_MIN_DAYS 至少必須為 1。")
+    if history_min_days > history_reference_days:
+        raise RuntimeError(
+            "HISTORY_MIN_DAYS 不可大於 HISTORY_REFERENCE_DAYS。"
+        )
+
+    coverage_threshold = float(os.getenv("COVERAGE_THRESHOLD", "0.90"))
+    if not 0 < coverage_threshold <= 1:
+        raise RuntimeError("COVERAGE_THRESHOLD 必須介於 0 與 1 之間。")
+
     return Config(
         token=token,
         stable_required=stable_required,
+        history_reference_days=history_reference_days,
+        history_min_days=history_min_days,
+        coverage_threshold=coverage_threshold,
         request_interval_seconds=float(
             os.getenv("REQUEST_INTERVAL_SECONDS", "0.30")
         ),
@@ -271,8 +306,37 @@ def dataframe_hash(df: pd.DataFrame) -> str:
     return sha256_text(normalized.to_csv(index=False, lineterminator="\n"))
 
 
+def ensure_csv_schema(path: Path, fields: list[str]) -> None:
+    """若欄位有新增，先安全遷移舊 CSV，避免追加資料時欄位錯位。"""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+
+    try:
+        current = pd.read_csv(
+            path,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+        )
+    except Exception as exc:
+        raise RuntimeError(f"無法讀取既有紀錄檔 {path}: {exc}") from exc
+
+    if list(current.columns) == fields:
+        return
+
+    for field in fields:
+        if field not in current.columns:
+            current[field] = ""
+
+    current = current.reindex(columns=fields, fill_value="")
+    temp_path = path.with_suffix(path.suffix + ".schema.tmp")
+    current.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    temp_path.replace(path)
+
+
 def append_csv(path: Path, row: dict[str, Any], fields: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_csv_schema(path, fields)
     file_exists = path.exists() and path.stat().st_size > 0
 
     with path.open("a", newline="", encoding="utf-8-sig") as file:
@@ -315,6 +379,174 @@ def safe_float_sum(series: pd.Series) -> float:
     if series.empty:
         return 0.0
     return round(float(pd.to_numeric(series, errors="coerce").fillna(0).sum()), 2)
+
+
+def parse_bool_series(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .isin({"1", "true", "yes", "y", "on"})
+    )
+
+
+def safe_ratio(numerator: float, denominator: float) -> float | None:
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def format_ratio(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2%}"
+
+
+def load_historical_baseline(
+    target_date: str,
+    configured_brokers: int,
+    reference_days: int,
+) -> dict[str, Any]:
+    """
+    取目前目標日前、已確認完整的交易日。
+
+    每個交易日只保留最後一筆 COMPLETE 紀錄，再取最近 reference_days 日，
+    並以中位數作為資料量基準，降低單日極端行情的影響。
+    """
+    empty = {
+        "history_days": 0,
+        "baseline_raw_rows": 0.0,
+        "baseline_unique_warrants": 0.0,
+        "baseline_brokers_with_data": 0.0,
+        "history_dates": [],
+    }
+
+    if not SUMMARY_LOG_PATH.exists() or SUMMARY_LOG_PATH.stat().st_size == 0:
+        return empty
+
+    try:
+        history = pd.read_csv(
+            SUMMARY_LOG_PATH,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+        )
+    except Exception:
+        return empty
+
+    required = {
+        "target_date",
+        "configured_brokers",
+        "successful_queries",
+        "failed_queries",
+        "brokers_with_data",
+        "raw_rows",
+        "unique_warrants",
+        "is_complete",
+    }
+    if not required.issubset(history.columns):
+        return empty
+
+    history = history.copy()
+    history = history.loc[parse_bool_series(history["is_complete"])].copy()
+    history = history.loc[history["target_date"].astype(str) < target_date].copy()
+
+    for column in [
+        "configured_brokers",
+        "successful_queries",
+        "failed_queries",
+        "brokers_with_data",
+        "raw_rows",
+        "unique_warrants",
+    ]:
+        history[column] = pd.to_numeric(history[column], errors="coerce")
+
+    history = history.loc[
+        history["configured_brokers"].eq(configured_brokers)
+        & history["successful_queries"].eq(configured_brokers)
+        & history["failed_queries"].eq(0)
+        & history["raw_rows"].gt(0)
+        & history["unique_warrants"].gt(0)
+        & history["brokers_with_data"].gt(0)
+    ].copy()
+
+    if history.empty:
+        return empty
+
+    if "probe_time" in history.columns:
+        history = history.sort_values(
+            ["target_date", "probe_time"],
+            kind="stable",
+        )
+    else:
+        history = history.sort_values("target_date", kind="stable")
+
+    history = history.drop_duplicates(subset=["target_date"], keep="last")
+    history = history.sort_values("target_date", kind="stable").tail(reference_days)
+
+    if history.empty:
+        return empty
+
+    return {
+        "history_days": int(history["target_date"].nunique()),
+        "baseline_raw_rows": float(history["raw_rows"].median()),
+        "baseline_unique_warrants": float(
+            history["unique_warrants"].median()
+        ),
+        "baseline_brokers_with_data": float(
+            history["brokers_with_data"].median()
+        ),
+        "history_dates": history["target_date"].astype(str).tolist(),
+    }
+
+
+def evaluate_coverage(
+    current_metrics: dict[str, Any],
+    brokers_with_data: int,
+    baseline: dict[str, Any],
+    threshold: float,
+    min_history_days: int,
+) -> dict[str, Any]:
+    raw_rows_coverage = safe_ratio(
+        float(current_metrics["raw_rows"]),
+        float(baseline["baseline_raw_rows"]),
+    )
+    unique_warrants_coverage = safe_ratio(
+        float(current_metrics["unique_warrants"]),
+        float(baseline["baseline_unique_warrants"]),
+    )
+    brokers_with_data_coverage = safe_ratio(
+        float(brokers_with_data),
+        float(baseline["baseline_brokers_with_data"]),
+    )
+
+    valid_ratios = [
+        value
+        for value in [
+            raw_rows_coverage,
+            unique_warrants_coverage,
+            brokers_with_data_coverage,
+        ]
+        if value is not None
+    ]
+    overall_coverage = min(valid_ratios) if valid_ratios else None
+    coverage_enforced = int(baseline["history_days"]) >= min_history_days
+
+    # 歷史完整日尚不足時，先累積可靠基準；達門檻後才正式要求 90%。
+    coverage_pass = bool(
+        not coverage_enforced
+        or (
+            len(valid_ratios) == 3
+            and all(value >= threshold for value in valid_ratios)
+        )
+    )
+
+    return {
+        "coverage_enforced": coverage_enforced,
+        "raw_rows_coverage": raw_rows_coverage,
+        "unique_warrants_coverage": unique_warrants_coverage,
+        "brokers_with_data_coverage": brokers_with_data_coverage,
+        "overall_coverage": overall_coverage,
+        "coverage_pass": coverage_pass,
+    }
 
 
 # ============================================================
@@ -857,6 +1089,19 @@ def main() -> int:
         1 for row in broker_rows if int(row.get("raw_rows", 0)) > 0
     )
 
+    historical_baseline = load_historical_baseline(
+        target_date=target_date,
+        configured_brokers=len(brokers),
+        reference_days=config.history_reference_days,
+    )
+    coverage = evaluate_coverage(
+        current_metrics=total_metrics,
+        brokers_with_data=brokers_with_data,
+        baseline=historical_baseline,
+        threshold=config.coverage_threshold,
+        min_history_days=config.history_min_days,
+    )
+
     previous_hash = str(state.get("last_hash", ""))
     current_hash = str(total_metrics["snapshot_hash"])
     has_data = total_metrics["raw_rows"] > 0
@@ -878,6 +1123,7 @@ def main() -> int:
         all_queries_succeeded
         and has_data
         and stable_count >= config.stable_required
+        and coverage["coverage_pass"]
     )
 
     if failed_queries:
@@ -886,6 +1132,11 @@ def main() -> int:
         status = "NO_DATA"
     elif is_complete:
         status = "COMPLETE"
+    elif (
+        coverage["coverage_enforced"]
+        and not coverage["coverage_pass"]
+    ):
+        status = "COVERAGE_TOO_LOW"
     elif stable_count >= 2:
         status = "STABLE_WAITING"
     else:
@@ -904,9 +1155,32 @@ def main() -> int:
             "last_hash": current_hash if all_queries_succeeded else previous_hash,
             "last_raw_rows": total_metrics["raw_rows"],
             "last_unique_warrants": total_metrics["unique_warrants"],
+            "last_brokers_with_data": brokers_with_data,
             "last_successful_queries": successful_queries,
             "last_failed_queries": failed_queries,
             "configured_brokers": len(brokers),
+            "history_days": historical_baseline["history_days"],
+            "history_reference_days": config.history_reference_days,
+            "history_min_days": config.history_min_days,
+            "history_dates": historical_baseline["history_dates"],
+            "coverage_threshold": config.coverage_threshold,
+            "coverage_enforced": coverage["coverage_enforced"],
+            "baseline_raw_rows": historical_baseline["baseline_raw_rows"],
+            "baseline_unique_warrants": historical_baseline[
+                "baseline_unique_warrants"
+            ],
+            "baseline_brokers_with_data": historical_baseline[
+                "baseline_brokers_with_data"
+            ],
+            "raw_rows_coverage": coverage["raw_rows_coverage"],
+            "unique_warrants_coverage": coverage[
+                "unique_warrants_coverage"
+            ],
+            "brokers_with_data_coverage": coverage[
+                "brokers_with_data_coverage"
+            ],
+            "overall_coverage": coverage["overall_coverage"],
+            "coverage_pass": coverage["coverage_pass"],
         }
     )
     save_json(current_state_path, state)
@@ -922,6 +1196,27 @@ def main() -> int:
         **total_metrics,
         "stable_count": stable_count,
         "stable_required": config.stable_required,
+        "history_days": historical_baseline["history_days"],
+        "history_reference_days": config.history_reference_days,
+        "history_min_days": config.history_min_days,
+        "coverage_threshold": config.coverage_threshold,
+        "coverage_enforced": coverage["coverage_enforced"],
+        "baseline_raw_rows": historical_baseline["baseline_raw_rows"],
+        "baseline_unique_warrants": historical_baseline[
+            "baseline_unique_warrants"
+        ],
+        "baseline_brokers_with_data": historical_baseline[
+            "baseline_brokers_with_data"
+        ],
+        "raw_rows_coverage": coverage["raw_rows_coverage"],
+        "unique_warrants_coverage": coverage[
+            "unique_warrants_coverage"
+        ],
+        "brokers_with_data_coverage": coverage[
+            "brokers_with_data_coverage"
+        ],
+        "overall_coverage": coverage["overall_coverage"],
+        "coverage_pass": coverage["coverage_pass"],
         "is_complete": is_complete,
         "first_data_time": state.get("first_data_time", ""),
         "last_changed_time": state.get("last_changed_time", ""),
@@ -966,38 +1261,102 @@ def main() -> int:
         f"淨買賣超金額：{total_metrics['net_amount']:,.2f}"
     )
     print(
+        f"歷史完整日：{historical_baseline['history_days']}/"
+        f"{config.history_min_days} 日啟用門檻｜"
+        f"參考最近最多 {config.history_reference_days} 日"
+    )
+    if historical_baseline["history_days"] > 0:
+        print(
+            "歷史中位數基準："
+            f"{historical_baseline['baseline_raw_rows']:,.1f} 列｜"
+            f"{historical_baseline['baseline_unique_warrants']:,.1f} 檔權證｜"
+            f"{historical_baseline['baseline_brokers_with_data']:,.1f} 家有資料分點"
+        )
+        print(
+            "目前覆蓋率："
+            f"列數 {format_ratio(coverage['raw_rows_coverage'])}｜"
+            f"權證數 {format_ratio(coverage['unique_warrants_coverage'])}｜"
+            f"有資料分點 {format_ratio(coverage['brokers_with_data_coverage'])}｜"
+            f"最低值 {format_ratio(coverage['overall_coverage'])}"
+        )
+    else:
+        print("歷史中位數基準：尚無已確認完整的歷史交易日。")
+
+    print(
+        f"90% 覆蓋率門檻："
+        f"{'已啟用' if coverage['coverage_enforced'] else '尚未啟用'}｜"
+        f"門檻 {config.coverage_threshold:.0%}｜"
+        f"覆蓋率通過：{'是' if coverage['coverage_pass'] else '否'}"
+    )
+    print(
         f"穩定次數：{stable_count}/{config.stable_required}｜"
         f"判定完整：{'是' if is_complete else '否'}"
     )
+
     if is_complete:
         print(f"✅ 完整買賣超已輸出：{complete_output_path}")
     elif failed_queries:
         print("⚠️ 本次有 API 查詢失敗，不會累計穩定次數。")
     elif not has_data:
         print("⏳ 尚未取得目標日期資料，等待下次 10 分鐘探測。")
+    elif coverage["coverage_enforced"] and not coverage["coverage_pass"]:
+        print(
+            "⏳ 資料量尚未達歷史中位數的 90%，"
+            "即使內容暫時不變也不會判定完整。"
+        )
+    elif stable_count < config.stable_required:
+        print("⏳ 資料量門檻已通過，等待連續穩定條件完成。")
     else:
-        print("⏳ 資料尚未符合連續穩定條件，等待下次探測。")
+        print("⏳ 資料尚未符合完整條件，等待下次探測。")
     print("=" * 72)
 
-    write_github_summary(
-        [
-            "## FinMind 權證分點更新偵測",
-            "",
-            f"- 探測時間：`{probe_time}`",
-            f"- 目標日期：`{target_date}`",
-            f"- 狀態：**{status}**",
-            f"- 原始資料量：**{total_metrics['raw_rows']:,} 列**",
-            f"- 不同權證：**{total_metrics['unique_warrants']:,} 檔**",
-            f"- 成功查詢：**{successful_queries}/{len(brokers)}**",
-            f"- 有資料分點：**{brokers_with_data}/{len(brokers)}**",
-            f"- 買進量：`{total_metrics['buy_volume']:,}`",
-            f"- 賣出量：`{total_metrics['sell_volume']:,}`",
-            f"- 淨買賣超：`{total_metrics['net_volume']:,}`",
-            f"- 淨買賣超金額：`{total_metrics['net_amount']:,.2f}`",
-            f"- 穩定次數：**{stable_count}/{config.stable_required}**",
-            f"- 判定完整：**{'是' if is_complete else '否'}**",
-        ]
-    )
+    summary_lines = [
+        "## FinMind 權證分點更新偵測",
+        "",
+        f"- 探測時間：`{probe_time}`",
+        f"- 目標日期：`{target_date}`",
+        f"- 狀態：**{status}**",
+        f"- 原始資料量：**{total_metrics['raw_rows']:,} 列**",
+        f"- 不同權證：**{total_metrics['unique_warrants']:,} 檔**",
+        f"- 成功查詢：**{successful_queries}/{len(brokers)}**",
+        f"- 有資料分點：**{brokers_with_data}/{len(brokers)}**",
+        f"- 買進量：`{total_metrics['buy_volume']:,}`",
+        f"- 賣出量：`{total_metrics['sell_volume']:,}`",
+        f"- 淨買賣超：`{total_metrics['net_volume']:,}`",
+        f"- 淨買賣超金額：`{total_metrics['net_amount']:,.2f}`",
+        (
+            f"- 歷史完整日：**{historical_baseline['history_days']}** "
+            f"（至少 {config.history_min_days} 日後啟用 90% 門檻）"
+        ),
+        f"- 90% 門檻：**{'已啟用' if coverage['coverage_enforced'] else '尚未啟用'}**",
+        f"- 列數覆蓋率：**{format_ratio(coverage['raw_rows_coverage'])}**",
+        f"- 權證數覆蓋率：**{format_ratio(coverage['unique_warrants_coverage'])}**",
+        f"- 有資料分點覆蓋率：**{format_ratio(coverage['brokers_with_data_coverage'])}**",
+        f"- 最低覆蓋率：**{format_ratio(coverage['overall_coverage'])}**",
+        f"- 覆蓋率通過：**{'是' if coverage['coverage_pass'] else '否'}**",
+        f"- 穩定次數：**{stable_count}/{config.stable_required}**",
+        f"- 判定完整：**{'是' if is_complete else '否'}**",
+    ]
+
+    if historical_baseline["history_days"] > 0:
+        summary_lines.extend(
+            [
+                (
+                    "- 歷史列數中位數："
+                    f"`{historical_baseline['baseline_raw_rows']:,.1f}`"
+                ),
+                (
+                    "- 歷史權證數中位數："
+                    f"`{historical_baseline['baseline_unique_warrants']:,.1f}`"
+                ),
+                (
+                    "- 歷史有資料分點中位數："
+                    f"`{historical_baseline['baseline_brokers_with_data']:,.1f}`"
+                ),
+            ]
+        )
+
+    write_github_summary(summary_lines)
 
     # API 短暫失敗已經寫入紀錄，不讓 workflow 中斷，下一個 10 分鐘會再試。
     return 0
