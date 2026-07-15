@@ -201,6 +201,10 @@ jobs:
       FINMIND_CONNECT_TIMEOUT: "10"
       FINMIND_READ_TIMEOUT: "240"
       FINMIND_WARRANT_DOWNLOAD_WORKERS: "8"
+      # 歷史日期用 Parquet；最新交易日固定逐支有效權證呼叫 API，取得該權證所有分點。
+      FINMIND_WARRANT_LATEST_DAY_API_ENABLE: "1"
+      FINMIND_WARRANT_LATEST_DAY_API_WORKERS: "8"
+      FINMIND_WARRANT_LATEST_DAY_API_STRICT: "1"
       FINMIND_NEWS_WORKERS: "8"
       FINMIND_NEWS_LOOKBACK_DAYS: "30"
       FINMIND_WARRANT_LATEST_PROBE_DAYS: "7"
@@ -257,8 +261,9 @@ jobs:
       WARRANT_LOCAL_CACHE_ENABLE: "0"
 
       # ========================================================
-      # Gemini：新聞有完整摘要／內文時才使用；FinMind 僅標題時改走嚴格規則式摘要。
-      # 本週重點直接使用既有條件式資料分析，避免每檔新股票固定等待一次 Gemini。
+      # Gemini：所有通過公司主體驗證的新聞素材都使用原始高品質規則。
+      # 第一輪不足時允許 evidence／數字接地修復與不同事件補點；寧缺勿濫，不強迫湊滿。
+      # 本週重點仍使用既有條件式資料分析。
       # ========================================================
       WARRANT_GEMINI_ENABLE: "1"
       WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE: "0"
@@ -282,26 +287,16 @@ jobs:
       # 新聞只使用 FinMind TaiwanStockNews。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v18_finmind_event_level_dedup"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v19_gemini_quality_event_dedup"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
       WARRANT_NEWS_GOOGLE_MAX_ITEMS: "24"
       WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI: "12"
       WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT: "24"
-      WARRANT_NEWS_MIN_DISTINCT_ARTICLES: "2"
-      WARRANT_NEWS_FAST_MODE: "1"
-      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE: "0"
-      WARRANT_NEWS_MULTI_SOURCE_ENABLE: "0"
-      WARRANT_NEWS_YAHOO_RSS_ENABLE: "0"
-      WARRANT_NEWS_BING_RSS_ENABLE: "0"
-      WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE: "0"
-      WARRANT_NEWS_MOPS_ENABLE: "0"
-      WARRANT_NEWS_GNEWSDECODER_ENABLE: "0"
-      # FinMind 只有標題時：原始標題必須直接出現本公司名稱／代號，且以規則式摘要取代 Gemini 擴寫。
+      # 原始標題／摘要必須直接出現本公司名稱或代號，避免錯標新聞。
       WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET: "1"
-      WARRANT_FINMIND_NEWS_TITLE_ONLY_RULE_BASED: "1"
-      # 第一輪模型若驗證失敗，只保留通過項目，不再為 repair／補點重打 Gemini。
-      WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "0"
-      WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "0"
+      # 恢復原始高品質流程：格式／evidence／數字不合格時修復，另有不同事件才補點。
+      WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "1"
+      WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "1"
 
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
@@ -433,6 +428,9 @@ jobs:
           echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
           echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
           echo "FINMIND_WARRANT_DOWNLOAD_WORKERS=$FINMIND_WARRANT_DOWNLOAD_WORKERS"
+          echo "FINMIND_WARRANT_LATEST_DAY_API_ENABLE=$FINMIND_WARRANT_LATEST_DAY_API_ENABLE"
+          echo "FINMIND_WARRANT_LATEST_DAY_API_WORKERS=$FINMIND_WARRANT_LATEST_DAY_API_WORKERS"
+          echo "FINMIND_WARRANT_LATEST_DAY_API_STRICT=$FINMIND_WARRANT_LATEST_DAY_API_STRICT"
           echo "FINMIND_NEWS_LOOKBACK_DAYS=$FINMIND_NEWS_LOOKBACK_DAYS"
           echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
