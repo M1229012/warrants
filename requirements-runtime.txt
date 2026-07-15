@@ -1,0 +1,14 @@
+# GitHub Actions 正式執行依賴。
+# 完整 .venv 會依本檔雜湊快取；修改此檔即自動重建執行環境。
+# googlenewsdecoder 未安裝：目前極速 RSS 流程預設關閉該功能，程式仍保留 optional fallback。
+requests
+pandas
+gspread
+google-auth
+Pillow
+matplotlib
+numpy
+google-genai
+pyarrow
+beautifulsoup4
+lxml
