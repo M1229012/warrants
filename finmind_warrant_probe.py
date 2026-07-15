@@ -38,6 +38,12 @@ RESOLVED_BROKERS_PATH = OUTPUT_ROOT / "resolved_brokers.json"
 # 使用者目前追蹤的 38 個分點。
 # 若 GitHub Variables 有設定 FINMIND_BROKER_IDS 或 FINMIND_BROKER_NAMES，
 # 會優先使用 GitHub Variables，不使用此預設清單。
+# FinMind 官方分點名稱與專案慣用名稱不同時，在此建立明確別名。
+# configured_name 仍保留原本顯示名稱；lookup_name 僅用於查找 FinMind 代碼。
+BROKER_LOOKUP_ALIASES = {
+    "群益東大": "群益金鼎-東大",
+}
+
 DEFAULT_BROKER_NAMES = [
     "富邦公益",
     "富邦敦南",
@@ -516,7 +522,11 @@ def resolve_brokers(client: FinMindClient) -> list[BrokerTarget]:
     unresolved_messages: list[str] = []
 
     for configured_name in target_names:
-        key = normalize_broker_name(configured_name)
+        lookup_name = BROKER_LOOKUP_ALIASES.get(
+            configured_name,
+            configured_name,
+        )
+        key = normalize_broker_name(lookup_name)
         matches = by_normalized.get(key, [])
 
         if len(matches) == 1:
@@ -538,7 +548,8 @@ def resolve_brokers(client: FinMindClient) -> list[BrokerTarget]:
                 for item in matches
             )
             unresolved_messages.append(
-                f"{configured_name}：匹配到多筆 [{options}]"
+                f"{configured_name}（查找名稱：{lookup_name}）："
+                f"匹配到多筆 [{options}]"
             )
             continue
 
@@ -554,7 +565,8 @@ def resolve_brokers(client: FinMindClient) -> list[BrokerTarget]:
             for item in suggestions
         )
         unresolved_messages.append(
-            f"{configured_name}：找不到；可能為 [{suggestion_text}]"
+            f"{configured_name}（查找名稱：{lookup_name}）："
+            f"找不到；可能為 [{suggestion_text}]"
         )
 
     if unresolved_messages:
