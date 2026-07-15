@@ -12373,7 +12373,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-api-parallel-six-source-news-v24"
+FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-selected-branch-backfill-v25"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -12506,6 +12506,22 @@ FINMIND_WARRANT_LATEST_DAY_API_WORKERS = max(
 )
 FINMIND_WARRANT_LATEST_DAY_API_STRICT = os.getenv(
     "FINMIND_WARRANT_LATEST_DAY_API_STRICT",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 最新日權證母體不能只相信 Summary 的有效期間：
+# 1. 補入最近 N 個歷史交易日實際出現的權證。
+# 2. 直接查詢本次精選分點當日資料，發現漏網權證後再補做逐權證全分點查詢。
+# 3. 最後以精選分點端點回傳值核對逐權證端點；若有缺漏或金額差異，僅替換該分點該權證列。
+FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS = max(
+    1,
+    int(os.getenv("FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS", "10")),
+)
+FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT",
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
 # 可手動指定名稱到 ID，例如：第一金中壢=5380,華南永昌台中=9A9g
@@ -14452,6 +14468,221 @@ def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events
     )
 
 
+def _finmind_recent_history_warrant_codes(
+    historical_events: pd.DataFrame | None,
+    latest_day,
+    lookback_trading_days: int,
+) -> set:
+    """取得最新日前最近 N 個實際有事件交易日出現過的權證代號。"""
+    if historical_events is None or historical_events.empty:
+        return set()
+    if "Date" not in historical_events.columns or "warrant_code" not in historical_events.columns:
+        return set()
+
+    day = pd.Timestamp(latest_day).normalize()
+    work = historical_events[["Date", "warrant_code"]].copy()
+    work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work["warrant_code"] = work["warrant_code"].map(normalize_openapi_warrant_code)
+    work = work.dropna(subset=["Date"])
+    work = work[(work["Date"] < day) & (work["warrant_code"] != "")]
+    if work.empty:
+        return set()
+
+    recent_dates = sorted(work["Date"].drop_duplicates().tolist())[-max(1, int(lookback_trading_days)):]
+    return set(work.loc[work["Date"].isin(recent_dates), "warrant_code"].astype(str))
+
+
+def _finmind_fetch_selected_branch_day_raw(
+    securities_trader_id: str,
+    trade_date,
+) -> tuple[pd.DataFrame, dict]:
+    """以分點 ID 查詢單日全部權證，用於最新日權證母體補漏與精選分點核對。"""
+    broker_id = str(securities_trader_id or "").strip()
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    diagnostic = {
+        "securities_trader_id": broker_id,
+        "date": date_s,
+        "http_status": 0,
+        "payload_keys": [],
+        "message": "",
+        "rows": 0,
+    }
+    if not broker_id:
+        diagnostic["message"] = "empty securities_trader_id"
+        return pd.DataFrame(), diagnostic
+
+    last_error = None
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
+        try:
+            _finmind_wait_for_rate_limit_gate()
+            resp = get_thread_session().get(
+                FINMIND_WARRANT_BRANCH_URL,
+                headers=_finmind_headers(),
+                params={"securities_trader_id": broker_id, "date": date_s},
+                timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+            )
+            diagnostic["http_status"] = int(resp.status_code)
+            if resp.status_code in (401, 402, 403, 429):
+                _, message = _finmind_error_payload_from_response(resp)
+                diagnostic["message"] = message
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日精選分點 API｜分點={broker_id}｜date={date_s}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 最新日精選分點 API 授權失敗：HTTP {resp.status_code}｜{message}"
+                )
+            if resp.status_code == 404:
+                diagnostic["message"] = resp.text[:500]
+                return pd.DataFrame(), diagnostic
+            resp.raise_for_status()
+            payload = resp.json()
+            diagnostic["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else []
+            diagnostic["message"] = _finmind_error_message(payload)
+            payload_status = payload.get("status", 200) if isinstance(payload, dict) else 200
+            if str(payload_status) not in ("200", "success", "True", "true"):
+                if _finmind_is_rate_limit(payload_status, diagnostic["message"]):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日精選分點 API｜分點={broker_id}｜date={date_s}",
+                        quota_attempt,
+                        diagnostic["message"],
+                    )
+                    continue
+                raise RuntimeError(
+                    f"FinMind 最新日精選分點 API 回傳失敗：status={payload_status}｜"
+                    f"{diagnostic['message']}"
+                )
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            df = pd.DataFrame(data)
+            if not df.empty:
+                if "securities_trader_id" not in df.columns:
+                    df["securities_trader_id"] = broker_id
+                if "date" in df.columns:
+                    df["date"] = df["date"].astype(str)
+                    df = df[df["date"] == date_s].copy()
+            diagnostic["rows"] = int(len(df))
+            _finmind_debug_print_df(
+                f"最新日精選分點 API 實際格式｜分點={broker_id}｜{date_s}",
+                df,
+                once_key="schema:latest-selected-branch-api",
+            )
+            return df, diagnostic
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
+        except Exception as exc:
+            last_error = exc
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
+                break
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
+            print(
+                f"⚠️ FinMind 最新日精選分點 API 重試 "
+                f"{normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                f"分點={broker_id}｜date={date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
+            )
+            time.sleep(wait_sec)
+
+    diagnostic["message"] = str(last_error or "unknown error")
+    raise RuntimeError(
+        f"FinMind 最新日精選分點 API 最終失敗："
+        f"分點={broker_id}｜date={date_s}｜{last_error}"
+    )
+
+
+def _finmind_discover_selected_branch_latest_day_rows(
+    selected_branch_id_map: Dict[str, set] | None,
+    trade_date,
+    target_warrant_codes: set,
+) -> tuple[pd.DataFrame, dict]:
+    """直接查本次精選分點，找出最新日漏網權證並保留核對用原始列。"""
+    branch_ids = sorted({
+        str(branch_id or "").strip()
+        for ids in (selected_branch_id_map or {}).values()
+        for branch_id in (ids or set())
+        if str(branch_id or "").strip()
+    })
+    stats = {
+        "branch_ids": len(branch_ids),
+        "success_branch_ids": 0,
+        "failed_branch_ids": 0,
+        "raw_rows": 0,
+        "target_rows": 0,
+        "target_codes": 0,
+    }
+    if (
+        not FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE
+        or not branch_ids
+        or not target_warrant_codes
+    ):
+        return pd.DataFrame(), stats
+
+    frames = []
+    failures = []
+    workers = min(max(1, FINMIND_WARRANT_LATEST_DAY_API_WORKERS), len(branch_ids))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_finmind_fetch_selected_branch_day_raw, branch_id, trade_date): branch_id
+            for branch_id in branch_ids
+        }
+        for future in as_completed(future_map):
+            branch_id = future_map[future]
+            try:
+                raw, _ = future.result()
+                stats["success_branch_ids"] += 1
+                stats["raw_rows"] += int(len(raw))
+                if raw is None or raw.empty or "stock_id" not in raw.columns:
+                    continue
+                work = raw.copy().fillna("")
+                work["stock_id"] = work["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+                work = work[work["stock_id"].isin(target_warrant_codes)].copy()
+                if not work.empty:
+                    frames.append(work)
+            except (FinMindAuthorizationError, FinMindRateLimitError):
+                for pending in future_map:
+                    pending.cancel()
+                raise
+            except Exception as exc:
+                stats["failed_branch_ids"] += 1
+                failures.append((branch_id, str(exc)))
+
+    if failures:
+        preview = "；".join(f"{branch_id}:{error[:140]}" for branch_id, error in failures[:8])
+        message = (
+            f"最新日精選分點補漏查詢不完整：失敗 {len(failures)}/{len(branch_ids)} 個分點｜{preview}"
+        )
+        if FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT:
+            raise RuntimeError(message)
+        print(f"⚠️ {message}")
+
+    if not frames:
+        print(
+            f"🔎 最新日精選分點直接核對：日期={pd.Timestamp(trade_date).date()}｜"
+            f"分點={len(branch_ids)}個｜原始列={stats['raw_rows']:,}｜"
+            "目標標的列=0"
+        )
+        return pd.DataFrame(), stats
+
+    rows = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+    rows["stock_id"] = rows["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    rows = rows[rows["stock_id"].isin(target_warrant_codes)].copy()
+    stats["target_rows"] = int(len(rows))
+    stats["target_codes"] = int(rows["stock_id"].nunique())
+    print(
+        f"🔎 最新日精選分點直接核對：日期={pd.Timestamp(trade_date).date()}｜"
+        f"分點={len(branch_ids)}個｜原始列={stats['raw_rows']:,}｜"
+        f"目標標的列={len(rows):,}｜權證={stats['target_codes']:,}支"
+    )
+    return rows.reset_index(drop=True), stats
+
+
 def _finmind_fetch_warrant_code_day_raw(warrant_code: str, trade_date) -> tuple[pd.DataFrame, dict]:
     """以權證代號查詢單日所有分點明細，回傳 DataFrame 與診斷資訊。"""
     code = normalize_openapi_warrant_code(warrant_code)
@@ -14626,13 +14857,50 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
     stock_code: str,
     stock_name: str,
     trader_name_map: Dict[str, str],
+    historical_events: pd.DataFrame | None = None,
+    selected_branch_id_map: Dict[str, set] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """依最新交易日有效權證逐檔查 API，取得該標的完整分點資料。"""
+    """最新日以「Summary有效 + 近期歷史 + 精選分點當日發現」聯集逐檔查 API。"""
     day = pd.Timestamp(trade_date).normalize()
-    active_codes = sorted(_finmind_active_warrant_codes(summary_df, day))
+    summary_active_codes = set(_finmind_active_warrant_codes(summary_df, day))
+    summary_all_codes = set(
+        summary_df.get("stock_id", pd.Series(dtype=str))
+        .astype(str)
+        .map(normalize_openapi_warrant_code)
+    ) if summary_df is not None and not summary_df.empty else set()
+    summary_all_codes.discard("")
+
+    recent_history_codes = _finmind_recent_history_warrant_codes(
+        historical_events,
+        day,
+        FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS,
+    )
+    target_warrant_codes = summary_all_codes | recent_history_codes
+    selected_branch_raw, branch_discovery_stats = _finmind_discover_selected_branch_latest_day_rows(
+        selected_branch_id_map,
+        day,
+        target_warrant_codes,
+    )
+    selected_branch_discovered_codes = set()
+    if selected_branch_raw is not None and not selected_branch_raw.empty and "stock_id" in selected_branch_raw.columns:
+        selected_branch_discovered_codes = set(
+            selected_branch_raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        )
+        selected_branch_discovered_codes.discard("")
+
+    query_codes = sorted(
+        summary_active_codes
+        | recent_history_codes
+        | selected_branch_discovered_codes
+    )
     stats = {
         "date": day.strftime("%Y-%m-%d"),
-        "active_codes": len(active_codes),
+        "active_codes": len(query_codes),
+        "summary_active_codes": len(summary_active_codes),
+        "recent_history_codes": len(recent_history_codes),
+        "selected_branch_discovered_codes": len(selected_branch_discovered_codes),
+        "selected_branch_raw_rows": int(branch_discovery_stats.get("target_rows", 0) or 0),
+        "selected_branch_repaired_rows": 0,
         "success_codes": 0,
         "empty_codes": 0,
         "failed_codes": 0,
@@ -14644,31 +14912,32 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
         "underlying_code", "underlying_name", "buy_amount", "sell_amount",
         "net_amount", "buy_shares", "sell_shares", "side",
     ]
-    if not active_codes:
-        print(f"ℹ️ 最新交易日沒有有效認購權證：{stock_code}｜日期={day.date()}")
+    if not query_codes:
+        print(f"ℹ️ 最新交易日沒有可查詢的認購權證：{stock_code}｜日期={day.date()}")
         return pd.DataFrame(columns=output_cols), stats
 
+    recent_only = recent_history_codes - summary_active_codes
+    branch_only = selected_branch_discovered_codes - summary_active_codes - recent_history_codes
     print(
         f"🚀 最新交易日改用 FinMind 權證代號 API：{stock_code} {stock_name}｜"
-        f"日期={day.date()}｜有效權證={len(active_codes):,}支｜"
-        f"workers={FINMIND_WARRANT_LATEST_DAY_API_WORKERS}"
+        f"日期={day.date()}｜Summary有效={len(summary_active_codes):,}支｜"
+        f"近期歷史補入={len(recent_only):,}支｜精選分點當日補入={len(branch_only):,}支｜"
+        f"最終查詢={len(query_codes):,}支｜workers={FINMIND_WARRANT_LATEST_DAY_API_WORKERS}"
     )
     frames = []
     failures = []
-    diagnostics = []
     completed = 0
 
     with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_LATEST_DAY_API_WORKERS) as executor:
         future_map = {
             executor.submit(_finmind_fetch_warrant_code_day_raw, code, day): code
-            for code in active_codes
+            for code in query_codes
         }
         for future in as_completed(future_map):
             code = future_map[future]
             completed += 1
             try:
-                raw, diagnostic = future.result()
-                diagnostics.append(diagnostic)
+                raw, _ = future.result()
                 stats["success_codes"] += 1
                 stats["endpoint_rows"] += int(len(raw))
                 if raw is None or raw.empty:
@@ -14693,33 +14962,105 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
                 failures.append((code, str(exc)))
                 stats["failed_codes"] += 1
 
-            if completed == 1 or completed % 25 == 0 or completed == len(active_codes):
+            if completed == 1 or completed % 25 == 0 or completed == len(query_codes):
                 print(
-                    f"📊 最新日權證 API 進度：{completed}/{len(active_codes)}｜"
+                    f"📊 最新日權證 API 進度：{completed}/{len(query_codes)}｜"
                     f"有成交權證={len(frames)}｜空資料={stats['empty_codes']}｜失敗={len(failures)}"
                 )
 
     if failures:
         preview = "；".join(f"{code}:{error[:140]}" for code, error in failures[:8])
         message = (
-            f"最新日權證 API 不完整：失敗 {len(failures)}/{len(active_codes)} 支｜{preview}"
+            f"最新日權證 API 不完整：失敗 {len(failures)}/{len(query_codes)} 支｜{preview}"
         )
         if FINMIND_WARRANT_LATEST_DAY_API_STRICT:
             raise RuntimeError(message)
         print(f"⚠️ {message}")
 
-    if not frames:
+    events = (
+        pd.concat(frames, ignore_index=True, sort=False).fillna("")
+        if frames
+        else pd.DataFrame(columns=output_cols)
+    )
+    if not events.empty:
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+        events = events.dropna(subset=["Date"])
+        for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0.0)
+        events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
+        events["branch"] = events["branch"].map(normalize_branch_name)
+        events["broker_code"] = events["broker_code"].astype(str).str.strip()
+
+    # 用「按分點查詢」的原始結果核對精選分點。若逐權證 API 漏列或金額不同，
+    # 只替換相同日期 × 分點 ID × 權證的列，不影響其他分點與其他權證。
+    branch_frames = []
+    if selected_branch_raw is not None and not selected_branch_raw.empty:
+        selected_branch_raw = selected_branch_raw.copy().fillna("")
+        selected_branch_raw["stock_id"] = selected_branch_raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        for warrant_code, raw_code in selected_branch_raw.groupby("stock_id", sort=False):
+            if not warrant_code:
+                continue
+            converted = _finmind_convert_warrant_code_rows(
+                raw_code,
+                day,
+                warrant_code,
+                warrant_name_map,
+                stock_code,
+                stock_name,
+                trader_name_map,
+            )
+            if not converted.empty:
+                branch_frames.append(converted)
+
+    if branch_frames:
+        branch_events = pd.concat(branch_frames, ignore_index=True, sort=False).fillna("")
+        key_cols = ["Date", "broker_code", "warrant_code"]
+        branch_events["Date"] = pd.to_datetime(branch_events["Date"], errors="coerce").dt.normalize()
+        branch_events["broker_code"] = branch_events["broker_code"].astype(str).str.strip()
+        branch_events["warrant_code"] = branch_events["warrant_code"].map(normalize_openapi_warrant_code)
+        for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            branch_events[col] = pd.to_numeric(branch_events[col], errors="coerce").fillna(0.0)
+
+        if events.empty:
+            repaired_count = len(branch_events)
+        else:
+            audit = branch_events[key_cols + ["buy_amount", "sell_amount"]].merge(
+                events[key_cols + ["buy_amount", "sell_amount"]],
+                on=key_cols,
+                how="left",
+                suffixes=("_branch", "_warrant"),
+            )
+            missing_mask = audit["buy_amount_warrant"].isna() | audit["sell_amount_warrant"].isna()
+            mismatch_mask = (
+                (audit["buy_amount_branch"] - audit["buy_amount_warrant"].fillna(0.0)).abs() > 0.01
+            ) | (
+                (audit["sell_amount_branch"] - audit["sell_amount_warrant"].fillna(0.0)).abs() > 0.01
+            )
+            repaired_count = int((missing_mask | mismatch_mask).sum())
+
+        branch_key = branch_events[key_cols].astype(str).agg("|".join, axis=1)
+        if not events.empty:
+            event_key = events[key_cols].astype(str).agg("|".join, axis=1)
+            events = events[~event_key.isin(set(branch_key))].copy()
+        events = pd.concat([events, branch_events], ignore_index=True, sort=False).fillna("")
+        stats["selected_branch_repaired_rows"] = repaired_count
+        print(
+            f"✅ 最新日精選分點核對完成：{stock_code}｜日期={day.date()}｜"
+            f"直接端點={len(branch_events):,}筆｜逐權證端點需修補={repaired_count:,}筆｜"
+            "已以分點端點替換相同鍵值"
+        )
+
+    if events.empty:
         message = (
             f"最新日權證 API 全部無成交資料：{stock_code} {stock_name}｜"
-            f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(active_codes)}｜"
+            f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
             "可能是 API 尚未完成更新"
         )
-        if FINMIND_WARRANT_LATEST_DAY_API_STRICT and active_codes:
+        if FINMIND_WARRANT_LATEST_DAY_API_STRICT and query_codes:
             raise RuntimeError(message)
         print(f"⚠️ {message}")
         return pd.DataFrame(columns=output_cols), stats
 
-    events = pd.concat(frames, ignore_index=True, sort=False).fillna("")
     events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
     events = events.dropna(subset=["Date"])
     for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
@@ -14732,14 +15073,13 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
     stats["event_rows"] = int(len(events))
     print(
         f"✅ 最新日權證 API 完成：{stock_code}｜日期={day.date()}｜"
-        f"請求成功={stats['success_codes']}/{len(active_codes)}｜"
+        f"請求成功={stats['success_codes']}/{len(query_codes)}｜"
         f"有成交權證={events['warrant_code'].nunique():,}支｜分點事件={len(events):,}筆｜"
         f"買進={fmt_money(float(events['buy_amount'].sum()))}｜"
         f"賣出={fmt_money(-float(events['sell_amount'].sum()))}｜"
         f"淨額={fmt_money(float(events['net_amount'].sum()))}"
     )
     return events, stats
-
 
 def _finmind_replace_latest_day_with_warrant_api(
     base_events: pd.DataFrame,
@@ -14749,6 +15089,7 @@ def _finmind_replace_latest_day_with_warrant_api(
     stock_code: str,
     stock_name: str,
     trader_name_map: Dict[str, str],
+    selected_branch_id_map: Dict[str, set] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """刪除最新日 Parquet 半成品，再以權證代號 API 完整結果取代。"""
     day = pd.Timestamp(latest_day).normalize()
@@ -14786,6 +15127,8 @@ def _finmind_replace_latest_day_with_warrant_api(
         stock_code,
         stock_name,
         trader_name_map,
+        historical_events=base,
+        selected_branch_id_map=selected_branch_id_map,
     )
     if latest_events is None or latest_events.empty:
         historical_only = (
@@ -14976,6 +15319,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         code,
         stock_name,
         trader_name_map,
+        selected_branch_id_map=selected_branch_id_map,
     )
 
     latest_failed = int(latest_api_stats.get("failed_codes", 0) or 0)
@@ -15712,7 +16056,7 @@ def main():
     print(
         "🧩 ACTIVE_FEATURES="
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
-        "latest-day-warrant-code-api+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+gemini-news-repair-supplement+"
+        "latest-day-warrant-code-api+latest-day-selected-branch-backfill+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+gemini-news-repair-supplement+"
         "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
         "single-context+uv-ready+calendar7+deadcode-cleanup"
     )
