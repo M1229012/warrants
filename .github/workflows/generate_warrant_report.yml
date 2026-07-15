@@ -419,7 +419,7 @@ jobs:
 
       - name: Validate Python syntax
         run: |
-          python -m py_compile run_report.py
+          python -m py_compile K_function_warrant_report_20260530.py
 
       - name: Run warrant report test
         run: |
