@@ -84,6 +84,10 @@ jobs:
       MPLBACKEND: Agg
       MPLCONFIGDIR: .cache/matplotlib
       WARRANT_REPORT_FONT_DIR: .cache/report-fonts
+      UV_LINK_MODE: hardlink
+      UV_NO_PROGRESS: "1"
+      UV_NO_CONFIG: "1"
+      UV_NO_INSTALLER_METADATA: "1"
       OUTPUT_DIR: output
       WARRANT_PREWARM_ONLY: "1"
       WARRANT_DATA_SOURCE_MODE: "finmind_only"
@@ -127,11 +131,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build cache date
+      - name: Prepare runtime metadata and folders
         id: cache-date
         shell: bash
         run: |
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          mkdir -p output \
+            finmind_cache/warrant_daily \
+            finmind_cache/warrant_market_compact_v1 \
+            finmind_cache/reference \
+            .cache/report-fonts \
+            .cache/matplotlib
 
       # 預熱工作保留少量原始 Parquet，供隔日增量更新；正式報表不再下載這個大型快取。
       - name: Restore FinMind raw prewarm cache
@@ -143,48 +153,38 @@ jobs:
             warrant-finmind-raw-${{ runner.os }}-
             warrant-finmind-market-${{ runner.os }}-
 
-      # 精簡事件與參考資料另存小型快取，正式產圖只還原這兩個目錄。
+      # 精簡事件、參考資料、字型與 Matplotlib 索引共用同一份報表快取，減少一次 cache action。
       - name: Restore FinMind report cache
         uses: actions/cache/restore@v4
         with:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
+            .cache/report-fonts
+            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
           restore-keys: |
             warrant-finmind-report-${{ runner.os }}-
 
-      - name: Prepare folders
-        run: |
-          mkdir -p output \
-            finmind_cache/warrant_daily \
-            finmind_cache/warrant_market_compact_v1 \
-            finmind_cache/reference \
-            .cache/report-fonts \
-            .cache/matplotlib
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.11.15"
 
-      # 只快取字型與 Matplotlib 索引；不再還原龐大的完整 .venv。
-      - name: Restore report font cache
-        id: report-font-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/report-fonts
-            .cache/matplotlib
-          key: warrant-report-fonts-${{ runner.os }}-noto-cjk-tc-v2
 
       # uv 只快取套件下載／解壓成果，每次以快取內容快速重建小型 .venv。
-      - name: Set up uv with dependency cache
+      - name: Set up fixed uv with full dependency cache
+        id: setup-uv
         uses: astral-sh/setup-uv@v8.3.2
         with:
+          version: "0.11.28"
           enable-cache: true
           cache-dependency-glob: requirements-runtime.txt
-          cache-suffix: warrant-report-runtime-v27
+          cache-suffix: warrant-report-runtime-v28-full
+          prune-cache: false
+          cache-python: false
+          add-problem-matchers: false
+          quiet: true
 
       - name: Build lightweight Python runtime and prepare fonts
         shell: bash
@@ -214,21 +214,41 @@ jobs:
           FONT_PID_2=$!
 
           rm -rf .venv
-          uv venv --python "$(command -v python)" .venv
-          uv pip install \
-            --python .venv/bin/python \
-            --requirements requirements-runtime.txt
+          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
+
+          if [ "${{ steps.setup-uv.outputs.cache-hit }}" = "true" ]; then
+            if ! uv pip install \
+              --offline \
+              --no-build \
+              --no-deps \
+              --python .venv/bin/python \
+              --requirements requirements-runtime.txt; then
+              echo "⚠️ uv 完整快取命中但離線安裝不完整，僅本次回退線上補齊"
+              uv pip install \
+                --no-build \
+                --no-deps \
+                --python .venv/bin/python \
+                --requirements requirements-runtime.txt
+            fi
+          else
+            uv pip install \
+              --no-build \
+              --no-deps \
+              --python .venv/bin/python \
+              --requirements requirements-runtime.txt
+          fi
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          if [ "${{ steps.report-font-cache.outputs.cache-hit }}" != "true" ]; then
+          if [ ! -f .cache/matplotlib/.warrant-font-index-ready ]; then
             MPLCONFIGDIR=.cache/matplotlib \
             WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
             .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
+            touch .cache/matplotlib/.warrant-font-index-ready
           fi
 
       - name: Prewarm FinMind all-market cache
@@ -250,6 +270,8 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
+            .cache/report-fonts
+            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
   run-warrant-report-test:
@@ -267,6 +289,10 @@ jobs:
       MPLBACKEND: Agg
       MPLCONFIGDIR: .cache/matplotlib
       WARRANT_REPORT_FONT_DIR: .cache/report-fonts
+      UV_LINK_MODE: hardlink
+      UV_NO_PROGRESS: "1"
+      UV_NO_CONFIG: "1"
+      UV_NO_INSTALLER_METADATA: "1"
 
       # ========================================================
       # 市場資料使用 FinMind；新聞使用六來源整合
@@ -452,11 +478,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build cache date
+      - name: Prepare runtime metadata and folders
         id: cache-date
         shell: bash
         run: |
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          mkdir -p output llm_cache \
+            finmind_cache/warrant_daily \
+            finmind_cache/warrant_market_compact_v1 \
+            finmind_cache/reference \
+            .cache/report-fonts \
+            .cache/matplotlib
+          rm -f output/*_warrant_report.png output/debug_*.csv
 
       - name: Restore LLM cache
         uses: actions/cache/restore@v4
@@ -468,48 +501,38 @@ jobs:
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
 
-      # 正式報表只下載精簡事件與參考資料，不再還原預熱用原始 Parquet。
+      # 正式報表只還原精簡事件、參考資料與產圖資源，不再還原預熱用原始 Parquet。
       - name: Restore latest FinMind report cache
         uses: actions/cache/restore@v4
         with:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
+            .cache/report-fonts
+            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
           restore-keys: |
             warrant-finmind-report-${{ runner.os }}-
             warrant-finmind-market-${{ runner.os }}-
 
-      - name: Prepare folders
-        run: |
-          mkdir -p output llm_cache \
-            finmind_cache/warrant_daily \
-            finmind_cache/warrant_market_compact_v1 \
-            finmind_cache/reference \
-            .cache/report-fonts \
-            .cache/matplotlib
-          rm -f output/*_warrant_report.png output/debug_*.csv
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.11.15"
 
-      - name: Restore report font cache
-        id: report-font-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/report-fonts
-            .cache/matplotlib
-          key: warrant-report-fonts-${{ runner.os }}-noto-cjk-tc-v2
 
-      - name: Set up uv with dependency cache
+      - name: Set up fixed uv with full dependency cache
+        id: setup-uv
         uses: astral-sh/setup-uv@v8.3.2
         with:
+          version: "0.11.28"
           enable-cache: true
           cache-dependency-glob: requirements-runtime.txt
-          cache-suffix: warrant-report-runtime-v27
+          cache-suffix: warrant-report-runtime-v28-full
+          prune-cache: false
+          cache-python: false
+          add-problem-matchers: false
+          quiet: true
 
       - name: Build lightweight Python runtime and prepare fonts
         shell: bash
@@ -539,21 +562,41 @@ jobs:
           FONT_PID_2=$!
 
           rm -rf .venv
-          uv venv --python "$(command -v python)" .venv
-          uv pip install \
-            --python .venv/bin/python \
-            --requirements requirements-runtime.txt
+          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
+
+          if [ "${{ steps.setup-uv.outputs.cache-hit }}" = "true" ]; then
+            if ! uv pip install \
+              --offline \
+              --no-build \
+              --no-deps \
+              --python .venv/bin/python \
+              --requirements requirements-runtime.txt; then
+              echo "⚠️ uv 完整快取命中但離線安裝不完整，僅本次回退線上補齊"
+              uv pip install \
+                --no-build \
+                --no-deps \
+                --python .venv/bin/python \
+                --requirements requirements-runtime.txt
+            fi
+          else
+            uv pip install \
+              --no-build \
+              --no-deps \
+              --python .venv/bin/python \
+              --requirements requirements-runtime.txt
+          fi
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          if [ "${{ steps.report-font-cache.outputs.cache-hit }}" != "true" ]; then
+          if [ ! -f .cache/matplotlib/.warrant-font-index-ready ]; then
             MPLCONFIGDIR=.cache/matplotlib \
             WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
             .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
+            touch .cache/matplotlib/.warrant-font-index-ready
           fi
 
       - name: Run warrant report test
@@ -592,6 +635,8 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
+            .cache/report-fonts
+            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
 
       - name: Save refreshed LLM cache
