@@ -4144,7 +4144,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v29_multisource_body_grounded"
+    internal_version = "validated_v30_multisource_finmind_grounded"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -4266,6 +4266,19 @@ NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
 NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "2")))
 # 公開資訊觀測站重大訊息補強：使用證交所 OpenAPI 的上市／上櫃每日重大訊息。
 NEWS_MOPS_ENABLE = os.getenv("WARRANT_NEWS_MOPS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# FinMind TaiwanStockNews 作為第六個新聞來源。
+# 僅標題資料只作低優先級事實素材；不可人工補上公司名稱，也不可覆蓋其他多來源新聞。
+FINMIND_NEWS_ENABLE = os.getenv(
+    "WARRANT_FINMIND_NEWS_ENABLE",
+    os.getenv("FINMIND_NEWS_ENABLE", "1"),
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_NEWS_WORKERS = max(1, int(os.getenv("FINMIND_NEWS_WORKERS", "8")))
+FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", "30")))
+FINMIND_NEWS_REQUIRE_DIRECT_TARGET = os.getenv(
+    "WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "12")))
 NEWS_MOPS_ENDPOINTS = [
     ("上市重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"),
@@ -6002,6 +6015,169 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
     return articles[:max(1, int(max_items))]
 
 
+
+def _finmind_fetch_news_day(stock_code: str, trade_date) -> pd.DataFrame:
+    """依 FinMind 官方逐日限制取得單日 TaiwanStockNews。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    return _finmind_get_data(
+        "TaiwanStockNews",
+        data_id=_normalize_stock_name_code_key(stock_code),
+        start_date=date_s,
+        allow_empty=True,
+    )
+
+
+def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
+    """取得 FinMind TaiwanStockNews，作為多來源新聞池中的第六個來源。
+
+    規則：
+    1. 原始 stock_id 必須符合目標股票。
+    2. 標題／摘要本身必須直接提及目標公司，禁止人工補上公司名稱。
+    3. 有摘要時可作一般素材；只有標題時標記 finmind_title_only，排序落在完整內文之後。
+    4. 本函式只回傳 FinMind 候選，不覆蓋 Google／Yahoo／Bing／MoneyDJ／MOPS。
+    """
+    if not NEWS_ENABLE or not FINMIND_NEWS_ENABLE:
+        return []
+
+    code = _normalize_stock_name_code_key(stock_code)
+    today = get_taipei_today_ts()
+    dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
+    frames = []
+    failures = []
+
+    with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
+        future_map = {executor.submit(_finmind_fetch_news_day, code, day): day for day in dates}
+        for future in as_completed(future_map):
+            day = future_map[future]
+            try:
+                day_df = future.result()
+                if day_df is not None and not day_df.empty:
+                    frames.append(day_df)
+            except Exception as exc:
+                failures.append((str(pd.Timestamp(day).date()), str(exc)))
+
+    if failures:
+        print(
+            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
+            + "；".join(f"{day}:{error[:80]}" for day, error in failures[:3])
+        )
+
+    raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
+    if raw.empty:
+        print(f"ℹ️ FinMind TaiwanStockNews 無近期新聞：{code} {stock_name}")
+        return []
+
+    required = {"date", "stock_id", "link", "source", "title"}
+    missing = required - set(raw.columns)
+    if missing:
+        _finmind_debug_print_df(f"TaiwanStockNews 必要欄位不足｜{code}", raw)
+        print(
+            f"⚠️ FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
+            f"實際欄位={raw.columns.tolist()}｜本來源略過"
+        )
+        return []
+
+    description_col = next(
+        (column for column in ["description", "content", "summary", "snippet", "text"] if column in raw.columns),
+        "",
+    )
+    if description_col:
+        print(f"📰 FinMind TaiwanStockNews 摘要欄位：{description_col}｜欄位={raw.columns.tolist()}")
+    else:
+        print(
+            "ℹ️ FinMind TaiwanStockNews 本次沒有 description／content／summary，"
+            "僅將原始 title 作為低優先級事實素材｜"
+            f"欄位={raw.columns.tolist()}"
+        )
+
+    raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
+    raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
+
+    articles = []
+    seen = set()
+    skipped_not_target = 0
+    skipped_conflict = 0
+    skipped_stock_id = 0
+
+    for _, row in raw.iterrows():
+        title = _clean_news_title(row.get("title", ""))
+        raw_description = row.get(description_col, "") if description_col else ""
+        description = _normalize_news_text(_html_to_readable_text(raw_description))
+        url = str(row.get("link", "") or "").strip()
+        source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
+        if not title and not description:
+            continue
+
+        row_stock_id = _normalize_stock_name_code_key(row.get("stock_id", ""))
+        if row_stock_id and row_stock_id != code:
+            skipped_stock_id += 1
+            continue
+
+        source_text = _normalize_news_text("。".join(part for part in [title, description] if part))
+        if _has_conflicting_similar_company_name(source_text, code, stock_name):
+            skipped_conflict += 1
+            continue
+        if FINMIND_NEWS_REQUIRE_DIRECT_TARGET and not _news_text_matches_target_stock(
+            source_text,
+            code,
+            stock_name,
+        ):
+            skipped_not_target += 1
+            continue
+
+        key = _article_seen_key(title, url)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+
+        fact_text = _normalize_news_text(description or title)
+        if not fact_text:
+            continue
+        has_description = bool(description)
+        article = {
+            "title": title or fact_text[:80],
+            "url": url,
+            "source": source,
+            "source_family": "FinMind",
+            "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
+            "description": description,
+            "content": fact_text,
+            "body_ok": bool(has_description and len(fact_text) >= 80),
+            "fallback_ok": True,
+            "content_source": "finmind_description" if has_description else "finmind_title_fact",
+            "finmind_title_only": not has_description,
+            "finmind_target_verified": True,
+            "search_days": FINMIND_NEWS_LOOKBACK_DAYS,
+            "query_stage": "FinMind TaiwanStockNews",
+            "body_length": len(fact_text),
+        }
+        article["relevance_score"] = _score_news_article_relevance(article, code, stock_name)
+        articles.append(article)
+
+    if skipped_not_target or skipped_conflict or skipped_stock_id:
+        print(
+            f"🛡️ FinMind 新聞嚴格主體過濾：{code} {stock_name}｜"
+            f"非直接主體={skipped_not_target}｜相似公司衝突={skipped_conflict}｜stock_id不符={skipped_stock_id}"
+        )
+
+    def _finmind_news_sort_key(article: dict):
+        published_dt = pd.to_datetime(article.get("published", ""), errors="coerce")
+        timestamp = float(published_dt.timestamp()) if pd.notna(published_dt) else 0.0
+        material_rank = 0 if article.get("body_ok") else 1
+        return (material_rank, -int(article.get("relevance_score", 0) or 0), -timestamp)
+
+    articles = sorted(articles, key=_finmind_news_sort_key)
+    limit = max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT), int(max_items))
+    result = articles[:limit]
+    title_only_count = sum(bool(article.get("finmind_title_only")) for article in result)
+    print(
+        f"📰 FinMind TaiwanStockNews：{code} {stock_name}｜"
+        f"近 {FINMIND_NEWS_LOOKBACK_DAYS} 天｜保留 {len(result):,} 筆｜"
+        f"僅標題 {title_only_count:,} 筆"
+    )
+    return result
+
 def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: str, stock_name: str, limit: int) -> List[dict]:
     merged = []
     seen = set()
@@ -6016,10 +6192,25 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
             article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
             merged.append(article)
 
-    def sort_key(a: dict):
-        dt = _parse_rss_pub_date(a.get("published", "")) or datetime.min
-        body_rank = 0 if a.get("body_ok") else 1 if a.get("fallback_ok") else 2
-        return (-int(a.get("relevance_score", 0) or 0), body_rank, -dt.timestamp() if dt != datetime.min else 0)
+    def sort_key(article: dict):
+        published_dt = _parse_rss_pub_date(article.get("published", "")) or datetime.min
+        if article.get("body_ok"):
+            material_rank = 0
+        elif article.get("fallback_ok") and not article.get("finmind_title_only"):
+            material_rank = 1
+        elif article.get("finmind_title_only"):
+            material_rank = 2
+        else:
+            material_rank = 3
+
+        source_family = str(article.get("source_family", article.get("source", "")) or "")
+        official_rank = 0 if source_family == "MOPS" else 1
+        return (
+            material_rank,
+            official_rank,
+            -int(article.get("relevance_score", 0) or 0),
+            -published_dt.timestamp() if published_dt != datetime.min else 0,
+        )
 
     merged = sorted(merged, key=sort_key)
     # 先依事件去重，再做來源多樣化；避免同一月份營收因來自 Google／Yahoo／MoneyDJ
@@ -6065,7 +6256,10 @@ def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items
     per_source = max(minimum_needed, 3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
 
     # 所有來源都會實際查詢，不因 Google 先找到一篇就停止。
+    # FinMind 是第六個來源，只加入候選池；不得覆蓋其他來源。
     groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max(max_items, minimum_needed))]
+    if FINMIND_NEWS_ENABLE:
+        groups.append(fetch_finmind_news_articles(stock_code, stock_name, max_items=per_source))
     if NEWS_MULTI_SOURCE_ENABLE:
         groups.append(fetch_yahoo_finance_rss_articles(stock_code, stock_name, max_items=per_source))
         groups.append(fetch_bing_news_rss_articles(stock_code, stock_name, max_items=per_source))
@@ -7998,7 +8192,14 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         raw_content = _normalize_news_text(rec.get("content", ""))
         description = _normalize_news_text(rec.get("description", ""))
         content_source = str(rec.get("content_source", ""))
-        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "manual")
+        is_fast_rss = content_source in (
+            "google_news_rss_fast",
+            "rss_description",
+            "rss_title_fact",
+            "finmind_description",
+            "finmind_title_fact",
+            "manual",
+        )
 
         inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
         if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
@@ -8046,7 +8247,12 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
             focused_content = raw_content
             focused_norm = _normalize_news_text(focused_content)
 
-        if len(focused_norm) < (20 if is_fast_rss else 40):
+        focused_min_len = (
+            8
+            if content_source in ("rss_title_fact", "finmind_title_fact")
+            else 20 if is_fast_rss else 40
+        )
+        if len(focused_norm) < focused_min_len:
             print(f"⚠️ 略過多股混雜新聞：{title[:36]}｜找不到足夠的 {stock_code} {stock_name} 明確片段")
             continue
 
@@ -8065,10 +8271,12 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         usable.append({
             "id": f"A{len(usable) + 1}",
             "source": rec.get("source", ""),
+            "source_family": rec.get("source_family", rec.get("source", "")),
             "title": title,
             "published": rec.get("published", ""),
             "url": rec.get("url", ""),
             "content_source": content_source,
+            "finmind_title_only": bool(rec.get("finmind_title_only")),
             "event_key": event_key,
             "target_aliases": aliases,
             "body": focused_content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
@@ -12184,7 +12392,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-api-multisource-news-v22"
+FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-api-multisource-finmind-news-v23"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15523,7 +15731,7 @@ def main():
     print(
         "🧩 ACTIVE_FEATURES="
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
-        "latest-day-warrant-code-api+multisource-news+event-level-news-dedup+gemini-news-repair-supplement+"
+        "latest-day-warrant-code-api+six-source-news+finmind-news-grounding+event-level-news-dedup+gemini-news-repair-supplement+"
         "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
         "single-context+uv-ready+calendar7+deadcode-cleanup"
     )
