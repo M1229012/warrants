@@ -61,6 +61,13 @@ jobs:
       SELL_THRESHOLD_RATIO: "0.5"
       DISPLAY_EXIT_ALWAYS: "0"
 
+      # 近2個月 TOP15 固定使用最近 40 個有效交易日。
+      LOOKBACK_TRADING_DAYS: "40"
+
+      # 「第幾次加碼」獨立使用最近 50 個有效交易日，
+      # 不影響近40交易日共識淨買超 TOP15。
+      ADD_COUNT_LOOKBACK_TRADING_DAYS: "50"
+
       # 每日五分點買賣超只顯示符合新制 A/B/C/D/E 的事件。
       DAILY_REQUIRE_AMOUNT_CLASSIFIED: "1"
 
@@ -102,14 +109,34 @@ jobs:
       - name: Generate image from Google Sheet and send to Discord
         run: |
           ACTION_VALUE="${RUN_PLAN}"
+          INPUT_RUN_PLAN="${{ github.event.inputs.run_plan }}"
           TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
           BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
 
-          if [ -n "${{ github.event.inputs.run_plan }}" ]; then
-            ACTION_VALUE="${{ github.event.inputs.run_plan }}"
+          # 手動執行時，使用 workflow_dispatch 下拉選單的執行方案。
+          # 排程執行時 INPUT_RUN_PLAN 為空，維持 env.RUN_PLAN 的每日圖流程。
+          if [ -n "${INPUT_RUN_PLAN}" ]; then
+            ACTION_VALUE="${INPUT_RUN_PLAN}"
           fi
 
-          CMD=(python "discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
+          # GitHub Actions 顯示名稱保留「近2個月」，
+          # 但傳給 Python 時轉成程式內部正式名稱，
+          # 避免 normalize_image_action() 無法辨識而誤跑每日圖。
+          case "${ACTION_VALUE}" in
+            "近2個月共識淨買超TOP15"|"近兩個月共識淨買超TOP15")
+              ACTION_VALUE="近40交易日共識淨買超TOP15"
+              ;;
+          esac
+
+          echo "GitHub Actions 選擇方案：${INPUT_RUN_PLAN:-${RUN_PLAN}}"
+          echo "實際傳入 Python 動作：${ACTION_VALUE}"
+          echo "TOP15 回溯有效交易日：${LOOKBACK_TRADING_DAYS}"
+
+          CMD=(
+            python
+            "discord_warrant_report_gsheet.py"
+            --action "${ACTION_VALUE}"
+          )
 
           if [ -n "${TARGET_DATE_VALUE}" ]; then
             CMD+=(--date "${TARGET_DATE_VALUE}")
@@ -118,6 +145,10 @@ jobs:
           if [ -n "${BROKER_NAME_VALUE}" ]; then
             CMD+=(--broker "${BROKER_NAME_VALUE}")
           fi
+
+          printf '執行指令：'
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
 
           "${CMD[@]}"
 
