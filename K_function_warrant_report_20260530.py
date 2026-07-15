@@ -156,13 +156,6 @@ REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_REPORT_INTERMEDI
 SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL", "6"))
 SCREENSHOT_OUTPUT_PNG_OPTIMIZE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_OPTIMIZE", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# K 線圖 Y 軸留白設定：避免價格已經很集中時，上下空白仍過大。
-# 調小後會讓股價區更貼近實際波動範圍，但仍保留少量空間給均線、布林與文字標註。
-CANDLE_Y_PAD_LOWER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_RATIO", "0.06"))
-CANDLE_Y_PAD_UPPER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_RATIO", "0.12"))
-CANDLE_Y_PAD_LOWER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_MIN_PCT", "0.008"))
-CANDLE_Y_PAD_UPPER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_MIN_PCT", "0.015"))
-
 # 疑似造市 / 避險對沖設定
 # 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
 HEDGE_MARK_THRESHOLD = float(os.getenv("WARRANT_HEDGE_MARK_THRESHOLD", os.getenv("WARRANT_HEDGE_THRESHOLD", "0.08")))
@@ -12372,8 +12365,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-selected-branch-backfill-v25"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-runtime-cache-deadcode-cleanup-v26"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -12555,17 +12547,14 @@ _FINMIND_STORAGE_LOCKS = {}
 _FINMIND_STORAGE_LOCKS_GUARD = threading.Lock()
 _FINMIND_MARKET_COMPACT_LOCKS = {}
 _FINMIND_MARKET_COMPACT_LOCKS_GUARD = threading.Lock()
-_FINMIND_REFERENCE_CACHE_LOCK = threading.RLock()
 _FINMIND_RATE_LIMIT_GATE_LOCK = threading.Lock()
 _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = 0.0
 _FINMIND_WARRANT_RUN_STATS = {}
 _FINMIND_MULTI_STOCK_PREFETCH_READY = False
 _FINMIND_MULTI_STOCK_PREFETCH_RANGE = (pd.NaT, pd.NaT)
-_FINMIND_MULTI_STOCK_LATEST_AVAILABLE = pd.NaT
 _FINMIND_MULTI_STOCK_EVENT_CACHE = {}
 _FINMIND_MULTI_STOCK_SUMMARY_CACHE = {}
 _FINMIND_MULTI_STOCK_NAME_MAP_CACHE = {}
-_FINMIND_MULTI_STOCK_NAME_CACHE = {}
 _FINMIND_MULTI_STOCK_PREFETCH_LOCK = threading.RLock()
 
 FINMIND_WARRANT_SOURCE_LABEL = "FinMind_TaiwanStockWarrantTradingDailyReport"
@@ -14185,11 +14174,9 @@ def _finmind_prepare_multi_stock_warrant_events(stock_codes: List[str]):
     """多股票預處理：每個交易日只解析一次全市場 Parquet，結果按股票保存在記憶體。"""
     global _FINMIND_MULTI_STOCK_PREFETCH_READY
     global _FINMIND_MULTI_STOCK_PREFETCH_RANGE
-    global _FINMIND_MULTI_STOCK_LATEST_AVAILABLE
     global _FINMIND_MULTI_STOCK_EVENT_CACHE
     global _FINMIND_MULTI_STOCK_SUMMARY_CACHE
     global _FINMIND_MULTI_STOCK_NAME_MAP_CACHE
-    global _FINMIND_MULTI_STOCK_NAME_CACHE
 
     codes = []
     for raw_code in stock_codes or []:
@@ -14310,9 +14297,7 @@ def _finmind_prepare_multi_stock_warrant_events(stock_codes: List[str]):
         _FINMIND_MULTI_STOCK_EVENT_CACHE = event_cache
         _FINMIND_MULTI_STOCK_SUMMARY_CACHE = summaries
         _FINMIND_MULTI_STOCK_NAME_MAP_CACHE = name_maps
-        _FINMIND_MULTI_STOCK_NAME_CACHE = stock_names
         _FINMIND_MULTI_STOCK_PREFETCH_RANGE = (start_ts, end_ts)
-        _FINMIND_MULTI_STOCK_LATEST_AVAILABLE = latest_available
         _FINMIND_MULTI_STOCK_PREFETCH_READY = True
         print(
             f"✅ 多股票權證聯集預處理完成：{len(codes)} 檔｜"
@@ -16023,10 +16008,6 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         if REPORT_TIMING_ENABLE:
             print(f"⏱️ {stock_code or 'UNKNOWN'}｜週報總時間：{time.perf_counter() - report_total_start:.2f} 秒")
 
-
-def generate_k_chart(stock_code: str) -> io.BytesIO:
-    """保留相容舊呼叫。"""
-    return generate_warrant_report(stock_code)
 
 # ============================================================
 # GitHub Actions 手動執行入口
