@@ -22,19 +22,10 @@ concurrency:
   group: finmind-warrant-branch-8-hour-probe-${{ github.ref }}
   cancel-in-progress: false
 
-
-# ============================================================
-# 第一階段：
-# 手動啟動後立即探測，共探測 24 次。
-# 探測時間約為第 0、10、20 ... 230 分鐘。
-# ============================================================
 jobs:
   probe_phase_1:
     name: Probe Phase 1
     runs-on: ubuntu-latest
-
-    # GitHub-hosted runner 單一 job 最長 6 小時。
-    # 此階段正常約執行 4 小時，保留額外緩衝。
     timeout-minutes: 330
 
     outputs:
@@ -59,10 +50,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --------------------------------------------------------
-      # 在工作流開始時固定目標日期。
-      # 避免流程跨過午夜後，Python 自動改查另一個日期。
-      # --------------------------------------------------------
       - name: Resolve target trading date
         id: resolve_date
         env:
@@ -97,7 +84,6 @@ jobs:
                       target_date -= timedelta(days=1)
 
           target_date_text = target_date.isoformat()
-
           print(f"固定偵測交易日期：{target_date_text}")
 
           with open(
@@ -110,16 +96,11 @@ jobs:
               )
           PY
 
-      # --------------------------------------------------------
-      # 每 10 分鐘執行一次，共 24 次。
-      # 每次執行完都提交 CSV 與狀態檔，避免中途失敗遺失紀錄。
-      # --------------------------------------------------------
       - name: Probe every 10 minutes
         id: probe_loop
         shell: bash
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_API_0714 }}
-
           FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
           FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
 
@@ -153,10 +134,6 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # ----------------------------------------------------
-          # 檢查目前狀態檔是否已判定完整。
-          # 完整回傳 0；尚未完整回傳 1。
-          # ----------------------------------------------------
           state_is_complete() {
             python - "${STATE_FILE}" <<'PY'
           import json
@@ -181,10 +158,6 @@ jobs:
           PY
           }
 
-          # ----------------------------------------------------
-          # 每次探測後立即提交資料。
-          # 即使工作流稍後被取消，已完成的紀錄仍會保留。
-          # ----------------------------------------------------
           commit_probe_outputs() {
             if [ ! -d "data/finmind_probe" ]; then
               echo "本次沒有輸出資料夾，不需要提交。"
@@ -198,8 +171,6 @@ jobs:
                 -m "chore: update FinMind probe ${TARGET_DATE} [skip ci]"
             fi
 
-            # 若前一次 push 暫時失敗，本次也會繼續嘗試推送
-            # 尚未送到遠端的本機 commit。
             if [ -z "$(git log --format=%H "origin/${TARGET_BRANCH}..HEAD")" ]; then
               echo "沒有尚未推送的探測紀錄。"
               return 0
@@ -239,7 +210,6 @@ jobs:
             echo "目標日期：${TARGET_DATE}"
             echo "============================================================"
 
-            # 不讓單次暫時性失敗中止整個 8 小時流程。
             set +e
             python finmind_warrant_probe.py
             PROBE_EXIT_CODE=$?
@@ -256,7 +226,6 @@ jobs:
               echo ""
               echo "✅ ${TARGET_DATE} 已確認資料完整。"
               echo "第一階段提前停止，第二階段不會執行。"
-
               echo "complete=true" >> "${GITHUB_OUTPUT}"
 
               {
@@ -273,23 +242,15 @@ jobs:
             fi
 
             if [ "${ATTEMPT}" -lt "${MAX_PROBES}" ]; then
-              # 使用固定時間軸，而非單純每次 sleep 600。
-              # API 執行花費的時間會從等待時間中扣除，
-              # 讓每次探測盡量維持約 10 分鐘間隔。
-              NEXT_PROBE_EPOCH="$(
-                (
-                  PHASE_START_EPOCH
-                  + ATTEMPT * PROBE_INTERVAL_SECONDS
-                )
-              )"
-
+              NEXT_PROBE_EPOCH=$((
+                PHASE_START_EPOCH
+                + ATTEMPT * PROBE_INTERVAL_SECONDS
+              ))
               CURRENT_EPOCH="$(date +%s)"
-              SLEEP_SECONDS="$(
-                (
-                  NEXT_PROBE_EPOCH
-                  - CURRENT_EPOCH
-                )
-              )"
+              SLEEP_SECONDS=$((
+                NEXT_PROBE_EPOCH
+                - CURRENT_EPOCH
+              ))
 
               if [ "${SLEEP_SECONDS}" -gt 0 ]; then
                 echo ""
@@ -313,21 +274,12 @@ jobs:
             echo "- 下一步：接續執行第二階段"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-
-  # ==========================================================
-  # 第二階段：
-  # 只有第一階段仍未完整時才執行。
-  #
-  # 先等待約 10 分鐘，再探測 25 次：
-  # 約對應整體流程的第 240、250 ... 480 分鐘。
-  # ==========================================================
   probe_phase_2:
     name: Probe Phase 2
     needs:
       - probe_phase_1
 
     if: ${{ needs.probe_phase_1.outputs.complete != 'true' }}
-
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
@@ -353,8 +305,7 @@ jobs:
         id: probe_loop
         shell: bash
         env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-
+          FINMIND_TOKEN: ${{ secrets.FINMIND_API_0714 }}
           FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
           FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
 
@@ -367,11 +318,7 @@ jobs:
           FORCE_PROBE: ${{ inputs.force_probe }}
 
           MAX_PROBES: "25"
-
-          # 第一階段最後一筆約在第 230 分鐘。
-          # 第二階段先等待 10 分鐘，讓下一筆約在第 240 分鐘。
           INITIAL_DELAY_SECONDS: "600"
-
           PROBE_INTERVAL_SECONDS: "600"
 
         run: |
@@ -453,11 +400,9 @@ jobs:
             return 0
           }
 
-          # 若第一階段剛結束，先補足約 10 分鐘間隔。
           echo "⏳ 等待 ${INITIAL_DELAY_SECONDS} 秒後開始第二階段。"
           sleep "${INITIAL_DELAY_SECONDS}"
 
-          # 等待期間若分支被其他程序更新，重新同步一次。
           git pull --rebase origin "${TARGET_BRANCH}" || true
 
           if state_is_complete; then
@@ -516,20 +461,15 @@ jobs:
             fi
 
             if [ "${ATTEMPT}" -lt "${MAX_PROBES}" ]; then
-              NEXT_PROBE_EPOCH="$(
-                (
-                  PHASE_START_EPOCH
-                  + ATTEMPT * PROBE_INTERVAL_SECONDS
-                )
-              )"
-
+              NEXT_PROBE_EPOCH=$((
+                PHASE_START_EPOCH
+                + ATTEMPT * PROBE_INTERVAL_SECONDS
+              ))
               CURRENT_EPOCH="$(date +%s)"
-              SLEEP_SECONDS="$(
-                (
-                  NEXT_PROBE_EPOCH
-                  - CURRENT_EPOCH
-                )
-              )"
+              SLEEP_SECONDS=$((
+                NEXT_PROBE_EPOCH
+                - CURRENT_EPOCH
+              ))
 
               if [ "${SLEEP_SECONDS}" -gt 0 ]; then
                 echo ""
