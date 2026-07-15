@@ -12550,7 +12550,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-rich-news-local-repair-fast-runtime-v27"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-rich-news-full-uv-cache-runtime-v28"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -16224,7 +16224,7 @@ def main():
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
         "latest-day-warrant-code-api+latest-day-selected-branch-backfill+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+local-evidence-repair+local-number-unit-repair+rich-two-sentence-news+gemini-max-two-calls+"
         "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
-        "single-context+uv-ready+calendar7+deadcode-cleanup"
+        "single-context+uv-full-cache+calendar7+deadcode-cleanup"
     )
     print(
         f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
