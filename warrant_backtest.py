@@ -194,7 +194,14 @@ DAILY_RESULT_SHEET_TITLES = {
 
 TOP15_LOOKBACK_TRADING_DAYS = int(os.getenv("TOP15_LOOKBACK_TRADING_DAYS", os.getenv("TOP15_RETURN_LOOKBACK_TRADING_DAYS", "40")))
 TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv("TOP15_RETURN_PRICE_LOOKBACK_DAYS", "75")))
-TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "10")))
+TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "0")))
+# TOP15 報酬率預設只接受「統計日期當日」的權證價格。
+# 若當日無成交／無有效收盤價，該部位仍保留在淨買超成本與部位明細，
+# 但不納入報酬率計算，避免以數日前舊價格冒充統計日報酬率。
+TOP15_REQUIRE_TARGET_DATE_PRICE = os.getenv("TOP15_REQUIRE_TARGET_DATE_PRICE", "1").strip().lower() not in ("0", "false", "no")
+# 同一分點＋同一標的的剩餘成本低於此門檻時，視為零碎部位：
+# 保留在「快取_TOP15部位明細」供稽核，但不納入共識 TOP15 的金額、排名、報酬率與參與分點數。
+TOP15_MIN_BROKER_REMAINING_COST = max(float(os.getenv("TOP15_MIN_BROKER_REMAINING_COST", "100000")), 0.0)
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
 # 若 TOP15 剩餘部位因多日未造市 / 無成交而缺少有效權證價格，
 # 預設不讓 RUN 失敗，而是保留淨買超成本，但該筆部位不納入報酬率估算。
@@ -7403,7 +7410,9 @@ def history_cache_latest_dates(history_df):
 
 def get_incremental_refresh_target_dt():
     lag_days = max(int(CACHE_INCREMENTAL_REFRESH_LAG_DAYS or 0), 0)
-    return datetime.today() - timedelta(days=lag_days)
+    base_date = resolve_latest_trading_date_on_or_before(datetime.today())
+    base_dt = parse_date(base_date) or datetime.today()
+    return base_dt - timedelta(days=lag_days)
 
 
 def should_fetch_candidate_incremental(key, history_keys, history_latest_map, direct_refresh_keys, missing_fetch_keys=None):
@@ -8183,7 +8192,8 @@ def prescan_all_live(warrants, broker_map, scan_days=40):
 
     print("【Step 3a】預篩：找有目標分點的權證...")
 
-    today = datetime.today()
+    target_date = current_prescan_target_date()
+    today = parse_date(target_date) or datetime.today()
     today_s = today.strftime("%Y/%m/%d")
     end_s = today.strftime("%Y/%m/%d")
     start_s = (today - timedelta(days=scan_days)).strftime("%Y/%m/%d")
@@ -9827,25 +9837,184 @@ def get_latest_price_info_on_or_before(price_cache, code, target_date):
     return valid[-1][1], valid[-1][0]
 
 
-def collect_top15_return_recent_dates(a_events, b_events, c_events, d_events, e_events=None, lookback_days=None):
-    """
-    從 A/B/C/D/E 事件抓近 N 個有效事件交易日。
 
-    這個範圍要和 TOP15 圖的「近兩個月、約 40 個交易日」概念一致，
-    讓報酬率快取可以直接對應圖片中的 TOP15 參與分點。
+def _top15_find_item(item_map, broker_code, warrant_code):
+    """用券商代號與權證代號的常見正規化形式尋找原始分點歷史項目。"""
+    item_map = item_map or {}
+    broker_code = str(broker_code or "").strip()
+    warrant_code = str(warrant_code or "").strip()
+
+    if not broker_code or not warrant_code:
+        return None
+
+    broker_candidates = []
+    for value in [broker_code, broker_code.upper(), broker_code.lower()]:
+        if value and value not in broker_candidates:
+            broker_candidates.append(value)
+
+    warrant_candidates = []
+    for value in [
+        warrant_code,
+        normalize_warrant_code_for_unique(warrant_code),
+        normalize_price_code(warrant_code),
+    ]:
+        value = str(value or "").strip()
+        if value and value not in warrant_candidates:
+            warrant_candidates.append(value)
+
+    for bc in broker_candidates:
+        for wc in warrant_candidates:
+            item = item_map.get((bc, wc))
+            if item:
+                return item
+
+    normalized_broker = broker_code.upper()
+    normalized_warrant = normalize_warrant_code_for_unique(warrant_code)
+    normalized_price_warrant = normalize_price_code(warrant_code)
+
+    for (raw_broker, raw_warrant), item in item_map.items():
+        if str(raw_broker or "").strip().upper() != normalized_broker:
+            continue
+        raw_warrant_text = str(raw_warrant or "").strip()
+        if (
+            normalize_warrant_code_for_unique(raw_warrant_text) == normalized_warrant
+            or normalize_price_code(raw_warrant_text) == normalized_price_warrant
+        ):
+            return item
+
+    return None
+
+
+def _top15_observed_market_dates(item_map=None, price_cache=None, target_date=None):
     """
+    從既有價格快取與分點歷史收集實際出現過的市場交易日。
+
+    不用星期一到星期五硬推交易日，避免國定假日被誤算；價格日期優先，
+    分點歷史日期作為補充。回傳日期皆不晚於 target_date。
+    """
+    target_dt = parse_date(target_date) or datetime.today()
+    target_text = target_dt.strftime("%Y/%m/%d")
+    dates = set()
+
+    seen_series_ids = set()
+    for prices in (price_cache or {}).values():
+        if not isinstance(prices, dict):
+            continue
+        series_id = id(prices)
+        if series_id in seen_series_ids:
+            continue
+        seen_series_ids.add(series_id)
+
+        for raw_date, raw_price in prices.items():
+            dt = parse_date(raw_date)
+            if not dt or dt > target_dt:
+                continue
+            if safe_price_float(raw_price) is None:
+                continue
+            dates.add(dt.strftime("%Y/%m/%d"))
+
+    seen_item_ids = set()
+    for item in (item_map or {}).values():
+        item_id = id(item)
+        if item_id in seen_item_ids:
+            continue
+        seen_item_ids.add(item_id)
+
+        df = item.get("df", pd.DataFrame()) if isinstance(item, dict) else pd.DataFrame()
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        for raw_date in df["日期"].tolist():
+            dt = parse_date(raw_date)
+            if dt and dt <= target_dt:
+                dates.add(dt.strftime("%Y/%m/%d"))
+
+    return sorted(d for d in dates if d <= target_text)
+
+
+def _top15_merge_lot_metadata(existing, incoming):
+    """合併指向同一筆原始每日買進流水的事件資訊，避免 C／D 等重疊事件重複加總。"""
+    if existing is None:
+        existing = dict(incoming)
+        existing["_事件集合"] = {str(incoming.get("事件", "")).strip()} if str(incoming.get("事件", "")).strip() else set()
+        existing["_事件類型集合"] = {str(incoming.get("事件類型", "")).strip()} if str(incoming.get("事件類型", "")).strip() else set()
+        existing["_事件日集合"] = {normalize_date_str(incoming.get("事件日", ""))} if parse_date(incoming.get("事件日", "")) else set()
+        existing["_來源集合"] = {str(incoming.get("來源", "")).strip()} if str(incoming.get("來源", "")).strip() else set()
+        return existing
+
+    event_code = str(incoming.get("事件", "")).strip()
+    event_type = str(incoming.get("事件類型", "")).strip()
+    event_date = normalize_date_str(incoming.get("事件日", ""))
+    source_text = str(incoming.get("來源", "")).strip()
+
+    if event_code:
+        existing.setdefault("_事件集合", set()).add(event_code)
+    if event_type:
+        existing.setdefault("_事件類型集合", set()).add(event_type)
+    if parse_date(event_date):
+        existing.setdefault("_事件日集合", set()).add(event_date)
+    if source_text:
+        existing.setdefault("_來源集合", set()).add(source_text)
+
+    # 同一分點、同一權證、同一買進日的原始流水只能算一次。
+    # 若備援欄位與原始歷史數值略有差異，採較完整的較大值，不做加總。
+    existing["原始股數"] = max(float(existing.get("原始股數", 0) or 0), float(incoming.get("原始股數", 0) or 0))
+    existing["原始成本"] = max(float(existing.get("原始成本", 0) or 0), float(incoming.get("原始成本", 0) or 0))
+    existing["剩餘股數"] = existing["原始股數"]
+    existing["剩餘成本"] = existing["原始成本"]
+
+    for field in ["分點", "分點名稱", "券商代號", "標的股", "標的名稱", "權證代號", "權證名稱"]:
+        if not str(existing.get(field, "")).strip() and str(incoming.get(field, "")).strip():
+            existing[field] = incoming.get(field, "")
+
+    return existing
+
+
+def _top15_finalize_lot_metadata(lot):
+    lot = dict(lot)
+    event_codes = sorted(x for x in lot.pop("_事件集合", set()) if x)
+    event_types = sorted(x for x in lot.pop("_事件類型集合", set()) if x)
+    event_dates = sorted(x for x in lot.pop("_事件日集合", set()) if parse_date(x))
+    sources = sorted(x for x in lot.pop("_來源集合", set()) if x)
+
+    lot["事件"] = "/".join(event_codes)
+    lot["事件類型"] = "／".join(event_types)
+    lot["事件日"] = event_dates[-1] if event_dates else normalize_date_str(lot.get("事件日", ""))
+    lot["來源"] = "；".join(sources)
+    return lot
+
+
+def collect_top15_return_recent_dates(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events=None,
+    lookback_days=None,
+    item_map=None,
+    price_cache=None,
+    target_date=None,
+):
+    """取得統計日前最近 N 個實際市場交易日，而不是最近 N 個事件發生日。"""
     if lookback_days is None:
         lookback_days = TOP15_LOOKBACK_TRADING_DAYS
 
-    dates = set()
+    target_dt = parse_date(target_date) or datetime.today()
+    dates = set(_top15_observed_market_dates(item_map, price_cache, target_dt))
 
+    # 事件日期只作為快取資料不足時的補充，不再作為 40 日曆的唯一來源。
     for _, group_events in iter_amount_class_event_groups(a_events, b_events, c_events, d_events, e_events):
         for ev in group_events:
-            d = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日") or ev.get("買進日"))
-            if d:
-                dates.add(normalize_date_str(d.strftime("%Y/%m/%d")))
+            dt = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日") or ev.get("買進日"))
+            if dt and dt <= target_dt:
+                dates.add(dt.strftime("%Y/%m/%d"))
 
     recent_dates = sorted(dates, reverse=True)[:max(int(lookback_days), 1)]
+    if len(recent_dates) < max(int(lookback_days), 1):
+        print(
+            f"  ⚠️ TOP15交易日曆僅取得 {len(recent_dates)} 個實際交易日，"
+            f"少於設定的 {int(lookback_days)} 日；不以平日硬補國定假日。"
+        )
     return recent_dates
 
 
@@ -9857,43 +10026,14 @@ def _top15_return_event_date(ev, is_a=False):
 
 def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e_events=None, recent_dates=None, item_map=None):
     """
-    將近 N 個有效事件交易日內的 A/B/C/D/E 買超事件轉成可計算未實現報酬率的 lot。
+    將 40 個市場交易日範圍內的 A/B/C/D/E 事件標記成 TOP15 事件 lot。
 
-    定義：
-    - 這裡只看「近 N 個有效事件交易日內」被 A/B/C/D/E 納入的權證部位。
-    - 報酬率要表達的是：這批近 N 日買進後，持有到目前的帳面報酬。
-    - A 直接使用原本單檔買進毛額。
-    - B/C/D 優先回到 item_map 的原始逐日資料抓「毛買進金額 / 毛買進股數」建立 lot；
-      後續賣出一律交給 apply_sales_to_top15_return_lots() 統一扣減。
-      這樣報酬率就是「當時實際買進均價 vs 目前權證價格」，不會用淨額先扣一次又再扣賣出。
+    同一筆「券商代號＋權證代號＋實際買進日」原始流水只建立一次；
+    即使事件來源重疊，也只合併事件資訊，不重複增加股數與成本。
     """
     date_set = set(recent_dates or [])
-    lots = []
+    lot_map = {}
     item_map = item_map or {}
-
-    def _find_item(broker_code, warrant_code):
-        broker_code = str(broker_code or "").strip()
-        warrant_code = str(warrant_code or "").strip()
-
-        if not broker_code or not warrant_code:
-            return None
-
-        candidates = []
-        for wc in [
-            warrant_code,
-            normalize_warrant_code_for_unique(warrant_code),
-            normalize_price_code(warrant_code),
-        ]:
-            wc = str(wc or "").strip()
-            if wc and wc not in candidates:
-                candidates.append(wc)
-
-        for wc in candidates:
-            item = item_map.get((broker_code, wc))
-            if item:
-                return item
-
-        return None
 
     def add_lot(
         event_code, event_type, broker_label, broker_name, broker_code,
@@ -9902,25 +10042,24 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
     ):
         event_date = normalize_date_str(event_date)
         buy_date = normalize_date_str(buy_date or event_date)
-
         if not event_date or event_date not in date_set:
             return False
 
         warrant_code = normalize_warrant_code_for_unique(warrant_code)
         buy_amount = float(buy_amount or 0)
         buy_qty = float(buy_qty or 0)
-
-        if not warrant_code or buy_amount <= 0 or buy_qty <= 0:
+        broker_code_text = str(broker_code or "").strip()
+        if not broker_code_text or not warrant_code or buy_amount <= 0 or buy_qty <= 0:
             return False
 
-        lots.append({
-            "事件": event_code,
-            "事件類型": event_type,
+        incoming = {
+            "事件": str(event_code or "").strip(),
+            "事件類型": str(event_type or "").strip(),
             "事件日": event_date,
             "買進日": buy_date,
             "分點": str(broker_label or "").strip(),
             "分點名稱": str(broker_name or "").strip(),
-            "券商代號": str(broker_code or "").strip(),
+            "券商代號": broker_code_text,
             "標的股": str(underlying_code or "").strip(),
             "標的名稱": str(underlying_name or "").strip(),
             "權證代號": warrant_code,
@@ -9930,14 +10069,12 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
             "剩餘股數": buy_qty,
             "剩餘成本": buy_amount,
             "來源": source_text,
-        })
+        }
+        dedup_key = (broker_code_text.upper(), warrant_code, buy_date)
+        lot_map[dedup_key] = _top15_merge_lot_metadata(lot_map.get(dedup_key), incoming)
         return True
 
     def add_group_lots_from_history(event_code, event_type, ev, lot, event_date, start_date, end_date):
-        """
-        B/C/D TOP15 報酬率用毛買進資料建立 lot。
-        回傳 True 代表已成功用原始流水建立；False 則外層可退回舊欄位資料。
-        """
         event_date = normalize_date_str(event_date)
         if not event_date or event_date not in date_set:
             return False
@@ -9948,8 +10085,7 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
 
         start_date = normalize_date_str(start_date or event_date)
         end_date = normalize_date_str(end_date or start_date)
-
-        item = _find_item(ev.get("券商代號", ""), warrant_code)
+        item = _top15_find_item(item_map, ev.get("券商代號", ""), warrant_code)
         if not item:
             return False
 
@@ -9965,30 +10101,20 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
         for row in df2.itertuples(index=False):
             row_dict = row._asdict()
             buy_date = normalize_date_str(row_dict.get("日期", ""))
-
             if not buy_date or buy_date < start_date or buy_date > end_date:
                 continue
 
             buy_qty = float(row_dict.get("買進股數", 0) or 0)
             buy_amount = float(row_dict.get("買進金額", 0) or 0)
-
             if buy_qty <= 0 or buy_amount <= 0:
                 continue
 
             added = add_lot(
-                event_code,
-                event_type,
-                ev.get("分點", ""),
-                ev.get("分點名稱", ""),
-                ev.get("券商代號", ""),
-                ev.get("標的股", ""),
-                ev.get("標的名稱", ""),
-                event_date,
-                buy_date,
-                warrant_code,
-                lot.get("權證名稱", ""),
-                buy_amount,
-                buy_qty,
+                event_code, event_type,
+                ev.get("分點", ""), ev.get("分點名稱", ""), ev.get("券商代號", ""),
+                ev.get("標的股", ""), ev.get("標的名稱", ""),
+                event_date, buy_date, warrant_code, lot.get("權證名稱", ""),
+                buy_amount, buy_qty,
                 f'{event_code} | {buy_date} | {warrant_code} {lot.get("權證名稱", "")}',
             ) or added
 
@@ -10001,129 +10127,246 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
 
             for lot in ev.get("lots", []):
                 if event_code == "D":
-                    # D 是近 N 日累積事件，報酬率要用該 D 視窗內的實際毛買進流水。
                     buy_start_date = ev.get("起始日") or lot.get("買進日") or event_date
                     buy_end_date = ev.get("結束日") or event_date
                 else:
-                    # B/C 的 lot 本身已有實際買進日，直接抓該日毛買進流水。
                     buy_start_date = lot.get("買進日") or ev.get("事件日") or ev.get("結束日") or event_date
                     buy_end_date = buy_start_date
 
                 used_history = add_group_lots_from_history(
-                    event_code,
-                    event_type,
-                    ev,
-                    lot,
-                    event_date,
-                    buy_start_date,
-                    buy_end_date,
+                    event_code, event_type, ev, lot, event_date, buy_start_date, buy_end_date
                 )
-
                 if used_history:
                     continue
 
-                # 備援：若 item_map 找不到原始流水，才沿用事件內既有 lot 金額。
-                # 這個分支正常情況很少用到，保留是避免舊快取缺資料時整批報酬率消失。
                 add_lot(
-                    event_code,
-                    event_type,
-                    ev.get("分點", ""),
-                    ev.get("分點名稱", ""),
-                    ev.get("券商代號", ""),
-                    ev.get("標的股", ""),
-                    ev.get("標的名稱", ""),
-                    event_date,
-                    lot.get("買進日") or event_date,
-                    lot.get("權證代號", ""),
-                    lot.get("權證名稱", ""),
-                    lot.get("金額", 0),
-                    lot.get("股數", 0),
+                    event_code, event_type,
+                    ev.get("分點", ""), ev.get("分點名稱", ""), ev.get("券商代號", ""),
+                    ev.get("標的股", ""), ev.get("標的名稱", ""),
+                    event_date, lot.get("買進日") or event_date,
+                    lot.get("權證代號", ""), lot.get("權證名稱", ""),
+                    lot.get("金額", 0), lot.get("股數", 0),
                     f'{event_code} | {lot.get("權證代號", "")} {lot.get("權證名稱", "")}',
                 )
 
-    return lots
+    return [
+        _top15_finalize_lot_metadata(lot)
+        for _, lot in sorted(lot_map.items(), key=lambda x: x[0])
+    ]
 
 
-
-def apply_sales_to_top15_return_lots(position_lots, item_map, target_date):
+def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, window_start=None):
     """
-    依照原始分點歷史資料，把近 N 日事件 lot 買進日之後的賣出股數扣掉，得到目前剩餘部位。
+    用完整可用分點歷史重建 FIFO，再只輸出仍未出清的 TOP15 事件 lot。
 
-    扣減邏輯：
-    - 同一分點 + 同一權證代號的 lot 依「買進日」FIFO 扣。
-    - 只扣「賣出日 > 買進日」的賣出，避免權證不可當沖時，同日賣出誤扣當日新買。
-    - 扣掉的是賣出股數對應的原始成本，不是賣出成交金額。
-    - 這裡不回溯計算近 N 個交易日範圍以前的舊庫存，因為 TOP15 報酬率定義為近 N 日事件部位的帳面報酬。
+    每日順序固定為：
+    1. 當日賣出先扣前一日以前的庫存。
+    2. 尚未配對的賣出再抵銷當日買進。
+    3. 當日剩餘買進才建立新 lot。
+
+    因此 40 日以前的舊庫存會先被扣除，同日賣出也不會再被忽略。
     """
     if not position_lots:
         return position_lots
 
-    target_dt = parse_date(target_date)
-    if not target_dt:
-        target_dt = datetime.today()
+    target_dt = parse_date(target_date) or datetime.today()
+    target_text = target_dt.strftime("%Y/%m/%d")
+    window_start_text = normalize_date_str(window_start) if parse_date(window_start) else ""
 
-    lots_by_key = {}
-    for lot in position_lots:
-        key = (str(lot.get("券商代號", "")).strip(), str(lot.get("權證代號", "")).strip())
-        lots_by_key.setdefault(key, []).append(lot)
+    templates_by_key = {}
+    for raw_lot in position_lots:
+        lot = dict(raw_lot)
+        broker_code = str(lot.get("券商代號", "")).strip()
+        warrant_code = normalize_warrant_code_for_unique(lot.get("權證代號", ""))
+        buy_date = normalize_date_str(lot.get("買進日") or lot.get("事件日", ""))
+        if not broker_code or not warrant_code or not parse_date(buy_date):
+            continue
+        key = (broker_code.upper(), warrant_code)
+        templates_by_key.setdefault(key, {})[buy_date] = lot
 
-    for key, lots in lots_by_key.items():
-        broker_code, warrant_code = key
-        item = item_map.get((broker_code, warrant_code))
+    rebuilt_event_lots = []
+
+    for key, templates_by_date in templates_by_key.items():
+        broker_code_upper, warrant_code = key
+        sample_template = next(iter(templates_by_date.values()))
+        broker_code = str(sample_template.get("券商代號", "")).strip()
+        item = _top15_find_item(item_map, broker_code, warrant_code)
 
         if not item:
-            item = item_map.get((broker_code, normalize_price_code(warrant_code)))
-
-        if not item:
+            for template in templates_by_date.values():
+                fallback = dict(template)
+                fallback["當日抵銷股數"] = 0.0
+                fallback["歷史FIFO扣除股數"] = max(
+                    float(fallback.get("原始股數", 0) or 0) - float(fallback.get("剩餘股數", 0) or 0),
+                    0.0,
+                )
+                fallback["完整FIFO歷史起日"] = ""
+                fallback["期初庫存股數"] = 0.0
+                fallback["未配對賣出股數"] = 0.0
+                fallback["FIFO完整狀態"] = "缺少分點歷史"
+                rebuilt_event_lots.append(fallback)
             continue
 
         df = item.get("df", pd.DataFrame())
-        if df is None or df.empty:
+        if df is None or df.empty or "日期" not in df.columns:
+            for template in templates_by_date.values():
+                fallback = dict(template)
+                fallback["當日抵銷股數"] = 0.0
+                fallback["歷史FIFO扣除股數"] = 0.0
+                fallback["完整FIFO歷史起日"] = ""
+                fallback["期初庫存股數"] = 0.0
+                fallback["未配對賣出股數"] = 0.0
+                fallback["FIFO完整狀態"] = "分點歷史為空"
+                rebuilt_event_lots.append(fallback)
             continue
 
-        lots.sort(key=lambda x: (x.get("買進日", "") or x.get("事件日", ""), x.get("事件日", ""), x.get("權證代號", "")))
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
-        df2 = df2.sort_values("日期").reset_index(drop=True)
+        df2 = df2[df2["日期"].map(lambda x: bool(parse_date(x)) and x <= target_text)].copy()
 
-        for row in df2.itertuples(index=False):
-            row_dict = row._asdict()
-            sell_date = normalize_date_str(row_dict.get("日期", ""))
-            sell_dt = parse_date(sell_date)
+        for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
+            if col not in df2.columns:
+                df2[col] = 0
+            df2[col] = pd.to_numeric(df2[col], errors="coerce").fillna(0.0)
 
-            if not sell_dt or sell_dt > target_dt:
-                continue
+        daily_map = {}
+        if not df2.empty:
+            grouped = df2.groupby("日期", as_index=False)[["買進股數", "賣出股數", "買進金額", "賣出金額"]].sum()
+            for row in grouped.itertuples(index=False):
+                row_dict = row._asdict()
+                date_text = normalize_date_str(row_dict.get("日期", ""))
+                daily_map[date_text] = {
+                    "買進股數": float(row_dict.get("買進股數", 0) or 0),
+                    "賣出股數": float(row_dict.get("賣出股數", 0) or 0),
+                    "買進金額": float(row_dict.get("買進金額", 0) or 0),
+                    "賣出金額": float(row_dict.get("賣出金額", 0) or 0),
+                    "合成事件列": False,
+                }
 
-            sell_qty_left = float(row_dict.get("賣出股數", 0) or 0)
-            if sell_qty_left <= 0:
-                continue
+        # 若舊快取缺少事件當日原始流水，才用事件 lot 建立合成買進列，並在稽核欄標記。
+        for buy_date, template in templates_by_date.items():
+            if buy_date not in daily_map or float(daily_map[buy_date].get("買進股數", 0) or 0) <= 0:
+                daily_map[buy_date] = {
+                    "買進股數": float(template.get("原始股數", 0) or 0),
+                    "賣出股數": float(daily_map.get(buy_date, {}).get("賣出股數", 0) or 0),
+                    "買進金額": float(template.get("原始成本", 0) or 0),
+                    "賣出金額": float(daily_map.get(buy_date, {}).get("賣出金額", 0) or 0),
+                    "合成事件列": True,
+                }
 
-            for lot in lots:
+        all_dates = sorted(d for d in daily_map if parse_date(d) and d <= target_text)
+        history_start = all_dates[0] if all_dates else ""
+        queue = []
+        unmatched_sell_total = 0.0
+        opening_inventory_qty = 0.0
+        opening_captured = not bool(window_start_text)
+
+        for date_text in all_dates:
+            if not opening_captured and date_text >= window_start_text:
+                opening_inventory_qty = sum(float(q.get("剩餘股數", 0) or 0) for q in queue)
+                opening_captured = True
+
+            day = daily_map[date_text]
+            sell_qty_left = max(float(day.get("賣出股數", 0) or 0), 0.0)
+
+            # 先扣前一日以前已存在的 FIFO 庫存。
+            for qlot in queue:
                 if sell_qty_left <= 0:
                     break
-
-                buy_dt = parse_date(lot.get("買進日") or lot.get("事件日", ""))
-                if not buy_dt or sell_dt <= buy_dt:
+                remaining_qty = float(qlot.get("剩餘股數", 0) or 0)
+                remaining_cost = float(qlot.get("剩餘成本", 0) or 0)
+                if remaining_qty <= 0:
                     continue
 
-                remaining_qty = float(lot.get("剩餘股數", 0) or 0)
-                remaining_cost = float(lot.get("剩餘成本", 0) or 0)
-                original_qty = float(lot.get("原始股數", 0) or 0)
-                original_cost = float(lot.get("原始成本", 0) or 0)
-
-                if remaining_qty <= 0 or remaining_cost <= 0 or original_qty <= 0 or original_cost <= 0:
-                    continue
-
-                avg_cost = original_cost / original_qty
                 alloc_qty = min(sell_qty_left, remaining_qty)
+                avg_cost = remaining_cost / remaining_qty if remaining_qty > 0 else 0.0
                 alloc_cost = min(remaining_cost, alloc_qty * avg_cost)
-
-                lot["剩餘股數"] = max(remaining_qty - alloc_qty, 0)
-                lot["剩餘成本"] = max(remaining_cost - alloc_cost, 0)
+                qlot["剩餘股數"] = max(remaining_qty - alloc_qty, 0.0)
+                qlot["剩餘成本"] = max(remaining_cost - alloc_cost, 0.0)
+                if qlot.get("_是TOP15事件lot"):
+                    qlot["歷史FIFO扣除股數"] = float(qlot.get("歷史FIFO扣除股數", 0) or 0) + alloc_qty
                 sell_qty_left -= alloc_qty
 
-    return position_lots
+            buy_qty = max(float(day.get("買進股數", 0) or 0), 0.0)
+            buy_amount = max(float(day.get("買進金額", 0) or 0), 0.0)
 
+            # 前一日庫存不足時，剩餘賣出抵銷當日買進。
+            same_day_offset_qty = min(sell_qty_left, buy_qty)
+            residual_buy_qty = max(buy_qty - same_day_offset_qty, 0.0)
+            residual_buy_cost = (
+                buy_amount * residual_buy_qty / buy_qty
+                if buy_qty > 0 and buy_amount > 0 and residual_buy_qty > 0
+                else 0.0
+            )
+            sell_qty_left -= same_day_offset_qty
+
+            if sell_qty_left > 0:
+                unmatched_sell_total += sell_qty_left
+
+            if residual_buy_qty <= 0 or residual_buy_cost <= 0:
+                continue
+
+            template = templates_by_date.get(date_text)
+            is_event_lot = template is not None
+
+            if template:
+                qlot = dict(template)
+                qlot["原始股數"] = residual_buy_qty
+                qlot["原始成本"] = residual_buy_cost
+                qlot["剩餘股數"] = residual_buy_qty
+                qlot["剩餘成本"] = residual_buy_cost
+                qlot["買進日"] = date_text
+                qlot["當日抵銷股數"] = same_day_offset_qty
+                qlot["歷史FIFO扣除股數"] = 0.0
+                qlot["_合成事件列"] = bool(day.get("合成事件列"))
+            else:
+                qlot = {
+                    "買進日": date_text,
+                    "原始股數": residual_buy_qty,
+                    "原始成本": residual_buy_cost,
+                    "剩餘股數": residual_buy_qty,
+                    "剩餘成本": residual_buy_cost,
+                    "當日抵銷股數": 0.0,
+                    "歷史FIFO扣除股數": 0.0,
+                    "_合成事件列": False,
+                }
+
+            qlot["_是TOP15事件lot"] = is_event_lot
+            queue.append(qlot)
+
+        if not opening_captured:
+            opening_inventory_qty = sum(float(q.get("剩餘股數", 0) or 0) for q in queue)
+
+        synthetic_used = any(bool(q.get("_合成事件列")) for q in queue if q.get("_是TOP15事件lot"))
+        if synthetic_used:
+            fifo_status = "歷史缺少事件買進列"
+        elif unmatched_sell_total > 0:
+            fifo_status = "歷史起點前可能有庫存"
+        else:
+            fifo_status = "OK"
+
+        for qlot in queue:
+            if not qlot.get("_是TOP15事件lot"):
+                continue
+            if float(qlot.get("剩餘股數", 0) or 0) <= 0 or float(qlot.get("剩餘成本", 0) or 0) <= 0:
+                continue
+
+            qlot.pop("_是TOP15事件lot", None)
+            qlot.pop("_合成事件列", None)
+            qlot["完整FIFO歷史起日"] = history_start
+            qlot["期初庫存股數"] = opening_inventory_qty
+            qlot["未配對賣出股數"] = unmatched_sell_total
+            qlot["FIFO完整狀態"] = fifo_status
+            rebuilt_event_lots.append(qlot)
+
+    rebuilt_event_lots.sort(
+        key=lambda x: (
+            str(x.get("券商代號", "")).upper(),
+            str(x.get("權證代號", "")),
+            normalize_date_str(x.get("買進日", "")),
+        )
+    )
+    return rebuilt_event_lots
 
 
 def ensure_top15_return_warrant_prices(
@@ -10186,8 +10429,15 @@ def ensure_top15_return_warrant_prices(
         )
         latest_dt = parse_date(latest_date) if latest_date else None
 
+        target_date_text = target_dt.strftime("%Y/%m/%d")
+        latest_date_text = normalize_date_str(latest_date) if latest_date else ""
+
         need_fetch = latest_price is None
-        if latest_dt and (target_dt - latest_dt).days > TOP15_PRICE_STALE_DAYS:
+        if TOP15_REQUIRE_TARGET_DATE_PRICE:
+            # 統計日報酬率只能使用統計日當日價格；快取只有較早日期時必須補抓。
+            if latest_date_text != target_date_text:
+                need_fetch = True
+        elif latest_dt and (target_dt - latest_dt).days > TOP15_PRICE_STALE_DAYS:
             need_fetch = True
 
         if need_fetch:
@@ -10242,6 +10492,231 @@ def ensure_top15_return_warrant_prices(
     )
 
 
+_TRADING_DATE_RESOLUTION_CACHE = {}
+_OFFICIAL_TRADING_DATE_STATUS_CACHE = {}
+
+
+def _market_rows_contain_records(rows):
+    if not isinstance(rows, list):
+        return False
+
+    for row in rows:
+        if isinstance(row, dict) and row:
+            return True
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            return True
+
+    return False
+
+
+def _market_payload_has_trading_rows(payload):
+    """判斷 TWSE／TPEx 單日行情回應是否含有實際交易資料列。"""
+    if not isinstance(payload, (dict, list)):
+        return False
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_text = str(key or "").strip().lower()
+
+            if re.fullmatch(r"data\d*", key_text) and _market_rows_contain_records(value):
+                return True
+
+            if key_text in {"tables", "table"} and isinstance(value, list):
+                for table in value:
+                    if not isinstance(table, dict):
+                        continue
+                    rows = table.get("data") or table.get("aaData") or table.get("rows")
+                    if _market_rows_contain_records(rows):
+                        return True
+
+            if isinstance(value, (dict, list)) and _market_payload_has_trading_rows(value):
+                return True
+
+        return False
+
+    for value in payload:
+        if isinstance(value, (dict, list)) and _market_payload_has_trading_rows(value):
+            return True
+
+    return False
+
+
+def _official_market_has_trading_data(target_dt):
+    """
+    用 TWSE／TPEx 官方盤後行情確認指定日期是否為已有完整資料的交易日。
+
+    回傳：
+    - True：至少一個官方市場已確認有當日交易資料。
+    - False：官方市場成功回應，但指定日期沒有交易資料。
+    - None：官方來源皆連線或解析失敗，交由本機快取備援。
+    """
+    if not target_dt:
+        return None
+
+    target_dt = datetime(target_dt.year, target_dt.month, target_dt.day)
+    target_key = target_dt.strftime("%Y/%m/%d")
+
+    if target_key in _OFFICIAL_TRADING_DATE_STATUS_CACHE:
+        return _OFFICIAL_TRADING_DATE_STATUS_CACHE[target_key]
+
+    if target_dt.weekday() >= 5:
+        _OFFICIAL_TRADING_DATE_STATUS_CACHE[target_key] = False
+        return False
+
+    endpoints = [
+        (
+            "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+            {
+                "response": "json",
+                "date": target_dt.strftime("%Y%m%d"),
+                "type": "ALLBUT0999",
+            },
+        ),
+        (
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+            {
+                "date": target_dt.strftime("%Y/%m/%d"),
+                "response": "json",
+            },
+        ),
+    ]
+
+    successful_results = []
+
+    for url, params in endpoints:
+        try:
+            session = get_thread_session()
+            response = session.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=(5, 15),
+            )
+            response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except Exception:
+                payload = json.loads(response.content.decode("utf-8"))
+
+            has_rows = _market_payload_has_trading_rows(payload)
+            successful_results.append(bool(has_rows))
+
+            if has_rows:
+                _OFFICIAL_TRADING_DATE_STATUS_CACHE[target_key] = True
+                return True
+        except Exception:
+            continue
+
+    if successful_results:
+        _OFFICIAL_TRADING_DATE_STATUS_CACHE[target_key] = False
+        return False
+
+    return None
+
+
+def _latest_cached_trading_date_on_or_before(target_dt):
+    """官方行情無法使用時，從既有價格／分點歷史快取找最近實際資料日。"""
+    if not target_dt:
+        return None
+
+    candidates = []
+    latest_prescan_dt = globals().get("PRESCAN_LATEST_ACTIVITY_DATE")
+    if isinstance(latest_prescan_dt, datetime) and latest_prescan_dt <= target_dt:
+        candidates.append(datetime(latest_prescan_dt.year, latest_prescan_dt.month, latest_prescan_dt.day))
+
+    for path_name in ("PRICE_CACHE_PATH", "HISTORY_CACHE_PATH"):
+        path_value = globals().get(path_name)
+        if not path_value or not os.path.exists(path_value):
+            continue
+
+        try:
+            df = pd.read_csv(
+                path_value,
+                usecols=lambda col: str(col).strip() == "日期",
+                dtype=str,
+                encoding=globals().get("CACHE_ENCODING", "utf-8-sig"),
+                low_memory=False,
+            )
+        except Exception:
+            continue
+
+        if df is None or df.empty or "日期" not in df.columns:
+            continue
+
+        parsed = pd.to_datetime(
+            df["日期"].astype(str).str.replace("/", "-", regex=False),
+            errors="coerce",
+        ).dropna()
+        parsed = parsed[parsed <= pd.Timestamp(target_dt)]
+
+        if not parsed.empty:
+            latest = parsed.max().to_pydatetime()
+            candidates.append(datetime(latest.year, latest.month, latest.day))
+
+    return max(candidates) if candidates else None
+
+
+def resolve_latest_trading_date_on_or_before(target_date=None):
+    """
+    將指定日期解析成「該日或之前最近一個已有官方盤後資料的交易日」。
+
+    - 假日／週末執行會自動回退到最近交易日。
+    - 當日盤後資料尚未發布時，會使用前一個已完成交易日。
+    - 官方來源暫時失敗時，改由既有價格／分點歷史快取判斷。
+    """
+    if isinstance(target_date, datetime):
+        requested_dt = target_date
+    elif hasattr(target_date, "to_pydatetime"):
+        try:
+            requested_dt = target_date.to_pydatetime()
+        except Exception:
+            requested_dt = parse_date(target_date) or datetime.today()
+    else:
+        requested_dt = parse_date(target_date) or datetime.today()
+
+    today_dt = datetime.today()
+
+    if requested_dt.date() > today_dt.date():
+        requested_dt = today_dt
+
+    requested_dt = datetime(requested_dt.year, requested_dt.month, requested_dt.day)
+    requested_key = requested_dt.strftime("%Y/%m/%d")
+
+    if requested_key in _TRADING_DATE_RESOLUTION_CACHE:
+        return _TRADING_DATE_RESOLUTION_CACHE[requested_key]
+
+    resolved_dt = None
+
+    # 31 個日曆日足以涵蓋春節等連續休市區間。
+    for offset in range(32):
+        candidate_dt = requested_dt - timedelta(days=offset)
+        if candidate_dt.weekday() >= 5:
+            continue
+
+        market_status = _official_market_has_trading_data(candidate_dt)
+        if market_status is True:
+            resolved_dt = candidate_dt
+            break
+
+    if resolved_dt is None:
+        resolved_dt = _latest_cached_trading_date_on_or_before(requested_dt)
+
+    if resolved_dt is None:
+        # 官方與本機快取都暫時不可用時，至少排除星期六、星期日。
+        resolved_dt = requested_dt
+        while resolved_dt.weekday() >= 5:
+            resolved_dt -= timedelta(days=1)
+
+    resolved_text = resolved_dt.strftime("%Y/%m/%d")
+    _TRADING_DATE_RESOLUTION_CACHE[requested_key] = resolved_text
+
+    if resolved_text != requested_key:
+        print(f"  📅 統計日自動回退：{requested_key} → {resolved_text}（最近可用交易日）")
+
+    return resolved_text
+
+
 def normalize_top15_target_date(target_date=None):
     raw = str(target_date or TOP15_TARGET_DATE or "").strip()
 
@@ -10249,9 +10724,9 @@ def normalize_top15_target_date(target_date=None):
         dt = parse_date(raw)
         if not dt:
             raise RuntimeError(f"TOP15_TARGET_DATE 格式錯誤，請使用 YYYY/MM/DD 或 YYYY-MM-DD：{raw}")
-        return dt.strftime("%Y/%m/%d")
+        return resolve_latest_trading_date_on_or_before(dt)
 
-    return datetime.today().strftime("%Y/%m/%d")
+    return resolve_latest_trading_date_on_or_before(datetime.today())
 
 
 def top15_safe_float(value, default=0.0):
@@ -10316,7 +10791,15 @@ def build_top15_position_detail_and_consensus_rows(
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     recent_dates = collect_top15_return_recent_dates(
-        a_events, b_events, c_events, d_events, e_events, TOP15_LOOKBACK_TRADING_DAYS
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        TOP15_LOOKBACK_TRADING_DAYS,
+        item_map=item_map,
+        price_cache=price_cache,
+        target_date=target_date,
     )
 
     if not recent_dates:
@@ -10333,7 +10816,12 @@ def build_top15_position_detail_and_consensus_rows(
         print("  ⚠️ TOP15固定資料集：沒有可用買超 lot")
         return [], []
 
-    position_lots = apply_sales_to_top15_return_lots(position_lots, item_map, target_date)
+    position_lots = apply_sales_to_top15_return_lots(
+        position_lots,
+        item_map,
+        target_date,
+        window_start=min(recent_dates),
+    )
     position_lots = [
         lot for lot in position_lots
         if top15_safe_float(lot.get("剩餘成本", 0)) > 0 and top15_safe_float(lot.get("剩餘股數", 0)) > 0
@@ -10402,10 +10890,13 @@ def build_top15_position_detail_and_consensus_rows(
 
         if latest_price is None:
             price_status = "缺價格"
+        elif TOP15_REQUIRE_TARGET_DATE_PRICE and normalize_date_str(latest_price_date) != target_date:
+            # 保留實際最後價格日期供稽核，但不使用非統計日價格估值。
+            price_status = "非統計日價格"
+            latest_price = None
         elif latest_dt and target_dt and (target_dt - latest_dt).days > TOP15_PRICE_STALE_DAYS:
             price_status = "價格過舊"
             latest_price = None
-            latest_price_date = ""
 
         if latest_price is None:
             market_value = ""
@@ -10414,6 +10905,8 @@ def build_top15_position_detail_and_consensus_rows(
             return_text = "-"
             if price_status == "缺價格":
                 price_status = "未造市不計報酬率"
+            elif price_status == "非統計日價格":
+                price_status = "無統計日價格不計報酬率"
             elif price_status == "價格過舊":
                 price_status = "價格過舊不計報酬率"
 
@@ -10439,6 +10932,15 @@ def build_top15_position_detail_and_consensus_rows(
             "統計日期": target_date,
             "統計期間": period_text,
             "有效交易日數": len(recent_dates),
+            "交易日區間起日": min(recent_dates),
+            "交易日區間迄日": max(recent_dates),
+            "事件是否位於40日內": "是",
+            "完整FIFO歷史起日": normalize_date_str(lot.get("完整FIFO歷史起日", "")),
+            "期初庫存股數": round(top15_safe_float(lot.get("期初庫存股數", 0)), 0),
+            "同日抵銷股數": round(top15_safe_float(lot.get("當日抵銷股數", 0)), 0),
+            "歷史FIFO扣除股數": round(top15_safe_float(lot.get("歷史FIFO扣除股數", 0)), 0),
+            "未配對賣出股數": round(top15_safe_float(lot.get("未配對賣出股數", 0)), 0),
+            "FIFO完整狀態": str(lot.get("FIFO完整狀態", "OK")).strip() or "OK",
             "分點": str(lot.get("分點", "")).strip(),
             "分點名稱": str(lot.get("分點名稱", "")).strip(),
             "券商代號": str(lot.get("券商代號", "")).strip(),
@@ -10502,6 +11004,11 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     """
     由「快取_TOP15部位明細」加總出「快取_TOP15共識淨買超」。
     這裡不再讀 A/B/C/D/E 或分點歷史，確保圖片用資料只來自同一份固定明細。
+
+    零碎部位規則：
+    - 先依「標的股＋分點」完整加總剩餘部位。
+    - 分點合計剩餘成本低於 TOP15_MIN_BROKER_REMAINING_COST 時，
+      僅保留在部位明細，不納入共識 TOP15 的金額、排名、報酬率與參與分點數。
     """
     if not detail_rows:
         return []
@@ -10511,68 +11018,27 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         or get_result_data_scope()
     ).strip()
 
-    agg = {}
+    # 第一階段先依「標的股＋分點」彙總，避免逐 lot 套門檻時誤刪
+    # 兩筆各 6 萬、合計其實達 12 萬的有效分點部位。
+    broker_agg = {}
 
     for row in detail_rows:
         underlying = str(row.get("標的股", "")).strip()
         if not underlying:
             continue
 
-        key = underlying
-        rec = agg.setdefault(key, {
+        broker = str(row.get("分點", "")).strip()
+        broker_name = str(row.get("分點名稱", "")).strip()
+        broker_code = str(row.get("券商代號", "")).strip()
+        broker_key = (underlying, broker, broker_name, broker_code)
+
+        broker_rec = broker_agg.setdefault(broker_key, {
             "資料範圍": row.get("資料範圍", scope),
             "統計日期": row.get("統計日期", ""),
             "統計期間": row.get("統計期間", ""),
             "有效交易日數": row.get("有效交易日數", ""),
             "標的股": underlying,
             "標的名稱": str(row.get("標的名稱", "")).strip(),
-            "淨買超成本": 0.0,
-            "可估成本": 0.0,
-            "缺價格成本": 0.0,
-            "目前市值": 0.0,
-            "未實現損益": 0.0,
-            "分點": {},
-            "事件集合": set(),
-            "權證集合": set(),
-            "權證清單": [],
-            "最新價格日期集合": set(),
-            "資料狀態": "OK",
-        })
-
-        remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
-        market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
-        pnl = top15_safe_float(row.get("未實現損益", 0), 0.0) if row.get("未實現損益", "") != "" else 0.0
-        price_status = str(row.get("價格狀態", "")).strip()
-        broker = str(row.get("分點", "")).strip()
-        broker_name = str(row.get("分點名稱", "")).strip()
-        broker_code = str(row.get("券商代號", "")).strip()
-        event_code = str(row.get("事件", "")).strip()
-        warrant_code = str(row.get("權證代號", "")).strip()
-        warrant_name = str(row.get("權證名稱", "")).strip()
-        latest_price_date = str(row.get("最新價格日期", "")).strip()
-
-        rec["淨買超成本"] += remaining_cost
-
-        if price_status == "OK":
-            rec["可估成本"] += remaining_cost
-            rec["目前市值"] += market_value
-            rec["未實現損益"] += pnl
-        else:
-            rec["缺價格成本"] += remaining_cost
-            rec["資料狀態"] = "部分報酬率未估"
-
-        if event_code:
-            rec["事件集合"].add(event_code)
-        if warrant_code:
-            rec["權證集合"].add(warrant_code)
-            warrant_label = f"{warrant_code} {warrant_name}".strip()
-            if warrant_label and warrant_label not in rec["權證清單"]:
-                rec["權證清單"].append(warrant_label)
-        if latest_price_date:
-            rec["最新價格日期集合"].add(latest_price_date)
-
-        broker_key = (broker, broker_name, broker_code)
-        broker_rec = rec["分點"].setdefault(broker_key, {
             "分點": broker,
             "分點名稱": broker_name,
             "券商代號": broker_code,
@@ -10583,7 +11049,21 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "未實現損益": 0.0,
             "事件集合": set(),
             "權證集合": set(),
+            "權證清單": [],
+            "最新價格日期集合": set(),
+            "FIFO狀態集合": set(),
         })
+
+        remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
+        market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
+        pnl = top15_safe_float(row.get("未實現損益", 0), 0.0) if row.get("未實現損益", "") != "" else 0.0
+        price_status = str(row.get("價格狀態", "")).strip()
+        event_code = str(row.get("事件", "")).strip()
+        warrant_code = str(row.get("權證代號", "")).strip()
+        warrant_name = str(row.get("權證名稱", "")).strip()
+        latest_price_date = str(row.get("最新價格日期", "")).strip()
+        fifo_status = str(row.get("FIFO完整狀態", "OK")).strip() or "OK"
+
         broker_rec["淨買超成本"] += remaining_cost
         if price_status == "OK":
             broker_rec["可估成本"] += remaining_cost
@@ -10591,13 +11071,91 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             broker_rec["未實現損益"] += pnl
         else:
             broker_rec["缺價格成本"] += remaining_cost
+
         if event_code:
             broker_rec["事件集合"].add(event_code)
         if warrant_code:
             broker_rec["權證集合"].add(warrant_code)
+            warrant_label = f"{warrant_code} {warrant_name}".strip()
+            if warrant_label and warrant_label not in broker_rec["權證清單"]:
+                broker_rec["權證清單"].append(warrant_label)
+        if latest_price_date:
+            broker_rec["最新價格日期集合"].add(latest_price_date)
+        if fifo_status and fifo_status != "OK":
+            broker_rec["FIFO狀態集合"].add(fifo_status)
+
+    # 第二階段套用「分點＋標的」合計門檻，再建立標的股總表。
+    agg = {}
+    filtered_broker_count = 0
+    filtered_broker_cost = 0.0
+
+    for broker_rec in broker_agg.values():
+        broker_cost = float(broker_rec.get("淨買超成本", 0) or 0)
+        if broker_cost < TOP15_MIN_BROKER_REMAINING_COST:
+            filtered_broker_count += 1
+            filtered_broker_cost += broker_cost
+            continue
+
+        underlying = broker_rec["標的股"]
+        rec = agg.setdefault(underlying, {
+            "資料範圍": broker_rec.get("資料範圍", scope),
+            "統計日期": broker_rec.get("統計日期", ""),
+            "統計期間": broker_rec.get("統計期間", ""),
+            "有效交易日數": broker_rec.get("有效交易日數", ""),
+            "標的股": underlying,
+            "標的名稱": broker_rec.get("標的名稱", ""),
+            "淨買超成本": 0.0,
+            "可估成本": 0.0,
+            "缺價格成本": 0.0,
+            "目前市值": 0.0,
+            "未實現損益": 0.0,
+            "分點": {},
+            "事件集合": set(),
+            "權證集合": set(),
+            "權證清單": [],
+            "最新價格日期集合": set(),
+            "FIFO狀態集合": set(),
+            "資料狀態": "OK",
+        })
+
+        rec["淨買超成本"] += broker_cost
+        rec["可估成本"] += float(broker_rec.get("可估成本", 0) or 0)
+        rec["缺價格成本"] += float(broker_rec.get("缺價格成本", 0) or 0)
+        rec["目前市值"] += float(broker_rec.get("目前市值", 0) or 0)
+        rec["未實現損益"] += float(broker_rec.get("未實現損益", 0) or 0)
+        rec["事件集合"].update(broker_rec["事件集合"])
+        rec["權證集合"].update(broker_rec["權證集合"])
+        rec["最新價格日期集合"].update(broker_rec["最新價格日期集合"])
+        rec["FIFO狀態集合"].update(broker_rec.get("FIFO狀態集合", set()))
+        for warrant_label in broker_rec["權證清單"]:
+            if warrant_label not in rec["權證清單"]:
+                rec["權證清單"].append(warrant_label)
+
+        if float(broker_rec.get("缺價格成本", 0) or 0) > 0:
+            rec["資料狀態"] = "部分報酬率未估"
+        if broker_rec.get("FIFO狀態集合"):
+            fifo_warning = "／".join(sorted(broker_rec["FIFO狀態集合"]))
+            rec["資料狀態"] = (
+                f"{rec['資料狀態']}；FIFO:{fifo_warning}"
+                if rec["資料狀態"] != "OK"
+                else f"FIFO:{fifo_warning}"
+            )
+
+        broker_identity = (
+            broker_rec["分點"],
+            broker_rec["分點名稱"],
+            broker_rec["券商代號"],
+        )
+        rec["分點"][broker_identity] = broker_rec
+
+    if filtered_broker_count > 0:
+        print(
+            f"  ℹ️ TOP15零碎分點部位已排除：{filtered_broker_count:,} 筆｜"
+            f"合計 {filtered_broker_cost:,.0f} 元｜"
+            f"門檻 {TOP15_MIN_BROKER_REMAINING_COST:,.0f} 元"
+        )
 
     rows = []
-
     sorted_records = sorted(
         agg.values(),
         key=lambda r: (float(r.get("淨買超成本", 0) or 0), float(r.get("可估成本", 0) or 0)),
@@ -10679,13 +11237,15 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
 
     return rows
 
-
 def write_top15_position_detail_sheet(wb, detail_rows):
     """寫入 TOP15 部位明細固定資料集。"""
     ws = wb.create_sheet(TOP15_POSITION_DETAIL_SHEET)
 
     headers = [
         "資料範圍", "統計日期", "統計期間", "有效交易日數",
+        "交易日區間起日", "交易日區間迄日", "事件是否位於40日內",
+        "完整FIFO歷史起日", "期初庫存股數", "同日抵銷股數",
+        "歷史FIFO扣除股數", "未配對賣出股數", "FIFO完整狀態",
         "分點", "分點名稱", "券商代號",
         "標的股", "標的名稱",
         "事件", "事件類型", "事件日", "買進日",
@@ -10703,7 +11263,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
     for row in detail_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 12, 24, 12, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 14, 14, 10, 12, 10, 10, 44, 16, 20]
+    col_widths = [12, 12, 24, 12, 12, 12, 14, 14, 12, 12, 14, 14, 18, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 14, 14, 10, 12, 10, 10, 44, 16, 20]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="價格狀態")
 
 
@@ -15560,9 +16120,9 @@ def normalize_price_prefetch_target_date(target_date=None):
     if raw:
         dt = parse_date(raw)
         if dt:
-            return dt.strftime("%Y/%m/%d")
+            return resolve_latest_trading_date_on_or_before(dt)
 
-    return datetime.today().strftime("%Y/%m/%d")
+    return resolve_latest_trading_date_on_or_before(datetime.today())
 
 
 def load_price_prefetch_state():
@@ -15810,12 +16370,11 @@ def price_cache_has_required_10d_underlying_target_prices(history_cache_df, cand
 
 
 def has_today_market_data_from_prescan(target_date=None):
-    """API4 是否已出現任一有效的今日市場資料列，不限定追蹤分點。"""
+    """API4 是否已出現任一有效的本次目標交易日市場資料列，不限定追蹤分點。"""
     target_date = normalize_price_prefetch_target_date(target_date)
-    today_s = datetime.today().strftime("%Y/%m/%d")
+    prescan_target_date = current_prescan_target_date()
 
-    if target_date != today_s:
-        # 目前 prescan 掃描的結束日固定為今天；自訂其他日期時不做錯誤推論。
+    if target_date != prescan_target_date:
         return False
 
     return bool(PRESCAN_MARKET_TODAY_DATA_FOUND)
