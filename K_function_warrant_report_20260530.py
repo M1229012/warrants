@@ -4123,18 +4123,25 @@ def build_key_points(ctx, stock_name: str):
 # ============================================================
 
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
-NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
+NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "6"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
 NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "125"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "120"))
-NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞 detail 驗收：必須同時包含具體事件與營運意涵／後續觀察。
 NEWS_SUMMARY_DETAIL_MIN_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS", "40"))
 NEWS_SUMMARY_DETAIL_MAX_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_DETAIL_MAX_CHARS", "70"))
 # 驗證後少於 2 點、但仍有至少 3 篇合格文章時，額外嘗試一次不同事件補點。
 NEWS_SUPPLEMENT_TRIGGER_POINTS = int(os.getenv("WARRANT_NEWS_SUPPLEMENT_TRIGGER_POINTS", "2"))
 NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES", "3"))
+NEWS_GEMINI_REPAIR_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_REPAIR_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_GEMINI_SUPPLEMENT_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
 NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v15_arabic_digits_news").strip() or "v15_arabic_digits_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -4144,7 +4151,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v30_multisource_finmind_grounded"
+    internal_version = "validated_v31_parallel_six_source_fast"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -4152,8 +4159,6 @@ NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
 NEWS_REQUIRE_ARTICLE_BODY = os.getenv("WARRANT_NEWS_REQUIRE_BODY", "0").strip().lower() not in ("0", "false", "no", "off")
 NEWS_RSS_DESCRIPTION_FALLBACK = os.getenv("WARRANT_NEWS_RSS_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_OPENAI_ENABLE = os.getenv("WARRANT_NEWS_OPENAI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_OPENAI_MODEL = os.getenv("WARRANT_NEWS_OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
 # Gemini / LLM 設定：GitHub Actions 請設定 Repository Secret / Variable：WARRANTS_API_KEY
 GEMINI_ENABLE = os.getenv("WARRANT_GEMINI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
@@ -4166,7 +4171,7 @@ GEMINI_STRUCTURED_OUTPUT_ENABLE = os.getenv(
     "WARRANT_GEMINI_STRUCTURED_OUTPUT_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
-NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "12"))
+NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 WEEKLY_GEMINI_REPAIR_ENABLE = os.getenv(
@@ -4184,8 +4189,8 @@ WEEKLY_KEYPOINT_STYLE_VERSION = os.getenv(
 ).strip() or "validated_v24_json_grounded_previous_week"
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
 # 預設提高搜尋母體，避免部分冷門股因前幾篇原文被擋或 RSS 摘要太短而沒有新聞輸出。
-NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "36"))
-NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "10"))
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
+NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "4"))
 NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
 NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
 # 極速新聞模式：預設開啟。只使用 Google News RSS 的標題 / 摘要 / URL，不進新聞網站抓原文。
@@ -4201,33 +4206,29 @@ NEWS_FAST_HYBRID_BODY_FETCH_ENABLE = os.getenv(
 ).strip().lower() in ("1", "true", "yes", "on")
 NEWS_FAST_HYBRID_BODY_FETCH_TOPK = max(
     0,
-    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK", "3")),
+    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK", "2")),
 )
-NEWS_FAST_HYBRID_BODY_FETCH_WORKERS = max(
-    1,
-    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_WORKERS", "3")),
-)
-# 即使環境變數設得過大，混合補抓仍強制限制單篇最多 5 秒、整批最多 10 秒，
+# 即使環境變數設得過大，混合補抓仍強制限制單篇最多 4 秒、整批最多 6 秒，
 # 並限制下載大小，避免慢速串流或超大網頁拖住 GitHub Actions 數分鐘。
 NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT = min(
-    5.0,
+    4.0,
     max(
         1.0,
-        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT", "4")),
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT", "3")),
     ),
 )
 NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT = min(
-    10.0,
+    6.0,
     max(
         1.0,
-        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT", "8")),
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT", "5")),
     ),
 )
 NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES = max(
     32768,
     min(
         524288,
-        int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES", "196608")),
+        int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES", "131072")),
     ),
 )
 # 極速模式最多建立幾篇 RSS 新聞素材；預設等於真正會送進 Gemini 的篇數，避免掃太多新聞拖慢速度。
@@ -4255,12 +4256,35 @@ NEWS_MULTI_SOURCE_ENABLE = os.getenv("WARRANT_NEWS_MULTI_SOURCE_ENABLE", "1").st
 NEWS_YAHOO_RSS_ENABLE = os.getenv("WARRANT_NEWS_YAHOO_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_BING_RSS_ENABLE = os.getenv("WARRANT_NEWS_BING_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_MONEYDJ_SEARCH_ENABLE = os.getenv("WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "12"))
-NEWS_MONEYDJ_BODY_FETCH_LIMIT = int(os.getenv("WARRANT_NEWS_MONEYDJ_BODY_FETCH_LIMIT", "5"))
+NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "8"))
 NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
     "WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT",
-    str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 24)),
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 12)),
 ))
+# 六個來源平行抓取；個別來源失敗或逾時只略過該來源。
+NEWS_SOURCE_FETCH_WORKERS = max(1, int(os.getenv("WARRANT_NEWS_SOURCE_FETCH_WORKERS", "6")))
+NEWS_SOURCE_BATCH_TIMEOUT = min(
+    15.0,
+    max(3.0, float(os.getenv("WARRANT_NEWS_SOURCE_BATCH_TIMEOUT", "9"))),
+)
+# 原始新聞候選短期快取與 Gemini 摘要快取分離。
+# refresh_news_summary=1 只重跑 Gemini；剛抓過的六來源候選仍可重用，避免重複等待網站。
+NEWS_RAW_CACHE_ENABLE = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_RAW_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.getenv("WARRANT_NEWS_RAW_CACHE_TTL_SECONDS", "1800")),
+)
+NEWS_RAW_CACHE_DIR = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_DIR",
+    os.path.join(LLM_CACHE_DIR, "raw_news"),
+).strip() or os.path.join(LLM_CACHE_DIR, "raw_news")
+NEWS_RAW_CACHE_FORCE_REFRESH = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_FORCE_REFRESH",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
 # 新聞最低素材／顯示目標：正常情況至少整理 2 則不同事件；
 # 只有所有來源與 7/14/30 日範圍都查完後仍只有一個事件，才允許只顯示 1 則。
 NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "2")))
@@ -4275,11 +4299,15 @@ FINMIND_NEWS_ENABLE = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 FINMIND_NEWS_WORKERS = max(1, int(os.getenv("FINMIND_NEWS_WORKERS", "8")))
 FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", "30")))
+FINMIND_NEWS_LOOKBACK_STAGES = os.getenv(
+    "FINMIND_NEWS_LOOKBACK_STAGES",
+    "7,14,30",
+).strip() or "7,14,30"
 FINMIND_NEWS_REQUIRE_DIRECT_TARGET = os.getenv(
     "WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET",
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
-NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "12")))
+NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "8")))
 NEWS_MOPS_ENDPOINTS = [
     ("上市重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"),
     ("上櫃重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_O"),
@@ -4586,50 +4614,6 @@ def _can_use_news_title_as_fact(title: str) -> bool:
         s,
         re.I,
     ))
-
-
-def _looks_like_title_copy_or_meta_noise(point: str, records: list[dict] | None = None) -> bool:
-    """過濾直接複製新聞標題或混入日期／來源等中繼資訊的重點。"""
-    s = _normalize_news_text(point)
-    if not s:
-        return True
-    meta_patterns = [
-        r'(^|[｜：:；;。])\s*(標題|來源|日期)[:：]',
-        r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\b',
-        r'\bGMT\b',
-        r'^【\d{1,2}:\d{2}[^】]*】',
-        r'即時新聞',
-    ]
-    if any(re.search(p, s, re.I) for p in meta_patterns):
-        return True
-
-    # 此函式位於模組層級，不能呼叫 plot_weekly_report() 內部才定義的
-    # _parse_status_fields()。這裡只解析新聞重點會使用的欄位，避免 NameError。
-    field_names = ['結果', '說明', '重點', '依據', '觀察', '影響']
-    body_parts = []
-    for field_name in field_names:
-        pattern = (
-            rf'(?:^|｜){field_name}[:：]'
-            rf'(.*?)(?=｜(?:結果|說明|重點|依據|觀察|影響|分類|面向|方向|tone)[:：]|$)'
-        )
-        match = re.search(pattern, s, flags=re.DOTALL)
-        if match:
-            value = _normalize_news_text(match.group(1)).strip()
-            if value:
-                body_parts.append(value)
-
-    content = _strip_news_meta_noise('。'.join(body_parts) or s)
-    if not content:
-        return True
-    if records:
-        for rec in records or []:
-            title = _clean_news_title(rec.get('title', ''))
-            if not title:
-                continue
-            overlap = _char_overlap_ratio(content, title)
-            if overlap >= 0.68 and len(content) <= len(title) + 32:
-                return True
-    return False
 
 
 def _looks_like_news_headline(text: str, title: str = "") -> bool:
@@ -5133,11 +5117,6 @@ def _build_google_news_queries(stock_code: str, stock_name: str, days: int) -> L
             out.append((label, q))
             seen.add(q)
     return out
-
-
-def _is_enough_usable_news(articles: List[dict]) -> bool:
-    usable = sum(1 for a in articles if a.get("body_ok") or a.get("fallback_ok"))
-    return usable >= max(1, int(NEWS_GOOGLE_MIN_USABLE_ARTICLES))
 
 
 def _make_google_news_rss_url(query: str) -> str:
@@ -5691,23 +5670,36 @@ def fetch_yahoo_finance_rss_articles(stock_code: str, stock_name: str, max_items
     aliases = _get_news_aliases(stock_code, stock_name)
     articles = []
     seen = set()
-    for family, url in urls:
-        for item in _read_rss_items(url, family, max_items=max(30, max_items * 5)):
-            combined = f"{item.get('title', '')} {item.get('description', '')}"
-            if aliases and not any(a and a in combined for a in aliases):
-                continue
-            key = _article_seen_key(item.get("title", ""), item.get("url", ""))
-            if key and key in seen:
-                continue
-            article = _build_external_rss_article(item, stock_code, stock_name, max_days, "yahoo_finance")
-            if article is None:
-                continue
-            if key:
-                seen.add(key)
-            articles.append(article)
+
+    feed_results = []
+    with ThreadPoolExecutor(max_workers=min(3, len(urls))) as executor:
+        future_map = {
+            executor.submit(_read_rss_items, url, family, max(20, max_items * 3)): family
+            for family, url in urls
+        }
+        for future in as_completed(future_map):
+            try:
+                feed_results.extend(future.result() or [])
+            except Exception as exc:
+                print(f"⚠️ {future_map[future]} RSS 工作失敗：{exc}")
+
+    for item in feed_results:
+        combined = f"{item.get('title', '')} {item.get('description', '')}"
+        if aliases and not any(a and a in combined for a in aliases):
+            continue
+        key = _article_seen_key(item.get("title", ""), item.get("url", ""))
+        if key and key in seen:
+            continue
+        article = _build_external_rss_article(item, stock_code, stock_name, max_days, "yahoo_finance")
+        if article is None:
+            continue
+        if key:
+            seen.add(key)
+        articles.append(article)
     articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
     print(f"📰 Yahoo 股市 RSS：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
     return articles[:max(1, int(max_items))]
+
 
 
 def fetch_bing_news_rss_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
@@ -5805,70 +5797,77 @@ def fetch_moneydj_news_articles(stock_code: str, stock_name: str, max_items: int
     if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MONEYDJ_SEARCH_ENABLE:
         return []
     queries = []
-    for q in [stock_name, stock_code]:
-        q = str(q or "").strip()
-        if q and q not in queries:
-            queries.append(q)
-    candidates = []
-    seen = set()
+    for query in [stock_name, stock_code]:
+        query = str(query or "").strip()
+        if query and query not in queries:
+            queries.append(query)
     headers = {
         "User-Agent": HDR["User-Agent"],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    for q in queries:
+
+    def fetch_query(query: str) -> List[dict]:
         url = "https://www.moneydj.com/kmdj/search/list.aspx?" + urllib.parse.urlencode({
             "_QueryType_": "NW",
-            "_Query_": q,
+            "_Query_": query,
         })
         try:
-            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
-            r.raise_for_status()
-            for c in _extract_moneydj_search_candidates(r.text, stock_code, stock_name):
-                key = _article_seen_key(c.get("title", ""), c.get("url", ""))
+            response = get_thread_session().get(
+                url,
+                headers=headers,
+                timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)),
+            )
+            response.raise_for_status()
+            return _extract_moneydj_search_candidates(response.text, stock_code, stock_name)
+        except Exception as exc:
+            print(f"⚠️ MoneyDJ 新聞搜尋失敗：{query}｜{exc}")
+            return []
+
+    candidates = []
+    seen = set()
+    with ThreadPoolExecutor(max_workers=max(1, min(2, len(queries)))) as executor:
+        future_map = {executor.submit(fetch_query, query): query for query in queries}
+        for future in as_completed(future_map):
+            for candidate in future.result() or []:
+                key = _article_seen_key(candidate.get("title", ""), candidate.get("url", ""))
                 if key and key in seen:
                     continue
                 if key:
                     seen.add(key)
-                candidates.append(c)
-        except Exception as e:
-            print(f"⚠️ MoneyDJ 新聞搜尋失敗：{q}｜{e}")
+                candidates.append(candidate)
 
     articles = []
     max_days = max(_get_news_search_day_list())
-    for candidate in candidates[:max(1, int(NEWS_MONEYDJ_BODY_FETCH_LIMIT))]:
+    candidate_limit = max(max_items * 2, max_items, NEWS_SUMMARY_MAX_POINTS)
+    for candidate in candidates[:candidate_limit]:
         title = candidate.get("title", "")
-        body = _fetch_article_body(candidate.get("url", ""))
-        body_ok = (
-            _is_valid_article_body(body, title=title, description=candidate.get("description", ""))
-            and _passes_news_quality_gate(title, body, stock_code, stock_name)
+        description = _normalize_news_text(candidate.get("description", ""))
+        fallback_ok = _passes_news_quality_gate(title, description, stock_code, stock_name)
+        if not fallback_ok:
+            continue
+        content = _build_fast_rss_news_content(
+            title,
+            description,
+            source="MoneyDJ",
+            published=candidate.get("published", ""),
         )
-        if body_ok:
-            content = body
-            fallback_ok = False
-            content_source = "moneydj_article"
-        else:
-            description = candidate.get("description", "")
-            fallback_ok = _passes_news_quality_gate(title, description, stock_code, stock_name)
-            if not fallback_ok:
-                continue
-            content = _build_fast_rss_news_content(title, description, source="MoneyDJ", published=candidate.get("published", ""))
-            content_source = "moneydj_search"
         article = {
             **candidate,
             "content": content,
-            "body_ok": bool(body_ok),
-            "fallback_ok": bool(fallback_ok),
-            "content_source": content_source,
-            "body_length": len(content),
+            "body_ok": False,
+            "fallback_ok": True,
+            "content_source": "moneydj_search",
+            "body_length": 0,
             "search_days": int(max_days),
             "query_stage": "MoneyDJ關鍵字搜尋",
         }
         article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
         articles.append(article)
-    articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
-    print(f"📰 MoneyDJ 新聞搜尋：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    articles = sorted(articles, key=lambda article: -int(article.get("relevance_score", 0) or 0))
+    print(f"📰 MoneyDJ 新聞搜尋：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜前段不抓原文")
     return articles[:max(1, int(max_items))]
+
 
 
 
@@ -5936,7 +5935,7 @@ def _mops_announcement_has_information_value(title: str, detail: str) -> bool:
 
 
 def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
-    """從公開資訊觀測站每日重大訊息補充公司直接公告；來源失敗不影響週報。"""
+    """從公開資訊觀測站每日重大訊息補充公司直接公告；兩市場平行讀取。"""
     if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MOPS_ENABLE:
         return []
     stock_key = _clean_code(stock_code)
@@ -5949,17 +5948,31 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "zh-TW,zh;q=0.9",
     }
-    for market_name, url in NEWS_MOPS_ENDPOINTS:
-        try:
-            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-        except Exception as e:
-            print(f"⚠️ MOPS {market_name}讀取失敗：{e}")
-            continue
 
+    def fetch_endpoint(market_name: str, url: str):
+        try:
+            response = get_thread_session().get(
+                url,
+                headers=headers,
+                timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)),
+            )
+            response.raise_for_status()
+            data = response.json()
+            return market_name, data if isinstance(data, list) else []
+        except Exception as exc:
+            print(f"⚠️ MOPS {market_name}讀取失敗：{exc}")
+            return market_name, []
+
+    endpoint_results = []
+    with ThreadPoolExecutor(max_workers=min(2, len(NEWS_MOPS_ENDPOINTS))) as executor:
+        future_map = {
+            executor.submit(fetch_endpoint, market_name, url): market_name
+            for market_name, url in NEWS_MOPS_ENDPOINTS
+        }
+        for future in as_completed(future_map):
+            endpoint_results.append(future.result())
+
+    for market_name, data in endpoint_results:
         for row in data:
             if not isinstance(row, dict):
                 continue
@@ -5969,8 +5982,8 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
             title = _clean_news_title(row.get("主旨", row.get("公告主旨", "")))
             detail = _normalize_news_text(row.get("說明", row.get("公告內容", "")))
             speech_date = row.get("發言日期", row.get("公告日期", row.get("事實發生日", "")))
-            dt = _parse_mops_date(speech_date)
-            if dt is not None and dt < cutoff:
+            published_dt = _parse_mops_date(speech_date)
+            if published_dt is not None and published_dt < cutoff:
                 continue
             if not title or not _mops_announcement_has_information_value(title, detail):
                 continue
@@ -5982,7 +5995,7 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
                 continue
             if key:
                 seen.add(key)
-            published = dt.strftime("%Y-%m-%d") if dt else str(speech_date or "")
+            published = published_dt.strftime("%Y-%m-%d") if published_dt else str(speech_date or "")
             article = {
                 "title": title,
                 "url": "",
@@ -6002,17 +6015,21 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
             articles.append(article)
 
     def sort_key(article: dict):
-        dt = _parse_rss_pub_date(article.get("published", ""))
-        if dt is None:
+        parsed = _parse_rss_pub_date(article.get("published", ""))
+        if parsed is None:
             try:
-                dt = pd.Timestamp(article.get("published", "")).to_pydatetime()
+                parsed = pd.Timestamp(article.get("published", "")).to_pydatetime()
             except Exception:
-                dt = datetime.min
-        return (-int(article.get("relevance_score", 0) or 0), -dt.timestamp() if dt != datetime.min else 0)
+                parsed = datetime.min
+        return (
+            -int(article.get("relevance_score", 0) or 0),
+            -parsed.timestamp() if parsed != datetime.min else 0,
+        )
 
     articles = sorted(articles, key=sort_key)
     print(f"📰 MOPS 重大訊息：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
     return articles[:max(1, int(max_items))]
+
 
 
 
@@ -6028,155 +6045,163 @@ def _finmind_fetch_news_day(stock_code: str, trade_date) -> pd.DataFrame:
 
 
 def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """取得 FinMind TaiwanStockNews，作為多來源新聞池中的第六個來源。
-
-    規則：
-    1. 原始 stock_id 必須符合目標股票。
-    2. 標題／摘要本身必須直接提及目標公司，禁止人工補上公司名稱。
-    3. 有摘要時可作一般素材；只有標題時標記 finmind_title_only，排序落在完整內文之後。
-    4. 本函式只回傳 FinMind 候選，不覆蓋 Google／Yahoo／Bing／MoneyDJ／MOPS。
-    """
+    """漸進式取得 FinMind TaiwanStockNews，避免每次固定發出 30 個日期請求。"""
     if not NEWS_ENABLE or not FINMIND_NEWS_ENABLE:
         return []
 
     code = _normalize_stock_name_code_key(stock_code)
     today = get_taipei_today_ts()
-    dates = [today - pd.Timedelta(days=i) for i in range(FINMIND_NEWS_LOOKBACK_DAYS)]
+
+    stages = []
+    for token in re.split(r"[,，;；\s]+", FINMIND_NEWS_LOOKBACK_STAGES):
+        try:
+            value = int(token)
+        except Exception:
+            continue
+        if value > 0:
+            stages.append(min(value, FINMIND_NEWS_LOOKBACK_DAYS))
+    stages.append(FINMIND_NEWS_LOOKBACK_DAYS)
+    stages = sorted(set(value for value in stages if value > 0))
+
     frames = []
     failures = []
+    queried_days = set()
+    minimum_needed = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
 
-    with ThreadPoolExecutor(max_workers=FINMIND_NEWS_WORKERS) as executor:
-        future_map = {executor.submit(_finmind_fetch_news_day, code, day): day for day in dates}
-        for future in as_completed(future_map):
-            day = future_map[future]
-            try:
-                day_df = future.result()
-                if day_df is not None and not day_df.empty:
-                    frames.append(day_df)
-            except Exception as exc:
-                failures.append((str(pd.Timestamp(day).date()), str(exc)))
+    def convert_frames_to_articles(search_days: int) -> List[dict]:
+        raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
+        if raw.empty:
+            return []
+        required = {"date", "stock_id", "link", "source", "title"}
+        missing = required - set(raw.columns)
+        if missing:
+            _finmind_debug_print_df(f"TaiwanStockNews 必要欄位不足｜{code}", raw)
+            print(
+                f"⚠️ FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
+                f"實際欄位={raw.columns.tolist()}｜本來源略過"
+            )
+            return []
+
+        description_col = next(
+            (column for column in ["description", "content", "summary", "snippet", "text"] if column in raw.columns),
+            "",
+        )
+        raw = raw.copy()
+        raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
+        raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
+
+        articles = []
+        seen = set()
+        for _, row in raw.iterrows():
+            title = _clean_news_title(row.get("title", ""))
+            raw_description = row.get(description_col, "") if description_col else ""
+            description = _normalize_news_text(_html_to_readable_text(raw_description))
+            url = str(row.get("link", "") or "").strip()
+            source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
+            if not title and not description:
+                continue
+
+            row_stock_id = _normalize_stock_name_code_key(row.get("stock_id", ""))
+            if row_stock_id and row_stock_id != code:
+                continue
+            source_text = _normalize_news_text("。".join(part for part in [title, description] if part))
+            if _has_conflicting_similar_company_name(source_text, code, stock_name):
+                continue
+            if FINMIND_NEWS_REQUIRE_DIRECT_TARGET and not _news_text_matches_target_stock(
+                source_text,
+                code,
+                stock_name,
+            ):
+                continue
+
+            key = _article_seen_key(title, url)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+
+            fact_text = _normalize_news_text(description or title)
+            if not fact_text:
+                continue
+            has_description = bool(description)
+            article = {
+                "title": title or fact_text[:80],
+                "url": url,
+                "source": source,
+                "source_family": "FinMind",
+                "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "description": description,
+                "content": fact_text,
+                "body_ok": bool(has_description and len(fact_text) >= 80),
+                "fallback_ok": True,
+                "content_source": "finmind_description" if has_description else "finmind_title_fact",
+                "finmind_title_only": not has_description,
+                "finmind_target_verified": True,
+                "search_days": int(search_days),
+                "query_stage": "FinMind TaiwanStockNews",
+                "body_length": len(fact_text),
+            }
+            article["relevance_score"] = _score_news_article_relevance(article, code, stock_name)
+            articles.append(article)
+
+        def sort_key(article: dict):
+            published_dt = pd.to_datetime(article.get("published", ""), errors="coerce")
+            timestamp = float(published_dt.timestamp()) if pd.notna(published_dt) else 0.0
+            material_rank = 0 if article.get("body_ok") else 1
+            return (material_rank, -int(article.get("relevance_score", 0) or 0), -timestamp)
+
+        articles = sorted(articles, key=sort_key)
+        return articles[:max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT), int(max_items))]
+
+    result = []
+    for stage_days in stages:
+        new_dates = [
+            today - pd.Timedelta(days=offset)
+            for offset in range(stage_days)
+            if offset not in queried_days
+        ]
+        queried_days.update(range(stage_days))
+        if new_dates:
+            with ThreadPoolExecutor(max_workers=min(FINMIND_NEWS_WORKERS, len(new_dates))) as executor:
+                future_map = {
+                    executor.submit(_finmind_fetch_news_day, code, day): day
+                    for day in new_dates
+                }
+                for future in as_completed(future_map):
+                    day = future_map[future]
+                    try:
+                        day_df = future.result()
+                        if day_df is not None and not day_df.empty:
+                            frames.append(day_df)
+                    except Exception as exc:
+                        failures.append((str(pd.Timestamp(day).date()), str(exc)))
+
+        result = convert_frames_to_articles(stage_days)
+        distinct_count = _count_distinct_usable_news_articles(result, code, stock_name)
+        print(
+            f"📰 FinMind TaiwanStockNews 漸進查詢：{code} {stock_name}｜"
+            f"近 {stage_days} 天｜保留 {len(result):,} 筆｜不同事件 {distinct_count:,} 則"
+        )
+        if distinct_count >= minimum_needed:
+            break
 
     if failures:
         print(
-            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(dates)}｜"
+            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(queried_days)}｜"
             + "；".join(f"{day}:{error[:80]}" for day, error in failures[:3])
         )
-
-    raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
-    if raw.empty:
-        print(f"ℹ️ FinMind TaiwanStockNews 無近期新聞：{code} {stock_name}")
+    if not result:
+        print(f"ℹ️ FinMind TaiwanStockNews 無近期合格新聞：{code} {stock_name}")
         return []
 
-    required = {"date", "stock_id", "link", "source", "title"}
-    missing = required - set(raw.columns)
-    if missing:
-        _finmind_debug_print_df(f"TaiwanStockNews 必要欄位不足｜{code}", raw)
-        print(
-            f"⚠️ FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
-            f"實際欄位={raw.columns.tolist()}｜本來源略過"
-        )
-        return []
-
-    description_col = next(
-        (column for column in ["description", "content", "summary", "snippet", "text"] if column in raw.columns),
-        "",
-    )
-    if description_col:
-        print(f"📰 FinMind TaiwanStockNews 摘要欄位：{description_col}｜欄位={raw.columns.tolist()}")
-    else:
-        print(
-            "ℹ️ FinMind TaiwanStockNews 本次沒有 description／content／summary，"
-            "僅將原始 title 作為低優先級事實素材｜"
-            f"欄位={raw.columns.tolist()}"
-        )
-
-    raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
-    raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
-
-    articles = []
-    seen = set()
-    skipped_not_target = 0
-    skipped_conflict = 0
-    skipped_stock_id = 0
-
-    for _, row in raw.iterrows():
-        title = _clean_news_title(row.get("title", ""))
-        raw_description = row.get(description_col, "") if description_col else ""
-        description = _normalize_news_text(_html_to_readable_text(raw_description))
-        url = str(row.get("link", "") or "").strip()
-        source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
-        if not title and not description:
-            continue
-
-        row_stock_id = _normalize_stock_name_code_key(row.get("stock_id", ""))
-        if row_stock_id and row_stock_id != code:
-            skipped_stock_id += 1
-            continue
-
-        source_text = _normalize_news_text("。".join(part for part in [title, description] if part))
-        if _has_conflicting_similar_company_name(source_text, code, stock_name):
-            skipped_conflict += 1
-            continue
-        if FINMIND_NEWS_REQUIRE_DIRECT_TARGET and not _news_text_matches_target_stock(
-            source_text,
-            code,
-            stock_name,
-        ):
-            skipped_not_target += 1
-            continue
-
-        key = _article_seen_key(title, url)
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-
-        fact_text = _normalize_news_text(description or title)
-        if not fact_text:
-            continue
-        has_description = bool(description)
-        article = {
-            "title": title or fact_text[:80],
-            "url": url,
-            "source": source,
-            "source_family": "FinMind",
-            "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
-            "description": description,
-            "content": fact_text,
-            "body_ok": bool(has_description and len(fact_text) >= 80),
-            "fallback_ok": True,
-            "content_source": "finmind_description" if has_description else "finmind_title_fact",
-            "finmind_title_only": not has_description,
-            "finmind_target_verified": True,
-            "search_days": FINMIND_NEWS_LOOKBACK_DAYS,
-            "query_stage": "FinMind TaiwanStockNews",
-            "body_length": len(fact_text),
-        }
-        article["relevance_score"] = _score_news_article_relevance(article, code, stock_name)
-        articles.append(article)
-
-    if skipped_not_target or skipped_conflict or skipped_stock_id:
-        print(
-            f"🛡️ FinMind 新聞嚴格主體過濾：{code} {stock_name}｜"
-            f"非直接主體={skipped_not_target}｜相似公司衝突={skipped_conflict}｜stock_id不符={skipped_stock_id}"
-        )
-
-    def _finmind_news_sort_key(article: dict):
-        published_dt = pd.to_datetime(article.get("published", ""), errors="coerce")
-        timestamp = float(published_dt.timestamp()) if pd.notna(published_dt) else 0.0
-        material_rank = 0 if article.get("body_ok") else 1
-        return (material_rank, -int(article.get("relevance_score", 0) or 0), -timestamp)
-
-    articles = sorted(articles, key=_finmind_news_sort_key)
-    limit = max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT), int(max_items))
-    result = articles[:limit]
     title_only_count = sum(bool(article.get("finmind_title_only")) for article in result)
+    searched_days = max((int(article.get("search_days", 0) or 0) for article in result), default=0)
     print(
         f"📰 FinMind TaiwanStockNews：{code} {stock_name}｜"
-        f"近 {FINMIND_NEWS_LOOKBACK_DAYS} 天｜保留 {len(result):,} 筆｜"
-        f"僅標題 {title_only_count:,} 筆"
+        f"實際查至近 {searched_days} 天｜保留 {len(result):,} 筆｜僅標題 {title_only_count:,} 筆"
     )
     return result
+
 
 def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: str, stock_name: str, limit: int) -> List[dict]:
     merged = []
@@ -6244,27 +6269,150 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
     return selected[:limit]
 
 
+
+def _news_raw_cache_signature() -> str:
+    payload = {
+        "schema": "v24_parallel_sources",
+        "finmind": FINMIND_NEWS_ENABLE,
+        "multi": NEWS_MULTI_SOURCE_ENABLE,
+        "yahoo": NEWS_YAHOO_RSS_ENABLE,
+        "bing": NEWS_BING_RSS_ENABLE,
+        "moneydj": NEWS_MONEYDJ_SEARCH_ENABLE,
+        "mops": NEWS_MOPS_ENABLE,
+        "google_max": NEWS_GOOGLE_MAX_ITEMS,
+        "google_scan": NEWS_GOOGLE_SCAN_MULTIPLIER,
+        "external_max": NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE,
+        "return_limit": NEWS_MULTI_SOURCE_RETURN_LIMIT,
+        "finmind_stages": FINMIND_NEWS_LOOKBACK_STAGES,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _news_raw_cache_path(stock_code: str) -> str:
+    date_key = _compact_date_key(_taipei_today_str())
+    filename = f"{date_key}_{_safe_cache_part(stock_code)}_{_news_raw_cache_signature()}.json"
+    return os.path.join(NEWS_RAW_CACHE_DIR, filename)
+
+
+def _load_news_raw_cache(stock_code: str, stock_name: str) -> List[dict]:
+    if not NEWS_RAW_CACHE_ENABLE or NEWS_RAW_CACHE_FORCE_REFRESH or NEWS_RAW_CACHE_TTL_SECONDS <= 0:
+        return []
+    path = _news_raw_cache_path(stock_code)
+    try:
+        if not os.path.exists(path):
+            return []
+        age_seconds = max(0.0, time.time() - os.path.getmtime(path))
+        if age_seconds > NEWS_RAW_CACHE_TTL_SECONDS:
+            return []
+        with open(path, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        articles = payload.get("articles", []) if isinstance(payload, dict) else []
+        if not isinstance(articles, list) or not articles:
+            return []
+        print(
+            f"⚡ 六來源原始新聞短期快取命中：{stock_code} {stock_name}｜"
+            f"{len(articles):,} 筆｜age={age_seconds:.0f}秒"
+        )
+        return [dict(article) for article in articles if isinstance(article, dict)]
+    except Exception as exc:
+        print(f"⚠️ 六來源原始新聞快取讀取失敗：{stock_code}｜{exc}")
+        return []
+
+
+def _save_news_raw_cache(stock_code: str, stock_name: str, articles: List[dict]):
+    if not NEWS_RAW_CACHE_ENABLE or not articles:
+        return
+    path = _news_raw_cache_path(stock_code)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        payload = {
+            "stock_code": str(stock_code),
+            "stock_name": str(stock_name),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "articles": [dict(article) for article in articles if isinstance(article, dict)],
+        }
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as cache_file:
+            json.dump(payload, cache_file, ensure_ascii=False)
+        os.replace(temp_path, path)
+        print(f"💾 六來源原始新聞短期快取已更新：{stock_code}｜{len(articles):,} 筆")
+    except Exception as exc:
+        print(f"⚠️ 六來源原始新聞快取寫入失敗：{stock_code}｜{exc}")
+
+
 def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """合併多來源新聞；至少蒐集 2 則不同合格事件後才視為素材充足。"""
+    """平行合併六個新聞來源；短期快取避免同日手動重跑反覆等待網站。"""
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
         return fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
     if not NEWS_ENABLE:
         return []
 
+    cached_articles = _load_news_raw_cache(stock_code, stock_name)
+    if cached_articles:
+        return cached_articles
+
     minimum_needed = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
     per_source = max(minimum_needed, 3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
-
-    # 所有來源都會實際查詢，不因 Google 先找到一篇就停止。
-    # FinMind 是第六個來源，只加入候選池；不得覆蓋其他來源。
-    groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max(max_items, minimum_needed))]
+    jobs = [
+        (
+            "GoogleNews",
+            fetch_google_news_articles,
+            (stock_code, stock_name, max(max_items, minimum_needed)),
+        ),
+    ]
     if FINMIND_NEWS_ENABLE:
-        groups.append(fetch_finmind_news_articles(stock_code, stock_name, max_items=per_source))
+        jobs.append(("FinMind", fetch_finmind_news_articles, (stock_code, stock_name, per_source)))
     if NEWS_MULTI_SOURCE_ENABLE:
-        groups.append(fetch_yahoo_finance_rss_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_bing_news_rss_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_moneydj_news_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_mops_material_info_articles(stock_code, stock_name, max_items=max(NEWS_MOPS_MAX_ITEMS, per_source)))
+        if NEWS_YAHOO_RSS_ENABLE:
+            jobs.append(("Yahoo", fetch_yahoo_finance_rss_articles, (stock_code, stock_name, per_source)))
+        if NEWS_BING_RSS_ENABLE:
+            jobs.append(("Bing", fetch_bing_news_rss_articles, (stock_code, stock_name, per_source)))
+        if NEWS_MONEYDJ_SEARCH_ENABLE:
+            jobs.append(("MoneyDJ", fetch_moneydj_news_articles, (stock_code, stock_name, per_source)))
+        if NEWS_MOPS_ENABLE:
+            jobs.append(("MOPS", fetch_mops_material_info_articles, (stock_code, stock_name, max(NEWS_MOPS_MAX_ITEMS, per_source))))
+
+    groups = []
+    completed_sources = []
+    started = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=min(NEWS_SOURCE_FETCH_WORKERS, len(jobs)))
+    future_map = {
+        executor.submit(function, *arguments): label
+        for label, function, arguments in jobs
+    }
+    pending = set(future_map)
+    deadline = started + NEWS_SOURCE_BATCH_TIMEOUT
+    try:
+        while pending:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending,
+                timeout=min(0.25, max(0.05, remaining)),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                label = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    print(f"⚠️ 新聞來源工作失敗：{label}｜{exc}")
+                    result = []
+                groups.append(result or [])
+                completed_sources.append(label)
+    finally:
+        if pending:
+            pending_labels = [future_map[future] for future in pending]
+            for future in pending:
+                future.cancel()
+            print(
+                f"⚠️ 六來源新聞整批超過 {NEWS_SOURCE_BATCH_TIMEOUT:g} 秒，"
+                f"略過尚未完成來源：{'、'.join(pending_labels)}"
+            )
+        executor.shutdown(wait=False, cancel_futures=True)
 
     limit = max(
         minimum_needed,
@@ -6274,24 +6422,26 @@ def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items
     )
     articles = _merge_and_rank_news_articles(groups, stock_code, stock_name, limit=limit)
     distinct_count = _count_distinct_usable_news_articles(articles, stock_code, stock_name)
-
     source_counts = {}
     for article in articles:
         family = str(article.get("source_family", article.get("source", "unknown")) or "unknown")
         source_counts[family] = source_counts.get(family, 0) + 1
-    source_text = "、".join(f"{k}:{v}" for k, v in source_counts.items()) or "無"
+    source_text = "、".join(f"{key}:{value}" for key, value in source_counts.items()) or "無"
+    elapsed = time.perf_counter() - started
 
-    if distinct_count >= minimum_needed:
+    print(
+        f"📰 六來源平行抓取完成：{stock_code} {stock_name}｜{elapsed:.2f} 秒｜"
+        f"完成來源={'、'.join(completed_sources) or '無'}｜保留 {len(articles):,} 筆｜"
+        f"不同事件 {distinct_count:,} 則｜來源 {source_text}"
+    )
+    if distinct_count < minimum_needed:
         print(
-            f"📰 多來源新聞完成：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜"
-            f"不同合格事件 {distinct_count:,} 則｜來源 {source_text}"
+            f"⚠️ 六來源僅取得 {distinct_count:,} 則不同合格事件；"
+            "允許單則輸出，不以盤勢或重複事件硬湊"
         )
-    else:
-        print(
-            f"⚠️ 多來源與最長 {max(_get_news_search_day_list())} 日範圍均已查完："
-            f"{stock_code} {stock_name} 僅取得 {distinct_count:,} 則不同合格事件；允許單則輸出｜來源 {source_text}"
-        )
+    _save_news_raw_cache(stock_code, stock_name, articles)
     return articles
+
 
 
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
@@ -6502,7 +6652,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                 f"fetch_limit={fetch_limit}｜mode={mode_label}"
             )
             try:
-                r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
+                r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)))
                 r.raise_for_status()
                 root = ET.fromstring(r.content)
             except Exception as e:
@@ -6605,22 +6755,6 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         log_label="Google News",
     )
     return all_articles[:fetch_limit]
-
-def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
-    """保留舊函式相容性；新流程請優先使用 fetch_google_news_articles。"""
-    articles = fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
-    titles = []
-    for a in articles:
-        if isinstance(a, dict):
-            title = _clean_news_title(a.get("title", ""))
-            if title:
-                titles.append(title)
-        else:
-            title = _clean_news_title(str(a))
-            if title:
-                titles.append(title)
-    return titles[:max_items]
-
 
 def _news_items_to_records(news_items) -> List[dict]:
     records = []
@@ -7102,20 +7236,6 @@ def _collect_news_sentences(records: List[dict], stock_code: str = "", stock_nam
             seen.add(sent)
     return candidates
 
-def _clean_summary_points(raw_points: List[str]) -> List[str]:
-    points = []
-    for p in raw_points or []:
-        s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
-        if not s or _is_bad_news_sentence(s):
-            continue
-        if s in points:
-            continue
-        points.append(s)
-        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return points
-
-
 def _count_summary_chars(points: List[str]) -> int:
     """計算重點實際文字量；tone 為控制欄位，不計入圖卡內容字數。"""
     joined = "".join(_strip_report_tone_metadata(str(p or "")) for p in points or [])
@@ -7145,21 +7265,6 @@ def _parse_raw_points_from_llm(output_text: str) -> List[str]:
     return points
 
 
-def _clean_news_summary_points(raw_points: List[str]) -> List[str]:
-    """新聞專用清理：保留較完整的重點，使總字數可達 150 字以上。"""
-    points = []
-    for p in raw_points or []:
-        s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
-        if not s or _is_bad_news_sentence(s):
-            continue
-        if s in points:
-            continue
-        points.append(s)
-        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return points
-
-
 def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str, stock_name: str) -> List[str]:
     """清理新聞重點並排除跨公司數字、純盤勢或缺乏實質內容的句子。"""
     points = []
@@ -7183,107 +7288,6 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
         if len(points) >= NEWS_SUMMARY_MAX_POINTS:
             break
     return points
-
-def _refine_news_points_with_records(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """移除日期／來源雜訊；若 AI 幾乎照抄具體基本面標題，改由程式整理成標準重點。"""
-    cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
-    refined = []
-    for p in cleaned:
-        if not _looks_like_title_copy_or_meta_noise(p, records):
-            refined.append(p)
-            continue
-
-        best_title = ""
-        best_overlap = 0.0
-        for rec in records or []:
-            title = _clean_news_title(rec.get("title", ""))
-            if not title or not _can_use_news_title_as_fact(title):
-                continue
-            overlap = _char_overlap_ratio(p, title)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_title = title
-
-        rebuilt = ""
-        if best_title and best_overlap >= 0.45:
-            rebuilt = _make_news_keypoint(
-                _infer_news_label_from_text(best_title, fallback_label="新聞焦點"),
-                best_title,
-                stock_code,
-                stock_name,
-            )
-        if rebuilt and not _is_bad_news_sentence(rebuilt):
-            print(f"🧹 疑似照抄新聞標題，已改寫為標準重點：{best_title[:42]}")
-            refined.append(rebuilt)
-        else:
-            print(f"⚠️ 略過疑似直接複製標題或中繼資訊的新聞重點：{p}")
-    return _clean_news_summary_points_for_stock(refined, stock_code, stock_name)
-
-
-def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
-    """Gemini 輸出太短時，從近期原文 / RSS 摘要候選句補足重點字數；不使用新聞標題硬湊。"""
-    used_points = used_points or []
-    sentence_candidates = _collect_news_sentences(records, stock_code, stock_name)
-    title_candidates = _collect_news_title_candidates(records, stock_code, stock_name)
-    candidates = list(sentence_candidates or [])
-    seen_candidate_keys = {_title_compare_text(c.get("text", "")) for c in candidates if c.get("text")}
-    for c in title_candidates or []:
-        key = _title_compare_text(c.get("text", ""))
-        if key and key not in seen_candidate_keys:
-            candidates.append(c)
-            seen_candidate_keys.add(key)
-    if not candidates:
-        return []
-
-    broad_keywords = [
-        stock_code, stock_name, "營收", "財報", "獲利", "EPS", "毛利", "毛利率", "AI", "伺服器",
-        "半導體", "記憶體", "DRAM", "NAND", "HBM", "報價", "漲價", "供需", "需求",
-        "法說", "展望", "接單", "出貨", "產能", "擴產", "合作", "法人", "外資", "投信",
-        "評等", "目標價", "調升", "調降", "客戶", "長約", "庫存", "價格", "景氣",
-    ]
-    scored = []
-    used_compare = {_title_compare_text(p) for p in used_points if p}
-    for c in candidates:
-        text = c.get("text", "")
-        if not text or _is_bad_news_sentence(text):
-            continue
-        if _is_cross_company_target_value_sentence(text, stock_code, stock_name):
-            continue
-        if not _has_substantive_company_news(text):
-            continue
-        cmp_text = _title_compare_text(text)
-        if not cmp_text or cmp_text in used_compare:
-            continue
-        score = _score_news_sentence(text, broad_keywords, stock_code, stock_name)
-        if score > 0:
-            scored.append((score, text))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    extra = []
-    for _, text in scored:
-        label = _infer_news_label_from_text(text, fallback_label="新聞焦點")
-        point = _make_news_keypoint(label, text, stock_code, stock_name)
-        if not point or _is_bad_news_sentence(point):
-            continue
-        cmp_point = _title_compare_text(point)
-        if cmp_point in used_compare:
-            continue
-        extra.append(point)
-        used_compare.add(cmp_point)
-        if len(extra) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return extra
-
-
-def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """新聞允許 0 點；只清理現有內容，不再為點數或字數自動擴寫。"""
-    return _refine_news_points_with_records(
-        points,
-        records,
-        stock_code,
-        stock_name,
-    )[:NEWS_SUMMARY_MAX_POINTS]
-
 
 def _parse_gemini_news_points(
     output_text: str,
@@ -7492,14 +7496,6 @@ def _trim_news_point_detail_to_max(point: str, log_label: str = "新聞重點") 
     return _replace_news_point_detail(point, trimmed_detail)
 
 
-def _trim_news_point_details_to_max(points: List[str], log_label: str = "新聞重點") -> List[str]:
-    return [
-        _trim_news_point_detail_to_max(point, log_label=log_label)
-        for point in (points or [])
-        if str(point or "").strip()
-    ]
-
-
 def _find_news_detail_length_problems(points: List[str]) -> List[str]:
     """只把 detail 過短視為內容不足；超長由程式端裁切，不觸發 repair。"""
     problems = []
@@ -7561,12 +7557,6 @@ def _get_warrants_api_keys() -> List[str]:
         keys.append(key)
         seen.add(key)
     return keys
-
-
-def _get_warrants_api_key() -> str:
-    """保留舊函式相容性；回傳第一組可用 Gemini API Key。"""
-    keys = _get_warrants_api_keys()
-    return keys[0] if keys else ""
 
 
 def _extract_json_from_text(text: str):
@@ -7978,11 +7968,6 @@ def _call_gemini_with_retry(
     return None
 
 
-def _parse_gemini_points(output_text: str) -> List[str]:
-    return _clean_summary_points(_parse_raw_points_from_llm(output_text))
-
-
-
 def _is_fetchable_news_article_url(url: str) -> bool:
     """只把具備 http(s) scheme 與網域的網址送入原文抓取。"""
     raw = str(url or "").strip()
@@ -7995,21 +7980,6 @@ def _is_fetchable_news_article_url(url: str) -> bool:
         return False
 
 
-def _is_direct_fetchable_news_article_url(url: str) -> bool:
-    """判斷是否為可直接存取的非 Google News 新聞網址；保留供其他流程使用。"""
-    if not _is_fetchable_news_article_url(url):
-        return False
-    try:
-        host = (urllib.parse.urlparse(str(url or "").strip()).hostname or "").lower()
-    except Exception:
-        return False
-    if not host:
-        return False
-    if host == "google.com" or host.endswith(".google.com") or host == "news.google.com":
-        return False
-    return True
-
-
 def _hybrid_news_event_key(record: dict, stock_code: str = "", stock_name: str = "") -> str:
     """建立混合模式用的事件鍵；與新聞素材／輸出點共用同一套事件去重規則。"""
     return _news_article_event_key(record, stock_code, stock_name)
@@ -8020,7 +7990,7 @@ def _enrich_fast_news_records_with_topk_bodies(
     stock_code: str,
     stock_name: str,
 ) -> List[dict]:
-    """RSS 快掃後只替最高分的前幾篇補抓原文，兼顧速度與摘要具體度。"""
+    """只替最高分的前兩個不同事件平行補抓原文，避免六來源搜尋後再次長時間等待。"""
     enriched = [dict(record) for record in (records or [])]
     if (
         not NEWS_FAST_MODE
@@ -8031,14 +8001,16 @@ def _enrich_fast_news_records_with_topk_bodies(
         return enriched
 
     candidates_by_event = {}
-    for idx, record in enumerate(enriched):
+    for index, record in enumerate(enriched):
         if record.get("body_ok") or not record.get("fallback_ok"):
             continue
         url = str(record.get("url", "") or "").strip()
-        # RSS 大多提供 Google News 導流網址；_fetch_article_body 會先解析成原始網址。
         if not _is_fetchable_news_article_url(url):
             continue
         if str(record.get("content_source", "") or "") == "manual":
+            continue
+        if record.get("finmind_title_only"):
+            # FinMind 標題仍可提供事件線索，但沒有直接新聞頁原文可補抓時不浪費請求。
             continue
 
         combined = _normalize_news_text(
@@ -8059,33 +8031,32 @@ def _enrich_fast_news_records_with_topk_bodies(
             relevance = _score_news_article_relevance(record, stock_code, stock_name)
         published_dt = _parse_rss_pub_date(record.get("published", "")) or datetime.min
         host = (urllib.parse.urlparse(url).netloc or "").lower()
-        direct_url_rank = 0 if "news.google." in host else 1
-        event_key = _hybrid_news_event_key(record, stock_code, stock_name) or f"row:{idx}"
-        candidate = (idx, relevance, published_dt, direct_url_rank, event_key)
+        direct_rank = 0 if "news.google." in host else 1
+        event_key = _hybrid_news_event_key(record, stock_code, stock_name) or f"row:{index}"
+        candidate = (index, relevance, published_dt, direct_rank, event_key)
 
-        # 同一事件只保留一篇；有直接原文網址時優先於 Google News 導流網址。
         previous = candidates_by_event.get(event_key)
-        candidate_quality = (
-            direct_url_rank,
+        quality = (
+            direct_rank,
             relevance,
             published_dt.timestamp() if published_dt != datetime.min else 0,
-            -idx,
+            -index,
         )
         if previous is None:
             candidates_by_event[event_key] = candidate
         else:
-            prev_idx, prev_relevance, prev_dt, prev_direct_rank, _ = previous
+            prev_index, prev_relevance, prev_dt, prev_direct_rank, _ = previous
             previous_quality = (
                 prev_direct_rank,
                 prev_relevance,
                 prev_dt.timestamp() if prev_dt != datetime.min else 0,
-                -prev_idx,
+                -prev_index,
             )
-            if candidate_quality > previous_quality:
+            if quality > previous_quality:
                 candidates_by_event[event_key] = candidate
 
     if not candidates_by_event:
-        print("ℹ️ RSS 混合模式沒有可補抓的新聞原文網址，略過原文補抓")
+        print("ℹ️ 混合新聞模式沒有值得補抓的原文網址，直接使用已取得摘要")
         return enriched
 
     candidates = sorted(
@@ -8099,70 +8070,77 @@ def _enrich_fast_news_records_with_topk_bodies(
     )[:NEWS_FAST_HYBRID_BODY_FETCH_TOPK]
 
     print(
-        f"📰 RSS 混合模式：從 {len(enriched):,} 筆素材中，"
-        f"事件去重後替最高分 {len(candidates):,} 篇補抓原文"
+        f"📰 混合新聞模式：從 {len(enriched):,} 筆素材中，"
+        f"事件去重後平行補抓最高分 {len(candidates):,} 篇原文"
     )
-    fetch_started = time.perf_counter()
-    batch_timeout = max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT))
-    batch_deadline = fetch_started + batch_timeout
+    started = time.perf_counter()
+    deadline = started + max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT))
     upgraded = 0
-    attempted = 0
 
-    # 不再使用 ThreadPoolExecutor：requests 執行緒無法被安全強制終止，
-    # 即使 future.cancel() 成功印出，Python 仍可能在收尾時等待卡住的執行緒。
-    # 這裡改成最多 3 篇循序補抓，每篇與整批皆有硬上限，預設則完全不執行此功能。
-    for candidate_pos, (idx, _, _, _, _) in enumerate(candidates):
-        remaining_batch = batch_deadline - time.perf_counter()
-        if remaining_batch <= 0:
-            remaining_count = len(candidates) - candidate_pos
-            print(f"⚠️ RSS 混合模式批次逾時，略過剩餘 {remaining_count:,} 篇")
-            break
-
-        record = enriched[idx]
-        attempted += 1
-        per_request_timeout = min(
-            float(NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT),
-            max(1.0, remaining_batch),
+    def fetch_candidate(candidate):
+        index, _, _, _, _ = candidate
+        record = enriched[index]
+        body = _fetch_article_body(
+            str(record.get("url", "") or "").strip(),
+            request_timeout=float(NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT),
+            max_bytes=NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES,
+            hard_deadline_seconds=float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT),
         )
-        try:
-            body = _fetch_article_body(
-                str(record.get("url", "") or "").strip(),
-                request_timeout=per_request_timeout,
-                max_bytes=NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES,
-                hard_deadline_seconds=remaining_batch,
-            )
-        except Exception as e:
-            print(f"⚠️ RSS 混合模式原文抓取失敗：{record.get('title', '')[:36]}｜{e}")
-            continue
+        return index, body
 
-        body = _normalize_news_text(body)
-        body_ok = (
-            _is_valid_article_body(
-                body,
-                title=record.get("title", ""),
-                description=record.get("description", ""),
+    executor = ThreadPoolExecutor(max_workers=max(1, min(2, len(candidates))))
+    future_map = {executor.submit(fetch_candidate, candidate): candidate for candidate in candidates}
+    pending = set(future_map)
+    try:
+        while pending:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending,
+                timeout=min(0.2, max(0.05, remaining)),
+                return_when=FIRST_COMPLETED,
             )
-            and _passes_news_quality_gate(
-                record.get("title", ""),
-                body,
-                stock_code,
-                stock_name,
-            )
-        )
-        if not body_ok:
-            print(f"ℹ️ RSS 混合模式未取得可用原文，保留摘要：{record.get('title', '')[:36]}")
-            continue
+            for future in done:
+                candidate = future_map[future]
+                index = candidate[0]
+                record = enriched[index]
+                try:
+                    _, body = future.result()
+                except Exception as exc:
+                    print(f"⚠️ 混合新聞原文抓取失敗：{record.get('title', '')[:36]}｜{exc}")
+                    continue
+                body = _normalize_news_text(body)
+                body_ok = (
+                    _is_valid_article_body(
+                        body,
+                        title=record.get("title", ""),
+                        description=record.get("description", ""),
+                    )
+                    and _passes_news_quality_gate(
+                        record.get("title", ""),
+                        body,
+                        stock_code,
+                        stock_name,
+                    )
+                )
+                if not body_ok:
+                    continue
+                record["content"] = body
+                record["body_ok"] = True
+                record["fallback_ok"] = False
+                record["content_source"] = "hybrid_article"
+                record["body_length"] = len(body)
+                record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
+                upgraded += 1
+                print(f"✅ 混合新聞補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
+    finally:
+        if pending:
+            for future in pending:
+                future.cancel()
+            print(f"⚠️ 混合新聞原文整批逾時，略過剩餘 {len(pending):,} 篇")
+        executor.shutdown(wait=False, cancel_futures=True)
 
-        record["content"] = body
-        record["body_ok"] = True
-        record["fallback_ok"] = False
-        record["content_source"] = "hybrid_article"
-        record["body_length"] = len(body)
-        record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
-        upgraded += 1
-        print(f"✅ RSS 混合模式補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
-
-    # 原文優先，再依相關性排序；相同條件保留原始順序。
     indexed = list(enumerate(enriched))
     indexed.sort(
         key=lambda item: (
@@ -8171,9 +8149,10 @@ def _enrich_fast_news_records_with_topk_bodies(
             item[0],
         )
     )
-    elapsed = time.perf_counter() - fetch_started
-    print(f"⏱️ RSS 混合模式原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{attempted} 篇")
+    elapsed = time.perf_counter() - started
+    print(f"⏱️ 混合新聞原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{len(candidates)} 篇")
     return [record for _, record in indexed]
+
 
 
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
@@ -8417,7 +8396,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         )
 
     # 0 點本身不算問題；只有格式、數字或 evidence 被刪除時才 repair。
-    if problems or rejected_points:
+    if (problems or rejected_points) and NEWS_GEMINI_REPAIR_ENABLE:
         log_problems = list(problems)
         log_problems.extend(
             str(item.get("reason", "") or "evidence 驗證失敗")
@@ -8533,7 +8512,8 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     # 驗證後少於 2 點，但仍有至少 3 篇合格文章時，再額外嘗試一次不同事件補點。
     # 補回來的點仍走完全相同的 source_id、evidence、公司主體、數字與 detail 長度驗證。
     if (
-        len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
         and len(usable_articles) < NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
     ):
         print(
@@ -8542,7 +8522,8 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
         )
 
     if (
-        len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
         and len(usable_articles) >= NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
     ):
         remaining_slots = max(0, NEWS_SUMMARY_MAX_POINTS - len(points))
@@ -12392,7 +12373,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
 FINMIND_ONLY_MODE = True
-FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-api-multisource-finmind-news-v23"
+FINMIND_BUILD_VERSION = "2026-07-15-finmind-latest-day-api-parallel-six-source-news-v24"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15077,7 +15058,7 @@ def _prepare_report_news_pipeline(stock_code: str, stock_name: str) -> dict:
         )
         if cached_news_points:
             print(
-                f"⚡ 今日新聞本機快取已存在，略過 FinMind 新聞抓取與 Gemini："
+                f"⚡ 今日新聞本機快取已存在，略過六來源新聞抓取與 Gemini："
                 f"{stock_code}｜{len(cached_news_points)} 點"
             )
             return {
@@ -15731,7 +15712,7 @@ def main():
     print(
         "🧩 ACTIVE_FEATURES="
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
-        "latest-day-warrant-code-api+six-source-news+finmind-news-grounding+event-level-news-dedup+gemini-news-repair-supplement+"
+        "latest-day-warrant-code-api+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+gemini-news-repair-supplement+"
         "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
         "single-context+uv-ready+calendar7+deadcode-cleanup"
     )
