@@ -1,0 +1,561 @@
+name: FinMind Warrant Branch 8-Hour Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "手動指定交易日期，例如 2026-07-15；留空則自動判斷"
+        required: false
+        default: ""
+        type: string
+
+      force_probe:
+        description: "即使當日已判定完整，仍強制再查一次"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finmind-warrant-branch-8-hour-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+
+# ============================================================
+# 第一階段：
+# 手動啟動後立即探測，共探測 24 次。
+# 探測時間約為第 0、10、20 ... 230 分鐘。
+# ============================================================
+jobs:
+  probe_phase_1:
+    name: Probe Phase 1
+    runs-on: ubuntu-latest
+
+    # GitHub-hosted runner 單一 job 最長 6 小時。
+    # 此階段正常約執行 4 小時，保留額外緩衝。
+    timeout-minutes: 330
+
+    outputs:
+      target_date: ${{ steps.resolve_date.outputs.target_date }}
+      complete: ${{ steps.probe_loop.outputs.complete }}
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --------------------------------------------------------
+      # 在工作流開始時固定目標日期。
+      # 避免流程跨過午夜後，Python 自動改查另一個日期。
+      # --------------------------------------------------------
+      - name: Resolve target trading date
+        id: resolve_date
+        env:
+          INPUT_TARGET_DATE: ${{ inputs.target_date }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          raw_target_date = os.environ.get(
+              "INPUT_TARGET_DATE",
+              "",
+          ).strip()
+
+          if raw_target_date:
+              target_date = datetime.strptime(
+                  raw_target_date,
+                  "%Y-%m-%d",
+              ).date()
+          else:
+              now = datetime.now(ZoneInfo("Asia/Taipei"))
+              current_date = now.date()
+
+              if current_date.weekday() < 5 and now.hour >= 17:
+                  target_date = current_date
+              else:
+                  target_date = current_date - timedelta(days=1)
+
+                  while target_date.weekday() >= 5:
+                      target_date -= timedelta(days=1)
+
+          target_date_text = target_date.isoformat()
+
+          print(f"固定偵測交易日期：{target_date_text}")
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8",
+          ) as output_file:
+              output_file.write(
+                  f"target_date={target_date_text}\n"
+              )
+          PY
+
+      # --------------------------------------------------------
+      # 每 10 分鐘執行一次，共 24 次。
+      # 每次執行完都提交 CSV 與狀態檔，避免中途失敗遺失紀錄。
+      # --------------------------------------------------------
+      - name: Probe every 10 minutes
+        id: probe_loop
+        shell: bash
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_API_0714 }}
+
+          FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
+          FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
+
+          STABLE_PROBES_REQUIRED: "4"
+          REQUEST_INTERVAL_SECONDS: "0.30"
+          REQUEST_TIMEOUT_SECONDS: "60"
+          MAX_RETRIES: "3"
+
+          TARGET_DATE: ${{ steps.resolve_date.outputs.target_date }}
+          FORCE_PROBE: ${{ inputs.force_probe }}
+
+          MAX_PROBES: "24"
+          INITIAL_DELAY_SECONDS: "0"
+          PROBE_INTERVAL_SECONDS: "600"
+
+        run: |
+          set -uo pipefail
+
+          STATE_FILE="data/finmind_probe/states/${TARGET_DATE}.json"
+          TARGET_BRANCH="${GITHUB_REF_NAME}"
+
+          echo "============================================================"
+          echo "FinMind 權證分點更新偵測｜第一階段"
+          echo "目標日期：${TARGET_DATE}"
+          echo "執行分支：${TARGET_BRANCH}"
+          echo "探測次數：${MAX_PROBES}"
+          echo "探測間隔：${PROBE_INTERVAL_SECONDS} 秒"
+          echo "============================================================"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # ----------------------------------------------------
+          # 檢查目前狀態檔是否已判定完整。
+          # 完整回傳 0；尚未完整回傳 1。
+          # ----------------------------------------------------
+          state_is_complete() {
+            python - "${STATE_FILE}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          state_path = Path(sys.argv[1])
+
+          if not state_path.exists():
+              sys.exit(1)
+
+          try:
+              payload = json.loads(
+                  state_path.read_text(encoding="utf-8")
+              )
+          except Exception:
+              sys.exit(1)
+
+          sys.exit(
+              0 if bool(payload.get("completed", False)) else 1
+          )
+          PY
+          }
+
+          # ----------------------------------------------------
+          # 每次探測後立即提交資料。
+          # 即使工作流稍後被取消，已完成的紀錄仍會保留。
+          # ----------------------------------------------------
+          commit_probe_outputs() {
+            if [ ! -d "data/finmind_probe" ]; then
+              echo "本次沒有輸出資料夾，不需要提交。"
+              return 0
+            fi
+
+            git add data/finmind_probe
+
+            if ! git diff --cached --quiet; then
+              git commit \
+                -m "chore: update FinMind probe ${TARGET_DATE} [skip ci]"
+            fi
+
+            # 若前一次 push 暫時失敗，本次也會繼續嘗試推送
+            # 尚未送到遠端的本機 commit。
+            if [ -z "$(git log --format=%H "origin/${TARGET_BRANCH}..HEAD")" ]; then
+              echo "沒有尚未推送的探測紀錄。"
+              return 0
+            fi
+
+            for retry_number in 1 2 3; do
+              echo "推送探測紀錄，第 ${retry_number}/3 次嘗試。"
+
+              if git pull --rebase origin "${TARGET_BRANCH}" \
+                && git push origin "HEAD:${TARGET_BRANCH}"; then
+                echo "✅ 探測紀錄已推送到 ${TARGET_BRANCH}"
+                return 0
+              fi
+
+              echo "⚠️ 推送失敗，準備重試。"
+              git rebase --abort 2>/dev/null || true
+              sleep 5
+            done
+
+            echo "⚠️ 本次探測紀錄暫時無法推送。"
+            echo "工作流將繼續進行下一次探測。"
+            return 0
+          }
+
+          if [ "${INITIAL_DELAY_SECONDS}" -gt 0 ]; then
+            echo "等待 ${INITIAL_DELAY_SECONDS} 秒後開始第一筆探測。"
+            sleep "${INITIAL_DELAY_SECONDS}"
+          fi
+
+          PHASE_START_EPOCH="$(date +%s)"
+
+          for ATTEMPT in $(seq 1 "${MAX_PROBES}"); do
+            echo ""
+            echo "============================================================"
+            echo "第一階段探測：${ATTEMPT}/${MAX_PROBES}"
+            echo "台北時間：$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+            echo "目標日期：${TARGET_DATE}"
+            echo "============================================================"
+
+            # 不讓單次暫時性失敗中止整個 8 小時流程。
+            set +e
+            python finmind_warrant_probe.py
+            PROBE_EXIT_CODE=$?
+            set -e
+
+            if [ "${PROBE_EXIT_CODE}" -ne 0 ]; then
+              echo "⚠️ 本次 Python 探測失敗，離開碼：${PROBE_EXIT_CODE}"
+              echo "10 分鐘後仍會繼續重試。"
+            fi
+
+            commit_probe_outputs
+
+            if state_is_complete; then
+              echo ""
+              echo "✅ ${TARGET_DATE} 已確認資料完整。"
+              echo "第一階段提前停止，第二階段不會執行。"
+
+              echo "complete=true" >> "${GITHUB_OUTPUT}"
+
+              {
+                echo ""
+                echo "## FinMind 八小時探測結果"
+                echo ""
+                echo "- 目標日期：\`${TARGET_DATE}\`"
+                echo "- 狀態：**已確認完整**"
+                echo "- 完成階段：第一階段"
+                echo "- 完成時間：\`$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')\`"
+              } >> "${GITHUB_STEP_SUMMARY}"
+
+              exit 0
+            fi
+
+            if [ "${ATTEMPT}" -lt "${MAX_PROBES}" ]; then
+              # 使用固定時間軸，而非單純每次 sleep 600。
+              # API 執行花費的時間會從等待時間中扣除，
+              # 讓每次探測盡量維持約 10 分鐘間隔。
+              NEXT_PROBE_EPOCH="$(
+                (
+                  PHASE_START_EPOCH
+                  + ATTEMPT * PROBE_INTERVAL_SECONDS
+                )
+              )"
+
+              CURRENT_EPOCH="$(date +%s)"
+              SLEEP_SECONDS="$(
+                (
+                  NEXT_PROBE_EPOCH
+                  - CURRENT_EPOCH
+                )
+              )"
+
+              if [ "${SLEEP_SECONDS}" -gt 0 ]; then
+                echo ""
+                echo "⏳ 等待 ${SLEEP_SECONDS} 秒進行下一次探測。"
+                sleep "${SLEEP_SECONDS}"
+              else
+                echo ""
+                echo "⚠️ 本次探測已超過 10 分鐘，立即開始下一次。"
+              fi
+            fi
+          done
+
+          echo "complete=false" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo ""
+            echo "## 第一階段結束"
+            echo ""
+            echo "- 目標日期：\`${TARGET_DATE}\`"
+            echo "- 狀態：尚未確認完整"
+            echo "- 下一步：接續執行第二階段"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+
+  # ==========================================================
+  # 第二階段：
+  # 只有第一階段仍未完整時才執行。
+  #
+  # 先等待約 10 分鐘，再探測 25 次：
+  # 約對應整體流程的第 240、250 ... 480 分鐘。
+  # ==========================================================
+  probe_phase_2:
+    name: Probe Phase 2
+    needs:
+      - probe_phase_1
+
+    if: ${{ needs.probe_phase_1.outputs.complete != 'true' }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout latest selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Continue probing every 10 minutes
+        id: probe_loop
+        shell: bash
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+
+          FINMIND_BROKER_IDS: ${{ vars.FINMIND_BROKER_IDS }}
+          FINMIND_BROKER_NAMES: ${{ vars.FINMIND_BROKER_NAMES }}
+
+          STABLE_PROBES_REQUIRED: "4"
+          REQUEST_INTERVAL_SECONDS: "0.30"
+          REQUEST_TIMEOUT_SECONDS: "60"
+          MAX_RETRIES: "3"
+
+          TARGET_DATE: ${{ needs.probe_phase_1.outputs.target_date }}
+          FORCE_PROBE: ${{ inputs.force_probe }}
+
+          MAX_PROBES: "25"
+
+          # 第一階段最後一筆約在第 230 分鐘。
+          # 第二階段先等待 10 分鐘，讓下一筆約在第 240 分鐘。
+          INITIAL_DELAY_SECONDS: "600"
+
+          PROBE_INTERVAL_SECONDS: "600"
+
+        run: |
+          set -uo pipefail
+
+          STATE_FILE="data/finmind_probe/states/${TARGET_DATE}.json"
+          TARGET_BRANCH="${GITHUB_REF_NAME}"
+
+          echo "============================================================"
+          echo "FinMind 權證分點更新偵測｜第二階段"
+          echo "目標日期：${TARGET_DATE}"
+          echo "執行分支：${TARGET_BRANCH}"
+          echo "探測次數：${MAX_PROBES}"
+          echo "開始前等待：${INITIAL_DELAY_SECONDS} 秒"
+          echo "============================================================"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          state_is_complete() {
+            python - "${STATE_FILE}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          state_path = Path(sys.argv[1])
+
+          if not state_path.exists():
+              sys.exit(1)
+
+          try:
+              payload = json.loads(
+                  state_path.read_text(encoding="utf-8")
+              )
+          except Exception:
+              sys.exit(1)
+
+          sys.exit(
+              0 if bool(payload.get("completed", False)) else 1
+          )
+          PY
+          }
+
+          commit_probe_outputs() {
+            if [ ! -d "data/finmind_probe" ]; then
+              echo "本次沒有輸出資料夾，不需要提交。"
+              return 0
+            fi
+
+            git add data/finmind_probe
+
+            if ! git diff --cached --quiet; then
+              git commit \
+                -m "chore: update FinMind probe ${TARGET_DATE} [skip ci]"
+            fi
+
+            if [ -z "$(git log --format=%H "origin/${TARGET_BRANCH}..HEAD")" ]; then
+              echo "沒有尚未推送的探測紀錄。"
+              return 0
+            fi
+
+            for retry_number in 1 2 3; do
+              echo "推送探測紀錄，第 ${retry_number}/3 次嘗試。"
+
+              if git pull --rebase origin "${TARGET_BRANCH}" \
+                && git push origin "HEAD:${TARGET_BRANCH}"; then
+                echo "✅ 探測紀錄已推送到 ${TARGET_BRANCH}"
+                return 0
+              fi
+
+              echo "⚠️ 推送失敗，準備重試。"
+              git rebase --abort 2>/dev/null || true
+              sleep 5
+            done
+
+            echo "⚠️ 本次探測紀錄暫時無法推送。"
+            echo "工作流將繼續進行下一次探測。"
+            return 0
+          }
+
+          # 若第一階段剛結束，先補足約 10 分鐘間隔。
+          echo "⏳ 等待 ${INITIAL_DELAY_SECONDS} 秒後開始第二階段。"
+          sleep "${INITIAL_DELAY_SECONDS}"
+
+          # 等待期間若分支被其他程序更新，重新同步一次。
+          git pull --rebase origin "${TARGET_BRANCH}" || true
+
+          if state_is_complete; then
+            echo "✅ 等待期間資料已被判定完整，不需要繼續探測。"
+
+            {
+              echo ""
+              echo "## FinMind 八小時探測結果"
+              echo ""
+              echo "- 目標日期：\`${TARGET_DATE}\`"
+              echo "- 狀態：**已確認完整**"
+              echo "- 第二階段未再呼叫 API"
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            exit 0
+          fi
+
+          PHASE_START_EPOCH="$(date +%s)"
+
+          for ATTEMPT in $(seq 1 "${MAX_PROBES}"); do
+            echo ""
+            echo "============================================================"
+            echo "第二階段探測：${ATTEMPT}/${MAX_PROBES}"
+            echo "台北時間：$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+            echo "目標日期：${TARGET_DATE}"
+            echo "============================================================"
+
+            set +e
+            python finmind_warrant_probe.py
+            PROBE_EXIT_CODE=$?
+            set -e
+
+            if [ "${PROBE_EXIT_CODE}" -ne 0 ]; then
+              echo "⚠️ 本次 Python 探測失敗，離開碼：${PROBE_EXIT_CODE}"
+              echo "10 分鐘後仍會繼續重試。"
+            fi
+
+            commit_probe_outputs
+
+            if state_is_complete; then
+              echo ""
+              echo "✅ ${TARGET_DATE} 已確認資料完整。"
+              echo "第二階段提前停止。"
+
+              {
+                echo ""
+                echo "## FinMind 八小時探測結果"
+                echo ""
+                echo "- 目標日期：\`${TARGET_DATE}\`"
+                echo "- 狀態：**已確認完整**"
+                echo "- 完成階段：第二階段"
+                echo "- 完成時間：\`$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')\`"
+              } >> "${GITHUB_STEP_SUMMARY}"
+
+              exit 0
+            fi
+
+            if [ "${ATTEMPT}" -lt "${MAX_PROBES}" ]; then
+              NEXT_PROBE_EPOCH="$(
+                (
+                  PHASE_START_EPOCH
+                  + ATTEMPT * PROBE_INTERVAL_SECONDS
+                )
+              )"
+
+              CURRENT_EPOCH="$(date +%s)"
+              SLEEP_SECONDS="$(
+                (
+                  NEXT_PROBE_EPOCH
+                  - CURRENT_EPOCH
+                )
+              )"
+
+              if [ "${SLEEP_SECONDS}" -gt 0 ]; then
+                echo ""
+                echo "⏳ 等待 ${SLEEP_SECONDS} 秒進行下一次探測。"
+                sleep "${SLEEP_SECONDS}"
+              else
+                echo ""
+                echo "⚠️ 本次探測已超過 10 分鐘，立即開始下一次。"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "============================================================"
+          echo "⚠️ 八小時偵測時間已結束，資料仍未確認完整。"
+          echo "目標日期：${TARGET_DATE}"
+          echo "最後時間：$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+          echo "============================================================"
+
+          {
+            echo ""
+            echo "## FinMind 八小時探測結果"
+            echo ""
+            echo "- 目標日期：\`${TARGET_DATE}\`"
+            echo "- 狀態：**八小時內仍未確認完整**"
+            echo "- 總探測上限：49 次"
+            echo "- 探測間隔：約 10 分鐘"
+            echo "- 結束時間：\`$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
