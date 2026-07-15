@@ -162,12 +162,12 @@ jobs:
 
       - name: Validate Python syntax
         run: |
-          python -m py_compile run_report.py
+          python -m py_compile K_function_warrant_report_20260530.py
 
       - name: Prewarm FinMind all-market cache
         run: |
           echo "========== 開始預熱 FinMind 全市場共用快取 =========="
-          python -u run_report.py
+          python -u K_function_warrant_report_20260530.py
 
       - name: Save refreshed FinMind market cache
         if: success()
@@ -423,7 +423,7 @@ jobs:
 
       - name: Run warrant report test
         run: |
-          echo "========== 開始執行 FinMind-only run_report.py =========="
+          echo "========== 開始執行 FinMind-only K_function_warrant_report_20260530.py =========="
           echo "STOCK_CODES=$STOCK_CODES"
           echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
           echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
@@ -438,7 +438,7 @@ jobs:
           echo "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE=$WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
-          python -u run_report.py
+          python -u K_function_warrant_report_20260530.py
 
       - name: Save refreshed LLM cache
         if: always()
