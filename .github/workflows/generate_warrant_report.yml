@@ -284,17 +284,46 @@ jobs:
       GEMINI_MODEL: gemini-3.1-flash-lite
 
       # ========================================================
-      # 新聞只使用 FinMind TaiwanStockNews。
+      # 新聞恢復舊版多來源高品質管線：
+      # Google News + Yahoo RSS + Bing RSS + MoneyDJ + MOPS，
+      # 先事件去重與相關性排序，再替 Top-K 補抓原文並交由 Gemini 驗證。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v19_gemini_quality_event_dedup"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v20_multisource_body_grounded"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
-      WARRANT_NEWS_GOOGLE_MAX_ITEMS: "24"
+      WARRANT_NEWS_GOOGLE_MAX_ITEMS: "36"
+      WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "10"
+      WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES: "2"
+      WARRANT_NEWS_FALLBACK_DAYS: "7,14,30"
       WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI: "12"
       WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT: "24"
-      # 原始標題／摘要必須直接出現本公司名稱或代號，避免錯標新聞。
-      WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET: "1"
-      # 恢復原始高品質流程：格式／evidence／數字不合格時修復，另有不同事件才補點。
+      WARRANT_NEWS_MIN_DISTINCT_ARTICLES: "2"
+
+      # 先以 RSS 快速建候選，再只替最相關的前 3 篇補抓原文。
+      WARRANT_NEWS_FAST_MODE: "1"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_ENABLE: "1"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK: "3"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_WORKERS: "3"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT: "4"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT: "8"
+      WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES: "196608"
+      WARRANT_NEWS_MIN_BODY_CHARS: "120"
+      WARRANT_NEWS_RSS_FALLBACK: "1"
+      WARRANT_NEWS_REQUIRE_BODY: "0"
+
+      # 多來源全部啟用；單一來源失敗時只略過該來源。
+      WARRANT_NEWS_MULTI_SOURCE_ENABLE: "1"
+      WARRANT_NEWS_YAHOO_RSS_ENABLE: "1"
+      WARRANT_NEWS_BING_RSS_ENABLE: "1"
+      WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE: "1"
+      WARRANT_NEWS_MOPS_ENABLE: "1"
+      WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE: "12"
+      WARRANT_NEWS_MONEYDJ_BODY_FETCH_LIMIT: "5"
+      WARRANT_NEWS_MOPS_MAX_ITEMS: "12"
+      WARRANT_NEWS_GNEWSDECODER_ENABLE: "0"
+
+      # 第一輪輸出若 evidence、數字或格式不合格，允許修復；
+      # 合格事件不足時只補不同事件，不用重複新聞湊滿。
       WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "1"
       WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "1"
 
@@ -411,7 +440,7 @@ jobs:
           download_font "$BOLD_FONT" "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Bold.otf" &
           FONT_PID_2=$!
 
-          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4
+          uv pip install --system requests pandas gspread google-auth Pillow matplotlib numpy google-genai pyarrow beautifulsoup4 lxml googlenewsdecoder
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
@@ -423,7 +452,7 @@ jobs:
 
       - name: Run warrant report test
         run: |
-          echo "========== 開始執行 FinMind-only K_function_warrant_report_20260530.py =========="
+          echo "========== 開始執行 FinMind market + multi-source news K_function_warrant_report_20260530.py =========="
           echo "STOCK_CODES=$STOCK_CODES"
           echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
           echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
