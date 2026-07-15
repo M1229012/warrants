@@ -192,7 +192,7 @@ jobs:
       WARRANT_REPORT_FONT_DIR: .cache/report-fonts
 
       # ========================================================
-      # 唯一市場／新聞資料來源：FinMind
+      # 市場資料使用 FinMind；新聞使用六來源整合
       # ========================================================
       WARRANT_DATA_SOURCE_MODE: "finmind_only"
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
@@ -285,11 +285,14 @@ jobs:
 
       # ========================================================
       # 新聞恢復舊版多來源高品質管線：
-      # Google News + Yahoo RSS + Bing RSS + MoneyDJ + MOPS，
+      # Google News + FinMind + Yahoo RSS + Bing RSS + MoneyDJ + MOPS，
       # 先事件去重與相關性排序，再替 Top-K 補抓原文並交由 Gemini 驗證。
       # ========================================================
       WARRANT_NEWS_ENABLE: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v20_multisource_body_grounded"
+      # FinMind TaiwanStockNews 作為第六個來源；只有標題時僅作低優先級事實素材。
+      WARRANT_FINMIND_NEWS_ENABLE: "1"
+      WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET: "1"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v21_multisource_finmind_grounded"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
       WARRANT_NEWS_GOOGLE_MAX_ITEMS: "36"
       WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "10"
@@ -461,6 +464,7 @@ jobs:
           echo "FINMIND_WARRANT_LATEST_DAY_API_WORKERS=$FINMIND_WARRANT_LATEST_DAY_API_WORKERS"
           echo "FINMIND_WARRANT_LATEST_DAY_API_STRICT=$FINMIND_WARRANT_LATEST_DAY_API_STRICT"
           echo "FINMIND_NEWS_LOOKBACK_DAYS=$FINMIND_NEWS_LOOKBACK_DAYS"
+          echo "WARRANT_FINMIND_NEWS_ENABLE=$WARRANT_FINMIND_NEWS_ENABLE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
           echo "WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE=$WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE"
