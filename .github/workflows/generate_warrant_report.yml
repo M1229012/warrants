@@ -164,49 +164,29 @@ jobs:
             .cache/matplotlib
 
       - name: Set up Python
-        id: setup-python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      # 快取完整已安裝的 .venv、中文字型與 Matplotlib 字型索引。
-      # 相同 Python 修補版本與 requirements-runtime.txt 時，後續 run 不再執行套件安裝。
-      - name: Restore Python runtime cache
-        id: runtime-cache
+      # 只快取字型與 Matplotlib 索引；不再還原龐大的完整 .venv。
+      - name: Restore report font cache
+        id: report-font-cache
         uses: actions/cache@v4
         with:
           path: |
-            .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-report-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements-runtime.txt') }}-v1
+          key: warrant-report-fonts-${{ runner.os }}-noto-cjk-tc-v2
 
-      - name: Check cached Python runtime
-        id: runtime-check
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -x .venv/bin/python ] \
-            && [ -f .venv/.warrant-runtime-ready ] \
-            && [ -s .cache/report-fonts/NotoSansCJKtc-Regular.otf ] \
-            && [ -s .cache/report-fonts/NotoSansCJKtc-Bold.otf ] \
-            && .venv/bin/python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 完整 Python runtime cache 可直接使用"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "ℹ️ Python runtime cache 未命中或不完整，準備建立一次"
-          fi
-
-      - name: Set up uv on runtime cache miss
-        if: steps.runtime-check.outputs.ready != 'true'
+      # uv 只快取套件下載／解壓成果，每次以快取內容快速重建小型 .venv。
+      - name: Set up uv with dependency cache
         uses: astral-sh/setup-uv@v8.3.2
         with:
           enable-cache: true
-          cache-suffix: warrant-report-runtime-bootstrap
+          cache-dependency-glob: requirements-runtime.txt
+          cache-suffix: warrant-report-runtime-v27
 
-      - name: Build Python runtime and prepare fonts
-        if: steps.runtime-check.outputs.ready != 'true'
+      - name: Build lightweight Python runtime and prepare fonts
         shell: bash
         run: |
           set -euo pipefail
@@ -237,19 +217,19 @@ jobs:
           uv venv --python "$(command -v python)" .venv
           uv pip install \
             --python .venv/bin/python \
-            --requirements requirements-runtime.txt \
-            --compile-bytecode
+            --requirements requirements-runtime.txt
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          MPLCONFIGDIR=.cache/matplotlib \
-          WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
-          .venv/bin/python - <<'PYCODE'
+          if [ "${{ steps.report-font-cache.outputs.cache-hit }}" != "true" ]; then
+            MPLCONFIGDIR=.cache/matplotlib \
+            WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
+            .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
-          touch .venv/.warrant-runtime-ready
+          fi
 
       - name: Prewarm FinMind all-market cache
         run: |
@@ -394,7 +374,10 @@ jobs:
       # FinMind TaiwanStockNews 作為第六個來源；只有標題時僅作低優先級事實素材。
       WARRANT_FINMIND_NEWS_ENABLE: "1"
       WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET: "1"
-      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v22_parallel_six_source_fast"
+      WARRANT_NEWS_SUMMARY_STYLE_VERSION: "v23_rich_local_grounding_two_call"
+      WARRANT_NEWS_SUMMARY_POINT_MAX_LEN: "150"
+      WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS: "50"
+      WARRANT_NEWS_SUMMARY_DETAIL_MAX_CHARS: "70"
       WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK: "0"
       WARRANT_NEWS_GOOGLE_MAX_ITEMS: "24"
       WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER: "4"
@@ -433,8 +416,8 @@ jobs:
       WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE: "8"
       WARRANT_NEWS_MOPS_MAX_ITEMS: "8"
 
-      # 第一輪輸出若 evidence、數字或格式不合格，允許修復；
-      # 合格事件不足時只補不同事件，不用重複新聞湊滿。
+      # 第一輪先做 evidence、數字單位與 detail 本地修復；仍需補正時，
+      # 只再呼叫一次 Gemini，同一輪完成格式修正與不同事件補充。
       WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "1"
       WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "1"
 
@@ -508,47 +491,27 @@ jobs:
           rm -f output/*_warrant_report.png output/debug_*.csv
 
       - name: Set up Python
-        id: setup-python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Restore Python runtime cache
-        id: runtime-cache
+      - name: Restore report font cache
+        id: report-font-cache
         uses: actions/cache@v4
         with:
           path: |
-            .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-report-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements-runtime.txt') }}-v1
+          key: warrant-report-fonts-${{ runner.os }}-noto-cjk-tc-v2
 
-      - name: Check cached Python runtime
-        id: runtime-check
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -x .venv/bin/python ] \
-            && [ -f .venv/.warrant-runtime-ready ] \
-            && [ -s .cache/report-fonts/NotoSansCJKtc-Regular.otf ] \
-            && [ -s .cache/report-fonts/NotoSansCJKtc-Bold.otf ] \
-            && .venv/bin/python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 完整 Python runtime cache 可直接使用；略過 uv 與套件安裝"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "ℹ️ Python runtime cache 未命中或不完整，準備建立一次"
-          fi
-
-      - name: Set up uv on runtime cache miss
-        if: steps.runtime-check.outputs.ready != 'true'
+      - name: Set up uv with dependency cache
         uses: astral-sh/setup-uv@v8.3.2
         with:
           enable-cache: true
-          cache-suffix: warrant-report-runtime-bootstrap
+          cache-dependency-glob: requirements-runtime.txt
+          cache-suffix: warrant-report-runtime-v27
 
-      - name: Build Python runtime and prepare fonts
-        if: steps.runtime-check.outputs.ready != 'true'
+      - name: Build lightweight Python runtime and prepare fonts
         shell: bash
         run: |
           set -euo pipefail
@@ -579,19 +542,19 @@ jobs:
           uv venv --python "$(command -v python)" .venv
           uv pip install \
             --python .venv/bin/python \
-            --requirements requirements-runtime.txt \
-            --compile-bytecode
+            --requirements requirements-runtime.txt
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          MPLCONFIGDIR=.cache/matplotlib \
-          WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
-          .venv/bin/python - <<'PYCODE'
+          if [ "${{ steps.report-font-cache.outputs.cache-hit }}" != "true" ]; then
+            MPLCONFIGDIR=.cache/matplotlib \
+            WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
+            .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
-          touch .venv/.warrant-runtime-ready
+          fi
 
       - name: Run warrant report test
         run: |
@@ -611,6 +574,9 @@ jobs:
           echo "WARRANT_FINMIND_NEWS_ENABLE=$WARRANT_FINMIND_NEWS_ENABLE"
           echo "WARRANT_NEWS_SOURCE_BATCH_TIMEOUT=$WARRANT_NEWS_SOURCE_BATCH_TIMEOUT"
           echo "WARRANT_NEWS_RAW_CACHE_TTL_SECONDS=$WARRANT_NEWS_RAW_CACHE_TTL_SECONDS"
+          echo "WARRANT_NEWS_SUMMARY_STYLE_VERSION=$WARRANT_NEWS_SUMMARY_STYLE_VERSION"
+          echo "WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS=$WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS"
+          echo "WARRANT_NEWS_SUMMARY_DETAIL_MAX_CHARS=$WARRANT_NEWS_SUMMARY_DETAIL_MAX_CHARS"
           echo "WARRANT_SELECTED_BRANCH_FLOW_MODE=$WARRANT_SELECTED_BRANCH_FLOW_MODE"
           echo "WARRANT_SELECTED_BRANCH_FLOW_BRANCHES=$WARRANT_SELECTED_BRANCH_FLOW_BRANCHES"
           echo "WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE=$WARRANT_COMPARE_MONEYDJ_DEBUG_ENABLE"
@@ -618,6 +584,15 @@ jobs:
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
           .venv/bin/python -u K_function_warrant_report_20260530.py
+
+      - name: Save refreshed FinMind report cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            finmind_cache/warrant_market_compact_v1
+            finmind_cache/reference
+          key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
 
       - name: Save refreshed LLM cache
         if: always()
