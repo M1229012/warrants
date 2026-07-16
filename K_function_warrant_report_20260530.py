@@ -12595,7 +12595,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-parallel-pipeline-issuer-cache-runtime-v29"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-parallel-pipeline-backfill-empty-hotfix-v30"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15086,6 +15086,7 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
     trader_name_map: Dict[str, str],
     historical_events: pd.DataFrame | None = None,
     selected_branch_id_map: Dict[str, set] | None = None,
+    all_empty_is_error: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """最新日以「Summary有效 + 近期歷史 + 精選分點當日發現」聯集逐檔查 API。"""
     day = pd.Timestamp(trade_date).normalize()
@@ -15284,9 +15285,16 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
             f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
             "可能是 API 尚未完成更新"
         )
-        if FINMIND_WARRANT_LATEST_DAY_API_STRICT and query_codes:
+        if FINMIND_WARRANT_LATEST_DAY_API_STRICT and query_codes and all_empty_is_error:
             raise RuntimeError(message)
-        print(f"⚠️ {message}")
+        if query_codes and not all_empty_is_error:
+            print(
+                f"ℹ️ 最新日補查權證皆無成交：{stock_code} {stock_name}｜"
+                f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
+                "視為合法空結果，不影響主要最新日資料"
+            )
+        else:
+            print(f"⚠️ {message}")
         return pd.DataFrame(columns=output_cols), stats
 
     events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
@@ -15586,6 +15594,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             trader_name_map,
             historical_events=None,
             selected_branch_id_map={},
+            all_empty_is_error=False,
         )
         latest_events = pd.concat([latest_events, backfill_events], ignore_index=True, sort=False).fillna("")
         if not latest_events.empty:
