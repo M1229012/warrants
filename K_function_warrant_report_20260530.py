@@ -2426,17 +2426,64 @@ def _read_gsheet_warrant_status() -> pd.DataFrame:
 # 官方權證 OpenAPI：僅供發行商辨識與當日成交量完整性驗證
 # ============================================================
 
-def fetch_openapi_json(url: str, source_name: str):
-    try:
-        r = get_thread_session().get(url, headers=OPENAPI_WARRANT_HEADERS, timeout=(8, 30))
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
+def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
+    """抓取官方 OpenAPI，針對暫時性斷線重試並回傳明確成功狀態。
+
+    回傳值：
+    - data：官方 JSON list。
+    - fetch_ok：是否成功取得且解析為 list。
+    - error_text：最後一次失敗原因。
+
+    官方來源抓取失敗不能等同於「官方尚未發布」，因此呼叫端必須使用
+    fetch_ok 區分網路錯誤與真正沒有目標日資料。
+    """
+    max_attempts = max(2, int(FINMIND_REQUEST_RETRIES))
+    last_error = ""
+    request_headers = dict(OPENAPI_WARRANT_HEADERS)
+    request_headers["Connection"] = "close"
+
+    for attempt in range(1, max_attempts + 1):
+        session = None
+        try:
+            # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的
+            # keep-alive 連線持續觸發 Response ended prematurely。
+            if attempt == 1:
+                session = get_thread_session()
+                close_session = False
+            else:
+                session = requests.Session()
+                close_session = True
+
+            try:
+                r = session.get(
+                    url,
+                    headers=request_headers,
+                    timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
+                )
+                r.raise_for_status()
+                data = r.json()
+            finally:
+                if close_session and session is not None:
+                    session.close()
+
+            if not isinstance(data, list):
+                raise RuntimeError(f"官方回應不是 list：type={type(data).__name__}")
+
             print(f"✅ {source_name} OpenAPI：{len(data):,} 筆")
-            return data
-    except Exception as e:
-        print(f"⚠️ {source_name} OpenAPI 抓取失敗：{e}")
-    return []
+            return data, True, ""
+        except Exception as exc:
+            last_error = str(exc or type(exc).__name__)
+            if attempt < max_attempts:
+                wait_sec = min(8.0, FINMIND_RETRY_BASE_WAIT * attempt)
+                print(
+                    f"⚠️ {source_name} OpenAPI 暫時失敗，準備重試 "
+                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}"
+                )
+                time.sleep(wait_sec)
+                continue
+            print(f"⚠️ {source_name} OpenAPI 抓取失敗：{last_error}")
+
+    return [], False, last_error
 
 
 def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataFrame:
@@ -2447,10 +2494,14 @@ def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
             print(f"♻️ 重用同次執行 TWSE 權證 OpenAPI：{len(cached):,} 筆")
             return cached.copy()
 
-    data = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
+    data, fetch_ok, fetch_error = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
     df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}.issubset(df.columns):
-        return pd.DataFrame()
+    required_columns = {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}
+    if df.empty or not required_columns.issubset(df.columns):
+        out = pd.DataFrame()
+        out.attrs["openapi_fetch_ok"] = False
+        out.attrs["openapi_fetch_error"] = fetch_error or "TWSE 官方回傳空資料或欄位不完整"
+        return out
     out = pd.DataFrame()
     out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
     out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
@@ -2459,6 +2510,8 @@ def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
     out["名稱"] = df["權證名稱"].astype(str).str.strip()
     out["成交金額"] = df["成交金額"].map(clean_openapi_number)
     out["成交量"] = df["成交張數"].map(clean_openapi_number)
+    out.attrs["openapi_fetch_ok"] = bool(fetch_ok)
+    out.attrs["openapi_fetch_error"] = str(fetch_error or "")
     with _OPENAPI_WARRANT_DAILY_CACHE_LOCK:
         _OPENAPI_WARRANT_DAILY_CACHE[cache_key] = out.copy()
     return out
@@ -2472,10 +2525,14 @@ def fetch_tpex_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
             print(f"♻️ 重用同次執行 TPEx 權證 OpenAPI：{len(cached):,} 筆")
             return cached.copy()
 
-    data = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
+    data, fetch_ok, fetch_error = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
     df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}.issubset(df.columns):
-        return pd.DataFrame()
+    required_columns = {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}
+    if df.empty or not required_columns.issubset(df.columns):
+        out = pd.DataFrame()
+        out.attrs["openapi_fetch_ok"] = False
+        out.attrs["openapi_fetch_error"] = fetch_error or "TPEx 官方回傳空資料或欄位不完整"
+        return out
     out = pd.DataFrame()
     out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
     out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
@@ -2483,9 +2540,11 @@ def fetch_tpex_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
     out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
     out["名稱"] = df["權證名稱"].astype(str).str.strip()
     out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    # TPEx「成交數量」欄位為股數；FinMind buy_shares / sell_shares 為張數。
+    # TPEx「成交數量」為股數；FinMind buy_shares / sell_shares 為張數。
     # 先除以 1,000 統一成張，避免完整性保護把相同成交量誤判為相差 1,000 倍。
     out["成交量"] = df["成交數量"].map(clean_openapi_number).astype(float) / 1000.0
+    out.attrs["openapi_fetch_ok"] = bool(fetch_ok)
+    out.attrs["openapi_fetch_error"] = str(fetch_error or "")
     with _OPENAPI_WARRANT_DAILY_CACHE_LOCK:
         _OPENAPI_WARRANT_DAILY_CACHE[cache_key] = out.copy()
     return out
@@ -12701,7 +12760,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-official-preflight-crossprobe-v34"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-official-openapi-failsafe-v35"
 FINMIND_PERFORMANCE_PATCH = "official-preflight+selected-branch-crossprobe+probe-first+second-stage-no-reprobe+issuer-vectorized+timed-context"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
@@ -15868,6 +15927,39 @@ def _finmind_current_day_official_preflight(
                 print(f"⚠️ 官方發布前置檢查 TPEx OpenAPI 失敗：{exc}")
                 tpex_df = pd.DataFrame()
 
+        source_frames = {"TWSE": twse_df, "TPEx": tpex_df}
+        unavailable_sources = []
+        for source_name, source_df in source_frames.items():
+            fetch_ok = bool(
+                isinstance(source_df, pd.DataFrame)
+                and source_df.attrs.get("openapi_fetch_ok", False)
+            )
+            if not fetch_ok:
+                error_text = (
+                    str(source_df.attrs.get("openapi_fetch_error", "") or "")
+                    if isinstance(source_df, pd.DataFrame)
+                    else "未取得 DataFrame"
+                )
+                unavailable_sources.append(
+                    f"{source_name}{f'（{error_text}）' if error_text else ''}"
+                )
+
+        # 任一官方市場來源抓取失敗時，不能把另一個市場仍停在前一日
+        # 解讀成「所有官方權證尚未發布」。此時改為 unknown，讓 FinMind
+        # 逐權證 API 繼續查詢，避免網路暫時斷線直接抹掉今日資料。
+        if unavailable_sources:
+            result["status"] = "unknown"
+            result["reason"] = (
+                "官方來源暫時無法完整取得："
+                + "、".join(unavailable_sources)
+                + "；不以此判定尚未發布，維持完整逐權證查詢"
+            )
+            print(
+                f"⚠️ 官方發布前置檢查來源不完整，維持完整逐權證查詢："
+                f"{stock_code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
         official_parts = []
         source_latest = {"TWSE": pd.NaT, "TPEx": pd.NaT}
         for source_name, source_df in (("TWSE", twse_df), ("TPEx", tpex_df)):
@@ -16728,6 +16820,38 @@ def _finmind_current_day_official_volume_audit(
                 print(f"⚠️ 當日完整性驗證 TPEx OpenAPI 失敗：{exc}")
                 tpex_df = pd.DataFrame()
 
+        source_frames = {"TWSE": twse_df, "TPEx": tpex_df}
+        unavailable_sources = []
+        for source_name, source_df in source_frames.items():
+            fetch_ok = bool(
+                isinstance(source_df, pd.DataFrame)
+                and source_df.attrs.get("openapi_fetch_ok", False)
+            )
+            if not fetch_ok:
+                error_text = (
+                    str(source_df.attrs.get("openapi_fetch_error", "") or "")
+                    if isinstance(source_df, pd.DataFrame)
+                    else "未取得 DataFrame"
+                )
+                unavailable_sources.append(
+                    f"{source_name}{f'（{error_text}）' if error_text else ''}"
+                )
+
+        # 官方來源網路失敗只代表「本次無法驗證」，不代表 FinMind 當日資料不完整。
+        # 由 safety guard 保留當日資料，下一次執行再重新驗證。
+        if unavailable_sources:
+            result["status"] = "source_unavailable"
+            result["reason"] = (
+                "官方來源暫時無法完整取得："
+                + "、".join(unavailable_sources)
+                + "；本次無法完成官方成交量核對"
+            )
+            print(
+                f"⚠️ FinMind 當日完整性驗證暫時無法執行："
+                f"{code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
         official_parts = []
         source_latest = {}
         for source_name, source_df in [("TWSE", twse_df), ("TPEx", tpex_df)]:
@@ -16963,6 +17087,22 @@ def _apply_finmind_current_day_safety_guard(
         )
         return out
 
+    guard_status = str(audit.get("status", "") or "")
+    hard_reject_statuses = {"mismatch", "official_pending"}
+
+    # 只有官方資料已成功取得，且明確判定「總量不符」或「官方尚未發布」時才退回。
+    # source_unavailable / error / unverified 都是驗證工具本身暫時不可用，不能因此
+    # 刪除已由 FinMind 成功取得的當日資料。
+    if guard_status not in hard_reject_statuses:
+        print(
+            "⚠️ FinMind 最新日 API 官方驗證未完成，但不視為資料不完整；"
+            f"正式圖保留當日資料｜日期={taipei_today.date()}｜事件={len(current_rows):,}筆｜"
+            f"驗證狀態={guard_status or 'unverified'}｜原因={audit.get('reason', '')}"
+        )
+        out.attrs["finmind_guard_status"] = "unverified_keep"
+        out.attrs["finmind_guard_unverified_date"] = taipei_today.strftime("%Y-%m-%d")
+        return out
+
     if kept.empty:
         print(
             "⚠️ FinMind 最新日 API 完整性未通過，但沒有較早資料可退回；"
@@ -16973,7 +17113,6 @@ def _apply_finmind_current_day_safety_guard(
 
     for col in ["buy_amount", "sell_amount", "net_amount"]:
         current_rows[col] = pd.to_numeric(current_rows.get(col, 0), errors="coerce").fillna(0.0)
-    guard_status = str(audit.get("status", "") or "")
     guard_title = "官方相關市場資料尚未更新" if guard_status == "official_pending" else "官方成交量核對未通過"
     result = kept.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
     print(
