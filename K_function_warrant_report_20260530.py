@@ -2483,7 +2483,9 @@ def fetch_tpex_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
     out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
     out["名稱"] = df["權證名稱"].astype(str).str.strip()
     out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    out["成交量"] = df["成交數量"].map(clean_openapi_number)
+    # TPEx「成交數量」欄位為股數；FinMind buy_shares / sell_shares 為張數。
+    # 先除以 1,000 統一成張，避免完整性保護把相同成交量誤判為相差 1,000 倍。
+    out["成交量"] = df["成交數量"].map(clean_openapi_number).astype(float) / 1000.0
     with _OPENAPI_WARRANT_DAILY_CACHE_LOCK:
         _OPENAPI_WARRANT_DAILY_CACHE[cache_key] = out.copy()
     return out
