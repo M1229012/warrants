@@ -98,6 +98,7 @@ jobs:
       FINMIND_READ_TIMEOUT: "240"
       FINMIND_CACHE_DIR: finmind_cache
       FINMIND_WARRANT_DOWNLOAD_WORKERS: "8"
+      FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE: "1"
       FINMIND_PREWARM_WORKERS: "4"
       FINMIND_PREWARM_CALENDAR_DAYS: "150"
       FINMIND_PREWARM_REFRESH_RECENT_DAYS: "2"
@@ -141,7 +142,8 @@ jobs:
             finmind_cache/warrant_market_compact_v1 \
             finmind_cache/reference \
             .cache/report-fonts \
-            .cache/matplotlib
+            .cache/matplotlib \
+            .runtime-cache
 
       # 預熱工作保留少量原始 Parquet，供隔日增量更新；正式報表不再下載這個大型快取。
       - name: Restore FinMind raw prewarm cache
@@ -160,8 +162,6 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
-            .cache/report-fonts
-            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
           restore-keys: |
             warrant-finmind-report-${{ runner.os }}-
@@ -171,37 +171,58 @@ jobs:
         with:
           python-version: "3.11.15"
 
+      # 單一壓縮檔保存已安裝完成的 .venv、中文字型與 Matplotlib 索引。
+      # 暖快取只還原一個檔案並本機解壓，不再還原數千個 wheel／site-packages 小檔。
+      - name: Restore packaged Python runtime
+        id: runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: .runtime-cache/warrant-runtime-py311-v29.tar.zst
+          key: warrant-runtime-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v29
 
-      # uv 只快取套件下載／解壓成果，每次以快取內容快速重建小型 .venv。
-      - name: Set up fixed uv with full dependency cache
-        id: setup-uv
+      - name: Set up fixed uv on packaged-runtime cache miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
         uses: astral-sh/setup-uv@v8.3.2
         with:
           version: "0.11.28"
-          enable-cache: true
-          cache-dependency-glob: requirements-runtime.txt
-          cache-suffix: warrant-report-runtime-v28-full
-          prune-cache: false
-          cache-python: false
+          enable-cache: false
           add-problem-matchers: false
           quiet: true
 
-      - name: Build lightweight Python runtime and prepare fonts
+      - name: Restore or build packaged Python runtime
         shell: bash
         run: |
           set -euo pipefail
 
+          ARCHIVE=".runtime-cache/warrant-runtime-py311-v29.tar.zst"
           FONT_DIR=".cache/report-fonts"
           REGULAR_FONT="${FONT_DIR}/NotoSansCJKtc-Regular.otf"
           BOLD_FONT="${FONT_DIR}/NotoSansCJKtc-Bold.otf"
-          mkdir -p "$FONT_DIR" .cache/matplotlib
+          mkdir -p .runtime-cache "$FONT_DIR" .cache/matplotlib
+
+          runtime_ok() {
+            [ -x .venv/bin/python ] \
+              && [ -s "$REGULAR_FONT" ] \
+              && [ -s "$BOLD_FONT" ] \
+              && .venv/bin/python -c "import pandas,numpy,pyarrow,matplotlib,PIL,gspread,google.genai" >/dev/null 2>&1
+          }
+
+          if [ -s "$ARCHIVE" ]; then
+            rm -rf .venv .cache/report-fonts .cache/matplotlib
+            mkdir -p .cache
+            tar --zstd -xf "$ARCHIVE"
+            if runtime_ok; then
+              echo "✅ 單一封裝 Python runtime 快取命中並完成解壓"
+              exit 0
+            fi
+            echo "⚠️ 封裝 runtime 驗證失敗，本次重新建立"
+            rm -rf .venv .cache/report-fonts .cache/matplotlib "$ARCHIVE"
+            mkdir -p "$FONT_DIR" .cache/matplotlib
+          fi
 
           download_font() {
             local target="$1"
             local url="$2"
-            if [ -s "$target" ]; then
-              return 0
-            fi
             curl --fail --location --retry 4 --retry-delay 2 \
               --connect-timeout 10 --max-time 120 \
               --output "$target" "$url"
@@ -214,42 +235,35 @@ jobs:
           FONT_PID_2=$!
 
           rm -rf .venv
-          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
-
-          if [ "${{ steps.setup-uv.outputs.cache-hit }}" = "true" ]; then
-            if ! uv pip install \
-              --offline \
-              --no-build \
-              --no-deps \
-              --python .venv/bin/python \
-              --requirements requirements-runtime.txt; then
-              echo "⚠️ uv 完整快取命中但離線安裝不完整，僅本次回退線上補齊"
-              uv pip install \
-                --no-build \
-                --no-deps \
-                --python .venv/bin/python \
-                --requirements requirements-runtime.txt
-            fi
-          else
-            uv pip install \
-              --no-build \
-              --no-deps \
-              --python .venv/bin/python \
-              --requirements requirements-runtime.txt
+          if ! command -v uv >/dev/null 2>&1; then
+            curl --fail --location --retry 4 --retry-delay 2               --connect-timeout 10 --max-time 120               https://astral.sh/uv/0.11.28/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
           fi
+          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
+          uv pip install \
+            --no-build \
+            --no-deps \
+            --python .venv/bin/python \
+            --requirements requirements-runtime.txt
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          if [ ! -f .cache/matplotlib/.warrant-font-index-ready ]; then
-            MPLCONFIGDIR=.cache/matplotlib \
-            WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
-            .venv/bin/python - <<'PYCODE'
+          MPLCONFIGDIR=.cache/matplotlib \
+          WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
+          .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
-            touch .cache/matplotlib/.warrant-font-index-ready
-          fi
+          touch .cache/matplotlib/.warrant-font-index-ready
+          runtime_ok
+
+          rm -f "$ARCHIVE"
+          tar --zstd -cf "$ARCHIVE" \
+            .venv \
+            .cache/report-fonts \
+            .cache/matplotlib
+          echo "✅ 已建立單一封裝 Python runtime：$(du -h "$ARCHIVE" | cut -f1)"
 
       - name: Prewarm FinMind all-market cache
         run: |
@@ -270,8 +284,6 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
-            .cache/report-fonts
-            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
   run-warrant-report-test:
@@ -304,6 +316,7 @@ jobs:
       FINMIND_CONNECT_TIMEOUT: "10"
       FINMIND_READ_TIMEOUT: "240"
       FINMIND_WARRANT_DOWNLOAD_WORKERS: "8"
+      FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE: "1"
       # 歷史日期用 Parquet；最新交易日固定逐支有效權證呼叫 API，取得該權證所有分點。
       FINMIND_WARRANT_LATEST_DAY_API_ENABLE: "1"
       FINMIND_WARRANT_LATEST_DAY_API_WORKERS: "8"
@@ -488,7 +501,8 @@ jobs:
             finmind_cache/warrant_market_compact_v1 \
             finmind_cache/reference \
             .cache/report-fonts \
-            .cache/matplotlib
+            .cache/matplotlib \
+            .runtime-cache
           rm -f output/*_warrant_report.png output/debug_*.csv
 
       - name: Restore LLM cache
@@ -508,8 +522,6 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
-            .cache/report-fonts
-            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
           restore-keys: |
             warrant-finmind-report-${{ runner.os }}-
@@ -520,36 +532,58 @@ jobs:
         with:
           python-version: "3.11.15"
 
+      # 單一壓縮檔保存已安裝完成的 .venv、中文字型與 Matplotlib 索引。
+      # 暖快取只還原一個檔案並本機解壓，不再還原數千個 wheel／site-packages 小檔。
+      - name: Restore packaged Python runtime
+        id: runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: .runtime-cache/warrant-runtime-py311-v29.tar.zst
+          key: warrant-runtime-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v29
 
-      - name: Set up fixed uv with full dependency cache
-        id: setup-uv
+      - name: Set up fixed uv on packaged-runtime cache miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
         uses: astral-sh/setup-uv@v8.3.2
         with:
           version: "0.11.28"
-          enable-cache: true
-          cache-dependency-glob: requirements-runtime.txt
-          cache-suffix: warrant-report-runtime-v28-full
-          prune-cache: false
-          cache-python: false
+          enable-cache: false
           add-problem-matchers: false
           quiet: true
 
-      - name: Build lightweight Python runtime and prepare fonts
+      - name: Restore or build packaged Python runtime
         shell: bash
         run: |
           set -euo pipefail
 
+          ARCHIVE=".runtime-cache/warrant-runtime-py311-v29.tar.zst"
           FONT_DIR=".cache/report-fonts"
           REGULAR_FONT="${FONT_DIR}/NotoSansCJKtc-Regular.otf"
           BOLD_FONT="${FONT_DIR}/NotoSansCJKtc-Bold.otf"
-          mkdir -p "$FONT_DIR" .cache/matplotlib
+          mkdir -p .runtime-cache "$FONT_DIR" .cache/matplotlib
+
+          runtime_ok() {
+            [ -x .venv/bin/python ] \
+              && [ -s "$REGULAR_FONT" ] \
+              && [ -s "$BOLD_FONT" ] \
+              && .venv/bin/python -c "import pandas,numpy,pyarrow,matplotlib,PIL,gspread,google.genai" >/dev/null 2>&1
+          }
+
+          if [ -s "$ARCHIVE" ]; then
+            rm -rf .venv .cache/report-fonts .cache/matplotlib
+            mkdir -p .cache
+            tar --zstd -xf "$ARCHIVE"
+            if runtime_ok; then
+              echo "✅ 單一封裝 Python runtime 快取命中並完成解壓"
+              exit 0
+            fi
+            echo "⚠️ 封裝 runtime 驗證失敗，本次重新建立"
+            rm -rf .venv .cache/report-fonts .cache/matplotlib "$ARCHIVE"
+            mkdir -p "$FONT_DIR" .cache/matplotlib
+          fi
 
           download_font() {
             local target="$1"
             local url="$2"
-            if [ -s "$target" ]; then
-              return 0
-            fi
             curl --fail --location --retry 4 --retry-delay 2 \
               --connect-timeout 10 --max-time 120 \
               --output "$target" "$url"
@@ -562,42 +596,35 @@ jobs:
           FONT_PID_2=$!
 
           rm -rf .venv
-          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
-
-          if [ "${{ steps.setup-uv.outputs.cache-hit }}" = "true" ]; then
-            if ! uv pip install \
-              --offline \
-              --no-build \
-              --no-deps \
-              --python .venv/bin/python \
-              --requirements requirements-runtime.txt; then
-              echo "⚠️ uv 完整快取命中但離線安裝不完整，僅本次回退線上補齊"
-              uv pip install \
-                --no-build \
-                --no-deps \
-                --python .venv/bin/python \
-                --requirements requirements-runtime.txt
-            fi
-          else
-            uv pip install \
-              --no-build \
-              --no-deps \
-              --python .venv/bin/python \
-              --requirements requirements-runtime.txt
+          if ! command -v uv >/dev/null 2>&1; then
+            curl --fail --location --retry 4 --retry-delay 2               --connect-timeout 10 --max-time 120               https://astral.sh/uv/0.11.28/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
           fi
+          uv venv --no-project --python "${pythonLocation}/bin/python" .venv
+          uv pip install \
+            --no-build \
+            --no-deps \
+            --python .venv/bin/python \
+            --requirements requirements-runtime.txt
 
           wait "$FONT_PID_1"
           wait "$FONT_PID_2"
 
-          if [ ! -f .cache/matplotlib/.warrant-font-index-ready ]; then
-            MPLCONFIGDIR=.cache/matplotlib \
-            WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
-            .venv/bin/python - <<'PYCODE'
+          MPLCONFIGDIR=.cache/matplotlib \
+          WARRANT_REPORT_FONT_DIR=.cache/report-fonts \
+          .venv/bin/python - <<'PYCODE'
           import matplotlib.font_manager as fm
           print(f"✅ Matplotlib 字型索引已建立：{len(fm.fontManager.ttflist)} fonts")
           PYCODE
-            touch .cache/matplotlib/.warrant-font-index-ready
-          fi
+          touch .cache/matplotlib/.warrant-font-index-ready
+          runtime_ok
+
+          rm -f "$ARCHIVE"
+          tar --zstd -cf "$ARCHIVE" \
+            .venv \
+            .cache/report-fonts \
+            .cache/matplotlib
+          echo "✅ 已建立單一封裝 Python runtime：$(du -h "$ARCHIVE" | cut -f1)"
 
       - name: Run warrant report test
         run: |
@@ -606,6 +633,7 @@ jobs:
           echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
           echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
           echo "FINMIND_WARRANT_DOWNLOAD_WORKERS=$FINMIND_WARRANT_DOWNLOAD_WORKERS"
+          echo "FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE=$FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE"
           echo "FINMIND_WARRANT_LATEST_DAY_API_ENABLE=$FINMIND_WARRANT_LATEST_DAY_API_ENABLE"
           echo "FINMIND_WARRANT_LATEST_DAY_API_WORKERS=$FINMIND_WARRANT_LATEST_DAY_API_WORKERS"
           echo "FINMIND_WARRANT_LATEST_DAY_API_STRICT=$FINMIND_WARRANT_LATEST_DAY_API_STRICT"
@@ -635,8 +663,6 @@ jobs:
           path: |
             finmind_cache/warrant_market_compact_v1
             finmind_cache/reference
-            .cache/report-fonts
-            .cache/matplotlib
           key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
 
       - name: Save refreshed LLM cache
