@@ -29,91 +29,72 @@ jobs:
 
     env:
       # ============================================================
-      # 路徑
+      # 路徑與 FinMind
       # ============================================================
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
 
-      OPENAPI_TWSE_FALLBACK_FILE: "t187ap42_L.csv"
-      OPENAPI_TPEX_FALLBACK_FILE: "t187ap42_O.csv"
+      FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
+      FINMIND_API_BASE: "https://api.finmindtrade.com/api/v4"
+      FINMIND_CACHE_SCHEMA_VERSION: "finmind-v2-date-aware"
+
+      FINMIND_METADATA_CACHE_HOURS: "18"
+      FINMIND_HISTORY_WORKERS: "6"
+      FINMIND_MAX_RETRIES: "4"
+      FINMIND_RETRY_BASE_SECONDS: "2"
+      FINMIND_REQUEST_TIMEOUT_CONNECT: "8"
+      FINMIND_REQUEST_TIMEOUT_READ: "120"
+
+      # 目標日每次重新確認；若尚未發布，立即結束，不抓空資料。
+      FINMIND_FORCE_REFRESH_TARGET_DATE: "1"
+      FINMIND_INITIAL_BACKFILL_ON_EMPTY: "1"
+
+      # 原始全市場日檔只保留最近少量日期；標準化歷史另存 Parquet。
+      FINMIND_RAW_DAILY_RETENTION_DAYS: "7"
+      CACHE_WRITE_CSV_COMPAT: "0"
 
       # ============================================================
       # 基本快取
       # ============================================================
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
-
-      HISTORY_CACHE_APPEND_ONLY: "1"
-      HISTORY_CACHE_MERGE_GSHEET_BEFORE_SAVE: "1"
+      CACHE_AUTO_PRUNE_ENABLED: "1"
+      HISTORY_RETENTION_TRADING_DAYS: "200"
+      PRICE_RETENTION_TRADING_DAYS: "200"
 
       # ============================================================
       # 精選五分點
       # ============================================================
       SELECTED_TARGET_LABELS: "華南永昌台中,元大南屯,富邦敦南,永豐金內湖,新光"
 
-      SELECTED_FORCE_ALL_WARRANTS: "0"
-      SELECTED_REFRESH_ALL_WARRANTS: "0"
-
       # ============================================================
-      # 預掃描與每日更新
+      # 價格與報表規則
       # ============================================================
-      CACHE_RECENT_SCAN_DAYS: "50"
-      SELECTED_FULL_SCAN_DAYS: "50"
-      FAST_SKIP_RECENT_PRESCAN: "0"
-
-      DAILY_LIGHT_PROBE_SAMPLE_SIZE: "300"
-      DAILY_LIGHT_PROBE_HISTORY_TRADING_DAYS: "5"
-      DAILY_LIGHT_PROBE_SCAN_DAYS: "2"
-      DAILY_LIGHT_PROBE_WORKERS: "80"
-
-      DAILY_SIGNAL_API5_DAYS: "12"
-
-      # ============================================================
-      # 價格
-      # ============================================================
-      SKIP_PRICE_FETCH: "0"
-
-      PRICE_PREFETCH_RETRY_UNTIL_TARGET_PRICE: "1"
-      PRICE_PREFETCH_FORCE: "0"
-      PRICE_PREFETCH_ALL_ITEM_PRICES: "0"
-
       FETCH_GROUP_WARRANT_PRICES: "0"
+      PRICE_WORKERS: "60"
 
-      # ============================================================
-      # 報表
-      # ============================================================
-      TODAY_IMAGE_USE_CURRENT_CANDIDATES: "1"
-      DATA_UPDATE_ONLY: "0"
+      TOP15_CACHE_ENABLED: "1"
+      TOP15_LOOKBACK_TRADING_DAYS: "40"
+      TOP15_PRICE_LOOKBACK_DAYS: "75"
+      TOP15_REQUIRE_TARGET_DATE_PRICE: "1"
+      TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN: "1"
+      TOP15_MIN_BROKER_REMAINING_COST: "100000"
 
-      # ============================================================
-      # MoneyDJ Repair 固定設定
-      # 是否啟用會由執行方案決定
-      # ============================================================
-      MONEYDJ_SEARCH_REPAIR_RECENT_HISTORY_DAYS: "45"
-      MONEYDJ_SEARCH_REPAIR_INCLUDE_OPEN_POSITION: "1"
-      MONEYDJ_SEARCH_REPAIR_SELECTED_FULL_POOL: "1"
-      MONEYDJ_SEARCH_REPAIR_MAX_FETCH_KEYS: "0"
-
-      MONEYDJ_SEARCH_REPAIR_HISTORY_UNDERLYING_EXPAND_ENABLED: "1"
-      MONEYDJ_SEARCH_REPAIR_FORCE_HISTORY_UNDERLYING_FETCH: "1"
-
-      MONEYDJ_SEARCH_REPAIR_FULL_POOL_FORCE_FETCH: "0"
-      MONEYDJ_SEARCH_REPAIR_FULL_POOL_MAX_FETCH: "0"
-
+      SELL_DETAIL_DAYS: "3"
       # ============================================================
       # Google Sheet
+      # 只同步最終 8 張結果表；原始歷史／價格／候選快取不再存入 Sheet。
       # ============================================================
-      GSHEET_ENABLE: "1"
-      GSHEET_UPLOAD_RESULTS: "1"
-
-      GSHEET_NAME: "權證分點資料_NEW"
       GOOGLE_SHEET_NAME: "權證分點資料_NEW"
 
-      GSHEET_CACHE_ENABLED: "1"
+      GSHEET_CACHE_ENABLED: "0"
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
+      GSHEET_DELETE_OBSOLETE_MANAGED_SHEETS: "1"
 
       GSHEET_WRITE_SLEEP_SECONDS: "1.25"
+      GSHEET_MAX_RETRIES: "6"
+      GSHEET_RETRY_BASE_SECONDS: "12"
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
 
@@ -121,12 +102,6 @@ jobs:
       # Supabase
       # ============================================================
       SUPABASE_CACHE_ENABLED: "0"
-
-      # ============================================================
-      # 執行緒
-      # ============================================================
-      PRICE_WORKERS: "60"
-      FIND_BROKER_WORKERS: "40"
 
 
     steps:
@@ -139,89 +114,42 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Restore local cache backup
+      - name: Restore FinMind local cache
         uses: actions/cache@v4
         with:
           path: warrant_cache
-          key: warrant-cache-${{ runner.os }}-${{ github.run_id }}
+          key: warrant-cache-finmind-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            warrant-cache-${{ runner.os }}-
+            warrant-cache-finmind-v2-${{ runner.os }}-
 
       - name: Resolve run settings
         shell: bash
         run: |
           PLAN="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan || '每日自動流程' }}"
 
-          # ----------------------------------------------------------
-          # 預設值：每日自動流程
-          # 排程執行也會使用這組設定
-          # ----------------------------------------------------------
           WORKFLOW_MODE="daily"
-          RUN_PLAN="daily_signal"
           RUN_MODE="2"
-
-          OPENAPI_ACTIVE_PRESCAN_DAYS="1"
-          ACTIVE_WARRANT_FORCE_REFRESH="1"
-
-          DAILY_LIGHT_PROBE_ENABLED="1"
-
-          INITIAL_HISTORY_DAYS="250"
+          INITIAL_HISTORY_DAYS="200"
           DAILY_UPDATE_DAYS="3"
 
-          PRICE_FETCH_SCOPE="today"
-          AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="1"
-
-          REPORT_FULL_HISTORY="0"
-
-          MONEYDJ_SEARCH_REPAIR_ENABLED="0"
-
-          MAX_WORKERS="80"
-          PRESCAN_WORKERS="80"
-
-          # ----------------------------------------------------------
-          # 各執行方案差異
-          # ----------------------------------------------------------
           case "$PLAN" in
             "每日自動流程")
               ;;
 
             "精選五分點新分類")
               RUN_MODE="1"
-
-              ACTIVE_WARRANT_FORCE_REFRESH="0"
-              DAILY_LIGHT_PROBE_ENABLED="0"
-
-              AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="0"
               ;;
 
             "長期留單補價格")
               WORKFLOW_MODE="longterm"
-              RUN_PLAN="longterm"
               RUN_MODE="2"
               ;;
 
             "完整修補模式")
               WORKFLOW_MODE="repair"
-              RUN_PLAN="full_report"
               RUN_MODE="2"
-
-              OPENAPI_ACTIVE_PRESCAN_DAYS="3"
-              ACTIVE_WARRANT_FORCE_REFRESH="1"
-
-              DAILY_LIGHT_PROBE_ENABLED="1"
-
-              INITIAL_HISTORY_DAYS="750"
+              INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
-
-              PRICE_FETCH_SCOPE="full"
-              AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING="1"
-
-              REPORT_FULL_HISTORY="1"
-
-              MONEYDJ_SEARCH_REPAIR_ENABLED="1"
-
-              MAX_WORKERS="60"
-              PRESCAN_WORKERS="60"
               ;;
 
             *)
@@ -230,50 +158,30 @@ jobs:
               ;;
           esac
 
-          # ----------------------------------------------------------
-          # 寫入後續步驟使用的環境變數
-          # ----------------------------------------------------------
           {
             echo "WORKFLOW_MODE=$WORKFLOW_MODE"
-            echo "RUN_PLAN=$RUN_PLAN"
             echo "RUN_MODE=$RUN_MODE"
-
-            echo "OPENAPI_ACTIVE_PRESCAN_DAYS=$OPENAPI_ACTIVE_PRESCAN_DAYS"
-            echo "ACTIVE_WARRANT_FORCE_REFRESH=$ACTIVE_WARRANT_FORCE_REFRESH"
-
-            echo "DAILY_LIGHT_PROBE_ENABLED=$DAILY_LIGHT_PROBE_ENABLED"
-
             echo "INITIAL_HISTORY_DAYS=$INITIAL_HISTORY_DAYS"
             echo "DAILY_UPDATE_DAYS=$DAILY_UPDATE_DAYS"
-
-            echo "PRICE_FETCH_SCOPE=$PRICE_FETCH_SCOPE"
-            echo "AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING=$AUTO_PRICE_PREFETCH_WHEN_BROKER_DATA_MISSING"
-
-            echo "REPORT_FULL_HISTORY=$REPORT_FULL_HISTORY"
-
-            echo "MONEYDJ_SEARCH_REPAIR_ENABLED=$MONEYDJ_SEARCH_REPAIR_ENABLED"
-
-            echo "MAX_WORKERS=$MAX_WORKERS"
-            echo "PRESCAN_WORKERS=$PRESCAN_WORKERS"
           } >> "$GITHUB_ENV"
 
           echo "=========================================="
           echo "執行方案：$PLAN"
           echo "WORKFLOW_MODE：$WORKFLOW_MODE"
           echo "RUN_MODE：$RUN_MODE"
-          echo "PRICE_FETCH_SCOPE：$PRICE_FETCH_SCOPE"
-          echo "REPORT_FULL_HISTORY：$REPORT_FULL_HISTORY"
-          echo "MONEYDJ_SEARCH_REPAIR_ENABLED：$MONEYDJ_SEARCH_REPAIR_ENABLED"
+          echo "INITIAL_HISTORY_DAYS：$INITIAL_HISTORY_DAYS"
+          echo "DAILY_UPDATE_DAYS：$DAILY_UPDATE_DAYS"
           echo "=========================================="
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pyarrow
 
       - name: Run warrant backtest
         run: |
-          mkdir -p output
+          mkdir -p output warrant_cache
           python warrant_backtest.py
 
       - name: Upload Excel artifact
