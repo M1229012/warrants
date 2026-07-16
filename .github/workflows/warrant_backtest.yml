@@ -82,15 +82,30 @@ jobs:
 
       SELL_DETAIL_DAYS: "3"
       # ============================================================
+      # 完整修補延伸報表
+      # 每日流程不計算這些表；完整修補模式會建立缺少的工作表。
+      # ============================================================
+      RECENT_RANKING_DAYS: "62"
+      WARRANT_CONSENSUS_7D_ENABLED: "1"
+      WARRANT_CONSENSUS_7D_DAYS: "7"
+      WARRANT_CONSENSUS_14D_DAYS: "14"
+      WARRANT_CONSENSUS_21D_DAYS: "21"
+      WARRANT_CONSENSUS_7D_TOP_N: "15"
+      BROKER_10D_DETAIL_ENABLED: "1"
+      BROKER_10D_WINRATE_RANK_ENABLED: "1"
+      BROKER_10D_DETAIL_DAYS: "10"
+
+      # ============================================================
       # Google Sheet
-      # 只同步最終 8 張結果表；原始歷史／價格／候選快取不再存入 Sheet。
+      # 工作表不存在時才建立；已存在時只 insert 缺少資料。
+      # 不刪除、不清空、不重建任何工作表；只刪除已失效分點的舊資料列。
       # ============================================================
       GOOGLE_SHEET_NAME: "權證分點資料_NEW"
 
       GSHEET_CACHE_ENABLED: "0"
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
-      GSHEET_DELETE_OBSOLETE_MANAGED_SHEETS: "1"
+      GSHEET_CLEAN_DELETED_BROKER_ROWS: "1"
 
       GSHEET_WRITE_SLEEP_SECONDS: "1.25"
       GSHEET_MAX_RETRIES: "6"
@@ -148,6 +163,8 @@ jobs:
             "完整修補模式")
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
+              # 重抓完整保留區間，並建立目前缺少的所有完整報表工作表。
+              # 已存在的工作表只增量 insert 缺少資料，不會整表覆寫。
               INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
               ;;
