@@ -12640,7 +12640,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-parallel-pipeline-backfill-empty-hotfix-v30"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-latest-day-empty-fallback-v31"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -12777,6 +12777,13 @@ FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 FINMIND_WARRANT_LATEST_DAY_API_STRICT = os.getenv(
     "FINMIND_WARRANT_LATEST_DAY_API_STRICT",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 最新交易日若所有逐權證請求都成功、但完全沒有成交資料，代表 FinMind 當日權證資料
+# 多半尚未更新完成。此情況不是 API 失敗，預設保留歷史資料並自動回退到最近已有資料的交易日；
+# 欄位缺漏、授權失敗、請求失敗或部分權證失敗仍維持嚴格報錯。
+FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE",
     "1",
 ).strip().lower() not in ("0", "false", "no", "off")
 # 最新日權證母體不能只相信 Summary 的有效期間：
@@ -15288,6 +15295,11 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
         "event_rows": 0,
         "query_codes": list(query_codes),
         "cancelled": False,
+        "all_empty": False,
+        "not_ready": False,
+        "fallback_used": False,
+        "requested_date": day.strftime("%Y-%m-%d"),
+        "resolved_date": "",
     }
     output_cols = [
         "Date", "branch", "broker_code", "warrant_code", "warrant_name",
@@ -15463,11 +15475,28 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
         )
 
     if events.empty:
+        clean_all_empty = bool(
+            query_codes
+            and stats["failed_codes"] == 0
+            and stats["success_codes"] == len(query_codes)
+        )
+        stats["all_empty"] = True
+        stats["not_ready"] = clean_all_empty
         message = (
             f"最新日權證 API 全部無成交資料：{stock_code} {stock_name}｜"
             f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
             "可能是 API 尚未完成更新"
         )
+
+        # 所有請求均成功但結果全空，屬於資料發布時點問題，不是 API 完整性失敗。
+        # 主流程會保留既有歷史事件，並自動使用最近已有資料的交易日產生週報。
+        if clean_all_empty and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE:
+            print(
+                f"⚠️ {message}｜已啟用最近有效交易日回退，"
+                "不將本次全空結果視為致命錯誤"
+            )
+            return pd.DataFrame(columns=output_cols), stats
+
         if FINMIND_WARRANT_LATEST_DAY_API_STRICT and query_codes and all_empty_is_error:
             raise RuntimeError(message)
         if query_codes and not all_empty_is_error:
@@ -15536,14 +15565,6 @@ def _finmind_replace_latest_day_with_warrant_api(
             "query_codes": [],
         }
 
-    removed_rows = int((base["Date"] == day).sum()) if not base.empty and "Date" in base.columns else 0
-    if removed_rows:
-        base = base[base["Date"] != day].copy()
-        print(
-            f"🧹 已移除最新日 Parquet 資料，準備由 API 取代："
-            f"{stock_code}｜日期={day.date()}｜移除={removed_rows:,}筆"
-        )
-
     if precomputed_latest_events is None or precomputed_api_stats is None:
         latest_events, api_stats = _finmind_fetch_latest_day_events_by_warrant_api(
             summary_df,
@@ -15569,8 +15590,45 @@ def _finmind_replace_latest_day_with_warrant_api(
                 "net_amount", "buy_shares", "sell_shares", "side",
             ])
         )
+        fallback_date = (
+            pd.Timestamp(historical_only["Date"].max()).normalize()
+            if not historical_only.empty and "Date" in historical_only.columns
+            else pd.NaT
+        )
+        fallback_used = bool(
+            api_stats.get("not_ready", False)
+            and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE
+            and pd.notna(fallback_date)
+        )
+        api_stats["fallback_used"] = fallback_used
+        api_stats["requested_date"] = day.strftime("%Y-%m-%d")
+        api_stats["resolved_date"] = (
+            fallback_date.strftime("%Y-%m-%d") if pd.notna(fallback_date) else ""
+        )
+        if fallback_used:
+            print(
+                f"↩️ 最新日權證資料尚未更新，已自動回退最近有效交易日："
+                f"{stock_code}｜要求={day.date()}｜實際={fallback_date.date()}｜"
+                f"保留歷史事件={len(historical_only):,}筆"
+            )
+        elif api_stats.get("not_ready", False):
+            print(
+                f"⚠️ 最新日權證資料尚未更新，且找不到可回退的歷史事件："
+                f"{stock_code}｜要求={day.date()}"
+            )
         return historical_only, api_stats
 
+    removed_rows = int((base["Date"] == day).sum()) if not base.empty and "Date" in base.columns else 0
+    if removed_rows:
+        base = base[base["Date"] != day].copy()
+        print(
+            f"🧹 已移除最新日 Parquet 資料，準備由 API 取代："
+            f"{stock_code}｜日期={day.date()}｜移除={removed_rows:,}筆"
+        )
+
+    api_stats["fallback_used"] = False
+    api_stats["requested_date"] = day.strftime("%Y-%m-%d")
+    api_stats["resolved_date"] = day.strftime("%Y-%m-%d")
     merged = _concat_warrant_event_frames([base, latest_events])
     merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
     merged = merged.dropna(subset=["Date"])
@@ -15853,10 +15911,14 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     latest_success = int(latest_api_stats.get("success_codes", 0) or 0)
     latest_active = int(latest_api_stats.get("active_codes", 0) or 0)
     latest_has_data = int(latest_api_stats.get("event_rows", 0) or 0) > 0
+    latest_fallback_used = bool(latest_api_stats.get("fallback_used", False))
     latest_date_count = 1 if FINMIND_WARRANT_LATEST_DAY_API_ENABLE else 0
     latest_success_date_count = (
         1
-        if latest_date_count and latest_failed == 0 and (latest_success == latest_active or latest_active == 0)
+        if latest_date_count
+        and latest_has_data
+        and latest_failed == 0
+        and (latest_success == latest_active or latest_active == 0)
         else 0
     )
     stats = {
@@ -15871,6 +15933,10 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         "latest_api_success_codes": latest_success,
         "latest_api_empty_codes": int(latest_api_stats.get("empty_codes", 0) or 0),
         "latest_api_event_rows": int(latest_api_stats.get("event_rows", 0) or 0),
+        "latest_api_all_empty": bool(latest_api_stats.get("all_empty", False)),
+        "latest_api_fallback_used": latest_fallback_used,
+        "latest_api_requested_date": str(latest_api_stats.get("requested_date", "") or ""),
+        "latest_api_resolved_date": str(latest_api_stats.get("resolved_date", "") or ""),
     }
     _FINMIND_WARRANT_RUN_STATS[code] = stats
 
@@ -15888,7 +15954,9 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         return pd.DataFrame(columns=empty_columns)
     events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
     latest_source_label = (
-        "平行權證代號API"
+        "API尚未更新，回退最近有效交易日"
+        if latest_fallback_used
+        else "平行權證代號API"
         if FINMIND_WARRANT_LATEST_DAY_API_ENABLE and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE
         else "權證代號API"
         if FINMIND_WARRANT_LATEST_DAY_API_ENABLE
@@ -16682,7 +16750,7 @@ def main():
     print(
         "🧩 ACTIVE_FEATURES="
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
-        "latest-day-warrant-code-api+latest-day-selected-branch-backfill+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+local-evidence-repair+local-number-unit-repair+rich-two-sentence-news+gemini-max-two-calls+"
+        "latest-day-warrant-code-api+latest-day-empty-fallback+latest-day-selected-branch-backfill+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+local-evidence-repair+local-number-unit-repair+rich-two-sentence-news+gemini-max-two-calls+"
         "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
         "single-context+direct-runtime-cache+parallel-history-latest+cooperative-cancel+next-stock-news-prefetch+shared-market-compact-write+issuer-background-once+issuer-unique-vectorized+calendar7+deadcode-cleanup"
     )
