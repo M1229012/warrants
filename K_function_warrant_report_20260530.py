@@ -12699,8 +12699,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-probe-issuer-vectorized-v33"
-FINMIND_PERFORMANCE_PATCH = "probe-first+issuer-alias-precompiled+lru+unique-combo-map+skip-renormalize+timed-context"
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-official-preflight-crossprobe-v34"
+FINMIND_PERFORMANCE_PATCH = "official-preflight+selected-branch-crossprobe+probe-first+second-stage-no-reprobe+issuer-vectorized+timed-context"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -15353,6 +15353,7 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
     selected_branch_id_map: Dict[str, set] | None = None,
     all_empty_is_error: bool = True,
     cancel_event: threading.Event | None = None,
+    probe_enable: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """最新日以「Summary有效 + 近期歷史 + 精選分點當日發現」聯集逐檔查 API。"""
     day = pd.Timestamp(trade_date).normalize()
@@ -15419,6 +15420,9 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
         "fallback_used": False,
         "requested_date": day.strftime("%Y-%m-%d"),
         "resolved_date": "",
+        "probe_enabled": bool(probe_enable),
+        "selected_branch_cross_probe_codes": [],
+        "selected_branch_cross_probe_has_data": False,
     }
     output_cols = [
         "Date", "branch", "broker_code", "warrant_code", "warrant_name",
@@ -15441,6 +15445,8 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
     failures = []
     completed = 0
     successful_raw_data_codes = set()
+    empty_raw_data_codes = set()
+    failed_code_set = set()
     actual_queried_codes = []
 
     def _run_latest_code_batch(batch_codes: List[str], phase_label: str) -> None:
@@ -15491,6 +15497,7 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
                         stats["endpoint_rows"] += int(len(raw))
                         if raw is None or raw.empty:
                             stats["empty_codes"] += 1
+                            empty_raw_data_codes.add(code)
                         else:
                             successful_raw_data_codes.add(code)
                             converted = _finmind_convert_warrant_code_rows(
@@ -15512,6 +15519,7 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
                         raise
                     except Exception as exc:
                         failures.append((code, str(exc)))
+                        failed_code_set.add(code)
                         stats["failed_codes"] += 1
 
                     if phase_completed == 1 or phase_completed % 25 == 0 or phase_completed == len(batch_codes):
@@ -15526,82 +15534,134 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
             cancelled = bool(cancel_event is not None and cancel_event.is_set())
             executor.shutdown(wait=not cancelled, cancel_futures=True)
 
-    probe_codes = _finmind_select_latest_day_probe_codes(
-        query_codes,
-        historical_events,
-        day,
-        max_count=5,
-    )
-    probe_code_set = set(probe_codes)
-    remaining_codes = [code for code in query_codes if code not in probe_code_set]
     stats["intended_active_codes"] = len(query_codes)
-    stats["probe_codes"] = list(probe_codes)
-    stats["probe_count"] = len(probe_codes)
     stats["probe_short_circuit"] = False
 
-    print(
-        f"🧪 最新日權證輕量探測：{stock_code} {stock_name}｜日期={day.date()}｜"
-        f"探測={len(probe_codes)}支｜來源=前一交易日成交金額優先｜"
-        f"代號={','.join(probe_codes)}"
-    )
-    _run_latest_code_batch(probe_codes, "輕量探測")
-
-    branch_ids = int(branch_discovery_stats.get("branch_ids", 0) or 0)
-    branch_success = int(branch_discovery_stats.get("success_branch_ids", 0) or 0)
-    branch_failed = int(branch_discovery_stats.get("failed_branch_ids", 0) or 0)
-    branch_target_rows = int(branch_discovery_stats.get("target_rows", 0) or 0)
-    branch_signal_reliable = bool(
-        branch_ids > 0 and branch_failed == 0 and branch_success == branch_ids
-    )
-    branch_has_target_data = branch_target_rows > 0
-    branch_corroborates_empty = branch_signal_reliable and not branch_has_target_data
-    probe_all_success_empty = bool(
-        probe_codes
-        and stats["failed_codes"] == 0
-        and stats["success_codes"] == len(probe_codes)
-        and not successful_raw_data_codes
-    )
-    # 有設定精選分點時，必須五分點核對也可靠且全空才提前回退；
-    # 沒有精選分點訊號時，使用 5 支高成交權證探測結果判斷。
-    can_short_circuit = bool(
-        probe_all_success_empty
-        and not branch_has_target_data
-        and (branch_corroborates_empty or branch_ids == 0)
-        and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE
-    )
-
-    if can_short_circuit:
-        stats["all_empty"] = True
-        stats["not_ready"] = True
-        stats["probe_short_circuit"] = True
-        stats["query_codes"] = list(actual_queried_codes)
-        stats["active_codes"] = len(actual_queried_codes)
-        stats["event_rows"] = 0
-        corroboration = (
-            f"精選分點={branch_success}/{branch_ids}個成功且目標列全空"
-            if branch_ids
-            else "未提供精選分點訊號"
-        )
+    if not probe_enable:
+        stats["probe_codes"] = []
+        stats["probe_count"] = 0
         print(
-            f"⚠️ 最新日權證探測全空，提前判定資料尚未更新：{stock_code} {stock_name}｜"
-            f"日期={day.date()}｜探測成功={stats['success_codes']}/{len(probe_codes)}｜"
-            f"{corroboration}｜略過剩餘 {len(remaining_codes):,} 支逐權證請求"
+            f"⏩ 最新日權證補查沿用第一階段已確認的發布狀態：{stock_code} {stock_name}｜"
+            f"日期={day.date()}｜直接查詢={len(query_codes):,}支，不重複做輕量探測"
         )
-        return pd.DataFrame(columns=output_cols), stats
+        _run_latest_code_batch(query_codes, "完整查詢")
+    else:
+        probe_codes = _finmind_select_latest_day_probe_codes(
+            query_codes,
+            historical_events,
+            day,
+            max_count=5,
+        )
+        probe_code_set = set(probe_codes)
+        stats["probe_codes"] = list(probe_codes)
+        stats["probe_count"] = len(probe_codes)
 
-    if remaining_codes:
-        reason = (
-            "精選分點已出現當日目標資料"
-            if branch_has_target_data
-            else "探測權證已有當日資料"
-            if successful_raw_data_codes
-            else "探測訊號不足，為確保完整性"
-        )
         print(
-            f"✅ 最新日探測通過，啟動完整逐權證查詢：{stock_code}｜"
-            f"原因={reason}｜剩餘={len(remaining_codes):,}支"
+            f"🧪 最新日權證輕量探測：{stock_code} {stock_name}｜日期={day.date()}｜"
+            f"探測={len(probe_codes)}支｜來源=前一交易日成交金額優先｜"
+            f"代號={','.join(probe_codes)}"
         )
-        _run_latest_code_batch(remaining_codes, "完整查詢")
+        _run_latest_code_batch(probe_codes, "輕量探測")
+
+        branch_ids = int(branch_discovery_stats.get("branch_ids", 0) or 0)
+        branch_success = int(branch_discovery_stats.get("success_branch_ids", 0) or 0)
+        branch_failed = int(branch_discovery_stats.get("failed_branch_ids", 0) or 0)
+        branch_target_rows = int(branch_discovery_stats.get("target_rows", 0) or 0)
+        branch_signal_reliable = bool(
+            branch_ids > 0 and branch_failed == 0 and branch_success == branch_ids
+        )
+        branch_has_target_data = branch_target_rows > 0
+        branch_corroborates_empty = branch_signal_reliable and not branch_has_target_data
+        probe_all_success_empty = bool(
+            probe_codes
+            and set(probe_codes).issubset(empty_raw_data_codes)
+            and not (set(probe_codes) & failed_code_set)
+        )
+
+        # 精選分點端點可能比逐權證正式端點更早出現部分資料。
+        # 不能只因分點端點有列就直接啟動數百支全量查詢；先用該批權證代號
+        # 回查逐權證端點，確認至少一支真的有資料後才放行全量查詢。
+        branch_cross_probe_codes = []
+        branch_cross_probe_has_data = False
+        branch_cross_probe_all_success_empty = False
+        if probe_all_success_empty and branch_has_target_data:
+            branch_cross_probe_codes = sorted(
+                code for code in selected_branch_discovered_codes
+                if code and code not in probe_code_set
+            )[:5]
+            stats["selected_branch_cross_probe_codes"] = list(branch_cross_probe_codes)
+            if branch_cross_probe_codes:
+                print(
+                    f"🔬 精選分點當日資料交叉探測：{stock_code}｜"
+                    f"分點端點目標列={branch_target_rows:,}｜權證={len(branch_cross_probe_codes)}支｜"
+                    f"代號={','.join(branch_cross_probe_codes)}"
+                )
+                _run_latest_code_batch(branch_cross_probe_codes, "精選分點交叉探測")
+                branch_cross_set = set(branch_cross_probe_codes)
+                branch_cross_probe_has_data = bool(
+                    branch_cross_set & successful_raw_data_codes
+                )
+                branch_cross_probe_all_success_empty = bool(
+                    branch_cross_set.issubset(empty_raw_data_codes)
+                    and not (branch_cross_set & failed_code_set)
+                )
+                stats["selected_branch_cross_probe_has_data"] = branch_cross_probe_has_data
+
+        queried_probe_codes = set(probe_codes) | set(branch_cross_probe_codes)
+        remaining_codes = [code for code in query_codes if code not in queried_probe_codes]
+
+        no_reliable_branch_data = bool(
+            not branch_has_target_data
+            and (branch_corroborates_empty or branch_ids == 0)
+        )
+        branch_data_disproved_by_warrant_api = bool(
+            branch_has_target_data
+            and branch_cross_probe_codes
+            and branch_cross_probe_all_success_empty
+            and not branch_cross_probe_has_data
+        )
+        can_short_circuit = bool(
+            probe_all_success_empty
+            and (no_reliable_branch_data or branch_data_disproved_by_warrant_api)
+            and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE
+        )
+
+        if can_short_circuit:
+            stats["all_empty"] = True
+            stats["not_ready"] = True
+            stats["probe_short_circuit"] = True
+            stats["query_codes"] = list(actual_queried_codes)
+            stats["active_codes"] = len(actual_queried_codes)
+            stats["event_rows"] = 0
+            if branch_data_disproved_by_warrant_api:
+                corroboration = (
+                    f"精選分點端點雖有 {branch_target_rows:,} 列，但其 {len(branch_cross_probe_codes)} 支"
+                    "權證在逐權證端點全空"
+                )
+            elif branch_ids:
+                corroboration = f"精選分點={branch_success}/{branch_ids}個成功且目標列全空"
+            else:
+                corroboration = "未提供精選分點訊號"
+            print(
+                f"⚠️ 最新日權證探測全空，提前判定資料尚未更新：{stock_code} {stock_name}｜"
+                f"日期={day.date()}｜已探測={len(actual_queried_codes)}支｜"
+                f"{corroboration}｜略過剩餘 {len(remaining_codes):,} 支逐權證請求"
+            )
+            return pd.DataFrame(columns=output_cols), stats
+
+        if remaining_codes:
+            reason = (
+                "精選分點權證已通過逐權證交叉探測"
+                if branch_cross_probe_has_data
+                else "探測權證已有當日資料"
+                if successful_raw_data_codes
+                else "探測訊號不足，為確保完整性"
+            )
+            print(
+                f"✅ 最新日探測通過，啟動完整逐權證查詢：{stock_code}｜"
+                f"原因={reason}｜剩餘={len(remaining_codes):,}支"
+            )
+            _run_latest_code_batch(remaining_codes, "完整查詢")
 
     stats["query_codes"] = list(actual_queried_codes)
     stats["active_codes"] = len(actual_queried_codes)
@@ -15745,6 +15805,229 @@ def _finmind_fetch_latest_day_events_by_warrant_api(
         f"賣出={fmt_money(-float(events['sell_amount'].sum()))}｜"
         f"淨額={fmt_money(float(events['net_amount'].sum()))}"
     )
+    return events, stats
+
+
+
+def _finmind_current_day_official_preflight(
+    summary_df: pd.DataFrame,
+    stock_code: str,
+    stock_name: str,
+    target_date,
+) -> dict:
+    """在大量逐權證請求前，先確認官方市場是否已發布到目標日。
+
+    只在目標日等於台北今日、且官方完整性保護開啟時生效。
+    官方資料明確仍停在前一交易日時回傳 pending；官方來源失敗、日期矛盾
+    或無法確認時回傳 unknown，主流程維持既有完整查詢以避免誤退。
+    """
+    target_ts = pd.Timestamp(target_date).normalize()
+    result = {
+        "status": "not_applicable",
+        "reason": "非當日資料，不執行官方發布前置檢查",
+        "target_date": target_ts.strftime("%Y-%m-%d"),
+        "relevant_latest_date": "",
+        "twse_latest_date": "",
+        "tpex_latest_date": "",
+        "official_target_rows": 0,
+        "active_codes": 0,
+    }
+    try:
+        if not FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE or not FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE:
+            result["status"] = "disabled"
+            result["reason"] = "官方完整性前置檢查已關閉"
+            return result
+        if target_ts != get_taipei_today_ts():
+            return result
+
+        active_codes = set(_finmind_active_warrant_codes(summary_df, target_ts))
+        active_codes = {
+            normalize_openapi_warrant_code(code)
+            for code in active_codes
+            if normalize_openapi_warrant_code(code)
+        }
+        result["active_codes"] = len(active_codes)
+        if not active_codes:
+            result["status"] = "unknown"
+            result["reason"] = "找不到目標日有效認購權證母體"
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            twse_future = executor.submit(fetch_twse_openapi_warrant_daily_df)
+            tpex_future = executor.submit(fetch_tpex_openapi_warrant_daily_df)
+            try:
+                twse_df = twse_future.result()
+            except Exception as exc:
+                print(f"⚠️ 官方發布前置檢查 TWSE OpenAPI 失敗：{exc}")
+                twse_df = pd.DataFrame()
+            try:
+                tpex_df = tpex_future.result()
+            except Exception as exc:
+                print(f"⚠️ 官方發布前置檢查 TPEx OpenAPI 失敗：{exc}")
+                tpex_df = pd.DataFrame()
+
+        official_parts = []
+        source_latest = {"TWSE": pd.NaT, "TPEx": pd.NaT}
+        for source_name, source_df in (("TWSE", twse_df), ("TPEx", tpex_df)):
+            if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+                continue
+            part = source_df.copy()
+            for col in ["交易日期", "代號"]:
+                if col not in part.columns:
+                    part[col] = ""
+            part["_trade_date"] = _normalize_official_trade_date_series(part["交易日期"])
+            part["代號"] = part["代號"].map(normalize_openapi_warrant_code)
+            source_latest[source_name] = part["_trade_date"].dropna().max()
+            official_parts.append(part[["_trade_date", "代號"]])
+
+        result["twse_latest_date"] = (
+            source_latest["TWSE"].strftime("%Y-%m-%d")
+            if pd.notna(source_latest["TWSE"])
+            else ""
+        )
+        result["tpex_latest_date"] = (
+            source_latest["TPEx"].strftime("%Y-%m-%d")
+            if pd.notna(source_latest["TPEx"])
+            else ""
+        )
+        if not official_parts:
+            result["status"] = "unknown"
+            result["reason"] = "TWSE / TPEx 官方權證資料皆無法取得"
+            return result
+
+        official_all = pd.concat(official_parts, ignore_index=True, sort=False)
+        relevant = official_all[official_all["代號"].isin(active_codes)].copy()
+        relevant_latest = relevant["_trade_date"].dropna().max() if not relevant.empty else pd.NaT
+        result["relevant_latest_date"] = (
+            relevant_latest.strftime("%Y-%m-%d") if pd.notna(relevant_latest) else ""
+        )
+        target_rows = relevant[relevant["_trade_date"] == target_ts]
+        result["official_target_rows"] = int(len(target_rows))
+        if not target_rows.empty:
+            result["status"] = "ready"
+            result["reason"] = (
+                f"官方相關權證已發布到 {target_ts.strftime('%Y-%m-%d')}｜"
+                f"目標列={len(target_rows):,}"
+            )
+            print(
+                f"✅ 官方最新日發布前置檢查通過：{stock_code} {stock_name}｜"
+                f"日期={target_ts.date()}｜相關列={len(target_rows):,}｜"
+                f"TWSE最新={result['twse_latest_date'] or '-'}｜"
+                f"TPEx最新={result['tpex_latest_date'] or '-'}"
+            )
+            return result
+
+        available_source_dates = [d for d in source_latest.values() if pd.notna(d)]
+        all_sources_before_target = bool(
+            available_source_dates
+            and all(pd.Timestamp(d).normalize() < target_ts for d in available_source_dates)
+        )
+        relevant_before_target = bool(
+            pd.notna(relevant_latest) and pd.Timestamp(relevant_latest).normalize() < target_ts
+        )
+        if relevant_before_target or all_sources_before_target:
+            result["status"] = "pending"
+            result["reason"] = (
+                f"官方相關權證尚未發布到 {target_ts.strftime('%Y-%m-%d')}"
+                f"（相關權證最新 {result['relevant_latest_date'] or '-'}；"
+                f"TWSE最新 {result['twse_latest_date'] or '-'}；"
+                f"TPEx最新 {result['tpex_latest_date'] or '-'}）"
+            )
+            print(
+                f"⏭️ 官方最新日尚未發布，逐權證 API 直接回退："
+                f"{stock_code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
+        result["status"] = "unknown"
+        result["reason"] = (
+            f"官方日期訊號不足，維持完整逐權證查詢｜"
+            f"相關權證最新 {result['relevant_latest_date'] or '-'}；"
+            f"TWSE最新 {result['twse_latest_date'] or '-'}；"
+            f"TPEx最新 {result['tpex_latest_date'] or '-'}"
+        )
+        print(f"ℹ️ 官方發布前置檢查無法定論：{stock_code}｜{result['reason']}")
+        return result
+    except Exception as exc:
+        result["status"] = "unknown"
+        result["reason"] = f"官方發布前置檢查例外：{exc}"
+        print(f"⚠️ 官方發布前置檢查失敗，維持完整逐權證查詢：{stock_code}｜{exc}")
+        return result
+
+
+def _finmind_fetch_latest_day_with_official_preflight(
+    summary_df: pd.DataFrame,
+    trade_date,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+    historical_events: pd.DataFrame | None = None,
+    selected_branch_id_map: Dict[str, set] | None = None,
+    all_empty_is_error: bool = True,
+    cancel_event: threading.Event | None = None,
+    probe_enable: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+    """官方發布日期先行；明確 pending 時不發出任何逐權證請求。"""
+    day = pd.Timestamp(trade_date).normalize()
+    with report_stage_timer(f"{stock_code}｜官方最新日發布前置檢查"):
+        preflight = _finmind_current_day_official_preflight(
+            summary_df,
+            stock_code,
+            stock_name,
+            day,
+        )
+    if str(preflight.get("status", "")) == "pending":
+        intended_codes = _finmind_active_warrant_codes(summary_df, day)
+        stats = {
+            "date": day.strftime("%Y-%m-%d"),
+            "active_codes": 0,
+            "intended_active_codes": len(intended_codes),
+            "summary_active_codes": len(intended_codes),
+            "recent_history_codes": 0,
+            "selected_branch_discovered_codes": 0,
+            "selected_branch_raw_rows": 0,
+            "selected_branch_repaired_rows": 0,
+            "success_codes": 0,
+            "empty_codes": 0,
+            "failed_codes": 0,
+            "endpoint_rows": 0,
+            "event_rows": 0,
+            "query_codes": [],
+            "cancelled": False,
+            "all_empty": True,
+            "not_ready": True,
+            "fallback_used": False,
+            "requested_date": day.strftime("%Y-%m-%d"),
+            "resolved_date": "",
+            "probe_enabled": bool(probe_enable),
+            "probe_codes": [],
+            "probe_count": 0,
+            "probe_short_circuit": True,
+            "official_preflight_status": "pending",
+            "official_preflight_reason": str(preflight.get("reason", "") or ""),
+        }
+        return pd.DataFrame(columns=[
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+            "net_amount", "buy_shares", "sell_shares", "side",
+        ]), stats
+
+    events, stats = _finmind_fetch_latest_day_events_by_warrant_api(
+        summary_df,
+        day,
+        warrant_name_map,
+        stock_code,
+        stock_name,
+        trader_name_map,
+        historical_events=historical_events,
+        selected_branch_id_map=selected_branch_id_map,
+        all_empty_is_error=all_empty_is_error,
+        cancel_event=cancel_event,
+        probe_enable=probe_enable,
+    )
+    stats["official_preflight_status"] = str(preflight.get("status", "") or "")
+    stats["official_preflight_reason"] = str(preflight.get("reason", "") or "")
     return events, stats
 
 
@@ -15924,7 +16207,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if FINMIND_WARRANT_LATEST_DAY_API_ENABLE and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE:
         latest_executor = ThreadPoolExecutor(max_workers=1)
         latest_future = latest_executor.submit(
-            _finmind_fetch_latest_day_events_by_warrant_api,
+            _finmind_fetch_latest_day_with_official_preflight,
             summary,
             latest_day,
             warrant_name_map,
@@ -16057,11 +16340,12 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             latest_executor.shutdown(wait=True)
     else:
         # 非平行組態已完成歷史事件，直接帶入可一次涵蓋近期歷史權證，避免第二輪重查。
-        latest_events, latest_api_stats = _finmind_fetch_latest_day_events_by_warrant_api(
+        latest_events, latest_api_stats = _finmind_fetch_latest_day_with_official_preflight(
             summary, latest_day, warrant_name_map, code, stock_name, trader_name_map,
             historical_events=historical_events,
             selected_branch_id_map=selected_branch_id_map,
             cancel_event=latest_cancel_event,
+            probe_enable=True,
         )
 
     # 第二階段只補平行第一階段尚未看見、但歷史完成後確認近期曾出現的權證。
@@ -16097,6 +16381,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             selected_branch_id_map={},
             all_empty_is_error=False,
             cancel_event=latest_cancel_event,
+            probe_enable=False,
         )
         latest_events = _concat_warrant_event_frames([latest_events, backfill_events])
         if not latest_events.empty:
@@ -16168,6 +16453,8 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         "latest_api_fallback_used": latest_fallback_used,
         "latest_api_requested_date": str(latest_api_stats.get("requested_date", "") or ""),
         "latest_api_resolved_date": str(latest_api_stats.get("resolved_date", "") or ""),
+        "latest_api_official_preflight_status": str(latest_api_stats.get("official_preflight_status", "") or ""),
+        "latest_api_official_preflight_reason": str(latest_api_stats.get("official_preflight_reason", "") or ""),
     }
     _FINMIND_WARRANT_RUN_STATS[code] = stats
 
