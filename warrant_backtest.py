@@ -179,6 +179,23 @@ TOP15_REQUIRE_TARGET_DATE_PRICE = os.getenv("TOP15_REQUIRE_TARGET_DATE_PRICE", "
 TOP15_MIN_BROKER_REMAINING_COST = max(float(os.getenv("TOP15_MIN_BROKER_REMAINING_COST", "100000")), 0.0)
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
+# TOP15 當日無成交價時，可向「權證資訊揭露平台」查詢流動量提供者委買報價。
+# 報酬率仍優先使用當日實際成交收盤價；只有統計日沒有成交價時才使用 LP 委買價估值。
+# 預設關閉；確認可用的正式查詢端點後，需同時設定：
+# TOP15_LP_QUOTE_FALLBACK_ENABLED=1 與 TOP15_LP_QUOTE_URLS。
+TOP15_LP_QUOTE_FALLBACK_ENABLED = os.getenv("TOP15_LP_QUOTE_FALLBACK_ENABLED", "0").strip().lower() not in ("0", "false", "no")
+TOP15_LP_QUOTE_TIMEOUT_SECONDS = max(float(os.getenv("TOP15_LP_QUOTE_TIMEOUT_SECONDS", "15")), 3.0)
+TOP15_LP_QUOTE_WORKERS = max(int(os.getenv("TOP15_LP_QUOTE_WORKERS", "10")), 1)
+TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT = min(
+    max(float(os.getenv("TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT", "60")), 0.0),
+    100.0,
+)
+TOP15_LP_QUOTE_URLS_ENV = os.getenv("TOP15_LP_QUOTE_URLS", "").strip()
+TOP15_LP_QUOTE_URLS = [
+    x.strip()
+    for x in re.split(r"[,;；、\n\r\t]+", TOP15_LP_QUOTE_URLS_ENV)
+    if x.strip()
+]
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
 
 # 完整修補模式會重建下列延伸報表；每日流程不計算、不碰觸這些既有工作表。
@@ -8650,6 +8667,398 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, windo
     return rebuilt_event_lots
 
 
+_TOP15_LP_QUOTE_CACHE = {}
+_TOP15_LP_QUOTE_CACHE_LOCK = threading.Lock()
+
+
+def _top15_lp_normalize_field_name(value):
+    s = str(value or "").strip().upper()
+    s = s.replace("％", "%")
+    return re.sub(r"[\s_\-－—–/\\()（）\[\]【】:：｜|]+", "", s)
+
+
+def _top15_lp_parse_positive_price(value):
+    try:
+        if value is None:
+            return None
+        s = str(value).replace(",", "").replace("元", "").strip()
+        s = re.sub(r"[^0-9.+-]", "", s)
+        if not s:
+            return None
+        v = float(s)
+        if v <= 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _top15_lp_extract_date_from_text(text):
+    s = str(text or "")
+    patterns = [
+        r"(?:資料日期|報價日期|交易日期|日期)\s*[:：]?\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})",
+        r"(?:資料日期|報價日期|交易日期|日期)\s*[:：]?\s*(\d{3})[/-](\d{1,2})[/-](\d{1,2})",
+    ]
+    for idx, pattern in enumerate(patterns):
+        m = re.search(pattern, s)
+        if not m:
+            continue
+        y, mth, d = map(int, m.groups())
+        if idx == 1 or y < 1911:
+            y += 1911
+        try:
+            return f"{y:04d}/{mth:02d}/{d:02d}"
+        except Exception:
+            continue
+    return ""
+
+
+def _top15_lp_price_field_score(field_name):
+    """挑選 LP 最佳一檔委買價格；排除委買量、隱含波動率等非價格欄。"""
+    name = _top15_lp_normalize_field_name(field_name)
+    if not name:
+        return -1
+
+    if any(token in name for token in ("IV", "隱含", "波動", "委買量", "買進量", "買量", "張數", "筆數", "數量")):
+        return -1
+
+    exact_priority = [
+        "最佳一檔委託買進價格",
+        "最佳一檔委買價格",
+        "最佳委託買進價格",
+        "最佳委買價格",
+        "流動量提供者委買價格",
+        "流動量提供者買進價格",
+        "委託買進價格",
+        "買1價",
+        "買一價",
+        "委買價",
+        "買進價",
+        "買價",
+    ]
+    normalized_priority = [_top15_lp_normalize_field_name(x) for x in exact_priority]
+    for rank, candidate in enumerate(normalized_priority):
+        if name == candidate:
+            return 1000 - rank
+
+    score = 0
+    if "流動量提供者" in name or name.startswith("LP"):
+        score += 100
+    if "最佳" in name or "一檔" in name or "買1" in name or "買一" in name:
+        score += 50
+    if "委買" in name or "委託買進" in name or "買進價格" in name or name.endswith("買價"):
+        score += 30
+    if "價" in name or "價格" in name:
+        score += 10
+    return score if score >= 40 else -1
+
+
+def _top15_lp_code_matches(value, warrant_code):
+    raw = str(value or "").strip()
+    wanted = normalize_price_code(warrant_code)
+    if not raw or not wanted:
+        return False
+    candidates = set(re.findall(r"(?<!\d)\d{4,6}(?!\d)", raw))
+    for candidate in candidates:
+        if normalize_price_code(candidate) == wanted:
+            return True
+    return normalize_price_code(raw) == wanted
+
+
+def _top15_lp_extract_from_record(record, warrant_code):
+    if not isinstance(record, dict) or not record:
+        return None
+
+    code_fields = []
+    for key, value in record.items():
+        key_name = _top15_lp_normalize_field_name(key)
+        if any(token in key_name for token in ("權證代號", "證券代號", "商品代號", "權證代碼", "代號", "CODE")):
+            code_fields.append(value)
+
+    # 有代號欄位時必須與查詢權證一致，避免從同頁其他權證誤抓價格。
+    if code_fields and not any(_top15_lp_code_matches(value, warrant_code) for value in code_fields):
+        return None
+
+    candidates = []
+    for key, value in record.items():
+        score = _top15_lp_price_field_score(key)
+        if score < 0:
+            continue
+        price = _top15_lp_parse_positive_price(value)
+        if price is not None:
+            candidates.append((score, price, str(key)))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    score, price, field = candidates[0]
+    return {
+        "price": price,
+        "field": field,
+    }
+
+
+def _top15_lp_walk_json(payload, warrant_code):
+    if isinstance(payload, dict):
+        hit = _top15_lp_extract_from_record(payload, warrant_code)
+        if hit:
+            return hit
+        for value in payload.values():
+            hit = _top15_lp_walk_json(value, warrant_code)
+            if hit:
+                return hit
+    elif isinstance(payload, list):
+        for value in payload:
+            hit = _top15_lp_walk_json(value, warrant_code)
+            if hit:
+                return hit
+    return None
+
+
+def _top15_lp_parse_html_tables(text, warrant_code):
+    try:
+        tables = pd.read_html(StringIO(text))
+    except Exception:
+        tables = []
+
+    for table in tables:
+        if table is None or table.empty:
+            continue
+
+        df = table.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                " ".join(str(x) for x in col if str(x).strip() and str(x).lower() != "nan").strip()
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(x).strip() for x in df.columns]
+
+        rows = df.fillna("").to_dict("records")
+        matched_rows = []
+        unmatched_rows = []
+
+        for row in rows:
+            row_text = " ".join(str(v) for v in row.values())
+            if _top15_lp_code_matches(row_text, warrant_code):
+                matched_rows.append(row)
+            else:
+                unmatched_rows.append(row)
+
+        search_rows = matched_rows or (rows if len(rows) == 1 else [])
+        for row in search_rows:
+            hit = _top15_lp_extract_from_record(row, warrant_code)
+            if hit:
+                return hit
+
+    return None
+
+
+def _top15_lp_parse_response(response, warrant_code, target_date):
+    text = response.text or ""
+    quote_date = _top15_lp_extract_date_from_text(text)
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    hit = _top15_lp_walk_json(payload, warrant_code) if payload is not None else None
+    if not hit:
+        hit = _top15_lp_parse_html_tables(text, warrant_code)
+
+    # 最後備援：頁面中有明確欄名時，直接從其後方數字解析。
+    if not hit:
+        patterns = [
+            r"(?:最佳一檔委託買進價格|最佳一檔委買價格|最佳委買價格|流動量提供者委買價格|委買價|買1價|買一價)"
+            r"[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, flags=re.I)
+            if not m:
+                continue
+            price = _top15_lp_parse_positive_price(m.group(1))
+            if price is not None:
+                hit = {"price": price, "field": "頁面委買價"}
+                break
+
+    if not hit:
+        return None
+
+    # LP 報價必須能從回應中明確取得日期，且日期必須與統計日完全相同。
+    # 找不到日期時不可自行假設為統計日，避免歷史回補誤用最新盤後報價。
+    if not quote_date:
+        return None
+
+    if normalize_date_str(quote_date) != normalize_date_str(target_date):
+        return None
+
+    hit["date"] = normalize_date_str(quote_date)
+    return hit
+
+
+def _top15_lp_accept_disclaimer(session, base_url):
+    try:
+        root = re.match(r"^(https?://[^/]+)", base_url)
+        root_url = root.group(1) + "/" if root else base_url
+        response = session.get(
+            root_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=(5, TOP15_LP_QUOTE_TIMEOUT_SECONDS),
+        )
+        if response.status_code >= 400 or "BTNConfirm" not in response.text:
+            return
+
+        hidden = {}
+        for tag in re.findall(r"<input\b[^>]*>", response.text, flags=re.I):
+            name_match = re.search(r"\bname=[\"\']([^\"\']+)[\"\']", tag, flags=re.I)
+            if not name_match:
+                continue
+            value_match = re.search(r"\bvalue=[\"\']([^\"\']*)[\"\']", tag, flags=re.I)
+            hidden[name_match.group(1)] = value_match.group(1) if value_match else ""
+
+        hidden["agree"] = "on"
+        hidden["BTNConfirm"] = "確認"
+        session.post(
+            response.url,
+            data=hidden,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": response.url,
+            },
+            timeout=(5, TOP15_LP_QUOTE_TIMEOUT_SECONDS),
+        )
+    except Exception:
+        return
+
+
+def fetch_top15_lp_quote_price(warrant_code, target_date):
+    """
+    當統計日沒有權證成交價時，從權證資訊揭露平台取得流動量提供者最佳委買價。
+
+    回傳：{"price": float, "date": YYYY/MM/DD, "source": str, "field": str} 或 None。
+    平台查不到、欄位無法辨識或資料日期不符時，維持原本缺價格處理，不使用一般市場委買單。
+    """
+    if not TOP15_LP_QUOTE_FALLBACK_ENABLED or not TOP15_LP_QUOTE_URLS:
+        return None
+
+    code = normalize_price_code(warrant_code)
+    target_date = normalize_date_str(target_date)
+    if not code or not target_date:
+        return None
+
+    cache_key = (code, target_date)
+    with _TOP15_LP_QUOTE_CACHE_LOCK:
+        if cache_key in _TOP15_LP_QUOTE_CACHE:
+            cached = _TOP15_LP_QUOTE_CACHE[cache_key]
+            return dict(cached) if isinstance(cached, dict) else None
+
+    params = {
+        "stockNo": code,
+        "duration1": 0,
+        "duration2": 730,
+        "Period": 14,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/html,application/xhtml+xml,*/*",
+    }
+    result = None
+
+    for url in TOP15_LP_QUOTE_URLS:
+        session = requests.Session()
+        try:
+            _top15_lp_accept_disclaimer(session, url)
+
+            responses = []
+            try:
+                responses.append(session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=(5, TOP15_LP_QUOTE_TIMEOUT_SECONDS),
+                    allow_redirects=True,
+                ))
+            except Exception:
+                pass
+
+            try:
+                responses.append(session.post(
+                    url,
+                    data=params,
+                    headers=headers,
+                    timeout=(5, TOP15_LP_QUOTE_TIMEOUT_SECONDS),
+                    allow_redirects=True,
+                ))
+            except Exception:
+                pass
+
+            for response in responses:
+                if response is None or response.status_code >= 400:
+                    continue
+                hit = _top15_lp_parse_response(response, code, target_date)
+                if hit:
+                    result = {
+                        "price": float(hit["price"]),
+                        "date": hit.get("date") or target_date,
+                        "source": "權證資訊揭露平台LP委買價",
+                        "field": hit.get("field", ""),
+                        "url": response.url,
+                    }
+                    break
+            if result:
+                break
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    with _TOP15_LP_QUOTE_CACHE_LOCK:
+        _TOP15_LP_QUOTE_CACHE[cache_key] = dict(result) if result else False
+    return result
+
+
+def fetch_top15_lp_quote_map(warrant_codes, target_date):
+    codes = sorted({normalize_price_code(code) for code in warrant_codes if normalize_price_code(code)})
+    if not TOP15_LP_QUOTE_FALLBACK_ENABLED or not TOP15_LP_QUOTE_URLS or not codes:
+        return {}
+
+    normalized_target_date = normalize_date_str(target_date)
+    latest_market_date = normalize_date_str(
+        resolve_latest_trading_date_on_or_before(datetime.today())
+    )
+
+    # LP 平台屬於最新盤後資料；歷史回補、repair 或手動指定舊日期時不使用。
+    if normalized_target_date != latest_market_date:
+        print(
+            f"  TOP15 LP 報價略過：統計日 {normalized_target_date} 不是最新交易日 {latest_market_date}"
+        )
+        return {}
+
+    print(f"  TOP15統計日無成交價，查詢權證資訊揭露平台 LP 報價：{len(codes):,} 檔")
+    result = {}
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=min(TOP15_LP_QUOTE_WORKERS, len(codes))) as ex:
+        futures = {ex.submit(fetch_top15_lp_quote_price, code, target_date): code for code in codes}
+        for future in as_completed(futures):
+            code = futures[future]
+            done += 1
+            try:
+                quote = future.result()
+            except Exception:
+                quote = None
+            if quote and top15_safe_float(quote.get("price"), 0) > 0:
+                result[code] = quote
+            if done % 20 == 0:
+                print(f"  [{done}/{len(codes)}] TOP15 LP 報價查詢中...")
+
+    print(f"  TOP15 LP 報價查詢完成：取得 {len(result):,}/{len(codes):,} 檔")
+    return result
+
+
 def ensure_top15_return_warrant_prices(
     price_cache,
     position_lots,
@@ -9118,6 +9527,22 @@ def build_top15_position_detail_and_consensus_rows(
                 defer_save=False,
             )
 
+    # 僅針對統計日沒有成交收盤價的權證查詢 LP 報價；有當日成交價者不查平台。
+    lp_quote_needed_codes = set()
+    for lot in position_lots:
+        code = normalize_price_code(lot.get("權證代號", ""))
+        if not code:
+            continue
+        traded_price, traded_price_date = get_latest_price_info_on_or_before(
+            price_cache,
+            code,
+            target_date,
+        )
+        if traded_price is None or normalize_date_str(traded_price_date) != target_date:
+            lp_quote_needed_codes.add(code)
+
+    lp_quote_map = fetch_top15_lp_quote_map(lp_quote_needed_codes, target_date)
+
     detail_rows = []
     validation_errors = []
     missing_price_rows = []
@@ -9146,24 +9571,44 @@ def build_top15_position_detail_and_consensus_rows(
                 f"剩餘成本大於原始成本：{lot.get('分點')} {lot.get('權證代號')} 原始={original_cost} 剩餘={remaining_cost}"
             )
 
+        warrant_code = normalize_price_code(lot.get("權證代號", ""))
         latest_price, latest_price_date = get_latest_price_info_on_or_before(
             price_cache,
-            lot.get("權證代號", ""),
+            warrant_code,
             target_date,
         )
 
         price_status = "OK"
+        valuation_price_source = ""
         latest_dt = parse_date(latest_price_date) if latest_price_date else None
+        has_target_date_trade_price = bool(
+            latest_price is not None
+            and latest_price_date
+            and normalize_date_str(latest_price_date) == target_date
+        )
 
-        if latest_price is None:
-            price_status = "缺價格"
-        elif TOP15_REQUIRE_TARGET_DATE_PRICE and normalize_date_str(latest_price_date) != target_date:
-            # 保留實際最後價格日期供稽核，但不使用非統計日價格估值。
-            price_status = "非統計日價格"
-            latest_price = None
-        elif latest_dt and target_dt and (target_dt - latest_dt).days > TOP15_PRICE_STALE_DAYS:
-            price_status = "價格過舊"
-            latest_price = None
+        if has_target_date_trade_price:
+            valuation_price_source = "當日成交價"
+        else:
+            # 統計日無成交價時，不使用數日前舊成交價，改查權證資訊揭露平台 LP 最佳委買價。
+            lp_quote = lp_quote_map.get(warrant_code)
+            if lp_quote and top15_safe_float(lp_quote.get("price"), 0) > 0:
+                latest_price = top15_safe_float(lp_quote.get("price"), None)
+                latest_price_date = normalize_date_str(lp_quote.get("date") or target_date)
+                latest_dt = parse_date(latest_price_date) if latest_price_date else None
+                valuation_price_source = "LP流動量提供者委買價"
+                price_status = "OK"
+            elif latest_price is None:
+                price_status = "缺價格"
+            elif TOP15_REQUIRE_TARGET_DATE_PRICE:
+                # 保留實際最後成交日期供稽核，但不使用非統計日舊成交價估值。
+                price_status = "非統計日價格"
+                latest_price = None
+            elif latest_dt and target_dt and (target_dt - latest_dt).days > TOP15_PRICE_STALE_DAYS:
+                price_status = "價格過舊"
+                latest_price = None
+            else:
+                valuation_price_source = "最近成交價"
 
         if latest_price is None:
             market_value = ""
@@ -9229,6 +9674,7 @@ def build_top15_position_detail_and_consensus_rows(
             "剩餘均價": "" if remaining_avg is None else round(remaining_avg, 4),
             "最新權證價格": "" if latest_price is None else latest_price,
             "最新價格日期": latest_price_date,
+            "估值價格來源": valuation_price_source,
             "目前市值": market_value,
             "未實現損益": unrealized_pnl,
             "報酬率": return_pct,
@@ -9311,6 +9757,8 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "券商代號": broker_code,
             "淨買超成本": 0.0,
             "可估成本": 0.0,
+            "成交價成本": 0.0,
+            "LP報價成本": 0.0,
             "缺價格成本": 0.0,
             "目前市值": 0.0,
             "未實現損益": 0.0,
@@ -9325,6 +9773,7 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
         pnl = top15_safe_float(row.get("未實現損益", 0), 0.0) if row.get("未實現損益", "") != "" else 0.0
         price_status = str(row.get("價格狀態", "")).strip()
+        valuation_price_source = str(row.get("估值價格來源", "")).strip()
         event_code = str(row.get("事件", "")).strip()
         warrant_code = str(row.get("權證代號", "")).strip()
         warrant_name = str(row.get("權證名稱", "")).strip()
@@ -9336,6 +9785,10 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             broker_rec["可估成本"] += remaining_cost
             broker_rec["目前市值"] += market_value
             broker_rec["未實現損益"] += pnl
+            if valuation_price_source == "當日成交價":
+                broker_rec["成交價成本"] += remaining_cost
+            elif valuation_price_source == "LP流動量提供者委買價":
+                broker_rec["LP報價成本"] += remaining_cost
         else:
             broker_rec["缺價格成本"] += remaining_cost
 
@@ -9373,6 +9826,8 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "標的名稱": broker_rec.get("標的名稱", ""),
             "淨買超成本": 0.0,
             "可估成本": 0.0,
+            "成交價成本": 0.0,
+            "LP報價成本": 0.0,
             "缺價格成本": 0.0,
             "目前市值": 0.0,
             "未實現損益": 0.0,
@@ -9387,6 +9842,8 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
 
         rec["淨買超成本"] += broker_cost
         rec["可估成本"] += float(broker_rec.get("可估成本", 0) or 0)
+        rec["成交價成本"] += float(broker_rec.get("成交價成本", 0) or 0)
+        rec["LP報價成本"] += float(broker_rec.get("LP報價成本", 0) or 0)
         rec["缺價格成本"] += float(broker_rec.get("缺價格成本", 0) or 0)
         rec["目前市值"] += float(broker_rec.get("目前市值", 0) or 0)
         rec["未實現損益"] += float(broker_rec.get("未實現損益", 0) or 0)
@@ -9432,11 +9889,21 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     for rank, rec in enumerate(sorted_records, 1):
         total_cost = float(rec.get("淨買超成本", 0) or 0)
         estimated_cost = float(rec.get("可估成本", 0) or 0)
+        traded_price_cost = float(rec.get("成交價成本", 0) or 0)
+        lp_quote_cost = float(rec.get("LP報價成本", 0) or 0)
         missing_cost = float(rec.get("缺價格成本", 0) or 0)
         market_value = float(rec.get("目前市值", 0) or 0)
         pnl = float(rec.get("未實現損益", 0) or 0)
         return_pct = round(pnl / estimated_cost * 100, 2) if estimated_cost > 0 else None
         coverage_pct = round(estimated_cost / total_cost * 100, 2) if total_cost > 0 else None
+        traded_price_coverage_pct = round(traded_price_cost / total_cost * 100, 2) if total_cost > 0 else None
+        valuation_symbol = (
+            "*"
+            if return_pct is not None
+            and traded_price_coverage_pct is not None
+            and traded_price_coverage_pct < TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT
+            else ""
+        )
 
         broker_rows = []
         broker_json = []
@@ -9444,11 +9911,21 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         for broker_rec in sorted(rec["分點"].values(), key=lambda x: x["淨買超成本"], reverse=True):
             b_cost = float(broker_rec.get("淨買超成本", 0) or 0)
             b_estimated_cost = float(broker_rec.get("可估成本", 0) or 0)
+            b_traded_price_cost = float(broker_rec.get("成交價成本", 0) or 0)
+            b_lp_quote_cost = float(broker_rec.get("LP報價成本", 0) or 0)
             b_pnl = float(broker_rec.get("未實現損益", 0) or 0)
             b_return_pct = round(b_pnl / b_estimated_cost * 100, 2) if b_estimated_cost > 0 else None
+            b_traded_price_coverage_pct = round(b_traded_price_cost / b_cost * 100, 2) if b_cost > 0 else None
+            b_valuation_symbol = (
+                "*"
+                if b_return_pct is not None
+                and b_traded_price_coverage_pct is not None
+                and b_traded_price_coverage_pct < TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT
+                else ""
+            )
             b_events = "/".join(sorted(x for x in broker_rec["事件集合"] if x))
             b_warrant_count = len(broker_rec["權證集合"])
-            b_return_text = "-" if b_return_pct is None else f"{b_return_pct:+.2f}%"
+            b_return_text = "-" if b_return_pct is None else f"{b_return_pct:+.2f}%{b_valuation_symbol}"
 
             b_missing_cost = float(broker_rec.get("缺價格成本", 0) or 0)
             b_coverage_text = ""
@@ -9464,7 +9941,11 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
                 "券商代號": broker_rec["券商代號"],
                 "淨買超成本": round(b_cost, 0),
                 "可估成本": round(b_estimated_cost, 0),
+                "成交價成本": round(b_traded_price_cost, 0),
+                "LP報價成本": round(b_lp_quote_cost, 0),
                 "缺價格成本": round(float(broker_rec.get("缺價格成本", 0) or 0), 0),
+                "成交價覆蓋率": "" if b_traded_price_coverage_pct is None else b_traded_price_coverage_pct,
+                "估值符號": b_valuation_symbol,
                 "目前市值": round(float(broker_rec.get("目前市值", 0) or 0), 0),
                 "未實現損益": round(b_pnl, 0),
                 "報酬率": "" if b_return_pct is None else b_return_pct,
@@ -9482,11 +9963,19 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "標的名稱": rec.get("標的名稱", ""),
             "淨買超成本": round(total_cost, 0),
             "可估成本": round(estimated_cost, 0),
+            "成交價成本": round(traded_price_cost, 0),
+            "LP報價成本": round(lp_quote_cost, 0),
             "缺價格成本": round(missing_cost, 0),
+            "成交價覆蓋率": "" if traded_price_coverage_pct is None else traded_price_coverage_pct,
+            "估值符號": valuation_symbol,
             "目前市值": round(market_value, 0),
             "未實現損益": round(pnl, 0),
             "報酬率": "" if return_pct is None else return_pct,
-            "報酬率文字": "-" if return_pct is None else (f"{return_pct:+.2f}%" if missing_cost <= 0 else f"{return_pct:+.2f}%（部分估）"),
+            "報酬率文字": "-" if return_pct is None else (
+                f"{return_pct:+.2f}%{valuation_symbol}"
+                if missing_cost <= 0
+                else f"{return_pct:+.2f}%{valuation_symbol}（部分估）"
+            ),
             "價格覆蓋率": "" if coverage_pct is None else coverage_pct,
             "價格覆蓋率文字": "-" if coverage_pct is None else f"{coverage_pct:.2f}%",
             "參與分點數": len(rec["分點"]),
@@ -9520,7 +10009,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
         "原始股數", "原始成本", "原始均價",
         "已扣賣出股數", "已扣賣出成本",
         "剩餘股數", "剩餘成本", "剩餘均價",
-        "最新權證價格", "最新價格日期",
+        "最新權證價格", "最新價格日期", "估值價格來源",
         "目前市值", "未實現損益", "報酬率", "報酬率文字",
         "價格狀態", "完成狀態", "來源", "run_id", "更新時間",
     ]
@@ -9530,7 +10019,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
     for row in detail_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 12, 24, 12, 12, 12, 14, 14, 12, 12, 14, 14, 18, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 14, 14, 10, 12, 10, 10, 44, 16, 20]
+    col_widths = [12, 12, 24, 12, 12, 12, 14, 14, 12, 12, 14, 14, 18, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 22, 14, 14, 10, 12, 10, 10, 44, 16, 20]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="價格狀態")
 
 
@@ -9541,7 +10030,8 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     headers = [
         "資料範圍", "統計日期", "統計期間", "有效交易日數", "排名",
         "標的股", "標的名稱",
-        "淨買超成本", "可估成本", "缺價格成本",
+        "淨買超成本", "可估成本", "成交價成本", "LP報價成本", "缺價格成本",
+        "成交價覆蓋率", "估值符號",
         "目前市值", "未實現損益", "報酬率", "報酬率文字",
         "價格覆蓋率", "價格覆蓋率文字",
         "參與分點數", "參與分點明細",
@@ -9555,7 +10045,7 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     for row in consensus_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 12, 24, 12, 8, 10, 12, 14, 14, 14, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60, 12, 10, 10, 20, 16, 80]
+    col_widths = [12, 12, 24, 12, 8, 10, 12, 14, 14, 14, 14, 14, 12, 10, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60, 12, 10, 10, 20, 16, 80]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="資料狀態")
 
 
