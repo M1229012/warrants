@@ -3690,16 +3690,18 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
 
+
     text(
-        fig_w / 2,
-        0.34,
-        f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋率低於 {TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%。",
-        12.5,
-        MUTED,
-        FONT,
-        ha="center",
-    )
-    text(fig_w / 2, 0.12, "本圖為籌碼追蹤整理，不構成投資建議。", 12.5, MUTED, FONT, ha="center")
+    fig_w / 2,
+    0.24,
+    f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋率低於 "
+    f"{TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%｜"
+    "本圖為籌碼追蹤整理，不構成投資建議。",
+    11.5,
+    MUTED,
+    FONT,
+    ha="center",
+)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
