@@ -128,6 +128,11 @@ BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "1000000"))
 SELL_RATIO = float(os.getenv("SELL_THRESHOLD_RATIO", "0.5"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", str(BUY_THRESHOLD * SELL_RATIO)))
 LOOKBACK_TRADING_DAYS = int(os.getenv("LOOKBACK_TRADING_DAYS", "40"))
+TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT = min(
+    max(float(os.getenv("TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT", "60")), 0.0),
+    100.0,
+)
+TOP15_LOW_TRADED_COVERAGE_SYMBOL = "*"
 # 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
 ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
 
@@ -803,12 +808,15 @@ def _parse_period_text_to_dates(period_text: str) -> tuple[date | None, date | N
     return None, None
 
 
-def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None]]:
+def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]]:
     """
     解析「快取_TOP15共識淨買超」的分點明細_JSON。
 
     回傳格式：
-        [(分點, 淨買超成本, 報酬率), ...]
+        [(分點, 淨買超成本, 報酬率, 估值符號), ...]
+
+    估值符號「*」代表當日成交價覆蓋成本低於設定門檻；
+    無成交部位已優先使用權證資訊揭露平台 LP 委買價估值。
     """
     raw = strip_gsheet_text_prefix(value)
     if not raw:
@@ -851,13 +859,27 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None]]:
             if estimated_cost > 0:
                 return_pct = round(pnl / estimated_cost * 100, 2)
 
-        out.append((broker, amount, return_pct))
+        coverage_pct = safe_float(rec.get("成交價覆蓋率"), None)
+        if coverage_pct is None:
+            traded_cost = safe_float(rec.get("成交價成本"), None)
+            if traded_cost is not None and amount > 0:
+                coverage_pct = traded_cost / amount * 100
+
+        marker = strip_gsheet_text_prefix(rec.get("估值符號", ""))
+        if (
+            not marker
+            and return_pct is not None
+            and coverage_pct is not None
+            and coverage_pct < TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT
+        ):
+            marker = TOP15_LOW_TRADED_COVERAGE_SYMBOL
+
+        out.append((broker, amount, return_pct, marker))
 
     out.sort(key=lambda x: x[1], reverse=True)
     return out
 
-
-def _parse_top15_broker_text(value) -> list[tuple[str, float, float | None]]:
+def _parse_top15_broker_text(value) -> list[tuple[str, float, float | None, str]]:
     """
     備援解析「參與分點明細」文字。
     常見格式：元大南屯 123.4萬（+5.20%｜A｜3檔）；...
@@ -890,8 +912,9 @@ def _parse_top15_broker_text(value) -> list[tuple[str, float, float | None]]:
         if m_ret:
             return_pct = normalize_top15_cache_return_pct(m_ret.group(1))
 
+        marker = TOP15_LOW_TRADED_COVERAGE_SYMBOL if TOP15_LOW_TRADED_COVERAGE_SYMBOL in part else ""
         if amount > 0:
-            out.append((broker, amount, return_pct))
+            out.append((broker, amount, return_pct, marker))
 
     out.sort(key=lambda x: x[1], reverse=True)
     return out
@@ -913,7 +936,7 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         "標的股", "標的代號", "標的", "標的名稱", "股票名稱",
         "剩餘成本", "目前剩餘成本", "淨買超成本", "remaining_cost",
         "目前市值", "未實現損益", "可估成本", "缺價格成本",
-        "報酬率", "報酬率文字", "價格狀態",
+        "報酬率", "報酬率文字", "價格狀態", "估值價格來源",
     ]
 
     df = read_gsheet_table_optional(
@@ -951,6 +974,8 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
     agg: dict[tuple[str, str], dict] = defaultdict(lambda: {
         "cost": 0.0,
         "estimated_cost": 0.0,
+        "traded_price_cost": 0.0,
+        "lp_quote_cost": 0.0,
         "pnl": 0.0,
         "weighted_return_cost": 0.0,
         "weighted_return_sum": 0.0,
@@ -999,6 +1024,11 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         rec = agg[(underlying, broker)]
         rec["cost"] += amount
         rec["estimated_cost"] += estimated_cost
+        price_source = strip_gsheet_text_prefix(r.get("估值價格來源", ""))
+        if price_source == "當日成交價":
+            rec["traded_price_cost"] += amount
+        elif price_source == "LP流動量提供者委買價":
+            rec["lp_quote_cost"] += amount
         rec["pnl"] += pnl
 
         if return_pct is not None and amount > 0:
@@ -1021,7 +1051,16 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         elif safe_float(rec.get("weighted_return_cost"), 0) > 0:
             return_pct = round(rec["weighted_return_sum"] / rec["weighted_return_cost"], 2)
 
-        by_underlying[underlying].append((broker, amount, return_pct))
+        traded_price_cost = safe_float(rec.get("traded_price_cost"), 0)
+        traded_coverage_pct = traded_price_cost / amount * 100 if amount > 0 else None
+        marker = (
+            TOP15_LOW_TRADED_COVERAGE_SYMBOL
+            if return_pct is not None
+            and traded_coverage_pct is not None
+            and traded_coverage_pct < TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT
+            else ""
+        )
+        by_underlying[underlying].append((broker, amount, return_pct, marker))
 
     for underlying in by_underlying:
         by_underlying[underlying].sort(key=lambda x: x[1], reverse=True)
@@ -3395,7 +3434,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     section_title_h = 0.55
     header_h = 0.42
     row_h = 0.50
-    footer_h = 0.45
+    footer_h = 0.66
 
     table_h = section_title_h + header_h + max(1, n) * row_h
 
@@ -3496,7 +3535,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
         if not items:
             top_broker = row.get("top_broker", "")
             top_amount = row.get("top_broker_amount", 0)
-            return [(top_broker, top_amount, None)], False
+            return [(top_broker, top_amount, None, "")], False
 
         shown = items[:limit]
         has_more = len(items) > limit
@@ -3527,6 +3566,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             broker = item[0]
             amount = item[1] if len(item) > 1 else 0
             return_pct = item[2] if len(item) > 2 else None
+            valuation_marker = item[3] if len(item) > 3 else ""
 
             prefix = f"{broker} {fmt_wan(amount)} / "
             if not draw_piece(prefix, TEXT):
@@ -3536,6 +3576,9 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             ret_color = RED if safe_float(return_pct, 0) > 0 else GREEN if safe_float(return_pct, 0) < 0 else TEXT
             if not draw_piece(ret_text, ret_color):
                 return
+            if valuation_marker:
+                if not draw_piece(valuation_marker, ret_color):
+                    return
 
             if idx < len(items) - 1:
                 if not draw_piece("、", TEXT):
@@ -3647,7 +3690,16 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
 
-    text(fig_w / 2, 0.18, "本圖為籌碼追蹤整理，不構成投資建議。", 11, MUTED, FONT, ha="center")
+    text(
+        fig_w / 2,
+        0.34,
+        f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋成本低於 {TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%；無成交部位若取得有效 LP 報價則納入估值。",
+        9.5,
+        MUTED,
+        FONT,
+        ha="center",
+    )
+    text(fig_w / 2, 0.12, "本圖為籌碼追蹤整理，不構成投資建議。", 10.5, MUTED, FONT, ha="center")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, format="png", dpi=130, facecolor=fig.get_facecolor(), pad_inches=0)
