@@ -112,6 +112,17 @@ FINMIND_METADATA_CACHE_DIR = os.path.join(CACHE_DIR, "finmind_metadata")
 FINMIND_STATE_PATH = os.path.join(CACHE_DIR, "finmind_update_state.json")
 FINMIND_CACHE_SCHEMA_VERSION = os.getenv("FINMIND_CACHE_SCHEMA_VERSION", "finmind-v2-date-aware").strip() or "finmind-v2-date-aware"
 FINMIND_RAW_DAILY_RETENTION_DAYS = max(int(os.getenv("FINMIND_RAW_DAILY_RETENTION_DAYS", "7")), 1)
+# 完整修補模式不可因最新交易日資料尚未發布而提前結束。
+# repair 會往前探測最近已發布的全市場權證分點日檔，並以該日作為修補基準日；
+# daily 仍維持最新日未發布就快速結束，避免排程空抓。
+FINMIND_REPAIR_ALLOW_TARGET_FALLBACK = os.getenv(
+    "FINMIND_REPAIR_ALLOW_TARGET_FALLBACK",
+    "1",
+).strip().lower() not in ("0", "false", "no")
+FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS = max(
+    int(os.getenv("FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS", "15")),
+    1,
+)
 CACHE_WRITE_CSV_COMPAT = os.getenv("CACHE_WRITE_CSV_COMPAT", "0").strip().lower() in ("1", "true", "yes")
 GSHEET_CLEAN_DELETED_BROKER_ROWS = os.getenv("GSHEET_CLEAN_DELETED_BROKER_ROWS", "1").strip().lower() not in ("0", "false", "no")
 
@@ -6262,6 +6273,80 @@ def latest_finmind_trading_date_on_or_before(target=None):
     if available:
         return max(available).strftime("%Y/%m/%d")
     return resolve_latest_trading_date_on_or_before(target_dt or datetime.today())
+
+
+def resolve_finmind_refresh_target(requested_target_date, preloaded_raw=None, preloaded_status=None):
+    """
+    依工作流模式決定實際刷新基準日。
+
+    daily：
+    - 只接受 requested_target_date。
+    - 最新交易日尚未發布時，交由主流程快速結束。
+
+    repair：
+    - requested_target_date 已發布時直接使用。
+    - 若尚未發布／請求失敗，往前探測最近已發布的實際交易日。
+    - 找到後仍會由 refresh_history_from_finmind() 依完整修補天數補抓歷史，
+      不會因「今天沒有資料」或「今天已經處理」而跳過修補。
+
+    回傳：
+        (effective_date, raw_df, status, used_fallback)
+    """
+    requested_key = normalize_date_str(requested_target_date)
+
+    if preloaded_status is None:
+        preloaded_raw, preloaded_status = download_finmind_warrant_day(
+            requested_key,
+            force_refresh=FINMIND_FORCE_REFRESH_TARGET_DATE,
+        )
+
+    if preloaded_status == "ok":
+        return requested_key, preloaded_raw, "ok", False
+
+    if not workflow_is_repair() or not FINMIND_REPAIR_ALLOW_TARGET_FALLBACK:
+        return requested_key, preloaded_raw, preloaded_status, False
+
+    requested_dt = parse_date(requested_key) or datetime.today()
+    trading_dates = get_finmind_trading_dates()
+    candidates = sorted(
+        {d for d in trading_dates if d < requested_dt.date()},
+        reverse=True,
+    )[:FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS]
+
+    # 交易日清單暫時無法取得時，以曆日回退作最後備援；
+    # download_finmind_warrant_day() 仍會驗證是否為有效 Parquet。
+    if not candidates:
+        candidates = [
+            (requested_dt - timedelta(days=offset)).date()
+            for offset in range(1, FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS + 8)
+        ]
+
+    print(
+        f"  🔧 完整修補模式：{requested_key} 尚未取得（status={preloaded_status}），"
+        f"往前探測最近已發布交易日，最多 {FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS} 個交易日。"
+    )
+
+    seen = set()
+    for candidate_day in candidates:
+        candidate_key = candidate_day.strftime("%Y/%m/%d")
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+
+        raw_df, status = download_finmind_warrant_day(
+            candidate_key,
+            force_refresh=False,
+        )
+        if status == "ok":
+            print(
+                f"  ✅ 完整修補模式改用最近已發布交易日："
+                f"{requested_key} → {candidate_key}｜原始列數 {len(raw_df):,}"
+            )
+            return candidate_key, raw_df, "ok", True
+
+        print(f"  ↪️ 修補基準日探測：{candidate_key}｜status={status}")
+
+    return requested_key, preloaded_raw, preloaded_status, False
 
 
 def _finmind_day_cache_path(date_value):
@@ -15012,20 +15097,44 @@ def main():
         run_longterm_workflow(warrants, broker_map, output_path, program_start)
         return
 
-    target_date = latest_finmind_trading_date_on_or_before(datetime.today())
-    print(f"  ✅ 本次目標交易日：{target_date}")
+    requested_target_date = latest_finmind_trading_date_on_or_before(datetime.today())
+    print(f"  ✅ 本次要求目標交易日：{requested_target_date}")
 
-    # 先直接取得目標日完整日檔；若尚未更新，立即停止，不再浪費時間做歷史、價格與 Google Sheet 工作。
-    target_raw, target_status = download_finmind_warrant_day(
-        target_date,
+    # daily：最新日尚未發布就快速結束，避免排程反覆空抓。
+    # repair：不可在此提前 return；若最新日尚未發布，往前找最近已發布交易日，
+    # 再以該日為基準補抓完整歷史區間。
+    requested_raw, requested_status = download_finmind_warrant_day(
+        requested_target_date,
         force_refresh=FINMIND_FORCE_REFRESH_TARGET_DATE,
     )
+    target_date, target_raw, target_status, used_target_fallback = resolve_finmind_refresh_target(
+        requested_target_date,
+        preloaded_raw=requested_raw,
+        preloaded_status=requested_status,
+    )
+
     if target_status != "ok":
-        print(
-            f"  ⏹️ FinMind 尚未提供 {target_date} 全市場權證分點資料（status={target_status}）。"
-            "本次快速結束，不抓空白資料、不補價格、不修改 Google Sheet。"
-        )
+        if workflow_is_repair():
+            print(
+                f"  ⚠️ 完整修補模式找不到可用的 FinMind 全市場權證分點日檔："
+                f"要求日={requested_target_date}｜status={target_status}。"
+                "為避免以不完整來源修補，本次停止且不修改 Google Sheet。"
+            )
+        else:
+            print(
+                f"  ⏹️ FinMind 尚未提供 {requested_target_date} 全市場權證分點資料"
+                f"（status={target_status}）。本次每日流程快速結束，"
+                "不抓空白資料、不補價格、不修改 Google Sheet。"
+            )
         return
+
+    if used_target_fallback:
+        print(
+            f"  🔧 完整修補基準日：{target_date}｜"
+            f"原要求日 {requested_target_date} 尚未發布，但歷史補抓會繼續執行。"
+        )
+    else:
+        print(f"  ✅ 本次實際目標交易日：{target_date}")
 
     print(f"  ✅ 目標日全市場權證分點原始列數：{len(target_raw):,}")
     history_cache_df = load_history_cache()
@@ -15050,7 +15159,7 @@ def main():
 
     items = items_from_history_cache(history_cache_df)
     if not items:
-        print("  ✅ 目標日完整日檔已取得，但追蹤分點沒有可用資料；將建立空結果以清除舊快照。")
+        print("  ✅ 目標日完整日檔已取得，但追蹤分點沒有可用資料；仍會依既有歷史完成修補與報表計算，不會刪除工作表。")
 
     item_map = {(item["broker_code"], item["warrant_code"]): item for item in items}
     daily_records = build_daily_records(items)
