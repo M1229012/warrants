@@ -3693,7 +3693,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(
         fig_w / 2,
         0.34,
-        f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋成本低於 {TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%。",
+        f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋率低於 {TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%。",
         12.5,
         MUTED,
         FONT,
