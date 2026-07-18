@@ -37,6 +37,10 @@ jobs:
       FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
       FINMIND_API_BASE: "https://api.finmindtrade.com/api/v4"
       FINMIND_CACHE_SCHEMA_VERSION: "finmind-v2-date-aware"
+      WARRANT_IDENTITY_RECONCILE_ENABLED: "1"
+      WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX: "3"
+      WARRANT_IDENTITY_REPAIR_HISTORY: "1"
+      GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "1"
 
       FINMIND_METADATA_CACHE_HOURS: "18"
       FINMIND_HISTORY_WORKERS: "6"
@@ -45,9 +49,13 @@ jobs:
       FINMIND_REQUEST_TIMEOUT_CONNECT: "8"
       FINMIND_REQUEST_TIMEOUT_READ: "120"
 
-      # 目標日每次重新確認；若尚未發布，立即結束，不抓空資料。
+      # 目標日每次重新確認。
+      # daily：最新日未發布就快速結束，避免空抓。
+      # repair：往前找最近已發布交易日作為基準，仍會補抓完整歷史區間。
       FINMIND_FORCE_REFRESH_TARGET_DATE: "1"
       FINMIND_INITIAL_BACKFILL_ON_EMPTY: "1"
+      FINMIND_REPAIR_ALLOW_TARGET_FALLBACK: "1"
+      FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS: "15"
 
       # 原始全市場日檔只保留最近少量日期；標準化歷史另存 Parquet。
       FINMIND_RAW_DAILY_RETENTION_DAYS: "7"
@@ -76,9 +84,18 @@ jobs:
       TOP15_CACHE_ENABLED: "1"
       TOP15_LOOKBACK_TRADING_DAYS: "40"
       TOP15_PRICE_LOOKBACK_DAYS: "75"
+      TOP15_TARGET_PRICE_REFETCH_DAYS: "12"
       TOP15_REQUIRE_TARGET_DATE_PRICE: "1"
       TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN: "1"
       TOP15_MIN_BROKER_REMAINING_COST: "100000"
+      TOP15_LP_QUOTE_FALLBACK_ENABLED: "1"
+      TOP15_LP_QUOTE_TIMEOUT_SECONDS: "15"
+      TOP15_LP_QUOTE_WORKERS: "10"
+      TOP15_LP_ALLOW_IMPLICIT_LATEST_DATE: "0"
+      TOP15_LAST_TRADE_FALLBACK_ENABLED: "1"
+      TOP15_LAST_TRADE_FALLBACK_MAX_DAYS: "75"
+      TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT: "60"
+      TOP15_LP_QUOTE_URLS: "https://warrants.twse.com.tw/Query.aspx,https://warrants.twse.com.tw/query,https://warrants.sfi.org.tw/Query.aspx"
 
       SELL_DETAIL_DAYS: "3"
       # ============================================================
@@ -107,7 +124,9 @@ jobs:
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "1"
 
-      GSHEET_WRITE_SLEEP_SECONDS: "1.25"
+      GSHEET_WRITE_SLEEP_SECONDS: "0.05"
+      GSHEET_WRITE_RATE_PER_MINUTE: "45"
+      GSHEET_WRITE_BURST: "5"
       GSHEET_MAX_RETRIES: "6"
       GSHEET_RETRY_BASE_SECONDS: "12"
 
