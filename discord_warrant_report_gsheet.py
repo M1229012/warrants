@@ -48,6 +48,65 @@ import matplotlib.patches as patches
 from matplotlib import font_manager
 
 
+_TEXT_WIDTH_PIXEL_CACHE = {}
+_TEXT_WIDTH_PIXEL_CACHE_MAX_ENTRIES = 50000
+
+
+def _font_properties_measure_key(font_properties):
+    try:
+        return (
+            font_properties.get_file(),
+            tuple(font_properties.get_family()),
+            font_properties.get_style(),
+            font_properties.get_variant(),
+            font_properties.get_weight(),
+            font_properties.get_stretch(),
+        )
+    except Exception:
+        return id(font_properties)
+
+
+def _measure_text_width_cached(ax, renderer, text_value, size, font_properties):
+    """
+    快取 Matplotlib 文字像素寬度，再依目前座標轉成 data width。
+
+    相同文字、字級、字型與 DPI 只量一次；各張圖仍使用自己的 ax
+    做座標轉換，因此原本排版與截斷判斷不變。
+    """
+    text_value = str(text_value)
+    key = (
+        text_value,
+        round(float(size), 4),
+        _font_properties_measure_key(font_properties),
+        round(float(ax.figure.dpi), 4),
+    )
+
+    pixel_width = _TEXT_WIDTH_PIXEL_CACHE.get(key)
+    if pixel_width is None:
+        ghost = ax.text(
+            0,
+            0,
+            text_value,
+            fontsize=size,
+            fontproperties=font_properties,
+            alpha=0,
+        )
+        try:
+            pixel_width = float(ghost.get_window_extent(renderer=renderer).width)
+        finally:
+            ghost.remove()
+
+        if len(_TEXT_WIDTH_PIXEL_CACHE) >= _TEXT_WIDTH_PIXEL_CACHE_MAX_ENTRIES:
+            _TEXT_WIDTH_PIXEL_CACHE.clear()
+        _TEXT_WIDTH_PIXEL_CACHE[key] = pixel_width
+
+    x0_disp, y0_disp = ax.transData.transform((0, 0))
+    x1_disp = x0_disp + pixel_width
+    x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
+    x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
+    return x1_data - x0_data
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 基本設定
 # ══════════════════════════════════════════════════════════════════════
@@ -293,6 +352,7 @@ def format_event_names(value) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 _GSHEET = None
+_WORKSHEET_VALUES_CACHE: dict[str, list[list[str]]] = {}
 
 
 def get_gsheet():
@@ -329,9 +389,15 @@ def strip_gsheet_text_prefix(v):
 
 
 def worksheet_values(sheet_name: str) -> list[list[str]]:
+    """同一次執行內每張 Google Sheet 只讀一次，後續回傳防修改副本。"""
+    if sheet_name in _WORKSHEET_VALUES_CACHE:
+        return [list(row) for row in _WORKSHEET_VALUES_CACHE[sheet_name]]
+
     sh = get_gsheet()
     ws = sh.worksheet(sheet_name)
-    return ws.get_all_values()
+    values = ws.get_all_values()
+    _WORKSHEET_VALUES_CACHE[sheet_name] = [list(row) for row in values]
+    return [list(row) for row in values]
 
 
 def read_gsheet_table(
@@ -3280,14 +3346,13 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     renderer = fig.canvas.get_renderer()
 
     def measure_text_width(s, size=14, fp=None):
-        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
-        bb = ghost.get_window_extent(renderer=renderer)
-        ghost.remove()
-        x0_disp, y0_disp = ax.transData.transform((0, 0))
-        x1_disp = x0_disp + bb.width
-        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
-        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
-        return x1_data - x0_data
+        return _measure_text_width_cached(
+            ax,
+            renderer,
+            s,
+            size,
+            fp or FONT,
+        )
 
     def fit_to_cell_width(s, cell_w, size=14, fp=None):
         s = str(s or "")
@@ -3722,14 +3787,13 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     renderer = fig.canvas.get_renderer()
 
     def measure_text_width(s, size=14, fp=None):
-        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
-        bb = ghost.get_window_extent(renderer=renderer)
-        ghost.remove()
-        x0_disp, y0_disp = ax.transData.transform((0, 0))
-        x1_disp = x0_disp + bb.width
-        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
-        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
-        return x1_data - x0_data
+        return _measure_text_width_cached(
+            ax,
+            renderer,
+            s,
+            size,
+            fp or FONT,
+        )
 
     def fit_to_cell_width(s, cell_w, size=14, fp=None):
         s = str(s or "")
@@ -4029,14 +4093,13 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
     renderer = fig.canvas.get_renderer()
 
     def measure_text_width(s, size=11.5, fp=None):
-        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
-        bb = ghost.get_window_extent(renderer=renderer)
-        ghost.remove()
-        x0_disp, y0_disp = ax.transData.transform((0, 0))
-        x1_disp = x0_disp + bb.width
-        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
-        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
-        return x1_data - x0_data
+        return _measure_text_width_cached(
+            ax,
+            renderer,
+            s,
+            size,
+            fp or FONT,
+        )
 
     def fit_to_cell_width(s, cell_w, size=11.5, fp=None):
         s = str(s or "")
@@ -5048,14 +5111,13 @@ def draw_weekly_warrant_consensus_image(target: date, output_path: Path, window_
     renderer = fig.canvas.get_renderer()
 
     def measure_text_width(s, size=13.0, fp=None):
-        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
-        bb = ghost.get_window_extent(renderer=renderer)
-        ghost.remove()
-        x0_disp, y0_disp = ax.transData.transform((0, 0))
-        x1_disp = x0_disp + bb.width
-        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
-        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
-        return x1_data - x0_data
+        return _measure_text_width_cached(
+            ax,
+            renderer,
+            s,
+            size,
+            fp or FONT,
+        )
 
     def fit_to_cell_width(s, cell_w, size=13.0, fp=None):
         s = str(s or "")
@@ -5787,14 +5849,13 @@ def draw_broker_10d_detail_image(target: date, broker: str, output_path: Path):
     renderer = fig.canvas.get_renderer()
 
     def measure_text_width(s, size=13.0, fp=None):
-        ghost = ax.text(0, 0, str(s), fontsize=size, fontproperties=fp or FONT, alpha=0)
-        bb = ghost.get_window_extent(renderer=renderer)
-        ghost.remove()
-        x0_disp, y0_disp = ax.transData.transform((0, 0))
-        x1_disp = x0_disp + bb.width
-        x0_data = ax.transData.inverted().transform((x0_disp, y0_disp))[0]
-        x1_data = ax.transData.inverted().transform((x1_disp, y0_disp))[0]
-        return x1_data - x0_data
+        return _measure_text_width_cached(
+            ax,
+            renderer,
+            s,
+            size,
+            fp or FONT,
+        )
 
     def fit_to_cell_width(s, cell_w, size=13.0, fp=None):
         s = str(s or "")
