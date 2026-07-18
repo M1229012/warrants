@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-IDENTITY-MAPPING-FIXED-20260718-V4"
+PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260719-V6"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -76,6 +76,20 @@ _CURRENT_STOCK_CODE_TO_NAME = {}
 _CURRENT_STOCK_NAME_TO_CODE = {}
 _CURRENT_UNDERLYING_RESOLVER = []
 _CURRENT_WARRANT_INTERVAL_RECORDS = []
+
+# 權證身分配對效能快取：只快取索引與既有判斷結果，不改變任何身分判斷規則。
+# 1. 股名 resolver 依第一個字建立候選索引，仍保持原 resolver 排序。
+# 2. 相同 resolver + 權證名稱只解析一次。
+# 3. 權證日期對照依 warrants 物件與日期快取，同一天只建立一次。
+_UNDERLYING_RESOLVER_RUNTIME_LOCK = threading.Lock()
+_UNDERLYING_RESOLVER_RUNTIME_REF = None
+_UNDERLYING_RESOLVER_FIRST_CHAR_INDEX = {}
+_UNDERLYING_RESOLUTION_RESULT_CACHE = {}
+_UNDERLYING_RESOLUTION_RESULT_CACHE_MAXSIZE = 65536
+
+_WARRANT_LOOKUP_CACHE_LOCK = threading.Lock()
+_WARRANT_LOOKUP_CACHE_WARRANTS_REF = None
+_WARRANT_LOOKUP_CACHE = {}
 
 # 新制金額強度分類：
 # 事件單位為「同一分點 + 同一標的 + 同一天」。
@@ -505,9 +519,19 @@ def parse_date(date_str):
     return _parse_date_cached_text(str(date_str).strip())
 
 
-def normalize_date_str(date_str):
+@lru_cache(maxsize=65536)
+def _normalize_date_str_cached_value(date_str):
     dt = parse_date(date_str)
     return dt.strftime("%Y/%m/%d") if dt else str(date_str).strip()
+
+
+def normalize_date_str(date_str):
+    try:
+        hash(date_str)
+    except TypeError:
+        dt = parse_date(date_str)
+        return dt.strftime("%Y/%m/%d") if dt else str(date_str).strip()
+    return _normalize_date_str_cached_value(date_str)
 
 
 def add_months(dt, months):
@@ -1362,14 +1386,444 @@ def fetch_twse_prices(code, start_dt=None, end_dt=None):
     return prices
 
 
+# 單日全市場收盤價：TWSE／TPEx 各一個請求；逐檔月檔 API 只保留作補漏備援。
+_MARKET_CLOSE_PRICE_CACHE_LOCK = threading.Lock()
+_MARKET_CLOSE_PRICE_CACHE = {}
+_MARKET_CLOSE_SEEN_CODE_CACHE = {}
+_MARKET_CLOSE_DAY_LOCKS = {}
+_MARKET_CLOSE_DAY_LOCKS_GUARD = threading.Lock()
+
+# 價格序列日期索引：以 dict 物件身分為主鍵，同一序列只排序一次。
+_SORTED_PRICE_DATES_CACHE_LOCK = threading.Lock()
+_SORTED_PRICE_DATES_CACHE = {}
+_SORTED_PRICE_DATES_CACHE_MAXSIZE = 8192
+
+
+def _clean_market_cell_text(value):
+    text = re.sub(r"<[^>]*>", "", str(value or ""))
+    return text.replace("&nbsp;", " ").replace("\u3000", " ").strip()
+
+
+def _normalize_market_header(value):
+    return re.sub(r"[\s\u3000]+", "", _clean_market_cell_text(value)).lower()
+
+
+def _market_header_index(headers, kind):
+    normalized = [_normalize_market_header(header) for header in (headers or [])]
+    if kind == "code":
+        exact = {
+            "證券代號", "股票代號", "商品代號", "代號", "證券代碼", "股票代碼",
+            "securitycode", "stockid", "stock_id", "code",
+        }
+        contains = ("證券代號", "股票代號", "商品代號")
+    else:
+        exact = {
+            "收盤價", "收盤", "收市價", "成交價", "close", "closingprice",
+            "closeprice", "closing_price",
+        }
+        contains = ("收盤價", "收市價")
+
+    for idx, header in enumerate(normalized):
+        if header in exact:
+            return idx
+    for idx, header in enumerate(normalized):
+        if any(token in header for token in contains):
+            return idx
+    return None
+
+
+def _extract_market_close_prices_from_payload(payload):
+    """從 TWSE／TPEx 多種 JSON 表格格式擷取「代號、收盤價」，並保留所有看見的代號。"""
+    prices = {}
+    seen_codes = set()
+    visited = set()
+
+    def add_record(record):
+        if not isinstance(record, dict):
+            return
+        headers = list(record.keys())
+        code_idx = _market_header_index(headers, "code")
+        close_idx = _market_header_index(headers, "close")
+        if code_idx is None:
+            return
+        values = list(record.values())
+        code = normalize_price_code(_clean_market_cell_text(values[code_idx]))
+        if not code:
+            return
+        seen_codes.add(code)
+        if close_idx is None:
+            return
+        price = safe_price_float(_clean_market_cell_text(values[close_idx]))
+        if price is not None:
+            prices[code] = price
+
+    def add_table(headers, rows):
+        if not isinstance(headers, list) or not isinstance(rows, list):
+            return
+        code_idx = _market_header_index(headers, "code")
+        close_idx = _market_header_index(headers, "close")
+        if code_idx is None:
+            return
+        for row in rows:
+            if isinstance(row, dict):
+                add_record(row)
+                continue
+            if not isinstance(row, (list, tuple)) or code_idx >= len(row):
+                continue
+            code = normalize_price_code(_clean_market_cell_text(row[code_idx]))
+            if not code:
+                continue
+            seen_codes.add(code)
+            if close_idx is None or close_idx >= len(row):
+                continue
+            price = safe_price_float(_clean_market_cell_text(row[close_idx]))
+            if price is not None:
+                prices[code] = price
+
+    def visit(obj):
+        if isinstance(obj, (dict, list)):
+            obj_id = id(obj)
+            if obj_id in visited:
+                return
+            visited.add(obj_id)
+
+        if isinstance(obj, dict):
+            # 單筆 dict record。
+            add_record(obj)
+
+            # 標準 fields/data 與 TWSE fields1/data1、fields2/data2...。
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("data"), list):
+                add_table(obj.get("fields"), obj.get("data"))
+            for key, headers in obj.items():
+                match = re.fullmatch(r"fields(\d*)", str(key or ""), flags=re.IGNORECASE)
+                if not match or not isinstance(headers, list):
+                    continue
+                rows = obj.get(f"data{match.group(1)}")
+                if isinstance(rows, list):
+                    add_table(headers, rows)
+
+            # TPEx tables 陣列及其他巢狀容器。
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, dict):
+                    add_record(value)
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+    visit(payload)
+    return prices, seen_codes
+
+
+def _market_close_day_lock(date_key):
+    with _MARKET_CLOSE_DAY_LOCKS_GUARD:
+        lock = _MARKET_CLOSE_DAY_LOCKS.get(date_key)
+        if lock is None:
+            lock = threading.Lock()
+            _MARKET_CLOSE_DAY_LOCKS[date_key] = lock
+        return lock
+
+
+def _fetch_market_close_snapshot_for_date(target_date):
+    """同一天最多抓一次 TWSE＋TPEx；回傳有效價格與該日市場回應曾出現的代號。"""
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return {}, set()
+    target_key = target_dt.strftime("%Y/%m/%d")
+
+    with _MARKET_CLOSE_PRICE_CACHE_LOCK:
+        if target_key in _MARKET_CLOSE_PRICE_CACHE:
+            return (
+                dict(_MARKET_CLOSE_PRICE_CACHE[target_key]),
+                set(_MARKET_CLOSE_SEEN_CODE_CACHE.get(target_key, set())),
+            )
+
+    with _market_close_day_lock(target_key):
+        with _MARKET_CLOSE_PRICE_CACHE_LOCK:
+            if target_key in _MARKET_CLOSE_PRICE_CACHE:
+                return (
+                    dict(_MARKET_CLOSE_PRICE_CACHE[target_key]),
+                    set(_MARKET_CLOSE_SEEN_CODE_CACHE.get(target_key, set())),
+                )
+
+        endpoints = [
+            (
+                "TWSE",
+                "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                {
+                    "response": "json",
+                    "date": target_dt.strftime("%Y%m%d"),
+                    "type": "ALL",
+                },
+            ),
+            (
+                "TPEx",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+                {
+                    "date": target_dt.strftime("%Y/%m/%d"),
+                    "response": "json",
+                },
+            ),
+        ]
+
+        def fetch_one(endpoint):
+            market_name, url, params = endpoint
+            session = get_thread_session()
+            response = session.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
+                timeout=(5, 25),
+            )
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except Exception:
+                payload = json.loads(response.content.decode("utf-8"))
+            market_prices, seen_codes = _extract_market_close_prices_from_payload(payload)
+            return market_name, market_prices, seen_codes
+
+        all_prices = {}
+        all_seen_codes = set()
+        market_results = []
+        successful_markets = 0
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(fetch_one, endpoint): endpoint[0] for endpoint in endpoints}
+            for future in as_completed(futures):
+                market_name = futures[future]
+                try:
+                    market_name, market_prices, seen_codes = future.result()
+                    all_prices.update(market_prices)
+                    all_seen_codes.update(seen_codes)
+                    market_results.append(
+                        f"{market_name}:{len(market_prices):,}價/{len(seen_codes):,}檔"
+                    )
+                    if seen_codes:
+                        successful_markets += 1
+                except Exception as exc:
+                    market_results.append(f"{market_name}:失敗")
+                    print(
+                        f"  ⚠️ {market_name} 全市場收盤價批次抓取失敗：{target_key}｜"
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        # 兩市場皆成功才固定快取；部分成功仍回傳，讓逐檔補漏接手缺口。
+        if successful_markets == len(endpoints):
+            with _MARKET_CLOSE_PRICE_CACHE_LOCK:
+                _MARKET_CLOSE_PRICE_CACHE[target_key] = dict(all_prices)
+                _MARKET_CLOSE_SEEN_CODE_CACHE[target_key] = set(all_seen_codes)
+
+        print(
+            f"  ✅ 單日全市場收盤價批次：{target_key}｜"
+            f"{'｜'.join(sorted(market_results))}｜合併 {len(all_prices):,} 價"
+        )
+        return dict(all_prices), set(all_seen_codes)
+
+
+def fetch_market_close_prices_for_date(target_date):
+    prices, _seen_codes = _fetch_market_close_snapshot_for_date(target_date)
+    return prices
+
+
+def _normalize_price_fetch_plan(fetch_plan):
+    normalized = {}
+    for raw_code, raw_range in (fetch_plan or {}).items():
+        code = normalize_price_code(raw_code)
+        if not code or not raw_range or len(raw_range) < 2:
+            continue
+        start_dt = parse_date(raw_range[0])
+        end_dt = parse_date(raw_range[1])
+        if not start_dt or not end_dt:
+            continue
+        end_dt = min(end_dt, datetime.today())
+        if start_dt > end_dt:
+            start_dt = end_dt
+        normalized[code] = [start_dt, end_dt]
+    return normalized
+
+
+def _price_plan_trading_dates(fetch_plan):
+    fetch_plan = _normalize_price_fetch_plan(fetch_plan)
+    if not fetch_plan:
+        return []
+    min_day = min(value[0].date() for value in fetch_plan.values())
+    max_day = max(value[1].date() for value in fetch_plan.values())
+
+    official_dates = [
+        day for day in get_finmind_trading_dates()
+        if min_day <= day <= max_day
+    ]
+    selected = set(official_dates)
+
+    # 交易日主檔可能尚未包含今天；只對主檔最後日期之後補平日候選。
+    fallback_start = (max(official_dates) + timedelta(days=1)) if official_dates else min_day
+    current = fallback_start
+    while current <= max_day:
+        if current.weekday() < 5:
+            selected.add(current)
+        current += timedelta(days=1)
+
+    return sorted(selected)
+
+
+def _latest_valid_price_date(prices):
+    valid_dates = _sorted_valid_price_dates(prices)
+    return valid_dates[-1] if valid_dates else ""
+
+
+def fetch_price_plan_batch_first(
+    price_cache,
+    persistent_price_cache,
+    fetch_plan,
+    label="價格",
+    progress_every=10,
+):
+    """
+    先依交易日抓 TWSE／TPEx 全市場收盤價，再只對未出現在批次資料或仍完全缺價的代號逐檔補漏。
+    """
+    fetch_plan = _normalize_price_fetch_plan(fetch_plan)
+    changed_codes = set()
+    if not fetch_plan:
+        return changed_codes
+
+    trading_dates = _price_plan_trading_dates(fetch_plan)
+    batch_seen_codes = set()
+    latest_expected_by_code = {}
+
+    print(
+        f"  {label}全市場批次價：{len(trading_dates):,} 個交易日｜"
+        f"最多 {len(trading_dates) * 2:,} 個市場請求"
+    )
+
+    for date_index, trade_day in enumerate(trading_dates, start=1):
+        target_key = trade_day.strftime("%Y/%m/%d")
+        wanted_codes = {
+            code
+            for code, (start_dt, end_dt) in fetch_plan.items()
+            if start_dt.date() <= trade_day <= end_dt.date()
+        }
+        if not wanted_codes:
+            continue
+
+        market_prices, seen_codes = _fetch_market_close_snapshot_for_date(target_key)
+        batch_seen_codes.update(wanted_codes & seen_codes)
+        for code in wanted_codes:
+            latest_expected_by_code[code] = target_key
+            price = safe_price_float(market_prices.get(code))
+            if price is None:
+                continue
+            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+            old_price = safe_price_float(old_prices.get(target_key))
+            merged_prices = merge_price_dicts(old_prices, {target_key: price})
+            persistent_price_cache[code] = merged_prices
+            add_price_aliases(price_cache, code, merged_prices)
+            if old_price != price:
+                changed_codes.add(code)
+
+        if progress_every and date_index % max(int(progress_every), 1) == 0:
+            print(f"  [{date_index}/{len(trading_dates)}] {label}全市場批次價處理中...")
+
+    fallback_plan = {}
+    for code, date_range in fetch_plan.items():
+        prices = get_cached_prices_for_code(persistent_price_cache, code)
+        latest_date = _latest_valid_price_date(prices)
+        expected_date = latest_expected_by_code.get(code, "")
+        need_fallback = not prices or not latest_date or code not in batch_seen_codes
+
+        # 股票通常每天都有收盤價；若批次漏掉需求區間最後交易日，逐檔補一次。
+        # 權證若該日無成交但全市場回應已看見代號，不重複逐檔打 API。
+        if len(code) == 4 and expected_date and latest_date != expected_date:
+            need_fallback = True
+
+        if need_fallback:
+            fallback_plan[code] = date_range
+        elif prices:
+            add_price_aliases(price_cache, code, prices)
+
+    print(
+        f"  {label}批次價命中：{len(fetch_plan) - len(fallback_plan):,}/{len(fetch_plan):,} 檔｜"
+        f"逐檔補漏：{len(fallback_plan):,} 檔"
+    )
+
+    if not fallback_plan:
+        return changed_codes
+
+    def fetch_one(code):
+        start_dt, end_dt = fallback_plan[code]
+        return code, fetch_twse_prices(code, start_dt, end_dt)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as executor:
+        futures = {executor.submit(fetch_one, code): code for code in fallback_plan}
+        for future in as_completed(futures):
+            done += 1
+            code = futures[future]
+            try:
+                code, fetched_prices = future.result()
+            except Exception:
+                fetched_prices = {}
+
+            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
+            merged_prices = merge_price_dicts(old_prices, fetched_prices)
+            if merged_prices:
+                persistent_price_cache[code] = merged_prices
+                add_price_aliases(price_cache, code, merged_prices)
+                if fetched_prices:
+                    changed_codes.add(code)
+            else:
+                add_price_aliases(price_cache, code, old_prices)
+
+            if done % 20 == 0:
+                print(f"  [{done}/{len(fallback_plan)}] {label}逐檔補漏中...")
+
+    return changed_codes
+
+
+def _price_dates_cache_signature(prices):
+    try:
+        length = len(prices)
+        if length == 0:
+            return (0, None, None, None, None)
+        first_key = next(iter(prices))
+        last_key = next(reversed(prices))
+        return (
+            length,
+            first_key,
+            last_key,
+            prices.get(first_key),
+            prices.get(last_key),
+        )
+    except Exception:
+        return (len(prices) if prices else 0, None, None, None, None)
+
+
 def _sorted_valid_price_dates(prices):
     if not prices:
         return []
-    return sorted(
+
+    cache_key = id(prices)
+    signature = _price_dates_cache_signature(prices)
+    with _SORTED_PRICE_DATES_CACHE_LOCK:
+        cached = _SORTED_PRICE_DATES_CACHE.get(cache_key)
+        if cached is not None and cached[0] is prices and cached[1] == signature:
+            return cached[2]
+
+    valid_dates = sorted(
         normalize_date_str(d)
         for d, p in prices.items()
         if parse_date(d) and safe_price_float(p) is not None
     )
+
+    with _SORTED_PRICE_DATES_CACHE_LOCK:
+        if len(_SORTED_PRICE_DATES_CACHE) >= _SORTED_PRICE_DATES_CACHE_MAXSIZE:
+            _SORTED_PRICE_DATES_CACHE.clear()
+        _SORTED_PRICE_DATES_CACHE[cache_key] = (prices, signature, valid_dates)
+
+    return valid_dates
 
 
 def get_price_nearest(prices, date):
@@ -3116,6 +3570,21 @@ def reset_worksheet_before_value_write(ws, row_count, col_count):
     _gsheet_batch_update(requests)
 
 
+def gsheet_values_batch_update(ws, data, description, chunk_size=5000):
+    """以 values.batchUpdate 在單一請求內寫入多個 range；超大 payload 才分大批次。"""
+    if ws is None or not data:
+        return
+    chunk_size = max(int(chunk_size or 5000), 1)
+    for start in range(0, len(data), chunk_size):
+        chunk = data[start:start + chunk_size]
+        gsheet_api_call(
+            f"{description} {start + 1}-{start + len(chunk)}",
+            ws.batch_update,
+            chunk,
+            value_input_option="USER_ENTERED",
+        )
+
+
 def write_values_to_worksheet(ws, values):
     if ws is None:
         return False
@@ -3147,17 +3616,18 @@ def write_values_to_worksheet(ws, values):
 
         reset_worksheet_before_value_write(ws, row_count, col_count)
 
+        batch_ranges = []
         for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
             chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
-            start_row = start + 1
-            cell_range = f"A{start_row}"
-            gsheet_api_call(
-                f"寫入工作表資料 {ws.title} A{start_row}",
-                ws.update,
-                values=chunk,
-                range_name=cell_range,
-                value_input_option="USER_ENTERED",
-            )
+            batch_ranges.append({
+                "range": f"A{start + 1}",
+                "values": chunk,
+            })
+        gsheet_values_batch_update(
+            ws,
+            batch_ranges,
+            f"批次寫入工作表資料 {ws.title}",
+        )
 
         apply_text_format_to_gsheet(ws, normalized_values)
 
@@ -4420,15 +4890,18 @@ def _write_values_to_archive_worksheet(ws, values):
         )
         gsheet_api_call(f"清除封存工作表 {ws.title}", ws.clear)
 
+        batch_ranges = []
         for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
             chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
-            gsheet_api_call(
-                f"寫入封存工作表 {ws.title} A{start + 1}",
-                ws.update,
-                values=chunk,
-                range_name=f"A{start + 1}",
-                value_input_option="USER_ENTERED",
-            )
+            batch_ranges.append({
+                "range": f"A{start + 1}",
+                "values": chunk,
+            })
+        gsheet_values_batch_update(
+            ws,
+            batch_ranges,
+            f"批次寫入封存工作表 {ws.title}",
+        )
 
         # 再 resize 一次，確保 clear / update 後沒有殘留多餘空白列欄。
         gsheet_api_call(
@@ -5495,14 +5968,12 @@ def repair_existing_worksheet_security_identities(ws, title, existing_values):
             })
 
     if cell_updates:
-        for start in range(0, len(cell_updates), 500):
-            chunk = cell_updates[start:start + 500]
-            gsheet_api_call(
-                f"修正權證與標的身分 {safe_worksheet_title(title)}",
-                ws.batch_update,
-                chunk,
-                value_input_option="USER_ENTERED",
-            )
+        gsheet_values_batch_update(
+            ws,
+            cell_updates,
+            f"修正權證與標的身分 {safe_worksheet_title(title)}",
+            chunk_size=5000,
+        )
         print(
             f"  🧭 Google Sheet 身分欄位精準更正：{safe_worksheet_title(title)}｜"
             f"{repaired_rows:,} 列｜{len(cell_updates):,} 格｜未覆寫其他欄位"
@@ -6600,6 +7071,32 @@ def build_underlying_resolver_from_stock_master(code_to_name):
     return candidates
 
 
+def _reset_underlying_resolver_runtime_cache(resolver=None):
+    """切換股名 resolver 時重建第一字索引並清空名稱解析快取。"""
+    global _UNDERLYING_RESOLVER_RUNTIME_REF
+    global _UNDERLYING_RESOLVER_FIRST_CHAR_INDEX
+    global _UNDERLYING_RESOLUTION_RESULT_CACHE
+
+    resolver = resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER
+    first_char_index = defaultdict(list)
+    for rec in resolver or []:
+        prefix = str(rec.get("prefix", "") or "")
+        if prefix:
+            first_char_index[prefix[0]].append(rec)
+
+    with _UNDERLYING_RESOLVER_RUNTIME_LOCK:
+        _UNDERLYING_RESOLVER_RUNTIME_REF = resolver
+        _UNDERLYING_RESOLVER_FIRST_CHAR_INDEX = dict(first_char_index)
+        _UNDERLYING_RESOLUTION_RESULT_CACHE = {}
+
+
+def _ensure_underlying_resolver_runtime_cache(resolver):
+    """確保目前 resolver 的索引存在；以物件身分判斷，不改 resolver 內容。"""
+    if resolver is _UNDERLYING_RESOLVER_RUNTIME_REF:
+        return
+    _reset_underlying_resolver_runtime_cache(resolver)
+
+
 def resolve_underlying_from_warrant_name(warrant_name, resolver=None):
     wname = normalize_stock_name_text(warrant_name)
     if not wname:
@@ -6617,11 +7114,28 @@ def resolve_underlying_from_warrant_name(warrant_name, resolver=None):
         }
 
     resolver = resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER
-    for rec in resolver or []:
+    _ensure_underlying_resolver_runtime_cache(resolver)
+
+    with _UNDERLYING_RESOLVER_RUNTIME_LOCK:
+        if wname in _UNDERLYING_RESOLUTION_RESULT_CACHE:
+            return _UNDERLYING_RESOLUTION_RESULT_CACHE[wname]
+        candidates = _UNDERLYING_RESOLVER_FIRST_CHAR_INDEX.get(wname[0], ())
+
+    result = None
+    # candidates 仍維持 build_underlying_resolver_from_stock_master() 的原排序，
+    # 因此命中結果與原本逐筆掃完整 resolver 完全相同。
+    for rec in candidates:
         prefix = rec.get("prefix", "")
         if prefix and wname.startswith(prefix):
-            return rec
-    return None
+            result = rec
+            break
+
+    with _UNDERLYING_RESOLVER_RUNTIME_LOCK:
+        if len(_UNDERLYING_RESOLUTION_RESULT_CACHE) >= _UNDERLYING_RESOLUTION_RESULT_CACHE_MAXSIZE:
+            _UNDERLYING_RESOLUTION_RESULT_CACHE.clear()
+        _UNDERLYING_RESOLUTION_RESULT_CACHE[wname] = result
+
+    return result
 
 
 def reconcile_underlying_identity(
@@ -6678,13 +7192,33 @@ def reconcile_underlying_identity(
     return chosen_code, chosen_name, source
 
 
+def build_cached_warrant_index(cached_warrants):
+    """將舊權證快取依代號預先分組；只改查找方式，不改候選順序。"""
+    by_code = defaultdict(list)
+    for rec in cached_warrants or []:
+        code = normalize_security_code_text(rec.get("代號", ""))
+        if code:
+            by_code[code].append(rec)
+    return dict(by_code)
+
+
 def _cached_warrant_name_candidates(cached_warrants, code, list_date, end_date):
     out = []
+    code = normalize_security_code_text(code)
     list_dt = parse_date(list_date)
     end_dt = parse_date(end_date)
-    for rec in cached_warrants or []:
-        if normalize_security_code_text(rec.get("代號", "")) != code:
-            continue
+
+    # get_all_call_warrants_live() 會傳入按代號建立的 dict 索引；
+    # 仍相容舊呼叫傳入 list，避免影響其他既有流程。
+    if isinstance(cached_warrants, dict):
+        candidate_records = cached_warrants.get(code, ())
+    else:
+        candidate_records = (
+            rec for rec in (cached_warrants or [])
+            if normalize_security_code_text(rec.get("代號", "")) == code
+        )
+
+    for rec in candidate_records:
         name = str(rec.get("名稱", "")).strip()
         if not name:
             continue
@@ -6801,9 +7335,9 @@ def dedupe_warrant_interval_records(records, resolver=None):
 
 def repair_history_metadata_from_warrants(history_df, warrants):
     """
-    用「權證代號＋交易日期」重新回填權證名稱與標的股／名稱。
+    用「權證代號＋交易日期」批次回填權證名稱與標的股／名稱。
 
-    這會修正舊快取中已存在的錯配，不必等該歷史日期重新下載才生效。
+    依日期分組後以 Series.map + .loc 批次比較與回寫，避免逐列 .at。
     """
     stats = {"rows": 0, "warrant_name": 0, "underlying_code": 0, "underlying_name": 0}
     if not WARRANT_IDENTITY_REPAIR_HISTORY or history_df is None or history_df.empty or not warrants:
@@ -6813,35 +7347,43 @@ def repair_history_metadata_from_warrants(history_df, warrants):
         return history_df, stats
 
     out = history_df.copy()
-    normalized_dates = out["日期"].map(normalize_date_str)
-    out["日期"] = normalized_dates
+    out["日期"] = out["日期"].map(normalize_date_str)
+    changed_row_mask = pd.Series(False, index=out.index)
+
+    field_specs = (
+        ("權證名稱", "名稱", "warrant_name", lambda value: str(value or "").strip()),
+        ("標的股", "標的股", "underlying_code", normalize_security_code_text),
+        ("標的名稱", "標的名稱", "underlying_name", lambda value: str(value or "").strip()),
+    )
+
     for date_value, indices in out.groupby("日期", sort=False).groups.items():
         lookup = _warrant_lookup(warrants, date_value)
         if not lookup:
             continue
-        for idx in indices:
-            code = normalize_security_code_text(out.at[idx, "權證代號"])
-            meta = lookup.get(code)
-            if not meta:
-                continue
-            new_values = {
-                "權證名稱": str(meta.get("名稱", "")).strip(),
-                "標的股": normalize_security_code_text(meta.get("標的股", "")),
-                "標的名稱": str(meta.get("標的名稱", "")).strip(),
-            }
-            changed = False
-            for col, new_value in new_values.items():
-                if not new_value:
-                    continue
-                old_value = str(out.at[idx, col] or "").strip()
-                if old_value == new_value:
-                    continue
-                out.at[idx, col] = new_value
-                stats[col == "權證名稱" and "warrant_name" or col == "標的股" and "underlying_code" or "underlying_name"] += 1
-                changed = True
-            if changed:
-                stats["rows"] += 1
 
+        group_index = pd.Index(indices)
+        codes = out.loc[group_index, "權證代號"].map(normalize_security_code_text)
+        metas = codes.map(lookup)
+        has_meta = metas.map(lambda meta: isinstance(meta, dict))
+        if not bool(has_meta.any()):
+            continue
+
+        for column, meta_key, stat_key, normalizer in field_specs:
+            new_values = metas.map(
+                lambda meta, _key=meta_key, _normalizer=normalizer:
+                    _normalizer(meta.get(_key, "")) if isinstance(meta, dict) else ""
+            )
+            old_values = out.loc[group_index, column].fillna("").astype(str).str.strip()
+            change_mask = has_meta & new_values.ne("") & old_values.ne(new_values)
+            if not bool(change_mask.any()):
+                continue
+
+            changed_indices = group_index[change_mask.to_numpy()]
+            out.loc[changed_indices, column] = new_values.loc[changed_indices].to_numpy()
+            changed_row_mask.loc[changed_indices] = True
+            stats[stat_key] += int(change_mask.sum())
+
+    stats["rows"] = int(changed_row_mask.sum())
     return out, stats
 
 
@@ -7153,9 +7695,31 @@ def download_finmind_warrant_day(date_value, *, force_refresh=False):
 
 
 
+def _reset_warrant_lookup_cache(warrants=None):
+    """切換權證區間清單時清空日期化 lookup；不修改權證資料。"""
+    global _WARRANT_LOOKUP_CACHE_WARRANTS_REF
+    global _WARRANT_LOOKUP_CACHE
+    with _WARRANT_LOOKUP_CACHE_LOCK:
+        _WARRANT_LOOKUP_CACHE_WARRANTS_REF = warrants
+        _WARRANT_LOOKUP_CACHE = {}
+
+
 def _warrant_lookup(warrants, date_value=None):
     """依交易日期選出當時有效的權證代號→標的對照，正確處理代號重用。"""
+    global _WARRANT_LOOKUP_CACHE_WARRANTS_REF
+    global _WARRANT_LOOKUP_CACHE
+
     target_dt = parse_date(date_value) if date_value else None
+    cache_key = target_dt.strftime("%Y/%m/%d") if target_dt else ""
+
+    with _WARRANT_LOOKUP_CACHE_LOCK:
+        if warrants is not _WARRANT_LOOKUP_CACHE_WARRANTS_REF:
+            _WARRANT_LOOKUP_CACHE_WARRANTS_REF = warrants
+            _WARRANT_LOOKUP_CACHE = {}
+        cached = _WARRANT_LOOKUP_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     selected = {}
     selected_start = {}
 
@@ -7176,6 +7740,11 @@ def _warrant_lookup(warrants, date_value=None):
         if code not in selected or start_key >= selected_start[code]:
             selected[code] = warrant
             selected_start[code] = start_key
+
+    with _WARRANT_LOOKUP_CACHE_LOCK:
+        # 若計算期間 warrants 未被另一流程切換，才寫入目前快取。
+        if warrants is _WARRANT_LOOKUP_CACHE_WARRANTS_REF:
+            _WARRANT_LOOKUP_CACHE[cache_key] = selected
 
     return selected
 
@@ -7284,42 +7853,6 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
     out = pd.DataFrame.from_records(records, columns=columns)
     out = out.sort_values(["日期", "分點", "標的股", "權證代號"]).reset_index(drop=True)
     return out
-
-
-
-def _merge_complete_finmind_day(history_df, day_df, date_value, broker_map):
-    date_key = normalize_date_str(date_value)
-    active_codes = {
-        normalize_broker_code_for_compare(code)
-        for _, code in (broker_map or {}).values()
-        if normalize_broker_code_for_compare(code)
-    }
-
-    if history_df is None or history_df.empty:
-        base = pd.DataFrame(columns=list(day_df.columns) if day_df is not None and not day_df.empty else [
-            "權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號", "日期",
-            "買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額",
-        ])
-    else:
-        base = history_df.copy()
-
-    if not base.empty and {"日期", "券商代號"}.issubset(base.columns):
-        base_dates = base["日期"].map(normalize_date_str)
-        base_codes = base["券商代號"].map(normalize_broker_code_for_compare)
-        # 全市場日檔是完整快照：同日期、目前追蹤分點的舊列必須先移除，
-        # 目標分點當天 0 筆時也能正確清除舊的錯誤快照。
-        base = base[~((base_dates == date_key) & base_codes.isin(active_codes))].copy()
-
-    if day_df is not None and not day_df.empty:
-        base = pd.concat([base, day_df], ignore_index=True)
-
-    if base.empty:
-        return base
-
-    base["日期"] = base["日期"].map(normalize_date_str)
-    base = base.drop_duplicates(subset=["權證代號", "券商代號", "日期"], keep="last")
-    return base.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
-
 
 
 
@@ -7521,7 +8054,6 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
                 f"  ✅ {result_date}：市場原始 {len(raw):,} 列｜"
                 f"追蹤分點彙總 {len(normalized):,} 列"
             )
-            prune_finmind_daily_raw_cache(keep_date=target_key)
 
     if success_dates:
         combined = _merge_complete_finmind_days(combined, normalized_by_date, broker_map)
@@ -7796,6 +8328,8 @@ def get_all_call_warrants_live(cached_warrants=None):
     _CURRENT_STOCK_CODE_TO_NAME = stock_code_to_name
     _CURRENT_STOCK_NAME_TO_CODE = stock_name_to_code
     _CURRENT_UNDERLYING_RESOLVER = build_underlying_resolver_from_stock_master(stock_code_to_name)
+    _reset_underlying_resolver_runtime_cache(_CURRENT_UNDERLYING_RESOLVER)
+    cached_warrant_index = build_cached_warrant_index(cached_warrants)
 
     info = info_df.copy().fillna("")
     info["stock_id"] = info["stock_id"].map(normalize_security_code_text)
@@ -7853,7 +8387,7 @@ def get_all_call_warrants_live(cached_warrants=None):
             list_date,
             end_date,
             info_name_candidates,
-            cached_warrants,
+            cached_warrant_index,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
             enforce_underlying_match=False,
         )
@@ -7874,7 +8408,7 @@ def get_all_call_warrants_live(cached_warrants=None):
             list_date,
             end_date,
             info_name_candidates,
-            cached_warrants,
+            cached_warrant_index,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
         )
         if final_name_source.startswith("code_only"):
@@ -7894,6 +8428,7 @@ def get_all_call_warrants_live(cached_warrants=None):
 
     warrants = dedupe_warrant_interval_records(warrants, resolver=_CURRENT_UNDERLYING_RESOLVER)
     _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in warrants]
+    _reset_warrant_lookup_cache(_CURRENT_WARRANT_INTERVAL_RECORDS)
     for rec in warrants:
         rec.pop("_名稱來源", None)
         rec.pop("_標的來源", None)
@@ -8665,42 +9200,14 @@ def fetch_all_prices(
             defer_save=defer_save,
         )
 
-    def fetch_one(code):
-        start_dt, end_dt = fetch_plan[code]
-        return code, fetch_twse_prices(code, start_dt, end_dt)
-
-    price_workers = PRICE_WORKERS
-    print(f"  價格抓取執行緒：{price_workers}")
-
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=price_workers) as ex:
-        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
-
-        for future in as_completed(futures):
-            done += 1
-
-            try:
-                code, fetched_prices = future.result()
-                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
-                merged_prices = merge_price_dicts(old_prices, fetched_prices)
-
-                norm_code = normalize_price_code(code)
-
-                if norm_code:
-                    persistent_price_cache[norm_code] = merged_prices
-                    if fetched_prices:
-                        changed_price_codes.add(norm_code)
-
-                add_price_aliases(price_cache, code, merged_prices)
-
-            except Exception:
-                code = futures[future]
-                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
-                add_price_aliases(price_cache, code, old_prices)
-
-            if done % 20 == 0:
-                print(f"  [{done}/{len(fetch_plan)}] 收盤價補抓中...")
+    changed_price_codes.update(
+        fetch_price_plan_batch_first(
+            price_cache,
+            persistent_price_cache,
+            fetch_plan,
+            label="收盤價",
+        )
+    )
 
     print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
     return _finish_price_ensure(
@@ -9882,35 +10389,18 @@ def ensure_top15_return_warrant_prices(
             defer_save=defer_save,
         )
 
-    def fetch_one(code):
-        return code, fetch_twse_prices(code, fetch_start_by_code.get(code, start_dt), target_dt)
-
-    done = 0
-    with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
-        futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
-
-        for future in as_completed(futures):
-            done += 1
-            code = futures[future]
-
-            try:
-                code, fetched_prices = future.result()
-            except Exception:
-                fetched_prices = {}
-
-            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
-            merged_prices = merge_price_dicts(old_prices, fetched_prices)
-
-            if merged_prices:
-                norm_code = normalize_price_code(code)
-                if norm_code:
-                    persistent_price_cache[norm_code] = merged_prices
-                    if fetched_prices:
-                        changed_price_codes.add(norm_code)
-                add_price_aliases(price_cache, code, merged_prices)
-
-            if done % 20 == 0:
-                print(f"  [{done}/{len(fetch_plan)}] TOP15固定資料集權證價格補抓中...")
+    top15_fetch_plan = {
+        code: [fetch_start_by_code.get(code, start_dt), target_dt]
+        for code in fetch_plan
+    }
+    changed_price_codes.update(
+        fetch_price_plan_batch_first(
+            price_cache,
+            persistent_price_cache,
+            top15_fetch_plan,
+            label="TOP15固定資料集權證價格",
+        )
+    )
 
     return _finish_price_ensure(
         price_cache,
@@ -9997,7 +10487,7 @@ def _official_market_has_trading_data(target_dt):
             {
                 "response": "json",
                 "date": target_dt.strftime("%Y%m%d"),
-                "type": "ALLBUT0999",
+                "type": "ALL",
             },
         ),
         (
@@ -15608,35 +16098,16 @@ def ensure_longterm_warrant_prices(price_cache, open_lots, target_date):
     print(f"  長期留單需補抓權證價格：{len(fetch_plan):,} 檔")
 
     if fetch_plan:
-        changed_price_codes = set()
-
-        def fetch_one(code):
-            return code, fetch_twse_prices(code, start_dt, target_dt)
-
-        done = 0
-        with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
-            futures = {ex.submit(fetch_one, code): code for code in fetch_plan}
-            for future in as_completed(futures):
-                done += 1
-                code = futures[future]
-                try:
-                    code, fetched_prices = future.result()
-                except Exception:
-                    fetched_prices = {}
-
-                old_prices = get_cached_prices_for_code(persistent_price_cache, code)
-                merged_prices = merge_price_dicts(old_prices, fetched_prices)
-                if merged_prices:
-                    norm_code = normalize_price_code(code)
-                    if norm_code:
-                        persistent_price_cache[norm_code] = merged_prices
-                        if fetched_prices:
-                            changed_price_codes.add(norm_code)
-                    add_price_aliases(price_cache, code, merged_prices)
-
-                if done % 50 == 0:
-                    print(f"  [{done:,}/{len(fetch_plan):,}] 長期留單權證價格補抓中...")
-
+        longterm_fetch_plan = {
+            code: [start_dt, target_dt]
+            for code in fetch_plan
+        }
+        changed_price_codes = fetch_price_plan_batch_first(
+            price_cache,
+            persistent_price_cache,
+            longterm_fetch_plan,
+            label="長期留單權證價格",
+        )
         save_price_cache(persistent_price_cache, changed_codes=changed_price_codes)
 
     return price_cache
