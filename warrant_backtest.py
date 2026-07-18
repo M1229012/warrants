@@ -32,6 +32,8 @@ E：單日累積買進金額 >= 1000萬
 
 import json, re, time, os
 import threading
+from bisect import bisect_right
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import BytesIO, StringIO
@@ -438,26 +440,56 @@ LOSS_EXIT_SIDE   = Side(style="thick", color="38761D")
 # 工具函式
 # ══════════════════════════════════════════════════════════════════════
 
-def parse_date(date_str):
+def _date_cache_key(date_value):
+    """將日期輸入轉成穩定、可快取的字串鍵。"""
+    if isinstance(date_value, datetime):
+        return date_value.strftime("%Y/%m/%d")
+
     try:
-        if date_str is None:
+        to_pydatetime = getattr(date_value, "to_pydatetime", None)
+        if callable(to_pydatetime):
+            dt = to_pydatetime()
+            if isinstance(dt, datetime):
+                return dt.strftime("%Y/%m/%d")
+    except Exception:
+        pass
+
+    # 保留舊版 normalize_date_str 對 None 等非日期值的文字語意。
+    return str(date_value).strip()
+
+
+@lru_cache(maxsize=65536)
+def _parse_date_cached(date_key):
+    try:
+        s = str(date_key).strip()
+        if not s or s == "-" or s == "None":
             return None
-        s = str(date_str).strip()
-        if not s or s == "-":
-            return None
+
+        # 相容 datetime / Timestamp 字串，只保留日期部分。
+        s = s.split("T", 1)[0].split(" ", 1)[0]
         s = s.replace("-", "/")
         parts = s.split("/")
         if len(parts) != 3:
             return None
+
         y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
         return datetime(y, m, d)
     except Exception:
         return None
 
 
+def parse_date(date_str):
+    return _parse_date_cached(_date_cache_key(date_str))
+
+
+@lru_cache(maxsize=65536)
+def _normalize_date_str_cached(date_key):
+    dt = _parse_date_cached(date_key)
+    return dt.strftime("%Y/%m/%d") if dt else str(date_key).strip()
+
+
 def normalize_date_str(date_str):
-    dt = parse_date(date_str)
-    return dt.strftime("%Y/%m/%d") if dt else str(date_str).strip()
+    return _normalize_date_str_cached(_date_cache_key(date_str))
 
 
 def add_months(dt, months):
@@ -1378,13 +1410,16 @@ GSHEET_COMPACT_MIN_COLS = max(int(os.getenv("GSHEET_COMPACT_MIN_COLS", "1")), 1)
 # Google Sheets API 有「每分鐘寫入請求」限制。
 # 結果工作表很多、又要同步格式時，如果沒有節流與 429 重試，
 # 會出現後面工作表建立 / 寫入失敗，甚至因先刪後建導致工作表消失。
-GSHEET_WRITE_SLEEP_SECONDS = float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS", "1.25"))
+GSHEET_WRITE_SLEEP_SECONDS = float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS", "1.0"))
+GSHEET_WRITE_BURST = max(int(os.getenv("GSHEET_WRITE_BURST", "5")), 1)
 GSHEET_MAX_RETRIES = int(os.getenv("GSHEET_MAX_RETRIES", "6"))
 GSHEET_RETRY_BASE_SECONDS = float(os.getenv("GSHEET_RETRY_BASE_SECONDS", "12"))
 
 _GSHEET_CLIENT = None
 _GSHEET_SPREADSHEET = None
-_GSHEET_LAST_WRITE_TS = 0.0
+_GSHEET_WRITE_TOKENS = float(GSHEET_WRITE_BURST)
+_GSHEET_WRITE_TOKEN_TS = time.monotonic()
+_GSHEET_WRITE_TOKEN_LOCK = threading.Lock()
 _GSHEET_ARCHIVE_SPREADSHEETS = {}
 _GSHEET_ARCHIVE_PERMISSION_SYNCED = set()
 _GSHEET_ARCHIVE_CREATE_BLOCKED = False
@@ -1846,23 +1881,39 @@ def is_gsheet_quota_error(exc):
 
 def gsheet_write_sleep():
     """
-    Google Sheets 寫入節流。
+    Google Sheets 寫入 token bucket 節流。
 
-    這不是改資料邏輯，而是避免短時間連續建立 / 清除 / 寫入 / 套格式
-    造成 429 quota exceeded。
+    - 平均速率仍由 GSHEET_WRITE_SLEEP_SECONDS 控制，預設約每秒 1 次。
+    - 允許少量 burst，只有 token 不足時才等待。
+    - 原本 429 自動重試仍保留作為安全網。
     """
-    global _GSHEET_LAST_WRITE_TS
+    global _GSHEET_WRITE_TOKENS, _GSHEET_WRITE_TOKEN_TS
 
-    if GSHEET_WRITE_SLEEP_SECONDS <= 0:
+    interval = max(float(GSHEET_WRITE_SLEEP_SECONDS or 0), 0.0)
+    if interval <= 0:
         return
 
-    now = time.time()
-    elapsed = now - _GSHEET_LAST_WRITE_TS
+    refill_rate = 1.0 / interval
+    capacity = float(max(int(GSHEET_WRITE_BURST or 1), 1))
 
-    if elapsed < GSHEET_WRITE_SLEEP_SECONDS:
-        time.sleep(GSHEET_WRITE_SLEEP_SECONDS - elapsed)
+    while True:
+        with _GSHEET_WRITE_TOKEN_LOCK:
+            now = time.monotonic()
+            elapsed = max(now - _GSHEET_WRITE_TOKEN_TS, 0.0)
+            _GSHEET_WRITE_TOKENS = min(
+                capacity,
+                _GSHEET_WRITE_TOKENS + elapsed * refill_rate,
+            )
+            _GSHEET_WRITE_TOKEN_TS = now
 
-    _GSHEET_LAST_WRITE_TS = time.time()
+            if _GSHEET_WRITE_TOKENS >= 1.0:
+                _GSHEET_WRITE_TOKENS -= 1.0
+                return
+
+            wait_seconds = (1.0 - _GSHEET_WRITE_TOKENS) / refill_rate
+
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
 
 
 def gsheet_api_call(description, func, *args, **kwargs):
@@ -6593,38 +6644,78 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
 
 
 
-def _merge_complete_finmind_day(history_df, day_df, date_value, broker_map):
-    date_key = normalize_date_str(date_value)
+def _merge_complete_finmind_days(history_df, day_frames, refreshed_dates, broker_map):
+    """
+    將本次成功刷新的 FinMind 完整日檔一次合併。
+
+    保留原本語意：
+    1. 先移除「本次刷新日期 × 目前追蹤分點」的舊列。
+    2. 再插入本次完整日檔；即使某日為 0 列，也會正確清掉舊快照。
+    3. 最後只做一次去重與排序，避免逐日重複掃描整份歷史。
+    """
+    standard_columns = [
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    ]
+
+    if history_df is None or history_df.empty:
+        base = pd.DataFrame(columns=standard_columns)
+    else:
+        base = history_df.copy()
+
+    refreshed_date_keys = {
+        normalize_date_str(date_value)
+        for date_value in (refreshed_dates or [])
+        if normalize_date_str(date_value)
+    }
     active_codes = {
         normalize_broker_code_for_compare(code)
         for _, code in (broker_map or {}).values()
         if normalize_broker_code_for_compare(code)
     }
 
-    if history_df is None or history_df.empty:
-        base = pd.DataFrame(columns=list(day_df.columns) if day_df is not None and not day_df.empty else [
-            "權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號", "日期",
-            "買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額",
-        ])
-    else:
-        base = history_df.copy()
+    if not base.empty and "日期" in base.columns:
+        # 舊快取只在這裡一次正規化；新下載日檔已在
+        # normalize_finmind_warrant_day() 完成日期正規化。
+        base["日期"] = base["日期"].map(normalize_date_str)
 
-    if not base.empty and {"日期", "券商代號"}.issubset(base.columns):
-        base_dates = base["日期"].map(normalize_date_str)
+    if (
+        not base.empty
+        and refreshed_date_keys
+        and active_codes
+        and {"日期", "券商代號"}.issubset(base.columns)
+    ):
         base_codes = base["券商代號"].map(normalize_broker_code_for_compare)
-        # 全市場日檔是完整快照：同日期、目前追蹤分點的舊列必須先移除，
-        # 目標分點當天 0 筆時也能正確清除舊的錯誤快照。
-        base = base[~((base_dates == date_key) & base_codes.isin(active_codes))].copy()
+        refresh_mask = (
+            base["日期"].isin(refreshed_date_keys)
+            & base_codes.isin(active_codes)
+        )
+        base = base[~refresh_mask].copy()
 
-    if day_df is not None and not day_df.empty:
-        base = pd.concat([base, day_df], ignore_index=True)
+    frames = [base]
+    for day_df in day_frames or []:
+        if day_df is not None and not day_df.empty:
+            frames.append(day_df)
 
-    if base.empty:
-        return base
+    if len(frames) == 1:
+        merged = base
+    else:
+        merged = pd.concat(frames, ignore_index=True)
 
-    base["日期"] = base["日期"].map(normalize_date_str)
-    base = base.drop_duplicates(subset=["權證代號", "券商代號", "日期"], keep="last")
-    return base.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
+    if merged.empty:
+        return merged
+
+    # 日期欄已正規化；這裡只作安全保護，一次完成即可。
+    merged["日期"] = merged["日期"].map(normalize_date_str)
+    merged = merged.drop_duplicates(
+        subset=["權證代號", "券商代號", "日期"],
+        keep="last",
+    )
+    return merged.sort_values(
+        ["權證代號", "券商代號", "日期"]
+    ).reset_index(drop=True)
 
 
 
@@ -6732,6 +6823,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     target_key = normalize_date_str(target_date)
     previous_empty = history_df is None or history_df.empty
     combined = history_df.copy() if history_df is not None else pd.DataFrame()
+    normalized_day_frames = []
     completed_dates = set(str(x) for x in state.get("completed_dates", []) if str(x).strip())
     success_dates = []
     failed_dates = []
@@ -6777,14 +6869,22 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
                 failed_dates.append(result_date)
                 continue
 
-            combined = _merge_complete_finmind_day(combined, normalized, result_date, broker_map)
+            normalized_day_frames.append((result_date, normalized))
             completed_dates.add(result_date)
             success_dates.append(result_date)
             print(
                 f"  ✅ {result_date}：市場原始 {len(raw):,} 列｜"
                 f"追蹤分點彙總 {len(normalized):,} 列"
             )
-            prune_finmind_daily_raw_cache(keep_date=target_key)
+
+    if success_dates:
+        normalized_day_frames.sort(key=lambda item: normalize_date_str(item[0]))
+        combined = _merge_complete_finmind_days(
+            combined,
+            [frame for _date_key, frame in normalized_day_frames],
+            success_dates,
+            broker_map,
+        )
 
     state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
     state["last_target_date"] = target_key
@@ -7927,6 +8027,42 @@ def get_price_series_from_cache(price_cache, code):
     return {}
 
 
+_PRICE_SERIES_INDEX_CACHE = {}
+_PRICE_SERIES_INDEX_CACHE_MAX_ENTRIES = 20000
+
+
+def _get_sorted_price_series_index(prices):
+    """每份價格 dict 只建立一次排序日期索引，供 bisect 快速查找。"""
+    if not prices:
+        return (), ()
+
+    cache_key = id(prices)
+    cached = _PRICE_SERIES_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] is prices:
+        return cached[1], cached[2]
+
+    valid_rows = []
+    for raw_date, raw_price in prices.items():
+        date_norm = normalize_date_str(raw_date)
+        if not parse_date(date_norm):
+            continue
+
+        price = safe_price_float(raw_price)
+        if price is None:
+            continue
+
+        valid_rows.append((date_norm, price))
+
+    valid_rows.sort(key=lambda item: item[0])
+    dates = tuple(item[0] for item in valid_rows)
+    values = tuple(item[1] for item in valid_rows)
+
+    if len(_PRICE_SERIES_INDEX_CACHE) >= _PRICE_SERIES_INDEX_CACHE_MAX_ENTRIES:
+        _PRICE_SERIES_INDEX_CACHE.clear()
+    _PRICE_SERIES_INDEX_CACHE[cache_key] = (prices, dates, values)
+    return dates, values
+
+
 def price_dates_after(prices, base_date):
     base_date = normalize_date_str(base_date)
     return [d for d in sorted(prices.keys()) if d > base_date]
@@ -8105,34 +8241,26 @@ def get_latest_price_info_on_or_before(price_cache, code, target_date):
     """
     取得指定代號在 target_date 當天或之前最近一筆有效收盤價。
 
-    回傳：
-    - (價格, 日期字串)
-    - 找不到則回傳 (None, "")
+    每份代號價格序列只排序一次，後續以 bisect 查找，避免每個 lot
+    都重新 parse、正規化與排序整條價格序列。
     """
     prices = get_price_series_from_cache(price_cache, code)
-
     if not prices:
         return None, ""
 
     target_str = normalize_date_str(target_date)
-    valid = []
-
-    for d, p in prices.items():
-        dt = parse_date(d)
-        price = safe_price_float(p)
-
-        if not dt or price is None:
-            continue
-
-        d_norm = normalize_date_str(d)
-        if d_norm <= target_str:
-            valid.append((d_norm, price))
-
-    if not valid:
+    if not parse_date(target_str):
         return None, ""
 
-    valid.sort(key=lambda x: x[0])
-    return valid[-1][1], valid[-1][0]
+    dates, values = _get_sorted_price_series_index(prices)
+    if not dates:
+        return None, ""
+
+    idx = bisect_right(dates, target_str) - 1
+    if idx < 0:
+        return None, ""
+
+    return values[idx], dates[idx]
 
 
 
@@ -9100,7 +9228,7 @@ def ensure_top15_return_warrant_prices(
     if persistent_price_cache is None:
         persistent_price_cache = load_price_cache()
 
-    fetch_plan = []
+    fetch_plan = {}
     changed_price_codes = set()
 
     for code in needed_codes:
@@ -9131,7 +9259,13 @@ def ensure_top15_return_warrant_prices(
             need_fetch = True
 
         if need_fetch:
-            fetch_plan.append(code)
+            fetch_start_dt = start_dt
+            if latest_dt:
+                # 已有價格快取時，從最後快取日所在月份起補即可；
+                # 避免每檔固定重抓 75 天、重複打 2～3 個月份端點。
+                cached_month_start = datetime(latest_dt.year, latest_dt.month, 1)
+                fetch_start_dt = max(start_dt, cached_month_start)
+            fetch_plan[code] = (fetch_start_dt, target_dt)
 
     print(f"  TOP15固定資料集需檢查權證價格：{len(needed_codes):,} 檔")
     print(f"  TOP15固定資料集需補抓權證價格：{len(fetch_plan):,} 檔")
@@ -9145,7 +9279,8 @@ def ensure_top15_return_warrant_prices(
         )
 
     def fetch_one(code):
-        return code, fetch_twse_prices(code, start_dt, target_dt)
+        fetch_start_dt, fetch_end_dt = fetch_plan[code]
+        return code, fetch_twse_prices(code, fetch_start_dt, fetch_end_dt)
 
     done = 0
     with ThreadPoolExecutor(max_workers=PRICE_WORKERS) as ex:
