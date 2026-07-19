@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260719-V6"
+PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260719-V8"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -214,7 +214,9 @@ TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").stri
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 # TOP15 統計日沒有成交價時，改向權證資訊揭露平台查詢流動量提供者最佳委買價。
 # 當日成交價永遠優先；只有統計日無成交價時才使用 LP 委買價估值。
-TOP15_LP_QUOTE_FALLBACK_ENABLED = os.getenv("TOP15_LP_QUOTE_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+# 目前預設的 LP 查詢網址沒有可驗證的正式資料端點，預設停用以避免大量無效請求。
+# 未來若取得正式可用端點，可在 YAML 明確設定 TOP15_LP_QUOTE_FALLBACK_ENABLED=1 重新啟用。
+TOP15_LP_QUOTE_FALLBACK_ENABLED = os.getenv("TOP15_LP_QUOTE_FALLBACK_ENABLED", "0").strip().lower() not in ("0", "false", "no")
 TOP15_LP_QUOTE_TIMEOUT_SECONDS = max(float(os.getenv("TOP15_LP_QUOTE_TIMEOUT_SECONDS", "15")), 3.0)
 TOP15_LP_QUOTE_WORKERS = max(int(os.getenv("TOP15_LP_QUOTE_WORKERS", "10")), 1)
 # LP 頁面若沒有顯示資料日期，預設不接受，避免通用頁面或錯誤端點的數字被誤認為統計日報價。
@@ -1408,18 +1410,113 @@ def _normalize_market_header(value):
     return re.sub(r"[\s\u3000]+", "", _clean_market_cell_text(value)).lower()
 
 
+def _normalize_market_payload_date(value):
+    """將市場批次端點回應日期統一成 YYYY/MM/DD；支援西元與民國年。"""
+    if value is None:
+        return ""
+
+    try:
+        if isinstance(value, datetime):
+            return value.strftime("%Y/%m/%d")
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return ""
+            return value.strftime("%Y/%m/%d")
+    except Exception:
+        pass
+
+    text = _clean_market_cell_text(value)
+    if not text:
+        return ""
+
+    text = (
+        text.replace("年", "/")
+        .replace("月", "/")
+        .replace("日", "")
+        .replace("-", "/")
+        .replace(".", "/")
+    )
+    text = re.sub(r"\s+", "", text)
+
+    year = month = day = None
+    match = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", text)
+    if match:
+        year, month, day = map(int, match.groups())
+        if year < 1911:
+            year += 1911
+    else:
+        compact = re.sub(r"[^0-9]", "", text)
+        if re.fullmatch(r"\d{8}", compact):
+            year, month, day = int(compact[:4]), int(compact[4:6]), int(compact[6:8])
+        elif re.fullmatch(r"\d{7}", compact):
+            year, month, day = int(compact[:3]) + 1911, int(compact[3:5]), int(compact[5:7])
+
+    if year is None:
+        return ""
+
+    try:
+        return datetime(year, month, day).strftime("%Y/%m/%d")
+    except Exception:
+        return ""
+
+
+def _market_payload_reported_dates(payload):
+    """擷取市場批次回應的報表日期欄位；目前 TWSE 用 date、TPEx 用 reportDate。"""
+    if not isinstance(payload, dict):
+        return set()
+
+    date_key_aliases = {
+        "date", "reportdate", "report_date", "tradedate", "trade_date",
+        "資料日期", "交易日期", "報表日期",
+    }
+    reported_dates = set()
+
+    for raw_key, raw_value in payload.items():
+        normalized_key = _normalize_market_header(raw_key)
+        if normalized_key not in date_key_aliases:
+            continue
+        if isinstance(raw_value, (dict, list, tuple, set)):
+            continue
+        normalized_date = _normalize_market_payload_date(raw_value)
+        if normalized_date:
+            reported_dates.add(normalized_date)
+
+    return reported_dates
+
+
+def _market_payload_date_matches_request(payload, expected_date, source_name=""):
+    """回應若明示日期，所有日期都必須與請求日一致，否則整批拒收。"""
+    expected_key = _normalize_market_payload_date(expected_date)
+    if not expected_key:
+        return True
+
+    reported_dates = _market_payload_reported_dates(payload)
+    if not reported_dates:
+        return True
+    if reported_dates == {expected_key}:
+        return True
+
+    source_label = str(source_name or "市場").strip() or "市場"
+    print(
+        f"  ⚠️ {source_label} 全市場收盤價回應日期不符："
+        f"請求={expected_key}｜回應={','.join(sorted(reported_dates))}｜整批丟棄"
+    )
+    return False
+
+
 def _market_header_index(headers, kind):
     normalized = [_normalize_market_header(header) for header in (headers or [])]
     if kind == "code":
         exact = {
             "證券代號", "股票代號", "商品代號", "代號", "證券代碼", "股票代碼",
-            "securitycode", "stockid", "stock_id", "code",
+            "securitycode", "securitiescode", "securitiescompanycode",
+            "stockid", "stock_id", "code",
         }
         contains = ("證券代號", "股票代號", "商品代號")
     else:
         exact = {
             "收盤價", "收盤", "收市價", "成交價", "close", "closingprice",
-            "closeprice", "closing_price",
+            "closeprice", "closing_price", "close_price",
         }
         contains = ("收盤價", "收市價")
 
@@ -1432,8 +1529,23 @@ def _market_header_index(headers, kind):
     return None
 
 
-def _extract_market_close_prices_from_payload(payload):
-    """從 TWSE／TPEx 多種 JSON 表格格式擷取「代號、收盤價」，並保留所有看見的代號。"""
+def _extract_market_close_prices_from_payload(
+    payload,
+    expected_date=None,
+    source_name="",
+):
+    """從 TWSE／TPEx 多種 JSON 表格格式擷取「代號、收盤價」。
+
+    安全規則：回應若帶 date／reportDate，必須與 expected_date 完全一致；
+    不一致時整批回空，禁止將其他日期的行情寫入請求日快取。
+    """
+    if not _market_payload_date_matches_request(
+        payload,
+        expected_date,
+        source_name=source_name,
+    ):
+        return {}, set()
+
     prices = {}
     seen_codes = set()
     visited = set()
@@ -1491,9 +1603,24 @@ def _extract_market_close_prices_from_payload(payload):
             # 單筆 dict record。
             add_record(obj)
 
-            # 標準 fields/data 與 TWSE fields1/data1、fields2/data2...。
+            # 標準 fields/data、TPEx fields/aaData，與 TWSE fields1/data1、fields2/data2...。
             if isinstance(obj.get("fields"), list) and isinstance(obj.get("data"), list):
                 add_table(obj.get("fields"), obj.get("data"))
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("aaData"), list):
+                add_table(obj.get("fields"), obj.get("aaData"))
+            elif isinstance(obj.get("aaData"), list):
+                # TPEx 歷史收盤行情固定欄位：0=代號、1=名稱、2=收盤。
+                # 即使未來回應暫時缺少 fields，也能安全解析既有 aaData 格式。
+                for row in obj.get("aaData", []):
+                    if not isinstance(row, (list, tuple)) or len(row) <= 2:
+                        continue
+                    code = normalize_price_code(_clean_market_cell_text(row[0]))
+                    if not code:
+                        continue
+                    seen_codes.add(code)
+                    price = safe_price_float(_clean_market_cell_text(row[2]))
+                    if price is not None:
+                        prices[code] = price
             for key, headers in obj.items():
                 match = re.fullmatch(r"fields(\d*)", str(key or ""), flags=re.IGNORECASE)
                 if not match or not isinstance(headers, list):
@@ -1561,10 +1688,12 @@ def _fetch_market_close_snapshot_for_date(target_date):
             ),
             (
                 "TPEx",
-                "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+                "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
                 {
-                    "date": target_dt.strftime("%Y/%m/%d"),
-                    "response": "json",
+                    "l": "zh-tw",
+                    "o": "json",
+                    "d": f"{target_dt.year - 1911:03d}/{target_dt.month:02d}/{target_dt.day:02d}",
+                    "s": "0,asc,0",
                 },
             ),
         ]
@@ -1583,7 +1712,11 @@ def _fetch_market_close_snapshot_for_date(target_date):
                 payload = response.json()
             except Exception:
                 payload = json.loads(response.content.decode("utf-8"))
-            market_prices, seen_codes = _extract_market_close_prices_from_payload(payload)
+            market_prices, seen_codes = _extract_market_close_prices_from_payload(
+                payload,
+                expected_date=target_key,
+                source_name=market_name,
+            )
             return market_name, market_prices, seen_codes
 
         all_prices = {}
@@ -1646,6 +1779,91 @@ def _normalize_price_fetch_plan(fetch_plan):
     return normalized
 
 
+_WARRANT_PRICE_LIFECYCLE_INDEX_LOCK = threading.Lock()
+_WARRANT_PRICE_LIFECYCLE_INDEX_REF = None
+_WARRANT_PRICE_LIFECYCLE_INDEX = {}
+
+
+def _get_warrant_price_lifecycle_index():
+    """建立權證代號→上市／最後交易日區間索引，同一份權證主檔只建立一次。"""
+    global _WARRANT_PRICE_LIFECYCLE_INDEX_REF
+    global _WARRANT_PRICE_LIFECYCLE_INDEX
+
+    records = _CURRENT_WARRANT_INTERVAL_RECORDS
+    if not records:
+        return {}
+
+    with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+        if records is _WARRANT_PRICE_LIFECYCLE_INDEX_REF:
+            return _WARRANT_PRICE_LIFECYCLE_INDEX
+
+    index = defaultdict(list)
+    for record in records:
+        code = normalize_price_code(record.get("代號", ""))
+        if len(code) != 6:
+            continue
+        list_dt = parse_date(record.get("上市日", ""))
+        end_dt = parse_date(record.get("最後交易日", ""))
+        if not list_dt and not end_dt:
+            continue
+        index[code].append((list_dt, end_dt))
+
+    for code in index:
+        index[code].sort(
+            key=lambda interval: (
+                interval[0] or datetime.min,
+                interval[1] or datetime.max,
+            )
+        )
+
+    built = dict(index)
+    with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+        _WARRANT_PRICE_LIFECYCLE_INDEX_REF = records
+        _WARRANT_PRICE_LIFECYCLE_INDEX = built
+    return built
+
+
+def _clip_price_fetch_plan_to_warrant_lifecycle(fetch_plan):
+    """
+    將權證補價區間裁切在實際上市日～最後交易日內。
+
+    - 股票與沒有生命週期主檔的代號維持原區間。
+    - 權證需求區間若完全落在上市前或最後交易日後，直接排除，不送入批次與逐檔補漏。
+    - 權證代號重用時，取與需求區間有重疊的生命週期；若有多段，保留所有重疊段的最小包絡區間。
+    """
+    normalized = _normalize_price_fetch_plan(fetch_plan)
+    lifecycle_index = _get_warrant_price_lifecycle_index()
+    if not normalized or not lifecycle_index:
+        return normalized, {}
+
+    clipped_plan = {}
+    skipped_plan = {}
+
+    for code, (requested_start, requested_end) in normalized.items():
+        intervals = lifecycle_index.get(code)
+        if len(code) != 6 or not intervals:
+            clipped_plan[code] = [requested_start, requested_end]
+            continue
+
+        overlaps = []
+        for list_dt, end_dt in intervals:
+            clipped_start = max(requested_start, list_dt) if list_dt else requested_start
+            clipped_end = min(requested_end, end_dt) if end_dt else requested_end
+            if clipped_start <= clipped_end:
+                overlaps.append((clipped_start, clipped_end))
+
+        if not overlaps:
+            skipped_plan[code] = [requested_start, requested_end]
+            continue
+
+        clipped_plan[code] = [
+            min(start_dt for start_dt, _ in overlaps),
+            max(end_dt for _, end_dt in overlaps),
+        ]
+
+    return clipped_plan, skipped_plan
+
+
 def _price_plan_trading_dates(fetch_plan):
     fetch_plan = _normalize_price_fetch_plan(fetch_plan)
     if not fetch_plan:
@@ -1688,6 +1906,22 @@ def fetch_price_plan_batch_first(
     fetch_plan = _normalize_price_fetch_plan(fetch_plan)
     changed_codes = set()
     if not fetch_plan:
+        return changed_codes
+
+    original_fetch_count = len(fetch_plan)
+    fetch_plan, lifecycle_skipped_plan = _clip_price_fetch_plan_to_warrant_lifecycle(fetch_plan)
+    if lifecycle_skipped_plan:
+        sample_codes = ", ".join(sorted(lifecycle_skipped_plan)[:10])
+        sample_suffix = "..." if len(lifecycle_skipped_plan) > 10 else ""
+        print(
+            f"  ℹ️ {label}已下市／未上市權證不補價：{len(lifecycle_skipped_plan):,} 檔｜"
+            f"需求區間不在上市日～最後交易日內｜{sample_codes}{sample_suffix}"
+        )
+    if not fetch_plan:
+        print(
+            f"  ✅ {label}補價計畫已由權證生命週期全數排除："
+            f"原 {original_fetch_count:,} 檔，無需批次或逐檔請求"
+        )
         return changed_codes
 
     trading_dates = _price_plan_trading_dates(fetch_plan)
