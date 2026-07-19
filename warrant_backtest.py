@@ -1688,12 +1688,11 @@ def _fetch_market_close_snapshot_for_date(target_date):
             ),
             (
                 "TPEx",
-                "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
                 {
-                    "l": "zh-tw",
-                    "o": "json",
-                    "d": f"{target_dt.year - 1911:03d}/{target_dt.month:02d}/{target_dt.day:02d}",
-                    "s": "0,asc,0",
+                    "date": target_dt.strftime("%Y/%m/%d"),
+                    "id": "",
+                    "response": "json",
                 },
             ),
         ]
@@ -1782,16 +1781,27 @@ def _normalize_price_fetch_plan(fetch_plan):
 _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK = threading.Lock()
 _WARRANT_PRICE_LIFECYCLE_INDEX_REF = None
 _WARRANT_PRICE_LIFECYCLE_INDEX = {}
+_WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = None
 
 
 def _get_warrant_price_lifecycle_index():
     """建立權證代號→上市／最後交易日區間索引，同一份權證主檔只建立一次。"""
     global _WARRANT_PRICE_LIFECYCLE_INDEX_REF
     global _WARRANT_PRICE_LIFECYCLE_INDEX
+    global _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS
 
     records = _CURRENT_WARRANT_INTERVAL_RECORDS
     if not records:
-        return {}
+        with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+            if _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS is None:
+                try:
+                    _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = load_warrants_cache() or []
+                except Exception:
+                    _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = []
+            records = _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS
+
+        if not records:
+            return {}
 
     with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
         if records is _WARRANT_PRICE_LIFECYCLE_INDEX_REF:
