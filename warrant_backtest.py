@@ -6051,6 +6051,44 @@ def _existing_result_sheet(primary_sh, title):
         return ws, True
 
 
+def ensure_worksheet_grid_capacity(ws, required_rows=None, required_cols=None):
+    """
+    只在既有 Google Sheet 工作表格數不足時向外擴充。
+
+    - 不縮小工作表。
+    - 不清空、不覆寫任何既有資料。
+    - 增量同步新增欄位前先呼叫，避免寫入 AB1 等超出目前 grid limits 的範圍。
+    """
+    if ws is None:
+        return False
+
+    try:
+        current_rows = max(int(getattr(ws, "row_count", 1) or 1), 1)
+        current_cols = max(int(getattr(ws, "col_count", 1) or 1), 1)
+        target_rows = max(current_rows, int(required_rows or 1), 1)
+        target_cols = max(current_cols, int(required_cols or 1), 1)
+
+        if target_rows == current_rows and target_cols == current_cols:
+            return True
+
+        gsheet_api_call(
+            f"擴充工作表格數 {ws.title}",
+            ws.resize,
+            rows=target_rows,
+            cols=target_cols,
+        )
+        print(
+            f"  ↔️ Google Sheet 工作表自動擴充：{ws.title}｜"
+            f"{current_rows:,}×{current_cols:,} → {target_rows:,}×{target_cols:,}"
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"  ⚠️ Google Sheet 工作表擴充失敗：{getattr(ws, 'title', '-')}，"
+            f"原因：{type(exc).__name__}: {exc}"
+        )
+        return False
+
 def _insert_rows_below_header(ws, rows):
     """由後往前分批插入第 2 列，維持本次資料原排序且不覆寫既有列。"""
     if not rows:
@@ -6119,6 +6157,21 @@ def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=No
     # 只在新版本多出欄位時，將欄位加到表頭尾端；既有欄位順序完全不動。
     missing_headers = [h for h in incoming_headers if h not in existing_headers]
     final_headers = list(existing_headers) + missing_headers
+
+    # 增量同步可能比既有工作表多出新欄位；必須先擴充 grid，才能寫入 AB1 等範圍。
+    # 這裡只向外擴充，不縮小、不清空，也不覆寫任何既有資料。
+    required_rows = max(
+        int(getattr(ws, "row_count", 1) or 1),
+        len(existing_values),
+        1,
+    )
+    if not ensure_worksheet_grid_capacity(
+        ws,
+        required_rows=required_rows,
+        required_cols=max(len(final_headers), 1),
+    ):
+        return 0
+
     if missing_headers:
         start_col = len(existing_headers) + 1
         start_letter = get_column_letter(start_col)
