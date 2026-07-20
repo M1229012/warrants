@@ -630,7 +630,7 @@ jobs:
           echo "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE=$WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
-          .venv/bin/python -u K_function_warrant_report_FINMIND_MONEYDJ_HYBRID.py
+          .venv/bin/python -u K_function_warrant_report_20260530.py
 
       - name: Save refreshed FinMind report cache
         if: success()
