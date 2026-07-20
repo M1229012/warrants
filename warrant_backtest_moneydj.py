@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ONLY-ABCDE-V10.1-FIXED-20260720-R3"
+PROGRAM_BUILD_ID = "MONEYDJ-ONLY-ABCDE-V10.1-FIXED-20260720-R4"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -393,7 +393,14 @@ FALLBACK = {
 
 FULL_TARGET_PATTERNS = dict(TARGET_PATTERNS)
 FULL_FALLBACK = dict(FALLBACK)
+
+# 即時上市／上櫃權證清單狀態。
+# MoneyDJ 版的權證母清單由 TWSE ISIN 上市(strMode=2)與上櫃(strMode=4)兩個市場組成，
+# 因此只有兩個市場都成功時，才把快照標記為完整並允許據此清理失效權證。
+CURRENT_LIVE_WARRANT_CODES = set()
 LIVE_WARRANT_SNAPSHOT_READY = False
+LIVE_WARRANT_MARKET_SUCCESS_COUNT = 0
+LIVE_WARRANT_MARKET_EXPECTED_COUNT = 2
 
 
 
