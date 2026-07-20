@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ONLY-ABCDE-V10.1-FIXED-20260720-R2"
+PROGRAM_BUILD_ID = "MONEYDJ-ONLY-ABCDE-V10.1-FIXED-20260720-R3"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -17561,19 +17561,31 @@ def evaluate_empty_result_source_completeness(
 # ══════════════════════════════════════════════════════════════════════
 
 def verify_moneydj_only_runtime():
-    """確認正式主流程不依賴 FinMind Token，且 MoneyDJ API4/API5 與官方 ISIN 清單函式存在。"""
-    required = {
-        "API4": globals().get("API4"),
-        "API5": globals().get("API5"),
+    """確認 MoneyDJ API4/API5、官方權證清單與 MoneyDJ 歷史流程均已正確載入。"""
+    required_urls = {
+        "MONEYDJ_API4_URL": globals().get("MONEYDJ_API4_URL"),
+        "MONEYDJ_API5_URL": globals().get("MONEYDJ_API5_URL"),
+    }
+    required_callables = {
+        "api4_get_with_status": globals().get("api4_get_with_status"),
+        "api5_get_with_status": globals().get("api5_get_with_status"),
+        "get_all_call_warrants": globals().get("get_all_call_warrants"),
         "get_all_call_warrants_live": globals().get("get_all_call_warrants_live"),
+        "find_broker_codes_moneydj": globals().get("find_broker_codes_moneydj"),
         "refresh_history_from_moneydj": globals().get("refresh_history_from_moneydj"),
     }
-    missing = [name for name, value in required.items() if not value]
+
+    missing = [name for name, value in required_urls.items() if not isinstance(value, str) or not value.strip()]
+    missing.extend(name for name, value in required_callables.items() if not callable(value))
     if missing:
         raise RuntimeError(f"MoneyDJ-only 啟動自檢失敗，缺少：{', '.join(missing)}")
 
-    print("  ✅ 資料來源自檢：MoneyDJ API4／API5")
+    if "pscnetsecrwd.moneydj.com" not in MONEYDJ_API4_URL or "pscnetsecrwd.moneydj.com" not in MONEYDJ_API5_URL:
+        raise RuntimeError("MoneyDJ-only 啟動自檢失敗：API4／API5 不是 MoneyDJ 網址")
+
+    print("  ✅ 資料來源自檢：MoneyDJ API4／API5 網址與抓取函式正常")
     print("  ✅ 權證清單來源自檢：TWSE ISIN 上市＋上櫃")
+    print("  ✅ 歷史資料流程自檢：refresh_history_from_moneydj")
     print("  ✅ FinMind Token：本流程不需要 FINMIND_API_0714")
 
 
