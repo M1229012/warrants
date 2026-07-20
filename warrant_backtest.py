@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260720-V10"
+PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260720-V10.1"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -166,6 +166,9 @@ _FINMIND_DAY_LOCKS = {}
 _FINMIND_DAY_LOCKS_GUARD = threading.Lock()
 _FINMIND_TARGET_DATE_OK = False
 _FINMIND_TARGET_DATE = ""
+# 價格批次計畫的最晚可用交易日。主流程會在 FinMind 最新日回退完成後，
+# 將實際已發布基準日寫入此值，避免把尚未發布的今天誤當成預期收盤價日期。
+_PRICE_PLAN_MAX_PUBLISHED_DATE = ""
 
 # 保留給 longterm 指定日期相容使用。
 PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
@@ -1699,24 +1702,45 @@ def _fetch_market_close_snapshot_for_date(target_date):
 
         def fetch_one(endpoint):
             market_name, url, params = endpoint
-            session = get_thread_session()
-            response = session.get(
-                url,
-                params=params,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
-                timeout=(5, 25),
+            retryable_errors = (
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
             )
-            response.raise_for_status()
-            try:
-                payload = response.json()
-            except Exception:
-                payload = json.loads(response.content.decode("utf-8"))
-            market_prices, seen_codes = _extract_market_close_prices_from_payload(
-                payload,
-                expected_date=target_key,
-                source_name=market_name,
-            )
-            return market_name, market_prices, seen_codes
+            max_attempts = 3
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    session = get_thread_session()
+                    response = session.get(
+                        url,
+                        params=params,
+                        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
+                        timeout=(5, 25),
+                    )
+                    response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = json.loads(response.content.decode("utf-8"))
+                    market_prices, seen_codes = _extract_market_close_prices_from_payload(
+                        payload,
+                        expected_date=target_key,
+                        source_name=market_name,
+                    )
+                    return market_name, market_prices, seen_codes
+                except retryable_errors as exc:
+                    if attempt >= max_attempts:
+                        raise
+                    wait_seconds = 1.0 if attempt == 1 else 2.0
+                    print(
+                        f"  ↻ {market_name} 全市場收盤價連線中斷：{target_key}｜"
+                        f"{type(exc).__name__}｜{wait_seconds:.0f} 秒後重試 "
+                        f"({attempt}/{max_attempts - 1})"
+                    )
+                    time.sleep(wait_seconds)
+
+            raise RuntimeError(f"{market_name} 全市場收盤價重試流程異常結束：{target_key}")
 
         all_prices = {}
         all_seen_codes = set()
@@ -1763,6 +1787,9 @@ def fetch_market_close_prices_for_date(target_date):
 
 def _normalize_price_fetch_plan(fetch_plan):
     normalized = {}
+    published_end_dt = parse_date(_PRICE_PLAN_MAX_PUBLISHED_DATE)
+    max_end_dt = published_end_dt or datetime.today()
+
     for raw_code, raw_range in (fetch_plan or {}).items():
         code = normalize_price_code(raw_code)
         if not code or not raw_range or len(raw_range) < 2:
@@ -1771,7 +1798,10 @@ def _normalize_price_fetch_plan(fetch_plan):
         end_dt = parse_date(raw_range[1])
         if not start_dt or not end_dt:
             continue
-        end_dt = min(end_dt, datetime.today())
+        # 價格計畫只能走到已確認發布的市場基準日，不能直接使用今天。
+        # 例如週一資料尚未發布而修補基準日回退到上週五時，避免把週一
+        # 誤記成股票 expected_date，進而讓所有股票落入無效逐檔補漏。
+        end_dt = min(end_dt, max_end_dt)
         if start_dt > end_dt:
             start_dt = end_dt
         normalized[code] = [start_dt, end_dt]
@@ -1954,6 +1984,16 @@ def fetch_price_plan_batch_first(
             continue
 
         market_prices, seen_codes = _fetch_market_close_snapshot_for_date(target_key)
+
+        # 兩個市場都回 0 檔時，視為尚未發布或休市日。
+        # 不可把這一天寫成股票的 expected_date，否則會誤觸發整批逐檔補漏。
+        if not seen_codes:
+            print(
+                f"  ℹ️ {label}全市場批次價略過無資料日：{target_key}｜"
+                "兩市場均未回傳任何代號，不列入預期價格日期"
+            )
+            continue
+
         batch_seen_codes.update(wanted_codes & seen_codes)
         for code in wanted_codes:
             latest_expected_by_code[code] = target_key
@@ -17286,6 +17326,8 @@ def evaluate_empty_result_source_completeness(
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    global _PRICE_PLAN_MAX_PUBLISHED_DATE
+
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
     configure_run_mode()
@@ -17368,6 +17410,11 @@ def main():
         )
     else:
         print(f"  ✅ 本次實際目標交易日：{target_date}")
+
+    # 後續所有收盤價批次計畫統一以實際已發布基準日為上限。
+    # 這個日期已經通過 FinMind 全市場日檔驗證，比 datetime.today() 更可靠。
+    _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(target_date)
+    print(f"  ✅ 收盤價計畫最晚日期：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
 
     print(f"  ✅ 目標日全市場權證分點原始列數：{len(target_raw):,}")
     history_cache_df = load_history_cache()
