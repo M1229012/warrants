@@ -71,7 +71,7 @@ jobs:
       FORCE_FULL_CACHE_REFRESH: "0"
       CACHE_AUTO_PRUNE_ENABLED: "1"
       HISTORY_RETENTION_TRADING_DAYS: "200"
-      PRICE_RETENTION_TRADING_DAYS: "200"
+      PRICE_RETENTION_TRADING_DAYS: "260"
 
       # ============================================================
       # 精選五分點
