@@ -2153,7 +2153,7 @@ def get_price_nearest(prices, date):
 # Google Sheet 快取 / 結果同步工具（GitHub Actions 部署用）
 # ══════════════════════════════════════════════════════════════════════
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點資料_NEW")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點資料_MONEYDJ_NEW")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
@@ -17101,7 +17101,7 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
 
     longterm_output_path = os.path.join(
         OUTPUT_DIR,
-        f"warrant_longterm_open_positions_{datetime.today().strftime('%Y%m%d')}.xlsx",
+        f"warrant_longterm_open_positions_MONEYDJ_{datetime.today().strftime('%Y%m%d_%H%M%S')}.xlsx",
     )
     build_longterm_workbook(
         longterm_output_path,
@@ -17487,7 +17487,8 @@ def main():
     configure_run_mode()
 
     today_fn = datetime.today().strftime("%Y%m%d")
-    output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_ABCDE_{today_fn}.xlsx")
+    output_run_stamp = datetime.today().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_MONEYDJ_ABCDE_{output_run_stamp}.xlsx")
 
     print(f"\n認購權證特定分點買超回測 ABCDE MoneyDJ V10.1 | {today_fn}")
     print("資料來源：MoneyDJ API4／API5（分點資料）＋官方權證／行情來源")
@@ -17590,7 +17591,7 @@ def main():
 
     extra_scope_values = None
     if RUN_MODE == 2:
-        selected_output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_ABCDE_selected5_{today_fn}.xlsx")
+        selected_output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_MONEYDJ_ABCDE_selected5_{output_run_stamp}.xlsx")
         build_selected_scope_excel(
             selected_items, selected_events, selected_item_map, price_cache,
             selected_output_path, selected_top15_detail_rows, selected_top15_consensus_rows,
