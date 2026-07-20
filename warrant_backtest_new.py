@@ -25,7 +25,7 @@ E：單日累積買進金額 >= 1000萬
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
 完整修補模式會重新產生完整報表，缺少的工作表才建立，既有工作表只增量插入缺少資料。
 
-資料來源：FinMind API（FINMIND_API_0714）
+資料來源：MoneyDJ API4／API5（分點資料）＋官方權證清單
 執行：python warrant_backtest.py
 依賴：pip install requests pandas openpyxl pyarrow
 """
@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260719-V6"
+PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-20260720"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -127,6 +127,37 @@ BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 HISTORY_CACHE_PATH = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH = os.path.join(CACHE_DIR, "price_cache.csv")
 
+# MoneyDJ 分點資料來源設定（V10.1）
+MONEYDJ_HISTORY_WORKERS = max(int(os.getenv("MONEYDJ_HISTORY_WORKERS", "50")), 1)
+MONEYDJ_PRESCAN_WORKERS = max(int(os.getenv("MONEYDJ_PRESCAN_WORKERS", "60")), 1)
+MONEYDJ_RECENT_SCAN_DAYS = max(int(os.getenv("MONEYDJ_RECENT_SCAN_DAYS", "50")), 1)
+MONEYDJ_API5_HISTORY_LIMIT = max(int(os.getenv("MONEYDJ_API5_HISTORY_LIMIT", os.getenv("HISTORY_RETENTION_TRADING_DAYS", "200"))), 1)
+MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
+MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
+MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
+MONEYDJ_API5_STRICT = os.getenv("MONEYDJ_API5_STRICT", "1").strip().lower() not in ("0", "false", "no")
+MONEYDJ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
+    "Referer": "https://pscnetsecrwd.moneydj.com/",
+}
+MONEYDJ_API4_URL = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/"
+    "9b/6e/0a/TwWarrantData.xdjjson"
+    "?a={code}&x=warrant-chip0002-4&c={start}&d={end}&revision=2018_07_31_1"
+)
+MONEYDJ_API5_URL = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/"
+    "d8/f5/27/twWarrantData.xdjjson"
+    "?x=warrant-chip0002-5&c={limit}&a={warrant}&b={broker}&revision=2018_07_31_1"
+)
+_MONEYDJ_SOURCE_REACHABLE = False
+_MONEYDJ_TARGET_DATE_OK = False
+_MONEYDJ_TARGET_DATE = ""
+_MONEYDJ_API5_FAILED_COUNT = 0
+MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
+MONEYDJ_PRESCAN_TOTAL_REQUESTS = 0
+
 # FinMind 正式資料來源。
 FINMIND_TOKEN = os.getenv("FINMIND_API_0714", "").strip()
 FINMIND_API_BASE = os.getenv("FINMIND_API_BASE", "https://api.finmindtrade.com/api/v4").rstrip("/")
@@ -166,6 +197,8 @@ _FINMIND_DAY_LOCKS = {}
 _FINMIND_DAY_LOCKS_GUARD = threading.Lock()
 _FINMIND_TARGET_DATE_OK = False
 _FINMIND_TARGET_DATE = ""
+# 價格批次計畫的最晚可用交易日；由主流程在實際已發布基準日確定後設定。
+_PRICE_PLAN_MAX_PUBLISHED_DATE = ""
 
 # 保留給 longterm 指定日期相容使用。
 PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
@@ -214,7 +247,7 @@ TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").stri
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 # TOP15 統計日沒有成交價時，改向權證資訊揭露平台查詢流動量提供者最佳委買價。
 # 當日成交價永遠優先；只有統計日無成交價時才使用 LP 委買價估值。
-TOP15_LP_QUOTE_FALLBACK_ENABLED = os.getenv("TOP15_LP_QUOTE_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+TOP15_LP_QUOTE_FALLBACK_ENABLED = os.getenv("TOP15_LP_QUOTE_FALLBACK_ENABLED", "0").strip().lower() not in ("0", "false", "no")
 TOP15_LP_QUOTE_TIMEOUT_SECONDS = max(float(os.getenv("TOP15_LP_QUOTE_TIMEOUT_SECONDS", "15")), 3.0)
 TOP15_LP_QUOTE_WORKERS = max(int(os.getenv("TOP15_LP_QUOTE_WORKERS", "10")), 1)
 # LP 頁面若沒有顯示資料日期，預設不接受，避免通用頁面或錯誤端點的數字被誤認為統計日報價。
@@ -1408,18 +1441,110 @@ def _normalize_market_header(value):
     return re.sub(r"[\s\u3000]+", "", _clean_market_cell_text(value)).lower()
 
 
+def _normalize_market_payload_date(value):
+    """將市場批次端點回應日期統一成 YYYY/MM/DD；支援西元與民國年。"""
+    if value is None:
+        return ""
+
+    try:
+        if isinstance(value, datetime):
+            return value.strftime("%Y/%m/%d")
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return ""
+            return value.strftime("%Y/%m/%d")
+    except Exception:
+        pass
+
+    text = _clean_market_cell_text(value)
+    if not text:
+        return ""
+
+    text = (
+        text.replace("年", "/")
+        .replace("月", "/")
+        .replace("日", "")
+        .replace("-", "/")
+        .replace(".", "/")
+    )
+    text = re.sub(r"\s+", "", text)
+
+    year = month = day = None
+    match = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", text)
+    if match:
+        year, month, day = map(int, match.groups())
+        if year < 1911:
+            year += 1911
+    else:
+        compact = re.sub(r"[^0-9]", "", text)
+        if re.fullmatch(r"\d{8}", compact):
+            year, month, day = int(compact[:4]), int(compact[4:6]), int(compact[6:8])
+        elif re.fullmatch(r"\d{7}", compact):
+            year, month, day = int(compact[:3]) + 1911, int(compact[3:5]), int(compact[5:7])
+
+    if year is None:
+        return ""
+
+    try:
+        return datetime(year, month, day).strftime("%Y/%m/%d")
+    except Exception:
+        return ""
+
+def _market_payload_reported_dates(payload):
+    """擷取市場批次回應的報表日期欄位；目前 TWSE 用 date、TPEx 用 reportDate。"""
+    if not isinstance(payload, dict):
+        return set()
+
+    date_key_aliases = {
+        "date", "reportdate", "report_date", "tradedate", "trade_date",
+        "資料日期", "交易日期", "報表日期",
+    }
+    reported_dates = set()
+
+    for raw_key, raw_value in payload.items():
+        normalized_key = _normalize_market_header(raw_key)
+        if normalized_key not in date_key_aliases:
+            continue
+        if isinstance(raw_value, (dict, list, tuple, set)):
+            continue
+        normalized_date = _normalize_market_payload_date(raw_value)
+        if normalized_date:
+            reported_dates.add(normalized_date)
+
+    return reported_dates
+
+def _market_payload_date_matches_request(payload, expected_date, source_name=""):
+    """回應若明示日期，所有日期都必須與請求日一致，否則整批拒收。"""
+    expected_key = _normalize_market_payload_date(expected_date)
+    if not expected_key:
+        return True
+
+    reported_dates = _market_payload_reported_dates(payload)
+    if not reported_dates:
+        return True
+    if reported_dates == {expected_key}:
+        return True
+
+    source_label = str(source_name or "市場").strip() or "市場"
+    print(
+        f"  ⚠️ {source_label} 全市場收盤價回應日期不符："
+        f"請求={expected_key}｜回應={','.join(sorted(reported_dates))}｜整批丟棄"
+    )
+    return False
+
 def _market_header_index(headers, kind):
     normalized = [_normalize_market_header(header) for header in (headers or [])]
     if kind == "code":
         exact = {
             "證券代號", "股票代號", "商品代號", "代號", "證券代碼", "股票代碼",
-            "securitycode", "stockid", "stock_id", "code",
+            "securitycode", "securitiescode", "securitiescompanycode",
+            "stockid", "stock_id", "code",
         }
         contains = ("證券代號", "股票代號", "商品代號")
     else:
         exact = {
             "收盤價", "收盤", "收市價", "成交價", "close", "closingprice",
-            "closeprice", "closing_price",
+            "closeprice", "closing_price", "close_price",
         }
         contains = ("收盤價", "收市價")
 
@@ -1432,8 +1557,23 @@ def _market_header_index(headers, kind):
     return None
 
 
-def _extract_market_close_prices_from_payload(payload):
-    """從 TWSE／TPEx 多種 JSON 表格格式擷取「代號、收盤價」，並保留所有看見的代號。"""
+def _extract_market_close_prices_from_payload(
+    payload,
+    expected_date=None,
+    source_name="",
+):
+    """從 TWSE／TPEx 多種 JSON 表格格式擷取「代號、收盤價」。
+
+    安全規則：回應若帶 date／reportDate，必須與 expected_date 完全一致；
+    不一致時整批回空，禁止將其他日期的行情寫入請求日快取。
+    """
+    if not _market_payload_date_matches_request(
+        payload,
+        expected_date,
+        source_name=source_name,
+    ):
+        return {}, set()
+
     prices = {}
     seen_codes = set()
     visited = set()
@@ -1491,9 +1631,24 @@ def _extract_market_close_prices_from_payload(payload):
             # 單筆 dict record。
             add_record(obj)
 
-            # 標準 fields/data 與 TWSE fields1/data1、fields2/data2...。
+            # 標準 fields/data、TPEx fields/aaData，與 TWSE fields1/data1、fields2/data2...。
             if isinstance(obj.get("fields"), list) and isinstance(obj.get("data"), list):
                 add_table(obj.get("fields"), obj.get("data"))
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("aaData"), list):
+                add_table(obj.get("fields"), obj.get("aaData"))
+            elif isinstance(obj.get("aaData"), list):
+                # TPEx 歷史收盤行情固定欄位：0=代號、1=名稱、2=收盤。
+                # 即使未來回應暫時缺少 fields，也能安全解析既有 aaData 格式。
+                for row in obj.get("aaData", []):
+                    if not isinstance(row, (list, tuple)) or len(row) <= 2:
+                        continue
+                    code = normalize_price_code(_clean_market_cell_text(row[0]))
+                    if not code:
+                        continue
+                    seen_codes.add(code)
+                    price = safe_price_float(_clean_market_cell_text(row[2]))
+                    if price is not None:
+                        prices[code] = price
             for key, headers in obj.items():
                 match = re.fullmatch(r"fields(\d*)", str(key or ""), flags=re.IGNORECASE)
                 if not match or not isinstance(headers, list):
@@ -1561,9 +1716,10 @@ def _fetch_market_close_snapshot_for_date(target_date):
             ),
             (
                 "TPEx",
-                "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
                 {
                     "date": target_dt.strftime("%Y/%m/%d"),
+                    "id": "",
                     "response": "json",
                 },
             ),
@@ -1571,20 +1727,45 @@ def _fetch_market_close_snapshot_for_date(target_date):
 
         def fetch_one(endpoint):
             market_name, url, params = endpoint
-            session = get_thread_session()
-            response = session.get(
-                url,
-                params=params,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
-                timeout=(5, 25),
+            retryable_errors = (
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
             )
-            response.raise_for_status()
-            try:
-                payload = response.json()
-            except Exception:
-                payload = json.loads(response.content.decode("utf-8"))
-            market_prices, seen_codes = _extract_market_close_prices_from_payload(payload)
-            return market_name, market_prices, seen_codes
+            max_attempts = 3
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    session = get_thread_session()
+                    response = session.get(
+                        url,
+                        params=params,
+                        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
+                        timeout=(5, 25),
+                    )
+                    response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = json.loads(response.content.decode("utf-8"))
+                    market_prices, seen_codes = _extract_market_close_prices_from_payload(
+                        payload,
+                        expected_date=target_key,
+                        source_name=market_name,
+                    )
+                    return market_name, market_prices, seen_codes
+                except retryable_errors as exc:
+                    if attempt >= max_attempts:
+                        raise
+                    wait_seconds = 1.0 if attempt == 1 else 2.0
+                    print(
+                        f"  ↻ {market_name} 全市場收盤價連線中斷：{target_key}｜"
+                        f"{type(exc).__name__}｜{wait_seconds:.0f} 秒後重試 "
+                        f"({attempt}/{max_attempts - 1})"
+                    )
+                    time.sleep(wait_seconds)
+
+            raise RuntimeError(f"{market_name} 全市場收盤價重試流程異常結束：{target_key}")
 
         all_prices = {}
         all_seen_codes = set()
@@ -1631,6 +1812,9 @@ def fetch_market_close_prices_for_date(target_date):
 
 def _normalize_price_fetch_plan(fetch_plan):
     normalized = {}
+    published_end_dt = parse_date(_PRICE_PLAN_MAX_PUBLISHED_DATE)
+    max_end_dt = published_end_dt or datetime.today()
+
     for raw_code, raw_range in (fetch_plan or {}).items():
         code = normalize_price_code(raw_code)
         if not code or not raw_range or len(raw_range) < 2:
@@ -1639,12 +1823,108 @@ def _normalize_price_fetch_plan(fetch_plan):
         end_dt = parse_date(raw_range[1])
         if not start_dt or not end_dt:
             continue
-        end_dt = min(end_dt, datetime.today())
+        # 價格計畫只能走到已確認發布的市場基準日，不能直接使用今天。
+        # 例如週一資料尚未發布而修補基準日回退到上週五時，避免把週一
+        # 誤記成股票 expected_date，進而讓所有股票落入無效逐檔補漏。
+        end_dt = min(end_dt, max_end_dt)
         if start_dt > end_dt:
             start_dt = end_dt
         normalized[code] = [start_dt, end_dt]
     return normalized
 
+
+_WARRANT_PRICE_LIFECYCLE_INDEX_LOCK = threading.Lock()
+_WARRANT_PRICE_LIFECYCLE_INDEX_REF = None
+_WARRANT_PRICE_LIFECYCLE_INDEX = {}
+_WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = None
+
+def _get_warrant_price_lifecycle_index():
+    """建立權證代號→上市／最後交易日區間索引，同一份權證主檔只建立一次。"""
+    global _WARRANT_PRICE_LIFECYCLE_INDEX_REF
+    global _WARRANT_PRICE_LIFECYCLE_INDEX
+    global _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS
+
+    records = _CURRENT_WARRANT_INTERVAL_RECORDS
+    if not records:
+        with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+            if _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS is None:
+                try:
+                    _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = load_warrants_cache() or []
+                except Exception:
+                    _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS = []
+            records = _WARRANT_PRICE_LIFECYCLE_DISK_RECORDS
+
+        if not records:
+            return {}
+
+    with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+        if records is _WARRANT_PRICE_LIFECYCLE_INDEX_REF:
+            return _WARRANT_PRICE_LIFECYCLE_INDEX
+
+    index = defaultdict(list)
+    for record in records:
+        code = normalize_price_code(record.get("代號", ""))
+        if len(code) != 6:
+            continue
+        list_dt = parse_date(record.get("上市日", ""))
+        end_dt = parse_date(record.get("最後交易日", ""))
+        if not list_dt and not end_dt:
+            continue
+        index[code].append((list_dt, end_dt))
+
+    for code in index:
+        index[code].sort(
+            key=lambda interval: (
+                interval[0] or datetime.min,
+                interval[1] or datetime.max,
+            )
+        )
+
+    built = dict(index)
+    with _WARRANT_PRICE_LIFECYCLE_INDEX_LOCK:
+        _WARRANT_PRICE_LIFECYCLE_INDEX_REF = records
+        _WARRANT_PRICE_LIFECYCLE_INDEX = built
+    return built
+
+def _clip_price_fetch_plan_to_warrant_lifecycle(fetch_plan):
+    """
+    將權證補價區間裁切在實際上市日～最後交易日內。
+
+    - 股票與沒有生命週期主檔的代號維持原區間。
+    - 權證需求區間若完全落在上市前或最後交易日後，直接排除，不送入批次與逐檔補漏。
+    - 權證代號重用時，取與需求區間有重疊的生命週期；若有多段，保留所有重疊段的最小包絡區間。
+    """
+    normalized = _normalize_price_fetch_plan(fetch_plan)
+    lifecycle_index = _get_warrant_price_lifecycle_index()
+    if not normalized or not lifecycle_index:
+        return normalized, {}
+
+    clipped_plan = {}
+    skipped_plan = {}
+
+    for code, (requested_start, requested_end) in normalized.items():
+        intervals = lifecycle_index.get(code)
+        if len(code) != 6 or not intervals:
+            clipped_plan[code] = [requested_start, requested_end]
+            continue
+
+        overlaps = []
+        for list_dt, end_dt in intervals:
+            clipped_start = max(requested_start, list_dt) if list_dt else requested_start
+            clipped_end = min(requested_end, end_dt) if end_dt else requested_end
+            if clipped_start <= clipped_end:
+                overlaps.append((clipped_start, clipped_end))
+
+        if not overlaps:
+            skipped_plan[code] = [requested_start, requested_end]
+            continue
+
+        clipped_plan[code] = [
+            min(start_dt for start_dt, _ in overlaps),
+            max(end_dt for _, end_dt in overlaps),
+        ]
+
+    return clipped_plan, skipped_plan
 
 def _price_plan_trading_dates(fetch_plan):
     fetch_plan = _normalize_price_fetch_plan(fetch_plan)
@@ -1690,6 +1970,22 @@ def fetch_price_plan_batch_first(
     if not fetch_plan:
         return changed_codes
 
+    original_fetch_count = len(fetch_plan)
+    fetch_plan, lifecycle_skipped_plan = _clip_price_fetch_plan_to_warrant_lifecycle(fetch_plan)
+    if lifecycle_skipped_plan:
+        sample_codes = ", ".join(sorted(lifecycle_skipped_plan)[:10])
+        sample_suffix = "..." if len(lifecycle_skipped_plan) > 10 else ""
+        print(
+            f"  ℹ️ {label}已下市／未上市權證不補價：{len(lifecycle_skipped_plan):,} 檔｜"
+            f"需求區間不在上市日～最後交易日內｜{sample_codes}{sample_suffix}"
+        )
+    if not fetch_plan:
+        print(
+            f"  ✅ {label}補價計畫已由權證生命週期全數排除："
+            f"原 {original_fetch_count:,} 檔，無需批次或逐檔請求"
+        )
+        return changed_codes
+
     trading_dates = _price_plan_trading_dates(fetch_plan)
     batch_seen_codes = set()
     latest_expected_by_code = {}
@@ -1710,6 +2006,16 @@ def fetch_price_plan_batch_first(
             continue
 
         market_prices, seen_codes = _fetch_market_close_snapshot_for_date(target_key)
+
+        # 兩個市場都回 0 檔時，視為尚未發布或休市日。
+        # 不可把這一天寫成股票的 expected_date，否則會誤觸發整批逐檔補漏。
+        if not seen_codes:
+            print(
+                f"  ℹ️ {label}全市場批次價略過無資料日：{target_key}｜"
+                "兩市場均未回傳任何代號，不列入預期價格日期"
+            )
+            continue
+
         batch_seen_codes.update(wanted_codes & seen_codes)
         for code in wanted_codes:
             latest_expected_by_code[code] = target_key
@@ -8117,8 +8423,6 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     state["updated_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
     if not failed_dates and len(success_dates) == len(refresh_dates):
         state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
-    else:
-        state.pop("schema_version", None)
     _save_finmind_state(state)
 
     combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
@@ -10544,9 +10848,10 @@ def _official_market_has_trading_data(target_dt):
             },
         ),
         (
-            "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
             {
                 "date": target_dt.strftime("%Y/%m/%d"),
+                "id": "",
                 "response": "json",
             },
         ),
@@ -16828,6 +17133,321 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
 
 # ══════════════════════════════════════════════════════════════════════
+# MoneyDJ API4／API5 資料來源（V10.1）
+# ══════════════════════════════════════════════════════════════════════
+
+def _moneydj_json_rows(response_content):
+    data = json.loads(response_content.decode("utf-8"))
+    rows = []
+    for item in data if isinstance(data, list) else [data]:
+        if not isinstance(item, dict):
+            continue
+        result_set = item.get("ResultSet", {})
+        result = result_set.get("Result", []) if isinstance(result_set, dict) else []
+        if isinstance(result, list):
+            rows.extend(result)
+    return rows
+
+
+def api4_get_with_status(code, start_date, end_date):
+    url = MONEYDJ_API4_URL.format(code=code, start=start_date, end=end_date)
+    for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
+        try:
+            response = get_thread_session().get(
+                url, headers=MONEYDJ_HEADERS, timeout=(5, 20)
+            )
+            response.raise_for_status()
+            return _moneydj_json_rows(response.content), True
+        except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
+            if attempt < MONEYDJ_MAX_RETRIES:
+                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
+        except Exception:
+            if attempt < MONEYDJ_MAX_RETRIES:
+                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
+    return [], False
+
+
+def api5_get_with_status(warrant_code, broker_code):
+    url = MONEYDJ_API5_URL.format(
+        warrant=warrant_code,
+        broker=broker_code,
+        limit=MONEYDJ_API5_HISTORY_LIMIT,
+    )
+    for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
+        try:
+            response = get_thread_session().get(
+                url, headers=MONEYDJ_HEADERS, timeout=(5, 20)
+            )
+            response.raise_for_status()
+            return _moneydj_json_rows(response.content), True
+        except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
+            if attempt < MONEYDJ_MAX_RETRIES:
+                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
+        except Exception:
+            if attempt < MONEYDJ_MAX_RETRIES:
+                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
+    return [], False
+
+
+def _moneydj_int(value):
+    try:
+        return int(float(str(value or "0").replace(",", "").strip() or 0))
+    except Exception:
+        return 0
+
+
+def find_broker_codes_moneydj(warrants):
+    print("【Step 2】MoneyDJ API4 掃描目標分點券商代號...")
+    target_date = resolve_latest_trading_date_on_or_before(datetime.today())
+    target_dt = parse_date(target_date) or datetime.today()
+    start_s = (target_dt - timedelta(days=5)).strftime("%Y/%m/%d")
+    end_s = target_dt.strftime("%Y/%m/%d")
+    found = {}
+
+    def scan_one(warrant):
+        rows, ok = api4_get_with_status(str(warrant.get("代號", "")).strip(), start_s, end_s)
+        hits = {}
+        if ok:
+            for row in rows:
+                name = str(row.get("V3", "")).strip()
+                label = match_target(name)
+                if label:
+                    raw_code = str(row.get("V2", "")).strip()
+                    canonical = str(FALLBACK.get(label, (name, raw_code))[1] or raw_code).strip()
+                    hits[label] = (name or FALLBACK.get(label, (label, canonical))[0], canonical)
+        return hits
+
+    sample = list(warrants or [])[:300]
+    if sample:
+        with ThreadPoolExecutor(max_workers=min(40, len(sample))) as executor:
+            futures = [executor.submit(scan_one, warrant) for warrant in sample]
+            for future in as_completed(futures):
+                try:
+                    hits = future.result()
+                except Exception:
+                    hits = {}
+                for label, value in hits.items():
+                    found.setdefault(label, value)
+                if len(found) >= len(TARGET_PATTERNS):
+                    break
+
+    for label in TARGET_PATTERNS:
+        if label not in found and label in FALLBACK:
+            found[label] = FALLBACK[label]
+            print(f"    ✅ {label:14s} → {found[label][0]} ({found[label][1]}) [設定備援]")
+        elif label in found:
+            print(f"    ✅ {label:14s} → {found[label][0]} ({found[label][1]})")
+    return found
+
+
+def _moneydj_scan_candidates(warrants, broker_map, target_date, history_empty=False):
+    global _MONEYDJ_SOURCE_REACHABLE
+    global MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS, MONEYDJ_PRESCAN_TOTAL_REQUESTS
+
+    target_dt = parse_date(target_date) or datetime.today()
+    scan_days = MONEYDJ_RECENT_SCAN_DAYS
+    if workflow_is_repair() or history_empty:
+        scan_days = max(scan_days, HISTORY_RETENTION_TRADING_DAYS * 2)
+    start_s = (target_dt - timedelta(days=scan_days)).strftime("%Y/%m/%d")
+    end_s = target_dt.strftime("%Y/%m/%d")
+    code_map = {
+        normalize_broker_code_for_compare(code): (label, name, code)
+        for label, (name, code) in broker_map.items()
+    }
+    MONEYDJ_PRESCAN_TOTAL_REQUESTS = len(warrants or [])
+    MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
+
+    def scan_one(warrant):
+        code = str(warrant.get("代號", "")).strip()
+        rows, ok = api4_get_with_status(code, start_s, end_s)
+        found = []
+        latest_date = None
+        if ok:
+            for row in rows:
+                broker_norm = normalize_broker_code_for_compare(row.get("V2", ""))
+                info = code_map.get(broker_norm)
+                if not info:
+                    continue
+                row_dt = parse_date(row.get("V1", ""))
+                if row_dt and (latest_date is None or row_dt > latest_date):
+                    latest_date = row_dt
+                label, broker_name, canonical_code = info
+                found.append((
+                    code,
+                    str(warrant.get("名稱", "")).strip(),
+                    str(warrant.get("標的股", "")).strip(),
+                    str(warrant.get("標的名稱", "")).strip(),
+                    label,
+                    broker_name,
+                    canonical_code,
+                ))
+        return found, ok, latest_date
+
+    candidates = {}
+    latest_market_date = None
+    with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, max(len(warrants or []), 1))) as executor:
+        futures = [executor.submit(scan_one, warrant) for warrant in (warrants or [])]
+        for idx, future in enumerate(as_completed(futures), start=1):
+            try:
+                rows, ok, latest_date = future.result()
+            except Exception:
+                rows, ok, latest_date = [], False, None
+            if ok:
+                MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS += 1
+                _MONEYDJ_SOURCE_REACHABLE = True
+            if latest_date and (latest_market_date is None or latest_date > latest_market_date):
+                latest_market_date = latest_date
+            for candidate in rows:
+                candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
+            if idx % 1000 == 0:
+                print(f"  [{idx:,}/{len(warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
+
+    print(
+        f"  ✅ MoneyDJ API4 預篩：成功 {MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS:,}/"
+        f"{MONEYDJ_PRESCAN_TOTAL_REQUESTS:,}｜候選 {len(candidates):,} 組｜"
+        f"市場最新日 {latest_market_date.strftime('%Y/%m/%d') if latest_market_date else '-'}"
+    )
+    return list(candidates.values()), latest_market_date
+
+
+def _moneydj_candidate_to_item(candidate, target_date):
+    warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = candidate
+    rows, ok = api5_get_with_status(warrant_code, broker_code)
+    if not ok:
+        return None, False
+    target_dt = parse_date(target_date)
+    records = []
+    for row in rows:
+        date_text = normalize_date_str(row.get("V1", ""))
+        row_dt = parse_date(date_text)
+        if not row_dt or (target_dt and row_dt.date() > target_dt.date()):
+            continue
+        buy_shares = _moneydj_int(row.get("V2", 0))
+        sell_shares = _moneydj_int(row.get("V3", 0))
+        buy_amount = _moneydj_int(row.get("V4", 0)) * 1000
+        sell_amount = _moneydj_int(row.get("V5", 0)) * 1000
+        records.append({
+            "日期": date_text,
+            "買進股數": buy_shares,
+            "賣出股數": sell_shares,
+            "買進金額": buy_amount,
+            "賣出金額": sell_amount,
+            "買超股數": buy_shares - sell_shares,
+            "買超金額": buy_amount - sell_amount,
+        })
+    if not records:
+        return None, True
+    df = pd.DataFrame(records).drop_duplicates(subset=["日期"], keep="last").sort_values("日期").reset_index(drop=True)
+    return {
+        "warrant_code": warrant_code,
+        "warrant_name": warrant_name,
+        "underlying_code": underlying_code,
+        "underlying_name": underlying_name,
+        "broker_label": broker_label,
+        "broker_name": broker_name,
+        "broker_code": broker_code,
+        "df": df,
+    }, True
+
+
+def _moneydj_items_to_history_df(items):
+    rows = []
+    for item in items or []:
+        df = item.get("df")
+        if df is None or df.empty:
+            continue
+        for rec in df.to_dict("records"):
+            rows.append({
+                "權證代號": item.get("warrant_code", ""),
+                "權證名稱": item.get("warrant_name", ""),
+                "標的股": item.get("underlying_code", ""),
+                "標的名稱": item.get("underlying_name", ""),
+                "分點": item.get("broker_label", ""),
+                "分點名稱": item.get("broker_name", ""),
+                "券商代號": item.get("broker_code", ""),
+                **rec,
+            })
+    return pd.DataFrame(rows)
+
+
+def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
+    global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
+    _MONEYDJ_TARGET_DATE = normalize_date_str(target_date)
+    candidates, latest_market_date = _moneydj_scan_candidates(
+        warrants, broker_map, _MONEYDJ_TARGET_DATE,
+        history_empty=history_df is None or history_df.empty,
+    )
+
+    # 補回既有歷史仍在使用的權證×分點，避免近期 API4 無活動時遺失既有部位。
+    if history_df is not None and not history_df.empty:
+        warrant_map = {str(w.get("代號", "")).strip(): w for w in warrants or []}
+        broker_by_code = {
+            normalize_broker_code_for_compare(code): (label, name, code)
+            for label, (name, code) in broker_map.items()
+        }
+        existing = {(c[0], normalize_broker_code_for_compare(c[6])) for c in candidates}
+        for row in history_df[["權證代號", "券商代號"]].drop_duplicates().itertuples(index=False, name=None):
+            warrant_code, broker_code = str(row[0]).strip(), normalize_broker_code_for_compare(row[1])
+            if (warrant_code, broker_code) in existing:
+                continue
+            warrant = warrant_map.get(warrant_code)
+            broker = broker_by_code.get(broker_code)
+            if warrant and broker:
+                label, broker_name, canonical_code = broker
+                candidates.append((
+                    warrant_code, str(warrant.get("名稱", "")), str(warrant.get("標的股", "")),
+                    str(warrant.get("標的名稱", "")), label, broker_name, canonical_code,
+                ))
+
+    print(f"【Step 3b】MoneyDJ API5 歷史：候選 {len(candidates):,} 組｜workers={min(MONEYDJ_HISTORY_WORKERS, max(len(candidates),1))}")
+    fetched_items = []
+    _MONEYDJ_API5_FAILED_COUNT = 0
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(MONEYDJ_HISTORY_WORKERS, len(candidates))) as executor:
+            futures = [executor.submit(_moneydj_candidate_to_item, candidate, _MONEYDJ_TARGET_DATE) for candidate in candidates]
+            for idx, future in enumerate(as_completed(futures), start=1):
+                try:
+                    item, ok = future.result()
+                except Exception:
+                    item, ok = None, False
+                if not ok:
+                    _MONEYDJ_API5_FAILED_COUNT += 1
+                if item:
+                    fetched_items.append(item)
+                if idx % 200 == 0:
+                    print(f"  [{idx:,}/{len(candidates):,}] MoneyDJ API5 抓取中｜有效 {len(fetched_items):,} 組｜失敗 {_MONEYDJ_API5_FAILED_COUNT:,}")
+
+    new_df = _moneydj_items_to_history_df(fetched_items)
+    if history_df is None or history_df.empty:
+        combined = new_df
+    elif new_df.empty:
+        combined = history_df.copy()
+    else:
+        keys = set(zip(new_df["權證代號"].astype(str), new_df["券商代號"].astype(str)))
+        old = history_df.copy()
+        keep = [
+            (str(w), str(b)) not in keys
+            for w, b in zip(old["權證代號"], old["券商代號"])
+        ]
+        combined = pd.concat([old.loc[keep].copy(), new_df], ignore_index=True)
+
+    if combined is None:
+        combined = pd.DataFrame()
+    if not combined.empty:
+        for col in ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]:
+            combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype("int64")
+        combined["日期"] = combined["日期"].map(normalize_date_str)
+        combined = combined.drop_duplicates(subset=["權證代號", "券商代號", "日期"], keep="last")
+        combined = combined.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
+        combined = save_history_cache(combined, fetched_items=fetched_items, previous_history_empty=history_df is None or history_df.empty)
+
+    _MONEYDJ_TARGET_DATE_OK = bool(
+        latest_market_date and latest_market_date.date() >= (parse_date(_MONEYDJ_TARGET_DATE) or datetime.min).date()
+    )
+    return combined
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 空結果安全同步判斷
 # ══════════════════════════════════════════════════════════════════════
 
@@ -16839,19 +17459,21 @@ def evaluate_empty_result_source_completeness(
     allow_empty_candidates=False,
 ):
     reasons = []
-    if not LIVE_WARRANT_SNAPSHOT_READY:
-        reasons.append("FinMind 權證清單與標的對照未完整取得")
-
     active_labels = set(TARGET_PATTERNS.keys())
     missing_brokers = sorted(active_labels - set((broker_map or {}).keys()))
     if missing_brokers:
         reasons.append(f"追蹤分點代號不完整：缺少 {len(missing_brokers)} 個")
-
-    if not _FINMIND_TARGET_DATE_OK:
-        reasons.append(f"FinMind 目標交易日 {_FINMIND_TARGET_DATE or '-'} 全市場日檔未完整取得")
-
+    if not _MONEYDJ_SOURCE_REACHABLE:
+        reasons.append("MoneyDJ API4 本次沒有任何成功請求")
+    elif MONEYDJ_PRESCAN_TOTAL_REQUESTS > 0:
+        ratio = MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS / MONEYDJ_PRESCAN_TOTAL_REQUESTS
+        if ratio < MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:
+            reasons.append(f"MoneyDJ API4 成功率不足：{ratio:.2%} < {MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:.2%}")
+    if MONEYDJ_API5_STRICT and _MONEYDJ_API5_FAILED_COUNT > 0:
+        reasons.append(f"MoneyDJ API5 有 {_MONEYDJ_API5_FAILED_COUNT} 組連線／解析失敗")
+    if not _MONEYDJ_TARGET_DATE_OK:
+        reasons.append(f"MoneyDJ 尚未確認目標交易日 {_MONEYDJ_TARGET_DATE or '-'} 已更新")
     return not reasons, reasons
-
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -16859,126 +17481,60 @@ def evaluate_empty_result_source_completeness(
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    global _PRICE_PLAN_MAX_PUBLISHED_DATE
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
     configure_run_mode()
 
-    if not FINMIND_TOKEN:
-        raise RuntimeError("缺少 FINMIND_API_0714，請先在 GitHub Secrets 設定同名 Secret。")
-
     today_fn = datetime.today().strftime("%Y%m%d")
     output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_ABCDE_{today_fn}.xlsx")
 
-    print(f"\n認購權證特定分點買超回測 ABCDE 版 | {today_fn}")
-    print("資料來源：FinMind TaiwanStockWarrantTradingDailyReport 全市場日 Parquet")
+    print(f"\n認購權證特定分點買超回測 ABCDE MoneyDJ V10.1 | {today_fn}")
+    print("資料來源：MoneyDJ API4／API5（分點資料）＋官方權證／行情來源")
     print("新制分類：同一分點 × 同一標的 × 同一天 = 1 筆事件")
-    print(f"進入條件：事件內至少 1 檔權證單日買進金額 >= {AMOUNT_THRESH // 10000}萬")
-    print("A：100–159萬｜B：160–249萬｜C：250–499萬｜D：500–999萬｜E：1000萬以上")
     print(f"程式版本：{PROGRAM_BUILD_ID}")
-    print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}")
-    print(
-        "TOP15估值備援："
-        f"LP={'ON' if TOP15_LP_QUOTE_FALLBACK_ENABLED else 'OFF'}｜"
-        f"LP無日期接受={'ON' if TOP15_LP_ALLOW_IMPLICIT_LATEST_DATE else 'OFF'}｜"
-        f"最近成交價={'ON' if TOP15_LAST_TRADE_FALLBACK_ENABLED else 'OFF'}"
-        f"({TOP15_LAST_TRADE_FALLBACK_MAX_DAYS}日)"
-    )
-    print(f"執行模式：RUN_MODE={RUN_MODE}｜分點數：{len(TARGET_PATTERNS)}")
+    print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}")
     print("=" * 70)
 
-    # 權證中繼資料與券商資料可同時抓取；兩者均有本機 Parquet 快取。
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        warrant_future = ex.submit(get_all_call_warrants)
-        broker_future = ex.submit(find_broker_codes, None)
-        warrants = warrant_future.result()
-        broker_map = filter_broker_map_for_active_targets(broker_future.result())
-
-    if not warrants or not broker_map:
-        print("  ⚠️ FinMind 權證或分點中繼資料不完整，本次停止，不修改 Google Sheet。")
+    warrants = get_all_call_warrants()
+    if not warrants:
+        print("  ⚠️ 權證清單無法取得，本次停止，不修改 Google Sheet。")
+        return
+    broker_map = filter_broker_map_for_active_targets(find_broker_codes_moneydj(warrants))
+    if not broker_map:
+        print("  ⚠️ MoneyDJ 分點代號無法取得，本次停止，不修改 Google Sheet。")
         return
 
     run_automatic_cache_maintenance(warrants)
-
     if workflow_is_longterm():
         run_longterm_workflow(warrants, broker_map, output_path, program_start)
         return
 
-    requested_target_date = latest_finmind_trading_date_on_or_before(datetime.today())
-    print(f"  ✅ 本次要求目標交易日：{requested_target_date}")
+    target_date = resolve_latest_trading_date_on_or_before(datetime.today())
+    print(f"  ✅ 本次實際目標交易日：{target_date}")
+    _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(target_date)
+    print(f"  ✅ 價格批次最晚已發布基準日：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
 
-    # daily：最新日尚未發布就快速結束，避免排程反覆空抓。
-    # repair：不可在此提前 return；若最新日尚未發布，往前找最近已發布交易日，
-    # 再以該日為基準補抓完整歷史區間。
-    requested_raw, requested_status = download_finmind_warrant_day(
-        requested_target_date,
-        force_refresh=FINMIND_FORCE_REFRESH_TARGET_DATE,
-    )
-    target_date, target_raw, target_status, used_target_fallback = resolve_finmind_refresh_target(
-        requested_target_date,
-        preloaded_raw=requested_raw,
-        preloaded_status=requested_status,
-    )
-
-    if target_status != "ok":
-        if workflow_is_repair():
-            print(
-                f"  ⚠️ 完整修補模式找不到可用的 FinMind 全市場權證分點日檔："
-                f"要求日={requested_target_date}｜status={target_status}。"
-                "為避免以不完整來源修補，本次停止且不修改 Google Sheet。"
-            )
-        else:
-            print(
-                f"  ⏹️ FinMind 尚未提供 {requested_target_date} 全市場權證分點資料"
-                f"（status={target_status}）。本次每日流程快速結束，"
-                "不抓空白資料、不補價格、不修改 Google Sheet。"
-            )
-        return
-
-    if used_target_fallback:
-        print(
-            f"  🔧 完整修補基準日：{target_date}｜"
-            f"原要求日 {requested_target_date} 尚未發布，但歷史補抓會繼續執行。"
-        )
-    else:
-        print(f"  ✅ 本次實際目標交易日：{target_date}")
-
-    print(f"  ✅ 目標日全市場權證分點原始列數：{len(target_raw):,}")
     history_cache_df = load_history_cache()
-    history_cache_df, refresh_status = refresh_history_from_finmind(
-        warrants,
-        broker_map,
-        history_cache_df,
-        target_date,
-        preloaded_target_df=target_raw,
-    )
+    history_cache_df = refresh_history_from_moneydj(warrants, broker_map, history_cache_df, target_date)
 
     source_complete, source_reasons = evaluate_empty_result_source_completeness(
-        broker_map,
-        history_cache_df=history_cache_df,
-        allow_empty_candidates=True,
+        broker_map, history_cache_df=history_cache_df, allow_empty_candidates=True
     )
     if not source_complete:
-        print("  ⚠️ FinMind 來源完整性未確認，本次停止，不修改 Google Sheet。")
+        print("  ⚠️ MoneyDJ 來源完整性未確認，本次停止，不修改 Google Sheet。")
         for reason in source_reasons:
             print(f"    - {reason}")
         return
 
     items = items_from_history_cache(history_cache_df)
-    if not items:
-        print("  ✅ 目標日完整日檔已取得，但追蹤分點沒有可用資料；仍會依既有歷史完成修補與報表計算，不會刪除工作表。")
-
     item_map = {(item["broker_code"], item["warrant_code"]): item for item in items}
     daily_records = build_daily_records(items)
 
-    print("【Step 3b】建立 A/B/C/D/E 金額強度事件...")
+    print("【Step 3c】建立 A/B/C/D/E 金額強度事件...")
     amount_events = build_amount_class_events(daily_records, item_map)
-    a_events, b_events, c_events, d_events, e_events = [
-        amount_events.get(code, []) for code in AMOUNT_CLASS_CODES
-    ]
-    print(
-        f"  ✅ 金額強度事件：A:{len(a_events):,}｜B:{len(b_events):,}｜"
-        f"C:{len(c_events):,}｜D:{len(d_events):,}｜E:{len(e_events):,}"
-    )
+    a_events, b_events, c_events, d_events, e_events = [amount_events.get(code, []) for code in AMOUNT_CLASS_CODES]
+    print(f"  ✅ 金額強度事件：A:{len(a_events):,}｜B:{len(b_events):,}｜C:{len(c_events):,}｜D:{len(d_events):,}｜E:{len(e_events):,}")
 
     persistent_price_cache = load_price_cache()
     all_changed_price_codes = set()
@@ -16991,8 +17547,7 @@ def main():
 
     top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
         a_events, b_events, c_events, d_events, e_events,
-        item_map,
-        price_cache,
+        item_map, price_cache,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allow_price_fetch=True,
         persistent_price_cache=persistent_price_cache,
@@ -17000,35 +17555,26 @@ def main():
         price_changed_codes=all_changed_price_codes,
     )
 
-    selected_items = []
-    selected_item_map = {}
+    selected_items, selected_item_map = [], {}
     selected_events = ([], [], [], [], [])
-    selected_top15_detail_rows = []
-    selected_top15_consensus_rows = []
-
+    selected_top15_detail_rows, selected_top15_consensus_rows = [], []
     if RUN_MODE == 2:
         selected_items = filter_items_for_selected_scope(items)
         selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
         selected_events = (sa, sb, sc, sd, se)
         selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
-            sa, sb, sc, sd, se,
-            selected_item_map,
-            price_cache,
-            data_scope="精選五分點",
-            allow_price_fetch=False,
+            sa, sb, sc, sd, se, selected_item_map, price_cache,
+            data_scope="精選五分點", allow_price_fetch=False,
         )
-        print(f"  ✅ 已從同一份 FinMind 歷史資料切出精選五分點：{len(selected_items):,} 組，不重抓 API。")
+        print(f"  ✅ 已從同一份 MoneyDJ 歷史資料切出精選五分點：{len(selected_items):,} 組，不重抓 API。")
 
     if all_changed_price_codes:
         save_price_cache(persistent_price_cache, changed_codes=all_changed_price_codes)
     else:
         print("  ✅ 價格快取沒有新增或更新，略過儲存。")
 
-    warrant_consensus_7d_rows = None
-    broker_10d_detail_rows = None
-    broker_10d_winrate_rank_rows = None
+    warrant_consensus_7d_rows = broker_10d_detail_rows = broker_10d_winrate_rank_rows = None
     if workflow_is_repair() and RUN_MODE == 2:
-        print("  🔧 完整修補模式：重建延伸報表資料，不影響每日流程。")
         warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items, target_date)
         broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache, target_date)
         broker_10d_winrate_rank_rows = build_10d_broker_winrate_rank_rows(broker_10d_detail_rows)
@@ -17046,18 +17592,10 @@ def main():
     if RUN_MODE == 2:
         selected_output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_ABCDE_selected5_{today_fn}.xlsx")
         build_selected_scope_excel(
-            selected_items,
-            selected_events,
-            selected_item_map,
-            price_cache,
-            selected_output_path,
-            selected_top15_detail_rows,
-            selected_top15_consensus_rows,
+            selected_items, selected_events, selected_item_map, price_cache,
+            selected_output_path, selected_top15_detail_rows, selected_top15_consensus_rows,
         )
-        extra_scope_values = read_excel_values_by_title(
-            selected_output_path,
-            allowed_titles=set(DAILY_RESULT_SHEET_TITLES),
-        )
+        extra_scope_values = read_excel_values_by_title(selected_output_path, allowed_titles=set(DAILY_RESULT_SHEET_TITLES))
 
     upload_excel_to_google_sheet(
         output_path,
@@ -17068,10 +17606,9 @@ def main():
 
     elapsed = time.time() - program_start
     print(f"\n{'=' * 70}")
-    print("✅ 完成！")
+    print("✅ MoneyDJ V10.1 完成！")
     print(f"📄 {output_path}")
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
-
 
 
 if __name__ == "__main__":
