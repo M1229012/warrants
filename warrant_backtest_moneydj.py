@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-20260720"
+PROGRAM_BUILD_ID = "MONEYDJ-ONLY-ABCDE-V10.1-FIXED-20260720-R2"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -2153,7 +2153,7 @@ def get_price_nearest(prices, date):
 # Google Sheet 快取 / 結果同步工具（GitHub Actions 部署用）
 # ══════════════════════════════════════════════════════════════════════
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點資料_MONEYDJ_NEW")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點資料_NEW_MoneyDJ")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 GSHEET_CACHE_ENABLED = os.getenv("GSHEET_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_RESULT_ENABLED = os.getenv("GSHEET_RESULT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
@@ -7866,15 +7866,22 @@ def fetch_finmind_dataset(dataset, *, params=None, cache_hours=None, force=False
 
 
 def get_finmind_trading_dates():
-    try:
-        df = fetch_finmind_dataset("TaiwanStockTradingDate", cache_hours=6)
-        if "date" not in df.columns:
-            return []
-        dates = pd.to_datetime(df["date"], errors="coerce").dropna().dt.date.tolist()
-        return sorted(set(dates))
-    except Exception as exc:
-        print(f"  ⚠️ FinMind 交易日清單取得失敗：{type(exc).__name__}: {exc}")
-        return []
+    """
+    MoneyDJ 版本的交易日候選清單。
+
+    保留舊函式名稱，避免改動 V10.1 價格批次呼叫點；實際上完全不連 FinMind。
+    交易日候選以近三年的平日建立，真正是否有盤後資料仍由 TWSE／TPEx
+    單日全市場端點確認，假日或休市日只會得到空資料，不會寫入價格快取。
+    """
+    today = datetime.today().date()
+    start = today - timedelta(days=max(HISTORY_RETENTION_TRADING_DAYS * 3, 1100))
+    dates = []
+    current = start
+    while current <= today:
+        if current.weekday() < 5:
+            dates.append(current)
+        current += timedelta(days=1)
+    return dates
 
 
 def latest_finmind_trading_date_on_or_before(target=None):
@@ -8341,6 +8348,9 @@ def _run_finmind_refresh_dates(target_date, history_df, force_full=False):
 
 
 def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, preloaded_target_df=None):
+    raise RuntimeError("MoneyDJ-only 版本禁止呼叫 refresh_history_from_finmind；請使用 refresh_history_from_moneydj。")
+
+def _legacy_refresh_history_from_finmind_disabled(warrants, broker_map, history_df, target_date, preloaded_target_df=None):
     global _FINMIND_TARGET_DATE_OK, _FINMIND_TARGET_DATE
 
     state = _load_finmind_state()
@@ -8651,155 +8661,188 @@ def cleanup_deleted_broker_rows_in_existing_worksheets():
         print("  ✅ Google Sheet 舊分點資料檢查完成：沒有需要清除的失效分點列，未刪除任何工作表。")
 
 
-def get_all_call_warrants_live(cached_warrants=None):
-    global LIVE_WARRANT_SNAPSHOT_READY, CURRENT_LIVE_WARRANT_CODES
-    global _CURRENT_STOCK_CODE_TO_NAME, _CURRENT_STOCK_NAME_TO_CODE, _CURRENT_UNDERLYING_RESOLVER
-    global _CURRENT_WARRANT_INTERVAL_RECORDS
+def build_stock_map(df):
+    stock_map = {}
 
-    print("【Step 1】FinMind 取得認購權證清單與日期化標的對照...")
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        future_info = ex.submit(fetch_finmind_dataset, "TaiwanStockInfoWithWarrant")
-        future_summary = ex.submit(fetch_finmind_dataset, "TaiwanStockInfoWithWarrantSummary")
-        future_stock = ex.submit(fetch_finmind_dataset, "TaiwanStockInfo")
-        info_df = future_info.result()
-        summary_df = future_summary.result()
-        stock_df = future_stock.result()
+    for row in df.itertuples(index=False, name=None):
+        cell = str(row[0]).strip()
 
-    required_summary = {"stock_id", "target_stock_id", "type", "date", "end_date"}
-    if info_df.empty or summary_df.empty or not required_summary.issubset(summary_df.columns):
-        LIVE_WARRANT_SNAPSHOT_READY = False
-        return []
+        if "　" in cell:
+            parts = cell.split("　", 1)
+            code, name = parts[0].strip(), parts[1].strip()
+        else:
+            m = re.match(r"^(\d{4})\s+(.+)$", cell)
+            if m:
+                code, name = m.group(1), m.group(2)
+            else:
+                continue
 
-    # 先建立唯一股號／股名主檔，禁止再用 dict(zip) 的最後一列任意覆蓋。
-    # TaiwanStockInfo 為主；TaiwanStockInfoWithWarrant 中非權證的標的／指數名稱只做補充。
-    stock_master_parts = []
-    if stock_df is not None and not stock_df.empty:
-        stock_master_parts.append(stock_df.copy())
-    if info_df is not None and not info_df.empty and {"stock_id", "stock_name"}.issubset(info_df.columns):
-        info_master = info_df.copy()
-        if "date" not in info_master.columns:
-            info_master["date"] = ""
-        stock_master_parts.append(info_master)
-    stock_master_df = pd.concat(stock_master_parts, ignore_index=True, sort=False) if stock_master_parts else pd.DataFrame()
-    stock_code_to_name, stock_name_to_code = build_canonical_stock_master(stock_master_df)
-    _CURRENT_STOCK_CODE_TO_NAME = stock_code_to_name
-    _CURRENT_STOCK_NAME_TO_CODE = stock_name_to_code
-    _CURRENT_UNDERLYING_RESOLVER = build_underlying_resolver_from_stock_master(stock_code_to_name)
-    _reset_underlying_resolver_runtime_cache(_CURRENT_UNDERLYING_RESOLVER)
-    cached_warrant_index = build_cached_warrant_index(cached_warrants)
+        if len(code) == 4 and code.isdigit():
+            stock_map[name] = code
 
-    info = info_df.copy().fillna("")
-    info["stock_id"] = info["stock_id"].map(normalize_security_code_text)
-    info_name_candidates = defaultdict(list)
-    if "stock_name" in info.columns:
-        for code, name in info[["stock_id", "stock_name"]].itertuples(index=False, name=None):
-            name = str(name or "").strip()
-            if code and name and name not in info_name_candidates[code]:
-                info_name_candidates[code].append(name)
+    return stock_map
 
-    summary = summary_df.copy().fillna("")
-    summary["stock_id"] = summary["stock_id"].map(normalize_security_code_text)
-    summary["target_stock_id"] = summary["target_stock_id"].map(normalize_security_code_text)
-    summary["_list_date"] = pd.to_datetime(summary["date"], errors="coerce")
-    summary["_end_date"] = pd.to_datetime(summary["end_date"], errors="coerce")
+def build_underlying_resolver(stock_map):
+    """
+    預先建立完整股名與安全 alias 對照表。
 
-    today = pd.Timestamp(datetime.today().date())
-    lookback_days = max(
-        int(os.getenv("WARRANT_METADATA_LOOKBACK_DAYS", str(max(HISTORY_RETENTION_TRADING_DAYS * 2, 420)))),
-        365,
-    )
-    cutoff = today - pd.Timedelta(days=lookback_days)
-    call_mask = summary["type"].astype(str).str.contains("認購", na=False)
-    relevant_mask = (
-        summary["_list_date"].notna()
-        & summary["_end_date"].notna()
-        & (summary["_list_date"] <= today)
-        & (summary["_end_date"] >= cutoff)
-    )
-    summary = summary[call_mask & relevant_mask].copy()
-    # target_stock_id 必須保留在去重鍵中；同區間若 FinMind 有衝突列，後面再用身分分數選正確者。
-    summary = summary.sort_values(["stock_id", "_list_date", "_end_date", "target_stock_id"]).drop_duplicates(
-        ["stock_id", "target_stock_id", "_list_date", "_end_date"],
-        keep="last",
-    )
+    重要：
+    原本 find_underlying_info() 會先用完整股名比對，導致「昇陽半XXX購」
+    先被短股名「昇陽」吃到，誤判成 3266。
+    這版改成完整股名與 alias 全部放在同一個候選表，統一採「最長前綴優先」。
+    因此「昇陽半」會優先於「昇陽」。
+    """
+    exact_stock_names = set()
 
-    warrants = []
-    active_codes = set()
-    identity_override_count = 0
-    name_guard_count = 0
+    for stock_name in stock_map.keys():
+        sname = normalize_stock_name_text(stock_name)
+        if sname:
+            exact_stock_names.add(sname)
 
-    for code, summary_underlying, list_ts, end_ts in summary[
-        ["stock_id", "target_stock_id", "_list_date", "_end_date"]
-    ].itertuples(index=False, name=None):
-        code = normalize_security_code_text(code)
-        summary_underlying = normalize_security_code_text(summary_underlying)
-        if not code or not summary_underlying or pd.isna(list_ts) or pd.isna(end_ts):
-            continue
+    candidates = []
+    seen = set()
 
-        list_date = pd.Timestamp(list_ts).strftime("%Y/%m/%d")
-        end_date = pd.Timestamp(end_ts).strftime("%Y/%m/%d")
-        provisional_name, name_source = select_warrant_name_for_interval(
-            code,
-            summary_underlying,
-            list_date,
-            end_date,
-            info_name_candidates,
-            cached_warrant_index,
-            resolver=_CURRENT_UNDERLYING_RESOLVER,
-            enforce_underlying_match=False,
-        )
-        final_underlying, final_underlying_name, identity_source = reconcile_underlying_identity(
-            provisional_name,
-            summary_underlying,
-            stock_code_to_name.get(summary_underlying, ""),
-            code_to_name=stock_code_to_name,
-            resolver=_CURRENT_UNDERLYING_RESOLVER,
-        )
-        if identity_source == "warrant_name_override":
-            identity_override_count += 1
+    def add_candidate(prefix, stock_code, stock_name, is_exact_alias):
+        prefix_norm = normalize_stock_name_text(prefix)
+        stock_name_norm = normalize_stock_name_text(stock_name)
 
-        # 以更正後標的再挑一次名稱；可處理 Summary 錯標但權證名稱正確的情況。
-        final_name, final_name_source = select_warrant_name_for_interval(
-            code,
-            final_underlying,
-            list_date,
-            end_date,
-            info_name_candidates,
-            cached_warrant_index,
-            resolver=_CURRENT_UNDERLYING_RESOLVER,
-        )
-        if final_name_source.startswith("code_only"):
-            name_guard_count += 1
+        if not prefix_norm:
+            return
 
-        final_underlying_name = str(stock_code_to_name.get(final_underlying, final_underlying_name)).strip()
-        warrants.append({
-            "代號": code,
-            "名稱": final_name,
-            "標的股": final_underlying,
-            "標的名稱": final_underlying_name,
-            "上市日": list_date,
-            "最後交易日": end_date,
-            "_名稱來源": final_name_source or name_source,
-            "_標的來源": identity_source,
+        key = (prefix_norm, str(stock_code), stock_name_norm)
+
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        candidates.append({
+            "prefix": prefix_norm,
+            "prefix_len": len(prefix_norm),
+            "is_exact_alias": 1 if is_exact_alias else 0,
+            "stock_name_len": len(stock_name_norm),
+            "stock_code": stock_code,
+            "stock_name": stock_name,
         })
 
-    warrants = dedupe_warrant_interval_records(warrants, resolver=_CURRENT_UNDERLYING_RESOLVER)
-    _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in warrants]
-    _reset_warrant_lookup_cache(_CURRENT_WARRANT_INTERVAL_RECORDS)
-    for rec in warrants:
-        rec.pop("_名稱來源", None)
-        rec.pop("_標的來源", None)
-        if parse_date(rec.get("上市日", "")) <= datetime.today() <= parse_date(rec.get("最後交易日", "")):
-            active_codes.add(normalize_security_code_text(rec.get("代號", "")))
+    for stock_name, stock_code in stock_map.items():
+        stock_name_norm = normalize_stock_name_text(stock_name)
 
-    LIVE_WARRANT_SNAPSHOT_READY = bool(warrants)
-    CURRENT_LIVE_WARRANT_CODES = active_codes
-    print(
-        f"  ✅ FinMind 認購權證日期區間紀錄：{len(warrants):,} 筆｜"
-        f"今日有效代號：{len(active_codes):,} 支｜"
-        f"標的交叉更正：{identity_override_count:,} 筆｜"
-        f"權證名稱防錯降級：{name_guard_count:,} 筆"
+        # 完整股名也是候選，但不再獨立提前回傳，避免短完整股名壓過較長 alias。
+        add_candidate(stock_name_norm, stock_code, stock_name, True)
+
+        for alias in make_stock_aliases(stock_name, exact_stock_names):
+            alias_norm = normalize_stock_name_text(alias)
+            add_candidate(alias_norm, stock_code, stock_name, alias_norm == stock_name_norm)
+
+    candidates = sorted(
+        candidates,
+        key=lambda x: (
+            x["prefix_len"],
+            x["is_exact_alias"],
+            -x["stock_name_len"],
+        ),
+        reverse=True
     )
+
+    return candidates
+
+def find_underlying_info(warrant_name, stock_map, resolver=None):
+    wname = normalize_stock_name_text(warrant_name)
+
+    if not wname:
+        return "", ""
+
+    # 特殊標的優先處理，避免「台灣50」被一般股票短 alias「台灣」誤判成 3045 台灣大哥大。
+    special_code, special_name = get_special_underlying_info_from_warrant_name(warrant_name)
+    if special_code:
+        return special_code, special_name
+
+    if resolver is None:
+        resolver = build_underlying_resolver(stock_map)
+
+    for rec in resolver:
+        prefix = rec["prefix"]
+
+        if prefix and wname.startswith(prefix):
+            return rec["stock_code"], rec["stock_name"]
+
+    return "", ""
+
+def get_all_call_warrants_live():
+    global LIVE_WARRANT_MARKET_SUCCESS_COUNT
+
+    print("【Step 1】TWSE ISIN 取得上市＋上櫃認購權證清單（不使用 FinMind）...")
+    warrants = []
+    LIVE_WARRANT_MARKET_SUCCESS_COUNT = 0
+
+    # strMode=2：上市有價證券
+    # strMode=4：上櫃有價證券
+    # 兩邊都要抓，否則上櫃標的的權證，例如 70xxxx 權證會漏掉。
+    isin_modes = [
+        ("上市", "2"),
+        ("上櫃", "4"),
+    ]
+
+    all_dfs = []
+    stock_map = {}
+
+    for market_name, mode in isin_modes:
+        try:
+            resp = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30
+            )
+            resp.raise_for_status()
+            resp.encoding = "cp950"
+
+            tables = pd.read_html(StringIO(resp.text))
+            df = tables[0].iloc[2:].reset_index(drop=True)
+
+            all_dfs.append((market_name, df))
+            stock_map.update(build_stock_map(df))
+            LIVE_WARRANT_MARKET_SUCCESS_COUNT += 1
+
+            print(f"  ✅ 已取得{market_name} ISIN 清單：{len(df)} 筆")
+
+        except Exception as e:
+            print(f"  ⚠️ {market_name} ISIN 清單取得失敗：{e}")
+
+    # 只建立一次 resolver，避免每檔權證都重新掃全部股票與 alias，保持執行速度。
+    underlying_resolver = build_underlying_resolver(stock_map)
+
+    seen_warrants = set()
+
+    for market_name, df in all_dfs:
+        for row in df.itertuples(index=False, name=None):
+            cell = str(row[0]).strip()
+
+            if "\u3000" in cell:
+                parts = cell.split("\u3000", 1)
+                code, name = parts[0].strip(), parts[1].strip()
+            else:
+                m = re.match(r"^(\d{6})\s+(.+)$", cell)
+                if m:
+                    code, name = m.group(1), m.group(2)
+                else:
+                    continue
+
+            if len(code) == 6 and code.isdigit() and "購" in name:
+                if code in seen_warrants:
+                    continue
+
+                seen_warrants.add(code)
+                underlying, underlying_name = find_underlying_info(name, stock_map, underlying_resolver)
+
+                warrants.append({
+                    "代號": code,
+                    "名稱": name,
+                    "標的股": underlying,
+                    "標的名稱": underlying_name
+                })
+
+    print(f"  ✅ 共 {len(warrants)} 支認購權證")
     return warrants
 
 
@@ -8809,38 +8852,75 @@ def get_all_call_warrants_live(cached_warrants=None):
 
 def get_all_call_warrants():
     global CURRENT_LIVE_WARRANT_CODES, LIVE_WARRANT_SNAPSHOT_READY
-    global _CURRENT_WARRANT_INTERVAL_RECORDS
 
     cached_warrants = load_warrants_cache()
-    try:
-        warrants = get_all_call_warrants_live(cached_warrants)
-    except Exception as exc:
-        warrants = []
-        print(f"  ⚠️ FinMind 權證清單更新失敗：{type(exc).__name__}: {exc}")
-
-    if warrants:
-        _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in warrants]
-        save_warrants_cache(warrants)
-        return warrants
 
     if cached_warrants:
-        _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in cached_warrants]
-        LIVE_WARRANT_SNAPSHOT_READY = False
-        today = datetime.today()
+        print("【Step 1】讀取認購權證清單快取...")
+        print(f"  ✅ 已讀取權證清單快取：{len(cached_warrants)} 支")
+        print("  🔄 即時更新今日認購權證清單；成功時以今日清單完整覆蓋，移除已到期權證...")
+        live_warrants = get_all_call_warrants_live()
+
+        if not live_warrants or LIVE_WARRANT_MARKET_SUCCESS_COUNT < LIVE_WARRANT_MARKET_EXPECTED_COUNT:
+            LIVE_WARRANT_SNAPSHOT_READY = False
+            CURRENT_LIVE_WARRANT_CODES = {
+                str(w.get("代號", "")).strip()
+                for w in cached_warrants
+                if str(w.get("代號", "")).strip()
+            }
+            if live_warrants:
+                print(
+                    f"  ⚠️ 即時權證清單只有 {LIVE_WARRANT_MARKET_SUCCESS_COUNT}/{LIVE_WARRANT_MARKET_EXPECTED_COUNT} 個市場成功，"
+                    "為避免把另一市場的有效權證誤刪，暫時沿用既有權證清單快取。"
+                )
+            else:
+                print("  ⚠️ 即時權證清單取得失敗，為避免誤刪資料，暫時沿用既有權證清單快取。")
+            return cached_warrants
+
+        warrants = live_warrants
+        LIVE_WARRANT_SNAPSHOT_READY = True
         CURRENT_LIVE_WARRANT_CODES = {
-            str(w.get("代號", "")).strip().upper()
+            str(w.get("代號", "")).strip()
+            for w in warrants
+            if str(w.get("代號", "")).strip()
+        }
+        save_warrants_cache(warrants)
+
+        old_codes = {
+            str(w.get("代號", "")).strip()
             for w in cached_warrants
             if str(w.get("代號", "")).strip()
-            and (not parse_date(w.get("上市日", "")) or parse_date(w.get("上市日", "")) <= today)
-            and (not parse_date(w.get("最後交易日", "")) or parse_date(w.get("最後交易日", "")) >= today)
         }
+        removed_count = len(old_codes - CURRENT_LIVE_WARRANT_CODES)
+        new_count = len(CURRENT_LIVE_WARRANT_CODES - old_codes)
         print(
-            f"  ⚠️ 沿用既有權證日期對照快取：{len(cached_warrants):,} 筆；"
-            "本次不允許以空結果清除 Google Sheet。"
+            f"  ✅ 權證清單更新完成：原快取 {len(old_codes):,} 支｜"
+            f"今日有效 {len(warrants):,} 支｜新增 {new_count:,} 支｜移除已失效 {removed_count:,} 支"
         )
-        return cached_warrants
+        return warrants
 
-    return []
+    warrants = get_all_call_warrants_live()
+    if warrants and LIVE_WARRANT_MARKET_SUCCESS_COUNT >= LIVE_WARRANT_MARKET_EXPECTED_COUNT:
+        LIVE_WARRANT_SNAPSHOT_READY = True
+        CURRENT_LIVE_WARRANT_CODES = {
+            str(w.get("代號", "")).strip()
+            for w in warrants
+            if str(w.get("代號", "")).strip()
+        }
+        save_warrants_cache(warrants)
+    else:
+        LIVE_WARRANT_SNAPSHOT_READY = False
+        CURRENT_LIVE_WARRANT_CODES = {
+            str(w.get("代號", "")).strip()
+            for w in (warrants or [])
+            if str(w.get("代號", "")).strip()
+        }
+        if warrants:
+            print(
+                f"  ⚠️ 即時權證清單只有 {LIVE_WARRANT_MARKET_SUCCESS_COUNT}/{LIVE_WARRANT_MARKET_EXPECTED_COUNT} 個市場成功，"
+                "本次可繼續使用已取得資料，但不會執行失效權證刪除。"
+            )
+    return warrants
 
 
 
@@ -17477,6 +17557,27 @@ def evaluate_empty_result_source_completeness(
 
 
 # ══════════════════════════════════════════════════════════════════════
+# MoneyDJ-only 啟動自檢
+# ══════════════════════════════════════════════════════════════════════
+
+def verify_moneydj_only_runtime():
+    """確認正式主流程不依賴 FinMind Token，且 MoneyDJ API4/API5 與官方 ISIN 清單函式存在。"""
+    required = {
+        "API4": globals().get("API4"),
+        "API5": globals().get("API5"),
+        "get_all_call_warrants_live": globals().get("get_all_call_warrants_live"),
+        "refresh_history_from_moneydj": globals().get("refresh_history_from_moneydj"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"MoneyDJ-only 啟動自檢失敗，缺少：{', '.join(missing)}")
+
+    print("  ✅ 資料來源自檢：MoneyDJ API4／API5")
+    print("  ✅ 權證清單來源自檢：TWSE ISIN 上市＋上櫃")
+    print("  ✅ FinMind Token：本流程不需要 FINMIND_API_0714")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
 
@@ -17485,6 +17586,7 @@ def main():
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
     configure_run_mode()
+    verify_moneydj_only_runtime()
 
     today_fn = datetime.today().strftime("%Y%m%d")
     output_run_stamp = datetime.today().strftime("%Y%m%d_%H%M%S")
