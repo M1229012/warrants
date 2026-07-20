@@ -1,4 +1,4 @@
-name: Warrant Report Manual Test - FinMind Only
+name: Warrant Report Manual Test - FinMind History + MoneyDJ Latest
 
 on:
   workflow_dispatch:
@@ -325,7 +325,24 @@ jobs:
       # ========================================================
       # 市場資料使用 FinMind；新聞使用六來源整合
       # ========================================================
-      WARRANT_DATA_SOURCE_MODE: "finmind_only"
+      WARRANT_DATA_SOURCE_MODE: "finmind_history_moneydj_latest"
+
+      # ========================================================
+      # FinMind 歷史 + MoneyDJ 最新交易日混合模式
+      # 18:20 後若 FinMind 尚未更新目標交易日，才以 MoneyDJ 整日資料替換該日。
+      # FinMind 已有同日資料時仍優先使用 FinMind，避免雙來源重複計算。
+      # ========================================================
+      WARRANT_HYBRID_MONEYDJ_LATEST_DAY_ENABLE: "1"
+      WARRANT_HYBRID_MONEYDJ_FORCE_ENABLE: "0"
+      WARRANT_HYBRID_MONEYDJ_START_HOUR: "18"
+      WARRANT_HYBRID_MONEYDJ_START_MINUTE: "20"
+      WARRANT_HYBRID_MONEYDJ_API4_WORKERS: "40"
+      WARRANT_HYBRID_MONEYDJ_API5_WORKERS: "50"
+      WARRANT_HYBRID_MONEYDJ_API5_DAYS: "5"
+      WARRANT_HYBRID_MONEYDJ_RETRIES: "3"
+      WARRANT_HYBRID_MONEYDJ_RETRY_WAIT: "1.5"
+      WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS: "0"
+
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
       FINMIND_REQUEST_RETRIES: "5"
       FINMIND_RETRY_BASE_WAIT: "1.5"
@@ -580,9 +597,15 @@ jobs:
 
       - name: Run warrant report test
         run: |
-          echo "========== 開始執行 FinMind market + multi-source news K_function_warrant_report_20260530.py =========="
+          echo "========== 開始執行 FinMind 歷史 + MoneyDJ 最新日混合版 =========="
           echo "STOCK_CODES=$STOCK_CODES"
           echo "WARRANT_REPORT_MODE=$WARRANT_REPORT_MODE"
+          echo "WARRANT_HYBRID_MONEYDJ_LATEST_DAY_ENABLE=$WARRANT_HYBRID_MONEYDJ_LATEST_DAY_ENABLE"
+          echo "WARRANT_HYBRID_MONEYDJ_FORCE_ENABLE=$WARRANT_HYBRID_MONEYDJ_FORCE_ENABLE"
+          echo "WARRANT_HYBRID_MONEYDJ_START_HOUR=$WARRANT_HYBRID_MONEYDJ_START_HOUR"
+          echo "WARRANT_HYBRID_MONEYDJ_START_MINUTE=$WARRANT_HYBRID_MONEYDJ_START_MINUTE"
+          echo "WARRANT_HYBRID_MONEYDJ_API4_WORKERS=$WARRANT_HYBRID_MONEYDJ_API4_WORKERS"
+          echo "WARRANT_HYBRID_MONEYDJ_API5_WORKERS=$WARRANT_HYBRID_MONEYDJ_API5_WORKERS"
           echo "WARRANT_LLM_CACHE_FORCE_REFRESH=$WARRANT_LLM_CACHE_FORCE_REFRESH"
           echo "FINMIND_WARRANT_DOWNLOAD_WORKERS=$FINMIND_WARRANT_DOWNLOAD_WORKERS"
           echo "FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE=$FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE"
@@ -607,7 +630,7 @@ jobs:
           echo "WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE=$WARRANT_COMPARE_DEBUG_ALL_BRANCH_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE"
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
-          .venv/bin/python -u K_function_warrant_report_20260530.py
+          .venv/bin/python -u K_function_warrant_report_FINMIND_MONEYDJ_HYBRID.py
 
       - name: Save refreshed FinMind report cache
         if: success()
@@ -629,7 +652,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: warrant-report-finmind-test-output
+          name: warrant-report-hybrid-test-output
           path: |
             output/*.png
             output/debug_*.csv
