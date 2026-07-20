@@ -1,4 +1,4 @@
-name: Warrant Backtest Google Sheet - MoneyDJ ABCDE V7
+name: Warrant Backtest Google Sheet - MoneyDJ New Excel
 
 on:
   workflow_dispatch:
@@ -14,12 +14,13 @@ on:
           - "長期留單補價格"
           - "完整修補模式"
 
-  schedule:
-    # Asia/Taipei 17:10 = UTC 09:10
-    - cron: "10 9 * * 1-5"
+  # 測試期間停用排程，只保留 workflow_dispatch。
+  # 驗證 MoneyDJ 資料正確後，再與 FinMind 工作流程錯開至少 30 分鐘啟用。
 
-    # Asia/Taipei 21:05、21:35 = UTC 13:05、13:35
-    - cron: "5,35 13 * * 1-5"
+
+permissions:
+  contents: read
+  actions: write
 
 
 jobs:
@@ -33,7 +34,7 @@ jobs:
       # ============================================================
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
-      PYTHON_FILE: warrant_backtest_new.py
+      PYTHON_FILE: warrant_backtest_moneydj.py
 
       # ============================================================
       # MoneyDJ 資料來源
@@ -92,14 +93,13 @@ jobs:
       TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN: "1"
       TOP15_MIN_BROKER_REMAINING_COST: "100000"
 
-      TOP15_LP_QUOTE_FALLBACK_ENABLED: "1"
+      TOP15_LP_QUOTE_FALLBACK_ENABLED: "0"
       TOP15_LP_QUOTE_TIMEOUT_SECONDS: "15"
       TOP15_LP_QUOTE_WORKERS: "10"
       TOP15_LP_ALLOW_IMPLICIT_LATEST_DATE: "0"
       TOP15_LAST_TRADE_FALLBACK_ENABLED: "1"
       TOP15_LAST_TRADE_FALLBACK_MAX_DAYS: "75"
       TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT: "60"
-      TOP15_LP_QUOTE_URLS: "https://warrants.twse.com.tw/Query.aspx,https://warrants.twse.com.tw/query,https://warrants.sfi.org.tw/Query.aspx"
 
       SELL_DETAIL_DAYS: "3"
 
@@ -132,7 +132,7 @@ jobs:
       # 工作表不存在時才建立；已存在時只 insert 缺少資料。
       # 不清空、不重建任何既有工作表。
       # ============================================================
-      GOOGLE_SHEET_NAME: "權證分點資料_NEW"
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
 
       GSHEET_CACHE_ENABLED: "0"
       GSHEET_RESULT_ENABLED: "1"
@@ -168,11 +168,14 @@ jobs:
           cache: "pip"
 
       - name: Restore MoneyDJ local cache
-        uses: actions/cache@v4
+        id: moneydj-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: warrant_cache
-          key: warrant-cache-moneydj-v7-${{ runner.os }}-${{ github.run_id }}
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+            warrant-cache-moneydj-v10-${{ runner.os }}-
             warrant-cache-moneydj-v7-${{ runner.os }}-
 
       - name: Resolve run settings
@@ -255,12 +258,12 @@ jobs:
 
           SCRIPT_PATH="$PYTHON_FILE"
 
-          # 支援完整 V7 檔名；若 GitHub 倉庫內仍使用 warrant_backtest_new.py，則自動改用該檔。
+          # MoneyDJ workflow 僅允許執行 MoneyDJ 專用檔名，禁止退回 FinMind warrant_backtest.py。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
-            if [[ -f "warrant_backtest_new.py" ]]; then
-              SCRIPT_PATH="warrant_backtest_new.py"
+            if [[ -f "warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py" ]]; then
+              SCRIPT_PATH="warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
             else
-              echo "找不到程式碼：$PYTHON_FILE 或 warrant_backtest_new.py"
+              echo "找不到 MoneyDJ 程式碼：$PYTHON_FILE 或 warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
               echo "目前倉庫內的 Python 檔案："
               find . -maxdepth 2 -type f -name "*.py" -print
               exit 1
@@ -270,11 +273,49 @@ jobs:
           echo "執行程式：$SCRIPT_PATH"
           python "$SCRIPT_PATH"
 
+      - name: Save MoneyDJ local cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Prune old MoneyDJ caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_PREFIX: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+        shell: bash
+        run: |
+          echo "保留同分支最新3份MoneyDJ cache，刪除更舊項目。"
+          mapfile -t OLD_CACHE_IDS < <(
+            gh cache list \
+              --repo "$GITHUB_REPOSITORY" \
+              --key "$CACHE_PREFIX" \
+              --ref "$GITHUB_REF" \
+              --sort created_at \
+              --order desc \
+              --limit 100 \
+              --json id \
+              --jq '.[3:][] | .id'
+          )
+
+          if [ "${#OLD_CACHE_IDS[@]}" -eq 0 ]; then
+            echo "沒有需要刪除的舊MoneyDJ cache。"
+            exit 0
+          fi
+
+          for cache_id in "${OLD_CACHE_IDS[@]}"; do
+            echo "刪除舊MoneyDJ cache id=$cache_id"
+            gh cache delete "$cache_id" --repo "$GITHUB_REPOSITORY"
+          done
+
       - name: Upload Excel artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: warrant-backtest-moneydj-abcde-v7
+          name: warrant-backtest-moneydj-new-excel
           path: output/*.xlsx
           if-no-files-found: ignore
           retention-days: 14
