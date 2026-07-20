@@ -76,6 +76,45 @@ OPENAPI_WARRANT_HEADERS = {
 TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
 TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
 
+
+# ============================================================
+# FinMind 歷史 + MoneyDJ 最新交易日混合模式
+# ============================================================
+# 正常流程仍以 FinMind 為主；只有台北時間盤後且 FinMind 尚未取得目標交易日時，
+# 才以 MoneyDJ 單日資料整日取代該交易日。MoneyDJ 與 FinMind 歷史流程平行執行。
+HYBRID_MONEYDJ_LATEST_DAY_ENABLE = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_LATEST_DAY_ENABLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+HYBRID_MONEYDJ_FORCE_ENABLE = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_FORCE_ENABLE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+HYBRID_MONEYDJ_START_HOUR = int(os.getenv("WARRANT_HYBRID_MONEYDJ_START_HOUR", "18"))
+HYBRID_MONEYDJ_START_MINUTE = int(os.getenv("WARRANT_HYBRID_MONEYDJ_START_MINUTE", "20"))
+HYBRID_MONEYDJ_API4_WORKERS = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API4_WORKERS", "40")))
+HYBRID_MONEYDJ_API5_WORKERS = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API5_WORKERS", "50")))
+HYBRID_MONEYDJ_API5_DAYS = max(2, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API5_DAYS", "5")))
+HYBRID_MONEYDJ_RETRIES = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRIES", "3")))
+HYBRID_MONEYDJ_RETRY_WAIT = float(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRY_WAIT", "1.5"))
+HYBRID_MONEYDJ_STRICT_COMPLETENESS = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
+MONEYDJ_API4 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
+    "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={start}&d={end}"
+    "&revision=2018_07_31_1"
+)
+MONEYDJ_API5 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/"
+    "twWarrantData.xdjjson?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}"
+    "&revision=2018_07_31_1"
+)
+MONEYDJ_HEADERS = {
+    "User-Agent": HDR["User-Agent"],
+    "Accept": "*/*",
+    "Referer": "https://pscnetsecrwd.moneydj.com/",
+}
+
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
@@ -16237,6 +16276,261 @@ def _finmind_replace_latest_day_with_warrant_api(
 
 
 
+
+def _hybrid_moneydj_should_run(latest_day) -> bool:
+    """僅在台北當日盤後啟動 MoneyDJ；午夜後回到 FinMind 主流程。"""
+    if not HYBRID_MONEYDJ_LATEST_DAY_ENABLE:
+        return False
+    if HYBRID_MONEYDJ_FORCE_ENABLE:
+        return True
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    day = pd.Timestamp(latest_day).normalize()
+    today = pd.Timestamp(now.date()).normalize()
+    start_minute = HYBRID_MONEYDJ_START_HOUR * 60 + HYBRID_MONEYDJ_START_MINUTE
+    now_minute = now.hour * 60 + now.minute
+    return day == today and now_minute >= start_minute
+
+
+def _hybrid_moneydj_get_json(url: str):
+    last_error = None
+    for attempt in range(1, HYBRID_MONEYDJ_RETRIES + 1):
+        try:
+            response = get_thread_session().get(
+                url,
+                headers=MONEYDJ_HEADERS,
+                timeout=(5, 18),
+            )
+            response.raise_for_status()
+            text = response.content.decode("utf-8", errors="replace")
+            return json.loads(text)
+        except Exception as exc:
+            last_error = exc
+            if attempt < HYBRID_MONEYDJ_RETRIES:
+                time.sleep(HYBRID_MONEYDJ_RETRY_WAIT * attempt)
+    raise RuntimeError(str(last_error or "MoneyDJ request failed"))
+
+
+def _hybrid_moneydj_api4_one(warrant: dict, target_day: pd.Timestamp) -> tuple[list, str]:
+    code = normalize_openapi_warrant_code(warrant.get("warrant_code", ""))
+    day_s = pd.Timestamp(target_day).strftime("%Y/%m/%d")
+    try:
+        payload = _hybrid_moneydj_get_json(
+            MONEYDJ_API4.format(code=code, start=day_s, end=day_s)
+        )
+        rows = []
+        for item in (payload if isinstance(payload, list) else [payload]):
+            if isinstance(item, dict):
+                rows.extend(item.get("ResultSet", {}).get("Result", []) or [])
+        return rows, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _hybrid_moneydj_api5_one(pair: dict, target_day: pd.Timestamp) -> tuple[list, str]:
+    code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
+    broker = str(pair.get("broker_code", "") or "").strip()
+    try:
+        payload = _hybrid_moneydj_get_json(
+            MONEYDJ_API5.format(
+                warrant=code,
+                broker=broker,
+                days=HYBRID_MONEYDJ_API5_DAYS,
+            )
+        )
+        result_set = (
+            payload[0].get("ResultSet", {})
+            if isinstance(payload, list) and payload
+            else payload.get("ResultSet", {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        api_rows = result_set.get("Result", []) or []
+        out = []
+        day = pd.Timestamp(target_day).normalize()
+        for row in api_rows:
+            dt = parse_date(row.get("V1", ""))
+            if not dt or pd.Timestamp(dt).normalize() != day:
+                continue
+            try:
+                buy_shares = int(float(row.get("V2", 0) or 0))
+                sell_shares = int(float(row.get("V3", 0) or 0))
+                buy_amount = float(row.get("V4", 0) or 0) * 1000.0
+                sell_amount = float(row.get("V5", 0) or 0) * 1000.0
+            except Exception:
+                continue
+            if buy_amount == 0 and sell_amount == 0:
+                continue
+            net_amount = buy_amount - sell_amount
+            out.append({
+                "Date": day,
+                "branch": normalize_branch_name(pair.get("branch", "")),
+                "broker_code": broker,
+                "warrant_code": code,
+                "warrant_name": str(pair.get("warrant_name", "") or code),
+                "underlying_code": str(pair.get("underlying_code", "") or ""),
+                "underlying_name": str(pair.get("underlying_name", "") or ""),
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "net_amount": net_amount,
+                "buy_shares": buy_shares,
+                "sell_shares": sell_shares,
+                "side": "買超" if net_amount >= 0 else "賣超",
+                "data_source": "MoneyDJ_latest_day",
+            })
+        return out, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _hybrid_moneydj_latest_day_events(
+    summary: pd.DataFrame,
+    latest_day,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+) -> tuple[pd.DataFrame, dict]:
+    """只抓目標交易日，不重抓歷史；API4 找當日分點，API5 只保留目標日。"""
+    started = time.perf_counter()
+    day = pd.Timestamp(latest_day).normalize()
+    active_codes = sorted(_finmind_active_warrant_codes(summary, day))
+    warrants = [
+        {
+            "warrant_code": code,
+            "warrant_name": str(warrant_name_map.get(code, "") or code),
+            "underlying_code": _normalize_stock_name_code_key(stock_code),
+            "underlying_name": str(stock_name or ""),
+        }
+        for code in active_codes
+        if code
+    ]
+    stats = {
+        "requested_date": day.strftime("%Y-%m-%d"),
+        "active_codes": len(warrants),
+        "api4_failed": 0,
+        "api4_empty": 0,
+        "pairs": 0,
+        "api5_failed": 0,
+        "event_rows": 0,
+        "elapsed": 0.0,
+    }
+    if not warrants:
+        return pd.DataFrame(), stats
+
+    print(
+        f"🚀 MoneyDJ 最新日單日補丁啟動：{stock_code}｜{day.date()}｜"
+        f"權證={len(warrants):,}｜API4 workers={HYBRID_MONEYDJ_API4_WORKERS}"
+    )
+    pairs = {}
+    with ThreadPoolExecutor(max_workers=HYBRID_MONEYDJ_API4_WORKERS) as executor:
+        future_map = {
+            executor.submit(_hybrid_moneydj_api4_one, warrant, day): warrant
+            for warrant in warrants
+        }
+        for future in as_completed(future_map):
+            warrant = future_map[future]
+            rows, error = future.result()
+            if error:
+                stats["api4_failed"] += 1
+                continue
+            if not rows:
+                stats["api4_empty"] += 1
+                continue
+            for row in rows:
+                broker_code = str(row.get("V2", "") or "").strip()
+                if not broker_code:
+                    continue
+                pair = dict(warrant)
+                pair["broker_code"] = broker_code
+                pair["branch"] = normalize_branch_name(row.get("V3", ""))
+                pairs[(pair["warrant_code"], broker_code)] = pair
+
+    stats["pairs"] = len(pairs)
+    if stats["api4_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+        raise RuntimeError(
+            f"MoneyDJ API4 單日補丁不完整：failed={stats['api4_failed']}/"
+            f"{stats['active_codes']}"
+        )
+    if not pairs:
+        stats["elapsed"] = time.perf_counter() - started
+        print(
+            f"ℹ️ MoneyDJ 最新日單日補丁無 pair：{stock_code}｜{day.date()}｜"
+            f"API4 empty={stats['api4_empty']}｜failed={stats['api4_failed']}"
+        )
+        return pd.DataFrame(), stats
+
+    event_rows = []
+    pair_values = list(pairs.values())
+    with ThreadPoolExecutor(max_workers=HYBRID_MONEYDJ_API5_WORKERS) as executor:
+        future_map = {
+            executor.submit(_hybrid_moneydj_api5_one, pair, day): pair
+            for pair in pair_values
+        }
+        for future in as_completed(future_map):
+            rows, error = future.result()
+            if error:
+                stats["api5_failed"] += 1
+                continue
+            event_rows.extend(rows)
+
+    if stats["api5_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+        raise RuntimeError(
+            f"MoneyDJ API5 單日補丁不完整：failed={stats['api5_failed']}/"
+            f"{stats['pairs']}"
+        )
+
+    events = pd.DataFrame(event_rows)
+    if not events.empty:
+        events = _fill_warrant_event_missing_values(events)
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+        events = events.dropna(subset=["Date"])
+        # 同一權證、同一分點、同一天若端點回傳重複列，先合計成單一事件。
+        group_cols = [
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "data_source",
+        ]
+        events = events.groupby(group_cols, as_index=False, dropna=False).agg({
+            "buy_amount": "sum",
+            "sell_amount": "sum",
+            "net_amount": "sum",
+            "buy_shares": "sum",
+            "sell_shares": "sum",
+        })
+        events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
+        events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+        events.attrs["_warrant_events_normalized"] = True
+
+    stats["event_rows"] = int(len(events))
+    stats["elapsed"] = time.perf_counter() - started
+    print(
+        f"✅ MoneyDJ 最新日單日補丁完成：{stock_code}｜{day.date()}｜"
+        f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
+        f"API4 failed={stats['api4_failed']}｜API5 failed={stats['api5_failed']}｜"
+        f"{stats['elapsed']:.2f}秒"
+    )
+    return events, stats
+
+
+def _hybrid_replace_day_with_moneydj(
+    events: pd.DataFrame,
+    moneydj_events: pd.DataFrame,
+    latest_day,
+) -> pd.DataFrame:
+    """MoneyDJ 有完整目標日事件時，整日替換，禁止與 FinMind 同日重複。"""
+    if moneydj_events is None or moneydj_events.empty:
+        return events
+    day = pd.Timestamp(latest_day).normalize()
+    base = events.copy() if events is not None else pd.DataFrame()
+    if not base.empty:
+        base["Date"] = pd.to_datetime(base["Date"], errors="coerce").dt.normalize()
+        base = base.dropna(subset=["Date"])
+        base = base[base["Date"] != day].copy()
+    merged = _concat_warrant_event_frames([base, moneydj_events])
+    merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
+    merged = merged.dropna(subset=["Date"])
+    merged = merged.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    merged.attrs["_warrant_events_normalized"] = True
+    return merged
+
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date, cancel_event: threading.Event | None = None) -> pd.DataFrame:
     """FinMind 權證分點主流程。
 
@@ -16281,6 +16575,24 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         return pd.DataFrame(columns=empty_columns)
     trading_dates = [pd.Timestamp(day).normalize() for day in trading_dates]
     latest_day = trading_dates[-1]
+
+    # MoneyDJ 只負責當日補丁，與 FinMind 歷史／最新日流程平行進行。
+    moneydj_executor = None
+    moneydj_future = None
+    if _hybrid_moneydj_should_run(latest_day):
+        moneydj_executor = ThreadPoolExecutor(max_workers=1)
+        moneydj_future = moneydj_executor.submit(
+            _hybrid_moneydj_latest_day_events,
+            summary,
+            latest_day,
+            warrant_name_map,
+            code,
+            stock_name,
+        )
+        print(
+            f"🚀 混合資料源平行啟動：FinMind 歷史／最新日 + MoneyDJ {latest_day.date()} 單日補丁"
+        )
+
     # API 啟用時，最後一個交易日由逐權證 API 完整取代；API 關閉時，
     # 最後一日仍必須保留在 Parquet 歷史路徑，不能平白少掉最新交易日。
     historical_dates = (
@@ -16393,6 +16705,8 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         latest_cancel_event.set()
         if latest_executor is not None:
             latest_executor.shutdown(wait=False, cancel_futures=True)
+        if moneydj_executor is not None:
+            moneydj_executor.shutdown(wait=False, cancel_futures=True)
         samples = "；".join(f"{day}:{error[:120]}" for day, error in historical_failures[:5])
         raise RuntimeError(
             f"FinMind 歷史權證分點不完整：失敗 {len(historical_failures)}/{len(historical_jobs)} 日｜{samples}"
@@ -16517,6 +16831,47 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         precomputed_api_stats=latest_api_stats,
     )
 
+    # FinMind 已有目標日資料時維持 FinMind；只有 FinMind 落後且 MoneyDJ 已有目標日，
+    # 才將該日整日替換成 MoneyDJ，避免同日雙來源重複。
+    latest_source_override = ""
+    moneydj_stats = {}
+    if moneydj_future is not None:
+        try:
+            moneydj_events, moneydj_stats = moneydj_future.result()
+        except Exception as exc:
+            moneydj_events, moneydj_stats = pd.DataFrame(), {"error": str(exc)}
+            print(f"⚠️ MoneyDJ 最新日補丁失敗，保留 FinMind 結果：{code}｜{exc}")
+        finally:
+            moneydj_executor.shutdown(wait=True)
+
+        finmind_dates = (
+            pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
+            if events is not None and not events.empty and "Date" in events.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        finmind_has_target_day = bool((finmind_dates == latest_day).any())
+        moneydj_has_target_day = bool(
+            moneydj_events is not None
+            and not moneydj_events.empty
+            and (pd.to_datetime(moneydj_events["Date"], errors="coerce").dt.normalize() == latest_day).any()
+        )
+        if not finmind_has_target_day and moneydj_has_target_day:
+            events = _hybrid_replace_day_with_moneydj(events, moneydj_events, latest_day)
+            latest_source_override = "MoneyDJ單日補丁"
+            latest_api_stats["event_rows"] = int(len(moneydj_events))
+            latest_api_stats["fallback_used"] = False
+            latest_api_stats["resolved_date"] = latest_day.strftime("%Y-%m-%d")
+            latest_api_stats["hybrid_moneydj_used"] = True
+            latest_api_stats["hybrid_moneydj_stats"] = moneydj_stats
+            print(
+                f"🔀 混合資料源切換成功：FinMind 歷史 + MoneyDJ 最新日｜"
+                f"{code}｜{latest_day.date()}｜MoneyDJ事件={len(moneydj_events):,}"
+            )
+        elif finmind_has_target_day:
+            print(f"✅ FinMind 已有目標日資料，MoneyDJ 補丁不採用：{code}｜{latest_day.date()}")
+        else:
+            print(f"ℹ️ FinMind 與 MoneyDJ 均尚無目標日，維持最近有效交易日：{code}｜{latest_day.date()}")
+
     latest_failed = int(latest_api_stats.get("failed_codes", 0) or 0)
     latest_success = int(latest_api_stats.get("success_codes", 0) or 0)
     latest_active = int(latest_api_stats.get("active_codes", 0) or 0)
@@ -16566,7 +16921,9 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         return pd.DataFrame(columns=empty_columns)
     events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
     latest_source_label = (
-        "API尚未更新，回退最近有效交易日"
+        latest_source_override
+        if latest_source_override
+        else "API尚未更新，回退最近有效交易日"
         if latest_fallback_used
         else "平行權證代號API"
         if FINMIND_WARRANT_LATEST_DAY_API_ENABLE and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE
@@ -17070,6 +17427,19 @@ def _apply_finmind_current_day_safety_guard(
     kept = out.loc[~current_mask].copy()
     if current_rows.empty:
         return out
+
+    # 混合模式的 MoneyDJ 當日補丁本來就是在官方 OpenAPI／FinMind 尚未發布時使用；
+    # 不能再套用 FinMind 的官方發布前完整性退回，否則 18:30～FinMind 更新前會被刪掉。
+    if "data_source" in current_rows.columns:
+        source_values = current_rows["data_source"].fillna("").astype(str)
+        if source_values.str.contains("MoneyDJ_latest_day", regex=False).any():
+            out.attrs["finmind_guard_status"] = "moneydj_latest_day_keep"
+            out.attrs["hybrid_latest_date"] = taipei_today.strftime("%Y-%m-%d")
+            print(
+                "✅ 混合模式最新日由 MoneyDJ 提供：略過 FinMind 官方發布前退回保護｜"
+                f"日期={taipei_today.date()}｜事件={len(current_rows):,}筆"
+            )
+            return out
 
     audit = _finmind_current_day_official_volume_audit(
         out,
