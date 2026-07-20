@@ -1,0 +1,321 @@
+name: Warrant Backtest Google Sheet - MoneyDJ New Excel
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_plan:
+        description: "執行方案"
+        required: true
+        default: "每日自動流程"
+        type: choice
+        options:
+          - "每日自動流程"
+          - "精選五分點新分類"
+          - "長期留單補價格"
+          - "完整修補模式"
+
+  # 測試期間停用排程，只保留 workflow_dispatch。
+  # 驗證 MoneyDJ 資料正確後，再與 FinMind 工作流程錯開至少 30 分鐘啟用。
+
+
+permissions:
+  contents: read
+  actions: write
+
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      # ============================================================
+      # 路徑與程式
+      # ============================================================
+      OUTPUT_DIR: output
+      CACHE_DIR: warrant_cache
+      PYTHON_FILE: warrant_backtest_moneydj.py
+
+      # ============================================================
+      # MoneyDJ 資料來源
+      # API4：近期權證分點候選與最新市場日期
+      # API5：權證＋分點歷史買賣資料
+      # ============================================================
+      MONEYDJ_HISTORY_WORKERS: "50"
+      MONEYDJ_PRESCAN_WORKERS: "60"
+      MONEYDJ_FIND_BROKER_WORKERS: "40"
+      MONEYDJ_RECENT_SCAN_DAYS: "50"
+      MONEYDJ_API5_HISTORY_LIMIT: "200"
+      MONEYDJ_MAX_RETRIES: "3"
+      MONEYDJ_RETRY_BASE_SECONDS: "1.0"
+      MONEYDJ_ISIN_TIMEOUT_SECONDS: "30"
+      MONEYDJ_CACHE_INCREMENTAL_UPDATE_ENABLED: "1"
+
+      # MoneyDJ 完整性保護：
+      # API4 成功率低於 98%，或 API5 有連線／解析失敗時，
+      # 本次停止同步 Google Sheet，避免產生不完整報表。
+      MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO: "0.98"
+      MONEYDJ_API5_STRICT: "1"
+
+      # ============================================================
+      # 權證／標的身分防錯
+      # ============================================================
+      WARRANT_IDENTITY_RECONCILE_ENABLED: "1"
+      WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX: "3"
+      WARRANT_IDENTITY_REPAIR_HISTORY: "1"
+      GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "1"
+
+      # ============================================================
+      # 基本快取
+      # ============================================================
+      USE_CACHE: "1"
+      FORCE_FULL_CACHE_REFRESH: "0"
+      CACHE_AUTO_PRUNE_ENABLED: "1"
+      HISTORY_RETENTION_TRADING_DAYS: "200"
+      PRICE_RETENTION_TRADING_DAYS: "260"
+
+      # ============================================================
+      # 精選五分點
+      # ============================================================
+      SELECTED_TARGET_LABELS: "華南永昌台中,元大南屯,富邦敦南,永豐金內湖,新光"
+
+      # ============================================================
+      # 價格與報表規則
+      # ============================================================
+      FETCH_GROUP_WARRANT_PRICES: "0"
+      PRICE_WORKERS: "60"
+
+      TOP15_CACHE_ENABLED: "1"
+      TOP15_LOOKBACK_TRADING_DAYS: "40"
+      TOP15_PRICE_LOOKBACK_DAYS: "75"
+      TOP15_TARGET_PRICE_REFETCH_DAYS: "12"
+      TOP15_REQUIRE_TARGET_DATE_PRICE: "1"
+      TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN: "1"
+      TOP15_MIN_BROKER_REMAINING_COST: "100000"
+
+      TOP15_LP_QUOTE_FALLBACK_ENABLED: "0"
+      TOP15_LP_QUOTE_TIMEOUT_SECONDS: "15"
+      TOP15_LP_QUOTE_WORKERS: "10"
+      TOP15_LP_ALLOW_IMPLICIT_LATEST_DATE: "0"
+      TOP15_LAST_TRADE_FALLBACK_ENABLED: "1"
+      TOP15_LAST_TRADE_FALLBACK_MAX_DAYS: "75"
+      TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT: "60"
+
+      SELL_DETAIL_DAYS: "3"
+
+      # ============================================================
+      # 完整修補延伸報表
+      # 每日流程只同步八張主要工作表；完整修補模式才建立延伸報表。
+      # ============================================================
+      RECENT_RANKING_DAYS: "62"
+      WARRANT_CONSENSUS_7D_ENABLED: "1"
+      WARRANT_CONSENSUS_7D_DAYS: "7"
+      WARRANT_CONSENSUS_14D_DAYS: "14"
+      WARRANT_CONSENSUS_21D_DAYS: "21"
+      WARRANT_CONSENSUS_7D_TOP_N: "15"
+      BROKER_10D_DETAIL_ENABLED: "1"
+      BROKER_10D_WINRATE_RANK_ENABLED: "1"
+      BROKER_10D_DETAIL_DAYS: "10"
+
+      # ============================================================
+      # 長期留單
+      # ============================================================
+      LONGTERM_OPEN_DAYS: "120,150,180"
+      LONGTERM_PRICE_LOOKBACK_DAYS: "420"
+      LONGTERM_PRICE_STALE_DAYS: "10"
+      LONGTERM_ZERO_PRICE_THRESHOLD: "0.05"
+      LONGTERM_UPDATE_WINRATE_SHEET: "1"
+      LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET: "0"
+
+      # ============================================================
+      # Google Sheet
+      # 工作表不存在時才建立；已存在時只 insert 缺少資料。
+      # 不清空、不重建任何既有工作表。
+      # ============================================================
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
+
+      GSHEET_CACHE_ENABLED: "0"
+      GSHEET_RESULT_ENABLED: "1"
+      GSHEET_RESULT_UPSERT_ENABLED: "1"
+      GSHEET_CLEAN_DELETED_BROKER_ROWS: "1"
+
+      GSHEET_WRITE_SLEEP_SECONDS: "0.05"
+      GSHEET_WRITE_RATE_PER_MINUTE: "45"
+      GSHEET_WRITE_BURST: "5"
+      GSHEET_MAX_RETRIES: "6"
+      GSHEET_RETRY_BASE_SECONDS: "12"
+
+      GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
+
+      # ============================================================
+      # Supabase
+      # 要啟用時改成 1，並在 GitHub Secrets 設定 SUPABASE_DB_URL。
+      # ============================================================
+      SUPABASE_CACHE_ENABLED: "0"
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      SUPABASE_SCHEMA: "warrant_cache"
+      SUPABASE_BATCH_SIZE: "5000"
+
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Restore MoneyDJ local cache
+        id: moneydj-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+            warrant-cache-moneydj-v10-${{ runner.os }}-
+            warrant-cache-moneydj-v7-${{ runner.os }}-
+
+      - name: Resolve run settings
+        shell: bash
+        run: |
+          PLAN="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_plan || '每日自動流程' }}"
+
+          WORKFLOW_MODE="daily"
+          RUN_MODE="2"
+          INITIAL_HISTORY_DAYS="200"
+          DAILY_UPDATE_DAYS="3"
+
+          case "$PLAN" in
+            "每日自動流程")
+              ;;
+
+            "精選五分點新分類")
+              RUN_MODE="1"
+              ;;
+
+            "長期留單補價格")
+              WORKFLOW_MODE="longterm"
+              RUN_MODE="2"
+              ;;
+
+            "完整修補模式")
+              WORKFLOW_MODE="repair"
+              RUN_MODE="2"
+              INITIAL_HISTORY_DAYS="200"
+              DAILY_UPDATE_DAYS="5"
+              ;;
+
+            *)
+              echo "不支援的執行方案：$PLAN"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "WORKFLOW_MODE=$WORKFLOW_MODE"
+            echo "RUN_MODE=$RUN_MODE"
+            echo "INITIAL_HISTORY_DAYS=$INITIAL_HISTORY_DAYS"
+            echo "DAILY_UPDATE_DAYS=$DAILY_UPDATE_DAYS"
+          } >> "$GITHUB_ENV"
+
+          echo "=========================================="
+          echo "執行方案：$PLAN"
+          echo "WORKFLOW_MODE：$WORKFLOW_MODE"
+          echo "RUN_MODE：$RUN_MODE"
+          echo "INITIAL_HISTORY_DAYS：$INITIAL_HISTORY_DAYS"
+          echo "DAILY_UPDATE_DAYS：$DAILY_UPDATE_DAYS"
+          echo "資料來源：MoneyDJ API4／API5"
+          echo "=========================================="
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          fi
+
+          pip install \
+            requests \
+            pandas \
+            openpyxl \
+            pyarrow \
+            lxml \
+            html5lib \
+            beautifulsoup4 \
+            gspread \
+            google-auth \
+            "psycopg[binary]"
+
+      - name: Run MoneyDJ ABCDE warrant backtest
+        shell: bash
+        run: |
+          mkdir -p output warrant_cache
+
+          SCRIPT_PATH="$PYTHON_FILE"
+
+          # MoneyDJ workflow 僅允許執行 MoneyDJ 專用檔名，禁止退回 FinMind warrant_backtest.py。
+          if [[ ! -f "$SCRIPT_PATH" ]]; then
+            if [[ -f "warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py" ]]; then
+              SCRIPT_PATH="warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
+            else
+              echo "找不到 MoneyDJ 程式碼：$PYTHON_FILE 或 warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
+              echo "目前倉庫內的 Python 檔案："
+              find . -maxdepth 2 -type f -name "*.py" -print
+              exit 1
+            fi
+          fi
+
+          echo "執行程式：$SCRIPT_PATH"
+          python "$SCRIPT_PATH"
+
+      - name: Save MoneyDJ local cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Prune old MoneyDJ caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_PREFIX: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+        shell: bash
+        run: |
+          echo "保留同分支最新3份MoneyDJ cache，刪除更舊項目。"
+          mapfile -t OLD_CACHE_IDS < <(
+            gh cache list \
+              --repo "$GITHUB_REPOSITORY" \
+              --key "$CACHE_PREFIX" \
+              --ref "$GITHUB_REF" \
+              --sort created_at \
+              --order desc \
+              --limit 100 \
+              --json id \
+              --jq '.[3:][] | .id'
+          )
+
+          if [ "${#OLD_CACHE_IDS[@]}" -eq 0 ]; then
+            echo "沒有需要刪除的舊MoneyDJ cache。"
+            exit 0
+          fi
+
+          for cache_id in "${OLD_CACHE_IDS[@]}"; do
+            echo "刪除舊MoneyDJ cache id=$cache_id"
+            gh cache delete "$cache_id" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Upload Excel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warrant-backtest-moneydj-new-excel
+          path: output/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 14
