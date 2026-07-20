@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260719-V8"
+PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-PERFORMANCE-FIXED-20260720-V10"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -8235,10 +8235,16 @@ def _load_finmind_state():
             with open(FINMIND_STATE_PATH, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
                 if isinstance(payload, dict):
+                    payload.setdefault("completed_dates", [])
+                    payload.setdefault("failed_dates", [])
                     return payload
-    except Exception:
-        pass
-    return {"completed_dates": []}
+    except Exception as exc:
+        print(f"  ⚠️ FinMind 狀態檔讀取失敗：{type(exc).__name__}: {exc}")
+    return {
+        "schema_version": "",
+        "completed_dates": [],
+        "failed_dates": [],
+    }
 
 
 def _save_finmind_state(state):
@@ -8249,13 +8255,83 @@ def _save_finmind_state(state):
     os.replace(tmp, FINMIND_STATE_PATH)
 
 
+def _normalize_finmind_state_dates(values):
+    normalized = set()
+    for value in values or []:
+        dt = parse_date(value)
+        if dt:
+            normalized.add(dt.strftime("%Y/%m/%d"))
+    return normalized
 
-def _run_finmind_refresh_dates(target_date, history_df, force_full=False):
+
+def _history_cache_compatibility(history_df):
+    """檢查標準化歷史快取是否可直接沿用，並回傳其實際涵蓋交易日期。"""
+    required_cols = {
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    }
+
+    if history_df is None or history_df.empty:
+        return False, "歷史快取不存在或為空", set()
+
+    missing_cols = sorted(required_cols - set(history_df.columns))
+    if missing_cols:
+        return False, f"缺少欄位：{','.join(missing_cols)}", set()
+
+    history_dates = set()
+    invalid_dates = 0
+    try:
+        for raw_date in history_df["日期"].tolist():
+            dt = parse_date(raw_date)
+            if dt:
+                history_dates.add(dt.strftime("%Y/%m/%d"))
+            elif str(raw_date).strip():
+                invalid_dates += 1
+    except Exception as exc:
+        return False, f"日期欄讀取失敗：{type(exc).__name__}: {exc}", set()
+
+    if not history_dates:
+        return False, "歷史快取沒有可解析日期", set()
+    if invalid_dates > 0:
+        return False, f"歷史快取有 {invalid_dates:,} 筆無法解析日期", history_dates
+
+    return True, "格式相容", history_dates
+
+
+def _finmind_raw_daily_cache_file_count():
+    try:
+        return sum(
+            1
+            for filename in os.listdir(FINMIND_DAILY_CACHE_DIR)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.parquet", filename)
+        )
+    except Exception:
+        return 0
+
+
+def _run_finmind_refresh_dates(
+    target_date,
+    history_df,
+    force_full=False,
+    completed_dates=None,
+    failed_dates=None,
+):
+    """
+    決定本輪真正需要下載的FinMind交易日。
+
+    daily／longterm：維持最近 DAILY_UPDATE_DAYS 日重新確認，並加入過去失敗日。
+    repair：以最近 INITIAL_HISTORY_DAYS 日為完整性窗口，但只下載歷史快取／state尚未完成的日期、
+            過去失敗日與本次目標日，不再每輪無條件重抓200日。
+    強制重建或歷史快取不存在時：才下載完整保留窗口。
+    """
     trading_dates = get_finmind_trading_dates()
     target_dt = parse_date(target_date) or datetime.today()
-    eligible = [d for d in trading_dates if d <= target_dt.date()]
+    target_day = target_dt.date()
+    eligible = [d for d in trading_dates if d <= target_day]
     if not eligible:
-        eligible = [target_dt.date()]
+        eligible = [target_day]
 
     recent_count = max(int(os.getenv("DAILY_UPDATE_DAYS", "3")), 1)
     repair_count = min(
@@ -8263,46 +8339,130 @@ def _run_finmind_refresh_dates(target_date, history_df, force_full=False):
         HISTORY_RETENTION_TRADING_DAYS,
     )
 
+    completed_keys = _normalize_finmind_state_dates(completed_dates)
+    failed_keys = _normalize_finmind_state_dates(failed_dates)
+
+    history_keys = set()
+    if history_df is not None and not history_df.empty and "日期" in history_df.columns:
+        history_keys = _normalize_finmind_state_dates(history_df["日期"].tolist())
+
+    available_keys = completed_keys | history_keys
+    repair_window = eligible[-repair_count:]
+    repair_window_keys = {d.strftime("%Y/%m/%d") for d in repair_window}
+
+    # failed_dates只保留仍落在目前200日保留窗口內的日期，避免永久追逐已超期資料。
+    failed_keys &= repair_window_keys | {target_dt.strftime("%Y/%m/%d")}
+
     history_empty = history_df is None or history_df.empty
-    if force_full or workflow_is_repair() or FORCE_FULL_CACHE_REFRESH or (history_empty and FINMIND_INITIAL_BACKFILL_ON_EMPTY):
-        count = repair_count
+    if force_full or FORCE_FULL_CACHE_REFRESH or (
+        history_empty and FINMIND_INITIAL_BACKFILL_ON_EMPTY
+    ):
+        selected_days = set(repair_window)
+    elif workflow_is_repair():
+        missing_days = {
+            day
+            for day in repair_window
+            if day.strftime("%Y/%m/%d") not in available_keys
+        }
+        selected_days = missing_days | {
+            parse_date(date_key).date()
+            for date_key in failed_keys
+            if parse_date(date_key)
+        }
     else:
-        count = recent_count
+        # daily／longterm保留原本最近數日重新確認的行為。
+        selected_days = set(eligible[-recent_count:]) | {
+            parse_date(date_key).date()
+            for date_key in failed_keys
+            if parse_date(date_key)
+        }
 
-    selected = eligible[-count:]
-    target_day = target_dt.date()
-    if target_day not in selected:
-        selected.append(target_day)
-    return [d.strftime("%Y/%m/%d") for d in sorted(set(selected))]
-
-
+    selected_days.add(target_day)
+    return [d.strftime("%Y/%m/%d") for d in sorted(selected_days)]
 
 
 def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, preloaded_target_df=None):
     global _FINMIND_TARGET_DATE_OK, _FINMIND_TARGET_DATE
 
+    state_file_exists = os.path.exists(FINMIND_STATE_PATH)
     state = _load_finmind_state()
-    schema_reset = state.get("schema_version") != FINMIND_CACHE_SCHEMA_VERSION
-    if schema_reset:
-        print(
-            f"  ♻️ 偵測到舊資料源／舊快取格式，將以 FinMind 完整重建最近 "
-            f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日，不沿用舊原始分點歷史。"
-        )
+    state_schema = str(state.get("schema_version", "") or "").strip()
+    state_completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
+    state_failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+
+    history_compatible, history_reason, history_dates = _history_cache_compatibility(history_df)
+    explicit_force_full = bool(FORCE_FULL_CACHE_REFRESH)
+    full_rebuild_required = not history_compatible
+
+    if history_compatible:
+        state_completed_dates.update(history_dates)
+        if state_schema != FINMIND_CACHE_SCHEMA_VERSION:
+            if state_file_exists:
+                print(
+                    "  ⚠️ FinMind 狀態版本缺少／不同，但歷史快取格式相容，"
+                    "已接管既有快取並重建狀態檔，不執行200日重建。"
+                )
+            else:
+                print(
+                    "  ⚠️ FinMind 狀態檔遺失，但歷史快取格式相容，"
+                    "已接管既有快取並重建狀態檔，不執行200日重建。"
+                )
+    else:
+        # 歷史本體不存在或格式真的不相容時，completed_dates不可拿來跳過下載。
+        state_completed_dates = set()
         history_df = pd.DataFrame()
+        if explicit_force_full:
+            print(
+                f"  ♻️ FORCE_FULL_CACHE_REFRESH=1，將以FinMind完整重建最近 "
+                f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日。"
+            )
+        else:
+            print(
+                f"  ♻️ FinMind歷史快取無法沿用（{history_reason}），將完整建立最近 "
+                f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日。"
+            )
 
     refresh_dates = _run_finmind_refresh_dates(
         target_date,
         history_df,
-        force_full=schema_reset,
+        force_full=full_rebuild_required or explicit_force_full,
+        completed_dates=state_completed_dates,
+        failed_dates=state_failed_dates,
     )
     target_key = normalize_date_str(target_date)
     previous_empty = history_df is None or history_df.empty
     combined = history_df.copy() if history_df is not None else pd.DataFrame()
-    completed_dates = set(str(x) for x in state.get("completed_dates", []) if str(x).strip())
+    completed_dates = set(state_completed_dates)
     success_dates = []
     failed_dates = []
     normalized_by_date = {}
     target_status = "error"
+
+    print(
+        "  🧭 FinMind快取狀態："
+        f"state檔={'存在' if state_file_exists else '不存在'}｜"
+        f"schema={state_schema or '-'}｜"
+        f"歷史快取={len(combined):,}列/{len(history_dates):,}日｜"
+        f"原始日檔={_finmind_raw_daily_cache_file_count():,}份"
+    )
+    print(
+        "  🧭 FinMind刷新計畫："
+        f"completed_dates={len(state_completed_dates):,}日｜"
+        f"failed_dates={len(state_failed_dates):,}日｜"
+        f"本次需下載={len(refresh_dates):,}日｜"
+        f"模式={WORKFLOW_MODE}"
+    )
+
+    # 下載開始前先把本輪日期記為待重試。
+    # 若Python中途失敗，GitHub Actions的cache/save（if: always()）仍會保存這份狀態；
+    # 下一輪只重試這些日期，不會因狀態遺失重新下載200日。
+    planned_retry_dates = state_failed_dates | set(refresh_dates)
+    state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["failed_dates"] = sorted(planned_retry_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["refresh_in_progress_dates"] = list(refresh_dates)
+    state["last_refresh_started_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+    _save_finmind_state(state)
 
     print(
         f"【Step 3】FinMind 全市場權證分點批次更新：{len(refresh_dates):,} 個交易日｜"
@@ -8355,16 +8515,6 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     if success_dates:
         combined = _merge_complete_finmind_days(combined, normalized_by_date, broker_map)
 
-    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
-    state["last_target_date"] = target_key
-    state["last_target_status"] = target_status
-    state["updated_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-    if not failed_dates and len(success_dates) == len(refresh_dates):
-        state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
-    else:
-        state.pop("schema_version", None)
-    _save_finmind_state(state)
-
     combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
     if identity_stats.get("rows", 0) > 0:
         print(
@@ -8378,13 +8528,46 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
         combined = save_history_cache(combined, fetched_items=None, previous_history_empty=previous_empty)
     prune_finmind_daily_raw_cache(keep_date=target_key)
 
+    # 只有成功日期會從failed_dates移除；單日失敗不再刪除schema_version。
+    remaining_failed_dates = planned_retry_dates - set(success_dates)
+    remaining_failed_dates.update(failed_dates)
+    completed_dates.update(
+        _normalize_finmind_state_dates(combined["日期"].tolist())
+        if combined is not None and not combined.empty and "日期" in combined.columns
+        else set()
+    )
+
+    state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["failed_dates"] = sorted(remaining_failed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["refresh_in_progress_dates"] = []
+    state["last_refresh_requested_dates"] = list(refresh_dates)
+    state["last_refresh_success_dates"] = sorted(success_dates)
+    state["last_refresh_failed_dates"] = sorted(failed_dates)
+    state["last_target_date"] = target_key
+    state["last_target_status"] = target_status
+    state["history_row_count"] = int(len(combined)) if combined is not None else 0
+    state["history_trading_date_count"] = len(
+        _normalize_finmind_state_dates(combined["日期"].tolist())
+        if combined is not None and not combined.empty and "日期" in combined.columns
+        else []
+    )
+    state["updated_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+    _save_finmind_state(state)
+
+    print(
+        "  ✅ FinMind快取狀態已保存："
+        f"completed_dates={len(state['completed_dates']):,}日｜"
+        f"failed_dates={len(state['failed_dates']):,}日｜"
+        f"schema={state['schema_version']}"
+    )
+
     return combined, {
         "target_status": target_status,
         "success_dates": success_dates,
         "failed_dates": failed_dates,
-        "schema_reset": schema_reset,
+        "schema_reset": full_rebuild_required,
     }
-
 
 
 def _normalized_broker_label_key(value):
