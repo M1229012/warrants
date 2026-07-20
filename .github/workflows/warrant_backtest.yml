@@ -22,6 +22,11 @@ on:
     - cron: "5,35 13 * * 1-5"
 
 
+permissions:
+  contents: read
+  actions: write
+
+
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
@@ -51,7 +56,7 @@ jobs:
 
       # 目標日每次重新確認。
       # daily：最新日未發布就快速結束，避免空抓。
-      # repair：往前找最近已發布交易日作為基準，仍會補抓完整歷史區間。
+      # repair：往前找最近已發布交易日作為基準，只補歷史快取缺少／失敗日期。
       FINMIND_FORCE_REFRESH_TARGET_DATE: "1"
       FINMIND_INITIAL_BACKFILL_ON_EMPTY: "1"
       FINMIND_REPAIR_ALLOW_TARGET_FALLBACK: "1"
@@ -88,7 +93,8 @@ jobs:
       TOP15_REQUIRE_TARGET_DATE_PRICE: "1"
       TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN: "1"
       TOP15_MIN_BROKER_REMAINING_COST: "100000"
-      TOP15_LP_QUOTE_FALLBACK_ENABLED: "1"
+      # 正式LP端點尚未確認，先停用，避免每輪大量無效請求。
+      TOP15_LP_QUOTE_FALLBACK_ENABLED: "0"
       TOP15_LP_QUOTE_TIMEOUT_SECONDS: "15"
       TOP15_LP_QUOTE_WORKERS: "10"
       TOP15_LP_ALLOW_IMPLICIT_LATEST_DATE: "0"
@@ -134,6 +140,7 @@ jobs:
 
       # ============================================================
       # Supabase
+      # 本版只先上快取止血與診斷；Supabase讀回另開一版實作與驗收。
       # ============================================================
       SUPABASE_CACHE_ENABLED: "0"
 
@@ -148,12 +155,21 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Ensure FinMind cache directory
+        shell: bash
+        run: mkdir -p warrant_cache
+
+      # restore與save拆開，讓程式失敗時仍可透過if: always()保存failed_dates狀態。
+      # 每次run使用唯一key保存最新快取，再由restore-keys抓同分支最新一份。
       - name: Restore FinMind local cache
-        uses: actions/cache@v4
+        id: finmind-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: warrant_cache
-          key: warrant-cache-finmind-v2-${{ runner.os }}-${{ github.run_id }}
+          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-
+            warrant-cache-finmind-v3-${{ runner.os }}-
             warrant-cache-finmind-v2-${{ runner.os }}-
 
       - name: Resolve run settings
@@ -182,7 +198,7 @@ jobs:
             "完整修補模式")
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
-              # 重抓完整保留區間，並建立目前缺少的所有完整報表工作表。
+              # 以200日作完整性窗口，但程式只補缺少日、失敗日與本次目標日。
               # 已存在的工作表只增量 insert 缺少資料，不會整表覆寫。
               INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
@@ -215,10 +231,125 @@ jobs:
           pip install -r requirements.txt
           pip install pyarrow
 
+      - name: Inspect restored FinMind cache
+        shell: bash
+        run: |
+          echo "cache-hit=${{ steps.finmind-cache-restore.outputs.cache-hit }}"
+          echo "cache-primary-key=${{ steps.finmind-cache-restore.outputs.cache-primary-key }}"
+          du -sh warrant_cache 2>/dev/null || true
+          find warrant_cache -maxdepth 2 -type f -printf '%p %s bytes\n' | sort | head -200 || true
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          cache_dir = Path("warrant_cache")
+          state_path = cache_dir / "finmind_update_state.json"
+          history_path = cache_dir / "broker_warrant_history_cache.csv.parquet"
+          price_path = cache_dir / "price_cache.csv.parquet"
+          raw_dir = cache_dir / "finmind_warrant_daily"
+
+          print(f"CACHE_DIAG state_exists={state_path.exists()}")
+          if state_path.exists():
+              try:
+                  state = json.loads(state_path.read_text(encoding="utf-8"))
+                  print(
+                      "CACHE_DIAG "
+                      f"schema={state.get('schema_version', '-')} "
+                      f"completed_dates={len(state.get('completed_dates') or [])} "
+                      f"failed_dates={len(state.get('failed_dates') or [])} "
+                      f"updated_at={state.get('updated_at', '-')}"
+                  )
+              except Exception as exc:
+                  print(f"CACHE_DIAG state_read_error={type(exc).__name__}: {exc}")
+
+          try:
+              import pyarrow.parquet as pq
+              for label, path in (("history", history_path), ("price", price_path)):
+                  if path.exists():
+                      meta = pq.ParquetFile(path).metadata
+                      print(f"CACHE_DIAG {label}_rows={meta.num_rows} size={path.stat().st_size}")
+                  else:
+                      print(f"CACHE_DIAG {label}_missing=1")
+          except Exception as exc:
+              print(f"CACHE_DIAG parquet_metadata_error={type(exc).__name__}: {exc}")
+
+          raw_count = len(list(raw_dir.glob("*.parquet"))) if raw_dir.exists() else 0
+          print(f"CACHE_DIAG raw_daily_files={raw_count}")
+          PY
+
       - name: Run warrant backtest
         run: |
           mkdir -p output warrant_cache
           python warrant_backtest.py
+
+      - name: Inspect FinMind cache before save
+        if: always()
+        shell: bash
+        run: |
+          echo "========== FinMind cache before save =========="
+          du -sh warrant_cache 2>/dev/null || true
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          state_path = Path("warrant_cache/finmind_update_state.json")
+          print(f"CACHE_SAVE_DIAG state_exists={state_path.exists()}")
+          if state_path.exists():
+              try:
+                  state = json.loads(state_path.read_text(encoding="utf-8"))
+                  print(
+                      "CACHE_SAVE_DIAG "
+                      f"schema={state.get('schema_version', '-')} "
+                      f"completed_dates={len(state.get('completed_dates') or [])} "
+                      f"failed_dates={len(state.get('failed_dates') or [])} "
+                      f"in_progress_dates={len(state.get('refresh_in_progress_dates') or [])} "
+                      f"updated_at={state.get('updated_at', state.get('last_refresh_started_at', '-'))}"
+                  )
+              except Exception as exc:
+                  print(f"CACHE_SAVE_DIAG state_read_error={type(exc).__name__}: {exc}")
+          PY
+
+      # 關鍵閉環：即使Run warrant backtest失敗，也要保存state與Parquet，
+      # 讓下一輪能讀到failed_dates並只重試失敗日期。
+      - name: Save FinMind local cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      # GitHub cache不可覆寫同一key，因此每輪使用唯一key；保存後只留同分支最新3份，
+      # 避免大型warrant_cache長期累積而觸發10GB配額淘汰。
+      - name: Prune old FinMind caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_PREFIX: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-
+        shell: bash
+        run: |
+          echo "保留同分支最新3份FinMind cache，刪除更舊項目。"
+          mapfile -t OLD_CACHE_IDS < <(
+            gh cache list \
+              --repo "$GITHUB_REPOSITORY" \
+              --key "$CACHE_PREFIX" \
+              --ref "$GITHUB_REF" \
+              --sort created_at \
+              --order desc \
+              --limit 100 \
+              --json id \
+              --jq '.[3:][] | .id'
+          )
+
+          if [ "${#OLD_CACHE_IDS[@]}" -eq 0 ]; then
+            echo "沒有需要刪除的舊FinMind cache。"
+            exit 0
+          fi
+
+          for cache_id in "${OLD_CACHE_IDS[@]}"; do
+            echo "刪除舊FinMind cache id=$cache_id"
+            gh cache delete "$cache_id" --repo "$GITHUB_REPOSITORY"
+          done
 
       - name: Upload Excel artifact
         if: always()
