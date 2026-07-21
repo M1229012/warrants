@@ -98,6 +98,16 @@ HYBRID_MONEYDJ_RETRY_WAIT = float(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRY_WAIT",
 HYBRID_MONEYDJ_STRICT_COMPLETENESS = os.getenv(
     "WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
+# 混合時段下，MoneyDJ 若已成功提供目標交易日，就完全略過 FinMind 最新日
+# 官方 OpenAPI preflight 與逐權證 API。MoneyDJ 失敗或當日為空時，才回退原本 FinMind 流程。
+HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# MoneyDJ 在短路模式下位於最新日關鍵路徑，必須有總等待上限。
+# 逾時後立即回退 FinMind 原始 preflight／逐權證 API，不等待仍在執行的 MoneyDJ 執行緒。
+HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS = max(1.0, float(os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS", "35"
+)))
 
 MONEYDJ_API4 = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
@@ -16606,11 +16616,22 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         if (active_codes := _finmind_active_warrant_codes(summary, day))
     ]
 
-    # 第一階段最新日查詢只使用 Summary + 精選分點直接發現，與歷史 69 日同步進行。
+    # 第一階段最新日查詢：
+    # - 一般模式維持原本 FinMind 最新日 API + 官方 preflight 平行流程。
+    # - 混合模式且 MoneyDJ 已啟動時，先不啟動 FinMind 最新日流程；MoneyDJ 成功就直接短路，
+    #   只有 MoneyDJ 失敗／無目標日資料時才回退 FinMind，避免白等官方全市場 OpenAPI。
     latest_executor = None
     latest_future = None
     latest_cancel_event = cancel_event if cancel_event is not None else threading.Event()
-    if FINMIND_WARRANT_LATEST_DAY_API_ENABLE and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE:
+    defer_finmind_latest_for_moneydj = bool(
+        moneydj_future is not None
+        and HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST
+    )
+    if (
+        FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+        and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE
+        and not defer_finmind_latest_for_moneydj
+    ):
         latest_executor = ThreadPoolExecutor(max_workers=1)
         latest_future = latest_executor.submit(
             _finmind_fetch_latest_day_with_official_preflight,
@@ -16627,6 +16648,11 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         )
         print(
             f"🚀 權證流水線平行啟動：歷史 {len(historical_jobs)} 日 + 最新日主要 API + 官方發行商預載"
+        )
+    elif defer_finmind_latest_for_moneydj:
+        print(
+            f"⚡ 混合模式短路待命：先等 MoneyDJ {latest_day.date()}；"
+            "成功即略過 FinMind 官方 preflight／逐權證 API，失敗才回退"
         )
 
     prefetched_events = _finmind_get_multi_stock_prefetched_events(code, start_date, end_date)
@@ -16727,6 +16753,86 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         historical_events["side"] = np.where(historical_events["net_amount"] >= 0, "買超", "賣超")
         historical_events.attrs["_warrant_events_normalized"] = True
 
+    # 混合模式優先收斂 MoneyDJ 結果。成功取得目標日後，不再啟動或等待 FinMind preflight。
+    moneydj_events = pd.DataFrame(columns=empty_columns)
+    moneydj_stats = {}
+    moneydj_has_target_day = False
+    if moneydj_future is not None and defer_finmind_latest_for_moneydj:
+        moneydj_wait_timed_out = False
+        try:
+            moneydj_events, moneydj_stats = moneydj_future.result(
+                timeout=HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS
+            )
+        except FuturesTimeoutError:
+            moneydj_wait_timed_out = True
+            moneydj_events, moneydj_stats = pd.DataFrame(columns=empty_columns), {
+                "error": "timeout",
+                "timeout_seconds": HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS,
+            }
+            moneydj_future.cancel()
+            print(
+                f"⏰ MoneyDJ 最新日補丁等待逾時：{code}｜"
+                f"上限={HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS:g}秒｜立即回退 FinMind 最新日流程"
+            )
+        except Exception as exc:
+            moneydj_events, moneydj_stats = pd.DataFrame(columns=empty_columns), {"error": str(exc)}
+            print(f"⚠️ MoneyDJ 最新日補丁失敗，回退 FinMind 最新日流程：{code}｜{exc}")
+        finally:
+            if moneydj_executor is not None:
+                moneydj_executor.shutdown(
+                    wait=not moneydj_wait_timed_out,
+                    cancel_futures=moneydj_wait_timed_out,
+                )
+            moneydj_executor = None
+            moneydj_future = None
+
+        moneydj_has_target_day = bool(
+            moneydj_events is not None
+            and not moneydj_events.empty
+            and "Date" in moneydj_events.columns
+            and (
+                pd.to_datetime(moneydj_events["Date"], errors="coerce").dt.normalize()
+                == latest_day
+            ).any()
+        )
+        if moneydj_has_target_day:
+            latest_cancel_event.set()
+            latest_events = moneydj_events.copy()
+            latest_api_stats = {
+                "date": latest_day.strftime("%Y-%m-%d"),
+                "requested_date": latest_day.strftime("%Y-%m-%d"),
+                "resolved_date": latest_day.strftime("%Y-%m-%d"),
+                "active_codes": int(latest_events["warrant_code"].nunique()) if "warrant_code" in latest_events.columns else 0,
+                "success_codes": int(latest_events["warrant_code"].nunique()) if "warrant_code" in latest_events.columns else 0,
+                "empty_codes": 0,
+                "failed_codes": 0,
+                "endpoint_rows": int(len(latest_events)),
+                "event_rows": int(len(latest_events)),
+                "query_codes": sorted(latest_events["warrant_code"].dropna().astype(str).unique().tolist()) if "warrant_code" in latest_events.columns else [],
+                "cancelled": False,
+                "not_ready": False,
+                "all_empty": False,
+                "fallback_used": False,
+                "hybrid_moneydj_used": True,
+                "hybrid_moneydj_stats": moneydj_stats,
+                "official_preflight_status": "skipped_by_moneydj",
+                "official_preflight_reason": "MoneyDJ 已成功提供目標交易日，混合模式略過 FinMind 官方 preflight 與逐權證 API",
+            }
+            print(
+                f"⚡ MoneyDJ 當日資料已就緒，短路 FinMind 最新日流程：{code}｜"
+                f"{latest_day.date()}｜事件={len(latest_events):,}｜"
+                "官方 preflight=略過｜逐權證 API=略過"
+            )
+            print(
+                f"⏭️ {code}｜官方最新日發布前置檢查：skipped｜"
+                "原因=MoneyDJ 已提供目標交易日"
+            )
+        else:
+            print(
+                f"↩️ MoneyDJ 未取得目標日資料，啟動 FinMind 原始最新日流程："
+                f"{code}｜{latest_day.date()}"
+            )
+
     if not FINMIND_WARRANT_LATEST_DAY_API_ENABLE:
         latest_events = pd.DataFrame(columns=empty_columns)
         latest_api_stats = {
@@ -16741,13 +16847,16 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             "cancelled": False,
         }
         print(f"ℹ️ 最新日權證 API 已關閉，完全略過逐權證與精選分點補查：{code}")
+    elif moneydj_has_target_day:
+        # latest_events / latest_api_stats 已由 MoneyDJ 建立，不做任何 FinMind 最新日請求。
+        pass
     elif latest_future is not None:
         try:
             latest_events, latest_api_stats = latest_future.result()
         finally:
             latest_executor.shutdown(wait=True)
     else:
-        # 非平行組態已完成歷史事件，直接帶入可一次涵蓋近期歷史權證，避免第二輪重查。
+        # MoneyDJ 失敗、非平行組態，或混合短路未命中時，才執行原本 FinMind preflight + 最新日 API。
         latest_events, latest_api_stats = _finmind_fetch_latest_day_with_official_preflight(
             summary, latest_day, warrant_name_map, code, stock_name, trader_name_map,
             historical_events=historical_events,
@@ -16768,6 +16877,7 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         FINMIND_WARRANT_LATEST_DAY_API_ENABLE
         and missing_recent_codes
         and not bool(latest_api_stats.get("not_ready", False))
+        and not bool(latest_api_stats.get("hybrid_moneydj_used", False))
     ):
         print(
             f"🔁 最新日第二階段補查：近期歷史額外權證={len(missing_recent_codes):,}支｜"
@@ -16831,18 +16941,45 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
         precomputed_api_stats=latest_api_stats,
     )
 
-    # FinMind 已有目標日資料時維持 FinMind；只有 FinMind 落後且 MoneyDJ 已有目標日，
-    # 才將該日整日替換成 MoneyDJ，避免同日雙來源重複。
+    # MoneyDJ 短路命中時，precomputed latest_events 已在上方併入；直接標記來源。
+    # 未啟用短路時則維持原本「FinMind 落後才採 MoneyDJ」的行為。
     latest_source_override = ""
-    moneydj_stats = {}
-    if moneydj_future is not None:
+    if bool(latest_api_stats.get("hybrid_moneydj_used", False)):
+        latest_source_override = "MoneyDJ單日補丁"
+        latest_api_stats["fallback_used"] = False
+        latest_api_stats["resolved_date"] = latest_day.strftime("%Y-%m-%d")
+        print(
+            f"🔀 混合資料源切換成功：FinMind 歷史 + MoneyDJ 最新日｜"
+            f"{code}｜{latest_day.date()}｜MoneyDJ事件={int(latest_api_stats.get('event_rows', 0) or 0):,}"
+        )
+    elif moneydj_future is not None:
+        moneydj_wait_timed_out = False
         try:
-            moneydj_events, moneydj_stats = moneydj_future.result()
+            moneydj_events, moneydj_stats = moneydj_future.result(
+                timeout=HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS
+            )
+        except FuturesTimeoutError:
+            moneydj_wait_timed_out = True
+            moneydj_events, moneydj_stats = pd.DataFrame(), {
+                "error": "timeout",
+                "timeout_seconds": HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS,
+            }
+            moneydj_future.cancel()
+            print(
+                f"⏰ MoneyDJ 最新日補丁等待逾時，保留 FinMind 結果：{code}｜"
+                f"上限={HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS:g}秒"
+            )
         except Exception as exc:
             moneydj_events, moneydj_stats = pd.DataFrame(), {"error": str(exc)}
             print(f"⚠️ MoneyDJ 最新日補丁失敗，保留 FinMind 結果：{code}｜{exc}")
         finally:
-            moneydj_executor.shutdown(wait=True)
+            if moneydj_executor is not None:
+                moneydj_executor.shutdown(
+                    wait=not moneydj_wait_timed_out,
+                    cancel_futures=moneydj_wait_timed_out,
+                )
+            moneydj_executor = None
+            moneydj_future = None
 
         finmind_dates = (
             pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
@@ -16871,6 +17008,22 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             print(f"✅ FinMind 已有目標日資料，MoneyDJ 補丁不採用：{code}｜{latest_day.date()}")
         else:
             print(f"ℹ️ FinMind 與 MoneyDJ 均尚無目標日，維持最近有效交易日：{code}｜{latest_day.date()}")
+
+    final_event_dates = (
+        pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
+        if events is not None and not events.empty and "Date" in events.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    final_latest_day = pd.Timestamp(final_event_dates.max()).normalize() if not final_event_dates.empty else pd.NaT
+    final_latest_source = latest_source_override or (
+        "FinMind最新日API" if pd.notna(final_latest_day) and final_latest_day == latest_day else "最近有效交易日"
+    )
+    print(
+        f"🧪 最新日驗收：{code}｜要求={latest_day.date()}｜"
+        f"實際={final_latest_day.date() if pd.notna(final_latest_day) else '-'}｜"
+        f"來源={final_latest_source}｜"
+        f"當日命中={1 if pd.notna(final_latest_day) and final_latest_day == latest_day else 0}"
+    )
 
     latest_failed = int(latest_api_stats.get("failed_codes", 0) or 0)
     latest_success = int(latest_api_stats.get("success_codes", 0) or 0)
