@@ -181,9 +181,9 @@ jobs:
             .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-${{ github.run_id }}
+          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-${{ github.run_id }}
           restore-keys: |
-            warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-
+            warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-
 
       - name: Restore or build Python runtime
         id: runtime-build
@@ -246,7 +246,7 @@ jobs:
             --no-build \
             --no-deps \
             --python .venv/bin/python \
-            --requirements requirements-runtime.txt
+            --requirements requirements.txt
 
           set +e
           wait "$FONT_PID_1"
@@ -279,7 +279,7 @@ jobs:
             .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-${{ github.run_id }}
+          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-${{ github.run_id }}
 
       - name: Prewarm FinMind all-market cache
         run: |
@@ -577,9 +577,9 @@ jobs:
             .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-${{ github.run_id }}
+          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-${{ github.run_id }}
           restore-keys: |
-            warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-
+            warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-
 
       - name: Restore or build Python runtime
         id: runtime-build
@@ -593,7 +593,7 @@ jobs:
             .venv
             .cache/report-fonts
             .cache/matplotlib
-          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements-runtime.txt') }}-v30-${{ github.run_id }}
+          key: warrant-runtime-direct-${{ runner.os }}-py3.11.15-${{ hashFiles('requirements.txt') }}-v30-${{ github.run_id }}
 
       - name: Run warrant report test
         run: |
