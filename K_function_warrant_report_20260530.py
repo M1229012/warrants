@@ -3,23 +3,30 @@ import json
 import html
 import base64
 import hashlib
-import math
 import os
 import re
-import textwrap
 import time
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
-from datetime import datetime, timedelta
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+    FIRST_COMPLETED,
+    TimeoutError as FuturesTimeoutError,
+)
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
 try:
     from google import genai
@@ -36,6 +43,7 @@ try:
 except Exception:
     BeautifulSoup = None
 
+
 try:
     from PIL import Image
 except Exception:
@@ -49,11 +57,6 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.patches import FancyBboxPatch, Rectangle, Patch
 from matplotlib.ticker import FuncFormatter
 
-try:
-    from X_function import get_institutional_stats_finmind
-except Exception:
-    get_institutional_stats_finmind = None
-
 
 # ============================================================
 # 基本設定
@@ -62,7 +65,6 @@ except Exception:
 HDR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*",
-    "Referer": "https://pscnetsecrwd.moneydj.com/",
 }
 
 OPENAPI_WARRANT_HEADERS = {
@@ -74,36 +76,58 @@ OPENAPI_WARRANT_HEADERS = {
 TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
 TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
 
-API4 = (
-    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
-    "/9b/6e/0a/TwWarrantData.xdjjson"
-    "?a={code}&x=warrant-chip0002-4&c={start}&d={end}&revision=2018_07_31_1"
-)
-API5 = (
-    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata"
-    "/d8/f5/27/twWarrantData.xdjjson"
-    "?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}&revision=2018_07_31_1"
-)
 
-# MoneyDJ 權證搜尋備援 / 補漏：
-# 1. OpenAPI 抓不到任何權證母體時，仍維持原本備援：MoneyDJ Search 全部補進，不過濾成交量 0。
-# 2. OpenAPI 已抓到部分權證時，也會額外跑 MoneyDJ Search 補漏；
-#    預設只補 MoneyDJ Search 顯示成交量 >= 1 的漏網認購權證，避免把同標的全部 0 量權證都丟進 API4/API5 拖慢。
-# 3. 若要完全不看 MoneyDJ 成交量、全部補漏，可設 WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_MIN_VOLUME=0。
-MONEYDJ_WARRANT_SEARCH_PAGE = "https://www.moneydj.com/warrant/xdjhtm/Search.xdjhtm"
-MONEYDJ_WARRANT_PROXY_URL = "https://www.moneydj.com/warrant/xdjjs/ProxyXQ.xdjjs"
-MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_ENABLE = os.getenv("WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME = int(os.getenv("WARRANT_MONEYDJ_SEARCH_SUPPLEMENT_MIN_VOLUME", "1"))
+# ============================================================
+# FinMind 歷史 + MoneyDJ 最新交易日混合模式
+# ============================================================
+# 正常流程仍以 FinMind 為主；只有台北時間盤後且 FinMind 尚未取得目標交易日時，
+# 才以 MoneyDJ 單日資料整日取代該交易日。MoneyDJ 與 FinMind 歷史流程平行執行。
+HYBRID_MONEYDJ_LATEST_DAY_ENABLE = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_LATEST_DAY_ENABLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+HYBRID_MONEYDJ_FORCE_ENABLE = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_FORCE_ENABLE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+HYBRID_MONEYDJ_START_HOUR = int(os.getenv("WARRANT_HYBRID_MONEYDJ_START_HOUR", "18"))
+HYBRID_MONEYDJ_START_MINUTE = int(os.getenv("WARRANT_HYBRID_MONEYDJ_START_MINUTE", "20"))
+HYBRID_MONEYDJ_API4_WORKERS = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API4_WORKERS", "40")))
+HYBRID_MONEYDJ_API5_WORKERS = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API5_WORKERS", "50")))
+HYBRID_MONEYDJ_API5_DAYS = max(2, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API5_DAYS", "5")))
+HYBRID_MONEYDJ_RETRIES = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRIES", "3")))
+HYBRID_MONEYDJ_RETRY_WAIT = float(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRY_WAIT", "1.5"))
+HYBRID_MONEYDJ_STRICT_COMPLETENESS = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+# 混合時段下，MoneyDJ 若已成功提供目標交易日，就完全略過 FinMind 最新日
+# 官方 OpenAPI preflight 與逐權證 API。MoneyDJ 失敗或當日為空時，才回退原本 FinMind 流程。
+HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST = os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# MoneyDJ 在短路模式下位於最新日關鍵路徑，必須有總等待上限。
+# 逾時後立即回退 FinMind 原始 preflight／逐權證 API，不等待仍在執行的 MoneyDJ 執行緒。
+HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS = max(1.0, float(os.getenv(
+    "WARRANT_HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS", "35"
+)))
+
+MONEYDJ_API4 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
+    "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={start}&d={end}"
+    "&revision=2018_07_31_1"
+)
+MONEYDJ_API5 = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/"
+    "twWarrantData.xdjjson?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}"
+    "&revision=2018_07_31_1"
+)
+MONEYDJ_HEADERS = {
+    "User-Agent": HDR["User-Agent"],
+    "Accept": "*/*",
+    "Referer": "https://pscnetsecrwd.moneydj.com/",
+}
 
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
 CHART_LOOKBACK = int(os.getenv("WARRANT_CHART_LOOKBACK", "70"))
-API4_WORKERS = int(os.getenv("WARRANT_API4_WORKERS", "40"))
-API5_WORKERS = int(os.getenv("WARRANT_API5_WORKERS", "50"))
-API5_DAYS = int(os.getenv("WARRANT_API5_DAYS", "110"))
-API4_SCAN_CALENDAR_DAYS = int(os.getenv("WARRANT_API4_SCAN_CALENDAR_DAYS", "110"))
-MAX_WARRANTS = int(os.getenv("WARRANT_REPORT_MAX_WARRANTS", "0"))
-MAX_PAIRS = int(os.getenv("WARRANT_REPORT_MAX_PAIRS", "0"))
 
 # GitHub Actions 的 0 / 1 主控：
 # - 0：優先使用 Google Sheet 當日快取與完整權證快照；若快取不存在或不完整，才回退 Live 抓取。
@@ -140,10 +164,6 @@ if ACTION_REFRESH_CONTROLS_REPORT_DATA:
     REPORT_LIVE_ONLY = bool(ACTION_FORCE_REFRESH)
 else:
     REPORT_LIVE_ONLY = os.getenv("WARRANT_REPORT_LIVE_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
-GSHEET_FALLBACK_ENABLE = (
-    os.getenv("WARRANT_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no")
-    and not REPORT_LIVE_ONLY
-)
 NEWS_ENABLE = os.getenv("WARRANT_NEWS_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 
 # 週報輸出模式：
@@ -188,13 +208,6 @@ REPORT_INTERMEDIATE_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_REPORT_INTERMEDI
 SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL = int(os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_COMPRESS_LEVEL", "6"))
 SCREENSHOT_OUTPUT_PNG_OPTIMIZE = os.getenv("WARRANT_SCREENSHOT_OUTPUT_PNG_OPTIMIZE", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# K 線圖 Y 軸留白設定：避免價格已經很集中時，上下空白仍過大。
-# 調小後會讓股價區更貼近實際波動範圍，但仍保留少量空間給均線、布林與文字標註。
-CANDLE_Y_PAD_LOWER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_RATIO", "0.06"))
-CANDLE_Y_PAD_UPPER_RATIO = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_RATIO", "0.12"))
-CANDLE_Y_PAD_LOWER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_LOWER_MIN_PCT", "0.008"))
-CANDLE_Y_PAD_UPPER_MIN_PCT = float(os.getenv("WARRANT_CANDLE_Y_PAD_UPPER_MIN_PCT", "0.015"))
-
 # 疑似造市 / 避險對沖設定
 # 預設只標記不刪除：8% 用於提示疑似對沖；若真的啟用刪除，3% 才會過濾。
 HEDGE_MARK_THRESHOLD = float(os.getenv("WARRANT_HEDGE_MARK_THRESHOLD", os.getenv("WARRANT_HEDGE_THRESHOLD", "0.08")))
@@ -217,6 +230,27 @@ TOP5_EXTRA_HEAD_OFFICE_BRANCHES = os.getenv("WARRANT_TOP5_EXTRA_HEAD_OFFICE_BRAN
 # TOP5 總公司型分點白名單：
 # 預設仍過濾總公司型分點，但「新光」與「第一金」這兩個分點保留，不列入總公司過濾。
 TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST = os.getenv("WARRANT_TOP5_HEAD_OFFICE_BRANCH_ALLOWLIST", "新光,第一金,福邦證券").strip()
+
+# FinMind 全市場權證分點包含完整買賣雙邊，直接把所有分點加總時淨額會接近 0。
+# 上方「權證資金流」與 TOP5 先逐檔辨識發行商，只排除該權證的發行／造市總公司列；
+# TOP5 再沿用原本的總公司／自營型分點過濾，正常地方分點仍保留。
+# 下方精選分點固定使用完整原始資料，不受上述排除影響。
+FINMIND_ISSUER_FLOW_ENABLE = os.getenv(
+    "FINMIND_ISSUER_FLOW_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_ISSUER_FLOW_DEBUG_ENABLE = os.getenv(
+    "FINMIND_ISSUER_FLOW_DEBUG_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS = max(
+    1,
+    int(os.getenv("FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS", "30")),
+)
+FINMIND_ISSUER_FLOW_EXCLUDE_UNRESOLVED_ENABLE = os.getenv(
+    "FINMIND_ISSUER_FLOW_EXCLUDE_UNRESOLVED_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
 
 # 精選分點資金流：只統計指定分點的權證買賣金額，不再設定單筆金額門檻。
 # 預設仍是原本五分點；Discord / GitHub Actions 可用 WARRANT_SELECTED_BRANCH_FLOW_BRANCHES 傳入自訂分點。
@@ -251,25 +285,6 @@ DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_W
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
-GSHEET_STOCK_NAME_SHEET = os.getenv("WARRANT_STOCK_NAME_SHEET", "快取_股票名稱").strip() or "快取_股票名稱"
-# 股票名稱快取只作為「代號 → 名稱」對照，不屬於交易資料快取。
-# 因此即使 REPORT_LIVE_ONLY=1，也允許讀取這張表，避免官方名稱來源短暫失敗時，
-# 後續新聞搜尋變成「未知公司」而把明確公司新聞全部過濾掉。
-STOCK_NAME_GSHEET_ENABLE = os.getenv("WARRANT_STOCK_NAME_GSHEET_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-# 股票名稱優先使用本機小型 JSON 與官方公司基本資料；Google Sheet 改為背景預載與備援。
-# 這只改變名稱取得順序，不改變交易資料、新聞篩選或權證統計邏輯。
-STOCK_NAME_LOCAL_CACHE_ENABLE = os.getenv(
-    "WARRANT_STOCK_NAME_LOCAL_CACHE_ENABLE",
-    "1",
-).strip().lower() not in ("0", "false", "no", "off")
-STOCK_NAME_OFFICIAL_TIMEOUT = float(os.getenv("WARRANT_STOCK_NAME_OFFICIAL_TIMEOUT", "8"))
-_STOCK_NAME_MAP_CACHE = None
-_STOCK_NAME_MAP_CACHE_LOCK = threading.Lock()
-_STOCK_NAME_LOCAL_MAP_CACHE = None
-_STOCK_NAME_LOCAL_MAP_CACHE_LOCK = threading.Lock()
-_OFFICIAL_STOCK_NAME_INFO_CACHE = None
-_OFFICIAL_STOCK_NAME_INFO_CACHE_LOCK = threading.Lock()
-
 
 # 分點勝率 / 歷史加權報酬率：供「本週重點」引用 Google Sheet 勝率統計。
 # 可用環境變數 WARRANT_BRANCH_PERF_SHEETS 指定工作表名稱，若未指定，
@@ -293,6 +308,16 @@ WEEKLY_KEYPOINT_INST_NEUTRAL_MIN_SHARES = float(
 WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO = float(
     os.getenv("WARRANT_WEEKLY_KEYPOINT_INST_NEUTRAL_MV20_RATIO", "0.05")
 )
+BRANCH_PERF_DISK_CACHE_ENABLE = os.getenv(
+    "WARRANT_BRANCH_PERF_DISK_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+_BRANCH_PERF_DISK_CACHE_ROOT = os.path.join(
+    os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache",
+    "reference",
+)
+_BRANCH_PERF_DISK_CACHE_PATH = os.path.join(_BRANCH_PERF_DISK_CACHE_ROOT, "branch_performance.parquet")
+_BRANCH_PERF_DISK_META_PATH = os.path.join(_BRANCH_PERF_DISK_CACHE_ROOT, "branch_performance.meta.json")
 _BRANCH_PERF_CACHE_DF = None
 _BRANCH_PERF_CACHE_LOCK = threading.Lock()
 
@@ -312,7 +337,6 @@ else:
         os.getenv("WARRANT_LOCAL_CACHE_FORCE_REFRESH", "0"),
     ).strip().lower() in ("1", "true", "yes", "on")
 GSHEET_WARRANT_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-GSHEET_WARRANT_HISTORY_SHEET = os.getenv("WARRANT_GSHEET_HISTORY_SHEET", "快取_分點歷史").strip() or "快取_分點歷史"
 GSHEET_WARRANT_STATUS_SHEET = os.getenv("WARRANT_GSHEET_STATUS_SHEET", "快取_分點歷史_狀態").strip() or "快取_分點歷史_狀態"
 # 權證完整快照預設使用獨立試算表，避免主試算表超過 Google Sheets 1,000 萬儲存格上限。
 # 可直接設定 WARRANT_CACHE_GOOGLE_SHEET_ID；未設定時會依名稱開啟，找不到則自動建立。
@@ -337,83 +361,7 @@ WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE = os.getenv(
     "WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE",
     "0",
 ).strip().lower() not in ("0", "false", "no", "off")
-# 快取未命中時，使用接近純 Live 的快速路徑：不再掃描主試算表的大型歷史清單，
-# 避免「先讀大量舊快取，再跑完整 Live」造成母體建立與總時間明顯變慢。
-WARRANT_CACHE_FAST_FALLBACK_ENABLE = os.getenv(
-    "WARRANT_CACHE_FAST_FALLBACK_ENABLE",
-    "1",
-).strip().lower() not in ("0", "false", "no", "off")
-WARRANT_CACHE_FAST_FALLBACK_SKIP_LEGACY_SUPPLEMENT = os.getenv(
-    "WARRANT_CACHE_FAST_FALLBACK_SKIP_LEGACY_SUPPLEMENT",
-    "1",
-).strip().lower() not in ("0", "false", "no", "off")
 # 每個股票／日期區間使用獨立工作表，避免每次讀取與重寫整張巨型「快取_分點歷史」。
-WARRANT_CACHE_PER_SNAPSHOT_SHEET_ENABLE = os.getenv(
-    "WARRANT_CACHE_PER_SNAPSHOT_SHEET_ENABLE",
-    "1",
-).strip().lower() not in ("0", "false", "no", "off")
-
-# 歷史分點買賣明細補漏：
-# OpenAPI / MoneyDJ Search 只能建立「目前可取得」的權證母體，若某檔權證近 90 天曾有分點買賣超，
-# 但最新權證清單或 MoneyDJ Search 已經找不到，就會漏掉，例如 062599 這類已在明細表出現過的權證。
-# 這裡會從既有「分點買賣明細」工作表補進：
-# 1. 歷史權證代號，讓 API4 可以掃這檔權證。
-# 2. 歷史 權證×分點 pair，若 API4 掃不到，也能直接交給 API5 回查近 110 天金額。
-HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE = os.getenv("WARRANT_HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS = int(os.getenv("WARRANT_HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS", "90"))
-HISTORICAL_BRANCH_DETAIL_SHEETS_RAW = os.getenv(
-    "WARRANT_HISTORICAL_BRANCH_DETAIL_SHEETS",
-    "快取_近10日分點買賣明細,快取_近20日分點買賣明細,快取_近30日分點買賣明細,快取_近60日分點買賣明細,快取_近90日分點買賣明細,快取_權證分點買賣明細,快取_分點買賣明細",
-).strip()
-# 純 Live 模式下，若使用者明確知道某些仍有效但 MoneyDJ Search / OpenAPI 沒列出的權證，
-# 可用環境變數補入代號，程式仍會透過 API4 / API5 即時回查，不讀 Google Sheet。
-# 格式支援：062599 或 062599:晶技國票5B購01，多筆用逗號分隔。
-EXTRA_LIVE_WARRANTS_RAW = os.getenv("WARRANT_EXTRA_LIVE_WARRANTS", os.getenv("WARRANT_EXTRA_WARRANT_CODES", "")).strip()
-# 純 Live 指定 pair 補抓：
-# 當 MoneyDJ Search 有權證，但 API4 沒有回傳某分點清單時，可直接把 權證×券商代號×分點 丟給 API5 回查。
-# 格式支援：
-#   062599:9A9g:永豐金內湖
-#   062599:9A9g:永豐金內湖:晶技國票5B購01
-# 多筆用逗號、分號或換行分隔。
-EXTRA_LIVE_PAIRS_RAW = os.getenv("WARRANT_EXTRA_LIVE_PAIRS", "").strip()
-# API4 空回應 / 指定權證補查：
-# 預設啟用。若 API4 對某支權證回 empty，會用本次 API4 已知的精選分點券商代號，
-# 自動補出該權證 × 精選分點 pair，再交給 API5 純 Live 回查。
-AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE = os.getenv(
-    "WARRANT_AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE",
-    "1",
-).strip().lower() in ("1", "true", "yes", "on")
-# 權證追蹤 Debug：預設追蹤本次問題權證 062599；可設空字串關閉，或用逗號追蹤多檔。
-DEBUG_WARRANT_CODES_RAW = os.getenv("WARRANT_DEBUG_WARRANT_CODES", "").strip()
-DEBUG_API5_ROWS_ENABLE = os.getenv("WARRANT_DEBUG_API5_ROWS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-
-# 本機快照快取：預設關閉，避免 GitHub runner 本機快照蓋過 Google Sheet 快取。
-LOCAL_WARRANT_CACHE_ENABLE = (
-    os.getenv("WARRANT_LOCAL_CACHE_ENABLE", "0").strip().lower() not in ("0", "false", "no", "off")
-    and not REPORT_LIVE_ONLY
-)
-LOCAL_WARRANT_CACHE_DIR = os.getenv("WARRANT_LOCAL_CACHE_DIR", "warrant_cache").strip() or "warrant_cache"
-STOCK_NAME_LOCAL_CACHE_FILE = os.getenv(
-    "WARRANT_STOCK_NAME_LOCAL_CACHE_FILE",
-    os.path.join(LOCAL_WARRANT_CACHE_DIR, "stock_names.json"),
-).strip() or os.path.join(LOCAL_WARRANT_CACHE_DIR, "stock_names.json")
-LOCAL_WARRANT_CACHE_FORCE_REFRESH = WARRANT_CACHE_FORCE_REFRESH or REPORT_LIVE_ONLY
-
-# API 重試與完整度檢查：預設仍保守，但允許極少數硬失敗，避免大母體請求因單筆 timeout 整張中止。
-# MoneyDJ 偶爾會短暫回 500，因此預設重試次數拉高，並在 API4 第一輪失敗後做第二輪低併發補抓。
-API_RETRY_TIMES = int(os.getenv("WARRANT_API_RETRY_TIMES", "3"))
-API_RETRY_BASE_WAIT = float(os.getenv("WARRANT_API_RETRY_BASE_WAIT", "2.0"))
-API_FAILURE_ABORT_RATIO = float(os.getenv("WARRANT_API_FAILURE_ABORT_RATIO", "0.005"))
-API_FAILURE_ABORT_ABS_COUNT = int(os.getenv("WARRANT_API_FAILURE_ABORT_ABS_COUNT", "3"))
-API_FAILURE_ABORT_MIN_REQUESTS = int(os.getenv("WARRANT_API_FAILURE_ABORT_MIN_REQUESTS", "1"))
-API_REQUIRE_FULL_SUCCESS = os.getenv("WARRANT_API_REQUIRE_FULL_SUCCESS", "1").strip().lower() not in ("0", "false", "no", "off")
-API_ALLOW_TINY_FAILURE = os.getenv("WARRANT_API_ALLOW_TINY_FAILURE", "1").strip().lower() in ("1", "true", "yes", "on")
-API_EMPTY_AS_FAILURE = os.getenv("WARRANT_API_EMPTY_AS_FAILURE", "0").strip().lower() in ("1", "true", "yes", "on")
-API4_SECOND_PASS_ENABLE = os.getenv("WARRANT_API4_SECOND_PASS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-API4_SECOND_PASS_WORKERS = int(os.getenv("WARRANT_API4_SECOND_PASS_WORKERS", "6"))
-API4_SECOND_PASS_WAIT = float(os.getenv("WARRANT_API4_SECOND_PASS_WAIT", "5"))
-# 由 Google Sheet 歷史快取補進來的權證，若 API4 仍查不到，保留既有快取資料，不讓已到期 / 已下市權證拖垮整張圖。
-API4_HISTORY_FAILURE_AS_EMPTY = os.getenv("WARRANT_API4_HISTORY_FAILURE_AS_EMPTY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Gemini / LLM 結果快取：同一份 prompt 重跑時直接重用，不再重打 API。
 # 注意：純 Live 模式只禁止交易資料快取；Gemini 文字快取仍應依 ACTION 參數運作。
@@ -423,23 +371,33 @@ LLM_CACHE_ENABLE = os.getenv("WARRANT_LLM_CACHE_ENABLE", "1").strip().lower() no
 LLM_CACHE_DIR = os.getenv("WARRANT_LLM_CACHE_DIR", "llm_cache").strip() or "llm_cache"
 # Gemini 結果寫回 Google Sheet：同股票同任務當天跑過一次，當天再跑直接讀快取，不再呼叫 Gemini。
 GSHEET_LLM_CACHE_ENABLE = os.getenv("WARRANT_GSHEET_LLM_CACHE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_READ_ENABLE = os.getenv(
+    "WARRANT_GSHEET_LLM_CACHE_READ_ENABLE",
+    "1" if GSHEET_LLM_CACHE_ENABLE else "0",
+).strip().lower() not in ("0", "false", "no", "off")
+GSHEET_LLM_CACHE_WRITE_ENABLE = os.getenv(
+    "WARRANT_GSHEET_LLM_CACHE_WRITE_ENABLE",
+    "1" if GSHEET_LLM_CACHE_ENABLE else "0",
+).strip().lower() not in ("0", "false", "no", "off")
+LLM_DAILY_TASK_CACHE_ENABLE = os.getenv(
+    "WARRANT_LLM_DAILY_TASK_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 GSHEET_LLM_CACHE_SHEET = os.getenv("WARRANT_GSHEET_LLM_CACHE_SHEET", "快取_Gemini結果").strip() or "快取_Gemini結果"
 LLM_CACHE_FORCE_REFRESH = bool(ACTION_FORCE_REFRESH)
 
+
 _THREAD_LOCAL = threading.local()
-_FETCH_STATS_LOCK = threading.Lock()
-_FETCH_STATS = {}
 
 # 同一場程式執行中共用 Google Sheet 授權 client 與 spreadsheet handle，
 # 避免股票名稱、勝率統計、Gemini 快取等功能反覆重新授權與開啟同一份試算表。
 _GSPREAD_CLIENT_CACHE = None
 _GSHEET_HANDLE_CACHE = None
 _WARRANT_CACHE_GSHEET_HANDLE_CACHE = None
-_WARRANT_FAST_FALLBACK_LIVE_ACTIVE = False
-_WARRANT_FAST_FALLBACK_LIVE_LOCK = threading.RLock()
+_WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN = False
 _GSHEET_CONNECTION_LOCK = threading.RLock()
-_STOCK_NAME_GSHEET_PRELOAD_THREAD = None
-_STOCK_NAME_GSHEET_PRELOAD_LOCK = threading.Lock()
+_DAILY_LLM_CACHE_MEM = {}
+_DAILY_LLM_CACHE_LOCK = threading.RLock()
 
 # TWSE / TPEx 全市場權證 OpenAPI 在同一個 Python process 只下載一次。
 # 多股票批次執行時，第二支股票開始直接重用記憶體資料；每次新 Actions run 仍會重新抓 Live。
@@ -512,7 +470,6 @@ def _has_neutral_target_price_or_rating(text: str) -> bool:
         r"(維持中立|維持持有|中立評等|持有評等)",
     ]
     return any(re.search(p, t) for p in patterns)
-
 
 
 def _report_branch_positive_color_allowed(text: str):
@@ -799,14 +756,41 @@ CENTER_WATERMARK_ROTATION = 18
 # Supertrend 目前圖表沒有繪製，預設不計算；若未來要畫再用環境變數打開。
 ENABLE_SUPERTREND = os.getenv("WARRANT_ENABLE_SUPERTREND", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# 字型：GitHub Actions 建議安裝 fonts-noto-cjk
-available_fonts = [f.name for f in fm.fontManager.ttflist]
-for font_name in ["Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans TC", "Microsoft JhengHei", "SimHei"]:
-    if font_name in available_fonts:
+# 字型：優先使用 Workflow 自動下載並快取的 Noto Sans CJK TC 字型，避免每次 apt 安裝。
+REPORT_FONT_DIR = os.getenv("WARRANT_REPORT_FONT_DIR", ".cache/report-fonts").strip() or ".cache/report-fonts"
+_REPORT_FONT_FILES = [
+    os.path.join(REPORT_FONT_DIR, "NotoSansCJKtc-Regular.otf"),
+    os.path.join(REPORT_FONT_DIR, "NotoSansCJKtc-Bold.otf"),
+]
+_registered_report_fonts = []
+for _font_path in _REPORT_FONT_FILES:
+    if not os.path.isfile(_font_path):
+        continue
+    try:
+        fm.fontManager.addfont(_font_path)
+        _font_name = fm.FontProperties(fname=_font_path).get_name()
+        if _font_name:
+            _registered_report_fonts.append(_font_name)
+        print(f"✅ 已註冊報表字型：{os.path.basename(_font_path)}｜family={_font_name}")
+    except Exception as exc:
+        print(f"⚠️ 報表字型註冊失敗：{_font_path}｜{exc}")
+
+available_fonts = {f.name for f in fm.fontManager.ttflist}
+font_candidates = _registered_report_fonts + [
+    "Noto Sans CJK TC",
+    "Noto Sans CJK JP",
+    "Noto Sans TC",
+    "Microsoft JhengHei",
+    "SimHei",
+]
+for font_name in font_candidates:
+    if font_name and font_name in available_fonts:
         plt.rcParams["font.family"] = font_name
+        print(f"✅ Matplotlib 中文字型：{font_name}")
         break
 else:
     plt.rcParams["font.family"] = "DejaVu Sans"
+    print("⚠️ 找不到中文字型，暫時使用 DejaVu Sans")
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -898,10 +882,6 @@ def normalize_openapi_trade_date(date_value) -> str:
     return dt.strftime("%Y/%m/%d") if dt else str(date_value or "").strip()
 
 
-def parse_openapi_trade_date_for_sort(date_value):
-    return parse_date(date_value) or datetime.min
-
-
 def clean_openapi_number(value) -> int:
     if value is None:
         return 0
@@ -946,17 +926,6 @@ def money_tick(v, pos=None):
         return str(v)
 
 
-def wrap_text(s: str, width: int = 18, max_lines: int = 2) -> str:
-    s = str(s or "").strip()
-    if len(s) <= width:
-        return s
-    lines = textwrap.wrap(s, width=width)
-    lines = lines[:max_lines]
-    if len("".join(lines)) < len(s):
-        lines[-1] = lines[-1][: max(0, width - 1)] + "…"
-    return "\n".join(lines)
-
-
 def _safe_cache_part(v) -> str:
     s = str(v or "").strip()
     s = re.sub(r"[^0-9A-Za-z_\-]+", "_", s)
@@ -976,6 +945,37 @@ def _cache_date_part(v) -> str:
 def _ensure_dir(path: str):
     if path:
         os.makedirs(path, exist_ok=True)
+
+
+_WARRANT_EVENT_NUMERIC_COLUMNS = {
+    "buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares",
+}
+_WARRANT_EVENT_STRING_COLUMNS = {
+    "branch", "broker_code", "warrant_code", "warrant_name",
+    "underlying_code", "underlying_name", "side",
+}
+
+
+def _fill_warrant_event_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """只填補權證事件中需要的欄位，避免整張表 ``fillna("")`` 將數值欄升成 object。"""
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in _WARRANT_EVENT_NUMERIC_COLUMNS.intersection(out.columns):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    for col in _WARRANT_EVENT_STRING_COLUMNS.intersection(out.columns):
+        out[col] = out[col].fillna("").astype(str)
+    return out
+
+
+def _concat_warrant_event_frames(frames) -> pd.DataFrame:
+    """合併權證事件時保留數值 dtype，只對字串欄補空字串。"""
+    valid_frames = [frame for frame in (frames or []) if frame is not None and not frame.empty]
+    if not valid_frames:
+        return pd.DataFrame()
+    return _fill_warrant_event_missing_values(
+        pd.concat(valid_frames, ignore_index=True, sort=False)
+    )
 
 
 @contextmanager
@@ -1083,200 +1083,6 @@ def screenshot_like_output_buffer(buf: io.BytesIO) -> io.BytesIO:
         return buf
 
 
-def _local_warrant_cache_path(stock_code: str, start_date=None, end_date=None) -> str:
-    start_s = _cache_date_part(start_date) if start_date is not None else "start"
-    end_s = _cache_date_part(end_date) if end_date is not None else "end"
-    filename = f"warrant_events_{_safe_cache_part(stock_code)}_{start_s}_{end_s}.json"
-    return os.path.join(LOCAL_WARRANT_CACHE_DIR, filename)
-
-
-def _normalize_warrant_events_for_cache(events_df: pd.DataFrame) -> pd.DataFrame:
-    if events_df is None or events_df.empty:
-        return pd.DataFrame()
-    out = events_df.copy().fillna("")
-    if "Date" in out.columns:
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
-        out = out.dropna(subset=["Date"])
-        out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
-    for c in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    for c in ["warrant_code", "underlying_code", "broker_code", "branch", "warrant_name", "underlying_name", "side"]:
-        if c in out.columns:
-            out[c] = out[c].astype(str).str.strip()
-    if "branch" in out.columns:
-        out["branch"] = out["branch"].map(normalize_branch_name)
-    return out
-
-
-def load_local_warrant_events_snapshot(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    if not LOCAL_WARRANT_CACHE_ENABLE or LOCAL_WARRANT_CACHE_FORCE_REFRESH:
-        return pd.DataFrame()
-    path = _local_warrant_cache_path(stock_code, start_date=start_date, end_date=end_date)
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        records = payload.get("records", []) if isinstance(payload, dict) else []
-        if not records:
-            return pd.DataFrame()
-        df = pd.DataFrame(records).fillna("")
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
-            df = df.dropna(subset=["Date"])
-        for c in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        if "side" not in df.columns and "net_amount" in df.columns:
-            df["side"] = np.where(df["net_amount"] >= 0, "買超", "賣超")
-        print(f"📦 本機權證快照命中：{path}｜{len(df):,} 筆")
-        return df.reset_index(drop=True)
-    except Exception as e:
-        print(f"⚠️ 本機權證快照讀取失敗，改走原本資料流程：{path}｜{e}")
-        return pd.DataFrame()
-
-
-def save_local_warrant_events_snapshot(stock_code: str, events_df: pd.DataFrame, start_date=None, end_date=None):
-    if not LOCAL_WARRANT_CACHE_ENABLE or events_df is None or events_df.empty:
-        return
-    path = _local_warrant_cache_path(stock_code, start_date=start_date, end_date=end_date)
-    try:
-        _ensure_dir(os.path.dirname(path))
-        out = _normalize_warrant_events_for_cache(events_df)
-        payload = {
-            "stock_code": str(stock_code),
-            "start_date": _cache_date_part(start_date),
-            "end_date": _cache_date_part(end_date),
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "rows": int(len(out)),
-            "records": out.to_dict(orient="records"),
-        }
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp_path, path)
-        print(f"💾 已寫入本機權證快照：{path}｜{len(out):,} 筆")
-    except Exception as e:
-        print(f"⚠️ 本機權證快照寫入失敗：{path}｜{e}")
-
-
-def reset_api_fetch_stats(scope: str):
-    with _FETCH_STATS_LOCK:
-        _FETCH_STATS[scope] = {
-            "total": 0,
-            "success": 0,
-            "empty": 0,
-            "failed": 0,
-            "retry": 0,
-            "errors": [],
-        }
-
-
-def _record_api_fetch(scope: str, status: str, error: str = "", retry_count: int = 0):
-    with _FETCH_STATS_LOCK:
-        st = _FETCH_STATS.setdefault(scope, {
-            "total": 0,
-            "success": 0,
-            "empty": 0,
-            "failed": 0,
-            "retry": 0,
-            "errors": [],
-        })
-        st["total"] += 1
-        if status not in ("success", "empty", "failed"):
-            status = "failed"
-        st[status] += 1
-        st["retry"] += int(retry_count or 0)
-        if error:
-            errors = st.setdefault("errors", [])
-            if len(errors) < 8:
-                errors.append(str(error)[:220])
-
-
-def get_api_fetch_stats(scope: str) -> dict:
-    with _FETCH_STATS_LOCK:
-        return dict(_FETCH_STATS.get(scope, {}))
-
-
-def print_api_fetch_stats(scope: str, label: str):
-    st = get_api_fetch_stats(scope)
-    total = int(st.get("total", 0) or 0)
-    failed = int(st.get("failed", 0) or 0)
-    success = int(st.get("success", 0) or 0)
-    empty = int(st.get("empty", 0) or 0)
-    retry = int(st.get("retry", 0) or 0)
-    fail_ratio = failed / total if total else 0.0
-    print(f"📊 {label} 完整度：total={total:,}｜success={success:,}｜empty={empty:,}｜failed={failed:,}｜retry={retry:,}｜fail_ratio={fail_ratio:.1%}")
-    for err in st.get("errors", [])[:5]:
-        print(f"   ⚠️ {label} 錯誤樣本：{err}")
-
-
-def abort_if_api_failure_too_high(scope: str, label: str):
-    st = get_api_fetch_stats(scope)
-    total = int(st.get("total", 0) or 0)
-    failed = int(st.get("failed", 0) or 0)
-    empty = int(st.get("empty", 0) or 0)
-    if total < API_FAILURE_ABORT_MIN_REQUESTS:
-        return
-
-    if API_REQUIRE_FULL_SUCCESS:
-        bad_count = failed + (empty if API_EMPTY_AS_FAILURE else 0)
-        if bad_count <= 0:
-            return
-
-        bad_ratio = bad_count / total if total else 0.0
-        empty_msg = f"，empty={empty:,}" if API_EMPTY_AS_FAILURE else f"，empty={empty:,}（不列入失敗）"
-
-        if API_ALLOW_TINY_FAILURE and bad_count <= API_FAILURE_ABORT_ABS_COUNT and bad_ratio <= API_FAILURE_ABORT_RATIO:
-            print(
-                f"⚠️ {label} 有極少數請求失敗但低於容許門檻，仍繼續輸出："
-                f"total={total:,}，failed={failed:,}{empty_msg}，"
-                f"bad_ratio={bad_ratio:.2%}，門檻={API_FAILURE_ABORT_ABS_COUNT}筆 / {API_FAILURE_ABORT_RATIO:.2%}"
-            )
-            return
-
-        raise RuntimeError(
-            f"{label} 完整度未達輸出門檻：total={total:,}，failed={failed:,}{empty_msg}，"
-            f"bad_ratio={bad_ratio:.2%}，容許門檻={API_FAILURE_ABORT_ABS_COUNT}筆 / {API_FAILURE_ABORT_RATIO:.2%}。"
-            f"本次資料已中止輸出，避免產生錯誤資金流圖。"
-        )
-
-    fail_ratio = failed / total if total else 0.0
-    if fail_ratio > API_FAILURE_ABORT_RATIO:
-        raise RuntimeError(
-            f"{label} 失敗比例過高：{failed:,}/{total:,} = {fail_ratio:.2%}，"
-            f"超過門檻 {API_FAILURE_ABORT_RATIO:.2%}。本次資料可能嚴重不完整，已中止輸出，避免產生錯誤資金流圖。"
-        )
-
-
-class ApiFetchRetryError(RuntimeError):
-    """保留 MoneyDJ API 最終失敗前實際重試次數，避免 log 顯示 retry=0。"""
-    def __init__(self, message: str, retry_count: int = 0):
-        super().__init__(message)
-        self.retry_count = int(retry_count or 0)
-
-
-def _moneydj_get_json_with_retry(url: str, scope: str):
-    last_error = None
-    retry_count = 0
-    max_times = max(1, int(API_RETRY_TIMES))
-    for attempt in range(1, max_times + 1):
-        try:
-            r = get_thread_session().get(url, headers=HDR, timeout=(5, 15))
-            r.raise_for_status()
-            text = r.content.decode("utf-8", errors="replace")
-            return json.loads(text), retry_count
-        except Exception as e:
-            last_error = e
-            if attempt < max_times:
-                retry_count += 1
-                wait_sec = API_RETRY_BASE_WAIT * attempt
-                time.sleep(wait_sec)
-                continue
-    raise ApiFetchRetryError(str(last_error), retry_count=retry_count)
-
-
 def _llm_cache_path(prompt: str) -> str:
     digest = hashlib.sha256((GEMINI_MODEL + "\n" + str(prompt or "")).encode("utf-8")).hexdigest()
     return os.path.join(LLM_CACHE_DIR, f"gemini_{digest}.txt")
@@ -1320,7 +1126,7 @@ GSHEET_LLM_CACHE_HEADERS = [
 
 def _taipei_today_str() -> str:
     """GitHub runner 預設常是 UTC；這裡固定用台北日期判斷「當天」。"""
-    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y/%m/%d")
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y/%m/%d")
 
 
 def _compact_date_key(date_str: str) -> str:
@@ -1339,17 +1145,78 @@ def _gsheet_llm_cache_key(task: str, stock_code: str, cache_date: str | None = N
     return f"{date_key}_{stock_key}_{task_key}_{model_key}"
 
 
-def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prompt: str = "") -> str:
-    """讀取 Google Sheet Gemini 每日快取。
+def _daily_task_llm_cache_path(task: str, stock_code: str, cache_date: str | None = None) -> str:
+    key = _gsheet_llm_cache_key(task, stock_code, cache_date=cache_date)
+    safe_key = re.sub(r"[^A-Za-z0-9_.一-鿿-]", "_", key)
+    return os.path.join(LLM_CACHE_DIR, "daily", f"{safe_key}.txt")
 
-    設計原則：同股票、同任務、同模型、同一個台北日期，只要跑過一次，
-    當天再跑就直接使用該輸出，不再呼叫 Gemini。PromptHash 只保留作檢查紀錄，
-    不拿來阻擋當日快取命中。
+
+def load_daily_task_llm_cache(task: str, stock_code: str) -> str:
+    """同股票、同任務、同模型、同一台北日期的本機快取。
+
+    與 prompt hash 快取不同，這份快取可直接取代原本每次都要連線 Google Sheet
+    才能判斷「今天是否已產生摘要」的慢速路徑。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if not LLM_CACHE_ENABLE or not LLM_DAILY_TASK_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
         return ""
     if not task or not stock_code:
         return ""
+    key = _gsheet_llm_cache_key(task, stock_code)
+    with _DAILY_LLM_CACHE_LOCK:
+        if key in _DAILY_LLM_CACHE_MEM:
+            return str(_DAILY_LLM_CACHE_MEM.get(key, "") or "")
+
+    path = _daily_task_llm_cache_path(task, stock_code)
+    text = ""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+    except Exception as exc:
+        print(f"⚠️ Gemini 每日任務本機快取讀取失敗：{path}｜{exc}")
+        text = ""
+
+    with _DAILY_LLM_CACHE_LOCK:
+        _DAILY_LLM_CACHE_MEM[key] = text
+    if text:
+        print(f"⚡ Gemini 每日任務本機快取命中：{key}")
+    return text
+
+
+def save_daily_task_llm_cache(task: str, stock_code: str, output_text: str, cache_date: str | None = None):
+    if not LLM_CACHE_ENABLE or not LLM_DAILY_TASK_CACHE_ENABLE or not output_text:
+        return
+    if not task or not stock_code:
+        return
+    key = _gsheet_llm_cache_key(task, stock_code, cache_date=cache_date)
+    path = _daily_task_llm_cache_path(task, stock_code, cache_date=cache_date)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(output_text))
+        with _DAILY_LLM_CACHE_LOCK:
+            _DAILY_LLM_CACHE_MEM[key] = str(output_text)
+        print(f"💾 Gemini 每日任務結果已存本機：{key}")
+    except Exception as exc:
+        print(f"⚠️ Gemini 每日任務本機快取寫入失敗：{path}｜{exc}")
+
+
+def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prompt: str = "") -> str:
+    """本機每日任務快取優先；只有允許時才回退 Google Sheet。
+
+    正式產圖可停用 Google Sheet 讀取，避免一次快取命中仍等待十多秒；
+    預熱或舊資料相容模式仍可保留 Google Sheet 作為備援來源。
+    """
+    if LLM_CACHE_FORCE_REFRESH or not task or not stock_code:
+        return ""
+
+    local_text = load_daily_task_llm_cache(task, stock_code)
+    if local_text:
+        return local_text
+
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_LLM_CACHE_READ_ENABLE:
+        return ""
+
     key = _gsheet_llm_cache_key(task, stock_code)
     try:
         sh = _open_gsheet()
@@ -1363,8 +1230,6 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
         if "快取鍵" not in headers or "Gemini輸出" not in headers:
             return ""
 
-        # 只讀第一欄尋找最後一筆相同快取鍵，再讀取該列；
-        # 避免每次命中檢查都下載整張包含長篇 Gemini 文字的工作表。
         key_values = ws.col_values(1)
         matched_row_numbers = [
             row_number
@@ -1387,17 +1252,18 @@ def load_gsheet_llm_cache(task: str, stock_code: str, stock_name: str = "", prom
                 print(f"📦 Google Sheet Gemini 當日快取命中：{key}｜PromptHash 不同，但依當日快取規則直接重用")
             else:
                 print(f"📦 Google Sheet Gemini 當日快取命中：{key}")
+            save_daily_task_llm_cache(task, stock_code, output_text)
             return output_text
-    except Exception as e:
-        print(f"⚠️ Google Sheet Gemini 快取讀取失敗：{key}｜{e}")
+    except Exception as exc:
+        print(f"⚠️ Google Sheet Gemini 快取讀取失敗：{key}｜{exc}")
     return ""
 
-
 def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: str, output_text: str):
-    """將 Gemini 原始輸出寫回 Google Sheet，供同日重跑直接重用。"""
-    if not GSHEET_LLM_CACHE_ENABLE or not output_text:
+    """先寫本機每日快取；Google Sheet 寫入可獨立停用以縮短正式產圖時間。"""
+    if not output_text or not task or not stock_code:
         return
-    if not task or not stock_code:
+    save_daily_task_llm_cache(task, stock_code, output_text)
+    if not GSHEET_LLM_CACHE_ENABLE or not GSHEET_LLM_CACHE_WRITE_ENABLE:
         return
     sh = _open_gsheet()
     if sh is None:
@@ -1441,408 +1307,70 @@ def save_gsheet_llm_cache(task: str, stock_code: str, stock_name: str, prompt: s
 # 股價 / 指標
 # ============================================================
 
-def _load_local_stock_name_map(force_refresh: bool = False) -> Dict[str, str]:
-    """讀取本機股票名稱 JSON；檔案不存在時回傳空表，不影響原有備援流程。"""
-    global _STOCK_NAME_LOCAL_MAP_CACHE
-
-    if not STOCK_NAME_LOCAL_CACHE_ENABLE:
-        return {}
-
-    with _STOCK_NAME_LOCAL_MAP_CACHE_LOCK:
-        if _STOCK_NAME_LOCAL_MAP_CACHE is not None and not force_refresh:
-            return dict(_STOCK_NAME_LOCAL_MAP_CACHE)
-
-    lookup = {}
-    path = str(STOCK_NAME_LOCAL_CACHE_FILE or "").strip()
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            raw_map = payload.get("stocks", payload) if isinstance(payload, dict) else {}
-            if isinstance(raw_map, dict):
-                for raw_code, raw_name in raw_map.items():
-                    code = _normalize_stock_name_code_key(raw_code)
-                    name = str(raw_name or "").strip()
-                    if code and name and name != "未知公司":
-                        lookup[code] = name
-            if lookup:
-                print(f"📦 已讀取本機股票名稱對照：{path}｜{len(lookup):,} 筆")
-        except Exception as e:
-            print(f"⚠️ 本機股票名稱對照讀取失敗：{path}｜{e}")
-
-    with _STOCK_NAME_LOCAL_MAP_CACHE_LOCK:
-        _STOCK_NAME_LOCAL_MAP_CACHE = dict(lookup)
-    return lookup
-
-
-def _save_local_stock_name_entry(stock_code: str, stock_name: str):
-    """將新查到的股票名稱寫入本機 JSON，供同次執行與有 Actions cache 的後續執行重用。"""
-    global _STOCK_NAME_LOCAL_MAP_CACHE
-
-    if not STOCK_NAME_LOCAL_CACHE_ENABLE:
-        return
-    code = _normalize_stock_name_code_key(stock_code)
-    name = str(stock_name or "").strip()
-    if not code or not name or name == "未知公司":
-        return
-
-    try:
-        lookup = _load_local_stock_name_map(force_refresh=False)
-        if lookup.get(code) == name:
-            return
-        lookup[code] = name
-        path = str(STOCK_NAME_LOCAL_CACHE_FILE or "").strip()
-        if not path:
-            return
-        _ensure_dir(os.path.dirname(path))
-        payload = {
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "stocks": dict(sorted(lookup.items())),
-        }
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
-        with _STOCK_NAME_LOCAL_MAP_CACHE_LOCK:
-            _STOCK_NAME_LOCAL_MAP_CACHE = dict(lookup)
-        print(f"💾 股票名稱已寫入本機對照：{code} {name}")
-    except Exception as e:
-        print(f"⚠️ 本機股票名稱對照寫入失敗：{code}｜{e}")
-
-
-def _fetch_official_stock_name_source(source: dict) -> Dict[str, dict]:
-    """抓取單一官方公司基本資料來源，回傳代號到名稱資訊。"""
-    try:
-        resp = get_thread_session().get(
-            source["url"],
-            headers={
-                "User-Agent": HDR["User-Agent"],
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-            timeout=(5, max(5.0, STOCK_NAME_OFFICIAL_TIMEOUT)),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list):
-            return {}
-
-        lookup = {}
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            code = _normalize_stock_name_code_key(_pick_row_value(row, source["code_keys"]))
-            name = str(_pick_row_value(row, source["name_keys"]) or "").strip()
-            if code and name and name != "未知公司":
-                lookup[code] = {
-                    "name": name,
-                    "market": source["market"],
-                    "source": source["label"],
-                }
-        return lookup
-    except Exception as e:
-        print(f"⚠️ {source['label']} 股票名稱對照抓取失敗：{e}")
-        return {}
-
-
-def read_official_stock_name_info_map(force_refresh: bool = False) -> Dict[str, dict]:
-    """TWSE 與 TPEx 公司基本資料平行抓取，並在同次執行中共用結果。"""
-    global _OFFICIAL_STOCK_NAME_INFO_CACHE
-
-    with _OFFICIAL_STOCK_NAME_INFO_CACHE_LOCK:
-        if _OFFICIAL_STOCK_NAME_INFO_CACHE is not None and not force_refresh:
-            return {k: dict(v) for k, v in _OFFICIAL_STOCK_NAME_INFO_CACHE.items()}
-
-    sources = [
-        {
-            "label": "TWSE上市公司基本資料",
-            "market": "上市",
-            "url": "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-            "code_keys": ["公司代號", "股票代號", "有價證券代號", "代號"],
-            "name_keys": ["公司簡稱", "公司名稱", "有價證券名稱", "名稱"],
-        },
-        {
-            "label": "TPEx上櫃公司基本資料",
-            "market": "上櫃",
-            "url": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-            "code_keys": ["公司代號", "股票代號", "有價證券代號", "代號"],
-            "name_keys": ["公司簡稱", "公司名稱", "有價證券名稱", "名稱"],
-        },
-    ]
-
-    combined = {}
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(_fetch_official_stock_name_source, source) for source in sources]
-        for future in futures:
-            try:
-                combined.update(future.result())
-            except Exception as e:
-                print(f"⚠️ 官方股票名稱對照工作失敗：{e}")
-
-    with _OFFICIAL_STOCK_NAME_INFO_CACHE_LOCK:
-        _OFFICIAL_STOCK_NAME_INFO_CACHE = {k: dict(v) for k, v in combined.items()}
-    if combined:
-        print(f"📦 官方股票名稱對照已載入並快取：{len(combined):,} 筆")
-    return combined
-
-
-def read_official_stock_name_info_for_code(stock_code: str) -> dict:
-    """只查單一股票代號；任一官方來源先命中就立即回傳，不等待另一市場逾時。"""
-    global _OFFICIAL_STOCK_NAME_INFO_CACHE
-
-    code = _normalize_stock_name_code_key(stock_code)
-    if not code:
-        return {}
-
-    with _OFFICIAL_STOCK_NAME_INFO_CACHE_LOCK:
-        if _OFFICIAL_STOCK_NAME_INFO_CACHE is not None:
-            cached = _OFFICIAL_STOCK_NAME_INFO_CACHE.get(code)
-            if cached:
-                return dict(cached)
-
-    sources = [
-        {
-            "label": "TWSE上市公司基本資料",
-            "market": "上市",
-            "url": "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-            "code_keys": ["公司代號", "股票代號", "有價證券代號", "代號"],
-            "name_keys": ["公司簡稱", "公司名稱", "有價證券名稱", "名稱"],
-        },
-        {
-            "label": "TPEx上櫃公司基本資料",
-            "market": "上櫃",
-            "url": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-            "code_keys": ["公司代號", "股票代號", "有價證券代號", "代號"],
-            "name_keys": ["公司簡稱", "公司名稱", "有價證券名稱", "名稱"],
-        },
-    ]
-
-    executor = ThreadPoolExecutor(max_workers=2)
-    futures = [executor.submit(_fetch_official_stock_name_source, source) for source in sources]
-    combined = {}
-    found = {}
-    try:
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-            except Exception as e:
-                print(f"⚠️ 官方股票名稱單一代號查詢失敗：{e}")
-                result = {}
-            if result:
-                combined.update(result)
-            if code in result:
-                found = dict(result[code])
-                for pending in futures:
-                    if pending is not future:
-                        pending.cancel()
-                break
-    finally:
-        executor.shutdown(wait=not bool(found), cancel_futures=True)
-
-    if combined:
-        with _OFFICIAL_STOCK_NAME_INFO_CACHE_LOCK:
-            if _OFFICIAL_STOCK_NAME_INFO_CACHE is None:
-                _OFFICIAL_STOCK_NAME_INFO_CACHE = {}
-            _OFFICIAL_STOCK_NAME_INFO_CACHE.update({k: dict(v) for k, v in combined.items()})
-
-    return found
-
-
-def _preload_stock_name_gsheet_worker():
-    """背景開啟 Google Sheet 並預載名稱表，讓網路等待與股價／權證流程重疊。"""
-    try:
-        read_gsheet_stock_name_map(force_refresh=False)
-    except Exception as e:
-        print(f"⚠️ Google Sheet 股票名稱背景預載失敗：{e}")
-
-
-def _start_stock_name_gsheet_preload():
-    global _STOCK_NAME_GSHEET_PRELOAD_THREAD
-
-    if not STOCK_NAME_GSHEET_ENABLE:
-        return
-    with _STOCK_NAME_GSHEET_PRELOAD_LOCK:
-        if _STOCK_NAME_MAP_CACHE is not None:
-            return
-        if _STOCK_NAME_GSHEET_PRELOAD_THREAD is not None and _STOCK_NAME_GSHEET_PRELOAD_THREAD.is_alive():
-            return
-        _STOCK_NAME_GSHEET_PRELOAD_THREAD = threading.Thread(
-            target=_preload_stock_name_gsheet_worker,
-            name="stock-name-gsheet-preload",
-            daemon=True,
-        )
-        _STOCK_NAME_GSHEET_PRELOAD_THREAD.start()
-        print("🚀 Google Sheet 股票名稱對照已在背景預載")
-
-
-def _save_gsheet_stock_name_cache_async(stock_code: str, stock_name: str, market: str = "", source: str = ""):
-    """維持原本名稱寫回功能，但不讓 Google Sheet 網路等待卡住主報告。"""
-    if not STOCK_NAME_GSHEET_ENABLE:
-        return
-
-    def worker():
-        try:
-            code = _normalize_stock_name_code_key(stock_code)
-            name = str(stock_name or "").strip()
-            # 背景名稱表若已經有相同對照，就不再讀全表與寫回。
-            existing = read_gsheet_stock_name_map(force_refresh=False)
-            if code and str(existing.get(code, "") or "").strip() == name:
-                return
-            save_gsheet_stock_name_cache(stock_code, stock_name, market=market, source=source)
-        except Exception as e:
-            print(f"⚠️ 股票名稱背景寫回 Google Sheet 失敗：{stock_code}｜{e}")
-
-    threading.Thread(
-        target=worker,
-        name=f"stock-name-save-{_normalize_stock_name_code_key(stock_code)}",
-        daemon=True,
-    ).start()
-
-
-def get_tw_stock_name(stock_code: str) -> str:
-    stock_code = _normalize_stock_name_code_key(stock_code)
-    if not stock_code:
-        return "未知公司"
-
-    # 1) 本機名稱對照最快；若 GitHub Actions 有快取 warrant_cache，後續 run 可直接命中。
-    try:
-        local_name = str(_load_local_stock_name_map().get(stock_code, "") or "").strip()
-        if local_name and local_name != "未知公司":
-            print(f"✅ 股票名稱本機對照命中：{stock_code} {local_name}｜來源：{STOCK_NAME_LOCAL_CACHE_FILE}")
-            _start_stock_name_gsheet_preload()
-            return local_name
-    except Exception as e:
-        print(f"⚠️ 本機股票名稱對照查詢失敗：{stock_code}｜{e}")
-
-    # Google Sheet 在背景預載，不再先阻塞股票名稱查詢。
-    _start_stock_name_gsheet_preload()
-
-    # 2) 上市與上櫃公司基本資料平行下載，通常比首次 Google Sheet 授權與讀全表更快。
-    try:
-        official_info = read_official_stock_name_info_for_code(stock_code)
-        official_name = str(official_info.get("name", "") or "").strip()
-        if official_name and official_name != "未知公司":
-            market = str(official_info.get("market", "") or "")
-            source = str(official_info.get("source", "") or "官方公司基本資料")
-            print(f"✅ 股票名稱查詢成功：{stock_code} {official_name}｜來源：{source}")
-            _save_local_stock_name_entry(stock_code, official_name)
-            _save_gsheet_stock_name_cache_async(stock_code, official_name, market=market, source=source)
-            return official_name
-    except Exception as e:
-        print(f"⚠️ 官方股票名稱對照查詢失敗：{stock_code}｜{e}")
-
-    # 3) ETF / ETN 或官方基本資料暫時缺漏時，才等待 Google Sheet 名稱對照備援。
-    if STOCK_NAME_GSHEET_ENABLE:
-        try:
-            name_map = read_gsheet_stock_name_map()
-            cached_name = str(name_map.get(stock_code, "") or "").strip()
-            if cached_name and cached_name != "未知公司":
-                mode_note = "純 Live 名稱對照" if REPORT_LIVE_ONLY else "名稱快取"
-                print(f"✅ 股票名稱{mode_note}命中：{stock_code} {cached_name}｜來源：{GSHEET_STOCK_NAME_SHEET}")
-                _save_local_stock_name_entry(stock_code, cached_name)
-                return cached_name
-        except Exception as e:
-            print(f"⚠️ Google Sheet 股票名稱對照讀取失敗：{stock_code}｜{e}")
-    elif REPORT_LIVE_ONLY:
-        print(f"🔴 純 Live 模式：股票名稱對照已關閉，改查官方即時資料源：{stock_code}")
-
-    # 3) 公司基本資料查不到時，保留原本每日行情備援。ETF / ETN 常會靠這段或 Google Sheet 對照表取得名稱。
-    # TWSE
-    try:
-        url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json"
-        resp = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=8)
-        resp.raise_for_status()
-        for item in resp.json().get("data", []):
-            if len(item) >= 2 and _normalize_stock_name_code_key(item[0]) == stock_code:
-                name = str(item[1]).strip()
-                if name and name != "未知公司":
-                    print(f"✅ 股票名稱查詢成功：{stock_code} {name}｜來源：TWSE每日行情")
-                    _save_local_stock_name_entry(stock_code, name)
-                    _save_gsheet_stock_name_cache_async(stock_code, name, market="上市", source="TWSE每日行情")
-                    return name
-    except Exception as e:
-        print(f"⚠️ TWSE 每日行情股票名稱查詢失敗：{stock_code}｜{e}")
-
-    # TPEx
-    try:
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=json"
-        resp = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=8)
-        resp.raise_for_status()
-        tables = resp.json().get("tables", [])
-        if tables:
-            for item in tables[0].get("data", []):
-                if len(item) >= 2 and _normalize_stock_name_code_key(item[0]) == stock_code:
-                    name = str(item[1]).strip()
-                    if name and name != "未知公司":
-                        print(f"✅ 股票名稱查詢成功：{stock_code} {name}｜來源：TPEx每日行情")
-                        _save_local_stock_name_entry(stock_code, name)
-                        _save_gsheet_stock_name_cache_async(stock_code, name, market="上櫃", source="TPEx每日行情")
-                        return name
-    except Exception as e:
-        print(f"⚠️ TPEx 每日行情股票名稱查詢失敗：{stock_code}｜{e}")
-
-    print(f"⚠️ 股票名稱查詢失敗：{stock_code}，請確認 Google Sheet「{GSHEET_STOCK_NAME_SHEET}」是否有此代號，或官方資料源是否可連線")
-    return "未知公司"
-
-
-def fetch_stock_data_yf(stock_code: str, period="160d"):
-    for suffix, market in [("TW", "上市"), ("TWO", "上櫃")]:
-        full_code = f"{stock_code}.{suffix}"
-        try:
-            print(f"🔍 下載股價：{full_code}")
-            df = yf.download(full_code, period=period, interval="1d", progress=False, auto_adjust=False)
-            if df is None or df.empty:
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            need = {"Open", "High", "Low", "Close", "Volume"}
-            if not need.issubset(df.columns):
-                continue
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy().dropna()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            df.index.name = "Date"
-            return df, market, full_code
-        except Exception as e:
-            print(f"⚠️ {full_code} 下載失敗：{e}")
-    return None, None, None
-
 
 def add_supertrend(df: pd.DataFrame, period=10, multiplier=2.5, use_atr=True) -> pd.DataFrame:
-    df = df.copy()
-    hl2 = (df["High"] + df["Low"]) / 2
+    """計算 Supertrend；使用 NumPy 陣列迴圈，避免逐列 ``.iloc`` 寫入的額外成本。"""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["Supertrend", "Supertrend_Trend", "Supertrend_Buy", "Supertrend_Sell"],
+            index=getattr(df, "index", None),
+        )
+
+    work = df.copy()
+    hl2 = (work["High"] + work["Low"]) / 2
     tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift()).abs(),
-        (df["Low"] - df["Close"].shift()).abs(),
+        work["High"] - work["Low"],
+        (work["High"] - work["Close"].shift()).abs(),
+        (work["Low"] - work["Close"].shift()).abs(),
     ], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / period, adjust=False).mean() if use_atr else tr.rolling(period).mean()
-    upper_basic = hl2 - multiplier * atr
-    lower_basic = hl2 + multiplier * atr
+
+    close = pd.to_numeric(work["Close"], errors="coerce").to_numpy(dtype=float)
+    upper_basic = (hl2 - multiplier * atr).to_numpy(dtype=float)
+    lower_basic = (hl2 + multiplier * atr).to_numpy(dtype=float)
+    n = len(work)
+
     upper_band = upper_basic.copy()
     lower_band = lower_basic.copy()
-    trend = [1]
-    supertrend = [np.nan]
-    buy_signal = [False]
-    sell_signal = [False]
-    for i in range(1, len(df)):
-        upper_band.iloc[i] = max(upper_basic.iloc[i], upper_band.iloc[i - 1]) if df["Close"].iloc[i - 1] > upper_band.iloc[i - 1] else upper_basic.iloc[i]
-        lower_band.iloc[i] = min(lower_basic.iloc[i], lower_band.iloc[i - 1]) if df["Close"].iloc[i - 1] < lower_band.iloc[i - 1] else lower_basic.iloc[i]
-        prev = trend[-1]
-        if prev == -1 and df["Close"].iloc[i] > lower_band.iloc[i - 1]:
-            trend.append(1)
-        elif prev == 1 and df["Close"].iloc[i] < upper_band.iloc[i - 1]:
-            trend.append(-1)
+    trend = np.ones(n, dtype=int)
+    supertrend = np.full(n, np.nan, dtype=float)
+    buy_signal = np.zeros(n, dtype=bool)
+    sell_signal = np.zeros(n, dtype=bool)
+
+    for i in range(1, n):
+        prev_close = close[i - 1]
+        prev_upper = upper_band[i - 1]
+        prev_lower = lower_band[i - 1]
+
+        upper_band[i] = (
+            max(upper_basic[i], prev_upper)
+            if prev_close > prev_upper
+            else upper_basic[i]
+        )
+        lower_band[i] = (
+            min(lower_basic[i], prev_lower)
+            if prev_close < prev_lower
+            else lower_basic[i]
+        )
+
+        previous_trend = trend[i - 1]
+        if previous_trend == -1 and close[i] > prev_lower:
+            trend[i] = 1
+        elif previous_trend == 1 and close[i] < prev_upper:
+            trend[i] = -1
         else:
-            trend.append(prev)
-        buy_signal.append(trend[-1] == 1 and trend[-2] == -1)
-        sell_signal.append(trend[-1] == -1 and trend[-2] == 1)
-        supertrend.append(upper_band.iloc[i] if trend[-1] == 1 else lower_band.iloc[i])
+            trend[i] = previous_trend
+
+        buy_signal[i] = trend[i] == 1 and previous_trend == -1
+        sell_signal[i] = trend[i] == -1 and previous_trend == 1
+        supertrend[i] = upper_band[i] if trend[i] == 1 else lower_band[i]
+
     return pd.DataFrame({
         "Supertrend": supertrend,
         "Supertrend_Trend": trend,
         "Supertrend_Buy": buy_signal,
         "Supertrend_Sell": sell_signal,
-    }, index=df.index)
+    }, index=work.index)
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -1943,18 +1471,9 @@ def get_macd_signals(df):
     return "．".join(notes)
 
 
-
 # ============================================================
 # 三大法人資料與繪圖
 # ============================================================
-
-def _to_lots(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
-    # 舊版相容函式：只用在單一欄位備援。三大法人主流程請使用 _convert_inst_amounts_to_lots，
-    # 避免外資 / 投信被轉成張，但數值較小的自營商仍停留在股。
-    if s.abs().median(skipna=True) > 50000:
-        return s / 1000.0
-    return s
 
 
 def _convert_inst_amounts_to_lots(amount_df: pd.DataFrame, source_label: str = "三大法人") -> pd.DataFrame:
@@ -2054,47 +1573,6 @@ def _pick_existing_col_loose(df: pd.DataFrame, candidates: List[str]) -> str:
     return ""
 
 
-def _find_institutional_col_by_keywords(
-    df: pd.DataFrame,
-    include_groups: List[List[str]],
-    exclude_keywords: List[str] | None = None,
-) -> str:
-    """依欄位名稱關鍵字尋找法人欄位；include_groups 任一組全命中即符合。"""
-    exclude_keys = [_normalize_inst_column_key(k) for k in (exclude_keywords or []) if str(k or "").strip()]
-    include_keys = [
-        [_normalize_inst_column_key(k) for k in group if str(k or "").strip()]
-        for group in include_groups
-    ]
-    for col in df.columns:
-        key = _normalize_inst_column_key(col)
-        if not key:
-            continue
-        if any(ex and ex in key for ex in exclude_keys):
-            continue
-        for group in include_keys:
-            if group and all(k in key for k in group):
-                return col
-    return ""
-
-
-def _find_dealer_total_col(df: pd.DataFrame) -> str:
-    """只找自營商合計欄位；排除自行買賣與避險欄位。"""
-    exact_candidates = [
-        "自營商", "自營商買賣超", "自營商買賣超股數", "自營商買賣超張數",
-        "dealer", "Dealer", "Dealer買賣超", "Dealer_BuySell",
-    ]
-    col = _pick_existing_col_loose(df, exact_candidates)
-    if col:
-        key = _normalize_inst_column_key(col)
-        if not any(k in key for k in ["自行", "self", "避險", "hedg"]):
-            return col
-    return _find_institutional_col_by_keywords(
-        df,
-        include_groups=[["自營商", "買賣超"], ["dealer"]],
-        exclude_keywords=["自行", "self", "避險", "hedg"],
-    )
-
-
 def _standardize_institutional_long_df(raw: pd.DataFrame, stock_code: str, days: int, source_label: str) -> pd.DataFrame:
     """處理 FinMind / X_function 原始長表格式。
 
@@ -2186,177 +1664,6 @@ def _standardize_institutional_long_df(raw: pd.DataFrame, stock_code: str, days:
     print(f"✅ {source_label} 三大法人資料：{stock_code}，{len(out):,} 筆｜{dealer_note}")
     return out[["Date", "foreign", "invest", "dealer", "total"]]
 
-def _standardize_institutional_wide_df(raw: pd.DataFrame, stock_code: str, days: int, source_label: str) -> pd.DataFrame:
-    """處理 X_function 可能回傳的寬表格式；自營商只採自行買賣，不採避險。"""
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-
-    date_col = _pick_existing_col_loose(raw, ["date", "Date", "日期"])
-    foreign_col = _pick_existing_col_loose(raw, [
-        "外資", "外資買賣超", "外資買賣超股數", "外資及陸資", "外資及陸資買賣超股數",
-        "foreign", "Foreign", "Foreign_Investor",
-    ]) or _find_institutional_col_by_keywords(
-        raw,
-        include_groups=[["外資"], ["foreign"]],
-        exclude_keywords=["自營", "dealer", "投信", "trust", "避險", "hedg"],
-    )
-    invest_col = _pick_existing_col_loose(raw, [
-        "投信", "投信買賣超", "投信買賣超股數", "investment_trust", "Investment_Trust",
-    ]) or _find_institutional_col_by_keywords(
-        raw,
-        include_groups=[["投信"], ["investment", "trust"]],
-        exclude_keywords=["自營", "dealer", "外資", "foreign", "避險", "hedg"],
-    )
-    dealer_self_col = _pick_existing_col_loose(raw, [
-        "自營商自行買賣", "自營商自行買賣買賣超", "自營商自行買賣買賣超股數",
-        "自營商買賣超股數自行買賣", "自營商(自行買賣)", "自營商-自行買賣",
-        "Dealer_self", "dealer_self", "DealerSelf", "self_dealer",
-    ]) or _find_institutional_col_by_keywords(
-        raw,
-        include_groups=[["自營", "自行"], ["dealer", "self"]],
-        exclude_keywords=["避險", "hedg"],
-    )
-    dealer_hedge_col = _pick_existing_col_loose(raw, [
-        "自營商避險", "自營商避險買賣超", "自營商避險買賣超股數",
-        "自營商買賣超股數避險", "自營商(避險)", "自營商-避險",
-        "Dealer_Hedging", "dealer_hedging", "DealerHedging",
-    ]) or _find_institutional_col_by_keywords(
-        raw,
-        include_groups=[["自營", "避險"], ["dealer", "hedg"]],
-    )
-    dealer_total_col = _find_dealer_total_col(raw)
-
-    if not date_col or not foreign_col or not invest_col:
-        print(f"⚠️ {source_label} 法人資料欄位不符：{raw.columns.tolist()}")
-        return pd.DataFrame()
-
-    if dealer_self_col:
-        dealer_raw = pd.to_numeric(raw[dealer_self_col], errors="coerce").fillna(0.0)
-        dealer_note = f"自營商採用自行買賣欄位：{dealer_self_col}"
-    elif dealer_total_col and dealer_hedge_col:
-        dealer_raw = (
-            pd.to_numeric(raw[dealer_total_col], errors="coerce").fillna(0.0)
-            - pd.to_numeric(raw[dealer_hedge_col], errors="coerce").fillna(0.0)
-        )
-        dealer_note = f"自營商合計扣除避險：{dealer_total_col} - {dealer_hedge_col}"
-    elif dealer_total_col:
-        allow_aggregate = os.getenv("WARRANT_ALLOW_AGGREGATE_DEALER_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
-        if allow_aggregate:
-            dealer_raw = pd.to_numeric(raw[dealer_total_col], errors="coerce").fillna(0.0)
-            dealer_note = f"⚠️ 自營商使用合計欄位：{dealer_total_col}（未排除避險）"
-        else:
-            print(
-                f"⚠️ {source_label} 只有自營商合計欄位「{dealer_total_col}」，無法確認是否含避險；"
-                "本次略過 X_function 三大法人備援，避免把 Dealer_Hedging 算進圖表。"
-            )
-            return pd.DataFrame()
-    else:
-        print(f"⚠️ {source_label} 找不到自營商自行買賣欄位，略過三大法人備援：{raw.columns.tolist()}")
-        return pd.DataFrame()
-
-    out = pd.DataFrame()
-    out["Date"] = raw[date_col].map(parse_date)
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    if out["Date"].isna().any():
-        fallback_date = pd.to_datetime(raw.loc[out["Date"].isna(), date_col], errors="coerce")
-        out.loc[out["Date"].isna(), "Date"] = fallback_date
-    out = out.dropna(subset=["Date"])
-    if out.empty:
-        print(f"⚠️ {source_label} 日期欄位無法解析：{date_col}")
-        return pd.DataFrame()
-
-    raw2 = raw.loc[out.index].copy()
-    out["foreign"] = pd.to_numeric(raw2[foreign_col], errors="coerce").fillna(0.0).astype(float).values
-    out["invest"] = pd.to_numeric(raw2[invest_col], errors="coerce").fillna(0.0).astype(float).values
-    out["dealer"] = pd.to_numeric(dealer_raw.loc[out.index], errors="coerce").fillna(0.0).astype(float).values
-    out = _convert_inst_amounts_to_lots(out, source_label=f"{source_label} 三大法人備援")
-    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
-    out = out.sort_values("Date").tail(days).reset_index(drop=True)
-    print(f"✅ {source_label} 三大法人備援資料：{stock_code}，{len(out):,} 筆｜{dealer_note}")
-    return out[["Date", "foreign", "invest", "dealer", "total"]]
-
-
-def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
-    """
-    直接使用 FinMind API 抓三大法人買賣超。
-    若有 FINMIND_API_TOKEN 會帶 token；若沒有 token，仍先嘗試 FinMind 公開 API。
-    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
-    """
-    token = os.getenv("FINMIND_API_TOKEN", "").strip()
-    if not token:
-        print("⚠️ 未設定 FINMIND_API_TOKEN，先嘗試 FinMind 公開 API；若失敗再走 X_function 安全備援")
-
-    try:
-        end_dt = datetime.today()
-        start_dt = end_dt - timedelta(days=max(int(days * 2.8), 120))
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {
-            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-            "data_id": str(stock_code).strip(),
-            "start_date": start_dt.strftime("%Y-%m-%d"),
-            "end_date": end_dt.strftime("%Y-%m-%d"),
-        }
-        headers = {
-            "User-Agent": HDR["User-Agent"],
-        }
-        if token:
-            params["token"] = token
-            headers["Authorization"] = f"Bearer {token}"
-
-        resp = requests.get(url, params=params, headers=headers, timeout=(8, 30))
-        resp.raise_for_status()
-        payload = resp.json()
-        data = payload.get("data", []) if isinstance(payload, dict) else payload
-        if not data:
-            msg = payload.get("msg", "") if isinstance(payload, dict) else ""
-            print(f"⚠️ FinMind 三大法人資料為空：{stock_code} {msg}")
-            return pd.DataFrame()
-
-        raw = pd.DataFrame(data).fillna(0)
-        out = _standardize_institutional_long_df(raw, stock_code, days, "FinMind")
-        if out is None or out.empty:
-            print(f"⚠️ FinMind 三大法人欄位不符：{raw.columns.tolist()}")
-            return pd.DataFrame()
-        return out
-    except Exception as e:
-        print(f"⚠️ FinMind 三大法人資料抓取失敗：{e}")
-        return pd.DataFrame()
-
-
-def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
-    """
-    優先使用 FinMind API 抓三大法人資料，並排除 Dealer_Hedging / 自營商避險。
-    若 FinMind API 失敗，才使用 X_function 備援；備援也必須能拆出自營商自行買賣，
-    否則直接略過，避免把權證或衍生性商品避險部位誤算進自營商。
-    回傳欄位: Date, foreign, invest, dealer, total，單位統一為張。
-    """
-    out = fetch_inst_60d_from_finmind_token(stock_code, days=days)
-    if out is not None and not out.empty:
-        return out
-
-    if get_institutional_stats_finmind is None:
-        print("⚠️ 找不到 X_function.get_institutional_stats_finmind，且 FinMind 未取得資料，略過三大法人資料")
-        return pd.DataFrame()
-    try:
-        inst = get_institutional_stats_finmind(stock_code, n_days=int(days * 2.2))
-    except Exception as e:
-        print(f"⚠️ X_function 三大法人資料抓取失敗：{e}")
-        return pd.DataFrame()
-    if inst is None or inst.empty:
-        return pd.DataFrame()
-
-    # 若 X_function 回傳的是 FinMind 長表格式，使用同一套分類邏輯，會排除 Dealer_Hedging。
-    maybe_name_col = _pick_existing_col_loose(inst, [
-        "name", "institutional_investor", "institutional_investors", "investor",
-        "type", "category", "法人", "身份別", "投資人類別",
-    ])
-    if maybe_name_col:
-        out = _standardize_institutional_long_df(inst, stock_code, days, "X_function")
-        if out is not None and not out.empty:
-            return out
-
-    # 若 X_function 回傳的是外資 / 投信 / 自營商寬表，必須確認自營商是「自行買賣」口徑。
-    return _standardize_institutional_wide_df(inst, stock_code, days, "X_function")
 
 def plot_institutional_stacked_bars(ax, plot_df: pd.DataFrame, x: list):
     """三大法人買賣超（正負堆疊柱狀圖），單位：張。"""
@@ -2481,8 +1788,11 @@ def _open_gsheet(force_refresh: bool = False):
 
 
 def _open_warrant_cache_gsheet(force_refresh: bool = False, create_if_missing: bool = True):
-    """開啟權證完整快照專用試算表；讀取快取時可禁止自動建立，避免無快取時先花時間建表。"""
-    global _WARRANT_CACHE_GSHEET_HANDLE_CACHE
+    """開啟權證完整快照專用試算表；同次執行遇到 Drive 配額錯誤後不再重試。"""
+    global _WARRANT_CACHE_GSHEET_HANDLE_CACHE, _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN
+
+    if _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN and not force_refresh:
+        return None
 
     if not WARRANT_CACHE_USE_SEPARATE_SHEET:
         return _open_gsheet(force_refresh=force_refresh)
@@ -2517,7 +1827,14 @@ def _open_warrant_cache_gsheet(force_refresh: bool = False, create_if_missing: b
             return sh
         except Exception as e:
             _WARRANT_CACHE_GSHEET_HANDLE_CACHE = None
-            print(f"⚠️ 權證快取試算表開啟失敗：{e}")
+            error_text = str(e or "")
+            if any(token in error_text.lower() for token in [
+                "storage quota", "quota has been exceeded", "drive storage quota", "insufficient storage",
+            ]):
+                _WARRANT_CACHE_GSHEET_DISABLED_FOR_RUN = True
+                print(f"⚠️ 權證快取試算表開啟失敗：{e}｜本次執行不再重試權證快取")
+            else:
+                print(f"⚠️ 權證快取試算表開啟失敗：{e}")
             return None
 
 
@@ -2552,19 +1869,6 @@ def read_warrant_cache_worksheet(title: str, allow_legacy: bool = True) -> pd.Da
     return pd.DataFrame()
 
 
-def read_gsheet_worksheet(title: str) -> pd.DataFrame:
-    if not GSHEET_FALLBACK_ENABLE:
-        return pd.DataFrame()
-    sh = _open_gsheet()
-    if sh is None:
-        return pd.DataFrame()
-    try:
-        ws = sh.worksheet(title)
-        records = ws.get_all_records(empty2zero=False, head=1)
-        return pd.DataFrame(records).fillna("") if records else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
 BRANCH_PERF_BRANCH_COL_CANDIDATES = [
     "分點", "分點名稱", "券商分點", "券商名稱", "券商", "分公司", "分點別"
 ]
@@ -2584,252 +1888,6 @@ BRANCH_PERF_AVG_HOLDING_DAYS_COL_CANDIDATES = [
 
 def _split_env_csv(raw: str) -> List[str]:
     return [x.strip() for x in re.split(r"[,，;；\n\r]+", str(raw or "")) if str(x or "").strip()]
-
-
-def _get_historical_branch_detail_sheet_names() -> List[str]:
-    """取得用來補漏歷史權證 / 歷史權證×分點 pair 的分點買賣明細工作表清單。"""
-    names = []
-    if HISTORICAL_BRANCH_DETAIL_SHEETS_RAW:
-        for item in re.split(r"[,，;；\n\r]+", HISTORICAL_BRANCH_DETAIL_SHEETS_RAW):
-            item = str(item or "").strip()
-            if item and item not in names:
-                names.append(item)
-    return names
-
-
-
-def parse_extra_live_warrants(stock_code: str, stock_name: str) -> List[dict]:
-    """解析手動指定的純 Live 補抓權證代號。
-
-    這不是 Google Sheet 快取；只是把使用者指定的權證代號補進本次 live API4/API5 查詢母體。
-    若不設定 WARRANT_EXTRA_LIVE_WARRANTS / WARRANT_EXTRA_WARRANT_CODES，預設不會新增任何權證。
-    """
-    raw = str(EXTRA_LIVE_WARRANTS_RAW or "").strip()
-    if not raw:
-        return []
-
-    stock_code_clean = _clean_code(stock_code)
-    out = []
-    seen = set()
-    for item in re.split(r"[,，;；\n\r]+", raw):
-        item = str(item or "").strip()
-        if not item:
-            continue
-        parts = [p.strip() for p in re.split(r"[:：|｜]", item) if p.strip()]
-        code = normalize_openapi_warrant_code(parts[0] if parts else item)
-        if not code or not re.fullmatch(r"\d{6}", code) or code in seen:
-            continue
-        name = parts[1] if len(parts) >= 2 else code
-        seen.add(code)
-        out.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": str(stock_code_clean),
-            "標的名稱": stock_name,
-            "成交金額": 0,
-            "成交量": 0,
-            "母體來源": "ExtraLiveWarrant",
-        })
-
-    if out:
-        preview = "、".join([f"{x['代號']} {x['名稱']}" for x in out[:12]])
-        if len(out) > 12:
-            preview += "…"
-        print(f"🔁 指定權證純 Live 補抓：{len(out):,} 支｜{preview}")
-    return out
-
-
-def get_debug_warrant_codes() -> set:
-    """取得要追蹤的權證代號集合；預設不指定，避免跨股票時固定追蹤舊案例。"""
-    raw = str(DEBUG_WARRANT_CODES_RAW or "").strip()
-    codes = set()
-    if raw:
-        for item in re.split(r"[,，;；\n\r|｜]+", raw):
-            code = normalize_openapi_warrant_code(str(item or "").strip())
-            if code and re.fullmatch(r"\d{6}", code):
-                codes.add(code)
-
-    # 使用者若有指定純 Live 權證，也一併納入 debug。
-    for item in re.split(r"[,，;；\n\r]+", str(EXTRA_LIVE_WARRANTS_RAW or "")):
-        parts = [p.strip() for p in re.split(r"[:：|｜]", str(item or "")) if p.strip()]
-        if parts:
-            code = normalize_openapi_warrant_code(parts[0])
-            if code and re.fullmatch(r"\d{6}", code):
-                codes.add(code)
-
-    # 使用者若有指定純 Live pair，也一併納入 debug。
-    for item in re.split(r"[,，;；\n\r]+", str(EXTRA_LIVE_PAIRS_RAW or "")):
-        parts = [p.strip() for p in re.split(r"[:：|｜]", str(item or "")) if p.strip()]
-        if parts:
-            code = normalize_openapi_warrant_code(parts[0])
-            if code and re.fullmatch(r"\d{6}", code):
-                codes.add(code)
-
-    return codes
-
-
-def parse_extra_live_pairs(stock_code: str, stock_name: str, warrant_lookup: dict | None = None) -> List[dict]:
-    """解析手動指定的純 Live 補抓 pair。
-
-    這不是 Google Sheet 快取；只是讓使用者在完全純 Live 模式下，
-    直接指定「權證代號 × 券商代號 × 分點」，再由 API5 即時回查買賣金額。
-    """
-    raw = str(EXTRA_LIVE_PAIRS_RAW or "").strip()
-    if not raw:
-        return []
-
-    warrant_lookup = warrant_lookup or {}
-    stock_code_clean = _clean_code(stock_code)
-    out = []
-    seen = set()
-
-    for item in re.split(r"[,，;；\n\r]+", raw):
-        item = str(item or "").strip()
-        if not item:
-            continue
-
-        parts = [p.strip() for p in re.split(r"[:：|｜]", item) if p.strip()]
-        if len(parts) < 3:
-            print(f"⚠️ 指定 pair 格式不足，略過：{item}｜格式：權證代號:券商代號:分點[:權證名稱]")
-            continue
-
-        code = normalize_openapi_warrant_code(parts[0])
-        broker_code = str(parts[1] or "").strip()
-        branch = normalize_branch_name(parts[2])
-        if not code or not re.fullmatch(r"\d{6}", code) or not broker_code or not branch:
-            print(f"⚠️ 指定 pair 欄位不完整，略過：{item}")
-            continue
-
-        key = (code, broker_code)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        w = warrant_lookup.get(code, {}) if isinstance(warrant_lookup, dict) else {}
-        warrant_name = parts[3] if len(parts) >= 4 else str(w.get("名稱", "") or w.get("warrant_name", "") or code).strip()
-        out.append({
-            "warrant_code": code,
-            "warrant_name": warrant_name,
-            "underlying_code": str(w.get("標的股", "") or stock_code_clean),
-            "underlying_name": str(w.get("標的名稱", "") or stock_name),
-            "broker_code": broker_code,
-            "branch": branch,
-            "pair_source": "ExtraLivePair",
-        })
-
-    if out:
-        preview = "、".join([
-            f"{p['warrant_code']}×{p['broker_code']}×{p['branch']}"
-            for p in out[:12]
-        ])
-        if len(out) > 12:
-            preview += "…"
-        print(f"🔁 指定 權證×分點 純 Live pair 補抓：{len(out):,} 組｜{preview}")
-    return out
-
-
-def _build_selected_branch_broker_code_map(pair_values: List[dict]) -> dict:
-    """從本次 API4 成功回傳的 pair 中推回分點對應券商代號。"""
-    branch_to_brokers = {}
-    for p in pair_values or []:
-        branch = normalize_branch_name(p.get("branch", ""))
-        broker_code = str(p.get("broker_code", "") or "").strip()
-        if not branch or not broker_code:
-            continue
-        branch_to_brokers.setdefault(branch, set()).add(broker_code)
-
-    out = {}
-    for branch, brokers in branch_to_brokers.items():
-        if len(brokers) == 1:
-            out[branch] = sorted(brokers)[0]
-        elif len(brokers) > 1:
-            # 理論上同一分點應該只會對應一個券商代號；若有多個，保守取排序第一個並印出提醒。
-            chosen = sorted(brokers)[0]
-            out[branch] = chosen
-            print(f"⚠️ 分點 {branch} 對應多個券商代號：{sorted(brokers)}，暫用 {chosen}")
-    return out
-
-
-def build_auto_selected_branch_backfill_pairs(
-    warrants: List[dict],
-    existing_pairs: List[dict],
-    api4_status_by_code: dict,
-    stock_code: str,
-    stock_name: str,
-) -> List[dict]:
-    """替所有精選分點補齊「權證 × 分點」pair，讓 API5 直接回查歷史買賣金額。
-
-    MoneyDJ API4 回傳的分點清單可能只包含最新日或目前頁面中的部分分點，
-    不一定會列出近 N 天曾經交易過該權證的所有分點。
-    因此這裡只要能從本次 API4 其他權證結果推回精選分點的券商代號，
-    就會把所有本次權證母體中尚未存在的「權證 × 精選分點」pair 補進 API5。
-    這樣使用者選哪個精選分點，就會針對那個分點做完整補查。
-    """
-    if not AUTO_BACKFILL_SELECTED_BRANCH_PAIRS_ENABLE:
-        return []
-    if not warrants:
-        return []
-
-    selected_branches = _get_selected_branch_flow_list()
-    selected_branches = [normalize_branch_name(x) for x in selected_branches if normalize_branch_name(x)]
-    if not selected_branches:
-        return []
-
-    branch_code_map = _build_selected_branch_broker_code_map(existing_pairs)
-    missing_branch_codes = [b for b in selected_branches if b not in branch_code_map]
-    if missing_branch_codes:
-        print(f"⚠️ API4 pair 中找不到精選分點券商代號，無法自動補查：{', '.join(missing_branch_codes)}")
-
-    existing_keys = {
-        (normalize_openapi_warrant_code(p.get("warrant_code", "")), str(p.get("broker_code", "") or "").strip())
-        for p in existing_pairs or []
-    }
-
-    out = []
-    for w in warrants:
-        code = normalize_openapi_warrant_code(w.get("代號", ""))
-        if not code:
-            continue
-
-        for branch in selected_branches:
-            broker_code = branch_code_map.get(branch, "")
-            if not broker_code:
-                continue
-
-            key = (code, broker_code)
-            if key in existing_keys:
-                continue
-            existing_keys.add(key)
-
-            out.append({
-                "warrant_code": code,
-                "warrant_name": str(w.get("名稱", "") or code).strip(),
-                "underlying_code": str(w.get("標的股", "") or _clean_code(stock_code)),
-                "underlying_name": str(w.get("標的名稱", "") or stock_name),
-                "broker_code": broker_code,
-                "branch": branch,
-                "pair_source": "AutoSelectedBranchBackfill",
-            })
-
-    if out:
-        preview = "、".join([
-            f"{p['warrant_code']}×{p['broker_code']}×{p['branch']}"
-            for p in out[:12]
-        ])
-        if len(out) > 12:
-            preview += "…"
-        empty_count = sum(
-            1
-            for w in warrants
-            if str(api4_status_by_code.get(normalize_openapi_warrant_code(w.get("代號", "")), "")) == "empty"
-        )
-        print(
-            f"🔁 精選分點 pair 完整補查："
-            f"精選分點 {len(selected_branches):,} 個｜API4 empty權證 {empty_count:,} 支｜"
-            f"新增 {len(out):,} 組｜{preview}"
-        )
-
-    return out
 
 
 def _normalize_perf_header(v) -> str:
@@ -3003,6 +2061,46 @@ def _extract_branch_perf_values(values: List[List[str]], source_sheet: str) -> p
     return out.drop(columns=["_event_sort"])
 
 
+def _load_branch_perf_disk_cache() -> pd.DataFrame:
+    if not BRANCH_PERF_DISK_CACHE_ENABLE:
+        return pd.DataFrame()
+    try:
+        if not os.path.exists(_BRANCH_PERF_DISK_CACHE_PATH) or not os.path.exists(_BRANCH_PERF_DISK_META_PATH):
+            return pd.DataFrame()
+        with open(_BRANCH_PERF_DISK_META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if str(meta.get("cache_date", "") or "") != _taipei_today_str():
+            return pd.DataFrame()
+        cached = pd.read_parquet(_BRANCH_PERF_DISK_CACHE_PATH)
+        if cached is not None and not cached.empty:
+            print(f"⚡ 分點勝率統計本機快取命中：{len(cached):,} 個分點")
+            return cached
+    except Exception as exc:
+        print(f"⚠️ 分點勝率統計本機快取讀取失敗：{exc}")
+    return pd.DataFrame()
+
+
+def _save_branch_perf_disk_cache(df: pd.DataFrame, source_sheet: str = ""):
+    if not BRANCH_PERF_DISK_CACHE_ENABLE or df is None or df.empty:
+        return
+    try:
+        _ensure_dir(_BRANCH_PERF_DISK_CACHE_ROOT)
+        tmp_path = _BRANCH_PERF_DISK_CACHE_PATH + ".tmp"
+        df.to_parquet(tmp_path, index=False, compression="zstd")
+        os.replace(tmp_path, _BRANCH_PERF_DISK_CACHE_PATH)
+        meta = {
+            "cache_date": _taipei_today_str(),
+            "source_sheet": str(source_sheet or ""),
+            "rows": int(len(df)),
+            "updated_at": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+        }
+        with open(_BRANCH_PERF_DISK_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"💾 分點勝率統計已存本機共用快取：{len(df):,} 個分點")
+    except Exception as exc:
+        print(f"⚠️ 分點勝率統計本機快取寫入失敗：{exc}")
+
+
 def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
     global _BRANCH_PERF_CACHE_DF
     # 勝率統計只提供「分點歷史績效」作為文字輔助，不屬於本次交易資料快取；
@@ -3013,6 +2111,13 @@ def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
     with _BRANCH_PERF_CACHE_LOCK:
         if _BRANCH_PERF_CACHE_DF is not None and not force_refresh:
             return _BRANCH_PERF_CACHE_DF.copy()
+
+    if not force_refresh:
+        disk_cached = _load_branch_perf_disk_cache()
+        if disk_cached is not None and not disk_cached.empty:
+            with _BRANCH_PERF_CACHE_LOCK:
+                _BRANCH_PERF_CACHE_DF = disk_cached.copy()
+            return disk_cached.copy()
 
     sh = _open_gsheet()
     if sh is None:
@@ -3033,6 +2138,7 @@ def read_gsheet_branch_perf_df(force_refresh: bool = False) -> pd.DataFrame:
                 f"✅ 讀取分點勝率統計：{ws.title}｜"
                 f"全部-A+B+C+D合併 {len(result):,} 個分點"
             )
+            _save_branch_perf_disk_cache(result, source_sheet=ws.title)
             with _BRANCH_PERF_CACHE_LOCK:
                 _BRANCH_PERF_CACHE_DF = result.copy()
             return result
@@ -3253,156 +2359,6 @@ def _normalize_stock_name_code_key(code) -> str:
     return s
 
 
-def _pick_row_value(row: dict, keys: List[str]) -> str:
-    for k in keys:
-        if k in row and str(row.get(k, "") or "").strip():
-            return str(row.get(k, "") or "").strip()
-    return ""
-
-
-def _find_header_index(headers: List[str], candidates: List[str]) -> int:
-    normalized = [str(h or "").strip() for h in headers]
-    for cand in candidates:
-        if cand in normalized:
-            return normalized.index(cand)
-    return -1
-
-
-def read_gsheet_stock_name_map(force_refresh: bool = False) -> Dict[str, str]:
-    """讀取 Google Sheet「快取_股票名稱」工作表。
-
-    預期欄位至少包含：代號、名稱。
-    使用 get_all_values() 而不是 get_all_records()，避免 0050 被轉成 50。
-    """
-    global _STOCK_NAME_MAP_CACHE
-
-    if not STOCK_NAME_GSHEET_ENABLE:
-        return {}
-
-    with _STOCK_NAME_MAP_CACHE_LOCK:
-        if _STOCK_NAME_MAP_CACHE is not None and not force_refresh:
-            return dict(_STOCK_NAME_MAP_CACHE)
-
-    sh = _open_gsheet()
-    if sh is None:
-        return {}
-
-    try:
-        ws = sh.worksheet(GSHEET_STOCK_NAME_SHEET)
-        values = ws.get_all_values()
-        if not values or len(values) < 2:
-            lookup = {}
-        else:
-            headers = [str(x or "").strip() for x in values[0]]
-            code_idx = _find_header_index(headers, ["代號", "股票代號", "證券代號", "有價證券代號", "公司代號"])
-            name_idx = _find_header_index(headers, ["名稱", "股票名稱", "證券名稱", "有價證券名稱", "公司名稱", "公司簡稱"])
-            if code_idx < 0 or name_idx < 0:
-                print(f"⚠️ {GSHEET_STOCK_NAME_SHEET} 缺少「代號」或「名稱」欄位")
-                lookup = {}
-            else:
-                lookup = {}
-                for row in values[1:]:
-                    if len(row) <= max(code_idx, name_idx):
-                        continue
-                    code = _normalize_stock_name_code_key(row[code_idx])
-                    name = str(row[name_idx] or "").strip()
-                    if code and name and name != "未知公司":
-                        lookup[code] = name
-        with _STOCK_NAME_MAP_CACHE_LOCK:
-            _STOCK_NAME_MAP_CACHE = dict(lookup)
-        if lookup:
-            print(f"📦 已讀取股票名稱快取：{GSHEET_STOCK_NAME_SHEET}｜{len(lookup):,} 筆")
-        return lookup
-    except Exception as e:
-        print(f"⚠️ Google Sheet 股票名稱對照表讀取失敗：{GSHEET_STOCK_NAME_SHEET}｜{e}")
-        return {}
-
-
-def save_gsheet_stock_name_cache(stock_code: str, stock_name: str, market: str = "", source: str = ""):
-    """官方資料查到名稱後，寫回 Google Sheet「快取_股票名稱」。
-
-    若工作表只有「代號、名稱」兩欄，就只寫這兩欄；若使用者之後自行加上
-    「市場、來源、更新時間」欄位，程式也會順便補上。
-    """
-    global _STOCK_NAME_MAP_CACHE
-
-    if not STOCK_NAME_GSHEET_ENABLE:
-        return
-
-    code = _normalize_stock_name_code_key(stock_code)
-    name = str(stock_name or "").strip()
-    if not code or not name or name == "未知公司":
-        return
-
-    sh = _open_gsheet()
-    if sh is None:
-        return
-
-    try:
-        try:
-            ws = sh.worksheet(GSHEET_STOCK_NAME_SHEET)
-        except Exception:
-            ws = sh.add_worksheet(title=GSHEET_STOCK_NAME_SHEET, rows=1000, cols=2)
-            ws.update([['代號', '名稱']], value_input_option="RAW")
-
-        values = ws.get_all_values()
-        if not values:
-            ws.update([['代號', '名稱']], value_input_option="RAW")
-            values = ws.get_all_values()
-
-        headers = [str(x or "").strip() for x in values[0]]
-        code_idx = _find_header_index(headers, ["代號", "股票代號", "證券代號", "有價證券代號", "公司代號"])
-        name_idx = _find_header_index(headers, ["名稱", "股票名稱", "證券名稱", "有價證券名稱", "公司名稱", "公司簡稱"])
-        if code_idx < 0 or name_idx < 0:
-            print(f"⚠️ {GSHEET_STOCK_NAME_SHEET} 缺少「代號」或「名稱」欄位，略過股票名稱快取寫入")
-            return
-
-        market_idx = _find_header_index(headers, ["市場"])
-        source_idx = _find_header_index(headers, ["來源"])
-        updated_idx = _find_header_index(headers, ["更新時間"])
-        updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-
-        target_row_number = None
-        for row_i, row in enumerate(values[1:], start=2):
-            if len(row) > code_idx and _normalize_stock_name_code_key(row[code_idx]) == code:
-                target_row_number = row_i
-                break
-
-        if target_row_number is not None:
-            current_name = ""
-            row_values = values[target_row_number - 1]
-            if len(row_values) > name_idx:
-                current_name = str(row_values[name_idx] or "").strip()
-            if not current_name or current_name == "未知公司":
-                ws.update_cell(target_row_number, name_idx + 1, name)
-                if market_idx >= 0 and market:
-                    ws.update_cell(target_row_number, market_idx + 1, market)
-                if source_idx >= 0 and source:
-                    ws.update_cell(target_row_number, source_idx + 1, source)
-                if updated_idx >= 0:
-                    ws.update_cell(target_row_number, updated_idx + 1, updated_at)
-                print(f"💾 已更新股票名稱快取：{code} {name}｜{GSHEET_STOCK_NAME_SHEET}")
-        else:
-            new_row = [""] * len(headers)
-            new_row[code_idx] = code
-            new_row[name_idx] = name
-            if market_idx >= 0:
-                new_row[market_idx] = market
-            if source_idx >= 0:
-                new_row[source_idx] = source
-            if updated_idx >= 0:
-                new_row[updated_idx] = updated_at
-            ws.append_row(new_row, value_input_option="RAW")
-            print(f"💾 已新增股票名稱快取：{code} {name}｜{GSHEET_STOCK_NAME_SHEET}")
-
-        with _STOCK_NAME_MAP_CACHE_LOCK:
-            if _STOCK_NAME_MAP_CACHE is None:
-                _STOCK_NAME_MAP_CACHE = {}
-            _STOCK_NAME_MAP_CACHE[code] = name
-    except Exception as e:
-        print(f"⚠️ Google Sheet 股票名稱快取寫入失敗：{code} {name}｜{e}")
-
-
 def normalize_history_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     if raw_df is None or raw_df.empty:
         return pd.DataFrame()
@@ -3442,31 +2398,10 @@ def normalize_history_cache_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_cached_warrant_history(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    raw = read_warrant_cache_worksheet(GSHEET_WARRANT_HISTORY_SHEET)
-    events = normalize_history_cache_df(raw)
-    if events.empty:
-        return pd.DataFrame()
-    stock_code = _clean_code(stock_code)
-    events = events[events["underlying_code"].astype(str) == stock_code].copy()
-    if start_date is not None:
-        events = events[events["Date"] >= pd.Timestamp(start_date).normalize()]
-    if end_date is not None:
-        events = events[events["Date"] <= pd.Timestamp(end_date).normalize()]
-    return events.reset_index(drop=True)
-
-
 GSHEET_WARRANT_HISTORY_HEADERS = [
     "日期", "權證代號", "權證名稱", "標的股", "標的名稱",
     "分點", "分點名稱", "券商代號", "買進金額", "賣出金額", "買超金額",
     "買進張數", "賣出張數", "資料來源", "快取起日", "快取迄日", "更新時間",
-]
-
-GSHEET_WARRANT_STATUS_HEADERS = [
-    "快取鍵", "標的股", "標的名稱", "快取起日", "快取迄日", "完整度狀態",
-    "API4總請求", "API4成功", "API4空回應", "API4失敗",
-    "API5總請求", "API5成功", "API5空回應", "API5失敗",
-    "資料筆數", "快照工作表", "更新時間",
 ]
 
 
@@ -3493,26 +2428,6 @@ def _warrant_snapshot_worksheet_title(stock_code: str, start_date=None, end_date
 
 
 @contextmanager
-def _warrant_fast_fallback_live_scope(enabled: bool):
-    """快取未命中時暫時切到純 Live 式快速路徑，結束後恢復原狀。"""
-    global _WARRANT_FAST_FALLBACK_LIVE_ACTIVE
-    if not enabled:
-        yield
-        return
-
-    with _WARRANT_FAST_FALLBACK_LIVE_LOCK:
-        previous = bool(_WARRANT_FAST_FALLBACK_LIVE_ACTIVE)
-        _WARRANT_FAST_FALLBACK_LIVE_ACTIVE = True
-    try:
-        yield
-    finally:
-        with _WARRANT_FAST_FALLBACK_LIVE_LOCK:
-            _WARRANT_FAST_FALLBACK_LIVE_ACTIVE = previous
-
-
-def _is_warrant_fast_fallback_live_active() -> bool:
-    with _WARRANT_FAST_FALLBACK_LIVE_LOCK:
-        return bool(_WARRANT_FAST_FALLBACK_LIVE_ACTIVE)
 
 
 def _get_or_create_worksheet(sh, title: str, rows: int = 1000, cols: int = 20):
@@ -3550,260 +2465,74 @@ def _update_worksheet_from_df(ws, df: pd.DataFrame, headers: List[str]):
     ws.update(values, value_input_option="USER_ENTERED")
 
 
-def _events_to_gsheet_history_df(events_df: pd.DataFrame, stock_code: str, stock_name: str, start_date=None, end_date=None) -> pd.DataFrame:
-    if events_df is None or events_df.empty:
-        return pd.DataFrame(columns=GSHEET_WARRANT_HISTORY_HEADERS)
-    e = events_df.copy().fillna("")
-    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
-    e = e.dropna(subset=["Date"])
-    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    out = pd.DataFrame()
-    out["日期"] = e["Date"].dt.strftime("%Y/%m/%d")
-    out["權證代號"] = e.get("warrant_code", "").map(normalize_openapi_warrant_code) if "warrant_code" in e.columns else ""
-    out["權證名稱"] = e.get("warrant_name", "").astype(str).str.strip() if "warrant_name" in e.columns else ""
-    out["標的股"] = e.get("underlying_code", str(stock_code)).astype(str).str.strip() if "underlying_code" in e.columns else str(stock_code)
-    out["標的股"] = out["標的股"].replace("", str(stock_code))
-    out["標的名稱"] = e.get("underlying_name", str(stock_name)).astype(str).str.strip() if "underlying_name" in e.columns else str(stock_name)
-    out["標的名稱"] = out["標的名稱"].replace("", str(stock_name))
-    out["分點"] = e.get("branch", "").astype(str).str.strip() if "branch" in e.columns else ""
-    out["分點"] = out["分點"].map(normalize_branch_name)
-    out["分點名稱"] = out["分點"]
-    out["券商代號"] = e.get("broker_code", "").astype(str).str.strip() if "broker_code" in e.columns else ""
-    out["買進金額"] = pd.to_numeric(e.get("buy_amount", 0), errors="coerce").fillna(0).astype(float)
-    out["賣出金額"] = pd.to_numeric(e.get("sell_amount", 0), errors="coerce").fillna(0).astype(float)
-    out["買超金額"] = pd.to_numeric(e.get("net_amount", 0), errors="coerce").fillna(0).astype(float)
-    out["買進張數"] = pd.to_numeric(e.get("buy_shares", 0), errors="coerce").fillna(0).astype(float) if "buy_shares" in e.columns else 0
-    out["賣出張數"] = pd.to_numeric(e.get("sell_shares", 0), errors="coerce").fillna(0).astype(float) if "sell_shares" in e.columns else 0
-    out["資料來源"] = "MoneyDJ_API4_API5_100pct"
-    out["快取起日"] = _gsheet_cache_date_str(start_date)
-    out["快取迄日"] = _gsheet_cache_date_str(end_date)
-    out["更新時間"] = updated_at
-    return out[GSHEET_WARRANT_HISTORY_HEADERS]
-
-
-def _remove_same_stock_range_rows(raw_df: pd.DataFrame, stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    if raw_df is None or raw_df.empty:
-        return pd.DataFrame()
-    df = raw_df.copy().fillna("")
-    if "標的股" not in df.columns or "日期" not in df.columns:
-        return df
-    start_ts = pd.Timestamp(start_date).normalize() if start_date is not None else pd.Timestamp.min
-    end_ts = pd.Timestamp(end_date).normalize() if end_date is not None else pd.Timestamp.max
-    date_s = df["日期"].map(parse_date)
-    date_s = pd.to_datetime(date_s, errors="coerce").dt.normalize()
-    stock_s = df["標的股"].map(_clean_code).astype(str)
-    mask = (stock_s == _clean_code(stock_code)) & (date_s >= start_ts) & (date_s <= end_ts)
-    return df.loc[~mask].copy()
-
-
 def _read_gsheet_warrant_status() -> pd.DataFrame:
     if not GSHEET_WARRANT_CACHE_ENABLE:
         return pd.DataFrame()
     return read_warrant_cache_worksheet(GSHEET_WARRANT_STATUS_SHEET)
 
 
-def load_gsheet_warrant_events_snapshot(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
-    if not GSHEET_WARRANT_CACHE_ENABLE or WARRANT_CACHE_FORCE_REFRESH:
-        return pd.DataFrame()
+# ============================================================
+# 官方權證 OpenAPI：僅供發行商辨識與當日成交量完整性驗證
+# ============================================================
 
-    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
-    status_df = _read_gsheet_warrant_status()
-    if status_df is None or status_df.empty or "快取鍵" not in status_df.columns:
-        return pd.DataFrame()
+def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
+    """抓取官方 OpenAPI，針對暫時性斷線重試並回傳明確成功狀態。
 
-    matched = status_df[status_df["快取鍵"].astype(str) == key].copy()
-    if matched.empty:
-        return pd.DataFrame()
-    row = matched.tail(1).iloc[0]
+    回傳值：
+    - data：官方 JSON list。
+    - fetch_ok：是否成功取得且解析為 list。
+    - error_text：最後一次失敗原因。
 
-    if str(row.get("完整度狀態", "")).strip().lower() != "complete":
-        print(f"⚠️ Google Sheet 快取狀態不是 complete：{key}，改走 live 抓取")
-        return pd.DataFrame()
+    官方來源抓取失敗不能等同於「官方尚未發布」，因此呼叫端必須使用
+    fetch_ok 區分網路錯誤與真正沒有目標日資料。
+    """
+    max_attempts = max(2, int(FINMIND_REQUEST_RETRIES))
+    last_error = ""
+    request_headers = dict(OPENAPI_WARRANT_HEADERS)
+    request_headers["Connection"] = "close"
 
-    def _safe_int_from_status(value, default=0):
+    for attempt in range(1, max_attempts + 1):
+        session = None
         try:
-            v = pd.to_numeric(value, errors="coerce")
-            if pd.isna(v):
-                return int(default)
-            return int(v)
-        except Exception:
-            return int(default)
+            # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的
+            # keep-alive 連線持續觸發 Response ended prematurely。
+            if attempt == 1:
+                session = get_thread_session()
+                close_session = False
+            else:
+                session = requests.Session()
+                close_session = True
 
-    api4_failed = _safe_int_from_status(row.get("API4失敗", 0))
-    api5_failed = _safe_int_from_status(row.get("API5失敗", 0))
-    expected_rows = _safe_int_from_status(row.get("資料筆數", 0))
-    if api4_failed != 0 or api5_failed != 0 or expected_rows <= 0:
-        print(f"⚠️ Google Sheet 快取完整度紀錄不合格：{key}，改走 live 抓取")
-        return pd.DataFrame()
+            try:
+                r = session.get(
+                    url,
+                    headers=request_headers,
+                    timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
+                )
+                r.raise_for_status()
+                data = r.json()
+            finally:
+                if close_session and session is not None:
+                    session.close()
 
-    events = pd.DataFrame()
-    snapshot_sheet = str(row.get("快照工作表", "") or "").strip()
-    if not snapshot_sheet:
-        snapshot_sheet = _warrant_snapshot_worksheet_title(stock_code, start_date, end_date)
+            if not isinstance(data, list):
+                raise RuntimeError(f"官方回應不是 list：type={type(data).__name__}")
 
-    if WARRANT_CACHE_PER_SNAPSHOT_SHEET_ENABLE:
-        sh = _open_warrant_cache_gsheet(create_if_missing=False)
-        raw_snapshot = _read_worksheet_from_spreadsheet(sh, snapshot_sheet)
-        events = normalize_history_cache_df(raw_snapshot)
-        if not events.empty:
-            stock_code_clean = _clean_code(stock_code)
-            events = events[events["underlying_code"].astype(str) == stock_code_clean].copy()
-            if start_date is not None:
-                events = events[events["Date"] >= pd.Timestamp(start_date).normalize()]
-            if end_date is not None:
-                events = events[events["Date"] <= pd.Timestamp(end_date).normalize()]
-
-    if events.empty and WARRANT_CACHE_LEGACY_MAIN_FALLBACK_ENABLE:
-        events = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
-
-    if events.empty:
-        print(f"⚠️ Google Sheet 快取狀態存在，但找不到快照資料：{key}，改走 live 抓取")
-        return pd.DataFrame()
-
-    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
-    if len(events) != expected_rows:
-        print(f"⚠️ Google Sheet 快取筆數不一致：狀態 {expected_rows:,} 筆，實際 {len(events):,} 筆；改走 live 抓取")
-        return pd.DataFrame()
-
-    print(f"☁️ Google Sheet 完整快照命中：{key}｜工作表={snapshot_sheet}｜{len(events):,} 筆")
-    return events
-
-
-def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events_df: pd.DataFrame, start_date=None, end_date=None):
-    if not GSHEET_WARRANT_CACHE_ENABLE or events_df is None or events_df.empty:
-        return
-
-    api4_stats = get_api_fetch_stats("api4")
-    api5_stats = get_api_fetch_stats("api5")
-    api4_failed = int(api4_stats.get("failed", 0) or 0)
-    api5_failed = int(api5_stats.get("failed", 0) or 0)
-    if api4_failed != 0 or api5_failed != 0:
-        print(f"⚠️ API 未達 100%，不寫入 Google Sheet 快取：API4 failed={api4_failed}｜API5 failed={api5_failed}")
-        return
-
-    sh = _open_warrant_cache_gsheet(create_if_missing=True)
-    if sh is None:
-        print("⚠️ 權證快取試算表無法開啟，略過權證快取寫回")
-        return
-
-    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
-    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    new_history = _events_to_gsheet_history_df(
-        events_df,
-        stock_code,
-        stock_name,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    if new_history.empty:
-        return
-
-    snapshot_sheet = _warrant_snapshot_worksheet_title(stock_code, start_date, end_date)
-
-    try:
-        if WARRANT_CACHE_PER_SNAPSHOT_SHEET_ENABLE:
-            history_ws = _get_or_create_worksheet(
-                sh,
-                snapshot_sheet,
-                rows=max(len(new_history) + 1, 1000),
-                cols=len(GSHEET_WARRANT_HISTORY_HEADERS),
-            )
-            # 每檔股票固定覆寫自己的工作表，不讀取、不合併整張巨型歷史表。
-            _update_worksheet_from_df(history_ws, new_history, GSHEET_WARRANT_HISTORY_HEADERS)
-            print(f"💾 已寫入 Google Sheet 快照：{snapshot_sheet}｜{key}｜{len(new_history):,} 筆")
-        else:
-            history_ws = _get_or_create_worksheet(
-                sh,
-                GSHEET_WARRANT_HISTORY_SHEET,
-                rows=max(len(new_history) + 10, 1000),
-                cols=len(GSHEET_WARRANT_HISTORY_HEADERS),
-            )
-            old_history = _worksheet_to_df(history_ws)
-            kept_history = _remove_same_stock_range_rows(
-                old_history,
-                stock_code,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            all_history = pd.concat([kept_history, new_history], ignore_index=True, sort=False).fillna("")
-            _update_worksheet_from_df(history_ws, all_history, GSHEET_WARRANT_HISTORY_HEADERS)
-            snapshot_sheet = GSHEET_WARRANT_HISTORY_SHEET
-            print(f"💾 已寫入 Google Sheet {GSHEET_WARRANT_HISTORY_SHEET}：{key}｜{len(new_history):,} 筆")
-
-        status_ws = _get_or_create_worksheet(
-            sh,
-            GSHEET_WARRANT_STATUS_SHEET,
-            rows=200,
-            cols=len(GSHEET_WARRANT_STATUS_HEADERS),
-        )
-        old_status = _worksheet_to_df(status_ws)
-        if old_status is not None and not old_status.empty and "快取鍵" in old_status.columns:
-            # 同一股票只保留最新一筆狀態，避免狀態表無限增長。
-            stock_col = old_status.get("標的股", pd.Series([""] * len(old_status))).map(_clean_code)
-            old_status = old_status[stock_col.astype(str) != _clean_code(stock_code)].copy()
-        else:
-            old_status = pd.DataFrame(columns=GSHEET_WARRANT_STATUS_HEADERS)
-
-        new_status = pd.DataFrame([{
-            "快取鍵": key,
-            "標的股": _clean_code(stock_code),
-            "標的名稱": str(stock_name or ""),
-            "快取起日": _gsheet_cache_date_str(start_date),
-            "快取迄日": _gsheet_cache_date_str(end_date),
-            "完整度狀態": "complete",
-            "API4總請求": int(api4_stats.get("total", 0) or 0),
-            "API4成功": int(api4_stats.get("success", 0) or 0),
-            "API4空回應": int(api4_stats.get("empty", 0) or 0),
-            "API4失敗": api4_failed,
-            "API5總請求": int(api5_stats.get("total", 0) or 0),
-            "API5成功": int(api5_stats.get("success", 0) or 0),
-            "API5空回應": int(api5_stats.get("empty", 0) or 0),
-            "API5失敗": api5_failed,
-            "資料筆數": int(len(new_history)),
-            "快照工作表": snapshot_sheet,
-            "更新時間": updated_at,
-        }])
-        all_status = pd.concat([old_status, new_status], ignore_index=True, sort=False).fillna("")
-        _update_worksheet_from_df(status_ws, all_status, GSHEET_WARRANT_STATUS_HEADERS)
-        print(f"✅ Google Sheet 快取狀態已更新：{key}｜complete｜工作表={snapshot_sheet}")
-    except Exception as e:
-        print(f"⚠️ Google Sheet 權證快取寫入失敗：{key}｜{e}")
-
-
-def load_warrant_underlying_lookup() -> Dict[str, dict]:
-    if REPORT_LIVE_ONLY or _is_warrant_fast_fallback_live_active():
-        return {}
-    lookup = {}
-    for sheet_name in ["快取_權證清單", "快取_分點歷史", "快取_候選組合_OpenAPI精選5", "快取_候選組合", "快取_候選組合_精選5"]:
-        df = read_gsheet_worksheet(sheet_name)
-        if df is None or df.empty:
-            continue
-        for _, r in df.iterrows():
-            wcode = normalize_openapi_warrant_code(r.get("代號", r.get("權證代號", "")))
-            if not wcode:
-                continue
-            rec = lookup.setdefault(wcode, {"warrant_name": "", "underlying_code": "", "underlying_name": ""})
-            rec["warrant_name"] = rec["warrant_name"] or str(r.get("名稱", r.get("權證名稱", ""))).strip()
-            rec["underlying_code"] = rec["underlying_code"] or _clean_code(r.get("標的股", r.get("標的代號", "")))
-            rec["underlying_name"] = rec["underlying_name"] or str(r.get("標的名稱", "")).strip()
-    return lookup
-
-
-# ============================================================
-# 權證全市場分點資料：OpenAPI 權證母體 + API4 分點 + API5 金額
-# ============================================================
-
-def fetch_openapi_json(url: str, source_name: str):
-    try:
-        r = get_thread_session().get(url, headers=OPENAPI_WARRANT_HEADERS, timeout=(8, 30))
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
             print(f"✅ {source_name} OpenAPI：{len(data):,} 筆")
-            return data
-    except Exception as e:
-        print(f"⚠️ {source_name} OpenAPI 抓取失敗：{e}")
-    return []
+            return data, True, ""
+        except Exception as exc:
+            last_error = str(exc or type(exc).__name__)
+            if attempt < max_attempts:
+                wait_sec = min(8.0, FINMIND_RETRY_BASE_WAIT * attempt)
+                print(
+                    f"⚠️ {source_name} OpenAPI 暫時失敗，準備重試 "
+                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}"
+                )
+                time.sleep(wait_sec)
+                continue
+            print(f"⚠️ {source_name} OpenAPI 抓取失敗：{last_error}")
+
+    return [], False, last_error
 
 
 def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataFrame:
@@ -3814,10 +2543,14 @@ def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
             print(f"♻️ 重用同次執行 TWSE 權證 OpenAPI：{len(cached):,} 筆")
             return cached.copy()
 
-    data = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
+    data, fetch_ok, fetch_error = fetch_openapi_json(TWSE_WARRANT_DAILY_OPENAPI_URL, "上市 TWSE")
     df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}.issubset(df.columns):
-        return pd.DataFrame()
+    required_columns = {"出表日期", "交易日期", "權證代號", "權證名稱", "成交金額", "成交張數"}
+    if df.empty or not required_columns.issubset(df.columns):
+        out = pd.DataFrame()
+        out.attrs["openapi_fetch_ok"] = False
+        out.attrs["openapi_fetch_error"] = fetch_error or "TWSE 官方回傳空資料或欄位不完整"
+        return out
     out = pd.DataFrame()
     out["出表日期"] = df["出表日期"].map(normalize_openapi_trade_date)
     out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
@@ -3826,6 +2559,8 @@ def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
     out["名稱"] = df["權證名稱"].astype(str).str.strip()
     out["成交金額"] = df["成交金額"].map(clean_openapi_number)
     out["成交量"] = df["成交張數"].map(clean_openapi_number)
+    out.attrs["openapi_fetch_ok"] = bool(fetch_ok)
+    out.attrs["openapi_fetch_error"] = str(fetch_error or "")
     with _OPENAPI_WARRANT_DAILY_CACHE_LOCK:
         _OPENAPI_WARRANT_DAILY_CACHE[cache_key] = out.copy()
     return out
@@ -3839,10 +2574,14 @@ def fetch_tpex_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
             print(f"♻️ 重用同次執行 TPEx 權證 OpenAPI：{len(cached):,} 筆")
             return cached.copy()
 
-    data = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
+    data, fetch_ok, fetch_error = fetch_openapi_json(TPEX_WARRANT_DAILY_OPENAPI_URL, "上櫃 TPEx")
     df = pd.DataFrame(data).fillna("")
-    if df.empty or not {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}.issubset(df.columns):
-        return pd.DataFrame()
+    required_columns = {"Date", "交易日期", "權證代號", "權證名稱", "成交金額", "成交數量"}
+    if df.empty or not required_columns.issubset(df.columns):
+        out = pd.DataFrame()
+        out.attrs["openapi_fetch_ok"] = False
+        out.attrs["openapi_fetch_error"] = fetch_error or "TPEx 官方回傳空資料或欄位不完整"
+        return out
     out = pd.DataFrame()
     out["出表日期"] = df["Date"].map(normalize_openapi_trade_date)
     out["交易日期"] = df["交易日期"].map(normalize_openapi_trade_date)
@@ -3850,1341 +2589,15 @@ def fetch_tpex_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataF
     out["代號"] = df["權證代號"].map(normalize_openapi_warrant_code)
     out["名稱"] = df["權證名稱"].astype(str).str.strip()
     out["成交金額"] = df["成交金額"].map(clean_openapi_number)
-    out["成交量"] = df["成交數量"].map(clean_openapi_number)
+    # TPEx「成交數量」為股數；FinMind buy_shares / sell_shares 為張數。
+    # 先除以 1,000 統一成張，避免完整性保護把相同成交量誤判為相差 1,000 倍。
+    out["成交量"] = df["成交數量"].map(clean_openapi_number).astype(float) / 1000.0
+    out.attrs["openapi_fetch_ok"] = bool(fetch_ok)
+    out.attrs["openapi_fetch_error"] = str(fetch_error or "")
     with _OPENAPI_WARRANT_DAILY_CACHE_LOCK:
         _OPENAPI_WARRANT_DAILY_CACHE[cache_key] = out.copy()
     return out
 
-
-def make_stock_aliases(stock_name: str) -> List[str]:
-    name = str(stock_name or "").strip().replace(" ", "")
-    aliases = [name] if name else []
-    suffixes = ["半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療", "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業", "企業", "國際", "控股", "投控"]
-    stripped = name
-    changed = True
-    while changed:
-        changed = False
-        for suf in suffixes:
-            if stripped.endswith(suf) and len(stripped) > len(suf) + 1:
-                stripped = stripped[: -len(suf)]
-                if len(stripped) >= 2 and stripped not in aliases:
-                    aliases.append(stripped)
-                changed = True
-                break
-    # 不主動切兩字，避免昇陽半/昇陽這類誤判；只保留三字以上安全前綴
-    if len(name) >= 3 and name[:3] not in aliases:
-        aliases.append(name[:3])
-    return [a for a in aliases if a]
-
-
-def _normalize_warrant_match_text(text: str) -> str:
-    """權證名稱 / 股票別名比對用正規化，避免空白、符號、台臺差異造成名稱比對失敗。"""
-    s = html.unescape(str(text or "")).strip()
-    s = s.replace("臺", "台")
-    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
-    return s.strip()
-
-
-def _row_date_in_range_for_warrant_cache(row: dict, start_date=None, end_date=None) -> bool:
-    """判斷 Google Sheet 權證快取列是否落在指定區間；沒有日期欄位時視為可用。"""
-    date_value = _pick_row_value(row, ["日期", "Date", "交易日期", "出表日期", "date", "trade_date"])
-    if not str(date_value or "").strip():
-        return True
-    dt = parse_date(date_value)
-    if dt is None:
-        return True
-    ts = pd.Timestamp(dt).normalize()
-    if start_date is not None and ts < pd.Timestamp(start_date).normalize():
-        return False
-    if end_date is not None and ts > pd.Timestamp(end_date).normalize():
-        return False
-    return True
-
-
-def _is_call_warrant_name(name: str) -> bool:
-    """保守判斷是否為認購權證；名稱空白時不在這裡否決，交由標的對照判斷。"""
-    s = str(name or "").strip()
-    if not s:
-        return True
-    if re.search(r"售|牛|熊", s):
-        return False
-    return "購" in s
-
-
-def load_historical_call_warrants_from_cache(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
-    """從 Google Sheet 歷史 / 候選快取補權證母體。
-
-    OpenAPI 只能取得最新交易日仍有量的權證，若某檔權證在圖表期間內曾爆量，
-    但最新交易日無量或已不在最新清單，原本就不會被 API4/API5 回查。
-    這裡改從既有 Google Sheet 快取補回同標的、區間內曾出現過的認購權證代號，
-    再與 OpenAPI 母體合併去重。
-    """
-    if not GSHEET_FALLBACK_ENABLE:
-        return []
-    if _is_warrant_fast_fallback_live_active() and WARRANT_CACHE_FAST_FALLBACK_SKIP_LEGACY_SUPPLEMENT:
-        print("⚡ 快取未命中快速回補：略過主試算表歷史權證母體掃描")
-        return []
-
-    stock_code_clean = _clean_code(stock_code)
-    aliases = make_stock_aliases(stock_name)
-    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
-    records = {}
-
-    sheet_names = [
-        "快取_分點歷史",
-        "快取_權證清單",
-        "快取_候選組合_OpenAPI精選5",
-        "快取_候選組合",
-        "快取_候選組合_精選5",
-    ]
-    if HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE:
-        for detail_sheet in _get_historical_branch_detail_sheet_names():
-            if detail_sheet not in sheet_names:
-                sheet_names.append(detail_sheet)
-
-    for sheet_name in sheet_names:
-        df = read_gsheet_worksheet(sheet_name)
-        if df is None or df.empty:
-            continue
-
-        sheet_hit = 0
-        for _, r in df.iterrows():
-            row = r.to_dict()
-            if not _row_date_in_range_for_warrant_cache(row, start_date=start_date, end_date=end_date):
-                continue
-
-            code = normalize_openapi_warrant_code(_pick_row_value(row, [
-                "代號", "權證代號", "warrant_code", "WarrantCode",
-            ]))
-            if not code or not re.fullmatch(r"\d{6}", code):
-                continue
-
-            name = str(_pick_row_value(row, [
-                "名稱", "權證名稱", "warrant_name", "WarrantName",
-            ]) or "").strip()
-            if not _is_call_warrant_name(name):
-                continue
-
-            ucode = _clean_code(_pick_row_value(row, [
-                "標的股", "標的代號", "underlying_code", "UnderlyingCode",
-            ]))
-            uname = str(_pick_row_value(row, [
-                "標的名稱", "underlying_name", "UnderlyingName",
-            ]) or "").strip()
-
-            name_key = _normalize_warrant_match_text(name)
-            name_front = name_key[:16]
-            name_match = bool(name_front and any(alias and alias in name_front for alias in aliases_norm))
-            lookup_match = bool(ucode and ucode == stock_code_clean)
-            underlying_name_match = bool(uname and any(alias and alias in _normalize_warrant_match_text(uname) for alias in aliases_norm))
-
-            if not (lookup_match or name_match or underlying_name_match):
-                continue
-
-            rec = records.setdefault(code, {
-                "代號": code,
-                "名稱": "",
-                "標的股": str(stock_code_clean),
-                "標的名稱": stock_name,
-                "成交金額": 0,
-                "成交量": 0,
-                "資料來源": set(),
-            })
-            if name and not rec["名稱"]:
-                rec["名稱"] = name
-            if ucode and not rec["標的股"]:
-                rec["標的股"] = ucode
-            if uname and (not rec["標的名稱"] or rec["標的名稱"] == stock_name):
-                rec["標的名稱"] = uname
-            rec["成交金額"] = max(int(rec.get("成交金額", 0) or 0), clean_openapi_number(_pick_row_value(row, ["成交金額", "成交金額(元)"])))
-            rec["成交量"] = max(int(rec.get("成交量", 0) or 0), clean_openapi_number(_pick_row_value(row, ["成交量", "成交張數", "成交數量"])))
-            rec["資料來源"].add(sheet_name)
-            sheet_hit += 1
-
-        if sheet_hit > 0:
-            print(f"☁️ 權證歷史母體快取命中：{sheet_name}｜{sheet_hit:,} 筆")
-
-    out = []
-    for rec in records.values():
-        rec = dict(rec)
-        rec["資料來源"] = "+".join(sorted(rec.get("資料來源", [])))
-        if not rec.get("名稱"):
-            rec["名稱"] = rec["代號"]
-        out.append(rec)
-
-    out = sorted(out, key=lambda x: (int(x.get("成交金額", 0) or 0), int(x.get("成交量", 0) or 0)), reverse=True)
-    if out:
-        print(f"☁️ Google Sheet 歷史母體補充候選：{len(out):,} 支")
-    return out
-
-
-
-def _historical_detail_effective_start(start_date=None, end_date=None):
-    """取得歷史分點明細補漏的起始日期。"""
-    starts = []
-    if start_date is not None:
-        try:
-            starts.append(pd.Timestamp(start_date).normalize())
-        except Exception:
-            pass
-    if end_date is not None and HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS > 0:
-        try:
-            starts.append(pd.Timestamp(end_date).normalize() - pd.Timedelta(days=int(HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS)))
-        except Exception:
-            pass
-    if not starts:
-        return None
-    return max(starts)
-
-
-def _row_date_in_historical_detail_range(row: dict, start_date=None, end_date=None) -> bool:
-    """歷史分點買賣明細補漏用日期範圍。
-
-    與一般權證母體快取不同，這裡預設額外限制近 HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS 日，
-    避免太舊的明細把已經完全失效的權證大量塞進 API4/API5。
-    """
-    date_value = _pick_row_value(row, ["日期", "Date", "交易日期", "出表日期", "date", "trade_date"])
-    if not str(date_value or "").strip():
-        return False
-    dt = parse_date(date_value)
-    if dt is None:
-        return False
-    ts = pd.Timestamp(dt).normalize()
-    effective_start = _historical_detail_effective_start(start_date=start_date, end_date=end_date)
-    if effective_start is not None and ts < effective_start:
-        return False
-    if end_date is not None and ts > pd.Timestamp(end_date).normalize():
-        return False
-    return True
-
-
-def _row_matches_stock_for_historical_detail(row: dict, stock_code: str, stock_name: str) -> bool:
-    stock_code_clean = _clean_code(stock_code)
-    aliases = make_stock_aliases(stock_name)
-    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
-
-    ucode = _clean_code(_pick_row_value(row, [
-        "標的股", "標的代號", "股票代號", "underlying_code", "UnderlyingCode",
-    ]))
-    uname = str(_pick_row_value(row, [
-        "標的名稱", "股票名稱", "underlying_name", "UnderlyingName",
-    ]) or "").strip()
-    wname = str(_pick_row_value(row, [
-        "權證名稱", "名稱", "warrant_name", "WarrantName",
-    ]) or "").strip()
-
-    if ucode and ucode == stock_code_clean:
-        return True
-    if uname and any(alias and alias in _normalize_warrant_match_text(uname) for alias in aliases_norm):
-        return True
-    name_front = _normalize_warrant_match_text(wname)[:16]
-    if name_front and any(alias and alias in name_front for alias in aliases_norm):
-        return True
-    return False
-
-
-def _row_has_historical_detail_amount(row: dict) -> bool:
-    amount_keys = [
-        "買進金額", "賣出金額", "買超金額", "淨買超金額", "淨額", "成交金額",
-        "buy_amount", "sell_amount", "net_amount",
-        "買進張數", "賣出張數", "賣出股數", "買進股數",
-    ]
-    for key in amount_keys:
-        if key in row and abs(clean_openapi_number(row.get(key))) > 0:
-            return True
-    return False
-
-
-def _build_historical_detail_pair_record(row: dict, stock_code: str, stock_name: str, source_sheet: str) -> dict:
-    code = normalize_openapi_warrant_code(_pick_row_value(row, [
-        "權證代號", "代號", "warrant_code", "WarrantCode",
-    ]))
-    if not code or not re.fullmatch(r"\d{6}", code):
-        return {}
-
-    name = str(_pick_row_value(row, [
-        "權證名稱", "名稱", "warrant_name", "WarrantName",
-    ]) or "").strip()
-    if not _is_call_warrant_name(name):
-        return {}
-
-    broker_code = str(_pick_row_value(row, [
-        "券商代號", "broker_code", "BrokerCode", "分點代號",
-    ]) or "").strip()
-    branch = normalize_branch_name(_pick_row_value(row, [
-        "分點", "分點名稱", "券商分點", "branch", "broker_name", "BrokerName",
-    ]))
-
-    if not broker_code or not branch:
-        return {}
-
-    ucode = _clean_code(_pick_row_value(row, [
-        "標的股", "標的代號", "股票代號", "underlying_code", "UnderlyingCode",
-    ])) or _clean_code(stock_code)
-    uname = str(_pick_row_value(row, [
-        "標的名稱", "股票名稱", "underlying_name", "UnderlyingName",
-    ]) or stock_name).strip()
-
-    return {
-        "warrant_code": code,
-        "warrant_name": name or code,
-        "underlying_code": ucode or _clean_code(stock_code),
-        "underlying_name": uname or stock_name,
-        "broker_code": broker_code,
-        "branch": branch,
-        "pair_source": source_sheet,
-    }
-
-
-def load_historical_branch_detail_pairs_from_cache(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
-    """從近 90 天分點買賣明細補進歷史 權證×分點 pair。
-
-    目的：如果某檔權證近 90 天有分點買賣超，但 OpenAPI / MoneyDJ Search 最新母體沒列入，
-    或 API4 掃不到該檔已知分點，仍可直接把「權證代號 × 券商代號 × 分點」交給 API5 回查，
-    避免 062599 這類有實際買賣超的權證漏出週報統計。
-    """
-    if not HISTORICAL_BRANCH_DETAIL_SUPPLEMENT_ENABLE or not GSHEET_FALLBACK_ENABLE:
-        return []
-    if _is_warrant_fast_fallback_live_active() and WARRANT_CACHE_FAST_FALLBACK_SKIP_LEGACY_SUPPLEMENT:
-        print("⚡ 快取未命中快速回補：略過主試算表歷史分點明細掃描，改用即時母體與精選分點完整補查")
-        return []
-
-    pair_map = {}
-    sheet_names = _get_historical_branch_detail_sheet_names()
-    if not sheet_names:
-        return []
-
-    total_hit_rows = 0
-    sheet_summaries = []
-
-    for sheet_name in sheet_names:
-        df = read_gsheet_worksheet(sheet_name)
-        if df is None or df.empty:
-            continue
-
-        sheet_hit_rows = 0
-        sheet_pair_added = 0
-        for _, r in df.iterrows():
-            row = r.to_dict()
-            if not _row_date_in_historical_detail_range(row, start_date=start_date, end_date=end_date):
-                continue
-            if not _row_matches_stock_for_historical_detail(row, stock_code, stock_name):
-                continue
-            if not _row_has_historical_detail_amount(row):
-                continue
-
-            pair = _build_historical_detail_pair_record(row, stock_code, stock_name, sheet_name)
-            if not pair:
-                continue
-
-            key = (pair["warrant_code"], pair["broker_code"])
-            if key not in pair_map:
-                pair_map[key] = pair
-                sheet_pair_added += 1
-            sheet_hit_rows += 1
-
-        if sheet_hit_rows > 0:
-            total_hit_rows += sheet_hit_rows
-            sheet_summaries.append(f"{sheet_name} {sheet_hit_rows:,}列/{sheet_pair_added:,}組")
-
-    pairs = list(pair_map.values())
-    if pairs:
-        preview_codes = sorted({p.get("warrant_code", "") for p in pairs if p.get("warrant_code")})[:12]
-        preview = "、".join(preview_codes)
-        if len(preview_codes) < len({p.get("warrant_code", "") for p in pairs if p.get("warrant_code")}):
-            preview += "…"
-        print(
-            f"☁️ 歷史分點買賣明細補 pair：近 {HISTORICAL_BRANCH_DETAIL_LOOKBACK_DAYS} 日｜"
-            f"命中 {total_hit_rows:,} 列｜新增候選 {len(pairs):,} 組 權證×分點｜權證 {preview}"
-        )
-        if sheet_summaries:
-            print(f"   來源：{'；'.join(sheet_summaries[:8])}")
-    return pairs
-
-
-def merge_pair_lists(primary_pairs: List[dict], supplement_pairs: List[dict]) -> List[dict]:
-    """合併 API4 掃出的 pair 與歷史明細補進的 pair。"""
-    merged = {}
-    for p in list(primary_pairs or []) + list(supplement_pairs or []):
-        code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
-        broker_code = str(p.get("broker_code", "") or "").strip()
-        if not code or not broker_code:
-            continue
-        p = dict(p)
-        p["warrant_code"] = code
-        p["branch"] = normalize_branch_name(p.get("branch", ""))
-        key = (code, broker_code)
-        if key not in merged:
-            merged[key] = p
-        else:
-            # 優先保留 API4 的權證 / 分點名稱；若原資料缺漏，再用補充 pair 補上。
-            old = merged[key]
-            for col in ["warrant_name", "underlying_code", "underlying_name", "branch"]:
-                if not str(old.get(col, "") or "").strip() and str(p.get(col, "") or "").strip():
-                    old[col] = p.get(col, "")
-    return list(merged.values())
-
-
-
-def _moneydj_fix_mojibake(value) -> str:
-    """修正 MoneyDJ ProxyXQ 回傳中偶爾出現的 UTF-8 / latin1 亂碼。"""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    s = str(value)
-    try:
-        return s.encode("latin1").decode("utf-8")
-    except Exception:
-        return s
-
-
-def _moneydj_clean_text(value) -> str:
-    s = _moneydj_fix_mojibake(value)
-    s = html.unescape(str(s or ""))
-    s = s.replace("\ufeff", "")
-    s = s.replace("\xa0", " ")
-    s = s.replace("\u3000", " ")
-    s = s.replace("臺", "台")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
-def _moneydj_safe_int(value, default=0) -> int:
-    try:
-        s = str(value or "").replace(",", "").strip()
-        if not s:
-            return int(default)
-        return int(float(s))
-    except Exception:
-        return int(default)
-
-
-def _moneydj_build_warrant_search_param(target: str) -> str:
-    """建立 MoneyDJ 權證搜尋 ProxyXQ 參數。
-
-    關鍵條件：
-    - C-csv2：要求回傳 rows 結構。
-    - P-S1[3]B2[xxxx.TW/TWO]：以標的股代碼查詢。
-    """
-    target = str(target or "").strip().upper()
-    return (
-        "A-57"
-        "^B-7"
-        "^C-csv2"
-        "^P-S1[3]"
-        f"B2[{target}]"
-        "C1[]"
-        "C2[]"
-        "E1[]"
-        "E2[]"
-        "S5[]"
-        "S6[]"
-        "S7[]"
-        "S2[]"
-        "S3[]"
-        "S4[]"
-        "H1[]"
-        "H2["
-    )
-
-
-def fetch_moneydj_warrant_search_raw(target: str) -> str:
-    """直接呼叫 MoneyDJ 權證搜尋備援 API，回傳原始文字。"""
-    target = str(target or "").strip().upper()
-    if not target:
-        return ""
-
-    session = get_thread_session()
-    headers_page = {
-        "User-Agent": HDR["User-Agent"],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.moneydj.com/",
-    }
-    headers_api = {
-        "User-Agent": HDR["User-Agent"],
-        "Accept": "text/html, */*; q=0.01",
-        "Accept-Language": headers_page["Accept-Language"],
-        "Referer": MONEYDJ_WARRANT_SEARCH_PAGE,
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    try:
-        # 先進搜尋頁建立 Cookie / Session，再打 ProxyXQ。
-        try:
-            session.get(MONEYDJ_WARRANT_SEARCH_PAGE, headers=headers_page, timeout=(8, 20))
-        except Exception as e:
-            print(f"⚠️ MoneyDJ 權證搜尋頁預載失敗，仍嘗試直接查詢：{target}｜{e}")
-
-        param = _moneydj_build_warrant_search_param(target)
-        url = MONEYDJ_WARRANT_PROXY_URL + "?param=" + urllib.parse.quote(param, safe="")
-        resp = session.get(url, headers=headers_api, timeout=(8, 30))
-        resp.raise_for_status()
-        text = resp.content.decode("utf-8", errors="replace")
-        print(f"✅ MoneyDJ 權證搜尋備援：{target}｜回傳長度 {len(text):,}")
-        return text
-    except Exception as e:
-        print(f"⚠️ MoneyDJ 權證搜尋備援失敗：{target}｜{e}")
-        return ""
-
-
-def parse_moneydj_warrant_search_rows(raw_text: str, stock_code: str, target: str, stock_name: str = "") -> List[dict]:
-    """解析 MoneyDJ ProxyXQ 權證搜尋 rows，回傳認購權證母體。
-
-    注意：此備援刻意不過濾成交量為 0 的權證，避免 MoneyDJ 搜尋頁成交量欄位尚未更新時漏掉權證。
-    """
-    if not raw_text:
-        return []
-
-    try:
-        payload = json.loads(raw_text)
-    except Exception as e:
-        print(f"⚠️ MoneyDJ 權證搜尋備援 JSON 解析失敗：{target}｜{e}")
-        return []
-
-    rows = payload.get("rows", []) if isinstance(payload, dict) else []
-    if not rows:
-        print(f"⚠️ MoneyDJ 權證搜尋備援 rows 為空：{target}")
-        return []
-
-    stock_code_clean = _clean_code(stock_code)
-    target = str(target or "").strip().upper()
-    out = []
-    seen = set()
-
-    for item in rows:
-        row = item.get("Row", []) if isinstance(item, dict) else []
-        if not row or len(row) < 58:
-            continue
-
-        full_code = _moneydj_clean_text(row[0]).upper()
-        code = normalize_openapi_warrant_code(full_code.replace(".TW", "").replace(".TWO", ""))
-        warrant_name = _moneydj_clean_text(row[1])
-        display_name = _moneydj_clean_text(row[48]) if len(row) > 48 else ""
-        underlying_code = _moneydj_clean_text(row[29]).upper() if len(row) > 29 else ""
-        underlying_name = _moneydj_clean_text(row[30]) if len(row) > 30 else ""
-        full_type = _moneydj_clean_text(row[8]) if len(row) > 8 else ""
-        display_type = _moneydj_clean_text(row[51]) if len(row) > 51 else ""
-
-        # 僅取指定標的；MoneyDJ 對上市通常是 xxxx.TW，上櫃可能是 xxxx.TWO。
-        if underlying_code != target:
-            continue
-
-        # 只取認購，不取認售 / 牛熊。
-        if display_type != "認購" and "認購" not in full_type:
-            continue
-
-        if not code or not re.fullmatch(r"\d{6}", code):
-            continue
-
-        if code in seen:
-            continue
-        seen.add(code)
-
-        name = display_name or warrant_name or code
-        out.append({
-            "代號": code,
-            "名稱": name,
-            "標的股": str(stock_code_clean),
-            "標的名稱": underlying_name or stock_name,
-            "成交金額": 0,
-            "成交量": _moneydj_safe_int(row[28]) if len(row) > 28 else 0,
-            "母體來源": "MoneyDJSearch",
-        })
-
-    out = sorted(out, key=lambda x: (int(x.get("成交量", 0) or 0), x.get("代號", "")), reverse=True)
-    print(f"🔎 MoneyDJ 權證搜尋備援解析：{target}｜認購 {len(out):,} 支（未過濾成交量=0）")
-    return out
-
-
-def fetch_moneydj_call_warrants_fallback(stock_code: str, stock_name: str) -> List[dict]:
-    """OpenAPI 沒抓到權證母體時，改用 MoneyDJ 依標的股代碼抓認購權證。
-
-    會依序嘗試：
-    1. xxxx.TW
-    2. xxxx.TWO
-
-    並合併去重。此備援不過濾成交量為 0。
-    """
-    stock_code_clean = _clean_code(stock_code)
-    if not stock_code_clean:
-        return []
-
-    records = {}
-
-    def fetch_one_suffix(suffix: str):
-        target = f"{stock_code_clean}.{suffix}"
-        raw = fetch_moneydj_warrant_search_raw(target)
-        rows = parse_moneydj_warrant_search_rows(raw, stock_code_clean, target, stock_name=stock_name)
-        return rows
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(fetch_one_suffix, suffix) for suffix in ["TW", "TWO"]]
-        for future in futures:
-            try:
-                rows = future.result()
-            except Exception as e:
-                print(f"⚠️ MoneyDJ 權證搜尋平行工作失敗：{stock_code_clean}｜{e}")
-                rows = []
-            for rec in rows:
-                code = normalize_openapi_warrant_code(rec.get("代號"))
-                if not code:
-                    continue
-                old = records.get(code)
-                if old is None:
-                    records[code] = rec
-                else:
-                    # 若兩個市場來源重複，保留成交量較大的資料。
-                    if int(rec.get("成交量", 0) or 0) > int(old.get("成交量", 0) or 0):
-                        records[code] = rec
-
-    out = list(records.values())
-    out = sorted(out, key=lambda x: (int(x.get("成交量", 0) or 0), x.get("代號", "")), reverse=True)
-    if out:
-        print(f"✅ MoneyDJ 權證搜尋備援完成：{stock_code_clean} {stock_name}｜認購 {len(out):,} 支（未過濾成交量=0）")
-    else:
-        print(f"⚠️ MoneyDJ 權證搜尋備援沒有取得認購權證：{stock_code_clean} {stock_name}")
-    return out
-
-
-def get_all_active_call_warrants(stock_code: str, stock_name: str, start_date=None, end_date=None) -> List[dict]:
-    # TWSE、TPEx 與 MoneyDJ Search 彼此沒有資料相依，平行抓取可縮短母體建立等待。
-    prefetched_moneydj_warrants = None
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        twse_future = executor.submit(fetch_twse_openapi_warrant_daily_df)
-        tpex_future = executor.submit(fetch_tpex_openapi_warrant_daily_df)
-        moneydj_future = (
-            executor.submit(fetch_moneydj_call_warrants_fallback, stock_code, stock_name)
-            if MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_ENABLE
-            else None
-        )
-        try:
-            twse_df = twse_future.result()
-        except Exception as e:
-            print(f"⚠️ TWSE 權證 OpenAPI 平行工作失敗：{e}")
-            twse_df = pd.DataFrame()
-        try:
-            tpex_df = tpex_future.result()
-        except Exception as e:
-            print(f"⚠️ TPEx 權證 OpenAPI 平行工作失敗：{e}")
-            tpex_df = pd.DataFrame()
-        if moneydj_future is not None:
-            try:
-                prefetched_moneydj_warrants = moneydj_future.result()
-            except Exception as e:
-                print(f"⚠️ MoneyDJ 權證搜尋平行工作失敗：{stock_code}｜{e}")
-                prefetched_moneydj_warrants = []
-
-    frames = []
-    for source_label, f in [("TWSE", twse_df), ("TPEx", tpex_df)]:
-        if f is None or f.empty:
-            continue
-        trade_dates = sorted([d for d in f["交易日期"].unique() if str(d).strip()], key=parse_openapi_trade_date_for_sort)
-        if not trade_dates:
-            continue
-        latest_trade_date = trade_dates[-1]
-        latest_df = f[f["交易日期"] == latest_trade_date].copy()
-        frames.append(latest_df)
-        print(f"🔎 {source_label} OpenAPI 最新交易日：{latest_trade_date}｜當日權證：{len(latest_df):,} 支")
-
-    if frames:
-        all_df = pd.concat(frames, ignore_index=True).fillna("")
-        active_df = all_df[
-            (pd.to_numeric(all_df["成交量"], errors="coerce").fillna(0) > 0)
-            & (all_df["名稱"].astype(str).str.contains("購", na=False))
-            & (~all_df["名稱"].astype(str).str.contains("售|牛|熊", na=False))
-            & (all_df["代號"].astype(str).str.fullmatch(r"\d{6}", na=False))
-        ].copy()
-    else:
-        active_df = pd.DataFrame(columns=["代號", "名稱", "成交金額", "成交量"])
-    print(f"🔎 OpenAPI 認購候選（最新交易日成交量 > 0）：{len(active_df):,} 支")
-
-    lookup = load_warrant_underlying_lookup()
-    aliases = make_stock_aliases(stock_name)
-    aliases_norm = [_normalize_warrant_match_text(a) for a in aliases if _normalize_warrant_match_text(a)]
-    stock_code_clean = _clean_code(stock_code)
-    warrants = []
-    seen = set()
-    name_match_count = 0
-    lookup_match_count = 0
-    moneydj_added = 0
-
-    for _, r in active_df.sort_values(["成交金額", "成交量"], ascending=[False, False]).iterrows():
-        code = normalize_openapi_warrant_code(r.get("代號"))
-        name = str(r.get("名稱", "")).strip()
-        if not code or code in seen:
-            continue
-        cached = lookup.get(code, {})
-        ucode = _clean_code(cached.get("underlying_code", ""))
-        uname = str(cached.get("underlying_name", "")).strip()
-
-        name_key = _normalize_warrant_match_text(name)
-        # 權證名稱通常格式為「標的 + 發行券商 + 到期年月 + 購xx」，但不同來源可能有空白或符號。
-        # 這裡改成檢查股票別名是否出現在名稱前段，而不是硬性 startswith。
-        name_front = name_key[:16]
-        name_match = any(alias and alias in name_front for alias in aliases_norm)
-        lookup_match = bool(ucode and ucode == stock_code_clean)
-
-        if lookup_match or name_match:
-            if lookup_match:
-                lookup_match_count += 1
-            if name_match:
-                name_match_count += 1
-            seen.add(code)
-            warrants.append({
-                "代號": code,
-                "名稱": name,
-                "標的股": str(stock_code_clean),
-                "標的名稱": uname or stock_name,
-                "成交金額": int(r.get("成交金額", 0) or 0),
-                "成交量": int(r.get("成交量", 0) or 0),
-                "母體來源": "OpenAPI",
-            })
-
-    # MoneyDJ 權證搜尋補漏：
-    # 原本只有在 OpenAPI 完全抓不到母體時才啟用 MoneyDJ Search。
-    # 這會造成 OpenAPI 已有部分權證、但漏掉 MoneyDJ 當天已有成交量的權證時，後續 API4/API5 完全不會查該檔。
-    # 這版改成：
-    # - OpenAPI 有抓到權證：MoneyDJ Search 也跑一次，只補「OpenAPI 沒有、且 MoneyDJ Search 成交量達門檻」的漏網權證。
-    # - OpenAPI 完全沒有權證：維持原本備援行為，MoneyDJ Search 找到的認購權證全部補進，不過濾成交量 0。
-    moneydj_skipped_low_volume = 0
-    if MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_ENABLE or not warrants:
-        if warrants:
-            print(
-                f"🔁 MoneyDJ 權證搜尋補漏啟用：OpenAPI 已命中 {len(warrants):,} 支，"
-                f"額外補 MoneyDJ Search 成交量 >= {MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME:,} 的漏網權證"
-            )
-        else:
-            print("⚠️ OpenAPI 未取得可用認購權證母體或比對後為 0，啟用 MoneyDJ 權證搜尋備援（不過濾成交量=0）")
-
-        moneydj_warrants = (
-            list(prefetched_moneydj_warrants or [])
-            if prefetched_moneydj_warrants is not None
-            else fetch_moneydj_call_warrants_fallback(stock_code_clean, stock_name)
-        )
-        had_openapi_warrants = bool(warrants)
-
-        for rec in moneydj_warrants:
-            code = normalize_openapi_warrant_code(rec.get("代號"))
-            if not code or code in seen:
-                continue
-
-            mdj_volume = int(rec.get("成交量", 0) or 0)
-
-            # OpenAPI 已有母體時只補 MoneyDJ 有量的漏網權證，避免把全部 0 量權證都丟進 API4/API5。
-            # OpenAPI 完全沒有母體時維持原本備援：不過濾成交量 0。
-            if (
-                had_openapi_warrants
-                and MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME > 0
-                and mdj_volume < MONEYDJ_WARRANT_SEARCH_SUPPLEMENT_MIN_VOLUME
-            ):
-                moneydj_skipped_low_volume += 1
-                continue
-
-            seen.add(code)
-            moneydj_added += 1
-            warrants.append({
-                "代號": code,
-                "名稱": str(rec.get("名稱", "") or code).strip(),
-                "標的股": str(stock_code_clean),
-                "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
-                "成交金額": int(rec.get("成交金額", 0) or 0),
-                "成交量": mdj_volume,
-                "母體來源": "MoneyDJSearchSupplement" if had_openapi_warrants else "MoneyDJSearch",
-            })
-
-        if had_openapi_warrants:
-            print(
-                f"🔁 MoneyDJ Search 補漏完成：新增 {moneydj_added:,} 支｜"
-                f"低於成交量門檻略過 {moneydj_skipped_low_volume:,} 支"
-            )
-
-    extra_live_added = 0
-    for rec in parse_extra_live_warrants(stock_code_clean, stock_name):
-        code = normalize_openapi_warrant_code(rec.get("代號"))
-        if not code or code in seen:
-            continue
-        seen.add(code)
-        extra_live_added += 1
-        warrants.append({
-            "代號": code,
-            "名稱": str(rec.get("名稱", "") or code).strip(),
-            "標的股": str(stock_code_clean),
-            "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
-            "成交金額": int(rec.get("成交金額", 0) or 0),
-            "成交量": int(rec.get("成交量", 0) or 0),
-            "母體來源": "ExtraLiveWarrant",
-        })
-
-    historical_warrants = load_historical_call_warrants_from_cache(
-        stock_code,
-        stock_name,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    historical_added = 0
-    for rec in historical_warrants:
-        code = normalize_openapi_warrant_code(rec.get("代號"))
-        if not code or code in seen:
-            continue
-        seen.add(code)
-        historical_added += 1
-        warrants.append({
-            "代號": code,
-            "名稱": str(rec.get("名稱", "") or code).strip(),
-            "標的股": str(stock_code_clean),
-            "標的名稱": str(rec.get("標的名稱", "") or stock_name).strip(),
-            "成交金額": int(rec.get("成交金額", 0) or 0),
-            "成交量": int(rec.get("成交量", 0) or 0),
-            "母體來源": "GoogleSheetHistory",
-        })
-
-    if MAX_WARRANTS > 0:
-        warrants = warrants[:MAX_WARRANTS]
-
-    debug_codes = get_debug_warrant_codes()
-    if debug_codes:
-        warrant_map_for_debug = {normalize_openapi_warrant_code(w.get("代號", "")): w for w in warrants}
-        for debug_code in sorted(debug_codes):
-            if debug_code in warrant_map_for_debug:
-                print(f"✅ Debug 權證母體包含 {debug_code}：{warrant_map_for_debug[debug_code]}")
-            else:
-                print(f"⚠️ Debug 權證母體不包含 {debug_code}，後續 API4/API5 不會查到這檔")
-
-    print(
-        f"🔎 {stock_code_clean} {stock_name} 權證比對："
-        f"lookup命中 {lookup_match_count:,} 支｜名稱命中 {name_match_count:,} 支｜"
-        f"MoneyDJ補漏/備援新增 {moneydj_added:,} 支｜指定Live新增 {extra_live_added:,} 支｜歷史補充新增 {historical_added:,} 支"
-    )
-    print(f"✅ {stock_code_clean} 相關認購權證：{len(warrants):,} 支")
-    return warrants
-
-def _api4_fetch_raw(code, start, end):
-    """API4 原始抓取，不直接寫入統計；由呼叫端決定第一輪/第二輪後的最終狀態。"""
-    retry_count = 0
-    try:
-        url = API4.format(code=code, start=start, end=end)
-        data, retry_count = _moneydj_get_json_with_retry(url, scope="api4")
-        rows = []
-        for item in (data if isinstance(data, list) else [data]):
-            rows.extend(item.get("ResultSet", {}).get("Result", []))
-        return rows, ("success" if rows else "empty"), "", retry_count
-    except Exception as e:
-        retry_count = int(getattr(e, "retry_count", retry_count) or 0)
-        return [], "failed", str(e), retry_count
-
-
-def api4_get(code, start, end):
-    rows, status, error, retry_count = _api4_fetch_raw(code, start, end)
-    _record_api_fetch("api4", status, error=f"{code}｜{error}" if error else "", retry_count=retry_count)
-    return rows
-
-
-def api5_get(warrant, broker, days=None):
-    retry_count = 0
-    try:
-        days = int(days if days is not None else API5_DAYS)
-        url = API5.format(warrant=warrant, broker=broker, days=days)
-        data, retry_count = _moneydj_get_json_with_retry(url, scope="api5")
-        rs = data[0].get("ResultSet", {}) if isinstance(data, list) else data.get("ResultSet", {})
-        rows = rs.get("Result", [])
-        _record_api_fetch("api5", "success" if rows else "empty", retry_count=retry_count)
-        return rows
-    except Exception as e:
-        retry_count = int(getattr(e, "retry_count", retry_count) or 0)
-        _record_api_fetch("api5", "failed", error=f"{warrant}/{broker}｜{e}", retry_count=retry_count)
-        return []
-
-
-def fetch_all_broker_pairs_for_warrants(warrants: List[dict], start_s: str, end_s: str) -> List[dict]:
-    pairs = {}
-    api4_status_by_code = {}
-    api4_rows_count_by_code = {}
-    api4_error_by_code = {}
-    debug_codes = get_debug_warrant_codes()
-    warrant_lookup = {
-        normalize_openapi_warrant_code(w.get("代號", "")): w
-        for w in warrants or []
-        if normalize_openapi_warrant_code(w.get("代號", ""))
-    }
-
-    if not warrants:
-        return []
-
-    def rows_to_pair_records(w, rows):
-        out = []
-        for row in rows or []:
-            broker_code = str(row.get("V2", "")).strip()
-            broker_name = normalize_branch_name(row.get("V3", ""))
-            if not broker_code:
-                continue
-            out.append({
-                "warrant_code": w["代號"],
-                "warrant_name": w["名稱"],
-                "underlying_code": w.get("標的股", ""),
-                "underlying_name": w.get("標的名稱", ""),
-                "broker_code": broker_code,
-                "branch": broker_name,
-            })
-        return out
-
-    def scan_one(w):
-        rows, status, error, retry_count = _api4_fetch_raw(w["代號"], start_s, end_s)
-        return {
-            "warrant": w,
-            "rows": rows,
-            "status": status,
-            "error": error,
-            "retry_count": retry_count,
-        }
-
-    def remember_api4_result(result):
-        w = result.get("warrant", {})
-        code = normalize_openapi_warrant_code(w.get("代號", ""))
-        if not code:
-            return
-        api4_status_by_code[code] = str(result.get("status", "") or "")
-        api4_rows_count_by_code[code] = len(result.get("rows", []) or [])
-        api4_error_by_code[code] = str(result.get("error", "") or "")
-
-    def print_api4_debug(result, stage: str = "第一輪"):
-        w = result.get("warrant", {})
-        code = normalize_openapi_warrant_code(w.get("代號", ""))
-        if code not in debug_codes:
-            return
-
-        rows = result.get("rows", []) or []
-        status = result.get("status", "")
-        error = result.get("error", "")
-        print("========== API4 指定權證 Debug ==========")
-        print(f"權證：{code}｜名稱：{w.get('名稱', '')}｜來源：{w.get('母體來源', '')}｜階段：{stage}")
-        print(f"API4 status={status}｜rows={len(rows):,}｜error={error}")
-        if rows:
-            for row in rows[:20]:
-                print(row)
-            if len(rows) > 20:
-                print(f"... API4 rows 尚有 {len(rows) - 20:,} 筆未列印")
-        print("========== API4 指定權證 Debug 結束 ==========")
-
-    def record_final_result(result, second_pass: bool = False):
-        w = result.get("warrant", {})
-        code = str(w.get("代號", "") or "").strip()
-        source = str(w.get("母體來源", "") or "").strip()
-        status = result.get("status", "failed")
-        error = result.get("error", "")
-        retry_count = int(result.get("retry_count", 0) or 0)
-
-        # 歷史快取補進來的權證，若第二輪仍查不到 API4，代表 live 無法補齊；
-        # 但既有快取資料已在 fetch_warrant_events_full_market 前段合併，不把它列為硬失敗。
-        if (
-            second_pass
-            and API4_HISTORY_FAILURE_AS_EMPTY
-            and status == "failed"
-            and source == "GoogleSheetHistory"
-        ):
-            _record_api_fetch(
-                "api4",
-                "empty",
-                error=f"{code}｜歷史補充權證 API4 二次補抓仍失敗，保留既有快取資料：{error}",
-                retry_count=retry_count,
-            )
-            return
-
-        _record_api_fetch(
-            "api4",
-            status,
-            error=f"{code}｜{error}" if error and status == "failed" else "",
-            retry_count=retry_count,
-        )
-
-    reset_api_fetch_stats("api4")
-    print(f"🔎 API4 掃描全部分點：{len(warrants):,} 支權證，workers={API4_WORKERS}")
-
-    failed_results = []
-    with ThreadPoolExecutor(max_workers=max(1, API4_WORKERS)) as ex:
-        futures = {ex.submit(scan_one, w): w for w in warrants}
-        for i, fut in enumerate(as_completed(futures), 1):
-            w = futures.get(fut, {})
-            try:
-                result = fut.result()
-                remember_api4_result(result)
-                print_api4_debug(result, stage="第一輪")
-                if result.get("status") == "failed":
-                    failed_results.append(result)
-                else:
-                    record_final_result(result, second_pass=False)
-                    for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
-                        pairs[(rec["warrant_code"], rec["broker_code"])] = rec
-            except Exception as e:
-                code = normalize_openapi_warrant_code(w.get("代號", ""))
-                if code:
-                    api4_status_by_code[code] = "failed"
-                    api4_rows_count_by_code[code] = 0
-                    api4_error_by_code[code] = f"future {w.get('代號', '')}｜{e}"
-                failed_results.append({
-                    "warrant": w,
-                    "rows": [],
-                    "status": "failed",
-                    "error": f"future {w.get('代號', '')}｜{e}",
-                    "retry_count": 0,
-                })
-            if i % 100 == 0:
-                print(f"  API4 {i:,}/{len(warrants):,}，pairs={len(pairs):,}，待補抓={len(failed_results):,}")
-
-    if failed_results and API4_SECOND_PASS_ENABLE:
-        retry_warrants = [r.get("warrant", {}) for r in failed_results]
-        print(
-            f"🔁 API4 第一輪仍有 {len(retry_warrants):,} 支失敗，"
-            f"{API4_SECOND_PASS_WAIT:g} 秒後進行第二輪低併發補抓，workers={API4_SECOND_PASS_WORKERS}"
-        )
-        time.sleep(max(0.0, float(API4_SECOND_PASS_WAIT)))
-        second_failed = []
-        with ThreadPoolExecutor(max_workers=max(1, API4_SECOND_PASS_WORKERS)) as ex:
-            futures = {ex.submit(scan_one, w): w for w in retry_warrants}
-            for i, fut in enumerate(as_completed(futures), 1):
-                w = futures.get(fut, {})
-                try:
-                    result = fut.result()
-                    remember_api4_result(result)
-                    print_api4_debug(result, stage="第二輪")
-                    if result.get("status") == "failed":
-                        second_failed.append(result)
-                    record_final_result(result, second_pass=True)
-                    if result.get("status") != "failed":
-                        for rec in rows_to_pair_records(result.get("warrant", {}), result.get("rows", [])):
-                            pairs[(rec["warrant_code"], rec["broker_code"])] = rec
-                except Exception as e:
-                    code = normalize_openapi_warrant_code(w.get("代號", ""))
-                    if code:
-                        api4_status_by_code[code] = "failed"
-                        api4_rows_count_by_code[code] = 0
-                        api4_error_by_code[code] = f"second future {w.get('代號', '')}｜{e}"
-                    result = {
-                        "warrant": w,
-                        "rows": [],
-                        "status": "failed",
-                        "error": f"second future {w.get('代號', '')}｜{e}",
-                        "retry_count": 0,
-                    }
-                    second_failed.append(result)
-                    record_final_result(result, second_pass=True)
-        if second_failed:
-            print(f"⚠️ API4 第二輪後仍失敗：{len(second_failed):,} 支")
-    else:
-        for result in failed_results:
-            remember_api4_result(result)
-            record_final_result(result, second_pass=False)
-
-    if debug_codes:
-        for debug_code in sorted(debug_codes):
-            if debug_code in warrant_lookup:
-                status = api4_status_by_code.get(debug_code, "未執行")
-                rows_count = api4_rows_count_by_code.get(debug_code, 0)
-                err = api4_error_by_code.get(debug_code, "")
-                print(f"🔎 API4 指定權證總結：{debug_code}｜status={status}｜rows={rows_count:,}｜error={err}")
-            else:
-                print(f"⚠️ API4 指定權證總結：{debug_code} 不在本次權證母體，所以 API4 未執行")
-
-    # 完全純 Live 的 pair 補查：
-    # 1. 使用者手動指定的 權證×券商代號×分點。
-    # 2. API4 對某權證回 empty，或指定 debug 權證時，自動用本次已知精選分點券商代號補 pair。
-    pair_values_before_backfill = list(pairs.values())
-    extra_pairs = parse_extra_live_pairs(
-        warrants[0].get("標的股", "") if warrants else "",
-        warrants[0].get("標的名稱", "") if warrants else "",
-        warrant_lookup=warrant_lookup,
-    )
-    auto_pairs = build_auto_selected_branch_backfill_pairs(
-        warrants,
-        pair_values_before_backfill,
-        api4_status_by_code,
-        warrants[0].get("標的股", "") if warrants else "",
-        warrants[0].get("標的名稱", "") if warrants else "",
-    )
-
-    backfill_pairs = extra_pairs + auto_pairs
-    if backfill_pairs:
-        before = len(pairs)
-        for p in backfill_pairs:
-            code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
-            broker_code = str(p.get("broker_code", "") or "").strip()
-            branch = normalize_branch_name(p.get("branch", ""))
-            if not code or not broker_code:
-                continue
-            p = dict(p)
-            p["warrant_code"] = code
-            p["branch"] = branch
-            p.setdefault("warrant_name", str(warrant_lookup.get(code, {}).get("名稱", "") or code))
-            p.setdefault("underlying_code", str(warrant_lookup.get(code, {}).get("標的股", "") or ""))
-            p.setdefault("underlying_name", str(warrant_lookup.get(code, {}).get("標的名稱", "") or ""))
-            pairs[(code, broker_code)] = p
-
-        added = len(pairs) - before
-        print(
-            f"🔁 純 Live API5 pair 補查合併完成：原始 {before:,} 組｜"
-            f"補查候選 {len(backfill_pairs):,} 組｜實際新增 {added:,} 組｜合併後 {len(pairs):,} 組"
-        )
-
-    print_api_fetch_stats("api4", "API4")
-    abort_if_api_failure_too_high("api4", "API4")
-    pair_list = list(pairs.values())
-    if MAX_PAIRS > 0:
-        pair_list = pair_list[:MAX_PAIRS]
-    print(f"✅ API4 完成：{len(pair_list):,} 組 權證×分點")
-    return pair_list
-
-
-def fetch_api5_events_for_pairs(pair_list: List[dict], start_date=None, end_date=None) -> pd.DataFrame:
-    rows = []
-    if not pair_list:
-        return pd.DataFrame()
-
-    debug_codes = get_debug_warrant_codes()
-    selected_branches_for_debug = set(_get_selected_branch_flow_list()) if SELECTED_BRANCH_FLOW_ENABLE else set()
-    selected_branches_for_debug = {normalize_branch_name(x) for x in selected_branches_for_debug if normalize_branch_name(x)}
-
-    if debug_codes:
-        debug_pairs = [
-            p for p in pair_list
-            if normalize_openapi_warrant_code(p.get("warrant_code", "")) in debug_codes
-        ]
-        if debug_pairs:
-            print("========== API5 指定權證 pair Debug ==========")
-            print(f"指定權證：{', '.join(sorted(debug_codes))}｜pair 數：{len(debug_pairs):,}")
-            for p in debug_pairs[:30]:
-                print(
-                    f"{normalize_openapi_warrant_code(p.get('warrant_code', ''))}｜"
-                    f"{p.get('warrant_name', '')}｜broker={p.get('broker_code', '')}｜"
-                    f"branch={normalize_branch_name(p.get('branch', ''))}｜source={p.get('pair_source', 'API4')}"
-                )
-            if len(debug_pairs) > 30:
-                print(f"... 指定權證 pair 尚有 {len(debug_pairs) - 30:,} 組未列印")
-            print("========== API5 指定權證 pair Debug 結束 ==========")
-        else:
-            print(f"⚠️ API5 指定權證沒有任何 pair：{', '.join(sorted(debug_codes))}")
-
-    def fetch_one(p):
-        out = []
-        code = normalize_openapi_warrant_code(p.get("warrant_code", ""))
-        branch = normalize_branch_name(p.get("branch", ""))
-        broker_code = str(p.get("broker_code", "") or "").strip()
-        api_rows = api5_get(p["warrant_code"], p["broker_code"], days=API5_DAYS)
-
-        debug_this_pair = code in debug_codes and (
-            not selected_branches_for_debug or branch in selected_branches_for_debug
-        )
-        if debug_this_pair:
-            print(
-                f"🔎 API5 指定權證回查：{code}｜{p.get('warrant_name', '')}｜"
-                f"broker={broker_code}｜branch={branch}｜raw_rows={len(api_rows or []):,}｜source={p.get('pair_source', 'API4')}"
-            )
-
-        debug_nonzero_rows = []
-        for row in api_rows or []:
-            buy_s = int(float(row.get("V2", 0) or 0))
-            sell_s = int(float(row.get("V3", 0) or 0))
-            buy_a = int(float(row.get("V4", 0) or 0) * 1000)
-            sell_a = int(float(row.get("V5", 0) or 0) * 1000)
-            net_a = buy_a - sell_a
-            if debug_this_pair and (buy_a != 0 or sell_a != 0):
-                debug_nonzero_rows.append({
-                    "Date": row.get("V1", ""),
-                    "buy_shares": buy_s,
-                    "sell_shares": sell_s,
-                    "buy_amount": buy_a,
-                    "sell_amount": sell_a,
-                    "net_amount": net_a,
-                })
-            if buy_a == 0 and sell_a == 0:
-                continue
-            dt = parse_date(row.get("V1", ""))
-            if not dt:
-                continue
-            out.append({
-                "Date": pd.Timestamp(dt).normalize(),
-                "branch": branch,
-                "broker_code": broker_code,
-                "warrant_code": p["warrant_code"],
-                "warrant_name": p["warrant_name"],
-                "underlying_code": p.get("underlying_code", ""),
-                "underlying_name": p.get("underlying_name", ""),
-                "buy_amount": float(buy_a),
-                "sell_amount": float(sell_a),
-                "net_amount": float(net_a),
-                "buy_shares": buy_s,
-                "sell_shares": sell_s,
-            })
-
-        if debug_this_pair and DEBUG_API5_ROWS_ENABLE:
-            if debug_nonzero_rows:
-                print(f"------ API5 指定權證非零買賣明細：{code} × {branch} ------")
-                for r in debug_nonzero_rows[:30]:
-                    print(
-                        f"{r['Date']}｜買金額 {r['buy_amount']:,}｜賣金額 {r['sell_amount']:,}｜"
-                        f"淨額 {r['net_amount']:,}｜買張 {r['buy_shares']:,}｜賣張 {r['sell_shares']:,}"
-                    )
-                if len(debug_nonzero_rows) > 30:
-                    print(f"... 非零明細尚有 {len(debug_nonzero_rows) - 30:,} 筆未列印")
-            else:
-                print(f"⚠️ API5 指定權證沒有非零買賣明細：{code} × {branch}")
-
-        return out
-
-    reset_api_fetch_stats("api5")
-    print(f"💰 API5 回查買賣金額：{len(pair_list):,} 組，workers={API5_WORKERS}")
-    with ThreadPoolExecutor(max_workers=max(1, API5_WORKERS)) as ex:
-        futures = {ex.submit(fetch_one, p): p for p in pair_list}
-        for i, fut in enumerate(as_completed(futures), 1):
-            p = futures.get(fut, {})
-            try:
-                rows.extend(fut.result())
-            except Exception as e:
-                _record_api_fetch("api5", "failed", error=f"future {p.get('warrant_code', '')}/{p.get('broker_code', '')}｜{e}")
-            if i % 200 == 0:
-                print(f"  API5 {i:,}/{len(pair_list):,}，events={len(rows):,}")
-    print_api_fetch_stats("api5", "API5")
-    abort_if_api_failure_too_high("api5", "API5")
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    if start_date is not None:
-        df = df[df["Date"] >= pd.Timestamp(start_date).normalize()]
-    if end_date is not None:
-        df = df[df["Date"] <= pd.Timestamp(end_date).normalize()]
-    df["side"] = np.where(df["net_amount"] >= 0, "買超", "賣超")
-    return df.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
-
-
-
-def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date) -> pd.DataFrame:
-    frames = []
-    fast_fallback_live = False
-
-    if REPORT_LIVE_ONLY:
-        print("🔴 純 Live 模式：權證分點資料不讀取 Google Sheet 快照、不合併 Google Sheet 歷史列、不讀本機快取")
-    else:
-        # 優先讀 Google Sheet 完整快照；只有狀態表標記 complete 且 API4/API5 失敗數為 0 才會直接使用。
-        gsheet_snapshot = load_gsheet_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
-        if gsheet_snapshot is not None and not gsheet_snapshot.empty:
-            return gsheet_snapshot
-
-        if ACTION_CACHE_ONLY_MODE:
-            key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
-            raise RuntimeError(
-                "Action=0 嚴格快取模式找不到完整權證快照："
-                f"{key}。請先以 Action=1 執行一次 Live 更新，成功後會寫入獨立權證快取試算表。"
-            )
-
-        # 保留本機快照相容舊流程，但預設關閉；若使用，仍排在 Google Sheet 完整快照之後。
-        local_snapshot = load_local_warrant_events_snapshot(stock_code, start_date=start_date, end_date=end_date)
-        if local_snapshot is not None and not local_snapshot.empty:
-            return local_snapshot
-
-        fast_fallback_live = bool(
-            ACTION_CACHE_PREFERRED_MODE
-            and WARRANT_CACHE_FAST_FALLBACK_ENABLE
-        )
-        if fast_fallback_live:
-            print(
-                f"⚡ Google Sheet 快照未命中：{_gsheet_cache_key(stock_code, start_date, end_date)}｜"
-                "自動切換快速 Live 抓取，完成後建立新快照"
-            )
-        else:
-            # 僅在未啟用快速回補時，才讀取舊大型歷史表並與 live 合併。
-            cached = load_cached_warrant_history(stock_code, start_date=start_date, end_date=end_date)
-            if not cached.empty:
-                frames.append(cached)
-                print(f"☁️ Google Sheet {GSHEET_WARRANT_HISTORY_SHEET} 既有歷史列命中：{len(cached):,} 筆，將與 100% live 資料合併去重")
-
-    live_fetched = False
-    if LIVE_FETCH_ENABLE:
-        with _warrant_fast_fallback_live_scope(fast_fallback_live):
-            end_dt = pd.Timestamp(end_date).to_pydatetime()
-            start_s = (end_dt - timedelta(days=API4_SCAN_CALENDAR_DAYS)).strftime("%Y/%m/%d")
-            end_s = end_dt.strftime("%Y/%m/%d")
-            with report_stage_timer(f"{stock_code}｜權證母體建立"):
-                warrants = get_all_active_call_warrants(
-                    stock_code,
-                    stock_name,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-
-            with report_stage_timer(f"{stock_code}｜API4 分點掃描"):
-                pairs = fetch_all_broker_pairs_for_warrants(warrants, start_s, end_s)
-
-            # 快取未命中快速回補時，略過主試算表的大型歷史分點明細掃描；
-            # 精選分點完整補查仍由既有 API4/API5 pair 邏輯保留。
-            supplement_pairs = load_historical_branch_detail_pairs_from_cache(
-                stock_code,
-                stock_name,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            if supplement_pairs:
-                before_pairs = len(pairs)
-                pairs = merge_pair_lists(pairs, supplement_pairs)
-                added_pairs = len(pairs) - before_pairs
-                print(
-                    f"🔁 API5 pair 補漏合併完成：API4原始 {before_pairs:,} 組｜"
-                    f"歷史明細候選 {len(supplement_pairs):,} 組｜實際新增 {added_pairs:,} 組｜合併後 {len(pairs):,} 組"
-                )
-                if MAX_PAIRS > 0 and len(pairs) > MAX_PAIRS:
-                    pairs = pairs[:MAX_PAIRS]
-                    print(f"⚠️ MAX_PAIRS 限制啟用，合併後 pair 截斷為 {len(pairs):,} 組")
-
-            with report_stage_timer(f"{stock_code}｜API5 買賣金額回查｜pairs={len(pairs):,}"):
-                live = fetch_api5_events_for_pairs(
-                    pairs,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-            live_fetched = True
-            if not live.empty:
-                frames.append(live)
-                print(f"🌐 Live 權證全分點資料：{len(live):,} 筆")
-
-    if not frames:
-        return pd.DataFrame(columns=["Date", "branch", "broker_code", "warrant_code", "warrant_name", "underlying_code", "underlying_name", "buy_amount", "sell_amount", "net_amount"])
-
-    events = pd.concat(frames, ignore_index=True, sort=False).fillna("")
-    for c in ["buy_amount", "sell_amount", "net_amount"]:
-        events[c] = pd.to_numeric(events[c], errors="coerce").fillna(0.0)
-    events["Date"] = pd.to_datetime(events["Date"]).dt.normalize()
-    events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
-    events["branch"] = events["branch"].map(normalize_branch_name)
-    events["broker_code"] = events["broker_code"].astype(str).str.strip()
-    # 合併 live/cache 重複資料
-    # 注意：net_amount 是有正負號的欄位，不能直接用 max。
-    # 若賣超資料為負數，max 會選到絕對值較小、較接近 0 的那筆，造成賣超被低估。
-    # 因此只對買進 / 賣出金額取 max，最後再重新計算 net_amount，確保：
-    # net_amount = buy_amount - sell_amount。
-    group_cols = ["Date", "broker_code", "branch", "warrant_code", "warrant_name", "underlying_code", "underlying_name"]
-    events = events.groupby(group_cols, as_index=False, dropna=False).agg({
-        "buy_amount": "max",
-        "sell_amount": "max",
-    })
-    events["net_amount"] = events["buy_amount"] - events["sell_amount"]
-    events = events[(events["buy_amount"] > 0) | (events["sell_amount"] > 0) | (events["net_amount"].abs() > 0)].copy()
-    events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
-    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
-
-    # 只有本次真的完成 live 抓取，且 API4/API5 皆 100% 無 failed，才寫回快取。
-    # Action=1 雖是純 Live 讀取模式，仍必須把成功結果寫入獨立快取，供下一次 Action=0 使用。
-    should_write_live_snapshot = bool(
-        live_fetched
-        and (
-            not REPORT_LIVE_ONLY
-            or (ACTION_REFRESH_CONTROLS_REPORT_DATA and ACTION_FORCE_REFRESH)
-        )
-    )
-    if should_write_live_snapshot:
-        save_gsheet_warrant_events_snapshot(stock_code, stock_name, events, start_date=start_date, end_date=end_date)
-        save_local_warrant_events_snapshot(stock_code, events, start_date=start_date, end_date=end_date)
-
-    return events
-
-
-# ============================================================
 # 週報統計
 # ============================================================
 
@@ -5240,8 +2653,6 @@ def filter_out_market_maker_hedges(
     if do_filter:
         return e.loc[~mask].copy(), n_rows
     return e, n_rows
-
-
 
 
 def filter_out_cross_broker_offset_trades(
@@ -5451,82 +2862,583 @@ def is_top5_head_office_branch(branch_name: str) -> bool:
     return s in _get_top5_head_office_branch_set()
 
 
-def build_watch_points(ctx, stock_name: str, news_titles: List[str]):
-    points = []
-    df = ctx["plot_df"]
-    latest = df.iloc[-1]
-    close = float(latest["Close"])
-    ma5 = float(latest["MA5"])
-    ma20 = float(latest["MA20"])
-    ma60 = float(latest["MA60"])
-    k9 = float(latest.get("K9", np.nan))
-    d9 = float(latest.get("D9", np.nan))
-    vol = float(latest.get("Volume", np.nan))
-    mv20 = float(latest.get("MV20", np.nan))
+# 權證名稱中的發行券商簡稱，統一映射成券商根名稱。
+# 這份表只用來辨識「該檔權證的發行券商」，不會用來過濾其他券商。
+_FINMIND_WARRANT_ISSUER_ALIASES = {
+    "中國信託": ["中國信託", "中信"],
+    "華南永昌": ["華南永昌", "華南"],
+    "永豐金": ["永豐金", "永豐"],
+    "群益": ["群益金鼎", "群益"],
+    "第一金": ["第一金"],
+    "摩根士丹利": ["摩根士丹利", "大摩"],
+    "摩根大通": ["摩根大通", "小摩"],
+    "法銀巴黎": ["法銀巴黎", "法巴", "巴黎"],
+    "花旗": ["花旗環球", "花旗"],
+    "匯豐": ["香港上海滙豐", "香港上海匯豐", "滙豐", "匯豐"],
+    "麥格理": ["港商麥格理", "麥格理"],
+    "野村": ["香港商野村", "野村"],
+    "里昂": ["港商里昂", "里昂"],
+    "瑞銀": ["新加坡商瑞銀", "瑞銀"],
+    "高盛": ["美商高盛", "高盛"],
+    "美林": ["美商美林", "美林"],
+    "德意志": ["德意志"],
+    "元大": ["元大"],
+    "凱基": ["凱基"],
+    "國泰": ["國泰"],
+    "統一": ["統一"],
+    "元富": ["元富"],
+    "兆豐": ["兆豐"],
+    "富邦": ["富邦"],
+    "國票": ["國票綜合", "國票"],
+    "玉山": ["玉山"],
+    "台新": ["台新"],
+    "康和": ["康和"],
+    "新光": ["新光"],
+    "合庫": ["合作金庫", "合庫"],
+    "台中銀": ["台中銀"],
+    "大華銀": ["大華銀"],
+    "星展": ["星展"],
+}
 
-    if close >= ma5 >= ma20:
-        points.append(f"技術面：收盤 {close:.0f} 站穩 5MA {ma5:.1f} 與 20MA {ma20:.1f}，下週先看短均線是否續揚。")
-    elif close >= ma20:
-        points.append(f"技術面：收盤仍守 20MA {ma20:.1f}，但需觀察能否重新站回 5MA {ma5:.1f}。")
-    else:
-        points.append(f"技術面：收盤已落在 20MA {ma20:.1f} 下方，下週需留意月線是否轉為壓力。")
 
-    if close > ma60:
-        points.append(f"中期趨勢：目前仍在 60MA {ma60:.1f} 之上，中期架構尚未轉弱。")
-    else:
-        points.append(f"中期趨勢：股價已逼近或跌破 60MA {ma60:.1f}，中期防守力道需再確認。")
+@lru_cache(maxsize=8192)
+def _finmind_compact_issuer_text(value: str) -> str:
+    """壓縮發行商文字；高頻名稱透過 LRU 避免重複正規化與正則處理。"""
+    s = html.unescape(str(value or "")).strip().replace("臺", "台")
+    s = re.sub(r"(股份有限公司|有限公司|證券股份|證券公司|證券|分公司|營業處|營業部)", "", s)
+    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
+    return s.strip()
 
-    if not pd.isna(vol) and not pd.isna(mv20) and mv20 > 0:
-        vr = vol / mv20
-        points.append(f"量能面：最新日量能約為月均量 {vr:.1f} 倍，若再放量，短線趨勢延續性會更好。")
 
-    if not pd.isna(k9) and not pd.isna(d9):
-        if k9 >= 80 and d9 >= 80:
-            points.append(f"動能面：KD 位於高檔（K {k9:.1f} / D {d9:.1f}），若續強屬高檔鈍化；跌破 5MA 則要防拉回。")
-        elif k9 > d9:
-            points.append(f"動能面：K 值高於 D 值，短線動能仍偏多，但需搭配量能不失溫。")
+# Alias 在模組載入時只正規化一次；canonical 查詢不再每次重建 alias_key。
+_FINMIND_WARRANT_ISSUER_ALIAS_KEYS = tuple(sorted(
+    (
+        (_finmind_compact_issuer_text(alias), canonical)
+        for canonical, aliases in _FINMIND_WARRANT_ISSUER_ALIASES.items()
+        for alias in aliases
+        if _finmind_compact_issuer_text(alias)
+    ),
+    key=lambda item: (-len(item[0]), item[1], item[0]),
+))
+
+_FINMIND_ISSUER_HQ_BROKER_CODE_SET = frozenset(
+    token.strip().upper()
+    for token in re.split(r"[,，;；\s]+", os.getenv("FINMIND_ISSUER_HQ_BROKER_CODES", ""))
+    if token.strip()
+)
+
+
+@lru_cache(maxsize=8192)
+def _finmind_canonical_issuer_key(value: str) -> str:
+    """將權證名稱或券商名稱轉成同一發行券商鍵；使用預編譯 alias 與 LRU。"""
+    s = _finmind_compact_issuer_text(value)
+    if not s:
+        return ""
+    for alias_key, canonical in _FINMIND_WARRANT_ISSUER_ALIAS_KEYS:
+        if alias_key in s:
+            return canonical
+    return ""
+
+def _finmind_extract_warrant_issuer_key(warrant_name: str, underlying_name: str = "") -> str:
+    """由權證名稱辨識發行券商，例如「松川國票5B購01」→「國票」。"""
+    name = _finmind_compact_issuer_text(warrant_name)
+    if not name:
+        return ""
+
+    # 先嘗試移除標的名稱及常見的前 2～4 字標的簡稱，降低標的名稱誤含券商字樣的機率。
+    underlying = _finmind_compact_issuer_text(underlying_name)
+    search_texts = []
+    if underlying and name.startswith(underlying):
+        search_texts.append(name[len(underlying):])
+    if underlying:
+        for n in range(min(4, len(underlying)), 1, -1):
+            prefix = underlying[:n]
+            if name.startswith(prefix):
+                search_texts.append(name[n:])
+    search_texts.append(name)
+
+    for candidate_text in search_texts:
+        key = _finmind_canonical_issuer_key(candidate_text)
+        if key:
+            return key
+    return ""
+
+
+def _finmind_is_issuer_hq_or_market_maker_branch(
+    branch: str,
+    broker_code: str,
+    issuer_key: str,
+) -> bool:
+    """只判斷同一發行券商中的明確總公司／自營／造市端。
+
+    不再用 ``broker_code.endswith("0")`` 猜總公司，避免代碼尾碼巧合造成地方分點誤刪。
+    特殊代碼可透過 ``FINMIND_ISSUER_HQ_BROKER_CODES`` 明確列入白名單式判定。
+    """
+    if not issuer_key:
+        return False
+
+    branch_raw = str(branch or "").strip()
+    branch_key = _finmind_canonical_issuer_key(branch_raw)
+    if not branch_key or branch_key != issuer_key:
+        return False
+
+    compact = _finmind_compact_issuer_text(branch_raw)
+    code = str(broker_code or "").strip().upper()
+
+    explicit_market_maker_terms = (
+        "總公司", "總部", "本部", "自營", "承銷", "權證", "衍生", "金融商品",
+        "金融交易", "綜合", "證券總公司",
+    )
+    if any(term in branch_raw for term in explicit_market_maker_terms):
+        return True
+
+    # 分點名稱正好就是券商根名稱，視為總公司列。
+    issuer_compact = _finmind_compact_issuer_text(issuer_key)
+    if compact == issuer_compact:
+        return True
+
+    # 僅接受明確設定的例外代碼，不再以尾碼推測；集合於模組載入時建立一次。
+    return bool(code and code in _FINMIND_ISSUER_HQ_BROKER_CODE_SET)
+
+
+def _official_row_value(row: dict, candidates: List[str]) -> str:
+    """以大小寫與符號寬鬆方式取得官方欄位值。"""
+    if not isinstance(row, dict):
+        return ""
+    for key in candidates:
+        if key in row and str(row.get(key, "") or "").strip():
+            return str(row.get(key, "") or "").strip()
+    normalized = {
+        re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(k or "").lower()): k
+        for k in row.keys()
+    }
+    for key in candidates:
+        nk = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(key or "").lower())
+        actual = normalized.get(nk)
+        if actual is not None and str(row.get(actual, "") or "").strip():
+            return str(row.get(actual, "") or "").strip()
+    return ""
+
+
+def _fetch_official_warrant_issuer_source(url: str, source_label: str) -> tuple[dict, pd.DataFrame]:
+    """讀取官方權證資料，建立「權證代號 → 發行商」對照；欄位未知時保留完整 Debug。"""
+    try:
+        response = get_thread_session().get(
+            url,
+            headers=OPENAPI_WARRANT_HEADERS,
+            timeout=(8, 45),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            rows = payload.get("data", payload.get("records", payload.get("result", [])))
         else:
-            points.append(f"動能面：K 值低於 D 值，下週需觀察是否重新黃金交叉。")
+            rows = payload
+        if not isinstance(rows, list):
+            raise RuntimeError(f"官方回應不是 list：type={type(rows).__name__}")
+        raw = pd.DataFrame(rows).fillna("")
+        if raw.empty:
+            print(f"ℹ️ {source_label} 無資料")
+            return {}, raw
 
-    net = float(ctx.get("total_net", 0))
-    if net > 0:
-        points.append(f"權證籌碼：本週淨買超 {fmt_money(net)}，若下週紅柱續增、累計線續上彎，代表追價資金延續。")
-    elif net < 0:
-        points.append(f"權證籌碼：本週淨賣超 {fmt_money(net)}，若下週綠柱持續，需留意權證資金退潮。")
+        code_fields = [
+            "權證代號", "證券代號", "代號", "warrant_code", "WarrantCode",
+            "SecuritiesCode", "SecurityCode", "stock_id", "StockId",
+        ]
+        name_fields = [
+            "權證名稱", "證券名稱", "名稱", "warrant_name", "WarrantName",
+            "SecuritiesName", "SecurityName", "stock_name", "StockName",
+        ]
+        issuer_code_fields = [
+            "發行人代號", "發行券商代號", "issuer_code", "IssuerCode",
+            "SecuritiesCompanyCode", "SecuritiesFirmCode", "BrokerCode",
+        ]
+        issuer_name_fields = [
+            "發行人名稱", "發行券商", "發行券商名稱", "issuer_name", "IssuerName",
+            "SecuritiesCompany", "SecuritiesCompanyName", "SecuritiesFirmName", "BrokerName",
+        ]
+        liquidity_fields = [
+            "流動量提供者", "流動量提供者證券商", "造市商", "造市券商",
+            "liquidity_provider", "LiquidityProvider", "LiquidityProviderName", "MarketMaker",
+        ]
+
+        result = {}
+        explicit_count = 0
+        name_fallback_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = normalize_openapi_warrant_code(_official_row_value(row, code_fields))
+            if not code:
+                continue
+            official_name = _official_row_value(row, name_fields)
+            issuer_code = _official_row_value(row, issuer_code_fields)
+            issuer_name = _official_row_value(row, issuer_name_fields)
+            liquidity_provider = _official_row_value(row, liquidity_fields)
+
+            issuer_key = (
+                _finmind_canonical_issuer_key(liquidity_provider)
+                or _finmind_canonical_issuer_key(issuer_name)
+            )
+            match_method = "official_field" if issuer_key else ""
+            if issuer_key:
+                explicit_count += 1
+            elif official_name:
+                issuer_key = _finmind_extract_warrant_issuer_key(official_name, "")
+                if issuer_key:
+                    name_fallback_count += 1
+                    match_method = "official_name"
+
+            if not issuer_key and not official_name and not issuer_name and not liquidity_provider:
+                continue
+
+            rec = {
+                "issuer_key": issuer_key,
+                "issuer_code": issuer_code,
+                "issuer_name": issuer_name,
+                "liquidity_provider": liquidity_provider,
+                "official_warrant_name": official_name,
+                "source": source_label,
+                "match_method": match_method or "unresolved",
+            }
+            old = result.get(code)
+            # 有官方發行人／流動量提供者欄位者優先於只靠權證名稱解析者。
+            if old is None or (old.get("match_method") != "official_field" and match_method == "official_field"):
+                result[code] = rec
+
+        print(
+            f"✅ {source_label} 發行商對照：權證={len(result):,}｜"
+            f"官方欄位={explicit_count:,}｜官方名稱解析={name_fallback_count:,}"
+        )
+        if FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE and not result:
+            _finmind_debug_print_df(
+                f"{source_label} 無法辨識發行商，實際欄位",
+                raw,
+                once_key=f"official-issuer-schema:{source_label}",
+            )
+        return result, raw
+    except Exception as exc:
+        print(f"⚠️ {source_label} 發行商資料讀取失敗，改用其他官方來源／權證名稱：{exc}")
+        return {}, pd.DataFrame()
+
+
+
+def _finmind_official_warrant_issuer_map_impl(force_refresh: bool = False) -> dict:
+    """真正執行官方發行商快取讀取／下載；同一輪只允許一個背景工作呼叫。"""
+    global _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE
+    if not FINMIND_OFFICIAL_ISSUER_ENABLE:
+        return {}
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        if _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE is not None and not force_refresh:
+            return dict(_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE)
+
+    if not force_refresh:
+        disk_mapping = _finmind_read_reference_json("official_warrant_issuer", max_age_days=1)
+        if isinstance(disk_mapping, dict):
+            with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+                _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = dict(disk_mapping)
+            return dict(disk_mapping)
+
+    sources = [
+        (TWSE_WARRANT_ISSUER_OPENAPI_URL, "TWSE 官方權證資料"),
+        (TPEX_WARRANT_ISSUER_OPENAPI_URL, "TPEx 官方權證發行資料"),
+    ]
+    combined = {}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_map = {
+            executor.submit(_fetch_official_warrant_issuer_source, url, label): label
+            for url, label in sources
+        }
+        for future in as_completed(future_map):
+            try:
+                mapping, _ = future.result()
+            except Exception as exc:
+                print(f"⚠️ {future_map[future]} 發行商對照工作失敗：{exc}")
+                mapping = {}
+            for code, rec in mapping.items():
+                old = combined.get(code)
+                if old is None or (old.get("match_method") != "official_field" and rec.get("match_method") == "official_field"):
+                    combined[code] = rec
+
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = dict(combined)
+    _finmind_write_reference_json("official_warrant_issuer", combined)
+    print(f"📦 官方權證發行商合併對照：{len(combined):,} 支")
+    return combined
+
+
+def _finmind_start_official_warrant_issuer_prefetch():
+    """在股價、新聞與權證流程開始時背景預載官方發行商；同一輪絕不重抓。"""
+    global _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE, _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR
+    if not FINMIND_OFFICIAL_ISSUER_ENABLE:
+        return None
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        if _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE is not None:
+            return None
+        if _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE is not None:
+            return _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE
+        _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+        _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE = _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR.submit(
+            _finmind_official_warrant_issuer_map_impl,
+            False,
+        )
+        print("🚀 官方發行商對照已在背景預載，與新聞／歷史／最新日 API 同時進行")
+        return _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE
+
+
+def _finmind_official_warrant_issuer_map(force_refresh: bool = False) -> dict:
+    """官方來源優先建立權證發行商對照；同一執行只等待既有背景工作，不重抓。"""
+    global _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE, _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR
+    if force_refresh:
+        return _finmind_official_warrant_issuer_map_impl(True)
+    with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+        if _FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE is not None:
+            return dict(_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE)
+        future = _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE
+    if future is None:
+        return _finmind_official_warrant_issuer_map_impl(False)
+    try:
+        return dict(future.result() or {})
+    finally:
+        with _FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK:
+            executor = _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR
+            _FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE = None
+            _FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR = None
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+
+
+def filter_warrant_flow_excluding_issuer_market_makers(events_df: pd.DataFrame) -> pd.DataFrame:
+    """建立上方權證資金流與 TOP5 的可解讀口徑。
+
+    計算口徑與舊版完全相同，但所有高成本文字解析都只針對唯一權證、唯一分點與
+    唯一 ``(branch, broker_code, issuer_key)`` 組合執行一次，再向量化映射回全表。
+    """
+    if events_df is None or events_df.empty:
+        return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
+    if not FINMIND_ISSUER_FLOW_ENABLE:
+        print("ℹ️ FinMind 發行券商造市端排除已關閉；權證資金流將使用完整雙邊資料")
+        return events_df.copy()
+
+    required = {"warrant_code", "warrant_name", "branch", "broker_code", "buy_amount", "sell_amount", "net_amount"}
+    missing = required - set(events_df.columns)
+    if missing:
+        print(f"⚠️ 無法建立發行券商權證資金流，缺少欄位：{sorted(missing)}")
+        return events_df.copy()
+
+    stage_started = time.perf_counter()
+    already_normalized = bool(events_df.attrs.get("_warrant_events_normalized"))
+    e = events_df.copy().reset_index(drop=True)
+
+    # 數值欄已是數值 dtype 時不重做 to_numeric；compact / API 正規化事件不再重跑字串 normalize。
+    for col in ["buy_amount", "sell_amount", "net_amount"]:
+        if not pd.api.types.is_numeric_dtype(e[col]):
+            e[col] = pd.to_numeric(e[col], errors="coerce").fillna(0.0)
+        if e[col].dtype != float:
+            e[col] = e[col].astype(float, copy=False)
+
+    if not already_normalized:
+        e["branch"] = e["branch"].astype(str).map(normalize_branch_name)
+        e["broker_code"] = e["broker_code"].astype(str).str.strip()
+        e["warrant_code"] = e["warrant_code"].map(normalize_openapi_warrant_code)
+    e["warrant_name"] = e["warrant_name"].fillna("").astype(str).str.strip()
+    if "underlying_name" not in e.columns:
+        e["underlying_name"] = ""
     else:
-        points.append("權證籌碼：本週淨流向接近中性，下週需觀察是否出現連續性紅柱或綠柱。")
+        e["underlying_name"] = e["underlying_name"].fillna("").astype(str)
 
-    e = ctx.get("week_events")
-    if e is not None and not e.empty:
-        by_branch = e.groupby("branch")["net_amount"].sum().sort_values(ascending=False)
-        if not by_branch.empty:
-            top_branch = str(by_branch.index[0])
-            top_amt = float(by_branch.iloc[0])
-            points.append(f"分點觀察：目前由「{top_branch}」領軍 {fmt_money(top_amt)}，下週可觀察是否續買或轉為調節。")
+    official_map = _finmind_official_warrant_issuer_map()
 
-    news_points = build_news_points(ctx.get("stock_code", ""), stock_name, news_titles, ctx)
-    if news_points:
-        points.append(news_points[0])
+    # 發行商只按不同權證辨識一次。
+    unique_warrants = (
+        e[["warrant_code", "warrant_name", "underlying_name"]]
+        .drop_duplicates(subset=["warrant_code"], keep="last")
+        .reset_index(drop=True)
+    )
+    issuer_lookup = {}
+    for row in unique_warrants.itertuples(index=False):
+        code = str(row.warrant_code or "")
+        rec = official_map.get(code, {})
+        key = str(rec.get("issuer_key", "") or "").strip()
+        method = str(rec.get("match_method", "") or "").strip()
+        source = str(rec.get("source", "") or "").strip()
+        if key and method == "official_field":
+            issuer_source = f"{source}:official_field"
+        elif key:
+            issuer_source = f"{source}:official_name"
+        else:
+            key = _finmind_extract_warrant_issuer_key(row.warrant_name, row.underlying_name)
+            issuer_source = "FinMind權證名稱解析" if key else "unresolved"
+        issuer_lookup[code] = {
+            "issuer_key": key,
+            "issuer_source": issuer_source,
+            "issuer_name": str(rec.get("issuer_name", "") or ""),
+            "liquidity_provider": str(rec.get("liquidity_provider", "") or ""),
+        }
 
-    return points[:5]
+    # 四個 lambda map 改成純 dict map，避免 10～20 萬次 Python callback。
+    issuer_key_map = {code: rec["issuer_key"] for code, rec in issuer_lookup.items()}
+    issuer_source_map = {code: rec["issuer_source"] for code, rec in issuer_lookup.items()}
+    issuer_name_map = {code: rec["issuer_name"] for code, rec in issuer_lookup.items()}
+    liquidity_provider_map = {code: rec["liquidity_provider"] for code, rec in issuer_lookup.items()}
+    e["_issuer_key"] = e["warrant_code"].map(issuer_key_map).fillna("")
+    e["_issuer_source"] = e["warrant_code"].map(issuer_source_map).fillna("unresolved")
+    e["_official_issuer_name"] = e["warrant_code"].map(issuer_name_map).fillna("")
+    e["_official_liquidity_provider"] = e["warrant_code"].map(liquidity_provider_map).fillna("")
+
+    source_s = e["_issuer_source"].astype(str)
+    official_field_mask = source_s.str.contains("official_field", na=False)
+    official_name_mask = source_s.str.contains("official_name", na=False)
+    finmind_name_mask = e["_issuer_source"].eq("FinMind權證名稱解析")
+    official_field_count = int(official_field_mask.sum())
+    official_name_count = int(official_name_mask.sum())
+    finmind_name_count = int(finmind_name_mask.sum())
+
+    # branch 只正規解析不同名稱一次，再 map 回全表。
+    unique_branch_values = pd.unique(e["branch"])
+    branch_issuer_map = {
+        branch: _finmind_canonical_issuer_key(branch)
+        for branch in unique_branch_values
+    }
+    e["_branch_issuer_key"] = e["branch"].map(branch_issuer_map).fillna("")
+    e["_issuer_same_broker"] = (
+        e["_issuer_key"].ne("")
+        & e["_branch_issuer_key"].eq(e["_issuer_key"])
+    )
+
+    # 只對唯一 (branch, broker_code, issuer_key) 組合做 Python 判斷。
+    combo_cols = ["branch", "broker_code", "_issuer_key"]
+    candidate_combos = (
+        e.loc[e["_issuer_same_broker"], combo_cols]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    if candidate_combos.empty:
+        e["_issuer_market_maker"] = False
+        unique_combo_count = 0
+    else:
+        combo_flags = np.fromiter(
+            (
+                _finmind_is_issuer_hq_or_market_maker_branch(branch, broker, issuer)
+                for branch, broker, issuer in candidate_combos.itertuples(index=False, name=None)
+            ),
+            dtype=bool,
+            count=len(candidate_combos),
+        )
+        combo_index = pd.MultiIndex.from_frame(candidate_combos[combo_cols])
+        combo_flag_map = pd.Series(combo_flags, index=combo_index)
+        row_index = pd.MultiIndex.from_frame(e[combo_cols])
+        e["_issuer_market_maker"] = combo_flag_map.reindex(row_index, fill_value=False).to_numpy(dtype=bool)
+        unique_combo_count = len(candidate_combos)
+
+    issuer_market_maker_mask = e["_issuer_same_broker"] & e["_issuer_market_maker"]
+    unresolved_mask = e["_issuer_key"].eq("")
+    removed_rows = int(issuer_market_maker_mask.sum())
+    unresolved_rows = int(unresolved_mask.sum())
+    final_remove_mask = issuer_market_maker_mask.copy()
+    if FINMIND_ISSUER_FLOW_EXCLUDE_UNRESOLVED_ENABLE:
+        final_remove_mask = final_remove_mask | unresolved_mask
+    kept = e.loc[~final_remove_mask].copy()
+
+    raw_buy = float(e["buy_amount"].sum())
+    raw_sell = float(e["sell_amount"].sum())
+    raw_net = float(e["net_amount"].sum())
+    kept_buy = float(kept["buy_amount"].sum())
+    kept_sell = float(kept["sell_amount"].sum())
+    kept_net = float(kept["net_amount"].sum())
+
+    parsed_warrants = int(e.loc[e["_issuer_key"].ne(""), "warrant_code"].nunique())
+    total_warrants = int(e["warrant_code"].nunique())
+    unresolved_warrants = int(e.loc[unresolved_mask, "warrant_code"].nunique()) if unresolved_rows else 0
+    print(
+        "💰 FinMind 權證資金流口徑：逐檔排除官方辨識的發行造市端｜"
+        f"權證辨識={parsed_warrants}/{total_warrants}｜造市端排除={removed_rows:,}筆｜"
+        f"未辨識排除={unresolved_warrants}支/{unresolved_rows:,}筆｜保留={len(kept):,}筆"
+    )
+    official_field_warrants = int(e.loc[official_field_mask, "warrant_code"].nunique())
+    official_name_warrants = int(e.loc[official_name_mask, "warrant_code"].nunique())
+    finmind_name_warrants = int(e.loc[finmind_name_mask, "warrant_code"].nunique())
+    print(
+        "🔎 發行商辨識來源："
+        f"官方欄位={official_field_warrants}支/{official_field_count:,}列｜"
+        f"官方名稱={official_name_warrants}支/{official_name_count:,}列｜"
+        f"FinMind名稱備援={finmind_name_warrants}支/{finmind_name_count:,}列"
+    )
+    print(
+        f"💰 權證資金流檢查：原始買進={fmt_money(raw_buy)}｜原始賣出={fmt_money(-raw_sell)}｜原始淨額={fmt_money(raw_net)}｜"
+        f"排除後買進={fmt_money(kept_buy)}｜排除後賣出={fmt_money(-kept_sell)}｜排除後淨額={fmt_money(kept_net)}"
+    )
+
+    if unresolved_rows:
+        unknown_summary = (
+            e.loc[unresolved_mask, [
+                "warrant_code", "warrant_name", "underlying_name", "_issuer_source",
+                "_official_issuer_name", "_official_liquidity_provider",
+            ]]
+            .drop_duplicates()
+            .head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS)
+        )
+        action_text = "已排除正式資金流" if FINMIND_ISSUER_FLOW_EXCLUDE_UNRESOLVED_ENABLE else "目前仍保留"
+        print(f"⚠️ 發行商仍無法辨識的權證：{unresolved_warrants:,} 支｜{action_text}")
+        print(unknown_summary.to_string(index=False))
+
+    if FINMIND_ISSUER_FLOW_DEBUG_ENABLE and removed_rows:
+        removed = e.loc[issuer_market_maker_mask]
+        removed_summary = (
+            removed.groupby(
+                ["warrant_code", "warrant_name", "_issuer_key", "_issuer_source", "broker_code", "branch"],
+                as_index=False,
+                dropna=False,
+            )
+            .agg(
+                rows=("net_amount", "size"),
+                buy_amount=("buy_amount", "sum"),
+                sell_amount=("sell_amount", "sum"),
+                net_amount=("net_amount", "sum"),
+            )
+        )
+        removed_summary["abs_net"] = removed_summary["net_amount"].abs()
+        removed_summary = removed_summary.sort_values(
+            ["abs_net", "rows"], ascending=[False, False]
+        ).drop(columns=["abs_net"])
+        print("🧪 逐檔排除的發行券商造市列（前幾筆）：")
+        print(removed_summary.head(FINMIND_ISSUER_FLOW_DEBUG_MAX_ROWS).to_string(index=False))
+
+    elapsed = time.perf_counter() - stage_started
+    print(
+        f"⚡ 發行商造市端排除效能：事件={len(e):,}列｜權證={len(unique_warrants):,}支｜"
+        f"分點名稱={len(unique_branch_values):,}個｜唯一判斷組合={unique_combo_count:,}組｜"
+        f"normalized_cache={'命中' if already_normalized else '未命中'}｜{elapsed:.2f}秒"
+    )
+
+    result = kept.drop(columns=[
+        "_issuer_key", "_issuer_source", "_official_issuer_name", "_official_liquidity_provider",
+        "_branch_issuer_key", "_issuer_same_broker", "_issuer_market_maker",
+    ], errors="ignore").reset_index(drop=True)
+    result.attrs["_warrant_events_normalized"] = True
+    return result
 
 
 def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, week_days: int = WEEK_TRADING_DAYS):
     plot_df = stock_df.tail(CHART_LOOKBACK).copy()
     trading_dates = [pd.Timestamp(d).normalize() for d in list(plot_df.index)]
+    warrant_data_end = pd.NaT
+    if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
+        warrant_dates_for_label = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna()
+        if not warrant_dates_for_label.empty:
+            warrant_data_end = pd.Timestamp(warrant_dates_for_label.max()).normalize()
 
     # 週報的權證統計區間改用「股價日期 + 權證事件日期」合併日期軸。
-    # 原本只用股價 K 線最新日當週報結束日，若 yfinance 晚一天更新，
-    # TOP5 買賣超與本週權證淨流向就會漏掉 MoneyDJ / Google Sheet 已經更新的今日分點資料。
+    # 原本只用股價 K 線最新日當週報結束日，若股價資料晚一天更新，
+    # TOP5 買賣超與本週權證淨流向就會漏掉 FinMind 已更新的今日分點資料。
     if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns and trading_dates:
         report_dates = build_flow_axis_dates(plot_df, warrant_events)
     else:
         report_dates = trading_dates
 
     report_dates = [pd.Timestamp(d).normalize() for d in report_dates]
-    week_dates = report_dates[-week_days:] if len(report_dates) >= week_days else report_dates
-    week_start = pd.Timestamp(week_dates[0]).normalize() if week_dates else pd.NaT
-    week_end = pd.Timestamp(week_dates[-1]).normalize() if week_dates else pd.NaT
+    week_start, week_end, week_dates = _resolve_report_week_range(report_dates, fallback_count=week_days)
 
     if pd.notna(week_start) and pd.notna(week_end):
         stock_week_dates = [d for d in trading_dates if pd.Timestamp(d).normalize() >= week_start and pd.Timestamp(d).normalize() <= week_end]
@@ -5543,8 +3455,16 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             prev_end_pos = prev_end_pos.start or 0
         elif isinstance(prev_end_pos, np.ndarray):
             prev_end_pos = int(np.where(prev_end_pos)[0][0]) if prev_end_pos.any() else 0
-        prev_start_pos = max(0, int(prev_end_pos) - week_days)
-        prev_stock = plot_df.iloc[prev_start_pos:int(prev_end_pos)].copy()
+        if WARRANT_WEEK_RANGE_MODE in {"calendar7", "calendar", "7d", "seven_days"}:
+            prev_week_end = week_start - pd.Timedelta(days=1)
+            prev_week_start = prev_week_end - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+            prev_stock = plot_df[
+                (pd.to_datetime(plot_df.index).normalize() >= prev_week_start)
+                & (pd.to_datetime(plot_df.index).normalize() <= prev_week_end)
+            ].copy()
+        else:
+            prev_start_pos = max(0, int(prev_end_pos) - week_days)
+            prev_stock = plot_df.iloc[prev_start_pos:int(prev_end_pos)].copy()
     else:
         prev_stock = plot_df.iloc[max(0, len(plot_df) - week_days * 2): max(0, len(plot_df) - week_days)].copy()
 
@@ -5559,6 +3479,8 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
     if warrant_events is None or warrant_events.empty:
         week_events = pd.DataFrame(columns=["Date", "branch", "warrant_code", "warrant_name", "buy_amount", "sell_amount", "net_amount"])
         plot_events = week_events.copy()
+        raw_week_events = week_events.copy()
+        raw_plot_events = week_events.copy()
     else:
         e = warrant_events.copy()
         if "branch" in e.columns:
@@ -5582,29 +3504,60 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
             )
             hedge_removed = 0
 
+        # 兩種口徑分開保存：
+        # 1. flow_e：上方權證資金流與 TOP5，使用歷史 Parquet＋最新日完整 API，並逐檔排除發行造市端。
+        # 2. e：原始完整分點事件，供下方精選分點使用，不套用發行造市端排除。
+        with report_stage_timer("發行商造市端排除"):
+            flow_e = filter_warrant_flow_excluding_issuer_market_makers(e)
+        flow_dates_for_label = pd.to_datetime(
+            flow_e.get("Date", pd.Series(dtype="datetime64[ns]")),
+            errors="coerce",
+        ).dropna()
+        warrant_data_end = (
+            pd.Timestamp(flow_dates_for_label.max()).normalize()
+            if not flow_dates_for_label.empty
+            else pd.NaT
+        )
+
         if pd.notna(week_start) and pd.notna(week_end):
-            week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
+            week_events = flow_e[(flow_e["Date"] >= week_start) & (flow_e["Date"] <= week_end)].copy()
+            raw_week_events = e[(e["Date"] >= week_start) & (e["Date"] <= week_end)].copy()
         else:
-            week_events = e.iloc[0:0].copy()
+            week_events = flow_e.iloc[0:0].copy()
+            raw_week_events = e.iloc[0:0].copy()
 
         if trading_dates:
             plot_start = pd.Timestamp(plot_df.index.min()).normalize()
             plot_end = pd.Timestamp(report_dates[-1]).normalize() if report_dates else pd.Timestamp(plot_df.index.max()).normalize()
-            plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
+            plot_events = flow_e[(flow_e["Date"] >= plot_start) & (flow_e["Date"] <= plot_end)].copy()
+            raw_plot_events = e[(e["Date"] >= plot_start) & (e["Date"] <= plot_end)].copy()
         else:
-            plot_events = e.copy()
+            plot_events = flow_e.copy()
+            raw_plot_events = e.copy()
 
     total_buy = float(week_events["buy_amount"].sum()) if not week_events.empty else 0.0
     total_sell = float(week_events["sell_amount"].sum()) if not week_events.empty else 0.0
     total_net = float(week_events["net_amount"].sum()) if not week_events.empty else 0.0
     bias = "偏買超" if total_net > 0 else "偏賣超" if total_net < 0 else "中性"
 
+    print(
+        f"📅 週報統計區間：{week_start.strftime('%Y/%m/%d') if pd.notna(week_start) else '-'} - "
+        f"{week_end.strftime('%Y/%m/%d') if pd.notna(week_end) else '-'}｜"
+        f"模式={WARRANT_WEEK_RANGE_MODE}｜實際股價日={len(stock_week_dates)}｜"
+        f"權證事件={len(week_events):,}｜"
+        f"權證資料截至={warrant_data_end.strftime('%Y/%m/%d') if pd.notna(warrant_data_end) else '-'}"
+    )
+
     return {
         "plot_df": plot_df,
+
         "plot_events": plot_events,
         "week_events": week_events,
+        "raw_plot_events": raw_plot_events,
+        "raw_week_events": raw_week_events,
         "week_start": week_start,
         "week_end": week_end,
+        "warrant_data_end": warrant_data_end,
         "report_dates": report_dates,
         "stock_week_dates": stock_week_dates,
         "stock_ret": stock_ret,
@@ -5619,16 +3572,11 @@ def build_weekly_context(stock_df: pd.DataFrame, warrant_events: pd.DataFrame, w
     }
 
 
-def daily_warrant_net(plot_df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    dates = pd.to_datetime(plot_df.index).normalize()
-    return daily_warrant_net_from_dates(dates, events)
-
-
 def daily_warrant_net_from_dates(dates, events: pd.DataFrame) -> pd.DataFrame:
     """依指定日期軸彙總每日權證淨額。
 
     原本 daily_warrant_net() 只會使用股價 K 線日期作為日期軸，因此若權證分點資料已經更新到
-    最新交易日，但 yfinance 股價還停在前一個交易日，最新一日的權證資金流就會被圖表日期軸排除。
+    最新交易日，但股價資料還停在前一個交易日，最新一日的權證資金流就會被圖表日期軸排除。
     這個函式保留原本欄位格式，但允許呼叫端傳入「股價日期 + 權證事件日期」合併後的日期軸。
     """
     dates = pd.to_datetime(pd.Index(list(dates)), errors="coerce").dropna().normalize()
@@ -5692,12 +3640,13 @@ def filter_events_by_date_range(events_df: pd.DataFrame, start_date, end_date) -
 
 
 def get_taipei_today_ts() -> pd.Timestamp:
-    """取得台北日期的今日 00:00。
+    """取得台北日期的今日 00:00，並統一回傳 tz-naive Timestamp。
 
     GitHub Actions runner 常用 UTC，若直接 datetime.today() 可能在台灣盤後仍停在前一天；
-    權證分點資料抓取區間應以台北日期為準。
+    權證分點資料抓取區間應以台北日期為準。回傳 tz-naive 可避免與股價索引比較時
+    出現 Cannot compare tz-naive and tz-aware timestamps。
     """
-    return pd.Timestamp(datetime.utcnow() + timedelta(hours=8)).normalize()
+    return pd.Timestamp.now(tz="Asia/Taipei").normalize().tz_localize(None)
 
 
 def _parse_selected_branch_flow_names(raw: str) -> List[str]:
@@ -5897,20 +3846,155 @@ def print_debug_branch_warrant_flow(
     print("========== 指定分點權證明細 Debug 結束 ==========")
 
 
-def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
-    """篩出精選分點資金流事件。
+def _parse_finmind_selected_branch_id_overrides() -> dict:
+    """解析 FINMIND_SELECTED_BRANCH_ID_OVERRIDES：分點名稱=代碼，多筆可逗號分隔。"""
+    out = {}
+    raw = str(FINMIND_SELECTED_BRANCH_ID_OVERRIDES_RAW or "").strip()
+    if not raw:
+        return out
+    for item in re.split(r"[,，;；\n\r]+", raw):
+        item = str(item or "").strip()
+        if not item:
+            continue
+        parts = re.split(r"[=:：]", item, maxsplit=1)
+        if len(parts) != 2:
+            print(f"⚠️ FINMIND_SELECTED_BRANCH_ID_OVERRIDES 格式錯誤，略過：{item}")
+            continue
+        name = normalize_branch_name(parts[0])
+        trader_id = str(parts[1] or "").strip()
+        if name and trader_id:
+            out.setdefault(name, set()).add(trader_id)
+    return out
 
-    條件：
-    1. 分點名稱屬於 SELECTED_BRANCH_FLOW_BRANCHES。
 
-    回傳後可直接丟給 daily_warrant_net()，產生每日淨額柱狀圖與累計折線圖。
+def _branch_location_tokens(value: str) -> list:
+    """從使用者分點名稱取出可能的地名尾碼，僅用於候選排序，不直接猜 ID。"""
+    key = _finmind_branch_lookup_key(value)
+    locations = [
+        "台北", "台中", "中壢", "桃園", "新竹", "高雄", "台南", "板橋", "中和", "內湖",
+        "南屯", "敦南", "公益", "忠孝", "南京", "三重", "新店", "士林", "基隆", "彰化",
+        "員林", "竹北", "竹科", "市政", "信義", "淡水", "頭份", "內壢", "東大", "古亭",
+        "民權", "汐止", "虎尾", "東港", "苑裡", "民生", "三多", "土城", "建成", "溪湖",
+        "豐中", "忠明", "復興", "城中", "松山", "永和", "嘉義", "屏東", "羅東", "花蓮",
+    ]
+    return [loc for loc in locations if loc in key]
+
+
+def _rank_finmind_branch_candidates(info: pd.DataFrame, requested: str) -> pd.DataFrame:
+    """列出名稱最接近的官方分點；只提供 Debug，不在多解時自行亂選。"""
+    if info is None or info.empty:
+        return pd.DataFrame()
+    key = _finmind_branch_lookup_key(requested)
+    root = _finmind_branch_root_key(requested)
+    location_tokens = _branch_location_tokens(requested)
+    work = info.copy()
+    work["_score"] = 0
+    lookup = work["branch_lookup_key"].astype(str)
+    roots = work["branch_root_key"].astype(str)
+    work.loc[lookup.eq(key), "_score"] += 100
+    if key:
+        work.loc[lookup.str.contains(key, regex=False), "_score"] += 50
+        work.loc[lookup.map(lambda x: bool(x) and x in key), "_score"] += 35
+    if root:
+        work.loc[roots.eq(root), "_score"] += 30
+        work.loc[lookup.str.contains(root, regex=False), "_score"] += 15
+    for token in location_tokens:
+        work.loc[lookup.str.contains(token, regex=False), "_score"] += 25
+        if "address" in work.columns:
+            work.loc[work["address"].astype(str).str.contains(token, regex=False), "_score"] += 8
+    work = work[work["_score"] > 0].copy()
+    return work.sort_values(["_score", "securities_trader_id"], ascending=[False, True])
+
+
+def _resolve_selected_branch_ids(selected_branches: set) -> dict:
+    """將使用者分點名稱解析為 FinMind securities_trader_id；結果以輸入分點為 key。
+
+    僅在官方名稱正規化後唯一命中時自動採用。模糊候選只印出，不會亂選，避免
+    把「第一金中壢」錯配成第一金總公司或其他分點。
     """
+    cache_key = tuple(sorted(normalize_branch_name(x) for x in selected_branches if normalize_branch_name(x)))
+    with _FINMIND_DATA_CACHE_LOCK:
+        cached = _FINMIND_SELECTED_BRANCH_ID_CACHE.get(cache_key)
+        if cached is not None:
+            return {k: set(v) for k, v in cached.items()}
+
+    resolved = {}
+    overrides = _parse_finmind_selected_branch_id_overrides()
+    try:
+        info = _finmind_load_securities_trader_info()
+    except Exception as exc:
+        print(f"⚠️ 無法載入 TaiwanSecuritiesTraderInfo，精選分點無法使用正式 ID：{exc}")
+        for requested in cache_key:
+            resolved[requested] = set(overrides.get(requested, set()))
+        return resolved
+
+    print(
+        f"🧩 FinMind 分點解析啟動｜build={FINMIND_BUILD_VERSION}｜"
+        f"官方分點代碼={len(info):,}｜輸入={'、'.join(cache_key) or '無'}"
+    )
+
+    for requested in cache_key:
+        if requested in overrides and overrides[requested]:
+            ids = set(overrides[requested])
+            resolved[requested] = ids
+            print(f"✅ 精選分點使用手動 ID：{requested} → {sorted(ids)}")
+            continue
+
+        key = _finmind_branch_lookup_key(requested)
+        exact = info[info["branch_lookup_key"].astype(str) == key].copy()
+        exact_ids = sorted(set(exact["securities_trader_id"].astype(str))) if not exact.empty else []
+
+        if len(exact_ids) == 1:
+            resolved[requested] = {exact_ids[0]}
+            label_rows = exact[[c for c in [
+                "securities_trader_id", "securities_trader", "date", "address", "phone",
+                "branch_lookup_key",
+            ] if c in exact.columns]]
+            print(f"✅ 精選分點 ID 對照成功：{requested} → {exact_ids[0]}")
+            print(label_rows.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            continue
+
+        if len(exact_ids) > 1:
+            resolved[requested] = set()
+            print(f"⚠️ 精選分點名稱對應多個 ID，為避免誤配暫不自動選擇：{requested} → {exact_ids}")
+            print(exact.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            continue
+
+        ranked = _rank_finmind_branch_candidates(info, requested)
+        resolved[requested] = set()
+        print(
+            f"⚠️ 精選分點 ID 對照失敗：{requested}｜lookup_key={key}｜"
+            f"候選={len(ranked):,}"
+        )
+        if ranked.empty:
+            _finmind_debug_print_df(
+                f"TaiwanSecuritiesTraderInfo 無候選｜輸入={requested}",
+                info,
+                max_rows=FINMIND_DEBUG_MAX_ROWS,
+            )
+        else:
+            show_cols = [c for c in [
+                "_score", "securities_trader_id", "securities_trader", "date", "address", "phone",
+                "branch_lookup_key", "branch_root_key",
+            ] if c in ranked.columns]
+            print("🧪 請將以下候選完整複製回來：")
+            print(ranked[show_cols].head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_SELECTED_BRANCH_ID_CACHE[cache_key] = {k: set(v) for k, v in resolved.items()}
+    return resolved
+
+
+def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """篩出精選分點資金流事件；優先使用 securities_trader_id，不再只靠券商簡稱。"""
     if not SELECTED_BRANCH_FLOW_ENABLE:
         return pd.DataFrame()
     if events_df is None or events_df.empty:
         return pd.DataFrame()
-    need_cols = {"Date", "branch", "net_amount", "buy_amount", "sell_amount"}
+    need_cols = {"Date", "branch", "broker_code", "net_amount", "buy_amount", "sell_amount"}
     if not need_cols.issubset(events_df.columns):
+        _finmind_debug_print_df("精選分點事件欄位不足", events_df)
+        print(f"⚠️ 精選分點事件缺少欄位：{sorted(need_cols - set(events_df.columns))}")
         return pd.DataFrame()
 
     selected_branches = _get_selected_branch_flow_set()
@@ -5921,11 +4005,45 @@ def filter_selected_branch_flow_events(events_df: pd.DataFrame) -> pd.DataFrame:
     e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
     e = e.dropna(subset=["Date"])
     e["branch"] = e["branch"].map(normalize_branch_name)
+    e["broker_code"] = e["broker_code"].astype(str).str.strip()
     for c in ["buy_amount", "sell_amount", "net_amount"]:
         e[c] = pd.to_numeric(e[c], errors="coerce").fillna(0.0).astype(float)
 
-    mask = e["branch"].isin(selected_branches)
-    return e.loc[mask].copy().reset_index(drop=True)
+    resolved_map = _resolve_selected_branch_ids(selected_branches)
+    selected_ids = set().union(*(ids for ids in resolved_map.values())) if resolved_map else set()
+
+    # 主要條件：正式分點 ID。名稱比對僅作為對照表失敗時的安全備援。
+    id_mask = e["broker_code"].isin(selected_ids) if selected_ids else pd.Series(False, index=e.index)
+    selected_names_normalized = {normalize_branch_name(x) for x in selected_branches}
+    selected_keys = {_finmind_branch_lookup_key(x) for x in selected_branches if _finmind_branch_lookup_key(x)}
+    exact_name_mask = e["branch"].isin(selected_names_normalized)
+    alias_name_mask = e["branch"].map(_finmind_branch_lookup_key).isin(selected_keys) if selected_keys else pd.Series(False, index=e.index)
+    mask = id_mask | exact_name_mask | alias_name_mask
+    matched = e.loc[mask].copy().reset_index(drop=True)
+
+    if matched.empty:
+        print(f"⚠️ 精選分點沒有權證交易：{'、'.join(sorted(selected_branches))}")
+        _debug_selected_branch_candidates(selected_branches, e)
+    else:
+        matched_names = "、".join(sorted(set(matched["branch"].astype(str))))
+        matched_ids = "、".join(sorted(set(matched["broker_code"].astype(str))))
+        print(
+            f"✅ 精選分點 FinMind ID 比對成功：{matched_names}｜"
+            f"ID={matched_ids}｜{len(matched):,} 筆"
+        )
+        if FINMIND_DEBUG_SELECTED_BRANCH_ENABLE:
+            summary = matched.groupby(["broker_code", "branch"], as_index=False).agg(
+                rows=("net_amount", "size"),
+                first_date=("Date", "min"),
+                last_date=("Date", "max"),
+                buy_amount=("buy_amount", "sum"),
+                sell_amount=("sell_amount", "sum"),
+                net_amount=("net_amount", "sum"),
+            )
+            print("🧪 精選分點命中彙總：")
+            print(summary.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+    return matched
 
 
 def top_branch_tables(week_events: pd.DataFrame, topn: int = 5):
@@ -6232,18 +4350,25 @@ def build_key_points(ctx, stock_name: str):
 # ============================================================
 
 NEWS_BODY_MAX_CHARS = int(os.getenv("WARRANT_NEWS_BODY_MAX_CHARS", "3500"))
-NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "10"))
+NEWS_FETCH_TIMEOUT = float(os.getenv("WARRANT_NEWS_FETCH_TIMEOUT", "6"))
 NEWS_SUMMARY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MAX_POINTS", "3"))
 NEWS_DISPLAY_MAX_POINTS = int(os.getenv("WARRANT_NEWS_DISPLAY_MAX_POINTS", "3"))
-NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "125"))
+NEWS_SUMMARY_POINT_MAX_LEN = int(os.getenv("WARRANT_NEWS_SUMMARY_POINT_MAX_LEN", "150"))
 NEWS_SUMMARY_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_TOTAL_CHARS", "120"))
-NEWS_SUMMARY_MIN_POINTS = int(os.getenv("WARRANT_NEWS_SUMMARY_MIN_POINTS", "1"))
 # 新聞 detail 驗收：必須同時包含具體事件與營運意涵／後續觀察。
-NEWS_SUMMARY_DETAIL_MIN_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS", "40"))
+NEWS_SUMMARY_DETAIL_MIN_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_DETAIL_MIN_CHARS", "50"))
 NEWS_SUMMARY_DETAIL_MAX_CHARS = int(os.getenv("WARRANT_NEWS_SUMMARY_DETAIL_MAX_CHARS", "70"))
-# 驗證後少於 2 點、但仍有至少 3 篇合格文章時，額外嘗試一次不同事件補點。
+# 驗證後少於 2 點、但仍有至少 3 篇合格文章時，在唯一一次補正呼叫內一併補不同事件。
 NEWS_SUPPLEMENT_TRIGGER_POINTS = int(os.getenv("WARRANT_NEWS_SUPPLEMENT_TRIGGER_POINTS", "2"))
 NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES", "3"))
+NEWS_GEMINI_REPAIR_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_REPAIR_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_GEMINI_SUPPLEMENT_ENABLE = os.getenv(
+    "WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 # 新聞摘要風格版本：調整 prompt 後使用新快取鍵，避免 Google Sheet 當日舊快取繼續輸出舊版空泛摘要。
 NEWS_SUMMARY_STYLE_VERSION = os.getenv("WARRANT_NEWS_SUMMARY_STYLE_VERSION", "v15_arabic_digits_news").strip() or "v15_arabic_digits_news"
 NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK = os.getenv("WARRANT_NEWS_ALLOW_OLD_STYLE_CACHE_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -6253,7 +4378,7 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v27_event_level_dedup"
+    internal_version = "validated_v32_rich_local_grounding_two_call"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -6261,8 +4386,6 @@ NEWS_MIN_BODY_CHARS = int(os.getenv("WARRANT_NEWS_MIN_BODY_CHARS", "260"))
 # 預設：優先用新聞原文；若原文被擋，允許用 RSS 摘要文字「改寫成重點」，但不直接輸出標題。
 NEWS_REQUIRE_ARTICLE_BODY = os.getenv("WARRANT_NEWS_REQUIRE_BODY", "0").strip().lower() not in ("0", "false", "no", "off")
 NEWS_RSS_DESCRIPTION_FALLBACK = os.getenv("WARRANT_NEWS_RSS_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_OPENAI_ENABLE = os.getenv("WARRANT_NEWS_OPENAI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
-NEWS_OPENAI_MODEL = os.getenv("WARRANT_NEWS_OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
 # Gemini / LLM 設定：GitHub Actions 請設定 Repository Secret / Variable：WARRANTS_API_KEY
 GEMINI_ENABLE = os.getenv("WARRANT_GEMINI_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
@@ -6275,9 +4398,13 @@ GEMINI_STRUCTURED_OUTPUT_ENABLE = os.getenv(
     "WARRANT_GEMINI_STRUCTURED_OUTPUT_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")
-NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "12"))
+NEWS_MAX_ARTICLES_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLES_TO_GEMINI", "8"))
 NEWS_MAX_ARTICLE_CHARS_TO_GEMINI = int(os.getenv("WARRANT_NEWS_MAX_ARTICLE_CHARS_TO_GEMINI", "3500"))
 WEEKLY_KEYPOINT_LLM_ENABLE = os.getenv("WARRANT_WEEKLY_KEYPOINT_LLM_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+WEEKLY_GEMINI_REPAIR_ENABLE = os.getenv(
+    "WARRANT_WEEKLY_GEMINI_REPAIR_ENABLE",
+    "0",
+).strip().lower() not in ("0", "false", "no", "off")
 WEEKLY_KEYPOINT_MAX_POINTS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MAX_POINTS", "3"))
 WEEKLY_KEYPOINT_POINT_MAX_LEN = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_POINT_MAX_LEN", "100"))
 WEEKLY_KEYPOINT_MIN_TOTAL_CHARS = int(os.getenv("WARRANT_WEEKLY_KEYPOINT_MIN_TOTAL_CHARS", "120"))
@@ -6289,8 +4416,8 @@ WEEKLY_KEYPOINT_STYLE_VERSION = os.getenv(
 ).strip() or "validated_v24_json_grounded_previous_week"
 # 新聞抓取速度版：只抓 Google News 重要新聞，不再掃 PTT，避免 GitHub Actions 執行時間過長。
 # 預設提高搜尋母體，避免部分冷門股因前幾篇原文被擋或 RSS 摘要太短而沒有新聞輸出。
-NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "36"))
-NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "10"))
+NEWS_GOOGLE_MAX_ITEMS = int(os.getenv("WARRANT_NEWS_GOOGLE_MAX_ITEMS", "24"))
+NEWS_GOOGLE_SCAN_MULTIPLIER = int(os.getenv("WARRANT_NEWS_GOOGLE_SCAN_MULTIPLIER", "4"))
 NEWS_GOOGLE_MIN_USABLE_ARTICLES = int(os.getenv("WARRANT_NEWS_GOOGLE_MIN_USABLE_ARTICLES", str(max(2, min(4, NEWS_SUMMARY_MAX_POINTS)))))
 NEWS_GOOGLE_FALLBACK_DAYS = os.getenv("WARRANT_NEWS_FALLBACK_DAYS", "7,14,30").strip() or "7,14,30"
 # 極速新聞模式：預設開啟。只使用 Google News RSS 的標題 / 摘要 / URL，不進新聞網站抓原文。
@@ -6306,33 +4433,29 @@ NEWS_FAST_HYBRID_BODY_FETCH_ENABLE = os.getenv(
 ).strip().lower() in ("1", "true", "yes", "on")
 NEWS_FAST_HYBRID_BODY_FETCH_TOPK = max(
     0,
-    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK", "3")),
+    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_TOPK", "2")),
 )
-NEWS_FAST_HYBRID_BODY_FETCH_WORKERS = max(
-    1,
-    int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_WORKERS", "3")),
-)
-# 即使環境變數設得過大，混合補抓仍強制限制單篇最多 5 秒、整批最多 10 秒，
+# 即使環境變數設得過大，混合補抓仍強制限制單篇最多 4 秒、整批最多 6 秒，
 # 並限制下載大小，避免慢速串流或超大網頁拖住 GitHub Actions 數分鐘。
 NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT = min(
-    5.0,
+    4.0,
     max(
         1.0,
-        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT", "4")),
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT", "3")),
     ),
 )
 NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT = min(
-    10.0,
+    6.0,
     max(
         1.0,
-        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT", "8")),
+        float(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT", "5")),
     ),
 )
 NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES = max(
     32768,
     min(
         524288,
-        int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES", "196608")),
+        int(os.getenv("WARRANT_NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES", "131072")),
     ),
 )
 # 極速模式最多建立幾篇 RSS 新聞素材；預設等於真正會送進 Gemini 的篇數，避免掃太多新聞拖慢速度。
@@ -6360,18 +4483,58 @@ NEWS_MULTI_SOURCE_ENABLE = os.getenv("WARRANT_NEWS_MULTI_SOURCE_ENABLE", "1").st
 NEWS_YAHOO_RSS_ENABLE = os.getenv("WARRANT_NEWS_YAHOO_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_BING_RSS_ENABLE = os.getenv("WARRANT_NEWS_BING_RSS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 NEWS_MONEYDJ_SEARCH_ENABLE = os.getenv("WARRANT_NEWS_MONEYDJ_SEARCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "12"))
-NEWS_MONEYDJ_BODY_FETCH_LIMIT = int(os.getenv("WARRANT_NEWS_MONEYDJ_BODY_FETCH_LIMIT", "5"))
+NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE = int(os.getenv("WARRANT_NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE", "8"))
 NEWS_MULTI_SOURCE_RETURN_LIMIT = int(os.getenv(
     "WARRANT_NEWS_MULTI_SOURCE_RETURN_LIMIT",
-    str(max(NEWS_MAX_ARTICLES_TO_GEMINI * 2, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 24)),
+    str(max(NEWS_MAX_ARTICLES_TO_GEMINI, NEWS_GOOGLE_MIN_USABLE_ARTICLES, 12)),
 ))
+# 六個來源平行抓取；個別來源失敗或逾時只略過該來源。
+NEWS_SOURCE_FETCH_WORKERS = max(1, int(os.getenv("WARRANT_NEWS_SOURCE_FETCH_WORKERS", "6")))
+NEWS_SOURCE_BATCH_TIMEOUT = min(
+    15.0,
+    max(3.0, float(os.getenv("WARRANT_NEWS_SOURCE_BATCH_TIMEOUT", "9"))),
+)
+# 原始新聞候選短期快取與 Gemini 摘要快取分離。
+# refresh_news_summary=1 只重跑 Gemini；剛抓過的六來源候選仍可重用，避免重複等待網站。
+NEWS_RAW_CACHE_ENABLE = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_RAW_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.getenv("WARRANT_NEWS_RAW_CACHE_TTL_SECONDS", "1800")),
+)
+NEWS_RAW_CACHE_DIR = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_DIR",
+    os.path.join(LLM_CACHE_DIR, "raw_news"),
+).strip() or os.path.join(LLM_CACHE_DIR, "raw_news")
+NEWS_RAW_CACHE_FORCE_REFRESH = os.getenv(
+    "WARRANT_NEWS_RAW_CACHE_FORCE_REFRESH",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
 # 新聞最低素材／顯示目標：正常情況至少整理 2 則不同事件；
 # 只有所有來源與 7/14/30 日範圍都查完後仍只有一個事件，才允許只顯示 1 則。
 NEWS_MIN_DISTINCT_ARTICLES = max(1, int(os.getenv("WARRANT_NEWS_MIN_DISTINCT_ARTICLES", "2")))
 # 公開資訊觀測站重大訊息補強：使用證交所 OpenAPI 的上市／上櫃每日重大訊息。
 NEWS_MOPS_ENABLE = os.getenv("WARRANT_NEWS_MOPS_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "12")))
+
+# FinMind TaiwanStockNews 作為第六個新聞來源。
+# 僅標題資料只作低優先級事實素材；不可人工補上公司名稱，也不可覆蓋其他多來源新聞。
+FINMIND_NEWS_ENABLE = os.getenv(
+    "WARRANT_FINMIND_NEWS_ENABLE",
+    os.getenv("FINMIND_NEWS_ENABLE", "1"),
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_NEWS_WORKERS = max(1, int(os.getenv("FINMIND_NEWS_WORKERS", "8")))
+FINMIND_NEWS_LOOKBACK_DAYS = max(1, int(os.getenv("FINMIND_NEWS_LOOKBACK_DAYS", "30")))
+FINMIND_NEWS_LOOKBACK_STAGES = os.getenv(
+    "FINMIND_NEWS_LOOKBACK_STAGES",
+    "7,14,30",
+).strip() or "7,14,30"
+FINMIND_NEWS_REQUIRE_DIRECT_TARGET = os.getenv(
+    "WARRANT_FINMIND_NEWS_REQUIRE_DIRECT_TARGET",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+NEWS_MOPS_MAX_ITEMS = max(1, int(os.getenv("WARRANT_NEWS_MOPS_MAX_ITEMS", "8")))
 NEWS_MOPS_ENDPOINTS = [
     ("上市重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"),
     ("上櫃重大訊息", "https://openapi.twse.com.tw/v1/opendata/t187ap04_O"),
@@ -6498,6 +4661,10 @@ def _parse_chinese_numeral_to_int(token: str):
         return None
     if not all(ch in _CN_NUMERAL_DIGITS or ch in _CN_NUMERAL_UNITS for ch in t):
         return None
+    # 至少要含一個真正的中文數字字元。只有「億、萬、十」等單位字的普通詞彙
+    #（例如「億萬富翁」）不是數字，絕不可轉成 0。
+    if not any(ch in _CN_NUMERAL_DIGITS for ch in t):
+        return None
 
     # 二零二六、二〇二六 這種逐字年份寫法。
     if not any(ch in _CN_NUMERAL_UNITS for ch in t):
@@ -6539,56 +4706,64 @@ def _format_chinese_numeral_number(int_part: str, frac_part: str | None = None) 
     return str(value)
 
 
-def _normalize_chinese_numbers_for_news(text: str) -> str:
-    """新聞區塊數字統一用阿拉伯數字。
 
-    只轉換明確接數量單位的中文數字，避免把券商分點名稱或一般中文詞誤改。
-    例：十二點六億元 → 12.6億元、第三季 → 第3季、六月 → 6月。
+def _normalize_chinese_numbers_for_news(text: str) -> str:
+    """新聞區塊數字統一用阿拉伯數字，但只轉換真正含數字字元的量詞。
+
+    量詞改成「明確捕捉單位」而非 lookahead，避免把「十二億元」誤讀成
+    「十二億」再乘一次，也避免將「億萬富翁」中的單位字當成數字 0。
     """
     s = str(text or "")
     if not s:
         return ""
 
-    unit_pattern = r"(?:億元|萬元|元|億|萬|%|％|百分點|個百分點|倍|天|張|季|月|年|日|檔|筆|項|座|家|人|台|套)"
+    units = r"億元|萬元|百分點|個百分點|元|億|萬|%|％|倍|天|張|季|月|年|日|檔|筆|項|座|家|人|台|套"
 
-    # 百分之十二點六 → 12.6%
     def repl_percent(m):
         num = _format_chinese_numeral_number(m.group("int"), m.groupdict().get("frac"))
         return f"{num}%"
 
     s = re.sub(
-        rf"百分之(?P<int>[{_CN_NUMERAL_CHARS}]+)(?:點(?P<frac>[零〇○一二兩两三四五六七八九]+))?",
+        rf"百分之(?P<int>[{_CN_NUMERAL_CHARS}]+?)(?:點(?P<frac>[零〇○一二兩两三四五六七八九]+))?(?![{_CN_NUMERAL_CHARS}])",
         repl_percent,
         s,
     )
 
-    # 第三季、第二季 → 第3季、第2季。
     s = re.sub(
-        rf"第(?P<num>[{_CN_NUMERAL_CHARS}]+)(?P<unit>季|期|屆|次)",
-        lambda m: f"第{_format_chinese_numeral_number(m.group('num'))}{m.group('unit')}",
+        rf"第(?P<num>[{_CN_NUMERAL_CHARS}]+?)(?P<unit>季|期|屆|次)",
+        lambda m: (
+            f"第{_format_chinese_numeral_number(m.group('num'))}{m.group('unit')}"
+            if _parse_chinese_numeral_to_int(m.group("num")) is not None
+            else m.group(0)
+        ),
         s,
     )
 
-    # 十二點六億元 → 12.6億元。
+    def repl_decimal_quantity(m):
+        if _parse_chinese_numeral_to_int(m.group("int")) is None:
+            return m.group(0)
+        return f"{_format_chinese_numeral_number(m.group('int'), m.group('frac'))}{m.group('unit')}"
+
     s = re.sub(
-        rf"(?P<int>[{_CN_NUMERAL_CHARS}]+)點(?P<frac>[零〇○一二兩两三四五六七八九]+)(?=\s*{unit_pattern})",
-        lambda m: _format_chinese_numeral_number(m.group("int"), m.group("frac")),
+        rf"(?<![第0-9.])(?P<int>[{_CN_NUMERAL_CHARS}]+?)點"
+        rf"(?P<frac>[零〇○一二兩两三四五六七八九]+?)(?P<unit>{units})",
+        repl_decimal_quantity,
         s,
     )
 
-    # 十二億元、六月、一百二十家 → 12億元、6月、120家。
-    # 注意：前一段會先把「十二點零六億元」轉成「12.06億元」。
-    # 這裡不能再把「億元」中的「億」當成中文數字轉成 0，
-    # 否則會誤變成「12.060元」，造成億元單位消失。
+    def repl_integer_quantity(m):
+        value = _parse_chinese_numeral_to_int(m.group("num"))
+        if value is None:
+            return m.group(0)
+        return f"{value}{m.group('unit')}"
+
     s = re.sub(
-        rf"(?<![第0-9.])(?P<num>[{_CN_NUMERAL_CHARS}]+)(?=\s*{unit_pattern})",
-        lambda m: _format_chinese_numeral_number(m.group("num")),
+        rf"(?<![第0-9.])(?P<num>[{_CN_NUMERAL_CHARS}]+?)(?P<unit>{units})",
+        repl_integer_quantity,
         s,
     )
 
-    # 舊快取若已被前一版誤轉成「12.060元 / 12.60元」，
-    # 且前文明確是營收、訂單、接單、合約、工程金額等金額語境，
-    # 顯示前補回「億元」，避免圖卡繼續出現單位消失的文字。
+    # 僅修復已存在的舊快取錯字；新流程本身不再生成這種格式。
     def _repair_bad_billion_unit(m):
         start = m.start()
         ctx = s[max(0, start - 22): start]
@@ -6598,6 +4773,7 @@ def _normalize_chinese_numbers_for_news(text: str) -> str:
 
     s = re.sub(r"(?P<num>\d+\.\d{1,3})0元", _repair_bad_billion_unit, s)
     return s
+
 
 
 def _normalize_news_text(text: str) -> str:
@@ -6678,50 +4854,6 @@ def _can_use_news_title_as_fact(title: str) -> bool:
         s,
         re.I,
     ))
-
-
-def _looks_like_title_copy_or_meta_noise(point: str, records: list[dict] | None = None) -> bool:
-    """過濾直接複製新聞標題或混入日期／來源等中繼資訊的重點。"""
-    s = _normalize_news_text(point)
-    if not s:
-        return True
-    meta_patterns = [
-        r'(^|[｜：:；;。])\s*(標題|來源|日期)[:：]',
-        r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\b',
-        r'\bGMT\b',
-        r'^【\d{1,2}:\d{2}[^】]*】',
-        r'即時新聞',
-    ]
-    if any(re.search(p, s, re.I) for p in meta_patterns):
-        return True
-
-    # 此函式位於模組層級，不能呼叫 plot_weekly_report() 內部才定義的
-    # _parse_status_fields()。這裡只解析新聞重點會使用的欄位，避免 NameError。
-    field_names = ['結果', '說明', '重點', '依據', '觀察', '影響']
-    body_parts = []
-    for field_name in field_names:
-        pattern = (
-            rf'(?:^|｜){field_name}[:：]'
-            rf'(.*?)(?=｜(?:結果|說明|重點|依據|觀察|影響|分類|面向|方向|tone)[:：]|$)'
-        )
-        match = re.search(pattern, s, flags=re.DOTALL)
-        if match:
-            value = _normalize_news_text(match.group(1)).strip()
-            if value:
-                body_parts.append(value)
-
-    content = _strip_news_meta_noise('。'.join(body_parts) or s)
-    if not content:
-        return True
-    if records:
-        for rec in records or []:
-            title = _clean_news_title(rec.get('title', ''))
-            if not title:
-                continue
-            overlap = _char_overlap_ratio(content, title)
-            if overlap >= 0.68 and len(content) <= len(title) + 32:
-                return True
-    return False
 
 
 def _looks_like_news_headline(text: str, title: str = "") -> bool:
@@ -7147,12 +5279,17 @@ def _get_news_aliases(stock_code: str, stock_name: str) -> List[str]:
     return aliases
 
 
+def _taipei_now_naive() -> datetime:
+    """取得台北目前時間並移除時區資訊，供既有 naive datetime 比較使用。"""
+    return datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None)
+
+
 def _parse_rss_pub_date(pub_date: str):
     try:
         from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(pub_date)
         if dt.tzinfo is not None:
-            dt = dt.astimezone().replace(tzinfo=None)
+            dt = dt.astimezone(ZoneInfo("Asia/Taipei")).replace(tzinfo=None)
         return dt
     except Exception:
         return None
@@ -7162,7 +5299,7 @@ def _is_within_recent_days_from_rss(pub_date: str, days: int = 7) -> bool:
     dt = _parse_rss_pub_date(pub_date)
     if dt is None:
         return True
-    return dt >= datetime.now() - timedelta(days=days)
+    return dt >= _taipei_now_naive() - timedelta(days=days)
 
 
 
@@ -7227,11 +5364,6 @@ def _build_google_news_queries(stock_code: str, stock_name: str, days: int) -> L
     return out
 
 
-def _is_enough_usable_news(articles: List[dict]) -> bool:
-    usable = sum(1 for a in articles if a.get("body_ok") or a.get("fallback_ok"))
-    return usable >= max(1, int(NEWS_GOOGLE_MIN_USABLE_ARTICLES))
-
-
 def _make_google_news_rss_url(query: str) -> str:
     return "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": query,
@@ -7261,7 +5393,7 @@ def _news_published_datetime(published: str):
         if pd.isna(ts):
             return None
         if getattr(ts, "tzinfo", None) is not None:
-            ts = ts.tz_localize(None)
+            ts = ts.tz_convert("Asia/Taipei").tz_localize(None)
         return ts.to_pydatetime()
     except Exception:
         return None
@@ -7783,23 +5915,36 @@ def fetch_yahoo_finance_rss_articles(stock_code: str, stock_name: str, max_items
     aliases = _get_news_aliases(stock_code, stock_name)
     articles = []
     seen = set()
-    for family, url in urls:
-        for item in _read_rss_items(url, family, max_items=max(30, max_items * 5)):
-            combined = f"{item.get('title', '')} {item.get('description', '')}"
-            if aliases and not any(a and a in combined for a in aliases):
-                continue
-            key = _article_seen_key(item.get("title", ""), item.get("url", ""))
-            if key and key in seen:
-                continue
-            article = _build_external_rss_article(item, stock_code, stock_name, max_days, "yahoo_finance")
-            if article is None:
-                continue
-            if key:
-                seen.add(key)
-            articles.append(article)
+
+    feed_results = []
+    with ThreadPoolExecutor(max_workers=min(3, len(urls))) as executor:
+        future_map = {
+            executor.submit(_read_rss_items, url, family, max(20, max_items * 3)): family
+            for family, url in urls
+        }
+        for future in as_completed(future_map):
+            try:
+                feed_results.extend(future.result() or [])
+            except Exception as exc:
+                print(f"⚠️ {future_map[future]} RSS 工作失敗：{exc}")
+
+    for item in feed_results:
+        combined = f"{item.get('title', '')} {item.get('description', '')}"
+        if aliases and not any(a and a in combined for a in aliases):
+            continue
+        key = _article_seen_key(item.get("title", ""), item.get("url", ""))
+        if key and key in seen:
+            continue
+        article = _build_external_rss_article(item, stock_code, stock_name, max_days, "yahoo_finance")
+        if article is None:
+            continue
+        if key:
+            seen.add(key)
+        articles.append(article)
     articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
     print(f"📰 Yahoo 股市 RSS：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
     return articles[:max(1, int(max_items))]
+
 
 
 def fetch_bing_news_rss_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
@@ -7897,70 +6042,77 @@ def fetch_moneydj_news_articles(stock_code: str, stock_name: str, max_items: int
     if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MONEYDJ_SEARCH_ENABLE:
         return []
     queries = []
-    for q in [stock_name, stock_code]:
-        q = str(q or "").strip()
-        if q and q not in queries:
-            queries.append(q)
-    candidates = []
-    seen = set()
+    for query in [stock_name, stock_code]:
+        query = str(query or "").strip()
+        if query and query not in queries:
+            queries.append(query)
     headers = {
         "User-Agent": HDR["User-Agent"],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    for q in queries:
+
+    def fetch_query(query: str) -> List[dict]:
         url = "https://www.moneydj.com/kmdj/search/list.aspx?" + urllib.parse.urlencode({
             "_QueryType_": "NW",
-            "_Query_": q,
+            "_Query_": query,
         })
         try:
-            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
-            r.raise_for_status()
-            for c in _extract_moneydj_search_candidates(r.text, stock_code, stock_name):
-                key = _article_seen_key(c.get("title", ""), c.get("url", ""))
+            response = get_thread_session().get(
+                url,
+                headers=headers,
+                timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)),
+            )
+            response.raise_for_status()
+            return _extract_moneydj_search_candidates(response.text, stock_code, stock_name)
+        except Exception as exc:
+            print(f"⚠️ MoneyDJ 新聞搜尋失敗：{query}｜{exc}")
+            return []
+
+    candidates = []
+    seen = set()
+    with ThreadPoolExecutor(max_workers=max(1, min(2, len(queries)))) as executor:
+        future_map = {executor.submit(fetch_query, query): query for query in queries}
+        for future in as_completed(future_map):
+            for candidate in future.result() or []:
+                key = _article_seen_key(candidate.get("title", ""), candidate.get("url", ""))
                 if key and key in seen:
                     continue
                 if key:
                     seen.add(key)
-                candidates.append(c)
-        except Exception as e:
-            print(f"⚠️ MoneyDJ 新聞搜尋失敗：{q}｜{e}")
+                candidates.append(candidate)
 
     articles = []
     max_days = max(_get_news_search_day_list())
-    for candidate in candidates[:max(1, int(NEWS_MONEYDJ_BODY_FETCH_LIMIT))]:
+    candidate_limit = max(max_items * 2, max_items, NEWS_SUMMARY_MAX_POINTS)
+    for candidate in candidates[:candidate_limit]:
         title = candidate.get("title", "")
-        body = _fetch_article_body(candidate.get("url", ""))
-        body_ok = (
-            _is_valid_article_body(body, title=title, description=candidate.get("description", ""))
-            and _passes_news_quality_gate(title, body, stock_code, stock_name)
+        description = _normalize_news_text(candidate.get("description", ""))
+        fallback_ok = _passes_news_quality_gate(title, description, stock_code, stock_name)
+        if not fallback_ok:
+            continue
+        content = _build_fast_rss_news_content(
+            title,
+            description,
+            source="MoneyDJ",
+            published=candidate.get("published", ""),
         )
-        if body_ok:
-            content = body
-            fallback_ok = False
-            content_source = "moneydj_article"
-        else:
-            description = candidate.get("description", "")
-            fallback_ok = _passes_news_quality_gate(title, description, stock_code, stock_name)
-            if not fallback_ok:
-                continue
-            content = _build_fast_rss_news_content(title, description, source="MoneyDJ", published=candidate.get("published", ""))
-            content_source = "moneydj_search"
         article = {
             **candidate,
             "content": content,
-            "body_ok": bool(body_ok),
-            "fallback_ok": bool(fallback_ok),
-            "content_source": content_source,
-            "body_length": len(content),
+            "body_ok": False,
+            "fallback_ok": True,
+            "content_source": "moneydj_search",
+            "body_length": 0,
             "search_days": int(max_days),
             "query_stage": "MoneyDJ關鍵字搜尋",
         }
         article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
         articles.append(article)
-    articles = sorted(articles, key=lambda a: -int(a.get("relevance_score", 0) or 0))
-    print(f"📰 MoneyDJ 新聞搜尋：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
+    articles = sorted(articles, key=lambda article: -int(article.get("relevance_score", 0) or 0))
+    print(f"📰 MoneyDJ 新聞搜尋：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜前段不抓原文")
     return articles[:max(1, int(max_items))]
+
 
 
 
@@ -8028,12 +6180,12 @@ def _mops_announcement_has_information_value(title: str, detail: str) -> bool:
 
 
 def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_items: int = 8) -> List[dict]:
-    """從公開資訊觀測站每日重大訊息補充公司直接公告；來源失敗不影響週報。"""
+    """從公開資訊觀測站每日重大訊息補充公司直接公告；兩市場平行讀取。"""
     if not NEWS_MULTI_SOURCE_ENABLE or not NEWS_MOPS_ENABLE:
         return []
     stock_key = _clean_code(stock_code)
     max_days = max(_get_news_search_day_list())
-    cutoff = datetime.now() - timedelta(days=max_days)
+    cutoff = _taipei_now_naive() - timedelta(days=max_days)
     articles = []
     seen = set()
     headers = {
@@ -8041,17 +6193,31 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "zh-TW,zh;q=0.9",
     }
-    for market_name, url in NEWS_MOPS_ENDPOINTS:
-        try:
-            r = get_thread_session().get(url, headers=headers, timeout=(5, NEWS_FETCH_TIMEOUT))
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-        except Exception as e:
-            print(f"⚠️ MOPS {market_name}讀取失敗：{e}")
-            continue
 
+    def fetch_endpoint(market_name: str, url: str):
+        try:
+            response = get_thread_session().get(
+                url,
+                headers=headers,
+                timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)),
+            )
+            response.raise_for_status()
+            data = response.json()
+            return market_name, data if isinstance(data, list) else []
+        except Exception as exc:
+            print(f"⚠️ MOPS {market_name}讀取失敗：{exc}")
+            return market_name, []
+
+    endpoint_results = []
+    with ThreadPoolExecutor(max_workers=min(2, len(NEWS_MOPS_ENDPOINTS))) as executor:
+        future_map = {
+            executor.submit(fetch_endpoint, market_name, url): market_name
+            for market_name, url in NEWS_MOPS_ENDPOINTS
+        }
+        for future in as_completed(future_map):
+            endpoint_results.append(future.result())
+
+    for market_name, data in endpoint_results:
         for row in data:
             if not isinstance(row, dict):
                 continue
@@ -8061,8 +6227,8 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
             title = _clean_news_title(row.get("主旨", row.get("公告主旨", "")))
             detail = _normalize_news_text(row.get("說明", row.get("公告內容", "")))
             speech_date = row.get("發言日期", row.get("公告日期", row.get("事實發生日", "")))
-            dt = _parse_mops_date(speech_date)
-            if dt is not None and dt < cutoff:
+            published_dt = _parse_mops_date(speech_date)
+            if published_dt is not None and published_dt < cutoff:
                 continue
             if not title or not _mops_announcement_has_information_value(title, detail):
                 continue
@@ -8074,7 +6240,7 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
                 continue
             if key:
                 seen.add(key)
-            published = dt.strftime("%Y-%m-%d") if dt else str(speech_date or "")
+            published = published_dt.strftime("%Y-%m-%d") if published_dt else str(speech_date or "")
             article = {
                 "title": title,
                 "url": "",
@@ -8094,17 +6260,192 @@ def fetch_mops_material_info_articles(stock_code: str, stock_name: str, max_item
             articles.append(article)
 
     def sort_key(article: dict):
-        dt = _parse_rss_pub_date(article.get("published", ""))
-        if dt is None:
+        parsed = _parse_rss_pub_date(article.get("published", ""))
+        if parsed is None:
             try:
-                dt = pd.Timestamp(article.get("published", "")).to_pydatetime()
+                parsed = pd.Timestamp(article.get("published", "")).to_pydatetime()
             except Exception:
-                dt = datetime.min
-        return (-int(article.get("relevance_score", 0) or 0), -dt.timestamp() if dt != datetime.min else 0)
+                parsed = datetime.min
+        return (
+            -int(article.get("relevance_score", 0) or 0),
+            -parsed.timestamp() if parsed != datetime.min else 0,
+        )
 
     articles = sorted(articles, key=sort_key)
     print(f"📰 MOPS 重大訊息：{stock_code} {stock_name}｜保留 {len(articles):,} 筆")
     return articles[:max(1, int(max_items))]
+
+
+
+
+def _finmind_fetch_news_day(stock_code: str, trade_date) -> pd.DataFrame:
+    """依 FinMind 官方逐日限制取得單日 TaiwanStockNews。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    return _finmind_get_data(
+        "TaiwanStockNews",
+        data_id=_normalize_stock_name_code_key(stock_code),
+        start_date=date_s,
+        allow_empty=True,
+    )
+
+
+def fetch_finmind_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
+    """漸進式取得 FinMind TaiwanStockNews，避免每次固定發出 30 個日期請求。"""
+    if not NEWS_ENABLE or not FINMIND_NEWS_ENABLE:
+        return []
+
+    code = _normalize_stock_name_code_key(stock_code)
+    today = get_taipei_today_ts()
+
+    stages = []
+    for token in re.split(r"[,，;；\s]+", FINMIND_NEWS_LOOKBACK_STAGES):
+        try:
+            value = int(token)
+        except Exception:
+            continue
+        if value > 0:
+            stages.append(min(value, FINMIND_NEWS_LOOKBACK_DAYS))
+    stages.append(FINMIND_NEWS_LOOKBACK_DAYS)
+    stages = sorted(set(value for value in stages if value > 0))
+
+    frames = []
+    failures = []
+    queried_days = set()
+    minimum_needed = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
+
+    def convert_frames_to_articles(search_days: int) -> List[dict]:
+        raw = pd.concat(frames, ignore_index=True, sort=False).fillna("") if frames else pd.DataFrame()
+        if raw.empty:
+            return []
+        required = {"date", "stock_id", "link", "source", "title"}
+        missing = required - set(raw.columns)
+        if missing:
+            _finmind_debug_print_df(f"TaiwanStockNews 必要欄位不足｜{code}", raw)
+            print(
+                f"⚠️ FinMind TaiwanStockNews 必要欄位不足：{sorted(missing)}｜"
+                f"實際欄位={raw.columns.tolist()}｜本來源略過"
+            )
+            return []
+
+        description_col = next(
+            (column for column in ["description", "content", "summary", "snippet", "text"] if column in raw.columns),
+            "",
+        )
+        raw = raw.copy()
+        raw["published_dt"] = pd.to_datetime(raw["date"], errors="coerce")
+        raw = raw.dropna(subset=["published_dt"]).sort_values("published_dt", ascending=False)
+
+        articles = []
+        seen = set()
+        for _, row in raw.iterrows():
+            title = _clean_news_title(row.get("title", ""))
+            raw_description = row.get(description_col, "") if description_col else ""
+            description = _normalize_news_text(_html_to_readable_text(raw_description))
+            url = str(row.get("link", "") or "").strip()
+            source = str(row.get("source", "") or "FinMind").strip() or "FinMind"
+            if not title and not description:
+                continue
+
+            row_stock_id = _normalize_stock_name_code_key(row.get("stock_id", ""))
+            if row_stock_id and row_stock_id != code:
+                continue
+            source_text = _normalize_news_text("。".join(part for part in [title, description] if part))
+            if _has_conflicting_similar_company_name(source_text, code, stock_name):
+                continue
+            if FINMIND_NEWS_REQUIRE_DIRECT_TARGET and not _news_text_matches_target_stock(
+                source_text,
+                code,
+                stock_name,
+            ):
+                continue
+
+            key = _article_seen_key(title, url)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+
+            fact_text = _normalize_news_text(description or title)
+            if not fact_text:
+                continue
+            has_description = bool(description)
+            article = {
+                "title": title or fact_text[:80],
+                "url": url,
+                "source": source,
+                "source_family": "FinMind",
+                "published": pd.Timestamp(row["published_dt"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "description": description,
+                "content": fact_text,
+                "body_ok": bool(has_description and len(fact_text) >= 80),
+                "fallback_ok": True,
+                "content_source": "finmind_description" if has_description else "finmind_title_fact",
+                "finmind_title_only": not has_description,
+                "finmind_target_verified": True,
+                "search_days": int(search_days),
+                "query_stage": "FinMind TaiwanStockNews",
+                "body_length": len(fact_text),
+            }
+            article["relevance_score"] = _score_news_article_relevance(article, code, stock_name)
+            articles.append(article)
+
+        def sort_key(article: dict):
+            published_dt = pd.to_datetime(article.get("published", ""), errors="coerce")
+            timestamp = float(published_dt.timestamp()) if pd.notna(published_dt) else 0.0
+            material_rank = 0 if article.get("body_ok") else 1
+            return (material_rank, -int(article.get("relevance_score", 0) or 0), -timestamp)
+
+        articles = sorted(articles, key=sort_key)
+        return articles[:max(1, int(NEWS_MULTI_SOURCE_RETURN_LIMIT), int(max_items))]
+
+    result = []
+    for stage_days in stages:
+        new_dates = [
+            today - pd.Timedelta(days=offset)
+            for offset in range(stage_days)
+            if offset not in queried_days
+        ]
+        queried_days.update(range(stage_days))
+        if new_dates:
+            with ThreadPoolExecutor(max_workers=min(FINMIND_NEWS_WORKERS, len(new_dates))) as executor:
+                future_map = {
+                    executor.submit(_finmind_fetch_news_day, code, day): day
+                    for day in new_dates
+                }
+                for future in as_completed(future_map):
+                    day = future_map[future]
+                    try:
+                        day_df = future.result()
+                        if day_df is not None and not day_df.empty:
+                            frames.append(day_df)
+                    except Exception as exc:
+                        failures.append((str(pd.Timestamp(day).date()), str(exc)))
+
+        result = convert_frames_to_articles(stage_days)
+        distinct_count = _count_distinct_usable_news_articles(result, code, stock_name)
+        print(
+            f"📰 FinMind TaiwanStockNews 漸進查詢：{code} {stock_name}｜"
+            f"近 {stage_days} 天｜保留 {len(result):,} 筆｜不同事件 {distinct_count:,} 則"
+        )
+        if distinct_count >= minimum_needed:
+            break
+
+    if failures:
+        print(
+            f"⚠️ FinMind 新聞部分日期失敗：{len(failures)}/{len(queried_days)}｜"
+            + "；".join(f"{day}:{error[:80]}" for day, error in failures[:3])
+        )
+    if not result:
+        print(f"ℹ️ FinMind TaiwanStockNews 無近期合格新聞：{code} {stock_name}")
+        return []
+
+    title_only_count = sum(bool(article.get("finmind_title_only")) for article in result)
+    searched_days = max((int(article.get("search_days", 0) or 0) for article in result), default=0)
+    print(
+        f"📰 FinMind TaiwanStockNews：{code} {stock_name}｜"
+        f"實際查至近 {searched_days} 天｜保留 {len(result):,} 筆｜僅標題 {title_only_count:,} 筆"
+    )
+    return result
 
 
 def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: str, stock_name: str, limit: int) -> List[dict]:
@@ -8121,10 +6462,25 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
             article["relevance_score"] = _score_news_article_relevance(article, stock_code, stock_name)
             merged.append(article)
 
-    def sort_key(a: dict):
-        dt = _parse_rss_pub_date(a.get("published", "")) or datetime.min
-        body_rank = 0 if a.get("body_ok") else 1 if a.get("fallback_ok") else 2
-        return (-int(a.get("relevance_score", 0) or 0), body_rank, -dt.timestamp() if dt != datetime.min else 0)
+    def sort_key(article: dict):
+        published_dt = _parse_rss_pub_date(article.get("published", "")) or datetime.min
+        if article.get("body_ok"):
+            material_rank = 0
+        elif article.get("fallback_ok") and not article.get("finmind_title_only"):
+            material_rank = 1
+        elif article.get("finmind_title_only"):
+            material_rank = 2
+        else:
+            material_rank = 3
+
+        source_family = str(article.get("source_family", article.get("source", "")) or "")
+        official_rank = 0 if source_family == "MOPS" else 1
+        return (
+            material_rank,
+            official_rank,
+            -int(article.get("relevance_score", 0) or 0),
+            -published_dt.timestamp() if published_dt != datetime.min else 0,
+        )
 
     merged = sorted(merged, key=sort_key)
     # 先依事件去重，再做來源多樣化；避免同一月份營收因來自 Google／Yahoo／MoneyDJ
@@ -8158,24 +6514,156 @@ def _merge_and_rank_news_articles(article_groups: List[List[dict]], stock_code: 
     return selected[:limit]
 
 
-def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
-    """合併多來源新聞；至少蒐集 2 則不同合格事件後才視為素材充足。"""
+
+def _news_raw_cache_signature() -> str:
+    payload = {
+        "schema": "v24_parallel_sources",
+        "finmind": FINMIND_NEWS_ENABLE,
+        "multi": NEWS_MULTI_SOURCE_ENABLE,
+        "yahoo": NEWS_YAHOO_RSS_ENABLE,
+        "bing": NEWS_BING_RSS_ENABLE,
+        "moneydj": NEWS_MONEYDJ_SEARCH_ENABLE,
+        "mops": NEWS_MOPS_ENABLE,
+        "google_max": NEWS_GOOGLE_MAX_ITEMS,
+        "google_scan": NEWS_GOOGLE_SCAN_MULTIPLIER,
+        "external_max": NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE,
+        "return_limit": NEWS_MULTI_SOURCE_RETURN_LIMIT,
+        "finmind_stages": FINMIND_NEWS_LOOKBACK_STAGES,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _news_raw_cache_path(stock_code: str) -> str:
+    date_key = _compact_date_key(_taipei_today_str())
+    filename = f"{date_key}_{_safe_cache_part(stock_code)}_{_news_raw_cache_signature()}.json"
+    return os.path.join(NEWS_RAW_CACHE_DIR, filename)
+
+
+def _load_news_raw_cache(stock_code: str, stock_name: str) -> List[dict]:
+    if not NEWS_RAW_CACHE_ENABLE or NEWS_RAW_CACHE_FORCE_REFRESH or NEWS_RAW_CACHE_TTL_SECONDS <= 0:
+        return []
+    path = _news_raw_cache_path(stock_code)
+    try:
+        if not os.path.exists(path):
+            return []
+        age_seconds = max(0.0, time.time() - os.path.getmtime(path))
+        if age_seconds > NEWS_RAW_CACHE_TTL_SECONDS:
+            return []
+        with open(path, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        articles = payload.get("articles", []) if isinstance(payload, dict) else []
+        if not isinstance(articles, list) or not articles:
+            return []
+        print(
+            f"⚡ 六來源原始新聞短期快取命中：{stock_code} {stock_name}｜"
+            f"{len(articles):,} 筆｜age={age_seconds:.0f}秒"
+        )
+        return [dict(article) for article in articles if isinstance(article, dict)]
+    except Exception as exc:
+        print(f"⚠️ 六來源原始新聞快取讀取失敗：{stock_code}｜{exc}")
+        return []
+
+
+def _save_news_raw_cache(stock_code: str, stock_name: str, articles: List[dict]):
+    if not NEWS_RAW_CACHE_ENABLE or not articles:
+        return
+    path = _news_raw_cache_path(stock_code)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        payload = {
+            "stock_code": str(stock_code),
+            "stock_name": str(stock_name),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "articles": [dict(article) for article in articles if isinstance(article, dict)],
+        }
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as cache_file:
+            json.dump(payload, cache_file, ensure_ascii=False)
+        os.replace(temp_path, path)
+        print(f"💾 六來源原始新聞短期快取已更新：{stock_code}｜{len(articles):,} 筆")
+    except Exception as exc:
+        print(f"⚠️ 六來源原始新聞快取寫入失敗：{stock_code}｜{exc}")
+
+
+def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items: int = 10, cancel_event: threading.Event | None = None) -> List[dict]:
+    """平行合併六個新聞來源；短期快取避免同日手動重跑反覆等待網站。"""
+    if cancel_event is not None and cancel_event.is_set():
+        print(f"🛑 新聞管線已取消：{stock_code}")
+        return []
     manual = os.getenv("WEEKLY_NEWS_TEXT", "").strip()
     if manual:
         return fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
     if not NEWS_ENABLE:
         return []
 
+    cached_articles = _load_news_raw_cache(stock_code, stock_name)
+    if cached_articles:
+        return cached_articles
+
     minimum_needed = max(1, int(NEWS_MIN_DISTINCT_ARTICLES))
     per_source = max(minimum_needed, 3, int(NEWS_EXTERNAL_MAX_ITEMS_PER_SOURCE))
-
-    # 所有來源都會實際查詢，不因 Google 先找到一篇就停止。
-    groups = [fetch_google_news_articles(stock_code, stock_name, max_items=max(max_items, minimum_needed))]
+    jobs = [
+        (
+            "GoogleNews",
+            fetch_google_news_articles,
+            (stock_code, stock_name, max(max_items, minimum_needed)),
+        ),
+    ]
+    if FINMIND_NEWS_ENABLE:
+        jobs.append(("FinMind", fetch_finmind_news_articles, (stock_code, stock_name, per_source)))
     if NEWS_MULTI_SOURCE_ENABLE:
-        groups.append(fetch_yahoo_finance_rss_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_bing_news_rss_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_moneydj_news_articles(stock_code, stock_name, max_items=per_source))
-        groups.append(fetch_mops_material_info_articles(stock_code, stock_name, max_items=max(NEWS_MOPS_MAX_ITEMS, per_source)))
+        if NEWS_YAHOO_RSS_ENABLE:
+            jobs.append(("Yahoo", fetch_yahoo_finance_rss_articles, (stock_code, stock_name, per_source)))
+        if NEWS_BING_RSS_ENABLE:
+            jobs.append(("Bing", fetch_bing_news_rss_articles, (stock_code, stock_name, per_source)))
+        if NEWS_MONEYDJ_SEARCH_ENABLE:
+            jobs.append(("MoneyDJ", fetch_moneydj_news_articles, (stock_code, stock_name, per_source)))
+        if NEWS_MOPS_ENABLE:
+            jobs.append(("MOPS", fetch_mops_material_info_articles, (stock_code, stock_name, max(NEWS_MOPS_MAX_ITEMS, per_source))))
+
+    groups = []
+    completed_sources = []
+    started = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=min(NEWS_SOURCE_FETCH_WORKERS, len(jobs)))
+    future_map = {
+        executor.submit(function, *arguments): label
+        for label, function, arguments in jobs
+    }
+    pending = set(future_map)
+    deadline = started + NEWS_SOURCE_BATCH_TIMEOUT
+    try:
+        while pending:
+            if cancel_event is not None and cancel_event.is_set():
+                print(f"🛑 六來源新聞抓取收到取消訊號：{stock_code}")
+                break
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending,
+                timeout=min(0.25, max(0.05, remaining)),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                label = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    print(f"⚠️ 新聞來源工作失敗：{label}｜{exc}")
+                    result = []
+                groups.append(result or [])
+                completed_sources.append(label)
+    finally:
+        if pending:
+            pending_labels = [future_map[future] for future in pending]
+            for future in pending:
+                future.cancel()
+            print(
+                f"⚠️ 六來源新聞整批超過 {NEWS_SOURCE_BATCH_TIMEOUT:g} 秒，"
+                f"略過尚未完成來源：{'、'.join(pending_labels)}"
+            )
+        executor.shutdown(wait=False, cancel_futures=True)
 
     limit = max(
         minimum_needed,
@@ -8185,24 +6673,28 @@ def fetch_multi_source_news_articles(stock_code: str, stock_name: str, max_items
     )
     articles = _merge_and_rank_news_articles(groups, stock_code, stock_name, limit=limit)
     distinct_count = _count_distinct_usable_news_articles(articles, stock_code, stock_name)
-
     source_counts = {}
     for article in articles:
         family = str(article.get("source_family", article.get("source", "unknown")) or "unknown")
         source_counts[family] = source_counts.get(family, 0) + 1
-    source_text = "、".join(f"{k}:{v}" for k, v in source_counts.items()) or "無"
+    source_text = "、".join(f"{key}:{value}" for key, value in source_counts.items()) or "無"
+    elapsed = time.perf_counter() - started
 
-    if distinct_count >= minimum_needed:
+    print(
+        f"📰 六來源平行抓取完成：{stock_code} {stock_name}｜{elapsed:.2f} 秒｜"
+        f"完成來源={'、'.join(completed_sources) or '無'}｜保留 {len(articles):,} 筆｜"
+        f"不同事件 {distinct_count:,} 則｜來源 {source_text}"
+    )
+    if distinct_count < minimum_needed:
         print(
-            f"📰 多來源新聞完成：{stock_code} {stock_name}｜保留 {len(articles):,} 筆｜"
-            f"不同合格事件 {distinct_count:,} 則｜來源 {source_text}"
+            f"⚠️ 六來源僅取得 {distinct_count:,} 則不同合格事件；"
+            "允許單則輸出，不以盤勢或重複事件硬湊"
         )
-    else:
-        print(
-            f"⚠️ 多來源與最長 {max(_get_news_search_day_list())} 日範圍均已查完："
-            f"{stock_code} {stock_name} 僅取得 {distinct_count:,} 則不同合格事件；允許單則輸出｜來源 {source_text}"
-        )
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    _save_news_raw_cache(stock_code, stock_name, articles)
     return articles
+
 
 
 def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int = 10) -> List[dict]:
@@ -8413,7 +6905,7 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
                 f"fetch_limit={fetch_limit}｜mode={mode_label}"
             )
             try:
-                r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=10)
+                r = requests.get(url, headers={"User-Agent": HDR["User-Agent"]}, timeout=(4, max(2.0, NEWS_FETCH_TIMEOUT)))
                 r.raise_for_status()
                 root = ET.fromstring(r.content)
             except Exception as e:
@@ -8516,22 +7008,6 @@ def fetch_google_news_articles(stock_code: str, stock_name: str, max_items: int 
         log_label="Google News",
     )
     return all_articles[:fetch_limit]
-
-def fetch_google_news_titles(stock_code: str, stock_name: str, max_items: int = 5) -> List[str]:
-    """保留舊函式相容性；新流程請優先使用 fetch_google_news_articles。"""
-    articles = fetch_google_news_articles(stock_code, stock_name, max_items=max_items)
-    titles = []
-    for a in articles:
-        if isinstance(a, dict):
-            title = _clean_news_title(a.get("title", ""))
-            if title:
-                titles.append(title)
-        else:
-            title = _clean_news_title(str(a))
-            if title:
-                titles.append(title)
-    return titles[:max_items]
-
 
 def _news_items_to_records(news_items) -> List[dict]:
     records = []
@@ -9013,20 +7489,6 @@ def _collect_news_sentences(records: List[dict], stock_code: str = "", stock_nam
             seen.add(sent)
     return candidates
 
-def _clean_summary_points(raw_points: List[str]) -> List[str]:
-    points = []
-    for p in raw_points or []:
-        s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
-        if not s or _is_bad_news_sentence(s):
-            continue
-        if s in points:
-            continue
-        points.append(s)
-        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return points
-
-
 def _count_summary_chars(points: List[str]) -> int:
     """計算重點實際文字量；tone 為控制欄位，不計入圖卡內容字數。"""
     joined = "".join(_strip_report_tone_metadata(str(p or "")) for p in points or [])
@@ -9056,21 +7518,6 @@ def _parse_raw_points_from_llm(output_text: str) -> List[str]:
     return points
 
 
-def _clean_news_summary_points(raw_points: List[str]) -> List[str]:
-    """新聞專用清理：保留較完整的重點，使總字數可達 150 字以上。"""
-    points = []
-    for p in raw_points or []:
-        s = _trim_news_point(p, max_len=NEWS_SUMMARY_POINT_MAX_LEN)
-        if not s or _is_bad_news_sentence(s):
-            continue
-        if s in points:
-            continue
-        points.append(s)
-        if len(points) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return points
-
-
 def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str, stock_name: str) -> List[str]:
     """清理新聞重點並排除跨公司數字、純盤勢或缺乏實質內容的句子。"""
     points = []
@@ -9094,107 +7541,6 @@ def _clean_news_summary_points_for_stock(raw_points: List[str], stock_code: str,
         if len(points) >= NEWS_SUMMARY_MAX_POINTS:
             break
     return points
-
-def _refine_news_points_with_records(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """移除日期／來源雜訊；若 AI 幾乎照抄具體基本面標題，改由程式整理成標準重點。"""
-    cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
-    refined = []
-    for p in cleaned:
-        if not _looks_like_title_copy_or_meta_noise(p, records):
-            refined.append(p)
-            continue
-
-        best_title = ""
-        best_overlap = 0.0
-        for rec in records or []:
-            title = _clean_news_title(rec.get("title", ""))
-            if not title or not _can_use_news_title_as_fact(title):
-                continue
-            overlap = _char_overlap_ratio(p, title)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_title = title
-
-        rebuilt = ""
-        if best_title and best_overlap >= 0.45:
-            rebuilt = _make_news_keypoint(
-                _infer_news_label_from_text(best_title, fallback_label="新聞焦點"),
-                best_title,
-                stock_code,
-                stock_name,
-            )
-        if rebuilt and not _is_bad_news_sentence(rebuilt):
-            print(f"🧹 疑似照抄新聞標題，已改寫為標準重點：{best_title[:42]}")
-            refined.append(rebuilt)
-        else:
-            print(f"⚠️ 略過疑似直接複製標題或中繼資訊的新聞重點：{p}")
-    return _clean_news_summary_points_for_stock(refined, stock_code, stock_name)
-
-
-def _build_news_expansion_points(records: List[dict], stock_code: str, stock_name: str, used_points: List[str] | None = None) -> List[str]:
-    """Gemini 輸出太短時，從近期原文 / RSS 摘要候選句補足重點字數；不使用新聞標題硬湊。"""
-    used_points = used_points or []
-    sentence_candidates = _collect_news_sentences(records, stock_code, stock_name)
-    title_candidates = _collect_news_title_candidates(records, stock_code, stock_name)
-    candidates = list(sentence_candidates or [])
-    seen_candidate_keys = {_title_compare_text(c.get("text", "")) for c in candidates if c.get("text")}
-    for c in title_candidates or []:
-        key = _title_compare_text(c.get("text", ""))
-        if key and key not in seen_candidate_keys:
-            candidates.append(c)
-            seen_candidate_keys.add(key)
-    if not candidates:
-        return []
-
-    broad_keywords = [
-        stock_code, stock_name, "營收", "財報", "獲利", "EPS", "毛利", "毛利率", "AI", "伺服器",
-        "半導體", "記憶體", "DRAM", "NAND", "HBM", "報價", "漲價", "供需", "需求",
-        "法說", "展望", "接單", "出貨", "產能", "擴產", "合作", "法人", "外資", "投信",
-        "評等", "目標價", "調升", "調降", "客戶", "長約", "庫存", "價格", "景氣",
-    ]
-    scored = []
-    used_compare = {_title_compare_text(p) for p in used_points if p}
-    for c in candidates:
-        text = c.get("text", "")
-        if not text or _is_bad_news_sentence(text):
-            continue
-        if _is_cross_company_target_value_sentence(text, stock_code, stock_name):
-            continue
-        if not _has_substantive_company_news(text):
-            continue
-        cmp_text = _title_compare_text(text)
-        if not cmp_text or cmp_text in used_compare:
-            continue
-        score = _score_news_sentence(text, broad_keywords, stock_code, stock_name)
-        if score > 0:
-            scored.append((score, text))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    extra = []
-    for _, text in scored:
-        label = _infer_news_label_from_text(text, fallback_label="新聞焦點")
-        point = _make_news_keypoint(label, text, stock_code, stock_name)
-        if not point or _is_bad_news_sentence(point):
-            continue
-        cmp_point = _title_compare_text(point)
-        if cmp_point in used_compare:
-            continue
-        extra.append(point)
-        used_compare.add(cmp_point)
-        if len(extra) >= NEWS_SUMMARY_MAX_POINTS:
-            break
-    return extra
-
-
-def _ensure_news_summary_min_total(points: List[str], records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """新聞允許 0 點；只清理現有內容，不再為點數或字數自動擴寫。"""
-    return _refine_news_points_with_records(
-        points,
-        records,
-        stock_code,
-        stock_name,
-    )[:NEWS_SUMMARY_MAX_POINTS]
-
 
 def _parse_gemini_news_points(
     output_text: str,
@@ -9235,17 +7581,24 @@ def _parse_gemini_news_points(
         if str(article.get("id", "") or "").strip()
     }
     for item in raw_items:
+        working_item = _repair_news_item_number_units_locally(item, usable_articles)
+        working_item = _repair_news_item_evidence_locally(
+            working_item,
+            usable_articles,
+            stock_code,
+            stock_name,
+        )
         ok, reason = _validate_news_point_evidence(
-            item,
+            working_item,
             usable_articles,
             stock_code,
             stock_name,
         )
         if not ok:
-            rejected.append(_format_rejected_news_point(item, reason))
+            rejected.append(_format_rejected_news_point(working_item, reason))
             continue
 
-        canonical = _point_item_to_canonical_text(item)
+        canonical = _point_item_to_canonical_text(working_item)
         cleaned = _clean_news_summary_points_for_stock(
             [canonical],
             stock_code,
@@ -9261,6 +7614,8 @@ def _parse_gemini_news_points(
             continue
 
         point = _trim_news_point_detail_to_max(cleaned[0], log_label="Gemini 新聞")
+        point = _enrich_short_news_point_detail(point, log_label="Gemini 新聞")
+        point = _trim_news_point_detail_to_max(point, log_label="Gemini 新聞")
         if not _points_are_independent_and_complete([point]):
             rejected.append(
                 _format_rejected_news_point(
@@ -9271,7 +7626,7 @@ def _parse_gemini_news_points(
             continue
 
         key = _title_compare_text(point)
-        source_id = str(item.get("source_id", "") or "").strip() if isinstance(item, dict) else ""
+        source_id = str(working_item.get("source_id", "") or "").strip() if isinstance(working_item, dict) else ""
         event_key = _news_point_event_key(
             point,
             stock_code,
@@ -9308,15 +7663,22 @@ def _extract_validated_news_source_ids(
     raw_items = parsed.get("points", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
     source_ids = []
     for item in raw_items or []:
-        ok, _ = _validate_news_point_evidence(
-            item,
+        working_item = _repair_news_item_number_units_locally(item, usable_articles)
+        working_item = _repair_news_item_evidence_locally(
+            working_item,
             usable_articles,
             stock_code,
             stock_name,
         )
-        if not ok or not isinstance(item, dict):
+        ok, _ = _validate_news_point_evidence(
+            working_item,
+            usable_articles,
+            stock_code,
+            stock_name,
+        )
+        if not ok or not isinstance(working_item, dict):
             continue
-        source_id = str(item.get("source_id", "") or "").strip()
+        source_id = str(working_item.get("source_id", "") or "").strip()
         if source_id and source_id not in source_ids:
             source_ids.append(source_id)
     return source_ids
@@ -9341,37 +7703,112 @@ def _slice_by_nonspace_chars(text: str, max_chars: int) -> str:
 
 
 def _trim_news_detail_text(detail: str, max_chars: int | None = None) -> str:
-    """detail 太長時由程式端裁成完整句，不把純格式問題交給 Gemini repair。
+    """將新聞 detail 控制在上限內，同時避免裁成比最低門檻更短的殘句。
 
-    優先保留上限內最後一個完整句號；若素材本身沒有句號，才退回分號／逗號，
-    最後才硬切並補句號。這只處理長度，不改變事件題材與數字內容。
+    先尋找最低保留字數到上限之間的完整句號；若第二句在上限內尚未收尾，
+    再找該區間最後一個分號／逗號。只有完全沒有可用斷點時才硬切，確保
+    原本 70～90 字的兩句內容不會因第一個句號太早而只剩 30 多字。
     """
     s = _normalize_news_text(str(detail or "")).strip()
     if not s:
         return ""
 
     limit = max(1, int(max_chars or NEWS_SUMMARY_DETAIL_MAX_CHARS))
+    min_keep = min(
+        limit,
+        max(40, int(NEWS_SUMMARY_DETAIL_MIN_CHARS) - 5),
+    )
     if _count_nonspace_chars(s) <= limit:
         return s if s[-1:] in "。！？" else s.rstrip("；;，,、 ") + "。"
 
     prefix = _slice_by_nonspace_chars(s, limit).strip()
-    sentence_idx = max(prefix.rfind("。"), prefix.rfind("！"), prefix.rfind("？"))
-    if sentence_idx >= 0:
-        trimmed = prefix[:sentence_idx + 1].strip()
-        if trimmed:
-            return trimmed
 
-    clause_idx = max(
-        prefix.rfind("；"), prefix.rfind(";"),
-        prefix.rfind("，"), prefix.rfind(","),
-    )
-    if clause_idx >= 0:
-        trimmed = prefix[:clause_idx].rstrip("；;，,、 ")
+    def _boundary_positions(chars: str) -> List[int]:
+        return [idx for idx, ch in enumerate(prefix) if ch in chars]
+
+    # 只有位於最低保留字數之後的完整句才可作為裁切點。
+    sentence_positions = _boundary_positions("。！？")
+    sentence_candidates = [
+        idx for idx in sentence_positions
+        if _count_nonspace_chars(prefix[:idx + 1]) >= min_keep
+    ]
+    if sentence_candidates:
+        return prefix[:sentence_candidates[-1] + 1].strip()
+
+    # 第二句可能超過上限，保留其主要子句，不回退到過短的第一句。
+    clause_positions = _boundary_positions("；;，,")
+    clause_candidates = [
+        idx for idx in clause_positions
+        if _count_nonspace_chars(prefix[:idx + 1]) >= min_keep
+    ]
+    if clause_candidates:
+        trimmed = prefix[:clause_candidates[-1]].rstrip("；;，,、 ")
         if trimmed:
             return trimmed + "。"
 
-    return prefix.rstrip("；;，,、 ") + "。"
+    hard_prefix = prefix
+    if _count_nonspace_chars(hard_prefix) >= limit and hard_prefix[-1:] not in "。！？":
+        hard_prefix = _slice_by_nonspace_chars(hard_prefix, max(1, limit - 1))
+    return hard_prefix.rstrip("；;，,、 ") + "。"
 
+
+def _news_detail_observation_suffix(label: str, status: str, tone: str) -> str:
+    """依既有題材補一個不新增外部事實的觀察句，供過短 detail 本地補足。"""
+    context = f"{label} {status}".strip()
+    if re.search(r"營收|獲利|財報|EPS|毛利|業績|法說", context, flags=re.I):
+        return "後續觀察出貨節奏、產品組合與獲利表現能否延續。"
+    if re.search(r"接單|訂單|合約|得標|出貨|量產|擴產|產能", context, flags=re.I):
+        return "後續觀察執行進度、產能配置與營收認列時程。"
+    if re.search(r"報價|供需|缺貨|庫存|需求|產業|AI|晶片|半導體", context, flags=re.I):
+        return "後續觀察需求延續性、報價變化與公司實際出貨表現。"
+    if re.search(r"目標價|評等|法人|外資|市場", context, flags=re.I):
+        return "後續仍需以實際營收、獲利與訂單進度驗證市場預期。"
+    if tone == "negative":
+        return "後續觀察負面因素是否持續影響出貨、成本與獲利表現。"
+    if tone == "positive":
+        return "後續觀察題材能否轉化為實際訂單、出貨與獲利貢獻。"
+    return "後續觀察事件進度及其對營收、出貨與獲利的實際影響。"
+
+
+def _enrich_short_news_point_detail(point: str, log_label: str = "新聞重點") -> str:
+    """過短 detail 先用既有題材補足觀察句，避免為純長度問題重打 Gemini。"""
+    fields = _parse_report_point_fields(point)
+    detail = str(fields.get("detail", "") or "").strip()
+    min_chars = max(1, int(NEWS_SUMMARY_DETAIL_MIN_CHARS))
+    before_chars = _count_nonspace_chars(detail)
+    if not detail or before_chars >= min_chars:
+        return str(point or "").strip()
+
+    suffix = _news_detail_observation_suffix(
+        str(fields.get("label", "") or ""),
+        str(fields.get("status", "") or ""),
+        normalize_report_tone(fields.get("tone", "")) or "neutral",
+    )
+    base = detail if detail[-1:] in "。！？" else detail.rstrip("；;，,、 ") + "。"
+    sentence_matches = list(re.finditer(r"[。！？]", base))
+    if len(sentence_matches) >= 2:
+        last_boundary = sentence_matches[-2].end()
+        first_part = base[:last_boundary]
+        second_part = base[last_boundary:].rstrip("。！？ ")
+        suffix_core = re.sub(r"^後續(?:仍需)?觀察", "", suffix).rstrip("。！？ ")
+        if not suffix_core:
+            suffix_core = suffix.rstrip("。！？ ")
+        if second_part:
+            combined = f"{first_part}{second_part}，並追蹤{suffix_core}。"
+        else:
+            combined = f"{first_part}{suffix}"
+    else:
+        combined = f"{base}{suffix}"
+    combined = _normalize_news_text(combined)
+    combined = _trim_news_detail_text(combined, max_chars=NEWS_SUMMARY_DETAIL_MAX_CHARS)
+    after_chars = _count_nonspace_chars(combined)
+    if after_chars > before_chars:
+        print(
+            f"🧩 {log_label} detail 本地補足：{before_chars} 字 → {after_chars} 字｜"
+            "沿用原事件，只補營運觀察句"
+        )
+        return _replace_news_point_detail(point, combined)
+    return str(point or "").strip()
 
 def _replace_news_point_detail(point: str, new_detail: str) -> str:
     fields = _parse_report_point_fields(point)
@@ -9403,14 +7840,6 @@ def _trim_news_point_detail_to_max(point: str, log_label: str = "新聞重點") 
     return _replace_news_point_detail(point, trimmed_detail)
 
 
-def _trim_news_point_details_to_max(points: List[str], log_label: str = "新聞重點") -> List[str]:
-    return [
-        _trim_news_point_detail_to_max(point, log_label=log_label)
-        for point in (points or [])
-        if str(point or "").strip()
-    ]
-
-
 def _find_news_detail_length_problems(points: List[str]) -> List[str]:
     """只把 detail 過短視為內容不足；超長由程式端裁切，不觸發 repair。"""
     problems = []
@@ -9422,22 +7851,6 @@ def _find_news_detail_length_problems(points: List[str]) -> List[str]:
             problems.append(f"第{idx}點 detail 僅 {detail_chars} 字，少於 {min_chars} 字")
     return problems
 
-
-def _build_news_length_only_payload(points: List[str]) -> List[dict]:
-    """列出只因 detail 太短而需補寫的點，repair 時明確保留原題材。"""
-    min_chars = max(1, int(NEWS_SUMMARY_DETAIL_MIN_CHARS))
-    payload = []
-    for idx, point in enumerate(points or [], 1):
-        detail = str(_parse_report_point_fields(point).get("detail", "") or "").strip()
-        detail_chars = _count_nonspace_chars(detail)
-        if detail_chars < min_chars:
-            payload.append({
-                "index": idx,
-                "reason": f"detail 僅 {detail_chars} 字，少於 {min_chars} 字",
-                "point": point,
-                "instruction": "保留此題材、source_id、evidence 與既有事實，只補足營運意涵或後續觀察。",
-            })
-    return payload
 
 
 def _merge_distinct_news_points(
@@ -9472,12 +7885,6 @@ def _get_warrants_api_keys() -> List[str]:
         keys.append(key)
         seen.add(key)
     return keys
-
-
-def _get_warrants_api_key() -> str:
-    """保留舊函式相容性；回傳第一組可用 Gemini API Key。"""
-    keys = _get_warrants_api_keys()
-    return keys[0] if keys else ""
 
 
 def _extract_json_from_text(text: str):
@@ -9589,6 +7996,180 @@ def _find_article_by_source_id(usable_articles: List[dict], source_id: str):
         if str(article.get("id", "") or "").strip() == source_id:
             return article
     return None
+
+
+_NEWS_SCALED_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<num>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>兆|億|萬)?\s*(?P<currency>元)?"
+)
+_NEWS_UNIT_MULTIPLIERS = {
+    "萬": 10_000,
+    "億": 100_000_000,
+    "兆": 1_000_000_000_000,
+}
+
+
+def _decimal_news_number(raw: str):
+    try:
+        return Decimal(str(raw or "").replace(",", ""))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _build_scaled_source_number_map(article: dict) -> Dict[Decimal, str]:
+    """建立單篇來源中「500億元 → 50000000000」的可逆對照。"""
+    source_text = _normalize_news_text(
+        f"{article.get('title', '')}。{article.get('body', '')}"
+    )
+    mapping: Dict[Decimal, str] = {}
+    for matched in _NEWS_SCALED_NUMBER_RE.finditer(source_text):
+        unit = str(matched.group("unit") or "")
+        if unit not in _NEWS_UNIT_MULTIPLIERS:
+            continue
+        number = _decimal_news_number(matched.group("num"))
+        if number is None:
+            continue
+        base_value = number * Decimal(_NEWS_UNIT_MULTIPLIERS[unit])
+        phrase = re.sub(r"\s+", "", matched.group(0))
+        previous = mapping.get(base_value, "")
+        if not previous or ("元" in phrase and "元" not in previous) or len(phrase) < len(previous):
+            mapping[base_value] = phrase
+    return mapping
+
+
+def _repair_scaled_numbers_in_text(text: str, article: dict) -> tuple[str, int]:
+    """只在同一 source_id 文章存在完全等值單位表達時，還原 Gemini 的錯誤展開。"""
+    raw = str(text or "")
+    source_map = _build_scaled_source_number_map(article)
+    if not raw or not source_map:
+        return raw, 0
+
+    repaired_count = 0
+
+    def replace_match(matched):
+        nonlocal repaired_count
+        # 已帶萬／億／兆的輸出不處理；只修正 Gemini 展開成長整數的情況。
+        if matched.group("unit"):
+            return matched.group(0)
+        number_text = str(matched.group("num") or "").replace(",", "")
+        integer_digits = len(number_text.split(".", 1)[0].lstrip("0"))
+        if integer_digits < 8:
+            return matched.group(0)
+        number = _decimal_news_number(number_text)
+        if number is None:
+            return matched.group(0)
+        replacement = source_map.get(number)
+        if not replacement:
+            return matched.group(0)
+        repaired_count += 1
+        return replacement
+
+    return _NEWS_SCALED_NUMBER_RE.sub(replace_match, raw), repaired_count
+
+
+def _repair_news_item_number_units_locally(item: dict, usable_articles: List[dict]) -> dict:
+    """依 point 的 source_id 本地還原數字單位，不跨文章借用數字。"""
+    if not isinstance(item, dict):
+        return item
+    source_id = str(item.get("source_id", "") or "").strip()
+    article = _find_article_by_source_id(usable_articles, source_id)
+    if article is None:
+        return dict(item)
+
+    repaired = dict(item)
+    total_repairs = 0
+    for field in ("status", "detail"):
+        new_text, count = _repair_scaled_numbers_in_text(repaired.get(field, ""), article)
+        repaired[field] = new_text
+        total_repairs += count
+    if total_repairs:
+        print(
+            f"🧩 新聞數字單位本地還原：source_id={source_id}｜"
+            f"修正 {total_repairs} 處｜保留來源原始萬／億／兆表達"
+        )
+    return repaired
+
+
+def _news_evidence_match_score(sentence: str, point_obj: dict) -> int:
+    """以數字、財經關鍵詞與中文字雙字詞，挑選最接近 point 的來源原句。"""
+    sentence_text = _normalize_news_text(sentence)
+    query_text = _normalize_news_text(
+        f"{point_obj.get('label', '')} {point_obj.get('status', '')} {point_obj.get('detail', '')}"
+    )
+    if not sentence_text or not query_text:
+        return 0
+
+    score = 0
+    sentence_numbers = set(_extract_grounded_number_tokens(sentence_text))
+    query_numbers = set(_extract_grounded_number_tokens(query_text))
+    score += 12 * len(sentence_numbers & query_numbers)
+
+    keywords = [
+        "營收", "獲利", "毛利", "EPS", "接單", "訂單", "得標", "出貨", "量產",
+        "擴產", "產能", "需求", "供給", "報價", "庫存", "法說", "財測", "目標價",
+        "評等", "AI", "ASIC", "晶片", "半導體", "伺服器", "手機", "車用",
+    ]
+    score += 5 * sum(1 for keyword in keywords if keyword in query_text and keyword in sentence_text)
+
+    def bigrams(text: str) -> set:
+        compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", text)
+        return {compact[idx:idx + 2] for idx in range(max(0, len(compact) - 1))}
+
+    score += min(20, len(bigrams(sentence_text) & bigrams(query_text)))
+    return score
+
+
+def _repair_news_item_evidence_locally(
+    item: dict,
+    usable_articles: List[dict],
+    stock_code: str,
+    stock_name: str,
+) -> dict:
+    """Gemini evidence 有改寫時，從同一 source_id 找回可逐字驗證的最佳原句。"""
+    if not isinstance(item, dict):
+        return item
+    repaired = dict(item)
+    ok, _ = _validate_news_point_evidence(repaired, usable_articles, stock_code, stock_name)
+    if ok:
+        return repaired
+
+    source_id = str(repaired.get("source_id", "") or "").strip()
+    article = _find_article_by_source_id(usable_articles, source_id)
+    if article is None:
+        return repaired
+
+    raw_text = _normalize_news_text(
+        f"{article.get('title', '')}。{article.get('body', '')}"
+    )
+    sentences = [
+        str(sentence or "").strip()
+        for sentence in _SENTENCE_SPLIT_RE.split(raw_text)
+        if str(sentence or "").strip()
+    ]
+    candidates = []
+    for idx, sentence in enumerate(sentences):
+        window_start = max(0, idx - 1)
+        subject_window = "。".join(sentences[window_start:idx + 1])
+        if not _news_text_matches_target_stock(subject_window, stock_code, stock_name):
+            continue
+        if len(_normalize_for_evidence_match(sentence)) < 8:
+            continue
+        candidates.append((_news_evidence_match_score(sentence, repaired), -idx, sentence))
+
+    if not candidates:
+        return repaired
+    candidates.sort(reverse=True)
+    best_sentence = candidates[0][2]
+    original = str(repaired.get("evidence", "") or "").strip()
+    repaired["evidence"] = best_sentence
+    ok, _ = _validate_news_point_evidence(repaired, usable_articles, stock_code, stock_name)
+    if ok and best_sentence != original:
+        print(
+            f"🧩 新聞 evidence 本地修復：source_id={source_id}｜"
+            f"改用來源原句「{best_sentence[:48]}」"
+        )
+        return repaired
+    return dict(item)
 
 
 def _validate_news_point_evidence(
@@ -9889,11 +8470,6 @@ def _call_gemini_with_retry(
     return None
 
 
-def _parse_gemini_points(output_text: str) -> List[str]:
-    return _clean_summary_points(_parse_raw_points_from_llm(output_text))
-
-
-
 def _is_fetchable_news_article_url(url: str) -> bool:
     """只把具備 http(s) scheme 與網域的網址送入原文抓取。"""
     raw = str(url or "").strip()
@@ -9906,21 +8482,6 @@ def _is_fetchable_news_article_url(url: str) -> bool:
         return False
 
 
-def _is_direct_fetchable_news_article_url(url: str) -> bool:
-    """判斷是否為可直接存取的非 Google News 新聞網址；保留供其他流程使用。"""
-    if not _is_fetchable_news_article_url(url):
-        return False
-    try:
-        host = (urllib.parse.urlparse(str(url or "").strip()).hostname or "").lower()
-    except Exception:
-        return False
-    if not host:
-        return False
-    if host == "google.com" or host.endswith(".google.com") or host == "news.google.com":
-        return False
-    return True
-
-
 def _hybrid_news_event_key(record: dict, stock_code: str = "", stock_name: str = "") -> str:
     """建立混合模式用的事件鍵；與新聞素材／輸出點共用同一套事件去重規則。"""
     return _news_article_event_key(record, stock_code, stock_name)
@@ -9931,7 +8492,7 @@ def _enrich_fast_news_records_with_topk_bodies(
     stock_code: str,
     stock_name: str,
 ) -> List[dict]:
-    """RSS 快掃後只替最高分的前幾篇補抓原文，兼顧速度與摘要具體度。"""
+    """只替最高分的前兩個不同事件平行補抓原文，避免六來源搜尋後再次長時間等待。"""
     enriched = [dict(record) for record in (records or [])]
     if (
         not NEWS_FAST_MODE
@@ -9942,14 +8503,16 @@ def _enrich_fast_news_records_with_topk_bodies(
         return enriched
 
     candidates_by_event = {}
-    for idx, record in enumerate(enriched):
+    for index, record in enumerate(enriched):
         if record.get("body_ok") or not record.get("fallback_ok"):
             continue
         url = str(record.get("url", "") or "").strip()
-        # RSS 大多提供 Google News 導流網址；_fetch_article_body 會先解析成原始網址。
         if not _is_fetchable_news_article_url(url):
             continue
         if str(record.get("content_source", "") or "") == "manual":
+            continue
+        if record.get("finmind_title_only"):
+            # FinMind 標題仍可提供事件線索，但沒有直接新聞頁原文可補抓時不浪費請求。
             continue
 
         combined = _normalize_news_text(
@@ -9970,33 +8533,32 @@ def _enrich_fast_news_records_with_topk_bodies(
             relevance = _score_news_article_relevance(record, stock_code, stock_name)
         published_dt = _parse_rss_pub_date(record.get("published", "")) or datetime.min
         host = (urllib.parse.urlparse(url).netloc or "").lower()
-        direct_url_rank = 0 if "news.google." in host else 1
-        event_key = _hybrid_news_event_key(record, stock_code, stock_name) or f"row:{idx}"
-        candidate = (idx, relevance, published_dt, direct_url_rank, event_key)
+        direct_rank = 0 if "news.google." in host else 1
+        event_key = _hybrid_news_event_key(record, stock_code, stock_name) or f"row:{index}"
+        candidate = (index, relevance, published_dt, direct_rank, event_key)
 
-        # 同一事件只保留一篇；有直接原文網址時優先於 Google News 導流網址。
         previous = candidates_by_event.get(event_key)
-        candidate_quality = (
-            direct_url_rank,
+        quality = (
+            direct_rank,
             relevance,
             published_dt.timestamp() if published_dt != datetime.min else 0,
-            -idx,
+            -index,
         )
         if previous is None:
             candidates_by_event[event_key] = candidate
         else:
-            prev_idx, prev_relevance, prev_dt, prev_direct_rank, _ = previous
+            prev_index, prev_relevance, prev_dt, prev_direct_rank, _ = previous
             previous_quality = (
                 prev_direct_rank,
                 prev_relevance,
                 prev_dt.timestamp() if prev_dt != datetime.min else 0,
-                -prev_idx,
+                -prev_index,
             )
-            if candidate_quality > previous_quality:
+            if quality > previous_quality:
                 candidates_by_event[event_key] = candidate
 
     if not candidates_by_event:
-        print("ℹ️ RSS 混合模式沒有可補抓的新聞原文網址，略過原文補抓")
+        print("ℹ️ 混合新聞模式沒有值得補抓的原文網址，直接使用已取得摘要")
         return enriched
 
     candidates = sorted(
@@ -10010,70 +8572,77 @@ def _enrich_fast_news_records_with_topk_bodies(
     )[:NEWS_FAST_HYBRID_BODY_FETCH_TOPK]
 
     print(
-        f"📰 RSS 混合模式：從 {len(enriched):,} 筆素材中，"
-        f"事件去重後替最高分 {len(candidates):,} 篇補抓原文"
+        f"📰 混合新聞模式：從 {len(enriched):,} 筆素材中，"
+        f"事件去重後平行補抓最高分 {len(candidates):,} 篇原文"
     )
-    fetch_started = time.perf_counter()
-    batch_timeout = max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT))
-    batch_deadline = fetch_started + batch_timeout
+    started = time.perf_counter()
+    deadline = started + max(1.0, float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT))
     upgraded = 0
-    attempted = 0
 
-    # 不再使用 ThreadPoolExecutor：requests 執行緒無法被安全強制終止，
-    # 即使 future.cancel() 成功印出，Python 仍可能在收尾時等待卡住的執行緒。
-    # 這裡改成最多 3 篇循序補抓，每篇與整批皆有硬上限，預設則完全不執行此功能。
-    for candidate_pos, (idx, _, _, _, _) in enumerate(candidates):
-        remaining_batch = batch_deadline - time.perf_counter()
-        if remaining_batch <= 0:
-            remaining_count = len(candidates) - candidate_pos
-            print(f"⚠️ RSS 混合模式批次逾時，略過剩餘 {remaining_count:,} 篇")
-            break
-
-        record = enriched[idx]
-        attempted += 1
-        per_request_timeout = min(
-            float(NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT),
-            max(1.0, remaining_batch),
+    def fetch_candidate(candidate):
+        index, _, _, _, _ = candidate
+        record = enriched[index]
+        body = _fetch_article_body(
+            str(record.get("url", "") or "").strip(),
+            request_timeout=float(NEWS_FAST_HYBRID_BODY_FETCH_REQUEST_TIMEOUT),
+            max_bytes=NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES,
+            hard_deadline_seconds=float(NEWS_FAST_HYBRID_BODY_FETCH_BATCH_TIMEOUT),
         )
-        try:
-            body = _fetch_article_body(
-                str(record.get("url", "") or "").strip(),
-                request_timeout=per_request_timeout,
-                max_bytes=NEWS_FAST_HYBRID_BODY_FETCH_MAX_BYTES,
-                hard_deadline_seconds=remaining_batch,
-            )
-        except Exception as e:
-            print(f"⚠️ RSS 混合模式原文抓取失敗：{record.get('title', '')[:36]}｜{e}")
-            continue
+        return index, body
 
-        body = _normalize_news_text(body)
-        body_ok = (
-            _is_valid_article_body(
-                body,
-                title=record.get("title", ""),
-                description=record.get("description", ""),
+    executor = ThreadPoolExecutor(max_workers=max(1, min(2, len(candidates))))
+    future_map = {executor.submit(fetch_candidate, candidate): candidate for candidate in candidates}
+    pending = set(future_map)
+    try:
+        while pending:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending,
+                timeout=min(0.2, max(0.05, remaining)),
+                return_when=FIRST_COMPLETED,
             )
-            and _passes_news_quality_gate(
-                record.get("title", ""),
-                body,
-                stock_code,
-                stock_name,
-            )
-        )
-        if not body_ok:
-            print(f"ℹ️ RSS 混合模式未取得可用原文，保留摘要：{record.get('title', '')[:36]}")
-            continue
+            for future in done:
+                candidate = future_map[future]
+                index = candidate[0]
+                record = enriched[index]
+                try:
+                    _, body = future.result()
+                except Exception as exc:
+                    print(f"⚠️ 混合新聞原文抓取失敗：{record.get('title', '')[:36]}｜{exc}")
+                    continue
+                body = _normalize_news_text(body)
+                body_ok = (
+                    _is_valid_article_body(
+                        body,
+                        title=record.get("title", ""),
+                        description=record.get("description", ""),
+                    )
+                    and _passes_news_quality_gate(
+                        record.get("title", ""),
+                        body,
+                        stock_code,
+                        stock_name,
+                    )
+                )
+                if not body_ok:
+                    continue
+                record["content"] = body
+                record["body_ok"] = True
+                record["fallback_ok"] = False
+                record["content_source"] = "hybrid_article"
+                record["body_length"] = len(body)
+                record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
+                upgraded += 1
+                print(f"✅ 混合新聞補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
+    finally:
+        if pending:
+            for future in pending:
+                future.cancel()
+            print(f"⚠️ 混合新聞原文整批逾時，略過剩餘 {len(pending):,} 篇")
+        executor.shutdown(wait=False, cancel_futures=True)
 
-        record["content"] = body
-        record["body_ok"] = True
-        record["fallback_ok"] = False
-        record["content_source"] = "hybrid_article"
-        record["body_length"] = len(body)
-        record["relevance_score"] = _score_news_article_relevance(record, stock_code, stock_name)
-        upgraded += 1
-        print(f"✅ RSS 混合模式補到原文：{record.get('title', '')[:36]}｜{len(body):,} 字")
-
-    # 原文優先，再依相關性排序；相同條件保留原始順序。
     indexed = list(enumerate(enriched))
     indexed.sort(
         key=lambda item: (
@@ -10082,9 +8651,10 @@ def _enrich_fast_news_records_with_topk_bodies(
             item[0],
         )
     )
-    elapsed = time.perf_counter() - fetch_started
-    print(f"⏱️ RSS 混合模式原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{attempted} 篇")
+    elapsed = time.perf_counter() - started
+    print(f"⏱️ 混合新聞原文補抓：{elapsed:.2f} 秒｜成功 {upgraded}/{len(candidates)} 篇")
     return [record for _, record in indexed]
+
 
 
 def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock_name: str = "") -> List[dict]:
@@ -10103,7 +8673,14 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         raw_content = _normalize_news_text(rec.get("content", ""))
         description = _normalize_news_text(rec.get("description", ""))
         content_source = str(rec.get("content_source", ""))
-        is_fast_rss = content_source in ("google_news_rss_fast", "rss_description", "manual")
+        is_fast_rss = content_source in (
+            "google_news_rss_fast",
+            "rss_description",
+            "rss_title_fact",
+            "finmind_description",
+            "finmind_title_fact",
+            "manual",
+        )
 
         inferred_name = _extract_company_name_near_code(f"{title} {description} {raw_content}", stock_code)
         if inferred_name and inferred_name not in STOCK_NEWS_ALIAS_MAP.get(str(stock_code).strip(), []):
@@ -10151,7 +8728,12 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
             focused_content = raw_content
             focused_norm = _normalize_news_text(focused_content)
 
-        if len(focused_norm) < (20 if is_fast_rss else 40):
+        focused_min_len = (
+            8
+            if content_source in ("rss_title_fact", "finmind_title_fact")
+            else 20 if is_fast_rss else 40
+        )
+        if len(focused_norm) < focused_min_len:
             print(f"⚠️ 略過多股混雜新聞：{title[:36]}｜找不到足夠的 {stock_code} {stock_name} 明確片段")
             continue
 
@@ -10170,10 +8752,12 @@ def _build_gemini_news_articles(records: List[dict], stock_code: str = "", stock
         usable.append({
             "id": f"A{len(usable) + 1}",
             "source": rec.get("source", ""),
+            "source_family": rec.get("source_family", rec.get("source", "")),
             "title": title,
             "published": rec.get("published", ""),
             "url": rec.get("url", ""),
             "content_source": content_source,
+            "finmind_title_only": bool(rec.get("finmind_title_only")),
             "event_key": event_key,
             "target_aliases": aliases,
             "body": focused_content[:NEWS_MAX_ARTICLE_CHARS_TO_GEMINI],
@@ -10237,7 +8821,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 你是台股財經新聞編輯。只能使用下方素材，整理 {stock_code} {display_name} 的新聞／題材重點，使用繁體中文。
 
 分析原則：
-1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，只有「不同事件」才能分成不同點；寧可只輸出 1 點，也不得為了湊點數拆分同一事件。同一月份營收、同一份財報、同一公告或同一法人報告，即使來源、標題、source_id 不同，也只能保留 1 點；不得拿股價漲跌、熱門排行或大盤盤勢湊數。
+1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，只有「不同事件」才能分成不同點；若素材中有 3 個直接相關且具體的不同事件，優先完整輸出 3 點；只有 2 個就輸出 2 點，只有 1 個才輸出 1 點。同一月份營收、同一份財報、同一公告或同一法人報告，即使來源、標題、source_id 不同，也只能保留 1 點；不得拿股價漲跌、熱門排行或大盤盤勢湊數。
 2. 每個 points item 必須回傳 label、status、detail、tone、confidence、source_id、evidence；status 不可寫「重點待確認」「題材待觀察」等空句。
 2-1. tone 只能是 positive、negative、neutral、mixed、watch：明確利多用 positive，明確利空用 negative，正負並存用 mixed，無明確方向用 neutral，單純後續觀察用 watch。
 2-2. 「受關注」不等於 positive；創新高必須確認是營收、獲利、毛利率、接單等正向指標，若是虧損、庫存、負債創高則為 negative。
@@ -10245,9 +8829,9 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向，例如「6月營收年增328%創新高」「DRAM供給緊縮推升報價」；不得只寫 2～4 字的詞，如「創新高」「供給緊縮」「需求強勁」。status 不要以 {display_name} 或股票代號 {stock_code} 開頭（圖卡主體已是該公司）。
 3. 每點必須附 source_id（文章編號）與 evidence（逐字抄自該文章、能直接支持這個結論的一句原文，不可改寫）。evidence 所在句或其前一句必須明確出現 {stock_code} 或 {display_name}，可接受「公司名建立主體，下一句以公司承接」的寫法；文章若只是順帶提到本公司、主體是產業或其他公司，不得使用。
 4. 若所有素材都沒有以 {display_name} 為主體的具體事件，points 回傳空陣列 []，這是正確行為，嚴禁硬湊。
-5. 所有數字必須使用阿拉伯數字，而且必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。
+5. 所有數字與單位必須原樣存在於素材；不得換算、推估或補充素材沒有的數字。素材寫「500億元」時必須維持「500億元」，禁止改成「50000000000元」；素材寫「1.5億」時不得改成「150000000」。
 6. 只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點；不得寫權證、分點、K線、均線、買賣建議、網址或媒體資訊。每點需獨立完整、自然收尾並以句號結束。
-7. detail 必須包含事件具體內容（優先保留素材中的關鍵數字），以及對營運的意涵或後續觀察；請寫成 2 個短句並以句號分隔：第一句講事件與關鍵數字，第二句講營運意涵或後續觀察。少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄。超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可先保留完整事實，程式端會自動裁到最後一個完整句號；不得只寫「後續持續關注」等空泛句。
+7. detail 必須寫成與本週重點同等完整的 2 個短句，總長度控制在 {NEWS_SUMMARY_DETAIL_MIN_CHARS}～{NEWS_SUMMARY_DETAIL_MAX_CHARS} 字：第一句交代事件、關鍵數字與方向，第二句說明對營運的意涵或具體後續觀察。不得只寫「後續持續關注」等空泛句，也不得為了縮短而只保留第一句。
 
 好範例：
 - {{"label":"公司動態","status":"取得12億元大單、下半年出貨","detail":"公司取得新客戶大單，金額約12億元、預計下半年開始出貨。後續觀察產能配置與營收認列時程，若如期放量將挹注第4季營運動能。","tone":"positive","confidence":0.92,"source_id":"A1","evidence":"{display_name}取得金額約12億元的新客戶大單，預計下半年開始出貨"}}
@@ -10297,7 +8881,6 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
     if ungrounded:
         content_problems.append("含素材找不到的數字：" + _format_ungrounded_number_problems(ungrounded))
     detail_length_problems = _find_news_detail_length_problems(points)
-    length_only_points = _build_news_length_only_payload(points)
     if (
         len(points) >= NEWS_SUPPLEMENT_TRIGGER_POINTS
         and _count_summary_chars(points) < NEWS_SUMMARY_MIN_TOTAL_CHARS
@@ -10313,34 +8896,58 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             f"{rejected.get('reason', '')}｜{str(rejected.get('point', ''))[:80]}"
         )
 
-    # 0 點本身不算問題；只有格式、數字或 evidence 被刪除時才 repair。
-    if problems or rejected_points:
+    needs_distinct_event_completion = bool(
+        NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        and len(usable_articles) >= NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
+    )
+    if (
+        NEWS_GEMINI_SUPPLEMENT_ENABLE
+        and len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
+        and len(usable_articles) < NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
+    ):
+        print(
+            f"ℹ️ 新聞不同事件補充未觸發：驗證後 {len(points)} 點｜"
+            f"合格文章 {len(usable_articles)} 篇｜至少需要 {NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES} 篇"
+        )
+
+    # 最多只再呼叫一次 Gemini：同一輪完成格式補正、保留合格題材與補充不同事件。
+    combined_repair_needed = bool(
+        ((problems or rejected_points) and NEWS_GEMINI_REPAIR_ENABLE)
+        or needs_distinct_event_completion
+    )
+    if combined_repair_needed:
         log_problems = list(problems)
         log_problems.extend(
             str(item.get("reason", "") or "evidence 驗證失敗")
             for item in rejected_points
         )
-        print("⚠️ Gemini 新聞重點需要補正：" + "；".join(log_problems))
+        if needs_distinct_event_completion:
+            log_problems.append(
+                f"目前僅 {len(points)} 點，但有 {len(usable_articles)} 篇不同事件素材可補充"
+            )
+        print("⚠️ Gemini 新聞重點進入一次性補正／補點：" + "；".join(log_problems))
+
         repair_payload = {
             "content_or_format_problems": content_problems,
             "evidence_deleted_points": rejected_points,
-            "length_only_points_to_preserve": length_only_points,
-            "original_points": points,
+            "validated_points_to_preserve": points,
+            "validated_source_ids": accepted_source_ids,
+            "need_distinct_event_completion": needs_distinct_event_completion,
             "articles": usable_articles,
         }
         repair_prompt = f"""
-你是台股財經新聞編輯。上一版輸出未通過檢查，請只依修正資料重新整理 {stock_code} {display_name}。
+你是台股財經新聞編輯。上一版輸出未完全通過檢查，請只依修正資料重新輸出 {stock_code} {display_name} 的「最終完整 points 清單」。
 
 修正原則：
-1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，而且每點必須是不同事件；同一月份營收、同一份財報、同一公告或同一法人報告不論來源多少都只能保留 1 點。寧可只輸出 1 點，也不得湊滿。每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。
-2. 每點必須獨立完整；tone 只能是 positive、negative、neutral、mixed、watch，並依事件真正方向判斷，不得把「受關注」直接當利多。
-2-4. status 必須是 8～14 字的具體結論短句，需包含事件主體或數據方向；不得只寫「創新高」「供給緊縮」「需求強勁」等 2～4 字詞語。status 不要以 {display_name} 或股票代號 {stock_code} 開頭（圖卡主體已是該公司）。
-3. source_id 必須存在於 articles；evidence 必須逐字抄自該文章的一句原文，而且 evidence 所在句或其前一句必須明確出現 {stock_code} 或 {display_name}。
-4. 只有 evidence_deleted_points 中因 evidence／公司主體驗證被刪除的點，其題材才不得換句話說重現；除非提供另一句全新且通過規則的原文 evidence。
-4-1. length_only_points_to_preserve 不是事實錯誤，題材必須保留；請沿用原本 source_id、evidence、數字與事件，只補足 detail 的營運意涵或後續觀察，不得因長度問題放棄該題材。
-5. 若沒有任何以 {display_name} 為主體的具體事件，回傳 points: []，不得硬湊。
-6. 每個阿拉伯數字都必須在 articles 的 title、published 或 body 中找到完全相同的數字；不得寫技術分析、權證、分點、買賣建議、網址或外部資訊。
-7. detail 必須同時包含具體事件內容（優先保留素材中的關鍵數字）與營運意涵或後續觀察；請寫成 2 個短句並以句號分隔：第一句講事件與關鍵數字，第二句講營運意涵或後續觀察。少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字視為內容太薄，超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。若有至少 2 個合格事件，全部 points 的有效總字數應達 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字以上。
+1. 最多輸出 {NEWS_SUMMARY_MAX_POINTS} 點，每點必須是不同事件；同一月份營收、同一份財報、同一公告或同一法人報告不論來源多少都只能保留 1 點。若素材中有 3 個直接相關且具體的不同事件，優先完整輸出 3 點；只有 2 個就輸出 2 點，只有 1 個才輸出 1 點，不得用股價漲跌或空泛題材湊數。
+2. validated_points_to_preserve 已通過本地 evidence、公司主體與數字驗證，除非與更完整的同事件版本重複，否則必須保留其題材與事實；再從其他文章補入不同事件。
+3. 每個 item 必須包含 label、status、detail、tone、confidence、source_id、evidence。status 必須是 8～14 字的具體結論短句，不要以 {display_name} 或 {stock_code} 開頭。
+4. detail 必須是 {NEWS_SUMMARY_DETAIL_MIN_CHARS}～{NEWS_SUMMARY_DETAIL_MAX_CHARS} 字的 2 個完整短句：第一句交代事件、關鍵數字與方向，第二句說明營運意涵或具體後續觀察。不得只寫「後續持續關注」；不得把完整內容縮成單句。
+5. source_id 必須存在於 articles；evidence 必須逐字抄自該文章的一句原文，且 evidence 所在句或前一句必須出現 {stock_code} 或 {display_name}。
+6. 所有數字與單位都必須原樣保留來源寫法。來源寫「500億元」時必須寫「500億元」，禁止換算成「50000000000元」；來源寫「1.5億」時不得改成「150000000」。不得推估、補充或跨文章借用數字。
+7. tone 只能是 positive、negative、neutral、mixed、watch；只寫公司新聞、重大訊息、營運、產業供需或具體法人觀點，不得寫權證、分點、K線、買賣建議、網址或媒體資訊。
+8. 找不到直接相關事件時可回傳 points: []，但不可刪掉已在 validated_points_to_preserve 中通過驗證的有效題材。
 
 只回傳符合 JSON Schema 的 JSON。
 
@@ -10349,7 +8956,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
 """
         repaired_text = _call_gemini_with_retry(
             repair_prompt,
-            cache_task=f"{_news_points_cache_task()}_repair_v27",
+            cache_task=f"{_news_points_cache_task()}_repair_complete_v32",
             stock_code=stock_code,
             stock_name=stock_name,
             write_cache=False,
@@ -10362,6 +8969,14 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             stock_code,
             stock_name,
         )
+        repaired_source_ids = _extract_validated_news_source_ids(
+            repaired_text or "",
+            usable_articles,
+            stock_code,
+            stock_name,
+        )
+        accepted_source_ids = list(dict.fromkeys(accepted_source_ids + repaired_source_ids))
+
         repaired_ungrounded = _find_ungrounded_number_tokens(
             repaired,
             number_grounding_source,
@@ -10372,8 +8987,7 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             or len(repaired) < NEWS_SUPPLEMENT_TRIGGER_POINTS
             or _count_summary_chars(repaired) >= NEWS_SUMMARY_MIN_TOTAL_CHARS
         )
-        # 不讓 repair 的空陣列覆蓋原本已通過 evidence 的內容；有 2 點以上時要達到 120 字門檻。
-        repaired_ok = (
+        repaired_ok = bool(
             not repaired_rejected
             and (not repaired or _points_are_independent_and_complete(repaired))
             and not repaired_ungrounded
@@ -10381,154 +8995,61 @@ def _summarize_news_with_gemini(records: List[dict], stock_code: str, stock_name
             and repaired_total_ok
             and (bool(repaired) or not points)
         )
-        repaired_source_ids = _extract_validated_news_source_ids(
-            repaired_text or "",
-            usable_articles,
-            stock_code,
-            stock_name,
-        )
+
         if repaired_ok:
-            points = repaired
-            accepted_source_ids = repaired_source_ids
-            problems = []
-            rejected_points = []
-            print(f"✅ Gemini 新聞補正完成：{len(points)} 點")
+            # 補正稿應是完整清單；若模型意外漏掉原本合格點，合併後再做事件去重。
+            points = _merge_distinct_news_points(
+                repaired,
+                points,
+                stock_code,
+                stock_name,
+            )
+            print(
+                f"✅ Gemini 新聞一次性補正／補點完成：{len(points)} 點｜"
+                f"總字數約 {_count_summary_chars(points)} 字"
+            )
         else:
-            accepted_source_ids = list(dict.fromkeys(accepted_source_ids + repaired_source_ids))
             for rejected in repaired_rejected:
                 print(
-                    "⚠️ Gemini 新聞補正後 evidence 仍不合格："
+                    "⚠️ Gemini 新聞一次性補正後 evidence 仍不合格："
                     f"{rejected.get('reason', '')}｜{str(rejected.get('point', ''))[:80]}"
                 )
             if repaired_ungrounded:
                 print(
-                    "⚠️ Gemini 新聞補正後仍有無依據數字："
+                    "⚠️ Gemini 新聞一次性補正後仍有無依據數字："
                     + _format_ungrounded_number_problems(repaired_ungrounded)
                 )
             if repaired_detail_problems:
-                print("⚠️ Gemini 新聞補正後 detail 仍過短：" + "；".join(repaired_detail_problems))
+                print(
+                    "⚠️ Gemini 新聞一次性補正後 detail 仍過短："
+                    + "；".join(repaired_detail_problems)
+                )
             if not repaired_total_ok:
                 print(
-                    f"⚠️ Gemini 新聞補正後總字數約 {_count_summary_chars(repaired)} 字，"
+                    f"⚠️ Gemini 新聞一次性補正後總字數約 {_count_summary_chars(repaired)} 字，"
                     f"仍低於 {NEWS_SUMMARY_MIN_TOTAL_CHARS} 字"
                 )
-            if points and not repaired:
-                print("⚠️ Gemini 新聞補正回傳空陣列，保留原本已通過 evidence 的新聞點")
-            # repair 仍失敗，只保留已通過 evidence、數字與完整句驗證的點。
-            candidate_points = repaired if len(repaired) >= len(points) else points
-            points = _filter_points_with_grounded_numbers(
-                candidate_points,
+
+            valid_repaired = _filter_points_with_grounded_numbers(
+                repaired,
                 number_grounding_source,
-                "新聞重點",
+                "新聞一次性補正",
             )
-            points = [
+            valid_repaired = [
                 point
-                for point in points
-                if _points_are_independent_and_complete([point])
+                for point in valid_repaired
+                if not _find_news_detail_length_problems([point])
+                and _points_are_independent_and_complete([point])
             ]
-
-    # 驗證後少於 2 點，但仍有至少 3 篇合格文章時，再額外嘗試一次不同事件補點。
-    # 補回來的點仍走完全相同的 source_id、evidence、公司主體、數字與 detail 長度驗證。
-    if (
-        len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
-        and len(usable_articles) < NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
-    ):
-        print(
-            f"ℹ️ 新聞補點未觸發：驗證後 {len(points)} 點｜合格文章 {len(usable_articles)} 篇｜"
-            f"至少需要 {NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES} 篇"
-        )
-
-    if (
-        len(points) < NEWS_SUPPLEMENT_TRIGGER_POINTS
-        and len(usable_articles) >= NEWS_SUPPLEMENT_MIN_USABLE_ARTICLES
-    ):
-        remaining_slots = max(0, NEWS_SUMMARY_MAX_POINTS - len(points))
-        if remaining_slots > 0:
-            supplement_schema = _build_gemini_points_response_schema(
-                min_points=0,
-                max_points=remaining_slots,
-                include_note=True,
-                include_news_grounding=True,
-            )
-            supplement_payload = {
-                "existing_points": points,
-                "used_source_ids": accepted_source_ids,
-                "articles": usable_articles,
-            }
-            supplement_prompt = f"""
-你是台股財經新聞編輯。{stock_code} {display_name} 的第一輪新聞驗證後只留下 {len(points)} 點，請從其他文章補充不同事件。
-
-補點規則：
-1. 只輸出新增的點，不要重寫 existing_points；最多補 {remaining_slots} 點，找不到就回傳空陣列。
-2. 優先使用 used_source_ids 以外的文章，且事件不得與 existing_points 重複；可涵蓋公司動態、業績、產業供需或具體法人觀點。
-3. 每點必須包含 label、status、detail、tone、confidence、source_id、evidence。status 必須是 8～14 字的具體結論短句，且不要以 {display_name} 或股票代號 {stock_code} 開頭。detail 需包含具體事件內容（優先保留關鍵數字）與營運意涵或後續觀察，並寫成 2 個短句，以句號分隔事件事實與營運意涵；不得少於 {NEWS_SUMMARY_DETAIL_MIN_CHARS} 字，若超過 {NEWS_SUMMARY_DETAIL_MAX_CHARS} 字可保留完整事實，程式端會自動裁成完整句。
-4. evidence 必須逐字抄自 source_id 對應文章的一句原文；evidence 所在句或前一句必須出現 {stock_code} 或 {display_name}。
-5. 所有阿拉伯數字必須原樣存在於素材；不得推估、換算、引用外部資料，不得寫權證、分點、技術分析或買賣建議。
-6. 無法找到另一個直接相關且具體的事件時，points 回傳 []，寧缺勿濫。
-
-只回傳符合 JSON Schema 的 JSON。
-
-補點資料：
-{json.dumps(supplement_payload, ensure_ascii=False, indent=2)}
-"""
-            print(
-                f"🧩 新聞補點：驗證後 {len(points)} 點｜合格文章 {len(usable_articles)} 篇｜"
-                f"最多補 {remaining_slots} 點"
-            )
-            supplement_text = _call_gemini_with_retry(
-                supplement_prompt,
-                cache_task=f"{_news_points_cache_task()}_supplement_v27",
-                stock_code=stock_code,
-                stock_name=stock_name,
-                write_cache=False,
-                response_schema=supplement_schema,
-                temperature=GEMINI_ANALYSIS_TEMPERATURE,
-            )
-            supplement_points, supplement_rejected = _parse_gemini_news_points(
-                supplement_text or "",
-                usable_articles,
+            points = _merge_distinct_news_points(
+                points,
+                valid_repaired,
                 stock_code,
                 stock_name,
             )
-            supplement_ungrounded = _find_ungrounded_number_tokens(
-                supplement_points,
-                number_grounding_source,
+            print(
+                f"ℹ️ 一次性補正未完全通過，保留本地已驗證結果：{len(points)} 點"
             )
-            for rejected in supplement_rejected:
-                print(
-                    "⚠️ Gemini 新聞補點 evidence 驗證刪除："
-                    f"{rejected.get('reason', '')}｜{str(rejected.get('point', ''))[:80]}"
-                )
-            if supplement_ungrounded:
-                print(
-                    "⚠️ Gemini 新聞補點含無依據數字，已移除相關點："
-                    + _format_ungrounded_number_problems(supplement_ungrounded)
-                )
-                supplement_points = _filter_points_with_grounded_numbers(
-                    supplement_points,
-                    number_grounding_source,
-                    "新聞補點",
-                )
-            valid_supplement_points = []
-            for point in supplement_points:
-                detail_problems = _find_news_detail_length_problems([point])
-                if detail_problems:
-                    print("⚠️ Gemini 新聞補點 detail 過短，已刪除：" + "；".join(detail_problems))
-                    continue
-                if not _points_are_independent_and_complete([point]):
-                    continue
-                valid_supplement_points.append(point)
-
-            before_count = len(points)
-            points = _merge_distinct_news_points(points, valid_supplement_points, stock_code, stock_name)
-            added_count = max(0, len(points) - before_count)
-            if added_count > 0:
-                print(
-                    f"✅ Gemini 新聞補點完成：新增 {added_count} 點｜"
-                    f"合計 {len(points)} 點｜總字數約 {_count_summary_chars(points)} 字"
-                )
-            else:
-                print("ℹ️ Gemini 新聞補點未找到另一個通過驗證的不同事件，保留原結果")
 
     points = _dedupe_news_points_by_event(
         points,
@@ -11009,8 +9530,6 @@ def _build_price_volume_pattern_payload(ctx: dict, n_bins: int = 40) -> dict:
     }
 
 
-
-
 def _build_technical_card_summary(ctx: dict) -> dict:
     """依圖上已計算的均線 / 價量型態，產生下方技術面卡片文字。
 
@@ -11230,7 +9749,6 @@ def _get_weekly_institutional_context(ctx: dict) -> dict:
     }
 
 
-
 def _derive_technical_tone_from_ctx(ctx: dict) -> str:
     """技術面顏色只依程式已計算的技術卡片結果，不依 AI 新詞猜測。"""
     try:
@@ -11243,6 +9761,52 @@ def _derive_technical_tone_from_ctx(ctx: dict) -> str:
     if any(k in headline for k in ["站上均線", "偏強", "多頭排列", "黃金交叉", "突破"]):
         return "positive"
     return "neutral"
+
+
+def _infer_face_label_from_text(text, fallback="重點面"):
+    """依自由文字推斷週報面向，供模組層級 fallback 與畫圖流程共用。"""
+    s = str(text or "")
+    if any(k in s for k in ["技術", "均線", "K線", "布林", "跌破", "站回", "量能", "型態", "價量"]):
+        return "技術面"
+    if any(k in s for k in ["權證", "分點", "資金流", "買超", "賣超", "淨流入", "淨流出"]):
+        return "權證面"
+    if any(k in s for k in ["法人", "外資", "投信", "自營", "三大法人"]):
+        return "法人面"
+    if any(k in s for k in ["新聞", "營收", "產業", "題材", "法說", "訂單", "毛利"]):
+        return "新聞面"
+    if any(k in s for k in ["下週", "觀察", "追蹤", "留意"]):
+        return "下週觀察"
+    return fallback
+
+
+def _infer_status_from_text(text, fallback="重點待確認"):
+    """依自由文字推斷簡短狀態，供純文字 fallback 與畫圖流程共用。"""
+    s = str(text or "")
+    if "營收" in s and "年增" in s and "月減" in s:
+        return "偏多"
+    if _has_negative_target_price_or_rating(s):
+        return "偏弱"
+    if _has_positive_target_price_or_rating(s):
+        return "偏多"
+    if _has_neutral_target_price_or_rating(s):
+        return "中性觀察"
+    if any(k in s for k in [
+        "轉強", "買超", "資金流入", "淨流入", "站回", "突破", "月增", "年增", "正向",
+        "利多", "傳捷報", "捷報", "看好", "看旺", "調升", "上修", "評等調升",
+        "接單", "訂單", "受惠", "成長", "需求強勁", "需求延續", "AI散熱", "液冷", "營運看旺",
+    ]):
+        return "偏多"
+    if any(k in s for k in [
+        "轉弱", "賣壓", "跌破", "空頭", "空頭排列", "均線空頭", "死亡交叉", "均線死亡交叉",
+        "死叉", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞",
+        "衰退", "需求疲弱",
+    ]):
+        return "偏弱"
+    if "月減" in s and "年增" not in s:
+        return "偏弱"
+    if any(k in s for k in ["中性", "觀望", "待確認", "有限", "接近中性"]):
+        return "中性觀察"
+    return fallback
 
 
 def _canonicalize_weekly_point_structure(point: str, ctx: dict) -> str:
@@ -11479,12 +10043,19 @@ def _build_weekly_llm_payload(ctx: dict, stock_name: str) -> dict:
         for d in (ctx.get("report_dates") or [])
         if pd.notna(d)
     })
-    current_report_dates = report_dates[-WEEK_TRADING_DAYS:] if report_dates else []
-    previous_report_dates = (
-        report_dates[-WEEK_TRADING_DAYS * 2:-WEEK_TRADING_DAYS]
-        if len(report_dates) > WEEK_TRADING_DAYS
-        else []
+    current_start, current_end, current_report_dates = _resolve_report_week_range(
+        report_dates,
+        fallback_count=WEEK_TRADING_DAYS,
     )
+    if report_dates and pd.notna(current_start):
+        previous_end_boundary = current_start - pd.Timedelta(days=1)
+        previous_start_boundary = previous_end_boundary - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+        previous_report_dates = [
+            d for d in report_dates
+            if previous_start_boundary <= d <= previous_end_boundary
+        ]
+    else:
+        previous_report_dates = []
     previous_week_start = previous_report_dates[0] if previous_report_dates else pd.NaT
     previous_week_end = previous_report_dates[-1] if previous_report_dates else pd.NaT
 
@@ -11709,7 +10280,6 @@ def _weekly_points_cover_required_representative_analysis(points: List[str], ctx
     return True
 
 
-
 def _weekly_points_cover_required_pattern_analysis(points: List[str], ctx: dict) -> bool:
     pattern = _build_price_volume_pattern_payload(ctx)
     if not pattern.get("available"):
@@ -11850,7 +10420,6 @@ def _weekly_points_conditionally_cover_pattern(points: List[str], ctx: dict) -> 
     return _weekly_points_cover_required_pattern_analysis(points, ctx)
 
 
-
 def _validate_weekly_points(
     points: List[str],
     payload: dict,
@@ -11976,58 +10545,6 @@ def _repair_weekly_expert_points(
     return _parse_weekly_gemini_points(output_text or "")
 
 
-def _repair_weekly_points_with_required_branch(
-    points: List[str],
-    payload: dict,
-    ctx: dict,
-    stock_name: str,
-) -> List[str]:
-    """相容舊流程：若需強制補充分點資料，仍使用同一套 JSON 與接地規則。"""
-    required = payload.get("required_representative_branch_analysis")
-    if not required:
-        return points
-
-    stock_code = str(ctx.get("stock_code", "") or "")
-    repair_payload = {
-        "required_representative_branch_analysis": required,
-        "required_price_volume_pattern_analysis": payload.get("price_volume_pattern", {}),
-        "original_points": [str(p or "").strip() for p in points if str(p or "").strip()],
-        "full_weekly_data": payload,
-    }
-    response_schema = _build_gemini_points_response_schema(
-        min_points=3,
-        max_points=3,
-        include_note=False,
-    )
-    repair_prompt = f"""
-你是專業且中立的台股研究員。上一版漏掉必要的代表性分點資料，請只依修正資料重寫。
-
-原則：
-1. 剛好 3 點；前 2 點為本週分析，第 3 點的 label 必須是「下週觀察」。
-2. 每個 item 必須包含 label、status、detail、tone、confidence、evidence；第 3 點 label 為「下週觀察」且 tone 為 watch。
-2-1. tone 只能是 positive、negative、neutral、mixed、watch，並依數據方向判斷。
-3. 其中 1 點完整使用 required_representative_branch_analysis，包含分點名稱、本週方向與金額、勝率、平均持有天數與歷史加權報酬率。
-4. 另 1 點使用均線訊號與程式判定價量型態；不得羅列均線價格或只寫 KD、MACD。
-5. 優先比較 previous_week_comparison，指出延續、反轉或分歧。
-6. 每個數字都必須存在於 full_weekly_data；不得補數字、誇大法人中性訊號或提供買賣建議。
-
-只回傳符合 JSON Schema 的 JSON。
-
-修正資料：
-{json.dumps(repair_payload, ensure_ascii=False, indent=2)}
-"""
-    output_text = _call_gemini_with_retry(
-        repair_prompt,
-        cache_task=f"{_weekly_keypoints_cache_task()}_required_branch_repair",
-        stock_code=stock_code,
-        stock_name=stock_name,
-        write_cache=False,
-        response_schema=response_schema,
-        temperature=GEMINI_ANALYSIS_TEMPERATURE,
-    )
-    return _parse_weekly_gemini_points(output_text or "")
-
-
 def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[str]:
     """讓 Gemini 比較本週與上週，只快取完整驗證通過的三點結果。"""
     if not WEEKLY_KEYPOINT_LLM_ENABLE:
@@ -12084,6 +10601,9 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
 
         if problems:
             print("⚠️ Gemini 本週重點與下週觀察需要修正：" + "；".join(problems))
+            if not WEEKLY_GEMINI_REPAIR_ENABLE:
+                print("⚡ 最快模式：略過第 2 次 Gemini repair，直接使用既有條件式備援")
+                return []
             repaired_points = _repair_weekly_expert_points(
                 points,
                 payload,
@@ -12122,81 +10642,6 @@ def _summarize_weekly_context_with_gemini(ctx: dict, stock_name: str) -> List[st
         return points[:3]
     except Exception as e:
         print(f"⚠️ Gemini 本週重點與下週觀察整理失敗，改用條件式備援：{e}")
-        return []
-
-def _summarize_news_with_openai(records: List[dict], stock_code: str, stock_name: str) -> List[str]:
-    """若有 OPENAI_API_KEY，優先用新聞內文整理成真正重點；失敗則自動走規則式摘要。"""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not NEWS_OPENAI_ENABLE or not api_key:
-        return []
-
-    blocks = []
-    total_len = 0
-    body_records = [r for r in records if r.get("body_ok") and _normalize_news_text(r.get("content", ""))]
-    for idx, rec in enumerate(body_records, 1):
-        content = _normalize_news_text(rec.get("content", ""))
-        sentences = _split_news_sentences(content)
-        if not sentences:
-            continue
-        clean_content = "。".join(sentences[:10])
-        if len(clean_content) < 60:
-            continue
-        title = _clean_news_title(rec.get("title", ""))
-        block = f"新聞{idx}\n標題：{title}\n內文：{clean_content[:1600]}"
-        blocks.append(block)
-        total_len += len(block)
-        if total_len >= 6500:
-            break
-
-    if not blocks:
-        return []
-
-    prompt = (
-        f"請根據以下一週內新聞內文，整理 {stock_code} {stock_name} 的新聞重點。\n"
-        "要求：\n"
-        "1. 最多輸出 3 點，每點 42 到 78 個中文字，說明必須是一句完整短句。\n"
-        "2. 只能根據『內文』重寫成重點，不要直接複製新聞標題或原句。\n"
-        "3. 不要出現『完整看』、『新聞線索』、『來源』、新聞網站名稱或多檔股名清單。\n"
-        "4. 每點要像財經新聞摘要，格式盡量為「短標籤：具體事件／數字／市場消息 + 對公司或產業的影響」，不要寫成空泛研究報告。\n"
-        "4-1. 不得輸出「法人尚未表態」「法人消息不足」「法人看法待確認」這類沒有資訊量的法人觀點；沒有具體券商、評等、目標價、EPS上修/下修或法人買賣超，就改寫其他有內容的新聞或直接少輸出。\n"
-        "5. 只聚焦公司本身可能影響股價的消息：公司產業、法人目標價/評等、EPS/每股純益、營收、毛利率、獲利、ASP/報價、接單出貨、產能與供需。\n"
-        "6. 若目標價、EPS、營收、ASP、毛利率或產業題材沒有明確指向本公司，請不要使用。\n"
-        "6-1. 必須確認新聞明確對應目標股票代號或公司名；若公司名稱相近，例如威健與威健生技這種不同公司，沒有目標股票代號就不得使用。\n"
-        "7. 若資料不足，寧可保守，不要臆測。\n\n"
-        + "\n\n".join(blocks)
-    )
-
-    try:
-        payload = {
-            "model": NEWS_OPENAI_MODEL,
-            "messages": [
-                {"role": "system", "content": "你是台股財經新聞編輯，輸出繁體中文、重點清楚、像新聞摘要，避免空泛分析語氣。"},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=(8, 40))
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        raw_points = []
-        for line in str(text).splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            line = re.sub(r"^[•\-–—\d\.、\)）\s]+", "", line).strip()
-            if line:
-                raw_points.append(line)
-        points = _clean_summary_points(raw_points)
-        if points:
-            print(f"✅ OpenAI 新聞摘要完成：{len(points)} 點")
-        return points
-    except Exception as e:
-        print(f"⚠️ OpenAI 新聞摘要失敗，改用規則式摘要：{e}")
         return []
 
 
@@ -12257,28 +10702,6 @@ def _infer_news_label_from_text(text: str, fallback_label: str = "新聞焦點")
     if re.search(r"公告|重大訊息|董事會|投資|合作|擴產|產能|接單|出貨|客戶", s):
         return "公司動態"
     return str(fallback_label or "新聞焦點").strip() or "新聞焦點"
-
-
-def _infer_news_conclusion(label: str, text: str) -> str:
-    s = _normalize_news_text(text)
-    if re.search(r"營收", s):
-        has_year_up = re.search(r"年增|年成長|YoY|同期高|創同期高|創高", s, re.I)
-        has_month_down = re.search(r"月減|月衰退|月增率-|-\d+(?:\.\d+)?%", s)
-        has_month_up = re.search(r"月增|月成長", s) and not has_month_down
-        if has_year_up and has_month_down:
-            return "營收表現偏正向，月減留待後續觀察。"
-        if has_year_up or has_month_up:
-            return "營收表現偏正向。"
-        return "營收變化是本週主要基本面訊息。"
-    if re.search(r"散熱|液冷|水冷", s, re.I):
-        return "AI散熱題材仍是市場焦點。"
-    if re.search(r"AI|伺服器|GPU|ASIC", s, re.I):
-        return "AI業務布局仍是市場焦點。"
-    if re.search(r"法人|評等|目標價|EPS|調升|調降", s):
-        return "市場預期仍在重新評估。"
-    if re.search(r"公告|重大訊息|董事會|投資|合作|擴產", s):
-        return "公司事件需觀察後續落地。"
-    return "本週新聞提供後續追蹤線索。"
 
 
 def _infer_news_watch(label: str, text: str) -> str:
@@ -12520,21 +10943,23 @@ def _rule_based_news_summary(records: List[dict], stock_code: str, stock_name: s
 def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str, allow_stale: bool = False) -> List[str]:
     """直接讀取 Google Sheet 的 news_points 快取，供新聞區塊顯示使用。
 
-    原本快取只在 _call_gemini_with_retry() 內讀取；如果 Google News 沒抓到素材，
+    原本快取只在 _call_gemini_with_retry() 內讀取；如果 FinMind 沒抓到素材，
     流程會在 build_news_points() 提早 return，導致永遠不會讀到 Google Sheet 快取。
     這個函式放在 build_news_points() 前面直接查快取，確保當天跑過的新聞摘要能直接被圖片使用。
     """
-    if not GSHEET_LLM_CACHE_ENABLE or LLM_CACHE_FORCE_REFRESH:
+    if LLM_CACHE_FORCE_REFRESH:
         return []
     stock_key = _clean_code(stock_code)
     if not stock_key:
         return []
 
-    cached_text = load_gsheet_llm_cache(_news_points_cache_task(), stock_key, stock_name, prompt="")
+    cached_text = load_daily_task_llm_cache(_news_points_cache_task(), stock_key)
+    if not cached_text and GSHEET_LLM_CACHE_ENABLE and GSHEET_LLM_CACHE_READ_ENABLE:
+        cached_text = load_gsheet_llm_cache(_news_points_cache_task(), stock_key, stock_name, prompt="")
     if cached_text:
         points = _clean_news_summary_points_for_stock(_parse_raw_points_from_llm(cached_text), stock_key, stock_name)
         if points:
-            print(f"📦 直接使用 Google Sheet 當日新聞快取：{stock_key}｜{len(points)} 點")
+            print(f"📦 直接使用當日新聞本機快取：{stock_key}｜{len(points)} 點")
             return points[:NEWS_DISPLAY_MAX_POINTS]
 
     if not allow_stale:
@@ -12592,31 +11017,29 @@ def _load_gsheet_news_points_cache_for_display(stock_code: str, stock_name: str,
     return []
 
 def _finalize_news_points_for_display(points: List[str], stock_code: str, stock_name: str, ctx: dict | None = None) -> List[str]:
-    """只顯示真正通過品質門檻的新聞，並在顯示前做最後一次事件級去重。"""
+    """只顯示真正通過品質門檻的新聞；結構化重點不得被一般標題分隔符誤刪。"""
     cleaned = _clean_news_summary_points_for_stock(points, stock_code, stock_name)
     cleaned = [p for p in cleaned if _points_are_independent_and_complete([p])]
     cleaned = _dedupe_news_points_by_event(
-        cleaned,
-        stock_code,
-        stock_name,
-        log_label="新聞顯示前",
+        cleaned, stock_code, stock_name, log_label="新聞顯示前"
     )
     return cleaned[:NEWS_DISPLAY_MAX_POINTS]
 
-def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None) -> List[str]:
-    """整理高品質公司新聞；允許 0 點，寧缺勿濫，不再強制補足顯示數量。"""
-    cached_points = _load_gsheet_news_points_cache_for_display(
-        stock_code,
-        stock_name,
-        allow_stale=False,
-    )
-    if cached_points:
-        return _finalize_news_points_for_display(
-            cached_points,
+def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | None = None, cache_lookup: bool = True) -> List[str]:
+    """整理高品質公司新聞；允許 0 點，寧缺勿濫，不強制補足顯示數量。"""
+    if cache_lookup:
+        cached_points = _load_gsheet_news_points_cache_for_display(
             stock_code,
             stock_name,
-            ctx,
+            allow_stale=False,
         )
+        if cached_points:
+            return _finalize_news_points_for_display(
+                cached_points,
+                stock_code,
+                stock_name,
+                ctx,
+            )
 
     records = _news_items_to_records(news_items)
     records = _enrich_fast_news_records_with_topk_bodies(
@@ -12647,12 +11070,20 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         )
         if content_ok or title_fact_ok:
             fallback_records.append(r)
-    usable_records = body_records + [r for r in fallback_records if r not in body_records]
 
+    usable_records = body_records + [r for r in fallback_records if r not in body_records]
+    usable_records = _dedupe_news_articles_by_event(
+        usable_records,
+        stock_code,
+        stock_name,
+        log_label="新聞管線送模前",
+    )
     if not usable_records:
-        # 沒有當期合格素材時直接回傳 0 點，不以舊日期新聞填補本週區塊。
+        # 沒有當期合格素材時直接回傳 0 點，不以舊日期新聞或大盤題材填補。
         return []
 
+    # 無論素材是完整摘要或 FinMind 原始標題，都使用同一套 Gemini 結構化規則、
+    # evidence 驗證、數字接地、事件級去重、repair 與 supplement 流程。
     ai_points = _summarize_news_with_gemini(
         usable_records,
         stock_code,
@@ -12694,7 +11125,6 @@ def build_news_points(stock_code: str, stock_name: str, news_items, ctx: dict | 
         )
         return final_points
 
-    # Gemini 與嚴格規則式備援都沒有合格事件時，保留 0 點，讓圖卡顯示固定文案。
     return []
 
 
@@ -12713,12 +11143,6 @@ def style_ax(ax, title=None, title_color=GOLD):
         ax.set_title(title, loc="left", fontsize=38, color=title_color, fontweight="bold", pad=14)
     ax.yaxis.label.set_color(MUTED)
     ax.xaxis.label.set_color(MUTED)
-
-
-def add_panel_title(ax, title, subtitle=""):
-    ax.text(0.01, 0.96, title, transform=ax.transAxes, ha="left", va="top", color=TEXT, fontsize=16, fontweight="bold")
-    if subtitle:
-        ax.text(0.01, 0.86, subtitle, transform=ax.transAxes, ha="left", va="top", color=MUTED, fontsize=11)
 
 
 def add_weighted_volume_profile_overlay(ax, df: pd.DataFrame, n_bins: int = 40, color="#38BDF8", alpha=0.15, scale=1.08):
@@ -12990,12 +11414,10 @@ def adjust_institutional_ylim(ax, plot_df: pd.DataFrame):
     ax.set_ylim(y_min - lower_pad, y_max + upper_pad)
 
 
-
-
 def build_institutional_axis_df(plot_df: pd.DataFrame, stock_df: pd.DataFrame) -> pd.DataFrame:
     """建立三大法人圖專用日期軸。
 
-    股價資料來源（yfinance）有時會比 FinMind 三大法人晚一天，原本三大法人圖完全綁定
+    股價資料有時會比 FinMind 三大法人晚一天，原本三大法人圖完全綁定
     plot_df.index，因此即使 FinMind 已經更新最新一日，也會被股價日期軸排除。
     這裡會保留原本股價日期，再補上 stock_df.attrs["institutional_df"] 中較新的法人日期，
     讓三大法人資料能更新就先顯示。
@@ -13090,31 +11512,34 @@ def add_center_watermarks(fig):
     except Exception:
         pass
 
-def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict], precomputed_news_points: List[str] | None = None):
-    ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame, warrant_events: pd.DataFrame, news_items: List[dict], precomputed_news_points: List[str] | None = None, precomputed_ctx: dict | None = None):
+    ctx = precomputed_ctx if isinstance(precomputed_ctx, dict) else build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
     ctx["stock_code"] = stock_code
     plot_df = ctx["plot_df"].copy()
     plot_events = ctx["plot_events"]
     week_events = ctx["week_events"]
     x = list(range(len(plot_df)))
-    date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in plot_df.index]
 
     # 權證資金流改用「股價日期 + 權證事件日期」合併日期軸。
-    # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
+    # 避免股價最新日尚未更新，但 FinMind 權證分點資料已經有今日資料時，
     # 今日權證資金流被 plot_df.index.max() 擋掉。
     warrant_flow_dates = build_flow_axis_dates(plot_df, plot_events)
     warrant_x = list(range(len(warrant_flow_dates)))
     warrant_date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in warrant_flow_dates]
     daily_net = daily_warrant_net_from_dates(warrant_flow_dates, plot_events)
 
-    # 三大法人圖允許使用 FinMind 已更新、但 yfinance 股價尚未更新的最新法人日期。
+    # 三大法人圖允許使用 FinMind 已更新、但股價尚未更新的最新法人日期。
     inst_plot_df = build_institutional_axis_df(plot_df, stock_df)
     x_inst = list(range(len(inst_plot_df)))
 
     # 精選分點資金流改用「股價日期 + 精選分點權證事件日期」合併日期軸。
-    # 避免 yfinance 股價最新日尚未更新，但 MoneyDJ / Google Sheet 權證分點資料已經有今日資料時，
+    # 避免股價最新日尚未更新，但 FinMind 權證分點資料已經有今日資料時，
     # 今日精選分點大買 / 大賣被 plot_df.index.max() 擋掉。
-    selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
+    selected_branch_events_all = ctx.get("_selected_branch_events_all_cache")
+    if selected_branch_events_all is None:
+        selected_branch_events_all = filter_selected_branch_flow_events(warrant_events)
+    else:
+        selected_branch_events_all = selected_branch_events_all.copy()
     selected_flow_dates = build_flow_axis_dates(plot_df, selected_branch_events_all)
     selected_x = list(range(len(selected_flow_dates)))
     selected_date_labels = [pd.Timestamp(d).strftime("%m-%d") for d in selected_flow_dates]
@@ -13124,14 +11549,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             selected_flow_dates[0],
             selected_flow_dates[-1],
         )
-        selected_week_dates = selected_flow_dates[-WEEK_TRADING_DAYS:]
-        selected_week_start = selected_week_dates[0]
-        selected_week_end = selected_week_dates[-1]
+        selected_week_start = ctx.get("week_start", pd.NaT)
+        selected_week_end = ctx.get("week_end", pd.NaT)
         selected_branch_week_events = filter_events_by_date_range(
             selected_branch_events,
             selected_week_start,
             selected_week_end,
-        )
+        ) if pd.notna(selected_week_start) and pd.notna(selected_week_end) else pd.DataFrame()
     else:
         selected_branch_events = pd.DataFrame()
         selected_branch_week_events = pd.DataFrame()
@@ -13194,8 +11618,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     ax_header = fig.add_subplot(gs[0, :])
     ax_header.set_axis_off()
     period = f"{ctx['week_start'].strftime('%Y/%m/%d')} - {ctx['week_end'].strftime('%Y/%m/%d')}" if pd.notna(ctx["week_start"]) else "-"
+    warrant_data_end = ctx.get("warrant_data_end", pd.NaT)
+    warrant_period_note = ""
+    if pd.notna(warrant_data_end) and pd.notna(ctx.get("week_end")) and pd.Timestamp(warrant_data_end).normalize() < pd.Timestamp(ctx.get("week_end")).normalize():
+        warrant_period_note = f"｜權證資料至 {pd.Timestamp(warrant_data_end).strftime('%Y/%m/%d')}"
     ax_header.text(0.01, 0.50, f"{stock_code} {stock_name}｜權證資金流週報", color=GOLD, fontsize=68, fontweight="bold", ha="left", va="center")
-    ax_header.text(0.01, -0.10, f"週報區間：{period}｜資訊僅供參考", color=MUTED, fontsize=32, ha="left", va="center")
+    ax_header.text(0.01, -0.10, f"週報區間：{period}{warrant_period_note}｜資訊僅供參考", color=MUTED, fontsize=32, ha="left", va="center")
     ax_header.text(1.03, 0.62, "By 股市艾斯出品  請勿轉傳", color=GOLD, fontsize=30, fontweight="bold", ha="right", va="center")
 
     # Cards
@@ -13481,7 +11909,9 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
     draw_header_text_and_advance(selected_wnet_ax, xpos, f"累計 {fmt_money(selected_latest_cum)}", BLUE, gap_px=0)
 
-    selected_branch_label = "、".join(_get_selected_branch_flow_list())
+    selected_branch_names_for_render = list(ctx.get("_selected_branch_names_snapshot") or _get_selected_branch_flow_list())
+    selected_branch_label = "、".join(selected_branch_names_for_render)
+    print(f"🖼️ 圖片實際使用精選分點：{selected_branch_label or '未設定'}")
     if selected_branch_label:
         selected_wnet_ax.text(
             0.001, 0.985,
@@ -13628,8 +12058,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 clip_on=False,
                 zorder=6,
             )
-
-        notes_right_padding = 0.025
 
         def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=0, first_prefix="", next_prefix="", width_boost=1.0):
             """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
@@ -13830,20 +12258,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             # 最後才保留前段，但會去掉看起來未完成的尾巴。
             return finish(prefix)
 
-        def _infer_face_label_from_text(text, fallback="重點面"):
-            s = str(text or "")
-            if any(k in s for k in ["技術", "均線", "K線", "布林", "跌破", "站回", "量能", "型態", "價量"]):
-                return "技術面"
-            if any(k in s for k in ["權證", "分點", "資金流", "買超", "賣超", "淨流入", "淨流出"]):
-                return "權證面"
-            if any(k in s for k in ["法人", "外資", "投信", "自營", "三大法人"]):
-                return "法人面"
-            if any(k in s for k in ["新聞", "營收", "產業", "題材", "法說", "訂單", "毛利"]):
-                return "新聞面"
-            if any(k in s for k in ["下週", "觀察", "追蹤", "留意"]):
-                return "下週觀察"
-            return fallback
-
         GENERIC_STATUS_WORDS = {
             "偏多", "中性偏多", "偏多觀察", "偏弱", "中性偏弱", "偏弱整理", "偏弱觀察",
             "中性", "中性觀察", "觀望", "待確認", "方向未明", "仍待確認", "偏正向", "偏負向", "正向", "負向",
@@ -13975,33 +12389,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     derived = _derive_headline_from_body(label, body, fallback="")
                     raw = derived if 6 <= len(derived) <= max_chars else raw[:max_chars].rstrip("。；;，,、 ")
             return raw or fallback
-
-        def _infer_status_from_text(text, fallback="重點待確認"):
-            # 保留舊呼叫相容性；實際顯示時會再由 _compact_status_text 轉成具體短句。
-            s = str(text or "")
-            if "營收" in s and "年增" in s and "月減" in s:
-                return "偏多"
-            if _has_negative_target_price_or_rating(s):
-                return "偏弱"
-            if _has_positive_target_price_or_rating(s):
-                return "偏多"
-            if _has_neutral_target_price_or_rating(s):
-                return "中性觀察"
-            if any(k in s for k in [
-                "轉強", "買超", "資金流入", "淨流入", "站回", "突破", "月增", "年增", "正向",
-                "利多", "傳捷報", "捷報", "看好", "看旺", "調升", "上修", "評等調升",
-                "接單", "訂單", "受惠", "成長", "需求強勁", "需求延續", "AI散熱", "液冷", "營運看旺",
-            ]):
-                return "偏多"
-            if _has_negative_target_price_or_rating(s) or any(k in s for k in [
-                "轉弱", "賣壓", "跌破", "空頭", "空頭排列", "均線空頭", "死亡交叉", "均線死亡交叉", "死叉", "資金流出", "淨流出", "賣超", "年減", "利空", "調降", "下修", "看壞", "衰退", "需求疲弱",
-            ]):
-                return "偏弱"
-            if "月減" in s and "年增" not in s:
-                return "偏弱"
-            if any(k in s for k in ["中性", "觀望", "待確認", "有限", "接近中性"]):
-                return "中性觀察"
-            return fallback
 
         def _format_note_pct_value(value, digits=0, force_sign=False):
             try:
@@ -14380,7 +12767,6 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
         )
 
     # x ticks
-    interval = max(1, len(x) // 12)
     for ax in [candle_ax, vol_ax]:
         ax.set_xlim(-1, len(x))
     inst_ax.set_xlim(-1, len(x_inst))
@@ -14416,15 +12802,4331 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
 
 # ============================================================
+# FinMind-only 唯一市場資料來源
+# ============================================================
+# 市場資料正式只使用下方 FinMind 實作；歷史權證分點使用全市場 Parquet，最新交易日使用權證代號 API。
+# TWSE／TPEx 權證 OpenAPI 僅保留發行商辨識與當日成交量完整性驗證，不作為資金流來源。
+#
+# Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
+
+FINMIND_BUILD_VERSION = "2026-07-16-finmind-official-openapi-failsafe-v35"
+FINMIND_PERFORMANCE_PATCH = "official-preflight+selected-branch-crossprobe+probe-first+second-stage-no-reprobe+issuer-vectorized+timed-context"
+FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
+FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
+FINMIND_REQUEST_RETRIES = max(1, int(os.getenv("FINMIND_REQUEST_RETRIES", "5")))
+FINMIND_RETRY_BASE_WAIT = max(0.2, float(os.getenv("FINMIND_RETRY_BASE_WAIT", "1.5")))
+FINMIND_CONNECT_TIMEOUT = max(3.0, float(os.getenv("FINMIND_CONNECT_TIMEOUT", "10")))
+FINMIND_READ_TIMEOUT = max(15.0, float(os.getenv("FINMIND_READ_TIMEOUT", "180")))
+# FinMind 額度超限與授權失敗分流：
+# - 401 / 403，以及不含額度關鍵字的 402：視為 Token／方案權限錯誤，立即中止。
+# - 402 / 429 且訊息包含 upper limit、reach、quota、rate limit 等：視為每小時額度超限，等待後重試。
+FINMIND_RATE_LIMIT_RETRIES = max(0, int(os.getenv("FINMIND_RATE_LIMIT_RETRIES", "4")))
+FINMIND_RATE_LIMIT_BASE_WAIT = max(1.0, float(os.getenv("FINMIND_RATE_LIMIT_BASE_WAIT", "60")))
+FINMIND_RATE_LIMIT_MAX_WAIT = max(
+    FINMIND_RATE_LIMIT_BASE_WAIT,
+    float(os.getenv("FINMIND_RATE_LIMIT_MAX_WAIT", "300")),
+)
+FINMIND_WARRANT_DOWNLOAD_WORKERS = max(1, int(os.getenv("FINMIND_WARRANT_DOWNLOAD_WORKERS", "4")))
+FINMIND_CACHE_DIR = os.getenv("FINMIND_CACHE_DIR", "finmind_cache").strip() or "finmind_cache"
+FINMIND_WARRANT_DAY_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "warrant_daily")
+
+# 全市場共用精簡事件快取：每天只把原始全市場 Parquet 正規化與聚合一次。
+# 手動搜尋任何新股票時，只需以權證代號掃描這批共用小檔，不再重做 60～70 日全市場解析。
+FINMIND_MARKET_COMPACT_CACHE_ENABLE = os.getenv(
+    "FINMIND_MARKET_COMPACT_CACHE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_MARKET_COMPACT_CACHE_VERSION = os.getenv(
+    "FINMIND_MARKET_COMPACT_CACHE_VERSION",
+    "v1",
+).strip() or "v1"
+FINMIND_MARKET_COMPACT_CACHE_DIR = os.path.join(
+    FINMIND_CACHE_DIR,
+    f"warrant_market_compact_{FINMIND_MARKET_COMPACT_CACHE_VERSION}",
+)
+FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE = max(
+    1000,
+    int(os.getenv("FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE", "50000")),
+)
+FINMIND_REFERENCE_CACHE_DIR = os.path.join(FINMIND_CACHE_DIR, "reference")
+FINMIND_PREWARM_ONLY = os.getenv(
+    "WARRANT_PREWARM_ONLY",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_PREWARM_CALENDAR_DAYS = max(
+    110,
+    int(os.getenv("FINMIND_PREWARM_CALENDAR_DAYS", "150")),
+)
+FINMIND_PREWARM_WORKERS = max(
+    1,
+    int(os.getenv("FINMIND_PREWARM_WORKERS", "4")),
+)
+FINMIND_PREWARM_REFRESH_RECENT_DAYS = max(
+    0,
+    int(os.getenv("FINMIND_PREWARM_REFRESH_RECENT_DAYS", "2")),
+)
+FINMIND_PREWARM_KEEP_RAW_DAYS = max(
+    0,
+    int(os.getenv("FINMIND_PREWARM_KEEP_RAW_DAYS", "7")),
+)
+# 多股票時，每個交易日的全市場 Parquet 只解析一次：
+# 先建立所有目標股票有效認購權證代號聯集，再一次讀取、聚合並依標的股拆分。
+FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE = os.getenv(
+    "FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS = max(2, int(os.getenv(
+    "FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS",
+    "2",
+)))
+FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS = max(90, int(os.getenv(
+    "FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS",
+    "150",
+)))
+FINMIND_WARRANT_LATEST_PROBE_DAYS = max(1, int(os.getenv("FINMIND_WARRANT_LATEST_PROBE_DAYS", "7")))
+# TaiwanStockTradingDate 可能尚未反映颱風等臨時休市；權證分點實際下載日期
+# 改以高流動性 ETF 的 TaiwanStockPrice 實際成交日期為準。
+FINMIND_TRADING_DATE_REFERENCE_STOCK = (
+    os.getenv("FINMIND_TRADING_DATE_REFERENCE_STOCK", "0050").strip() or "0050"
+)
+FINMIND_STRICT_WARRANT_COMPLETENESS = os.getenv(
+    "FINMIND_STRICT_WARRANT_COMPLETENESS",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+
+# FinMind 欄位／分點對照 Debug：
+# 預設開啟。遇到欄位不足、分點名稱無法對照或資料為空時，會把實際欄位、dtype、
+# 前幾筆資料與候選分點代碼印到 GitHub Actions log，方便直接複製回來檢查。
+FINMIND_DEBUG_SCHEMA_ENABLE = os.getenv(
+    "FINMIND_DEBUG_SCHEMA_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_DEBUG_MAX_ROWS = max(1, int(os.getenv("FINMIND_DEBUG_MAX_ROWS", "20")))
+FINMIND_DEBUG_SELECTED_BRANCH_ENABLE = os.getenv(
+    "FINMIND_DEBUG_SELECTED_BRANCH_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE = os.getenv(
+    "FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+
+# 權證發行商辨識：官方資料優先，官方資料缺欄位時才退回官方權證名稱／FinMind 權證名稱解析。
+FINMIND_OFFICIAL_ISSUER_ENABLE = os.getenv(
+    "FINMIND_OFFICIAL_ISSUER_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE = os.getenv(
+    "FINMIND_OFFICIAL_ISSUER_DEBUG_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+TWSE_WARRANT_ISSUER_OPENAPI_URL = os.getenv(
+    "TWSE_WARRANT_ISSUER_OPENAPI_URL",
+    TWSE_WARRANT_DAILY_OPENAPI_URL,
+).strip() or TWSE_WARRANT_DAILY_OPENAPI_URL
+TPEX_WARRANT_ISSUER_OPENAPI_URL = os.getenv(
+    "TPEX_WARRANT_ISSUER_OPENAPI_URL",
+    "https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue",
+).strip() or "https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue"
+
+# 最新交易日固定改用 FinMind「query by 權證代號」API：
+# 每支有效認購權證只需一個請求，即可取得該權證當日所有分點；歷史日期仍使用 Parquet。
+# API 結果會完整取代同一天可能尚未同步完成的 Parquet，避免半成品混入正式週報。
+FINMIND_WARRANT_LATEST_DAY_API_ENABLE = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_API_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_WARRANT_LATEST_DAY_API_WORKERS = max(
+    1,
+    int(os.getenv("FINMIND_WARRANT_LATEST_DAY_API_WORKERS", "8")),
+)
+FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE = os.getenv(
+    "FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_WARRANT_LATEST_DAY_API_STRICT = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_API_STRICT",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 最新交易日若所有逐權證請求都成功、但完全沒有成交資料，代表 FinMind 當日權證資料
+# 多半尚未更新完成。此情況不是 API 失敗，預設保留歷史資料並自動回退到最近已有資料的交易日；
+# 欄位缺漏、授權失敗、請求失敗或部分權證失敗仍維持嚴格報錯。
+FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 最新日權證母體不能只相信 Summary 的有效期間：
+# 1. 補入最近 N 個歷史交易日實際出現的權證。
+# 2. 直接查詢本次精選分點當日資料，發現漏網權證後再補做逐權證全分點查詢。
+# 3. 最後以精選分點端點回傳值核對逐權證端點；若有缺漏或金額差異，僅替換該分點該權證列。
+FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS = max(
+    1,
+    int(os.getenv("FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS", "10")),
+)
+FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT = os.getenv(
+    "FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
+# 可手動指定名稱到 ID，例如：第一金中壢=5380,華南永昌台中=9A9g
+# 正常情況不需要；只有 FinMind 對照表名稱真的無法辨識時才使用。
+FINMIND_SELECTED_BRANCH_ID_OVERRIDES_RAW = os.getenv(
+    "FINMIND_SELECTED_BRANCH_ID_OVERRIDES",
+    "",
+).strip()
+
+# 週報區間恢復成第一張圖的口徑：最新資料日往前含當日共 7 個日曆日。
+# 例如最新日 2026/07/14，週報區間即為 2026/07/08～2026/07/14；
+# 休市日不會產生資料列，但仍保留正確的日曆週邊界。
+WARRANT_WEEK_RANGE_MODE = os.getenv(
+    "WARRANT_WEEK_RANGE_MODE",
+    "calendar7",
+).strip().lower() or "calendar7"
+WARRANT_WEEK_CALENDAR_DAYS = max(1, int(os.getenv("WARRANT_WEEK_CALENDAR_DAYS", "7")))
+
+_FINMIND_STOCK_INFO_CACHE = None
+_FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = None
+_FINMIND_SECURITIES_TRADER_INFO_CACHE = None
+_FINMIND_TRADING_DATE_CACHE = {}
+_FINMIND_WARRANT_SUMMARY_CACHE = {}
+_FINMIND_SELECTED_BRANCH_ID_CACHE = {}
+_FINMIND_OFFICIAL_WARRANT_ISSUER_CACHE = None
+_FINMIND_OFFICIAL_WARRANT_ISSUER_FUTURE = None
+_FINMIND_OFFICIAL_WARRANT_ISSUER_EXECUTOR = None
+_FINMIND_OFFICIAL_WARRANT_ISSUER_LOCK = threading.RLock()
+_FINMIND_DEBUG_ONCE_KEYS = set()
+_FINMIND_DATA_CACHE_LOCK = threading.RLock()
+_FINMIND_STORAGE_LOCKS = {}
+_FINMIND_STORAGE_LOCKS_GUARD = threading.Lock()
+_FINMIND_MARKET_COMPACT_LOCKS = {}
+_FINMIND_MARKET_COMPACT_LOCKS_GUARD = threading.Lock()
+_FINMIND_RATE_LIMIT_GATE_LOCK = threading.Lock()
+_FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = 0.0
+_FINMIND_WARRANT_RUN_STATS = {}
+_FINMIND_MULTI_STOCK_PREFETCH_READY = False
+_FINMIND_MULTI_STOCK_PREFETCH_RANGE = (pd.NaT, pd.NaT)
+_FINMIND_MULTI_STOCK_EVENT_CACHE = {}
+_FINMIND_MULTI_STOCK_SUMMARY_CACHE = {}
+_FINMIND_MULTI_STOCK_NAME_MAP_CACHE = {}
+_FINMIND_MULTI_STOCK_PREFETCH_LOCK = threading.RLock()
+
+FINMIND_WARRANT_SOURCE_LABEL = "FinMind_TaiwanStockWarrantTradingDailyReport"
+
+# 快取狀態欄位使用 FinMind 日期完整度名稱，避免與舊版欄位混淆。
+GSHEET_WARRANT_STATUS_HEADERS = [
+    "快取鍵", "標的股", "標的名稱", "快取起日", "快取迄日", "完整度狀態",
+    "資料來源", "FinMind交易日總數", "FinMind成功日期", "FinMind空資料日期", "FinMind失敗日期",
+    "資料筆數", "快照工作表", "更新時間",
+]
+
+
+def _require_finmind_token() -> str:
+    token = os.getenv("FINMIND_API_TOKEN", "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        raise RuntimeError(
+            "找不到 FINMIND_API_TOKEN。請在 GitHub Actions 將 "
+            "FINMIND_API_TOKEN 映射到 secrets.FINMIND_API_0714。"
+        )
+    return token
+
+
+def _finmind_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_require_finmind_token()}",
+        "User-Agent": HDR["User-Agent"],
+        "Accept": "application/json, application/octet-stream, */*",
+    }
+
+
+def _finmind_error_message(payload, fallback: str = "") -> str:
+    if isinstance(payload, dict):
+        return str(
+            payload.get("msg")
+            or payload.get("message")
+            or payload.get("detail")
+            or fallback
+            or payload
+        )
+    return str(fallback or payload or "未知錯誤")
+
+
+class FinMindAuthorizationError(RuntimeError):
+    """FinMind Token、方案或資料集權限錯誤；等待不會改善，必須立即中止。"""
+
+
+class FinMindRateLimitError(RuntimeError):
+    """FinMind 每小時／短時間請求額度超限；已完成等待重試後仍失敗。"""
+
+
+class FinMindBadRequestError(RuntimeError):
+    """FinMind HTTP 400 或回傳狀態 400；相同參數重試不會改善，立即停止該請求。"""
+
+
+def _finmind_error_payload_from_response(resp) -> tuple[dict, str]:
+    try:
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    try:
+        fallback = str(resp.text or "")[:500]
+    except Exception:
+        fallback = ""
+    return payload, _finmind_error_message(payload, fallback)
+
+
+def _finmind_is_rate_limit(status_code, message: str) -> bool:
+    """只把明確的額度訊息視為可等待重試，避免把真正的 402 方案權限問題誤當限流。"""
+    try:
+        status = int(status_code)
+    except Exception:
+        status = 0
+    msg = str(message or "").strip().lower()
+    if status not in (402, 429):
+        return False
+    tokens = (
+        "upper limit", "reach", "reached", "rate limit", "request limit",
+        "too many request", "too many requests", "quota", "exceed", "exceeded",
+        "hourly limit", "per hour", "frequency limit", "額度", "上限",
+        "請求次數", "每小時", "超限", "超過",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _finmind_rate_limit_wait_seconds(quota_attempt: int, resp=None) -> float:
+    retry_after = 0.0
+    if resp is not None:
+        try:
+            retry_after = float(resp.headers.get("Retry-After", 0) or 0)
+        except Exception:
+            retry_after = 0.0
+    exponential = FINMIND_RATE_LIMIT_BASE_WAIT * (2 ** max(0, int(quota_attempt) - 1))
+    return min(FINMIND_RATE_LIMIT_MAX_WAIT, max(FINMIND_RATE_LIMIT_BASE_WAIT, retry_after, exponential))
+
+
+def _finmind_wait_for_rate_limit_gate():
+    """所有 FinMind worker 共用同一個限流閘門，避免多執行緒在等待期間繼續撞 API。"""
+    with _FINMIND_RATE_LIMIT_GATE_LOCK:
+        remaining = max(0.0, _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC - time.monotonic())
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _finmind_wait_after_rate_limit(label: str, quota_attempt: int, message: str, resp=None):
+    global _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC
+    if quota_attempt > FINMIND_RATE_LIMIT_RETRIES:
+        raise FinMindRateLimitError(
+            f"FinMind 額度超限，等待重試 {FINMIND_RATE_LIMIT_RETRIES} 次後仍未恢復："
+            f"{label}｜{str(message or '')[:300]}"
+        )
+    wait_sec = _finmind_rate_limit_wait_seconds(quota_attempt, resp=resp)
+    with _FINMIND_RATE_LIMIT_GATE_LOCK:
+        target = time.monotonic() + wait_sec
+        _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC = max(_FINMIND_RATE_LIMIT_UNTIL_MONOTONIC, target)
+        remaining = max(0.0, _FINMIND_RATE_LIMIT_UNTIL_MONOTONIC - time.monotonic())
+    print(
+        f"⏳ FinMind 額度超限，所有 worker 暫停後重試 {quota_attempt}/{FINMIND_RATE_LIMIT_RETRIES}｜"
+        f"{label}｜等待 {remaining:.0f} 秒｜{str(message or '')[:220]}"
+    )
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _finmind_debug_print_df(label: str, df: pd.DataFrame, max_rows: int | None = None, once_key: str = ""):
+    """將 FinMind 實際欄位、型別與資料樣本印到 Actions log。
+
+    once_key 有值時，同一執行只印一次，避免 60～70 個交易日重複洗版。
+    """
+    if not FINMIND_DEBUG_SCHEMA_ENABLE:
+        return
+    key = str(once_key or "").strip()
+    if key:
+        with _FINMIND_DATA_CACHE_LOCK:
+            if key in _FINMIND_DEBUG_ONCE_KEYS:
+                return
+            _FINMIND_DEBUG_ONCE_KEYS.add(key)
+    try:
+        rows = max(1, int(max_rows or FINMIND_DEBUG_MAX_ROWS))
+        if df is None:
+            print(f"🧪 FinMind Debug｜{label}｜DataFrame=None")
+            return
+        print("=" * 110)
+        print(f"🧪 FinMind Debug｜{label}")
+        print(f"資料筆數：{len(df):,}")
+        print(f"實際欄位：{list(df.columns)}")
+        try:
+            dtype_text = ", ".join(f"{c}={df[c].dtype}" for c in df.columns)
+            print(f"欄位型別：{dtype_text}")
+        except Exception:
+            pass
+        if not df.empty:
+            preview = df.head(rows).copy()
+            for col in preview.columns:
+                if preview[col].dtype == object:
+                    preview[col] = preview[col].astype(str).str.slice(0, 180)
+            print(f"前 {min(rows, len(preview))} 筆：")
+            print(preview.to_string(index=False))
+        print("=" * 110)
+    except Exception as exc:
+        print(f"⚠️ FinMind Debug 輸出失敗：{label}｜{exc}")
+
+
+def _finmind_branch_lookup_key(value: str) -> str:
+    """分點對照鍵：保留券商與地名，移除公司型態及格式符號。"""
+    s = html.unescape(str(value or "")).strip().replace("臺", "台")
+    s = re.sub(r"(股份有限公司|有限公司|證券股份|證券公司|證券|分公司|營業處|營業部|辦事處)", "", s)
+    s = re.sub(r"[\s　\-＿_－—–/\\|｜·．・•()（）［］\[\]{}｛｝]+", "", s)
+    return s.strip().lower()
+
+
+def _finmind_branch_root_key(value: str) -> str:
+    """只供失敗時列出同券商候選，不拿來直接決定分點。"""
+    key = _finmind_branch_lookup_key(value)
+    locations = (
+        "台北", "台中", "中壢", "桃園", "新竹", "高雄", "台南", "板橋", "中和", "內湖",
+        "南屯", "敦南", "公益", "忠孝", "南京", "三重", "新店", "士林", "基隆", "彰化",
+        "員林", "竹北", "竹科", "市政", "信義", "淡水", "頭份", "內壢", "東大", "古亭",
+        "民權", "汐止", "虎尾", "東港", "苑裡", "民生", "三多", "土城", "建成", "溪湖",
+    )
+    for suffix in sorted(locations, key=len, reverse=True):
+        if key.endswith(suffix) and len(key) > len(suffix):
+            return key[:-len(suffix)]
+    return key
+
+
+def _resolve_report_week_range(report_dates, fallback_count: int = WEEK_TRADING_DAYS):
+    """回傳週報邊界與落在邊界內的實際資料日期。"""
+    dates = sorted({pd.Timestamp(d).normalize() for d in (report_dates or []) if pd.notna(d)})
+    if not dates:
+        return pd.NaT, pd.NaT, []
+    week_end = dates[-1]
+    if WARRANT_WEEK_RANGE_MODE in {"calendar7", "calendar", "7d", "seven_days"}:
+        week_start = week_end - pd.Timedelta(days=WARRANT_WEEK_CALENDAR_DAYS - 1)
+        week_dates = [d for d in dates if week_start <= d <= week_end]
+    else:
+        count = max(1, int(fallback_count or WEEK_TRADING_DAYS))
+        week_dates = dates[-count:]
+        week_start = week_dates[0]
+    return pd.Timestamp(week_start).normalize(), pd.Timestamp(week_end).normalize(), week_dates
+
+
+def _finmind_get_data(
+    dataset: str,
+    data_id: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    extra_params: dict | None = None,
+    allow_empty: bool = True,
+) -> pd.DataFrame:
+    params = {"dataset": str(dataset).strip()}
+    if data_id:
+        params["data_id"] = str(data_id).strip()
+    if start_date:
+        params["start_date"] = str(start_date).strip()
+    if end_date:
+        params["end_date"] = str(end_date).strip()
+    if extra_params:
+        params.update({k: v for k, v in extra_params.items() if v not in (None, "")})
+
+    last_error = None
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
+        try:
+            _finmind_wait_for_rate_limit_gate()
+            resp = get_thread_session().get(
+                FINMIND_API_URL,
+                headers=_finmind_headers(),
+                params=params,
+                timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+            )
+            if resp.status_code == 400:
+                payload, message = _finmind_error_payload_from_response(resp)
+                raise FinMindBadRequestError(
+                    f"FinMind 請求參數錯誤：HTTP 400｜dataset={dataset}｜"
+                    f"data_id={data_id}｜{message}"
+                )
+
+            if resp.status_code in (401, 402, 403, 429):
+                payload, message = _finmind_error_payload_from_response(resp)
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"dataset={dataset}｜data_id={data_id}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 授權或方案權限失敗：HTTP {resp.status_code}｜{message}"
+                )
+
+            resp.raise_for_status()
+            payload = resp.json()
+            status = payload.get("status", 200) if isinstance(payload, dict) else 200
+            if str(status) not in ("200", "success", "True", "true"):
+                message = _finmind_error_message(payload)
+                if _finmind_is_rate_limit(status, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"dataset={dataset}｜data_id={data_id}",
+                        quota_attempt,
+                        message,
+                    )
+                    continue
+                try:
+                    status_code = int(status)
+                except Exception:
+                    status_code = 0
+                if status_code == 400:
+                    raise FinMindBadRequestError(
+                        f"FinMind 請求參數錯誤：status=400｜dataset={dataset}｜"
+                        f"data_id={data_id}｜{message}"
+                    )
+                raise RuntimeError(
+                    f"FinMind API 回傳失敗：dataset={dataset}｜status={status}｜{message}"
+                )
+
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            df = pd.DataFrame(data)
+            if df.empty and not allow_empty:
+                _finmind_debug_print_df(
+                    f"{dataset} 空資料｜data_id={data_id}｜{start_date}～{end_date}",
+                    df,
+                )
+                if isinstance(payload, dict):
+                    print(f"🧪 FinMind Debug｜{dataset} 原始回應鍵：{list(payload.keys())}")
+                    print(f"🧪 FinMind Debug｜{dataset} msg：{_finmind_error_message(payload)}")
+                raise RuntimeError(
+                    f"FinMind API 回傳空資料：dataset={dataset}｜data_id={data_id}｜"
+                    f"start_date={start_date}｜end_date={end_date}"
+                )
+            if (
+                FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE
+                and dataset in {"TaiwanSecuritiesTraderInfo", "TaiwanStockNews"}
+            ):
+                _finmind_debug_print_df(
+                    f"{dataset} 實際回傳格式",
+                    df,
+                    once_key=f"schema:{dataset}",
+                )
+            return df
+        except (FinMindAuthorizationError, FinMindRateLimitError, FinMindBadRequestError):
+            raise
+        except Exception as exc:
+            last_error = exc
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
+                break
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
+            print(
+                f"⚠️ FinMind API 重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}："
+                f"dataset={dataset}｜{exc}｜等待 {wait_sec:.1f} 秒"
+            )
+            time.sleep(wait_sec)
+    raise RuntimeError(f"FinMind API 最終失敗：dataset={dataset}｜{last_error}")
+
+
+class FinMindStorageObjectUnavailable(RuntimeError):
+    """指定日期沒有 sponsorpro 全市場 Parquet；屬不可重試的 HTTP 4xx。"""
+
+
+def _finmind_storage_lock(date_s: str):
+    with _FINMIND_STORAGE_LOCKS_GUARD:
+        return _FINMIND_STORAGE_LOCKS.setdefault(date_s, threading.Lock())
+
+
+def _finmind_warrant_day_path(trade_date) -> str:
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    return os.path.join(FINMIND_WARRANT_DAY_CACHE_DIR, f"{date_s}.parquet")
+
+
+def _finmind_market_compact_lock(date_s: str):
+    with _FINMIND_MARKET_COMPACT_LOCKS_GUARD:
+        return _FINMIND_MARKET_COMPACT_LOCKS.setdefault(date_s, threading.Lock())
+
+
+def _finmind_market_compact_day_path(trade_date) -> str:
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    return os.path.join(FINMIND_MARKET_COMPACT_CACHE_DIR, f"{date_s}.parquet")
+
+
+def _finmind_market_compact_meta_path(trade_date) -> str:
+    return _finmind_market_compact_day_path(trade_date) + ".meta.json"
+
+
+def _finmind_trader_map_hash(trader_name_map: Dict[str, str] | None) -> str:
+    payload = "\n".join(
+        f"{str(k)}={str(v)}"
+        for k, v in sorted((trader_name_map or {}).items())
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _finmind_reference_paths(cache_name: str) -> tuple[str, str]:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(cache_name or "reference")).strip("_") or "reference"
+    return (
+        os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.parquet"),
+        os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.meta.json"),
+    )
+
+
+def _finmind_read_reference_df(cache_name: str, max_age_days: int) -> pd.DataFrame | None:
+    data_path, meta_path = _finmind_reference_paths(cache_name)
+    if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        updated = pd.to_datetime(meta.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        age_days = int((get_taipei_today_ts() - updated).days)
+        if age_days < 0 or age_days > max(0, int(max_age_days)):
+            return None
+        df = pd.read_parquet(data_path)
+        print(f"⚡ FinMind 參考資料磁碟快取命中：{cache_name}｜{len(df):,} 筆｜age={age_days}日")
+        return df
+    except Exception as exc:
+        print(f"⚠️ FinMind 參考資料快取讀取失敗：{cache_name}｜{exc}")
+        return None
+
+
+def _finmind_write_reference_df(cache_name: str, df: pd.DataFrame):
+    if df is None:
+        return
+    data_path, meta_path = _finmind_reference_paths(cache_name)
+    _ensure_dir(FINMIND_REFERENCE_CACHE_DIR)
+    tmp_data = f"{data_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    tmp_meta = f"{meta_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        df.to_parquet(tmp_data, index=False, compression="zstd")
+        payload = {
+            "cache_name": cache_name,
+            "updated_at": get_taipei_today_ts().strftime("%Y-%m-%d"),
+            "rows": int(len(df)),
+            "build": FINMIND_BUILD_VERSION,
+        }
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_data, data_path)
+        os.replace(tmp_meta, meta_path)
+    except Exception as exc:
+        print(f"⚠️ FinMind 參考資料快取寫入失敗：{cache_name}｜{exc}")
+        for path in [tmp_data, tmp_meta]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
+def _finmind_reference_json_path(cache_name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(cache_name or "reference")).strip("_") or "reference"
+    return os.path.join(FINMIND_REFERENCE_CACHE_DIR, f"{safe}.json")
+
+
+def _finmind_read_reference_json(cache_name: str, max_age_days: int):
+    path = _finmind_reference_json_path(cache_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        updated = pd.to_datetime(payload.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        age_days = int((get_taipei_today_ts() - updated).days)
+        if age_days < 0 or age_days > max(0, int(max_age_days)):
+            return None
+        print(f"⚡ FinMind JSON 參考快取命中：{cache_name}｜age={age_days}日")
+        return payload.get("data")
+    except Exception as exc:
+        print(f"⚠️ FinMind JSON 參考快取讀取失敗：{cache_name}｜{exc}")
+        return None
+
+
+def _finmind_write_reference_json(cache_name: str, data):
+    path = _finmind_reference_json_path(cache_name)
+    _ensure_dir(FINMIND_REFERENCE_CACHE_DIR)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "updated_at": get_taipei_today_ts().strftime("%Y-%m-%d"),
+                "build": FINMIND_BUILD_VERSION,
+                "data": data,
+            }, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        print(f"⚠️ FinMind JSON 參考快取寫入失敗：{cache_name}｜{exc}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _finmind_market_compact_day_is_valid(
+    trade_date,
+    trader_name_map: Dict[str, str] | None = None,
+) -> bool:
+    if not FINMIND_MARKET_COMPACT_CACHE_ENABLE:
+        return False
+    path = _finmind_market_compact_day_path(trade_date)
+    meta_path = _finmind_market_compact_meta_path(trade_date)
+    if not os.path.exists(path) or os.path.getsize(path) <= 0 or not os.path.exists(meta_path):
+        return False
+    required = {
+        "Date", "branch", "broker_code", "warrant_code",
+        "buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares", "side",
+    }
+    try:
+        import pyarrow.parquet as pq
+        schema_names = set(pq.ParquetFile(path).schema.names)
+        if not required.issubset(schema_names):
+            return False
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if str(meta.get("cache_version", "")) != FINMIND_MARKET_COMPACT_CACHE_VERSION:
+            return False
+        if trader_name_map is not None:
+            expected_hash = _finmind_trader_map_hash(trader_name_map)
+            if str(meta.get("trader_map_hash", "")) != expected_hash:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+
+def _finmind_build_market_compact_day(
+    trade_date,
+    trader_name_map: Dict[str, str],
+    force_refresh: bool = False,
+    allow_not_ready: bool = False,
+    return_frame: bool = False,
+):
+    """將單日全市場原始 Parquet 正規化、聚合成所有股票共用的精簡事件檔。
+
+    ``return_frame=True`` 時同時回傳本次已在記憶體完成的全市場精簡表，讓
+    手動查詢第一支股票時不必為了寫共用快取再重讀一次 Parquet。
+    """
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    path = _finmind_market_compact_day_path(date_s)
+    meta_path = _finmind_market_compact_meta_path(date_s)
+    _ensure_dir(FINMIND_MARKET_COMPACT_CACHE_DIR)
+
+    with _finmind_market_compact_lock(date_s):
+        if not force_refresh and _finmind_market_compact_day_is_valid(date_s, trader_name_map):
+            if return_frame:
+                try:
+                    return path, pd.read_parquet(path)
+                except Exception:
+                    pass
+            else:
+                return path
+
+        raw_path = _finmind_download_warrant_day(date_s, allow_not_ready=allow_not_ready)
+        if not raw_path:
+            return (None, pd.DataFrame()) if return_frame else None
+        columns = [
+            "securities_trader", "price", "buy", "sell",
+            "securities_trader_id", "stock_id", "date",
+        ]
+        raw = pd.read_parquet(raw_path, columns=columns)
+        if raw.empty:
+            return (None, pd.DataFrame()) if return_frame else None
+
+        raw = raw.copy()
+        stock_ids = raw["stock_id"].astype(str).str.strip().str.upper().str.replace(r"\.0$", "", regex=True)
+        numeric_5 = stock_ids.str.fullmatch(r"\d{5}", na=False)
+        stock_ids.loc[numeric_5] = stock_ids.loc[numeric_5].str.zfill(6)
+        raw["warrant_code"] = stock_ids
+        raw["price"] = pd.to_numeric(raw["price"], errors="coerce").fillna(0.0)
+        raw["buy"] = pd.to_numeric(raw["buy"], errors="coerce").fillna(0.0)
+        raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
+        raw["buy_amount_row"] = raw["price"] * raw["buy"]
+        raw["sell_amount_row"] = raw["price"] * raw["sell"]
+        raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+        raw["raw_branch"] = raw["securities_trader"].astype(str).str.strip()
+        raw["mapped_branch"] = raw["broker_code"].map(trader_name_map or {}).fillna("").astype(str)
+        raw["branch"] = np.where(raw["mapped_branch"].str.strip() != "", raw["mapped_branch"], raw["raw_branch"])
+        raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+        raw = raw[(raw["warrant_code"] != "") & (raw["broker_code"] != "") & (raw["branch"] != "")]
+
+        grouped = raw.groupby(
+            ["warrant_code", "broker_code", "branch"],
+            as_index=False,
+            dropna=False,
+            sort=False,
+        ).agg(
+            buy_shares_raw=("buy", "sum"),
+            sell_shares_raw=("sell", "sum"),
+            buy_amount=("buy_amount_row", "sum"),
+            sell_amount=("sell_amount_row", "sum"),
+        )
+        grouped["Date"] = pd.Timestamp(date_s)
+        grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+        grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+        grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+        grouped = grouped[
+            (grouped["buy_amount"] != 0)
+            | (grouped["sell_amount"] != 0)
+            | (grouped["net_amount"] != 0)
+        ].copy()
+        grouped["side"] = np.where(grouped["net_amount"] >= 0, "買超", "賣超")
+        grouped = grouped[[
+            "Date", "branch", "broker_code", "warrant_code",
+            "buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares", "side",
+        ]].sort_values(["warrant_code", "broker_code"], kind="stable").reset_index(drop=True)
+
+        tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        tmp_meta = f"{meta_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            grouped.to_parquet(
+                tmp_path,
+                index=False,
+                engine="pyarrow",
+                compression="zstd",
+                row_group_size=FINMIND_MARKET_COMPACT_ROW_GROUP_SIZE,
+            )
+            meta = {
+                "cache_version": FINMIND_MARKET_COMPACT_CACHE_VERSION,
+                "date": date_s,
+                "rows": int(len(grouped)),
+                "trader_map_hash": _finmind_trader_map_hash(trader_name_map),
+                "source_size": int(os.path.getsize(raw_path)),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "build": FINMIND_BUILD_VERSION,
+            }
+            with open(tmp_meta, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+            os.replace(tmp_meta, meta_path)
+            print(
+                f"✅ 全市場精簡權證事件快取：{date_s}｜{len(grouped):,} 筆｜"
+                f"{os.path.getsize(path) / 1024 / 1024:.2f} MB"
+            )
+            return (path, grouped) if return_frame else path
+        except Exception:
+            for temp in [tmp_path, tmp_meta]:
+                try:
+                    if os.path.exists(temp):
+                        os.remove(temp)
+                except Exception:
+                    pass
+            raise
+
+
+
+def _finmind_load_target_events_from_market_compact(
+    summary_df: pd.DataFrame,
+    jobs: List[tuple],
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+) -> tuple[pd.DataFrame, set]:
+    """一次掃描所有已預熱精簡日檔，取得任意新股票的完整區間事件。"""
+    if not FINMIND_MARKET_COMPACT_CACHE_ENABLE or summary_df is None or summary_df.empty or not jobs:
+        return pd.DataFrame(), set()
+
+    valid_paths = []
+    compact_dates = set()
+    for day, _ in jobs:
+        day_ts = pd.Timestamp(day).normalize()
+        if _finmind_market_compact_day_is_valid(day_ts, trader_name_map):
+            valid_paths.append(_finmind_market_compact_day_path(day_ts))
+            compact_dates.add(day_ts)
+    if not valid_paths:
+        return pd.DataFrame(), set()
+
+    all_codes = sorted(set(summary_df["stock_id"].astype(str).map(normalize_openapi_warrant_code)) - {""})
+    if not all_codes:
+        return pd.DataFrame(), compact_dates
+
+    try:
+        import pyarrow.dataset as ds
+        dataset = ds.dataset(valid_paths, format="parquet")
+        min_date = min(compact_dates).to_datetime64()
+        max_date = max(compact_dates).to_datetime64()
+        filter_expr = (
+            ds.field("warrant_code").isin(all_codes)
+            & (ds.field("Date") >= min_date)
+            & (ds.field("Date") <= max_date)
+        )
+        table = dataset.to_table(filter=filter_expr)
+        compact = table.to_pandas()
+    except Exception as exc:
+        print(f"⚠️ 全市場精簡快取單次掃描失敗，退回逐日原始 Parquet：{exc}")
+        return pd.DataFrame(), set()
+
+    if compact.empty:
+        print(f"⚡ 全市場精簡快取命中：{stock_code}｜{len(compact_dates)} 日｜0 筆")
+        return pd.DataFrame(), compact_dates
+
+    compact["Date"] = pd.to_datetime(compact["Date"], errors="coerce").dt.normalize()
+    compact["warrant_code"] = compact["warrant_code"].astype(str).map(normalize_openapi_warrant_code)
+    intervals = summary_df[["stock_id", "listing_date", "last_trade_date"]].copy()
+    intervals["stock_id"] = intervals["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    intervals = intervals.dropna(subset=["listing_date", "last_trade_date"]).drop_duplicates()
+    merged = compact.merge(intervals, left_on="warrant_code", right_on="stock_id", how="inner")
+    merged = merged[
+        (merged["Date"] >= merged["listing_date"])
+        & (merged["Date"] <= merged["last_trade_date"])
+    ].copy()
+    merged = merged.drop(columns=["stock_id", "listing_date", "last_trade_date"], errors="ignore")
+    merged = merged.drop_duplicates(
+        subset=["Date", "broker_code", "branch", "warrant_code", "buy_amount", "sell_amount"],
+        keep="last",
+    )
+    merged["warrant_name"] = merged["warrant_code"].map(warrant_name_map).fillna(merged["warrant_code"])
+    merged["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+    merged["underlying_name"] = str(stock_name or "")
+    merged["side"] = np.where(pd.to_numeric(merged["net_amount"], errors="coerce").fillna(0.0) >= 0, "買超", "賣超")
+    output = merged[[
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]].sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    output.attrs["_warrant_events_normalized"] = True
+    print(
+        f"⚡ 全市場精簡快取命中：{stock_code}｜{len(compact_dates)} 日｜"
+        f"{len(output):,} 筆｜單次 Dataset 掃描"
+    )
+    return output, compact_dates
+
+
+def _finmind_prewarm_market_compact_cache():
+    """排程預熱：更新全市場共用精簡事件與每日參考資料，不產圖。"""
+    start_clock = time.perf_counter()
+    today = get_taipei_today_ts()
+    start_date = today - pd.Timedelta(days=FINMIND_PREWARM_CALENDAR_DAYS - 1)
+    print(
+        f"🔥 開始預熱 FinMind 全市場快取｜{start_date.date()} ~ {today.date()}｜"
+        f"workers={FINMIND_PREWARM_WORKERS}"
+    )
+
+    # 參考資料在預熱流程先更新，手動查任何新股票時直接讀本機快取。
+    _finmind_load_stock_info(force_refresh=False)
+    trader_name_map, _ = _finmind_securities_trader_maps()
+    if not trader_name_map:
+        raise RuntimeError("預熱失敗：TaiwanSecuritiesTraderInfo 無法建立分點對照")
+
+    reference_executor = ThreadPoolExecutor(max_workers=3)
+    reference_futures = [
+        reference_executor.submit(_finmind_load_stock_info_with_warrant, False),
+        reference_executor.submit(_finmind_official_warrant_issuer_map, False),
+    ]
+    if BRANCH_PERF_ENABLE:
+        reference_futures.append(
+            reference_executor.submit(read_gsheet_branch_perf_df, False)
+        )
+
+    trading_dates = _finmind_get_trading_dates(start_date, today)
+    if not trading_dates:
+        raise RuntimeError("預熱失敗：找不到實際交易日")
+
+    if FINMIND_PREWARM_REFRESH_RECENT_DAYS > 0:
+        cutoff = today - pd.Timedelta(days=FINMIND_PREWARM_REFRESH_RECENT_DAYS - 1)
+        for day in trading_dates:
+            if day < cutoff:
+                continue
+            for path in [
+                _finmind_warrant_day_path(day),
+                _finmind_market_compact_day_path(day),
+                _finmind_market_compact_meta_path(day),
+            ]:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception as exc:
+                    print(f"⚠️ 預熱更新舊檔刪除失敗：{path}｜{exc}")
+
+    latest_available = None
+    for day in reversed(trading_dates[-FINMIND_WARRANT_LATEST_PROBE_DAYS:]):
+        probe = _finmind_download_warrant_day(day, allow_not_ready=True)
+        if probe:
+            latest_available = pd.Timestamp(day).normalize()
+            break
+    if latest_available is None:
+        raise RuntimeError("預熱失敗：最近交易日沒有可用權證分點日檔")
+    target_dates = [d for d in trading_dates if d <= latest_available]
+
+    failures = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=FINMIND_PREWARM_WORKERS) as executor:
+        future_map = {
+            executor.submit(
+                _finmind_build_market_compact_day,
+                day,
+                trader_name_map,
+                False,
+                False,
+            ): day
+            for day in target_dates
+        }
+        for future in as_completed(future_map):
+            day = future_map[future]
+            completed += 1
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+                print(f"❌ 全市場精簡快取預熱失敗：{pd.Timestamp(day).date()}｜{exc}")
+            if completed == 1 or completed % 10 == 0 or completed == len(target_dates):
+                print(f"📊 全市場快取預熱進度：{completed}/{len(target_dates)}｜失敗={len(failures)}")
+
+    for future in reference_futures:
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"⚠️ 預熱參考資料工作失敗：{exc}")
+    reference_executor.shutdown(wait=True)
+
+    # 全市場精簡檔已可服務任何股票；只保留最近幾天原始檔，降低 Actions cache 體積與還原時間。
+    if FINMIND_PREWARM_KEEP_RAW_DAYS >= 0:
+        raw_cutoff = latest_available - pd.Timedelta(days=FINMIND_PREWARM_KEEP_RAW_DAYS)
+        for raw_path in Path(FINMIND_WARRANT_DAY_CACHE_DIR).glob("*.parquet"):
+            try:
+                raw_date = pd.Timestamp(raw_path.stem).normalize()
+                if raw_date < raw_cutoff and _finmind_market_compact_day_is_valid(raw_date, trader_name_map):
+                    raw_path.unlink()
+            except Exception:
+                pass
+
+    if failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
+        sample = "；".join(f"{d}:{e[:100]}" for d, e in failures[:5])
+        raise RuntimeError(f"全市場快取預熱不完整：{len(failures)}/{len(target_dates)} 日｜{sample}")
+    print(
+        f"✅ 全市場快取預熱完成｜最新日={latest_available.date()}｜"
+        f"交易日={len(target_dates)}｜耗時={time.perf_counter() - start_clock:.2f}秒"
+    )
+
+
+def _looks_like_json_or_html_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            prefix = f.read(32).lstrip().lower()
+        return prefix.startswith(b"{") or prefix.startswith(b"[") or prefix.startswith(b"<html") or prefix.startswith(b"<!doctype")
+    except Exception:
+        return False
+
+
+def _read_small_error_file(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return f.read(1200).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> str | None:
+    """下載 sponsorpro 全市場權證分點 Parquet；同一執行中每個日期只下載一次。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    path = _finmind_warrant_day_path(date_s)
+    _ensure_dir(os.path.dirname(path))
+
+    with _finmind_storage_lock(date_s):
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            try:
+                pd.read_parquet(path, columns=["date", "stock_id"])
+                return path
+            except Exception:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+        last_error = None
+        normal_attempt = 0
+        quota_attempt = 0
+        while normal_attempt < FINMIND_REQUEST_RETRIES:
+            tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            try:
+                _finmind_wait_for_rate_limit_gate()
+                resp = get_thread_session().get(
+                    FINMIND_STORAGE_URL,
+                    headers=_finmind_headers(),
+                    params={
+                        "dataset": "TaiwanStockWarrantTradingDailyReport",
+                        "date": date_s,
+                    },
+                    timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+                    stream=True,
+                    allow_redirects=True,
+                )
+
+                if resp.status_code in (401, 402, 403, 429):
+                    payload, message = _finmind_error_payload_from_response(resp)
+                    if _finmind_is_rate_limit(resp.status_code, message):
+                        quota_attempt += 1
+                        _finmind_wait_after_rate_limit(
+                            f"storage_objects｜date={date_s}",
+                            quota_attempt,
+                            message,
+                            resp=resp,
+                        )
+                        continue
+                    raise FinMindAuthorizationError(
+                        "FinMind sponsorpro 權證分點權限失敗："
+                        f"HTTP {resp.status_code}｜{message}"
+                    )
+
+                if resp.status_code in (400, 404, 422):
+                    message = resp.text[:500]
+                    if allow_not_ready:
+                        print(
+                            f"ℹ️ FinMind 權證分點尚無 {date_s}："
+                            f"HTTP {resp.status_code}｜{message[:160]}"
+                        )
+                        return None
+                    raise FinMindStorageObjectUnavailable(
+                        f"FinMind 權證分點物件不存在：{date_s}｜"
+                        f"HTTP {resp.status_code}｜{message[:300]}"
+                    )
+
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
+                    raise RuntimeError("FinMind storage_objects 回傳空檔")
+
+                if _looks_like_json_or_html_file(tmp_path):
+                    message = _read_small_error_file(tmp_path)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    if _finmind_is_rate_limit(402, message):
+                        quota_attempt += 1
+                        _finmind_wait_after_rate_limit(
+                            f"storage_objects｜date={date_s}",
+                            quota_attempt,
+                            message,
+                        )
+                        continue
+                    if allow_not_ready and any(
+                        token in message.lower()
+                        for token in ["no data", "not found", "尚無", "查無", "empty"]
+                    ):
+                        print(f"ℹ️ FinMind 權證分點尚無 {date_s}：{message[:200]}")
+                        return None
+                    raise RuntimeError(f"FinMind storage_objects 未回傳 Parquet：{message[:500]}")
+
+                required_columns = [
+                    "securities_trader", "price", "buy", "sell",
+                    "securities_trader_id", "stock_id", "date",
+                ]
+                check_df = pd.read_parquet(tmp_path, columns=required_columns)
+                missing = set(required_columns) - set(check_df.columns)
+                if missing:
+                    raise RuntimeError(f"FinMind 權證分點欄位不足：{sorted(missing)}")
+
+                os.replace(tmp_path, path)
+                print(
+                    f"✅ FinMind 全市場權證分點下載：{date_s}｜"
+                    f"{os.path.getsize(path) / 1024 / 1024:.2f} MB"
+                )
+                return path
+            except (FinMindStorageObjectUnavailable, FinMindAuthorizationError, FinMindRateLimitError):
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:
+                last_error = exc
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                normal_attempt += 1
+                if normal_attempt >= FINMIND_REQUEST_RETRIES:
+                    break
+                wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
+                print(
+                    f"⚠️ FinMind 權證分點下載重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                    f"{date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
+                )
+                time.sleep(wait_sec)
+        raise RuntimeError(f"FinMind 權證分點下載最終失敗：{date_s}｜{last_error}")
+
+
+def _finmind_load_stock_info(force_refresh: bool = False) -> pd.DataFrame:
+    global _FINMIND_STOCK_INFO_CACHE
+    with _FINMIND_DATA_CACHE_LOCK:
+        if _FINMIND_STOCK_INFO_CACHE is not None and not force_refresh:
+            return _FINMIND_STOCK_INFO_CACHE.copy()
+    df = None
+    if not force_refresh:
+        df = _finmind_read_reference_df("TaiwanStockInfo", max_age_days=1)
+    if df is None:
+        df = _finmind_get_data("TaiwanStockInfo", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanStockInfo", df)
+    required = {"stock_id", "stock_name", "type"}
+    missing = required - set(df.columns)
+    if missing:
+        _finmind_debug_print_df("TaiwanStockInfo 欄位不足", df)
+        raise RuntimeError(f"FinMind TaiwanStockInfo 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
+    df = df.copy()
+    df["stock_id"] = df["stock_id"].astype(str).str.strip()
+    df["stock_name"] = df["stock_name"].astype(str).str.strip()
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_STOCK_INFO_CACHE = df.copy()
+    print(f"📦 FinMind 股票總覽載入：{len(df):,} 筆")
+    return df
+
+
+def _finmind_load_stock_info_with_warrant(force_refresh: bool = False) -> pd.DataFrame:
+    global _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE
+    with _FINMIND_DATA_CACHE_LOCK:
+        if _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE is not None and not force_refresh:
+            return _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE.copy()
+    df = None
+    if not force_refresh:
+        df = _finmind_read_reference_df("TaiwanStockInfoWithWarrant", max_age_days=1)
+    if df is None:
+        df = _finmind_get_data("TaiwanStockInfoWithWarrant", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanStockInfoWithWarrant", df)
+    required = {"stock_id", "stock_name"}
+    missing = required - set(df.columns)
+    if missing:
+        _finmind_debug_print_df("TaiwanStockInfoWithWarrant 欄位不足", df)
+        raise RuntimeError(f"FinMind TaiwanStockInfoWithWarrant 欄位不足：{sorted(missing)}｜實際欄位={df.columns.tolist()}")
+    df = df.copy()
+    df["stock_id"] = df["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    df["stock_name"] = df["stock_name"].astype(str).str.strip()
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_STOCK_INFO_WITH_WARRANT_CACHE = df.copy()
+    print(f"📦 FinMind 股票與權證名稱總覽載入：{len(df):,} 筆")
+    return df
+
+
+def _finmind_load_securities_trader_info(force_refresh: bool = False) -> pd.DataFrame:
+    """讀取 FinMind 證券商資訊表，供 securities_trader_id 還原完整分點名稱。"""
+    global _FINMIND_SECURITIES_TRADER_INFO_CACHE
+    with _FINMIND_DATA_CACHE_LOCK:
+        if _FINMIND_SECURITIES_TRADER_INFO_CACHE is not None and not force_refresh:
+            return _FINMIND_SECURITIES_TRADER_INFO_CACHE.copy()
+
+    df = None
+    if not force_refresh:
+        # 正式產圖一律優先信任既有分點參考快取，即使超過七天也不在正式 job 臨時刷新。
+        # 只有預熱流程會依七天 TTL 更新，避免正式產圖因名稱微調造成全部 compact hash 失效。
+        reference_max_age_days = 7 if FINMIND_PREWARM_ONLY else 3650
+        df = _finmind_read_reference_df(
+            "TaiwanSecuritiesTraderInfo",
+            max_age_days=reference_max_age_days,
+        )
+    if df is None:
+        df = _finmind_get_data("TaiwanSecuritiesTraderInfo", allow_empty=False).fillna("")
+        _finmind_write_reference_df("TaiwanSecuritiesTraderInfo", df)
+    required = {"securities_trader_id", "securities_trader"}
+    missing = required - set(df.columns)
+    if missing:
+        _finmind_debug_print_df("TaiwanSecuritiesTraderInfo 欄位不足", df)
+        raise RuntimeError(
+            f"FinMind TaiwanSecuritiesTraderInfo 欄位不足：{sorted(missing)}｜"
+            f"實際欄位={df.columns.tolist()}"
+        )
+
+    out = df.copy()
+    out["securities_trader_id"] = out["securities_trader_id"].astype(str).str.strip()
+    out["securities_trader"] = out["securities_trader"].astype(str).str.strip()
+    if "date" in out.columns:
+        out["_sort_date"] = pd.to_datetime(out["date"], errors="coerce")
+        out = out.sort_values(["securities_trader_id", "_sort_date"])
+    out = out[(out["securities_trader_id"] != "") & (out["securities_trader"] != "")]
+    out = out.drop_duplicates(subset=["securities_trader_id"], keep="last").copy()
+    out["branch"] = out["securities_trader"].map(normalize_branch_name)
+    out["branch_lookup_key"] = out["securities_trader"].map(_finmind_branch_lookup_key)
+    out["branch_root_key"] = out["securities_trader"].map(_finmind_branch_root_key)
+    out = out.drop(columns=["_sort_date"], errors="ignore")
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        _FINMIND_SECURITIES_TRADER_INFO_CACHE = out.copy()
+    print(f"📦 FinMind 證券商分點對照載入：{len(out):,} 個代碼")
+    return out
+
+
+def _finmind_securities_trader_maps() -> tuple[Dict[str, str], pd.DataFrame]:
+    try:
+        info = _finmind_load_securities_trader_info()
+    except Exception as exc:
+        print(f"⚠️ FinMind 證券商分點對照讀取失敗，暫用 Parquet 券商簡稱：{exc}")
+        return {}, pd.DataFrame()
+    name_map = dict(zip(
+        info["securities_trader_id"].astype(str),
+        info["branch"].astype(str),
+    ))
+    return name_map, info
+
+
+def _debug_selected_branch_candidates(selected_names, events_df: pd.DataFrame | None = None):
+    """分點無法對照時，把官方對照表與權證事件候選完整印出。"""
+    if not FINMIND_DEBUG_SELECTED_BRANCH_ENABLE:
+        return
+    try:
+        selected = [normalize_branch_name(x) for x in (selected_names or []) if normalize_branch_name(x)]
+        info = _finmind_load_securities_trader_info()
+        for requested in selected:
+            requested_key = _finmind_branch_lookup_key(requested)
+            requested_root = _finmind_branch_root_key(requested)
+            print("=" * 110)
+            print(f"🧪 精選分點 Debug｜使用者輸入={requested}｜lookup_key={requested_key}｜root={requested_root}")
+            candidate_mask = (
+                info["branch_lookup_key"].astype(str).str.contains(requested_key, regex=False)
+                | info["branch_lookup_key"].astype(str).map(lambda x: requested_key in x if x else False)
+                | info["branch_root_key"].astype(str).eq(requested_root)
+            )
+            candidates = info.loc[candidate_mask].copy()
+            if candidates.empty and requested_root:
+                candidates = info[
+                    info["branch_lookup_key"].astype(str).str.contains(requested_root, regex=False)
+                ].copy()
+            show_cols = [c for c in [
+                "securities_trader_id", "securities_trader", "branch", "date", "address", "phone",
+                "branch_lookup_key", "branch_root_key",
+            ] if c in candidates.columns]
+            if candidates.empty:
+                print("官方 TaiwanSecuritiesTraderInfo 找不到候選分點。")
+            else:
+                print(f"官方候選共 {len(candidates):,} 筆：")
+                print(candidates[show_cols].head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+
+            if events_df is not None and not events_df.empty:
+                e = events_df.copy()
+                e["branch"] = e.get("branch", "").astype(str).map(normalize_branch_name)
+                e["broker_code"] = e.get("broker_code", "").astype(str).str.strip()
+                event_mask = e["branch"].map(_finmind_branch_root_key).eq(requested_root)
+                candidate_ids = set(candidates.get("securities_trader_id", pd.Series(dtype=str)).astype(str))
+                if candidate_ids:
+                    event_mask = event_mask | e["broker_code"].isin(candidate_ids)
+                event_candidates = e.loc[event_mask].copy()
+                if event_candidates.empty:
+                    print("本次權證事件中沒有相符候選。")
+                else:
+                    agg = event_candidates.groupby(["broker_code", "branch"], as_index=False).agg(
+                        rows=("net_amount", "size"),
+                        buy_amount=("buy_amount", "sum"),
+                        sell_amount=("sell_amount", "sum"),
+                        net_amount=("net_amount", "sum"),
+                    )
+                    agg["abs_net"] = agg["net_amount"].abs()
+                    agg = agg.sort_values(["abs_net", "rows"], ascending=[False, False]).drop(columns=["abs_net"])
+                    print(f"本次權證事件候選共 {len(agg):,} 組：")
+                    print(agg.head(FINMIND_DEBUG_MAX_ROWS).to_string(index=False))
+            print("=" * 110)
+    except Exception as exc:
+        print(f"⚠️ 精選分點 Debug 失敗：{exc}")
+
+
+def _finmind_market_label(raw_type: str) -> str:
+    key = str(raw_type or "").strip().lower()
+    return {
+        "twse": "上市",
+        "tpex": "上櫃",
+        "otc": "上櫃",
+        "emerging": "興櫃",
+        "rotc": "興櫃",
+    }.get(key, key or "FinMind")
+
+
+def get_tw_stock_name(stock_code: str) -> str:
+    """FinMind-only：優先讀 TaiwanStockInfo；暫缺時以股票代號作名稱並保留警告。"""
+    code = _normalize_stock_name_code_key(stock_code)
+    if not code:
+        raise ValueError("股票代號不可為空")
+    df = _finmind_load_stock_info()
+    hit = df[df["stock_id"].astype(str) == code]
+    if hit.empty:
+        print(
+            f"⚠️ FinMind TaiwanStockInfo 暫時找不到股票代號：{code}｜"
+            f"本次先以代號「{code}」作為名稱，股價資料仍會繼續驗證"
+        )
+        return code
+    name = str(hit.iloc[-1].get("stock_name", "") or "").strip()
+    if not name:
+        print(
+            f"⚠️ FinMind TaiwanStockInfo 股票名稱為空：{code}｜"
+            f"本次先以代號「{code}」作為名稱"
+        )
+        return code
+    print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：FinMind TaiwanStockInfo")
+    return name
+
+
+def fetch_stock_data_yf(stock_code: str, period="160d"):
+    """保留舊函式名稱相容性；實際只呼叫 FinMind TaiwanStockPrice。"""
+    code = _normalize_stock_name_code_key(stock_code)
+    match = re.search(r"(\d+)", str(period or "160d"))
+    calendar_days = max(120, int(match.group(1)) if match else 160)
+    end_dt = datetime.now(timezone.utc) + timedelta(hours=8)
+    start_dt = end_dt - timedelta(days=calendar_days)
+    raw = _finmind_get_data(
+        "TaiwanStockPrice",
+        data_id=code,
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d"),
+        allow_empty=False,
+    ).fillna(0)
+    required = {"date", "open", "max", "min", "close", "Trading_Volume"}
+    missing = required - set(raw.columns)
+    if missing:
+        _finmind_debug_print_df(f"TaiwanStockPrice 欄位不足｜{code}", raw)
+        raise RuntimeError(f"FinMind TaiwanStockPrice 欄位不足：{sorted(missing)}｜實際欄位={raw.columns.tolist()}")
+
+    df = raw.rename(columns={
+        "date": "Date",
+        "open": "Open",
+        "max": "High",
+        "min": "Low",
+        "close": "Close",
+        "Trading_Volume": "Volume",
+    })[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = (
+        df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+        .drop_duplicates(subset=["Date"], keep="last")
+        .sort_values("Date")
+        .set_index("Date")
+    )
+    if df.empty:
+        raise RuntimeError(f"FinMind TaiwanStockPrice 無有效股價：{code}")
+
+    info = _finmind_load_stock_info()
+    hit = info[info["stock_id"].astype(str) == code]
+    market = _finmind_market_label(hit.iloc[-1].get("type", "")) if not hit.empty else "FinMind"
+    print(
+        f"✅ FinMind 股價資料：{code}｜{len(df):,} 筆｜"
+        f"{df.index.min().date()} ~ {df.index.max().date()}"
+    )
+    return df, market, code
+
+
+def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
+    """FinMind-only：三大法人不再使用公開模式或 X_function 備援。"""
+    code = _normalize_stock_name_code_key(stock_code)
+    end_dt = datetime.now(timezone.utc) + timedelta(hours=8)
+    start_dt = end_dt - timedelta(days=max(int(days * 3.0), 160))
+    raw = _finmind_get_data(
+        "TaiwanStockInstitutionalInvestorsBuySell",
+        data_id=code,
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d"),
+        allow_empty=True,
+    )
+    if raw.empty:
+        print(f"⚠️ FinMind 三大法人資料為空：{code}")
+        return pd.DataFrame()
+    out = _standardize_institutional_long_df(raw.fillna(0), code, days, "FinMind")
+    if out is None or out.empty:
+        raise RuntimeError(f"FinMind 三大法人欄位無法標準化：{code}｜{raw.columns.tolist()}")
+    return out
+
+
+def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
+    """保留舊函式名稱；只使用 FinMind。"""
+    return fetch_inst_60d_from_finmind_token(stock_code, days=days)
+
+
+def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
+    """取得市場實際有成交的日期。
+
+    不直接採用 TaiwanStockTradingDate，因為該表可能先列入原訂開市日，
+    但臨時颱風休市後未即時移除。改用 0050（可由環境變數調整）的
+    TaiwanStockPrice 實際成交日期，避免把臨時休市日送進 storage_objects。
+    """
+    global _FINMIND_TRADING_DATE_CACHE
+
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    reference_stock = _normalize_stock_name_code_key(FINMIND_TRADING_DATE_REFERENCE_STOCK)
+    cache_key = (
+        reference_stock,
+        start_ts.strftime("%Y-%m-%d"),
+        end_ts.strftime("%Y-%m-%d"),
+    )
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        cache_store = (
+            _FINMIND_TRADING_DATE_CACHE
+            if isinstance(_FINMIND_TRADING_DATE_CACHE, dict)
+            else {}
+        )
+        cached = cache_store.get(cache_key)
+        if cached is not None:
+            return [pd.Timestamp(x).normalize() for x in cached]
+
+    raw = _finmind_get_data(
+        "TaiwanStockPrice",
+        data_id=reference_stock,
+        start_date=start_ts.strftime("%Y-%m-%d"),
+        end_date=end_ts.strftime("%Y-%m-%d"),
+        allow_empty=False,
+    )
+    if "date" not in raw.columns:
+        raise RuntimeError(
+            "FinMind TaiwanStockPrice 缺少 date 欄位，"
+            f"無法建立實際交易日：{raw.columns.tolist()}"
+        )
+
+    actual_dates = (
+        pd.to_datetime(raw["date"], errors="coerce")
+        .dropna()
+        .dt.normalize()
+        .drop_duplicates()
+        .sort_values()
+    )
+    actual_dates = actual_dates[
+        (actual_dates >= start_ts) & (actual_dates <= end_ts)
+    ]
+    dates = [pd.Timestamp(x).normalize() for x in actual_dates.tolist()]
+    if not dates:
+        raise RuntimeError(
+            f"FinMind TaiwanStockPrice 找不到 {reference_stock} 在 "
+            f"{start_ts.date()} ~ {end_ts.date()} 的實際成交日"
+        )
+
+    with _FINMIND_DATA_CACHE_LOCK:
+        if not isinstance(_FINMIND_TRADING_DATE_CACHE, dict):
+            _FINMIND_TRADING_DATE_CACHE = {}
+        _FINMIND_TRADING_DATE_CACHE[cache_key] = list(dates)
+
+    print(
+        f"📅 FinMind 實際交易日：以 {reference_stock} TaiwanStockPrice 為準｜"
+        f"{len(dates):,} 日｜{dates[0].date()} ~ {dates[-1].date()}"
+    )
+    return dates
+
+
+def _finmind_get_warrant_summary(stock_code: str, start_date, end_date) -> pd.DataFrame:
+    code = _normalize_stock_name_code_key(stock_code)
+    cache_key = code
+    with _FINMIND_DATA_CACHE_LOCK:
+        cached = _FINMIND_WARRANT_SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            raw = cached.copy()
+        else:
+            raw = None
+    if raw is None:
+        raw = _finmind_get_data(
+            "TaiwanStockInfoWithWarrantSummary",
+            data_id=code,
+            allow_empty=True,
+        ).fillna("")
+        with _FINMIND_DATA_CACHE_LOCK:
+            _FINMIND_WARRANT_SUMMARY_CACHE[cache_key] = raw.copy()
+
+    if raw.empty:
+        print(f"ℹ️ FinMind 找不到 {code} 的權證標的對照")
+        return pd.DataFrame()
+    required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
+    missing = required - set(raw.columns)
+    if missing:
+        _finmind_debug_print_df("TaiwanStockInfoWithWarrantSummary 欄位不足", raw)
+        raise RuntimeError(
+            f"FinMind TaiwanStockInfoWithWarrantSummary 欄位不足：{sorted(missing)}｜"
+            f"實際欄位={raw.columns.tolist()}"
+        )
+
+    df = raw.copy()
+    df["stock_id"] = df["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    df["target_stock_id"] = df["target_stock_id"].astype(str).map(_normalize_stock_name_code_key)
+    df["listing_date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["last_trade_date"] = pd.to_datetime(df["end_date"], errors="coerce").dt.normalize()
+    df["type"] = df["type"].astype(str).str.strip()
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    df = df[
+        (df["target_stock_id"] == code)
+        & df["type"].str.contains("認購", na=False)
+        & df["listing_date"].notna()
+        & df["last_trade_date"].notna()
+        & (df["listing_date"] <= end_ts)
+        & (df["last_trade_date"] >= start_ts)
+    ].copy()
+    df = df.drop_duplicates(
+        subset=["stock_id", "target_stock_id", "listing_date", "last_trade_date"],
+        keep="last",
+    )
+    print(
+        f"✅ FinMind 認購權證區間對照：{code}｜{len(df):,} 段｜"
+        f"查詢 {start_ts.date()} ~ {end_ts.date()}"
+    )
+    return df
+
+
+def _finmind_warrant_name_map() -> Dict[str, str]:
+    try:
+        df = _finmind_load_stock_info_with_warrant()
+    except Exception as exc:
+        print(f"⚠️ FinMind 權證名稱總覽讀取失敗，名稱暫以代號顯示：{exc}")
+        return {}
+    if df.empty:
+        return {}
+    work = df[["stock_id", "stock_name"]].copy()
+    if "date" in df.columns:
+        work["date"] = pd.to_datetime(df["date"], errors="coerce")
+        work = work.sort_values("date")
+    work = work.drop_duplicates(subset=["stock_id"], keep="last")
+    return dict(zip(work["stock_id"].astype(str), work["stock_name"].astype(str)))
+
+
+def _finmind_target_warrant_name_map(summary_df: pd.DataFrame) -> Dict[str, str]:
+    """只建立本次目標股票的權證名稱表；官方資料完整時不載入 19 萬筆全市場名稱。"""
+    if summary_df is None or summary_df.empty or "stock_id" not in summary_df.columns:
+        return {}
+
+    codes = set(summary_df["stock_id"].astype(str).map(normalize_openapi_warrant_code))
+    codes.discard("")
+    result = {}
+
+    # FinMind summary 若未來直接提供名稱，優先就地使用。
+    for name_col in ["stock_name", "warrant_name", "name", "證券名稱", "權證名稱"]:
+        if name_col not in summary_df.columns:
+            continue
+        for code, name in zip(summary_df["stock_id"], summary_df[name_col]):
+            normalized_code = normalize_openapi_warrant_code(code)
+            clean_name = str(name or "").strip()
+            if normalized_code and clean_name:
+                result[normalized_code] = clean_name
+        if result:
+            break
+
+    # 官方 TWSE／TPEx 權證資料通常已涵蓋目前有效權證，直接補名稱與發行商。
+    official_map = _finmind_official_warrant_issuer_map()
+    for code in codes:
+        if code in result:
+            continue
+        rec = official_map.get(code, {})
+        official_name = str(rec.get("official_warrant_name", "") or "").strip()
+        if official_name:
+            result[code] = official_name
+
+    missing = codes - set(result)
+    if not missing:
+        print(f"⚡ 目標權證名稱表：官方／Summary 已涵蓋 {len(result):,} 支，略過全市場 19 萬筆名稱總覽")
+        return result
+
+    # 官方資料暫時缺漏時才保留原本全市場 FinMind 名稱備援，避免圖卡顯示權證代號。
+    print(f"ℹ️ 目標權證名稱尚缺 {len(missing):,} 支，啟用 FinMind 全市場名稱備援")
+    full_map = _finmind_warrant_name_map()
+    for code in missing:
+        name = str(full_map.get(code, "") or "").strip()
+        if name:
+            result[code] = name
+    return result
+
+
+def _finmind_active_warrant_codes(summary_df: pd.DataFrame, trade_date) -> set:
+    if summary_df is None or summary_df.empty:
+        return set()
+    day = pd.Timestamp(trade_date).normalize()
+    hit = summary_df[
+        (summary_df["listing_date"] <= day)
+        & (summary_df["last_trade_date"] >= day)
+    ]
+    return set(hit["stock_id"].astype(str))
+
+
+
+def _finmind_process_warrant_day(
+    trade_date,
+    active_codes: set,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """處理單日歷史事件；缺少共用精簡檔時，本次直接建立並立即重用。"""
+    if not active_codes:
+        return pd.DataFrame()
+    trader_name_map = trader_name_map or {}
+
+    if FINMIND_MARKET_COMPACT_CACHE_ENABLE:
+        compact_result = _finmind_build_market_compact_day(
+            trade_date,
+            trader_name_map,
+            force_refresh=False,
+            allow_not_ready=False,
+            return_frame=True,
+        )
+        compact_path, compact = compact_result if isinstance(compact_result, tuple) else (compact_result, pd.DataFrame())
+        if compact is None or compact.empty:
+            return pd.DataFrame()
+        work = compact.copy()
+        work["warrant_code"] = work["warrant_code"].astype(str).map(normalize_openapi_warrant_code)
+        work = work[work["warrant_code"].isin(set(active_codes))].copy()
+        if work.empty:
+            return pd.DataFrame()
+        work["warrant_name"] = work["warrant_code"].map(warrant_name_map).fillna(work["warrant_code"])
+        work["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+        work["underlying_name"] = str(stock_name or "")
+        return work[[
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+            "net_amount", "buy_shares", "sell_shares", "side",
+        ]].reset_index(drop=True)
+
+    # 關閉共用精簡快取時保留原本的目標權證快速篩選路徑。
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    path = _finmind_download_warrant_day(trade_date, allow_not_ready=False)
+    columns = [
+        "securities_trader", "price", "buy", "sell",
+        "securities_trader_id", "stock_id", "date",
+    ]
+    codes = sorted(active_codes)
+    try:
+        raw = pd.read_parquet(path, columns=columns, filters=[("stock_id", "in", codes)])
+    except Exception:
+        raw = pd.read_parquet(path, columns=columns)
+        raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        raw = raw[raw["stock_id"].isin(active_codes)].copy()
+    if raw.empty:
+        return pd.DataFrame()
+
+    raw = raw.copy()
+    raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    raw = raw[raw["stock_id"].isin(active_codes)].copy()
+    raw["price"] = pd.to_numeric(raw["price"], errors="coerce").fillna(0.0)
+    raw["buy"] = pd.to_numeric(raw["buy"], errors="coerce").fillna(0.0)
+    raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
+    raw["buy_amount_row"] = raw["price"] * raw["buy"]
+    raw["sell_amount_row"] = raw["price"] * raw["sell"]
+    raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+    raw_branch = raw["securities_trader"].astype(str).str.strip()
+    mapped_branch = raw["broker_code"].map(trader_name_map).fillna("").astype(str)
+    raw["branch"] = np.where(mapped_branch.str.strip() != "", mapped_branch, raw_branch)
+    raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+    raw = raw[(raw["branch"] != "") & (raw["broker_code"] != "")]
+
+    grouped = raw.groupby(["broker_code", "branch", "stock_id"], as_index=False, dropna=False).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount_row", "sum"),
+        sell_amount=("sell_amount_row", "sum"),
+    ).rename(columns={"stock_id": "warrant_code"})
+    grouped["Date"] = pd.Timestamp(date_s)
+    grouped["warrant_name"] = grouped["warrant_code"].map(warrant_name_map).fillna(grouped["warrant_code"])
+    grouped["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+    grouped["underlying_name"] = str(stock_name or "")
+    grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+    grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+    grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+    grouped = grouped[(grouped["buy_amount"] != 0) | (grouped["sell_amount"] != 0)].copy()
+    grouped["side"] = np.where(grouped["net_amount"] >= 0, "買超", "賣超")
+    return grouped[[
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]]
+
+
+
+def _finmind_process_warrant_day_union(
+    trade_date,
+    active_codes_by_stock: Dict[str, set],
+    warrant_name_maps: Dict[str, Dict[str, str]],
+    stock_names: Dict[str, str],
+    trader_name_map: Dict[str, str],
+) -> Dict[str, pd.DataFrame]:
+    """多股票共用：單日全市場 Parquet 只讀一次，再依有效權證代號拆回各標的股。"""
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    union_codes = set()
+    for codes in active_codes_by_stock.values():
+        union_codes.update(set(codes or set()))
+    if not union_codes:
+        return {}
+
+    path = _finmind_download_warrant_day(trade_date, allow_not_ready=False)
+    columns = [
+        "securities_trader", "price", "buy", "sell",
+        "securities_trader_id", "stock_id", "date",
+    ]
+    sorted_codes = sorted(union_codes)
+    try:
+        raw = pd.read_parquet(path, columns=columns, filters=[("stock_id", "in", sorted_codes)])
+    except Exception:
+        raw = pd.read_parquet(path, columns=columns)
+        raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        raw = raw[raw["stock_id"].isin(union_codes)].copy()
+    if raw.empty:
+        return {code: pd.DataFrame() for code in active_codes_by_stock}
+
+    raw = raw.copy()
+    _finmind_debug_print_df(
+        f"多股票聯集權證分點 Parquet 實際格式｜{date_s}",
+        raw,
+        once_key="schema:TaiwanStockWarrantTradingDailyReport:parquet",
+    )
+    raw["stock_id"] = raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    raw = raw[raw["stock_id"].isin(union_codes)].copy()
+    if raw.empty:
+        return {code: pd.DataFrame() for code in active_codes_by_stock}
+
+    raw["price"] = pd.to_numeric(raw["price"], errors="coerce").fillna(0.0)
+    raw["buy"] = pd.to_numeric(raw["buy"], errors="coerce").fillna(0.0)
+    raw["sell"] = pd.to_numeric(raw["sell"], errors="coerce").fillna(0.0)
+    raw["buy_amount_row"] = raw["price"] * raw["buy"]
+    raw["sell_amount_row"] = raw["price"] * raw["sell"]
+    raw["raw_securities_trader"] = raw["securities_trader"].astype(str).str.strip()
+    raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+    raw["mapped_branch"] = raw["broker_code"].map(trader_name_map).fillna("").astype(str)
+    raw["branch"] = np.where(
+        raw["mapped_branch"].astype(str).str.strip() != "",
+        raw["mapped_branch"],
+        raw["raw_securities_trader"],
+    )
+    raw["branch"] = pd.Series(raw["branch"], index=raw.index).map(normalize_branch_name)
+    raw = raw[(raw["branch"] != "") & (raw["broker_code"] != "")]
+
+    grouped = raw.groupby(
+        ["broker_code", "branch", "stock_id"],
+        as_index=False,
+        dropna=False,
+    ).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount_row", "sum"),
+        sell_amount=("sell_amount_row", "sum"),
+    )
+
+    output = {}
+    for stock_code, active_codes in active_codes_by_stock.items():
+        code = _normalize_stock_name_code_key(stock_code)
+        part = grouped[grouped["stock_id"].isin(set(active_codes or set()))].copy()
+        if part.empty:
+            output[code] = pd.DataFrame()
+            continue
+        part = part.rename(columns={"stock_id": "warrant_code"})
+        part["Date"] = pd.Timestamp(date_s)
+        name_map = warrant_name_maps.get(code, {}) or {}
+        part["warrant_name"] = part["warrant_code"].map(name_map).fillna(part["warrant_code"])
+        part["underlying_code"] = code
+        part["underlying_name"] = str(stock_names.get(code, code) or code)
+        part["buy_shares"] = part["buy_shares_raw"] / 1000.0
+        part["sell_shares"] = part["sell_shares_raw"] / 1000.0
+        part["net_amount"] = part["buy_amount"] - part["sell_amount"]
+        part = part[
+            (part["buy_amount"] != 0)
+            | (part["sell_amount"] != 0)
+            | (part["net_amount"] != 0)
+        ].copy()
+        part["side"] = np.where(part["net_amount"] >= 0, "買超", "賣超")
+        output[code] = part[[
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+            "net_amount", "buy_shares", "sell_shares", "side",
+        ]]
+    return output
+
+
+def _finmind_prepare_multi_stock_warrant_events(stock_codes: List[str]):
+    """多股票預處理：每個交易日只解析一次全市場 Parquet，結果按股票保存在記憶體。"""
+    global _FINMIND_MULTI_STOCK_PREFETCH_READY
+    global _FINMIND_MULTI_STOCK_PREFETCH_RANGE
+    global _FINMIND_MULTI_STOCK_EVENT_CACHE
+    global _FINMIND_MULTI_STOCK_SUMMARY_CACHE
+    global _FINMIND_MULTI_STOCK_NAME_MAP_CACHE
+
+    codes = []
+    for raw_code in stock_codes or []:
+        code = _normalize_stock_name_code_key(raw_code)
+        if code and code not in codes:
+            codes.append(code)
+    if (
+        not FINMIND_MULTI_STOCK_DAILY_READ_ONCE_ENABLE
+        or len(codes) < FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS
+    ):
+        return False
+
+    with _FINMIND_MULTI_STOCK_PREFETCH_LOCK:
+        if _FINMIND_MULTI_STOCK_PREFETCH_READY and set(codes).issubset(_FINMIND_MULTI_STOCK_EVENT_CACHE):
+            return True
+
+        end_ts = get_taipei_today_ts()
+        start_ts = end_ts - pd.Timedelta(days=FINMIND_MULTI_STOCK_PREFETCH_CALENDAR_DAYS - 1)
+        print(
+            f"🚀 多股票權證聯集預處理：{len(codes)} 檔｜"
+            f"{start_ts.date()} ~ {end_ts.date()}｜每日 Parquet 只讀一次"
+        )
+
+        # 多檔摘要並行前先啟動單一官方發行商 Future，避免每個 metadata worker 各自重抓官方來源。
+        _finmind_start_official_warrant_issuer_prefetch()
+
+        stock_names = {}
+        summaries = {}
+        name_maps = {}
+        metadata_failures = []
+
+        def prepare_stock_metadata(code: str):
+            stock_name = get_tw_stock_name(code)
+            summary = _finmind_get_warrant_summary(code, start_ts, end_ts)
+            name_map = _finmind_target_warrant_name_map(summary) if summary is not None and not summary.empty else {}
+            return code, stock_name, summary, name_map
+
+        with ThreadPoolExecutor(max_workers=min(8, len(codes))) as metadata_executor:
+            metadata_future_map = {
+                metadata_executor.submit(prepare_stock_metadata, code): code
+                for code in codes
+            }
+            for future in as_completed(metadata_future_map):
+                code = metadata_future_map[future]
+                try:
+                    result_code, stock_name, summary, name_map = future.result()
+                    stock_names[result_code] = stock_name
+                    summaries[result_code] = summary
+                    name_maps[result_code] = name_map
+                except Exception as exc:
+                    metadata_failures.append((code, str(exc)))
+                    print(f"❌ 多股票標的／權證摘要預載失敗：{code}｜{exc}")
+
+        if metadata_failures:
+            sample = "；".join(f"{code}:{error[:120]}" for code, error in metadata_failures[:5])
+            message = f"多股票標的／權證摘要預載不完整：{len(metadata_failures)}/{len(codes)} 檔｜{sample}"
+            if FINMIND_STRICT_WARRANT_COMPLETENESS:
+                raise RuntimeError(message)
+            print(f"⚠️ {message}｜退回逐股票流程")
+            return False
+
+        trading_dates = _finmind_get_trading_dates(start_ts, end_ts)
+        if not trading_dates:
+            return False
+
+        latest_available = None
+        for day in reversed(trading_dates[-FINMIND_WARRANT_LATEST_PROBE_DAYS:]):
+            probe_path = _finmind_download_warrant_day(day, allow_not_ready=True)
+            if probe_path:
+                latest_available = pd.Timestamp(day).normalize()
+                break
+        if latest_available is None:
+            raise RuntimeError("多股票預處理找不到最近可用的 FinMind 權證分點日檔")
+
+        missing_price_based_dates = [
+            pd.Timestamp(day).normalize()
+            for day in trading_dates
+            if pd.Timestamp(day).normalize() > latest_available
+        ]
+        # 最新日 API 只能補最末一個交易日；若 Parquet 落後兩個以上交易日，
+        # 中間日期會永久缺漏。API 關閉時，即使只落後一日也沒有任何補齊來源。
+        parquet_gap_unrecoverable = bool(
+            len(missing_price_based_dates) > 1
+            or (missing_price_based_dates and not FINMIND_WARRANT_LATEST_DAY_API_ENABLE)
+        )
+        if parquet_gap_unrecoverable:
+            missing_text = ",".join(day.strftime("%Y-%m-%d") for day in missing_price_based_dates)
+            recovery_reason = (
+                "最新日 API 無法補齊中間缺日"
+                if len(missing_price_based_dates) > 1
+                else "最新日 API 已關閉，無法補齊缺日"
+            )
+            message = (
+                f"多股票預處理偵測到 FinMind Parquet 落後 {len(missing_price_based_dates)} 個交易日："
+                f"latest_available={latest_available.date()}｜price_based_missing={missing_text}｜"
+                f"{recovery_reason}"
+            )
+            if FINMIND_STRICT_WARRANT_COMPLETENESS:
+                raise RuntimeError(message)
+            print(f"⚠️ {message}｜退回逐股票流程")
+            return False
+        if missing_price_based_dates:
+            print(
+                f"ℹ️ 多股票預處理 Parquet 僅落後最新交易日：{missing_price_based_dates[-1].date()}｜"
+                "後續由最新日權證 API 補齊"
+            )
+        trading_dates = [d for d in trading_dates if d <= latest_available]
+
+        trader_name_map, _ = _finmind_securities_trader_maps()
+        jobs = []
+        active_date_count = {code: 0 for code in codes}
+        for day in trading_dates:
+            active_by_stock = {}
+            for code in codes:
+                active_codes = _finmind_active_warrant_codes(summaries.get(code), day)
+                if active_codes:
+                    active_by_stock[code] = active_codes
+                    active_date_count[code] += 1
+            if active_by_stock:
+                jobs.append((day, active_by_stock))
+
+        frames_by_stock = {code: [] for code in codes}
+        failures = []
+        failed_dates_by_stock = {code: set() for code in codes}
+        completed = 0
+        with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_DOWNLOAD_WORKERS) as executor:
+            future_map = {
+                executor.submit(
+                    _finmind_process_warrant_day_union,
+                    day,
+                    active_by_stock,
+                    name_maps,
+                    stock_names,
+                    trader_name_map,
+                ): (day, tuple(active_by_stock.keys()))
+                for day, active_by_stock in jobs
+            }
+            for future in as_completed(future_map):
+                day, active_stock_codes = future_map[future]
+                completed += 1
+                try:
+                    day_map = future.result()
+                    for code, day_df in (day_map or {}).items():
+                        if day_df is not None and not day_df.empty:
+                            frames_by_stock.setdefault(code, []).append(day_df)
+                except Exception as exc:
+                    day_s = pd.Timestamp(day).strftime("%Y-%m-%d")
+                    failures.append((day_s, str(exc)))
+                    for failed_code in active_stock_codes:
+                        failed_dates_by_stock.setdefault(failed_code, set()).add(day_s)
+                    print(f"❌ 多股票聯集 Parquet 日期失敗：{pd.Timestamp(day).date()}｜{exc}")
+                if completed == 1 or completed % 5 == 0 or completed == len(jobs):
+                    print(
+                        f"📊 多股票聯集進度：{completed}/{len(jobs)}｜"
+                        f"失敗={len(failures)}"
+                    )
+
+        if failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
+            samples = "；".join(f"{d}:{err[:120]}" for d, err in failures[:5])
+            raise RuntimeError(
+                f"多股票 FinMind 權證分點不完整：失敗 {len(failures)}/{len(jobs)} 日｜{samples}"
+            )
+
+        event_cache = {}
+        for code in codes:
+            frames = frames_by_stock.get(code, [])
+            if frames:
+                events = _concat_warrant_event_frames(frames)
+                events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+                events = events.dropna(subset=["Date"])
+                events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+                events.attrs["_warrant_events_normalized"] = True
+            else:
+                events = pd.DataFrame()
+            event_cache[code] = events
+            total_active_dates = int(active_date_count.get(code, 0))
+            failed_date_list = sorted(failed_dates_by_stock.get(code, set()))
+            failed_date_count = len(failed_date_list)
+            successful_date_count = max(0, total_active_dates - failed_date_count)
+            event_date_count = int(events["Date"].nunique()) if not events.empty else 0
+            _FINMIND_WARRANT_RUN_STATS[code] = {
+                "total_dates": total_active_dates,
+                "success_dates": successful_date_count,
+                "empty_dates": max(0, successful_date_count - event_date_count),
+                "failed_dates": failed_date_count,
+                "failed_date_list": failed_date_list,
+                "latest_available_date": latest_available.strftime("%Y-%m-%d"),
+            }
+            print(f"✅ 多股票聯集拆分：{code} {stock_names.get(code, code)}｜{len(events):,} 筆")
+
+        _FINMIND_MULTI_STOCK_EVENT_CACHE = event_cache
+        _FINMIND_MULTI_STOCK_SUMMARY_CACHE = summaries
+        _FINMIND_MULTI_STOCK_NAME_MAP_CACHE = name_maps
+        _FINMIND_MULTI_STOCK_PREFETCH_RANGE = (start_ts, end_ts)
+        _FINMIND_MULTI_STOCK_PREFETCH_READY = True
+        print(
+            f"✅ 多股票權證聯集預處理完成：{len(codes)} 檔｜"
+            f"交易日 {len(jobs)} 日｜失敗 {len(failures)} 日"
+        )
+        return True
+
+
+def _finmind_get_multi_stock_prefetched_events(stock_code: str, start_date, end_date):
+    code = _normalize_stock_name_code_key(stock_code)
+    with _FINMIND_MULTI_STOCK_PREFETCH_LOCK:
+        if not _FINMIND_MULTI_STOCK_PREFETCH_READY or code not in _FINMIND_MULTI_STOCK_EVENT_CACHE:
+            return None
+        range_start, range_end = _FINMIND_MULTI_STOCK_PREFETCH_RANGE
+        start_ts = pd.Timestamp(start_date).normalize()
+        end_ts = pd.Timestamp(end_date).normalize()
+        if pd.isna(range_start) or pd.isna(range_end) or start_ts < range_start or end_ts > range_end:
+            return None
+        events = _FINMIND_MULTI_STOCK_EVENT_CACHE.get(code)
+        if events is None:
+            return pd.DataFrame()
+        out = events.copy()
+        if not out.empty:
+            out = out[(out["Date"] >= start_ts) & (out["Date"] <= end_ts)].copy()
+        result = out.reset_index(drop=True)
+        if not result.empty:
+            result.attrs["_warrant_events_normalized"] = True
+        return result
+
+def _events_to_gsheet_history_df(events_df: pd.DataFrame, stock_code: str, stock_name: str, start_date=None, end_date=None) -> pd.DataFrame:
+    if events_df is None or events_df.empty:
+        return pd.DataFrame(columns=GSHEET_WARRANT_HISTORY_HEADERS)
+    e = events_df.copy().fillna("")
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    out = pd.DataFrame()
+    out["日期"] = e["Date"].dt.strftime("%Y/%m/%d")
+    out["權證代號"] = e["warrant_code"].map(normalize_openapi_warrant_code)
+    out["權證名稱"] = e["warrant_name"].astype(str).str.strip()
+    out["標的股"] = e["underlying_code"].astype(str).str.strip().replace("", str(stock_code))
+    out["標的名稱"] = e["underlying_name"].astype(str).str.strip().replace("", str(stock_name))
+    out["分點"] = e["branch"].astype(str).map(normalize_branch_name)
+    out["分點名稱"] = out["分點"]
+    out["券商代號"] = e["broker_code"].astype(str).str.strip()
+    out["買進金額"] = pd.to_numeric(e["buy_amount"], errors="coerce").fillna(0.0)
+    out["賣出金額"] = pd.to_numeric(e["sell_amount"], errors="coerce").fillna(0.0)
+    out["買超金額"] = pd.to_numeric(e["net_amount"], errors="coerce").fillna(0.0)
+    out["買進張數"] = pd.to_numeric(e.get("buy_shares", 0), errors="coerce").fillna(0.0)
+    out["賣出張數"] = pd.to_numeric(e.get("sell_shares", 0), errors="coerce").fillna(0.0)
+    out["資料來源"] = FINMIND_WARRANT_SOURCE_LABEL
+    out["快取起日"] = _gsheet_cache_date_str(start_date)
+    out["快取迄日"] = _gsheet_cache_date_str(end_date)
+    out["更新時間"] = updated_at
+    return out[GSHEET_WARRANT_HISTORY_HEADERS]
+
+
+def load_gsheet_warrant_events_snapshot(stock_code: str, start_date=None, end_date=None) -> pd.DataFrame:
+    """只接受新版 FinMind 快照；舊 MoneyDJ 快照不再讀取。"""
+    if not GSHEET_WARRANT_CACHE_ENABLE or WARRANT_CACHE_FORCE_REFRESH:
+        return pd.DataFrame()
+    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
+    status_df = _read_gsheet_warrant_status()
+    if status_df is None or status_df.empty or "快取鍵" not in status_df.columns:
+        return pd.DataFrame()
+    matched = status_df[status_df["快取鍵"].astype(str) == key].copy()
+    if matched.empty:
+        return pd.DataFrame()
+    row = matched.tail(1).iloc[0]
+    if str(row.get("完整度狀態", "")).strip().lower() != "complete":
+        return pd.DataFrame()
+    if str(row.get("資料來源", "") or "").strip() != FINMIND_WARRANT_SOURCE_LABEL:
+        print(f"⚠️ 拒絕舊資料源權證快照：{key}｜將重新抓 FinMind")
+        return pd.DataFrame()
+    failed_count = int(pd.to_numeric(row.get("FinMind失敗日期", 0), errors="coerce") or 0)
+    expected_rows = int(pd.to_numeric(row.get("資料筆數", 0), errors="coerce") or 0)
+    if failed_count != 0 or expected_rows <= 0:
+        return pd.DataFrame()
+    snapshot_sheet = str(row.get("快照工作表", "") or "").strip() or _warrant_snapshot_worksheet_title(stock_code)
+    sh = _open_warrant_cache_gsheet(create_if_missing=False)
+    raw_snapshot = _read_worksheet_from_spreadsheet(sh, snapshot_sheet)
+    events = normalize_history_cache_df(raw_snapshot)
+    if events.empty:
+        return pd.DataFrame()
+    code = _normalize_stock_name_code_key(stock_code)
+    events = events[events["underlying_code"].astype(str) == code].copy()
+    if start_date is not None:
+        events = events[events["Date"] >= pd.Timestamp(start_date).normalize()]
+    if end_date is not None:
+        events = events[events["Date"] <= pd.Timestamp(end_date).normalize()]
+    if len(events) != expected_rows:
+        print(f"⚠️ FinMind 快照筆數不一致：{key}｜狀態={expected_rows:,}｜實際={len(events):,}")
+        return pd.DataFrame()
+    print(f"☁️ FinMind Google Sheet 快照命中：{key}｜{len(events):,} 筆")
+    return events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+
+def save_gsheet_warrant_events_snapshot(stock_code: str, stock_name: str, events_df: pd.DataFrame, start_date=None, end_date=None):
+    if not GSHEET_WARRANT_CACHE_ENABLE or events_df is None or events_df.empty:
+        return
+    stats = dict(_FINMIND_WARRANT_RUN_STATS.get(_normalize_stock_name_code_key(stock_code), {}))
+    failed_dates = int(stats.get("failed_dates", 0) or 0)
+    if failed_dates > 0:
+        print(f"⚠️ FinMind 權證日期仍有失敗，不寫入完整快照：failed_dates={failed_dates}")
+        return
+    sh = _open_warrant_cache_gsheet(create_if_missing=True)
+    if sh is None:
+        print("⚠️ 權證快取試算表無法開啟，略過 FinMind 權證快取寫回")
+        return
+    key = _gsheet_cache_key(stock_code, start_date=start_date, end_date=end_date)
+    snapshot_sheet = _warrant_snapshot_worksheet_title(stock_code, start_date, end_date)
+    updated_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    new_history = _events_to_gsheet_history_df(events_df, stock_code, stock_name, start_date, end_date)
+    history_ws = _get_or_create_worksheet(
+        sh,
+        snapshot_sheet,
+        rows=max(len(new_history) + 1, 1000),
+        cols=len(GSHEET_WARRANT_HISTORY_HEADERS),
+    )
+    _update_worksheet_from_df(history_ws, new_history, GSHEET_WARRANT_HISTORY_HEADERS)
+
+    status_ws = _get_or_create_worksheet(
+        sh,
+        GSHEET_WARRANT_STATUS_SHEET,
+        rows=200,
+        cols=len(GSHEET_WARRANT_STATUS_HEADERS),
+    )
+    old_status = _worksheet_to_df(status_ws)
+    if old_status is not None and not old_status.empty and "快取鍵" in old_status.columns:
+        # 只覆蓋完全相同的快取鍵；同一標的不同日期區間的快照狀態必須同時保留。
+        old_status = old_status[old_status["快取鍵"].astype(str) != str(key)].copy()
+    else:
+        old_status = pd.DataFrame(columns=GSHEET_WARRANT_STATUS_HEADERS)
+
+    new_status = pd.DataFrame([{
+        "快取鍵": key,
+        "標的股": _normalize_stock_name_code_key(stock_code),
+        "標的名稱": str(stock_name or ""),
+        "快取起日": _gsheet_cache_date_str(start_date),
+        "快取迄日": _gsheet_cache_date_str(end_date),
+        "完整度狀態": "complete",
+        "資料來源": FINMIND_WARRANT_SOURCE_LABEL,
+        "FinMind交易日總數": int(stats.get("total_dates", 0) or 0),
+        "FinMind成功日期": int(stats.get("success_dates", 0) or 0),
+        "FinMind空資料日期": int(stats.get("empty_dates", 0) or 0),
+        "FinMind失敗日期": failed_dates,
+        "資料筆數": int(len(new_history)),
+        "快照工作表": snapshot_sheet,
+        "更新時間": updated_at,
+    }])
+    all_status = pd.concat([old_status, new_status], ignore_index=True, sort=False).fillna("")
+    _update_worksheet_from_df(status_ws, all_status, GSHEET_WARRANT_STATUS_HEADERS)
+    print(
+        f"✅ FinMind 權證快照已寫入 Google Sheet：{key}｜"
+        f"工作表={snapshot_sheet}｜{len(new_history):,} 筆"
+    )
+
+
+def _finmind_recent_history_warrant_codes(
+    historical_events: pd.DataFrame | None,
+    latest_day,
+    lookback_trading_days: int,
+) -> set:
+    """取得最新日前最近 N 個實際有事件交易日出現過的權證代號。"""
+    if historical_events is None or historical_events.empty:
+        return set()
+    if "Date" not in historical_events.columns or "warrant_code" not in historical_events.columns:
+        return set()
+
+    day = pd.Timestamp(latest_day).normalize()
+    work = historical_events[["Date", "warrant_code"]].copy()
+    work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work["warrant_code"] = work["warrant_code"].map(normalize_openapi_warrant_code)
+    work = work.dropna(subset=["Date"])
+    work = work[(work["Date"] < day) & (work["warrant_code"] != "")]
+    if work.empty:
+        return set()
+
+    recent_dates = sorted(work["Date"].drop_duplicates().tolist())[-max(1, int(lookback_trading_days)):]
+    return set(work.loc[work["Date"].isin(recent_dates), "warrant_code"].astype(str))
+
+
+def _finmind_fetch_selected_branch_day_raw(
+    securities_trader_id: str,
+    trade_date,
+) -> tuple[pd.DataFrame, dict]:
+    """以分點 ID 查詢單日全部權證，用於最新日權證母體補漏與精選分點核對。"""
+    broker_id = str(securities_trader_id or "").strip()
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    diagnostic = {
+        "securities_trader_id": broker_id,
+        "date": date_s,
+        "http_status": 0,
+        "payload_keys": [],
+        "message": "",
+        "rows": 0,
+    }
+    if not broker_id:
+        diagnostic["message"] = "empty securities_trader_id"
+        return pd.DataFrame(), diagnostic
+
+    last_error = None
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
+        try:
+            _finmind_wait_for_rate_limit_gate()
+            resp = get_thread_session().get(
+                FINMIND_WARRANT_BRANCH_URL,
+                headers=_finmind_headers(),
+                params={"securities_trader_id": broker_id, "date": date_s},
+                timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+            )
+            diagnostic["http_status"] = int(resp.status_code)
+            if resp.status_code in (401, 402, 403, 429):
+                _, message = _finmind_error_payload_from_response(resp)
+                diagnostic["message"] = message
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日精選分點 API｜分點={broker_id}｜date={date_s}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 最新日精選分點 API 授權失敗：HTTP {resp.status_code}｜{message}"
+                )
+            if resp.status_code == 404:
+                diagnostic["message"] = resp.text[:500]
+                return pd.DataFrame(), diagnostic
+            resp.raise_for_status()
+            payload = resp.json()
+            diagnostic["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else []
+            diagnostic["message"] = _finmind_error_message(payload)
+            payload_status = payload.get("status", 200) if isinstance(payload, dict) else 200
+            if str(payload_status) not in ("200", "success", "True", "true"):
+                if _finmind_is_rate_limit(payload_status, diagnostic["message"]):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日精選分點 API｜分點={broker_id}｜date={date_s}",
+                        quota_attempt,
+                        diagnostic["message"],
+                    )
+                    continue
+                raise RuntimeError(
+                    f"FinMind 最新日精選分點 API 回傳失敗：status={payload_status}｜"
+                    f"{diagnostic['message']}"
+                )
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            df = pd.DataFrame(data)
+            if not df.empty:
+                if "securities_trader_id" not in df.columns:
+                    df["securities_trader_id"] = broker_id
+                if "date" in df.columns:
+                    df["date"] = df["date"].astype(str)
+                    df = df[df["date"] == date_s].copy()
+            diagnostic["rows"] = int(len(df))
+            _finmind_debug_print_df(
+                f"最新日精選分點 API 實際格式｜分點={broker_id}｜{date_s}",
+                df,
+                once_key="schema:latest-selected-branch-api",
+            )
+            return df, diagnostic
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
+        except Exception as exc:
+            last_error = exc
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
+                break
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
+            print(
+                f"⚠️ FinMind 最新日精選分點 API 重試 "
+                f"{normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                f"分點={broker_id}｜date={date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
+            )
+            time.sleep(wait_sec)
+
+    diagnostic["message"] = str(last_error or "unknown error")
+    raise RuntimeError(
+        f"FinMind 最新日精選分點 API 最終失敗："
+        f"分點={broker_id}｜date={date_s}｜{last_error}"
+    )
+
+
+def _finmind_discover_selected_branch_latest_day_rows(
+    selected_branch_id_map: Dict[str, set] | None,
+    trade_date,
+    target_warrant_codes: set,
+) -> tuple[pd.DataFrame, dict]:
+    """直接查本次精選分點，找出最新日漏網權證並保留核對用原始列。"""
+    branch_ids = sorted({
+        str(branch_id or "").strip()
+        for ids in (selected_branch_id_map or {}).values()
+        for branch_id in (ids or set())
+        if str(branch_id or "").strip()
+    })
+    stats = {
+        "branch_ids": len(branch_ids),
+        "success_branch_ids": 0,
+        "failed_branch_ids": 0,
+        "raw_rows": 0,
+        "target_rows": 0,
+        "target_codes": 0,
+    }
+    if (
+        not FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_DISCOVERY_ENABLE
+        or not branch_ids
+        or not target_warrant_codes
+    ):
+        return pd.DataFrame(), stats
+
+    frames = []
+    failures = []
+    workers = min(max(1, FINMIND_WARRANT_LATEST_DAY_API_WORKERS), len(branch_ids))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_finmind_fetch_selected_branch_day_raw, branch_id, trade_date): branch_id
+            for branch_id in branch_ids
+        }
+        for future in as_completed(future_map):
+            branch_id = future_map[future]
+            try:
+                raw, _ = future.result()
+                stats["success_branch_ids"] += 1
+                stats["raw_rows"] += int(len(raw))
+                if raw is None or raw.empty or "stock_id" not in raw.columns:
+                    continue
+                work = raw.copy().fillna("")
+                work["stock_id"] = work["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+                work = work[work["stock_id"].isin(target_warrant_codes)].copy()
+                if not work.empty:
+                    frames.append(work)
+            except (FinMindAuthorizationError, FinMindRateLimitError):
+                for pending in future_map:
+                    pending.cancel()
+                raise
+            except Exception as exc:
+                stats["failed_branch_ids"] += 1
+                failures.append((branch_id, str(exc)))
+
+    if failures:
+        preview = "；".join(f"{branch_id}:{error[:140]}" for branch_id, error in failures[:8])
+        message = (
+            f"最新日精選分點補漏查詢不完整：失敗 {len(failures)}/{len(branch_ids)} 個分點｜{preview}"
+        )
+        if FINMIND_WARRANT_LATEST_DAY_SELECTED_BRANCH_STRICT:
+            raise RuntimeError(message)
+        print(f"⚠️ {message}")
+
+    if not frames:
+        print(
+            f"🔎 最新日精選分點直接核對：日期={pd.Timestamp(trade_date).date()}｜"
+            f"分點={len(branch_ids)}個｜原始列={stats['raw_rows']:,}｜"
+            "目標標的列=0"
+        )
+        return pd.DataFrame(), stats
+
+    rows = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+    rows["stock_id"] = rows["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    rows = rows[rows["stock_id"].isin(target_warrant_codes)].copy()
+    stats["target_rows"] = int(len(rows))
+    stats["target_codes"] = int(rows["stock_id"].nunique())
+    print(
+        f"🔎 最新日精選分點直接核對：日期={pd.Timestamp(trade_date).date()}｜"
+        f"分點={len(branch_ids)}個｜原始列={stats['raw_rows']:,}｜"
+        f"目標標的列={len(rows):,}｜權證={stats['target_codes']:,}支"
+    )
+    return rows.reset_index(drop=True), stats
+
+
+def _finmind_fetch_warrant_code_day_raw(warrant_code: str, trade_date, cancel_event: threading.Event | None = None) -> tuple[pd.DataFrame, dict]:
+    """以權證代號查詢單日所有分點明細，回傳 DataFrame 與診斷資訊。"""
+    code = normalize_openapi_warrant_code(warrant_code)
+    date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+    diagnostic = {
+        "warrant_code": code,
+        "date": date_s,
+        "http_status": 0,
+        "payload_keys": [],
+        "message": "",
+        "rows": 0,
+    }
+    if not code:
+        diagnostic["message"] = "empty warrant code"
+        return pd.DataFrame(), diagnostic
+    if cancel_event is not None and cancel_event.is_set():
+        diagnostic["message"] = "cancelled"
+        return pd.DataFrame(), diagnostic
+
+    last_error = None
+    normal_attempt = 0
+    quota_attempt = 0
+    while normal_attempt < FINMIND_REQUEST_RETRIES:
+        if cancel_event is not None and cancel_event.is_set():
+            diagnostic["message"] = "cancelled"
+            return pd.DataFrame(), diagnostic
+        try:
+            _finmind_wait_for_rate_limit_gate()
+            if cancel_event is not None and cancel_event.is_set():
+                diagnostic["message"] = "cancelled"
+                return pd.DataFrame(), diagnostic
+            resp = get_thread_session().get(
+                FINMIND_WARRANT_BRANCH_URL,
+                headers=_finmind_headers(),
+                params={"data_id": code, "date": date_s},
+                timeout=(FINMIND_CONNECT_TIMEOUT, FINMIND_READ_TIMEOUT),
+            )
+            diagnostic["http_status"] = int(resp.status_code)
+            if resp.status_code in (401, 402, 403, 429):
+                _, message = _finmind_error_payload_from_response(resp)
+                diagnostic["message"] = message
+                if _finmind_is_rate_limit(resp.status_code, message):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日權證 API｜權證={code}｜date={date_s}",
+                        quota_attempt,
+                        message,
+                        resp=resp,
+                    )
+                    continue
+                raise FinMindAuthorizationError(
+                    f"FinMind 最新日權證 API 授權失敗：HTTP {resp.status_code}｜{message}"
+                )
+            if resp.status_code == 404:
+                diagnostic["message"] = resp.text[:500]
+                return pd.DataFrame(), diagnostic
+            resp.raise_for_status()
+            payload = resp.json()
+            diagnostic["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else []
+            diagnostic["message"] = _finmind_error_message(payload)
+            payload_status = payload.get("status", 200) if isinstance(payload, dict) else 200
+            if str(payload_status) not in ("200", "success", "True", "true"):
+                if _finmind_is_rate_limit(payload_status, diagnostic["message"]):
+                    quota_attempt += 1
+                    _finmind_wait_after_rate_limit(
+                        f"最新日權證 API｜權證={code}｜date={date_s}",
+                        quota_attempt,
+                        diagnostic["message"],
+                    )
+                    continue
+                raise RuntimeError(
+                    f"FinMind 最新日權證 API 回傳失敗：status={payload_status}｜"
+                    f"{diagnostic['message']}"
+                )
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            df = pd.DataFrame(data)
+            diagnostic["rows"] = int(len(df))
+            _finmind_debug_print_df(
+                f"最新日權證 API 實際格式｜權證={code}｜{date_s}",
+                df,
+                once_key="schema:latest-warrant-code-api",
+            )
+            return df, diagnostic
+        except (FinMindAuthorizationError, FinMindRateLimitError):
+            raise
+        except Exception as exc:
+            last_error = exc
+            normal_attempt += 1
+            if normal_attempt >= FINMIND_REQUEST_RETRIES:
+                break
+            wait_sec = FINMIND_RETRY_BASE_WAIT * normal_attempt
+            print(
+                f"⚠️ FinMind 最新日權證 API 重試 {normal_attempt}/{FINMIND_REQUEST_RETRIES - 1}｜"
+                f"權證={code}｜date={date_s}｜{exc}｜等待 {wait_sec:.1f} 秒"
+            )
+            if cancel_event is not None and cancel_event.wait(wait_sec):
+                diagnostic["message"] = "cancelled"
+                return pd.DataFrame(), diagnostic
+
+    diagnostic["message"] = str(last_error or "unknown error")
+    raise RuntimeError(
+        f"FinMind 最新日權證 API 最終失敗：權證={code}｜date={date_s}｜{last_error}"
+    )
+
+
+def _finmind_convert_warrant_code_rows(
+    raw: pd.DataFrame,
+    trade_date,
+    warrant_code: str,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+) -> pd.DataFrame:
+    """將單一權證 API 回傳的所有分點轉成既有 warrant_events 格式。"""
+    output_cols = [
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    required = {"price", "buy", "sell", "stock_id", "securities_trader_id"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise RuntimeError(
+            f"最新日權證 API 缺少欄位：權證={warrant_code}｜缺少={sorted(missing)}｜"
+            f"實際欄位={raw.columns.tolist()}"
+        )
+
+    expected_code = normalize_openapi_warrant_code(warrant_code)
+    work = raw.copy().fillna("")
+    work["stock_id"] = work["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+    work = work[work["stock_id"] == expected_code].copy()
+    if work.empty:
+        raise RuntimeError(
+            f"最新日權證 API 回傳代號不符：要求={expected_code}｜"
+            f"實際={sorted(set(raw.get('stock_id', pd.Series(dtype=str)).astype(str)))[:10]}"
+        )
+
+    work["price"] = pd.to_numeric(work["price"], errors="coerce").fillna(0.0)
+    work["buy"] = pd.to_numeric(work["buy"], errors="coerce").fillna(0.0)
+    work["sell"] = pd.to_numeric(work["sell"], errors="coerce").fillna(0.0)
+    work["buy_amount_row"] = work["price"] * work["buy"]
+    work["sell_amount_row"] = work["price"] * work["sell"]
+    work["broker_code"] = work["securities_trader_id"].astype(str).str.strip()
+    raw_branch = work.get("securities_trader", pd.Series("", index=work.index)).astype(str).str.strip()
+    mapped_branch = work["broker_code"].map(trader_name_map or {}).fillna("").astype(str)
+    work["branch"] = np.where(mapped_branch.str.strip() != "", mapped_branch, raw_branch)
+    work["branch"] = pd.Series(work["branch"], index=work.index).map(normalize_branch_name)
+    work = work[(work["broker_code"] != "") & (work["branch"] != "")].copy()
+    if work.empty:
+        raise RuntimeError(f"最新日權證 API 無法還原任何分點：權證={expected_code}")
+
+    grouped = work.groupby(
+        ["broker_code", "branch", "stock_id"],
+        as_index=False,
+        dropna=False,
+    ).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount_row", "sum"),
+        sell_amount=("sell_amount_row", "sum"),
+    )
+    grouped = grouped.rename(columns={"stock_id": "warrant_code"})
+    grouped["Date"] = pd.Timestamp(trade_date).normalize()
+    grouped["warrant_name"] = grouped["warrant_code"].map(warrant_name_map).fillna(grouped["warrant_code"])
+    grouped["underlying_code"] = _normalize_stock_name_code_key(stock_code)
+    grouped["underlying_name"] = str(stock_name or "")
+    grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+    grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+    grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+    grouped = grouped[(grouped["buy_amount"] != 0) | (grouped["sell_amount"] != 0)].copy()
+    grouped["side"] = np.where(grouped["net_amount"] >= 0, "買超", "賣超")
+    return grouped[output_cols]
+
+
+def _finmind_select_latest_day_probe_codes(
+    query_codes,
+    historical_events: pd.DataFrame | None,
+    trade_date,
+    max_count: int = 5,
+) -> List[str]:
+    """挑選最新日輕量探測權證；優先使用前一交易日成交金額最高者。"""
+    normalized_codes = sorted({
+        normalize_openapi_warrant_code(code)
+        for code in (query_codes or [])
+        if normalize_openapi_warrant_code(code)
+    })
+    if not normalized_codes:
+        return []
+    limit = max(1, min(int(max_count or 5), len(normalized_codes)))
+    query_set = set(normalized_codes)
+    selected = []
+
+    if historical_events is not None and not historical_events.empty and {
+        "Date", "warrant_code"
+    }.issubset(historical_events.columns):
+        work = historical_events[[
+            col for col in ["Date", "warrant_code", "buy_amount", "sell_amount", "net_amount"]
+            if col in historical_events.columns
+        ]].copy()
+        work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+        work = work[work["Date"].notna() & (work["Date"] < pd.Timestamp(trade_date).normalize())]
+        if not work.empty:
+            latest_history_day = work["Date"].max()
+            work = work[work["Date"] == latest_history_day].copy()
+            if not bool(historical_events.attrs.get("_warrant_events_normalized")):
+                work["warrant_code"] = work["warrant_code"].map(normalize_openapi_warrant_code)
+            else:
+                work["warrant_code"] = work["warrant_code"].astype(str)
+            work = work[work["warrant_code"].isin(query_set)]
+            if not work.empty:
+                buy = pd.to_numeric(work.get("buy_amount", 0.0), errors="coerce").fillna(0.0)
+                sell = pd.to_numeric(work.get("sell_amount", 0.0), errors="coerce").fillna(0.0)
+                work["_probe_turnover"] = buy.abs() + sell.abs()
+                ranked = (
+                    work.groupby("warrant_code", as_index=False)["_probe_turnover"]
+                    .sum()
+                    .sort_values(["_probe_turnover", "warrant_code"], ascending=[False, True])
+                )
+                selected.extend(ranked["warrant_code"].head(limit).tolist())
+
+    # 歷史資料不足時，以固定分散抽樣補足，確保結果可重現且涵蓋代號區間。
+    if len(selected) < limit:
+        remaining = [code for code in normalized_codes if code not in set(selected)]
+        need = limit - len(selected)
+        if need >= len(remaining):
+            selected.extend(remaining)
+        elif need > 0 and remaining:
+            positions = np.linspace(0, len(remaining) - 1, num=need, dtype=int)
+            selected.extend(remaining[int(pos)] for pos in positions)
+
+    return list(dict.fromkeys(selected))[:limit]
+
+
+def _finmind_fetch_latest_day_events_by_warrant_api(
+    summary_df: pd.DataFrame,
+    trade_date,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+    historical_events: pd.DataFrame | None = None,
+    selected_branch_id_map: Dict[str, set] | None = None,
+    all_empty_is_error: bool = True,
+    cancel_event: threading.Event | None = None,
+    probe_enable: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+    """最新日以「Summary有效 + 近期歷史 + 精選分點當日發現」聯集逐檔查 API。"""
+    day = pd.Timestamp(trade_date).normalize()
+    if cancel_event is not None and cancel_event.is_set():
+        return pd.DataFrame(), {
+            "date": day.strftime("%Y-%m-%d"),
+            "active_codes": 0,
+            "success_codes": 0,
+            "empty_codes": 0,
+            "failed_codes": 0,
+            "endpoint_rows": 0,
+            "event_rows": 0,
+            "query_codes": [],
+            "cancelled": True,
+        }
+    summary_active_codes = set(_finmind_active_warrant_codes(summary_df, day))
+    summary_all_codes = set(
+        summary_df.get("stock_id", pd.Series(dtype=str))
+        .astype(str)
+        .map(normalize_openapi_warrant_code)
+    ) if summary_df is not None and not summary_df.empty else set()
+    summary_all_codes.discard("")
+
+    recent_history_codes = _finmind_recent_history_warrant_codes(
+        historical_events,
+        day,
+        FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS,
+    )
+    target_warrant_codes = summary_all_codes | recent_history_codes
+    selected_branch_raw, branch_discovery_stats = _finmind_discover_selected_branch_latest_day_rows(
+        selected_branch_id_map,
+        day,
+        target_warrant_codes,
+    )
+    selected_branch_discovered_codes = set()
+    if selected_branch_raw is not None and not selected_branch_raw.empty and "stock_id" in selected_branch_raw.columns:
+        selected_branch_discovered_codes = set(
+            selected_branch_raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        )
+        selected_branch_discovered_codes.discard("")
+
+    query_codes = sorted(
+        summary_active_codes
+        | recent_history_codes
+        | selected_branch_discovered_codes
+    )
+    stats = {
+        "date": day.strftime("%Y-%m-%d"),
+        "active_codes": len(query_codes),
+        "summary_active_codes": len(summary_active_codes),
+        "recent_history_codes": len(recent_history_codes),
+        "selected_branch_discovered_codes": len(selected_branch_discovered_codes),
+        "selected_branch_raw_rows": int(branch_discovery_stats.get("target_rows", 0) or 0),
+        "selected_branch_repaired_rows": 0,
+        "success_codes": 0,
+        "empty_codes": 0,
+        "failed_codes": 0,
+        "endpoint_rows": 0,
+        "event_rows": 0,
+        "query_codes": list(query_codes),
+        "cancelled": False,
+        "all_empty": False,
+        "not_ready": False,
+        "fallback_used": False,
+        "requested_date": day.strftime("%Y-%m-%d"),
+        "resolved_date": "",
+        "probe_enabled": bool(probe_enable),
+        "selected_branch_cross_probe_codes": [],
+        "selected_branch_cross_probe_has_data": False,
+    }
+    output_cols = [
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]
+    if not query_codes:
+        print(f"ℹ️ 最新交易日沒有可查詢的認購權證：{stock_code}｜日期={day.date()}")
+        return pd.DataFrame(columns=output_cols), stats
+
+    recent_only = recent_history_codes - summary_active_codes
+    branch_only = selected_branch_discovered_codes - summary_active_codes - recent_history_codes
+    print(
+        f"🚀 最新交易日改用 FinMind 權證代號 API：{stock_code} {stock_name}｜"
+        f"日期={day.date()}｜Summary有效={len(summary_active_codes):,}支｜"
+        f"近期歷史補入={len(recent_only):,}支｜精選分點當日補入={len(branch_only):,}支｜"
+        f"最終查詢={len(query_codes):,}支｜workers={FINMIND_WARRANT_LATEST_DAY_API_WORKERS}"
+    )
+    frames = []
+    failures = []
+    completed = 0
+    successful_raw_data_codes = set()
+    empty_raw_data_codes = set()
+    failed_code_set = set()
+    actual_queried_codes = []
+
+    def _run_latest_code_batch(batch_codes: List[str], phase_label: str) -> None:
+        nonlocal completed
+        batch_codes = [code for code in batch_codes if code]
+        if not batch_codes:
+            return
+        executor = ThreadPoolExecutor(
+            max_workers=min(FINMIND_WARRANT_LATEST_DAY_API_WORKERS, len(batch_codes))
+        )
+        future_map = {
+            executor.submit(_finmind_fetch_warrant_code_day_raw, code, day, cancel_event): code
+            for code in batch_codes
+        }
+        actual_queried_codes.extend(batch_codes)
+        phase_completed = 0
+        try:
+            pending_futures = set(future_map)
+            while pending_futures:
+                if cancel_event is not None and cancel_event.is_set():
+                    stats["cancelled"] = True
+                    for pending in pending_futures:
+                        pending.cancel()
+                    print(
+                        f"🛑 最新日權證 API 已協作式中止：{stock_code}｜"
+                        f"階段={phase_label}｜完成={phase_completed}/{len(batch_codes)}"
+                    )
+                    break
+
+                done_futures, pending_futures = wait(
+                    pending_futures,
+                    timeout=0.25,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    continue
+
+                for future in done_futures:
+                    code = future_map[future]
+                    completed += 1
+                    phase_completed += 1
+                    try:
+                        raw, diagnostic = future.result()
+                        if str((diagnostic or {}).get("message", "")) == "cancelled":
+                            stats["cancelled"] = True
+                            continue
+                        stats["success_codes"] += 1
+                        stats["endpoint_rows"] += int(len(raw))
+                        if raw is None or raw.empty:
+                            stats["empty_codes"] += 1
+                            empty_raw_data_codes.add(code)
+                        else:
+                            successful_raw_data_codes.add(code)
+                            converted = _finmind_convert_warrant_code_rows(
+                                raw,
+                                day,
+                                code,
+                                warrant_name_map,
+                                stock_code,
+                                stock_name,
+                                trader_name_map,
+                            )
+                            if not converted.empty:
+                                frames.append(converted)
+                    except (FinMindAuthorizationError, FinMindRateLimitError):
+                        if cancel_event is not None:
+                            cancel_event.set()
+                        for pending in pending_futures:
+                            pending.cancel()
+                        raise
+                    except Exception as exc:
+                        failures.append((code, str(exc)))
+                        failed_code_set.add(code)
+                        stats["failed_codes"] += 1
+
+                    if phase_completed == 1 or phase_completed % 25 == 0 or phase_completed == len(batch_codes):
+                        icon = "🧪" if phase_label == "輕量探測" else "📊"
+                        print(
+                            f"{icon} 最新日權證 API {phase_label}進度："
+                            f"{phase_completed}/{len(batch_codes)}｜"
+                            f"有原始資料權證={len(successful_raw_data_codes)}｜"
+                            f"空資料={stats['empty_codes']}｜失敗={len(failures)}"
+                        )
+        finally:
+            cancelled = bool(cancel_event is not None and cancel_event.is_set())
+            executor.shutdown(wait=not cancelled, cancel_futures=True)
+
+    stats["intended_active_codes"] = len(query_codes)
+    stats["probe_short_circuit"] = False
+
+    if not probe_enable:
+        stats["probe_codes"] = []
+        stats["probe_count"] = 0
+        print(
+            f"⏩ 最新日權證補查沿用第一階段已確認的發布狀態：{stock_code} {stock_name}｜"
+            f"日期={day.date()}｜直接查詢={len(query_codes):,}支，不重複做輕量探測"
+        )
+        _run_latest_code_batch(query_codes, "完整查詢")
+    else:
+        probe_codes = _finmind_select_latest_day_probe_codes(
+            query_codes,
+            historical_events,
+            day,
+            max_count=5,
+        )
+        probe_code_set = set(probe_codes)
+        stats["probe_codes"] = list(probe_codes)
+        stats["probe_count"] = len(probe_codes)
+
+        print(
+            f"🧪 最新日權證輕量探測：{stock_code} {stock_name}｜日期={day.date()}｜"
+            f"探測={len(probe_codes)}支｜來源=前一交易日成交金額優先｜"
+            f"代號={','.join(probe_codes)}"
+        )
+        _run_latest_code_batch(probe_codes, "輕量探測")
+
+        branch_ids = int(branch_discovery_stats.get("branch_ids", 0) or 0)
+        branch_success = int(branch_discovery_stats.get("success_branch_ids", 0) or 0)
+        branch_failed = int(branch_discovery_stats.get("failed_branch_ids", 0) or 0)
+        branch_target_rows = int(branch_discovery_stats.get("target_rows", 0) or 0)
+        branch_signal_reliable = bool(
+            branch_ids > 0 and branch_failed == 0 and branch_success == branch_ids
+        )
+        branch_has_target_data = branch_target_rows > 0
+        branch_corroborates_empty = branch_signal_reliable and not branch_has_target_data
+        probe_all_success_empty = bool(
+            probe_codes
+            and set(probe_codes).issubset(empty_raw_data_codes)
+            and not (set(probe_codes) & failed_code_set)
+        )
+
+        # 精選分點端點可能比逐權證正式端點更早出現部分資料。
+        # 不能只因分點端點有列就直接啟動數百支全量查詢；先用該批權證代號
+        # 回查逐權證端點，確認至少一支真的有資料後才放行全量查詢。
+        branch_cross_probe_codes = []
+        branch_cross_probe_has_data = False
+        branch_cross_probe_all_success_empty = False
+        if probe_all_success_empty and branch_has_target_data:
+            branch_cross_probe_codes = sorted(
+                code for code in selected_branch_discovered_codes
+                if code and code not in probe_code_set
+            )[:5]
+            stats["selected_branch_cross_probe_codes"] = list(branch_cross_probe_codes)
+            if branch_cross_probe_codes:
+                print(
+                    f"🔬 精選分點當日資料交叉探測：{stock_code}｜"
+                    f"分點端點目標列={branch_target_rows:,}｜權證={len(branch_cross_probe_codes)}支｜"
+                    f"代號={','.join(branch_cross_probe_codes)}"
+                )
+                _run_latest_code_batch(branch_cross_probe_codes, "精選分點交叉探測")
+                branch_cross_set = set(branch_cross_probe_codes)
+                branch_cross_probe_has_data = bool(
+                    branch_cross_set & successful_raw_data_codes
+                )
+                branch_cross_probe_all_success_empty = bool(
+                    branch_cross_set.issubset(empty_raw_data_codes)
+                    and not (branch_cross_set & failed_code_set)
+                )
+                stats["selected_branch_cross_probe_has_data"] = branch_cross_probe_has_data
+
+        queried_probe_codes = set(probe_codes) | set(branch_cross_probe_codes)
+        remaining_codes = [code for code in query_codes if code not in queried_probe_codes]
+
+        no_reliable_branch_data = bool(
+            not branch_has_target_data
+            and (branch_corroborates_empty or branch_ids == 0)
+        )
+        branch_data_disproved_by_warrant_api = bool(
+            branch_has_target_data
+            and branch_cross_probe_codes
+            and branch_cross_probe_all_success_empty
+            and not branch_cross_probe_has_data
+        )
+        can_short_circuit = bool(
+            probe_all_success_empty
+            and (no_reliable_branch_data or branch_data_disproved_by_warrant_api)
+            and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE
+        )
+
+        if can_short_circuit:
+            stats["all_empty"] = True
+            stats["not_ready"] = True
+            stats["probe_short_circuit"] = True
+            stats["query_codes"] = list(actual_queried_codes)
+            stats["active_codes"] = len(actual_queried_codes)
+            stats["event_rows"] = 0
+            if branch_data_disproved_by_warrant_api:
+                corroboration = (
+                    f"精選分點端點雖有 {branch_target_rows:,} 列，但其 {len(branch_cross_probe_codes)} 支"
+                    "權證在逐權證端點全空"
+                )
+            elif branch_ids:
+                corroboration = f"精選分點={branch_success}/{branch_ids}個成功且目標列全空"
+            else:
+                corroboration = "未提供精選分點訊號"
+            print(
+                f"⚠️ 最新日權證探測全空，提前判定資料尚未更新：{stock_code} {stock_name}｜"
+                f"日期={day.date()}｜已探測={len(actual_queried_codes)}支｜"
+                f"{corroboration}｜略過剩餘 {len(remaining_codes):,} 支逐權證請求"
+            )
+            return pd.DataFrame(columns=output_cols), stats
+
+        if remaining_codes:
+            reason = (
+                "精選分點權證已通過逐權證交叉探測"
+                if branch_cross_probe_has_data
+                else "探測權證已有當日資料"
+                if successful_raw_data_codes
+                else "探測訊號不足，為確保完整性"
+            )
+            print(
+                f"✅ 最新日探測通過，啟動完整逐權證查詢：{stock_code}｜"
+                f"原因={reason}｜剩餘={len(remaining_codes):,}支"
+            )
+            _run_latest_code_batch(remaining_codes, "完整查詢")
+
+    stats["query_codes"] = list(actual_queried_codes)
+    stats["active_codes"] = len(actual_queried_codes)
+
+    if stats.get("cancelled") or (cancel_event is not None and cancel_event.is_set()):
+        stats["cancelled"] = True
+        return pd.DataFrame(columns=output_cols), stats
+
+    if failures:
+        preview = "；".join(f"{code}:{error[:140]}" for code, error in failures[:8])
+        message = (
+            f"最新日權證 API 不完整：失敗 {len(failures)}/{len(query_codes)} 支｜{preview}"
+        )
+        if FINMIND_WARRANT_LATEST_DAY_API_STRICT:
+            raise RuntimeError(message)
+        print(f"⚠️ {message}")
+
+    events = (
+        _concat_warrant_event_frames(frames)
+        if frames
+        else pd.DataFrame(columns=output_cols)
+    )
+    if not events.empty:
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+        events = events.dropna(subset=["Date"])
+        for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0.0)
+        events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
+        events["branch"] = events["branch"].map(normalize_branch_name)
+        events["broker_code"] = events["broker_code"].astype(str).str.strip()
+
+    # 用「按分點查詢」的原始結果核對精選分點。若逐權證 API 漏列或金額不同，
+    # 只替換相同日期 × 分點 ID × 權證的列，不影響其他分點與其他權證。
+    branch_frames = []
+    if selected_branch_raw is not None and not selected_branch_raw.empty:
+        selected_branch_raw = selected_branch_raw.copy().fillna("")
+        selected_branch_raw["stock_id"] = selected_branch_raw["stock_id"].astype(str).map(normalize_openapi_warrant_code)
+        for warrant_code, raw_code in selected_branch_raw.groupby("stock_id", sort=False):
+            if not warrant_code:
+                continue
+            converted = _finmind_convert_warrant_code_rows(
+                raw_code,
+                day,
+                warrant_code,
+                warrant_name_map,
+                stock_code,
+                stock_name,
+                trader_name_map,
+            )
+            if not converted.empty:
+                branch_frames.append(converted)
+
+    if branch_frames:
+        branch_events = _concat_warrant_event_frames(branch_frames)
+        key_cols = ["Date", "broker_code", "warrant_code"]
+        branch_events["Date"] = pd.to_datetime(branch_events["Date"], errors="coerce").dt.normalize()
+        branch_events["broker_code"] = branch_events["broker_code"].astype(str).str.strip()
+        branch_events["warrant_code"] = branch_events["warrant_code"].map(normalize_openapi_warrant_code)
+        for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            branch_events[col] = pd.to_numeric(branch_events[col], errors="coerce").fillna(0.0)
+
+        if events.empty:
+            repaired_count = len(branch_events)
+        else:
+            audit = branch_events[key_cols + ["buy_amount", "sell_amount"]].merge(
+                events[key_cols + ["buy_amount", "sell_amount"]],
+                on=key_cols,
+                how="left",
+                suffixes=("_branch", "_warrant"),
+            )
+            missing_mask = audit["buy_amount_warrant"].isna() | audit["sell_amount_warrant"].isna()
+            mismatch_mask = (
+                (audit["buy_amount_branch"] - audit["buy_amount_warrant"].fillna(0.0)).abs() > 0.01
+            ) | (
+                (audit["sell_amount_branch"] - audit["sell_amount_warrant"].fillna(0.0)).abs() > 0.01
+            )
+            repaired_count = int((missing_mask | mismatch_mask).sum())
+
+        branch_key = branch_events[key_cols].astype(str).agg("|".join, axis=1)
+        if not events.empty:
+            event_key = events[key_cols].astype(str).agg("|".join, axis=1)
+            events = events[~event_key.isin(set(branch_key))].copy()
+        events = _concat_warrant_event_frames([events, branch_events])
+        stats["selected_branch_repaired_rows"] = repaired_count
+        print(
+            f"✅ 最新日精選分點核對完成：{stock_code}｜日期={day.date()}｜"
+            f"直接端點={len(branch_events):,}筆｜逐權證端點需修補={repaired_count:,}筆｜"
+            "已以分點端點替換相同鍵值"
+        )
+
+    if events.empty:
+        clean_all_empty = bool(
+            query_codes
+            and stats["failed_codes"] == 0
+            and stats["success_codes"] == len(query_codes)
+        )
+        stats["all_empty"] = True
+        stats["not_ready"] = clean_all_empty
+        message = (
+            f"最新日權證 API 全部無成交資料：{stock_code} {stock_name}｜"
+            f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
+            "可能是 API 尚未完成更新"
+        )
+
+        # 所有請求均成功但結果全空，屬於資料發布時點問題，不是 API 完整性失敗。
+        # 主流程會保留既有歷史事件，並自動使用最近已有資料的交易日產生週報。
+        if clean_all_empty and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE:
+            print(
+                f"⚠️ {message}｜已啟用最近有效交易日回退，"
+                "不將本次全空結果視為致命錯誤"
+            )
+            return pd.DataFrame(columns=output_cols), stats
+
+        if FINMIND_WARRANT_LATEST_DAY_API_STRICT and query_codes and all_empty_is_error:
+            raise RuntimeError(message)
+        if query_codes and not all_empty_is_error:
+            print(
+                f"ℹ️ 最新日補查權證皆無成交：{stock_code} {stock_name}｜"
+                f"日期={day.date()}｜成功請求={stats['success_codes']}/{len(query_codes)}｜"
+                "視為合法空結果，不影響主要最新日資料"
+            )
+        else:
+            print(f"⚠️ {message}")
+        return pd.DataFrame(columns=output_cols), stats
+
+    events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+    events = events.dropna(subset=["Date"])
+    for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+        events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0.0)
+    events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
+    events["branch"] = events["branch"].map(normalize_branch_name)
+    events["broker_code"] = events["broker_code"].astype(str).str.strip()
+    events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
+    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    stats["event_rows"] = int(len(events))
+    print(
+        f"✅ 最新日權證 API 完成：{stock_code}｜日期={day.date()}｜"
+        f"請求成功={stats['success_codes']}/{len(query_codes)}｜"
+        f"有成交權證={events['warrant_code'].nunique():,}支｜分點事件={len(events):,}筆｜"
+        f"買進={fmt_money(float(events['buy_amount'].sum()))}｜"
+        f"賣出={fmt_money(-float(events['sell_amount'].sum()))}｜"
+        f"淨額={fmt_money(float(events['net_amount'].sum()))}"
+    )
+    return events, stats
+
+
+
+def _finmind_current_day_official_preflight(
+    summary_df: pd.DataFrame,
+    stock_code: str,
+    stock_name: str,
+    target_date,
+) -> dict:
+    """在大量逐權證請求前，先確認官方市場是否已發布到目標日。
+
+    只在目標日等於台北今日、且官方完整性保護開啟時生效。
+    官方資料明確仍停在前一交易日時回傳 pending；官方來源失敗、日期矛盾
+    或無法確認時回傳 unknown，主流程維持既有完整查詢以避免誤退。
+    """
+    target_ts = pd.Timestamp(target_date).normalize()
+    result = {
+        "status": "not_applicable",
+        "reason": "非當日資料，不執行官方發布前置檢查",
+        "target_date": target_ts.strftime("%Y-%m-%d"),
+        "relevant_latest_date": "",
+        "twse_latest_date": "",
+        "tpex_latest_date": "",
+        "official_target_rows": 0,
+        "active_codes": 0,
+    }
+    try:
+        if not FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE or not FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE:
+            result["status"] = "disabled"
+            result["reason"] = "官方完整性前置檢查已關閉"
+            return result
+        if target_ts != get_taipei_today_ts():
+            return result
+
+        active_codes = set(_finmind_active_warrant_codes(summary_df, target_ts))
+        active_codes = {
+            normalize_openapi_warrant_code(code)
+            for code in active_codes
+            if normalize_openapi_warrant_code(code)
+        }
+        result["active_codes"] = len(active_codes)
+        if not active_codes:
+            result["status"] = "unknown"
+            result["reason"] = "找不到目標日有效認購權證母體"
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            twse_future = executor.submit(fetch_twse_openapi_warrant_daily_df)
+            tpex_future = executor.submit(fetch_tpex_openapi_warrant_daily_df)
+            try:
+                twse_df = twse_future.result()
+            except Exception as exc:
+                print(f"⚠️ 官方發布前置檢查 TWSE OpenAPI 失敗：{exc}")
+                twse_df = pd.DataFrame()
+            try:
+                tpex_df = tpex_future.result()
+            except Exception as exc:
+                print(f"⚠️ 官方發布前置檢查 TPEx OpenAPI 失敗：{exc}")
+                tpex_df = pd.DataFrame()
+
+        source_frames = {"TWSE": twse_df, "TPEx": tpex_df}
+        unavailable_sources = []
+        for source_name, source_df in source_frames.items():
+            fetch_ok = bool(
+                isinstance(source_df, pd.DataFrame)
+                and source_df.attrs.get("openapi_fetch_ok", False)
+            )
+            if not fetch_ok:
+                error_text = (
+                    str(source_df.attrs.get("openapi_fetch_error", "") or "")
+                    if isinstance(source_df, pd.DataFrame)
+                    else "未取得 DataFrame"
+                )
+                unavailable_sources.append(
+                    f"{source_name}{f'（{error_text}）' if error_text else ''}"
+                )
+
+        # 任一官方市場來源抓取失敗時，不能把另一個市場仍停在前一日
+        # 解讀成「所有官方權證尚未發布」。此時改為 unknown，讓 FinMind
+        # 逐權證 API 繼續查詢，避免網路暫時斷線直接抹掉今日資料。
+        if unavailable_sources:
+            result["status"] = "unknown"
+            result["reason"] = (
+                "官方來源暫時無法完整取得："
+                + "、".join(unavailable_sources)
+                + "；不以此判定尚未發布，維持完整逐權證查詢"
+            )
+            print(
+                f"⚠️ 官方發布前置檢查來源不完整，維持完整逐權證查詢："
+                f"{stock_code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
+        official_parts = []
+        source_latest = {"TWSE": pd.NaT, "TPEx": pd.NaT}
+        for source_name, source_df in (("TWSE", twse_df), ("TPEx", tpex_df)):
+            if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+                continue
+            part = source_df.copy()
+            for col in ["交易日期", "代號"]:
+                if col not in part.columns:
+                    part[col] = ""
+            part["_trade_date"] = _normalize_official_trade_date_series(part["交易日期"])
+            part["代號"] = part["代號"].map(normalize_openapi_warrant_code)
+            source_latest[source_name] = part["_trade_date"].dropna().max()
+            official_parts.append(part[["_trade_date", "代號"]])
+
+        result["twse_latest_date"] = (
+            source_latest["TWSE"].strftime("%Y-%m-%d")
+            if pd.notna(source_latest["TWSE"])
+            else ""
+        )
+        result["tpex_latest_date"] = (
+            source_latest["TPEx"].strftime("%Y-%m-%d")
+            if pd.notna(source_latest["TPEx"])
+            else ""
+        )
+        if not official_parts:
+            result["status"] = "unknown"
+            result["reason"] = "TWSE / TPEx 官方權證資料皆無法取得"
+            return result
+
+        official_all = pd.concat(official_parts, ignore_index=True, sort=False)
+        relevant = official_all[official_all["代號"].isin(active_codes)].copy()
+        relevant_latest = relevant["_trade_date"].dropna().max() if not relevant.empty else pd.NaT
+        result["relevant_latest_date"] = (
+            relevant_latest.strftime("%Y-%m-%d") if pd.notna(relevant_latest) else ""
+        )
+        target_rows = relevant[relevant["_trade_date"] == target_ts]
+        result["official_target_rows"] = int(len(target_rows))
+        if not target_rows.empty:
+            result["status"] = "ready"
+            result["reason"] = (
+                f"官方相關權證已發布到 {target_ts.strftime('%Y-%m-%d')}｜"
+                f"目標列={len(target_rows):,}"
+            )
+            print(
+                f"✅ 官方最新日發布前置檢查通過：{stock_code} {stock_name}｜"
+                f"日期={target_ts.date()}｜相關列={len(target_rows):,}｜"
+                f"TWSE最新={result['twse_latest_date'] or '-'}｜"
+                f"TPEx最新={result['tpex_latest_date'] or '-'}"
+            )
+            return result
+
+        available_source_dates = [d for d in source_latest.values() if pd.notna(d)]
+        all_sources_before_target = bool(
+            available_source_dates
+            and all(pd.Timestamp(d).normalize() < target_ts for d in available_source_dates)
+        )
+        relevant_before_target = bool(
+            pd.notna(relevant_latest) and pd.Timestamp(relevant_latest).normalize() < target_ts
+        )
+        if relevant_before_target or all_sources_before_target:
+            result["status"] = "pending"
+            result["reason"] = (
+                f"官方相關權證尚未發布到 {target_ts.strftime('%Y-%m-%d')}"
+                f"（相關權證最新 {result['relevant_latest_date'] or '-'}；"
+                f"TWSE最新 {result['twse_latest_date'] or '-'}；"
+                f"TPEx最新 {result['tpex_latest_date'] or '-'}）"
+            )
+            print(
+                f"⏭️ 官方最新日尚未發布，逐權證 API 直接回退："
+                f"{stock_code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
+        result["status"] = "unknown"
+        result["reason"] = (
+            f"官方日期訊號不足，維持完整逐權證查詢｜"
+            f"相關權證最新 {result['relevant_latest_date'] or '-'}；"
+            f"TWSE最新 {result['twse_latest_date'] or '-'}；"
+            f"TPEx最新 {result['tpex_latest_date'] or '-'}"
+        )
+        print(f"ℹ️ 官方發布前置檢查無法定論：{stock_code}｜{result['reason']}")
+        return result
+    except Exception as exc:
+        result["status"] = "unknown"
+        result["reason"] = f"官方發布前置檢查例外：{exc}"
+        print(f"⚠️ 官方發布前置檢查失敗，維持完整逐權證查詢：{stock_code}｜{exc}")
+        return result
+
+
+def _finmind_fetch_latest_day_with_official_preflight(
+    summary_df: pd.DataFrame,
+    trade_date,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+    historical_events: pd.DataFrame | None = None,
+    selected_branch_id_map: Dict[str, set] | None = None,
+    all_empty_is_error: bool = True,
+    cancel_event: threading.Event | None = None,
+    probe_enable: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+    """官方發布日期先行；明確 pending 時不發出任何逐權證請求。"""
+    day = pd.Timestamp(trade_date).normalize()
+    with report_stage_timer(f"{stock_code}｜官方最新日發布前置檢查"):
+        preflight = _finmind_current_day_official_preflight(
+            summary_df,
+            stock_code,
+            stock_name,
+            day,
+        )
+    if str(preflight.get("status", "")) == "pending":
+        intended_codes = _finmind_active_warrant_codes(summary_df, day)
+        stats = {
+            "date": day.strftime("%Y-%m-%d"),
+            "active_codes": 0,
+            "intended_active_codes": len(intended_codes),
+            "summary_active_codes": len(intended_codes),
+            "recent_history_codes": 0,
+            "selected_branch_discovered_codes": 0,
+            "selected_branch_raw_rows": 0,
+            "selected_branch_repaired_rows": 0,
+            "success_codes": 0,
+            "empty_codes": 0,
+            "failed_codes": 0,
+            "endpoint_rows": 0,
+            "event_rows": 0,
+            "query_codes": [],
+            "cancelled": False,
+            "all_empty": True,
+            "not_ready": True,
+            "fallback_used": False,
+            "requested_date": day.strftime("%Y-%m-%d"),
+            "resolved_date": "",
+            "probe_enabled": bool(probe_enable),
+            "probe_codes": [],
+            "probe_count": 0,
+            "probe_short_circuit": True,
+            "official_preflight_status": "pending",
+            "official_preflight_reason": str(preflight.get("reason", "") or ""),
+        }
+        return pd.DataFrame(columns=[
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+            "net_amount", "buy_shares", "sell_shares", "side",
+        ]), stats
+
+    events, stats = _finmind_fetch_latest_day_events_by_warrant_api(
+        summary_df,
+        day,
+        warrant_name_map,
+        stock_code,
+        stock_name,
+        trader_name_map,
+        historical_events=historical_events,
+        selected_branch_id_map=selected_branch_id_map,
+        all_empty_is_error=all_empty_is_error,
+        cancel_event=cancel_event,
+        probe_enable=probe_enable,
+    )
+    stats["official_preflight_status"] = str(preflight.get("status", "") or "")
+    stats["official_preflight_reason"] = str(preflight.get("reason", "") or "")
+    return events, stats
+
+
+def _finmind_replace_latest_day_with_warrant_api(
+    base_events: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    latest_day,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+    trader_name_map: Dict[str, str],
+    selected_branch_id_map: Dict[str, set] | None = None,
+    precomputed_latest_events: pd.DataFrame | None = None,
+    precomputed_api_stats: dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """刪除最新日 Parquet 半成品，再以權證代號 API 完整結果取代。"""
+    day = pd.Timestamp(latest_day).normalize()
+    base = base_events.copy() if base_events is not None else pd.DataFrame()
+    if not base.empty:
+        base["Date"] = pd.to_datetime(base["Date"], errors="coerce").dt.normalize()
+        base = base.dropna(subset=["Date"])
+    if not FINMIND_WARRANT_LATEST_DAY_API_ENABLE:
+        # 關閉 API 時，最新交易日應完整保留在 Parquet 路徑；不能先刪掉再回傳。
+        print(
+            f"ℹ️ 最新日權證 API 已關閉：{stock_code}｜日期={day.date()}｜"
+            "正式資料保留完整 Parquet 交易日"
+        )
+        return base.reset_index(drop=True), {
+            "date": day.strftime("%Y-%m-%d"),
+            "active_codes": 0,
+            "success_codes": 0,
+            "empty_codes": 0,
+            "failed_codes": 0,
+            "endpoint_rows": 0,
+            "event_rows": 0,
+            "query_codes": [],
+        }
+
+    if precomputed_latest_events is None or precomputed_api_stats is None:
+        latest_events, api_stats = _finmind_fetch_latest_day_events_by_warrant_api(
+            summary_df,
+            day,
+            warrant_name_map,
+            stock_code,
+            stock_name,
+            trader_name_map,
+            historical_events=base,
+            selected_branch_id_map=selected_branch_id_map,
+        )
+    else:
+        latest_events = precomputed_latest_events.copy()
+        api_stats = dict(precomputed_api_stats)
+
+    if latest_events is None or latest_events.empty:
+        historical_only = (
+            base.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+            if not base.empty
+            else pd.DataFrame(columns=[
+                "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+                "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+                "net_amount", "buy_shares", "sell_shares", "side",
+            ])
+        )
+        fallback_date = (
+            pd.Timestamp(historical_only["Date"].max()).normalize()
+            if not historical_only.empty and "Date" in historical_only.columns
+            else pd.NaT
+        )
+        fallback_used = bool(
+            api_stats.get("not_ready", False)
+            and FINMIND_WARRANT_LATEST_DAY_EMPTY_FALLBACK_ENABLE
+            and pd.notna(fallback_date)
+        )
+        api_stats["fallback_used"] = fallback_used
+        api_stats["requested_date"] = day.strftime("%Y-%m-%d")
+        api_stats["resolved_date"] = (
+            fallback_date.strftime("%Y-%m-%d") if pd.notna(fallback_date) else ""
+        )
+        if fallback_used:
+            print(
+                f"↩️ 最新日權證資料尚未更新，已自動回退最近有效交易日："
+                f"{stock_code}｜要求={day.date()}｜實際={fallback_date.date()}｜"
+                f"保留歷史事件={len(historical_only):,}筆"
+            )
+        elif api_stats.get("not_ready", False):
+            print(
+                f"⚠️ 最新日權證資料尚未更新，且找不到可回退的歷史事件："
+                f"{stock_code}｜要求={day.date()}"
+            )
+        return historical_only, api_stats
+
+    removed_rows = int((base["Date"] == day).sum()) if not base.empty and "Date" in base.columns else 0
+    if removed_rows:
+        base = base[base["Date"] != day].copy()
+        print(
+            f"🧹 已移除最新日 Parquet 資料，準備由 API 取代："
+            f"{stock_code}｜日期={day.date()}｜移除={removed_rows:,}筆"
+        )
+
+    api_stats["fallback_used"] = False
+    api_stats["requested_date"] = day.strftime("%Y-%m-%d")
+    api_stats["resolved_date"] = day.strftime("%Y-%m-%d")
+    merged = _concat_warrant_event_frames([base, latest_events])
+    merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
+    merged = merged.dropna(subset=["Date"])
+    merged = merged.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    print(
+        f"✅ 最新交易日已由 API 完整取代 Parquet：{stock_code}｜"
+        f"日期={day.date()}｜API事件={len(latest_events):,}筆｜合併後={len(merged):,}筆"
+    )
+    return merged, api_stats
+
+
+
+
+
+def _hybrid_moneydj_should_run(latest_day) -> bool:
+    """僅在台北當日盤後啟動 MoneyDJ；午夜後回到 FinMind 主流程。"""
+    if not HYBRID_MONEYDJ_LATEST_DAY_ENABLE:
+        return False
+    if HYBRID_MONEYDJ_FORCE_ENABLE:
+        return True
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    day = pd.Timestamp(latest_day).normalize()
+    today = pd.Timestamp(now.date()).normalize()
+    start_minute = HYBRID_MONEYDJ_START_HOUR * 60 + HYBRID_MONEYDJ_START_MINUTE
+    now_minute = now.hour * 60 + now.minute
+    return day == today and now_minute >= start_minute
+
+
+def _hybrid_moneydj_get_json(url: str):
+    last_error = None
+    for attempt in range(1, HYBRID_MONEYDJ_RETRIES + 1):
+        try:
+            response = get_thread_session().get(
+                url,
+                headers=MONEYDJ_HEADERS,
+                timeout=(5, 18),
+            )
+            response.raise_for_status()
+            text = response.content.decode("utf-8", errors="replace")
+            return json.loads(text)
+        except Exception as exc:
+            last_error = exc
+            if attempt < HYBRID_MONEYDJ_RETRIES:
+                time.sleep(HYBRID_MONEYDJ_RETRY_WAIT * attempt)
+    raise RuntimeError(str(last_error or "MoneyDJ request failed"))
+
+
+def _hybrid_moneydj_api4_one(warrant: dict, target_day: pd.Timestamp) -> tuple[list, str]:
+    code = normalize_openapi_warrant_code(warrant.get("warrant_code", ""))
+    day_s = pd.Timestamp(target_day).strftime("%Y/%m/%d")
+    try:
+        payload = _hybrid_moneydj_get_json(
+            MONEYDJ_API4.format(code=code, start=day_s, end=day_s)
+        )
+        rows = []
+        for item in (payload if isinstance(payload, list) else [payload]):
+            if isinstance(item, dict):
+                rows.extend(item.get("ResultSet", {}).get("Result", []) or [])
+        return rows, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _hybrid_moneydj_api5_one(pair: dict, target_day: pd.Timestamp) -> tuple[list, str]:
+    code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
+    broker = str(pair.get("broker_code", "") or "").strip()
+    try:
+        payload = _hybrid_moneydj_get_json(
+            MONEYDJ_API5.format(
+                warrant=code,
+                broker=broker,
+                days=HYBRID_MONEYDJ_API5_DAYS,
+            )
+        )
+        result_set = (
+            payload[0].get("ResultSet", {})
+            if isinstance(payload, list) and payload
+            else payload.get("ResultSet", {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        api_rows = result_set.get("Result", []) or []
+        out = []
+        day = pd.Timestamp(target_day).normalize()
+        for row in api_rows:
+            dt = parse_date(row.get("V1", ""))
+            if not dt or pd.Timestamp(dt).normalize() != day:
+                continue
+            try:
+                buy_shares = int(float(row.get("V2", 0) or 0))
+                sell_shares = int(float(row.get("V3", 0) or 0))
+                buy_amount = float(row.get("V4", 0) or 0) * 1000.0
+                sell_amount = float(row.get("V5", 0) or 0) * 1000.0
+            except Exception:
+                continue
+            if buy_amount == 0 and sell_amount == 0:
+                continue
+            net_amount = buy_amount - sell_amount
+            out.append({
+                "Date": day,
+                "branch": normalize_branch_name(pair.get("branch", "")),
+                "broker_code": broker,
+                "warrant_code": code,
+                "warrant_name": str(pair.get("warrant_name", "") or code),
+                "underlying_code": str(pair.get("underlying_code", "") or ""),
+                "underlying_name": str(pair.get("underlying_name", "") or ""),
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "net_amount": net_amount,
+                "buy_shares": buy_shares,
+                "sell_shares": sell_shares,
+                "side": "買超" if net_amount >= 0 else "賣超",
+                "data_source": "MoneyDJ_latest_day",
+            })
+        return out, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _hybrid_moneydj_latest_day_events(
+    summary: pd.DataFrame,
+    latest_day,
+    warrant_name_map: Dict[str, str],
+    stock_code: str,
+    stock_name: str,
+) -> tuple[pd.DataFrame, dict]:
+    """只抓目標交易日，不重抓歷史；API4 找當日分點，API5 只保留目標日。"""
+    started = time.perf_counter()
+    day = pd.Timestamp(latest_day).normalize()
+    active_codes = sorted(_finmind_active_warrant_codes(summary, day))
+    warrants = [
+        {
+            "warrant_code": code,
+            "warrant_name": str(warrant_name_map.get(code, "") or code),
+            "underlying_code": _normalize_stock_name_code_key(stock_code),
+            "underlying_name": str(stock_name or ""),
+        }
+        for code in active_codes
+        if code
+    ]
+    stats = {
+        "requested_date": day.strftime("%Y-%m-%d"),
+        "active_codes": len(warrants),
+        "api4_failed": 0,
+        "api4_empty": 0,
+        "pairs": 0,
+        "api5_failed": 0,
+        "event_rows": 0,
+        "elapsed": 0.0,
+    }
+    if not warrants:
+        return pd.DataFrame(), stats
+
+    print(
+        f"🚀 MoneyDJ 最新日單日補丁啟動：{stock_code}｜{day.date()}｜"
+        f"權證={len(warrants):,}｜API4 workers={HYBRID_MONEYDJ_API4_WORKERS}"
+    )
+    pairs = {}
+    with ThreadPoolExecutor(max_workers=HYBRID_MONEYDJ_API4_WORKERS) as executor:
+        future_map = {
+            executor.submit(_hybrid_moneydj_api4_one, warrant, day): warrant
+            for warrant in warrants
+        }
+        for future in as_completed(future_map):
+            warrant = future_map[future]
+            rows, error = future.result()
+            if error:
+                stats["api4_failed"] += 1
+                continue
+            if not rows:
+                stats["api4_empty"] += 1
+                continue
+            for row in rows:
+                broker_code = str(row.get("V2", "") or "").strip()
+                if not broker_code:
+                    continue
+                pair = dict(warrant)
+                pair["broker_code"] = broker_code
+                pair["branch"] = normalize_branch_name(row.get("V3", ""))
+                pairs[(pair["warrant_code"], broker_code)] = pair
+
+    stats["pairs"] = len(pairs)
+    if stats["api4_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+        raise RuntimeError(
+            f"MoneyDJ API4 單日補丁不完整：failed={stats['api4_failed']}/"
+            f"{stats['active_codes']}"
+        )
+    if not pairs:
+        stats["elapsed"] = time.perf_counter() - started
+        print(
+            f"ℹ️ MoneyDJ 最新日單日補丁無 pair：{stock_code}｜{day.date()}｜"
+            f"API4 empty={stats['api4_empty']}｜failed={stats['api4_failed']}"
+        )
+        return pd.DataFrame(), stats
+
+    event_rows = []
+    pair_values = list(pairs.values())
+    with ThreadPoolExecutor(max_workers=HYBRID_MONEYDJ_API5_WORKERS) as executor:
+        future_map = {
+            executor.submit(_hybrid_moneydj_api5_one, pair, day): pair
+            for pair in pair_values
+        }
+        for future in as_completed(future_map):
+            rows, error = future.result()
+            if error:
+                stats["api5_failed"] += 1
+                continue
+            event_rows.extend(rows)
+
+    if stats["api5_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+        raise RuntimeError(
+            f"MoneyDJ API5 單日補丁不完整：failed={stats['api5_failed']}/"
+            f"{stats['pairs']}"
+        )
+
+    events = pd.DataFrame(event_rows)
+    if not events.empty:
+        events = _fill_warrant_event_missing_values(events)
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+        events = events.dropna(subset=["Date"])
+        # 同一權證、同一分點、同一天若端點回傳重複列，先合計成單一事件。
+        group_cols = [
+            "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+            "underlying_code", "underlying_name", "data_source",
+        ]
+        events = events.groupby(group_cols, as_index=False, dropna=False).agg({
+            "buy_amount": "sum",
+            "sell_amount": "sum",
+            "net_amount": "sum",
+            "buy_shares": "sum",
+            "sell_shares": "sum",
+        })
+        events["side"] = np.where(events["net_amount"] >= 0, "買超", "賣超")
+        events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+        events.attrs["_warrant_events_normalized"] = True
+
+    stats["event_rows"] = int(len(events))
+    stats["elapsed"] = time.perf_counter() - started
+    print(
+        f"✅ MoneyDJ 最新日單日補丁完成：{stock_code}｜{day.date()}｜"
+        f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
+        f"API4 failed={stats['api4_failed']}｜API5 failed={stats['api5_failed']}｜"
+        f"{stats['elapsed']:.2f}秒"
+    )
+    return events, stats
+
+
+def _hybrid_replace_day_with_moneydj(
+    events: pd.DataFrame,
+    moneydj_events: pd.DataFrame,
+    latest_day,
+) -> pd.DataFrame:
+    """MoneyDJ 有完整目標日事件時，整日替換，禁止與 FinMind 同日重複。"""
+    if moneydj_events is None or moneydj_events.empty:
+        return events
+    day = pd.Timestamp(latest_day).normalize()
+    base = events.copy() if events is not None else pd.DataFrame()
+    if not base.empty:
+        base["Date"] = pd.to_datetime(base["Date"], errors="coerce").dt.normalize()
+        base = base.dropna(subset=["Date"])
+        base = base[base["Date"] != day].copy()
+    merged = _concat_warrant_event_frames([base, moneydj_events])
+    merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
+    merged = merged.dropna(subset=["Date"])
+    merged = merged.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    merged.attrs["_warrant_events_normalized"] = True
+    return merged
+
+def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date, cancel_event: threading.Event | None = None) -> pd.DataFrame:
+    """FinMind 權證分點主流程。
+
+    歷史日全市場 Parquet、最新日主要權證 API 與官方發行商預載同時進行；
+    歷史完成後只補查最近實際出現、但第一階段尚未查詢的少數權證。
+    """
+    code = _normalize_stock_name_code_key(stock_code)
+    empty_columns = [
+        "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+        "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+        "net_amount", "buy_shares", "sell_shares", "side",
+    ]
+
+    if not REPORT_LIVE_ONLY:
+        snapshot = load_gsheet_warrant_events_snapshot(code, start_date=start_date, end_date=end_date)
+        if snapshot is not None and not snapshot.empty:
+            return snapshot
+        if ACTION_CACHE_ONLY_MODE:
+            raise RuntimeError(
+                f"嚴格快取模式找不到 FinMind 權證快照：{_gsheet_cache_key(code, start_date, end_date)}"
+            )
+    if not LIVE_FETCH_ENABLE:
+        return pd.DataFrame(columns=empty_columns)
+
+    summary = _FINMIND_MULTI_STOCK_SUMMARY_CACHE.get(code)
+    if summary is None:
+        summary = _finmind_get_warrant_summary(code, start_date, end_date)
+    if summary is None or summary.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    warrant_name_map = _FINMIND_MULTI_STOCK_NAME_MAP_CACHE.get(code, {}) or _finmind_target_warrant_name_map(summary)
+    trader_name_map, _ = _finmind_securities_trader_maps()
+    if not trader_name_map:
+        print("⚠️ FinMind 分點 ID 對照表為空；本次會保留 API／Parquet 券商簡稱")
+
+    selected_branch_names = _get_selected_branch_flow_set() if SELECTED_BRANCH_FLOW_ENABLE else set()
+    selected_branch_id_map = _resolve_selected_branch_ids(selected_branch_names) if selected_branch_names else {}
+    print(f"🧩 精選分點正式 ID 結果：{ {name: sorted(ids) for name, ids in selected_branch_id_map.items()} }")
+
+    trading_dates = _finmind_get_trading_dates(start_date, end_date)
+    if not trading_dates:
+        return pd.DataFrame(columns=empty_columns)
+    trading_dates = [pd.Timestamp(day).normalize() for day in trading_dates]
+    latest_day = trading_dates[-1]
+
+    # MoneyDJ 只負責當日補丁，與 FinMind 歷史／最新日流程平行進行。
+    moneydj_executor = None
+    moneydj_future = None
+    if _hybrid_moneydj_should_run(latest_day):
+        moneydj_executor = ThreadPoolExecutor(max_workers=1)
+        moneydj_future = moneydj_executor.submit(
+            _hybrid_moneydj_latest_day_events,
+            summary,
+            latest_day,
+            warrant_name_map,
+            code,
+            stock_name,
+        )
+        print(
+            f"🚀 混合資料源平行啟動：FinMind 歷史／最新日 + MoneyDJ {latest_day.date()} 單日補丁"
+        )
+
+    # API 啟用時，最後一個交易日由逐權證 API 完整取代；API 關閉時，
+    # 最後一日仍必須保留在 Parquet 歷史路徑，不能平白少掉最新交易日。
+    historical_dates = (
+        trading_dates[:-1]
+        if FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+        else trading_dates
+    )
+    historical_jobs = [
+        (day, active_codes)
+        for day in historical_dates
+        if (active_codes := _finmind_active_warrant_codes(summary, day))
+    ]
+
+    # 第一階段最新日查詢：
+    # - 一般模式維持原本 FinMind 最新日 API + 官方 preflight 平行流程。
+    # - 混合模式且 MoneyDJ 已啟動時，先不啟動 FinMind 最新日流程；MoneyDJ 成功就直接短路，
+    #   只有 MoneyDJ 失敗／無目標日資料時才回退 FinMind，避免白等官方全市場 OpenAPI。
+    latest_executor = None
+    latest_future = None
+    latest_cancel_event = cancel_event if cancel_event is not None else threading.Event()
+    defer_finmind_latest_for_moneydj = bool(
+        moneydj_future is not None
+        and HYBRID_MONEYDJ_SHORT_CIRCUIT_FINMIND_LATEST
+    )
+    if (
+        FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+        and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE
+        and not defer_finmind_latest_for_moneydj
+    ):
+        latest_executor = ThreadPoolExecutor(max_workers=1)
+        latest_future = latest_executor.submit(
+            _finmind_fetch_latest_day_with_official_preflight,
+            summary,
+            latest_day,
+            warrant_name_map,
+            code,
+            stock_name,
+            trader_name_map,
+            None,
+            selected_branch_id_map,
+            True,
+            latest_cancel_event,
+        )
+        print(
+            f"🚀 權證流水線平行啟動：歷史 {len(historical_jobs)} 日 + 最新日主要 API + 官方發行商預載"
+        )
+    elif defer_finmind_latest_for_moneydj:
+        print(
+            f"⚡ 混合模式短路待命：先等 MoneyDJ {latest_day.date()}；"
+            "成功即略過 FinMind 官方 preflight／逐權證 API，失敗才回退"
+        )
+
+    prefetched_events = _finmind_get_multi_stock_prefetched_events(code, start_date, end_date)
+    historical_failures = []
+    historical_empty_dates = 0
+
+    if prefetched_events is not None:
+        prefetched_stats = dict(_FINMIND_WARRANT_RUN_STATS.get(code, {}) or {})
+        prefetched_failed_dates = list(prefetched_stats.get("failed_date_list", []) or [])
+        historical_failures.extend((day_s, "multi-stock prefetch failed") for day_s in prefetched_failed_dates)
+        historical_events = prefetched_events.copy()
+        if not historical_events.empty:
+            historical_events["Date"] = pd.to_datetime(historical_events["Date"], errors="coerce").dt.normalize()
+            historical_events = historical_events.dropna(subset=["Date"])
+            latest_comparison = (
+                historical_events["Date"] < latest_day
+                if FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+                else historical_events["Date"] <= latest_day
+            )
+            historical_events = historical_events[latest_comparison].copy()
+        historical_event_dates = int(historical_events["Date"].nunique()) if not historical_events.empty else 0
+        historical_empty_dates = max(0, len(historical_jobs) - historical_event_dates)
+        print(
+            f"⚡ 使用多股票聯集歷史預處理結果：{code}｜{len(historical_events):,}筆｜"
+            f"歷史日至 {historical_dates[-1].date() if historical_dates else '-'}"
+        )
+    else:
+        compact_events, compact_dates = _finmind_load_target_events_from_market_compact(
+            summary, historical_jobs, warrant_name_map, code, stock_name, trader_name_map,
+        ) if historical_jobs else (pd.DataFrame(), set())
+        remaining_jobs = [
+            (day, active_codes) for day, active_codes in historical_jobs
+            if pd.Timestamp(day).normalize() not in compact_dates
+        ]
+        print(
+            f"🚀 FinMind 歷史權證分點處理：{code} {stock_name}｜"
+            f"歷史交易日 {len(historical_jobs):,} 日｜精簡快取 {len(compact_dates):,} 日｜"
+            f"原始 Parquet 補處理 {len(remaining_jobs):,} 日｜workers={FINMIND_WARRANT_DOWNLOAD_WORKERS}"
+        )
+        frames = [compact_events] if compact_events is not None and not compact_events.empty else []
+        compact_event_dates = set(
+            pd.to_datetime(compact_events["Date"], errors="coerce").dropna().dt.normalize().tolist()
+        ) if compact_events is not None and not compact_events.empty else set()
+        historical_empty_dates = max(0, len(compact_dates - compact_event_dates))
+        completed = len(compact_dates)
+
+        if remaining_jobs:
+            with ThreadPoolExecutor(max_workers=FINMIND_WARRANT_DOWNLOAD_WORKERS) as executor:
+                future_map = {
+                    executor.submit(
+                        _finmind_process_warrant_day,
+                        day, active_codes, warrant_name_map, code, stock_name, trader_name_map,
+                    ): day
+                    for day, active_codes in remaining_jobs
+                }
+                for future in as_completed(future_map):
+                    day = future_map[future]
+                    completed += 1
+                    try:
+                        day_df = future.result()
+                        if day_df is None or day_df.empty:
+                            historical_empty_dates += 1
+                        else:
+                            frames.append(day_df)
+                    except Exception as exc:
+                        historical_failures.append((pd.Timestamp(day).strftime("%Y-%m-%d"), str(exc)))
+                        print(f"❌ FinMind 歷史權證日期失敗：{pd.Timestamp(day).date()}｜{exc}")
+                    if completed == 1 or completed % 5 == 0 or completed == len(historical_jobs):
+                        print(
+                            f"📊 FinMind 歷史權證進度：{completed}/{len(historical_jobs)}｜"
+                            f"資料區塊={len(frames)}｜空資料={historical_empty_dates}｜失敗={len(historical_failures)}"
+                        )
+        historical_events = _concat_warrant_event_frames(frames) if frames else pd.DataFrame(columns=empty_columns)
+
+    if historical_failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
+        latest_cancel_event.set()
+        if latest_executor is not None:
+            latest_executor.shutdown(wait=False, cancel_futures=True)
+        if moneydj_executor is not None:
+            moneydj_executor.shutdown(wait=False, cancel_futures=True)
+        samples = "；".join(f"{day}:{error[:120]}" for day, error in historical_failures[:5])
+        raise RuntimeError(
+            f"FinMind 歷史權證分點不完整：失敗 {len(historical_failures)}/{len(historical_jobs)} 日｜{samples}"
+        )
+
+    if historical_events is None or historical_events.empty:
+        historical_events = pd.DataFrame(columns=empty_columns)
+    else:
+        already_normalized = bool(historical_events.attrs.get("_warrant_events_normalized"))
+        historical_events["Date"] = pd.to_datetime(historical_events["Date"], errors="coerce").dt.normalize()
+        historical_events = historical_events.dropna(subset=["Date"])
+        for col in ["buy_amount", "sell_amount", "net_amount", "buy_shares", "sell_shares"]:
+            historical_events[col] = pd.to_numeric(historical_events[col], errors="coerce").fillna(0.0)
+        if not already_normalized:
+            historical_events["warrant_code"] = historical_events["warrant_code"].map(normalize_openapi_warrant_code)
+            historical_events["branch"] = historical_events["branch"].map(normalize_branch_name)
+            historical_events["broker_code"] = historical_events["broker_code"].astype(str).str.strip()
+        historical_events["side"] = np.where(historical_events["net_amount"] >= 0, "買超", "賣超")
+        historical_events.attrs["_warrant_events_normalized"] = True
+
+    # 混合模式優先收斂 MoneyDJ 結果。成功取得目標日後，不再啟動或等待 FinMind preflight。
+    moneydj_events = pd.DataFrame(columns=empty_columns)
+    moneydj_stats = {}
+    moneydj_has_target_day = False
+    if moneydj_future is not None and defer_finmind_latest_for_moneydj:
+        moneydj_wait_timed_out = False
+        try:
+            moneydj_events, moneydj_stats = moneydj_future.result(
+                timeout=HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS
+            )
+        except FuturesTimeoutError:
+            moneydj_wait_timed_out = True
+            moneydj_events, moneydj_stats = pd.DataFrame(columns=empty_columns), {
+                "error": "timeout",
+                "timeout_seconds": HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS,
+            }
+            moneydj_future.cancel()
+            print(
+                f"⏰ MoneyDJ 最新日補丁等待逾時：{code}｜"
+                f"上限={HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS:g}秒｜立即回退 FinMind 最新日流程"
+            )
+        except Exception as exc:
+            moneydj_events, moneydj_stats = pd.DataFrame(columns=empty_columns), {"error": str(exc)}
+            print(f"⚠️ MoneyDJ 最新日補丁失敗，回退 FinMind 最新日流程：{code}｜{exc}")
+        finally:
+            if moneydj_executor is not None:
+                moneydj_executor.shutdown(
+                    wait=not moneydj_wait_timed_out,
+                    cancel_futures=moneydj_wait_timed_out,
+                )
+            moneydj_executor = None
+            moneydj_future = None
+
+        moneydj_has_target_day = bool(
+            moneydj_events is not None
+            and not moneydj_events.empty
+            and "Date" in moneydj_events.columns
+            and (
+                pd.to_datetime(moneydj_events["Date"], errors="coerce").dt.normalize()
+                == latest_day
+            ).any()
+        )
+        if moneydj_has_target_day:
+            latest_cancel_event.set()
+            latest_events = moneydj_events.copy()
+            latest_api_stats = {
+                "date": latest_day.strftime("%Y-%m-%d"),
+                "requested_date": latest_day.strftime("%Y-%m-%d"),
+                "resolved_date": latest_day.strftime("%Y-%m-%d"),
+                "active_codes": int(latest_events["warrant_code"].nunique()) if "warrant_code" in latest_events.columns else 0,
+                "success_codes": int(latest_events["warrant_code"].nunique()) if "warrant_code" in latest_events.columns else 0,
+                "empty_codes": 0,
+                "failed_codes": 0,
+                "endpoint_rows": int(len(latest_events)),
+                "event_rows": int(len(latest_events)),
+                "query_codes": sorted(latest_events["warrant_code"].dropna().astype(str).unique().tolist()) if "warrant_code" in latest_events.columns else [],
+                "cancelled": False,
+                "not_ready": False,
+                "all_empty": False,
+                "fallback_used": False,
+                "hybrid_moneydj_used": True,
+                "hybrid_moneydj_stats": moneydj_stats,
+                "official_preflight_status": "skipped_by_moneydj",
+                "official_preflight_reason": "MoneyDJ 已成功提供目標交易日，混合模式略過 FinMind 官方 preflight 與逐權證 API",
+            }
+            print(
+                f"⚡ MoneyDJ 當日資料已就緒，短路 FinMind 最新日流程：{code}｜"
+                f"{latest_day.date()}｜事件={len(latest_events):,}｜"
+                "官方 preflight=略過｜逐權證 API=略過"
+            )
+            print(
+                f"⏭️ {code}｜官方最新日發布前置檢查：skipped｜"
+                "原因=MoneyDJ 已提供目標交易日"
+            )
+        else:
+            print(
+                f"↩️ MoneyDJ 未取得目標日資料，啟動 FinMind 原始最新日流程："
+                f"{code}｜{latest_day.date()}"
+            )
+
+    if not FINMIND_WARRANT_LATEST_DAY_API_ENABLE:
+        latest_events = pd.DataFrame(columns=empty_columns)
+        latest_api_stats = {
+            "date": latest_day.strftime("%Y-%m-%d"),
+            "active_codes": 0,
+            "success_codes": 0,
+            "empty_codes": 0,
+            "failed_codes": 0,
+            "endpoint_rows": 0,
+            "event_rows": 0,
+            "query_codes": [],
+            "cancelled": False,
+        }
+        print(f"ℹ️ 最新日權證 API 已關閉，完全略過逐權證與精選分點補查：{code}")
+    elif moneydj_has_target_day:
+        # latest_events / latest_api_stats 已由 MoneyDJ 建立，不做任何 FinMind 最新日請求。
+        pass
+    elif latest_future is not None:
+        try:
+            latest_events, latest_api_stats = latest_future.result()
+        finally:
+            latest_executor.shutdown(wait=True)
+    else:
+        # MoneyDJ 失敗、非平行組態，或混合短路未命中時，才執行原本 FinMind preflight + 最新日 API。
+        latest_events, latest_api_stats = _finmind_fetch_latest_day_with_official_preflight(
+            summary, latest_day, warrant_name_map, code, stock_name, trader_name_map,
+            historical_events=historical_events,
+            selected_branch_id_map=selected_branch_id_map,
+            cancel_event=latest_cancel_event,
+            probe_enable=True,
+        )
+
+    # 第二階段只補平行第一階段尚未看見、但歷史完成後確認近期曾出現的權證。
+    recent_history_codes = _finmind_recent_history_warrant_codes(
+        historical_events,
+        latest_day,
+        FINMIND_WARRANT_LATEST_DAY_HISTORY_BACKFILL_TRADING_DAYS,
+    ) if FINMIND_WARRANT_LATEST_DAY_API_ENABLE else set()
+    queried_codes = set(latest_api_stats.get("query_codes", []) or [])
+    missing_recent_codes = sorted(recent_history_codes - queried_codes)
+    if (
+        FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+        and missing_recent_codes
+        and not bool(latest_api_stats.get("not_ready", False))
+        and not bool(latest_api_stats.get("hybrid_moneydj_used", False))
+    ):
+        print(
+            f"🔁 最新日第二階段補查：近期歷史額外權證={len(missing_recent_codes):,}支｜"
+            "只補第一階段未查代號"
+        )
+        backfill_summary = pd.DataFrame({
+            "stock_id": missing_recent_codes,
+            "listing_date": [latest_day] * len(missing_recent_codes),
+            "last_trade_date": [latest_day] * len(missing_recent_codes),
+        })
+        backfill_events, backfill_stats = _finmind_fetch_latest_day_events_by_warrant_api(
+            backfill_summary,
+            latest_day,
+            warrant_name_map,
+            code,
+            stock_name,
+            trader_name_map,
+            historical_events=None,
+            selected_branch_id_map={},
+            all_empty_is_error=False,
+            cancel_event=latest_cancel_event,
+            probe_enable=False,
+        )
+        latest_events = _concat_warrant_event_frames([latest_events, backfill_events])
+        if not latest_events.empty:
+            latest_events["Date"] = pd.to_datetime(latest_events["Date"], errors="coerce").dt.normalize()
+            latest_events["broker_code"] = latest_events["broker_code"].astype(str).str.strip()
+            latest_events["warrant_code"] = latest_events["warrant_code"].map(normalize_openapi_warrant_code)
+            latest_events = latest_events.drop_duplicates(
+                subset=["Date", "broker_code", "warrant_code"], keep="last"
+            ).reset_index(drop=True)
+        all_query_codes = queried_codes | set(backfill_stats.get("query_codes", []) or [])
+        latest_api_stats["query_codes"] = sorted(all_query_codes)
+        latest_api_stats["active_codes"] = len(all_query_codes)
+        latest_api_stats["recent_history_codes"] = len(recent_history_codes)
+        for key in ["success_codes", "empty_codes", "failed_codes", "endpoint_rows"]:
+            latest_api_stats[key] = int(latest_api_stats.get(key, 0) or 0) + int(backfill_stats.get(key, 0) or 0)
+        latest_api_stats["event_rows"] = int(len(latest_events))
+    else:
+        latest_api_stats["recent_history_codes"] = len(recent_history_codes)
+        if (
+            FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+            and missing_recent_codes
+            and bool(latest_api_stats.get("not_ready", False))
+        ):
+            print(
+                f"⏭️ 最新日探測已確認尚未更新，略過第二階段補查與額外精選分點發現："
+                f"{code}｜原可補={len(missing_recent_codes):,}支"
+            )
+
+    events, latest_api_stats = _finmind_replace_latest_day_with_warrant_api(
+        historical_events,
+        summary,
+        latest_day,
+        warrant_name_map,
+        code,
+        stock_name,
+        trader_name_map,
+        selected_branch_id_map=selected_branch_id_map,
+        precomputed_latest_events=latest_events,
+        precomputed_api_stats=latest_api_stats,
+    )
+
+    # MoneyDJ 短路命中時，precomputed latest_events 已在上方併入；直接標記來源。
+    # 未啟用短路時則維持原本「FinMind 落後才採 MoneyDJ」的行為。
+    latest_source_override = ""
+    if bool(latest_api_stats.get("hybrid_moneydj_used", False)):
+        latest_source_override = "MoneyDJ單日補丁"
+        latest_api_stats["fallback_used"] = False
+        latest_api_stats["resolved_date"] = latest_day.strftime("%Y-%m-%d")
+        print(
+            f"🔀 混合資料源切換成功：FinMind 歷史 + MoneyDJ 最新日｜"
+            f"{code}｜{latest_day.date()}｜MoneyDJ事件={int(latest_api_stats.get('event_rows', 0) or 0):,}"
+        )
+    elif moneydj_future is not None:
+        moneydj_wait_timed_out = False
+        try:
+            moneydj_events, moneydj_stats = moneydj_future.result(
+                timeout=HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS
+            )
+        except FuturesTimeoutError:
+            moneydj_wait_timed_out = True
+            moneydj_events, moneydj_stats = pd.DataFrame(), {
+                "error": "timeout",
+                "timeout_seconds": HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS,
+            }
+            moneydj_future.cancel()
+            print(
+                f"⏰ MoneyDJ 最新日補丁等待逾時，保留 FinMind 結果：{code}｜"
+                f"上限={HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS:g}秒"
+            )
+        except Exception as exc:
+            moneydj_events, moneydj_stats = pd.DataFrame(), {"error": str(exc)}
+            print(f"⚠️ MoneyDJ 最新日補丁失敗，保留 FinMind 結果：{code}｜{exc}")
+        finally:
+            if moneydj_executor is not None:
+                moneydj_executor.shutdown(
+                    wait=not moneydj_wait_timed_out,
+                    cancel_futures=moneydj_wait_timed_out,
+                )
+            moneydj_executor = None
+            moneydj_future = None
+
+        finmind_dates = (
+            pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
+            if events is not None and not events.empty and "Date" in events.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        finmind_has_target_day = bool((finmind_dates == latest_day).any())
+        moneydj_has_target_day = bool(
+            moneydj_events is not None
+            and not moneydj_events.empty
+            and (pd.to_datetime(moneydj_events["Date"], errors="coerce").dt.normalize() == latest_day).any()
+        )
+        if not finmind_has_target_day and moneydj_has_target_day:
+            events = _hybrid_replace_day_with_moneydj(events, moneydj_events, latest_day)
+            latest_source_override = "MoneyDJ單日補丁"
+            latest_api_stats["event_rows"] = int(len(moneydj_events))
+            latest_api_stats["fallback_used"] = False
+            latest_api_stats["resolved_date"] = latest_day.strftime("%Y-%m-%d")
+            latest_api_stats["hybrid_moneydj_used"] = True
+            latest_api_stats["hybrid_moneydj_stats"] = moneydj_stats
+            print(
+                f"🔀 混合資料源切換成功：FinMind 歷史 + MoneyDJ 最新日｜"
+                f"{code}｜{latest_day.date()}｜MoneyDJ事件={len(moneydj_events):,}"
+            )
+        elif finmind_has_target_day:
+            print(f"✅ FinMind 已有目標日資料，MoneyDJ 補丁不採用：{code}｜{latest_day.date()}")
+        else:
+            print(f"ℹ️ FinMind 與 MoneyDJ 均尚無目標日，維持最近有效交易日：{code}｜{latest_day.date()}")
+
+    final_event_dates = (
+        pd.to_datetime(events["Date"], errors="coerce").dropna().dt.normalize()
+        if events is not None and not events.empty and "Date" in events.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    final_latest_day = pd.Timestamp(final_event_dates.max()).normalize() if not final_event_dates.empty else pd.NaT
+    final_latest_source = latest_source_override or (
+        "FinMind最新日API" if pd.notna(final_latest_day) and final_latest_day == latest_day else "最近有效交易日"
+    )
+    print(
+        f"🧪 最新日驗收：{code}｜要求={latest_day.date()}｜"
+        f"實際={final_latest_day.date() if pd.notna(final_latest_day) else '-'}｜"
+        f"來源={final_latest_source}｜"
+        f"當日命中={1 if pd.notna(final_latest_day) and final_latest_day == latest_day else 0}"
+    )
+
+    latest_failed = int(latest_api_stats.get("failed_codes", 0) or 0)
+    latest_success = int(latest_api_stats.get("success_codes", 0) or 0)
+    latest_active = int(latest_api_stats.get("active_codes", 0) or 0)
+    latest_has_data = int(latest_api_stats.get("event_rows", 0) or 0) > 0
+    latest_fallback_used = bool(latest_api_stats.get("fallback_used", False))
+    latest_date_count = 1 if FINMIND_WARRANT_LATEST_DAY_API_ENABLE else 0
+    latest_success_date_count = (
+        1
+        if latest_date_count
+        and latest_has_data
+        and latest_failed == 0
+        and (latest_success == latest_active or latest_active == 0)
+        else 0
+    )
+    stats = {
+        "total_dates": len(historical_jobs) + latest_date_count,
+        "success_dates": max(0, len(historical_jobs) - len(historical_failures)) + latest_success_date_count,
+        "empty_dates": historical_empty_dates + (1 if latest_date_count and not latest_has_data else 0),
+        "failed_dates": len(historical_failures) + (1 if latest_date_count and latest_failed > 0 else 0),
+        "latest_available_date": latest_day.strftime("%Y-%m-%d") if latest_has_data else (
+            events["Date"].max().strftime("%Y-%m-%d") if events is not None and not events.empty else ""
+        ),
+        "latest_api_active_codes": latest_active,
+        "latest_api_success_codes": latest_success,
+        "latest_api_empty_codes": int(latest_api_stats.get("empty_codes", 0) or 0),
+        "latest_api_event_rows": int(latest_api_stats.get("event_rows", 0) or 0),
+        "latest_api_all_empty": bool(latest_api_stats.get("all_empty", False)),
+        "latest_api_fallback_used": latest_fallback_used,
+        "latest_api_requested_date": str(latest_api_stats.get("requested_date", "") or ""),
+        "latest_api_resolved_date": str(latest_api_stats.get("resolved_date", "") or ""),
+        "latest_api_official_preflight_status": str(latest_api_stats.get("official_preflight_status", "") or ""),
+        "latest_api_official_preflight_reason": str(latest_api_stats.get("official_preflight_reason", "") or ""),
+    }
+    _FINMIND_WARRANT_RUN_STATS[code] = stats
+
+    should_write_snapshot = bool(
+        stats["failed_dates"] == 0 and events is not None and not events.empty and (
+            not REPORT_LIVE_ONLY
+            or (ACTION_REFRESH_CONTROLS_REPORT_DATA and ACTION_FORCE_REFRESH)
+            or WARRANT_CACHE_FORCE_REFRESH
+        )
+    )
+    if should_write_snapshot:
+        save_gsheet_warrant_events_snapshot(code, stock_name, events, start_date, end_date)
+
+    if events is None or events.empty:
+        return pd.DataFrame(columns=empty_columns)
+    events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    latest_source_label = (
+        latest_source_override
+        if latest_source_override
+        else "API尚未更新，回退最近有效交易日"
+        if latest_fallback_used
+        else "平行權證代號API"
+        if FINMIND_WARRANT_LATEST_DAY_API_ENABLE and FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE
+        else "權證代號API"
+        if FINMIND_WARRANT_LATEST_DAY_API_ENABLE
+        else "已關閉"
+    )
+    print(
+        f"✅ FinMind 權證分點完成：{code}｜{len(events):,}筆｜"
+        f"歷史=Parquet/全市場精簡快取｜最新日={latest_source_label}｜"
+        f"日期 {events['Date'].min().date()} ~ {events['Date'].max().date()}"
+    )
+    return events
+
+
+
+
+# ============================================================
 # 對外入口
 # ============================================================
 
-def _prepare_report_news_items(stock_code: str, stock_name: str) -> List[dict]:
-    """準備週報新聞素材；可與權證 API 流程平行執行。"""
+def _prepare_report_news_items(stock_code: str, stock_name: str, cancel_event: threading.Event | None = None) -> List[dict]:
+    """準備週報新聞素材；快取檢查由完整新聞管線統一執行一次。"""
     with report_stage_timer(f"{stock_code}｜新聞資料準備"):
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if is_compact_report_mode():
             print("📄 精簡週報模式：略過本週重點、多來源新聞抓取與 Gemini 新聞統整")
             return []
+        if ACTION_CACHE_ONLY_MODE:
+            print(
+                f"☁️ Action=0 嚴格快取模式未命中當日新聞快取：{stock_code}，"
+                "不執行新聞搜尋"
+            )
+            return []
+        return fetch_multi_source_news_articles(
+            stock_code,
+            stock_name,
+            max_items=NEWS_GOOGLE_MAX_ITEMS,
+            cancel_event=cancel_event,
+        )
+
+
+def _prepare_report_news_pipeline(stock_code: str, stock_name: str, cancel_event: threading.Event | None = None) -> dict:
+    """新聞快取只檢查一次；命中本機後不再連 Google Sheet或重進 build_news_points。"""
+    with report_stage_timer(f"{stock_code}｜完整新聞管線"):
+        if cancel_event is not None and cancel_event.is_set():
+            return {"news_items": [], "news_points": []}
+        if is_compact_report_mode():
+            return {"news_items": [], "news_points": []}
 
         cached_news_points = _load_gsheet_news_points_cache_for_display(
             stock_code,
@@ -14433,40 +17135,23 @@ def _prepare_report_news_items(stock_code: str, stock_name: str) -> List[dict]:
         )
         if cached_news_points:
             print(
-                f"📦 今日新聞快取已存在，略過多來源新聞抓取與 Gemini 新聞統整："
+                f"⚡ 今日新聞本機快取已存在，略過六來源新聞抓取與 Gemini："
                 f"{stock_code}｜{len(cached_news_points)} 點"
             )
-            return []
+            return {
+                "news_items": [],
+                "news_points": list(cached_news_points or []),
+            }
 
-        if ACTION_CACHE_ONLY_MODE:
-            print(
-                f"☁️ Action=0 嚴格快取模式未命中當日新聞快取：{stock_code}，"
-                "不執行 Google News／Yahoo／MoneyDJ 新聞搜尋"
-            )
-            return []
-
-        return fetch_multi_source_news_articles(
-            stock_code,
-            stock_name,
-            max_items=NEWS_GOOGLE_MAX_ITEMS,
-        )
-
-
-def _prepare_report_news_pipeline(stock_code: str, stock_name: str) -> dict:
-    """完整新聞管線：素材抓取、Top-K 原文補抓、Gemini 統整、repair／補點一次完成。
-
-    此流程不依賴 API4／API5 分點資料，可在背景執行；回傳的空 points 也是合法結果，
-    因此 plot 端以 None 區分「尚未預先計算」與「已計算但沒有合格新聞」。
-    """
-    with report_stage_timer(f"{stock_code}｜完整新聞管線"):
-        news_items = _prepare_report_news_items(stock_code, stock_name)
-        if is_compact_report_mode():
-            return {"news_items": news_items, "news_points": []}
+        news_items = _prepare_report_news_items(stock_code, stock_name, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return {"news_items": [], "news_points": []}
         news_points = build_news_points(
             stock_code,
             stock_name,
             news_items,
             ctx=None,
+            cache_lookup=False,
         )
         return {
             "news_items": news_items,
@@ -14474,13 +17159,513 @@ def _prepare_report_news_pipeline(stock_code: str, stock_name: str) -> dict:
         }
 
 
-def generate_warrant_report(stock_code: str) -> io.BytesIO:
-    report_total_start = time.perf_counter()
-    stock_code = str(stock_code).strip()
-    report_data_executor = None
-    news_future = None
+_REPORT_NEWS_PREFETCH_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_REPORT_NEWS_PREFETCH_FUTURES = {}
+_REPORT_NEWS_PREFETCH_CANCEL_EVENTS = {}
+_REPORT_NEWS_PREFETCH_LOCK = threading.RLock()
+
+
+def _prepare_report_news_pipeline_by_code(stock_code: str, cancel_event: threading.Event) -> dict:
+    code = _normalize_stock_name_code_key(stock_code)
+    if cancel_event.is_set():
+        return {"news_items": [], "news_points": []}
+    stock_name = get_tw_stock_name(code)
+    return _prepare_report_news_pipeline(code, stock_name, cancel_event=cancel_event)
+
+
+def _schedule_next_report_news_prefetch(stock_code: str):
+    """在目前股票建圖時預抓下一檔新聞，下一檔開始後直接接續既有 Future。"""
+    code = _normalize_stock_name_code_key(stock_code)
+    if not code or is_compact_report_mode():
+        return None
+    with _REPORT_NEWS_PREFETCH_LOCK:
+        existing = _REPORT_NEWS_PREFETCH_FUTURES.get(code)
+        if existing is not None:
+            return existing
+        cancel_event = threading.Event()
+        future = _REPORT_NEWS_PREFETCH_EXECUTOR.submit(
+            _prepare_report_news_pipeline_by_code,
+            code,
+            cancel_event,
+        )
+        _REPORT_NEWS_PREFETCH_FUTURES[code] = future
+        _REPORT_NEWS_PREFETCH_CANCEL_EVENTS[code] = cancel_event
+        print(f"🚀 已提前啟動下一檔新聞管線：{code}｜與目前建圖重疊")
+        return future
+
+
+def _take_report_news_prefetch(stock_code: str):
+    code = _normalize_stock_name_code_key(stock_code)
+    with _REPORT_NEWS_PREFETCH_LOCK:
+        return (
+            _REPORT_NEWS_PREFETCH_FUTURES.get(code),
+            _REPORT_NEWS_PREFETCH_CANCEL_EVENTS.get(code),
+        )
+
+
+def _clear_report_news_prefetch(stock_code: str):
+    code = _normalize_stock_name_code_key(stock_code)
+    with _REPORT_NEWS_PREFETCH_LOCK:
+        _REPORT_NEWS_PREFETCH_FUTURES.pop(code, None)
+        _REPORT_NEWS_PREFETCH_CANCEL_EVENTS.pop(code, None)
+
+
+def _shutdown_report_news_prefetch():
+    with _REPORT_NEWS_PREFETCH_LOCK:
+        for event in _REPORT_NEWS_PREFETCH_CANCEL_EVENTS.values():
+            event.set()
+        for future in _REPORT_NEWS_PREFETCH_FUTURES.values():
+            future.cancel()
+        _REPORT_NEWS_PREFETCH_FUTURES.clear()
+        _REPORT_NEWS_PREFETCH_CANCEL_EVENTS.clear()
+    _REPORT_NEWS_PREFETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
+
+# ============================================================
+# ============================================================
+# FinMind 當日資料完整性保護
+# ============================================================
+# FinMind 當日權證分點可能在盤後分批更新。正式圖以 TWSE／TPEx 官方權證
+# 當日成交量做交叉驗證；採「代號覆蓋率門檻 + 全體總量差異容忍度」，
+# 不再因單一冷門權證延遲或官方／FinMind 多出一碼就否決整批資料。
+FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE = os.getenv(
+    "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE = os.getenv(
+    "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE = min(
+    1.0,
+    max(0.0, float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE", "0.95"))),
+)
+FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS", "1.0")),
+)
+FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT", "0.001")),
+)
+FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_LOTS = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_LOTS", "20.0")),
+)
+FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_PCT = max(
+    0.0,
+    float(os.getenv("FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_PCT", "0.002")),
+)
+FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES = max(
+    1,
+    int(os.getenv("FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES", "1")),
+)
+
+
+def _normalize_official_trade_date_series(series: pd.Series) -> pd.Series:
+    """統一 TWSE / TPEx OpenAPI 的斜線、連字號與空白日期格式。"""
+    raw = series.astype(str).str.strip().str.replace(".", "-", regex=False).str.replace("/", "-", regex=False)
+    return pd.to_datetime(raw, errors="coerce").dt.tz_localize(None).dt.normalize()
+
+
+def _finmind_current_day_official_volume_audit(
+    events_df: pd.DataFrame,
+    stock_code: str,
+    stock_name: str,
+    target_date,
+) -> dict:
+    """用官方權證成交量驗證 FinMind 當日分點資料是否完整。
+
+    同時檢查官方端與 FinMind 端的權證代號覆蓋，避免只比到已發布市場的一小部分，
+    或因 TWSE / TPEx 日期格式不同而誤判。官方相關市場尚未更新時，明確標示為等待官方資料。
+    """
+    result = {
+        "verified": False,
+        "reason": "尚未驗證",
+        "audit_df": pd.DataFrame(),
+        "official_codes": 0,
+        "presence_codes": 0,
+        "matched_codes": 0,
+        "coverage": 0.0,
+        "matched_volume_coverage": 0.0,
+        "official_total_lots": 0.0,
+        "finmind_buy_total_lots": 0.0,
+        "finmind_sell_total_lots": 0.0,
+        "total_allowed_diff_lots": 0.0,
+        "status": "unverified",
+    }
+    if not FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE:
+        result["reason"] = "官方成交量驗證已關閉"
+        return result
+    if events_df is None or events_df.empty:
+        result["reason"] = "FinMind 當日事件為空"
+        return result
+
+    target_ts = pd.Timestamp(target_date).normalize()
+    code = _normalize_stock_name_code_key(stock_code)
 
     try:
+        summary = _finmind_get_warrant_summary(code, target_ts, target_ts)
+        active_codes = set(
+            summary.get("stock_id", pd.Series(dtype=str))
+            .astype(str)
+            .map(normalize_openapi_warrant_code)
+        )
+        active_codes.discard("")
+        if not active_codes:
+            result["reason"] = "FinMind 找不到當日有效認購權證母體"
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            twse_future = executor.submit(fetch_twse_openapi_warrant_daily_df)
+            tpex_future = executor.submit(fetch_tpex_openapi_warrant_daily_df)
+            try:
+                twse_df = twse_future.result()
+            except Exception as exc:
+                print(f"⚠️ 當日完整性驗證 TWSE OpenAPI 失敗：{exc}")
+                twse_df = pd.DataFrame()
+            try:
+                tpex_df = tpex_future.result()
+            except Exception as exc:
+                print(f"⚠️ 當日完整性驗證 TPEx OpenAPI 失敗：{exc}")
+                tpex_df = pd.DataFrame()
+
+        source_frames = {"TWSE": twse_df, "TPEx": tpex_df}
+        unavailable_sources = []
+        for source_name, source_df in source_frames.items():
+            fetch_ok = bool(
+                isinstance(source_df, pd.DataFrame)
+                and source_df.attrs.get("openapi_fetch_ok", False)
+            )
+            if not fetch_ok:
+                error_text = (
+                    str(source_df.attrs.get("openapi_fetch_error", "") or "")
+                    if isinstance(source_df, pd.DataFrame)
+                    else "未取得 DataFrame"
+                )
+                unavailable_sources.append(
+                    f"{source_name}{f'（{error_text}）' if error_text else ''}"
+                )
+
+        # 官方來源網路失敗只代表「本次無法驗證」，不代表 FinMind 當日資料不完整。
+        # 由 safety guard 保留當日資料，下一次執行再重新驗證。
+        if unavailable_sources:
+            result["status"] = "source_unavailable"
+            result["reason"] = (
+                "官方來源暫時無法完整取得："
+                + "、".join(unavailable_sources)
+                + "；本次無法完成官方成交量核對"
+            )
+            print(
+                f"⚠️ FinMind 當日完整性驗證暫時無法執行："
+                f"{code} {stock_name}｜{result['reason']}"
+            )
+            return result
+
+        official_parts = []
+        source_latest = {}
+        for source_name, source_df in [("TWSE", twse_df), ("TPEx", tpex_df)]:
+            if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+                source_latest[source_name] = "-"
+                continue
+            part = source_df.copy()
+            for col in ["交易日期", "代號", "成交量", "市場", "名稱"]:
+                if col not in part.columns:
+                    part[col] = "" if col != "成交量" else 0
+            part["_trade_date"] = _normalize_official_trade_date_series(part["交易日期"])
+            part["_source"] = source_name
+            latest = part["_trade_date"].dropna().max()
+            source_latest[source_name] = latest.strftime("%Y-%m-%d") if pd.notna(latest) else "-"
+            official_parts.append(part)
+
+        if not official_parts:
+            result["reason"] = "TWSE / TPEx 官方權證資料皆無法取得"
+            return result
+
+        official_all = pd.concat(official_parts, ignore_index=True, sort=False)
+        official_all["代號"] = official_all["代號"].map(normalize_openapi_warrant_code)
+        official_all["成交量"] = pd.to_numeric(official_all["成交量"], errors="coerce").fillna(0.0)
+        relevant_all = official_all[official_all["代號"].isin(active_codes)].copy()
+        official_target = relevant_all[
+            (relevant_all["_trade_date"] == target_ts)
+            & (relevant_all["成交量"] > 0)
+        ].copy()
+
+        current = events_df.copy()
+        current["Date"] = pd.to_datetime(current["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+        current = current[current["Date"] == target_ts].copy()
+        current["warrant_code"] = current["warrant_code"].map(normalize_openapi_warrant_code)
+        for col in ["buy_shares", "sell_shares"]:
+            if col not in current.columns:
+                current[col] = 0.0
+            current[col] = pd.to_numeric(current[col], errors="coerce").fillna(0.0)
+        fin = current.groupby("warrant_code", as_index=False).agg(
+            finmind_buy_lots=("buy_shares", "sum"),
+            finmind_sell_lots=("sell_shares", "sum"),
+            finmind_rows=("warrant_code", "size"),
+        )
+        fin = fin[(fin["finmind_buy_lots"].abs() + fin["finmind_sell_lots"].abs()) > 0].copy()
+
+        if official_target.empty:
+            relevant_latest = relevant_all["_trade_date"].dropna().max() if not relevant_all.empty else pd.NaT
+            relevant_latest_text = relevant_latest.strftime("%Y-%m-%d") if pd.notna(relevant_latest) else "-"
+            result["status"] = "official_pending"
+            result["reason"] = (
+                f"與本標的有效權證相符的官方資料尚未發布到 {target_ts.strftime('%Y-%m-%d')}"
+                f"（相關權證最新 {relevant_latest_text}；TWSE最新 {source_latest.get('TWSE', '-')}；"
+                f"TPEx最新 {source_latest.get('TPEx', '-')}）"
+            )
+            print(f"ℹ️ FinMind 當日完整性等待官方資料：{code} {stock_name}｜{result['reason']}")
+            return result
+
+        official = (
+            official_target.sort_values("成交量")
+            .drop_duplicates(subset=["代號"], keep="last")
+            [["代號", "名稱", "市場", "成交量", "_source"]]
+            .rename(columns={
+                "代號": "warrant_code",
+                "名稱": "official_name",
+                "市場": "official_market",
+                "成交量": "official_volume_lots",
+                "_source": "official_source",
+            })
+        )
+
+        # outer merge 保留雙方缺碼診斷；正式門檻改採「代號存在覆蓋率 + 全體總量差異」。
+        # 單一冷門權證逐檔延遲不再直接否決整批，但若缺碼造成總量差異過大仍會退回。
+        audit = official.merge(fin, on="warrant_code", how="outer", indicator=True)
+        for col in ["official_volume_lots", "finmind_buy_lots", "finmind_sell_lots", "finmind_rows"]:
+            audit[col] = pd.to_numeric(audit[col], errors="coerce").fillna(0.0)
+        for col in ["official_name", "official_market", "official_source"]:
+            if col not in audit.columns:
+                audit[col] = ""
+            audit[col] = audit[col].fillna("").astype(str)
+
+        audit["buy_diff_lots"] = audit["finmind_buy_lots"] - audit["official_volume_lots"]
+        audit["sell_diff_lots"] = audit["finmind_sell_lots"] - audit["official_volume_lots"]
+        audit["allowed_diff_lots"] = np.maximum(
+            FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_LOTS,
+            audit["official_volume_lots"].abs() * FINMIND_WARRANT_CURRENT_DAY_VOLUME_TOLERANCE_PCT,
+        )
+        audit["code_coverage_match"] = audit["_merge"].eq("both")
+        audit["buy_match"] = audit["code_coverage_match"] & (
+            audit["buy_diff_lots"].abs() <= audit["allowed_diff_lots"]
+        )
+        audit["sell_match"] = audit["code_coverage_match"] & (
+            audit["sell_diff_lots"].abs() <= audit["allowed_diff_lots"]
+        )
+        audit["matched"] = audit["buy_match"] & audit["sell_match"]
+        audit["abs_max_diff_lots"] = audit[["buy_diff_lots", "sell_diff_lots"]].abs().max(axis=1)
+        audit = audit.sort_values(
+            ["code_coverage_match", "matched", "_merge", "abs_max_diff_lots"],
+            ascending=[True, True, True, False],
+        ).reset_index(drop=True)
+
+        official_codes = int(len(official))
+        union_codes = int(len(audit))
+        presence_codes = int(audit["code_coverage_match"].sum())
+        matched_codes = int(audit["matched"].sum())
+        coverage = presence_codes / union_codes if union_codes else 0.0
+        matched_volume_coverage = matched_codes / union_codes if union_codes else 0.0
+
+        official_total = float(official["official_volume_lots"].sum())
+        fin_buy_total = float(fin["finmind_buy_lots"].sum())
+        fin_sell_total = float(fin["finmind_sell_lots"].sum())
+        total_allowed = max(
+            FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_LOTS,
+            abs(official_total) * FINMIND_WARRANT_CURRENT_DAY_TOTAL_VOLUME_TOLERANCE_PCT,
+        )
+        buy_total_diff = fin_buy_total - official_total
+        sell_total_diff = fin_sell_total - official_total
+        total_match = (
+            abs(buy_total_diff) <= total_allowed
+            and abs(sell_total_diff) <= total_allowed
+        )
+        verified = (
+            official_codes >= FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES
+            and coverage >= FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE
+            and total_match
+        )
+
+        failed_reasons = []
+        if official_codes < FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES:
+            failed_reasons.append(
+                f"官方代號數 {official_codes} < {FINMIND_WARRANT_CURRENT_DAY_MIN_OFFICIAL_CODES}"
+            )
+        if coverage < FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE:
+            failed_reasons.append(
+                f"代號覆蓋率 {coverage:.2%} < {FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE:.2%}"
+            )
+        if not total_match:
+            failed_reasons.append(
+                f"總量差超限：買{buy_total_diff:+,.0f}張／賣{sell_total_diff:+,.0f}張，容忍±{total_allowed:,.0f}張"
+            )
+        reason = (
+            f"代號覆蓋率 {coverage:.2%}，買賣總量差均在 ±{total_allowed:,.0f} 張內"
+            if verified
+            else "；".join(failed_reasons) or "未通過官方成交量核對"
+        )
+
+        result.update({
+            "verified": bool(verified),
+            "reason": reason,
+            "audit_df": audit,
+            "official_codes": official_codes,
+            "presence_codes": presence_codes,
+            "matched_codes": matched_codes,
+            "coverage": float(coverage),
+            "matched_volume_coverage": float(matched_volume_coverage),
+            "official_total_lots": official_total,
+            "finmind_buy_total_lots": fin_buy_total,
+            "finmind_sell_total_lots": fin_sell_total,
+            "total_allowed_diff_lots": float(total_allowed),
+            "status": "verified" if verified else "mismatch",
+        })
+        print(
+            "🔬 FinMind 當日官方成交量核對："
+            f"{code} {stock_name}｜日期={target_ts.date()}｜"
+            f"代號存在={presence_codes}/{union_codes}（{coverage:.2%}；門檻{FINMIND_WARRANT_CURRENT_DAY_MIN_CODE_COVERAGE:.2%}）｜"
+            f"逐檔量吻合={matched_codes}/{union_codes}（{matched_volume_coverage:.2%}；僅供診斷）｜"
+            f"官方代號={official_codes}｜FinMind代號={len(fin)}｜"
+            f"官方={official_total:,.0f}張｜FinMind買={fin_buy_total:,.0f}張（差{buy_total_diff:+,.0f}）｜"
+            f"FinMind賣={fin_sell_total:,.0f}張（差{sell_total_diff:+,.0f}）｜容忍±{total_allowed:,.0f}張"
+        )
+        if not verified:
+            bad = audit[(~audit["code_coverage_match"]) | (~audit["matched"])].head(30)
+            if not bad.empty:
+                print("⚠️ 當日完整性差異權證（前30筆）：")
+                print(bad[[
+                    "warrant_code", "official_name", "official_market", "official_source", "_merge",
+                    "official_volume_lots", "finmind_buy_lots", "finmind_sell_lots",
+                    "buy_diff_lots", "sell_diff_lots",
+                ]].to_string(index=False))
+        return result
+    except Exception as exc:
+        result["reason"] = f"官方成交量驗證例外：{exc}"
+        result["status"] = "error"
+        print(f"⚠️ FinMind 當日完整性驗證失敗：{exc}")
+        return result
+
+def _apply_finmind_current_day_safety_guard(
+    events_df: pd.DataFrame,
+    stock_code: str = "",
+    stock_name: str = "",
+    requested_end=None,
+) -> pd.DataFrame:
+    """以官方權證成交量驗證最新日 API；未通過時整批退回前一交易日。"""
+    if events_df is None or events_df.empty or "Date" not in events_df.columns:
+        return events_df.copy() if isinstance(events_df, pd.DataFrame) else pd.DataFrame()
+
+    out = events_df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    out = out.dropna(subset=["Date"])
+    if out.empty:
+        return out
+    out = out.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+
+    if not FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE:
+        return out
+
+    taipei_today = get_taipei_today_ts()
+    latest_date = pd.Timestamp(out["Date"].max()).normalize()
+    if latest_date != taipei_today:
+        print(
+            f"ℹ️ FinMind 最新日 API 尚未提供今日資料：今日={taipei_today.date()}｜"
+            f"目前最新日={latest_date.date()}"
+        )
+        return out
+
+    current_mask = out["Date"] == taipei_today
+    current_rows = out.loc[current_mask].copy()
+    kept = out.loc[~current_mask].copy()
+    if current_rows.empty:
+        return out
+
+    # 混合模式的 MoneyDJ 當日補丁本來就是在官方 OpenAPI／FinMind 尚未發布時使用；
+    # 不能再套用 FinMind 的官方發布前完整性退回，否則 18:30～FinMind 更新前會被刪掉。
+    if "data_source" in current_rows.columns:
+        source_values = current_rows["data_source"].fillna("").astype(str)
+        if source_values.str.contains("MoneyDJ_latest_day", regex=False).any():
+            out.attrs["finmind_guard_status"] = "moneydj_latest_day_keep"
+            out.attrs["hybrid_latest_date"] = taipei_today.strftime("%Y-%m-%d")
+            print(
+                "✅ 混合模式最新日由 MoneyDJ 提供：略過 FinMind 官方發布前退回保護｜"
+                f"日期={taipei_today.date()}｜事件={len(current_rows):,}筆"
+            )
+            return out
+
+    audit = _finmind_current_day_official_volume_audit(
+        out,
+        stock_code=stock_code,
+        stock_name=stock_name,
+        target_date=taipei_today,
+    )
+    if audit.get("verified"):
+        out.attrs["finmind_guard_status"] = "verified_keep"
+        out.attrs["finmind_guard_verified_date"] = taipei_today.strftime("%Y-%m-%d")
+        print(
+            "✅ FinMind 最新日 API 完整性驗證通過：正式圖納入當日全市場權證分點｜"
+            f"日期={taipei_today.date()}｜事件={len(current_rows):,}筆｜"
+            f"原因={audit.get('reason', '')}"
+        )
+        return out
+
+    guard_status = str(audit.get("status", "") or "")
+    hard_reject_statuses = {"mismatch", "official_pending"}
+
+    # 只有官方資料已成功取得，且明確判定「總量不符」或「官方尚未發布」時才退回。
+    # source_unavailable / error / unverified 都是驗證工具本身暫時不可用，不能因此
+    # 刪除已由 FinMind 成功取得的當日資料。
+    if guard_status not in hard_reject_statuses:
+        print(
+            "⚠️ FinMind 最新日 API 官方驗證未完成，但不視為資料不完整；"
+            f"正式圖保留當日資料｜日期={taipei_today.date()}｜事件={len(current_rows):,}筆｜"
+            f"驗證狀態={guard_status or 'unverified'}｜原因={audit.get('reason', '')}"
+        )
+        out.attrs["finmind_guard_status"] = "unverified_keep"
+        out.attrs["finmind_guard_unverified_date"] = taipei_today.strftime("%Y-%m-%d")
+        return out
+
+    if kept.empty:
+        print(
+            "⚠️ FinMind 最新日 API 完整性未通過，但沒有較早資料可退回；"
+            f"保留當日並標記未驗證｜日期={taipei_today.date()}｜原因={audit.get('reason', '')}"
+        )
+        out.attrs["finmind_guard_status"] = "unverified_no_fallback"
+        return out
+
+    for col in ["buy_amount", "sell_amount", "net_amount"]:
+        current_rows[col] = pd.to_numeric(current_rows.get(col, 0), errors="coerce").fillna(0.0)
+    guard_title = "官方相關市場資料尚未更新" if guard_status == "official_pending" else "官方成交量核對未通過"
+    result = kept.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
+    print(
+        f"🛡️ FinMind 最新日 API 完整性保護：{guard_title}，正式圖退回前一交易日｜"
+        f"日期={taipei_today.date()}｜排除={len(current_rows):,}筆｜"
+        f"買進={fmt_money(float(current_rows['buy_amount'].sum()))}｜"
+        f"賣出={fmt_money(-float(current_rows['sell_amount'].sum()))}｜"
+        f"淨額={fmt_money(float(current_rows['net_amount'].sum()))}｜"
+        f"正式最新日={result['Date'].max().date()}｜原因={audit.get('reason', '')}"
+    )
+    result.attrs["finmind_guard_status"] = "excluded_incomplete_latest_api"
+    result.attrs["finmind_guard_excluded_date"] = taipei_today.strftime("%Y-%m-%d")
+    result.attrs["finmind_guard_excluded_rows"] = int(len(current_rows))
+    return result
+
+
+def generate_warrant_report(stock_code: str, next_stock_code: str = "") -> io.BytesIO:
+    report_total_start = time.perf_counter()
+    stock_code = str(stock_code).strip()
+    selected_branch_snapshot = tuple(_get_selected_branch_flow_list())
+    report_data_executor = None
+    news_future = None
+    report_cancel_event = threading.Event()
+    prefetched_news_cancel_event = None
+
+    try:
+        print(
+            f"🧭 本次產圖精選分點快照：模式={get_selected_branch_flow_mode_label()}｜"
+            f"分點={'、'.join(selected_branch_snapshot) or '未設定'}"
+        )
         if REPORT_LIVE_ONLY:
             print("🔴 本次啟用純 Live 週報模式：圖片內容不使用 Google Sheet / 本機快取資料")
         else:
@@ -14498,20 +17683,32 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         with report_stage_timer(f"{stock_code}｜股票名稱查詢"):
             stock_name = get_tw_stock_name(stock_code)
 
+        # 官方發行商對照不依賴本次權證事件，先在背景抓取／讀快取，避免後段阻塞。
+        _finmind_start_official_warrant_issuer_prefetch()
+
         # 股票名稱取得後立刻啟動完整新聞管線，讓 RSS、Top-K 原文、Gemini 統整、
-        # repair／補點與後續股價、法人、API4／API5 等待時間重疊。
+        # 新聞管線與後續股價、法人、FinMind 權證下載等待時間重疊。
         report_data_executor = ThreadPoolExecutor(max_workers=2)
-        news_future = report_data_executor.submit(
-            _prepare_report_news_pipeline,
-            stock_code,
-            stock_name,
-        )
+        prefetched_news_future, prefetched_news_cancel_event = _take_report_news_prefetch(stock_code)
+        if prefetched_news_future is not None:
+            news_future = prefetched_news_future
+            print(f"⚡ 接續前一檔建圖期間已啟動的新聞管線：{stock_code}")
+        else:
+            news_future = report_data_executor.submit(
+                _prepare_report_news_pipeline,
+                stock_code,
+                stock_name,
+                report_cancel_event,
+            )
 
         with report_stage_timer(f"{stock_code}｜股價資料抓取"):
             stock_df, market, yf_code = fetch_stock_data_yf(stock_code, period="180d")
 
         if stock_df is None or stock_df.empty:
             print(f"❌ 股價資料不足：{stock_code}")
+            report_cancel_event.set()
+            if prefetched_news_cancel_event is not None:
+                prefetched_news_cancel_event.set()
             return None
 
         with report_stage_timer(f"{stock_code}｜技術指標計算"):
@@ -14544,7 +17741,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         start_date = pd.Timestamp(plot_df.index.min()).normalize()
         stock_end_date = pd.Timestamp(plot_df.index.max()).normalize()
         taipei_today = get_taipei_today_ts()
-        # 權證分點資料的更新時間可能比 yfinance 股價更快。
+        # 權證分點資料的更新時間可能比股價資料更快。
         # 因此抓權證資料時，結束日不能只用股價最新日，否則盤後會漏掉今日分點買賣超。
         end_date = max(stock_end_date, taipei_today)
 
@@ -14553,17 +17750,24 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             f"股價最新日 {stock_end_date.date()}｜權證資料區間 {start_date.date()} ~ {end_date.date()}"
         )
 
-        # 權證 API 與已提前啟動的完整新聞管線彼此沒有資料相依。
+        # FinMind 權證流程與已提前啟動的完整新聞管線彼此沒有資料相依。
         warrant_future = report_data_executor.submit(
             fetch_warrant_events_full_market,
             stock_code,
             stock_name,
             start_date,
             end_date,
+            report_cancel_event,
         )
 
         with report_stage_timer(f"{stock_code}｜權證完整流程"):
             warrant_events = warrant_future.result()
+        warrant_events = _apply_finmind_current_day_safety_guard(
+            warrant_events,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            requested_end=end_date,
+        )
         try:
             news_pipeline_result = news_future.result()
         except Exception as e:
@@ -14571,15 +17775,22 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             news_pipeline_result = {"news_items": [], "news_points": []}
         news_items = list(news_pipeline_result.get("news_items", []) or [])
         precomputed_news_points = list(news_pipeline_result.get("news_points", []) or [])
+        _clear_report_news_prefetch(stock_code)
         report_data_executor.shutdown(wait=True)
         report_data_executor = None
 
+        # 目前股票資料已齊全，下一段主要是統計與建圖；此時預抓下一檔新聞最能隱藏網路等待。
+        if next_stock_code:
+            _schedule_next_report_news_prefetch(next_stock_code)
+
         print(f"✅ 權證分點事件總筆數：{len(warrant_events):,}")
+        selected_debug_cache = None
         if warrant_events is not None and not warrant_events.empty and "Date" in warrant_events.columns:
             latest_event_date = pd.to_datetime(warrant_events["Date"], errors="coerce").dropna().max()
             if pd.notna(latest_event_date):
                 print(f"🔎 權證分點事件最新日期：{pd.Timestamp(latest_event_date).date()}")
             selected_debug = filter_selected_branch_flow_events(warrant_events)
+            selected_debug_cache = selected_debug.copy() if selected_debug is not None else pd.DataFrame()
             if selected_debug is not None and not selected_debug.empty:
                 selected_debug = selected_debug.copy()
                 selected_debug["Date"] = pd.to_datetime(selected_debug["Date"], errors="coerce").dt.normalize()
@@ -14598,17 +17809,29 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                 end_date=end_date,
             )
 
+
+        weekly_ctx = None
         if warrant_events is not None and not warrant_events.empty:
             try:
-                debug_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
-                debug_week_events = debug_ctx.get("week_events", pd.DataFrame())
+                with report_stage_timer(f"{stock_code}｜build_weekly_context"):
+                    weekly_ctx = build_weekly_context(stock_df, warrant_events, WEEK_TRADING_DAYS)
+                if selected_debug_cache is not None:
+                    weekly_ctx["_selected_branch_events_all_cache"] = selected_debug_cache.copy()
+                weekly_ctx["_selected_branch_names_snapshot"] = list(selected_branch_snapshot)
+                debug_week_events = weekly_ctx.get("week_events", pd.DataFrame())
                 if debug_week_events is not None and not debug_week_events.empty:
-                    debug_buy_top, debug_sell_top = top_branch_tables(debug_week_events, topn=5)
+                    debug_buy_top, debug_sell_top = _get_cached_top_branch_tables(
+                        weekly_ctx,
+                        "current_week",
+                        debug_week_events,
+                        topn=5,
+                    )
                     print(
-                        f"🔎 TOP5統計區間：{pd.Timestamp(debug_ctx['week_start']).date()} ~ {pd.Timestamp(debug_ctx['week_end']).date()}｜"
+                        f"🔎 TOP5統計區間：{pd.Timestamp(weekly_ctx['week_start']).date()} ~ {pd.Timestamp(weekly_ctx['week_end']).date()}｜"
                         f"週事件 {len(debug_week_events):,} 筆｜買超TOP5 {len(debug_buy_top):,} 筆｜賣超TOP5 {len(debug_sell_top):,} 筆"
                     )
             except Exception as e:
+                weekly_ctx = None
                 print(f"⚠️ TOP5統計區間檢查失敗：{e}")
 
         with report_stage_timer(f"{stock_code}｜週報內容生成與建圖總流程"):
@@ -14619,6 +17842,7 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
                 warrant_events,
                 news_items,
                 precomputed_news_points=precomputed_news_points,
+                precomputed_ctx=weekly_ctx,
             )
 
         buf = io.BytesIO()
@@ -14667,6 +17891,9 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
         traceback.print_exc()
         return None
     finally:
+        report_cancel_event.set()
+        if prefetched_news_cancel_event is not None and news_future is not None and not news_future.done():
+            prefetched_news_cancel_event.set()
         if report_data_executor is not None:
             try:
                 report_data_executor.shutdown(wait=False, cancel_futures=True)
@@ -14678,10 +17905,6 @@ def generate_warrant_report(stock_code: str) -> io.BytesIO:
             print(f"⏱️ {stock_code or 'UNKNOWN'}｜週報總時間：{time.perf_counter() - report_total_start:.2f} 秒")
 
 
-def generate_k_chart(stock_code: str) -> io.BytesIO:
-    """保留相容舊呼叫。"""
-    return generate_warrant_report(stock_code)
-
 # ============================================================
 # GitHub Actions 手動執行入口
 # ============================================================
@@ -14692,7 +17915,10 @@ def _send_discord_file(webhook_url: str, file_path: str, content: str = ""):
     try:
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "image/png")}
-            data = {"content": content or os.path.basename(file_path)}
+            data = {}
+            clean_content = str(content or "").strip()
+            if clean_content:
+                data["content"] = clean_content
             resp = requests.post(webhook_url, data=data, files=files, timeout=(8, 40))
             resp.raise_for_status()
         print(f"✅ Discord 測試頻道已送出：{file_path}")
@@ -14701,8 +17927,31 @@ def _send_discord_file(webhook_url: str, file_path: str, content: str = ""):
 
 
 def main():
+    print("=" * 100)
+    print(f"🧩 FINMIND_BUILD_VERSION={FINMIND_BUILD_VERSION}")
+    print(f"🧩 FINMIND_PERFORMANCE_PATCH={FINMIND_PERFORMANCE_PATCH}")
+    print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
+    print(
+        "🧩 ACTIVE_FEATURES="
+        "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
+        "latest-day-warrant-code-api+latest-day-empty-fallback+latest-day-probe-first+latest-day-selected-branch-backfill+parallel-six-source-news+progressive-finmind-news+raw-news-ttl-cache+top2-parallel-body+event-level-news-dedup+local-evidence-repair+local-number-unit-repair+rich-two-sentence-news+gemini-max-two-calls+"
+        "discord-image-only+atomic-output+market-compact-prewarm+branch-perf-disk+"
+        "single-context+direct-runtime-cache+parallel-history-latest+cooperative-cancel+next-stock-news-prefetch+shared-market-compact-write+issuer-background-once+issuer-unique-vectorized+calendar7+deadcode-cleanup"
+    )
+    print(
+        f"🧩 FUNCTION_LINES：fetch_warrant_events_full_market="
+        f"{fetch_warrant_events_full_market.__code__.co_firstlineno}｜"
+        f"fetch_multi_source_news_articles={fetch_multi_source_news_articles.__code__.co_firstlineno}｜"
+        f"filter_selected_branch_flow_events={filter_selected_branch_flow_events.__code__.co_firstlineno}"
+    )
+    print("=" * 100)
     output_dir = os.getenv("OUTPUT_DIR", "output").strip() or "output"
     os.makedirs(output_dir, exist_ok=True)
+
+    if FINMIND_PREWARM_ONLY:
+        print("🔥 WARRANT_PREWARM_ONLY=1：本次只建立全市場共用快取，不產圖、不呼叫 Gemini、不送 Discord")
+        _finmind_prewarm_market_compact_cache()
+        return
 
     raw_codes = os.getenv("STOCK_CODES", "2408").strip() or "2408"
     stock_codes = [c.strip() for c in re.split(r"[,，\s]+", raw_codes) if c.strip()]
@@ -14716,21 +17965,60 @@ def main():
     print(f"📌 新聞開關：WARRANT_NEWS_ENABLE={os.getenv('WARRANT_NEWS_ENABLE', '')}")
     selected_branch_label = "、".join(_get_selected_branch_flow_list()) or "未設定"
     print(f"📌 精選分點資金流：{get_selected_branch_flow_mode_label()}｜{selected_branch_label}")
-    print(f"📌 權證快照：enable={os.getenv('WARRANT_LOCAL_CACHE_ENABLE', '')}｜force_refresh={WARRANT_CACHE_FORCE_REFRESH}｜dir={LOCAL_WARRANT_CACHE_DIR}")
+    print(
+        f"📌 Google Sheet 權證快照：enable={GSHEET_WARRANT_CACHE_ENABLE}｜"
+        f"force_refresh={WARRANT_CACHE_FORCE_REFRESH}"
+    )
+    print(
+        f"📌 FinMind 本機快取目錄：raw={FINMIND_WARRANT_DAY_CACHE_DIR}｜"
+        f"compact={FINMIND_MARKET_COMPACT_CACHE_DIR}"
+    )
 
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL_TEST", "").strip()
+
+    if len(stock_codes) >= FINMIND_MULTI_STOCK_PREFETCH_MIN_STOCKS:
+        try:
+            _finmind_prepare_multi_stock_warrant_events(stock_codes)
+        except Exception as exc:
+            # 預處理失敗時保留原本逐股票流程，不讓效率功能改變既有可用性。
+            print(f"⚠️ 多股票權證聯集預處理失敗，退回逐股票處理：{exc}")
+
     ok_count = 0
-    for stock_code in stock_codes:
-        buf = generate_warrant_report(stock_code)
+    for stock_index, stock_code in enumerate(stock_codes):
+        next_stock_code = stock_codes[stock_index + 1] if stock_index + 1 < len(stock_codes) else ""
+        out_path = os.path.join(output_dir, f"{stock_code}_warrant_report.png")
+        tmp_path = out_path + f".{os.getpid()}.tmp"
+        for stale_path in [out_path, tmp_path]:
+            try:
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+                    print(f"🧹 已刪除舊輸出：{stale_path}")
+            except Exception as exc:
+                print(f"⚠️ 舊輸出刪除失敗：{stale_path}｜{exc}")
+
+        buf = generate_warrant_report(stock_code, next_stock_code=next_stock_code)
         if buf is None:
             print(f"❌ {stock_code} 報告產生失敗")
             continue
-        out_path = os.path.join(output_dir, f"{stock_code}_warrant_report.png")
-        with open(out_path, "wb") as f:
-            f.write(buf.getvalue())
+        payload = buf.getvalue()
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, out_path)
+        image_sha = hashlib.sha256(payload).hexdigest()[:16]
         ok_count += 1
-        print(f"✅ 已輸出圖片：{out_path}")
-        _send_discord_file(webhook_url, out_path, content=f"{stock_code} 權證資金流週報測試")
+        selected_branch_label = "、".join(_get_selected_branch_flow_list()) or "未設定"
+        print(
+            f"✅ 已原子輸出圖片：{out_path}｜sha256={image_sha}｜"
+            f"精選分點={selected_branch_label}｜build={FINMIND_BUILD_VERSION}"
+        )
+        _send_discord_file(
+            webhook_url,
+            out_path,
+        )
+
+    _shutdown_report_news_prefetch()
 
     if ok_count <= 0:
         raise SystemExit("沒有任何報告成功產生")
