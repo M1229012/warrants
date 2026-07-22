@@ -234,11 +234,11 @@ if IS_NEW_GSHEET_DATA:
         },
     ]
     EVENT_LEGEND_ITEMS = [
-        ("A", "基礎買超 100–159萬"),
-        ("B", "明顯買超 160–249萬"),
-        ("C", "強勢買超 250–499萬"),
-        ("D", "大額布局 500–999萬"),
-        ("E", "超大額布局 1000萬以上"),
+        ("A", "基礎買超"),
+        ("B", "明顯買超"),
+        ("C", "強勢買超"),
+        ("D", "大額布局"),
+        ("E", "超大額布局"),
     ]
     A_EVENT_DESCRIPTION = "基礎買超"
     TOTAL_EVENT_DESCRIPTION = "全部 A+B+C+D+E 合併"
@@ -1086,6 +1086,7 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
         "剩餘成本", "目前剩餘成本", "淨買超成本", "remaining_cost",
         "目前市值", "未實現損益", "可估成本", "缺價格成本",
         "報酬率", "報酬率文字", "價格狀態", "估值價格來源",
+        "更新時間", "run_id",
     ]
 
     df = read_gsheet_table_optional(
@@ -1119,6 +1120,18 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
             chosen_date = max(valid) if valid else max(available_dates)
         else:
             chosen_date = max(available_dates)
+
+    # 同一統計日期可能因 GitHub Actions 重跑而保留多個 run_id。
+    # TOP15 部位明細若把不同快照一起加總，分點剩餘成本與報酬率就會被重複放大。
+    if chosen_date is not None:
+        df = df[df.apply(lambda r: pick_cache_date(r) == chosen_date, axis=1)].copy()
+    if df.empty:
+        return {}
+
+    df = filter_latest_cache_snapshot(
+        df,
+        SHEET_TOP15_POSITION_DETAIL,
+    )
 
     agg: dict[tuple[str, str], dict] = defaultdict(lambda: {
         "cost": 0.0,
@@ -1279,6 +1292,15 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     if df.empty:
         return [], empty_meta
 
+    # 只採用同一統計日期的最新快照，避免工作表累積多次 run_id 後，
+    # 同一標的在 TOP15 圖中重複出現 2～3 次，並使合計成本被重複加總。
+    df = filter_latest_cache_snapshot(
+        df,
+        SHEET_TOP15_CONSENSUS_CACHE,
+    )
+    if df.empty:
+        return [], empty_meta
+
     position_map = read_top15_position_detail_cache_from_gsheet(chosen_date)
 
     first_row = df.iloc[0].to_dict()
@@ -1390,7 +1412,29 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     else:
         rows.sort(key=lambda x: (safe_float(x.get("net_amount"), 0), safe_float(x.get("amount"), 0)), reverse=True)
 
-    rows = rows[:15]
+    # 最後一道防護：同一標的在排名圖中只能出現一次。
+    # 即使舊工作表沒有 run_id，或同步時殘留完全重複列，也不會再把同一標的畫三次。
+    deduped_rows = []
+    seen_underlyings = set()
+    duplicate_count = 0
+
+    for item in rows:
+        key = str(item.get("underlying") or item.get("target") or "").strip()
+        if not key:
+            continue
+        if key in seen_underlyings:
+            duplicate_count += 1
+            continue
+        seen_underlyings.add(key)
+        deduped_rows.append(item)
+
+    if duplicate_count > 0:
+        print(
+            f"  ⚠️ {SHEET_TOP15_CONSENSUS_CACHE} 已移除同標的重複列 "
+            f"{duplicate_count:,} 筆，避免 TOP15 重複顯示與合計成本重複計算。"
+        )
+
+    rows = deduped_rows[:15]
 
     if start_date is None:
         starts = [r.get("first_date") for r in rows if r.get("first_date")]
