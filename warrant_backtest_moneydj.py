@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-TOP15-SNAPSHOT-FIX-20260722"
+PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-INCREMENTAL-DEDUP-FIX-20260722"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4694,7 +4694,10 @@ def _sheet_upsert_key_columns(title, headers):
         return [c for c in cols if c in hset]
 
     if title in AMOUNT_CLASS_SHEET_NAMES:
-        return keep(["資料範圍", "事件類型", "分點", "券商代號", "標的股", "事件日", "權證清單"])
+        # ABCDE 的事件單位本來就是「同一資料範圍 + 同一分點 + 同一標的 + 同一天」。
+        # 權證清單、金額、出清狀態都可能因資料補齊而改變，不能放進唯一鍵，
+        # 否則同一天重跑會因文字格式或清單內容不同而被誤判成新事件。
+        return keep(["資料範圍", "分點", "券商代號", "標的股", "事件日"])
 
     if title == TOP15_CONSENSUS_SHEET:
         return keep(["資料範圍", "統計日期", "標的股"])
@@ -4714,7 +4717,10 @@ def _sheet_upsert_key_columns(title, headers):
 
 
     if title == "每日賣出明細":
-        return keep(["資料範圍", "日期", "分點", "券商代號", "標的股", "權證代號", "事件", "狀態", "事件日"])
+        # MoneyDJ API5 每個「日期 + 券商 + 權證」只有一筆日彙總交易。
+        # 事件歸類、狀態與事件日可能在 FIFO 或事件配對修正後改變，
+        # 這些可變欄位不可放入唯一鍵，否則同一筆賣出會被重複新增。
+        return keep(["資料範圍", "日期", "分點", "券商代號", "標的股", "權證代號"])
 
     if title == "近兩月買賣金額排行":
         return keep(["資料範圍", "權證代號", "買進分點"])
@@ -4768,18 +4774,57 @@ def normalize_underlying_code_for_group(value, fallback_text=""):
 
     return ""
 
+_RESULT_KEY_DATE_COLUMNS = {
+    "日期", "統計日期", "買進日", "事件日", "起始日", "結束日",
+    "第一筆日期", "最後筆日期", "減碼日", "出清日",
+}
+_RESULT_KEY_UNDERLYING_COLUMNS = {"標的股", "標的代號", "標的代碼", "股票代號", "股票代碼"}
+_RESULT_KEY_WARRANT_COLUMNS = {"權證代號", "權證代碼"}
+_RESULT_KEY_BROKER_CODE_COLUMNS = {"券商代號", "券商代碼"}
+
+
+def _normalize_result_key_value(column, value):
+    """將 Excel 與 Google Sheet 同一筆資料轉成完全一致的唯一鍵文字。
+
+    Google Sheet 讀回時常見差異：
+    - 日期可能是 yyyy/mm/dd、yyyy-mm-dd，或日期序號 46xxx。
+    - 0 開頭的六碼權證可能被讀成五碼。
+    - 券商代號可能有大小寫差異。
+    - 儲存格可能帶有 Google Sheet 的文字前導單引號。
+
+    這些都只是顯示／儲存格式差異，不應被視為新資料。
+    """
+    column = str(column or "").strip()
+    raw = strip_gsheet_text_prefix(value)
+
+    if column in _RESULT_KEY_DATE_COLUMNS:
+        dt = _parse_result_record_date(raw)
+        if dt is not None:
+            return dt.strftime("%Y/%m/%d")
+        return normalize_date_str(raw)
+
+    if column in _RESULT_KEY_UNDERLYING_COLUMNS:
+        return normalize_underlying_code_for_group(raw)
+
+    if column in _RESULT_KEY_WARRANT_COLUMNS:
+        normalized = normalize_price_code(raw)
+        return normalized or str(raw or "").strip()
+
+    if column in _RESULT_KEY_BROKER_CODE_COLUMNS:
+        return normalize_broker_code_for_compare(raw)
+
+    if column == "資料範圍":
+        return str(raw or "").strip() or "全分點"
+
+    # 顯示文字只統一前後空白與連續空白；不改名稱本身。
+    return re.sub(r"\s+", " ", str(raw or "").strip())
+
+
 def _record_key(rec, key_cols):
-    parts = []
-    for col in key_cols:
-        value = rec.get(col, "")
-        if col in ("日期", "統計日期", "買進日", "事件日", "起始日", "結束日", "第一筆日期", "最後筆日期"):
-            value = normalize_date_str(strip_gsheet_text_prefix(value))
-        elif col in ("標的股", "標的代號", "標的代碼"):
-            value = normalize_underlying_code_for_group(value)
-        else:
-            value = strip_gsheet_text_prefix(value)
-        parts.append(str(value).strip())
-    return tuple(parts)
+    return tuple(
+        _normalize_result_key_value(col, rec.get(col, ""))
+        for col in key_cols
+    )
 
 
 
@@ -6652,6 +6697,109 @@ def replace_top15_snapshot_rows_in_worksheet(
         "remaining": len(retained_records),
     }
 
+
+GSHEET_INCREMENT_DEDUPE_TITLES = {
+    *AMOUNT_CLASS_SHEET_NAMES,
+    "每日賣出明細",
+}
+
+
+def is_incremental_dedupe_sheet(title):
+    """ABCDE 與每日賣出明細在增量插入前先清除既有重複列。"""
+    return safe_worksheet_title(title) in {
+        safe_worksheet_title(item)
+        for item in GSHEET_INCREMENT_DEDUPE_TITLES
+    }
+
+
+def _contiguous_row_ranges(row_numbers):
+    """將列號整理成連續區間，供 Google Sheet 由下往上批次刪除。"""
+    numbers = sorted({int(x) for x in row_numbers if int(x) >= 2})
+    if not numbers:
+        return []
+
+    ranges = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append((start, previous))
+        start = previous = number
+    ranges.append((start, previous))
+    return ranges
+
+
+def remove_existing_duplicate_increment_rows(ws, title, existing_values):
+    """
+    清除 ABCDE／每日賣出明細已經累積在 Google Sheet 的重複列。
+
+    保留規則：
+    - 工作表資料是由第 2 列向下插入，因此越上面的列代表越新的執行結果。
+    - 相同穩定唯一鍵只保留最上面一列，較下面的舊重複列由下往上刪除。
+    - 只刪除能形成完整安全唯一鍵的重複列；空白列或人工無法識別資料不動。
+    """
+    if not is_incremental_dedupe_sheet(title):
+        return existing_values, 0
+    if not existing_values or _find_simple_header_row(existing_values) != 0:
+        return existing_values, 0
+
+    headers = [str(h).strip() for h in list(existing_values[0])]
+    while headers and headers[-1] == "":
+        headers.pop()
+    if not headers:
+        return existing_values, 0
+
+    key_cols = _sheet_upsert_key_columns(title, headers)
+    if not key_cols:
+        return existing_values, 0
+
+    seen = set()
+    duplicate_rows = []
+    n_cols = len(headers)
+
+    for sheet_row_no, raw_row in enumerate(existing_values[1:], start=2):
+        row = list(raw_row)
+        if len(row) < n_cols:
+            row += [""] * (n_cols - len(row))
+        elif len(row) > n_cols:
+            row = row[:n_cols]
+
+        if not any(str(value).strip() for value in row):
+            continue
+
+        record = {header: row[idx] for idx, header in enumerate(headers)}
+        if "資料範圍" in headers and not str(record.get("資料範圍", "")).strip():
+            record["資料範圍"] = "全分點"
+
+        key = _record_key(record, key_cols)
+        # 所有 key 欄都必須有值，才有資格自動刪除，避免誤刪人工資料。
+        if not key or any(str(part).strip() == "" for part in key):
+            continue
+        if key in seen:
+            duplicate_rows.append(sheet_row_no)
+        else:
+            seen.add(key)
+
+    if not duplicate_rows:
+        return existing_values, 0
+
+    # 由下往上刪除，避免上方列號因先刪除而位移。
+    for start_row, end_row in reversed(_contiguous_row_ranges(duplicate_rows)):
+        gsheet_api_call(
+            f"刪除既有重複列 {safe_worksheet_title(title)} {start_row}-{end_row}",
+            ws.delete_rows,
+            start_row,
+            end_row,
+        )
+
+    print(
+        f"  🧹 Google Sheet 既有重複列清理：{safe_worksheet_title(title)}｜"
+        f"刪除 {len(duplicate_rows):,} 列｜保留每個穩定唯一鍵最上方最新資料"
+    )
+    return _worksheet_values_with_formulas(ws), len(duplicate_rows)
+
+
 def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=None, extra_scope_values=None):
     """
     已存在工作表的同步方式：保留全部既有資料，只插入唯一鍵尚未存在的新列。
@@ -6671,6 +6819,10 @@ def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=No
     incoming_headers, incoming_records = prepared
     existing_values = _worksheet_values_with_formulas(ws)
     existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
+        ws, title, existing_values
+    )
+    # 先用穩定唯一鍵清掉過去同日重跑累積的重複列，再判斷本次是否有缺少資料。
+    existing_values, _existing_duplicate_removed = remove_existing_duplicate_increment_rows(
         ws, title, existing_values
     )
     existing_header_idx = _find_simple_header_row(existing_values)
@@ -6768,7 +6920,7 @@ def upload_excel_to_google_sheet(
     """
     Google Sheet 同步規則：
     1. 工作表不存在時才第一次建立並完整寫入。
-    2. A～E、每日賣出明細等歷史表：只 insert 唯一鍵尚未存在的新資料。
+    2. A～E、每日賣出明細等歷史表：先清理既有重複列，再以穩定唯一鍵只 insert 真正缺少的新資料。
     3. TOP15 兩張快取：同一資料範圍 + 同一統計日期整批替換，並保留最近 N 個統計日。
     4. 除 TOP15 快照與明確失效分點列外，不刪除、清空、重建其他既有工作表。
     """
@@ -6797,7 +6949,7 @@ def upload_excel_to_google_sheet(
             + (f"｜ID={GOOGLE_SHEET_ID}" if GOOGLE_SHEET_ID else "")
         )
         print(
-            "  ⚙️ 同步模式：A～E／每日賣出明細採增量 insert；"
+            "  ⚙️ 同步模式：A～E／每日賣出明細採穩定唯一鍵增量 insert（同步前清理既有重複）；"
             "TOP15 採同資料範圍＋同統計日期整批替換。"
         )
 
