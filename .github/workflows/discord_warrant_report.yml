@@ -36,7 +36,7 @@ on:
           - "正式推播"
 
   schedule:
-    # 台灣時間 16:00 = UTC 08:00
+    # 台灣時間 16:20 = UTC 08:20
     - cron: "20 08 * * 1-5"
 
 jobs:
@@ -45,10 +45,11 @@ jobs:
     timeout-minutes: 30
 
     env:
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
+      # 改讀 MoneyDJ 新制 A～E 回測程式輸出的 Google Sheet。
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
 
-      # 建議使用 GOOGLE_SHEET_ID，比名稱開啟更穩定。
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      # 可另外建立 GOOGLE_SHEET_ID_MONEYDJ；未設定時沿用原 GOOGLE_SHEET_ID。
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ || secrets.GOOGLE_SHEET_ID }}
 
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
@@ -62,11 +63,9 @@ jobs:
 
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
 
-      # 排程自動執行時，仍只執行原本的每日圖流程。
+      # 排程自動執行時，仍只執行每日圖流程。
       RUN_PLAN: "精選五分點每日圖"
 
-      # 正式執行關閉除錯。
-      # 若要確認近10日圖實際採用的 run_id，可暫時改成 "1"。
       DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
@@ -88,7 +87,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas pillow gspread google-auth matplotlib
 
-      - name: Generate image from Google Sheet and send to Discord
+      - name: Generate image from MoneyDJ A-E Google Sheet and send to Discord
         run: |
           ACTION_VALUE="${RUN_PLAN}"
           TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
