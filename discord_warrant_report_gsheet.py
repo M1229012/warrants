@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日精選分點買賣超追蹤圖卡｜MoneyDJ 新制 A～E Google Sheet 讀取版
+每日精選分點買賣超追蹤圖卡｜Google Sheet 新舊資料相容版
 
 用途：
-- 直接讀取 Google Sheet「權證分點籌碼」內的 A/B/C/D/E 與勝率統計工作表
+- 保留舊版 A/B/C/D 產圖邏輯，並可切換讀取新版 A/B/C/D/E 金額分級工作表
 - 不需要本機 Excel
 - 產生一頁式 PNG
 - 可產生「所有分點勝率統計圖」，列出 A 勝率、A 事件數、總勝率、總事件數、平均持有天數與加權報酬率
@@ -16,7 +16,8 @@
 
 可選環境變數：
 - GOOGLE_SHEET_ID：建議使用，最穩
-- GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟，預設「權證分點籌碼」
+- GSHEET_DATA_VERSION：old 或 new，由 GitHub Actions 下拉選項傳入
+- GOOGLE_SHEET_NAME：沒有 GOOGLE_SHEET_ID 時才用名稱開啟；舊版預設「權證分點籌碼」，新版預設「權證分點資料_NEW_MoneyDJ」
 - TARGET_DATE：指定日期，例如 2026-05-18；沒指定會從 Google Sheet 內自動抓最新日期
 - IMAGE_ACTION / ACTION / RUN_PLAN：圖片產生選項，用於 GitHub Actions workflow_dispatch 區別要跑哪張圖
 - ADD_COUNT_LOOKBACK_TRADING_DAYS：第幾次加碼計算用，預設 50 個有效交易日
@@ -139,27 +140,171 @@ ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS
 # 若你未來想讓「出清不管金額都顯示」，改成 "1"
 DISPLAY_EXIT_ALWAYS = os.getenv("DISPLAY_EXIT_ALWAYS", "0") == "1"
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "權證分點資料_NEW_MoneyDJ")
+# Google Sheet 資料版本：
+# - old：舊版 A/B/C/D 分類（完全沿用原程式的日期與欄位口徑）
+# - new：新版 A/B/C/D/E 金額分級
+_RAW_GSHEET_DATA_VERSION = (os.getenv("GSHEET_DATA_VERSION", "old") or "old").strip().lower()
+_GSHEET_DATA_VERSION_ALIASES = {
+    "old": "old",
+    "舊": "old",
+    "舊版": "old",
+    "舊版資料": "old",
+    "舊版資料（a～d舊分類）": "old",
+    "new": "new",
+    "新": "new",
+    "新版": "new",
+    "新版資料": "new",
+    "新版資料（a～e金額分級）": "new",
+}
+GSHEET_DATA_VERSION = _GSHEET_DATA_VERSION_ALIASES.get(
+    _RAW_GSHEET_DATA_VERSION,
+    _RAW_GSHEET_DATA_VERSION,
+)
+if GSHEET_DATA_VERSION not in {"old", "new"}:
+    raise RuntimeError(
+        f"GSHEET_DATA_VERSION 只能是 old 或 new，目前收到：{_RAW_GSHEET_DATA_VERSION!r}"
+    )
+
+IS_NEW_GSHEET_DATA = GSHEET_DATA_VERSION == "new"
+DEFAULT_GOOGLE_SHEET_NAME = (
+    "權證分點資料_NEW_MoneyDJ"
+    if IS_NEW_GSHEET_DATA
+    else "權證分點籌碼"
+)
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", DEFAULT_GOOGLE_SHEET_NAME)
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 
-SHEET_A = os.getenv("SHEET_A", "A_基礎買超")
-SHEET_B = os.getenv("SHEET_B", "B_明顯買超")
-SHEET_C = os.getenv("SHEET_C", "C_強勢買超")
-SHEET_D = os.getenv("SHEET_D", "D_大額布局")
-SHEET_E = os.getenv("SHEET_E", "E_超大額布局")
+# 舊版欄位口徑保持不變；新版只在這裡增加對照，不改動其他產圖功能。
+if IS_NEW_GSHEET_DATA:
+    SHEET_A = os.getenv("SHEET_A", "A_基礎買超")
+    SHEET_B = os.getenv("SHEET_B", "B_明顯買超")
+    SHEET_C = os.getenv("SHEET_C", "C_強勢買超")
+    SHEET_D = os.getenv("SHEET_D", "D_大額布局")
+    SHEET_E = os.getenv("SHEET_E", "E_超大額布局")
+    EVENT_SHEET_CONFIGS = [
+        {
+            "code": "A",
+            "label": "基礎買超",
+            "sheet": SHEET_A,
+            "date_col": "事件日",
+            "amount_cols": ["單日累積買進金額", "買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單", "最大單筆權證"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "B",
+            "label": "明顯買超",
+            "sheet": SHEET_B,
+            "date_col": "事件日",
+            "amount_cols": ["單日累積買進金額", "買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單", "最大單筆權證"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "C",
+            "label": "強勢買超",
+            "sheet": SHEET_C,
+            "date_col": "事件日",
+            "amount_cols": ["單日累積買進金額", "買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單", "最大單筆權證"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "D",
+            "label": "大額布局",
+            "sheet": SHEET_D,
+            "date_col": "事件日",
+            "amount_cols": ["單日累積買進金額", "買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單", "最大單筆權證"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "E",
+            "label": "超大額布局",
+            "sheet": SHEET_E,
+            "date_col": "事件日",
+            "amount_cols": ["單日累積買進金額", "買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單", "最大單筆權證"],
+            "warrant_code_cols": [],
+        },
+    ]
+    EVENT_LEGEND_ITEMS = [
+        ("A", "基礎買超 100–159萬"),
+        ("B", "明顯買超 160–249萬"),
+        ("C", "強勢買超 250–499萬"),
+        ("D", "大額布局 500–999萬"),
+        ("E", "超大額布局 1000萬以上"),
+    ]
+    A_EVENT_DESCRIPTION = "基礎買超"
+    TOTAL_EVENT_DESCRIPTION = "全部 A+B+C+D+E 合併"
+else:
+    SHEET_A = os.getenv("SHEET_A", "A_單檔大買")
+    SHEET_B = os.getenv("SHEET_B", "B_同標的單日合計")
+    SHEET_C = os.getenv("SHEET_C", "C_同標的3日累積")
+    SHEET_D = os.getenv("SHEET_D", "D_近10日累積淨買進")
+    SHEET_E = ""
+    EVENT_SHEET_CONFIGS = [
+        {
+            "code": "A",
+            "label": "單檔權證單日大買",
+            "sheet": SHEET_A,
+            "date_col": "買進日",
+            "amount_cols": ["買進金額"],
+            "qty_cols": ["買進張數"],
+            "warrant_text_cols": ["權證名稱"],
+            "warrant_code_cols": ["權證代碼", "權證代號"],
+        },
+        {
+            "code": "B",
+            "label": "同標的單日合買",
+            "sheet": SHEET_B,
+            "date_col": "事件日",
+            "amount_cols": ["買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "C",
+            "label": "同標的3日累積",
+            "sheet": SHEET_C,
+            "date_col": "結束日",
+            "amount_cols": ["買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單"],
+            "warrant_code_cols": [],
+        },
+        {
+            "code": "D",
+            "label": "近10日累積淨買",
+            "sheet": SHEET_D,
+            "date_col": "結束日",
+            "amount_cols": ["買超金額"],
+            "qty_cols": ["買超張數"],
+            "warrant_text_cols": ["權證清單"],
+            "warrant_code_cols": [],
+        },
+    ]
+    EVENT_LEGEND_ITEMS = [
+        ("A", "單檔權證單日大買"),
+        ("B", "同標的單日合買"),
+        ("C", "同標的3日累積"),
+        ("D", "近10日累積淨買"),
+    ]
+    A_EVENT_DESCRIPTION = "單檔權證單日大買"
+    TOTAL_EVENT_DESCRIPTION = "全部 A+B+C+D 合併"
 
-# 新制金額強度分類。五張事件表欄位結構相同：
-# 事件日、單日累積買進金額、買超張數、權證清單、減碼／出清資訊。
-AMOUNT_CLASS_SHEET_PLAN = [
-    ("A", "基礎買超", SHEET_A),
-    ("B", "明顯買超", SHEET_B),
-    ("C", "強勢買超", SHEET_C),
-    ("D", "大額布局", SHEET_D),
-    ("E", "超大額布局", SHEET_E),
-]
-AMOUNT_CLASS_SHEETS = [sheet_name for _code, _label, sheet_name in AMOUNT_CLASS_SHEET_PLAN]
-AMOUNT_CLASS_LABELS = {code: label for code, label, _sheet_name in AMOUNT_CLASS_SHEET_PLAN}
-SHEET_STAT = "勝率統計"
+ACTIVE_EVENT_CODES = [cfg["code"] for cfg in EVENT_SHEET_CONFIGS]
+EVENT_CONFIG_BY_CODE = {cfg["code"]: cfg for cfg in EVENT_SHEET_CONFIGS}
+EVENT_CONFIG_BY_SHEET = {cfg["sheet"]: cfg for cfg in EVENT_SHEET_CONFIGS}
+EVENT_COMBINED_LABEL = "ABCDE合計" if IS_NEW_GSHEET_DATA else "ABCD合計"
+
+SHEET_STAT = os.getenv("SHEET_STAT", "勝率統計")
 WIN_RATE_STATS_LAYOUT_VERSION = "dual-event-count-v2"
 SHEET_DAILY_SELL = os.getenv("SHEET_DAILY_SELL", "每日賣出明細")
 SHEET_HISTORY = os.getenv("SHEET_HISTORY", "快取_分點歷史")
@@ -178,7 +323,7 @@ BROKER_10D_CONSENSUS_REVERSE_AMOUNT_RATIO = float(os.getenv("BROKER_10D_CONSENSU
 
 
 NTD_PER_WARRANT_POINT = float(os.getenv("NTD_PER_WARRANT_POINT", "1000"))
-# 若某權證不在 A/B/C/D/E 白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
+# 若某權證不在事件白名單，但同一分點 + 同一標的於同一天賣出合計達此門檻，
 # 仍納入今日賣超明細。預設沿用買超門檻 100 萬。
 NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
     os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
@@ -220,16 +365,6 @@ CENTER_WATERMARK_TEXT = "股市艾斯\n台股DC討論群"
 CENTER_WATERMARK_ALPHA = 0.06
 CENTER_WATERMARK_FONT_SIZE = 80
 CENTER_WATERMARK_ROTATION = 18
-
-# 事件代號說明
-EVENT_LEGEND_ITEMS = [
-    ("A", "基礎買超 100–159萬"),
-    ("B", "明顯買超 160–249萬"),
-    ("C", "強勢買超 250–499萬"),
-    ("D", "大額布局 500–999萬"),
-    ("E", "超大額布局 1000萬以上"),
-]
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Google Sheet 讀取
@@ -1085,7 +1220,7 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     """
     直接讀取新版「快取_TOP15共識淨買超」。
 
-    這是近一個月 TOP15 圖的唯一排名來源；圖片端不再重新計算 A/B/C/D/E。
+    這是近一個月 TOP15 圖的唯一排名來源；圖片端不再重新計算 A/B/C/D。
     近一個月 TOP15 圖固定只讀 資料範圍=精選五分點。
     """
     needed_cols = [
@@ -1330,50 +1465,51 @@ def extract_stock_name_from_warrant_text(text: str) -> str:
 
 def build_stock_name_map_from_gsheet() -> dict[str, str]:
     """
-    從新制 A／B／C／D／E 工作表蒐集「標的股代碼 -> 股名」映射。
-
-    新制五張表都以「權證清單」保存事件內所有權證，因此不再把 A 表當成
-    單一權證特殊格式處理。
+    從目前選用的舊版 A/B/C/D 或新版 A/B/C/D/E 工作表蒐集標的代號與名稱。
+    舊版 A 仍讀「權證名稱」，舊版 B/C/D 與新版則讀「權證清單」。
     """
     name_counter: dict[str, Counter] = defaultdict(Counter)
 
-    def add_mapping(underlying, text_value):
-        code = normalize_underlying(underlying, text_value)
+    def add_mapping(underlying, warrant_text):
+        code = normalize_underlying(underlying, warrant_text)
         if not code:
             return
-        name = extract_stock_name_from_warrant_text(text_value)
-        if name:
-            mapped_code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(name)
-            if mapped_code:
-                code = mapped_code
-            name_counter[code][name] += 1
+        name = extract_stock_name_from_warrant_text(warrant_text)
+        if not name:
+            return
+        mapped_code = KNOWN_UNDERLYING_NAME_CODE_MAP.get(name)
+        if mapped_code:
+            code = mapped_code
+        name_counter[code][name] += 1
 
-    for _event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
+        needed_cols = ["標的股", "權證名稱", "權證清單", "最大單筆權證"]
+        needed_cols.extend(cfg.get("warrant_text_cols", []))
         try:
             df = read_gsheet_table(
-                sheet_name,
-                ["資料範圍", "標的股", "權證清單", "最大單筆權證"],
+                cfg["sheet"],
+                list(dict.fromkeys(needed_cols)),
                 filter_tracked_brokers=False,
             )
         except Exception:
             continue
 
         for _, row in df.iterrows():
-            warrant_text = _first_non_empty_value(
-                row.get("權證清單", ""),
-                row.get("最大單筆權證", ""),
-            )
+            warrant_text = ""
+            for col in cfg.get("warrant_text_cols", []) + ["權證名稱", "權證清單", "最大單筆權證"]:
+                value = strip_gsheet_text_prefix(row.get(col, ""))
+                if value and value != "-":
+                    warrant_text = value
+                    break
             add_mapping(row.get("標的股", ""), warrant_text)
 
     stock_map = {}
     for code, counter in name_counter.items():
         if counter:
-            best_name = sorted(
+            stock_map[code] = sorted(
                 counter.items(),
                 key=lambda kv: (-kv[1], len(kv[0]), kv[0]),
             )[0][0]
-            stock_map[code] = best_name
-
     return stock_map
 
 
@@ -1494,20 +1630,24 @@ def resolve_target_identity(
 
 
 def infer_latest_date_from_gsheet() -> date:
-    """從新制 A～E 事件表與每日賣出明細推斷最新可用日期。"""
+    """依目前選用的新／舊事件表推斷最新日期。"""
     candidates = []
 
-    for _event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
+        cols = list(dict.fromkeys([
+            cfg["date_col"],
+            "事件日", "買進日", "結束日", "減碼日", "出清日",
+        ]))
         try:
             df = read_gsheet_table(
-                sheet_name,
-                ["資料範圍", "事件日", "減碼日", "出清日"],
+                cfg["sheet"],
+                cols,
                 filter_tracked_brokers=False,
             )
         except Exception:
             continue
 
-        for col in ["事件日", "減碼日", "出清日"]:
+        for col in cols:
             if col not in df.columns:
                 continue
             for value in df[col].dropna().tolist():
@@ -1515,7 +1655,7 @@ def infer_latest_date_from_gsheet() -> date:
                 if parsed:
                     candidates.append(parsed)
 
-    # 若當日只有賣出、沒有新 A～E 事件，仍可由每日賣出明細取得最新日期。
+    # 若當天只有賣出沒有新事件，仍可由每日賣出明細取得最新日期。
     try:
         sell_df = read_gsheet_table_optional(
             SHEET_DAILY_SELL,
@@ -1530,22 +1670,14 @@ def infer_latest_date_from_gsheet() -> date:
         pass
 
     if not candidates:
-        raise RuntimeError(
-            "無法從 Google Sheet 的 A～E 或每日賣出明細推斷日期，"
-            "請用 TARGET_DATE=YYYY-MM-DD 指定。"
-        )
-
+        raise RuntimeError("無法從 Google Sheet 推斷日期，請用 TARGET_DATE=YYYY-MM-DD 指定。")
     return max(candidates)
 
 
 def read_history_stats_from_gsheet() -> dict:
-    """讀取新制勝率統計中的「全部 A+B+C+D+E 合併」資料。"""
+    """讀取勝率統計中的全部事件合併列；同時相容 A+B+C+D 與 A+B+C+D+E。"""
     result = {
-        broker: {
-            "total_events": 0,
-            "win_rate": 0.0,
-            "avg_hold_days": 0.0,
-        }
+        broker: {"total_events": 0, "win_rate": 0.0, "avg_hold_days": 0.0}
         for broker in TRACKED_BROKERS
     }
 
@@ -1571,22 +1703,21 @@ def read_history_stats_from_gsheet() -> dict:
             "win_rate": safe_float(row[8]),
             "avg_hold_days": safe_float(row[9]),
         }
-
     return result
+
 
 
 def read_selected5_history_from_abcd() -> dict:
     """
-    從新制 A／B／C／D／E 計算精選五分點平均持有天數。
-
-    保留原函式名稱，避免既有 main() 與外部呼叫需要同步改名。
+    使用目前選用的全部事件工作表計算精選五分點平均持有天數。
+    保留原函式名稱，避免舊版其他呼叫點需要改動。
     """
     hold_days_map: dict[str, list[float]] = defaultdict(list)
 
-    for _event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
         try:
             df = read_gsheet_table(
-                sheet_name,
+                cfg["sheet"],
                 ["資料範圍", "分點", "持有天數"],
             )
             df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
@@ -1600,27 +1731,22 @@ def read_selected5_history_from_abcd() -> dict:
             broker = str(row.get("分點", "")).strip()
             if broker not in TRACKED_BROKERS:
                 continue
-
             raw_hold_days = strip_gsheet_text_prefix(row.get("持有天數", ""))
             if raw_hold_days in ("", "-"):
                 continue
-
             hold_days = safe_float(raw_hold_days, None)
             if hold_days is None or hold_days < 0:
                 continue
-
             hold_days_map[broker].append(hold_days)
 
     result = {}
     for broker in TRACKED_BROKERS:
         values = hold_days_map.get(broker, [])
-        avg_hold_days = sum(values) / len(values) if values else 0.0
         result[broker] = {
             "total_events": 0,
             "win_rate": 0.0,
-            "avg_hold_days": avg_hold_days,
+            "avg_hold_days": sum(values) / len(values) if values else 0.0,
         }
-
     return result
 
 
@@ -1689,7 +1815,7 @@ def _parse_stat_plain_number(value):
 
 
 def _classify_stat_event(value) -> str:
-    """將勝率統計表事件名稱分類成 A 或 total；其他事件不納入本圖。"""
+    """將勝率統計表事件名稱分類成 A 或 total；同時相容舊版與新版。"""
     raw = strip_gsheet_text_prefix(value).strip()
     compact = re.sub(r"[\s_－—｜|/\\]+", "", raw)
     upper = compact.upper()
@@ -1710,7 +1836,11 @@ def _classify_stat_event(value) -> str:
 
     if upper == "A" or (
         upper.startswith("A")
-        and ("基礎買超" in compact or "基礎" in compact or "單檔" in compact)
+        and (
+            "單檔" in compact
+            or "基礎買超" in compact
+            or "基礎" in compact
+        )
     ):
         return "A"
 
@@ -1733,9 +1863,9 @@ def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
     """
     讀取 Google Sheet「勝率統計」，整理所有分點的：
     - A：單檔權證大買勝率
-    - 總勝率：全部 A+B+C+D+E 合併
+    - 總勝率：全部 A+B+C+D 合併
     - A 事件數：採 A 列
-    - 總事件數：採全部 A+B+C+D+E 合併列
+    - 總事件數：採全部 A+B+C+D 合併列
     - 平均持有天數：採總計列，總計缺值時才用 A 列備援
     - 加權報酬率：採總計列，總計缺值時才用 A 列備援
 
@@ -1838,7 +1968,7 @@ def read_all_broker_win_rate_stats_from_gsheet() -> list[dict]:
             "a_event_count": a_event_count,
             "total_win_rate": total_metric.get("win_rate"),
             "total_event_count": total_event_count,
-            # 保留舊欄位名稱供其他既有呼叫相容；其內容仍代表全部 A+B+C+D+E 合併事件數。
+            # 保留舊欄位名稱供其他既有呼叫相容；其內容仍代表全部 A+B+C+D 合併事件數。
             "event_count": total_event_count,
             "avg_hold_days": avg_hold_days,
             "weighted_return": weighted_return,
@@ -1883,7 +2013,7 @@ def append_buy(buys: list[dict], broker: str, event: str, underlying, warrant_na
 
 def dedupe_buy_actions(actions: list[dict]) -> list[dict]:
     """
-    清理 A/B/C/D/E 買超事件可能重複列，避免今日買超明細金額被重複加總。
+    清理 目前選用的買超事件可能重複列，避免今日買超明細金額被重複加總。
 
     設計原則：
     - 同一分點、同一事件、同一標的、同一權證 / 權證清單、同一來源工作表、同一金額與張數，視為重複同步資料。
@@ -1961,33 +2091,34 @@ def collect_broker_underlying_add_count_map(
     lookback_days: int = ADD_COUNT_LOOKBACK_TRADING_DAYS,
 ) -> dict[tuple[str, str], int]:
     """
-    計算同一分點＋同一標的，在近 N 個有效事件交易日內出現新制 A～E
-    買超事件的不同日期次數。
-
-    同一天即使資料因同步重複出現，仍只算一次；已在目標日前出清的事件不納入。
+    計算同一分點＋同一標的在近 N 個有效事件日內的加碼次數。
+    舊版維持原本 A/B/C/D 日期欄位；新版改讀 A/B/C/D/E 的事件日。
     """
-    trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
+    try:
+        trading_dates = collect_recent_buy_trading_dates(target, lookback_days)
+    except Exception:
+        trading_dates = []
     if not trading_dates:
         return {}
 
     date_set = set(trading_dates)
     counter: dict[tuple[str, str], set[date]] = defaultdict(set)
 
-    for _event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
+        cols = [
+            "資料範圍", "分點", "標的股", cfg["date_col"], "出清日",
+            "權證名稱", "權證清單", "最大單筆權證",
+        ]
+        cols.extend(cfg.get("amount_cols", []))
+        cols.extend(cfg.get("warrant_text_cols", []))
         try:
-            df = read_gsheet_table(
-                sheet_name,
-                [
-                    "資料範圍", "分點", "標的股", "事件日",
-                    "單日累積買進金額", "買超金額", "權證清單", "出清日",
-                ],
-            )
+            df = read_gsheet_table(cfg["sheet"], list(dict.fromkeys(cols)))
             df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
         for _, row in df.iterrows():
-            event_date = parse_date_value(row.get("事件日"))
+            event_date = parse_date_value(row.get(cfg["date_col"]))
             if not event_date or event_date not in date_set or event_date > target:
                 continue
 
@@ -1999,24 +2130,28 @@ def collect_broker_underlying_add_count_map(
             if broker not in TRACKED_BROKERS:
                 continue
 
-            warrant_text = row.get("權證清單", "")
-            underlying = normalize_underlying(row.get("標的股", ""), warrant_text)
-            if not underlying:
-                continue
-
-            amount = safe_float(
-                _first_non_empty_value(
-                    row.get("單日累積買進金額", ""),
-                    row.get("買超金額", ""),
-                ),
-                0,
-            )
+            amount = 0.0
+            for col in cfg.get("amount_cols", []):
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    amount = safe_float(raw, 0)
+                    break
             if amount < BUY_THRESHOLD:
                 continue
 
-            counter[(broker, underlying)].add(event_date)
+            warrant_text = ""
+            for col in cfg.get("warrant_text_cols", []) + ["權證名稱", "權證清單", "最大單筆權證"]:
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    warrant_text = raw
+                    break
+
+            underlying = normalize_underlying(row.get("標的股"), warrant_text)
+            if underlying:
+                counter[(broker, underlying)].add(event_date)
 
     return {key: len(days) for key, days in counter.items()}
+
 
 
 def normalize_event_code(v) -> str:
@@ -2024,21 +2159,17 @@ def normalize_event_code(v) -> str:
     if not s or s == "-":
         return ""
 
-    # 支援 A～E、A-基礎買超、E-超大額布局，以及 A/B/C 等合併文字。
+    # 同時辨識舊版 A～D 與新版 A～E，以及 A/B/C 等合併文字。
     hits = []
     for code in ["A", "B", "C", "D", "E"]:
         if re.search(rf"(^|[^A-Z]){code}([^A-Z]|$)", s.upper()):
             hits.append(code)
-
-    if hits:
-        return "/".join(hits)
-
-    return s
+    return "/".join(hits) if hits else s
 
 
 def is_unclassified_event(v) -> bool:
     s = normalize_event_code(v)
-    return s in ["", "-", "未歸類", "ABCDE合計"]
+    return s in ["", "-", "未歸類", "ABCD合計", "ABCDE合計", EVENT_COMBINED_LABEL]
 
 
 def parse_warrant_items_from_text(text_value: str) -> list[tuple[str, str]]:
@@ -2070,10 +2201,8 @@ def parse_warrant_items_from_text(text_value: str) -> list[tuple[str, str]]:
 
 def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[str, str], dict]:
     """
-    從新制 A／B／C／D／E 工作表建立「分點＋權證代號」事件備援對照。
-
-    新版每日賣出明細本身已包含事件代號；只有該欄缺漏時才使用此對照補回。
-    保留原函式名稱以相容既有呼叫。
+    從目前選用的舊版 A/B/C/D 或新版 A/B/C/D/E 工作表建立
+    「分點＋權證代號」事件備援對照。保留原函式名稱供舊程式呼叫。
     """
     lookup: dict[tuple[str, str], dict] = {}
 
@@ -2084,35 +2213,47 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
             return
 
         key = (broker, warrant_code)
-        old = lookup.get(key)
-        if old is None:
+        old_info = lookup.get(key)
+        if old_info is None:
             lookup[key] = info
             return
 
-        # 同一權證可能多次進場。備援時優先保留較早事件，貼近 FIFO 歸屬。
-        old_date = old.get("event_date")
+        if not IS_NEW_GSHEET_DATA:
+            # 舊版完全保留 A > B > C > D 優先順序。
+            priority = {"A": 4, "B": 3, "C": 2, "D": 1}
+            if priority.get(str(old_info.get("event", "")), 0) > priority.get(str(info.get("event", "")), 0):
+                return
+            lookup[key] = info
+            return
+
+        # 新版金額分級是互斥分類；若同一權證有多次事件，備援時保留較早事件，貼近 FIFO。
+        old_date = old_info.get("event_date")
         new_date = info.get("event_date")
         if old_date is None or (new_date is not None and new_date < old_date):
             lookup[key] = info
 
-    for event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
+        cols = [
+            "資料範圍", "分點", "標的股", cfg["date_col"],
+            "權證代碼", "權證代號", "權證名稱", "權證清單", "最大單筆權證",
+            "買進金額", "買超金額", "單日累積買進金額",
+            "買進張數", "買超張數",
+            "減碼日", "減碼獲利%", "出清日", "出清獲利%",
+        ]
+        cols.extend(cfg.get("amount_cols", []))
+        cols.extend(cfg.get("qty_cols", []))
+        cols.extend(cfg.get("warrant_text_cols", []))
+        cols.extend(cfg.get("warrant_code_cols", []))
+
         try:
-            df = read_gsheet_table(
-                sheet_name,
-                [
-                    "資料範圍", "分點", "標的股", "事件日", "權證清單",
-                    "單日累積買進金額", "買超金額", "買超張數",
-                    "減碼日", "減碼獲利%", "出清日", "出清獲利%",
-                ],
-            )
+            df = read_gsheet_table(cfg["sheet"], list(dict.fromkeys(cols)))
             df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
         for _, row in df.iterrows():
             broker = row.get("分點", "")
-            warrant_list = row.get("權證清單", "")
-            underlying = normalize_underlying(row.get("標的股", ""), warrant_list)
+            event_date = parse_date_value(row.get(cfg["date_col"]))
 
             return_pct = None
             if target and parse_date_value(row.get("出清日")) == target:
@@ -2120,37 +2261,63 @@ def build_sell_event_lookup_from_abcd(target: date | None = None) -> dict[tuple[
             elif target and parse_date_value(row.get("減碼日")) == target:
                 return_pct = row.get("減碼獲利%")
 
-            buy_amount = safe_float(
-                _first_non_empty_value(
-                    row.get("單日累積買進金額", ""),
-                    row.get("買超金額", ""),
-                ),
-                0,
-            )
-            buy_qty = safe_float(row.get("買超張數", ""), 0)
+            buy_amount = 0.0
+            for col in cfg.get("amount_cols", []):
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    buy_amount = safe_float(raw, 0)
+                    break
+
+            buy_qty = 0.0
+            for col in cfg.get("qty_cols", []):
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    buy_qty = safe_float(raw, 0)
+                    break
+
             buy_avg = (
                 buy_amount / (buy_qty * NTD_PER_WARRANT_POINT)
                 if buy_amount > 0 and buy_qty > 0
                 else 0
             )
-            event_date = parse_date_value(row.get("事件日"))
 
-            for warrant_code, warrant_name in parse_warrant_items_from_text(warrant_list):
-                put(
-                    broker,
-                    warrant_code,
-                    {
-                        "event": event_code,
-                        "underlying": underlying,
-                        "warrant_name": strip_gsheet_text_prefix(warrant_name),
-                        "return_pct": return_pct,
-                        "buy_amount": buy_amount,
-                        "buy_avg": buy_avg,
-                        "event_date": event_date,
-                    },
-                )
+            # 舊版 A 是單一權證欄位，維持原本直接對照方式。
+            if not IS_NEW_GSHEET_DATA and cfg["code"] == "A":
+                warrant_code = row.get("權證代碼") or row.get("權證代號")
+                warrant_name = row.get("權證名稱", "")
+                underlying = normalize_underlying(row.get("標的股"), warrant_name)
+                put(broker, warrant_code, {
+                    "event": cfg["code"],
+                    "underlying": underlying,
+                    "warrant_name": strip_gsheet_text_prefix(warrant_name),
+                    "return_pct": return_pct,
+                    "buy_amount": buy_amount,
+                    "buy_avg": buy_avg,
+                    "event_date": event_date,
+                })
+                continue
+
+            warrant_text = ""
+            for col in cfg.get("warrant_text_cols", []) + ["權證清單", "最大單筆權證", "權證名稱"]:
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    warrant_text = raw
+                    break
+
+            underlying = normalize_underlying(row.get("標的股"), warrant_text)
+            for warrant_code, warrant_name in parse_warrant_items_from_text(warrant_text):
+                put(broker, warrant_code, {
+                    "event": cfg["code"],
+                    "underlying": underlying,
+                    "warrant_name": strip_gsheet_text_prefix(warrant_name),
+                    "return_pct": return_pct,
+                    "buy_amount": buy_amount,
+                    "buy_avg": buy_avg,
+                    "event_date": event_date,
+                })
 
     return lookup
+
 
 
 def build_warrant_sell_history_return_lookup(target: date) -> dict[tuple[str, str], dict]:
@@ -2158,8 +2325,8 @@ def build_warrant_sell_history_return_lookup(target: date) -> dict[tuple[str, st
     從「快取_分點歷史」估算指定日期各分點 + 權證代號的賣出報酬率與對應成本。
 
     用途：
-    1. A/B/C/D/E 白名單權證若事件表本身沒有報酬率，可用歷史實際買賣資料補估。
-    2. 不在 A/B/C/D/E，但因「同分點 + 同標的今日賣出合計 >= 100 萬」而被納入圖卡的權證，
+    1. 事件白名單權證若事件表本身沒有報酬率，可用歷史實際買賣資料補估。
+    2. 不在 A/B/C/D，但因「同分點 + 同標的今日賣出合計 >= 100 萬」而被納入圖卡的權證，
        也能顯示合理的報酬率。
 
     估算法：
@@ -2277,7 +2444,7 @@ def dedupe_daily_sell_rows(df: pd.DataFrame) -> pd.DataFrame:
     2. 同一天、同分點、同一檔權證理論上只會有一筆官方 API5 日資料。
        若 Google Sheet 因同步或快取異常出現多列，保留賣出金額較大的那筆作為當日值，
        不把多列相加，避免同一筆日資料被重複放大。
-    3. 分點、權證、標的、事件、狀態等文字欄位會盡量保留非空值；事件代號優先保留 A/B/C/D/E。
+    3. 分點、權證、標的、事件、狀態等文字欄位會盡量保留非空值；事件代號優先保留 A/B/C/D。
     """
     if df is None or df.empty:
         return df
@@ -2336,7 +2503,7 @@ def dedupe_daily_sell_rows(df: pd.DataFrame) -> pd.DataFrame:
             keep["_dedupe_sell_qty_shares"] = sell_qty_shares
             keep["_dedupe_sell_qty_lots"] = sell_qty_lots
 
-        # 文字資訊補強：保留非空值，事件代號優先保留可解析的 A/B/C/D/E。
+        # 文字資訊補強：保留非空值，事件代號優先保留可解析的 A/B/C/D。
         # 新版每日賣出明細若已由主程式算好 FIFO 報酬 / 成本，這些欄位也要保留下來，
         # 否則同日同分點同權證去重後，圖片端可能又退回顯示「-」。
         for col in [
@@ -2381,11 +2548,11 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
     不再用 A 表的「減碼均價 × 買進張數」推估。
 
     顯示規則：
-    1. 若該筆「分點 + 權證代號」曾出現在 A/B/C/D/E，照原本事件邏輯顯示。
-    2. 若該權證未出現在 A/B/C/D/E，但同一分點今天對同一標的的賣出金額合計
+    1. 若該筆「分點 + 權證代號」曾出現在 A/B/C/D，照原本事件邏輯顯示。
+    2. 若該權證未出現在 A/B/C/D，但同一分點今天對同一標的的賣出金額合計
        達 NON_ABCD_SELL_UNDERLYING_THRESHOLD，仍納入賣超明細。
-       這類資料不標 A/B/C/D/E，直接顯示權證與賣出金額。
-    3. 非 A/B/C/D/E 的大額單標的賣超，直接使用「每日賣出明細」內
+       這類資料不標 A/B/C/D，直接顯示權證與賣出金額。
+    3. 非 A/B/C/D 的大額單標的賣超，直接使用「每日賣出明細」內
        主程式已計算的 FIFO 成本與報酬率。
     """
     needed_cols = [
@@ -2413,7 +2580,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
     event_lookup = build_sell_event_lookup_from_abcd(target)
 
-    # 先統計「不在 A/B/C/D/E 白名單」的權證，在同一天 + 同分點 + 同標的的實際賣出合計。
+    # 先統計「不在 事件白名單」的權證，在同一天 + 同分點 + 同標的的實際賣出合計。
     non_abcd_underlying_amounts: dict[tuple[str, str], float] = defaultdict(float)
 
     for _, r in df.iterrows():
@@ -2468,7 +2635,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
         # 主程式新版「每日賣出明細」若已經寫入 FIFO 報酬率 / 賣出成本，
         # 圖片端優先採用這張表的結果。
-        # 只有每日賣出明細沒有報酬 / 成本時，才退回 A/B/C/D/E 或快取_分點歷史估算。
+        # 只有每日賣出明細沒有報酬 / 成本時，才退回 A/B/C/D 或快取_分點歷史估算。
         daily_return_pct = normalize_return_pct(_pick_first_existing_value_fuzzy(r, [
             "報酬率", "報酬率%", "賣出報酬率", "賣出報酬%",
             "已實現報酬率", "已實現報酬%", "FIFO報酬率", "FIFO報酬%",
@@ -2493,8 +2660,8 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             buy_amount = daily_buy_amount
 
             if is_unclassified_event(event):
-                # 權證雖可對到 A/B/C/D/E 白名單，但事件代號仍無法解析時，
-                # 不強行標註 A/B/C/D/E，直接當作單一賣超顯示。
+                # 權證雖可對到 事件白名單，但事件代號仍無法解析時，
+                # 不強行標註 A/B/C/D，直接當作單一賣超顯示。
                 event = "單一賣超"
 
             buy_avg = safe_float(lookup_info.get("buy_avg"), 0)
@@ -2524,7 +2691,7 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
             )
             continue
 
-        # 不在 A/B/C/D/E 的權證：同一分點 + 同一標的今日實際賣出合計 >= 100 萬才納入。
+        # 不在 A/B/C/D 的權證：同一分點 + 同一標的今日實際賣出合計 >= 100 萬才納入。
         if (broker, underlying) not in qualifying_non_abcd_underlyings:
             continue
 
@@ -2551,55 +2718,80 @@ def append_daily_sell_rows_from_gsheet(sells: list[dict], target: date):
 
 
 def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
+    """
+    以舊版程式原本的 append_buy / append_sell / 去重 / 加碼邏輯為核心，
+    僅依 GSHEET_DATA_VERSION 切換事件工作表與欄位。
+    """
     buys: list[dict] = []
     sells: list[dict] = []
 
-    event_cols = [
-        "資料範圍", "事件類型", "分點", "標的股", "事件日",
-        "涵蓋權證數", "權證清單", "最大單筆權證",
-        "單日累積買進金額", "買超金額", "買超張數",
-        "減碼日", "減碼賣出金額", "減碼獲利%",
-        "出清日", "出清賣出金額", "出清獲利%",
-    ]
+    for cfg in EVENT_SHEET_CONFIGS:
+        cols = [
+            "資料範圍", "事件類型", "分點", "標的股", cfg["date_col"],
+            "權證代碼", "權證代號", "權證名稱", "權證清單", "最大單筆權證",
+            "買進張數", "買超張數", "買進金額", "買超金額", "單日累積買進金額",
+            "減碼日", "減碼均價", "減碼獲利%", "減碼賣出金額",
+            "出清日", "出清均價", "出清獲利%", "出清賣出金額",
+        ]
+        cols.extend(cfg.get("amount_cols", []))
+        cols.extend(cfg.get("qty_cols", []))
+        cols.extend(cfg.get("warrant_text_cols", []))
+        cols.extend(cfg.get("warrant_code_cols", []))
 
-    for event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
         try:
-            df = read_gsheet_table(sheet_name, event_cols)
+            df = read_gsheet_table(cfg["sheet"], list(dict.fromkeys(cols)))
             df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception as exc:
-            print(f"  ⚠️ 讀取 {sheet_name} 失敗：{type(exc).__name__}: {exc}")
+            print(f"  ⚠️ 讀取 {cfg['sheet']} 失敗：{type(exc).__name__}: {exc}")
             continue
 
         for _, row in df.iterrows():
-            if parse_date_value(row.get("事件日")) != target:
+            if parse_date_value(row.get(cfg["date_col"])) != target:
                 continue
 
-            amount = safe_float(
-                _first_non_empty_value(
-                    row.get("單日累積買進金額", ""),
-                    row.get("買超金額", ""),
-                ),
-                0,
-            )
-            warrant_text = _first_non_empty_value(
-                row.get("權證清單", ""),
-                row.get("最大單筆權證", ""),
-            )
+            amount = 0.0
+            for col in cfg.get("amount_cols", []):
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    amount = safe_float(raw, 0)
+                    break
+
+            qty = 0
+            for col in cfg.get("qty_cols", []):
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    qty = safe_int(raw, 0)
+                    break
+
+            warrant_text = ""
+            for col in cfg.get("warrant_text_cols", []) + ["權證名稱", "權證清單", "最大單筆權證"]:
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    warrant_text = raw
+                    break
+
+            warrant_code = ""
+            for col in cfg.get("warrant_code_cols", []) + ["權證代碼", "權證代號"]:
+                raw = strip_gsheet_text_prefix(row.get(col, ""))
+                if raw and raw != "-":
+                    warrant_code = raw
+                    break
 
             append_buy(
                 buys,
                 row.get("分點", ""),
-                event_code,
+                cfg["code"],
                 row.get("標的股", ""),
                 warrant_text,
                 amount,
-                safe_int(row.get("買超張數", ""), 0),
-                sheet_name,
+                qty,
+                cfg["sheet"],
+                warrant_code,
             )
 
     buys = dedupe_buy_actions(buys)
 
-    # 賣方資料仍直接讀新版主程式輸出的「每日賣出明細」。
+    # 賣方明細仍完全沿用舊版程式：讀取「每日賣出明細」。
     append_daily_sell_rows_from_gsheet(sells, target)
 
     add_count_map = collect_broker_underlying_add_count_map(
@@ -2612,7 +2804,6 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
 
     return buys, sells
 
-
 def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     """
     同一分點、同一事件、同一標的若有多筆權證，合併成標的顯示。
@@ -2622,10 +2813,10 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
 
     for a in actions:
         # 賣方明細採「同一天、同分點、同狀態、同標的」直接合計。
-        # 若同一標的同一天同時出現在 A/B/C/D/E，會合併為一列，報酬率用買進金額與賣出金額概算。
+        # 若同一標的同一天同時出現在 A/B/C/D，會合併為一列，報酬率用買進金額與賣出金額概算。
         # 買方仍保留事件別，避免買超訊號被過度合併。
         if kind == "sell":
-            key = (a["broker"], a.get("status", ""), "ABCDE合計", a["underlying"] or a["warrant"])
+            key = (a["broker"], a.get("status", ""), EVENT_COMBINED_LABEL, a["underlying"] or a["warrant"])
         else:
             key = (a["broker"], a.get("status", ""), a["event"], a["underlying"] or a["warrant"])
         groups[key].append(a)
@@ -2637,7 +2828,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
         warrant_count = len(items)
 
         # 賣方報酬率合計邏輯：
-        # 同一天同分點同標的可能會把 A/B/C/D/E 權證與「單一賣超」合併。
+        # 同一天同分點同標的可能會把 事件權證與「單一賣超」合併。
         # 因此報酬率計算時，分子與分母必須限定在同一批「有成本」的項目，
         # 避免分子含全部賣出金額、分母只含部分買進成本，造成報酬率被高估。
         costed_items = [
@@ -2720,7 +2911,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
 
             # B/C/D 通常是權證清單；若有多檔，顯示第一檔權證 + ...
             # 這樣至少能看到其中一支權證代碼/名稱，不會只剩「N 檔權證」。
-            if kind == "buy" and event in {"A", "B", "C", "D", "E"} and list_count >= 2 and warrant_label:
+            if kind == "buy" and event in {"B", "C", "D", "E"} and list_count >= 2 and warrant_label:
                 first_warrant = re.split(r"[；;]", warrant_label)[0].strip()
                 content = f"{first_warrant}；..."
             else:
@@ -2728,7 +2919,7 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
 
             if kind == "sell":
                 sell_event_label = event
-                if not sell_event_label or sell_event_label == "ABCDE合計":
+                if not sell_event_label or sell_event_label == EVENT_COMBINED_LABEL:
                     sell_event_label = "/".join(sorted({
                         str(i.get("event", "")).strip()
                         for i in items
@@ -2738,12 +2929,12 @@ def compress_actions(actions: list[dict], kind: str) -> list[dict]:
                 if sell_event_label:
                     content = f"{sell_event_label}｜{content}"
 
-        # 賣超明細內容欄最前面固定保留 A/B/C/D/E 事件代號。
+        # 賣超明細內容欄最前面固定保留 A/B/C/D 事件代號。
         # 注意：賣方資料可能在前面被合併成 warrant_count >= 2，
         # 因此不能只在單筆 else 分支加前綴，必須在 result.append 前統一處理。
         if kind == "sell":
             sell_event_label = event
-            if not sell_event_label or sell_event_label == "ABCDE合計":
+            if not sell_event_label or sell_event_label == EVENT_COMBINED_LABEL:
                 sell_event_label = "/".join(sorted({
                     str(i.get("event", "")).strip()
                     for i in items
@@ -2817,7 +3008,7 @@ def read_actual_daily_net_from_history(target: date) -> dict:
 
     用途：
     - 第一張圖 KPI 的「實際淨買超」必須用同一個資料來源計算。
-    - 不再用 A/B/C/D/E 買超事件金額去扣「每日賣出明細」的實際賣出金額，
+    - 不再用 目前選用的買超事件金額去扣「每日賣出明細」的實際賣出金額，
       避免買方與賣方來源集合不同，造成數學口徑不一致。
 
     回傳：
@@ -3291,13 +3482,14 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     text(margin_x + 0.25, legend_y + event_legend_h / 2, "事件代號說明", 13.5, NAVY, BOLD)
 
     legend_items = EVENT_LEGEND_ITEMS
-
-    lx = margin_x + 1.72
-    for code_name, desc in legend_items:
+    legend_start_x = margin_x + 2.00
+    legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
+    for idx, (code_name, desc) in enumerate(legend_items):
+        lx = legend_start_x + idx * legend_slot_w
         rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.39, legend_y + event_legend_h / 2, desc, 9.6, TEXT, FONT)
-        lx += 2.08 if code_name in {"A", "B"} else 1.98
+        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 9.6, WHITE, BOLD, ha="center")
+        desc_text = fit_to_cell_width(desc, max(0.35, legend_slot_w - 0.46), size=9.6, fp=FONT)
+        text(lx + 0.40, legend_y + event_legend_h / 2, desc_text, 9.6, TEXT, FONT)
 
     # footer
     y -= event_legend_h
@@ -3315,8 +3507,11 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
 # ══════════════════════════════════════════════════════════════════════
 
 def get_buy_event_date(row, sheet_name: str) -> date | None:
-    """新制 A～E 五張事件表一律使用「事件日」。"""
-    return parse_date_value(row.get("事件日"))
+    """依目前選用的新／舊事件工作表取得買超事件日期。"""
+    cfg = EVENT_CONFIG_BY_SHEET.get(sheet_name)
+    if not cfg:
+        return None
+    return parse_date_value(row.get(cfg["date_col"]))
 
 
 def get_sell_event_date(row, sheet_name: str, status: str) -> date | None:
@@ -3329,21 +3524,21 @@ def collect_recent_buy_trading_dates(
     target: date,
     lookback_days: int = LOOKBACK_TRADING_DAYS,
 ) -> list[date]:
-    """從新制 A～E 事件表取得最近 N 個有事件資料的交易日。"""
+    """從目前選用的事件表抓出最近 N 個有資料的有效事件日。"""
     dates = set()
 
-    for _event_code, _event_label, sheet_name in AMOUNT_CLASS_SHEET_PLAN:
+    for cfg in EVENT_SHEET_CONFIGS:
         try:
             df = read_gsheet_table(
-                sheet_name,
-                ["資料範圍", "分點", "事件日"],
+                cfg["sheet"],
+                ["資料範圍", "分點", cfg["date_col"]],
             )
             df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
         except Exception:
             continue
 
         for _, row in df.iterrows():
-            event_date = parse_date_value(row.get("事件日"))
+            event_date = parse_date_value(row.get(cfg["date_col"]))
             if event_date and event_date <= target:
                 dates.add(event_date)
 
@@ -3354,7 +3549,7 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     """
     直接讀取 Google Sheet「快取_TOP15共識淨買超」。
 
-    這張近一個月 TOP15 圖不再由圖片端重新計算 A/B/C/D/E 或快取_分點歷史，
+    這張近一個月 TOP15 圖不再由圖片端重新計算 A/B/C/D 或快取_分點歷史，
     lookback_days 只保留相容舊呼叫，實際期間與排名以主程式 Step 4b 產生的快取為準。
     """
     rows, meta = read_top15_consensus_cache_from_gsheet(target)
@@ -3579,13 +3774,14 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.25, legend_y + legend_h / 2, f"TOP15淨買超成本：{fmt_wan(total_net_amount)}", 13.5, RED if total_net_amount >= 0 else GREEN, BOLD)
 
     legend_items = EVENT_LEGEND_ITEMS
-
-    lx = margin_x + 2.62
-    for code_name, desc in legend_items:
+    legend_start_x = margin_x + 3.40
+    legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
+    for idx, (code_name, desc) in enumerate(legend_items):
+        lx = legend_start_x + idx * legend_slot_w
         rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + legend_h / 2, code_name, 10, WHITE, BOLD, ha="center")
-        text(lx + 0.39, legend_y + legend_h / 2, desc, 9.4, TEXT, FONT)
-        lx += 2.05 if code_name in {"A", "B"} else 1.93
+        text(lx + 0.16, legend_y + legend_h / 2, code_name, 9.4, WHITE, BOLD, ha="center")
+        desc_text = fit_to_cell_width(desc, max(0.30, legend_slot_w - 0.44), size=9.2, fp=FONT)
+        text(lx + 0.39, legend_y + legend_h / 2, desc_text, 9.2, TEXT, FONT)
 
     y = legend_y - gap
 
@@ -3832,7 +4028,7 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
     text_draw(
         margin_x + 0.18,
         y,
-        "A勝率、A事件數＝基礎買超（100–159萬）｜總勝率、總事件數、平均持有天數與加權報酬率＝全部 A+B+C+D+E 合併",
+        f"A勝率、A事件數＝{A_EVENT_DESCRIPTION}｜總勝率、總事件數、平均持有天數與加權報酬率＝{TOTAL_EVENT_DESCRIPTION}",
         13,
         TEXT,
         BOLD,
@@ -3854,7 +4050,7 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
 
     y = summary_y - gap
     rounded(margin_x, y - section_title_h, content_w, section_title_h, fc=NAVY, ec=NAVY, lw=1.0, r=0.08)
-    text_draw(margin_x + 0.30, y - section_title_h / 2, "全分點 A／ABCDE總勝率、A／ABCDE總事件數、持有天數與加權報酬", 19, WHITE, BOLD)
+    text_draw(margin_x + 0.30, y - section_title_h / 2, "全分點 A／總勝率、A／總事件數、持有天數與加權報酬", 19, WHITE, BOLD)
     table_top = y - section_title_h
 
     headers = ["序號", "分點", "A勝率", "A事件數", "總勝率", "總事件數", "持有天數", "加權報酬"]
@@ -5786,6 +5982,7 @@ def main():
         f"實際執行：{action}\n"
         f"買超門檻：{BUY_THRESHOLD:.0f}，賣方門檻：{SELL_THRESHOLD:.0f}\n"
         f"加碼次數計算範圍：近 {ADD_COUNT_LOOKBACK_TRADING_DAYS} 個有效交易日\n"
+        f"資料版本：{GSHEET_DATA_VERSION}｜事件工作表：{'、'.join(cfg['sheet'] for cfg in EVENT_SHEET_CONFIGS)}\n"
         f"近10日分點圖指定分點：{'、'.join(broker_10d_image_brokers) if broker_10d_image_brokers else '-'}"
     )
 
