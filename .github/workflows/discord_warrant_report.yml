@@ -3,6 +3,15 @@ name: Discord Warrant Branch Report From Google Sheet
 on:
   workflow_dispatch:
     inputs:
+      data_source:
+        description: "選擇要使用的 Google Sheet 資料"
+        required: true
+        default: "新版資料（A～E 金額分級）"
+        type: choice
+        options:
+          - "新版資料（A～E 金額分級）"
+          - "舊版資料（A～D 舊分類）"
+
       target_date:
         description: "指定圖卡日期，例如 2026-05-18。留空則自動抓 Google Sheet 內最新日期"
         required: false
@@ -37,6 +46,7 @@ on:
 
   schedule:
     # 台灣時間 16:20 = UTC 08:20
+    # 排程無法選下拉選項，因此固定使用新版資料。
     - cron: "20 08 * * 1-5"
 
 jobs:
@@ -45,27 +55,25 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # 改讀 MoneyDJ 新制 A～E 回測程式輸出的 Google Sheet。
-      GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
-
-      # 可另外建立 GOOGLE_SHEET_ID_MONEYDJ；未設定時沿用原 GOOGLE_SHEET_ID。
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ || secrets.GOOGLE_SHEET_ID }}
-
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
 
-      # 手動選擇「正式推播」時使用正式 Webhook。
-      # 選擇「測試推播」或排程自動執行時使用測試 Webhook。
-      DISCORD_WEBHOOK_URL_TEST: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.notification_mode == '正式推播' && secrets.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL_TEST }}
+      # 建議將新舊兩份 Google Sheet 分別建立 Secret。
+      GOOGLE_SHEET_ID_OLD_SECRET: ${{ secrets.GOOGLE_SHEET_ID_OLD }}
+      GOOGLE_SHEET_ID_NEW_SECRET: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
+
+      # 舊有 GOOGLE_SHEET_ID 保留作為備援，避免尚未新增 Secret 時直接失敗。
+      GOOGLE_SHEET_ID_FALLBACK: ${{ secrets.GOOGLE_SHEET_ID }}
+
+      DISCORD_WEBHOOK_URL_FORMAL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL_TEST_SECRET: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
       BUY_THRESHOLD: "1000000"
       SELL_THRESHOLD_RATIO: "0.5"
       DISPLAY_EXIT_ALWAYS: "0"
-
       OUTPUT_IMAGE: output/精選分點買賣超追蹤.png
 
-      # 排程自動執行時，仍只執行每日圖流程。
+      # 排程預設執行每日圖；手動執行時會由 run_plan 覆蓋。
       RUN_PLAN: "精選五分點每日圖"
-
       DEBUG_BROKER_10D_DETAIL: "0"
 
     steps:
@@ -87,14 +95,82 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas pillow gspread google-auth matplotlib
 
-      - name: Generate image from MoneyDJ A-E Google Sheet and send to Discord
+      - name: Resolve selected data source
+        shell: bash
         run: |
-          ACTION_VALUE="${RUN_PLAN}"
-          TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
-          BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
+          set -euo pipefail
 
-          if [ -n "${{ github.event.inputs.run_plan }}" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DATA_SOURCE="${{ github.event.inputs.data_source }}"
+            NOTIFICATION_MODE="${{ github.event.inputs.notification_mode }}"
+          else
+            DATA_SOURCE="新版資料（A～E 金額分級）"
+            NOTIFICATION_MODE="測試推播"
+          fi
+
+          case "${DATA_SOURCE}" in
+            "舊版資料（A～D 舊分類）")
+              DATA_VERSION="old"
+              SHEET_NAME="權證分點籌碼"
+              SHEET_ID="${GOOGLE_SHEET_ID_OLD_SECRET:-${GOOGLE_SHEET_ID_FALLBACK:-}}"
+              ;;
+
+            "新版資料（A～E 金額分級）")
+              DATA_VERSION="new"
+              SHEET_NAME="權證分點資料_NEW_MoneyDJ"
+              SHEET_ID="${GOOGLE_SHEET_ID_NEW_SECRET:-${GOOGLE_SHEET_ID_FALLBACK:-}}"
+              ;;
+
+            *)
+              echo "不支援的資料來源選項：${DATA_SOURCE}"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "${SHEET_ID}" ]; then
+            echo "找不到 Google Sheet ID。"
+            echo "舊版請設定 GOOGLE_SHEET_ID_OLD。"
+            echo "新版請設定 GOOGLE_SHEET_ID_MONEYDJ。"
+            echo "也可以暫時使用 GOOGLE_SHEET_ID 作為備援。"
+            exit 1
+          fi
+
+          if [ "${NOTIFICATION_MODE}" = "正式推播" ]; then
+            WEBHOOK_URL="${DISCORD_WEBHOOK_URL_FORMAL:-}"
+          else
+            WEBHOOK_URL="${DISCORD_WEBHOOK_URL_TEST_SECRET:-}"
+          fi
+
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "找不到 ${NOTIFICATION_MODE} 對應的 Discord Webhook。"
+            exit 1
+          fi
+
+          {
+            echo "GSHEET_DATA_VERSION=${DATA_VERSION}"
+            echo "GOOGLE_SHEET_NAME=${SHEET_NAME}"
+            echo "GOOGLE_SHEET_ID=${SHEET_ID}"
+            echo "DISCORD_WEBHOOK_URL_TEST=${WEBHOOK_URL}"
+          } >> "${GITHUB_ENV}"
+
+          echo "選擇資料來源：${DATA_SOURCE}"
+          echo "程式資料版本：${DATA_VERSION}"
+          echo "Google Sheet 名稱：${SHEET_NAME}"
+          echo "Discord 推播模式：${NOTIFICATION_MODE}"
+
+      - name: Generate image from selected Google Sheet and send to Discord
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTION_VALUE="${RUN_PLAN}"
+          TARGET_DATE_VALUE=""
+          BROKER_NAME_VALUE=""
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ACTION_VALUE="${{ github.event.inputs.run_plan }}"
+            TARGET_DATE_VALUE="${{ github.event.inputs.target_date }}"
+            BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
           fi
 
           CMD=(python "discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
@@ -106,6 +182,10 @@ jobs:
           if [ -n "${BROKER_NAME_VALUE}" ]; then
             CMD+=(--broker "${BROKER_NAME_VALUE}")
           fi
+
+          printf '執行指令：'
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
 
           "${CMD[@]}"
 
