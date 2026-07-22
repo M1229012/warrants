@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-ALIGNED-20260722"
+PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-TOP15-SNAPSHOT-FIX-20260722"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4473,6 +4473,14 @@ GSHEET_RESULT_UPSERT_TITLES = {
 # 同一資料範圍每次都應以本次結果完整替換，否則跌出排名或已刪除的分點會殘留。
 GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES = set()
 
+# TOP15 兩張表是「指定統計日的快照」，不是只能追加的歷史事件表。
+# 同一資料範圍 + 同一統計日期重新執行時，必須整批替換該快照，
+# 否則舊 run_id、舊金額、舊報酬率與已退出排名的列會永久殘留。
+GSHEET_TOP15_SNAPSHOT_REPLACE_TITLES = {
+    TOP15_CONSENSUS_SHEET,
+    TOP15_POSITION_DETAIL_SHEET,
+}
+
 GSHEET_RESULT_OVERWRITE_TITLES = {
     "券商查詢",
     "券商查詢資料",
@@ -6424,6 +6432,226 @@ def _insert_rows_below_header(ws, rows):
         return False
 
 
+
+def is_top15_snapshot_replace_sheet(title):
+    """TOP15 快取表使用同日快照替換，不走一般 insert-only 同步。"""
+    normalized_title = safe_worksheet_title(title)
+    return normalized_title in {
+        safe_worksheet_title(item)
+        for item in GSHEET_TOP15_SNAPSHOT_REPLACE_TITLES
+    }
+
+
+def _top15_scope_date_key(record):
+    """回傳 TOP15 快照識別鍵：(資料範圍, 統計日期)。"""
+    scope = str(
+        strip_gsheet_text_prefix(record.get("資料範圍", ""))
+    ).strip() or "全分點"
+    stat_dt = _parse_result_record_date(record.get("統計日期", ""))
+    if stat_dt is None:
+        return None
+    return scope, stat_dt.strftime("%Y/%m/%d")
+
+
+def _dedupe_top15_snapshot_records(title, headers, records):
+    """
+    依 TOP15 工作表既有唯一鍵去重。
+
+    records 順序必須是「本次新快照在前、舊資料在後」，因此遇到相同 key 時
+    保留第一筆，確保本次結果覆蓋舊 run_id，而不是反過來。
+    """
+    key_cols = _sheet_upsert_key_columns(title, headers)
+    if not key_cols:
+        return list(records), 0
+
+    seen = set()
+    output = []
+    removed = 0
+
+    for raw_record in records:
+        record = dict(raw_record)
+        if "資料範圍" in headers and not str(record.get("資料範圍", "")).strip():
+            record["資料範圍"] = "全分點"
+
+        key = _record_key(record, key_cols)
+        if not any(key):
+            # 無法形成安全唯一鍵的列保留，避免誤刪人工資料。
+            output.append(record)
+            continue
+        if key in seen:
+            removed += 1
+            continue
+
+        seen.add(key)
+        output.append(record)
+
+    return output, removed
+
+
+def _apply_top15_cache_retention(title, headers, records):
+    """
+    TOP15 快取每個資料範圍只保留最近 GSHEET_TOP15_KEEP_STAT_DATES 個統計日期。
+
+    TOP15 是可由 MoneyDJ 歷史資料重建的圖片快取，因此即使年度封存因 Drive
+    配額或設定問題失敗，仍會依設定裁切主表，避免舊 run_id 無限累積。
+    """
+    retained, expired = _split_records_by_recent_dates(
+        records,
+        date_col="統計日期",
+        keep_count=GSHEET_TOP15_KEEP_STAT_DATES,
+    )
+    if not expired:
+        return retained, 0
+
+    archive_ok = False
+    if GSHEET_RESULT_ARCHIVE_ENABLED:
+        archive_ok = archive_result_records(
+            title,
+            headers,
+            expired,
+            date_col="統計日期",
+        )
+
+    if not archive_ok:
+        print(
+            f"  ℹ️ {safe_worksheet_title(title)} 為可重建 TOP15 快取；"
+            f"封存未完成或未啟用，仍依設定移除 {len(expired):,} 筆舊快照。"
+        )
+
+    print(
+        f"  🧹 TOP15 快取保留策略：{safe_worksheet_title(title)}｜"
+        f"每個資料範圍保留最近 {GSHEET_TOP15_KEEP_STAT_DATES} 個統計日期｜"
+        f"主表 {len(retained):,} 筆｜移除舊快照 {len(expired):,} 筆"
+    )
+    return retained, len(expired)
+
+
+def replace_top15_snapshot_rows_in_worksheet(
+    ws,
+    title,
+    new_values,
+    data_scope=None,
+    extra_scope_values=None,
+):
+    """
+    TOP15 專用同步：同一「資料範圍 + 統計日期」整批替換。
+
+    與一般 A～E／每日賣出明細不同，TOP15 是每日快照：
+    - 同一天重跑時，金額、報酬率、排名與明細必須以本次結果為準。
+    - 已退出排名或已無部位的舊列必須從該日快照移除。
+    - 其他資料範圍與其他統計日期完整保留。
+    - 寫回前依唯一鍵清除歷史重複 run_id，並套用最近 N 日保留策略。
+    """
+    prepared = _prepare_incremental_result_values(
+        title,
+        new_values,
+        data_scope=data_scope,
+        extra_scope_values=extra_scope_values,
+    )
+    if prepared is None:
+        print(f"  ⚠️ TOP15 快照資料格式無法辨識：{safe_worksheet_title(title)}")
+        return None
+
+    incoming_headers, incoming_records = prepared
+    incoming_pairs = {
+        key
+        for key in (_top15_scope_date_key(record) for record in incoming_records)
+        if key is not None
+    }
+    if not incoming_pairs:
+        print(
+            f"  ⚠️ {safe_worksheet_title(title)} 本次資料找不到統計日期；"
+            "為避免誤刪既有快照，本次不寫入。"
+        )
+        return None
+
+    existing_values = _worksheet_values_with_formulas(ws)
+    existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
+        ws,
+        title,
+        existing_values,
+    )
+    existing_header_idx = _find_simple_header_row(existing_values)
+    if existing_header_idx != 0:
+        print(
+            f"  ⚠️ {safe_worksheet_title(title)} 無法確認第一列表頭；"
+            "為避免破壞既有工作表，本次不替換。"
+        )
+        return None
+
+    existing_headers, existing_records = _values_to_records(
+        existing_values,
+        header_row_idx=0,
+        default_scope="全分點",
+    )
+    existing_headers = _ensure_scope_header(existing_headers) if existing_headers else []
+
+    final_headers = []
+    for header in list(incoming_headers) + list(existing_headers):
+        header = str(header).strip()
+        if header and header not in final_headers:
+            final_headers.append(header)
+    if not final_headers:
+        return None
+
+    retained_existing = []
+    replaced_old_count = 0
+    removed_deleted_broker_count = 0
+
+    for raw_record in existing_records:
+        record = dict(raw_record)
+        if not str(record.get("資料範圍", "")).strip():
+            record["資料範圍"] = "全分點"
+
+        cleaned = normalize_or_remove_deleted_broker_result_record(record)
+        if cleaned is None:
+            removed_deleted_broker_count += 1
+            continue
+
+        cleaned, _identity_changes = repair_result_record_security_identity(cleaned)
+        pair = _top15_scope_date_key(cleaned)
+        if pair in incoming_pairs:
+            replaced_old_count += 1
+            continue
+        retained_existing.append(cleaned)
+
+    # 本次結果放前面，去重時自然由本次快照覆蓋舊資料。
+    merged_records, duplicate_removed = _dedupe_top15_snapshot_records(
+        title,
+        final_headers,
+        list(incoming_records) + retained_existing,
+    )
+    retained_records, expired_removed = _apply_top15_cache_retention(
+        title,
+        final_headers,
+        merged_records,
+    )
+
+    values = _records_to_values(final_headers, retained_records)
+    values = normalize_result_values_for_comma_numbers(values)
+    if not write_values_to_worksheet(ws, values):
+        return None
+
+    pair_text = "、".join(
+        f"{scope}/{stat_date}"
+        for scope, stat_date in sorted(incoming_pairs)
+    )
+    print(
+        f"  ♻️ Google Sheet TOP15 快照替換：{safe_worksheet_title(title)}｜"
+        f"快照={pair_text}｜本次 {len(incoming_records):,} 列｜"
+        f"替換舊列 {replaced_old_count:,}｜去除重複 {duplicate_removed:,}｜"
+        f"移除失效分點 {removed_deleted_broker_count:,}｜"
+        f"裁切舊日期 {expired_removed:,}｜主表保留 {len(retained_records):,} 列"
+    )
+    return {
+        "values": values,
+        "incoming": len(incoming_records),
+        "replaced": replaced_old_count,
+        "deduped": duplicate_removed,
+        "expired": expired_removed,
+        "remaining": len(retained_records),
+    }
+
 def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=None, extra_scope_values=None):
     """
     已存在工作表的同步方式：保留全部既有資料，只插入唯一鍵尚未存在的新列。
@@ -6540,10 +6768,9 @@ def upload_excel_to_google_sheet(
     """
     Google Sheet 同步規則：
     1. 工作表不存在時才第一次建立並完整寫入。
-    2. 工作表已存在時只 insert 唯一鍵尚不存在的新資料。
-    3. 絕不刪除、清空、重建或整張覆寫任何既有工作表。
-    4. 唯一允許刪除的是 cleanup_deleted_broker_rows_in_existing_worksheets()
-       明確判定為已從目前程式分點清單移除的舊分點資料列。
+    2. A～E、每日賣出明細等歷史表：只 insert 唯一鍵尚未存在的新資料。
+    3. TOP15 兩張快取：同一資料範圍 + 同一統計日期整批替換，並保留最近 N 個統計日。
+    4. 除 TOP15 快照與明確失效分點列外，不刪除、清空、重建其他既有工作表。
     """
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -6569,7 +6796,10 @@ def upload_excel_to_google_sheet(
             f"  ☁️ Google Sheet 目標試算表：{GOOGLE_SHEET_NAME}"
             + (f"｜ID={GOOGLE_SHEET_ID}" if GOOGLE_SHEET_ID else "")
         )
-        print("  ⚙️ 同步模式：工作表只建立一次；之後只增量 insert 缺少資料。")
+        print(
+            "  ⚙️ 同步模式：A～E／每日賣出明細採增量 insert；"
+            "TOP15 採同資料範圍＋同統計日期整批替換。"
+        )
 
         for ws_xlsx in wb.worksheets:
             title = safe_worksheet_title(ws_xlsx.title)
@@ -6613,6 +6843,26 @@ def upload_excel_to_google_sheet(
                         apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
                         apply_header_widths_to_gsheet(gws, values=values)
                     print(f"  ☁️ 第一次建立並寫入工作表：{title}")
+                continue
+
+            # TOP15 兩張表是每日快照：同一資料範圍 + 同一統計日期必須整批替換，
+            # 不能沿用一般歷史事件表的 insert-only 規則。
+            if is_top15_snapshot_replace_sheet(title):
+                snapshot_result = replace_top15_snapshot_rows_in_worksheet(
+                    gws,
+                    title,
+                    raw_values,
+                    data_scope=current_scope,
+                    extra_scope_values=selected_values,
+                )
+                if snapshot_result is not None:
+                    current_values = snapshot_result.get("values") or _worksheet_values_with_formulas(gws)
+                    clear_all_number_formats_for_written_range(gws, values=current_values)
+                    apply_safe_result_table_style_to_gsheet(gws, values=current_values)
+                    apply_text_format_to_gsheet(gws, current_values)
+                    apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=current_values)
+                    apply_date_format_to_gsheet(ws_xlsx, gws, values=current_values)
+                    apply_header_widths_to_gsheet(gws, values=current_values)
                 continue
 
             inserted = insert_missing_result_rows_to_worksheet(
@@ -7758,6 +8008,14 @@ def _finmind_headers():
 
 
 def _finmind_request(method, url, *, params=None, stream=False, description="FinMind API"):
+    # 缺少 Token 是設定錯誤，不是暫時性網路錯誤；直接失敗並讓上層沿用快取，
+    # 禁止無意義地等待 2、4、8 秒重試。
+    if not FINMIND_TOKEN:
+        raise RuntimeError(
+            "缺少 FINMIND_API_0714，已略過 FinMind 網路請求；"
+            "若有既有快取將直接沿用。"
+        )
+
     session = get_thread_session()
     last_error = None
 
@@ -7833,6 +8091,19 @@ def fetch_finmind_dataset(dataset, *, params=None, cache_hours=None, force=False
             cached = _read_parquet_safe(cache_path)
             if not cached.empty:
                 return cached
+
+    # Token 未設定時直接使用既有中繼資料快取，不進入 HTTP 重試流程。
+    if not FINMIND_TOKEN:
+        stale = _read_parquet_safe(cache_path)
+        if not stale.empty:
+            print(
+                f"  ℹ️ 缺少 FINMIND_API_0714，直接沿用 FinMind {dataset} 既有快取："
+                f"{len(stale):,} 筆"
+            )
+            return stale
+        raise RuntimeError(
+            f"缺少 FINMIND_API_0714，且 FinMind {dataset} 沒有可沿用的本機快取。"
+        )
 
     query = {"dataset": dataset}
     if params:
