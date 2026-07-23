@@ -3530,9 +3530,9 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
     for idx, (code_name, desc) in enumerate(legend_items):
         lx = legend_start_x + idx * legend_slot_w
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + event_legend_h / 2, code_name, 9.6, WHITE, BOLD, ha="center")
-        desc_text = fit_to_cell_width(desc, max(0.35, legend_slot_w - 0.46), size=9.6, fp=FONT)
+        rounded(lx, legend_y + 0.10, 0.38, 0.30, fc="#334155", ec="#334155", lw=0.8, r=0.07)
+        text(lx + 0.19, legend_y + event_legend_h / 2, code_name, 9.6, WHITE, BOLD, ha="center")
+        desc_text = fit_to_cell_width(desc, max(0.35, legend_slot_w - 0.52), size=11, fp=FONT)
         text(lx + 0.40, legend_y + event_legend_h / 2, desc_text, 9.6, TEXT, FONT)
 
     # footer
@@ -3822,10 +3822,10 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
     for idx, (code_name, desc) in enumerate(legend_items):
         lx = legend_start_x + idx * legend_slot_w
-        rounded(lx, legend_y + 0.10, 0.32, 0.25, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.16, legend_y + legend_h / 2, code_name, 9.4, WHITE, BOLD, ha="center")
-        desc_text = fit_to_cell_width(desc, max(0.30, legend_slot_w - 0.44), size=9.2, fp=FONT)
-        text(lx + 0.39, legend_y + legend_h / 2, desc_text, 9.2, TEXT, FONT)
+        rounded(lx, legend_y + 0.10, 0.38, 0.30, fc="#334155", ec="#334155", lw=0.8, r=0.07)
+        text(lx + 0.19, legend_y + legend_h / 2, code_name, 9.4, WHITE, BOLD, ha="center")
+        desc_text = fit_to_cell_width(desc, max(0.30, legend_slot_w - 0.44), size=11, fp=FONT)
+        text(lx + 0.46, legend_y + legend_h / 2, desc_text, 11, TEXT, FONT)
 
     y = legend_y - gap
 
