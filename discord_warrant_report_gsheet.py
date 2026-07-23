@@ -3366,11 +3366,16 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         circle = patches.Circle((x + 0.48, kpi_y + kpi_h / 2), radius=0.28, facecolor=color, edgecolor=color, zorder=3)
         ax.add_patch(circle)
         text(x + 0.48, kpi_y + kpi_h / 2, icon, 22, WHITE, BOLD, ha="center")
-        text(x + 0.88, kpi_y + 0.86, title, 16, TEXT, BOLD)
         if mid:
-            text(x + 0.88, kpi_y + 0.54, mid, 15, color, BOLD)
-            text(x + 0.88, kpi_y + 0.23, val, 18, color, BOLD)
+            # 三行 KPI（今日買超／今日賣超）以卡片垂直中心為基準平均排列，
+            # 避免原本固定座標讓整組文字看起來偏下。
+            kpi_text_center_y = kpi_y + kpi_h / 2
+            text(x + 0.88, kpi_text_center_y + 0.30, title, 16, TEXT, BOLD)
+            text(x + 0.88, kpi_text_center_y, mid, 15, color, BOLD)
+            text(x + 0.88, kpi_text_center_y - 0.30, val, 18, color, BOLD)
         else:
+            # 今日淨額維持原本兩行配置，不改動現有視覺位置。
+            text(x + 0.88, kpi_y + 0.86, title, 16, TEXT, BOLD)
             text(x + 0.88, kpi_y + 0.42, val, 20, color, BOLD)
 
     y = kpi_y - gap
