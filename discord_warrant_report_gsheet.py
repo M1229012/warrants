@@ -3549,12 +3549,12 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             va="center",
         )
 
-        # 中文事件名稱改用較大的粗體深藍字，讓辨識度接近「事件代號說明」。
+        # 中文事件名稱維持較大字級，但改用一般字重，避免粗體筆畫擠在一起。
         desc_size = 11.8
         desc_x = badge_x + badge_w + 0.10
         desc_w = max(0.35, legend_slot_w - (desc_x - lx) - 0.08)
-        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=BOLD)
-        text(desc_x, legend_y + event_legend_h / 2, desc_text, desc_size, NAVY2, BOLD)
+        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=FONT)
+        text(desc_x, legend_y + event_legend_h / 2, desc_text, desc_size, NAVY2, FONT)
 
     # footer
     y -= event_legend_h
@@ -3861,12 +3861,12 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             va="center",
         )
 
-        # 中文事件名稱改為較大、粗體、深藍色，維持清楚且不壓縮代號徽章。
+        # 中文事件名稱維持較大、深藍色，但改用一般字重，讓筆畫更清楚。
         desc_size = 11.8
         desc_x = badge_x + badge_w + 0.10
         desc_w = max(0.30, legend_slot_w - (desc_x - lx) - 0.08)
-        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=BOLD)
-        text(desc_x, legend_y + legend_h / 2, desc_text, desc_size, NAVY2, BOLD)
+        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=FONT)
+        text(desc_x, legend_y + legend_h / 2, desc_text, desc_size, NAVY2, FONT)
 
     y = legend_y - gap
 
@@ -3877,7 +3877,9 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.70, 2.15, 1.45, 0.65, 1.35, 5.90]
+    # 標的欄加寬 0.30，讓「參與分點 / 報酬率」整欄起點稍微右移。
+    # 六欄總寬仍為 12.20，右側表格邊界與原版完全一致。
+    col_w = [0.70, 2.45, 1.45, 0.65, 1.35, 5.60]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
