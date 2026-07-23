@@ -25,7 +25,7 @@ E：單日累積買進金額 >= 1000萬
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
 完整修補模式會重新產生完整報表；A～E／每日賣出明細採穩定唯一鍵補齊，TOP15 採同日快照替換，勝率統計與 ABCDE組合勝率會以本次重算結果完整覆蓋並回讀驗證。
 
-資料來源：MoneyDJ API4／API5（分點資料）＋官方權證清單
+資料來源：daily 使用 MoneyDJ API4／API5；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
 執行：python warrant_backtest.py
 依賴：pip install requests pandas openpyxl pyarrow
 """
@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "MONEYDJ-ABCDE-V10.1-REPAIR-WINRATE-OVERWRITE-VERIFIED-20260723"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-HISTORY-MONEYDJ-LATEST-REPAIR-FIX-20260723"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -136,6 +136,19 @@ MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
 MONEYDJ_API5_STRICT = os.getenv("MONEYDJ_API5_STRICT", "1").strip().lower() not in ("0", "false", "no")
+# repair 模式資料源：FinMind 負責最近 HISTORY_RETENTION_TRADING_DAYS 個完整交易日，
+# MoneyDJ 只疊加 FinMind 尚未發布的最新交易日。避免以 API4 候選預篩取代完整歷史，
+# 造成勝率統計樣本數遠低於 FinMind 全市場日檔版本。
+REPAIR_FINMIND_FULL_HISTORY_ENABLED = os.getenv(
+    "REPAIR_FINMIND_FULL_HISTORY_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_REPAIR_LATEST_DAY_OVERLAY_ENABLED = os.getenv(
+    "MONEYDJ_REPAIR_LATEST_DAY_OVERLAY_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_REPAIR_OVERLAY_SCAN_DAYS = max(
+    int(os.getenv("MONEYDJ_REPAIR_OVERLAY_SCAN_DAYS", "10")),
+    1,
+)
 MONEYDJ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*",
@@ -175,6 +188,16 @@ FINMIND_DAILY_CACHE_DIR = os.path.join(CACHE_DIR, "finmind_warrant_daily")
 FINMIND_METADATA_CACHE_DIR = os.path.join(CACHE_DIR, "finmind_metadata")
 FINMIND_STATE_PATH = os.path.join(CACHE_DIR, "finmind_update_state.json")
 FINMIND_CACHE_SCHEMA_VERSION = os.getenv("FINMIND_CACHE_SCHEMA_VERSION", "finmind-v2-date-aware").strip() or "finmind-v2-date-aware"
+# 歷史來源標記與 schema 分開管理：舊 MoneyDJ 候選歷史即使欄位／日期完整，
+# 也不能被誤認成 FinMind 全市場完整歷史。第一次切換到 hybrid repair 時會強制重建 200 日，
+# 後續只補缺少日與失敗日。
+FINMIND_REPAIR_HISTORY_SOURCE_ID = os.getenv(
+    "FINMIND_REPAIR_HISTORY_SOURCE_ID",
+    "finmind-full-market-200d-hybrid-v1",
+).strip() or "finmind-full-market-200d-hybrid-v1"
+FINMIND_REPAIR_STRICT_HISTORY_WINDOW = os.getenv(
+    "FINMIND_REPAIR_STRICT_HISTORY_WINDOW", "1"
+).strip().lower() not in ("0", "false", "no")
 FINMIND_RAW_DAILY_RETENTION_DAYS = max(int(os.getenv("FINMIND_RAW_DAILY_RETENTION_DAYS", "7")), 1)
 # 完整修補模式不可因最新交易日資料尚未發布而提前結束。
 # repair 會往前探測最近已發布的全市場權證分點日檔，並以該日作為修補基準日；
@@ -8897,10 +8920,16 @@ def _load_finmind_state():
             with open(FINMIND_STATE_PATH, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
                 if isinstance(payload, dict):
+                    payload.setdefault("completed_dates", [])
+                    payload.setdefault("failed_dates", [])
                     return payload
-    except Exception:
-        pass
-    return {"completed_dates": []}
+    except Exception as exc:
+        print(f"  ⚠️ FinMind 狀態檔讀取失敗：{type(exc).__name__}: {exc}")
+    return {
+        "schema_version": "",
+        "completed_dates": [],
+        "failed_dates": [],
+    }
 
 
 def _save_finmind_state(state):
@@ -8911,13 +8940,83 @@ def _save_finmind_state(state):
     os.replace(tmp, FINMIND_STATE_PATH)
 
 
+def _normalize_finmind_state_dates(values):
+    normalized = set()
+    for value in values or []:
+        dt = parse_date(value)
+        if dt:
+            normalized.add(dt.strftime("%Y/%m/%d"))
+    return normalized
 
-def _run_finmind_refresh_dates(target_date, history_df, force_full=False):
+
+def _history_cache_compatibility(history_df):
+    """檢查標準化歷史快取是否可直接沿用，並回傳其實際涵蓋交易日期。"""
+    required_cols = {
+        "權證代號", "權證名稱", "標的股", "標的名稱",
+        "分點", "分點名稱", "券商代號", "日期",
+        "買進股數", "賣出股數", "買進金額", "賣出金額",
+        "買超股數", "買超金額",
+    }
+
+    if history_df is None or history_df.empty:
+        return False, "歷史快取不存在或為空", set()
+
+    missing_cols = sorted(required_cols - set(history_df.columns))
+    if missing_cols:
+        return False, f"缺少欄位：{','.join(missing_cols)}", set()
+
+    history_dates = set()
+    invalid_dates = 0
+    try:
+        for raw_date in history_df["日期"].tolist():
+            dt = parse_date(raw_date)
+            if dt:
+                history_dates.add(dt.strftime("%Y/%m/%d"))
+            elif str(raw_date).strip():
+                invalid_dates += 1
+    except Exception as exc:
+        return False, f"日期欄讀取失敗：{type(exc).__name__}: {exc}", set()
+
+    if not history_dates:
+        return False, "歷史快取沒有可解析日期", set()
+    if invalid_dates > 0:
+        return False, f"歷史快取有 {invalid_dates:,} 筆無法解析日期", history_dates
+
+    return True, "格式相容", history_dates
+
+
+def _finmind_raw_daily_cache_file_count():
+    try:
+        return sum(
+            1
+            for filename in os.listdir(FINMIND_DAILY_CACHE_DIR)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.parquet", filename)
+        )
+    except Exception:
+        return 0
+
+
+def _run_finmind_refresh_dates(
+    target_date,
+    history_df,
+    force_full=False,
+    completed_dates=None,
+    failed_dates=None,
+):
+    """
+    決定本輪真正需要下載的FinMind交易日。
+
+    daily／longterm：維持最近 DAILY_UPDATE_DAYS 日重新確認，並加入過去失敗日。
+    repair：以最近 INITIAL_HISTORY_DAYS 日為完整性窗口，但只下載歷史快取／state尚未完成的日期、
+            過去失敗日與本次目標日，不再每輪無條件重抓200日。
+    強制重建或歷史快取不存在時：才下載完整保留窗口。
+    """
     trading_dates = get_finmind_trading_dates()
     target_dt = parse_date(target_date) or datetime.today()
-    eligible = [d for d in trading_dates if d <= target_dt.date()]
+    target_day = target_dt.date()
+    eligible = [d for d in trading_dates if d <= target_day]
     if not eligible:
-        eligible = [target_dt.date()]
+        eligible = [target_day]
 
     recent_count = max(int(os.getenv("DAILY_UPDATE_DAYS", "3")), 1)
     repair_count = min(
@@ -8925,46 +9024,130 @@ def _run_finmind_refresh_dates(target_date, history_df, force_full=False):
         HISTORY_RETENTION_TRADING_DAYS,
     )
 
+    completed_keys = _normalize_finmind_state_dates(completed_dates)
+    failed_keys = _normalize_finmind_state_dates(failed_dates)
+
+    history_keys = set()
+    if history_df is not None and not history_df.empty and "日期" in history_df.columns:
+        history_keys = _normalize_finmind_state_dates(history_df["日期"].tolist())
+
+    available_keys = completed_keys | history_keys
+    repair_window = eligible[-repair_count:]
+    repair_window_keys = {d.strftime("%Y/%m/%d") for d in repair_window}
+
+    # failed_dates只保留仍落在目前200日保留窗口內的日期，避免永久追逐已超期資料。
+    failed_keys &= repair_window_keys | {target_dt.strftime("%Y/%m/%d")}
+
     history_empty = history_df is None or history_df.empty
-    if force_full or workflow_is_repair() or FORCE_FULL_CACHE_REFRESH or (history_empty and FINMIND_INITIAL_BACKFILL_ON_EMPTY):
-        count = repair_count
+    if force_full or FORCE_FULL_CACHE_REFRESH or (
+        history_empty and FINMIND_INITIAL_BACKFILL_ON_EMPTY
+    ):
+        selected_days = set(repair_window)
+    elif workflow_is_repair():
+        missing_days = {
+            day
+            for day in repair_window
+            if day.strftime("%Y/%m/%d") not in available_keys
+        }
+        selected_days = missing_days | {
+            parse_date(date_key).date()
+            for date_key in failed_keys
+            if parse_date(date_key)
+        }
     else:
-        count = recent_count
+        # daily／longterm保留原本最近數日重新確認的行為。
+        selected_days = set(eligible[-recent_count:]) | {
+            parse_date(date_key).date()
+            for date_key in failed_keys
+            if parse_date(date_key)
+        }
 
-    selected = eligible[-count:]
-    target_day = target_dt.date()
-    if target_day not in selected:
-        selected.append(target_day)
-    return [d.strftime("%Y/%m/%d") for d in sorted(set(selected))]
-
-
+    selected_days.add(target_day)
+    return [d.strftime("%Y/%m/%d") for d in sorted(selected_days)]
 
 
 def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, preloaded_target_df=None):
     global _FINMIND_TARGET_DATE_OK, _FINMIND_TARGET_DATE
 
+    state_file_exists = os.path.exists(FINMIND_STATE_PATH)
     state = _load_finmind_state()
-    schema_reset = state.get("schema_version") != FINMIND_CACHE_SCHEMA_VERSION
-    if schema_reset:
-        print(
-            f"  ♻️ 偵測到舊資料源／舊快取格式，將以 FinMind 完整重建最近 "
-            f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日，不沿用舊原始分點歷史。"
-        )
+    state_schema = str(state.get("schema_version", "") or "").strip()
+    state_completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
+    state_failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+
+    history_compatible, history_reason, history_dates = _history_cache_compatibility(history_df)
+    explicit_force_full = bool(FORCE_FULL_CACHE_REFRESH)
+    full_rebuild_required = not history_compatible
+
+    if history_compatible:
+        state_completed_dates.update(history_dates)
+        if state_schema != FINMIND_CACHE_SCHEMA_VERSION:
+            if state_file_exists:
+                print(
+                    "  ⚠️ FinMind 狀態版本缺少／不同，但歷史快取格式相容，"
+                    "已接管既有快取並重建狀態檔，不執行200日重建。"
+                )
+            else:
+                print(
+                    "  ⚠️ FinMind 狀態檔遺失，但歷史快取格式相容，"
+                    "已接管既有快取並重建狀態檔，不執行200日重建。"
+                )
+    else:
+        # 歷史本體不存在或格式真的不相容時，completed_dates不可拿來跳過下載。
+        state_completed_dates = set()
         history_df = pd.DataFrame()
+        if explicit_force_full:
+            print(
+                f"  ♻️ FORCE_FULL_CACHE_REFRESH=1，將以FinMind完整重建最近 "
+                f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日。"
+            )
+        else:
+            print(
+                f"  ♻️ FinMind歷史快取無法沿用（{history_reason}），將完整建立最近 "
+                f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日。"
+            )
 
     refresh_dates = _run_finmind_refresh_dates(
         target_date,
         history_df,
-        force_full=schema_reset,
+        force_full=full_rebuild_required or explicit_force_full,
+        completed_dates=state_completed_dates,
+        failed_dates=state_failed_dates,
     )
     target_key = normalize_date_str(target_date)
     previous_empty = history_df is None or history_df.empty
     combined = history_df.copy() if history_df is not None else pd.DataFrame()
-    completed_dates = set(str(x) for x in state.get("completed_dates", []) if str(x).strip())
+    completed_dates = set(state_completed_dates)
     success_dates = []
     failed_dates = []
     normalized_by_date = {}
     target_status = "error"
+
+    print(
+        "  🧭 FinMind快取狀態："
+        f"state檔={'存在' if state_file_exists else '不存在'}｜"
+        f"schema={state_schema or '-'}｜"
+        f"歷史快取={len(combined):,}列/{len(history_dates):,}日｜"
+        f"原始日檔={_finmind_raw_daily_cache_file_count():,}份"
+    )
+    print(
+        "  🧭 FinMind刷新計畫："
+        f"completed_dates={len(state_completed_dates):,}日｜"
+        f"failed_dates={len(state_failed_dates):,}日｜"
+        f"本次需下載={len(refresh_dates):,}日｜"
+        f"模式={WORKFLOW_MODE}"
+    )
+
+    # 下載開始前先把本輪日期記為待重試。
+    # 若Python中途失敗，GitHub Actions的cache/save（if: always()）仍會保存這份狀態；
+    # 下一輪只重試這些日期，不會因狀態遺失重新下載200日。
+    planned_retry_dates = state_failed_dates | set(refresh_dates)
+    state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["failed_dates"] = sorted(planned_retry_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["refresh_in_progress_dates"] = list(refresh_dates)
+    state["last_refresh_started_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+    _save_finmind_state(state)
 
     print(
         f"【Step 3】FinMind 全市場權證分點批次更新：{len(refresh_dates):,} 個交易日｜"
@@ -9017,14 +9200,6 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     if success_dates:
         combined = _merge_complete_finmind_days(combined, normalized_by_date, broker_map)
 
-    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
-    state["last_target_date"] = target_key
-    state["last_target_status"] = target_status
-    state["updated_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-    if not failed_dates and len(success_dates) == len(refresh_dates):
-        state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
-    _save_finmind_state(state)
-
     combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
     if identity_stats.get("rows", 0) > 0:
         print(
@@ -9038,13 +9213,46 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
         combined = save_history_cache(combined, fetched_items=None, previous_history_empty=previous_empty)
     prune_finmind_daily_raw_cache(keep_date=target_key)
 
+    # 只有成功日期會從failed_dates移除；單日失敗不再刪除schema_version。
+    remaining_failed_dates = planned_retry_dates - set(success_dates)
+    remaining_failed_dates.update(failed_dates)
+    completed_dates.update(
+        _normalize_finmind_state_dates(combined["日期"].tolist())
+        if combined is not None and not combined.empty and "日期" in combined.columns
+        else set()
+    )
+
+    state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["failed_dates"] = sorted(remaining_failed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["refresh_in_progress_dates"] = []
+    state["last_refresh_requested_dates"] = list(refresh_dates)
+    state["last_refresh_success_dates"] = sorted(success_dates)
+    state["last_refresh_failed_dates"] = sorted(failed_dates)
+    state["last_target_date"] = target_key
+    state["last_target_status"] = target_status
+    state["history_row_count"] = int(len(combined)) if combined is not None else 0
+    state["history_trading_date_count"] = len(
+        _normalize_finmind_state_dates(combined["日期"].tolist())
+        if combined is not None and not combined.empty and "日期" in combined.columns
+        else []
+    )
+    state["updated_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+    _save_finmind_state(state)
+
+    print(
+        "  ✅ FinMind快取狀態已保存："
+        f"completed_dates={len(state['completed_dates']):,}日｜"
+        f"failed_dates={len(state['failed_dates']):,}日｜"
+        f"schema={state['schema_version']}"
+    )
+
     return combined, {
         "target_status": target_status,
         "success_dates": success_dates,
         "failed_dates": failed_dates,
-        "schema_reset": schema_reset,
+        "schema_reset": full_rebuild_required,
     }
-
 
 
 def _normalized_broker_label_key(value):
@@ -17840,14 +18048,23 @@ def find_broker_codes_moneydj(warrants):
     return found
 
 
-def _moneydj_scan_candidates(warrants, broker_map, target_date, history_empty=False):
+def _moneydj_scan_candidates(
+    warrants,
+    broker_map,
+    target_date,
+    history_empty=False,
+    scan_days_override=None,
+):
     global _MONEYDJ_SOURCE_REACHABLE
     global MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS, MONEYDJ_PRESCAN_TOTAL_REQUESTS
 
     target_dt = parse_date(target_date) or datetime.today()
-    scan_days = MONEYDJ_RECENT_SCAN_DAYS
-    if workflow_is_repair() or history_empty:
-        scan_days = max(scan_days, HISTORY_RETENTION_TRADING_DAYS * 2)
+    if scan_days_override is not None:
+        scan_days = max(int(scan_days_override), 1)
+    else:
+        scan_days = MONEYDJ_RECENT_SCAN_DAYS
+        if workflow_is_repair() or history_empty:
+            scan_days = max(scan_days, HISTORY_RETENTION_TRADING_DAYS * 2)
     start_s = (target_dt - timedelta(days=scan_days)).strftime("%Y/%m/%d")
     end_s = target_dt.strftime("%Y/%m/%d")
     code_map = {
@@ -18047,6 +18264,252 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     return combined
 
 
+def _moneydj_candidate_to_target_day_item(candidate, target_date):
+    """只保留 MoneyDJ API5 回傳中的指定交易日，供 repair 最新日疊加使用。"""
+    item, ok = _moneydj_candidate_to_item(candidate, target_date)
+    if not ok or not item:
+        return item, ok
+
+    target_key = normalize_date_str(target_date)
+    df = item.get("df", pd.DataFrame())
+    if df is None or df.empty or "日期" not in df.columns:
+        return None, True
+
+    day_df = df.copy()
+    day_df["日期"] = day_df["日期"].map(normalize_date_str)
+    day_df = day_df[day_df["日期"] == target_key].copy()
+    if day_df.empty:
+        return None, True
+
+    day_item = dict(item)
+    day_item["df"] = day_df.drop_duplicates(subset=["日期"], keep="last").reset_index(drop=True)
+    return day_item, True
+
+
+def overlay_latest_day_from_moneydj(warrants, broker_map, history_df, target_date):
+    """
+    在 FinMind 完整歷史上疊加 MoneyDJ 最新交易日。
+
+    安全規則：
+    1. 只新增／覆蓋 target_date，不用 MoneyDJ API5 的候選歷史取代 FinMind 200 日資料。
+    2. API4 成功率不足、API5 有失敗或 MoneyDJ 尚未更新到 target_date 時，整批放棄疊加。
+    3. 放棄疊加時保留 FinMind 完整歷史，repair 仍可產出完整勝率統計。
+    """
+    global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
+
+    target_key = normalize_date_str(target_date)
+    _MONEYDJ_TARGET_DATE = target_key
+    _MONEYDJ_TARGET_DATE_OK = False
+    _MONEYDJ_API5_FAILED_COUNT = 0
+
+    baseline = history_df.copy() if history_df is not None else pd.DataFrame()
+    candidates, latest_market_date = _moneydj_scan_candidates(
+        warrants,
+        broker_map,
+        target_key,
+        history_empty=False,
+        scan_days_override=MONEYDJ_REPAIR_OVERLAY_SCAN_DAYS,
+    )
+
+    prescan_ratio = (
+        MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS / MONEYDJ_PRESCAN_TOTAL_REQUESTS
+        if MONEYDJ_PRESCAN_TOTAL_REQUESTS > 0
+        else 0.0
+    )
+    target_dt = parse_date(target_key)
+    market_ready = bool(
+        latest_market_date
+        and target_dt
+        and latest_market_date.date() >= target_dt.date()
+    )
+
+    if not market_ready:
+        print(
+            f"  ℹ️ repair 保留 FinMind 基準日：MoneyDJ 尚未確認 {target_key} 已更新，"
+            "不使用不完整最新日覆蓋。"
+        )
+        return baseline, {
+            "accepted": False,
+            "reason": "target_not_ready",
+            "target_date": target_key,
+            "row_count": 0,
+        }
+
+    if prescan_ratio < MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:
+        print(
+            f"  ⚠️ repair 放棄 MoneyDJ 最新日覆蓋：API4 成功率 {prescan_ratio:.2%} "
+            f"低於門檻 {MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:.2%}。"
+        )
+        return baseline, {
+            "accepted": False,
+            "reason": "prescan_ratio",
+            "target_date": target_key,
+            "row_count": 0,
+        }
+
+    print(
+        f"【Step 3c】repair MoneyDJ 最新日疊加：{target_key}｜"
+        f"候選 {len(candidates):,} 組｜workers={min(MONEYDJ_HISTORY_WORKERS, max(len(candidates), 1))}"
+    )
+
+    fetched_items = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(MONEYDJ_HISTORY_WORKERS, len(candidates))) as executor:
+            futures = [
+                executor.submit(_moneydj_candidate_to_target_day_item, candidate, target_key)
+                for candidate in candidates
+            ]
+            for idx, future in enumerate(as_completed(futures), start=1):
+                try:
+                    item, ok = future.result()
+                except Exception:
+                    item, ok = None, False
+
+                if not ok:
+                    _MONEYDJ_API5_FAILED_COUNT += 1
+                if item:
+                    fetched_items.append(item)
+
+                if idx % 200 == 0:
+                    print(
+                        f"  [{idx:,}/{len(candidates):,}] MoneyDJ 最新日疊加中｜"
+                        f"有效 {len(fetched_items):,} 組｜失敗 {_MONEYDJ_API5_FAILED_COUNT:,}"
+                    )
+
+    if MONEYDJ_API5_STRICT and _MONEYDJ_API5_FAILED_COUNT > 0:
+        print(
+            f"  ⚠️ repair 放棄 MoneyDJ 最新日覆蓋：API5 有 "
+            f"{_MONEYDJ_API5_FAILED_COUNT:,} 組失敗；保留 FinMind 完整歷史。"
+        )
+        return baseline, {
+            "accepted": False,
+            "reason": "api5_failed",
+            "target_date": target_key,
+            "row_count": 0,
+        }
+
+    latest_day_df = _moneydj_items_to_history_df(fetched_items)
+    if latest_day_df is None or latest_day_df.empty:
+        # 市場已更新但追蹤分點當日可能沒有符合候選的交易；不刪除 FinMind 既有列。
+        _MONEYDJ_TARGET_DATE_OK = True
+        print(
+            f"  ℹ️ MoneyDJ 已更新到 {target_key}，但追蹤分點沒有可疊加資料；"
+            "沿用 FinMind 完整歷史。"
+        )
+        return baseline, {
+            "accepted": True,
+            "reason": "no_tracked_rows",
+            "target_date": target_key,
+            "row_count": 0,
+        }
+
+    latest_day_df["日期"] = latest_day_df["日期"].map(normalize_date_str)
+    latest_day_df = latest_day_df[latest_day_df["日期"] == target_key].copy()
+    latest_day_df = latest_day_df.drop_duplicates(
+        subset=["權證代號", "券商代號", "日期"],
+        keep="last",
+    )
+
+    if baseline is None or baseline.empty:
+        combined = latest_day_df.copy()
+    else:
+        combined = pd.concat([baseline.copy(), latest_day_df], ignore_index=True)
+
+    for col in ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]:
+        if col in combined.columns:
+            combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype("int64")
+
+    combined["日期"] = combined["日期"].map(normalize_date_str)
+    combined = combined.drop_duplicates(
+        subset=["權證代號", "券商代號", "日期"],
+        keep="last",
+    )
+    combined = combined.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
+    combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
+    combined = save_history_cache(
+        combined,
+        fetched_items=fetched_items,
+        previous_history_empty=baseline is None or baseline.empty,
+    )
+
+    _MONEYDJ_TARGET_DATE_OK = True
+    print(
+        f"  ✅ repair MoneyDJ 最新日疊加完成：{target_key}｜"
+        f"新增／更新 {len(latest_day_df):,} 列｜完整歷史合計 {len(combined):,} 列"
+    )
+    if identity_stats.get("rows", 0) > 0:
+        print(
+            f"  🧭 疊加後身分修正：{identity_stats['rows']:,} 列｜"
+            f"權證名稱 {identity_stats['warrant_name']:,}｜"
+            f"標的股 {identity_stats['underlying_code']:,}｜"
+            f"標的名稱 {identity_stats['underlying_name']:,}"
+        )
+
+    return combined, {
+        "accepted": True,
+        "reason": "ok",
+        "target_date": target_key,
+        "row_count": int(len(latest_day_df)),
+    }
+
+
+def evaluate_finmind_repair_source_completeness(broker_map):
+    """repair 使用 FinMind 全市場日檔時的完整性判斷，不套用 MoneyDJ 候選成功率。"""
+    reasons = []
+    if not LIVE_WARRANT_SNAPSHOT_READY:
+        reasons.append("FinMind 權證清單與標的對照未完整取得")
+
+    active_labels = set(TARGET_PATTERNS.keys())
+    missing_brokers = sorted(active_labels - set((broker_map or {}).keys()))
+    if missing_brokers:
+        reasons.append(f"追蹤分點代號不完整：缺少 {len(missing_brokers)} 個")
+
+    if not _FINMIND_TARGET_DATE_OK:
+        reasons.append(f"FinMind 目標交易日 {_FINMIND_TARGET_DATE or '-'} 全市場日檔未完整取得")
+
+    return not reasons, reasons
+
+
+def evaluate_finmind_repair_window_completeness(target_date):
+    """驗證最近 N 個官方交易日是否全部已成功下載；避免半套 repair 覆蓋勝率表。"""
+    if not FINMIND_REPAIR_STRICT_HISTORY_WINDOW:
+        return True, []
+
+    target_dt = parse_date(target_date) or datetime.today()
+    official_dates = [
+        day for day in get_finmind_trading_dates()
+        if day <= target_dt.date()
+    ]
+    expected_dates = {
+        day.strftime("%Y/%m/%d")
+        for day in official_dates[-HISTORY_RETENTION_TRADING_DAYS:]
+    }
+    if not expected_dates:
+        return False, ["FinMind 官方交易日清單為空，無法驗證 repair 歷史窗口"]
+
+    state = _load_finmind_state()
+    completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
+    failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+
+    missing_dates = sorted(expected_dates - completed_dates)
+    failed_in_window = sorted(expected_dates & failed_dates)
+    reasons = []
+    if missing_dates:
+        sample = ",".join(missing_dates[:10])
+        suffix = "..." if len(missing_dates) > 10 else ""
+        reasons.append(
+            f"FinMind 最近 {len(expected_dates)} 個交易日仍缺少 {len(missing_dates)} 日：{sample}{suffix}"
+        )
+    if failed_in_window:
+        sample = ",".join(failed_in_window[:10])
+        suffix = "..." if len(failed_in_window) > 10 else ""
+        reasons.append(
+            f"FinMind repair 窗口仍有 {len(failed_in_window)} 個失敗日待重試：{sample}{suffix}"
+        )
+
+    return not reasons, reasons
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 空結果安全同步判斷
 # ══════════════════════════════════════════════════════════════════════
@@ -18082,6 +18545,7 @@ def evaluate_empty_result_source_completeness(
 
 def main():
     global _PRICE_PLAN_MAX_PUBLISHED_DATE
+    global FORCE_FULL_CACHE_REFRESH
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
     configure_run_mode()
@@ -18090,12 +18554,21 @@ def main():
     output_run_stamp = datetime.today().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_MONEYDJ_ABCDE_{output_run_stamp}.xlsx")
 
-    print(f"\n認購權證特定分點買超回測 ABCDE MoneyDJ V10.1 | {today_fn}")
-    print("資料來源：MoneyDJ API4／API5（分點資料）＋官方權證／行情來源")
+    print(f"\n認購權證特定分點買超回測 ABCDE Hybrid V10.1 | {today_fn}")
+    if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED:
+        print("資料來源：repair=FinMind 近200交易日完整歷史＋MoneyDJ 最新交易日疊加")
+    else:
+        print("資料來源：daily=MoneyDJ API4／API5（分點資料）＋官方權證／行情來源")
     print("新制分類：同一分點 × 同一標的 × 同一天 = 1 筆事件")
     print(f"程式版本：{PROGRAM_BUILD_ID}")
     print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}")
     print("=" * 70)
+
+    if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED and not FINMIND_TOKEN:
+        raise RuntimeError(
+            "repair 完整歷史模式需要 FINMIND_API_0714；"
+            "未設定時禁止退回 MoneyDJ 候選歷史，以免勝率統計樣本數不足。"
+        )
 
     warrants = get_all_call_warrants()
     if not warrants:
@@ -18111,22 +18584,143 @@ def main():
         run_longterm_workflow(warrants, broker_map, output_path, program_start)
         return
 
-    target_date = resolve_latest_trading_date_on_or_before(datetime.today())
-    print(f"  ✅ 本次實際目標交易日：{target_date}")
-    _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(target_date)
-    print(f"  ✅ 價格批次最晚已發布基準日：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
-
+    market_target_date = resolve_latest_trading_date_on_or_before(datetime.today())
     history_cache_df = load_history_cache()
-    history_cache_df = refresh_history_from_moneydj(warrants, broker_map, history_cache_df, target_date)
 
-    source_complete, source_reasons = evaluate_empty_result_source_completeness(
-        broker_map, history_cache_df=history_cache_df, allow_empty_candidates=True
-    )
-    if not source_complete:
-        print("  ⚠️ MoneyDJ 來源完整性未確認，本次停止，不修改 Google Sheet。")
-        for reason in source_reasons:
-            print(f"    - {reason}")
-        return
+    if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED:
+        print("【Step 3】repair 完整歷史重建：FinMind 全市場日檔為主，MoneyDJ 僅補最新日...")
+        requested_finmind_target = latest_finmind_trading_date_on_or_before(market_target_date)
+        print(
+            f"  ✅ MoneyDJ 市場目標日：{market_target_date}｜"
+            f"FinMind 要求基準日：{requested_finmind_target}"
+        )
+
+        requested_raw, requested_status = download_finmind_warrant_day(
+            requested_finmind_target,
+            force_refresh=FINMIND_FORCE_REFRESH_TARGET_DATE,
+        )
+        finmind_target_date, finmind_target_raw, finmind_target_status, used_target_fallback = resolve_finmind_refresh_target(
+            requested_finmind_target,
+            preloaded_raw=requested_raw,
+            preloaded_status=requested_status,
+        )
+
+        if finmind_target_status != "ok":
+            print(
+                f"  ⚠️ repair 找不到可用的 FinMind 全市場權證分點日檔："
+                f"要求日={requested_finmind_target}｜status={finmind_target_status}。"
+                "為避免再次產生低樣本勝率，本次停止且不修改 Google Sheet。"
+            )
+            return
+
+        if used_target_fallback:
+            print(
+                f"  🔧 FinMind 完整歷史基準日回退：{finmind_target_date}｜"
+                f"原要求日 {requested_finmind_target} 尚未發布。"
+            )
+        else:
+            print(f"  ✅ FinMind 完整歷史基準日：{finmind_target_date}")
+
+        _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(finmind_target_date)
+
+        finmind_state_before = _load_finmind_state()
+        history_source_before = str(
+            finmind_state_before.get("history_source_id", "") or ""
+        ).strip()
+        source_migration_required = history_source_before != FINMIND_REPAIR_HISTORY_SOURCE_ID
+        original_force_full = FORCE_FULL_CACHE_REFRESH
+        if source_migration_required:
+            print(
+                "  ♻️ 偵測到目前分點歷史不是 FinMind 全市場完整來源，"
+                f"本次強制重建最近 {HISTORY_RETENTION_TRADING_DAYS} 個交易日；"
+                "完成後才會寫入新的來源標記。"
+            )
+            FORCE_FULL_CACHE_REFRESH = True
+
+        try:
+            history_cache_df, finmind_refresh_status = refresh_history_from_finmind(
+                warrants,
+                broker_map,
+                history_cache_df,
+                finmind_target_date,
+                preloaded_target_df=finmind_target_raw,
+            )
+        finally:
+            FORCE_FULL_CACHE_REFRESH = original_force_full
+
+        if source_migration_required and finmind_refresh_status.get("target_status") == "ok":
+            finmind_state_after = _load_finmind_state()
+            finmind_state_after["history_source_id"] = FINMIND_REPAIR_HISTORY_SOURCE_ID
+            finmind_state_after["history_source_verified_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+            finmind_state_after["history_source_row_count"] = int(len(history_cache_df)) if history_cache_df is not None else 0
+            _save_finmind_state(finmind_state_after)
+            print(
+                f"  ✅ FinMind 完整歷史來源標記已建立：{FINMIND_REPAIR_HISTORY_SOURCE_ID}｜"
+                f"歷史 {len(history_cache_df):,} 列｜"
+                f"待重試日期 {len(finmind_refresh_status.get('failed_dates', [])):,} 日"
+            )
+
+        source_complete, source_reasons = evaluate_finmind_repair_source_completeness(broker_map)
+        window_complete, window_reasons = evaluate_finmind_repair_window_completeness(finmind_target_date)
+        source_reasons.extend(window_reasons)
+        if not source_complete or not window_complete:
+            print("  ⚠️ FinMind repair 來源／歷史窗口尚未完整，本次停止，不修改 Google Sheet。")
+            for reason in source_reasons:
+                print(f"    - {reason}")
+            print("  ℹ️ 已成功下載的日期與本機快取會保留；下次 repair 只補缺少日／失敗日。")
+            return
+
+        print(
+            f"  ✅ FinMind repair 歷史窗口驗證完成：最近 "
+            f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日均已完成。"
+        )
+        target_date = normalize_date_str(finmind_target_date)
+        if MONEYDJ_REPAIR_LATEST_DAY_OVERLAY_ENABLED:
+            history_cache_df, overlay_status = overlay_latest_day_from_moneydj(
+                warrants,
+                broker_map,
+                history_cache_df,
+                market_target_date,
+            )
+            if overlay_status.get("accepted"):
+                target_date = normalize_date_str(market_target_date)
+            else:
+                print(
+                    f"  ℹ️ repair 最新日疊加未採用（{overlay_status.get('reason', '-') }），"
+                    f"報表統計日維持 FinMind 基準日 {target_date}。"
+                )
+        else:
+            print("  ℹ️ 已停用 repair MoneyDJ 最新日疊加，報表完全使用 FinMind 完整歷史。")
+
+        _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(target_date)
+        print(
+            f"  ✅ repair 最終報表統計日：{target_date}｜"
+            f"完整歷史 {len(history_cache_df):,} 列｜"
+            f"價格批次最晚基準日 {_PRICE_PLAN_MAX_PUBLISHED_DATE}"
+        )
+    else:
+        target_date = normalize_date_str(market_target_date)
+        print(f"  ✅ 本次實際目標交易日：{target_date}")
+        _PRICE_PLAN_MAX_PUBLISHED_DATE = target_date
+        print(f"  ✅ 價格批次最晚已發布基準日：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
+
+        history_cache_df = refresh_history_from_moneydj(
+            warrants,
+            broker_map,
+            history_cache_df,
+            target_date,
+        )
+
+        source_complete, source_reasons = evaluate_empty_result_source_completeness(
+            broker_map,
+            history_cache_df=history_cache_df,
+            allow_empty_candidates=True,
+        )
+        if not source_complete:
+            print("  ⚠️ MoneyDJ 來源完整性未確認，本次停止，不修改 Google Sheet。")
+            for reason in source_reasons:
+                print(f"    - {reason}")
+            return
 
     items = items_from_history_cache(history_cache_df)
     item_map = {(item["broker_code"], item["warrant_code"]): item for item in items}
@@ -18167,7 +18761,8 @@ def main():
             sa, sb, sc, sd, se, selected_item_map, price_cache,
             data_scope="精選五分點", allow_price_fetch=False,
         )
-        print(f"  ✅ 已從同一份 MoneyDJ 歷史資料切出精選五分點：{len(selected_items):,} 組，不重抓 API。")
+        history_source_label = "FinMind完整歷史＋MoneyDJ最新日" if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED else "MoneyDJ歷史"
+        print(f"  ✅ 已從同一份{history_source_label}切出精選五分點：{len(selected_items):,} 組，不重抓 API。")
 
     if all_changed_price_codes:
         save_price_cache(persistent_price_cache, changed_codes=all_changed_price_codes)
@@ -18207,7 +18802,7 @@ def main():
 
     elapsed = time.time() - program_start
     print(f"\n{'=' * 70}")
-    print("✅ MoneyDJ V10.1 完成！")
+    print("✅ Hybrid V10.1 完成！")
     print(f"📄 {output_path}")
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
 
