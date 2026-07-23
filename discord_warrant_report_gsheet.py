@@ -3549,12 +3549,12 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
             va="center",
         )
 
-        # 中文事件名稱維持較大字級，但改用一般字重，避免粗體筆畫擠在一起。
+        # 中文事件名稱維持一般字重，顏色統一使用其他標題文字相同的 NAVY 深藍色。
         desc_size = 11.8
         desc_x = badge_x + badge_w + 0.10
         desc_w = max(0.35, legend_slot_w - (desc_x - lx) - 0.08)
         desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=FONT)
-        text(desc_x, legend_y + event_legend_h / 2, desc_text, desc_size, NAVY2, FONT)
+        text(desc_x, legend_y + event_legend_h / 2, desc_text, desc_size, NAVY, FONT)
 
     # footer
     y -= event_legend_h
@@ -3861,12 +3861,12 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             va="center",
         )
 
-        # 中文事件名稱維持較大、深藍色，但改用一般字重，讓筆畫更清楚。
+        # 中文事件名稱維持一般字重，顏色統一使用其他標題文字相同的 NAVY 深藍色。
         desc_size = 11.8
         desc_x = badge_x + badge_w + 0.10
         desc_w = max(0.30, legend_slot_w - (desc_x - lx) - 0.08)
         desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=FONT)
-        text(desc_x, legend_y + legend_h / 2, desc_text, desc_size, NAVY2, FONT)
+        text(desc_x, legend_y + legend_h / 2, desc_text, desc_size, NAVY, FONT)
 
     y = legend_y - gap
 
