@@ -3530,10 +3530,31 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
     for idx, (code_name, desc) in enumerate(legend_items):
         lx = legend_start_x + idx * legend_slot_w
-        rounded(lx, legend_y + 0.10, 0.38, 0.30, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.19, legend_y + event_legend_h / 2, code_name, 9.6, WHITE, BOLD, ha="center")
-        desc_text = fit_to_cell_width(desc, max(0.35, legend_slot_w - 0.52), size=11, fp=FONT)
-        text(lx + 0.40, legend_y + event_legend_h / 2, desc_text, 9.6, TEXT, FONT)
+
+        # A～E 代號使用較精簡的深藍徽章，並以徽章本身的中心點定位，
+        # 避免放大方框後英文字母看起來偏小、上下左右不置中。
+        badge_w = 0.32
+        badge_h = 0.25
+        badge_x = lx
+        badge_y = legend_y + (event_legend_h - badge_h) / 2
+        rounded(badge_x, badge_y, badge_w, badge_h, fc="#334155", ec="#334155", lw=0.8, r=0.06)
+        text(
+            badge_x + badge_w / 2,
+            badge_y + badge_h / 2,
+            code_name,
+            11.0,
+            WHITE,
+            BOLD,
+            ha="center",
+            va="center",
+        )
+
+        # 中文事件名稱改用較大的粗體深藍字，讓辨識度接近「事件代號說明」。
+        desc_size = 11.8
+        desc_x = badge_x + badge_w + 0.10
+        desc_w = max(0.35, legend_slot_w - (desc_x - lx) - 0.08)
+        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=BOLD)
+        text(desc_x, legend_y + event_legend_h / 2, desc_text, desc_size, NAVY2, BOLD)
 
     # footer
     y -= event_legend_h
@@ -3822,10 +3843,30 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     legend_slot_w = (margin_x + content_w - legend_start_x - 0.10) / max(len(legend_items), 1)
     for idx, (code_name, desc) in enumerate(legend_items):
         lx = legend_start_x + idx * legend_slot_w
-        rounded(lx, legend_y + 0.10, 0.38, 0.30, fc="#334155", ec="#334155", lw=0.8, r=0.07)
-        text(lx + 0.19, legend_y + legend_h / 2, code_name, 9.4, WHITE, BOLD, ha="center")
-        desc_text = fit_to_cell_width(desc, max(0.30, legend_slot_w - 0.44), size=11, fp=FONT)
-        text(lx + 0.46, legend_y + legend_h / 2, desc_text, 11, TEXT, FONT)
+
+        # A～E 徽章縮回精簡比例，英文字母放大並以徽章中心精準置中。
+        badge_w = 0.32
+        badge_h = 0.25
+        badge_x = lx
+        badge_y = legend_y + (legend_h - badge_h) / 2
+        rounded(badge_x, badge_y, badge_w, badge_h, fc="#334155", ec="#334155", lw=0.8, r=0.06)
+        text(
+            badge_x + badge_w / 2,
+            badge_y + badge_h / 2,
+            code_name,
+            11.0,
+            WHITE,
+            BOLD,
+            ha="center",
+            va="center",
+        )
+
+        # 中文事件名稱改為較大、粗體、深藍色，維持清楚且不壓縮代號徽章。
+        desc_size = 11.8
+        desc_x = badge_x + badge_w + 0.10
+        desc_w = max(0.30, legend_slot_w - (desc_x - lx) - 0.08)
+        desc_text = fit_to_cell_width(desc, desc_w, size=desc_size, fp=BOLD)
+        text(desc_x, legend_y + legend_h / 2, desc_text, desc_size, NAVY2, BOLD)
 
     y = legend_y - gap
 
