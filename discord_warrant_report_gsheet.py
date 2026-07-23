@@ -3836,7 +3836,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
     headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    col_w = [0.70, 2.15, 1.45, 0.65, 0.85, 6.40]
+    col_w = [0.70, 2.15, 1.45, 0.65, 1.35, 5.90]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
