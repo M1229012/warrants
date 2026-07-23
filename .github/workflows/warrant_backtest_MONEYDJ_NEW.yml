@@ -35,6 +35,7 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
       PYTHON_FILE: warrant_backtest_moneydj.py
+      FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
 
       # ============================================================
       # MoneyDJ 資料來源
