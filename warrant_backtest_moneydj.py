@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-HISTORY-MONEYDJ-LATEST-REPAIR-FIX-20260723"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-BACKFILL-REPAIR-FIX-20260723"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -198,6 +198,20 @@ FINMIND_REPAIR_HISTORY_SOURCE_ID = os.getenv(
 FINMIND_REPAIR_STRICT_HISTORY_WINDOW = os.getenv(
     "FINMIND_REPAIR_STRICT_HISTORY_WINDOW", "1"
 ).strip().lower() not in ("0", "false", "no")
+# repair 採「成功交易日補足制」：固定窗口內某一天缺檔時，不讓整個修補流程作廢，
+# 而是繼續往前抓較早交易日，直到累積 HISTORY_RETENTION_TRADING_DAYS 個
+# 已由 FinMind 全市場日檔驗證成功的交易日。失敗日仍保留待重試，但不阻擋已補足的報表。
+FINMIND_REPAIR_SUCCESS_DAY_BACKFILL_ENABLED = os.getenv(
+    "FINMIND_REPAIR_SUCCESS_DAY_BACKFILL_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT = max(
+    int(os.getenv("FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT", "30")),
+    1,
+)
+FINMIND_REPAIR_SUCCESS_DAY_BATCH_SIZE = max(
+    int(os.getenv("FINMIND_REPAIR_SUCCESS_DAY_BATCH_SIZE", "6")),
+    1,
+)
 FINMIND_RAW_DAILY_RETENTION_DAYS = max(int(os.getenv("FINMIND_RAW_DAILY_RETENTION_DAYS", "7")), 1)
 # 完整修補模式不可因最新交易日資料尚未發布而提前結束。
 # repair 會往前探測最近已發布的全市場權證分點日檔，並以該日作為修補基準日；
@@ -8922,6 +8936,7 @@ def _load_finmind_state():
                 if isinstance(payload, dict):
                     payload.setdefault("completed_dates", [])
                     payload.setdefault("failed_dates", [])
+                    payload.setdefault("full_market_completed_dates", [])
                     return payload
     except Exception as exc:
         print(f"  ⚠️ FinMind 狀態檔讀取失敗：{type(exc).__name__}: {exc}")
@@ -8929,6 +8944,7 @@ def _load_finmind_state():
         "schema_version": "",
         "completed_dates": [],
         "failed_dates": [],
+        "full_market_completed_dates": [],
     }
 
 
@@ -9002,14 +9018,16 @@ def _run_finmind_refresh_dates(
     force_full=False,
     completed_dates=None,
     failed_dates=None,
+    full_market_completed_dates=None,
 ):
     """
-    決定本輪真正需要下載的FinMind交易日。
+    決定本輪真正需要下載的 FinMind 交易日。
 
     daily／longterm：維持最近 DAILY_UPDATE_DAYS 日重新確認，並加入過去失敗日。
-    repair：以最近 INITIAL_HISTORY_DAYS 日為完整性窗口，但只下載歷史快取／state尚未完成的日期、
-            過去失敗日與本次目標日，不再每輪無條件重抓200日。
-    強制重建或歷史快取不存在時：才下載完整保留窗口。
+    repair：只把「已由 FinMind 全市場日檔成功驗證」的日期視為完成；
+            舊 MoneyDJ 候選歷史即使日期存在，也不能跳過 FinMind 下載。
+    強制重建或歷史快取不存在時：先抓最近保留窗口；若其中有缺檔，
+            後續由成功交易日補足函式往前補到完整 N 個成功日。
     """
     trading_dates = get_finmind_trading_dates()
     target_dt = parse_date(target_date) or datetime.today()
@@ -9026,16 +9044,22 @@ def _run_finmind_refresh_dates(
 
     completed_keys = _normalize_finmind_state_dates(completed_dates)
     failed_keys = _normalize_finmind_state_dates(failed_dates)
+    verified_full_market_keys = _normalize_finmind_state_dates(full_market_completed_dates)
 
     history_keys = set()
     if history_df is not None and not history_df.empty and "日期" in history_df.columns:
         history_keys = _normalize_finmind_state_dates(history_df["日期"].tolist())
 
-    available_keys = completed_keys | history_keys
+    # repair 只能信任全市場成功驗證日；daily／longterm 才可沿用一般歷史日期。
+    available_keys = (
+        verified_full_market_keys
+        if workflow_is_repair()
+        else (completed_keys | history_keys)
+    )
     repair_window = eligible[-repair_count:]
     repair_window_keys = {d.strftime("%Y/%m/%d") for d in repair_window}
 
-    # failed_dates只保留仍落在目前200日保留窗口內的日期，避免永久追逐已超期資料。
+    # 失敗日只保留目前窗口與目標日，避免永久追逐早已超期的日期。
     failed_keys &= repair_window_keys | {target_dt.strftime("%Y/%m/%d")}
 
     history_empty = history_df is None or history_df.empty
@@ -9055,7 +9079,6 @@ def _run_finmind_refresh_dates(
             if parse_date(date_key)
         }
     else:
-        # daily／longterm保留原本最近數日重新確認的行為。
         selected_days = set(eligible[-recent_count:]) | {
             parse_date(date_key).date()
             for date_key in failed_keys
@@ -9066,7 +9089,14 @@ def _run_finmind_refresh_dates(
     return [d.strftime("%Y/%m/%d") for d in sorted(selected_days)]
 
 
-def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, preloaded_target_df=None):
+def refresh_history_from_finmind(
+    warrants,
+    broker_map,
+    history_df,
+    target_date,
+    preloaded_target_df=None,
+    reset_full_market_verified=False,
+):
     global _FINMIND_TARGET_DATE_OK, _FINMIND_TARGET_DATE
 
     state_file_exists = os.path.exists(FINMIND_STATE_PATH)
@@ -9074,6 +9104,27 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     state_schema = str(state.get("schema_version", "") or "").strip()
     state_completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
     state_failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+    state_full_market_completed_dates = _normalize_finmind_state_dates(
+        state.get("full_market_completed_dates", [])
+    )
+
+    # 相容已執行過上一版 hybrid repair 的狀態檔：上一版雖未建立專用欄位，
+    # 但 last_refresh_success_dates 就是該輪確實成功下載的全市場日檔。
+    if (
+        not state_full_market_completed_dates
+        and str(state.get("history_source_id", "") or "").strip() == FINMIND_REPAIR_HISTORY_SOURCE_ID
+    ):
+        state_full_market_completed_dates.update(
+            _normalize_finmind_state_dates(state.get("last_refresh_success_dates", []))
+        )
+        if state_full_market_completed_dates:
+            print(
+                "  🔧 已從上一版 hybrid 狀態接管 FinMind 全市場成功日："
+                f"{len(state_full_market_completed_dates):,} 日"
+            )
+
+    if reset_full_market_verified:
+        state_full_market_completed_dates = set()
 
     history_compatible, history_reason, history_dates = _history_cache_compatibility(history_df)
     explicit_force_full = bool(FORCE_FULL_CACHE_REFRESH)
@@ -9113,6 +9164,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
         force_full=full_rebuild_required or explicit_force_full,
         completed_dates=state_completed_dates,
         failed_dates=state_failed_dates,
+        full_market_completed_dates=state_full_market_completed_dates,
     )
     target_key = normalize_date_str(target_date)
     previous_empty = history_df is None or history_df.empty
@@ -9133,6 +9185,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     print(
         "  🧭 FinMind刷新計畫："
         f"completed_dates={len(state_completed_dates):,}日｜"
+        f"全市場成功日={len(state_full_market_completed_dates):,}日｜"
         f"failed_dates={len(state_failed_dates):,}日｜"
         f"本次需下載={len(refresh_dates):,}日｜"
         f"模式={WORKFLOW_MODE}"
@@ -9143,8 +9196,11 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     # 下一輪只重試這些日期，不會因狀態遺失重新下載200日。
     planned_retry_dates = state_failed_dates | set(refresh_dates)
     state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
-    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
-    state["failed_dates"] = sorted(planned_retry_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
+    state["full_market_completed_dates"] = sorted(state_full_market_completed_dates)[
+        -max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):
+    ]
+    state["failed_dates"] = sorted(planned_retry_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
     state["refresh_in_progress_dates"] = list(refresh_dates)
     state["last_refresh_started_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
     _save_finmind_state(state)
@@ -9191,6 +9247,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
 
             normalized_by_date[result_date] = normalized
             completed_dates.add(result_date)
+            state_full_market_completed_dates.add(result_date)
             success_dates.append(result_date)
             print(
                 f"  ✅ {result_date}：市場原始 {len(raw):,} 列｜"
@@ -9223,8 +9280,11 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     )
 
     state["schema_version"] = FINMIND_CACHE_SCHEMA_VERSION
-    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
-    state["failed_dates"] = sorted(remaining_failed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 2, 400):]
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
+    state["full_market_completed_dates"] = sorted(state_full_market_completed_dates)[
+        -max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):
+    ]
+    state["failed_dates"] = sorted(remaining_failed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
     state["refresh_in_progress_dates"] = []
     state["last_refresh_requested_dates"] = list(refresh_dates)
     state["last_refresh_success_dates"] = sorted(success_dates)
@@ -9243,6 +9303,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
     print(
         "  ✅ FinMind快取狀態已保存："
         f"completed_dates={len(state['completed_dates']):,}日｜"
+        f"全市場成功日={len(state['full_market_completed_dates']):,}日｜"
         f"failed_dates={len(state['failed_dates']):,}日｜"
         f"schema={state['schema_version']}"
     )
@@ -9251,6 +9312,7 @@ def refresh_history_from_finmind(warrants, broker_map, history_df, target_date, 
         "target_status": target_status,
         "success_dates": success_dates,
         "failed_dates": failed_dates,
+        "full_market_completed_dates": sorted(state_full_market_completed_dates),
         "schema_reset": full_rebuild_required,
     }
 
@@ -18453,6 +18515,211 @@ def overlay_latest_day_from_moneydj(warrants, broker_map, history_df, target_dat
     }
 
 
+
+def _finmind_verified_full_market_dates(state=None, target_date=None):
+    """讀取確實由 FinMind 全市場日檔成功驗證的日期；不把 MoneyDJ 歷史日期混入。"""
+    state = state or _load_finmind_state()
+    verified = _normalize_finmind_state_dates(state.get("full_market_completed_dates", []))
+
+    # 舊 hybrid v1 狀態相容：該欄尚不存在時，上一輪成功下載清單可安全接管。
+    if not verified and str(state.get("history_source_id", "") or "").strip() == FINMIND_REPAIR_HISTORY_SOURCE_ID:
+        verified.update(_normalize_finmind_state_dates(state.get("last_refresh_success_dates", [])))
+
+    target_dt = parse_date(target_date) if target_date else None
+    if target_dt:
+        verified = {
+            date_key
+            for date_key in verified
+            if parse_date(date_key) and parse_date(date_key).date() <= target_dt.date()
+        }
+    return verified
+
+
+def ensure_finmind_successful_history_window(
+    warrants,
+    broker_map,
+    history_df,
+    target_date,
+    recently_failed_dates=None,
+):
+    """
+    repair 成功交易日補足制。
+
+    固定最近 200 個官方交易日中若有單日缺檔，例如 2026/07/10，
+    該日保留在 failed_dates 等待未來重試，但本輪會繼續往前抓較早交易日，
+    直到累積 200 個 FinMind 全市場日檔成功日，才交給勝率統計與 Google Sheet。
+    """
+    state = _load_finmind_state()
+    target_dt = parse_date(target_date) or datetime.today()
+    target_key = target_dt.strftime("%Y/%m/%d")
+    verified = _finmind_verified_full_market_dates(state, target_key)
+    failed_this_run = _normalize_finmind_state_dates(recently_failed_dates)
+    attempted = set()
+    successful_backfill_dates = []
+    failed_backfill_dates = []
+
+    official_dates = [
+        day for day in get_finmind_trading_dates()
+        if day <= target_dt.date()
+    ]
+    if not official_dates:
+        return history_df, {
+            "complete": False,
+            "verified_count": len(verified),
+            "success_dates": [],
+            "failed_dates": [],
+            "reason": "FinMind 官方交易日清單為空",
+        }
+
+    required_count = HISTORY_RETENTION_TRADING_DAYS
+    current_verified = {
+        date_key for date_key in verified
+        if parse_date(date_key) and parse_date(date_key).date() <= target_dt.date()
+    }
+
+    if len(current_verified) >= required_count:
+        return history_df, {
+            "complete": True,
+            "verified_count": len(current_verified),
+            "success_dates": [],
+            "failed_dates": [],
+            "reason": "already-complete",
+        }
+
+    if not FINMIND_REPAIR_SUCCESS_DAY_BACKFILL_ENABLED:
+        return history_df, {
+            "complete": False,
+            "verified_count": len(current_verified),
+            "success_dates": [],
+            "failed_dates": [],
+            "reason": "成功交易日補足功能已停用",
+        }
+
+    print(
+        f"  🔧 FinMind 成功交易日補足：目前 {len(current_verified):,}/"
+        f"{required_count:,} 日｜本輪失敗日不阻擋，改往前補較早交易日"
+    )
+
+    extra_attempts = 0
+    combined = history_df.copy() if history_df is not None else pd.DataFrame()
+    while len(current_verified) < required_count and extra_attempts < FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT:
+        needed = required_count - len(current_verified)
+        candidates = []
+        for day in reversed(official_dates):
+            date_key = day.strftime("%Y/%m/%d")
+            if date_key in current_verified or date_key in failed_this_run or date_key in attempted:
+                continue
+            candidates.append(date_key)
+            if len(candidates) >= min(
+                FINMIND_REPAIR_SUCCESS_DAY_BATCH_SIZE,
+                needed,
+                FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT - extra_attempts,
+            ):
+                break
+
+        if not candidates:
+            break
+
+        print(
+            f"  🧩 往前補抓 {len(candidates):,} 個候選交易日："
+            f"{candidates[-1]} ～ {candidates[0]}"
+        )
+        normalized_by_date = {}
+
+        def load_one(date_key):
+            raw, status = download_finmind_warrant_day(date_key, force_refresh=False)
+            normalized = (
+                normalize_finmind_warrant_day(raw, warrants, broker_map, date_key)
+                if status == "ok"
+                else pd.DataFrame()
+            )
+            return date_key, raw, normalized, status
+
+        max_workers = min(FINMIND_HISTORY_WORKERS, max(len(candidates), 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(load_one, date_key): date_key for date_key in candidates}
+            for future in as_completed(futures):
+                requested_key = futures[future]
+                attempted.add(requested_key)
+                extra_attempts += 1
+                try:
+                    result_date, raw, normalized, status = future.result()
+                except Exception as exc:
+                    failed_backfill_dates.append(requested_key)
+                    print(
+                        f"  ⚠️ FinMind 補足日處理失敗：{requested_key}｜"
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+
+                if status != "ok":
+                    failed_backfill_dates.append(result_date)
+                    print(f"  ⚠️ FinMind 補足日無資料：{result_date}｜status={status}")
+                    continue
+
+                normalized_by_date[result_date] = normalized
+                current_verified.add(result_date)
+                verified.add(result_date)
+                successful_backfill_dates.append(result_date)
+                print(
+                    f"  ✅ FinMind 補足成功：{result_date}｜"
+                    f"市場原始 {len(raw):,} 列｜追蹤分點彙總 {len(normalized):,} 列｜"
+                    f"成功日 {len(current_verified):,}/{required_count:,}"
+                )
+
+        if normalized_by_date:
+            combined = _merge_complete_finmind_days(combined, normalized_by_date, broker_map)
+
+    if successful_backfill_dates:
+        combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
+        if identity_stats.get("rows", 0) > 0:
+            print(
+                f"  🧭 補足後歷史身分配對修正：{identity_stats['rows']:,} 列｜"
+                f"權證名稱 {identity_stats['warrant_name']:,}｜"
+                f"標的股 {identity_stats['underlying_code']:,}｜"
+                f"標的名稱 {identity_stats['underlying_name']:,}"
+            )
+        combined = save_history_cache(combined, fetched_items=None, previous_history_empty=False)
+
+    state = _load_finmind_state()
+    completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
+    completed_dates.update(successful_backfill_dates)
+    failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+    failed_dates.update(failed_backfill_dates)
+    failed_dates.difference_update(successful_backfill_dates)
+
+    state["completed_dates"] = sorted(completed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
+    state["full_market_completed_dates"] = sorted(verified)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
+    state["failed_dates"] = sorted(failed_dates)[-max(HISTORY_RETENTION_TRADING_DAYS * 3, 600):]
+    state["last_success_day_backfill_success_dates"] = sorted(successful_backfill_dates)
+    state["last_success_day_backfill_failed_dates"] = sorted(failed_backfill_dates)
+    state["last_success_day_backfill_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+    state["success_window_target_date"] = target_key
+    state["success_window_verified_count"] = len(current_verified)
+    _save_finmind_state(state)
+
+    complete = len(current_verified) >= required_count
+    if complete:
+        selected_window = sorted(current_verified)[-required_count:]
+        print(
+            f"  ✅ FinMind 成功交易日已補足：{required_count:,} 日｜"
+            f"窗口 {selected_window[0]} ～ {selected_window[-1]}｜"
+            f"本次額外成功 {len(successful_backfill_dates):,} 日"
+        )
+    else:
+        print(
+            f"  ⚠️ FinMind 成功交易日仍不足：{len(current_verified):,}/"
+            f"{required_count:,} 日｜額外嘗試 {extra_attempts:,} 日"
+        )
+
+    return combined, {
+        "complete": complete,
+        "verified_count": len(current_verified),
+        "success_dates": sorted(successful_backfill_dates),
+        "failed_dates": sorted(failed_backfill_dates),
+        "reason": "ok" if complete else "成功交易日不足",
+    }
+
 def evaluate_finmind_repair_source_completeness(broker_map):
     """repair 使用 FinMind 全市場日檔時的完整性判斷，不套用 MoneyDJ 候選成功率。"""
     reasons = []
@@ -18471,43 +18738,53 @@ def evaluate_finmind_repair_source_completeness(broker_map):
 
 
 def evaluate_finmind_repair_window_completeness(target_date):
-    """驗證最近 N 個官方交易日是否全部已成功下載；避免半套 repair 覆蓋勝率表。"""
+    """
+    驗證是否已有最近 N 個「FinMind 全市場成功日」。
+
+    不再要求固定官方窗口每一天都成功；單日缺檔會保留待重試，
+    但只要已往前補足 N 個成功交易日，就允許 repair 產生報表與更新 Google Sheet。
+    """
     if not FINMIND_REPAIR_STRICT_HISTORY_WINDOW:
         return True, []
 
     target_dt = parse_date(target_date) or datetime.today()
-    official_dates = [
-        day for day in get_finmind_trading_dates()
-        if day <= target_dt.date()
-    ]
-    expected_dates = {
-        day.strftime("%Y/%m/%d")
-        for day in official_dates[-HISTORY_RETENTION_TRADING_DAYS:]
-    }
-    if not expected_dates:
-        return False, ["FinMind 官方交易日清單為空，無法驗證 repair 歷史窗口"]
-
     state = _load_finmind_state()
-    completed_dates = _normalize_finmind_state_dates(state.get("completed_dates", []))
-    failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+    verified_dates = _finmind_verified_full_market_dates(state, target_dt)
+    verified_dates = {
+        date_key
+        for date_key in verified_dates
+        if parse_date(date_key) and parse_date(date_key).date() <= target_dt.date()
+    }
 
-    missing_dates = sorted(expected_dates - completed_dates)
-    failed_in_window = sorted(expected_dates & failed_dates)
+    required_count = HISTORY_RETENTION_TRADING_DAYS
     reasons = []
-    if missing_dates:
-        sample = ",".join(missing_dates[:10])
-        suffix = "..." if len(missing_dates) > 10 else ""
+    if len(verified_dates) < required_count:
         reasons.append(
-            f"FinMind 最近 {len(expected_dates)} 個交易日仍缺少 {len(missing_dates)} 日：{sample}{suffix}"
+            f"FinMind 全市場成功交易日不足：{len(verified_dates)}/{required_count} 日"
         )
-    if failed_in_window:
-        sample = ",".join(failed_in_window[:10])
-        suffix = "..." if len(failed_in_window) > 10 else ""
-        reasons.append(
-            f"FinMind repair 窗口仍有 {len(failed_in_window)} 個失敗日待重試：{sample}{suffix}"
+        return False, reasons
+
+    selected_window = sorted(verified_dates)[-required_count:]
+    failed_dates = _normalize_finmind_state_dates(state.get("failed_dates", []))
+    fixed_official_dates = [
+        day.strftime("%Y/%m/%d")
+        for day in get_finmind_trading_dates()
+        if day <= target_dt.date()
+    ][-required_count:]
+    skipped_failed = sorted(set(fixed_official_dates) & failed_dates)
+    if skipped_failed:
+        sample = ",".join(skipped_failed[:10])
+        suffix = "..." if len(skipped_failed) > 10 else ""
+        print(
+            f"  ℹ️ 固定最近 {required_count} 日中有 {len(skipped_failed)} 個 FinMind 缺檔日"
+            f"（{sample}{suffix}），已用更早成功交易日補足，不阻擋 repair。"
         )
 
-    return not reasons, reasons
+    print(
+        f"  ✅ FinMind 成功日窗口驗證：{len(selected_window):,} 日｜"
+        f"{selected_window[0]} ～ {selected_window[-1]}"
+    )
+    return True, []
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -18644,35 +18921,48 @@ def main():
                 history_cache_df,
                 finmind_target_date,
                 preloaded_target_df=finmind_target_raw,
+                reset_full_market_verified=source_migration_required,
             )
         finally:
             FORCE_FULL_CACHE_REFRESH = original_force_full
 
-        if source_migration_required and finmind_refresh_status.get("target_status") == "ok":
-            finmind_state_after = _load_finmind_state()
-            finmind_state_after["history_source_id"] = FINMIND_REPAIR_HISTORY_SOURCE_ID
-            finmind_state_after["history_source_verified_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-            finmind_state_after["history_source_row_count"] = int(len(history_cache_df)) if history_cache_df is not None else 0
-            _save_finmind_state(finmind_state_after)
-            print(
-                f"  ✅ FinMind 完整歷史來源標記已建立：{FINMIND_REPAIR_HISTORY_SOURCE_ID}｜"
-                f"歷史 {len(history_cache_df):,} 列｜"
-                f"待重試日期 {len(finmind_refresh_status.get('failed_dates', [])):,} 日"
-            )
+        history_cache_df, success_window_status = ensure_finmind_successful_history_window(
+            warrants,
+            broker_map,
+            history_cache_df,
+            finmind_target_date,
+            recently_failed_dates=finmind_refresh_status.get("failed_dates", []),
+        )
 
         source_complete, source_reasons = evaluate_finmind_repair_source_completeness(broker_map)
         window_complete, window_reasons = evaluate_finmind_repair_window_completeness(finmind_target_date)
         source_reasons.extend(window_reasons)
         if not source_complete or not window_complete:
-            print("  ⚠️ FinMind repair 來源／歷史窗口尚未完整，本次停止，不修改 Google Sheet。")
+            print("  ⚠️ FinMind repair 成功交易日仍未補足，本次停止，不修改 Google Sheet。")
             for reason in source_reasons:
                 print(f"    - {reason}")
-            print("  ℹ️ 已成功下載的日期與本機快取會保留；下次 repair 只補缺少日／失敗日。")
+            print("  ℹ️ 已成功下載的日期與本機快取會保留；下次 repair 會繼續重試缺檔日並往前補足成功日。")
             return
 
+        # 只有成功交易日已補足並通過驗證後，才建立／更新完整來源標記。
+        finmind_state_after = _load_finmind_state()
+        finmind_state_after["history_source_id"] = FINMIND_REPAIR_HISTORY_SOURCE_ID
+        finmind_state_after["history_source_verified_at"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+        finmind_state_after["history_source_row_count"] = int(len(history_cache_df)) if history_cache_df is not None else 0
+        finmind_state_after["history_source_success_day_count"] = int(
+            success_window_status.get("verified_count", 0)
+        )
+        _save_finmind_state(finmind_state_after)
         print(
-            f"  ✅ FinMind repair 歷史窗口驗證完成：最近 "
-            f"{HISTORY_RETENTION_TRADING_DAYS} 個交易日均已完成。"
+            f"  ✅ FinMind 完整歷史來源標記已確認：{FINMIND_REPAIR_HISTORY_SOURCE_ID}｜"
+            f"歷史 {len(history_cache_df):,} 列｜"
+            f"成功交易日 {success_window_status.get('verified_count', 0):,} 日｜"
+            f"待重試日期 {len(_normalize_finmind_state_dates(finmind_state_after.get('failed_dates', []))):,} 日"
+        )
+
+        print(
+            f"  ✅ FinMind repair 歷史窗口驗證完成：已取得最近 "
+            f"{HISTORY_RETENTION_TRADING_DAYS} 個成功交易日。"
         )
         target_date = normalize_date_str(finmind_target_date)
         if MONEYDJ_REPAIR_LATEST_DAY_OVERLAY_ENABLED:
