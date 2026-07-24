@@ -22,7 +22,11 @@ jobs:
     timeout-minutes: 30
 
     env:
-      GOOGLE_SHEET_NAME: "權證分點籌碼"
+      # 公開預覽版改讀新版 MoneyDJ A～E 金額分級資料。
+      GSHEET_DATA_VERSION: "new"
+      GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
+
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
       DISCORD_WEBHOOK_URL_TEST: ${{ secrets.DISCORD_WEBHOOK_URL_TEST }}
 
