@@ -44,9 +44,32 @@ jobs:
           python-version: "3.11"
 
       - name: Install system fonts
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk fonts-noto-color-emoji
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          install_fonts() {
+            sudo timeout 120s apt-get update -qq
+            sudo timeout 120s apt-get install -y --no-install-recommends \
+              fonts-noto-cjk \
+              fonts-noto-color-emoji
+            fc-cache -f
+          }
+
+          if dpkg -s fonts-noto-cjk fonts-noto-color-emoji >/dev/null 2>&1; then
+            echo "✅ Noto CJK 與 Emoji 字型已存在，略過安裝"
+          else
+            echo "開始安裝 Noto CJK 與 Emoji 字型"
+
+            if ! install_fonts; then
+              echo "⚠️ 第一次安裝字型失敗或逾時，等待 10 秒後重試"
+              sleep 10
+              install_fonts
+            fi
+
+            echo "✅ Noto CJK 與 Emoji 字型安裝完成"
+          fi
 
       - name: Install Python dependencies
         run: |
