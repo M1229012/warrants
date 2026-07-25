@@ -27,6 +27,13 @@ permissions:
   actions: write
 
 
+# 同一分支共用同一份 Google Sheet 與快取，禁止多個 workflow 同時執行。
+# cancel-in-progress=false：目前執行中的流程不會被後來的排程／手動執行中止。
+concurrency:
+  group: warrant-backtest-google-sheet-${{ github.ref }}
+  cancel-in-progress: false
+
+
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
@@ -162,13 +169,13 @@ jobs:
         run: mkdir -p warrant_cache
 
       # restore與save拆開，讓程式失敗時仍可透過if: always()保存failed_dates狀態。
-      # 每次run使用唯一key保存最新快取，再由restore-keys抓同分支最新一份。
+      # 每次 run／rerun 使用唯一 key 保存最新快取，再由 restore-keys 抓同分支最新一份。
       - name: Restore FinMind local cache
         id: finmind-cache-restore
         uses: actions/cache/restore@v4
         with:
           path: warrant_cache
-          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-
             warrant-cache-finmind-v3-${{ runner.os }}-
@@ -318,9 +325,9 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: warrant_cache
-          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: warrant-cache-finmind-v3-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # GitHub cache不可覆寫同一key，因此每輪使用唯一key；保存後只留同分支最新3份，
+      # GitHub cache 不可覆寫同一 key，因此 key 同時包含 run_id 與 run_attempt；保存後只留同分支最新 3 份，
       # 避免大型warrant_cache長期累積而觸發10GB配額淘汰。
       - name: Prune old FinMind caches
         if: always()
