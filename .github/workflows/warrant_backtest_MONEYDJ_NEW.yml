@@ -302,7 +302,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R5"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R6"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -312,9 +312,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R5。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R6。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R5。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R6。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
