@@ -23,7 +23,7 @@ E：單日累積買進金額 >= 1000萬
 8. 快取_TOP15部位明細
 
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
-完整修補模式會重新產生完整報表；A～E／每日賣出明細採穩定唯一鍵補齊，TOP15 採同日快照替換，勝率統計與 ABCDE組合勝率會以本次重算結果完整覆蓋並回讀驗證。
+完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會重新產生完整報表，並將 FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表以本次重算結果完整覆蓋、重新套用格式並回讀驗證；不在程式報表清單內的人工工作表仍保留不動。
 
 資料來源：daily 使用 MoneyDJ API4／API5；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
 執行：python warrant_backtest.py
@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-BACKFILL-REPAIR-FIX-20260723"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-FULL-GSHEET-REFRESH-20260725"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4507,8 +4507,12 @@ GSHEET_RESULT_UPSERT_TITLES = {
 }
 
 # 這兩張是「目前近兩月排名快照」，不是逐日歷史明細。
-# 同一資料範圍每次都應以本次結果完整替換，否則跌出排名或已刪除的分點會殘留。
-GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES = set()
+# daily 模式若未來重新啟用 current-scope replacement，可沿用此清單；
+# repair + RUN_MODE=2 已改由完整工作表覆蓋統一處理。
+GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES = {
+    "近兩月買賣金額排行",
+    "近兩月分點數排行",
+}
 
 # TOP15 兩張表是「指定統計日的快照」，不是只能追加的歷史事件表。
 # 同一資料範圍 + 同一統計日期重新執行時，必須整批替換該快照，
@@ -4527,16 +4531,16 @@ GSHEET_RESULT_OVERWRITE_TITLES = {
     "顏色說明",
 }
 
-# repair 模式必須把本次重新計算出的勝率報表完整覆蓋到 Google Sheet。
-# daily 模式仍保留既有版面，不重寫這兩張表，避免每日排程不必要地大量寫入。
+# repair + RUN_MODE=2 必須把本次重新計算出的所有完整修補報表覆蓋到 Google Sheet。
+# daily 與 RUN_MODE=1 仍沿用既有增量／快照邏輯，不增加日常排程寫入量。
 GSHEET_REPAIR_OVERWRITE_TITLES = {
-    "勝率統計",
-    "ABCDE組合勝率",
+    safe_worksheet_title(title)
+    for title in FULL_REPAIR_RESULT_SHEET_TITLES
 }
 
 
 def should_overwrite_result_sheet_in_repair(title):
-    """只有 RUN_MODE=2 的 repair 模式，才完整覆蓋勝率相關版面型工作表。"""
+    """只有 RUN_MODE=2 的 repair 模式，才完整覆蓋完整修補報表清單。"""
     title = safe_worksheet_title(title)
     return (
         WORKFLOW_MODE == "repair"
@@ -4625,9 +4629,50 @@ def verify_repair_overwrite_values(gws, expected_values):
     return True, ""
 
 
-def overwrite_repair_result_sheet_from_excel(ws_xlsx, gws, raw_values, title):
-    """完整覆蓋 repair 版面型結果表，並回讀驗證；失敗時自動再寫一次。"""
-    values = normalize_result_values_for_comma_numbers(raw_values)
+def prepare_repair_full_overwrite_values(
+    title,
+    raw_values,
+    data_scope=None,
+    extra_scope_values=None,
+):
+    """整理 repair 完整覆蓋值。
+
+    簡單表格（A～E、每日賣出、TOP15、排行與延伸快取）會重新建立
+    「資料範圍」欄，並在同一次覆蓋中合併全分點與精選五分點結果；
+    查詢頁、勝率頁、價格狀態與顏色說明等版面型工作表則直接使用
+    本次 Excel 內容。整個過程不讀取舊 Google Sheet 資料，因此舊金額、
+    舊報酬率、已退出排行與已刪除列都不會殘留。
+    """
+    prepared = _prepare_incremental_result_values(
+        title,
+        raw_values,
+        data_scope=data_scope,
+        extra_scope_values=extra_scope_values,
+    )
+    if prepared is not None:
+        headers, records = prepared
+        values = _records_to_values(headers, records)
+    else:
+        values = raw_values
+
+    return normalize_result_values_for_comma_numbers(values)
+
+
+def overwrite_repair_result_sheet_from_excel(
+    ws_xlsx,
+    gws,
+    raw_values,
+    title,
+    data_scope=None,
+    extra_scope_values=None,
+):
+    """完整覆蓋 repair 結果表並回讀驗證；失敗時自動再寫一次。"""
+    values = prepare_repair_full_overwrite_values(
+        title,
+        raw_values,
+        data_scope=data_scope,
+        extra_scope_values=extra_scope_values,
+    )
     max_cols = max((len(row) for row in values), default=0)
 
     for attempt in range(1, 3):
@@ -4637,7 +4682,15 @@ def overwrite_repair_result_sheet_from_excel(ws_xlsx, gws, raw_values, title):
                 continue
             raise RuntimeError(f"repair 覆蓋寫入失敗：{title}")
 
-        apply_excel_style_to_gsheet(ws_xlsx, gws)
+        if should_upsert_result_sheet(title):
+            # 大型簡單表格使用安全表格樣式，避免逐列複製 Excel 樣式造成大量 API 請求。
+            clear_all_number_formats_for_written_range(gws, values=values)
+            apply_safe_result_table_style_to_gsheet(gws, values=values)
+            apply_text_format_to_gsheet(gws, values)
+        else:
+            # 查詢頁、勝率頁、狀態頁與說明頁保留 Excel 的版面、公式及下拉選單。
+            apply_excel_style_to_gsheet(ws_xlsx, gws)
+
         apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
         apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
         apply_header_widths_to_gsheet(gws, values=values)
@@ -7086,10 +7139,11 @@ def upload_excel_to_google_sheet(
 ):
     """
     Google Sheet 同步規則：
-    1. 工作表不存在時才第一次建立並完整寫入。
-    2. A～E、每日賣出明細等歷史表：先清理既有重複列，再以穩定唯一鍵只 insert 真正缺少的新資料。
-    3. TOP15 兩張快取：同一資料範圍 + 同一統計日期整批替換，並保留最近 N 個統計日。
-    4. 除 TOP15 快照與明確失效分點列外，不刪除、清空、重建其他既有工作表。
+    1. repair + RUN_MODE=2：FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表，
+       都以本次重算結果完整覆蓋、重套格式並回讀驗證。
+    2. daily／RUN_MODE=1：A～E、每日賣出明細仍採穩定唯一鍵增量 insert。
+    3. daily／RUN_MODE=1：TOP15 仍採同資料範圍 + 同統計日期快照替換。
+    4. 不在本次 allowed_titles／完整修補清單內的人工工作表一律保留不動。
     """
     if not GSHEET_RESULT_ENABLED or not gsheet_enabled():
         print("  ⚠️ 未設定 GCP_SERVICE_KEY，略過 Google Sheet 結果同步")
@@ -7116,6 +7170,7 @@ def upload_excel_to_google_sheet(
             repair_expected_overwrites = {
                 safe_worksheet_title(title)
                 for title in GSHEET_REPAIR_OVERWRITE_TITLES
+                if allowed is None or safe_worksheet_title(title) in allowed
             }
             missing_repair_titles = sorted(repair_expected_overwrites - workbook_titles)
             if missing_repair_titles:
@@ -7124,7 +7179,7 @@ def upload_excel_to_google_sheet(
                     + "、".join(missing_repair_titles)
                 )
             print(
-                "  ✅ repair 覆蓋前置檢查完成："
+                f"  ✅ repair 全工作表覆蓋前置檢查完成：{len(repair_expected_overwrites)} 張｜"
                 + "、".join(sorted(repair_expected_overwrites))
             )
 
@@ -7134,12 +7189,16 @@ def upload_excel_to_google_sheet(
             f"  ☁️ Google Sheet 目標試算表：{GOOGLE_SHEET_NAME}"
             + (f"｜ID={GOOGLE_SHEET_ID}" if GOOGLE_SHEET_ID else "")
         )
-        sync_mode_message = (
-            "  ⚙️ 同步模式：A～E／每日賣出明細採穩定唯一鍵增量 insert（同步前清理既有重複）；"
-            "TOP15 採同資料範圍＋同統計日期整批替換。"
-        )
         if WORKFLOW_MODE == "repair" and RUN_MODE == 2:
-            sync_mode_message += " repair 會完整覆蓋勝率統計與 ABCDE組合勝率。"
+            sync_mode_message = (
+                f"  ⚙️ 同步模式：完整修補全工作表覆蓋｜共 {len(repair_expected_overwrites)} 張；"
+                "每張都以本次 Excel 重算結果重寫並回讀驗證，其他人工工作表保留。"
+            )
+        else:
+            sync_mode_message = (
+                "  ⚙️ 同步模式：A～E／每日賣出明細採穩定唯一鍵增量 insert（同步前清理既有重複）；"
+                "TOP15 採同資料範圍＋同統計日期整批替換。"
+            )
         print(sync_mode_message)
 
         for ws_xlsx in wb.worksheets:
@@ -7154,6 +7213,20 @@ def upload_excel_to_google_sheet(
             selected_values = extra_scope_values.get(title)
             gws, created = _existing_result_sheet(primary_sh, title)
             if gws is None:
+                continue
+
+            # repair + RUN_MODE=2：不論工作表原本是否存在，所有完整修補報表
+            # 都直接以本次結果完整覆蓋。簡單表格會同時合併全分點與精選五分點。
+            if should_overwrite_result_sheet_in_repair(title):
+                overwrite_repair_result_sheet_from_excel(
+                    ws_xlsx,
+                    gws,
+                    raw_values,
+                    title,
+                    data_scope=current_scope,
+                    extra_scope_values=selected_values,
+                )
+                repair_completed_overwrites.add(title)
                 continue
 
             if created:
@@ -7184,19 +7257,6 @@ def upload_excel_to_google_sheet(
                         apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
                         apply_header_widths_to_gsheet(gws, values=values)
                     print(f"  ☁️ 第一次建立並寫入工作表：{title}")
-                continue
-
-            # repair 模式下，勝率統計與 ABCDE 組合勝率必須以本次完整重算結果覆蓋。
-            # 舊版在這裡落入 insert-only 分支，因版面型報表無簡單第一列表頭而被直接略過，
-            # 導致 Excel 已更新、Google Sheet 卻永遠停留在舊數據。
-            if should_overwrite_result_sheet_in_repair(title):
-                overwrite_repair_result_sheet_from_excel(
-                    ws_xlsx,
-                    gws,
-                    raw_values,
-                    title,
-                )
-                repair_completed_overwrites.add(title)
                 continue
 
             # TOP15 兩張表是每日快照：同一資料範圍 + 同一統計日期必須整批替換，
@@ -7242,7 +7302,7 @@ def upload_excel_to_google_sheet(
                     + "、".join(missing_completed)
                 )
             print(
-                "  ✅ repair 必要工作表已全部覆蓋並回讀驗證："
+                f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(repair_completed_overwrites)} 張｜"
                 + "、".join(sorted(repair_completed_overwrites))
             )
 
