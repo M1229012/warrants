@@ -1,4 +1,4 @@
-name: Warrant Backtest Google Sheet - MoneyDJ New Excel
+name: Warrant Backtest Google Sheet - FinMind + MoneyDJ Hybrid
 
 on:
   workflow_dispatch:
@@ -36,6 +36,35 @@ jobs:
       CACHE_DIR: warrant_cache
       PYTHON_FILE: warrant_backtest_moneydj.py
       FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
+
+      # ============================================================
+      # FinMind 全市場完整歷史（Hybrid repair 主要歷史來源）
+      # 完整修補模式：FinMind 補足最近 200 個成功交易日；
+      # MoneyDJ 負責近期候選與最新交易日補強。
+      # ============================================================
+      FINMIND_API_BASE: "https://api.finmindtrade.com/api/v4"
+      FINMIND_CACHE_SCHEMA_VERSION: "finmind-v2-date-aware"
+      FINMIND_METADATA_CACHE_HOURS: "18"
+      FINMIND_HISTORY_WORKERS: "10"
+      FINMIND_MAX_RETRIES: "4"
+      FINMIND_RETRY_BASE_SECONDS: "2"
+      FINMIND_REQUEST_TIMEOUT_CONNECT: "8"
+      FINMIND_REQUEST_TIMEOUT_READ: "120"
+
+      FINMIND_FORCE_REFRESH_TARGET_DATE: "1"
+      FINMIND_INITIAL_BACKFILL_ON_EMPTY: "1"
+      FINMIND_REPAIR_ALLOW_TARGET_FALLBACK: "1"
+      FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS: "15"
+
+      # 舊 MoneyDJ 候選歷史不能被當成 FinMind 全市場完整歷史。
+      # 第一次執行 Hybrid 完整修補時會建立來源標記並補足 200 個成功交易日。
+      FINMIND_REPAIR_HISTORY_SOURCE_ID: "finmind-full-market-200d-hybrid-v1"
+      FINMIND_REPAIR_STRICT_HISTORY_WINDOW: "1"
+      FINMIND_REPAIR_SUCCESS_DAY_BACKFILL_ENABLED: "1"
+      FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT: "30"
+      FINMIND_REPAIR_SUCCESS_DAY_BATCH_SIZE: "6"
+      FINMIND_RAW_DAILY_RETENTION_DAYS: "7"
+      CACHE_WRITE_CSV_COMPAT: "0"
 
       # ============================================================
       # MoneyDJ 資料來源
@@ -130,10 +159,14 @@ jobs:
 
       # ============================================================
       # Google Sheet
-      # 工作表不存在時才建立；已存在時只 insert 缺少資料。
-      # 不清空、不重建任何既有工作表。
+      # daily 模式維持增量更新。
+      # repair + RUN_MODE=2 會完整覆蓋程式管理的 21 張工作表，
+      # 重新套用格式並逐張回讀驗證；其他人工工作表保留不動。
       # ============================================================
       GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
+      GSHEET_REPAIR_REQUIRE_EXPLICIT_ID: "1"
+      GSHEET_MAIN_ALLOW_CREATE: "0"
 
       GSHEET_CACHE_ENABLED: "0"
       GSHEET_RESULT_ENABLED: "1"
@@ -205,6 +238,8 @@ jobs:
             "完整修補模式")
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
+              # FinMind 補足最近 200 個成功交易日完整歷史，MoneyDJ 補強最新資料；
+              # 報表完成後完整覆蓋並回讀驗證程式管理的 21 張工作表。
               INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
               ;;
@@ -228,7 +263,7 @@ jobs:
           echo "RUN_MODE：$RUN_MODE"
           echo "INITIAL_HISTORY_DAYS：$INITIAL_HISTORY_DAYS"
           echo "DAILY_UPDATE_DAYS：$DAILY_UPDATE_DAYS"
-          echo "資料來源：MoneyDJ API4／API5"
+          echo "資料來源：FinMind 全市場完整歷史＋MoneyDJ 最新資料補強"
           echo "=========================================="
 
       - name: Install dependencies
@@ -252,26 +287,40 @@ jobs:
             google-auth \
             "psycopg[binary]"
 
-      - name: Run MoneyDJ ABCDE warrant backtest
+      - name: Run Hybrid FinMind and MoneyDJ warrant backtest
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R3"
 
-          # MoneyDJ workflow 僅允許執行 MoneyDJ 專用檔名，禁止退回 FinMind warrant_backtest.py。
+          # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
-            if [[ -f "warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py" ]]; then
-              SCRIPT_PATH="warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
-            else
-              echo "找不到 MoneyDJ 程式碼：$PYTHON_FILE 或 warrant_backtest_MONEYDJ_V10_1_NEW_EXCEL.py"
-              echo "目前倉庫內的 Python 檔案："
-              find . -maxdepth 2 -type f -name "*.py" -print
-              exit 1
-            fi
+            echo "找不到正式 Hybrid 程式碼：$SCRIPT_PATH"
+            echo "目前倉庫內的 Python 檔案："
+            find . -maxdepth 2 -type f -name "*.py" -print
+            exit 1
+          fi
+
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R3。
+          if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R3。"
+            echo "預期 Build ID：$EXPECTED_BUILD_ID"
+            grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
+            exit 1
+          fi
+
+          # 完整修補一定要鎖定明確的試算表 ID，禁止依名稱誤寫到別份檔案。
+          if [[ "${WORKFLOW_MODE:-daily}" == "repair" && -z "${GOOGLE_SHEET_ID:-}" ]]; then
+            echo "完整修補模式缺少 GOOGLE_SHEET_ID。"
+            echo "請建立 GitHub Secret：GOOGLE_SHEET_ID_MONEYDJ。"
+            exit 1
           fi
 
           echo "執行程式：$SCRIPT_PATH"
+          echo "驗證版本：$EXPECTED_BUILD_ID"
           python "$SCRIPT_PATH"
 
       - name: Save MoneyDJ local cache
