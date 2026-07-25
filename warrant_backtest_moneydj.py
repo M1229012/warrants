@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R3"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R5"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -2264,6 +2264,17 @@ _GSHEET_ARCHIVE_PERMISSION_SYNCED = set()
 _GSHEET_ARCHIVE_CREATE_BLOCKED = False
 _GSHEET_ARCHIVE_CREATE_BLOCK_LOGGED = False
 
+# repair 全覆蓋狀態：
+# 1. 追蹤已通過值驗證的工作表，若只有格式 batchUpdate 失敗，第二輪只重試格式，禁止重寫值。
+# 2. 收集 batchUpdate 失敗，讓 repair 可區分「值錯誤」與「格式錯誤」。
+_GSHEET_REPAIR_VALUE_VERIFIED_TITLES = set()
+_GSHEET_BATCH_UPDATE_FAILURES = []
+
+
+class RepairSheetFormatError(RuntimeError):
+    """repair 工作表的值已正確，但格式套用仍失敗。"""
+
+
 CACHE_SHEET_NAME_MAP = {
     "warrants_cache.csv": "快取_權證清單",
     "broker_map_cache.csv": "快取_分點代號",
@@ -2759,10 +2770,10 @@ def gsheet_write_sleep():
 
 def gsheet_api_call(description, func, *args, **kwargs):
     """
-    所有 Google Sheet 寫入動作統一走這裡：
-    1. 先節流
-    2. 遇到 429 自動等待重試
-    3. 不讓暫時 quota 造成後續工作表消失
+    所有 Google Sheets API 動作統一走同一個 token bucket：
+    1. 寫入、格式與 repair 回讀驗證都先節流。
+    2. 遇到 429／RESOURCE_EXHAUSTED 自動等待重試。
+    3. 暫時性配額錯誤會在 API 層重試，不會被誤判成值不一致。
     """
     last_error = None
 
@@ -2778,7 +2789,7 @@ def gsheet_api_call(description, func, *args, **kwargs):
 
             wait_seconds = min(90, GSHEET_RETRY_BASE_SECONDS * attempt)
             print(
-                f"  ⚠️ Google Sheet 觸發寫入配額限制，{description} 第 {attempt}/{GSHEET_MAX_RETRIES} 次重試，"
+                f"  ⚠️ Google Sheet 觸發 API 配額限制，{description} 第 {attempt}/{GSHEET_MAX_RETRIES} 次重試，"
                 f"等待 {wait_seconds:.0f} 秒..."
             )
             time.sleep(wait_seconds)
@@ -2902,26 +2913,42 @@ def spreadsheet_grid_cell_count(spreadsheet):
     return total
 
 
-def _worksheet_values_with_formulas(ws):
+def _worksheet_values_with_formulas(ws, throttled=False, strict_read=False):
     """
     讀取工作表實際內容，優先保留公式字串。
 
-    使用 FORMULA 可避免公式結果剛好是空字串時，被誤判成多餘空白列而刪除。
+    - throttled=True：讀取也走與寫入相同的 token bucket，避免 repair 驗證額外撞到 read quota。
+    - strict_read=True：讀取失敗時拋出例外，禁止把 429／暫時性錯誤偽裝成空工作表後觸發整表重寫。
     """
     if ws is None:
         return []
 
+    def read_formula_values():
+        try:
+            return ws.get_all_values(value_render_option="FORMULA") or []
+        except TypeError:
+            return ws.get_all_values() or []
+
     try:
-        return ws.get_all_values(value_render_option="FORMULA") or []
-    except TypeError:
-        try:
-            return ws.get_all_values() or []
-        except Exception:
-            return []
+        if throttled:
+            return gsheet_api_call(
+                f"回讀驗證工作表 {getattr(ws, 'title', '-')}",
+                read_formula_values,
+            ) or []
+        return read_formula_values()
     except Exception:
+        if strict_read:
+            raise
         try:
+            if throttled:
+                return gsheet_api_call(
+                    f"回讀工作表備援 {getattr(ws, 'title', '-')}",
+                    ws.get_all_values,
+                ) or []
             return ws.get_all_values() or []
         except Exception:
+            if strict_read:
+                raise
             return []
 
 
@@ -3158,7 +3185,7 @@ def normalize_gsheet_code_text_value(header, value):
             token = match.group(0)
             return token.zfill(6) if token.isdigit() and len(token) == 5 else token
 
-        s = re.sub(r"(?<!\d)\d{5}(?!\d)", repl, s)
+        s = re.sub(r"(?<![0-9A-Za-z])\d{5}(?![0-9A-Za-z])", repl, s)
         return ("'" + s) if had_prefix else s
 
     if "權證代號" in header or "權證代碼" in header:
@@ -3965,7 +3992,13 @@ def reset_worksheet_before_value_write(ws, row_count, col_count):
     _gsheet_batch_update(requests)
 
 
-def gsheet_values_batch_update(ws, data, description, chunk_size=5000):
+def gsheet_values_batch_update(
+    ws,
+    data,
+    description,
+    chunk_size=5000,
+    value_input_option="USER_ENTERED",
+):
     """以 values.batchUpdate 在單一請求內寫入多個 range；超大 payload 才分大批次。"""
     if ws is None or not data:
         return
@@ -3976,32 +4009,55 @@ def gsheet_values_batch_update(ws, data, description, chunk_size=5000):
             f"{description} {start + 1}-{start + len(chunk)}",
             ws.batch_update,
             chunk,
-            value_input_option="USER_ENTERED",
+            value_input_option=value_input_option,
         )
 
 
-def write_values_to_worksheet(ws, values):
-    if ws is None:
-        return False
+def prepare_gsheet_write_values(values):
+    """
+    建立實際送往 Google Sheets values API 的矩陣。
 
-    if not values:
-        values = [[""]]
-
-    row_count = max(len(values), 1)
-    col_count = max(max((len(row) for row in values), default=1), 1)
+    驗證端必須使用這個矩陣，而不是使用正規化前的原始 values；否則寫入端日後只要
+    調整代號、文字前導單引號或欄位型別正規化，repair 回讀驗證就可能再次誤判。
+    """
+    source_values = values if values else [[""]]
+    row_count = max(len(source_values), 1)
+    col_count = max(max((len(row) for row in source_values), default=1), 1)
 
     normalized_values = []
-    for row in values:
+    for row in source_values:
         row = list(row)
         if len(row) < col_count:
             row = row + [""] * (col_count - len(row))
         normalized_values.append([clean_gsheet_value(v) for v in row])
 
     normalized_values = normalize_gsheet_values_for_text_columns(normalized_values)
+    return normalized_values, row_count, col_count
+
+
+def write_values_to_worksheet(
+    ws,
+    values,
+    clear_existing_values=False,
+    value_input_option="USER_ENTERED",
+    return_normalized_values=False,
+):
+    if ws is None:
+        return None if return_normalized_values else False
+
+    normalized_values, row_count, col_count = prepare_gsheet_write_values(values)
 
     try:
-        # 不再使用 delete/recreate。先 resize，再清格式，最後寫入值。
-        # 這樣遇到 429 時不會把既有工作表刪掉。
+        # repair 全覆蓋必須先走 values.clear，再 resize 成精確尺寸。
+        # 只 resize／只覆蓋前 N 列可能讓舊資料尾端殘留，造成尺寸不符與舊權證代號混入。
+        if clear_existing_values:
+            gsheet_api_call(
+                f"完整清空工作表舊值 {ws.title}",
+                ws.clear,
+            )
+            print(f"  🧽 repair 覆蓋前已清空舊值：{ws.title}")
+
+        # 不刪除工作表本身，保留 sheetId 與人工引用；只精確調整 grid 後重寫。
         gsheet_api_call(
             f"調整工作表大小 {ws.title}",
             ws.resize,
@@ -4022,14 +4078,16 @@ def write_values_to_worksheet(ws, values):
             ws,
             batch_ranges,
             f"批次寫入工作表資料 {ws.title}",
+            value_input_option=value_input_option,
         )
 
         apply_text_format_to_gsheet(ws, normalized_values)
 
-        return True
+        # repair 可直接把這份「實際送出矩陣」交給 verify，避免 expected 與寫入正規化脫鉤。
+        return normalized_values if return_normalized_values else True
     except Exception as e:
         print(f"  ⚠️ Google Sheet 寫入失敗：{ws.title}，原因：{type(e).__name__}: {e}")
-        return False
+        return None if return_normalized_values else False
 
 
 def read_cache_from_gsheet(path):
@@ -4268,14 +4326,16 @@ def _format_fields(fmt):
 
 
 def _gsheet_batch_update(requests, chunk_size=1000):
+    """執行格式／工作表屬性 batchUpdate，並回傳是否全部成功。"""
     if not requests:
-        return
+        return True
 
     sh = get_gsheet_spreadsheet()
 
     if sh is None:
-        return
+        return False
 
+    all_ok = True
     for start in range(0, len(requests), chunk_size):
         chunk = requests[start:start + chunk_size]
         try:
@@ -4285,8 +4345,16 @@ def _gsheet_batch_update(requests, chunk_size=1000):
                 {"requests": chunk},
             )
         except Exception as e:
-            print(f"  ⚠️ Google Sheet 格式套用失敗：{type(e).__name__}: {e}")
-            return
+            all_ok = False
+            failure = {
+                "start": start + 1,
+                "end": start + len(chunk),
+                "error": f"{type(e).__name__}: {e}",
+            }
+            _GSHEET_BATCH_UPDATE_FAILURES.append(failure)
+            print(f"  ⚠️ Google Sheet 格式套用失敗：{failure['error']}")
+
+    return all_ok
 
 
 def _openpyxl_freeze_to_grid_properties(ws_xlsx):
@@ -4657,25 +4725,70 @@ def _normalize_repair_verify_value(value):
     return text_value
 
 
-def _normalize_repair_verify_date_value(value):
-    """將日期文字或 Google Sheet 日期序號統一成 YYYY/MM/DD。"""
+def _repair_expected_datetime_kind(value):
+    """判斷預期值是否為日期或日期時間，避免把一般 46xxx 數字誤當日期。"""
+    raw = str(strip_gsheet_text_prefix(value) or "").strip()
+    if not raw or raw.startswith("="):
+        return ""
+
+    match = re.fullmatch(
+        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?",
+        raw,
+    )
+    if not match:
+        return ""
+    return "datetime" if (":" in raw) else "date"
+
+
+def _normalize_repair_verify_datetime_value(value, kind="date"):
+    """
+    將日期文字、日期時間文字或 Google Sheet 日期序號統一。
+
+    Google Sheets 使用 USER_ENTERED 時，可能把：
+    - 2026/05/28 轉成 46170
+    - 2026/07/25 17:07:20 轉成 46228.713... 
+    驗證時依預期值的精度轉回日期／秒級日期時間。
+    """
     if value is None:
         return None
 
     raw = strip_gsheet_text_prefix(value)
-    dt = parse_date(raw)
-    if dt is not None:
-        return dt.strftime("%Y/%m/%d")
+    raw_text = str(raw or "").strip()
+    parsed = None
 
-    try:
-        serial = float(str(raw).replace(",", "").strip())
-        # Google Sheets／Excel 日期序號使用 1899/12/30 為基準。
-        if 20000 <= serial <= 100000:
-            return (datetime(1899, 12, 30) + timedelta(days=serial)).strftime("%Y/%m/%d")
-    except Exception:
-        pass
+    if raw_text:
+        normalized_text = raw_text.replace("-", "/").replace("T", " ")
+        for fmt in (
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%Y/%m/%d",
+        ):
+            try:
+                parsed = datetime.strptime(normalized_text, fmt)
+                break
+            except Exception:
+                continue
 
-    return None
+    if parsed is None:
+        try:
+            serial = float(raw_text.replace(",", ""))
+            if 20000 <= serial <= 100000:
+                parsed = datetime(1899, 12, 30) + timedelta(days=serial)
+                # 浮點日期序號可能產生數百微秒誤差，統一四捨五入到秒。
+                parsed = (parsed + timedelta(microseconds=500000)).replace(microsecond=0)
+        except Exception:
+            pass
+
+    if parsed is None:
+        return None
+    if kind == "datetime":
+        return parsed.strftime("%Y/%m/%d %H:%M:%S")
+    return parsed.strftime("%Y/%m/%d")
+
+
+def _normalize_repair_verify_date_value(value):
+    """相容舊呼叫：將日期文字或 Google Sheet 日期序號統一成 YYYY/MM/DD。"""
+    return _normalize_repair_verify_datetime_value(value, kind="date")
 
 
 def _normalize_repair_verify_percent_value(value):
@@ -4756,7 +4869,13 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
     並忽略 Google Sheets 自動正規化造成的非語意差異。
     """
     expected = _trim_result_value_matrix(expected_values)
-    actual = _trim_result_value_matrix(_worksheet_values_with_formulas(gws))
+    actual = _trim_result_value_matrix(
+        _worksheet_values_with_formulas(
+            gws,
+            throttled=True,
+            strict_read=True,
+        )
+    )
     typed_cells = _repair_verify_typed_cells(expected)
 
     expected_rows = len(expected)
@@ -4776,12 +4895,24 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
             raw_expected = exp_row[col_idx]
             raw_actual = act_row[col_idx]
             cell_kind = typed_cells.get((row_idx, col_idx))
-            if cell_kind == "date":
-                exp_date = _normalize_repair_verify_date_value(raw_expected)
-                act_date = _normalize_repair_verify_date_value(raw_actual)
-                if exp_date is not None and act_date is not None and exp_date == act_date:
+
+            # 表頭辨識到的日期／百分比照型別比對；即使表頭是「更新時間」等未列入關鍵字，
+            # 也會從預期值本身辨識日期時間與百分比，涵蓋 USER_ENTERED 的序號轉換。
+            datetime_kind = _repair_expected_datetime_kind(raw_expected)
+            if cell_kind == "date" and not datetime_kind:
+                datetime_kind = "date"
+            if datetime_kind:
+                exp_datetime = _normalize_repair_verify_datetime_value(raw_expected, datetime_kind)
+                act_datetime = _normalize_repair_verify_datetime_value(raw_actual, datetime_kind)
+                if (
+                    exp_datetime is not None
+                    and act_datetime is not None
+                    and exp_datetime == act_datetime
+                ):
                     continue
-            elif cell_kind == "percent":
+
+            expected_text = str(strip_gsheet_text_prefix(raw_expected) or "").strip()
+            if cell_kind == "percent" or expected_text.endswith("%"):
                 exp_percent = _normalize_repair_verify_percent_value(raw_expected)
                 act_percent = _normalize_repair_verify_percent_value(raw_actual)
                 if exp_percent is not None and act_percent is not None and exp_percent == act_percent:
@@ -4844,54 +4975,109 @@ def overwrite_repair_result_sheet_from_excel(
     data_scope=None,
     extra_scope_values=None,
 ):
-    """完整覆蓋 repair 結果表並回讀驗證；失敗時自動再寫一次。"""
+    """
+    完整覆蓋 repair 結果表並回讀驗證。
+
+    修正原則：
+    1. 清空舊值 → 精確 resize → 寫值 → 套格式 → 節流回讀驗證。
+    2. 值不一致才允許再清空重寫一次。
+    3. 若只有格式 batchUpdate 失敗，值通過驗證後會記錄；第二輪只重試格式，禁止重寫值。
+    """
+    title = safe_worksheet_title(title)
     values = prepare_repair_full_overwrite_values(
         title,
         raw_values,
         data_scope=data_scope,
         extra_scope_values=extra_scope_values,
     )
-    max_cols = max((len(row) for row in values), default=0)
+    # 先用與寫入端完全相同的函式建立 expected；若本輪真的寫值，會再以
+    # write_values_to_worksheet 回傳的實際送出矩陣覆蓋此變數。
+    written_values, _written_rows, _written_cols = prepare_gsheet_write_values(values)
+    max_cols = max((len(row) for row in written_values), default=0)
     simple_table = should_upsert_result_sheet(title)
 
-    for attempt in range(1, 3):
-        if not write_values_to_worksheet(gws, values):
-            if attempt == 1:
-                print(f"  ⚠️ repair 覆蓋第一次寫入失敗，準備重試：{title}")
-                continue
-            raise RuntimeError(f"repair 覆蓋寫入失敗：{title}")
+    def apply_repair_formats(failure_start=None):
+        if failure_start is None:
+            failure_start = len(_GSHEET_BATCH_UPDATE_FAILURES)
 
         if simple_table:
             # 大型簡單表格使用安全表格樣式，避免逐列複製 Excel 樣式造成大量 API 請求。
-            clear_all_number_formats_for_written_range(gws, values=values)
-            apply_safe_result_table_style_to_gsheet(gws, values=values)
-            apply_text_format_to_gsheet(gws, values)
+            clear_all_number_formats_for_written_range(gws, values=written_values)
+            apply_safe_result_table_style_to_gsheet(gws, values=written_values)
+            apply_text_format_to_gsheet(gws, written_values)
         else:
             # 查詢頁、勝率頁、狀態頁與說明頁保留 Excel 的版面、公式及下拉選單。
             apply_excel_style_to_gsheet(ws_xlsx, gws)
 
-        apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
-        apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
-        apply_header_widths_to_gsheet(gws, values=values)
+        apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=written_values)
+        apply_date_format_to_gsheet(ws_xlsx, gws, values=written_values)
+        apply_header_widths_to_gsheet(gws, values=written_values)
 
+        return list(_GSHEET_BATCH_UPDATE_FAILURES[failure_start:])
+
+    # 若上一輪已確認值完全正確，代表當時只有格式失敗；這次直接重試格式，絕不清空／重寫值。
+    values_already_verified = title in _GSHEET_REPAIR_VALUE_VERIFIED_TITLES
+    write_attempt = 0
+
+    while True:
+        batch_failure_start = len(_GSHEET_BATCH_UPDATE_FAILURES)
+
+        if not values_already_verified:
+            write_attempt += 1
+            write_result = write_values_to_worksheet(
+                gws,
+                values,
+                clear_existing_values=True,
+                value_input_option="USER_ENTERED",
+                return_normalized_values=True,
+            )
+            if write_result is None:
+                if write_attempt < 2:
+                    print(f"  ⚠️ repair 覆蓋第一次寫入失敗，準備重新清空後重試：{title}")
+                    continue
+                raise RuntimeError(f"repair 覆蓋寫入失敗：{title}")
+            written_values = write_result
+
+        format_failures = apply_repair_formats(failure_start=batch_failure_start)
+
+        # API 已同步回應後，驗證讀取再走同一 token bucket；讀取 429 由 gsheet_api_call 自己重試，
+        # 不會被轉成空矩陣或尺寸不一致。
         verified, reason = verify_repair_overwrite_values(
             gws,
-            values,
+            written_values,
             strict=simple_table,
         )
-        if verified:
+
+        if not verified:
+            _GSHEET_REPAIR_VALUE_VERIFIED_TITLES.discard(title)
+            values_already_verified = False
+            if write_attempt < 2:
+                print(
+                    f"  ⚠️ repair 值回讀驗證失敗，僅因值不一致才重新清空寫入："
+                    f"{title}｜{reason}"
+                )
+                continue
+            raise RuntimeError(f"repair 覆蓋回讀驗證失敗：{title}｜{reason}")
+
+        _GSHEET_REPAIR_VALUE_VERIFIED_TITLES.add(title)
+        values_already_verified = True
+
+        if format_failures:
+            failure_text = "；".join(item.get("error", "格式失敗") for item in format_failures[:3])
             print(
-                f"  ♻️ 完整修補模式已覆蓋並驗證 Google Sheet：{title}｜"
-                f"{len(values):,} 列 × {max_cols:,} 欄"
+                f"  ⚠️ repair 值已驗證正確，但格式尚未完成：{title}｜"
+                f"{len(format_failures)} 批｜第二輪只會重試格式，不重寫值"
             )
-            return True
+            raise RepairSheetFormatError(
+                f"repair 格式套用失敗：{title}｜{failure_text}"
+            )
 
-        if attempt == 1:
-            print(f"  ⚠️ repair 覆蓋回讀驗證失敗，重新寫入一次：{title}｜{reason}")
-            continue
-        raise RuntimeError(f"repair 覆蓋回讀驗證失敗：{title}｜{reason}")
+        print(
+            f"  ♻️ 完整修補模式已覆蓋並驗證 Google Sheet：{title}｜"
+            f"{len(written_values):,} 列 × {max_cols:,} 欄"
+        )
+        return True
 
-    raise RuntimeError(f"repair 覆蓋未完成：{title}")
 
 # RUN_MODE=1 精選五分點模式只用來產出每日圖卡與精選資料，
 # 不應覆蓋全分點模式才需要維護的查詢頁與勝率統計頁。
@@ -6685,6 +6871,7 @@ def repair_existing_worksheet_security_identities(ws, title, existing_values):
     """
     if (
         not GSHEET_REPAIR_SECURITY_IDENTITY_ROWS
+        or (WORKFLOW_MODE == "repair" and RUN_MODE == 2)
         or ws is None
         or not existing_values
         or not _CURRENT_WARRANT_INTERVAL_RECORDS
@@ -7328,6 +7515,9 @@ def upload_excel_to_google_sheet(
     4. daily／RUN_MODE=1 維持既有增量與 TOP15 快照邏輯。
     """
     strict_repair = WORKFLOW_MODE == "repair" and RUN_MODE == 2
+    if strict_repair:
+        _GSHEET_REPAIR_VALUE_VERIFIED_TITLES.clear()
+        _GSHEET_BATCH_UPDATE_FAILURES.clear()
 
     if not GSHEET_RESULT_ENABLED:
         message = "GSHEET_RESULT_ENABLED=0，Google Sheet 結果同步已停用。"
