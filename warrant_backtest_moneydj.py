@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R5"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R6"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4697,6 +4697,9 @@ def _normalize_repair_verify_value(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
             number = float(value)
+            # IEEE 754 負零與正零數值相等，但格式化可能分別得到 -0 與 0。
+            # USER_ENTERED 會把 -0.00% 或 -0 解析成底層 0，因此驗證前統一負零。
+            number = number + 0.0
             if number.is_integer():
                 return str(int(number))
             return format(number, ".15g")
@@ -4717,6 +4720,8 @@ def _normalize_repair_verify_value(value):
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", number_text):
         try:
             number = float(number_text)
+            # 將字串形式的 -0、-0.0、-0.000 統一成正零，避免回讀 0 時誤判。
+            number = number + 0.0
             if number.is_integer():
                 return str(int(number))
             return format(number, ".15g")
@@ -4805,6 +4810,8 @@ def _normalize_repair_verify_percent_value(value):
             number = float(raw[:-1]) / 100.0
         else:
             number = float(raw)
+        # Google Sheets 會將 -0.00% 的底層值儲存為 0；驗證前統一 IEEE 754 負零。
+        number = number + 0.0
         return format(number, ".12g")
     except Exception:
         return None
