@@ -93,6 +93,8 @@ jobs:
       WARRANT_IDENTITY_RECONCILE_ENABLED: "1"
       WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX: "3"
       WARRANT_IDENTITY_REPAIR_HISTORY: "1"
+      # daily／增量模式仍可修正既有錯配；完整 repair 會由程式自動跳過此逐列修正，
+      # 避免全覆蓋完成後又改值而造成回讀驗證差異。
       GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "1"
 
       # ============================================================
@@ -172,6 +174,12 @@ jobs:
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "1"
+
+      # repair 會先 values.clear，再以 USER_ENTERED 寫入。
+      # 驗證直接使用實際送出的 normalized 矩陣，並與寫入共用 token bucket。
+      GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
+      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "1"
+      GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
 
       GSHEET_WRITE_SLEEP_SECONDS: "0.05"
       GSHEET_WRITE_RATE_PER_MINUTE: "45"
@@ -294,7 +302,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R3"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R5"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -304,9 +312,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R3。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R5。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R3。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R5。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
