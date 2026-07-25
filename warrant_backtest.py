@@ -61,7 +61,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R3-V10.1"
+PROGRAM_BUILD_ID = "FINMIND-BATCH-PRICE-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R4-V10.1"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -3100,7 +3100,7 @@ def normalize_gsheet_code_text_value(header, value):
             token = match.group(0)
             return token.zfill(6) if token.isdigit() and len(token) == 5 else token
 
-        s = re.sub(r"(?<!\d)\d{5}(?!\d)", repl, s)
+        s = re.sub(r"(?<![0-9A-Za-z])\d{5}(?![0-9A-Za-z])", repl, s)
         return ("'" + s) if had_prefix else s
 
     if "權證代號" in header or "權證代碼" in header:
@@ -3156,6 +3156,19 @@ def strip_gsheet_text_prefix(value):
         return s[1:]
 
     return s
+
+
+def gsheet_expected_values_after_write(values):
+    """建立 repair 回讀驗證應使用的預期矩陣。
+
+    寫入端會為代號相關欄位加上前導單引號，讓 Google Sheets 以文字保存；
+    回讀時這個單引號不會出現在儲存格值中。因此驗證必須使用「已完成所有
+    寫入正規化、但移除文字前綴」的值，而不能再拿原始 Excel values 比對。
+    """
+    return [
+        [strip_gsheet_text_prefix(value) for value in list(row or [])]
+        for row in (values or [])
+    ]
 
 
 def normalize_gsheet_values_for_text_columns(values):
@@ -3923,6 +3936,12 @@ def gsheet_values_batch_update(ws, data, description, chunk_size=5000):
 
 
 def write_values_to_worksheet(ws, values):
+    """覆蓋工作表並回傳實際送出值所對應的驗證矩陣。
+
+    成功時回傳完成文字欄正規化、且移除 Google Sheets 文字前綴後的二維陣列；
+    失敗時回傳 False。既有以 ``if write_values_to_worksheet(...)`` 判斷成功與否的
+    呼叫方式仍可相容，同時 repair 可直接用回傳值做嚴格回讀驗證。
+    """
     if ws is None:
         return False
 
@@ -3940,6 +3959,7 @@ def write_values_to_worksheet(ws, values):
         normalized_values.append([clean_gsheet_value(v) for v in row])
 
     normalized_values = normalize_gsheet_values_for_text_columns(normalized_values)
+    expected_written_values = gsheet_expected_values_after_write(normalized_values)
 
     try:
         # 不再使用 delete/recreate。先 resize，再清格式，最後寫入值。
@@ -3968,7 +3988,7 @@ def write_values_to_worksheet(ws, values):
 
         apply_text_format_to_gsheet(ws, normalized_values)
 
-        return True
+        return expected_written_values
     except Exception as e:
         print(f"  ⚠️ Google Sheet 寫入失敗：{ws.title}，原因：{type(e).__name__}: {e}")
         return False
@@ -6636,25 +6656,107 @@ def _normalize_repair_verify_value(value):
     return text_value
 
 
-def _normalize_repair_verify_date_value(value):
-    """將日期文字或 Google Sheet 日期序號統一成 YYYY/MM/DD。"""
+def _parse_repair_verify_datetime_text(value):
+    """只解析明確的西元日期／日期時間文字，避免把一般數字誤認成日期。"""
+    text = str(value or "").strip()
+    if not text or text.startswith("="):
+        return None
+
+    match = re.fullmatch(
+        r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})"
+        r"(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,6}))?)?)?",
+        text,
+    )
+    if not match:
+        return None
+
+    year, month, day, hour, minute, second, microsecond = match.groups()
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour or 0),
+            int(minute or 0),
+            int(second or 0),
+            int((microsecond or "0").ljust(6, "0")),
+        )
+    except Exception:
+        return None
+
+
+def _repair_expected_datetime_kind(value):
+    """由預期值本身判斷是日期或日期時間，不依賴表頭名稱。"""
     if value is None:
         return None
 
     raw = strip_gsheet_text_prefix(value)
-    dt = parse_date(raw)
-    if dt is not None:
-        return dt.strftime("%Y/%m/%d")
-
     try:
-        serial = float(str(raw).replace(",", "").strip())
-        # Google Sheets／Excel 日期序號使用 1899/12/30 為基準。
-        if 20000 <= serial <= 100000:
-            return (datetime(1899, 12, 30) + timedelta(days=serial)).strftime("%Y/%m/%d")
+        if isinstance(raw, pd.Timestamp):
+            if pd.isna(raw):
+                return None
+            return "datetime" if any((raw.hour, raw.minute, raw.second, raw.microsecond)) else "date"
     except Exception:
         pass
 
-    return None
+    if isinstance(raw, datetime):
+        return "datetime" if any((raw.hour, raw.minute, raw.second, raw.microsecond)) else "date"
+
+    text = str(raw).strip()
+    parsed = _parse_repair_verify_datetime_text(text)
+    if parsed is None:
+        return None
+    return "datetime" if (" " in text or "T" in text) else "date"
+
+
+def _round_repair_datetime_to_second(dt):
+    if dt.microsecond >= 500000:
+        dt = dt + timedelta(seconds=1)
+    return dt.replace(microsecond=0)
+
+
+def _normalize_repair_verify_datetime_value(value, expected_kind):
+    """將日期文字或 Google Sheet 序號依預期型別正規化到秒。"""
+    if value is None or expected_kind not in ("date", "datetime"):
+        return None
+
+    raw = strip_gsheet_text_prefix(value)
+    dt = None
+
+    try:
+        if isinstance(raw, pd.Timestamp):
+            if pd.isna(raw):
+                return None
+            dt = raw.to_pydatetime()
+    except Exception:
+        pass
+
+    if dt is None and isinstance(raw, datetime):
+        dt = raw
+
+    if dt is None:
+        dt = _parse_repair_verify_datetime_text(raw)
+
+    if dt is None:
+        try:
+            serial = float(str(raw).replace(",", "").strip())
+            # Google Sheets／Excel 日期序號使用 1899/12/30 為基準。
+            if 20000 <= serial <= 100000:
+                dt = datetime(1899, 12, 30) + timedelta(days=serial)
+        except Exception:
+            pass
+
+    if dt is None:
+        return None
+
+    if expected_kind == "datetime":
+        return _round_repair_datetime_to_second(dt).strftime("%Y/%m/%d %H:%M:%S")
+    return dt.strftime("%Y/%m/%d")
+
+
+def _normalize_repair_verify_date_value(value):
+    """保留舊函式相容性；日期欄統一成 YYYY/MM/DD。"""
+    return _normalize_repair_verify_datetime_value(value, "date")
 
 
 def _normalize_repair_verify_percent_value(value):
@@ -6755,9 +6857,12 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
             raw_expected = exp_row[col_idx]
             raw_actual = act_row[col_idx]
             cell_kind = typed_cells.get((row_idx, col_idx))
+
+            # 先保留既有表頭型別提示，但日期／日期時間的精度由預期值本身決定。
             if cell_kind == "date":
-                exp_date = _normalize_repair_verify_date_value(raw_expected)
-                act_date = _normalize_repair_verify_date_value(raw_actual)
+                expected_kind = _repair_expected_datetime_kind(raw_expected) or "date"
+                exp_date = _normalize_repair_verify_datetime_value(raw_expected, expected_kind)
+                act_date = _normalize_repair_verify_datetime_value(raw_actual, expected_kind)
                 if exp_date is not None and act_date is not None and exp_date == act_date:
                     continue
             elif cell_kind == "percent":
@@ -6768,6 +6873,8 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
 
             exp_value = _normalize_repair_verify_value(raw_expected)
             act_value = _normalize_repair_verify_value(raw_actual)
+            if exp_value == act_value:
+                continue
 
             if not strict and isinstance(raw_expected, str) and raw_expected.strip().startswith("="):
                 if not (isinstance(raw_actual, str) and raw_actual.strip().startswith("=")):
@@ -6778,11 +6885,34 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
                 # 公式正規化後相同最好；即使 Google 進一步改寫公式，只要仍是公式便接受。
                 continue
 
-            if exp_value != act_value:
-                return False, (
-                    f"第 {row_idx + 1} 列第 {col_idx + 1} 欄不一致："
-                    f"預期={exp_value!r}，實際={act_value!r}"
-                )
+            # Fallback 不再依賴欄位名稱：普通字串比對失敗後，直接由預期值辨識
+            # 日期／日期時間或百分比，再與 Google Sheets 的序號／小數底層值比對。
+            expected_kind = _repair_expected_datetime_kind(raw_expected)
+            if expected_kind is not None:
+                exp_datetime = _normalize_repair_verify_datetime_value(raw_expected, expected_kind)
+                act_datetime = _normalize_repair_verify_datetime_value(raw_actual, expected_kind)
+                if (
+                    exp_datetime is not None
+                    and act_datetime is not None
+                    and exp_datetime == act_datetime
+                ):
+                    continue
+
+            expected_text = str(strip_gsheet_text_prefix(raw_expected)).strip()
+            if expected_text.endswith("%") or cell_kind == "percent":
+                exp_percent = _normalize_repair_verify_percent_value(raw_expected)
+                act_percent = _normalize_repair_verify_percent_value(raw_actual)
+                if (
+                    exp_percent is not None
+                    and act_percent is not None
+                    and exp_percent == act_percent
+                ):
+                    continue
+
+            return False, (
+                f"第 {row_idx + 1} 列第 {col_idx + 1} 欄不一致："
+                f"預期={exp_value!r}，實際={act_value!r}"
+            )
     return True, ""
 
 
@@ -6834,7 +6964,8 @@ def overwrite_repair_result_sheet_from_excel(
     simple_table = should_upsert_result_sheet(title)
 
     for attempt in range(1, 3):
-        if not write_values_to_worksheet(gws, values):
+        written_values = write_values_to_worksheet(gws, values)
+        if not written_values:
             if attempt == 1:
                 print(f"  ⚠️ repair 覆蓋第一次寫入失敗，準備重試：{title}")
                 continue
@@ -6855,7 +6986,7 @@ def overwrite_repair_result_sheet_from_excel(
 
         verified, reason = verify_repair_overwrite_values(
             gws,
-            values,
+            written_values,
             strict=simple_table,
         )
         if verified:
