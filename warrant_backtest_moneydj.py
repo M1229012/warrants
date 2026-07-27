@@ -133,6 +133,26 @@ MONEYDJ_PRESCAN_WORKERS = max(int(os.getenv("MONEYDJ_PRESCAN_WORKERS", "60")), 1
 MONEYDJ_RECENT_SCAN_DAYS = max(int(os.getenv("MONEYDJ_RECENT_SCAN_DAYS", "50")), 1)
 MONEYDJ_API5_HISTORY_LIMIT = max(int(os.getenv("MONEYDJ_API5_HISTORY_LIMIT", os.getenv("HISTORY_RETENTION_TRADING_DAYS", "200"))), 1)
 MONEYDJ_DAILY_API5_LIMIT = max(int(os.getenv("MONEYDJ_DAILY_API5_LIMIT", "5")), 1)
+MONEYDJ_DAILY_API5_FALLBACK_LIMIT = max(
+    int(os.getenv("MONEYDJ_DAILY_API5_FALLBACK_LIMIT", "50")),
+    MONEYDJ_DAILY_API5_LIMIT,
+)
+MONEYDJ_DAILY_API5_MAX_LIMIT = max(
+    int(os.getenv("MONEYDJ_DAILY_API5_MAX_LIMIT", str(MONEYDJ_API5_HISTORY_LIMIT))),
+    MONEYDJ_DAILY_API5_FALLBACK_LIMIT,
+)
+MONEYDJ_API5_RECOVERY_WORKERS = max(
+    int(os.getenv("MONEYDJ_API5_RECOVERY_WORKERS", "10")),
+    1,
+)
+MONEYDJ_API5_RECOVERY_ROUNDS = max(
+    int(os.getenv("MONEYDJ_API5_RECOVERY_ROUNDS", "2")),
+    0,
+)
+MONEYDJ_API5_RECOVERY_PAUSE_SECONDS = max(
+    float(os.getenv("MONEYDJ_API5_RECOVERY_PAUSE_SECONDS", "2.0")),
+    0.0,
+)
 MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
@@ -169,6 +189,9 @@ _MONEYDJ_SOURCE_REACHABLE = False
 _MONEYDJ_TARGET_DATE_OK = False
 _MONEYDJ_TARGET_DATE = ""
 _MONEYDJ_API5_FAILED_COUNT = 0
+_MONEYDJ_API5_MISSING_TARGET_COUNT = 0
+_MONEYDJ_API5_UNCOVERED_TARGET_COUNT = 0
+_MONEYDJ_API5_EXPANDED_RETRY_COUNT = 0
 MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
 MONEYDJ_PRESCAN_TOTAL_REQUESTS = 0
 
@@ -20425,7 +20448,20 @@ def _moneydj_scan_candidates(
         normalize_broker_code_for_compare(code): (label, name, code)
         for label, (name, code) in broker_map.items()
     }
-    MONEYDJ_PRESCAN_TOTAL_REQUESTS = len(warrants or [])
+
+    # warrants 含最近數百日的日期化區間紀錄，同一權證代號可能出現很多次。
+    # API4 只需要目標日仍有效的那一筆身分；先依日期過濾並按代號去重，
+    # 禁止把 9 萬多筆歷史區間全部送去 MoneyDJ。
+    target_warrant_map = _warrant_lookup(warrants, target_dt)
+    scan_warrants = list(target_warrant_map.values())
+    original_count = len(warrants or [])
+    if original_count != len(scan_warrants):
+        print(
+            f"  🧹 MoneyDJ API4 掃描集合：歷史區間 {original_count:,} 筆 → "
+            f"目標日有效唯一權證 {len(scan_warrants):,} 支"
+        )
+
+    MONEYDJ_PRESCAN_TOTAL_REQUESTS = len(scan_warrants)
     MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
 
     def scan_one(warrant):
@@ -20465,8 +20501,8 @@ def _moneydj_scan_candidates(
 
     candidates = {}
     latest_market_date = None
-    with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, max(len(warrants or []), 1))) as executor:
-        futures = [executor.submit(scan_one, warrant) for warrant in (warrants or [])]
+    with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, max(len(scan_warrants), 1))) as executor:
+        futures = [executor.submit(scan_one, warrant) for warrant in scan_warrants]
         for idx, future in enumerate(as_completed(futures), start=1):
             try:
                 rows, ok, latest_date = future.result()
@@ -20480,7 +20516,7 @@ def _moneydj_scan_candidates(
             for candidate in rows:
                 candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
             if idx % 1000 == 0:
-                print(f"  [{idx:,}/{len(warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
+                print(f"  [{idx:,}/{len(scan_warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
 
     print(
         f"  ✅ MoneyDJ API4 預篩：成功 {MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS:,}/"
@@ -20554,11 +20590,48 @@ def _moneydj_items_to_history_df(items):
     return pd.DataFrame(rows)
 
 
+def _moneydj_candidate_to_daily_target_day_item(candidate, target_date):
+    """
+    daily API5 自適應回查。
+
+    先取少量最新列；若連線成功但其中沒有目標日，才依序擴大到 fallback／max。
+    只有連線或解析失敗回傳 request_failed；所有窗口都成功但沒有目標日則回傳
+    target_missing，兩者不可混為一談。
+    """
+    limits = []
+    for raw_limit in (
+        MONEYDJ_DAILY_API5_LIMIT,
+        MONEYDJ_DAILY_API5_FALLBACK_LIMIT,
+        MONEYDJ_DAILY_API5_MAX_LIMIT,
+    ):
+        limit = max(int(raw_limit or 1), 1)
+        if limit not in limits:
+            limits.append(limit)
+
+    for attempt_no, limit in enumerate(limits, start=1):
+        item, ok = _moneydj_candidate_to_target_day_item(
+            candidate,
+            target_date,
+            history_limit=limit,
+        )
+        if not ok:
+            return None, False, "request_failed", limit, attempt_no
+        if item is not None:
+            return item, True, "ok", limit, attempt_no
+
+    return None, True, "target_missing", limits[-1], len(limits)
+
+
 def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
+    global _MONEYDJ_API5_MISSING_TARGET_COUNT, _MONEYDJ_API5_UNCOVERED_TARGET_COUNT
+    global _MONEYDJ_API5_EXPANDED_RETRY_COUNT
     _MONEYDJ_TARGET_DATE = normalize_date_str(target_date)
     _MONEYDJ_TARGET_DATE_OK = False
     _MONEYDJ_API5_FAILED_COUNT = 0
+    _MONEYDJ_API5_MISSING_TARGET_COUNT = 0
+    _MONEYDJ_API5_UNCOVERED_TARGET_COUNT = 0
+    _MONEYDJ_API5_EXPANDED_RETRY_COUNT = 0
     baseline = history_df.copy() if history_df is not None else pd.DataFrame()
 
     candidates, latest_market_date = _moneydj_scan_candidates(
@@ -20588,38 +20661,152 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
 
     print(
         f"【Step 3b】MoneyDJ API5 當日快照：{_MONEYDJ_TARGET_DATE}｜"
-        f"候選 {len(candidates):,} 組｜每組最多 {MONEYDJ_DAILY_API5_LIMIT} 列｜"
+        f"候選 {len(candidates):,} 組｜先查 {MONEYDJ_DAILY_API5_LIMIT} 列，"
+        f"缺目標日才擴大至 {MONEYDJ_DAILY_API5_MAX_LIMIT} 列｜"
         f"workers={min(MONEYDJ_HISTORY_WORKERS, max(len(candidates),1))}"
     )
     fetched_items = []
+    missing_target_pairs = set()
+    request_failed_candidates = []
     if candidates:
         with ThreadPoolExecutor(max_workers=min(MONEYDJ_HISTORY_WORKERS, len(candidates))) as executor:
-            futures = [
+            futures = {
                 executor.submit(
-                    _moneydj_candidate_to_target_day_item,
+                    _moneydj_candidate_to_daily_target_day_item,
                     candidate,
                     _MONEYDJ_TARGET_DATE,
-                    MONEYDJ_DAILY_API5_LIMIT,
-                )
+                ): candidate
                 for candidate in candidates
-            ]
+            }
             for idx, future in enumerate(as_completed(futures), start=1):
+                candidate = futures[future]
                 try:
-                    item, ok = future.result()
+                    item, ok, status, _used_limit, attempt_count = future.result()
                 except Exception:
-                    item, ok = None, False
-                # API4 已確認該權證×分點在目標日有資料；API5 若沒有回到同日列，
-                # 視同資料不完整，禁止拿部分快照取代快取中的完整目標日。
-                if not ok or item is None:
-                    _MONEYDJ_API5_FAILED_COUNT += 1
+                    item, ok, status, _used_limit, attempt_count = (
+                        None,
+                        False,
+                        "request_failed",
+                        MONEYDJ_DAILY_API5_LIMIT,
+                        1,
+                    )
+
+                _MONEYDJ_API5_EXPANDED_RETRY_COUNT += max(int(attempt_count) - 1, 0)
+                if not ok or status == "request_failed":
+                    request_failed_candidates.append(candidate)
+                elif status == "target_missing":
+                    _MONEYDJ_API5_MISSING_TARGET_COUNT += 1
+                    missing_target_pairs.add((
+                        str(candidate[0]).strip(),
+                        normalize_broker_code_for_compare(candidate[6]),
+                    ))
                 if item:
                     fetched_items.append(item)
                 if idx % 200 == 0:
-                    print(f"  [{idx:,}/{len(candidates):,}] MoneyDJ API5 當日抓取中｜有效 {len(fetched_items):,} 組｜失敗 {_MONEYDJ_API5_FAILED_COUNT:,}")
+                    print(
+                        f"  [{idx:,}/{len(candidates):,}] MoneyDJ API5 當日抓取中｜"
+                        f"有效 {len(fetched_items):,}｜暫時失敗 {len(request_failed_candidates):,}｜"
+                        f"擴大後仍無目標日 {_MONEYDJ_API5_MISSING_TARGET_COUNT:,}"
+                    )
 
+    # 高併發階段若碰到暫時性限流，只重試失敗的組合，不重抓已成功資料。
+    # 復原輪改用較低併發；全部復原後不觸發 fail-closed。
+    unresolved_candidates = request_failed_candidates
+    for recovery_round in range(1, MONEYDJ_API5_RECOVERY_ROUNDS + 1):
+        if not unresolved_candidates:
+            break
+        print(
+            f"  🔁 MoneyDJ API5 低併發復原第 {recovery_round} 輪："
+            f"只重試 {len(unresolved_candidates):,} 組｜"
+            f"workers={min(MONEYDJ_API5_RECOVERY_WORKERS, len(unresolved_candidates))}"
+        )
+        if MONEYDJ_API5_RECOVERY_PAUSE_SECONDS > 0:
+            time.sleep(MONEYDJ_API5_RECOVERY_PAUSE_SECONDS)
+
+        next_unresolved = []
+        with ThreadPoolExecutor(
+            max_workers=min(MONEYDJ_API5_RECOVERY_WORKERS, len(unresolved_candidates))
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _moneydj_candidate_to_daily_target_day_item,
+                    candidate,
+                    _MONEYDJ_TARGET_DATE,
+                ): candidate
+                for candidate in unresolved_candidates
+            }
+            for future in as_completed(futures):
+                candidate = futures[future]
+                try:
+                    item, ok, status, _used_limit, attempt_count = future.result()
+                except Exception:
+                    item, ok, status, _used_limit, attempt_count = (
+                        None,
+                        False,
+                        "request_failed",
+                        MONEYDJ_DAILY_API5_LIMIT,
+                        1,
+                    )
+
+                _MONEYDJ_API5_EXPANDED_RETRY_COUNT += max(int(attempt_count) - 1, 0)
+                if not ok or status == "request_failed":
+                    next_unresolved.append(candidate)
+                elif status == "target_missing":
+                    _MONEYDJ_API5_MISSING_TARGET_COUNT += 1
+                    missing_target_pairs.add((
+                        str(candidate[0]).strip(),
+                        normalize_broker_code_for_compare(candidate[6]),
+                    ))
+                if item:
+                    fetched_items.append(item)
+        recovered_count = len(unresolved_candidates) - len(next_unresolved)
+        print(
+            f"    {'✅' if recovered_count else '⚠️'} 本輪復原 "
+            f"{recovered_count:,} 組｜仍失敗 {len(next_unresolved):,} 組"
+        )
+        unresolved_candidates = next_unresolved
+
+    _MONEYDJ_API5_FAILED_COUNT = len(unresolved_candidates)
     if MONEYDJ_API5_STRICT and _MONEYDJ_API5_FAILED_COUNT > 0:
         print(
             f"  ⚠️ daily 當日快照有 {_MONEYDJ_API5_FAILED_COUNT:,} 組 API5 失敗；"
+            "保留原歷史快取，不寫入部分資料。"
+        )
+        return baseline
+
+    if _MONEYDJ_API5_EXPANDED_RETRY_COUNT or _MONEYDJ_API5_MISSING_TARGET_COUNT:
+        print(
+            f"  ℹ️ MoneyDJ API5 自適應回查：額外請求 "
+            f"{_MONEYDJ_API5_EXPANDED_RETRY_COUNT:,} 次｜"
+            f"擴大到 {MONEYDJ_DAILY_API5_MAX_LIMIT} 列後仍無目標日 "
+            f"{_MONEYDJ_API5_MISSING_TARGET_COUNT:,} 組"
+        )
+
+    # API4 已確認該分點／權證在目標日有交易，因此 API5 擴大後仍缺目標日
+    # 不能直接視為完整資料。若是同日重跑且快取已有該組，安全沿用；第一次跑
+    # 沒有可沿用資料時維持 fail-closed，避免把部分結果寫入 Google Sheet。
+    existing_target_pairs = set()
+    if (
+        missing_target_pairs
+        and baseline is not None
+        and not baseline.empty
+        and {"日期", "權證代號", "券商代號"}.issubset(baseline.columns)
+    ):
+        baseline_dates = baseline["日期"].map(normalize_date_str)
+        target_rows = baseline[baseline_dates == _MONEYDJ_TARGET_DATE]
+        existing_target_pairs = {
+            (
+                str(row.get("權證代號", "")).strip(),
+                normalize_broker_code_for_compare(row.get("券商代號", "")),
+            )
+            for row in target_rows.to_dict("records")
+        }
+    uncovered_missing_pairs = missing_target_pairs - existing_target_pairs
+    _MONEYDJ_API5_UNCOVERED_TARGET_COUNT = len(uncovered_missing_pairs)
+    if _MONEYDJ_API5_UNCOVERED_TARGET_COUNT > 0:
+        print(
+            f"  ⚠️ MoneyDJ API5 有 {_MONEYDJ_API5_UNCOVERED_TARGET_COUNT:,} 組在擴大回查後"
+            "仍缺目標日，且同日快取沒有可安全沿用資料；"
             "保留原歷史快取，不寫入部分資料。"
         )
         return baseline
@@ -20628,7 +20815,24 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     old = baseline.copy()
     if not old.empty and "日期" in old.columns:
         old["日期"] = old["日期"].map(normalize_date_str)
-        old = old[old["日期"] != _MONEYDJ_TARGET_DATE].copy()
+        old_warrant_codes = old["權證代號"].astype(str).str.strip()
+        old_broker_codes = old["券商代號"].map(normalize_broker_code_for_compare)
+        preserve_missing_mask = pd.Series(False, index=old.index)
+        if missing_target_pairs:
+            preserve_missing_mask = pd.Series(
+                [
+                    (warrant_code, broker_code) in missing_target_pairs
+                    for warrant_code, broker_code in zip(
+                        old_warrant_codes,
+                        old_broker_codes,
+                    )
+                ],
+                index=old.index,
+            )
+        old = old[
+            (old["日期"] != _MONEYDJ_TARGET_DATE)
+            | preserve_missing_mask
+        ].copy()
     combined = (
         pd.concat([old, new_df], ignore_index=True)
         if new_df is not None and not new_df.empty
@@ -21152,6 +21356,10 @@ def evaluate_empty_result_source_completeness(
             reasons.append(f"MoneyDJ API4 成功率不足：{ratio:.2%} < {MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:.2%}")
     if MONEYDJ_API5_STRICT and _MONEYDJ_API5_FAILED_COUNT > 0:
         reasons.append(f"MoneyDJ API5 有 {_MONEYDJ_API5_FAILED_COUNT} 組連線／解析失敗")
+    if _MONEYDJ_API5_UNCOVERED_TARGET_COUNT > 0:
+        reasons.append(
+            f"MoneyDJ API5 有 {_MONEYDJ_API5_UNCOVERED_TARGET_COUNT} 組缺目標日且無同日快取可沿用"
+        )
     if not _MONEYDJ_TARGET_DATE_OK:
         reasons.append(f"MoneyDJ 尚未確認目標交易日 {_MONEYDJ_TARGET_DATE or '-'} 已更新")
     return not reasons, reasons
