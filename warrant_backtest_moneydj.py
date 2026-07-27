@@ -66,7 +66,7 @@ PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRES
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
 # 2. 權證名稱以日期區間、標的股與權證名稱前綴交叉驗證，避免權證代號重用後抓到舊名稱。
 # 3. 若 FinMind Summary 的 target_stock_id 與權證名稱明確指向不同標的，
-#    只在名稱前綴屬於高信心匹配時才更正，避免短別名誤判。
+#    只在名稱前綴屬於高信心或唯一命中時才更正，避免短別名誤判。
 WARRANT_IDENTITY_RECONCILE_ENABLED = os.getenv("WARRANT_IDENTITY_RECONCILE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX = max(int(os.getenv("WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX", "3")), 2)
 WARRANT_IDENTITY_REPAIR_HISTORY = os.getenv("WARRANT_IDENTITY_REPAIR_HISTORY", "1").strip().lower() not in ("0", "false", "no")
@@ -76,6 +76,7 @@ _CURRENT_STOCK_CODE_TO_NAME = {}
 _CURRENT_STOCK_NAME_TO_CODE = {}
 _CURRENT_UNDERLYING_RESOLVER = []
 _CURRENT_WARRANT_INTERVAL_RECORDS = []
+_HISTORY_IDENTITY_REPAIR_DATES = set()
 
 # 權證身分配對效能快取：只快取索引與既有判斷結果，不改變任何身分判斷規則。
 # 1. 股名 resolver 依第一個字建立候選索引，仍保持原 resolver 排序。
@@ -6940,6 +6941,17 @@ def _normalize_warrant_code_for_identity(value):
     return code
 
 
+def format_warrant_identity_label(warrant_code, warrant_name=""):
+    """顯示「權證代號 名稱」；名稱缺失或等於代號時只顯示一次代號。"""
+    code = _normalize_warrant_code_for_identity(warrant_code)
+    if not code:
+        code = str(strip_gsheet_text_prefix(warrant_code) or "").strip()
+    name = str(strip_gsheet_text_prefix(warrant_name) or "").strip()
+    if not name or _normalize_warrant_code_for_identity(name) == code:
+        return code
+    return f"{code} {name}".strip()
+
+
 def _result_record_identity_date(record):
     """從結果列挑選最適合判斷權證代號重用區間的日期。"""
     for header in (
@@ -6979,10 +6991,15 @@ def _repair_warrant_label_text(value, warrant_lookup):
         meta, code = _warrant_meta_from_label_segment(segment, warrant_lookup)
         if not meta or not code:
             continue
-        name = str(meta.get("名稱", "")).strip()
+        name = safe_warrant_name_for_identity(
+            code,
+            meta.get("名稱", ""),
+            meta.get("標的股", ""),
+            meta.get("標的名稱", ""),
+        )
         if not name:
             continue
-        replacement = f"{code} {name}".strip()
+        replacement = format_warrant_identity_label(code, name)
         if str(segment).strip() != replacement:
             leading = str(segment)[: len(str(segment)) - len(str(segment).lstrip())]
             trailing = str(segment)[len(str(segment).rstrip()):]
@@ -7018,7 +7035,12 @@ def repair_result_record_security_identity(record):
         meta = warrant_lookup.get(direct_code)
         if meta:
             metas.append(meta)
-            canonical_name = str(meta.get("名稱", "")).strip()
+            canonical_name = safe_warrant_name_for_identity(
+                direct_code,
+                meta.get("名稱", ""),
+                meta.get("標的股", ""),
+                meta.get("標的名稱", ""),
+            )
             if "權證代號" in rec and str(strip_gsheet_text_prefix(rec.get("權證代號", ""))).strip() != direct_code:
                 rec["權證代號"] = direct_code
                 changed_fields.add("權證代號")
@@ -7389,6 +7411,20 @@ def _daily_date_replace_column(title):
     return ""
 
 
+def _normalize_daily_refresh_date_keys(refresh_date):
+    """支援單一日期或身分修復所需的多日期集合。"""
+    raw_values = (
+        list(refresh_date)
+        if isinstance(refresh_date, (list, tuple, set))
+        else [refresh_date]
+    )
+    return sorted({
+        parsed.strftime("%Y/%m/%d")
+        for parsed in (_parse_result_record_date(value) for value in raw_values)
+        if parsed is not None
+    })
+
+
 def _prepare_daily_date_replace_values(
     title,
     new_values,
@@ -7406,11 +7442,11 @@ def _prepare_daily_date_replace_values(
     if prepared is None:
         return None
 
-    target_dt = _parse_result_record_date(refresh_date)
+    target_keys = _normalize_daily_refresh_date_keys(refresh_date)
     date_col = _daily_date_replace_column(title)
-    if target_dt is None or not date_col:
+    if not target_keys or not date_col:
         return None
-    target_key = target_dt.strftime("%Y/%m/%d")
+    target_key_set = set(target_keys)
 
     current_scope = str(data_scope or get_result_data_scope()).strip()
     incoming_scopes = {current_scope}
@@ -7427,7 +7463,7 @@ def _prepare_daily_date_replace_values(
         record_dt = _parse_result_record_date(record.get(date_col, ""))
         if scope not in incoming_scopes or record_dt is None:
             continue
-        if record_dt.strftime("%Y/%m/%d") != target_key:
+        if record_dt.strftime("%Y/%m/%d") not in target_key_set:
             continue
         record["資料範圍"] = scope
         filtered_records.append(record)
@@ -7449,7 +7485,8 @@ def _prepare_daily_date_replace_values(
         "headers": list(incoming_headers),
         "records": deduped_records,
         "scopes": incoming_scopes,
-        "target_date": target_key,
+        "target_date": target_keys[-1],
+        "target_dates": target_keys,
         "date_col": date_col,
     }
 
@@ -7482,7 +7519,8 @@ def replace_daily_date_rows_in_worksheet(
     incoming_headers = prepared["headers"]
     incoming_records = prepared["records"]
     incoming_scopes = prepared["scopes"]
-    target_key = prepared["target_date"]
+    target_keys = prepared.get("target_dates") or [prepared["target_date"]]
+    target_key_set = set(target_keys)
     date_col = prepared["date_col"]
 
     existing_values = _worksheet_values_with_formulas(ws)
@@ -7553,7 +7591,7 @@ def replace_daily_date_rows_in_worksheet(
         if (
             scope in incoming_scopes
             and row_dt is not None
-            and row_dt.strftime("%Y/%m/%d") == target_key
+            and row_dt.strftime("%Y/%m/%d") in target_key_set
         ):
             old_target_rows.append(sheet_row_no)
 
@@ -7575,16 +7613,22 @@ def replace_daily_date_rows_in_worksheet(
         )
 
     current_values = _worksheet_values_with_formulas(ws)
+    date_label = (
+        target_keys[0]
+        if len(target_keys) == 1
+        else f"{target_keys[0]}～{target_keys[-1]}（{len(target_keys)}日）"
+    )
     print(
         f"  ♻️ Google Sheet daily 日期替換：{safe_worksheet_title(title)}｜"
-        f"日期={target_key}｜範圍={'、'.join(sorted(incoming_scopes))}｜"
+        f"日期={date_label}｜範圍={'、'.join(sorted(incoming_scopes))}｜"
         f"本次 {len(rows_to_insert):,} 列｜替換舊列 {len(old_target_rows):,}"
     )
     return {
         "values": current_values,
         "incoming": len(rows_to_insert),
         "replaced": len(old_target_rows),
-        "target_date": target_key,
+        "target_date": target_keys[-1],
+        "target_dates": target_keys,
     }
 
 
@@ -8103,8 +8147,19 @@ def upload_excel_to_google_sheet(
             "單張失敗不中止其他工作表，結束後統一重試並嚴格驗收。"
         )
     else:
+        daily_refresh_keys = _normalize_daily_refresh_date_keys(refresh_date)
+        daily_refresh_label = (
+            daily_refresh_keys[0]
+            if len(daily_refresh_keys) == 1
+            else (
+                f"{daily_refresh_keys[0]}～{daily_refresh_keys[-1]}"
+                f"（{len(daily_refresh_keys)}日，含身分自動修復）"
+                if daily_refresh_keys
+                else "-"
+            )
+        )
         print(
-            f"  ⚙️ 同步模式：A～E／每日賣出只替換目標交易日 {normalize_date_str(refresh_date) or '-'}；"
+            f"  ⚙️ 同步模式：A～E／每日賣出替換日期 {daily_refresh_label}；"
             "TOP15 採同資料範圍＋同統計日期整批替換。"
         )
 
@@ -9049,7 +9104,7 @@ def build_canonical_stock_master(stock_df, excluded_security_codes=None):
 _STOCK_NAME_SUFFIXES = [
     "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
     "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業",
-    "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品",
+    "企業", "國際", "工程", "控股", "投控", "控", "建設", "營造", "食品",
     "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥",
 ]
 
@@ -9083,6 +9138,57 @@ def _warrant_name_matches_stock_name(warrant_name, stock_name):
             for prefix in _stock_name_validation_prefixes(stock_name)
         )
     )
+
+
+def safe_warrant_name_for_identity(
+    warrant_code,
+    warrant_name,
+    underlying_code="",
+    underlying_name="",
+    resolver=None,
+    code_to_name=None,
+):
+    """名稱與標的不一致時回退成代號，禁止舊名稱污染權證清單。"""
+    code = _normalize_warrant_code_for_identity(warrant_code)
+    name = str(warrant_name or "").strip()
+    if not name or _normalize_warrant_code_for_identity(name) == code:
+        return code
+
+    underlying_code = normalize_security_code_text(underlying_code)
+    code_to_name = (
+        code_to_name
+        if code_to_name is not None
+        else _CURRENT_STOCK_CODE_TO_NAME
+    )
+    expected_name = str(
+        (code_to_name or {}).get(underlying_code, underlying_name)
+    ).strip()
+    resolved = resolve_underlying_from_warrant_name(
+        name,
+        resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER,
+    )
+    if resolved:
+        resolved_code = normalize_security_code_text(
+            resolved.get("stock_code", "")
+        )
+        high_confidence = bool(
+            resolved.get("is_special")
+            or resolved.get("is_exact_alias")
+            or resolved.get("is_unambiguous_prefix")
+            or int(resolved.get("prefix_len", 0) or 0)
+            >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
+        )
+        if (
+            high_confidence
+            and underlying_code
+            and resolved_code
+            and resolved_code != underlying_code
+        ):
+            return code
+
+    if expected_name and not _warrant_name_matches_stock_name(name, expected_name):
+        return code
+    return name
 
 
 def _stock_names_share_validation_alias(left_name, right_name):
@@ -9252,8 +9358,26 @@ def resolve_underlying_from_warrant_name(warrant_name, resolver=None):
     for rec in candidates:
         prefix = rec.get("prefix", "")
         if prefix and wname.startswith(prefix):
-            result = rec
+            result = dict(rec)
             break
+
+    if result:
+        # 「洋基」這類只有兩字的合法簡稱，不能單憑長度一律視為低信心。
+        # 若所有同等最長的命中前綴都只指向同一股號，即可安全視為唯一命中；
+        # 若同長前綴存在不同股號則維持 fail-closed，不做跨標的改寫。
+        best_prefix_len = int(result.get("prefix_len", 0) or 0)
+        strongest_codes = {
+            normalize_security_code_text(rec.get("stock_code", ""))
+            for rec in candidates
+            if int(rec.get("prefix_len", 0) or 0) == best_prefix_len
+            and str(rec.get("prefix", "") or "")
+            and wname.startswith(str(rec.get("prefix", "") or ""))
+            and normalize_security_code_text(rec.get("stock_code", ""))
+        }
+        result["is_unambiguous_prefix"] = bool(
+            len(strongest_codes) == 1
+            and normalize_security_code_text(result.get("stock_code", "")) in strongest_codes
+        )
 
     with _UNDERLYING_RESOLVER_RUNTIME_LOCK:
         if len(_UNDERLYING_RESOLUTION_RESULT_CACHE) >= _UNDERLYING_RESOLUTION_RESULT_CACHE_MAXSIZE:
@@ -9298,6 +9422,7 @@ def reconcile_underlying_identity(
         high_confidence = bool(
             resolved.get("is_special")
             or resolved.get("is_exact_alias")
+            or resolved.get("is_unambiguous_prefix")
             or prefix_len >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
         )
 
@@ -9417,6 +9542,7 @@ def select_warrant_name_for_interval(
             high_confidence = bool(
                 resolved.get("is_special")
                 or resolved.get("is_exact_alias")
+                or resolved.get("is_unambiguous_prefix")
                 or int(resolved.get("prefix_len", 0) or 0) >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
             )
             if resolved_code == underlying_code:
@@ -9434,6 +9560,7 @@ def select_warrant_name_for_interval(
         high_confidence = bool(
             best_resolved.get("is_special")
             or best_resolved.get("is_exact_alias")
+            or best_resolved.get("is_unambiguous_prefix")
             or int(best_resolved.get("prefix_len", 0) or 0) >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
         )
         if enforce_underlying_match and high_confidence and resolved_code and resolved_code != underlying_code:
@@ -9483,7 +9610,15 @@ def repair_history_metadata_from_warrants(history_df, warrants):
 
     依日期分組後以 Series.map + .loc 批次比較與回寫，避免逐列 .at。
     """
-    stats = {"rows": 0, "warrant_name": 0, "underlying_code": 0, "underlying_name": 0}
+    global _HISTORY_IDENTITY_REPAIR_DATES
+
+    stats = {
+        "rows": 0,
+        "warrant_name": 0,
+        "underlying_code": 0,
+        "underlying_name": 0,
+        "dates": [],
+    }
     if not WARRANT_IDENTITY_REPAIR_HISTORY or history_df is None or history_df.empty or not warrants:
         return history_df, stats
     required = {"權證代號", "權證名稱", "標的股", "標的名稱", "日期"}
@@ -9513,10 +9648,23 @@ def repair_history_metadata_from_warrants(history_df, warrants):
             continue
 
         for column, meta_key, stat_key, normalizer in field_specs:
-            new_values = metas.map(
-                lambda meta, _key=meta_key, _normalizer=normalizer:
-                    _normalizer(meta.get(_key, "")) if isinstance(meta, dict) else ""
-            )
+            if column == "權證名稱":
+                new_values = metas.map(
+                    lambda meta:
+                        safe_warrant_name_for_identity(
+                            meta.get("代號", ""),
+                            meta.get("名稱", ""),
+                            meta.get("標的股", ""),
+                            meta.get("標的名稱", ""),
+                        )
+                        if isinstance(meta, dict)
+                        else ""
+                )
+            else:
+                new_values = metas.map(
+                    lambda meta, _key=meta_key, _normalizer=normalizer:
+                        _normalizer(meta.get(_key, "")) if isinstance(meta, dict) else ""
+                )
             old_values = out.loc[group_index, column].fillna("").astype(str).str.strip()
             change_mask = has_meta & new_values.ne("") & old_values.ne(new_values)
             if not bool(change_mask.any()):
@@ -9528,6 +9676,15 @@ def repair_history_metadata_from_warrants(history_df, warrants):
             stats[stat_key] += int(change_mask.sum())
 
     stats["rows"] = int(changed_row_mask.sum())
+    if stats["rows"] > 0:
+        changed_dates = sorted({
+            normalize_date_str(value)
+            for value in out.loc[changed_row_mask, "日期"].tolist()
+            if parse_date(value)
+        })
+        stats["dates"] = changed_dates
+        if not workflow_is_repair():
+            _HISTORY_IDENTITY_REPAIR_DATES.update(changed_dates)
     return out, stats
 
 
@@ -9996,9 +10153,15 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
         sell_qty = int(sell_qty or 0)
         buy_amount = int(buy_amount or 0)
         sell_amount = int(sell_amount or 0)
+        warrant_name = safe_warrant_name_for_identity(
+            warrant.get("代號", wcode),
+            warrant.get("名稱", ""),
+            warrant.get("標的股", ""),
+            warrant.get("標的名稱", ""),
+        )
         records.append({
             "權證代號": str(warrant.get("代號", wcode)).strip(),
-            "權證名稱": str(warrant.get("名稱", "")).strip(),
+            "權證名稱": warrant_name,
             "標的股": str(warrant.get("標的股", "")).strip(),
             "標的名稱": str(warrant.get("標的名稱", "")).strip(),
             "分點": label,
@@ -10896,6 +11059,18 @@ def get_all_call_warrants_live(cached_warrants=None):
             name_guard_count += 1
 
         final_underlying_name = str(stock_code_to_name.get(final_underlying, final_underlying_name)).strip()
+        guarded_final_name = safe_warrant_name_for_identity(
+            code,
+            final_name,
+            final_underlying,
+            final_underlying_name,
+            resolver=_CURRENT_UNDERLYING_RESOLVER,
+            code_to_name=stock_code_to_name,
+        )
+        if guarded_final_name != final_name:
+            name_guard_count += 1
+            final_name_source = "code_only_final_identity_guard"
+        final_name = guarded_final_name
         warrants.append({
             "代號": code,
             "名稱": final_name,
@@ -11070,8 +11245,103 @@ def find_broker_codes(warrants=None):
 # 建立每日資料，用於新制 A/B/C/D/E 金額強度分類
 # ══════════════════════════════════════════════════════════════════════
 
+def _event_warrant_identity_for_date(item, trade_date):
+    """
+    在建立 ABCDE 事件前，再以「權證代號＋交易日」確認權證名稱與標的。
+
+    這是事件分組前的最後防線：日期化對照可用時一律以其為準；若權證名稱
+    唯一指向另一標的，將整筆移到正確標的，而不是讓它混入原標的的權證清單。
+    無法證實名稱與標的一致時保留代號與交易數字，但名稱降級為代號。
+    """
+    warrant_code = normalize_security_code_text(item.get("warrant_code", ""))
+    warrant_name = str(item.get("warrant_name", "") or "").strip()
+    underlying_code = normalize_security_code_text(item.get("underlying_code", ""))
+    underlying_name = str(item.get("underlying_name", "") or "").strip()
+    changed = False
+
+    if warrant_code and _CURRENT_WARRANT_INTERVAL_RECORDS:
+        dated_meta = _warrant_lookup(
+            _CURRENT_WARRANT_INTERVAL_RECORDS,
+            trade_date,
+        ).get(warrant_code)
+        if isinstance(dated_meta, dict):
+            meta_name = str(dated_meta.get("名稱", "") or "").strip()
+            meta_underlying = normalize_security_code_text(
+                dated_meta.get("標的股", "")
+            )
+            meta_underlying_name = str(
+                dated_meta.get("標的名稱", "") or ""
+            ).strip()
+            if meta_name and meta_name != warrant_name:
+                warrant_name = meta_name
+                changed = True
+            if meta_underlying and meta_underlying != underlying_code:
+                underlying_code = meta_underlying
+                changed = True
+            if meta_underlying_name and meta_underlying_name != underlying_name:
+                underlying_name = meta_underlying_name
+                changed = True
+
+    resolved = resolve_underlying_from_warrant_name(
+        warrant_name,
+        _CURRENT_UNDERLYING_RESOLVER,
+    )
+    if resolved:
+        resolved_code = normalize_security_code_text(
+            resolved.get("stock_code", "")
+        )
+        high_confidence = bool(
+            resolved.get("is_special")
+            or resolved.get("is_exact_alias")
+            or resolved.get("is_unambiguous_prefix")
+            or int(resolved.get("prefix_len", 0) or 0)
+            >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
+        )
+        if (
+            WARRANT_IDENTITY_RECONCILE_ENABLED
+            and high_confidence
+            and resolved_code
+            and resolved_code != underlying_code
+        ):
+            underlying_code = resolved_code
+            underlying_name = str(
+                _CURRENT_STOCK_CODE_TO_NAME.get(
+                    resolved_code,
+                    resolved.get("stock_name", ""),
+                )
+            ).strip()
+            changed = True
+
+    expected_underlying_name = str(
+        _CURRENT_STOCK_CODE_TO_NAME.get(underlying_code, underlying_name)
+    ).strip()
+    if expected_underlying_name:
+        underlying_name = expected_underlying_name
+
+    if (
+        warrant_name
+        and _normalize_warrant_code_for_identity(warrant_name) != warrant_code
+        and expected_underlying_name
+        and not _warrant_name_matches_stock_name(
+            warrant_name,
+            expected_underlying_name,
+        )
+    ):
+        warrant_name = warrant_code
+        changed = True
+
+    return {
+        "warrant_code": warrant_code,
+        "warrant_name": warrant_name or warrant_code,
+        "underlying_code": underlying_code,
+        "underlying_name": underlying_name,
+        "changed": changed,
+    }
+
+
 def build_daily_records(items):
     daily_records = []
+    identity_corrected = 0
 
     for item in items:
         if not item["underlying_code"]:
@@ -11079,15 +11349,23 @@ def build_daily_records(items):
 
         for row in item["df"].itertuples(index=False):
             row_dict = row._asdict()
+            identity = _event_warrant_identity_for_date(
+                item,
+                row_dict["日期"],
+            )
+            if identity["changed"]:
+                identity_corrected += 1
+            if not identity["underlying_code"] or not identity["warrant_code"]:
+                continue
             daily_records.append({
                 "日期": row_dict["日期"],
                 "分點": item["broker_label"],
                 "分點名稱": item["broker_name"],
                 "券商代號": item["broker_code"],
-                "權證代號": item["warrant_code"],
-                "權證名稱": item["warrant_name"],
-                "標的股": item["underlying_code"],
-                "標的名稱": item.get("underlying_name", ""),
+                "權證代號": identity["warrant_code"],
+                "權證名稱": identity["warrant_name"],
+                "標的股": identity["underlying_code"],
+                "標的名稱": identity["underlying_name"],
                 "買進股數": int(row_dict["買進股數"]),
                 "賣出股數": int(row_dict["賣出股數"]),
                 "買進金額": int(row_dict["買進金額"]),
@@ -11095,6 +11373,12 @@ def build_daily_records(items):
                 "買超股數": int(row_dict["買超股數"]),
                 "買超金額": int(row_dict["買超金額"]),
             })
+
+    if identity_corrected:
+        print(
+            f"  🧭 ABCDE 分組前權證身分防錯：修正／降級 "
+            f"{identity_corrected:,} 筆，禁止跨標的混入權證清單"
+        )
 
     return daily_records
 
@@ -11226,7 +11510,10 @@ def build_amount_class_events(daily_records, item_map):
 
             if buy_amount > max_single_amount:
                 max_single_amount = buy_amount
-                max_single_warrant = f'{wr["權證代號"]} {wr["權證名稱"]}'
+                max_single_warrant = format_warrant_identity_label(
+                    wr["權證代號"],
+                    wr["權證名稱"],
+                )
 
             lots.append({
                 "買進日": date,
@@ -11267,7 +11554,10 @@ def build_amount_class_events(daily_records, item_map):
             "結束日": date,
             "事件日": date,
             "涵蓋權證數": warrant_count,
-            "權證清單": "；".join([f'{lot["權證代號"]} {lot["權證名稱"]}' for lot in lots]),
+            "權證清單": "；".join([
+                format_warrant_identity_label(lot["權證代號"], lot["權證名稱"])
+                for lot in lots
+            ]),
             "最大單筆金額": max_single_amount,
             "最大單筆權證": max_single_warrant,
             "單日累積買進金額": total_amount,
@@ -21657,6 +21947,51 @@ def main():
     )
     all_changed_price_codes.update(changed_codes)
 
+    if not workflow_is_repair() and _HISTORY_IDENTITY_REPAIR_DATES:
+        repaired_date_keys = set(_HISTORY_IDENTITY_REPAIR_DATES)
+        cache_only_codes = set()
+        for _event_code, event_group in iter_amount_class_event_groups(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            e_events,
+        ):
+            for event in event_group:
+                event_date_key = normalize_date_str(
+                    event.get("事件日")
+                    or event.get("結束日")
+                    or event.get("起始日")
+                )
+                if event_date_key not in repaired_date_keys:
+                    continue
+                underlying_code = normalize_price_code(event.get("標的股", ""))
+                if underlying_code:
+                    cache_only_codes.add(underlying_code)
+                if FETCH_GROUP_WARRANT_PRICES:
+                    for lot in event.get("lots", []):
+                        warrant_code = normalize_price_code(
+                            lot.get("權證代號", "")
+                        )
+                        if warrant_code:
+                            cache_only_codes.add(warrant_code)
+
+        loaded_cache_only_codes = 0
+        for code in sorted(cache_only_codes):
+            cached_prices = get_cached_prices_for_code(
+                persistent_price_cache,
+                code,
+            )
+            if not cached_prices:
+                continue
+            add_price_aliases(price_cache, code, cached_prices)
+            loaded_cache_only_codes += 1
+        print(
+            f"  🧩 身分修復日期價格只讀快取："
+            f"{loaded_cache_only_codes:,}/{len(cache_only_codes):,} 檔；"
+            "未發出歷史價格請求"
+        )
+
     top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache,
@@ -21712,12 +22047,24 @@ def main():
         )
         extra_scope_values = read_excel_values_by_title(selected_output_path, allowed_titles=set(DAILY_RESULT_SHEET_TITLES))
 
+    sheet_refresh_dates = normalize_date_str(target_date)
+    if not workflow_is_repair() and _HISTORY_IDENTITY_REPAIR_DATES:
+        sheet_refresh_dates = sorted(
+            set(_HISTORY_IDENTITY_REPAIR_DATES)
+            | {normalize_date_str(target_date)}
+        )
+        print(
+            f"  🩹 Google Sheet 權證身分自動修復：除今日外同步重建 "
+            f"{len(set(sheet_refresh_dates) - {normalize_date_str(target_date)}):,} 個受影響日期；"
+            "不重新抓歷史 API"
+        )
+
     upload_excel_to_google_sheet(
         output_path,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allowed_titles=(FULL_REPAIR_RESULT_SHEET_TITLES if workflow_is_repair() else DAILY_RESULT_SHEET_TITLES),
         extra_scope_values=extra_scope_values,
-        refresh_date=target_date,
+        refresh_date=sheet_refresh_dates,
     )
 
     elapsed = time.time() - program_start
