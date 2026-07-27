@@ -80,7 +80,7 @@ jobs:
 
           # GitHub-hosted runner 最長約六小時；提前送出 SIGINT，
           # 讓程式保留已完成日期，並留時間保存 cache 與上傳報表。
-          timeout --signal=INT --kill-after=2m 5h25m \
+          timeout --signal=INT --kill-after=2m 325m \
             python warrant_broker_ma_history.py
           status=$?
 
