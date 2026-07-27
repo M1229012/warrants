@@ -5091,6 +5091,7 @@ def prepare_repair_full_overwrite_values(
     else:
         values = raw_values
 
+    values = sort_abcde_result_values(title, values)
     return normalize_result_values_for_comma_numbers(values)
 
 
@@ -5541,6 +5542,57 @@ def _record_key(rec, key_cols):
         _normalize_result_key_value(col, rec.get(col, ""))
         for col in key_cols
     )
+
+
+def _abcde_result_sort_amount(value):
+    try:
+        return int(round(float(str(value or "0").replace(",", "").strip() or 0)))
+    except Exception:
+        return 0
+
+
+def sort_abcde_result_values(title, values):
+    """
+    ABCDE 固定排序：
+    資料範圍分區（全分點在前、精選五分點在後）→ 日期新到舊 →
+    分點 → 標的股 → 單日累積買進金額大到小。
+    """
+    if safe_worksheet_title(title) not in AMOUNT_CLASS_SHEET_NAMES:
+        return values
+    if _find_simple_header_row(values) != 0:
+        return values
+
+    headers, records = _values_to_records(
+        values,
+        header_row_idx=0,
+        default_scope="全分點",
+    )
+    if not headers:
+        return values
+
+    scope_order = {"全分點": 0, "精選五分點": 1}
+
+    def sort_key(record):
+        scope = str(
+            strip_gsheet_text_prefix(record.get("資料範圍", ""))
+        ).strip() or "全分點"
+        event_dt = _parse_result_record_date(record.get("事件日", ""))
+        date_ordinal = event_dt.toordinal() if event_dt else datetime.min.toordinal()
+        underlying = normalize_underlying_code_for_group(record.get("標的股", ""))
+        if not underlying:
+            underlying = str(record.get("標的股", "") or "").strip()
+        return (
+            scope_order.get(scope, 2),
+            scope if scope not in scope_order else "",
+            -date_ordinal,
+            normalize_stock_name_text(record.get("分點", "")),
+            underlying,
+            -_abcde_result_sort_amount(record.get("單日累積買進金額", 0)),
+            str(record.get("事件類型", "") or ""),
+        )
+
+    records = sorted(records, key=sort_key)
+    return _records_to_values(headers, records)
 
 
 
@@ -7194,6 +7246,98 @@ def _insert_rows_below_header(ws, rows):
         return False
 
 
+def sort_abcde_worksheet_rows(ws, title, values=None):
+    """
+    以 Google Sheets sortRange 在伺服器端排序 ABCDE，不重寫整張資料。
+
+    先把舊版空白資料範圍補成「全分點」，再依：
+    資料範圍 → 事件日（新到舊）→ 分點 → 標的股 → 金額（大到小）。
+    """
+    if safe_worksheet_title(title) not in AMOUNT_CLASS_SHEET_NAMES:
+        return True
+
+    values = values or _worksheet_values_with_formulas(ws)
+    if not values or _find_simple_header_row(values) != 0:
+        return False
+
+    headers = [str(header).strip() for header in values[0]]
+    while headers and headers[-1] == "":
+        headers.pop()
+    required_headers = {
+        "資料範圍",
+        "事件日",
+        "分點",
+        "標的股",
+        "單日累積買進金額",
+    }
+    if not required_headers.issubset(headers):
+        print(
+            f"  ⚠️ ABCDE 排序欄位不完整：{safe_worksheet_title(title)}｜"
+            f"缺少 {'、'.join(sorted(required_headers - set(headers)))}"
+        )
+        return False
+
+    scope_idx = headers.index("資料範圍")
+    blank_scope_updates = []
+    scope_col_letter = get_column_letter(scope_idx + 1)
+    for row_no, row in enumerate(values[1:], start=2):
+        scope_value = row[scope_idx] if scope_idx < len(row) else ""
+        if not str(strip_gsheet_text_prefix(scope_value) or "").strip():
+            blank_scope_updates.append({
+                "range": f"{scope_col_letter}{row_no}",
+                "values": [["全分點"]],
+            })
+    if blank_scope_updates:
+        gsheet_values_batch_update(
+            ws,
+            blank_scope_updates,
+            f"補齊 ABCDE 資料範圍 {safe_worksheet_title(title)}",
+            chunk_size=5000,
+        )
+
+    if len(values) <= 2:
+        return True
+
+    try:
+        sheet_id = int(ws.id)
+    except Exception:
+        return False
+
+    sort_specs = [
+        ("資料範圍", "ASCENDING"),
+        ("事件日", "DESCENDING"),
+        ("分點", "ASCENDING"),
+        ("標的股", "ASCENDING"),
+        ("單日累積買進金額", "DESCENDING"),
+    ]
+    request = {
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": len(values),
+                "startColumnIndex": 0,
+                "endColumnIndex": len(headers),
+            },
+            "sortSpecs": [
+                {
+                    "dimensionIndex": headers.index(header),
+                    "sortOrder": direction,
+                }
+                for header, direction in sort_specs
+            ],
+        }
+    }
+    if not _gsheet_batch_update([request]):
+        return False
+
+    print(
+        f"  ↕️ Google Sheet ABCDE 排序完成：{safe_worksheet_title(title)}｜"
+        "資料範圍分區 → 日期新到舊 → 分點 → 股號 → 金額大到小"
+    )
+    return True
+
+
 
 def is_top15_snapshot_replace_sheet(title):
     """TOP15 快取表使用同日快照替換，不走一般 insert-only 同步。"""
@@ -7999,6 +8143,7 @@ def upload_excel_to_google_sheet(
             else:
                 values = raw_values
 
+            values = sort_abcde_result_values(title, values)
             values = normalize_result_values_for_comma_numbers(values)
             if not write_values_to_worksheet(gws, values):
                 raise RuntimeError(f"第一次建立後寫入失敗：{title}")
@@ -8026,6 +8171,10 @@ def upload_excel_to_google_sheet(
             if daily_result is None:
                 raise RuntimeError(f"daily 日期替換失敗：{title}")
             current_values = daily_result.get("values") or _worksheet_values_with_formulas(gws)
+            if not sort_abcde_worksheet_rows(gws, title, values=current_values):
+                raise RuntimeError(f"ABCDE 排序失敗：{title}")
+            if safe_worksheet_title(title) in AMOUNT_CLASS_SHEET_NAMES:
+                current_values = _worksheet_values_with_formulas(gws)
             clear_all_number_formats_for_written_range(gws, values=current_values)
             apply_safe_result_table_style_to_gsheet(gws, values=current_values)
             apply_text_format_to_gsheet(gws, current_values)
@@ -8802,15 +8951,22 @@ def _looks_like_warrant_security_name(name):
     return bool(name and ("購" in name or "售" in name) and len(name) >= 4)
 
 
-def build_canonical_stock_master(stock_df):
+def build_canonical_stock_master(stock_df, excluded_security_codes=None):
     """
     建立唯一且穩定的「股號→股名」主檔。
 
     TaiwanStockInfo 可能保留同代號的多筆歷史紀錄；優先選 date 最新的一列，
     同日仍有重複時才用名稱出現次數與原始順序決定，避免 dict(zip) 任意取最後列。
+    TaiwanStockInfoWithWarrant 只作標的名稱補充；已知權證代號必須排除，
+    即使該列名稱沒有「購／售」字樣，也不得被誤當成標的股。
     """
     code_to_name = {}
     name_to_code = {}
+    excluded_codes = {
+        normalize_security_code_text(code)
+        for code in (excluded_security_codes or [])
+        if normalize_security_code_text(code)
+    }
     if stock_df is None or stock_df.empty:
         return code_to_name, name_to_code
     if not {"stock_id", "stock_name"}.issubset(stock_df.columns):
@@ -8830,6 +8986,8 @@ def build_canonical_stock_master(stock_df):
         code = normalize_security_code_text(raw_code)
         name = str(raw_name or "").strip()
         if not code or not name:
+            continue
+        if code in excluded_codes:
             continue
         if not re.fullmatch(r"[0-9A-Z]{4,12}", code):
             continue
@@ -8865,7 +9023,57 @@ def build_canonical_stock_master(stock_df):
 
 
 
-def make_stock_aliases(stock_name, exact_stock_names=None):
+_STOCK_NAME_SUFFIXES = [
+    "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
+    "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業",
+    "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品",
+    "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥",
+]
+
+
+def _stock_name_validation_prefixes(stock_name):
+    """只產生完整名稱與公司型態後綴簡稱，不使用任意前兩字作身分驗證。"""
+    name = normalize_stock_name_text(stock_name)
+    if not name:
+        return set()
+
+    prefixes = {name}
+    stripped = name
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _STOCK_NAME_SUFFIXES:
+            if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
+                stripped = stripped[:-len(suffix)]
+                prefixes.add(stripped)
+                changed = True
+                break
+    return {prefix for prefix in prefixes if len(prefix) >= 2}
+
+
+def _warrant_name_matches_stock_name(warrant_name, stock_name):
+    wname = normalize_stock_name_text(warrant_name)
+    return bool(
+        wname
+        and any(
+            wname.startswith(prefix)
+            for prefix in _stock_name_validation_prefixes(stock_name)
+        )
+    )
+
+
+def _stock_names_share_validation_alias(left_name, right_name):
+    return bool(
+        _stock_name_validation_prefixes(left_name)
+        & _stock_name_validation_prefixes(right_name)
+    )
+
+
+def make_stock_aliases(
+    stock_name,
+    exact_stock_names=None,
+    allow_exact_name_collisions=False,
+):
     """建立安全的股名別名，避免短別名撞到另一檔正式股名。"""
     name = normalize_stock_name_text(stock_name)
     aliases = set()
@@ -8874,22 +9082,19 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
 
     exact_stock_names = exact_stock_names or set()
     aliases.add(name)
-    suffixes = [
-        "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
-        "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業",
-        "企業", "國際", "控股", "投控", "控", "建設", "營造", "食品",
-        "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥",
-    ]
-
     stripped = name
     changed = True
     while changed:
         changed = False
-        for suffix in suffixes:
+        for suffix in _STOCK_NAME_SUFFIXES:
             if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
                 candidate = stripped[:-len(suffix)]
                 stripped = candidate
-                if candidate not in exact_stock_names or candidate == name:
+                if (
+                    allow_exact_name_collisions
+                    or candidate not in exact_stock_names
+                    or candidate == name
+                ):
                     aliases.add(candidate)
                 changed = True
                 break
@@ -8904,7 +9109,22 @@ def make_stock_aliases(stock_name, exact_stock_names=None):
     return {alias for alias in aliases if len(alias) >= 2 and alias not in dangerous_aliases}
 
 
-def build_underlying_resolver_from_stock_master(code_to_name):
+def build_underlying_resolver_from_stock_master(
+    code_to_name,
+    preferred_code_counts=None,
+):
+    """
+    建立權證名稱前綴解析器。
+
+    relevant warrant summary 中經常作為 target_stock_id 的現行標的優先。
+    這可處理「日月光」同時是舊代號 2311 正式名稱、又是現行
+    3711「日月光投控」簡稱的情況；不再讓舊代號覆蓋有效 target_stock_id。
+    """
+    preferred_counts = Counter({
+        normalize_security_code_text(code): int(count or 0)
+        for code, count in dict(preferred_code_counts or {}).items()
+        if normalize_security_code_text(code)
+    })
     exact_names = {
         normalize_stock_name_text(name)
         for name in (code_to_name or {}).values()
@@ -8927,18 +9147,24 @@ def build_underlying_resolver_from_stock_master(code_to_name):
             "stock_code": code,
             "stock_name": name,
             "stock_name_len": len(name_norm),
+            "preferred_score": int(preferred_counts.get(code, 0)),
         })
 
     for code, name in (code_to_name or {}).items():
         name_norm = normalize_stock_name_text(name)
         add_candidate(name_norm, code, name, True)
-        for alias in make_stock_aliases(name, exact_names):
+        for alias in make_stock_aliases(
+            name,
+            exact_names,
+            allow_exact_name_collisions=preferred_counts.get(code, 0) > 0,
+        ):
             alias_norm = normalize_stock_name_text(alias)
             add_candidate(alias_norm, code, name, alias_norm == name_norm)
 
     candidates.sort(
         key=lambda rec: (
             rec["prefix_len"],
+            rec["preferred_score"],
             1 if rec["is_exact_alias"] else 0,
             -rec["stock_name_len"],
         ),
@@ -9020,6 +9246,7 @@ def reconcile_underlying_identity(
     underlying_name="",
     code_to_name=None,
     resolver=None,
+    preferred_code_counts=None,
 ):
     """
     交叉驗證標的身分，並保證回傳的股號與股名來自同一筆主檔。
@@ -9029,10 +9256,14 @@ def reconcile_underlying_identity(
     """
     code_to_name = code_to_name if code_to_name is not None else _CURRENT_STOCK_CODE_TO_NAME
     resolver = resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER
+    preferred_counts = Counter({
+        normalize_security_code_text(code): int(count or 0)
+        for code, count in dict(preferred_code_counts or {}).items()
+        if normalize_security_code_text(code)
+    })
     raw_code = normalize_security_code_text(underlying_code)
     raw_name = str(underlying_name or "").strip()
     master_name = str((code_to_name or {}).get(raw_code, "")).strip()
-    wname_norm = normalize_stock_name_text(warrant_name)
     resolved = resolve_underlying_from_warrant_name(warrant_name, resolver)
 
     chosen_code = raw_code
@@ -9051,11 +9282,25 @@ def reconcile_underlying_identity(
             chosen_code = resolved_code
             source = "warrant_name"
         elif resolved_code and resolved_code != chosen_code and high_confidence:
-            summary_name_norm = normalize_stock_name_text(master_name or raw_name)
-            summary_name_matches = bool(summary_name_norm and wname_norm.startswith(summary_name_norm))
-            if not summary_name_matches:
+            summary_name = master_name or raw_name
+            summary_name_matches = _warrant_name_matches_stock_name(
+                warrant_name,
+                summary_name,
+            )
+            preferred_current_override = bool(
+                summary_name_matches
+                and _warrant_name_matches_stock_name(warrant_name, resolved_name)
+                and _stock_names_share_validation_alias(summary_name, resolved_name)
+                and preferred_counts.get(resolved_code, 0)
+                > preferred_counts.get(chosen_code, 0)
+            )
+            if not summary_name_matches or preferred_current_override:
                 chosen_code = resolved_code
-                source = "warrant_name_override"
+                source = (
+                    "target_frequency_override"
+                    if preferred_current_override
+                    else "warrant_name_override"
+                )
         elif resolved_code == chosen_code:
             source = "summary_verified"
 
@@ -10422,6 +10667,52 @@ def cleanup_deleted_broker_rows_in_existing_worksheets():
         print("  ✅ Google Sheet 舊分點資料檢查完成：沒有需要清除的失效分點列，未刪除任何工作表。")
 
 
+def _warrant_summary_identity_preferences(summary_df):
+    """
+    從近期權證 Summary 建立：
+    1. 所有權證代號集合，禁止混入標的股票主檔。
+    2. 近期 target_stock_id 使用次數，解決現行公司簡稱與舊股票名稱撞名。
+    """
+    if summary_df is None or summary_df.empty:
+        return set(), Counter()
+    required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
+    if not required.issubset(summary_df.columns):
+        return set(), Counter()
+
+    work = summary_df[list(required)].copy().fillna("")
+    warrant_mask = work["type"].astype(str).str.contains("認購|認售", regex=True, na=False)
+    warrant_codes = {
+        normalize_security_code_text(code)
+        for code in work.loc[warrant_mask, "stock_id"].tolist()
+        if normalize_security_code_text(code)
+    }
+
+    work["_list_date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["_end_date"] = pd.to_datetime(work["end_date"], errors="coerce")
+    today = pd.Timestamp(datetime.today().date())
+    lookback_days = max(
+        int(os.getenv(
+            "WARRANT_METADATA_LOOKBACK_DAYS",
+            str(max(HISTORY_RETENTION_TRADING_DAYS * 2, 420)),
+        )),
+        365,
+    )
+    cutoff = today - pd.Timedelta(days=lookback_days)
+    relevant_mask = (
+        warrant_mask
+        & work["_list_date"].notna()
+        & work["_end_date"].notna()
+        & (work["_list_date"] <= today)
+        & (work["_end_date"] >= cutoff)
+    )
+    preferred_counts = Counter(
+        normalize_security_code_text(code)
+        for code in work.loc[relevant_mask, "target_stock_id"].tolist()
+        if normalize_security_code_text(code)
+    )
+    return warrant_codes, preferred_counts
+
+
 def get_all_call_warrants_live(cached_warrants=None):
     global LIVE_WARRANT_SNAPSHOT_READY, CURRENT_LIVE_WARRANT_CODES
     global _CURRENT_STOCK_CODE_TO_NAME, _CURRENT_STOCK_NAME_TO_CODE, _CURRENT_UNDERLYING_RESOLVER
@@ -10441,6 +10732,10 @@ def get_all_call_warrants_live(cached_warrants=None):
         LIVE_WARRANT_SNAPSHOT_READY = False
         return []
 
+    warrant_security_codes, preferred_underlying_counts = (
+        _warrant_summary_identity_preferences(summary_df)
+    )
+
     # 先建立唯一股號／股名主檔，禁止再用 dict(zip) 的最後一列任意覆蓋。
     # TaiwanStockInfo 為主；TaiwanStockInfoWithWarrant 中非權證的標的／指數名稱只做補充。
     stock_master_parts = []
@@ -10452,10 +10747,16 @@ def get_all_call_warrants_live(cached_warrants=None):
             info_master["date"] = ""
         stock_master_parts.append(info_master)
     stock_master_df = pd.concat(stock_master_parts, ignore_index=True, sort=False) if stock_master_parts else pd.DataFrame()
-    stock_code_to_name, stock_name_to_code = build_canonical_stock_master(stock_master_df)
+    stock_code_to_name, stock_name_to_code = build_canonical_stock_master(
+        stock_master_df,
+        excluded_security_codes=warrant_security_codes,
+    )
     _CURRENT_STOCK_CODE_TO_NAME = stock_code_to_name
     _CURRENT_STOCK_NAME_TO_CODE = stock_name_to_code
-    _CURRENT_UNDERLYING_RESOLVER = build_underlying_resolver_from_stock_master(stock_code_to_name)
+    _CURRENT_UNDERLYING_RESOLVER = build_underlying_resolver_from_stock_master(
+        stock_code_to_name,
+        preferred_code_counts=preferred_underlying_counts,
+    )
     _reset_underlying_resolver_runtime_cache(_CURRENT_UNDERLYING_RESOLVER)
     cached_warrant_index = build_cached_warrant_index(cached_warrants)
 
@@ -10498,6 +10799,7 @@ def get_all_call_warrants_live(cached_warrants=None):
     active_codes = set()
     identity_override_count = 0
     name_guard_count = 0
+    invalid_underlying_skipped_count = 0
 
     for code, summary_underlying, list_ts, end_ts in summary[
         ["stock_id", "target_stock_id", "_list_date", "_end_date"]
@@ -10525,9 +10827,37 @@ def get_all_call_warrants_live(cached_warrants=None):
             stock_code_to_name.get(summary_underlying, ""),
             code_to_name=stock_code_to_name,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
+            preferred_code_counts=preferred_underlying_counts,
         )
-        if identity_source == "warrant_name_override":
+        if identity_source.endswith("_override"):
             identity_override_count += 1
+
+        # 最後一道防線：標的股必須存在於已排除權證代號後的股票主檔。
+        # 若 Summary 把另一檔權證代號放進 target_stock_id，嘗試以權證名稱修正；
+        # 仍無法得到有效標的時直接略過，禁止錯號進入快取、Sheet 與圖片。
+        if (
+            final_underlying in warrant_security_codes
+            or final_underlying not in stock_code_to_name
+        ):
+            resolved = resolve_underlying_from_warrant_name(
+                provisional_name,
+                _CURRENT_UNDERLYING_RESOLVER,
+            )
+            resolved_code = normalize_security_code_text(
+                (resolved or {}).get("stock_code", "")
+            )
+            if (
+                resolved_code
+                and resolved_code not in warrant_security_codes
+                and resolved_code in stock_code_to_name
+            ):
+                final_underlying = resolved_code
+                final_underlying_name = stock_code_to_name[resolved_code]
+                identity_source = "invalid_target_override"
+                identity_override_count += 1
+            else:
+                invalid_underlying_skipped_count += 1
+                continue
 
         # 以更正後標的再挑一次名稱；可處理 Summary 錯標但權證名稱正確的情況。
         final_name, final_name_source = select_warrant_name_for_interval(
@@ -10569,6 +10899,7 @@ def get_all_call_warrants_live(cached_warrants=None):
         f"  ✅ FinMind 認購權證日期區間紀錄：{len(warrants):,} 筆｜"
         f"今日有效代號：{len(active_codes):,} 支｜"
         f"標的交叉更正：{identity_override_count:,} 筆｜"
+        f"無法確認標的略過：{invalid_underlying_skipped_count:,} 筆｜"
         f"權證名稱防錯降級：{name_guard_count:,} 筆"
     )
     return warrants
@@ -14662,6 +14993,7 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
             -((parse_date(x.get(sort_date_field) or x.get("事件日") or x.get("起始日")) or datetime.min).toordinal()),
             str(x.get("分點", "")),
             str(x.get("標的股", "")),
+            -_safe_stat_amount(x.get("單日累積買進金額", x.get("買超金額", 0))),
         )
     )
 
