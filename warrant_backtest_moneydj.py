@@ -60,7 +60,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260727-R7-TOP15-PATTERN"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R6"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
