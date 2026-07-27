@@ -76,6 +76,7 @@ _CURRENT_STOCK_CODE_TO_NAME = {}
 _CURRENT_STOCK_NAME_TO_CODE = {}
 _CURRENT_UNDERLYING_RESOLVER = []
 _CURRENT_WARRANT_INTERVAL_RECORDS = []
+_CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = {}
 _HISTORY_IDENTITY_REPAIR_DATES = set()
 
 # 權證身分配對效能快取：只快取索引與既有判斷結果，不改變任何身分判斷規則。
@@ -9178,13 +9179,13 @@ def safe_warrant_name_for_identity(
             or int(resolved.get("prefix_len", 0) or 0)
             >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
         )
-        if (
-            high_confidence
-            and underlying_code
-            and resolved_code
-            and resolved_code != underlying_code
-        ):
-            return code
+        if high_confidence and underlying_code and resolved_code:
+            if resolved_code != underlying_code:
+                return code
+            # 權證名稱解析出的股號與日期化標的股完全一致時，名稱已通過身分驗證。
+            # 不再要求字串必須以股票主檔全名開頭，否則「臻鼎」對「臻鼎-KY」、
+            # 「台灣50」對「元大台灣50」等正確市場簡稱會被誤降級成純代號。
+            return name
 
     if expected_name and not _warrant_name_matches_stock_name(name, expected_name):
         return code
@@ -9532,7 +9533,11 @@ def select_warrant_name_for_interval(
     scored = []
     for name, source_priority, source in dedup.values():
         score = source_priority
-        if name != code:
+        if _normalize_warrant_code_for_identity(name) == code:
+            # 純代號只是最後備援，不能因 cache_exact 的來源分數較高，
+            # 反而壓過 FinMind／舊區間中可驗證為同一標的的完整名稱。
+            score -= 2000
+        else:
             score += 20
         if "購" in name:
             score += 20
@@ -10899,10 +10904,59 @@ def _warrant_summary_identity_preferences(summary_df):
     return warrant_codes, preferred_counts
 
 
+def fetch_current_official_isin_warrant_names():
+    """
+    從 TWSE ISIN 上市／上櫃清單取得目前權證代號→名稱。
+
+    FinMind 名稱缺漏或舊快取只剩代號時才呼叫；這裡只補名稱，不取代
+    FinMind Summary 的日期區間。名稱仍須通過標的股交叉驗證才會採用。
+    """
+    names = {}
+    success_markets = 0
+    for market_name, mode in (("上市", "2"), ("上櫃", "4")):
+        try:
+            response = get_thread_session().get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers={"User-Agent": MONEYDJ_HEADERS["User-Agent"]},
+                timeout=(5, 30),
+            )
+            response.raise_for_status()
+            response.encoding = "cp950"
+            tables = pd.read_html(StringIO(response.text))
+            success_markets += 1
+        except Exception as exc:
+            print(
+                f"  ⚠️ {market_name} ISIN 權證名稱備援失敗："
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        for table in tables:
+            if table is None or table.empty:
+                continue
+            first_column = table.iloc[:, 0].fillna("").astype(str)
+            for cell in first_column.tolist():
+                text = str(cell or "").strip()
+                match = re.match(r"^'?([0-9A-Za-z]{6})[\s\u3000]+(.+?)\s*$", text)
+                if not match:
+                    continue
+                code = normalize_security_code_text(match.group(1))
+                name = str(match.group(2) or "").strip()
+                if code and name and "購" in name:
+                    names[code] = name
+
+    print(
+        f"  {'✅' if success_markets == 2 else '⚠️'} ISIN 權證名稱備援："
+        f"市場 {success_markets}/2｜取得 {len(names):,} 個認購權證名稱"
+    )
+    return names
+
+
 def get_all_call_warrants_live(cached_warrants=None):
     global LIVE_WARRANT_SNAPSHOT_READY, CURRENT_LIVE_WARRANT_CODES
     global _CURRENT_STOCK_CODE_TO_NAME, _CURRENT_STOCK_NAME_TO_CODE, _CURRENT_UNDERLYING_RESOLVER
     global _CURRENT_WARRANT_INTERVAL_RECORDS
+    global _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE
 
     print("【Step 1】FinMind 取得認購權證清單與日期化標的對照...")
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -11083,12 +11137,88 @@ def get_all_call_warrants_live(cached_warrants=None):
         })
 
     warrants = dedupe_warrant_interval_records(warrants, resolver=_CURRENT_UNDERLYING_RESOLVER)
+    today_dt = datetime.today()
+    unresolved_active_records = [
+        rec
+        for rec in warrants
+        if parse_date(rec.get("上市日", "")) <= today_dt
+        <= parse_date(rec.get("最後交易日", ""))
+        and _normalize_warrant_code_for_identity(rec.get("名稱", ""))
+        == _normalize_warrant_code_for_identity(rec.get("代號", ""))
+    ]
+    isin_name_recovered_count = 0
+    _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = {}
+    if unresolved_active_records:
+        _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = (
+            fetch_current_official_isin_warrant_names()
+        )
+        for rec in unresolved_active_records:
+            code = normalize_security_code_text(rec.get("代號", ""))
+            official_name = str(
+                _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE.get(code, "")
+            ).strip()
+            if not official_name:
+                continue
+
+            recovered_underlying, recovered_underlying_name, recovered_source = (
+                reconcile_underlying_identity(
+                    official_name,
+                    rec.get("標的股", ""),
+                    rec.get("標的名稱", ""),
+                    code_to_name=stock_code_to_name,
+                    resolver=_CURRENT_UNDERLYING_RESOLVER,
+                    preferred_code_counts=preferred_underlying_counts,
+                )
+            )
+            if (
+                not recovered_underlying
+                or recovered_underlying in warrant_security_codes
+                or recovered_underlying not in stock_code_to_name
+            ):
+                continue
+
+            recovered_underlying_name = str(
+                stock_code_to_name.get(
+                    recovered_underlying,
+                    recovered_underlying_name,
+                )
+            ).strip()
+            guarded_name = safe_warrant_name_for_identity(
+                code,
+                official_name,
+                recovered_underlying,
+                recovered_underlying_name,
+                resolver=_CURRENT_UNDERLYING_RESOLVER,
+                code_to_name=stock_code_to_name,
+            )
+            if _normalize_warrant_code_for_identity(guarded_name) == code:
+                continue
+
+            if recovered_underlying != normalize_security_code_text(
+                rec.get("標的股", "")
+            ):
+                identity_override_count += 1
+            rec["名稱"] = guarded_name
+            rec["標的股"] = recovered_underlying
+            rec["標的名稱"] = recovered_underlying_name
+            rec["_名稱來源"] = "twse_isin_fallback"
+            rec["_標的來源"] = recovered_source
+            isin_name_recovered_count += 1
+
+    unresolved_active_name_count = sum(
+        1
+        for rec in warrants
+        if parse_date(rec.get("上市日", "")) <= today_dt
+        <= parse_date(rec.get("最後交易日", ""))
+        and _normalize_warrant_code_for_identity(rec.get("名稱", ""))
+        == _normalize_warrant_code_for_identity(rec.get("代號", ""))
+    )
     _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in warrants]
     _reset_warrant_lookup_cache(_CURRENT_WARRANT_INTERVAL_RECORDS)
     for rec in warrants:
         rec.pop("_名稱來源", None)
         rec.pop("_標的來源", None)
-        if parse_date(rec.get("上市日", "")) <= datetime.today() <= parse_date(rec.get("最後交易日", "")):
+        if parse_date(rec.get("上市日", "")) <= today_dt <= parse_date(rec.get("最後交易日", "")):
             active_codes.add(normalize_security_code_text(rec.get("代號", "")))
 
     LIVE_WARRANT_SNAPSHOT_READY = bool(warrants)
@@ -11098,7 +11228,9 @@ def get_all_call_warrants_live(cached_warrants=None):
         f"今日有效代號：{len(active_codes):,} 支｜"
         f"標的交叉更正：{identity_override_count:,} 筆｜"
         f"無法確認標的略過：{invalid_underlying_skipped_count:,} 筆｜"
-        f"權證名稱防錯降級：{name_guard_count:,} 筆"
+        f"權證名稱防錯降級：{name_guard_count:,} 筆｜"
+        f"ISIN名稱補回：{isin_name_recovered_count:,} 筆｜"
+        f"有效權證仍缺名稱：{unresolved_active_name_count:,} 筆"
     )
     return warrants
 
@@ -11318,16 +11450,16 @@ def _event_warrant_identity_for_date(item, trade_date):
     if expected_underlying_name:
         underlying_name = expected_underlying_name
 
-    if (
-        warrant_name
-        and _normalize_warrant_code_for_identity(warrant_name) != warrant_code
-        and expected_underlying_name
-        and not _warrant_name_matches_stock_name(
-            warrant_name,
-            expected_underlying_name,
-        )
-    ):
-        warrant_name = warrant_code
+    guarded_warrant_name = safe_warrant_name_for_identity(
+        warrant_code,
+        warrant_name,
+        underlying_code,
+        underlying_name,
+        resolver=_CURRENT_UNDERLYING_RESOLVER,
+        code_to_name=_CURRENT_STOCK_CODE_TO_NAME,
+    )
+    if guarded_warrant_name != warrant_name:
+        warrant_name = guarded_warrant_name
         changed = True
 
     return {
@@ -11571,6 +11703,52 @@ def build_amount_class_events(daily_records, item_map):
 
     events = simulate_group_outcomes_fifo(events, item_map)
     return {code: group for code, group in zip(AMOUNT_CLASS_CODES, split_amount_class_events(events))}
+
+
+def unresolved_amount_event_warrant_names(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events=None,
+    date_keys=None,
+):
+    """找出即將同步日期內仍只有代號、沒有名稱的 ABCDE 權證。"""
+    wanted_dates = {
+        normalize_date_str(value)
+        for value in (date_keys or [])
+        if parse_date(value)
+    }
+    unresolved = set()
+    checked = set()
+
+    for _event_code, event_group in iter_amount_class_event_groups(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+    ):
+        for event in event_group:
+            event_date = normalize_date_str(
+                event.get("事件日")
+                or event.get("結束日")
+                or event.get("起始日")
+            )
+            if wanted_dates and event_date not in wanted_dates:
+                continue
+            for lot in event.get("lots", []):
+                code = _normalize_warrant_code_for_identity(
+                    lot.get("權證代號", "")
+                )
+                name = str(lot.get("權證名稱", "") or "").strip()
+                if not code:
+                    continue
+                checked.add((event_date, code))
+                if not name or _normalize_warrant_code_for_identity(name) == code:
+                    unresolved.add((event_date, code))
+
+    return unresolved, checked
 
 
 
@@ -12535,7 +12713,7 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
                     event_date, lot.get("買進日") or event_date,
                     lot.get("權證代號", ""), lot.get("權證名稱", ""),
                     lot.get("金額", 0), lot.get("股數", 0),
-                    f'{event_code} | {lot.get("權證代號", "")} {lot.get("權證名稱", "")}',
+                    f'{event_code} | {format_warrant_identity_label(lot.get("權證代號", ""), lot.get("權證名稱", ""))}',
                 )
 
     return [
@@ -14892,7 +15070,10 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             broker_rec["事件集合"].add(event_code)
         if warrant_code:
             broker_rec["權證集合"].add(warrant_code)
-            warrant_label = f"{warrant_code} {warrant_name}".strip()
+            warrant_label = format_warrant_identity_label(
+                warrant_code,
+                warrant_name,
+            )
             if warrant_label and warrant_label not in broker_rec["權證清單"]:
                 broker_rec["權證清單"].append(warrant_label)
         if latest_price_date:
@@ -15788,7 +15969,7 @@ def build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_eve
                     event_type,
                     event_date,
                     ev.get("出清日"),
-                    f'{event_code} | {lot.get("權證代號", "")} {lot.get("權證名稱", "")}',
+                    f'{event_code} | {format_warrant_identity_label(lot.get("權證代號", ""), lot.get("權證名稱", ""))}',
                 )
 
     return source_map
@@ -17048,7 +17229,10 @@ def write_broker_query_sheet(wb, items):
 
         rec["權證集合"].add(warrant_code)
 
-        warrant_label = f"{warrant_code} {warrant_name}"
+        warrant_label = format_warrant_identity_label(
+            warrant_code,
+            warrant_name,
+        )
         if warrant_label not in rec["權證清單"]:
             rec["權證清單"].append(warrant_label)
 
@@ -18065,7 +18249,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
                     # 缺最新權證價格的部位直接從買超平均報酬分子 / 分母排除，
                     # 避免用 0 市值把整體報酬率不合理壓低。
                     rec["買超報酬缺價權證數"] += 1
-                    rec.setdefault("買超缺價省略權證清單", []).append(f"{warrant_code} {warrant_name}".strip())
+                    rec.setdefault("買超缺價省略權證清單", []).append(
+                        format_warrant_identity_label(
+                            warrant_code,
+                            warrant_name,
+                        )
+                    )
                     warrant_rec["買超報酬省略原因"] = "缺最新權證價格，未納入買超平均報酬"
                 else:
                     rec["買超剩餘成本"] += remaining_cost
@@ -18213,8 +18402,12 @@ def build_10d_broker_underlying_detail_rows(items, price_cache, target_date=None
             key=lambda x: (float(x.get("買進金額", 0) or 0) + float(x.get("賣出金額", 0) or 0)),
             reverse=True,
         ):
+            warrant_label = format_warrant_identity_label(
+                w.get("權證代號", ""),
+                w.get("權證名稱", ""),
+            )
             warrant_rows.append(
-                f"{w.get('權證代號', '')} {w.get('權證名稱', '')}"
+                f"{warrant_label}"
                 f"｜買{_fmt_wan_text(w.get('買進金額', 0))}／賣{_fmt_wan_text(w.get('賣出金額', 0))}"
             )
             warrant_json.append({
@@ -19242,7 +19435,7 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
                     reverse=True,
                 )
                 warrant_list = "；".join([
-                    f"{w.get('權證代號', '')} {w.get('權證名稱', '')}"
+                    f"{format_warrant_identity_label(w.get('權證代號', ''), w.get('權證名稱', ''))}"
                     f"｜買{_fmt_wan_text(w.get('買進金額', 0))}／賣{_fmt_wan_text(w.get('賣出金額', 0))}"
                     for w in warrant_values
                 ])
@@ -21936,6 +22129,39 @@ def main():
     amount_events = build_amount_class_events(daily_records, item_map)
     a_events, b_events, c_events, d_events, e_events = [amount_events.get(code, []) for code in AMOUNT_CLASS_CODES]
     print(f"  ✅ 金額強度事件：A:{len(a_events):,}｜B:{len(b_events):,}｜C:{len(c_events):,}｜D:{len(d_events):,}｜E:{len(e_events):,}")
+
+    name_validation_dates = None
+    if not workflow_is_repair():
+        name_validation_dates = (
+            set(_HISTORY_IDENTITY_REPAIR_DATES)
+            | {normalize_date_str(target_date)}
+        )
+    unresolved_names, checked_names = unresolved_amount_event_warrant_names(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        date_keys=name_validation_dates,
+    )
+    if unresolved_names:
+        sample = "、".join(
+            f"{date_key} {code}"
+            for date_key, code in sorted(unresolved_names)[:20]
+        )
+        suffix = "…" if len(unresolved_names) > 20 else ""
+        print(
+            f"  ⚠️ 權證名稱完整性驗證失敗：仍有 {len(unresolved_names):,} 檔只有代號｜"
+            f"{sample}{suffix}"
+        )
+        print(
+            "  ⚠️ 本次停止，不修改 Google Sheet；避免權證清單與最大單筆權證再次寫入不完整名稱。"
+        )
+        return
+    print(
+        f"  ✅ 權證名稱完整性驗證："
+        f"{len(checked_names):,} 個日期化權證全部具有名稱"
+    )
 
     persistent_price_cache = load_price_cache()
     all_changed_price_codes = set()
