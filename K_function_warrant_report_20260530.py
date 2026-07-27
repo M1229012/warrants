@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import re
+import shutil
 import time
 import threading
 import urllib.parse
@@ -12809,8 +12810,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 #
 # Google Sheet 只保留 FinMind 權證結果快照、Gemini 當日摘要快取與使用者勝率統計。
 
-FINMIND_BUILD_VERSION = "2026-07-16-finmind-official-openapi-failsafe-v35"
-FINMIND_PERFORMANCE_PATCH = "official-preflight+selected-branch-crossprobe+probe-first+second-stage-no-reprobe+issuer-vectorized+timed-context"
+FINMIND_BUILD_VERSION = "2026-07-27-cache-self-heal-rebuild-v36"
+FINMIND_PERFORMANCE_PATCH = "official-preflight+selected-branch-crossprobe+probe-first+second-stage-no-reprobe+issuer-vectorized+timed-context+raw-revalidate+compact-source-size+recent5-trading-days+full-cache-rebuild"
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_STORAGE_URL = "https://api.finmindtrade.com/api/v4/storage_objects"
 FINMIND_WARRANT_BRANCH_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_warrant_trading_daily_report"
@@ -12839,8 +12840,8 @@ FINMIND_MARKET_COMPACT_CACHE_ENABLE = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 FINMIND_MARKET_COMPACT_CACHE_VERSION = os.getenv(
     "FINMIND_MARKET_COMPACT_CACHE_VERSION",
-    "v1",
-).strip() or "v1"
+    "v2",
+).strip() or "v2"
 FINMIND_MARKET_COMPACT_CACHE_DIR = os.path.join(
     FINMIND_CACHE_DIR,
     f"warrant_market_compact_{FINMIND_MARKET_COMPACT_CACHE_VERSION}",
@@ -12862,10 +12863,31 @@ FINMIND_PREWARM_WORKERS = max(
     1,
     int(os.getenv("FINMIND_PREWARM_WORKERS", "4")),
 )
+# 最近 N 個「實際交易日」即使已有原始日檔，也會重新下載並重建精簡快取。
+# 保留舊環境變數名稱以相容既有 Workflow，但語意已改為交易日數。
 FINMIND_PREWARM_REFRESH_RECENT_DAYS = max(
     0,
-    int(os.getenv("FINMIND_PREWARM_REFRESH_RECENT_DAYS", "2")),
+    int(os.getenv("FINMIND_PREWARM_REFRESH_RECENT_DAYS", "5")),
 )
+# 正式產圖也會刷新最近 N 個「實際交易日」，避免預熱失敗後靜默沿用仍可讀但已過期的 compact。
+FINMIND_REPORT_REFRESH_RECENT_DAYS = max(
+    0,
+    int(os.getenv("FINMIND_REPORT_REFRESH_RECENT_DAYS", "2")),
+)
+# 用來判斷最近一次排程預熱是否已落後；預設對應 Workflow 的台北時間 21:20。
+FINMIND_PREWARM_SCHEDULE_HOUR = min(
+    23,
+    max(0, int(os.getenv("FINMIND_PREWARM_SCHEDULE_HOUR", "21"))),
+)
+FINMIND_PREWARM_SCHEDULE_MINUTE = min(
+    59,
+    max(0, int(os.getenv("FINMIND_PREWARM_SCHEDULE_MINUTE", "20"))),
+)
+# 手動完整重建：捨棄所有 FinMind 權證原始日檔與全市場精簡快取。
+FINMIND_FORCE_REBUILD_ALL_CACHE = os.getenv(
+    "FINMIND_FORCE_REBUILD_ALL_CACHE",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
 FINMIND_PREWARM_KEEP_RAW_DAYS = max(
     0,
     int(os.getenv("FINMIND_PREWARM_KEEP_RAW_DAYS", "7")),
@@ -13363,6 +13385,168 @@ def _finmind_market_compact_meta_path(trade_date) -> str:
     return _finmind_market_compact_day_path(trade_date) + ".meta.json"
 
 
+def _finmind_prewarm_status_path() -> str:
+    return os.path.join(FINMIND_REFERENCE_CACHE_DIR, "warrant_market_prewarm_status.json")
+
+
+def _finmind_emit_actions_warning(message: str):
+    clean = str(message or "").replace("\r", " ").replace("\n", " ").strip()
+    if not clean:
+        return
+    print(f"::warning title=FinMind market cache::{clean}")
+    print(f"⚠️ {clean}")
+
+
+def _finmind_invalidate_recent_market_cache(
+    trading_dates,
+    recent_days: int,
+    reason: str,
+) -> List[pd.Timestamp]:
+    normalized_dates = sorted({
+        pd.Timestamp(day).tz_localize(None).normalize()
+        for day in (trading_dates or [])
+    })
+    refresh_count = max(0, int(recent_days))
+    if not normalized_dates or refresh_count <= 0:
+        return []
+
+    refresh_dates = normalized_dates[-refresh_count:]
+    print(
+        f"♻️ {reason}近期交易日強制刷新："
+        + "、".join(day.strftime("%Y-%m-%d") for day in refresh_dates)
+    )
+    for day in refresh_dates:
+        for path in [
+            _finmind_warrant_day_path(day),
+            _finmind_market_compact_day_path(day),
+            _finmind_market_compact_meta_path(day),
+        ]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as exc:
+                print(f"⚠️ {reason}更新舊檔刪除失敗：{path}｜{exc}")
+    return refresh_dates
+
+
+def _finmind_write_prewarm_status(latest_available, target_dates) -> bool:
+    path = _finmind_prewarm_status_path()
+    _ensure_dir(os.path.dirname(path))
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    payload = {
+        "success": True,
+        "completed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
+        "latest_available": pd.Timestamp(latest_available).strftime("%Y-%m-%d"),
+        "target_date_count": int(len(target_dates or [])),
+        "cache_version": FINMIND_MARKET_COMPACT_CACHE_VERSION,
+        "build": FINMIND_BUILD_VERSION,
+    }
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return True
+    except Exception as exc:
+        print(f"⚠️ FinMind 預熱狀態寫入失敗：{path}｜{exc}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _finmind_expected_prewarm_date(trading_dates) -> pd.Timestamp | None:
+    normalized_dates = sorted({
+        pd.Timestamp(day).tz_localize(None).normalize()
+        for day in (trading_dates or [])
+    })
+    if not normalized_dates:
+        return None
+
+    now_taipei = datetime.now(ZoneInfo("Asia/Taipei"))
+    today = pd.Timestamp(now_taipei.date())
+    schedule_reached = (
+        now_taipei.hour,
+        now_taipei.minute,
+    ) >= (
+        FINMIND_PREWARM_SCHEDULE_HOUR,
+        FINMIND_PREWARM_SCHEDULE_MINUTE,
+    )
+    if normalized_dates[-1] == today and not schedule_reached and len(normalized_dates) >= 2:
+        return normalized_dates[-2]
+    return normalized_dates[-1]
+
+
+def _finmind_warn_if_prewarm_cache_stale(trading_dates):
+    path = _finmind_prewarm_status_path()
+    expected_date = _finmind_expected_prewarm_date(trading_dates)
+    if not os.path.exists(path):
+        _finmind_emit_actions_warning(
+            "找不到最近一次成功的 FinMind 預熱狀態；本次產圖將自行刷新近期交易日"
+        )
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        status_version = str(payload.get("cache_version", "") or "")
+        completed_at = str(payload.get("completed_at", "") or "")
+        latest_available = pd.to_datetime(payload.get("latest_available", ""), errors="coerce")
+        if status_version != FINMIND_MARKET_COMPACT_CACHE_VERSION:
+            _finmind_emit_actions_warning(
+                f"FinMind 預熱狀態版本不符：status={status_version or '-'}｜"
+                f"current={FINMIND_MARKET_COMPACT_CACHE_VERSION}；本次產圖將自行刷新近期交易日"
+            )
+            return
+        if pd.isna(latest_available):
+            _finmind_emit_actions_warning(
+                "FinMind 預熱狀態缺少有效 latest_available；本次產圖將自行刷新近期交易日"
+            )
+            return
+        latest_available = pd.Timestamp(latest_available).tz_localize(None).normalize()
+        if expected_date is not None and latest_available < expected_date:
+            _finmind_emit_actions_warning(
+                f"最近一次成功的 FinMind 預熱已落後：latest={latest_available.date()}｜"
+                f"expected={expected_date.date()}｜completed_at={completed_at or '-'}；"
+                "本次產圖將自行刷新近期交易日"
+            )
+            return
+        print(
+            f"✅ FinMind 預熱狀態正常：latest={latest_available.date()}｜"
+            f"completed_at={completed_at or '-'}｜version={status_version}"
+        )
+    except Exception as exc:
+        _finmind_emit_actions_warning(
+            f"FinMind 預熱狀態無法讀取：{exc}；本次產圖將自行刷新近期交易日"
+        )
+
+
+def _finmind_prepare_report_market_cache():
+    if not FINMIND_MARKET_COMPACT_CACHE_ENABLE:
+        return
+    today = get_taipei_today_ts()
+    start_date = today - pd.Timedelta(days=max(14, FINMIND_REPORT_REFRESH_RECENT_DAYS * 4))
+    try:
+        trading_dates = _finmind_get_trading_dates(start_date, today)
+    except Exception as exc:
+        _finmind_emit_actions_warning(
+            f"產圖前無法取得實際交易日：{exc}；將保留既有快取並由後續資料流程檢查"
+        )
+        return
+    if not trading_dates:
+        _finmind_emit_actions_warning(
+            "產圖前找不到實際交易日；將保留既有快取並由後續資料流程檢查"
+        )
+        return
+    _finmind_warn_if_prewarm_cache_stale(trading_dates)
+    _finmind_invalidate_recent_market_cache(
+        trading_dates,
+        FINMIND_REPORT_REFRESH_RECENT_DAYS,
+        "產圖",
+    )
+
+
 def _finmind_trader_map_hash(trader_name_map: Dict[str, str] | None) -> str:
     payload = "\n".join(
         f"{str(k)}={str(v)}"
@@ -13504,6 +13688,23 @@ def _finmind_market_compact_day_is_valid(
             expected_hash = _finmind_trader_map_hash(trader_name_map)
             if str(meta.get("trader_map_hash", "")) != expected_hash:
                 return False
+
+        # 原始日檔仍存在時，必須確認精簡快取確實由目前這份原始檔建立。
+        # FinMind 若補完同一交易日而使原始檔大小改變，舊 compact 立即失效並重建。
+        raw_path = _finmind_warrant_day_path(trade_date)
+        if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+            try:
+                cached_source_size = int(meta.get("source_size", -1))
+                current_source_size = int(os.path.getsize(raw_path))
+            except Exception:
+                return False
+            if cached_source_size != current_source_size:
+                print(
+                    f"♻️ 全市場精簡快取來源已變更，準備重建："
+                    f"{pd.Timestamp(trade_date).strftime('%Y-%m-%d')}｜"
+                    f"meta={cached_source_size:,} bytes｜raw={current_source_size:,} bytes"
+                )
+                return False
         return True
     except Exception:
         return False
@@ -13537,7 +13738,11 @@ def _finmind_build_market_compact_day(
             else:
                 return path
 
-        raw_path = _finmind_download_warrant_day(date_s, allow_not_ready=allow_not_ready)
+        raw_path = _finmind_download_warrant_day(
+            date_s,
+            allow_not_ready=allow_not_ready,
+            force_refresh=force_refresh,
+        )
         if not raw_path:
             return (None, pd.DataFrame()) if return_frame else None
         columns = [
@@ -13718,6 +13923,12 @@ def _finmind_prewarm_market_compact_cache():
         f"workers={FINMIND_PREWARM_WORKERS}"
     )
 
+    if FINMIND_FORCE_REBUILD_ALL_CACHE:
+        print("🧹 完整重建模式：捨棄既有 FinMind 權證原始日檔與全市場精簡快取")
+        for cache_dir in [FINMIND_WARRANT_DAY_CACHE_DIR, FINMIND_MARKET_COMPACT_CACHE_DIR]:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            _ensure_dir(cache_dir)
+
     # 參考資料在預熱流程先更新，手動查任何新股票時直接讀本機快取。
     _finmind_load_stock_info(force_refresh=False)
     trader_name_map, _ = _finmind_securities_trader_maps()
@@ -13738,21 +13949,13 @@ def _finmind_prewarm_market_compact_cache():
     if not trading_dates:
         raise RuntimeError("預熱失敗：找不到實際交易日")
 
-    if FINMIND_PREWARM_REFRESH_RECENT_DAYS > 0:
-        cutoff = today - pd.Timedelta(days=FINMIND_PREWARM_REFRESH_RECENT_DAYS - 1)
-        for day in trading_dates:
-            if day < cutoff:
-                continue
-            for path in [
-                _finmind_warrant_day_path(day),
-                _finmind_market_compact_day_path(day),
-                _finmind_market_compact_meta_path(day),
-            ]:
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception as exc:
-                    print(f"⚠️ 預熱更新舊檔刪除失敗：{path}｜{exc}")
+    if FINMIND_PREWARM_REFRESH_RECENT_DAYS > 0 and not FINMIND_FORCE_REBUILD_ALL_CACHE:
+        # 以實際交易日計算，不再用日曆日。星期一也會涵蓋上週五，避免最新有效日漏刷新。
+        _finmind_invalidate_recent_market_cache(
+            trading_dates,
+            FINMIND_PREWARM_REFRESH_RECENT_DAYS,
+            "預熱",
+        )
 
     latest_available = None
     for day in reversed(trading_dates[-FINMIND_WARRANT_LATEST_PROBE_DAYS:]):
@@ -13809,6 +14012,7 @@ def _finmind_prewarm_market_compact_cache():
     if failures and FINMIND_STRICT_WARRANT_COMPLETENESS:
         sample = "；".join(f"{d}:{e[:100]}" for d, e in failures[:5])
         raise RuntimeError(f"全市場快取預熱不完整：{len(failures)}/{len(target_dates)} 日｜{sample}")
+    _finmind_write_prewarm_status(latest_available, target_dates)
     print(
         f"✅ 全市場快取預熱完成｜最新日={latest_available.date()}｜"
         f"交易日={len(target_dates)}｜耗時={time.perf_counter() - start_clock:.2f}秒"
@@ -13832,13 +14036,28 @@ def _read_small_error_file(path: str) -> str:
         return ""
 
 
-def _finmind_download_warrant_day(trade_date, allow_not_ready: bool = False) -> str | None:
-    """下載 sponsorpro 全市場權證分點 Parquet；同一執行中每個日期只下載一次。"""
+def _finmind_download_warrant_day(
+    trade_date,
+    allow_not_ready: bool = False,
+    force_refresh: bool = False,
+) -> str | None:
+    """下載 sponsorpro 全市場權證分點 Parquet。
+
+    ``force_refresh=True`` 時即使同日檔案已存在，也會先刪除再重新下載，
+    用於近期交易日自癒與 Action 的完整快取重建。
+    """
     date_s = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
     path = _finmind_warrant_day_path(date_s)
     _ensure_dir(os.path.dirname(path))
 
     with _finmind_storage_lock(date_s):
+        if force_refresh and os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"🧹 強制捨棄 FinMind 權證原始日檔：{date_s}")
+            except Exception as exc:
+                raise RuntimeError(f"無法刪除待重抓原始日檔：{path}｜{exc}") from exc
+
         if os.path.exists(path) and os.path.getsize(path) > 0:
             try:
                 pd.read_parquet(path, columns=["date", "stock_id"])
@@ -17952,6 +18171,8 @@ def main():
         print("🔥 WARRANT_PREWARM_ONLY=1：本次只建立全市場共用快取，不產圖、不呼叫 Gemini、不送 Discord")
         _finmind_prewarm_market_compact_cache()
         return
+
+    _finmind_prepare_report_market_cache()
 
     raw_codes = os.getenv("STOCK_CODES", "2408").strip() or "2408"
     stock_codes = [c.strip() for c in re.split(r"[,，\s]+", raw_codes) if c.strip()]
