@@ -25,12 +25,12 @@ E：單日累積買進金額 >= 1000萬
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
 完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會重新產生完整報表，並將 FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表以本次重算結果完整覆蓋、重新套用格式並回讀驗證；不在程式報表清單內的人工工作表仍保留不動。
 
-資料來源：daily 使用 MoneyDJ API4／API5；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
+資料來源：daily 沿用完整歷史快取並只抓 MoneyDJ 目標交易日；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
 執行：python warrant_backtest.py
 依賴：pip install requests pandas openpyxl pyarrow
 """
 
-import json, re, time, os
+import json, re, time, os, math
 import threading
 from bisect import bisect_right
 from collections import Counter, defaultdict
@@ -132,6 +132,7 @@ MONEYDJ_HISTORY_WORKERS = max(int(os.getenv("MONEYDJ_HISTORY_WORKERS", "50")), 1
 MONEYDJ_PRESCAN_WORKERS = max(int(os.getenv("MONEYDJ_PRESCAN_WORKERS", "60")), 1)
 MONEYDJ_RECENT_SCAN_DAYS = max(int(os.getenv("MONEYDJ_RECENT_SCAN_DAYS", "50")), 1)
 MONEYDJ_API5_HISTORY_LIMIT = max(int(os.getenv("MONEYDJ_API5_HISTORY_LIMIT", os.getenv("HISTORY_RETENTION_TRADING_DAYS", "200"))), 1)
+MONEYDJ_DAILY_API5_LIMIT = max(int(os.getenv("MONEYDJ_DAILY_API5_LIMIT", "5")), 1)
 MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
@@ -316,6 +317,66 @@ TOP15_LP_QUOTE_URLS = [
     "https://warrants.sfi.org.tw/Query.aspx",
 ]
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
+
+
+# TOP15 個股型態標籤：只新增至 TOP15 快取資料，不改動排名、權證估值、損益與 ABCDE 邏輯。
+PATTERN_ENABLE = os.getenv("PATTERN_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+PATTERN_LOOKBACK = max(int(os.getenv("PATTERN_LOOKBACK", "60")), 20)
+PATTERN_MAX_MISSING_DAYS = max(int(os.getenv("PATTERN_MAX_MISSING_DAYS", "5")), 0)
+PATTERN_REFRESH_FULL_WINDOW = os.getenv("PATTERN_REFRESH_FULL_WINDOW", "1").strip().lower() not in ("0", "false", "no")
+
+PATTERN_HIGH_TOLERANCE = float(os.getenv("PATTERN_HIGH_TOLERANCE", "0.98"))
+PATTERN_SUPPORT_UPPER = float(os.getenv("PATTERN_SUPPORT_UPPER", "1.03"))
+PATTERN_WEAK_THRESHOLD = float(os.getenv("PATTERN_WEAK_THRESHOLD", "0.97"))
+PATTERN_MA_SLOPE_DAYS = max(int(os.getenv("PATTERN_MA_SLOPE_DAYS", "5")), 1)
+PATTERN_MA_HISTORY_BUFFER_DAYS = 20 + PATTERN_MA_SLOPE_DAYS
+
+PATTERN_PROFILE_BIN_PCT = float(os.getenv("PATTERN_PROFILE_BIN_PCT", "0.01"))
+PATTERN_PROFILE_WEIGHT = os.getenv("PATTERN_PROFILE_WEIGHT", "Trading_money").strip() or "Trading_money"
+
+PATTERN_PRICE_DATASET = os.getenv("PATTERN_PRICE_DATASET", "TaiwanStockPriceAdj").strip() or "TaiwanStockPriceAdj"
+PATTERN_REQUIRE_ADJUSTED_PRICE = os.getenv("PATTERN_REQUIRE_ADJUSTED_PRICE", "1").strip().lower() not in ("0", "false", "no")
+PATTERN_REQUIRE_TARGET_DATE = os.getenv("PATTERN_REQUIRE_TARGET_DATE", "1").strip().lower() not in ("0", "false", "no")
+
+PATTERN_ALLOW_TARGET_BRIDGE = os.getenv("PATTERN_ALLOW_TARGET_BRIDGE", "1").strip().lower() not in ("0", "false", "no")
+PATTERN_BRIDGE_RATIO_DAYS = max(int(os.getenv("PATTERN_BRIDGE_RATIO_DAYS", "5")), 1)
+PATTERN_BRIDGE_RATIO_TOLERANCE = max(float(os.getenv("PATTERN_BRIDGE_RATIO_TOLERANCE", "0.001")), 0.0)
+PATTERN_BRIDGE_MAX_TRADING_DAYS = max(int(os.getenv("PATTERN_BRIDGE_MAX_TRADING_DAYS", "1")), 0)
+
+PATTERN_REQUIRE_NO_CORPORATE_ACTION_IN_GAP = os.getenv(
+    "PATTERN_REQUIRE_NO_CORPORATE_ACTION_IN_GAP", "1"
+).strip().lower() not in ("0", "false", "no")
+PATTERN_DIVIDEND_DATASET = os.getenv("PATTERN_DIVIDEND_DATASET", "TaiwanStockDividend").strip() or "TaiwanStockDividend"
+PATTERN_DIVIDEND_RESULT_DATASET = os.getenv(
+    "PATTERN_DIVIDEND_RESULT_DATASET", "TaiwanStockDividendResult"
+).strip() or "TaiwanStockDividendResult"
+PATTERN_CAPITAL_REDUCTION_DATASET = os.getenv(
+    "PATTERN_CAPITAL_REDUCTION_DATASET", "TaiwanStockCapitalReductionReferencePrice"
+).strip() or "TaiwanStockCapitalReductionReferencePrice"
+PATTERN_SPLIT_DATASET = os.getenv("PATTERN_SPLIT_DATASET", "TaiwanStockSplitPrice").strip() or "TaiwanStockSplitPrice"
+PATTERN_CORPORATE_ACTION_FAIL_CLOSED = os.getenv(
+    "PATTERN_CORPORATE_ACTION_FAIL_CLOSED", "1"
+).strip().lower() not in ("0", "false", "no")
+
+PATTERN_COMPARE_DECIMALS = max(int(os.getenv("PATTERN_COMPARE_DECIMALS", "6")), 0)
+PATTERN_DEFAULT_LABEL = os.getenv("PATTERN_DEFAULT_LABEL", "盤").strip() or "盤"
+PATTERN_INVALID_LABEL = os.getenv("PATTERN_INVALID_LABEL", "-").strip() or "-"
+PATTERN_FETCH_WORKERS = max(min(int(os.getenv("PATTERN_FETCH_WORKERS", str(FINMIND_HISTORY_WORKERS))), 12), 1)
+
+PATTERN_AUDIT_FIELDS = [
+    "型態", "型態統計日期", "型態價格來源",
+    "型態還原收盤價", "型態原始收盤價",
+    "型態MA5", "型態MA10", "型態MA20",
+    "型態前59日高點", "型態量峰價", "型態橋接係數",
+    "型態公司行動狀態", "型態計算狀態", "型態錯誤原因",
+]
+PATTERN_AUDIT_COLUMN_WIDTHS = [
+    8, 12, 18,
+    14, 14,
+    12, 12, 12,
+    14, 14, 12,
+    18, 20, 36,
+]
 
 # 完整修補模式會重建下列延伸報表；每日流程不計算、不碰觸這些既有工作表。
 RECENT_RANKING_DAYS = int(os.getenv("RECENT_RANKING_DAYS", "62"))
@@ -3472,6 +3533,13 @@ def is_gsheet_decimal_number_header(header):
     if header.startswith("D+"):
         return False
 
+    if header in (
+        "型態還原收盤價", "型態原始收盤價",
+        "型態MA5", "型態MA10", "型態MA20",
+        "型態前59日高點", "型態量峰價", "型態橋接係數",
+    ):
+        return True
+
     if is_gsheet_text_header(header):
         return False
 
@@ -3871,6 +3939,23 @@ def _gsheet_pixel_width_for_header(header):
     if header == "資料範圍":
         return 105
 
+    if header == "型態":
+        return 60
+    if header == "型態統計日期":
+        return 105
+    if header == "型態價格來源":
+        return 145
+    if header in ("型態還原收盤價", "型態原始收盤價", "型態前59日高點", "型態量峰價"):
+        return 120
+    if header in ("型態MA5", "型態MA10", "型態MA20", "型態橋接係數"):
+        return 105
+    if header == "型態公司行動狀態":
+        return 150
+    if header == "型態計算狀態":
+        return 170
+    if header == "型態錯誤原因":
+        return 320
+
     # 有權證資訊的欄位加寬，避免新增「資料範圍」後欄寬位移造成內容被擠在一起。
     if "權證清單" in header or "權證集合" in header:
         return 520
@@ -4035,6 +4120,29 @@ def prepare_gsheet_write_values(values):
     return normalized_values, row_count, col_count
 
 
+def _safe_worksheet_resize_shape(ws, row_count, col_count):
+    """
+    Google Sheets 不允許 resize 後刪除全部非凍結列／欄。
+
+    空資料表通常只剩一列表頭；若既有工作表同時 frozenRowCount=1，
+    直接 resize(rows=1) 會得到「not possible to delete all non-frozen rows」。
+    grid 至少保留凍結區之外的一列／一欄，但實際值矩陣仍維持原始尺寸。
+    """
+    try:
+        frozen_rows = max(int(getattr(ws, "frozen_row_count", 0) or 0), 0)
+    except Exception:
+        frozen_rows = 0
+    try:
+        frozen_cols = max(int(getattr(ws, "frozen_col_count", 0) or 0), 0)
+    except Exception:
+        frozen_cols = 0
+
+    return (
+        max(int(row_count or 1), frozen_rows + 1, 1),
+        max(int(col_count or 1), frozen_cols + 1, 1),
+    )
+
+
 def write_values_to_worksheet(
     ws,
     values,
@@ -4058,11 +4166,16 @@ def write_values_to_worksheet(
             print(f"  🧽 repair 覆蓋前已清空舊值：{ws.title}")
 
         # 不刪除工作表本身，保留 sheetId 與人工引用；只精確調整 grid 後重寫。
+        resize_rows, resize_cols = _safe_worksheet_resize_shape(
+            ws,
+            row_count,
+            col_count,
+        )
         gsheet_api_call(
             f"調整工作表大小 {ws.title}",
             ws.resize,
-            rows=max(row_count, 1),
-            cols=max(col_count, 1),
+            rows=resize_rows,
+            cols=resize_cols,
         )
 
         reset_worksheet_before_value_write(ws, row_count, col_count)
@@ -4640,6 +4753,13 @@ GSHEET_RESULT_REPLACE_CURRENT_SCOPE_TITLES = {
 GSHEET_TOP15_SNAPSHOT_REPLACE_TITLES = {
     TOP15_CONSENSUS_SHEET,
     TOP15_POSITION_DETAIL_SHEET,
+}
+
+# daily 模式只替換本次目標交易日；其他日期與資料範圍完全保留。
+# repair 模式仍由完整工作表覆蓋流程處理，不會走這份清單。
+GSHEET_DAILY_DATE_REPLACE_TITLES = {
+    *AMOUNT_CLASS_SHEET_NAMES,
+    "每日賣出明細",
 }
 
 GSHEET_RESULT_OVERWRITE_TITLES = {
@@ -7084,6 +7204,223 @@ def is_top15_snapshot_replace_sheet(title):
     }
 
 
+def is_daily_date_replace_sheet(title):
+    """daily 的 A～E／每日賣出明細以目標交易日整批替換。"""
+    normalized_title = safe_worksheet_title(title)
+    return normalized_title in {
+        safe_worksheet_title(item)
+        for item in GSHEET_DAILY_DATE_REPLACE_TITLES
+    }
+
+
+def _daily_date_replace_column(title):
+    normalized_title = safe_worksheet_title(title)
+    if normalized_title in AMOUNT_CLASS_SHEET_NAMES:
+        return "事件日"
+    if normalized_title == "每日賣出明細":
+        return "日期"
+    return ""
+
+
+def _prepare_daily_date_replace_values(
+    title,
+    new_values,
+    refresh_date,
+    data_scope=None,
+    extra_scope_values=None,
+):
+    """整理 daily 指定交易日的資料，並保留即使零列也必須更新的資料範圍。"""
+    prepared = _prepare_incremental_result_values(
+        title,
+        new_values,
+        data_scope=data_scope,
+        extra_scope_values=extra_scope_values,
+    )
+    if prepared is None:
+        return None
+
+    target_dt = _parse_result_record_date(refresh_date)
+    date_col = _daily_date_replace_column(title)
+    if target_dt is None or not date_col:
+        return None
+    target_key = target_dt.strftime("%Y/%m/%d")
+
+    current_scope = str(data_scope or get_result_data_scope()).strip()
+    incoming_scopes = {current_scope}
+    if extra_scope_values and _find_simple_header_row(extra_scope_values) == 0:
+        incoming_scopes.add("精選五分點")
+
+    incoming_headers, incoming_records = prepared
+    filtered_records = []
+    for raw_record in incoming_records:
+        record = dict(raw_record)
+        scope = str(
+            strip_gsheet_text_prefix(record.get("資料範圍", ""))
+        ).strip() or "全分點"
+        record_dt = _parse_result_record_date(record.get(date_col, ""))
+        if scope not in incoming_scopes or record_dt is None:
+            continue
+        if record_dt.strftime("%Y/%m/%d") != target_key:
+            continue
+        record["資料範圍"] = scope
+        filtered_records.append(record)
+
+    key_cols = _sheet_upsert_key_columns(title, incoming_headers)
+    if not key_cols:
+        return None
+
+    deduped_records = []
+    seen = set()
+    for record in filtered_records:
+        key = _record_key(record, key_cols)
+        if not key or any(str(part).strip() == "" for part in key) or key in seen:
+            continue
+        seen.add(key)
+        deduped_records.append(record)
+
+    return {
+        "headers": list(incoming_headers),
+        "records": deduped_records,
+        "scopes": incoming_scopes,
+        "target_date": target_key,
+        "date_col": date_col,
+    }
+
+
+def replace_daily_date_rows_in_worksheet(
+    ws,
+    title,
+    new_values,
+    refresh_date,
+    data_scope=None,
+    extra_scope_values=None,
+):
+    """
+    daily 專用同步：只替換本次「資料範圍 + 目標交易日」的列。
+
+    本次新列先插入，再刪除位移後的舊列；若刪除失敗，最多暫時留下重複資料，
+    不會先把可用舊資料刪掉。其他日期與未執行的資料範圍完全不動。
+    """
+    prepared = _prepare_daily_date_replace_values(
+        title,
+        new_values,
+        refresh_date,
+        data_scope=data_scope,
+        extra_scope_values=extra_scope_values,
+    )
+    if prepared is None:
+        print(f"  ⚠️ daily 日期快照資料格式無法辨識：{safe_worksheet_title(title)}")
+        return None
+
+    incoming_headers = prepared["headers"]
+    incoming_records = prepared["records"]
+    incoming_scopes = prepared["scopes"]
+    target_key = prepared["target_date"]
+    date_col = prepared["date_col"]
+
+    existing_values = _worksheet_values_with_formulas(ws)
+    existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
+        ws,
+        title,
+        existing_values,
+    )
+    if _find_simple_header_row(existing_values) != 0:
+        print(
+            f"  ⚠️ {safe_worksheet_title(title)} 無法確認第一列表頭；"
+            "為避免破壞既有工作表，本次不替換。"
+        )
+        return None
+
+    existing_headers, _existing_records = _values_to_records(
+        existing_values,
+        header_row_idx=0,
+        default_scope="全分點",
+    )
+    existing_headers = [str(h).strip() for h in existing_headers if str(h).strip()]
+    if not existing_headers:
+        return None
+
+    missing_headers = [header for header in incoming_headers if header not in existing_headers]
+    final_headers = list(existing_headers) + missing_headers
+    required_rows = max(
+        int(getattr(ws, "row_count", 1) or 1),
+        len(existing_values) + 1,
+        2,
+    )
+    if not ensure_worksheet_grid_capacity(
+        ws,
+        required_rows=required_rows,
+        required_cols=max(len(final_headers), 1),
+    ):
+        return None
+
+    if missing_headers:
+        start_col = len(existing_headers) + 1
+        gsheet_api_call(
+            f"補上新欄位 {ws.title}",
+            ws.update,
+            values=[missing_headers],
+            range_name=f"{get_column_letter(start_col)}1",
+            value_input_option="USER_ENTERED",
+        )
+
+    old_target_rows = []
+    n_existing_cols = len(existing_headers)
+    for sheet_row_no, raw_row in enumerate(existing_values[1:], start=2):
+        row = list(raw_row)
+        if len(row) < n_existing_cols:
+            row += [""] * (n_existing_cols - len(row))
+        elif len(row) > n_existing_cols:
+            row = row[:n_existing_cols]
+        if not any(str(value).strip() for value in row):
+            continue
+
+        record = {
+            header: row[idx]
+            for idx, header in enumerate(existing_headers)
+        }
+        scope = str(
+            strip_gsheet_text_prefix(record.get("資料範圍", ""))
+        ).strip() or "全分點"
+        row_dt = _parse_result_record_date(record.get(date_col, ""))
+        if (
+            scope in incoming_scopes
+            and row_dt is not None
+            and row_dt.strftime("%Y/%m/%d") == target_key
+        ):
+            old_target_rows.append(sheet_row_no)
+
+    rows_to_insert = [
+        [record.get(header, "") for header in final_headers]
+        for record in incoming_records
+    ]
+    if rows_to_insert and not _insert_rows_below_header(ws, rows_to_insert):
+        return None
+
+    row_shift = len(rows_to_insert)
+    shifted_old_rows = [row_no + row_shift for row_no in old_target_rows]
+    for start_row, end_row in reversed(_contiguous_row_ranges(shifted_old_rows)):
+        gsheet_api_call(
+            f"刪除 daily 舊日期快照 {safe_worksheet_title(title)} {start_row}-{end_row}",
+            ws.delete_rows,
+            start_row,
+            end_row,
+        )
+
+    current_values = _worksheet_values_with_formulas(ws)
+    print(
+        f"  ♻️ Google Sheet daily 日期替換：{safe_worksheet_title(title)}｜"
+        f"日期={target_key}｜範圍={'、'.join(sorted(incoming_scopes))}｜"
+        f"本次 {len(rows_to_insert):,} 列｜替換舊列 {len(old_target_rows):,}"
+    )
+    return {
+        "values": current_values,
+        "incoming": len(rows_to_insert),
+        "replaced": len(old_target_rows),
+        "target_date": target_key,
+    }
+
+
 def _top15_scope_date_key(record):
     """回傳 TOP15 快照識別鍵：(資料範圍, 統計日期)。"""
     scope = str(
@@ -7513,13 +7850,15 @@ def upload_excel_to_google_sheet(
     data_scope=None,
     allowed_titles=None,
     extra_scope_values=None,
+    refresh_date=None,
 ):
     """
     Google Sheet 同步規則：
     1. repair + RUN_MODE=2：FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表完整覆蓋。
     2. 完整修補會逐張處理；單張失敗不會阻止其他工作表，最後再統一重試失敗項目。
     3. 任何必要工作表最終失敗都會讓程式以錯誤結束，禁止印出假成功。
-    4. daily／RUN_MODE=1 維持既有增量與 TOP15 快照邏輯。
+    4. daily 的 A～E／每日賣出只替換目標交易日；TOP15 維持同日快照替換。
+    5. daily 單張失敗也會自動重試一次；仍失敗時明確中止，避免誤報完成。
     """
     strict_repair = WORKFLOW_MODE == "repair" and RUN_MODE == 2
     if strict_repair:
@@ -7598,7 +7937,7 @@ def upload_excel_to_google_sheet(
         )
     else:
         print(
-            "  ⚙️ 同步模式：A～E／每日賣出採穩定唯一鍵增量 insert；"
+            f"  ⚙️ 同步模式：A～E／每日賣出只替換目標交易日 {normalize_date_str(refresh_date) or '-'}；"
             "TOP15 採同資料範圍＋同統計日期整批替換。"
         )
 
@@ -7632,12 +7971,28 @@ def upload_excel_to_google_sheet(
             return
 
         if created:
-            prepared = _prepare_incremental_result_values(
-                title,
-                raw_values,
-                data_scope=current_scope,
-                extra_scope_values=selected_values,
-            )
+            if WORKFLOW_MODE == "daily" and is_daily_date_replace_sheet(title):
+                daily_prepared = _prepare_daily_date_replace_values(
+                    title,
+                    raw_values,
+                    refresh_date,
+                    data_scope=current_scope,
+                    extra_scope_values=selected_values,
+                )
+                prepared = (
+                    (daily_prepared["headers"], daily_prepared["records"])
+                    if daily_prepared is not None
+                    else None
+                )
+                if prepared is None:
+                    raise RuntimeError(f"daily 新工作表日期資料無法辨識：{title}")
+            else:
+                prepared = _prepare_incremental_result_values(
+                    title,
+                    raw_values,
+                    data_scope=current_scope,
+                    extra_scope_values=selected_values,
+                )
             if prepared is not None:
                 headers, records = prepared
                 values = _records_to_values(headers, records)
@@ -7657,6 +8012,26 @@ def upload_excel_to_google_sheet(
             apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
             apply_header_widths_to_gsheet(gws, values=values)
             print(f"  ☁️ 第一次建立並寫入工作表：{title}")
+            return
+
+        if WORKFLOW_MODE == "daily" and is_daily_date_replace_sheet(title):
+            daily_result = replace_daily_date_rows_in_worksheet(
+                gws,
+                title,
+                raw_values,
+                refresh_date,
+                data_scope=current_scope,
+                extra_scope_values=selected_values,
+            )
+            if daily_result is None:
+                raise RuntimeError(f"daily 日期替換失敗：{title}")
+            current_values = daily_result.get("values") or _worksheet_values_with_formulas(gws)
+            clear_all_number_formats_for_written_range(gws, values=current_values)
+            apply_safe_result_table_style_to_gsheet(gws, values=current_values)
+            apply_text_format_to_gsheet(gws, current_values)
+            apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=current_values)
+            apply_date_format_to_gsheet(ws_xlsx, gws, values=current_values)
+            apply_header_widths_to_gsheet(gws, values=current_values)
             return
 
         if is_top15_snapshot_replace_sheet(title):
@@ -7723,6 +8098,22 @@ def upload_excel_to_google_sheet(
                 failures[title] = f"{type(exc).__name__}: {exc}"
                 print(f"  ❌ repair 第二輪仍失敗：{title}｜{failures[title]}")
 
+    if WORKFLOW_MODE == "daily" and failures:
+        retry_titles = [title for title in ordered_titles if title in failures]
+        print(
+            f"  🔁 daily 自動重試失敗工作表：{len(retry_titles)} 張｜"
+            + "、".join(retry_titles)
+        )
+        for title in retry_titles:
+            try:
+                sync_one(title)
+                completed.add(title)
+                failures.pop(title, None)
+                print(f"  ✅ daily 自動重試成功：{title}")
+            except Exception as exc:
+                failures[title] = f"{type(exc).__name__}: {exc}"
+                print(f"  ❌ daily 自動重試仍失敗：{title}｜{failures[title]}")
+
     if strict_repair:
         missing_completed = sorted(repair_expected_overwrites - completed)
         unexpected_failures = {
@@ -7739,6 +8130,12 @@ def upload_excel_to_google_sheet(
         print(
             f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(completed & repair_expected_overwrites)} 張｜"
             + "、".join(sorted(completed & repair_expected_overwrites))
+        )
+
+    if WORKFLOW_MODE == "daily" and failures:
+        raise RuntimeError(
+            "daily 未能更新所有必要工作表："
+            + "｜".join(f"{title}={reason}" for title, reason in failures.items())
         )
 
     if failures and not strict_repair:
@@ -12384,6 +12781,1029 @@ def top15_fmt_amount_wan(value):
         return "0.0萬"
 
 
+
+# TOP15 個股型態執行期快取：同一 RUN 中全分點與精選五分點共用結果，避免重複打 API。
+_TOP15_PATTERN_RESULT_CACHE = {}
+_TOP15_PATTERN_RESULT_CACHE_LOCK = threading.Lock()
+_TOP15_PATTERN_DATASET_CACHE = {}
+_TOP15_PATTERN_DATASET_CACHE_LOCK = threading.Lock()
+_TOP15_PATTERN_MARKET_RAW_CACHE = {}
+_TOP15_PATTERN_MARKET_RAW_CACHE_LOCK = threading.Lock()
+
+
+def _normalize_pattern_stock_code(value):
+    """保留台股／ETF 英數代號，例如 2330、00981A；不套用權證補零規則。"""
+    if value is None:
+        return ""
+    s = strip_gsheet_text_prefix(str(value)).strip().upper()
+    if not s:
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    s = s.split()[0]
+    s = re.sub(r"[^0-9A-Z]", "", s)
+    return s if 4 <= len(s) <= 8 else ""
+
+
+def _pattern_round(value):
+    try:
+        if value in (None, ""):
+            return None
+        return round(float(value), PATTERN_COMPARE_DECIMALS)
+    except Exception:
+        return None
+
+
+def _pattern_empty_result(
+    stock_code,
+    target_date,
+    status,
+    reason,
+    *,
+    price_source="Missing",
+    company_action_status="UNKNOWN",
+):
+    return {
+        "型態": PATTERN_INVALID_LABEL,
+        "型態統計日期": normalize_date_str(target_date),
+        "型態價格來源": price_source,
+        "型態還原收盤價": "",
+        "型態原始收盤價": "",
+        "型態MA5": "",
+        "型態MA10": "",
+        "型態MA20": "",
+        "型態前59日高點": "",
+        "型態量峰價": "",
+        "型態橋接係數": "",
+        "型態公司行動狀態": company_action_status,
+        "型態計算狀態": status,
+        "型態錯誤原因": str(reason or "").strip(),
+        "_pattern_stock_code": stock_code,
+    }
+
+
+def _pattern_normalized_column_name(value):
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", str(value or "")).lower()
+
+
+def _pattern_find_column(df, candidates):
+    if df is None or df.empty:
+        return None
+    normalized_map = {
+        _pattern_normalized_column_name(column): column
+        for column in df.columns
+    }
+    for candidate in candidates:
+        key = _pattern_normalized_column_name(candidate)
+        if key in normalized_map:
+            return normalized_map[key]
+    return None
+
+
+def _pattern_finmind_dataframe(dataset, stock_code, start_date, end_date):
+    """型態專用 FinMind 查詢；允許合法空結果，且依資料集／股票／日期分開快取。"""
+    start_key = parse_date(start_date).strftime("%Y-%m-%d") if parse_date(start_date) else ""
+    end_key = parse_date(end_date).strftime("%Y-%m-%d") if parse_date(end_date) else ""
+
+    # TaiwanStockSplitPrice 官方文件採全市場查詢；其他資料集使用 data_id 個股查詢。
+    query_stock_code = "" if str(dataset) == PATTERN_SPLIT_DATASET else stock_code
+    cache_key = (str(dataset), str(query_stock_code or "__ALL__"), start_key, end_key)
+
+    with _TOP15_PATTERN_DATASET_CACHE_LOCK:
+        cached = _TOP15_PATTERN_DATASET_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+    query = {
+        "dataset": dataset,
+        "start_date": start_key,
+        "end_date": end_key,
+    }
+    if query_stock_code:
+        query["data_id"] = query_stock_code
+
+    response = _finmind_request(
+        "GET",
+        FINMIND_DATA_URL,
+        params=query,
+        description=f"FinMind {dataset} {query_stock_code or '全市場'}",
+    )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"{dataset} 回應不是合法 JSON：{exc}") from exc
+
+    status = int(payload.get("status", response.status_code) or response.status_code)
+    if status != 200:
+        raise RuntimeError(payload.get("msg") or f"{dataset} status={status}")
+
+    data = payload.get("data")
+    if data is None:
+        raise RuntimeError(f"{dataset} 回應缺少 data 欄位")
+    if not isinstance(data, list):
+        raise RuntimeError(f"{dataset} data 欄位格式錯誤")
+
+    df = pd.DataFrame(data)
+    with _TOP15_PATTERN_DATASET_CACHE_LOCK:
+        _TOP15_PATTERN_DATASET_CACHE[cache_key] = df.copy()
+    return df
+
+
+def _pattern_numeric_series(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+
+
+def _pattern_normalize_price_dataframe(df, stock_code, *, adjusted):
+    """將 FinMind 原始／還原日價統一成 date、close、Trading_money。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "close", "Trading_money"])
+
+    out = df.copy()
+    stock_col = _pattern_find_column(out, ["stock_id", "stockid", "股票代號", "證券代號"])
+    if stock_col:
+        normalized_stock = out[stock_col].map(_normalize_pattern_stock_code)
+        out = out[normalized_stock == stock_code].copy()
+
+    date_col = _pattern_find_column(out, ["date", "trade_date", "tradedate", "交易日期", "日期"])
+    close_col = _pattern_find_column(out, ["close", "Close", "收盤價", "收盤"])
+    money_col = _pattern_find_column(
+        out,
+        ["Trading_money", "trading_money", "TradeValue", "trade_value", "成交金額", "成交值"],
+    )
+
+    if date_col is None or close_col is None:
+        kind = "還原價" if adjusted else "原始價"
+        raise RuntimeError(f"{kind}資料缺少 date／close 欄位")
+
+    normalized = pd.DataFrame()
+    normalized["date"] = pd.to_datetime(out[date_col], errors="coerce")
+    normalized["close"] = _pattern_numeric_series(out[close_col])
+    normalized["Trading_money"] = (
+        _pattern_numeric_series(out[money_col])
+        if money_col is not None
+        else float("nan")
+    )
+    normalized = normalized[normalized["date"].notna()].copy()
+    normalized["date"] = normalized["date"].dt.strftime("%Y/%m/%d")
+
+    # 同日若有互相矛盾的價格／成交金額，禁止任意 keep last。
+    for date_key, group in normalized.groupby("date", sort=False):
+        close_values = {
+            round(float(v), PATTERN_COMPARE_DECIMALS)
+            for v in group["close"].dropna().tolist()
+        }
+        money_values = {
+            round(float(v), 2)
+            for v in group["Trading_money"].dropna().tolist()
+        }
+        if len(close_values) > 1 or len(money_values) > 1:
+            raise RuntimeError(f"同日資料矛盾：{stock_code} {date_key}")
+
+    normalized = normalized.drop_duplicates(subset=["date"], keep="last")
+    normalized = normalized.sort_values("date").reset_index(drop=True)
+    return normalized
+
+
+def _pattern_trading_dates_on_or_before(target_date):
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return []
+    target_day = target_dt.date()
+    return [day for day in get_finmind_trading_dates() if day <= target_day]
+
+
+def _pattern_fetch_start_date(target_date):
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return None
+    needed = (
+        PATTERN_LOOKBACK
+        + PATTERN_MAX_MISSING_DAYS
+        + PATTERN_MA_HISTORY_BUFFER_DAYS
+    )
+    dates = _pattern_trading_dates_on_or_before(target_date)
+    if len(dates) >= needed:
+        return datetime.combine(dates[-needed], datetime.min.time())
+    # 交易日清單暫時不可用時，給足日曆緩衝；有效日數仍會在後面嚴格驗證。
+    return target_dt - timedelta(days=max(needed * 2 + 20, 150))
+
+
+def _pattern_previous_trading_date(target_date):
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return None
+    dates = [day for day in _pattern_trading_dates_on_or_before(target_date) if day < target_dt.date()]
+    if dates:
+        return datetime.combine(dates[-1], datetime.min.time())
+    candidate = target_dt - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _pattern_trading_day_gap(start_date, end_date):
+    start_dt = parse_date(start_date)
+    end_dt = parse_date(end_date)
+    if not start_dt or not end_dt or start_dt >= end_dt:
+        return 0 if start_dt == end_dt else 999999
+    dates = get_finmind_trading_dates()
+    if dates:
+        return sum(1 for day in dates if start_dt.date() < day <= end_dt.date())
+    count = 0
+    current = start_dt + timedelta(days=1)
+    while current <= end_dt:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def _pattern_market_money_column(headers):
+    normalized = [_normalize_market_header(header) for header in (headers or [])]
+    exact = {
+        "成交金額", "成交金額元", "成交值", "交易金額",
+        "tradingmoney", "tradevalue", "transactionamount", "amount",
+    }
+    for idx, header in enumerate(normalized):
+        if header in exact:
+            scale = 1000.0 if ("千元" in str(headers[idx]) or "仟元" in str(headers[idx])) else 1.0
+            return idx, scale
+    for idx, header in enumerate(normalized):
+        if "成交金額" in header or "成交值" in header:
+            scale = 1000.0 if ("千元" in str(headers[idx]) or "仟元" in str(headers[idx])) else 1.0
+            return idx, scale
+    return None, 1.0
+
+
+def _pattern_extract_market_raw_payload(payload, expected_date, source_name=""):
+    """從 TWSE／TPEx 單日全市場資料擷取原始收盤與成交金額。"""
+    if not _market_payload_date_matches_request(payload, expected_date, source_name=source_name):
+        return {}
+
+    records = {}
+    visited = set()
+
+    def add_values(headers, values):
+        if not isinstance(headers, list) or not isinstance(values, (list, tuple)):
+            return
+        code_idx = _market_header_index(headers, "code")
+        close_idx = _market_header_index(headers, "close")
+        money_idx, money_scale = _pattern_market_money_column(headers)
+        if code_idx is None or close_idx is None or money_idx is None:
+            return
+        if max(code_idx, close_idx, money_idx) >= len(values):
+            return
+        code = _normalize_pattern_stock_code(_clean_market_cell_text(values[code_idx]))
+        close_value = safe_price_float(_clean_market_cell_text(values[close_idx]))
+        money_value = safe_price_float(_clean_market_cell_text(values[money_idx]))
+        if not code or close_value is None or money_value is None:
+            return
+        records[code] = {
+            "raw_close": float(close_value),
+            "Trading_money": float(money_value) * money_scale,
+        }
+
+    def add_record(record):
+        if not isinstance(record, dict):
+            return
+        headers = list(record.keys())
+        add_values(headers, list(record.values()))
+
+    def add_table(headers, rows):
+        if not isinstance(headers, list) or not isinstance(rows, list):
+            return
+        for row in rows:
+            if isinstance(row, dict):
+                add_record(row)
+            else:
+                add_values(headers, row)
+
+    def visit(obj):
+        if isinstance(obj, (dict, list)):
+            obj_id = id(obj)
+            if obj_id in visited:
+                return
+            visited.add(obj_id)
+
+        if isinstance(obj, dict):
+            add_record(obj)
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("data"), list):
+                add_table(obj.get("fields"), obj.get("data"))
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("aaData"), list):
+                add_table(obj.get("fields"), obj.get("aaData"))
+            elif isinstance(obj.get("aaData"), list):
+                # TPEx dailyQuotes 既有無 fields 格式：0=代號、2=收盤、9=成交金額。
+                for row in obj.get("aaData", []):
+                    if not isinstance(row, (list, tuple)) or len(row) <= 9:
+                        continue
+                    code = _normalize_pattern_stock_code(_clean_market_cell_text(row[0]))
+                    close_value = safe_price_float(_clean_market_cell_text(row[2]))
+                    money_value = safe_price_float(_clean_market_cell_text(row[9]))
+                    if code and close_value is not None and money_value is not None:
+                        records[code] = {
+                            "raw_close": float(close_value),
+                            "Trading_money": float(money_value),
+                        }
+            for key, headers in obj.items():
+                match = re.fullmatch(r"fields(\d*)", str(key or ""), flags=re.IGNORECASE)
+                if not match or not isinstance(headers, list):
+                    continue
+                rows = obj.get(f"data{match.group(1)}")
+                if isinstance(rows, list):
+                    add_table(headers, rows)
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, dict):
+                    add_record(value)
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+    visit(payload)
+    return records
+
+
+def _pattern_fetch_market_raw_snapshot(target_date):
+    target_key = normalize_date_str(target_date)
+    with _TOP15_PATTERN_MARKET_RAW_CACHE_LOCK:
+        cached = _TOP15_PATTERN_MARKET_RAW_CACHE.get(target_key)
+        if cached is not None:
+            return dict(cached)
+
+        target_dt = parse_date(target_key)
+        if not target_dt:
+            _TOP15_PATTERN_MARKET_RAW_CACHE[target_key] = {}
+            return {}
+
+        endpoints = [
+            (
+                "TWSE",
+                "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                {"response": "json", "date": target_dt.strftime("%Y%m%d"), "type": "ALL"},
+            ),
+            (
+                "TPEx",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
+                {"date": target_dt.strftime("%Y/%m/%d"), "id": "", "response": "json"},
+            ),
+        ]
+
+        merged = {}
+        for market_name, url, params in endpoints:
+            try:
+                response = get_thread_session().get(
+                    url,
+                    params=params,
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
+                    timeout=(5, 25),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                merged.update(
+                    _pattern_extract_market_raw_payload(
+                        payload,
+                        target_key,
+                        source_name=f"型態{market_name}",
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"  ⚠️ TOP15型態 {market_name} 統計日原始行情取得失敗："
+                    f"{target_key}｜{type(exc).__name__}: {exc}"
+                )
+
+        _TOP15_PATTERN_MARKET_RAW_CACHE[target_key] = dict(merged)
+        return dict(merged)
+
+
+def _pattern_date_values_from_columns(df, columns):
+    values = []
+    for column in columns:
+        if column not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[column], errors="coerce").dropna()
+        values.extend(parsed.dt.strftime("%Y/%m/%d").tolist())
+    return values
+
+
+def _pattern_check_corporate_actions(stock_code, gap_start_date, target_date):
+    """橋接前查詢除權息、減資、分割；任一 UNKNOWN 預設 fail closed。"""
+    target_dt = parse_date(target_date)
+    gap_start_dt = parse_date(gap_start_date)
+    if not target_dt or not gap_start_dt:
+        return "UNKNOWN", "公司行動日期無法解析"
+
+    query_start = target_dt - timedelta(days=30)
+    # 股利政策的權利分派基準日可能晚於除權息交易日，前後各保留 30 天查詢緩衝。
+    query_end = target_dt + timedelta(days=30)
+    specs = [
+        (
+            PATTERN_DIVIDEND_DATASET,
+            [
+                "StockExDividendTradingDate", "CashExDividendTradingDate",
+                "stock_ex_dividend_trading_date", "cash_ex_dividend_trading_date",
+            ],
+            "DIVIDEND",
+        ),
+        (
+            PATTERN_DIVIDEND_RESULT_DATASET,
+            ["date", "Date", "ex_dividend_date", "除權息日期", "交易日期"],
+            "DIVIDEND",
+        ),
+        (
+            PATTERN_CAPITAL_REDUCTION_DATASET,
+            ["date", "Date", "resume_date", "ResumeTradeDate", "恢復買賣日期"],
+            "CAPITAL_REDUCTION",
+        ),
+        (
+            PATTERN_SPLIT_DATASET,
+            ["date", "Date", "split_date", "SplitDate", "分割日期"],
+            "SPLIT",
+        ),
+    ]
+
+    unknown_messages = []
+    for dataset, candidate_columns, event_label in specs:
+        try:
+            df = _pattern_finmind_dataframe(dataset, stock_code, query_start, query_end)
+        except Exception as exc:
+            unknown_messages.append(f"{dataset}:{type(exc).__name__}:{exc}")
+            continue
+
+        if df.empty:
+            continue
+
+        stock_col = _pattern_find_column(df, ["stock_id", "stockid", "股票代號", "證券代號"])
+        if stock_col:
+            normalized_stock = df[stock_col].map(_normalize_pattern_stock_code)
+            df = df[normalized_stock == stock_code].copy()
+        if df.empty:
+            continue
+
+        actual_columns = []
+        normalized_columns = {
+            _pattern_normalized_column_name(column): column
+            for column in df.columns
+        }
+        for candidate in candidate_columns:
+            key = _pattern_normalized_column_name(candidate)
+            if key in normalized_columns and normalized_columns[key] not in actual_columns:
+                actual_columns.append(normalized_columns[key])
+
+        if not actual_columns:
+            unknown_messages.append(f"{dataset}:缺少公司行動日期欄位")
+            continue
+
+        event_dates = _pattern_date_values_from_columns(df, actual_columns)
+        for event_date in event_dates:
+            event_dt = parse_date(event_date)
+            if event_dt and gap_start_dt < event_dt <= target_dt:
+                return event_label, f"{dataset} 確認 {event_date} 有公司行動"
+
+    if unknown_messages:
+        return "UNKNOWN", "；".join(unknown_messages)
+    return "NO_EVENT", ""
+
+
+def _pattern_profile_peak_price(window):
+    if str(PATTERN_PROFILE_WEIGHT).strip().lower() != "trading_money":
+        raise RuntimeError("PATTERN_PROFILE_WEIGHT 只允許 Trading_money")
+    if window is None or window.empty:
+        raise RuntimeError("成交金額價格輪廓沒有資料")
+    if PATTERN_PROFILE_BIN_PCT <= 0:
+        raise RuntimeError("PATTERN_PROFILE_BIN_PCT 必須大於 0")
+
+    prices = pd.to_numeric(window["adjusted_close"], errors="coerce")
+    monies = pd.to_numeric(window["Trading_money"], errors="coerce")
+    if prices.isna().any() or monies.isna().any():
+        raise RuntimeError("成交金額價格輪廓含無效數值")
+    if (prices <= 0).any() or (monies <= 0).any():
+        raise RuntimeError("成交金額價格輪廓含非正值")
+
+    base_price = float(prices.min())
+    log_base = math.log1p(PATTERN_PROFILE_BIN_PCT)
+    if base_price <= 0 or log_base <= 0:
+        raise RuntimeError("成交金額價格輪廓基準無效")
+
+    bin_indices = []
+    for price in prices.tolist():
+        raw_index = math.log(float(price) / base_price) / log_base
+        # 邊界採 [下界, 上界)，只消除極小浮點誤差。
+        bin_indices.append(max(int(math.floor(raw_index + 1e-12)), 0))
+
+    profile = window.copy()
+    profile["_pattern_bin"] = bin_indices
+    grouped = []
+    for bin_index, group in profile.groupby("_pattern_bin", sort=True):
+        total_money = float(group["Trading_money"].sum())
+        if total_money <= 0:
+            continue
+        weighted_price = float(
+            (group["adjusted_close"] * group["Trading_money"]).sum()
+            / total_money
+        )
+        grouped.append((int(bin_index), total_money, weighted_price))
+
+    if not grouped:
+        raise RuntimeError("成交金額價格輪廓無有效量峰箱")
+
+    max_money = max(item[1] for item in grouped)
+    candidates = [item for item in grouped if item[1] == max_money]
+    current_close = float(window.iloc[-1]["adjusted_close"])
+    candidates.sort(key=lambda item: (abs(item[2] - current_close), item[2], item[0]))
+    return candidates[0][2]
+
+
+def _pattern_classify_window(history, *, target_date, price_source, bridge_factor, company_action_status):
+    if history is None or len(history) < PATTERN_LOOKBACK:
+        raise RuntimeError("有效交易日不足")
+
+    full_data = history.copy().reset_index(drop=True)
+    full_data["ma5"] = full_data["adjusted_close"].rolling(5).mean()
+    full_data["ma10"] = full_data["adjusted_close"].rolling(10).mean()
+    full_data["ma20"] = full_data["adjusted_close"].rolling(20).mean()
+    data = full_data.tail(PATTERN_LOOKBACK).copy().reset_index(drop=True)
+
+    if len(data) <= PATTERN_MA_SLOPE_DAYS:
+        raise RuntimeError("MA20斜率比較資料不足")
+
+    current = data.iloc[-1]
+    previous = data.iloc[-2]
+    slope_reference = data.iloc[-1 - PATTERN_MA_SLOPE_DAYS]
+    required_values = [
+        current["adjusted_close"], current["raw_close"], current["ma5"], current["ma10"], current["ma20"],
+        previous["adjusted_close"], previous["ma20"], slope_reference["ma20"],
+    ]
+    if any(pd.isna(value) for value in required_values):
+        raise RuntimeError("MA計算失敗")
+
+    previous_high = float(data.iloc[:-1]["adjusted_close"].max())
+    profile_peak_price = _pattern_profile_peak_price(data)
+
+    adjusted_close = _pattern_round(current["adjusted_close"])
+    raw_close = _pattern_round(current["raw_close"])
+    previous_adjusted_close = _pattern_round(previous["adjusted_close"])
+    ma5 = _pattern_round(current["ma5"])
+    ma10 = _pattern_round(current["ma10"])
+    ma20 = _pattern_round(current["ma20"])
+    previous_ma20 = _pattern_round(previous["ma20"])
+    slope_ma20 = _pattern_round(slope_reference["ma20"])
+    previous_high_cmp = _pattern_round(previous_high)
+    profile_peak_cmp = _pattern_round(profile_peak_price)
+
+    high_threshold = _pattern_round(previous_high * PATTERN_HIGH_TOLERANCE)
+    support_upper = _pattern_round(profile_peak_price * PATTERN_SUPPORT_UPPER)
+    weak_threshold = _pattern_round(float(current["ma20"]) * PATTERN_WEAK_THRESHOLD)
+
+    is_breakout = (
+        adjusted_close >= high_threshold
+        and adjusted_close >= previous_adjusted_close
+    )
+    is_cross_ma20 = (
+        adjusted_close > ma20
+        and previous_adjusted_close <= previous_ma20
+        and ma20 >= slope_ma20
+    )
+    is_support = (
+        profile_peak_cmp <= adjusted_close <= support_upper
+        and adjusted_close >= weak_threshold
+    )
+    is_strong = (
+        ma5 > ma10 > ma20
+        and adjusted_close > ma5
+        and ma20 >= slope_ma20
+    )
+    is_weak = adjusted_close < weak_threshold
+
+    if is_breakout:
+        label = "突"
+    elif is_cross_ma20:
+        label = "站"
+    elif is_support:
+        label = "撐"
+    elif is_strong:
+        label = "強"
+    elif is_weak:
+        label = "弱"
+    else:
+        label = PATTERN_DEFAULT_LABEL
+
+    return {
+        "型態": label,
+        "型態統計日期": normalize_date_str(target_date),
+        "型態價格來源": price_source,
+        "型態還原收盤價": adjusted_close,
+        "型態原始收盤價": raw_close,
+        "型態MA5": ma5,
+        "型態MA10": ma10,
+        "型態MA20": ma20,
+        "型態前59日高點": previous_high_cmp,
+        "型態量峰價": profile_peak_cmp,
+        "型態橋接係數": "" if bridge_factor in (None, "") else _pattern_round(bridge_factor),
+        "型態公司行動狀態": company_action_status,
+        "型態計算狀態": "OK",
+        "型態錯誤原因": "",
+    }
+
+
+def _build_single_top15_pattern(stock_code, target_date):
+    stock_code = _normalize_pattern_stock_code(stock_code)
+    target_date = normalize_date_str(target_date)
+    cache_key = (
+        stock_code, target_date, PATTERN_LOOKBACK, PATTERN_MAX_MISSING_DAYS,
+        PATTERN_HIGH_TOLERANCE, PATTERN_SUPPORT_UPPER, PATTERN_WEAK_THRESHOLD,
+        PATTERN_MA_SLOPE_DAYS, PATTERN_PROFILE_BIN_PCT,
+    )
+    with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+        cached = _TOP15_PATTERN_RESULT_CACHE.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+    if not stock_code:
+        result = _pattern_empty_result(stock_code, target_date, "DATE_MISMATCH", "標的股代號無效")
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    if not PATTERN_ENABLE:
+        result = _pattern_empty_result(stock_code, target_date, "DISABLED", "PATTERN_ENABLE=0", company_action_status="NOT_REQUIRED")
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    target_dt = parse_date(target_date)
+    fetch_start = _pattern_fetch_start_date(target_date)
+    if not target_dt or not fetch_start:
+        result = _pattern_empty_result(stock_code, target_date, "DATE_MISMATCH", "型態統計日期無法解析")
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    try:
+        adjusted_raw = _pattern_finmind_dataframe(
+            PATTERN_PRICE_DATASET,
+            stock_code,
+            fetch_start,
+            target_dt,
+        )
+        original_raw = _pattern_finmind_dataframe(
+            "TaiwanStockPrice",
+            stock_code,
+            fetch_start,
+            target_dt,
+        )
+        adjusted = _pattern_normalize_price_dataframe(adjusted_raw, stock_code, adjusted=True)
+        original = _pattern_normalize_price_dataframe(original_raw, stock_code, adjusted=False)
+    except Exception as exc:
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "TARGET_ADJ_MISSING",
+            f"還原／原始股價取得失敗：{type(exc).__name__}: {exc}",
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    # 統計日原始收盤與成交金額：FinMind 優先，未發布時才用官方 TWSE／TPEx 單日資料。
+    original_target = original[original["date"] == target_date].copy()
+    if original_target.empty or not (
+        top15_safe_float(original_target.iloc[-1].get("close"), 0) > 0
+        and top15_safe_float(original_target.iloc[-1].get("Trading_money"), 0) > 0
+    ):
+        market_row = _pattern_fetch_market_raw_snapshot(target_date).get(stock_code)
+        if market_row:
+            original = original[original["date"] != target_date].copy()
+            original = pd.concat([
+                original,
+                pd.DataFrame([{
+                    "date": target_date,
+                    "close": market_row.get("raw_close"),
+                    "Trading_money": market_row.get("Trading_money"),
+                }]),
+            ], ignore_index=True)
+            original = original.sort_values("date").reset_index(drop=True)
+            original_target = original[original["date"] == target_date].copy()
+
+    if original_target.empty:
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "TARGET_RAW_MISSING",
+            "統計日原始收盤價或成交金額缺少",
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    target_adj = adjusted[adjusted["date"] == target_date].copy()
+    bridge_factor = None
+    company_action_status = "NOT_REQUIRED"
+    price_source = "FinMindAdj"
+
+    if target_adj.empty:
+        if not PATTERN_ALLOW_TARGET_BRIDGE:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "TARGET_ADJ_MISSING",
+                "統計日正式還原價缺少且橋接已關閉",
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        available_adj = adjusted[
+            (adjusted["date"] < target_date)
+            & (pd.to_numeric(adjusted["close"], errors="coerce") > 0)
+        ].copy()
+        if available_adj.empty:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "TARGET_ADJ_MISSING",
+                "沒有可供橋接的最近正式還原價",
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        latest_adj_date = str(available_adj.iloc[-1]["date"])
+        expected_previous = _pattern_previous_trading_date(target_date)
+        expected_previous_key = normalize_date_str(expected_previous) if expected_previous else ""
+        gap_days = _pattern_trading_day_gap(latest_adj_date, target_date)
+        if latest_adj_date != expected_previous_key or gap_days > PATTERN_BRIDGE_MAX_TRADING_DAYS:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "TARGET_ADJ_MISSING",
+                f"最新正式還原價不是統計日前一交易日：latest={latest_adj_date} expected={expected_previous_key}",
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        if PATTERN_REQUIRE_NO_CORPORATE_ACTION_IN_GAP:
+            company_action_status, action_reason = _pattern_check_corporate_actions(
+                stock_code,
+                latest_adj_date,
+                target_date,
+            )
+            if company_action_status in ("DIVIDEND", "CAPITAL_REDUCTION", "SPLIT"):
+                result = _pattern_empty_result(
+                    stock_code,
+                    target_date,
+                    "CORPORATE_ACTION_FOUND",
+                    action_reason,
+                    price_source="MissingCorporateAction",
+                    company_action_status=company_action_status,
+                )
+                with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                    _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+                return result
+            if company_action_status == "UNKNOWN" and PATTERN_CORPORATE_ACTION_FAIL_CLOSED:
+                result = _pattern_empty_result(
+                    stock_code,
+                    target_date,
+                    "CORPORATE_ACTION_QUERY_FAILED",
+                    action_reason,
+                    company_action_status="UNKNOWN",
+                )
+                with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                    _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+                return result
+        else:
+            company_action_status = "NOT_REQUIRED"
+
+        ratio_frame = adjusted[["date", "close"]].rename(columns={"close": "adjusted_close"}).merge(
+            original[["date", "close"]].rename(columns={"close": "raw_close"}),
+            on="date",
+            how="inner",
+        )
+        ratio_frame = ratio_frame[
+            (ratio_frame["date"] <= latest_adj_date)
+            & (pd.to_numeric(ratio_frame["adjusted_close"], errors="coerce") > 0)
+            & (pd.to_numeric(ratio_frame["raw_close"], errors="coerce") > 0)
+        ].sort_values("date").tail(PATTERN_BRIDGE_RATIO_DAYS)
+
+        if len(ratio_frame) < PATTERN_BRIDGE_RATIO_DAYS:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "BRIDGE_RATIO_UNSTABLE",
+                f"共同交易日不足 {PATTERN_BRIDGE_RATIO_DAYS} 日",
+                company_action_status=company_action_status,
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        ratios = (
+            pd.to_numeric(ratio_frame["adjusted_close"], errors="coerce")
+            / pd.to_numeric(ratio_frame["raw_close"], errors="coerce")
+        ).dropna().tolist()
+        if len(ratios) != PATTERN_BRIDGE_RATIO_DAYS:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "BRIDGE_RATIO_UNSTABLE",
+                "還原係數含無效值",
+                company_action_status=company_action_status,
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        bridge_factor = float(pd.Series(ratios).median())
+        if bridge_factor <= 0:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "BRIDGE_RATIO_UNSTABLE",
+                "還原係數小於等於 0",
+                company_action_status=company_action_status,
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        max_deviation = max(abs(float(ratio) / bridge_factor - 1.0) for ratio in ratios)
+        if max_deviation > PATTERN_BRIDGE_RATIO_TOLERANCE:
+            result = _pattern_empty_result(
+                stock_code,
+                target_date,
+                "BRIDGE_RATIO_UNSTABLE",
+                f"最近{PATTERN_BRIDGE_RATIO_DAYS}日還原係數最大偏差={max_deviation:.6f}",
+                company_action_status=company_action_status,
+            )
+            with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+                _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+            return result
+
+        target_raw_close = float(original_target.iloc[-1]["close"])
+        adjusted = pd.concat([
+            adjusted,
+            pd.DataFrame([{
+                "date": target_date,
+                "close": target_raw_close * bridge_factor,
+                "Trading_money": original_target.iloc[-1].get("Trading_money"),
+            }]),
+        ], ignore_index=True)
+        adjusted = adjusted.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        price_source = "Bridge"
+
+    merged = adjusted[["date", "close"]].rename(columns={"close": "adjusted_close"}).merge(
+        original[["date", "close", "Trading_money"]].rename(columns={"close": "raw_close"}),
+        on="date",
+        how="inner",
+    )
+    merged = merged[
+        (merged["date"] <= target_date)
+        & (pd.to_numeric(merged["adjusted_close"], errors="coerce") > 0)
+        & (pd.to_numeric(merged["raw_close"], errors="coerce") > 0)
+        & (pd.to_numeric(merged["Trading_money"], errors="coerce") > 0)
+    ].copy()
+    merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+
+    trading_dates = _pattern_trading_dates_on_or_before(target_date)
+    candidate_count = (
+        PATTERN_LOOKBACK
+        + PATTERN_MAX_MISSING_DAYS
+        + PATTERN_MA_HISTORY_BUFFER_DAYS
+    )
+    if len(trading_dates) >= candidate_count:
+        candidate_set = {
+            day.strftime("%Y/%m/%d")
+            for day in trading_dates[-candidate_count:]
+        }
+        merged = merged[merged["date"].isin(candidate_set)].copy()
+
+    if target_date not in set(merged["date"].tolist()):
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "TARGET_ADJ_MISSING",
+            "統計日無法形成同尺度還原價＋原始成交資料",
+            price_source=price_source,
+            company_action_status=company_action_status,
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    if len(merged) < PATTERN_LOOKBACK:
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "INSUFFICIENT_HISTORY",
+            f"有效交易日僅 {len(merged)} 日，需求 {PATTERN_LOOKBACK} 日",
+            price_source=price_source,
+            company_action_status=company_action_status,
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    calculation_data = merged.reset_index(drop=True)
+    window = calculation_data.tail(PATTERN_LOOKBACK).reset_index(drop=True)
+    if str(window.iloc[-1]["date"]) != target_date:
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "TARGET_ADJ_MISSING",
+            "型態窗口最後一日不是統計日",
+            price_source=price_source,
+            company_action_status=company_action_status,
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
+    try:
+        result = _pattern_classify_window(
+            calculation_data,
+            target_date=target_date,
+            price_source=price_source,
+            bridge_factor=bridge_factor,
+            company_action_status=company_action_status,
+        )
+        result["_pattern_stock_code"] = stock_code
+    except Exception as exc:
+        status = "PROFILE_CALC_FAILED" if "輪廓" in str(exc) else "MA_CALC_FAILED"
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            status,
+            f"{type(exc).__name__}: {exc}",
+            price_source=price_source,
+            company_action_status=company_action_status,
+        )
+
+    with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+        _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+    return result
+
+
+def build_top15_pattern_map(rows, target_date):
+    stock_codes = sorted({
+        _normalize_pattern_stock_code(row.get("標的股", ""))
+        for row in (rows or [])
+        if _normalize_pattern_stock_code(row.get("標的股", ""))
+    })
+    if not stock_codes:
+        return {}
+
+    print(f"  🧭 TOP15個股型態標籤：計算 {len(stock_codes):,} 檔標的｜統計日 {normalize_date_str(target_date)}")
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(PATTERN_FETCH_WORKERS, len(stock_codes))) as executor:
+        futures = {
+            executor.submit(_build_single_top15_pattern, code, target_date): code
+            for code in stock_codes
+        }
+        done = 0
+        for future in as_completed(futures):
+            code = futures[future]
+            done += 1
+            try:
+                results[code] = future.result()
+            except Exception as exc:
+                results[code] = _pattern_empty_result(
+                    code,
+                    target_date,
+                    "PATTERN_CALC_FAILED",
+                    f"{type(exc).__name__}: {exc}",
+                )
+            if done % 10 == 0:
+                print(f"  [{done}/{len(stock_codes)}] TOP15個股型態計算中...")
+
+    counts = Counter(str(result.get("型態", PATTERN_INVALID_LABEL)) for result in results.values())
+    summary = "、".join(f"{label}:{counts.get(label, 0)}" for label in ["突", "站", "撐", "強", "弱", "盤", PATTERN_INVALID_LABEL])
+    print(f"  ✅ TOP15個股型態標籤完成：{summary}")
+    return results
+
+
+def _apply_top15_pattern_results_to_rows(rows, pattern_map, target_date):
+    for row in rows or []:
+        code = _normalize_pattern_stock_code(row.get("標的股", ""))
+        result = pattern_map.get(code)
+        if result is None:
+            result = _pattern_empty_result(
+                code,
+                target_date,
+                "DATE_MISMATCH",
+                "找不到標的股型態結果",
+            )
+        for field in PATTERN_AUDIT_FIELDS:
+            row[field] = result.get(field, "")
+    return rows
+
+
 def build_top15_position_detail_and_consensus_rows(
     a_events,
     b_events,
@@ -12692,7 +14112,11 @@ def build_top15_position_detail_and_consensus_rows(
             + extra
         )
 
+    pattern_map = build_top15_pattern_map(detail_rows, target_date)
+    _apply_top15_pattern_results_to_rows(detail_rows, pattern_map, target_date)
+
     consensus_rows = build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time)
+    _apply_top15_pattern_results_to_rows(consensus_rows, pattern_map, target_date)
 
     print(
         f"  ✅ TOP15固定資料集完成：部位明細 {len(detail_rows):,} 筆，"
@@ -13005,6 +14429,7 @@ def write_top15_position_detail_sheet(wb, detail_rows):
         "歷史FIFO扣除股數", "未配對賣出股數", "FIFO完整狀態",
         "分點", "分點名稱", "券商代號",
         "標的股", "標的名稱",
+        *PATTERN_AUDIT_FIELDS,
         "事件", "事件類型", "事件日", "買進日",
         "權證代號", "權證名稱",
         "原始股數", "原始成本", "原始均價",
@@ -13020,7 +14445,12 @@ def write_top15_position_detail_sheet(wb, detail_rows):
     for row in detail_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 12, 24, 12, 12, 12, 14, 14, 12, 12, 14, 14, 18, 14, 18, 12, 10, 12, 8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 22, 10, 14, 14, 10, 12, 10, 10, 44, 16, 20]
+    col_widths = [
+        12, 12, 24, 12, 12, 12, 14, 14, 12, 12, 14, 14, 18, 14, 18, 12, 10, 12,
+        *PATTERN_AUDIT_COLUMN_WIDTHS,
+        8, 22, 12, 12, 12, 24, 12, 14, 10, 14, 14, 12, 14, 10, 12, 12, 22, 10,
+        14, 14, 10, 12, 10, 10, 44, 16, 20,
+    ]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="價格狀態")
 
 
@@ -13031,6 +14461,7 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     headers = [
         "資料範圍", "統計日期", "統計期間", "有效交易日數", "排名",
         "標的股", "標的名稱",
+        *PATTERN_AUDIT_FIELDS,
         "淨買超成本", "可估成本", "成交價成本", "LP報價成本",
         "最近成交價備援成本", "缺價格成本",
         "成交價覆蓋率", "估值符號",
@@ -13047,13 +14478,23 @@ def write_top15_consensus_cache_sheet(wb, consensus_rows):
     for row in consensus_rows or []:
         ws.append([row.get(h, "") for h in headers])
 
-    col_widths = [12, 12, 24, 12, 8, 10, 12, 14, 14, 14, 14, 14, 14, 12, 10, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60, 12, 10, 10, 20, 16, 80]
+    col_widths = [
+        12, 12, 24, 12, 8, 10, 12,
+        *PATTERN_AUDIT_COLUMN_WIDTHS,
+        14, 14, 14, 14, 14, 14, 12, 10, 14, 14, 10, 12, 12, 14, 12, 48, 10, 10, 60,
+        12, 10, 10, 20, 16, 80,
+    ]
     _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="資料狀態")
 
 
 def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status_col_name="資料狀態"):
     thin_gray = Side(style="thin", color="B7B7B7")
     normal_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+    if len(col_widths) != ws.max_column:
+        raise RuntimeError(
+            f"{ws.title} 欄寬數量不一致：headers={ws.max_column}, col_widths={len(col_widths)}"
+        )
 
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -13854,7 +15295,8 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
 
     source_map = build_event_warrant_source_map(a_events, b_events, c_events, d_events, e_events)
     rows = []
-    cutoff_dt = datetime.today() - timedelta(days=max(SELL_DETAIL_DAYS - 1, 0))
+    report_dt = parse_date(_PRICE_PLAN_MAX_PUBLISHED_DATE) or datetime.today()
+    cutoff_dt = report_dt - timedelta(days=max(SELL_DETAIL_DAYS - 1, 0))
     cutoff_dt = datetime(cutoff_dt.year, cutoff_dt.month, cutoff_dt.day)
 
     for item in items:
@@ -18541,11 +19983,12 @@ def api4_get_with_status(code, start_date, end_date):
     return [], False
 
 
-def api5_get_with_status(warrant_code, broker_code):
+def api5_get_with_status(warrant_code, broker_code, history_limit=None):
+    request_limit = max(int(history_limit or MONEYDJ_API5_HISTORY_LIMIT), 1)
     url = MONEYDJ_API5_URL.format(
         warrant=warrant_code,
         broker=broker_code,
-        limit=MONEYDJ_API5_HISTORY_LIMIT,
+        limit=request_limit,
     )
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
         try:
@@ -18572,6 +20015,12 @@ def _moneydj_int(value):
 
 def find_broker_codes_moneydj(warrants):
     print("【Step 2】MoneyDJ API4 掃描目標分點券商代號...")
+    if not workflow_is_repair():
+        cached = filter_broker_map_for_active_targets(load_broker_map_cache())
+        if cached:
+            print(f"  ✅ daily 沿用完整分點代號快取：{len(cached):,} 個，略過重複探索。")
+            return cached
+
     target_date = resolve_latest_trading_date_on_or_before(datetime.today())
     target_dt = parse_date(target_date) or datetime.today()
     start_s = (target_dt - timedelta(days=5)).strftime("%Y/%m/%d")
@@ -18611,6 +20060,8 @@ def find_broker_codes_moneydj(warrants):
             print(f"    ✅ {label:14s} → {found[label][0]} ({found[label][1]}) [設定備援]")
         elif label in found:
             print(f"    ✅ {label:14s} → {found[label][0]} ({found[label][1]})")
+    if found:
+        save_broker_map_cache(found)
     return found
 
 
@@ -18620,6 +20071,7 @@ def _moneydj_scan_candidates(
     target_date,
     history_empty=False,
     scan_days_override=None,
+    exact_target_date=False,
 ):
     global _MONEYDJ_SOURCE_REACHABLE
     global MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS, MONEYDJ_PRESCAN_TOTAL_REQUESTS
@@ -18631,7 +20083,11 @@ def _moneydj_scan_candidates(
         scan_days = MONEYDJ_RECENT_SCAN_DAYS
         if workflow_is_repair() or history_empty:
             scan_days = max(scan_days, HISTORY_RETENTION_TRADING_DAYS * 2)
-    start_s = (target_dt - timedelta(days=scan_days)).strftime("%Y/%m/%d")
+    start_s = (
+        target_dt.strftime("%Y/%m/%d")
+        if exact_target_date
+        else (target_dt - timedelta(days=scan_days)).strftime("%Y/%m/%d")
+    )
     end_s = target_dt.strftime("%Y/%m/%d")
     code_map = {
         normalize_broker_code_for_compare(code): (label, name, code)
@@ -18647,13 +20103,22 @@ def _moneydj_scan_candidates(
         latest_date = None
         if ok:
             for row in rows:
+                row_dt = parse_date(row.get("V1", ""))
+                row_is_target = bool(
+                    row_dt and row_dt.date() == target_dt.date()
+                )
+                if (
+                    row_dt
+                    and (not exact_target_date or row_is_target)
+                    and (latest_date is None or row_dt > latest_date)
+                ):
+                    latest_date = row_dt
+                if exact_target_date and not row_is_target:
+                    continue
                 broker_norm = normalize_broker_code_for_compare(row.get("V2", ""))
                 info = code_map.get(broker_norm)
                 if not info:
                     continue
-                row_dt = parse_date(row.get("V1", ""))
-                if row_dt and (latest_date is None or row_dt > latest_date):
-                    latest_date = row_dt
                 label, broker_name, canonical_code = info
                 found.append((
                     code,
@@ -18693,9 +20158,13 @@ def _moneydj_scan_candidates(
     return list(candidates.values()), latest_market_date
 
 
-def _moneydj_candidate_to_item(candidate, target_date):
+def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
     warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = candidate
-    rows, ok = api5_get_with_status(warrant_code, broker_code)
+    rows, ok = api5_get_with_status(
+        warrant_code,
+        broker_code,
+        history_limit=history_limit,
+    )
     if not ok:
         return None, False
     target_dt = parse_date(target_date)
@@ -18756,63 +20225,83 @@ def _moneydj_items_to_history_df(items):
 def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
     _MONEYDJ_TARGET_DATE = normalize_date_str(target_date)
+    _MONEYDJ_TARGET_DATE_OK = False
+    _MONEYDJ_API5_FAILED_COUNT = 0
+    baseline = history_df.copy() if history_df is not None else pd.DataFrame()
+
     candidates, latest_market_date = _moneydj_scan_candidates(
         warrants, broker_map, _MONEYDJ_TARGET_DATE,
-        history_empty=history_df is None or history_df.empty,
+        history_empty=False,
+        exact_target_date=True,
     )
 
-    # 補回既有歷史仍在使用的權證×分點，避免近期 API4 無活動時遺失既有部位。
-    if history_df is not None and not history_df.empty:
-        warrant_map = {str(w.get("代號", "")).strip(): w for w in warrants or []}
-        broker_by_code = {
-            normalize_broker_code_for_compare(code): (label, name, code)
-            for label, (name, code) in broker_map.items()
-        }
-        existing = {(c[0], normalize_broker_code_for_compare(c[6])) for c in candidates}
-        for row in history_df[["權證代號", "券商代號"]].drop_duplicates().itertuples(index=False, name=None):
-            warrant_code, broker_code = str(row[0]).strip(), normalize_broker_code_for_compare(row[1])
-            if (warrant_code, broker_code) in existing:
-                continue
-            warrant = warrant_map.get(warrant_code)
-            broker = broker_by_code.get(broker_code)
-            if warrant and broker:
-                label, broker_name, canonical_code = broker
-                candidates.append((
-                    warrant_code, str(warrant.get("名稱", "")), str(warrant.get("標的股", "")),
-                    str(warrant.get("標的名稱", "")), label, broker_name, canonical_code,
-                ))
+    prescan_ratio = (
+        MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS / MONEYDJ_PRESCAN_TOTAL_REQUESTS
+        if MONEYDJ_PRESCAN_TOTAL_REQUESTS > 0
+        else 0.0
+    )
+    target_dt = parse_date(_MONEYDJ_TARGET_DATE)
+    market_ready = bool(
+        latest_market_date
+        and target_dt
+        and latest_market_date.date() >= target_dt.date()
+    )
+    if not market_ready or prescan_ratio < MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO:
+        print(
+            f"  ⚠️ daily 目標日快照未通過前置驗證：日期={_MONEYDJ_TARGET_DATE}｜"
+            f"市場最新日={latest_market_date.strftime('%Y/%m/%d') if latest_market_date else '-'}｜"
+            f"API4 成功率={prescan_ratio:.2%}；保留原歷史快取。"
+        )
+        return baseline
 
-    print(f"【Step 3b】MoneyDJ API5 歷史：候選 {len(candidates):,} 組｜workers={min(MONEYDJ_HISTORY_WORKERS, max(len(candidates),1))}")
+    print(
+        f"【Step 3b】MoneyDJ API5 當日快照：{_MONEYDJ_TARGET_DATE}｜"
+        f"候選 {len(candidates):,} 組｜每組最多 {MONEYDJ_DAILY_API5_LIMIT} 列｜"
+        f"workers={min(MONEYDJ_HISTORY_WORKERS, max(len(candidates),1))}"
+    )
     fetched_items = []
-    _MONEYDJ_API5_FAILED_COUNT = 0
     if candidates:
         with ThreadPoolExecutor(max_workers=min(MONEYDJ_HISTORY_WORKERS, len(candidates))) as executor:
-            futures = [executor.submit(_moneydj_candidate_to_item, candidate, _MONEYDJ_TARGET_DATE) for candidate in candidates]
+            futures = [
+                executor.submit(
+                    _moneydj_candidate_to_target_day_item,
+                    candidate,
+                    _MONEYDJ_TARGET_DATE,
+                    MONEYDJ_DAILY_API5_LIMIT,
+                )
+                for candidate in candidates
+            ]
             for idx, future in enumerate(as_completed(futures), start=1):
                 try:
                     item, ok = future.result()
                 except Exception:
                     item, ok = None, False
-                if not ok:
+                # API4 已確認該權證×分點在目標日有資料；API5 若沒有回到同日列，
+                # 視同資料不完整，禁止拿部分快照取代快取中的完整目標日。
+                if not ok or item is None:
                     _MONEYDJ_API5_FAILED_COUNT += 1
                 if item:
                     fetched_items.append(item)
                 if idx % 200 == 0:
-                    print(f"  [{idx:,}/{len(candidates):,}] MoneyDJ API5 抓取中｜有效 {len(fetched_items):,} 組｜失敗 {_MONEYDJ_API5_FAILED_COUNT:,}")
+                    print(f"  [{idx:,}/{len(candidates):,}] MoneyDJ API5 當日抓取中｜有效 {len(fetched_items):,} 組｜失敗 {_MONEYDJ_API5_FAILED_COUNT:,}")
+
+    if MONEYDJ_API5_STRICT and _MONEYDJ_API5_FAILED_COUNT > 0:
+        print(
+            f"  ⚠️ daily 當日快照有 {_MONEYDJ_API5_FAILED_COUNT:,} 組 API5 失敗；"
+            "保留原歷史快取，不寫入部分資料。"
+        )
+        return baseline
 
     new_df = _moneydj_items_to_history_df(fetched_items)
-    if history_df is None or history_df.empty:
-        combined = new_df
-    elif new_df.empty:
-        combined = history_df.copy()
-    else:
-        keys = set(zip(new_df["權證代號"].astype(str), new_df["券商代號"].astype(str)))
-        old = history_df.copy()
-        keep = [
-            (str(w), str(b)) not in keys
-            for w, b in zip(old["權證代號"], old["券商代號"])
-        ]
-        combined = pd.concat([old.loc[keep].copy(), new_df], ignore_index=True)
+    old = baseline.copy()
+    if not old.empty and "日期" in old.columns:
+        old["日期"] = old["日期"].map(normalize_date_str)
+        old = old[old["日期"] != _MONEYDJ_TARGET_DATE].copy()
+    combined = (
+        pd.concat([old, new_df], ignore_index=True)
+        if new_df is not None and not new_df.empty
+        else old
+    )
 
     if combined is None:
         combined = pd.DataFrame()
@@ -18822,17 +20311,33 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
         combined["日期"] = combined["日期"].map(normalize_date_str)
         combined = combined.drop_duplicates(subset=["權證代號", "券商代號", "日期"], keep="last")
         combined = combined.sort_values(["權證代號", "券商代號", "日期"]).reset_index(drop=True)
-        combined = save_history_cache(combined, fetched_items=fetched_items, previous_history_empty=history_df is None or history_df.empty)
+        combined, identity_stats = repair_history_metadata_from_warrants(combined, warrants)
+    else:
+        identity_stats = {"rows": 0}
 
-    _MONEYDJ_TARGET_DATE_OK = bool(
-        latest_market_date and latest_market_date.date() >= (parse_date(_MONEYDJ_TARGET_DATE) or datetime.min).date()
+    combined = save_history_cache(
+        combined,
+        fetched_items=fetched_items,
+        previous_history_empty=False,
     )
+    _MONEYDJ_TARGET_DATE_OK = True
+    print(
+        f"  ✅ daily 只替換當日原始資料：{_MONEYDJ_TARGET_DATE}｜"
+        f"當日 {len(new_df) if new_df is not None else 0:,} 列｜"
+        f"完整歷史保留 {len(combined):,} 列"
+    )
+    if identity_stats.get("rows", 0) > 0:
+        print(f"  🧭 當日更新後身分修正：{identity_stats['rows']:,} 列")
     return combined
 
 
-def _moneydj_candidate_to_target_day_item(candidate, target_date):
+def _moneydj_candidate_to_target_day_item(candidate, target_date, history_limit=None):
     """只保留 MoneyDJ API5 回傳中的指定交易日，供 repair 最新日疊加使用。"""
-    item, ok = _moneydj_candidate_to_item(candidate, target_date)
+    item, ok = _moneydj_candidate_to_item(
+        candidate,
+        target_date,
+        history_limit=history_limit,
+    )
     if not ok or not item:
         return item, ok
 
@@ -19339,7 +20844,7 @@ def main():
     if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED:
         print("資料來源：repair=FinMind 近200交易日完整歷史＋MoneyDJ 最新交易日疊加")
     else:
-        print("資料來源：daily=MoneyDJ API4／API5（分點資料）＋官方權證／行情來源")
+        print("資料來源：daily=完整歷史快取＋MoneyDJ 目標交易日 API4／API5＋官方權證／行情來源")
     print("新制分類：同一分點 × 同一標的 × 同一天 = 1 筆事件")
     print(f"程式版本：{PROGRAM_BUILD_ID}")
     print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}")
@@ -19498,6 +21003,14 @@ def main():
         _PRICE_PLAN_MAX_PUBLISHED_DATE = target_date
         print(f"  ✅ 價格批次最晚已發布基準日：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
 
+        if history_cache_df is None or history_cache_df.empty:
+            print(
+                "  ⚠️ daily 找不到可用的完整分點歷史快取；"
+                "為避免用單日資料誤算 FIFO、勝率與持倉，本次停止且不修改 Google Sheet。"
+            )
+            print("  ℹ️ 請先執行 WORKFLOW_MODE=repair 建立完整歷史；後續 daily 將只重抓當日。")
+            return
+
         history_cache_df = refresh_history_from_moneydj(
             warrants,
             broker_map,
@@ -19592,6 +21105,7 @@ def main():
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allowed_titles=(FULL_REPAIR_RESULT_SHEET_TITLES if workflow_is_repair() else DAILY_RESULT_SHEET_TITLES),
         extra_scope_values=extra_scope_values,
+        refresh_date=target_date,
     )
 
     elapsed = time.time() - program_start
