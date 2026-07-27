@@ -96,6 +96,9 @@ FORCE_RECALCULATE_STATS = os.getenv(
 FORCE_REDOWNLOAD_DATES = os.getenv(
     "FORCE_REDOWNLOAD_DATES", ""
 ).strip()
+KEEP_RAW_DAILY = os.getenv(
+    "KEEP_RAW_DAILY", "1"
+).strip().lower() not in ("0", "false", "no")
 
 AMOUNT_CLASS_SPECS = [
     ("A", "100萬至未滿160萬", 1_000_000, 1_600_000),
@@ -951,13 +954,16 @@ def compact_path(day: str) -> Path:
 
 def validate_saved_day(day: str) -> tuple[bool, str, int, int]:
     try:
-        raw = read_parquet(raw_path(day))
-        missing_raw = RAW_REQUIRED_COLUMNS - set(raw.columns)
-        if missing_raw:
-            return False, f"raw 缺少欄位 {sorted(missing_raw)}", 0, 0
-        raw_dates = {iso_date(value) for value in raw["date"] if iso_date(value)}
-        if raw.empty or raw_dates != {day}:
-            return False, f"raw 日期不符或為空：{sorted(raw_dates)}", 0, 0
+        raw_rows = 0
+        if KEEP_RAW_DAILY:
+            raw = read_parquet(raw_path(day))
+            missing_raw = RAW_REQUIRED_COLUMNS - set(raw.columns)
+            if missing_raw:
+                return False, f"raw 缺少欄位 {sorted(missing_raw)}", 0, 0
+            raw_dates = {iso_date(value) for value in raw["date"] if iso_date(value)}
+            if raw.empty or raw_dates != {day}:
+                return False, f"raw 日期不符或為空：{sorted(raw_dates)}", 0, 0
+            raw_rows = len(raw)
         compact = read_parquet(compact_path(day))
         missing_compact = set(COMPACT_COLUMNS) - set(compact.columns)
         if missing_compact:
@@ -970,7 +976,7 @@ def validate_saved_day(day: str) -> tuple[bool, str, int, int]:
         duplicate_key = ["權證代號", "券商代號", "日期"]
         if compact.duplicated(duplicate_key).any():
             return False, "compact 出現重複權證＋券商＋日期", 0, 0
-        return True, "", len(raw), len(compact)
+        return True, "", raw_rows, len(compact)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}", 0, 0
 
@@ -982,7 +988,8 @@ def audit_successful_files(state: dict[str, Any]) -> list[str]:
         ok, reason, raw_rows, compact_rows = validate_saved_day(day)
         if ok:
             valid.append(day)
-            state["raw_rows_by_date"][day] = raw_rows
+            if KEEP_RAW_DAILY:
+                state["raw_rows_by_date"][day] = raw_rows
             state["compact_rows_by_date"][day] = compact_rows
             state["deduplicated_rows_by_date"][day] = compact_rows
         else:
@@ -1128,12 +1135,13 @@ def download_and_compact_history(
                 compact, pre_dedup_rows = normalize_warrant_day(
                     raw, day, identity_index, broker_map
                 )
-                atomic_write_parquet(raw, raw_path(day))
+                if KEEP_RAW_DAILY:
+                    atomic_write_parquet(raw, raw_path(day))
                 atomic_write_parquet(compact, compact_path(day))
                 ok, reason, raw_rows, compact_rows = validate_saved_day(day)
                 if not ok:
                     raise RuntimeError(f"落盤後驗證失敗：{reason}")
-                state["raw_rows_by_date"][day] = raw_rows
+                state["raw_rows_by_date"][day] = len(raw)
                 state["compact_rows_by_date"][day] = compact_rows
                 state["deduplicated_rows_by_date"][day] = compact_rows
                 mark_day_status(state, day, "ok")
