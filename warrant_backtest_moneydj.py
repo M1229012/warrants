@@ -20488,6 +20488,11 @@ def _moneydj_scan_candidates(
                 if not info:
                     continue
                 label, broker_name, canonical_code = info
+                # API4 的券商代號比對可以忽略大小寫，但 API5 的 b 參數大小寫敏感。
+                # 例如 API4 回傳 9A9g，API5 若改傳快取中的 9A9G 會成功回 HTTP 200
+                # 卻回傳空 Result。故同時保留標準代號與 API4 原始代號：
+                # 前者寫入快取／Sheet，後者只用於本次 API5 請求。
+                api_broker_code = str(row.get("V2", "")).strip() or canonical_code
                 found.append((
                     code,
                     str(warrant.get("名稱", "")).strip(),
@@ -20496,6 +20501,7 @@ def _moneydj_scan_candidates(
                     label,
                     broker_name,
                     canonical_code,
+                    api_broker_code,
                 ))
         return found, ok, latest_date
 
@@ -20518,6 +20524,19 @@ def _moneydj_scan_candidates(
             if idx % 1000 == 0:
                 print(f"  [{idx:,}/{len(scan_warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
 
+    api5_case_sensitive_count = sum(
+        1
+        for candidate in candidates.values()
+        if len(candidate) >= 8
+        and str(candidate[7]).strip()
+        and str(candidate[7]).strip() != str(candidate[6]).strip()
+    )
+    if api5_case_sensitive_count:
+        print(
+            f"  🔤 MoneyDJ API5 大小寫敏感代號橋接："
+            f"{api5_case_sensitive_count:,} 組改用 API4 原始券商代號查詢"
+        )
+
     print(
         f"  ✅ MoneyDJ API4 預篩：成功 {MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS:,}/"
         f"{MONEYDJ_PRESCAN_TOTAL_REQUESTS:,}｜候選 {len(candidates):,} 組｜"
@@ -20527,10 +20546,23 @@ def _moneydj_scan_candidates(
 
 
 def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
-    warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = candidate
+    (
+        warrant_code,
+        warrant_name,
+        underlying_code,
+        underlying_name,
+        broker_label,
+        broker_name,
+        broker_code,
+    ) = candidate[:7]
+    api_broker_code = (
+        str(candidate[7]).strip()
+        if len(candidate) >= 8 and str(candidate[7]).strip()
+        else broker_code
+    )
     rows, ok = api5_get_with_status(
         warrant_code,
-        broker_code,
+        api_broker_code,
         history_limit=history_limit,
     )
     if not ok:
