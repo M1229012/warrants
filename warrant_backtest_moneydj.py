@@ -11579,10 +11579,18 @@ def fetch_all_prices(
     e_events=None,
     persistent_price_cache=None,
     defer_save=False,
+    incremental_target_date=None,
 ):
     print("【Step 4】抓收盤價...")
 
     code_ranges = {}
+    incremental_target_dt = parse_date(incremental_target_date)
+    if incremental_target_dt:
+        incremental_target_dt = min(incremental_target_dt, datetime.today())
+        print(
+            f"  🗓️ daily 價格增量模式：只抓目標日 {incremental_target_dt:%Y/%m/%d}；"
+            "歷史價格只讀既有快取，不重新補抓"
+        )
 
     def update_code_range(code, start_dt, end_dt):
         if not code or start_dt is None or end_dt is None:
@@ -11606,8 +11614,14 @@ def fetch_all_prices(
         for ev in group_events:
             dt = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日"))
             if dt:
-                start_dt = dt - timedelta(days=60)
-                end_dt = dt + timedelta(days=160)
+                if incremental_target_dt:
+                    if dt.date() != incremental_target_dt.date():
+                        continue
+                    start_dt = incremental_target_dt
+                    end_dt = incremental_target_dt
+                else:
+                    start_dt = dt - timedelta(days=60)
+                    end_dt = dt + timedelta(days=160)
                 update_code_range(ev.get("標的股"), start_dt, end_dt)
 
                 # 新制 A/B/C/D/E 的 D+ 欄位目前只看標的股；若未來需要群組事件權證明細價格，
@@ -11648,6 +11662,13 @@ def fetch_all_prices(
 
         cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
 
+        if incremental_target_dt:
+            # daily 同日重跑也必須重新查目標日，才能覆蓋盤中／盤後更新值；
+            # 既有歷史序列只載入記憶體，不以覆蓋率不足為由回抓數百日。
+            add_price_aliases(price_cache, code, cached_prices)
+            fetch_plan[code] = [incremental_target_dt, incremental_target_dt]
+            continue
+
         if cached_prices:
             add_price_aliases(price_cache, code, cached_prices)
 
@@ -11670,8 +11691,16 @@ def fetch_all_prices(
             fetch_plan[code] = [start_dt, end_dt]
 
     print(f"  價格代號去重後：{total:,} 檔")
-    print(f"  價格快取命中：{total - len(fetch_plan):,} 檔")
-    print(f"  本次需補抓價格：{len(fetch_plan):,} 檔")
+    if incremental_target_dt:
+        cached_history_count = sum(
+            bool(get_cached_prices_for_code(persistent_price_cache, code))
+            for code in all_codes
+        )
+        print(f"  已載入既有歷史快取：{cached_history_count:,} 檔")
+        print(f"  本次只刷新目標日價格：{len(fetch_plan):,} 檔")
+    else:
+        print(f"  價格快取命中：{total - len(fetch_plan):,} 檔")
+        print(f"  本次需補抓價格：{len(fetch_plan):,} 檔")
 
     if not fetch_plan:
         print(f"  ✅ 共 {len(price_cache)} 支股票/權證收盤價")
@@ -12816,6 +12845,7 @@ def ensure_top15_return_warrant_prices(
     fetch_plan = []
     fetch_start_by_code = {}
     changed_price_codes = set()
+    daily_target_only = not workflow_is_repair()
 
     for code in needed_codes:
         cached_prices = get_cached_prices_for_code(persistent_price_cache, code)
@@ -12837,7 +12867,11 @@ def ensure_top15_return_warrant_prices(
         latest_date_text = normalize_date_str(latest_date) if latest_date else ""
 
         need_fetch = latest_price is None
-        if TOP15_REQUIRE_TARGET_DATE_PRICE:
+        if daily_target_only:
+            # daily 的 TOP15 是同日快照替換：完整 FIFO 由分點歷史快取重建，
+            # 價格只重新查統計日。即使快取已有同日價格，同日重跑仍強制刷新。
+            need_fetch = True
+        elif TOP15_REQUIRE_TARGET_DATE_PRICE:
             # 統計日報酬率只能使用統計日當日價格；快取只有較早日期時必須補抓。
             if latest_date_text != target_date_text:
                 need_fetch = True
@@ -12846,6 +12880,9 @@ def ensure_top15_return_warrant_prices(
 
         if need_fetch:
             fetch_plan.append(code)
+            if daily_target_only:
+                fetch_start_by_code[code] = target_dt
+                continue
             # 已有 75 日內可用歷史價時，只補抓統計日前短窗口；
             # 完全沒有可用備援價時才抓完整 TOP15_PRICE_LOOKBACK_DAYS。
             has_recent_fallback = bool(
@@ -21616,12 +21653,14 @@ def main():
         a_events, b_events, c_events, d_events, e_events,
         persistent_price_cache=persistent_price_cache,
         defer_save=True,
+        incremental_target_date=(None if workflow_is_repair() else target_date),
     )
     all_changed_price_codes.update(changed_codes)
 
     top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache,
+        target_date=target_date,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allow_price_fetch=True,
         persistent_price_cache=persistent_price_cache,
@@ -21638,6 +21677,7 @@ def main():
         selected_events = (sa, sb, sc, sd, se)
         selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
             sa, sb, sc, sd, se, selected_item_map, price_cache,
+            target_date=target_date,
             data_scope="精選五分點", allow_price_fetch=False,
         )
         history_source_label = "FinMind完整歷史＋MoneyDJ最新日" if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED else "MoneyDJ歷史"
