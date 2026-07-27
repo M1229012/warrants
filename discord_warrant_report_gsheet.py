@@ -3216,8 +3216,15 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + footer_h
     )
 
-    # 避免資料太少時圖片過扁
-    fig_h = max(fig_h, 9.5)
+    # 不再套用固定的最小高度。
+    #
+    # 上面的 fig_h 已完整包含頁首、KPI、分點卡片、實際明細列、
+    # 事件說明與頁尾留白；若再強制至少 9.5 吋，少量資料時多出的
+    # 高度只會堆在圖片底部，形成大片空白。
+    #
+    # 資料多時，buy_table_h / sell_table_h 仍會隨列數逐列增加，
+    # 因此畫布會自然向下延伸；資料少時則會自動收合。
+    fig_h = round(fig_h, 2)
 
     # ─────────────────────────────────────────────
     # 顏色與字型
