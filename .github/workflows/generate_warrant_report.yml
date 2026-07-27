@@ -43,6 +43,14 @@ on:
           - "0"
           - "1"
         default: "0"
+      rebuild_finmind_cache:
+        description: "捨棄舊的 FinMind 原始日檔與全市場精簡快取並完整重建（1=重建；本次不產圖）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
       moneydj_compare_debug:
         description: "FinMind 與舊 MoneyDJ 完整對帳（成交量、上方權證資金流、TOP5、精選五分點；會額外耗時）"
         required: false
@@ -75,7 +83,7 @@ on:
 
 jobs:
   prewarm-finmind-market-cache:
-    if: github.event_name == 'schedule' || inputs.prewarm_cache_only == '1'
+    if: github.event_name == 'schedule' || inputs.prewarm_cache_only == '1' || inputs.rebuild_finmind_cache == '1'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -101,10 +109,12 @@ jobs:
       FINMIND_WARRANT_PIPELINE_PARALLEL_ENABLE: "1"
       FINMIND_PREWARM_WORKERS: "4"
       FINMIND_PREWARM_CALENDAR_DAYS: "150"
-      FINMIND_PREWARM_REFRESH_RECENT_DAYS: "2"
+      # 此值在新版程式中代表「最近 5 個實際交易日」，不是日曆日。
+      FINMIND_PREWARM_REFRESH_RECENT_DAYS: "5"
+      FINMIND_FORCE_REBUILD_ALL_CACHE: ${{ inputs.rebuild_finmind_cache || '0' }}
       FINMIND_PREWARM_KEEP_RAW_DAYS: "7"
       FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
-      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
+      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v2"
       FINMIND_STRICT_WARRANT_COMPLETENESS: "1"
       FINMIND_WARRANT_LATEST_PROBE_DAYS: "7"
       FINMIND_OFFICIAL_ISSUER_ENABLE: "1"
@@ -139,31 +149,40 @@ jobs:
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
           mkdir -p output \
             finmind_cache/warrant_daily \
-            finmind_cache/warrant_market_compact_v1 \
+            finmind_cache/warrant_market_compact_v2 \
             finmind_cache/reference \
             .cache/report-fonts \
             .cache/matplotlib
 
+      - name: Discard old FinMind market cache
+        if: inputs.rebuild_finmind_cache == '1'
+        shell: bash
+        run: |
+          echo "🧹 捨棄舊的 FinMind 原始日檔與全市場精簡快取"
+          rm -rf finmind_cache/warrant_daily finmind_cache/warrant_market_compact_v2
+          mkdir -p finmind_cache/warrant_daily finmind_cache/warrant_market_compact_v2
+
       # 預熱工作保留少量原始 Parquet，供隔日增量更新；正式報表不再下載這個大型快取。
       - name: Restore FinMind raw prewarm cache
+        if: inputs.rebuild_finmind_cache != '1'
         uses: actions/cache/restore@v4
         with:
           path: finmind_cache/warrant_daily
-          key: warrant-finmind-raw-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          key: warrant-finmind-raw-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
           restore-keys: |
-            warrant-finmind-raw-${{ runner.os }}-
-            warrant-finmind-market-${{ runner.os }}-
+            warrant-finmind-raw-${{ runner.os }}-v2-
 
       # 精簡事件、參考資料、字型與 Matplotlib 索引共用同一份報表快取，減少一次 cache action。
       - name: Restore FinMind report cache
+        if: inputs.rebuild_finmind_cache != '1'
         uses: actions/cache/restore@v4
         with:
           path: |
-            finmind_cache/warrant_market_compact_v1
+            finmind_cache/warrant_market_compact_v2
             finmind_cache/reference
-          key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          key: warrant-finmind-report-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
           restore-keys: |
-            warrant-finmind-report-${{ runner.os }}-
+            warrant-finmind-report-${{ runner.os }}-v2-
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -291,19 +310,19 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: finmind_cache/warrant_daily
-          key: warrant-finmind-raw-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          key: warrant-finmind-raw-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
       - name: Save refreshed FinMind report cache
         if: success()
         uses: actions/cache/save@v4
         with:
           path: |
-            finmind_cache/warrant_market_compact_v1
+            finmind_cache/warrant_market_compact_v2
             finmind_cache/reference
-          key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          key: warrant-finmind-report-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
   run-warrant-report-test:
-    if: github.event_name == 'workflow_dispatch' && inputs.prewarm_cache_only != '1'
+    if: github.event_name == 'workflow_dispatch' && inputs.prewarm_cache_only != '1' && inputs.rebuild_finmind_cache != '1'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -369,7 +388,10 @@ jobs:
 
       # 任意新股票直接使用排程預熱的全市場精簡事件檔。
       FINMIND_MARKET_COMPACT_CACHE_ENABLE: "1"
-      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v1"
+      FINMIND_MARKET_COMPACT_CACHE_VERSION: "v2"
+      FINMIND_REPORT_REFRESH_RECENT_DAYS: "2"
+      FINMIND_PREWARM_SCHEDULE_HOUR: "21"
+      FINMIND_PREWARM_SCHEDULE_MINUTE: "20"
       # FinMind 當日權證分點用 TWSE / TPEx 官方權證成交量逐檔驗證；通過才納入正式圖。
       FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE: ${{ inputs.finmind_current_day_guard }}
       FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE: "1"
@@ -533,7 +555,7 @@ jobs:
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
           mkdir -p output llm_cache \
             finmind_cache/warrant_daily \
-            finmind_cache/warrant_market_compact_v1 \
+            finmind_cache/warrant_market_compact_v2 \
             finmind_cache/reference \
             .cache/report-fonts \
             .cache/matplotlib
@@ -549,17 +571,25 @@ jobs:
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
 
-      # 正式報表只還原精簡事件、參考資料與產圖資源，不再還原預熱用原始 Parquet。
+      # 正式產圖還原近期原始日檔，讓 compact meta 的 source_size 能與現行 raw 實際比對。
+      - name: Restore latest FinMind raw cache
+        uses: actions/cache/restore@v4
+        with:
+          path: finmind_cache/warrant_daily
+          key: warrant-finmind-raw-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
+          restore-keys: |
+            warrant-finmind-raw-${{ runner.os }}-v2-
+
+      # 正式報表的精簡事件與參考資料維持獨立 cache；原始 Parquet 由上一個步驟分開還原。
       - name: Restore latest FinMind report cache
         uses: actions/cache/restore@v4
         with:
           path: |
-            finmind_cache/warrant_market_compact_v1
+            finmind_cache/warrant_market_compact_v2
             finmind_cache/reference
-          key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
+          key: warrant-finmind-report-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
           restore-keys: |
-            warrant-finmind-report-${{ runner.os }}-
-            warrant-finmind-market-${{ runner.os }}-
+            warrant-finmind-report-${{ runner.os }}-v2-
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -632,14 +662,21 @@ jobs:
           echo "FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE=$FINMIND_WARRANT_CURRENT_DAY_OPENAPI_VERIFY_ENABLE"
           .venv/bin/python -u K_function_warrant_report_20260530.py
 
+      - name: Save refreshed FinMind raw cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: finmind_cache/warrant_daily
+          key: warrant-finmind-raw-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
+
       - name: Save refreshed FinMind report cache
         if: success()
         uses: actions/cache/save@v4
         with:
           path: |
-            finmind_cache/warrant_market_compact_v1
+            finmind_cache/warrant_market_compact_v2
             finmind_cache/reference
-          key: warrant-finmind-report-${{ runner.os }}-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
+          key: warrant-finmind-report-${{ runner.os }}-v2-${{ steps.cache-date.outputs.date }}-manual-${{ github.run_id }}
 
       - name: Save refreshed LLM cache
         if: always()
