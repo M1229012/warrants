@@ -192,7 +192,7 @@ MONEYDJ_DAILY_TARGET_LOOKBACK_DAYS = max(
 )
 MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
-MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
+MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.97")), 0.0), 1.0)
 MONEYDJ_API5_STRICT = os.getenv("MONEYDJ_API5_STRICT", "1").strip().lower() not in ("0", "false", "no")
 # repair 模式資料源：FinMind 負責最近 HISTORY_RETENTION_TRADING_DAYS 個完整交易日，
 # MoneyDJ 只疊加 FinMind 尚未發布的最新交易日。避免以 API4 候選預篩取代完整歷史，
