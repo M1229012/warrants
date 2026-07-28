@@ -5,9 +5,10 @@ FinMind 完整歷史權證分點均線勝率統計
 固定流程：
 1. 逐日下載 FinMind 全市場權證分點 Parquet。
 2. 驗證、過濾 26 個目標分點，將不含身分判斷的交易事實逐日保存。
-3. 僅由 compact_daily 日期感知配對身分，重建 ABCDE 事件與跨事件 FIFO。
-4. 以 TaiwanStockPriceAdj 建立事件日 MA5/MA10/MA20 條件。
-5. 輸出 Parquet 與獨立 Excel，不使用 MoneyDJ 或 Google Sheet。
+3. 由 FinMind Summary 優先、MOPS 含下市權證官方歷史備援，日期感知配對身分。
+4. 僅由 compact_daily 重建 ABCDE 事件與跨事件 FIFO。
+5. 以 TaiwanStockPriceAdj 建立事件日 MA5/MA10/MA20 條件。
+6. 輸出 Parquet 與獨立 Excel，不使用 MoneyDJ 或 Google Sheet。
 
 必要環境變數：
     FINMIND_API_0714=<FinMind token>
@@ -36,6 +37,7 @@ import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -52,9 +54,9 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.2.3"
+PROGRAM_VERSION = "1.3.0"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v6-exhaustive-target-shards"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v7-mops-official-history"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -65,6 +67,19 @@ WARRANT_SUMMARY_HISTORY_START = os.getenv(
 WARRANT_SUMMARY_CACHE_PREFIX = "TaiwanStockInfoWithWarrantSummary_history"
 WARRANT_SUMMARY_TARGET_CACHE_PREFIX = (
     "TaiwanStockInfoWithWarrantSummary_target"
+)
+MOPS_WARRANT_HISTORY_CACHE_PREFIX = "MOPS_warrant_identity"
+MOPS_WARRANT_URL = os.getenv(
+    "MOPS_WARRANT_URL",
+    "https://mopsov.twse.com.tw/mops/web/ajax_t90sb01",
+).strip()
+MOPS_WARRANT_LANDING_URL = os.getenv(
+    "MOPS_WARRANT_LANDING_URL",
+    "https://mopsov.twse.com.tw/mops/web/t90sb01",
+).strip()
+MOPS_PAGE_SIZE = max(int(os.getenv("MOPS_WARRANT_PAGE_SIZE", "10000")), 100)
+MOPS_REQUEST_DELAY_SECONDS = max(
+    float(os.getenv("MOPS_REQUEST_DELAY_SECONDS", "0.5")), 0
 )
 
 BASE_DIR = Path(os.getenv("MA_HISTORY_BASE_DIR", ".")).resolve()
@@ -1168,6 +1183,392 @@ def build_warrant_names_by_code(
     return names_by_code
 
 
+def roc_date_to_iso(value: Any) -> str:
+    """將 MOPS 的民國日期（例如 112/11/30）轉成 ISO 日期。"""
+    text = str(value or "").strip()
+    matched = re.fullmatch(r"(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})", text)
+    if not matched:
+        return iso_date(text)
+    year, month, day = (int(part) for part in matched.groups())
+    try:
+        return date(year + 1911, month, day).isoformat()
+    except ValueError:
+        return ""
+
+
+def iso_month_to_roc(value: str) -> str:
+    parsed = parse_date(f"{value}-01" if re.fullmatch(r"\d{4}-\d{2}", value) else value)
+    if parsed is None:
+        raise ValueError(f"無效年月：{value}")
+    roc_year = parsed.year - 1911
+    if roc_year <= 0:
+        raise ValueError(f"MOPS 不支援民國前日期：{value}")
+    return f"{roc_year:03d}{parsed.month:02d}"
+
+
+def month_range(start_day: str, end_day: str) -> list[str]:
+    start = parse_date(start_day)
+    end = parse_date(end_day)
+    if start is None or end is None or start > end:
+        raise ValueError(f"無效月份範圍：{start_day}～{end_day}")
+    cursor = date(start.year, start.month, 1)
+    final = date(end.year, end.month, 1)
+    values: list[str] = []
+    while cursor <= final:
+        values.append(cursor.strftime("%Y-%m"))
+        cursor = (
+            date(cursor.year + 1, 1, 1)
+            if cursor.month == 12
+            else date(cursor.year, cursor.month + 1, 1)
+        )
+    return values
+
+
+def normalize_mops_warrant_code(value: Any) -> str:
+    """
+    MOPS 的下市清單會在實際交易代號後附加小寫 e（上市）或 c（上櫃）。
+
+    必須在 normalize_code 轉大寫前移除；正常交易代號原本可能以大寫英文字母
+    結尾（例如認售權證），不可一概刪除最後一碼。
+    """
+    text = re.sub(r"\s+", "", str(value or "").strip())
+    if re.fullmatch(r"[0-9A-Za-z]+[ec]", text) and text[-1].islower():
+        text = text[:-1]
+    return normalize_code(text)
+
+
+class MopsWarrantTableParser(HTMLParser):
+    """只解析 MOPS 回應中的 hasBorder 資料表，不依賴 lxml/BeautifulSoup。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_target_table = False
+        self.table_depth = 0
+        self.in_row = False
+        self.in_cell = False
+        self.cell_parts: list[str] = []
+        self.row: list[str] = []
+        self.rows: list[list[str]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        lowered = tag.lower()
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        if lowered == "table":
+            if self.in_target_table:
+                self.table_depth += 1
+            elif "hasBorder" in attributes.get("class", "").split():
+                self.in_target_table = True
+                self.table_depth = 1
+            return
+        if not self.in_target_table:
+            return
+        if lowered == "tr":
+            self.in_row = True
+            self.row = []
+        elif lowered in ("th", "td") and self.in_row:
+            self.in_cell = True
+            self.cell_parts = []
+        elif lowered == "br" and self.in_cell:
+            self.cell_parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self.in_target_table and self.in_cell:
+            self.cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if not self.in_target_table:
+            return
+        if lowered in ("th", "td") and self.in_cell:
+            value = re.sub(r"\s+", " ", "".join(self.cell_parts)).strip()
+            self.row.append(value)
+            self.in_cell = False
+            self.cell_parts = []
+        elif lowered == "tr" and self.in_row:
+            if self.row:
+                self.rows.append(self.row)
+            self.in_row = False
+            self.row = []
+        elif lowered == "table":
+            self.table_depth -= 1
+            if self.table_depth <= 0:
+                self.in_target_table = False
+                self.table_depth = 0
+
+
+MOPS_IDENTITY_COLUMNS = [
+    "code",
+    "name",
+    "warrant_type",
+    "target_code",
+    "target_name",
+    "list_date",
+    "end_date",
+    "status",
+    "reason",
+]
+
+
+def parse_mops_warrant_html(html: str, market: str) -> pd.DataFrame:
+    parser = MopsWarrantTableParser()
+    parser.feed(html or "")
+    header: Optional[list[str]] = None
+    data_rows: list[list[str]] = []
+    for row in parser.rows:
+        normalized = [normalize_name(value) for value in row]
+        if normalized and normalized[0] == "權證代號":
+            header = normalized
+            continue
+        if header is not None and len(row) >= len(header):
+            data_rows.append(row[: len(header)])
+    if header is None:
+        return pd.DataFrame(columns=MOPS_IDENTITY_COLUMNS)
+
+    def column_index(*candidates: str) -> int:
+        for candidate in candidates:
+            if candidate in header:
+                return header.index(candidate)
+        raise RuntimeError(
+            f"MOPS 權證表缺少欄位 {candidates}；實際欄位={header}"
+        )
+
+    code_index = column_index("權證代號")
+    name_index = column_index("權證簡稱")
+    type_index = column_index("權證類型")
+    list_index = column_index("上市日期", "上櫃日期")
+    end_index = column_index("履約截止日")
+    target_code_index = column_index("標的代號")
+    target_name_index = column_index("標的名稱")
+    records: list[dict[str, str]] = []
+    source_name = "MOPS上市官方歷史" if str(market) == "1" else "MOPS上櫃官方歷史"
+    for row in data_rows:
+        code = normalize_mops_warrant_code(row[code_index])
+        target_code = normalize_code(row[target_code_index])
+        list_date = roc_date_to_iso(row[list_index])
+        end_date = roc_date_to_iso(row[end_index])
+        if not code or not target_code or not list_date or not end_date:
+            continue
+        records.append(
+            {
+                "code": code,
+                "name": str(row[name_index] or "").strip(),
+                "warrant_type": str(row[type_index] or "").strip(),
+                "target_code": target_code,
+                "target_name": str(row[target_name_index] or "").strip(),
+                "list_date": list_date,
+                "end_date": end_date,
+                "status": "Matched",
+                "reason": f"{source_name}（含下市權證正式區間）",
+            }
+        )
+    return pd.DataFrame(records, columns=MOPS_IDENTITY_COLUMNS).drop_duplicates(
+        ["code", "list_date", "end_date", "target_code"],
+        keep="last",
+    )
+
+
+def mops_identity_cache_path(market: str, period: str) -> Path:
+    safe_period = re.sub(r"[^0-9A-Za-z_-]", "_", period)
+    return METADATA_DIR / (
+        f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_{market}_{safe_period}.parquet"
+    )
+
+
+def mops_headers() -> dict[str, str]:
+    return {
+        "User-Agent": f"warrant-broker-ma-history/{PROGRAM_VERSION}",
+        "Accept": "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.5",
+        "Referer": MOPS_WARRANT_LANDING_URL,
+    }
+
+
+def prepare_mops_session() -> Any:
+    session = get_session()
+    if getattr(_thread_local, "mops_session_ready", False):
+        return session
+    response = session.get(
+        MOPS_WARRANT_LANDING_URL,
+        headers=mops_headers(),
+        timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
+    )
+    response.raise_for_status()
+    _thread_local.mops_session_ready = True
+    return session
+
+
+def request_mops_warrant_page(
+    market: str,
+    *,
+    roc_month: str = "",
+    page: int = 1,
+    active: bool = False,
+) -> tuple[str, int]:
+    payload: dict[str, str] = {
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "r": str(market),
+        "pageno": str(page),
+        "pagesize": str(MOPS_PAGE_SIZE),
+    }
+    if not active:
+        payload.update(
+            {
+                "rc": "0",
+                "start_date": roc_month,
+                "end_date": roc_month,
+            }
+        )
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = prepare_mops_session().post(
+                MOPS_WARRANT_URL,
+                data=payload,
+                headers=mops_headers(),
+                timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
+            )
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or "utf-8"
+            html = response.text
+            if "FOR SECURITY REASONS" in html or "錯誤代碼" in html:
+                raise RuntimeError("MOPS 拒絕此查詢")
+            page_match = re.search(
+                r"&nbsp;\s*&nbsp;\s*\d+\s*/\s*(\d+)", html
+            )
+            total_pages = int(page_match.group(1)) if page_match else 1
+            has_table = "class='hasBorder'" in html or 'class="hasBorder"' in html
+            explicit_empty = any(
+                phrase in html
+                for phrase in ("查無資料", "無符合", "沒有符合", "無資料")
+            )
+            if not has_table and not explicit_empty:
+                raise RuntimeError("MOPS 回應未包含資料表")
+            return html, max(total_pages, 1)
+        except Exception as exc:
+            last_error = exc
+            _thread_local.mops_session_ready = False
+            if attempt < MAX_RETRIES:
+                delay = min(RETRY_BASE_SECONDS * (2 ** (attempt - 1)), 30)
+                print(
+                    f"    ⚠️ MOPS 第 {attempt}/{MAX_RETRIES} 次失敗："
+                    f"{type(exc).__name__}: {exc}；{delay:.1f} 秒後重試",
+                    flush=True,
+                )
+                time.sleep(delay)
+    raise RuntimeError(
+        f"MOPS 權證歷史重試 {MAX_RETRIES} 次仍失敗："
+        f"{type(last_error).__name__}: {last_error}"
+    )
+
+
+def fetch_mops_warrant_identity(
+    market: str,
+    *,
+    month: str = "",
+    active: bool = False,
+) -> pd.DataFrame:
+    period = "active" if active else iso_month_to_roc(month)
+    path = mops_identity_cache_path(market, period)
+    if path.exists() and path.stat().st_size > 0:
+        age_hours = max((time.time() - path.stat().st_mtime) / 3600, 0)
+        if not active or age_hours <= METADATA_CACHE_HOURS:
+            try:
+                cached = read_parquet(path)
+                missing = set(MOPS_IDENTITY_COLUMNS) - set(cached.columns)
+                if not missing and (not active or not cached.empty):
+                    return cached[MOPS_IDENTITY_COLUMNS].copy()
+            except Exception as exc:
+                print(
+                    f"    ⚠️ MOPS 快取 {path.name} 損壞，重新下載："
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    label = "目前仍掛牌" if active else f"到期月 {month}"
+    market_name = "上市" if str(market) == "1" else "上櫃"
+    print(f"    ⏳ MOPS {market_name}{label}權證...", flush=True)
+    first_html, total_pages = request_mops_warrant_page(
+        market,
+        roc_month="" if active else period,
+        page=1,
+        active=active,
+    )
+    frames = [parse_mops_warrant_html(first_html, market)]
+    for page in range(2, total_pages + 1):
+        if MOPS_REQUEST_DELAY_SECONDS:
+            time.sleep(MOPS_REQUEST_DELAY_SECONDS)
+        html, _ = request_mops_warrant_page(
+            market,
+            roc_month="" if active else period,
+            page=page,
+            active=active,
+        )
+        frames.append(parse_mops_warrant_html(html, market))
+        print(
+            f"      MOPS {market_name}{label}分頁：{page}/{total_pages}",
+            flush=True,
+        )
+    frame = pd.concat(frames, ignore_index=True).drop_duplicates(
+        ["code", "list_date", "end_date", "target_code"],
+        keep="last",
+    )
+    if frame.empty and active:
+        raise RuntimeError(f"MOPS {market_name}{label}回傳空白身分資料")
+    atomic_write_parquet(frame[MOPS_IDENTITY_COLUMNS], path)
+    print(
+        f"    {'↪️' if frame.empty else '✅'} "
+        f"MOPS {market_name}{label}：{len(frame):,} 筆",
+        flush=True,
+    )
+    return frame[MOPS_IDENTITY_COLUMNS].copy()
+
+
+def mops_frames_to_identity_records(
+    frames: Iterable[pd.DataFrame],
+) -> list["WarrantIdentity"]:
+    records: list[WarrantIdentity] = []
+    for frame in frames:
+        if frame.empty:
+            continue
+        missing = set(MOPS_IDENTITY_COLUMNS) - set(frame.columns)
+        if missing:
+            raise RuntimeError(f"MOPS 身分快取缺少欄位：{sorted(missing)}")
+        for values in frame[MOPS_IDENTITY_COLUMNS].itertuples(
+            index=False, name=None
+        ):
+            records.append(
+                WarrantIdentity(
+                    *[
+                        "" if value is None or pd.isna(value) else str(value)
+                        for value in values
+                    ]
+                )
+            )
+    return records
+
+
+def load_cached_mops_identity_frames() -> list[pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    for path in sorted(
+        METADATA_DIR.glob(f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_*.parquet")
+    ):
+        try:
+            frame = read_parquet(path)
+            if not frame.empty:
+                frames.append(frame[MOPS_IDENTITY_COLUMNS].copy())
+        except Exception as exc:
+            print(
+                f"  ⚠️ 略過損壞的 MOPS 身分快取 {path.name}："
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    return frames
+
+
 @dataclass(frozen=True)
 class WarrantIdentity:
     code: str
@@ -1428,6 +1829,11 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
                 f"{WARRANT_SUMMARY_TARGET_CACHE_PREFIX}_*.parquet"
             )
         ),
+        *sorted(
+            METADATA_DIR.glob(
+                f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_*.parquet"
+            )
+        ),
     ]
     newer_sources = [
         source.name
@@ -1567,6 +1973,15 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
         stock_master,
         progress_label="配對全部權證歷史區間",
     )
+    mops_frames = load_cached_mops_identity_frames()
+    if mops_frames:
+        mops_records = mops_frames_to_identity_records(mops_frames)
+        records.extend(mops_records)
+        print(
+            f"  📦 合併 MOPS 官方歷史身分快取："
+            f"{len(mops_frames):,} 片｜{len(mops_records):,} 筆",
+            flush=True,
+        )
     identity_index = save_warrant_identity_index(records)
     print(
         f"  ✅ 日期化權證身分索引完成："
@@ -1804,6 +2219,107 @@ def backfill_identity_from_target_shards(
         "  ✅ 母股分片補抓完成："
         f"候選區間 {candidate_record_count:,} 筆｜"
         f"全母股區間 {exhaustive_record_count:,} 筆｜"
+        f"本批已配對 {matched_before:,} → {matched_after:,}/"
+        f"{len(normalized_pairs):,}",
+        flush=True,
+    )
+    return repaired_index
+
+
+def backfill_identity_from_official_mops(
+    identity_index: WarrantIdentityIndex,
+    pairs: Iterable[tuple[str, str]],
+) -> WarrantIdentityIndex:
+    """
+    以 MOPS「認購(售)權證基本資料彙總表（含下市權證）」補足正式區間。
+
+    FinMind Summary 實際只回傳目前可見的代號區間；代號重用時，2023 年交易
+    可能只查到 2025 年的新權證。MOPS 的下市彙總表則明確包含權證代號、
+    上市/上櫃日、履約截止日與標的代號，因此可作日期化身分的官方備援。
+    每個到期月份、每個市場都立即寫入獨立 Parquet，runner 中止後可續抓。
+    """
+    normalized_pairs = {
+        (normalize_code(code), iso_date(trade_day) or "")
+        for code, trade_day in pairs
+        if normalize_code(code) and iso_date(trade_day)
+    }
+    unresolved_pairs = {
+        pair
+        for pair in normalized_pairs
+        if not identity_pair_is_matched(identity_index, pair)
+    }
+    if not unresolved_pairs:
+        return identity_index
+
+    earliest_trade_day = min(day for _, day in unresolved_pairs)
+    latest_month_day = max(
+        datetime.now().date().isoformat(),
+        max(day for _, day in unresolved_pairs),
+    )
+    months = month_range(earliest_trade_day, latest_month_day)
+    matched_before = len(normalized_pairs) - len(unresolved_pairs)
+    print(
+        "  🏛️ 啟動 MOPS 官方含下市權證歷史補抓："
+        f"{len(unresolved_pairs):,} 個代號日期組合｜"
+        f"到期月份 {months[0]}～{months[-1]}（{len(months):,} 月）",
+        flush=True,
+    )
+
+    frames: list[pd.DataFrame] = []
+    for month_index, month in enumerate(months, start=1):
+        for market in ("1", "2"):
+            frames.append(
+                fetch_mops_warrant_identity(
+                    market,
+                    month=month,
+                    active=False,
+                )
+            )
+            if MOPS_REQUEST_DELAY_SECONDS:
+                time.sleep(MOPS_REQUEST_DELAY_SECONDS)
+        if month_index % 6 == 0 or month_index == len(months):
+            print(
+                f"  🏛️ MOPS 歷史補抓進度：{month_index:,}/{len(months):,} 月",
+                flush=True,
+            )
+
+    official_records = mops_frames_to_identity_records(frames)
+    repaired_index = save_warrant_identity_index(
+        [*identity_index.records(), *official_records]
+    )
+    remaining_pairs = {
+        pair
+        for pair in normalized_pairs
+        if not identity_pair_is_matched(repaired_index, pair)
+    }
+
+    # 未到期權證不會出現在「已下市」月份清單；僅在確實仍有缺口時抓一次
+    # MOPS 目前掛牌清單。active 快取依 METADATA_CACHE_HOURS 更新。
+    active_record_count = 0
+    if remaining_pairs:
+        print(
+            f"  🏛️ 歷史到期批次後仍有 {len(remaining_pairs):,} 組未配對；"
+            "補抓目前掛牌權證。",
+            flush=True,
+        )
+        active_frames = [
+            fetch_mops_warrant_identity(market, active=True)
+            for market in ("1", "2")
+        ]
+        active_records = mops_frames_to_identity_records(active_frames)
+        active_record_count = len(active_records)
+        repaired_index = save_warrant_identity_index(
+            [*repaired_index.records(), *active_records]
+        )
+
+    matched_after = sum(
+        identity_pair_is_matched(repaired_index, pair)
+        for pair in normalized_pairs
+    )
+    print(
+        "  ✅ MOPS 官方身分補抓完成："
+        f"歷史區間 {len(official_records):,} 筆｜"
+        f"目前掛牌 {active_record_count:,} 筆｜"
         f"本批已配對 {matched_before:,} → {matched_after:,}/"
         f"{len(normalized_pairs):,}",
         flush=True,
@@ -2277,7 +2793,7 @@ def preflight_identity_quality(
     identity_index: WarrantIdentityIndex,
     sample_days: int = 5,
     *,
-    allow_target_backfill: bool = True,
+    allow_official_backfill: bool = True,
 ) -> WarrantIdentityIndex:
     """在繼續下載前抽查既有 compact，避免錯誤索引一路跑完整段歷史。"""
     successful = sorted(state["successful_dates"])
@@ -2333,8 +2849,8 @@ def preflight_identity_quality(
     if unmatched_rows:
         print_identity_diagnostic(reason_counts, examples, identity_index)
     if total_rows and unmatched_pct > MAX_IDENTITY_UNMATCHED_PCT:
-        if allow_target_backfill and bad_pairs:
-            repaired_index = backfill_identity_from_target_shards(
+        if allow_official_backfill and bad_pairs:
+            repaired_index = backfill_identity_from_official_mops(
                 identity_index,
                 bad_pairs,
             )
@@ -2342,7 +2858,7 @@ def preflight_identity_quality(
                 state,
                 repaired_index,
                 sample_days=sample_days,
-                allow_target_backfill=False,
+                allow_official_backfill=False,
             )
         raise RuntimeError(
             f"下載前抽查的身分未配對率 {unmatched_pct:.2f}% 超過允許上限 "
@@ -2476,7 +2992,7 @@ def load_compact_frames(
     stored_by_day: list[tuple[str, pd.DataFrame]] = []
     unresolved_pairs: set[tuple[str, str]] = set()
     print(
-        "  ⏳ 掃描全部 compact 的權證代號日期，檢查是否需要母股分片補抓...",
+        "  ⏳ 掃描全部 compact 的權證代號日期，檢查是否需要 MOPS 官方歷史補抓...",
         flush=True,
     )
     for index, day in enumerate(successful, start=1):
@@ -2503,7 +3019,7 @@ def load_compact_frames(
                 flush=True,
             )
     if unresolved_pairs:
-        identity_index = backfill_identity_from_target_shards(
+        identity_index = backfill_identity_from_official_mops(
             identity_index,
             unresolved_pairs,
         )
@@ -3451,6 +3967,13 @@ def build_integrity_report(
     actual_first = min(successful, default="")
     actual_latest = max(successful, default="")
     complete = not failed and not unprocessed
+    mops_identity_cache_count = len(
+        list(
+            METADATA_DIR.glob(
+                f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_*.parquet"
+            )
+        )
+    )
     rows = [
         ("歷史資料狀態", "完整" if complete else "尚未完整"),
         ("FinMind最早可用日期", actual_first or "尚未確認"),
@@ -3459,6 +3982,11 @@ def build_integrity_report(
             "可用範圍探索來源",
             state.get("availability_discovery_source", ""),
         ),
+        (
+            "權證身分來源",
+            "FinMind Summary 優先；MOPS 含下市權證官方歷史備援",
+        ),
+        ("MOPS官方身分快取分片數", mops_identity_cache_count),
         ("候選範圍起始日", min(expected_dates, default="")),
         ("候選範圍結束日", max(expected_dates, default="")),
         ("預期交易日數", len(expected_dates)),
@@ -3747,6 +4275,74 @@ def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
 
 def run_self_tests() -> dict[str, str]:
     """不連網的小型測試；失敗時直接拋出 AssertionError。"""
+    assert roc_date_to_iso("112/11/30") == "2023-11-30"
+    assert iso_month_to_roc("2023-06") == "11206"
+    assert month_range("2023-11-15", "2024-02-01") == [
+        "2023-11",
+        "2023-12",
+        "2024-01",
+        "2024-02",
+    ]
+    mops_html_test = """
+    <html><body><table class='hasBorder'>
+      <tr>
+        <th>權證代號</th><th>權證簡稱</th><th>權證類型</th>
+        <th>上市日期</th><th>履約截止日</th>
+        <th>標的<br>代號</th><th>標的<br>名稱</th>
+      </tr>
+      <tr class='cColor'>
+        <td>030650e</td><td>台積電凱基2A購11</td><td>認購</td>
+        <td>111/11/30</td><td>112/10/02</td>
+        <td>2330</td><td>台積電</td>
+      </tr>
+      <tr class='lColor'>
+        <td>07925P</td><td>仁寶元富83售01</td><td>認售</td>
+        <td>107/06/11</td><td>108/03/11</td>
+        <td>2324</td><td>仁寶</td>
+      </tr>
+      <tr class='cColor'>
+        <td>034676e</td><td>東哥凱基28購03</td><td>認購</td>
+        <td>112/02/01</td><td>112/08/31</td>
+        <td>8478</td><td>東哥遊艇</td>
+      </tr>
+      <tr class='lColor'>
+        <td>030961e</td><td>台積電凱基33購01</td><td>認購</td>
+        <td>111/12/05</td><td>113/03/04</td>
+        <td>2330</td><td>台積電</td>
+      </tr>
+      <tr class='lColor'>
+        <td>035628e</td><td>臺股指凱基2A購20</td><td>認購</td>
+        <td>112/02/09</td><td>112/10/11</td>
+        <td>IX0001</td><td>臺股指數</td>
+      </tr>
+    </table></body></html>
+    """
+    parsed_mops_test = parse_mops_warrant_html(mops_html_test, "1")
+    assert list(parsed_mops_test["code"]) == [
+        "030650",
+        "07925P",
+        "034676",
+        "030961",
+        "035628",
+    ]
+    assert parsed_mops_test.iloc[0]["list_date"] == "2022-11-30"
+    assert parsed_mops_test.iloc[0]["end_date"] == "2023-10-02"
+    mops_identity_test = WarrantIdentityIndex(
+        mops_frames_to_identity_records([parsed_mops_test])
+    ).resolve("030650", "2023-06-21")
+    assert mops_identity_test.status == "Matched"
+    assert mops_identity_test.target_code == "2330"
+    assert "MOPS上市官方歷史" in mops_identity_test.reason
+    assert WarrantIdentityIndex(
+        mops_frames_to_identity_records([parsed_mops_test])
+    ).resolve("034676", "2023-06-21").target_code == "8478"
+    assert WarrantIdentityIndex(
+        mops_frames_to_identity_records([parsed_mops_test])
+    ).resolve("030961", "2023-06-21").target_code == "2330"
+    assert WarrantIdentityIndex(
+        mops_frames_to_identity_records([parsed_mops_test])
+    ).resolve("035628", "2023-06-21").target_code == "IX0001"
+
     test_ranges = warrant_summary_chunk_ranges(
         "2022-06-01",
         "2024-02-01",
@@ -4361,6 +4957,10 @@ def run_self_tests() -> dict[str, str]:
     assert summary["勝筆數"] == 1 and summary["敗筆數"] == 1
     assert summary["平手筆數"] == 1
     return {
+        "MOPS民國年月與月份切片": "PASS",
+        "MOPS官方HTML欄位解析": "PASS",
+        "MOPS下市代號尾碼正規化": "PASS",
+        "MOPS日期化身分命中2023交易日": "PASS",
         "Summary明確日期年度切片": "PASS",
         "Summary年度合併去重": "PASS",
         "Summary忽略日期時拒絕快取": "PASS",
