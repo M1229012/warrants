@@ -3682,7 +3682,9 @@ def draw_consensus_buy_image(
     section_title_h = 0.55
     header_h = 0.42
     row_h = 0.50
-    footer_h = 0.66
+    # 含型態版已在表格下方增加備註框，因此只需保留精簡頁尾；
+    # 原版仍沿用既有高度，避免改變既有圖片版面。
+    footer_h = 0.10 if show_pattern else 0.66
 
     table_h = section_title_h + header_h + max(1, n) * row_h
 
@@ -4004,7 +4006,7 @@ def draw_consensus_buy_image(
         text(
             margin_x + 0.22,
             pattern_note_y + pattern_note_h - 0.22,
-            "型態備註",
+            "型態備註（直接取自 Google Sheet「快取_TOP15共識淨買超」）",
             12.2,
             NAVY,
             BOLD,
@@ -4033,7 +4035,7 @@ def draw_consensus_buy_image(
 
     text(
     fig_w / 2,
-    0.24,
+    0.14 if show_pattern else 0.24,
     f"{TOP15_LOW_TRADED_COVERAGE_SYMBOL} 代表當日成交價覆蓋率低於 "
     f"{TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT:.0f}%｜"
     "本圖為籌碼追蹤整理，不構成投資建議。",
