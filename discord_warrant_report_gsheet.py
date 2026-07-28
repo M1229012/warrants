@@ -3948,8 +3948,8 @@ def draw_consensus_buy_image(
                 pattern = str(r.get("pattern", "") or "-").strip() or "-"
                 pattern_color = {
                     "突": RED,
-                    "站": "#D97706",
-                    "撐": GREEN,
+                    "站": RED,
+                    "撐": NAVY,
                     "強": RED,
                     "弱": GREEN,
                     "盤": MUTED,
