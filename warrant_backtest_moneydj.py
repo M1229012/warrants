@@ -127,6 +127,19 @@ USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "n
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "80"))
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
+WARRANT_NAME_ALLOW_MARKED_FALLBACK = os.getenv(
+    "WARRANT_NAME_ALLOW_MARKED_FALLBACK",
+    "1",
+).strip().lower() not in ("0", "false", "no")
+WARRANT_NAME_UNRESOLVED_TOLERANCE = max(
+    int(os.getenv("WARRANT_NAME_UNRESOLVED_TOLERANCE", "250")),
+    0,
+)
+WARRANT_NAME_RECOVERY_MAX_ROUNDS = max(
+    int(os.getenv("WARRANT_NAME_RECOVERY_MAX_ROUNDS", "4")),
+    1,
+)
+WARRANT_NAME_PENDING_MARKER = "【官方名稱待補】"
 
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(OUTPUT_DIR, "warrant_cache"))
 CACHE_ENCODING = "utf-8-sig"
@@ -1674,6 +1687,12 @@ def _market_header_index(headers, kind):
             "stockid", "stock_id", "code",
         }
         contains = ("證券代號", "股票代號", "商品代號")
+    elif kind == "name":
+        exact = {
+            "證券名稱", "股票名稱", "商品名稱", "名稱",
+            "securityname", "securitiesname", "stockname", "name",
+        }
+        contains = ("證券名稱", "股票名稱", "商品名稱")
     else:
         exact = {
             "收盤價", "收盤", "收市價", "成交價", "close", "closingprice",
@@ -1688,6 +1707,230 @@ def _market_header_index(headers, kind):
         if any(token in header for token in contains):
             return idx
     return None
+
+
+def _extract_market_security_names_from_payload(
+    payload,
+    expected_date=None,
+    source_name="",
+    wanted_codes=None,
+):
+    """從官方歷史日行情依「交易日＋代號」擷取當時的證券名稱。"""
+    if not _market_payload_date_matches_request(
+        payload,
+        expected_date,
+        source_name=source_name,
+    ):
+        return {}
+
+    wanted = {
+        _normalize_warrant_code_for_identity(code)
+        for code in (wanted_codes or [])
+        if _normalize_warrant_code_for_identity(code)
+    }
+    names = {}
+    visited = set()
+
+    def add_pair(raw_code, raw_name):
+        code = _normalize_warrant_code_for_identity(
+            _clean_market_cell_text(raw_code)
+        )
+        name = _clean_market_cell_text(raw_name)
+        if (
+            not code
+            or (wanted and code not in wanted)
+            or not _is_complete_warrant_name(code, name)
+            or "售" in name
+            or "熊" in name
+        ):
+            return
+        names[code] = name
+
+    def add_record(record):
+        if not isinstance(record, dict):
+            return
+        headers = list(record.keys())
+        code_idx = _market_header_index(headers, "code")
+        name_idx = _market_header_index(headers, "name")
+        if code_idx is None or name_idx is None:
+            return
+        values = list(record.values())
+        if code_idx < len(values) and name_idx < len(values):
+            add_pair(values[code_idx], values[name_idx])
+
+    def add_table(headers, rows):
+        if not isinstance(headers, list) or not isinstance(rows, list):
+            return
+        code_idx = _market_header_index(headers, "code")
+        name_idx = _market_header_index(headers, "name")
+        if code_idx is None or name_idx is None:
+            return
+        for row in rows:
+            if isinstance(row, dict):
+                add_record(row)
+                continue
+            if not isinstance(row, (list, tuple)):
+                continue
+            if code_idx < len(row) and name_idx < len(row):
+                add_pair(row[code_idx], row[name_idx])
+
+    def visit(obj):
+        if isinstance(obj, (dict, list)):
+            obj_id = id(obj)
+            if obj_id in visited:
+                return
+            visited.add(obj_id)
+
+        if isinstance(obj, dict):
+            add_record(obj)
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("data"), list):
+                add_table(obj.get("fields"), obj.get("data"))
+            if isinstance(obj.get("fields"), list) and isinstance(obj.get("aaData"), list):
+                add_table(obj.get("fields"), obj.get("aaData"))
+            elif isinstance(obj.get("aaData"), list):
+                # TPEx dailyQuotes 既有格式：0=代號、1=名稱。
+                for row in obj.get("aaData", []):
+                    if isinstance(row, (list, tuple)) and len(row) > 1:
+                        add_pair(row[0], row[1])
+            for key, headers in obj.items():
+                match = re.fullmatch(
+                    r"fields(\d*)",
+                    str(key or ""),
+                    flags=re.IGNORECASE,
+                )
+                if not match or not isinstance(headers, list):
+                    continue
+                rows = obj.get(f"data{match.group(1)}")
+                if isinstance(rows, list):
+                    add_table(headers, rows)
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, dict):
+                    add_record(value)
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+    visit(payload)
+    return names
+
+
+def _fetch_official_daily_security_names(
+    market_name,
+    target_date,
+    wanted_codes,
+):
+    """查詢官方歷史權證日報；522／429／連線中斷自動退避重試。"""
+    target_dt = parse_date(target_date)
+    if not target_dt:
+        return {}
+    target_key = target_dt.strftime("%Y/%m/%d")
+    if market_name == "TPEx":
+        endpoint_specs = (
+            (
+                "TPEx權證日報",
+                "https://www.tpex.org.tw/www/zh-tw/warrant/wntQuts",
+                {
+                    "type": "Daily",
+                    "date": target_key,
+                    "response": "json",
+                },
+            ),
+            (
+                "TPEx全市場日行情備援",
+                "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
+                {
+                    "date": target_key,
+                    "id": "",
+                    "response": "json",
+                },
+            ),
+        )
+    else:
+        endpoint_specs = (
+            (
+                "TWSE權證分類日報",
+                "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                {
+                    "response": "json",
+                    "date": target_dt.strftime("%Y%m%d"),
+                    "type": "0999",
+                },
+            ),
+            (
+                "TWSE全市場日行情備援",
+                "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                {
+                    "response": "json",
+                    "date": target_dt.strftime("%Y%m%d"),
+                    "type": "ALL",
+                },
+            ),
+        )
+
+    last_error = None
+    max_attempts = 4
+    for source_label, url, params in endpoint_specs:
+        endpoint_failed = False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = get_thread_session().get(
+                    url,
+                    params=params,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/json, */*",
+                        "Referer": (
+                            "https://www.tpex.org.tw/zh-tw/derivative/"
+                            "warrant/info/price/day.html"
+                            if market_name == "TPEx"
+                            else "https://www.twse.com.tw/"
+                        ),
+                    },
+                    timeout=(5, 45),
+                )
+                response.raise_for_status()
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = json.loads(response.content.decode("utf-8"))
+                recovered = _extract_market_security_names_from_payload(
+                    payload,
+                    expected_date=target_key,
+                    source_name=source_label,
+                    wanted_codes=wanted_codes,
+                )
+                if recovered:
+                    return recovered
+                # 回應有效但目標代號不在這份報表，立即改查同市場備援報表。
+                endpoint_failed = False
+                break
+            except Exception as exc:
+                endpoint_failed = True
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                wait_seconds = float(2 ** (attempt - 1))
+                print(
+                    f"    ↻ {source_label}查詢失敗：{target_key}｜"
+                    f"{type(exc).__name__}: {exc}｜{wait_seconds:.0f} 秒後重試 "
+                    f"({attempt}/{max_attempts - 1})"
+                )
+                time.sleep(wait_seconds)
+        if endpoint_failed:
+            print(
+                f"    ⚠️ {source_label}持續失敗，改查同市場下一個官方來源："
+                f"{target_key}"
+            )
+
+    if last_error is not None:
+        print(
+            f"    ⚠️ {market_name} 歷史權證名稱仍無法取得：{target_key}｜"
+            f"{type(last_error).__name__}: {last_error}"
+        )
+    return {}
 
 
 def _extract_market_close_prices_from_payload(
@@ -5338,7 +5581,6 @@ def normalize_or_remove_deleted_broker_result_record(record):
     rec = dict(record)
     scope = result_record_broker_scope(rec)
     label_to_code, code_to_label = configured_broker_pair_maps_for_scope(scope)
-    active_labels = set(label_to_code.keys())
 
     broker_label = str(
         strip_gsheet_text_prefix(rec.get("分點", ""))
@@ -7051,6 +7293,12 @@ def _repair_warrant_label_text(value, warrant_lookup):
         )
         if not name:
             continue
+        if (
+            WARRANT_NAME_PENDING_MARKER in str(segment)
+            and not _is_complete_warrant_name(code, name)
+        ):
+            metas.append(meta)
+            continue
         replacement = format_warrant_identity_label(code, name)
         if str(segment).strip() != replacement:
             leading = str(segment)[: len(str(segment)) - len(str(segment).lstrip())]
@@ -7097,7 +7345,17 @@ def repair_result_record_security_identity(record):
             if "權證代號" in rec and str(strip_gsheet_text_prefix(rec.get("權證代號", ""))).strip() != direct_code:
                 rec["權證代號"] = direct_code
                 changed_fields.add("權證代號")
-            if "權證名稱" in rec and canonical_name and str(rec.get("權證名稱", "")).strip() != canonical_name:
+            existing_name = str(rec.get("權證名稱", "") or "").strip()
+            preserve_pending_marker = bool(
+                WARRANT_NAME_PENDING_MARKER in existing_name
+                and not _is_complete_warrant_name(direct_code, canonical_name)
+            )
+            if (
+                "權證名稱" in rec
+                and canonical_name
+                and existing_name != canonical_name
+                and not preserve_pending_marker
+            ):
                 rec["權證名稱"] = canonical_name
                 changed_fields.add("權證名稱")
 
@@ -7744,7 +8002,7 @@ def replace_daily_date_rows_in_worksheet(
 
     row_shift = len(rows_to_insert)
     shifted_old_rows = [row_no + row_shift for row_no in old_target_rows]
-    for start_row, end_row in reversed(_contiguous_row_ranges(shifted_old_rows)):
+    for start_row, end_row in reversed(_contiguous_data_row_ranges(shifted_old_rows)):
         gsheet_api_call(
             f"刪除 daily 舊日期快照 {safe_worksheet_title(title)} {start_row}-{end_row}",
             ws.delete_rows,
@@ -7997,7 +8255,7 @@ def is_incremental_dedupe_sheet(title):
     }
 
 
-def _contiguous_row_ranges(row_numbers):
+def _contiguous_data_row_ranges(row_numbers):
     """將列號整理成連續區間，供 Google Sheet 由下往上批次刪除。"""
     numbers = sorted({int(x) for x in row_numbers if int(x) >= 2})
     if not numbers:
@@ -8070,7 +8328,7 @@ def remove_existing_duplicate_increment_rows(ws, title, existing_values):
         return existing_values, 0
 
     # 由下往上刪除，避免上方列號因先刪除而位移。
-    for start_row, end_row in reversed(_contiguous_row_ranges(duplicate_rows)):
+    for start_row, end_row in reversed(_contiguous_data_row_ranges(duplicate_rows)):
         gsheet_api_call(
             f"刪除既有重複列 {safe_worksheet_title(title)} {start_row}-{end_row}",
             ws.delete_rows,
@@ -11276,7 +11534,7 @@ def _canonical_gsheet_header(value):
     return aliases.get(header, header)
 
 
-def _contiguous_row_ranges(row_numbers):
+def _contiguous_sheet_row_ranges(row_numbers):
     """把 1-based 列號整理成連續區間，供 Google Sheet 由後往前刪列。"""
     rows = sorted({int(x) for x in row_numbers if int(x) >= 1})
     if not rows:
@@ -11392,7 +11650,7 @@ def cleanup_deleted_broker_rows_in_existing_worksheets():
             total_renamed += len(cell_updates)
 
         # 必須由後往前刪除，否則前面刪列後會改變後續列號。
-        for start_row, end_row in reversed(_contiguous_row_ranges(rows_to_delete)):
+        for start_row, end_row in reversed(_contiguous_sheet_row_ranges(rows_to_delete)):
             gsheet_api_call(
                 f"清除失效分點舊資料 {ws.title} R{start_row}:R{end_row}",
                 ws.delete_rows,
@@ -11503,12 +11761,33 @@ def fetch_current_official_warrant_metadata():
     )
 
     def fetch_one(market_name, url, source):
-        response = get_thread_session().get(
-            url,
-            headers={"User-Agent": MONEYDJ_HEADERS["User-Agent"]},
-            timeout=(5, 90),
-        )
-        response.raise_for_status()
+        response = None
+        last_error = None
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = get_thread_session().get(
+                    url,
+                    headers={"User-Agent": MONEYDJ_HEADERS["User-Agent"]},
+                    timeout=(5, 90),
+                )
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                last_error = exc
+                response = None
+                if attempt >= max_attempts:
+                    break
+                wait_seconds = float(2 ** (attempt - 1))
+                print(
+                    f"    ⚠️ {market_name}官方權證基本資料暫時失敗："
+                    f"{type(exc).__name__}: {exc}｜{wait_seconds:.0f} 秒後重試 "
+                    f"({attempt}/{max_attempts - 1})"
+                )
+                time.sleep(wait_seconds)
+        if response is None:
+            raise last_error or RuntimeError("官方權證 API 未取得回應")
+
         payload = response.json()
         if not isinstance(payload, list):
             raise RuntimeError("官方權證 API 回傳格式不是 list")
@@ -12758,6 +13037,339 @@ def unresolved_amount_event_warrant_names(
                     unresolved.add((event_date, code))
 
     return unresolved, checked
+
+
+def mark_unresolved_amount_event_warrant_names(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events,
+    unresolved_pairs,
+):
+    """將容忍範圍內的極少數缺名權證明確標記，並同步更新事件顯示欄。"""
+    unresolved = {
+        (
+            normalize_date_str(date_key),
+            _normalize_warrant_code_for_identity(code),
+        )
+        for date_key, code in (unresolved_pairs or [])
+    }
+    if not unresolved:
+        return 0
+
+    marked = set()
+    for _event_code, event_group in iter_amount_class_event_groups(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+    ):
+        for event in event_group:
+            event_date = normalize_date_str(
+                event.get("事件日")
+                or event.get("結束日")
+                or event.get("起始日")
+            )
+            event_changed = False
+            for lot in event.get("lots", []):
+                code = _normalize_warrant_code_for_identity(
+                    lot.get("權證代號", "")
+                )
+                if (event_date, code) not in unresolved:
+                    continue
+                lot["權證名稱"] = WARRANT_NAME_PENDING_MARKER
+                marked.add((event_date, code))
+                event_changed = True
+
+            if not event_changed:
+                continue
+            lots = event.get("lots", [])
+            event["權證清單"] = "；".join(
+                format_warrant_identity_label(
+                    lot.get("權證代號", ""),
+                    lot.get("權證名稱", ""),
+                )
+                for lot in lots
+            )
+            if lots:
+                max_lot = max(
+                    lots,
+                    key=lambda lot: int(lot.get("金額", 0) or 0),
+                )
+                event["最大單筆權證"] = format_warrant_identity_label(
+                    max_lot.get("權證代號", ""),
+                    max_lot.get("權證名稱", ""),
+                )
+    return len(marked)
+
+
+def recover_historical_warrant_names_from_official_daily_quotes(
+    unresolved_pairs,
+    warrants,
+):
+    """
+    依事件交易日向 TWSE／TPEx 官方歷史日行情補回已到期權證名稱。
+
+    現行基本資料與 ISIN 清單不含已下市權證；但權證在事件日有成交時，
+    官方日行情仍保留該日的「代號＋名稱」。本函式以日期區間 lookup
+    鎖定生命週期，再用貪婪覆蓋挑最少交易日查詢，避免跨期或只憑代號猜名。
+    """
+    global _CURRENT_WARRANT_INTERVAL_RECORDS
+
+    if not unresolved_pairs or not warrants:
+        return warrants, {
+            "requested_pairs": 0,
+            "lifecycles": 0,
+            "recovered_lifecycles": 0,
+            "request_dates": 0,
+            "market_requests": 0,
+            "ambiguous": 0,
+            "rounds": 0,
+            "lookup_missing_pairs": 0,
+            "lookup_missing_sample": [],
+            "round_limit_reached": False,
+        }
+
+    lifecycle_records = defaultdict(list)
+    lifecycle_dates = defaultdict(set)
+    requested_pairs = set()
+    lookup_missing_pairs = set()
+
+    for raw_date, raw_code in unresolved_pairs:
+        date_key = normalize_date_str(raw_date)
+        code = _normalize_warrant_code_for_identity(raw_code)
+        if not date_key or not code:
+            continue
+        requested_pairs.add((date_key, code))
+        record = _warrant_lookup(warrants, date_key).get(code)
+        if not isinstance(record, dict):
+            lookup_missing_pairs.add((date_key, code))
+            continue
+        if _is_complete_warrant_name(code, record.get("名稱", "")):
+            continue
+
+        lifecycle_key = (
+            code,
+            normalize_date_str(record.get("上市日", "")),
+            normalize_date_str(record.get("最後交易日", "")),
+        )
+        lifecycle_dates[lifecycle_key].add(date_key)
+
+    if not lifecycle_dates:
+        return warrants, {
+            "requested_pairs": len(requested_pairs),
+            "lifecycles": 0,
+            "recovered_lifecycles": 0,
+            "request_dates": 0,
+            "market_requests": 0,
+            "ambiguous": 0,
+            "rounds": 0,
+            "lookup_missing_pairs": len(lookup_missing_pairs),
+            "lookup_missing_sample": sorted(lookup_missing_pairs)[:20],
+            "round_limit_reached": False,
+        }
+
+    for record in warrants:
+        lifecycle_key = (
+            _normalize_warrant_code_for_identity(record.get("代號", "")),
+            normalize_date_str(record.get("上市日", "")),
+            normalize_date_str(record.get("最後交易日", "")),
+        )
+        if lifecycle_key in lifecycle_dates:
+            lifecycle_records[lifecycle_key].append(record)
+
+    # 同一生命週期可能出現在多個事件日。每輪挑能涵蓋最多尚未補正
+    # 生命週期的日期，以降低官方 API 請求數。
+    date_coverage = defaultdict(set)
+    for lifecycle_key, date_keys in lifecycle_dates.items():
+        for date_key in date_keys:
+            date_coverage[date_key].add(lifecycle_key)
+
+    remaining = set(lifecycle_dates)
+    attempted_dates = defaultdict(set)
+    request_dates_seen = set()
+    market_request_count = 0
+    recovered_lifecycles = 0
+    ambiguous_lifecycles = set()
+    round_count = 0
+
+    # 第一輪失敗的生命週期不永久放棄；只要它還有其他事件日，就在下一輪
+    # 改查另一日。最多執行設定輪數，避免官方端點持續失敗拖垮 CI。
+    while remaining and round_count < WARRANT_NAME_RECOVERY_MAX_ROUNDS:
+        round_pending = set(remaining)
+        selected_dates = {}
+        while round_pending:
+            candidates = []
+            for date_key, covered in date_coverage.items():
+                eligible = {
+                    lifecycle_key
+                    for lifecycle_key in (covered & round_pending)
+                    if date_key not in attempted_dates[lifecycle_key]
+                }
+                if eligible:
+                    candidates.append((
+                        len(eligible),
+                        date_key,
+                        eligible,
+                    ))
+            if not candidates:
+                break
+            _count, date_key, covered = max(
+                candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            selected_dates[date_key] = set(covered)
+            round_pending.difference_update(covered)
+
+        if not selected_dates:
+            break
+
+        round_count += 1
+        requests_to_run = []
+        for date_key, lifecycle_keys in selected_dates.items():
+            request_dates_seen.add(date_key)
+            codes = {key[0] for key in lifecycle_keys}
+            for lifecycle_key in lifecycle_keys:
+                attempted_dates[lifecycle_key].add(date_key)
+            # 權證代號本身不能可靠判斷上市／上櫃；兩市場都查。若意外
+            # 回傳不同名稱，視為歧義並改試其他事件日，不任選一個。
+            for market_name in ("TWSE", "TPEx"):
+                requests_to_run.append((market_name, date_key, codes))
+
+        market_request_count += len(requests_to_run)
+        names_by_date_code = defaultdict(set)
+        max_workers = min(4, max(len(requests_to_run), 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_official_daily_security_names,
+                    market_name,
+                    date_key,
+                    codes,
+                ): (market_name, date_key)
+                for market_name, date_key, codes in requests_to_run
+            }
+            completed = 0
+            for future in as_completed(futures):
+                market_name, date_key = futures[future]
+                completed += 1
+                try:
+                    recovered_names = future.result()
+                except Exception as exc:
+                    recovered_names = {}
+                    print(
+                        f"    ⚠️ {market_name} 官方歷史權證名稱查詢失敗："
+                        f"{date_key}｜{type(exc).__name__}: {exc}"
+                    )
+                for code, name in (recovered_names or {}).items():
+                    normalized_code = _normalize_warrant_code_for_identity(
+                        code
+                    )
+                    if _is_complete_warrant_name(
+                        normalized_code,
+                        name,
+                    ):
+                        names_by_date_code[
+                            (date_key, normalized_code)
+                        ].add(str(name).strip())
+                if completed % 10 == 0 or completed == len(futures):
+                    print(
+                        f"    [第{round_count}輪 "
+                        f"{completed:,}/{len(futures):,}] "
+                        f"官方歷史權證名稱回查中"
+                    )
+
+        recovered_this_round = 0
+        for date_key, lifecycle_keys in selected_dates.items():
+            for lifecycle_key in lifecycle_keys:
+                code = lifecycle_key[0]
+                name_candidates = names_by_date_code.get(
+                    (date_key, code),
+                    set(),
+                )
+                if len(name_candidates) > 1:
+                    ambiguous_lifecycles.add(lifecycle_key)
+                    continue
+                if len(name_candidates) != 1:
+                    continue
+                official_name = next(iter(name_candidates))
+                changed = False
+                for record in lifecycle_records.get(lifecycle_key, []):
+                    if not _is_complete_warrant_name(
+                        code,
+                        record.get("名稱", ""),
+                    ):
+                        record["名稱"] = official_name
+                        record["_名稱來源"] = "official_daily_quote"
+                        changed = True
+                if changed:
+                    recovered_lifecycles += 1
+                    recovered_this_round += 1
+                remaining.discard(lifecycle_key)
+
+        print(
+            f"    {'✅' if recovered_this_round else '⚠️'} "
+            f"官方歷史名稱第 {round_count} 輪："
+            f"補回 {recovered_this_round:,} 個生命週期｜"
+            f"尚待嘗試其他事件日 {len(remaining):,}"
+        )
+
+    round_limit_reached = bool(
+        remaining
+        and round_count >= WARRANT_NAME_RECOVERY_MAX_ROUNDS
+    )
+    if round_limit_reached:
+        print(
+            f"    ⚠️ 官方歷史名稱回查已達輪數上限 "
+            f"{WARRANT_NAME_RECOVERY_MAX_ROUNDS:,}；"
+            f"停止額外網路請求，剩餘 {len(remaining):,} 個生命週期"
+        )
+
+    updated_warrants = warrants
+    if recovered_lifecycles > 0:
+        if USE_CACHE:
+            current = _normalize_warrant_cache_dataframe(
+                pd.DataFrame(warrants)
+            )
+            previous = _read_local_cache_even_when_forced(
+                WARRANTS_CACHE_PATH
+            )
+            merged = _merge_warrant_cache_dataframes(previous, current)
+            save_warrant_names_cache(merged)
+            write_cache_csv(
+                merged,
+                WARRANTS_CACHE_PATH,
+                sync_gsheet=False,
+                sync_supabase=False,
+            )
+            updated_warrants = merged.to_dict("records")
+            print(
+                f"  💾 已保存官方歷史權證名稱："
+                f"{recovered_lifecycles:,} 個生命週期｜"
+                f"權證對照快取 {len(merged):,} 筆"
+            )
+        else:
+            updated_warrants = [dict(record) for record in warrants]
+
+        _CURRENT_WARRANT_INTERVAL_RECORDS = [
+            dict(record) for record in updated_warrants
+        ]
+        _reset_warrant_lookup_cache(_CURRENT_WARRANT_INTERVAL_RECORDS)
+
+    return updated_warrants, {
+        "requested_pairs": len(requested_pairs),
+        "lifecycles": len(lifecycle_dates),
+        "recovered_lifecycles": recovered_lifecycles,
+        "request_dates": len(request_dates_seen),
+        "market_requests": market_request_count,
+        "ambiguous": len(ambiguous_lifecycles),
+        "rounds": round_count,
+        "lookup_missing_pairs": len(lookup_missing_pairs),
+        "lookup_missing_sample": sorted(lookup_missing_pairs)[:20],
+        "round_limit_reached": round_limit_reached,
+    }
 
 
 
@@ -22260,9 +22872,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
             for idx, future in enumerate(as_completed(futures), start=1):
                 candidate = futures[future]
                 try:
-                    item, ok, status, _used_limit, attempt_count = future.result()
+                    item, ok, status, _, attempt_count = future.result()
                 except Exception:
-                    item, ok, status, _used_limit, attempt_count = (
+                    item, ok, status, _, attempt_count = (
                         None,
                         False,
                         "request_failed",
@@ -22317,9 +22929,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
             for future in as_completed(futures):
                 candidate = futures[future]
                 try:
-                    item, ok, status, _used_limit, attempt_count = future.result()
+                    item, ok, status, _, attempt_count = future.result()
                 except Exception:
-                    item, ok, status, _used_limit, attempt_count = (
+                    item, ok, status, _, attempt_count = (
                         None,
                         False,
                         "request_failed",
@@ -23170,6 +23782,7 @@ def main():
             set(_HISTORY_IDENTITY_REPAIR_DATES)
             | {normalize_date_str(target_date)}
         )
+    marked_unresolved_count = 0
     unresolved_names, checked_names = unresolved_amount_event_warrant_names(
         a_events,
         b_events,
@@ -23178,6 +23791,119 @@ def main():
         e_events,
         date_keys=name_validation_dates,
     )
+    if unresolved_names:
+        print(
+            f"  🔎 偵測到 {len(unresolved_names):,} 個日期化權證缺少名稱；"
+            "開始依事件日回查 TWSE／TPEx 官方歷史行情..."
+        )
+        warrants, recovery_stats = (
+            recover_historical_warrant_names_from_official_daily_quotes(
+                unresolved_names,
+                warrants,
+            )
+        )
+        print(
+            f"  {'✅' if recovery_stats['recovered_lifecycles'] else '⚠️'} "
+            f"官方歷史權證名稱補正："
+            f"日期化缺名 {recovery_stats['requested_pairs']:,}｜"
+            f"生命週期 {recovery_stats['recovered_lifecycles']:,}/"
+            f"{recovery_stats['lifecycles']:,}｜"
+            f"查詢日 {recovery_stats['request_dates']:,}｜"
+            f"市場請求 {recovery_stats['market_requests']:,}｜"
+            f"回查輪數 {recovery_stats['rounds']:,}｜"
+            f"區間無對照 {recovery_stats['lookup_missing_pairs']:,}｜"
+            f"歧義拒收 {recovery_stats['ambiguous']:,}"
+        )
+        if recovery_stats["lookup_missing_pairs"]:
+            missing_lookup_sample = "、".join(
+                f"{date_key} {code}"
+                for date_key, code in recovery_stats[
+                    "lookup_missing_sample"
+                ]
+            )
+            suffix = (
+                "…"
+                if recovery_stats["lookup_missing_pairs"]
+                > len(recovery_stats["lookup_missing_sample"])
+                else ""
+            )
+            print(
+                "  ⚠️ 權證日期區間無法涵蓋事件日，未套用到錯誤生命週期："
+                f"{missing_lookup_sample}{suffix}"
+            )
+
+        if recovery_stats["recovered_lifecycles"] > 0:
+            history_cache_df, identity_stats = (
+                repair_history_metadata_from_warrants(
+                    history_cache_df,
+                    warrants,
+                )
+            )
+            if identity_stats.get("rows", 0) > 0:
+                history_cache_df = save_history_cache(
+                    history_cache_df,
+                    fetched_items=None,
+                    previous_history_empty=False,
+                )
+                print(
+                    f"  ♻️ 歷史名稱已修復 {identity_stats['warrant_name']:,} 列；"
+                    "僅重建 ABCDE 事件，不重抓 FinMind／MoneyDJ。"
+                )
+
+            items = items_from_history_cache(history_cache_df)
+            item_map = {
+                (item["broker_code"], item["warrant_code"]): item
+                for item in items
+            }
+            daily_records = build_daily_records(items)
+            amount_events = build_amount_class_events(
+                daily_records,
+                item_map,
+            )
+            a_events, b_events, c_events, d_events, e_events = [
+                amount_events.get(code, [])
+                for code in AMOUNT_CLASS_CODES
+            ]
+            print(
+                f"  ✅ 補正後金額強度事件："
+                f"A:{len(a_events):,}｜B:{len(b_events):,}｜"
+                f"C:{len(c_events):,}｜D:{len(d_events):,}｜"
+                f"E:{len(e_events):,}"
+            )
+            unresolved_names, checked_names = (
+                unresolved_amount_event_warrant_names(
+                    a_events,
+                    b_events,
+                    c_events,
+                    d_events,
+                    e_events,
+                    date_keys=name_validation_dates,
+                )
+            )
+
+    if unresolved_names:
+        if (
+            WARRANT_NAME_ALLOW_MARKED_FALLBACK
+            and len(unresolved_names)
+            <= WARRANT_NAME_UNRESOLVED_TOLERANCE
+        ):
+            marked_unresolved_count = (
+                mark_unresolved_amount_event_warrant_names(
+                    a_events,
+                    b_events,
+                    c_events,
+                    d_events,
+                    e_events,
+                    unresolved_names,
+                )
+            )
+            print(
+                f"  ⚠️ 官方所有事件日仍無法確認 {len(unresolved_names):,} 檔名稱；"
+                f"未超過容忍門檻 {WARRANT_NAME_UNRESOLVED_TOLERANCE:,}，"
+                f"已在權證清單明確標記「{WARRANT_NAME_PENDING_MARKER}」並繼續輸出。"
+            )
+            unresolved_names = set()
+
     if unresolved_names:
         sample = "、".join(
             f"{date_key} {code}"
@@ -23189,13 +23915,22 @@ def main():
             f"{sample}{suffix}"
         )
         print(
-            "  ⚠️ 本次停止，不修改 Google Sheet；避免權證清單與最大單筆權證再次寫入不完整名稱。"
+            "  ⚠️ 缺名數超過安全容忍門檻，本次停止且不修改 Google Sheet；"
+            "可用 WARRANT_NAME_UNRESOLVED_TOLERANCE 調整門檻，"
+            "或設 WARRANT_NAME_ALLOW_MARKED_FALLBACK=0 強制零容忍。"
         )
         return
-    print(
-        f"  ✅ 權證名稱完整性驗證："
-        f"{len(checked_names):,} 個日期化權證全部具有名稱"
-    )
+    if marked_unresolved_count:
+        print(
+            f"  ⚠️ 權證名稱完整性驗證："
+            f"{len(checked_names) - marked_unresolved_count:,} 個已確認｜"
+            f"{marked_unresolved_count:,} 個明確標記待補｜不中斷其餘資料輸出"
+        )
+    else:
+        print(
+            f"  ✅ 權證名稱完整性驗證："
+            f"{len(checked_names):,} 個日期化權證全部具有名稱"
+        )
 
     persistent_price_cache = load_price_cache()
     all_changed_price_codes = set()
