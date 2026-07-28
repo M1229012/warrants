@@ -13,12 +13,18 @@ on:
         required: false
         default: ""
         type: string
+      continuation_depth:
+        description: "自動續跑代數；由 workflow 維護，手動執行請保持 0"
+        required: false
+        default: "0"
+        type: string
   schedule:
     # 台北時間每週二至週六 09:30 執行，處理前一交易日已發布資料。
     - cron: "30 1 * * 2-6"
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: warrant-broker-ma-history
@@ -45,6 +51,9 @@ jobs:
       IDENTITY_INDEX_CACHE_HOURS: "168"
       FORCE_RECALCULATE_STATS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_recalculate_stats && '1' || '0' }}
       FORCE_REDOWNLOAD_DATES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_redownload_dates || '' }}
+      CONTINUATION_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.continuation_depth || '0' }}
+      MAX_AUTO_CONTINUATIONS: "6"
+      RUN_CUTOFF_MINUTES: "300"
 
     steps:
       - name: Checkout repository
@@ -82,9 +91,11 @@ jobs:
         run: |
           set +e
 
-          # GitHub-hosted runner 最長約六小時；提前送出 SIGINT，
-          # 讓程式保留已完成日期，並留時間保存 cache 與上傳報表。
-          timeout --signal=INT --kill-after=2m 325m \
+          needs_continue=false
+
+          # GitHub-hosted runner 單一 job 最長六小時；五小時先送出 SIGINT，
+          # 保存 cache 後由後續 step 自動 workflow_dispatch 下一輪。
+          timeout --signal=INT --kill-after=2m "${RUN_CUTOFF_MINUTES}m" \
             python warrant_broker_ma_history.py
           status=$?
 
@@ -95,8 +106,12 @@ jobs:
             )"
             echo "程式收到超時中止訊號；當時階段=$stage"
 
-            if [[ "$stage" == "downloading" || "$stage" == "complete" ]]; then
-              echo "已保存可安全續跑的逐日資料；下次會從 state.json 接續。"
+            if [[ "$stage" == "downloading" ]]; then
+              echo "下載階段已安全中止；保存 cache 後將自動啟動下一輪。"
+              needs_continue=true
+              status=0
+            elif [[ "$stage" == "complete" ]]; then
+              echo "程式已完成，不需要續跑。"
               status=0
             elif [[ "$stage" == "statistics" ]]; then
               echo "統計階段未完成，本次沒有完整報表；下載快取已保存，但 job 必須標記失敗。"
@@ -106,9 +121,11 @@ jobs:
           fi
 
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          echo "needs_continue=$needs_continue" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Save historical cache
+        id: save-history
         if: always()
         continue-on-error: true
         uses: actions/cache/save@v6
@@ -128,6 +145,64 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           compression-level: 6
+
+      - name: Dispatch next continuation run
+        if: >-
+          always() &&
+          steps.run-history.outputs.needs_continue == 'true' &&
+          steps.save-history.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current_depth="${CONTINUATION_DEPTH:-0}"
+          if ! [[ "$current_depth" =~ ^[0-9]+$ ]]; then
+            echo "continuation_depth 不是非負整數：$current_depth"
+            exit 1
+          fi
+          if (( current_depth >= MAX_AUTO_CONTINUATIONS )); then
+            echo "已達自動續跑上限 ${MAX_AUTO_CONTINUATIONS} 輪；停止建立新 workflow。"
+            exit 1
+          fi
+
+          next_depth=$((current_depth + 1))
+          workflow_id="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --jq '.workflow_id'
+          )"
+          payload="$(
+            jq -n \
+              --arg ref "$GITHUB_REF_NAME" \
+              --arg depth "$next_depth" \
+              '{
+                ref: $ref,
+                inputs: {
+                  force_recalculate_stats: "false",
+                  force_redownload_dates: "",
+                  continuation_depth: $depth
+                }
+              }'
+          )"
+          printf '%s' "$payload" | gh api \
+            --method POST \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/dispatches" \
+            --input -
+          echo "已建立第 ${next_depth} 輪續跑；新 workflow 會還原剛保存的最新 cache。"
+
+      - name: Fail if continuation cache was not saved
+        if: >-
+          always() &&
+          steps.run-history.outputs.needs_continue == 'true' &&
+          steps.save-history.outcome != 'success'
+        shell: bash
+        run: |
+          echo "歷史 cache 保存失敗，因此未啟動下一輪，避免從舊進度繼續。"
+          exit 1
 
       - name: Propagate program failure
         if: always() && steps.run-history.outputs.exit_code != '0'
