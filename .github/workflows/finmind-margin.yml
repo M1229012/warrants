@@ -1,0 +1,71 @@
+name: Generate FinMind margin chart
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: Start date (YYYY-MM-DD)
+        required: true
+        default: "2025-01-01"
+        type: string
+      end_date:
+        description: End date (YYYY-MM-DD)
+        required: true
+        default: "2026-07-28"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate CSV and SVG
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FINMIND_TOKEN: ${{ secrets.FINMIND_API_0714 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate FinMind secret
+        shell: bash
+        run: |
+          if [ -z "$FINMIND_TOKEN" ]; then
+            echo "::error::Missing repository secret FINMIND_API_0714"
+            exit 1
+          fi
+
+      - name: Download data and generate chart
+        shell: bash
+        run: |
+          python finmind_margin_chart.py \
+            --start "${{ inputs.start_date }}" \
+            --end "${{ inputs.end_date }}" \
+            --output-dir finmind_output
+
+      - name: Add files to workflow summary
+        shell: bash
+        run: |
+          {
+            echo "## FinMind output"
+            echo
+            echo "- Start: \`${{ inputs.start_date }}\`"
+            echo "- End: \`${{ inputs.end_date }}\`"
+            echo
+            echo "Download the CSV and SVG from the artifact below."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload CSV and SVG
+        uses: actions/upload-artifact@v7
+        with:
+          name: finmind-margin-${{ inputs.start_date }}-to-${{ inputs.end_date }}
+          path: finmind_output/*
+          if-no-files-found: error
+          retention-days: 30
