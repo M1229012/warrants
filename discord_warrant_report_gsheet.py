@@ -4006,7 +4006,7 @@ def draw_consensus_buy_image(
         text(
             margin_x + 0.22,
             pattern_note_y + pattern_note_h - 0.22,
-            "型態備註（直接取自 Google Sheet「快取_TOP15共識淨買超」）",
+            "型態備註",
             12.2,
             NAVY,
             BOLD,
