@@ -51,6 +51,10 @@ jobs:
       IDENTITY_INDEX_CACHE_HOURS: "168"
       # Summary API 必須明確帶歷史起日；按年度分段下載並另存獨立快取。
       WARRANT_SUMMARY_HISTORY_START_DATE: "2011-01-03"
+      # MOPS「含下市權證」補足 FinMind 代號重用的歷史缺口；
+      # 每個到期月份立即落盤，runner 中止後可接續。
+      MOPS_WARRANT_PAGE_SIZE: "10000"
+      MOPS_REQUEST_DELAY_SECONDS: "0.5"
       FORCE_RECALCULATE_STATS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_recalculate_stats && '1' || '0' }}
       FORCE_REDOWNLOAD_DATES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_redownload_dates || '' }}
       CONTINUATION_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.continuation_depth || '0' }}
