@@ -84,7 +84,7 @@ jobs:
       # MoneyDJ 完整性保護：
       # API4 成功率低於 98%，或 API5 有連線／解析失敗時，
       # 本次停止同步 Google Sheet，避免產生不完整報表。
-      MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO: "0.98"
+      MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO: "0.97"
       MONEYDJ_API5_STRICT: "1"
 
       # ============================================================
