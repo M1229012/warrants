@@ -30,7 +30,7 @@ E：單日累積買進金額 >= 1000萬
 依賴：pip install requests pandas openpyxl pyarrow
 """
 
-import json, re, time, os, math
+import json, re, time, os, math, unicodedata
 import threading
 from bisect import bisect_right
 from collections import Counter, defaultdict
@@ -92,6 +92,8 @@ _UNDERLYING_RESOLUTION_RESULT_CACHE_MAXSIZE = 65536
 _WARRANT_LOOKUP_CACHE_LOCK = threading.Lock()
 _WARRANT_LOOKUP_CACHE_WARRANTS_REF = None
 _WARRANT_LOOKUP_CACHE = {}
+_WARRANT_INTERVAL_INDEX_WARRANTS_REF = None
+_WARRANT_INTERVAL_INDEX = {}
 
 # 新制金額強度分類：
 # 事件單位為「同一分點 + 同一標的 + 同一天」。
@@ -125,6 +127,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 WARRANTS_CACHE_PATH = os.path.join(CACHE_DIR, "warrants_cache.csv")
+WARRANT_NAMES_CACHE_PATH = os.path.join(CACHE_DIR, "warrant_names_cache.csv")
 BROKER_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "broker_map_cache.csv")
 HISTORY_CACHE_PATH = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH = os.path.join(CACHE_DIR, "price_cache.csv")
@@ -2461,6 +2464,45 @@ def _supabase_date_for_db(value):
     return dt.strftime("%Y-%m-%d") if dt else None
 
 
+def _select_supabase_warrant_representatives(df, as_of=None):
+    """
+    Supabase warrants 表每個代號只能存一列：優先今日有效生命週期，
+    否則取上市日最新者，禁止完整歷史升冪排序後誤存最舊名稱。
+    """
+    if df is None or df.empty:
+        return []
+    target_dt = parse_date(as_of) if as_of else datetime.today()
+    target_day = (target_dt or datetime.today()).date()
+    selected = {}
+    for raw in df.fillna("").to_dict("records"):
+        code = _normalize_warrant_code_for_identity(raw.get("代號", ""))
+        if not code:
+            continue
+        start_dt = parse_date(raw.get("上市日", ""))
+        end_dt = parse_date(raw.get("最後交易日", ""))
+        is_active = bool(
+            start_dt
+            and end_dt
+            and start_dt.date() <= target_day <= end_dt.date()
+        )
+        rank = (
+            1 if is_active else 0,
+            start_dt or datetime.min,
+            end_dt or datetime.min,
+            1 if _is_complete_warrant_name(code, raw.get("名稱", "")) else 0,
+            normalize_stock_name_text(raw.get("名稱", "")),
+            normalize_security_code_text(raw.get("標的股", "")),
+        )
+        if code not in selected or rank > selected[code][0]:
+            record = dict(raw)
+            record["代號"] = code
+            selected[code] = (rank, record)
+    return [
+        selected[code][1]
+        for code in sorted(selected)
+    ]
+
+
 
 
 def _supabase_int(value):
@@ -2735,13 +2777,14 @@ def write_cache_to_supabase(df, path, full_df=None):
 
     elif kind == "warrants":
         rows = []
-        seen_codes = set()
-        for row in df2.itertuples(index=False):
-            row = row._asdict()
+        representative_records = _select_supabase_warrant_representatives(
+            df2,
+            as_of=datetime.today(),
+        )
+        for row in representative_records:
             warrant_code = _supabase_text(row.get("代號", ""))
-            if not warrant_code or warrant_code in seen_codes:
+            if not warrant_code:
                 continue
-            seen_codes.add(warrant_code)
             rows.append((
                 warrant_code,
                 _supabase_text(row.get("名稱", "")),
@@ -6997,6 +7040,7 @@ def _repair_warrant_label_text(value, warrant_lookup):
             meta.get("名稱", ""),
             meta.get("標的股", ""),
             meta.get("標的名稱", ""),
+            authoritative_name=True,
         )
         if not name:
             continue
@@ -7041,6 +7085,7 @@ def repair_result_record_security_identity(record):
                 meta.get("名稱", ""),
                 meta.get("標的股", ""),
                 meta.get("標的名稱", ""),
+                authoritative_name=True,
             )
             if "權證代號" in rec and str(strip_gsheet_text_prefix(rec.get("權證代號", ""))).strip() != direct_code:
                 rec["權證代號"] = direct_code
@@ -8622,37 +8667,181 @@ def add_price_aliases(price_cache, code, prices):
 
 
 def candidate_key_from_values(warrant_code, broker_code):
-    return (str(warrant_code).strip(), str(broker_code).strip())
+    return (
+        _normalize_warrant_code_for_identity(warrant_code),
+        str(broker_code).strip(),
+    )
+
+
+_WARRANT_CACHE_COLUMNS = [
+    "代號", "名稱", "標的股", "標的名稱", "上市日", "最後交易日",
+    "標的狀態",
+]
+
+
+def _read_local_cache_even_when_forced(path):
+    """
+    直接讀本機既有快取，不受 FORCE_FULL_CACHE_REFRESH 影響。
+
+    FORCE 代表重新抓來源，不代表可以刪除歷史權證生命週期或把完整名稱退化成代號。
+    """
+    parquet_path = f"{path}.parquet"
+    if os.path.exists(parquet_path):
+        try:
+            return pd.read_parquet(parquet_path).fillna("")
+        except Exception:
+            pass
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(
+                path,
+                dtype=str,
+                encoding=CACHE_ENCODING,
+            ).fillna("")
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def _is_complete_warrant_name(warrant_code, warrant_name):
+    code = _normalize_warrant_code_for_identity(warrant_code)
+    name = str(warrant_name or "").strip()
+    return bool(
+        code
+        and name
+        and _normalize_warrant_code_for_identity(name) != code
+    )
+
+
+def _normalize_warrant_cache_dataframe(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=_WARRANT_CACHE_COLUMNS)
+    out = df.copy().fillna("")
+    for col in _WARRANT_CACHE_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    out = out[_WARRANT_CACHE_COLUMNS].copy()
+    out["代號"] = out["代號"].map(_normalize_warrant_code_for_identity)
+    out["名稱"] = out["名稱"].map(lambda value: str(value or "").strip())
+    out["標的股"] = out["標的股"].map(normalize_security_code_text)
+    out["標的名稱"] = out["標的名稱"].map(lambda value: str(value or "").strip())
+    out["上市日"] = out["上市日"].map(
+        lambda value: normalize_date_str(value) if parse_date(value) else ""
+    )
+    out["最後交易日"] = out["最後交易日"].map(
+        lambda value: normalize_date_str(value) if parse_date(value) else ""
+    )
+    out = out[out["代號"] != ""].copy()
+    return fix_known_underlying_info_dataframe(
+        out,
+        "名稱",
+        "標的股",
+        "標的名稱",
+    )
+
+
+def _merge_warrant_cache_dataframes(old_df, new_df):
+    """
+    以（代號、上市日、最後交易日）合併，不刪 lookback 外舊區間。
+
+    同一生命週期若新名稱退化成純代號、舊名稱完整，必須保留舊名稱；
+    新資料只有在提供完整名稱時才能覆蓋舊名稱。
+    """
+    old = _normalize_warrant_cache_dataframe(old_df)
+    new = _normalize_warrant_cache_dataframe(new_df)
+    key_cols = ["代號", "上市日", "最後交易日"]
+    merged = {}
+
+    for rec in old.to_dict("records"):
+        key = tuple(rec.get(col, "") for col in key_cols)
+        merged[key] = dict(rec)
+
+    for rec in new.to_dict("records"):
+        key = tuple(rec.get(col, "") for col in key_cols)
+        previous = merged.get(key)
+        if previous is None:
+            merged[key] = dict(rec)
+            continue
+
+        combined = dict(previous)
+        if _is_complete_warrant_name(rec.get("代號"), rec.get("名稱")):
+            combined["名稱"] = rec.get("名稱", "")
+        elif not _is_complete_warrant_name(
+            previous.get("代號"),
+            previous.get("名稱"),
+        ):
+            combined["名稱"] = rec.get("名稱", "") or previous.get("名稱", "")
+
+        for field in ("標的股", "標的名稱", "標的狀態"):
+            new_value = str(rec.get(field, "") or "").strip()
+            if new_value:
+                combined[field] = new_value
+        merged[key] = combined
+
+    out = pd.DataFrame(merged.values(), columns=_WARRANT_CACHE_COLUMNS)
+    if out.empty:
+        return out
+    out = out.drop_duplicates(
+        subset=key_cols,
+        keep="last",
+    )
+    return out.sort_values(key_cols).reset_index(drop=True)
+
+
+def save_warrant_names_cache(warrant_df):
+    """長期名稱字典只接受完整名稱，永遠不以純代號覆寫既有名稱。"""
+    current = _normalize_warrant_cache_dataframe(warrant_df)
+    if not current.empty:
+        complete_mask = [
+            _is_complete_warrant_name(code, name)
+            for code, name in zip(current["代號"], current["名稱"])
+        ]
+        current = current.loc[complete_mask].copy()
+    old = _read_local_cache_even_when_forced(WARRANT_NAMES_CACHE_PATH)
+    merged = _merge_warrant_cache_dataframes(old, current)
+    if merged.empty:
+        return merged
+    write_cache_csv(
+        merged,
+        WARRANT_NAMES_CACHE_PATH,
+        sync_gsheet=False,
+        sync_supabase=False,
+    )
+    return merged
 
 
 
 def save_warrants_cache(warrants):
     if not USE_CACHE or not warrants:
-        return
+        return []
 
-    df = pd.DataFrame(warrants)
-    wanted_cols = ["代號", "名稱", "標的股", "標的名稱", "上市日", "最後交易日"]
-    for col in wanted_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = fix_known_underlying_info_dataframe(df, "名稱", "標的股", "標的名稱")
-    df["代號"] = df["代號"].astype(str).str.strip().str.upper()
-    df["上市日"] = df["上市日"].map(lambda x: normalize_date_str(x) if parse_date(x) else "")
-    df["最後交易日"] = df["最後交易日"].map(lambda x: normalize_date_str(x) if parse_date(x) else "")
-    df = df[df["代號"] != ""].drop_duplicates(
-        subset=["代號", "上市日", "最後交易日"],
-        keep="last",
+    current = _normalize_warrant_cache_dataframe(pd.DataFrame(warrants))
+    previous = _read_local_cache_even_when_forced(WARRANTS_CACHE_PATH)
+    merged = _merge_warrant_cache_dataframes(previous, current)
+    save_warrant_names_cache(merged)
+    write_cache_csv(
+        merged,
+        WARRANTS_CACHE_PATH,
+        force_supabase_sync=FORCE_FULL_CACHE_REFRESH,
     )
-    df = df.sort_values(["代號", "上市日", "最後交易日"]).reset_index(drop=True)
-
-    write_cache_csv(df[wanted_cols], WARRANTS_CACHE_PATH, force_supabase_sync=FORCE_FULL_CACHE_REFRESH)
-    print(f"  💾 已更新權證對照快取：{WARRANTS_CACHE_PATH}，保留 {len(df):,} 筆日期區間紀錄")
+    preserved_count = max(len(merged) - len(current), 0)
+    print(
+        f"  💾 已合併權證對照快取：{WARRANTS_CACHE_PATH}｜"
+        f"本次 {len(current):,} 筆｜保留舊區間 {preserved_count:,} 筆｜"
+        f"合計 {len(merged):,} 筆"
+    )
+    return merged.to_dict("records")
 
 
 
 def load_warrants_cache():
     df = read_cache_csv(WARRANTS_CACHE_PATH)
+    if df.empty:
+        df = pd.DataFrame(columns=_WARRANT_CACHE_COLUMNS)
+
+    # 主快取若曾被純代號污染，使用只增不壞的長期名稱字典按生命週期補回。
+    name_df = _read_local_cache_even_when_forced(WARRANT_NAMES_CACHE_PATH)
+    df = _merge_warrant_cache_dataframes(df, name_df)
     if df.empty:
         return []
 
@@ -8666,7 +8855,7 @@ def load_warrants_cache():
     warrants = []
     for row in df.itertuples(index=False):
         rec = row._asdict()
-        code = str(rec.get("代號", "")).strip().upper()
+        code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
         name = str(rec.get("名稱", "")).strip() or code
         if not code:
             continue
@@ -8683,6 +8872,10 @@ def load_warrants_cache():
             "標的名稱": underlying_name,
             "上市日": normalize_date_str(rec.get("上市日", "")) if parse_date(rec.get("上市日", "")) else "",
             "最後交易日": normalize_date_str(rec.get("最後交易日", "")) if parse_date(rec.get("最後交易日", "")) else "",
+            "標的狀態": str(rec.get("標的狀態", "") or "").strip(),
+            "_標的待確認": str(
+                rec.get("標的狀態", "") or ""
+            ).strip() == "待確認",
         })
     return warrants
 
@@ -8797,6 +8990,9 @@ def load_history_cache():
 
     out_df = df[required_cols].copy()
     out_df = fix_known_underlying_info_dataframe(out_df, "權證名稱", "標的股", "標的名稱")
+    out_df["權證代號"] = out_df["權證代號"].map(
+        _normalize_warrant_code_for_identity
+    )
     out_df["日期"] = out_df["日期"].map(normalize_date_str)
     out_df = out_df.drop_duplicates(
         subset=["權證代號", "券商代號", "日期"],
@@ -8834,6 +9030,11 @@ def save_history_cache(history_df, fetched_items=None, previous_history_empty=Fa
     if not USE_CACHE or history_df is None:
         return history_df
 
+    history_df = history_df.copy()
+    if "權證代號" in history_df.columns:
+        history_df["權證代號"] = history_df["權證代號"].map(
+            _normalize_warrant_code_for_identity
+        )
     history_df, prune_stats = prune_history_cache_dataframe(history_df)
     if prune_stats.get("removed", 0) > 0:
         print(
@@ -8890,7 +9091,7 @@ def items_from_history_cache(history_df, candidate_filter=None):
         item_df = item_df.sort_values("日期").reset_index(drop=True)
 
         item = {
-            "warrant_code": str(warrant_code).strip(),
+            "warrant_code": _normalize_warrant_code_for_identity(warrant_code),
             "warrant_name": str(warrant_name).strip(),
             "underlying_code": str(underlying_code).strip(),
             "underlying_name": str(underlying_name).strip(),
@@ -8913,7 +9114,17 @@ def items_from_history_cache(history_df, candidate_filter=None):
 
 
 def normalize_stock_name_text(s):
-    return str(s).strip().replace(" ", "").replace("　", "")
+    """
+    跨 FinMind／MoneyDJ／Sheet 的股名比較正規化。
+
+    顯示仍保留來源原文；這裡只處理比對時常見的全半形、臺／台、KY 與星號差異。
+    """
+    text = unicodedata.normalize("NFKC", str(s or "")).strip()
+    text = text.replace("臺", "台")
+    text = re.sub(r"[\s\u3000]+", "", text)
+    text = text.replace("＊", "*").replace("*", "")
+    text = re.sub(r"[-－]?KY$", "", text, flags=re.IGNORECASE)
+    return text
 
 
 # 特殊標的優先對照：
@@ -9042,9 +9253,9 @@ def build_canonical_stock_master(stock_df, excluded_security_codes=None):
     code_to_name = {}
     name_to_code = {}
     excluded_codes = {
-        normalize_security_code_text(code)
+        _normalize_warrant_code_for_identity(code)
         for code in (excluded_security_codes or [])
-        if normalize_security_code_text(code)
+        if _normalize_warrant_code_for_identity(code)
     }
     if stock_df is None or stock_df.empty:
         return code_to_name, name_to_code
@@ -9066,7 +9277,10 @@ def build_canonical_stock_master(stock_df, excluded_security_codes=None):
         name = str(raw_name or "").strip()
         if not code or not name:
             continue
-        if code in excluded_codes:
+        if (
+            code in excluded_codes
+            or _normalize_warrant_code_for_identity(code) in excluded_codes
+        ):
             continue
         if not re.fullmatch(r"[0-9A-Z]{4,12}", code):
             continue
@@ -9109,6 +9323,23 @@ _STOCK_NAME_SUFFIXES = [
     "鋼鐵", "化學", "化工", "紡織", "玻璃", "塑膠", "水泥",
 ]
 
+_ETF_ISSUER_PREFIXES = [
+    "元大", "國泰", "富邦", "群益", "中信", "中國信託", "永豐",
+    "兆豐", "第一金", "統一", "台新", "新光", "復華", "野村",
+]
+
+
+def _strip_etf_issuer_prefix(stock_name):
+    name = normalize_stock_name_text(stock_name)
+    for issuer in sorted(
+        {normalize_stock_name_text(value) for value in _ETF_ISSUER_PREFIXES},
+        key=len,
+        reverse=True,
+    ):
+        if name.startswith(issuer) and len(name) >= len(issuer) + 2:
+            return name[len(issuer):]
+    return ""
+
 
 def _stock_name_validation_prefixes(stock_name):
     """只產生完整名稱與公司型態後綴簡稱，不使用任意前兩字作身分驗證。"""
@@ -9117,6 +9348,9 @@ def _stock_name_validation_prefixes(stock_name):
         return set()
 
     prefixes = {name}
+    issuer_stripped = _strip_etf_issuer_prefix(name)
+    if issuer_stripped:
+        prefixes.add(issuer_stripped)
     stripped = name
     changed = True
     while changed:
@@ -9127,6 +9361,9 @@ def _stock_name_validation_prefixes(stock_name):
                 prefixes.add(stripped)
                 changed = True
                 break
+    stripped_issuer = _strip_etf_issuer_prefix(stripped)
+    if stripped_issuer:
+        prefixes.add(stripped_issuer)
     return {prefix for prefix in prefixes if len(prefix) >= 2}
 
 
@@ -9148,22 +9385,22 @@ def safe_warrant_name_for_identity(
     underlying_name="",
     resolver=None,
     code_to_name=None,
+    authoritative_name=False,
 ):
-    """名稱與標的不一致時回退成代號，禁止舊名稱污染權證清單。"""
+    """
+    驗證非權威名稱；FinMind／ISIN 的代號→名稱不由標的 resolver 否決。
+
+    名稱與標的是兩條獨立鏈路：日期區間負責避免代號重用，resolver 只協助
+    標的交叉驗證。只有非權威名稱被高信心解析到另一標的時才降級成代號。
+    """
     code = _normalize_warrant_code_for_identity(warrant_code)
     name = str(warrant_name or "").strip()
     if not name or _normalize_warrant_code_for_identity(name) == code:
         return code
+    if authoritative_name:
+        return name
 
     underlying_code = normalize_security_code_text(underlying_code)
-    code_to_name = (
-        code_to_name
-        if code_to_name is not None
-        else _CURRENT_STOCK_CODE_TO_NAME
-    )
-    expected_name = str(
-        (code_to_name or {}).get(underlying_code, underlying_name)
-    ).strip()
     resolved = resolve_underlying_from_warrant_name(
         name,
         resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER,
@@ -9187,8 +9424,8 @@ def safe_warrant_name_for_identity(
             # 「台灣50」對「元大台灣50」等正確市場簡稱會被誤降級成純代號。
             return name
 
-    if expected_name and not _warrant_name_matches_stock_name(name, expected_name):
-        return code
+    # resolver 無法解析或信心不足時，不得拿股票全名 startswith 規則否決名稱。
+    # ETF 省略發行商、KY／星號、臺／台等跨來源差異都不代表權證名稱錯誤。
     return name
 
 
@@ -9203,6 +9440,7 @@ def make_stock_aliases(
     stock_name,
     exact_stock_names=None,
     allow_exact_name_collisions=False,
+    stock_code="",
 ):
     """建立安全的股名別名，避免短別名撞到另一檔正式股名。"""
     name = normalize_stock_name_text(stock_name)
@@ -9229,13 +9467,13 @@ def make_stock_aliases(
                 changed = True
                 break
 
-    for length in range(min(4, len(name)), 1, -1):
-        candidate = name[:length]
-        if candidate in exact_stock_names and candidate != name:
-            continue
-        aliases.add(candidate)
+    normalized_code = normalize_security_code_text(stock_code)
+    if normalized_code.startswith("00"):
+        issuer_stripped = _strip_etf_issuer_prefix(name)
+        if issuer_stripped and issuer_stripped not in exact_stock_names:
+            aliases.add(issuer_stripped)
 
-    dangerous_aliases = {"台灣", "臺灣"}
+    dangerous_aliases = {"台灣"}
     return {alias for alias in aliases if len(alias) >= 2 and alias not in dangerous_aliases}
 
 
@@ -9287,6 +9525,7 @@ def build_underlying_resolver_from_stock_master(
             name,
             exact_names,
             allow_exact_name_collisions=preferred_counts.get(code, 0) > 0,
+            stock_code=code,
         ):
             alias_norm = normalize_stock_name_text(alias)
             add_candidate(alias_norm, code, name, alias_norm == name_norm)
@@ -9466,7 +9705,7 @@ def build_cached_warrant_index(cached_warrants):
     """將舊權證快取依代號預先分組；只改查找方式，不改候選順序。"""
     by_code = defaultdict(list)
     for rec in cached_warrants or []:
-        code = normalize_security_code_text(rec.get("代號", ""))
+        code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
         if code:
             by_code[code].append(rec)
     return dict(by_code)
@@ -9474,7 +9713,7 @@ def build_cached_warrant_index(cached_warrants):
 
 def _cached_warrant_name_candidates(cached_warrants, code, list_date, end_date):
     out = []
-    code = normalize_security_code_text(code)
+    code = _normalize_warrant_code_for_identity(code)
     list_dt = parse_date(list_date)
     end_dt = parse_date(end_date)
 
@@ -9485,7 +9724,7 @@ def _cached_warrant_name_candidates(cached_warrants, code, list_date, end_date):
     else:
         candidate_records = (
             rec for rec in (cached_warrants or [])
-            if normalize_security_code_text(rec.get("代號", "")) == code
+            if _normalize_warrant_code_for_identity(rec.get("代號", "")) == code
         )
 
     for rec in candidate_records:
@@ -9503,6 +9742,20 @@ def _cached_warrant_name_candidates(cached_warrants, code, list_date, end_date):
     return out
 
 
+def _is_authoritative_warrant_name_source(source):
+    source = str(source or "").strip().lower()
+    return (
+        source in {
+            "finmind_info_exact",
+            "finmind_info_interval",
+            "finmind_info_single_lifecycle",
+        }
+        or source.startswith("twse_isin")
+        or source.startswith("warrant_names_cache")
+        or source == "cache_exact"
+    )
+
+
 def select_warrant_name_for_interval(
     code,
     underlying_code,
@@ -9512,13 +9765,45 @@ def select_warrant_name_for_interval(
     cached_warrants,
     resolver=None,
     enforce_underlying_match=True,
+    code_lifecycle_count=None,
 ):
     """日期化挑選權證名稱，避免同一權證代號重用時拿到另一期間的名稱。"""
-    code = normalize_security_code_text(code)
+    code = _normalize_warrant_code_for_identity(code)
     underlying_code = normalize_security_code_text(underlying_code)
     candidates = []
-    for name in info_name_candidates.get(code, []):
-        candidates.append((str(name).strip(), 300, "finmind_info"))
+    list_dt = parse_date(list_date)
+    end_dt = parse_date(end_date)
+    for raw_candidate in info_name_candidates.get(code, []):
+        if isinstance(raw_candidate, dict):
+            name = str(raw_candidate.get("name", "") or "").strip()
+            info_dt = parse_date(raw_candidate.get("date", ""))
+        else:
+            name = str(raw_candidate or "").strip()
+            info_dt = None
+
+        if info_dt and list_dt and info_dt.date() == list_dt.date():
+            priority = 1000
+            source = "finmind_info_exact"
+        elif (
+            info_dt
+            and list_dt
+            and end_dt
+            and list_dt.date() <= info_dt.date() <= end_dt.date()
+        ):
+            priority = 900
+            source = "finmind_info_interval"
+        elif info_dt and list_dt and end_dt:
+            # FinMind 明確標示的名稱日期落在另一生命週期時不得跨區間借用；
+            # 寧可交給 exact cache／長期名稱字典，也不能在代號重用時配錯名稱。
+            continue
+        else:
+            priority = 650
+            source = (
+                "finmind_info_single_lifecycle"
+                if int(code_lifecycle_count or 0) == 1
+                else "finmind_info_undated"
+            )
+        candidates.append((name, priority, source))
     candidates.extend(_cached_warrant_name_candidates(cached_warrants, code, list_date, end_date))
 
     dedup = {}
@@ -9552,13 +9837,27 @@ def select_warrant_name_for_interval(
             )
             if resolved_code == underlying_code:
                 score += 1200
-            elif enforce_underlying_match and high_confidence and resolved_code:
+            elif (
+                enforce_underlying_match
+                and high_confidence
+                and resolved_code
+                and not _is_authoritative_warrant_name_source(source)
+            ):
                 score -= 1200
         scored.append((score, name, source, resolved))
 
     if not scored:
         return code, "code_only"
-    scored.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+    scored.sort(
+        key=lambda item: (
+            item[0],
+            1 if _is_authoritative_warrant_name_source(item[2]) else 0,
+            len(normalize_stock_name_text(item[1])),
+            normalize_stock_name_text(item[1]),
+            item[2],
+        ),
+        reverse=True,
+    )
     best_score, best_name, best_source, best_resolved = scored[0]
     if best_resolved:
         resolved_code = normalize_security_code_text(best_resolved.get("stock_code", ""))
@@ -9568,7 +9867,13 @@ def select_warrant_name_for_interval(
             or best_resolved.get("is_unambiguous_prefix")
             or int(best_resolved.get("prefix_len", 0) or 0) >= WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX
         )
-        if enforce_underlying_match and high_confidence and resolved_code and resolved_code != underlying_code:
+        if (
+            enforce_underlying_match
+            and high_confidence
+            and resolved_code
+            and resolved_code != underlying_code
+            and not _is_authoritative_warrant_name_source(best_source)
+        ):
             return code, "code_only_mismatch_guard"
     return best_name, best_source
 
@@ -9591,21 +9896,35 @@ def _warrant_record_identity_score(record, resolver=None):
 
 
 def dedupe_warrant_interval_records(records, resolver=None):
-    """同代號、同上市／到期區間若有衝突，保留身分交叉驗證分數最高的一筆。"""
+    """同生命週期衝突時使用穩定排序選擇，不依賴 FinMind 回傳列順序。"""
     best = {}
     order = []
     for rec in records or []:
         key = (
-            normalize_security_code_text(rec.get("代號", "")),
+            _normalize_warrant_code_for_identity(rec.get("代號", "")),
             normalize_date_str(rec.get("上市日", "")),
             normalize_date_str(rec.get("最後交易日", "")),
         )
         score = _warrant_record_identity_score(rec, resolver)
+        rank = (
+            score,
+            1 if _is_complete_warrant_name(
+                rec.get("代號", ""),
+                rec.get("名稱", ""),
+            ) else 0,
+            1 if _is_authoritative_warrant_name_source(
+                rec.get("_名稱來源", "")
+            ) else 0,
+            len(normalize_stock_name_text(rec.get("名稱", ""))),
+            normalize_stock_name_text(rec.get("名稱", "")),
+            normalize_security_code_text(rec.get("標的股", "")),
+            normalize_stock_name_text(rec.get("標的名稱", "")),
+        )
         if key not in best:
             order.append(key)
-            best[key] = (score, rec)
-        elif score >= best[key][0]:
-            best[key] = (score, rec)
+            best[key] = (rank, rec)
+        elif rank > best[key][0]:
+            best[key] = (rank, rec)
     return [best[key][1] for key in order]
 
 
@@ -9632,6 +9951,11 @@ def repair_history_metadata_from_warrants(history_df, warrants):
 
     out = history_df.copy()
     out["日期"] = out["日期"].map(normalize_date_str)
+    # CSV／Google Sheet 可能把 049787 讀成 49787 或 49787.0。
+    # 先把歷史列本身改回 canonical 6 碼，後續 map、快取與輸出才會共用同一 key。
+    out["權證代號"] = out["權證代號"].map(
+        _normalize_warrant_code_for_identity
+    )
     changed_row_mask = pd.Series(False, index=out.index)
 
     field_specs = (
@@ -9646,7 +9970,7 @@ def repair_history_metadata_from_warrants(history_df, warrants):
             continue
 
         group_index = pd.Index(indices)
-        codes = out.loc[group_index, "權證代號"].map(normalize_security_code_text)
+        codes = out.loc[group_index, "權證代號"]
         metas = codes.map(lookup)
         has_meta = metas.map(lambda meta: isinstance(meta, dict))
         if not bool(has_meta.any()):
@@ -9661,6 +9985,7 @@ def repair_history_metadata_from_warrants(history_df, warrants):
                             meta.get("名稱", ""),
                             meta.get("標的股", ""),
                             meta.get("標的名稱", ""),
+                            authoritative_name=True,
                         )
                         if isinstance(meta, dict)
                         else ""
@@ -10022,13 +10347,61 @@ def download_finmind_warrant_day(date_value, *, force_refresh=False):
 
 
 
+def _warrant_interval_index_for(warrants):
+    """每份完整生命週期清單只建一次 per-code 區間索引。"""
+    global _WARRANT_INTERVAL_INDEX_WARRANTS_REF
+    global _WARRANT_INTERVAL_INDEX
+
+    with _WARRANT_LOOKUP_CACHE_LOCK:
+        if warrants is _WARRANT_INTERVAL_INDEX_WARRANTS_REF:
+            return _WARRANT_INTERVAL_INDEX
+
+    grouped = defaultdict(list)
+    for warrant in warrants or []:
+        code = _normalize_warrant_code_for_identity(
+            warrant.get("代號", "")
+        )
+        if not code:
+            continue
+        start_dt = parse_date(warrant.get("上市日", ""))
+        end_dt = parse_date(warrant.get("最後交易日", ""))
+        start_day = (
+            start_dt.date() if start_dt else datetime.min.date()
+        )
+        end_day = end_dt.date() if end_dt else datetime.max.date()
+        rank = (
+            start_day,
+            end_day,
+            normalize_stock_name_text(warrant.get("名稱", "")),
+            normalize_security_code_text(warrant.get("標的股", "")),
+        )
+        grouped[code].append((start_day, end_day, rank, warrant))
+
+    built = {}
+    for code, entries in grouped.items():
+        entries.sort(key=lambda item: item[2])
+        built[code] = {
+            "starts": [item[0] for item in entries],
+            "entries": entries,
+        }
+
+    with _WARRANT_LOOKUP_CACHE_LOCK:
+        _WARRANT_INTERVAL_INDEX_WARRANTS_REF = warrants
+        _WARRANT_INTERVAL_INDEX = built
+    return built
+
+
 def _reset_warrant_lookup_cache(warrants=None):
     """切換權證區間清單時清空日期化 lookup；不修改權證資料。"""
     global _WARRANT_LOOKUP_CACHE_WARRANTS_REF
     global _WARRANT_LOOKUP_CACHE
+    global _WARRANT_INTERVAL_INDEX_WARRANTS_REF
+    global _WARRANT_INTERVAL_INDEX
     with _WARRANT_LOOKUP_CACHE_LOCK:
         _WARRANT_LOOKUP_CACHE_WARRANTS_REF = warrants
         _WARRANT_LOOKUP_CACHE = {}
+        _WARRANT_INTERVAL_INDEX_WARRANTS_REF = None
+        _WARRANT_INTERVAL_INDEX = {}
 
 
 def _warrant_lookup(warrants, date_value=None):
@@ -10048,25 +10421,39 @@ def _warrant_lookup(warrants, date_value=None):
             return cached
 
     selected = {}
-    selected_start = {}
+    interval_index = _warrant_interval_index_for(warrants)
 
-    for warrant in warrants or []:
-        code = str(warrant.get("代號", "")).strip().upper()
-        if not code:
-            continue
-
-        start_dt = parse_date(warrant.get("上市日", ""))
-        end_dt = parse_date(warrant.get("最後交易日", ""))
-        if target_dt:
-            if start_dt and target_dt.date() < start_dt.date():
+    if target_dt:
+        target_day = target_dt.date()
+        for code, index_record in interval_index.items():
+            starts = index_record["starts"]
+            entries = index_record["entries"]
+            idx = bisect_right(starts, target_day) - 1
+            # 先找上市日最晚且仍涵蓋 target 的區間；同上市日的穩定 rank
+            # 已在 entries 排序中決定。一般情況只檢查一筆。
+            while idx >= 0:
+                start_day, end_day, _rank, warrant = entries[idx]
+                if start_day <= target_day <= end_day:
+                    selected[code] = warrant
+                    break
+                idx -= 1
+    else:
+        for code, index_record in interval_index.items():
+            records = [
+                item[3] for item in index_record["entries"]
+            ]
+            identities = {
+                (
+                    normalize_stock_name_text(rec.get("名稱", "")),
+                    normalize_security_code_text(rec.get("標的股", "")),
+                )
+                for rec in records
+            }
+            # 沒日期時，代號若曾重用且身分不同就不猜；單一生命週期或所有區間
+            # 身分完全相同時，才可安全提供 lookup。
+            if len(records) > 1 and len(identities) > 1:
                 continue
-            if end_dt and target_dt.date() > end_dt.date():
-                continue
-
-        start_key = start_dt or datetime.min
-        if code not in selected or start_key >= selected_start[code]:
-            selected[code] = warrant
-            selected_start[code] = start_key
+            selected[code] = index_record["entries"][-1][3]
 
     with _WARRANT_LOOKUP_CACHE_LOCK:
         # 若計算期間 warrants 未被另一流程切換，才寫入目前快取。
@@ -10103,7 +10490,9 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
         return pd.DataFrame(columns=columns)
 
     df = raw_df.copy()
-    df["stock_id"] = df["stock_id"].astype(str).str.strip().str.upper()
+    df["stock_id"] = df["stock_id"].map(
+        _normalize_warrant_code_for_identity
+    )
     df["securities_trader_id"] = (
         df["securities_trader_id"].astype(str).str.strip().str.upper()
     )
@@ -10145,7 +10534,7 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
         wcode, broker_code_raw, date_str, buy_qty, sell_qty,
         buy_amount, sell_amount, finmind_broker_name,
     ) in grouped.itertuples(index=False, name=None):
-        wcode = str(wcode).strip().upper()
+        wcode = _normalize_warrant_code_for_identity(wcode)
         bnorm = normalize_broker_code_for_compare(broker_code_raw)
         warrant = warrant_map.get(wcode)
         broker = broker_by_code.get(bnorm)
@@ -10163,9 +10552,12 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
             warrant.get("名稱", ""),
             warrant.get("標的股", ""),
             warrant.get("標的名稱", ""),
+            authoritative_name=True,
         )
         records.append({
-            "權證代號": str(warrant.get("代號", wcode)).strip(),
+            "權證代號": _normalize_warrant_code_for_identity(
+                warrant.get("代號", wcode)
+            ),
             "權證名稱": warrant_name,
             "標的股": str(warrant.get("標的股", "")).strip(),
             "標的名稱": str(warrant.get("標的名稱", "")).strip(),
@@ -10871,11 +11263,15 @@ def _warrant_summary_identity_preferences(summary_df):
         return set(), Counter()
 
     work = summary_df[list(required)].copy().fillna("")
-    warrant_mask = work["type"].astype(str).str.contains("認購|認售", regex=True, na=False)
+    # 此資料集本身就是權證 Summary；即使 FinMind 對牛證／可展延型使用不同
+    # type 文字，也必須先把 stock_id 排除於股票主檔之外。
+    warrant_mask = work["stock_id"].map(
+        _normalize_warrant_code_for_identity
+    ).ne("")
     warrant_codes = {
-        normalize_security_code_text(code)
+        _normalize_warrant_code_for_identity(code)
         for code in work.loc[warrant_mask, "stock_id"].tolist()
-        if normalize_security_code_text(code)
+        if _normalize_warrant_code_for_identity(code)
     }
 
     work["_list_date"] = pd.to_datetime(work["date"], errors="coerce")
@@ -10940,14 +11336,17 @@ def fetch_current_official_isin_warrant_names():
                 match = re.match(r"^'?([0-9A-Za-z]{6})[\s\u3000]+(.+?)\s*$", text)
                 if not match:
                     continue
-                code = normalize_security_code_text(match.group(1))
+                code = _normalize_warrant_code_for_identity(match.group(1))
                 name = str(match.group(2) or "").strip()
-                if code and name and "購" in name:
+                if code and name and not re.search(
+                    r"有價證券代號|名稱|國際證券辨識號碼",
+                    name,
+                ):
                     names[code] = name
 
     print(
         f"  {'✅' if success_markets == 2 else '⚠️'} ISIN 權證名稱備援："
-        f"市場 {success_markets}/2｜取得 {len(names):,} 個認購權證名稱"
+        f"市場 {success_markets}/2｜取得 {len(names):,} 個現行證券名稱候選"
     )
     return names
 
@@ -10968,7 +11367,7 @@ def get_all_call_warrants_live(cached_warrants=None):
         stock_df = future_stock.result()
 
     required_summary = {"stock_id", "target_stock_id", "type", "date", "end_date"}
-    if info_df.empty or summary_df.empty or not required_summary.issubset(summary_df.columns):
+    if summary_df.empty or not required_summary.issubset(summary_df.columns):
         LIVE_WARRANT_SNAPSHOT_READY = False
         return []
 
@@ -11000,17 +11399,40 @@ def get_all_call_warrants_live(cached_warrants=None):
     _reset_underlying_resolver_runtime_cache(_CURRENT_UNDERLYING_RESOLVER)
     cached_warrant_index = build_cached_warrant_index(cached_warrants)
 
-    info = info_df.copy().fillna("")
-    info["stock_id"] = info["stock_id"].map(normalize_security_code_text)
+    info = (
+        info_df.copy().fillna("")
+        if info_df is not None
+        else pd.DataFrame()
+    )
+    # 此欄用於權證名稱索引，5 碼數字必須補回前導零。
     info_name_candidates = defaultdict(list)
-    if "stock_name" in info.columns:
-        for code, name in info[["stock_id", "stock_name"]].itertuples(index=False, name=None):
+    if {"stock_id", "stock_name"}.issubset(info.columns):
+        info["stock_id"] = info["stock_id"].map(
+            _normalize_warrant_code_for_identity
+        )
+        if "date" not in info.columns:
+            info["date"] = ""
+        for code, name, info_date in info[
+            ["stock_id", "stock_name", "date"]
+        ].itertuples(index=False, name=None):
             name = str(name or "").strip()
-            if code and name and name not in info_name_candidates[code]:
-                info_name_candidates[code].append(name)
+            candidate = {
+                "name": name,
+                "date": normalize_date_str(info_date)
+                if parse_date(info_date)
+                else "",
+            }
+            if (
+                code
+                and name
+                and candidate not in info_name_candidates[code]
+            ):
+                info_name_candidates[code].append(candidate)
 
     summary = summary_df.copy().fillna("")
-    summary["stock_id"] = summary["stock_id"].map(normalize_security_code_text)
+    summary["stock_id"] = summary["stock_id"].map(
+        _normalize_warrant_code_for_identity
+    )
     summary["target_stock_id"] = summary["target_stock_id"].map(normalize_security_code_text)
     summary["_list_date"] = pd.to_datetime(summary["date"], errors="coerce")
     summary["_end_date"] = pd.to_datetime(summary["end_date"], errors="coerce")
@@ -11021,7 +11443,28 @@ def get_all_call_warrants_live(cached_warrants=None):
         365,
     )
     cutoff = today - pd.Timedelta(days=lookback_days)
-    call_mask = summary["type"].astype(str).str.contains("認購", na=False)
+    type_text = summary["type"].astype(str)
+    put_type_mask = type_text.str.contains(
+        "認售|熊",
+        regex=True,
+        na=False,
+    )
+    call_type_mask = (
+        type_text.str.contains(
+            "認購|購|牛證",
+            regex=True,
+            na=False,
+        )
+        & ~put_type_mask
+    )
+    call_name_codes = {
+        code
+        for code, candidates in info_name_candidates.items()
+        if any("購" in str(candidate.get("name", "")) for candidate in candidates)
+    }
+    call_mask = (
+        call_type_mask | summary["stock_id"].isin(call_name_codes)
+    ) & ~put_type_mask
     relevant_mask = (
         summary["_list_date"].notna()
         & summary["_end_date"].notna()
@@ -11029,6 +11472,16 @@ def get_all_call_warrants_live(cached_warrants=None):
         & (summary["_end_date"] >= cutoff)
     )
     summary = summary[call_mask & relevant_mask].copy()
+    lifecycle_count_by_code = (
+        summary.assign(
+            _lifecycle_key=summary["_list_date"].astype(str)
+            + "|"
+            + summary["_end_date"].astype(str)
+        )
+        .groupby("stock_id")["_lifecycle_key"]
+        .nunique()
+        .to_dict()
+    )
     # target_stock_id 必須保留在去重鍵中；同區間若 FinMind 有衝突列，後面再用身分分數選正確者。
     summary = summary.sort_values(["stock_id", "_list_date", "_end_date", "target_stock_id"]).drop_duplicates(
         ["stock_id", "target_stock_id", "_list_date", "_end_date"],
@@ -11039,12 +11492,12 @@ def get_all_call_warrants_live(cached_warrants=None):
     active_codes = set()
     identity_override_count = 0
     name_guard_count = 0
-    invalid_underlying_skipped_count = 0
+    pending_underlying_count = 0
 
     for code, summary_underlying, list_ts, end_ts in summary[
         ["stock_id", "target_stock_id", "_list_date", "_end_date"]
     ].itertuples(index=False, name=None):
-        code = normalize_security_code_text(code)
+        code = _normalize_warrant_code_for_identity(code)
         summary_underlying = normalize_security_code_text(summary_underlying)
         if not code or not summary_underlying or pd.isna(list_ts) or pd.isna(end_ts):
             continue
@@ -11060,6 +11513,7 @@ def get_all_call_warrants_live(cached_warrants=None):
             cached_warrant_index,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
             enforce_underlying_match=False,
+            code_lifecycle_count=lifecycle_count_by_code.get(code, 0),
         )
         final_underlying, final_underlying_name, identity_source = reconcile_underlying_identity(
             provisional_name,
@@ -11074,7 +11528,9 @@ def get_all_call_warrants_live(cached_warrants=None):
 
         # 最後一道防線：標的股必須存在於已排除權證代號後的股票主檔。
         # 若 Summary 把另一檔權證代號放進 target_stock_id，嘗試以權證名稱修正；
-        # 仍無法得到有效標的時直接略過，禁止錯號進入快取、Sheet 與圖片。
+        # 仍無法得到有效標的時保留 Summary 原值並標記待確認；禁止因股票主檔
+        # 暫時缺資料而讓整檔權證從名稱字典與日期區間清單消失。
+        underlying_pending = False
         if (
             final_underlying in warrant_security_codes
             or final_underlying not in stock_code_to_name
@@ -11096,8 +11552,13 @@ def get_all_call_warrants_live(cached_warrants=None):
                 identity_source = "invalid_target_override"
                 identity_override_count += 1
             else:
-                invalid_underlying_skipped_count += 1
-                continue
+                final_underlying = summary_underlying
+                final_underlying_name = str(
+                    stock_code_to_name.get(summary_underlying, "")
+                ).strip()
+                identity_source = "summary_pending"
+                underlying_pending = True
+                pending_underlying_count += 1
 
         # 以更正後標的再挑一次名稱；可處理 Summary 錯標但權證名稱正確的情況。
         final_name, final_name_source = select_warrant_name_for_interval(
@@ -11108,6 +11569,7 @@ def get_all_call_warrants_live(cached_warrants=None):
             info_name_candidates,
             cached_warrant_index,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
+            code_lifecycle_count=lifecycle_count_by_code.get(code, 0),
         )
         if final_name_source.startswith("code_only"):
             name_guard_count += 1
@@ -11120,6 +11582,9 @@ def get_all_call_warrants_live(cached_warrants=None):
             final_underlying_name,
             resolver=_CURRENT_UNDERLYING_RESOLVER,
             code_to_name=stock_code_to_name,
+            authoritative_name=_is_authoritative_warrant_name_source(
+                final_name_source
+            ),
         )
         if guarded_final_name != final_name:
             name_guard_count += 1
@@ -11132,28 +11597,54 @@ def get_all_call_warrants_live(cached_warrants=None):
             "標的名稱": final_underlying_name,
             "上市日": list_date,
             "最後交易日": end_date,
+            "標的狀態": "待確認" if underlying_pending else "已確認",
             "_名稱來源": final_name_source or name_source,
             "_標的來源": identity_source,
+            "_標的待確認": underlying_pending,
         })
 
     warrants = dedupe_warrant_interval_records(warrants, resolver=_CURRENT_UNDERLYING_RESOLVER)
     today_dt = datetime.today()
-    unresolved_active_records = [
+    unresolved_records = [
         rec
         for rec in warrants
-        if parse_date(rec.get("上市日", "")) <= today_dt
-        <= parse_date(rec.get("最後交易日", ""))
-        and _normalize_warrant_code_for_identity(rec.get("名稱", ""))
+        if _normalize_warrant_code_for_identity(rec.get("名稱", ""))
         == _normalize_warrant_code_for_identity(rec.get("代號", ""))
     ]
+    lifecycle_keys_by_code = defaultdict(set)
+    for rec in list(cached_warrants or []) + list(warrants or []):
+        code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
+        start_dt = parse_date(rec.get("上市日", ""))
+        end_dt = parse_date(rec.get("最後交易日", ""))
+        # 舊版 legacy ("", "") 不是一個生命週期，不得阻擋 ISIN 回補。
+        if not code or not start_dt or not end_dt:
+            continue
+        lifecycle_keys_by_code[code].add((
+            start_dt.strftime("%Y/%m/%d"),
+            end_dt.strftime("%Y/%m/%d"),
+        ))
+    official_recovery_records = []
+    for rec in unresolved_records:
+        code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
+        start_dt = parse_date(rec.get("上市日", ""))
+        end_dt = parse_date(rec.get("最後交易日", ""))
+        is_active = bool(
+            start_dt
+            and end_dt
+            and start_dt <= today_dt <= end_dt
+        )
+        # ISIN 是現行清單；到期區間只有在完整快取顯示該代號從未重用時才可
+        # 安全採用。已重用代號的歷史名稱只准由日期化 FinMind／長期字典補回。
+        if is_active or len(lifecycle_keys_by_code.get(code, set())) == 1:
+            official_recovery_records.append(rec)
     isin_name_recovered_count = 0
     _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = {}
-    if unresolved_active_records:
+    if official_recovery_records:
         _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = (
             fetch_current_official_isin_warrant_names()
         )
-        for rec in unresolved_active_records:
-            code = normalize_security_code_text(rec.get("代號", ""))
+        for rec in official_recovery_records:
+            code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
             official_name = str(
                 _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE.get(code, "")
             ).strip()
@@ -11170,41 +11661,45 @@ def get_all_call_warrants_live(cached_warrants=None):
                     preferred_code_counts=preferred_underlying_counts,
                 )
             )
-            if (
-                not recovered_underlying
-                or recovered_underlying in warrant_security_codes
-                or recovered_underlying not in stock_code_to_name
-            ):
-                continue
-
-            recovered_underlying_name = str(
-                stock_code_to_name.get(
-                    recovered_underlying,
-                    recovered_underlying_name,
-                )
-            ).strip()
             guarded_name = safe_warrant_name_for_identity(
                 code,
                 official_name,
-                recovered_underlying,
-                recovered_underlying_name,
+                rec.get("標的股", ""),
+                rec.get("標的名稱", ""),
                 resolver=_CURRENT_UNDERLYING_RESOLVER,
                 code_to_name=stock_code_to_name,
+                authoritative_name=True,
             )
             if _normalize_warrant_code_for_identity(guarded_name) == code:
                 continue
 
-            if recovered_underlying != normalize_security_code_text(
-                rec.get("標的股", "")
-            ):
-                identity_override_count += 1
             rec["名稱"] = guarded_name
-            rec["標的股"] = recovered_underlying
-            rec["標的名稱"] = recovered_underlying_name
             rec["_名稱來源"] = "twse_isin_fallback"
-            rec["_標的來源"] = recovered_source
+            if (
+                recovered_underlying
+                and recovered_underlying not in warrant_security_codes
+                and recovered_underlying in stock_code_to_name
+            ):
+                recovered_underlying_name = str(
+                    stock_code_to_name.get(
+                        recovered_underlying,
+                        recovered_underlying_name,
+                    )
+                ).strip()
+                if recovered_underlying != normalize_security_code_text(
+                    rec.get("標的股", "")
+                ):
+                    identity_override_count += 1
+                rec["標的股"] = recovered_underlying
+                rec["標的名稱"] = recovered_underlying_name
+                rec["_標的來源"] = recovered_source
+                rec["_標的待確認"] = False
+                rec["標的狀態"] = "已確認"
             isin_name_recovered_count += 1
 
+    pending_underlying_count = sum(
+        1 for rec in warrants if bool(rec.get("_標的待確認"))
+    )
     unresolved_active_name_count = sum(
         1
         for rec in warrants
@@ -11219,7 +11714,7 @@ def get_all_call_warrants_live(cached_warrants=None):
         rec.pop("_名稱來源", None)
         rec.pop("_標的來源", None)
         if parse_date(rec.get("上市日", "")) <= today_dt <= parse_date(rec.get("最後交易日", "")):
-            active_codes.add(normalize_security_code_text(rec.get("代號", "")))
+            active_codes.add(_normalize_warrant_code_for_identity(rec.get("代號", "")))
 
     LIVE_WARRANT_SNAPSHOT_READY = bool(warrants)
     CURRENT_LIVE_WARRANT_CODES = active_codes
@@ -11227,7 +11722,7 @@ def get_all_call_warrants_live(cached_warrants=None):
         f"  ✅ FinMind 認購權證日期區間紀錄：{len(warrants):,} 筆｜"
         f"今日有效代號：{len(active_codes):,} 支｜"
         f"標的交叉更正：{identity_override_count:,} 筆｜"
-        f"無法確認標的略過：{invalid_underlying_skipped_count:,} 筆｜"
+        f"標的待確認但保留：{pending_underlying_count:,} 筆｜"
         f"權證名稱防錯降級：{name_guard_count:,} 筆｜"
         f"ISIN名稱補回：{isin_name_recovered_count:,} 筆｜"
         f"有效權證仍缺名稱：{unresolved_active_name_count:,} 筆"
@@ -11251,18 +11746,21 @@ def get_all_call_warrants():
         print(f"  ⚠️ FinMind 權證清單更新失敗：{type(exc).__name__}: {exc}")
 
     if warrants:
-        _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in warrants]
-        save_warrants_cache(warrants)
-        return warrants
+        merged_warrants = save_warrants_cache(warrants) or warrants
+        _CURRENT_WARRANT_INTERVAL_RECORDS = [
+            dict(rec) for rec in merged_warrants
+        ]
+        _reset_warrant_lookup_cache(_CURRENT_WARRANT_INTERVAL_RECORDS)
+        return merged_warrants
 
     if cached_warrants:
         _CURRENT_WARRANT_INTERVAL_RECORDS = [dict(rec) for rec in cached_warrants]
         LIVE_WARRANT_SNAPSHOT_READY = False
         today = datetime.today()
         CURRENT_LIVE_WARRANT_CODES = {
-            str(w.get("代號", "")).strip().upper()
+            _normalize_warrant_code_for_identity(w.get("代號", ""))
             for w in cached_warrants
-            if str(w.get("代號", "")).strip()
+            if _normalize_warrant_code_for_identity(w.get("代號", ""))
             and (not parse_date(w.get("上市日", "")) or parse_date(w.get("上市日", "")) <= today)
             and (not parse_date(w.get("最後交易日", "")) or parse_date(w.get("最後交易日", "")) >= today)
         }
@@ -11385,11 +11883,14 @@ def _event_warrant_identity_for_date(item, trade_date):
     唯一指向另一標的，將整筆移到正確標的，而不是讓它混入原標的的權證清單。
     無法證實名稱與標的一致時保留代號與交易數字，但名稱降級為代號。
     """
-    warrant_code = normalize_security_code_text(item.get("warrant_code", ""))
+    warrant_code = _normalize_warrant_code_for_identity(
+        item.get("warrant_code", "")
+    )
     warrant_name = str(item.get("warrant_name", "") or "").strip()
     underlying_code = normalize_security_code_text(item.get("underlying_code", ""))
     underlying_name = str(item.get("underlying_name", "") or "").strip()
     changed = False
+    dated_identity_authoritative = False
 
     if warrant_code and _CURRENT_WARRANT_INTERVAL_RECORDS:
         dated_meta = _warrant_lookup(
@@ -11397,6 +11898,7 @@ def _event_warrant_identity_for_date(item, trade_date):
             trade_date,
         ).get(warrant_code)
         if isinstance(dated_meta, dict):
+            dated_identity_authoritative = True
             meta_name = str(dated_meta.get("名稱", "") or "").strip()
             meta_underlying = normalize_security_code_text(
                 dated_meta.get("標的股", "")
@@ -11457,6 +11959,7 @@ def _event_warrant_identity_for_date(item, trade_date):
         underlying_name,
         resolver=_CURRENT_UNDERLYING_RESOLVER,
         code_to_name=_CURRENT_STOCK_CODE_TO_NAME,
+        authoritative_name=dated_identity_authoritative,
     )
     if guarded_warrant_name != warrant_name:
         warrant_name = guarded_warrant_name
@@ -11520,7 +12023,7 @@ def normalize_warrant_code_for_unique(warrant_code):
     用於新制金額強度分類與 FIFO 扣減的權證代號正規化。
 
     """
-    return str(warrant_code or "").strip()
+    return _normalize_warrant_code_for_identity(warrant_code)
 
 
 def make_broker_warrant_key(broker_code, warrant_code):
@@ -11773,7 +12276,10 @@ def get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
     後續由 simulate_group_outcomes_fifo() 將每一筆賣出依事件時間 FIFO 分配，
     避免同一筆賣出被不同事件重複使用。
     """
-    key = (str(broker_code).strip(), str(warrant_code).strip())
+    key = (
+        str(broker_code).strip(),
+        _normalize_warrant_code_for_identity(warrant_code),
+    )
 
     if key in _GROUP_OUTCOME_SALE_ROWS_CACHE:
         return _GROUP_OUTCOME_SALE_ROWS_CACHE[key]
@@ -14928,7 +15434,9 @@ def build_top15_position_detail_and_consensus_rows(
             "事件類型": str(lot.get("事件類型", "")).strip(),
             "事件日": normalize_date_str(lot.get("事件日", "")),
             "買進日": normalize_date_str(lot.get("買進日", "")),
-            "權證代號": str(lot.get("權證代號", "")).strip(),
+            "權證代號": _normalize_warrant_code_for_identity(
+                lot.get("權證代號", "")
+            ),
             "權證名稱": str(lot.get("權證名稱", "")).strip(),
             "原始股數": round(original_qty, 0),
             "原始成本": round(original_cost, 0),
@@ -15047,7 +15555,9 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         price_status = str(row.get("價格狀態", "")).strip()
         valuation_price_source = str(row.get("估值價格來源", "")).strip()
         event_code = str(row.get("事件", "")).strip()
-        warrant_code = str(row.get("權證代號", "")).strip()
+        warrant_code = _normalize_warrant_code_for_identity(
+            row.get("權證代號", "")
+        )
         warrant_name = str(row.get("權證名稱", "")).strip()
         latest_price_date = str(row.get("最新價格日期", "")).strip()
         fifo_status = str(row.get("FIFO完整狀態", "OK")).strip() or "OK"
@@ -20043,7 +20553,9 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
                     "分點": str(broker_label).strip(),
                     "分點名稱": str(broker_name).strip(),
                     "券商代號": str(broker_code).strip(),
-                    "權證代號": str(warrant_code).strip(),
+                    "權證代號": _normalize_warrant_code_for_identity(
+                        warrant_code
+                    ),
                     "權證名稱": str(warrant_name).strip(),
                     "標的股": underlying_norm,
                     "標的名稱": str(underlying_name).strip(),
@@ -20915,7 +21427,11 @@ def find_broker_codes_moneydj(warrants):
                     hits[label] = (name or FALLBACK.get(label, (label, canonical))[0], canonical)
         return hits
 
-    sample = list(warrants or [])[:300]
+    # merged warrants 包含完整歷史生命週期，不能直接取排序後前 300 筆；
+    # 那會幾乎全是最舊已下市權證。分點探索只抽目標日仍有效的代號。
+    sample = list(
+        _warrant_lookup(warrants, target_date).values()
+    )[:300]
     if sample:
         with ThreadPoolExecutor(max_workers=min(40, len(sample))) as executor:
             futures = [executor.submit(scan_one, warrant) for warrant in sample]
@@ -20985,7 +21501,9 @@ def _moneydj_scan_candidates(
     MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
 
     def scan_one(warrant):
-        code = str(warrant.get("代號", "")).strip()
+        code = _normalize_warrant_code_for_identity(
+            warrant.get("代號", "")
+        )
         rows, ok = api4_get_with_status(code, start_s, end_s)
         found = []
         latest_date = None
@@ -21075,6 +21593,7 @@ def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
         broker_name,
         broker_code,
     ) = candidate[:7]
+    warrant_code = _normalize_warrant_code_for_identity(warrant_code)
     api_broker_code = (
         str(candidate[7]).strip()
         if len(candidate) >= 8 and str(candidate[7]).strip()
@@ -21130,7 +21649,9 @@ def _moneydj_items_to_history_df(items):
             continue
         for rec in df.to_dict("records"):
             rows.append({
-                "權證代號": item.get("warrant_code", ""),
+                "權證代號": _normalize_warrant_code_for_identity(
+                    item.get("warrant_code", "")
+                ),
                 "權證名稱": item.get("warrant_name", ""),
                 "標的股": item.get("underlying_code", ""),
                 "標的名稱": item.get("underlying_name", ""),
@@ -21348,7 +21869,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
         target_rows = baseline[baseline_dates == _MONEYDJ_TARGET_DATE]
         existing_target_pairs = {
             (
-                str(row.get("權證代號", "")).strip(),
+                _normalize_warrant_code_for_identity(
+                    row.get("權證代號", "")
+                ),
                 normalize_broker_code_for_compare(row.get("券商代號", "")),
             )
             for row in target_rows.to_dict("records")
@@ -21367,7 +21890,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     old = baseline.copy()
     if not old.empty and "日期" in old.columns:
         old["日期"] = old["日期"].map(normalize_date_str)
-        old_warrant_codes = old["權證代號"].astype(str).str.strip()
+        old_warrant_codes = old["權證代號"].map(
+            _normalize_warrant_code_for_identity
+        )
         old_broker_codes = old["券商代號"].map(normalize_broker_code_for_compare)
         preserve_missing_mask = pd.Series(False, index=old.index)
         if missing_target_pairs:
@@ -21394,6 +21919,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     if combined is None:
         combined = pd.DataFrame()
     if not combined.empty:
+        combined["權證代號"] = combined["權證代號"].map(
+            _normalize_warrant_code_for_identity
+        )
         for col in ["買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額"]:
             combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype("int64")
         combined["日期"] = combined["日期"].map(normalize_date_str)
