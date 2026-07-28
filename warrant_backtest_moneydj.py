@@ -30,7 +30,7 @@ E：單日累積買進金額 >= 1000萬
 依賴：pip install requests pandas openpyxl pyarrow
 """
 
-import json, re, time, os, math, unicodedata
+import json, re, time, os, math, sys, unicodedata
 import threading
 from bisect import bisect_right
 from collections import Counter, defaultdict
@@ -46,6 +46,13 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+
+
+for _console_stream in (sys.stdout, sys.stderr):
+    try:
+        _console_stream.reconfigure(line_buffering=True, write_through=True)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 os.environ.setdefault("TZ", "Asia/Taipei")
@@ -7337,6 +7344,83 @@ def _insert_rows_below_header(ws, rows):
         return False
 
 
+def repair_legacy_abcde_scope_shift(ws, title, values):
+    """
+    修復舊版 ABCDE 列在新增「資料範圍」欄後整列左移一格的資料。
+
+    舊列的第一格會是「A-基礎買超」～「E-超大額布局」，而目前表頭第一格
+    已是「資料範圍」。這種列不能只補 A 欄，必須把整列右移一格，否則分點、
+    標的股、事件日與後續金額欄位都會永久錯位。
+    """
+    if safe_worksheet_title(title) not in AMOUNT_CLASS_SHEET_NAMES:
+        return values, 0
+    if not values or _find_simple_header_row(values) != 0:
+        return values, 0
+
+    headers = [str(header).strip() for header in values[0]]
+    while headers and headers[-1] == "":
+        headers.pop()
+    required = {"資料範圍", "事件類型", "標的股", "事件日"}
+    if not required.issubset(headers) or headers.index("資料範圍") != 0:
+        return values, 0
+
+    n_cols = len(headers)
+    event_type_idx = headers.index("事件類型")
+    stock_idx = headers.index("標的股")
+    valid_scopes = {"全分點", "精選五分點", GSHEET_LEGACY_SCOPE_LABEL}
+    event_pattern = re.compile(r"^[A-E](?:[-_：:]|$)")
+    repaired_values = [list(values[0])]
+    updates = []
+    repaired_count = 0
+    last_col = get_column_letter(n_cols)
+
+    for sheet_row_no, raw_row in enumerate(values[1:], start=2):
+        row = list(raw_row)
+        padded = row[:n_cols] + [""] * max(n_cols - len(row), 0)
+        scope_text = str(
+            strip_gsheet_text_prefix(padded[0] if padded else "")
+        ).strip()
+        current_event = str(
+            strip_gsheet_text_prefix(
+                padded[event_type_idx] if event_type_idx < len(padded) else ""
+            )
+        ).strip()
+        legacy_event_date = (
+            padded[stock_idx] if stock_idx < len(padded) else ""
+        )
+
+        is_legacy_shift = bool(
+            scope_text not in valid_scopes
+            and event_pattern.match(scope_text)
+            and not event_pattern.match(current_event)
+            and _parse_result_record_date(legacy_event_date) is not None
+        )
+        if is_legacy_shift:
+            padded = (["全分點"] + row)[:n_cols]
+            padded += [""] * max(n_cols - len(padded), 0)
+            updates.append({
+                "range": f"A{sheet_row_no}:{last_col}{sheet_row_no}",
+                "values": [padded],
+            })
+            repaired_count += 1
+
+        repaired_values.append(padded)
+
+    if updates:
+        gsheet_values_batch_update(
+            ws,
+            updates,
+            f"修復 ABCDE 舊版欄位位移 {safe_worksheet_title(title)}",
+            chunk_size=1000,
+        )
+        print(
+            f"  🩹 Google Sheet ABCDE 舊列位移已修復："
+            f"{safe_worksheet_title(title)}｜{repaired_count:,} 列"
+        )
+
+    return repaired_values, repaired_count
+
+
 def sort_abcde_worksheet_rows(ws, title, values=None):
     """
     以 Google Sheets sortRange 在伺服器端排序 ABCDE，不重寫整張資料。
@@ -7348,6 +7432,11 @@ def sort_abcde_worksheet_rows(ws, title, values=None):
         return True
 
     values = values or _worksheet_values_with_formulas(ws)
+    values, _legacy_shift_repaired = repair_legacy_abcde_scope_shift(
+        ws,
+        title,
+        values,
+    )
     if not values or _find_simple_header_row(values) != 0:
         return False
 
@@ -7570,6 +7659,11 @@ def replace_daily_date_rows_in_worksheet(
     date_col = prepared["date_col"]
 
     existing_values = _worksheet_values_with_formulas(ws)
+    existing_values, _legacy_shift_repaired = repair_legacy_abcde_scope_shift(
+        ws,
+        title,
+        existing_values,
+    )
     existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
         ws,
         title,
@@ -8009,6 +8103,11 @@ def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=No
 
     incoming_headers, incoming_records = prepared
     existing_values = _worksheet_values_with_formulas(ws)
+    existing_values, _legacy_shift_repaired = repair_legacy_abcde_scope_shift(
+        ws,
+        title,
+        existing_values,
+    )
     existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
         ws, title, existing_values
     )
@@ -8772,10 +8871,30 @@ def _merge_warrant_cache_dataframes(old_df, new_df):
         ):
             combined["名稱"] = rec.get("名稱", "") or previous.get("名稱", "")
 
-        for field in ("標的股", "標的名稱", "標的狀態"):
-            new_value = str(rec.get(field, "") or "").strip()
-            if new_value:
-                combined[field] = new_value
+        previous_status = str(
+            combined.get("標的狀態", "") or ""
+        ).strip()
+        new_status = str(rec.get("標的狀態", "") or "").strip()
+        preserve_confirmed_identity = bool(
+            previous_status == "已確認"
+            and new_status == "待確認"
+        )
+
+        # 「已確認」是一整組標的身分，不只是一個狀態字串。暫時性來源缺漏
+        # 不得用待確認的代號／名稱覆蓋既有已確認身分，避免形成
+        # 「錯誤標的股＋已確認狀態」的不一致快取。
+        if not preserve_confirmed_identity:
+            for field in ("標的股", "標的名稱"):
+                new_value = str(rec.get(field, "") or "").strip()
+                if new_value:
+                    combined[field] = new_value
+
+        # 只允許空白／待確認升級為已確認；禁止已確認降級為待確認。
+        if new_status == "已確認" or not previous_status:
+            combined["標的狀態"] = (
+                new_status
+                or combined.get("標的狀態", "")
+            )
         merged[key] = combined
 
     out = pd.DataFrame(merged.values(), columns=_WARRANT_CACHE_COLUMNS)
@@ -9742,6 +9861,51 @@ def _cached_warrant_name_candidates(cached_warrants, code, list_date, end_date):
     return out
 
 
+def _cached_exact_warrant_identity(
+    cached_warrants,
+    code,
+    list_date,
+    end_date,
+    stock_code_to_name,
+    warrant_security_codes,
+):
+    """只沿用同一生命週期且仍存在股票主檔的已確認標的身分。"""
+    code = _normalize_warrant_code_for_identity(code)
+    list_dt = parse_date(list_date)
+    end_dt = parse_date(end_date)
+    if not code or not list_dt or not end_dt:
+        return None
+
+    candidates = (
+        cached_warrants.get(code, ())
+        if isinstance(cached_warrants, dict)
+        else cached_warrants or ()
+    )
+    for record in candidates:
+        if _normalize_warrant_code_for_identity(record.get("代號", "")) != code:
+            continue
+        rec_list = parse_date(record.get("上市日", ""))
+        rec_end = parse_date(record.get("最後交易日", ""))
+        rec_underlying = normalize_security_code_text(record.get("標的股", ""))
+        rec_status = str(record.get("標的狀態", "") or "").strip()
+        if not (
+            rec_list
+            and rec_end
+            and rec_list.date() == list_dt.date()
+            and rec_end.date() == end_dt.date()
+            and rec_underlying
+            and rec_underlying not in warrant_security_codes
+            and rec_underlying in stock_code_to_name
+            and rec_status == "已確認"
+        ):
+            continue
+        return {
+            "標的股": rec_underlying,
+            "標的名稱": stock_code_to_name[rec_underlying],
+        }
+    return None
+
+
 def _is_authoritative_warrant_name_source(source):
     source = str(source or "").strip().lower()
     return (
@@ -9750,6 +9914,8 @@ def _is_authoritative_warrant_name_source(source):
             "finmind_info_interval",
             "finmind_info_single_lifecycle",
         }
+        or source.startswith("twse_openapi")
+        or source.startswith("tpex_openapi")
         or source.startswith("twse_isin")
         or source.startswith("warrant_names_cache")
         or source == "cache_exact"
@@ -11300,6 +11466,257 @@ def _warrant_summary_identity_preferences(summary_df):
     return warrant_codes, preferred_counts
 
 
+def _official_metadata_value(row, field_names):
+    """只按已驗證欄名讀取 TWSE／TPEx 官方 OpenAPI，欄位異動不得猜值。"""
+    if not isinstance(row, dict):
+        return ""
+    normalized = {
+        _normalize_market_header(key): value
+        for key, value in row.items()
+    }
+    for field_name in field_names:
+        key = _normalize_market_header(field_name)
+        if key in normalized:
+            return normalized[key]
+    return ""
+
+
+def fetch_current_official_warrant_metadata():
+    """
+    取得現行權證的官方「代號、名稱、標的」資料。
+
+    TWSE 的基本資料彙總表可補上市特殊 ETF／牛證名稱；TPEx 發行基本資料
+    另提供明確標的代號。此資料只修復目前仍有效的區間，不跨生命週期套用。
+    """
+    print("  🔎 特殊權證補正：查詢 TWSE／TPEx 官方權證基本資料...")
+    source_specs = (
+        (
+            "上市",
+            "https://openapi.twse.com.tw/v1/opendata/t187ap37_L",
+            "twse_openapi",
+        ),
+        (
+            "上櫃",
+            "https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue",
+            "tpex_openapi",
+        ),
+    )
+
+    def fetch_one(market_name, url, source):
+        response = get_thread_session().get(
+            url,
+            headers={"User-Agent": MONEYDJ_HEADERS["User-Agent"]},
+            timeout=(5, 90),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise RuntimeError("官方權證 API 回傳格式不是 list")
+        if not payload or not isinstance(payload[0], dict):
+            raise RuntimeError("官方權證 API 沒有可驗證的欄位")
+
+        available_fields = {
+            _normalize_market_header(key)
+            for key in payload[0].keys()
+        }
+        required_fields = (
+            {
+                _normalize_market_header(key)
+                for key in (
+                    "Code",
+                    "Name",
+                    "ListedDate",
+                    "ExpiryDate",
+                    "UnderlyingStockCode",
+                    "UnderlyingStock",
+                    "Type",
+                )
+            }
+            if source == "tpex_openapi"
+            else {
+                _normalize_market_header(key)
+                for key in (
+                    "權證代號",
+                    "權證簡稱",
+                    "權證類型",
+                    "最後交易日",
+                    "標的證券/指數",
+                )
+            }
+        )
+        missing_fields = required_fields - available_fields
+        if missing_fields:
+            raise RuntimeError(
+                "官方權證 API 欄位異動，停止套用："
+                + "、".join(sorted(missing_fields))
+            )
+
+        records = []
+        for row in payload:
+            if source == "tpex_openapi":
+                code = _official_metadata_value(row, ("Code",))
+                name = _official_metadata_value(row, ("Name",))
+                warrant_type = _official_metadata_value(row, ("Type",))
+                underlying_code = _official_metadata_value(
+                    row,
+                    ("UnderlyingStockCode",),
+                )
+                underlying_name = _official_metadata_value(
+                    row,
+                    ("UnderlyingStock",),
+                )
+                list_date = _official_metadata_value(row, ("ListedDate",))
+                end_date = _official_metadata_value(row, ("ExpiryDate",))
+            else:
+                # t187ap37_L 的第 2、3、4、8、12 欄依序為：
+                # 權證代號、權證簡稱、權證種類、最後交易日、標的證券／指數。
+                code = _official_metadata_value(
+                    row,
+                    ("權證代號", "證券代號"),
+                )
+                name = _official_metadata_value(
+                    row,
+                    ("權證簡稱", "權證名稱", "證券名稱"),
+                )
+                warrant_type = _official_metadata_value(
+                    row,
+                    ("權證種類", "權證類型"),
+                )
+                underlying_code = _official_metadata_value(
+                    row,
+                    ("標的代號", "標的證券代號"),
+                )
+                underlying_name = _official_metadata_value(
+                    row,
+                    ("標的證券/指數", "標的證券／指數", "標的名稱"),
+                )
+                list_date = _official_metadata_value(
+                    row,
+                    ("上市日期", "上市日"),
+                )
+                end_date = _official_metadata_value(
+                    row,
+                    ("最後交易日",),
+                )
+
+            code = _normalize_warrant_code_for_identity(code)
+            name = str(name or "").strip()
+            warrant_type = str(warrant_type or "").strip()
+            if (
+                not code
+                or not name
+                or "售" in name
+                or "認售" in warrant_type
+                or "熊" in warrant_type
+            ):
+                continue
+            records.append({
+                "代號": code,
+                "名稱": name,
+                "標的股": normalize_security_code_text(underlying_code),
+                "標的名稱": str(underlying_name or "").strip(),
+                "上市日": _normalize_market_payload_date(list_date),
+                "最後交易日": _normalize_market_payload_date(end_date),
+                "來源": source,
+            })
+        return market_name, records
+
+    metadata_by_code = defaultdict(list)
+    success_markets = 0
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(fetch_one, *spec): spec[0]
+            for spec in source_specs
+        }
+        for future in as_completed(futures):
+            market_name = futures[future]
+            try:
+                _market_name, records = future.result()
+                success_markets += 1
+                print(
+                    f"    ✅ {market_name}官方權證基本資料："
+                    f"{len(records):,} 筆認購候選"
+                )
+                for record in records:
+                    code = record["代號"]
+                    if record not in metadata_by_code[code]:
+                        metadata_by_code[code].append(record)
+            except Exception as exc:
+                print(
+                    f"  ⚠️ {market_name}官方權證基本資料備援失敗："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    print(
+        f"  {'✅' if success_markets == 2 else '⚠️'} 官方權證基本資料備援："
+        f"市場 {success_markets}/2｜取得 {len(metadata_by_code):,} 個現行認購代號"
+    )
+    return dict(metadata_by_code)
+
+
+def _select_official_warrant_metadata(records, list_date="", end_date=""):
+    """同代號有多筆時，以日期區間與資料完整度選出目前生命週期。"""
+    list_dt = parse_date(list_date)
+    end_dt = parse_date(end_date)
+    ranked = []
+    for idx, record in enumerate(records or []):
+        rec_list = parse_date(record.get("上市日", ""))
+        rec_end = parse_date(record.get("最後交易日", ""))
+        score = 0
+        if _is_complete_warrant_name(record.get("代號", ""), record.get("名稱", "")):
+            score += 100
+        if record.get("標的股"):
+            score += 50
+        if record.get("標的名稱"):
+            score += 30
+        if list_dt and rec_list and list_dt.date() == rec_list.date():
+            score += 1000
+        if end_dt and rec_end and end_dt.date() == rec_end.date():
+            score += 800
+        if record.get("來源") == "tpex_openapi":
+            score += 10
+        ranked.append((
+            score,
+            normalize_date_str(record.get("上市日", "")),
+            normalize_date_str(record.get("最後交易日", "")),
+            idx,
+            record,
+        ))
+    return max(
+        ranked,
+        key=lambda item: item[:4],
+        default=(0, "", "", 0, None),
+    )[4]
+
+
+def _official_metadata_underlying_code(metadata, stock_code_to_name, resolver):
+    """將官方標的代號或官方標的全名解析回股票主檔代號。"""
+    explicit_code = normalize_security_code_text(
+        (metadata or {}).get("標的股", "")
+    )
+    if explicit_code and explicit_code in stock_code_to_name:
+        return explicit_code
+
+    underlying_name = str((metadata or {}).get("標的名稱", "")).strip()
+    normalized_name = normalize_stock_name_text(underlying_name)
+    exact_code = normalize_security_code_text(
+        _CURRENT_STOCK_NAME_TO_CODE.get(normalized_name, "")
+    )
+    if exact_code and exact_code in stock_code_to_name:
+        return exact_code
+
+    resolved = resolve_underlying_from_warrant_name(
+        underlying_name,
+        resolver,
+    )
+    resolved_code = normalize_security_code_text(
+        (resolved or {}).get("stock_code", "")
+    )
+    if resolved_code and resolved_code in stock_code_to_name:
+        return resolved_code
+    return ""
+
+
 def fetch_current_official_isin_warrant_names():
     """
     從 TWSE ISIN 上市／上櫃清單取得目前權證代號→名稱。
@@ -11552,13 +11969,27 @@ def get_all_call_warrants_live(cached_warrants=None):
                 identity_source = "invalid_target_override"
                 identity_override_count += 1
             else:
-                final_underlying = summary_underlying
-                final_underlying_name = str(
-                    stock_code_to_name.get(summary_underlying, "")
-                ).strip()
-                identity_source = "summary_pending"
-                underlying_pending = True
-                pending_underlying_count += 1
+                cached_identity = _cached_exact_warrant_identity(
+                    cached_warrant_index,
+                    code,
+                    list_date,
+                    end_date,
+                    stock_code_to_name,
+                    warrant_security_codes,
+                )
+                if cached_identity:
+                    final_underlying = cached_identity["標的股"]
+                    final_underlying_name = cached_identity["標的名稱"]
+                    identity_source = "cache_exact_verified"
+                    identity_override_count += 1
+                else:
+                    final_underlying = summary_underlying
+                    final_underlying_name = str(
+                        stock_code_to_name.get(summary_underlying, "")
+                    ).strip()
+                    identity_source = "summary_pending"
+                    underlying_pending = True
+                    pending_underlying_count += 1
 
         # 以更正後標的再挑一次名稱；可處理 Summary 錯標但權證名稱正確的情況。
         final_name, final_name_source = select_warrant_name_for_interval(
@@ -11605,12 +12036,6 @@ def get_all_call_warrants_live(cached_warrants=None):
 
     warrants = dedupe_warrant_interval_records(warrants, resolver=_CURRENT_UNDERLYING_RESOLVER)
     today_dt = datetime.today()
-    unresolved_records = [
-        rec
-        for rec in warrants
-        if _normalize_warrant_code_for_identity(rec.get("名稱", ""))
-        == _normalize_warrant_code_for_identity(rec.get("代號", ""))
-    ]
     lifecycle_keys_by_code = defaultdict(set)
     for rec in list(cached_warrants or []) + list(warrants or []):
         code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
@@ -11624,7 +12049,7 @@ def get_all_call_warrants_live(cached_warrants=None):
             end_dt.strftime("%Y/%m/%d"),
         ))
     official_recovery_records = []
-    for rec in unresolved_records:
+    for rec in warrants:
         code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
         start_dt = parse_date(rec.get("上市日", ""))
         end_dt = parse_date(rec.get("最後交易日", ""))
@@ -11633,17 +12058,96 @@ def get_all_call_warrants_live(cached_warrants=None):
             and end_dt
             and start_dt <= today_dt <= end_dt
         )
-        # ISIN 是現行清單；到期區間只有在完整快取顯示該代號從未重用時才可
-        # 安全採用。已重用代號的歷史名稱只准由日期化 FinMind／長期字典補回。
-        if is_active or len(lifecycle_keys_by_code.get(code, set())) == 1:
+        name_missing = bool(
+            _normalize_warrant_code_for_identity(rec.get("名稱", ""))
+            == code
+        )
+        if is_active and (name_missing or bool(rec.get("_標的待確認"))):
             official_recovery_records.append(rec)
+
+    openapi_name_recovered_count = 0
+    openapi_underlying_recovered_count = 0
+    official_metadata_by_code = {}
+    if official_recovery_records:
+        official_metadata_by_code = fetch_current_official_warrant_metadata()
+        for rec in official_recovery_records:
+            code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
+            metadata = _select_official_warrant_metadata(
+                official_metadata_by_code.get(code, ()),
+                rec.get("上市日", ""),
+                rec.get("最後交易日", ""),
+            )
+            if not metadata:
+                continue
+
+            official_name = str(metadata.get("名稱", "")).strip()
+            if (
+                official_name
+                and _normalize_warrant_code_for_identity(rec.get("名稱", ""))
+                == code
+            ):
+                rec["名稱"] = safe_warrant_name_for_identity(
+                    code,
+                    official_name,
+                    rec.get("標的股", ""),
+                    rec.get("標的名稱", ""),
+                    resolver=_CURRENT_UNDERLYING_RESOLVER,
+                    code_to_name=stock_code_to_name,
+                    authoritative_name=True,
+                )
+                rec["_名稱來源"] = str(
+                    metadata.get("來源", "official_openapi")
+                )
+                openapi_name_recovered_count += 1
+
+            official_underlying = _official_metadata_underlying_code(
+                metadata,
+                stock_code_to_name,
+                _CURRENT_UNDERLYING_RESOLVER,
+            )
+            if (
+                official_underlying
+                and official_underlying not in warrant_security_codes
+                and official_underlying in stock_code_to_name
+            ):
+                old_underlying = normalize_security_code_text(
+                    rec.get("標的股", "")
+                )
+                rec["標的股"] = official_underlying
+                rec["標的名稱"] = stock_code_to_name[official_underlying]
+                rec["_標的來源"] = (
+                    f"{metadata.get('來源', 'official_openapi')}_underlying"
+                )
+                rec["_標的待確認"] = False
+                rec["標的狀態"] = "已確認"
+                if official_underlying != old_underlying:
+                    identity_override_count += 1
+                    openapi_underlying_recovered_count += 1
+
+    # ISIN 只補官方基本資料 API 仍缺的名稱。它沒有日期區間，因此到期區間
+    # 僅在完整快取證明代號從未重用時才可安全採用。
+    isin_recovery_records = []
+    for rec in warrants:
+        code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
+        if _normalize_warrant_code_for_identity(rec.get("名稱", "")) != code:
+            continue
+        start_dt = parse_date(rec.get("上市日", ""))
+        end_dt = parse_date(rec.get("最後交易日", ""))
+        is_active = bool(
+            start_dt
+            and end_dt
+            and start_dt <= today_dt <= end_dt
+        )
+        if is_active or len(lifecycle_keys_by_code.get(code, set())) == 1:
+            isin_recovery_records.append(rec)
+
     isin_name_recovered_count = 0
     _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = {}
-    if official_recovery_records:
+    if isin_recovery_records:
         _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE = (
             fetch_current_official_isin_warrant_names()
         )
-        for rec in official_recovery_records:
+        for rec in isin_recovery_records:
             code = _normalize_warrant_code_for_identity(rec.get("代號", ""))
             official_name = str(
                 _CURRENT_OFFICIAL_WARRANT_NAME_BY_CODE.get(code, "")
@@ -11724,6 +12228,8 @@ def get_all_call_warrants_live(cached_warrants=None):
         f"標的交叉更正：{identity_override_count:,} 筆｜"
         f"標的待確認但保留：{pending_underlying_count:,} 筆｜"
         f"權證名稱防錯降級：{name_guard_count:,} 筆｜"
+        f"官方API名稱補回：{openapi_name_recovered_count:,} 筆｜"
+        f"官方API標的修正：{openapi_underlying_recovered_count:,} 筆｜"
         f"ISIN名稱補回：{isin_name_recovered_count:,} 筆｜"
         f"有效權證仍缺名稱：{unresolved_active_name_count:,} 筆"
     )
