@@ -52,8 +52,9 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.0.1"
+PROGRAM_VERSION = "1.1.2"
 SCHEMA_VERSION = "ma-history-v1"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v2-stock-only-prefix-map"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -86,6 +87,9 @@ REQUEST_READ_TIMEOUT = float(os.getenv("FINMIND_READ_TIMEOUT", "180"))
 MAX_RETRIES = max(int(os.getenv("FINMIND_MAX_RETRIES", "4")), 1)
 RETRY_BASE_SECONDS = max(float(os.getenv("FINMIND_RETRY_BASE_SECONDS", "2")), 0.1)
 METADATA_CACHE_HOURS = max(float(os.getenv("FINMIND_METADATA_CACHE_HOURS", "12")), 0)
+IDENTITY_INDEX_CACHE_HOURS = max(
+    float(os.getenv("IDENTITY_INDEX_CACHE_HOURS", "168")), 0
+)
 PROGRESS_EVERY_DAYS = max(int(os.getenv("PROGRESS_EVERY_DAYS", "20")), 1)
 LOCAL_ERROR_CIRCUIT_BREAKER = max(
     int(os.getenv("LOCAL_ERROR_CIRCUIT_BREAKER", "5")), 2
@@ -333,8 +337,11 @@ def default_state() -> dict[str, Any]:
         "raw_rows_by_date": {},
         "compact_rows_by_date": {},
         "deduplicated_rows_by_date": {},
+        "invalid_numeric_rows_by_date": {},
         "failure_reasons": {},
         "availability_discovery_source": "",
+        "current_stage": "",
+        "stage_updated_at": "",
     }
 
 
@@ -353,7 +360,12 @@ def load_state() -> dict[str, Any]:
             print(f"⚠️ state.json 損壞，已移至 {damaged.name}：{exc}")
     for key in ("successful_dates", "failed_dates", "confirmed_empty_dates"):
         state[key] = sorted({iso_date(x) for x in state.get(key, []) if iso_date(x)})
-    for key in ("raw_rows_by_date", "compact_rows_by_date", "deduplicated_rows_by_date"):
+    for key in (
+        "raw_rows_by_date",
+        "compact_rows_by_date",
+        "deduplicated_rows_by_date",
+        "invalid_numeric_rows_by_date",
+    ):
         if not isinstance(state.get(key), dict):
             state[key] = {}
     if not isinstance(state.get("failure_reasons"), dict):
@@ -367,6 +379,12 @@ def save_state(state: dict[str, Any]) -> None:
     for key in ("successful_dates", "failed_dates", "confirmed_empty_dates"):
         state[key] = sorted(set(state.get(key, [])))
     atomic_write_json(state, STATE_PATH)
+
+
+def set_run_stage(state: dict[str, Any], stage: str) -> None:
+    state["current_stage"] = stage
+    state["stage_updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
 
 
 def get_session() -> Any:
@@ -442,6 +460,16 @@ def fetch_dataset(
     cache: bool = False,
     force: bool = False,
 ) -> pd.DataFrame:
+    started_at = time.perf_counter()
+    parameter_note = ""
+    if params:
+        interesting = [
+            f"{key}={value}"
+            for key, value in params.items()
+            if key in ("data_id", "start_date", "end_date") and value not in (None, "")
+        ]
+        if interesting:
+            parameter_note = f"（{', '.join(interesting)}）"
     cache_path = metadata_cache_path(dataset)
     if cache and cache_path.exists() and not force:
         age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
@@ -449,9 +477,15 @@ def fetch_dataset(
             try:
                 cached = read_parquet(cache_path)
                 if not cached.empty:
+                    print(
+                        f"  📦 {dataset}{parameter_note}：沿用 metadata 快取 "
+                        f"{len(cached):,} 筆｜{time.perf_counter() - started_at:.1f} 秒",
+                        flush=True,
+                    )
                     return cached
             except Exception:
                 pass
+    print(f"  ⏳ 下載 FinMind {dataset}{parameter_note}...", flush=True)
     query: dict[str, Any] = {"dataset": dataset}
     if params:
         query.update({key: value for key, value in params.items() if value not in (None, "")})
@@ -468,12 +502,21 @@ def fetch_dataset(
             raise RuntimeError("回傳空資料")
         if cache:
             atomic_write_parquet(frame, cache_path)
+        print(
+            f"  ✅ FinMind {dataset}{parameter_note}：{len(frame):,} 筆｜"
+            f"{time.perf_counter() - started_at:.1f} 秒",
+            flush=True,
+        )
         return frame
     except Exception:
         if cache and cache_path.exists():
             cached = read_parquet(cache_path)
             if not cached.empty:
-                print(f"  ⚠️ {dataset} 更新失敗，沿用既有中繼資料快取")
+                print(
+                    f"  ⚠️ {dataset} 更新失敗，沿用既有中繼資料快取 "
+                    f"{len(cached):,} 筆｜{time.perf_counter() - started_at:.1f} 秒",
+                    flush=True,
+                )
                 return cached
         raise
 
@@ -506,6 +549,8 @@ def discover_dataset_start_from_metadata() -> tuple[str, str]:
             for child in value:
                 yield from walk(child)
 
+    started_at = time.perf_counter()
+    print("  ⏳ 查詢 FinMind datalist 資料範圍...", flush=True)
     try:
         response = request_with_retries(
             FINMIND_DATALIST_URL,
@@ -530,12 +575,22 @@ def discover_dataset_start_from_metadata() -> tuple[str, str]:
                         if parsed:
                             candidates.append(parsed)
             if candidates:
+                print(
+                    f"  ✅ datalist 起始日：{min(candidates)}｜"
+                    f"{time.perf_counter() - started_at:.1f} 秒",
+                    flush=True,
+                )
                 return min(candidates), "FinMind datalist metadata"
     except Exception as exc:
         print(
             f"  ⚠️ datalist 未提供可用起始日，改用官方資料集範圍："
             f"{type(exc).__name__}: {exc}"
         )
+    print(
+        f"  ℹ️ datalist 無可用起始日，採官方備援 {FINMIND_DOCUMENTED_START}｜"
+        f"{time.perf_counter() - started_at:.1f} 秒",
+        flush=True,
+    )
     return FINMIND_DOCUMENTED_START, "FinMind 官方資料集範圍備援"
 
 
@@ -672,14 +727,65 @@ def build_stock_master(frame: pd.DataFrame) -> dict[str, str]:
     return dict(zip(work["stock_id"], work["stock_name"]))
 
 
-def stock_alias_resolver(stock_master: dict[str, str]) -> list[tuple[str, str, str, bool]]:
+class StockAliasResolver:
+    """以最長前綴字典取代逐筆線性掃描，並快取重複權證名稱。"""
+
+    def __init__(
+        self,
+        by_prefix: dict[str, tuple[str, str, bool]],
+        *,
+        memo_limit: int = 200_000,
+    ):
+        self.by_prefix = by_prefix
+        self.prefix_lengths = sorted(
+            {len(prefix) for prefix in by_prefix}, reverse=True
+        )
+        self.memo: dict[str, Optional[tuple[str, str, int, bool]]] = {}
+        self.memo_limit = max(int(memo_limit), 1)
+
+    def resolve(self, warrant_name: str) -> Optional[tuple[str, str, int, bool]]:
+        name = normalize_name(warrant_name)
+        if not name:
+            return None
+        if name in self.memo:
+            return self.memo[name]
+
+        if not name.startswith(
+            ("台灣50正", "臺灣50正", "台灣50反", "臺灣50反")
+        ) and name.startswith(
+            ("台灣50", "臺灣50", "元大台灣50", "元大臺灣50")
+        ):
+            result: Optional[tuple[str, str, int, bool]] = (
+                "0050",
+                "元大台灣50",
+                4,
+                True,
+            )
+        else:
+            result = None
+            for length in self.prefix_lengths:
+                if length > len(name):
+                    continue
+                matched = self.by_prefix.get(name[:length])
+                if matched is not None:
+                    code, stock_name, exact = matched
+                    result = code, stock_name, length, exact
+                    break
+
+        if len(self.memo) >= self.memo_limit:
+            self.memo.clear()
+        self.memo[name] = result
+        return result
+
+
+def stock_alias_resolver(stock_master: dict[str, str]) -> StockAliasResolver:
     exact_names = {normalize_name(name) for name in stock_master.values() if normalize_name(name)}
     suffixes = (
         "半導體", "科技", "電子", "光電", "精密", "材料", "生技", "醫療",
         "資訊", "電腦", "通信", "通訊", "電機", "機械", "工業", "實業",
         "企業", "國際", "控股", "投控", "建設", "營造", "食品", "鋼鐵",
     )
-    candidates: dict[tuple[str, str], tuple[str, str, str, bool]] = {}
+    candidates: dict[str, list[tuple[str, str, bool]]] = defaultdict(list)
     for code, name in stock_master.items():
         normalized = normalize_name(name)
         aliases = {normalized}
@@ -693,27 +799,28 @@ def stock_alias_resolver(stock_master: dict[str, str]) -> list[tuple[str, str, s
                 aliases.add(prefix)
         for alias in aliases:
             if len(alias) >= 2 and alias not in {"台灣", "臺灣"}:
-                record = (alias, code, name, alias == normalized)
-                candidates[(alias, code)] = record
-    candidates[("台灣50", "0050")] = ("台灣50", "0050", "元大台灣50", True)
-    candidates[("臺灣50", "0050")] = ("臺灣50", "0050", "元大台灣50", True)
-    return sorted(
-        candidates.values(), key=lambda item: (len(item[0]), item[3]), reverse=True
-    )
+                candidates[alias].append((code, name, alias == normalized))
+    candidates["台灣50"].append(("0050", "元大台灣50", True))
+    candidates["臺灣50"].append(("0050", "元大台灣50", True))
+
+    by_prefix: dict[str, tuple[str, str, bool]] = {}
+    for prefix, records in candidates.items():
+        # 同前綴優先正式全名，再優先較完整名稱；最後以代號穩定排序。
+        by_prefix[prefix] = sorted(
+            records,
+            key=lambda item: (
+                -int(item[2]),
+                -len(normalize_name(item[1])),
+                item[0],
+            ),
+        )[0]
+    return StockAliasResolver(by_prefix)
 
 
 def resolve_underlying_from_name(
-    warrant_name: str, resolver: list[tuple[str, str, str, bool]]
+    warrant_name: str, resolver: StockAliasResolver
 ) -> Optional[tuple[str, str, int, bool]]:
-    name = normalize_name(warrant_name)
-    if name.startswith(("台灣50正", "臺灣50正", "台灣50反", "臺灣50反")):
-        pass
-    elif name.startswith(("台灣50", "臺灣50", "元大台灣50", "元大臺灣50")):
-        return "0050", "元大台灣50", 4, True
-    for prefix, code, stock_name, exact in resolver:
-        if name.startswith(prefix):
-            return code, stock_name, len(prefix), exact
-    return None
+    return resolver.resolve(warrant_name)
 
 
 @dataclass(frozen=True)
@@ -763,7 +870,114 @@ class WarrantIdentityIndex:
         return chosen
 
 
+def identity_index_cache_path() -> Path:
+    return METADATA_DIR / "warrant_identity_intervals.parquet"
+
+
+def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
+    path = identity_index_cache_path()
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    age_hours = max((time.time() - path.stat().st_mtime) / 3600, 0)
+    if age_hours > IDENTITY_INDEX_CACHE_HOURS:
+        print(
+            f"  ℹ️ 權證身分索引快取已逾 {IDENTITY_INDEX_CACHE_HOURS:g} 小時，重新建立。",
+            flush=True,
+        )
+        return None
+
+    source_paths = [
+        metadata_cache_path(dataset)
+        for dataset in (
+            "TaiwanStockInfoWithWarrant",
+            "TaiwanStockInfoWithWarrantSummary",
+            "TaiwanStockInfo",
+        )
+    ]
+    newer_sources = [
+        source.name
+        for source in source_paths
+        if source.exists() and source.stat().st_mtime > path.stat().st_mtime
+    ]
+    if newer_sources:
+        print(
+            f"  ℹ️ 權證身分來源快取較新，重新建立索引：{newer_sources}",
+            flush=True,
+        )
+        return None
+
+    required_columns = {
+        "code",
+        "name",
+        "target_code",
+        "target_name",
+        "list_date",
+        "end_date",
+        "status",
+        "reason",
+        "_identity_schema_version",
+    }
+    try:
+        frame = read_parquet(path)
+        missing = required_columns - set(frame.columns)
+        versions = set(
+            frame["_identity_schema_version"].dropna().astype(str).unique()
+        ) if "_identity_schema_version" in frame.columns else set()
+        if frame.empty or missing or versions != {IDENTITY_INDEX_SCHEMA_VERSION}:
+            print(
+                f"  ℹ️ 權證身分索引快取 schema 不相容，重新建立："
+                f"missing={sorted(missing)} versions={sorted(versions)}",
+                flush=True,
+            )
+            return None
+        records: list[WarrantIdentity] = []
+        for values in frame[
+            [
+                "code",
+                "name",
+                "target_code",
+                "target_name",
+                "list_date",
+                "end_date",
+                "status",
+                "reason",
+            ]
+        ].itertuples(index=False, name=None):
+            record = WarrantIdentity(
+                *[
+                    "" if value is None or pd.isna(value) else str(value)
+                    for value in values
+                ]
+            )
+            if (
+                not record.code
+                or not iso_date(record.list_date)
+                or not iso_date(record.end_date)
+            ):
+                raise ValueError("索引包含無效代號或日期")
+            records.append(record)
+        print(
+            f"  📦 沿用權證日期化身分索引：{len(records):,} 筆｜"
+            f"快取年齡 {age_hours:.1f} 小時",
+            flush=True,
+        )
+        return WarrantIdentityIndex(records)
+    except Exception as exc:
+        print(
+            f"  ⚠️ 權證身分索引快取讀取失敗，重新建立："
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None
+
+
 def build_warrant_identity_index() -> WarrantIdentityIndex:
+    cached_index = load_cached_warrant_identity_index()
+    if cached_index is not None:
+        return cached_index
+
+    started_at = time.perf_counter()
+    print("【初始化】建立日期化權證身分索引...", flush=True)
     info = fetch_dataset("TaiwanStockInfoWithWarrant", cache=True)
     summary = fetch_dataset("TaiwanStockInfoWithWarrantSummary", cache=True)
     stock_info = fetch_dataset("TaiwanStockInfo", cache=True)
@@ -772,27 +986,55 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
     if missing:
         raise RuntimeError(f"權證標的歷史對照缺少欄位：{sorted(missing)}")
 
-    stock_parts = [stock_info]
-    if {"stock_id", "stock_name"}.issubset(info.columns):
-        stock_parts.append(info)
-    stock_master = build_stock_master(pd.concat(stock_parts, ignore_index=True))
+    # 標的 resolver 只能由真正股票／ETF 主檔建立；TaiwanStockInfoWithWarrant
+    # 含大量權證本身，混入後會令別名數暴增並造成近似平方級掃描。
+    stock_master = build_stock_master(stock_info)
     resolver = stock_alias_resolver(stock_master)
+    print(
+        f"  ✅ 標的主檔 {len(stock_master):,} 檔｜"
+        f"前綴索引 {len(resolver.by_prefix):,} 個",
+        flush=True,
+    )
     names_by_code: dict[str, list[str]] = defaultdict(list)
     if {"stock_id", "stock_name"}.issubset(info.columns):
-        for code, name in info[["stock_id", "stock_name"]].itertuples(
-            index=False, name=None
+        print(
+            f"  ⏳ 建立權證名稱對照：來源 {len(info):,} 筆...",
+            flush=True,
+        )
+        for row_number, (code, name) in enumerate(
+            info[["stock_id", "stock_name"]].itertuples(index=False, name=None),
+            start=1,
         ):
             code_text = normalize_code(code)
             name_text = str(name or "").strip()
             if code_text and name_text and name_text not in names_by_code[code_text]:
                 names_by_code[code_text].append(name_text)
+            if row_number % 50_000 == 0:
+                print(
+                    f"    權證名稱對照進度：{row_number:,}/{len(info):,}",
+                    flush=True,
+                )
+        print(
+            f"  ✅ 權證名稱對照完成：{len(names_by_code):,} 個代號",
+            flush=True,
+        )
 
     records: list[WarrantIdentity] = []
     work = summary.copy().fillna("")
     work = work[work["type"].astype(str).str.contains("認購", na=False)]
-    for raw_code, raw_target, raw_listed, raw_ended in work[
-        ["stock_id", "target_stock_id", "date", "end_date"]
-    ].itertuples(index=False, name=None):
+    total_intervals = len(work)
+    print(f"  ⏳ 配對認購權證歷史區間：{total_intervals:,} 筆...", flush=True)
+    for row_number, (
+        raw_code,
+        raw_target,
+        raw_listed,
+        raw_ended,
+    ) in enumerate(
+        work[["stock_id", "target_stock_id", "date", "end_date"]].itertuples(
+            index=False, name=None
+        ),
+        start=1,
+    ):
         code = normalize_code(raw_code)
         target = normalize_code(raw_target)
         listed = iso_date(raw_listed)
@@ -836,6 +1078,13 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
                 code, name, target, target_name, listed, ended, status, reason
             )
         )
+        if row_number % 5_000 == 0:
+            print(
+                f"    身分配對進度：{row_number:,}/{total_intervals:,}｜"
+                f"已建立 {len(records):,} 筆｜"
+                f"{time.perf_counter() - started_at:.1f} 秒",
+                flush=True,
+            )
 
     deduplicated: dict[tuple[str, str, str], WarrantIdentity] = {}
     for record in records:
@@ -852,7 +1101,14 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
         ):
             deduplicated[key] = record
     frame = pd.DataFrame([record.__dict__ for record in deduplicated.values()])
-    atomic_write_parquet(frame, METADATA_DIR / "warrant_identity_intervals.parquet")
+    frame["_identity_schema_version"] = IDENTITY_INDEX_SCHEMA_VERSION
+    frame["_built_at"] = datetime.now().isoformat(timespec="seconds")
+    atomic_write_parquet(frame, identity_index_cache_path())
+    print(
+        f"  ✅ 日期化權證身分索引完成：{len(deduplicated):,} 筆｜"
+        f"{time.perf_counter() - started_at:.1f} 秒",
+        flush=True,
+    )
     return WarrantIdentityIndex(deduplicated.values())
 
 
@@ -861,7 +1117,7 @@ def normalize_warrant_day(
     day: str,
     identity_index: WarrantIdentityIndex,
     broker_map: dict[str, tuple[str, str]],
-) -> tuple[pd.DataFrame, int]:
+) -> tuple[pd.DataFrame, int, int]:
     broker_by_code: dict[str, tuple[str, str, str]] = {}
     for label, (name, code) in broker_map.items():
         broker_by_code[normalize_broker_code(code)] = (label, name, code)
@@ -872,13 +1128,29 @@ def normalize_warrant_day(
     )
     work = work[work["securities_trader_id"].isin(broker_by_code)].copy()
     if work.empty:
-        return pd.DataFrame(columns=COMPACT_COLUMNS), 0
+        return pd.DataFrame(columns=COMPACT_COLUMNS), 0, 0
 
     work["price"] = pd.to_numeric(work["price"], errors="coerce")
     work["buy"] = pd.to_numeric(work["buy"], errors="coerce")
     work["sell"] = pd.to_numeric(work["sell"], errors="coerce")
-    if work[["price", "buy", "sell"]].isna().any().any():
-        raise RuntimeError("價格／買進／賣出欄位含無法解析的數值")
+    invalid_numeric = (
+        work[["price", "buy", "sell"]].isna().any(axis=1)
+        | (work["price"] <= 0)
+        | (work["buy"] < 0)
+        | (work["sell"] < 0)
+        | work["buy"].mod(1).ne(0)
+        | work["sell"].mod(1).ne(0)
+    )
+    invalid_count = int(invalid_numeric.sum())
+    if invalid_count:
+        print(
+            f"  ⚠️ {day} 略過 {invalid_count:,} 列無效價量資料；"
+            "其餘有效列繼續處理。",
+            flush=True,
+        )
+        work = work[~invalid_numeric].copy()
+    if work.empty:
+        raise RuntimeError("目標分點價量列全部無效，無法建立可信 compact")
     work["buy"] = work["buy"].astype("int64")
     work["sell"] = work["sell"].astype("int64")
     work = work[(work["buy"] != 0) | (work["sell"] != 0)].copy()
@@ -953,7 +1225,7 @@ def normalize_warrant_day(
     result = result.sort_values(
         ["日期", "分點", "標的股", "權證代號"]
     ).reset_index(drop=True)
-    return result, before_dedup
+    return result, before_dedup, invalid_count
 
 
 def raw_path(day: str) -> Path:
@@ -1030,6 +1302,7 @@ def audit_successful_files(state: dict[str, Any]) -> list[str]:
             state["deduplicated_rows_by_date"][day] = compact_rows
         else:
             invalid.append(day)
+            state["invalid_numeric_rows_by_date"].pop(day, None)
             state["failure_reasons"][day] = f"啟動檢查失敗：{reason}"
             print(f"  ⚠️ {day} 成功檔案損壞，排入重新下載：{reason}")
     state["successful_dates"] = sorted(valid)
@@ -1139,6 +1412,7 @@ def download_and_compact_history(
         state["raw_rows_by_date"].pop(day, None)
         state["compact_rows_by_date"].pop(day, None)
         state["deduplicated_rows_by_date"].pop(day, None)
+        state["invalid_numeric_rows_by_date"].pop(day, None)
     save_state(state)
 
     completed = set(state["successful_dates"]) | set(state["confirmed_empty_dates"])
@@ -1160,6 +1434,7 @@ def download_and_compact_history(
     last_local_error_signature = ""
     consecutive_local_errors = 0
     for day in queue:
+        state["invalid_numeric_rows_by_date"].pop(day, None)
         try:
             cached_raw = load_valid_raw_day(day)
             result = (
@@ -1179,7 +1454,7 @@ def download_and_compact_history(
                 # 下次直接重用；compact 驗證成功後才依 KEEP_RAW_DAILY 決定刪除。
                 if cached_raw is None:
                     atomic_write_parquet(raw, raw_path(day))
-                compact, pre_dedup_rows = normalize_warrant_day(
+                compact, pre_dedup_rows, invalid_numeric_rows = normalize_warrant_day(
                     raw, day, identity_index, broker_map
                 )
                 atomic_write_parquet(compact, compact_path(day))
@@ -1189,6 +1464,7 @@ def download_and_compact_history(
                 state["raw_rows_by_date"][day] = len(raw)
                 state["compact_rows_by_date"][day] = compact_rows
                 state["deduplicated_rows_by_date"][day] = compact_rows
+                state["invalid_numeric_rows_by_date"][day] = invalid_numeric_rows
                 mark_day_status(state, day, "ok")
                 if not KEEP_RAW_DAILY:
                     try:
@@ -1297,7 +1573,9 @@ def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
         if not lots or max_single < AMOUNT_THRESH:
             continue
         total_amount = sum(lot["金額"] for lot in lots)
-        total_quantity = sum(lot["股數"] for lot in lots)
+        net_buy_quantity = int(
+            pd.to_numeric(group["買超股數"], errors="coerce").fillna(0).sum()
+        )
         code, label = classify_amount_class(total_amount)
         if not code:
             continue
@@ -1313,7 +1591,7 @@ def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
                 "事件代碼": code,
                 "事件類型": f"{code}-{label}",
                 "單日累積買進金額": int(total_amount),
-                "買超股數": int(total_quantity),
+                "買超股數": net_buy_quantity,
                 "涵蓋權證數": len({lot["權證代號"] for lot in lots}),
                 "權證清單": "；".join(
                     f"{lot['權證代號']} {lot['權證名稱']}" for lot in lots
@@ -1666,6 +1944,20 @@ def find_lookback_start(
     return prior[max(len(prior) - trading_days, 0)] if prior else event_day
 
 
+def build_trading_calendar(
+    all_trading_dates: list[str],
+) -> tuple[list[str], dict[str, int]]:
+    """交易日曆只正規化與排序一次，供所有事件 O(1) 查位置。"""
+    calendar = sorted(
+        {
+            normalized
+            for value in all_trading_dates
+            if (normalized := iso_date(value))
+        }
+    )
+    return calendar, {day: index for index, day in enumerate(calendar)}
+
+
 def prepare_ma_table(price_frame: pd.DataFrame) -> pd.DataFrame:
     work = normalize_price_frame(
         price_frame,
@@ -1721,13 +2013,43 @@ def calculate_ma_values(
     ma_table: pd.DataFrame,
     event_day: str,
     tolerance: float = MA20_FLAT_TOLERANCE_PCT,
+    expected_trading_dates: Optional[list[str]] = None,
+    trading_calendar: Optional[tuple[list[str], dict[str, int]]] = None,
+    available_dates: Optional[set[str]] = None,
+    ma_rows_by_date: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     if ma_table.empty:
         return missing_ma_values("無還原股價資料")
-    rows = ma_table[ma_table["date"] == event_day]
-    if rows.empty:
-        return missing_ma_values("事件日沒有還原收盤價；禁止使用事件日後價格補值")
-    row = rows.iloc[-1]
+    if trading_calendar is None and expected_trading_dates is not None:
+        trading_calendar = build_trading_calendar(expected_trading_dates)
+    if trading_calendar is not None:
+        calendar, calendar_index = trading_calendar
+        event_index = calendar_index.get(event_day)
+        if event_index is None:
+            return missing_ma_values("事件日不在市場交易日曆中")
+        if event_index < 24:
+            return missing_ma_values("事件日前不足25個市場交易日，無法計算完整均線")
+        required_dates = calendar[event_index - 24 : event_index + 1]
+        if available_dates is None:
+            available_dates = set(ma_table["date"].dropna().astype(str))
+        missing_dates = [
+            value for value in required_dates if value not in available_dates
+        ]
+        if missing_dates:
+            preview = "、".join(missing_dates[:5])
+            suffix = "…" if len(missing_dates) > 5 else ""
+            return missing_ma_values(
+                f"事件日前25個市場交易日股價有缺口：{preview}{suffix}"
+            )
+    if ma_rows_by_date is None:
+        rows = ma_table[ma_table["date"] == event_day]
+        if rows.empty:
+            return missing_ma_values("事件日沒有還原收盤價；禁止使用事件日後價格補值")
+        row: Any = rows.iloc[-1]
+    else:
+        row = ma_rows_by_date.get(event_day)
+        if row is None:
+            return missing_ma_values("事件日沒有還原收盤價；禁止使用事件日後價格補值")
     required = [
         "close",
         "ma5",
@@ -1801,6 +2123,7 @@ def attach_ma_to_events(
     all_trading_dates: list[str],
     statistics_day: str = "",
 ) -> list[dict[str, Any]]:
+    trading_calendar = build_trading_calendar(all_trading_dates)
     by_stock: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for event in events:
         by_stock[normalize_code(event["標的股"])].append(event)
@@ -1824,8 +2147,22 @@ def attach_ma_to_events(
             stock_id, start_day, latest_day, all_trading_dates
         )
         ma_table = prepare_ma_table(price_frame)
+        ma_rows_by_date = (
+            ma_table.set_index("date", drop=False).to_dict(orient="index")
+            if not ma_table.empty
+            else {}
+        )
+        available_dates = set(ma_rows_by_date)
         for event in stock_events:
-            event.update(calculate_ma_values(ma_table, event["事件日"]))
+            event.update(
+                calculate_ma_values(
+                    ma_table,
+                    event["事件日"],
+                    trading_calendar=trading_calendar,
+                    available_dates=available_dates,
+                    ma_rows_by_date=ma_rows_by_date,
+                )
+            )
         if index % 20 == 0 or index == len(by_stock):
             print(f"  📈 還原股價／均線進度：{index:,}/{len(by_stock):,} 個標的")
     return events
@@ -1877,6 +2214,38 @@ EVENT_OUTPUT_COLUMNS = [
 ]
 
 
+def validate_event_outcomes(frame: pd.DataFrame) -> None:
+    """驗證狀態與出清欄位彼此一致，避免用恆真式掩蓋資料錯誤。"""
+    if frame.empty:
+        return
+    allowed_statuses = {"已出清", "未出清", "減碼"}
+    statuses = set(frame["目前狀態"].dropna().astype(str))
+    if frame["目前狀態"].isna().any() or not statuses.issubset(allowed_statuses):
+        invalid = statuses - allowed_statuses
+        if frame["目前狀態"].isna().any():
+            invalid.add("<空值>")
+        raise AssertionError(f"目前狀態不合法：{sorted(invalid)}")
+
+    closed = frame[frame["目前狀態"] == "已出清"]
+    if (
+        closed["出清日"].fillna("").astype(str).str.strip().eq("").any()
+        or pd.to_numeric(closed["出清報酬%"], errors="coerce").isna().any()
+        or pd.to_numeric(closed["持有天數"], errors="coerce").isna().any()
+    ):
+        raise AssertionError("已出清事件缺少出清日、出清報酬或持有天數")
+
+    open_events = frame[frame["目前狀態"].isin(["未出清", "減碼"])]
+    if (
+        open_events["出清日"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .ne("")
+        .any()
+    ):
+        raise AssertionError("未出清或減碼事件不應填入出清日")
+
+
 def events_to_frame(events: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for event in events:
@@ -1889,10 +2258,7 @@ def events_to_frame(events: list[dict[str, Any]]) -> pd.DataFrame:
     invalid_codes = set(frame["事件代碼"]) - set("ABCDE")
     if invalid_codes:
         raise AssertionError(f"事件代碼不在 A~E：{invalid_codes}")
-    if len(frame) != int((frame["目前狀態"] == "已出清").sum()) + int(
-        (frame["目前狀態"] != "已出清").sum()
-    ):
-        raise AssertionError("事件總數不等於已出清加未出清")
+    validate_event_outcomes(frame)
     valid_ma = frame["均線資料狀態"] == "OK"
     calculated_codes = (
         frame.loc[valid_ma, ["高於MA5", "高於MA10", "高於MA20"]]
@@ -2144,6 +2510,27 @@ def build_integrity_report(
         if not events.empty
         else 0
     )
+    missing_reason_summary = "-"
+    if missing_ma:
+        reasons = (
+            events.loc[
+                events["均線資料狀態"] == "Missing",
+                "均線錯誤原因",
+            ]
+            .fillna("未提供原因")
+            .astype(str)
+            .str.strip()
+            .replace("", "未提供原因")
+            .str.split("：", n=1)
+            .str[0]
+            .value_counts()
+        )
+        top_reasons = reasons.head(10)
+        parts = [f"{reason}：{int(count):,}" for reason, count in top_reasons.items()]
+        remaining_count = int(reasons.iloc[10:].sum())
+        if remaining_count:
+            parts.append(f"其他原因：{remaining_count:,}")
+        missing_reason_summary = "；".join(parts)
     actual_first = min(successful, default="")
     actual_latest = max(successful, default="")
     complete = not failed and not unprocessed
@@ -2176,9 +2563,21 @@ def build_integrity_report(
             "去重複後列數",
             sum(int(v or 0) for v in state["deduplicated_rows_by_date"].values()),
         ),
+        (
+            "無效價量略過列數（已記錄成功日）",
+            sum(
+                int(v or 0)
+                for v in state["invalid_numeric_rows_by_date"].values()
+            ),
+        ),
+        (
+            "無效價量列數已記錄日數",
+            len(state["invalid_numeric_rows_by_date"]),
+        ),
         ("事件總數", len(events)),
         ("有完整均線事件數", complete_ma),
         ("均線Missing事件數", missing_ma),
+        ("均線Missing原因分布（前10類）", missing_reason_summary),
         ("已出清事件數", closed),
         ("未出清事件數", len(events) - closed),
         ("最早事件日", events["事件日"].min() if not events.empty else ""),
@@ -2287,9 +2686,7 @@ def validate_final_results(
             raise AssertionError("事件唯一ID不得重複")
         if not set(events["事件代碼"]).issubset(set("ABCDE")):
             raise AssertionError("每筆事件只能屬於 A~E 其中一類")
-        closed = int((events["目前狀態"] == "已出清").sum())
-        if len(events) != closed + int((events["目前狀態"] != "已出清").sum()):
-            raise AssertionError("事件總數不等於已出清加未出清")
+        validate_event_outcomes(events)
     for frame, label in (
         (condition_stats, "均線條件"),
         (position_stats, "MA位置"),
@@ -2304,9 +2701,113 @@ def validate_final_results(
             raise AssertionError(f"{label}統計勝敗平手驗證失敗")
         if (frame["事件總數"] != frame["已出清筆數"] + frame["未出清筆數"]).any():
             raise AssertionError(f"{label}統計事件數驗證失敗")
-    valid_ids = set(events["事件唯一ID"]) if not events.empty else set()
-    if len(valid_ids) != len(events):
-        raise AssertionError("統計事件無法一對一追溯至事件明細")
+
+    valid = events[events["均線資料狀態"] == "OK"].copy()
+    brokers = sorted(set(events["分點"].dropna())) if not events.empty else []
+    event_codes = ["ALL", "A", "B", "C", "D", "E"]
+    condition_predicates = dict(CONDITION_SPECS)
+    valid_by_broker = {
+        broker: valid[valid["分點"] == broker]
+        for broker in brokers
+    }
+    condition_groups = {
+        (broker, condition): broker_group[predicate(broker_group)]
+        for broker, broker_group in valid_by_broker.items()
+        for condition, predicate in CONDITION_SPECS
+    }
+    position_groups = {
+        (broker, position): broker_group[
+            broker_group["MA位置代碼"] == position
+        ]
+        for broker, broker_group in valid_by_broker.items()
+        for position in MA_POSITION_NAMES
+    }
+
+    expected_condition_keys = {
+        (broker, condition, code)
+        for broker in brokers
+        for condition in condition_predicates
+        for code in event_codes
+    }
+    actual_condition_keys = [
+        (row["分點"], row["均線條件"], row["事件代碼"])
+        for _, row in condition_stats.iterrows()
+    ]
+    if (
+        len(actual_condition_keys) != len(set(actual_condition_keys))
+        or set(actual_condition_keys) != expected_condition_keys
+    ):
+        raise AssertionError("均線條件統計的分點／條件／事件代碼索引不完整或重複")
+
+    expected_position_keys = {
+        (broker, position, code)
+        for broker in brokers
+        for position in MA_POSITION_NAMES
+        for code in event_codes
+    }
+    actual_position_keys = [
+        (row["分點"], row["MA位置代碼"], row["事件代碼"])
+        for _, row in position_stats.iterrows()
+    ]
+    if (
+        len(actual_position_keys) != len(set(actual_position_keys))
+        or set(actual_position_keys) != expected_position_keys
+    ):
+        raise AssertionError("MA位置統計的分點／位置／事件代碼索引不完整或重複")
+
+    def values_match(actual: Any, expected: Any) -> bool:
+        if pd.isna(actual) and pd.isna(expected):
+            return True
+        if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+            return math.isclose(float(actual), float(expected), rel_tol=1e-12, abs_tol=1e-9)
+        return actual == expected
+
+    def verify_row(
+        actual: pd.Series,
+        source_group: pd.DataFrame,
+        *,
+        label: str,
+        condition: str = "",
+        position_code: str = "",
+    ) -> None:
+        expected = summarize_event_group(
+            source_group,
+            broker=actual["分點"],
+            condition=condition,
+            position_code=position_code,
+            event_code=actual["事件代碼"],
+        )
+        for column, expected_value in expected.items():
+            if column not in actual.index or not values_match(
+                actual[column], expected_value
+            ):
+                raise AssertionError(
+                    f"{label}統計無法追溯事件明細："
+                    f"{actual['分點']}／{condition or position_code}／"
+                    f"{actual['事件代碼']}／{column}"
+                )
+
+    for _, row in condition_stats.iterrows():
+        source = condition_groups[(row["分點"], row["均線條件"])]
+        if row["事件代碼"] != "ALL":
+            source = source[source["事件代碼"] == row["事件代碼"]]
+        verify_row(
+            row,
+            source,
+            label="均線條件",
+            condition=row["均線條件"],
+        )
+
+    for _, row in position_stats.iterrows():
+        source = position_groups[(row["分點"], row["MA位置代碼"])]
+        if row["事件代碼"] != "ALL":
+            source = source[source["事件代碼"] == row["事件代碼"]]
+        verify_row(
+            row,
+            source,
+            label="MA位置",
+            position_code=row["MA位置代碼"],
+        )
 
 
 def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
@@ -2329,6 +2830,24 @@ def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
 
 def run_self_tests() -> dict[str, str]:
     """不連網的小型測試；失敗時直接拋出 AssertionError。"""
+    resolver_test = stock_alias_resolver(
+        {
+            "1111": "台積",
+            "2330": "台積電",
+            "0050": "元大台灣50",
+        }
+    )
+    resolved_test = resolve_underlying_from_name("台積電測試購01", resolver_test)
+    assert resolved_test is not None and resolved_test[0] == "2330"
+    for sequence in range(5_000):
+        resolved = resolve_underlying_from_name(
+            f"台積電效能測試購{sequence}", resolver_test
+        )
+        assert resolved is not None and resolved[0] == "2330"
+    memo_size_after_first_pass = len(resolver_test.memo)
+    resolve_underlying_from_name("台積電測試購01", resolver_test)
+    assert len(resolver_test.memo) == memo_size_after_first_pass
+
     raw_test = pd.DataFrame(
         [
             {
@@ -2344,6 +2863,15 @@ def run_self_tests() -> dict[str, str]:
                 "securities_trader": "測試分點",
                 "price": 11.0,
                 "buy": 50,
+                "sell": 0,
+                "securities_trader_id": "T001",
+                "stock_id": "W1",
+                "date": "2026-01-02",
+            },
+            {
+                "securities_trader": "測試分點",
+                "price": "壞值",
+                "buy": 999,
                 "sell": 0,
                 "securities_trader_id": "T001",
                 "stock_id": "W1",
@@ -2365,7 +2893,7 @@ def run_self_tests() -> dict[str, str]:
             )
         ]
     )
-    normalized_test, _ = normalize_warrant_day(
+    normalized_test, _, invalid_numeric_rows = normalize_warrant_day(
         raw_test,
         "2026-01-02",
         identity_test,
@@ -2374,6 +2902,7 @@ def run_self_tests() -> dict[str, str]:
     assert len(normalized_test) == 1
     assert normalized_test.iloc[0]["日期"] == "2026-01-02"
     assert int(normalized_test.iloc[0]["買進股數"]) == 150
+    assert invalid_numeric_rows == 1
 
     high = calculate_ma_values(make_test_ma_row(), "2026-01-30")
     assert high["MA位置代碼"] == "111"
@@ -2400,6 +2929,63 @@ def run_self_tests() -> dict[str, str]:
 
     missing = calculate_ma_values(pd.DataFrame(), "2026-01-30")
     assert missing["均線資料狀態"] == "Missing"
+
+    short_dates = [
+        value.strftime("%Y-%m-%d")
+        for value in pd.bdate_range("2026-01-01", periods=19)
+    ]
+    short_prices = pd.DataFrame(
+        {
+            "date": short_dates,
+            "stock_id": "2330",
+            "close": [100 + value for value in range(len(short_dates))],
+        }
+    )
+    short_ma = prepare_ma_table(short_prices)
+    short_result = calculate_ma_values(
+        short_ma,
+        short_dates[-1],
+        expected_trading_dates=short_dates,
+    )
+    assert short_result["均線資料狀態"] == "Missing"
+    assert "不足25個市場交易日" in short_result["均線錯誤原因"]
+
+    gap_dates = [
+        value.strftime("%Y-%m-%d")
+        for value in pd.bdate_range("2026-01-01", periods=30)
+    ]
+    missing_price_day = gap_dates[-10]
+    gap_prices = pd.DataFrame(
+        {
+            "date": [
+                value for value in gap_dates if value != missing_price_day
+            ],
+            "stock_id": "2330",
+            "close": [
+                100 + sequence
+                for sequence, value in enumerate(gap_dates)
+                if value != missing_price_day
+            ],
+        }
+    )
+    gap_ma = prepare_ma_table(gap_prices)
+    gap_result = calculate_ma_values(
+        gap_ma,
+        gap_dates[-1],
+        expected_trading_dates=gap_dates,
+    )
+    assert gap_result["均線資料狀態"] == "Missing"
+    assert missing_price_day in gap_result["均線錯誤原因"]
+    gap_calendar = build_trading_calendar(gap_dates)
+    gap_rows_by_date = gap_ma.set_index("date", drop=False).to_dict(orient="index")
+    optimized_gap_result = calculate_ma_values(
+        gap_ma,
+        gap_dates[-1],
+        trading_calendar=gap_calendar,
+        available_dates=set(gap_rows_by_date),
+        ma_rows_by_date=gap_rows_by_date,
+    )
+    assert optimized_gap_result == gap_result
 
     compact = pd.DataFrame(
         [
@@ -2431,11 +3017,11 @@ def run_self_tests() -> dict[str, str]:
                 "券商代號": "T001",
                 "日期": "2026-01-02",
                 "買進股數": 50,
-                "賣出股數": 0,
+                "賣出股數": 20,
                 "買進金額": 500_000,
-                "賣出金額": 0,
-                "買超股數": 50,
-                "買超金額": 500_000,
+                "賣出金額": 200_000,
+                "買超股數": 30,
+                "買超金額": 300_000,
                 "身分配對狀態": "Matched",
                 "身分配對錯誤原因": "",
             },
@@ -2445,6 +3031,7 @@ def run_self_tests() -> dict[str, str]:
     built = build_events_for_day(compact, "2026-01-02")
     assert len(built) == 1, "同券商＋標的＋日必須去重成一事件"
     assert built[0]["事件代碼"] == "B"
+    assert built[0]["買超股數"] == 130
     built_again = build_events_for_day(compact, "2026-01-02")
     assert [item["事件唯一ID"] for item in built] == [
         item["事件唯一ID"] for item in built_again
@@ -2487,6 +3074,19 @@ def run_self_tests() -> dict[str, str]:
         event_frame, condition_frame, position_frame
     )
     validate_final_results(event_frame, condition_frame, position_frame)
+    broken_condition_frame = condition_frame.copy()
+    broken_condition_frame.loc[0, "事件總數"] += 1
+    broken_condition_frame.loc[0, "未出清筆數"] += 1
+    try:
+        validate_final_results(
+            event_frame,
+            broken_condition_frame,
+            position_frame,
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("統計交叉檢核未抓到無法追溯事件明細的數值")
     assert len(condition_frame) == len(CONDITION_SPECS) * 6
     assert len(position_frame) == len(MA_POSITION_NAMES) * 6
     assert len(profile_frame) == 1
@@ -2528,17 +3128,23 @@ def run_self_tests() -> dict[str, str]:
     assert summary["勝筆數"] == 1 and summary["敗筆數"] == 1
     assert summary["平手筆數"] == 1
     return {
+        "標的前綴字典與名稱memo": "PASS",
         "FinMind日檔精簡與_date欄位": "PASS",
         "均線位置與排列": "PASS",
         "剛站上MA20": "PASS",
         "剛跌破MA10": "PASS",
         "不足歷史Missing": "PASS",
+        "真實19交易日均線Missing": "PASS",
+        "股價缺口均線Missing": "PASS",
+        "壞數值列隔離": "PASS",
         "事件去重複": "PASS",
         "ABCDE分類": "PASS",
+        "事件買超股數語意": "PASS",
         "FIFO已出清": "PASS",
         "FIFO未出清": "PASS",
         "勝率": "PASS",
         "平均與中位持有天數": "PASS",
+        "統計可追溯交叉檢核": "PASS",
         "完整統計管線": "PASS",
     }
 
@@ -2580,18 +3186,42 @@ def main() -> int:
     print(
         "FinMind 完整歷史權證分點均線勝率統計\n"
         f"程式版本：{PROGRAM_VERSION}｜schema：{SCHEMA_VERSION}\n"
-        f"快取目錄：{CACHE_ROOT}"
+        f"快取目錄：{CACHE_ROOT}",
+        flush=True,
     )
     state = load_state()
+    set_run_stage(state, "initialization")
+    initialization_started = time.perf_counter()
+    print("【初始化 1/4】檢查 state 與成功日期檔案...", flush=True)
     audit_successful_files(state)
+    print(
+        f"  ✅ state 檢查完成｜成功 {len(state['successful_dates']):,} 日｜"
+        f"失敗 {len(state['failed_dates']):,} 日｜"
+        f"{time.perf_counter() - initialization_started:.1f} 秒",
+        flush=True,
+    )
+    print("【初始化 2/4】探索 FinMind 預期交易日期...", flush=True)
     expected_dates = discover_expected_dates(state)
+    print(
+        f"  ✅ 預期日期 {len(expected_dates):,} 日｜"
+        f"{min(expected_dates, default='-')}～{max(expected_dates, default='-')}",
+        flush=True,
+    )
     if not FORCE_RECALCULATE_STATS:
+        print("【初始化 3/4】建立 26 分點券商代號對照...", flush=True)
         broker_map = build_broker_map()
         if len(broker_map) != len(TARGET_PATTERNS):
             raise RuntimeError(
                 f"目標分點對照不完整：{len(broker_map)}/{len(TARGET_PATTERNS)}"
             )
+        print(f"  ✅ 目標分點對照完成：{len(broker_map):,} 個", flush=True)
+        print("【初始化 4/4】載入或建立日期化權證身分索引...", flush=True)
         identity_index = build_warrant_identity_index()
+        print(
+            f"  ✅ 初始化全部完成｜{time.perf_counter() - initialization_started:.1f} 秒",
+            flush=True,
+        )
+        set_run_stage(state, "downloading")
         download_and_compact_history(
             state, expected_dates, identity_index, broker_map
         )
@@ -2599,6 +3229,7 @@ def main() -> int:
         raise RuntimeError(
             "FORCE_RECALCULATE_STATS=1，但本機沒有任何成功 compact_daily"
         )
+    set_run_stage(state, "statistics")
     (
         events,
         condition_stats,
@@ -2610,7 +3241,7 @@ def main() -> int:
         events, condition_stats, position_stats, profiles, integrity
     )
     state["last_statistics_time"] = datetime.now().isoformat(timespec="seconds")
-    save_state(state)
+    set_run_stage(state, "complete")
     print(
         "\n✅ 完成\n"
         f"  事件：{len(events):,}\n"
