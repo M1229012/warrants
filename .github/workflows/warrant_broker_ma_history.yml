@@ -37,8 +37,12 @@ jobs:
       MA_HISTORY_BASE_DIR: ${{ github.workspace }}
       MA_HISTORY_CACHE_DIR: ${{ github.workspace }}/warrant_cache/ma_history
       OUTPUT_DIR: ${{ github.workspace }}/output
-      # Actions Cache 容量有限；compact_daily 驗證成功後不長期保留全市場 raw。
+      # compact_daily 只保存可重新配對的交易事實，驗證成功後不保留全市場 raw。
       KEEP_RAW_DAILY: "0"
+      # 抽樣或全量身分未配對率超過此值即停止，禁止產生近乎空白的報表。
+      MAX_IDENTITY_UNMATCHED_PCT: "5"
+      # 身分索引明確採週更，避免與每日排程的 24 小時邊界互相抖動。
+      IDENTITY_INDEX_CACHE_HOURS: "168"
       FORCE_RECALCULATE_STATS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_recalculate_stats && '1' || '0' }}
       FORCE_REDOWNLOAD_DATES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_redownload_dates || '' }}
 
@@ -62,7 +66,7 @@ jobs:
         id: restore-history
         uses: actions/cache/restore@v6
         with:
-          path: warrant_cache/ma_history
+          path: ${{ env.MA_HISTORY_CACHE_DIR }}
           key: warrant-ma-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             warrant-ma-history-${{ runner.os }}-
@@ -85,8 +89,20 @@ jobs:
           status=$?
 
           if [[ "$status" -eq 124 || "$status" -eq 130 ]]; then
-            echo "程式已在 runner 硬性超時前優雅停止；下次會從 state.json 續跑。"
-            status=0
+            stage="$(
+              python -c "import json, os, pathlib; p=pathlib.Path(os.environ['MA_HISTORY_CACHE_DIR']) / 'state.json'; print(json.loads(p.read_text(encoding='utf-8')).get('current_stage', 'unknown') if p.exists() else 'unknown')" \
+                2>/dev/null || echo unknown
+            )"
+            echo "程式收到超時中止訊號；當時階段=$stage"
+
+            if [[ "$stage" == "downloading" || "$stage" == "complete" ]]; then
+              echo "已保存可安全續跑的逐日資料；下次會從 state.json 接續。"
+              status=0
+            elif [[ "$stage" == "statistics" ]]; then
+              echo "統計階段未完成，本次沒有完整報表；下載快取已保存，但 job 必須標記失敗。"
+            else
+              echo "初始化尚未完成，本次不得標記成功。"
+            fi
           fi
 
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
@@ -97,7 +113,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
-          path: warrant_cache/ma_history
+          path: ${{ env.MA_HISTORY_CACHE_DIR }}
           key: warrant-ma-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload Excel and result Parquet
@@ -106,9 +122,9 @@ jobs:
         with:
           name: warrant-broker-ma-history-${{ github.run_number }}
           path: |
-            output/warrant_broker_ma_history_*.xlsx
-            warrant_cache/ma_history/results/*.parquet
-            warrant_cache/ma_history/state.json
+            ${{ env.OUTPUT_DIR }}/warrant_broker_ma_history_*.xlsx
+            ${{ env.MA_HISTORY_CACHE_DIR }}/results/*.parquet
+            ${{ env.MA_HISTORY_CACHE_DIR }}/state.json
           if-no-files-found: warn
           retention-days: 14
           compression-level: 6
