@@ -134,6 +134,14 @@ TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT = min(
     100.0,
 )
 TOP15_LOW_TRADED_COVERAGE_SYMBOL = "*"
+TOP15_PATTERN_DESCRIPTIONS = [
+    ("突", "突破前高"),
+    ("站", "站上MA20（月線）"),
+    ("撐", "量峰價附近有支撐"),
+    ("強", "多頭排列，走勢偏強"),
+    ("弱", "跌破MA20，走勢偏弱"),
+    ("盤", "區間整理"),
+]
 # 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
 ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
 
@@ -1241,6 +1249,7 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         "統計日期", "日期", "目標日期", "統計期間", "有效交易日數",
         "排名", "rank",
         "標的股", "標的代號", "標的", "標的名稱", "股票名稱",
+        "型態", "型態統計日期", "型態計算狀態",
         "淨買超成本", "剩餘淨買超成本", "淨買超金額", "淨買超", "remaining_cost",
         "買超成本", "原始買超成本", "總買超成本", "買超金額", "合計買超成本", "amount",
         "目前市值", "未實現損益", "報酬率", "報酬率文字",
@@ -1393,6 +1402,9 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
             "target": target_label,
             "underlying": underlying,
             "stock_name": stock_name,
+            "pattern": strip_gsheet_text_prefix(row.get("型態", "")) or "-",
+            "pattern_date": strip_gsheet_text_prefix(row.get("型態統計日期", "")),
+            "pattern_status": strip_gsheet_text_prefix(row.get("型態計算狀態", "")),
             "amount": amount,
             "net_amount": net_amount,
             "count": warrant_count,
@@ -3632,7 +3644,12 @@ def collect_consensus_buy_top10(target: date, lookback_days: int = LOOKBACK_TRAD
     rows, meta = read_top15_consensus_cache_from_gsheet(target)
     return rows, meta
 
-def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int = LOOKBACK_TRADING_DAYS):
+def draw_consensus_buy_image(
+    target: date,
+    output_path: Path,
+    lookback_days: int = LOOKBACK_TRADING_DAYS,
+    show_pattern: bool = False,
+):
     """
     第二張圖：近40個交易日｜五大分點共識淨買超成本 TOP15
     """
@@ -3661,6 +3678,7 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     top_h = 1.95
     legend_h = 0.45
     gap = 0.18
+    pattern_note_h = 1.04 if show_pattern else 0.0
     section_title_h = 0.55
     header_h = 0.42
     row_h = 0.50
@@ -3668,7 +3686,14 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
 
     table_h = section_title_h + header_h + max(1, n) * row_h
 
-    fig_h = top_h + legend_h + gap + table_h + footer_h
+    fig_h = (
+        top_h
+        + legend_h
+        + gap
+        + table_h
+        + footer_h
+        + (gap + pattern_note_h if show_pattern else 0.0)
+    )
     fig_h = max(fig_h, 7.6)
 
     BG = "#F6F8FB"
@@ -3888,10 +3913,14 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
     rect(margin_x, table_top - section_title_h, content_w, section_title_h, fc=NAVY)
     text(margin_x + 0.30, table_top - section_title_h / 2, "共識淨買超成本 TOP15", 19, WHITE, BOLD)
 
-    headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
-    # 標的欄加寬 0.30，讓「參與分點 / 報酬率」整欄起點稍微右移。
-    # 六欄總寬仍為 12.20，右側表格邊界與原版完全一致。
-    col_w = [0.70, 2.45, 1.45, 0.65, 1.35, 5.60]
+    if show_pattern:
+        headers = ["排名", "標的", "型態", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
+        # 七欄總寬維持 12.20；新增型態欄時從標的與右側明細欄各讓出少量寬度。
+        col_w = [0.65, 2.15, 0.70, 1.40, 0.65, 1.25, 5.40]
+    else:
+        headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
+        # 六欄總寬仍為 12.20，右側表格邊界與原版完全一致。
+        col_w = [0.70, 2.45, 1.45, 0.65, 1.35, 5.60]
 
     header_y_top = table_top - section_title_h
     rect(margin_x, header_y_top - header_h, content_w, header_h, fc=HEADER_BG, ec=BORDER, lw=0.6)
@@ -3913,18 +3942,40 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
             rect(margin_x, ry, content_w, row_h, fc=WHITE if i % 2 == 0 else ROW_ALT, ec=BORDER, lw=0.5)
 
             net_color = RED if r["net_amount"] > 0 else GREEN if r["net_amount"] < 0 else TEXT
-            values = [
-                str(i + 1),
-                fit(r["target"], 14),
-                fmt_wan(r["net_amount"]),
-                str(r["broker_count"]),
-                r["events"],
-                None,
-            ]
-
-            colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
-            aligns = ["center", "left", "right", "center", "center", "left"]
-            bolds = [True, True, True, True, True, True]
+            if show_pattern:
+                pattern = str(r.get("pattern", "") or "-").strip() or "-"
+                pattern_color = {
+                    "突": RED,
+                    "站": "#D97706",
+                    "撐": GREEN,
+                    "強": RED,
+                    "弱": GREEN,
+                    "盤": MUTED,
+                }.get(pattern, MUTED)
+                values = [
+                    str(i + 1),
+                    fit(r["target"], 14),
+                    pattern,
+                    fmt_wan(r["net_amount"]),
+                    str(r["broker_count"]),
+                    r["events"],
+                    None,
+                ]
+                colors = [TEXT, TEXT, pattern_color, net_color, TEXT, NAVY2, TEXT]
+                aligns = ["center", "left", "center", "right", "center", "center", "left"]
+                bolds = [True, True, True, True, True, True, True]
+            else:
+                values = [
+                    str(i + 1),
+                    fit(r["target"], 14),
+                    fmt_wan(r["net_amount"]),
+                    str(r["broker_count"]),
+                    r["events"],
+                    None,
+                ]
+                colors = [TEXT, TEXT, net_color, TEXT, NAVY2, TEXT]
+                aligns = ["center", "left", "right", "center", "center", "left"]
+                bolds = [True, True, True, True, True, True]
 
             x = margin_x
             for col_idx, (val, w, c, a, is_bold) in enumerate(zip(values, col_w, colors, aligns, bolds)):
@@ -3937,6 +3988,47 @@ def draw_consensus_buy_image(target: date, output_path: Path, lookback_days: int
                 px = x + (w / 2 if a == "center" else 0.12 if a == "left" else w - 0.12)
                 text(px, ry + row_h / 2, display_val, 14, c, BOLD if is_bold else FONT, ha=a)
                 x += w
+
+    if show_pattern:
+        pattern_note_y = table_top - table_h - gap - pattern_note_h
+        rounded(
+            margin_x,
+            pattern_note_y,
+            content_w,
+            pattern_note_h,
+            fc=WHITE,
+            ec=BORDER,
+            lw=1.0,
+            r=0.08,
+        )
+        text(
+            margin_x + 0.22,
+            pattern_note_y + pattern_note_h - 0.22,
+            "型態備註（直接取自 Google Sheet「快取_TOP15共識淨買超」）",
+            12.2,
+            NAVY,
+            BOLD,
+        )
+        note_lines = [
+            "｜".join(f"{label}：{description}" for label, description in TOP15_PATTERN_DESCRIPTIONS[:3]),
+            "｜".join(f"{label}：{description}" for label, description in TOP15_PATTERN_DESCRIPTIONS[3:]),
+        ]
+        text(
+            margin_x + 0.22,
+            pattern_note_y + 0.50,
+            note_lines[0],
+            10.4,
+            TEXT,
+            FONT,
+        )
+        text(
+            margin_x + 0.22,
+            pattern_note_y + 0.20,
+            f"{note_lines[1]}｜-：資料不足或計算未完成",
+            10.4,
+            TEXT,
+            FONT,
+        )
 
 
     text(
@@ -4232,6 +4324,7 @@ def draw_all_broker_win_rate_stats_image(target: date, output_path: Path):
 
 IMAGE_ACTION_DAILY_BUNDLE = "精選五分點每日圖"
 IMAGE_ACTION_CONSENSUS_BUY = "近一個月共識淨買超TOP15"
+IMAGE_ACTION_CONSENSUS_BUY_PATTERN = "近一個月共識淨買超TOP15（含型態）"
 IMAGE_ACTION_WEEKLY_WARRANT = "本週權證共識買賣超TOP15"
 IMAGE_ACTION_BROKER_10D = "近10日分點買賣明細圖"
 IMAGE_ACTION_WIN_RATE_STATS = "所有分點勝率統計圖"
@@ -4245,6 +4338,7 @@ def normalize_image_action(action_text: str) -> str:
     支援常見名稱：
     - 精選五分點每日圖 / 精選5分點當日買賣超產圖 / 每日精選分點買賣超追蹤
     - 近一個月共識淨買超TOP15
+    - 近一個月共識淨買超TOP15（含型態）
     - 本週權證共識買賣超TOP15 / 近7／14／21日權證分點共識TOP15
     - 近10日分點買賣明細圖 / 近10日分點明細 / 近10日分點買賣明細
     - 所有分點勝率統計圖 / 全分點勝率統計
@@ -4293,6 +4387,17 @@ def normalize_image_action(action_text: str) -> str:
         or "warrantconsensus" in key
     ):
         return IMAGE_ACTION_WEEKLY_WARRANT
+
+    if (
+        "型態" in raw
+        and (
+            "近一個月" in raw
+            or "共識淨買超" in raw
+            or "TOP15" in raw.upper()
+            or "consensus" in key
+        )
+    ):
+        return IMAGE_ACTION_CONSENSUS_BUY_PATTERN
 
     if "近一個月" in raw or "共識淨買超成本" in raw or "五大分點共識" in raw or "consensus" in key:
         return IMAGE_ACTION_CONSENSUS_BUY
@@ -6049,6 +6154,7 @@ def main():
         default=os.getenv("IMAGE_ACTION", os.getenv("ACTION", os.getenv("RUN_PLAN", ""))),
         help=(
             "圖片產生選項：精選五分點每日圖 / 近一個月共識淨買超TOP15 / "
+            "近一個月共識淨買超TOP15（含型態） / "
             "本週權證共識買賣超TOP15（輸出近7／14／21日三張圖） / 近10日分點買賣明細圖 / "
             "所有分點勝率統計圖 / 全部圖片。也支援 GitHub Actions 的 RUN_PLAN。"
         ),
@@ -6099,9 +6205,16 @@ def main():
         image_paths.append(output_path)
     
 
-    elif action == IMAGE_ACTION_CONSENSUS_BUY:
+    elif action in [IMAGE_ACTION_CONSENSUS_BUY, IMAGE_ACTION_CONSENSUS_BUY_PATTERN]:
+        show_pattern = action == IMAGE_ACTION_CONSENSUS_BUY_PATTERN
         print(f"輸出圖檔：{consensus_output_path}")
-        draw_consensus_buy_image(target, consensus_output_path, LOOKBACK_TRADING_DAYS)
+        print(f"TOP15型態顯示：{'開啟' if show_pattern else '關閉'}")
+        draw_consensus_buy_image(
+            target,
+            consensus_output_path,
+            LOOKBACK_TRADING_DAYS,
+            show_pattern=show_pattern,
+        )
         image_paths.append(consensus_output_path)
 
     if action in [IMAGE_ACTION_WEEKLY_WARRANT, IMAGE_ACTION_ALL]:
