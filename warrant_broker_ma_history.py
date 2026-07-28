@@ -52,9 +52,9 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.2.1"
+PROGRAM_VERSION = "1.2.2"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v4-explicit-history-chunks"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v5-target-shard-backfill"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -63,6 +63,9 @@ WARRANT_SUMMARY_HISTORY_START = os.getenv(
     "WARRANT_SUMMARY_HISTORY_START_DATE", "2011-01-03"
 ).strip()
 WARRANT_SUMMARY_CACHE_PREFIX = "TaiwanStockInfoWithWarrantSummary_history"
+WARRANT_SUMMARY_TARGET_CACHE_PREFIX = (
+    "TaiwanStockInfoWithWarrantSummary_target"
+)
 
 BASE_DIR = Path(os.getenv("MA_HISTORY_BASE_DIR", ".")).resolve()
 CACHE_ROOT = Path(
@@ -601,7 +604,12 @@ def fetch_warrant_summary_history(
         work = frame.copy()
         work["date"] = work["date"].map(iso_date)
         work["end_date"] = work["end_date"].map(iso_date)
-        if work["date"].isna().any() or work["end_date"].isna().any():
+        if (
+            work["date"].eq("").any()
+            or work["end_date"].eq("").any()
+            or work["date"].isna().any()
+            or work["end_date"].isna().any()
+        ):
             raise RuntimeError(
                 f"權證 Summary {chunk_start}～{chunk_end} 含無效上市／下市日期"
             )
@@ -647,6 +655,170 @@ def fetch_warrant_summary_history(
         flush=True,
     )
     return combined
+
+
+def warrant_summary_target_cache_paths(
+    target_code: str,
+) -> tuple[Path, Path]:
+    target = normalize_code(target_code)
+    if not target:
+        raise ValueError("母股代號不得為空")
+    stem = f"{WARRANT_SUMMARY_TARGET_CACHE_PREFIX}_{target}"
+    return (
+        metadata_cache_path(stem),
+        METADATA_DIR / f"{stem}.empty.json",
+    )
+
+
+def fetch_warrant_summary_target_history(
+    target_code: str,
+    start_date: str = WARRANT_SUMMARY_HISTORY_START,
+    end_date: str = "",
+) -> pd.DataFrame:
+    """
+    依母股 data_id 反查權證歷史。
+
+    FinMind 官方文件明確指出 data_id 為母股代號，且此查法包含已到期及
+    代號重用的歷史權證。不帶 data_id 的全表在實際服務上可能漏掉舊區間，
+    因此此函式作為精確補抓；回傳 target_stock_id 不一致時一律拒收。
+    """
+    target = normalize_code(target_code)
+    normalized_start = iso_date(start_date)
+    normalized_end = iso_date(end_date) or datetime.now().date().isoformat()
+    if not target or not normalized_start or not normalized_end:
+        raise ValueError("母股分片查詢參數無效")
+    cache_path, empty_marker = warrant_summary_target_cache_paths(target)
+    max_age = IDENTITY_INDEX_CACHE_HOURS
+    for path, is_empty_marker in (
+        (cache_path, False),
+        (empty_marker, True),
+    ):
+        if not path.exists() or path.stat().st_size <= 0:
+            continue
+        age_hours = max((time.time() - path.stat().st_mtime) / 3600, 0)
+        if age_hours > max_age:
+            continue
+        if is_empty_marker:
+            print(
+                f"    📦 母股 {target}：沿用空結果標記｜"
+                f"快取年齡 {age_hours:.1f} 小時",
+                flush=True,
+            )
+            return pd.DataFrame(
+                columns=[
+                    "stock_id",
+                    "target_stock_id",
+                    "type",
+                    "date",
+                    "end_date",
+                ]
+            )
+        cached = read_parquet(path)
+        if not cached.empty:
+            print(
+                f"    📦 母股 {target}：沿用歷史分片 "
+                f"{len(cached):,} 筆｜快取年齡 {age_hours:.1f} 小時",
+                flush=True,
+            )
+            return cached
+
+    started_at = time.perf_counter()
+    print(f"    ⏳ 母股 {target}：反查權證完整歷史...", flush=True)
+    response = request_with_retries(
+        FINMIND_DATA_URL,
+        params={
+            "dataset": "TaiwanStockInfoWithWarrantSummary",
+            "data_id": target,
+            "start_date": normalized_start,
+            "end_date": normalized_end,
+        },
+        description=f"FinMind 權證 Summary 母股 {target}",
+    )
+    payload = response.json()
+    status = int(payload.get("status", response.status_code) or response.status_code)
+    if status != 200:
+        raise RuntimeError(payload.get("msg") or f"status={status}")
+    frame = pd.DataFrame(payload.get("data") or [])
+    if frame.empty:
+        atomic_write_json(
+            {
+                "target_stock_id": target,
+                "start_date": normalized_start,
+                "end_date": normalized_end,
+                "queried_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            empty_marker,
+        )
+        print(
+            f"    ℹ️ 母股 {target}：沒有權證歷史｜"
+            f"{time.perf_counter() - started_at:.1f} 秒",
+            flush=True,
+        )
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "target_stock_id",
+                "type",
+                "date",
+                "end_date",
+            ]
+        )
+
+    required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            f"母股 {target} 的權證 Summary 缺少欄位：{sorted(missing)}"
+        )
+    work = frame.copy()
+    work["stock_id"] = work["stock_id"].map(normalize_code)
+    work["target_stock_id"] = work["target_stock_id"].map(normalize_code)
+    work["date"] = work["date"].map(iso_date)
+    work["end_date"] = work["end_date"].map(iso_date)
+    if (
+        work["date"].eq("").any()
+        or work["end_date"].eq("").any()
+        or work["date"].isna().any()
+        or work["end_date"].isna().any()
+    ):
+        raise RuntimeError(f"母股 {target} 的權證 Summary 含無效日期")
+    wrong_targets = sorted(
+        {
+            value
+            for value in work["target_stock_id"].astype(str)
+            if value != target
+        }
+    )
+    if wrong_targets:
+        raise RuntimeError(
+            f"FinMind data_id={target} 未依母股過濾，"
+            f"回傳其他 target_stock_id={wrong_targets[:5]}；拒絕補入索引"
+        )
+    outside = (work["date"] < normalized_start) | (
+        work["date"] > normalized_end
+    )
+    if outside.any():
+        raise RuntimeError(
+            f"母股 {target} 的權證 Summary 超出請求上市日期範圍："
+            f"{work['date'].min()}～{work['date'].max()}"
+        )
+    work = (
+        work.drop_duplicates(
+            ["stock_id", "target_stock_id", "type", "date", "end_date"],
+            keep="last",
+        )
+        .sort_values(["date", "stock_id", "end_date"])
+        .reset_index(drop=True)
+    )
+    atomic_write_parquet(work, cache_path)
+    if empty_marker.exists():
+        empty_marker.unlink(missing_ok=True)
+    print(
+        f"    ✅ 母股 {target}：{len(work):,} 筆｜"
+        f"{time.perf_counter() - started_at:.1f} 秒",
+        flush=True,
+    )
+    return work
 
 
 def trading_dates() -> list[str]:
@@ -951,6 +1123,41 @@ def resolve_underlying_from_name(
     return resolver.resolve(warrant_name)
 
 
+def build_warrant_names_by_code(
+    info: pd.DataFrame,
+    required_codes: Optional[set[str]] = None,
+    *,
+    show_progress: bool = False,
+) -> dict[str, list[str]]:
+    names_by_code: dict[str, list[str]] = defaultdict(list)
+    if not {"stock_id", "stock_name"}.issubset(info.columns):
+        return names_by_code
+    total = len(info)
+    if show_progress:
+        print(f"  ⏳ 建立權證名稱對照：來源 {total:,} 筆...", flush=True)
+    for row_number, (raw_code, raw_name) in enumerate(
+        info[["stock_id", "stock_name"]].itertuples(index=False, name=None),
+        start=1,
+    ):
+        code = normalize_code(raw_code)
+        if required_codes is not None and code not in required_codes:
+            continue
+        name = str(raw_name or "").strip()
+        if code and name and name not in names_by_code[code]:
+            names_by_code[code].append(name)
+        if show_progress and row_number % 50_000 == 0:
+            print(
+                f"    權證名稱對照進度：{row_number:,}/{total:,}",
+                flush=True,
+            )
+    if show_progress:
+        print(
+            f"  ✅ 權證名稱對照完成：{len(names_by_code):,} 個代號",
+            flush=True,
+        )
+    return names_by_code
+
+
 @dataclass(frozen=True)
 class WarrantIdentity:
     code: str
@@ -971,6 +1178,13 @@ class WarrantIdentityIndex:
             self.by_code[record.code].append(record)
         for code in self.by_code:
             self.by_code[code].sort(key=lambda rec: (rec.list_date, rec.end_date))
+
+    def records(self) -> list[WarrantIdentity]:
+        return [
+            record
+            for code in sorted(self.by_code)
+            for record in self.by_code[code]
+        ]
 
     def resolve(self, warrant_code: str, trade_date: str) -> WarrantIdentity:
         code = normalize_code(warrant_code)
@@ -1012,6 +1226,168 @@ def identity_index_cache_path() -> Path:
     return METADATA_DIR / "warrant_identity_intervals.parquet"
 
 
+def build_identity_records_from_summary(
+    summary: pd.DataFrame,
+    names_by_code: dict[str, list[str]],
+    resolver: StockAliasResolver,
+    stock_master: dict[str, str],
+    *,
+    progress_label: str = "",
+) -> list[WarrantIdentity]:
+    records: list[WarrantIdentity] = []
+    if summary.empty:
+        return records
+    required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
+    missing = required - set(summary.columns)
+    if missing:
+        raise RuntimeError(f"權證標的歷史對照缺少欄位：{sorted(missing)}")
+    work = summary.copy().fillna("")
+    total_intervals = len(work)
+    if progress_label:
+        print(
+            f"  ⏳ {progress_label}：{total_intervals:,} 筆...",
+            flush=True,
+        )
+    for row_number, (
+        raw_code,
+        raw_target,
+        raw_type,
+        raw_listed,
+        raw_ended,
+    ) in enumerate(
+        work[
+            ["stock_id", "target_stock_id", "type", "date", "end_date"]
+        ].itertuples(index=False, name=None),
+        start=1,
+    ):
+        code = normalize_code(raw_code)
+        target = normalize_code(raw_target)
+        warrant_type = str(raw_type or "").strip()
+        listed = iso_date(raw_listed)
+        ended = iso_date(raw_ended)
+        if not code or not listed or not ended:
+            continue
+        names = names_by_code.get(code, [])
+        name = names[0] if names else code
+        resolved_candidates = [
+            (candidate, resolve_underlying_from_name(candidate, resolver))
+            for candidate in names
+        ]
+        resolved_candidates = [item for item in resolved_candidates if item[1]]
+        matching_names = [
+            candidate
+            for candidate, resolved in resolved_candidates
+            if resolved and resolved[0] == target
+        ]
+        if matching_names:
+            name = max(matching_names, key=len)
+        elif target:
+            # TaiwanStockInfoWithWarrant 沒有日期區間；代號重用時其中的名稱
+            # 可能屬於較新的商品。若名稱無法印證這筆日期化母股，寧可顯示
+            # 代號，也不能拿目前名稱反向覆蓋正式 target_stock_id。
+            name = code
+        resolved = resolve_underlying_from_name(name, resolver)
+        target_name = stock_master.get(target, "")
+        status = "Matched"
+        reason = "FinMind target_stock_id＋上市區間"
+        if resolved:
+            resolved_code, resolved_name, prefix_len, exact = resolved
+            high_confidence = exact or prefix_len >= 3
+            if not target and high_confidence:
+                target, target_name = resolved_code, resolved_name
+                reason = "權證名稱解析補足標的"
+            elif target and resolved_code != target and high_confidence:
+                reason = (
+                    "FinMind target_stock_id＋上市區間"
+                    "（非日期化權證名稱不一致，保留正式母股）"
+                )
+        if not target:
+            status = "Unmatched"
+            reason = "缺少 target_stock_id 且權證名稱無法可靠解析"
+        records.append(
+            WarrantIdentity(
+                code,
+                name,
+                warrant_type,
+                target,
+                target_name,
+                listed,
+                ended,
+                status,
+                reason,
+            )
+        )
+        if progress_label and row_number % 5_000 == 0:
+            print(
+                f"    身分配對進度：{row_number:,}/{total_intervals:,}｜"
+                f"已建立 {len(records):,} 筆",
+                flush=True,
+            )
+    return records
+
+
+def deduplicate_identity_records(
+    records: Iterable[WarrantIdentity],
+) -> dict[tuple[str, str, str, str], WarrantIdentity]:
+    deduplicated: dict[tuple[str, str, str, str], WarrantIdentity] = {}
+    for record in records:
+        # target_code 必須留在鍵內；同代號、同區間卻有不同母股時，
+        # WarrantIdentityIndex.resolve 會回 Ambiguous，禁止任意挑一筆。
+        key = (
+            record.code,
+            record.list_date,
+            record.end_date,
+            record.target_code,
+        )
+        previous = deduplicated.get(key)
+        if previous is None or (
+            record.status == "Matched",
+            bool(record.target_code),
+            len(record.name),
+        ) >= (
+            previous.status == "Matched",
+            bool(previous.target_code),
+            len(previous.name),
+        ):
+            deduplicated[key] = record
+    return deduplicated
+
+
+def save_warrant_identity_index(
+    records: Iterable[WarrantIdentity],
+) -> WarrantIdentityIndex:
+    deduplicated = deduplicate_identity_records(records)
+    frame = pd.DataFrame([record.__dict__ for record in deduplicated.values()])
+    if frame.empty:
+        raise RuntimeError("不得保存空白權證身分索引")
+    frame["_identity_schema_version"] = IDENTITY_INDEX_SCHEMA_VERSION
+    frame["_summary_history_start"] = WARRANT_SUMMARY_HISTORY_START
+    frame["_summary_history_end"] = datetime.now().date().isoformat()
+    frame["_built_at"] = datetime.now().isoformat(timespec="seconds")
+    atomic_write_parquet(frame, identity_index_cache_path())
+    return WarrantIdentityIndex(deduplicated.values())
+
+
+def load_cached_target_summary_frames() -> list[pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    for path in sorted(
+        METADATA_DIR.glob(
+            f"{WARRANT_SUMMARY_TARGET_CACHE_PREFIX}_*.parquet"
+        )
+    ):
+        try:
+            frame = read_parquet(path)
+            if not frame.empty:
+                frames.append(frame)
+        except Exception as exc:
+            print(
+                f"  ⚠️ 略過損壞的母股歷史分片 {path.name}："
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    return frames
+
+
 def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
     path = identity_index_cache_path()
     if not path.exists() or path.stat().st_size <= 0:
@@ -1037,6 +1413,11 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
         metadata_cache_path("TaiwanStockInfoWithWarrant"),
         metadata_cache_path("TaiwanStockInfo"),
         *summary_history_paths,
+        *sorted(
+            METADATA_DIR.glob(
+                f"{WARRANT_SUMMARY_TARGET_CACHE_PREFIX}_*.parquet"
+            )
+        ),
     ]
     newer_sources = [
         source.name
@@ -1153,132 +1534,175 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
         f"前綴索引 {len(resolver.by_prefix):,} 個",
         flush=True,
     )
-    names_by_code: dict[str, list[str]] = defaultdict(list)
-    if {"stock_id", "stock_name"}.issubset(info.columns):
+    names_by_code = build_warrant_names_by_code(
+        info,
+        show_progress=True,
+    )
+    shard_frames = load_cached_target_summary_frames()
+    if shard_frames:
+        summary = pd.concat([summary, *shard_frames], ignore_index=True)
+        summary = summary.drop_duplicates(
+            ["stock_id", "target_stock_id", "type", "date", "end_date"],
+            keep="last",
+        )
         print(
-            f"  ⏳ 建立權證名稱對照：來源 {len(info):,} 筆...",
+            f"  📦 合併既有母股歷史分片：{len(shard_frames):,} 片｜"
+            f"合計 {len(summary):,} 筆",
             flush=True,
         )
-        for row_number, (code, name) in enumerate(
-            info[["stock_id", "stock_name"]].itertuples(index=False, name=None),
-            start=1,
-        ):
-            code_text = normalize_code(code)
-            name_text = str(name or "").strip()
-            if code_text and name_text and name_text not in names_by_code[code_text]:
-                names_by_code[code_text].append(name_text)
-            if row_number % 50_000 == 0:
-                print(
-                    f"    權證名稱對照進度：{row_number:,}/{len(info):,}",
-                    flush=True,
-                )
-        print(
-            f"  ✅ 權證名稱對照完成：{len(names_by_code):,} 個代號",
-            flush=True,
-        )
-
-    records: list[WarrantIdentity] = []
-    work = summary.copy().fillna("")
-    total_intervals = len(work)
-    print(f"  ⏳ 配對全部權證歷史區間：{total_intervals:,} 筆...", flush=True)
-    for row_number, (
-        raw_code,
-        raw_target,
-        raw_type,
-        raw_listed,
-        raw_ended,
-    ) in enumerate(
-        work[
-            ["stock_id", "target_stock_id", "type", "date", "end_date"]
-        ].itertuples(index=False, name=None),
-        start=1,
-    ):
-        code = normalize_code(raw_code)
-        target = normalize_code(raw_target)
-        warrant_type = str(raw_type or "").strip()
-        listed = iso_date(raw_listed)
-        ended = iso_date(raw_ended)
-        if not code or not listed or not ended:
-            continue
-        names = names_by_code.get(code, [])
-        name = names[0] if names else code
-        resolved_candidates = [
-            (candidate, resolve_underlying_from_name(candidate, resolver))
-            for candidate in names
-        ]
-        resolved_candidates = [item for item in resolved_candidates if item[1]]
-        matching_names = [
-            candidate
-            for candidate, resolved in resolved_candidates
-            if resolved and resolved[0] == target
-        ]
-        if matching_names:
-            name = max(matching_names, key=len)
-        resolved = resolve_underlying_from_name(name, resolver)
-        target_name = stock_master.get(target, "")
-        status = "Matched"
-        reason = "FinMind target_stock_id＋上市區間"
-        if resolved:
-            resolved_code, resolved_name, prefix_len, exact = resolved
-            high_confidence = exact or prefix_len >= 3
-            if not target and high_confidence:
-                target, target_name = resolved_code, resolved_name
-                reason = "權證名稱解析補足標的"
-            elif target and resolved_code != target and high_confidence:
-                summary_name = normalize_name(target_name)
-                if not summary_name or not normalize_name(name).startswith(summary_name):
-                    target, target_name = resolved_code, resolved_name
-                    reason = "權證名稱高信心修正 FinMind target_stock_id"
-        if not target:
-            status = "Unmatched"
-            reason = "缺少 target_stock_id 且權證名稱無法可靠解析"
-        records.append(
-            WarrantIdentity(
-                code,
-                name,
-                warrant_type,
-                target,
-                target_name,
-                listed,
-                ended,
-                status,
-                reason,
-            )
-        )
-        if row_number % 5_000 == 0:
-            print(
-                f"    身分配對進度：{row_number:,}/{total_intervals:,}｜"
-                f"已建立 {len(records):,} 筆｜"
-                f"{time.perf_counter() - started_at:.1f} 秒",
-                flush=True,
-            )
-
-    deduplicated: dict[tuple[str, str, str], WarrantIdentity] = {}
-    for record in records:
-        key = (record.code, record.list_date, record.end_date)
-        previous = deduplicated.get(key)
-        if previous is None or (
-            record.status == "Matched",
-            bool(record.target_code),
-            len(record.name),
-        ) >= (
-            previous.status == "Matched",
-            bool(previous.target_code),
-            len(previous.name),
-        ):
-            deduplicated[key] = record
-    frame = pd.DataFrame([record.__dict__ for record in deduplicated.values()])
-    frame["_identity_schema_version"] = IDENTITY_INDEX_SCHEMA_VERSION
-    frame["_summary_history_start"] = WARRANT_SUMMARY_HISTORY_START
-    frame["_summary_history_end"] = datetime.now().date().isoformat()
-    frame["_built_at"] = datetime.now().isoformat(timespec="seconds")
-    atomic_write_parquet(frame, identity_index_cache_path())
+    records = build_identity_records_from_summary(
+        summary,
+        names_by_code,
+        resolver,
+        stock_master,
+        progress_label="配對全部權證歷史區間",
+    )
+    identity_index = save_warrant_identity_index(records)
     print(
-        f"  ✅ 日期化權證身分索引完成：{len(deduplicated):,} 筆｜"
+        f"  ✅ 日期化權證身分索引完成："
+        f"{len(identity_index.records()):,} 筆｜"
         f"{time.perf_counter() - started_at:.1f} 秒",
         flush=True,
     )
-    return WarrantIdentityIndex(deduplicated.values())
+    return identity_index
+
+
+def identity_pair_is_matched(
+    identity_index: WarrantIdentityIndex,
+    pair: tuple[str, str],
+) -> bool:
+    code, trade_day = pair
+    return identity_index.resolve(code, trade_day).status == "Matched"
+
+
+def backfill_identity_from_target_shards(
+    identity_index: WarrantIdentityIndex,
+    pairs: Iterable[tuple[str, str]],
+) -> WarrantIdentityIndex:
+    """
+    以權證名稱只找出「應查詢哪些母股」，再向 FinMind 逐母股取回正式區間。
+
+    名稱解析結果不會直接成為身分；只有母股分片實際回傳相同權證代號，
+    且交易日在該列 date～end_date 內，resolve 才會變成 Matched。
+    """
+    normalized_pairs = {
+        (normalize_code(code), iso_date(trade_day) or "")
+        for code, trade_day in pairs
+        if normalize_code(code) and iso_date(trade_day)
+    }
+    unresolved_pairs = {
+        pair
+        for pair in normalized_pairs
+        if not identity_pair_is_matched(identity_index, pair)
+    }
+    if not unresolved_pairs:
+        return identity_index
+
+    unresolved_codes = {code for code, _ in unresolved_pairs}
+    print(
+        "  🧩 啟動 FinMind 母股分片歷史補抓："
+        f"{len(unresolved_codes):,} 個權證代號｜"
+        f"{len(unresolved_pairs):,} 個代號日期組合",
+        flush=True,
+    )
+    info = fetch_dataset("TaiwanStockInfoWithWarrant", cache=True)
+    stock_info = fetch_dataset("TaiwanStockInfo", cache=True)
+    stock_master = build_stock_master(stock_info)
+    resolver = stock_alias_resolver(stock_master)
+    required_names = build_warrant_names_by_code(
+        info,
+        required_codes=unresolved_codes,
+    )
+    all_names = build_warrant_names_by_code(info)
+
+    candidate_targets: set[str] = set()
+    codes_without_candidate: set[str] = set()
+    for code in sorted(unresolved_codes):
+        code_targets: set[str] = {
+            record.target_code
+            for record in identity_index.by_code.get(code, [])
+            if record.target_code
+        }
+        for name in required_names.get(code, []):
+            resolved = resolve_underlying_from_name(name, resolver)
+            if resolved is None:
+                continue
+            target, _, prefix_len, exact = resolved
+            if exact or prefix_len >= 3:
+                code_targets.add(target)
+        if not code_targets:
+            codes_without_candidate.add(code)
+        candidate_targets.update(code_targets)
+
+    print(
+        f"  🧭 待查母股 {len(candidate_targets):,} 檔｜"
+        f"無可靠名稱候選 {len(codes_without_candidate):,} 個權證代號",
+        flush=True,
+    )
+    if not candidate_targets:
+        return identity_index
+
+    shard_frames: list[pd.DataFrame] = []
+    consecutive_errors = 0
+    failed_targets: list[str] = []
+    for index, target in enumerate(sorted(candidate_targets), start=1):
+        try:
+            shard = fetch_warrant_summary_target_history(target)
+            consecutive_errors = 0
+            if not shard.empty:
+                shard_frames.append(shard)
+        except Exception as exc:
+            consecutive_errors += 1
+            failed_targets.append(target)
+            print(
+                f"    ⚠️ 母股 {target} 歷史分片失敗："
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            if consecutive_errors >= LOCAL_ERROR_CIRCUIT_BREAKER:
+                raise RuntimeError(
+                    "母股歷史分片連續失敗 "
+                    f"{consecutive_errors} 次，停止避免消耗 API 額度"
+                ) from exc
+        if index % 25 == 0 or index == len(candidate_targets):
+            print(
+                f"  📚 母股歷史補抓進度：{index:,}/"
+                f"{len(candidate_targets):,}｜"
+                f"有資料 {len(shard_frames):,}｜"
+                f"失敗 {len(failed_targets):,}",
+                flush=True,
+            )
+
+    if not shard_frames:
+        print("  ⚠️ 母股分片沒有取得任何可加入的歷史區間。", flush=True)
+        return identity_index
+
+    shard_summary = pd.concat(shard_frames, ignore_index=True)
+    new_records = build_identity_records_from_summary(
+        shard_summary,
+        all_names,
+        resolver,
+        stock_master,
+        progress_label="配對母股分片補回區間",
+    )
+    repaired_index = save_warrant_identity_index(
+        [*identity_index.records(), *new_records]
+    )
+    matched_before = sum(
+        identity_pair_is_matched(identity_index, pair)
+        for pair in normalized_pairs
+    )
+    matched_after = sum(
+        identity_pair_is_matched(repaired_index, pair)
+        for pair in normalized_pairs
+    )
+    print(
+        f"  ✅ 母股分片補抓完成：新增來源區間 {len(new_records):,} 筆｜"
+        f"本批已配對 {matched_before:,} → {matched_after:,}/"
+        f"{len(normalized_pairs):,}",
+        flush=True,
+    )
+    return repaired_index
 
 
 def normalize_warrant_day(
@@ -1746,11 +2170,13 @@ def preflight_identity_quality(
     state: dict[str, Any],
     identity_index: WarrantIdentityIndex,
     sample_days: int = 5,
-) -> None:
+    *,
+    allow_target_backfill: bool = True,
+) -> WarrantIdentityIndex:
     """在繼續下載前抽查既有 compact，避免錯誤索引一路跑完整段歷史。"""
     successful = sorted(state["successful_dates"])
     if not successful:
-        return
+        return identity_index
     sample_count = min(max(sample_days, 1), len(successful))
     if sample_count == 1:
         selected = [successful[0]]
@@ -1766,6 +2192,7 @@ def preflight_identity_quality(
     reason_counts: Counter[str] = Counter()
     examples: list[tuple[str, str]] = []
     seen_examples: set[tuple[str, str]] = set()
+    bad_pairs: set[tuple[str, str]] = set()
     for day in selected:
         enriched = enrich_compact_identity(
             read_parquet(compact_path(day)),
@@ -1785,6 +2212,8 @@ def preflight_identity_quality(
             ["權證代號", "日期"]
         ].drop_duplicates().itertuples(index=False, name=None):
             key = (normalize_code(warrant_code), iso_date(trade_day) or "")
+            if key[0] and key[1]:
+                bad_pairs.add(key)
             if key not in seen_examples and len(examples) < 5:
                 seen_examples.add(key)
                 examples.append(key)
@@ -1798,11 +2227,23 @@ def preflight_identity_quality(
     if unmatched_rows:
         print_identity_diagnostic(reason_counts, examples, identity_index)
     if total_rows and unmatched_pct > MAX_IDENTITY_UNMATCHED_PCT:
+        if allow_target_backfill and bad_pairs:
+            repaired_index = backfill_identity_from_target_shards(
+                identity_index,
+                bad_pairs,
+            )
+            return preflight_identity_quality(
+                state,
+                repaired_index,
+                sample_days=sample_days,
+                allow_target_backfill=False,
+            )
         raise RuntimeError(
             f"下載前抽查的身分未配對率 {unmatched_pct:.2f}% 超過允許上限 "
             f"{MAX_IDENTITY_UNMATCHED_PCT:.2f}%；已停止繼續下載。"
             "既有 compact_daily 的交易事實仍可保留，修正索引後不必重抓。"
         )
+    return identity_index
 
 
 def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
@@ -1926,8 +2367,42 @@ def load_compact_frames(
     diagnostic_examples: list[tuple[str, str]] = []
     seen_examples: set[tuple[str, str]] = set()
     successful = sorted(state["successful_dates"])
+    stored_by_day: list[tuple[str, pd.DataFrame]] = []
+    unresolved_pairs: set[tuple[str, str]] = set()
+    print(
+        "  ⏳ 掃描全部 compact 的權證代號日期，檢查是否需要母股分片補抓...",
+        flush=True,
+    )
     for index, day in enumerate(successful, start=1):
         stored = read_parquet(compact_path(day))
+        stored_by_day.append((day, stored))
+        if {"權證代號", "日期"}.issubset(stored.columns):
+            for warrant_code, trade_day in stored[
+                ["權證代號", "日期"]
+            ].drop_duplicates().itertuples(index=False, name=None):
+                pair = (
+                    normalize_code(warrant_code),
+                    iso_date(trade_day) or "",
+                )
+                if (
+                    pair[0]
+                    and pair[1]
+                    and not identity_pair_is_matched(identity_index, pair)
+                ):
+                    unresolved_pairs.add(pair)
+        if index % PROGRESS_EVERY_DAYS == 0:
+            print(
+                f"    compact 身分掃描：{index:,}/{len(successful):,}｜"
+                f"待補代號日期 {len(unresolved_pairs):,}",
+                flush=True,
+            )
+    if unresolved_pairs:
+        identity_index = backfill_identity_from_target_shards(
+            identity_index,
+            unresolved_pairs,
+        )
+
+    for index, (day, stored) in enumerate(stored_by_day, start=1):
         frame = enrich_compact_identity(stored, identity_index)
         frames.append(frame)
         identity_rows += len(frame)
@@ -3256,6 +3731,190 @@ def run_self_tests() -> dict[str, str]:
     finally:
         globals()["fetch_dataset"] = original_fetch_dataset
 
+    original_request_with_retries = globals()["request_with_retries"]
+    original_target_cache_paths = globals()["warrant_summary_target_cache_paths"]
+    original_atomic_write_parquet = globals()["atomic_write_parquet"]
+    target_query_calls: list[dict[str, Any]] = []
+
+    class FakeSummaryResponse:
+        status_code = 200
+
+        def __init__(self, rows: list[dict[str, Any]]):
+            self.rows = rows
+
+        def json(self) -> dict[str, Any]:
+            return {"status": 200, "data": self.rows}
+
+    def fake_target_cache_paths(target_code: str) -> tuple[Path, Path]:
+        return (
+            Path(f"__self_test_{target_code}.parquet"),
+            Path(f"__self_test_{target_code}.empty.json"),
+        )
+
+    def fake_target_request(
+        url: str,
+        *,
+        params: dict[str, Any],
+        description: str,
+        attempts: Optional[int] = None,
+    ) -> FakeSummaryResponse:
+        target_query_calls.append(dict(params))
+        return FakeSummaryResponse(
+            [
+                {
+                    "stock_id": "WREUSE",
+                    "target_stock_id": "2330",
+                    "type": "認購",
+                    "date": "2023-01-01",
+                    "end_date": "2023-12-31",
+                }
+            ]
+        )
+
+    globals()["request_with_retries"] = fake_target_request
+    globals()["warrant_summary_target_cache_paths"] = fake_target_cache_paths
+    globals()["atomic_write_parquet"] = lambda frame, path: None
+    try:
+        target_shard_test = fetch_warrant_summary_target_history(
+            "2330",
+            "2023-01-01",
+            "2023-12-31",
+        )
+    finally:
+        globals()["request_with_retries"] = original_request_with_retries
+        globals()["warrant_summary_target_cache_paths"] = (
+            original_target_cache_paths
+        )
+        globals()["atomic_write_parquet"] = original_atomic_write_parquet
+    assert len(target_shard_test) == 1
+    assert target_query_calls[-1]["data_id"] == "2330"
+
+    original_save_identity = globals()["save_warrant_identity_index"]
+    original_target_fetch = globals()["fetch_warrant_summary_target_history"]
+    base_reused_index = WarrantIdentityIndex(
+        [
+            WarrantIdentity(
+                "WREUSE",
+                "臻鼎測試購01",
+                "認購",
+                "4958",
+                "臻鼎-KY",
+                "2025-08-01",
+                "2026-02-01",
+                "Matched",
+                "目前區間",
+            )
+        ]
+    )
+
+    def fake_support_fetch(
+        dataset: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        cache: bool = False,
+        force: bool = False,
+        cache_key: str = "",
+    ) -> pd.DataFrame:
+        if dataset == "TaiwanStockInfoWithWarrant":
+            return pd.DataFrame(
+                [
+                    {
+                        "stock_id": "WREUSE",
+                        "stock_name": "台積電測試購01",
+                    }
+                ]
+            )
+        if dataset == "TaiwanStockInfo":
+            return pd.DataFrame(
+                [
+                    {
+                        "stock_id": "2330",
+                        "stock_name": "台積電",
+                        "date": "2021-01-01",
+                    },
+                    {
+                        "stock_id": "4958",
+                        "stock_name": "臻鼎-KY",
+                        "date": "2021-01-01",
+                    },
+                ]
+            )
+        raise AssertionError(dataset)
+
+    def fake_target_history(
+        target_code: str,
+        start_date: str = WARRANT_SUMMARY_HISTORY_START,
+        end_date: str = "",
+    ) -> pd.DataFrame:
+        if target_code == "2330":
+            return pd.DataFrame(
+                [
+                    {
+                        "stock_id": "WREUSE",
+                        "target_stock_id": "2330",
+                        "type": "認購",
+                        "date": "2023-01-01",
+                        "end_date": "2023-12-31",
+                    }
+                ]
+            )
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "target_stock_id",
+                "type",
+                "date",
+                "end_date",
+            ]
+        )
+
+    globals()["fetch_dataset"] = fake_support_fetch
+    globals()["fetch_warrant_summary_target_history"] = fake_target_history
+    globals()["save_warrant_identity_index"] = (
+        lambda records: WarrantIdentityIndex(records)
+    )
+    try:
+        repaired_reused_index = backfill_identity_from_target_shards(
+            base_reused_index,
+            {("WREUSE", "2023-06-21")},
+        )
+    finally:
+        globals()["fetch_dataset"] = original_fetch_dataset
+        globals()["fetch_warrant_summary_target_history"] = original_target_fetch
+        globals()["save_warrant_identity_index"] = original_save_identity
+    repaired_identity = repaired_reused_index.resolve(
+        "WREUSE",
+        "2023-06-21",
+    )
+    assert repaired_identity.status == "Matched"
+    assert repaired_identity.target_code == "2330"
+    explicit_target_records = build_identity_records_from_summary(
+        pd.DataFrame(
+            [
+                {
+                    "stock_id": "WREUSE",
+                    "target_stock_id": "2330",
+                    "type": "認購",
+                    "date": "2023-01-01",
+                    "end_date": "2023-12-31",
+                }
+            ]
+        ),
+        {"WREUSE": ["臻鼎測試購01"]},
+        stock_alias_resolver(
+            {
+                "2330": "台積電",
+                "4958": "臻鼎-KY",
+            }
+        ),
+        {
+            "2330": "台積電",
+            "4958": "臻鼎-KY",
+        },
+    )
+    assert explicit_target_records[0].target_code == "2330"
+    assert explicit_target_records[0].name == "WREUSE"
+
     resolver_test = stock_alias_resolver(
         {
             "1111": "台積",
@@ -3587,6 +4246,9 @@ def run_self_tests() -> dict[str, str]:
         "Summary明確日期年度切片": "PASS",
         "Summary年度合併去重": "PASS",
         "Summary忽略日期時拒絕快取": "PASS",
+        "Summary母股data_id分片查詢": "PASS",
+        "代號重用母股分片日期補配": "PASS",
+        "日期化母股不被目前名稱覆蓋": "PASS",
         "標的前綴字典與名稱memo": "PASS",
         "FinMind日檔精簡與_date欄位": "PASS",
         "均線位置與排列": "PASS",
@@ -3614,9 +4276,11 @@ def rebuild_statistics(
     state: dict[str, Any], expected_dates: list[str]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     print("【階段二】只讀 compact_daily，重新配對身分並重建事件、FIFO、均線與統計...")
+    set_run_stage(state, "identity_history")
     print("  ⏳ 載入或建立日期化權證身分索引...", flush=True)
     identity_index = build_warrant_identity_index()
     compact_frames, events = load_compact_frames(state, identity_index)
+    set_run_stage(state, "statistics")
     sales = build_sale_rows(compact_frames)
     events = simulate_group_outcomes_fifo(events, sales)
     last_day = max(state["successful_dates"], default="")
@@ -3680,6 +4344,7 @@ def main() -> int:
         print(f"  ✅ 目標分點對照完成：{len(broker_map):,} 個", flush=True)
         if state["successful_dates"]:
             print("【下載前檢查】抽查既有 compact 的身分配對品質...", flush=True)
+            set_run_stage(state, "identity_history")
             preflight_identity_quality(
                 state,
                 build_warrant_identity_index(),
@@ -3694,7 +4359,6 @@ def main() -> int:
         raise RuntimeError(
             "FORCE_RECALCULATE_STATS=1，但本機沒有任何成功 compact_daily"
         )
-    set_run_stage(state, "statistics")
     (
         events,
         condition_stats,
