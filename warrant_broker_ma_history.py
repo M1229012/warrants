@@ -52,7 +52,7 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.0.0"
+PROGRAM_VERSION = "1.0.1"
 SCHEMA_VERSION = "ma-history-v1"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
@@ -87,6 +87,9 @@ MAX_RETRIES = max(int(os.getenv("FINMIND_MAX_RETRIES", "4")), 1)
 RETRY_BASE_SECONDS = max(float(os.getenv("FINMIND_RETRY_BASE_SECONDS", "2")), 0.1)
 METADATA_CACHE_HOURS = max(float(os.getenv("FINMIND_METADATA_CACHE_HOURS", "12")), 0)
 PROGRESS_EVERY_DAYS = max(int(os.getenv("PROGRESS_EVERY_DAYS", "20")), 1)
+LOCAL_ERROR_CIRCUIT_BREAKER = max(
+    int(os.getenv("LOCAL_ERROR_CIRCUIT_BREAKER", "5")), 2
+)
 MA20_FLAT_TOLERANCE_PCT = float(
     os.getenv("MA20_FLAT_TOLERANCE_PCT", "0.001")
 )
@@ -787,12 +790,13 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
     records: list[WarrantIdentity] = []
     work = summary.copy().fillna("")
     work = work[work["type"].astype(str).str.contains("認購", na=False)]
-    for row in work.itertuples(index=False):
-        values = row._asdict()
-        code = normalize_code(values.get("stock_id"))
-        target = normalize_code(values.get("target_stock_id"))
-        listed = iso_date(values.get("date"))
-        ended = iso_date(values.get("end_date"))
+    for raw_code, raw_target, raw_listed, raw_ended in work[
+        ["stock_id", "target_stock_id", "date", "end_date"]
+    ].itertuples(index=False, name=None):
+        code = normalize_code(raw_code)
+        target = normalize_code(raw_target)
+        listed = iso_date(raw_listed)
+        ended = iso_date(raw_ended)
         if not code or not listed or not ended:
             continue
         names = names_by_code.get(code, [])
@@ -900,18 +904,26 @@ def normalize_warrant_day(
     )
     before_dedup = len(grouped)
     records: list[dict[str, Any]] = []
-    for row in grouped.itertuples(index=False):
-        values = row._asdict()
-        warrant_code = values["stock_id"]
-        broker_code = values["securities_trader_id"]
-        trade_day = values["_date"] or day
+    # name=None 很重要：Pandas namedtuple 會把前導底線欄位 `_date`
+    # 自動改名成 `_2`，再用 row._asdict() 讀 `_date` 會造成 KeyError。
+    for (
+        warrant_code,
+        broker_code,
+        trade_day,
+        buy_qty,
+        sell_qty,
+        buy_amount,
+        sell_amount,
+        finmind_broker_name,
+    ) in grouped.itertuples(index=False, name=None):
+        trade_day = trade_day or day
         identity = identity_index.resolve(warrant_code, trade_day)
         label, configured_name, canonical_code = broker_by_code[broker_code]
-        broker_name = values["FinMind分點名稱"] or configured_name
-        buy_qty = int(values["買進股數"])
-        sell_qty = int(values["賣出股數"])
-        buy_amount = int(values["買進金額"])
-        sell_amount = int(values["賣出金額"])
+        broker_name = finmind_broker_name or configured_name
+        buy_qty = int(buy_qty)
+        sell_qty = int(sell_qty)
+        buy_amount = int(buy_amount)
+        sell_amount = int(sell_amount)
         records.append(
             {
                 "權證代號": warrant_code,
@@ -950,6 +962,30 @@ def raw_path(day: str) -> Path:
 
 def compact_path(day: str) -> Path:
     return COMPACT_DAILY_DIR / f"{day}.parquet"
+
+
+def load_valid_raw_day(day: str) -> Optional[pd.DataFrame]:
+    """讀取精簡失敗後留下的 raw，讓下次執行不必重新呼叫 FinMind。"""
+    path = raw_path(day)
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    try:
+        raw = read_parquet(path)
+        missing = RAW_REQUIRED_COLUMNS - set(raw.columns)
+        actual_dates = {iso_date(value) for value in raw["date"] if iso_date(value)}
+        if raw.empty or missing or actual_dates != {day}:
+            print(
+                f"  ⚠️ {day} 暫存 raw 驗證失敗，將重新下載："
+                f"missing={sorted(missing)} dates={sorted(actual_dates)}"
+            )
+            return None
+        return raw
+    except Exception as exc:
+        print(
+            f"  ⚠️ {day} 暫存 raw 無法讀取，將重新下載："
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
 
 
 def validate_saved_day(day: str) -> tuple[bool, str, int, int]:
@@ -1121,9 +1157,16 @@ def download_and_compact_history(
     )
     processed = 0
     new_compact_rows = 0
+    last_local_error_signature = ""
+    consecutive_local_errors = 0
     for day in queue:
         try:
-            result = download_warrant_day(day)
+            cached_raw = load_valid_raw_day(day)
+            result = (
+                DownloadResult("ok", cached_raw, "沿用精簡失敗後保存的 raw")
+                if cached_raw is not None
+                else download_warrant_day(day)
+            )
             if result.status == "empty":
                 mark_day_status(state, day, "empty", result.reason)
                 print(f"  ↪️ {day}：FinMind 明確回覆無全市場日檔")
@@ -1132,11 +1175,13 @@ def download_and_compact_history(
                 print(f"  ❌ {day}：{result.reason}")
             else:
                 raw = result.frame
+                # 先保存 raw，再進行精簡。精簡或身分配對失敗時 raw 會留下，
+                # 下次直接重用；compact 驗證成功後才依 KEEP_RAW_DAILY 決定刪除。
+                if cached_raw is None:
+                    atomic_write_parquet(raw, raw_path(day))
                 compact, pre_dedup_rows = normalize_warrant_day(
                     raw, day, identity_index, broker_map
                 )
-                if KEEP_RAW_DAILY:
-                    atomic_write_parquet(raw, raw_path(day))
                 atomic_write_parquet(compact, compact_path(day))
                 ok, reason, raw_rows, compact_rows = validate_saved_day(day)
                 if not ok:
@@ -1145,6 +1190,14 @@ def download_and_compact_history(
                 state["compact_rows_by_date"][day] = compact_rows
                 state["deduplicated_rows_by_date"][day] = compact_rows
                 mark_day_status(state, day, "ok")
+                if not KEEP_RAW_DAILY:
+                    try:
+                        raw_path(day).unlink(missing_ok=True)
+                    except Exception as exc:
+                        print(
+                            f"  ⚠️ {day} compact 已成功，但暫存 raw 刪除失敗："
+                            f"{type(exc).__name__}: {exc}"
+                        )
                 new_compact_rows += compact_rows
                 unmatched = int(
                     (compact["身分配對狀態"] != "Matched").sum()
@@ -1153,14 +1206,27 @@ def download_and_compact_history(
                     f"  ✅ {day}：原始 {raw_rows:,}｜26分點 {compact_rows:,}｜"
                     f"身分待確認 {unmatched:,}"
                 )
+            last_local_error_signature = ""
+            consecutive_local_errors = 0
         except KeyboardInterrupt:
             print("\n⏹️ 使用者中止；已完成日期均已保存。")
             raise
         except Exception as exc:
+            signature = f"{type(exc).__name__}: {exc}"
             mark_day_status(
-                state, day, "error", f"{type(exc).__name__}: {exc}"
+                state, day, "error", signature
             )
-            print(f"  ❌ {day}：{type(exc).__name__}: {exc}")
+            print(f"  ❌ {day}：{signature}")
+            if signature == last_local_error_signature:
+                consecutive_local_errors += 1
+            else:
+                last_local_error_signature = signature
+                consecutive_local_errors = 1
+            if consecutive_local_errors >= LOCAL_ERROR_CIRCUIT_BREAKER:
+                raise RuntimeError(
+                    f"連續 {consecutive_local_errors} 個交易日發生相同本機處理錯誤，"
+                    f"已啟動斷路器避免持續浪費 runner 時間：{signature}"
+                ) from exc
         processed += 1
         if processed % PROGRESS_EVERY_DAYS == 0:
             print_download_progress(state, new_compact_rows, processed)
@@ -1211,18 +1277,19 @@ def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
         )
         lots: list[dict[str, Any]] = []
         max_single = 0
-        for row in warrants.itertuples(index=False):
-            values = row._asdict()
-            amount = int(values["買進金額"] or 0)
-            quantity = int(values["買進股數"] or 0)
+        for warrant_code, warrant_name, raw_amount, raw_quantity in warrants[
+            ["權證代號", "權證名稱", "買進金額", "買進股數"]
+        ].itertuples(index=False, name=None):
+            amount = int(raw_amount or 0)
+            quantity = int(raw_quantity or 0)
             if amount <= 0 or quantity <= 0:
                 continue
             max_single = max(max_single, amount)
             lots.append(
                 {
                     "買進日": event_day,
-                    "權證代號": normalize_code(values["權證代號"]),
-                    "權證名稱": str(values["權證名稱"] or ""),
+                    "權證代號": normalize_code(warrant_code),
+                    "權證名稱": str(warrant_name or ""),
                     "金額": amount,
                     "股數": quantity,
                 }
@@ -2262,6 +2329,52 @@ def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
 
 def run_self_tests() -> dict[str, str]:
     """不連網的小型測試；失敗時直接拋出 AssertionError。"""
+    raw_test = pd.DataFrame(
+        [
+            {
+                "securities_trader": "測試分點",
+                "price": 10.0,
+                "buy": 100,
+                "sell": 20,
+                "securities_trader_id": "T001",
+                "stock_id": "W1",
+                "date": "2026-01-02",
+            },
+            {
+                "securities_trader": "測試分點",
+                "price": 11.0,
+                "buy": 50,
+                "sell": 0,
+                "securities_trader_id": "T001",
+                "stock_id": "W1",
+                "date": "2026-01-02",
+            },
+        ]
+    )
+    identity_test = WarrantIdentityIndex(
+        [
+            WarrantIdentity(
+                "W1",
+                "測試購01",
+                "2330",
+                "台積電",
+                "2025-01-01",
+                "2026-12-31",
+                "Matched",
+                "測試身分",
+            )
+        ]
+    )
+    normalized_test, _ = normalize_warrant_day(
+        raw_test,
+        "2026-01-02",
+        identity_test,
+        {"測試分點": ("測試分點", "T001")},
+    )
+    assert len(normalized_test) == 1
+    assert normalized_test.iloc[0]["日期"] == "2026-01-02"
+    assert int(normalized_test.iloc[0]["買進股數"]) == 150
+
     high = calculate_ma_values(make_test_ma_row(), "2026-01-30")
     assert high["MA位置代碼"] == "111"
     assert high["均線多頭排列"] is True
@@ -2415,6 +2528,7 @@ def run_self_tests() -> dict[str, str]:
     assert summary["勝筆數"] == 1 and summary["敗筆數"] == 1
     assert summary["平手筆數"] == 1
     return {
+        "FinMind日檔精簡與_date欄位": "PASS",
         "均線位置與排列": "PASS",
         "剛站上MA20": "PASS",
         "剛跌破MA10": "PASS",
