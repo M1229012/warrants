@@ -108,8 +108,8 @@ jobs:
             )"
             echo "程式收到超時中止訊號；當時階段=$stage"
 
-            if [[ "$stage" == "downloading" ]]; then
-              echo "下載階段已安全中止；保存 cache 後將自動啟動下一輪。"
+            if [[ "$stage" == "downloading" || "$stage" == "identity_history" ]]; then
+              echo "可續跑階段已安全中止；保存逐日／母股分片 cache 後將自動啟動下一輪。"
               needs_continue=true
               status=0
             elif [[ "$stage" == "complete" ]]; then
