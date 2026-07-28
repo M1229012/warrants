@@ -52,13 +52,17 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.2.0"
+PROGRAM_VERSION = "1.2.1"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v3-all-types-stage2"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v4-explicit-history-chunks"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
 FINMIND_DOCUMENTED_START = "2023-06-21"
+WARRANT_SUMMARY_HISTORY_START = os.getenv(
+    "WARRANT_SUMMARY_HISTORY_START_DATE", "2011-01-03"
+).strip()
+WARRANT_SUMMARY_CACHE_PREFIX = "TaiwanStockInfoWithWarrantSummary_history"
 
 BASE_DIR = Path(os.getenv("MA_HISTORY_BASE_DIR", ".")).resolve()
 CACHE_ROOT = Path(
@@ -456,8 +460,11 @@ def request_with_retries(
     )
 
 
-def metadata_cache_path(dataset: str) -> Path:
-    return METADATA_DIR / f"{dataset}.parquet"
+def metadata_cache_path(cache_key: str) -> Path:
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]", "_", str(cache_key or "").strip())
+    if not safe_key:
+        raise ValueError("metadata cache key 不得為空")
+    return METADATA_DIR / f"{safe_key}.parquet"
 
 
 def fetch_dataset(
@@ -466,6 +473,7 @@ def fetch_dataset(
     params: Optional[dict[str, Any]] = None,
     cache: bool = False,
     force: bool = False,
+    cache_key: str = "",
 ) -> pd.DataFrame:
     started_at = time.perf_counter()
     parameter_note = ""
@@ -477,7 +485,7 @@ def fetch_dataset(
         ]
         if interesting:
             parameter_note = f"（{', '.join(interesting)}）"
-    cache_path = metadata_cache_path(dataset)
+    cache_path = metadata_cache_path(cache_key or dataset)
     if cache and cache_path.exists() and not force:
         age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
         if age_hours <= METADATA_CACHE_HOURS:
@@ -526,6 +534,119 @@ def fetch_dataset(
                 )
                 return cached
         raise
+
+
+def warrant_summary_chunk_ranges(
+    start_date: str,
+    end_date: str,
+) -> list[tuple[str, str]]:
+    start = parse_date(start_date)
+    end = parse_date(end_date)
+    if start is None or end is None or start.date() > end.date():
+        raise ValueError(
+            f"權證 Summary 歷史範圍無效：{start_date}～{end_date}"
+        )
+    cursor = start.date()
+    final_day = end.date()
+    ranges: list[tuple[str, str]] = []
+    while cursor <= final_day:
+        next_year = date(cursor.year + 1, 1, 1)
+        chunk_end = min(next_year, final_day)
+        ranges.append((cursor.isoformat(), chunk_end.isoformat()))
+        if chunk_end >= final_day:
+            break
+        # 相鄰年度在 1 月 1 日重疊一天；合併時去重，可兼容 API 的
+        # end_date 為含首不含尾或首尾皆含兩種實作。
+        cursor = chunk_end
+    return ranges
+
+
+def fetch_warrant_summary_history(
+    start_date: str = WARRANT_SUMMARY_HISTORY_START,
+    end_date: str = "",
+) -> pd.DataFrame:
+    """明確帶日期、逐年下載完整權證代號重用歷史。"""
+    normalized_start = iso_date(start_date)
+    normalized_end = iso_date(end_date) or datetime.now().date().isoformat()
+    if not normalized_start or not normalized_end:
+        raise ValueError("權證 Summary 歷史起訖日期無效")
+    required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
+    frames: list[pd.DataFrame] = []
+    ranges = warrant_summary_chunk_ranges(normalized_start, normalized_end)
+    print(
+        f"  ⏳ 分段下載權證標的完整歷史：{normalized_start}～"
+        f"{normalized_end}｜{len(ranges)} 段",
+        flush=True,
+    )
+    for index, (chunk_start, chunk_end) in enumerate(ranges, start=1):
+        cache_key = (
+            f"{WARRANT_SUMMARY_CACHE_PREFIX}_"
+            f"{chunk_start.replace('-', '')}"
+        )
+        frame = fetch_dataset(
+            "TaiwanStockInfoWithWarrantSummary",
+            params={
+                "start_date": chunk_start,
+                "end_date": chunk_end,
+            },
+            cache=True,
+            cache_key=cache_key,
+        )
+        missing = required - set(frame.columns)
+        if missing:
+            raise RuntimeError(
+                f"權證 Summary {chunk_start}～{chunk_end} 缺少欄位："
+                f"{sorted(missing)}"
+            )
+        work = frame.copy()
+        work["date"] = work["date"].map(iso_date)
+        work["end_date"] = work["end_date"].map(iso_date)
+        if work["date"].isna().any() or work["end_date"].isna().any():
+            raise RuntimeError(
+                f"權證 Summary {chunk_start}～{chunk_end} 含無效上市／下市日期"
+            )
+        outside = (work["date"] < chunk_start) | (work["date"] > chunk_end)
+        if outside.any():
+            raise RuntimeError(
+                "FinMind 權證 Summary 未遵守請求的年度範圍："
+                f"要求 {chunk_start}～{chunk_end}，"
+                f"實際 {work['date'].min()}～{work['date'].max()}。"
+                "禁止快取不完整或跨段資料。"
+            )
+        frames.append(work)
+        print(
+            f"    Summary 歷史進度：{index}/{len(ranges)}｜"
+            f"{chunk_start}～{chunk_end}｜{len(work):,} 筆",
+            flush=True,
+        )
+    if not frames:
+        raise RuntimeError("權證 Summary 完整歷史沒有任何分段資料")
+    combined = pd.concat(frames, ignore_index=True)
+    dedup_keys = [
+        "stock_id",
+        "target_stock_id",
+        "type",
+        "date",
+        "end_date",
+    ]
+    combined = (
+        combined.drop_duplicates(dedup_keys, keep="last")
+        .sort_values(["date", "stock_id", "end_date"])
+        .reset_index(drop=True)
+    )
+    earliest = min(combined["date"], default="")
+    if not earliest or earliest > FINMIND_DOCUMENTED_START:
+        raise RuntimeError(
+            "權證 Summary 歷史仍不完整："
+            f"最早上市日 {earliest or '-'} 晚於分點資料起始日 "
+            f"{FINMIND_DOCUMENTED_START}。禁止建立身分索引。"
+        )
+    print(
+        f"  ✅ 權證標的完整歷史合併：{len(combined):,} 筆｜"
+        f"最早上市 {earliest}｜最新上市 {max(combined['date'], default='-')}",
+        flush=True,
+    )
+    return combined
 
 
 def trading_dates() -> list[str]:
@@ -903,13 +1024,19 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
         )
         return None
 
-    source_paths = [
-        metadata_cache_path(dataset)
-        for dataset in (
-            "TaiwanStockInfoWithWarrant",
-            "TaiwanStockInfoWithWarrantSummary",
-            "TaiwanStockInfo",
+    summary_history_paths = sorted(
+        METADATA_DIR.glob(f"{WARRANT_SUMMARY_CACHE_PREFIX}_*.parquet")
+    )
+    if not summary_history_paths:
+        print(
+            "  ℹ️ 尚無明確日期範圍的權證 Summary 歷史快取，重新建立索引。",
+            flush=True,
         )
+        return None
+    source_paths = [
+        metadata_cache_path("TaiwanStockInfoWithWarrant"),
+        metadata_cache_path("TaiwanStockInfo"),
+        *summary_history_paths,
     ]
     newer_sources = [
         source.name
@@ -934,6 +1061,7 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
         "status",
         "reason",
         "_identity_schema_version",
+        "_summary_history_start",
     }
     try:
         frame = read_parquet(path)
@@ -945,6 +1073,17 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
             print(
                 f"  ℹ️ 權證身分索引快取 schema 不相容，重新建立："
                 f"missing={sorted(missing)} versions={sorted(versions)}",
+                flush=True,
+            )
+            return None
+        history_starts = set(
+            frame["_summary_history_start"].dropna().astype(str).unique()
+        )
+        if history_starts != {WARRANT_SUMMARY_HISTORY_START}:
+            print(
+                "  ℹ️ 權證身分索引歷史起日不符，重新建立："
+                f"cache={sorted(history_starts)} "
+                f"expected={WARRANT_SUMMARY_HISTORY_START}",
                 flush=True,
             )
             return None
@@ -998,7 +1137,7 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
     started_at = time.perf_counter()
     print("【初始化】建立日期化權證身分索引...", flush=True)
     info = fetch_dataset("TaiwanStockInfoWithWarrant", cache=True)
-    summary = fetch_dataset("TaiwanStockInfoWithWarrantSummary", cache=True)
+    summary = fetch_warrant_summary_history()
     stock_info = fetch_dataset("TaiwanStockInfo", cache=True)
     required = {"stock_id", "target_stock_id", "type", "date", "end_date"}
     missing = required - set(summary.columns)
@@ -1130,6 +1269,8 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
             deduplicated[key] = record
     frame = pd.DataFrame([record.__dict__ for record in deduplicated.values()])
     frame["_identity_schema_version"] = IDENTITY_INDEX_SCHEMA_VERSION
+    frame["_summary_history_start"] = WARRANT_SUMMARY_HISTORY_START
+    frame["_summary_history_end"] = datetime.now().date().isoformat()
     frame["_built_at"] = datetime.now().isoformat(timespec="seconds")
     atomic_write_parquet(frame, identity_index_cache_path())
     print(
@@ -3025,6 +3166,96 @@ def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
 
 def run_self_tests() -> dict[str, str]:
     """不連網的小型測試；失敗時直接拋出 AssertionError。"""
+    test_ranges = warrant_summary_chunk_ranges(
+        "2022-06-01",
+        "2024-02-01",
+    )
+    assert test_ranges == [
+        ("2022-06-01", "2023-01-01"),
+        ("2023-01-01", "2024-01-01"),
+        ("2024-01-01", "2024-02-01"),
+    ]
+    summary_calls: list[tuple[dict[str, Any], str]] = []
+    original_fetch_dataset = globals()["fetch_dataset"]
+
+    def fake_summary_fetch(
+        dataset: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        cache: bool = False,
+        force: bool = False,
+        cache_key: str = "",
+    ) -> pd.DataFrame:
+        assert dataset == "TaiwanStockInfoWithWarrantSummary"
+        assert params and params.get("start_date") and params.get("end_date")
+        assert cache and cache_key.startswith(WARRANT_SUMMARY_CACHE_PREFIX)
+        summary_calls.append((dict(params), cache_key))
+        chunk_start = str(params["start_date"])
+        chunk_end = str(params["end_date"])
+        rows = [
+            {
+                "stock_id": f"W{chunk_start[:4]}",
+                "target_stock_id": "2330",
+                "type": "認購",
+                "date": chunk_start,
+                "end_date": chunk_end,
+            }
+        ]
+        if chunk_end == "2023-01-01" or chunk_start == "2023-01-01":
+            rows.append(
+                {
+                    "stock_id": "WDUP",
+                    "target_stock_id": "2330",
+                    "type": "認購",
+                    "date": "2023-01-01",
+                    "end_date": "2023-12-31",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    globals()["fetch_dataset"] = fake_summary_fetch
+    try:
+        summary_test = fetch_warrant_summary_history(
+            "2022-06-01",
+            "2024-02-01",
+        )
+    finally:
+        globals()["fetch_dataset"] = original_fetch_dataset
+    assert len(summary_calls) == 3
+    assert len({cache_key for _, cache_key in summary_calls}) == 3
+    assert len(summary_test[summary_test["stock_id"] == "WDUP"]) == 1
+
+    def fake_ignored_range(
+        dataset: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        cache: bool = False,
+        force: bool = False,
+        cache_key: str = "",
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "stock_id": "WBAD",
+                    "target_stock_id": "2330",
+                    "type": "認購",
+                    "date": "2025-08-01",
+                    "end_date": "2026-02-01",
+                }
+            ]
+        )
+
+    globals()["fetch_dataset"] = fake_ignored_range
+    try:
+        try:
+            fetch_warrant_summary_history("2022-01-01", "2022-12-31")
+        except RuntimeError as exc:
+            assert "未遵守請求的年度範圍" in str(exc)
+        else:
+            raise AssertionError("Summary 忽略日期範圍時必須停止")
+    finally:
+        globals()["fetch_dataset"] = original_fetch_dataset
+
     resolver_test = stock_alias_resolver(
         {
             "1111": "台積",
@@ -3353,6 +3584,9 @@ def run_self_tests() -> dict[str, str]:
     assert summary["勝筆數"] == 1 and summary["敗筆數"] == 1
     assert summary["平手筆數"] == 1
     return {
+        "Summary明確日期年度切片": "PASS",
+        "Summary年度合併去重": "PASS",
+        "Summary忽略日期時拒絕快取": "PASS",
         "標的前綴字典與名稱memo": "PASS",
         "FinMind日檔精簡與_date欄位": "PASS",
         "均線位置與排列": "PASS",
