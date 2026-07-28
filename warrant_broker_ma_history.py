@@ -52,9 +52,9 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.2.2"
+PROGRAM_VERSION = "1.2.3"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v5-target-shard-backfill"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v6-exhaustive-target-shards"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -252,6 +252,10 @@ CONDITION_SPECS = [
 _thread_local = threading.local()
 
 
+class FinMindQuotaExceeded(RuntimeError):
+    """FinMind 回傳 402；歷史分片可保留，等待額度恢復後續抓。"""
+
+
 def ensure_directories() -> None:
     for path in (
         RAW_DAILY_DIR,
@@ -441,13 +445,19 @@ def request_with_retries(
                 headers=finmind_headers(),
                 timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
             )
-            if response.status_code in (401, 402, 403):
+            if response.status_code == 402:
+                raise FinMindQuotaExceeded(
+                    "FinMind API 使用次數已達上限（HTTP 402）"
+                )
+            if response.status_code in (401, 403):
                 raise RuntimeError(
                     f"FinMind 權限或額度錯誤（HTTP {response.status_code}）"
                 )
             if response.status_code >= 500 or response.status_code in (408, 429):
                 response.raise_for_status()
             return response
+        except FinMindQuotaExceeded:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < total_attempts:
@@ -1639,65 +1649,161 @@ def backfill_identity_from_target_shards(
         f"無可靠名稱候選 {len(codes_without_candidate):,} 個權證代號",
         flush=True,
     )
-    if not candidate_targets:
-        return identity_index
-
-    shard_frames: list[pd.DataFrame] = []
-    consecutive_errors = 0
-    failed_targets: list[str] = []
-    for index, target in enumerate(sorted(candidate_targets), start=1):
-        try:
-            shard = fetch_warrant_summary_target_history(target)
-            consecutive_errors = 0
-            if not shard.empty:
-                shard_frames.append(shard)
-        except Exception as exc:
-            consecutive_errors += 1
-            failed_targets.append(target)
-            print(
-                f"    ⚠️ 母股 {target} 歷史分片失敗："
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            if consecutive_errors >= LOCAL_ERROR_CIRCUIT_BREAKER:
-                raise RuntimeError(
-                    "母股歷史分片連續失敗 "
-                    f"{consecutive_errors} 次，停止避免消耗 API 額度"
-                ) from exc
-        if index % 25 == 0 or index == len(candidate_targets):
-            print(
-                f"  📚 母股歷史補抓進度：{index:,}/"
-                f"{len(candidate_targets):,}｜"
-                f"有資料 {len(shard_frames):,}｜"
-                f"失敗 {len(failed_targets):,}",
-                flush=True,
-            )
-
-    if not shard_frames:
-        print("  ⚠️ 母股分片沒有取得任何可加入的歷史區間。", flush=True)
-        return identity_index
-
-    shard_summary = pd.concat(shard_frames, ignore_index=True)
-    new_records = build_identity_records_from_summary(
-        shard_summary,
-        all_names,
-        resolver,
-        stock_master,
-        progress_label="配對母股分片補回區間",
-    )
-    repaired_index = save_warrant_identity_index(
-        [*identity_index.records(), *new_records]
-    )
     matched_before = sum(
         identity_pair_is_matched(identity_index, pair)
         for pair in normalized_pairs
     )
+
+    def fetch_target_round(
+        targets: set[str],
+        round_label: str,
+    ) -> list[pd.DataFrame]:
+        frames: list[pd.DataFrame] = []
+        consecutive_errors = 0
+        failed_targets: list[str] = []
+        ordered_targets = sorted(
+            {normalize_code(target) for target in targets if normalize_code(target)}
+        )
+        if not ordered_targets:
+            return frames
+        print(
+            f"  📚 {round_label}：共 {len(ordered_targets):,} 檔母股",
+            flush=True,
+        )
+        for index, target in enumerate(ordered_targets, start=1):
+            while True:
+                try:
+                    shard = fetch_warrant_summary_target_history(target)
+                    consecutive_errors = 0
+                    if not shard.empty:
+                        frames.append(shard)
+                    break
+                except FinMindQuotaExceeded:
+                    wait_seconds = max(
+                        int(
+                            os.getenv(
+                                "FINMIND_QUOTA_WAIT_SECONDS",
+                                "3660",
+                            )
+                        ),
+                        60,
+                    )
+                    print(
+                        "    ⏸️ FinMind API 額度已用完；"
+                        f"已完成分片均已保存，等待 {wait_seconds:,} 秒後"
+                        f"從母股 {target} 接續。若先達 GitHub 截止時間，"
+                        "下一個 workflow 會從快取續跑。",
+                        flush=True,
+                    )
+                    time.sleep(wait_seconds)
+                except Exception as exc:
+                    consecutive_errors += 1
+                    failed_targets.append(target)
+                    print(
+                        f"    ⚠️ 母股 {target} 歷史分片失敗："
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    if consecutive_errors >= LOCAL_ERROR_CIRCUIT_BREAKER:
+                        raise RuntimeError(
+                            "母股歷史分片連續失敗 "
+                            f"{consecutive_errors} 次，停止避免消耗 API 額度"
+                        ) from exc
+                    break
+            if index % 25 == 0 or index == len(ordered_targets):
+                print(
+                    f"  📚 {round_label}進度：{index:,}/"
+                    f"{len(ordered_targets):,}｜"
+                    f"有資料 {len(frames):,}｜"
+                    f"失敗 {len(failed_targets):,}",
+                    flush=True,
+                )
+        return frames
+
+    def merge_shard_frames(
+        base_index: WarrantIdentityIndex,
+        frames: list[pd.DataFrame],
+        progress_label: str,
+    ) -> tuple[WarrantIdentityIndex, int]:
+        if not frames:
+            return base_index, 0
+        shard_summary = pd.concat(frames, ignore_index=True).drop_duplicates(
+            ["stock_id", "target_stock_id", "type", "date", "end_date"],
+            keep="last",
+        )
+        new_records = build_identity_records_from_summary(
+            shard_summary,
+            all_names,
+            resolver,
+            stock_master,
+            progress_label=progress_label,
+        )
+        return (
+            save_warrant_identity_index(
+                [*base_index.records(), *new_records]
+            ),
+            len(new_records),
+        )
+
+    candidate_frames = fetch_target_round(
+        candidate_targets,
+        "名稱候選母股補抓",
+    )
+    repaired_index, candidate_record_count = merge_shard_frames(
+        identity_index,
+        candidate_frames,
+        "配對名稱候選母股區間",
+    )
+    matched_after_candidates = sum(
+        identity_pair_is_matched(repaired_index, pair)
+        for pair in normalized_pairs
+    )
+    remaining_after_candidates = len(normalized_pairs) - matched_after_candidates
+    remaining_pct = (
+        remaining_after_candidates / len(normalized_pairs) * 100
+        if normalized_pairs
+        else 0.0
+    )
+    exhaustive_record_count = 0
+    if remaining_pct > MAX_IDENTITY_UNMATCHED_PCT:
+        # TaiwanStockInfoWithWarrant 的名稱不是日期化資料。代號重用後，舊名稱
+        # 可能完全消失，因此不能只依目前名稱找母股。第二輪遍歷真正股票主檔
+        # 以及全表 Summary 已知的所有母股；FinMind 每個 data_id 回傳的正式
+        # date～end_date 才是最後身分依據。
+        known_summary_targets = {
+            record.target_code
+            for record in repaired_index.records()
+            if record.target_code
+        }
+        exhaustive_targets = (
+            set(stock_master)
+            | known_summary_targets
+        ) - candidate_targets
+        print(
+            "  🔄 名稱候選不足："
+            f"仍有 {remaining_after_candidates:,}/"
+            f"{len(normalized_pairs):,} 組未配對（{remaining_pct:.2f}%）；"
+            f"改查其餘 {len(exhaustive_targets):,} 檔已知母股。",
+            flush=True,
+        )
+        exhaustive_frames = fetch_target_round(
+            exhaustive_targets,
+            "全母股歷史補抓",
+        )
+        repaired_index, exhaustive_record_count = merge_shard_frames(
+            repaired_index,
+            exhaustive_frames,
+            "配對全母股補回區間",
+        )
+
     matched_after = sum(
         identity_pair_is_matched(repaired_index, pair)
         for pair in normalized_pairs
     )
     print(
-        f"  ✅ 母股分片補抓完成：新增來源區間 {len(new_records):,} 筆｜"
+        "  ✅ 母股分片補抓完成："
+        f"候選區間 {candidate_record_count:,} 筆｜"
+        f"全母股區間 {exhaustive_record_count:,} 筆｜"
         f"本批已配對 {matched_before:,} → {matched_after:,}/"
         f"{len(normalized_pairs):,}",
         flush=True,
@@ -3791,6 +3897,9 @@ def run_self_tests() -> dict[str, str]:
 
     original_save_identity = globals()["save_warrant_identity_index"]
     original_target_fetch = globals()["fetch_warrant_summary_target_history"]
+    original_sleep = time.sleep
+    quota_pause_calls: list[float] = []
+    quota_raised = False
     base_reused_index = WarrantIdentityIndex(
         [
             WarrantIdentity(
@@ -3820,7 +3929,9 @@ def run_self_tests() -> dict[str, str]:
                 [
                     {
                         "stock_id": "WREUSE",
-                        "stock_name": "台積電測試購01",
+                        # 只保留 2025 新一輪商品名稱，模擬 FinMind 總覽
+                        # 已遺失 2023 舊名稱的真實狀況。
+                        "stock_name": "臻鼎測試購01",
                     }
                 ]
             )
@@ -3846,6 +3957,10 @@ def run_self_tests() -> dict[str, str]:
         start_date: str = WARRANT_SUMMARY_HISTORY_START,
         end_date: str = "",
     ) -> pd.DataFrame:
+        nonlocal quota_raised
+        if target_code == "4958" and not quota_raised:
+            quota_raised = True
+            raise FinMindQuotaExceeded("測試額度用完")
         if target_code == "2330":
             return pd.DataFrame(
                 [
@@ -3873,6 +3988,7 @@ def run_self_tests() -> dict[str, str]:
     globals()["save_warrant_identity_index"] = (
         lambda records: WarrantIdentityIndex(records)
     )
+    time.sleep = lambda seconds: quota_pause_calls.append(seconds)
     try:
         repaired_reused_index = backfill_identity_from_target_shards(
             base_reused_index,
@@ -3882,12 +3998,14 @@ def run_self_tests() -> dict[str, str]:
         globals()["fetch_dataset"] = original_fetch_dataset
         globals()["fetch_warrant_summary_target_history"] = original_target_fetch
         globals()["save_warrant_identity_index"] = original_save_identity
+        time.sleep = original_sleep
     repaired_identity = repaired_reused_index.resolve(
         "WREUSE",
         "2023-06-21",
     )
     assert repaired_identity.status == "Matched"
     assert repaired_identity.target_code == "2330"
+    assert quota_pause_calls and quota_pause_calls[0] >= 60
     explicit_target_records = build_identity_records_from_summary(
         pd.DataFrame(
             [
@@ -4247,7 +4365,8 @@ def run_self_tests() -> dict[str, str]:
         "Summary年度合併去重": "PASS",
         "Summary忽略日期時拒絕快取": "PASS",
         "Summary母股data_id分片查詢": "PASS",
-        "代號重用母股分片日期補配": "PASS",
+        "目前名稱失效時全母股日期補配": "PASS",
+        "母股補抓額度耗盡等待續跑": "PASS",
         "日期化母股不被目前名稱覆蓋": "PASS",
         "標的前綴字典與名稱memo": "PASS",
         "FinMind日檔精簡與_date欄位": "PASS",
