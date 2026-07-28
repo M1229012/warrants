@@ -178,6 +178,18 @@ MONEYDJ_API5_RECOVERY_PAUSE_SECONDS = max(
     float(os.getenv("MONEYDJ_API5_RECOVERY_PAUSE_SECONDS", "2.0")),
     0.0,
 )
+MONEYDJ_DAILY_TARGET_DATE = os.getenv(
+    "MONEYDJ_DAILY_TARGET_DATE",
+    os.getenv("DAILY_TARGET_DATE", ""),
+).strip()
+MONEYDJ_DAILY_TARGET_PROBE_SIZE = max(
+    int(os.getenv("MONEYDJ_DAILY_TARGET_PROBE_SIZE", "160")),
+    1,
+)
+MONEYDJ_DAILY_TARGET_LOOKBACK_DAYS = max(
+    int(os.getenv("MONEYDJ_DAILY_TARGET_LOOKBACK_DAYS", "15")),
+    3,
+)
 MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.98")), 0.0), 1.0)
@@ -22574,6 +22586,188 @@ def find_broker_codes_moneydj(warrants):
     return found
 
 
+def resolve_moneydj_daily_published_date(
+    warrants,
+    requested_date,
+    history_df=None,
+):
+    """
+    以少量近期活躍權證探測 MoneyDJ 在 requested_date 當下已發布的最近交易日。
+
+    daily 不可先對 3 萬多檔權證做「未發布日」精確掃描；探測成功後才針對
+    實際已發布日執行完整 API4／API5。指定歷史日期時，查詢上限仍鎖在該日，
+    因此可用同一流程補跑過去某個交易日。
+    """
+    requested_dt = parse_date(requested_date)
+    if not requested_dt or not warrants:
+        return "", {
+            "requested_date": normalize_date_str(requested_date),
+            "published_date": "",
+            "sample_size": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+        }
+
+    requested_key = normalize_date_str(requested_dt)
+    active_map = _warrant_lookup(warrants, requested_key)
+    if not active_map:
+        print(
+            f"  ⚠️ daily MoneyDJ 日期探測找不到 {requested_key} 的有效權證清單。"
+        )
+        return "", {
+            "requested_date": requested_key,
+            "published_date": "",
+            "sample_size": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+        }
+
+    preferred_codes = []
+    if (
+        history_df is not None
+        and not history_df.empty
+        and {"日期", "權證代號"}.issubset(history_df.columns)
+    ):
+        recent = history_df[["日期", "權證代號"]].copy()
+        recent["_date"] = pd.to_datetime(
+            recent["日期"],
+            errors="coerce",
+        )
+        recent["_code"] = recent["權證代號"].map(
+            _normalize_warrant_code_for_identity
+        )
+        recent = recent[
+            recent["_date"].notna()
+            & (recent["_date"] <= pd.Timestamp(requested_dt.date()))
+            & recent["_code"].isin(active_map)
+        ].sort_values("_date", ascending=False)
+        preferred_limit = max(
+            min(
+                MONEYDJ_DAILY_TARGET_PROBE_SIZE * 3 // 4,
+                MONEYDJ_DAILY_TARGET_PROBE_SIZE,
+            ),
+            1,
+        )
+        preferred_codes = (
+            recent["_code"]
+            .drop_duplicates()
+            .head(preferred_limit)
+            .tolist()
+        )
+
+    selected_codes = []
+    selected_set = set()
+    for code in preferred_codes:
+        if code in active_map and code not in selected_set:
+            selected_codes.append(code)
+            selected_set.add(code)
+
+    slots = MONEYDJ_DAILY_TARGET_PROBE_SIZE - len(selected_codes)
+    remaining_codes = sorted(
+        code for code in active_map if code not in selected_set
+    )
+    if slots > 0 and remaining_codes:
+        if len(remaining_codes) <= slots:
+            sampled_codes = remaining_codes
+        elif slots == 1:
+            sampled_codes = [remaining_codes[len(remaining_codes) // 2]]
+        else:
+            sampled_indices = sorted({
+                round(
+                    idx * (len(remaining_codes) - 1) / (slots - 1)
+                )
+                for idx in range(slots)
+            })
+            sampled_codes = [
+                remaining_codes[idx] for idx in sampled_indices
+            ]
+        selected_codes.extend(sampled_codes)
+
+    probe_start = (
+        requested_dt - timedelta(days=MONEYDJ_DAILY_TARGET_LOOKBACK_DAYS)
+    ).strftime("%Y/%m/%d")
+    probe_end = requested_dt.strftime("%Y/%m/%d")
+    print(
+        f"  🔎 daily MoneyDJ 已發布日探測：要求 {requested_key}｜"
+        f"區間 {probe_start}～{probe_end}｜樣本 {len(selected_codes):,} 支"
+    )
+
+    def probe_one(code):
+        rows, ok = api4_get_with_status(code, probe_start, probe_end)
+        latest = None
+        if ok:
+            for row in rows:
+                row_dt = parse_date(row.get("V1", ""))
+                if (
+                    row_dt
+                    and row_dt.date() <= requested_dt.date()
+                    and (latest is None or row_dt > latest)
+                ):
+                    latest = row_dt
+        return ok, latest
+
+    successful_requests = 0
+    failed_requests = 0
+    latest_published = None
+    if selected_codes:
+        with ThreadPoolExecutor(
+            max_workers=min(40, len(selected_codes))
+        ) as executor:
+            futures = [
+                executor.submit(probe_one, code)
+                for code in selected_codes
+            ]
+            for future in as_completed(futures):
+                try:
+                    ok, latest = future.result()
+                except Exception:
+                    ok, latest = False, None
+                if ok:
+                    successful_requests += 1
+                else:
+                    failed_requests += 1
+                if (
+                    latest
+                    and (
+                        latest_published is None
+                        or latest > latest_published
+                    )
+                ):
+                    latest_published = latest
+
+    published_key = (
+        latest_published.strftime("%Y/%m/%d")
+        if latest_published
+        else ""
+    )
+    if published_key:
+        if published_key == requested_key:
+            print(
+                f"  ✅ MoneyDJ 已確認要求日 {requested_key} 有資料｜"
+                f"探測成功 {successful_requests:,}/{len(selected_codes):,}"
+            )
+        else:
+            print(
+                f"  ↩️ MoneyDJ 要求日尚未發布，自動回退："
+                f"{requested_key} → {published_key}｜"
+                f"探測成功 {successful_requests:,}/{len(selected_codes):,}"
+            )
+    else:
+        print(
+            f"  ⚠️ MoneyDJ 已發布日探測失敗：要求 {requested_key}｜"
+            f"成功回應 {successful_requests:,}｜失敗 {failed_requests:,}｜"
+            "沒有任何可確認交易日"
+        )
+
+    return published_key, {
+        "requested_date": requested_key,
+        "published_date": published_key,
+        "sample_size": len(selected_codes),
+        "successful_requests": successful_requests,
+        "failed_requests": failed_requests,
+    }
+
+
 def _moneydj_scan_candidates(
     warrants,
     broker_map,
@@ -23736,11 +23930,6 @@ def main():
             f"價格批次最晚基準日 {_PRICE_PLAN_MAX_PUBLISHED_DATE}"
         )
     else:
-        target_date = normalize_date_str(market_target_date)
-        print(f"  ✅ 本次實際目標交易日：{target_date}")
-        _PRICE_PLAN_MAX_PUBLISHED_DATE = target_date
-        print(f"  ✅ 價格批次最晚已發布基準日：{_PRICE_PLAN_MAX_PUBLISHED_DATE}")
-
         if history_cache_df is None or history_cache_df.empty:
             print(
                 "  ⚠️ daily 找不到可用的完整分點歷史快取；"
@@ -23748,6 +23937,59 @@ def main():
             )
             print("  ℹ️ 請先執行 WORKFLOW_MODE=repair 建立完整歷史；後續 daily 將只重抓當日。")
             return
+
+        if MONEYDJ_DAILY_TARGET_DATE:
+            requested_dt = parse_date(MONEYDJ_DAILY_TARGET_DATE)
+            if not requested_dt:
+                print(
+                    "  ⚠️ MONEYDJ_DAILY_TARGET_DATE 格式錯誤；"
+                    "請使用 YYYY/MM/DD 或 YYYY-MM-DD，本次停止。"
+                )
+                return
+            requested_daily_target = (
+                resolve_latest_trading_date_on_or_before(requested_dt)
+            )
+            market_latest_dt = parse_date(market_target_date)
+            requested_daily_dt = parse_date(requested_daily_target)
+            if (
+                market_latest_dt
+                and requested_daily_dt
+                and requested_daily_dt > market_latest_dt
+            ):
+                print(
+                    f"  ⚠️ 指定補跑日 {requested_daily_target} 晚於目前交易日；"
+                    f"改以 {market_target_date} 為上限。"
+                )
+                requested_daily_target = market_target_date
+            print(
+                f"  🗓️ daily 指定歷史補跑日期："
+                f"{MONEYDJ_DAILY_TARGET_DATE} → {requested_daily_target}"
+            )
+        else:
+            requested_daily_target = normalize_date_str(
+                market_target_date
+            )
+
+        target_date, _ = (
+            resolve_moneydj_daily_published_date(
+                warrants,
+                requested_daily_target,
+                history_df=history_cache_df,
+            )
+        )
+        if not target_date:
+            print(
+                f"  ⚠️ MoneyDJ 無法確認 {requested_daily_target} 或之前的"
+                "最近已發布交易日；保留原歷史快取，本次不修改 Google Sheet。"
+            )
+            return
+
+        print(f"  ✅ 本次實際目標交易日：{target_date}")
+        _PRICE_PLAN_MAX_PUBLISHED_DATE = target_date
+        print(
+            f"  ✅ 價格批次最晚已發布基準日："
+            f"{_PRICE_PLAN_MAX_PUBLISHED_DATE}"
+        )
 
         history_cache_df = refresh_history_from_moneydj(
             warrants,
