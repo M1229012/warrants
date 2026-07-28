@@ -4,8 +4,8 @@ FinMind 完整歷史權證分點均線勝率統計
 
 固定流程：
 1. 逐日下載 FinMind 全市場權證分點 Parquet。
-2. 驗證、日期感知權證身分配對、過濾 26 個目標分點並逐日保存。
-3. 僅由 compact_daily 重建 ABCDE 事件與跨事件 FIFO 出清結果。
+2. 驗證、過濾 26 個目標分點，將不含身分判斷的交易事實逐日保存。
+3. 僅由 compact_daily 日期感知配對身分，重建 ABCDE 事件與跨事件 FIFO。
 4. 以 TaiwanStockPriceAdj 建立事件日 MA5/MA10/MA20 條件。
 5. 輸出 Parquet 與獨立 Excel，不使用 MoneyDJ 或 Google Sheet。
 
@@ -52,9 +52,9 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.1.2"
-SCHEMA_VERSION = "ma-history-v1"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v2-stock-only-prefix-map"
+PROGRAM_VERSION = "1.2.0"
+SCHEMA_VERSION = "ma-history-v2-fact-compact"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v3-all-types-stage2"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -93,6 +93,9 @@ IDENTITY_INDEX_CACHE_HOURS = max(
 PROGRESS_EVERY_DAYS = max(int(os.getenv("PROGRESS_EVERY_DAYS", "20")), 1)
 LOCAL_ERROR_CIRCUIT_BREAKER = max(
     int(os.getenv("LOCAL_ERROR_CIRCUIT_BREAKER", "5")), 2
+)
+MAX_IDENTITY_UNMATCHED_PCT = max(
+    float(os.getenv("MAX_IDENTITY_UNMATCHED_PCT", "5")), 0
 )
 MA20_FLAT_TOLERANCE_PCT = float(
     os.getenv("MA20_FLAT_TOLERANCE_PCT", "0.001")
@@ -183,11 +186,8 @@ RAW_REQUIRED_COLUMNS = {
     "stock_id",
     "date",
 }
-COMPACT_COLUMNS = [
+COMPACT_FACT_COLUMNS = [
     "權證代號",
-    "權證名稱",
-    "標的股",
-    "標的名稱",
     "分點",
     "分點名稱",
     "券商代號",
@@ -198,9 +198,16 @@ COMPACT_COLUMNS = [
     "賣出金額",
     "買超股數",
     "買超金額",
+]
+COMPACT_IDENTITY_COLUMNS = [
+    "權證名稱",
+    "權證類型",
+    "標的股",
+    "標的名稱",
     "身分配對狀態",
     "身分配對錯誤原因",
 ]
+COMPACT_COLUMNS = COMPACT_FACT_COLUMNS + COMPACT_IDENTITY_COLUMNS
 
 MA_POSITION_NAMES = {
     "000": "低於全部均線",
@@ -827,6 +834,7 @@ def resolve_underlying_from_name(
 class WarrantIdentity:
     code: str
     name: str
+    warrant_type: str
     target_code: str
     target_name: str
     list_date: str
@@ -852,13 +860,22 @@ class WarrantIdentityIndex:
         ]
         if not matches:
             return WarrantIdentity(
-                code, "", "", "", "", "", "Unmatched", "交易日找不到有效權證上市區間"
+                code,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "Unmatched",
+                "交易日找不到有效權證上市區間",
             )
         targets = {(rec.target_code, rec.target_name) for rec in matches if rec.target_code}
         if len(targets) > 1:
             return WarrantIdentity(
                 code,
                 matches[-1].name,
+                matches[-1].warrant_type,
                 "",
                 "",
                 matches[-1].list_date,
@@ -909,6 +926,7 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
     required_columns = {
         "code",
         "name",
+        "warrant_type",
         "target_code",
         "target_name",
         "list_date",
@@ -935,6 +953,7 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
             [
                 "code",
                 "name",
+                "warrant_type",
                 "target_code",
                 "target_name",
                 "list_date",
@@ -1021,22 +1040,23 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
 
     records: list[WarrantIdentity] = []
     work = summary.copy().fillna("")
-    work = work[work["type"].astype(str).str.contains("認購", na=False)]
     total_intervals = len(work)
-    print(f"  ⏳ 配對認購權證歷史區間：{total_intervals:,} 筆...", flush=True)
+    print(f"  ⏳ 配對全部權證歷史區間：{total_intervals:,} 筆...", flush=True)
     for row_number, (
         raw_code,
         raw_target,
+        raw_type,
         raw_listed,
         raw_ended,
     ) in enumerate(
-        work[["stock_id", "target_stock_id", "date", "end_date"]].itertuples(
-            index=False, name=None
-        ),
+        work[
+            ["stock_id", "target_stock_id", "type", "date", "end_date"]
+        ].itertuples(index=False, name=None),
         start=1,
     ):
         code = normalize_code(raw_code)
         target = normalize_code(raw_target)
+        warrant_type = str(raw_type or "").strip()
         listed = iso_date(raw_listed)
         ended = iso_date(raw_ended)
         if not code or not listed or not ended:
@@ -1075,7 +1095,15 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
             reason = "缺少 target_stock_id 且權證名稱無法可靠解析"
         records.append(
             WarrantIdentity(
-                code, name, target, target_name, listed, ended, status, reason
+                code,
+                name,
+                warrant_type,
+                target,
+                target_name,
+                listed,
+                ended,
+                status,
+                reason,
             )
         )
         if row_number % 5_000 == 0:
@@ -1115,7 +1143,6 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
 def normalize_warrant_day(
     raw: pd.DataFrame,
     day: str,
-    identity_index: WarrantIdentityIndex,
     broker_map: dict[str, tuple[str, str]],
 ) -> tuple[pd.DataFrame, int, int]:
     broker_by_code: dict[str, tuple[str, str, str]] = {}
@@ -1128,7 +1155,7 @@ def normalize_warrant_day(
     )
     work = work[work["securities_trader_id"].isin(broker_by_code)].copy()
     if work.empty:
-        return pd.DataFrame(columns=COMPACT_COLUMNS), 0, 0
+        return pd.DataFrame(columns=COMPACT_FACT_COLUMNS), 0, 0
 
     work["price"] = pd.to_numeric(work["price"], errors="coerce")
     work["buy"] = pd.to_numeric(work["buy"], errors="coerce")
@@ -1189,7 +1216,6 @@ def normalize_warrant_day(
         finmind_broker_name,
     ) in grouped.itertuples(index=False, name=None):
         trade_day = trade_day or day
-        identity = identity_index.resolve(warrant_code, trade_day)
         label, configured_name, canonical_code = broker_by_code[broker_code]
         broker_name = finmind_broker_name or configured_name
         buy_qty = int(buy_qty)
@@ -1199,9 +1225,6 @@ def normalize_warrant_day(
         records.append(
             {
                 "權證代號": warrant_code,
-                "權證名稱": identity.name,
-                "標的股": identity.target_code,
-                "標的名稱": identity.target_name,
                 "分點": label,
                 "分點名稱": broker_name,
                 "券商代號": canonical_code,
@@ -1212,18 +1235,16 @@ def normalize_warrant_day(
                 "賣出金額": sell_amount,
                 "買超股數": buy_qty - sell_qty,
                 "買超金額": buy_amount - sell_amount,
-                "身分配對狀態": identity.status,
-                "身分配對錯誤原因": identity.reason,
             }
         )
-    result = pd.DataFrame(records, columns=COMPACT_COLUMNS)
+    result = pd.DataFrame(records, columns=COMPACT_FACT_COLUMNS)
     duplicate_key = ["權證代號", "券商代號", "日期"]
     duplicates = result.duplicated(duplicate_key, keep=False)
     if duplicates.any():
         sample = result.loc[duplicates, duplicate_key].head(10).to_dict("records")
         raise RuntimeError(f"精簡資料出現重複權證＋券商＋日期：{sample}")
     result = result.sort_values(
-        ["日期", "分點", "標的股", "權證代號"]
+        ["日期", "分點", "權證代號"]
     ).reset_index(drop=True)
     return result, before_dedup, invalid_count
 
@@ -1273,7 +1294,7 @@ def validate_saved_day(day: str) -> tuple[bool, str, int, int]:
                 return False, f"raw 日期不符或為空：{sorted(raw_dates)}", 0, 0
             raw_rows = len(raw)
         compact = read_parquet(compact_path(day))
-        missing_compact = set(COMPACT_COLUMNS) - set(compact.columns)
+        missing_compact = set(COMPACT_FACT_COLUMNS) - set(compact.columns)
         if missing_compact:
             return False, f"compact 缺少欄位 {sorted(missing_compact)}", 0, 0
         compact_dates = {
@@ -1385,7 +1406,6 @@ def print_download_progress(
 def download_and_compact_history(
     state: dict[str, Any],
     expected_dates: list[str],
-    identity_index: WarrantIdentityIndex,
     broker_map: dict[str, tuple[str, str]],
 ) -> None:
     if FORCE_RECALCULATE_STATS:
@@ -1455,7 +1475,7 @@ def download_and_compact_history(
                 if cached_raw is None:
                     atomic_write_parquet(raw, raw_path(day))
                 compact, pre_dedup_rows, invalid_numeric_rows = normalize_warrant_day(
-                    raw, day, identity_index, broker_map
+                    raw, day, broker_map
                 )
                 atomic_write_parquet(compact, compact_path(day))
                 ok, reason, raw_rows, compact_rows = validate_saved_day(day)
@@ -1475,12 +1495,9 @@ def download_and_compact_history(
                             f"{type(exc).__name__}: {exc}"
                         )
                 new_compact_rows += compact_rows
-                unmatched = int(
-                    (compact["身分配對狀態"] != "Matched").sum()
-                ) if not compact.empty else 0
                 print(
-                    f"  ✅ {day}：原始 {raw_rows:,}｜26分點 {compact_rows:,}｜"
-                    f"身分待確認 {unmatched:,}"
+                    f"  ✅ {day}：原始 {len(raw):,}｜"
+                    f"26分點事實列 {compact_rows:,}"
                 )
             last_local_error_signature = ""
             consecutive_local_errors = 0
@@ -1524,11 +1541,135 @@ def event_unique_id(broker_code: str, underlying: str, event_day: str) -> str:
     return f"{normalize_code(broker_code)}|{normalize_code(underlying)}|{event_day}"
 
 
+def enrich_compact_identity(
+    frame: pd.DataFrame,
+    identity_index: WarrantIdentityIndex,
+) -> pd.DataFrame:
+    """由 compact 事實欄位即時計算身分；忽略舊檔內曾寫入的配對結果。"""
+    missing = set(COMPACT_FACT_COLUMNS) - set(frame.columns)
+    if missing:
+        raise RuntimeError(f"compact 事實資料缺少欄位：{sorted(missing)}")
+    work = frame[COMPACT_FACT_COLUMNS].copy()
+    if work.empty:
+        return pd.DataFrame(columns=COMPACT_COLUMNS)
+    work["權證代號"] = work["權證代號"].map(normalize_code)
+    work["日期"] = work["日期"].map(iso_date)
+    identity_by_key: dict[tuple[str, str], WarrantIdentity] = {}
+    for warrant_code, trade_day in work[
+        ["權證代號", "日期"]
+    ].drop_duplicates().itertuples(index=False, name=None):
+        key = (warrant_code, trade_day)
+        identity_by_key[key] = identity_index.resolve(warrant_code, trade_day)
+    identities = [
+        identity_by_key[(warrant_code, trade_day)]
+        for warrant_code, trade_day in work[
+            ["權證代號", "日期"]
+        ].itertuples(index=False, name=None)
+    ]
+    work["權證名稱"] = [identity.name for identity in identities]
+    work["權證類型"] = [identity.warrant_type for identity in identities]
+    work["標的股"] = [identity.target_code for identity in identities]
+    work["標的名稱"] = [identity.target_name for identity in identities]
+    work["身分配對狀態"] = [identity.status for identity in identities]
+    work["身分配對錯誤原因"] = [identity.reason for identity in identities]
+    return work[COMPACT_COLUMNS]
+
+
+def print_identity_diagnostic(
+    reason_counts: Counter[str],
+    examples: list[tuple[str, str]],
+    identity_index: WarrantIdentityIndex,
+) -> None:
+    print("  🔍 身分配對診斷：", flush=True)
+    for reason, count in reason_counts.most_common(5):
+        print(f"    原因｜{reason}：{count:,}", flush=True)
+    for warrant_code, trade_day in examples[:5]:
+        intervals = identity_index.by_code.get(normalize_code(warrant_code), [])
+        preview = [
+            (
+                record.list_date,
+                record.end_date,
+                record.warrant_type,
+                record.target_code,
+            )
+            for record in intervals[:3]
+        ]
+        print(
+            f"    {warrant_code} @ {trade_day}｜索引區間 {len(intervals)} 筆："
+            f"{preview}",
+            flush=True,
+        )
+
+
+def preflight_identity_quality(
+    state: dict[str, Any],
+    identity_index: WarrantIdentityIndex,
+    sample_days: int = 5,
+) -> None:
+    """在繼續下載前抽查既有 compact，避免錯誤索引一路跑完整段歷史。"""
+    successful = sorted(state["successful_dates"])
+    if not successful:
+        return
+    sample_count = min(max(sample_days, 1), len(successful))
+    if sample_count == 1:
+        selected = [successful[0]]
+    else:
+        positions = {
+            round(index * (len(successful) - 1) / (sample_count - 1))
+            for index in range(sample_count)
+        }
+        selected = [successful[position] for position in sorted(positions)]
+
+    total_rows = 0
+    unmatched_rows = 0
+    reason_counts: Counter[str] = Counter()
+    examples: list[tuple[str, str]] = []
+    seen_examples: set[tuple[str, str]] = set()
+    for day in selected:
+        enriched = enrich_compact_identity(
+            read_parquet(compact_path(day)),
+            identity_index,
+        )
+        total_rows += len(enriched)
+        bad = enriched[enriched["身分配對狀態"] != "Matched"]
+        unmatched_rows += len(bad)
+        reason_counts.update(
+            bad["身分配對錯誤原因"]
+            .fillna("未提供原因")
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
+        for warrant_code, trade_day in bad[
+            ["權證代號", "日期"]
+        ].drop_duplicates().itertuples(index=False, name=None):
+            key = (normalize_code(warrant_code), iso_date(trade_day) or "")
+            if key not in seen_examples and len(examples) < 5:
+                seen_examples.add(key)
+                examples.append(key)
+
+    unmatched_pct = unmatched_rows / total_rows * 100 if total_rows else 0.0
+    print(
+        f"  🩺 身分配對下載前抽查：{len(selected)} 日｜總列 {total_rows:,}｜"
+        f"待確認 {unmatched_rows:,}（{unmatched_pct:.2f}%）",
+        flush=True,
+    )
+    if unmatched_rows:
+        print_identity_diagnostic(reason_counts, examples, identity_index)
+    if total_rows and unmatched_pct > MAX_IDENTITY_UNMATCHED_PCT:
+        raise RuntimeError(
+            f"下載前抽查的身分未配對率 {unmatched_pct:.2f}% 超過允許上限 "
+            f"{MAX_IDENTITY_UNMATCHED_PCT:.2f}%；已停止繼續下載。"
+            "既有 compact_daily 的交易事實仍可保留，修正索引後不必重抓。"
+        )
+
+
 def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
     if frame.empty:
         return []
     valid = frame[
         (frame["身分配對狀態"] == "Matched")
+        & frame["權證類型"].astype(str).str.contains("認購", na=False)
         & (frame["標的股"].astype(str).str.strip() != "")
         & (pd.to_numeric(frame["買進金額"], errors="coerce").fillna(0) > 0)
         & (pd.to_numeric(frame["買進股數"], errors="coerce").fillna(0) > 0)
@@ -1632,13 +1773,45 @@ def checkpoint_frame(
 
 def load_compact_frames(
     state: dict[str, Any],
+    identity_index: WarrantIdentityIndex,
 ) -> tuple[list[pd.DataFrame], list[dict[str, Any]]]:
     frames: list[pd.DataFrame] = []
     events: list[dict[str, Any]] = []
+    identity_rows = 0
+    unmatched_rows = 0
+    call_rows = 0
+    put_rows = 0
+    reason_counts: Counter[str] = Counter()
+    diagnostic_examples: list[tuple[str, str]] = []
+    seen_examples: set[tuple[str, str]] = set()
     successful = sorted(state["successful_dates"])
     for index, day in enumerate(successful, start=1):
-        frame = read_parquet(compact_path(day))
+        stored = read_parquet(compact_path(day))
+        frame = enrich_compact_identity(stored, identity_index)
         frames.append(frame)
+        identity_rows += len(frame)
+        call_rows += int(
+            frame["權證類型"].astype(str).str.contains("認購", na=False).sum()
+        )
+        put_rows += int(
+            frame["權證類型"].astype(str).str.contains("認售", na=False).sum()
+        )
+        bad = frame[frame["身分配對狀態"] != "Matched"]
+        unmatched_rows += len(bad)
+        reason_counts.update(
+            bad["身分配對錯誤原因"]
+            .fillna("未提供原因")
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
+        for warrant_code, trade_day in bad[
+            ["權證代號", "日期"]
+        ].drop_duplicates().itertuples(index=False, name=None):
+            key = (normalize_code(warrant_code), iso_date(trade_day) or "")
+            if key not in seen_examples and len(diagnostic_examples) < 5:
+                seen_examples.add(key)
+                diagnostic_examples.append(key)
         events.extend(build_events_for_day(frame, day))
         if index % PROGRESS_EVERY_DAYS == 0:
             checkpoint = checkpoint_frame(events, day, "event-build")
@@ -1648,6 +1821,28 @@ def load_compact_frames(
             print(
                 f"  💾 事件 checkpoint：{day}｜累積事件 {len(events):,}"
             )
+    unmatched_pct = (
+        unmatched_rows / identity_rows * 100 if identity_rows else 0.0
+    )
+    print(
+        f"  🧭 階段二身分配對：總列 {identity_rows:,}｜"
+        f"認購 {call_rows:,}｜認售 {put_rows:,}｜"
+        f"待確認 {unmatched_rows:,}（{unmatched_pct:.2f}%）",
+        flush=True,
+    )
+    if unmatched_rows:
+        print_identity_diagnostic(
+            reason_counts,
+            diagnostic_examples,
+            identity_index,
+        )
+    if identity_rows and unmatched_pct > MAX_IDENTITY_UNMATCHED_PCT:
+        raise RuntimeError(
+            f"身分未配對率 {unmatched_pct:.2f}% 超過允許上限 "
+            f"{MAX_IDENTITY_UNMATCHED_PCT:.2f}%；已停止產生不可信報表。"
+            "compact_daily 僅保存交易事實，修正索引後可直接重跑階段二，"
+            "不必重新下載日檔。"
+        )
     if successful:
         checkpoint = checkpoint_frame(events, successful[-1], "event-build")
         atomic_write_parquet(checkpoint, RESULTS_DIR / "event_checkpoint.parquet")
@@ -2884,25 +3079,53 @@ def run_self_tests() -> dict[str, str]:
             WarrantIdentity(
                 "W1",
                 "測試購01",
+                "認購",
                 "2330",
                 "台積電",
                 "2025-01-01",
                 "2026-12-31",
                 "Matched",
                 "測試身分",
-            )
+            ),
+            WarrantIdentity(
+                "WPUT",
+                "測試售01",
+                "認售",
+                "2330",
+                "台積電",
+                "2025-01-01",
+                "2026-12-31",
+                "Matched",
+                "測試認售身分",
+            ),
         ]
     )
     normalized_test, _, invalid_numeric_rows = normalize_warrant_day(
         raw_test,
         "2026-01-02",
-        identity_test,
         {"測試分點": ("測試分點", "T001")},
     )
     assert len(normalized_test) == 1
     assert normalized_test.iloc[0]["日期"] == "2026-01-02"
     assert int(normalized_test.iloc[0]["買進股數"]) == 150
     assert invalid_numeric_rows == 1
+    assert list(normalized_test.columns) == COMPACT_FACT_COLUMNS
+    legacy_compact = normalized_test.copy()
+    legacy_compact["權證名稱"] = "舊錯誤名稱"
+    legacy_compact["標的股"] = "9999"
+    legacy_compact["標的名稱"] = "舊錯誤標的"
+    legacy_compact["身分配對狀態"] = "Unmatched"
+    legacy_compact["身分配對錯誤原因"] = "舊錯誤結果"
+    enriched_test = enrich_compact_identity(legacy_compact, identity_test)
+    assert enriched_test.iloc[0]["標的股"] == "2330"
+    assert enriched_test.iloc[0]["權證類型"] == "認購"
+    put_fact = normalized_test.copy()
+    put_fact["權證代號"] = "WPUT"
+    put_fact["買進金額"] = 2_000_000
+    enriched_put = enrich_compact_identity(put_fact, identity_test)
+    assert enriched_put.iloc[0]["身分配對狀態"] == "Matched"
+    assert enriched_put.iloc[0]["權證類型"] == "認售"
+    assert build_events_for_day(enriched_put, "2026-01-02") == []
 
     high = calculate_ma_values(make_test_ma_row(), "2026-01-30")
     assert high["MA位置代碼"] == "111"
@@ -2992,6 +3215,7 @@ def run_self_tests() -> dict[str, str]:
             {
                 "權證代號": "W1",
                 "權證名稱": "測試購01",
+                "權證類型": "認購",
                 "標的股": "2330",
                 "標的名稱": "台積電",
                 "分點": "測試分點",
@@ -3010,6 +3234,7 @@ def run_self_tests() -> dict[str, str]:
             {
                 "權證代號": "W2",
                 "權證名稱": "測試購02",
+                "權證類型": "認購",
                 "標的股": "2330",
                 "標的名稱": "台積電",
                 "分點": "測試分點",
@@ -3137,6 +3362,8 @@ def run_self_tests() -> dict[str, str]:
         "真實19交易日均線Missing": "PASS",
         "股價缺口均線Missing": "PASS",
         "壞數值列隔離": "PASS",
+        "compact事實與階段二身分重算": "PASS",
+        "認售有身分但不建立事件": "PASS",
         "事件去重複": "PASS",
         "ABCDE分類": "PASS",
         "事件買超股數語意": "PASS",
@@ -3152,8 +3379,10 @@ def run_self_tests() -> dict[str, str]:
 def rebuild_statistics(
     state: dict[str, Any], expected_dates: list[str]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    print("【階段二】只讀 compact_daily，重建事件、FIFO、均線與統計...")
-    compact_frames, events = load_compact_frames(state)
+    print("【階段二】只讀 compact_daily，重新配對身分並重建事件、FIFO、均線與統計...")
+    print("  ⏳ 載入或建立日期化權證身分索引...", flush=True)
+    identity_index = build_warrant_identity_index()
+    compact_frames, events = load_compact_frames(state, identity_index)
     sales = build_sale_rows(compact_frames)
     events = simulate_group_outcomes_fifo(events, sales)
     last_day = max(state["successful_dates"], default="")
@@ -3192,7 +3421,7 @@ def main() -> int:
     state = load_state()
     set_run_stage(state, "initialization")
     initialization_started = time.perf_counter()
-    print("【初始化 1/4】檢查 state 與成功日期檔案...", flush=True)
+    print("【初始化 1/3】檢查 state 與成功日期檔案...", flush=True)
     audit_successful_files(state)
     print(
         f"  ✅ state 檢查完成｜成功 {len(state['successful_dates']):,} 日｜"
@@ -3200,7 +3429,7 @@ def main() -> int:
         f"{time.perf_counter() - initialization_started:.1f} 秒",
         flush=True,
     )
-    print("【初始化 2/4】探索 FinMind 預期交易日期...", flush=True)
+    print("【初始化 2/3】探索 FinMind 預期交易日期...", flush=True)
     expected_dates = discover_expected_dates(state)
     print(
         f"  ✅ 預期日期 {len(expected_dates):,} 日｜"
@@ -3208,23 +3437,25 @@ def main() -> int:
         flush=True,
     )
     if not FORCE_RECALCULATE_STATS:
-        print("【初始化 3/4】建立 26 分點券商代號對照...", flush=True)
+        print("【初始化 3/3】建立 26 分點券商代號對照...", flush=True)
         broker_map = build_broker_map()
         if len(broker_map) != len(TARGET_PATTERNS):
             raise RuntimeError(
                 f"目標分點對照不完整：{len(broker_map)}/{len(TARGET_PATTERNS)}"
             )
         print(f"  ✅ 目標分點對照完成：{len(broker_map):,} 個", flush=True)
-        print("【初始化 4/4】載入或建立日期化權證身分索引...", flush=True)
-        identity_index = build_warrant_identity_index()
+        if state["successful_dates"]:
+            print("【下載前檢查】抽查既有 compact 的身分配對品質...", flush=True)
+            preflight_identity_quality(
+                state,
+                build_warrant_identity_index(),
+            )
         print(
             f"  ✅ 初始化全部完成｜{time.perf_counter() - initialization_started:.1f} 秒",
             flush=True,
         )
         set_run_stage(state, "downloading")
-        download_and_compact_history(
-            state, expected_dates, identity_index, broker_map
-        )
+        download_and_compact_history(state, expected_dates, broker_map)
     elif not state["successful_dates"]:
         raise RuntimeError(
             "FORCE_RECALCULATE_STATS=1，但本機沒有任何成功 compact_daily"
