@@ -49,6 +49,8 @@ jobs:
       MAX_IDENTITY_UNMATCHED_PCT: "5"
       # 身分索引明確採週更，避免與每日排程的 24 小時邊界互相抖動。
       IDENTITY_INDEX_CACHE_HOURS: "168"
+      # Summary API 必須明確帶歷史起日；按年度分段下載並另存獨立快取。
+      WARRANT_SUMMARY_HISTORY_START_DATE: "2011-01-03"
       FORCE_RECALCULATE_STATS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_recalculate_stats && '1' || '0' }}
       FORCE_REDOWNLOAD_DATES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_redownload_dates || '' }}
       CONTINUATION_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.continuation_depth || '0' }}
