@@ -58,10 +58,10 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.4.0"
+PROGRAM_VERSION = "1.4.1"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v8-bundled-mops-seed"
-MOPS_IDENTITY_SEED_VERSION = "2026-07-29-214445-last-trading-date"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v9-bundled-mops-six-code"
+MOPS_IDENTITY_SEED_VERSION = "2026-07-29-six-code-last-trading-date"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 AMOUNT_THRESH = 1_000_000
@@ -1240,15 +1240,16 @@ def month_range(start_day: str, end_day: str) -> list[str]:
 
 def normalize_mops_warrant_code(value: Any) -> str:
     """
-    MOPS 的下市清單會在實際交易代號後附加小寫 e（上市）或 c（上櫃）。
+    MOPS 的下市清單會在實際六碼交易代號後附加內部重用識別碼，
+    HTML 又可能再附小寫 e（上市）或 c（上櫃）。
 
-    必須在 normalize_code 轉大寫前移除；正常交易代號原本可能以大寫英文字母
-    結尾（例如認售權證），不可一概刪除最後一碼。
+    例如 MOPS 的 04472UA、044720F，在 FinMind 分點日檔實際分別是
+    04472U、044720；同一六碼的各段上市區間互不重疊。
     """
     text = re.sub(r"\s+", "", str(value or "").strip())
     if re.fullmatch(r"[0-9A-Za-z]+[ec]", text) and text[-1].islower():
         text = text[:-1]
-    return normalize_code(text)
+    return normalize_code(text[:6])
 
 
 class MopsWarrantTableParser(HTMLParser):
@@ -1382,6 +1383,7 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
     work["end_date"] = ended_dates.dt.strftime("%Y-%m-%d").fillna("")
     invalid = (
         work["code"].eq("")
+        | work["code"].str.len().ne(6)
         | work["target_code"].eq("")
         | work["list_date"].eq("")
         | work["end_date"].eq("")
@@ -1407,6 +1409,11 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
         ("034676", "2023-06-21"): "8478",
         ("034755", "2023-06-21"): "8478",
         ("035628", "2023-06-21"): "IX0001",
+        ("04472U", "2023-06-21"): "4763",
+        ("04900U", "2023-06-21"): "2603",
+        ("05159U", "2023-06-21"): "2603",
+        ("05575U", "2023-06-21"): "2454",
+        ("06037U", "2023-06-21"): "3443",
     }
     bad_samples: dict[str, str] = {}
     for (code, trade_day), expected_target in expected_samples.items():
@@ -1658,7 +1665,9 @@ def mops_frames_to_identity_records(
         missing = set(MOPS_IDENTITY_COLUMNS) - set(frame.columns)
         if missing:
             raise RuntimeError(f"MOPS 身分快取缺少欄位：{sorted(missing)}")
-        for values in frame[MOPS_IDENTITY_COLUMNS].itertuples(
+        work = frame[MOPS_IDENTITY_COLUMNS].copy()
+        work["code"] = work["code"].map(normalize_mops_warrant_code)
+        for values in work.itertuples(
             index=False, name=None
         ):
             records.append(
@@ -1737,8 +1746,8 @@ class WarrantIdentityIndex:
                 "Unmatched",
                 "交易日找不到有效權證上市區間",
             )
-        targets = {(rec.target_code, rec.target_name) for rec in matches if rec.target_code}
-        if len(targets) > 1:
+        target_codes = {rec.target_code for rec in matches if rec.target_code}
+        if len(target_codes) > 1:
             return WarrantIdentity(
                 code,
                 matches[-1].name,
@@ -1748,7 +1757,7 @@ class WarrantIdentityIndex:
                 matches[-1].list_date,
                 matches[-1].end_date,
                 "Ambiguous",
-                f"同一交易日命中多個標的：{sorted(targets)}",
+                f"同一交易日命中多個標的代號：{sorted(target_codes)}",
             )
         chosen = max(matches, key=lambda rec: rec.list_date)
         return chosen
@@ -1951,12 +1960,15 @@ def load_cached_warrant_identity_index() -> Optional[WarrantIdentityIndex]:
                 f"{WARRANT_SUMMARY_TARGET_CACHE_PREFIX}_*.parquet"
             )
         ),
-        *sorted(
-            METADATA_DIR.glob(
-                f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_*.parquet"
-            )
-        ),
     ]
+    if ENABLE_MOPS_NETWORK_REFRESH:
+        source_paths.extend(
+            sorted(
+                METADATA_DIR.glob(
+                    f"{MOPS_WARRANT_HISTORY_CACHE_PREFIX}_*.parquet"
+                )
+            )
+        )
     newer_sources = [
         source.name
         for source in source_paths
@@ -2118,15 +2130,16 @@ def build_warrant_identity_index() -> WarrantIdentityIndex:
     seed_frame = load_bundled_mops_identity_seed()
     seed_records = mops_frames_to_identity_records([seed_frame])
     records.extend(seed_records)
-    mops_frames = load_cached_mops_identity_frames()
-    if mops_frames:
-        mops_records = mops_frames_to_identity_records(mops_frames)
-        records.extend(mops_records)
-        print(
-            f"  📦 合併 MOPS 官方歷史身分快取："
-            f"{len(mops_frames):,} 片｜{len(mops_records):,} 筆",
-            flush=True,
-        )
+    if ENABLE_MOPS_NETWORK_REFRESH:
+        mops_frames = load_cached_mops_identity_frames()
+        if mops_frames:
+            mops_records = mops_frames_to_identity_records(mops_frames)
+            records.extend(mops_records)
+            print(
+                f"  📦 合併 MOPS 官方歷史身分快取："
+                f"{len(mops_frames):,} 片｜{len(mops_records):,} 筆",
+                flush=True,
+            )
     identity_index = save_warrant_identity_index(records)
     print(
         f"  ✅ 日期化權證身分索引完成："
@@ -4466,7 +4479,9 @@ def run_self_tests() -> dict[str, str]:
         mops_frames_to_identity_records(
             [
                 bundled_seed_test[
-                    bundled_seed_test["code"].isin(["030650", "034676"])
+                    bundled_seed_test["code"].isin(
+                        ["030650", "034676", "04472U"]
+                    )
                 ]
             ]
         )
@@ -4480,6 +4495,12 @@ def run_self_tests() -> dict[str, str]:
     assert bundled_seed_index.resolve(
         "034676", "2023-06-21"
     ).target_code == "8478"
+    assert bundled_seed_index.resolve(
+        "04472U", "2023-06-21"
+    ).target_code == "4763"
+    assert bundled_seed_index.resolve(
+        "04472U", "2025-08-06"
+    ).target_code == "3037"
     original_seed_save_identity = globals()["save_warrant_identity_index"]
     original_seed_network_fetch = globals()["fetch_mops_warrant_identity"]
     globals()["save_warrant_identity_index"] = (
@@ -4518,6 +4539,8 @@ def run_self_tests() -> dict[str, str]:
 
     assert roc_date_to_iso("112/11/30") == "2023-11-30"
     assert iso_month_to_roc("2023-06") == "11206"
+    assert normalize_mops_warrant_code("04472UAe") == "04472U"
+    assert normalize_mops_warrant_code("044720F") == "044720"
     assert month_range("2023-11-15", "2024-02-01") == [
         "2023-11",
         "2023-12",
@@ -4583,6 +4606,34 @@ def run_self_tests() -> dict[str, str]:
     assert WarrantIdentityIndex(
         mops_frames_to_identity_records([parsed_mops_test])
     ).resolve("035628", "2023-06-21").target_code == "IX0001"
+    same_target_name_variants = WarrantIdentityIndex(
+        [
+            WarrantIdentity(
+                "TEST01",
+                "智通",
+                "認購",
+                "8932",
+                "智通",
+                "2023-01-01",
+                "2023-12-31",
+                "Matched",
+                "測試",
+            ),
+            WarrantIdentity(
+                "TEST01",
+                "智通*",
+                "認購",
+                "8932",
+                "智通*",
+                "2023-01-01",
+                "2023-12-31",
+                "Matched",
+                "測試",
+            ),
+        ]
+    ).resolve("TEST01", "2023-06-21")
+    assert same_target_name_variants.status == "Matched"
+    assert same_target_name_variants.target_code == "8932"
 
     test_ranges = warrant_summary_chunk_ranges(
         "2022-06-01",
@@ -5200,6 +5251,8 @@ def run_self_tests() -> dict[str, str]:
     return {
         "隨附MOPS官方種子完整性": "PASS",
         "隨附種子處理權證代號重用": "PASS",
+        "MOPS第七碼重用標記正規化": "PASS",
+        "同母股名稱差異不誤判歧義": "PASS",
         "GitHub不連MOPS仍可補配": "PASS",
         "MOPS民國年月與月份切片": "PASS",
         "MOPS官方HTML欄位解析": "PASS",
