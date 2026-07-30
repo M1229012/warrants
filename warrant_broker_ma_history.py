@@ -58,12 +58,13 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.4.2"
+PROGRAM_VERSION = "1.5.0"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
-IDENTITY_INDEX_SCHEMA_VERSION = "identity-v9-bundled-mops-six-code"
-MOPS_IDENTITY_SEED_VERSION = "2026-07-29-six-code-last-trading-date"
+IDENTITY_INDEX_SCHEMA_VERSION = "identity-v10-contract-settlement"
+MOPS_IDENTITY_SEED_VERSION = "2026-07-30-contract-settlement-v1"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
+WARRANT_PRICE_DATASET = "TaiwanStockPrice"
 AMOUNT_THRESH = 1_000_000
 FINMIND_DOCUMENTED_START = "2023-06-21"
 WARRANT_SUMMARY_HISTORY_START = os.getenv(
@@ -103,6 +104,7 @@ CACHE_ROOT = Path(
 RAW_DAILY_DIR = CACHE_ROOT / "raw_daily"
 COMPACT_DAILY_DIR = CACHE_ROOT / "compact_daily"
 STOCK_PRICE_DIR = CACHE_ROOT / "stock_price"
+WARRANT_PRICE_DIR = CACHE_ROOT / "warrant_price"
 RESULTS_DIR = CACHE_ROOT / "results"
 METADATA_DIR = CACHE_ROOT / "metadata"
 STATE_PATH = CACHE_ROOT / "state.json"
@@ -136,6 +138,14 @@ MAX_IDENTITY_UNMATCHED_PCT = max(
 MA20_FLAT_TOLERANCE_PCT = float(
     os.getenv("MA20_FLAT_TOLERANCE_PCT", "0.001")
 )
+OPEN_POSITION_EVALUATION_MONTHS = max(
+    int(os.getenv("OPEN_POSITION_EVALUATION_MONTHS", "2")), 1
+)
+WARRANT_CASH_SETTLEMENT_TAX_RATE = float(
+    os.getenv("WARRANT_CASH_SETTLEMENT_TAX_RATE", "0.001")
+)
+if not 0 <= WARRANT_CASH_SETTLEMENT_TAX_RATE < 1:
+    raise ValueError("WARRANT_CASH_SETTLEMENT_TAX_RATE 必須介於 0（含）與 1（不含）")
 FORCE_RECALCULATE_STATS = os.getenv(
     "FORCE_RECALCULATE_STATS", "0"
 ).strip().lower() in ("1", "true", "yes")
@@ -290,6 +300,7 @@ def ensure_directories() -> None:
         RAW_DAILY_DIR,
         COMPACT_DAILY_DIR,
         STOCK_PRICE_DIR,
+        WARRANT_PRICE_DIR,
         RESULTS_DIR,
         METADATA_DIR,
         OUTPUT_DIR,
@@ -1324,6 +1335,16 @@ MOPS_IDENTITY_COLUMNS = [
     "status",
     "reason",
 ]
+MOPS_CONTRACT_COLUMNS = [
+    "market",
+    "fulfillment_end_date",
+    "settlement_method",
+    "exercise_ratio",
+    "fulfillment_price",
+    "settlement_price",
+    "settlement_record_found",
+]
+MOPS_SEED_COLUMNS = MOPS_IDENTITY_COLUMNS + MOPS_CONTRACT_COLUMNS
 
 
 def resolve_mops_identity_seed_path(*, required: bool = True) -> Optional[Path]:
@@ -1363,13 +1384,13 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
             f"MOPS 官方歷史身分種子檔無法讀取：{path.name}｜"
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    missing = set(MOPS_IDENTITY_COLUMNS) - set(frame.columns)
+    missing = set(MOPS_SEED_COLUMNS) - set(frame.columns)
     if missing:
         raise RuntimeError(
             f"MOPS 官方歷史身分種子檔缺少欄位：{sorted(missing)}"
         )
-    work = frame[MOPS_IDENTITY_COLUMNS].copy()
-    for column in MOPS_IDENTITY_COLUMNS:
+    work = frame[MOPS_SEED_COLUMNS].copy()
+    for column in MOPS_SEED_COLUMNS:
         work[column] = work[column].fillna("").astype(str).str.strip()
     work["code"] = work["code"].map(normalize_code)
     work["target_code"] = work["target_code"].map(normalize_code)
@@ -1381,6 +1402,18 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
     )
     work["list_date"] = listed_dates.dt.strftime("%Y-%m-%d").fillna("")
     work["end_date"] = ended_dates.dt.strftime("%Y-%m-%d").fillna("")
+    fulfillment_dates = pd.to_datetime(
+        work["fulfillment_end_date"], format="%Y-%m-%d", errors="coerce"
+    )
+    work["fulfillment_end_date"] = (
+        fulfillment_dates.dt.strftime("%Y-%m-%d").fillna("")
+    )
+    for column in ("exercise_ratio", "fulfillment_price", "settlement_price"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    settlement_found = work["settlement_record_found"].str.lower().isin(
+        {"1", "true", "yes"}
+    )
+    work["settlement_record_found"] = settlement_found
     invalid = (
         work["code"].eq("")
         | work["code"].str.len().ne(6)
@@ -1389,7 +1422,18 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
         | work["end_date"].eq("")
         | (work["list_date"] > work["end_date"])
         | work["status"].ne("Matched")
+        | ~work["market"].isin(["1", "2"])
+        | work["fulfillment_end_date"].eq("")
     )
+    invalid_settlement = settlement_found & (
+        work["exercise_ratio"].isna()
+        | (work["exercise_ratio"] <= 0)
+        | work["fulfillment_price"].isna()
+        | (work["fulfillment_price"] < 0)
+        | work["settlement_price"].isna()
+        | (work["settlement_price"] < 0)
+    )
+    invalid |= invalid_settlement
     if invalid.any():
         raise RuntimeError(
             "MOPS 官方歷史身分種子檔含無效代號、日期或狀態："
@@ -1431,7 +1475,8 @@ def load_bundled_mops_identity_seed() -> pd.DataFrame:
         )
     print(
         f"  📦 載入隨附 MOPS 官方歷史身分種子："
-        f"{len(work):,} 筆｜{path.name}",
+        f"{len(work):,} 筆｜官方到期結算 "
+        f"{int(work['settlement_record_found'].sum()):,} 筆｜{path.name}",
         flush=True,
     )
     return work
@@ -1761,6 +1806,78 @@ class WarrantIdentityIndex:
             )
         chosen = max(matches, key=lambda rec: rec.list_date)
         return chosen
+
+
+@dataclass(frozen=True)
+class WarrantContract:
+    code: str
+    warrant_type: str
+    target_code: str
+    list_date: str
+    end_date: str
+    fulfillment_end_date: str
+    settlement_method: str
+    exercise_ratio: Optional[float]
+    fulfillment_price: Optional[float]
+    settlement_price: Optional[float]
+    settlement_record_found: bool
+    market: str
+
+
+class WarrantContractIndex:
+    def __init__(self, records: Iterable[WarrantContract]):
+        self.by_code: dict[str, list[WarrantContract]] = defaultdict(list)
+        for record in records:
+            self.by_code[record.code].append(record)
+        for code in self.by_code:
+            self.by_code[code].sort(key=lambda rec: (rec.list_date, rec.end_date))
+
+    def resolve(self, warrant_code: str, buy_day: str) -> Optional[WarrantContract]:
+        code = normalize_code(warrant_code)
+        matches = [
+            record
+            for record in self.by_code.get(code, [])
+            if record.list_date <= buy_day <= record.end_date
+        ]
+        return max(matches, key=lambda rec: rec.list_date) if matches else None
+
+
+def optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def build_warrant_contract_index(
+    seed: Optional[pd.DataFrame] = None,
+) -> WarrantContractIndex:
+    work = seed if seed is not None else load_bundled_mops_identity_seed()
+    records = [
+        WarrantContract(
+            code=normalize_code(row.code),
+            warrant_type=str(row.warrant_type or "").strip(),
+            target_code=normalize_code(row.target_code),
+            list_date=iso_date(row.list_date),
+            end_date=iso_date(row.end_date),
+            fulfillment_end_date=iso_date(row.fulfillment_end_date),
+            settlement_method=str(row.settlement_method or "").strip(),
+            exercise_ratio=optional_float(row.exercise_ratio),
+            fulfillment_price=optional_float(row.fulfillment_price),
+            settlement_price=optional_float(row.settlement_price),
+            settlement_record_found=(
+                row.settlement_record_found is True
+                or str(row.settlement_record_found).strip().lower()
+                in {"1", "true", "yes"}
+            ),
+            market=str(row.market or "").strip(),
+        )
+        for row in work[MOPS_SEED_COLUMNS].itertuples(index=False)
+    ]
+    return WarrantContractIndex(records)
 
 
 def identity_index_cache_path() -> Path:
@@ -3510,6 +3627,322 @@ def simulate_group_outcomes_fifo(
     return events
 
 
+def add_calendar_months(day: str, months: int) -> str:
+    parsed = pd.Timestamp(day)
+    return (parsed + pd.DateOffset(months=months)).strftime("%Y-%m-%d")
+
+
+def warrant_price_cache_path(contract: WarrantContract) -> Path:
+    safe_code = re.sub(r"[^0-9A-Z_-]", "_", contract.code)
+    suffix = f"{contract.list_date}_{contract.end_date}".replace("-", "")
+    return WARRANT_PRICE_DIR / f"{safe_code}_{suffix}.parquet"
+
+
+def normalize_warrant_price_frame(
+    frame: pd.DataFrame, warrant_code: str
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["date", "stock_id", "close"])
+    if "date" not in frame.columns or "close" not in frame.columns:
+        raise RuntimeError(
+            f"{WARRANT_PRICE_DATASET} schema 缺少 date／close："
+            f"{list(frame.columns)}"
+        )
+    work = pd.DataFrame(
+        {
+            "date": frame["date"].map(iso_date),
+            "stock_id": normalize_code(warrant_code),
+            "close": pd.to_numeric(frame["close"], errors="coerce"),
+        }
+    )
+    return (
+        work[
+            work["date"].ne("")
+            & work["close"].notna()
+            & work["close"].ge(0)
+        ]
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def latest_warrant_market_price(
+    contract: WarrantContract,
+    valuation_day: str,
+) -> tuple[float, str]:
+    """取得合約本輪上市期間、統計截止日前最後一筆有效收盤價。"""
+    query_end = min(valuation_day, contract.end_date)
+    path = warrant_price_cache_path(contract)
+    status_path = path.with_suffix(".json")
+    try:
+        cached = normalize_warrant_price_frame(read_parquet(path), contract.code)
+    except Exception:
+        cached = pd.DataFrame(columns=["date", "stock_id", "close"])
+    status: dict[str, Any] = {}
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception:
+            status = {}
+    covered = (
+        status.get("code") == contract.code
+        and status.get("list_date") == contract.list_date
+        and status.get("requested_end", "") >= query_end
+    )
+    if not covered:
+        fetched = fetch_dataset(
+            WARRANT_PRICE_DATASET,
+            params={
+                "data_id": contract.code,
+                "start_date": contract.list_date,
+                "end_date": query_end,
+            },
+            cache=False,
+        )
+        normalized = normalize_warrant_price_frame(fetched, contract.code)
+        merged = (
+            pd.concat([cached, normalized], ignore_index=True)
+            .sort_values("date")
+            .drop_duplicates("date", keep="last")
+            .reset_index(drop=True)
+        )
+        atomic_write_parquet(merged, path)
+        atomic_write_json(
+            {
+                "code": contract.code,
+                "list_date": contract.list_date,
+                "end_date": contract.end_date,
+                "requested_end": query_end,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            status_path,
+        )
+        cached = merged
+    available = cached[
+        (cached["date"] >= contract.list_date)
+        & (cached["date"] <= query_end)
+    ]
+    if available.empty:
+        raise RuntimeError(
+            f"{contract.code} 在 {contract.list_date}～{query_end} "
+            "查不到可用的權證收盤價"
+        )
+    latest = available.iloc[-1]
+    price = float(latest["close"])
+    if price < 0 or not math.isfinite(price):
+        raise RuntimeError(f"{contract.code} 最後收盤價不合法：{price}")
+    return price, str(latest["date"])
+
+
+def warrant_cash_settlement_per_unit(contract: WarrantContract) -> float:
+    if not contract.settlement_record_found:
+        return 0.0
+    values = (
+        contract.exercise_ratio,
+        contract.fulfillment_price,
+        contract.settlement_price,
+    )
+    if any(value is None or not math.isfinite(float(value)) for value in values):
+        raise RuntimeError(f"{contract.code} 官方結算紀錄缺少價格或行使比例")
+    ratio = float(contract.exercise_ratio)
+    strike = float(contract.fulfillment_price)
+    settlement = float(contract.settlement_price)
+    is_put = "認售" in contract.warrant_type
+    intrinsic = (
+        max(strike - settlement, 0.0)
+        if is_put
+        else max(settlement - strike, 0.0)
+    )
+    gross = intrinsic * ratio
+    return gross * (1 - WARRANT_CASH_SETTLEMENT_TAX_RATE)
+
+
+def evaluate_open_positions_after_two_months(
+    events: list[dict[str, Any]],
+    contract_index: WarrantContractIndex,
+    valuation_day: str,
+    *,
+    price_loader: Any = latest_warrant_market_price,
+) -> list[dict[str, Any]]:
+    """為已出清及滿兩個曆月的未結部位建立可供勝率統計的認列結果。"""
+    if not valuation_day:
+        raise RuntimeError("缺少統計截止日，無法評價滿兩個月的未結部位")
+    failures: list[str] = []
+    market_price_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+    aged_count = 0
+    for event in events:
+        event_day = iso_date(event.get("事件日"))
+        threshold_day = add_calendar_months(
+            event_day, OPEN_POSITION_EVALUATION_MONTHS
+        )
+        total_cost = float(
+            sum(float(lot.get("金額", 0) or 0) for lot in event.get("lots", []))
+        )
+        realized = float(event.get("已實現賣出金額", 0) or 0)
+        event.update(
+            {
+                "兩月門檻日": threshold_day,
+                "勝敗認列狀態": "待認列",
+                "勝敗結果": "待認列",
+                "認列日": None,
+                "認列報酬%": None,
+                "認列持有天數": None,
+                "總成本": total_cost,
+                "已實現回收金額": realized,
+                "剩餘部位評價金額": None,
+                "估算總回收金額": None,
+                "評價資料狀態": "NotDue",
+                "評價錯誤原因": "",
+                "評價明細": "",
+            }
+        )
+        if event.get("目前狀態") == "已出清":
+            event.update(
+                {
+                    "勝敗認列狀態": "實際FIFO出清",
+                    "勝敗結果": result_tag(event.get("出清報酬%")),
+                    "認列日": event.get("出清日"),
+                    "認列報酬%": event.get("出清報酬%"),
+                    "認列持有天數": event.get("持有天數"),
+                    "剩餘部位評價金額": 0.0,
+                    "估算總回收金額": realized,
+                    "評價資料狀態": "Actual",
+                    "評價明細": "實際FIFO完全出清",
+                }
+            )
+            continue
+        if valuation_day < threshold_day:
+            event["評價錯誤原因"] = (
+                f"統計截止日尚未滿 {OPEN_POSITION_EVALUATION_MONTHS} 個曆月"
+            )
+            continue
+
+        aged_count += 1
+        remaining_value = 0.0
+        details: list[dict[str, Any]] = []
+        statuses: set[str] = set()
+        event_failures: list[str] = []
+        for lot in event.get("lots", []):
+            remaining_quantity = int(lot.get("剩餘股數", 0) or 0)
+            if remaining_quantity <= 0:
+                continue
+            code = normalize_code(lot.get("權證代號"))
+            buy_day = iso_date(lot.get("買進日")) or event_day
+            contract = contract_index.resolve(code, buy_day)
+            if contract is None:
+                event_failures.append(f"{code}@{buy_day} 找不到該輪官方權證契約")
+                continue
+            expired = valuation_day >= contract.fulfillment_end_date
+            if expired:
+                per_unit = warrant_cash_settlement_per_unit(contract)
+                value_source = (
+                    "MOPS官方到期結算"
+                    if contract.settlement_record_found
+                    else "MOPS到期日已過且無自動現金結算紀錄"
+                )
+                value_day = contract.fulfillment_end_date
+                statuses.add(
+                    "到期結算" if contract.settlement_record_found else "到期無給付"
+                )
+            else:
+                cache_key = (contract.code, contract.list_date, valuation_day)
+                try:
+                    if cache_key not in market_price_cache:
+                        market_price_cache[cache_key] = price_loader(
+                            contract, valuation_day
+                        )
+                        price_count = len(market_price_cache)
+                        if price_count == 1 or price_count % 25 == 0:
+                            print(
+                                f"    權證市價評價進度：{price_count:,} 組｜"
+                                f"目前 {contract.code}",
+                                flush=True,
+                            )
+                    per_unit, value_day = market_price_cache[cache_key]
+                except Exception as exc:
+                    event_failures.append(
+                        f"{code}@{buy_day} 市價評價失敗："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                value_source = f"FinMind {WARRANT_PRICE_DATASET} 收盤價"
+                statuses.add("兩月市價評價")
+            lot_value = remaining_quantity * float(per_unit)
+            remaining_value += lot_value
+            details.append(
+                {
+                    "權證代號": code,
+                    "剩餘股數": remaining_quantity,
+                    "每單位可回收金額": round(float(per_unit), 8),
+                    "評價金額": round(lot_value, 2),
+                    "評價日": value_day,
+                    "來源": value_source,
+                    "最後交易日": contract.end_date,
+                    "履約截止日": contract.fulfillment_end_date,
+                }
+            )
+        if event_failures:
+            reason = "；".join(event_failures)
+            event["評價資料狀態"] = "Error"
+            event["評價錯誤原因"] = reason
+            failures.append(f"{event.get('事件唯一ID')}｜{reason}")
+            continue
+        estimated_recovery = realized + remaining_value
+        if total_cost <= 0:
+            reason = "事件總成本小於等於 0"
+            event["評價資料狀態"] = "Error"
+            event["評價錯誤原因"] = reason
+            failures.append(f"{event.get('事件唯一ID')}｜{reason}")
+            continue
+        recognized_return = round(
+            (estimated_recovery - total_cost) / total_cost * 100, 2
+        )
+        if statuses == {"到期無給付"}:
+            recognition_status = "到期無給付"
+        elif "兩月市價評價" in statuses:
+            recognition_status = "兩月市價評價"
+        else:
+            recognition_status = "到期結算"
+        recognition_day = (
+            valuation_day
+            if "兩月市價評價" in statuses
+            else max(
+                (str(item["評價日"]) for item in details),
+                default=valuation_day,
+            )
+        )
+        event.update(
+            {
+                "勝敗認列狀態": recognition_status,
+                "勝敗結果": result_tag(recognized_return),
+                "認列日": recognition_day,
+                "認列報酬%": recognized_return,
+                "認列持有天數": (
+                    parse_date(recognition_day) - parse_date(event_day)
+                ).days,
+                "剩餘部位評價金額": round(remaining_value, 2),
+                "估算總回收金額": round(estimated_recovery, 2),
+                "評價資料狀態": "OK",
+                "評價錯誤原因": "",
+                "評價明細": json.dumps(details, ensure_ascii=False),
+            }
+        )
+    if failures:
+        examples = "\n".join(f"  - {item}" for item in failures[:10])
+        raise RuntimeError(
+            f"滿 {OPEN_POSITION_EVALUATION_MONTHS} 個月事件仍有 "
+            f"{len(failures):,} 筆無法可靠認列；為避免勝率失真已停止產表：\n"
+            f"{examples}"
+        )
+    print(
+        f"  💹 滿 {OPEN_POSITION_EVALUATION_MONTHS} 個月未結部位評價完成："
+        f"{aged_count:,} 筆｜權證市價查詢 {len(market_price_cache):,} 組",
+        flush=True,
+    )
+    return events
+
+
 def price_cache_path(stock_id: str) -> Path:
     safe_code = re.sub(r"[^0-9A-Z_-]", "_", normalize_code(stock_id))
     return STOCK_PRICE_DIR / f"{safe_code}.parquet"
@@ -3866,6 +4299,19 @@ EVENT_OUTPUT_COLUMNS = [
     "出清日",
     "出清報酬%",
     "持有天數",
+    "兩月門檻日",
+    "勝敗認列狀態",
+    "勝敗結果",
+    "認列日",
+    "認列報酬%",
+    "認列持有天數",
+    "總成本",
+    "已實現回收金額",
+    "剩餘部位評價金額",
+    "估算總回收金額",
+    "評價資料狀態",
+    "評價錯誤原因",
+    "評價明細",
     "事件日收盤價",
     "MA5",
     "MA10",
@@ -3925,6 +4371,41 @@ def validate_event_outcomes(frame: pd.DataFrame) -> None:
     ):
         raise AssertionError("未出清或減碼事件不應填入出清日")
 
+    allowed_recognition = {
+        "實際FIFO出清",
+        "兩月市價評價",
+        "到期結算",
+        "到期無給付",
+        "待認列",
+    }
+    recognition_statuses = set(frame["勝敗認列狀態"].dropna().astype(str))
+    if (
+        frame["勝敗認列狀態"].isna().any()
+        or not recognition_statuses.issubset(allowed_recognition)
+    ):
+        raise AssertionError(
+            f"勝敗認列狀態不合法：{sorted(recognition_statuses - allowed_recognition)}"
+        )
+    resolved = frame[frame["勝敗認列狀態"] != "待認列"]
+    if (
+        resolved["認列日"].fillna("").astype(str).str.strip().eq("").any()
+        or pd.to_numeric(resolved["認列報酬%"], errors="coerce").isna().any()
+        or pd.to_numeric(resolved["認列持有天數"], errors="coerce").isna().any()
+        or (~resolved["勝敗結果"].isin(["勝", "敗", "平手"])).any()
+    ):
+        raise AssertionError("已認列事件缺少認列日、報酬、持有天數或勝敗結果")
+    expected_tags = pd.to_numeric(
+        resolved["認列報酬%"], errors="coerce"
+    ).map(result_tag)
+    if not expected_tags.equals(resolved["勝敗結果"]):
+        raise AssertionError("勝敗結果與認列報酬%不一致")
+    pending = frame[frame["勝敗認列狀態"] == "待認列"]
+    if (
+        pd.to_numeric(pending["認列報酬%"], errors="coerce").notna().any()
+        or pending["勝敗結果"].ne("待認列").any()
+    ):
+        raise AssertionError("待認列事件不得預填認列報酬或勝敗結果")
+
 
 def events_to_frame(events: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
@@ -3981,26 +4462,33 @@ def summarize_event_group(
     event_code: str = "ALL",
 ) -> dict[str, Any]:
     closed = group[group["目前狀態"] == "已出清"].copy()
-    returns = pd.to_numeric(closed["出清報酬%"], errors="coerce").dropna()
-    holding = pd.to_numeric(closed["持有天數"], errors="coerce").dropna()
-    closed = closed.loc[returns.index] if len(returns) else closed.iloc[0:0]
+    resolved = group[group["勝敗認列狀態"] != "待認列"].copy()
+    returns = pd.to_numeric(resolved["認列報酬%"], errors="coerce").dropna()
+    holding = pd.to_numeric(resolved["認列持有天數"], errors="coerce").dropna()
+    resolved = resolved.loc[returns.index] if len(returns) else resolved.iloc[0:0]
     result_tags = returns.map(result_tag)
     total_amount = int(
         pd.to_numeric(group["單日累積買進金額"], errors="coerce")
         .fillna(0)
         .sum()
     )
-    closed_amount_series = pd.to_numeric(
-        closed["單日累積買進金額"], errors="coerce"
+    resolved_amount_series = pd.to_numeric(
+        resolved["總成本"], errors="coerce"
     ).fillna(0)
-    closed_amount = int(closed_amount_series.sum())
-    pnl = float((closed_amount_series * returns / 100).sum()) if len(returns) else 0.0
+    resolved_amount = int(resolved_amount_series.sum())
+    pnl = (
+        float((resolved_amount_series * returns / 100).sum())
+        if len(returns)
+        else 0.0
+    )
     event_type = (
         "全部-A+B+C+D+E合併"
         if event_code == "ALL"
         else f"{event_code}-{AMOUNT_CLASS_LABELS[event_code]}"
     )
     closed_count = len(closed)
+    resolved_count = len(resolved)
+    pending_count = len(group) - resolved_count
     row = {
         "分點": broker,
         "均線條件": condition,
@@ -4010,30 +4498,48 @@ def summarize_event_group(
         "事件總數": len(group),
         "已出清筆數": closed_count,
         "未出清筆數": len(group) - closed_count,
+        "勝敗樣本數": resolved_count,
+        "實際出清筆數": int(
+            (resolved["勝敗認列狀態"] == "實際FIFO出清").sum()
+        ),
+        "兩月以上評價筆數": int(
+            (resolved["勝敗認列狀態"] == "兩月市價評價").sum()
+        ),
+        "到期結算筆數": int(
+            resolved["勝敗認列狀態"].isin(["到期結算", "到期無給付"]).sum()
+        ),
+        "尚未認列筆數": pending_count,
         "勝筆數": int((result_tags == "勝").sum()),
         "敗筆數": int((result_tags == "敗").sum()),
         "平手筆數": int((result_tags == "平手").sum()),
-        "勝率": round(float((result_tags == "勝").sum()) / closed_count * 100, 2)
-        if closed_count
+        "勝率": round(float((result_tags == "勝").sum()) / resolved_count * 100, 2)
+        if resolved_count
         else None,
         "平均持有天數": round(float(holding.mean()), 2) if len(holding) else None,
         "中位數持有天數": round(float(holding.median()), 2) if len(holding) else None,
         "平均報酬%": round(float(returns.mean()), 2) if len(returns) else None,
         "中位數報酬%": round(float(returns.median()), 2) if len(returns) else None,
-        "加權報酬%": round(pnl / closed_amount * 100, 2)
-        if closed_amount
+        "加權報酬%": round(pnl / resolved_amount * 100, 2)
+        if resolved_amount
         else None,
         "總買進金額": total_amount,
-        "已出清買進金額": closed_amount,
+        "已認列買進金額": resolved_amount,
+        "已出清買進金額": int(
+            pd.to_numeric(
+                closed["單日累積買進金額"], errors="coerce"
+            ).fillna(0).sum()
+        ),
         "估算損益金額": int(round(pnl)),
         "最高報酬%": round(float(returns.max()), 2) if len(returns) else None,
         "最低報酬%": round(float(returns.min()), 2) if len(returns) else None,
-        "樣本等級": sample_grade(closed_count),
+        "樣本等級": sample_grade(resolved_count),
         "資料起始日": group["事件日"].min() if len(group) else None,
         "資料結束日": group["事件日"].max() if len(group) else None,
     }
-    if row["勝筆數"] + row["敗筆數"] + row["平手筆數"] != closed_count:
-        raise AssertionError("勝＋敗＋平手不等於已出清")
+    if row["勝筆數"] + row["敗筆數"] + row["平手筆數"] != resolved_count:
+        raise AssertionError("勝＋敗＋平手不等於勝敗樣本數")
+    if resolved_count + pending_count != len(group):
+        raise AssertionError("勝敗樣本數＋尚未認列筆數不等於事件總數")
     return row
 
 
@@ -4096,16 +4602,19 @@ def best_qualified(
         return "樣本不足，暫不判定"
     eligible = stats[
         (stats["事件代碼"] == "ALL")
-        & (stats["已出清筆數"] >= 15)
+        & (stats["勝敗樣本數"] >= 15)
         & stats["勝率"].notna()
     ]
     if eligible.empty:
         return "樣本不足，暫不判定"
     best = eligible.sort_values(
-        ["勝率", "已出清筆數", "事件總數"],
+        ["勝率", "勝敗樣本數", "事件總數"],
         ascending=[False, False, False],
     ).iloc[0]
-    return f"{best[label_column]}（勝率{best['勝率']:.2f}%，已出清{int(best['已出清筆數'])}筆）"
+    return (
+        f"{best[label_column]}（勝率{best['勝率']:.2f}%，"
+        f"勝敗樣本{int(best['勝敗樣本數'])}筆）"
+    )
 
 
 def build_broker_profiles(
@@ -4116,11 +4625,14 @@ def build_broker_profiles(
     rows: list[dict[str, Any]] = []
     for broker, group in events.groupby("分點", sort=True):
         closed = group[group["目前狀態"] == "已出清"].copy()
-        returns = pd.to_numeric(closed["出清報酬%"], errors="coerce")
+        resolved = group[group["勝敗認列狀態"] != "待認列"].copy()
+        returns = pd.to_numeric(resolved["認列報酬%"], errors="coerce")
         amounts = pd.to_numeric(
-            closed["單日累積買進金額"], errors="coerce"
+            resolved["總成本"], errors="coerce"
         ).fillna(0)
-        holding = pd.to_numeric(closed["持有天數"], errors="coerce").dropna()
+        holding = pd.to_numeric(
+            resolved["認列持有天數"], errors="coerce"
+        ).dropna()
         valid_positions = group.loc[
             group["均線資料狀態"] == "OK", "MA位置代碼"
         ]
@@ -4139,6 +4651,16 @@ def build_broker_profiles(
                 "事件總數": len(group),
                 "已出清事件數": len(closed),
                 "未出清事件數": len(group) - len(closed),
+                "勝敗樣本數": len(resolved),
+                "兩月以上評價事件數": int(
+                    (resolved["勝敗認列狀態"] == "兩月市價評價").sum()
+                ),
+                "到期結算事件數": int(
+                    resolved["勝敗認列狀態"]
+                    .isin(["到期結算", "到期無給付"])
+                    .sum()
+                ),
+                "尚未認列事件數": len(group) - len(resolved),
                 "最常出現MA位置": most_position,
                 "最高勝率均線條件": best_qualified(
                     condition_stats[condition_stats["分點"] == broker], "均線條件"
@@ -4190,6 +4712,11 @@ def build_integrity_report(
         if not events.empty
         else 0
     )
+    resolved = (
+        int((events["勝敗認列狀態"] != "待認列").sum())
+        if not events.empty
+        else 0
+    )
     missing_reason_summary = "-"
     if missing_ma:
         reasons = (
@@ -4231,7 +4758,8 @@ def build_integrity_report(
         ),
         (
             "權證身分來源",
-            "FinMind Summary 優先；隨附 MOPS 含下市權證官方歷史種子備援",
+            "FinMind Summary 優先；隨附 MOPS 含下市權證官方歷史、"
+            "契約與到期結算種子備援",
         ),
         (
             "MOPS官方身分種子檔",
@@ -4280,6 +4808,25 @@ def build_integrity_report(
         ("均線Missing原因分布（前10類）", missing_reason_summary),
         ("已出清事件數", closed),
         ("未出清事件數", len(events) - closed),
+        ("勝敗樣本數", resolved),
+        (
+            f"滿{OPEN_POSITION_EVALUATION_MONTHS}月市價評價事件數",
+            int((events["勝敗認列狀態"] == "兩月市價評價").sum())
+            if not events.empty
+            else 0,
+        ),
+        (
+            "到期結算／無給付事件數",
+            int(
+                events["勝敗認列狀態"]
+                .isin(["到期結算", "到期無給付"])
+                .sum()
+            )
+            if not events.empty
+            else 0,
+        ),
+        ("尚未認列事件數", len(events) - resolved),
+        ("勝敗統計截止日", actual_latest),
         ("最早事件日", events["事件日"].min() if not events.empty else ""),
         ("最新事件日", events["事件日"].max() if not events.empty else ""),
         ("程式版本", PROGRAM_VERSION),
@@ -4395,12 +4942,17 @@ def validate_final_results(
             continue
         bad = frame[
             frame["勝筆數"] + frame["敗筆數"] + frame["平手筆數"]
-            != frame["已出清筆數"]
+            != frame["勝敗樣本數"]
         ]
         if not bad.empty:
             raise AssertionError(f"{label}統計勝敗平手驗證失敗")
         if (frame["事件總數"] != frame["已出清筆數"] + frame["未出清筆數"]).any():
             raise AssertionError(f"{label}統計事件數驗證失敗")
+        if (
+            frame["事件總數"]
+            != frame["勝敗樣本數"] + frame["尚未認列筆數"]
+        ).any():
+            raise AssertionError(f"{label}統計勝敗認列事件數驗證失敗")
 
     valid = events[events["均線資料狀態"] == "OK"].copy()
     brokers = sorted(set(events["分點"].dropna())) if not events.empty else []
@@ -5246,6 +5798,14 @@ def run_self_tests() -> dict[str, str]:
     closed_event = simulate_group_outcomes_fifo(built, sales)[0]
     assert closed_event["目前狀態"] == "已出清"
     assert closed_event["出清報酬%"] == 10.0
+    closed_event = evaluate_open_positions_after_two_months(
+        [closed_event],
+        WarrantContractIndex([]),
+        "2026-04-30",
+        price_loader=lambda contract, day: (0.0, day),
+    )[0]
+    assert closed_event["勝敗認列狀態"] == "實際FIFO出清"
+    assert closed_event["勝敗結果"] == "勝"
 
     open_event = {
         **built[0],
@@ -5264,6 +5824,99 @@ def run_self_tests() -> dict[str, str]:
     }
     open_result = simulate_group_outcomes_fifo([open_event], {})[0]
     assert open_result["目前狀態"] == "未出清"
+    recent_result = evaluate_open_positions_after_two_months(
+        [open_result],
+        WarrantContractIndex([]),
+        "2026-02-28",
+        price_loader=lambda contract, day: (0.0, day),
+    )[0]
+    assert recent_result["勝敗認列狀態"] == "待認列"
+
+    active_contract = WarrantContract(
+        "W3",
+        "認購",
+        "2317",
+        "2025-12-01",
+        "2026-12-01",
+        "2026-12-05",
+        "4",
+        0.1,
+        100.0,
+        None,
+        False,
+        "1",
+    )
+    aged_result = evaluate_open_positions_after_two_months(
+        [open_result],
+        WarrantContractIndex([active_contract]),
+        "2026-04-30",
+        price_loader=lambda contract, day: (12_000.0, "2026-04-29"),
+    )[0]
+    assert aged_result["勝敗認列狀態"] == "兩月市價評價"
+    assert aged_result["認列報酬%"] == 20.0
+    assert aged_result["勝敗結果"] == "勝"
+
+    expired_contract = WarrantContract(
+        "W3",
+        "認購",
+        "2317",
+        "2025-12-01",
+        "2026-02-27",
+        "2026-03-05",
+        "4",
+        0.1,
+        100.0,
+        120.0,
+        True,
+        "1",
+    )
+    expired_result = evaluate_open_positions_after_two_months(
+        [open_result],
+        WarrantContractIndex([expired_contract]),
+        "2026-04-30",
+        price_loader=lambda contract, day: (_ for _ in ()).throw(
+            AssertionError("到期權證不得查市價")
+        ),
+    )[0]
+    expected_settlement = (120.0 - 100.0) * 0.1 * (1 - 0.001)
+    assert expired_result["勝敗認列狀態"] == "到期結算"
+    assert expired_result["剩餘部位評價金額"] == round(
+        expected_settlement * 100, 2
+    )
+
+    no_payment_contract = WarrantContract(
+        "W3",
+        "認購",
+        "2317",
+        "2025-12-01",
+        "2026-02-27",
+        "2026-03-05",
+        "5",
+        0.1,
+        100.0,
+        None,
+        False,
+        "1",
+    )
+    no_payment_result = evaluate_open_positions_after_two_months(
+        [open_result],
+        WarrantContractIndex([no_payment_contract]),
+        "2026-04-30",
+        price_loader=lambda contract, day: (999.0, day),
+    )[0]
+    assert no_payment_result["勝敗認列狀態"] == "到期無給付"
+    assert no_payment_result["認列報酬%"] == -100.0
+    try:
+        evaluate_open_positions_after_two_months(
+            [open_result],
+            WarrantContractIndex([]),
+            "2026-04-30",
+            price_loader=lambda contract, day: (1.0, day),
+        )
+    except RuntimeError as exc:
+        assert "無法可靠認列" in str(exc)
+    else:
+        raise AssertionError("滿兩月事件缺少契約時不得悄悄排除於勝率")
 
     closed_event.update(high)
     event_frame = events_to_frame([closed_event])
@@ -5297,6 +5950,10 @@ def run_self_tests() -> dict[str, str]:
                 "目前狀態": "已出清",
                 "出清報酬%": 10,
                 "持有天數": 1,
+                "勝敗認列狀態": "實際FIFO出清",
+                "認列報酬%": 10,
+                "認列持有天數": 1,
+                "總成本": 100,
                 "單日累積買進金額": 100,
                 "事件日": "2026-01-01",
             },
@@ -5305,6 +5962,10 @@ def run_self_tests() -> dict[str, str]:
                 "目前狀態": "已出清",
                 "出清報酬%": -5,
                 "持有天數": 3,
+                "勝敗認列狀態": "實際FIFO出清",
+                "認列報酬%": -5,
+                "認列持有天數": 3,
+                "總成本": 100,
                 "單日累積買進金額": 100,
                 "事件日": "2026-01-02",
             },
@@ -5313,6 +5974,10 @@ def run_self_tests() -> dict[str, str]:
                 "目前狀態": "已出清",
                 "出清報酬%": 0,
                 "持有天數": 100,
+                "勝敗認列狀態": "實際FIFO出清",
+                "認列報酬%": 0,
+                "認列持有天數": 100,
+                "總成本": 100,
                 "單日累積買進金額": 100,
                 "事件日": "2026-01-03",
             },
@@ -5360,6 +6025,11 @@ def run_self_tests() -> dict[str, str]:
         "事件買超股數語意": "PASS",
         "FIFO已出清": "PASS",
         "FIFO未出清": "PASS",
+        "兩個曆月前不提前認列": "PASS",
+        "滿兩月未結部位市價認列": "PASS",
+        "到期官方結算金額認列": "PASS",
+        "到期無自動給付按零元認列": "PASS",
+        "滿兩月無法評價時禁止產表": "PASS",
         "勝率": "PASS",
         "平均與中位持有天數": "PASS",
         "統計可追溯交叉檢核": "PASS",
@@ -5379,8 +6049,19 @@ def rebuild_statistics(
     sales = build_sale_rows(compact_frames)
     events = simulate_group_outcomes_fifo(events, sales)
     last_day = max(state["successful_dates"], default="")
+    print(
+        f"  ⏳ 評價截至 {last_day} 已滿 "
+        f"{OPEN_POSITION_EVALUATION_MONTHS} 個曆月的未結部位...",
+        flush=True,
+    )
+    contract_index = build_warrant_contract_index()
+    events = evaluate_open_positions_after_two_months(
+        events,
+        contract_index,
+        last_day,
+    )
     atomic_write_parquet(
-        checkpoint_frame(events, last_day, "fifo-complete"),
+        checkpoint_frame(events, last_day, "fifo-and-two-month-valuation-complete"),
         RESULTS_DIR / "fifo_checkpoint.parquet",
     )
     dates = trading_dates()
