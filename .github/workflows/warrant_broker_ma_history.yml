@@ -57,6 +57,10 @@ jobs:
       ENABLE_MOPS_NETWORK_REFRESH: "0"
       MOPS_WARRANT_PAGE_SIZE: "10000"
       MOPS_REQUEST_DELAY_SECONDS: "0.5"
+      # 未實際出清的事件滿兩個曆月後，強制以市價或官方到期結算認列勝敗。
+      OPEN_POSITION_EVALUATION_MONTHS: "2"
+      # TWSE 權證到期現金結算交易稅率 0.1%。
+      WARRANT_CASH_SETTLEMENT_TAX_RATE: "0.001"
       FORCE_RECALCULATE_STATS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_recalculate_stats && '1' || '0' }}
       FORCE_REDOWNLOAD_DATES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_redownload_dates || '' }}
       CONTINUATION_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.continuation_depth || '0' }}
@@ -122,7 +126,9 @@ jobs:
               echo "程式已完成，不需要續跑。"
               status=0
             elif [[ "$stage" == "statistics" ]]; then
-              echo "統計階段未完成，本次沒有完整報表；下載快取已保存，但 job 必須標記失敗。"
+              echo "統計階段未完成，本次沒有完整報表；股價／權證市價快取已逐筆保存，將自動續跑。"
+              needs_continue=true
+              status=0
             else
               echo "初始化尚未完成，本次不得標記成功。"
             fi
