@@ -34,6 +34,7 @@ jobs:
       # ============================================================
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
+      # 請把修正版程式內容放進這個既有檔名；若改用其他檔名，這裡也要同步修改。
       PYTHON_FILE: warrant_backtest_moneydj.py
       FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
 
@@ -93,9 +94,8 @@ jobs:
       WARRANT_IDENTITY_RECONCILE_ENABLED: "1"
       WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX: "3"
       WARRANT_IDENTITY_REPAIR_HISTORY: "1"
-      # daily／增量模式仍可修正既有錯配；完整 repair 會由程式自動跳過此逐列修正，
-      # 避免全覆蓋完成後又改值而造成回讀驗證差異。
-      GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "1"
+      # 歷史保護模式不修改 Google Sheet 既有列；身分修正只反映在新插入資料。
+      GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "0"
 
       # ============================================================
       # 基本快取
@@ -119,6 +119,8 @@ jobs:
 
       TOP15_CACHE_ENABLED: "1"
       TOP15_LOOKBACK_TRADING_DAYS: "40"
+      # repair 回補近一個月的 TOP15 每日快照（約 22 個交易日）。
+      TOP15_REPAIR_BACKFILL_TRADING_DAYS: "22"
       TOP15_PRICE_LOOKBACK_DAYS: "75"
       TOP15_TARGET_PRICE_REFETCH_DAYS: "12"
       TOP15_REQUIRE_TARGET_DATE_PRICE: "1"
@@ -160,10 +162,9 @@ jobs:
       LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET: "0"
 
       # ============================================================
-      # Google Sheet
-      # daily 模式維持增量更新。
-      # repair + RUN_MODE=2 會完整覆蓋程式管理的 21 張工作表，
-      # 重新套用格式並逐張回讀驗證；其他人工工作表保留不動。
+      # Google Sheet 歷史保護：
+      # daily 與 repair 都只新增缺少的唯一資料，不清空、不刪列、不裁切歷史。
+      # repair + RUN_MODE=2 會補齊完整歷史及近 22 個交易日 TOP15 快照。
       # ============================================================
       GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
@@ -173,12 +174,14 @@ jobs:
       GSHEET_CACHE_ENABLED: "0"
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
-      GSHEET_CLEAN_DELETED_BROKER_ROWS: "1"
+      GSHEET_PRESERVE_ALL_HISTORY: "1"
+      GSHEET_CLEAN_DELETED_BROKER_ROWS: "0"
+      GSHEET_RESULT_ARCHIVE_ENABLED: "0"
+      GSHEET_COMPACT_BLANK_GRID_ENABLED: "0"
 
-      # repair 會先 values.clear，再以 USER_ENTERED 寫入。
-      # 驗證直接使用實際送出的 normalized 矩陣，並與寫入共用 token bucket。
+      # 歷史保護模式禁止 repair 先 clear；保留變數供舊版相容，但明確關閉。
       GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
-      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "1"
+      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "0"
       GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
 
       GSHEET_WRITE_SLEEP_SECONDS: "0.05"
@@ -247,7 +250,7 @@ jobs:
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
               # FinMind 補足最近 200 個成功交易日完整歷史，MoneyDJ 補強最新資料；
-              # 報表完成後完整覆蓋並回讀驗證程式管理的 21 張工作表。
+              # Google Sheet 僅增量補齊，並回補近 22 個交易日 TOP15 快照。
               INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
               ;;
@@ -302,7 +305,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R6"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-APPEND-ONLY-TOP15-1M-BACKFILL-20260730-R7"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -312,9 +315,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行 R6。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行歷史保護版 R7。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 Hybrid R6。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的歷史保護版 Hybrid R7。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
