@@ -58,7 +58,7 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.4.1"
+PROGRAM_VERSION = "1.4.2"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
 IDENTITY_INDEX_SCHEMA_VERSION = "identity-v9-bundled-mops-six-code"
 MOPS_IDENTITY_SEED_VERSION = "2026-07-29-six-code-last-trading-date"
@@ -2919,6 +2919,29 @@ def event_unique_id(broker_code: str, underlying: str, event_day: str) -> str:
     return f"{normalize_code(broker_code)}|{normalize_code(underlying)}|{event_day}"
 
 
+def preferred_group_text(values: Iterable[Any], fallback: str = "") -> str:
+    """
+    從同一穩定事件鍵的顯示名稱中選出可重現的代表值。
+
+    分點名稱、標的名稱可能因資料來源、星號或歷史改名而不同；它們只能用來
+    顯示，不能拆分事件。優先取出現次數最多者，同次數時取較短再按字典序。
+    """
+    texts = [
+        str(value).strip()
+        for value in values
+        if value is not None
+        and not pd.isna(value)
+        and str(value).strip()
+    ]
+    if not texts:
+        return str(fallback or "").strip()
+    counts = Counter(texts)
+    return min(
+        counts,
+        key=lambda text: (-counts[text], len(text), text),
+    )
+
+
 def enrich_compact_identity(
     frame: pd.DataFrame,
     identity_index: WarrantIdentityIndex,
@@ -3071,37 +3094,70 @@ def build_events_for_day(frame: pd.DataFrame, day: str) -> list[dict[str, Any]]:
     ].copy()
     if valid.empty:
         return []
+    # 事件唯一性與 FIFO 都以代號事實為準。歷史資料中的分點名稱、標的名稱
+    # 可能因星號、簡稱或資料來源不同而改變；若把顯示名稱放入 groupby，
+    # 同一「券商＋標的＋日」會被拆成多筆，卻得到相同事件唯一 ID。
+    valid["_事件券商代號"] = valid["券商代號"].map(normalize_code)
+    valid["_事件標的股"] = valid["標的股"].map(normalize_code)
+    valid["_事件日"] = [
+        iso_date(value) or day
+        for value in valid["日期"]
+    ]
+    valid = valid[
+        (valid["_事件券商代號"] != "")
+        & (valid["_事件標的股"] != "")
+        & (valid["_事件日"] != "")
+    ].copy()
+    if valid.empty:
+        return []
     events: list[dict[str, Any]] = []
     group_columns = [
-        "分點",
-        "分點名稱",
-        "券商代號",
-        "標的股",
-        "標的名稱",
-        "日期",
+        "_事件券商代號",
+        "_事件標的股",
+        "_事件日",
     ]
     for key, group in valid.groupby(group_columns, dropna=False, sort=False):
-        broker, broker_name, broker_code, underlying, underlying_name, event_day = key
-        event_day = iso_date(event_day) or day
-        warrants = (
-            group.groupby(["權證代號", "權證名稱"], as_index=False)
-            .agg(買進金額=("買進金額", "sum"), 買進股數=("買進股數", "sum"))
+        broker_code, underlying, event_day = key
+        broker = preferred_group_text(group["分點"], broker_code)
+        broker_name = preferred_group_text(group["分點名稱"], broker)
+        underlying_name = preferred_group_text(
+            group["標的名稱"],
+            underlying,
         )
         lots: list[dict[str, Any]] = []
         max_single = 0
-        for warrant_code, warrant_name, raw_amount, raw_quantity in warrants[
-            ["權證代號", "權證名稱", "買進金額", "買進股數"]
-        ].itertuples(index=False, name=None):
-            amount = int(raw_amount or 0)
-            quantity = int(raw_quantity or 0)
+        for warrant_code, warrant_group in group.groupby(
+            "權證代號",
+            dropna=False,
+            sort=False,
+        ):
+            normalized_warrant_code = normalize_code(warrant_code)
+            if not normalized_warrant_code:
+                continue
+            warrant_name = preferred_group_text(
+                warrant_group["權證名稱"],
+                normalized_warrant_code,
+            )
+            amount = int(
+                pd.to_numeric(
+                    warrant_group["買進金額"],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
+            quantity = int(
+                pd.to_numeric(
+                    warrant_group["買進股數"],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
             if amount <= 0 or quantity <= 0:
                 continue
             max_single = max(max_single, amount)
             lots.append(
                 {
                     "買進日": event_day,
-                    "權證代號": normalize_code(warrant_code),
-                    "權證名稱": str(warrant_name or ""),
+                    "權證代號": normalized_warrant_code,
+                    "權證名稱": warrant_name,
                     "金額": amount,
                     "股數": quantity,
                 }
@@ -5157,6 +5213,28 @@ def run_self_tests() -> dict[str, str]:
     assert [item["事件唯一ID"] for item in built] == [
         item["事件唯一ID"] for item in built_again
     ], "相同精簡資料重算不得增加事件"
+
+    display_name_variants = compact.copy()
+    display_name_variants.loc[1, "分點名稱"] = "測試分點（舊名）"
+    display_name_variants.loc[1, "券商代號"] = "t001"
+    display_name_variants.loc[1, "標的名稱"] = "台積電*"
+    display_name_variants.loc[1, "買進金額"] = 1_000_000
+    display_name_variants.loc[1, "買超金額"] = 800_000
+    merged_variant_events = build_events_for_day(
+        display_name_variants,
+        "2026-01-02",
+    )
+    assert len(merged_variant_events) == 1, (
+        "顯示名稱或代號大小寫不同不得拆成重複事件"
+    )
+    assert merged_variant_events[0]["事件唯一ID"] == "T001|2330|2026-01-02"
+    assert merged_variant_events[0]["單日累積買進金額"] == 2_100_000
+    assert merged_variant_events[0]["事件代碼"] == "B"
+    assert merged_variant_events[0]["涵蓋權證數"] == 2
+    assert len(merged_variant_events[0]["lots"]) == 2
+    assert merged_variant_events[0]["分點名稱"] == "測試分點"
+    assert merged_variant_events[0]["標的名稱"] == "台積電"
+
     sales = {
         ("T001", "W1"): [
             {"日期": "2026-01-03", "賣出股數": 100, "賣出金額": 1_210_000}
@@ -5277,6 +5355,7 @@ def run_self_tests() -> dict[str, str]:
         "compact事實與階段二身分重算": "PASS",
         "認售有身分但不建立事件": "PASS",
         "事件去重複": "PASS",
+        "事件顯示名稱變體穩定聚合": "PASS",
         "ABCDE分類": "PASS",
         "事件買超股數語意": "PASS",
         "FIFO已出清": "PASS",
