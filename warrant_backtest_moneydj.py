@@ -2587,6 +2587,12 @@ GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 GSHEET_PRESERVE_ALL_HISTORY = os.getenv(
     "GSHEET_PRESERVE_ALL_HISTORY", "1"
 ).strip().lower() not in ("0", "false", "no")
+# 歷史保護開啟時，repair 仍可只重建「勝率統計／ABCDE組合勝率」。
+# 這兩張是由本次完整資料計算出的版面型彙總表，若沿用舊值會讓 60 日估值
+# 無法反映到 Google Sheet；其他 A～E、TOP15 與歷史明細仍維持不清除。
+GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED = os.getenv(
+    "GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
 
 # 保留舊版封存參數供相容使用；歷史保護模式下不會執行主表裁切。
 GSHEET_RESULT_ARCHIVE_ENABLED = os.getenv("GSHEET_RESULT_ARCHIVE_ENABLED", "0").strip().lower() not in ("0", "false", "no")
@@ -5147,17 +5153,31 @@ GSHEET_REPAIR_OVERWRITE_TITLES = {
     safe_worksheet_title(title)
     for title in FULL_REPAIR_RESULT_SHEET_TITLES
 }
+GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES = {
+    safe_worksheet_title("勝率統計"),
+    safe_worksheet_title("ABCDE組合勝率"),
+}
 
 
 def should_overwrite_result_sheet_in_repair(title):
-    """只有 RUN_MODE=2 的 repair 模式，才完整覆蓋完整修補報表清單。"""
+    """
+    RUN_MODE=2 repair 的覆蓋判斷。
+
+    - 關閉歷史保護：完整覆蓋所有 repair 結果表。
+    - 開啟歷史保護：只允許覆蓋可安全重建的兩張勝率彙總表。
+    """
     title = safe_worksheet_title(title)
     return (
-        not GSHEET_PRESERVE_ALL_HISTORY
-        and
         WORKFLOW_MODE == "repair"
         and RUN_MODE == 2
         and title in GSHEET_REPAIR_OVERWRITE_TITLES
+        and (
+            not GSHEET_PRESERVE_ALL_HISTORY
+            or (
+                GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED
+                and title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES
+            )
+        )
     )
 
 
@@ -8594,7 +8614,14 @@ def upload_excel_to_google_sheet(
             + "、".join(sorted(repair_expected_overwrites))
         )
         if GSHEET_PRESERVE_ALL_HISTORY:
-            print("  🛡️ repair 歷史保護模式：既有資料不清空、不刪列，只補上缺少資料。")
+            print(
+                "  🛡️ repair 歷史保護模式：A～E、TOP15 與歷史明細不清空、不刪列；"
+                + (
+                    "勝率統計／ABCDE組合勝率以本次重算結果重建。"
+                    if GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED
+                    else "勝率彙總表也維持既有值。"
+                )
+            )
         else:
             # 舊版完整覆蓋本身已會移除失效分點與舊資料。
             print("  ✅ repair 完整覆蓋模式：略過同步前舊資料清理，直接以本次結果重建。")
@@ -8615,7 +8642,11 @@ def upload_excel_to_google_sheet(
     if strict_repair and GSHEET_PRESERVE_ALL_HISTORY:
         print(
             f"  ⚙️ 同步模式：完整修補增量補齊｜共 {len(repair_expected_overwrites)} 張；"
-            "資料表只新增缺少列，既有版面型工作表保持原狀。"
+            + (
+                "歷史資料表只新增缺少列，兩張勝率彙總表完整重建。"
+                if GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED
+                else "資料表只新增缺少列，既有版面型工作表保持原狀。"
+            )
         )
     elif strict_repair:
         print(
@@ -8656,6 +8687,19 @@ def upload_excel_to_google_sheet(
         gws, created = _existing_result_sheet(primary_sh, title)
         if gws is None:
             raise RuntimeError(f"無法取得或建立 Google Sheet 工作表：{title}")
+
+        # repair 的勝率彙總表必須先於歷史保護安全門判斷，才能用本次
+        # 60 日按市價估值結果重建；其餘既有工作表仍受歷史保護。
+        if not created and should_overwrite_result_sheet_in_repair(title):
+            overwrite_repair_result_sheet_from_excel(
+                ws_xlsx,
+                gws,
+                raw_values,
+                title,
+                data_scope=current_scope,
+                extra_scope_values=selected_values,
+            )
+            return
 
         # 最高優先級安全門：既有 Google Sheet 一律不 clear、不 delete_rows、不 resize 縮小。
         # 簡單資料表僅插入尚未存在的唯一鍵；版面型工作表保持原狀。
