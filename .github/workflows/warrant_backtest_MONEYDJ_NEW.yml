@@ -117,6 +117,14 @@ jobs:
       FETCH_GROUP_WARRANT_PRICES: "0"
       PRICE_WORKERS: "60"
 
+      # repair 勝率重算：
+      # 持有滿 60 日仍未出清，以統計日權證價格估值；
+      # 已下市／到期取生命週期內最後有效價，完全無價時以 0 結算。
+      WINRATE_MARK_TO_MARKET_DAYS: "60"
+      WINRATE_MARK_TO_MARKET_REPAIR_ENABLED: "1"
+      WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED: "1"
+      WINRATE_DELISTED_MISSING_PRICE: "0"
+
       TOP15_CACHE_ENABLED: "1"
       TOP15_LOOKBACK_TRADING_DAYS: "40"
       # repair 回補近一個月的 TOP15 每日快照（約 22 個交易日）。
@@ -154,7 +162,8 @@ jobs:
       # ============================================================
       # 長期留單
       # ============================================================
-      LONGTERM_OPEN_DAYS: "120,150,180"
+      LONGTERM_OPEN_DAYS: "60,120,180"
+      LONGTERM_WINRATE_SHEET_DAYS: "60"
       LONGTERM_PRICE_LOOKBACK_DAYS: "420"
       LONGTERM_PRICE_STALE_DAYS: "10"
       LONGTERM_ZERO_PRICE_THRESHOLD: "0.05"
@@ -175,11 +184,13 @@ jobs:
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_PRESERVE_ALL_HISTORY: "1"
+      # repair 僅重建兩張勝率彙總表；A～E、TOP15 與歷史明細仍受歷史保護。
+      GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "0"
       GSHEET_RESULT_ARCHIVE_ENABLED: "0"
       GSHEET_COMPACT_BLANK_GRID_ENABLED: "0"
 
-      # 歷史保護模式禁止 repair 先 clear；保留變數供舊版相容，但明確關閉。
+      # 全域歷史表不 clear；勝率彙總表由上方專用開關安全重建。
       GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
       GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "0"
       GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
@@ -305,7 +316,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-APPEND-ONLY-TOP15-1M-BACKFILL-20260730-R7"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R8"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -315,9 +326,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已經執行歷史保護版 R7。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 60 日估值修正版 R8。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的歷史保護版 Hybrid R7。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 60 日估值修正版 Hybrid R8。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
