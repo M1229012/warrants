@@ -68,7 +68,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-APPEND-ONLY-TOP15-1M-BACKFILL-20260730-R7"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R8"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -302,14 +302,31 @@ _PRICE_PLAN_MAX_PUBLISHED_DATE = ""
 # 保留給 longterm 指定日期相容使用。
 PRICE_PREFETCH_TARGET_DATE = os.getenv("PRICE_PREFETCH_TARGET_DATE", "").strip()
 
+# 勝率強制估值設定：
+# repair 模式會把持有達門檻、但尚未完全出清的事件，以統計日權證價格
+# （已下市／到期者使用最後交易日前最後有效價；仍無價時以 0 計）納入勝負。
+WINRATE_MARK_TO_MARKET_DAYS = max(
+    int(os.getenv("WINRATE_MARK_TO_MARKET_DAYS", "60")),
+    1,
+)
+WINRATE_MARK_TO_MARKET_REPAIR_ENABLED = os.getenv(
+    "WINRATE_MARK_TO_MARKET_REPAIR_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED = os.getenv(
+    "WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED", "1"
+).strip().lower() not in ("0", "false", "no")
+WINRATE_DELISTED_MISSING_PRICE = float(
+    os.getenv("WINRATE_DELISTED_MISSING_PRICE", "0")
+)
+
 # 長期留單補價／修正勝率設定。
 LONGTERM_OPEN_DAYS = [
     int(x.strip())
-    for x in re.split(r"[,;；、\n\r\t]+", os.getenv("LONGTERM_OPEN_DAYS", "120,150,180"))
+    for x in re.split(r"[,;；、\n\r\t]+", os.getenv("LONGTERM_OPEN_DAYS", "60,120,180"))
     if x.strip().isdigit()
 ]
 if not LONGTERM_OPEN_DAYS:
-    LONGTERM_OPEN_DAYS = [120, 150, 180]
+    LONGTERM_OPEN_DAYS = [60, 120, 180]
 LONGTERM_OPEN_DAYS = sorted(set(max(int(x), 1) for x in LONGTERM_OPEN_DAYS))
 LONGTERM_PRICE_LOOKBACK_DAYS = int(os.getenv("LONGTERM_PRICE_LOOKBACK_DAYS", "420"))
 LONGTERM_PRICE_STALE_DAYS = int(os.getenv("LONGTERM_PRICE_STALE_DAYS", "10"))
@@ -318,7 +335,7 @@ LONGTERM_TARGET_DATE = os.getenv("LONGTERM_TARGET_DATE", "").strip()
 LONGTERM_MAX_DETAIL_ROWS = int(os.getenv("LONGTERM_MAX_DETAIL_ROWS", "0"))
 LONGTERM_UPDATE_WINRATE_SHEET = os.getenv("LONGTERM_UPDATE_WINRATE_SHEET", os.getenv("LONGTERM_UPLOAD_TO_GSHEET", "1")).strip().lower() not in ("0", "false", "no")
 LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET = os.getenv("LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET", "0").strip().lower() in ("1", "true", "yes")
-LONGTERM_WINRATE_SHEET_DAYS = int(os.getenv("LONGTERM_WINRATE_SHEET_DAYS", str(LONGTERM_OPEN_DAYS[0])) or "120")
+LONGTERM_WINRATE_SHEET_DAYS = int(os.getenv("LONGTERM_WINRATE_SHEET_DAYS", str(LONGTERM_OPEN_DAYS[0])) or "60")
 LONGTERM_WINRATE_SHEET_HEADER = os.getenv("LONGTERM_WINRATE_SHEET_HEADER", "修正勝率").strip() or "修正勝率"
 
 # daily：每日增量；longterm：長期留單；repair：重建保留區間。
@@ -17296,8 +17313,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
             "減碼日", "減碼賣出金額", "減碼獲利%",
             "出清日", "出清賣出金額", "出清獲利%",
             "持有天數",
+            "勝率結算方式", "勝率結算日", "勝率結算報酬%", "勝率估值狀態",
         ] + day_cols
-        fixed_len = 21
+        fixed_len = 25
     else:
         headers = [
             "事件類型", "分點", "標的股",
@@ -17308,8 +17326,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
             "減碼日", "減碼賣出金額", "減碼獲利%",
             "出清日", "出清賣出金額", "出清獲利%",
             "持有天數",
+            "勝率結算方式", "勝率結算日", "勝率結算報酬%", "勝率估值狀態",
         ] + day_cols
-        fixed_len = 20
+        fixed_len = 24
 
     ws.append(headers)
     status_rows = []
@@ -17358,6 +17377,10 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
                 fmt_amount(ev["出清賣出金額"]),
                 fmt_pct(ev["出清獲利%"]),
                 fmt_num(ev["持有天數"]),
+                ev.get("勝率結算方式") or ("實際出清" if ev.get("出清獲利%") is not None else "-"),
+                ev.get("勝率結算日") or ev.get("出清日") or "-",
+                fmt_pct(ev.get("勝率結算報酬%") if ev.get("勝率結算報酬%") is not None else ev.get("出清獲利%")),
+                ev.get("勝率估值狀態") or ("實際成交" if ev.get("出清獲利%") is not None else "-"),
             ] + day_values
         else:
             row = [
@@ -17381,6 +17404,10 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
                 fmt_amount(ev["出清賣出金額"]),
                 fmt_pct(ev["出清獲利%"]),
                 fmt_num(ev["持有天數"]),
+                ev.get("勝率結算方式") or ("實際出清" if ev.get("出清獲利%") is not None else "-"),
+                ev.get("勝率結算日") or ev.get("出清日") or "-",
+                fmt_pct(ev.get("勝率結算報酬%") if ev.get("勝率結算報酬%") is not None else ev.get("出清獲利%")),
+                ev.get("勝率估值狀態") or ("實際成交" if ev.get("出清獲利%") is not None else "-"),
             ] + day_values
 
         ws.append(row)
@@ -17398,9 +17425,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
             exit_profit_result_cells.append((current_row_idx, exit_profit_col_idx, ev["出清獲利%"]))
 
     if is_c:
-        col_widths = [20, 14, 8, 12, 12, 12, 8, 8, 12, 45, 14, 24, 16, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
+        col_widths = [20, 14, 8, 12, 12, 12, 8, 8, 12, 45, 14, 24, 16, 10, 12, 14, 12, 12, 14, 12, 10, 24, 12, 14, 45] + [14] * 20
     else:
-        col_widths = [20, 14, 8, 12, 12, 8, 8, 12, 45, 14, 24, 16, 10, 12, 14, 12, 12, 14, 12, 10] + [14] * 20
+        col_widths = [20, 14, 8, 12, 12, 8, 8, 12, 45, 14, 24, 16, 10, 12, 14, 12, 12, 14, 12, 10, 24, 12, 14, 45] + [14] * 20
 
     style_sheet(ws, col_widths, status_rows)
 
@@ -17425,39 +17452,79 @@ def collect_stat_records(a_events, b_events, c_events, d_events, e_events=None):
 
     for event_code, events in iter_amount_class_event_groups(a_events, b_events, c_events, d_events, e_events):
         for ev in events:
-            return_pct = ev["出清獲利%"]
-            closed = return_pct is not None
+            actual_return_pct = ev.get("出清獲利%")
+            marked_return_pct = ev.get("勝率結算報酬%")
+            return_pct = (
+                actual_return_pct
+                if actual_return_pct is not None
+                else marked_return_pct
+            )
+            actually_closed = actual_return_pct is not None
+            forced_valuation = (
+                not actually_closed
+                and marked_return_pct is not None
+            )
+            included = return_pct is not None
 
             records.append({
                 "分點": ev["分點"],
                 "事件類型": ev.get("事件類型", f"{event_code}-{AMOUNT_CLASS_LABELS.get(event_code, '事件')}"),
                 "事件代碼": event_code,
-                "是否出清": closed,
+                "是否出清": actually_closed,
+                "是否實際出清": actually_closed,
+                "是否強制估值": forced_valuation,
+                "是否納入勝率": included,
                 "結果": calc_result_tag(return_pct),
                 "持有天數": ev["持有天數"],
                 "報酬%": return_pct,
                 "買進金額": _safe_stat_amount(ev.get("買超金額", ev.get("單日累積買進金額", 0))),
+                "勝率結算方式": (
+                    ev.get("勝率結算方式")
+                    or ("實際出清" if actually_closed else "")
+                ),
+                "勝率結算日": (
+                    ev.get("勝率結算日")
+                    or (ev.get("出清日") if actually_closed else "")
+                ),
+                "勝率估值狀態": ev.get("勝率估值狀態", ""),
             })
 
     return records
 
 def calc_summary_for_group(g, broker, event_type):
     total_events = len(g)
-    closed_g = g[g["是否出清"] == True]
-    open_g = g[g["是否出清"] == False]
+    actual_closed_mask = (
+        g["是否實際出清"] == True
+        if "是否實際出清" in g.columns
+        else g["是否出清"] == True
+    )
+    included_mask = (
+        g["是否納入勝率"] == True
+        if "是否納入勝率" in g.columns
+        else actual_closed_mask
+    )
+    forced_mask = (
+        g["是否強制估值"] == True
+        if "是否強制估值" in g.columns
+        else pd.Series(False, index=g.index)
+    )
 
-    closed_count = len(closed_g)
-    open_count = len(open_g)
+    evaluated_g = g[included_mask]
+    actual_closed_count = int(actual_closed_mask.sum())
+    forced_count = int(forced_mask.sum())
+    evaluated_count = len(evaluated_g)
+    open_count = total_events - actual_closed_count
+    unresolved_count = total_events - evaluated_count
 
-    win_count = int((closed_g["結果"] == "勝").sum()) if closed_count > 0 else 0
-    loss_count = int((closed_g["結果"] == "敗").sum()) if closed_count > 0 else 0
-    flat_count = int((closed_g["結果"] == "平手").sum()) if closed_count > 0 else 0
+    win_count = int((evaluated_g["結果"] == "勝").sum()) if evaluated_count > 0 else 0
+    loss_count = int((evaluated_g["結果"] == "敗").sum()) if evaluated_count > 0 else 0
+    flat_count = int((evaluated_g["結果"] == "平手").sum()) if evaluated_count > 0 else 0
 
-    win_rate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
+    win_rate = round(win_count / evaluated_count * 100, 2) if evaluated_count > 0 else None
 
     avg_holding_days = None
-    if closed_count > 0:
-        holding_series = pd.to_numeric(closed_g["持有天數"], errors="coerce").dropna()
+    if evaluated_count > 0:
+        holding_series = pd.to_numeric(evaluated_g["持有天數"], errors="coerce").dropna()
         if len(holding_series) > 0:
             avg_holding_days = round(float(holding_series.mean()), 2)
 
@@ -17466,40 +17533,43 @@ def calc_summary_for_group(g, broker, event_type):
     max_return = None
     min_return = None
     total_entry_amount = 0
-    closed_entry_amount = 0
+    evaluated_entry_amount = 0
     estimated_pnl_amount = None
     avg_entry_amount = None
 
     if "買進金額" in g.columns:
         total_entry_amount = int(pd.to_numeric(g["買進金額"], errors="coerce").fillna(0).sum())
 
-    if closed_count > 0:
-        return_series = pd.to_numeric(closed_g["報酬%"], errors="coerce").dropna()
+    if evaluated_count > 0:
+        return_series = pd.to_numeric(evaluated_g["報酬%"], errors="coerce").dropna()
         if len(return_series) > 0:
             avg_return = round(float(return_series.mean()), 2)
             max_return = round(float(return_series.max()), 2)
             min_return = round(float(return_series.min()), 2)
 
-        if "買進金額" in closed_g.columns:
-            weighted_df = closed_g.copy()
+        if "買進金額" in evaluated_g.columns:
+            weighted_df = evaluated_g.copy()
             weighted_df["報酬%"] = pd.to_numeric(weighted_df["報酬%"], errors="coerce")
             weighted_df["買進金額"] = pd.to_numeric(weighted_df["買進金額"], errors="coerce").fillna(0)
             weighted_df = weighted_df.dropna(subset=["報酬%"] )
             weighted_df = weighted_df[weighted_df["買進金額"] > 0]
 
             if not weighted_df.empty:
-                closed_entry_amount = int(round(float(weighted_df["買進金額"].sum())))
+                evaluated_entry_amount = int(round(float(weighted_df["買進金額"].sum())))
                 weighted_pnl = float((weighted_df["買進金額"] * weighted_df["報酬%"] / 100.0).sum())
                 estimated_pnl_amount = int(round(weighted_pnl))
-                weighted_return = round(weighted_pnl / closed_entry_amount * 100.0, 2) if closed_entry_amount > 0 else None
-                avg_entry_amount = int(round(closed_entry_amount / len(weighted_df))) if len(weighted_df) > 0 else None
+                weighted_return = round(weighted_pnl / evaluated_entry_amount * 100.0, 2) if evaluated_entry_amount > 0 else None
+                avg_entry_amount = int(round(evaluated_entry_amount / len(weighted_df))) if len(weighted_df) > 0 else None
 
     return {
         "分點": broker,
         "事件類型": event_type,
         "事件數": total_events,
-        "已出清筆數": closed_count,
+        "已出清筆數": actual_closed_count,
         "未出清筆數": open_count,
+        "滿門檻估值筆數": forced_count,
+        "納入勝率筆數": evaluated_count,
+        "未納入勝率筆數": unresolved_count,
         "勝筆數": win_count,
         "敗筆數": loss_count,
         "平手筆數": flat_count,
@@ -17508,7 +17578,8 @@ def calc_summary_for_group(g, broker, event_type):
         "平均報酬%": avg_return,
         "加權報酬%": weighted_return,
         "總買進金額": total_entry_amount,
-        "已出清買進金額": closed_entry_amount,
+        "已出清買進金額": evaluated_entry_amount,
+        "納入勝率買進金額": evaluated_entry_amount,
         "估算損益金額": estimated_pnl_amount,
         "平均單筆買進金額": avg_entry_amount,
         "最高報酬%": max_return,
@@ -17523,6 +17594,9 @@ def calc_empty_summary(broker, event_type):
         "事件數": 0,
         "已出清筆數": 0,
         "未出清筆數": 0,
+        "滿門檻估值筆數": 0,
+        "納入勝率筆數": 0,
+        "未納入勝率筆數": 0,
         "勝筆數": 0,
         "敗筆數": 0,
         "平手筆數": 0,
@@ -17532,6 +17606,7 @@ def calc_empty_summary(broker, event_type):
         "加權報酬%": None,
         "總買進金額": 0,
         "已出清買進金額": 0,
+        "納入勝率買進金額": 0,
         "估算損益金額": None,
         "平均單筆買進金額": None,
         "最高報酬%": None,
@@ -17589,7 +17664,11 @@ def sort_brokers_by_winrate_summary(summary_map, broker_order):
 
 def make_summary_map(stat_records):
     if not stat_records:
-        stat_df = pd.DataFrame(columns=["分點", "事件代碼", "事件類型", "是否出清", "結果", "持有天數", "報酬%", "買進金額"])
+        stat_df = pd.DataFrame(columns=[
+            "分點", "事件代碼", "事件類型", "是否出清",
+            "是否實際出清", "是否強制估值", "是否納入勝率",
+            "結果", "持有天數", "報酬%", "買進金額",
+        ])
     else:
         stat_df = pd.DataFrame(stat_records)
 
@@ -18185,6 +18264,9 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events=None)
         "事件數",
         "已出清筆數",
         "未出清筆數",
+        f"滿{WINRATE_MARK_TO_MARKET_DAYS}日估值筆數",
+        "納入勝率筆數",
+        "未納入勝率筆數",
         "勝筆數",
         "敗筆數",
         "平手筆數",
@@ -18193,7 +18275,7 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events=None)
         "平均報酬%",
         "加權報酬%",
         "總買進金額",
-        "已出清買進金額",
+        "納入勝率買進金額",
         "估算損益金額",
         "平均單筆買進金額",
         "最高報酬%",
@@ -18247,6 +18329,9 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events=None)
                 row["事件數"],
                 row["已出清筆數"],
                 row["未出清筆數"],
+                row["滿門檻估值筆數"],
+                row["納入勝率筆數"],
+                row["未納入勝率筆數"],
                 row["勝筆數"],
                 row["敗筆數"],
                 row["平手筆數"],
@@ -18255,7 +18340,7 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events=None)
                 "-" if row["平均報酬%"] is None else f'{row["平均報酬%"]:+.2f}%',
                 "-" if row["加權報酬%"] is None else f'{row["加權報酬%"]:+.2f}%',
                 fmt_amount(row.get("總買進金額")),
-                fmt_amount(row.get("已出清買進金額")),
+                fmt_amount(row.get("納入勝率買進金額")),
                 "-" if row.get("估算損益金額") is None else fmt_amount(row.get("估算損益金額")),
                 "-" if row.get("平均單筆買進金額") is None else fmt_amount(row.get("平均單筆買進金額")),
                 "-" if row["最高報酬%"] is None else f'{row["最高報酬%"]:+.2f}%',
@@ -18279,7 +18364,7 @@ def write_stats_sheet(wb, a_events, b_events, c_events, d_events, e_events=None)
 
         current_row += 1
 
-    col_widths = [16, 24, 10, 12, 12, 10, 10, 10, 10, 14, 12, 12, 14, 16, 14, 16, 12, 12]
+    col_widths = [16, 24, 10, 12, 12, 14, 14, 14, 10, 10, 10, 10, 14, 12, 12, 14, 16, 14, 16, 12, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -18293,7 +18378,7 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
     1. 以分點為單位。
     2. 組合包含 AB / AC / AD / BC / BD / CD / ABC / ABD / ACD / BCD / ABCDE。
     3. 只有該分點同時具備該組合內所有事件類型，才列入該組合勝率。
-    4. 勝率只用「已出清」事件計算，未出清不列入勝敗。
+    4. 勝率使用「實際出清 + 持有滿門檻日按市價估值」事件計算。
 
     排版邏輯：
     參考「勝率統計」工作表，每個分點獨立區塊顯示，方便閱讀與截圖。
@@ -18313,6 +18398,9 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
         "組合事件數",
         "已出清筆數",
         "未出清筆數",
+        f"滿{WINRATE_MARK_TO_MARKET_DAYS}日估值筆數",
+        "納入勝率筆數",
+        "未納入勝率筆數",
         "勝筆數",
         "敗筆數",
         "平手筆數",
@@ -18328,6 +18416,7 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
     if not stat_records:
         stat_df = pd.DataFrame(columns=[
             "分點", "事件代碼", "事件類型", "是否出清",
+            "是否實際出清", "是否強制估值", "是否納入勝率",
             "結果", "持有天數", "報酬%", "買進金額"
         ])
     else:
@@ -18371,7 +18460,10 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
 
     ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(headers))
     note_cell = ws.cell(current_row, 1)
-    note_cell.value = "統計邏輯：只有該分點同時具備該組合內所有事件類型，才列入該組合勝率；勝率只用「已出清」事件計算，未出清不列入勝敗。"
+    note_cell.value = (
+        "統計邏輯：只有該分點同時具備該組合內所有事件類型，才列入該組合勝率；"
+        f"勝率包含實際出清，以及持有滿 {WINRATE_MARK_TO_MARKET_DAYS} 日後按統計日權證價格估值的事件。"
+    )
     note_cell.font = Font(color="666666")
     note_cell.fill = WHITE
     note_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -18433,29 +18525,33 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
                 combo_g = broker_g[broker_g["事件代碼"].isin(combo_codes)].copy()
 
                 combo_event_count = len(combo_g)
-                closed_g = combo_g[combo_g["是否出清"] == True]
-                open_g = combo_g[combo_g["是否出清"] == False]
+                actual_closed_mask = combo_g["是否實際出清"] == True
+                included_mask = combo_g["是否納入勝率"] == True
+                included_g = combo_g[included_mask]
 
-                closed_count = len(closed_g)
-                open_count = len(open_g)
+                closed_count = int(actual_closed_mask.sum())
+                open_count = combo_event_count - closed_count
+                forced_count = int((combo_g["是否強制估值"] == True).sum())
+                included_count = len(included_g)
+                unresolved_count = combo_event_count - included_count
 
-                win_count = int((closed_g["結果"] == "勝").sum()) if closed_count > 0 else 0
-                loss_count = int((closed_g["結果"] == "敗").sum()) if closed_count > 0 else 0
-                flat_count = int((closed_g["結果"] == "平手").sum()) if closed_count > 0 else 0
+                win_count = int((included_g["結果"] == "勝").sum()) if included_count > 0 else 0
+                loss_count = int((included_g["結果"] == "敗").sum()) if included_count > 0 else 0
+                flat_count = int((included_g["結果"] == "平手").sum()) if included_count > 0 else 0
 
-                win_rate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
+                win_rate = round(win_count / included_count * 100, 2) if included_count > 0 else None
 
                 avg_holding_days = None
-                if closed_count > 0:
-                    holding_series = pd.to_numeric(closed_g["持有天數"], errors="coerce").dropna()
+                if included_count > 0:
+                    holding_series = pd.to_numeric(included_g["持有天數"], errors="coerce").dropna()
                     if len(holding_series) > 0:
                         avg_holding_days = round(float(holding_series.mean()), 2)
 
                 avg_return = None
                 max_return = None
                 min_return = None
-                if closed_count > 0:
-                    return_series = pd.to_numeric(closed_g["報酬%"], errors="coerce").dropna()
+                if included_count > 0:
+                    return_series = pd.to_numeric(included_g["報酬%"], errors="coerce").dropna()
                     if len(return_series) > 0:
                         avg_return = round(float(return_series.mean()), 2)
                         max_return = round(float(return_series.max()), 2)
@@ -18474,6 +18570,9 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
                     combo_event_count,
                     closed_count,
                     open_count,
+                    forced_count,
+                    included_count,
+                    unresolved_count,
                     win_count,
                     loss_count,
                     flat_count,
@@ -18494,6 +18593,9 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
                     event_counts["C"],
                     event_counts["D"],
                     event_counts["E"],
+                    0,
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -18527,7 +18629,7 @@ def write_combo_winrate_sheet(wb, a_events, b_events, c_events, d_events, e_even
 
         current_row += 1
 
-    col_widths = [16, 8, 14, 14, 10, 10, 10, 10, 10, 12, 12, 12, 10, 10, 10, 10, 14, 12, 12, 12]
+    col_widths = [16, 8, 14, 14, 10, 10, 10, 10, 10, 12, 12, 12, 14, 14, 14, 10, 10, 10, 10, 14, 12, 12, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -21962,6 +22064,295 @@ def ensure_longterm_warrant_prices(price_cache, open_lots, target_date):
     return price_cache
 
 
+def _winrate_event_date(event):
+    return normalize_date_str(
+        event.get("起始日")
+        or event.get("事件日")
+        or event.get("結束日")
+        or ""
+    )
+
+
+def _warrant_lifecycle_for_event_lot(code, buy_date, target_date):
+    """
+    依買進日選出正確的權證生命週期，避免權證代號重用時誤拿到新一輪價格。
+    回傳 (上市日, 最後交易日)；找不到生命週期時回傳 (None, None)。
+    """
+    code = normalize_price_code(code)
+    buy_dt = parse_date(buy_date)
+    target_dt = parse_date(target_date) or datetime.today()
+    intervals = (_get_warrant_price_lifecycle_index() or {}).get(code, [])
+    if not intervals:
+        return None, None
+
+    containing = []
+    for list_dt, end_dt in intervals:
+        if buy_dt:
+            if list_dt and buy_dt < list_dt:
+                continue
+            if end_dt and buy_dt > end_dt:
+                continue
+            containing.append((list_dt, end_dt))
+
+    candidates = containing or [
+        (list_dt, end_dt)
+        for list_dt, end_dt in intervals
+        if not list_dt or list_dt <= target_dt
+    ]
+    if not candidates:
+        return None, None
+
+    return max(
+        candidates,
+        key=lambda value: (
+            value[0] or datetime.min,
+            value[1] or datetime.max,
+        ),
+    )
+
+
+def _winrate_lot_price_info(price_cache, lot, target_date):
+    """
+    取得勝率估值使用的權證價格。
+
+    - 尚在交易：取統計日當天或之前的最近有效收盤價。
+    - 已下市／到期：只在該次生命週期內取最後有效收盤價。
+    - 已確認下市／到期且完整補價後仍無價：以 WINRATE_DELISTED_MISSING_PRICE
+      （預設 0）結算，確保不會因缺價而從勝率分母消失。
+    """
+    code = normalize_price_code(lot.get("權證代號", ""))
+    buy_date = normalize_date_str(lot.get("買進日", ""))
+    target_dt = parse_date(target_date) or datetime.today()
+    list_dt, end_dt = _warrant_lifecycle_for_event_lot(
+        code,
+        buy_date,
+        target_date,
+    )
+    delisted = bool(end_dt and end_dt.date() < target_dt.date())
+    valuation_dt = min(target_dt, end_dt) if end_dt else target_dt
+
+    prices = get_price_series_from_cache(price_cache, code)
+    valid_rows = []
+    for date_key in _sorted_valid_price_dates(prices):
+        price_dt = parse_date(date_key)
+        price = safe_price_float(prices.get(date_key))
+        if not price_dt or price is None:
+            continue
+        if list_dt and price_dt < list_dt:
+            continue
+        if price_dt > valuation_dt:
+            continue
+        valid_rows.append((price_dt, normalize_date_str(date_key), float(price)))
+
+    if valid_rows:
+        _price_dt, price_date, price = valid_rows[-1]
+        if delisted:
+            status = "已下市/到期：最後有效收盤價"
+        else:
+            stale_days = max((target_dt.date() - _price_dt.date()).days, 0)
+            status = "統計日最近收盤價"
+            if stale_days > LONGTERM_PRICE_STALE_DAYS:
+                status = f"在市但價格逾{stale_days}日未更新"
+        return price, price_date, status, delisted, False
+
+    if delisted:
+        return (
+            float(WINRATE_DELISTED_MISSING_PRICE),
+            normalize_date_str(end_dt),
+            f"已下市/到期且無成交價：以{WINRATE_DELISTED_MISSING_PRICE:g}結算",
+            True,
+            False,
+        )
+
+    return None, "", "在市權證缺估值價格", False, True
+
+
+def collect_winrate_mark_to_market_lots(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events,
+    target_date,
+):
+    """收集持有達門檻、尚未出清事件中的剩餘權證批次，供 repair 補價。"""
+    target_dt = parse_date(target_date) or datetime.today()
+    lots = []
+    eligible_events = 0
+
+    for _code, events in iter_amount_class_event_groups(
+        a_events, b_events, c_events, d_events, e_events
+    ):
+        for event in events:
+            if event.get("出清獲利%") is not None:
+                continue
+            event_dt = parse_date(_winrate_event_date(event))
+            if not event_dt:
+                continue
+            holding_days = max((target_dt.date() - event_dt.date()).days, 0)
+            if holding_days < WINRATE_MARK_TO_MARKET_DAYS:
+                continue
+            eligible_events += 1
+            for lot in event.get("lots", []):
+                remain_qty = longterm_safe_float(lot.get("剩餘股數"), 0)
+                if remain_qty <= 0:
+                    continue
+                lot["持有天數"] = holding_days
+                lots.append(lot)
+
+    return lots, eligible_events
+
+
+def apply_winrate_mark_to_market(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events,
+    price_cache,
+    target_date,
+):
+    """
+    將持有達門檻但尚未出清的「事件」按市價估值並納入主勝率。
+
+    報酬 =（FIFO 已實現賣出金額 + 剩餘部位估值）/ 原始事件成本 - 1。
+    多檔權證事件會先合併所有 lot，再以一筆事件判斷勝／敗／平手，
+    因此不會因一個事件買了多檔權證而重複增加勝率樣本數。
+    """
+    target_dt = parse_date(target_date) or datetime.today()
+    stats = {
+        "eligible": 0,
+        "valued": 0,
+        "delisted_valued": 0,
+        "delisted_zero": 0,
+        "unresolved": 0,
+        "unresolved_codes": set(),
+    }
+
+    for _code, events in iter_amount_class_event_groups(
+        a_events, b_events, c_events, d_events, e_events
+    ):
+        for event in events:
+            event.setdefault("勝率結算方式", "")
+            event.setdefault("勝率結算日", "")
+            event.setdefault("勝率結算報酬%", None)
+            event.setdefault("勝率估值狀態", "")
+
+            if event.get("出清獲利%") is not None:
+                event["勝率結算方式"] = "實際出清"
+                event["勝率結算日"] = event.get("出清日") or ""
+                event["勝率結算報酬%"] = event.get("出清獲利%")
+                event["勝率估值狀態"] = "實際成交"
+                continue
+
+            event_dt = parse_date(_winrate_event_date(event))
+            if not event_dt:
+                continue
+            holding_days = max((target_dt.date() - event_dt.date()).days, 0)
+            if holding_days < WINRATE_MARK_TO_MARKET_DAYS:
+                continue
+
+            stats["eligible"] += 1
+            total_cost = sum(
+                longterm_safe_float(lot.get("金額"), 0)
+                for lot in event.get("lots", [])
+            )
+            realized_revenue = longterm_safe_float(
+                event.get("已實現賣出金額"), 0
+            )
+            remaining_value = 0.0
+            unresolved_codes = []
+            statuses = []
+            has_delisted = False
+            has_delisted_zero = False
+
+            for lot in event.get("lots", []):
+                remain_qty = longterm_safe_float(lot.get("剩餘股數"), 0)
+                if remain_qty <= 0:
+                    continue
+                price, price_date, status, delisted, unresolved = (
+                    _winrate_lot_price_info(price_cache, lot, target_date)
+                )
+                code = normalize_price_code(lot.get("權證代號", ""))
+                if unresolved or price is None:
+                    unresolved_codes.append(code or "(空白代號)")
+                    continue
+                remaining_value += remain_qty * float(price)
+                statuses.append(
+                    f"{code}:{status}"
+                    + (f"({price_date})" if price_date else "")
+                )
+                has_delisted = has_delisted or delisted
+                has_delisted_zero = has_delisted_zero or (
+                    delisted and float(price) == float(WINRATE_DELISTED_MISSING_PRICE)
+                )
+
+            if unresolved_codes or total_cost <= 0:
+                stats["unresolved"] += 1
+                stats["unresolved_codes"].update(unresolved_codes)
+                event["勝率估值狀態"] = (
+                    "缺價未納入：" + "、".join(sorted(set(unresolved_codes)))
+                    if unresolved_codes
+                    else "事件成本為0，未納入"
+                )
+                continue
+
+            estimated_proceeds = realized_revenue + remaining_value
+            return_pct = round(
+                (estimated_proceeds - total_cost) / total_cost * 100.0,
+                2,
+            )
+            event["持有天數"] = holding_days
+            event["勝率結算方式"] = (
+                f"持有滿{WINRATE_MARK_TO_MARKET_DAYS}日按市價估值"
+            )
+            event["勝率結算日"] = normalize_date_str(target_date)
+            event["勝率結算報酬%"] = return_pct
+            event["勝率估值狀態"] = "；".join(statuses)
+            event["勝率估算總價值"] = round(estimated_proceeds, 0)
+            stats["valued"] += 1
+            if has_delisted:
+                stats["delisted_valued"] += 1
+            if has_delisted_zero:
+                stats["delisted_zero"] += 1
+
+    return stats
+
+
+def prepare_repair_winrate_mark_to_market(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events,
+    price_cache,
+    target_date,
+):
+    """repair 專用入口：先補齊 60 日以上未出清權證價格，再重算事件報酬。"""
+    lots, eligible_events = collect_winrate_mark_to_market_lots(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        target_date,
+    )
+    if lots:
+        ensure_longterm_warrant_prices(price_cache, lots, target_date)
+
+    stats = apply_winrate_mark_to_market(
+        a_events,
+        b_events,
+        c_events,
+        d_events,
+        e_events,
+        price_cache,
+        target_date,
+    )
+    stats["eligible"] = max(int(stats.get("eligible", 0)), eligible_events)
+    return stats
+
+
 def attach_longterm_price_and_pnl(open_lots, price_cache, target_date):
     rows = []
     target_dt = parse_date(target_date) or datetime.today()
@@ -22173,8 +22564,8 @@ def build_longterm_adjusted_winrate_rows(summary_map, threshold_rows_map):
 
     這裡會依 分點 × A/B/C/D/E/ALL 計算：
     - 原始勝率：原本已出清勝率。
-    - 修正勝率：把長期留單中已知虧損與疑似龜苓膏視為額外敗筆。
-    - 保守勝率：再把長期缺價留單也視為風險敗筆。
+    - 修正勝率：長期留單有價格者依賺錢／賠錢／打平完整加入分子與分母。
+    - 保守勝率：再把長期缺價留單視為敗筆。
     """
     rows = []
     brokers = list(TARGET_PATTERNS.keys())
@@ -22198,10 +22589,13 @@ def build_longterm_adjusted_winrate_rows(summary_map, threshold_rows_map):
                 win_count = int(original.get("勝筆數") or 0)
                 loss_count = int(original.get("敗筆數") or 0)
                 flat_count = int(original.get("平手筆數") or 0)
+                long_win = int(longterm_safe_float(risk.get("長期賺錢筆數"), 0))
+                long_flat = int(longterm_safe_float(risk.get("長期打平筆數"), 0))
                 long_loss = int(longterm_safe_float(risk.get("長期已知虧損/龜苓膏筆數"), 0))
                 long_missing = int(longterm_safe_float(risk.get("長期缺價筆數"), 0))
-                revised_den = closed_count + long_loss
-                conservative_den = closed_count + long_loss + long_missing
+                revised_win = win_count + long_win
+                revised_den = closed_count + long_win + long_loss + long_flat
+                conservative_den = revised_den + long_missing
                 rows.append({
                     "門檻天數": days,
                     "分點": broker,
@@ -22215,16 +22609,19 @@ def build_longterm_adjusted_winrate_rows(summary_map, threshold_rows_map):
                     "原始平手筆數": flat_count,
                     "原始勝率": original.get("勝率"),
                     "長期留單筆數": int(longterm_safe_float(risk.get("長期留單筆數"), 0)),
-                    "長期賺錢筆數": int(longterm_safe_float(risk.get("長期賺錢筆數"), 0)),
+                    "長期賺錢筆數": long_win,
                     "長期賠錢筆數": int(longterm_safe_float(risk.get("長期賠錢筆數"), 0)),
                     "長期疑似龜苓膏筆數": int(longterm_safe_float(risk.get("長期疑似龜苓膏筆數"), 0)),
                     "長期已知虧損/龜苓膏筆數": long_loss,
                     "長期缺價筆數": long_missing,
                     "長期留單成本": risk.get("長期留單成本", 0),
                     "長期缺價成本": risk.get("長期缺價成本", 0),
-                    "修正勝率_已知虧損視為敗": "" if revised_den <= 0 else round(win_count / revised_den * 100, 2),
-                    "保守勝率_已知虧損加缺價視為敗": "" if conservative_den <= 0 else round(win_count / conservative_den * 100, 2),
-                    "說明": "修正勝率以同分點同事件類型的長期留單已知虧損/龜苓膏視為額外敗筆；保守勝率再把缺價留單也視為風險敗筆。",
+                    "修正勝率_有價留單納入勝敗": "" if revised_den <= 0 else round(revised_win / revised_den * 100, 2),
+                    "保守勝率_缺價視為敗": "" if conservative_den <= 0 else round(revised_win / conservative_den * 100, 2),
+                    # 保留舊欄名，避免既有 Google Sheet 回填程式失去相容性。
+                    "修正勝率_已知虧損視為敗": "" if revised_den <= 0 else round(revised_win / revised_den * 100, 2),
+                    "保守勝率_已知虧損加缺價視為敗": "" if conservative_den <= 0 else round(revised_win / conservative_den * 100, 2),
+                    "說明": "修正勝率將長期留單的賺錢、賠錢、疑似歸零與打平結果完整納入；保守勝率再把缺價留單視為敗筆。",
                 })
     return rows
 
@@ -24347,6 +24744,48 @@ def main():
         incremental_target_date=(None if workflow_is_repair() else target_date),
     )
     all_changed_price_codes.update(changed_codes)
+
+    if workflow_is_repair() and WINRATE_MARK_TO_MARKET_REPAIR_ENABLED:
+        print(
+            f"【Step 4b】repair 勝率重算：持有滿 "
+            f"{WINRATE_MARK_TO_MARKET_DAYS} 日未出清事件按權證市價估值..."
+        )
+        mark_stats = prepare_repair_winrate_mark_to_market(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            e_events,
+            price_cache,
+            target_date,
+        )
+        unresolved_codes = sorted(mark_stats.get("unresolved_codes", set()))
+        print(
+            f"  ✅ 滿門檻事件 {int(mark_stats.get('eligible', 0)):,} 筆｜"
+            f"已估值納入 {int(mark_stats.get('valued', 0)):,} 筆｜"
+            f"含已下市/到期 {int(mark_stats.get('delisted_valued', 0)):,} 筆｜"
+            f"下市/到期無價視為 {WINRATE_DELISTED_MISSING_PRICE:g}："
+            f"{int(mark_stats.get('delisted_zero', 0)):,} 筆｜"
+            f"仍缺價 {int(mark_stats.get('unresolved', 0)):,} 筆"
+        )
+        if mark_stats.get("unresolved", 0):
+            sample = "、".join(unresolved_codes[:20])
+            suffix = "…" if len(unresolved_codes) > 20 else ""
+            print(
+                f"  ⚠️ 在市權證仍缺估值價格：{sample}{suffix}"
+            )
+            if WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED:
+                print(
+                    "  ⚠️ 為避免缺價事件再次被排除而高估勝率，本次 repair "
+                    "停止，不建立／覆寫勝率報表。可先補齊價格後重跑；"
+                    "不建議關閉 WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED。"
+                )
+                return
+    elif workflow_is_repair():
+        print(
+            "  ⚠️ WINRATE_MARK_TO_MARKET_REPAIR_ENABLED=0："
+            "repair 未套用長期未出清按市價估值。"
+        )
 
     if not workflow_is_repair() and _HISTORY_IDENTITY_REPAIR_DATES:
         repaired_date_keys = set(_HISTORY_IDENTITY_REPAIR_DATES)
