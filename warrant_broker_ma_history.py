@@ -8,7 +8,7 @@ FinMind 完整歷史權證分點均線勝率統計
 3. 由 FinMind Summary 優先、隨附 MOPS 含下市權證官方歷史種子備援，
    日期感知配對身分；GitHub runner 不需連線 MOPS 舊主機。
 4. 僅由 compact_daily 重建 ABCDE 事件與跨事件 FIFO。
-5. 以 TaiwanStockPriceAdj 建立事件日 MA5/MA10/MA20 條件。
+5. 以 TaiwanStockPriceAdj 建立事件日 MA5/MA10/MA20/MA60/MA120/MA240 條件。
 6. 輸出 Parquet 與獨立 Excel，不使用 MoneyDJ 或 Google Sheet。
 
 必要環境變數：
@@ -58,7 +58,7 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.5.0"
+PROGRAM_VERSION = "1.5.1"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
 IDENTITY_INDEX_SCHEMA_VERSION = "identity-v10-contract-settlement"
 MOPS_IDENTITY_SEED_VERSION = "2026-07-30-contract-settlement-v1"
@@ -256,31 +256,49 @@ COMPACT_IDENTITY_COLUMNS = [
 COMPACT_COLUMNS = COMPACT_FACT_COLUMNS + COMPACT_IDENTITY_COLUMNS
 
 MA_POSITION_NAMES = {
-    "000": "低於全部均線",
+    "000": "短線弱勢（低於MA5、MA10、MA20）",
     "001": "僅高於MA20",
     "010": "僅高於MA10",
     "011": "高於MA10與MA20",
     "100": "僅高於MA5",
     "101": "高於MA5與MA20",
     "110": "高於MA5與MA10",
-    "111": "高於全部均線",
+    "111": "高於MA5、MA10、MA20",
 }
 
 CONDITION_SPECS = [
     ("高於MA5", lambda d: d["高於MA5"] == True),
-    ("低於MA5", lambda d: d["高於MA5"] == False),
+    ("低於MA5", lambda d: d["低於MA5"] == True),
     ("高於MA10", lambda d: d["高於MA10"] == True),
-    ("低於MA10", lambda d: d["高於MA10"] == False),
+    ("低於MA10", lambda d: d["低於MA10"] == True),
     ("高於MA20", lambda d: d["高於MA20"] == True),
-    ("低於MA20", lambda d: d["高於MA20"] == False),
+    ("低於MA20", lambda d: d["低於MA20"] == True),
+    ("低於MA60", lambda d: d["低於MA60"] == True),
+    ("低於MA120", lambda d: d["低於MA120"] == True),
+    ("低於MA240", lambda d: d["低於MA240"] == True),
     ("剛站上MA5", lambda d: d["剛站上MA5"] == True),
     ("剛站上MA10", lambda d: d["剛站上MA10"] == True),
     ("剛站上MA20", lambda d: d["剛站上MA20"] == True),
     ("剛跌破MA5", lambda d: d["剛跌破MA5"] == True),
     ("剛跌破MA10", lambda d: d["剛跌破MA10"] == True),
     ("剛跌破MA20", lambda d: d["剛跌破MA20"] == True),
-    ("高於全部均線", lambda d: d["MA位置代碼"] == "111"),
-    ("低於全部均線", lambda d: d["MA位置代碼"] == "000"),
+    ("高於MA5、MA10、MA20", lambda d: d["MA位置代碼"] == "111"),
+    (
+        "短線弱勢（低於MA5、MA10、MA20）",
+        lambda d: d["低檔層級代碼"] >= 1,
+    ),
+    (
+        "中期低檔（再低於MA60）",
+        lambda d: d["低檔層級代碼"] >= 2,
+    ),
+    (
+        "長期低檔（再低於MA120）",
+        lambda d: d["低檔層級代碼"] >= 3,
+    ),
+    (
+        "全週期均線下方（低於MA5～MA240）",
+        lambda d: d["低檔層級代碼"] == 4,
+    ),
     ("均線多頭排列", lambda d: d["均線多頭排列"] == True),
     ("均線空頭排列", lambda d: d["均線空頭排列"] == True),
     ("MA20上彎", lambda d: d["MA20方向"] == "上彎"),
@@ -4079,7 +4097,7 @@ def prepare_ma_table(price_frame: pd.DataFrame) -> pd.DataFrame:
     if work.empty:
         return work
     work = work.sort_values("date").reset_index(drop=True)
-    for window in (5, 10, 20):
+    for window in (5, 10, 20, 60, 120, 240):
         work[f"ma{window}"] = work["close"].rolling(
             window=window, min_periods=window
         ).mean()
@@ -4091,12 +4109,36 @@ def prepare_ma_table(price_frame: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
+def classify_low_price_level(
+    *,
+    below5: bool,
+    below10: bool,
+    below20: bool,
+    below60: bool,
+    below120: bool,
+    below240: bool,
+) -> tuple[int, str]:
+    """回傳互斥的最深低檔層級；統計條件則用代碼門檻做巢狀樣本。"""
+    if not (below5 and below10 and below20):
+        return 0, "非低檔分級"
+    if below60 and below120 and below240:
+        return 4, "4-全週期低檔（低於MA5～MA240）"
+    if below60 and below120:
+        return 3, "3-長期低檔（低於MA5～MA120）"
+    if below60:
+        return 2, "2-中期低檔（低於MA5～MA60）"
+    return 1, "1-短線弱勢（低於MA5、MA10、MA20）"
+
+
 def missing_ma_values(reason: str) -> dict[str, Any]:
     values: dict[str, Any] = {
         "事件日收盤價": None,
         "MA5": None,
         "MA10": None,
         "MA20": None,
+        "MA60": None,
+        "MA120": None,
+        "MA240": None,
         "昨日收盤價": None,
         "昨日MA5": None,
         "昨日MA10": None,
@@ -4105,6 +4147,12 @@ def missing_ma_values(reason: str) -> dict[str, Any]:
         "高於MA5": None,
         "高於MA10": None,
         "高於MA20": None,
+        "低於MA5": None,
+        "低於MA10": None,
+        "低於MA20": None,
+        "低於MA60": None,
+        "低於MA120": None,
+        "低於MA240": None,
         "剛站上MA5": None,
         "剛站上MA10": None,
         "剛站上MA20": None,
@@ -4113,6 +4161,8 @@ def missing_ma_values(reason: str) -> dict[str, Any]:
         "剛跌破MA20": None,
         "MA位置代碼": "",
         "MA位置名稱": "",
+        "低檔層級代碼": None,
+        "低檔層級": "",
         "MA20方向": "",
         "均線多頭排列": None,
         "均線空頭排列": None,
@@ -4140,9 +4190,11 @@ def calculate_ma_values(
         event_index = calendar_index.get(event_day)
         if event_index is None:
             return missing_ma_values("事件日不在市場交易日曆中")
-        if event_index < 24:
-            return missing_ma_values("事件日前不足25個市場交易日，無法計算完整均線")
-        required_dates = calendar[event_index - 24 : event_index + 1]
+        if event_index < 239:
+            return missing_ma_values(
+                "事件日前不足240個市場交易日，無法計算MA240與完整低檔層級"
+            )
+        required_dates = calendar[event_index - 239 : event_index + 1]
         if available_dates is None:
             available_dates = set(ma_table["date"].dropna().astype(str))
         missing_dates = [
@@ -4152,7 +4204,7 @@ def calculate_ma_values(
             preview = "、".join(missing_dates[:5])
             suffix = "…" if len(missing_dates) > 5 else ""
             return missing_ma_values(
-                f"事件日前25個市場交易日股價有缺口：{preview}{suffix}"
+                f"事件日前240個市場交易日股價有缺口：{preview}{suffix}"
             )
     if ma_rows_by_date is None:
         rows = ma_table[ma_table["date"] == event_day]
@@ -4168,6 +4220,9 @@ def calculate_ma_values(
         "ma5",
         "ma10",
         "ma20",
+        "ma60",
+        "ma120",
+        "ma240",
         "prev_close",
         "prev_ma5",
         "prev_ma10",
@@ -4183,6 +4238,9 @@ def calculate_ma_values(
     ma5 = float(row["ma5"])
     ma10 = float(row["ma10"])
     ma20 = float(row["ma20"])
+    ma60 = float(row["ma60"])
+    ma120 = float(row["ma120"])
+    ma240 = float(row["ma240"])
     prev_close = float(row["prev_close"])
     prev_ma5 = float(row["prev_ma5"])
     prev_ma10 = float(row["prev_ma10"])
@@ -4191,6 +4249,20 @@ def calculate_ma_values(
     above5 = close > ma5
     above10 = close > ma10
     above20 = close > ma20
+    below5 = close < ma5
+    below10 = close < ma10
+    below20 = close < ma20
+    below60 = close < ma60
+    below120 = close < ma120
+    below240 = close < ma240
+    low_level_code, low_level_name = classify_low_price_level(
+        below5=below5,
+        below10=below10,
+        below20=below20,
+        below60=below60,
+        below120=below120,
+        below240=below240,
+    )
     position = f"{int(above5)}{int(above10)}{int(above20)}"
     base = abs(old_ma20)
     relative_difference = (
@@ -4207,6 +4279,9 @@ def calculate_ma_values(
         "MA5": ma5,
         "MA10": ma10,
         "MA20": ma20,
+        "MA60": ma60,
+        "MA120": ma120,
+        "MA240": ma240,
         "昨日收盤價": prev_close,
         "昨日MA5": prev_ma5,
         "昨日MA10": prev_ma10,
@@ -4215,6 +4290,12 @@ def calculate_ma_values(
         "高於MA5": above5,
         "高於MA10": above10,
         "高於MA20": above20,
+        "低於MA5": below5,
+        "低於MA10": below10,
+        "低於MA20": below20,
+        "低於MA60": below60,
+        "低於MA120": below120,
+        "低於MA240": below240,
         "剛站上MA5": close > ma5 and prev_close <= prev_ma5,
         "剛站上MA10": close > ma10 and prev_close <= prev_ma10,
         "剛站上MA20": close > ma20 and prev_close <= prev_ma20,
@@ -4223,6 +4304,8 @@ def calculate_ma_values(
         "剛跌破MA20": close < ma20 and prev_close >= prev_ma20,
         "MA位置代碼": position,
         "MA位置名稱": MA_POSITION_NAMES[position],
+        "低檔層級代碼": low_level_code,
+        "低檔層級": low_level_name,
         "MA20方向": direction,
         "均線多頭排列": ma5 > ma10 > ma20,
         "均線空頭排列": ma5 < ma10 < ma20,
@@ -4255,7 +4338,7 @@ def attach_ma_to_events(
     )
     for index, (stock_id, stock_events) in enumerate(sorted(by_stock.items()), start=1):
         earliest_event = min(event["事件日"] for event in stock_events)
-        start_day = find_lookback_start(earliest_event, all_trading_dates, 80)
+        start_day = find_lookback_start(earliest_event, all_trading_dates, 260)
         price_frame = ensure_stock_price(
             stock_id, start_day, latest_day, all_trading_dates
         )
@@ -4316,6 +4399,9 @@ EVENT_OUTPUT_COLUMNS = [
     "MA5",
     "MA10",
     "MA20",
+    "MA60",
+    "MA120",
+    "MA240",
     "昨日收盤價",
     "昨日MA5",
     "昨日MA10",
@@ -4324,6 +4410,12 @@ EVENT_OUTPUT_COLUMNS = [
     "高於MA5",
     "高於MA10",
     "高於MA20",
+    "低於MA5",
+    "低於MA10",
+    "低於MA20",
+    "低於MA60",
+    "低於MA120",
+    "低於MA240",
     "剛站上MA5",
     "剛站上MA10",
     "剛站上MA20",
@@ -4332,6 +4424,8 @@ EVENT_OUTPUT_COLUMNS = [
     "剛跌破MA20",
     "MA位置代碼",
     "MA位置名稱",
+    "低檔層級代碼",
+    "低檔層級",
     "MA20方向",
     "均線多頭排列",
     "均線空頭排列",
@@ -4429,6 +4523,30 @@ def events_to_frame(events: list[dict[str, Any]]) -> pd.DataFrame:
     )
     if not calculated_codes.equals(frame.loc[valid_ma, "MA位置代碼"]):
         raise AssertionError("MA位置代碼與高於MA5／10／20不一致")
+    expected_low_levels = pd.Series(
+        [
+            classify_low_price_level(
+                below5=bool(row["低於MA5"]),
+                below10=bool(row["低於MA10"]),
+                below20=bool(row["低於MA20"]),
+                below60=bool(row["低於MA60"]),
+                below120=bool(row["低於MA120"]),
+                below240=bool(row["低於MA240"]),
+            )
+            for _, row in frame.loc[valid_ma].iterrows()
+        ],
+        index=frame.index[valid_ma],
+    )
+    expected_low_codes = expected_low_levels.map(lambda value: value[0])
+    expected_low_names = expected_low_levels.map(lambda value: value[1])
+    if not expected_low_codes.equals(
+        pd.to_numeric(
+            frame.loc[valid_ma, "低檔層級代碼"], errors="coerce"
+        ).astype(int)
+    ):
+        raise AssertionError("低檔層級代碼與MA5～MA240位置不一致")
+    if not expected_low_names.equals(frame.loc[valid_ma, "低檔層級"]):
+        raise AssertionError("低檔層級名稱與代碼不一致")
     return frame
 
 
@@ -4493,6 +4611,7 @@ def summarize_event_group(
         "分點": broker,
         "均線條件": condition,
         "MA位置代碼": position_code,
+        "MA位置名稱": MA_POSITION_NAMES.get(position_code, ""),
         "事件代碼": event_code,
         "事件類型": event_type,
         "事件總數": len(group),
@@ -5070,6 +5189,9 @@ def make_test_ma_row(**overrides: Any) -> pd.DataFrame:
         "ma5": 115.0,
         "ma10": 110.0,
         "ma20": 105.0,
+        "ma60": 100.0,
+        "ma120": 95.0,
+        "ma240": 90.0,
         "prev_close": 100.0,
         "prev_ma5": 104.0,
         "prev_ma10": 103.0,
@@ -5633,6 +5755,7 @@ def run_self_tests() -> dict[str, str]:
 
     high = calculate_ma_values(make_test_ma_row(), "2026-01-30")
     assert high["MA位置代碼"] == "111"
+    assert high["低檔層級代碼"] == 0
     assert high["均線多頭排列"] is True
     assert high["剛站上MA20"] is True
 
@@ -5651,15 +5774,69 @@ def run_self_tests() -> dict[str, str]:
         "2026-01-30",
     )
     assert low["MA位置代碼"] == "000"
+    assert low["低檔層級代碼"] == 4
+    assert low["低檔層級"].startswith("4-全週期低檔")
     assert low["均線空頭排列"] is True
     assert low["剛跌破MA10"] is True
+    assert classify_low_price_level(
+        below5=True,
+        below10=True,
+        below20=True,
+        below60=False,
+        below120=False,
+        below240=False,
+    )[0] == 1
+    assert classify_low_price_level(
+        below5=True,
+        below10=True,
+        below20=True,
+        below60=True,
+        below120=False,
+        below240=False,
+    )[0] == 2
+    assert classify_low_price_level(
+        below5=True,
+        below10=True,
+        below20=True,
+        below60=True,
+        below120=True,
+        below240=False,
+    )[0] == 3
+    assert classify_low_price_level(
+        below5=True,
+        below10=True,
+        below20=True,
+        below60=True,
+        below120=True,
+        below240=True,
+    )[0] == 4
+    low_level_test_frame = pd.DataFrame(
+        {"低檔層級代碼": [0, 1, 2, 3, 4]}
+    )
+    condition_map = dict(CONDITION_SPECS)
+    assert int(
+        condition_map["短線弱勢（低於MA5、MA10、MA20）"](
+            low_level_test_frame
+        ).sum()
+    ) == 4
+    assert int(
+        condition_map["中期低檔（再低於MA60）"](low_level_test_frame).sum()
+    ) == 3
+    assert int(
+        condition_map["長期低檔（再低於MA120）"](low_level_test_frame).sum()
+    ) == 2
+    assert int(
+        condition_map["全週期均線下方（低於MA5～MA240）"](
+            low_level_test_frame
+        ).sum()
+    ) == 1
 
     missing = calculate_ma_values(pd.DataFrame(), "2026-01-30")
     assert missing["均線資料狀態"] == "Missing"
 
     short_dates = [
         value.strftime("%Y-%m-%d")
-        for value in pd.bdate_range("2026-01-01", periods=19)
+        for value in pd.bdate_range("2025-01-01", periods=239)
     ]
     short_prices = pd.DataFrame(
         {
@@ -5675,11 +5852,11 @@ def run_self_tests() -> dict[str, str]:
         expected_trading_dates=short_dates,
     )
     assert short_result["均線資料狀態"] == "Missing"
-    assert "不足25個市場交易日" in short_result["均線錯誤原因"]
+    assert "不足240個市場交易日" in short_result["均線錯誤原因"]
 
     gap_dates = [
         value.strftime("%Y-%m-%d")
-        for value in pd.bdate_range("2026-01-01", periods=30)
+        for value in pd.bdate_range("2025-01-01", periods=250)
     ]
     missing_price_day = gap_dates[-10]
     gap_prices = pd.DataFrame(
@@ -6011,10 +6188,13 @@ def run_self_tests() -> dict[str, str]:
         "標的前綴字典與名稱memo": "PASS",
         "FinMind日檔精簡與_date欄位": "PASS",
         "均線位置與排列": "PASS",
+        "MA60／MA120／MA240": "PASS",
+        "四級低檔互斥分類": "PASS",
+        "四級低檔巢狀統計條件": "PASS",
         "剛站上MA20": "PASS",
         "剛跌破MA10": "PASS",
         "不足歷史Missing": "PASS",
-        "真實19交易日均線Missing": "PASS",
+        "真實239交易日均線Missing": "PASS",
         "股價缺口均線Missing": "PASS",
         "壞數值列隔離": "PASS",
         "compact事實與階段二身分重算": "PASS",
