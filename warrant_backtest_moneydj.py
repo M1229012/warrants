@@ -23,7 +23,8 @@ E：單日累積買進金額 >= 1000萬
 8. 快取_TOP15部位明細
 
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
-完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會重新產生完整報表，並將 FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表以本次重算結果完整覆蓋、重新套用格式並回讀驗證；不在程式報表清單內的人工工作表仍保留不動。
+Google Sheet 預設採歷史保護模式：既有資料不清空、不裁切、不刪列、不縮小工作表；每日新資料只新增，已存在的唯一鍵不重複寫入。
+完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會重算完整報表，但既有 Google Sheet 仍採增量補齊；TOP15 會回補最近一個月（預設 22 個交易日）的每日快照，不覆蓋或刪除過去日期。
 
 資料來源：daily 沿用完整歷史快取並只抓 MoneyDJ 目標交易日；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
 執行：python warrant_backtest.py
@@ -67,7 +68,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-SUCCESS-200D-REPAIR-STRICT-FULL-GSHEET-REFRESH-20260725-R6"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-APPEND-ONLY-TOP15-1M-BACKFILL-20260730-R7"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -377,6 +378,11 @@ TOP15_LP_QUOTE_URLS = [
     "https://warrants.sfi.org.tw/Query.aspx",
 ]
 TOP15_TARGET_DATE = os.getenv("TOP15_TARGET_DATE", "").strip()
+# repair 模式回補 TOP15 最近一個月的每日快照；22 個交易日約等於一個月。
+TOP15_REPAIR_BACKFILL_TRADING_DAYS = max(
+    int(os.getenv("TOP15_REPAIR_BACKFILL_TRADING_DAYS", "22")),
+    1,
+)
 
 
 # TOP15 個股型態標籤：只新增至 TOP15 快取資料，不改動排名、權證估值、損益與 ABCDE 邏輯。
@@ -2557,13 +2563,16 @@ GSHEET_MAIN_ALLOW_CREATE = os.getenv(
 ).strip().lower() in ("1", "true", "yes")
 GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 
-# Google Sheet 結果表自動封存 / 保留設定：
-# 1. 每日賣出明細預設只在主試算表保留最近 60 個實際交易日，可改成 30 / 60 / 90 或其他正整數。
-# 2. TOP15 兩張快取表預設各資料範圍保留最近 5 個統計日期。
-# 3. 超出保留範圍的舊資料會先寫入獨立的年度封存試算表，封存成功後才從主表移除。
-# 4. 封存試算表依年份自動建立；單一年度封存檔接近儲存格上限時，會自動切換到 _02、_03...。
-# 5. 同步前會把所有工作表縮到實際有內容的列數 / 欄數；後續每張寫入表也會直接 resize 成實際大小。
-GSHEET_RESULT_ARCHIVE_ENABLED = os.getenv("GSHEET_RESULT_ARCHIVE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+# Google Sheet 歷史保護設定：
+# 1. 預設開啟後，任何既有資料都不 clear、不 delete_rows、不因保留天數裁切。
+# 2. repair 也只補上缺少的唯一鍵；版面型工作表已存在時保持原狀。
+# 3. 若未來真的需要舊版覆蓋／裁切行為，必須明確設定 GSHEET_PRESERVE_ALL_HISTORY=0。
+GSHEET_PRESERVE_ALL_HISTORY = os.getenv(
+    "GSHEET_PRESERVE_ALL_HISTORY", "1"
+).strip().lower() not in ("0", "false", "no")
+
+# 保留舊版封存參數供相容使用；歷史保護模式下不會執行主表裁切。
+GSHEET_RESULT_ARCHIVE_ENABLED = os.getenv("GSHEET_RESULT_ARCHIVE_ENABLED", "0").strip().lower() not in ("0", "false", "no")
 GSHEET_ARCHIVE_NAME_PREFIX = os.getenv(
     "GSHEET_ARCHIVE_NAME_PREFIX",
     f"{GOOGLE_SHEET_NAME}_歷史封存",
@@ -2591,7 +2600,7 @@ GSHEET_ARCHIVE_MAX_CELLS = max(int(os.getenv("GSHEET_ARCHIVE_MAX_CELLS", "850000
 GSHEET_ARCHIVE_YEARLY_SPLIT = os.getenv("GSHEET_ARCHIVE_YEARLY_SPLIT", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_TOP15_KEEP_STAT_DATES = max(int(os.getenv("GSHEET_TOP15_KEEP_STAT_DATES", "5")), 1)
 GSHEET_DAILY_SELL_KEEP_TRADING_DAYS = max(int(os.getenv("GSHEET_DAILY_SELL_KEEP_TRADING_DAYS", "30")), 1)
-GSHEET_COMPACT_BLANK_GRID_ENABLED = os.getenv("GSHEET_COMPACT_BLANK_GRID_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+GSHEET_COMPACT_BLANK_GRID_ENABLED = os.getenv("GSHEET_COMPACT_BLANK_GRID_ENABLED", "0").strip().lower() not in ("0", "false", "no")
 GSHEET_COMPACT_MIN_ROWS = max(int(os.getenv("GSHEET_COMPACT_MIN_ROWS", "1")), 1)
 GSHEET_COMPACT_MIN_COLS = max(int(os.getenv("GSHEET_COMPACT_MIN_COLS", "1")), 1)
 
@@ -3372,7 +3381,7 @@ def compact_spreadsheet_blank_grid(spreadsheet=None, label="主試算表"):
     Google Sheets 的 1,000 萬格上限會把空白預留列與欄也算進去，因此不能只 clear，
     必須真的 resize 才能釋放格數。
     """
-    if not GSHEET_COMPACT_BLANK_GRID_ENABLED:
+    if GSHEET_PRESERVE_ALL_HISTORY or not GSHEET_COMPACT_BLANK_GRID_ENABLED:
         return False
 
     spreadsheet = spreadsheet or get_gsheet_spreadsheet()
@@ -4483,6 +4492,13 @@ def write_values_to_worksheet(
     if ws is None:
         return None if return_normalized_values else False
 
+    if GSHEET_PRESERVE_ALL_HISTORY and clear_existing_values:
+        print(
+            f"  🛡️ Google Sheet 歷史保護：拒絕清空既有工作表："
+            f"{getattr(ws, 'title', '-')}"
+        )
+        return None if return_normalized_values else False
+
     normalized_values, row_count, col_count = prepare_gsheet_write_values(values)
 
     try:
@@ -4582,6 +4598,13 @@ def read_cache_from_gsheet(path):
 
 def write_cache_to_gsheet(df, path):
     if not GSHEET_CACHE_ENABLED or not gsheet_enabled():
+        return
+
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        print(
+            f"  🛡️ Google Sheet 歷史保護：略過快取工作表整表重寫："
+            f"{cache_sheet_name_from_path(path)}"
+        )
         return
 
     if df is None:
@@ -5113,6 +5136,8 @@ def should_overwrite_result_sheet_in_repair(title):
     """只有 RUN_MODE=2 的 repair 模式，才完整覆蓋完整修補報表清單。"""
     title = safe_worksheet_title(title)
     return (
+        not GSHEET_PRESERVE_ALL_HISTORY
+        and
         WORKFLOW_MODE == "repair"
         and RUN_MODE == 2
         and title in GSHEET_REPAIR_OVERWRITE_TITLES
@@ -5928,6 +5953,10 @@ def sort_abcde_result_values(title, values):
 def _result_retention_policy(title):
     """回傳需要裁切的日期欄與保留的不同日期數。"""
     title = safe_worksheet_title(title)
+
+    # 歷史保護模式下所有日期永久留在主表，不進行裁切或移除。
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        return None
 
     if title == "每日賣出明細":
         return {
@@ -8095,6 +8124,9 @@ def _apply_top15_cache_retention(title, headers, records):
     TOP15 是可由 MoneyDJ 歷史資料重建的圖片快取，因此即使年度封存因 Drive
     配額或設定問題失敗，仍會依設定裁切主表，避免舊 run_id 無限累積。
     """
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        return list(records), 0
+
     retained, expired = _split_records_by_recent_dates(
         records,
         date_col="統計日期",
@@ -8294,6 +8326,9 @@ def remove_existing_duplicate_increment_rows(ws, title, existing_values):
     - 相同穩定唯一鍵只保留最上面一列，較下面的舊重複列由下往上刪除。
     - 只刪除能形成完整安全唯一鍵的重複列；空白列或人工無法識別資料不動。
     """
+    # 使用者要求 Google Sheet 不刪任何既有列；即使發現舊重複列也只保留原狀。
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        return existing_values, 0
     if not is_incremental_dedupe_sheet(title):
         return existing_values, 0
     if not existing_values or _find_simple_header_row(existing_values) != 0:
@@ -8373,18 +8408,19 @@ def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=No
 
     incoming_headers, incoming_records = prepared
     existing_values = _worksheet_values_with_formulas(ws)
-    existing_values, _legacy_shift_repaired = repair_legacy_abcde_scope_shift(
-        ws,
-        title,
-        existing_values,
-    )
-    existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
-        ws, title, existing_values
-    )
-    # 先用穩定唯一鍵清掉過去同日重跑累積的重複列，再判斷本次是否有缺少資料。
-    existing_values, _existing_duplicate_removed = remove_existing_duplicate_increment_rows(
-        ws, title, existing_values
-    )
+    if not GSHEET_PRESERVE_ALL_HISTORY:
+        existing_values, _legacy_shift_repaired = repair_legacy_abcde_scope_shift(
+            ws,
+            title,
+            existing_values,
+        )
+        existing_values, _identity_repaired_rows = repair_existing_worksheet_security_identities(
+            ws, title, existing_values
+        )
+        # 舊版模式才會清除同日重跑累積的重複列。
+        existing_values, _existing_duplicate_removed = remove_existing_duplicate_increment_rows(
+            ws, title, existing_values
+        )
     existing_header_idx = _find_simple_header_row(existing_values)
     if existing_header_idx != 0:
         print(f"  ⚠️ {safe_worksheet_title(title)} 無法確認第一列表頭，為避免破壞既有工作表，本次不插入。")
@@ -8480,11 +8516,11 @@ def upload_excel_to_google_sheet(
 ):
     """
     Google Sheet 同步規則：
-    1. repair + RUN_MODE=2：FULL_REPAIR_RESULT_SHEET_TITLES 內所有工作表完整覆蓋。
-    2. 完整修補會逐張處理；單張失敗不會阻止其他工作表，最後再統一重試失敗項目。
-    3. 任何必要工作表最終失敗都會讓程式以錯誤結束，禁止印出假成功。
-    4. daily 的 A～E／每日賣出只替換目標交易日；TOP15 維持同日快照替換。
-    5. daily 單張失敗也會自動重試一次；仍失敗時明確中止，避免誤報完成。
+    1. GSHEET_PRESERVE_ALL_HISTORY=1（預設）：既有表只新增缺少的唯一鍵，絕不清空、刪列或縮小。
+    2. repair + RUN_MODE=2：資料型工作表增量補齊；既有版面型工作表保持原狀。
+    3. 只有明確設定 GSHEET_PRESERVE_ALL_HISTORY=0 才允許舊版完整覆蓋流程。
+    4. 單張失敗不會阻止其他工作表，最後再統一重試失敗項目。
+    5. 任何必要工作表最終失敗都會讓程式以錯誤結束，禁止印出假成功。
     """
     strict_repair = WORKFLOW_MODE == "repair" and RUN_MODE == 2
     if strict_repair:
@@ -8540,8 +8576,11 @@ def upload_excel_to_google_sheet(
             f"  ✅ repair 全工作表覆蓋前置檢查完成：{len(repair_expected_overwrites)} 張｜"
             + "、".join(sorted(repair_expected_overwrites))
         )
-        # 完整覆蓋本身已會移除失效分點與舊資料；先跑舊資料清理只會增加配額與中斷風險。
-        print("  ✅ repair 完整覆蓋模式：略過同步前舊資料清理，直接以本次結果重建。")
+        if GSHEET_PRESERVE_ALL_HISTORY:
+            print("  🛡️ repair 歷史保護模式：既有資料不清空、不刪列，只補上缺少資料。")
+        else:
+            # 舊版完整覆蓋本身已會移除失效分點與舊資料。
+            print("  ✅ repair 完整覆蓋模式：略過同步前舊資料清理，直接以本次結果重建。")
     else:
         cleanup_deleted_broker_rows_in_existing_worksheets()
 
@@ -8556,7 +8595,12 @@ def upload_excel_to_google_sheet(
         f"  🧾 程式版本：{PROGRAM_BUILD_ID}｜WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}"
     )
 
-    if strict_repair:
+    if strict_repair and GSHEET_PRESERVE_ALL_HISTORY:
+        print(
+            f"  ⚙️ 同步模式：完整修補增量補齊｜共 {len(repair_expected_overwrites)} 張；"
+            "資料表只新增缺少列，既有版面型工作表保持原狀。"
+        )
+    elif strict_repair:
         print(
             f"  ⚙️ 同步模式：完整修補全工作表覆蓋｜共 {len(repair_expected_overwrites)} 張；"
             "單張失敗不中止其他工作表，結束後統一重試並嚴格驗收。"
@@ -8595,6 +8639,29 @@ def upload_excel_to_google_sheet(
         gws, created = _existing_result_sheet(primary_sh, title)
         if gws is None:
             raise RuntimeError(f"無法取得或建立 Google Sheet 工作表：{title}")
+
+        # 最高優先級安全門：既有 Google Sheet 一律不 clear、不 delete_rows、不 resize 縮小。
+        # 簡單資料表僅插入尚未存在的唯一鍵；版面型工作表保持原狀。
+        if GSHEET_PRESERVE_ALL_HISTORY and not created:
+            if should_upsert_result_sheet(title):
+                inserted = insert_missing_result_rows_to_worksheet(
+                    gws,
+                    title,
+                    raw_values,
+                    data_scope=current_scope,
+                    extra_scope_values=selected_values,
+                )
+                if inserted > 0:
+                    current_values = _worksheet_values_with_formulas(gws)
+                    apply_text_format_to_gsheet(gws, current_values)
+                    apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=current_values)
+                    apply_date_format_to_gsheet(ws_xlsx, gws, values=current_values)
+                    apply_header_widths_to_gsheet(gws, values=current_values)
+            else:
+                print(
+                    f"  🛡️ Google Sheet 歷史保護：既有版面型工作表不覆蓋：{title}"
+                )
+            return
 
         if should_overwrite_result_sheet_in_repair(title):
             overwrite_repair_result_sheet_from_excel(
@@ -8769,10 +8836,16 @@ def upload_excel_to_google_sheet(
             raise RuntimeError(
                 "repair 未能完整更新所有必要工作表：" + "｜".join(detail_parts)
             )
-        print(
-            f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(completed & repair_expected_overwrites)} 張｜"
-            + "、".join(sorted(completed & repair_expected_overwrites))
-        )
+        if GSHEET_PRESERVE_ALL_HISTORY:
+            print(
+                f"  ✅ repair 歷史資料已完成增量補齊：{len(completed & repair_expected_overwrites)} 張｜"
+                + "、".join(sorted(completed & repair_expected_overwrites))
+            )
+        else:
+            print(
+                f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(completed & repair_expected_overwrites)} 張｜"
+                + "、".join(sorted(completed & repair_expected_overwrites))
+            )
 
     if WORKFLOW_MODE == "daily" and failures:
         raise RuntimeError(
@@ -11575,6 +11648,9 @@ def cleanup_deleted_broker_rows_in_existing_worksheets():
     4. 無法辨識表頭、人工說明列、彙總列與沒有分點欄位的工作表完全不動。
     5. 刪資料列時由後往前刪除，避免列號位移造成誤刪。
     """
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        print("  🛡️ Google Sheet 歷史保護：略過失效分點舊列清理。")
+        return
     if not GSHEET_CLEAN_DELETED_BROKER_ROWS or not gsheet_enabled():
         return
 
@@ -16620,6 +16696,88 @@ def build_top15_position_detail_and_consensus_rows(
         f"共識淨買超 {len(consensus_rows):,} 檔標的"
     )
     return detail_rows, consensus_rows
+
+
+def top15_stat_dates_for_current_run(item_map, price_cache, target_date):
+    """
+    決定本次需要產生的 TOP15 統計日期。
+
+    daily 只產生目標交易日；repair 由實際價格／分點歷史交易日中取最近
+    TOP15_REPAIR_BACKFILL_TRADING_DAYS 日，讓近一個月每一天都能補進 Google Sheet。
+    """
+    target_key = normalize_date_str(target_date)
+    if not workflow_is_repair():
+        return [target_key] if target_key else []
+
+    observed_dates = _top15_observed_market_dates(
+        item_map=item_map,
+        price_cache=price_cache,
+        target_date=target_key,
+    )
+    if target_key and parse_date(target_key):
+        observed_dates = sorted(set(observed_dates) | {target_key})
+
+    return observed_dates[-TOP15_REPAIR_BACKFILL_TRADING_DAYS:]
+
+
+def build_top15_history_rows_for_current_run(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events=None,
+    item_map=None,
+    price_cache=None,
+    target_date=None,
+    data_scope=None,
+    allow_price_fetch=True,
+    persistent_price_cache=None,
+    defer_price_save=False,
+    price_changed_codes=None,
+):
+    """daily 建一日；repair 建最近一個月的 TOP15 每日歷史快照。"""
+    stat_dates = top15_stat_dates_for_current_run(
+        item_map or {},
+        price_cache or {},
+        target_date,
+    )
+    if not stat_dates:
+        return [], []
+
+    if workflow_is_repair():
+        print(
+            f"  🗓️ TOP15 修補範圍：{stat_dates[0]} ～ {stat_dates[-1]}｜"
+            f"{len(stat_dates)} 個交易日（每日快照全部保留）"
+        )
+
+    all_detail_rows = []
+    all_consensus_rows = []
+    for index, stat_date in enumerate(stat_dates, start=1):
+        if workflow_is_repair():
+            print(f"  🔄 TOP15 歷史快照 {index}/{len(stat_dates)}：{stat_date}")
+        detail_rows, consensus_rows = build_top15_position_detail_and_consensus_rows(
+            a_events,
+            b_events,
+            c_events,
+            d_events,
+            e_events,
+            item_map,
+            price_cache,
+            target_date=stat_date,
+            data_scope=data_scope,
+            allow_price_fetch=allow_price_fetch,
+            persistent_price_cache=persistent_price_cache,
+            defer_price_save=defer_price_save,
+            price_changed_codes=price_changed_codes,
+        )
+        all_detail_rows.extend(detail_rows)
+        all_consensus_rows.extend(consensus_rows)
+
+    print(
+        f"  ✅ TOP15 本次合計：{len(stat_dates)} 個統計日｜"
+        f"部位明細 {len(all_detail_rows):,} 筆｜共識淨買超 {len(all_consensus_rows):,} 筆"
+    )
+    return all_detail_rows, all_consensus_rows
 
 
 def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
@@ -22204,6 +22362,9 @@ def _longterm_find_winrate_header_info(values):
 
 def _longterm_clear_old_bottom_winrate_block(ws, values):
     """清掉舊版曾寫在勝率統計底部的長期留單修正勝率區塊。"""
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        return False
+
     marker = "長期留單修正勝率"
     marker_row = None
     for idx, row in enumerate(values or [], start=1):
@@ -22231,6 +22392,9 @@ def upload_longterm_adjusted_winrate_to_gsheet(adjusted_rows, target_date):
     不新增長期留單明細 / 分點彙總工作表，完整明細只保留在 Excel artifact。
     若勝率旁邊尚未有修正勝率欄，第一次 longterm 會插入一欄；之後重跑只更新該欄。
     """
+    if GSHEET_PRESERVE_ALL_HISTORY:
+        print("  🛡️ Google Sheet 歷史保護：略過 longterm 對既有勝率統計的覆寫。")
+        return False
     if not LONGTERM_UPDATE_WINRATE_SHEET:
         print("  ✅ LONGTERM_UPDATE_WINRATE_SHEET=0，略過更新 Google Sheet 勝率統計。")
         return False
@@ -24229,7 +24393,7 @@ def main():
             "未發出歷史價格請求"
         )
 
-    top15_detail_rows, top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
+    top15_detail_rows, top15_consensus_rows = build_top15_history_rows_for_current_run(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache,
         target_date=target_date,
@@ -24247,7 +24411,7 @@ def main():
         selected_items = filter_items_for_selected_scope(items)
         selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
         selected_events = (sa, sb, sc, sd, se)
-        selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_position_detail_and_consensus_rows(
+        selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_history_rows_for_current_run(
             sa, sb, sc, sd, se, selected_item_map, price_cache,
             target_date=target_date,
             data_scope="精選五分點", allow_price_fetch=False,
