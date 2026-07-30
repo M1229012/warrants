@@ -58,10 +58,10 @@ except ImportError:  # 允許 --self-test 在未安裝網路套件的環境執�
     HTTPAdapter = None
 
 
-PROGRAM_VERSION = "1.5.1"
+PROGRAM_VERSION = "1.5.2"
 SCHEMA_VERSION = "ma-history-v2-fact-compact"
 IDENTITY_INDEX_SCHEMA_VERSION = "identity-v10-contract-settlement"
-MOPS_IDENTITY_SEED_VERSION = "2026-07-30-contract-settlement-v1"
+MOPS_IDENTITY_SEED_VERSION = "2026-07-30-contract-settlement-v2-full-otc"
 WARRANT_DATASET = "TaiwanStockWarrantTradingDailyReport"
 PRICE_DATASET = "TaiwanStockPriceAdj"
 WARRANT_PRICE_DATASET = "TaiwanStockPrice"
@@ -1840,12 +1840,29 @@ class WarrantContract:
     settlement_price: Optional[float]
     settlement_record_found: bool
     market: str
+    source: str = ""
 
 
 class WarrantContractIndex:
     def __init__(self, records: Iterable[WarrantContract]):
         self.by_code: dict[str, list[WarrantContract]] = defaultdict(list)
+        deduplicated: dict[
+            tuple[str, str, str, str], WarrantContract
+        ] = {}
         for record in records:
+            key = (
+                record.code,
+                record.list_date,
+                record.end_date,
+                record.target_code,
+            )
+            previous = deduplicated.get(key)
+            if previous is None or (
+                record.source == "MOPS官方種子"
+                and previous.source != "MOPS官方種子"
+            ):
+                deduplicated[key] = record
+        for record in deduplicated.values():
             self.by_code[record.code].append(record)
         for code in self.by_code:
             self.by_code[code].sort(key=lambda rec: (rec.list_date, rec.end_date))
@@ -1857,7 +1874,17 @@ class WarrantContractIndex:
             for record in self.by_code.get(code, [])
             if record.list_date <= buy_day <= record.end_date
         ]
-        return max(matches, key=lambda rec: rec.list_date) if matches else None
+        return (
+            max(
+                matches,
+                key=lambda rec: (
+                    rec.list_date,
+                    rec.source == "MOPS官方種子",
+                ),
+            )
+            if matches
+            else None
+        )
 
 
 def optional_float(value: Any) -> Optional[float]:
@@ -1870,8 +1897,16 @@ def optional_float(value: Any) -> Optional[float]:
     return numeric if math.isfinite(numeric) else None
 
 
+def fast_iso_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    return iso_date(value)
+
+
 def build_warrant_contract_index(
     seed: Optional[pd.DataFrame] = None,
+    summary_frames: Optional[list[pd.DataFrame]] = None,
 ) -> WarrantContractIndex:
     work = seed if seed is not None else load_bundled_mops_identity_seed()
     records = [
@@ -1879,9 +1914,9 @@ def build_warrant_contract_index(
             code=normalize_code(row.code),
             warrant_type=str(row.warrant_type or "").strip(),
             target_code=normalize_code(row.target_code),
-            list_date=iso_date(row.list_date),
-            end_date=iso_date(row.end_date),
-            fulfillment_end_date=iso_date(row.fulfillment_end_date),
+            list_date=fast_iso_date(row.list_date),
+            end_date=fast_iso_date(row.end_date),
+            fulfillment_end_date=fast_iso_date(row.fulfillment_end_date),
             settlement_method=str(row.settlement_method or "").strip(),
             exercise_ratio=optional_float(row.exercise_ratio),
             fulfillment_price=optional_float(row.fulfillment_price),
@@ -1892,9 +1927,107 @@ def build_warrant_contract_index(
                 in {"1", "true", "yes"}
             ),
             market=str(row.market or "").strip(),
+            source="MOPS官方種子",
         )
         for row in work[MOPS_SEED_COLUMNS].itertuples(index=False)
     ]
+    if summary_frames is None:
+        summary_frames = []
+        for path in sorted(
+            METADATA_DIR.glob(f"{WARRANT_SUMMARY_CACHE_PREFIX}_*.parquet")
+        ):
+            try:
+                frame = read_parquet(path)
+                if not frame.empty:
+                    summary_frames.append(frame)
+            except Exception as exc:
+                print(
+                    f"  ⚠️ 略過損壞的權證契約 Summary 快取 {path.name}："
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+    summary_required = {
+        "stock_id",
+        "type",
+        "target_stock_id",
+        "date",
+        "end_date",
+        "fulfillment_end_date",
+        "exercise_ratio",
+        "fulfillment_price",
+    }
+    summary_added = 0
+    for frame in summary_frames:
+        if frame.empty or not summary_required.issubset(frame.columns):
+            continue
+        method_column = (
+            "fulfillment_method"
+            if "fulfillment_method" in frame.columns
+            else None
+        )
+        columns = [
+            "stock_id",
+            "type",
+            "target_stock_id",
+            "date",
+            "end_date",
+            "fulfillment_end_date",
+            "exercise_ratio",
+            "fulfillment_price",
+        ]
+        if method_column:
+            columns.append(method_column)
+        for row in frame[columns].itertuples(index=False, name=None):
+            (
+                raw_code,
+                raw_type,
+                raw_target,
+                raw_listed,
+                raw_ended,
+                raw_fulfillment_end,
+                raw_ratio,
+                raw_price,
+                *raw_method,
+            ) = row
+            code = normalize_code(raw_code)
+            listed = fast_iso_date(raw_listed)
+            ended = fast_iso_date(raw_ended)
+            fulfillment_end = fast_iso_date(raw_fulfillment_end)
+            ratio = optional_float(raw_ratio)
+            price = optional_float(raw_price)
+            if (
+                not code
+                or not listed
+                or not ended
+                or not fulfillment_end
+            ):
+                continue
+            records.append(
+                WarrantContract(
+                    code=code,
+                    warrant_type=str(raw_type or "").strip(),
+                    target_code=normalize_code(raw_target),
+                    list_date=listed,
+                    end_date=ended,
+                    fulfillment_end_date=fulfillment_end,
+                    settlement_method=(
+                        str(raw_method[0] or "").strip() if raw_method else ""
+                    ),
+                    exercise_ratio=ratio,
+                    fulfillment_price=price,
+                    settlement_price=None,
+                    settlement_record_found=False,
+                    market="",
+                    source="FinMind日期化Summary",
+                )
+            )
+            summary_added += 1
+    if summary_added:
+        print(
+            f"  📚 契約索引合併 FinMind 日期化 Summary："
+            f"{summary_added:,} 筆｜MOPS 仍優先",
+            flush=True,
+        )
     return WarrantContractIndex(records)
 
 
@@ -3853,6 +3986,12 @@ def evaluate_open_positions_after_two_months(
                 continue
             expired = valuation_day >= contract.fulfillment_end_date
             if expired:
+                if contract.source != "MOPS官方種子":
+                    event_failures.append(
+                        f"{code}@{buy_day} 已到期，但只有 FinMind 契約、"
+                        "缺少 MOPS 官方結算查核結果"
+                    )
+                    continue
                 per_unit = warrant_cash_settlement_per_unit(contract)
                 value_source = (
                     "MOPS官方到期結算"
@@ -6022,7 +6161,31 @@ def run_self_tests() -> dict[str, str]:
         None,
         False,
         "1",
+        "MOPS官方種子",
     )
+    summary_contract_frame = pd.DataFrame(
+        [
+            {
+                "stock_id": "736436",
+                "type": "認購",
+                "target_stock_id": "4768",
+                "date": "2025-07-01",
+                "end_date": "2026-08-20",
+                "fulfillment_end_date": "2026-08-24",
+                "exercise_ratio": 0.1,
+                "fulfillment_price": 55.0,
+                "fulfillment_method": "現金結算",
+            }
+        ]
+    )
+    summary_contract_index = build_warrant_contract_index(
+        seed=pd.DataFrame(columns=MOPS_SEED_COLUMNS),
+        summary_frames=[summary_contract_frame],
+    )
+    summary_contract = summary_contract_index.resolve("736436", "2025-08-18")
+    assert summary_contract is not None
+    assert summary_contract.target_code == "4768"
+    assert summary_contract.source == "FinMind日期化Summary"
     aged_result = evaluate_open_positions_after_two_months(
         [open_result],
         WarrantContractIndex([active_contract]),
@@ -6046,6 +6209,7 @@ def run_self_tests() -> dict[str, str]:
         120.0,
         True,
         "1",
+        "MOPS官方種子",
     )
     expired_result = evaluate_open_positions_after_two_months(
         [open_result],
@@ -6074,6 +6238,7 @@ def run_self_tests() -> dict[str, str]:
         None,
         False,
         "1",
+        "MOPS官方種子",
     )
     no_payment_result = evaluate_open_positions_after_two_months(
         [open_result],
@@ -6207,6 +6372,7 @@ def run_self_tests() -> dict[str, str]:
         "FIFO未出清": "PASS",
         "兩個曆月前不提前認列": "PASS",
         "滿兩月未結部位市價認列": "PASS",
+        "MOPS缺輪時FinMind日期化契約補足": "PASS",
         "到期官方結算金額認列": "PASS",
         "到期無自動給付按零元認列": "PASS",
         "滿兩月無法評價時禁止產表": "PASS",
