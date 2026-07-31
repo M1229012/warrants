@@ -972,8 +972,14 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
     回傳格式：
         [(分點, 淨買超成本, 報酬率, 估值符號), ...]
 
-    同一標的列中的同一分點，不論拆成多少權證、事件或部位，
-    都會合併成一筆：金額加總、報酬率依可估成本（無則用剩餘成本）加權。
+    合併規則：
+    - 優先以「券商代號」判定是否為同一分點。
+    - 若沒有券商代號，才以標準化後的「分點」名稱判定。
+    - 同一標的列中的同一分點，不論分點名稱寫法、權證、事件或部位
+      被拆成幾筆，都只會合併成一筆。
+    - 淨買超成本直接加總。
+    - 合併報酬率優先使用「總未實現損益 ÷ 總可估成本」計算；
+      若來源沒有可估成本或未實現損益，才退回以各筆成本加權報酬率。
 
     估值符號「*」代表當日成交價覆蓋成本低於設定門檻；
     無成交部位已優先使用權證資訊揭露平台 LP 委買價估值。
@@ -993,7 +999,11 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
         return []
 
     broker_agg = defaultdict(lambda: {
+        "broker": "",
         "amount": 0.0,
+        "estimated_cost": 0.0,
+        "pnl": 0.0,
+        "has_pnl": False,
         "weighted_return_sum": 0.0,
         "weighted_return_cost": 0.0,
         "marker": "",
@@ -1003,9 +1013,22 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
         if not isinstance(rec, dict):
             continue
 
-        broker = str(rec.get("分點", "") or rec.get("券商", "") or rec.get("broker", "")).strip()
+        broker = str(
+            rec.get("分點", "")
+            or rec.get("券商", "")
+            or rec.get("broker", "")
+        ).strip()
         if broker not in TRACKED_BROKERS:
             continue
+
+        broker_code = str(
+            rec.get("券商代號", "")
+            or rec.get("分點代號", "")
+            or rec.get("broker_code", "")
+        ).strip()
+
+        # 同一券商代號即視為同一分點；沒有代號時才以分點名稱合併。
+        broker_key = f"code:{broker_code.upper()}" if broker_code else f"name:{broker}"
 
         amount = safe_float(
             rec.get("淨買超成本", rec.get("剩餘成本", rec.get("remaining_cost", 0))),
@@ -1018,17 +1041,17 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
             rec.get("可估成本", rec.get("estimated_cost", 0)),
             0,
         )
-        pnl = safe_float(
-            rec.get("未實現損益", rec.get("unrealized_pnl", 0)),
-            0,
-        )
+
+        pnl_raw = rec.get("未實現損益", rec.get("unrealized_pnl", None))
+        pnl = safe_float(pnl_raw, 0)
+        has_pnl = strip_gsheet_text_prefix(pnl_raw) not in ("", "-")
 
         return_pct = normalize_top15_cache_return_pct(
             rec.get("報酬率", rec.get("報酬率文字", rec.get("return_pct", "")))
         )
 
         # 若 JSON 沒有直接給報酬率，就用未實現損益 / 可估成本回推。
-        if return_pct is None and estimated_cost > 0:
+        if return_pct is None and has_pnl and estimated_cost > 0:
             return_pct = round(pnl / estimated_cost * 100, 2)
 
         coverage_pct = safe_float(rec.get("成交價覆蓋率"), None)
@@ -1046,8 +1069,15 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
         ):
             marker = TOP15_LOW_TRADED_COVERAGE_SYMBOL
 
-        agg = broker_agg[broker]
+        agg = broker_agg[broker_key]
+        if not agg["broker"]:
+            # 圖卡一律沿用標準化後的「分點」欄位顯示名稱。
+            agg["broker"] = broker
+
         agg["amount"] += amount
+        agg["estimated_cost"] += estimated_cost
+        agg["pnl"] += pnl
+        agg["has_pnl"] = agg["has_pnl"] or has_pnl
 
         weight = estimated_cost if estimated_cost > 0 else amount
         if return_pct is not None and weight > 0:
@@ -1058,18 +1088,28 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
             agg["marker"] = TOP15_LOW_TRADED_COVERAGE_SYMBOL
 
     out = []
-    for broker, agg in broker_agg.items():
+    for agg in broker_agg.values():
+        broker = str(agg.get("broker", "")).strip()
         amount = safe_float(agg.get("amount"), 0)
-        if amount <= 0:
+        if not broker or amount <= 0:
             continue
 
         return_pct = None
-        weighted_return_cost = safe_float(agg.get("weighted_return_cost"), 0)
-        if weighted_return_cost > 0:
+        estimated_cost = safe_float(agg.get("estimated_cost"), 0)
+
+        # 使用合併後的總損益與總可估成本，避免先四捨五入各筆報酬率造成誤差。
+        if agg.get("has_pnl") and estimated_cost > 0:
             return_pct = round(
-                safe_float(agg.get("weighted_return_sum"), 0) / weighted_return_cost,
+                safe_float(agg.get("pnl"), 0) / estimated_cost * 100,
                 2,
             )
+        else:
+            weighted_return_cost = safe_float(agg.get("weighted_return_cost"), 0)
+            if weighted_return_cost > 0:
+                return_pct = round(
+                    safe_float(agg.get("weighted_return_sum"), 0) / weighted_return_cost,
+                    2,
+                )
 
         out.append((broker, amount, return_pct, agg.get("marker", "")))
 
