@@ -972,6 +972,9 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
     回傳格式：
         [(分點, 淨買超成本, 報酬率, 估值符號), ...]
 
+    同一標的列中的同一分點，不論拆成多少權證、事件或部位，
+    都會合併成一筆：金額加總、報酬率依可估成本（無則用剩餘成本）加權。
+
     估值符號「*」代表當日成交價覆蓋成本低於設定門檻；
     無成交部位已優先使用權證資訊揭露平台 LP 委買價估值。
     """
@@ -989,7 +992,13 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
     if not isinstance(data, list):
         return []
 
-    out = []
+    broker_agg = defaultdict(lambda: {
+        "amount": 0.0,
+        "weighted_return_sum": 0.0,
+        "weighted_return_cost": 0.0,
+        "marker": "",
+    })
+
     for rec in data:
         if not isinstance(rec, dict):
             continue
@@ -1005,16 +1014,22 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
         if amount <= 0:
             continue
 
+        estimated_cost = safe_float(
+            rec.get("可估成本", rec.get("estimated_cost", 0)),
+            0,
+        )
+        pnl = safe_float(
+            rec.get("未實現損益", rec.get("unrealized_pnl", 0)),
+            0,
+        )
+
         return_pct = normalize_top15_cache_return_pct(
             rec.get("報酬率", rec.get("報酬率文字", rec.get("return_pct", "")))
         )
 
         # 若 JSON 沒有直接給報酬率，就用未實現損益 / 可估成本回推。
-        if return_pct is None:
-            estimated_cost = safe_float(rec.get("可估成本", rec.get("estimated_cost", 0)), 0)
-            pnl = safe_float(rec.get("未實現損益", rec.get("unrealized_pnl", 0)), 0)
-            if estimated_cost > 0:
-                return_pct = round(pnl / estimated_cost * 100, 2)
+        if return_pct is None and estimated_cost > 0:
+            return_pct = round(pnl / estimated_cost * 100, 2)
 
         coverage_pct = safe_float(rec.get("成交價覆蓋率"), None)
         if coverage_pct is None:
@@ -1031,7 +1046,32 @@ def _parse_top15_broker_json(value) -> list[tuple[str, float, float | None, str]
         ):
             marker = TOP15_LOW_TRADED_COVERAGE_SYMBOL
 
-        out.append((broker, amount, return_pct, marker))
+        agg = broker_agg[broker]
+        agg["amount"] += amount
+
+        weight = estimated_cost if estimated_cost > 0 else amount
+        if return_pct is not None and weight > 0:
+            agg["weighted_return_sum"] += return_pct * weight
+            agg["weighted_return_cost"] += weight
+
+        if marker:
+            agg["marker"] = TOP15_LOW_TRADED_COVERAGE_SYMBOL
+
+    out = []
+    for broker, agg in broker_agg.items():
+        amount = safe_float(agg.get("amount"), 0)
+        if amount <= 0:
+            continue
+
+        return_pct = None
+        weighted_return_cost = safe_float(agg.get("weighted_return_cost"), 0)
+        if weighted_return_cost > 0:
+            return_pct = round(
+                safe_float(agg.get("weighted_return_sum"), 0) / weighted_return_cost,
+                2,
+            )
+
+        out.append((broker, amount, return_pct, agg.get("marker", "")))
 
     out.sort(key=lambda x: x[1], reverse=True)
     return out
@@ -1373,12 +1413,13 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         if net_amount <= 0:
             continue
 
-        broker_count = safe_int(
-            _pick_first_existing_value(row, ["參與分點數", "分點數", "broker_count"]),
-            0,
-        )
-        if broker_count <= 0 and participant_brokers:
-            broker_count = len(participant_brokers)
+        # 以合併後的唯一分點為準，避免來源快取將同一分點的不同權證、
+        # 事件或部位誤算成多個參與分點。
+        broker_count = len({
+            str(item[0]).strip()
+            for item in participant_brokers
+            if item and str(item[0]).strip()
+        })
 
         events = strip_gsheet_text_prefix(_pick_first_existing_value(row, ["事件", "事件代號", "事件類型"]))
         if not events and participant_brokers:
