@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260731-R11"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260801-R12"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -5989,7 +5989,11 @@ def _sheet_upsert_key_columns(title, headers):
         # ABCDE 的事件單位本來就是「同一資料範圍 + 同一分點 + 同一標的 + 同一天」。
         # 權證清單、金額、出清狀態都可能因資料補齊而改變，不能放進唯一鍵，
         # 否則同一天重跑會因文字格式或清單內容不同而被誤判成新事件。
-        return keep(["資料範圍", "分點", "券商代號", "標的股", "事件日"])
+        if "事件日" in hset:
+            return keep(["資料範圍", "分點", "券商代號", "標的股", "事件日"])
+        # C_強勢買超沿用起始日／結束日版面，沒有「事件日」欄；若日期不放進 key，
+        # 同一分點與標的在不同日期的事件會被誤判成重複列。
+        return keep(["資料範圍", "分點", "券商代號", "標的股", "起始日", "結束日"])
 
     if title == TOP15_CONSENSUS_SHEET:
         return keep(["資料範圍", "統計日期", "標的股"])
@@ -13234,7 +13238,23 @@ def build_amount_class_events(daily_records, item_map):
     if not daily_records:
         return {code: [] for code in AMOUNT_CLASS_CODES}
 
-    df = pd.DataFrame(daily_records)
+    # 在建立事件主鍵前再做一次「權證代號＋日期」身分正規化。
+    # 這可涵蓋來源資料的標的代號曾錯配、但權證區間主檔已能確認正確標的的情況；
+    # 避免兩個舊代號在輸出階段才被修成同一標的，進而產生重複事件鍵。
+    normalized_daily_records = []
+    identity_repaired_rows = 0
+    for record in daily_records:
+        repaired_record, changed_fields = repair_result_record_security_identity(record)
+        normalized_daily_records.append(repaired_record)
+        if changed_fields:
+            identity_repaired_rows += 1
+
+    if identity_repaired_rows:
+        print(
+            f"  🧭 ABCDE 事件分組前身分再確認：{identity_repaired_rows:,} 筆已依權證日期主檔修正"
+        )
+
+    df = pd.DataFrame(normalized_daily_records)
 
     if df.empty:
         return {code: [] for code in AMOUNT_CLASS_CODES}
@@ -13244,11 +13264,56 @@ def build_amount_class_events(daily_records, item_map):
     if df.empty:
         return {code: [] for code in AMOUNT_CLASS_CODES}
 
-    group_cols = ["分點", "分點名稱", "券商代號", "標的股", "標的名稱", "日期"]
+    # 事件主鍵只能使用穩定識別欄位。舊版把「分點名稱／標的名稱」也放進 groupby，
+    # 同一券商代號、同一標的、同一天只要名稱來源不同，就會被拆成兩筆 ABCDE 事件。
+    # 先正規化券商代號、標的代號與日期，再以三者建立唯一事件。
+    df["_券商代號鍵"] = df["券商代號"].map(normalize_broker_code_for_compare)
+    df["_標的股鍵"] = df["標的股"].map(
+        lambda value: normalize_underlying_code_for_group(value)
+        or normalize_security_code_text(value)
+    )
+    df["_日期鍵"] = df["日期"].map(normalize_date_str)
+    df = df[
+        (df["_券商代號鍵"] != "")
+        & (df["_標的股鍵"] != "")
+        & (df["_日期鍵"] != "")
+    ].copy()
+
+    if df.empty:
+        return {code: [] for code in AMOUNT_CLASS_CODES}
+
+    def preferred_group_text(series):
+        values = [
+            str(value or "").strip()
+            for value in series.tolist()
+            if str(value or "").strip()
+        ]
+        if not values:
+            return ""
+        counts = Counter(values)
+        return sorted(counts, key=lambda value: (-counts[value], value))[0]
+
+    _label_to_code, code_to_label = configured_broker_pair_maps_for_scope("all")
+    group_cols = ["_券商代號鍵", "_標的股鍵", "_日期鍵"]
 
     for key, g in df.groupby(group_cols, dropna=False, sort=False):
-        broker_label, broker_name, broker_code, underlying_code, underlying_name, date = key
-        date = normalize_date_str(date)
+        broker_code_key, underlying_code, date = key
+        canonical_broker = code_to_label.get(broker_code_key)
+        if canonical_broker:
+            broker_label, broker_code = canonical_broker
+            broker_name = str(
+                FULL_FALLBACK.get(broker_label, (broker_label, broker_code))[0]
+                or broker_label
+            ).strip()
+        else:
+            broker_label = preferred_group_text(g["分點"])
+            broker_name = preferred_group_text(g["分點名稱"]) or broker_label
+            broker_code = preferred_group_text(g["券商代號"]) or broker_code_key
+
+        underlying_name = str(
+            _CURRENT_STOCK_CODE_TO_NAME.get(underlying_code, "")
+            or preferred_group_text(g["標的名稱"])
+        ).strip()
 
         warrant_rows = g.groupby(["權證代號", "權證名稱"], as_index=False).agg({
             "買進金額": "sum",
