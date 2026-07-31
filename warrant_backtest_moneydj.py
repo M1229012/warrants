@@ -23,8 +23,10 @@ E：單日累積買進金額 >= 1000萬
 8. 快取_TOP15部位明細
 
 每日流程仍只計算與同步上述 8 張工作表；其他既有 Google Sheet 工作表一律保留。
-Google Sheet 預設採歷史保護模式：既有資料不清空、不裁切、不刪列、不縮小工作表；每日新資料只新增，已存在的唯一鍵不重複寫入。
-完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會重算完整報表，但既有 Google Sheet 仍採增量補齊；TOP15 會回補最近一個月（預設 22 個交易日）的每日快照，不覆蓋或刪除過去日期。
+daily 預設採歷史保護模式：只替換指定交易日／統計日快照，不清空其他日期或其他工作表。
+完整修補模式（WORKFLOW_MODE=repair + RUN_MODE=2）會先驗證完整工作簿，再把 21 張結果表當成
+同一份一致性快照完整重建並回讀驗收；排行、ABCDE、TOP15、勝率與查詢頁不會混入舊統計窗口。
+快取與非結果工作表不在 repair 清空範圍內。
 
 資料來源：daily 沿用完整歷史快取並只抓 MoneyDJ 目標交易日；repair 使用 FinMind 近 200 交易日完整歷史＋MoneyDJ 最新日覆蓋
 執行：python warrant_backtest.py
@@ -68,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R10"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260731-R11"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -2581,17 +2583,23 @@ GSHEET_MAIN_ALLOW_CREATE = os.getenv(
 GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 
 # Google Sheet 歷史保護設定：
-# 1. 預設開啟後，任何既有資料都不 clear、不 delete_rows、不因保留天數裁切。
-# 2. repair 也只補上缺少的唯一鍵；版面型工作表已存在時保持原狀。
-# 3. 若未來真的需要舊版覆蓋／裁切行為，必須明確設定 GSHEET_PRESERVE_ALL_HISTORY=0。
+# 1. daily 預設開啟後，非本次日期／快照不 clear、不 delete_rows、不因保留天數裁切。
+# 2. repair 的 21 張結果表若啟用下方 FULL_RESULT_OVERWRITE，會例外地完整重建；
+#    快取、非結果表與 repair 清單以外的工作表仍受保護。
+# 3. 關閉 FULL_RESULT_OVERWRITE 時，才回到本開關控制的增量／舊版覆蓋策略。
 GSHEET_PRESERVE_ALL_HISTORY = os.getenv(
     "GSHEET_PRESERVE_ALL_HISTORY", "1"
 ).strip().lower() not in ("0", "false", "no")
-# 歷史保護開啟時，repair 仍可只重建「勝率統計／ABCDE組合勝率」。
-# 這兩張是由本次完整資料計算出的版面型彙總表，若沿用舊值會讓 60 日估值
-# 無法反映到 Google Sheet；其他 A～E、TOP15 與歷史明細仍維持不清除。
+# 相容開關：若關閉完整結果快照，repair 仍可只重建
+# 「勝率統計／ABCDE組合勝率」，讓 60 日估值反映到 Google Sheet。
 GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED = os.getenv(
     "GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# repair + RUN_MODE=2 的結果工作表是同一份完整工作簿的物化結果；
+# 排名、勝率、查詢資料、ABCDE 與 TOP15 必須使用相同統計範圍。
+# 啟用後 repair 會完整重建本次工作簿內的所有結果表；daily 仍維持增量更新。
+GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED = os.getenv(
+    "GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no")
 
 # 保留舊版封存參數供相容使用；歷史保護模式下不會執行主表裁切。
@@ -4554,25 +4562,24 @@ def write_values_to_worksheet(
     worksheet_title = safe_worksheet_title(
         getattr(ws, "title", "")
     )
-    allow_repair_winrate_clear = bool(
+    allow_repair_result_clear = bool(
         clear_existing_values
         and should_overwrite_result_sheet_in_repair(worksheet_title)
-        and worksheet_title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES
     )
 
     if (
         GSHEET_PRESERVE_ALL_HISTORY
         and clear_existing_values
-        and not allow_repair_winrate_clear
+        and not allow_repair_result_clear
     ):
         print(
             f"  🛡️ Google Sheet 歷史保護：拒絕清空既有工作表："
             f"{getattr(ws, 'title', '-')}"
         )
         return None if return_normalized_values else False
-    if allow_repair_winrate_clear:
+    if allow_repair_result_clear:
         print(
-            f"  🔄 repair 勝率彙總表安全重建放行："
+            f"  🔄 repair 結果表安全重建放行："
             f"{getattr(ws, 'title', '-')}"
         )
 
@@ -5217,8 +5224,10 @@ def should_overwrite_result_sheet_in_repair(title):
     """
     RUN_MODE=2 repair 的覆蓋判斷。
 
-    - 關閉歷史保護：完整覆蓋所有 repair 結果表。
-    - 開啟歷史保護：只允許覆蓋可安全重建的兩張勝率彙總表。
+    - GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED=1：完整覆蓋本次 repair
+      工作簿的全部結果表，確保排名、明細、統計與查詢頁使用同一份資料。
+    - 關閉完整同步且關閉歷史保護：沿用舊版完整覆蓋。
+    - 關閉完整同步且開啟歷史保護：只重建兩張勝率彙總表。
     """
     title = safe_worksheet_title(title)
     return (
@@ -5226,7 +5235,8 @@ def should_overwrite_result_sheet_in_repair(title):
         and RUN_MODE == 2
         and title in GSHEET_REPAIR_OVERWRITE_TITLES
         and (
-            not GSHEET_PRESERVE_ALL_HISTORY
+            GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED
+            or not GSHEET_PRESERVE_ALL_HISTORY
             or (
                 GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED
                 and title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES
@@ -5511,6 +5521,117 @@ def verify_repair_overwrite_values(gws, expected_values, strict=True):
     return True, ""
 
 
+def _repair_rank_integer(value):
+    """把 Excel／Google Sheet 的排名值轉成正整數；格式錯誤時回傳 None。"""
+    raw = str(strip_gsheet_text_prefix(value) or "").strip().replace(",", "")
+    if not raw:
+        return None
+    try:
+        number = float(raw)
+    except Exception:
+        return None
+    if not number.is_integer() or number <= 0:
+        return None
+    return int(number)
+
+
+def validate_repair_result_values(title, values):
+    """在清空 Google Sheet 前驗證 repair 工作表的結構與唯一性。
+
+    近兩月排行屬於「當次快照」，每個資料範圍的排名必須從 1 連續到 N，
+    且最多 20 名；這會直接攔截舊增量策略造成的 20、1、19 等殘缺排行。
+    其他簡單表格則檢查表頭、資料範圍及既有 upsert 唯一鍵，避免同類問題
+    在 ABCDE、TOP15、每日賣出或快取表中再次發生。
+    """
+    title = safe_worksheet_title(title)
+    matrix = _trim_result_value_matrix(values)
+    if not matrix:
+        raise RuntimeError(f"repair 工作表沒有可寫入內容：{title}")
+
+    if not should_upsert_result_sheet(title):
+        return matrix
+
+    header_row_idx = _find_simple_header_row(matrix)
+    if header_row_idx != 0:
+        raise RuntimeError(
+            f"repair 簡單表格的表頭不在第 1 列：{title}｜header_row={header_row_idx}"
+        )
+
+    headers, records = _values_to_records(matrix, header_row_idx=0)
+    normalized_headers = [str(header or "").strip() for header in headers]
+    if not normalized_headers or any(not header for header in normalized_headers):
+        raise RuntimeError(f"repair 工作表含空白表頭：{title}")
+
+    duplicate_headers = sorted({
+        header for header in normalized_headers
+        if normalized_headers.count(header) > 1
+    })
+    if duplicate_headers:
+        raise RuntimeError(
+            f"repair 工作表含重複表頭：{title}｜{', '.join(duplicate_headers)}"
+        )
+    if "資料範圍" not in normalized_headers:
+        raise RuntimeError(f"repair 工作表缺少資料範圍欄：{title}")
+
+    key_columns = _sheet_upsert_key_columns(title, normalized_headers)
+    if key_columns:
+        seen_keys = {}
+        for row_no, record in enumerate(records, start=2):
+            key = _record_key(record, key_columns)
+            if key in seen_keys:
+                raise RuntimeError(
+                    f"repair 工作表唯一鍵重複：{title}｜第 {seen_keys[key]}、{row_no} 列｜"
+                    f"欄位={','.join(key_columns)}｜key={key}"
+                )
+            seen_keys[key] = row_no
+
+    ranking_identity_header = {
+        safe_worksheet_title("近兩月買賣金額排行"): "權證代號",
+        safe_worksheet_title("近兩月分點數排行"): "標的股",
+    }.get(title)
+    if ranking_identity_header:
+        required_headers = {"資料範圍", "排名", ranking_identity_header}
+        missing_headers = sorted(required_headers - set(normalized_headers))
+        if missing_headers:
+            raise RuntimeError(
+                f"repair 排行表缺少必要欄位：{title}｜{', '.join(missing_headers)}"
+            )
+
+        grouped = {}
+        for row_no, record in enumerate(records, start=2):
+            scope = str(record.get("資料範圍", "") or "").strip()
+            rank = _repair_rank_integer(record.get("排名"))
+            identity = _normalize_result_key_value(
+                ranking_identity_header,
+                record.get(ranking_identity_header, ""),
+            )
+            if not scope or rank is None or not identity:
+                raise RuntimeError(
+                    f"repair 排行表資料不完整：{title}｜第 {row_no} 列｜"
+                    f"資料範圍={scope!r}｜排名={record.get('排名')!r}｜"
+                    f"{ranking_identity_header}={record.get(ranking_identity_header)!r}"
+                )
+            group = grouped.setdefault(scope, {"ranks": [], "identities": set()})
+            if identity in group["identities"]:
+                raise RuntimeError(
+                    f"repair 排行表標的重複：{title}｜資料範圍={scope}｜"
+                    f"{ranking_identity_header}={identity}"
+                )
+            group["ranks"].append(rank)
+            group["identities"].add(identity)
+
+        for scope, group in grouped.items():
+            ranks = group["ranks"]
+            expected_ranks = list(range(1, len(ranks) + 1))
+            if len(ranks) > 20 or ranks != expected_ranks:
+                raise RuntimeError(
+                    f"repair 排行不連續：{title}｜資料範圍={scope}｜"
+                    f"實際={ranks}｜預期={expected_ranks}｜上限=20"
+                )
+
+    return matrix
+
+
 def prepare_repair_full_overwrite_values(
     title,
     raw_values,
@@ -5538,7 +5659,8 @@ def prepare_repair_full_overwrite_values(
         values = raw_values
 
     values = sort_abcde_result_values(title, values)
-    return normalize_result_values_for_comma_numbers(values)
+    values = normalize_result_values_for_comma_numbers(values)
+    return validate_repair_result_values(title, values)
 
 
 def overwrite_repair_result_sheet_from_excel(
@@ -5582,9 +5704,9 @@ def overwrite_repair_result_sheet_from_excel(
         else:
             # 查詢頁、勝率頁、狀態頁與說明頁保留 Excel 的版面、公式及下拉選單。
             apply_excel_style_to_gsheet(ws_xlsx, gws)
-            if title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES:
-                # 勝率欄位曾增刪或位移時，Excel 樣式／Google Sheet 舊格式都可能
-                # 把新欄誤套成百分比。每次 repair 都先清除本次資料範圍的
+            if title in GSHEET_REPAIR_OVERWRITE_TITLES:
+                # 欄位曾增刪或位移時，Excel 樣式／Google Sheet 舊格式都可能
+                # 套到錯誤欄位。每次 repair 都先清除本次資料範圍的
                 # numberFormat，再依「本次實際表頭」重新套用。
                 clear_all_number_formats_for_written_range(
                     gws,
@@ -8615,9 +8737,10 @@ def upload_excel_to_google_sheet(
 ):
     """
     Google Sheet 同步規則：
-    1. GSHEET_PRESERVE_ALL_HISTORY=1（預設）：既有表只新增缺少的唯一鍵，絕不清空、刪列或縮小。
-    2. repair + RUN_MODE=2：資料型工作表增量補齊；既有版面型工作表保持原狀。
-    3. 只有明確設定 GSHEET_PRESERVE_ALL_HISTORY=0 才允許舊版完整覆蓋流程。
+    1. repair + RUN_MODE=2 且 GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED=1：
+       21 張結果表視為同一份快照，寫入前全表驗證，之後完整重建並回讀驗收。
+    2. daily 模式仍只替換指定日期／快照；其他歷史資料不清空、不刪列。
+    3. 關閉完整 repair 覆蓋時，才依 GSHEET_PRESERVE_ALL_HISTORY 決定增量或舊版覆蓋。
     4. 單張失敗不會阻止其他工作表，最後再統一重試失敗項目。
     5. 任何必要工作表最終失敗都會讓程式以錯誤結束，禁止印出假成功。
     """
@@ -8671,11 +8794,28 @@ def upload_excel_to_google_sheet(
                 "repair 工作簿缺少必須重算並覆蓋的工作表："
                 + "、".join(missing_repair_titles)
             )
+
+        # 先驗證全部必要工作表，再允許任何一張 Google Sheet 被清空。
+        # 如排行不連續、表頭錯位或唯一鍵重複，本次 repair 會在遠端資料未變更前失敗。
+        for title in sorted(repair_expected_overwrites):
+            ws_xlsx = workbook_map[title]
+            raw_values = worksheet_values_for_gsheet(ws_xlsx)
+            prepare_repair_full_overwrite_values(
+                title,
+                raw_values,
+                data_scope=current_scope,
+                extra_scope_values=extra_scope_values.get(title),
+            )
         print(
-            f"  ✅ repair 全工作表覆蓋前置檢查完成：{len(repair_expected_overwrites)} 張｜"
+            f"  ✅ repair 全工作表覆蓋前置驗證完成：{len(repair_expected_overwrites)} 張｜"
             + "、".join(sorted(repair_expected_overwrites))
         )
-        if GSHEET_PRESERVE_ALL_HISTORY:
+        if GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED:
+            print(
+                "  🔄 repair 一致性快照模式：21 張結果表均依本次完整工作簿重建；"
+                "不保留已退出排行、舊統計窗口或舊欄位格式。"
+            )
+        elif GSHEET_PRESERVE_ALL_HISTORY:
             print(
                 "  🛡️ repair 歷史保護模式：A～E、TOP15 與歷史明細不清空、不刪列；"
                 + (
@@ -8701,7 +8841,12 @@ def upload_excel_to_google_sheet(
         f"  🧾 程式版本：{PROGRAM_BUILD_ID}｜WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}"
     )
 
-    if strict_repair and GSHEET_PRESERVE_ALL_HISTORY:
+    if strict_repair and GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED:
+        print(
+            f"  ⚙️ 同步模式：完整修補一致性快照｜共 {len(repair_expected_overwrites)} 張；"
+            "全部完整重建、重套欄位格式，並逐張回讀驗證。"
+        )
+    elif strict_repair and GSHEET_PRESERVE_ALL_HISTORY:
         print(
             f"  ⚙️ 同步模式：完整修補增量補齊｜共 {len(repair_expected_overwrites)} 張；"
             + (
@@ -8750,9 +8895,9 @@ def upload_excel_to_google_sheet(
         if gws is None:
             raise RuntimeError(f"無法取得或建立 Google Sheet 工作表：{title}")
 
-        # repair 的勝率彙總表必須先於歷史保護安全門判斷，才能用本次
-        # 60 日按市價估值結果重建；其餘既有工作表仍受歷史保護。
-        if not created and should_overwrite_result_sheet_in_repair(title):
+        # repair 完整結果快照必須先於歷史保護安全門判斷；既有表與本次
+        # 新建立的表都走同一套「完整寫入 → 格式重建 → 回讀驗證」。
+        if should_overwrite_result_sheet_in_repair(title):
             overwrite_repair_result_sheet_from_excel(
                 ws_xlsx,
                 gws,
@@ -8784,17 +8929,6 @@ def upload_excel_to_google_sheet(
                 print(
                     f"  🛡️ Google Sheet 歷史保護：既有版面型工作表不覆蓋：{title}"
                 )
-            return
-
-        if should_overwrite_result_sheet_in_repair(title):
-            overwrite_repair_result_sheet_from_excel(
-                ws_xlsx,
-                gws,
-                raw_values,
-                title,
-                data_scope=current_scope,
-                extra_scope_values=selected_values,
-            )
             return
 
         if created:
@@ -8959,14 +9093,14 @@ def upload_excel_to_google_sheet(
             raise RuntimeError(
                 "repair 未能完整更新所有必要工作表：" + "｜".join(detail_parts)
             )
-        if GSHEET_PRESERVE_ALL_HISTORY:
+        if GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED or not GSHEET_PRESERVE_ALL_HISTORY:
             print(
-                f"  ✅ repair 歷史資料已完成增量補齊：{len(completed & repair_expected_overwrites)} 張｜"
+                f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(completed & repair_expected_overwrites)} 張｜"
                 + "、".join(sorted(completed & repair_expected_overwrites))
             )
         else:
             print(
-                f"  ✅ repair 完整報表已全部覆蓋並回讀驗證：{len(completed & repair_expected_overwrites)} 張｜"
+                f"  ✅ repair 歷史資料已完成增量補齊：{len(completed & repair_expected_overwrites)} 張｜"
                 + "、".join(sorted(completed & repair_expected_overwrites))
             )
 
