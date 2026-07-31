@@ -184,13 +184,15 @@ jobs:
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_PRESERVE_ALL_HISTORY: "1"
-      # repair 僅重建兩張勝率彙總表；A～E、TOP15 與歷史明細仍受歷史保護。
+      # repair + RUN_MODE=2 將 21 張結果表視為同一份快照完整重建；daily 仍保留歷史。
+      GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED: "1"
+      # 關閉完整快照開關時，仍可單獨允許兩張勝率彙總表重建。
       GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "0"
       GSHEET_RESULT_ARCHIVE_ENABLED: "0"
       GSHEET_COMPACT_BLANK_GRID_ENABLED: "0"
 
-      # 全域歷史表不 clear；勝率彙總表由上方專用開關安全重建。
+      # daily 不 clear 全域歷史；repair 只重建本次工作簿列出的 21 張結果表。
       GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
       GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "0"
       GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
@@ -316,7 +318,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R10"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260731-R11"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -326,9 +328,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 60 日估值修正版 R10。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 repair 全結果一致性快照版 R11。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 60 日估值修正版 Hybrid R10。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 repair 全結果一致性快照版 Hybrid R11。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
