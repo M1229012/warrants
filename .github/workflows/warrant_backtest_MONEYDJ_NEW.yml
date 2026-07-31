@@ -316,7 +316,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R8"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R9"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -326,9 +326,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 60 日估值修正版 R8。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 60 日估值修正版 R9。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 60 日估值修正版 Hybrid R8。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 60 日估值修正版 Hybrid R9。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
