@@ -68,7 +68,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R8"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R9"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4515,12 +4515,30 @@ def write_values_to_worksheet(
     if ws is None:
         return None if return_normalized_values else False
 
-    if GSHEET_PRESERVE_ALL_HISTORY and clear_existing_values:
+    worksheet_title = safe_worksheet_title(
+        getattr(ws, "title", "")
+    )
+    allow_repair_winrate_clear = bool(
+        clear_existing_values
+        and should_overwrite_result_sheet_in_repair(worksheet_title)
+        and worksheet_title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES
+    )
+
+    if (
+        GSHEET_PRESERVE_ALL_HISTORY
+        and clear_existing_values
+        and not allow_repair_winrate_clear
+    ):
         print(
             f"  🛡️ Google Sheet 歷史保護：拒絕清空既有工作表："
             f"{getattr(ws, 'title', '-')}"
         )
         return None if return_normalized_values else False
+    if allow_repair_winrate_clear:
+        print(
+            f"  🔄 repair 勝率彙總表安全重建放行："
+            f"{getattr(ws, 'title', '-')}"
+        )
 
     normalized_values, row_count, col_count = prepare_gsheet_write_values(values)
 
