@@ -68,7 +68,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R9"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-20260731-R10"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -3866,6 +3866,31 @@ GSHEET_DECIMAL_NUMBER_EXCLUDE_KEYWORDS = (
 )
 
 
+def is_gsheet_integer_measure_header(header):
+    """
+    判斷「計數／總額」欄位。
+
+    欄名可能同時含有「勝率」，例如「納入勝率筆數」與
+    「納入勝率買進金額」；語意仍是筆數／金額，不能套百分比格式。
+    """
+    header = str(header).strip()
+    if not header:
+        return False
+
+    # 平均值保留小數格式，例如「平均單筆買進金額」。
+    if "平均" in header:
+        return False
+
+    return any(
+        keyword in header
+        for keyword in (
+            "筆數", "件數", "事件數", "檔數",
+            "金額", "成本", "市值", "損益",
+            "股數", "張數", "排名",
+        )
+    )
+
+
 def is_gsheet_percent_header(header):
     header = str(header).strip()
 
@@ -3873,6 +3898,9 @@ def is_gsheet_percent_header(header):
         return False
 
     if "文字" in header or "日期" in header or "代號" in header:
+        return False
+
+    if is_gsheet_integer_measure_header(header):
         return False
 
     return ("%" in header) or ("勝率" in header) or ("占比" in header) or ("比例" in header)
@@ -3905,6 +3933,9 @@ def is_gsheet_decimal_number_header(header):
     if is_gsheet_text_header(header):
         return False
 
+    if is_gsheet_integer_measure_header(header):
+        return False
+
     for keyword in GSHEET_DECIMAL_NUMBER_EXCLUDE_KEYWORDS:
         if keyword in header:
             return False
@@ -3935,6 +3966,11 @@ def is_gsheet_comma_number_header(header):
 
     if is_gsheet_text_header(header):
         return False
+
+    # 計數／總額優先於排除字詞判斷；例如「納入勝率筆數」雖含「勝率」，
+    # 仍必須使用整數千分位，而不是百分比或兩位小數。
+    if is_gsheet_integer_measure_header(header):
+        return True
 
     for keyword in GSHEET_COMMA_NUMBER_EXCLUDE_KEYWORDS:
         if keyword in header:
@@ -5546,6 +5582,14 @@ def overwrite_repair_result_sheet_from_excel(
         else:
             # 查詢頁、勝率頁、狀態頁與說明頁保留 Excel 的版面、公式及下拉選單。
             apply_excel_style_to_gsheet(ws_xlsx, gws)
+            if title in GSHEET_REPAIR_WINRATE_OVERWRITE_TITLES:
+                # 勝率欄位曾增刪或位移時，Excel 樣式／Google Sheet 舊格式都可能
+                # 把新欄誤套成百分比。每次 repair 都先清除本次資料範圍的
+                # numberFormat，再依「本次實際表頭」重新套用。
+                clear_all_number_formats_for_written_range(
+                    gws,
+                    values=written_values,
+                )
 
         apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=written_values)
         apply_date_format_to_gsheet(ws_xlsx, gws, values=written_values)
