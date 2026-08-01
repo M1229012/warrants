@@ -117,14 +117,6 @@ jobs:
       FETCH_GROUP_WARRANT_PRICES: "0"
       PRICE_WORKERS: "60"
 
-      # repair 勝率重算：
-      # 持有滿 60 日仍未出清，以統計日權證價格估值；
-      # 已下市／到期取生命週期內最後有效價，完全無價時以 0 結算。
-      WINRATE_MARK_TO_MARKET_DAYS: "60"
-      WINRATE_MARK_TO_MARKET_REPAIR_ENABLED: "1"
-      WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED: "1"
-      WINRATE_DELISTED_MISSING_PRICE: "0"
-
       TOP15_CACHE_ENABLED: "1"
       TOP15_LOOKBACK_TRADING_DAYS: "40"
       # repair 回補近一個月的 TOP15 每日快照（約 22 個交易日）。
@@ -162,18 +154,23 @@ jobs:
       # ============================================================
       # 長期留單
       # ============================================================
-      LONGTERM_OPEN_DAYS: "60,120,180"
-      LONGTERM_WINRATE_SHEET_DAYS: "60"
+      LONGTERM_OPEN_DAYS: "120,150,180"
       LONGTERM_PRICE_LOOKBACK_DAYS: "420"
       LONGTERM_PRICE_STALE_DAYS: "10"
       LONGTERM_ZERO_PRICE_THRESHOLD: "0.05"
       LONGTERM_UPDATE_WINRATE_SHEET: "1"
       LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET: "0"
 
+      # repair 勝率：持有滿 60 日未出清者按統計日估值；已下市／到期且無價以 0 結算。
+      WINRATE_MARK_TO_MARKET_DAYS: "60"
+      WINRATE_MARK_TO_MARKET_REPAIR_ENABLED: "1"
+      WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED: "1"
+      WINRATE_DELISTED_MISSING_PRICE: "0"
+
       # ============================================================
-      # Google Sheet 歷史保護：
-      # daily 與 repair 都只新增缺少的唯一資料，不清空、不刪列、不裁切歷史。
-      # repair + RUN_MODE=2 會補齊完整歷史及近 22 個交易日 TOP15 快照。
+      # Google Sheet 同步：
+      # daily 保留其他日期歷史；repair + RUN_MODE=2 將 21 張結果表當成一致性快照完整重建。
+      # 非結果工作表與 repair 清單以外的工作表仍受歷史保護。
       # ============================================================
       GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
@@ -184,17 +181,15 @@ jobs:
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_PRESERVE_ALL_HISTORY: "1"
-      # repair + RUN_MODE=2 將 21 張結果表視為同一份快照完整重建；daily 仍保留歷史。
       GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED: "1"
-      # 關閉完整快照開關時，仍可單獨允許兩張勝率彙總表重建。
       GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "0"
       GSHEET_RESULT_ARCHIVE_ENABLED: "0"
       GSHEET_COMPACT_BLANK_GRID_ENABLED: "0"
 
-      # daily 不 clear 全域歷史；repair 只重建本次工作簿列出的 21 張結果表。
+      # repair 只允許完整重建程式列出的 21 張結果表；daily 與其他工作表不做全表 clear。
       GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
-      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "0"
+      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "1"
       GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
 
       GSHEET_WRITE_SLEEP_SECONDS: "0.05"
@@ -263,7 +258,7 @@ jobs:
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
               # FinMind 補足最近 200 個成功交易日完整歷史，MoneyDJ 補強最新資料；
-              # Google Sheet 僅增量補齊，並回補近 22 個交易日 TOP15 快照。
+              # Google Sheet 21 張結果表依同一次工作簿完整重建並逐張回讀驗證。
               INITIAL_HISTORY_DAYS="200"
               DAILY_UPDATE_DAYS="5"
               ;;
@@ -318,7 +313,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260801-R12"
+          EXPECTED_BUILD_ID="HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FLEXSCHEMA-20260801-R13"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -328,9 +323,9 @@ jobs:
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行 ABCDE 穩定事件主鍵修正版 R12。
+          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行欄位驅動修補驗證版 R13。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的 ABCDE 穩定事件主鍵修正版 Hybrid R12。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的欄位驅動修補驗證版 Hybrid R13。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
