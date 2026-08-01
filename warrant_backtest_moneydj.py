@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260801-R14"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260801-R15"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -5538,77 +5538,54 @@ def _repair_rank_integer(value):
     return int(number)
 
 
-def _validate_result_rank_block(title, headers, records, block_label=""):
+def _check_result_rank_sequence(title, headers, records, block_label=""):
     """
-    欄位驅動的通用排行驗證：不綁工作表名稱，也不把名次上限寫死。
+    純結構的排名檢查：不猜分組欄位，也不猜「排名標的」是哪一欄。
 
-    有「排名」欄才檢查；依實際存在的統計維度分組，每組必須是 1～N。
-    多段式報表的每個區塊都會各自套用同一套規則。
+    唯一規則：依原始列序，「排名」欄必須由一段或多段 1,2,3,…,N 組成。
+    多段代表同一張表放了多組排行（例如券商查詢資料是每個券商各自 1～15 名，
+    近7／14／21 日共識是買超 1～15 再賣超 1～15）。
+    這條規則對所有排行表都成立，完全不需要知道業務語意，
+    因此不會再因為某張表的分組維度沒被寫進清單而誤判。
+
+    不一致時只印警告、不中斷：排名順序屬於呈現層問題，
+    內容與 Excel artifact 完全相同，不值得讓整輪 repair 作廢重跑。
+    真正會破壞資料的結構問題（空表、表頭重複、缺資料範圍欄、
+    資料超出表頭欄數）仍然是致命錯誤，會在清空 Google Sheet 前擋下。
     """
     normalized_headers = [str(header or "").strip() for header in headers]
     if "排名" not in normalized_headers:
-        return
+        return True
 
     label = f"{title}｜{block_label}" if block_label else title
-    group_headers = [
-        header for header in ("資料範圍", "統計日期", "統計天數", "排名類型")
-        if header in normalized_headers
-    ]
-    if "權證代號" in normalized_headers and "買進分點" in normalized_headers:
-        identity_candidates = ["權證代號"]
-    elif "標的股" in normalized_headers:
-        identity_candidates = ["標的股"]
-    elif "券商代號" in normalized_headers or "分點" in normalized_headers:
-        identity_candidates = [
-            header for header in ("券商代號", "分點")
-            if header in normalized_headers
-        ]
-    elif "權證代號" in normalized_headers:
-        identity_candidates = ["權證代號"]
-    else:
-        identity_candidates = []
 
-    if not identity_candidates:
-        raise RuntimeError(f"repair 排行表找不到排名標的欄：{label}")
-
-    grouped = {}
+    ranks = []
     for row_no, record in enumerate(records, start=2):
         rank = _repair_rank_integer(record.get("排名"))
-        group_key = tuple(
-            _normalize_result_key_value(header, record.get(header, ""))
-            for header in group_headers
-        )
-        identity = ""
-        identity_header = ""
-        for candidate in identity_candidates:
-            candidate_value = _normalize_result_key_value(candidate, record.get(candidate, ""))
-            if candidate_value:
-                identity = candidate_value
-                identity_header = candidate
-                break
-        if rank is None or not identity:
-            raise RuntimeError(
-                f"repair 排行表資料不完整：{label}｜區塊內第 {row_no} 列｜"
-                f"分組={group_key}｜排名={record.get('排名')!r}｜"
-                f"排名標的候選={identity_candidates}"
+        if rank is None:
+            print(
+                f"  ⚠️ repair 排名欄格式異常（僅警告，不中斷）：{label}｜"
+                f"區塊內第 {row_no} 列｜排名={record.get('排名')!r}"
             )
-        group = grouped.setdefault(group_key, {"ranks": [], "identities": set()})
-        if identity in group["identities"]:
-            raise RuntimeError(
-                f"repair 排行表標的重複：{label}｜分組={group_key}｜"
-                f"{identity_header}={identity}"
-            )
-        group["ranks"].append(rank)
-        group["identities"].add(identity)
+            return False
+        ranks.append(rank)
 
-    for group_key, group in grouped.items():
-        ranks = group["ranks"]
-        expected_ranks = list(range(1, len(ranks) + 1))
-        if ranks != expected_ranks:
-            raise RuntimeError(
-                f"repair 排行不連續：{label}｜分組={group_key}｜"
-                f"實際={ranks}｜預期={expected_ranks}"
-            )
+    expected = 1
+    for position, rank in enumerate(ranks, start=1):
+        if rank == expected:
+            expected += 1
+            continue
+        if rank == 1:
+            # 新的一段排行開始。
+            expected = 2
+            continue
+        print(
+            f"  ⚠️ repair 排名不是連續 1～N（僅警告，不中斷）：{label}｜"
+            f"第 {position} 筆排名={rank}｜預期 {expected} 或 1"
+        )
+        return False
+
+    return True
 
 
 def validate_repair_result_values(title, values):
@@ -5619,8 +5596,11 @@ def validate_repair_result_values(title, values):
     只嚴格驗證不依業務猜測的結構條件，以及由「排名」欄明確表達的 1～N 語意。
 
     結構完全以本次內容判定，不再依工作表名稱假設「表頭一定在第 1 列」：
-    - 單一資料表：驗表頭、資料範圍欄、欄寬與排行語意。
-    - 多段式版面：逐區塊驗排行語意；含公式的區塊交由寫入後的逐格回讀驗證把關。
+    - 單一資料表：驗表頭、資料範圍欄與欄寬（致命）＋排名連續性（警告）。
+    - 多段式版面：逐區塊檢查排名連續性（警告）；含公式的區塊交由回讀驗證把關。
+
+    只有「會讓 Google Sheet 被清空後寫入垃圾」的結構問題才中斷本輪 repair；
+    純呈現層的排名順序問題一律只警告，避免整輪一小時多的計算白跑。
     """
     title = safe_worksheet_title(title)
     matrix = _trim_result_value_matrix(values)
@@ -5631,7 +5611,7 @@ def validate_repair_result_values(title, values):
         for block in _iter_result_header_blocks(matrix):
             if block["has_formula"]:
                 continue
-            _validate_result_rank_block(
+            _check_result_rank_sequence(
                 title,
                 block["headers"],
                 block["records"],
@@ -5666,7 +5646,7 @@ def validate_repair_result_values(title, values):
         if not str(record.get("資料範圍", "") or "").strip():
             raise RuntimeError(f"repair 工作表資料範圍空白：{title}｜第 {row_no} 列")
 
-    _validate_result_rank_block(title, headers, records)
+    _check_result_rank_sequence(title, headers, records)
     return matrix
 
 
@@ -8955,16 +8935,29 @@ def upload_excel_to_google_sheet(
             )
 
         # 先驗證全部必要工作表，再允許任何一張 Google Sheet 被清空。
-        # 如排行不連續、表頭錯位、資料超出表頭或資料範圍缺失，
-        # 本次 repair 會在遠端資料未變更前失敗；一般明細不以推測唯一鍵攔截。
+        # 一次驗完全部工作表並彙總所有錯誤再拋出；不要遇到第一張就中斷，
+        # 否則每輪只會暴露一個問題，使用者得重跑一小時多才看到下一個。
+        validation_errors = []
         for title in sorted(repair_expected_overwrites):
             ws_xlsx = workbook_map[title]
             raw_values = worksheet_values_for_gsheet(ws_xlsx)
-            prepare_repair_full_overwrite_values(
-                title,
-                raw_values,
-                data_scope=current_scope,
-                extra_scope_values=extra_scope_values.get(title),
+            try:
+                prepare_repair_full_overwrite_values(
+                    title,
+                    raw_values,
+                    data_scope=current_scope,
+                    extra_scope_values=extra_scope_values.get(title),
+                )
+            except Exception as exc:
+                message = f"{title}｜{type(exc).__name__}: {exc}"
+                validation_errors.append(message)
+                print(f"  ❌ repair 前置驗證失敗：{message}")
+
+        if validation_errors:
+            raise RuntimeError(
+                f"repair 前置驗證未通過（{len(validation_errors)}/"
+                f"{len(repair_expected_overwrites)} 張工作表）："
+                + "；".join(validation_errors)
             )
         print(
             f"  ✅ repair 全工作表覆蓋前置驗證完成：{len(repair_expected_overwrites)} 張｜"
