@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FLEXSCHEMA-20260801-R13"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260801-R14"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -5164,6 +5164,9 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
 GSHEET_RESULT_UPSERT_ENABLED = os.getenv("GSHEET_RESULT_UPSERT_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 GSHEET_LEGACY_SCOPE_LABEL = os.getenv("GSHEET_LEGACY_SCOPE_LABEL", "未標記舊資料").strip() or "未標記舊資料"
 
+# 只作為「拿不到本次內容時」的預設值。
+# 正常流程一律由 is_simple_result_table_values() 依實際結構判定，
+# 因此工作表改版面或新增報表都不需要同步維護這份清單。
 GSHEET_RESULT_UPSERT_TITLES = {
     *AMOUNT_CLASS_SHEET_NAMES,
     "每日賣出明細",
@@ -5535,27 +5538,106 @@ def _repair_rank_integer(value):
     return int(number)
 
 
+def _validate_result_rank_block(title, headers, records, block_label=""):
+    """
+    欄位驅動的通用排行驗證：不綁工作表名稱，也不把名次上限寫死。
+
+    有「排名」欄才檢查；依實際存在的統計維度分組，每組必須是 1～N。
+    多段式報表的每個區塊都會各自套用同一套規則。
+    """
+    normalized_headers = [str(header or "").strip() for header in headers]
+    if "排名" not in normalized_headers:
+        return
+
+    label = f"{title}｜{block_label}" if block_label else title
+    group_headers = [
+        header for header in ("資料範圍", "統計日期", "統計天數", "排名類型")
+        if header in normalized_headers
+    ]
+    if "權證代號" in normalized_headers and "買進分點" in normalized_headers:
+        identity_candidates = ["權證代號"]
+    elif "標的股" in normalized_headers:
+        identity_candidates = ["標的股"]
+    elif "券商代號" in normalized_headers or "分點" in normalized_headers:
+        identity_candidates = [
+            header for header in ("券商代號", "分點")
+            if header in normalized_headers
+        ]
+    elif "權證代號" in normalized_headers:
+        identity_candidates = ["權證代號"]
+    else:
+        identity_candidates = []
+
+    if not identity_candidates:
+        raise RuntimeError(f"repair 排行表找不到排名標的欄：{label}")
+
+    grouped = {}
+    for row_no, record in enumerate(records, start=2):
+        rank = _repair_rank_integer(record.get("排名"))
+        group_key = tuple(
+            _normalize_result_key_value(header, record.get(header, ""))
+            for header in group_headers
+        )
+        identity = ""
+        identity_header = ""
+        for candidate in identity_candidates:
+            candidate_value = _normalize_result_key_value(candidate, record.get(candidate, ""))
+            if candidate_value:
+                identity = candidate_value
+                identity_header = candidate
+                break
+        if rank is None or not identity:
+            raise RuntimeError(
+                f"repair 排行表資料不完整：{label}｜區塊內第 {row_no} 列｜"
+                f"分組={group_key}｜排名={record.get('排名')!r}｜"
+                f"排名標的候選={identity_candidates}"
+            )
+        group = grouped.setdefault(group_key, {"ranks": [], "identities": set()})
+        if identity in group["identities"]:
+            raise RuntimeError(
+                f"repair 排行表標的重複：{label}｜分組={group_key}｜"
+                f"{identity_header}={identity}"
+            )
+        group["ranks"].append(rank)
+        group["identities"].add(identity)
+
+    for group_key, group in grouped.items():
+        ranks = group["ranks"]
+        expected_ranks = list(range(1, len(ranks) + 1))
+        if ranks != expected_ranks:
+            raise RuntimeError(
+                f"repair 排行不連續：{label}｜分組={group_key}｜"
+                f"實際={ranks}｜預期={expected_ranks}"
+            )
+
+
 def validate_repair_result_values(title, values):
     """在清空 Google Sheet 前，依工作表實際結構驗證 repair 輸出。
 
     完整修補採整張快照覆蓋，明細列不需要、也不應套用 daily upsert 的推測唯一鍵；
     同一分點與標的可能因方向、權證或明細類型不同而合法出現多列。
     只嚴格驗證不依業務猜測的結構條件，以及由「排名」欄明確表達的 1～N 語意。
-    寫入後另由逐格回讀驗證確保 Google Sheet 與 Excel 完全一致。
+
+    結構完全以本次內容判定，不再依工作表名稱假設「表頭一定在第 1 列」：
+    - 單一資料表：驗表頭、資料範圍欄、欄寬與排行語意。
+    - 多段式版面：逐區塊驗排行語意；含公式的區塊交由寫入後的逐格回讀驗證把關。
     """
     title = safe_worksheet_title(title)
     matrix = _trim_result_value_matrix(values)
     if not matrix:
         raise RuntimeError(f"repair 工作表沒有可寫入內容：{title}")
 
-    if not should_upsert_result_sheet(title):
+    if not should_upsert_result_sheet(title, matrix):
+        for block in _iter_result_header_blocks(matrix):
+            if block["has_formula"]:
+                continue
+            _validate_result_rank_block(
+                title,
+                block["headers"],
+                block["records"],
+                block_label=f"第 {block['header_row'] + 1} 列表頭",
+            )
         return matrix
-
-    header_row_idx = _find_simple_header_row(matrix)
-    if header_row_idx != 0:
-        raise RuntimeError(
-            f"repair 簡單表格的表頭不在第 1 列：{title}｜header_row={header_row_idx}"
-        )
 
     headers, records = _values_to_records(matrix, header_row_idx=0)
     normalized_headers = [str(header or "").strip() for header in headers]
@@ -5584,69 +5666,7 @@ def validate_repair_result_values(title, values):
         if not str(record.get("資料範圍", "") or "").strip():
             raise RuntimeError(f"repair 工作表資料範圍空白：{title}｜第 {row_no} 列")
 
-    # 欄位驅動的通用排行驗證：不綁工作表名稱，也不把名次上限寫死成 20。
-    # 有排名欄才檢查；依實際存在的統計維度分組，每組必須是 1～N。
-    if "排名" in normalized_headers:
-        group_headers = [
-            header for header in ("資料範圍", "統計日期", "統計天數", "排名類型")
-            if header in normalized_headers
-        ]
-        if "權證代號" in normalized_headers and "買進分點" in normalized_headers:
-            identity_candidates = ["權證代號"]
-        elif "標的股" in normalized_headers:
-            identity_candidates = ["標的股"]
-        elif "券商代號" in normalized_headers or "分點" in normalized_headers:
-            identity_candidates = [
-                header for header in ("券商代號", "分點")
-                if header in normalized_headers
-            ]
-        elif "權證代號" in normalized_headers:
-            identity_candidates = ["權證代號"]
-        else:
-            identity_candidates = []
-
-        if not identity_candidates:
-            raise RuntimeError(f"repair 排行表找不到排名標的欄：{title}")
-
-        grouped = {}
-        for row_no, record in enumerate(records, start=2):
-            rank = _repair_rank_integer(record.get("排名"))
-            group_key = tuple(
-                _normalize_result_key_value(header, record.get(header, ""))
-                for header in group_headers
-            )
-            identity = ""
-            identity_header = ""
-            for candidate in identity_candidates:
-                candidate_value = _normalize_result_key_value(candidate, record.get(candidate, ""))
-                if candidate_value:
-                    identity = candidate_value
-                    identity_header = candidate
-                    break
-            if rank is None or not identity:
-                raise RuntimeError(
-                    f"repair 排行表資料不完整：{title}｜第 {row_no} 列｜"
-                    f"分組={group_key}｜排名={record.get('排名')!r}｜"
-                    f"排名標的候選={identity_candidates}"
-                )
-            group = grouped.setdefault(group_key, {"ranks": [], "identities": set()})
-            if identity in group["identities"]:
-                raise RuntimeError(
-                    f"repair 排行表標的重複：{title}｜分組={group_key}｜"
-                    f"{identity_header}={identity}"
-                )
-            group["ranks"].append(rank)
-            group["identities"].add(identity)
-
-        for group_key, group in grouped.items():
-            ranks = group["ranks"]
-            expected_ranks = list(range(1, len(ranks) + 1))
-            if ranks != expected_ranks:
-                raise RuntimeError(
-                    f"repair 排行不連續：{title}｜分組={group_key}｜"
-                    f"實際={ranks}｜預期={expected_ranks}"
-                )
-
+    _validate_result_rank_block(title, headers, records)
     return matrix
 
 
@@ -5708,7 +5728,8 @@ def overwrite_repair_result_sheet_from_excel(
     # write_values_to_worksheet 回傳的實際送出矩陣覆蓋此變數。
     written_values, _written_rows, _written_cols = prepare_gsheet_write_values(values)
     max_cols = max((len(row) for row in written_values), default=0)
-    simple_table = should_upsert_result_sheet(title)
+    # 結構以本次實際輸出判定；工作表改成多段式版面時會自動改走 Excel 版面覆蓋。
+    simple_table = should_upsert_result_sheet(title, values)
 
     def apply_repair_formats(failure_start=None):
         if failure_start is None:
@@ -5902,7 +5923,20 @@ def normalize_or_remove_deleted_broker_result_record(record):
     return rec
 
 
-def should_upsert_result_sheet(title):
+def should_upsert_result_sheet(title, values=None):
+    """
+    判斷工作表能否套用 upsert／唯一鍵／資料範圍欄的「單一簡單表格」處理。
+
+    修正前：完全依賴寫死的工作表名稱清單。只要某張表改成多段式版面
+    （例如近 7／14／21 日共識改成一張表放三個區塊），
+    就會在 validate_repair_result_values() 被判成「表頭不在第 1 列」而整個 repair 失敗。
+
+    修正後：
+    1. GSHEET_RESULT_OVERWRITE_TITLES 是明確的「永不 upsert」清單，
+       因為這些工作表的欄位位置被公式或下拉選單引用，插欄會壞掉。
+    2. 其餘工作表只要拿得到本次內容，一律以實際結構判斷；
+       名稱清單只在取不到內容時當預設值。
+    """
     title = safe_worksheet_title(title)
 
     if not GSHEET_RESULT_UPSERT_ENABLED:
@@ -5911,10 +5945,10 @@ def should_upsert_result_sheet(title):
     if title in GSHEET_RESULT_OVERWRITE_TITLES:
         return False
 
-    if title in GSHEET_RESULT_UPSERT_TITLES:
-        return True
+    if values is not None:
+        return is_simple_result_table_values(values)
 
-    return False
+    return title in GSHEET_RESULT_UPSERT_TITLES
 
 
 def read_existing_worksheet_values(title):
@@ -5930,25 +5964,131 @@ def read_existing_worksheet_values(title):
         return []
 
 
+# 結果工作表表頭辨識用的關鍵欄名，全程式只有這一份定義。
+# 表頭列偵測、多段式版面切塊與「是否為單一簡單表格」都共用它，
+# 因此新增或改版報表時不需要再維護「哪張表是簡單表格」的名稱清單。
+RESULT_HEADER_KEY_COLUMNS = {
+    "統計日期", "事件類型", "日期", "排名", "權證代號", "標的股", "分點",
+    "買進金額", "賣出金額", "淨買超成本", "排名類型",
+}
+
+
+def _row_is_result_header(row):
+    """以欄名關鍵字判斷這一列是不是表頭；採完整欄名比對，不做子字串比對。"""
+    cells = {str(x).strip() for x in (row or [])}
+    return len(cells & RESULT_HEADER_KEY_COLUMNS) >= 2
+
+
 def _find_simple_header_row(values):
     if not values:
         return None
 
     scan_limit = min(len(values), 10)
-    key_headers = {
-        "統計日期", "事件類型", "日期", "排名", "權證代號", "標的股", "分點",
-        "買進金額", "賣出金額", "淨買超成本", "排名類型",
-    }
 
     for idx in range(scan_limit):
         row = [str(x).strip() for x in values[idx]]
         non_empty = [x for x in row if x]
         if not non_empty:
             continue
-        if len(set(row) & key_headers) >= 2:
+        if _row_is_result_header(row):
             return idx
 
     return 0 if values and any(str(x).strip() for x in values[0]) else None
+
+
+def is_simple_result_table_values(values):
+    """
+    依「本次實際內容」判斷這份結果是不是表頭在第 1 列的單一資料表。
+
+    只有單一資料表才適用 upsert 唯一鍵、資料範圍欄與安全表格樣式；
+    下列任一情況都視為版面型工作表，改以原 Excel 版面完整覆蓋：
+    1. 第 1 列不是表頭（合併標題列、副標題列）。
+    2. 表頭有空洞、重複欄名，或看不出是結果表表頭。
+    3. 同一張工作表後面又出現相同表頭（多段式報表）。
+    4. 資料列超出表頭欄數（同一列還有其他區塊）。
+    5. 任何儲存格是公式（欄位位置被其他公式或下拉選單引用，不可插欄）。
+
+    這樣工作表改版面時只要改產表函式即可，不必再同步改任何名稱清單。
+    """
+    matrix = _trim_result_value_matrix(values)
+    if not matrix:
+        return False
+
+    headers = [str(header or "").strip() for header in matrix[0]]
+    while headers and headers[-1] == "":
+        headers.pop()
+
+    if len(headers) < 2 or any(header == "" for header in headers):
+        return False
+    if len(set(headers)) != len(headers):
+        return False
+    if not _row_is_result_header(headers):
+        return False
+
+    header_width = len(headers)
+    header_key = tuple(headers)
+    for row in matrix[1:]:
+        cells = [str(value or "").strip() for value in row]
+        if any(cells[header_width:]):
+            return False
+        if tuple((cells + [""] * header_width)[:header_width]) == header_key:
+            return False
+
+    for row in matrix:
+        for value in row:
+            if isinstance(value, str) and value.strip().startswith("="):
+                return False
+
+    return True
+
+
+def _iter_result_header_blocks(values):
+    """
+    把工作表切成一到多個「表頭 + 資料列」區塊。
+
+    多段式報表（例如同一張表放近 7／14／21 日三組排名）也能逐段取出，
+    驗證時不需要為每張表寫死版面規則。
+
+    區塊內只保留「至少兩欄有值」的列當資料列；合併標題列、副標題列與
+    「無符合排名資料」這類提示列只有一欄有值，會被排除在資料列之外。
+    """
+    matrix = _trim_result_value_matrix(values)
+    if not matrix:
+        return []
+
+    header_rows = [
+        idx for idx, row in enumerate(matrix)
+        if any(str(x).strip() for x in row) and _row_is_result_header(row)
+    ]
+
+    blocks = []
+    for order, header_row in enumerate(header_rows):
+        end_row = (
+            header_rows[order + 1]
+            if order + 1 < len(header_rows)
+            else len(matrix)
+        )
+        block_values = matrix[header_row:end_row]
+        data_values = [block_values[0]] + [
+            row for row in block_values[1:]
+            if sum(1 for value in row if str(value or "").strip()) >= 2
+        ]
+        headers, records = _values_to_records(data_values, header_row_idx=0)
+        if not headers:
+            continue
+        has_formula = any(
+            isinstance(value, str) and value.strip().startswith("=")
+            for row in block_values
+            for value in row
+        )
+        blocks.append({
+            "header_row": header_row,
+            "headers": headers,
+            "records": records,
+            "has_formula": has_formula,
+        })
+
+    return blocks
 
 
 def _values_to_records(values, header_row_idx=0, default_scope=None):
@@ -6795,12 +6935,8 @@ def merge_result_values_for_gsheet(
     - 舊資料若沒有「資料範圍」，會保留為「未標記舊資料」。
     - 每日賣出明細與 TOP15 快取超過主表保留日期的資料，會先封存。
     """
-    if not should_upsert_result_sheet(title):
-        return new_values
-
-    header_row_idx = _find_simple_header_row(new_values)
-    if header_row_idx is None or header_row_idx != 0:
-        # 多段式報表仍維持原本覆蓋模式，避免破壞版面與公式。
+    # 多段式報表與含公式的版面型工作表維持原本覆蓋模式，避免破壞版面與公式。
+    if not should_upsert_result_sheet(title, new_values):
         return new_values
 
     current_scope = str(data_scope or get_result_data_scope()).strip()
@@ -7751,12 +7887,12 @@ def repair_existing_worksheet_security_identities(ws, title, existing_values):
 
 
 def _prepare_incremental_result_values(title, new_values, data_scope=None, extra_scope_values=None):
-    """整理本次可增量插入的簡單表格資料，不讀取或覆寫既有工作表。"""
-    if not should_upsert_result_sheet(title):
-        return None
+    """整理本次可增量插入的簡單表格資料，不讀取或覆寫既有工作表。
 
-    header_row_idx = _find_simple_header_row(new_values)
-    if header_row_idx != 0:
+    是否為簡單表格改由本次內容判定；多段式版面或含公式的工作表會回傳 None，
+    由呼叫端沿用原 Excel 版面完整覆蓋。
+    """
+    if not should_upsert_result_sheet(title, new_values):
         return None
 
     current_scope = str(data_scope or get_result_data_scope()).strip()
@@ -8935,7 +9071,7 @@ def upload_excel_to_google_sheet(
         # 最高優先級安全門：既有 Google Sheet 一律不 clear、不 delete_rows、不 resize 縮小。
         # 簡單資料表僅插入尚未存在的唯一鍵；版面型工作表保持原狀。
         if GSHEET_PRESERVE_ALL_HISTORY and not created:
-            if should_upsert_result_sheet(title):
+            if should_upsert_result_sheet(title, raw_values):
                 inserted = insert_missing_result_rows_to_worksheet(
                     gws,
                     title,
@@ -8988,7 +9124,7 @@ def upload_excel_to_google_sheet(
             values = normalize_result_values_for_comma_numbers(values)
             if not write_values_to_worksheet(gws, values):
                 raise RuntimeError(f"第一次建立後寫入失敗：{title}")
-            if should_upsert_result_sheet(title):
+            if should_upsert_result_sheet(title, raw_values):
                 clear_all_number_formats_for_written_range(gws, values=values)
                 apply_safe_result_table_style_to_gsheet(gws, values=values)
                 apply_text_format_to_gsheet(gws, values)
