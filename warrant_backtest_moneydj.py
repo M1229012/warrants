@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FULLSYNC-20260801-R12"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-FLEXSCHEMA-20260801-R13"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -5536,12 +5536,12 @@ def _repair_rank_integer(value):
 
 
 def validate_repair_result_values(title, values):
-    """在清空 Google Sheet 前驗證 repair 工作表的結構與唯一性。
+    """在清空 Google Sheet 前，依工作表實際結構驗證 repair 輸出。
 
-    近兩月排行屬於「當次快照」，每個資料範圍的排名必須從 1 連續到 N，
-    且最多 20 名；這會直接攔截舊增量策略造成的 20、1、19 等殘缺排行。
-    其他簡單表格則檢查表頭、資料範圍及既有 upsert 唯一鍵，避免同類問題
-    在 ABCDE、TOP15、每日賣出或快取表中再次發生。
+    完整修補採整張快照覆蓋，明細列不需要、也不應套用 daily upsert 的推測唯一鍵；
+    同一分點與標的可能因方向、權證或明細類型不同而合法出現多列。
+    只嚴格驗證不依業務猜測的結構條件，以及由「排名」欄明確表達的 1～N 語意。
+    寫入後另由逐格回讀驗證確保 Google Sheet 與 Excel 完全一致。
     """
     title = safe_worksheet_title(title)
     matrix = _trim_result_value_matrix(values)
@@ -5573,60 +5573,78 @@ def validate_repair_result_values(title, values):
     if "資料範圍" not in normalized_headers:
         raise RuntimeError(f"repair 工作表缺少資料範圍欄：{title}")
 
-    key_columns = _sheet_upsert_key_columns(title, normalized_headers)
-    if key_columns:
-        seen_keys = {}
-        for row_no, record in enumerate(records, start=2):
-            key = _record_key(record, key_columns)
-            if key in seen_keys:
-                raise RuntimeError(
-                    f"repair 工作表唯一鍵重複：{title}｜第 {seen_keys[key]}、{row_no} 列｜"
-                    f"欄位={','.join(key_columns)}｜key={key}"
-                )
-            seen_keys[key] = row_no
-
-    ranking_identity_header = {
-        safe_worksheet_title("近兩月買賣金額排行"): "權證代號",
-        safe_worksheet_title("近兩月分點數排行"): "標的股",
-    }.get(title)
-    if ranking_identity_header:
-        required_headers = {"資料範圍", "排名", ranking_identity_header}
-        missing_headers = sorted(required_headers - set(normalized_headers))
-        if missing_headers:
+    header_width = len(normalized_headers)
+    for row_no, row in enumerate(matrix[1:], start=2):
+        if any(str(value or "").strip() for value in row[header_width:]):
             raise RuntimeError(
-                f"repair 排行表缺少必要欄位：{title}｜{', '.join(missing_headers)}"
+                f"repair 工作表資料超出表頭欄數：{title}｜第 {row_no} 列｜"
+                f"表頭={header_width} 欄｜資料={len(row)} 欄"
             )
+    for row_no, record in enumerate(records, start=2):
+        if not str(record.get("資料範圍", "") or "").strip():
+            raise RuntimeError(f"repair 工作表資料範圍空白：{title}｜第 {row_no} 列")
+
+    # 欄位驅動的通用排行驗證：不綁工作表名稱，也不把名次上限寫死成 20。
+    # 有排名欄才檢查；依實際存在的統計維度分組，每組必須是 1～N。
+    if "排名" in normalized_headers:
+        group_headers = [
+            header for header in ("資料範圍", "統計日期", "統計天數", "排名類型")
+            if header in normalized_headers
+        ]
+        if "權證代號" in normalized_headers and "買進分點" in normalized_headers:
+            identity_candidates = ["權證代號"]
+        elif "標的股" in normalized_headers:
+            identity_candidates = ["標的股"]
+        elif "券商代號" in normalized_headers or "分點" in normalized_headers:
+            identity_candidates = [
+                header for header in ("券商代號", "分點")
+                if header in normalized_headers
+            ]
+        elif "權證代號" in normalized_headers:
+            identity_candidates = ["權證代號"]
+        else:
+            identity_candidates = []
+
+        if not identity_candidates:
+            raise RuntimeError(f"repair 排行表找不到排名標的欄：{title}")
 
         grouped = {}
         for row_no, record in enumerate(records, start=2):
-            scope = str(record.get("資料範圍", "") or "").strip()
             rank = _repair_rank_integer(record.get("排名"))
-            identity = _normalize_result_key_value(
-                ranking_identity_header,
-                record.get(ranking_identity_header, ""),
+            group_key = tuple(
+                _normalize_result_key_value(header, record.get(header, ""))
+                for header in group_headers
             )
-            if not scope or rank is None or not identity:
+            identity = ""
+            identity_header = ""
+            for candidate in identity_candidates:
+                candidate_value = _normalize_result_key_value(candidate, record.get(candidate, ""))
+                if candidate_value:
+                    identity = candidate_value
+                    identity_header = candidate
+                    break
+            if rank is None or not identity:
                 raise RuntimeError(
                     f"repair 排行表資料不完整：{title}｜第 {row_no} 列｜"
-                    f"資料範圍={scope!r}｜排名={record.get('排名')!r}｜"
-                    f"{ranking_identity_header}={record.get(ranking_identity_header)!r}"
+                    f"分組={group_key}｜排名={record.get('排名')!r}｜"
+                    f"排名標的候選={identity_candidates}"
                 )
-            group = grouped.setdefault(scope, {"ranks": [], "identities": set()})
+            group = grouped.setdefault(group_key, {"ranks": [], "identities": set()})
             if identity in group["identities"]:
                 raise RuntimeError(
-                    f"repair 排行表標的重複：{title}｜資料範圍={scope}｜"
-                    f"{ranking_identity_header}={identity}"
+                    f"repair 排行表標的重複：{title}｜分組={group_key}｜"
+                    f"{identity_header}={identity}"
                 )
             group["ranks"].append(rank)
             group["identities"].add(identity)
 
-        for scope, group in grouped.items():
+        for group_key, group in grouped.items():
             ranks = group["ranks"]
             expected_ranks = list(range(1, len(ranks) + 1))
-            if len(ranks) > 20 or ranks != expected_ranks:
+            if ranks != expected_ranks:
                 raise RuntimeError(
-                    f"repair 排行不連續：{title}｜資料範圍={scope}｜"
-                    f"實際={ranks}｜預期={expected_ranks}｜上限=20"
+                    f"repair 排行不連續：{title}｜分組={group_key}｜"
+                    f"實際={ranks}｜預期={expected_ranks}"
                 )
 
     return matrix
@@ -6006,7 +6024,8 @@ def _sheet_upsert_key_columns(title, headers):
         return keep(["資料範圍", "統計日期", "統計天數", "排名類型", "標的股"])
 
     if title == BROKER_10D_DETAIL_SHEET:
-        return keep(["資料範圍", "統計日期", "分點", "券商代號", "標的股"])
+        # 同一分點與標的可同時有買超、賣超兩列；方向是明細身分的一部分。
+        return keep(["資料範圍", "統計日期", "分點", "券商代號", "標的股", "買賣方向"])
 
     if title == BROKER_10D_WINRATE_RANK_SHEET:
         return keep(["資料範圍", "統計日期", "分點", "券商代號"])
@@ -8800,7 +8819,8 @@ def upload_excel_to_google_sheet(
             )
 
         # 先驗證全部必要工作表，再允許任何一張 Google Sheet 被清空。
-        # 如排行不連續、表頭錯位或唯一鍵重複，本次 repair 會在遠端資料未變更前失敗。
+        # 如排行不連續、表頭錯位、資料超出表頭或資料範圍缺失，
+        # 本次 repair 會在遠端資料未變更前失敗；一般明細不以推測唯一鍵攔截。
         for title in sorted(repair_expected_overwrites):
             ws_xlsx = workbook_map[title]
             raw_values = worksheet_values_for_gsheet(ws_xlsx)
