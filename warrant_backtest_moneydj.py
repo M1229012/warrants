@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R16"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R17"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -6201,7 +6201,8 @@ def _sheet_upsert_key_columns(title, headers):
         return keep(["資料範圍", "日期", "分點", "券商代號", "標的股", "權證代號"])
 
     if title == "近兩月買賣金額排行":
-        return keep(["資料範圍", "權證代號", "買進分點"])
+        # 排名單位已改為標的股：同一資料範圍下每檔標的只會有一列。
+        return keep(["資料範圍", "標的股"])
 
     if title == "近兩月分點數排行":
         return keep(["資料範圍", "標的股", "買進分點清單"])
@@ -19167,14 +19168,21 @@ def collect_recent_trade_date_sets(items, cutoff_dt):
     return last_5_dates, last_20_dates
 
 def write_recent_warrant_amount_ranking_sheet(wb, items):
+    """
+    近兩月買賣金額排行：以「標的股」為排名單位。
+
+    同一標的底下所有認購權證先完整合計，再依淨買進金額排序取前 20 名，
+    因此同一檔標的只會出現一次；個別權證改列在「權證清單」欄保留明細。
+    這與近兩月分點數排行、近7／14／21 日共識與券商查詢的排名單位一致。
+    """
     ws = wb.create_sheet("近兩月買賣金額排行")
 
     headers = [
         "排名",
-        "權證代號",
-        "權證名稱",
         "標的股",
         "標的名稱",
+        "權證檔數",
+        "權證清單",
         "買進金額",
         "賣出金額",
         "淨買進金額",
@@ -19218,13 +19226,14 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
             if buy_amount <= 0 and sell_amount <= 0:
                 continue
 
-            key = (warrant_code, warrant_name, underlying_code, underlying_name)
+            # 排名單位是標的股：同一標的底下所有權證合計成一筆。
+            key = normalize_underlying_code_for_group(underlying_code) or str(underlying_code).strip()
+            if not key:
+                continue
 
             if key not in ranking_map:
                 ranking_map[key] = {
-                    "權證代號": warrant_code,
-                    "權證名稱": warrant_name,
-                    "標的股": underlying_code,
+                    "標的股": key,
                     "標的名稱": underlying_name,
                     "買進金額": 0,
                     "賣出金額": 0,
@@ -19233,11 +19242,18 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
                     "近5日淨買進金額": 0,
                     "分點買進金額": {},
                     "分點賣出金額": {},
+                    "權證買進金額": {},
+                    "權證賣出金額": {},
+                    "權證名稱": {},
                     "最近買進日": "",
                 }
 
             rec = ranking_map[key]
+            if not rec["標的名稱"] and underlying_name:
+                rec["標的名稱"] = underlying_name
+
             net_amount = buy_amount - sell_amount
+            warrant_key = normalize_warrant_code_for_unique(warrant_code) or str(warrant_code).strip()
 
             rec["買進金額"] += buy_amount
             rec["賣出金額"] += sell_amount
@@ -19248,6 +19264,13 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
 
             if trade_date_str in last_5_dates:
                 rec["近5日淨買進金額"] += net_amount
+
+            if warrant_key:
+                rec["權證名稱"].setdefault(warrant_key, warrant_name)
+                if buy_amount > 0:
+                    rec["權證買進金額"][warrant_key] = rec["權證買進金額"].get(warrant_key, 0) + buy_amount
+                if sell_amount > 0:
+                    rec["權證賣出金額"][warrant_key] = rec["權證賣出金額"].get(warrant_key, 0) + sell_amount
 
             if buy_amount > 0:
                 rec["分點買進金額"][broker_label] = rec["分點買進金額"].get(broker_label, 0) + buy_amount
@@ -19289,12 +19312,30 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
         else:
             broker_text = "-"
 
+        warrant_net_rows = []
+        for warrant_code, warrant_buy_amount in rec["權證買進金額"].items():
+            warrant_sell_amount = rec["權證賣出金額"].get(warrant_code, 0)
+            warrant_net_amount = warrant_buy_amount - warrant_sell_amount
+            if warrant_net_amount > 0:
+                warrant_net_rows.append((warrant_code, warrant_net_amount))
+
+        warrant_net_rows = sorted(warrant_net_rows, key=lambda x: x[1], reverse=True)
+
+        if warrant_net_rows:
+            warrant_text = "；".join([
+                f"{format_warrant_identity_label(code, rec['權證名稱'].get(code, ''))}"
+                f"({fmt_amount(amount)})"
+                for code, amount in warrant_net_rows
+            ])
+        else:
+            warrant_text = "-"
+
         ws.append([
             rank,
-            rec["權證代號"],
-            rec["權證名稱"],
             rec["標的股"],
             rec["標的名稱"] or "-",
+            len(warrant_net_rows),
+            warrant_text,
             fmt_amount(rec["買進金額"]),
             fmt_amount(rec["賣出金額"]),
             fmt_amount(rec["淨買進金額"]),
@@ -19306,7 +19347,7 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
             rec["最近買進日"] or "-",
         ])
 
-    col_widths = [8, 12, 24, 10, 12, 16, 16, 18, 18, 18, 12, 12, 70, 14]
+    col_widths = [8, 10, 12, 10, 70, 16, 16, 18, 18, 18, 12, 12, 70, 14]
 
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
