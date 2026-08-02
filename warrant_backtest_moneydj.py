@@ -70,7 +70,7 @@ if hasattr(time, "tzset"):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260801-R15"
+PROGRAM_BUILD_ID = "HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R16"
 
 # 權證／標的身分配對防錯：
 # 1. 標的名稱永遠以 TaiwanStockInfo 的「股號→股名」主檔為準。
@@ -4953,7 +4953,7 @@ def normalize_formula_for_gsheet(value):
     return value
 
 
-def apply_excel_style_to_gsheet(ws_xlsx, gws):
+def apply_excel_style_to_gsheet(ws_xlsx, gws, values=None):
     """
     將 openpyxl 產生的 Excel 樣式轉成 Google Sheets 格式。
 
@@ -4967,6 +4967,12 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
 
     Google Sheets API 與 Excel 格式模型不同，因此外框只保留主要視覺效果，
     但 A/B/C/D/E 的紅綠藍橘狀態色、標頭色與查詢頁互動功能會完整保留。
+
+    重要：Google Sheet 的格線大小是依「實際寫入的 values」設定的，
+    而 openpyxl 的 max_row／max_column 可能更大（例如合併標題列撐出的空白欄、
+    為公式溢出保留的空白列）。若直接用 Excel 尺寸送格式請求，
+    會出現 "exceeds grid limits" 或 "column doesn't exist" 而讓整張表同步失敗。
+    因此傳入 values 時一律以實際寫入尺寸為上限，超出的範圍直接裁掉或略過。
     """
     if gws is None:
         return
@@ -4974,7 +4980,18 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
     sheet_id = int(gws.id)
     requests = []
 
+    max_row_limit = max(int(getattr(ws_xlsx, "max_row", 1) or 1), 1)
+    max_col_limit = max(int(getattr(ws_xlsx, "max_column", 1) or 1), 1)
+    if values:
+        max_row_limit = max(min(max_row_limit, len(values)), 1)
+        max_col_limit = max(
+            min(max_col_limit, max((len(row) for row in values), default=1)),
+            1,
+        )
+
     frozen_rows, frozen_cols = _openpyxl_freeze_to_grid_properties(ws_xlsx)
+    frozen_rows = min(frozen_rows, max(max_row_limit - 1, 0))
+    frozen_cols = min(frozen_cols, max(max_col_limit - 1, 0))
 
     requests.append({
         "updateSheetProperties": {
@@ -4999,17 +5016,25 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
         }
     })
 
-    # 合併儲存格。
+    # 合併儲存格：超出實際格線的部分先裁掉；裁完不足兩格就整個略過。
     for merged_range in ws_xlsx.merged_cells.ranges:
         try:
+            start_row = merged_range.min_row
+            end_row = min(merged_range.max_row, max_row_limit)
+            start_col = merged_range.min_col
+            end_col = min(merged_range.max_col, max_col_limit)
+            if start_row > max_row_limit or start_col > max_col_limit:
+                continue
+            if (end_row - start_row + 1) * (end_col - start_col + 1) < 2:
+                continue
             requests.append({
                 "mergeCells": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": merged_range.min_row - 1,
-                        "endRowIndex": merged_range.max_row,
-                        "startColumnIndex": merged_range.min_col - 1,
-                        "endColumnIndex": merged_range.max_col,
+                        "startRowIndex": start_row - 1,
+                        "endRowIndex": end_row,
+                        "startColumnIndex": start_col - 1,
+                        "endColumnIndex": end_col,
                     },
                     "mergeType": "MERGE_ALL",
                 }
@@ -5018,7 +5043,7 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
             pass
 
     # 欄寬。
-    for col_idx in range(1, ws_xlsx.max_column + 1):
+    for col_idx in range(1, max_col_limit + 1):
         letter = get_column_letter(col_idx)
         width = ws_xlsx.column_dimensions[letter].width
         pixel_size = _excel_width_to_pixels(width) if width else None
@@ -5040,7 +5065,7 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
             })
 
     # 列高。
-    for row_idx in range(1, ws_xlsx.max_row + 1):
+    for row_idx in range(1, max_row_limit + 1):
         height = ws_xlsx.row_dimensions[row_idx].height
         pixel_size = _excel_height_to_pixels(height) if height else None
 
@@ -5063,13 +5088,13 @@ def apply_excel_style_to_gsheet(ws_xlsx, gws):
     # 逐列壓縮相同格式的連續儲存格，減少 batchUpdate 請求數量。
     import json as _json
 
-    for row_idx in range(1, ws_xlsx.max_row + 1):
+    for row_idx in range(1, max_row_limit + 1):
         run_start = None
         run_fmt = None
         run_key = None
 
-        for col_idx in range(1, ws_xlsx.max_column + 2):
-            if col_idx <= ws_xlsx.max_column:
+        for col_idx in range(1, max_col_limit + 2):
+            if col_idx <= max_col_limit:
                 cell = ws_xlsx.cell(row_idx, col_idx)
                 fmt = _cell_gsheet_format(cell)
                 key = _json.dumps(fmt, sort_keys=True, ensure_ascii=False) if fmt else None
@@ -5601,6 +5626,11 @@ def validate_repair_result_values(title, values):
 
     只有「會讓 Google Sheet 被清空後寫入垃圾」的結構問題才中斷本輪 repair；
     純呈現層的排名順序問題一律只警告，避免整輪一小時多的計算白跑。
+
+    驗證只在「去除尾端空白列欄」的複本上進行，回傳的一定是原始 values：
+    查詢頁刻意保留的空白列是給 FILTER 公式溢出用的，
+    合併標題列撐出的空白欄也是版面的一部分，兩者都不能被裁掉，
+    否則 Google Sheet 格線會小於 Excel 版面，導致公式無法展開與格式套用越界。
     """
     title = safe_worksheet_title(title)
     matrix = _trim_result_value_matrix(values)
@@ -5617,7 +5647,7 @@ def validate_repair_result_values(title, values):
                 block["records"],
                 block_label=f"第 {block['header_row'] + 1} 列表頭",
             )
-        return matrix
+        return values
 
     headers, records = _values_to_records(matrix, header_row_idx=0)
     normalized_headers = [str(header or "").strip() for header in headers]
@@ -5647,7 +5677,7 @@ def validate_repair_result_values(title, values):
             raise RuntimeError(f"repair 工作表資料範圍空白：{title}｜第 {row_no} 列")
 
     _check_result_rank_sequence(title, headers, records)
-    return matrix
+    return values
 
 
 def prepare_repair_full_overwrite_values(
@@ -5722,7 +5752,8 @@ def overwrite_repair_result_sheet_from_excel(
             apply_text_format_to_gsheet(gws, written_values)
         else:
             # 查詢頁、勝率頁、狀態頁與說明頁保留 Excel 的版面、公式及下拉選單。
-            apply_excel_style_to_gsheet(ws_xlsx, gws)
+            # 一定要傳實際寫入矩陣，格式範圍才不會超出 Google Sheet 格線。
+            apply_excel_style_to_gsheet(ws_xlsx, gws, values=written_values)
             if title in GSHEET_REPAIR_OVERWRITE_TITLES:
                 # 欄位曾增刪或位移時，Excel 樣式／Google Sheet 舊格式都可能
                 # 套到錯誤欄位。每次 repair 都先清除本次資料範圍的
@@ -5852,7 +5883,8 @@ def normalize_or_remove_deleted_broker_result_record(record):
     規則：
     1. 有「分點／券商代號」的資料，若該分點已從目前設定移除，整列刪除。
     2. 若只是分點標籤改名，但券商代號仍存在，自動改成目前的新標籤。
-    3. 「買進分點」為單一分點欄位時，也會套用相同清理。
+    3. 「買進分點」只有在整格剛好是單一分點名稱時才套用相同清理；
+       彙總清單格式（含分隔符或金額括號）一律原樣保留，不刪列也不改寫。
     4. 沒有任何分點識別欄位的彙總資料保持不變。
     """
     rec = dict(record)
@@ -5893,6 +5925,17 @@ def normalize_or_remove_deleted_broker_result_record(record):
         strip_gsheet_text_prefix(rec.get("買進分點", ""))
     ).strip()
     if buy_broker_label:
+        # 「買進分點」在近兩月買賣金額排行是彙總清單欄，
+        # 內容是「分點A(金額)；分點B(金額)…」，不是單一分點識別。
+        # 舊版把它當單一分點解析：多分點的列會因為同時命中多個 pattern
+        # 而被整列刪除，單分點的列則會被改寫成純分點名稱而丟掉金額。
+        # 因此只有「整格剛好就是一個有效分點名稱」時才做失效分點過濾；
+        # 一旦出現分隔符或括號等彙總格式，整列原樣保留。
+        if buy_broker_label in label_to_code:
+            return rec
+        if re.search(r"[；;、,\n\r()（）]", buy_broker_label):
+            return rec
+
         canonical_label = _resolve_active_broker_label(buy_broker_label, scope=scope)
         if not canonical_label:
             return None
@@ -9122,7 +9165,7 @@ def upload_excel_to_google_sheet(
                 apply_safe_result_table_style_to_gsheet(gws, values=values)
                 apply_text_format_to_gsheet(gws, values)
             else:
-                apply_excel_style_to_gsheet(ws_xlsx, gws)
+                apply_excel_style_to_gsheet(ws_xlsx, gws, values=values)
             apply_comma_number_format_to_gsheet(ws_xlsx, gws, values=values)
             apply_date_format_to_gsheet(ws_xlsx, gws, values=values)
             apply_header_widths_to_gsheet(gws, values=values)
