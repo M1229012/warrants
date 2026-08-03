@@ -410,14 +410,60 @@ PATTERN_LOOKBACK = max(int(os.getenv("PATTERN_LOOKBACK", "60")), 20)
 PATTERN_MAX_MISSING_DAYS = max(int(os.getenv("PATTERN_MAX_MISSING_DAYS", "5")), 0)
 PATTERN_REFRESH_FULL_WINDOW = os.getenv("PATTERN_REFRESH_FULL_WINDOW", "1").strip().lower() not in ("0", "false", "no")
 
-PATTERN_HIGH_TOLERANCE = float(os.getenv("PATTERN_HIGH_TOLERANCE", "0.98"))
-PATTERN_SUPPORT_UPPER = float(os.getenv("PATTERN_SUPPORT_UPPER", "1.03"))
-PATTERN_WEAK_THRESHOLD = float(os.getenv("PATTERN_WEAK_THRESHOLD", "0.97"))
 PATTERN_MA_SLOPE_DAYS = max(int(os.getenv("PATTERN_MA_SLOPE_DAYS", "5")), 1)
-PATTERN_MA_HISTORY_BUFFER_DAYS = 20 + PATTERN_MA_SLOPE_DAYS
 
-PATTERN_PROFILE_BIN_PCT = float(os.getenv("PATTERN_PROFILE_BIN_PCT", "0.01"))
-PATTERN_PROFILE_WEIGHT = os.getenv("PATTERN_PROFILE_WEIGHT", "Trading_money").strip() or "Trading_money"
+# 門檻一律用「波動自適應帶寬 band」表示；band = 近 N 日日報酬標準差，夾在上下限之間。
+# 固定百分比門檻（舊版 0.98／1.03／0.97）對低波動股過鬆、對高波動股過緊，
+# 改用 band 之後不同波動族群的型態才有可比性。
+PATTERN_BAND_DAYS = max(int(os.getenv("PATTERN_BAND_DAYS", "20")), 5)
+PATTERN_BAND_MIN = max(float(os.getenv("PATTERN_BAND_MIN", "0.01")), 0.0001)
+PATTERN_BAND_MAX = max(float(os.getenv("PATTERN_BAND_MAX", "0.05")), PATTERN_BAND_MIN)
+
+# 突：阻力錨點 = max(近 N 日最高收盤, 第一大量區上緣)。
+# 舊版用「60 日最高收盤 × 0.98」當唯一錨點，做過頭的股票打底翻揚整段都會被判成「盤」。
+PATTERN_BREAKOUT_RANGE_DAYS = max(int(os.getenv("PATTERN_BREAKOUT_RANGE_DAYS", "20")), 5)
+PATTERN_BREAKOUT_BAND_MULT = max(float(os.getenv("PATTERN_BREAKOUT_BAND_MULT", "0.5")), 0.0)
+PATTERN_BREAKOUT_VOLUME_RATIO = max(float(os.getenv("PATTERN_BREAKOUT_VOLUME_RATIO", "1.5")), 0.0)
+# 量能未達門檻時，單日強幅度（>= N × band）可替代量能確認，避免漏掉無量急拉的起漲。
+PATTERN_BREAKOUT_SURGE_BAND_MULT = max(float(os.getenv("PATTERN_BREAKOUT_SURGE_BAND_MULT", "2.0")), 0.0)
+
+# 站：必須先在 MA20 下方待過一段時間，避免均線附近來回震盪反覆觸發。
+PATTERN_CROSS_BAND_MULT = max(float(os.getenv("PATTERN_CROSS_BAND_MULT", "0.25")), 0.0)
+PATTERN_CROSS_LOOKBACK_DAYS = max(int(os.getenv("PATTERN_CROSS_LOOKBACK_DAYS", "20")), 5)
+PATTERN_CROSS_MIN_BELOW_DAYS = max(int(os.getenv("PATTERN_CROSS_MIN_BELOW_DAYS", "5")), 1)
+
+# 撐：回檔 → 觸及支撐區 → 守住 → 收高於昨收，四段都成立才算支撐事件（舊版只判「位置」）。
+# 「收高於昨收」是止跌回升，不是紅K（close > open）；理由見 _pattern_classify_window。
+PATTERN_SUPPORT_TOUCH_DAYS = max(int(os.getenv("PATTERN_SUPPORT_TOUCH_DAYS", "3")), 1)
+PATTERN_SUPPORT_PULLBACK_DAYS = max(int(os.getenv("PATTERN_SUPPORT_PULLBACK_DAYS", "5")), 2)
+PATTERN_SUPPORT_PULLBACK_BAND_MULT = max(float(os.getenv("PATTERN_SUPPORT_PULLBACK_BAND_MULT", "0.5")), 0.0)
+PATTERN_SUPPORT_BAND_MULT = max(float(os.getenv("PATTERN_SUPPORT_BAND_MULT", "1.0")), 0.0)
+
+# 強：多頭排列 + 位置需在區間上緣，排除大跌後短線反彈造成的假強勢。
+PATTERN_STRONG_MIN_POSITION = min(max(float(os.getenv("PATTERN_STRONG_MIN_POSITION", "0.90")), 0.0), 1.0)
+
+# 弱：破線且均線下彎，或空頭排列（舊版只有單一價格條件，正常回檔就會被標弱）。
+PATTERN_WEAK_BAND_MULT = max(float(os.getenv("PATTERN_WEAK_BAND_MULT", "1.0")), 0.0)
+
+# 量峰／大量區：與週報 K 線價量累積圖 _calculate_weighted_volume_profile_stats 完全相同的算法
+# （n_bins 線性價格箱、每日量能按 下影線 0.2 / 實體 0.6 / 上影線 0.2 分配到箱中心）。
+# 舊版把整日成交金額壓在收盤價單一點上，算出來的量峰會與週報圖不一致。
+PATTERN_PROFILE_LOOKBACK = max(int(os.getenv("PATTERN_PROFILE_LOOKBACK", "70")), 20)
+PATTERN_PROFILE_BINS = max(int(os.getenv("PATTERN_PROFILE_BINS", "40")), 5)
+PATTERN_PROFILE_WEIGHT = os.getenv("PATTERN_PROFILE_WEIGHT", "Trading_Volume").strip() or "Trading_Volume"
+PATTERN_PROFILE_BODY_WEIGHT = max(float(os.getenv("PATTERN_PROFILE_BODY_WEIGHT", "0.6")), 0.0)
+PATTERN_PROFILE_SHADOW_WEIGHT = max(float(os.getenv("PATTERN_PROFILE_SHADOW_WEIGHT", "0.2")), 0.0)
+# adjusted：用還原 OHLC（跨除權息時比較正確）；raw：用原始 OHLC（與週報圖數字完全一致）。
+PATTERN_PROFILE_PRICE_BASE = (os.getenv("PATTERN_PROFILE_PRICE_BASE", "adjusted").strip().lower() or "adjusted")
+# 量區只用統計日之前的資料，避免統計日自己的爆量棒把壓力／支撐位推到當日價位。
+# 設 0 則與週報圖逐棒一致（週報圖的窗口含報告日）。
+PATTERN_PROFILE_EXCLUDE_TARGET_DAY = os.getenv(
+    "PATTERN_PROFILE_EXCLUDE_TARGET_DAY", "1"
+).strip().lower() not in ("0", "false", "no")
+
+# 量峰窗口比型態窗口長，歷史抓取與有效日檢查都要以較長者為準。
+PATTERN_HISTORY_SPAN = max(PATTERN_LOOKBACK, PATTERN_PROFILE_LOOKBACK)
+PATTERN_MA_HISTORY_BUFFER_DAYS = 20 + max(PATTERN_MA_SLOPE_DAYS, PATTERN_BAND_DAYS)
 
 PATTERN_PRICE_DATASET = os.getenv("PATTERN_PRICE_DATASET", "TaiwanStockPriceAdj").strip() or "TaiwanStockPriceAdj"
 PATTERN_REQUIRE_ADJUSTED_PRICE = os.getenv("PATTERN_REQUIRE_ADJUSTED_PRICE", "1").strip().lower() not in ("0", "false", "no")
@@ -453,6 +499,8 @@ PATTERN_AUDIT_FIELDS = [
     "型態還原收盤價", "型態原始收盤價",
     "型態MA5", "型態MA10", "型態MA20",
     "型態前59日高點", "型態量峰價", "型態橋接係數",
+    "型態量區下緣", "型態量區上緣", "型態第二量峰價",
+    "型態阻力錨點", "型態量能倍數", "型態波動帶寬",
     "型態公司行動狀態", "型態計算狀態", "型態錯誤原因",
 ]
 PATTERN_AUDIT_COLUMN_WIDTHS = [
@@ -460,6 +508,8 @@ PATTERN_AUDIT_COLUMN_WIDTHS = [
     14, 14,
     12, 12, 12,
     14, 14, 12,
+    14, 14, 14,
+    14, 12, 12,
     18, 20, 36,
 ]
 
@@ -3935,6 +3985,8 @@ def is_gsheet_decimal_number_header(header):
         "型態還原收盤價", "型態原始收盤價",
         "型態MA5", "型態MA10", "型態MA20",
         "型態前59日高點", "型態量峰價", "型態橋接係數",
+        "型態量區下緣", "型態量區上緣", "型態第二量峰價",
+        "型態阻力錨點", "型態量能倍數", "型態波動帶寬",
     ):
         return True
 
@@ -4351,9 +4403,12 @@ def _gsheet_pixel_width_for_header(header):
         return 105
     if header == "型態價格來源":
         return 145
-    if header in ("型態還原收盤價", "型態原始收盤價", "型態前59日高點", "型態量峰價"):
+    if header in (
+        "型態還原收盤價", "型態原始收盤價", "型態前59日高點", "型態量峰價",
+        "型態量區下緣", "型態量區上緣", "型態第二量峰價", "型態阻力錨點",
+    ):
         return 120
-    if header in ("型態MA5", "型態MA10", "型態MA20", "型態橋接係數"):
+    if header in ("型態MA5", "型態MA10", "型態MA20", "型態橋接係數", "型態量能倍數", "型態波動帶寬"):
         return 105
     if header == "型態公司行動狀態":
         return 150
@@ -15921,6 +15976,12 @@ def _pattern_empty_result(
         "型態前59日高點": "",
         "型態量峰價": "",
         "型態橋接係數": "",
+        "型態量區下緣": "",
+        "型態量區上緣": "",
+        "型態第二量峰價": "",
+        "型態阻力錨點": "",
+        "型態量能倍數": "",
+        "型態波動帶寬": "",
         "型態公司行動狀態": company_action_status,
         "型態計算狀態": status,
         "型態錯誤原因": str(reason or "").strip(),
@@ -16004,9 +16065,15 @@ def _pattern_numeric_series(series):
 
 
 def _pattern_normalize_price_dataframe(df, stock_code, *, adjusted):
-    """將 FinMind 原始／還原日價統一成 date、close、Trading_money。"""
+    """將 FinMind 原始／還原日價統一成 date、OHLC、Trading_Volume、Trading_money。
+
+    OHLC 與張數供價量累積圖量峰使用；缺欄位時留 NaN，之後以收盤價補（等同一字線），
+    只影響該日的量能分布寬度，不影響收盤價相關判定。
+    """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "close", "Trading_money"])
+        return pd.DataFrame(
+            columns=["date", "open", "high", "low", "close", "Trading_Volume", "Trading_money"]
+        )
 
     out = df.copy()
     stock_col = _pattern_find_column(out, ["stock_id", "stockid", "股票代號", "證券代號"])
@@ -16016,9 +16083,16 @@ def _pattern_normalize_price_dataframe(df, stock_code, *, adjusted):
 
     date_col = _pattern_find_column(out, ["date", "trade_date", "tradedate", "交易日期", "日期"])
     close_col = _pattern_find_column(out, ["close", "Close", "收盤價", "收盤"])
+    open_col = _pattern_find_column(out, ["open", "Open", "開盤價", "開盤"])
+    high_col = _pattern_find_column(out, ["max", "high", "High", "最高價", "最高"])
+    low_col = _pattern_find_column(out, ["min", "low", "Low", "最低價", "最低"])
     money_col = _pattern_find_column(
         out,
         ["Trading_money", "trading_money", "TradeValue", "trade_value", "成交金額", "成交值"],
+    )
+    volume_col = _pattern_find_column(
+        out,
+        ["Trading_Volume", "trading_volume", "volume", "Volume", "成交股數", "成交量", "成交張數"],
     )
 
     if date_col is None or close_col is None:
@@ -16028,6 +16102,15 @@ def _pattern_normalize_price_dataframe(df, stock_code, *, adjusted):
     normalized = pd.DataFrame()
     normalized["date"] = pd.to_datetime(out[date_col], errors="coerce")
     normalized["close"] = _pattern_numeric_series(out[close_col])
+    for name, col in (("open", open_col), ("high", high_col), ("low", low_col)):
+        normalized[name] = (
+            _pattern_numeric_series(out[col]) if col is not None else float("nan")
+        )
+    normalized["Trading_Volume"] = (
+        _pattern_numeric_series(out[volume_col])
+        if volume_col is not None
+        else float("nan")
+    )
     normalized["Trading_money"] = (
         _pattern_numeric_series(out[money_col])
         if money_col is not None
@@ -16067,7 +16150,7 @@ def _pattern_fetch_start_date(target_date):
     if not target_dt:
         return None
     needed = (
-        PATTERN_LOOKBACK
+        PATTERN_HISTORY_SPAN
         + PATTERN_MAX_MISSING_DAYS
         + PATTERN_MA_HISTORY_BUFFER_DAYS
     )
@@ -16357,80 +16440,159 @@ def _pattern_check_corporate_actions(stock_code, gap_start_date, target_date):
     return "NO_EVENT", ""
 
 
-def _pattern_profile_peak_price(window):
-    if str(PATTERN_PROFILE_WEIGHT).strip().lower() != "trading_money":
-        raise RuntimeError("PATTERN_PROFILE_WEIGHT 只允許 Trading_money")
+def _pattern_profile_weight_series(frame):
+    """量峰權重欄位；預設 Trading_Volume，與週報價量累積圖使用的 Volume 一致。"""
+    key = str(PATTERN_PROFILE_WEIGHT).strip().lower()
+    if key in ("trading_volume", "volume", "成交量", "成交股數", "成交張數"):
+        column = "Trading_Volume"
+    elif key in ("trading_money", "money", "成交金額", "成交值"):
+        column = "Trading_money"
+    else:
+        raise RuntimeError("PATTERN_PROFILE_WEIGHT 只允許 Trading_Volume 或 Trading_money")
+
+    if column not in frame.columns:
+        raise RuntimeError(f"價量累積圖缺少權重欄位 {column}")
+    series = pd.to_numeric(frame[column], errors="coerce")
+    if column == "Trading_Volume" and series.dropna().empty and "Trading_money" in frame.columns:
+        # 統計日改由 TWSE／TPEx 單日資料回補時只有金額沒有張數；權重比例不受影響。
+        series = pd.to_numeric(frame["Trading_money"], errors="coerce")
+    return series
+
+
+def _pattern_weighted_volume_profile_stats(window, n_bins=None):
+    """與週報 K 線價量累積圖 _calculate_weighted_volume_profile_stats 完全相同的算法。
+
+    n_bins 個等距價格箱（min(low) ~ max(high)），每日量能拆成
+    下影線 0.2 / 實體 0.6 / 上影線 0.2 三段，平均分配到「箱中心落在該段內」的箱。
+    回傳第一大量區（紅色）與第二大量區（橘色）的上下緣與中心價。
+    """
     if window is None or window.empty:
-        raise RuntimeError("成交金額價格輪廓沒有資料")
-    if PATTERN_PROFILE_BIN_PCT <= 0:
-        raise RuntimeError("PATTERN_PROFILE_BIN_PCT 必須大於 0")
+        raise RuntimeError("價量累積圖沒有資料")
 
-    prices = pd.to_numeric(window["adjusted_close"], errors="coerce")
-    monies = pd.to_numeric(window["Trading_money"], errors="coerce")
-    if prices.isna().any() or monies.isna().any():
-        raise RuntimeError("成交金額價格輪廓含無效數值")
-    if (prices <= 0).any() or (monies <= 0).any():
-        raise RuntimeError("成交金額價格輪廓含非正值")
+    close = pd.to_numeric(window["profile_close"], errors="coerce")
+    # 缺 OHLC 的交易日以收盤價補齊（等同一字線），不會憑空放大量區寬度。
+    frame = pd.DataFrame({
+        "open": pd.to_numeric(window["profile_open"], errors="coerce").fillna(close),
+        "high": pd.to_numeric(window["profile_high"], errors="coerce").fillna(close),
+        "low": pd.to_numeric(window["profile_low"], errors="coerce").fillna(close),
+        "close": close,
+        "weight": _pattern_profile_weight_series(window),
+    }).dropna()
+    frame = frame[
+        (frame[["open", "high", "low", "close"]] > 0).all(axis=1)
+        & (frame["weight"] > 0)
+    ]
+    if frame.empty:
+        raise RuntimeError("價量累積圖沒有有效交易日")
 
-    base_price = float(prices.min())
-    log_base = math.log1p(PATTERN_PROFILE_BIN_PCT)
-    if base_price <= 0 or log_base <= 0:
-        raise RuntimeError("成交金額價格輪廓基準無效")
+    price_min = float(frame["low"].min())
+    price_max = float(frame["high"].max())
+    if not math.isfinite(price_min) or not math.isfinite(price_max) or price_max <= price_min:
+        raise RuntimeError("價量累積圖價格區間無效")
 
-    bin_indices = []
-    for price in prices.tolist():
-        raw_index = math.log(float(price) / base_price) / log_base
-        # 邊界採 [下界, 上界)，只消除極小浮點誤差。
-        bin_indices.append(max(int(math.floor(raw_index + 1e-12)), 0))
+    bin_count = max(5, int(n_bins or PATTERN_PROFILE_BINS))
+    step = (price_max - price_min) / bin_count
+    bins = [price_min + step * i for i in range(bin_count + 1)]
+    centers = [(bins[i] + bins[i + 1]) / 2.0 for i in range(bin_count)]
+    profile = [0.0] * bin_count
 
-    profile = window.copy()
-    profile["_pattern_bin"] = bin_indices
-    grouped = []
-    for bin_index, group in profile.groupby("_pattern_bin", sort=True):
-        total_money = float(group["Trading_money"].sum())
-        if total_money <= 0:
-            continue
-        weighted_price = float(
-            (group["adjusted_close"] * group["Trading_money"]).sum()
-            / total_money
+    for row in frame.itertuples(index=False):
+        body_min, body_max = min(row.open, row.close), max(row.open, row.close)
+        segments = (
+            ((row.low, body_min), PATTERN_PROFILE_SHADOW_WEIGHT),
+            ((body_min, body_max), PATTERN_PROFILE_BODY_WEIGHT),
+            ((body_max, row.high), PATTERN_PROFILE_SHADOW_WEIGHT),
         )
-        grouped.append((int(bin_index), total_money, weighted_price))
+        for (start, end), seg_weight in segments:
+            if end - start < 1e-6 or seg_weight <= 0:
+                continue
+            idxs = [i for i, center in enumerate(centers) if start <= center <= end]
+            if not idxs:
+                continue
+            share = float(row.weight) * seg_weight / len(idxs)
+            for i in idxs:
+                profile[i] += share
 
-    if not grouped:
-        raise RuntimeError("成交金額價格輪廓無有效量峰箱")
+    if max(profile) <= 0:
+        raise RuntimeError("價量累積圖無有效量區")
 
-    max_money = max(item[1] for item in grouped)
-    candidates = [item for item in grouped if item[1] == max_money]
-    current_close = float(window.iloc[-1]["adjusted_close"])
-    candidates.sort(key=lambda item: (abs(item[2] - current_close), item[2], item[0]))
-    return candidates[0][2]
+    order = sorted(range(bin_count), key=lambda i: (-profile[i], i))
+    max_idx = order[0]
+    second_idx = order[1] if len(order) > 1 and profile[order[1]] > 0 else -1
+
+    return {
+        "peak_price": float(centers[max_idx]),
+        "zone_low": float(bins[max_idx]),
+        "zone_high": float(bins[max_idx + 1]),
+        "second_peak_price": float(centers[second_idx]) if second_idx >= 0 else None,
+        "second_zone_low": float(bins[second_idx]) if second_idx >= 0 else None,
+        "second_zone_high": float(bins[second_idx + 1]) if second_idx >= 0 else None,
+        "rows": int(len(frame)),
+    }
 
 
 def _pattern_classify_window(history, *, target_date, price_source, bridge_factor, company_action_status):
+    """型態判定。
+
+    「突／站／撐」是事件（今天才發生的轉折），「強／弱／盤」是狀態。
+    事件排在狀態前面，因此每個事件都必須帶「昨天不成立」的首次條件，
+    否則事件會退化成狀態，把後面的狀態標籤整段吃掉。
+    """
     if history is None or len(history) < PATTERN_LOOKBACK:
         raise RuntimeError("有效交易日不足")
 
     full_data = history.copy().reset_index(drop=True)
-    full_data["ma5"] = full_data["adjusted_close"].rolling(5).mean()
-    full_data["ma10"] = full_data["adjusted_close"].rolling(10).mean()
-    full_data["ma20"] = full_data["adjusted_close"].rolling(20).mean()
-    data = full_data.tail(PATTERN_LOOKBACK).copy().reset_index(drop=True)
+    close_series = full_data["adjusted_close"]
+    full_data["ma5"] = close_series.rolling(5).mean()
+    full_data["ma10"] = close_series.rolling(10).mean()
+    full_data["ma20"] = close_series.rolling(20).mean()
+    full_data["ma20_ref"] = full_data["ma20"].shift(PATTERN_MA_SLOPE_DAYS)
+    # 近 N 日最高收盤（不含當日）；每日各自有自己的比較基準，首次條件才不會失真。
+    full_data["range_high"] = close_series.shift(1).rolling(PATTERN_BREAKOUT_RANGE_DAYS).max()
+    # 波動自適應帶寬；shift(1) 只用統計日之前的資料。
+    # 含當日會造成循環自證：今日漲越多 → σ 越大 → 突破線越高 → 越難通過自己的門檻，
+    # 「弱」同理會被暴跌日自己撐開的帶寬擋掉。
+    full_data["band"] = (
+        close_series.pct_change().rolling(PATTERN_BAND_DAYS).std().shift(1)
+        .clip(lower=PATTERN_BAND_MIN, upper=PATTERN_BAND_MAX)
+    )
+    # 量能基準：統計日之前的成交金額中位數（中位數抗單日爆量，shift(1) 避免被當日拉高）。
+    full_data["money_ref"] = (
+        full_data["Trading_money"].rolling(PATTERN_BAND_DAYS).median().shift(1)
+    )
+    # 在 MA20 下方停留天數，供「站」去彈跳
+    full_data["below_ma20"] = (close_series < full_data["ma20"]).astype(float)
+    full_data["below_ma20_count"] = full_data["below_ma20"].rolling(PATTERN_CROSS_LOOKBACK_DAYS).sum()
 
+    data = full_data.tail(PATTERN_LOOKBACK).copy().reset_index(drop=True)
     if len(data) <= PATTERN_MA_SLOPE_DAYS:
         raise RuntimeError("MA20斜率比較資料不足")
 
     current = data.iloc[-1]
     previous = data.iloc[-2]
-    slope_reference = data.iloc[-1 - PATTERN_MA_SLOPE_DAYS]
     required_values = [
-        current["adjusted_close"], current["raw_close"], current["ma5"], current["ma10"], current["ma20"],
-        previous["adjusted_close"], previous["ma20"], slope_reference["ma20"],
+        current["adjusted_close"], current["raw_close"],
+        current["ma5"], current["ma10"], current["ma20"], current["ma20_ref"],
+        current["range_high"], current["band"],
+        previous["adjusted_close"], previous["ma20"], previous["range_high"],
     ]
     if any(pd.isna(value) for value in required_values):
         raise RuntimeError("MA計算失敗")
 
+    # 量峰窗口與週報圖同長（預設 70 個交易日），與型態窗口（預設 60）分開。
+    # 預設排除統計日：量區代表「今天以前累積的成本區」，是既有的壓力／支撐。
+    # 若含當日，低流動性股票單日爆量創高時，那根 K 棒可能自己變成最大量區，
+    # 使 zone_high 被推到今日價位附近，突破被自己壓掉。
+    # 設 PATTERN_PROFILE_EXCLUDE_TARGET_DAY=0 可改為與週報圖逐棒一致。
+    profile_source = full_data.iloc[:-1] if PATTERN_PROFILE_EXCLUDE_TARGET_DAY else full_data
+    profile_window = profile_source.tail(PATTERN_PROFILE_LOOKBACK).copy()
+    profile_stats = _pattern_weighted_volume_profile_stats(profile_window)
+    profile_peak_price = float(profile_stats["peak_price"])
+    zone_low = float(profile_stats["zone_low"])
+    zone_high = float(profile_stats["zone_high"])
+    second_peak_price = profile_stats.get("second_peak_price")
+
     previous_high = float(data.iloc[:-1]["adjusted_close"].max())
-    profile_peak_price = _pattern_profile_peak_price(data)
 
     adjusted_close = _pattern_round(current["adjusted_close"])
     raw_close = _pattern_round(current["raw_close"])
@@ -16439,33 +16601,106 @@ def _pattern_classify_window(history, *, target_date, price_source, bridge_facto
     ma10 = _pattern_round(current["ma10"])
     ma20 = _pattern_round(current["ma20"])
     previous_ma20 = _pattern_round(previous["ma20"])
-    slope_ma20 = _pattern_round(slope_reference["ma20"])
+    slope_ma20 = _pattern_round(current["ma20_ref"])
     previous_high_cmp = _pattern_round(previous_high)
     profile_peak_cmp = _pattern_round(profile_peak_price)
+    band = float(current["band"])
 
-    high_threshold = _pattern_round(previous_high * PATTERN_HIGH_TOLERANCE)
-    support_upper = _pattern_round(profile_peak_price * PATTERN_SUPPORT_UPPER)
-    weak_threshold = _pattern_round(float(current["ma20"]) * PATTERN_WEAK_THRESHOLD)
+    # 量能倍數：統計日成交金額 ÷ 近 N 日成交金額中位數
+    money_ref = current["money_ref"]
+    volume_ratio = None
+    if not pd.isna(money_ref) and float(money_ref) > 0:
+        volume_ratio = float(current["Trading_money"]) / float(money_ref)
 
-    is_breakout = (
-        adjusted_close >= high_threshold
-        and adjusted_close >= previous_adjusted_close
+    # 阻力錨點 = max(近 N 日最高收盤, 第一大量區上緣)。
+    # zone_high 與 band 都只用統計日之前的資料，兩天共用同一條突破線：
+    # 首次條件問的是「價格有沒有跨過這一條線」，兩天各用各的線會把「線在移動」
+    # 誤判成「價格在突破」（價格不動、量區下移也會觸發假事件）。
+    # range_high 則必須逐日各自計算，否則昨天的比較基準會含到昨天自己。
+    resistance = max(float(current["range_high"]), zone_high)
+    resistance_previous = max(float(previous["range_high"]), zone_high)
+    breakout_line = _pattern_round(resistance * (1.0 + PATTERN_BREAKOUT_BAND_MULT * band))
+    breakout_line_previous = _pattern_round(
+        resistance_previous * (1.0 + PATTERN_BREAKOUT_BAND_MULT * band)
     )
+
+    # 量能不足時，單日強幅度可替代確認：+9.5% 這種推升本身就是確認訊號。
+    day_change = (
+        adjusted_close / previous_adjusted_close - 1.0
+        if previous_adjusted_close and previous_adjusted_close > 0 else 0.0
+    )
+    breakout_confirmed = (
+        (volume_ratio is not None and volume_ratio >= PATTERN_BREAKOUT_VOLUME_RATIO)
+        or day_change >= PATTERN_BREAKOUT_SURGE_BAND_MULT * band
+    )
+    # 兩道防線分別擋兩類錯誤：
+    #   actual_cross      擋「門檻下降、價格沒動」造成的假事件
+    #   not yesterday_signal  擋「昨天其實已突破、今天因量區變動又標一次」
+    # 註：actual_cross 的前半段（昨收 <= 今日線）在目前錨點定義下恆真，
+    #     因為 range_high = close.shift(1).rolling(N).max() 本身就含昨收，
+    #     故今日線永遠不會低於昨收（400 條隨機序列驗證 0 次違反）。
+    #     保留此條是為了在錨點定義改變時仍能守住不變式，不是現況會觸發的分支。
+    actual_cross = previous_adjusted_close <= breakout_line < adjusted_close
+    yesterday_signal = previous_adjusted_close > breakout_line_previous
+    is_breakout = (
+        actual_cross
+        and not yesterday_signal                                # 昨天尚未突破 → 今天才是事件
+        and breakout_confirmed
+        and adjusted_close >= ma20                              # 排除空頭反彈假突破
+    )
+
+    # 站：首次站回 MA20，且此前確實在均線下方待過，避免均線附近反覆觸發。
+    cross_line = _pattern_round(ma20 * (1.0 + PATTERN_CROSS_BAND_MULT * band))
+    below_count = previous["below_ma20_count"]
     is_cross_ma20 = (
-        adjusted_close > ma20
+        adjusted_close > cross_line
         and previous_adjusted_close <= previous_ma20
         and ma20 >= slope_ma20
+        and not pd.isna(below_count)
+        and float(below_count) >= PATTERN_CROSS_MIN_BELOW_DAYS
     )
+
+    # 撐：回檔 → 觸及支撐區 → 守住 → 收高於昨收，四段都成立才算支撐事件。
+    #
+    # 最後一段是「收高於昨收」（止跌回升），不是紅K（close > open）：
+    # 跳空高開後收黑但仍大幅高於昨收，是有效反彈；跌深翻紅但收盤仍低於昨收，不是。
+    # 要求 close > open 會誤殺前者。
+    #
+    # 先後順序不需另外判斷，已被條件夾出來：
+    # pullback 要求近 5 日高點不是今天（否則 pullback = 0），
+    # 「今收 > 昨收」又排除高點落在昨天，故高點必在 2 日前以上；低點取近 3 日。
+    # 「觸及」本質是盤中概念，有還原最低價就用最低價，缺值才退回收盤價。
+    support_level = max(profile_peak_price, float(current["ma20"]))
+    support_touch_line = _pattern_round(support_level * (1.0 + PATTERN_SUPPORT_BAND_MULT * band))
+    touch_window = data.tail(PATTERN_SUPPORT_TOUCH_DAYS)
+    touch_low_series = pd.to_numeric(touch_window["adjusted_low"], errors="coerce").fillna(
+        pd.to_numeric(touch_window["adjusted_close"], errors="coerce")
+    )
+    recent_low = _pattern_round(float(touch_low_series.min()))
+    recent_peak = float(data["adjusted_close"].tail(PATTERN_SUPPORT_PULLBACK_DAYS).max())
+    pullback = recent_peak / adjusted_close - 1.0 if adjusted_close else 0.0
     is_support = (
-        profile_peak_cmp <= adjusted_close <= support_upper
-        and adjusted_close >= weak_threshold
+        ma20 >= slope_ma20
+        and pullback >= PATTERN_SUPPORT_PULLBACK_BAND_MULT * band
+        and recent_low <= support_touch_line
+        and adjusted_close >= _pattern_round(support_level)
+        and adjusted_close > previous_adjusted_close
     )
+
+    # 強：多頭排列 + 位置在區間上緣（排除大跌後短線反彈的假強勢）。
     is_strong = (
         ma5 > ma10 > ma20
         and adjusted_close > ma5
-        and ma20 >= slope_ma20
+        and ma20 > slope_ma20
+        and adjusted_close >= _pattern_round(previous_high * PATTERN_STRONG_MIN_POSITION)
     )
-    is_weak = adjusted_close < weak_threshold
+
+    # 弱：跌破 MA20 且均線下彎，或空頭排列。
+    weak_threshold = _pattern_round(ma20 * (1.0 - PATTERN_WEAK_BAND_MULT * band))
+    is_weak = (
+        (adjusted_close < weak_threshold and ma20 < slope_ma20)
+        or (ma5 < ma10 < ma20 and adjusted_close < ma5)
+    )
 
     if is_breakout:
         label = "突"
@@ -16492,6 +16727,12 @@ def _pattern_classify_window(history, *, target_date, price_source, bridge_facto
         "型態前59日高點": previous_high_cmp,
         "型態量峰價": profile_peak_cmp,
         "型態橋接係數": "" if bridge_factor in (None, "") else _pattern_round(bridge_factor),
+        "型態量區下緣": _pattern_round(zone_low),
+        "型態量區上緣": _pattern_round(zone_high),
+        "型態第二量峰價": "" if second_peak_price is None else _pattern_round(second_peak_price),
+        "型態阻力錨點": _pattern_round(resistance),
+        "型態量能倍數": "" if volume_ratio is None else round(float(volume_ratio), 2),
+        "型態波動帶寬": round(float(band), 4),
         "型態公司行動狀態": company_action_status,
         "型態計算狀態": "OK",
         "型態錯誤原因": "",
@@ -16503,8 +16744,16 @@ def _build_single_top15_pattern(stock_code, target_date):
     target_date = normalize_date_str(target_date)
     cache_key = (
         stock_code, target_date, PATTERN_LOOKBACK, PATTERN_MAX_MISSING_DAYS,
-        PATTERN_HIGH_TOLERANCE, PATTERN_SUPPORT_UPPER, PATTERN_WEAK_THRESHOLD,
-        PATTERN_MA_SLOPE_DAYS, PATTERN_PROFILE_BIN_PCT,
+        PATTERN_MA_SLOPE_DAYS, PATTERN_BAND_DAYS, PATTERN_BAND_MIN, PATTERN_BAND_MAX,
+        PATTERN_BREAKOUT_RANGE_DAYS, PATTERN_BREAKOUT_BAND_MULT,
+        PATTERN_BREAKOUT_VOLUME_RATIO, PATTERN_BREAKOUT_SURGE_BAND_MULT,
+        PATTERN_CROSS_BAND_MULT, PATTERN_CROSS_LOOKBACK_DAYS, PATTERN_CROSS_MIN_BELOW_DAYS,
+        PATTERN_SUPPORT_TOUCH_DAYS, PATTERN_SUPPORT_PULLBACK_DAYS,
+        PATTERN_SUPPORT_PULLBACK_BAND_MULT, PATTERN_SUPPORT_BAND_MULT,
+        PATTERN_STRONG_MIN_POSITION, PATTERN_WEAK_BAND_MULT,
+        PATTERN_PROFILE_LOOKBACK, PATTERN_PROFILE_BINS, PATTERN_PROFILE_WEIGHT,
+        PATTERN_PROFILE_BODY_WEIGHT, PATTERN_PROFILE_SHADOW_WEIGHT, PATTERN_PROFILE_PRICE_BASE,
+        PATTERN_PROFILE_EXCLUDE_TARGET_DAY,
     )
     with _TOP15_PATTERN_RESULT_CACHE_LOCK:
         cached = _TOP15_PATTERN_RESULT_CACHE.get(cache_key)
@@ -16566,11 +16815,16 @@ def _build_single_top15_pattern(stock_code, target_date):
         market_row = _pattern_fetch_market_raw_snapshot(target_date).get(stock_code)
         if market_row:
             original = original[original["date"] != target_date].copy()
+            # TWSE／TPEx 單日回補只有收盤與成交金額；OHLC 留空由量峰算法以收盤價補齊。
             original = pd.concat([
                 original,
                 pd.DataFrame([{
                     "date": target_date,
+                    "open": float("nan"),
+                    "high": float("nan"),
+                    "low": float("nan"),
                     "close": market_row.get("raw_close"),
+                    "Trading_Volume": float("nan"),
                     "Trading_money": market_row.get("Trading_money"),
                 }]),
             ], ignore_index=True)
@@ -16733,22 +16987,44 @@ def _build_single_top15_pattern(stock_code, target_date):
             return result
 
         target_raw_close = float(original_target.iloc[-1]["close"])
+        target_raw_row = original_target.iloc[-1]
+
+        def _bridge_price(field):
+            value = pd.to_numeric(pd.Series([target_raw_row.get(field)]), errors="coerce").iloc[0]
+            if pd.isna(value) or float(value) <= 0:
+                return float("nan")
+            return float(value) * bridge_factor
+
         adjusted = pd.concat([
             adjusted,
             pd.DataFrame([{
                 "date": target_date,
+                "open": _bridge_price("open"),
+                "high": _bridge_price("high"),
+                "low": _bridge_price("low"),
                 "close": target_raw_close * bridge_factor,
-                "Trading_money": original_target.iloc[-1].get("Trading_money"),
+                "Trading_Volume": target_raw_row.get("Trading_Volume"),
+                "Trading_money": target_raw_row.get("Trading_money"),
             }]),
         ], ignore_index=True)
         adjusted = adjusted.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
         price_source = "Bridge"
 
-    merged = adjusted[["date", "close"]].rename(columns={"close": "adjusted_close"}).merge(
-        original[["date", "close", "Trading_money"]].rename(columns={"close": "raw_close"}),
-        on="date",
-        how="inner",
-    )
+    adjusted_side = adjusted[["date", "open", "high", "low", "close"]].rename(columns={
+        "open": "adjusted_open",
+        "high": "adjusted_high",
+        "low": "adjusted_low",
+        "close": "adjusted_close",
+    })
+    original_side = original[
+        ["date", "open", "high", "low", "close", "Trading_Volume", "Trading_money"]
+    ].rename(columns={
+        "open": "raw_open",
+        "high": "raw_high",
+        "low": "raw_low",
+        "close": "raw_close",
+    })
+    merged = adjusted_side.merge(original_side, on="date", how="inner")
     merged = merged[
         (merged["date"] <= target_date)
         & (pd.to_numeric(merged["adjusted_close"], errors="coerce") > 0)
@@ -16757,9 +17033,14 @@ def _build_single_top15_pattern(stock_code, target_date):
     ].copy()
     merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date")
 
+    # 量峰用的 OHLC：預設走還原價（跨除權息才正確），設 raw 則與週報圖數字完全一致。
+    profile_prefix = "raw" if PATTERN_PROFILE_PRICE_BASE == "raw" else "adjusted"
+    for field in ("open", "high", "low", "close"):
+        merged[f"profile_{field}"] = merged[f"{profile_prefix}_{field}"]
+
     trading_dates = _pattern_trading_dates_on_or_before(target_date)
     candidate_count = (
-        PATTERN_LOOKBACK
+        PATTERN_HISTORY_SPAN
         + PATTERN_MAX_MISSING_DAYS
         + PATTERN_MA_HISTORY_BUFFER_DAYS
     )
@@ -16811,6 +17092,24 @@ def _build_single_top15_pattern(stock_code, target_date):
             _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
         return result
 
+    # PATTERN_MAX_MISSING_DAYS 原本只用來放大抓取範圍，實際容忍量等於整個緩衝區。
+    # 這裡真正把它當成上限：60 日窗口不得橫跨超過 60 + MAX_MISSING 個交易日，
+    # 否則「前59日高點」「MA20」都會名實不符。
+    window_span = _pattern_trading_day_gap(str(window.iloc[0]["date"]), target_date) + 1
+    if window_span > PATTERN_LOOKBACK + PATTERN_MAX_MISSING_DAYS:
+        result = _pattern_empty_result(
+            stock_code,
+            target_date,
+            "INSUFFICIENT_HISTORY",
+            f"型態窗口橫跨 {window_span} 個交易日，"
+            f"超過 {PATTERN_LOOKBACK}+{PATTERN_MAX_MISSING_DAYS} 上限（停牌或無量日過多）",
+            price_source=price_source,
+            company_action_status=company_action_status,
+        )
+        with _TOP15_PATTERN_RESULT_CACHE_LOCK:
+            _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
+        return result
+
     try:
         result = _pattern_classify_window(
             calculation_data,
@@ -16821,7 +17120,7 @@ def _build_single_top15_pattern(stock_code, target_date):
         )
         result["_pattern_stock_code"] = stock_code
     except Exception as exc:
-        status = "PROFILE_CALC_FAILED" if "輪廓" in str(exc) else "MA_CALC_FAILED"
+        status = "PROFILE_CALC_FAILED" if "價量累積圖" in str(exc) else "MA_CALC_FAILED"
         result = _pattern_empty_result(
             stock_code,
             target_date,
