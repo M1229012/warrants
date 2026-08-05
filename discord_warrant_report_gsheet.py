@@ -337,6 +337,29 @@ NON_ABCD_SELL_UNDERLYING_THRESHOLD = float(
     os.getenv("NON_ABCD_SELL_UNDERLYING_THRESHOLD", str(BUY_THRESHOLD))
 )
 
+# 每日買超補充區塊（全分點 C / D / E）：
+# - 主圖仍以「資料範圍=精選五分點 + TRACKED_BROKERS」的買超明細為主，這裡只做補足。
+# - 主圖買超標的數 < DAILY_LARGE_EVENT_MIN_STOCKS 才啟動；
+#   啟動後從「資料範圍=全分點」依 E → D → C 補到最多 DAILY_LARGE_EVENT_MAX_STOCKS 支標的。
+# - 全分點本身已包含精選五分點，因此補充列一定要去重，否則同一分點會被列兩次：
+#   1. 同一「分點 × 標的」在多個資料範圍 / 多張事件表重複出現時，只保留一列（優先全分點）。
+#   2. 主圖已顯示過的「分點 × 標的」不再補。
+#   3. 主圖已顯示過的標的不再補（補足的目的是補「新的股票」）。
+#   4. 同一支標的在補充區塊只會出現一次，取事件級別最高、金額最大的那個分點。
+DAILY_LARGE_EVENT_ENABLED = os.getenv("DAILY_LARGE_EVENT_ENABLED", "1") == "1"
+DAILY_LARGE_EVENT_MIN_STOCKS = max(int(os.getenv("DAILY_LARGE_EVENT_MIN_STOCKS", "5")), 1)
+DAILY_LARGE_EVENT_MAX_STOCKS = max(
+    int(os.getenv("DAILY_LARGE_EVENT_MAX_STOCKS", "7")),
+    DAILY_LARGE_EVENT_MIN_STOCKS,
+)
+DAILY_LARGE_EVENT_SCAN_ORDER = [
+    code.strip().upper()
+    for code in os.getenv("DAILY_LARGE_EVENT_SCAN_ORDER", "E,D,C").split(",")
+    if code.strip()
+]
+# 事件級別優先序，數字越大代表金額分級越高，用於同一標的 / 同一分點出現多列時擇優。
+DAILY_LARGE_EVENT_CODE_RANK = {"E": 5, "D": 4, "C": 3, "B": 2, "A": 1}
+
 # TOP15 計算明細除錯輸出。
 # 預設會在 console 印出 2408 南亞科 / 元大南屯 的買進與扣減明細，
 # 用來確認 TOP15 金額與手算差異。正式部署若不想顯示，設定 DEBUG_TOP15_DETAIL=0。
@@ -2941,6 +2964,235 @@ def extract_actions_from_gsheet(target: date) -> tuple[list[dict], list[dict]]:
 
     return buys, sells
 
+
+def collect_daily_large_events(target: date, existing_buy_rows: list[dict] | None = None) -> list[dict]:
+    """
+    當日買超標的數不足時，從「資料範圍=全分點」補充 C / D / E 大額買超事件。
+
+    設計原則：
+    1. 主圖仍先顯示精選五分點的買超明細，本函式只負責「補足」。
+    2. 主圖買超標的數 >= DAILY_LARGE_EVENT_MIN_STOCKS（預設 5 支）時完全不啟動。
+    3. 補足順序固定 E → D → C，同一級別內依買超金額由大到小。
+    4. 全分點資料本身已包含精選五分點，所以一定要去重，避免同一分點重複顯示：
+       - 同一「分點 × 標的」在多個資料範圍 / 多張事件表重複出現時只留一列，優先採用全分點。
+       - 主圖已出現過的「分點 × 標的」不再補。
+       - 主圖已出現過的標的不再補，因為補足的目的是補「新的股票」。
+       - 同一支標的在補充區塊只會出現一次，取事件級別最高、金額最大的那個分點。
+    5. 補到整體買超標的數達 DAILY_LARGE_EVENT_MAX_STOCKS（預設 7 支）為止；
+       C / D / E 本身不夠就顯示實際筆數，不硬湊低強度事件。
+    """
+    if not DAILY_LARGE_EVENT_ENABLED:
+        return []
+
+    existing_buy_rows = list(existing_buy_rows or [])
+
+    def row_underlying(row: dict) -> str:
+        return str(row.get("underlying") or row.get("target") or "").strip()
+
+    existing_underlyings = {
+        row_underlying(row)
+        for row in existing_buy_rows
+        if row_underlying(row)
+    }
+    existing_broker_underlying = {
+        (str(row.get("broker", "")).strip(), row_underlying(row))
+        for row in existing_buy_rows
+        if row_underlying(row)
+    }
+
+    current_stock_count = len(existing_underlyings)
+    if current_stock_count >= DAILY_LARGE_EVENT_MIN_STOCKS:
+        print(
+            f"  ✅ 買超補充區塊：主圖已有 {current_stock_count} 支標的，"
+            f"達門檻 {DAILY_LARGE_EVENT_MIN_STOCKS} 支，略過補充。"
+        )
+        return []
+
+    need_count = DAILY_LARGE_EVENT_MAX_STOCKS - current_stock_count
+    if need_count <= 0:
+        return []
+
+    # 舊版分類沒有 E 表（SHEET_E 為空字串），這裡直接略過不存在的工作表，避免讀取失敗。
+    scan_codes = [
+        code
+        for code in DAILY_LARGE_EVENT_SCAN_ORDER
+        if code in EVENT_CONFIG_BY_CODE
+        and str(EVENT_CONFIG_BY_CODE[code].get("sheet", "")).strip()
+    ]
+    if not scan_codes:
+        print("  ⚠️ 買超補充區塊：找不到可掃描的 C / D / E 工作表，略過補充。")
+        return []
+
+    def scope_rank(scope_text: str) -> int:
+        scope_text = str(scope_text or "").strip()
+        if scope_text == DATA_SCOPE_ALL:
+            return 2
+        if scope_text == DATA_SCOPE_SELECTED5:
+            return 1
+        return 0
+
+    def event_rank(row: dict) -> int:
+        return DAILY_LARGE_EVENT_CODE_RANK.get(str(row.get("event", "")).strip().upper(), 0)
+
+    # key =（分點, 標的）：把同一分點同一標的在不同資料範圍 / 不同事件表的重複列收斂成一列。
+    best_by_broker_underlying: dict[tuple[str, str], dict] = {}
+    scope_hits: Counter = Counter()
+    raw_row_count = 0
+
+    for code in scan_codes:
+        cfg = EVENT_CONFIG_BY_CODE[code]
+        needed_cols = list(dict.fromkeys([
+            "資料範圍", "分點", "標的股", "標的名稱", cfg["date_col"],
+            "涵蓋權證數", "權證清單", "最大單筆金額", "最大單筆權證",
+            *cfg.get("amount_cols", []),
+            *cfg.get("qty_cols", []),
+            *cfg.get("warrant_text_cols", []),
+        ]))
+
+        # 補充區塊本來就是要看「其他分點」，所以不能套用 TRACKED_BROKERS 過濾。
+        df = read_gsheet_table_optional(
+            cfg["sheet"],
+            needed_cols,
+            filter_tracked_brokers=False,
+        )
+        if df.empty:
+            continue
+
+        for _, r in df.iterrows():
+            if parse_date_value(r.get(cfg["date_col"])) != target:
+                continue
+
+            broker = str(r.get("分點", "")).strip()
+            if not broker:
+                continue
+
+            amount = 0.0
+            for col in cfg.get("amount_cols", []):
+                raw = strip_gsheet_text_prefix(r.get(col, ""))
+                if raw and raw != "-":
+                    amount = safe_float(raw, 0)
+                    break
+            if amount < BUY_THRESHOLD:
+                continue
+
+            warrant_list = strip_gsheet_text_prefix(r.get("權證清單", "")).strip()
+            max_warrant = strip_gsheet_text_prefix(r.get("最大單筆權證", "")).strip()
+
+            stock_name = strip_gsheet_text_prefix(r.get("標的名稱", "")).strip()
+            underlying = normalize_underlying(
+                r.get("標的股"),
+                stock_name or warrant_list or max_warrant,
+            )
+            if not underlying:
+                continue
+
+            if not stock_name:
+                stock_name = get_stock_name_map().get(underlying, "")
+            if not stock_name:
+                stock_name = extract_stock_name_from_warrant_text(warrant_list or max_warrant)
+
+            qty = 0
+            for col in cfg.get("qty_cols", []):
+                raw = strip_gsheet_text_prefix(r.get(col, ""))
+                if raw and raw != "-":
+                    qty = safe_int(raw, 0)
+                    break
+
+            warrant_count = safe_int(r.get("涵蓋權證數"), 0)
+            if warrant_count <= 0:
+                warrant_count = count_warrants_in_text(warrant_list)
+
+            scope = strip_gsheet_text_prefix(r.get("資料範圍", "")).strip() or "未標記"
+            scope_hits[scope] += 1
+            raw_row_count += 1
+
+            max_single_amount = safe_float(r.get("最大單筆金額"), 0)
+            content_parts = []
+            if warrant_count > 0:
+                content_parts.append(f"{warrant_count}檔權證")
+            if max_single_amount > 0:
+                content_parts.append(f"最大單筆 {fmt_wan(max_single_amount)}")
+            elif max_warrant:
+                content_parts.append(max_warrant)
+
+            row = {
+                "broker": broker,
+                "event": code,
+                "underlying": underlying,
+                "stock_name": stock_name,
+                "target": f"{underlying} {stock_name}".strip() if stock_name else underlying,
+                "content": "｜".join(content_parts) or (max_warrant or warrant_list or "-"),
+                "amount": amount,
+                "qty": qty,
+                "count": max(warrant_count, 1),
+                "scope": scope,
+                "sheet": cfg["sheet"],
+            }
+
+            key = (broker, underlying)
+            old = best_by_broker_underlying.get(key)
+            if old is None or (
+                scope_rank(row["scope"]),
+                event_rank(row),
+                safe_float(row.get("amount"), 0),
+            ) > (
+                scope_rank(old["scope"]),
+                event_rank(old),
+                safe_float(old.get("amount"), 0),
+            ):
+                best_by_broker_underlying[key] = row
+
+    # 排除主圖已顯示過的「分點 × 標的」與已顯示過的標的。
+    candidates = [
+        row
+        for (broker, underlying), row in best_by_broker_underlying.items()
+        if (broker, underlying) not in existing_broker_underlying
+        and underlying not in existing_underlyings
+    ]
+
+    # 同一支標的在補充區塊只留一列，取事件級別最高、金額最大的分點。
+    best_by_underlying: dict[str, dict] = {}
+    for row in candidates:
+        underlying = row["underlying"]
+        old = best_by_underlying.get(underlying)
+        if old is None or (
+            event_rank(row),
+            safe_float(row.get("amount"), 0),
+        ) > (
+            event_rank(old),
+            safe_float(old.get("amount"), 0),
+        ):
+            best_by_underlying[underlying] = row
+
+    selected: list[dict] = []
+    pool_stats = []
+    for code in scan_codes:
+        pool = sorted(
+            [row for row in best_by_underlying.values() if row.get("event") == code],
+            key=lambda row: (
+                -safe_float(row.get("amount"), 0),
+                row.get("broker", ""),
+                row.get("underlying", ""),
+            ),
+        )
+        pool_stats.append(f"{code} {len(pool)}")
+
+        for row in pool:
+            if len(selected) >= need_count:
+                break
+            selected.append(row)
+
+    print(
+        f"  ✅ 買超補充區塊：主圖 {current_stock_count} 支標的（低於門檻 {DAILY_LARGE_EVENT_MIN_STOCKS} 支，啟動補足）｜"
+        f"掃描 {' → '.join(scan_codes)}｜原始 {raw_row_count:,} 列｜"
+        f"分點×標的去重後 {len(best_by_broker_underlying):,} 列｜"
+        f"扣除主圖重複後可選 {len(best_by_underlying):,} 支（{'、'.join(pool_stats)}）｜"
+        f"實際補入 {len(selected)} 支｜整體上限 {DAILY_LARGE_EVENT_MAX_STOCKS} 支｜"
+        f"資料範圍分布 {dict(scope_hits) if scope_hits else '-'}"
+    )
+    return selected
+
+
 def compress_actions(actions: list[dict], kind: str) -> list[dict]:
     """
     同一分點、同一事件、同一標的若有多筆權證，合併成標的顯示。
@@ -3211,7 +3463,14 @@ def make_font(size, bold=False):
     return ImageFont.truetype(get_font_path(bold), size)
 
 
-def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict], history: dict, output_path: Path):
+def draw_report_image(
+    target: date,
+    buys_raw: list[dict],
+    sells_raw: list[dict],
+    history: dict,
+    output_path: Path,
+    large_events: list[dict] | None = None,
+):
     """
     Matplotlib 動態版面引擎：
     - 不固定圖片高度
@@ -3232,6 +3491,10 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     # 這裡放在 compress_actions 之後，代表即使同標的多筆小單合併，只要合併後未達 20 萬，
     # 也不會顯示在圖卡上。
     sells = [x for x in sells if safe_float(x.get("amount"), 0) >= SELL_THRESHOLD]
+
+    # 全分點 C/D/E 補充列：只在主圖買超標的數不足時才有值。
+    # 這些列不併入 KPI 與分點卡片，維持「今日買超 / 今日賣超 / 今日淨額」仍只代表精選五分點。
+    large_event_rows = list(large_events or [])
 
     buy_total = sum(x["amount"] for x in buys)
     sell_total = sum(x["amount"] for x in sells)
@@ -3292,6 +3555,10 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
     if sell_rows:
         sell_table_h = section_title_h + header_h + len(sell_rows) * row_h
 
+    large_event_table_h = 0.0
+    if large_event_rows:
+        large_event_table_h = section_title_h + header_h + len(large_event_rows) * row_h
+
     event_legend_h = 0.45
     footer_h = 0.48
 
@@ -3303,6 +3570,7 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         + (gap + inactive_h if show_inactive_bar else 0)
         + gap
         + buy_table_h
+        + (gap + large_event_table_h if large_event_rows else 0)
         + (gap + sell_table_h if sell_rows else 0)
         + gap
         + event_legend_h
@@ -3604,6 +3872,37 @@ def draw_report_image(target: date, buys_raw: list[dict], sells_raw: list[dict],
         )
 
     y = draw_table(f"{date_label} 今日買超明細", buy_rows, buy_headers, buy_col_w, buy_builder, NAVY, RED, y)
+
+    # 全分點 C/D/E 補充區塊：主圖買超標的數不足 DAILY_LARGE_EVENT_MIN_STOCKS 時才會出現。
+    if large_event_rows:
+        y -= gap
+        large_scope_text = str(large_event_rows[0].get("scope", "")).strip() or DATA_SCOPE_ALL
+        shown_codes = {str(r.get("event", "")).strip().upper() for r in large_event_rows}
+        large_code_text = "/".join(
+            code for code in DAILY_LARGE_EVENT_SCAN_ORDER if code in shown_codes
+        ) or "C/D/E"
+
+        large_headers = ["排名", "分點", "事件", "標的", "內容", "買超金額"]
+        large_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
+
+        def large_builder(i, r):
+            return (
+                [str(i + 1), r["broker"], r["event"], r["target"], r["content"], fmt_wan(r["amount"])],
+                [TEXT, TEXT, RED, TEXT, TEXT, RED],
+                ["center", "left", "center", "left", "left", "right"],
+                [True, True, True, True, False, True],
+            )
+
+        y = draw_table(
+            f"{date_label} {large_scope_text}大額買超補充（{large_code_text}）",
+            large_event_rows,
+            large_headers,
+            large_col_w,
+            large_builder,
+            NAVY2,
+            RED,
+            y,
+        )
 
     # Sell table
     if sell_rows:
@@ -6281,12 +6580,31 @@ def main():
         history = read_selected5_history_from_abcd()
         buys, sells = extract_actions_from_gsheet(target)
 
+        # 先算一次合併後的主圖買超列，用來判斷「當日買超標的數」是否需要啟動全分點補足。
+        compressed_buys_for_daily = compress_actions(buys, "buy")
+        main_stock_count = len({
+            str(x.get("underlying") or x.get("target") or "").strip()
+            for x in compressed_buys_for_daily
+            if str(x.get("underlying") or x.get("target") or "").strip()
+        })
+        large_events = collect_daily_large_events(target, compressed_buys_for_daily)
+
         print(
             f"買超原始筆數：{len(buys)}，賣方提醒原始筆數：{len(sells)}\n"
+            f"主圖買超標的數：{main_stock_count} 支"
+            f"（補足門檻 {DAILY_LARGE_EVENT_MIN_STOCKS} 支、整體上限 {DAILY_LARGE_EVENT_MAX_STOCKS} 支）\n"
+            f"全分點 C/D/E 補充：{len(large_events)} 支\n"
             f"輸出圖檔：{output_path}"
         )
 
-        draw_report_image(target, buys, sells, history, output_path)
+        draw_report_image(
+            target,
+            buys,
+            sells,
+            history,
+            output_path,
+            large_events=large_events,
+        )
         image_paths.append(output_path)
     
 
