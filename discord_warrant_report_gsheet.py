@@ -3877,10 +3877,6 @@ def draw_report_image(
     if large_event_rows:
         y -= gap
         large_scope_text = str(large_event_rows[0].get("scope", "")).strip() or DATA_SCOPE_ALL
-        shown_codes = {str(r.get("event", "")).strip().upper() for r in large_event_rows}
-        large_code_text = "/".join(
-            code for code in DAILY_LARGE_EVENT_SCAN_ORDER if code in shown_codes
-        ) or "C/D/E"
 
         large_headers = ["排名", "分點", "事件", "標的", "內容", "買超金額"]
         large_col_w = [0.75, 2.25, 0.90, 2.25, 3.35, 2.50]
@@ -3894,7 +3890,7 @@ def draw_report_image(
             )
 
         y = draw_table(
-            f"{date_label} {large_scope_text}大額買超補充（{large_code_text}）",
+            f"{date_label} {large_scope_text}大額買超明細",
             large_event_rows,
             large_headers,
             large_col_w,
