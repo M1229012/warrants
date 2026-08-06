@@ -14393,7 +14393,22 @@ def get_tw_stock_name(stock_code: str) -> str:
 
 
 def fetch_stock_data_yf(stock_code: str, period="160d"):
-    """保留舊函式名稱相容性；實際只呼叫 FinMind TaiwanStockPrice。"""
+    """股價來源。預設走 Yahoo，FinMind 保留為可切回的備援。
+
+    K 線本來就是 Yahoo，中途才改成 FinMind；會員到期後改回去。
+    兩邊對照過 109 個交易日，收盤價完全相同（最大差 0.0000），
+    上市 .TW 與上櫃 .TWO 都驗證過。
+
+    一個已知差異：Yahoo 的成交量比 FinMind 少 3.5%~15%，
+    不是單位問題而是收錄範圍不同，量能型態分析要留意。
+
+    要切回 FinMind：設環境變數 WARRANT_PRICE_SOURCE=finmind。
+    """
+    if (os.getenv("WARRANT_PRICE_SOURCE", "yahoo").strip().lower() != "finmind"):
+        from warrant_sources import fetch_stock_data_yahoo
+
+        return fetch_stock_data_yahoo(stock_code, period=period)
+
     code = _normalize_stock_name_code_key(stock_code)
     match = re.search(r"(\d+)", str(period or "160d"))
     calendar_days = max(120, int(match.group(1)) if match else 160)

@@ -15,6 +15,17 @@ on:
         default: false
         type: boolean
 
+  # Asia/Taipei 17:00 = UTC 09:00，交易日收盤後開始輪詢。
+  #
+  # 為什麼不更早：FinMind 的權證分點通常傍晚才更新，週報流程把
+  # WARRANT_HYBRID_MONEYDJ_START_HOUR 設在 18:20，就是因為那時常常還沒好。
+  # 17:00 起跑，兩階段各約 5.5 小時，足以涵蓋到隔日凌晨。
+  #
+  # 為什麼一定要排程：data/finmind_probe/complete/ 是唯一的長期分點歷史，
+  # MoneyDJ 只保留約兩週，漏掉的交易日事後補不回來。靠手動觸發遲早會缺天。
+  schedule:
+    - cron: "0 9 * * 1-5"
+
 permissions:
   contents: write
 
