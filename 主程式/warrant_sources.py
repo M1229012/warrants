@@ -596,6 +596,137 @@ def fetch_warrant_events_moneydj(
     return out
 
 
+# ------------------------------------------- 股票名稱／交易日曆／三大法人
+
+
+TWSE_COMPANY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+
+# 三大法人掛在 Yahoo 台股。國際版 query1.finance.yahoo.com 沒有台股法人資料，
+# 只有這個台灣站的端點有。
+YAHOO_TW_STATS_URL = (
+    "https://tw.stock.yahoo.com/_td-stock/api/resource/"
+    "StockServices.tradesWithQuoteStats;limit={limit};period=day;symbol={symbol}"
+)
+YAHOO_TW_HEADERS = {
+    "User-Agent": YAHOO_HEADERS["User-Agent"],
+    "Accept": "application/json",
+    "Accept-Language": "zh-TW",
+    "Referer": "https://tw.stock.yahoo.com/",
+}
+
+_STOCK_NAME_CACHE: dict | None = None
+
+
+def load_stock_name_map() -> dict:
+    """股票代號 → 中文簡稱，取代 FinMind TaiwanStockInfo。
+
+    這一項沒走 Yahoo：它只給英文名（2464 是 MIRLE AUTOMATION），
+    中文報告用不了，所以改讀證交所與櫃買的公司基本資料。
+    """
+    global _STOCK_NAME_CACHE
+    if _STOCK_NAME_CACHE is not None:
+        return _STOCK_NAME_CACHE
+
+    names: dict[str, str] = {}
+    for label, url, code_key, name_key in (
+        ("上市", TWSE_COMPANY_URL, "公司代號", "公司簡稱"),
+        ("上櫃", TPEX_COMPANY_URL, "SecuritiesCompanyCode", "CompanyAbbreviation"),
+    ):
+        try:
+            rows = requests.get(url, headers={"Accept": "application/json"}, timeout=(8, 40)).json()
+            added = 0
+            for row in rows:
+                code = str(row.get(code_key) or "").strip()
+                name = str(row.get(name_key) or "").strip()
+                if code and name:
+                    names.setdefault(code, name)
+                    added += 1
+            print(f"📦 {label}公司名稱：{added:,} 筆")
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ {label}公司基本資料讀取失敗：{exc}")
+
+    _STOCK_NAME_CACHE = names
+    return names
+
+
+def stock_name_of(stock_code: str) -> str:
+    """查不到就回代號本身，與原本 FinMind 版的行為一致。"""
+    code = _normalize_code(stock_code)
+    name = load_stock_name_map().get(code, "")
+    if not name:
+        print(f"⚠️ 公司基本資料查不到 {code}，本次以代號當名稱")
+        return code
+    return name
+
+
+def trading_dates_yahoo(start_date, end_date, reference: str = "0050") -> list[pd.Timestamp]:
+    """市場實際有成交的日期。
+
+    沿用原本的想法：不看公告的行事曆，改看一檔高流動性標的實際成交在哪幾天，
+    臨時休市（颱風）自然不會被算進去。原本用 FinMind 的 0050 股價，
+    現在直接用 Yahoo 的 K 線日期——同一個道理，少一個資料源。
+    """
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    span = max(30, (end_ts - start_ts).days + 10)
+    frame, _, _ = fetch_stock_data_yahoo(reference, period=f"{span}d")
+    return sorted(d for d in frame.index if start_ts <= d <= end_ts)
+
+
+def fetch_institutional_yahoo(stock_code: str, days: int = 80) -> pd.DataFrame:
+    """三大法人買賣超，回傳 Date/foreign/invest/dealer/total，單位「張」。
+
+    對照過 FinMind：外資與投信逐日數字完全相同。
+
+    ⚠️ 自營商是不同口徑。Yahoo 只給一個 dealerDiffVolK，那是「自營商合計」
+    （自行買賣 ＋ 避險）；原本的 FinMind 版取「自行買賣」。以 2330 在
+    2026-08-06 為例：Yahoo -583、FinMind 自行 -273、避險 -311。
+    這是刻意的行為變更，圖上自營商那條線會比舊版大，不是算錯。
+    """
+    code = _normalize_code(stock_code)
+    limit = max(10, min(int(days), 200))
+
+    rows = []
+    for suffix in ("TW", "TWO"):
+        url = YAHOO_TW_STATS_URL.format(limit=limit, symbol=f"{code}.{suffix}")
+        try:
+            payload = requests.get(url, headers=YAHOO_TW_HEADERS, timeout=(8, 40)).json()
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ Yahoo 三大法人讀取失敗：{code}.{suffix}｜{exc}")
+            continue
+        rows = payload.get("list") or []
+        if rows:
+            break
+
+    if not rows:
+        print(f"⚠️ Yahoo 查無三大法人資料：{code}")
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows)
+    out = pd.DataFrame()
+    out["Date"] = (
+        pd.to_datetime(frame["date"], errors="coerce", utc=True)
+        .dt.tz_convert("Asia/Taipei")
+        .dt.tz_localize(None)
+        .dt.normalize()
+    )
+    # 欄名尾巴的 VolK 就是「千股」也就是張，不必再換算單位。
+    for target, source in (
+        ("foreign", "foreignDiffVolK"),
+        ("invest", "investmentTrustDiffVolK"),
+        ("dealer", "dealerDiffVolK"),
+    ):
+        out[target] = pd.to_numeric(frame.get(source), errors="coerce").fillna(0.0).astype(float)
+    out["total"] = out["foreign"] + out["invest"] + out["dealer"]
+    out = out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    print(
+        f"✅ Yahoo 三大法人：{code}｜{len(out)} 筆｜"
+        f"{out['Date'].min().date()} ~ {out['Date'].max().date()}"
+    )
+    return out[["Date", "foreign", "invest", "dealer", "total"]]
+
+
 # ---------------------------------------------------------------- 對照測試
 
 

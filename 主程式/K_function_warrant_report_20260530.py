@@ -14369,10 +14369,20 @@ def _finmind_market_label(raw_type: str) -> str:
 
 
 def get_tw_stock_name(stock_code: str) -> str:
-    """FinMind-only：優先讀 TaiwanStockInfo；暫缺時以股票代號作名稱並保留警告。"""
+    """股票中文簡稱。預設讀證交所／櫃買公司基本資料，FinMind 為可切回的備援。
+
+    這一項沒走 Yahoo：它只給英文名（2464 是 MIRLE AUTOMATION），中文報告用不了。
+    查不到時回代號本身，行為與原本一致。
+    """
     code = _normalize_stock_name_code_key(stock_code)
     if not code:
         raise ValueError("股票代號不可為空")
+
+    if WARRANT_REFERENCE_SOURCE != "finmind":
+        from warrant_sources import stock_name_of
+
+        return stock_name_of(code)
+
     df = _finmind_load_stock_info()
     hit = df[df["stock_id"].astype(str) == code]
     if hit.empty:
@@ -14458,8 +14468,22 @@ def fetch_stock_data_yf(stock_code: str, period="160d"):
 
 
 def fetch_inst_60d_from_finmind_token(stock_code: str, days: int = 80) -> pd.DataFrame:
-    """FinMind-only：三大法人不再使用公開模式或 X_function 備援。"""
+    """三大法人。預設走 Yahoo 台股，FinMind 為可切回的備援。
+
+    外資與投信與 FinMind 逐日完全相同。
+
+    ⚠️ 自營商換了口徑：Yahoo 給的是「自營商合計」（自行買賣 ＋ 避險），
+    原本取的是「自行買賣」。2330 在 2026-08-06 是 Yahoo -583 對 FinMind
+    自行 -273、避險 -311。圖上自營商那條線會比舊版大，這是選定的行為，
+    不是計算錯誤。要回到舊口徑就設 WARRANT_REFERENCE_SOURCE=finmind。
+    """
     code = _normalize_stock_name_code_key(stock_code)
+
+    if WARRANT_REFERENCE_SOURCE != "finmind":
+        from warrant_sources import fetch_institutional_yahoo
+
+        return fetch_institutional_yahoo(code, days=days)
+
     end_dt = datetime.now(timezone.utc) + timedelta(hours=8)
     start_dt = end_dt - timedelta(days=max(int(days * 3.0), 160))
     raw = _finmind_get_data(
@@ -14486,10 +14510,19 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
 def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
     """取得市場實際有成交的日期。
 
-    不直接採用 TaiwanStockTradingDate，因為該表可能先列入原訂開市日，
-    但臨時颱風休市後未即時移除。改用 0050（可由環境變數調整）的
-    TaiwanStockPrice 實際成交日期，避免把臨時休市日送進 storage_objects。
+    不直接採用公告的行事曆，因為那可能先列入原訂開市日，但臨時颱風休市後
+    未即時移除。改看 0050 實際成交在哪幾天，臨時休市自然不會被算進去。
+
+    來源預設 Yahoo 的 K 線日期，與股價同一份資料；設
+    WARRANT_REFERENCE_SOURCE=finmind 可切回 FinMind TaiwanStockPrice。
     """
+    if WARRANT_REFERENCE_SOURCE != "finmind":
+        from warrant_sources import trading_dates_yahoo
+
+        return trading_dates_yahoo(
+            start_date, end_date, reference=FINMIND_TRADING_DATE_REFERENCE_STOCK
+        )
+
     global _FINMIND_TRADING_DATE_CACHE
 
     start_ts = pd.Timestamp(start_date).normalize()
@@ -17485,6 +17518,10 @@ def _shutdown_report_news_prefetch():
 # 不再因單一冷門權證延遲或官方／FinMind 多出一碼就否決整批資料。
 # 權證分點來源。預設 moneydj；設成 finmind 可切回原本的 Parquet／API 流程。
 WARRANT_BRANCH_SOURCE = os.getenv("WARRANT_BRANCH_SOURCE", "moneydj").strip().lower()
+
+# 股票名稱、交易日曆、三大法人這三項參考資料的來源。
+# 預設走 Yahoo 與證交所；設成 finmind 可整組切回原本的 FinMind 流程。
+WARRANT_REFERENCE_SOURCE = os.getenv("WARRANT_REFERENCE_SOURCE", "public").strip().lower()
 
 # 當日安全檢查是拿官方成交量去驗 FinMind 的最新日 API，MoneyDJ 路徑沒有那個
 # 問題，硬套只會因為兩邊統計口徑不同而誤退回前一交易日。
