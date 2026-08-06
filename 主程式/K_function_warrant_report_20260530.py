@@ -16794,19 +16794,13 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if WARRANT_BRANCH_SOURCE != "finmind":
         from warrant_sources import fetch_warrant_events_moneydj
 
-        # 官方分點對照只是把簡稱換成正式名稱，MoneyDJ 本身就附分點名，
-        # 所以 FinMind 到期後這裡失敗不該讓整條流程停下來。
-        try:
-            trader_name_map, _ = _finmind_securities_trader_maps()
-        except Exception as exc:  # noqa: BLE001
-            trader_name_map = {}
-            print(f"⚠️ 取不到官方分點對照表，改用 MoneyDJ 券商簡稱：{exc}")
+        # 分點對照改讀 repo 內的證交所名冊，不再經過 FinMind。
+        # 名冊查不到的分點會退回 MoneyDJ 自帶的券商簡稱，所以不會缺資料。
         return fetch_warrant_events_moneydj(
             code,
             start_date,
             end_date,
             branch_normalizer=normalize_branch_name,
-            trader_name_map=trader_name_map,
         )
 
     empty_columns = [

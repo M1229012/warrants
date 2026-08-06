@@ -17,6 +17,7 @@ FinMind 會員到期後，主程式的兩個資料來源由這裡接手。兩者
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -273,7 +274,9 @@ def _get_rows(url: str) -> list[dict]:
         try:
             response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             response.raise_for_status()
-            payload = response.json()
+            # MoneyDJ 不在標頭宣告 charset，requests 會猜成 latin-1，
+            # 分點名稱就變成「å\x9c\x8bæ³°」這種亂碼。明確用 UTF-8 解。
+            payload = json.loads(response.content.decode("utf-8", errors="replace"))
             items = payload if isinstance(payload, list) else [payload]
             rows: list[dict] = []
             for item in items:
@@ -422,6 +425,7 @@ def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
 
 
 SEED_FILENAME = "mops_warrant_identity_seed.csv.gz"
+TRADER_SEED_FILENAME = "securities_trader_seed.csv.gz"
 
 EVENT_COLUMNS = [
     "Date", "branch", "broker_code", "warrant_code", "warrant_name",
@@ -443,6 +447,39 @@ def load_warrant_seed(path: str | None = None) -> pd.DataFrame:
         seed[column] = pd.to_datetime(seed[column], errors="coerce")
     _SEED_CACHE = seed
     return seed
+
+
+_TRADER_CACHE: dict | None = None
+
+
+def load_trader_name_map(path: str | None = None) -> dict:
+    """分點代號 → 正式名稱，取代 FinMind 的 TaiwanSecuritiesTraderInfo。
+
+    來源是證交所「證券商基本資料」，840 筆含分行層級（合庫-台中、凱基站前…）。
+    官方 OpenAPI 的 brokerService/brokerList 只有 64 家總公司，拿不到分行，
+    所以這份只能靠人工下載的快照，會慢慢過時——實測 273 個實際出現的分點
+    命中 272 個（99.6%），漏的是新開分點。
+
+    漏掉不影響輸出：呼叫端取不到對照時會退回 MoneyDJ 自帶的券商簡稱。
+    要更新就去證交所下載新的證券商基本資料，轉存成同名檔案即可。
+    """
+    global _TRADER_CACHE
+    if _TRADER_CACHE is not None:
+        return _TRADER_CACHE
+    seed_path = path or os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), TRADER_SEED_FILENAME
+    )
+    try:
+        frame = pd.read_csv(seed_path, compression="gzip", dtype={"broker_code": str})
+        _TRADER_CACHE = {
+            str(row.broker_code).strip(): str(row.broker_name).strip()
+            for row in frame.itertuples()
+            if str(row.broker_code).strip() and str(row.broker_name).strip()
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 讀不到分點名冊，改用 MoneyDJ 券商簡稱：{exc}")
+        _TRADER_CACHE = {}
+    return _TRADER_CACHE
 
 
 def _seed_window(seed: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
@@ -483,6 +520,8 @@ def fetch_warrant_events_moneydj(
     buy_amount/sell_amount 是「元」，side 用中文「買超」「賣超」。
     """
     seed = seed if seed is not None else load_warrant_seed()
+    if trader_name_map is None:
+        trader_name_map = load_trader_name_map()
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
 
