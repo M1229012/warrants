@@ -35,7 +35,7 @@ jobs:
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
       # 請把修正版程式內容放進這個既有檔名；若改用其他檔名，這裡也要同步修改。
-      PYTHON_FILE: warrant_backtest_moneydj.py
+      PYTHON_FILE: 回測/warrant_backtest_moneydj.py
       FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
 
       # ============================================================

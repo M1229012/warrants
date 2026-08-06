@@ -37,7 +37,7 @@ jobs:
 
       # Supabase 快取設定
       # 這兩個只是把 Supabase 連線資訊傳進 GitHub Actions。
-      # 之後主程式 warrant_backtest.py 還需要改成讀寫 Supabase，才會真正生效。
+      # 之後主程式 回測/warrant_backtest.py 還需要改成讀寫 Supabase，才會真正生效。
       SUPABASE_CACHE_ENABLED: "1"
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
 
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p output
-          python -u warrant_backtest.py 2>&1 | tee output/warrant_backtest.log
+          python -u 回測/warrant_backtest.py 2>&1 | tee output/warrant_backtest.log
 
       - name: Upload Excel artifact
         if: always()

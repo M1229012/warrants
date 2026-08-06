@@ -216,7 +216,7 @@ jobs:
             echo "============================================================"
 
             set +e
-            python finmind_warrant_probe.py
+            python 分點工具/finmind_warrant_probe.py
             PROBE_EXIT_CODE=$?
             set -e
 
@@ -441,7 +441,7 @@ jobs:
             echo "============================================================"
 
             set +e
-            python finmind_warrant_probe.py
+            python 分點工具/finmind_warrant_probe.py
             PROBE_EXIT_CODE=$?
             set -e
 

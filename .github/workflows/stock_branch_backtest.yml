@@ -58,7 +58,7 @@ jobs:
           GSHEET_RESULT_ENABLED: "1"
           CAPTURE_ALL_TOP15: "0"
         run: |
-          python "Spot stock/stock_branch_backtest.py"
+          python "回測/stock_branch_backtest.py"
 
       - name: Upload output artifact
         uses: actions/upload-artifact@v4

@@ -89,9 +89,9 @@ jobs:
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: |
           if [ -n "$TARGET_DATE" ]; then
-            python public_preview_masked.py --date "$TARGET_DATE"
+            python Discord/public_preview_masked.py --date "$TARGET_DATE"
           else
-            python public_preview_masked.py
+            python Discord/public_preview_masked.py
           fi
 
       - name: Upload generated images as artifact

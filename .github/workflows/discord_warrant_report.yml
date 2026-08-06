@@ -195,7 +195,7 @@ jobs:
             BROKER_NAME_VALUE="${{ github.event.inputs.broker_name }}"
           fi
 
-          CMD=(python "discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
+          CMD=(python "Discord/discord_warrant_report_gsheet.py" --action "${ACTION_VALUE}")
 
           if [ -n "${TARGET_DATE_VALUE}" ]; then
             CMD+=(--date "${TARGET_DATE_VALUE}")

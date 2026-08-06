@@ -17,11 +17,11 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        working-directory: cloudflare_worker
+        working-directory: Discord/cloudflare_worker
         run: npm install
 
       - name: Register Discord slash commands
-        working-directory: cloudflare_worker
+        working-directory: Discord/cloudflare_worker
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}

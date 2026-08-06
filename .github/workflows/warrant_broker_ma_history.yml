@@ -94,8 +94,8 @@ jobs:
 
       - name: Verify program
         run: |
-          python -m py_compile warrant_broker_ma_history.py
-          python warrant_broker_ma_history.py --self-test
+          python -m py_compile 分點工具/warrant_broker_ma_history.py
+          python 分點工具/warrant_broker_ma_history.py --self-test
 
       - name: Run historical workflow with graceful cutoff
         id: run-history
@@ -108,7 +108,7 @@ jobs:
           # GitHub-hosted runner 單一 job 最長六小時；五小時先送出 SIGINT，
           # 保存 cache 後由後續 step 自動 workflow_dispatch 下一輪。
           timeout --signal=INT --kill-after=2m "${RUN_CUTOFF_MINUTES}m" \
-            python warrant_broker_ma_history.py
+            python 分點工具/warrant_broker_ma_history.py
           status=$?
 
           if [[ "$status" -eq 124 || "$status" -eq 130 ]]; then
@@ -222,5 +222,5 @@ jobs:
         if: always() && steps.run-history.outputs.exit_code != '0'
         shell: bash
         run: |
-          echo "warrant_broker_ma_history.py 執行失敗，exit code=${{ steps.run-history.outputs.exit_code }}"
+          echo "分點工具/warrant_broker_ma_history.py 執行失敗，exit code=${{ steps.run-history.outputs.exit_code }}"
           exit "${{ steps.run-history.outputs.exit_code }}"
