@@ -341,12 +341,21 @@ def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
     if not warrant_codes:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    # 週末日 API4 會回 HTTP 錯誤而不是空結果，每一個都要耗掉三次重試與退避。
-    # 先濾掉，探索次數少三成、時間也跟著省下來。國定假日仍會落空，那個從日期看不出來。
+    # 探索成本 = 權證數 × 天數，是整條流程最貴的一段。2330 有 1,126 檔權證，
+    # 問 16 天要 18,016 次請求、耗時近 6 分鐘；改成 8 天直接砍半。
+    #
+    # 砍窗口不等於少資料：API5 回的是每個 (權證, 分點) 的完整歷史，所以某分點
+    # 只要在窗口內出現過一次，它更早的紀錄一樣抓得到。真正會漏的只有
+    # 「窗口之前活躍、窗口內完全沒動」的分點。週報統計區間是 7 天，
+    # 8 天的窗口蓋得住；資金流圖若拉到更長的軸，較舊的分點會少一些。
+    discovery_days = max(2, int(os.getenv("MONEYDJ_DISCOVERY_DAYS", "8")))
+
+    # 週末 API4 會回 HTTP 錯誤而不是空結果，每一個都要耗掉三次重試與退避。
+    # 先濾掉，國定假日仍會落空，那個從日期看不出來。
     today = datetime.now(timezone.utc) + timedelta(hours=8)
     calendar_days = []
     offset = 0
-    while len(calendar_days) < int(days) + 2 and offset < int(days) + 12:
+    while len(calendar_days) < discovery_days and offset < discovery_days + 12:
         candidate = today - timedelta(days=offset)
         offset += 1
         if candidate.weekday() >= 5:
