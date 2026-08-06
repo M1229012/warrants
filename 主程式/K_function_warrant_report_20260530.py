@@ -16776,12 +16776,39 @@ def _hybrid_replace_day_with_moneydj(
     return merged
 
 def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_date, end_date, cancel_event: threading.Event | None = None) -> pd.DataFrame:
-    """FinMind 權證分點主流程。
+    """權證分點主流程。預設走 MoneyDJ，FinMind 保留為可切回的備援。
 
-    歷史日全市場 Parquet、最新日主要權證 API 與官方發行商預載同時進行；
-    歷史完成後只補查最近實際出現、但第一階段尚未查詢的少數權證。
+    MoneyDJ 路徑用 API4 取分點清單、API5 取每日買賣，識別欄位由 repo 內的
+    MOPS 種子檔補上。與 FinMind 對照過 2026-08-05 的 2408：315 檔權證、
+    2193 組分點，分點清單與買賣股數 0 組不符。
+
+    MoneyDJ 只保留約兩週的滾動視窗，五日週報夠用；更久遠的歷史要看
+    data/finmind_probe/complete/ 裡逐日 commit 的 CSV。
+
+    要切回 FinMind：設環境變數 WARRANT_BRANCH_SOURCE=finmind。
+    FinMind 路徑的說明：歷史日全市場 Parquet、最新日主要權證 API 與官方
+    發行商預載同時進行；歷史完成後只補查最近實際出現、但第一階段尚未查詢的少數權證。
     """
     code = _normalize_stock_name_code_key(stock_code)
+
+    if WARRANT_BRANCH_SOURCE != "finmind":
+        from warrant_sources import fetch_warrant_events_moneydj
+
+        # 官方分點對照只是把簡稱換成正式名稱，MoneyDJ 本身就附分點名，
+        # 所以 FinMind 到期後這裡失敗不該讓整條流程停下來。
+        try:
+            trader_name_map, _ = _finmind_securities_trader_maps()
+        except Exception as exc:  # noqa: BLE001
+            trader_name_map = {}
+            print(f"⚠️ 取不到官方分點對照表，改用 MoneyDJ 券商簡稱：{exc}")
+        return fetch_warrant_events_moneydj(
+            code,
+            start_date,
+            end_date,
+            branch_normalizer=normalize_branch_name,
+            trader_name_map=trader_name_map,
+        )
+
     empty_columns = [
         "Date", "branch", "broker_code", "warrant_code", "warrant_name",
         "underlying_code", "underlying_name", "buy_amount", "sell_amount",
@@ -17462,7 +17489,12 @@ def _shutdown_report_news_prefetch():
 # FinMind 當日權證分點可能在盤後分批更新。正式圖以 TWSE／TPEx 官方權證
 # 當日成交量做交叉驗證；採「代號覆蓋率門檻 + 全體總量差異容忍度」，
 # 不再因單一冷門權證延遲或官方／FinMind 多出一碼就否決整批資料。
-FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE = os.getenv(
+# 權證分點來源。預設 moneydj；設成 finmind 可切回原本的 Parquet／API 流程。
+WARRANT_BRANCH_SOURCE = os.getenv("WARRANT_BRANCH_SOURCE", "moneydj").strip().lower()
+
+# 當日安全檢查是拿官方成交量去驗 FinMind 的最新日 API，MoneyDJ 路徑沒有那個
+# 問題，硬套只會因為兩邊統計口徑不同而誤退回前一交易日。
+FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE = WARRANT_BRANCH_SOURCE == "finmind" and os.getenv(
     "FINMIND_WARRANT_CURRENT_DAY_GUARD_ENABLE",
     "1",
 ).strip().lower() in ("1", "true", "yes", "on")

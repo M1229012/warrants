@@ -217,10 +217,16 @@ def _compare_with_finmind(code: str, period: str = "160d") -> None:
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+# e 控制回傳筆數。不帶這個參數時 MoneyDJ 只回前 30 個分點，成交量大的權證
+# 會被默默截掉一半以上——072570 在 2026-08-05 實際有 92 個分點，不帶 e 只拿到 30。
+# 帶 e=500 之後與 FinMind 逐檔比對零缺漏。其他常見寫法（n / top / rows /
+# limit / count）都無效，只有 e 有用，所以這個參數不能拿掉。
+API4_ROWS = max(50, int(os.getenv("MONEYDJ_API4_ROWS", "500")))
+
 API4_URL = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
     "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={day}&d={day}"
-    "&revision=2018_07_31_1"
+    "&e={rows}&revision=2018_07_31_1"
 )
 API5_URL = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/"
@@ -254,6 +260,9 @@ OUTPUT_COLUMNS = [
     "buy",
     "sell",
     "price",
+    # MoneyDJ 直接給金額（V4/V5），比用單價乘股數回推準確，兩者都留著。
+    "buy_amount",
+    "sell_amount",
 ]
 
 
@@ -296,7 +305,7 @@ def discover_branches(warrant_codes, days: list[str]) -> dict:
 
     def one(job):
         code, day = job
-        return code, _get_rows(API4_URL.format(code=code, day=day))
+        return code, _get_rows(API4_URL.format(code=code, day=day, rows=API4_ROWS))
 
     with ThreadPoolExecutor(max_workers=API4_WORKERS) as executor:
         futures = {executor.submit(one, job): job for job in jobs}
@@ -392,6 +401,8 @@ def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
                         "buy": int(buy_shares),
                         "sell": int(sell_shares),
                         "price": round(price, 4),
+                        "buy_amount": buy_amount,
+                        "sell_amount": sell_amount,
                     }
                 )
 
@@ -405,6 +416,145 @@ def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
         f" ~ {frame['date'].max() if not frame.empty else '-'}｜失敗 {failed}"
     )
     return frame
+
+
+# ------------------------------------------------- 主程式用的權證事件表
+
+
+SEED_FILENAME = "mops_warrant_identity_seed.csv.gz"
+
+EVENT_COLUMNS = [
+    "Date", "branch", "broker_code", "warrant_code", "warrant_name",
+    "underlying_code", "underlying_name", "buy_amount", "sell_amount",
+    "net_amount", "buy_shares", "sell_shares", "side",
+]
+
+_SEED_CACHE: pd.DataFrame | None = None
+
+
+def load_warrant_seed(path: str | None = None) -> pd.DataFrame:
+    """MOPS 權證識別種子檔，含權證名稱與對應正股。整支程式只讀一次。"""
+    global _SEED_CACHE
+    if _SEED_CACHE is not None:
+        return _SEED_CACHE
+    seed_path = path or os.path.join(os.path.dirname(os.path.dirname(__file__)), SEED_FILENAME)
+    seed = pd.read_csv(seed_path, compression="gzip", dtype={"code": str, "target_code": str})
+    for column in ("list_date", "end_date"):
+        seed[column] = pd.to_datetime(seed[column], errors="coerce")
+    _SEED_CACHE = seed
+    return seed
+
+
+def _seed_window(seed: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
+    """
+    權證代號會被回收重用：03882T 在 2023-10 是「臺股指群益39售06」，
+    2026-07 重新掛牌後變成「力積電中信61售01」，正股完全不同。
+    所以一定要用交易日落在 list_date~end_date 之間去篩，只用代號會對到錯的正股。
+    尚未填 end_date 的視為仍在市。
+    """
+    return seed[
+        (seed["list_date"].isna() | (seed["list_date"] <= day))
+        & (seed["end_date"].isna() | (seed["end_date"] >= day))
+    ]
+
+
+def warrant_codes_of(underlying: str, day: pd.Timestamp, seed: pd.DataFrame | None = None) -> list[str]:
+    """某檔正股在指定日期仍有效的權證代號。"""
+    seed = seed if seed is not None else load_warrant_seed()
+    rows = _seed_window(seed, day)
+    rows = rows[rows["target_code"].astype(str) == str(underlying).strip()]
+    return sorted(rows["code"].astype(str).unique())
+
+
+def fetch_warrant_events_moneydj(
+    stock_code: str,
+    start_date,
+    end_date,
+    branch_normalizer=None,
+    trader_name_map: dict | None = None,
+    seed: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """MoneyDJ 版的權證分點事件表，欄位與 FinMind 版完全相同。
+
+    與 FinMind 版對照過 2026-08-05 的 2408：315 檔權證、2193 組分點，
+    分點清單與買賣股數 0 組不符，識別欄位補齊率 2193/2193。
+
+    單位比照 FinMind 版：buy_shares/sell_shares 是「張」（股數除以 1000），
+    buy_amount/sell_amount 是「元」，side 用中文「買超」「賣超」。
+    """
+    seed = seed if seed is not None else load_warrant_seed()
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+
+    codes = warrant_codes_of(stock_code, end_ts, seed)
+    if not codes:
+        print(f"⚠️ 種子檔查不到 {stock_code} 在 {end_ts.date()} 的有效權證")
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+
+    # MoneyDJ 只保留約兩週的滾動視窗，超出範圍要求也拿不到，多要只是浪費請求。
+    span_days = max(1, (end_ts - start_ts).days + 1)
+    raw = fetch_warrant_branch_daily(codes, days=min(span_days, 14))
+    if raw.empty:
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+
+    raw = raw.copy()
+    raw["Date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
+    raw = raw.dropna(subset=["Date"])
+    raw = raw[(raw["Date"] >= start_ts) & (raw["Date"] <= end_ts)]
+    if raw.empty:
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+
+    # 逐日各自查種子檔：同一個代號跨期時，每天要對到當時那一期的正股。
+    identity = _seed_window(seed, end_ts).drop_duplicates("code").set_index("code")
+    name_map = identity["name"].to_dict()
+    target_code_map = identity["target_code"].to_dict()
+    target_name_map = identity["target_name"].to_dict()
+
+    raw["warrant_code"] = raw["stock_id"].astype(str)
+    raw["warrant_name"] = raw["warrant_code"].map(name_map).fillna("")
+    raw["underlying_code"] = raw["warrant_code"].map(target_code_map).fillna("")
+    raw["underlying_name"] = raw["warrant_code"].map(target_name_map).fillna("")
+
+    raw["broker_code"] = raw["securities_trader_id"].astype(str).str.strip()
+    # 官方分點對照表優先，沒有才用 MoneyDJ 給的簡稱，與 FinMind 版同一套規則。
+    mapped = raw["broker_code"].map(trader_name_map or {}).fillna("").astype(str)
+    raw["branch"] = mapped.where(mapped.str.strip() != "", raw["securities_trader"].astype(str).str.strip())
+    if branch_normalizer is not None:
+        raw["branch"] = raw["branch"].map(branch_normalizer)
+    raw = raw[(raw["warrant_code"] != "") & (raw["broker_code"] != "") & (raw["branch"] != "")]
+
+    grouped = raw.groupby(
+        ["Date", "warrant_code", "broker_code", "branch"],
+        as_index=False,
+        dropna=False,
+        sort=False,
+    ).agg(
+        buy_shares_raw=("buy", "sum"),
+        sell_shares_raw=("sell", "sum"),
+        buy_amount=("buy_amount", "sum"),
+        sell_amount=("sell_amount", "sum"),
+        warrant_name=("warrant_name", "first"),
+        underlying_code=("underlying_code", "first"),
+        underlying_name=("underlying_name", "first"),
+    )
+    grouped["buy_shares"] = grouped["buy_shares_raw"] / 1000.0
+    grouped["sell_shares"] = grouped["sell_shares_raw"] / 1000.0
+    grouped["net_amount"] = grouped["buy_amount"] - grouped["sell_amount"]
+    grouped = grouped[
+        (grouped["buy_amount"] != 0)
+        | (grouped["sell_amount"] != 0)
+        | (grouped["net_amount"] != 0)
+    ].copy()
+    grouped["side"] = grouped["net_amount"].map(lambda v: "買超" if v >= 0 else "賣超")
+
+    out = grouped[EVENT_COLUMNS].sort_values(
+        ["Date", "warrant_code", "broker_code"], kind="stable"
+    ).reset_index(drop=True)
+    print(
+        f"📊 MoneyDJ 權證事件：{stock_code}｜權證 {len(codes)} 檔｜"
+        f"{len(out):,} 筆｜{out['Date'].min().date()} ~ {out['Date'].max().date()}"
+    )
+    return out
 
 
 # ---------------------------------------------------------------- 對照測試
