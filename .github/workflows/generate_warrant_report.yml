@@ -98,7 +98,6 @@ jobs:
       UV_NO_INSTALLER_METADATA: "1"
       OUTPUT_DIR: output
       WARRANT_PREWARM_ONLY: "1"
-      WARRANT_DATA_SOURCE_MODE: "finmind_only"
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
       FINMIND_REQUEST_RETRIES: "5"
       FINMIND_RETRY_BASE_WAIT: "1.5"
@@ -344,7 +343,6 @@ jobs:
       # ========================================================
       # 市場資料使用 FinMind；新聞使用六來源整合
       # ========================================================
-      WARRANT_DATA_SOURCE_MODE: "finmind_history_moneydj_latest"
 
       # ========================================================
       # FinMind 歷史 + MoneyDJ 最新交易日混合模式
