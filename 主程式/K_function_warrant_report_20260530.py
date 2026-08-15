@@ -12060,6 +12060,80 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                 zorder=6,
             )
 
+        # 數字（含小數點、千分位、百分比）與英文字串是不可從中間斷開的最小單位。
+        _ATOMIC_TOKEN_RE = re.compile(
+            r"[0-9]+(?:[.,][0-9]+)*%?"
+            r"|[A-Za-z]+(?:[./&+-][A-Za-z0-9]+)*"
+        )
+        # 數字後面緊跟這些單位字時，要跟數字綁在一起，例如「3季」「12億」不可拆開。
+        _ATOMIC_UNIT_CHARS = "季月年日元角分成倍檔支張股家次口件%‰億萬千百"
+        # 結論短句若必須截斷，結尾不可以停在這些「話還沒講完」的字上。
+        _DANGLING_TAIL_TOKENS = (
+            "且", "並", "與", "及", "和", "或", "但", "而", "含", "連", "第", "約",
+            "逾", "近", "達", "增", "減", "至", "為", "由", "從", "在", "以",
+            "使", "讓", "把", "被", "對", "向", "之", "的", "了", "是", "有",
+        )
+
+        def _split_atomic_tokens(text: str) -> list:
+            """把字串切成「不可從中間斷開」的最小單位清單。
+
+            中文維持逐字，但數字與英文整段綁成一個 token：
+              16.28% → 一個 token，不會被切成 16.2 / 8%
+              連3季   → 「連」+「3季」，不會被切成「連3」
+            換行與截斷都改用這個清單當最小單位，數字就不會被切壞。
+            """
+            s = str(text or "")
+            if not s:
+                return []
+            tokens = []
+            idx = 0
+            for m in _ATOMIC_TOKEN_RE.finditer(s):
+                start, end = m.span()
+                tokens.extend(s[idx:start])
+                token = m.group(0)
+                # 數字後緊接單位字時併入同一 token。
+                if end < len(s) and token[-1].isdigit() and s[end] in _ATOMIC_UNIT_CHARS:
+                    token += s[end]
+                    end += 1
+                tokens.append(token)
+                idx = end
+            tokens.extend(s[idx:])
+            return tokens
+
+        def _truncate_status_by_tokens(text: str, max_chars: int) -> str:
+            """在不切開數字／英文／數字＋單位的前提下截斷結論短句。
+
+            原本是 raw[:max_chars] 直接硬切，會產生兩種壞結果：
+              1. 把「連3季成長」切成「連3」
+              2. 把「16.28%」切成「16.2」
+            改成先用 token 累加到長度上限，再把結尾未講完的連接字去掉，
+            讓標題停在一個完整語意的位置。
+            """
+            s = str(text or "").strip()
+            limit = int(max_chars or 0)
+            if limit <= 0 or len(s) <= limit:
+                return s.rstrip("。；;，,、｜:： ")
+
+            out = ""
+            for token in _split_atomic_tokens(s):
+                if len(out) + len(token) > limit:
+                    break
+                out += token
+            if not out:
+                out = s[:limit]
+            out = out.rstrip("。；;，,、｜:： ")
+
+            # 去掉結尾明顯未完成的連接字，例如「…16.28%且連」→「…16.28%」。
+            trimmed = True
+            while trimmed and out:
+                trimmed = False
+                for tail in _DANGLING_TAIL_TOKENS:
+                    if out.endswith(tail) and len(out) - len(tail) >= 4:
+                        out = out[: -len(tail)].rstrip("。；;，,、｜:： ")
+                        trimmed = True
+                        break
+            return out or s[:limit].rstrip("。；;，,、｜:： ")
+
         def wrap_text_by_pixel(ax, fig, text, max_width_axes, fontsize=33, fontweight="normal", max_lines=0, first_prefix="", next_prefix="", width_boost=1.0):
             """依照實際像素寬度自動換行，避免固定字數造成太早換行或超出區塊邊界。"""
             s = str(text or "").strip()
@@ -12094,7 +12168,8 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
             lines = []
             current = ""
-            for ch in s:
+            # 以 token 為單位換行；數字與英文不會被拆到兩行（例：32.56% 不再變成 32.5 / 6%）。
+            for ch in _split_atomic_tokens(s):
                 prefix = first_prefix if not lines else next_prefix
                 candidate = current + ch
                 if measure_px(prefix + candidate) <= max_width_px or not current:
@@ -12131,7 +12206,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                         visible_text = visible_text[:-1].rstrip() + "。"
                     rebuilt = []
                     current = ""
-                    for ch in visible_text:
+                    for ch in _split_atomic_tokens(visible_text):
                         prefix = first_prefix if not rebuilt else next_prefix
                         candidate = current + ch
                         if measure_px(prefix + candidate) <= max_width_px or not current:
@@ -12388,7 +12463,12 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
                     raw = seg
                 else:
                     derived = _derive_headline_from_body(label, body, fallback="")
-                    raw = derived if 6 <= len(derived) <= max_chars else raw[:max_chars].rstrip("。；;，,、 ")
+                    # 不再用 raw[:max_chars] 硬切，改成不切壞數字／單位並去掉未完成尾巴。
+                    raw = (
+                        derived
+                        if 6 <= len(derived) <= max_chars
+                        else _truncate_status_by_tokens(raw, max_chars)
+                    )
             return raw or fallback
 
         def _format_note_pct_value(value, digits=0, force_sign=False):
