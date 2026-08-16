@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -229,6 +230,15 @@ API4_URL = (
     "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={day}&d={day}"
     "&e={rows}&revision=2018_07_31_1"
 )
+# API4 的 c / d 本來就是「起日 / 迄日」，不是同一天。
+# warrant_backtest_moneydj.py 的 api4_get_with_status(code, start, end) 就是這樣用的，
+# 一次請求就能拿回整段區間的分點。原本的 discover_branches() 把兩個參數塞同一天，
+# 於是請求數變成「權證數 × 天數」；改用區間後降到「權證數」，70 天窗口等於快 70 倍。
+API4_RANGE_URL = (
+    "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
+    "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={start}&d={end}"
+    "&e={rows}&revision=2018_07_31_1"
+)
 API5_URL = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/"
     "twWarrantData.xdjjson?x=warrant-chip0002-5&c={days}&a={warrant}&b={broker}"
@@ -269,11 +279,48 @@ API5_HISTORY_LIMIT = max(
 # 分點探索窗口：這個才是真正的成本來源，請求數 = 權證數 × 天數。
 # 程式實測 2330（1,126 檔權證）問 16 天要 18,016 次請求、約 6 分鐘，
 # 所以不跟著查詢區間無限放大，預設維持 8 天，需要更長再自行調高。
-DISCOVERY_DAYS_DEFAULT = max(2, int(os.getenv("MONEYDJ_DISCOVERY_DAYS", "8")))
-# 自動模式（MONEYDJ_DISCOVERY_DAYS=auto）跟著查詢區間走時的保護上限。
-DISCOVERY_MAX_DAYS = max(
-    DISCOVERY_DAYS_DEFAULT, int(os.getenv("MONEYDJ_DISCOVERY_MAX_DAYS", "30"))
+# 改用 API4 區間探索後，天數不再影響請求數（一支權證固定一次），
+# 因此預設直接對齊產圖程式的 K 棒數 CHART_LOOKBACK=70。
+DISCOVERY_DAYS_DEFAULT = max(2, int(os.getenv("MONEYDJ_DISCOVERY_DAYS", "70")))
+# 只有在區間探索失效、退回逐日模式時才會用到的保護上限，
+# 逐日模式的請求數是「權證數 × 天數」，不能讓它跟著 70 天跑。
+DISCOVERY_FALLBACK_MAX_DAYS = max(
+    2, int(os.getenv("MONEYDJ_DISCOVERY_FALLBACK_MAX_DAYS", "8"))
 )
+# 區間探索時單支權證可回傳的最大列數（API4 的 e 參數）。
+# 70 天 × 多個分點會遠多於原本單日的 500 列，太小會被截斷。
+API4_RANGE_ROWS = max(
+    API4_ROWS, int(os.getenv("MONEYDJ_API4_RANGE_ROWS", "3000"))
+)
+# 區間探索失敗時是否回退逐日模式。區間模式沒有在正式環境驗證過，留一條後路。
+DISCOVERY_RANGE_ENABLE = os.getenv(
+    "MONEYDJ_DISCOVERY_RANGE_ENABLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """每個執行緒共用一個 Session。
+
+    原本每次都直接 requests.get()，等於每個請求重做一次 TCP + TLS 交握。
+    幾千次小請求下這是純浪費；改用連線池後同一執行緒可以重用連線。
+    pool_maxsize 要跟著 worker 數走，否則 urllib3 會一直丟
+    "Connection pool is full" 並丟棄連線，反而更慢。
+    """
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=max(8, API4_WORKERS, API5_WORKERS),
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _THREAD_LOCAL.session = session
+    return session
 
 OUTPUT_COLUMNS = [
     "date",
@@ -294,7 +341,7 @@ def _get_rows(url: str) -> list[dict]:
     last_error = None
     for attempt in range(1, RETRIES + 1):
         try:
-            response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            response = _get_session().get(url, headers=HEADERS, timeout=TIMEOUT)
             response.raise_for_status()
             # MoneyDJ 不在標頭宣告 charset，requests 會猜成 latin-1，
             # 分點名稱就變成「å\x9c\x8bæ³°」這種亂碼。明確用 UTF-8 解。
@@ -357,6 +404,64 @@ def discover_branches(warrant_codes, days: list[str]) -> dict:
     return pairs
 
 
+def discover_branches_range(warrant_codes, start_day: str, end_day: str) -> dict:
+    """一支權證一次請求整段區間，取分點聯集。
+
+    與 discover_branches() 的差別只在請求數：
+      逐日模式：權證數 × 天數
+      區間模式：權證數
+    盟立 140 檔權證看 70 天，9,800 次變 140 次。
+
+    回傳格式與 discover_branches() 完全相同，呼叫端不用改。
+    """
+    codes = [str(c).strip().upper() for c in warrant_codes if str(c).strip()]
+    if not codes:
+        return {}
+
+    pairs: dict[tuple[str, str], dict] = {}
+    failed = 0
+    truncated = 0
+
+    def one(code):
+        return code, _get_rows(
+            API4_RANGE_URL.format(
+                code=code, start=start_day, end=end_day, rows=API4_RANGE_ROWS
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=API4_WORKERS) as executor:
+        futures = {executor.submit(one, code): code for code in codes}
+        for future in as_completed(futures):
+            try:
+                code, rows = future.result()
+            except Exception:  # noqa: BLE001
+                failed += 1
+                continue
+            # 回傳列數剛好觸頂時，很可能是被 e 參數截斷，要讓使用者知道。
+            if len(rows) >= API4_RANGE_ROWS:
+                truncated += 1
+            for row in rows:
+                broker_code = str(row.get("V2") or "").strip()
+                if not broker_code:
+                    continue
+                pairs[(code, broker_code)] = {
+                    "warrant_code": code,
+                    "broker_code": broker_code,
+                    "broker_name": str(row.get("V3") or "").strip(),
+                }
+
+    print(
+        f"🔎 API4 區間探索：{len(codes)} 檔 × 1 次 = {len(codes)} 次請求｜"
+        f"{start_day} ~ {end_day}｜找到 {len(pairs)} 組分點｜失敗 {failed}"
+    )
+    if truncated:
+        print(
+            f"   ⚠️ 有 {truncated} 檔權證回傳列數觸頂（{API4_RANGE_ROWS}），可能被截斷，"
+            "分點會少算；請調高 MONEYDJ_API4_RANGE_ROWS。"
+        )
+    return pairs
+
+
 def fetch_warrant_branch_daily(
     warrant_codes,
     days: int = 5,
@@ -371,28 +476,42 @@ def fetch_warrant_branch_daily(
     if not warrant_codes:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    # 探索成本 = 權證數 × 天數，是整條流程最貴的一段。2330 有 1,126 檔權證，
-    # 問 16 天要 18,016 次請求、耗時近 6 分鐘；改成 8 天直接砍半。
-    #
-    # 砍窗口不等於少資料：API5 回的是每個 (權證, 分點) 的完整歷史，所以某分點
-    # 只要在窗口內出現過一次，它更早的紀錄一樣抓得到。真正會漏的只有
-    # 「窗口之前活躍、窗口內完全沒動」的分點。週報統計區間是 7 天，
-    # 8 天的窗口蓋得住；資金流圖若拉到更長的軸，較舊的分點會少一些。
+    # API5 回的是每個 (權證, 分點) 的完整歷史，所以分點只要在探索窗口內出現過一次，
+    # 它更早的紀錄一樣抓得到。真正會漏的只有「窗口內完全沒動」的分點，
+    # 因此窗口越長結果越完整——而改用 API4 區間探索後，拉長窗口不再增加請求數。
     discovery_days = max(2, int(discovery_days or DISCOVERY_DAYS_DEFAULT))
-
-    # 週末 API4 會回 HTTP 錯誤而不是空結果，每一個都要耗掉三次重試與退避。
-    # 先濾掉，國定假日仍會落空，那個從日期看不出來。
     today = datetime.now(timezone.utc) + timedelta(hours=8)
-    calendar_days = []
-    offset = 0
-    while len(calendar_days) < discovery_days and offset < discovery_days + 12:
-        candidate = today - timedelta(days=offset)
-        offset += 1
-        if candidate.weekday() >= 5:
-            continue
-        calendar_days.append(candidate.strftime("%Y/%m/%d"))
+    pairs: dict = {}
 
-    pairs = discover_branches(warrant_codes, calendar_days)
+    if DISCOVERY_RANGE_ENABLE:
+        pairs = discover_branches_range(
+            warrant_codes,
+            (today - timedelta(days=discovery_days)).strftime("%Y/%m/%d"),
+            today.strftime("%Y/%m/%d"),
+        )
+
+    if not pairs:
+        # 區間模式沒回東西就退回原本的逐日模式，避免這條路整個斷掉。
+        # 逐日的請求數是「權證數 × 天數」，所以天數另外壓在 FALLBACK 上限。
+        fallback_days = max(2, min(discovery_days, DISCOVERY_FALLBACK_MAX_DAYS))
+        if DISCOVERY_RANGE_ENABLE:
+            print(
+                f"↩️ API4 區間探索沒有結果，退回逐日模式："
+                f"{len(warrant_codes)} 檔 × {fallback_days} 天"
+                f" = {len(warrant_codes) * fallback_days:,} 次請求"
+            )
+        # 週末 API4 會回 HTTP 錯誤而不是空結果，每一個都要耗掉三次重試與退避。
+        # 先濾掉，國定假日仍會落空，那個從日期看不出來。
+        calendar_days = []
+        offset = 0
+        while len(calendar_days) < fallback_days and offset < fallback_days + 12:
+            candidate = today - timedelta(days=offset)
+            offset += 1
+            if candidate.weekday() >= 5:
+                continue
+            calendar_days.append(candidate.strftime("%Y/%m/%d"))
+        pairs = discover_branches(warrant_codes, calendar_days)
+
     if not pairs:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
@@ -575,24 +694,21 @@ def fetch_warrant_events_moneydj(
     # 放大它不增加請求數（請求數只跟已探索到的分點組數有關），預設 200 對齊回測。
     history_days = min(span_days, API5_HISTORY_LIMIT)
 
-    # 分點探索窗口：成本 = 權證數 × 天數，所以跟 history_days 分開控制。
-    # MONEYDJ_DISCOVERY_DAYS=auto 會跟著查詢區間走，但仍受 DISCOVERY_MAX_DAYS 保護。
-    if os.getenv("MONEYDJ_DISCOVERY_DAYS", "").strip().lower() == "auto":
-        discovery_days = max(2, min(span_days, DISCOVERY_MAX_DAYS))
-    else:
-        discovery_days = DISCOVERY_DAYS_DEFAULT
+    # 分點探索窗口：改用 API4 區間探索後，請求數只跟權證數有關，與天數無關，
+    # 所以直接讓它蓋滿整個查詢區間；預設值 70 對齊產圖程式的 CHART_LOOKBACK。
+    discovery_days = max(2, min(span_days, DISCOVERY_DAYS_DEFAULT))
 
     print(
         f"🪟 MoneyDJ 視窗：{stock_code}｜查詢 {start_ts.date()} ~ {end_ts.date()}"
         f"（{span_days} 天）｜API5 回看 {history_days} 列｜分點探索 {discovery_days} 天｜"
-        f"權證 {len(codes)} 檔｜預估 API4 請求 {len(codes) * discovery_days:,} 次"
+        f"權證 {len(codes)} 檔"
     )
     if discovery_days < span_days:
-        # 只在窗口內完全沒動的分點會被漏掉；有動過的分點，API5 會回完整歷史。
+        # 只有「探索窗口內完全沒動」的分點會被漏掉；有動過的分點 API5 會回完整歷史。
         print(
             f"   ⚠️ 分點探索窗口（{discovery_days} 天）短於查詢區間（{span_days} 天）："
             f"最近 {discovery_days} 天完全沒交易的分點不會被發現。"
-            "要補完請設 MONEYDJ_DISCOVERY_DAYS=auto 或指定更大的天數（請求數會等比增加）。"
+            "要補完請調高 MONEYDJ_DISCOVERY_DAYS（區間模式下不會增加請求數）。"
         )
 
     raw = fetch_warrant_branch_daily(
