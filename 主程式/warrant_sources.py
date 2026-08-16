@@ -253,6 +253,28 @@ RETRY_WAIT = max(0.2, float(os.getenv("MONEYDJ_RETRY_WAIT", "1.5")))
 API4_WORKERS = max(1, int(os.getenv("MONEYDJ_API4_WORKERS", "40")))
 API5_WORKERS = max(1, int(os.getenv("MONEYDJ_API5_WORKERS", "50")))
 
+# API5 的 c={days} 是「一次回幾列歷史」，不是額外請求，
+# 所以放大它幾乎沒有成本：請求數固定是「已探索到的 (權證, 分點) 組數」。
+#
+# 這裡原本在 fetch_warrant_events_moneydj() 內被寫死成 min(span_days, 14)，
+# 註解宣稱「MoneyDJ 只保留約兩週的滾動視窗」。但 warrant_backtest_moneydj.py
+# 用 MONEYDJ_API5_HISTORY_LIMIT=200 打同一支端點可以取回 200 天，
+# 證明兩週的假設不成立——寫死的 14 會讓資金流累計線只涵蓋最近約兩週，
+# 更早的交易全部變成 0，圖上看起來像「沒有交易」。
+# 預設直接對齊回測的 200。
+API5_HISTORY_LIMIT = max(
+    1, int(os.getenv("MONEYDJ_API5_HISTORY_LIMIT", "200"))
+)
+
+# 分點探索窗口：這個才是真正的成本來源，請求數 = 權證數 × 天數。
+# 程式實測 2330（1,126 檔權證）問 16 天要 18,016 次請求、約 6 分鐘，
+# 所以不跟著查詢區間無限放大，預設維持 8 天，需要更長再自行調高。
+DISCOVERY_DAYS_DEFAULT = max(2, int(os.getenv("MONEYDJ_DISCOVERY_DAYS", "8")))
+# 自動模式（MONEYDJ_DISCOVERY_DAYS=auto）跟著查詢區間走時的保護上限。
+DISCOVERY_MAX_DAYS = max(
+    DISCOVERY_DAYS_DEFAULT, int(os.getenv("MONEYDJ_DISCOVERY_MAX_DAYS", "30"))
+)
+
 OUTPUT_COLUMNS = [
     "date",
     "stock_id",
@@ -335,8 +357,16 @@ def discover_branches(warrant_codes, days: list[str]) -> dict:
     return pairs
 
 
-def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
-    """回傳與 FinMind TaiwanStockWarrantTradingDailyReport 相同欄位的 DataFrame。"""
+def fetch_warrant_branch_daily(
+    warrant_codes,
+    days: int = 5,
+    discovery_days: int | None = None,
+) -> pd.DataFrame:
+    """回傳與 FinMind TaiwanStockWarrantTradingDailyReport 相同欄位的 DataFrame。
+
+    days           ：API5 一次回幾列歷史（不增加請求數）
+    discovery_days ：API4 分點探索窗口（請求數 = 權證數 × 天數，成本在這）
+    """
     warrant_codes = [str(c).strip().upper() for c in warrant_codes if str(c).strip()]
     if not warrant_codes:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -348,7 +378,7 @@ def fetch_warrant_branch_daily(warrant_codes, days: int = 5) -> pd.DataFrame:
     # 只要在窗口內出現過一次，它更早的紀錄一樣抓得到。真正會漏的只有
     # 「窗口之前活躍、窗口內完全沒動」的分點。週報統計區間是 7 天，
     # 8 天的窗口蓋得住；資金流圖若拉到更長的軸，較舊的分點會少一些。
-    discovery_days = max(2, int(os.getenv("MONEYDJ_DISCOVERY_DAYS", "8")))
+    discovery_days = max(2, int(discovery_days or DISCOVERY_DAYS_DEFAULT))
 
     # 週末 API4 會回 HTTP 錯誤而不是空結果，每一個都要耗掉三次重試與退避。
     # 先濾掉，國定假日仍會落空，那個從日期看不出來。
@@ -539,9 +569,37 @@ def fetch_warrant_events_moneydj(
         print(f"⚠️ 種子檔查不到 {stock_code} 在 {end_ts.date()} 的有效權證")
         return pd.DataFrame(columns=EVENT_COLUMNS)
 
-    # MoneyDJ 只保留約兩週的滾動視窗，超出範圍要求也拿不到，多要只是浪費請求。
     span_days = max(1, (end_ts - start_ts).days + 1)
-    raw = fetch_warrant_branch_daily(codes, days=min(span_days, 14))
+
+    # API5 回看筆數：原本寫死 min(span_days, 14)，會讓資金流累計線只涵蓋最近約兩週。
+    # 放大它不增加請求數（請求數只跟已探索到的分點組數有關），預設 200 對齊回測。
+    history_days = min(span_days, API5_HISTORY_LIMIT)
+
+    # 分點探索窗口：成本 = 權證數 × 天數，所以跟 history_days 分開控制。
+    # MONEYDJ_DISCOVERY_DAYS=auto 會跟著查詢區間走，但仍受 DISCOVERY_MAX_DAYS 保護。
+    if os.getenv("MONEYDJ_DISCOVERY_DAYS", "").strip().lower() == "auto":
+        discovery_days = max(2, min(span_days, DISCOVERY_MAX_DAYS))
+    else:
+        discovery_days = DISCOVERY_DAYS_DEFAULT
+
+    print(
+        f"🪟 MoneyDJ 視窗：{stock_code}｜查詢 {start_ts.date()} ~ {end_ts.date()}"
+        f"（{span_days} 天）｜API5 回看 {history_days} 列｜分點探索 {discovery_days} 天｜"
+        f"權證 {len(codes)} 檔｜預估 API4 請求 {len(codes) * discovery_days:,} 次"
+    )
+    if discovery_days < span_days:
+        # 只在窗口內完全沒動的分點會被漏掉；有動過的分點，API5 會回完整歷史。
+        print(
+            f"   ⚠️ 分點探索窗口（{discovery_days} 天）短於查詢區間（{span_days} 天）："
+            f"最近 {discovery_days} 天完全沒交易的分點不會被發現。"
+            "要補完請設 MONEYDJ_DISCOVERY_DAYS=auto 或指定更大的天數（請求數會等比增加）。"
+        )
+
+    raw = fetch_warrant_branch_daily(
+        codes,
+        days=history_days,
+        discovery_days=discovery_days,
+    )
     if raw.empty:
         return pd.DataFrame(columns=EVENT_COLUMNS)
 
