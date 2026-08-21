@@ -461,9 +461,31 @@ PATTERN_PROFILE_EXCLUDE_TARGET_DAY = os.getenv(
     "PATTERN_PROFILE_EXCLUDE_TARGET_DAY", "1"
 ).strip().lower() not in ("0", "false", "no")
 
+# 型態行情來源：MoneyDJ K 線為主，交易所只補 MoneyDJ K 線未提供的精確成交金額，
+# FinMind 僅在 MoneyDJ 原始／還原日線不足時才嘗試，不再是型態計算的必要條件。
+PATTERN_MONEYDJ_ENABLED = os.getenv("PATTERN_MONEYDJ_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+PATTERN_FINMIND_FALLBACK_ENABLED = os.getenv(
+    "PATTERN_FINMIND_FALLBACK_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+PATTERN_OFFICIAL_TURNOVER_ENRICH_ENABLED = os.getenv(
+    "PATTERN_OFFICIAL_TURNOVER_ENRICH_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+PATTERN_MONEYDJ_KLINE_URLS = [
+    "https://pscnetsecrwd.moneydj.com/z/BCD/czkc1.djbcd",
+    "https://5850web.moneydj.com/z/BCD/czkc1.djbcd",
+    "https://concords.moneydj.com/z/BCD/czkc1.djbcd",
+]
+PATTERN_MONEYDJ_CALENDAR_CODE = os.getenv("PATTERN_MONEYDJ_CALENDAR_CODE", "0050").strip() or "0050"
+PATTERN_MONEYDJ_CACHE_DIR = os.path.join(CACHE_DIR, "pattern_moneydj_kline")
+os.makedirs(PATTERN_MONEYDJ_CACHE_DIR, exist_ok=True)
+
 # 量峰窗口比型態窗口長，歷史抓取與有效日檢查都要以較長者為準。
 PATTERN_HISTORY_SPAN = max(PATTERN_LOOKBACK, PATTERN_PROFILE_LOOKBACK)
 PATTERN_MA_HISTORY_BUFFER_DAYS = 20 + max(PATTERN_MA_SLOPE_DAYS, PATTERN_BAND_DAYS)
+PATTERN_MONEYDJ_KLINE_LIMIT = max(
+    int(os.getenv("PATTERN_MONEYDJ_KLINE_LIMIT", "240")),
+    PATTERN_HISTORY_SPAN + PATTERN_MAX_MISSING_DAYS + PATTERN_MA_HISTORY_BUFFER_DAYS,
+)
 
 PATTERN_PRICE_DATASET = os.getenv("PATTERN_PRICE_DATASET", "TaiwanStockPriceAdj").strip() or "TaiwanStockPriceAdj"
 PATTERN_REQUIRE_ADJUSTED_PRICE = os.getenv("PATTERN_REQUIRE_ADJUSTED_PRICE", "1").strip().lower() not in ("0", "false", "no")
@@ -15930,6 +15952,10 @@ _TOP15_PATTERN_DATASET_CACHE = {}
 _TOP15_PATTERN_DATASET_CACHE_LOCK = threading.Lock()
 _TOP15_PATTERN_MARKET_RAW_CACHE = {}
 _TOP15_PATTERN_MARKET_RAW_CACHE_LOCK = threading.Lock()
+_TOP15_PATTERN_MONEYDJ_CACHE = {}
+_TOP15_PATTERN_MONEYDJ_CACHE_LOCK = threading.Lock()
+_TOP15_PATTERN_OFFICIAL_MONTH_CACHE = {}
+_TOP15_PATTERN_OFFICIAL_MONTH_CACHE_LOCK = threading.Lock()
 
 
 def _normalize_pattern_stock_code(value):
@@ -16057,6 +16083,340 @@ def _pattern_finmind_dataframe(dataset, stock_code, start_date, end_date):
     return df
 
 
+def _pattern_empty_price_dataframe():
+    return pd.DataFrame(
+        columns=["date", "open", "high", "low", "close", "Trading_Volume", "Trading_money"]
+    )
+
+
+def _pattern_moneydj_cache_path(stock_code, adjusted):
+    mode = "A" if adjusted else "D"
+    safe_code = re.sub(r"[^0-9A-Z]", "", str(stock_code or "").upper())
+    return os.path.join(PATTERN_MONEYDJ_CACHE_DIR, f"{safe_code}_{mode}.csv")
+
+
+def _pattern_parse_moneydj_kline(text, stock_code, *, adjusted):
+    """解析 MoneyDJ czkc1 K 線：日期、收、高、低、開、成交量（張）。"""
+    raw_text = str(text or "").strip()
+    if not raw_text or "<p" in raw_text.lower() or "<html" in raw_text.lower():
+        raise RuntimeError("MoneyDJ K 線回傳空白或 HTML 錯誤頁")
+
+    parts = re.split(r"\s+", raw_text)
+    if len(parts) < 6:
+        raise RuntimeError(f"MoneyDJ K 線欄位不足：{len(parts)}")
+
+    arrays = [part.split(",") for part in parts[:6]]
+    row_count = len(arrays[0])
+    if row_count <= 0 or any(len(values) != row_count for values in arrays):
+        raise RuntimeError("MoneyDJ K 線欄位長度不一致")
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(arrays[0], errors="coerce"),
+        "close": pd.to_numeric(pd.Series(arrays[1]), errors="coerce"),
+        "high": pd.to_numeric(pd.Series(arrays[2]), errors="coerce"),
+        "low": pd.to_numeric(pd.Series(arrays[3]), errors="coerce"),
+        "open": pd.to_numeric(pd.Series(arrays[4]), errors="coerce"),
+        # MoneyDJ 圖表明示成交量單位為「張」；統一轉成股，與 FinMind／TWSE schema 相同。
+        "Trading_Volume": pd.to_numeric(pd.Series(arrays[5]), errors="coerce") * 1000.0,
+    })
+    out = out[out["date"].notna()].copy()
+    out["date"] = out["date"].dt.strftime("%Y/%m/%d")
+    for column in ["open", "high", "low", "close", "Trading_Volume"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+
+    out = out[
+        (out[["open", "high", "low", "close"]] > 0).all(axis=1)
+        & (out["Trading_Volume"] > 0)
+    ].copy()
+    if out.empty:
+        raise RuntimeError(f"MoneyDJ K 線沒有有效資料：{stock_code}")
+
+    # czkc1 不提供成交金額。先以 OHLC4 × 成交股數估算，後續會優先用交易所月資料覆蓋。
+    typical_price = out[["open", "high", "low", "close"]].mean(axis=1)
+    out["Trading_money"] = typical_price * out["Trading_Volume"]
+    out = out.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+    return out
+
+
+def _pattern_moneydj_price_dataframe(stock_code, start_date, end_date, *, adjusted):
+    """MoneyDJ 原始／還原日 K 主來源；連線失敗時可沿用上次成功的本機型態快取。"""
+    if not PATTERN_MONEYDJ_ENABLED:
+        return _pattern_empty_price_dataframe(), "DISABLED"
+
+    stock_code = _normalize_pattern_stock_code(stock_code)
+    start_key = normalize_date_str(start_date)
+    end_key = normalize_date_str(end_date)
+    mode = "A" if adjusted else "D"
+    memory_key = (stock_code, mode)
+
+    with _TOP15_PATTERN_MONEYDJ_CACHE_LOCK:
+        cached = _TOP15_PATTERN_MONEYDJ_CACHE.get(memory_key)
+        if cached is not None:
+            full = cached.copy()
+            filtered = full[(full["date"] >= start_key) & (full["date"] <= end_key)].copy()
+            return filtered.reset_index(drop=True), "MoneyDJMemory"
+
+    errors = []
+    full = None
+    for base_url in PATTERN_MONEYDJ_KLINE_URLS:
+        try:
+            response = get_thread_session().get(
+                base_url,
+                params={
+                    "a": stock_code,
+                    "b": mode,
+                    "c": PATTERN_MONEYDJ_KLINE_LIMIT,
+                    "E": 1,
+                    "ver": 5,
+                },
+                headers={
+                    "User-Agent": MONEYDJ_HEADERS.get("User-Agent", "Mozilla/5.0"),
+                    "Accept": "text/plain, */*",
+                    "Referer": f"https://pscnetsecrwd.moneydj.com/z/zc/zcw/zcw1_{stock_code}.djhtm",
+                },
+                timeout=(5, 25),
+            )
+            response.raise_for_status()
+            full = _pattern_parse_moneydj_kline(response.text, stock_code, adjusted=adjusted)
+            break
+        except Exception as exc:
+            errors.append(f"{base_url}:{type(exc).__name__}:{exc}")
+
+    source = "MoneyDJ"
+    cache_path = _pattern_moneydj_cache_path(stock_code, adjusted)
+    if full is None or full.empty:
+        source = "MoneyDJDiskCache"
+        try:
+            full = pd.read_csv(cache_path, dtype={"date": str})
+            required = {"date", "open", "high", "low", "close", "Trading_Volume", "Trading_money"}
+            if not required.issubset(full.columns):
+                raise RuntimeError("本機快取欄位不足")
+            full["date"] = full["date"].map(normalize_date_str)
+            full = full.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        except Exception as cache_exc:
+            detail = "；".join(errors[-3:])
+            raise RuntimeError(
+                f"MoneyDJ {mode} K 線與本機快取皆不可用：{stock_code}｜{detail}｜"
+                f"cache={type(cache_exc).__name__}:{cache_exc}"
+            ) from cache_exc
+    elif USE_CACHE:
+        try:
+            temp_path = f"{cache_path}.tmp"
+            full.to_csv(temp_path, index=False, encoding=CACHE_ENCODING)
+            os.replace(temp_path, cache_path)
+        except Exception as exc:
+            print(f"  ⚠️ TOP15型態 MoneyDJ K 線快取寫入失敗：{stock_code} {mode}｜{exc}")
+
+    with _TOP15_PATTERN_MONEYDJ_CACHE_LOCK:
+        _TOP15_PATTERN_MONEYDJ_CACHE[memory_key] = full.copy()
+
+    filtered = full[(full["date"] >= start_key) & (full["date"] <= end_key)].copy()
+    return filtered.reset_index(drop=True), source
+
+
+def _pattern_parse_roc_date(value):
+    text_value = str(value or "").strip()
+    match = re.fullmatch(r"(\d{2,3})/(\d{1,2})/(\d{1,2})", text_value)
+    if match:
+        return f"{int(match.group(1)) + 1911:04d}/{int(match.group(2)):02d}/{int(match.group(3)):02d}"
+    return normalize_date_str(text_value)
+
+
+def _pattern_official_month_dataframe(stock_code, month_dt):
+    """交易所月資料只用來補 MoneyDJ 沒有的精確成交金額；不改寫 MoneyDJ OHLC。"""
+    month_key = month_dt.strftime("%Y%m")
+    cache_key = (stock_code, month_key)
+    with _TOP15_PATTERN_OFFICIAL_MONTH_CACHE_LOCK:
+        cached = _TOP15_PATTERN_OFFICIAL_MONTH_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+    rows = []
+    session = get_thread_session()
+    endpoints = [
+        (
+            "TWSE",
+            "https://www.twse.com.tw/exchangeReport/STOCK_DAY",
+            {"response": "json", "date": f"{month_key}01", "stockNo": stock_code},
+        ),
+        (
+            "TPEx",
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
+            {"code": stock_code, "date": month_dt.strftime("%Y/%m/01"), "response": "json"},
+        ),
+    ]
+
+    for market_name, url, params in endpoints:
+        try:
+            response = session.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, */*"},
+                timeout=(5, 20),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            tables = []
+            if market_name == "TWSE" and isinstance(payload.get("fields"), list):
+                tables.append((payload.get("fields", []), payload.get("data", []), 1.0, 1.0))
+            elif market_name == "TPEx":
+                for table in payload.get("tables", []) if isinstance(payload, dict) else []:
+                    tables.append((table.get("fields", []), table.get("data", []), 1000.0, 1000.0))
+
+            for headers, data_rows, volume_scale, money_scale in tables:
+                normalized_headers = [_pattern_normalized_column_name(value) for value in headers]
+                aliases = {
+                    "date": ["日期"],
+                    "volume": ["成交股數", "成交張數", "成交量"],
+                    "money": ["成交金額", "成交仟元", "成交千元", "成交值"],
+                }
+
+                def find_index(kind):
+                    candidates = {_pattern_normalized_column_name(value) for value in aliases[kind]}
+                    return next((idx for idx, header in enumerate(normalized_headers) if header in candidates), None)
+
+                date_idx, volume_idx, money_idx = find_index("date"), find_index("volume"), find_index("money")
+                if None in (date_idx, volume_idx, money_idx):
+                    continue
+                for values in data_rows if isinstance(data_rows, list) else []:
+                    if not isinstance(values, (list, tuple)) or max(date_idx, volume_idx, money_idx) >= len(values):
+                        continue
+                    volume = safe_price_float(values[volume_idx])
+                    money = safe_price_float(values[money_idx])
+                    date_key = _pattern_parse_roc_date(values[date_idx])
+                    if date_key and volume is not None and money is not None and volume > 0 and money > 0:
+                        rows.append({
+                            "date": date_key,
+                            "Trading_Volume": float(volume) * volume_scale,
+                            "Trading_money": float(money) * money_scale,
+                        })
+            if rows:
+                break
+        except Exception:
+            continue
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        result = pd.DataFrame(columns=["date", "Trading_Volume", "Trading_money"])
+    else:
+        result = result.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+    with _TOP15_PATTERN_OFFICIAL_MONTH_CACHE_LOCK:
+        _TOP15_PATTERN_OFFICIAL_MONTH_CACHE[cache_key] = result.copy()
+    return result
+
+
+def _pattern_enrich_moneydj_turnover(frame, stock_code, start_date, end_date):
+    if frame is None or frame.empty or not PATTERN_OFFICIAL_TURNOVER_ENRICH_ENABLED:
+        return frame, 0
+    start_dt = parse_date(start_date)
+    end_dt = parse_date(end_date)
+    if not start_dt or not end_dt:
+        return frame, 0
+
+    official_parts = []
+    for month_key in iter_month_starts(start_dt, end_dt):
+        month_dt = datetime.strptime(month_key, "%Y%m%d")
+        part = _pattern_official_month_dataframe(stock_code, month_dt)
+        if part is not None and not part.empty:
+            official_parts.append(part)
+    if not official_parts:
+        return frame, 0
+
+    official = pd.concat(official_parts, ignore_index=True).drop_duplicates(subset=["date"], keep="last")
+    official_map = official.set_index("date")
+    out = frame.copy()
+    matched = out["date"].isin(official_map.index)
+    if matched.any():
+        matched_dates = out.loc[matched, "date"]
+        out.loc[matched, "Trading_Volume"] = matched_dates.map(official_map["Trading_Volume"]).to_numpy()
+        out.loc[matched, "Trading_money"] = matched_dates.map(official_map["Trading_money"]).to_numpy()
+    return out, int(matched.sum())
+
+
+def _pattern_history_is_complete(frame, target_date):
+    if frame is None or frame.empty:
+        return False
+    valid = frame[
+        (frame["date"] <= normalize_date_str(target_date))
+        & (pd.to_numeric(frame["close"], errors="coerce") > 0)
+    ]
+    return len(valid) >= PATTERN_LOOKBACK and normalize_date_str(target_date) in set(valid["date"])
+
+
+def _pattern_load_price_histories(stock_code, fetch_start, target_dt):
+    """MoneyDJ 優先、FinMind 備援；回傳標準化的還原價、原始價與來源說明。"""
+    target_key = normalize_date_str(target_dt)
+    source_parts = []
+    adjusted = original = None
+
+    if PATTERN_MONEYDJ_ENABLED:
+        try:
+            adjusted, adjusted_source = _pattern_moneydj_price_dataframe(
+                stock_code, fetch_start, target_dt, adjusted=True
+            )
+            if _pattern_history_is_complete(adjusted, target_key):
+                source_parts.append("MoneyDJAdj" if adjusted_source == "MoneyDJ" else adjusted_source + "Adj")
+            else:
+                adjusted = None
+        except Exception:
+            adjusted = None
+        try:
+            original, original_source = _pattern_moneydj_price_dataframe(
+                stock_code, fetch_start, target_dt, adjusted=False
+            )
+            if _pattern_history_is_complete(original, target_key):
+                original, official_count = _pattern_enrich_moneydj_turnover(
+                    original, stock_code, fetch_start, target_dt
+                )
+                source_parts.append("MoneyDJRaw" if original_source == "MoneyDJ" else original_source + "Raw")
+                source_parts.append("OfficialTurnover" if official_count else "EstimatedTurnover")
+            else:
+                original = None
+        except Exception:
+            original = None
+
+    fallback_errors = []
+    if adjusted is None and PATTERN_FINMIND_FALLBACK_ENABLED:
+        try:
+            adjusted_raw = _pattern_finmind_dataframe(
+                PATTERN_PRICE_DATASET, stock_code, fetch_start, target_dt
+            )
+            adjusted = _pattern_normalize_price_dataframe(adjusted_raw, stock_code, adjusted=True)
+            if not _pattern_history_is_complete(adjusted, target_key):
+                adjusted = None
+            else:
+                source_parts.append("FinMindAdjFallback")
+        except Exception as exc:
+            fallback_errors.append(f"adj={type(exc).__name__}:{exc}")
+
+    if original is None and PATTERN_FINMIND_FALLBACK_ENABLED:
+        try:
+            original_raw = _pattern_finmind_dataframe(
+                "TaiwanStockPrice", stock_code, fetch_start, target_dt
+            )
+            original = _pattern_normalize_price_dataframe(original_raw, stock_code, adjusted=False)
+            if not _pattern_history_is_complete(original, target_key):
+                original = None
+            else:
+                source_parts.append("FinMindRawFallback")
+        except Exception as exc:
+            fallback_errors.append(f"raw={type(exc).__name__}:{exc}")
+
+    if adjusted is None or original is None:
+        missing = []
+        if adjusted is None:
+            missing.append("還原日線")
+        if original is None:
+            missing.append("原始日線")
+        detail = "；".join(fallback_errors)
+        raise RuntimeError(
+            f"型態行情不足：{stock_code} 缺{'、'.join(missing)}；MoneyDJ 主來源不可用或資料不足"
+            + (f"；FinMind備援={detail}" if detail else "")
+        )
+
+    return adjusted, original, "+".join(dict.fromkeys(source_parts))
+
+
 def _pattern_numeric_series(series):
     return pd.to_numeric(
         series.astype(str).str.replace(",", "", regex=False).str.strip(),
@@ -16142,7 +16502,29 @@ def _pattern_trading_dates_on_or_before(target_date):
     if not target_dt:
         return []
     target_day = target_dt.date()
-    return [day for day in get_finmind_trading_dates() if day <= target_day]
+    # 0050 MoneyDJ 日 K 作為型態專用交易日曆；FinMind 只在 MoneyDJ 日曆不可用時備援。
+    if PATTERN_MONEYDJ_ENABLED:
+        try:
+            calendar_start = target_dt - timedelta(days=max(PATTERN_MONEYDJ_KLINE_LIMIT * 2, 400))
+            calendar_df, _ = _pattern_moneydj_price_dataframe(
+                PATTERN_MONEYDJ_CALENDAR_CODE,
+                calendar_start,
+                target_dt,
+                adjusted=False,
+            )
+            dates = pd.to_datetime(calendar_df.get("date"), errors="coerce").dropna().dt.date.tolist()
+            dates = sorted({day for day in dates if day <= target_day})
+            if dates:
+                return dates
+        except Exception as exc:
+            print(f"  ⚠️ MoneyDJ 型態交易日曆取得失敗，嘗試 FinMind 備援：{type(exc).__name__}: {exc}")
+
+    if PATTERN_FINMIND_FALLBACK_ENABLED:
+        try:
+            return [day for day in get_finmind_trading_dates() if day <= target_day]
+        except Exception:
+            pass
+    return []
 
 
 def _pattern_fetch_start_date(target_date):
@@ -16179,7 +16561,7 @@ def _pattern_trading_day_gap(start_date, end_date):
     end_dt = parse_date(end_date)
     if not start_dt or not end_dt or start_dt >= end_dt:
         return 0 if start_dt == end_dt else 999999
-    dates = get_finmind_trading_dates()
+    dates = _pattern_trading_dates_on_or_before(end_dt)
     if dates:
         return sum(1 for day in dates if start_dt.date() < day <= end_dt.date())
     count = 0
@@ -16754,6 +17136,8 @@ def _build_single_top15_pattern(stock_code, target_date):
         PATTERN_PROFILE_LOOKBACK, PATTERN_PROFILE_BINS, PATTERN_PROFILE_WEIGHT,
         PATTERN_PROFILE_BODY_WEIGHT, PATTERN_PROFILE_SHADOW_WEIGHT, PATTERN_PROFILE_PRICE_BASE,
         PATTERN_PROFILE_EXCLUDE_TARGET_DAY,
+        PATTERN_MONEYDJ_ENABLED, PATTERN_FINMIND_FALLBACK_ENABLED,
+        PATTERN_OFFICIAL_TURNOVER_ENRICH_ENABLED, PATTERN_MONEYDJ_KLINE_LIMIT,
     )
     with _TOP15_PATTERN_RESULT_CACHE_LOCK:
         cached = _TOP15_PATTERN_RESULT_CACHE.get(cache_key)
@@ -16781,32 +17165,24 @@ def _build_single_top15_pattern(stock_code, target_date):
         return result
 
     try:
-        adjusted_raw = _pattern_finmind_dataframe(
-            PATTERN_PRICE_DATASET,
+        adjusted, original, pattern_price_source = _pattern_load_price_histories(
             stock_code,
             fetch_start,
             target_dt,
         )
-        original_raw = _pattern_finmind_dataframe(
-            "TaiwanStockPrice",
-            stock_code,
-            fetch_start,
-            target_dt,
-        )
-        adjusted = _pattern_normalize_price_dataframe(adjusted_raw, stock_code, adjusted=True)
-        original = _pattern_normalize_price_dataframe(original_raw, stock_code, adjusted=False)
     except Exception as exc:
         result = _pattern_empty_result(
             stock_code,
             target_date,
             "TARGET_ADJ_MISSING",
-            f"還原／原始股價取得失敗：{type(exc).__name__}: {exc}",
+            f"MoneyDJ 主來源／FinMind 備援皆無法形成完整型態行情：{type(exc).__name__}: {exc}",
         )
         with _TOP15_PATTERN_RESULT_CACHE_LOCK:
             _TOP15_PATTERN_RESULT_CACHE[cache_key] = dict(result)
         return result
 
-    # 統計日原始收盤與成交金額：FinMind 優先，未發布時才用官方 TWSE／TPEx 單日資料。
+    # 統計日原始收盤與成交金額：MoneyDJ 歷史主來源已先用交易所成交額補強；
+    # 若統計日仍缺欄位，再以 TWSE／TPEx 單日全市場資料補最後一層。
     original_target = original[original["date"] == target_date].copy()
     if original_target.empty or not (
         top15_safe_float(original_target.iloc[-1].get("close"), 0) > 0
@@ -16845,7 +17221,7 @@ def _build_single_top15_pattern(stock_code, target_date):
     target_adj = adjusted[adjusted["date"] == target_date].copy()
     bridge_factor = None
     company_action_status = "NOT_REQUIRED"
-    price_source = "FinMindAdj"
+    price_source = pattern_price_source or "MoneyDJ"
 
     if target_adj.empty:
         if not PATTERN_ALLOW_TARGET_BRIDGE:
