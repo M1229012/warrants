@@ -2713,7 +2713,7 @@ GSHEET_COMPACT_MIN_COLS = max(int(os.getenv("GSHEET_COMPACT_MIN_COLS", "1")), 1)
 GSHEET_WRITE_SLEEP_SECONDS = float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS", "0.05"))
 GSHEET_WRITE_RATE_PER_MINUTE = max(float(os.getenv("GSHEET_WRITE_RATE_PER_MINUTE", "45")), 1.0)
 GSHEET_WRITE_BURST = max(float(os.getenv("GSHEET_WRITE_BURST", "5")), 1.0)
-GSHEET_MAX_RETRIES = int(os.getenv("GSHEET_MAX_RETRIES", "6"))
+GSHEET_MAX_RETRIES = max(int(os.getenv("GSHEET_MAX_RETRIES", "6")), 1)
 GSHEET_RETRY_BASE_SECONDS = float(os.getenv("GSHEET_RETRY_BASE_SECONDS", "12"))
 
 _GSHEET_CLIENT = None
@@ -3222,14 +3222,40 @@ def gsheet_enabled():
     return bool(get_gcp_service_key())
 
 
+def _gsheet_http_status_code(exc):
+    """盡量從 gspread／requests 例外取出 HTTP 狀態碼。"""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    try:
+        if status_code is not None:
+            return int(status_code)
+    except (TypeError, ValueError):
+        pass
+
+    msg = str(exc or "")
+    match = re.search(r"\[(429|500|502|503|504)\]", msg)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def is_gsheet_quota_error(exc):
-    msg = str(exc)
+    msg = str(exc or "")
     return (
-        "429" in msg
+        _gsheet_http_status_code(exc) == 429
         or "Quota exceeded" in msg
         or "RESOURCE_EXHAUSTED" in msg
         or "Write requests per minute" in msg
     )
+
+
+def is_gsheet_retryable_error(exc):
+    """只重試配額、Google 伺服器端錯誤與短暫網路中斷。"""
+    if is_gsheet_quota_error(exc):
+        return True
+    if _gsheet_http_status_code(exc) in {500, 502, 503, 504}:
+        return True
+    return isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 
 
 def gsheet_write_sleep():
@@ -3275,8 +3301,8 @@ def gsheet_api_call(description, func, *args, **kwargs):
     """
     所有 Google Sheets API 動作統一走同一個 token bucket：
     1. 寫入、格式與 repair 回讀驗證都先節流。
-    2. 遇到 429／RESOURCE_EXHAUSTED 自動等待重試。
-    3. 暫時性配額錯誤會在 API 層重試，不會被誤判成值不一致。
+    2. 遇到 429／RESOURCE_EXHAUSTED、500／502／503／504 或短暫斷線自動等待重試。
+    3. 暫時性 API 錯誤會在 API 層重試，不會被誤判成值不一致。
     """
     last_error = None
 
@@ -3287,12 +3313,18 @@ def gsheet_api_call(description, func, *args, **kwargs):
         except Exception as e:
             last_error = e
 
-            if not is_gsheet_quota_error(e):
+            if not is_gsheet_retryable_error(e):
                 raise
 
+            if attempt >= GSHEET_MAX_RETRIES:
+                break
+
             wait_seconds = min(90, GSHEET_RETRY_BASE_SECONDS * attempt)
+            status_code = _gsheet_http_status_code(e)
+            error_label = f"HTTP {status_code}" if status_code else type(e).__name__
             print(
-                f"  ⚠️ Google Sheet 觸發 API 配額限制，{description} 第 {attempt}/{GSHEET_MAX_RETRIES} 次重試，"
+                f"  ⚠️ Google Sheet 暫時性錯誤（{error_label}），{description} "
+                f"第 {attempt}/{GSHEET_MAX_RETRIES - 1} 次重試，"
                 f"等待 {wait_seconds:.0f} 秒..."
             )
             time.sleep(wait_seconds)
@@ -3333,7 +3365,7 @@ def get_gsheet_spreadsheet():
     開啟主 Google Sheet，嚴格避免寫錯檔案。
 
     安全規則：
-    1. 有 GOOGLE_SHEET_ID：只能 open_by_key；失敗直接報錯，絕不建立另一份同名檔案。
+    1. 有 GOOGLE_SHEET_ID：只能 open_by_key；暫時性錯誤重試後仍失敗才報錯，絕不建立另一份同名檔案。
     2. repair + RUN_MODE=2：預設必須有 GOOGLE_SHEET_ID。
     3. 沒有 ID 的非 repair 流程：先依名稱開啟；只有 GSHEET_MAIN_ALLOW_CREATE=1 才可新建。
     4. 成功後會印出實際試算表 ID／網址，供 GitHub Actions 日誌核對。
@@ -3356,7 +3388,11 @@ def get_gsheet_spreadsheet():
 
     if GOOGLE_SHEET_ID:
         try:
-            _GSHEET_SPREADSHEET = gc.open_by_key(GOOGLE_SHEET_ID)
+            _GSHEET_SPREADSHEET = gsheet_api_call(
+                "開啟指定主試算表",
+                gc.open_by_key,
+                GOOGLE_SHEET_ID,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"指定的 GOOGLE_SHEET_ID 無法開啟：{GOOGLE_SHEET_ID}｜"
