@@ -16092,11 +16092,12 @@ def _pattern_empty_price_dataframe():
 def _pattern_moneydj_cache_path(stock_code, adjusted):
     mode = "A" if adjusted else "D"
     safe_code = re.sub(r"[^0-9A-Z]", "", str(stock_code or "").upper())
-    return os.path.join(PATTERN_MONEYDJ_CACHE_DIR, f"{safe_code}_{mode}.csv")
+    # v2 修正 czkc1 的 OHLC 順序（日期、開、高、低、收、量），禁止沿用舊錯位快取。
+    return os.path.join(PATTERN_MONEYDJ_CACHE_DIR, f"{safe_code}_{mode}_v2.csv")
 
 
 def _pattern_parse_moneydj_kline(text, stock_code, *, adjusted):
-    """解析 MoneyDJ czkc1 K 線：日期、收、高、低、開、成交量（張）。"""
+    """解析 MoneyDJ czkc1 K 線：日期、開、高、低、收、成交量（張）。"""
     raw_text = str(text or "").strip()
     if not raw_text or "<p" in raw_text.lower() or "<html" in raw_text.lower():
         raise RuntimeError("MoneyDJ K 線回傳空白或 HTML 錯誤頁")
@@ -16112,10 +16113,10 @@ def _pattern_parse_moneydj_kline(text, stock_code, *, adjusted):
 
     out = pd.DataFrame({
         "date": pd.to_datetime(arrays[0], errors="coerce"),
-        "close": pd.to_numeric(pd.Series(arrays[1]), errors="coerce"),
+        "open": pd.to_numeric(pd.Series(arrays[1]), errors="coerce"),
         "high": pd.to_numeric(pd.Series(arrays[2]), errors="coerce"),
         "low": pd.to_numeric(pd.Series(arrays[3]), errors="coerce"),
-        "open": pd.to_numeric(pd.Series(arrays[4]), errors="coerce"),
+        "close": pd.to_numeric(pd.Series(arrays[4]), errors="coerce"),
         # MoneyDJ 圖表明示成交量單位為「張」；統一轉成股，與 FinMind／TWSE schema 相同。
         "Trading_Volume": pd.to_numeric(pd.Series(arrays[5]), errors="coerce") * 1000.0,
     })
