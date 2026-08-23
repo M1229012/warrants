@@ -361,6 +361,12 @@ TOP15_PRICE_LOOKBACK_DAYS = int(os.getenv("TOP15_PRICE_LOOKBACK_DAYS", os.getenv
 TOP15_PRICE_STALE_DAYS = int(os.getenv("TOP15_PRICE_STALE_DAYS", os.getenv("TOP15_RETURN_PRICE_STALE_DAYS", "0")))
 TOP15_REQUIRE_TARGET_DATE_PRICE = os.getenv("TOP15_REQUIRE_TARGET_DATE_PRICE", "1").strip().lower() not in ("0", "false", "no")
 TOP15_MIN_BROKER_REMAINING_COST = max(float(os.getenv("TOP15_MIN_BROKER_REMAINING_COST", "100000")), 0.0)
+TOP15_RANK_REQUIRE_CONFIRMED_POSITION = os.getenv(
+    "TOP15_RANK_REQUIRE_CONFIRMED_POSITION", "1"
+).strip().lower() not in ("0", "false", "no")
+TOP15_RANK_REQUIRE_KNOWN_LIFECYCLE = os.getenv(
+    "TOP15_RANK_REQUIRE_KNOWN_LIFECYCLE", "1"
+).strip().lower() not in ("0", "false", "no")
 TOP15_FAIL_ON_MISSING_PRICE = os.getenv("TOP15_FAIL_ON_MISSING_PRICE", "1").strip().lower() not in ("0", "false", "no")
 TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN = os.getenv("TOP15_EXCLUDE_MISSING_PRICE_FROM_RETURN", "1").strip().lower() not in ("0", "false", "no")
 # TOP15 統計日沒有成交價時，改向權證資訊揭露平台查詢流動量提供者最佳委買價。
@@ -10106,21 +10112,61 @@ def items_from_history_cache(history_df, candidate_filter=None):
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    group_cols = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "分點名稱", "券商代號"]
+    # FIFO 的唯一身分只能使用穩定欄位。權證名稱、標的名稱或分點標籤可能因
+    # FinMind／MoneyDJ 補正而在不同日期略有差異；若把這些顯示欄放進 groupby，
+    # 同一券商＋同一權證會被拆成多個 item，後續 item_map 只留下其中一段歷史，
+    # 最常見的結果就是保留買進日、卻遺失後續賣出日，造成已出清仍顯示持有。
+    df["_券商代號鍵"] = df["券商代號"].map(normalize_broker_code_for_compare)
+    df["_權證代號鍵"] = df["權證代號"].map(_normalize_warrant_code_for_identity)
+    df["_日期鍵"] = df["日期"].map(normalize_date_str)
+    df = df[
+        (df["_券商代號鍵"] != "")
+        & (df["_權證代號鍵"] != "")
+        & (df["_日期鍵"] != "")
+    ].copy()
+    df = df.sort_values(["_券商代號鍵", "_權證代號鍵", "_日期鍵"]).drop_duplicates(
+        subset=["_券商代號鍵", "_權證代號鍵", "_日期鍵"],
+        keep="last",
+    )
 
-    for key, g in df.groupby(group_cols, dropna=False):
-        warrant_code, warrant_name, underlying_code, underlying_name, broker_label, broker_name, broker_code = key
+    def latest_nonempty(group, column):
+        if column not in group.columns:
+            return ""
+        values = [str(value or "").strip() for value in group[column].tolist()]
+        return next((value for value in reversed(values) if value), "")
+
+    _label_to_code, configured_code_to_label = configured_broker_pair_maps_for_scope("all")
+
+    for key, g in df.groupby(["_券商代號鍵", "_權證代號鍵"], dropna=False, sort=False):
+        broker_code_key, warrant_code = key
+        g = g.sort_values("_日期鍵").reset_index(drop=True)
+
+        configured_broker = configured_code_to_label.get(broker_code_key)
+        if configured_broker:
+            broker_label, broker_code = configured_broker
+            broker_name = str(
+                FULL_FALLBACK.get(broker_label, (broker_label, broker_code))[0]
+                or broker_label
+            ).strip()
+        else:
+            broker_label = latest_nonempty(g, "分點")
+            broker_name = latest_nonempty(g, "分點名稱") or broker_label
+            broker_code = latest_nonempty(g, "券商代號") or broker_code_key
+
+        warrant_name = latest_nonempty(g, "權證名稱")
+        underlying_code = latest_nonempty(g, "標的股")
+        underlying_name = latest_nonempty(g, "標的名稱")
 
         item_df = g[[
-            "日期", "買進股數", "賣出股數",
+            "_日期鍵", "買進股數", "賣出股數",
             "買進金額", "賣出金額", "買超股數", "買超金額"
         ]].copy()
 
-        item_df["日期"] = item_df["日期"].map(normalize_date_str)
+        item_df = item_df.rename(columns={"_日期鍵": "日期"})
         item_df = item_df.sort_values("日期").reset_index(drop=True)
 
         item = {
-            "warrant_code": _normalize_warrant_code_for_identity(warrant_code),
+            "warrant_code": warrant_code,
             "warrant_name": str(warrant_name).strip(),
             "underlying_code": str(underlying_code).strip(),
             "underlying_name": str(underlying_name).strip(),
@@ -14111,7 +14157,7 @@ def get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
     避免同一筆賣出被不同事件重複使用。
     """
     key = (
-        str(broker_code).strip(),
+        normalize_broker_code_for_compare(broker_code),
         _normalize_warrant_code_for_identity(warrant_code),
     )
 
@@ -14121,6 +14167,9 @@ def get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code):
     item = item_map.get(key)
     if not item:
         item = item_map.get((key[0], normalize_price_code(key[1])))
+    if not item:
+        # 相容舊呼叫端尚未正規化的 item_map；避免大小寫或代號格式差異漏掉賣出。
+        item = _top15_find_item(item_map, key[0], key[1])
 
     rows = []
 
@@ -14159,7 +14208,7 @@ def simulate_group_outcomes_fifo(events, item_map):
     1. 每個符合條件的事件各自保留成一筆資料，不合併。
     2. 同一分點 + 同一權證的賣出，只能使用一次。
     3. 賣出依事件成立時間由早到晚扣；舊事件未扣完前，不得先扣新事件。
-    4. 同日買賣不互扣：賣出日必須晚於該事件結束日。
+    4. 同日賣出先扣較舊事件，仍有餘額才抵銷當日事件買進。
     5. 減碼 / 出清只看事件 lots 的剩餘股數；金額只計算已實現報酬。
     """
     if not events:
@@ -14260,8 +14309,9 @@ def simulate_group_outcomes_fifo(events, item_map):
                 if sell_left <= 0:
                     break
 
-                # 事件視窗內的買賣已反映在事件成立金額 / 股數中；只扣事件結束日之後的賣出。
-                if sell_date <= ref["event_end_date"]:
+                # 金額分級仍看當日完整買進力道，但持倉必須反映當日賣出；
+                # 同日沒有盤中順序，統一採 FIFO：先扣舊事件，再抵銷當日事件。
+                if sell_date < ref["event_end_date"]:
                     continue
 
                 lot = ref["lot"]
@@ -15060,6 +15110,72 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
         _top15_finalize_lot_metadata(lot)
         for _, lot in sorted(lot_map.items(), key=lambda x: x[0])
     ]
+
+
+def _top15_warrant_lifecycle_for_position_lot(lot, target_date):
+    """依買進日鎖定權證生命週期，避免代號重用時誤拿新一輪到期日。"""
+    code = normalize_price_code(lot.get("權證代號", ""))
+    buy_dt = parse_date(lot.get("買進日") or lot.get("事件日", ""))
+    target_dt = parse_date(target_date) or datetime.today()
+    intervals = (_get_warrant_price_lifecycle_index() or {}).get(code, [])
+    if not code or not intervals:
+        return None, None
+
+    containing = []
+    for list_dt, end_dt in intervals:
+        reference_dt = buy_dt or target_dt
+        if list_dt and reference_dt < list_dt:
+            continue
+        if end_dt and reference_dt > end_dt:
+            continue
+        containing.append((list_dt, end_dt))
+
+    if not containing:
+        return None, None
+
+    return max(
+        containing,
+        key=lambda value: (
+            value[0] or datetime.min,
+            value[1] or datetime.max,
+        ),
+    )
+
+
+def exclude_expired_top15_position_lots(position_lots, target_date):
+    """
+    排除統計日已超過最後交易日的權證部位。
+
+    到期／下市不是券商實際賣出，因此不偽造出清日與出清損益；
+    但該權證已不可交易，不能再用歷史價格備援進入 TOP15 持倉排名。
+    """
+    target_dt = parse_date(target_date) or datetime.today()
+    kept = []
+    excluded = []
+    unknown = []
+
+    for lot in position_lots or []:
+        list_dt, end_dt = _top15_warrant_lifecycle_for_position_lot(
+            lot,
+            target_dt,
+        )
+        lot["權證上市日"] = normalize_date_str(list_dt) if list_dt else ""
+        lot["權證最後交易日"] = normalize_date_str(end_dt) if end_dt else ""
+
+        if end_dt and end_dt.date() < target_dt.date():
+            lot["排名資格"] = "排除：已過最後交易日"
+            excluded.append(lot)
+            continue
+
+        if not end_dt and TOP15_RANK_REQUIRE_KNOWN_LIFECYCLE:
+            lot["排名資格"] = "排除：權證生命週期未確認"
+            unknown.append(lot)
+            continue
+
+        lot["排名資格"] = "可排名" if end_dt else "可排名（生命週期未確認）"
+        kept.append(lot)
+
+    return kept, excluded, unknown
 
 
 def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, window_start=None):
@@ -17681,8 +17797,48 @@ def build_top15_position_detail_and_consensus_rows(
         if top15_safe_float(lot.get("剩餘成本", 0)) > 0 and top15_safe_float(lot.get("剩餘股數", 0)) > 0
     ]
 
+    (
+        position_lots,
+        expired_position_lots,
+        unknown_lifecycle_lots,
+    ) = exclude_expired_top15_position_lots(position_lots, target_date)
+    if expired_position_lots:
+        expired_cost = sum(
+            top15_safe_float(lot.get("剩餘成本", 0))
+            for lot in expired_position_lots
+        )
+        expired_codes = sorted({
+            _normalize_warrant_code_for_identity(lot.get("權證代號", ""))
+            for lot in expired_position_lots
+            if _normalize_warrant_code_for_identity(lot.get("權證代號", ""))
+        })
+        sample = "、".join(expired_codes[:10])
+        suffix = "…" if len(expired_codes) > 10 else ""
+        print(
+            f"  ✅ TOP15排名前排除已到期／下市權證："
+            f"{len(expired_position_lots):,} 筆｜剩餘成本 {expired_cost:,.0f} 元｜"
+            f"{sample}{suffix}"
+        )
+    if unknown_lifecycle_lots:
+        unknown_cost = sum(
+            top15_safe_float(lot.get("剩餘成本", 0))
+            for lot in unknown_lifecycle_lots
+        )
+        unknown_codes = sorted({
+            _normalize_warrant_code_for_identity(lot.get("權證代號", ""))
+            for lot in unknown_lifecycle_lots
+            if _normalize_warrant_code_for_identity(lot.get("權證代號", ""))
+        })
+        sample = "、".join(unknown_codes[:10])
+        suffix = "…" if len(unknown_codes) > 10 else ""
+        print(
+            f"  ⚠️ TOP15排名前排除生命週期未確認權證："
+            f"{len(unknown_lifecycle_lots):,} 筆｜剩餘成本 {unknown_cost:,.0f} 元｜"
+            f"{sample}{suffix}"
+        )
+
     if not position_lots:
-        print("  ⚠️ TOP15固定資料集：扣除賣出後沒有剩餘部位")
+        print("  ⚠️ TOP15固定資料集：扣除賣出及已過最後交易日權證後沒有剩餘部位")
         return [], []
 
     if allow_price_fetch:
@@ -18016,6 +18172,8 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     - 先依「標的股＋分點」完整加總剩餘部位。
     - 分點合計剩餘成本低於 TOP15_MIN_BROKER_REMAINING_COST 時，
       僅保留在部位明細，不納入共識 TOP15 的金額、排名、報酬率與參與分點數。
+    - 已出清（剩餘股數或剩餘成本為 0）一定在排名前排除。
+    - 找不到完整分點歷史、無法確認仍持有的 lot 預設只留稽核明細，不進排名。
     """
     if not detail_rows:
         return []
@@ -18028,8 +18186,31 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
     # 第一階段先依「標的股＋分點」彙總，避免逐 lot 套門檻時誤刪
     # 兩筆各 6 萬、合計其實達 12 萬的有效分點部位。
     broker_agg = {}
+    excluded_closed_count = 0
+    excluded_unconfirmed_count = 0
+    excluded_unconfirmed_cost = 0.0
+    unconfirmed_fifo_statuses = {
+        "缺少分點歷史",
+        "分點歷史為空",
+        "歷史缺少事件買進列",
+    }
 
     for row in detail_rows:
+        remaining_qty = top15_safe_float(row.get("剩餘股數", 0))
+        remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
+        if remaining_qty <= 0 or remaining_cost <= 0:
+            excluded_closed_count += 1
+            continue
+
+        fifo_status = str(row.get("FIFO完整狀態", "OK")).strip() or "OK"
+        if (
+            TOP15_RANK_REQUIRE_CONFIRMED_POSITION
+            and fifo_status in unconfirmed_fifo_statuses
+        ):
+            excluded_unconfirmed_count += 1
+            excluded_unconfirmed_cost += remaining_cost
+            continue
+
         underlying = str(row.get("標的股", "")).strip()
         if not underlying:
             continue
@@ -18064,7 +18245,6 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             "FIFO狀態集合": set(),
         })
 
-        remaining_cost = top15_safe_float(row.get("剩餘成本", 0))
         market_value = top15_safe_float(row.get("目前市值", 0), 0.0) if row.get("目前市值", "") != "" else 0.0
         pnl = top15_safe_float(row.get("未實現損益", 0), 0.0) if row.get("未實現損益", "") != "" else 0.0
         price_status = str(row.get("價格狀態", "")).strip()
@@ -18075,8 +18255,6 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
         )
         warrant_name = str(row.get("權證名稱", "")).strip()
         latest_price_date = str(row.get("最新價格日期", "")).strip()
-        fifo_status = str(row.get("FIFO完整狀態", "OK")).strip() or "OK"
-
         broker_rec["淨買超成本"] += remaining_cost
         if price_status == "OK":
             broker_rec["可估成本"] += remaining_cost
@@ -18105,6 +18283,17 @@ def build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time):
             broker_rec["最新價格日期集合"].add(latest_price_date)
         if fifo_status and fifo_status != "OK":
             broker_rec["FIFO狀態集合"].add(fifo_status)
+
+    if excluded_closed_count > 0:
+        print(
+            f"  ✅ TOP15排名前排除已出清部位：{excluded_closed_count:,} 筆"
+        )
+    if excluded_unconfirmed_count > 0:
+        print(
+            f"  ⚠️ TOP15排名前排除未確認持倉：{excluded_unconfirmed_count:,} 筆｜"
+            f"原始剩餘成本 {excluded_unconfirmed_cost:,.0f} 元；"
+            "仍保留於部位明細供稽核"
+        )
 
     # 第二階段套用「分點＋標的」合計門檻，再建立標的股總表。
     agg = {}
