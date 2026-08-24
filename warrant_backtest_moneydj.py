@@ -691,6 +691,10 @@ def configure_run_mode():
         print(f"  ⚠️ RUN_MODE={RUN_MODE} 不支援，改用 RUN_MODE=1 精選分點模式。")
         RUN_MODE = 1
 
+    # 券商代號比對是大小寫敏感的；設定裡若出現只差大小寫的代號會抓錯分點，
+    # 直接在啟動時擋下來，不要等資料混進歷史才發現。
+    assert_broker_codes_case_unique()
+
     if RUN_MODE == 1:
         selected_labels = parse_selected_target_labels()
         missing = [label for label in selected_labels if label not in FULL_TARGET_PATTERNS]
@@ -978,8 +982,49 @@ def configured_broker_codes_for_scope(scope="all"):
 
 
 def normalize_broker_code_for_compare(value):
-    """將券商代號轉成穩定比較格式，避免大小寫或空白造成誤判。"""
-    return str(value or "").strip().upper()
+    """
+    將券商代號轉成穩定比較格式。
+
+    只去前後空白，**不可轉大小寫**：台灣分公司代號大小寫敏感，
+    例如 9A9g 是永豐金內湖、9A9G 是永豐金天母，只差一個字母大小寫。
+    舊版在這裡做 .upper()，導致天母的成交被當成內湖收進來，
+    兩家的買賣股數與金額還會在 items_from_history_cache() 的
+    groupby 被合併成同一個 item。
+    """
+    return str(value or "").strip()
+
+
+def assert_broker_codes_case_unique(fallback_map=None):
+    """
+    啟動時檢查設定的分點代號沒有「只差大小寫」的組合。
+
+    代號比對已改成大小寫敏感，但只要有人把 9A9g 誤植成 9A9G，
+    仍會靜靜抓錯分點。這裡直接讓它在啟動時就被發現。
+    """
+    fallback_map = FULL_FALLBACK if fallback_map is None else fallback_map
+    by_upper = defaultdict(list)
+
+    for label, pair in (fallback_map or {}).items():
+        code = str(pair[1] or "").strip()
+        if code:
+            by_upper[code.upper()].append((label, code))
+
+    collisions = {
+        upper_code: entries
+        for upper_code, entries in by_upper.items()
+        if len({code for _label, code in entries}) > 1
+    }
+
+    if collisions:
+        detail = "；".join(
+            f"{upper_code}: " + "／".join(f"{label}={code}" for label, code in entries)
+            for upper_code, entries in sorted(collisions.items())
+        )
+        raise RuntimeError(
+            f"FALLBACK 內有只差大小寫的券商代號，無法區分分點：{detail}"
+        )
+
+    return True
 
 
 def configured_broker_pair_maps_for_scope(scope="all"):
@@ -6387,8 +6432,9 @@ def _normalize_result_key_value(column, value):
     Google Sheet 讀回時常見差異：
     - 日期可能是 yyyy/mm/dd、yyyy-mm-dd，或日期序號 46xxx。
     - 0 開頭的六碼權證可能被讀成五碼。
-    - 券商代號可能有大小寫差異。
     - 儲存格可能帶有 Google Sheet 的文字前導單引號。
+
+    注意：券商代號的大小寫是有意義的（9A9g 內湖 / 9A9G 天母），不做大小寫正規化。
 
     這些都只是顯示／儲存格式差異，不應被視為新資料。
     """
@@ -10005,6 +10051,73 @@ def workflow_is_longterm():
 
 
 
+def purge_case_collision_history_rows(df):
+    """
+    清掉舊快取裡因為券商代號大小寫碰撞而混進來的別家分點資料。
+
+    分公司代號大小寫敏感（9A9g 永豐金內湖 / 9A9G 永豐金天母），舊版比對前
+    先做 .upper()，未設定的分點會被寫成設定內分點的代號與標籤，只有「分點名稱」
+    還留著來源的真實名稱。
+
+    判定刻意保守：同一個券商代號底下出現兩種以上分點名稱時，才依該分點自己的
+    名稱樣式挑出正確的那一組；名稱一致、或沒有任何一組（或全部）符合樣式時
+    一律保留，只印警告不刪資料。
+    """
+    stats = {"removed": 0, "codes": [], "ambiguous": []}
+
+    if df is None or df.empty:
+        return df, stats
+    if not {"券商代號", "分點名稱", "分點"}.issubset(df.columns):
+        return df, stats
+
+    drop_index = []
+
+    for broker_code, group in df.groupby("券商代號", sort=False):
+        names = {
+            str(value or "").strip()
+            for value in group["分點名稱"].tolist()
+            if str(value or "").strip()
+        }
+        if len(names) <= 1:
+            continue
+
+        label = ""
+        for candidate in group["分點"].tolist():
+            candidate = str(candidate or "").strip()
+            if candidate in FULL_TARGET_PATTERNS:
+                label = candidate
+                break
+
+        if not label:
+            stats["ambiguous"].append((str(broker_code), sorted(names)))
+            continue
+
+        pattern = FULL_TARGET_PATTERNS[label]
+        matched = {name for name in names if re.search(pattern, name)}
+
+        if not matched:
+            # 沒有任何一組符合自己的名稱樣式：無法判斷誰才是對的，保留全部只做提醒。
+            stats["ambiguous"].append((str(broker_code), sorted(names)))
+            continue
+
+        if matched == names:
+            # 全部都符合，只是名稱寫法不同（例如有無連字號），不是碰撞。
+            continue
+
+        bad_names = names - matched
+        mask = group["分點名稱"].map(
+            lambda value: str(value or "").strip() in bad_names
+        )
+        drop_index.extend(group.loc[mask].index.tolist())
+        stats["codes"].append((str(broker_code), label, sorted(bad_names)))
+
+    if drop_index:
+        stats["removed"] = len(drop_index)
+        df = df.drop(index=drop_index).reset_index(drop=True)
+
+    return df, stats
+
+
 def load_history_cache():
     df = read_cache_csv(HISTORY_CACHE_PATH)
 
@@ -10033,6 +10146,23 @@ def load_history_cache():
         subset=["權證代號", "券商代號", "日期"],
         keep="last"
     ).reset_index(drop=True)
+
+    out_df, collision_stats = purge_case_collision_history_rows(out_df)
+    if collision_stats["removed"]:
+        for code, label, bad_names in collision_stats["codes"]:
+            print(
+                f"  🧹 券商代號大小寫碰撞清理：{code}（{label}）移除誤掛的分點名稱 "
+                f"{'、'.join(bad_names)}"
+            )
+        print(
+            f"  🧹 共移除 {collision_stats['removed']:,} 筆別家分點誤掛的歷史；"
+            "建議跑一次 repair 補回正確分點的完整歷史。"
+        )
+    for code, names in collision_stats["ambiguous"]:
+        print(
+            f"  ⚠️ 券商代號 {code} 在歷史快取中有多個分點名稱：{'、'.join(names)}；"
+            "無法自動判斷，請確認是否需要重建歷史。"
+        )
 
     out_df, prune_stats = prune_history_cache_dataframe(out_df)
     if prune_stats.get("removed", 0) > 0:
@@ -11615,8 +11745,10 @@ def normalize_finmind_warrant_day(raw_df, warrants, broker_map, date_value):
     df["stock_id"] = df["stock_id"].map(
         _normalize_warrant_code_for_identity
     )
+    # 分公司代號大小寫敏感（9A9g 內湖 vs 9A9G 天母），只能去空白不能轉大寫，
+    # 否則未設定的分點會被當成設定內的分點收進歷史。
     df["securities_trader_id"] = (
-        df["securities_trader_id"].astype(str).str.strip().str.upper()
+        df["securities_trader_id"].astype(str).str.strip()
     )
     df = df[
         df["stock_id"].isin(warrant_map)
@@ -14200,7 +14332,8 @@ def get_group_daily_rows_for_warrant(item_map, broker_code, warrant_code):
     if not item:
         item = item_map.get((key[0], normalize_price_code(key[1])))
     if not item:
-        # 相容舊呼叫端尚未正規化的 item_map；避免大小寫或代號格式差異漏掉賣出。
+        # 相容舊呼叫端尚未正規化的 item_map；只放寬權證代號格式，
+        # 券商代號仍是大小寫敏感的精準比對。
         item = _top15_find_item(item_map, key[0], key[1])
 
     if not item:
@@ -15032,18 +15165,19 @@ def get_latest_price_info_on_or_before(price_cache, code, target_date):
 
 
 def _top15_find_item(item_map, broker_code, warrant_code):
-    """用券商代號與權證代號的常見正規化形式尋找原始分點歷史項目。"""
+    """
+    用權證代號的常見正規化形式尋找原始分點歷史項目。
+
+    券商代號一律「大小寫敏感」精準比對：分公司代號只差大小寫就是不同分點
+    （9A9g 永豐金內湖 / 9A9G 永豐金天母），寬鬆比對會把兩家的部位混在一起。
+    只有權證代號允許補零／去雜訊等格式正規化。
+    """
     item_map = item_map or {}
     broker_code = str(broker_code or "").strip()
     warrant_code = str(warrant_code or "").strip()
 
     if not broker_code or not warrant_code:
         return None
-
-    broker_candidates = []
-    for value in [broker_code, broker_code.upper(), broker_code.lower()]:
-        if value and value not in broker_candidates:
-            broker_candidates.append(value)
 
     warrant_candidates = []
     for value in [
@@ -15055,18 +15189,16 @@ def _top15_find_item(item_map, broker_code, warrant_code):
         if value and value not in warrant_candidates:
             warrant_candidates.append(value)
 
-    for bc in broker_candidates:
-        for wc in warrant_candidates:
-            item = item_map.get((bc, wc))
-            if item:
-                return item
+    for wc in warrant_candidates:
+        item = item_map.get((broker_code, wc))
+        if item:
+            return item
 
-    normalized_broker = broker_code.upper()
     normalized_warrant = normalize_warrant_code_for_unique(warrant_code)
     normalized_price_warrant = normalize_price_code(warrant_code)
 
     for (raw_broker, raw_warrant), item in item_map.items():
-        if str(raw_broker or "").strip().upper() != normalized_broker:
+        if str(raw_broker or "").strip() != broker_code:
             continue
         raw_warrant_text = str(raw_warrant or "").strip()
         if (
@@ -15263,7 +15395,8 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
             "剩餘成本": buy_amount,
             "來源": source_text,
         }
-        dedup_key = (broker_code_text.upper(), warrant_code, buy_date)
+        # 券商代號大小寫敏感：9A9g 與 9A9G 是兩家分點，不能合併成同一個 lot。
+        dedup_key = (broker_code_text, warrant_code, buy_date)
         lot_map[dedup_key] = _top15_merge_lot_metadata(lot_map.get(dedup_key), incoming)
         return True
 
@@ -15440,13 +15573,14 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, windo
         buy_date = normalize_date_str(lot.get("買進日") or lot.get("事件日", ""))
         if not broker_code or not warrant_code or not parse_date(buy_date):
             continue
-        key = (broker_code.upper(), warrant_code)
+        # 券商代號大小寫敏感：9A9g 與 9A9G 是兩家分點，不能併成同一組 FIFO。
+        key = (broker_code, warrant_code)
         templates_by_key.setdefault(key, {})[buy_date] = lot
 
     rebuilt_event_lots = []
 
     for key, templates_by_date in templates_by_key.items():
-        broker_code_upper, warrant_code = key
+        _key_broker_code, warrant_code = key
         sample_template = next(iter(templates_by_date.values()))
         broker_code = str(sample_template.get("券商代號", "")).strip()
         item = _top15_find_item(item_map, broker_code, warrant_code)
@@ -22687,8 +22821,9 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
 
     selected_brokers = parse_warrant_consensus_selected_brokers()
     selected_broker_set = set(selected_brokers)
+    # 券商代號大小寫敏感（9A9g 內湖 / 9A9G 天母），不能用 lower() 比對。
     selected_broker_codes = {
-        str(FULL_FALLBACK[label][1]).strip().lower()
+        str(FULL_FALLBACK[label][1]).strip()
         for label in selected_brokers
         if label in FULL_FALLBACK
     }
@@ -22742,7 +22877,7 @@ def build_7d_warrant_consensus_top15_rows(items, target_date=None):
         for item in items:
             broker_label = str(item.get("broker_label", "")).strip()
             broker_code = str(item.get("broker_code", "")).strip()
-            broker_code_key = broker_code.lower()
+            broker_code_key = broker_code
 
             if broker_label not in selected_broker_set and broker_code_key not in selected_broker_codes:
                 continue
@@ -25074,10 +25209,12 @@ def _moneydj_scan_candidates(
                 if not info:
                     continue
                 label, broker_name, canonical_code = info
-                # API4 的券商代號比對可以忽略大小寫，但 API5 的 b 參數大小寫敏感。
-                # 例如 API4 回傳 9A9g，API5 若改傳快取中的 9A9G 會成功回 HTTP 200
-                # 卻回傳空 Result。故同時保留標準代號與 API4 原始代號：
-                # 前者寫入快取／Sheet，後者只用於本次 API5 請求。
+                # API4 與 API5 的券商代號都大小寫敏感：9A9g 是永豐金內湖、
+                # 9A9G 是永豐金天母，兩家不同。code_map 已改成大小寫敏感比對，
+                # 未設定的分點會在上面 `if not info: continue` 直接被排除。
+                # API5 的 b 參數若傳錯大小寫會回 HTTP 200 但空 Result，故同時
+                # 保留標準代號與 API4 原始代號：前者寫入快取／Sheet，
+                # 後者只用於本次 API5 請求。
                 api_broker_code = str(row.get("V2", "")).strip() or canonical_code
                 found.append((
                     code,
