@@ -3687,6 +3687,27 @@ def daily_warrant_net_from_dates(dates, events: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# 精選分點的「查詢區間之前」歷史事件，只用來給 FIFO 建立期初庫存。
+# 沿用 _FINMIND_WARRANT_RUN_STATS 的做法，以股票代號為 key 在模組層交接，
+# 避免為了這一段資料改動 fetch → generate → plot 一整條函式簽章。
+_SELECTED_BRANCH_FIFO_PRELOAD: Dict[str, pd.DataFrame] = {}
+_SELECTED_BRANCH_FIFO_PRELOAD_LOCK = threading.Lock()
+
+
+def _set_selected_branch_fifo_preload(stock_code: str, rows) -> None:
+    code = _normalize_stock_name_code_key(stock_code)
+    frame = pd.DataFrame(rows or [])
+    with _SELECTED_BRANCH_FIFO_PRELOAD_LOCK:
+        _SELECTED_BRANCH_FIFO_PRELOAD[code] = frame
+
+
+def _get_selected_branch_fifo_preload(stock_code: str) -> pd.DataFrame:
+    code = _normalize_stock_name_code_key(stock_code)
+    with _SELECTED_BRANCH_FIFO_PRELOAD_LOCK:
+        frame = _SELECTED_BRANCH_FIFO_PRELOAD.get(code)
+    return frame.copy() if frame is not None and not frame.empty else pd.DataFrame()
+
+
 def _warrant_expiry_date_map(warrant_codes: set) -> dict:
     """權證代號 → 到期日（MOPS 種子檔）。讀不到就回空 dict，FIFO 便不做到期歸零。
 
@@ -3700,7 +3721,7 @@ def _warrant_expiry_date_map(warrant_codes: set) -> dict:
     try:
         seed = _load_warrant_seed()
     except Exception as exc:
-        print(f"⚠️ FIFO 持有成本取不到權證到期日，改為不做到期歸零：{exc}")
+        print(f"⚠️ FIFO 庫存成本取不到權證到期日，改為不做到期歸零：{exc}")
         return {}
     if seed is None or seed.empty or "end_date" not in seed.columns or "code" not in seed.columns:
         return {}
@@ -3720,13 +3741,18 @@ def _warrant_expiry_date_map(warrant_codes: set) -> dict:
     return out
 
 
-def selected_branch_fifo_holding_cost(dates, events: pd.DataFrame) -> pd.DataFrame:
-    """逐權證 FIFO 結轉，算出每個日期「尚未賣出部位」的買進成本。
+def selected_branch_fifo_holding_cost(
+    dates,
+    events: pd.DataFrame,
+    preload_events: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """逐權證 FIFO 結轉，算出每個日期「尚未賣出部位」的買進成本（庫存成本）。
 
-    原本的累計線畫的是累計淨現金流（買進 − 賣出），恆等於
-    ``目前持有成本 + 已實現損益``。券商把舊權證賣掉換成新權證的那一天，
+    原本的累計線畫的是累計淨現金流（買進 − 賣出），恆等式是
+    ``庫存成本 = 累計淨現金流 + 已實現損益``，也就是那條線把「還壓在市場上的錢」
+    和「已經落袋的損益」混在一起了。券商把舊權證賣掉換成新權證的那一天，
     買賣互相抵銷、線是平的，看起來像什麼都沒發生，但部位其實已經整批換掉、
-    成本基準與到期日也跟著換了，圖上讀到的買超成本因此會和實際持有成本有落差。
+    成本基準與到期日也跟著換了，圖上讀到的買超成本因此會和實際庫存成本有落差。
 
     這裡只算「還沒賣掉的張數 × 當初買進均價」，換倉當天線就會跳動，
     線的值就是該分點目前真正壓在市場上的成本。
@@ -3737,7 +3763,11 @@ def selected_branch_fifo_holding_cost(dates, events: pd.DataFrame) -> pd.DataFra
       因此同日當沖只會沖掉當天的量，不會誤扣更早的部位。
     - 權證到期後不會再有賣出列，存貨不歸零會讓成本線虛高，
       所以到期日（含）之後直接把該權證剩餘部位清掉。
-    - 回看視窗之前買進、視窗內賣出會造成負庫存，這裡夾在 0，
+    - ``preload_events`` 是查詢區間之前的同分點事件，用來建立期初庫存。
+      沒有它的話，「買在視窗之前、賣在視窗之內」的賣出會找不到 lot 可扣，
+      庫存永遠平不掉，庫存成本被高估、已實現損益也跟著虛增。
+      這些列只參與結轉，不會出現在回傳的日期軸上。
+    - 補了期初庫存後仍然扣不掉的賣出（真的更早以前買的）夾在 0，
       並把筆數放進 ``attrs`` 讓呼叫端印出來。
 
     單位：``buy_shares`` / ``sell_shares`` 是張，``buy_amount`` 是元，
@@ -3750,13 +3780,24 @@ def selected_branch_fifo_holding_cost(dates, events: pd.DataFrame) -> pd.DataFra
     out.attrs["fifo_oversold_rows"] = 0
     out.attrs["fifo_missing_share_rows"] = 0
     out.attrs["fifo_expired_codes"] = 0
+    out.attrs["fifo_preload_rows"] = 0
     if events is None or events.empty or len(axis) == 0:
         return out
 
     need_cols = {"Date", "warrant_code", "buy_amount", "sell_amount", "buy_shares", "sell_shares"}
     if not need_cols.issubset(events.columns):
-        print(f"⚠️ FIFO 持有成本缺少欄位，改為不畫持有成本線：{sorted(need_cols - set(events.columns))}")
+        print(f"⚠️ FIFO 庫存成本缺少欄位，改為不畫庫存成本線：{sorted(need_cols - set(events.columns))}")
         return out
+
+    # 期初庫存：只取軸起點之前、欄位齊全的列，接在事件表前面一起結轉。
+    if preload_events is not None and not preload_events.empty and need_cols.issubset(preload_events.columns):
+        pre = preload_events.copy()
+        pre["Date"] = pd.to_datetime(pre["Date"], errors="coerce").dt.normalize()
+        pre = pre.dropna(subset=["Date"])
+        pre = pre[pre["Date"] < axis[0]]
+        if not pre.empty:
+            out.attrs["fifo_preload_rows"] = int(len(pre))
+            events = pd.concat([pre[sorted(need_cols)], events], ignore_index=True)
 
     e = events.copy()
     e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
@@ -12111,16 +12152,21 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_sell_vals = selected_branch_daily_net["sell_amount"].astype(float).values
     selected_latest_buy = float(selected_buy_vals[-1]) if len(selected_buy_vals) else 0.0
     selected_latest_sell = float(selected_sell_vals[-1]) if len(selected_sell_vals) else 0.0
-    # 折線改成 FIFO 未平倉成本，取代原本的累計淨現金流。
-    selected_hold_df = selected_branch_fifo_holding_cost(selected_flow_dates, selected_branch_events)
+    # 折線改成 FIFO 庫存成本（尚未賣出部位的買進金額），取代原本的累計淨現金流。
+    selected_hold_df = selected_branch_fifo_holding_cost(
+        selected_flow_dates,
+        selected_branch_events,
+        preload_events=_get_selected_branch_fifo_preload(stock_code),
+    )
     selected_hold_vals = selected_hold_df["holding_cost"].astype(float).values
     selected_latest_hold = float(selected_hold_vals[-1]) if len(selected_hold_vals) else 0.0
     selected_total_net = float(selected_branch_week_events["net_amount"].sum()) if selected_branch_week_events is not None and not selected_branch_week_events.empty else 0.0
     selected_total_color = RED if selected_total_net >= 0 else GREEN
     print(
-        f"📐 精選分點 FIFO 持有成本：最新 {fmt_money(selected_latest_hold)}｜"
+        f"📐 精選分點 FIFO 庫存成本：最新 {fmt_money(selected_latest_hold)}｜"
+        f"期初庫存列={selected_hold_df.attrs.get('fifo_preload_rows', 0)}｜"
         f"到期歸零權證={selected_hold_df.attrs.get('fifo_expired_codes', 0)}支｜"
-        f"視窗外買進造成的超賣列={selected_hold_df.attrs.get('fifo_oversold_rows', 0)}｜"
+        f"仍扣不掉的賣出列={selected_hold_df.attrs.get('fifo_oversold_rows', 0)}｜"
         f"有金額無張數列={selected_hold_df.attrs.get('fifo_missing_share_rows', 0)}"
     )
 
@@ -12143,7 +12189,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
-    draw_header_text_and_advance(selected_wnet_ax, xpos, f"持有成本 {fmt_money(selected_latest_hold)}", BLUE, gap_px=0)
+    draw_header_text_and_advance(selected_wnet_ax, xpos, f"累積金額 {fmt_money(selected_latest_hold)}", BLUE, gap_px=0)
 
     selected_branch_names_for_render = list(ctx.get("_selected_branch_names_snapshot") or _get_selected_branch_flow_list())
     selected_branch_label = "、".join(selected_branch_names_for_render)
@@ -17619,8 +17665,22 @@ def _moneydj_api4_range_rows(warrant: dict, start_day, end_day, depth: int = 0) 
     return merged, "", left_trunc + right_trunc
 
 
-def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) -> tuple[list, str]:
-    """API5 取回看 N 日的逐日資料，再只保留落在查詢區間內的交易日。"""
+def _moneydj_api5_range_one(
+    pair: dict,
+    start_day,
+    end_day,
+    lookback_days: int,
+    collect_preload: bool = False,
+) -> tuple[list, list, str]:
+    """API5 取回看 N 列的逐日資料，只保留落在查詢區間內的交易日。
+
+    ``collect_preload=True`` 時額外把「查詢區間之前」的列也收回來（第二個回傳值）。
+    API5 的 c 參數是列數不是日曆天，而每個 (權證, 分點) 實際有交易的天數通常
+    遠少於 200，所以這些列本來就已經連同區間內的資料一起抓回來了，
+    只是原本被這裡直接丟掉。精選分點用它來建立期初庫存，FIFO 才不會因為
+    「買在視窗之前、賣在視窗之內」找不到 lot 可扣而把庫存成本灌高。
+    這批資料只餵給 FIFO，不會併進主 events，以免污染權證資金流與 TOP5。
+    """
     code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
     broker = str(pair.get("broker_code", "") or "").strip()
     start_ts = pd.Timestamp(start_day).normalize()
@@ -17644,12 +17704,16 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
         # 同一個 (權證, 分點) 回應內若出現重複日期，與 warrant_backtest_moneydj 一致
         # 只保留最後一列，不做加總，避免重複列在後面的 groupby 被加成兩倍。
         by_day = {}
+        preload_by_day = {}
         for row in api_rows:
             dt = parse_date(row.get("V1", ""))
             if not dt:
                 continue
             day = pd.Timestamp(dt).normalize()
-            if day < start_ts or day > end_ts:
+            if day > end_ts:
+                continue
+            is_preload = day < start_ts
+            if is_preload and not collect_preload:
                 continue
             buy_shares = int(_moneydj_number(row.get("V2", 0)))
             sell_shares = int(_moneydj_number(row.get("V3", 0)))
@@ -17658,7 +17722,7 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
             if buy_amount == 0 and sell_amount == 0:
                 continue
             net_amount = buy_amount - sell_amount
-            by_day[day] = {
+            record = {
                 "Date": day,
                 "branch": normalize_branch_name(pair.get("branch", "")),
                 "broker_code": broker,
@@ -17672,11 +17736,15 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
                 "buy_shares": buy_shares,
                 "sell_shares": sell_shares,
                 "side": "買超" if net_amount >= 0 else "賣超",
-                "data_source": "MoneyDJ_primary",
+                "data_source": "MoneyDJ_primary_preload" if is_preload else "MoneyDJ_primary",
             }
-        return list(by_day.values()), ""
+            if is_preload:
+                preload_by_day[day] = record
+            else:
+                by_day[day] = record
+        return list(by_day.values()), list(preload_by_day.values()), ""
     except Exception as exc:
-        return [], str(exc)
+        return [], [], str(exc)
 
 
 def _moneydj_range_events(
@@ -17843,17 +17911,29 @@ def _moneydj_range_events(
         int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
     )
     event_rows = []
+    preload_rows = []
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API5_WORKERS) as executor:
         future_map = {
-            executor.submit(_moneydj_api5_range_one, pair, start_ts, end_ts, lookback_days): pair
+            executor.submit(
+                _moneydj_api5_range_one,
+                pair,
+                start_ts,
+                end_ts,
+                lookback_days,
+                str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
+            ): pair
             for pair in pairs.values()
         }
         for future in as_completed(future_map):
-            rows, error = future.result()
+            rows, pre_rows, error = future.result()
             if error:
                 stats["api5_failed"] += 1
                 continue
             event_rows.extend(rows)
+            preload_rows.extend(pre_rows)
+
+    # 精選分點的視窗前歷史只給 FIFO 建期初庫存，另外存放，不併進 events。
+    _set_selected_branch_fifo_preload(stock_code, preload_rows)
 
     if stats["api5_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
         raise RuntimeError(
