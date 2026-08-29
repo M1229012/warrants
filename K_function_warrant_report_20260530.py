@@ -119,6 +119,11 @@ MONEYDJ_API4_ROWS = max(50, int(os.getenv("MONEYDJ_API4_ROWS", "500")))
 MONEYDJ_API4_RANGE_ROWS = max(
     MONEYDJ_API4_ROWS, int(os.getenv("MONEYDJ_API4_RANGE_ROWS", "3000"))
 )
+# API4 回傳列數觸頂＝被 e 參數截斷，該權證會有分點整段消失，分點買賣超因此少算。
+# 觸頂時自動把日期區間切半重查再合併，這是允許的最大切分深度（4 → 最多 16 段）。
+MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH = max(
+    0, int(os.getenv("MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH", "4"))
+)
 MONEYDJ_API4 = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
     "TwWarrantData.xdjjson?a={code}&x=warrant-chip0002-4&c={start}&d={end}"
@@ -16726,6 +16731,51 @@ def _hybrid_moneydj_api4_one(warrant: dict, target_day: pd.Timestamp) -> tuple[l
         return [], str(exc)
 
 
+# MoneyDJ 的 V2～V5 會回傳帶千分位的字串（例："1,234"）。
+# 舊版直接 float("1,234") 會丟 ValueError，被 API5 解析區塊的 except 整列吃掉，
+# 結果是「金額越大的那幾天越容易整列消失」，分點買賣超因此被系統性低估，
+# 與 warrant_backtest_moneydj 對同一支 API5 的結果對不起來。
+# 這裡與 warrant_backtest_moneydj 的 _moneydj_int() 對齊：先去千分位再轉數值。
+_MONEYDJ_NUMBER_STATS_LOCK = threading.Lock()
+_MONEYDJ_NUMBER_STATS = {"comma_fixed": 0, "unparsable": 0}
+
+
+def _moneydj_number(value) -> float:
+    """MoneyDJ 數值欄位轉 float；容忍千分位、全形符號與空值，解析不了才回 0。"""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s or s in ("-", "--", "N/A", "n/a", "nan", "None"):
+        return 0.0
+    cleaned = (
+        s.replace(",", "")
+        .replace("，", "")
+        .replace("＋", "")
+        .replace("+", "")
+        .replace(" ", "")
+        .replace("　", "")
+    )
+    try:
+        result = float(cleaned)
+    except Exception:
+        with _MONEYDJ_NUMBER_STATS_LOCK:
+            _MONEYDJ_NUMBER_STATS["unparsable"] += 1
+        return 0.0
+    if cleaned != s:
+        with _MONEYDJ_NUMBER_STATS_LOCK:
+            _MONEYDJ_NUMBER_STATS["comma_fixed"] += 1
+    return result
+
+
+def _moneydj_number_stats_snapshot() -> dict:
+    with _MONEYDJ_NUMBER_STATS_LOCK:
+        return dict(_MONEYDJ_NUMBER_STATS)
+
+
 def _hybrid_moneydj_api5_one(pair: dict, target_day: pd.Timestamp) -> tuple[list, str]:
     code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
     broker = str(pair.get("broker_code", "") or "").strip()
@@ -16745,23 +16795,22 @@ def _hybrid_moneydj_api5_one(pair: dict, target_day: pd.Timestamp) -> tuple[list
             else {}
         )
         api_rows = result_set.get("Result", []) or []
-        out = []
+        # 同一個 (權證, 分點) 回應內若出現重複日期，與 warrant_backtest_moneydj 一致
+        # 只保留最後一列，不做加總，避免重複列被 groupby 加成兩倍。
+        by_day = {}
         day = pd.Timestamp(target_day).normalize()
         for row in api_rows:
             dt = parse_date(row.get("V1", ""))
             if not dt or pd.Timestamp(dt).normalize() != day:
                 continue
-            try:
-                buy_shares = int(float(row.get("V2", 0) or 0))
-                sell_shares = int(float(row.get("V3", 0) or 0))
-                buy_amount = float(row.get("V4", 0) or 0) * 1000.0
-                sell_amount = float(row.get("V5", 0) or 0) * 1000.0
-            except Exception:
-                continue
+            buy_shares = int(_moneydj_number(row.get("V2", 0)))
+            sell_shares = int(_moneydj_number(row.get("V3", 0)))
+            buy_amount = _moneydj_number(row.get("V4", 0)) * 1000.0
+            sell_amount = _moneydj_number(row.get("V5", 0)) * 1000.0
             if buy_amount == 0 and sell_amount == 0:
                 continue
             net_amount = buy_amount - sell_amount
-            out.append({
+            by_day[day] = {
                 "Date": day,
                 "branch": normalize_branch_name(pair.get("branch", "")),
                 "broker_code": broker,
@@ -16776,8 +16825,8 @@ def _hybrid_moneydj_api5_one(pair: dict, target_day: pd.Timestamp) -> tuple[list
                 "sell_shares": sell_shares,
                 "side": "買超" if net_amount >= 0 else "賣超",
                 "data_source": "MoneyDJ_latest_day",
-            })
-        return out, ""
+            }
+        return list(by_day.values()), ""
     except Exception as exc:
         return [], str(exc)
 
@@ -17382,6 +17431,44 @@ def _moneydj_api4_range_one(warrant: dict, start_day, end_day) -> tuple[list, st
         return [], str(exc)
 
 
+def _moneydj_api4_range_rows(warrant: dict, start_day, end_day, depth: int = 0) -> tuple[list, str, int]:
+    """API4 區間查詢；列數觸頂代表被 e 參數截斷，改切半區間重查再合併。
+
+    直接沿用截斷結果會讓該權證的部分分點整段消失，分點買賣超被系統性低估，
+    所以這裡遞迴切分日期區間，直到不再觸頂或達到 MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH。
+    任何一半失敗就退回原本（可能被截斷的）結果，確保不會比舊版更差。
+    """
+    rows, error = _moneydj_api4_range_one(warrant, start_day, end_day)
+    if error:
+        return [], error, 0
+    if len(rows) < MONEYDJ_API4_RANGE_ROWS:
+        return rows, "", 0
+
+    start_ts = pd.Timestamp(start_day).normalize()
+    end_ts = pd.Timestamp(end_day).normalize()
+    if depth >= MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH or start_ts >= end_ts:
+        return rows, "", 1
+
+    mid_ts = pd.Timestamp(start_ts + (end_ts - start_ts) / 2).normalize()
+    if mid_ts < start_ts:
+        mid_ts = start_ts
+    if mid_ts >= end_ts:
+        mid_ts = end_ts - pd.Timedelta(days=1)
+
+    left_rows, left_error, left_trunc = _moneydj_api4_range_rows(
+        warrant, start_ts, mid_ts, depth + 1
+    )
+    right_rows, right_error, right_trunc = _moneydj_api4_range_rows(
+        warrant, mid_ts + pd.Timedelta(days=1), end_ts, depth + 1
+    )
+    if left_error or right_error:
+        return rows, "", 1
+    merged = left_rows + right_rows
+    if len(merged) < len(rows):
+        return rows, "", 1
+    return merged, "", left_trunc + right_trunc
+
+
 def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) -> tuple[list, str]:
     """API5 取回看 N 日的逐日資料，再只保留落在查詢區間內的交易日。"""
     code = normalize_openapi_warrant_code(pair.get("warrant_code", ""))
@@ -17404,7 +17491,9 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
             else {}
         )
         api_rows = result_set.get("Result", []) or []
-        out = []
+        # 同一個 (權證, 分點) 回應內若出現重複日期，與 warrant_backtest_moneydj 一致
+        # 只保留最後一列，不做加總，避免重複列在後面的 groupby 被加成兩倍。
+        by_day = {}
         for row in api_rows:
             dt = parse_date(row.get("V1", ""))
             if not dt:
@@ -17412,17 +17501,14 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
             day = pd.Timestamp(dt).normalize()
             if day < start_ts or day > end_ts:
                 continue
-            try:
-                buy_shares = int(float(row.get("V2", 0) or 0))
-                sell_shares = int(float(row.get("V3", 0) or 0))
-                buy_amount = float(row.get("V4", 0) or 0) * 1000.0
-                sell_amount = float(row.get("V5", 0) or 0) * 1000.0
-            except Exception:
-                continue
+            buy_shares = int(_moneydj_number(row.get("V2", 0)))
+            sell_shares = int(_moneydj_number(row.get("V3", 0)))
+            buy_amount = _moneydj_number(row.get("V4", 0)) * 1000.0
+            sell_amount = _moneydj_number(row.get("V5", 0)) * 1000.0
             if buy_amount == 0 and sell_amount == 0:
                 continue
             net_amount = buy_amount - sell_amount
-            out.append({
+            by_day[day] = {
                 "Date": day,
                 "branch": normalize_branch_name(pair.get("branch", "")),
                 "broker_code": broker,
@@ -17437,8 +17523,8 @@ def _moneydj_api5_range_one(pair: dict, start_day, end_day, lookback_days: int) 
                 "sell_shares": sell_shares,
                 "side": "買超" if net_amount >= 0 else "賣超",
                 "data_source": "MoneyDJ_primary",
-            })
-        return out, ""
+            }
+        return list(by_day.values()), ""
     except Exception as exc:
         return [], str(exc)
 
@@ -17508,20 +17594,20 @@ def _moneydj_range_events(
     api4_truncated = 0
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API4_WORKERS) as executor:
         future_map = {
-            executor.submit(_moneydj_api4_range_one, warrant, start_ts, end_ts): warrant
+            executor.submit(_moneydj_api4_range_rows, warrant, start_ts, end_ts): warrant
             for warrant in warrants
         }
         for future in as_completed(future_map):
             warrant = future_map[future]
-            rows, error = future.result()
+            rows, error, truncated_chunks = future.result()
             if error:
                 stats["api4_failed"] += 1
                 continue
             if not rows:
                 stats["api4_empty"] += 1
                 continue
-            # 回傳列數剛好觸頂時，很可能是被 e 參數截斷，要讓使用者知道。
-            if len(rows) >= MONEYDJ_API4_RANGE_ROWS:
+            # 切分到深度上限仍觸頂的區段，代表分點還是可能少算，要讓使用者知道。
+            if truncated_chunks:
                 api4_truncated += 1
             for row in rows:
                 broker_code = str(row.get("V2", "") or "").strip()
@@ -17539,8 +17625,9 @@ def _moneydj_range_events(
     stats["api4_truncated"] = api4_truncated
     if api4_truncated:
         print(
-            f"⚠️ 有 {api4_truncated} 檔權證 API4 回傳列數觸頂（{MONEYDJ_API4_RANGE_ROWS}），"
-            "分點會少算；請調高 MONEYDJ_API4_RANGE_ROWS。"
+            f"⚠️ 有 {api4_truncated} 檔權證即使切分到深度 {MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH} "
+            f"仍有區段回傳列數觸頂（{MONEYDJ_API4_RANGE_ROWS}），分點仍可能少算；"
+            "請調高 MONEYDJ_API4_RANGE_ROWS 或 MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH。"
         )
     if stats["api4_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
         raise RuntimeError(
@@ -17609,6 +17696,16 @@ def _moneydj_range_events(
         f"API4 failed={stats['api4_failed']}｜API5 failed={stats['api5_failed']}｜"
         f"{stats['elapsed']:.2f}秒"
     )
+    number_stats = _moneydj_number_stats_snapshot()
+    stats["api5_comma_fixed_values"] = int(number_stats.get("comma_fixed", 0))
+    stats["api5_unparsable_values"] = int(number_stats.get("unparsable", 0))
+    if number_stats.get("comma_fixed") or number_stats.get("unparsable"):
+        print(
+            "🔢 MoneyDJ 數值欄位正規化："
+            f"千分位修正={number_stats.get('comma_fixed', 0):,} 個｜"
+            f"仍無法解析={number_stats.get('unparsable', 0):,} 個"
+            "（舊版會把這些列整列丟掉，分點買賣超因此被低估）"
+        )
     return events, stats
 
 
