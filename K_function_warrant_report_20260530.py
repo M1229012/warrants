@@ -3687,6 +3687,141 @@ def daily_warrant_net_from_dates(dates, events: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _warrant_expiry_date_map(warrant_codes: set) -> dict:
+    """權證代號 → 到期日（MOPS 種子檔）。讀不到就回空 dict，FIFO 便不做到期歸零。
+
+    同一個代號會被回收重用，這裡取最晚的到期日，寧可晚一點歸零也不要提早把
+    仍在市的部位清掉。
+    """
+    codes = {str(code or "").strip() for code in (warrant_codes or set())}
+    codes.discard("")
+    if not codes:
+        return {}
+    try:
+        seed = _load_warrant_seed()
+    except Exception as exc:
+        print(f"⚠️ FIFO 持有成本取不到權證到期日，改為不做到期歸零：{exc}")
+        return {}
+    if seed is None or seed.empty or "end_date" not in seed.columns or "code" not in seed.columns:
+        return {}
+    rows = seed[seed["code"].astype(str).isin(codes)]
+    out = {}
+    for row in rows.itertuples(index=False):
+        end_dt = pd.to_datetime(getattr(row, "end_date", None), errors="coerce")
+        if pd.isna(end_dt):
+            continue
+        code = str(getattr(row, "code", "") or "").strip()
+        if not code:
+            continue
+        end_dt = pd.Timestamp(end_dt).normalize()
+        old = out.get(code)
+        if old is None or end_dt > old:
+            out[code] = end_dt
+    return out
+
+
+def selected_branch_fifo_holding_cost(dates, events: pd.DataFrame) -> pd.DataFrame:
+    """逐權證 FIFO 結轉，算出每個日期「尚未賣出部位」的買進成本。
+
+    原本的累計線畫的是累計淨現金流（買進 − 賣出），恆等於
+    ``目前持有成本 + 已實現損益``。券商把舊權證賣掉換成新權證的那一天，
+    買賣互相抵銷、線是平的，看起來像什麼都沒發生，但部位其實已經整批換掉、
+    成本基準與到期日也跟著換了，圖上讀到的買超成本因此會和實際持有成本有落差。
+
+    這裡只算「還沒賣掉的張數 × 當初買進均價」，換倉當天線就會跳動，
+    線的值就是該分點目前真正壓在市場上的成本。
+
+    規則：
+    - 每支權證各自一本存貨，不同權證不互相沖抵。
+    - 同一天先把當天買進掛成新 lot 接在隊尾，再從最舊的 lot 開始扣賣出張數，
+      因此同日當沖只會沖掉當天的量，不會誤扣更早的部位。
+    - 權證到期後不會再有賣出列，存貨不歸零會讓成本線虛高，
+      所以到期日（含）之後直接把該權證剩餘部位清掉。
+    - 回看視窗之前買進、視窗內賣出會造成負庫存，這裡夾在 0，
+      並把筆數放進 ``attrs`` 讓呼叫端印出來。
+
+    單位：``buy_shares`` / ``sell_shares`` 是張，``buy_amount`` 是元，
+    所以 lot 的單位成本是元／張。
+    """
+    axis = pd.to_datetime(pd.Index(list(dates or [])), errors="coerce").dropna().normalize()
+    axis = pd.Index(sorted(pd.unique(axis)))
+    out = pd.DataFrame({"Date": axis})
+    out["holding_cost"] = 0.0
+    out.attrs["fifo_oversold_rows"] = 0
+    out.attrs["fifo_missing_share_rows"] = 0
+    out.attrs["fifo_expired_codes"] = 0
+    if events is None or events.empty or len(axis) == 0:
+        return out
+
+    need_cols = {"Date", "warrant_code", "buy_amount", "sell_amount", "buy_shares", "sell_shares"}
+    if not need_cols.issubset(events.columns):
+        print(f"⚠️ FIFO 持有成本缺少欄位，改為不畫持有成本線：{sorted(need_cols - set(events.columns))}")
+        return out
+
+    e = events.copy()
+    e["Date"] = pd.to_datetime(e["Date"], errors="coerce").dt.normalize()
+    e = e.dropna(subset=["Date"])
+    if e.empty:
+        return out
+    e["warrant_code"] = e["warrant_code"].astype(str).map(normalize_openapi_warrant_code)
+    for col in ["buy_amount", "sell_amount", "buy_shares", "sell_shares"]:
+        e[col] = pd.to_numeric(e[col], errors="coerce").fillna(0.0).astype(float)
+
+    daily = e.groupby(["Date", "warrant_code"], as_index=False).agg({
+        "buy_amount": "sum",
+        "sell_amount": "sum",
+        "buy_shares": "sum",
+        "sell_shares": "sum",
+    })
+    rows_by_date = {day: group for day, group in daily.groupby("Date", sort=True)}
+    expiry_map = _warrant_expiry_date_map(set(daily["warrant_code"].astype(str)))
+
+    lots = {}
+    oversold_rows = 0
+    missing_share_rows = 0
+    expired_codes = set()
+    running = {}
+    all_dates = sorted(set(axis.tolist()) | set(daily["Date"].tolist()))
+    for day in all_dates:
+        group = rows_by_date.get(day)
+        if group is not None:
+            for row in group.itertuples(index=False):
+                code = str(row.warrant_code)
+                queue = lots.setdefault(code, [])
+                if row.buy_shares > 0 and row.buy_amount > 0:
+                    queue.append([float(row.buy_shares), float(row.buy_amount) / float(row.buy_shares)])
+                elif row.buy_amount > 0:
+                    # 有金額但沒張數，算不出單位成本，只能放棄這一列。
+                    missing_share_rows += 1
+                remaining = float(row.sell_shares)
+                while remaining > 1e-9 and queue:
+                    lot = queue[0]
+                    take = min(lot[0], remaining)
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 1e-9:
+                        queue.pop(0)
+                if remaining > 1e-9:
+                    oversold_rows += 1
+
+        for code, end_dt in expiry_map.items():
+            if lots.get(code) and pd.notna(end_dt) and day >= end_dt:
+                lots[code] = []
+                expired_codes.add(code)
+
+        running[day] = float(sum(
+            shares * unit_cost
+            for queue in lots.values()
+            for shares, unit_cost in queue
+        ))
+
+    out["holding_cost"] = [float(running.get(pd.Timestamp(day), 0.0)) for day in axis]
+    out.attrs["fifo_oversold_rows"] = oversold_rows
+    out.attrs["fifo_missing_share_rows"] = missing_share_rows
+    out.attrs["fifo_expired_codes"] = len(expired_codes)
+    return out
+
+
 def build_flow_axis_dates(plot_df: pd.DataFrame, events: pd.DataFrame) -> List[pd.Timestamp]:
     """建立精選分點資金流專用日期軸。
 
@@ -11970,13 +12105,24 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     # 不再與 K 線共用 x 軸，讓今日已更新的精選分點事件可以先出現在資金流圖。
     selected_wnet_ax = fig.add_subplot(gs[6, :])
     style_ax(selected_wnet_ax)
-    selected_vals = selected_branch_daily_net["net_amount"].astype(float).values
-    selected_cum_vals = np.cumsum(selected_vals)
-    selected_latest_net = selected_vals[-1] if len(selected_vals) else 0.0
-    selected_latest_cum = selected_cum_vals[-1] if len(selected_cum_vals) else 0.0
+    # 柱子改成買進／賣出雙邊：換權證那天「買 630 萬、賣 632 萬」在淨額口徑下
+    # 幾乎是 0，看起來像沒動作，拆成雙邊才看得出來是大額換手。
+    selected_buy_vals = selected_branch_daily_net["buy_amount"].astype(float).values
+    selected_sell_vals = selected_branch_daily_net["sell_amount"].astype(float).values
+    selected_latest_buy = float(selected_buy_vals[-1]) if len(selected_buy_vals) else 0.0
+    selected_latest_sell = float(selected_sell_vals[-1]) if len(selected_sell_vals) else 0.0
+    # 折線改成 FIFO 未平倉成本，取代原本的累計淨現金流。
+    selected_hold_df = selected_branch_fifo_holding_cost(selected_flow_dates, selected_branch_events)
+    selected_hold_vals = selected_hold_df["holding_cost"].astype(float).values
+    selected_latest_hold = float(selected_hold_vals[-1]) if len(selected_hold_vals) else 0.0
     selected_total_net = float(selected_branch_week_events["net_amount"].sum()) if selected_branch_week_events is not None and not selected_branch_week_events.empty else 0.0
-    selected_latest_bar_color = RED if selected_latest_net >= 0 else GREEN
     selected_total_color = RED if selected_total_net >= 0 else GREEN
+    print(
+        f"📐 精選分點 FIFO 持有成本：最新 {fmt_money(selected_latest_hold)}｜"
+        f"到期歸零權證={selected_hold_df.attrs.get('fifo_expired_codes', 0)}支｜"
+        f"視窗外買進造成的超賣列={selected_hold_df.attrs.get('fifo_oversold_rows', 0)}｜"
+        f"有金額無張數列={selected_hold_df.attrs.get('fifo_missing_share_rows', 0)}"
+    )
 
     xpos = 0.000
     xpos = draw_header_text_and_advance(
@@ -11985,16 +12131,19 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     )
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
-    xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, selected_latest_bar_color, gap_px=8)
-    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"最新日 {fmt_money(selected_latest_net)}", selected_latest_bar_color, gap_px=22)
+    xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, RED, gap_px=8)
+    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"最新日買進 {fmt_money(selected_latest_buy)}", RED, gap_px=22)
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
-    xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, selected_total_color, gap_px=10)
-    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"本週合計 {fmt_money(selected_total_net)}", selected_total_color, gap_px=22)
+    xpos = draw_header_bar_and_advance(selected_wnet_ax, xpos, GREEN, gap_px=8)
+    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"最新日賣出 {fmt_money(-selected_latest_sell)}", GREEN, gap_px=22)
+
+    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
+    xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, f"本週淨額 {fmt_money(selected_total_net)}", selected_total_color, gap_px=22)
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
-    draw_header_text_and_advance(selected_wnet_ax, xpos, f"累計 {fmt_money(selected_latest_cum)}", BLUE, gap_px=0)
+    draw_header_text_and_advance(selected_wnet_ax, xpos, f"持有成本 {fmt_money(selected_latest_hold)}", BLUE, gap_px=0)
 
     selected_branch_names_for_render = list(ctx.get("_selected_branch_names_snapshot") or _get_selected_branch_flow_list())
     selected_branch_label = "、".join(selected_branch_names_for_render)
@@ -12015,12 +12164,13 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
             bbox=dict(facecolor=PANEL, edgecolor="none", boxstyle="round,pad=0.12", alpha=0.82),
         )
 
-    selected_wnet_ax.bar(selected_x, selected_vals, color=[RED if v >= 0 else GREEN for v in selected_vals], width=0.75, alpha=0.85)
+    selected_wnet_ax.bar(selected_x, selected_buy_vals, color=RED, width=0.75, alpha=0.85)
+    selected_wnet_ax.bar(selected_x, -selected_sell_vals, color=GREEN, width=0.75, alpha=0.85)
     selected_wnet_ax.axhline(0, color=MUTED, linestyle="--", linewidth=1)
 
-    if len(selected_vals):
-        svmin = min(float(np.nanmin(selected_vals)), 0.0)
-        svmax = max(float(np.nanmax(selected_vals)), 0.0)
+    if len(selected_buy_vals) or len(selected_sell_vals):
+        svmax = max(float(np.nanmax(selected_buy_vals)) if len(selected_buy_vals) else 0.0, 0.0)
+        svmin = min(-(float(np.nanmax(selected_sell_vals)) if len(selected_sell_vals) else 0.0), 0.0)
         svspan = max(svmax - svmin, 1.0)
         svpad = svspan * 0.15
         selected_wnet_ax.set_ylim(svmin - svpad, svmax + svpad)
@@ -12029,11 +12179,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_wnet_ax.yaxis.tick_right()
     selected_wnet_ax.tick_params(axis="y", labelsize=22)
     selected_wnet_ax2 = selected_wnet_ax.twinx()
-    selected_wnet_ax2.plot(selected_x, selected_cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
+    selected_wnet_ax2.plot(selected_x, selected_hold_vals, color=BLUE, linewidth=2.1, alpha=0.95)
 
-    if len(selected_cum_vals):
-        scmax = max(float(np.nanmax(selected_cum_vals)), 0.0)
-        scmin = min(float(np.nanmin(selected_cum_vals)), 0.0)
+    if len(selected_hold_vals):
+        scmax = max(float(np.nanmax(selected_hold_vals)), 0.0)
+        scmin = min(float(np.nanmin(selected_hold_vals)), 0.0)
         sy1_min, sy1_max = selected_wnet_ax.get_ylim()
         selected_zero_frac = (0 - sy1_min) / (sy1_max - sy1_min)
         selected_zero_frac = min(max(selected_zero_frac, 0.05), 0.95)
