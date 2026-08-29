@@ -17621,6 +17621,50 @@ def _moneydj_range_events(
                 )
                 pairs[(pair["warrant_code"], broker_code)] = pair
 
+    # 精選分點補查：
+    # API4 的區間分點清單只會列出該權證在區間內較顯著的分點，小額或只在少數
+    # 幾天進出的分點，整組 (權證, 分點) 從頭到尾不會出現，API5 也就不會去查，
+    # 圖上看起來就像「這個分點那幾天完全沒有交易」。
+    # warrant_backtest_moneydj 沒有這個問題，是因為它有跨次累積的 broker_map 快取，
+    # 週報是單次執行，只能靠這一輪 API4 的探索結果。
+    # 精選分點是週報主角，這裡直接對「每一支權證 × 精選分點代號」補上 pair，
+    # 沒有交易的組合 API5 會回空，成本只有 權證數 × 精選分點數 次請求。
+    selected_backfill_pairs = 0
+    selected_backfill_codes = set()
+    if SELECTED_BRANCH_FLOW_ENABLE:
+        resolved_map = {}
+        try:
+            resolved_map = _resolve_selected_branch_ids(_get_selected_branch_flow_set())
+        except Exception as exc:
+            print(f"⚠️ 精選分點補查取不到正式 ID，略過補查：{exc}")
+        code_to_name = {}
+        for requested_name, ids in (resolved_map or {}).items():
+            for raw_code in ids or set():
+                code = str(raw_code or "").strip()
+                if code:
+                    code_to_name.setdefault(code, str(requested_name or "").strip())
+        for broker_code, requested_name in sorted(code_to_name.items()):
+            selected_backfill_codes.add(broker_code)
+            official_name = str(trader_name_map.get(broker_code, "") or "").strip()
+            branch_name = normalize_branch_name(
+                official_name or requested_name or broker_code
+            )
+            for warrant in warrants:
+                key = (warrant["warrant_code"], broker_code)
+                if key in pairs:
+                    continue
+                pair = dict(warrant)
+                pair["broker_code"] = broker_code
+                pair["branch"] = branch_name
+                pairs[key] = pair
+                selected_backfill_pairs += 1
+        if selected_backfill_pairs:
+            print(
+                f"🎯 精選分點補查：API4 未列出的 (權證×分點) 組合補上 {selected_backfill_pairs:,} 組｜"
+                f"分點代號={sorted(selected_backfill_codes)}"
+            )
+    stats["selected_backfill_pairs"] = selected_backfill_pairs
+
     stats["pairs"] = len(pairs)
     stats["api4_truncated"] = api4_truncated
     if api4_truncated:
@@ -17696,6 +17740,29 @@ def _moneydj_range_events(
         f"API4 failed={stats['api4_failed']}｜API5 failed={stats['api5_failed']}｜"
         f"{stats['elapsed']:.2f}秒"
     )
+    if selected_backfill_codes and not events.empty:
+        sel = events[events["broker_code"].astype(str).isin(selected_backfill_codes)]
+        if sel.empty:
+            print(f"🎯 精選分點 MoneyDJ 實際命中：0 筆｜分點代號={sorted(selected_backfill_codes)}")
+        else:
+            print(
+                f"🎯 精選分點 MoneyDJ 實際命中：{len(sel):,} 筆｜"
+                f"買進={fmt_money(float(sel['buy_amount'].sum()))}｜"
+                f"賣出={fmt_money(-float(sel['sell_amount'].sum()))}｜"
+                f"淨額={fmt_money(float(sel['net_amount'].sum()))}｜"
+                f"權證={sel['warrant_code'].nunique()}支｜"
+                f"日期 {pd.Timestamp(sel['Date'].min()).date()} ~ {pd.Timestamp(sel['Date'].max()).date()}"
+            )
+            sel_daily = (
+                sel.groupby("Date", as_index=False)
+                .agg(rows=("net_amount", "size"), buy=("buy_amount", "sum"),
+                     sell=("sell_amount", "sum"), net=("net_amount", "sum"))
+            )
+            sel_daily["_abs_net"] = sel_daily["net"].abs()
+            sel_daily = sel_daily.sort_values("_abs_net", ascending=False).drop(columns=["_abs_net"])
+            print("🎯 精選分點淨額最大的交易日（可直接與 warrant_backtest 對帳）：")
+            print(sel_daily.head(10).to_string(index=False))
+
     number_stats = _moneydj_number_stats_snapshot()
     stats["api5_comma_fixed_values"] = int(number_stats.get("comma_fixed", 0))
     stats["api5_unparsable_values"] = int(number_stats.get("unparsable", 0))
