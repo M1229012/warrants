@@ -136,7 +136,7 @@ TOP15_TRADED_PRICE_COVERAGE_NOTE_THRESHOLD_PCT = min(
 TOP15_LOW_TRADED_COVERAGE_SYMBOL = "*"
 TOP15_PATTERN_DESCRIPTIONS = [
     ("突", "突破前高"),
-    ("站", "站上MA20（月線）"),
+    ("站", "月線翻揚並站回月線上"),
     ("撐", "量峰價附近有支撐"),
     ("強", "多頭排列，走勢偏強"),
     ("弱", "跌破MA20，走勢偏弱"),
@@ -1393,6 +1393,51 @@ def _read_previous_top15_pattern_map(df, pick_cache_date, chosen_date):
     return pattern_map, previous_date
 
 
+def _print_top15_pattern_change_diagnosis(rows, previous_pattern_map, previous_cache_date):
+    """
+    型態轉變一檔都沒顯示時，把每一檔卡在哪一關印出來。
+
+    只在「完全沒有轉變」時才會執行，正常有轉變的日子不會有這段輸出。
+    """
+    print(
+        f"     前一交易日快照：{previous_cache_date}｜"
+        f"可比對標的 {len(previous_pattern_map)} 檔"
+        + (
+            f"（例如 {'、'.join(f'{k}:{v}' for k, v in list(previous_pattern_map.items())[:5])}）"
+            if previous_pattern_map
+            else "（空的：前一日快照沒有任何有效型態）"
+        )
+    )
+    print(f"     {'標的':<12}{'今日型態':<8}{'前一交易日期欄':<16}{'前日型態':<8}原因")
+
+    for r in rows:
+        underlying = str(r.get("underlying", "")).strip()
+        today_pattern = str(r.get("pattern", "") or "-").strip()
+        raw_value = str(r.get("pattern_prev_date_raw", "") or "").strip()
+        parsed_date = r.get("pattern_prev_date")
+        previous_pattern = str(previous_pattern_map.get(underlying, "") or "").strip()
+
+        if today_pattern == "-":
+            reason = "今日型態無效"
+        elif not raw_value:
+            reason = "『型態前一交易日期』是空的（該列尚未寫入或填錯列）"
+        elif parsed_date is None:
+            reason = f"『型態前一交易日期』無法解析：{raw_value}"
+        elif parsed_date != previous_cache_date:
+            reason = f"日期對不上：欄位 {parsed_date}、前一份快照 {previous_cache_date}"
+        elif not previous_pattern:
+            reason = "前一交易日快照找不到這檔（新進榜）"
+        elif previous_pattern == today_pattern:
+            reason = "前後型態相同"
+        else:
+            reason = f"應顯示 {previous_pattern}→{today_pattern}（若圖上沒出現請回報）"
+
+        print(
+            f"     {r.get('target', underlying):<12}{today_pattern:<8}"
+            f"{(raw_value or '(空)'):<16}{(previous_pattern or '-'):<8}{reason}"
+        )
+
+
 def _build_top15_pattern_display(
     pattern: str,
     underlying: str,
@@ -1461,6 +1506,19 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         needed_cols,
         filter_tracked_brokers=False,
     )
+
+    # 工作表若因多次追加而出現同名欄，pandas 只會留下其中一欄，
+    # 會造成「畫面上看到的型態」與「程式讀到的型態」不一致，先明確示警。
+    duplicated_headers = sorted({
+        col for col in df.columns
+        if str(col).startswith("型態") and list(df.columns).count(col) > 1
+    })
+    if duplicated_headers:
+        print(
+            f"  ⚠️ {SHEET_TOP15_CONSENSUS_CACHE} 有重複欄名：{'、'.join(duplicated_headers)}；"
+            "型態可能讀到其中一欄，請在工作表移除多餘的重複欄位。"
+        )
+
     df = filter_df_by_data_scope(df, DATA_SCOPE_SELECTED5)
 
     empty_meta = {
@@ -1607,6 +1665,9 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
             previous_pattern_map,
             previous_cache_date,
         )
+        # 型態轉變沒出現時要能立刻看出卡在哪一關，因此保留原始值供除錯輸出使用。
+        pattern_prev_date_raw = strip_gsheet_text_prefix(row.get("型態前一交易日期", ""))
+        pattern_prev_date = _pick_first_existing_date(row, ["型態前一交易日期"])
 
         rows.append({
             "rank": safe_int(_pick_first_existing_value(row, ["排名", "rank"]), 0),
@@ -1616,6 +1677,8 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
             "pattern": pattern,
             "pattern_prev": pattern_prev,
             "pattern_display": pattern_display,
+            "pattern_prev_date_raw": pattern_prev_date_raw,
+            "pattern_prev_date": pattern_prev_date,
             "pattern_date": strip_gsheet_text_prefix(row.get("型態統計日期", "")),
             "pattern_status": strip_gsheet_text_prefix(row.get("型態計算狀態", "")),
             "amount": amount,
@@ -1676,7 +1739,12 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
     else:
         print(
             f"  ℹ️ TOP15型態轉變（{previous_cache_date} → {chosen_date}）："
-            "沒有可顯示的型態變化（型態相同、新進榜或非相鄰交易日）。"
+            "沒有可顯示的型態變化，逐檔原因如下："
+        )
+        _print_top15_pattern_change_diagnosis(
+            rows,
+            previous_pattern_map,
+            previous_cache_date,
         )
 
     if start_date is None:
