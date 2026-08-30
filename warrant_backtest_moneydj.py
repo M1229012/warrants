@@ -348,6 +348,13 @@ if WORKFLOW_MODE not in ("daily", "longterm", "repair"):
 
 # TOP15 固定資料集。
 TOP15_CACHE_ENABLED = os.getenv("TOP15_CACHE_ENABLED", os.getenv("TOP15_RETURN_CACHE_ENABLED", "1")).strip().lower() not in ("0", "false", "no")
+
+# 近一個月 TOP15 圖固定只讀「資料範圍=精選五分點」，全分點的 TOP15 排名與型態沒有任何圖在用。
+# 因此每日流程預設不再建立全分點 TOP15（省下型態 K 線與權證價格查詢），
+# 只有完整修補模式會重建全分點的 TOP15 排名與型態；要臨時打開就設 TOP15_FULL_SCOPE_DAILY_ENABLED=1。
+TOP15_FULL_SCOPE_DAILY_ENABLED = os.getenv(
+    "TOP15_FULL_SCOPE_DAILY_ENABLED", "0"
+).strip().lower() not in ("0", "false", "no")
 TOP15_POSITION_DETAIL_SHEET = os.getenv("TOP15_POSITION_DETAIL_SHEET", "快取_TOP15部位明細")
 TOP15_CONSENSUS_SHEET = os.getenv("TOP15_CONSENSUS_SHEET", "快取_TOP15共識淨買超")
 DAILY_RESULT_SHEET_TITLES = {
@@ -412,6 +419,19 @@ TOP15_REPAIR_BACKFILL_TRADING_DAYS = max(
 
 # TOP15 個股型態標籤：只新增至 TOP15 快取資料，不改動排名、權證估值、損益與 ABCDE 邏輯。
 PATTERN_ENABLE = os.getenv("PATTERN_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+
+# 型態只有近一個月 TOP15 圖在用，而那張圖固定只讀「資料範圍=精選五分點」。
+# daily 若連全分點也算型態，等於每天多抓上百檔 K 線後直接丟掉，
+# 因此預設只對 PATTERN_SCOPES 內的資料範圍計算；完整修補模式要回補全分點歷史快照，預設全部都算。
+PATTERN_SCOPES = {
+    scope.strip()
+    for scope in (os.getenv("PATTERN_SCOPES", "精選五分點") or "").split(",")
+    if scope.strip()
+}
+PATTERN_ALL_SCOPES_IN_REPAIR = os.getenv(
+    "PATTERN_ALL_SCOPES_IN_REPAIR", "1"
+).strip().lower() not in ("0", "false", "no")
+
 PATTERN_LOOKBACK = max(int(os.getenv("PATTERN_LOOKBACK", "60")), 20)
 PATTERN_MAX_MISSING_DAYS = max(int(os.getenv("PATTERN_MAX_MISSING_DAYS", "5")), 0)
 PATTERN_REFRESH_FULL_WINDOW = os.getenv("PATTERN_REFRESH_FULL_WINDOW", "1").strip().lower() not in ("0", "false", "no")
@@ -523,7 +543,7 @@ PATTERN_INVALID_LABEL = os.getenv("PATTERN_INVALID_LABEL", "-").strip() or "-"
 PATTERN_FETCH_WORKERS = max(min(int(os.getenv("PATTERN_FETCH_WORKERS", str(FINMIND_HISTORY_WORKERS))), 12), 1)
 
 PATTERN_AUDIT_FIELDS = [
-    "型態", "型態統計日期", "型態價格來源",
+    "型態", "型態統計日期", "型態前一交易日期", "型態價格來源",
     "型態還原收盤價", "型態原始收盤價",
     "型態MA5", "型態MA10", "型態MA20",
     "型態前59日高點", "型態量峰價", "型態橋接係數",
@@ -532,7 +552,7 @@ PATTERN_AUDIT_FIELDS = [
     "型態公司行動狀態", "型態計算狀態", "型態錯誤原因",
 ]
 PATTERN_AUDIT_COLUMN_WIDTHS = [
-    8, 12, 18,
+    8, 12, 14, 18,
     14, 14,
     12, 12, 12,
     14, 14, 12,
@@ -4561,6 +4581,8 @@ def _gsheet_pixel_width_for_header(header):
         return 60
     if header == "型態統計日期":
         return 105
+    if header == "型態前一交易日期":
+        return 125
     if header == "型態價格來源":
         return 145
     if header in (
@@ -16337,6 +16359,8 @@ def _pattern_empty_result(
     return {
         "型態": PATTERN_INVALID_LABEL,
         "型態統計日期": normalize_date_str(target_date),
+        # 前一交易日期一律由 build_top15_pattern_map 統一補上，避免每檔標的各自打一次交易日曆。
+        "型態前一交易日期": "",
         "型態價格來源": price_source,
         "型態還原收盤價": "",
         "型態原始收盤價": "",
@@ -16901,6 +16925,34 @@ def _pattern_previous_trading_date(target_date):
     return candidate
 
 
+_PATTERN_PREV_TRADING_DATE_CACHE = {}
+_PATTERN_PREV_TRADING_DATE_LOCK = threading.Lock()
+
+
+def pattern_previous_trading_date_str(target_date):
+    """
+    型態專用「前一交易日」字串，供圖片端判斷兩筆型態是否真的相鄰。
+
+    直接取 MoneyDJ 0050 日 K 的前一根 K 棒：颱風停市、國定連假、臨時休市那幾天
+    本來就不會出現在 0050 的 K 線裡，所以不需要自建行事曆，也不會把「漏跑一天」
+    誤判成相鄰。同一次 RUN 只查一次交易日曆，結果記憶化重用。
+    """
+    key = normalize_date_str(target_date)
+    if not key:
+        return ""
+
+    with _PATTERN_PREV_TRADING_DATE_LOCK:
+        if key in _PATTERN_PREV_TRADING_DATE_CACHE:
+            return _PATTERN_PREV_TRADING_DATE_CACHE[key]
+
+    value = normalize_date_str(_pattern_previous_trading_date(key)) or ""
+
+    with _PATTERN_PREV_TRADING_DATE_LOCK:
+        _PATTERN_PREV_TRADING_DATE_CACHE[key] = value
+
+    return value
+
+
 def _pattern_trading_day_gap(start_date, end_date):
     start_dt = parse_date(start_date)
     end_dt = parse_date(end_date)
@@ -17445,6 +17497,7 @@ def _pattern_classify_window(history, *, target_date, price_source, bridge_facto
     return {
         "型態": label,
         "型態統計日期": normalize_date_str(target_date),
+        "型態前一交易日期": "",
         "型態價格來源": price_source,
         "型態還原收盤價": adjusted_close,
         "型態原始收盤價": raw_close,
@@ -17856,6 +17909,23 @@ def _build_single_top15_pattern(stock_code, target_date):
     return result
 
 
+def pattern_enabled_for_scope(data_scope):
+    """
+    這個資料範圍要不要算型態。
+
+    型態只有近一個月 TOP15 圖在用，而那張圖固定只讀「資料範圍=精選五分點」，
+    所以每日流程不需要對全分點算型態（那是每天上百檔 K 線的純浪費）。
+    完整修補模式要回補全分點的歷史快照，預設不受 PATTERN_SCOPES 限制。
+    """
+    if not PATTERN_ENABLE:
+        return False
+
+    if PATTERN_ALL_SCOPES_IN_REPAIR and workflow_is_repair():
+        return True
+
+    return str(data_scope or "").strip() in PATTERN_SCOPES
+
+
 def build_top15_pattern_map(rows, target_date):
     stock_codes = sorted({
         _normalize_pattern_stock_code(row.get("標的股", ""))
@@ -17888,22 +17958,36 @@ def build_top15_pattern_map(rows, target_date):
             if done % 10 == 0:
                 print(f"  [{done}/{len(stock_codes)}] TOP15個股型態計算中...")
 
+    # 前一交易日期整批補：圖片端用它判斷「上一筆快取型態」是不是真的相鄰交易日。
+    # 整個 RUN 只查一次 MoneyDJ 交易日曆，颱風假／連假都不會誤判。
+    previous_trading_date = pattern_previous_trading_date_str(target_date)
+    for result in results.values():
+        result["型態前一交易日期"] = previous_trading_date
+
     counts = Counter(str(result.get("型態", PATTERN_INVALID_LABEL)) for result in results.values())
     summary = "、".join(f"{label}:{counts.get(label, 0)}" for label in ["突", "站", "撐", "強", "弱", "盤", PATTERN_INVALID_LABEL])
-    print(f"  ✅ TOP15個股型態標籤完成：{summary}")
+    print(
+        f"  ✅ TOP15個股型態標籤完成：{summary}｜"
+        f"前一交易日 {previous_trading_date or '未知'}"
+    )
     return results
 
 
 def _apply_top15_pattern_results_to_rows(rows, pattern_map, target_date):
+    # pattern_map=None 代表本資料範圍這次不算型態（例如 daily 的全分點）。
+    # 欄位仍然要寫滿，維持工作表欄位結構一致，只是狀態標成 SKIPPED_BY_SCOPE。
+    scope_skipped = pattern_map is None
+
     for row in rows or []:
         code = _normalize_pattern_stock_code(row.get("標的股", ""))
-        result = pattern_map.get(code)
+        result = None if scope_skipped else pattern_map.get(code)
         if result is None:
             result = _pattern_empty_result(
                 code,
                 target_date,
-                "DATE_MISMATCH",
-                "找不到標的股型態結果",
+                "SKIPPED_BY_SCOPE" if scope_skipped else "DATE_MISMATCH",
+                "本資料範圍未啟用型態計算" if scope_skipped else "找不到標的股型態結果",
+                company_action_status="NOT_REQUIRED" if scope_skipped else "UNKNOWN",
             )
         for field in PATTERN_AUDIT_FIELDS:
             row[field] = result.get(field, "")
@@ -18260,7 +18344,16 @@ def build_top15_position_detail_and_consensus_rows(
             + extra
         )
 
-    pattern_map = build_top15_pattern_map(detail_rows, target_date)
+    if pattern_enabled_for_scope(scope):
+        pattern_map = build_top15_pattern_map(detail_rows, target_date)
+    else:
+        pattern_map = None
+        allowed_scopes = "、".join(sorted(PATTERN_SCOPES)) or "（未設定）"
+        print(
+            f"  ⏭️ TOP15個股型態：資料範圍={scope} 本次不計算"
+            f"（PATTERN_SCOPES={allowed_scopes}；完整修補模式才會算全分點）"
+        )
+
     _apply_top15_pattern_results_to_rows(detail_rows, pattern_map, target_date)
 
     consensus_rows = build_top15_consensus_rows_from_detail(detail_rows, run_id, update_time)
@@ -18293,6 +18386,24 @@ def top15_stat_dates_for_current_run(item_map, price_cache, target_date):
         observed_dates = sorted(set(observed_dates) | {target_key})
 
     return observed_dates[-TOP15_REPAIR_BACKFILL_TRADING_DAYS:]
+
+
+def top15_full_scope_enabled(data_scope):
+    """
+    這個資料範圍的 TOP15（排名 + 型態）本次要不要建立。
+
+    全分點 TOP15 沒有任何圖片在用（近一個月 TOP15 圖只讀精選五分點），
+    所以每日流程直接跳過，只有完整修補模式才重建全分點歷史快照。
+    Google Sheet 的 TOP15 同步是「只替換本次帶入的資料範圍＋統計日期」，
+    因此本次不帶全分點資料時，工作表上既有的全分點快照不會被刪，只是停止更新。
+    """
+    if str(data_scope or "").strip() != "全分點":
+        return True
+
+    if TOP15_FULL_SCOPE_DAILY_ENABLED:
+        return True
+
+    return workflow_is_repair()
 
 
 def build_top15_history_rows_for_current_run(
@@ -26466,16 +26577,28 @@ def main():
             "未發出歷史價格請求"
         )
 
-    top15_detail_rows, top15_consensus_rows = build_top15_history_rows_for_current_run(
-        a_events, b_events, c_events, d_events, e_events,
-        item_map, price_cache,
-        target_date=target_date,
-        data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
-        allow_price_fetch=True,
-        persistent_price_cache=persistent_price_cache,
-        defer_price_save=True,
-        price_changed_codes=all_changed_price_codes,
-    )
+    main_top15_scope = "全分點" if RUN_MODE == 2 else "精選五分點"
+    build_main_scope_top15 = top15_full_scope_enabled(main_top15_scope)
+
+    if build_main_scope_top15:
+        top15_detail_rows, top15_consensus_rows = build_top15_history_rows_for_current_run(
+            a_events, b_events, c_events, d_events, e_events,
+            item_map, price_cache,
+            target_date=target_date,
+            data_scope=main_top15_scope,
+            allow_price_fetch=True,
+            persistent_price_cache=persistent_price_cache,
+            defer_price_save=True,
+            price_changed_codes=all_changed_price_codes,
+        )
+    else:
+        top15_detail_rows, top15_consensus_rows = [], []
+        print(
+            "【Step 4b】略過全分點 TOP15：排名與型態只在完整修補模式計算，"
+            "每日流程只建立精選五分點。\n"
+            "  ℹ️ Google Sheet 的 TOP15 只替換本次帶入的資料範圍＋統計日期，"
+            "既有全分點快照不會被刪除。"
+        )
 
     selected_items, selected_item_map = [], {}
     selected_events = ([], [], [], [], [])
@@ -26484,13 +26607,24 @@ def main():
         selected_items = filter_items_for_selected_scope(items)
         selected_item_map, sa, sb, sc, sd, se = build_price_prefetch_context_from_items(selected_items)
         selected_events = (sa, sb, sc, sd, se)
+        # 全分點那一輪原本負責補權證價格；跳過時改由精選五分點自己抓，
+        # 標的是全分點的子集合，抓的量更小，也不會再讓 TOP15 缺價格。
         selected_top15_detail_rows, selected_top15_consensus_rows = build_top15_history_rows_for_current_run(
             sa, sb, sc, sd, se, selected_item_map, price_cache,
             target_date=target_date,
-            data_scope="精選五分點", allow_price_fetch=False,
+            data_scope="精選五分點",
+            allow_price_fetch=not build_main_scope_top15,
+            persistent_price_cache=None if build_main_scope_top15 else persistent_price_cache,
+            defer_price_save=not build_main_scope_top15,
+            price_changed_codes=None if build_main_scope_top15 else all_changed_price_codes,
         )
         history_source_label = "FinMind完整歷史＋MoneyDJ最新日" if workflow_is_repair() and REPAIR_FINMIND_FULL_HISTORY_ENABLED else "MoneyDJ歷史"
-        print(f"  ✅ 已從同一份{history_source_label}切出精選五分點：{len(selected_items):,} 組，不重抓 API。")
+        price_note = (
+            "不重抓分點歷史 API"
+            if build_main_scope_top15
+            else "不重抓分點歷史 API；權證價格改由本輪自行補齊"
+        )
+        print(f"  ✅ 已從同一份{history_source_label}切出精選五分點：{len(selected_items):,} 組，{price_note}。")
 
     if all_changed_price_codes:
         save_price_cache(persistent_price_cache, changed_codes=all_changed_price_codes)
