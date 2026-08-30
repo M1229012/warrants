@@ -142,6 +142,8 @@ TOP15_PATTERN_DESCRIPTIONS = [
     ("弱", "跌破MA20，走勢偏弱"),
     ("盤", "區間整理"),
 ]
+# 型態由前一交易日轉為今日時，圖上顯示成「站→盤」。
+TOP15_PATTERN_CHANGE_ARROW = os.getenv("TOP15_PATTERN_CHANGE_ARROW", "→").strip() or "→"
 # 專門給「第幾次加碼」使用，不影響原本近一個月共識買超圖。
 ADD_COUNT_LOOKBACK_TRADING_DAYS = int(os.getenv("ADD_COUNT_LOOKBACK_TRADING_DAYS", "50"))
 
@@ -1340,6 +1342,95 @@ def read_top15_position_detail_cache_from_gsheet(target: date | None = None) -> 
 
     return dict(by_underlying)
 
+def _read_previous_top15_pattern_map(df, pick_cache_date, chosen_date):
+    """
+    取出「上一個統計日期」的型態，供 TOP15 圖顯示型態轉變（例如 站→盤）。
+
+    這裡只負責把上一份快照讀成 {標的股: 型態}；是不是真的相鄰交易日，
+    由每一列的「型態前一交易日期」再判斷一次（見 _build_top15_pattern_display）。
+    """
+    previous_dates = [
+        d
+        for d in (pick_cache_date(row) for _, row in df.iterrows())
+        if d and d < chosen_date
+    ]
+    if not previous_dates:
+        return {}, None
+
+    previous_date = max(previous_dates)
+    previous_df = df[df.apply(lambda r: pick_cache_date(r) == previous_date, axis=1)].copy()
+    if previous_df.empty:
+        return {}, None
+
+    previous_df = filter_latest_cache_snapshot(
+        previous_df,
+        f"{SHEET_TOP15_CONSENSUS_CACHE}（前一統計日 {previous_date}）",
+    )
+    if previous_df.empty:
+        return {}, None
+
+    pattern_map = {}
+    for _, r in previous_df.iterrows():
+        row = r.to_dict()
+        stock_name = strip_gsheet_text_prefix(
+            _pick_first_existing_value(row, ["標的名稱", "股票名稱"])
+        )
+        underlying = normalize_underlying(
+            _pick_first_existing_value(row, ["標的股", "標的代號", "標的"]),
+            stock_name,
+        )
+        label = strip_gsheet_text_prefix(row.get("型態", "")).strip()
+        status = strip_gsheet_text_prefix(row.get("型態計算狀態", "")).strip()
+
+        # 前值必須是真的算出來的型態；"-"、計算失敗或未啟用都不拿來比較。
+        if not underlying or not label or label == "-":
+            continue
+        if status and status != "OK":
+            continue
+
+        pattern_map[underlying] = label
+
+    return pattern_map, previous_date
+
+
+def _build_top15_pattern_display(
+    pattern: str,
+    underlying: str,
+    row: dict,
+    previous_pattern_map: dict,
+    previous_cache_date,
+):
+    """
+    決定型態欄要顯示「盤」還是「站→盤」。
+
+    只有確定兩份快照是相鄰交易日才顯示轉變：用回測端寫入的「型態前一交易日期」
+    與上一份快照的統計日期比對。那個日期來自 MoneyDJ 0050 的日 K 交易日曆，
+    所以颱風停市、國定連假、臨時休市都不會被誤判；日期對不上（漏跑、舊資料沒有這欄）
+    就退回只顯示今天的型態，寧可不比較也不顯示錯的轉變。
+
+    另外三種情況也只顯示今天的型態：
+    1. 該標的前一天不在 TOP15（新進榜）
+    2. 前值無效（"-"、計算失敗）
+    3. 前後型態相同
+    """
+    pattern = str(pattern or "").strip() or "-"
+
+    if not previous_pattern_map or previous_cache_date is None:
+        return pattern, ""
+    if pattern == "-":
+        return pattern, ""
+
+    expected_previous_date = _pick_first_existing_date(row, ["型態前一交易日期"])
+    if expected_previous_date is None or expected_previous_date != previous_cache_date:
+        return pattern, ""
+
+    previous_pattern = str(previous_pattern_map.get(underlying, "")).strip()
+    if not previous_pattern or previous_pattern == pattern:
+        return pattern, previous_pattern
+
+    return f"{previous_pattern}{TOP15_PATTERN_CHANGE_ARROW}{pattern}", previous_pattern
+
+
 def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[list[dict], dict]:
     """
     直接讀取新版「快取_TOP15共識淨買超」。
@@ -1352,7 +1443,7 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         "統計日期", "日期", "目標日期", "統計期間", "有效交易日數",
         "排名", "rank",
         "標的股", "標的代號", "標的", "標的名稱", "股票名稱",
-        "型態", "型態統計日期", "型態計算狀態",
+        "型態", "型態統計日期", "型態前一交易日期", "型態計算狀態",
         "淨買超成本", "剩餘淨買超成本", "淨買超金額", "淨買超", "remaining_cost",
         "買超成本", "原始買超成本", "總買超成本", "買超金額", "合計買超成本", "amount",
         "目前市值", "未實現損益", "報酬率", "報酬率文字",
@@ -1399,6 +1490,13 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         chosen_date = max(valid) if valid else max(available_dates)
     else:
         chosen_date = max(available_dates)
+
+    # 型態轉變（站→盤）用的前一交易日快照：必須在把 df 砍成單一統計日期之前先取出來。
+    previous_pattern_map, previous_cache_date = _read_previous_top15_pattern_map(
+        df,
+        pick_cache_date,
+        chosen_date,
+    )
 
     df = df[df.apply(lambda r: pick_cache_date(r) == chosen_date, axis=1)].copy()
     if df.empty:
@@ -1501,12 +1599,23 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         if warrant_count <= 0:
             warrant_count = count_warrants_in_text(_pick_first_existing_value(row, ["權證清單"])) or 1
 
+        pattern = strip_gsheet_text_prefix(row.get("型態", "")) or "-"
+        pattern_display, pattern_prev = _build_top15_pattern_display(
+            pattern,
+            underlying,
+            row,
+            previous_pattern_map,
+            previous_cache_date,
+        )
+
         rows.append({
             "rank": safe_int(_pick_first_existing_value(row, ["排名", "rank"]), 0),
             "target": target_label,
             "underlying": underlying,
             "stock_name": stock_name,
-            "pattern": strip_gsheet_text_prefix(row.get("型態", "")) or "-",
+            "pattern": pattern,
+            "pattern_prev": pattern_prev,
+            "pattern_display": pattern_display,
             "pattern_date": strip_gsheet_text_prefix(row.get("型態統計日期", "")),
             "pattern_status": strip_gsheet_text_prefix(row.get("型態計算狀態", "")),
             "amount": amount,
@@ -1551,6 +1660,24 @@ def read_top15_consensus_cache_from_gsheet(target: date | None = None) -> tuple[
         )
 
     rows = deduped_rows[:15]
+
+    changed_patterns = [
+        f"{r.get('target', '')}：{r.get('pattern_display', '')}"
+        for r in rows
+        if TOP15_PATTERN_CHANGE_ARROW in str(r.get("pattern_display", ""))
+    ]
+    if previous_cache_date is None:
+        print("  ℹ️ TOP15型態轉變：找不到更早的統計日期，本次只顯示當日型態。")
+    elif changed_patterns:
+        print(
+            f"  🔄 TOP15型態轉變（{previous_cache_date} → {chosen_date}）："
+            f"{len(changed_patterns)} 檔｜{'、'.join(changed_patterns)}"
+        )
+    else:
+        print(
+            f"  ℹ️ TOP15型態轉變（{previous_cache_date} → {chosen_date}）："
+            "沒有可顯示的型態變化（型態相同、新進榜或非相鄰交易日）。"
+        )
 
     if start_date is None:
         starts = [r.get("first_date") for r in rows if r.get("first_date")]
@@ -4054,7 +4181,9 @@ def draw_consensus_buy_image(
     top_h = 1.95
     legend_h = 0.45
     gap = 0.18
-    pattern_note_h = 1.04 if show_pattern else 0.0
+    # 備註框由兩行加為三行（多一行說明「站→盤」的型態轉變），框高一起加，
+    # 否則第三行會壓到框線。
+    pattern_note_h = 1.34 if show_pattern else 0.0
     section_title_h = 0.55
     header_h = 0.42
     row_h = 0.50
@@ -4296,7 +4425,9 @@ def draw_consensus_buy_image(
         # 七欄總寬維持 12.20，不改變表格左右邊界。
         # 「標的」欄由 2.15 縮為 1.75，釋出的 0.40 全部移給
         # 「參與分點 / 報酬率」，讓第二家券商的報酬率更容易完整顯示。
-        col_w = [0.65, 1.75, 0.70, 1.40, 0.65, 1.25, 5.80]
+        # 型態欄由 0.70 加寬為 1.20，容納「站→盤」這種三字轉變；
+        # 多出來的 0.50 從最寬的「參與分點 / 報酬率」扣，總寬仍是 12.20。
+        col_w = [0.65, 1.75, 1.20, 1.40, 0.65, 1.25, 5.30]
     else:
         headers = ["排名", "標的", "淨買超成本", "分點數", "事件", "參與分點 / 報酬率"]
         # 六欄總寬仍為 12.20，右側表格邊界與原版完全一致。
@@ -4324,6 +4455,9 @@ def draw_consensus_buy_image(
             net_color = RED if r["net_amount"] > 0 else GREEN if r["net_amount"] < 0 else TEXT
             if show_pattern:
                 pattern = str(r.get("pattern", "") or "-").strip() or "-"
+                # 顯示值可能是「站→盤」；顏色一律以「今天的型態」為準，
+                # 這樣整欄的紅綠含意仍然只代表最新狀態，不會因為前值而誤讀。
+                pattern_display = str(r.get("pattern_display", "") or "").strip() or pattern
                 pattern_color = {
                     "突": RED,
                     "站": RED,
@@ -4335,7 +4469,7 @@ def draw_consensus_buy_image(
                 values = [
                     str(i + 1),
                     fit(r["target"], 14),
-                    pattern,
+                    pattern_display,
                     fmt_wan(r["net_amount"]),
                     str(r["broker_count"]),
                     r["events"],
@@ -4395,7 +4529,7 @@ def draw_consensus_buy_image(
         ]
         text(
             margin_x + 0.22,
-            pattern_note_y + 0.50,
+            pattern_note_y + 0.80,
             note_lines[0],
             10.4,
             TEXT,
@@ -4403,8 +4537,17 @@ def draw_consensus_buy_image(
         )
         text(
             margin_x + 0.22,
-            pattern_note_y + 0.20,
+            pattern_note_y + 0.50,
             f"{note_lines[1]}｜-：資料不足或計算未完成",
+            10.4,
+            TEXT,
+            FONT,
+        )
+        text(
+            margin_x + 0.22,
+            pattern_note_y + 0.20,
+            f"站{TOP15_PATTERN_CHANGE_ARROW}盤：型態由前一交易日轉為今日；"
+            "新進榜、前一日型態無效或無法確認為相鄰交易日時，只顯示當日型態",
             10.4,
             TEXT,
             FONT,
