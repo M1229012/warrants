@@ -453,10 +453,15 @@ PATTERN_BREAKOUT_VOLUME_RATIO = max(float(os.getenv("PATTERN_BREAKOUT_VOLUME_RAT
 # 量能未達門檻時，單日強幅度（>= N × band）可替代量能確認，避免漏掉無量急拉的起漲。
 PATTERN_BREAKOUT_SURGE_BAND_MULT = max(float(os.getenv("PATTERN_BREAKOUT_SURGE_BAND_MULT", "2.0")), 0.0)
 
-# 站：必須先在 MA20 下方待過一段時間，避免均線附近來回震盪反覆觸發。
-PATTERN_CROSS_BAND_MULT = max(float(os.getenv("PATTERN_CROSS_BAND_MULT", "0.25")), 0.0)
-PATTERN_CROSS_LOOKBACK_DAYS = max(int(os.getenv("PATTERN_CROSS_LOOKBACK_DAYS", "20")), 5)
-PATTERN_CROSS_MIN_BELOW_DAYS = max(int(os.getenv("PATTERN_CROSS_MIN_BELOW_DAYS", "5")), 1)
+# 站：股價站回月線上方，且月線正在揚、接下來也會續揚。
+#
+# 舊版用「近 20 日至少 5 天收在 MA20 下方」當前提，但箱型震盪必然滿足，形同虛設；
+# 方向也只用「MA20 不比 5 天前低」判斷，看不出月線即將下彎。兩者都已移除。
+#
+# 現在改用扣抵：月線明天 = 今天 +（新收盤 − 扣抵值）÷20，
+# 只要接下來要扣掉的收盤價都低於現價，月線就會自己一路往上。
+PATTERN_CROSS_BAND_MULT = max(float(os.getenv("PATTERN_CROSS_BAND_MULT", "0.5")), 0.0)
+PATTERN_MA20_DEDUCT_DAYS = min(max(int(os.getenv("PATTERN_MA20_DEDUCT_DAYS", "5")), 1), 19)
 
 # 撐：回檔 → 觸及支撐區 → 守住 → 收高於昨收，四段都成立才算支撐事件（舊版只判「位置」）。
 # 「收高於昨收」是止跌回升，不是紅K（close > open）；理由見 _pattern_classify_window。
@@ -17339,9 +17344,6 @@ def _pattern_classify_window(history, *, target_date, price_source, bridge_facto
     full_data["money_ref"] = (
         full_data["Trading_money"].rolling(PATTERN_BAND_DAYS).median().shift(1)
     )
-    # 在 MA20 下方停留天數，供「站」去彈跳
-    full_data["below_ma20"] = (close_series < full_data["ma20"]).astype(float)
-    full_data["below_ma20_count"] = full_data["below_ma20"].rolling(PATTERN_CROSS_LOOKBACK_DAYS).sum()
 
     data = full_data.tail(PATTERN_LOOKBACK).copy().reset_index(drop=True)
     if len(data) <= PATTERN_MA_SLOPE_DAYS:
@@ -17428,15 +17430,40 @@ def _pattern_classify_window(history, *, target_date, price_source, bridge_facto
         and adjusted_close >= ma20                              # 排除空頭反彈假突破
     )
 
-    # 站：首次站回 MA20，且此前確實在均線下方待過，避免均線附近反覆觸發。
+    # 站：股價站回月線上方，且月線正在揚、接下來也會續揚。
+    #
+    # 前後兩天用各自的「站上線」比較，而不是拿昨收去比昨天的 MA20：
+    # 否則昨收落在 MA20 與站上線之間的股票會掉進死區——既不算「昨天在月線下方」，
+    # 也還沒站上，之後不管怎麼漲都永遠標不到站。進出用同一把尺才不會有這個漏洞。
+    #
+    # 月線方向用兩段確認，兩者的窗口不重疊、不冗餘：
+    #   ma20 > previous_ma20    等價於「今收 > 今天扣掉的那一筆」→ 月線當下在揚
+    #   收盤 > 未來 N 天扣抵均值 → 接下來每天要扣掉的都比現價低 → 月線會續揚
+    # 舊版只看「MA20 不比 5 天前低」是回頭看，抓不到「月線剛反彈但即將再下彎」。
+    previous_band_value = previous["band"]
+    previous_band = band if pd.isna(previous_band_value) else float(previous_band_value)
     cross_line = _pattern_round(ma20 * (1.0 + PATTERN_CROSS_BAND_MULT * band))
-    below_count = previous["below_ma20_count"]
+    cross_line_previous = _pattern_round(
+        previous_ma20 * (1.0 + PATTERN_CROSS_BAND_MULT * previous_band)
+    )
+
+    # 扣抵值 = 20 日窗口最舊的那幾筆收盤價，也就是接下來幾天會被移出均線的價格。
+    # 今天是 iloc[-1]，因此 t-19 是 iloc[-20]，往後數 N 天即 iloc[-20:-20+N]。
+    ma20_deduct_avg = None
+    if len(data) >= 20:
+        deduct_window = pd.to_numeric(
+            data["adjusted_close"].iloc[-20:(-20 + PATTERN_MA20_DEDUCT_DAYS)],
+            errors="coerce",
+        ).dropna()
+        if len(deduct_window) == PATTERN_MA20_DEDUCT_DAYS:
+            ma20_deduct_avg = _pattern_round(float(deduct_window.mean()))
+
     is_cross_ma20 = (
-        adjusted_close > cross_line
-        and previous_adjusted_close <= previous_ma20
-        and ma20 >= slope_ma20
-        and not pd.isna(below_count)
-        and float(below_count) >= PATTERN_CROSS_MIN_BELOW_DAYS
+        ma20_deduct_avg is not None
+        and adjusted_close > cross_line
+        and previous_adjusted_close <= cross_line_previous
+        and ma20 > previous_ma20
+        and adjusted_close > ma20_deduct_avg
     )
 
     # 撐：回檔 → 觸及支撐區 → 守住 → 收高於昨收，四段都成立才算支撐事件。
@@ -17527,7 +17554,7 @@ def _build_single_top15_pattern(stock_code, target_date):
         PATTERN_MA_SLOPE_DAYS, PATTERN_BAND_DAYS, PATTERN_BAND_MIN, PATTERN_BAND_MAX,
         PATTERN_BREAKOUT_RANGE_DAYS, PATTERN_BREAKOUT_BAND_MULT,
         PATTERN_BREAKOUT_VOLUME_RATIO, PATTERN_BREAKOUT_SURGE_BAND_MULT,
-        PATTERN_CROSS_BAND_MULT, PATTERN_CROSS_LOOKBACK_DAYS, PATTERN_CROSS_MIN_BELOW_DAYS,
+        PATTERN_CROSS_BAND_MULT, PATTERN_MA20_DEDUCT_DAYS,
         PATTERN_SUPPORT_TOUCH_DAYS, PATTERN_SUPPORT_PULLBACK_DAYS,
         PATTERN_SUPPORT_PULLBACK_BAND_MULT, PATTERN_SUPPORT_BAND_MULT,
         PATTERN_STRONG_MIN_POSITION, PATTERN_WEAK_BAND_MULT,
