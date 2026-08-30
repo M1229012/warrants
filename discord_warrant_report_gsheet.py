@@ -4181,9 +4181,7 @@ def draw_consensus_buy_image(
     top_h = 1.95
     legend_h = 0.45
     gap = 0.18
-    # 備註框由兩行加為三行（多一行說明「站→盤」的型態轉變），框高一起加，
-    # 否則第三行會壓到框線。
-    pattern_note_h = 1.34 if show_pattern else 0.0
+    pattern_note_h = 1.04 if show_pattern else 0.0
     section_title_h = 0.55
     header_h = 0.42
     row_h = 0.50
@@ -4529,7 +4527,7 @@ def draw_consensus_buy_image(
         ]
         text(
             margin_x + 0.22,
-            pattern_note_y + 0.80,
+            pattern_note_y + 0.50,
             note_lines[0],
             10.4,
             TEXT,
@@ -4537,17 +4535,9 @@ def draw_consensus_buy_image(
         )
         text(
             margin_x + 0.22,
-            pattern_note_y + 0.50,
-            f"{note_lines[1]}｜-：資料不足或計算未完成",
-            10.4,
-            TEXT,
-            FONT,
-        )
-        text(
-            margin_x + 0.22,
             pattern_note_y + 0.20,
-            f"站{TOP15_PATTERN_CHANGE_ARROW}盤：型態由前一交易日轉為今日；"
-            "新進榜、前一日型態無效或無法確認為相鄰交易日時，只顯示當日型態",
+            f"{note_lines[1]}｜-：資料不足或計算未完成"
+            f"｜站{TOP15_PATTERN_CHANGE_ARROW}盤：型態由前一交易日轉為今日",
             10.4,
             TEXT,
             FONT,
