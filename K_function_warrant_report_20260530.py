@@ -76,6 +76,13 @@ OPENAPI_WARRANT_HEADERS = {
 
 TWSE_WARRANT_DAILY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap42_L"
 TPEX_WARRANT_DAILY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap42_O"
+# 官方「權證基本資料彙總表」包含已下市權證與最後交易日；它不是只列當日
+# 有成交的 t187ap42 日成交檔，因此可建立歷史區間的完整權證母體。
+TWSE_WARRANT_REGISTRY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap37_L"
+TPEX_WARRANT_REGISTRY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap37_O"
+TWSE_STOCK_REGISTRY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_STOCK_REGISTRY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+TWSE_HOLIDAY_OPENAPI_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?response=json&year={year}"
 
 
 # ============================================================
@@ -97,7 +104,7 @@ HYBRID_MONEYDJ_API5_DAYS = max(2, int(os.getenv("WARRANT_HYBRID_MONEYDJ_API5_DAY
 HYBRID_MONEYDJ_RETRIES = max(1, int(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRIES", "3")))
 HYBRID_MONEYDJ_RETRY_WAIT = float(os.getenv("WARRANT_HYBRID_MONEYDJ_RETRY_WAIT", "1.5"))
 HYBRID_MONEYDJ_STRICT_COMPLETENESS = os.getenv(
-    "WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS", "0"
+    "WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
 # 混合時段下，MoneyDJ 若已成功提供目標交易日，就完全略過 FinMind 最新日
 # 官方 OpenAPI preflight 與逐權證 API。MoneyDJ 失敗或當日為空時，才回退原本 FinMind 流程。
@@ -117,12 +124,12 @@ HYBRID_MONEYDJ_RESULT_TIMEOUT_SECONDS = max(1.0, float(os.getenv(
 MONEYDJ_API4_ROWS = max(50, int(os.getenv("MONEYDJ_API4_ROWS", "500")))
 # 區間探索時單支權證可回傳的最大列數。70 天 × 多個分點會遠多於單日的 500 列。
 MONEYDJ_API4_RANGE_ROWS = max(
-    MONEYDJ_API4_ROWS, int(os.getenv("MONEYDJ_API4_RANGE_ROWS", "3000"))
+    MONEYDJ_API4_ROWS, int(os.getenv("MONEYDJ_API4_RANGE_ROWS", "10000"))
 )
 # API4 回傳列數觸頂＝被 e 參數截斷，該權證會有分點整段消失，分點買賣超因此少算。
 # 觸頂時自動把日期區間切半重查再合併，這是允許的最大切分深度（4 → 最多 16 段）。
 MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH = max(
-    0, int(os.getenv("MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH", "4"))
+    0, int(os.getenv("MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH", "6"))
 )
 MONEYDJ_API4 = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/"
@@ -151,12 +158,11 @@ MONEYDJ_HEADERS = {
 # WARRANT_PRIMARY_SOURCE：
 #   moneydj（預設）＝ 權證清單走官方 OpenAPI、籌碼走 MoneyDJ，FinMind 只在失敗時候補
 #   finmind        ＝ 完全回到原本 FinMind 主流程
-WARRANT_PRIMARY_SOURCE = os.getenv("WARRANT_PRIMARY_SOURCE", "moneydj").strip().lower()
-WARRANT_MONEYDJ_PRIMARY_ENABLE = WARRANT_PRIMARY_SOURCE in ("moneydj", "mdj", "money_dj")
-# FinMind 候補：MoneyDJ／官方清單失敗時，是否仍嘗試原本的 FinMind 流程。
-WARRANT_FINMIND_FALLBACK_ENABLE = os.getenv(
-    "WARRANT_FINMIND_FALLBACK_ENABLE", "1"
-).strip().lower() not in ("0", "false", "no", "off")
+WARRANT_PRIMARY_SOURCE = "moneydj"
+WARRANT_MONEYDJ_PRIMARY_ENABLE = True
+# 權證路徑嚴禁用 FinMind 補洞：任何環境變數都不能把它重新打開。
+# 官方／MoneyDJ 任一段不完整時直接失敗，不可產出少算的週報。
+WARRANT_FINMIND_FALLBACK_ENABLE = False
 # 權證清單來源：
 #   seed     ＝ MOPS 權證識別種子檔（含已下市權證的正式 上市日／到期日）
 #   official ＝ 官方 TWSE／TPEx OpenAPI 當日清單 + 權證名稱反推標的
@@ -167,10 +173,7 @@ WARRANT_FINMIND_FALLBACK_ENABLE = os.getenv(
 # 而 067611（2026-05-20~2026-11-17）、068014（2026-05-21~2027-09-16）
 # 這種明明還在市的權證都不在當日清單裡，整段歷史一起消失，
 # 資金流累計線大約只剩一半。種子檔讀不到時會自動退回 official。
-WARRANT_UNIVERSE_SOURCE = os.getenv(
-    "WARRANT_UNIVERSE_SOURCE",
-    "seed" if WARRANT_MONEYDJ_PRIMARY_ENABLE else "finmind",
-).strip().lower()
+WARRANT_UNIVERSE_SOURCE = "official_registry"
 # MOPS 權證識別種子檔。欄位：code,name,warrant_type,target_code,target_name,
 # list_date,end_date,...；含已下市權證，所以可以還原任意歷史日的權證母體。
 WARRANT_SEED_PATH = os.getenv("WARRANT_SEED_PATH", "").strip()
@@ -185,9 +188,8 @@ WARRANT_TRADER_SEED_FILENAME = os.getenv(
 ).strip()
 # 是否把認售權證一起算進資金流。FinMind 主流程只取認購（type 含「認購」），
 # 這裡預設對齊那個行為；設 1 才會把認售也納入。
-WARRANT_SEED_INCLUDE_PUT = os.getenv(
-    "WARRANT_SEED_INCLUDE_PUT", "0"
-).strip().lower() in ("1", "true", "yes", "on")
+# 完整權證分點買賣超必須包含認購與認售；不允許環境變數改成只取認購。
+WARRANT_SEED_INCLUDE_PUT = True
 # 權證名稱有字數上限，長標的名會被縮寫（例：聯發科 → 聯發）。
 # 反推時會由最長標的名往下嘗試前綴，這是允許的最短前綴長度。
 WARRANT_UNIVERSE_NAME_MIN_PREFIX = max(
@@ -2576,6 +2578,9 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
     max_attempts = max(2, int(FINMIND_REQUEST_RETRIES))
     last_error = ""
     request_headers = dict(OPENAPI_WARRANT_HEADERS)
+    # TPEx 的大型完整權證名冊偶爾在 gzip 串流結尾提早中斷；要求未壓縮內容
+    # 可避免把暫時性傳輸錯誤誤判為「上櫃沒有資料」。
+    request_headers["Accept-Encoding"] = "identity"
     request_headers["Connection"] = "close"
 
     for attempt in range(1, max_attempts + 1):
@@ -2620,6 +2625,42 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
             print(f"⚠️ {source_name} OpenAPI 抓取失敗：{last_error}")
 
     return [], False, last_error
+
+
+_OFFICIAL_STOCK_NAME_CACHE = None
+_OFFICIAL_STOCK_NAME_CACHE_LOCK = threading.Lock()
+
+
+def _official_stock_name_map() -> Dict[str, str]:
+    """載入 TWSE／TPEx 官方股票代號→簡稱對照；失敗即中止，不能改用猜測名稱。"""
+    global _OFFICIAL_STOCK_NAME_CACHE
+    with _OFFICIAL_STOCK_NAME_CACHE_LOCK:
+        if _OFFICIAL_STOCK_NAME_CACHE is not None:
+            return dict(_OFFICIAL_STOCK_NAME_CACHE)
+
+        sources = (
+            (TWSE_STOCK_REGISTRY_OPENAPI_URL, "上市股票基本資料", "公司代號", "公司簡稱"),
+            (TPEX_STOCK_REGISTRY_OPENAPI_URL, "上櫃股票基本資料", "SecuritiesCompanyCode", "CompanyAbbreviation"),
+        )
+        out = {}
+        failures = []
+        for url, label, code_col, name_col in sources:
+            rows, ok, error = fetch_openapi_json(url, label)
+            if not ok:
+                failures.append(f"{label}: {error}")
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                code = _normalize_stock_name_code_key(row.get(code_col, ""))
+                name = str(row.get(name_col, "") or "").strip()
+                if code and name:
+                    out[code] = name
+        if failures or not out:
+            raise RuntimeError("官方股票名冊不完整：" + "；".join(failures or ["回傳空資料"]))
+        _OFFICIAL_STOCK_NAME_CACHE = dict(out)
+        print(f"✅ 官方股票名稱對照載入：{len(out):,} 檔")
+        return dict(out)
 
 
 def fetch_twse_openapi_warrant_daily_df(force_refresh: bool = False) -> pd.DataFrame:
@@ -14731,26 +14772,19 @@ def _finmind_market_label(raw_type: str) -> str:
 
 
 def get_tw_stock_name(stock_code: str) -> str:
-    """FinMind-only：優先讀 TaiwanStockInfo；暫缺時以股票代號作名稱並保留警告。"""
+    """由 TWSE／TPEx 官方公司基本資料取得股票簡稱，不使用 FinMind。"""
     code = _normalize_stock_name_code_key(stock_code)
     if not code:
         raise ValueError("股票代號不可為空")
-    df = _finmind_load_stock_info()
-    hit = df[df["stock_id"].astype(str) == code]
-    if hit.empty:
-        print(
-            f"⚠️ FinMind TaiwanStockInfo 暫時找不到股票代號：{code}｜"
-            f"本次先以代號「{code}」作為名稱，股價資料仍會繼續驗證"
-        )
-        return code
-    name = str(hit.iloc[-1].get("stock_name", "") or "").strip()
+    name_map = _official_stock_name_map()
+    name = str(name_map.get(code, "") or "").strip()
     if not name:
         print(
-            f"⚠️ FinMind TaiwanStockInfo 股票名稱為空：{code}｜"
-            f"本次先以代號「{code}」作為名稱"
+            f"⚠️ 官方股票基本資料找不到代號：{code}｜"
+            "無法安全建立權證母體，請確認代號或官方 OpenAPI 狀態"
         )
-        return code
-    print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：FinMind TaiwanStockInfo")
+        raise RuntimeError(f"官方股票基本資料找不到：{code}")
+    print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：TWSE／TPEx 官方 OpenAPI")
     return name
 
 
@@ -14831,19 +14865,17 @@ def fetch_inst_60d_from_x(stock_code: str, days: int = 80) -> pd.DataFrame:
 
 
 def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
-    """取得市場實際有成交的日期。
+    """以 TWSE 官方休市表建立交易日，不使用 FinMind。
 
-    不直接採用 TaiwanStockTradingDate，因為該表可能先列入原訂開市日，
-    但臨時颱風休市後未即時移除。改用 0050（可由環境變數調整）的
-    TaiwanStockPrice 實際成交日期，避免把臨時休市日送進 storage_objects。
+    臨時休市日即使尚未列入年度表，也只會產生一個查無成交的日期，不會排除
+    真正的權證交易日；MoneyDJ 的逐日回應仍是事件是否存在的唯一依據。
     """
     global _FINMIND_TRADING_DATE_CACHE
 
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
-    reference_stock = _normalize_stock_name_code_key(FINMIND_TRADING_DATE_REFERENCE_STOCK)
     cache_key = (
-        reference_stock,
+        "TWSE_official_holiday_schedule",
         start_ts.strftime("%Y-%m-%d"),
         end_ts.strftime("%Y-%m-%d"),
     )
@@ -14858,34 +14890,31 @@ def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
         if cached is not None:
             return [pd.Timestamp(x).normalize() for x in cached]
 
-    raw = _finmind_get_data(
-        "TaiwanStockPrice",
-        data_id=reference_stock,
-        start_date=start_ts.strftime("%Y-%m-%d"),
-        end_date=end_ts.strftime("%Y-%m-%d"),
-        allow_empty=False,
-    )
-    if "date" not in raw.columns:
-        raise RuntimeError(
-            "FinMind TaiwanStockPrice 缺少 date 欄位，"
-            f"無法建立實際交易日：{raw.columns.tolist()}"
-        )
+    holidays = set()
+    for year in range(start_ts.year, end_ts.year + 1):
+        url = TWSE_HOLIDAY_OPENAPI_URL.format(year=year)
+        try:
+            response = get_thread_session().get(
+                url, headers=OPENAPI_WARRANT_HEADERS,
+                timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if str(payload.get("stat", "")).lower() != "ok" or not isinstance(payload.get("data"), list):
+                raise RuntimeError("官方休市表格式不正確")
+            for row in payload["data"]:
+                value = row[0] if isinstance(row, (list, tuple)) and row else ""
+                dt = pd.to_datetime(value, errors="coerce")
+                if pd.notna(dt):
+                    holidays.add(pd.Timestamp(dt).normalize())
+        except Exception as exc:
+            raise RuntimeError(f"TWSE 官方休市表讀取失敗（{year}）：{exc}") from exc
 
-    actual_dates = (
-        pd.to_datetime(raw["date"], errors="coerce")
-        .dropna()
-        .dt.normalize()
-        .drop_duplicates()
-        .sort_values()
-    )
-    actual_dates = actual_dates[
-        (actual_dates >= start_ts) & (actual_dates <= end_ts)
-    ]
-    dates = [pd.Timestamp(x).normalize() for x in actual_dates.tolist()]
+    candidates = pd.bdate_range(start_ts, end_ts)
+    dates = [pd.Timestamp(day).normalize() for day in candidates if pd.Timestamp(day).normalize() not in holidays]
     if not dates:
         raise RuntimeError(
-            f"FinMind TaiwanStockPrice 找不到 {reference_stock} 在 "
-            f"{start_ts.date()} ~ {end_ts.date()} 的實際成交日"
+            f"TWSE 官方休市表篩選後沒有交易日：{start_ts.date()} ~ {end_ts.date()}"
         )
 
     with _FINMIND_DATA_CACHE_LOCK:
@@ -14893,10 +14922,7 @@ def _finmind_get_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
             _FINMIND_TRADING_DATE_CACHE = {}
         _FINMIND_TRADING_DATE_CACHE[cache_key] = list(dates)
 
-    print(
-        f"📅 FinMind 實際交易日：以 {reference_stock} TaiwanStockPrice 為準｜"
-        f"{len(dates):,} 日｜{dates[0].date()} ~ {dates[-1].date()}"
-    )
+    print(f"📅 官方交易日：TWSE 休市表｜{len(dates):,} 日｜{dates[0].date()} ~ {dates[-1].date()}")
     return dates
 
 
@@ -17183,11 +17209,117 @@ def _hybrid_replace_day_with_moneydj(
 
 _WARRANT_UNIVERSE_CACHE: Dict[str, pd.DataFrame] = {}
 _WARRANT_UNIVERSE_CACHE_LOCK = threading.Lock()
+_OFFICIAL_WARRANT_REGISTRY_CACHE = None
+_OFFICIAL_WARRANT_REGISTRY_CACHE_LOCK = threading.Lock()
 
 _WARRANT_SUMMARY_COLUMNS = [
     "stock_id", "stock_name", "target_stock_id", "type",
     "listing_date", "last_trade_date",
 ]
+
+
+def _load_official_warrant_registry() -> pd.DataFrame:
+    """取得 TWSE／TPEx 官方完整權證基本名冊（含下市），不以當日成交檔代替。
+
+    每個市場都必須成功；少一個市場就不回傳半份名冊，避免上櫃或上市權證
+    被靜默漏掉。官方欄位沒有可靠上市日，因此下游採「最後交易日覆蓋查詢
+    起日」的保守策略：多查只會得到 MoneyDJ 空資料，少查才會少算。
+    """
+    global _OFFICIAL_WARRANT_REGISTRY_CACHE
+    with _OFFICIAL_WARRANT_REGISTRY_CACHE_LOCK:
+        if _OFFICIAL_WARRANT_REGISTRY_CACHE is not None:
+            return _OFFICIAL_WARRANT_REGISTRY_CACHE.copy()
+
+        sources = (
+            (TWSE_WARRANT_REGISTRY_OPENAPI_URL, "上市權證完整基本名冊", "上市"),
+            (TPEX_WARRANT_REGISTRY_OPENAPI_URL, "上櫃權證完整基本名冊", "上櫃"),
+        )
+        frames = []
+        failures = []
+        required = {"權證代號", "權證簡稱", "權證類型", "最後交易日", "標的證券/指數"}
+        for url, label, market in sources:
+            rows, ok, error = fetch_openapi_json(url, label)
+            if not ok:
+                failures.append(f"{label}: {error}")
+                continue
+            frame = pd.DataFrame(rows)
+            if frame.empty or not required.issubset(frame.columns):
+                failures.append(f"{label}: 回傳空資料或缺少欄位 {sorted(required - set(frame.columns))}")
+                continue
+            out = pd.DataFrame({
+                "stock_id": frame["權證代號"].map(normalize_openapi_warrant_code),
+                "stock_name": frame["權證簡稱"].astype(str).str.strip(),
+                "target_name": frame["標的證券/指數"].astype(str).str.strip(),
+                "type": frame["權證類型"].astype(str).str.strip(),
+                "listing_date": frame.get("履約開始日", pd.Series([""] * len(frame))).map(parse_date),
+                "last_trade_date": frame["最後交易日"].map(parse_date),
+                "market": market,
+            })
+            out["listing_date"] = pd.to_datetime(out["listing_date"], errors="coerce")
+            out["last_trade_date"] = pd.to_datetime(out["last_trade_date"], errors="coerce")
+            out = out[(out["stock_id"] != "") & (out["target_name"] != "")].copy()
+            frames.append(out)
+        if failures:
+            raise RuntimeError("官方完整權證名冊不完整：" + "；".join(failures))
+        registry = pd.concat(frames, ignore_index=True)
+        if registry.empty:
+            raise RuntimeError("官方完整權證名冊為空")
+        _OFFICIAL_WARRANT_REGISTRY_CACHE = registry.copy()
+        print(
+            f"✅ 官方完整權證名冊載入：{len(registry):,} 筆｜"
+            f"上市={int((registry['market'] == '上市').sum()):,}｜"
+            f"上櫃={int((registry['market'] == '上櫃').sum()):,}"
+        )
+        return registry.copy()
+
+
+def _official_registry_warrant_universe_for_stock(
+    stock_code: str,
+    stock_name: str,
+    start_date,
+    end_date,
+) -> pd.DataFrame:
+    """以官方完整名冊為唯一權證母體，確保含區間內已下市且曾交易的權證。"""
+    code = _normalize_stock_name_code_key(stock_code)
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    cache_key = f"official_registry|{code}|{start_ts.date()}|{end_ts.date()}|put={int(WARRANT_SEED_INCLUDE_PUT)}"
+    with _WARRANT_UNIVERSE_CACHE_LOCK:
+        cached = _WARRANT_UNIVERSE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    registry = _load_official_warrant_registry()
+    target_key = _finmind_compact_issuer_text(stock_name)
+    if not target_key:
+        raise RuntimeError(f"權證母體無法比對：{code} 缺少官方股票簡稱")
+    rows = registry[registry["target_name"].map(_finmind_compact_issuer_text) == target_key].copy()
+    # 最後交易日為空時不能安全排除；保守納入，讓 MoneyDJ 回傳實際有無成交。
+    rows = rows[rows["last_trade_date"].isna() | (rows["last_trade_date"] >= start_ts)].copy()
+    if not WARRANT_SEED_INCLUDE_PUT:
+        rows = rows[rows["type"].astype(str).str.contains("認購", na=False)].copy()
+    if rows.empty:
+        print(f"ℹ️ 官方完整權證名冊：{code} {stock_name} 在區間內沒有符合的權證")
+        return pd.DataFrame(columns=_WARRANT_SUMMARY_COLUMNS)
+
+    # 缺少正式上市日不可用來排除，否則會漏掉新掛牌或名冊日期格式變動的權證。
+    rows["listing_date"] = rows["listing_date"].fillna(start_ts)
+    rows.loc[rows["listing_date"] > end_ts, "listing_date"] = start_ts
+    rows["last_trade_date"] = rows["last_trade_date"].fillna(end_ts)
+    rows["target_stock_id"] = code
+    out = rows[["stock_id", "stock_name", "target_stock_id", "type", "listing_date", "last_trade_date"]].copy()
+    # 同一代號在一個短報表區間不應同時代表兩檔權證；保留最後交易日較晚的一筆。
+    out = out.sort_values(["stock_id", "last_trade_date", "listing_date"], ascending=[True, False, False])
+    out = out.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
+    if out.empty:
+        raise RuntimeError(f"官方完整權證名冊去重後為空：{code}")
+    with _WARRANT_UNIVERSE_CACHE_LOCK:
+        _WARRANT_UNIVERSE_CACHE[cache_key] = out.copy()
+    print(
+        f"✅ 官方完整權證母體：{code} {stock_name}｜{start_ts.date()}~{end_ts.date()}｜"
+        f"{len(out):,} 支{'含認售' if WARRANT_SEED_INCLUDE_PUT else '認購'}權證"
+    )
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -17314,6 +17446,39 @@ def _load_trader_name_map() -> Dict[str, str]:
             print(f"⚠️ 讀不到分點名冊，改用 MoneyDJ 券商簡稱：{seed_path}｜{exc}")
             _TRADER_SEED_CACHE = {}
         return _TRADER_SEED_CACHE
+
+
+def _resolve_selected_branch_ids_from_local_registry(selected_branches: set) -> dict:
+    """以本機官方證券商分點名冊解析 MoneyDJ 分點代碼，不呼叫 FinMind。
+
+    本機名冊沒有安裝時，呼叫端會再從已完整驗證的 API4 結果補足代碼；
+    這個函式本身不會呼叫 FinMind，也不會要求手動維護名冊才可執行。
+    """
+    selected = {normalize_branch_name(x) for x in (selected_branches or set()) if normalize_branch_name(x)}
+    if not selected:
+        return {}
+    resolved = {name: set() for name in selected}
+    for name, ids in _parse_finmind_selected_branch_id_overrides().items():
+        normalized = normalize_branch_name(name)
+        if normalized in resolved:
+            resolved[normalized].update(str(v).strip() for v in ids if str(v).strip())
+
+    name_map = _load_trader_name_map()
+    for broker_code, raw_name in name_map.items():
+        branch = normalize_branch_name(raw_name)
+        branch_key = _finmind_branch_lookup_key(branch)
+        for requested in selected:
+            if branch == requested or (branch_key and branch_key == _finmind_branch_lookup_key(requested)):
+                resolved[requested].add(str(broker_code).strip())
+
+    unresolved = [name for name, ids in resolved.items() if not ids]
+    if unresolved:
+        print(
+            "ℹ️ 本機分點名冊未對到：" + "、".join(sorted(unresolved))
+            + "；將由完整 API4 結果自動補足，不使用 FinMind。"
+        )
+    print(f"✅ 本機分點代碼對照：{ {name: sorted(ids) for name, ids in resolved.items() if ids} }")
+    return resolved
 
 
 def _seed_warrant_universe_for_stock(
@@ -17557,12 +17722,14 @@ def _resolve_warrant_summary(
     start_date,
     end_date,
 ) -> tuple[pd.DataFrame, str]:
-    """取得權證清單；MOPS 種子檔為主，官方當日清單、FinMind 依序候補。
-
-    回傳 (summary, source_label)。全部拿不到時回傳空 DataFrame，
-    由呼叫端印出原因後正常結束，不再讓 FinMind 的 HTTP 400 直接炸掉整份報告。
-    """
+    """取得權證清單；預設官方完整名冊，絕不以 FinMind 或當日成交清單補洞。"""
     code = _normalize_stock_name_code_key(stock_code)
+
+    if WARRANT_UNIVERSE_SOURCE in ("official_registry", "official_full", "official"):
+        official_registry = _official_registry_warrant_universe_for_stock(
+            code, stock_name, start_date, end_date
+        )
+        return official_registry, "TWSE/TPEx官方完整權證基本名冊"
 
     if WARRANT_UNIVERSE_SOURCE == "seed":
         try:
@@ -17572,35 +17739,12 @@ def _resolve_warrant_summary(
             print(f"⚠️ 種子檔權證清單建立失敗：{code}｜{type(exc).__name__}: {exc}")
         if seeded is not None and not seeded.empty:
             return seeded, "MOPS種子檔"
-        print(f"↩️ 種子檔權證清單為空，改用官方當日清單反推：{code}")
+        raise RuntimeError(f"MOPS 權證種子檔查無 {code}；為避免漏抓，不退回當日成交清單")
 
-    if WARRANT_UNIVERSE_SOURCE in ("official", "seed"):
-        try:
-            official = _official_warrant_universe_for_stock(code, stock_name, start_date, end_date)
-        except Exception as exc:
-            official = pd.DataFrame(columns=_WARRANT_SUMMARY_COLUMNS)
-            print(f"⚠️ 官方權證清單建立失敗：{code}｜{type(exc).__name__}: {exc}")
-        if official is not None and not official.empty:
-            return official, "官方OpenAPI反推"
-        if not WARRANT_FINMIND_FALLBACK_ENABLE:
-            print(f"⚠️ 官方權證清單為空且已關閉 FinMind 候補：{code}")
-            return pd.DataFrame(columns=_WARRANT_SUMMARY_COLUMNS), "無"
-        print(f"↩️ 官方權證清單為空，改用 FinMind 候補：{code}")
-
-    try:
-        summary = _finmind_get_warrant_summary(code, start_date, end_date)
-        if summary is not None and not summary.empty:
-            return summary, "FinMind"
-        return pd.DataFrame(columns=_WARRANT_SUMMARY_COLUMNS), "FinMind(空)"
-    except FinMindBadRequestError as exc:
-        # register 等級最典型的情況：TaiwanStockInfoWithWarrantSummary 需要贊助等級。
-        print(
-            f"⚠️ FinMind 權證清單候補失敗（權限不足）：{code}｜{exc}\n"
-            f"   → 請確認官方 OpenAPI 是否正常，或用 WARRANT_UNIVERSE_EXTRA_CODES 手動指定權證代號"
-        )
-    except Exception as exc:
-        print(f"⚠️ FinMind 權證清單候補失敗：{code}｜{type(exc).__name__}: {exc}")
-    return pd.DataFrame(columns=_WARRANT_SUMMARY_COLUMNS), "無"
+    raise RuntimeError(
+        f"不支援的 WARRANT_UNIVERSE_SOURCE={WARRANT_UNIVERSE_SOURCE!r}；"
+        "請使用 official_registry（預設）或已驗證的 seed，禁止使用 FinMind／當日成交清單。"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -17850,11 +17994,20 @@ def _moneydj_range_events(
     selected_backfill_pairs = 0
     selected_backfill_codes = set()
     if SELECTED_BRANCH_FLOW_ENABLE:
-        resolved_map = {}
-        try:
-            resolved_map = _resolve_selected_branch_ids(_get_selected_branch_flow_set())
-        except Exception as exc:
-            print(f"⚠️ 精選分點補查取不到正式 ID，略過補查：{exc}")
+        resolved_map = _resolve_selected_branch_ids_from_local_registry(
+            _get_selected_branch_flow_set()
+        )
+        # 沒有本機名冊時，API4 已在上方對所有權證完整枚舉分點；直接用其 V2/V3
+        # 反查精選分點代碼。這不會增加任何網路請求，也能讓新開分點自動被辨識。
+        for pair in pairs.values():
+            observed_name = normalize_branch_name(pair.get("branch", ""))
+            observed_key = _finmind_branch_lookup_key(observed_name)
+            for requested_name, ids in resolved_map.items():
+                requested_key = _finmind_branch_lookup_key(requested_name)
+                if observed_name == requested_name or (
+                    observed_key and requested_key and observed_key == requested_key
+                ):
+                    ids.add(str(pair.get("broker_code", "") or "").strip())
         code_to_name = {}
         for requested_name, ids in (resolved_map or {}).items():
             for raw_code in ids or set():
@@ -17886,12 +18039,12 @@ def _moneydj_range_events(
     stats["pairs"] = len(pairs)
     stats["api4_truncated"] = api4_truncated
     if api4_truncated:
-        print(
-            f"⚠️ 有 {api4_truncated} 檔權證即使切分到深度 {MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH} "
-            f"仍有區段回傳列數觸頂（{MONEYDJ_API4_RANGE_ROWS}），分點仍可能少算；"
-            "請調高 MONEYDJ_API4_RANGE_ROWS 或 MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH。"
+        raise RuntimeError(
+            f"MoneyDJ API4 分點探索遭截斷：{api4_truncated} 檔權證在深度 "
+            f"{MONEYDJ_API4_RANGE_SPLIT_MAX_DEPTH} 仍觸及 {MONEYDJ_API4_RANGE_ROWS} 筆上限；"
+            "已拒絕產出可能少算的報告，請提高 MONEYDJ_API4_RANGE_ROWS 或切分深度後重跑。"
         )
-    if stats["api4_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+    if stats["api4_failed"]:
         raise RuntimeError(
             f"MoneyDJ API4 主來源不完整：failed={stats['api4_failed']}/{stats['active_codes']}"
         )
@@ -17935,7 +18088,7 @@ def _moneydj_range_events(
     # 精選分點的視窗前歷史只給 FIFO 建期初庫存，另外存放，不併進 events。
     _set_selected_branch_fifo_preload(stock_code, preload_rows)
 
-    if stats["api5_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
+    if stats["api5_failed"]:
         raise RuntimeError(
             f"MoneyDJ API5 主來源不完整：failed={stats['api5_failed']}/{stats['pairs']}"
         )
@@ -18030,25 +18183,20 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
     if not LIVE_FETCH_ENABLE:
         return pd.DataFrame(columns=empty_columns)
 
-    # 權證清單改由 _resolve_warrant_summary 決定來源：
-    # 官方 TWSE／TPEx OpenAPI 反推為主，FinMind summary 為候補。
-    # 回傳欄位與 FinMind summary 同形狀，下游流程完全不用改。
-    summary = _FINMIND_MULTI_STOCK_SUMMARY_CACHE.get(code)
-    summary_source = "FinMind多股票預抓" if summary is not None else ""
-    if summary is None:
-        summary, summary_source = _resolve_warrant_summary(code, stock_name, start_date, end_date)
+    # 權證母體一律由官方完整基本名冊建立；不讀 FinMind 多股票快取，
+    # 也不允許失敗時改以 FinMind 或當日成交清單補洞。
+    summary, summary_source = _resolve_warrant_summary(code, stock_name, start_date, end_date)
     if summary is None or summary.empty:
         print(f"⚠️ 權證清單為空，無法產生分點資料：{code}｜來源={summary_source or '無'}")
         return pd.DataFrame(columns=empty_columns)
 
-    warrant_name_map = _FINMIND_MULTI_STOCK_NAME_MAP_CACHE.get(code, {}) or _finmind_target_warrant_name_map(summary)
-    trader_name_map, _ = _finmind_securities_trader_maps()
+    warrant_name_map = _finmind_target_warrant_name_map(summary)
+    trader_name_map = _load_trader_name_map()
     if not trader_name_map:
-        print("⚠️ FinMind 分點 ID 對照表為空；本次會保留 API／Parquet 券商簡稱")
+        print("ℹ️ 本機官方分點名冊不存在；本次保留 MoneyDJ 回傳的分點名稱")
 
-    selected_branch_names = _get_selected_branch_flow_set() if SELECTED_BRANCH_FLOW_ENABLE else set()
-    selected_branch_id_map = _resolve_selected_branch_ids(selected_branch_names) if selected_branch_names else {}
-    print(f"🧩 精選分點正式 ID 結果：{ {name: sorted(ids) for name, ids in selected_branch_id_map.items()} }")
+    # MoneyDJ 主流程不以 FinMind securities_trader_id 比對分點。
+    selected_branch_id_map = {}
 
     trading_dates = _finmind_get_trading_dates(start_date, end_date)
     if not trading_dates:
@@ -18077,12 +18225,12 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
                 stock_name,
             )
         except Exception as exc:
-            if HYBRID_MONEYDJ_STRICT_COMPLETENESS:
-                # 嚴格模式要的就是「不完整就失敗」，不能被這裡的回退吃掉。
-                raise
-            moneydj_primary_events = pd.DataFrame()
-            moneydj_primary_stats = {"error": f"{type(exc).__name__}: {exc}"}
-            print(f"⚠️ MoneyDJ 主來源失敗：{code}｜{type(exc).__name__}: {exc}")
+            # 不論環境變數如何設定，權證資料不能拿部分結果或 FinMind 當替代品。
+            # 讓本次報告失敗，下一次重跑時再從官方名冊與 MoneyDJ 重新取得完整資料。
+            raise RuntimeError(
+                f"MoneyDJ 權證分點資料不完整，已拒絕產出部分結果：{code}｜"
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
         if moneydj_primary_events is not None and not moneydj_primary_events.empty:
             events = moneydj_primary_events.copy()
@@ -19527,11 +19675,19 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     if FINMIND_PREWARM_ONLY:
+        if WARRANT_MONEYDJ_PRIMARY_ENABLE:
+            raise RuntimeError(
+                "WARRANT_PREWARM_ONLY 是 FinMind 全市場快取流程，"
+                "純 MoneyDJ 權證模式不可啟用。"
+            )
         print("🔥 WARRANT_PREWARM_ONLY=1：本次只建立全市場共用快取，不產圖、不呼叫 Gemini、不送 Discord")
         _finmind_prewarm_market_compact_cache()
         return
 
-    _finmind_prepare_report_market_cache()
+    if not WARRANT_MONEYDJ_PRIMARY_ENABLE:
+        _finmind_prepare_report_market_cache()
+    else:
+        print("⏭️ 純 MoneyDJ 權證模式：略過 FinMind 權證預熱與全市場快取")
 
     raw_codes = os.getenv("STOCK_CODES", "2408").strip() or "2408"
     stock_codes = [c.strip() for c in re.split(r"[,，\s]+", raw_codes) if c.strip()]
