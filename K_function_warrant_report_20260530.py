@@ -2597,15 +2597,15 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
     """
     max_attempts = max(2, int(FINMIND_REQUEST_RETRIES))
     last_error = ""
-    request_headers = dict(OPENAPI_WARRANT_HEADERS)
-    # TPEx 的大型完整權證名冊偶爾在 gzip 串流結尾提早中斷；要求未壓縮內容
-    # 可避免把暫時性傳輸錯誤誤判為「上櫃沒有資料」。
-    request_headers["Accept-Encoding"] = "identity"
-    request_headers["Connection"] = "close"
-
     for attempt in range(1, max_attempts + 1):
         session = None
         try:
+            request_headers = dict(OPENAPI_WARRANT_HEADERS)
+            # 大型 TPEx 名冊若一律 identity，GitHub runner 會下載約 15MB 未壓縮
+            # 資料而停在此步數分鐘。正常情況先用 gzip；只有發生串流截斷的重試
+            # 才退回 identity，速度與傳輸可靠性兩者都保留。
+            request_headers["Accept-Encoding"] = "gzip, deflate" if attempt == 1 else "identity"
+            request_headers["Connection"] = "close"
             # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的
             # keep-alive 連線持續觸發 Response ended prematurely。
             if attempt == 1:
@@ -2636,9 +2636,10 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
             last_error = str(exc or type(exc).__name__)
             if attempt < max_attempts:
                 wait_sec = min(8.0, FINMIND_RETRY_BASE_WAIT * attempt)
+                fallback_note = "｜下輪改未壓縮傳輸" if attempt == 1 else ""
                 print(
                     f"⚠️ {source_name} OpenAPI 暫時失敗，準備重試 "
-                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}"
+                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}{fallback_note}"
                 )
                 time.sleep(wait_sec)
                 continue
