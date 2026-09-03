@@ -213,6 +213,13 @@ WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
 WARRANT_MONEYDJ_API5_HISTORY_LIMIT = max(
     2, int(os.getenv("WARRANT_MONEYDJ_API5_HISTORY_LIMIT", "200"))
 )
+# 非精選分點不需要視窗前 FIFO 庫存。API5 的 c 是「回傳列數」，原本不分
+# 用途一律取 200 列，70 日圖表的絕大多數分點因此下載了完全不會使用的歷史。
+# 每個 (權證, 分點) 每交易日最多一列，故「查詢交易日數 + 緩衝」已完整覆蓋圖表。
+# 精選分點仍使用上方的 200 列，保留 FIFO 期初庫存與既有報表品質。
+WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER = max(
+    0, int(os.getenv("WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER", "5"))
+)
 # MoneyDJ API5 是整支程式最主要的網路成本。已結束交易日的分點明細不會再變，
 # 因此落盤快取並只重查最近幾個交易日；快取缺一個 API4 已觀測到的日期就會自動
 # 回源，不允許快取造成少算。
@@ -2642,6 +2649,35 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
 
 _OFFICIAL_STOCK_NAME_CACHE = None
 _OFFICIAL_STOCK_NAME_CACHE_LOCK = threading.Lock()
+
+
+def _official_stock_name_from_source(
+    stock_code: str,
+    url: str,
+    source_name: str,
+    code_column: str,
+    name_column: str,
+) -> tuple[str, str]:
+    """由單一官方市場名冊找股票簡稱。
+
+    完整載入雙市場名冊只為查一個股票代號，會讓 TPEx 的大回應或重試把
+    整份報告卡住數十秒。這裡維持官方來源與嚴格驗證，但先查 TWSE，查無
+    目標代號才查 TPEx；上市股票因此不必等待另一個市場的網路傳輸。
+    """
+    rows, ok, error = fetch_openapi_json(url, source_name)
+    if not ok:
+        return "", error or "官方 OpenAPI 讀取失敗"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_code = _normalize_stock_name_code_key(row.get(code_column, ""))
+        if row_code != stock_code:
+            continue
+        name = str(row.get(name_column, "") or "").strip()
+        if name:
+            return name, ""
+        return "", "目標代號的公司簡稱為空"
+    return "", "官方名冊沒有此代號"
 
 
 def _official_stock_name_map() -> Dict[str, str]:
@@ -14798,16 +14834,25 @@ def get_tw_stock_name(stock_code: str) -> str:
     code = _normalize_stock_name_code_key(stock_code)
     if not code:
         raise ValueError("股票代號不可為空")
-    name_map = _official_stock_name_map()
-    name = str(name_map.get(code, "") or "").strip()
-    if not name:
-        print(
-            f"⚠️ 官方股票基本資料找不到代號：{code}｜"
-            "無法安全建立權證母體，請確認代號或官方 OpenAPI 狀態"
+    sources = (
+        (TWSE_STOCK_REGISTRY_OPENAPI_URL, "上市股票基本資料", "公司代號", "公司簡稱", "TWSE"),
+        (TPEX_STOCK_REGISTRY_OPENAPI_URL, "上櫃股票基本資料", "SecuritiesCompanyCode", "CompanyAbbreviation", "TPEx"),
+    )
+    failures = []
+    for url, source_name, code_column, name_column, market in sources:
+        name, error = _official_stock_name_from_source(
+            code, url, source_name, code_column, name_column
         )
-        raise RuntimeError(f"官方股票基本資料找不到：{code}")
-    print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：TWSE／TPEx 官方 OpenAPI")
-    return name
+        if name:
+            print(f"✅ 股票名稱查詢成功：{code} {name}｜來源：{market} 官方 OpenAPI（按需查詢）")
+            return name
+        failures.append(f"{market}: {error}")
+
+    print(
+        f"⚠️ 官方股票基本資料找不到代號：{code}｜"
+        "無法安全建立權證母體，請確認代號或官方 OpenAPI 狀態"
+    )
+    raise RuntimeError(f"官方股票基本資料找不到：{code}｜" + "；".join(failures))
 
 
 def fetch_stock_data_yf(stock_code: str, period="160d"):
@@ -18125,6 +18170,9 @@ def _moneydj_range_events(
     trader_name_map = _load_trader_name_map()
 
     pairs = {}
+    # API4 的 V1 是實際交易日。記錄每個 (權證, 分點) 的日期集合，快取命中時
+    # 才能逐日驗證 API5 已有完整金額，而不是只看「這個 pair 曾經存在」。
+    api4_pair_dates = {}
     api4_truncated = 0
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API4_WORKERS) as executor:
         future_map = {
@@ -18153,7 +18201,13 @@ def _moneydj_range_events(
                 pair["branch"] = normalize_branch_name(
                     official_name or row.get("V3", "")
                 )
-                pairs[(pair["warrant_code"], broker_code)] = pair
+                pair_key = (pair["warrant_code"], broker_code)
+                pairs[pair_key] = pair
+                trade_dt = parse_date(row.get("V1", ""))
+                if trade_dt is not None:
+                    trade_day = pd.Timestamp(trade_dt).normalize()
+                    if api4_start_ts <= trade_day <= end_ts:
+                        api4_pair_dates.setdefault(pair_key, set()).add(trade_day)
 
     # 精選分點補查：
     # API4 的區間分點清單只會列出該權證在區間內較顯著的分點，小額或只在少數
@@ -18246,12 +18300,16 @@ def _moneydj_range_events(
         )
         return pd.DataFrame(), stats
 
-    # API5 的 c={days} 只是「一次回幾列」，不影響請求數，所以寧可開大。
-    # 開太小的後果是更早的交易全部變成 0，圖上看起來像「那段時間沒人買賣」。
-    lookback_days = max(
+    # 只有精選分點的 FIFO 需要視窗前庫存；其餘分點只服務本次圖表與
+    # TOP5，最多一個交易日一列，無須下載 200 筆舊資料。
+    selected_lookback_days = max(
         HYBRID_MONEYDJ_API5_DAYS,
         WARRANT_MONEYDJ_API5_HISTORY_LIMIT,
         int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
+    )
+    nonselected_lookback_days = max(
+        2,
+        len(days) + WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER,
     )
     cached_pair_dates = {}
     cached_key_series = pd.Series(dtype=str)
@@ -18309,10 +18367,14 @@ def _moneydj_range_events(
     stats["api5_cache_hits"] = api5_cache_hits
     print(
         f"⚡ MoneyDJ API5 排程：需回源={len(api5_pairs):,}｜快取重用={api5_cache_hits:,}｜"
-        f"近期重查={len(refresh_days)}個交易日"
+        f"近期重查={len(refresh_days)}個交易日｜"
+        f"一般分點回看={nonselected_lookback_days}列｜精選分點回看={selected_lookback_days}列"
     )
 
-    event_rows = []
+    # 暫存每組 API5 結果。這可避免非精選分點的縮短回傳不夠時，補查後將
+    # 兩次資料相加而造成雙倍金額。
+    api5_rows_by_key = {}
+    api5_preloads_by_key = {}
     preload_rows = []
     if cached_preloads is not None and not cached_preloads.empty and "Date" in cached_preloads.columns:
         cached_preload_copy = cached_preloads.copy()
@@ -18335,27 +18397,93 @@ def _moneydj_range_events(
                 pair,
                 start_ts,
                 end_ts,
-                lookback_days,
+                selected_lookback_days if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes else nonselected_lookback_days,
                 str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
             ): pair
             for pair in api5_pairs
         }
         for future in as_completed(future_map):
             rows, pre_rows, error = future.result()
+            pair = future_map[future]
+            cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
             if error:
                 stats["api5_failed"] += 1
                 continue
-            event_rows.extend(rows)
-            preload_rows.extend(pre_rows)
-            cache_key = _moneydj_event_pair_key(
-                pair.get("warrant_code", ""), pair.get("broker_code", "")
-            )
-            if rows:
-                queried_empty_pairs.discard(cache_key)
-            else:
-                queried_empty_pairs.add(cache_key)
-            if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes:
-                queried_preloaded_pairs.add(cache_key)
+            api5_rows_by_key[cache_key] = list(rows or [])
+            api5_preloads_by_key[cache_key] = list(pre_rows or [])
+
+    # API4 是完整性索引。僅有 API4 已揭示交易、但精簡 API5 沒有涵蓋該日期
+    # 的 pair 才升級取 200 列；其餘分點維持最小必要回傳。
+    coverage_retries = []
+    for pair in api5_pairs:
+        pair_key = (pair.get("warrant_code", ""), str(pair.get("broker_code", "") or "").strip())
+        expected_dates = set(api4_pair_dates.get(pair_key, set()))
+        if not expected_dates:
+            continue
+        cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
+        returned_dates = {
+            pd.Timestamp(row.get("Date")).normalize()
+            for row in api5_rows_by_key.get(cache_key, [])
+            if pd.notna(pd.to_datetime(row.get("Date"), errors="coerce"))
+        }
+        if not expected_dates.issubset(returned_dates):
+            coverage_retries.append(pair)
+    if coverage_retries:
+        print(
+            f"🔁 MoneyDJ API5 精簡列數覆蓋補查：{len(coverage_retries):,} 組｜"
+            f"僅這些組改取 {selected_lookback_days} 列"
+        )
+        with ThreadPoolExecutor(max_workers=min(WARRANT_MONEYDJ_RANGE_API5_WORKERS, len(coverage_retries))) as executor:
+            retry_future_map = {
+                executor.submit(
+                    _moneydj_api5_range_one, pair, start_ts, end_ts,
+                    selected_lookback_days,
+                    str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
+                ): pair
+                for pair in coverage_retries
+            }
+            for future in as_completed(retry_future_map):
+                rows, pre_rows, error = future.result()
+                pair = retry_future_map[future]
+                cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
+                if error:
+                    stats["api5_failed"] += 1
+                    continue
+                api5_rows_by_key[cache_key] = list(rows or [])
+                api5_preloads_by_key[cache_key] = list(pre_rows or [])
+
+    uncovered_pairs = []
+    for pair in api5_pairs:
+        pair_key = (pair.get("warrant_code", ""), str(pair.get("broker_code", "") or "").strip())
+        expected_dates = set(api4_pair_dates.get(pair_key, set()))
+        if not expected_dates:
+            continue
+        cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
+        returned_dates = {
+            pd.Timestamp(row.get("Date")).normalize()
+            for row in api5_rows_by_key.get(cache_key, [])
+            if pd.notna(pd.to_datetime(row.get("Date"), errors="coerce"))
+        }
+        if not expected_dates.issubset(returned_dates):
+            uncovered_pairs.append(cache_key)
+    if uncovered_pairs:
+        raise RuntimeError(
+            f"MoneyDJ API5 未覆蓋 API4 已揭示交易日：{len(uncovered_pairs):,} 組；"
+            "已拒絕產出可能少算的報告"
+        )
+
+    event_rows = []
+    for pair in api5_pairs:
+        cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
+        rows = api5_rows_by_key.get(cache_key, [])
+        event_rows.extend(rows)
+        preload_rows.extend(api5_preloads_by_key.get(cache_key, []))
+        if rows:
+            queried_empty_pairs.discard(cache_key)
+        else:
+            queried_empty_pairs.add(cache_key)
+        if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes:
+            queried_preloaded_pairs.add(cache_key)
 
     # 精選分點的視窗前歷史只給 FIFO 建期初庫存，另外存放，不併進 events。
     preload_frame = _concat_warrant_event_frames([pd.DataFrame(preload_rows)])
