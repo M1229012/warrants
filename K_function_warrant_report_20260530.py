@@ -213,6 +213,19 @@ WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
 WARRANT_MONEYDJ_API5_HISTORY_LIMIT = max(
     2, int(os.getenv("WARRANT_MONEYDJ_API5_HISTORY_LIMIT", "200"))
 )
+# MoneyDJ API5 是整支程式最主要的網路成本。已結束交易日的分點明細不會再變，
+# 因此落盤快取並只重查最近幾個交易日；快取缺一個 API4 已觀測到的日期就會自動
+# 回源，不允許快取造成少算。
+MONEYDJ_EVENT_CACHE_ENABLE = os.getenv(
+    "WARRANT_MONEYDJ_EVENT_CACHE_ENABLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+MONEYDJ_EVENT_CACHE_DIR = os.getenv(
+    "WARRANT_MONEYDJ_EVENT_CACHE_DIR", "moneydj_warrant_cache"
+).strip() or "moneydj_warrant_cache"
+MONEYDJ_EVENT_CACHE_SCHEMA = "moneydj_event_v2"
+MONEYDJ_EVENT_CACHE_REFRESH_TRADING_DAYS = max(
+    1, int(os.getenv("WARRANT_MONEYDJ_EVENT_CACHE_REFRESH_TRADING_DAYS", "2"))
+)
 
 # 週報參數
 WEEK_TRADING_DAYS = int(os.getenv("WARRANT_WEEK_TRADING_DAYS", "5"))
@@ -2644,8 +2657,17 @@ def _official_stock_name_map() -> Dict[str, str]:
         )
         out = {}
         failures = []
-        for url, label, code_col, name_col in sources:
-            rows, ok, error = fetch_openapi_json(url, label)
+        with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+            future_map = {
+                executor.submit(fetch_openapi_json, url, label): (label, code_col, name_col)
+                for url, label, code_col, name_col in sources
+            }
+            results = []
+            for future in as_completed(future_map):
+                label, code_col, name_col = future_map[future]
+                rows, ok, error = future.result()
+                results.append((label, code_col, name_col, rows, ok, error))
+        for label, code_col, name_col, rows, ok, error in results:
             if not ok:
                 failures.append(f"{label}: {error}")
                 continue
@@ -17092,6 +17114,9 @@ def _hybrid_moneydj_latest_day_events(
         f"權證={len(warrants):,}｜API4 workers={HYBRID_MONEYDJ_API4_WORKERS}"
     )
     pairs = {}
+    # API4 已經告訴我們每個 (權證, 分點) 在哪些日期有活動；它是 API5 快取
+    # 完整性的逐日期驗證依據，而非僅作為效能上的猜測。
+    api4_pair_dates = {}
     with ThreadPoolExecutor(max_workers=HYBRID_MONEYDJ_API4_WORKERS) as executor:
         future_map = {
             executor.submit(_hybrid_moneydj_api4_one, warrant, day): warrant
@@ -17113,7 +17138,13 @@ def _hybrid_moneydj_latest_day_events(
                 pair = dict(warrant)
                 pair["broker_code"] = broker_code
                 pair["branch"] = normalize_branch_name(row.get("V3", ""))
-                pairs[(pair["warrant_code"], broker_code)] = pair
+                pair_key = (pair["warrant_code"], broker_code)
+                pairs[pair_key] = pair
+                trade_dt = parse_date(row.get("V1", ""))
+                if trade_dt is not None:
+                    trade_day = pd.Timestamp(trade_dt).normalize()
+                    if start_ts <= trade_day <= end_ts:
+                        api4_pair_dates.setdefault(pair_key, set()).add(trade_day)
 
     stats["pairs"] = len(pairs)
     if stats["api4_failed"] and HYBRID_MONEYDJ_STRICT_COMPLETENESS:
@@ -17237,8 +17268,19 @@ def _load_official_warrant_registry() -> pd.DataFrame:
         frames = []
         failures = []
         required = {"權證代號", "權證簡稱", "權證類型", "最後交易日", "標的證券/指數"}
-        for url, label, market in sources:
-            rows, ok, error = fetch_openapi_json(url, label)
+        # 兩個市場彼此獨立，並行下載可將約十餘 MB 的上櫃名冊等待時間隱藏在
+        # 上市名冊下載之後；仍維持兩者都成功才接受資料的完整性規則。
+        with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+            future_map = {
+                executor.submit(fetch_openapi_json, url, label): (label, market)
+                for url, label, market in sources
+            }
+            results = []
+            for future in as_completed(future_map):
+                label, market = future_map[future]
+                rows, ok, error = future.result()
+                results.append((label, market, rows, ok, error))
+        for label, market, rows, ok, error in results:
             if not ok:
                 failures.append(f"{label}: {error}")
                 continue
@@ -17891,6 +17933,121 @@ def _moneydj_api5_range_one(
         return [], [], str(exc)
 
 
+_MONEYDJ_EVENT_CACHE_LOCK = threading.RLock()
+
+
+def _moneydj_event_pair_key(warrant_code, broker_code) -> str:
+    return f"{normalize_openapi_warrant_code(warrant_code)}|{str(broker_code or '').strip()}"
+
+
+def _moneydj_event_cache_paths(stock_code: str) -> tuple[str, str, str]:
+    safe_code = _safe_cache_part(_normalize_stock_name_code_key(stock_code))
+    root = os.path.join(MONEYDJ_EVENT_CACHE_DIR, MONEYDJ_EVENT_CACHE_SCHEMA)
+    return (
+        os.path.join(root, f"{safe_code}.pkl.gz"),
+        os.path.join(root, f"{safe_code}.meta.json"),
+        os.path.join(root, f"{safe_code}.preload.pkl.gz"),
+    )
+
+
+def _load_moneydj_event_cache(stock_code: str) -> tuple[pd.DataFrame, set, pd.DataFrame]:
+    """讀取已驗證的 API5 歷史事件快取；損壞或版本不同時安全地視為未命中。"""
+    if not MONEYDJ_EVENT_CACHE_ENABLE:
+        return pd.DataFrame(), set(), pd.DataFrame()
+    data_path, meta_path, preload_path = _moneydj_event_cache_paths(stock_code)
+    try:
+        with _MONEYDJ_EVENT_CACHE_LOCK:
+            if not (os.path.exists(data_path) and os.path.exists(meta_path)):
+                return pd.DataFrame(), set(), pd.DataFrame()
+            with open(meta_path, "r", encoding="utf-8") as cache_file:
+                meta = json.load(cache_file)
+            if str(meta.get("schema", "")) != MONEYDJ_EVENT_CACHE_SCHEMA:
+                return pd.DataFrame(), set(), pd.DataFrame()
+            events = pd.read_pickle(data_path, compression="gzip")
+            preloads = (
+                pd.read_pickle(preload_path, compression="gzip")
+                if os.path.exists(preload_path)
+                else pd.DataFrame()
+            )
+        covered_dates = set()
+        for value in (meta.get("covered_trading_dates", []) or []):
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.notna(parsed):
+                covered_dates.add(pd.Timestamp(parsed).normalize())
+        required = {"Date", "warrant_code", "broker_code", "buy_amount", "sell_amount"}
+        if events is None or events.empty or not required.issubset(events.columns):
+            empty = pd.DataFrame()
+            empty.attrs["_moneydj_cache_covered_dates"] = covered_dates
+            empty.attrs["_moneydj_cache_preloaded_pairs"] = set(meta.get("preloaded_pairs", []) or [])
+            return empty, set(meta.get("empty_pairs", []) or []), preloads
+        events = _fill_warrant_event_missing_values(events)
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
+        events["warrant_code"] = events["warrant_code"].map(normalize_openapi_warrant_code)
+        events["broker_code"] = events["broker_code"].astype(str).str.strip()
+        events = events.dropna(subset=["Date"])
+        events.attrs["_moneydj_cache_covered_dates"] = covered_dates
+        events.attrs["_moneydj_cache_preloaded_pairs"] = set(meta.get("preloaded_pairs", []) or [])
+        print(f"⚡ MoneyDJ API5 歷史快取命中：{stock_code}｜{len(events):,} 筆")
+        return events, set(str(x) for x in (meta.get("empty_pairs", []) or [])), preloads
+    except Exception as exc:
+        print(f"⚠️ MoneyDJ API5 歷史快取讀取失敗，改為完整回源：{stock_code}｜{exc}")
+        return pd.DataFrame(), set(), pd.DataFrame()
+
+
+def _save_moneydj_event_cache(
+    stock_code: str,
+    events: pd.DataFrame,
+    empty_pairs: set,
+    covered_trading_dates: list | None = None,
+    preloads: pd.DataFrame | None = None,
+    preloaded_pairs: set | None = None,
+) -> None:
+    """原子寫入 API5 歷史事件快取；僅由完整成功的主流程呼叫。"""
+    if not MONEYDJ_EVENT_CACHE_ENABLE or events is None:
+        return
+    try:
+        data_path, meta_path, preload_path = _moneydj_event_cache_paths(stock_code)
+        _ensure_dir(os.path.dirname(data_path))
+        out = events.copy()
+        if not out.empty:
+            out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
+            out = out.dropna(subset=["Date"])
+            out = out.drop_duplicates(
+                subset=["Date", "warrant_code", "broker_code"], keep="last"
+            ).reset_index(drop=True)
+        data_tmp = data_path + f".{os.getpid()}.tmp"
+        meta_tmp = meta_path + f".{os.getpid()}.tmp"
+        preload_tmp = preload_path + f".{os.getpid()}.tmp"
+        with _MONEYDJ_EVENT_CACHE_LOCK:
+            out.to_pickle(data_tmp, compression="gzip")
+            preload_out = preloads.copy() if isinstance(preloads, pd.DataFrame) else pd.DataFrame()
+            if not preload_out.empty:
+                preload_out["Date"] = pd.to_datetime(preload_out["Date"], errors="coerce").dt.normalize()
+                preload_out = preload_out.dropna(subset=["Date"])
+                preload_out = preload_out.drop_duplicates(
+                    subset=["Date", "warrant_code", "broker_code"], keep="last"
+                ).reset_index(drop=True)
+            preload_out.to_pickle(preload_tmp, compression="gzip")
+            with open(meta_tmp, "w", encoding="utf-8") as cache_file:
+                json.dump({
+                    "schema": MONEYDJ_EVENT_CACHE_SCHEMA,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "rows": int(len(out)),
+                    "empty_pairs": sorted(str(x) for x in (empty_pairs or set())),
+                    "preloaded_pairs": sorted(str(x) for x in (preloaded_pairs or set())),
+                    "covered_trading_dates": [
+                        pd.Timestamp(day).normalize().strftime("%Y-%m-%d")
+                        for day in (covered_trading_dates or [])
+                    ],
+                }, cache_file, ensure_ascii=False)
+            os.replace(data_tmp, data_path)
+            os.replace(preload_tmp, preload_path)
+            os.replace(meta_tmp, meta_path)
+    except Exception as exc:
+        # 快取是純效能層；寫入失敗不能改變本次已驗證資料或使報告失敗。
+        print(f"⚠️ MoneyDJ API5 歷史快取寫入失敗（本次資料仍有效）：{stock_code}｜{exc}")
+
+
 def _moneydj_range_events(
     summary: pd.DataFrame,
     trading_dates: list,
@@ -17949,6 +18106,21 @@ def _moneydj_range_events(
         f"API4 workers={WARRANT_MONEYDJ_RANGE_API4_WORKERS}"
     )
 
+    # 快取只重用已完整成功的歷史交易日；最近 N 個交易日一律重新從 MoneyDJ
+    # 驗證，能兼顧盤後更正與大幅縮短每日重跑時的 API4／API5 請求數。
+    cached_events, cached_empty_pairs, cached_preloads = _load_moneydj_event_cache(stock_code)
+    refresh_days = set(days[-MONEYDJ_EVENT_CACHE_REFRESH_TRADING_DAYS:])
+    historical_days = set(days) - refresh_days
+    cached_covered_days = set(cached_events.attrs.get("_moneydj_cache_covered_dates", set()) or set())
+    cached_preloaded_pairs = set(cached_events.attrs.get("_moneydj_cache_preloaded_pairs", set()) or set())
+    reuse_historical_cache = bool(historical_days) and historical_days.issubset(cached_covered_days)
+    api4_start_ts = min(refresh_days) if reuse_historical_cache and refresh_days else start_ts
+    if reuse_historical_cache:
+        print(
+            f"⚡ MoneyDJ 歷史快取覆蓋完整：重查 API4 僅 {api4_start_ts.date()} ~ {end_ts.date()}｜"
+            f"快取歷史日={len(historical_days):,}"
+        )
+
     # 分點正式名稱優先用證交所名冊，查不到才用 MoneyDJ 自帶的券商簡稱。
     trader_name_map = _load_trader_name_map()
 
@@ -17956,7 +18128,7 @@ def _moneydj_range_events(
     api4_truncated = 0
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API4_WORKERS) as executor:
         future_map = {
-            executor.submit(_moneydj_api4_range_rows, warrant, start_ts, end_ts): warrant
+            executor.submit(_moneydj_api4_range_rows, warrant, api4_start_ts, end_ts): warrant
             for warrant in warrants
         }
         for future in as_completed(future_map):
@@ -18008,6 +18180,24 @@ def _moneydj_range_events(
                     observed_key and requested_key and observed_key == requested_key
                 ):
                     ids.add(str(pair.get("broker_code", "") or "").strip())
+        # 快取命中時 API4 只查最近日，分點若近期未交易可能不會出現在這次 API4；
+        # 從已驗證的歷史事件補回其代碼，讓精選分點 FIFO 的查詢範圍維持不變。
+        cached_branch_frames = [
+            frame[["branch", "broker_code"]].copy()
+            for frame in (cached_events, cached_preloads)
+            if frame is not None and not frame.empty and {"branch", "broker_code"}.issubset(frame.columns)
+        ]
+        if cached_branch_frames:
+            cached_branches = pd.concat(cached_branch_frames, ignore_index=True).drop_duplicates()
+            for cached in cached_branches.itertuples(index=False):
+                observed_name = normalize_branch_name(cached.branch)
+                observed_key = _finmind_branch_lookup_key(observed_name)
+                for requested_name, ids in resolved_map.items():
+                    requested_key = _finmind_branch_lookup_key(requested_name)
+                    if observed_name == requested_name or (
+                        observed_key and requested_key and observed_key == requested_key
+                    ):
+                        ids.add(str(cached.broker_code or "").strip())
         code_to_name = {}
         for requested_name, ids in (resolved_map or {}).items():
             for raw_code in ids or set():
@@ -18063,8 +18253,81 @@ def _moneydj_range_events(
         WARRANT_MONEYDJ_API5_HISTORY_LIMIT,
         int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
     )
+    cached_pair_dates = {}
+    cached_key_series = pd.Series(dtype=str)
+    if cached_events is not None and not cached_events.empty:
+        cached_events = cached_events.copy()
+        cached_key_series = pd.Series(
+            [
+                _moneydj_event_pair_key(warrant, broker)
+                for warrant, broker in zip(cached_events["warrant_code"], cached_events["broker_code"])
+            ],
+            index=cached_events.index,
+            dtype=str,
+        )
+        for cache_key, part in cached_events.groupby(cached_key_series, sort=False):
+            cached_pair_dates[str(cache_key)] = set(
+                pd.to_datetime(part["Date"], errors="coerce").dropna().dt.normalize().tolist()
+            )
+
+    api5_pairs = []
+    cached_event_frames = []
+    if reuse_historical_cache and cached_events is not None and not cached_events.empty:
+        cached_event_frames.append(
+            cached_events.loc[
+                (cached_events["Date"] >= start_ts)
+                & (cached_events["Date"] < api4_start_ts)
+            ].copy()
+        )
+    api5_cache_hits = 0
+    for pair_key, pair in pairs.items():
+        cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
+        expected_dates = set(api4_pair_dates.get(pair_key, set()))
+        is_selected_pair = str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes
+        cached_dates = cached_pair_dates.get(cache_key, set())
+        # 精選分點的 API5 回看資料另行快取；快取完整時 FIFO 期初庫存與每次
+        # 回源計算相同，只有最新活動或尚未建快取的組合才重新查詢。
+        # 其餘分點只要快取涵蓋 API4 所觀測到的每個已結束交易日即可直接重用。
+        needs_api5 = (
+            bool(expected_dates & refresh_days)
+            or (is_selected_pair and cache_key not in cached_preloaded_pairs)
+            or (bool(expected_dates) and not expected_dates.issubset(cached_dates))
+            or (not expected_dates and cache_key not in cached_empty_pairs and not cached_dates)
+        )
+        if needs_api5:
+            api5_pairs.append(pair)
+        elif expected_dates and cached_events is not None and not cached_events.empty:
+            cached_event_frames.append(
+                cached_events.loc[
+                    (cached_key_series == cache_key)
+                    & cached_events["Date"].isin(expected_dates)
+                ].copy()
+            )
+            api5_cache_hits += 1
+
+    stats["api5_requests"] = len(api5_pairs)
+    stats["api5_cache_hits"] = api5_cache_hits
+    print(
+        f"⚡ MoneyDJ API5 排程：需回源={len(api5_pairs):,}｜快取重用={api5_cache_hits:,}｜"
+        f"近期重查={len(refresh_days)}個交易日"
+    )
+
     event_rows = []
     preload_rows = []
+    if cached_preloads is not None and not cached_preloads.empty and "Date" in cached_preloads.columns:
+        cached_preload_copy = cached_preloads.copy()
+        cached_preload_copy["Date"] = pd.to_datetime(cached_preload_copy["Date"], errors="coerce").dt.normalize()
+        preload_rows.extend(cached_preload_copy.loc[cached_preload_copy["Date"] < start_ts].to_dict("records"))
+    if cached_events is not None and not cached_events.empty and "Date" in cached_events.columns:
+        cached_prior_events = cached_events.copy()
+        cached_prior_events["Date"] = pd.to_datetime(cached_prior_events["Date"], errors="coerce").dt.normalize()
+        cached_prior_events = cached_prior_events[
+            (cached_prior_events["Date"] < start_ts)
+            & cached_prior_events["broker_code"].astype(str).isin(selected_backfill_codes)
+        ]
+        preload_rows.extend(cached_prior_events.to_dict("records"))
+    queried_empty_pairs = set(cached_empty_pairs)
+    queried_preloaded_pairs = set(cached_preloaded_pairs)
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API5_WORKERS) as executor:
         future_map = {
             executor.submit(
@@ -18075,7 +18338,7 @@ def _moneydj_range_events(
                 lookback_days,
                 str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
             ): pair
-            for pair in pairs.values()
+            for pair in api5_pairs
         }
         for future in as_completed(future_map):
             rows, pre_rows, error = future.result()
@@ -18084,16 +18347,37 @@ def _moneydj_range_events(
                 continue
             event_rows.extend(rows)
             preload_rows.extend(pre_rows)
+            cache_key = _moneydj_event_pair_key(
+                pair.get("warrant_code", ""), pair.get("broker_code", "")
+            )
+            if rows:
+                queried_empty_pairs.discard(cache_key)
+            else:
+                queried_empty_pairs.add(cache_key)
+            if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes:
+                queried_preloaded_pairs.add(cache_key)
 
     # 精選分點的視窗前歷史只給 FIFO 建期初庫存，另外存放，不併進 events。
-    _set_selected_branch_fifo_preload(stock_code, preload_rows)
+    preload_frame = _concat_warrant_event_frames([pd.DataFrame(preload_rows)])
+    if not preload_frame.empty:
+        preload_frame["Date"] = pd.to_datetime(preload_frame["Date"], errors="coerce").dt.normalize()
+        preload_frame = preload_frame.dropna(subset=["Date"])
+        preload_frame = preload_frame.drop_duplicates(
+            subset=["Date", "warrant_code", "broker_code"], keep="last"
+        )
+    _set_selected_branch_fifo_preload(
+        stock_code,
+        preload_frame.to_dict("records") if not preload_frame.empty else [],
+    )
 
     if stats["api5_failed"]:
         raise RuntimeError(
             f"MoneyDJ API5 主來源不完整：failed={stats['api5_failed']}/{stats['pairs']}"
         )
 
-    events = pd.DataFrame(event_rows)
+    events = _concat_warrant_event_frames(
+        [pd.DataFrame(event_rows)] + cached_event_frames
+    )
     if not events.empty:
         events = _fill_warrant_event_missing_values(events)
         events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
@@ -18114,13 +18398,32 @@ def _moneydj_range_events(
         events.attrs["_warrant_events_normalized"] = True
         stats["event_dates"] = int(events["Date"].nunique())
 
+    # 只有 API4/API5 全部成功後才更新；失敗時保留舊快取，下一次會重新驗證缺口。
+    selected_event_cache = (
+        events.loc[events["broker_code"].astype(str).isin(selected_backfill_codes)].copy()
+        if events is not None and not events.empty and selected_backfill_codes
+        else pd.DataFrame()
+    )
+    preload_cache_frame = _concat_warrant_event_frames(
+        [cached_preloads, preload_frame, selected_event_cache]
+    )
+    _save_moneydj_event_cache(
+        stock_code,
+        events,
+        queried_empty_pairs,
+        covered_trading_dates=days,
+        preloads=preload_cache_frame,
+        preloaded_pairs=queried_preloaded_pairs,
+    )
+
     stats["event_rows"] = int(len(events))
     stats["elapsed"] = time.perf_counter() - started
     print(
         f"✅ MoneyDJ 主來源完成：{stock_code}｜{start_ts.date()} ~ {end_ts.date()}｜"
         f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
         f"覆蓋交易日={stats['event_dates']}/{len(days)}｜"
-        f"API4 failed={stats['api4_failed']}｜API5 failed={stats['api5_failed']}｜"
+        f"API4 failed={stats['api4_failed']}｜API5 requests={stats.get('api5_requests', 0):,}｜"
+        f"API5 cache_hits={stats.get('api5_cache_hits', 0):,}｜API5 failed={stats['api5_failed']}｜"
         f"{stats['elapsed']:.2f}秒"
     )
     if selected_backfill_codes and not events.empty:
