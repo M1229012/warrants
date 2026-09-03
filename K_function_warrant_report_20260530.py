@@ -213,13 +213,6 @@ WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
 WARRANT_MONEYDJ_API5_HISTORY_LIMIT = max(
     2, int(os.getenv("WARRANT_MONEYDJ_API5_HISTORY_LIMIT", "200"))
 )
-# 非精選分點不需要視窗前 FIFO 庫存。API5 的 c 是「回傳列數」，原本不分
-# 用途一律取 200 列，70 日圖表的絕大多數分點因此下載了完全不會使用的歷史。
-# 每個 (權證, 分點) 每交易日最多一列，故「查詢交易日數 + 緩衝」已完整覆蓋圖表。
-# 精選分點仍使用上方的 200 列，保留 FIFO 期初庫存與既有報表品質。
-WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER = max(
-    0, int(os.getenv("WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER", "5"))
-)
 # MoneyDJ API5 是整支程式最主要的網路成本。已結束交易日的分點明細不會再變，
 # 因此落盤快取並只重查最近幾個交易日；快取缺一個 API4 已觀測到的日期就會自動
 # 回源，不允許快取造成少算。
@@ -18301,16 +18294,13 @@ def _moneydj_range_events(
         )
         return pd.DataFrame(), stats
 
-    # 只有精選分點的 FIFO 需要視窗前庫存；其餘分點只服務本次圖表與
-    # TOP5，最多一個交易日一列，無須下載 200 筆舊資料。
-    selected_lookback_days = max(
+    # MoneyDJ API4 僅負責發現活躍的 (權證, 分點)，它的日期列與 API5
+    # 精確金額歷史並非可逐列對照。為不以錯誤的交叉驗證漏掉資料，所有
+    # 已發現 pair 皆由 API5 取完整歷史列；效能改由 API4 預篩與持久快取負責。
+    api5_history_limit = max(
         HYBRID_MONEYDJ_API5_DAYS,
         WARRANT_MONEYDJ_API5_HISTORY_LIMIT,
         int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
-    )
-    nonselected_lookback_days = max(
-        2,
-        len(days) + WARRANT_MONEYDJ_API5_NONSELECTED_DAY_BUFFER,
     )
     cached_pair_dates = {}
     cached_key_series = pd.Series(dtype=str)
@@ -18369,7 +18359,7 @@ def _moneydj_range_events(
     print(
         f"⚡ MoneyDJ API5 排程：需回源={len(api5_pairs):,}｜快取重用={api5_cache_hits:,}｜"
         f"近期重查={len(refresh_days)}個交易日｜"
-        f"一般分點回看={nonselected_lookback_days}列｜精選分點回看={selected_lookback_days}列"
+        f"每組完整回看={api5_history_limit}列"
     )
 
     # 暫存每組 API5 結果。這可避免非精選分點的縮短回傳不夠時，補查後將
@@ -18398,7 +18388,7 @@ def _moneydj_range_events(
                 pair,
                 start_ts,
                 end_ts,
-                selected_lookback_days if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes else nonselected_lookback_days,
+                api5_history_limit,
                 str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
             ): pair
             for pair in api5_pairs
@@ -18412,66 +18402,6 @@ def _moneydj_range_events(
                 continue
             api5_rows_by_key[cache_key] = list(rows or [])
             api5_preloads_by_key[cache_key] = list(pre_rows or [])
-
-    # API4 是完整性索引。僅有 API4 已揭示交易、但精簡 API5 沒有涵蓋該日期
-    # 的 pair 才升級取 200 列；其餘分點維持最小必要回傳。
-    coverage_retries = []
-    for pair in api5_pairs:
-        pair_key = (pair.get("warrant_code", ""), str(pair.get("broker_code", "") or "").strip())
-        expected_dates = set(api4_pair_dates.get(pair_key, set()))
-        if not expected_dates:
-            continue
-        cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
-        returned_dates = {
-            pd.Timestamp(row.get("Date")).normalize()
-            for row in api5_rows_by_key.get(cache_key, [])
-            if pd.notna(pd.to_datetime(row.get("Date"), errors="coerce"))
-        }
-        if not expected_dates.issubset(returned_dates):
-            coverage_retries.append(pair)
-    if coverage_retries:
-        print(
-            f"🔁 MoneyDJ API5 精簡列數覆蓋補查：{len(coverage_retries):,} 組｜"
-            f"僅這些組改取 {selected_lookback_days} 列"
-        )
-        with ThreadPoolExecutor(max_workers=min(WARRANT_MONEYDJ_RANGE_API5_WORKERS, len(coverage_retries))) as executor:
-            retry_future_map = {
-                executor.submit(
-                    _moneydj_api5_range_one, pair, start_ts, end_ts,
-                    selected_lookback_days,
-                    str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
-                ): pair
-                for pair in coverage_retries
-            }
-            for future in as_completed(retry_future_map):
-                rows, pre_rows, error = future.result()
-                pair = retry_future_map[future]
-                cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
-                if error:
-                    stats["api5_failed"] += 1
-                    continue
-                api5_rows_by_key[cache_key] = list(rows or [])
-                api5_preloads_by_key[cache_key] = list(pre_rows or [])
-
-    uncovered_pairs = []
-    for pair in api5_pairs:
-        pair_key = (pair.get("warrant_code", ""), str(pair.get("broker_code", "") or "").strip())
-        expected_dates = set(api4_pair_dates.get(pair_key, set()))
-        if not expected_dates:
-            continue
-        cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
-        returned_dates = {
-            pd.Timestamp(row.get("Date")).normalize()
-            for row in api5_rows_by_key.get(cache_key, [])
-            if pd.notna(pd.to_datetime(row.get("Date"), errors="coerce"))
-        }
-        if not expected_dates.issubset(returned_dates):
-            uncovered_pairs.append(cache_key)
-    if uncovered_pairs:
-        raise RuntimeError(
-            f"MoneyDJ API5 未覆蓋 API4 已揭示交易日：{len(uncovered_pairs):,} 組；"
-            "已拒絕產出可能少算的報告"
-        )
 
     event_rows = []
     for pair in api5_pairs:
