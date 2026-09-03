@@ -12245,22 +12245,16 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_sell_vals = selected_branch_daily_net["sell_amount"].astype(float).values
     selected_latest_buy = float(selected_buy_vals[-1]) if len(selected_buy_vals) else 0.0
     selected_latest_sell = float(selected_sell_vals[-1]) if len(selected_sell_vals) else 0.0
-    # 折線改成 FIFO 庫存成本（尚未賣出部位的買進金額），取代原本的累計淨現金流。
-    selected_hold_df = selected_branch_fifo_holding_cost(
-        selected_flow_dates,
-        selected_branch_events,
-        preload_events=_get_selected_branch_fifo_preload(stock_code),
-    )
-    selected_hold_vals = selected_hold_df["holding_cost"].astype(float).values
-    selected_latest_hold = float(selected_hold_vals[-1]) if len(selected_hold_vals) else 0.0
+    # 藍線採「累積買賣超金額」：每日買進－賣出後逐日累加。
+    # 此口徑直接呈現精選分點對標的權證的資金傾向與積極程度；不使用
+    # FIFO 庫存成本，避免權證到期歸零讓當日大額買進看似憑空消失。
+    selected_cum_vals = selected_branch_daily_net["net_amount"].astype(float).cumsum().values
+    selected_latest_cum = float(selected_cum_vals[-1]) if len(selected_cum_vals) else 0.0
     selected_total_net = float(selected_branch_week_events["net_amount"].sum()) if selected_branch_week_events is not None and not selected_branch_week_events.empty else 0.0
     selected_total_color = RED if selected_total_net >= 0 else GREEN
     print(
-        f"📐 精選分點 FIFO 庫存成本：最新 {fmt_money(selected_latest_hold)}｜"
-        f"期初庫存列={selected_hold_df.attrs.get('fifo_preload_rows', 0)}｜"
-        f"到期歸零權證={selected_hold_df.attrs.get('fifo_expired_codes', 0)}支｜"
-        f"仍扣不掉的賣出列={selected_hold_df.attrs.get('fifo_oversold_rows', 0)}｜"
-        f"有金額無張數列={selected_hold_df.attrs.get('fifo_missing_share_rows', 0)}"
+        f"📐 精選分點累積買賣超：最新 {fmt_money(selected_latest_cum)}｜"
+        f"區間淨額合計={fmt_money(float(selected_branch_daily_net['net_amount'].sum()))}"
     )
 
     xpos = 0.000
@@ -12282,7 +12276,7 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
 
     xpos = draw_header_text_and_advance(selected_wnet_ax, xpos, "|", MUTED, fontsize=25, fontweight="bold", gap_px=14, alpha=0.82)
     xpos = draw_header_line_and_advance(selected_wnet_ax, xpos, BLUE, gap_px=10)
-    draw_header_text_and_advance(selected_wnet_ax, xpos, f"累積金額 {fmt_money(selected_latest_hold)}", BLUE, gap_px=0)
+    draw_header_text_and_advance(selected_wnet_ax, xpos, f"累積買賣超 {fmt_money(selected_latest_cum)}", BLUE, gap_px=0)
 
     selected_branch_names_for_render = list(ctx.get("_selected_branch_names_snapshot") or _get_selected_branch_flow_list())
     selected_branch_label = "、".join(selected_branch_names_for_render)
@@ -12318,11 +12312,11 @@ def plot_weekly_report(stock_code: str, stock_name: str, stock_df: pd.DataFrame,
     selected_wnet_ax.yaxis.tick_right()
     selected_wnet_ax.tick_params(axis="y", labelsize=22)
     selected_wnet_ax2 = selected_wnet_ax.twinx()
-    selected_wnet_ax2.plot(selected_x, selected_hold_vals, color=BLUE, linewidth=2.1, alpha=0.95)
+    selected_wnet_ax2.plot(selected_x, selected_cum_vals, color=BLUE, linewidth=2.1, alpha=0.95)
 
-    if len(selected_hold_vals):
-        scmax = max(float(np.nanmax(selected_hold_vals)), 0.0)
-        scmin = min(float(np.nanmin(selected_hold_vals)), 0.0)
+    if len(selected_cum_vals):
+        scmax = max(float(np.nanmax(selected_cum_vals)), 0.0)
+        scmin = min(float(np.nanmin(selected_cum_vals)), 0.0)
         sy1_min, sy1_max = selected_wnet_ax.get_ylim()
         selected_zero_frac = (0 - sy1_min) / (sy1_max - sy1_min)
         selected_zero_frac = min(max(selected_zero_frac, 0.05), 0.95)
