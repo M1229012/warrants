@@ -365,12 +365,15 @@ jobs:
       WARRANT_HYBRID_MONEYDJ_RETRIES: "3"
       WARRANT_HYBRID_MONEYDJ_RETRY_WAIT: "1.5"
       WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS: "0"
-      # MoneyDJ API4 對「最新交易日零成交」的權證常年回錯誤而非空字串。
-      # 所有重試用盡後，用官方 TWSE／TPEx 權證 OpenAPI 逐檔核對成交量：
-      # 官方顯示零成交／查無的權證判為跳過，不再讓整份週報失敗（1=啟用，預設）。
+      # 「僅缺報告最後交易日、且官方(交易日期需相符)確認該檔當日零成交」的 partial，
+      # 保留 API4 已抓到的前段分點資料（不整檔跳過）。1=啟用官方核對，預設。
       WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES: "1"
-      # 官方 OpenAPI 也拿不到時，最多容忍幾檔 API4 失敗仍照常產圖；0=維持嚴格。
-      WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED: "0"
+      # 整段 API4 抓不到、或缺 2 天以上的權證：預設嚴格報錯。
+      # 這個值＝操作者明確承擔「最多 N 檔 MoneyDJ 完全無法提供的權證可被省略」，
+      # 此時報告標記為不完整、不覆寫 Google Sheet 完整快照。
+      # 目前 2344 有 7 檔權證 MoneyDJ 常年回 500（研判為掛牌後零成交），故設 12 留裕度。
+      # 若某天 ❌ 逐檔錯誤清單暴增，代表是 MoneyDJ 整體異常而非個別零成交，應調回 0 並重跑。
+      WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED: "12"
 
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
       FINMIND_REQUEST_RETRIES: "5"
