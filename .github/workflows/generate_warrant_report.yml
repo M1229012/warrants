@@ -517,6 +517,17 @@ jobs:
       WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "1"
       WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "1"
 
+      # Add these entries under: jobs.run-warrant-report-test.env
+      # They apply only to the large MoneyDJ API4 interval scan. API5 stays at its
+      # existing concurrency because the failures reported here are API4 failures.
+      WARRANT_MONEYDJ_RANGE_API4_WORKERS: "16"
+      WARRANT_MONEYDJ_RANGE_API4_CONNECT_TIMEOUT: "8"
+      WARRANT_MONEYDJ_RANGE_API4_READ_TIMEOUT: "60"
+      WARRANT_MONEYDJ_RANGE_API4_RETRIES: "4"
+      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS: "3"
+      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS: "4"
+      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT: "2"
+
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
