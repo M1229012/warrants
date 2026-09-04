@@ -361,6 +361,12 @@ jobs:
       WARRANT_HYBRID_MONEYDJ_RETRIES: "3"
       WARRANT_HYBRID_MONEYDJ_RETRY_WAIT: "1.5"
       WARRANT_HYBRID_MONEYDJ_STRICT_COMPLETENESS: "0"
+      # MoneyDJ API4 對「最新交易日零成交」的權證常年回錯誤而非空字串。
+      # 所有重試用盡後，用官方 TWSE／TPEx 權證 OpenAPI 逐檔核對成交量：
+      # 官方顯示零成交／查無的權證判為跳過，不再讓整份週報失敗（1=啟用，預設）。
+      WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES: "1"
+      # 官方 OpenAPI 也拿不到時，最多容忍幾檔 API4 失敗仍照常產圖；0=維持嚴格。
+      WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED: "0"
 
       FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_0714 }}
       FINMIND_REQUEST_RETRIES: "5"
