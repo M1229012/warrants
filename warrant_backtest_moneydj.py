@@ -245,10 +245,17 @@ MONEYDJ_HEADERS = {
     "Accept": "*/*",
     "Referer": "https://pscnetsecrwd.moneydj.com/",
 }
+# API4 的 e 參數控制回傳列數。不帶 e 時 MoneyDJ 只回前 30 個分點，成交量大的
+# 權證會被默默截掉大半（實測 072570 在 2026/08/05 實際有 92 個分點，不帶 e 只拿到 30；
+# 區間查詢更慘，一年區間實際 301 個分點，不帶 e 一樣只回 30）。這會讓排在 30 名以外
+# 的追蹤分點整段從候選消失，API5 永遠不會去查，回測籌碼因此系統性漏抓。
+MONEYDJ_API4_ROW_LIMIT = max(int(os.getenv("MONEYDJ_API4_ROW_LIMIT", "20000")), 1)
 MONEYDJ_API4_URL = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/"
     "9b/6e/0a/TwWarrantData.xdjjson"
-    "?a={code}&x=warrant-chip0002-4&c={start}&d={end}&revision=2018_07_31_1"
+    "?a={code}&x=warrant-chip0002-4&c={start}&d={end}"
+    f"&e={MONEYDJ_API4_ROW_LIMIT}"
+    "&revision=2018_07_31_1"
 )
 MONEYDJ_API5_URL = (
     "https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/"
@@ -24513,15 +24520,28 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
 # ══════════════════════════════════════════════════════════════════════
 
 def _moneydj_json_rows(response_content):
+    # MoneyDJ API4 每次回應內含 2 個內容完全相同（只是排序不同）的 ResultSet 物件；
+    # 舊版直接 extend 兩個，等於每一列都重複一次。下游雖多半以 dict key 去重不受影響，
+    # 但只要有人對列數做加總／計數就會被灌成兩倍，這裡先逐列去重。
     data = json.loads(response_content.decode("utf-8"))
     rows = []
+    seen = set()
     for item in data if isinstance(data, list) else [data]:
         if not isinstance(item, dict):
             continue
         result_set = item.get("ResultSet", {})
         result = result_set.get("Result", []) if isinstance(result_set, dict) else []
-        if isinstance(result, list):
-            rows.extend(result)
+        if not isinstance(result, list):
+            continue
+        for row in result:
+            if not isinstance(row, dict):
+                rows.append(row)
+                continue
+            key = tuple(sorted((str(k), str(v)) for k, v in row.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
     return rows
 
 
@@ -24579,6 +24599,18 @@ def api5_get_with_status(warrant_code, broker_code, history_limit=None):
 def _moneydj_int(value):
     try:
         return int(float(str(value or "0").replace(",", "").strip() or 0))
+    except Exception:
+        return 0
+
+
+def _moneydj_amount_from_thousands(value):
+    """API5 的 V4／V5 是「仟元」且帶小數（例：'920.14' = 920,140 元）。
+
+    舊版 `_moneydj_int(V4) * 1000` 會先把小數截掉再乘，等於每一列的買進／賣出
+    金額都少算 0～999 元。這裡先轉 float 再 ×1000，最後四捨五入到整數元。
+    """
+    try:
+        return int(round(float(str(value or "0").replace(",", "").strip() or 0) * 1000))
     except Exception:
         return 0
 
@@ -25103,8 +25135,8 @@ def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
             continue
         buy_shares = _moneydj_int(row.get("V2", 0))
         sell_shares = _moneydj_int(row.get("V3", 0))
-        buy_amount = _moneydj_int(row.get("V4", 0)) * 1000
-        sell_amount = _moneydj_int(row.get("V5", 0)) * 1000
+        buy_amount = _moneydj_amount_from_thousands(row.get("V4", 0))
+        sell_amount = _moneydj_amount_from_thousands(row.get("V5", 0))
         records.append({
             "日期": date_text,
             "買進股數": buy_shares,
