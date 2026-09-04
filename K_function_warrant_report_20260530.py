@@ -17026,19 +17026,16 @@ def _hybrid_moneydj_get_json(url: str, max_retries: int | None = None):
 
     回傳：
     - 正常：解析後的 JSON（list 或 dict）。
-    - 伺服器明確表示「此代號查無資料」時（HTTP 404，或 HTTP 200 但內容為空），
-      多次重試仍為空 → 回傳空 list ``[]``，由上層視為「該權證整段區間沒有分點事件」。
-      這對應「最新交易日成交量為 0、整段區間都沒有成交」的權證：MoneyDJ 會回空內容，
-      這不是抓取失敗，不應讓整份週報 fail-closed。
-    - 逾時、連線重設、5xx、JSON 解析錯誤等「真的沒抓到」：重試後仍失敗才 raise，
-      維持原本 fail-closed 行為，不會靜默少算。
+    - **每一次**嘗試都拿到乾淨的 HTTP 回應且內容為空／404（沒有任何一次是逾時、
+      連線重設、5xx 或 JSON 解析錯誤）→ 回傳空 list ``[]``，由上層視為「該代號查無資料」。
+      只要中途出現一次真正的抓取失敗，就以 raise 結束，不會被當空資料而靜默少算。
 
     ``max_retries`` 供結束日二分探測使用：探測只是要知道某個結束日能不能成功，
     用較少重試以壓低成本，正式取回資料時仍用預設重試數。
     """
     retries = HYBRID_MONEYDJ_RETRIES if max_retries is None else max(1, int(max_retries))
     last_error = None
-    server_reported_empty = False
+    empty_confirmations = 0
     for attempt in range(1, retries + 1):
         try:
             response = get_thread_session().get(
@@ -17047,22 +17044,21 @@ def _hybrid_moneydj_get_json(url: str, max_retries: int | None = None):
                 timeout=(5, 18),
             )
             if response.status_code == 404:
-                server_reported_empty = True
+                empty_confirmations += 1
                 last_error = RuntimeError("HTTP 404")
             else:
                 response.raise_for_status()
                 text = response.content.decode("utf-8", errors="replace").strip()
                 if text:
                     return json.loads(text)
-                server_reported_empty = True
+                empty_confirmations += 1
                 last_error = RuntimeError("empty response body")
         except Exception as exc:
             last_error = exc
         if attempt < retries:
             time.sleep(HYBRID_MONEYDJ_RETRY_WAIT * attempt)
-    if server_reported_empty:
-        # 至少一次拿到乾淨的 HTTP 回應且內容為空／404，重試後仍如此：
-        # 視為「此代號查無資料」，回空讓上層當成該權證沒有分點事件。
+    if empty_confirmations == retries:
+        # 所有嘗試都確認是空回應／404 → 視為「此代號查無資料」。
         return []
     raise RuntimeError(str(last_error or "MoneyDJ request failed"))
 
@@ -18418,13 +18414,12 @@ def _moneydj_range_events(
     api4_truncated = 0
 
     api4_empty_codes = []
-    # 代號 → 缺尾交易日清單（結束日被二分往前縮的權證）。這些日子對「該權證」
-    # 視為 0（不是整支跳過），已由官方核對確認最後交易日確實零成交。
+    # 代號 → 缺尾交易日清單（結束日被二分往前縮的權證）。只有「僅缺報告最後交易日
+    # 這一天、且官方確認該權證當日零成交」時才接受；此時保留 API4 已抓到的前段分點。
     api4_partial_tail_by_code: dict = {}
     zero_tol = WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
-    # 「市場實際有資料的最後交易日」在成功權證處理完後才知道；先給保守初值。
-    # 官方零成交核對要對齊這一天，而不是日曆上的 days[-1]（今天可能還沒收盤）。
-    market_last_data_day = days[-1]
+    # 報告最後交易日（日曆）。官方零成交核對的交易日期必須「等於」這一天。
+    report_last_day = days[-1]
 
     def _accept_api4_rows(warrant: dict, rows: list, truncated_chunks: int,
                           unavailable_days: list | None = None) -> None:
@@ -18499,24 +18494,14 @@ def _moneydj_range_events(
     for warrant, rows, truncated_chunks in ok_results:
         _accept_api4_rows(warrant, rows, truncated_chunks)
 
-    # 成功權證觀測到的最後交易日＝市場真正有資料的一天。官方零成交核對對齊這一天，
-    # 避免「今天尚未收盤 / Action 隔日執行」時拿到不同交易日的官方 0 成交而誤判。
-    _observed_days = set()
-    for _dset in api4_pair_dates.values():
-        _observed_days |= _dset
-    if _observed_days:
-        market_last_data_day = max(_observed_days)
-
     initial_api4_failed = len(failed_api4_warrants) + len(partial_api4_results)
 
-    # 官方 TWSE／TPEx 權證 OpenAPI 核對：只在有失敗或有「缺尾」權證時才抓（同次執行有快取）。
-    # 帶入「市場實際有資料的最後交易日」，來源日期不符或該市場來源失敗時，
-    # 該市場的權證不做零成交判定。
-    api4_zero_volume_skipped = []
+    # 官方 TWSE／TPEx 權證 OpenAPI 核對：用來驗證 partial、以及判定失敗權證是否為
+    # 「報告最後交易日零成交」。交易日期必須「等於」報告最後交易日，否則該市場不採信。
     official_volume_map, markets_verified = ({}, {"上市": False, "上櫃": False})
-    if (failed_api4_warrants or partial_api4_results) and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+    if (partial_api4_results or failed_api4_warrants) and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
         official_volume_map, markets_verified = _official_latest_day_warrant_volume_map(
-            expected_trade_date=market_last_data_day
+            expected_trade_date=report_last_day
         )
 
     def _warrant_market_verifiable(warrant: dict) -> bool:
@@ -18526,8 +18511,8 @@ def _moneydj_range_events(
         # 市場未知：兩個市場都要驗證通過才能安全判零成交。
         return bool(markets_verified.get("上市", False) and markets_verified.get("上櫃", False))
 
-    def _official_says_zero(warrant: dict) -> bool | None:
-        """True=官方確認零成交/查無；False=官方顯示有成交；None=無法核對。"""
+    def _official_confirms_zero_on_last_day(warrant: dict) -> bool | None:
+        """True=官方確認報告最後交易日零成交/查無；False=官方顯示有成交；None=無法核對。"""
         if not _warrant_market_verifiable(warrant):
             return None
         norm = normalize_openapi_warrant_code(str(warrant.get("warrant_code", "") or ""))
@@ -18536,58 +18521,69 @@ def _moneydj_range_events(
             return True
         return bool(lots <= zero_tol and amount <= zero_tol)
 
-    def _split_zero_volume_failures(warrant_list: list) -> list:
-        """回傳仍需重試的權證；官方確認零成交的移入 api4_zero_volume_skipped。"""
-        retryable = []
-        for warrant in warrant_list:
-            verdict = _official_says_zero(warrant)
-            if verdict is True:
-                api4_zero_volume_skipped.append(str(warrant.get("warrant_code", "") or ""))
-                stats["api4_empty"] += 1
-            else:
-                retryable.append(warrant)   # False 或 None → 不敢判零成交，繼續重試
-        return retryable
+    # 「一定要報錯、不受容忍額度影響」的權證：缺 2 天以上，或官方顯示缺的日子其實有成交。
+    api4_fatal_warrants: list = []
 
-    # 缺尾權證：官方確認「報告最後交易日」零成交才接受部分資料；官方顯示有成交
-    # 或無法核對 → 當作硬失敗，交由下方復原／嚴格報錯，絕不靜默少算。
-    accepted_partial_codes = []
-    if partial_api4_results:
-        for warrant, rows, truncated_chunks, unavailable_days in partial_api4_results:
-            code = str(warrant.get("warrant_code", "") or "")
-            unavail_set = {pd.Timestamp(d).normalize() for d in unavailable_days}
-            verdict = _official_says_zero(warrant) if market_last_data_day in unavail_set else True
-            if verdict is True:
-                _accept_api4_rows(warrant, rows, truncated_chunks, unavailable_days)
-                accepted_partial_codes.append(code)
-            else:
-                failed_api4_warrants.append(warrant)
-                _record_api4_failure(
-                    warrant,
-                    "結束日縮短後仍缺最後交易日，且官方"
-                    + ("顯示有成交" if verdict is False else "來源無法核對"),
-                )
-        if accepted_partial_codes:
-            print(
-                f"🩹 MoneyDJ API4 結束日縮短取回部分資料（官方確認缺的交易日零成交）："
-                f"{len(accepted_partial_codes):,} 檔｜代號={'、'.join(sorted(accepted_partial_codes))}"
+    def _route_partial(warrant, rows, truncated_chunks, unavailable_days,
+                       failed_sink: list, accepted_sink: list) -> None:
+        """收斂規則：
+        - 只接受「僅缺報告最後交易日這一天、且官方(日期相符、市場驗證)確認該檔當日零成交」
+          的 partial；接受時保留 API4 已抓到的前段分點資料，不整檔跳過。
+        - 缺 2 天以上 → 進 fatal（一定報錯）。
+        - 僅缺最後一天但官方顯示該日有成交 → 進 fatal（真的漏了一天交易）。
+        - 僅缺最後一天但官方無法核對 → 進 failed（可再重試；仍失敗時由容忍規則決定）。"""
+        code = str(warrant.get("warrant_code", "") or "")
+        unavail_set = {pd.Timestamp(d).normalize() for d in unavailable_days}
+        if unavail_set != {report_last_day}:
+            api4_fatal_warrants.append(warrant)
+            _record_api4_failure(
+                warrant,
+                f"結束日縮短後仍缺 {len(unavail_set)} 個交易日（非僅缺報告最後交易日）",
+            )
+            return
+        verdict = _official_confirms_zero_on_last_day(warrant)
+        if verdict is True:
+            _accept_api4_rows(warrant, rows, truncated_chunks, unavailable_days)
+            accepted_sink.append(code)
+        elif verdict is False:
+            api4_fatal_warrants.append(warrant)
+            _record_api4_failure(warrant, "僅缺報告最後交易日，但官方顯示該日有成交")
+        else:
+            failed_sink.append(warrant)
+            _record_api4_failure(
+                warrant,
+                f"僅缺報告最後交易日，官方資料日期非 {report_last_day.date()} "
+                "或該市場來源失敗，無法核對",
             )
 
-    # 零成交核對（提前）：官方確認零成交／查無的權證，MoneyDJ 常年回 500，
-    # 先剔除、不再浪費復原重試。
-    if failed_api4_warrants and any(markets_verified.values()):
-        before = len(failed_api4_warrants)
-        failed_api4_warrants = _split_zero_volume_failures(failed_api4_warrants)
-        if api4_zero_volume_skipped:
-            print(
-                f"✅ 官方核對：失敗 {before:,} 檔中 {len(api4_zero_volume_skipped):,} 檔"
-                f"官方確認最後交易日零成交／查無，直接跳過（不影響資金流）｜"
-                f"代號={'、'.join(sorted(api4_zero_volume_skipped))}"
-            )
-    elif failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
-        print("⚠️ 官方權證 OpenAPI 無可採信來源（失敗或日期不符），改為重試後再核對")
+    accepted_partial_codes: list = []
+    for warrant, rows, truncated_chunks, unavailable_days in partial_api4_results:
+        _route_partial(
+            warrant, rows, truncated_chunks, unavailable_days,
+            failed_api4_warrants, accepted_partial_codes,
+        )
+    if accepted_partial_codes:
+        print(
+            f"🩹 MoneyDJ API4 僅缺報告最後交易日、官方確認該日零成交，保留前段分點："
+            f"{len(accepted_partial_codes):,} 檔｜代號={'、'.join(sorted(accepted_partial_codes))}"
+        )
+
+    # 若初掃後的失敗全部是「官方確認報告最後交易日零成交／查無」且在容忍額度內，
+    # 復原重試與序列重試的結果都一樣（會被容忍），直接跳過，省下數十秒。
+    _fast_tolerate = bool(
+        failed_api4_warrants
+        and not api4_fatal_warrants
+        and len(failed_api4_warrants) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED
+        and all(_official_confirms_zero_on_last_day(w) is True for w in failed_api4_warrants)
+    )
+    if _fast_tolerate:
+        print(
+            f"⏭️ 初掃後 {len(failed_api4_warrants):,} 檔失敗皆為官方確認的「報告最後交易日零成交」"
+            f"且在容忍額度內，跳過復原與序列重試"
+        )
 
     for recovery_round in range(1, WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS + 1):
-        if not failed_api4_warrants:
+        if not failed_api4_warrants or _fast_tolerate:
             break
         if WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT > 0:
             time.sleep(WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT * recovery_round)
@@ -18602,20 +18598,48 @@ def _moneydj_range_events(
         )
         for warrant, rows, truncated_chunks in rec_ok:
             _accept_api4_rows(warrant, rows, truncated_chunks)
+        if rec_partials and not any(markets_verified.values()) and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+            official_volume_map, markets_verified = _official_latest_day_warrant_volume_map(
+                expected_trade_date=report_last_day
+            )
         for warrant, rows, truncated_chunks, unavailable_days in rec_partials:
-            unavail_set = {pd.Timestamp(d).normalize() for d in unavailable_days}
-            verdict = _official_says_zero(warrant) if market_last_data_day in unavail_set else True
-            if verdict is True:
-                _accept_api4_rows(warrant, rows, truncated_chunks, unavailable_days)
-                accepted_partial_codes.append(str(warrant.get("warrant_code", "") or ""))
-            else:
-                still_failed.append(warrant)
+            _route_partial(
+                warrant, rows, truncated_chunks, unavailable_days,
+                still_failed, accepted_partial_codes,
+            )
         recovered = len(failed_api4_warrants) - len(still_failed)
         print(f"   {'✅' if recovered else '⚠️'} API4 本輪復原 {recovered:,} 檔｜仍失敗 {len(still_failed):,} 檔")
         failed_api4_warrants = still_failed
 
+    # 官方核對（若尚未成功）：供下方「跳過序列」與容忍額度判定使用。
+    if (
+        failed_api4_warrants
+        and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES
+        and not any(markets_verified.values())
+    ):
+        official_volume_map, markets_verified = _official_latest_day_warrant_volume_map(
+            expected_trade_date=report_last_day
+        )
+
+    # 若剩餘失敗都在容忍額度內、且官方(日期相符、市場驗證)確認全部是「報告最後交易日
+    # 零成交／查無」→ 結果與跑完序列相同（都會被容忍），直接跳過昂貴的序列重試。
+    _skip_serial = bool(
+        failed_api4_warrants
+        and not api4_fatal_warrants
+        and len(failed_api4_warrants) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED
+        and all(
+            _official_confirms_zero_on_last_day(w) is True
+            for w in failed_api4_warrants
+        )
+    )
+    if _skip_serial:
+        print(
+            f"⏭️ 剩餘 {len(failed_api4_warrants):,} 檔皆在容忍額度內且官方確認"
+            f"報告最後交易日零成交／查無，跳過序列復原"
+        )
+
     # 最終手段：對仍失敗的少數權證改成完全序列、長間隔重試一次。
-    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_ENABLE:
+    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_ENABLE and not _skip_serial:
         print(
             f"🐢 MoneyDJ API4 最終序列復原：{len(failed_api4_warrants):,} 檔（workers=1，"
             f"間隔 {WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_WAIT:g}s）"
@@ -18635,58 +18659,74 @@ def _moneydj_range_events(
                 _record_api4_failure(warrant, hard_error)
                 continue
             if unavailable_days:
-                unavail_set = {pd.Timestamp(d).normalize() for d in unavailable_days}
-                verdict = _official_says_zero(warrant) if market_last_data_day in unavail_set else True
-                if verdict is not True:
-                    still_failed.append(warrant)
-                    _record_api4_failure(warrant, "結束日縮短後仍缺最後交易日且官方無法確認零成交")
-                    continue
-                accepted_partial_codes.append(str(warrant.get("warrant_code", "") or ""))
-            _accept_api4_rows(warrant, rows, truncated_chunks, unavailable_days)
+                if not any(markets_verified.values()) and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+                    official_volume_map, markets_verified = _official_latest_day_warrant_volume_map(
+                        expected_trade_date=report_last_day
+                    )
+                _route_partial(
+                    warrant, rows, truncated_chunks, unavailable_days,
+                    still_failed, accepted_partial_codes,
+                )
+                continue
+            _accept_api4_rows(warrant, rows, truncated_chunks)
         recovered = len(failed_api4_warrants) - len(still_failed)
         print(f"   {'✅' if recovered else '⚠️'} 最終序列復原 {recovered:,} 檔｜仍失敗 {len(still_failed):,} 檔")
         failed_api4_warrants = still_failed
 
-    # 若提前核對時官方來源暫時不可用，重試後再核對一次（多數情況此步是 no-op）。
-    if (
-        failed_api4_warrants
-        and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES
-        and not any(markets_verified.values())
-    ):
-        official_volume_map, markets_verified = _official_latest_day_warrant_volume_map(
-            expected_trade_date=market_last_data_day
-        )
-        if any(markets_verified.values()):
-            before = len(failed_api4_warrants)
-            failed_api4_warrants = _split_zero_volume_failures(failed_api4_warrants)
-            if api4_zero_volume_skipped:
-                print(
-                    f"✅ 官方核對（重試後）：失敗 {before:,} 檔中 "
-                    f"{len(api4_zero_volume_skipped):,} 檔官方確認零成交／查無，判為跳過"
-                    f"｜代號={'、'.join(sorted(api4_zero_volume_skipped))}"
-                )
+    # fatal 權證（缺 2 天以上、或官方顯示缺的日子有成交）併入失敗清單，且一定報錯。
+    for _w in api4_fatal_warrants:
+        if _w not in failed_api4_warrants:
+            failed_api4_warrants.append(_w)
 
     # 逐檔印出仍失敗的真實錯誤字串。
     if failed_api4_warrants:
-        print("❌ MoneyDJ API4 重試全數用盡且官方核對非零成交，逐檔錯誤：")
+        print("❌ MoneyDJ API4 重試全數用盡仍失敗，逐檔錯誤：")
         for warrant in failed_api4_warrants:
             code = str(warrant.get("warrant_code", "") or "")
             print(f"   - {code}｜{failed_api4_error_by_code.get(code, 'unknown error')}")
 
-    # 官方核對後仍失敗、但在容忍上限內：照常產圖，但標記為不完整（不覆寫完整快照）。
+    # 容忍規則（比舊版更嚴）：
+    # 1. fatal（缺 2 天以上 / 官方顯示缺的日子有成交）→ 一律嚴格報錯，不受額度影響。
+    # 2. 其餘失敗只有「官方(交易日期相符、市場驗證)確認報告最後交易日零成交／查無」，
+    #    且總數 <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 時，才照常產圖並標記為不完整。
+    # 3. 官方顯示有量、或無法核對（來源失敗／日期不符）、或超過額度 → 嚴格報錯。
     api4_failed_tolerated = []
-    if 0 < len(failed_api4_warrants) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
-        api4_failed_tolerated = [
-            str(w.get("warrant_code", "") or "") for w in failed_api4_warrants
+    _fatal_codes = {str(w.get("warrant_code", "") or "") for w in api4_fatal_warrants}
+    if failed_api4_warrants:
+        _tolerable = [
+            w for w in failed_api4_warrants
+            if str(w.get("warrant_code", "") or "") not in _fatal_codes
+            and _official_confirms_zero_on_last_day(w) is True
         ]
-        print(
-            f"⚠️ MoneyDJ API4 仍有 {len(failed_api4_warrants):,} 檔失敗，在容忍上限 "
-            f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED} 內：本次照常產圖但不寫回完整快照｜"
-            f"代號={'、'.join(sorted(api4_failed_tolerated))}"
-        )
-        failed_api4_warrants = []
+        _blocking = [
+            w for w in failed_api4_warrants
+            if str(w.get("warrant_code", "") or "") in _fatal_codes
+            or _official_confirms_zero_on_last_day(w) is not True
+        ]
+        if _blocking:
+            print(
+                f"⛔ {len(_blocking):,} 檔失敗不可放行（缺 2 天以上／官方顯示有量／無法核對），"
+                "將嚴格報錯"
+            )
+        elif len(_tolerable) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
+            api4_failed_tolerated = [
+                str(w.get("warrant_code", "") or "") for w in _tolerable
+            ]
+            print(
+                f"⚠️ MoneyDJ API4 有 {len(_tolerable):,} 檔 MoneyDJ 完全無法提供、"
+                f"但官方確認報告最後交易日零成交，在容忍額度 "
+                f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED} 內：照常產圖但不寫回完整快照｜"
+                f"代號={'、'.join(sorted(api4_failed_tolerated))}"
+            )
+            failed_api4_warrants = []
+        else:
+            print(
+                f"⛔ 官方確認零成交的失敗有 {len(_tolerable):,} 檔，超過容忍額度 "
+                f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED}（疑似 MoneyDJ 整體異常），將嚴格報錯"
+            )
 
     stats["api4_failed"] = len(failed_api4_warrants)
+    stats["api4_fatal_codes"] = sorted(_fatal_codes)
     stats["api4_recovered"] = initial_api4_failed - len(failed_api4_warrants)
     stats["api4_elapsed"] = time.perf_counter() - started
     print(f"⏱️ MoneyDJ API4 階段耗時：{stats['api4_elapsed']:.2f} 秒")
@@ -18699,7 +18739,6 @@ def _moneydj_range_events(
         )
         for w in failed_api4_warrants
     }
-    stats["api4_zero_volume_skipped_codes"] = sorted(api4_zero_volume_skipped)
     stats["api4_failed_tolerated_codes"] = sorted(api4_failed_tolerated)
     stats["api4_partial_tail_codes"] = sorted(set(accepted_partial_codes))
     stats["api4_partial_tail_days"] = {
@@ -18707,12 +18746,12 @@ def _moneydj_range_events(
         for c, v in api4_partial_tail_by_code.items()
     }
     stats["api4_incomplete_but_continued"] = bool(
-        api4_zero_volume_skipped or api4_failed_tolerated or accepted_partial_codes
+        api4_failed_tolerated or accepted_partial_codes
     )
     if accepted_partial_codes:
         print(
-            f"ℹ️ MoneyDJ API4 缺尾但已取回在世期間資料：{len(set(accepted_partial_codes)):,} 檔｜"
-            "缺的交易日已由官方確認零成交，對該權證視為 0；本次標記為不完整快照"
+            f"ℹ️ MoneyDJ API4 保留前段分點的權證：{len(set(accepted_partial_codes)):,} 檔｜"
+            "僅缺報告最後交易日且官方確認該日零成交，對該權證該日視為 0；本次標記為不完整快照"
         )
     stats["api4_empty_codes"] = sorted(c for c in api4_empty_codes if c)
     if api4_empty_codes:
@@ -18808,8 +18847,8 @@ def _moneydj_range_events(
         )
         raise RuntimeError(
             f"MoneyDJ API4 主來源不完整：failed={stats['api4_failed']}/{stats['active_codes']}｜"
-            f"官方核對後仍失敗且非零成交｜{error_detail or '-'}｜"
-            "（確定可忽略時可設 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED）"
+            f"整段抓不到或缺 2 天以上、且官方無法核對為零成交｜{error_detail or '-'}｜"
+            "（確定為零成交可忽略時，才調高 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED）"
         )
     if not pairs:
         # 個別權證整段區間零成交會回空，這是正常的；但「全部權證都回空」通常代表
@@ -19030,7 +19069,7 @@ def _moneydj_range_events(
         f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
         f"覆蓋交易日={stats['event_dates']}/{len(days)}｜"
         f"API4 failed={stats['api4_failed']}｜"
-        f"API4 零成交跳過={len(stats.get('api4_zero_volume_skipped_codes', []))}｜"
+        f"API4 缺尾保留={len(stats.get('api4_partial_tail_codes', []))}｜"
         f"API4 容忍放行={len(stats.get('api4_failed_tolerated_codes', []))}｜"
         f"API5 requests={stats.get('api5_requests', 0):,}｜"
         f"API5 cache_hits={stats.get('api5_cache_hits', 0):,}｜API5 failed={stats['api5_failed']}｜"
