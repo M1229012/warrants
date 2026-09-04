@@ -224,6 +224,22 @@ WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_ENABLE = os.getenv(
 WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_WAIT = max(
     0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_FINAL_SERIAL_WAIT", "3.0"))
 )
+# 所有重試都用盡後，對仍失敗的權證用官方 TWSE／TPEx 權證 OpenAPI 逐檔核對「最新
+# 交易日成交量」。官方顯示零成交（或名冊查無此代號）的權證，MoneyDJ API4 對它們
+# 常年回錯誤而不是空字串；這種權證對分點資金流沒有任何貢獻，改判為「零成交跳過」，
+# 不再讓整份週報 fail-closed。官方顯示有成交量的權證仍維持硬失敗。
+WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES = os.getenv(
+    "WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# 官方 OpenAPI 也拿不到（無法核對）時，最多容忍幾檔 API4 失敗仍照常產圖。
+# 預設 0＝維持原本嚴格行為；官方核對能處理零成交權證，這個值通常不需要調。
+WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED = max(
+    0, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED", "0"))
+)
+# 判定「零成交」的容忍值（張 / 元）。官方張數與金額都 <= 此值才算零成交。
+WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS", "0.0"))
+)
 WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
     0, int(os.getenv("WARRANT_MONEYDJ_RANGE_DAY_BUFFER", "10"))
 )
@@ -18124,6 +18140,45 @@ def _save_moneydj_event_cache(
         print(f"⚠️ MoneyDJ API5 歷史快取寫入失敗（本次資料仍有效）：{stock_code}｜{exc}")
 
 
+def _official_latest_day_warrant_volume_map() -> tuple[dict, bool]:
+    """由官方 TWSE／TPEx 權證 OpenAPI 取得「最新交易日」每檔權證的成交張數與金額。
+
+    回傳 ``({normalized_code: (lots, amount)}, ok)``；``ok=False`` 代表兩個官方
+    來源都沒抓成功，呼叫端不得據此判定零成交。結果在同次執行內由
+    ``_OPENAPI_WARRANT_DAILY_CACHE`` 快取，這裡不會重複下載。
+    """
+    volume_map: dict = {}
+    any_ok = False
+    for fetcher, label in (
+        (fetch_twse_openapi_warrant_daily_df, "TWSE"),
+        (fetch_tpex_openapi_warrant_daily_df, "TPEx"),
+    ):
+        try:
+            df = fetcher()
+        except Exception as exc:
+            print(f"⚠️ 官方權證成交量核對 {label} OpenAPI 失敗：{exc}")
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        if not bool(df.attrs.get("openapi_fetch_ok", False)):
+            continue
+        if not {"代號", "成交量", "成交金額"}.issubset(df.columns):
+            continue
+        any_ok = True
+        codes = df["代號"].map(normalize_openapi_warrant_code).tolist()
+        lots_series = pd.to_numeric(df["成交量"], errors="coerce").fillna(0.0).tolist()
+        amount_series = pd.to_numeric(df["成交金額"], errors="coerce").fillna(0.0).tolist()
+        for code, lots, amount in zip(codes, lots_series, amount_series):
+            if not code:
+                continue
+            prev_lots, prev_amount = volume_map.get(code, (0.0, 0.0))
+            volume_map[code] = (
+                max(prev_lots, float(lots)),
+                max(prev_amount, float(amount)),
+            )
+    return volume_map, any_ok
+
+
 def _moneydj_range_events(
     summary: pd.DataFrame,
     trading_dates: list,
@@ -18235,6 +18290,14 @@ def _moneydj_range_events(
                     api4_pair_dates.setdefault(pair_key, set()).add(trade_day)
 
     failed_api4_warrants = []
+    # 記錄每個仍失敗代號最後一次的錯誤字串，供最終診斷輸出與零成交核對。
+    failed_api4_error_by_code: dict = {}
+
+    def _record_api4_failure(warrant: dict, error: str) -> None:
+        code = str(warrant.get("warrant_code", "") or "")
+        if code:
+            failed_api4_error_by_code[code] = str(error or "unknown error")
+
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API4_WORKERS) as executor:
         future_map = {
             executor.submit(_moneydj_api4_range_rows, warrant, api4_start_ts, end_ts): warrant
@@ -18248,6 +18311,7 @@ def _moneydj_range_events(
                 rows, error, truncated_chunks = [], str(exc), 0
             if error:
                 failed_api4_warrants.append(warrant)
+                _record_api4_failure(warrant, error)
                 continue
             _accept_api4_rows(warrant, rows, truncated_chunks)
 
@@ -18278,6 +18342,7 @@ def _moneydj_range_events(
                     rows, error, truncated_chunks = [], str(exc), 0
                 if error:
                     still_failed.append(warrant)
+                    _record_api4_failure(warrant, error)
                     continue
                 _accept_api4_rows(warrant, rows, truncated_chunks)
         recovered = len(failed_api4_warrants) - len(still_failed)
@@ -18304,17 +18369,82 @@ def _moneydj_range_events(
                 rows, error, truncated_chunks = [], str(exc), 0
             if error:
                 still_failed.append(warrant)
+                _record_api4_failure(warrant, error)
                 continue
             _accept_api4_rows(warrant, rows, truncated_chunks)
         recovered = len(failed_api4_warrants) - len(still_failed)
         print(f"   {'✅' if recovered else '⚠️'} 最終序列復原 {recovered:,} 檔｜仍失敗 {len(still_failed):,} 檔")
         failed_api4_warrants = still_failed
 
+    # 逐檔印出仍失敗的真實錯誤字串（之前只印代號，無法判斷是限流還是資料面）。
+    if failed_api4_warrants:
+        print("❌ MoneyDJ API4 重試全數用盡後仍失敗，逐檔錯誤：")
+        for warrant in failed_api4_warrants:
+            code = str(warrant.get("warrant_code", "") or "")
+            print(f"   - {code}｜{failed_api4_error_by_code.get(code, 'unknown error')}")
+
+    # 零成交核對：用官方 TWSE／TPEx 權證 OpenAPI 逐檔確認「最新交易日成交量」。
+    # 官方顯示零成交（或名冊查無）的權證，對分點資金流沒有貢獻，改判為跳過而非硬失敗。
+    api4_zero_volume_skipped = []
+    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+        official_volume_map, official_ok = _official_latest_day_warrant_volume_map()
+        if official_ok:
+            still_failed = []
+            for warrant in failed_api4_warrants:
+                code = str(warrant.get("warrant_code", "") or "")
+                norm = normalize_openapi_warrant_code(code)
+                lots, amount = official_volume_map.get(norm, (0.0, 0.0))
+                is_zero_volume = (
+                    norm not in official_volume_map
+                    or (
+                        lots <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
+                        and amount <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
+                    )
+                )
+                if is_zero_volume:
+                    api4_zero_volume_skipped.append(code)
+                    stats["api4_empty"] += 1
+                else:
+                    still_failed.append(warrant)
+            if api4_zero_volume_skipped:
+                print(
+                    f"✅ 官方核對：仍失敗 {len(failed_api4_warrants):,} 檔中 "
+                    f"{len(api4_zero_volume_skipped):,} 檔官方顯示最新日零成交／查無，"
+                    f"判為跳過（不影響資金流）｜代號={'、'.join(sorted(api4_zero_volume_skipped))}"
+                )
+            failed_api4_warrants = still_failed
+        else:
+            print("⚠️ 官方權證 OpenAPI 兩來源都無法取得，無法零成交核對；維持原本失敗判定")
+
+    # 官方核對後仍失敗、但在容忍上限內：照常產圖，但標記為不完整（不覆寫完整快照）。
+    api4_failed_tolerated = []
+    if 0 < len(failed_api4_warrants) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
+        api4_failed_tolerated = [
+            str(w.get("warrant_code", "") or "") for w in failed_api4_warrants
+        ]
+        print(
+            f"⚠️ MoneyDJ API4 仍有 {len(failed_api4_warrants):,} 檔失敗，在容忍上限 "
+            f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED} 內：本次照常產圖但不寫回完整快照｜"
+            f"代號={'、'.join(sorted(api4_failed_tolerated))}"
+        )
+        failed_api4_warrants = []
+
     stats["api4_failed"] = len(failed_api4_warrants)
     stats["api4_recovered"] = initial_api4_failed - len(failed_api4_warrants)
     stats["api4_failure_codes"] = [
         str(warrant.get("warrant_code", "") or "") for warrant in failed_api4_warrants
     ]
+    stats["api4_failure_errors"] = {
+        str(w.get("warrant_code", "") or ""): failed_api4_error_by_code.get(
+            str(w.get("warrant_code", "") or ""), "unknown error"
+        )
+        for w in failed_api4_warrants
+    }
+    stats["api4_zero_volume_skipped_codes"] = sorted(api4_zero_volume_skipped)
+    stats["api4_failed_tolerated_codes"] = sorted(api4_failed_tolerated)
+    stats["api4_incomplete_but_continued"] = bool(
+        api4_zero_volume_skipped or api4_failed_tolerated
+    )
     stats["api4_empty_codes"] = sorted(c for c in api4_empty_codes if c)
     if api4_empty_codes:
         print(
@@ -18404,10 +18534,13 @@ def _moneydj_range_events(
             "已拒絕產出可能少算的報告，請提高 MONEYDJ_API4_RANGE_ROWS 或切分深度後重跑。"
         )
     if stats["api4_failed"]:
-        failed_sample = "、".join(stats.get("api4_failure_codes", [])[:12])
+        error_detail = "；".join(
+            f"{c}:{e}" for c, e in list(stats.get("api4_failure_errors", {}).items())[:12]
+        )
         raise RuntimeError(
             f"MoneyDJ API4 主來源不完整：failed={stats['api4_failed']}/{stats['active_codes']}｜"
-            f"低併發復原後仍失敗代號={failed_sample or '-'}"
+            f"官方核對後仍失敗且非零成交｜{error_detail or '-'}｜"
+            "（確定可忽略時可設 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED）"
         )
     if not pairs:
         # 個別權證整段區間零成交會回空，這是正常的；但「全部權證都回空」通常代表
@@ -18616,7 +18749,10 @@ def _moneydj_range_events(
         f"✅ MoneyDJ 主來源完成：{stock_code}｜{start_ts.date()} ~ {end_ts.date()}｜"
         f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
         f"覆蓋交易日={stats['event_dates']}/{len(days)}｜"
-        f"API4 failed={stats['api4_failed']}｜API5 requests={stats.get('api5_requests', 0):,}｜"
+        f"API4 failed={stats['api4_failed']}｜"
+        f"API4 零成交跳過={len(stats.get('api4_zero_volume_skipped_codes', []))}｜"
+        f"API4 容忍放行={len(stats.get('api4_failed_tolerated_codes', []))}｜"
+        f"API5 requests={stats.get('api5_requests', 0):,}｜"
         f"API5 cache_hits={stats.get('api5_cache_hits', 0):,}｜API5 failed={stats['api5_failed']}｜"
         f"{stats['elapsed']:.2f}秒"
     )
@@ -18743,10 +18879,15 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             )
             api4_failed = int(moneydj_primary_stats.get("api4_failed", 0) or 0)
             api5_failed = int(moneydj_primary_stats.get("api5_failed", 0) or 0)
+            # 官方核對後判為零成交而跳過、或在容忍上限內放行的權證，資料本身仍是缺角的，
+            # 一樣視為當次不完整，不寫回完整快照。
+            api4_incomplete_but_continued = bool(
+                moneydj_primary_stats.get("api4_incomplete_but_continued", False)
+            )
             # MoneyDJ 是逐權證抓取，失敗是「權證級」而不是「日期級」。
             # 只要有任何一支權證抓失敗就視為當次不完整，不寫回完整快照，
             # 避免把缺角的資料標成 complete 蓋掉試算表裡原本正確的快照。
-            failed_dates = 1 if (api4_failed or api5_failed) else 0
+            failed_dates = 1 if (api4_failed or api5_failed or api4_incomplete_but_continued) else 0
             stats = {
                 "total_dates": len(trading_dates),
                 "success_dates": len(event_days),
