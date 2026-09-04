@@ -517,17 +517,6 @@ jobs:
       WARRANT_NEWS_GEMINI_REPAIR_ENABLE: "1"
       WARRANT_NEWS_GEMINI_SUPPLEMENT_ENABLE: "1"
 
-      # Add these entries under: jobs.run-warrant-report-test.env
-      # They apply only to the large MoneyDJ API4 interval scan. API5 stays at its
-      # existing concurrency because the failures reported here are API4 failures.
-      WARRANT_MONEYDJ_RANGE_API4_WORKERS: "16"
-      WARRANT_MONEYDJ_RANGE_API4_CONNECT_TIMEOUT: "8"
-      WARRANT_MONEYDJ_RANGE_API4_READ_TIMEOUT: "60"
-      WARRANT_MONEYDJ_RANGE_API4_RETRIES: "4"
-      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS: "3"
-      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS: "4"
-      WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT: "2"
-
       # 權證分點報告設定
       WARRANT_EVENT_MIN_AMOUNT: "0"
       WARRANT_EVENT_MARK_TOP_N_PER_DAY: "3"
@@ -565,6 +554,7 @@ jobs:
         run: |
           echo "date=$(TZ=Asia/Taipei date +%Y%m%d)" >> "$GITHUB_OUTPUT"
           mkdir -p output llm_cache \
+            moneydj_warrant_cache \
             finmind_cache/warrant_daily \
             finmind_cache/warrant_market_compact_v2 \
             finmind_cache/reference \
@@ -581,6 +571,18 @@ jobs:
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-
             warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-
             warrant-report-finmind-llm-${{ runner.os }}-
+
+      # MoneyDJ 權證分點事件落盤快取：已結束交易日的分點明細不會再變，
+      # 只重查最近 N 個交易日。跨 run 保存後，每日重跑 API4/API5 請求數大幅下降。
+      - name: Restore MoneyDJ warrant event cache
+        uses: actions/cache/restore@v4
+        with:
+          path: moneydj_warrant_cache
+          key: warrant-moneydj-events-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            warrant-moneydj-events-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-
+            warrant-moneydj-events-${{ runner.os }}-${{ inputs.stock_codes }}-
+            warrant-moneydj-events-${{ runner.os }}-
 
       # 正式產圖還原近期原始日檔，讓 compact meta 的 source_size 能與現行 raw 實際比對。
       - name: Restore latest FinMind raw cache
@@ -695,6 +697,14 @@ jobs:
         with:
           path: llm_cache
           key: warrant-report-finmind-llm-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
+
+      # MoneyDJ 事件快取只在單股票完整成功時原子寫入，失敗的 run 也值得保存已完成的部分。
+      - name: Save refreshed MoneyDJ warrant event cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: moneydj_warrant_cache
+          key: warrant-moneydj-events-${{ runner.os }}-${{ inputs.stock_codes }}-${{ steps.cache-date.outputs.date }}-${{ github.run_id }}
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
