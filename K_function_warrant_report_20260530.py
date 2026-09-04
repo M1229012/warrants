@@ -204,6 +204,18 @@ WARRANT_MONEYDJ_RANGE_API4_WORKERS = max(
 WARRANT_MONEYDJ_RANGE_API5_WORKERS = max(
     1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API5_WORKERS", str(HYBRID_MONEYDJ_API5_WORKERS)))
 )
+# 高併發下少數 API4 會因 MoneyDJ 暫時限流、逾時或連線重設而失敗。
+# 先完整高速掃描，再只對失敗權證採低併發復原；成功後才接受結果，仍維持
+# fail-closed，不能因為復原失敗就靜默少算。
+WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS = max(
+    0, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS", "3"))
+)
+WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS = max(
+    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS", "8"))
+)
+WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT", "2.0"))
+)
 WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
     0, int(os.getenv("WARRANT_MONEYDJ_RANGE_DAY_BUFFER", "10"))
 )
@@ -18162,6 +18174,33 @@ def _moneydj_range_events(
     # 才能逐日驗證 API5 已有完整金額，而不是只看「這個 pair 曾經存在」。
     api4_pair_dates = {}
     api4_truncated = 0
+
+    def _accept_api4_rows(warrant: dict, rows: list, truncated_chunks: int) -> None:
+        """只在一支權證 API4 完整成功後，將其分點候選納入主集合。"""
+        nonlocal api4_truncated
+        if not rows:
+            stats["api4_empty"] += 1
+            return
+        # 切分到深度上限仍觸頂的區段，代表分點還是可能少算，要讓使用者知道。
+        if truncated_chunks:
+            api4_truncated += 1
+        for row in rows:
+            broker_code = str(row.get("V2", "") or "").strip()
+            if not broker_code:
+                continue
+            pair = dict(warrant)
+            pair["broker_code"] = broker_code
+            official_name = str(trader_name_map.get(broker_code, "") or "").strip()
+            pair["branch"] = normalize_branch_name(official_name or row.get("V3", ""))
+            pair_key = (pair["warrant_code"], broker_code)
+            pairs[pair_key] = pair
+            trade_dt = parse_date(row.get("V1", ""))
+            if trade_dt is not None:
+                trade_day = pd.Timestamp(trade_dt).normalize()
+                if api4_start_ts <= trade_day <= end_ts:
+                    api4_pair_dates.setdefault(pair_key, set()).add(trade_day)
+
+    failed_api4_warrants = []
     with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API4_WORKERS) as executor:
         future_map = {
             executor.submit(_moneydj_api4_range_rows, warrant, api4_start_ts, end_ts): warrant
@@ -18169,33 +18208,53 @@ def _moneydj_range_events(
         }
         for future in as_completed(future_map):
             warrant = future_map[future]
-            rows, error, truncated_chunks = future.result()
+            try:
+                rows, error, truncated_chunks = future.result()
+            except Exception as exc:
+                rows, error, truncated_chunks = [], str(exc), 0
             if error:
-                stats["api4_failed"] += 1
+                failed_api4_warrants.append(warrant)
                 continue
-            if not rows:
-                stats["api4_empty"] += 1
-                continue
-            # 切分到深度上限仍觸頂的區段，代表分點還是可能少算，要讓使用者知道。
-            if truncated_chunks:
-                api4_truncated += 1
-            for row in rows:
-                broker_code = str(row.get("V2", "") or "").strip()
-                if not broker_code:
+            _accept_api4_rows(warrant, rows, truncated_chunks)
+
+    initial_api4_failed = len(failed_api4_warrants)
+    for recovery_round in range(1, WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS + 1):
+        if not failed_api4_warrants:
+            break
+        if WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT > 0:
+            time.sleep(WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT * recovery_round)
+        print(
+            f"🔁 MoneyDJ API4 失敗復原第 {recovery_round}/{WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS} 輪："
+            f"重試 {len(failed_api4_warrants):,} 檔｜workers="
+            f"{min(WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS, len(failed_api4_warrants))}"
+        )
+        still_failed = []
+        with ThreadPoolExecutor(
+            max_workers=min(WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS, len(failed_api4_warrants))
+        ) as executor:
+            future_map = {
+                executor.submit(_moneydj_api4_range_rows, warrant, api4_start_ts, end_ts): warrant
+                for warrant in failed_api4_warrants
+            }
+            for future in as_completed(future_map):
+                warrant = future_map[future]
+                try:
+                    rows, error, truncated_chunks = future.result()
+                except Exception as exc:
+                    rows, error, truncated_chunks = [], str(exc), 0
+                if error:
+                    still_failed.append(warrant)
                     continue
-                pair = dict(warrant)
-                pair["broker_code"] = broker_code
-                official_name = str(trader_name_map.get(broker_code, "") or "").strip()
-                pair["branch"] = normalize_branch_name(
-                    official_name or row.get("V3", "")
-                )
-                pair_key = (pair["warrant_code"], broker_code)
-                pairs[pair_key] = pair
-                trade_dt = parse_date(row.get("V1", ""))
-                if trade_dt is not None:
-                    trade_day = pd.Timestamp(trade_dt).normalize()
-                    if api4_start_ts <= trade_day <= end_ts:
-                        api4_pair_dates.setdefault(pair_key, set()).add(trade_day)
+                _accept_api4_rows(warrant, rows, truncated_chunks)
+        recovered = len(failed_api4_warrants) - len(still_failed)
+        print(f"   {'✅' if recovered else '⚠️'} API4 本輪復原 {recovered:,} 檔｜仍失敗 {len(still_failed):,} 檔")
+        failed_api4_warrants = still_failed
+
+    stats["api4_failed"] = len(failed_api4_warrants)
+    stats["api4_recovered"] = initial_api4_failed - len(failed_api4_warrants)
+    stats["api4_failure_codes"] = [
+        str(warrant.get("warrant_code", "") or "") for warrant in failed_api4_warrants
+    ]
 
     # 精選分點補查：
     # API4 的區間分點清單只會列出該權證在區間內較顯著的分點，小額或只在少數
@@ -18277,8 +18336,10 @@ def _moneydj_range_events(
             "已拒絕產出可能少算的報告，請提高 MONEYDJ_API4_RANGE_ROWS 或切分深度後重跑。"
         )
     if stats["api4_failed"]:
+        failed_sample = "、".join(stats.get("api4_failure_codes", [])[:12])
         raise RuntimeError(
-            f"MoneyDJ API4 主來源不完整：failed={stats['api4_failed']}/{stats['active_codes']}"
+            f"MoneyDJ API4 主來源不完整：failed={stats['api4_failed']}/{stats['active_codes']}｜"
+            f"低併發復原後仍失敗代號={failed_sample or '-'}"
         )
     if not pairs:
         stats["elapsed"] = time.perf_counter() - started
