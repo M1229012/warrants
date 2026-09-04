@@ -199,7 +199,7 @@ WARRANT_UNIVERSE_NAME_MIN_PREFIX = max(
 WARRANT_UNIVERSE_EXTRA_CODES = os.getenv("WARRANT_UNIVERSE_EXTRA_CODES", "").strip()
 # MoneyDJ 主來源整區間抓取的執行緒數與 API5 回看天數緩衝。
 WARRANT_MONEYDJ_RANGE_API4_WORKERS = max(
-    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_WORKERS", str(HYBRID_MONEYDJ_API4_WORKERS)))
+    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_WORKERS", "16"))
 )
 WARRANT_MONEYDJ_RANGE_API5_WORKERS = max(
     1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API5_WORKERS", str(HYBRID_MONEYDJ_API5_WORKERS)))
@@ -211,10 +211,19 @@ WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS = max(
     0, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS", "3"))
 )
 WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS = max(
-    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS", "8"))
+    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WORKERS", "4"))
 )
 WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT = max(
     0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RECOVERY_WAIT", "2.0"))
+)
+WARRANT_MONEYDJ_RANGE_API4_CONNECT_TIMEOUT = max(
+    3.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_CONNECT_TIMEOUT", "8.0"))
+)
+WARRANT_MONEYDJ_RANGE_API4_READ_TIMEOUT = max(
+    10.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API4_READ_TIMEOUT", "60.0"))
+)
+WARRANT_MONEYDJ_RANGE_API4_RETRIES = max(
+    1, int(os.getenv("WARRANT_MONEYDJ_RANGE_API4_RETRIES", "4"))
 )
 WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
     0, int(os.getenv("WARRANT_MONEYDJ_RANGE_DAY_BUFFER", "10"))
@@ -16983,21 +16992,40 @@ def _hybrid_moneydj_should_run(latest_day) -> bool:
     return day == today and now_minute >= start_minute
 
 
-def _hybrid_moneydj_get_json(url: str):
+def _hybrid_moneydj_get_json(
+    url: str,
+    connect_timeout: float = 5.0,
+    read_timeout: float = 18.0,
+    retries: int | None = None,
+):
+    """讀取 MoneyDJ JSON；大型 API4 區間回應可傳入專用 timeout／重試設定。"""
     last_error = None
-    for attempt in range(1, HYBRID_MONEYDJ_RETRIES + 1):
+    max_attempts = max(1, int(retries or HYBRID_MONEYDJ_RETRIES))
+    for attempt in range(1, max_attempts + 1):
         try:
             response = get_thread_session().get(
                 url,
                 headers=MONEYDJ_HEADERS,
-                timeout=(5, 18),
+                timeout=(max(1.0, float(connect_timeout)), max(1.0, float(read_timeout))),
             )
-            response.raise_for_status()
             text = response.content.decode("utf-8", errors="replace")
-            return json.loads(text)
+            if not response.ok:
+                # 不只回報「request failed」：某些下市／尚未有 MoneyDJ 建檔的
+                # 權證會回特殊 HTTP 狀態。保留簡短回應內容，才能和暫時性限流、
+                # 逾時區分，不能把兩者都當成重試即可解的問題。
+                detail = " ".join(text.split())[:220]
+                raise RuntimeError(
+                    f"HTTP {response.status_code} {response.reason or ''}".strip()
+                    + (f"｜{detail}" if detail else "")
+                )
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                detail = " ".join(text.split())[:220]
+                raise RuntimeError(f"JSON decode failed: {exc}" + (f"｜{detail}" if detail else "")) from exc
         except Exception as exc:
             last_error = exc
-            if attempt < HYBRID_MONEYDJ_RETRIES:
+            if attempt < max_attempts:
                 time.sleep(HYBRID_MONEYDJ_RETRY_WAIT * attempt)
     raise RuntimeError(str(last_error or "MoneyDJ request failed"))
 
@@ -17847,7 +17875,10 @@ def _moneydj_api4_range_one(warrant: dict, start_day, end_day) -> tuple[list, st
         payload = _hybrid_moneydj_get_json(
             MONEYDJ_API4.format(
                 code=code, start=start_s, end=end_s, rows=MONEYDJ_API4_RANGE_ROWS
-            )
+            ),
+            connect_timeout=WARRANT_MONEYDJ_RANGE_API4_CONNECT_TIMEOUT,
+            read_timeout=WARRANT_MONEYDJ_RANGE_API4_READ_TIMEOUT,
+            retries=WARRANT_MONEYDJ_RANGE_API4_RETRIES,
         )
         rows = []
         for item in (payload if isinstance(payload, list) else [payload]):
@@ -17894,6 +17925,37 @@ def _moneydj_api4_range_rows(warrant: dict, start_day, end_day, depth: int = 0) 
     if len(merged) < len(rows):
         return rows, "", 1
     return merged, "", left_trunc + right_trunc
+
+
+def _moneydj_api4_zero_trade_tail_fallback(
+    warrant: dict,
+    start_day,
+    previous_trading_days: list[pd.Timestamp],
+) -> tuple[list, str, int]:
+    """處理 MoneyDJ 對「當日零成交」錯誤回應的相容層。
+
+    API4 本應在零成交時回空列，但實際上少數權證會把「查無當日分點」回成
+    error。這不是連線失敗，也不是一支應被排除的權證。已知最後交易日零成交時，
+    改查至前一個 *實際交易日*，保留該權證先前所有分點；零成交日沒有事件即為
+    金額 0。不能用日曆日前推，否則週末／休市日會造成不必要的第二次空查詢。
+
+    僅在主查詢已連續重試後仍失敗時由呼叫端使用。若縮短區間仍失敗，表示不是這
+    個明確的零成交尾日案例，必須繼續走嚴格失敗處理，不能靜默漏算。
+    """
+    if not previous_trading_days:
+        # 本次只查一個交易日，且使用者已確認該權證當日成交量為 0。
+        return [], "", 0
+    last_error = ""
+    # 少數權證可能連續數日都零成交；只重查這一支權證，依實際交易日逐一
+    # 縮短尾端，找到有資料的最後一日後立即停止，避免掃完整段歷史資料。
+    for previous_trading_day in reversed(previous_trading_days):
+        rows, error, truncated_chunks = _moneydj_api4_range_rows(
+            warrant, start_day, previous_trading_day
+        )
+        if not error:
+            return rows, "", truncated_chunks
+        last_error = error
+    return [], last_error, 0
 
 
 def _moneydj_api5_range_one(
@@ -18113,6 +18175,7 @@ def _moneydj_range_events(
         "active_codes": 0,
         "api4_failed": 0,
         "api4_empty": 0,
+        "api4_zero_trade_tail": 0,
         "pairs": 0,
         "api5_failed": 0,
         "event_rows": 0,
@@ -18130,12 +18193,26 @@ def _moneydj_range_events(
     active_codes = set()
     for day in days:
         active_codes |= _finmind_active_warrant_codes(summary, day)
+    # 失敗時必須可以核對官方名冊所載的存續期間。只顯示代號不足以判斷它是
+    # 新掛牌、已到期，還是 MoneyDJ 對一檔理應有效的權證回了異常。
+    warrant_life_map = {}
+    for _, item in summary.iterrows():
+        warrant_code = normalize_openapi_warrant_code(item.get("stock_id", ""))
+        if not warrant_code:
+            continue
+        warrant_life_map[warrant_code] = {
+            "listing_date": pd.Timestamp(item.get("listing_date")).strftime("%Y-%m-%d")
+            if pd.notna(item.get("listing_date")) else "?",
+            "last_trade_date": pd.Timestamp(item.get("last_trade_date")).strftime("%Y-%m-%d")
+            if pd.notna(item.get("last_trade_date")) else "?",
+        }
     warrants = [
         {
             "warrant_code": code,
             "warrant_name": str(warrant_name_map.get(code, "") or code),
             "underlying_code": _normalize_stock_name_code_key(stock_code),
             "underlying_name": str(stock_name or ""),
+            **warrant_life_map.get(code, {}),
         }
         for code in sorted(active_codes)
         if code
@@ -18160,6 +18237,8 @@ def _moneydj_range_events(
     cached_preloaded_pairs = set(cached_events.attrs.get("_moneydj_cache_preloaded_pairs", set()) or set())
     reuse_historical_cache = bool(historical_days) and historical_days.issubset(cached_covered_days)
     api4_start_ts = min(refresh_days) if reuse_historical_cache and refresh_days else start_ts
+    api4_scan_days = [day for day in days if api4_start_ts <= day <= end_ts]
+    api4_previous_trading_days = api4_scan_days[:-1]
     if reuse_historical_cache:
         print(
             f"⚡ MoneyDJ 歷史快取覆蓋完整：重查 API4 僅 {api4_start_ts.date()} ~ {end_ts.date()}｜"
@@ -18213,7 +18292,17 @@ def _moneydj_range_events(
             except Exception as exc:
                 rows, error, truncated_chunks = [], str(exc), 0
             if error:
-                failed_api4_warrants.append(warrant)
+                # MoneyDJ 對部分「最後交易日成交量為 0」的權證錯誤回覆，並非
+                # 空 ResultSet。直接把整支權證丟掉會連帶遺失前一日以前的分點。
+                # 因此只剝除已確認為零成交的尾日，前段仍以 API4 正常探索。
+                zero_rows, zero_error, zero_truncated = _moneydj_api4_zero_trade_tail_fallback(
+                    warrant, api4_start_ts, api4_previous_trading_days
+                )
+                if not zero_error:
+                    stats["api4_zero_trade_tail"] += 1
+                    _accept_api4_rows(warrant, zero_rows, zero_truncated)
+                    continue
+                failed_api4_warrants.append({**warrant, "_api4_error": str(error)})
                 continue
             _accept_api4_rows(warrant, rows, truncated_chunks)
 
@@ -18243,7 +18332,14 @@ def _moneydj_range_events(
                 except Exception as exc:
                     rows, error, truncated_chunks = [], str(exc), 0
                 if error:
-                    still_failed.append(warrant)
+                    zero_rows, zero_error, zero_truncated = _moneydj_api4_zero_trade_tail_fallback(
+                        warrant, api4_start_ts, api4_previous_trading_days
+                    )
+                    if not zero_error:
+                        stats["api4_zero_trade_tail"] += 1
+                        _accept_api4_rows(warrant, zero_rows, zero_truncated)
+                        continue
+                    still_failed.append({**warrant, "_api4_error": str(error)})
                     continue
                 _accept_api4_rows(warrant, rows, truncated_chunks)
         recovered = len(failed_api4_warrants) - len(still_failed)
@@ -18255,6 +18351,23 @@ def _moneydj_range_events(
     stats["api4_failure_codes"] = [
         str(warrant.get("warrant_code", "") or "") for warrant in failed_api4_warrants
     ]
+    stats["api4_failure_details"] = [
+        {
+            "code": str(warrant.get("warrant_code", "") or ""),
+            "name": str(warrant.get("warrant_name", "") or ""),
+            "listing_date": str(warrant.get("listing_date", "?") or "?"),
+            "last_trade_date": str(warrant.get("last_trade_date", "?") or "?"),
+            "error": " ".join(str(warrant.get("_api4_error", "") or "").split())[:260],
+        }
+        for warrant in failed_api4_warrants
+    ]
+    if stats["api4_failure_details"]:
+        print("⚠️ MoneyDJ API4 最終失敗明細（請以此判斷資料源狀態，不可直接當作無報價）：")
+        for item in stats["api4_failure_details"]:
+            print(
+                f"   {item['code']} {item['name']}｜官方存續 "
+                f"{item['listing_date']} ~ {item['last_trade_date']}｜{item['error']}"
+            )
 
     # 精選分點補查：
     # API4 的區間分點清單只會列出該權證在區間內較顯著的分點，小額或只在少數
@@ -18536,6 +18649,7 @@ def _moneydj_range_events(
         f"✅ MoneyDJ 主來源完成：{stock_code}｜{start_ts.date()} ~ {end_ts.date()}｜"
         f"pairs={stats['pairs']:,}｜events={len(events):,}｜"
         f"覆蓋交易日={stats['event_dates']}/{len(days)}｜"
+        f"API4 零成交尾日={stats.get('api4_zero_trade_tail', 0)}｜"
         f"API4 failed={stats['api4_failed']}｜API5 requests={stats.get('api5_requests', 0):,}｜"
         f"API5 cache_hits={stats.get('api5_cache_hits', 0):,}｜API5 failed={stats['api5_failed']}｜"
         f"{stats['elapsed']:.2f}秒"
