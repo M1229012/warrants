@@ -18418,7 +18418,9 @@ def _moneydj_range_events(
     # 這一天、且官方確認該權證當日零成交」時才接受；此時保留 API4 已抓到的前段分點。
     api4_partial_tail_by_code: dict = {}
     zero_tol = WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
-    # 報告最後交易日（日曆）。官方零成交核對的交易日期必須「等於」這一天。
+    # 「報告最後交易日」＝成功權證實際觀測到的最後交易日（在初掃處理完後才確定）。
+    # 不用日曆上的 days[-1]：今天可能還沒收盤、官方 t187ap42 也還沒出當日資料，
+    # 用日曆日會讓官方日期核對永遠不符。初值先給 days[-1]（無任何成功資料時的極端情況）。
     report_last_day = days[-1]
 
     def _accept_api4_rows(warrant: dict, rows: list, truncated_chunks: int,
@@ -18494,6 +18496,21 @@ def _moneydj_range_events(
     for warrant, rows, truncated_chunks in ok_results:
         _accept_api4_rows(warrant, rows, truncated_chunks)
 
+    # 報告最後交易日 = 成功權證「普遍」有資料的最後一天。
+    # 用每日出現的 (權證,分點) 筆數做門檻，避免某一檔權證的零星當日殘列
+    # （盤中、資料未定案）把日期拉到官方 t187ap42 還沒出的日子。
+    # 官方核對時交易日期必須「等於」這一天；比它新或比它舊都不採信。
+    _day_counts: dict = {}
+    for _dset in api4_pair_dates.values():
+        for _d in _dset:
+            _day_counts[_d] = _day_counts.get(_d, 0) + 1
+    if _day_counts:
+        _peak = max(_day_counts.values())
+        _solid_days = [d for d, c in _day_counts.items() if c >= max(1, _peak * 0.2)]
+        if _solid_days:
+            report_last_day = max(_solid_days)
+    print(f"📅 MoneyDJ 報告最後交易日（有實際資料）：{report_last_day.date()}")
+
     initial_api4_failed = len(failed_api4_warrants) + len(partial_api4_results)
 
     # 官方 TWSE／TPEx 權證 OpenAPI 核對：用來驗證 partial、以及判定失敗權證是否為
@@ -18533,7 +18550,16 @@ def _moneydj_range_events(
         - 僅缺最後一天但官方顯示該日有成交 → 進 fatal（真的漏了一天交易）。
         - 僅缺最後一天但官方無法核對 → 進 failed（可再重試；仍失敗時由容忍規則決定）。"""
         code = str(warrant.get("warrant_code", "") or "")
-        unavail_set = {pd.Timestamp(d).normalize() for d in unavailable_days}
+        # 只看「報告最後交易日(含)以前」還沒拿到的日子；之後的日曆日（今天尚未收盤等）
+        # 本來就沒有資料，不算缺漏。
+        unavail_set = {
+            pd.Timestamp(d).normalize() for d in unavailable_days
+            if pd.Timestamp(d).normalize() <= report_last_day
+        }
+        if not unavail_set:
+            # 實際上該權證資料已到報告最後交易日 → 視為完整。
+            _accept_api4_rows(warrant, rows, truncated_chunks)
+            return
         if unavail_set != {report_last_day}:
             api4_fatal_warrants.append(warrant)
             _record_api4_failure(
@@ -18543,7 +18569,7 @@ def _moneydj_range_events(
             return
         verdict = _official_confirms_zero_on_last_day(warrant)
         if verdict is True:
-            _accept_api4_rows(warrant, rows, truncated_chunks, unavailable_days)
+            _accept_api4_rows(warrant, rows, truncated_chunks, sorted(unavail_set))
             accepted_sink.append(code)
         elif verdict is False:
             api4_fatal_warrants.append(warrant)
