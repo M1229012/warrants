@@ -249,6 +249,12 @@ WARRANT_MONEYDJ_RANGE_DAY_BUFFER = max(
 WARRANT_MONEYDJ_API5_HISTORY_LIMIT = max(
     2, int(os.getenv("WARRANT_MONEYDJ_API5_HISTORY_LIMIT", "200"))
 )
+# 非精選分點的 API5 只需涵蓋查詢視窗（不需要視窗前的 FIFO 期初庫存），
+# 回看列數可下修以縮小回應體、加快解析。這是「至少要幾列」的地板值，
+# 實際會取 max(視窗日曆天數+緩衝, 此值)，且不超過精選分點用的 200。
+WARRANT_MONEYDJ_RANGE_API5_NONSELECTED_MIN_ROWS = max(
+    2, int(os.getenv("WARRANT_MONEYDJ_RANGE_API5_NONSELECTED_MIN_ROWS", "150"))
+)
 # MoneyDJ API5 是整支程式最主要的網路成本。已結束交易日的分點明細不會再變，
 # 因此落盤快取並只重查最近幾個交易日；快取缺一個 API4 已觀測到的日期就會自動
 # 回源，不允許快取造成少算。
@@ -17334,6 +17340,13 @@ _WARRANT_UNIVERSE_CACHE: Dict[str, pd.DataFrame] = {}
 _WARRANT_UNIVERSE_CACHE_LOCK = threading.Lock()
 _OFFICIAL_WARRANT_REGISTRY_CACHE = None
 _OFFICIAL_WARRANT_REGISTRY_CACHE_LOCK = threading.Lock()
+# 官方完整權證名冊（上市 37K + 上櫃 14K 筆）每次冷啟動要下載並解析約十餘 MB，
+# 落盤到 finmind_cache/reference 後，同一天內的重跑直接讀 parquet。
+# 名冊只有「新掛牌權證」會變，天齡上限預設 1 天，隔天自動重抓。
+WARRANT_OFFICIAL_REGISTRY_CACHE_MAX_AGE_DAYS = max(
+    0, int(os.getenv("WARRANT_OFFICIAL_REGISTRY_CACHE_MAX_AGE_DAYS", "1"))
+)
+_OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME = "official_warrant_registry_full"
 
 _WARRANT_SUMMARY_COLUMNS = [
     "stock_id", "stock_name", "target_stock_id", "type",
@@ -17352,6 +17365,25 @@ def _load_official_warrant_registry() -> pd.DataFrame:
     with _OFFICIAL_WARRANT_REGISTRY_CACHE_LOCK:
         if _OFFICIAL_WARRANT_REGISTRY_CACHE is not None:
             return _OFFICIAL_WARRANT_REGISTRY_CACHE.copy()
+
+        disk_registry = _finmind_read_reference_df(
+            _OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME,
+            max_age_days=WARRANT_OFFICIAL_REGISTRY_CACHE_MAX_AGE_DAYS,
+        )
+        required_disk_cols = {
+            "stock_id", "stock_name", "target_name", "type",
+            "listing_date", "last_trade_date", "market",
+        }
+        if (
+            disk_registry is not None
+            and not disk_registry.empty
+            and required_disk_cols.issubset(disk_registry.columns)
+        ):
+            disk_registry = disk_registry.copy()
+            disk_registry["listing_date"] = pd.to_datetime(disk_registry["listing_date"], errors="coerce")
+            disk_registry["last_trade_date"] = pd.to_datetime(disk_registry["last_trade_date"], errors="coerce")
+            _OFFICIAL_WARRANT_REGISTRY_CACHE = disk_registry.copy()
+            return disk_registry.copy()
 
         sources = (
             (TWSE_WARRANT_REGISTRY_OPENAPI_URL, "上市權證完整基本名冊", "上市"),
@@ -17399,6 +17431,10 @@ def _load_official_warrant_registry() -> pd.DataFrame:
         if registry.empty:
             raise RuntimeError("官方完整權證名冊為空")
         _OFFICIAL_WARRANT_REGISTRY_CACHE = registry.copy()
+        try:
+            _finmind_write_reference_df(_OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME, registry)
+        except Exception as exc:
+            print(f"⚠️ 官方完整權證名冊磁碟快取寫入失敗（不影響本次）：{exc}")
         print(
             f"✅ 官方完整權證名冊載入：{len(registry):,} 筆｜"
             f"上市={int((registry['market'] == '上市').sum()):,}｜"
@@ -18316,6 +18352,46 @@ def _moneydj_range_events(
             _accept_api4_rows(warrant, rows, truncated_chunks)
 
     initial_api4_failed = len(failed_api4_warrants)
+
+    # 零成交核對（提前）：用官方 TWSE／TPEx 權證 OpenAPI 逐檔確認「最新交易日成交量」。
+    # 官方顯示零成交／查無的權證，MoneyDJ API4 對它們常年回 500，重試只是白費約 30 秒。
+    # 先把這些剔除，只對「官方確認應該有資料」的權證才做後續復原重試。
+    api4_zero_volume_skipped = []
+    official_volume_map, official_ok = ({}, False)
+    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+        official_volume_map, official_ok = _official_latest_day_warrant_volume_map()
+
+    def _split_zero_volume_failures(warrant_list: list) -> list:
+        """回傳仍需重試的權證；官方確認零成交的移入 api4_zero_volume_skipped。"""
+        if not official_ok:
+            return warrant_list
+        retryable = []
+        for warrant in warrant_list:
+            norm = normalize_openapi_warrant_code(str(warrant.get("warrant_code", "") or ""))
+            lots, amount = official_volume_map.get(norm, (0.0, 0.0))
+            is_zero_volume = norm not in official_volume_map or (
+                lots <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
+                and amount <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
+            )
+            if is_zero_volume:
+                api4_zero_volume_skipped.append(str(warrant.get("warrant_code", "") or ""))
+                stats["api4_empty"] += 1
+            else:
+                retryable.append(warrant)
+        return retryable
+
+    if failed_api4_warrants and official_ok:
+        before = len(failed_api4_warrants)
+        failed_api4_warrants = _split_zero_volume_failures(failed_api4_warrants)
+        if api4_zero_volume_skipped:
+            print(
+                f"✅ 官方核對：初掃失敗 {before:,} 檔中 {len(api4_zero_volume_skipped):,} 檔"
+                f"官方顯示最新日零成交／查無，直接跳過不再重試（不影響資金流）｜"
+                f"代號={'、'.join(sorted(api4_zero_volume_skipped))}"
+            )
+    elif failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
+        print("⚠️ 官方權證 OpenAPI 兩來源都無法取得，改為重試後再核對")
+
     for recovery_round in range(1, WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS + 1):
         if not failed_api4_warrants:
             break
@@ -18376,45 +18452,25 @@ def _moneydj_range_events(
         print(f"   {'✅' if recovered else '⚠️'} 最終序列復原 {recovered:,} 檔｜仍失敗 {len(still_failed):,} 檔")
         failed_api4_warrants = still_failed
 
+    # 若提前核對時官方來源暫時不可用，重試後再核對一次（多數情況此步是 no-op）。
+    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES and not official_ok:
+        official_volume_map, official_ok = _official_latest_day_warrant_volume_map()
+        if official_ok:
+            before = len(failed_api4_warrants)
+            failed_api4_warrants = _split_zero_volume_failures(failed_api4_warrants)
+            if api4_zero_volume_skipped:
+                print(
+                    f"✅ 官方核對（重試後）：仍失敗 {before:,} 檔中 "
+                    f"{len(api4_zero_volume_skipped):,} 檔官方顯示零成交／查無，判為跳過"
+                    f"｜代號={'、'.join(sorted(api4_zero_volume_skipped))}"
+                )
+
     # 逐檔印出仍失敗的真實錯誤字串（之前只印代號，無法判斷是限流還是資料面）。
     if failed_api4_warrants:
-        print("❌ MoneyDJ API4 重試全數用盡後仍失敗，逐檔錯誤：")
+        print("❌ MoneyDJ API4 重試全數用盡且官方核對非零成交，逐檔錯誤：")
         for warrant in failed_api4_warrants:
             code = str(warrant.get("warrant_code", "") or "")
             print(f"   - {code}｜{failed_api4_error_by_code.get(code, 'unknown error')}")
-
-    # 零成交核對：用官方 TWSE／TPEx 權證 OpenAPI 逐檔確認「最新交易日成交量」。
-    # 官方顯示零成交（或名冊查無）的權證，對分點資金流沒有貢獻，改判為跳過而非硬失敗。
-    api4_zero_volume_skipped = []
-    if failed_api4_warrants and WARRANT_MONEYDJ_RANGE_API4_SKIP_ZERO_VOLUME_FAILURES:
-        official_volume_map, official_ok = _official_latest_day_warrant_volume_map()
-        if official_ok:
-            still_failed = []
-            for warrant in failed_api4_warrants:
-                code = str(warrant.get("warrant_code", "") or "")
-                norm = normalize_openapi_warrant_code(code)
-                lots, amount = official_volume_map.get(norm, (0.0, 0.0))
-                is_zero_volume = (
-                    norm not in official_volume_map
-                    or (
-                        lots <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
-                        and amount <= WARRANT_MONEYDJ_RANGE_API4_ZERO_VOLUME_LOTS
-                    )
-                )
-                if is_zero_volume:
-                    api4_zero_volume_skipped.append(code)
-                    stats["api4_empty"] += 1
-                else:
-                    still_failed.append(warrant)
-            if api4_zero_volume_skipped:
-                print(
-                    f"✅ 官方核對：仍失敗 {len(failed_api4_warrants):,} 檔中 "
-                    f"{len(api4_zero_volume_skipped):,} 檔官方顯示最新日零成交／查無，"
-                    f"判為跳過（不影響資金流）｜代號={'、'.join(sorted(api4_zero_volume_skipped))}"
-                )
-            failed_api4_warrants = still_failed
-        else:
-            print("⚠️ 官方權證 OpenAPI 兩來源都無法取得，無法零成交核對；維持原本失敗判定")
 
     # 官方核對後仍失敗、但在容忍上限內：照常產圖，但標記為不完整（不覆寫完整快照）。
     api4_failed_tolerated = []
@@ -18431,6 +18487,8 @@ def _moneydj_range_events(
 
     stats["api4_failed"] = len(failed_api4_warrants)
     stats["api4_recovered"] = initial_api4_failed - len(failed_api4_warrants)
+    stats["api4_elapsed"] = time.perf_counter() - started
+    print(f"⏱️ MoneyDJ API4 階段耗時：{stats['api4_elapsed']:.2f} 秒")
     stats["api4_failure_codes"] = [
         str(warrant.get("warrant_code", "") or "") for warrant in failed_api4_warrants
     ]
@@ -18570,6 +18628,15 @@ def _moneydj_range_events(
         WARRANT_MONEYDJ_API5_HISTORY_LIMIT,
         int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
     )
+    # 只有精選分點需要「視窗前」歷史來建 FIFO 期初庫存，才需要深度回看（200 列）。
+    # 其餘分點只要涵蓋查詢視窗即可；MoneyDJ API5 的 c 參數回傳最近 N 列，
+    # 這裡取「視窗日曆天數 + 緩衝」就一定蓋得住整個視窗，回應體更小、解析更快。
+    api5_non_selected_limit = max(
+        HYBRID_MONEYDJ_API5_DAYS,
+        int((end_ts - start_ts).days) + 1 + WARRANT_MONEYDJ_RANGE_DAY_BUFFER,
+        WARRANT_MONEYDJ_RANGE_API5_NONSELECTED_MIN_ROWS,
+    )
+    api5_non_selected_limit = min(api5_history_limit, api5_non_selected_limit)
     cached_pair_dates = {}
     cached_key_series = pd.Series(dtype=str)
     if cached_events is not None and not cached_events.empty:
@@ -18627,7 +18694,7 @@ def _moneydj_range_events(
     print(
         f"⚡ MoneyDJ API5 排程：需回源={len(api5_pairs):,}｜快取重用={api5_cache_hits:,}｜"
         f"近期重查={len(refresh_days)}個交易日｜"
-        f"每組完整回看={api5_history_limit}列"
+        f"回看列數 精選={api5_history_limit}／其餘={api5_non_selected_limit}"
     )
 
     # 暫存每組 API5 結果。這可避免非精選分點的縮短回傳不夠時，補查後將
@@ -18656,7 +18723,9 @@ def _moneydj_range_events(
                 pair,
                 start_ts,
                 end_ts,
-                api5_history_limit,
+                api5_history_limit
+                if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes
+                else api5_non_selected_limit,
                 str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
             ): pair
             for pair in api5_pairs
@@ -18818,10 +18887,12 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
 
     # 權證母體一律由官方完整基本名冊建立；不讀 FinMind 多股票快取，
     # 也不允許失敗時改以 FinMind 或當日成交清單補洞。
+    _summary_started = time.perf_counter()
     summary, summary_source = _resolve_warrant_summary(code, stock_name, start_date, end_date)
     if summary is None or summary.empty:
         print(f"⚠️ 權證清單為空，無法產生分點資料：{code}｜來源={summary_source or '無'}")
         return pd.DataFrame(columns=empty_columns)
+    print(f"⏱️ 官方權證母體 / 名冊解析：{time.perf_counter() - _summary_started:.2f} 秒")
 
     warrant_name_map = _finmind_target_warrant_name_map(summary)
     trader_name_map = _load_trader_name_map()
