@@ -19124,6 +19124,22 @@ def _moneydj_range_events(
             print("🎯 精選分點淨額最大的交易日（可直接與 warrant_backtest 對帳）：")
             print(sel_daily.head(10).to_string(index=False))
 
+            # 🧪 ABCDE 100萬門檻模擬：比對 warrant_backtest 的 Excel 為何比週報累積數字低。
+            # ABCDE 規則＝同分點＋同標的＋同一天，只要「當天最大單筆買進」< 100萬，
+            # 整天（含當天其他權證）都不會被列入 Excel；否則整天全額列入。
+            _abcde_daily_max_buy = sel.groupby("Date")["buy_amount"].max()
+            _abcde_excluded_dates = _abcde_daily_max_buy[_abcde_daily_max_buy < 1_000_000].index
+            _abcde_included_dates = _abcde_daily_max_buy[_abcde_daily_max_buy >= 1_000_000].index
+            _abcde_excluded_rows = sel[sel["Date"].isin(_abcde_excluded_dates)]
+            _abcde_included_rows = sel[sel["Date"].isin(_abcde_included_dates)]
+            print(
+                f"🧪 ABCDE 100萬門檻模擬：整天被排除的日期={len(_abcde_excluded_dates)}天"
+                f"（{', '.join(str(pd.Timestamp(d).date()) for d in sorted(_abcde_excluded_dates))}）｜"
+                f"排除掉的買進合計={fmt_money(float(_abcde_excluded_rows['buy_amount'].sum()))}｜"
+                f"排除掉的淨額合計={fmt_money(float(_abcde_excluded_rows['net_amount'].sum()))}｜"
+                f"納入ABCDE的淨額合計={fmt_money(float(_abcde_included_rows['net_amount'].sum()))}"
+            )
+
     number_stats = _moneydj_number_stats_snapshot()
     stats["api5_comma_fixed_values"] = int(number_stats.get("comma_fixed", 0))
     stats["api5_unparsable_values"] = int(number_stats.get("unparsable", 0))
