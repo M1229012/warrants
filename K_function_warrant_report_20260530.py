@@ -18957,12 +18957,22 @@ def _moneydj_range_events(
         if needs_api5:
             api5_pairs.append(pair)
         elif expected_dates and cached_events is not None and not cached_events.empty:
-            cached_event_frames.append(
-                cached_events.loc[
-                    (cached_key_series == cache_key)
-                    & cached_events["Date"].isin(expected_dates)
-                ].copy()
+            # reuse_historical_cache 為真時，[start_ts, api4_start_ts) 這段已經由上面
+            # 的整批快取重用一次帶入 cached_event_frames；這裡只能補 api4_start_ts
+            # 之後（本次重查範圍）的日期，否則同一筆歷史交易會被塞進 cached_event_frames
+            # 兩次，經下面的 groupby(...).sum() 疊加成兩倍金額，且會被存回快取越滾越大。
+            reuse_dates = (
+                {d for d in expected_dates if d >= api4_start_ts}
+                if reuse_historical_cache
+                else expected_dates
             )
+            if reuse_dates:
+                cached_event_frames.append(
+                    cached_events.loc[
+                        (cached_key_series == cache_key)
+                        & cached_events["Date"].isin(reuse_dates)
+                    ].copy()
+                )
             api5_cache_hits += 1
 
     stats["api5_requests"] = len(api5_pairs)
