@@ -75,6 +75,14 @@ on:
           - "0"
           - "1"
         default: "1"
+      force_full_refresh:
+        description: "驗證用：完全不還原 MoneyDJ／FinMind 快取，強制整段區間重新抓取（1=是；會明顯變慢，只用於核對數字，平常請維持 0）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
 
   # Asia/Taipei 21:20 = UTC 13:20。
   # 每個交易日晚間先建立全市場精簡權證事件快取，之後手動查任何新股票都直接走快速路徑。
@@ -450,6 +458,10 @@ jobs:
       WARRANT_ALWAYS_REFRESH_WARRANT_FLOW: "0"
       WARRANT_CACHE_FORCE_REFRESH: "0"
       WARRANT_LOCAL_CACHE_ENABLE: "0"
+      # force_full_refresh=1 時，除了下面會跳過還原 MoneyDJ／FinMind 落盤快取的 restore
+      # 步驟，這裡再多一層保險：直接關掉程式本身的 MoneyDJ 事件快取讀寫，避免同一個
+      # runner 內殘留的檔案被誤用。
+      WARRANT_MONEYDJ_EVENT_CACHE_ENABLE: ${{ inputs.force_full_refresh == '1' && '0' || '1' }}
 
       # ========================================================
       # Gemini：所有通過公司主體驗證的新聞素材都使用原始高品質規則。
@@ -587,7 +599,9 @@ jobs:
 
       # MoneyDJ 權證分點事件落盤快取：已結束交易日的分點明細不會再變，
       # 只重查最近 N 個交易日。跨 run 保存後，每日重跑 API4/API5 請求數大幅下降。
+      # force_full_refresh=1 時整段跳過，讓這次執行完全沒有舊快取可還原。
       - name: Restore MoneyDJ warrant event cache
+        if: inputs.force_full_refresh != '1'
         uses: actions/cache/restore@v4
         with:
           path: moneydj_warrant_cache
@@ -598,7 +612,9 @@ jobs:
             warrant-moneydj-events-${{ runner.os }}-
 
       # 正式產圖還原近期原始日檔，讓 compact meta 的 source_size 能與現行 raw 實際比對。
+      # force_full_refresh=1 時跳過，強制這次執行完全重新從 FinMind／MoneyDJ 抓取。
       - name: Restore latest FinMind raw cache
+        if: inputs.force_full_refresh != '1'
         uses: actions/cache/restore@v4
         with:
           path: finmind_cache/warrant_daily
@@ -608,6 +624,7 @@ jobs:
 
       # 正式報表的精簡事件與參考資料維持獨立 cache；原始 Parquet 由上一個步驟分開還原。
       - name: Restore latest FinMind report cache
+        if: inputs.force_full_refresh != '1'
         uses: actions/cache/restore@v4
         with:
           path: |
