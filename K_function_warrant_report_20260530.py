@@ -435,7 +435,7 @@ DEBUG_BRANCH_WARRANT_FLOW_DAYS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_DAYS",
 DEBUG_BRANCH_WARRANT_FLOW_MAX_ROWS = int(os.getenv("WARRANT_DEBUG_BRANCH_FLOW_MAX_ROWS", "300"))
 DEBUG_BRANCH_WARRANT_FLOW_WARRANT_CODES = os.getenv("WARRANT_DEBUG_BRANCH_FLOW_WARRANT_CODES", "").strip()
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點籌碼"))
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", os.getenv("GSHEET_NAME", "權證分點資料_NEW_MoneyDJ"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", os.getenv("GSHEET_ID", "")).strip()
 
 # 分點勝率 / 歷史加權報酬率：供「本週重點」引用 Google Sheet 勝率統計。
