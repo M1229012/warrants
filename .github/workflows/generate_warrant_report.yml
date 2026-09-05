@@ -132,7 +132,7 @@ jobs:
       FINMIND_DEBUG_VERBOSE_SUCCESS_ENABLE: "0"
       # 預熱時順便把勝率統計保存到 finmind_cache/reference，正式產圖不再等待 Google Sheet。
       WARRANT_GSHEET_ENABLE: "1"
-      GSHEET_NAME: "權證分點籌碼"
+      GSHEET_NAME: "權證分點資料_NEW_MoneyDJ"
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY }}
       WARRANT_STOCK_NAME_GSHEET_ENABLE: "0"
       WARRANT_BRANCH_PERF_ENABLE: "1"
