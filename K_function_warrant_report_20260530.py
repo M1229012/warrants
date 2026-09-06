@@ -18900,6 +18900,203 @@ def _official_latest_day_warrant_volume_map(expected_trade_date=None) -> tuple[d
     return volume_map, markets_verified
 
 
+# ------------------------------------------------------------------
+# 官方逐日成交量核對（整段區間）
+#
+# MoneyDJ 對「整個查詢區間內從未成交過」的權證沒有分點資料頁，任何日期範圍
+# 都回 500（實測：單日區間也一樣）。這種權證對報表沒有任何貢獻，跳過不會少算，
+# 但原本的容忍規則只核對「報告最後一個交易日」零成交，證明力不足，只能靠
+# WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 這個絕對數量上限把關——而該上限
+# 不隨權證檔數放大（2330 有 1,259 支、6693 只有 70 支），大型標的很容易誤擋。
+#
+# 這裡改用證交所「個股每日成交資訊」逐月核對整段區間：只要官方顯示該權證
+# 在區間內每一個掛牌日都是零成交，就是可證明的安全跳過，不再受數量上限限制。
+# ------------------------------------------------------------------
+
+TWSE_SECURITY_DAILY_URL = (
+    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+    "?date={month}01&stockNo={code}&response=json"
+)
+# 整段區間零成交核對；關掉之後會退回原本「只看最後一個交易日 + 絕對數量上限」的規則。
+WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE = os.getenv(
+    "WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# 失敗檔數超過這個數量時不做逐檔核對：那已經像 MoneyDJ 整體異常，應該直接報錯。
+WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES = max(
+    0, int(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES", "80"))
+)
+# 證交所這個端點會擋密集請求，逐次之間至少間隔這麼久。
+WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL = max(
+    0.0, float(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL", "1.2"))
+)
+
+TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
+    "WARRANT_TWSE_SECURITY_DAILY_CACHE_DIR", "twse_security_daily_cache"
+).strip() or "twse_security_daily_cache"
+
+_TWSE_SECURITY_DAILY_CACHE: Dict[tuple, list] = {}
+_TWSE_SECURITY_DAILY_LOCK = threading.Lock()
+_TWSE_SECURITY_DAILY_LAST_CALL = [0.0]
+
+
+def _twse_security_month_is_closed(month: str) -> bool:
+    """該月份是否已經整個過去；已結束的月份資料不會再變，可以永久落盤。"""
+    try:
+        return str(month) < _taipei_now_naive().strftime("%Y%m")
+    except Exception:
+        return False
+
+
+def _twse_security_month_disk_path(code: str, month: str) -> str:
+    safe_code = _safe_cache_part(str(code))
+    return os.path.join(TWSE_SECURITY_DAILY_CACHE_DIR, f"{safe_code}_{month}.json")
+
+
+def _twse_security_month_rows(code: str, month: str) -> list | None:
+    """取某檔證券某個月的官方每日成交資訊。
+
+    回傳 ``[(日期, 成交股數), ...]``；該月無資料回 ``[]``；抓取失敗回 ``None``
+    （None 代表「無法核對」，絕不能當成零成交）。
+    """
+    cache_key = (str(code), str(month))
+    with _TWSE_SECURITY_DAILY_LOCK:
+        if cache_key in _TWSE_SECURITY_DAILY_CACHE:
+            return _TWSE_SECURITY_DAILY_CACHE[cache_key]
+
+    # 已結束的月份資料不會再變動，落盤後不必每次重抓（這是每次執行最主要的成本）。
+    disk_path = _twse_security_month_disk_path(code, month)
+    if _twse_security_month_is_closed(month) and os.path.exists(disk_path):
+        try:
+            with open(disk_path, "r", encoding="utf-8") as cache_file:
+                raw_rows = json.load(cache_file)
+            rows = [
+                (pd.Timestamp(day).normalize(), float(shares))
+                for day, shares in raw_rows
+            ]
+            with _TWSE_SECURITY_DAILY_LOCK:
+                _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
+            return rows
+        except Exception:
+            pass
+
+    payload = None
+    last_error = ""
+    for attempt in range(3):
+        try:
+            with _TWSE_SECURITY_DAILY_LOCK:
+                wait = (
+                    _TWSE_SECURITY_DAILY_LAST_CALL[0]
+                    + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL
+                    - time.monotonic()
+                )
+                if wait > 0:
+                    time.sleep(wait)
+                _TWSE_SECURITY_DAILY_LAST_CALL[0] = time.monotonic()
+
+            response = get_thread_session().get(
+                TWSE_SECURITY_DAILY_URL.format(month=month, code=code),
+                headers=OPENAPI_WARRANT_HEADERS,
+                timeout=(8.0, 30.0),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except Exception as exc:
+            # 證交所這個端點被打太密會回 429/5xx；退避後重試，仍失敗才回 None。
+            last_error = str(exc)
+            time.sleep(2.0 * (attempt + 1))
+    if payload is None:
+        print(f"⚠️ 官方個股每日成交資訊讀取失敗：{code}｜{month}｜{last_error}")
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    stat = str(payload.get("stat", ""))
+    if stat.upper() != "OK":
+        # 「沒有符合條件的資料」＝該月尚未掛牌或已下市，不是抓取失敗。
+        result = [] if "沒有符合條件" in stat or payload.get("total") == 0 else None
+        if result is not None:
+            with _TWSE_SECURITY_DAILY_LOCK:
+                _TWSE_SECURITY_DAILY_CACHE[cache_key] = result
+            if _twse_security_month_is_closed(month):
+                # 尚未掛牌／已下市的月份同樣不會再變，落盤避免每次重抓。
+                try:
+                    os.makedirs(TWSE_SECURITY_DAILY_CACHE_DIR, exist_ok=True)
+                    tmp_path = f"{disk_path}.tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as cache_file:
+                        json.dump([], cache_file)
+                    os.replace(tmp_path, disk_path)
+                except Exception:
+                    pass
+        return result
+
+    rows = []
+    for row in payload.get("data", []) or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        raw_day = str(row[0] or "").strip()
+        parts = raw_day.split("/")
+        if len(parts) != 3:
+            continue
+        try:
+            day = pd.Timestamp(
+                year=int(parts[0]) + 1911, month=int(parts[1]), day=int(parts[2])
+            )
+            shares = float(str(row[1]).replace(",", "").strip() or 0)
+        except Exception:
+            continue
+        rows.append((day.normalize(), shares))
+
+    with _TWSE_SECURITY_DAILY_LOCK:
+        _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
+    if _twse_security_month_is_closed(month):
+        try:
+            os.makedirs(TWSE_SECURITY_DAILY_CACHE_DIR, exist_ok=True)
+            tmp_path = f"{disk_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as cache_file:
+                json.dump(
+                    [[day.strftime("%Y-%m-%d"), shares] for day, shares in rows],
+                    cache_file,
+                )
+            os.replace(tmp_path, disk_path)
+        except Exception:
+            pass
+    return rows
+
+
+def _official_confirms_zero_over_window(warrant_code: str, start_ts, end_ts):
+    """官方逐日核對整段區間是否完全沒有成交。
+
+    True  = 區間內每個掛牌日官方都顯示零成交（跳過這檔不會少算）
+    False = 區間內官方顯示有成交（絕不可跳過）
+    None  = 無法核對（抓取失敗、或區間內完全沒有官方紀錄）
+    """
+    code = normalize_openapi_warrant_code(str(warrant_code or ""))
+    if not code:
+        return None
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+
+    months = []
+    cursor = start_ts.replace(day=1)
+    while cursor <= end_ts:
+        months.append(cursor.strftime("%Y%m"))
+        cursor = (cursor + pd.offsets.MonthBegin(1)).normalize()
+
+    in_window_rows = 0
+    for month in months:
+        rows = _twse_security_month_rows(code, month)
+        if rows is None:
+            return None
+        for day, shares in rows:
+            if not (start_ts <= day <= end_ts):
+                continue
+            in_window_rows += 1
+            if shares > 0:
+                return False
+    return True if in_window_rows > 0 else None
+
+
 def _moneydj_range_events(
     summary: pd.DataFrame,
     trading_dates: list,
@@ -19295,6 +19492,7 @@ def _moneydj_range_events(
     #    且總數 <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 時，才照常產圖並標記為不完整。
     # 3. 官方顯示有量、或無法核對（來源失敗／日期不符）、或超過額度 → 嚴格報錯。
     api4_failed_tolerated = []
+    api4_proven_zero_codes = []
     _fatal_codes = {str(w.get("warrant_code", "") or "") for w in api4_fatal_warrants}
     if failed_api4_warrants:
         _tolerable = [
@@ -19307,11 +19505,70 @@ def _moneydj_range_events(
             if str(w.get("warrant_code", "") or "") in _fatal_codes
             or _official_confirms_zero_on_last_day(w) is not True
         ]
+        # 先用官方逐日成交量核對整段區間：從未成交過的權證跳過不會少算，
+        # 這是可證明的，不受 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 數量上限限制。
+        _proven_zero = []
+        if (
+            WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
+            and _tolerable
+            and not _blocking
+            and len(_tolerable) <= WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
+        ):
+            print(
+                f"🔍 官方逐日核對整段區間成交量：{len(_tolerable):,} 檔｜"
+                f"{start_ts.date()} ~ {report_last_day.date()}"
+            )
+            _still_tolerable = []
+            _window_has_volume = []
+            for _w in _tolerable:
+                _code = str(_w.get("warrant_code", "") or "")
+                _verdict = _official_confirms_zero_over_window(
+                    _code, start_ts, report_last_day
+                )
+                if _verdict is True:
+                    _proven_zero.append(_w)
+                elif _verdict is False:
+                    _window_has_volume.append(_w)
+                else:
+                    _still_tolerable.append(_w)
+            if _window_has_volume:
+                # 官方顯示區間內有成交，但 MoneyDJ 拿不到分點 → 真的會少算，不可放行。
+                _blocking.extend(_window_has_volume)
+                print(
+                    f"⛔ {len(_window_has_volume):,} 檔官方顯示區間內有成交但 MoneyDJ 無資料，"
+                    f"必定少算，將嚴格報錯｜代號="
+                    + "、".join(
+                        sorted(str(w.get("warrant_code", "") or "") for w in _window_has_volume)
+                    )
+                )
+            if _proven_zero:
+                print(
+                    f"✅ 官方確認整段區間從未成交：{len(_proven_zero):,} 檔｜"
+                    "跳過不影響任何數字，不計入容忍額度"
+                )
+            _tolerable = _still_tolerable
+        elif (
+            WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
+            and len(_tolerable) > WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
+        ):
+            print(
+                f"⏭️ 失敗 {len(_tolerable):,} 檔超過逐日核對上限 "
+                f"{WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES}，"
+                "視為 MoneyDJ 整體異常，不做逐檔核對"
+            )
+
+        api4_proven_zero_codes = sorted(
+            str(w.get("warrant_code", "") or "") for w in _proven_zero
+        )
+
         if _blocking:
             print(
                 f"⛔ {len(_blocking):,} 檔失敗不可放行（缺 2 天以上／官方顯示有量／無法核對），"
                 "將嚴格報錯"
             )
+        elif not _tolerable:
+            # 全部失敗都已被官方逐日證明整段區間零成交：資料其實是完整的。
+            failed_api4_warrants = []
         elif len(_tolerable) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
             api4_failed_tolerated = [
                 str(w.get("warrant_code", "") or "") for w in _tolerable
@@ -19344,6 +19601,8 @@ def _moneydj_range_events(
         for w in failed_api4_warrants
     }
     stats["api4_failed_tolerated_codes"] = sorted(api4_failed_tolerated)
+    # 官方逐日證明整段區間零成交而跳過的權證：不算資料缺漏，不進不完整標記。
+    stats["api4_proven_zero_codes"] = list(api4_proven_zero_codes)
     stats["api4_partial_tail_codes"] = sorted(set(accepted_partial_codes))
     stats["api4_partial_tail_days"] = {
         c: [d.strftime("%Y-%m-%d") for d in v]
