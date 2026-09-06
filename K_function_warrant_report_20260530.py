@@ -18926,8 +18926,17 @@ WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES = max(
     0, int(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES", "80"))
 )
 # 證交所這個端點會擋密集請求，逐次之間至少間隔這麼久。
+# 證交所這個端點約以「5 秒 3 次」為限，超過就回 HTML 擋你（HTTP 仍是 200）。
+# 預設 2.0 秒＝每 5 秒 2.5 次，留安全邊際；被擋到時下面還會自動再放慢。
 WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL = max(
-    0.0, float(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL", "1.2"))
+    0.3, float(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL", "2.0"))
+)
+# 被限流時的退避秒數；證交所的封鎖通常持續數十秒，退避太短只是繼續撞牆。
+WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS = (20.0, 45.0, 90.0)
+# 整個核對階段的時間上限；超過就讓剩下的權證回「無法核對」，退回原本的容忍規則，
+# 不讓這一步無限拖長 GitHub Actions。
+WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC = max(
+    60.0, float(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC", "900"))
 )
 
 TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
@@ -18937,6 +18946,9 @@ TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
 _TWSE_SECURITY_DAILY_CACHE: Dict[tuple, list] = {}
 _TWSE_SECURITY_DAILY_LOCK = threading.Lock()
 _TWSE_SECURITY_DAILY_LAST_CALL = [0.0]
+# 被限流過就自動放慢，避免同一次執行一直反覆撞同一道牆。
+_TWSE_SECURITY_DAILY_INTERVAL = [WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL]
+_TWSE_SECURITY_DAILY_DEADLINE = [None]
 
 
 def _twse_security_month_is_closed(month: str) -> bool:
@@ -18979,32 +18991,61 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
         except Exception:
             pass
 
+    deadline = _TWSE_SECURITY_DAILY_DEADLINE[0]
+    if deadline is not None and time.monotonic() > deadline:
+        # 核對階段已超過時間預算：回 None（無法核對），交給原本的容忍規則決定。
+        return None
+
     payload = None
     last_error = ""
-    for attempt in range(3):
-        try:
-            with _TWSE_SECURITY_DAILY_LOCK:
-                wait = (
-                    _TWSE_SECURITY_DAILY_LAST_CALL[0]
-                    + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_INTERVAL
-                    - time.monotonic()
-                )
-                if wait > 0:
-                    time.sleep(wait)
-                _TWSE_SECURITY_DAILY_LAST_CALL[0] = time.monotonic()
+    for attempt in range(1 + len(WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS)):
+        with _TWSE_SECURITY_DAILY_LOCK:
+            wait = (
+                _TWSE_SECURITY_DAILY_LAST_CALL[0]
+                + _TWSE_SECURITY_DAILY_INTERVAL[0]
+                - time.monotonic()
+            )
+            if wait > 0:
+                time.sleep(wait)
+            _TWSE_SECURITY_DAILY_LAST_CALL[0] = time.monotonic()
 
+        throttled = False
+        try:
             response = get_thread_session().get(
                 TWSE_SECURITY_DAILY_URL.format(month=month, code=code),
                 headers=OPENAPI_WARRANT_HEADERS,
                 timeout=(8.0, 30.0),
             )
-            response.raise_for_status()
-            payload = response.json()
-            break
+            if response.status_code in (429, 503):
+                throttled = True
+                last_error = f"HTTP {response.status_code}"
+            else:
+                response.raise_for_status()
+                try:
+                    payload = response.json()
+                    break
+                except Exception:
+                    # 證交所限流時會回 HTML 而不是 JSON，HTTP 仍然是 200。
+                    # 這不是「查無資料」，絕不能當成零成交，必須退避重試。
+                    throttled = True
+                    last_error = "回應不是 JSON（證交所限流）"
         except Exception as exc:
-            # 證交所這個端點被打太密會回 429/5xx；退避後重試，仍失敗才回 None。
             last_error = str(exc)
-            time.sleep(2.0 * (attempt + 1))
+
+        if attempt >= len(WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS):
+            break
+        backoff = WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS[attempt]
+        if throttled:
+            with _TWSE_SECURITY_DAILY_LOCK:
+                _TWSE_SECURITY_DAILY_INTERVAL[0] = min(
+                    6.0, _TWSE_SECURITY_DAILY_INTERVAL[0] + 0.5
+                )
+            print(
+                f"⏳ 官方個股每日成交資訊被限流，退避 {backoff:.0f} 秒後重試："
+                f"{code}｜{month}｜間隔改為 {_TWSE_SECURITY_DAILY_INTERVAL[0]:.1f} 秒"
+            )
+        time.sleep(backoff)
+
     if payload is None:
         print(f"⚠️ 官方個股每日成交資訊讀取失敗：{code}｜{month}｜{last_error}")
         return None
@@ -19077,6 +19118,12 @@ def _official_confirms_zero_over_window(warrant_code: str, start_ts, end_ts):
     start_ts = pd.Timestamp(start_ts).normalize()
     end_ts = pd.Timestamp(end_ts).normalize()
 
+    # 刻意不用種子檔或官方名冊的日期來縮短查詢月份：
+    #   - 權證代號會被回收重用，種子檔同一個代號可能對應到已到期的舊權證
+    #     （實測 084113 在種子檔是 2024-03-15~2026-03-12 的舊券，官方名冊卻是
+    #      2026-09-03 才掛牌的新券），照著跳過月份會直接得出錯誤的「零成交」結論。
+    #   - 官方名冊的「履約開始日」對歐式權證接近到期日，不是上市日。
+    # 這裡寧可多打幾次請求，也不要憑不可靠的日期跳過該查的月份。
     months = []
     cursor = start_ts.replace(day=1)
     while cursor <= end_ts:
@@ -19516,7 +19563,11 @@ def _moneydj_range_events(
         ):
             print(
                 f"🔍 官方逐日核對整段區間成交量：{len(_tolerable):,} 檔｜"
-                f"{start_ts.date()} ~ {report_last_day.date()}"
+                f"{start_ts.date()} ~ {report_last_day.date()}｜"
+                f"時間預算 {WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC:.0f} 秒"
+            )
+            _TWSE_SECURITY_DAILY_DEADLINE[0] = (
+                time.monotonic() + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC
             )
             _still_tolerable = []
             _window_has_volume = []
@@ -19545,6 +19596,14 @@ def _moneydj_range_events(
                 print(
                     f"✅ 官方確認整段區間從未成交：{len(_proven_zero):,} 檔｜"
                     "跳過不影響任何數字，不計入容忍額度"
+                )
+            if _still_tolerable:
+                print(
+                    f"❓ 官方逐日核對無法完成：{len(_still_tolerable):,} 檔"
+                    "（讀取失敗／被限流／查無官方紀錄），退回原本的容忍額度規則｜代號="
+                    + "、".join(
+                        sorted(str(w.get("warrant_code", "") or "") for w in _still_tolerable)
+                    )
                 )
             _tolerable = _still_tolerable
         elif (
