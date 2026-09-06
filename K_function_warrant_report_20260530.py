@@ -18938,6 +18938,17 @@ WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS = (20.0, 45.0, 90.0)
 WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC = max(
     60.0, float(os.getenv("WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC", "900"))
 )
+# MoneyDJ 完全沒有分點資料、但官方顯示區間內「有一點點成交」的權證，容許跳過的
+# 官方成交金額上限（新台幣，所有這類權證的合計）。
+#
+# 為什麼不是 0：MoneyDJ 對某些冷門權證整段區間都回 500，而官方逐日資料可以精確
+# 告訴我們少掉多少。實測 2330 的兩檔合計約 103 萬，對照該檔原始買進 4.97 億是 0.2%，
+# 而且低於報表自己的 ABCDE 100 萬單筆門檻——為了這個金額讓整份週報失敗並不合理。
+# 設 0 即回到「只要官方顯示有成交就一律報錯」的最嚴格行為。
+# 超過上限一律嚴格報錯；跳過時會逐檔印出代號、金額與日期，並標記為不完整快照。
+WARRANT_MONEYDJ_MISSING_AMOUNT_MAX = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_MISSING_AMOUNT_MAX", "2000000"))
+)
 
 TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
     "WARRANT_TWSE_SECURITY_DAILY_CACHE_DIR", "twse_security_daily_cache"
@@ -18960,8 +18971,9 @@ def _twse_security_month_is_closed(month: str) -> bool:
 
 
 def _twse_security_month_disk_path(code: str, month: str) -> str:
+    # _v2：改為同時保存成交金額（原本只有成交股數），舊檔案格式不相容。
     safe_code = _safe_cache_part(str(code))
-    return os.path.join(TWSE_SECURITY_DAILY_CACHE_DIR, f"{safe_code}_{month}.json")
+    return os.path.join(TWSE_SECURITY_DAILY_CACHE_DIR, f"{safe_code}_{month}_v2.json")
 
 
 def _twse_security_month_rows(code: str, month: str) -> list | None:
@@ -18982,8 +18994,8 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
             with open(disk_path, "r", encoding="utf-8") as cache_file:
                 raw_rows = json.load(cache_file)
             rows = [
-                (pd.Timestamp(day).normalize(), float(shares))
-                for day, shares in raw_rows
+                (pd.Timestamp(day).normalize(), float(shares), float(amount))
+                for day, shares, amount in raw_rows
             ]
             with _TWSE_SECURITY_DAILY_LOCK:
                 _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
@@ -19084,9 +19096,13 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
                 year=int(parts[0]) + 1911, month=int(parts[1]), day=int(parts[2])
             )
             shares = float(str(row[1]).replace(",", "").strip() or 0)
+            amount = (
+                float(str(row[2]).replace(",", "").strip() or 0)
+                if len(row) > 2 else 0.0
+            )
         except Exception:
             continue
-        rows.append((day.normalize(), shares))
+        rows.append((day.normalize(), shares, amount))
 
     with _TWSE_SECURITY_DAILY_LOCK:
         _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
@@ -19096,7 +19112,10 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
             tmp_path = f"{disk_path}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as cache_file:
                 json.dump(
-                    [[day.strftime("%Y-%m-%d"), shares] for day, shares in rows],
+                    [
+                        [day.strftime("%Y-%m-%d"), shares, amount]
+                        for day, shares, amount in rows
+                    ],
                     cache_file,
                 )
             os.replace(tmp_path, disk_path)
@@ -19130,18 +19149,52 @@ def _official_confirms_zero_over_window(warrant_code: str, start_ts, end_ts):
         months.append(cursor.strftime("%Y%m"))
         cursor = (cursor + pd.offsets.MonthBegin(1)).normalize()
 
+    summary = _official_window_trade_summary(code, start_ts, end_ts, months)
+    if summary is None:
+        return None
+    return summary["amount"] <= 0 and summary["shares"] <= 0
+
+
+def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=None):
+    """官方逐日統計某檔證券在區間內的成交股數／金額／有成交的日期。
+
+    回傳 ``{"shares": float, "amount": float, "days": [Timestamp, ...]}``；
+    無法核對（抓取失敗、或區間內完全沒有官方紀錄）時回 ``None``。
+
+    有了金額才能判斷「MoneyDJ 少掉的這一檔到底重不重要」，而不是只能二選一：
+    要嘛整份報表失敗，要嘛不明不白地跳過。
+    """
+    code = normalize_openapi_warrant_code(str(warrant_code or ""))
+    if not code:
+        return None
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+    if months is None:
+        months = []
+        cursor = start_ts.replace(day=1)
+        while cursor <= end_ts:
+            months.append(cursor.strftime("%Y%m"))
+            cursor = (cursor + pd.offsets.MonthBegin(1)).normalize()
+
+    total_shares = 0.0
+    total_amount = 0.0
+    traded_days = []
     in_window_rows = 0
     for month in months:
         rows = _twse_security_month_rows(code, month)
         if rows is None:
             return None
-        for day, shares in rows:
+        for day, shares, amount in rows:
             if not (start_ts <= day <= end_ts):
                 continue
             in_window_rows += 1
+            total_shares += float(shares or 0)
+            total_amount += float(amount or 0)
             if shares > 0:
-                return False
-    return True if in_window_rows > 0 else None
+                traded_days.append(day)
+    if in_window_rows <= 0:
+        return None
+    return {"shares": total_shares, "amount": total_amount, "days": traded_days}
 
 
 def _moneydj_range_events(
@@ -19430,6 +19483,70 @@ def _moneydj_range_events(
             f"且在容忍額度內，跳過復原與序列重試"
         )
 
+    # 官方逐日核對提前到「復原重試之前」：MoneyDJ 對這些冷門權證是永久 500，
+    # 重試 3 輪 + 序列復原純粹是浪費時間（實測約 300 秒）。先問官方有沒有成交，
+    # 確定跳過不影響數字的就不必再對 MoneyDJ 重試。
+    api4_window_verdicts = {}
+    api4_pre_verified_zero_codes = []
+    if (
+        not _fast_tolerate
+        and failed_api4_warrants
+        and WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
+        and len(failed_api4_warrants) <= WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
+    ):
+        print(
+            f"🔍 官方逐日核對整段區間成交量：{len(failed_api4_warrants):,} 檔｜"
+            f"{start_ts.date()} ~ {report_last_day.date()}｜"
+            f"時間預算 {WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC:.0f} 秒"
+        )
+        _TWSE_SECURITY_DAILY_DEADLINE[0] = (
+            time.monotonic() + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC
+        )
+        _verify_started = time.perf_counter()
+        for _w in failed_api4_warrants:
+            _code = str(_w.get("warrant_code", "") or "")
+            api4_window_verdicts[_code] = _official_window_trade_summary(
+                _code, start_ts, report_last_day
+            )
+        _zero_n = sum(
+            1 for s in api4_window_verdicts.values()
+            if s is not None and s["amount"] <= 0 and s["shares"] <= 0
+        )
+        _traded_n = sum(
+            1 for s in api4_window_verdicts.values()
+            if s is not None and (s["amount"] > 0 or s["shares"] > 0)
+        )
+        _unknown_n = sum(1 for s in api4_window_verdicts.values() if s is None)
+        print(
+            f"🔍 官方核對完成：整段零成交={_zero_n:,}｜有成交={_traded_n:,}｜"
+            f"無法核對={_unknown_n:,}｜{time.perf_counter() - _verify_started:.1f} 秒"
+        )
+        # 官方已證明整段零成交的權證直接從重試清單移除：MoneyDJ 對它們是永久 500，
+        # 再跑 3 輪復原 + 序列重試（間隔 3 秒）也只是重複拿到同樣的錯誤。
+        # 只有「官方顯示有成交」與「無法核對」的才值得再對 MoneyDJ 重試。
+        _pre_verified_zero = [
+            w for w in failed_api4_warrants
+            if (
+                str(w.get("warrant_code", "") or "") not in
+                {str(x.get("warrant_code", "") or "") for x in api4_fatal_warrants}
+            )
+            and (lambda s: s is not None and s["amount"] <= 0 and s["shares"] <= 0)(
+                api4_window_verdicts.get(str(w.get("warrant_code", "") or ""))
+            )
+        ]
+        if _pre_verified_zero:
+            _zero_codes = {str(w.get("warrant_code", "") or "") for w in _pre_verified_zero}
+            failed_api4_warrants = [
+                w for w in failed_api4_warrants
+                if str(w.get("warrant_code", "") or "") not in _zero_codes
+            ]
+            initial_api4_failed -= len(_pre_verified_zero)
+            api4_pre_verified_zero_codes.extend(sorted(_zero_codes))
+            print(
+                f"⏭️ {len(_pre_verified_zero):,} 檔經官方確認「整段區間從未成交」，"
+                f"移出重試清單（跳過復原與序列重試）｜剩餘需重試 {len(failed_api4_warrants):,} 檔"
+            )
+
     for recovery_round in range(1, WARRANT_MONEYDJ_RANGE_API4_RECOVERY_ROUNDS + 1):
         if not failed_api4_warrants or _fast_tolerate:
             break
@@ -19480,6 +19597,19 @@ def _moneydj_range_events(
             for w in failed_api4_warrants
         )
     )
+    if not _skip_serial and failed_api4_warrants and not api4_fatal_warrants:
+        # 官方已逐日證明整段區間從未成交的權證，序列重試也只會再拿到 500。
+        _serial_pointless = [
+            w for w in failed_api4_warrants
+            if (api4_window_verdicts.get(str(w.get("warrant_code", "") or "")) or {}).get("shares", 1) == 0
+            and (api4_window_verdicts.get(str(w.get("warrant_code", "") or "")) or {}).get("amount", 1) == 0
+        ]
+        if len(_serial_pointless) == len(failed_api4_warrants):
+            _skip_serial = True
+            print(
+                f"⏭️ 剩餘 {len(failed_api4_warrants):,} 檔皆經官方逐日確認"
+                "「整段區間從未成交」，跳過序列復原"
+            )
     if _skip_serial:
         print(
             f"⏭️ 剩餘 {len(failed_api4_warrants):,} 檔皆在容忍額度內且官方確認"
@@ -19539,7 +19669,8 @@ def _moneydj_range_events(
     #    且總數 <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 時，才照常產圖並標記為不完整。
     # 3. 官方顯示有量、或無法核對（來源失敗／日期不符）、或超過額度 → 嚴格報錯。
     api4_failed_tolerated = []
-    api4_proven_zero_codes = []
+    # 復原重試前就已由官方確認「整段區間從未成交」而移出清單的權證。
+    api4_proven_zero_codes = list(api4_pre_verified_zero_codes)
     _fatal_codes = {str(w.get("warrant_code", "") or "") for w in api4_fatal_warrants}
     if failed_api4_warrants:
         _tolerable = [
@@ -19555,48 +19686,70 @@ def _moneydj_range_events(
         # 先用官方逐日成交量核對整段區間：從未成交過的權證跳過不會少算，
         # 這是可證明的，不受 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 數量上限限制。
         _proven_zero = []
-        if (
-            WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
-            and _tolerable
-            and not _blocking
-            and len(_tolerable) <= WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
-        ):
-            print(
-                f"🔍 官方逐日核對整段區間成交量：{len(_tolerable):,} 檔｜"
-                f"{start_ts.date()} ~ {report_last_day.date()}｜"
-                f"時間預算 {WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC:.0f} 秒"
-            )
-            _TWSE_SECURITY_DAILY_DEADLINE[0] = (
-                time.monotonic() + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC
-            )
+        if WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE and _tolerable and not _blocking:
+            # 判決在復原重試之前就算好了（api4_window_verdicts），這裡只做分類；
+            # 月資料有記憶體與磁碟快取，補算漏網的也很便宜。
             _still_tolerable = []
-            _window_has_volume = []
+            _minor_traded = []
+            _major_traded = []
+            _minor_amount = 0.0
             for _w in _tolerable:
                 _code = str(_w.get("warrant_code", "") or "")
-                _verdict = _official_confirms_zero_over_window(
-                    _code, start_ts, report_last_day
-                )
-                if _verdict is True:
-                    _proven_zero.append(_w)
-                elif _verdict is False:
-                    _window_has_volume.append(_w)
-                else:
-                    _still_tolerable.append(_w)
-            if _window_has_volume:
-                # 官方顯示區間內有成交，但 MoneyDJ 拿不到分點 → 真的會少算，不可放行。
-                _blocking.extend(_window_has_volume)
-                print(
-                    f"⛔ {len(_window_has_volume):,} 檔官方顯示區間內有成交但 MoneyDJ 無資料，"
-                    f"必定少算，將嚴格報錯｜代號="
-                    + "、".join(
-                        sorted(str(w.get("warrant_code", "") or "") for w in _window_has_volume)
+                if _code not in api4_window_verdicts:
+                    api4_window_verdicts[_code] = _official_window_trade_summary(
+                        _code, start_ts, report_last_day
                     )
+                _summary = api4_window_verdicts.get(_code)
+                if _summary is None:
+                    _still_tolerable.append(_w)
+                elif _summary["amount"] <= 0 and _summary["shares"] <= 0:
+                    _proven_zero.append(_w)
+                else:
+                    _minor_traded.append((_w, _summary))
+
+            # 有成交的部分依「合計官方成交金額」判斷重要性：小到不影響任何顯示數字
+            # 就放行並標記為不完整；否則一律嚴格報錯。
+            _minor_traded.sort(key=lambda item: item[1]["amount"], reverse=True)
+            _total_missing = sum(s["amount"] for _, s in _minor_traded)
+            if _minor_traded and _total_missing > WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:
+                _major_traded = [w for w, _ in _minor_traded]
+                _minor_traded = []
+            else:
+                _minor_amount = _total_missing
+
+            if _major_traded:
+                _blocking.extend(_major_traded)
+                print(
+                    f"⛔ 官方顯示區間內有成交但 MoneyDJ 無分點資料，合計 "
+                    f"{_total_missing:,.0f} 元，超過可容忍的 "
+                    f"{WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:,.0f} 元，將嚴格報錯"
                 )
+                for _w in _major_traded:
+                    _code = str(_w.get("warrant_code", "") or "")
+                    _s = api4_window_verdicts.get(_code) or {}
+                    print(
+                        f"   - {_code}｜官方成交 {_s.get('amount', 0):,.0f} 元／"
+                        f"{_s.get('shares', 0):,.0f} 股｜"
+                        f"{len(_s.get('days', []))} 個交易日"
+                    )
             if _proven_zero:
                 print(
                     f"✅ 官方確認整段區間從未成交：{len(_proven_zero):,} 檔｜"
                     "跳過不影響任何數字，不計入容忍額度"
                 )
+            if _minor_traded:
+                print(
+                    f"⚠️ MoneyDJ 無分點資料但官方顯示有少量成交：{len(_minor_traded):,} 檔｜"
+                    f"合計 {_minor_amount:,.0f} 元，在可容忍的 "
+                    f"{WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:,.0f} 元內：照常產圖，"
+                    "但標記為不完整快照"
+                )
+                for _w, _s in _minor_traded:
+                    _days = "、".join(d.strftime("%m/%d") for d in _s.get("days", [])[:6])
+                    print(
+                        f"   - {str(_w.get('warrant_code', '') or '')}｜"
+                        f"{_s['amount']:,.0f} 元／{_s['shares']:,.0f} 股｜日期 {_days}"
+                    )
             if _still_tolerable:
                 print(
                     f"❓ 官方逐日核對無法完成：{len(_still_tolerable):,} 檔"
@@ -19605,7 +19758,8 @@ def _moneydj_range_events(
                         sorted(str(w.get("warrant_code", "") or "") for w in _still_tolerable)
                     )
                 )
-            _tolerable = _still_tolerable
+            # 少量成交的仍視為「本次不完整」，走原本的容忍額度與不完整標記。
+            _tolerable = _still_tolerable + [w for w, _ in _minor_traded]
         elif (
             WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
             and len(_tolerable) > WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
@@ -19617,7 +19771,8 @@ def _moneydj_range_events(
             )
 
         api4_proven_zero_codes = sorted(
-            str(w.get("warrant_code", "") or "") for w in _proven_zero
+            set(api4_pre_verified_zero_codes)
+            | {str(w.get("warrant_code", "") or "") for w in _proven_zero}
         )
 
         if _blocking:
