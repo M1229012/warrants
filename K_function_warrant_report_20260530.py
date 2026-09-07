@@ -270,6 +270,12 @@ WARRANT_MONEYDJ_RANGE_API5_NONSELECTED_MIN_ROWS = max(
 WARRANT_SELECTED_FIFO_PRELOAD_ENABLE = os.getenv(
     "WARRANT_SELECTED_FIFO_PRELOAD_ENABLE", "0"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+# 精選分點快取的鮮度期限（秒）。API4 不會列出精選分點的小額交易，所以它的
+# 「已查到最後交易日」只能代表「當時」；盤後補齊或更正的資料需要重查才拿得到。
+# 設 0 代表每次都重查最新交易日（最保守，也最耗請求）。
+WARRANT_SELECTED_PAIR_REFRESH_TTL_SEC = max(
+    0.0, float(os.getenv("WARRANT_SELECTED_PAIR_REFRESH_TTL_SEC", "7200"))
+)
 # MoneyDJ API5 是整支程式最主要的網路成本。已結束交易日的分點明細不會再變，
 # 因此落盤快取並只重查最近幾個交易日；快取缺一個 API4 已觀測到的日期就會自動
 # 回源，不允許快取造成少算。
@@ -4894,7 +4900,11 @@ def _news_points_cache_task() -> str:
     safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", str(NEWS_SUMMARY_STYLE_VERSION or "v15_arabic_digits_news"))
     # 內部版本固定加在任務鍵後面，避免 Actions 環境變數仍停在舊版時，
     # 繼續讀到先前 0 點或壞格式的新聞快取。
-    internal_version = "validated_v32_rich_local_grounding_two_call"
+    # v33：新增「單位／幣別、指標、期間、增減方向」逐來源驗證。舊快取是在那些
+    # 檢查存在之前寫入的，命中就會整個繞過新驗證，所以必須升版讓它失效。
+    # v34：驗證規則再次改變（候選主張需同時滿足幣別／指標／期間／方向，
+    # 且數量級與計量單位分開），舊快取是在舊規則下寫入的，必須失效重驗。
+    internal_version = "validated_v34_whole_claim_source_binding"
     return f"news_points_{safe_version}_{internal_version}"
 
 # 只用真正抓到的新聞內文產生摘要；不要把 RSS 標題或導流摘要直接當成重點。
@@ -8992,6 +9002,87 @@ _NEWS_PERIOD_TOKENS = (
     "全年", "上半年", "下半年", "單月", "累計",
     "第一季", "第二季", "第三季", "第四季", "q1", "q2", "q3", "q4",
 )
+# 期間同義群組：同一群裡的寫法指的是同一個期間，不可因為用字不同就判定不符。
+_NEWS_PERIOD_GROUPS = {
+    "年比": ("年增", "年減", "年增率", "年減率", "yoy", "較去年同期", "去年同期"),
+    "月比": ("月增", "月減", "月增率", "月減率", "mom", "較上月", "上月"),
+    "季比": ("季增", "季減", "季增率", "季減率", "qoq", "較上季", "上季"),
+    "全年": ("全年", "整年"),
+    "上半年": ("上半年", "h1"),
+    "下半年": ("下半年", "h2"),
+    "單月": ("單月",),
+    "累計": ("累計",),
+    "第一季": ("第一季", "q1"),
+    "第二季": ("第二季", "q2"),
+    "第三季": ("第三季", "q3"),
+    "第四季": ("第四季", "q4"),
+}
+# 幣別：綁進單位一起比，避免「5 億美元」被當成支持「5 億元」。
+_NEWS_CURRENCY_ALIASES = {
+    "美元": ("美元", "美金", "usd", "us$"),
+    "人民幣": ("人民幣", "rmb", "cny"),
+    "日圓": ("日圓", "日元", "jpy"),
+    "歐元": ("歐元", "eur"),
+    "港幣": ("港幣", "hkd"),
+}
+
+
+def _news_period_groups(text: str) -> List[str]:
+    """回傳這段文字命中的期間群組名稱。"""
+    lowered = str(text or "").lower()
+    return [
+        name for name, aliases in _NEWS_PERIOD_GROUPS.items()
+        if any(alias in lowered for alias in aliases)
+    ]
+
+
+# 只有金額類單位需要比對幣別；%、倍、萬片這種不受同句美元金額影響。
+_NEWS_MONETARY_UNITS = {"兆", "億", "百萬", "萬", "千", "元"}
+# 子句切分：中文新聞常在同一句裡用逗號並列兩個指標
+# （「營收年增10%，獲利年減20%。」），只比對整句會讓指標互相掩護。
+# 逗號後面接數字時不切（避免破壞千分位），其餘的、；，都切。
+_NEWS_CLAUSE_SPLIT_RE = re.compile(r"[，,；;、](?!\d)")
+
+
+# 計量單位（片、座、家…）。「50萬片」的 50萬 是數量級，不是金額，
+# 不可以因為同一句出現美元金額就被判幣別不符。
+_NEWS_COUNTING_UNIT_RE = re.compile(
+    r"^\s*(片|座|家|台|顆|噸|人|個|支|檔|輛|架|艘|件|組|條|張|股|席|廠|條線)"
+)
+
+
+def _news_counting_unit_at(text: str, pos: int) -> str:
+    """數字＋數量級後面緊接的計量單位；沒有就回空字串。
+
+    必須保存實際單位（片／台／座…），只記布林值會讓「50萬片」與「50萬台」、
+    甚至「50萬元」互相通過。
+    """
+    matched = _NEWS_COUNTING_UNIT_RE.match(str(text or "")[pos:])
+    return matched.group(1) if matched else ""
+
+
+def _news_clauses_of(sentence: str) -> List[str]:
+    """把一個句子切成子句；只有一個子句時就回整句。"""
+    text = str(sentence or "")
+    clauses = [c for c in _NEWS_CLAUSE_SPLIT_RE.split(text) if c.strip()]
+    return clauses if len(clauses) > 1 else [text]
+
+
+def _news_clause_around(sentence: str, token: str, unit: str) -> str:
+    """回傳句子中第一個包含這個「數字＋單位」的子句（僅供測試與相容用）。"""
+    for clause in _news_clauses_of(sentence):
+        if (token, unit) in _extract_number_unit_pairs(clause):
+            return clause
+    return str(sentence or "")
+
+
+def _news_currency_in_text(text: str) -> str:
+    """辨識文字中的外幣別；沒寫就是新台幣（回空字串）。"""
+    lowered = str(text or "").lower()
+    for name, aliases in _NEWS_CURRENCY_ALIASES.items():
+        if any(alias in lowered for alias in aliases):
+            return name
+    return ""
 # 指標／期間／方向比對可能因為新聞寫法差異誤判；真的誤殺太多時可用環境變數關掉，
 # 關掉之後仍保有「數字必須出現在素材」與「數字＋單位必須對得上來源」兩層檢查。
 NEWS_NUMBER_CLAIM_CHECK_ENABLE = os.getenv(
@@ -9019,11 +9110,14 @@ def _news_claim_sentence_windows(article_text: str) -> List[str]:
     ]
     if not sentences:
         return []
-    windows = []
-    for idx in range(len(sentences)):
+    # 回傳 (單句, 前後各一句的視窗)。指標／方向／期間優先只看「數字所在的那一句」，
+    # 否則來源寫「營收年增10%。獲利年減20%。」時，視窗會同時含有「營收」和「20%」，
+    # 摘要寫成「營收年增20%」就會被誤判為通過。
+    out = []
+    for idx, sentence in enumerate(sentences):
         chunk = sentences[max(0, idx - 1): idx + 2]
-        windows.append("。".join(chunk).lower())
-    return windows
+        out.append((sentence.lower(), "。".join(chunk).lower()))
+    return out
 
 
 def _find_news_number_claim_problems(point_text: str, article_text: str) -> List[str]:
@@ -9042,7 +9136,37 @@ def _find_news_number_claim_problems(point_text: str, article_text: str) -> List
     if not point_norm or not windows:
         return []
 
-    window_pairs = [(w, _extract_number_unit_pairs(w)) for w in windows]
+    # 來源端：把每一個「數字＋單位」的出現位置各自展開成一個候選主張，
+    # 記下它所在的子句、所屬句子的前後文視窗，以及後面是不是接計量單位。
+    # 同一句出現兩個 10% 時，兩個位置是兩個獨立候選，不會互相頂替。
+    source_claims = {}
+    for sentence, window in windows:
+        for clause in _news_clauses_of(sentence):
+            for m in _GROUNDED_NUMBER_UNIT_RE.finditer(clause):
+                tok = _canonical_grounded_number_token(m.group(1))
+                uni = _canonical_number_unit(m.group(2) or "")
+                if not tok or not uni:
+                    continue
+                source_claims.setdefault((tok, uni), []).append({
+                    "clause": clause,
+                    "window": window,
+                    "counter": _news_counting_unit_at(clause, m.end()),
+                })
+
+    def _metrics(text):
+        return [
+            name for name, aliases in _NEWS_METRIC_ALIASES.items()
+            if any(alias in text for alias in aliases)
+        ]
+
+    def _directions(text):
+        out = []
+        if any(t in text for t in _NEWS_DIRECTION_UP_TOKENS):
+            out.append("增")
+        if any(t in text for t in _NEWS_DIRECTION_DOWN_TOKENS):
+            out.append("減")
+        return out
+
     problems = []
     seen = set()
     for match in _GROUNDED_NUMBER_UNIT_RE.finditer(point_norm):
@@ -9050,63 +9174,88 @@ def _find_news_number_claim_problems(point_text: str, article_text: str) -> List
         unit = _canonical_number_unit(match.group(2) or "")
         if not token or not unit:
             continue
-        candidates = [w for w, pairs in window_pairs if (token, unit) in pairs]
+        candidates = source_claims.get((token, unit)) or []
         if not candidates:
             # 數字本身就對不上來源，交給既有的接地檢查處理，這裡不重複回報。
             continue
 
         ctx = _news_claim_context_window(point_norm, match.start(), match.end())
         label = f"{token}{unit}"
+        point_counter = _news_counting_unit_at(point_norm, match.end())
+        # 幣別只對「金額」有意義：50 萬片的「萬」是數量級不是金額，
+        # 不該因為同一子句出現美元金額而被判幣別不符。
+        is_money = unit in _NEWS_MONETARY_UNITS and not point_counter
+        want_currency = _news_currency_in_text(ctx) if is_money else None
+        want_metrics = _metrics(ctx)
+        want_directions = _directions(ctx)
+        want_periods = _news_period_groups(ctx)
 
-        metric_name = ""
-        metric_aliases = ()
-        for name, aliases in _NEWS_METRIC_ALIASES.items():
-            if any(alias in ctx for alias in aliases):
-                metric_name, metric_aliases = name, aliases
-                break
-        if metric_name and not any(
-            alias in candidate for candidate in candidates for alias in metric_aliases
+        def _supports(candidate) -> bool:
+            """同一個候選必須同時支持幣別、指標、期間、方向，才算得到來源支持。
+
+            某一類資訊在子句裡完全沒出現時，才退一步看該句的前後文視窗；
+            不是每個條件各自去挑對自己有利的候選。
+            """
+            clause, window = candidate["clause"], candidate["window"]
+            # 計量單位必須真的一致：來源「50萬片」不能支持摘要「50萬元」或「50萬台」。
+            # 數量與金額不一致時直接拒絕。
+            if candidate["counter"] != point_counter:
+                return False
+            if want_currency is not None:
+                if _news_currency_in_text(clause) != want_currency:
+                    return False
+            for wanted, extract in (
+                (want_metrics, _metrics),
+                (want_directions, _directions),
+                (want_periods, _news_period_groups),
+            ):
+                if not wanted:
+                    continue
+                found = extract(clause) or extract(window)
+                if found and not (set(wanted) & set(found)):
+                    return False
+            return True
+
+        if any(_supports(c) for c in candidates):
+            continue
+
+        # 找不到任何一個候選同時支持全部條件 → 指出最具體的那一項。
+        if not any(c["counter"] == point_counter for c in candidates):
+            _src_counter = candidates[0]["counter"]
+            reason = (
+                f"{label}{point_counter or '（金額）'} 的計量單位與來源不符"
+                f"（來源為{_src_counter or '金額'}）"
+            )
+        elif want_currency is not None and not any(
+            _news_currency_in_text(c["clause"]) == want_currency
+            for c in candidates
+            if not c["counter"]
         ):
-            key = (label, "metric")
-            if key not in seen:
-                seen.add(key)
-                problems.append(f"{label} 在來源中並非「{metric_name}」的數字")
+            src = _news_currency_in_text(candidates[0]["clause"]) or "新台幣"
+            reason = f"{label} 的幣別與來源不符（來源為{src}）"
+        elif want_metrics and not any(
+            set(want_metrics) & set(_metrics(c["clause"]) or _metrics(c["window"]))
+            for c in candidates
+        ):
+            reason = f"{label} 在來源中並非「{want_metrics[0]}」的數字"
+        elif want_directions and not any(
+            set(want_directions)
+            & set(_directions(c["clause"]) or _directions(c["window"]))
+            for c in candidates
+        ):
+            reason = (
+                f"{label} 的增減方向與來源相反"
+                f"（來源為{'減少' if want_directions[0] == '增' else '增加'}）"
+            )
+        elif want_periods:
+            reason = f"{label} 的期間與來源不符（重點寫「{want_periods[0]}」）"
+        else:
+            reason = f"{label} 的敘述在來源中找不到一致的依據"
 
-        ctx_up = any(tok in ctx for tok in _NEWS_DIRECTION_UP_TOKENS)
-        ctx_down = any(tok in ctx for tok in _NEWS_DIRECTION_DOWN_TOKENS)
-        if ctx_up != ctx_down:
-            want = _NEWS_DIRECTION_UP_TOKENS if ctx_up else _NEWS_DIRECTION_DOWN_TOKENS
-            other = _NEWS_DIRECTION_DOWN_TOKENS if ctx_up else _NEWS_DIRECTION_UP_TOKENS
-            supported = any(
-                any(tok in candidate for tok in want) for candidate in candidates
-            )
-            opposed = any(
-                any(tok in candidate for tok in other) for candidate in candidates
-            )
-            if opposed and not supported:
-                key = (label, "direction")
-                if key not in seen:
-                    seen.add(key)
-                    problems.append(
-                        f"{label} 的增減方向與來源相反（來源為{'減少' if ctx_up else '增加'}）"
-                    )
-
-        ctx_periods = [tok for tok in _NEWS_PERIOD_TOKENS if tok in ctx]
-        if ctx_periods:
-            supported = any(
-                any(tok in candidate for tok in ctx_periods) for candidate in candidates
-            )
-            has_other_period = any(
-                any(tok in candidate for tok in _NEWS_PERIOD_TOKENS)
-                for candidate in candidates
-            )
-            if has_other_period and not supported:
-                key = (label, "period")
-                if key not in seen:
-                    seen.add(key)
-                    problems.append(
-                        f"{label} 的期間與來源不符（重點寫「{ctx_periods[0]}」）"
-                    )
+        key = (label, reason)
+        if key not in seen:
+            seen.add(key)
+            problems.append(reason)
     return problems
 
 
@@ -9130,12 +9279,25 @@ def _find_ungrounded_number_tokens(
     for idx, point in enumerate(points or []):
         point_text = str(point or "")
         missing = []
-        for token in _extract_grounded_number_tokens(point_text):
-            if token not in allowed and token not in missing:
-                missing.append(token)
-
         source_entry = _lookup_news_point_source_entry(point_text)
         scoped_pairs = (source_entry or {}).get("pairs") or global_pairs
+        # 知道這一點的來源文章時，裸數字也要用該來源比對，否則「A 篇的 EPS 3 元」
+        # 會被「B 篇的 50 萬片」放行成「EPS 50」。
+        # 四位數整數多半是股票代號（2330 之類），來源文章不一定會寫，予以豁免。
+        scoped_bare = {num for num, _unit in scoped_pairs} if source_entry else None
+        # 括號裡的四位數是股票代號（例如「台積電(2330)」），是排版加上去的，
+        # 來源文章不一定會寫，不能當成沒有依據的數字。
+        exempt_tokens = {
+            _canonical_grounded_number_token(m)
+            for m in re.findall(r"[（(]\s*(\d{4})\s*[)）]", point_text)
+        }
+        for token in _extract_grounded_number_tokens(point_text):
+            if token in missing or token in exempt_tokens:
+                continue
+            if token not in allowed:
+                missing.append(token)
+            elif scoped_bare is not None and token not in scoped_bare:
+                missing.append(token)
         for token, unit in sorted(_extract_number_unit_pairs(point_text)):
             if not unit or token in missing:
                 continue
@@ -10110,6 +10272,36 @@ def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 40)
     height = float(bins[1] - bins[0])
     profile = np.zeros(n_bins, dtype=float)
 
+    bin_low, bin_high = bins[:-1], bins[1:]
+
+    def _allocate_volume(start: float, end: float, amount: float) -> None:
+        """把一段價格區間的成交量分配到各個 bin。
+
+        原本的做法是「找出落在區間內的 bin 中心，平均分配」，有兩個漏洞：
+        1. 十字線（開盤＝收盤）實體寬度為 0，直接被 `continue` 跳過——
+           那根 K 棒 60% 的成交量整個消失。
+        2. 實體很窄但區間內沒有任何 bin 中心時，同樣分配不到，成交量也消失。
+        改成依「bin 邊界與區間的重疊長度」分配；區間退化成單一價位時，
+        整份配給該價位所在的 bin。這樣所有情況的分配總量都等於輸入量。
+        """
+        if amount <= 0:
+            return
+        if end < start:
+            start, end = end, start
+        if end - start < 1e-9:
+            idx = int(np.clip(np.searchsorted(bins, start, side="right") - 1, 0, n_bins - 1))
+            profile[idx] += amount
+            return
+        overlap = np.clip(
+            np.minimum(bin_high, end) - np.maximum(bin_low, start), 0.0, None
+        )
+        total_overlap = float(overlap.sum())
+        if total_overlap <= 0:
+            idx = int(np.clip(np.searchsorted(bins, start, side="right") - 1, 0, n_bins - 1))
+            profile[idx] += amount
+            return
+        profile[:] = profile + amount * overlap / total_overlap
+
     for _, row in work.iterrows():
         vol = float(row["Volume"])
         low = float(row["Low"])
@@ -10117,13 +10309,10 @@ def _calculate_weighted_volume_profile_stats(df: pd.DataFrame, n_bins: int = 40)
         open_ = float(row["Open"])
         close = float(row["Close"])
         body_min, body_max = min(open_, close), max(open_, close)
+        # 權重合計為 1.0，所以分配完的總量必定等於這根 K 棒的成交量。
         ranges = [((low, body_min), 0.2), ((body_min, body_max), 0.6), ((body_max, high), 0.2)]
         for (start, end), weight in ranges:
-            if end - start < 1e-6:
-                continue
-            idxs = np.where((centers >= start) & (centers <= end))[0]
-            if len(idxs):
-                profile[idxs] += vol * weight / len(idxs)
+            _allocate_volume(start, end, vol * weight)
 
     if len(profile) == 0 or float(profile.max()) <= 0:
         return {}
@@ -18766,6 +18955,12 @@ def _load_moneydj_event_cache(stock_code: str) -> tuple[pd.DataFrame, set, pd.Da
             empty = pd.DataFrame()
             empty.attrs["_moneydj_cache_covered_dates"] = covered_dates
             empty.attrs["_moneydj_cache_preloaded_pairs"] = set(meta.get("preloaded_pairs", []) or [])
+            empty.attrs["_moneydj_cache_verified_missing"] = dict(
+                meta.get("verified_missing", {}) or {}
+            )
+            empty.attrs["_moneydj_cache_pair_queried_through"] = dict(
+                meta.get("pair_queried_through", {}) or {}
+            )
             return empty, set(meta.get("empty_pairs", []) or []), preloads
         events = _fill_warrant_event_missing_values(events)
         events["Date"] = pd.to_datetime(events["Date"], errors="coerce").dt.normalize()
@@ -18774,11 +18969,44 @@ def _load_moneydj_event_cache(stock_code: str) -> tuple[pd.DataFrame, set, pd.Da
         events = events.dropna(subset=["Date"])
         events.attrs["_moneydj_cache_covered_dates"] = covered_dates
         events.attrs["_moneydj_cache_preloaded_pairs"] = set(meta.get("preloaded_pairs", []) or [])
+        # 已知的永久缺口必須讀回來，否則下一輪只查近期、那幾檔近期回空又不報錯時，
+        # 缺口會被當成「已完整覆蓋」而悄悄消失。
+        events.attrs["_moneydj_cache_verified_missing"] = dict(
+            meta.get("verified_missing", {}) or {}
+        )
+        events.attrs["_moneydj_cache_pair_queried_through"] = dict(
+            meta.get("pair_queried_through", {}) or {}
+        )
         print(f"⚡ MoneyDJ API5 歷史快取命中：{stock_code}｜{len(events):,} 筆")
         return events, set(str(x) for x in (meta.get("empty_pairs", []) or [])), preloads
     except Exception as exc:
         print(f"⚠️ MoneyDJ API5 歷史快取讀取失敗，改為完整回源：{stock_code}｜{exc}")
         return pd.DataFrame(), set(), pd.DataFrame()
+
+
+def _serialize_pair_queried_through(pair_queried_through: dict | None) -> dict:
+    """把每個 pair 的驗證進度寫成可存檔格式。
+
+    值可能是舊格式（純日期）或新格式（{"through": 日期, "fetched_at": epoch 秒}）；
+    一律輸出新格式，讀取端兩種都能吃。
+    """
+    out = {}
+    for key, value in (pair_queried_through or {}).items():
+        if isinstance(value, dict):
+            through, fetched_at = value.get("through"), value.get("fetched_at")
+        else:
+            through, fetched_at = value, None
+        parsed = pd.to_datetime(through, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        entry = {"through": pd.Timestamp(parsed).strftime("%Y-%m-%d")}
+        try:
+            if fetched_at is not None:
+                entry["fetched_at"] = float(fetched_at)
+        except Exception:
+            pass
+        out[str(key)] = entry
+    return out
 
 
 def _save_moneydj_event_cache(
@@ -18788,6 +19016,8 @@ def _save_moneydj_event_cache(
     covered_trading_dates: list | None = None,
     preloads: pd.DataFrame | None = None,
     preloaded_pairs: set | None = None,
+    verified_missing: dict | None = None,
+    pair_queried_through: dict | None = None,
 ) -> None:
     """原子寫入 API5 歷史事件快取；僅由完整成功的主流程呼叫。"""
     if not MONEYDJ_EVENT_CACHE_ENABLE or events is None:
@@ -18826,6 +19056,14 @@ def _save_moneydj_event_cache(
                         pd.Timestamp(day).normalize().strftime("%Y-%m-%d")
                         for day in (covered_trading_dates or [])
                     ],
+                    # MoneyDJ 永久拿不到、但官方已量化的缺口；覆蓋日照常記錄，
+                    # 缺了什麼在這裡留底，不會因為快取可用就被忘記。
+                    "verified_missing": verified_missing or {},
+                    # 每個 pair 已被 API5 驗證到哪一天；空結果同樣要記，
+                    # 否則「查過是空的」會被永遠當成「以後也沒有交易」。
+                    "pair_queried_through": _serialize_pair_queried_through(
+                        pair_queried_through
+                    ),
                 }, cache_file, ensure_ascii=False)
             os.replace(data_tmp, data_path)
             os.replace(preload_tmp, preload_path)
@@ -19008,9 +19246,21 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
         # 核對階段已超過時間預算：回 None（無法核對），交給原本的容忍規則決定。
         return None
 
+    def _remaining() -> float:
+        """還剩多少預算；沒有設定期限時視為無限。"""
+        if _TWSE_SECURITY_DAILY_DEADLINE[0] is None:
+            return float("inf")
+        return _TWSE_SECURITY_DAILY_DEADLINE[0] - time.monotonic()
+
     payload = None
     last_error = ""
     for attempt in range(1 + len(WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS)):
+        # 每一次限速等待、送出請求、退避之前都要重算剩餘時間，
+        # 否則 20/45/90 秒的退避會讓整體預算形同虛設。
+        if _remaining() <= 0:
+            print(f"⏱️ 官方核對時間預算用盡，{code}｜{month} 視為無法核對")
+            return None
+
         with _TWSE_SECURITY_DAILY_LOCK:
             wait = (
                 _TWSE_SECURITY_DAILY_LAST_CALL[0]
@@ -19018,15 +19268,19 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
                 - time.monotonic()
             )
             if wait > 0:
+                if wait >= _remaining():
+                    return None
                 time.sleep(wait)
             _TWSE_SECURITY_DAILY_LAST_CALL[0] = time.monotonic()
 
         throttled = False
         try:
+            # 連線／讀取 timeout 也不得超過剩餘預算。
+            budget = _remaining()
             response = get_thread_session().get(
                 TWSE_SECURITY_DAILY_URL.format(month=month, code=code),
                 headers=OPENAPI_WARRANT_HEADERS,
-                timeout=(8.0, 30.0),
+                timeout=(min(8.0, budget), min(30.0, budget)),
             )
             if response.status_code in (429, 503):
                 throttled = True
@@ -19047,6 +19301,13 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
         if attempt >= len(WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS):
             break
         backoff = WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BACKOFFS[attempt]
+        if backoff >= _remaining():
+            # 退避會超出剩餘預算 → 不值得再等，直接回「無法核對」。
+            print(
+                f"⏱️ 官方核對剩餘時間不足以退避 {backoff:.0f} 秒，"
+                f"{code}｜{month} 視為無法核對"
+            )
+            return None
         if throttled:
             with _TWSE_SECURITY_DAILY_LOCK:
                 _TWSE_SECURITY_DAILY_INTERVAL[0] = min(
@@ -19095,13 +19356,23 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
             day = pd.Timestamp(
                 year=int(parts[0]) + 1911, month=int(parts[1]), day=int(parts[2])
             )
-            shares = float(str(row[1]).replace(",", "").strip() or 0)
-            amount = (
-                float(str(row[2]).replace(",", "").strip() or 0)
-                if len(row) > 2 else 0.0
-            )
         except Exception:
             continue
+        # 每個欄位獨立解析。證交所會用 "--" 之類的字樣填欄位，若把成交股數與
+        # 成交金額放在同一個 try，金額解析失敗就會整列被丟掉——那一天的成交量
+        # 也跟著消失，最後被誤判成「整段區間從未成交」而安全跳過。
+        # 解析不出來一律給 NaN（代表「不知道」），絕不能當成 0。
+        def _parse_cell(value):
+            text = str(value if value is not None else "").replace(",", "").strip()
+            if not text:
+                return 0.0
+            try:
+                return float(text)
+            except Exception:
+                return float("nan")
+
+        shares = _parse_cell(row[1])
+        amount = _parse_cell(row[2]) if len(row) > 2 else float("nan")
         rows.append((day.normalize(), shares, amount))
 
     with _TWSE_SECURITY_DAILY_LOCK:
@@ -19180,6 +19451,7 @@ def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=N
     total_amount = 0.0
     traded_days = []
     in_window_rows = 0
+    amount_incomplete = False
     for month in months:
         rows = _twse_security_month_rows(code, month)
         if rows is None:
@@ -19188,13 +19460,28 @@ def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=N
             if not (start_ts <= day <= end_ts):
                 continue
             in_window_rows += 1
-            total_shares += float(shares or 0)
-            total_amount += float(amount or 0)
-            if shares > 0:
+            if pd.isna(shares):
+                # 連成交股數都讀不出來 → 完全無法判斷這一天有沒有交易，
+                # 整檔視為「無法核對」，交給嚴格規則處理。
+                return None
+            total_shares += float(shares)
+            if pd.isna(amount):
+                # 金額讀不出來：仍知道有沒有成交，但金額會少算，
+                # 不能拿來跟「可容忍缺口金額」比大小。
+                if float(shares) > 0:
+                    amount_incomplete = True
+            else:
+                total_amount += float(amount)
+            if float(shares) > 0:
                 traded_days.append(day)
     if in_window_rows <= 0:
         return None
-    return {"shares": total_shares, "amount": total_amount, "days": traded_days}
+    return {
+        "shares": total_shares,
+        "amount": total_amount,
+        "days": traded_days,
+        "amount_incomplete": amount_incomplete,
+    }
 
 
 def _moneydj_range_events(
@@ -19270,6 +19557,29 @@ def _moneydj_range_events(
     refresh_days = set(days[-MONEYDJ_EVENT_CACHE_REFRESH_TRADING_DAYS:])
     historical_days = set(days) - refresh_days
     cached_covered_days = set(cached_events.attrs.get("_moneydj_cache_covered_dates", set()) or set())
+    cached_verified_missing = dict(
+        cached_events.attrs.get("_moneydj_cache_verified_missing", {}) or {}
+    )
+    # 每個 (權證, 分點) 已經被 API5 驗證到哪一天。空結果也要記，否則「曾經查過是空的」
+    # 會被永久當成「以後也不會有交易」。
+    cached_pair_queried_through = {}
+    cached_pair_fetched_at = {}
+    for _key, _value in (
+        cached_events.attrs.get("_moneydj_cache_pair_queried_through", {}) or {}
+    ).items():
+        # 舊格式是純日期字串；新格式是 {"through": 日期, "fetched_at": epoch 秒}。
+        if isinstance(_value, dict):
+            _through, _fetched = _value.get("through"), _value.get("fetched_at")
+        else:
+            _through, _fetched = _value, None
+        _parsed = pd.to_datetime(_through, errors="coerce")
+        if pd.notna(_parsed):
+            cached_pair_queried_through[str(_key)] = pd.Timestamp(_parsed).normalize()
+        try:
+            if _fetched is not None:
+                cached_pair_fetched_at[str(_key)] = float(_fetched)
+        except Exception:
+            pass
     cached_preloaded_pairs = set(cached_events.attrs.get("_moneydj_cache_preloaded_pairs", set()) or set())
     reuse_historical_cache = bool(historical_days) and historical_days.issubset(cached_covered_days)
     api4_start_ts = min(refresh_days) if reuse_historical_cache and refresh_days else start_ts
@@ -19379,12 +19689,22 @@ def _moneydj_range_events(
     for _dset in api4_pair_dates.values():
         for _d in _dset:
             _day_counts[_d] = _day_counts.get(_d, 0) + 1
+    # 這個日期一開始是 days[-1]（要求日）的預設值。API4 完全沒有回任何日期時，
+    # 預設值會原封不動留下來——那只是「我們要求到這天」，不是「來源已經出到這天」。
+    # 空回應可能是真正零成交，也可能是尚未發布，不可混為一談，所以另外記錄
+    # 這個日期究竟是「實際觀測到的」還是「預設的」。
+    report_last_day_observed = False
     if _day_counts:
         _peak = max(_day_counts.values())
         _solid_days = [d for d, c in _day_counts.items() if c >= max(1, _peak * 0.2)]
         if _solid_days:
             report_last_day = max(_solid_days)
-    print(f"📅 MoneyDJ 報告最後交易日（有實際資料）：{report_last_day.date()}")
+            report_last_day_observed = True
+    print(
+        f"📅 MoneyDJ 報告最後交易日"
+        f"（{'有實際資料' if report_last_day_observed else '⚠️ 無任何 API4 日期，沿用要求日'}）："
+        f"{report_last_day.date()}"
+    )
 
     initial_api4_failed = len(failed_api4_warrants) + len(partial_api4_results)
 
@@ -19671,6 +19991,8 @@ def _moneydj_range_events(
     api4_failed_tolerated = []
     # 復原重試前就已由官方確認「整段區間從未成交」而移出清單的權證。
     api4_proven_zero_codes = list(api4_pre_verified_zero_codes)
+    api4_verified_missing = {}
+    api4_unverified_tolerated = []
     _fatal_codes = {str(w.get("warrant_code", "") or "") for w in api4_fatal_warrants}
     if failed_api4_warrants:
         _tolerable = [
@@ -19686,7 +20008,20 @@ def _moneydj_range_events(
         # 先用官方逐日成交量核對整段區間：從未成交過的權證跳過不會少算，
         # 這是可證明的，不受 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 數量上限限制。
         _proven_zero = []
-        if WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE and _tolerable and not _blocking:
+        if (
+            WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
+            and _tolerable
+            and not _blocking
+            # 這裡是第二個入口，數量上限必須和提前核對那一個一致，
+            # 否則大量失敗時會從這裡繞過去，逐檔核對到天荒地老。
+            and len(_tolerable) <= WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
+        ):
+            # deadline 是模組層全域狀態；多檔報告連續執行時，若沿用上一檔已經
+            # 過期的值，這一檔會一進來就被判定「預算用盡」。每個核對階段都要
+            # 重新設定自己的期限，不能只在 None 時初始化。
+            _TWSE_SECURITY_DAILY_DEADLINE[0] = (
+                time.monotonic() + WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC
+            )
             # 判決在復原重試之前就算好了（api4_window_verdicts），這裡只做分類；
             # 月資料有記憶體與磁碟快取，補算漏網的也很便宜。
             _still_tolerable = []
@@ -19711,7 +20046,19 @@ def _moneydj_range_events(
             # 就放行並標記為不完整；否則一律嚴格報錯。
             _minor_traded.sort(key=lambda item: item[1]["amount"], reverse=True)
             _total_missing = sum(s["amount"] for _, s in _minor_traded)
-            if _minor_traded and _total_missing > WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:
+            _amount_unknown = any(
+                s.get("amount_incomplete") for _, s in _minor_traded
+            )
+            if _amount_unknown:
+                # 官方金額欄有讀不出來的值 → 缺口金額必定被低估，
+                # 不能拿來判斷「小到可以容忍」，一律嚴格報錯。
+                print(
+                    "⛔ 官方成交金額欄位有無法解析的值，缺口金額會被低估，"
+                    "不做重要性判斷，一律嚴格報錯"
+                )
+                _major_traded = [w for w, _ in _minor_traded]
+                _minor_traded = []
+            elif _minor_traded and _total_missing > WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:
                 _major_traded = [w for w, _ in _minor_traded]
                 _minor_traded = []
             else:
@@ -19760,15 +20107,37 @@ def _moneydj_range_events(
                 )
             # 少量成交的仍視為「本次不完整」，走原本的容忍額度與不完整標記。
             _tolerable = _still_tolerable + [w for w, _ in _minor_traded]
-        elif (
-            WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE
-            and len(_tolerable) > WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES
-        ):
-            print(
-                f"⏭️ 失敗 {len(_tolerable):,} 檔超過逐日核對上限 "
-                f"{WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES}，"
-                "視為 MoneyDJ 整體異常，不做逐檔核對"
-            )
+            # 區分兩種不完整：
+            #   已核對（知道少了哪幾檔、少多少、而且 MoneyDJ 是永久 500）→ 重跑也拿不到，
+            #     不該因此讓其他 1,257 檔的歷史覆蓋標記作廢。
+            #   無法核對（不知道少了什麼）→ 維持保守，讓下次重新驗證。
+            api4_verified_missing = {
+                str(w.get("warrant_code", "") or ""): api4_window_verdicts.get(
+                    str(w.get("warrant_code", "") or "")
+                )
+                for w, _ in _minor_traded
+            }
+            api4_unverified_tolerated = [
+                str(w.get("warrant_code", "") or "") for w in _still_tolerable
+            ]
+        elif _tolerable:
+            # 沒有做逐日核對（功能關閉或超過數量上限）：這些缺口屬於「不知道少了什麼」，
+            # 必須計入 api4_unverified_tolerated，否則下面會誤判成已完整覆蓋而寫入
+            # covered_trading_dates，把不確定的缺口變成永久的靜默漏抓。
+            api4_unverified_tolerated = [
+                str(w.get("warrant_code", "") or "") for w in _tolerable
+            ]
+            if not WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE:
+                print(
+                    f"⏭️ 官方逐日核對已停用，{len(_tolerable):,} 檔缺口維持「無法核對」，"
+                    "本次不寫入完整覆蓋標記"
+                )
+            else:
+                print(
+                    f"⏭️ 失敗 {len(_tolerable):,} 檔超過逐日核對上限 "
+                    f"{WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_MAX_CODES}，"
+                    "視為 MoneyDJ 整體異常，不做逐檔核對"
+                )
 
         api4_proven_zero_codes = sorted(
             set(api4_pre_verified_zero_codes)
@@ -19800,6 +20169,11 @@ def _moneydj_range_events(
                 f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED}（疑似 MoneyDJ 整體異常），將嚴格報錯"
             )
 
+    # 外層要靠這個判斷「來源是否已經出到要求日」，決定能不能寫完整快照。
+    stats["report_last_day"] = report_last_day.strftime("%Y-%m-%d")
+    # False 代表這個日期只是「要求日」的預設值，沒有任何實際觀測支持，
+    # 不可以拿來當「來源已發布到該日」的證據。
+    stats["report_last_day_observed"] = bool(report_last_day_observed)
     stats["api4_failed"] = len(failed_api4_warrants)
     stats["api4_fatal_codes"] = sorted(_fatal_codes)
     stats["api4_recovered"] = initial_api4_failed - len(failed_api4_warrants)
@@ -19824,6 +20198,23 @@ def _moneydj_range_events(
     }
     stats["api4_incomplete_but_continued"] = bool(
         api4_failed_tolerated or accepted_partial_codes
+    )
+    # 已量化的永久缺口：知道是哪幾檔、官方成交多少、而且 MoneyDJ 是永久 500，
+    # 重跑也拿不到。這種缺口不該讓其他上千檔權證的歷史覆蓋標記整批作廢。
+    stats["api4_verified_missing"] = {
+        code: {
+            "amount": float((summary or {}).get("amount", 0.0)),
+            "shares": float((summary or {}).get("shares", 0.0)),
+            "days": [
+                pd.Timestamp(d).strftime("%Y-%m-%d")
+                for d in (summary or {}).get("days", [])
+            ],
+        }
+        for code, summary in api4_verified_missing.items()
+    }
+    # 只有「不知道少了什麼」才需要讓下次重新驗證整段歷史。
+    stats["api4_cache_blocking_incomplete"] = bool(
+        accepted_partial_codes or api4_unverified_tolerated
     )
     if accepted_partial_codes:
         print(
@@ -20032,6 +20423,8 @@ def _moneydj_range_events(
     # 的所有日期。若同時又把歷史快取的同一批列加進來，最後 groupby(...).sum()
     # 會把同一筆交易加總兩次（買賣金額變兩倍），因此重查的 pair 一律以新資料取代舊資料。
     refetched_pair_keys = set()
+    # 判定可以重用的 pair：它們的快取列必須整段帶回，不能只帶前段。
+    reused_pair_keys = set()
     api5_cache_hits = 0
     for pair_key, pair in pairs.items():
         cache_key = _moneydj_event_pair_key(pair_key[0], pair_key[1])
@@ -20041,8 +20434,30 @@ def _moneydj_range_events(
         # 精選分點的 API5 回看資料另行快取；快取完整時 FIFO 期初庫存與每次
         # 回源計算相同，只有最新活動或尚未建快取的組合才重新查詢。
         # 其餘分點只要快取涵蓋 API4 所觀測到的每個已結束交易日即可直接重用。
+        # 精選分點的存在理由就是「API4 不會列出它的小額／零星交易」，所以絕對不能
+        # 用「API4 這次沒列到」或「上次查是空的」來決定不查。空結果只代表「查到那天
+        # 為止沒有交易」，不代表之後也沒有；必須看該 pair 已驗證到哪一天。
+        pair_verified_through = cached_pair_queried_through.get(cache_key)
+        # 「已查到 9/4」不等於「9/4 之後來源新增／更正的資料也拿到了」。
+        # 最後一個交易日的資料可能盤後才補齊，所以對最新一天另外套用鮮度期限：
+        # 抓取時間太舊就重查，正結果與空結果都適用。
+        pair_fetched_at = cached_pair_fetched_at.get(cache_key)
+        recent_fetch_is_fresh = bool(
+            pair_fetched_at is not None
+            and (time.time() - pair_fetched_at)
+            <= WARRANT_SELECTED_PAIR_REFRESH_TTL_SEC
+        )
+        selected_needs_refresh = bool(
+            is_selected_pair
+            and (
+                pair_verified_through is None
+                or pair_verified_through < report_last_day
+                or not recent_fetch_is_fresh
+            )
+        )
         needs_api5 = (
             bool(expected_dates & refresh_days)
+            or selected_needs_refresh
             or (
                 WARRANT_SELECTED_FIFO_PRELOAD_ENABLE
                 and is_selected_pair
@@ -20054,38 +20469,44 @@ def _moneydj_range_events(
         if needs_api5:
             api5_pairs.append(pair)
             refetched_pair_keys.add(cache_key)
-        elif expected_dates and cached_events is not None and not cached_events.empty:
-            # reuse_historical_cache 為真時，[start_ts, api4_start_ts) 這段已經由上面
-            # 的整批快取重用一次帶入 cached_event_frames；這裡只能補 api4_start_ts
-            # 之後（本次重查範圍）的日期，否則同一筆歷史交易會被塞進 cached_event_frames
-            # 兩次，經下面的 groupby(...).sum() 疊加成兩倍金額，且會被存回快取越滾越大。
-            reuse_dates = (
-                {d for d in expected_dates if d >= api4_start_ts}
-                if reuse_historical_cache
-                else expected_dates
-            )
-            if reuse_dates:
-                pair_frame = cached_frames_by_key.get(cache_key)
-                if pair_frame is not None and not pair_frame.empty:
-                    cached_event_frames.append(
-                        pair_frame.loc[pair_frame["Date"].isin(reuse_dates)].copy()
-                    )
+        else:
+            reused_pair_keys.add(cache_key)
             api5_cache_hits += 1
 
-    if reuse_historical_cache and cached_events is not None and not cached_events.empty:
-        # 只帶入「本次不會重查」的 pair 的歷史列；重查的 pair 由 API5 新資料完整覆蓋，
-        # 不再與舊值相加。
-        historical_mask = (
-            (cached_events["Date"] >= start_ts)
-            & (cached_events["Date"] < api4_start_ts)
-        )
-        if refetched_pair_keys and not cached_key_series.empty:
-            historical_mask = historical_mask & (~cached_key_series.isin(refetched_pair_keys))
-        historical_frame = cached_events.loc[historical_mask].copy()
-        if not historical_frame.empty:
-            cached_event_frames.append(historical_frame)
+    # 快取列的組回規則集中在這裡，每個 pair 只會走其中一條，所以每一筆事件
+    # 最多被加入一次（避免修回先前的雙倍加總），也不會有人被漏掉：
+    #   A. 重查的 pair        → 完全由 API5 新資料覆蓋，快取列一律不採用
+    #   B. 判定可重用的 pair  → 整個查詢區間的快取列全部帶回（含最近兩天！）
+    #   C. 本次 API4 沒發現的 pair → 只有在「API4 只查了近期」時，才用快取補
+    #      API4 沒覆蓋到的前段；後段 API4 已查過卻沒發現，代表真的沒有交易
+    if cached_events is not None and not cached_events.empty:
+        reused_rows = 0
+        for cache_key in reused_pair_keys:
+            pair_frame = cached_frames_by_key.get(cache_key)
+            if pair_frame is None or pair_frame.empty:
+                continue
+            part = pair_frame.loc[
+                (pair_frame["Date"] >= start_ts) & (pair_frame["Date"] <= end_ts)
+            ]
+            if not part.empty:
+                cached_event_frames.append(part.copy())
+                reused_rows += len(part)
+
+        historical_rows = 0
+        if reuse_historical_cache and not cached_key_series.empty:
+            historical_mask = (
+                (cached_events["Date"] >= start_ts)
+                & (cached_events["Date"] < api4_start_ts)
+                & (~cached_key_series.isin(refetched_pair_keys | reused_pair_keys))
+            )
+            historical_frame = cached_events.loc[historical_mask].copy()
+            if not historical_frame.empty:
+                cached_event_frames.append(historical_frame)
+                historical_rows = len(historical_frame)
+
         print(
-            f"🗂️ MoneyDJ 歷史快取重用：{len(historical_frame):,} 列｜"
+            f"🗂️ MoneyDJ 快取重用：可重用 pair={len(reused_pair_keys):,}（{reused_rows:,} 列）｜"
+            f"API4 未發現 pair 的前段={historical_rows:,} 列｜"
             f"重查取代 pair={len(refetched_pair_keys):,}"
         )
 
@@ -20150,9 +20571,28 @@ def _moneydj_range_events(
             api5_rows_by_key[cache_key] = list(rows or [])
             api5_preloads_by_key[cache_key] = list(pre_rows or [])
 
+    # 保留上一輪的完整驗證進度（日期 **與** 抓取時間），再用本輪實際查過的 pair 覆寫。
+    # 只複製日期會讓沒重查的 pair 丟掉 fetched_at，下一輪就因為「沒有抓取時間 →
+    # 視為過期」而白白多打一次 API5。
+    # 反過來也不能把重用項目的時間改成現在，否則 TTL 會被每次讀快取無限延長，
+    # 來源更新永遠抓不到。
+    pair_queried_through = {}
+    for _key, _through in cached_pair_queried_through.items():
+        _entry = {"through": _through}
+        _prev_fetched = cached_pair_fetched_at.get(_key)
+        if _prev_fetched is not None:
+            _entry["fetched_at"] = _prev_fetched
+        pair_queried_through[_key] = _entry
     event_rows = []
     for pair in api5_pairs:
         cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
+        if cache_key in api5_rows_by_key:
+            # 這一輪成功查過（不論有沒有交易），記錄「驗證到哪一天」與「什麼時候抓的」。
+            # 後者用來判斷最新交易日的資料是否已經過時。
+            pair_queried_through[cache_key] = {
+                "through": report_last_day,
+                "fetched_at": time.time(),
+            }
         rows = api5_rows_by_key.get(cache_key, [])
         event_rows.extend(rows)
         preload_rows.extend(api5_preloads_by_key.get(cache_key, []))
@@ -20221,6 +20661,19 @@ def _moneydj_range_events(
         events = events.sort_values(["Date", "net_amount"], ascending=[True, False]).reset_index(drop=True)
         events.attrs["_warrant_events_normalized"] = True
         stats["event_dates"] = int(events["Date"].nunique())
+        # 只印覆蓋比率看不出「少的是哪一天」；列出缺少的日期才能對照官方交易日
+        # 判斷是臨時休市、來源當天無成交，還是真的漏抓。
+        _missing_days = sorted(
+            set(pd.Timestamp(d).normalize() for d in days)
+            - set(pd.to_datetime(events["Date"]).dt.normalize())
+        )
+        stats["event_missing_dates"] = [d.strftime("%Y-%m-%d") for d in _missing_days]
+        if _missing_days:
+            print(
+                f"ℹ️ 這些官方交易日沒有任何權證分點事件（{len(_missing_days)} 天）："
+                + "、".join(d.strftime("%m/%d") for d in _missing_days[:15])
+                + (" …" if len(_missing_days) > 15 else "")
+            )
 
     # 只有 API4/API5 全部成功後才更新；失敗時保留舊快取，下一次會重新驗證缺口。
     if WARRANT_SELECTED_FIFO_PRELOAD_ENABLE:
@@ -20237,14 +20690,109 @@ def _moneydj_range_events(
         preload_cache_frame = pd.DataFrame()
     # （Google Sheet 快照本來就有不完整阻擋，本機事件快取採同一準則。）
     cache_covered_dates = _resolve_cache_covered_dates(
-        bool(stats.get("api4_incomplete_but_continued")),
+        bool(stats.get("api4_cache_blocking_incomplete")),
         cached_covered_days,
         days,
     )
-    if stats.get("api4_incomplete_but_continued"):
+    if stats.get("api4_cache_blocking_incomplete"):
         print(
-            "⚠️ MoneyDJ 本次為不完整快照（API4 容忍放行／缺尾保留），"
+            "⚠️ MoneyDJ 本次有無法核對的缺口（缺尾保留／官方核對失敗），"
             "不更新 covered_trading_dates，下次仍會重新驗證歷史缺口"
+        )
+    # 缺口清單必須沿用舊快取再疊加本次結果：本次沒重查到的權證不代表缺口消失，
+    # 只有真的補到該權證的歷史事件時才可以移除。
+    merged_verified_missing = dict(cached_verified_missing)
+    merged_verified_missing.update(stats.get("api4_verified_missing") or {})
+    # 「某天有事件」不足以證明該權證那天的分點資料完整：精選分點補查本來就可能
+    # 在 API4 失敗時只拿到局部資料（例如只有 B2 一個分點）。只有本輪 API4 對該
+    # 權證完整探索成功，才有資格宣告缺漏補齊。
+    _incomplete_codes = (
+        set(api4_proven_zero_codes)
+        | set(api4_failed_tolerated)
+        | set(stats.get("api4_partial_tail_codes", []) or [])
+        | set(stats.get("api4_failure_codes", []) or [])
+        | set(stats.get("api4_fatal_codes", []) or [])
+    )
+    _fully_explored_codes = {
+        normalize_openapi_warrant_code(str(w.get("warrant_code", "") or ""))
+        for w in warrants
+    } - _incomplete_codes
+    stats["api4_fully_explored_codes"] = len(_fully_explored_codes)
+    # 「這一輪探索成功」只涵蓋這一輪實際查過的日期範圍。啟用歷史快取重用時，
+    # API4 只查了 [api4_start_ts, end_ts]，更早的日期這一輪根本沒碰過，
+    # 不能拿近期的成功當成那些日子的恢復證據。
+    _explored_from = api4_start_ts if reuse_historical_cache else start_ts
+    stats["api4_explored_from"] = pd.Timestamp(_explored_from).strftime("%Y-%m-%d")
+    if not events.empty and merged_verified_missing:
+        # 恢復判定必須逐「日期」比對：同一檔權證在別的日子有事件，
+        # 不代表當初缺的那幾天補上了。只移除確實已經有事件的缺漏日。
+        _days_by_code = (
+            events.assign(_c=events["warrant_code"].astype(str))
+            .groupby("_c")["Date"]
+            .apply(lambda s: set(pd.to_datetime(s, errors="coerce").dt.normalize()))
+            .to_dict()
+        )
+        for _code in sorted(merged_verified_missing):
+            if _code not in _fully_explored_codes:
+                # 本輪沒有把這檔權證完整探索過 → 沒有資格宣告任何一天補齊。
+                continue
+            _entry = merged_verified_missing.get(_code) or {}
+            _missing_days = [str(d) for d in (_entry.get("days") or [])]
+            if not _missing_days:
+                continue
+            _have = _days_by_code.get(_code, set())
+            # 恢復證據綁定到 (權證, 日期)：只有落在本輪實際探索範圍內、
+            # 而且該日確實已有事件的缺漏日，才算補齊。範圍外的日子這一輪
+            # 根本沒查過，快取裡的舊局部事件不能當成證據。
+            _still_missing = [
+                d for d in _missing_days
+                if not (
+                    pd.Timestamp(d).normalize() >= _explored_from
+                    and pd.Timestamp(d).normalize() in _have
+                )
+            ]
+            if not _still_missing:
+                merged_verified_missing.pop(_code, None)
+                print(f"✅ 先前記錄的 MoneyDJ 缺口已逐日補齊：{_code}")
+            elif len(_still_missing) < len(_missing_days):
+                _entry = dict(_entry)
+                _entry["days"] = _still_missing
+                _entry["partially_recovered"] = True
+                merged_verified_missing[_code] = _entry
+                print(
+                    f"◐ MoneyDJ 缺口部分補齊：{_code}｜仍缺 {len(_still_missing)}/"
+                    f"{len(_missing_days)} 天"
+                )
+    stats["api4_known_missing_codes"] = sorted(merged_verified_missing)
+    # 已知缺漏若落在本次報告區間內，這份報告就不是完整的——必須傳給外層，
+    # 否則 Google Sheet 會把缺角的資料標成 complete 蓋掉原本正確的快照。
+    _window_days = {pd.Timestamp(d).normalize() for d in days}
+    _missing_in_window = {
+        code: [
+            d for d in (entry or {}).get("days", [])
+            if pd.Timestamp(d).normalize() in _window_days
+        ]
+        for code, entry in merged_verified_missing.items()
+    }
+    _missing_in_window = {c: v for c, v in _missing_in_window.items() if v}
+    stats["api4_known_missing_in_window"] = {
+        c: [str(d) for d in v] for c, v in _missing_in_window.items()
+    }
+    if _missing_in_window:
+        stats["api4_incomplete_but_continued"] = True
+        print(
+            f"⚠️ 本次查詢區間內仍有 {len(_missing_in_window)} 檔已知缺漏"
+            f"（{sum(len(v) for v in _missing_in_window.values())} 個日期），"
+            "本次報告不得標記為完整快照"
+        )
+    if merged_verified_missing:
+        _missing_total = sum(
+            float(v.get("amount", 0.0)) for v in merged_verified_missing.values()
+        )
+        print(
+            f"ℹ️ MoneyDJ 已知永久缺口 {len(merged_verified_missing)} 檔"
+            f"（官方成交合計 {_missing_total:,.0f} 元），逐檔記錄在快取中並持續帶到下一輪；"
+            "重跑也拿不到，因此不讓其他權證的歷史覆蓋標記作廢"
         )
     _save_moneydj_event_cache(
         stock_code,
@@ -20253,6 +20801,8 @@ def _moneydj_range_events(
         covered_trading_dates=cache_covered_dates,
         preloads=preload_cache_frame,
         preloaded_pairs=queried_preloaded_pairs,
+        verified_missing=merged_verified_missing,
+        pair_queried_through=pair_queried_through,
     )
 
     stats["event_rows"] = int(len(events))
@@ -20444,15 +20994,52 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             }
             _FINMIND_WARRANT_RUN_STATS[code] = stats
 
+            # 「要求 9/4、來源只到 9/3」不能存成沒有期限的完整快照，否則同一個 key
+            # 之後會一直命中缺一天的資料。這裡只在「來源確實已出到要求日」時才寫。
+            # 注意真正零成交日未必有事件列，所以只有在 MoneyDJ 明確把該日認定為
+            # 報告最後交易日（有實際資料）時才算已發布。
+            _moneydj_last_day = str(
+                moneydj_primary_stats.get("report_last_day", "") or ""
+            )
+            # 只有「實際觀測到的」最後交易日才算發布證據；API4 全空時那個日期
+            # 只是要求日的預設值，不能拿來證明來源已經出到該日。
+            _latest_day_observed = bool(
+                moneydj_primary_stats.get("report_last_day_observed", False)
+            )
+            _latest_day_published = bool(
+                _moneydj_last_day
+                and _latest_day_observed
+                and pd.Timestamp(_moneydj_last_day).normalize() >= latest_day
+            )
+            if not _latest_day_published:
+                print(
+                    f"⏳ 來源尚未出到要求日（或無實際觀測日期），不寫入完整快照：{code}｜"
+                    f"要求={latest_day.date()}｜來源最後交易日="
+                    f"{_moneydj_last_day or '-'}｜實際觀測={_latest_day_observed}"
+                )
             should_write_snapshot = bool(
-                failed_dates == 0 and (
+                failed_dates == 0 and _latest_day_published and (
                     not REPORT_LIVE_ONLY
                     or (ACTION_REFRESH_CONTROLS_REPORT_DATA and ACTION_FORCE_REFRESH)
                     or WARRANT_CACHE_FORCE_REFRESH
                 )
             )
             if should_write_snapshot:
-                save_gsheet_warrant_events_snapshot(code, stock_name, events, start_date, end_date)
+                # 快照是可失敗的輔助層：資料已經抓好且驗證過，不能因為 Google Sheet
+                # 寫入出問題就把整份有效報表丟掉。強制重建快取的流程另行回報失敗。
+                try:
+                    save_gsheet_warrant_events_snapshot(
+                        code, stock_name, events, start_date, end_date
+                    )
+                except Exception as exc:
+                    stats["snapshot_write_error"] = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"⚠️ Google Sheet 權證快照寫入失敗，保留本次有效報表與上一份快取："
+                        f"{code}｜{type(exc).__name__}: {exc}"
+                    )
+                    if WARRANT_CACHE_FORCE_REFRESH:
+                        # 明確要求重建快取時，寫入失敗必須讓呼叫端知道。
+                        raise
 
             print(
                 f"🧪 最新日驗收：{code}｜要求={latest_day.date()}｜"
@@ -21836,6 +22423,18 @@ def main():
     print(f"🧩 FINMIND_BUILD_VERSION={FINMIND_BUILD_VERSION}")
     print(f"🧩 FINMIND_PERFORMANCE_PATCH={FINMIND_PERFORMANCE_PATCH}")
     print(f"🧩 EXECUTED_PYTHON_FILE={os.path.abspath(__file__)}")
+    # FINMIND_BUILD_VERSION 是手動維護的字串，改了程式不會自動變動，
+    # 導致 log 無法對應到實際跑的是哪一版。這裡輸出執行檔的 SHA-256 與行數，
+    # 任何一次修改都會反映出來。
+    try:
+        with open(os.path.abspath(__file__), "rb") as _src:
+            _src_bytes = _src.read()
+        print(
+            f"🧩 EXECUTED_FILE_SHA256={hashlib.sha256(_src_bytes).hexdigest()}"
+            f"｜lines={_src_bytes.count(bytes([10])) + 1}"
+        )
+    except Exception as _exc:
+        print(f"🧩 EXECUTED_FILE_SHA256=unavailable（{_exc}）")
     print(
         "🧩 ACTIVE_FEATURES="
         "official-issuer-refresh+unresolved-issuer-exclusion+coverage-total-current-day-check+"
