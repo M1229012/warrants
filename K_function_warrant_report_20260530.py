@@ -19155,6 +19155,13 @@ TWSE_SECURITY_DAILY_URL = (
     "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
     "?date={month}01&stockNo={code}&response=json"
 )
+# 上櫃證券必須走 TPEx 的端點；只查 TWSE 會每個月都回「查無資料」，
+# 被判成「無法核對」而讓整份報表失敗（實測 713459 穩懋中信68購03）。
+# 注意單位不同：TPEx 是「成交張數 / 成交仟元」，要換算成股數與元。
+TPEX_SECURITY_DAILY_URL = (
+    "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
+    "?code={code}&date={year}/{mon}/01&response=json"
+)
 # 整段區間零成交核對；關掉之後會退回原本「只看最後一個交易日 + 絕對數量上限」的規則。
 WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE = os.getenv(
     "WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_ENABLE", "1"
@@ -19208,25 +19215,117 @@ def _twse_security_month_is_closed(month: str) -> bool:
         return False
 
 
-def _twse_security_month_disk_path(code: str, month: str) -> str:
-    # _v2：改為同時保存成交金額（原本只有成交股數），舊檔案格式不相容。
+def _twse_security_month_disk_path(code: str, month: str, market: str = "TWSE") -> str:
+    # _v3：加入上櫃（TPEx）來源、單位換算與日期尾綴（如 "115/09/01*"）處理，
+    # 舊檔可能是用有缺陷的解析寫入的，換版讓它們自動失效重抓。
     safe_code = _safe_cache_part(str(code))
-    return os.path.join(TWSE_SECURITY_DAILY_CACHE_DIR, f"{safe_code}_{month}_v2.json")
+    safe_market = _safe_cache_part(str(market or "TWSE"))
+    return os.path.join(
+        TWSE_SECURITY_DAILY_CACHE_DIR, f"{safe_code}_{safe_market}_{month}_v3.json"
+    )
 
 
-def _twse_security_month_rows(code: str, month: str) -> list | None:
+def _parse_official_daily_cell(value) -> float:
+    """單一欄位獨立解析；讀不出來一律回 NaN（代表「不知道」），絕不能當成 0。
+
+    官方會用 "--" 之類的字樣填欄位，若把成交股數與金額放在同一個 try，
+    金額解析失敗就會整列被丟掉——那一天的成交量也跟著消失。
+    """
+    text = str(value if value is not None else "").replace(",", "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return float("nan")
+
+
+def _parse_official_daily_rows(raw_rows, lots_to_shares: bool = False) -> list:
+    """把官方每日成交列解析成 ``[(日期, 成交股數, 成交金額), ...]``。
+
+    ``lots_to_shares=True`` 用於 TPEx：它的欄位是「成交張數 / 成交仟元」，
+    要換算成股數與元，否則會和 TWSE 的口徑差 1,000 倍。
+    """
+    out = []
+    for row in raw_rows or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        # 日期可能帶尾綴（例如 TPEx 的 "115/09/01*"），只取數字。
+        parts = re.findall(r"\d+", str(row[0] or ""))
+        if len(parts) < 3:
+            continue
+        try:
+            day = pd.Timestamp(
+                year=int(parts[0]) + 1911, month=int(parts[1]), day=int(parts[2])
+            )
+        except Exception:
+            continue
+        shares = _parse_official_daily_cell(row[1])
+        amount = _parse_official_daily_cell(row[2]) if len(row) > 2 else float("nan")
+        if lots_to_shares:
+            shares = shares * 1000.0 if pd.notna(shares) else shares
+            amount = amount * 1000.0 if pd.notna(amount) else amount
+        out.append((day.normalize(), shares, amount))
+    return out
+
+
+def _store_official_month_rows(cache_key, disk_path: str, month: str, rows) -> None:
+    """記憶體快取 + 已結束月份落盤。"""
+    with _TWSE_SECURITY_DAILY_LOCK:
+        _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
+    if not _twse_security_month_is_closed(month):
+        return
+    try:
+        os.makedirs(TWSE_SECURITY_DAILY_CACHE_DIR, exist_ok=True)
+        tmp_path = f"{disk_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as cache_file:
+            json.dump(
+                [
+                    [day.strftime("%Y-%m-%d"), shares, amount]
+                    for day, shares, amount in (rows or [])
+                ],
+                cache_file,
+            )
+        os.replace(tmp_path, disk_path)
+    except Exception:
+        pass
+
+
+def _twse_security_month_rows(code: str, month: str, market: str = "") -> list | None:
     """取某檔證券某個月的官方每日成交資訊。
 
-    回傳 ``[(日期, 成交股數), ...]``；該月無資料回 ``[]``；抓取失敗回 ``None``
-    （None 代表「無法核對」，絕不能當成零成交）。
+    回傳 ``[(日期, 成交股數, 成交金額), ...]``；該月無資料回 ``[]``；
+    抓取失敗回 ``None``（None 代表「無法核對」，絕不能當成零成交）。
+
+    ``market`` 為「上市」／「上櫃」時直接走對應端點；留空則先試 TWSE，
+    查無資料再試 TPEx（上櫃權證只在 TPEx 有資料）。
     """
-    cache_key = (str(code), str(month))
+    market = str(market or "").strip()
+    if market == "上櫃":
+        return _official_security_month_rows_one(code, month, "TPEX")
+    if market == "上市":
+        return _official_security_month_rows_one(code, month, "TWSE")
+    twse_rows = _official_security_month_rows_one(code, month, "TWSE")
+    if twse_rows:
+        return twse_rows
+    tpex_rows = _official_security_month_rows_one(code, month, "TPEX")
+    if tpex_rows:
+        return tpex_rows
+    # 兩邊都查無資料時，只要其中一邊是「確定沒有」（[]）就回 []；
+    # 兩邊都失敗（None）才是真的無法核對。
+    if twse_rows == [] or tpex_rows == []:
+        return []
+    return None
+
+
+def _official_security_month_rows_one(code: str, month: str, market: str) -> list | None:
+    cache_key = (str(code), str(month), str(market))
     with _TWSE_SECURITY_DAILY_LOCK:
         if cache_key in _TWSE_SECURITY_DAILY_CACHE:
             return _TWSE_SECURITY_DAILY_CACHE[cache_key]
 
     # 已結束的月份資料不會再變動，落盤後不必每次重抓（這是每次執行最主要的成本）。
-    disk_path = _twse_security_month_disk_path(code, month)
+    disk_path = _twse_security_month_disk_path(code, month, market)
     if _twse_security_month_is_closed(month) and os.path.exists(disk_path):
         try:
             with open(disk_path, "r", encoding="utf-8") as cache_file:
@@ -19277,8 +19376,14 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
         try:
             # 連線／讀取 timeout 也不得超過剩餘預算。
             budget = _remaining()
+            if market == "TPEX":
+                url = TPEX_SECURITY_DAILY_URL.format(
+                    code=code, year=str(month)[:4], mon=str(month)[4:6]
+                )
+            else:
+                url = TWSE_SECURITY_DAILY_URL.format(month=month, code=code)
             response = get_thread_session().get(
-                TWSE_SECURITY_DAILY_URL.format(month=month, code=code),
+                url,
                 headers=OPENAPI_WARRANT_HEADERS,
                 timeout=(min(8.0, budget), min(30.0, budget)),
             )
@@ -19325,73 +19430,27 @@ def _twse_security_month_rows(code: str, month: str) -> list | None:
 
     if not isinstance(payload, dict):
         return None
+
+    if market == "TPEX":
+        # TPEx 形狀：{"tables":[{"data":[[日期, 成交張數, 成交仟元, ...]], "totalCount":N}]}
+        tables = payload.get("tables") or []
+        table = tables[0] if tables else {}
+        raw_rows = table.get("data") or []
+        result = _parse_official_daily_rows(raw_rows, lots_to_shares=True)
+        _store_official_month_rows(cache_key, disk_path, month, result)
+        return result
+
     stat = str(payload.get("stat", ""))
     if stat.upper() != "OK":
         # 「沒有符合條件的資料」＝該月尚未掛牌或已下市，不是抓取失敗。
         result = [] if "沒有符合條件" in stat or payload.get("total") == 0 else None
         if result is not None:
-            with _TWSE_SECURITY_DAILY_LOCK:
-                _TWSE_SECURITY_DAILY_CACHE[cache_key] = result
-            if _twse_security_month_is_closed(month):
-                # 尚未掛牌／已下市的月份同樣不會再變，落盤避免每次重抓。
-                try:
-                    os.makedirs(TWSE_SECURITY_DAILY_CACHE_DIR, exist_ok=True)
-                    tmp_path = f"{disk_path}.tmp"
-                    with open(tmp_path, "w", encoding="utf-8") as cache_file:
-                        json.dump([], cache_file)
-                    os.replace(tmp_path, disk_path)
-                except Exception:
-                    pass
+            # 尚未掛牌／已下市的月份同樣不會再變，落盤避免每次重抓。
+            _store_official_month_rows(cache_key, disk_path, month, result)
         return result
 
-    rows = []
-    for row in payload.get("data", []) or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        raw_day = str(row[0] or "").strip()
-        parts = raw_day.split("/")
-        if len(parts) != 3:
-            continue
-        try:
-            day = pd.Timestamp(
-                year=int(parts[0]) + 1911, month=int(parts[1]), day=int(parts[2])
-            )
-        except Exception:
-            continue
-        # 每個欄位獨立解析。證交所會用 "--" 之類的字樣填欄位，若把成交股數與
-        # 成交金額放在同一個 try，金額解析失敗就會整列被丟掉——那一天的成交量
-        # 也跟著消失，最後被誤判成「整段區間從未成交」而安全跳過。
-        # 解析不出來一律給 NaN（代表「不知道」），絕不能當成 0。
-        def _parse_cell(value):
-            text = str(value if value is not None else "").replace(",", "").strip()
-            if not text:
-                return 0.0
-            try:
-                return float(text)
-            except Exception:
-                return float("nan")
-
-        shares = _parse_cell(row[1])
-        amount = _parse_cell(row[2]) if len(row) > 2 else float("nan")
-        rows.append((day.normalize(), shares, amount))
-
-    with _TWSE_SECURITY_DAILY_LOCK:
-        _TWSE_SECURITY_DAILY_CACHE[cache_key] = rows
-    if _twse_security_month_is_closed(month):
-        try:
-            os.makedirs(TWSE_SECURITY_DAILY_CACHE_DIR, exist_ok=True)
-            tmp_path = f"{disk_path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as cache_file:
-                json.dump(
-                    [
-                        [day.strftime("%Y-%m-%d"), shares, amount]
-                        for day, shares, amount in rows
-                    ],
-                    cache_file,
-                )
-            os.replace(tmp_path, disk_path)
-        except Exception:
-            pass
+    rows = _parse_official_daily_rows(payload.get("data", []) or [])
+    _store_official_month_rows(cache_key, disk_path, month, rows)
     return rows
 
 
@@ -19426,7 +19485,10 @@ def _official_confirms_zero_over_window(warrant_code: str, start_ts, end_ts):
     return summary["amount"] <= 0 and summary["shares"] <= 0
 
 
-def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=None):
+def _official_window_trade_summary(
+    warrant_code: str, start_ts, end_ts, months=None, market: str = "",
+    expected_days=None,
+):
     """官方逐日統計某檔證券在區間內的成交股數／金額／有成交的日期。
 
     回傳 ``{"shares": float, "amount": float, "days": [Timestamp, ...]}``；
@@ -19450,16 +19512,18 @@ def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=N
     total_shares = 0.0
     total_amount = 0.0
     traded_days = []
+    seen_days = set()
     in_window_rows = 0
     amount_incomplete = False
     for month in months:
-        rows = _twse_security_month_rows(code, month)
+        rows = _twse_security_month_rows(code, month, market)
         if rows is None:
             return None
         for day, shares, amount in rows:
             if not (start_ts <= day <= end_ts):
                 continue
             in_window_rows += 1
+            seen_days.add(day)
             if pd.isna(shares):
                 # 連成交股數都讀不出來 → 完全無法判斷這一天有沒有交易，
                 # 整檔視為「無法核對」，交給嚴格規則處理。
@@ -19476,11 +19540,24 @@ def _official_window_trade_summary(warrant_code: str, start_ts, end_ts, months=N
                 traded_days.append(day)
     if in_window_rows <= 0:
         return None
+    # 官方尚未發布的交易日（例如當天盤後檔案還沒更新）要單獨列出：
+    # 那幾天不是「已證明零成交」，只是「還不知道」。
+    # 但「首次出現之前」的日子是尚未掛牌，本來就不會有紀錄，不算待發布。
+    first_seen = min(seen_days) if seen_days else None
+    pending_days = sorted(
+        d for d in (
+            pd.Timestamp(x).normalize() for x in (expected_days or [])
+        )
+        if start_ts <= d <= end_ts
+        and d not in seen_days
+        and (first_seen is None or d > first_seen)
+    )
     return {
         "shares": total_shares,
         "amount": total_amount,
         "days": traded_days,
         "amount_incomplete": amount_incomplete,
+        "pending_days": pending_days,
     }
 
 
@@ -19826,7 +19903,9 @@ def _moneydj_range_events(
         for _w in failed_api4_warrants:
             _code = str(_w.get("warrant_code", "") or "")
             api4_window_verdicts[_code] = _official_window_trade_summary(
-                _code, start_ts, report_last_day
+                _code, start_ts, report_last_day,
+                market=str(_w.get("market", "") or ""),
+                expected_days=days,
             )
         _zero_n = sum(
             1 for s in api4_window_verdicts.values()
@@ -19995,16 +20074,30 @@ def _moneydj_range_events(
     api4_unverified_tolerated = []
     _fatal_codes = {str(w.get("warrant_code", "") or "") for w in api4_fatal_warrants}
     if failed_api4_warrants:
-        _tolerable = [
-            w for w in failed_api4_warrants
-            if str(w.get("warrant_code", "") or "") not in _fatal_codes
-            and _official_confirms_zero_on_last_day(w) is True
-        ]
+        # 「最後交易日零成交」核對只看一天，而且當天官方檔案還沒發布時一定回 None
+        # （實測 9/7 執行、官方權證檔還停在 9/4，兩個市場都無法核對）。
+        # 這種「還不知道」不該直接判死：下面的整段區間逐日核對涵蓋範圍更大、
+        # 證明力更強，應該讓它有機會表態。
+        # 只有「確定致命」與「官方明確顯示當天有成交」才直接進 _blocking。
         _blocking = [
             w for w in failed_api4_warrants
             if str(w.get("warrant_code", "") or "") in _fatal_codes
-            or _official_confirms_zero_on_last_day(w) is not True
+            or _official_confirms_zero_on_last_day(w) is False
         ]
+        _blocked_codes = {str(w.get("warrant_code", "") or "") for w in _blocking}
+        _tolerable = [
+            w for w in failed_api4_warrants
+            if str(w.get("warrant_code", "") or "") not in _blocked_codes
+        ]
+        _last_day_unverified = [
+            w for w in _tolerable
+            if _official_confirms_zero_on_last_day(w) is None
+        ]
+        if _last_day_unverified:
+            print(
+                f"ℹ️ {len(_last_day_unverified):,} 檔無法用「最後交易日」核對"
+                "（官方當日檔案尚未發布或市場未通過驗證），改由整段區間逐日核對判定"
+            )
         # 先用官方逐日成交量核對整段區間：從未成交過的權證跳過不會少算，
         # 這是可證明的，不受 WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED 數量上限限制。
         _proven_zero = []
@@ -20032,13 +20125,21 @@ def _moneydj_range_events(
                 _code = str(_w.get("warrant_code", "") or "")
                 if _code not in api4_window_verdicts:
                     api4_window_verdicts[_code] = _official_window_trade_summary(
-                        _code, start_ts, report_last_day
+                        _code, start_ts, report_last_day,
+                        market=str(_w.get("market", "") or ""),
+                        expected_days=days,
                     )
                 _summary = api4_window_verdicts.get(_code)
                 if _summary is None:
                     _still_tolerable.append(_w)
                 elif _summary["amount"] <= 0 and _summary["shares"] <= 0:
-                    _proven_zero.append(_w)
+                    if _summary.get("pending_days"):
+                        # 官方已發布的每一天都是零成交，只有尾端幾天還沒發布。
+                        # 這比「完全無法核對」強得多，但仍不是完整證明：
+                        # 走容忍額度並標記為不完整，不當成可自由跳過。
+                        _still_tolerable.append(_w)
+                    else:
+                        _proven_zero.append(_w)
                 else:
                     _minor_traded.append((_w, _summary))
 
