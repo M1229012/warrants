@@ -19191,8 +19191,22 @@ WARRANT_OFFICIAL_WINDOW_ZERO_CHECK_BUDGET_SEC = max(
 # 而且低於報表自己的 ABCDE 100 萬單筆門檻——為了這個金額讓整份週報失敗並不合理。
 # 設 0 即回到「只要官方顯示有成交就一律報錯」的最嚴格行為。
 # 超過上限一律嚴格報錯；跳過時會逐檔印出代號、金額與日期，並標記為不完整快照。
+# 「小到不必理會」的絕對下限：低於這個金額一律容忍，不必再看比例。
+# 用 100 萬對齊報表自己的 ABCDE 單筆門檻——連自己的顯示門檻都跨不過的缺口，
+# 不可能影響圖上的任何數字。
 WARRANT_MONEYDJ_MISSING_AMOUNT_MAX = max(
-    0.0, float(os.getenv("WARRANT_MONEYDJ_MISSING_AMOUNT_MAX", "2000000"))
+    0.0, float(os.getenv("WARRANT_MONEYDJ_MISSING_AMOUNT_MAX", "1000000"))
+)
+# 真正的判斷標準：缺口佔「該檔股票自己的權證成交總額」的比例。
+#
+# 絕對金額門檻不會隨標的大小調整，這是先前 2330（缺 102 萬／原始買進 4.97 億）
+# 和 7788（缺 247 萬）都被同一個 200 萬擋住的原因——對台積電寬鬆到沒有意義，
+# 對中小型股又可能太鬆或太緊。改成用比例，分母是本次實際抓到的成交總額，
+# 會自動隨標的規模縮放。
+#
+# 這個判斷移到 API5 完成之後才做，因為那時才知道分母。
+WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO", "0.01"))
 )
 
 TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
@@ -20152,17 +20166,17 @@ def _moneydj_range_events(
             )
             if _amount_unknown:
                 # 官方金額欄有讀不出來的值 → 缺口金額必定被低估，
-                # 不能拿來判斷「小到可以容忍」，一律嚴格報錯。
+                # 無法做重要性判斷，這種「不知道多少」才需要一律嚴格報錯。
                 print(
                     "⛔ 官方成交金額欄位有無法解析的值，缺口金額會被低估，"
-                    "不做重要性判斷，一律嚴格報錯"
+                    "無法判斷重要性，一律嚴格報錯"
                 )
                 _major_traded = [w for w, _ in _minor_traded]
                 _minor_traded = []
-            elif _minor_traded and _total_missing > WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:
-                _major_traded = [w for w, _ in _minor_traded]
-                _minor_traded = []
             else:
+                # 金額已經量化：先全部放行、標記為不完整，最終是否重要
+                # 留到 API5 完成、知道「該檔股票的權證成交總額」之後再判斷。
+                # 在這裡用絕對金額硬擋，等於用同一把尺量台積電和中小型股。
                 _minor_amount = _total_missing
 
             if _major_traded:
@@ -20187,10 +20201,9 @@ def _moneydj_range_events(
                 )
             if _minor_traded:
                 print(
-                    f"⚠️ MoneyDJ 無分點資料但官方顯示有少量成交：{len(_minor_traded):,} 檔｜"
-                    f"合計 {_minor_amount:,.0f} 元，在可容忍的 "
-                    f"{WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:,.0f} 元內：照常產圖，"
-                    "但標記為不完整快照"
+                    f"⚠️ MoneyDJ 無分點資料但官方顯示有成交：{len(_minor_traded):,} 檔｜"
+                    f"合計 {_minor_amount:,.0f} 元｜標記為不完整快照，"
+                    "重要性待 API5 完成後以「佔權證成交總額比例」判定"
                 )
                 for _w, _s in _minor_traded:
                     _days = "、".join(d.strftime("%m/%d") for d in _s.get("days", [])[:6])
@@ -20253,20 +20266,23 @@ def _moneydj_range_events(
         elif not _tolerable:
             # 全部失敗都已被官方逐日證明整段區間零成交：資料其實是完整的。
             failed_api4_warrants = []
-        elif len(_tolerable) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
+        elif len(api4_unverified_tolerated) <= WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED:
+            # 數量上限只管「無法核對」的缺口——那種不知道少了什麼，多一檔就多一分風險。
+            # 已經量化的缺口（知道是哪幾檔、哪幾天、多少錢）不計入這個上限，
+            # 改由下面的「佔權證成交總額比例」判定，才不會用同一把尺量不同規模的標的。
             api4_failed_tolerated = [
                 str(w.get("warrant_code", "") or "") for w in _tolerable
             ]
             print(
-                f"⚠️ MoneyDJ API4 有 {len(_tolerable):,} 檔 MoneyDJ 完全無法提供、"
-                f"但官方確認報告最後交易日零成交，在容忍額度 "
-                f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED} 內：照常產圖但不寫回完整快照｜"
-                f"代號={'、'.join(sorted(api4_failed_tolerated))}"
+                f"⚠️ MoneyDJ API4 有 {len(_tolerable):,} 檔無法提供分點資料"
+                f"（其中無法核對 {len(api4_unverified_tolerated):,} 檔，"
+                f"上限 {WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED}）："
+                f"照常產圖但不寫回完整快照｜代號={'、'.join(sorted(api4_failed_tolerated))}"
             )
             failed_api4_warrants = []
         else:
             print(
-                f"⛔ 官方確認零成交的失敗有 {len(_tolerable):,} 檔，超過容忍額度 "
+                f"⛔ 無法核對的失敗有 {len(api4_unverified_tolerated):,} 檔，超過容忍額度 "
                 f"{WARRANT_MONEYDJ_RANGE_API4_MAX_FAILED}（疑似 MoneyDJ 整體異常），將嚴格報錯"
             )
 
@@ -20886,6 +20902,52 @@ def _moneydj_range_events(
             f"（{sum(len(v) for v in _missing_in_window.values())} 個日期），"
             "本次報告不得標記為完整快照"
         )
+
+    # ------------------------------------------------------------------
+    # 缺口重要性：到這裡才有分母（本次實際抓到的權證成交總額），
+    # 才能判斷「缺這些到底重不重要」。用比例而不是絕對金額，
+    # 才能同時適用台積電（成交 4.97 億）和中小型股。
+    # ------------------------------------------------------------------
+    _missing_amount = sum(
+        float((merged_verified_missing.get(code) or {}).get("amount", 0.0))
+        for code in _missing_in_window
+    )
+    _gross_amount = 0.0
+    if not events.empty:
+        for _col in ("buy_amount", "sell_amount"):
+            if _col in events.columns:
+                _gross_amount += float(
+                    pd.to_numeric(events[_col], errors="coerce").fillna(0.0).abs().sum()
+                )
+    _missing_ratio = (
+        _missing_amount / (_missing_amount + _gross_amount)
+        if (_missing_amount + _gross_amount) > 0 else 0.0
+    )
+    stats["missing_amount_in_window"] = _missing_amount
+    stats["warrant_gross_amount"] = _gross_amount
+    stats["missing_amount_ratio"] = _missing_ratio
+    if _missing_amount > 0:
+        _tolerable_gap = (
+            _missing_amount <= WARRANT_MONEYDJ_MISSING_AMOUNT_MAX
+            or _missing_ratio <= WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO
+        )
+        _detail = (
+            f"缺口 {_missing_amount:,.0f} 元｜權證成交總額 {_gross_amount:,.0f} 元｜"
+            f"佔比 {_missing_ratio * 100:.3f}%"
+        )
+        if _tolerable_gap:
+            print(
+                f"⚠️ MoneyDJ 已知缺口在可容忍範圍內，照常產圖但標記為不完整：{_detail}"
+                f"（門檻：{WARRANT_MONEYDJ_MISSING_AMOUNT_MAX:,.0f} 元或 "
+                f"{WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO * 100:.2f}%）"
+            )
+        else:
+            raise RuntimeError(
+                f"MoneyDJ 已知缺口佔比過高，拒絕產出會誤導的報表：{stock_code}｜{_detail}｜"
+                f"超過 {WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO * 100:.2f}% 門檻｜"
+                f"缺漏權證={sorted(_missing_in_window)}｜"
+                "（確認可接受時，調整 WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO）"
+            )
     if merged_verified_missing:
         _missing_total = sum(
             float(v.get("amount", 0.0)) for v in merged_verified_missing.values()
