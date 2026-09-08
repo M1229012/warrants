@@ -40,6 +40,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from functools import lru_cache
 from io import StringIO
 
@@ -65,13 +66,106 @@ if hasattr(time, "tzset"):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 分段計時與請求計數
+# ──────────────────────────────────────────────────────────────────────
+# 目的：不要再靠猜的優化。跑完會印出「哪一段花了多少秒、發了幾個請求」，
+# 之後要調併發或改演算法都以這份數字為準。
+# 開銷極低（每段一次 time.perf_counter），預設開啟；設 STAGE_PROFILE_ENABLED=0 關閉。
+# ══════════════════════════════════════════════════════════════════════
+
+STAGE_PROFILE_ENABLED = os.getenv(
+    "STAGE_PROFILE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+
+_STAGE_TIMINGS = defaultdict(lambda: {"seconds": 0.0, "calls": 0})
+_STAGE_TIMING_ORDER = []
+_STAGE_COUNTERS = defaultdict(int)
+_STAGE_PROFILE_LOCK = threading.Lock()
+
+
+def record_stage_seconds(name, seconds, calls=1):
+    if not STAGE_PROFILE_ENABLED:
+        return
+    with _STAGE_PROFILE_LOCK:
+        if name not in _STAGE_TIMINGS:
+            _STAGE_TIMING_ORDER.append(name)
+        entry = _STAGE_TIMINGS[name]
+        entry["seconds"] += float(seconds)
+        entry["calls"] += int(calls)
+
+
+def count_event(name, amount=1):
+    if not STAGE_PROFILE_ENABLED:
+        return
+    with _STAGE_PROFILE_LOCK:
+        _STAGE_COUNTERS[name] += int(amount)
+
+
+@contextmanager
+def stage_timer(name):
+    """量測一個階段的牆鐘時間；同名多次呼叫會累加。"""
+    if not STAGE_PROFILE_ENABLED:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        record_stage_seconds(name, time.perf_counter() - started)
+
+
+_STAGE_PROFILE_PRINTED = {"done": False}
+
+
+def print_stage_profile(total_seconds=None):
+    """在程式結束前印出分段耗時與請求數；重複呼叫只會印一次。"""
+    if not STAGE_PROFILE_ENABLED:
+        return
+    with _STAGE_PROFILE_LOCK:
+        if _STAGE_PROFILE_PRINTED["done"]:
+            return
+        _STAGE_PROFILE_PRINTED["done"] = True
+    with _STAGE_PROFILE_LOCK:
+        timings = [
+            (name, dict(_STAGE_TIMINGS[name]))
+            for name in _STAGE_TIMING_ORDER
+        ]
+        counters = dict(_STAGE_COUNTERS)
+
+    if not timings and not counters:
+        return
+
+    print(f"\n{'=' * 70}")
+    print("📊 分段耗時（牆鐘秒；巢狀階段會與外層重複計算）")
+    print(f"{'階段':<34}{'秒數':>10}{'次數':>10}{'佔比':>10}")
+    print("-" * 70)
+    for name, entry in sorted(
+        timings, key=lambda item: item[1]["seconds"], reverse=True
+    ):
+        seconds = entry["seconds"]
+        ratio = (
+            f"{seconds / total_seconds * 100:>9.1f}%"
+            if total_seconds and total_seconds > 0
+            else "        -"
+        )
+        print(f"{name:<34}{seconds:>10.2f}{entry['calls']:>10,}{ratio:>10}")
+
+    if counters:
+        print("-" * 70)
+        print("📡 請求／處理量計數")
+        for name in sorted(counters):
+            print(f"  {name:<40}{counters[name]:>12,}")
+    print(f"{'=' * 70}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 設定
 # ══════════════════════════════════════════════════════════════════════
 
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18"
+PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT4"
 # workflow 的版本驗證是 `grep -F`（純字串搜尋），保留下面這行舊 ID，
 # 讓還沒更新 EXPECTED_BUILD_ID 的 workflow 也能通過驗證後執行本版。
 # 相容舊版本驗證字串：HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R17
@@ -348,6 +442,29 @@ WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED = os.getenv(
 WINRATE_DELISTED_MISSING_PRICE = float(
     os.getenv("WINRATE_DELISTED_MISSING_PRICE", "0")
 )
+# 主檔完全查不到某個權證代號的生命週期時要不要估值。
+# 預設 0＝沿用既有寬鬆行為（沒有主檔資料就不設區間邊界）。
+# 注意：這個開關「不影響」代號重用的情況——主檔有這個代號、但沒有任何一段
+# 涵蓋買進日時，一律視為未解析不估值，因為那正是拿錯權證價格的來源。
+WINRATE_REQUIRE_KNOWN_LIFECYCLE = os.getenv(
+    "WINRATE_REQUIRE_KNOWN_LIFECYCLE", "0"
+).strip().lower() in ("1", "true", "yes")
+# ABCDE 事件 FIFO 是否要依權證生命週期隔離賣出配對。
+# 預設 0＝維持現行 ABCDE／TOP15 的計算方式不變（依你的決定保持現狀）。
+# 設 1 時，賣出日若晚於該批買進所屬生命週期的最後交易日，就不會被拿去扣那批
+# 舊部位——這能擋掉「代號重用後，新權證的賣出被算成舊權證出清」。
+FIFO_ISOLATE_WARRANT_LIFECYCLE = os.getenv(
+    "FIFO_ISOLATE_WARRANT_LIFECYCLE", "0"
+).strip().lower() in ("1", "true", "yes")
+
+# D+1～D+20 是否以「交易所真正的交易日曆」定義。
+# 1（預設）：D+N 就是事件日之後的第 N 個市場交易日；那天若沒有價格，欄位顯示
+#           「標:-」並標成缺值，不會把前一天的價格往前遞補、也不會讓後面的日期
+#           遞補上來冒充 D+N。
+# 0：回到舊行為（用「有價格的日子」當日曆，缺價日會被跳過，序號往前遞補）。
+DPLUS_STRICT_MARKET_CALENDAR = os.getenv(
+    "DPLUS_STRICT_MARKET_CALENDAR", "1"
+).strip().lower() not in ("0", "false", "no")
 
 # 長期留單補價／修正勝率設定。
 LONGTERM_OPEN_DAYS = [
@@ -669,7 +786,6 @@ TARGET_PATTERNS = {
     "元大南屯":       r"元大.*南屯",
     "元大汐止":       r"元大.*汐止",
     "元大虎尾":       r"元大.*虎尾",
-    "元大板橋":       r"元大.*板橋",
     "元大彰化民生":   r"元大.*彰化民生",
     "兆豐板橋":       r"兆豐.*板橋",
     "凱基士林":       r"凱基.*士林",
@@ -703,7 +819,6 @@ FALLBACK = {
     "元大南屯":       ("元大-南屯",       "9853"),
     "元大汐止":       ("元大-汐止",       "989Q"),
     "元大虎尾":       ("元大-虎尾",       "980l"),
-    "元大板橋":       ("元大-板橋",       "989C"),
     "元大彰化民生":   ("元大-彰化民生",   "989J"),
     "兆豐板橋":       ("兆豐-板橋",       "700B"),
     "凱基士林":       ("凱基-士林",       "9238"),
@@ -865,7 +980,7 @@ def _parse_date_cached_text(text):
 
 
 def parse_date(date_str):
-    if date_str is None:
+    if date_str is None or date_str is pd.NaT:
         return None
     if isinstance(date_str, datetime):
         return datetime(date_str.year, date_str.month, date_str.day)
@@ -970,7 +1085,7 @@ def safe_price_float(x):
 
         # 權證 / 股價不應該用 0 當有效收盤價。
         # 測試時發現部分權證會回傳 0.0，不能拿來計算 D+。
-        if v <= 0:
+        if not math.isfinite(v) or v <= 0:
             return None
 
         return v
@@ -979,35 +1094,35 @@ def safe_price_float(x):
 
 
 def merge_price_dicts(*dicts):
-    merged = {}
+    merged = PriceSeries()
 
     for prices in dicts:
         if not prices:
             continue
 
         for d, p in prices.items():
-            if p is not None and p > 0:
-                merged[d] = p
+            price = safe_price_float(p)
+            if price is not None:
+                merged[d] = price
 
     return merged
 
 
 def normalize_price_code(code):
+    """無狀態代號規則；字母尾碼為身分的一部分，不限於 ETF。"""
     s = str(code).strip()
-
     if s.endswith(".0"):
         s = s[:-2]
-
+    s = re.sub(r"\.(?:TW|TWO)$", "", s, flags=re.IGNORECASE).upper()
+    if re.fullmatch(r"[0-9]{4,5}[A-Z]", s):
+        return s
     s = "".join(ch for ch in s if ch.isdigit())
-
     if not s:
         return ""
-
-    # 權證通常為 6 碼；股票通常為 4 碼。
-    # 若是 5 碼權證，很可能是 Excel / pandas 吃掉前導 0，補回 6 碼。
-    if len(s) == 5:
+    # 五碼且以 00 開頭保留；其餘五碼沿用缺前導零權證的相容規則。
+    # 已遺失零且恰以 00 開頭的權證仍有歧義，需在匯入端依證券類型修復。
+    if len(s) == 5 and not s.startswith("00"):
         return s.zfill(6)
-
     return s
 
 
@@ -2722,6 +2837,9 @@ def fetch_price_plan_batch_first(
         f"最多 {len(trading_dates) * 2:,} 個市場請求"
     )
 
+    # 代號 → 已合併好別名的價格序列；整個批次階段共用，避免重複複製整份序列。
+    batch_series_by_code = {}
+
     for date_index, trade_day in enumerate(trading_dates, start=1):
         target_key = trade_day.strftime("%Y/%m/%d")
         wanted_codes = {
@@ -2749,11 +2867,22 @@ def fetch_price_plan_batch_first(
             price = safe_price_float(market_prices.get(code))
             if price is None:
                 continue
-            old_prices = get_cached_prices_for_code(persistent_price_cache, code)
-            old_price = safe_price_float(old_prices.get(target_key))
-            merged_prices = merge_price_dicts(old_prices, {target_key: price})
-            persistent_price_cache[code] = merged_prices
-            add_price_aliases(price_cache, code, merged_prices)
+
+            # 【效能】舊版每個「交易日 × 代號」都做一次
+            # get_cached_prices_for_code + merge_price_dicts，
+            # 而 merge_price_dicts 會建立一份「全新的完整序列」——
+            # 只為了塞進一天的價格，卻複製了整整 200 天。
+            # 200 個交易日 × 數千檔 = 上百萬次整份序列複製。
+            # 改成：每個代號只合併一次別名序列，之後直接就地寫入那一天。
+            series = batch_series_by_code.get(code)
+            if series is None:
+                series = get_cached_prices_for_code(persistent_price_cache, code)
+                persistent_price_cache[normalize_price_code(code) or code] = series
+                add_price_aliases(price_cache, code, series)
+                batch_series_by_code[code] = series
+
+            old_price = safe_price_float(series.get(target_key))
+            series[target_key] = price
             if old_price != price:
                 changed_codes.add(code)
 
@@ -2816,59 +2945,114 @@ def fetch_price_plan_batch_first(
     return changed_codes
 
 
+class PriceSeries(dict):
+    """內部價格序列：寫入時正規化日期並增加版本號；查價快取 O(1) 驗證。
+
+    使用一般 mapping 寫入操作，勿以 dict.__setitem__(series, ...) 繞過版本。
+    同一序列遵循現有主執行緒合併模型，不支援同時讀寫。
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.version = 0
+        self.update(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(normalize_date_str(key), value)
+        self.version += 1
+
+    def __delitem__(self, key):
+        super().__delitem__(normalize_date_str(key))
+        self.version += 1
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def setdefault(self, key, default=None):
+        key = normalize_date_str(key)
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def pop(self, key, *default):
+        if len(default) > 1:
+            raise TypeError("pop expected at most 2 arguments")
+        key = normalize_date_str(key)
+        if key in self:
+            value = self[key]
+            del self[key]
+            return value
+        if default:
+            return default[0]
+        raise KeyError(key)
+
+    def popitem(self):
+        result = super().popitem()
+        self.version += 1
+        return result
+
+    def clear(self):
+        if self:
+            super().clear()
+            self.version += 1
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def copy(self):
+        return type(self)(self)
+
+    @classmethod
+    def fromkeys(cls, keys, value=None):
+        return cls((key, value) for key in keys)
+
+
+def _price_date_index(prices):
+    """傳回 (有效日期, 正規日期對應價格)。普通 dict 不快取，以支援外部任意修改。"""
+    signature = _price_dates_cache_signature(prices)
+    if signature is not None:
+        with _SORTED_PRICE_DATES_CACHE_LOCK:
+            cached = _SORTED_PRICE_DATES_CACHE.get(id(prices))
+            if cached is not None and cached[0] is prices and cached[1] == signature:
+                return cached[2], cached[3]
+    normalized = {}
+    for raw_date, raw_price in prices.items():
+        dt = parse_date(raw_date)
+        price = safe_price_float(raw_price)
+        if dt and price is not None:
+            normalized[normalize_date_str(dt)] = price
+    dates = sorted(normalized)
+    if signature is not None:
+        with _SORTED_PRICE_DATES_CACHE_LOCK:
+            if len(_SORTED_PRICE_DATES_CACHE) >= _SORTED_PRICE_DATES_CACHE_MAXSIZE:
+                _SORTED_PRICE_DATES_CACHE.clear()
+            _SORTED_PRICE_DATES_CACHE[id(prices)] = (prices, signature, dates, normalized)
+    return dates, normalized
+
+
 def _price_dates_cache_signature(prices):
-    try:
-        length = len(prices)
-        if length == 0:
-            return (0, None, None, None, None)
-        first_key = next(iter(prices))
-        last_key = next(reversed(prices))
-        return (
-            length,
-            first_key,
-            last_key,
-            prices.get(first_key),
-            prices.get(last_key),
-        )
-    except Exception:
-        return (len(prices) if prices else 0, None, None, None, None)
+    return prices.version if isinstance(prices, PriceSeries) else None
 
 
 def _sorted_valid_price_dates(prices):
     if not prices:
         return []
-
-    cache_key = id(prices)
-    signature = _price_dates_cache_signature(prices)
-    with _SORTED_PRICE_DATES_CACHE_LOCK:
-        cached = _SORTED_PRICE_DATES_CACHE.get(cache_key)
-        if cached is not None and cached[0] is prices and cached[1] == signature:
-            return cached[2]
-
-    valid_dates = sorted(
-        normalize_date_str(d)
-        for d, p in prices.items()
-        if parse_date(d) and safe_price_float(p) is not None
-    )
-
-    with _SORTED_PRICE_DATES_CACHE_LOCK:
-        if len(_SORTED_PRICE_DATES_CACHE) >= _SORTED_PRICE_DATES_CACHE_MAXSIZE:
-            _SORTED_PRICE_DATES_CACHE.clear()
-        _SORTED_PRICE_DATES_CACHE[cache_key] = (prices, signature, valid_dates)
-
-    return valid_dates
+    return _price_date_index(prices)[0]
 
 
 def get_price_nearest(prices, date):
-    date = normalize_date_str(date)
-    if date in prices and safe_price_float(prices.get(date)) is not None:
-        return prices[date]
-
-    valid_dates = _sorted_valid_price_dates(prices)
-    idx = bisect_right(valid_dates, date) - 1
-    if idx < 0:
+    target = parse_date(date)
+    if not prices or target is None:
         return None
-    return prices.get(valid_dates[idx])
+    date = normalize_date_str(target)
+    if date in prices:
+        direct = safe_price_float(prices[date])
+        if direct is not None:
+            return direct
+    dates, normalized = _price_date_index(prices)
+    idx = bisect_right(dates, date) - 1
+    return normalized[dates[idx]] if idx >= 0 else None
 
 
 
@@ -2901,6 +3085,10 @@ GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 # 2. repair 的 21 張結果表若啟用下方 FULL_RESULT_OVERWRITE，會例外地完整重建；
 #    快取、非結果表與 repair 清單以外的工作表仍受保護。
 # 3. 關閉 FULL_RESULT_OVERWRITE 時，才回到本開關控制的增量／舊版覆蓋策略。
+# daily 精準快照替換為明確選用；0 保留歷史保護的原始優先序。
+GSHEET_DAILY_SNAPSHOT_REPLACE = os.getenv(
+    "GSHEET_DAILY_SNAPSHOT_REPLACE", "0"
+).strip().lower() in ("1", "true", "yes")
 GSHEET_PRESERVE_ALL_HISTORY = os.getenv(
     "GSHEET_PRESERVE_ALL_HISTORY", "1"
 ).strip().lower() not in ("0", "false", "no")
@@ -2914,6 +3102,12 @@ GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED = os.getenv(
 # 啟用後 repair 會完整重建本次工作簿內的所有結果表；daily 仍維持增量更新。
 GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED = os.getenv(
     "GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# repair 的 21 張結果表要當成一筆交易：全部成功才算數，中途失敗就把已寫入的
+# 表還原成本輪寫入前的內容，避免工作簿卡在「一半新一半舊」的狀態。
+# 代價是寫入前要多讀一次那 21 張表當回滾點（repair 本來就是重跑，可接受）。
+GSHEET_REPAIR_ROLLBACK_ON_FAILURE = os.getenv(
+    "GSHEET_REPAIR_ROLLBACK_ON_FAILURE", "1"
 ).strip().lower() not in ("0", "false", "no")
 
 # 保留舊版封存參數供相容使用；歷史保護模式下不會執行主表裁切。
@@ -3550,8 +3744,21 @@ def gsheet_api_call(description, func, *args, **kwargs):
 
     for attempt in range(1, GSHEET_MAX_RETRIES + 1):
         try:
+            throttle_started = time.perf_counter()
             gsheet_write_sleep()
-            return func(*args, **kwargs)
+            record_stage_seconds(
+                "Google Sheet 節流等待",
+                time.perf_counter() - throttle_started,
+            )
+            count_event("Google Sheet API 呼叫")
+            call_started = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                record_stage_seconds(
+                    "Google Sheet API（不含節流）",
+                    time.perf_counter() - call_started,
+                )
         except Exception as e:
             last_error = e
 
@@ -4967,9 +5174,16 @@ def write_values_to_worksheet(
 
         reset_worksheet_before_value_write(ws, row_count, col_count)
 
+        write_values = [
+            list(row) + [""] * max(resize_cols - len(row), 0)
+            for row in normalized_values
+        ]
+        write_values.extend(
+            [[""] * resize_cols for _ in range(max(resize_rows - len(write_values), 0))]
+        )
         batch_ranges = []
-        for start in range(0, len(normalized_values), GSHEET_CHUNK_ROWS):
-            chunk = normalized_values[start:start + GSHEET_CHUNK_ROWS]
+        for start in range(0, len(write_values), GSHEET_CHUNK_ROWS):
+            chunk = write_values[start:start + GSHEET_CHUNK_ROWS]
             batch_ranges.append({
                 "range": f"A{start + 1}",
                 "values": chunk,
@@ -8926,6 +9140,7 @@ def replace_top15_snapshot_rows_in_worksheet(
     new_values,
     data_scope=None,
     extra_scope_values=None,
+    refresh_pairs=None,
 ):
     """
     TOP15 專用同步：同一「資料範圍 + 統計日期」整批替換。
@@ -8952,6 +9167,11 @@ def replace_top15_snapshot_rows_in_worksheet(
         for key in (_top15_scope_date_key(record) for record in incoming_records)
         if key is not None
     }
+    # 明確傳入「本次確實計算」的快照，零持倉也可替換；未執行的範圍不動。
+    for scope, stat_date in refresh_pairs or []:
+        if not str(scope).strip() or parse_date(stat_date) is None:
+            raise ValueError("TOP15 refresh_pairs 含無效範圍或日期")
+        incoming_pairs.add((str(scope).strip(), normalize_date_str(stat_date)))
     if not incoming_pairs:
         print(
             f"  ⚠️ {safe_worksheet_title(title)} 本次資料找不到統計日期；"
@@ -9275,6 +9495,7 @@ def upload_excel_to_google_sheet(
     allowed_titles=None,
     extra_scope_values=None,
     refresh_date=None,
+    top15_refresh_pairs=None,
 ):
     """
     Google Sheet 同步規則：
@@ -9434,6 +9655,82 @@ def upload_excel_to_google_sheet(
 
     completed = set()
     failures = {}
+    rollback_snapshots = {}
+
+    # repair 一致性快照：寫入前先把 21 張結果表的現況讀進記憶體當回滾點。
+    # 舊版是「一張一張寫，第 10 張失敗就前 9 張新、其餘舊」，最後拋錯也救不回來，
+    # 等於工作簿卡在一個半新半舊、彼此對不起來的狀態。
+    # 這裡改成：全部成功才算數；中途失敗就把已經寫過的表還原成寫入前的內容。
+    #
+    # 不採用「先寫暫存表再改名」是因為那會讓結果表數量暫時翻倍，
+    # 很容易撞到 Google Sheet 單一試算表 1,000 萬格的上限。
+    if (
+        strict_repair
+        and GSHEET_REPAIR_ROLLBACK_ON_FAILURE
+        and repair_expected_overwrites
+    ):
+        # 只有這輪真的會被「整表覆蓋」的工作表才需要回滾點；
+        # 走增量補齊的表本來就不會被清空，硬還原反而會被歷史保護擋下來變成假警報。
+        rollback_titles = sorted(
+            title for title in repair_expected_overwrites
+            if should_overwrite_result_sheet_in_repair(title)
+        )
+        print(
+            f"  🧷 repair 建立回滾點：讀取 {len(rollback_titles)} 張"
+            "整表覆蓋工作表的現況（全部成功才提交，任一張失敗就還原）"
+        )
+        for title in rollback_titles:
+            try:
+                gws, created = _existing_result_sheet(primary_sh, title)
+                if gws is None:
+                    raise RuntimeError("工作表不存在且無法建立")
+                rollback_snapshots[title] = {
+                    "existed": not created,
+                    "values": (
+                        []
+                        if created
+                        else _worksheet_values_with_formulas(
+                            gws,
+                            throttled=True,
+                            strict_read=True,
+                        )
+                    ),
+                }
+            except Exception as exc:
+                raise RuntimeError(
+                    f"repair 無法建立回滾點：{title}｜{type(exc).__name__}: {exc}｜"
+                    "為避免寫到一半無法還原，本次不修改任何工作表。"
+                ) from exc
+
+    def rollback_repair_publish():
+        """把已寫入的結果表還原成本輪寫入前的內容。"""
+        if not rollback_snapshots:
+            return [], []
+
+        restored, restore_failed = [], []
+        for title in sorted(completed & set(rollback_snapshots)):
+            snapshot = rollback_snapshots.get(title) or {}
+            try:
+                gws, _created = _existing_result_sheet(primary_sh, title)
+                values = snapshot.get("values") or []
+                if not snapshot.get("existed"):
+                    values = [[
+                        "（本輪 repair 已回滾；此工作表在回滾前並不存在）"
+                    ]]
+                if not values:
+                    values = [[""]]
+                if write_values_to_worksheet(
+                    gws,
+                    values,
+                    clear_existing_values=True,
+                    value_input_option="USER_ENTERED",
+                ):
+                    restored.append(title)
+                else:
+                    restore_failed.append(title)
+            except Exception as exc:
+                restore_failed.append(f"{title}({type(exc).__name__})")
+        return restored, restore_failed
 
     # 公式／查詢頁依賴資料頁，讓資料頁先更新；其餘維持 Excel 原始順序。
     dependency_last = ["券商查詢", "股票ABCDE查詢"]
@@ -9465,7 +9762,10 @@ def upload_excel_to_google_sheet(
 
         # 最高優先級安全門：既有 Google Sheet 一律不 clear、不 delete_rows、不 resize 縮小。
         # 簡單資料表僅插入尚未存在的唯一鍵；版面型工作表保持原狀。
-        if GSHEET_PRESERVE_ALL_HISTORY and not created:
+        daily_snapshot = GSHEET_DAILY_SNAPSHOT_REPLACE and WORKFLOW_MODE == "daily" and (
+            is_daily_date_replace_sheet(title) or is_top15_snapshot_replace_sheet(title)
+        )
+        if GSHEET_PRESERVE_ALL_HISTORY and not created and not daily_snapshot:
             if should_upsert_result_sheet(title, raw_values):
                 inserted = insert_missing_result_rows_to_worksheet(
                     gws,
@@ -9562,6 +9862,7 @@ def upload_excel_to_google_sheet(
                 raw_values,
                 data_scope=current_scope,
                 extra_scope_values=selected_values,
+                refresh_pairs=top15_refresh_pairs,
             )
             if snapshot_result is None:
                 raise RuntimeError(f"TOP15 快照替換失敗：{title}")
@@ -9645,8 +9946,32 @@ def upload_excel_to_google_sheet(
             detail_parts = []
             for title in missing_completed:
                 detail_parts.append(f"{title}={failures.get(title, '未完成')}")
+
+            rollback_note = ""
+            if rollback_snapshots:
+                print(
+                    f"  ↩️ repair 有 {len(missing_completed):,} 張未完成，"
+                    f"開始回滾已寫入的 {len(completed & set(rollback_snapshots)):,} 張..."
+                )
+                restored, restore_failed = rollback_repair_publish()
+                if restore_failed:
+                    rollback_note = (
+                        f"；已還原 {len(restored):,} 張，但有 "
+                        f"{len(restore_failed):,} 張還原失敗（{'、'.join(restore_failed)}），"
+                        "工作簿目前處於不一致狀態，請以本機 Excel artifact 為準手動修復"
+                    )
+                    print(f"  ❌ repair 回滾未完全成功{rollback_note}")
+                else:
+                    rollback_note = (
+                        f"；已把 {len(restored):,} 張還原成本輪寫入前的內容，"
+                        "工作簿維持在上一個一致快照"
+                    )
+                    print(f"  ✅ repair 已完整回滾{rollback_note}")
+
             raise RuntimeError(
-                "repair 未能完整更新所有必要工作表：" + "｜".join(detail_parts)
+                "repair 未能完整更新所有必要工作表："
+                + "｜".join(detail_parts)
+                + rollback_note
             )
         if GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED or not GSHEET_PRESERVE_ALL_HISTORY:
             print(
@@ -9746,8 +10071,7 @@ def write_cache_csv(
             except Exception:
                 pass
     except Exception as exc:
-        print(f"  ⚠️ 快取寫入失敗：{parquet_path}｜{type(exc).__name__}: {exc}")
-        return
+        raise RuntimeError(f"快取寫入失敗：{parquet_path}") from exc
 
     if sync_supabase and supabase_enabled():
         upload_df = df if supabase_df is None else supabase_df
@@ -9798,7 +10122,13 @@ def load_price_cache():
         if price is None:
             continue
 
-        price_cache.setdefault(code, {})[dt.strftime("%Y/%m/%d")] = price
+        # setdefault 每一列都會先建一個 PriceSeries 再丟掉；資料列以百萬計時
+        # 等於數十萬次無用配置，改成先查再建。
+        series = price_cache.get(code)
+        if series is None:
+            series = PriceSeries()
+            price_cache[code] = series
+        series[dt.strftime("%Y/%m/%d")] = price
 
     return price_cache
 
@@ -9811,10 +10141,18 @@ def save_price_cache(price_cache, changed_codes=None):
         return
 
     rows = []
+    # 【效能】add_price_aliases 會讓補零版、去零版、原始碼三個 key 指向「同一個序列物件」。
+    # 舊版逐 key 展開，等於同一份資料轉三次再靠 drop_duplicates 丟掉三分之二。
+    # 這裡先用 (正規化代號, 序列物件身分) 去重，直接省掉約 2/3 的轉換工作。
+    seen_series = set()
     for code, prices in price_cache.items():
         norm_code = normalize_price_code(code)
         if not norm_code or not prices:
             continue
+        series_key = (norm_code, id(prices))
+        if series_key in seen_series:
+            continue
+        seen_series.add(series_key)
         for date_str, raw_price in prices.items():
             dt = parse_date(date_str)
             price = safe_price_float(raw_price)
@@ -9861,7 +10199,7 @@ def get_cached_prices_for_code(price_cache, code):
 
     同時支援補零版與去零版查找，最後回傳單一合併後 dict。
     """
-    out = {}
+    out = PriceSeries()
     norm_code = normalize_price_code(code)
 
     if not norm_code:
@@ -9896,8 +10234,8 @@ def add_price_aliases(price_cache, code, prices):
     在記憶體 price_cache 中建立補零 / 去零別名，
     避免 Excel 或 pandas 吃掉前導 0 時查不到。
     """
-    if not prices:
-        prices = {}
+    if not isinstance(prices, PriceSeries):
+        prices = PriceSeries(prices or {})
 
     norm_code = normalize_price_code(code)
 
@@ -10452,11 +10790,33 @@ def items_from_history_cache(history_df, candidate_filter=None):
         keep="last",
     )
 
-    def latest_nonempty(group, column):
-        if column not in group.columns:
+    # 【效能】顯示欄位的「最後一筆非空值」原本是每個群組各呼叫 6 次、
+    # 每次都把整欄轉成 Python list 再反向掃。群組數以萬計時純屬浪費。
+    # 改成先向量化算好整張對照表：空字串轉 NA 後用 groupby().last()
+    # （pandas 的 last() 會跳過 NA），語意完全等價，之後查表即可。
+    _display_cols = [
+        column for column in
+        ["分點", "分點名稱", "券商代號", "權證名稱", "標的股", "標的名稱"]
+        if column in df.columns
+    ]
+    _display_frame = df[["_券商代號鍵", "_權證代號鍵"] + _display_cols].copy()
+    for column in _display_cols:
+        _display_frame[column] = (
+            _display_frame[column].astype(str).str.strip().replace("", None)
+        )
+    _latest_display = (
+        _display_frame
+        .groupby(["_券商代號鍵", "_權證代號鍵"], dropna=False, sort=False)
+        .last()
+        .to_dict("index")
+    )
+
+    def latest_display_value(group_key, column):
+        record = _latest_display.get(group_key) or {}
+        value = record.get(column)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
             return ""
-        values = [str(value or "").strip() for value in group[column].tolist()]
-        return next((value for value in reversed(values) if value), "")
+        return str(value).strip()
 
     _label_to_code, configured_code_to_label = configured_broker_pair_maps_for_scope("all")
 
@@ -10472,13 +10832,13 @@ def items_from_history_cache(history_df, candidate_filter=None):
                 or broker_label
             ).strip()
         else:
-            broker_label = latest_nonempty(g, "分點")
-            broker_name = latest_nonempty(g, "分點名稱") or broker_label
-            broker_code = latest_nonempty(g, "券商代號") or broker_code_key
+            broker_label = latest_display_value(key, "分點")
+            broker_name = latest_display_value(key, "分點名稱") or broker_label
+            broker_code = latest_display_value(key, "券商代號") or broker_code_key
 
-        warrant_name = latest_nonempty(g, "權證名稱")
-        underlying_code = latest_nonempty(g, "標的股")
-        underlying_name = latest_nonempty(g, "標的名稱")
+        warrant_name = latest_display_value(key, "權證名稱")
+        underlying_code = latest_display_value(key, "標的股")
+        underlying_name = latest_display_value(key, "標的名稱")
 
         item_df = g[[
             "_日期鍵", "買進股數", "賣出股數",
@@ -13733,6 +14093,14 @@ def build_amount_class_events(daily_records, item_map):
 
     for key, g in df.groupby(group_cols, dropna=False, sort=False):
         broker_code_key, underlying_code, date = key
+        # 先做便宜的資格判斷，不合格組不必解析名称或建立 lot。
+        warrant_rows = g.groupby("權證代號", as_index=False, dropna=False).agg({
+            "權證名稱": preferred_group_text,
+            "買進金額": "sum",
+            "買進股數": "sum",
+        })
+        if warrant_rows["買進金額"].max() < AMOUNT_THRESH:
+            continue
         canonical_broker = code_to_label.get(broker_code_key)
         if canonical_broker:
             broker_label, broker_code = canonical_broker
@@ -13749,11 +14117,6 @@ def build_amount_class_events(daily_records, item_map):
             _CURRENT_STOCK_CODE_TO_NAME.get(underlying_code, "")
             or preferred_group_text(g["標的名稱"])
         ).strip()
-
-        warrant_rows = g.groupby(["權證代號", "權證名稱"], as_index=False).agg({
-            "買進金額": "sum",
-            "買進股數": "sum",
-        })
 
         lots = []
         max_single_amount = 0
@@ -14293,6 +14656,12 @@ def simulate_group_outcomes_fifo(events, item_map):
     """
     對同一類別的新制金額強度事件進行「跨事件、逐筆 FIFO」扣減。
 
+    【設計決定，不是待修的 bug】
+    ABCDE 只把「達到門檻的合格事件」放進庫存佇列，TOP15 則是用完整買賣流水重建
+    庫存。同一串買賣在兩邊會得到不同的剩餘股數（例如先買一筆未達門檻的小單、
+    再買一筆合格單，之後賣出時：ABCDE 會扣合格單，TOP15 會先扣較早的小單）。
+    這是兩套不同的統計定義，經確認維持現狀，兩邊都不要改成對方的算法。
+
     規則：
     1. 每個符合條件的事件各自保留成一筆資料，不合併。
     2. 同一分點 + 同一權證的賣出，只能使用一次。
@@ -14303,6 +14672,7 @@ def simulate_group_outcomes_fifo(events, item_map):
     if not events:
         return events
 
+    _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     queues = {}
 
     for event_seq, event in enumerate(events):
@@ -14356,6 +14726,16 @@ def simulate_group_outcomes_fifo(events, item_map):
             valid_lots.append(lot)
             original_total += qty
 
+            lifecycle_end_date = ""
+            if FIFO_ISOLATE_WARRANT_LIFECYCLE:
+                _status, _list_dt, _end_dt = _warrant_lifecycle_for_event_lot(
+                    warrant_code,
+                    buy_date,
+                    buy_date,
+                )
+                if _end_dt:
+                    lifecycle_end_date = normalize_date_str(_end_dt)
+
             key = (broker_code, warrant_code)
             queues.setdefault(key, []).append({
                 "event": event,
@@ -14365,6 +14745,7 @@ def simulate_group_outcomes_fifo(events, item_map):
                 "event_start_date": event_start_date,
                 "event_end_date": event_end_date,
                 "buy_date": buy_date,
+                "lifecycle_end_date": lifecycle_end_date,
             })
 
         event["lots"] = valid_lots
@@ -14383,6 +14764,7 @@ def simulate_group_outcomes_fifo(events, item_map):
         broker_code, warrant_code = key
         sales = get_group_sale_rows_for_warrant(item_map, broker_code, warrant_code)
 
+        queue_head = 0
         for sale in sales:
             sell_date = normalize_date_str(sale.get("日期", ""))
             sell_qty = int(sale.get("賣出股數", 0) or 0)
@@ -14394,16 +14776,28 @@ def simulate_group_outcomes_fifo(events, item_map):
             sell_price = sell_amount / sell_qty if sell_qty > 0 else 0
             sell_left = sell_qty
 
-            for ref in queue:
+            while queue_head < len(queue) and int(queue[queue_head]["lot"].get("剩餘股數", 0) or 0) <= 0:
+                queue_head += 1
+            for ref_index in range(queue_head, len(queue)):
+                ref = queue[ref_index]
                 if sell_left <= 0:
                     break
 
                 # 金額分級仍看當日完整買進力道，但持倉必須反映當日賣出；
                 # 同日沒有盤中順序，統一採 FIFO：先扣舊事件，再抵銷當日事件。
                 if sell_date < ref["event_end_date"]:
-                    continue
+                    break
 
                 lot = ref["lot"]
+
+                # 選用：權證代號重用時，新一輪權證的賣出不可拿來扣舊一輪的部位。
+                # 預設關閉以維持現行 ABCDE／TOP15 計算方式；設
+                # FIFO_ISOLATE_WARRANT_LIFECYCLE=1 才啟用。
+                if FIFO_ISOLATE_WARRANT_LIFECYCLE:
+                    lifecycle_end = ref.get("lifecycle_end_date")
+                    if lifecycle_end and sell_date > lifecycle_end:
+                        continue
+
                 remaining = int(lot.get("剩餘股數", 0) or 0)
                 if remaining <= 0:
                     continue
@@ -14452,6 +14846,12 @@ def simulate_group_outcomes_fifo(events, item_map):
 
         realized_revenue = sum(rec["賣出金額"] for rec in allocations_by_date.values())
         realized_cost = sum(rec["成本"] for rec in allocations_by_date.values())
+
+        # 記錄「哪些日子的賣出動到了這筆事件」。
+        # 減碼日只會記第一次減碼、出清日只會記最後一次，兩者都不足以判斷
+        # 「今天的賣出有沒有改到某個舊事件」；第二次以後的部分減碼會完全看不出來。
+        # daily 同步時要靠這份清單回頭刷新原本的事件日那幾列。
+        event["賣出影響日清單"] = sorted(allocations_by_date.keys())
 
         event["原始股數"] = original_total
         event["剩餘股數"] = remaining_total
@@ -14700,17 +15100,85 @@ def price_dates_after(prices, base_date):
     return [d for d in sorted(prices.keys()) if d > base_date]
 
 
+_MARKET_TRADING_CALENDAR_CACHE = {"dates": None}
+_MARKET_TRADING_CALENDAR_LOCK = threading.Lock()
+
+
+def get_market_trading_calendar():
+    """
+    市場交易日曆（升冪的 YYYY/MM/DD 字串）。
+
+    來源優先序：
+      1. MoneyDJ 0050 日 K（型態模組已在用的同一份）。0050 每個交易日一定有 K 棒，
+         颱風假、國定連假、臨時休市那幾天本來就不會出現，等於現成的交易所日曆。
+      2. 本機價格／分點歷史快取中真實出現過的日期。
+      3. 都取不到就回空清單，呼叫端自動退回舊的「用有價格的日子當日曆」行為。
+
+    整支程式只建立一次。
+    """
+    with _MARKET_TRADING_CALENDAR_LOCK:
+        cached = _MARKET_TRADING_CALENDAR_CACHE.get("dates")
+        if cached is not None:
+            return cached
+
+        dates = []
+        try:
+            today_key = normalize_date_str(datetime.today())
+            dates = [
+                day.strftime("%Y/%m/%d")
+                for day in _pattern_trading_dates_on_or_before(today_key)
+            ]
+        except Exception as exc:
+            print(f"  ⚠️ 市場交易日曆取得失敗（MoneyDJ）：{type(exc).__name__}: {exc}")
+
+        if not dates:
+            try:
+                dates = [
+                    day.strftime("%Y/%m/%d")
+                    for day in get_known_trading_dates()
+                ]
+                if dates:
+                    print(
+                        f"  ℹ️ 市場交易日曆改用本機快取推得：{len(dates):,} 個交易日"
+                    )
+            except Exception:
+                dates = []
+
+        _MARKET_TRADING_CALENDAR_CACHE["dates"] = dates
+        return dates
+
+
+def market_trading_dates_after(base_date, limit=20):
+    """回傳 base_date 之後的前 limit 個市場交易日；日曆不可用時回空清單。"""
+    base_key = normalize_date_str(base_date)
+    calendar = get_market_trading_calendar()
+    if not base_key or not calendar:
+        return []
+    start = bisect_right(calendar, base_key)
+    return calendar[start:start + max(int(limit), 0)]
+
+
 def build_dplus_dates(base_date, primary_prices, secondary_prices=None, limit=20):
     """
-    建立 D+1 ~ D+20 的交易日序列。
+    建立 D+1 ~ D+20 的日期序列。
 
-    原本用「權證價格日期 + 標的價格日期」聯集，容易造成 D+ 日期亂跳；
-    現在改成：
-    1. 優先使用標的股價格日期，因為標的股交易日最完整。
+    預設（DPLUS_STRICT_MARKET_CALENDAR=1）以交易所交易日曆定義：
+    D+N 就是事件日之後的第 N 個市場交易日，跟「我們有沒有抓到那天的價格」無關。
+
+    舊版是用「有價格的日子」當日曆，某一天價格整批缺失時，隔一個交易日就會遞補
+    上來冒充 D+N，序號會整段位移，D+20 也可能其實是市場的第 22 個交易日。
+
+    設 0 可回到舊行為：
+    1. 優先使用標的股價格日期。
     2. 標的股不足時，用權證價格日期補。
     3. 最後才用兩者聯集。
     """
     base_date = normalize_date_str(base_date)
+
+    if DPLUS_STRICT_MARKET_CALENDAR:
+        calendar_dates = market_trading_dates_after(base_date, limit)
+        if calendar_dates:
+            return calendar_dates
 
     primary_dates = price_dates_after(primary_prices or {}, base_date)
     secondary_dates = price_dates_after(secondary_prices or {}, base_date)
@@ -14734,7 +15202,7 @@ def calc_pct_by_base(current_price, base_price):
         current_price = float(current_price)
         base_price = float(base_price)
 
-        if base_price <= 0 or current_price <= 0:
+        if not math.isfinite(base_price) or not math.isfinite(current_price) or base_price <= 0 or current_price <= 0:
             return None
 
         return round((current_price - base_price) / base_price * 100, 2)
@@ -14744,6 +15212,9 @@ def calc_pct_by_base(current_price, base_price):
 
 
 
+
+
+_DPLUS_MISSING_PRICE_STATS = {"total": 0, "missing": 0}
 
 
 def make_group_day_cells(ev, price_cache):
@@ -14767,7 +15238,16 @@ def make_group_day_cells(ev, price_cache):
     for i, check_date in enumerate(future_dates[:20]):
         check_date = normalize_date_str(check_date)
 
-        u_p = get_price_on_or_before(u_prices, check_date) if u_prices else None
+        if DPLUS_STRICT_MARKET_CALENDAR:
+            # D+N 已經是交易所的第 N 個交易日；那天沒抓到價格就是真的缺值，
+            # 不可用前一個交易日的價格頂替，否則欄位會看起來「那天沒漲跌」。
+            u_p = safe_price_float(u_prices.get(check_date)) if u_prices else None
+            if u_p is None:
+                _DPLUS_MISSING_PRICE_STATS["missing"] += 1
+        else:
+            u_p = get_price_on_or_before(u_prices, check_date) if u_prices else None
+        _DPLUS_MISSING_PRICE_STATS["total"] += 1
+
         u_chg = calc_pct_by_base(u_p, buy_u)
 
         cell_text = f"標:{fmt_pct(u_chg)}"
@@ -14776,7 +15256,10 @@ def make_group_day_cells(ev, price_cache):
             status = "exit"
         elif ev["減碼日"] == check_date:
             status = "reduce"
-        elif u_chg is not None and u_chg > 0:
+        elif u_chg is None:
+            # 缺值不算勝也不算敗，避免把「沒資料」畫成綠色的下跌。
+            status = "none"
+        elif u_chg > 0:
             status = "win"
         else:
             status = "lose"
@@ -14931,15 +15414,36 @@ def _top15_find_item(item_map, broker_code, warrant_code):
     return None
 
 
+_TOP15_OBSERVED_DATES_CACHE = {}
+_TOP15_OBSERVED_DATES_LOCK = threading.Lock()
+
+
 def _top15_observed_market_dates(item_map=None, price_cache=None, target_date=None):
     """
     從既有價格快取與分點歷史收集實際出現過的市場交易日。
 
     不用星期一到星期五硬推交易日，避免國定假日被誤算；價格日期優先，
     分點歷史日期作為補充。回傳日期皆不晚於 target_date。
+
+    【效能】repair 會對 22 個統計日各呼叫一次，但這份「曾出現過的交易日」
+    只跟 price_cache／item_map 有關，跟統計日無關（統計日只是上界）。
+    因此改成整份掃一次快取後切片：同一組 price_cache + item_map 只掃一次，
+    之後每個統計日都是 O(log n) 的 bisect。
     """
     target_dt = parse_date(target_date) or datetime.today()
     target_text = target_dt.strftime("%Y/%m/%d")
+
+    cache_key = (id(item_map), id(price_cache))
+    with _TOP15_OBSERVED_DATES_LOCK:
+        cached = _TOP15_OBSERVED_DATES_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and cached[0] is item_map
+            and cached[1] is price_cache
+        ):
+            all_dates = cached[2]
+            return all_dates[:bisect_right(all_dates, target_text)]
+
     dates = set()
 
     seen_series_ids = set()
@@ -14953,7 +15457,7 @@ def _top15_observed_market_dates(item_map=None, price_cache=None, target_date=No
 
         for raw_date, raw_price in prices.items():
             dt = parse_date(raw_date)
-            if not dt or dt > target_dt:
+            if not dt:
                 continue
             if safe_price_float(raw_price) is None:
                 continue
@@ -14972,10 +15476,34 @@ def _top15_observed_market_dates(item_map=None, price_cache=None, target_date=No
 
         for raw_date in df["日期"].tolist():
             dt = parse_date(raw_date)
-            if dt and dt <= target_dt:
+            if dt:
                 dates.add(dt.strftime("%Y/%m/%d"))
 
-    return sorted(d for d in dates if d <= target_text)
+    all_dates = sorted(dates)
+    with _TOP15_OBSERVED_DATES_LOCK:
+        if len(_TOP15_OBSERVED_DATES_CACHE) > 8:
+            _TOP15_OBSERVED_DATES_CACHE.clear()
+        _TOP15_OBSERVED_DATES_CACHE[cache_key] = (item_map, price_cache, all_dates)
+
+    return all_dates[:bisect_right(all_dates, target_text)]
+
+
+_TOP15_HISTORY_INDEX_CACHE = {"ref": None, "index": {}}
+_TOP15_HISTORY_INDEX_LOCK = threading.Lock()
+
+
+def _get_top15_history_index(item_map):
+    """
+    取得與 item_map 綁定的「分點×權證 → 逐日流水」索引（惰性填充、跨統計日共用）。
+
+    索引內容只由 item_map 的 df 決定；同一次執行中 item_map 不會被改寫，
+    因此可以安全地在多個統計日之間重複使用。item_map 換人就整份重建。
+    """
+    with _TOP15_HISTORY_INDEX_LOCK:
+        if _TOP15_HISTORY_INDEX_CACHE["ref"] is not item_map:
+            _TOP15_HISTORY_INDEX_CACHE["ref"] = item_map
+            _TOP15_HISTORY_INDEX_CACHE["index"] = {}
+        return _TOP15_HISTORY_INDEX_CACHE["index"]
 
 
 def _top15_merge_lot_metadata(existing, incoming):
@@ -15079,6 +15607,10 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
     """
     date_set = set(recent_dates or [])
     lot_map = {}
+    # 【效能】這份「分點×權證 → 逐日流水」索引只由 item_map 決定，與統計日無關。
+    # repair 對 22 個統計日各呼叫一次本函式，舊版每次都從零重建整份索引；
+    # 改成同一個 item_map 共用一份，22 次只建一次。
+    history_index = _get_top15_history_index(item_map)
     item_map = item_map or {}
 
     def add_lot(
@@ -15132,21 +15664,31 @@ def collect_top15_return_position_lots(a_events, b_events, c_events, d_events, e
 
         start_date = normalize_date_str(start_date or event_date)
         end_date = normalize_date_str(end_date or start_date)
-        item = _top15_find_item(item_map, ev.get("券商代號", ""), warrant_code)
-        if not item:
+        history_key = (str(ev.get("券商代號", "")).strip(), warrant_code)
+        if history_key not in history_index:
+            item = _top15_find_item(item_map, history_key[0], warrant_code)
+            df = item.get("df") if item else None
+            indexed_rows = {}
+            if df is not None and not df.empty:
+                df2 = df.copy()
+                df2["日期"] = df2["日期"].map(normalize_date_str)
+                df2 = df2.sort_values("日期").reset_index(drop=True)
+                for row in df2.itertuples(index=False):
+                    record = row._asdict()
+                    indexed_rows.setdefault(record["日期"], []).append(record)
+            history_index[history_key] = (sorted(indexed_rows), indexed_rows)
+        dates, indexed_rows = history_index[history_key]
+        if not dates:
             return False
-
-        df = item.get("df", pd.DataFrame())
-        if df is None or df.empty:
-            return False
-
+        # 常見單日事件直接 O(1) 查找，舊版多日事件保留區間語意。
+        if start_date == end_date:
+            selected_dates = [start_date] if start_date in indexed_rows else []
+        else:
+            selected_dates = dates[bisect_right(dates, start_date):bisect_right(dates, end_date)]
+            if start_date in indexed_rows:
+                selected_dates.insert(0, start_date)
         added = False
-        df2 = df.copy()
-        df2["日期"] = df2["日期"].map(normalize_date_str)
-        df2 = df2.sort_values("日期").reset_index(drop=True)
-
-        for row in df2.itertuples(index=False):
-            row_dict = row._asdict()
+        for row_dict in (record for date in selected_dates for record in indexed_rows[date]):
             buy_date = normalize_date_str(row_dict.get("日期", ""))
             if not buy_date or buy_date < start_date or buy_date > end_date:
                 continue
@@ -15268,6 +15810,58 @@ def exclude_expired_top15_position_lots(position_lots, target_date):
     return kept, excluded, unknown
 
 
+_TOP15_PAIR_DAILY_MAP_CACHE = {"ref": None, "maps": {}}
+_TOP15_PAIR_DAILY_MAP_LOCK = threading.Lock()
+
+
+def _get_top15_pair_daily_map(item_map, pair_key, item):
+    """
+    取得某一組「分點×權證」的完整逐日彙總（不設日期上界），跨統計日共用。
+
+    回傳 {日期: {買進股數, 賣出股數, 買進金額, 賣出金額, 合成事件列}}。
+    呼叫端自行依統計日切片，因此同一組資料只需要彙總一次。
+    """
+    with _TOP15_PAIR_DAILY_MAP_LOCK:
+        if _TOP15_PAIR_DAILY_MAP_CACHE["ref"] is not item_map:
+            _TOP15_PAIR_DAILY_MAP_CACHE["ref"] = item_map
+            _TOP15_PAIR_DAILY_MAP_CACHE["maps"] = {}
+        cached = _TOP15_PAIR_DAILY_MAP_CACHE["maps"].get(pair_key)
+    if cached is not None:
+        return cached
+
+    df = item.get("df", pd.DataFrame()) if isinstance(item, dict) else pd.DataFrame()
+    daily_map = {}
+    if df is not None and not df.empty and "日期" in df.columns:
+        df2 = df.copy()
+        df2["日期"] = df2["日期"].map(normalize_date_str)
+        df2 = df2[df2["日期"].map(lambda x: bool(parse_date(x)))].copy()
+
+        for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
+            if col not in df2.columns:
+                df2[col] = 0
+            df2[col] = pd.to_numeric(df2[col], errors="coerce").fillna(0.0)
+
+        if not df2.empty:
+            grouped = df2.groupby("日期", as_index=False)[
+                ["買進股數", "賣出股數", "買進金額", "賣出金額"]
+            ].sum()
+            for row in grouped.itertuples(index=False):
+                row_dict = row._asdict()
+                date_text = normalize_date_str(row_dict.get("日期", ""))
+                daily_map[date_text] = {
+                    "買進股數": float(row_dict.get("買進股數", 0) or 0),
+                    "賣出股數": float(row_dict.get("賣出股數", 0) or 0),
+                    "買進金額": float(row_dict.get("買進金額", 0) or 0),
+                    "賣出金額": float(row_dict.get("賣出金額", 0) or 0),
+                    "合成事件列": False,
+                }
+
+    with _TOP15_PAIR_DAILY_MAP_LOCK:
+        if _TOP15_PAIR_DAILY_MAP_CACHE["ref"] is item_map:
+            _TOP15_PAIR_DAILY_MAP_CACHE["maps"][pair_key] = daily_map
+    return daily_map
+
+
 def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, window_start=None):
     """
     用完整可用分點歷史重建 FIFO，再只輸出仍未出清的 TOP15 事件 lot。
@@ -15334,28 +15928,15 @@ def apply_sales_to_top15_return_lots(position_lots, item_map, target_date, windo
                 rebuilt_event_lots.append(fallback)
             continue
 
-        df2 = df.copy()
-        df2["日期"] = df2["日期"].map(normalize_date_str)
-        df2 = df2[df2["日期"].map(lambda x: bool(parse_date(x)) and x <= target_text)].copy()
-
-        for col in ["買進股數", "賣出股數", "買進金額", "賣出金額"]:
-            if col not in df2.columns:
-                df2[col] = 0
-            df2[col] = pd.to_numeric(df2[col], errors="coerce").fillna(0.0)
-
-        daily_map = {}
-        if not df2.empty:
-            grouped = df2.groupby("日期", as_index=False)[["買進股數", "賣出股數", "買進金額", "賣出金額"]].sum()
-            for row in grouped.itertuples(index=False):
-                row_dict = row._asdict()
-                date_text = normalize_date_str(row_dict.get("日期", ""))
-                daily_map[date_text] = {
-                    "買進股數": float(row_dict.get("買進股數", 0) or 0),
-                    "賣出股數": float(row_dict.get("賣出股數", 0) or 0),
-                    "買進金額": float(row_dict.get("買進金額", 0) or 0),
-                    "賣出金額": float(row_dict.get("賣出金額", 0) or 0),
-                    "合成事件列": False,
-                }
+        # 【效能】逐日彙總只由 item 的 df 決定，與統計日無關（統計日只是上界）。
+        # 因此整份彙總一次後快取，各統計日只做日期切片；
+        # 舊版每個統計日都要對每一組重做 copy／map／to_numeric／groupby。
+        full_daily_map = _get_top15_pair_daily_map(item_map, key, item)
+        daily_map = {
+            date_text: dict(values)
+            for date_text, values in full_daily_map.items()
+            if date_text <= target_text
+        }
 
         # 若舊快取缺少事件當日原始流水，才用事件 lot 建立合成買進列，並在稽核欄標記。
         for buy_date, template in templates_by_date.items():
@@ -18195,6 +18776,8 @@ def build_top15_history_rows_for_current_run(
     for index, stat_date in enumerate(stat_dates, start=1):
         if workflow_is_repair():
             print(f"  🔄 TOP15 歷史快照 {index}/{len(stat_dates)}：{stat_date}")
+        count_event("TOP15 統計日快照次數")
+        _top15_stage_t = time.perf_counter()
         detail_rows, consensus_rows = build_top15_position_detail_and_consensus_rows(
             a_events,
             b_events,
@@ -18209,6 +18792,10 @@ def build_top15_history_rows_for_current_run(
             persistent_price_cache=persistent_price_cache,
             defer_price_save=defer_price_save,
             price_changed_codes=price_changed_codes,
+        )
+        record_stage_seconds(
+            "Step4b TOP15 每個統計日快照",
+            time.perf_counter() - _top15_stage_t,
         )
         all_detail_rows.extend(detail_rows)
         all_consensus_rows.extend(consensus_rows)
@@ -23084,6 +23671,20 @@ def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, pric
         f"C:{len(c_events)} 筆，D:{len(d_events)} 筆，E:{len(e_events)} 筆）"
     )
 
+    dplus_total = int(_DPLUS_MISSING_PRICE_STATS.get("total", 0) or 0)
+    dplus_missing = int(_DPLUS_MISSING_PRICE_STATS.get("missing", 0) or 0)
+    if DPLUS_STRICT_MARKET_CALENDAR and dplus_total > 0:
+        calendar_size = len(get_market_trading_calendar())
+        print(
+            f"  📅 D+ 交易日曆模式：市場交易日 {calendar_size:,} 天｜"
+            f"D+ 欄位 {dplus_total:,} 格｜其中 {dplus_missing:,} 格"
+            f"（{dplus_missing / dplus_total * 100:.2f}%）該交易日無標的價格，顯示為缺值"
+        )
+        if not calendar_size:
+            print(
+                "  ⚠️ 取不到市場交易日曆，D+ 已自動退回舊的『用有價格的日子當日曆』行為。"
+            )
+
 
 
 
@@ -23349,16 +23950,19 @@ def build_longterm_event_code_map(df):
         return {}
 
     event_map = {}
-    group_cols = ["分點", "券商代號", "標的股_norm", "日期"]
+    # 事件分類鍵只能用穩定識別：券商代號 + 標的股代號 + 日期。
+    # 舊版把「分點」顯示標籤也放進鍵，分點一改名（或來源標籤大小寫不同），
+    # 同一家券商同一天同一標的就會被拆成兩組，各自低於 100 萬門檻而分類失敗。
+    work["_券商代號鍵"] = work["券商代號"].map(normalize_broker_code_for_compare)
+    group_cols = ["_券商代號鍵", "標的股_norm", "日期"]
     for key, g in work.groupby(group_cols, dropna=False, sort=False):
-        broker_label, broker_code, underlying_code, trade_date = key
+        broker_code, underlying_code, trade_date = key
         total_amount = float(g["買進金額_num"].sum())
         max_amount = float(g["買進金額_num"].max())
         code = longterm_event_class_from_amount(total_amount, max_amount)
         if not code:
             continue
         event_map[(
-            str(broker_label).strip(),
             str(broker_code).strip(),
             str(underlying_code).strip(),
             normalize_date_str(trade_date),
@@ -23413,12 +24017,51 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
     event_code_map = build_longterm_event_code_map(df)
 
     open_lots = []
-    group_cols = ["分點", "分點名稱", "券商代號", "權證代號", "權證名稱", "標的股", "標的名稱"]
+    # 持倉身分只能用穩定代號：券商代號 + 權證代號。
+    # 舊版把分點名稱、權證名稱、標的名稱也放進 groupby，只要來源把權證名稱
+    # 更正一次（例如補上官方全名），同一分點同一權證就會被拆成兩組各自跑 FIFO，
+    # 買在改名前、賣在改名後的部位永遠扣不掉，帳上會留下不存在的留單。
+    df["_券商代號鍵"] = df["券商代號"].map(normalize_broker_code_for_compare)
+    df["_權證代號鍵"] = df["權證代號"].map(_normalize_warrant_code_for_identity)
+    df = df[(df["_券商代號鍵"] != "") & (df["_權證代號鍵"] != "")].copy()
+    if df.empty:
+        return []
+
+    group_cols = ["_券商代號鍵", "_權證代號鍵"]
+    _label_to_code, _code_to_label = configured_broker_pair_maps_for_scope("all")
+
+    def _latest_display_text(group, column):
+        """顯示欄位取「最後一筆非空值」，名稱更正後以最新寫法呈現。"""
+        if column not in group.columns:
+            return ""
+        values = [str(value or "").strip() for value in group[column].tolist()]
+        return next((value for value in reversed(values) if value), "")
 
     for key, g in df.groupby(group_cols, dropna=False, sort=False):
-        broker_label, broker_name, broker_code, warrant_code, warrant_name, underlying_code, underlying_name = key
-        lots = []
+        broker_code, warrant_code = key
         g = g.sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
+
+        # 顯示名稱獨立於身分：只影響呈現，不影響 FIFO 分組。
+        broker_label = _latest_display_text(g, "分點")
+        broker_name = _latest_display_text(g, "分點名稱") or broker_label
+        warrant_name = _latest_display_text(g, "權證名稱")
+        underlying_norm = normalize_underlying_code_for_group(
+            _latest_display_text(g, "標的股")
+        )
+        underlying_name = str(
+            _CURRENT_STOCK_CODE_TO_NAME.get(underlying_norm, "")
+            or _latest_display_text(g, "標的名稱")
+        ).strip()
+
+        canonical_broker = _code_to_label.get(broker_code)
+        if canonical_broker:
+            broker_label, broker_code = canonical_broker
+            broker_name = str(
+                FULL_FALLBACK.get(broker_label, (broker_label, broker_code))[0]
+                or broker_label
+            ).strip()
+
+        lots = []
 
         for rd in g.to_dict("records"):
             trade_dt = rd.get("dt_parsed")
@@ -23429,10 +24072,8 @@ def rebuild_longterm_open_lots_from_history(history_df, target_date):
             buy_qty = float(rd.get("買進股數", 0) or 0)
             buy_amount = float(rd.get("買進金額", 0) or 0)
             if buy_qty > 0 and buy_amount > 0:
-                underlying_norm = normalize_underlying_code_for_group(underlying_code)
                 event_info = event_code_map.get((
-                    str(broker_label).strip(),
-                    str(broker_code).strip(),
+                    normalize_broker_code_for_compare(broker_code),
                     str(underlying_norm).strip(),
                     trade_date,
                 ), {})
@@ -23572,40 +24213,48 @@ def _winrate_event_date(event):
 
 def _warrant_lifecycle_for_event_lot(code, buy_date, target_date):
     """
-    依買進日選出正確的權證生命週期，避免權證代號重用時誤拿到新一輪價格。
-    回傳 (上市日, 最後交易日)；找不到生命週期時回傳 (None, None)。
+    依買進日鎖定權證生命週期，回傳 (狀態, 上市日, 最後交易日)。
+
+    狀態三種，缺一不可：
+      "confirmed"  買進日確實落在某一段生命週期內，可安全估值。
+      "no_master"  主檔完全沒有這個代號的生命週期，維持舊行為不設邊界。
+      "ambiguous"  主檔有這個代號、但沒有任何一段涵蓋買進日。
+
+    "ambiguous" 是代號重用的典型徵兆：例如買進日 2026/01/01，主檔卻只剩
+    2026/08/01 起的新一輪權證。舊版在這裡會退而求其次挑「target_date 之前最晚
+    的那一段」，等於拿「新權證」的上市／到期區間與價格去估「舊權證」的部位，
+    可能算出完全不相干的報酬率。現在一律回報 ambiguous，交由呼叫端排除，
+    寧可少算一筆也不要算出錯的一筆。
     """
     code = normalize_price_code(code)
     buy_dt = parse_date(buy_date)
-    target_dt = parse_date(target_date) or datetime.today()
     intervals = (_get_warrant_price_lifecycle_index() or {}).get(code, [])
     if not intervals:
-        return None, None
+        return "no_master", None, None
 
-    containing = []
-    for list_dt, end_dt in intervals:
-        if buy_dt:
-            if list_dt and buy_dt < list_dt:
-                continue
-            if end_dt and buy_dt > end_dt:
-                continue
-            containing.append((list_dt, end_dt))
+    if not buy_dt:
+        # 沒有買進日就無從鎖定；有多段生命週期時不可任意挑一段。
+        if len(intervals) == 1:
+            return "confirmed", intervals[0][0], intervals[0][1]
+        return "ambiguous", None, None
 
-    candidates = containing or [
+    containing = [
         (list_dt, end_dt)
         for list_dt, end_dt in intervals
-        if not list_dt or list_dt <= target_dt
+        if not (list_dt and buy_dt < list_dt)
+        and not (end_dt and buy_dt > end_dt)
     ]
-    if not candidates:
-        return None, None
+    if not containing:
+        return "ambiguous", None, None
 
-    return max(
-        candidates,
+    list_dt, end_dt = max(
+        containing,
         key=lambda value: (
             value[0] or datetime.min,
             value[1] or datetime.max,
         ),
     )
+    return "confirmed", list_dt, end_dt
 
 
 def _winrate_lot_price_info(price_cache, lot, target_date):
@@ -23620,11 +24269,31 @@ def _winrate_lot_price_info(price_cache, lot, target_date):
     code = normalize_price_code(lot.get("權證代號", ""))
     buy_date = normalize_date_str(lot.get("買進日", ""))
     target_dt = parse_date(target_date) or datetime.today()
-    list_dt, end_dt = _warrant_lifecycle_for_event_lot(
+    lifecycle_status, list_dt, end_dt = _warrant_lifecycle_for_event_lot(
         code,
         buy_date,
         target_date,
     )
+
+    # 代號重用：主檔有這個代號但沒有一段涵蓋買進日。此時任何價格都可能屬於
+    # 另一檔權證，不可用來估值，直接回報未解析交由上游排除並列入稽核。
+    if lifecycle_status == "ambiguous":
+        return (
+            None,
+            "",
+            "權證代號重用疑慮：買進日不在任何已知生命週期內，不估值",
+            False,
+            True,
+        )
+    if lifecycle_status == "no_master" and WINRATE_REQUIRE_KNOWN_LIFECYCLE:
+        return (
+            None,
+            "",
+            "權證生命週期未確認：主檔查無此代號，不估值",
+            False,
+            True,
+        )
+
     delisted = bool(end_dt and end_dt.date() < target_dt.date())
     valuation_dt = min(target_dt, end_dt) if end_dt else target_dt
 
@@ -24527,35 +25196,62 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
 # MoneyDJ API4／API5 資料來源（V10.1）
 # ══════════════════════════════════════════════════════════════════════
 
-def _moneydj_json_rows(response_content):
-    # MoneyDJ API4 每次回應內含 2 個內容完全相同（只是排序不同）的 ResultSet 物件；
-    # 舊版直接 extend 兩個，等於每一列都重複一次。下游雖多半以 dict key 去重不受影響，
-    # 但只要有人對列數做加總／計數就會被灌成兩倍，這裡先逐列去重。
-    data = json.loads(response_content.decode("utf-8"))
-    rows = []
-    seen = set()
-    for item in data if isinstance(data, list) else [data]:
-        if not isinstance(item, dict):
-            continue
-        result_set = item.get("ResultSet", {})
-        result = result_set.get("Result", []) if isinstance(result_set, dict) else []
+MONEYDJ_MAX_INVALID_ROW_RATIO = min(max(
+    float(os.getenv("MONEYDJ_MAX_INVALID_ROW_RATIO", "0.01")), 0.0), 1.0)
+
+
+def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_name="MoneyDJ"):
+    """外層結構嚴格；獨立交易列略過並計數，超過比例或全部無效則拒收。"""
+    stats = {"source": source_name, "total": 0, "invalid": 0, "valid": 0, "ratio": 0.0}
+    _THREAD_LOCAL.moneydj_parse_stats = stats
+    data = json.loads(response_content.decode("utf-8-sig"))
+    blocks = data if isinstance(data, list) else [data]
+    if not blocks:
+        raise ValueError("MoneyDJ 缺少 ResultSet，無法確認為合法空交易資料")
+    rows, seen = [], set()
+    for item in blocks:
+        if not isinstance(item, dict) or not isinstance(item.get("ResultSet"), dict):
+            raise ValueError("MoneyDJ 回應缺少 ResultSet")
+        result = item["ResultSet"].get("Result")
         if not isinstance(result, list):
-            continue
+            raise ValueError("MoneyDJ Result 必須為 list；格式異常不可當成無交易")
         for row in result:
-            if not isinstance(row, dict):
-                rows.append(row)
-                continue
-            key = tuple(sorted((str(k), str(v)) for k, v in row.items()))
+            # API4 重複 ResultSet 不可灌大分母，掩蓋異常比例。
+            key = json.dumps(row, sort_keys=True, ensure_ascii=False)
             if key in seen:
                 continue
             seen.add(key)
+            stats["total"] += 1
+            if not isinstance(row, dict) or any(
+                field not in row or row[field] is None or
+                (isinstance(row[field], str) and not row[field].strip())
+                for field in required_fields
+            ):
+                stats["invalid"] += 1
+                continue
             rows.append(row)
+    stats["valid"] = len(rows)
+    stats["ratio"] = stats["invalid"] / stats["total"] if stats["total"] else 0.0
+    if stats["invalid"]:
+        print(f"  ⚠️ {source_name} 異常交易列：{stats['invalid']}/{stats['total']} "
+              f"({stats['ratio']:.2%})，門檻 {MONEYDJ_MAX_INVALID_ROW_RATIO:.2%}")
+        if not rows or stats["ratio"] > MONEYDJ_MAX_INVALID_ROW_RATIO:
+            raise ValueError(f"{source_name} 異常列比例超標或無有效列")
     return rows
 
 
 def api4_get_with_status(code, start_date, end_date):
+    started = time.perf_counter()
+    try:
+        return _api4_get_with_status_inner(code, start_date, end_date)
+    finally:
+        record_stage_seconds("MoneyDJ API4（累計執行緒時間）", time.perf_counter() - started)
+
+
+def _api4_get_with_status_inner(code, start_date, end_date):
     url = MONEYDJ_API4_URL.format(code=code, start=start_date, end=end_date)
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
+        count_event("MoneyDJ API4 HTTP 請求")
         try:
             response = get_thread_session().get(
                 url,
@@ -24566,7 +25262,7 @@ def api4_get_with_status(code, start_date, end_date):
                 ),
             )
             response.raise_for_status()
-            return _moneydj_json_rows(response.content), True
+            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2', 'V3'), source_name="API4"), True
         except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
             if attempt < MONEYDJ_MAX_RETRIES:
                 time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
@@ -24577,6 +25273,14 @@ def api4_get_with_status(code, start_date, end_date):
 
 
 def api5_get_with_status(warrant_code, broker_code, history_limit=None):
+    started = time.perf_counter()
+    try:
+        return _api5_get_with_status_inner(warrant_code, broker_code, history_limit)
+    finally:
+        record_stage_seconds("MoneyDJ API5（累計執行緒時間）", time.perf_counter() - started)
+
+
+def _api5_get_with_status_inner(warrant_code, broker_code, history_limit=None):
     request_limit = max(int(history_limit or MONEYDJ_API5_HISTORY_LIMIT), 1)
     url = MONEYDJ_API5_URL.format(
         warrant=warrant_code,
@@ -24584,6 +25288,7 @@ def api5_get_with_status(warrant_code, broker_code, history_limit=None):
         limit=request_limit,
     )
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
+        count_event("MoneyDJ API5 HTTP 請求")
         try:
             response = get_thread_session().get(
                 url,
@@ -24594,7 +25299,7 @@ def api5_get_with_status(warrant_code, broker_code, history_limit=None):
                 ),
             )
             response.raise_for_status()
-            return _moneydj_json_rows(response.content), True
+            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2', 'V3', 'V4', 'V5'), source_name="API5"), True
         except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
             if attempt < MONEYDJ_MAX_RETRIES:
                 time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
@@ -25239,6 +25944,9 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
         )
         return baseline, {"accepted": False, "reason": "prescan_ratio"}
 
+    if MONEYDJ_PRESCAN_STRICT and MONEYDJ_PRESCAN_FAILED_CODES:
+        return baseline, {"accepted": False, "reason": "prescan_failed_strict"}
+
     if not candidates:
         print("  ⚠️ repair 放棄重建：API4 在保留窗口內找不到任何追蹤分點交易。")
         return baseline, {"accepted": False, "reason": "no_candidate"}
@@ -25268,7 +25976,7 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
                 item, ok = future.result()
             except Exception:
                 item, ok = None, False
-            if not ok:
+            if not ok or item is None or item.get("df", pd.DataFrame()).empty:
                 unresolved.append(candidate)
             elif item:
                 fetched_items.append(item)
@@ -25298,7 +26006,7 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
                     item, ok = future.result()
                 except Exception:
                     item, ok = None, False
-                if not ok:
+                if not ok or item is None or item.get("df", pd.DataFrame()).empty:
                     still_failed.append(candidate)
                 elif item:
                     fetched_items.append(item)
@@ -25343,7 +26051,7 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
                 old["券商代號"].map(normalize_broker_code_for_compare),
             )
         )
-        in_window = old["日期"] >= window_start_key
+        in_window = (old["日期"] >= window_start_key) & (old["日期"] <= target_key)
         refetched_mask = pd.Series(
             [pair in refetched_pairs for pair in old_pairs],
             index=old.index,
@@ -25646,10 +26354,31 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
                 ],
                 index=old.index,
             )
-        old = old[
-            (old["日期"] != _MONEYDJ_TARGET_DATE)
-            | preserve_missing_mask
-        ].copy()
+        active_codes = {
+            normalize_broker_code_for_compare(code)
+            for _name, code in broker_map.values()
+        }
+        failed_codes = {
+            _normalize_warrant_code_for_identity(code)
+            for code in MONEYDJ_PRESCAN_FAILED_CODES
+        }
+        failed_pairs = {
+            (_normalize_warrant_code_for_identity(candidate[0]),
+             normalize_broker_code_for_compare(candidate[6]))
+            for candidate in unresolved_candidates
+        }
+        failed_pair_mask = pd.Series(
+            [pair in failed_pairs for pair in zip(old_warrant_codes, old_broker_codes)],
+            index=old.index,
+        )
+        replace_mask = (
+            (old["日期"] == _MONEYDJ_TARGET_DATE)
+            & old_broker_codes.isin(active_codes)
+            & ~old_warrant_codes.isin(failed_codes)
+            & ~preserve_missing_mask
+            & ~failed_pair_mask
+        )
+        old = old[~replace_mask].copy()
     combined = (
         pd.concat([old, new_df], ignore_index=True)
         if new_df is not None and not new_df.empty
@@ -25726,6 +26455,18 @@ def evaluate_empty_result_source_completeness(
     missing_brokers = sorted(active_labels - set((broker_map or {}).keys()))
     if missing_brokers:
         reasons.append(f"追蹤分點代號不完整：缺少 {len(missing_brokers)} 個")
+
+    # 母體（掃描清單）本身的完整性必須納入判斷。
+    # API4 的「成功率」只證明「掃到的那份清單」抓得順，不能證明清單本身是完整的：
+    # 官方權證來源失敗時程式會沿用舊快取並把 LIVE_WARRANT_SNAPSHOT_READY 設為
+    # False，此時新上市權證根本不在掃描清單裡，再高的成功率也掃不到它們。
+    # 舊版沒有檢查這個旗標，等於「漏掉整批新權證」還會被判定為資料完整。
+    if not LIVE_WARRANT_SNAPSHOT_READY:
+        reasons.append(
+            "權證母體未更新：官方權證來源本次失敗，掃描清單沿用舊快取，"
+            "新上市權證不在本次掃描範圍內"
+        )
+
     if not _MONEYDJ_SOURCE_REACHABLE:
         reasons.append("MoneyDJ API4 本次沒有任何成功請求")
     elif MONEYDJ_PRESCAN_TOTAL_REQUESTS > 0:
@@ -25747,7 +26488,74 @@ def evaluate_empty_result_source_completeness(
 # 主流程
 # ══════════════════════════════════════════════════════════════════════
 
+def event_dates_touched_by_sells_on(
+    a_events,
+    b_events,
+    c_events,
+    d_events,
+    e_events,
+    sell_date,
+):
+    """
+    找出「事件日不是今天、但今天的賣出動到它」的那些事件日。
+
+    daily 每天只重寫 refresh_date 指定的那幾列，所以三個月前的事件今天被賣掉時，
+    Google Sheet 上那一列的出清日、出清獲利%、剩餘股數與 D+ 欄位全都還停在舊值。
+    這裡把受影響的事件日一併列進刷新清單，讓那幾列跟著更新。
+
+    只回傳「有需要」的日期，不會把整份歷史都拉進來重寫。
+    """
+    sell_key = normalize_date_str(sell_date)
+    if not sell_key:
+        return []
+
+    affected = set()
+    for _event_code, event_group in iter_amount_class_event_groups(
+        a_events, b_events, c_events, d_events, e_events
+    ):
+        for event in event_group:
+            if sell_key not in set(event.get("賣出影響日清單", [])):
+                continue
+            event_date = normalize_date_str(
+                event.get("事件日")
+                or event.get("結束日")
+                or event.get("起始日")
+            )
+            if event_date and event_date != sell_key:
+                affected.add(event_date)
+
+    return sorted(affected)
+
+
+def history_for_report(history_df, broker_map, target_date):
+    """報表只讀本次分點與統計日以前資料，保留持久化快取中的其他日期與分點。"""
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+    target_dt = parse_date(target_date)
+    if target_dt is None:
+        raise ValueError("報表統計日無效")
+    active_codes = {
+        normalize_broker_code_for_compare(code)
+        for _name, code in broker_map.values()
+    }
+    dates = history_df["日期"].map(parse_date)
+    codes = history_df["券商代號"].map(normalize_broker_code_for_compare)
+    return history_df[dates.notna() & (dates <= target_dt) & codes.isin(active_codes)].copy()
+
+
 def main():
+    """
+    對外進入點：不論正常結束、提前 return 或例外，都保證印出分段耗時。
+    真正的流程在 _main_impl()；這層只負責把效能數據吐出來。
+    """
+    started = time.time()
+    try:
+        return _main_impl()
+    finally:
+        print_stage_profile(total_seconds=time.time() - started)
+
+
+def _main_impl():
     global _PRICE_PLAN_MAX_PUBLISHED_DATE
     global FORCE_FULL_CACHE_REFRESH
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
@@ -25772,16 +26580,23 @@ def main():
     print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}")
     print("=" * 70)
 
+    _stage_t = time.perf_counter()
     warrants = get_all_call_warrants()
+    record_stage_seconds("Step1 權證母體", time.perf_counter() - _stage_t)
     if not warrants:
         print("  ⚠️ 權證清單無法取得，本次停止，不修改 Google Sheet。")
         return
+
+    _stage_t = time.perf_counter()
     broker_map = filter_broker_map_for_active_targets(find_broker_codes_moneydj(warrants))
+    record_stage_seconds("Step2 分點代號", time.perf_counter() - _stage_t)
     if not broker_map:
         print("  ⚠️ MoneyDJ 分點代號無法取得，本次停止，不修改 Google Sheet。")
         return
 
+    _stage_t = time.perf_counter()
     run_automatic_cache_maintenance(warrants)
+    record_stage_seconds("快取維護", time.perf_counter() - _stage_t)
     if workflow_is_longterm():
         run_longterm_workflow(warrants, broker_map, output_path, program_start)
         return
@@ -25806,11 +26621,16 @@ def main():
         print(f"  ✅ repair 基準交易日：{repair_target_date}")
         _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(repair_target_date)
 
+        _stage_t = time.perf_counter()
         history_cache_df, rebuild_status = rebuild_full_history_from_moneydj(
             warrants,
             broker_map,
             history_cache_df,
             repair_target_date,
+        )
+        record_stage_seconds(
+            "Step3 repair 完整歷史重建（API4+API5）",
+            time.perf_counter() - _stage_t,
         )
         if not rebuild_status.get("accepted"):
             print(
@@ -25895,11 +26715,16 @@ def main():
             f"{_PRICE_PLAN_MAX_PUBLISHED_DATE}"
         )
 
+        _stage_t = time.perf_counter()
         history_cache_df = refresh_history_from_moneydj(
             warrants,
             broker_map,
             history_cache_df,
             target_date,
+        )
+        record_stage_seconds(
+            "Step3 daily 當日抓取（API4+API5）",
+            time.perf_counter() - _stage_t,
         )
 
         source_complete, source_reasons = evaluate_empty_result_source_completeness(
@@ -25913,12 +26738,18 @@ def main():
                 print(f"    - {reason}")
             return
 
-    items = items_from_history_cache(history_cache_df)
+    _stage_t = time.perf_counter()
+    items = items_from_history_cache(history_for_report(history_cache_df, broker_map, target_date))
     item_map = {(item["broker_code"], item["warrant_code"]): item for item in items}
     daily_records = build_daily_records(items)
+    record_stage_seconds("Step3c 歷史轉 items／daily", time.perf_counter() - _stage_t)
+    count_event("items（分點×權證組合）", len(items))
+    count_event("daily_records（逐日交易列）", len(daily_records))
 
     print("【Step 3c】建立 A/B/C/D/E 金額強度事件...")
+    _stage_t = time.perf_counter()
     amount_events = build_amount_class_events(daily_records, item_map)
+    record_stage_seconds("Step3c ABCDE 事件＋FIFO", time.perf_counter() - _stage_t)
     a_events, b_events, c_events, d_events, e_events = [amount_events.get(code, []) for code in AMOUNT_CLASS_CODES]
     print(f"  ✅ 金額強度事件：A:{len(a_events):,}｜B:{len(b_events):,}｜C:{len(c_events):,}｜D:{len(d_events):,}｜E:{len(e_events):,}")
 
@@ -25996,7 +26827,7 @@ def main():
                     "僅重建 ABCDE 事件，不重抓 MoneyDJ。"
                 )
 
-            items = items_from_history_cache(history_cache_df)
+            items = items_from_history_cache(history_for_report(history_cache_df, broker_map, target_date))
             item_map = {
                 (item["broker_code"], item["warrant_code"]): item
                 for item in items
@@ -26078,14 +26909,20 @@ def main():
             f"{len(checked_names):,} 個日期化權證全部具有名稱"
         )
 
+    _stage_t = time.perf_counter()
     persistent_price_cache = load_price_cache()
+    record_stage_seconds("Step4 讀取價格快取", time.perf_counter() - _stage_t)
+    count_event("價格快取代號數", len(persistent_price_cache))
+
     all_changed_price_codes = set()
+    _stage_t = time.perf_counter()
     price_cache, changed_codes = fetch_all_prices(
         a_events, b_events, c_events, d_events, e_events,
         persistent_price_cache=persistent_price_cache,
         defer_save=True,
         incremental_target_date=(None if workflow_is_repair() else target_date),
     )
+    record_stage_seconds("Step4 標的股價格", time.perf_counter() - _stage_t)
     all_changed_price_codes.update(changed_codes)
 
     if workflow_is_repair() and WINRATE_MARK_TO_MARKET_REPAIR_ENABLED:
@@ -26229,16 +27066,21 @@ def main():
         print(f"  ✅ 已從同一份{history_source_label}切出精選五分點：{len(selected_items):,} 組，{price_note}。")
 
     if all_changed_price_codes:
+        _stage_t = time.perf_counter()
         save_price_cache(persistent_price_cache, changed_codes=all_changed_price_codes)
+        record_stage_seconds("Step4 儲存價格快取", time.perf_counter() - _stage_t)
     else:
         print("  ✅ 價格快取沒有新增或更新，略過儲存。")
 
+    _stage_t = time.perf_counter()
     warrant_consensus_7d_rows = broker_10d_detail_rows = broker_10d_winrate_rank_rows = None
     if workflow_is_repair() and RUN_MODE == 2:
         warrant_consensus_7d_rows = build_7d_warrant_consensus_top15_rows(items, target_date)
         broker_10d_detail_rows = build_10d_broker_underlying_detail_rows(items, price_cache, target_date)
         broker_10d_winrate_rank_rows = build_10d_broker_winrate_rank_rows(broker_10d_detail_rows)
+    record_stage_seconds("Step4 repair 延伸報表（7/14/21日＋近10日）", time.perf_counter() - _stage_t)
 
+    _stage_t = time.perf_counter()
     build_excel(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache, items, output_path,
@@ -26247,6 +27089,7 @@ def main():
         broker_10d_detail_rows=broker_10d_detail_rows,
         broker_10d_winrate_rank_rows=broker_10d_winrate_rank_rows,
     )
+    record_stage_seconds("Step5 建立 Excel", time.perf_counter() - _stage_t)
 
     extra_scope_values = None
     if RUN_MODE == 2:
@@ -26269,19 +27112,64 @@ def main():
             "不重新抓歷史 API"
         )
 
+    # 舊事件今天被賣掉時，一併刷新原本那幾個事件日的列，
+    # 讓出清日／出清獲利%／剩餘股數／D+ 欄位不會停留在舊狀態。
+    if not workflow_is_repair():
+        sell_touched_dates = event_dates_touched_by_sells_on(
+            a_events, b_events, c_events, d_events, e_events,
+            target_date,
+        )
+        if sell_touched_dates:
+            current_dates = (
+                set(sheet_refresh_dates)
+                if isinstance(sheet_refresh_dates, (list, tuple, set))
+                else {sheet_refresh_dates}
+            )
+            new_dates = sorted(set(sell_touched_dates) - current_dates)
+            sheet_refresh_dates = sorted(current_dates | set(sell_touched_dates))
+            print(
+                f"  🔄 今日賣出影響舊事件：同步刷新 {len(new_dates):,} 個事件日"
+                f"（{new_dates[0]} ～ {new_dates[-1]}）；不重新抓歷史 API"
+                if new_dates
+                else "  ✅ 今日賣出只影響今日事件，無需額外刷新舊事件日"
+            )
+            if not GSHEET_DAILY_SNAPSHOT_REPLACE and new_dates:
+                print(
+                    "  ⚠️ GSHEET_DAILY_SNAPSHOT_REPLACE=0：這些舊事件日只會被"
+                    "「新增缺少的列」，既有列不會被覆蓋更新。要讓出清狀態真的寫回去，"
+                    "需設定 GSHEET_DAILY_SNAPSHOT_REPLACE=1。"
+                )
+
+    top15_refresh_pairs = []
+    if TOP15_CACHE_ENABLED:
+        if build_main_scope_top15:
+            top15_refresh_pairs.extend(
+                (main_top15_scope, date_key)
+                for date_key in top15_stat_dates_for_current_run(item_map, price_cache, target_date)
+            )
+        if RUN_MODE == 2:
+            top15_refresh_pairs.extend(
+                ("精選五分點", date_key)
+                for date_key in top15_stat_dates_for_current_run(selected_item_map, price_cache, target_date)
+            )
+
+    _stage_t = time.perf_counter()
     upload_excel_to_google_sheet(
         output_path,
         data_scope="全分點" if RUN_MODE == 2 else "精選五分點",
         allowed_titles=(FULL_REPAIR_RESULT_SHEET_TITLES if workflow_is_repair() else DAILY_RESULT_SHEET_TITLES),
         extra_scope_values=extra_scope_values,
         refresh_date=sheet_refresh_dates,
+        top15_refresh_pairs=top15_refresh_pairs,
     )
+    record_stage_seconds("Step6 同步 Google Sheet", time.perf_counter() - _stage_t)
 
     elapsed = time.time() - program_start
     print(f"\n{'=' * 70}")
     print("✅ Hybrid V10.1 完成！")
     print(f"📄 {output_path}")
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
+    print_stage_profile(total_seconds=elapsed)
 
 
 if __name__ == "__main__":
