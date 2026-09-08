@@ -165,7 +165,7 @@ def print_stage_profile(total_seconds=None):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT6"
+PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT7"
 # workflow 的版本驗證是 `grep -F`（純字串搜尋），保留下面這行舊 ID，
 # 讓還沒更新 EXPECTED_BUILD_ID 的 workflow 也能通過驗證後執行本版。
 # 相容舊版本驗證字串：HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R17
@@ -227,6 +227,12 @@ SELL_DETAIL_DAYS = int(os.getenv("SELL_DETAIL_DAYS", "3"))
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "80"))
+# daily 增量模式要不要載入「全部 A~E 事件」標的股的歷史價格快取。
+# 1（預設）＝載入，D+ 欄位才算得出來；0＝退回舊行為，只載入當日事件的標的股。
+# 這只影響「從本機快取載入多少代號」，抓取量不變（目標日走全市場批次）。
+DAILY_PRICE_LOAD_ALL_EVENT_CODES = os.getenv(
+    "DAILY_PRICE_LOAD_ALL_EVENT_CODES", "1"
+).strip().lower() not in ("0", "false", "no")
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
 WARRANT_NAME_ALLOW_MARKED_FALLBACK = os.getenv(
     "WARRANT_NAME_ALLOW_MARKED_FALLBACK",
@@ -15287,7 +15293,22 @@ def fetch_all_prices(
             dt = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日"))
             if dt:
                 if incremental_target_dt:
-                    if dt.date() != incremental_target_dt.date():
+                    # 【重要】daily 只跟官方要「目標日」的價格，但「要載入哪些代號的
+                    # 歷史快取」必須涵蓋全部事件，兩件事不能混為一談。
+                    #
+                    # 舊版在這裡對「事件日不是今天」的事件直接 continue，代號連
+                    # 收集都沒收集到，結果 price_cache 只有今天發生事件的 9 檔標的股；
+                    # 其餘 2,800 多筆舊事件的 D+ 欄位全部查不到價格
+                    # （實測 33,659 格裡有 30,805 格、91.52% 顯示為缺值）。
+                    # 諷刺的是 price_cache.csv 磁碟上有 7,809 個代號、639,507 筆，
+                    # 資料一直都在，只是沒被讀進記憶體。
+                    #
+                    # 這裡放行不會增加抓取量：下面的迴圈在 incremental 模式一律
+                    # 只把目標日放進 fetch_plan，而目標日走的是全市場批次，
+                    # 一天最多 2 個請求，代號多寡不影響。
+                    if not DAILY_PRICE_LOAD_ALL_EVENT_CODES and (
+                        dt.date() != incremental_target_dt.date()
+                    ):
                         continue
                     start_dt = incremental_target_dt
                     end_dt = incremental_target_dt
@@ -26191,6 +26212,15 @@ def _moneydj_scan_candidates(
             f"仍失敗 {len(still_failed):,} 檔"
         )
         failed_warrants = still_failed
+        # 復原 0 檔代表這批不是暫時性失敗，而是每次都以相同方式被拒絕
+        # （實測第 2、3 輪各花 6 分鐘、各復原 0 檔，純浪費 12 分鐘）。
+        # 再跑下去結果不會變，直接收手把時間留給後面的階段。
+        if recovered == 0 and failed_warrants:
+            print(
+                f"    ⏹️ 本輪沒有復原任何一檔，判定剩下的 {len(failed_warrants):,} 檔"
+                "屬於穩定失敗而非暫時性失敗，停止後續復原輪。"
+            )
+            break
 
     MONEYDJ_PRESCAN_FAILED_CODES = [
         _normalize_warrant_code_for_identity(warrant.get("代號", ""))
