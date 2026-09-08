@@ -165,7 +165,7 @@ def print_stage_profile(total_seconds=None):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT4"
+PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT6"
 # workflow 的版本驗證是 `grep -F`（純字串搜尋），保留下面這行舊 ID，
 # 讓還沒更新 EXPECTED_BUILD_ID 的 workflow 也能通過驗證後執行本版。
 # 相容舊版本驗證字串：HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R17
@@ -254,7 +254,12 @@ HISTORY_CACHE_PATH = os.path.join(CACHE_DIR, "broker_warrant_history_cache.csv")
 PRICE_CACHE_PATH = os.path.join(CACHE_DIR, "price_cache.csv")
 
 # MoneyDJ 分點資料來源設定（V10.1）
-MONEYDJ_HISTORY_WORKERS = max(int(os.getenv("MONEYDJ_HISTORY_WORKERS", "50")), 1)
+# API5（逐權證×分點歷史）是 repair 的最大單一開銷：實測 161,613 次請求、
+# 累計 54,843 秒，但單次平均只有 0.34 秒且 0 次失敗 —— 代表瓶頸在併發數不是對方
+# 速度。50 → 80 預期可讓 Step3 的 2,960 秒再降三到四成。
+# 若 MoneyDJ 開始限流（分段統計會出現 API5 失敗或重試暴增），
+# 在 workflow env 加一行 MONEYDJ_HISTORY_WORKERS: 50 即可立刻退回舊值。
+MONEYDJ_HISTORY_WORKERS = max(int(os.getenv("MONEYDJ_HISTORY_WORKERS", "80")), 1)
 MONEYDJ_PRESCAN_WORKERS = max(int(os.getenv("MONEYDJ_PRESCAN_WORKERS", "60")), 1)
 MONEYDJ_RECENT_SCAN_DAYS = max(int(os.getenv("MONEYDJ_RECENT_SCAN_DAYS", "50")), 1)
 MONEYDJ_API5_HISTORY_LIMIT = max(int(os.getenv("MONEYDJ_API5_HISTORY_LIMIT", os.getenv("HISTORY_RETENTION_TRADING_DAYS", "200"))), 1)
@@ -400,6 +405,12 @@ OFFICIAL_ISIN_SNAPSHOT_MODE = (
 )
 if OFFICIAL_ISIN_SNAPSHOT_MODE not in ("auto", "always", "never"):
     OFFICIAL_ISIN_SNAPSHOT_MODE = "auto"
+# ISIN 一覽表實測要跑 373 秒（Step1 的 92%），而且同一天內容不會變。
+# 與官方權證基本資料同款：本機快照沒過期就直接沿用，不再整份重抓。
+OFFICIAL_ISIN_SNAPSHOT_CACHE_HOURS = max(
+    float(os.getenv("OFFICIAL_ISIN_SNAPSHOT_CACHE_HOURS", "6")),
+    0.0,
+)
 OFFICIAL_STOCK_MASTER_MIN_CODES = max(
     int(os.getenv("OFFICIAL_STOCK_MASTER_MIN_CODES", "1200")),
     0,
@@ -418,6 +429,21 @@ STOCK_MASTER_CACHE_PATH = os.path.join(OFFICIAL_METADATA_CACHE_DIR, "stock_maste
 os.makedirs(OFFICIAL_METADATA_CACHE_DIR, exist_ok=True)
 
 CACHE_WRITE_CSV_COMPAT = os.getenv("CACHE_WRITE_CSV_COMPAT", "0").strip().lower() in ("1", "true", "yes")
+# 全市場單日行情（TWSE／TPEx）的重試次數。TPEx 很常回 ChunkedEncodingError，
+# 重試不足會讓整天的上櫃價格缺失，該日所有上櫃標的都取不到價。
+MARKET_SNAPSHOT_MAX_ATTEMPTS = max(
+    int(os.getenv("MARKET_SNAPSHOT_MAX_ATTEMPTS", "5")), 1)
+# 全市場批次價「同時處理幾個交易日」。
+# 舊版是一天做完才做下一天（每天內部只有 TWSE／TPEx 兩個 worker），
+# repair 要跑 237 個交易日，實測整段 5,003 秒＝83 分鐘，是整輪最大的單一瓶頸。
+# 這些日子彼此獨立，可以並行；抓取並行、寫入仍回主執行緒序列化，
+# 避免 PriceSeries 被多執行緒同時改寫。
+PRICE_MARKET_SNAPSHOT_DAY_WORKERS = max(
+    int(os.getenv("PRICE_MARKET_SNAPSHOT_DAY_WORKERS", "12")), 1)
+# 第一輪沒有「兩個市場都成功」的日子，改用低併發再收尾一輪。
+# TPEx 的 dailyQuotes 本來就容易斷線，高併發可能讓它更不穩。
+PRICE_MARKET_SNAPSHOT_RECOVERY_DAY_WORKERS = max(
+    int(os.getenv("PRICE_MARKET_SNAPSHOT_RECOVERY_DAY_WORKERS", "2")), 1)
 GSHEET_CLEAN_DELETED_BROKER_ROWS = os.getenv("GSHEET_CLEAN_DELETED_BROKER_ROWS", "1").strip().lower() not in ("0", "false", "no")
 
 # 價格批次計畫的最晚可用交易日；由主流程在實際已發布基準日確定後設定。
@@ -2498,7 +2524,23 @@ def _fetch_market_close_snapshot_for_date(target_date):
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
             )
-            max_attempts = 3
+            # TPEx 的 dailyQuotes 很常回 ChunkedEncodingError（連線被截斷）。
+            # 只重試 2 次時，實測 repair 一整輪仍會有數天整個上櫃行情抓不到，
+            # 那幾天所有上櫃標的就沒有價格。這裡拉高重試次數並可用環境變數調整。
+            max_attempts = MARKET_SNAPSHOT_MAX_ATTEMPTS
+
+            def is_retryable(exc):
+                """限流與伺服器端錯誤也要重試，不能當成永久失敗。
+
+                實測 log 出現過：
+                  HTTPError: 429 Client Error: Too Many Requests
+                429 是 raise_for_status() 丟出的 HTTPError，不在上面那組例外裡，
+                舊版會直接放棄，那一天的上櫃行情就整個沒了。限流本來就該退避重試。
+                """
+                if isinstance(exc, retryable_errors):
+                    return True
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                return status in (403, 408, 429, 500, 502, 503, 504)
 
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -2527,13 +2569,26 @@ def _fetch_market_close_snapshot_for_date(target_date):
                         source_name=market_name,
                     )
                     return market_name, market_prices, seen_codes, market_names
-                except retryable_errors as exc:
-                    if attempt >= max_attempts:
+                except Exception as exc:
+                    if attempt >= max_attempts or not is_retryable(exc):
                         raise
-                    wait_seconds = 1.0 if attempt == 1 else 2.0
+                    status = getattr(
+                        getattr(exc, "response", None), "status_code", None
+                    )
+                    if status == 429:
+                        # 被限流就退得久一點，而且隨並發數加長，避免整群同時再撞上去。
+                        count_event("全市場行情 429 限流")
+                        wait_seconds = min(
+                            5.0 * attempt * max(PRICE_MARKET_SNAPSHOT_DAY_WORKERS / 4, 1),
+                            60.0,
+                        )
+                    else:
+                        wait_seconds = 1.0 if attempt == 1 else 2.0 * attempt
                     print(
-                        f"  ↻ {market_name} 全市場收盤價連線中斷：{target_key}｜"
-                        f"{type(exc).__name__}｜{wait_seconds:.0f} 秒後重試 "
+                        f"  ↻ {market_name} 全市場收盤價重試：{target_key}｜"
+                        f"{type(exc).__name__}"
+                        + (f"({status})" if status else "")
+                        + f"｜{wait_seconds:.0f} 秒後重試 "
                         f"({attempt}/{max_attempts - 1})"
                     )
                     time.sleep(wait_seconds)
@@ -2583,6 +2638,19 @@ def _fetch_market_close_snapshot_for_date(target_date):
             f"證券名稱 {len(all_names):,} 個"
         )
         return dict(all_prices), set(all_seen_codes)
+
+
+def _market_close_snapshot_fully_cached(target_date):
+    """
+    這一天是不是「兩個市場都成功」。
+
+    _fetch_market_close_snapshot_for_date() 只有在 TWSE 與 TPEx 都成功時才寫入
+    _MARKET_CLOSE_PRICE_CACHE，所以快取裡有沒有這一天，就等於這一天完不完整。
+    部分失敗（例如 TPEx 斷線）不會被快取，因此重跑會真的重新抓，不是拿舊結果。
+    """
+    target_key = normalize_date_str(target_date)
+    with _MARKET_CLOSE_PRICE_CACHE_LOCK:
+        return target_key in _MARKET_CLOSE_PRICE_CACHE
 
 
 def fetch_market_close_prices_for_date(target_date):
@@ -2832,38 +2900,52 @@ def fetch_price_plan_batch_first(
     batch_seen_codes = set()
     latest_expected_by_code = {}
 
-    print(
-        f"  {label}全市場批次價：{len(trading_dates):,} 個交易日｜"
-        f"最多 {len(trading_dates) * 2:,} 個市場請求"
-    )
-
-    # 代號 → 已合併好別名的價格序列；整個批次階段共用，避免重複複製整份序列。
-    batch_series_by_code = {}
-
-    for date_index, trade_day in enumerate(trading_dates, start=1):
+    # 先算好「每一天需要哪些代號」；純本機運算，不打網路。
+    wanted_by_day = {}
+    for trade_day in trading_dates:
         target_key = trade_day.strftime("%Y/%m/%d")
         wanted_codes = {
             code
             for code, (start_dt, end_dt) in fetch_plan.items()
             if start_dt.date() <= trade_day <= end_dt.date()
         }
-        if not wanted_codes:
-            continue
+        if wanted_codes:
+            wanted_by_day[target_key] = wanted_codes
 
-        market_prices, seen_codes = _fetch_market_close_snapshot_for_date(target_key)
+    day_keys = [
+        trade_day.strftime("%Y/%m/%d")
+        for trade_day in trading_dates
+        if trade_day.strftime("%Y/%m/%d") in wanted_by_day
+    ]
+    day_workers = min(PRICE_MARKET_SNAPSHOT_DAY_WORKERS, max(len(day_keys), 1))
 
-        # 兩個市場都回 0 檔時，視為尚未發布或休市日。
-        # 不可把這一天寫成股票的 expected_date，否則會誤觸發整批逐檔補漏。
+    print(
+        f"  {label}全市場批次價：{len(day_keys):,} 個交易日｜"
+        f"最多 {len(day_keys) * 2:,} 個市場請求｜"
+        f"同時處理 {day_workers} 個交易日"
+    )
+
+    # 代號 → 已合併好別名的價格序列；整個批次階段共用，避免重複複製整份序列。
+    batch_series_by_code = {}
+    empty_days = []
+
+    def apply_day_snapshot(target_key, market_prices, seen_codes):
+        """把某一天的全市場結果寫入價格序列。只在主執行緒呼叫。"""
         if not seen_codes:
-            print(
-                f"  ℹ️ {label}全市場批次價略過無資料日：{target_key}｜"
-                "兩市場均未回傳任何代號，不列入預期價格日期"
-            )
-            continue
+            # 兩個市場都回 0 檔：視為尚未發布或休市日。
+            # 不可把這一天寫成股票的 expected_date，否則會誤觸發整批逐檔補漏。
+            empty_days.append(target_key)
+            return
 
+        wanted_codes = wanted_by_day.get(target_key, set())
         batch_seen_codes.update(wanted_codes & seen_codes)
         for code in wanted_codes:
-            latest_expected_by_code[code] = target_key
+            # 用 max 而不是直接覆寫：復原輪補回來的日子可能比較早，
+            # 直接覆寫會把「預期最後價格日」誤設成過去的日期。
+            previous_expected = latest_expected_by_code.get(code, "")
+            if target_key > previous_expected:
+                latest_expected_by_code[code] = target_key
+
             price = safe_price_float(market_prices.get(code))
             if price is None:
                 continue
@@ -2872,7 +2954,6 @@ def fetch_price_plan_batch_first(
             # get_cached_prices_for_code + merge_price_dicts，
             # 而 merge_price_dicts 會建立一份「全新的完整序列」——
             # 只為了塞進一天的價格，卻複製了整整 200 天。
-            # 200 個交易日 × 數千檔 = 上百萬次整份序列複製。
             # 改成：每個代號只合併一次別名序列，之後直接就地寫入那一天。
             series = batch_series_by_code.get(code)
             if series is None:
@@ -2886,8 +2967,85 @@ def fetch_price_plan_batch_first(
             if old_price != price:
                 changed_codes.add(code)
 
-        if progress_every and date_index % max(int(progress_every), 1) == 0:
-            print(f"  [{date_index}/{len(trading_dates)}] {label}全市場批次價處理中...")
+    def run_day_round(keys, workers, round_label):
+        """
+        並行抓取指定交易日，抓回來後回主執行緒序列化寫入。
+
+        以 workers 大小分批：抓取並行、套用照日期順序，記憶體也不會被
+        「一次持有 237 天的全市場報價」撐爆。
+        """
+        processed = 0
+        for start in range(0, len(keys), workers):
+            chunk = keys[start:start + workers]
+            results = {}
+            with ThreadPoolExecutor(max_workers=min(workers, len(chunk))) as executor:
+                futures = {
+                    executor.submit(_fetch_market_close_snapshot_for_date, key): key
+                    for key in chunk
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        results[key] = future.result()
+                    except Exception as exc:
+                        results[key] = ({}, set())
+                        print(
+                            f"  ⚠️ {label}全市場批次價整日失敗：{key}｜"
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            # 依日期順序套用，維持與舊版逐日處理相同的寫入次序。
+            for key in chunk:
+                market_prices, seen_codes = results.get(key, ({}, set()))
+                apply_day_snapshot(key, market_prices, seen_codes)
+
+            processed += len(chunk)
+            if progress_every and processed % max(int(progress_every), 1) < len(chunk):
+                print(
+                    f"  [{processed}/{len(keys)}] {label}全市場批次價"
+                    f"{round_label}處理中..."
+                )
+
+    run_day_round(day_keys, day_workers, "")
+
+    # 沒有「兩個市場都成功」的日子，改用低併發收尾。
+    # 部分失敗（例如只有 TPEx 斷線）不會被寫進快取，所以這一輪是真的重新抓。
+    incomplete_days = [
+        key for key in day_keys
+        if not _market_close_snapshot_fully_cached(key)
+    ]
+    if incomplete_days:
+        recovery_workers = min(
+            PRICE_MARKET_SNAPSHOT_RECOVERY_DAY_WORKERS,
+            len(incomplete_days),
+        )
+        print(
+            f"  🔁 {label}全市場批次價低併發收尾：{len(incomplete_days):,} 個交易日"
+            f"（含休市日）｜同時 {recovery_workers} 天"
+        )
+        empty_days.clear()
+        run_day_round(incomplete_days, recovery_workers, "收尾")
+
+        still_incomplete = [
+            key for key in incomplete_days
+            if not _market_close_snapshot_fully_cached(key)
+        ]
+        # 休市日本來就抓不到東西（兩市場都回 0 檔），不能算成「行情缺漏」。
+        missing_days = [key for key in still_incomplete if key not in empty_days]
+        if missing_days:
+            sample = "、".join(missing_days[:10])
+            suffix = "…" if len(missing_days) > 10 else ""
+            print(
+                f"  ⚠️ {label}仍有 {len(missing_days):,} 個交易日未取得完整雙市場行情："
+                f"{sample}{suffix}｜這些日子的部分市場標的會缺價"
+            )
+        count_event("全市場行情不完整交易日", len(missing_days))
+
+    if empty_days:
+        print(
+            f"  ℹ️ {label}全市場批次價略過無資料日：{len(empty_days):,} 天"
+            f"（休市或尚未發布），不列入預期價格日期"
+        )
 
     fallback_plan = {}
     for code, date_range in fetch_plan.items():
@@ -9533,8 +9691,23 @@ def upload_excel_to_google_sheet(
         allowed = {safe_worksheet_title(x) for x in allowed_titles}
     extra_scope_values = extra_scope_values or {}
 
-    wb = load_workbook(xlsx_path, data_only=False)
-    primary_sh = get_gsheet_spreadsheet()
+    # 【儀表】從「已存 xlsx」到「已鎖定 Google Sheet」中間實測約 303 秒沒有任何
+    # 輸出，是整段流程唯一的黑箱。絕大部分應該就耗在這裡：把剛寫好的整份
+    # 工作簿（200 萬格以上）再從磁碟讀回一次。先量出來，才知道值不值得改成
+    # 直接沿用記憶體中的 wb。
+    with stage_timer("Step6a 讀回 xlsx 工作簿"):
+        wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        xlsx_size_mb = os.path.getsize(xlsx_path) / 1024 / 1024
+    except Exception:
+        xlsx_size_mb = 0.0
+    print(
+        f"  📖 已讀回工作簿：{os.path.basename(xlsx_path)}"
+        f"｜{len(wb.sheetnames)} 張工作表｜檔案 {xlsx_size_mb:,.1f} MB"
+    )
+
+    with stage_timer("Step6b 開啟 Google Sheet"):
+        primary_sh = get_gsheet_spreadsheet()
     if primary_sh is None:
         raise RuntimeError("Google Sheet 主試算表開啟失敗。")
 
@@ -9561,20 +9734,21 @@ def upload_excel_to_google_sheet(
         # 一次驗完全部工作表並彙總所有錯誤再拋出；不要遇到第一張就中斷，
         # 否則每輪只會暴露一個問題，使用者得重跑一小時多才看到下一個。
         validation_errors = []
-        for title in sorted(repair_expected_overwrites):
-            ws_xlsx = workbook_map[title]
-            raw_values = worksheet_values_for_gsheet(ws_xlsx)
-            try:
-                prepare_repair_full_overwrite_values(
-                    title,
-                    raw_values,
-                    data_scope=current_scope,
-                    extra_scope_values=extra_scope_values.get(title),
-                )
-            except Exception as exc:
-                message = f"{title}｜{type(exc).__name__}: {exc}"
-                validation_errors.append(message)
-                print(f"  ❌ repair 前置驗證失敗：{message}")
+        with stage_timer("Step6c repair 前置驗證"):
+            for title in sorted(repair_expected_overwrites):
+                ws_xlsx = workbook_map[title]
+                raw_values = worksheet_values_for_gsheet(ws_xlsx)
+                try:
+                    prepare_repair_full_overwrite_values(
+                        title,
+                        raw_values,
+                        data_scope=current_scope,
+                        extra_scope_values=extra_scope_values.get(title),
+                    )
+                except Exception as exc:
+                    message = f"{title}｜{type(exc).__name__}: {exc}"
+                    validation_errors.append(message)
+                    print(f"  ❌ repair 前置驗證失敗：{message}")
 
         if validation_errors:
             raise RuntimeError(
@@ -12681,6 +12855,64 @@ def _official_metadata_underlying_code(metadata, stock_code_to_name, resolver):
 
 _ISIN_SNAPSHOT_CACHE = {}
 _ISIN_SNAPSHOT_LOCK = threading.Lock()
+OFFICIAL_ISIN_SNAPSHOT_DISK_PATH = os.path.join(
+    OFFICIAL_METADATA_CACHE_DIR,
+    "official_isin_snapshot.json",
+)
+
+
+def _load_isin_snapshot_disk_cache():
+    """回傳（權證名稱, 證券名稱, 快照年齡小時）；沒有快照時回 ({}, {}, None)。"""
+    path = OFFICIAL_ISIN_SNAPSHOT_DISK_PATH
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return {}, {}, None
+        age_hours = max((time.time() - os.path.getmtime(path)) / 3600.0, 0.0)
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return {}, {}, None
+        raw_warrants = payload.get("warrant_names")
+        raw_stocks = payload.get("stock_names")
+        if not isinstance(raw_warrants, dict) or not raw_warrants:
+            return {}, {}, None
+        warrant_names = {
+            str(code).strip(): str(name).strip()
+            for code, name in raw_warrants.items()
+            if str(code).strip() and str(name).strip()
+        }
+        stock_names = {}
+        if isinstance(raw_stocks, dict):
+            stock_names = {
+                str(code).strip(): str(name).strip()
+                for code, name in raw_stocks.items()
+                if str(code).strip() and str(name).strip()
+            }
+        if not warrant_names:
+            return {}, {}, None
+        return warrant_names, stock_names, age_hours
+    except Exception as exc:
+        print(f"  ⚠️ ISIN 一覽表快照讀取失敗：{type(exc).__name__}: {exc}")
+        return {}, {}, None
+
+
+def _save_isin_snapshot_disk_cache(warrant_names, stock_names):
+    if not USE_CACHE or not warrant_names:
+        return
+    path = OFFICIAL_ISIN_SNAPSHOT_DISK_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "saved_at": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
+            "warrant_names": dict(warrant_names),
+            "stock_names": dict(stock_names or {}),
+        }
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        print(f"  ⚠️ ISIN 一覽表快照寫入失敗：{type(exc).__name__}: {exc}")
 
 
 def fetch_current_official_isin_snapshot():
@@ -12699,6 +12931,27 @@ def fetch_current_official_isin_snapshot():
         cached_stocks = _ISIN_SNAPSHOT_CACHE.get("stock_names")
     if cached_warrants is not None and cached_stocks is not None:
         return dict(cached_warrants), dict(cached_stocks)
+
+    # 【效能】ISIN 兩個市場的一覽表要跑 6 分鐘以上（實測 373 秒）。
+    # 上一輪 repair 前面才印「略過 ISIN 一覽表」，後面卻又為了補 17 個權證名稱
+    # 整份重抓一次，Step1 有 92% 的時間耗在這裡。
+    # 這裡加上與官方權證基本資料同款的本機快照：同一天重跑直接沿用。
+    disk_warrants, disk_stocks, disk_age_hours = _load_isin_snapshot_disk_cache()
+    if (
+        disk_warrants
+        and disk_age_hours is not None
+        and disk_age_hours <= OFFICIAL_ISIN_SNAPSHOT_CACHE_HOURS
+    ):
+        print(
+            f"  ⏩ 沿用 ISIN 一覽表本機快照：權證名稱 {len(disk_warrants):,} 個｜"
+            f"一般證券名稱 {len(disk_stocks):,} 個｜"
+            f"快照年齡 {disk_age_hours:.1f} 小時"
+            f"（門檻 {OFFICIAL_ISIN_SNAPSHOT_CACHE_HOURS:.0f} 小時）"
+        )
+        with _ISIN_SNAPSHOT_LOCK:
+            _ISIN_SNAPSHOT_CACHE["warrant_names"] = dict(disk_warrants)
+            _ISIN_SNAPSHOT_CACHE["stock_names"] = dict(disk_stocks)
+        return dict(disk_warrants), dict(disk_stocks)
 
     names = {}
     stock_names = {}
@@ -12760,6 +13013,9 @@ def fetch_current_official_isin_snapshot():
         with _ISIN_SNAPSHOT_LOCK:
             _ISIN_SNAPSHOT_CACHE["warrant_names"] = dict(names)
             _ISIN_SNAPSHOT_CACHE["stock_names"] = dict(stock_names)
+        # 只有兩個市場都成功才寫快照，避免把半份清單當成完整結果沿用。
+        if success_markets == 2:
+            _save_isin_snapshot_disk_cache(names, stock_names)
     return dict(names), dict(stock_names)
 
 
@@ -19845,6 +20101,101 @@ def make_summary_map(stat_records):
 
 
 
+# 掃前 10 列找標題，因為大部分工作表標題在第 1 列，
+# 「券商查詢」的欄位標題在第 5 列。
+AMOUNT_FORMAT_HEADER_SCAN_ROWS = 10
+# 排除非金額欄位，避免小數或百分比被誤改。
+AMOUNT_FORMAT_EXCLUDE_KEYWORDS = ("%", "比例", "均價")
+
+
+def _amount_format_column_start_rows(ws):
+    """
+    回傳 {欄索引: 這一欄要從第幾列「之後」開始格式化}。
+
+    舊版是「前 10 列各掃一次、每認出一次就把整張表從該列往下重掃一遍」，
+    前 10 列只要有 N 列各自認出金額欄，整張表就會被完整掃 N 遍。
+    這裡先把同一欄取最小的標題列，之後整張表只需要掃一遍，結果完全等價：
+        儲存格 (r, c) 要被格式化
+        ⇔ 存在標題列 h < r 且 c 是 h 的金額欄
+        ⇔ c 的最小標題列 < r
+    """
+    start_rows = {}
+    max_header_row = min(ws.max_row, AMOUNT_FORMAT_HEADER_SCAN_ROWS)
+    if max_header_row <= 0:
+        return start_rows
+
+    for header_cells in ws.iter_rows(min_row=1, max_row=max_header_row):
+        for cell in header_cells:
+            header_value = cell.value
+            if header_value is None:
+                continue
+            header = str(header_value).strip()
+            if not header or "金額" not in header:
+                continue
+            if any(bad in header for bad in AMOUNT_FORMAT_EXCLUDE_KEYWORDS):
+                continue
+            col_idx = cell.column
+            existing = start_rows.get(col_idx)
+            if existing is None or cell.row < existing:
+                start_rows[col_idx] = cell.row
+
+    return start_rows
+
+
+def _apply_amount_comma_format_to_cell(cell):
+    """單一儲存格套千分位；行為與舊版逐格解析完全相同，只是加了數值快路徑。"""
+    value = cell.value
+
+    if value is None or value == "":
+        return
+
+    # 已經是數值就不必再走字串解析，這是最常見的情況。
+    if isinstance(value, bool):
+        return
+
+    if isinstance(value, int):
+        cell.number_format = '#,##0'
+        return
+
+    if isinstance(value, float):
+        if value.is_integer():
+            cell.value = int(value)
+            cell.number_format = '#,##0'
+        else:
+            cell.number_format = '#,##0.00'
+        return
+
+    if not isinstance(value, str):
+        return
+
+    text = value.strip()
+
+    # 公式欄位不動，只套顯示格式
+    if value.startswith("="):
+        cell.number_format = '#,##0'
+        return
+
+    if not text or text == "-":
+        return
+
+    raw = text.replace(",", "")
+    numeric_part = raw[1:] if raw.startswith("-") else raw
+    if not numeric_part.replace(".", "", 1).isdigit():
+        return
+
+    try:
+        num = float(raw)
+    except Exception:
+        return
+
+    if num.is_integer():
+        cell.value = int(num)
+        cell.number_format = '#,##0'
+    else:
+        cell.value = num
+        cell.number_format = '#,##0.00'
+
+
 def apply_global_amount_comma_format(wb):
     """
     全工作表套用金額千分位格式。
@@ -19854,65 +20205,36 @@ def apply_global_amount_comma_format(wb):
     就統一顯示為 1,234,567。
 
     不處理「均價」、「比例」、「獲利%」等欄位，避免小數或百分比被誤改。
+
+    【效能】實測整份工作簿（2,162,021 格）舊版要跑約 21 分鐘。兩個原因：
+      1. 前 10 列每認出一次金額欄，就把整張表從那列往下重掃一遍。
+      2. 用 ws.cell(r, c) 逐格取值，openpyxl 每次都要做座標解析與空格建立。
+    新版改成「每欄只掃一次」＋ iter_cols 直接拿儲存格物件，語意不變。
     """
-    for ws in wb.worksheets:
-        # 掃前 10 列，因為大部分工作表標題在第 1 列，
-        # 「券商查詢」的欄位標題在第 5 列。
-        for header_row in range(1, min(ws.max_row, 10) + 1):
-            amount_cols = []
+    with stage_timer("Excel 金額千分位格式化"):
+        scanned_cells = 0
 
-            for col_idx in range(1, ws.max_column + 1):
-                header_value = ws.cell(header_row, col_idx).value
-                header = str(header_value).strip() if header_value is not None else ""
-
-                if not header:
-                    continue
-
-                if "金額" in header:
-                    # 排除非金額欄位，避免誤格式化
-                    if "%" in header or "比例" in header or "均價" in header:
-                        continue
-
-                    amount_cols.append(col_idx)
-
-            if not amount_cols:
+        for ws in wb.worksheets:
+            start_rows = _amount_format_column_start_rows(ws)
+            if not start_rows:
                 continue
 
-            for col_idx in amount_cols:
-                for row_idx in range(header_row + 1, ws.max_row + 1):
-                    cell = ws.cell(row_idx, col_idx)
+            max_row = ws.max_row
 
-                    if cell.value is None or cell.value == "":
-                        continue
+            for col_idx, start_row in sorted(start_rows.items()):
+                if start_row >= max_row:
+                    continue
+                for column_cells in ws.iter_cols(
+                    min_col=col_idx,
+                    max_col=col_idx,
+                    min_row=start_row + 1,
+                    max_row=max_row,
+                ):
+                    for cell in column_cells:
+                        _apply_amount_comma_format_to_cell(cell)
+                        scanned_cells += 1
 
-                    # 公式欄位不動，只套顯示格式
-                    if isinstance(cell.value, str) and cell.value.startswith("="):
-                        cell.number_format = '#,##0'
-                        continue
-
-                    if str(cell.value).strip() == "-":
-                        continue
-
-                    try:
-                        raw = str(cell.value).replace(",", "").strip()
-
-                        if raw.startswith("-"):
-                            numeric_part = raw[1:]
-                        else:
-                            numeric_part = raw
-
-                        if numeric_part.replace(".", "", 1).isdigit():
-                            num = float(raw)
-
-                            if num.is_integer():
-                                cell.value = int(num)
-                                cell.number_format = '#,##0'
-                            else:
-                                cell.value = num
-                                cell.number_format = '#,##0.00'
-
-                    except Exception:
-                        pass
+        count_event("Excel 金額欄掃描格數", scanned_cells)
 
 
 
@@ -23731,7 +24053,8 @@ def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, pric
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    wb.save(output_path)
+    with stage_timer("Step5b 寫出 xlsx 工作簿"):
+        wb.save(output_path)
 
     print(
         f"  ✅ 已存：{output_path} "
@@ -25266,6 +25589,12 @@ def run_longterm_workflow(warrants, broker_map, output_path, program_start):
 
 MONEYDJ_MAX_INVALID_ROW_RATIO = min(max(
     float(os.getenv("MONEYDJ_MAX_INVALID_ROW_RATIO", "0.01")), 0.0), 1.0)
+# 只看比例會誤殺小回應：59 列裡壞 1 列就是 1.69%，超過 1% 門檻整批被拒，
+# 而且重試永遠拿到同一份資料，三輪復原一檔都救不回來（實測 957 檔就是這樣沒的）。
+# 因此加一個絕對下限：壞掉的列數沒超過這個數就只記錄、不拒收。
+# 兩個條件都超過才視為「這份回應真的壞了」。
+MONEYDJ_MAX_INVALID_ROW_COUNT = max(
+    int(os.getenv("MONEYDJ_MAX_INVALID_ROW_COUNT", "3")), 0)
 
 
 def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_name="MoneyDJ"):
@@ -25301,10 +25630,21 @@ def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_na
     stats["valid"] = len(rows)
     stats["ratio"] = stats["invalid"] / stats["total"] if stats["total"] else 0.0
     if stats["invalid"]:
-        print(f"  ⚠️ {source_name} 異常交易列：{stats['invalid']}/{stats['total']} "
-              f"({stats['ratio']:.2%})，門檻 {MONEYDJ_MAX_INVALID_ROW_RATIO:.2%}")
-        if not rows or stats["ratio"] > MONEYDJ_MAX_INVALID_ROW_RATIO:
-            raise ValueError(f"{source_name} 異常列比例超標或無有效列")
+        count_event(f"{source_name} 含異常列的回應數")
+        count_event(f"{source_name} 被略過的異常列", stats["invalid"])
+        # 全部無效一定拒收；否則要「列數」與「比例」都超標才算這份回應壞掉。
+        over_count = stats["invalid"] > MONEYDJ_MAX_INVALID_ROW_COUNT
+        over_ratio = stats["ratio"] > MONEYDJ_MAX_INVALID_ROW_RATIO
+        rejected = (not rows) or (over_count and over_ratio)
+        print(
+            f"  {'⚠️' if rejected else 'ℹ️'} {source_name} 異常交易列："
+            f"{stats['invalid']}/{stats['total']} ({stats['ratio']:.2%})｜"
+            f"門檻 {MONEYDJ_MAX_INVALID_ROW_COUNT} 列且 "
+            f"{MONEYDJ_MAX_INVALID_ROW_RATIO:.2%}｜"
+            + ("整批拒收" if rejected else f"略過異常列，保留 {stats['valid']} 列")
+        )
+        if rejected:
+            raise ValueError(f"{source_name} 異常列超標或無有效列")
     return rows
 
 
@@ -25330,7 +25670,11 @@ def _api4_get_with_status_inner(code, start_date, end_date):
                 ),
             )
             response.raise_for_status()
-            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2', 'V3'), source_name="API4"), True
+            # API4 預篩實際只用 V1（日期）與 V2（券商代號）；
+            # V3（券商名稱）只有 find_broker_codes_moneydj 在比對名稱時會用，
+            # 而那條路徑本來就對缺名稱有容錯。把 V3 列為必要欄位屬於過度嚴格，
+            # 會讓「只是名稱空白」的正常交易列害整批被拒。
+            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2'), source_name="API4"), True
         except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
             if attempt < MONEYDJ_MAX_RETRIES:
                 time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
