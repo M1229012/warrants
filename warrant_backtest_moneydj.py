@@ -10015,21 +10015,69 @@ def cache_enabled():
     return USE_CACHE and not FORCE_FULL_CACHE_REFRESH
 
 
+_CACHE_FILE_READ_CACHE = {}
+_CACHE_FILE_READ_LOCK = threading.Lock()
+
+
+def _cache_file_signature(*paths):
+    """用「檔案是否存在＋mtime＋大小」當簽章；任何一個檔案被改寫就自動失效。"""
+    signature = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append((path, None, None))
+    return tuple(signature)
+
+
+def invalidate_cache_file_read_cache(path=None):
+    """快取檔被寫入後呼叫，讓下一次讀取拿到新內容。"""
+    with _CACHE_FILE_READ_LOCK:
+        if path is None:
+            _CACHE_FILE_READ_CACHE.clear()
+        else:
+            _CACHE_FILE_READ_CACHE.pop(str(path), None)
+
+
 def read_cache_csv(path):
     if not cache_enabled():
         return pd.DataFrame()
 
     parquet_path = f"{path}.parquet"
+
+    # 【效能】同一份大型快取在一次執行中會被讀好幾次：
+    # run_automatic_cache_maintenance、load_history_cache／load_price_cache、
+    # get_known_trading_dates 各讀一次，等於同一個 parquet 解壓、解析三遍。
+    # 這裡用 (mtime, size) 當簽章做同進程快取；檔案一被寫入就自動失效。
+    # 回傳 copy()，維持「呼叫端可以任意改」的原有語意。
+    signature = _cache_file_signature(parquet_path, path)
+    with _CACHE_FILE_READ_LOCK:
+        cached = _CACHE_FILE_READ_CACHE.get(str(path))
+        if cached is not None and cached[0] == signature:
+            count_event("快取檔重複讀取命中")
+            return cached[1].copy()
+
+    def remember(df):
+        if df is not None:
+            with _CACHE_FILE_READ_LOCK:
+                _CACHE_FILE_READ_CACHE[str(path)] = (signature, df.copy())
+        return df
+
     if os.path.exists(parquet_path):
         try:
-            return pd.read_parquet(parquet_path).fillna("")
+            count_event("快取檔實際磁碟讀取")
+            return remember(pd.read_parquet(parquet_path).fillna(""))
         except Exception as exc:
             print(f"  ⚠️ Parquet 快取讀取失敗：{parquet_path}｜{type(exc).__name__}: {exc}")
 
     # 相容既有 CSV；成功讀取後會在下一次寫入時自動遷移成 Parquet。
     if os.path.exists(path):
         try:
-            return pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+            count_event("快取檔實際磁碟讀取")
+            return remember(
+                pd.read_csv(path, dtype=str, encoding=CACHE_ENCODING).fillna("")
+            )
         except Exception as exc:
             print(f"  ⚠️ CSV 快取讀取失敗：{path}｜{type(exc).__name__}: {exc}")
 
@@ -10061,6 +10109,9 @@ def write_cache_csv(
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     parquet_path = f"{path}.parquet"
+    # 檔案即將改變，先讓同進程讀取快取失效（簽章本身也會變，這裡是雙保險）。
+    invalidate_cache_file_read_cache(path)
+    invalidate_cache_file_read_cache(f"forced::{path}")
     try:
         _atomic_write_parquet(df, parquet_path)
         if CACHE_WRITE_CSV_COMPAT:
@@ -10276,11 +10327,28 @@ def _read_local_cache_even_when_forced(path):
     直接讀本機既有快取，不受 FORCE_FULL_CACHE_REFRESH 影響。
 
     FORCE 代表重新抓來源，不代表可以刪除歷史權證生命週期或把完整名稱退化成代號。
+
+    【效能】權證對照快取含完整歷史生命週期（可達數萬筆），一次執行中會被
+    load_warrants_cache／save_warrants_cache／save_warrant_names_cache／
+    官方歷史名稱回補各讀一次。與 read_cache_csv 共用同一份 (mtime, size) 快取。
     """
     parquet_path = f"{path}.parquet"
+
+    cache_key = f"forced::{path}"
+    signature = _cache_file_signature(parquet_path, path)
+    with _CACHE_FILE_READ_LOCK:
+        cached = _CACHE_FILE_READ_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            count_event("快取檔重複讀取命中")
+            return cached[1].copy()
+
     if os.path.exists(parquet_path):
         try:
-            return pd.read_parquet(parquet_path).fillna("")
+            count_event("快取檔實際磁碟讀取")
+            df = pd.read_parquet(parquet_path).fillna("")
+            with _CACHE_FILE_READ_LOCK:
+                _CACHE_FILE_READ_CACHE[cache_key] = (signature, df.copy())
+            return df
         except Exception:
             pass
     if os.path.exists(path):
