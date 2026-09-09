@@ -19208,6 +19208,19 @@ WARRANT_MONEYDJ_MISSING_AMOUNT_MAX = max(
 WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO = max(
     0.0, float(os.getenv("WARRANT_MONEYDJ_MISSING_AMOUNT_MAX_RATIO", "0.01"))
 )
+# API5 失敗復原：原本完全沒有重試，2 萬多次請求只要有任何一次被限流就整份報錯。
+WARRANT_MONEYDJ_RANGE_API5_RECOVERY_ROUNDS = max(
+    0, int(os.getenv("WARRANT_MONEYDJ_RANGE_API5_RECOVERY_ROUNDS", "3"))
+)
+WARRANT_MONEYDJ_RANGE_API5_RECOVERY_WAIT = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API5_RECOVERY_WAIT", "2.0"))
+)
+# 重試後仍失敗的 (權證, 分點) 佔比上限。這些組合的金額無法從官方逐日資料還原
+# （官方只有逐權證，沒有逐分點），所以用「組數佔比」判定：
+# 極少數殘留視為可容忍並標記為不完整，大量失敗才是真的來源異常。
+WARRANT_MONEYDJ_RANGE_API5_MAX_FAILED_RATIO = max(
+    0.0, float(os.getenv("WARRANT_MONEYDJ_RANGE_API5_MAX_FAILED_RATIO", "0.005"))
+)
 
 TWSE_SECURITY_DAILY_CACHE_DIR = os.getenv(
     "WARRANT_TWSE_SECURITY_DAILY_CACHE_DIR", "twse_security_daily_cache"
@@ -20663,30 +20676,73 @@ def _moneydj_range_events(
         preload_rows.extend(cached_prior_events.to_dict("records"))
     queried_empty_pairs = set(cached_empty_pairs)
     queried_preloaded_pairs = set(cached_preloaded_pairs)
-    with ThreadPoolExecutor(max_workers=WARRANT_MONEYDJ_RANGE_API5_WORKERS) as executor:
-        future_map = {
-            executor.submit(
-                _moneydj_api5_range_one,
-                pair,
-                start_ts,
-                end_ts,
-                api5_history_limit
-                if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes
-                else api5_non_selected_limit,
-                WARRANT_SELECTED_FIFO_PRELOAD_ENABLE
-                and str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
-            ): pair
-            for pair in api5_pairs
-        }
-        for future in as_completed(future_map):
-            rows, pre_rows, error = future.result()
-            pair = future_map[future]
-            cache_key = _moneydj_event_pair_key(pair.get("warrant_code", ""), pair.get("broker_code", ""))
-            if error:
-                stats["api5_failed"] += 1
-                continue
-            api5_rows_by_key[cache_key] = list(rows or [])
-            api5_preloads_by_key[cache_key] = list(pre_rows or [])
+    def _run_api5_batch(pairs_to_query: list, workers: int) -> list:
+        """跑一批 API5，回傳仍然失敗的 pair。成功的直接寫進結果字典。"""
+        still_failed = []
+        if not pairs_to_query:
+            return still_failed
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            future_map = {
+                executor.submit(
+                    _moneydj_api5_range_one,
+                    pair,
+                    start_ts,
+                    end_ts,
+                    api5_history_limit
+                    if str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes
+                    else api5_non_selected_limit,
+                    WARRANT_SELECTED_FIFO_PRELOAD_ENABLE
+                    and str(pair.get("broker_code", "") or "").strip() in selected_backfill_codes,
+                ): pair
+                for pair in pairs_to_query
+            }
+            for future in as_completed(future_map):
+                rows, pre_rows, error = future.result()
+                pair = future_map[future]
+                cache_key = _moneydj_event_pair_key(
+                    pair.get("warrant_code", ""), pair.get("broker_code", "")
+                )
+                if error:
+                    api5_failed_error_by_key[cache_key] = str(error)
+                    still_failed.append(pair)
+                    continue
+                api5_failed_error_by_key.pop(cache_key, None)
+                api5_rows_by_key[cache_key] = list(rows or [])
+                api5_preloads_by_key[cache_key] = list(pre_rows or [])
+        return still_failed
+
+    # API5 原本完全沒有重試：2 萬多次請求裡只要有任何一次因為對方限流或連線中斷
+    # 而失敗，整份報表就直接報錯（實測 2408 南亞科 failed=1314/23284）。
+    # API4 早就有 3 輪復原＋序列復原，API5 卻沒有，這是不對稱的。
+    # 這裡補上同樣的復原機制，並逐輪降低併發，讓對方喘口氣。
+    api5_failed_error_by_key = {}
+    failed_api5_pairs = _run_api5_batch(api5_pairs, WARRANT_MONEYDJ_RANGE_API5_WORKERS)
+    initial_api5_failed = len(failed_api5_pairs)
+    for _round in range(1, WARRANT_MONEYDJ_RANGE_API5_RECOVERY_ROUNDS + 1):
+        if not failed_api5_pairs:
+            break
+        _workers = max(1, WARRANT_MONEYDJ_RANGE_API5_WORKERS // (2 ** _round))
+        if WARRANT_MONEYDJ_RANGE_API5_RECOVERY_WAIT > 0:
+            time.sleep(WARRANT_MONEYDJ_RANGE_API5_RECOVERY_WAIT * _round)
+        print(
+            f"🔁 MoneyDJ API5 失敗復原第 {_round}/"
+            f"{WARRANT_MONEYDJ_RANGE_API5_RECOVERY_ROUNDS} 輪："
+            f"重試 {len(failed_api5_pairs):,} 組｜workers={_workers}"
+        )
+        _before = len(failed_api5_pairs)
+        failed_api5_pairs = _run_api5_batch(failed_api5_pairs, _workers)
+        _recovered = _before - len(failed_api5_pairs)
+        print(
+            f"   {'✅' if _recovered else '⚠️'} API5 本輪復原 {_recovered:,} 組｜"
+            f"仍失敗 {len(failed_api5_pairs):,} 組"
+        )
+    stats["api5_failed"] = len(failed_api5_pairs)
+    stats["api5_recovered"] = initial_api5_failed - len(failed_api5_pairs)
+    if initial_api5_failed:
+        print(
+            f"📊 MoneyDJ API5 復原結果：初掃失敗 {initial_api5_failed:,} 組｜"
+            f"復原 {stats['api5_recovered']:,} 組｜仍失敗 {stats['api5_failed']:,} 組"
+        )
 
     # 保留上一輪的完整驗證進度（日期 **與** 抓取時間），再用本輪實際查過的 pair 覆寫。
     # 只複製日期會讓沒重查的 pair 丟掉 fetched_at，下一輪就因為「沒有抓取時間 →
@@ -20739,9 +20795,36 @@ def _moneydj_range_events(
     )
 
     if stats["api5_failed"]:
-        raise RuntimeError(
-            f"MoneyDJ API5 主來源不完整：failed={stats['api5_failed']}/{stats['pairs']}"
+        _api5_total = max(1, len(api5_pairs))
+        _api5_ratio = stats["api5_failed"] / _api5_total
+        stats["api5_failed_ratio"] = _api5_ratio
+        stats["api5_failed_keys"] = sorted(api5_failed_error_by_key)[:50]
+        _api5_detail = (
+            f"failed={stats['api5_failed']:,}/{_api5_total:,}"
+            f"（{_api5_ratio * 100:.3f}%）"
         )
+        if _api5_ratio > WARRANT_MONEYDJ_RANGE_API5_MAX_FAILED_RATIO:
+            _sample = "；".join(
+                f"{k}:{v}" for k, v in list(api5_failed_error_by_key.items())[:5]
+            )
+            raise RuntimeError(
+                f"MoneyDJ API5 主來源不完整：{_api5_detail}｜"
+                f"超過 {WARRANT_MONEYDJ_RANGE_API5_MAX_FAILED_RATIO * 100:.2f}% 門檻"
+                f"（疑似來源限流或異常，重跑通常可恢復）｜{_sample}"
+            )
+        # 少數殘留：照常產圖，但標記為不完整，快取也不會宣告完整覆蓋。
+        print(
+            f"⚠️ MoneyDJ API5 少數組合重試後仍失敗：{_api5_detail}｜"
+            f"在 {WARRANT_MONEYDJ_RANGE_API5_MAX_FAILED_RATIO * 100:.2f}% 門檻內："
+            "照常產圖但標記為不完整快照"
+        )
+        api4_unverified_tolerated = list(api4_unverified_tolerated) + [
+            f"api5:{k}" for k in sorted(api5_failed_error_by_key)
+        ]
+        stats["api4_incomplete_but_continued"] = True
+        # 這是「不知道少了什麼」的缺口（無法從官方逐日資料還原逐分點金額），
+        # 必須擋住完整覆蓋標記，讓下一輪重新驗證。
+        stats["api4_cache_blocking_incomplete"] = True
 
     fresh_events_frame = pd.DataFrame(event_rows)
     if not fresh_events_frame.empty:
