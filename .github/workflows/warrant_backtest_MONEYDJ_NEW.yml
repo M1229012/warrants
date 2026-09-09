@@ -306,6 +306,45 @@ jobs:
             google-auth \
             "psycopg[binary]"
 
+      # ============================================================
+      # 診斷用：從 runner IP 探測 MoneyDJ 是否可用。
+      # 目的是分辨「端點掛了」與「我們的 IP 被擋」。
+      # continue-on-error：探測失敗不阻擋後面的正式執行。
+      # 確認原因後可以整個 step 刪掉。
+      # ============================================================
+      - name: Probe MoneyDJ API availability
+        continue-on-error: true
+        shell: bash
+        run: |
+          API5_URL="https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/twWarrantData.xdjjson?x=warrant-chip0002-5&c=5&a=056664&b=9853&revision=2018_07_31_1"
+          API4_URL="https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/TwWarrantData.xdjjson?a=056664&x=warrant-chip0002-4&c=20260901&d=20260910&e=200&revision=2018_07_31_1"
+
+          probe() {
+            label="$1"
+            url="$2"
+            for i in 1 2 3; do
+              rc=0
+              curl -sS -o probe.json \
+                -w "  ${label} try${i}: status=%{http_code} size=%{size_download} time=%{time_total}s" \
+                "$url" || rc=$?
+              echo
+              if [ "$rc" -ne 0 ]; then
+                echo "  ${label} try${i}: curl 失敗 rc=${rc}"
+              else
+                echo "  ${label} try${i} body: $(head -c 200 probe.json)"
+              fi
+            done
+          }
+
+          echo "=========================================="
+          echo "MoneyDJ 可用性探測（runner IP）"
+          echo "=========================================="
+          probe "API5" "$API5_URL"
+          echo "------------------------------------------"
+          probe "API4" "$API4_URL"
+          echo "=========================================="
+          rm -f probe.json
+
       - name: Run Hybrid FinMind and MoneyDJ warrant backtest
         shell: bash
         run: |
