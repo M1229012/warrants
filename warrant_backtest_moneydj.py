@@ -445,7 +445,7 @@ MARKET_SNAPSHOT_MAX_ATTEMPTS = max(
 # 這些日子彼此獨立，可以並行；抓取並行、寫入仍回主執行緒序列化，
 # 避免 PriceSeries 被多執行緒同時改寫。
 PRICE_MARKET_SNAPSHOT_DAY_WORKERS = max(
-    int(os.getenv("PRICE_MARKET_SNAPSHOT_DAY_WORKERS", "6")), 1)
+    int(os.getenv("PRICE_MARKET_SNAPSHOT_DAY_WORKERS", "12")), 1)
 # 第一輪沒有「兩個市場都成功」的日子，改用低併發再收尾一輪。
 # TPEx 的 dailyQuotes 本來就容易斷線，高併發可能讓它更不穩。
 PRICE_MARKET_SNAPSHOT_RECOVERY_DAY_WORKERS = max(
