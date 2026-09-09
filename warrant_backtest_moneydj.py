@@ -25656,10 +25656,70 @@ def api4_get_with_status(code, start_date, end_date):
         record_stage_seconds("MoneyDJ API4（累計執行緒時間）", time.perf_counter() - started)
 
 
+# 診斷補丁：只記錄請求失敗，原有抓取、重試與資料完整性規則維持原狀。
+_MONEYDJ_DIAG_LOCK = threading.Lock()
+_MONEYDJ_DIAG_COUNTS = Counter()
+_MONEYDJ_DIAG_PATH = None
+_MONEYDJ_DIAG_WRITE_WARNED = False
+
+
+def _moneydj_record_request_failure(api, url, response, exc, started, attempt):
+    global _MONEYDJ_DIAG_PATH, _MONEYDJ_DIAG_WRITE_WARNED
+    try:
+        status = response.status_code if response is not None else None
+        if isinstance(exc, requests.exceptions.SSLError):
+            kind = "tls_error"
+        elif isinstance(exc, requests.exceptions.Timeout):
+            kind = "timeout"
+        elif isinstance(exc, requests.exceptions.HTTPError):
+            kind = "http_error"
+        elif isinstance(exc, requests.RequestException):
+            kind = "transport_error"
+        elif isinstance(exc, (ValueError, UnicodeError)):
+            kind = "parse_error"
+        else:
+            kind = "unexpected_error"
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "api": api, "url": url, "kind": kind,
+            "exception_type": type(exc).__name__, "error": str(exc)[:1500],
+            "http_status": status, "attempt": attempt,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+        if response is not None:
+            record["content_type"] = response.headers.get("Content-Type", "")
+            record["retry_after"] = response.headers.get("Retry-After", "")
+            record["body_preview"] = response.content[:900].decode("utf-8", errors="replace")
+        if kind == "parse_error":
+            record["parse_stats"] = getattr(_THREAD_LOCAL, "moneydj_parse_stats", None)
+        with _MONEYDJ_DIAG_LOCK:
+            if _MONEYDJ_DIAG_PATH is None:
+                import ssl
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                _MONEYDJ_DIAG_PATH = os.path.join(CACHE_DIR, f"moneydj_request_failures_{stamp}_{os.getpid()}.jsonl")
+                print(f"  MoneyDJ 診斷檔：{_MONEYDJ_DIAG_PATH}", flush=True)
+                print(f"  MoneyDJ 執行環境：Python {sys.version.split()[0]}｜requests {requests.__version__}｜{ssl.OPENSSL_VERSION}", flush=True)
+            key = (api, kind, status, type(exc).__name__)
+            _MONEYDJ_DIAG_COUNTS[key] += 1
+            if _MONEYDJ_DIAG_COUNTS[key] <= 3:
+                print("  MoneyDJ 真正失敗原因：" + json.dumps(record, ensure_ascii=False), flush=True)
+            # 每次呼叫重試耗盡才存檔，避免將同一重試的全部回應灌入快取。
+            if attempt >= MONEYDJ_MAX_RETRIES:
+                with open(_MONEYDJ_DIAG_PATH, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as log_exc:
+        if not _MONEYDJ_DIAG_WRITE_WARNED:
+            _MONEYDJ_DIAG_WRITE_WARNED = True
+            print(f"  MoneyDJ 診斷寫入失敗：{type(log_exc).__name__}: {log_exc}", flush=True)
+
+
 def _api4_get_with_status_inner(code, start_date, end_date):
     url = MONEYDJ_API4_URL.format(code=code, start=start_date, end=end_date)
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
         count_event("MoneyDJ API4 HTTP 請求")
+        response = None
+        request_started = time.perf_counter()
+        _THREAD_LOCAL.moneydj_parse_stats = None
         try:
             response = get_thread_session().get(
                 url,
@@ -25675,10 +25735,8 @@ def _api4_get_with_status_inner(code, start_date, end_date):
             # 而那條路徑本來就對缺名稱有容錯。把 V3 列為必要欄位屬於過度嚴格，
             # 會讓「只是名稱空白」的正常交易列害整批被拒。
             return _moneydj_json_rows(response.content, required_fields=('V1', 'V2'), source_name="API4"), True
-        except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
-            if attempt < MONEYDJ_MAX_RETRIES:
-                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
-        except Exception:
+        except Exception as exc:
+            _moneydj_record_request_failure("API4", url, response, exc, request_started, attempt)
             if attempt < MONEYDJ_MAX_RETRIES:
                 time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
     return [], False
@@ -25701,6 +25759,9 @@ def _api5_get_with_status_inner(warrant_code, broker_code, history_limit=None):
     )
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
         count_event("MoneyDJ API5 HTTP 請求")
+        response = None
+        request_started = time.perf_counter()
+        _THREAD_LOCAL.moneydj_parse_stats = None
         try:
             response = get_thread_session().get(
                 url,
@@ -25712,10 +25773,8 @@ def _api5_get_with_status_inner(warrant_code, broker_code, history_limit=None):
             )
             response.raise_for_status()
             return _moneydj_json_rows(response.content, required_fields=('V1', 'V2', 'V3', 'V4', 'V5'), source_name="API5"), True
-        except (requests.exceptions.ChunkedEncodingError, requests.RequestException, ValueError, json.JSONDecodeError):
-            if attempt < MONEYDJ_MAX_RETRIES:
-                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
-        except Exception:
+        except Exception as exc:
+            _moneydj_record_request_failure("API5", url, response, exc, request_started, attempt)
             if attempt < MONEYDJ_MAX_RETRIES:
                 time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
     return [], False
