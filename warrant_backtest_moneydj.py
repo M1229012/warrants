@@ -35,6 +35,7 @@ daily 預設採歷史保護模式：只替換指定交易日／統計日快照�
 """
 
 import json, re, time, os, math, sys, unicodedata
+import hashlib
 import threading
 from bisect import bisect_right
 from collections import Counter, defaultdict
@@ -165,7 +166,7 @@ def print_stage_profile(total_seconds=None):
 DEFAULT_OUTPUT_DIR = "output" if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true" else r"C:\Users\chen1_ukw0m7r\Downloads"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 AMOUNT_THRESH = 1_000_000
-PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT7"
+PROGRAM_BUILD_ID = "OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT8"
 # workflow 的版本驗證是 `grep -F`（純字串搜尋），保留下面這行舊 ID，
 # 讓還沒更新 EXPECTED_BUILD_ID 的 workflow 也能通過驗證後執行本版。
 # 相容舊版本驗證字串：HYBRID-FINMIND-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260802-R17
@@ -227,6 +228,12 @@ SELL_DETAIL_DAYS = int(os.getenv("SELL_DETAIL_DAYS", "3"))
 USE_CACHE = os.getenv("USE_CACHE", "1").strip().lower() not in ("0", "false", "no")
 FORCE_FULL_CACHE_REFRESH = os.getenv("FORCE_FULL_CACHE_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 PRICE_WORKERS = int(os.getenv("PRICE_WORKERS", "80"))
+# daily 增量模式要不要載入「全部 A~E 事件」標的股的歷史價格快取。
+# 1（預設）＝載入，D+ 欄位才算得出來；0＝退回舊行為，只載入當日事件的標的股。
+# 這只影響「從本機快取載入多少代號」，抓取量不變（目標日走全市場批次）。
+DAILY_PRICE_LOAD_ALL_EVENT_CODES = os.getenv(
+    "DAILY_PRICE_LOAD_ALL_EVENT_CODES", "1"
+).strip().lower() not in ("0", "false", "no")
 FETCH_GROUP_WARRANT_PRICES = os.getenv("FETCH_GROUP_WARRANT_PRICES", "0").strip().lower() in ("1", "true", "yes")
 WARRANT_NAME_ALLOW_MARKED_FALLBACK = os.getenv(
     "WARRANT_NAME_ALLOW_MARKED_FALLBACK",
@@ -298,6 +305,72 @@ MONEYDJ_DAILY_TARGET_LOOKBACK_DAYS = max(
 )
 MONEYDJ_MAX_RETRIES = max(int(os.getenv("MONEYDJ_MAX_RETRIES", "3")), 1)
 MONEYDJ_RETRY_BASE_SECONDS = max(float(os.getenv("MONEYDJ_RETRY_BASE_SECONDS", "1.0")), 0.1)
+
+# ══════════════════════════════════════════════════════════════════════
+# MoneyDJ 限流偵測與全域退避（AUDIT8）
+# ──────────────────────────────────────────────────────────────────────
+# 實測現象：API4 預篩（約 35,000 次請求、60 併發）跑完之後，
+# 緊接著的 API5 出現 2,663/2,663 全數失敗；單獨探測時
+#   try1 = HTTP 500，耗時 65.7 秒（健康時平均 0.34 秒，慢 193 倍）
+#   try2 = HTTP 500
+#   try3 = HTTP 200（自己會恢復）
+# 回應內容是 1,196 bytes 的 IIS/ASP.NET 錯誤頁，不是乾淨的當機。
+# 「前面正常、後面整批崩、隔一陣子又好」是累積型節流的典型特徵。
+#
+# 舊版有兩個缺口：
+#   1. 完全不看 HTTP 狀態碼，500／逾時／解析失敗共用同一種退避。
+#   2. 退避只發生在「撞到牆的那一條執行緒」，另外 59 條還在全速打，
+#      等於整體沒有退避。
+# 本區塊補上全域冷卻閘門：任何一條執行緒偵測到節流徵兆，
+# 全部執行緒都會在下一次請求前一起等。
+# 設 MONEYDJ_THROTTLE_DETECT_ENABLED=0 可完全退回舊行為。
+# ══════════════════════════════════════════════════════════════════════
+MONEYDJ_THROTTLE_DETECT_ENABLED = os.getenv(
+    "MONEYDJ_THROTTLE_DETECT_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# MoneyDJ 不回 429，而是回 500；這些狀態碼一律視為節流／伺服器過載徵兆。
+MONEYDJ_THROTTLE_STATUS_CODES = {
+    int(x.strip())
+    for x in re.split(r"[,;、\s]+", os.getenv(
+        "MONEYDJ_THROTTLE_STATUS_CODES", "403,408,429,500,502,503,504"
+    ))
+    if x.strip().isdigit()
+}
+# 回應時間超過這個秒數即使成功也算節流徵兆（實測健康 0.34 秒 vs 節流 65.7 秒）。
+MONEYDJ_THROTTLE_SLOW_SECONDS = max(
+    float(os.getenv("MONEYDJ_THROTTLE_SLOW_SECONDS", "20")),
+    1.0,
+)
+# 第 1 級冷卻秒數；每再撞一次加一級，冷卻時間指數成長。
+MONEYDJ_THROTTLE_BASE_COOLDOWN = max(
+    float(os.getenv("MONEYDJ_THROTTLE_BASE_COOLDOWN", "15")),
+    1.0,
+)
+MONEYDJ_THROTTLE_MAX_COOLDOWN = max(
+    float(os.getenv("MONEYDJ_THROTTLE_MAX_COOLDOWN", "300")),
+    MONEYDJ_THROTTLE_BASE_COOLDOWN,
+)
+MONEYDJ_THROTTLE_MAX_LEVEL = max(
+    int(os.getenv("MONEYDJ_THROTTLE_MAX_LEVEL", "6")),
+    1,
+)
+# 連續成功這麼多次就降一級，讓對方恢復後速度能回來。
+MONEYDJ_THROTTLE_DECAY_SUCCESSES = max(
+    int(os.getenv("MONEYDJ_THROTTLE_DECAY_SUCCESSES", "300")),
+    1,
+)
+# 節流時的重試退避（與一般錯誤分開）；一般錯誤仍用 MONEYDJ_RETRY_BASE_SECONDS。
+MONEYDJ_THROTTLE_RETRY_BASE_SECONDS = max(
+    float(os.getenv("MONEYDJ_THROTTLE_RETRY_BASE_SECONDS", "8")),
+    0.5,
+)
+# 每一種失敗類型最多印幾筆完整明細（含 HTTP 狀態、耗時、回應片段）。
+# 這是「抓到問題點」的關鍵：舊版 API5 失敗完全靜默，只回 ([], False)。
+MONEYDJ_FAILURE_SAMPLE_PRINTS = max(
+    int(os.getenv("MONEYDJ_FAILURE_SAMPLE_PRINTS", "3")),
+    0,
+)
+
 # API4 預篩是整條籌碼漏斗的第一層：這裡漏掉一檔權證，後面所有防護都補不回來。
 # 因此門檻預設收緊到 99.5%，並加上與 API5 同等級的低併發復原輪。
 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO = min(max(float(os.getenv("MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO", "0.995")), 0.0), 1.0)
@@ -339,6 +412,88 @@ MONEYDJ_REPAIR_OVERLAY_SCAN_DAYS = max(
     int(os.getenv("MONEYDJ_REPAIR_OVERLAY_SCAN_DAYS", "10")),
     1,
 )
+
+# ══════════════════════════════════════════════════════════════════════
+# AUDIT8：API5 前置探測、API4 候選快取、API5 跨次續跑
+# ──────────────────────────────────────────────────────────────────────
+# 目前的執行順序是「API4 預篩（約 50 分鐘）→ API5 → 完整性檢查 → 寫 Sheet」。
+# API5 掛掉時，那 50 分鐘一定已經先花掉，而且結果整個丟棄。
+# 下面三個機制分別處理：
+#   1. 前置探測：跑 API4 之前先用少量請求確認 API5 活著，掛了 30 秒內收手。
+#   2. 候選快取：API4 預篩結果按「日期＋掃描參數」存檔，同日重跑直接跳過。
+#   3. API5 續跑：已抓到的 (權證×分點) 存檔，下次只補失敗的那些。
+#
+# 【重要】第 3 項是「跨次累積」，不是「放行半套資料」。
+# 湊齊之前一律不寫 Google Sheet，MONEYDJ_API5_STRICT 的保護完全不變。
+# ══════════════════════════════════════════════════════════════════════
+MONEYDJ_API5_PREFLIGHT_ENABLED = os.getenv(
+    "MONEYDJ_API5_PREFLIGHT_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_API5_PREFLIGHT_SAMPLE = max(
+    int(os.getenv("MONEYDJ_API5_PREFLIGHT_SAMPLE", "8")),
+    1,
+)
+# 探測樣本中至少要有幾個成功才往下跑；0 代表探測只警告不擋。
+MONEYDJ_API5_PREFLIGHT_MIN_SUCCESS = max(
+    int(os.getenv("MONEYDJ_API5_PREFLIGHT_MIN_SUCCESS", "1")),
+    0,
+)
+# 探測全掛時，等這麼久再探一次（節流通常幾分鐘內恢復）；0＝不重探。
+MONEYDJ_API5_PREFLIGHT_RETRY_WAIT = max(
+    float(os.getenv("MONEYDJ_API5_PREFLIGHT_RETRY_WAIT", "90")),
+    0.0,
+)
+MONEYDJ_API5_PREFLIGHT_RETRY_ROUNDS = max(
+    int(os.getenv("MONEYDJ_API5_PREFLIGHT_RETRY_ROUNDS", "2")),
+    0,
+)
+
+MONEYDJ_CANDIDATE_CACHE_ENABLED = os.getenv(
+    "MONEYDJ_CANDIDATE_CACHE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# 候選快取保留天數；超過就清掉，避免 warrant_cache 無限長大。
+MONEYDJ_CANDIDATE_CACHE_KEEP_DAYS = max(
+    int(os.getenv("MONEYDJ_CANDIDATE_CACHE_KEEP_DAYS", "7")),
+    1,
+)
+
+MONEYDJ_API5_CHECKPOINT_ENABLED = os.getenv(
+    "MONEYDJ_API5_CHECKPOINT_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# 每抓到這麼多組就落一次盤，避免中途被砍掉全部白做。
+MONEYDJ_API5_CHECKPOINT_FLUSH_EVERY = max(
+    int(os.getenv("MONEYDJ_API5_CHECKPOINT_FLUSH_EVERY", "2000")),
+    100,
+)
+MONEYDJ_API5_CHECKPOINT_KEEP_DAYS = max(
+    int(os.getenv("MONEYDJ_API5_CHECKPOINT_KEEP_DAYS", "3")),
+    1,
+)
+
+# ── AUDIT8：降級模式 ────────────────────────────────────────────────
+# 今日 API5／API6 抓不到時，舊版直接整輪作廢。但歷史快取裡有 200 天資料，
+# 昨天以前的 TOP15 排名、淨買超成本、參與分點、個股型態本來就算得出來。
+# 降級模式＝退回「快取最後一個有資料的交易日」，用那天當統計日補齊報表。
+#
+# 為什麼這是安全的：
+#   1. 統計日期欄位誠實寫退回後的日期，不冒充今日。
+#   2. Google Sheet 同步本來就是「同資料範圍＋同統計日期整批替換」，
+#      寫進去的就是那一天的快照，不會污染其他日期。
+#   3. 今日那一天完全不寫入任何一列。
+MONEYDJ_DEGRADED_FALLBACK_ENABLED = os.getenv(
+    "MONEYDJ_DEGRADED_FALLBACK_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# 只接受這麼多天內的退回日期；太舊就不如不要寫。
+MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS = max(
+    int(os.getenv("MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS", "10")),
+    1,
+)
+# 該交易日至少要有這麼多列歷史才視為「完整」，避免退回到一個只寫了一半的日子。
+MONEYDJ_DEGRADED_MIN_ROWS = max(
+    int(os.getenv("MONEYDJ_DEGRADED_MIN_ROWS", "50")),
+    1,
+)
+
 MONEYDJ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*",
@@ -361,6 +516,79 @@ MONEYDJ_API5_URL = (
     "d8/f5/27/twWarrantData.xdjjson"
     "?x=warrant-chip0002-5&c={limit}&a={warrant}&b={broker}&revision=2018_07_31_1"
 )
+
+# ══════════════════════════════════════════════════════════════════════
+# AUDIT8：API6（分點對個股明細 by 區間）與可計算的路徑 hash
+# ──────────────────────────────────────────────────────────────────────
+# 網址中間那三段（例如 API4 的 9b/6e/0a、API5 的 d8/f5/27）不是固定值，
+# 而是可以算出來的：
+#     key = md5("/b2brwdCommon/jsondata/" + x + "/" + endpoint + ".xdjjson?" + query)
+#     path = key[0:2] / key[2:4] / key[4:6]
+# 舊版對所有 API4 請求都寫死同一組 hash（雖然對方照樣接受），
+# 因此無法呼叫沒有現成 hash 的端點 —— API6 就是被這一點擋住的。
+#
+# API6 與 API5 是同一份資料的兩種查法（FieldLength 都是 6、欄位完全相同）：
+#     API5  x=warrant-chip0002-5  c=筆數        「by 近日」＝最近 N 筆
+#     API6  x=warrant-chip0002-6  d=起日 e=迄日  「by 區間」＝指定日期區間
+# 日期格式是 YYYYMMDD（沒有斜線）。
+#
+# daily 用 API6 的好處：可以直接指定 d=e=目標日，一次就拿到那天，
+# 不必再像 API5 那樣用 5→50→200 筆逐步擴大回查（那是額外請求的來源之一，
+# 在被限流時更是雪上加霜）。
+# ══════════════════════════════════════════════════════════════════════
+MONEYDJ_JSONDATA_DOMAIN = "/b2brwdCommon/jsondata/"
+MONEYDJ_JSONDATA_HOST = "https://pscnetsecrwd.moneydj.com"
+MONEYDJ_URL_REVISION = os.getenv("MONEYDJ_URL_REVISION", "2018_07_31_1").strip()
+
+# 1＝用算出來的 hash（可呼叫任意端點）；0＝只用寫死的舊網址。
+MONEYDJ_DYNAMIC_HASH_ENABLED = os.getenv(
+    "MONEYDJ_DYNAMIC_HASH_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+
+# daily 目標日改用 API6 精準查詢；設 0 退回舊的 API5 逐步擴大回查。
+MONEYDJ_DAILY_USE_API6 = os.getenv(
+    "MONEYDJ_DAILY_USE_API6", "1"
+).strip().lower() not in ("0", "false", "no")
+
+# repair 的區間歷史改用 API6；設 0 維持 API5 取最近 N 筆。
+MONEYDJ_REPAIR_USE_API6 = os.getenv(
+    "MONEYDJ_REPAIR_USE_API6", "0"
+).strip().lower() in ("1", "true", "yes")
+
+
+def moneydj_build_url(endpoint, params):
+    """依 MoneyDJ 規則算出含路徑 hash 的完整網址。
+
+    params 的順序會影響 hash，必須與查詢字串完全一致，
+    因此這裡刻意用 dict 的插入順序，不做任何排序。
+    """
+    query = "&".join(f"{key}={value}" for key, value in params.items())
+    signature = f"{MONEYDJ_JSONDATA_DOMAIN}{params.get('x', '')}/{endpoint}.xdjjson?{query}"
+    digest = hashlib.md5(signature.encode("utf-8")).hexdigest()
+    path = f"{digest[0:2]}/{digest[2:4]}/{digest[4:6]}"
+    return (
+        f"{MONEYDJ_JSONDATA_HOST}{MONEYDJ_JSONDATA_DOMAIN}{path}/"
+        f"{endpoint}.xdjjson?{query}&revision={MONEYDJ_URL_REVISION}"
+    )
+
+
+def moneydj_api6_url(warrant_code, broker_code, start_date, end_date):
+    """API6：分點對個股明細 by 區間。日期格式 YYYYMMDD。"""
+    return moneydj_build_url("twWarrantData", {
+        "x": "warrant-chip0002-6",
+        "d": start_date,
+        "e": end_date,
+        "a": str(warrant_code).strip(),
+        "b": str(broker_code).strip(),
+    })
+
+
+def _moneydj_compact_date(value):
+    """把 2026/09/09 之類的日期轉成 API6 要的 20260909。"""
+    dt = parse_date(value)
+    return dt.strftime("%Y%m%d") if dt else ""
+
+
 _MONEYDJ_SOURCE_REACHABLE = False
 _MONEYDJ_TARGET_DATE_OK = False
 _MONEYDJ_TARGET_DATE = ""
@@ -371,6 +599,20 @@ _MONEYDJ_API5_EXPANDED_RETRY_COUNT = 0
 MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = 0
 MONEYDJ_PRESCAN_TOTAL_REQUESTS = 0
 MONEYDJ_PRESCAN_FAILED_CODES = []
+
+# ── AUDIT8：限流狀態與失敗統計（全域，跨執行緒共用） ──────────────
+_MONEYDJ_THROTTLE_LOCK = threading.Lock()
+_MONEYDJ_THROTTLE_UNTIL = 0.0          # time.monotonic()：在此之前所有請求都要等
+_MONEYDJ_THROTTLE_LEVEL = 0            # 目前冷卻等級（越高冷卻越久）
+_MONEYDJ_THROTTLE_HITS = 0             # 觸發全域冷卻的次數
+_MONEYDJ_THROTTLE_WAIT_SECONDS = 0.0   # 所有執行緒累計等待秒數
+_MONEYDJ_SUCCESS_STREAK = 0            # 連續成功次數，用來降級
+_MONEYDJ_FAILURE_KINDS = Counter()     # kind -> 次數
+_MONEYDJ_FAILURE_STATUS = Counter()    # (api, status) -> 次數
+_MONEYDJ_FAILURE_PRINTED = Counter()   # (api, kind) -> 已印明細次數
+_MONEYDJ_SLOW_RESPONSES = Counter()    # api -> 超過門檻的慢回應次數
+_MONEYDJ_MAX_ELAPSED = {}              # api -> 最慢一次的秒數
+_MONEYDJ_HEALTH_LOCK = threading.Lock()
 
 # ══════════════════════════════════════════════════════════════════════
 # 官方權證母體來源（TWSE／TPEx）。本版已完全移除 FinMind：
@@ -15287,7 +15529,22 @@ def fetch_all_prices(
             dt = parse_date(ev.get("事件日") or ev.get("結束日") or ev.get("起始日"))
             if dt:
                 if incremental_target_dt:
-                    if dt.date() != incremental_target_dt.date():
+                    # 【重要】daily 只跟官方要「目標日」的價格，但「要載入哪些代號的
+                    # 歷史快取」必須涵蓋全部事件，兩件事不能混為一談。
+                    #
+                    # 舊版在這裡對「事件日不是今天」的事件直接 continue，代號連
+                    # 收集都沒收集到，結果 price_cache 只有今天發生事件的 9 檔標的股；
+                    # 其餘 2,800 多筆舊事件的 D+ 欄位全部查不到價格
+                    # （實測 33,659 格裡有 30,805 格、91.52% 顯示為缺值）。
+                    # 諷刺的是 price_cache.csv 磁碟上有 7,809 個代號、639,507 筆，
+                    # 資料一直都在，只是沒被讀進記憶體。
+                    #
+                    # 這裡放行不會增加抓取量：下面的迴圈在 incremental 模式一律
+                    # 只把目標日放進 fetch_plan，而目標日走的是全市場批次，
+                    # 一天最多 2 個請求，代號多寡不影響。
+                    if not DAILY_PRICE_LOAD_ALL_EVENT_CODES and (
+                        dt.date() != incremental_target_dt.date()
+                    ):
                         continue
                     start_dt = incremental_target_dt
                     end_dt = incremental_target_dt
@@ -25648,77 +25905,230 @@ def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_na
     return rows
 
 
-def api4_get_with_status(code, start_date, end_date):
-    started = time.perf_counter()
+# ══════════════════════════════════════════════════════════════════════
+# AUDIT8：限流偵測、全域退避與失敗可觀測性
+# ══════════════════════════════════════════════════════════════════════
+
+def _moneydj_http_status(exc, response):
+    """從例外或回應取出 HTTP 狀態碼；取不到回 None。"""
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     try:
-        return _api4_get_with_status_inner(code, start_date, end_date)
-    finally:
-        record_stage_seconds("MoneyDJ API4（累計執行緒時間）", time.perf_counter() - started)
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
-# 診斷補丁：只記錄請求失敗，原有抓取、重試與資料完整性規則維持原狀。
-_MONEYDJ_DIAG_LOCK = threading.Lock()
-_MONEYDJ_DIAG_COUNTS = Counter()
-_MONEYDJ_DIAG_PATH = None
-_MONEYDJ_DIAG_WRITE_WARNED = False
+def _moneydj_classify_failure(exc, response, elapsed):
+    """
+    把失敗分類成可行動的種類，而不是全部當成同一種「錯誤」。
+
+    這是舊版最大的盲點：500（對方擋你）、逾時（對方排隊）、
+    解析失敗（對方回了 HTML 錯誤頁）需要完全不同的處理，
+    舊版卻一律睡 1～2 秒就重試。
+    """
+    status = _moneydj_http_status(exc, response)
+
+    if status is not None and status in MONEYDJ_THROTTLE_STATUS_CODES:
+        return "throttle", status
+    if isinstance(exc, requests.exceptions.Timeout):
+        # 讀取逾時代表對方收了請求卻遲遲不回；在 MoneyDJ 上這與 500 同源。
+        return "timeout", status
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "tls", status
+    if isinstance(exc, (requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ConnectionError)):
+        return "connection", status
+    if isinstance(exc, (ValueError, UnicodeError, json.JSONDecodeError)):
+        # 回了東西但不是合法 JSON —— 多半是 IIS/WAF 的 HTML 錯誤頁。
+        return "parse", status
+    if isinstance(exc, requests.RequestException):
+        return "transport", status
+    return "other", status
 
 
-def _moneydj_record_request_failure(api, url, response, exc, started, attempt):
-    global _MONEYDJ_DIAG_PATH, _MONEYDJ_DIAG_WRITE_WARNED
-    try:
-        status = response.status_code if response is not None else None
-        if isinstance(exc, requests.exceptions.SSLError):
-            kind = "tls_error"
-        elif isinstance(exc, requests.exceptions.Timeout):
-            kind = "timeout"
-        elif isinstance(exc, requests.exceptions.HTTPError):
-            kind = "http_error"
-        elif isinstance(exc, requests.RequestException):
-            kind = "transport_error"
-        elif isinstance(exc, (ValueError, UnicodeError)):
-            kind = "parse_error"
+def _moneydj_wait_if_throttled():
+    """
+    全域冷卻閘門：任何一條執行緒觸發節流後，所有執行緒都要一起等。
+
+    這是與舊版最關鍵的差異。舊版的 time.sleep 只擋住撞牆的那一條，
+    另外 59 條還在全速打，對方看到的壓力完全沒下降。
+    """
+    global _MONEYDJ_THROTTLE_WAIT_SECONDS
+
+    if not MONEYDJ_THROTTLE_DETECT_ENABLED:
+        return
+
+    waited_total = 0.0
+    while True:
+        with _MONEYDJ_THROTTLE_LOCK:
+            remaining = _MONEYDJ_THROTTLE_UNTIL - time.monotonic()
+        if remaining <= 0:
+            break
+        # 加入每執行緒固定抖動，避免冷卻結束瞬間 60 條同時再撞一次。
+        jitter = (threading.get_ident() % 997) / 997.0 * 2.0
+        nap = min(remaining + jitter, 5.0)
+        time.sleep(nap)
+        waited_total += nap
+
+    if waited_total > 0:
+        record_stage_seconds("MoneyDJ 全域限流等待（累計執行緒時間）", waited_total)
+        with _MONEYDJ_THROTTLE_LOCK:
+            _MONEYDJ_THROTTLE_WAIT_SECONDS += waited_total
+
+
+def _moneydj_trigger_throttle(api, kind, status, elapsed):
+    """升一級冷卻，並把冷卻截止時間推給所有執行緒共用。"""
+    global _MONEYDJ_THROTTLE_UNTIL, _MONEYDJ_THROTTLE_LEVEL
+    global _MONEYDJ_THROTTLE_HITS, _MONEYDJ_SUCCESS_STREAK
+
+    if not MONEYDJ_THROTTLE_DETECT_ENABLED:
+        return
+
+    with _MONEYDJ_THROTTLE_LOCK:
+        _MONEYDJ_SUCCESS_STREAK = 0
+        _MONEYDJ_THROTTLE_HITS += 1
+        previous_level = _MONEYDJ_THROTTLE_LEVEL
+        _MONEYDJ_THROTTLE_LEVEL = min(
+            _MONEYDJ_THROTTLE_LEVEL + 1,
+            MONEYDJ_THROTTLE_MAX_LEVEL,
+        )
+        cooldown = min(
+            MONEYDJ_THROTTLE_BASE_COOLDOWN * (2 ** (_MONEYDJ_THROTTLE_LEVEL - 1)),
+            MONEYDJ_THROTTLE_MAX_COOLDOWN,
+        )
+        new_until = time.monotonic() + cooldown
+        # 只延後、不提前：多條執行緒同時撞牆時取最長的那個冷卻。
+        escalated = _MONEYDJ_THROTTLE_LEVEL != previous_level
+        if new_until > _MONEYDJ_THROTTLE_UNTIL:
+            _MONEYDJ_THROTTLE_UNTIL = new_until
+        level = _MONEYDJ_THROTTLE_LEVEL
+        hits = _MONEYDJ_THROTTLE_HITS
+
+    count_event("MoneyDJ 觸發全域限流冷卻")
+    if escalated or hits <= 3 or hits % 50 == 0:
+        print(
+            f"  🚦 MoneyDJ 疑似限流｜{api} {kind}"
+            + (f" HTTP {status}" if status else "")
+            + f"｜本次耗時 {elapsed:.1f}s｜冷卻等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}"
+            f"｜全部執行緒暫停 {cooldown:.0f} 秒｜累計觸發 {hits:,} 次",
+            flush=True,
+        )
+
+
+def _moneydj_note_success(api, elapsed):
+    """成功也要看耗時：健康 0.34 秒 vs 節流 65.7 秒，慢回應是最早的預警。"""
+    global _MONEYDJ_THROTTLE_LEVEL, _MONEYDJ_SUCCESS_STREAK
+
+    if elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
+        with _MONEYDJ_HEALTH_LOCK:
+            _MONEYDJ_SLOW_RESPONSES[api] += 1
+            if elapsed > _MONEYDJ_MAX_ELAPSED.get(api, 0.0):
+                _MONEYDJ_MAX_ELAPSED[api] = elapsed
+        count_event(f"MoneyDJ {api} 慢回應（成功但逾 {MONEYDJ_THROTTLE_SLOW_SECONDS:.0f}s）")
+        # 還沒失敗但已經很慢：提前踩煞車，比等它變成 500 再處理便宜得多。
+        _moneydj_trigger_throttle(api, "slow_success", None, elapsed)
+        return
+
+    if not MONEYDJ_THROTTLE_DETECT_ENABLED:
+        return
+
+    with _MONEYDJ_THROTTLE_LOCK:
+        _MONEYDJ_SUCCESS_STREAK += 1
+        if (
+            _MONEYDJ_THROTTLE_LEVEL > 0
+            and _MONEYDJ_SUCCESS_STREAK >= MONEYDJ_THROTTLE_DECAY_SUCCESSES
+        ):
+            _MONEYDJ_THROTTLE_LEVEL -= 1
+            _MONEYDJ_SUCCESS_STREAK = 0
+            decayed_to = _MONEYDJ_THROTTLE_LEVEL
         else:
-            kind = "unexpected_error"
-        record = {
-            "time": datetime.now().isoformat(timespec="seconds"),
-            "api": api, "url": url, "kind": kind,
-            "exception_type": type(exc).__name__, "error": str(exc)[:1500],
-            "http_status": status, "attempt": attempt,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-        }
-        if response is not None:
-            record["content_type"] = response.headers.get("Content-Type", "")
-            record["retry_after"] = response.headers.get("Retry-After", "")
-            record["body_preview"] = response.content[:900].decode("utf-8", errors="replace")
-        if kind == "parse_error":
-            record["parse_stats"] = getattr(_THREAD_LOCAL, "moneydj_parse_stats", None)
-        with _MONEYDJ_DIAG_LOCK:
-            if _MONEYDJ_DIAG_PATH is None:
-                import ssl
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                _MONEYDJ_DIAG_PATH = os.path.join(CACHE_DIR, f"moneydj_request_failures_{stamp}_{os.getpid()}.jsonl")
-                print(f"  MoneyDJ 診斷檔：{_MONEYDJ_DIAG_PATH}", flush=True)
-                print(f"  MoneyDJ 執行環境：Python {sys.version.split()[0]}｜requests {requests.__version__}｜{ssl.OPENSSL_VERSION}", flush=True)
-            key = (api, kind, status, type(exc).__name__)
-            _MONEYDJ_DIAG_COUNTS[key] += 1
-            if _MONEYDJ_DIAG_COUNTS[key] <= 3:
-                print("  MoneyDJ 真正失敗原因：" + json.dumps(record, ensure_ascii=False), flush=True)
-            # 每次呼叫重試耗盡才存檔，避免將同一重試的全部回應灌入快取。
-            if attempt >= MONEYDJ_MAX_RETRIES:
-                with open(_MONEYDJ_DIAG_PATH, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as log_exc:
-        if not _MONEYDJ_DIAG_WRITE_WARNED:
-            _MONEYDJ_DIAG_WRITE_WARNED = True
-            print(f"  MoneyDJ 診斷寫入失敗：{type(log_exc).__name__}: {log_exc}", flush=True)
+            decayed_to = None
+
+    if decayed_to is not None:
+        print(
+            f"  ✅ MoneyDJ 連續 {MONEYDJ_THROTTLE_DECAY_SUCCESSES:,} 次成功，"
+            f"限流冷卻降到等級 {decayed_to}",
+            flush=True,
+        )
 
 
-def _api4_get_with_status_inner(code, start_date, end_date):
-    url = MONEYDJ_API4_URL.format(code=code, start=start_date, end=end_date)
+def _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt):
+    """
+    記錄失敗，並針對每種失敗類型印出前幾筆完整明細。
+
+    舊版 API5 失敗是完全靜默的（只回 ([], False)），所以你只看得到
+    「2,663/2,663 失敗」卻不知道是 500、逾時還是解析錯誤。
+    """
+    with _MONEYDJ_HEALTH_LOCK:
+        _MONEYDJ_FAILURE_KINDS[kind] += 1
+        _MONEYDJ_FAILURE_STATUS[(api, status)] += 1
+        if elapsed > _MONEYDJ_MAX_ELAPSED.get(api, 0.0):
+            _MONEYDJ_MAX_ELAPSED[api] = elapsed
+        printed = _MONEYDJ_FAILURE_PRINTED[(api, kind)]
+        should_print = (
+            attempt >= MONEYDJ_MAX_RETRIES
+            and printed < MONEYDJ_FAILURE_SAMPLE_PRINTS
+        )
+        if should_print:
+            _MONEYDJ_FAILURE_PRINTED[(api, kind)] = printed + 1
+
+    count_event(f"MoneyDJ {api} 失敗-{kind}")
+
+    if not should_print:
+        return
+
+    body_preview = ""
+    content_type = ""
+    body_size = ""
+    if response is not None:
+        try:
+            content_type = str(response.headers.get("Content-Type", ""))[:60]
+            raw = response.content or b""
+            body_size = f"{len(raw):,} bytes"
+            body_preview = raw[:300].decode("utf-8", errors="replace")
+            body_preview = re.sub(r"\s+", " ", body_preview).strip()
+        except Exception:
+            body_preview = "(無法讀取回應內容)"
+
+    parse_stats = getattr(_THREAD_LOCAL, "moneydj_parse_stats", None)
+
+    print(
+        f"  🔍 MoneyDJ {api} 失敗明細（{kind} 第 {printed + 1} 筆）\n"
+        f"     HTTP：{status if status else '-'}"
+        f"｜耗時：{elapsed:.1f}s"
+        f"｜例外：{type(exc).__name__}: {str(exc)[:160]}\n"
+        f"     URL：{url[:180]}\n"
+        + (f"     回應：{content_type}｜{body_size}｜{body_preview[:220]}\n" if response is not None else "")
+        + (f"     解析：{parse_stats}\n" if parse_stats else ""),
+        end="",
+        flush=True,
+    )
+
+
+def _moneydj_retry_sleep(kind, attempt):
+    """節流用長退避，其他錯誤沿用原本的短退避。"""
+    if kind in ("throttle", "timeout"):
+        base = MONEYDJ_THROTTLE_RETRY_BASE_SECONDS
+    else:
+        base = MONEYDJ_RETRY_BASE_SECONDS
+    time.sleep(base * attempt)
+
+
+def _moneydj_request_rows(api, url, required_fields):
+    """
+    API4／API5 共用的請求本體：限流閘門 → 請求 → 分類 → 退避。
+
+    行為與舊版的差異只有「怎麼失敗、怎麼等」，
+    成功時回傳的資料與完整性判定規則完全沒有改變。
+    """
     for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
-        count_event("MoneyDJ API4 HTTP 請求")
+        count_event(f"MoneyDJ {api} HTTP 請求")
+        _moneydj_wait_if_throttled()
+
         response = None
-        request_started = time.perf_counter()
+        started = time.perf_counter()
         _THREAD_LOCAL.moneydj_parse_stats = None
         try:
             response = get_thread_session().get(
@@ -25730,16 +26140,109 @@ def _api4_get_with_status_inner(code, start_date, end_date):
                 ),
             )
             response.raise_for_status()
-            # API4 預篩實際只用 V1（日期）與 V2（券商代號）；
-            # V3（券商名稱）只有 find_broker_codes_moneydj 在比對名稱時會用，
-            # 而那條路徑本來就對缺名稱有容錯。把 V3 列為必要欄位屬於過度嚴格，
-            # 會讓「只是名稱空白」的正常交易列害整批被拒。
-            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2'), source_name="API4"), True
+            rows = _moneydj_json_rows(
+                response.content,
+                required_fields=required_fields,
+                source_name=api,
+            )
+            _moneydj_note_success(api, time.perf_counter() - started)
+            return rows, True
         except Exception as exc:
-            _moneydj_record_request_failure("API4", url, response, exc, request_started, attempt)
+            elapsed = time.perf_counter() - started
+            kind, status = _moneydj_classify_failure(exc, response, elapsed)
+            _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt)
+
+            if kind in ("throttle", "timeout") or elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
+                _moneydj_trigger_throttle(api, kind, status, elapsed)
+
             if attempt < MONEYDJ_MAX_RETRIES:
-                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
+                _moneydj_retry_sleep(kind, attempt)
+
     return [], False
+
+
+_MONEYDJ_HEALTH_PRINTED = {"done": False}
+
+
+def print_moneydj_health_report():
+    """跑完印一份 MoneyDJ 健康報告，讓「到底是被擋還是真的沒資料」一眼看得出來。
+
+    與 print_stage_profile 同款：重複呼叫只會印一次，
+    因此提前 return 的路徑可以直接呼叫，不必擔心 finally 又印一次。
+    """
+    with _MONEYDJ_HEALTH_LOCK:
+        if _MONEYDJ_HEALTH_PRINTED["done"]:
+            return
+        _MONEYDJ_HEALTH_PRINTED["done"] = True
+
+    with _MONEYDJ_HEALTH_LOCK:
+        kinds = dict(_MONEYDJ_FAILURE_KINDS)
+        statuses = dict(_MONEYDJ_FAILURE_STATUS)
+        slow = dict(_MONEYDJ_SLOW_RESPONSES)
+        max_elapsed = dict(_MONEYDJ_MAX_ELAPSED)
+    with _MONEYDJ_THROTTLE_LOCK:
+        hits = _MONEYDJ_THROTTLE_HITS
+        level = _MONEYDJ_THROTTLE_LEVEL
+        wait_seconds = _MONEYDJ_THROTTLE_WAIT_SECONDS
+
+    if not kinds and not slow and not hits:
+        print("\n📡 MoneyDJ 健康報告：本次沒有任何失敗或慢回應。")
+        return
+
+    print(f"\n{'=' * 70}")
+    print("📡 MoneyDJ 健康報告（判斷『被限流』還是『真的沒資料』）")
+    print(f"{'-' * 70}")
+    if kinds:
+        print("  失敗類型：")
+        for kind, count in sorted(kinds.items(), key=lambda x: -x[1]):
+            print(f"    {kind:<14}{count:>10,}")
+    if statuses:
+        print("  HTTP 狀態：")
+        for (api, status), count in sorted(statuses.items(), key=lambda x: -x[1]):
+            print(f"    {api} {str(status) if status else '(無回應)':<10}{count:>10,}")
+    if slow:
+        print(f"  慢回應（成功但逾 {MONEYDJ_THROTTLE_SLOW_SECONDS:.0f} 秒）：")
+        for api, count in sorted(slow.items()):
+            print(f"    {api:<14}{count:>10,}")
+    if max_elapsed:
+        print("  單次最慢：")
+        for api, seconds in sorted(max_elapsed.items()):
+            print(f"    {api:<14}{seconds:>10.1f}s")
+    print(f"  全域限流冷卻觸發：{hits:,} 次｜目前等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}")
+    print(f"  所有執行緒累計等待：{wait_seconds:,.0f} 秒")
+    print(f"{'-' * 70}")
+    throttle_like = sum(
+        count for kind, count in kinds.items()
+        if kind in ("throttle", "timeout", "connection")
+    )
+    stable_like = sum(
+        count for kind, count in kinds.items()
+        if kind in ("parse", "other")
+    )
+    if hits > 0 or throttle_like > stable_like:
+        print("  ➜ 判讀：偏向【被限流／伺服器過載】。降低併發或拉長冷卻通常會改善。")
+        print("     可調：MONEYDJ_PRESCAN_WORKERS、MONEYDJ_HISTORY_WORKERS、")
+        print("           MONEYDJ_THROTTLE_BASE_COOLDOWN")
+    elif stable_like > 0:
+        print("  ➜ 判讀：偏向【對方就是沒有這筆資料】。重試再多次也不會變。")
+    print(f"{'=' * 70}")
+
+
+def api4_get_with_status(code, start_date, end_date):
+    started = time.perf_counter()
+    try:
+        return _api4_get_with_status_inner(code, start_date, end_date)
+    finally:
+        record_stage_seconds("MoneyDJ API4（累計執行緒時間）", time.perf_counter() - started)
+
+
+def _api4_get_with_status_inner(code, start_date, end_date):
+    url = MONEYDJ_API4_URL.format(code=code, start=start_date, end=end_date)
+    # API4 預篩實際只用 V1（日期）與 V2（券商代號）；
+    # V3（券商名稱）只有 find_broker_codes_moneydj 在比對名稱時會用，
+    # 而那條路徑本來就對缺名稱有容錯。把 V3 列為必要欄位屬於過度嚴格，
+    # 會讓「只是名稱空白」的正常交易列害整批被拒。
+    return _moneydj_request_rows("API4", url, ("V1", "V2"))
 
 
 def api5_get_with_status(warrant_code, broker_code, history_limit=None):
@@ -25752,32 +26255,40 @@ def api5_get_with_status(warrant_code, broker_code, history_limit=None):
 
 def _api5_get_with_status_inner(warrant_code, broker_code, history_limit=None):
     request_limit = max(int(history_limit or MONEYDJ_API5_HISTORY_LIMIT), 1)
-    url = MONEYDJ_API5_URL.format(
-        warrant=warrant_code,
-        broker=broker_code,
-        limit=request_limit,
-    )
-    for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
-        count_event("MoneyDJ API5 HTTP 請求")
-        response = None
-        request_started = time.perf_counter()
-        _THREAD_LOCAL.moneydj_parse_stats = None
-        try:
-            response = get_thread_session().get(
-                url,
-                headers=MONEYDJ_HEADERS,
-                timeout=(
-                    MONEYDJ_REQUEST_TIMEOUT_CONNECT,
-                    MONEYDJ_REQUEST_TIMEOUT_READ,
-                ),
-            )
-            response.raise_for_status()
-            return _moneydj_json_rows(response.content, required_fields=('V1', 'V2', 'V3', 'V4', 'V5'), source_name="API5"), True
-        except Exception as exc:
-            _moneydj_record_request_failure("API5", url, response, exc, request_started, attempt)
-            if attempt < MONEYDJ_MAX_RETRIES:
-                time.sleep(MONEYDJ_RETRY_BASE_SECONDS * attempt)
-    return [], False
+    if MONEYDJ_DYNAMIC_HASH_ENABLED:
+        url = moneydj_build_url("twWarrantData", {
+            "x": "warrant-chip0002-5",
+            "c": request_limit,
+            "a": str(warrant_code).strip(),
+            "b": str(broker_code).strip(),
+        })
+    else:
+        url = MONEYDJ_API5_URL.format(
+            warrant=warrant_code,
+            broker=broker_code,
+            limit=request_limit,
+        )
+    return _moneydj_request_rows("API5", url, ("V1", "V2", "V3", "V4", "V5"))
+
+
+def api6_get_with_status(warrant_code, broker_code, start_date, end_date):
+    """
+    API6：分點對個股明細 by 區間。
+
+    與 API5 回傳完全相同的欄位（V1 日期、V2 買股數、V3 賣股數、
+    V4 買金額仟元、V5 賣金額仟元、V6=1000），差別只在查詢方式：
+    API5 是「最近 N 筆」，API6 是「指定日期區間」。
+    """
+    started = time.perf_counter()
+    try:
+        start_key = _moneydj_compact_date(start_date)
+        end_key = _moneydj_compact_date(end_date or start_date)
+        if not start_key or not end_key:
+            return [], False
+        url = moneydj_api6_url(warrant_code, broker_code, start_key, end_key)
+        return _moneydj_request_rows("API6", url, ("V1", "V2", "V3", "V4", "V5"))
+    finally:
+        record_stage_seconds("MoneyDJ API6（累計執行緒時間）", time.perf_counter() - started)
 
 
 def _moneydj_int(value):
@@ -26250,6 +26761,15 @@ def _moneydj_scan_candidates(
             f"仍失敗 {len(still_failed):,} 檔"
         )
         failed_warrants = still_failed
+        # 復原 0 檔代表這批不是暫時性失敗，而是每次都以相同方式被拒絕
+        # （實測第 2、3 輪各花 6 分鐘、各復原 0 檔，純浪費 12 分鐘）。
+        # 再跑下去結果不會變，直接收手把時間留給後面的階段。
+        if recovered == 0 and failed_warrants:
+            print(
+                f"    ⏹️ 本輪沒有復原任何一檔，判定剩下的 {len(failed_warrants):,} 檔"
+                "屬於穩定失敗而非暫時性失敗，停止後續復原輪。"
+            )
+            break
 
     MONEYDJ_PRESCAN_FAILED_CODES = [
         _normalize_warrant_code_for_identity(warrant.get("代號", ""))
@@ -26287,7 +26807,14 @@ def _moneydj_scan_candidates(
     return list(candidates.values()), latest_market_date
 
 
-def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
+def _moneydj_candidate_to_item(candidate, target_date, history_limit=None, date_range=None):
+    """
+    取回單一 (權證 × 分點) 的逐日明細。
+
+    date_range=(起日, 迄日) 時走 API6「by 區間」精準查詢；
+    否則走 API5「by 近日」取最近 history_limit 筆（舊行為）。
+    兩者回傳的欄位完全相同，因此下面的解析邏輯共用。
+    """
     (
         warrant_code,
         warrant_name,
@@ -26303,11 +26830,20 @@ def _moneydj_candidate_to_item(candidate, target_date, history_limit=None):
         if len(candidate) >= 8 and str(candidate[7]).strip()
         else broker_code
     )
-    rows, ok = api5_get_with_status(
-        warrant_code,
-        api_broker_code,
-        history_limit=history_limit,
-    )
+    if date_range and MONEYDJ_DYNAMIC_HASH_ENABLED:
+        range_start, range_end = date_range
+        rows, ok = api6_get_with_status(
+            warrant_code,
+            api_broker_code,
+            range_start,
+            range_end,
+        )
+    else:
+        rows, ok = api5_get_with_status(
+            warrant_code,
+            api_broker_code,
+            history_limit=history_limit,
+        )
     if not ok:
         return None, False
     target_dt = parse_date(target_date)
@@ -26575,12 +27111,30 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
 
 def _moneydj_candidate_to_daily_target_day_item(candidate, target_date):
     """
-    daily API5 自適應回查。
+    daily 目標日取值。
 
-    先取少量最新列；若連線成功但其中沒有目標日，才依序擴大到 fallback／max。
-    只有連線或解析失敗回傳 request_failed；所有窗口都成功但沒有目標日則回傳
-    target_missing，兩者不可混為一談。
+    【AUDIT8】優先走 API6「by 區間」，直接指定 d=e=目標日：
+    一次請求就精準命中，回應只有一列，不需要任何擴大回查。
+    舊版走 API5「by 近日」必須用 5→50→200 筆逐步猜，
+    猜不中就多打好幾次 —— 在被限流時那些額外請求正好是壓垮駱駝的稻草。
+
+    API6 不可用（例如關閉動態 hash）時自動退回舊的 API5 自適應回查，
+    行為與 AUDIT7 完全相同。
     """
+    if MONEYDJ_DAILY_USE_API6 and MONEYDJ_DYNAMIC_HASH_ENABLED:
+        target_key = normalize_date_str(target_date)
+        item, ok = _moneydj_candidate_to_target_day_item(
+            candidate,
+            target_date,
+            date_range=(target_key, target_key),
+        )
+        if not ok:
+            return None, False, "request_failed", 1, 1
+        if item is not None:
+            return item, True, "ok", 1, 1
+        # API6 明確回「這一天沒有這個分點的交易」，不必再擴大回查。
+        return None, True, "target_missing", 1, 1
+
     limits = []
     for raw_limit in (
         MONEYDJ_DAILY_API5_LIMIT,
@@ -26603,6 +27157,160 @@ def _moneydj_candidate_to_daily_target_day_item(candidate, target_date):
             return item, True, "ok", limit, attempt_no
 
     return None, True, "target_missing", limits[-1], len(limits)
+
+
+def _last_complete_history_date(history_df, target_date, max_lookback_days):
+    """
+    找出既有歷史快取中「最後一個真的有資料」的交易日。
+
+    fail-closed 的設計保證了一件事：寫得進快取的日子一定是完整抓到的，
+    半套資料根本不會被寫進去。所以「快取裡最後一個日期」＝
+    「最後一個可信的交易日」，可以安全地拿來當降級後的統計日。
+
+    回傳 (日期字串, 該日列數, datetime)；找不到回 ("", 0, None)。
+    """
+    if history_df is None or history_df.empty or "日期" not in history_df.columns:
+        return "", 0, None
+
+    target_dt = parse_date(target_date) or datetime.today()
+    work = history_df[["日期"]].copy()
+    work["_dt"] = pd.to_datetime(
+        work["日期"].astype(str).str.replace("/", "-", regex=False),
+        errors="coerce",
+    )
+    work = work[work["_dt"].notna()].copy()
+    if work.empty:
+        return "", 0, None
+
+    cutoff = target_dt - timedelta(days=max_lookback_days)
+    work = work[(work["_dt"] <= pd.Timestamp(target_dt)) & (work["_dt"] >= pd.Timestamp(cutoff))]
+    if work.empty:
+        return "", 0, None
+
+    counts = work.groupby(work["_dt"].dt.date).size()
+    # 列數太少代表那天本身就不完整，不可以拿來當基準。
+    counts = counts[counts >= MONEYDJ_DEGRADED_MIN_ROWS]
+    if counts.empty:
+        return "", 0, None
+
+    last_day = max(counts.index)
+    last_dt = datetime(last_day.year, last_day.month, last_day.day)
+    return last_dt.strftime("%Y/%m/%d"), int(counts[last_day]), last_dt
+
+
+def _collect_api5_preflight_pairs(history_df, broker_map, sample_size):
+    """
+    從既有歷史快取挑出真實存在的 (權證 × 分點) 組合當探測樣本。
+
+    刻意挑最近日期出現過的組合：那些一定有資料，
+    所以探測失敗只可能是「對方擋我們」，不會是「本來就沒這筆」。
+    """
+    if history_df is None or history_df.empty:
+        return []
+    required = {"日期", "權證代號", "券商代號"}
+    if not required.issubset(history_df.columns):
+        return []
+
+    active_codes = {
+        normalize_broker_code_for_compare(code)
+        for _name, code in (broker_map or {}).values()
+    }
+    work = history_df[["日期", "權證代號", "券商代號"]].copy()
+    work["_dt"] = pd.to_datetime(
+        work["日期"].astype(str).str.replace("/", "-", regex=False),
+        errors="coerce",
+    )
+    work = work[work["_dt"].notna()].sort_values("_dt", ascending=False)
+
+    pairs = []
+    seen = set()
+    for _dt, warrant_code, broker_code in work[
+        ["_dt", "權證代號", "券商代號"]
+    ].itertuples(index=False, name=None):
+        warrant_key = _normalize_warrant_code_for_identity(warrant_code)
+        broker_key = normalize_broker_code_for_compare(broker_code)
+        if not warrant_key or not broker_key:
+            continue
+        if active_codes and broker_key not in active_codes:
+            continue
+        if (warrant_key, broker_key) in seen:
+            continue
+        seen.add((warrant_key, broker_key))
+        pairs.append((warrant_key, broker_key))
+        if len(pairs) >= sample_size:
+            break
+    return pairs
+
+
+def preflight_check_moneydj_api5(history_df, broker_map):
+    """
+    在跑 API4 預篩（約 50 分鐘）之前，先用少量請求確認 API5／API6 活著。
+
+    這解決的問題很具體：舊版的順序是
+        API4 預篩（50 分鐘）→ API5 →（掛了）→ fail-closed → 什麼都沒寫
+    那 50 分鐘一定會先花掉。這裡改成 30 秒內就知道今天值不值得跑。
+
+    回傳 (是否通過, 摘要字串)。
+    """
+    if not MONEYDJ_API5_PREFLIGHT_ENABLED:
+        return True, "已停用前置探測"
+
+    pairs = _collect_api5_preflight_pairs(
+        history_df,
+        broker_map,
+        MONEYDJ_API5_PREFLIGHT_SAMPLE,
+    )
+    if not pairs:
+        # 沒有歷史快取可挑樣本（例如第一次跑），不擋，讓主流程自己判斷。
+        return True, "歷史快取無可用樣本，略過探測"
+
+    total_rounds = MONEYDJ_API5_PREFLIGHT_RETRY_ROUNDS + 1
+    for round_no in range(1, total_rounds + 1):
+        started = time.perf_counter()
+        successes = 0
+        failures = 0
+        elapsed_samples = []
+
+        for warrant_code, broker_code in pairs:
+            call_started = time.perf_counter()
+            rows, ok = api5_get_with_status(
+                warrant_code,
+                broker_code,
+                history_limit=MONEYDJ_DAILY_API5_LIMIT,
+            )
+            elapsed_samples.append(time.perf_counter() - call_started)
+            if ok:
+                successes += 1
+            else:
+                failures += 1
+
+        avg_elapsed = (
+            sum(elapsed_samples) / len(elapsed_samples) if elapsed_samples else 0.0
+        )
+        round_seconds = time.perf_counter() - started
+        summary = (
+            f"樣本 {len(pairs)}｜成功 {successes}｜失敗 {failures}｜"
+            f"平均 {avg_elapsed:.2f}s｜本輪 {round_seconds:.1f}s"
+        )
+
+        if successes >= MONEYDJ_API5_PREFLIGHT_MIN_SUCCESS:
+            print(f"  ✅ MoneyDJ API5 前置探測通過（第 {round_no} 輪）：{summary}")
+            if avg_elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
+                print(
+                    f"  ⚠️ 但平均回應 {avg_elapsed:.1f} 秒偏慢"
+                    f"（健康值約 0.3 秒），對方可能已經在節流。"
+                )
+            return True, summary
+
+        print(f"  ⚠️ MoneyDJ API5 前置探測失敗（第 {round_no}/{total_rounds} 輪）：{summary}")
+        if round_no < total_rounds and MONEYDJ_API5_PREFLIGHT_RETRY_WAIT > 0:
+            print(
+                f"  ⏳ 等 {MONEYDJ_API5_PREFLIGHT_RETRY_WAIT:.0f} 秒後再探一次"
+                "（限流通常幾分鐘內恢復）..."
+            )
+            time.sleep(MONEYDJ_API5_PREFLIGHT_RETRY_WAIT)
+
+    return False, summary
 
 
 def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
@@ -26887,12 +27595,18 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     return combined
 
 
-def _moneydj_candidate_to_target_day_item(candidate, target_date, history_limit=None):
-    """只保留 MoneyDJ API5 回傳中的指定交易日，供 repair 最新日疊加使用。"""
+def _moneydj_candidate_to_target_day_item(
+    candidate,
+    target_date,
+    history_limit=None,
+    date_range=None,
+):
+    """只保留回傳中的指定交易日，供 daily 與 repair 最新日疊加使用。"""
     item, ok = _moneydj_candidate_to_item(
         candidate,
         target_date,
         history_limit=history_limit,
+        date_range=date_range,
     )
     if not ok or not item:
         return item, ok
@@ -27023,6 +27737,11 @@ def main():
     try:
         return _main_impl()
     finally:
+        # 先印健康報告再印分段耗時：出事時最想先看到的是「為什麼失敗」。
+        try:
+            print_moneydj_health_report()
+        except Exception as exc:
+            print(f"  ⚠️ MoneyDJ 健康報告輸出失敗：{type(exc).__name__}: {exc}")
         print_stage_profile(total_seconds=time.time() - started)
 
 
@@ -27031,6 +27750,10 @@ def _main_impl():
     global FORCE_FULL_CACHE_REFRESH
     _GROUP_OUTCOME_SALE_ROWS_CACHE.clear()
     program_start = time.time()
+    # AUDIT8：降級模式旗標。True 代表今日資料抓不到，
+    # 本輪報表是用「快取最後一個完整交易日」算出來的。
+    degraded_mode = False
+    degraded_original_target = ""
     configure_run_mode()
 
     today_fn = datetime.today().strftime("%Y%m%d")
@@ -27074,6 +27797,25 @@ def _main_impl():
 
     market_target_date = resolve_latest_trading_date_on_or_before(datetime.today())
     history_cache_df = load_history_cache()
+
+    # ── AUDIT8：跑 API4 之前先確認 API5 活著 ─────────────────────────
+    # 舊版順序是「API4 預篩 50 分鐘 → API5 →（全掛）→ 什麼都不寫」，
+    # 那 50 分鐘一定先被花掉。這裡改成 30 秒內就決定今天要不要跑。
+    print("\n【Step 0】MoneyDJ API5 前置探測（避免白跑 API4 預篩）...")
+    _stage_t = time.perf_counter()
+    api5_alive, api5_preflight_summary = preflight_check_moneydj_api5(
+        history_cache_df,
+        broker_map,
+    )
+    record_stage_seconds("Step0 API5 前置探測", time.perf_counter() - _stage_t)
+    if not api5_alive:
+        print(
+            f"  ⛔ MoneyDJ API5 目前不可用（{api5_preflight_summary}）。\n"
+            "     為避免再花 50 分鐘跑完 API4 預篩後才發現寫不出結果，本次直接結束。\n"
+            "     既有快取與 Google Sheet 完全沒有被修改，稍後重跑即可。"
+        )
+        print_moneydj_health_report()
+        return
 
     if workflow_is_repair() and REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED:
         # repair 的基準日一樣先確認 MoneyDJ 是否已發布，避免用尚未更新的日期重建。
@@ -27204,10 +27946,65 @@ def _main_impl():
             allow_empty_candidates=True,
         )
         if not source_complete:
-            print("  ⚠️ MoneyDJ 來源完整性未確認，本次停止，不修改 Google Sheet。")
+            print("  ⚠️ MoneyDJ 來源完整性未確認：今日資料不可信，不會寫入今日的任何一列。")
             for reason in source_reasons:
                 print(f"    - {reason}")
-            return
+
+            # ── AUDIT8 降級模式 ──────────────────────────────────────
+            # 舊版在這裡直接 return，於是整輪結果全部作廢 —— 但 200 天的
+            # 歷史快取其實好好的躺在磁碟上，昨天以前的部位、買超金額、
+            # 型態、排名本來就算得出來，沒有理由一起陪葬。
+            #
+            # 這裡改成：退回「快取裡最後一個真的有資料的交易日」，
+            # 用那一天當統計日把報表補齊。
+            #
+            # 這不是假造資料：統計日期欄位誠實寫的就是那一天，
+            # 而 Google Sheet 的同步本來就是「同資料範圍＋同統計日期整批替換」，
+            # 所以寫進去的是那一天的快照，不會冒充今天。
+            fallback_date, fallback_rows, fallback_dt = _last_complete_history_date(
+                history_cache_df,
+                target_date,
+                MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS,
+            )
+            can_degrade = bool(
+                MONEYDJ_DEGRADED_FALLBACK_ENABLED
+                and fallback_date
+                and fallback_date != normalize_date_str(target_date)
+            )
+            if not can_degrade:
+                if not MONEYDJ_DEGRADED_FALLBACK_ENABLED:
+                    print("  ⛔ 降級模式已停用（MONEYDJ_DEGRADED_FALLBACK_ENABLED=0），本次停止。")
+                elif not fallback_date:
+                    print(
+                        f"  ⛔ 歷史快取中最近 {MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS} 天沒有可用交易日，"
+                        "無法降級，本次停止。"
+                    )
+                else:
+                    print("  ⛔ 快取最後交易日就是目標日本身，沒有可退的日期，本次停止。")
+                print("  ℹ️ 既有快取與 Google Sheet 完全沒有被修改。")
+                return
+
+            degraded_mode = True
+            degraded_original_target = normalize_date_str(target_date)
+            target_date = fallback_date
+            _PRICE_PLAN_MAX_PUBLISHED_DATE = fallback_date
+            stale_days = 0
+            original_dt = parse_date(degraded_original_target)
+            if original_dt and fallback_dt:
+                stale_days = max((original_dt.date() - fallback_dt.date()).days, 0)
+
+            print(f"\n{'=' * 70}")
+            print("🟡 進入降級模式：今日資料抓不到，改用快取最後一個完整交易日")
+            print(f"{'-' * 70}")
+            print(f"  原目標日（放棄）：{degraded_original_target}")
+            print(f"  改用統計日      ：{fallback_date}（落後 {stale_days} 天）")
+            print(f"  該日歷史列數    ：{fallback_rows:,}")
+            print("  ✅ 仍會計算：TOP15 排名、淨買超成本、參與分點、權證清單、個股型態")
+            print("     （型態走 MoneyDJ czkc1 日 K，與 API4／API5 無關）")
+            print("  ⚠️ 報酬率／市值：仍依賴 TWSE／TPEx 權證收盤價；")
+            print("     取不到價格的部位只會讓報酬率顯示 -，不影響排名與金額。")
+            print(f"  ℹ️ 寫入 Google Sheet 的統計日期是 {fallback_date}，不會冒充今日。")
+            print(f"{'=' * 70}\n")
 
     _stage_t = time.perf_counter()
     items = items_from_history_cache(history_for_report(history_cache_df, broker_map, target_date))
@@ -27637,7 +28434,15 @@ def _main_impl():
 
     elapsed = time.time() - program_start
     print(f"\n{'=' * 70}")
-    print("✅ Hybrid V10.1 完成！")
+    if degraded_mode:
+        print("🟡 Hybrid V10.1 完成（降級模式）")
+        print(f"   本輪報表統計日：{target_date}")
+        print(f"   原目標日 {degraded_original_target} 因 MoneyDJ 取不到資料而未寫入任何一列。")
+        print("   TOP15 排名／淨買超成本／參與分點／個股型態均已正常計算；")
+        print("   缺價格的部位只有報酬率顯示 -，排名與金額不受影響。")
+        print(f"   ➜ MoneyDJ 恢復後重跑，即可補上 {degraded_original_target}。")
+    else:
+        print("✅ Hybrid V10.1 完成！")
     print(f"📄 {output_path}")
     print(f"⏱️ 總執行時間：{elapsed:.2f} 秒")
     print_stage_profile(total_seconds=elapsed)
