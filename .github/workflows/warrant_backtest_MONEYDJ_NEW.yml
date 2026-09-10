@@ -78,7 +78,7 @@ jobs:
 
       # 全域速率限制：被擋就自動減半，連續成功再緩慢回升。
       MONEYDJ_RATE_LIMIT_ENABLED: "1"
-      MONEYDJ_RATE_START_PER_SECOND: "15"
+      MONEYDJ_RATE_START_PER_SECOND: "25"
       MONEYDJ_RATE_MIN_PER_SECOND: "2"
       MONEYDJ_RATE_MAX_PER_SECOND: "40"
 
