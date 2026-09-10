@@ -3782,6 +3782,16 @@ GSHEET_CHUNK_ROWS = int(os.getenv("GSHEET_CHUNK_ROWS", "3000"))
 GSHEET_DAILY_SNAPSHOT_REPLACE = os.getenv(
     "GSHEET_DAILY_SNAPSHOT_REPLACE", "0"
 ).strip().lower() in ("1", "true", "yes")
+# TOP15 兩張表與 A～E／每日賣出明細的性質完全不同，不該綁在同一個開關：
+#   TOP15  ＝「某個統計日的快照」，同日重跑本來就該以本次結果為準；
+#             不替換的話，第一次跑出來的空型態、舊報酬率會永久卡在表上。
+#   A～E   ＝ 歷史事件表，替換範圍動輒 30 天以上，風險大得多。
+# 舊版把兩者綁死，導致「只想補上型態」必須連帶重寫一個月的事件列。
+# 這裡拆開：未指定時沿用 GSHEET_DAILY_SNAPSHOT_REPLACE，行為與舊版一致。
+GSHEET_TOP15_SNAPSHOT_REPLACE = os.getenv(
+    "GSHEET_TOP15_SNAPSHOT_REPLACE",
+    os.getenv("GSHEET_DAILY_SNAPSHOT_REPLACE", "0"),
+).strip().lower() in ("1", "true", "yes")
 GSHEET_PRESERVE_ALL_HISTORY = os.getenv(
     "GSHEET_PRESERVE_ALL_HISTORY", "1"
 ).strip().lower() not in ("0", "false", "no")
@@ -10471,8 +10481,9 @@ def upload_excel_to_google_sheet(
 
         # 最高優先級安全門：既有 Google Sheet 一律不 clear、不 delete_rows、不 resize 縮小。
         # 簡單資料表僅插入尚未存在的唯一鍵；版面型工作表保持原狀。
-        daily_snapshot = GSHEET_DAILY_SNAPSHOT_REPLACE and WORKFLOW_MODE == "daily" and (
-            is_daily_date_replace_sheet(title) or is_top15_snapshot_replace_sheet(title)
+        daily_snapshot = WORKFLOW_MODE == "daily" and (
+            (GSHEET_DAILY_SNAPSHOT_REPLACE and is_daily_date_replace_sheet(title))
+            or (GSHEET_TOP15_SNAPSHOT_REPLACE and is_top15_snapshot_replace_sheet(title))
         )
         if GSHEET_PRESERVE_ALL_HISTORY and not created and not daily_snapshot:
             if should_upsert_result_sheet(title, raw_values):
