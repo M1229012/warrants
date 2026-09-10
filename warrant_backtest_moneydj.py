@@ -556,6 +556,52 @@ MONEYDJ_API5_CHECKPOINT_KEEP_DAYS = max(
     1,
 )
 
+# ══════════════════════════════════════════════════════════════════════
+# AUDIT8：daily「今日優先」兩階段流程
+# ──────────────────────────────────────────────────────────────────────
+# 舊流程的順序是反的：
+#     先花 41,200 次 API4 做全市場預篩 → 才去拿真正要的今日籌碼
+# 實測掃 28,000 檔只找到 1,772 組候選，也就是 93% 的請求
+# 都在確認「這檔權證沒有我追蹤的分點」—— 而那個答案幾乎天天一樣。
+# 被限流時更慘：貴的部分先花光，真正要的資料一筆都拿不到。
+#
+# 新流程把順序倒過來：
+#   第一階段（必要，約 2,700 次）
+#       直接用歷史快取裡「最近活躍的 (權證×分點)」組合，
+#       用 API6 精準查目標日 —— 這就是你每天真正要的資料。
+#   第二階段（加值，有預算上限、隨時可中斷）
+#       才去掃「可能有新組合」的權證，找到新的就補查。
+#
+# 差別：被限流時第一階段已經完成，今日資料照樣寫得出來。
+#
+# 【覆蓋率代價】某個分點「第一次」買進一檔全新權證，
+# 若那檔不在第二階段的預算內，daily 當天會漏，要等輪替或 repair 補上。
+# 因此預設關閉，確認可接受再開。
+# ══════════════════════════════════════════════════════════════════════
+MONEYDJ_DAILY_TODAY_FIRST = os.getenv(
+    "MONEYDJ_DAILY_TODAY_FIRST", "0"
+).strip().lower() in ("1", "true", "yes")
+# 第一階段：取最近幾個交易日出現過的 (權證×分點) 組合。
+MONEYDJ_DAILY_ACTIVE_PAIR_DAYS = max(
+    int(os.getenv("MONEYDJ_DAILY_ACTIVE_PAIR_DAYS", "20")),
+    1,
+)
+# 第二階段的請求預算；設 0 代表完全不做探索（只查已知組合）。
+MONEYDJ_DISCOVERY_BUDGET = max(
+    int(os.getenv("MONEYDJ_DISCOVERY_BUDGET", "8000")),
+    0,
+)
+# 第二階段被限流到什麼程度就收手（連續失敗次數）。
+MONEYDJ_DISCOVERY_ABORT_AFTER_FAILURES = max(
+    int(os.getenv("MONEYDJ_DISCOVERY_ABORT_AFTER_FAILURES", "60")),
+    5,
+)
+# 冷門權證輪替：每天掃 1/N，N 天涵蓋一輪。
+MONEYDJ_DISCOVERY_ROTATION_SLICES = max(
+    int(os.getenv("MONEYDJ_DISCOVERY_ROTATION_SLICES", "5")),
+    1,
+)
+
 # ── AUDIT8：降級模式 ────────────────────────────────────────────────
 # 今日 API5／API6 抓不到時，舊版直接整輪作廢。但歷史快取裡有 200 天資料，
 # 昨天以前的 TOP15 排名、淨買超成本、參與分點、個股型態本來就算得出來。
@@ -27649,6 +27695,330 @@ def preflight_check_moneydj_api5(history_df, broker_map):
     return False, summary
 
 
+def _moneydj_known_pairs_from_history(
+    history_df,
+    broker_map,
+    warrants,
+    target_date,
+    active_days,
+):
+    """
+    從歷史快取取出「最近活躍的 (權證×分點)」，組成與 API4 預篩相同格式的候選。
+
+    這是「今日優先」第一階段的輸入：不用問對方「誰買了這檔」，
+    因為過去 N 天的歷史已經告訴我們答案，而那份名單天天高度重疊。
+    回傳的 tuple 結構與 _moneydj_scan_candidates 完全一致，
+    所以下游取值、寫入、驗證的程式碼一行都不用改。
+    """
+    if history_df is None or history_df.empty:
+        return []
+    required = {"日期", "權證代號", "券商代號"}
+    if not required.issubset(history_df.columns):
+        return []
+
+    target_dt = parse_date(target_date) or datetime.today()
+    cutoff = target_dt - timedelta(days=max(int(active_days), 1) * 2)
+
+    work = history_df.copy()
+    work["_dt"] = pd.to_datetime(
+        work["日期"].astype(str).str.replace("/", "-", regex=False),
+        errors="coerce",
+    )
+    work = work[
+        work["_dt"].notna()
+        & (work["_dt"] <= pd.Timestamp(target_dt))
+        & (work["_dt"] >= pd.Timestamp(cutoff))
+    ]
+    if work.empty:
+        return []
+
+    # 只取最近 N 個「實際有資料的交易日」，而不是 N 個日曆日。
+    trade_days = sorted({d.date() for d in work["_dt"]}, reverse=True)
+    keep_days = set(trade_days[: max(int(active_days), 1)])
+    work = work[work["_dt"].dt.date.isin(keep_days)]
+    if work.empty:
+        return []
+
+    _label_to_code, code_to_label = configured_broker_pair_maps_for_scope("all")
+    warrant_lookup = _warrant_lookup(warrants, target_date)
+
+    candidates = {}
+    for warrant_code, broker_code in work[
+        ["權證代號", "券商代號"]
+    ].itertuples(index=False, name=None):
+        code = _normalize_warrant_code_for_identity(warrant_code)
+        broker_key = normalize_broker_code_for_compare(broker_code)
+        if not code or not broker_key:
+            continue
+        identity = code_to_label.get(broker_key)
+        if not identity:
+            continue
+        # 目標日已不在生命週期內的權證不必再問（到期／下市）。
+        meta = warrant_lookup.get(code)
+        if not meta:
+            continue
+        broker_label, canonical_code = identity
+        broker_name = str(
+            FULL_FALLBACK.get(broker_label, (broker_label, canonical_code))[0]
+            or broker_label
+        ).strip()
+        candidates[(code, broker_key)] = (
+            code,
+            str(meta.get("名稱", "")).strip(),
+            normalize_security_code_text(meta.get("標的股", "")),
+            str(meta.get("標的名稱", "")).strip(),
+            broker_label,
+            broker_name,
+            canonical_code,
+            canonical_code,
+        )
+
+    return list(candidates.values())
+
+
+def _moneydj_discovery_warrant_codes(
+    warrants,
+    history_df,
+    known_pairs,
+    target_date,
+    budget,
+):
+    """
+    決定第二階段要掃哪些權證，並照「最可能有新組合」排序。
+
+    優先序：
+      A. 今天新上市的權證（最可能出現全新組合）
+      B. 你的分點已經在交易的標的股，底下的其他權證
+      C. 其餘冷門權證的輪替切片（每天 1/N，N 天涵蓋一輪）
+    """
+    target_dt = parse_date(target_date) or datetime.today()
+    active_map = _warrant_lookup(warrants, target_date)
+    known_codes = {code for code, _broker in (
+        (c[0], c[6]) for c in known_pairs
+    )}
+
+    # A：新上市（快取歷史從未出現過的代號）
+    seen_codes = set()
+    if history_df is not None and not history_df.empty and "權證代號" in history_df.columns:
+        seen_codes = {
+            _normalize_warrant_code_for_identity(code)
+            for code in history_df["權證代號"].tolist()
+        }
+    newly = [code for code in active_map if code and code not in seen_codes]
+
+    # B：活躍標的股底下的其他權證
+    active_underlyings = set()
+    for code in known_codes:
+        meta = active_map.get(code)
+        if meta:
+            underlying = normalize_security_code_text(meta.get("標的股", ""))
+            if underlying:
+                active_underlyings.add(underlying)
+    same_underlying = [
+        code for code, meta in active_map.items()
+        if code not in known_codes
+        and code not in set(newly)
+        and normalize_security_code_text(meta.get("標的股", "")) in active_underlyings
+    ]
+
+    # C：其餘的輪替切片
+    covered = set(newly) | set(same_underlying) | known_codes
+    rest = sorted(code for code in active_map if code not in covered)
+    slice_index = target_dt.toordinal() % MONEYDJ_DISCOVERY_ROTATION_SLICES
+    rotated = [
+        code for idx, code in enumerate(rest)
+        if idx % MONEYDJ_DISCOVERY_ROTATION_SLICES == slice_index
+    ]
+
+    ordered = list(dict.fromkeys(sorted(newly) + sorted(same_underlying) + rotated))
+    plan = {
+        "new_listed": len(newly),
+        "same_underlying": len(same_underlying),
+        "rotation": len(rotated),
+        "rotation_slice": f"{slice_index + 1}/{MONEYDJ_DISCOVERY_ROTATION_SLICES}",
+        "total_available": len(ordered),
+    }
+    if budget > 0:
+        ordered = ordered[:budget]
+    plan["selected"] = len(ordered)
+    return ordered, plan
+
+
+def _moneydj_today_first_candidates(warrants, broker_map, history_df, target_date):
+    """
+    daily「今日優先」：先確保今日必要資料，再用剩餘預算探索新組合。
+
+    回傳 (候選清單, 市場最新日, 統計)。候選格式與 API4 全市場預篩完全相同。
+    """
+    global MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS, MONEYDJ_PRESCAN_TOTAL_REQUESTS
+    global MONEYDJ_PRESCAN_FAILED_CODES, _MONEYDJ_SOURCE_REACHABLE
+
+    target_dt = parse_date(target_date) or datetime.today()
+    stats = {"phase1_ok": False}
+
+    # ── 第一階段：已知活躍組合（這是你每天真正要的資料）────────────
+    known_pairs = _moneydj_known_pairs_from_history(
+        history_df,
+        broker_map,
+        warrants,
+        target_date,
+        MONEYDJ_DAILY_ACTIVE_PAIR_DAYS,
+    )
+    print(
+        f"\n【Step 3-A】今日優先：已知活躍組合 {len(known_pairs):,} 組"
+        f"（取最近 {MONEYDJ_DAILY_ACTIVE_PAIR_DAYS} 個交易日）"
+    )
+    if not known_pairs:
+        print(
+            "  ⚠️ 歷史快取沒有可用的活躍組合（可能是第一次執行）；"
+            "自動退回全市場預篩。"
+        )
+        candidates, latest = _moneydj_scan_candidates(
+            warrants, broker_map, target_date,
+            history_empty=False, exact_target_date=True,
+        )
+        stats["phase1_ok"] = True
+        stats["fallback_full_prescan"] = True
+        return candidates, latest, stats
+
+    # 第一階段不需要 API4：組合已知，直接進 API5／API6 取目標日。
+    # 這裡只驗證「目標日對方確實有資料」，用少量 API4 確認市場已發布。
+    verify_codes = [pair[0] for pair in known_pairs[:60]]
+    latest_market_date = None
+    verify_ok = 0
+    start_s = target_dt.strftime("%Y/%m/%d")
+    for code in verify_codes:
+        rows, ok = api4_get_with_status(code, start_s, start_s)
+        if not ok:
+            continue
+        verify_ok += 1
+        _MONEYDJ_SOURCE_REACHABLE = True
+        for row in rows:
+            row_dt = parse_date(row.get("V1", ""))
+            if row_dt and (latest_market_date is None or row_dt > latest_market_date):
+                latest_market_date = row_dt
+        if latest_market_date and verify_ok >= 10:
+            break
+
+    print(
+        f"  ✅ 市場發布驗證：抽查 {min(len(verify_codes), verify_ok or 1):,} 檔｜"
+        f"成功 {verify_ok:,}｜"
+        f"市場最新日 {latest_market_date.strftime('%Y/%m/%d') if latest_market_date else '-'}"
+    )
+
+    # 讓下游既有的成功率閘門沿用同一組統計。
+    MONEYDJ_PRESCAN_TOTAL_REQUESTS = max(verify_ok, 1)
+    MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS = max(verify_ok, 1)
+    MONEYDJ_PRESCAN_FAILED_CODES = []
+    stats["phase1_pairs"] = len(known_pairs)
+    stats["phase1_ok"] = bool(verify_ok > 0 and latest_market_date)
+
+    if not stats["phase1_ok"]:
+        print("  ⚠️ 無法確認市場已發布目標日資料，今日優先模式中止。")
+        return known_pairs, latest_market_date, stats
+
+    # ── 第二階段：探索新組合（有預算、可中斷）──────────────────────
+    discovered = []
+    if MONEYDJ_DISCOVERY_BUDGET <= 0:
+        print("  ⏭️ 第二階段已停用（MONEYDJ_DISCOVERY_BUDGET=0），只查已知組合。")
+        stats["discovery"] = {"selected": 0, "disabled": True}
+        return known_pairs, latest_market_date, stats
+
+    codes, plan = _moneydj_discovery_warrant_codes(
+        warrants, history_df, known_pairs, target_date, MONEYDJ_DISCOVERY_BUDGET,
+    )
+    print(
+        f"\n【Step 3-B】新組合探索（預算 {MONEYDJ_DISCOVERY_BUDGET:,} 次，可中斷）\n"
+        f"  新上市 {plan['new_listed']:,}｜活躍標的其他權證 {plan['same_underlying']:,}｜"
+        f"輪替切片 {plan['rotation']:,}（第 {plan['rotation_slice']} 批）\n"
+        f"  可掃總數 {plan['total_available']:,} → 本次實際掃 {plan['selected']:,}"
+    )
+
+    code_map = {
+        normalize_broker_code_for_compare(code): (label, name, code)
+        for label, (name, code) in broker_map.items()
+    }
+    warrant_lookup = _warrant_lookup(warrants, target_date)
+    known_keys = {(c[0], normalize_broker_code_for_compare(c[6])) for c in known_pairs}
+
+    def scan_one(code):
+        rows, ok = api4_get_with_status(code, start_s, start_s)
+        found = []
+        if ok:
+            for row in rows:
+                row_dt = parse_date(row.get("V1", ""))
+                if not row_dt or row_dt.date() != target_dt.date():
+                    continue
+                broker_norm = normalize_broker_code_for_compare(row.get("V2", ""))
+                info = code_map.get(broker_norm)
+                if not info:
+                    continue
+                label, broker_name, canonical = info
+                meta = warrant_lookup.get(code) or {}
+                found.append((
+                    code,
+                    str(meta.get("名稱", "")).strip(),
+                    normalize_security_code_text(meta.get("標的股", "")),
+                    str(meta.get("標的名稱", "")).strip(),
+                    label,
+                    broker_name,
+                    canonical,
+                    str(row.get("V2", "")).strip() or canonical,
+                ))
+        return found, ok
+
+    consecutive_failures = 0
+    scanned = 0
+    aborted = False
+    workers = min(MONEYDJ_PRESCAN_WORKERS, max(len(codes), 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(scan_one, code): code for code in codes}
+        for future in as_completed(futures):
+            scanned += 1
+            try:
+                found, ok = future.result()
+            except Exception:
+                found, ok = [], False
+            if ok:
+                consecutive_failures = 0
+                _MONEYDJ_SOURCE_REACHABLE = True
+                for cand in found:
+                    key = (cand[0], normalize_broker_code_for_compare(cand[6]))
+                    if key not in known_keys:
+                        known_keys.add(key)
+                        discovered.append(cand)
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= MONEYDJ_DISCOVERY_ABORT_AFTER_FAILURES:
+                    aborted = True
+                    for pending in futures:
+                        pending.cancel()
+                    break
+            if scanned % 2000 == 0:
+                print(
+                    f"  [{scanned:,}/{len(codes):,}] 探索中｜新組合 {len(discovered):,}"
+                )
+
+    if aborted:
+        print(
+            f"  ⏹️ 探索階段連續失敗 {consecutive_failures:,} 次，判定被限流，提前收手。\n"
+            f"     已掃 {scanned:,}/{len(codes):,}｜找到新組合 {len(discovered):,}\n"
+            "     ✅ 今日必要資料不受影響（第一階段已完成）；未掃到的下次輪替補上。"
+        )
+    else:
+        print(
+            f"  ✅ 探索完成：掃 {scanned:,} 檔｜新增組合 {len(discovered):,}"
+        )
+
+    stats["discovery"] = {
+        **plan,
+        "scanned": scanned,
+        "discovered": len(discovered),
+        "aborted": aborted,
+    }
+    return known_pairs + discovered, latest_market_date, stats
+
+
 def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
     global _MONEYDJ_API5_MISSING_TARGET_COUNT, _MONEYDJ_API5_UNCOVERED_TARGET_COUNT
@@ -27661,11 +28031,26 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     _MONEYDJ_API5_EXPANDED_RETRY_COUNT = 0
     baseline = history_df.copy() if history_df is not None else pd.DataFrame()
 
-    candidates, latest_market_date = _moneydj_scan_candidates(
-        warrants, broker_map, _MONEYDJ_TARGET_DATE,
-        history_empty=False,
-        exact_target_date=True,
-    )
+    if MONEYDJ_DAILY_TODAY_FIRST:
+        candidates, latest_market_date, today_first_stats = (
+            _moneydj_today_first_candidates(
+                warrants,
+                broker_map,
+                history_df,
+                _MONEYDJ_TARGET_DATE,
+            )
+        )
+        if not today_first_stats.get("phase1_ok"):
+            print(
+                "  ⚠️ 今日優先模式：第一階段（已知組合）未通過，保留原歷史快取。"
+            )
+            return baseline
+    else:
+        candidates, latest_market_date = _moneydj_scan_candidates(
+            warrants, broker_map, _MONEYDJ_TARGET_DATE,
+            history_empty=False,
+            exact_target_date=True,
+        )
 
     prescan_ratio = (
         MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS / MONEYDJ_PRESCAN_TOTAL_REQUESTS
