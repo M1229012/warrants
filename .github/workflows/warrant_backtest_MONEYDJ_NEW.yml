@@ -1,4 +1,4 @@
-name: Warrant Backtest Google Sheet - FinMind + MoneyDJ Hybrid
+name: Warrant Backtest Google Sheet - MoneyDJ
 
 on:
   workflow_dispatch:
@@ -15,7 +15,6 @@ on:
           - "完整修補模式"
 
   # 測試期間停用排程，只保留 workflow_dispatch。
-  # 驗證 MoneyDJ 資料正確後，再與 FinMind 工作流程錯開至少 30 分鐘啟用。
 
 
 permissions:
@@ -34,57 +33,77 @@ jobs:
       # ============================================================
       OUTPUT_DIR: output
       CACHE_DIR: warrant_cache
-      # 請把修正版程式內容放進這個既有檔名；若改用其他檔名，這裡也要同步修改。
       PYTHON_FILE: warrant_backtest_moneydj.py
-      FINMIND_API_0714: ${{ secrets.FINMIND_API_0714 }}
 
       # ============================================================
-      # FinMind 全市場完整歷史（Hybrid repair 主要歷史來源）
-      # 完整修補模式：FinMind 補足最近 200 個成功交易日；
-      # MoneyDJ 負責近期候選與最新交易日補強。
+      # MoneyDJ 抓取策略（AUDIT8 重點）
+      # ------------------------------------------------------------
+      # 舊流程 daily 要先掃全市場 41,200 檔 API4，才去拿真正要的今日籌碼。
+      # 實測掃 28,000 檔只找到 1,772 組候選 —— 93% 的請求都在確認
+      # 「這檔沒有我追蹤的分點」，而那個答案天天一樣。
+      # 被限流時更慘：貴的部分先花光，要的資料一筆都拿不到。
+      #
+      # 今日優先兩階段：
+      #   第一階段 直接用歷史快取的活躍組合（約 2,700 組）→ API6 精準查今日
+      #   第二階段 才去探索新組合，有預算上限、被擋就收手
+      # 請求數 44,000 → 約 2,700（DISCOVERY_BUDGET=0 時）
       # ============================================================
-      FINMIND_API_BASE: "https://api.finmindtrade.com/api/v4"
-      FINMIND_CACHE_SCHEMA_VERSION: "finmind-v2-date-aware"
-      FINMIND_METADATA_CACHE_HOURS: "18"
-      FINMIND_HISTORY_WORKERS: "10"
-      FINMIND_MAX_RETRIES: "4"
-      FINMIND_RETRY_BASE_SECONDS: "2"
-      FINMIND_REQUEST_TIMEOUT_CONNECT: "8"
-      FINMIND_REQUEST_TIMEOUT_READ: "120"
+      MONEYDJ_DAILY_TODAY_FIRST: "1"
 
-      FINMIND_FORCE_REFRESH_TARGET_DATE: "1"
-      FINMIND_INITIAL_BACKFILL_ON_EMPTY: "1"
-      FINMIND_REPAIR_ALLOW_TARGET_FALLBACK: "1"
-      FINMIND_REPAIR_TARGET_FALLBACK_TRADING_DAYS: "15"
+      # 第一次先設 0：只查已知組合，幾分鐘跑完。
+      # 確認資料正確且穩定後，再改成 8000 打開新組合探索。
+      MONEYDJ_DISCOVERY_BUDGET: "0"
 
-      # 舊 MoneyDJ 候選歷史不能被當成 FinMind 全市場完整歷史。
-      # 第一次執行 Hybrid 完整修補時會建立來源標記並補足 200 個成功交易日。
-      FINMIND_REPAIR_HISTORY_SOURCE_ID: "finmind-full-market-200d-hybrid-v1"
-      FINMIND_REPAIR_STRICT_HISTORY_WINDOW: "1"
-      FINMIND_REPAIR_SUCCESS_DAY_BACKFILL_ENABLED: "1"
-      FINMIND_REPAIR_SUCCESS_DAY_EXTRA_LIMIT: "30"
-      FINMIND_REPAIR_SUCCESS_DAY_BATCH_SIZE: "6"
-      FINMIND_RAW_DAILY_RETENTION_DAYS: "7"
-      CACHE_WRITE_CSV_COMPAT: "0"
+      MONEYDJ_DAILY_ACTIVE_PAIR_DAYS: "20"
+      MONEYDJ_DISCOVERY_ROTATION_SLICES: "5"
+      MONEYDJ_DISCOVERY_ABORT_AFTER_FAILURES: "60"
+
+      # daily 目標日改用 API6「by 區間」精準查詢（d=e=目標日），
+      # 一次命中，不必再用 5→50→200 筆逐步擴大回查。
+      MONEYDJ_DAILY_USE_API6: "1"
+      MONEYDJ_DYNAMIC_HASH_ENABLED: "1"
 
       # ============================================================
-      # MoneyDJ 資料來源
-      # API4：近期權證分點候選與最新市場日期
-      # API5：權證＋分點歷史買賣資料
+      # MoneyDJ 併發與限流
+      # ------------------------------------------------------------
+      # 實測 60 併發約在 28,000 筆後開始被擋，換算約 40~60 req/s。
+      # 降到 20 併發 + 起始 15 req/s，讓它一開始就不要撞牆。
       # ============================================================
-      MONEYDJ_HISTORY_WORKERS: "50"
-      MONEYDJ_PRESCAN_WORKERS: "60"
-      MONEYDJ_FIND_BROKER_WORKERS: "40"
+      MONEYDJ_PRESCAN_WORKERS: "20"
+      MONEYDJ_HISTORY_WORKERS: "20"
       MONEYDJ_RECENT_SCAN_DAYS: "50"
       MONEYDJ_API5_HISTORY_LIMIT: "200"
       MONEYDJ_MAX_RETRIES: "3"
       MONEYDJ_RETRY_BASE_SECONDS: "1.0"
-      MONEYDJ_ISIN_TIMEOUT_SECONDS: "30"
-      MONEYDJ_CACHE_INCREMENTAL_UPDATE_ENABLED: "1"
 
-      # MoneyDJ 完整性保護：
-      # API4 成功率低於 98%，或 API5 有連線／解析失敗時，
-      # 本次停止同步 Google Sheet，避免產生不完整報表。
+      # 全域速率限制：被擋就自動減半，連續成功再緩慢回升。
+      MONEYDJ_RATE_LIMIT_ENABLED: "1"
+      MONEYDJ_RATE_START_PER_SECOND: "15"
+      MONEYDJ_RATE_MIN_PER_SECOND: "2"
+      MONEYDJ_RATE_MAX_PER_SECOND: "40"
+
+      # 限流偵測：
+      #   HTTP 200 但 Content-Type 不是 json → 限流頁（57B 請稍候／22KB HTML）
+      #   慢速 500、逾時、429                → 限流
+      #   快速 500（固定那批壞代號）          → 不是限流，不冷卻
+      MONEYDJ_THROTTLE_DETECT_ENABLED: "1"
+      MONEYDJ_THROTTLE_BASE_COOLDOWN: "15"
+      MONEYDJ_THROTTLE_MAX_COOLDOWN: "45"
+      MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS: "6"
+      MONEYDJ_FAILURE_SAMPLE_PRINTS: "3"
+
+      # API5 前置探測：跑大量請求前先確認對方活著，掛了 30 秒內收手。
+      MONEYDJ_API5_PREFLIGHT_ENABLED: "1"
+      MONEYDJ_API5_PREFLIGHT_SAMPLE: "8"
+      MONEYDJ_API5_PREFLIGHT_RETRY_ROUNDS: "2"
+      MONEYDJ_API5_PREFLIGHT_RETRY_WAIT: "90"
+
+      # 降級模式：今日抓不到時，退回快取最後一個完整交易日產出報表，
+      # 而不是整輪作廢。統計日期欄位誠實寫退回後的日期，不冒充今日。
+      MONEYDJ_DEGRADED_FALLBACK_ENABLED: "1"
+      MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS: "10"
+
+      # 完整性保護：API4 成功率不足或 API5 有失敗時不寫 Google Sheet。
       MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO: "0.97"
       MONEYDJ_API5_STRICT: "1"
 
@@ -94,7 +113,6 @@ jobs:
       WARRANT_IDENTITY_RECONCILE_ENABLED: "1"
       WARRANT_IDENTITY_OVERRIDE_MIN_PREFIX: "3"
       WARRANT_IDENTITY_REPAIR_HISTORY: "1"
-      # 歷史保護模式不修改 Google Sheet 既有列；身分修正只反映在新插入資料。
       GSHEET_REPAIR_SECURITY_IDENTITY_ROWS: "0"
 
       # ============================================================
@@ -103,6 +121,7 @@ jobs:
       USE_CACHE: "1"
       FORCE_FULL_CACHE_REFRESH: "0"
       CACHE_AUTO_PRUNE_ENABLED: "1"
+      CACHE_WRITE_CSV_COMPAT: "0"
       HISTORY_RETENTION_TRADING_DAYS: "200"
       PRICE_RETENTION_TRADING_DAYS: "260"
 
@@ -116,10 +135,10 @@ jobs:
       # ============================================================
       FETCH_GROUP_WARRANT_PRICES: "0"
       PRICE_WORKERS: "60"
+      DAILY_PRICE_LOAD_ALL_EVENT_CODES: "1"
 
       TOP15_CACHE_ENABLED: "1"
       TOP15_LOOKBACK_TRADING_DAYS: "40"
-      # repair 回補近一個月的 TOP15 每日快照（約 22 個交易日）。
       TOP15_REPAIR_BACKFILL_TRADING_DAYS: "22"
       TOP15_PRICE_LOOKBACK_DAYS: "75"
       TOP15_TARGET_PRICE_REFETCH_DAYS: "12"
@@ -138,8 +157,7 @@ jobs:
       SELL_DETAIL_DAYS: "3"
 
       # ============================================================
-      # 完整修補延伸報表
-      # 每日流程只同步八張主要工作表；完整修補模式才建立延伸報表。
+      # 完整修補延伸報表（只有 repair 會建立）
       # ============================================================
       RECENT_RANKING_DAYS: "62"
       WARRANT_CONSENSUS_7D_ENABLED: "1"
@@ -168,9 +186,8 @@ jobs:
       WINRATE_DELISTED_MISSING_PRICE: "0"
 
       # ============================================================
-      # Google Sheet 同步：
-      # daily 保留其他日期歷史；repair + RUN_MODE=2 將 21 張結果表當成一致性快照完整重建。
-      # 非結果工作表與 repair 清單以外的工作表仍受歷史保護。
+      # Google Sheet 同步
+      # daily 保留其他日期歷史；repair + RUN_MODE=2 將 21 張結果表完整重建。
       # ============================================================
       GOOGLE_SHEET_NAME: "權證分點資料_NEW_MoneyDJ"
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID_MONEYDJ }}
@@ -187,11 +204,6 @@ jobs:
       GSHEET_RESULT_ARCHIVE_ENABLED: "0"
       GSHEET_COMPACT_BLANK_GRID_ENABLED: "0"
 
-      # repair 只允許完整重建程式列出的 21 張結果表；daily 與其他工作表不做全表 clear。
-      GSHEET_REPAIR_STATIC_VALUE_INPUT_OPTION: "USER_ENTERED"
-      GSHEET_REPAIR_CLEAR_BEFORE_WRITE: "1"
-      GSHEET_VERIFY_SETTLE_SECONDS: "0.30"
-
       GSHEET_WRITE_SLEEP_SECONDS: "0.05"
       GSHEET_WRITE_RATE_PER_MINUTE: "45"
       GSHEET_WRITE_BURST: "5"
@@ -201,8 +213,7 @@ jobs:
       GCP_SERVICE_KEY: ${{ secrets.GCP_SERVICE_KEY_NEW }}
 
       # ============================================================
-      # Supabase
-      # 要啟用時改成 1，並在 GitHub Secrets 設定 SUPABASE_DB_URL。
+      # Supabase（要啟用時改成 1，並設定 SUPABASE_DB_URL）
       # ============================================================
       SUPABASE_CACHE_ENABLED: "0"
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
@@ -238,8 +249,6 @@ jobs:
 
           WORKFLOW_MODE="daily"
           RUN_MODE="2"
-          INITIAL_HISTORY_DAYS="200"
-          DAILY_UPDATE_DAYS="3"
 
           case "$PLAN" in
             "每日自動流程")
@@ -257,10 +266,6 @@ jobs:
             "完整修補模式")
               WORKFLOW_MODE="repair"
               RUN_MODE="2"
-              # FinMind 補足最近 200 個成功交易日完整歷史，MoneyDJ 補強最新資料；
-              # Google Sheet 21 張結果表依同一次工作簿完整重建並逐張回讀驗證。
-              INITIAL_HISTORY_DAYS="200"
-              DAILY_UPDATE_DAYS="5"
               ;;
 
             *)
@@ -272,17 +277,19 @@ jobs:
           {
             echo "WORKFLOW_MODE=$WORKFLOW_MODE"
             echo "RUN_MODE=$RUN_MODE"
-            echo "INITIAL_HISTORY_DAYS=$INITIAL_HISTORY_DAYS"
-            echo "DAILY_UPDATE_DAYS=$DAILY_UPDATE_DAYS"
           } >> "$GITHUB_ENV"
 
           echo "=========================================="
           echo "執行方案：$PLAN"
           echo "WORKFLOW_MODE：$WORKFLOW_MODE"
           echo "RUN_MODE：$RUN_MODE"
-          echo "INITIAL_HISTORY_DAYS：$INITIAL_HISTORY_DAYS"
-          echo "DAILY_UPDATE_DAYS：$DAILY_UPDATE_DAYS"
-          echo "資料來源：FinMind 全市場完整歷史＋MoneyDJ 最新資料補強"
+          if [[ "$WORKFLOW_MODE" == "daily" ]]; then
+            echo "抓取策略：今日優先兩階段（MONEYDJ_DAILY_TODAY_FIRST=${MONEYDJ_DAILY_TODAY_FIRST}）"
+            echo "探索預算：${MONEYDJ_DISCOVERY_BUDGET}（0＝只查已知組合）"
+          else
+            echo "抓取策略：完整掃描（repair／longterm 不受今日優先影響）"
+          fi
+          echo "資料來源：TWSE／TPEx 官方權證母體＋MoneyDJ API4／API5／API6"
           echo "=========================================="
 
       - name: Install dependencies
@@ -306,46 +313,7 @@ jobs:
             google-auth \
             "psycopg[binary]"
 
-      # ============================================================
-      # 診斷用：從 runner IP 探測 MoneyDJ 是否可用。
-      # 目的是分辨「端點掛了」與「我們的 IP 被擋」。
-      # continue-on-error：探測失敗不阻擋後面的正式執行。
-      # 確認原因後可以整個 step 刪掉。
-      # ============================================================
-      - name: Probe MoneyDJ API availability
-        continue-on-error: true
-        shell: bash
-        run: |
-          API5_URL="https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/d8/f5/27/twWarrantData.xdjjson?x=warrant-chip0002-5&c=5&a=056664&b=9853&revision=2018_07_31_1"
-          API4_URL="https://pscnetsecrwd.moneydj.com/b2brwdCommon/jsondata/9b/6e/0a/TwWarrantData.xdjjson?a=056664&x=warrant-chip0002-4&c=20260901&d=20260910&e=200&revision=2018_07_31_1"
-
-          probe() {
-            label="$1"
-            url="$2"
-            for i in 1 2 3; do
-              rc=0
-              curl -sS -o probe.json \
-                -w "  ${label} try${i}: status=%{http_code} size=%{size_download} time=%{time_total}s" \
-                "$url" || rc=$?
-              echo
-              if [ "$rc" -ne 0 ]; then
-                echo "  ${label} try${i}: curl 失敗 rc=${rc}"
-              else
-                echo "  ${label} try${i} body: $(head -c 200 probe.json)"
-              fi
-            done
-          }
-
-          echo "=========================================="
-          echo "MoneyDJ 可用性探測（runner IP）"
-          echo "=========================================="
-          probe "API5" "$API5_URL"
-          echo "------------------------------------------"
-          probe "API4" "$API4_URL"
-          echo "=========================================="
-          rm -f probe.json
-
-      - name: Run Hybrid FinMind and MoneyDJ warrant backtest
+      - name: Run MoneyDJ warrant backtest
         shell: bash
         run: |
           set -euo pipefail
@@ -354,17 +322,17 @@ jobs:
           SCRIPT_PATH="$PYTHON_FILE"
           EXPECTED_BUILD_ID="OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT8"
 
-          # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
-            echo "找不到正式 Hybrid 程式碼：$SCRIPT_PATH"
+            echo "找不到程式碼：$SCRIPT_PATH"
             echo "目前倉庫內的 Python 檔案："
             find . -maxdepth 2 -type f -name "*.py" -print
             exit 1
           fi
 
-          # 防止 GitHub 倉庫仍是舊版程式，卻誤以為已執行結構自動判定版 R17。
+          # 版本閘門：倉庫裡的程式必須就是這個 Build ID。
+          # 注意：程式內若保留「相容舊版本驗證字串」的註解，這道閘門會被繞過。
           if ! grep -Fq "$EXPECTED_BUILD_ID" "$SCRIPT_PATH"; then
-            echo "程式版本驗證失敗：$SCRIPT_PATH 不是指定的結構自動判定版 Hybrid R17。"
+            echo "程式版本驗證失敗：$SCRIPT_PATH 不是預期的版本。"
             echo "預期 Build ID：$EXPECTED_BUILD_ID"
             grep -n "PROGRAM_BUILD_ID" "$SCRIPT_PATH" || true
             exit 1
@@ -425,5 +393,19 @@ jobs:
         with:
           name: warrant-backtest-moneydj-new-excel
           path: output/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # MoneyDJ 診斷檔（失敗明細 JSONL、預篩失敗代號）留在 runner 的
+      # output/warrant_cache 下，原本會隨 job 結束消失。出事時這些最有用。
+      - name: Upload MoneyDJ diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: warrant-backtest-moneydj-diagnostics
+          path: |
+            warrant_cache/moneydj_request_failures_*.jsonl
+            warrant_cache/prescan_failed_codes.csv
           if-no-files-found: ignore
           retention-days: 14
