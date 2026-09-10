@@ -352,7 +352,7 @@ jobs:
           mkdir -p output warrant_cache
 
           SCRIPT_PATH="$PYTHON_FILE"
-          EXPECTED_BUILD_ID="OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT7"
+          EXPECTED_BUILD_ID="OFFICIAL-TWSE-TPEX-GSHEET-MTM60-DELISTED-REPAIR-SHAPEDETECT-20260903-R18-AUDIT8"
 
           # 只允許執行目前正式 Hybrid 檔案，不再退回任何舊 MoneyDJ 檔名。
           if [[ ! -f "$SCRIPT_PATH" ]]; then
