@@ -14,6 +14,12 @@ on:
           - "長期留單補價格"
           - "完整修補模式"
 
+      target_date:
+        description: "補跑指定交易日 YYYY/MM/DD（留空＝自動抓最新已發布日）"
+        required: false
+        default: ""
+        type: string
+
   # 測試期間停用排程，只保留 workflow_dispatch。
 
 
@@ -202,6 +208,24 @@ jobs:
       GSHEET_RESULT_ENABLED: "1"
       GSHEET_RESULT_UPSERT_ENABLED: "1"
       GSHEET_PRESERVE_ALL_HISTORY: "1"
+
+      # 【型態空白的真正原因】
+      # TOP15 是「某統計日的快照」，同日重跑就該以本次結果為準。
+      # 但 GSHEET_PRESERVE_ALL_HISTORY=1 的安全門是「只新增缺少的列、
+      # 既有列一律不動」，而 TOP15 的整批替換路徑被這道門擋掉了 ——
+      # 於是第一次跑出來的空型態、舊報酬率永遠卡在表上，之後每天算好的
+      # 型態全被丟棄（log 會顯示「無缺少資料，既有資料完全保留」）。
+      GSHEET_TOP15_SNAPSHOT_REPLACE: "1"
+
+      # 補跑指定交易日：留空＝照常抓最新。
+      # 用途：某一天的 TOP15 因為當時抓不到 K 線而寫成「-／Missing」，
+      #       填入那一天重跑，替換路徑就會用正確的型態蓋掉那批壞列。
+      MONEYDJ_DAILY_TARGET_DATE: ${{ github.event.inputs.target_date }}
+
+      # 這個只影響 A～E／每日賣出明細，替換範圍動輒 30 天以上。
+      # 開了才會把「今日賣出導致的舊事件出清狀態」真的寫回既有列；
+      # 代價是那段期間的既有列會以本次結果重寫。確認資料無誤再開。
+      GSHEET_DAILY_SNAPSHOT_REPLACE: "0"
       GSHEET_REPAIR_FULL_RESULT_OVERWRITE_ENABLED: "1"
       GSHEET_REPAIR_WINRATE_OVERWRITE_ENABLED: "1"
       GSHEET_CLEAN_DELETED_BROKER_ROWS: "0"
