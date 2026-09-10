@@ -346,8 +346,11 @@ MONEYDJ_THROTTLE_BASE_COOLDOWN = max(
     float(os.getenv("MONEYDJ_THROTTLE_BASE_COOLDOWN", "15")),
     1.0,
 )
+# 冷卻上限刻意壓低到 45 秒：持續性的壓力改由「全域降速」承擔。
+# 舊版 300 秒會造成「全部停 5 分鐘 → 60 條同時爆衝 → 又被擋」的死循環，
+# 實測會卡住不動。短冷卻＋持續降速才會收斂。
 MONEYDJ_THROTTLE_MAX_COOLDOWN = max(
-    float(os.getenv("MONEYDJ_THROTTLE_MAX_COOLDOWN", "300")),
+    float(os.getenv("MONEYDJ_THROTTLE_MAX_COOLDOWN", "45")),
     MONEYDJ_THROTTLE_BASE_COOLDOWN,
 )
 MONEYDJ_THROTTLE_MAX_LEVEL = max(
@@ -389,6 +392,64 @@ MONEYDJ_THROTTLE_WINDOW_SIZE = max(
 )
 MONEYDJ_THROTTLE_WINDOW_FAIL_RATIO = min(max(
     float(os.getenv("MONEYDJ_THROTTLE_WINDOW_FAIL_RATIO", "0.35")), 0.05), 1.0)
+
+# 【關鍵發現】MoneyDJ 的限流訊號不是 500，也不是 429，而是：
+#     HTTP 200｜text/plain｜57 bytes
+#     "We appreciate your patience. Please hold on for a moment."
+# 舊版把它當成 JSONDecodeError（parse 失敗），因此
+#   1. 完全看不出是限流
+#   2. 三次重試用完就把那檔權證標記成永久失敗 —— 但它其實只是被要求等一下
+# 一旦大量權證這樣被誤判，預篩成功率會跌破門檻，整輪照樣作廢。
+MONEYDJ_THROTTLE_BODY_MARKERS = tuple(
+    marker.strip()
+    for marker in os.getenv(
+        "MONEYDJ_THROTTLE_BODY_MARKERS",
+        "appreciate your patience|hold on for a moment|請稍候|請稍後",
+    ).split("|")
+    if marker.strip()
+)
+# 被要求稍候時的回應大小上限；正常 JSON 都遠大於此，避免誤判正常資料。
+MONEYDJ_THROTTLE_BODY_MAX_BYTES = max(
+    int(os.getenv("MONEYDJ_THROTTLE_BODY_MAX_BYTES", "512")),
+    64,
+)
+
+# ── 全域速率限制（取代「全部停 N 秒」）──────────────────────────────
+# 舊做法是所有執行緒一起睡 300 秒，醒來後 60 條同時衝出去，
+# 立刻又被擋 —— 實測會卡在「停 300 秒 → 爆衝 → 再停」的死循環。
+# 正確做法是降低「每秒請求數」，讓壓力平滑下來；
+# 這與本程式對 Google Sheets 已經在用的 token bucket 是同一套模式。
+MONEYDJ_RATE_LIMIT_ENABLED = os.getenv(
+    "MONEYDJ_RATE_LIMIT_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+# 起始速率。實測 60 併發約在 28,000 筆後開始被擋，換算約 40~60 req/s，
+# 因此預設從 25 req/s 出發，被擋就自動減半。
+MONEYDJ_RATE_START_PER_SECOND = max(
+    float(os.getenv("MONEYDJ_RATE_START_PER_SECOND", "25")),
+    0.5,
+)
+MONEYDJ_RATE_MIN_PER_SECOND = max(
+    float(os.getenv("MONEYDJ_RATE_MIN_PER_SECOND", "2")),
+    0.2,
+)
+MONEYDJ_RATE_MAX_PER_SECOND = max(
+    float(os.getenv("MONEYDJ_RATE_MAX_PER_SECOND", "60")),
+    MONEYDJ_RATE_START_PER_SECOND,
+)
+# 被擋一次就把速率乘上這個係數（減半）。
+MONEYDJ_RATE_BACKOFF_FACTOR = min(max(
+    float(os.getenv("MONEYDJ_RATE_BACKOFF_FACTOR", "0.5")), 0.1), 0.95)
+# 連續成功一段時間後緩慢回升，避免一直卡在最低速。
+MONEYDJ_RATE_RECOVER_FACTOR = max(
+    float(os.getenv("MONEYDJ_RATE_RECOVER_FACTOR", "1.15")),
+    1.01,
+)
+# 「請稍候」額外給的重試次數。它不是資料錯誤，等一下就會有，
+# 不該吃掉一般錯誤的 MONEYDJ_MAX_RETRIES 額度，否則會被誤判成永久失敗。
+MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS = max(
+    int(os.getenv("MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS", "6")),
+    0,
+)
 # 每一種失敗類型最多印幾筆完整明細（含 HTTP 狀態、耗時、回應片段）。
 # 這是「抓到問題點」的關鍵：舊版 API5 失敗完全靜默，只回 ([], False)。
 MONEYDJ_FAILURE_SAMPLE_PRINTS = max(
@@ -643,6 +704,113 @@ _MONEYDJ_RECENT_OUTCOMES = deque(maxlen=MONEYDJ_THROTTLE_WINDOW_SIZE)
 _MONEYDJ_OUTCOME_LOCK = threading.Lock()
 # 哪些權證代號重複失敗（證明是確定性壞資料，不是限流）
 _MONEYDJ_FAILED_TARGETS = Counter()
+# 「請稍候」次數：這是 MoneyDJ 真正的限流訊號
+_MONEYDJ_HOLD_ON_COUNT = 0
+
+# ── 全域速率限制狀態（token bucket，所有執行緒共用）──────────────
+_MONEYDJ_RATE_LOCK = threading.Lock()
+_MONEYDJ_RATE_PER_SECOND = MONEYDJ_RATE_START_PER_SECOND
+_MONEYDJ_RATE_TOKENS = MONEYDJ_RATE_START_PER_SECOND
+_MONEYDJ_RATE_UPDATED = time.monotonic()
+_MONEYDJ_RATE_MIN_SEEN = MONEYDJ_RATE_START_PER_SECOND
+_MONEYDJ_RATE_WAIT_SECONDS = 0.0
+
+
+class MoneyDJThrottledError(RuntimeError):
+    """MoneyDJ 回 HTTP 200 但內容是「請稍候」—— 這是限流，不是資料錯誤。"""
+
+
+def _moneydj_body_is_hold_on(content):
+    """判斷回應內容是不是 MoneyDJ 的「請稍候」限流頁。"""
+    if not content or len(content) > MONEYDJ_THROTTLE_BODY_MAX_BYTES:
+        return False
+    try:
+        text = content.decode("utf-8", errors="replace").lower()
+    except Exception:
+        return False
+    return any(marker.lower() in text for marker in MONEYDJ_THROTTLE_BODY_MARKERS)
+
+
+def _moneydj_rate_limit_wait():
+    """
+    全域 token bucket：控制「每秒送出幾個 MoneyDJ 請求」。
+
+    與冷卻閘門的分工：
+      冷卻閘門  = 剛被擋時的短暫全停（讓對方喘口氣）
+      速率限制  = 之後持續生效的降速（避免醒來又爆衝）
+    """
+    global _MONEYDJ_RATE_TOKENS, _MONEYDJ_RATE_UPDATED, _MONEYDJ_RATE_WAIT_SECONDS
+
+    if not MONEYDJ_RATE_LIMIT_ENABLED:
+        return
+
+    waited = 0.0
+    while True:
+        with _MONEYDJ_RATE_LOCK:
+            now = time.monotonic()
+            elapsed = max(now - _MONEYDJ_RATE_UPDATED, 0.0)
+            _MONEYDJ_RATE_UPDATED = now
+            rate = _MONEYDJ_RATE_PER_SECOND
+            # 桶子容量＝一秒份的 token，避免累積太多造成瞬間爆衝。
+            _MONEYDJ_RATE_TOKENS = min(rate, _MONEYDJ_RATE_TOKENS + elapsed * rate)
+            if _MONEYDJ_RATE_TOKENS >= 1.0:
+                _MONEYDJ_RATE_TOKENS -= 1.0
+                break
+            need = (1.0 - _MONEYDJ_RATE_TOKENS) / rate
+        nap = min(max(need, 0.005), 2.0)
+        time.sleep(nap)
+        waited += nap
+
+    if waited > 0:
+        record_stage_seconds("MoneyDJ 速率限制等待（累計執行緒時間）", waited)
+        with _MONEYDJ_RATE_LOCK:
+            _MONEYDJ_RATE_WAIT_SECONDS += waited
+
+
+def _moneydj_rate_backoff(reason=""):
+    """被擋了：把全域速率打折。"""
+    global _MONEYDJ_RATE_PER_SECOND, _MONEYDJ_RATE_MIN_SEEN
+
+    if not MONEYDJ_RATE_LIMIT_ENABLED:
+        return None
+
+    with _MONEYDJ_RATE_LOCK:
+        previous = _MONEYDJ_RATE_PER_SECOND
+        _MONEYDJ_RATE_PER_SECOND = max(
+            _MONEYDJ_RATE_PER_SECOND * MONEYDJ_RATE_BACKOFF_FACTOR,
+            MONEYDJ_RATE_MIN_PER_SECOND,
+        )
+        _MONEYDJ_RATE_MIN_SEEN = min(_MONEYDJ_RATE_MIN_SEEN, _MONEYDJ_RATE_PER_SECOND)
+        current = _MONEYDJ_RATE_PER_SECOND
+    if current < previous:
+        print(
+            f"  🐌 MoneyDJ 全域降速：{previous:.1f} → {current:.1f} req/s"
+            + (f"｜{reason}" if reason else ""),
+            flush=True,
+        )
+    return current
+
+
+def _moneydj_rate_recover():
+    """連續成功一段時間：緩慢把速率調回來。"""
+    global _MONEYDJ_RATE_PER_SECOND
+
+    if not MONEYDJ_RATE_LIMIT_ENABLED:
+        return
+
+    with _MONEYDJ_RATE_LOCK:
+        if _MONEYDJ_RATE_PER_SECOND >= MONEYDJ_RATE_MAX_PER_SECOND:
+            return
+        previous = _MONEYDJ_RATE_PER_SECOND
+        _MONEYDJ_RATE_PER_SECOND = min(
+            _MONEYDJ_RATE_PER_SECOND * MONEYDJ_RATE_RECOVER_FACTOR,
+            MONEYDJ_RATE_MAX_PER_SECOND,
+        )
+        current = _MONEYDJ_RATE_PER_SECOND
+    print(
+        f"  🚀 MoneyDJ 速率回升：{previous:.1f} → {current:.1f} req/s",
+        flush=True,
+    )
 
 # ══════════════════════════════════════════════════════════════════════
 # 官方權證母體來源（TWSE／TPEx）。本版已完全移除 FinMind：
@@ -25960,6 +26128,10 @@ def _moneydj_classify_failure(exc, response, elapsed):
     """
     status = _moneydj_http_status(exc, response)
 
+    # HTTP 200 +「請稍候」＝ MoneyDJ 真正的限流訊號，最優先判斷。
+    if isinstance(exc, MoneyDJThrottledError):
+        return "hold_on", status
+
     if status is not None and status in MONEYDJ_THROTTLE_STATUS_CODES:
         # 429 是對方明說「你太快了」，一律當限流。
         if status == 429:
@@ -25984,6 +26156,22 @@ def _moneydj_classify_failure(exc, response, elapsed):
     if isinstance(exc, requests.RequestException):
         return "transport", status
     return "other", status
+
+
+def _moneydj_note_hold_on():
+    """記錄一次「請稍候」；每累積一定次數印一行，避免洗版。"""
+    global _MONEYDJ_HOLD_ON_COUNT
+
+    with _MONEYDJ_HEALTH_LOCK:
+        _MONEYDJ_HOLD_ON_COUNT += 1
+        total = _MONEYDJ_HOLD_ON_COUNT
+    count_event("MoneyDJ 被要求稍候（限流）")
+    if total in (1, 10, 50) or total % 250 == 0:
+        print(
+            f"  ⏳ MoneyDJ 要求稍候（累計 {total:,} 次）"
+            "｜這是限流訊號，不是資料錯誤，會自動放慢後重試",
+            flush=True,
+        )
 
 
 def _moneydj_record_outcome(failed):
@@ -26014,6 +26202,8 @@ def _moneydj_should_throttle(kind, status, elapsed):
     """
     if not MONEYDJ_THROTTLE_DETECT_ENABLED:
         return False
+    if kind == "hold_on":
+        return True
     if status == 429:
         return True
     if kind in ("throttle", "timeout"):
@@ -26131,6 +26321,8 @@ def _moneydj_note_success(api, elapsed):
             f"限流冷卻降到等級 {decayed_to}",
             flush=True,
         )
+        # 冷卻降級的同時也把速率調回來一點，否則會永遠卡在最低速。
+        _moneydj_rate_recover()
 
 
 def _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt):
@@ -26210,9 +26402,15 @@ def _moneydj_request_rows(api, url, required_fields):
     行為與舊版的差異只有「怎麼失敗、怎麼等」，
     成功時回傳的資料與完整性判定規則完全沒有改變。
     """
-    for attempt in range(1, MONEYDJ_MAX_RETRIES + 1):
+    # 被要求「請稍候」時多給幾次機會：那不是資料錯誤，等一下就會有。
+    max_attempts = MONEYDJ_MAX_RETRIES + MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS
+    attempt = 0
+    hold_on_hits = 0
+    while attempt < max_attempts:
+        attempt += 1
         count_event(f"MoneyDJ {api} HTTP 請求")
         _moneydj_wait_if_throttled()
+        _moneydj_rate_limit_wait()
 
         response = None
         started = time.perf_counter()
@@ -26227,6 +26425,10 @@ def _moneydj_request_rows(api, url, required_fields):
                 ),
             )
             response.raise_for_status()
+            if _moneydj_body_is_hold_on(response.content):
+                raise MoneyDJThrottledError(
+                    "MoneyDJ 回應『請稍候』限流頁，非資料錯誤"
+                )
             rows = _moneydj_json_rows(
                 response.content,
                 required_fields=required_fields,
@@ -26239,13 +26441,31 @@ def _moneydj_request_rows(api, url, required_fields):
             elapsed = time.perf_counter() - started
             kind, status = _moneydj_classify_failure(exc, response, elapsed)
             _moneydj_record_outcome(True)
+
+            if kind == "hold_on":
+                hold_on_hits += 1
+                _moneydj_note_hold_on()
+                _moneydj_rate_backoff("對方回覆『請稍候』")
+                # 「請稍候」不算真正的失敗次數：它是限流，等一下再問就有。
+                # 因此只有第一次印明細，也不讓它吃掉一般錯誤的重試額度。
+                if hold_on_hits == 1:
+                    _moneydj_note_failure(
+                        api, kind, status, elapsed, url, response, exc, max_attempts
+                    )
+                _moneydj_trigger_throttle(api, kind, status, elapsed)
+                continue
+
             _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt)
 
             if _moneydj_should_throttle(kind, status, elapsed):
                 _moneydj_trigger_throttle(api, kind, status, elapsed)
+                _moneydj_rate_backoff(f"{kind}"
+                                      + (f" HTTP {status}" if status else ""))
 
-            if attempt < MONEYDJ_MAX_RETRIES:
-                _moneydj_retry_sleep(kind, attempt)
+            # 一般錯誤仍只用 MONEYDJ_MAX_RETRIES 次；超過就放棄這一筆。
+            if attempt - hold_on_hits >= MONEYDJ_MAX_RETRIES:
+                break
+            _moneydj_retry_sleep(kind, attempt)
 
     return [], False
 
@@ -26300,6 +26520,20 @@ def print_moneydj_health_report():
     print(f"  全域限流冷卻觸發：{hits:,} 次｜目前等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}")
     print(f"  所有執行緒累計等待：{wait_seconds:,.0f} 秒")
     with _MONEYDJ_HEALTH_LOCK:
+        hold_on_total = _MONEYDJ_HOLD_ON_COUNT
+    with _MONEYDJ_RATE_LOCK:
+        rate_now = _MONEYDJ_RATE_PER_SECOND
+        rate_min = _MONEYDJ_RATE_MIN_SEEN
+        rate_wait = _MONEYDJ_RATE_WAIT_SECONDS
+    print(
+        f"  被要求『請稍候』：{hold_on_total:,} 次"
+        "（HTTP 200＋57 bytes 純文字＝ MoneyDJ 真正的限流訊號）"
+    )
+    print(
+        f"  全域速率：目前 {rate_now:.1f} req/s｜最低曾降到 {rate_min:.1f} req/s"
+        f"｜降速累計等待 {rate_wait:,.0f} 秒"
+    )
+    with _MONEYDJ_HEALTH_LOCK:
         repeat_targets = [
             (code, count)
             for code, count in _MONEYDJ_FAILED_TARGETS.most_common(15)
@@ -26312,8 +26546,8 @@ def print_moneydj_health_report():
     print(f"{'-' * 70}")
     throttle_like = sum(
         count for kind, count in kinds.items()
-        if kind in ("throttle", "timeout", "connection")
-    )
+        if kind in ("hold_on", "throttle", "timeout", "connection")
+    ) + hold_on_total
     # server_reject＝快速 500，代表對方對這些特定代號就是給不了。
     stable_like = sum(
         count for kind, count in kinds.items()
