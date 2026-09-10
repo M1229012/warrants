@@ -28242,9 +28242,28 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
             f"{_MONEYDJ_API5_MISSING_TARGET_COUNT:,} 組"
         )
 
-    # API4 已確認該分點／權證在目標日有交易，因此 API5 擴大後仍缺目標日
-    # 不能直接視為完整資料。若是同日重跑且快取已有該組，安全沿用；第一次跑
-    # 沒有可沿用資料時維持 fail-closed，避免把部分結果寫入 Google Sheet。
+    # 【重要】這道閘門只在「全市場預篩」流程下才成立。
+    #
+    # 舊流程：API4 先確認「這個分點今天買賣過這檔權證」，
+    #         所以 API5 之後查不到目標日 ＝ 前後矛盾 ＝ 資料有問題，必須擋。
+    #
+    # 今日優先流程：候選來自「最近 20 個交易日活躍過的組合」，
+    #         沒有任何人保證它們「今天」也有交易。實測 23,892 組裡
+    #         只有 2,651 組當天真的成交 —— 其餘 21,229 組查不到是
+    #         完全正常的「今天沒交易」，不是資料異常。
+    #         沿用舊閘門會把正常結果整批丟掉（實測就發生了）。
+    #
+    # 因此今日優先模式跳過這道檢查；資料完整性改由
+    #   1. 第一階段的市場發布驗證（確認目標日對方真的有資料）
+    #   2. API5／API6 的連線失敗計數（MONEYDJ_API5_STRICT）
+    # 這兩道守住，兩者都沒有被放寬。
+    if MONEYDJ_DAILY_TODAY_FIRST and missing_target_pairs:
+        print(
+            f"  ℹ️ 今日優先模式：{len(missing_target_pairs):,} 組今天沒有交易紀錄，"
+            "屬正常情形（候選來自歷史活躍組合，非當日確認）。"
+        )
+        missing_target_pairs = set()
+
     existing_target_pairs = set()
     if (
         missing_target_pairs
