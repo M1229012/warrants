@@ -26280,10 +26280,35 @@ def _moneydj_note_hold_on():
         )
 
 
-def _moneydj_record_outcome(failed):
-    """把每次請求結果放進滑動窗口，用來區分『全面性失敗』與『零星壞代號』。"""
+def _moneydj_record_outcome(failed, kind=None, status=None, elapsed=0.0):
+    """
+    把每次請求結果放進滑動窗口，用來區分『全面性失敗』與『零星壞代號』。
+
+    【repair 誤判修正】只有「可能是限流」的失敗才計入窗口。
+    快速 500（0.2～0.8 秒就回 1,196 bytes 的錯誤頁）代表「MoneyDJ 沒有這檔的資料」，
+    是確定性結果，重試、降速、等待都不會改變。
+
+    daily 只掃今日有效權證，這種代號約占 2%，窗口比例永遠碰不到 35% 門檻。
+    但 repair 會把「窗口內已到期權證」也納入掃描（實測額外 42,203 支），
+    掃到那些整片死掉的區段時失敗率會衝到 100%，
+    舊版就把它讀成「全面性限流」→ 冷卻 45 秒 → 速率砍半 → 整輪卡死。
+
+    真正的限流一定長成 hold_on（HTTP 200 但回 22KB HTML）、慢回應、逾時或 429，
+    絕不會是「快速且固定的 500」。
+    """
+    counts_as_failure = bool(failed)
+    if counts_as_failure:
+        throttle_plausible = (
+            kind in ("hold_on", "throttle", "timeout")
+            or status == 429
+            or float(elapsed or 0.0) >= MONEYDJ_THROTTLE_FAST_FAIL_SECONDS
+        )
+        if not throttle_plausible:
+            # 確定性壞代號：不算成功，但也不該汙染限流判斷。
+            return
+
     with _MONEYDJ_OUTCOME_LOCK:
-        _MONEYDJ_RECENT_OUTCOMES.append(bool(failed))
+        _MONEYDJ_RECENT_OUTCOMES.append(counts_as_failure)
 
 
 def _moneydj_window_failure_ratio():
@@ -26577,7 +26602,7 @@ def _moneydj_request_rows(api, url, required_fields):
         except Exception as exc:
             elapsed = time.perf_counter() - started
             kind, status = _moneydj_classify_failure(exc, response, elapsed)
-            _moneydj_record_outcome(True)
+            _moneydj_record_outcome(True, kind=kind, status=status, elapsed=elapsed)
 
             if kind == "hold_on":
                 hold_on_hits += 1
