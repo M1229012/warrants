@@ -357,6 +357,15 @@ MONEYDJ_THROTTLE_MAX_LEVEL = max(
     int(os.getenv("MONEYDJ_THROTTLE_MAX_LEVEL", "6")),
     1,
 )
+# 【死循環修正】冷卻結束的瞬間，20 條執行緒會同時醒來、同時再撞一次牆，
+# 於是「一個限流事件」被記成 20 次，等級一次推到頂、速率連續砍 20 次半。
+# 實測 log：25 → 12.5 → 6.2 → 3.1 → 2.0 只花了四行，隨後 100 次觸發全在等級 6。
+# 這個間隔內的重複撞牆一律視為「同一個事件的重複回報」：照樣等冷卻，
+# 但不再升級、不再降速。真正需要升級的是「冷卻過完了還在被擋」。
+MONEYDJ_THROTTLE_ESCALATE_MIN_GAP = max(
+    float(os.getenv("MONEYDJ_THROTTLE_ESCALATE_MIN_GAP", "10")),
+    0.0,
+)
 # 連續成功這麼多次就降一級，讓對方恢復後速度能回來。
 MONEYDJ_THROTTLE_DECAY_SUCCESSES = max(
     int(os.getenv("MONEYDJ_THROTTLE_DECAY_SUCCESSES", "300")),
@@ -737,6 +746,8 @@ _MONEYDJ_THROTTLE_LOCK = threading.Lock()
 _MONEYDJ_THROTTLE_UNTIL = 0.0          # time.monotonic()：在此之前所有請求都要等
 _MONEYDJ_THROTTLE_LEVEL = 0            # 目前冷卻等級（越高冷卻越久）
 _MONEYDJ_THROTTLE_HITS = 0             # 觸發全域冷卻的次數
+_MONEYDJ_THROTTLE_LAST_ESCALATE = 0.0  # 上次「真的升級」的時刻，用來去重驚群
+_MONEYDJ_THROTTLE_DUPLICATES = 0       # 被判定為同一事件重複回報的次數
 _MONEYDJ_THROTTLE_WAIT_SECONDS = 0.0   # 所有執行緒累計等待秒數
 _MONEYDJ_SUCCESS_STREAK = 0            # 連續成功次數，用來降級
 _MONEYDJ_FAILURE_KINDS = Counter()     # kind -> 次數
@@ -26332,42 +26343,72 @@ def _moneydj_wait_if_throttled():
 
 
 def _moneydj_trigger_throttle(api, kind, status, elapsed):
-    """升一級冷卻，並把冷卻截止時間推給所有執行緒共用。"""
+    """
+    升一級冷卻，並把冷卻截止時間推給所有執行緒共用。
+
+    回傳 True 代表「這是一個新的限流事件」，呼叫端才應該跟著降速；
+    回傳 False 代表「同一個事件被另一條執行緒重複回報」，只要跟著等就好。
+
+    去重的理由（實測 log 證實）：
+      冷卻一結束，20 條執行緒幾乎同時醒來、同時送出下一筆，
+      對方若還在懲罰窗內就會回 20 個「請稍候」。
+      舊版把這 20 次當成 20 個獨立事件 → 等級一次衝到頂、
+      速率被連砍 20 次半（25→2.0），冷卻截止時間又被一路往後推，
+      形成「永遠醒不過來」的死循環。
+    """
     global _MONEYDJ_THROTTLE_UNTIL, _MONEYDJ_THROTTLE_LEVEL
     global _MONEYDJ_THROTTLE_HITS, _MONEYDJ_SUCCESS_STREAK
+    global _MONEYDJ_THROTTLE_LAST_ESCALATE, _MONEYDJ_THROTTLE_DUPLICATES
 
     if not MONEYDJ_THROTTLE_DETECT_ENABLED:
-        return
+        return False
 
     with _MONEYDJ_THROTTLE_LOCK:
         _MONEYDJ_SUCCESS_STREAK = 0
         _MONEYDJ_THROTTLE_HITS += 1
-        previous_level = _MONEYDJ_THROTTLE_LEVEL
-        _MONEYDJ_THROTTLE_LEVEL = min(
-            _MONEYDJ_THROTTLE_LEVEL + 1,
-            MONEYDJ_THROTTLE_MAX_LEVEL,
+        now = time.monotonic()
+
+        # 仍在冷卻窗內，或距離上次升級還不到最小間隔 ── 同一個事件的回聲。
+        duplicate = (
+            now < _MONEYDJ_THROTTLE_UNTIL
+            or (now - _MONEYDJ_THROTTLE_LAST_ESCALATE)
+            < MONEYDJ_THROTTLE_ESCALATE_MIN_GAP
         )
+        if duplicate:
+            _MONEYDJ_THROTTLE_DUPLICATES += 1
+        else:
+            _MONEYDJ_THROTTLE_LEVEL = min(
+                _MONEYDJ_THROTTLE_LEVEL + 1,
+                MONEYDJ_THROTTLE_MAX_LEVEL,
+            )
+            _MONEYDJ_THROTTLE_LAST_ESCALATE = now
+
         cooldown = min(
             MONEYDJ_THROTTLE_BASE_COOLDOWN * (2 ** (_MONEYDJ_THROTTLE_LEVEL - 1)),
             MONEYDJ_THROTTLE_MAX_COOLDOWN,
         )
-        new_until = time.monotonic() + cooldown
-        # 只延後、不提前：多條執行緒同時撞牆時取最長的那個冷卻。
-        escalated = _MONEYDJ_THROTTLE_LEVEL != previous_level
-        if new_until > _MONEYDJ_THROTTLE_UNTIL:
-            _MONEYDJ_THROTTLE_UNTIL = new_until
+        # 只延後、不提前。重複回報也要重新蓋上冷卻，否則等級沒升、
+        # 冷卻又已過期，執行緒會回到迴圈頂端立刻再撞一次，變成空轉。
+        # 同一批醒來的執行緒相隔僅一兩秒，所以截止時間最多只會漂移那一兩秒。
+        _MONEYDJ_THROTTLE_UNTIL = max(_MONEYDJ_THROTTLE_UNTIL, now + cooldown)
         level = _MONEYDJ_THROTTLE_LEVEL
         hits = _MONEYDJ_THROTTLE_HITS
+        duplicates = _MONEYDJ_THROTTLE_DUPLICATES
 
     count_event("MoneyDJ 觸發全域限流冷卻")
-    if escalated or hits <= 3 or hits % 50 == 0:
-        print(
-            f"  🚦 MoneyDJ 疑似限流｜{api} {kind}"
-            + (f" HTTP {status}" if status else "")
-            + f"｜本次耗時 {elapsed:.1f}s｜冷卻等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}"
-            f"｜全部執行緒暫停 {cooldown:.0f} 秒｜累計觸發 {hits:,} 次",
-            flush=True,
-        )
+    if duplicate:
+        count_event("MoneyDJ 限流重複回報（同一事件，不再升級）")
+        return False
+
+    print(
+        f"  🚦 MoneyDJ 疑似限流｜{api} {kind}"
+        + (f" HTTP {status}" if status else "")
+        + f"｜本次耗時 {elapsed:.1f}s｜冷卻等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}"
+        f"｜全部執行緒暫停 {cooldown:.0f} 秒｜累計觸發 {hits:,} 次"
+        + (f"（另有 {duplicates:,} 次為同一事件重複回報）" if duplicates else ""),
+        flush=True,
+    )
+    return True
 
 
 def _moneydj_note_success(api, elapsed):
@@ -26530,22 +26571,24 @@ def _moneydj_request_rows(api, url, required_fields):
             if kind == "hold_on":
                 hold_on_hits += 1
                 _moneydj_note_hold_on()
-                _moneydj_rate_backoff("對方回覆『請稍候』")
                 # 「請稍候」不算真正的失敗次數：它是限流，等一下再問就有。
                 # 因此只有第一次印明細，也不讓它吃掉一般錯誤的重試額度。
                 if hold_on_hits == 1:
                     _moneydj_note_failure(
                         api, kind, status, elapsed, url, response, exc, max_attempts
                     )
-                _moneydj_trigger_throttle(api, kind, status, elapsed)
+                # 先判定是不是新事件，只有新事件才降速 ——
+                # 否則冷卻結束時 20 條執行緒會把速率一口氣連砍 20 次半。
+                if _moneydj_trigger_throttle(api, kind, status, elapsed):
+                    _moneydj_rate_backoff("對方回覆『請稍候』")
                 continue
 
             _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt)
 
             if _moneydj_should_throttle(kind, status, elapsed):
-                _moneydj_trigger_throttle(api, kind, status, elapsed)
-                _moneydj_rate_backoff(f"{kind}"
-                                      + (f" HTTP {status}" if status else ""))
+                if _moneydj_trigger_throttle(api, kind, status, elapsed):
+                    _moneydj_rate_backoff(f"{kind}"
+                                          + (f" HTTP {status}" if status else ""))
 
             # 一般錯誤仍只用 MONEYDJ_MAX_RETRIES 次；超過就放棄這一筆。
             if attempt - hold_on_hits >= MONEYDJ_MAX_RETRIES:
