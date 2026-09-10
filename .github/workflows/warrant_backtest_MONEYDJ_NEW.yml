@@ -66,8 +66,11 @@ jobs:
       # ============================================================
       # MoneyDJ 併發與限流
       # ------------------------------------------------------------
-      # 實測 60 併發約在 28,000 筆後開始被擋，換算約 40~60 req/s。
-      # 降到 20 併發 + 起始 15 req/s，讓它一開始就不要撞牆。
+      # 實證資料（不要再往上調）：
+      #   15 req/s → 23,892 筆全數跑完，0 次限流
+      #   25 req/s → 約 4,000 筆就被擋，之後全程卡在冷卻
+      # 門檻落在 15~25 之間。15 是已知安全值，MAX 也鎖在 15，
+      # 不讓自動回升把速率推回危險區。
       # ============================================================
       MONEYDJ_PRESCAN_WORKERS: "20"
       MONEYDJ_HISTORY_WORKERS: "20"
@@ -78,15 +81,16 @@ jobs:
 
       # 全域速率限制：被擋就自動減半，連續成功再緩慢回升。
       MONEYDJ_RATE_LIMIT_ENABLED: "1"
-      MONEYDJ_RATE_START_PER_SECOND: "25"
-      MONEYDJ_RATE_MIN_PER_SECOND: "2"
-      MONEYDJ_RATE_MAX_PER_SECOND: "40"
+      MONEYDJ_RATE_START_PER_SECOND: "15"
+      MONEYDJ_RATE_MIN_PER_SECOND: "5"
+      MONEYDJ_RATE_MAX_PER_SECOND: "15"
 
       # 限流偵測：
       #   HTTP 200 但 Content-Type 不是 json → 限流頁（57B 請稍候／22KB HTML）
       #   慢速 500、逾時、429                → 限流
       #   快速 500（固定那批壞代號）          → 不是限流，不冷卻
       MONEYDJ_THROTTLE_DETECT_ENABLED: "1"
+      MONEYDJ_THROTTLE_ESCALATE_MIN_GAP: "10"
       MONEYDJ_THROTTLE_BASE_COOLDOWN: "15"
       MONEYDJ_THROTTLE_MAX_COOLDOWN: "45"
       MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS: "6"
