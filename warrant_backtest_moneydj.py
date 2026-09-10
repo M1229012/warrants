@@ -38,7 +38,7 @@ import json, re, time, os, math, sys, unicodedata
 import hashlib
 import threading
 from bisect import bisect_right
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -364,6 +364,31 @@ MONEYDJ_THROTTLE_RETRY_BASE_SECONDS = max(
     float(os.getenv("MONEYDJ_THROTTLE_RETRY_BASE_SECONDS", "8")),
     0.5,
 )
+# 【AUDIT8 修正】快速 500 不是限流。
+#
+# 實測：050733、055850、055368 這批代號每次都在 0.2～1.0 秒內回 HTTP 500，
+# 而且每天都是同一批 —— 那是 MoneyDJ 對「這幾個特定權證」的確定性錯誤，
+# 重試再多次、等再久都一樣。
+# 真正的限流長這樣：回應要等 65.7 秒（健康值 0.34 秒）才回 500，或直接逾時。
+#
+# 初版把兩者混為一談，於是 2% 的確定性失敗被升級成 6 級冷卻、
+# 全部執行緒停 300 秒，41,200 檔要跑 5 小時。
+# 現在的規則：
+#   立即判定限流 → 429、逾時、或回應慢於 MONEYDJ_THROTTLE_SLOW_SECONDS
+#   快速 500     → 記錄但不冷卻，除非「整體失敗率」也同時飆高
+MONEYDJ_THROTTLE_FAST_FAIL_SECONDS = max(
+    float(os.getenv("MONEYDJ_THROTTLE_FAST_FAIL_SECONDS", "5")),
+    0.5,
+)
+# 滑動窗口：最近這麼多次請求裡，失敗率超過門檻才視為「全面性」失敗＝限流。
+# 確定性壞代號只占 2% 左右，永遠碰不到 35% 這條線；
+# 真正被擋時是整批一起掛，瞬間就會超過。
+MONEYDJ_THROTTLE_WINDOW_SIZE = max(
+    int(os.getenv("MONEYDJ_THROTTLE_WINDOW_SIZE", "200")),
+    20,
+)
+MONEYDJ_THROTTLE_WINDOW_FAIL_RATIO = min(max(
+    float(os.getenv("MONEYDJ_THROTTLE_WINDOW_FAIL_RATIO", "0.35")), 0.05), 1.0)
 # 每一種失敗類型最多印幾筆完整明細（含 HTTP 狀態、耗時、回應片段）。
 # 這是「抓到問題點」的關鍵：舊版 API5 失敗完全靜默，只回 ([], False)。
 MONEYDJ_FAILURE_SAMPLE_PRINTS = max(
@@ -613,6 +638,11 @@ _MONEYDJ_FAILURE_PRINTED = Counter()   # (api, kind) -> 已印明細次數
 _MONEYDJ_SLOW_RESPONSES = Counter()    # api -> 超過門檻的慢回應次數
 _MONEYDJ_MAX_ELAPSED = {}              # api -> 最慢一次的秒數
 _MONEYDJ_HEALTH_LOCK = threading.Lock()
+# 滑動窗口：True=失敗、False=成功，用來判斷是「全面性失敗」還是「零星壞代號」
+_MONEYDJ_RECENT_OUTCOMES = deque(maxlen=MONEYDJ_THROTTLE_WINDOW_SIZE)
+_MONEYDJ_OUTCOME_LOCK = threading.Lock()
+# 哪些權證代號重複失敗（證明是確定性壞資料，不是限流）
+_MONEYDJ_FAILED_TARGETS = Counter()
 
 # ══════════════════════════════════════════════════════════════════════
 # 官方權證母體來源（TWSE／TPEx）。本版已完全移除 FinMind：
@@ -25931,7 +25961,15 @@ def _moneydj_classify_failure(exc, response, elapsed):
     status = _moneydj_http_status(exc, response)
 
     if status is not None and status in MONEYDJ_THROTTLE_STATUS_CODES:
-        return "throttle", status
+        # 429 是對方明說「你太快了」，一律當限流。
+        if status == 429:
+            return "throttle", status
+        # 其餘（主要是 500）要看回應速度：
+        #   慢 → 對方在排隊／過載 → 限流
+        #   快 → 對方對這個特定請求就是給不了 → 確定性錯誤，重試無用
+        if elapsed >= MONEYDJ_THROTTLE_FAST_FAIL_SECONDS:
+            return "throttle", status
+        return "server_reject", status
     if isinstance(exc, requests.exceptions.Timeout):
         # 讀取逾時代表對方收了請求卻遲遲不回；在 MoneyDJ 上這與 500 同源。
         return "timeout", status
@@ -25946,6 +25984,47 @@ def _moneydj_classify_failure(exc, response, elapsed):
     if isinstance(exc, requests.RequestException):
         return "transport", status
     return "other", status
+
+
+def _moneydj_record_outcome(failed):
+    """把每次請求結果放進滑動窗口，用來區分『全面性失敗』與『零星壞代號』。"""
+    with _MONEYDJ_OUTCOME_LOCK:
+        _MONEYDJ_RECENT_OUTCOMES.append(bool(failed))
+
+
+def _moneydj_window_failure_ratio():
+    """回傳 (失敗率, 窗口是否已滿)。窗口沒滿時不做判斷，避免開頭幾筆就誤判。"""
+    with _MONEYDJ_OUTCOME_LOCK:
+        total = len(_MONEYDJ_RECENT_OUTCOMES)
+        if total < MONEYDJ_THROTTLE_WINDOW_SIZE:
+            return 0.0, False
+        failures = sum(1 for failed in _MONEYDJ_RECENT_OUTCOMES if failed)
+    return failures / total, True
+
+
+def _moneydj_should_throttle(kind, status, elapsed):
+    """
+    決定這次失敗要不要觸發全域冷卻。
+
+    分開判斷的理由（實測）：
+      快速 500（0.2～1.0 秒，固定那批代號）＝ 對方沒有這筆資料，冷卻沒有意義
+      慢速 500（65.7 秒）或逾時          ＝ 對方在排隊，必須降速
+      429                                ＝ 對方明說太快
+      整體失敗率飆高                      ＝ 被全面擋下，即使每筆都回得很快
+    """
+    if not MONEYDJ_THROTTLE_DETECT_ENABLED:
+        return False
+    if status == 429:
+        return True
+    if kind in ("throttle", "timeout"):
+        return True
+    if elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
+        return True
+
+    # 快速失敗：只有在「最近一整個窗口都在掛」時才算限流。
+    # 確定性壞代號約占 2%，永遠碰不到門檻；真的被擋時會瞬間衝到 100%。
+    ratio, ready = _moneydj_window_failure_ratio()
+    return bool(ready and ratio >= MONEYDJ_THROTTLE_WINDOW_FAIL_RATIO)
 
 
 def _moneydj_wait_if_throttled():
@@ -26061,9 +26140,17 @@ def _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attemp
     舊版 API5 失敗是完全靜默的（只回 ([], False)），所以你只看得到
     「2,663/2,663 失敗」卻不知道是 500、逾時還是解析錯誤。
     """
+    # 從 URL 取出 a= 參數（權證代號），用來證明「同一批代號每次都掛」。
+    target_code = ""
+    match = re.search(r"[?&]a=([^&]+)", url or "")
+    if match:
+        target_code = match.group(1)
+
     with _MONEYDJ_HEALTH_LOCK:
         _MONEYDJ_FAILURE_KINDS[kind] += 1
         _MONEYDJ_FAILURE_STATUS[(api, status)] += 1
+        if target_code:
+            _MONEYDJ_FAILED_TARGETS[target_code] += 1
         if elapsed > _MONEYDJ_MAX_ELAPSED.get(api, 0.0):
             _MONEYDJ_MAX_ELAPSED[api] = elapsed
         printed = _MONEYDJ_FAILURE_PRINTED[(api, kind)]
@@ -26145,14 +26232,16 @@ def _moneydj_request_rows(api, url, required_fields):
                 required_fields=required_fields,
                 source_name=api,
             )
+            _moneydj_record_outcome(False)
             _moneydj_note_success(api, time.perf_counter() - started)
             return rows, True
         except Exception as exc:
             elapsed = time.perf_counter() - started
             kind, status = _moneydj_classify_failure(exc, response, elapsed)
+            _moneydj_record_outcome(True)
             _moneydj_note_failure(api, kind, status, elapsed, url, response, exc, attempt)
 
-            if kind in ("throttle", "timeout") or elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
+            if _moneydj_should_throttle(kind, status, elapsed):
                 _moneydj_trigger_throttle(api, kind, status, elapsed)
 
             if attempt < MONEYDJ_MAX_RETRIES:
@@ -26210,21 +26299,34 @@ def print_moneydj_health_report():
             print(f"    {api:<14}{seconds:>10.1f}s")
     print(f"  全域限流冷卻觸發：{hits:,} 次｜目前等級 {level}/{MONEYDJ_THROTTLE_MAX_LEVEL}")
     print(f"  所有執行緒累計等待：{wait_seconds:,.0f} 秒")
+    with _MONEYDJ_HEALTH_LOCK:
+        repeat_targets = [
+            (code, count)
+            for code, count in _MONEYDJ_FAILED_TARGETS.most_common(15)
+            if count >= 2
+        ]
+    if repeat_targets:
+        print("  重複失敗的代號（同一個每次都掛＝確定性錯誤，不是限流）：")
+        print("    " + "、".join(f"{code}×{count}" for code, count in repeat_targets))
+
     print(f"{'-' * 70}")
     throttle_like = sum(
         count for kind, count in kinds.items()
         if kind in ("throttle", "timeout", "connection")
     )
+    # server_reject＝快速 500，代表對方對這些特定代號就是給不了。
     stable_like = sum(
         count for kind, count in kinds.items()
-        if kind in ("parse", "other")
+        if kind in ("server_reject", "parse", "other")
     )
-    if hits > 0 or throttle_like > stable_like:
+    if throttle_like > stable_like or hits > 0:
         print("  ➜ 判讀：偏向【被限流／伺服器過載】。降低併發或拉長冷卻通常會改善。")
         print("     可調：MONEYDJ_PRESCAN_WORKERS、MONEYDJ_HISTORY_WORKERS、")
         print("           MONEYDJ_THROTTLE_BASE_COOLDOWN")
     elif stable_like > 0:
-        print("  ➜ 判讀：偏向【對方就是沒有這筆資料】。重試再多次也不會變。")
+        print("  ➜ 判讀：偏向【對方就是沒有這幾檔的資料】。")
+        print("     這類失敗每次都是同一批代號、而且回得很快（不到 1 秒就 500），")
+        print("     重試、降速、等待都不會改變結果 —— 那些權證在 MoneyDJ 就是查不到。")
     print(f"{'=' * 70}")
 
 
