@@ -766,8 +766,46 @@ class MoneyDJThrottledError(RuntimeError):
     """MoneyDJ 回 HTTP 200 但內容是「請稍候」—— 這是限流，不是資料錯誤。"""
 
 
+def _moneydj_response_is_not_data(response):
+    """
+    HTTP 200 但回的不是資料 —— 一律視為限流／錯誤頁，不是資料錯誤。
+
+    實測 MoneyDJ 在壓力下會回好幾種東西，共通點是「HTTP 200 但不是 JSON」：
+        text/plain    57 bytes   "We appreciate your patience..."
+        text/html     22,100 bytes  完整 HTML 頁（含 viewport、NO-CACHE）
+    正常資料一律是 Content-Type: text/json。
+
+    因此判斷改用「Content-Type 是不是 JSON」，而不是比對特定字串 ——
+    對方之後再換一種錯誤頁也擋得住。
+    回傳 (是否為非資料回應, 描述)。
+    """
+    if response is None:
+        return False, ""
+
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    content = response.content or b""
+
+    # 正常資料：Content-Type 含 json。
+    if "json" in content_type:
+        return False, ""
+
+    # 沒有 Content-Type 時退回看內容開頭是不是 JSON。
+    if not content_type:
+        head = content[:8].lstrip()
+        if head[:1] in (b"{", b"["):
+            return False, ""
+
+    preview = ""
+    try:
+        preview = content[:80].decode("utf-8", errors="replace").strip()
+        preview = re.sub(r"\s+", " ", preview)
+    except Exception:
+        preview = "(無法解碼)"
+    return True, f"{content_type or '(無Content-Type)'}｜{len(content):,} bytes｜{preview}"
+
+
 def _moneydj_body_is_hold_on(content):
-    """判斷回應內容是不是 MoneyDJ 的「請稍候」限流頁。"""
+    """相容保留：以字串比對辨識「請稍候」限流頁（現已由 Content-Type 主判）。"""
     if not content or len(content) > MONEYDJ_THROTTLE_BODY_MAX_BYTES:
         return False
     try:
@@ -26471,9 +26509,10 @@ def _moneydj_request_rows(api, url, required_fields):
                 ),
             )
             response.raise_for_status()
-            if _moneydj_body_is_hold_on(response.content):
+            not_data, detail = _moneydj_response_is_not_data(response)
+            if not_data:
                 raise MoneyDJThrottledError(
-                    "MoneyDJ 回應『請稍候』限流頁，非資料錯誤"
+                    f"MoneyDJ 回 HTTP 200 但不是 JSON 資料（限流／錯誤頁）：{detail}"
                 )
             rows = _moneydj_json_rows(
                 response.content,
@@ -28493,6 +28532,22 @@ def _main_impl():
     print("新制分類：同一分點 × 同一標的 × 同一天 = 1 筆事件")
     print(f"程式版本：{PROGRAM_BUILD_ID}")
     print(f"工作流模式：WORKFLOW_MODE={WORKFLOW_MODE}｜RUN_MODE={RUN_MODE}")
+    if WORKFLOW_MODE == "daily":
+        if MONEYDJ_DAILY_TODAY_FIRST:
+            budget_text = (
+                f"探索預算 {MONEYDJ_DISCOVERY_BUDGET:,} 次"
+                if MONEYDJ_DISCOVERY_BUDGET > 0
+                else "不做探索（只查已知組合）"
+            )
+            print(
+                f"抓取策略：🟢 今日優先兩階段｜活躍組合取最近 "
+                f"{MONEYDJ_DAILY_ACTIVE_PAIR_DAYS} 個交易日｜{budget_text}"
+            )
+        else:
+            print(
+                "抓取策略：⚪ 全市場預篩（舊流程，約 41,200 次 API4）"
+                "｜設 MONEYDJ_DAILY_TODAY_FIRST=1 可切換成今日優先兩階段"
+            )
     print("=" * 70)
 
     _stage_t = time.perf_counter()
