@@ -190,6 +190,18 @@ jobs:
       LONGTERM_UPLOAD_FULL_WORKBOOK_TO_GSHEET: "0"
 
       # repair 勝率：持有滿 60 日未出清者按統計日估值；已下市／到期且無價以 0 結算。
+      # 【repair 改用現有快取重算，不再全量重抓 MoneyDJ】
+      # 全量重建要掃 83,429 支權證（其中 42,203 支已到期）＋ 8.8 萬組以上 API5，
+      # 15 req/s 下光網路就要 3 小時以上，還會卡在 API4 成功率 97% 的閘門。
+      # 設 0 之後 repair 走 daily 已驗證的抓取路徑（今日優先，約 2.4 萬次），
+      # 其餘 21 張表由 daily 每天維護的 200 交易日歷史快取直接重算。
+      REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED: "0"
+
+      # repair 預設連「全分點」也算型態，但 K 線請求沒有經過速率限制器。
+      # 近一個月 TOP15 圖只讀精選五分點，全分點型態沒有任何圖在用。
+      # 設 0 讓 repair 的型態範圍跟 daily 一樣（已驗證約 40 檔，每檔只抓一次）。
+      PATTERN_ALL_SCOPES_IN_REPAIR: "0"
+
       WINRATE_MARK_TO_MARKET_DAYS: "60"
       WINRATE_MARK_TO_MARKET_REPAIR_ENABLED: "1"
       WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED: "1"
