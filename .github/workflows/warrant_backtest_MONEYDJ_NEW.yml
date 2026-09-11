@@ -200,7 +200,7 @@ jobs:
       # repair 預設連「全分點」也算型態，但 K 線請求沒有經過速率限制器。
       # 近一個月 TOP15 圖只讀精選五分點，全分點型態沒有任何圖在用。
       # 設 0 讓 repair 的型態範圍跟 daily 一樣（已驗證約 40 檔，每檔只抓一次）。
-      PATTERN_ALL_SCOPES_IN_REPAIR: "0"
+      PATTERN_ALL_SCOPES_IN_REPAIR: "1"
 
       WINRATE_MARK_TO_MARKET_DAYS: "60"
       WINRATE_MARK_TO_MARKET_REPAIR_ENABLED: "1"
