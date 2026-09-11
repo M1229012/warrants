@@ -58,7 +58,7 @@ jobs:
 
       # 第一次先設 0：只查已知組合，幾分鐘跑完。
       # 確認資料正確且穩定後，再改成 8000 打開新組合探索。
-      MONEYDJ_DISCOVERY_BUDGET: "0"
+      MONEYDJ_DISCOVERY_BUDGET: "8000"
 
       MONEYDJ_DAILY_ACTIVE_PAIR_DAYS: "20"
       MONEYDJ_DISCOVERY_ROTATION_SLICES: "5"
