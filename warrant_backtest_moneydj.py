@@ -27894,6 +27894,49 @@ def _moneydj_known_pairs_from_history(
     return list(candidates.values())
 
 
+def _moneydj_report_new_pairs(candidates, warrants, broker_map, history_df, target_date):
+    """
+    全市場預篩模式專用診斷：今天的成交組合裡，有幾組「最近 N 個交易日從沒出現過」。
+
+    這個數字就是「今日優先」模式（只查歷史已知組合）每天會漏掉的量——
+    通常是分點新建倉、或新上市權證的第一筆買進，偏偏是最有訊號價值的事件。
+    只做統計與列印，不影響候選清單；任何例外都吞掉，絕不讓診斷拖垮整輪。
+    """
+    try:
+        target_key = normalize_date_str(target_date)
+        prior = history_df
+        # 同一天重跑時快取可能已含目標日，必須排除，否則今天的組合會被誤算成「已知」。
+        if prior is not None and not prior.empty and "日期" in prior.columns and target_key:
+            prior = prior[prior["日期"].map(normalize_date_str) < target_key]
+        known = _moneydj_known_pairs_from_history(
+            prior, broker_map, warrants, target_date, MONEYDJ_DAILY_ACTIVE_PAIR_DAYS
+        )
+
+        def _pair_key(candidate):
+            return (
+                _normalize_warrant_code_for_identity(candidate[0]),
+                normalize_broker_code_for_compare(candidate[6]),
+            )
+
+        known_keys = {_pair_key(c) for c in known}
+        new_pairs = [c for c in (candidates or []) if _pair_key(c) not in known_keys]
+        total = len(candidates or [])
+        ratio = (len(new_pairs) / total) if total else 0.0
+        print(
+            f"  🆕 今日新組合：{len(new_pairs):,} / {total:,} 組（{ratio:.1%}）"
+            f"不在最近 {MONEYDJ_DAILY_ACTIVE_PAIR_DAYS} 個交易日的已知清單"
+            "｜今日優先模式會漏掉這些"
+        )
+        if new_pairs:
+            sample = "、".join(
+                f"{_pair_key(c)[0]}@{_pair_key(c)[1]}" for c in new_pairs[:10]
+            )
+            print(f"     樣本（權證@券商）：{sample}")
+        count_event("今日新組合（今日優先會漏掉）", len(new_pairs))
+    except Exception as exc:
+        print(f"  ⚠️ 今日新組合診斷略過：{type(exc).__name__}: {exc}")
+
+
 def _moneydj_discovery_warrant_codes(
     warrants,
     history_df,
@@ -28168,6 +28211,9 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
             warrants, broker_map, _MONEYDJ_TARGET_DATE,
             history_empty=False,
             exact_target_date=True,
+        )
+        _moneydj_report_new_pairs(
+            candidates, warrants, broker_map, history_df, _MONEYDJ_TARGET_DATE
         )
 
     prescan_ratio = (
