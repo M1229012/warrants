@@ -54,11 +54,18 @@ jobs:
       #   第二階段 才去探索新組合，有預算上限、被擋就收手
       # 請求數 44,000 → 約 2,700（DISCOVERY_BUDGET=0 時）
       # ============================================================
-      MONEYDJ_DAILY_TODAY_FIRST: "1"
+      # 【2026/09/11 改回 0：完整預篩】
+      # 今日優先只查「最近 20 日出現過的組合」，分點今天第一次買某檔權證
+      # （新建倉、新上市權證）根本不在清單上，一定漏掉——偏偏那是最有訊號的事件。
+      # 限流的根因是速率不是總量（15 req/s 下 4 萬次 API4 實測零 hold_on），
+      # 完整預篩：API4 掃全部今日有效權證（約 4.1 萬次）→ 只查今天真有成交的組合，
+      # 網路約 48 分鐘，比今日優先多約 20 分鐘，但完整。
+      # log 會印「🆕 今日新組合：N 組」＝今日優先每天會漏掉的量，可據此決定要不要切回 1。
+      MONEYDJ_DAILY_TODAY_FIRST: "0"
 
       # 第一次先設 0：只查已知組合，幾分鐘跑完。
       # 確認資料正確且穩定後，再改成 8000 打開新組合探索。
-      MONEYDJ_DISCOVERY_BUDGET: "8000"
+      MONEYDJ_DISCOVERY_BUDGET: "0"
 
       MONEYDJ_DAILY_ACTIVE_PAIR_DAYS: "20"
       MONEYDJ_DISCOVERY_ROTATION_SLICES: "5"
@@ -197,9 +204,9 @@ jobs:
       # 其餘 21 張表由 daily 每天維護的 200 交易日歷史快取直接重算。
       REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED: "0"
 
-      # repair 預設連「全分點」也算型態，但 K 線請求沒有經過速率限制器。
-      # 近一個月 TOP15 圖只讀精選五分點，全分點型態沒有任何圖在用。
-      # 設 0 讓 repair 的型態範圍跟 daily 一樣（已驗證約 40 檔，每檔只抓一次）。
+      # repair 會連「全分點」一起算型態（daily 只算精選五分點，全分點 TOP15 整張不碰）。
+      # ⚠️ 不要設 0：repair 是整表覆寫，設 0 會把表上既有的全分點型態全部蓋成 -／Missing
+      #    （2026/09/11 實際發生過）。K 線每檔只抓一次、有磁碟快取，實測速度遠低於限流門檻。
       PATTERN_ALL_SCOPES_IN_REPAIR: "1"
 
       WINRATE_MARK_TO_MARKET_DAYS: "60"
