@@ -6,6 +6,8 @@ import hashlib
 import os
 import re
 import shutil
+import ssl
+import tempfile
 import time
 import threading
 import urllib.parse
@@ -2732,6 +2734,137 @@ def _read_gsheet_warrant_status() -> pd.DataFrame:
 # 官方權證 OpenAPI：僅供發行商辨識與當日成交量完整性驗證
 # ============================================================
 
+# ------------------------------------------------------------------
+# TLS：伺服器漏送中繼憑證時，依 AIA 補上（驗證全程保持開啟）
+#
+# 實測 2026-09-13：GitHub runner 連 www.tpex.org.tw 連續 4 次都報
+#   CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+# 原因是 TPEx 某些節點只送 leaf、沒附中繼憑證「TWCA SSL Certification Authority」，
+# 而 certifi 只收錄根憑證、不收錄中繼憑證，憑證鏈接不上。瀏覽器遇到這種情況會
+# 依憑證內的 AIA 網址自動補抓中繼憑證，requests 不會——所以瀏覽器打得開、程式打不開。
+#
+# 這裡照瀏覽器的做法補抓，另加兩道保險：
+#   1. 只接受 SHA-256 指紋在允許清單內的中繼憑證。AIA 依慣例走 HTTP，
+#      若不釘住指紋，被竄改的檔案就會被當成可信任的 CA。
+#   2. 補上之後仍由 OpenSSL 完整驗證到 certifi 裡的根憑證，絕不關閉驗證。
+# 只對官方交易所網域啟用。TWCA 若換發中繼憑證，指紋對不上就不補，
+# 此時由名冊的磁碟副本退回機制接手；新指紋可用環境變數加入。
+# ------------------------------------------------------------------
+_AIA_FALLBACK_HOST_SUFFIXES = ("tpex.org.tw", "twse.com.tw")
+_AIA_TRUSTED_INTERMEDIATE_SHA256 = {
+    # TWCA SSL Certification Authority（簽發者 TWCA CYBER Root CA，有效至 2033-02-23）
+    # 來源 http://sslserver.twca.com.tw/cacert/Cyber_SSL_2023.crt，已驗證可接上 certifi 根憑證。
+    "01af2324d098098f5e0cdf6faabada430b21cce777f47eacb26248b2fda3e531",
+} | {
+    fp.strip().lower()
+    for fp in os.getenv("WARRANT_AIA_TRUSTED_INTERMEDIATE_SHA256", "").split(",")
+    if fp.strip()
+}
+# host → (bundle 路徑或 None, 建立時間)。失敗結果只記 120 秒，之後允許再試。
+_AIA_CA_BUNDLE_CACHE: Dict[str, tuple] = {}
+_AIA_CA_BUNDLE_LOCK = threading.Lock()
+_AIA_FAILURE_RETRY_SEC = 120.0
+
+
+def _is_cert_chain_error(exc) -> bool:
+    """是否為「憑證鏈接不上」類的驗證失敗（其他 SSL 錯誤不補抓，照常拋出）。"""
+    text = str(exc or "")
+    return "CERTIFICATE_VERIFY_FAILED" in text and (
+        "unable to get local issuer" in text or "unable to get issuer" in text
+    )
+
+
+def _extract_aia_ca_issuer_urls(der_bytes: bytes) -> List[str]:
+    """從憑證 DER 內容取出 AIA caIssuers 網址（純字串搜尋，不需額外套件）。
+
+    只取副檔名為 .crt / .cer / .der 的網址；OCSP 與 CRL 網址會被排除。
+    """
+    urls = []
+    for matched in re.finditer(rb"https?://[\x21-\x7e]+?\.(?:crt|cer|der)", der_bytes or b""):
+        url = matched.group(0).decode("ascii", "ignore")
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _aia_augmented_ca_bundle(host: str) -> str | None:
+    """回傳「certifi ＋ 已釘選的 AIA 中繼憑證」的暫存 CA bundle 路徑；做不到回 None。"""
+    host = str(host or "").strip().lower()
+    if not host or not host.endswith(_AIA_FALLBACK_HOST_SUFFIXES):
+        return None
+    with _AIA_CA_BUNDLE_LOCK:
+        cached = _AIA_CA_BUNDLE_CACHE.get(host)
+    if cached is not None:
+        cached_path, cached_at = cached
+        if cached_path and os.path.exists(cached_path):
+            return cached_path
+        if cached_path is None and (time.time() - cached_at) < _AIA_FAILURE_RETRY_SEC:
+            return None
+
+    bundle_path = None
+    try:
+        # 只為了讀 leaf 裡的 AIA 網址才不驗證；補完之後的正式請求一定完整驗證。
+        leaf_pem = ssl.get_server_certificate((host, 443), timeout=15)
+        urls = _extract_aia_ca_issuer_urls(ssl.PEM_cert_to_DER_cert(leaf_pem))
+        accepted = []
+        for url in urls[:3]:
+            resp = requests.get(url, timeout=(5.0, 15.0), headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            body = resp.content
+            der = (
+                ssl.PEM_cert_to_DER_cert(body.decode("ascii", "ignore"))
+                if b"-----BEGIN CERTIFICATE-----" in body
+                else body
+            )
+            fingerprint = hashlib.sha256(der).hexdigest()
+            if fingerprint not in _AIA_TRUSTED_INTERMEDIATE_SHA256:
+                print(
+                    f"⚠️ {host} AIA 中繼憑證指紋不在允許清單，拒絕使用：{fingerprint}"
+                    "（確認無誤後可加入 WARRANT_AIA_TRUSTED_INTERMEDIATE_SHA256）"
+                )
+                continue
+            accepted.append(ssl.DER_cert_to_PEM_cert(der))
+        if accepted:
+            import certifi  # requests 的相依套件，一定存在
+            with open(certifi.where(), "r", encoding="utf-8") as f:
+                base_bundle = f.read()
+            safe_host = re.sub(r"[^0-9A-Za-z_.-]+", "_", host)
+            bundle_path = os.path.join(
+                tempfile.gettempdir(), f"warrant_aia_ca_bundle_{safe_host}.pem"
+            )
+            tmp_path = f"{bundle_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(base_bundle.rstrip() + "\n" + "\n".join(accepted))
+            os.replace(tmp_path, bundle_path)
+            print(
+                f"🔐 {host} 伺服器未送完整憑證鏈，已依 AIA 補上已釘選的中繼憑證"
+                "（憑證驗證維持開啟）"
+            )
+    except Exception as exc:
+        print(f"⚠️ {host} AIA 中繼憑證補抓失敗：{type(exc).__name__}: {exc}")
+        bundle_path = None
+    with _AIA_CA_BUNDLE_LOCK:
+        _AIA_CA_BUNDLE_CACHE[host] = (bundle_path, time.time())
+    return bundle_path
+
+
+def _requests_get_with_aia_fallback(session, url: str, **kwargs):
+    """``session.get()``；只在「憑證鏈接不上」時補上 AIA 中繼憑證重試一次。
+
+    其他任何錯誤（包含其他 SSL 錯誤、呼叫端自己指定 verify 的情況）一律原樣拋出。
+    """
+    try:
+        return session.get(url, **kwargs)
+    except requests.exceptions.SSLError as exc:
+        if "verify" in kwargs or not _is_cert_chain_error(exc):
+            raise
+        host = urllib.parse.urlsplit(url).hostname or ""
+        bundle = _aia_augmented_ca_bundle(host)
+        if not bundle:
+            raise
+        return session.get(url, verify=bundle, **kwargs)
+
+
 def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
     """抓取官方 OpenAPI，針對暫時性斷線重試並回傳明確成功狀態。
 
@@ -2764,7 +2897,8 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
                 close_session = True
 
             try:
-                r = session.get(
+                r = _requests_get_with_aia_fallback(
+                    session,
                     url,
                     headers=request_headers,
                     timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
@@ -14767,6 +14901,23 @@ def _finmind_read_reference_df(cache_name: str, max_age_days: int) -> pd.DataFra
         return None
 
 
+def _finmind_reference_age_days(cache_name: str) -> int | None:
+    """參考資料磁碟副本距今幾天；不存在或讀不到回 None。"""
+    data_path, meta_path = _finmind_reference_paths(cache_name)
+    if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        updated = pd.to_datetime(meta.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        return int((get_taipei_today_ts() - updated).days)
+    except Exception:
+        return None
+
+
 def _finmind_write_reference_df(cache_name: str, df: pd.DataFrame):
     if df is None:
         return
@@ -18106,6 +18257,16 @@ WARRANT_OFFICIAL_REGISTRY_CACHE_MAX_AGE_DAYS = max(
     0, int(os.getenv("WARRANT_OFFICIAL_REGISTRY_CACHE_MAX_AGE_DAYS", "1"))
 )
 _OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME = "official_warrant_registry_full"
+# 某個市場的名冊當下抓不到（實測 2026-09-13 TPEx 憑證鏈異常，4 次重試全失敗）時，
+# 允許退回上一份成功抓到的磁碟副本，最長這麼多天。名冊是「有哪些權證」的清單，
+# 變動很慢；舊一點只會漏掉這幾天剛掛牌的新權證（它們幾乎沒有歷史成交），
+# 比整份報表失敗好得多。使用舊名冊時本次標記為不完整、不寫完整快照。
+# 設 0 = 不允許退回（回到「任一市場抓不到就報錯」）。
+WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS = max(
+    0, int(os.getenv("WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS", "14"))
+)
+# 本次執行中哪些市場用了舊名冊：{"上櫃": 幾天前}。模組層記錄，多檔連跑時共用。
+_OFFICIAL_REGISTRY_STALE_INFO: Dict[str, int] = {}
 
 _WARRANT_SUMMARY_COLUMNS = [
     "stock_id", "stock_name", "target_stock_id", "type",
@@ -18189,15 +18350,66 @@ def _load_official_warrant_registry() -> pd.DataFrame:
             out = out[(out["stock_id"] != "") & (out["target_name"] != "")].copy()
             frames.append(out)
         if failures:
-            raise RuntimeError("官方完整權證名冊不完整：" + "；".join(failures))
+            # 某個市場抓不到時，改用上一份成功抓到的磁碟副本裡「該市場」的部分；
+            # 另一個市場照用剛抓到的新資料。沒有可用副本的市場才報錯。
+            ok_markets = {
+                str(frame["market"].iloc[0]) for frame in frames if not frame.empty
+            }
+            missing_markets = [m for m in ("上市", "上櫃") if m not in ok_markets]
+            stale_age = _finmind_reference_age_days(_OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME)
+            stale = None
+            if (
+                WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS > 0
+                and stale_age is not None
+                and stale_age <= WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS
+            ):
+                stale = _finmind_read_reference_df(
+                    _OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME,
+                    max_age_days=WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS,
+                )
+            recovered = {}
+            if (
+                stale is not None
+                and not stale.empty
+                and required_disk_cols.issubset(stale.columns)
+            ):
+                registry_cols = [
+                    "stock_id", "stock_name", "target_name", "type",
+                    "listing_date", "last_trade_date", "market",
+                ]
+                for market in missing_markets:
+                    part = stale[stale["market"].astype(str) == market][registry_cols].copy()
+                    if part.empty:
+                        continue
+                    part["listing_date"] = pd.to_datetime(part["listing_date"], errors="coerce")
+                    part["last_trade_date"] = pd.to_datetime(part["last_trade_date"], errors="coerce")
+                    frames.append(part)
+                    recovered[market] = (int(stale_age), len(part))
+            still_missing = [m for m in missing_markets if m not in recovered]
+            if still_missing:
+                hint = (
+                    f"｜且沒有 {WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS} 日內的磁碟副本可退回"
+                    "（請確認 Actions 有保存 finmind_cache/reference/）"
+                    if WARRANT_OFFICIAL_REGISTRY_STALE_MAX_DAYS > 0 else ""
+                )
+                raise RuntimeError("官方完整權證名冊不完整：" + "；".join(failures) + hint)
+            for market, (age, count) in recovered.items():
+                _OFFICIAL_REGISTRY_STALE_INFO[market] = age
+                print(
+                    f"⚠️ {market}權證名冊暫時抓不到，改用 {age} 日前的磁碟副本（{count:,} 筆）｜"
+                    "只可能漏掉這幾天新掛牌的權證；本次標記為不完整，不寫完整快照"
+                )
         registry = pd.concat(frames, ignore_index=True)
         if registry.empty:
             raise RuntimeError("官方完整權證名冊為空")
         _OFFICIAL_WARRANT_REGISTRY_CACHE = registry.copy()
-        try:
-            _finmind_write_reference_df(_OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME, registry)
-        except Exception as exc:
-            print(f"⚠️ 官方完整權證名冊磁碟快取寫入失敗（不影響本次）：{exc}")
+        if not _OFFICIAL_REGISTRY_STALE_INFO:
+            # 有任一市場用了舊副本時不寫回磁碟：否則舊資料的時間戳會被刷新成今天，
+            # 下一次會誤以為它是新鮮的名冊。
+            try:
+                _finmind_write_reference_df(_OFFICIAL_WARRANT_REGISTRY_DISK_CACHE_NAME, registry)
+            except Exception as exc:
+                print(f"⚠️ 官方完整權證名冊磁碟快取寫入失敗（不影響本次）：{exc}")
         print(
             f"✅ 官方完整權證名冊載入：{len(registry):,} 筆｜"
             f"上市={int((registry['market'] == '上市').sum()):,}｜"
@@ -19409,7 +19621,8 @@ def _official_security_month_rows_one(code: str, month: str, market: str) -> lis
                 )
             else:
                 url = TWSE_SECURITY_DAILY_URL.format(month=month, code=code)
-            response = get_thread_session().get(
+            response = _requests_get_with_aia_fallback(
+                get_thread_session(),
                 url,
                 headers=OPENAPI_WARRANT_HEADERS,
                 timeout=(min(8.0, budget), min(30.0, budget)),
@@ -21217,8 +21430,13 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             # MoneyDJ 是逐權證抓取，失敗是「權證級」而不是「日期級」。
             # 只要有任何一支權證抓失敗就視為當次不完整，不寫回完整快照，
             # 避免把缺角的資料標成 complete 蓋掉試算表裡原本正確的快照。
-            failed_dates = 1 if (api4_failed or api5_failed or api4_incomplete_but_continued) else 0
+            # 權證清單若用了舊的名冊副本，可能漏掉這幾天新掛牌的權證 → 同樣視為不完整。
+            registry_stale = bool(_OFFICIAL_REGISTRY_STALE_INFO)
+            failed_dates = 1 if (
+                api4_failed or api5_failed or api4_incomplete_but_continued or registry_stale
+            ) else 0
             stats = {
+                "registry_stale_markets": dict(_OFFICIAL_REGISTRY_STALE_INFO),
                 "total_dates": len(trading_dates),
                 "success_dates": len(event_days),
                 "empty_dates": max(0, len(trading_dates) - len(event_days)),
