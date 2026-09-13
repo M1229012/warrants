@@ -1347,9 +1347,6 @@ TARGET_PATTERNS = {
     "元大南屯":       r"元大.*南屯",
     "元大汐止":       r"元大.*汐止",
     "元大虎尾":       r"元大.*虎尾",
-    "元大向上":       r"元大.*向上",
-    "元大西屯":       r"元大.*西屯",
-    "元大西螺":       r"元大.*西螺",
     "元大彰化民生":   r"元大.*彰化民生",
     "兆豐板橋":       r"兆豐.*板橋",
     "凱基士林":       r"凱基.*士林",
@@ -1383,9 +1380,6 @@ FALLBACK = {
     "元大南屯":       ("元大-南屯",       "9853"),
     "元大汐止":       ("元大-汐止",       "989Q"),
     "元大虎尾":       ("元大-虎尾",       "980l"),
-    "元大向上":       ("元大-向上",       "9824"),
-    "元大西屯":       ("元大-西屯",       "980w"),
-    "元大西螺":       ("元大-西螺",       "981i"),
     "元大彰化民生":   ("元大-彰化民生",   "989J"),
     "兆豐板橋":       ("兆豐-板橋",       "700B"),
     "凱基士林":       ("凱基-士林",       "9238"),
@@ -27900,6 +27894,84 @@ def _moneydj_known_pairs_from_history(
     return list(candidates.values())
 
 
+# repair 自動回補新分點：設定裡有、但歷史快取一筆都沒有的分點，只替它們重抓完整歷史。
+# 背景：repair 改成沿用快取重算後（REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED=0），
+# 新加入的分點永遠只有「當天」一筆資料，勝率統計需要的 60 日持有／出清事件全都算不出來。
+# 全量重建（=1）要把 30 多間全部重抓，17 萬次請求會超過 6 小時；
+# 而重建的合併規則是「只取代本次抓到的 (權證, 分點)」，所以只帶新分點重建是安全的。
+REPAIR_BACKFILL_NEW_BROKERS = os.getenv(
+    "REPAIR_BACKFILL_NEW_BROKERS", "1"
+).strip().lower() not in ("0", "false", "no")
+
+
+def _brokers_missing_from_history(broker_map, history_df):
+    """回傳 broker_map 中，在歷史快取裡一筆紀錄都沒有的分點（格式與 broker_map 相同）。"""
+    if not broker_map:
+        return {}
+    if history_df is None or history_df.empty or "券商代號" not in history_df.columns:
+        return dict(broker_map)
+    seen = {
+        normalize_broker_code_for_compare(code)
+        for code in history_df["券商代號"].dropna().astype(str).tolist()
+    }
+    return {
+        label: value
+        for label, value in broker_map.items()
+        if normalize_broker_code_for_compare(value[1]) not in seen
+    }
+
+
+def backfill_new_brokers_for_repair(warrants, broker_map, history_df, target_date):
+    """
+    repair 專用：只替「新分點」做完整歷史回補，其他分點沿用快取、完全不動。
+
+    成本：API4 仍須掃完保留窗口內所有權證（API4 以權證為單位，省不掉），
+    但 API5 只查新分點的組合，遠少於全量重建。
+    回補未通過時回傳 None，由呼叫端停止本次 repair（既有快取完整保留）。
+    """
+    if not REPAIR_BACKFILL_NEW_BROKERS:
+        return history_df
+
+    missing = _brokers_missing_from_history(broker_map, history_df)
+    if not missing:
+        print("  ✅ repair 新分點檢查：所有分點在歷史快取中都有紀錄，不需回補。")
+        return history_df
+
+    print(
+        f"\n【Step 3-0】repair 新分點歷史回補：{len(missing)} 間｜"
+        + "、".join(missing.keys())
+    )
+    print(
+        "  ℹ️ 只重抓這幾間的完整歷史；其他分點沿用快取、完全不動"
+        "（重建只取代本次抓到的權證×分點組合）。"
+    )
+    rebuilt, status = rebuild_full_history_from_moneydj(
+        warrants, missing, history_df, target_date
+    )
+    if not status.get("accepted"):
+        print(
+            f"  ⛔ 新分點回補未通過（{status.get('reason', '-')}）；"
+            "既有歷史快取完整保留，本次停止、不修改 Google Sheet。"
+        )
+        if status.get("reason") == "prescan_ratio":
+            print(
+                "  ℹ️ 若 API4 成功率只是略低於門檻（已到期權證較多時常見），"
+                "可暫時調低 MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO 後重跑。"
+            )
+        return None
+
+    still_missing = _brokers_missing_from_history(missing, rebuilt)
+    if still_missing:
+        print(
+            "  ⚠️ 下列分點在保留窗口內查無任何交易，勝率統計不會出現它們："
+            + "、".join(still_missing.keys())
+        )
+    print(
+        f"  ✅ 新分點回補完成：{len(missing) - len(still_missing)} / {len(missing)} 間已補入歷史"
+    )
+    return rebuilt
+
+
 def _moneydj_report_new_pairs(candidates, warrants, broker_map, history_df, target_date):
     """
     全市場預篩模式專用診斷：今天的成交組合裡，有幾組「最近 N 個交易日從沒出現過」。
@@ -28853,6 +28925,21 @@ def _main_impl():
             f"  ✅ 價格批次最晚已發布基準日："
             f"{_PRICE_PLAN_MAX_PUBLISHED_DATE}"
         )
+
+        # 【repair 自動回補新分點】設定裡有、但快取一筆紀錄都沒有的分點，
+        # 先只替它們補完整歷史，再照常抓當日資料。daily 不做（太慢），只在 repair。
+        if workflow_is_repair():
+            _stage_t = time.perf_counter()
+            history_cache_df = backfill_new_brokers_for_repair(
+                warrants, broker_map, history_cache_df, target_date
+            )
+            record_stage_seconds(
+                "Step3-0 repair 新分點歷史回補",
+                time.perf_counter() - _stage_t,
+            )
+            if history_cache_df is None:
+                print_moneydj_health_report()
+                return
 
         _stage_t = time.perf_counter()
         history_cache_df = refresh_history_from_moneydj(
