@@ -2865,6 +2865,128 @@ def _requests_get_with_aia_fallback(session, url: str, **kwargs):
         return session.get(url, verify=bundle, **kwargs)
 
 
+# ------------------------------------------------------------------
+# 大型官方檔案的斷點續傳下載
+#
+# 實測 2026-09-13：TPEx 上櫃權證名冊約 14MB，伺服器多數連線在前 16～106KB 就
+# 被切斷（IncompleteRead），而且不論 Accept-Encoding 用 gzip、identity 或預設都一樣。
+# 原本的做法是整份從頭重抓，5 次全部在開頭就斷掉，整份報表失敗。
+# 伺服器支援 Range（回 206），所以改成「斷了就從已收到的位置接著抓」：
+# 同樣狀況下實測 1 次重連、2.7 秒就拿到完整 14,002,936 bytes。
+# ------------------------------------------------------------------
+OPENAPI_RESUMABLE_MAX_RESUMES = max(
+    0, int(os.getenv("OPENAPI_RESUMABLE_MAX_RESUMES", "60"))
+)
+
+
+def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None, max_resumes=None) -> bytes:
+    """下載完整內容；連線中途被切斷時，用 Range 從斷點接著抓。
+
+    正確性保險：
+    - 只有伺服器「沒有做內容壓縮」且回報 Content-Length 時才續傳；壓縮串流的位移對不上。
+    - 續傳回應必須是 206、Content-Range 起點等於已收到的長度，否則丟棄已收到的部分
+      從頭接收。寧可多抓，也不拼出錯的內容。
+    - 最終長度必須等於 Content-Length。
+    - 還沒收到任何位元組就連不上（含 SSL 錯誤）→ 原樣拋出，交給呼叫端的重試與退避。
+    """
+    max_resumes = (
+        OPENAPI_RESUMABLE_MAX_RESUMES if max_resumes is None else max(0, int(max_resumes))
+    )
+    base_headers = dict(headers or {})
+    buf = bytearray()
+    expected_total = None
+    resumable = False
+    last_error = None
+    zero_progress = 0
+    for _attempt in range(max_resumes + 1):
+        resuming = bool(buf) and resumable
+        req_headers = dict(base_headers)
+        if resuming:
+            req_headers["Range"] = f"bytes={len(buf)}-"
+        else:
+            buf = bytearray()
+        before = len(buf)
+        broke = False
+        # 送出請求、收到回應標頭這一步就失敗（連不上、SSL 錯誤）→ 原樣拋出，
+        # 交給呼叫端的重試與退避；這裡只處理「串流中途被切斷」。
+        resp = _requests_get_with_aia_fallback(
+            session, url, headers=req_headers, timeout=timeout, stream=True
+        )
+        try:
+            if resuming:
+                content_range = str(resp.headers.get("Content-Range", "") or "")
+                if not (
+                    resp.status_code == 206
+                    and content_range.startswith(f"bytes {len(buf)}-")
+                ):
+                    # 伺服器沒有照 Range 回應：已收到的部分不能拼，這個回應當成全新的一份。
+                    buf = bytearray()
+                    before = 0
+                    resuming = False
+            if not resuming:
+                resp.raise_for_status()
+                encoding = str(resp.headers.get("Content-Encoding", "") or "").strip().lower()
+                length = str(resp.headers.get("Content-Length", "") or "").strip()
+                plain = encoding in ("", "identity")
+                expected_total = int(length) if (plain and length.isdigit()) else None
+                resumable = bool(expected_total)
+            if resumable:
+                # urllib3 預設在「收到的長度不足 Content-Length」時丟出 IncompleteRead，
+                # 而且會把這次已經讀進緩衝區、還沒交給呼叫端的位元組一起丟掉。
+                # 實測 TPEx 在第一個 64KB 區塊內就斷線時，呼叫端一個位元組都拿不到，
+                # 續傳根本無從接起。對「未壓縮、有 Content-Length」的回應關掉這個檢查，
+                # 讓串流在斷線處正常結束、保住已收到的部分，長度由下面自己比對。
+                # 壓縮過的回應維持原本的檢查：截斷的壓縮串流不能拿來拼接。
+                raw = getattr(resp, "raw", None)
+                if raw is not None and hasattr(raw, "enforce_content_length"):
+                    try:
+                        raw.enforce_content_length = False
+                    except Exception:
+                        pass
+            for chunk in resp.iter_content(65536):
+                if chunk:
+                    buf.extend(chunk)
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            broke = True
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        progress = len(buf) - before
+        if not broke and (expected_total is None or len(buf) == expected_total):
+            return bytes(buf)
+        if expected_total is not None and len(buf) > expected_total:
+            # 比宣告的長度還多：內容已不可信，從頭來。
+            buf = bytearray()
+            resumable = False
+        if not resumable:
+            # 不能續傳（壓縮或沒有長度）→ 下一輪整份從頭來。
+            buf = bytearray()
+        if progress <= 0:
+            # 連續幾次一個位元組都沒拿到：不是偶發切斷，交給外層重試與退避。
+            zero_progress += 1
+            if zero_progress >= 3:
+                raise RuntimeError(
+                    f"連續 {zero_progress} 次連線都沒有收到任何資料："
+                    f"{len(buf):,}/{expected_total if expected_total is not None else '?'} bytes"
+                    f"｜{last_error}"
+                )
+            time.sleep(0.5 * zero_progress)
+        else:
+            zero_progress = 0
+            time.sleep(0.2)
+        if last_error is None and expected_total is not None:
+            last_error = RuntimeError(f"內容長度不足：{len(buf):,}/{expected_total:,}")
+
+    raise RuntimeError(
+        f"斷點續傳 {max_resumes} 次仍未取得完整內容："
+        f"{len(buf):,}/{expected_total if expected_total is not None else '?'} bytes｜{last_error}"
+    )
+
+
 def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
     """抓取官方 OpenAPI，針對暫時性斷線重試並回傳明確成功狀態。
 
@@ -2882,10 +3004,10 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
         session = None
         try:
             request_headers = dict(OPENAPI_WARRANT_HEADERS)
-            # 大型 TPEx 名冊若一律 identity，GitHub runner 會下載約 15MB 未壓縮
-            # 資料而停在此步數分鐘。正常情況先用 gzip；只有發生串流截斷的重試
-            # 才退回 identity，速度與傳輸可靠性兩者都保留。
-            request_headers["Accept-Encoding"] = "gzip, deflate" if attempt == 1 else "identity"
+            # 串流截斷改由 _requests_get_bytes_resumable 的 Range 斷點續傳處理。
+            # 原本「截斷時改用 identity 重試」實測無效：TPEx 不論哪種 Accept-Encoding
+            # 都會在前 16～106KB 切斷連線，identity 只是剛好出現在失敗的重試上。
+            request_headers["Accept-Encoding"] = "gzip, deflate"
             request_headers["Connection"] = "close"
             # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的
             # keep-alive 連線持續觸發 Response ended prematurely。
@@ -2897,14 +3019,13 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
                 close_session = True
 
             try:
-                r = _requests_get_with_aia_fallback(
+                raw_bytes = _requests_get_bytes_resumable(
                     session,
                     url,
                     headers=request_headers,
                     timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
                 )
-                r.raise_for_status()
-                data = r.json()
+                data = json.loads(raw_bytes.decode("utf-8-sig"))
             finally:
                 if close_session and session is not None:
                     session.close()
@@ -2918,7 +3039,7 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
             last_error = str(exc or type(exc).__name__)
             if attempt < max_attempts:
                 wait_sec = min(8.0, FINMIND_RETRY_BASE_WAIT * attempt)
-                fallback_note = "｜下輪改未壓縮傳輸" if attempt == 1 else ""
+                fallback_note = ""
                 print(
                     f"⚠️ {source_name} OpenAPI 暫時失敗，準備重試 "
                     f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}{fallback_note}"
@@ -3492,13 +3613,16 @@ def _official_row_value(row: dict, candidates: List[str]) -> str:
 def _fetch_official_warrant_issuer_source(url: str, source_label: str) -> tuple[dict, pd.DataFrame]:
     """讀取官方權證資料，建立「權證代號 → 發行商」對照；欄位未知時保留完整 Debug。"""
     try:
-        response = get_thread_session().get(
-            url,
-            headers=OPENAPI_WARRANT_HEADERS,
-            timeout=(8, 45),
+        # 走同一套「憑證鏈補抓＋斷點續傳」，原本直接 session.get() 會在
+        # TPEx 憑證鏈不完整時失敗（實測 2026-09-13）。
+        payload = json.loads(
+            _requests_get_bytes_resumable(
+                get_thread_session(),
+                url,
+                headers=OPENAPI_WARRANT_HEADERS,
+                timeout=(8, 45),
+            ).decode("utf-8-sig")
         )
-        response.raise_for_status()
-        payload = response.json()
         if isinstance(payload, dict):
             rows = payload.get("data", payload.get("records", payload.get("result", [])))
         else:
