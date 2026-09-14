@@ -136,6 +136,15 @@ REPLAY_CHART_MODE = os.getenv("REPLAY_CHART_MODE", "分段").strip()
 # 第幾次買賣：最新／全部／3／1,3／2-4／近3（最近三段）／-2（倒數第二段）。
 # 分段模式每個編號一張；整段模式把選到的波段從第一段畫到最後一段。
 REPLAY_ROUNDS = os.getenv("REPLAY_ROUNDS", "最新").strip()
+# 怎麼算「一次」：
+# - 逐筆：每一次大額買進（ABCDE 事件）各算一次，出場日＝那一筆自己的 FIFO 出清日，
+#         與 Google Sheet ABCDE 表一列對一列。
+# - 合併：還沒出清前又大額加碼就併成同一段，看的是「持倉從建立到完全出清」。
+# 分點常常舊部位還沒賣完就加碼，合併模式下會整串黏成一段——2026/09 光寶科元大南屯
+# 01/16～08/20 連續加碼 10 次，合併後只剩 1 段，選「近5」也只有 1 張。所以預設逐筆。
+REPLAY_ROUND_SPLIT = os.getenv("REPLAY_ROUND_SPLIT", "逐筆").strip()
+REPLAY_MERGE_ROUNDS = ("合併" in REPLAY_ROUND_SPLIT) or REPLAY_ROUND_SPLIT.lower() in ("merge", "merged")
+ROUND_UNIT = "段" if REPLAY_MERGE_ROUNDS else "次"
 
 # 沒指定股票時最多畫幾檔（依最近一次大額買進日排序），避免大分點一次產出上百張圖。
 REPLAY_MAX_STOCKS = max(1, int(os.getenv("REPLAY_MAX_STOCKS", "10")))
@@ -166,14 +175,14 @@ REPLAY_LEVERAGE_MIN_STOCK_PCT = max(0.1, float(os.getenv("REPLAY_LEVERAGE_MIN_ST
 # K 線上只畫單日賣出達這個金額的 ▼（出清日一律畫）。
 # 分批出場常一天只賣幾萬，全部畫會變成一整排三角形；小額賣出看下方權證買賣面板就好。
 REPLAY_SELL_MARK_MIN_AMOUNT = max(0.0, float(os.getenv("REPLAY_SELL_MARK_MIN_AMOUNT", "1000000")))
-# 每段最多幾個賣出日加文字（金額大的優先，出清日一律加）；其餘只畫三角形。
-# 整段圖一次有好幾段，每段只標更少。
+# 最多幾個「非出清」賣出日加文字（金額大的優先；出清日一律加）；其餘只畫三角形。
+# 分段圖是單一筆的上限，整段圖是整張圖合計的上限（同一天的賣出只標一次）。
 REPLAY_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_SELL_LABEL_MAX", "8")))
-REPLAY_FULL_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_FULL_SELL_LABEL_MAX", "2")))
+REPLAY_FULL_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_FULL_SELL_LABEL_MAX", "4")))
 # K 線上下標籤帶最多先開幾列；再擠不下會左右找空位，真的沒有空位才再加列（寧可變高也不重疊）。
 REPLAY_LANE_MAX_ROWS = max(1, int(os.getenv("REPLAY_LANE_MAX_ROWS", "4")))
 # 歷次波段表格最多列幾段；超過時以本段為中心取前後各半。
-REPLAY_TABLE_MAX_ROWS = max(3, int(os.getenv("REPLAY_TABLE_MAX_ROWS", "12")))
+REPLAY_TABLE_MAX_ROWS = max(3, int(os.getenv("REPLAY_TABLE_MAX_ROWS", "15")))
 # 長區間的加權價量分布是逐列迴圈，趕時間可以關掉。
 REPLAY_SHOW_VOLUME_PROFILE = os.getenv("REPLAY_SHOW_VOLUME_PROFILE", "1").strip().lower() not in ("0", "false", "no", "off")
 REPLAY_HTML_INDEX_ENABLE = os.getenv("REPLAY_HTML_INDEX_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -322,16 +331,33 @@ def parse_chart_modes(raw) -> set:
     return {"segment"}
 
 
-def parse_round_selection(spec, total) -> list:
-    """REPLAY_ROUNDS → 1 起算的波段編號（排序、去重）。
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
-    支援：最新／全部／3／1,3／2-4／近3（最近三段）／-2（倒數第二段），可混用：「1,近2」。
+
+def _cn_numerals_to_arabic(text) -> str:
+    """「近五」「第十二次」→「近5」「第12次」。workflow 輸入框常直接打中文數字。"""
+    def convert(match):
+        s = match.group(0)
+        if "十" in s:
+            tens, _sep, ones = s.partition("十")
+            return str((_CN_DIGITS.get(tens, 1) if tens else 1) * 10 + (_CN_DIGITS.get(ones, 0) if ones else 0))
+        return "".join(str(_CN_DIGITS[c]) for c in s)
+    return re.sub(r"[零〇一二兩三四五六七八九十]+", convert, str(text or ""))
+
+
+def parse_round_selection(spec, total) -> list:
+    """REPLAY_ROUNDS → 1 起算的編號（排序、去重）。
+
+    支援：最新／全部／3／1,3／2-4／2到4／近3（最近三次）／-2（倒數第二次），可混用：「1,近2」。
+    中文數字與「第3次」「近五段」這種口語寫法也吃。
     """
     if total <= 0:
         return []
-    s = str(spec or "").strip().lower()
-    for old, new in (("，", ","), ("、", ","), ("～", "-"), ("~", "-"), ("－", "-")):
+    s = _cn_numerals_to_arabic(str(spec or "").strip().lower())
+    for old, new in (("，", ","), ("、", ","), ("～", "-"), ("~", "-"), ("－", "-"), ("到", "-")):
         s = s.replace(old, new)
+    s = re.sub(r"[第次段]", "", s)
     if s in ("", "全部", "all"):
         return list(range(1, total + 1))
 
@@ -365,7 +391,7 @@ def parse_round_selection(spec, total) -> list:
 
     dropped = sorted(n for n in picked if not 1 <= n <= total)
     if dropped:
-        log(f"⚠️ 波段編號超出範圍（本檔共 {total} 段）：{dropped}")
+        log(f"⚠️ 編號超出範圍（本檔共 {total} {ROUND_UNIT}）：{dropped}")
     return sorted(n for n in picked if 1 <= n <= total)
 
 
@@ -519,7 +545,7 @@ def fetch_kline_frames(bt, stock_code):
 # ============================================================
 
 def group_rounds(events, stock_code):
-    """把同一檔股票的 ABCDE 事件依持有期間重疊合併成波段。"""
+    """把同一檔股票的 ABCDE 事件整理成「一次一次」的紀錄（逐筆或合併，見 REPLAY_ROUND_SPLIT）。"""
     evs = [ev for ev in events if _stock_key(ev.get("標的股")) == stock_code]
     evs.sort(key=lambda ev: _date_key(ev.get("事件日") or ev.get("起始日")))
 
@@ -529,7 +555,11 @@ def group_rounds(events, stock_code):
         if not start:
             continue
         exit_key = _date_key(ev.get("出清日")) if str(ev.get("狀態", "")).strip() == "出清" else ""
-        # 上一段還沒出清（或出清當天）又大額買進 → 視為加碼，併進同一段。
+        if not REPLAY_MERGE_ROUNDS:
+            # 逐筆：每筆 ABCDE 事件自成一次，出場就是它自己的 FIFO 出清日。
+            rounds.append({"events": [ev], "start": start, "exit": exit_key, "open": not exit_key})
+            continue
+        # 合併：上一段還沒出清（或出清當天）又大額買進 → 視為加碼，併進同一段。
         if cur is not None and (cur["open"] or start <= cur["exit"]):
             cur["events"].append(ev)
             if exit_key:
@@ -542,7 +572,7 @@ def group_rounds(events, stock_code):
     return rounds
 
 
-def summarize_round(rnd, latest_key, flow_df, stock_code):
+def summarize_round(rnd, latest_key):
     """彙總一段波段的權證部位：買進金額、FIFO 已實現報酬、買進日與賣出日。"""
     events = rnd["events"]
     lots = [lot for ev in events for lot in (ev.get("lots") or [])]
@@ -566,18 +596,11 @@ def summarize_round(rnd, latest_key, flow_df, stock_code):
         key=lambda b: b["date"],
     )
 
-    # FIFO 只留下「哪幾天的賣出動到這一段」，沒有記每天扣了多少；
-    # 標籤金額取這一段用到的權證在那幾天的全部賣出金額，當作出場力道參考。
-    exit_dates = sorted({
+    # FIFO 只留下「哪幾天的賣出動到這一筆」，沒有記每天扣了多少；
+    # K 線標籤的金額在畫圖時取「分點當天對這檔的全部權證賣出」，與下方權證買賣面板同一個數字。
+    exit_days = sorted({
         _date_key(d) for ev in events for d in (ev.get("賣出影響日清單") or []) if _date_key(d)
     })
-    sells = flow_df[
-        (flow_df["標的股"] == stock_code)
-        & flow_df["權證代號"].isin(warrant_codes)
-        & flow_df["日期"].isin(exit_dates)
-    ]
-    sell_by_day = sells.groupby("日期")["賣出金額"].sum().to_dict() if not sells.empty else {}
-    exit_days = [{"date": d, "amount": to_float(sell_by_day.get(d))} for d in exit_dates]
 
     if not rnd["open"]:
         status = "已出清"
@@ -668,10 +691,10 @@ def summarize_habit(rounds) -> str:
     closed = [r for r in rounds if not r["open"]]
     open_n = len(rounds) - len(closed)
     if not closed:
-        return f"分點習性｜尚無已出清波段｜持有中 {open_n} 段"
+        return f"分點習性｜尚無已出清紀錄｜持有中 {open_n} {ROUND_UNIT}"
     wins = sum(1 for r in closed if (r["warrant_pct"] or 0) > 0)
     parts = [
-        f"已出清 {len(closed)} 段",
+        f"已出清 {len(closed)} {ROUND_UNIT}",
         f"權證勝率 {wins / len(closed):.0%}",
         f"平均持有 {_mean([r['hold_days'] for r in closed]):.0f} 天",
     ]
@@ -682,7 +705,7 @@ def summarize_habit(rounds) -> str:
     if avg_s is not None:
         parts.append(f"平均同期現股 {avg_s:+.1f}%")
     if open_n:
-        parts.append(f"持有中 {open_n} 段")
+        parts.append(f"持有中 {open_n} {ROUND_UNIT}")
     return "分點習性｜" + "｜".join(parts)
 
 
@@ -715,6 +738,17 @@ def round_positions(plot_df, rounds):
         if s < len(keys) and e >= s:
             out.append((r, s, e))
     return out
+
+
+def _span_union(spans):
+    """把重疊的持有區間合併後再畫底色；逐筆模式區間互相重疊，逐一疊 alpha 會越疊越黑。"""
+    merged = []
+    for _r, s_idx, e_idx in sorted(spans, key=lambda t: t[1]):
+        if merged and s_idx <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e_idx)
+        else:
+            merged.append([s_idx, e_idx])
+    return merged
 
 
 def pick_table_rounds(rounds, anchor):
@@ -953,46 +987,61 @@ def assign_lane_rows(items, lo, hi, pad, max_rows):
     return len(rows)
 
 
-def build_lane_items(plot_df, spans, full_mode):
-    """整理 K 線上要標的事件：下方標籤帶＝大額買進，上方標籤帶＝賣出（與整段圖的波段編號）。"""
+def build_lane_items(plot_df, spans, full_mode, stock_flow):
+    """整理 K 線上要標的事件：下方標籤帶＝大額買進，上方標籤帶＝賣出（與整段圖的編號）。
+
+    賣出日依日期合併：逐筆模式下同一天常同時是好幾筆的出場日，只畫一個 ▼、一個標籤。
+    標籤金額＝分點當天對這檔的全部權證賣出，與下方權證買賣面板的綠柱同一個數字。
+    """
     keys = list(plot_df.index.strftime("%Y/%m/%d"))
     pos = {k: i for i, k in enumerate(keys)}
-    sell_label_cap = REPLAY_FULL_SELL_LABEL_MAX if full_mode else REPLAY_SELL_LABEL_MAX
     bottom, top = [], []
+    sell_days = {}
     for r, s_idx, _e_idx in spans:
+        # 整段圖裡只有一個買進日的（逐筆模式一定是），編號直接寫在買進標籤上，不另外佔一列。
+        numbered = full_mode and len(r["buy_days"]) == 1
         for b in r["buy_days"]:
             i = pos.get(b["date"])
             if i is None:
                 continue
+            prefix = f"#{r['no']} " if numbered else ""
             bottom.append({
                 "x": i, "marker": True, "final": False, "color": RED,
-                "text": f"{b['date'][5:]} {b['class']} {fmt_wan(b['amount'])}",
+                "text": f"{prefix}{b['date'][5:]} {b['class']} {fmt_wan(b['amount'])}",
             })
-
-        final_exit = "" if r["open"] else r["end"]
-        exits = [
-            e for e in r["exit_days"]
-            if e["date"] in pos and (e["amount"] >= REPLAY_SELL_MARK_MIN_AMOUNT or e["date"] == final_exit)
-        ]
-        labeled = {
-            e["date"] for e in sorted(exits, key=lambda e: e["amount"], reverse=True)[:sell_label_cap]
-        }
-        for e in exits:
-            is_final = e["date"] == final_exit
-            text = ""
-            if is_final or e["date"] in labeled:
-                text = f"{e['date'][5:]} {'出清' if is_final else '賣'} {fmt_wan(e['amount'])}"
-            top.append({"x": pos[e["date"]], "marker": True, "final": is_final, "color": GREEN, "text": text})
-
-        if full_mode:
+        if full_mode and not numbered:
             top.append({
                 "x": s_idx, "marker": False, "final": False, "color": NAVY, "align": "left", "order": -1,
                 "text": f"#{r['no']}  {r['start'][5:]}→{r['end'][5:]}",
             })
+
+        final_exit = "" if r["open"] else r["end"]
+        for d in r["exit_days"]:
+            if d not in pos:
+                continue
+            rec = sell_days.setdefault(d, [])
+            if d == final_exit:
+                rec.append(r["no"])
+
+    amount_of = {d: float(stock_flow.get(d, (0.0, 0.0))[1]) for d in sell_days}
+    shown = [d for d in sorted(sell_days) if amount_of[d] >= REPLAY_SELL_MARK_MIN_AMOUNT or sell_days[d]]
+    cap = REPLAY_FULL_SELL_LABEL_MAX if full_mode else REPLAY_SELL_LABEL_MAX
+    ranked = [d for d in sorted(shown, key=lambda d: amount_of[d], reverse=True) if not sell_days[d]]
+    labeled = set(ranked[:cap])
+    for d in shown:
+        finals = sell_days[d]
+        amount_text = f" {fmt_wan(amount_of[d])}" if amount_of[d] > 0 else ""
+        text = ""
+        if finals:
+            who = ("、".join(f"#{n}" for n in finals) + " ") if full_mode else ""
+            text = f"{d[5:]} {who}出清{amount_text}"
+        elif d in labeled:
+            text = f"{d[5:]} 賣{amount_text}"
+        top.append({"x": pos[d], "marker": True, "final": bool(finals), "color": GREEN, "text": text})
     return bottom, top
 
 
-def draw_event_lanes(ax, plot_df, spans, full_mode):
+def draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow):
     """設定 K 線 Y 軸（上下各留標籤帶）並畫出三角形、虛線導引與標籤。"""
     fig = ax.figure
     dpi = fig.dpi
@@ -1002,7 +1051,7 @@ def draw_event_lanes(ax, plot_df, spans, full_mode):
     data_per_px = (x_hi - x_lo) / ax_w
     box_pad_px = LANE_LABEL_PAD * LANE_FONT_SIZE * dpi / 72
 
-    bottom, top = build_lane_items(plot_df, spans, full_mode)
+    bottom, top = build_lane_items(plot_df, spans, full_mode, stock_flow)
     for it in bottom + top:
         if it["text"]:
             w_px, _h = _text_px(ax, it["text"], LANE_FONT_SIZE)
@@ -1096,24 +1145,25 @@ def draw_event_lanes(ax, plot_df, spans, full_mode):
 # 繪圖層：各面板
 # ============================================================
 
-def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels):
+def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels, stock_flow):
     style_ax(ax)
     ax.set_xlim(-1, len(x))
-    for _r, s_idx, e_idx in spans:
+    for s_idx, e_idx in _span_union(spans):
         ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
     plot_candles(ax, plot_df, x)
     for col, color in [("MA5", RED), ("MA10", ORANGE), ("MA20", LIME), ("MA60", BLUE)]:
         ax.plot(x, plot_df[col], color=color, linewidth=2.1, zorder=2)
     for col in ["BB_UPPER", "BB_LOWER"]:
         ax.plot(x, plot_df[col], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9, zorder=2)
-    for r, s_idx, e_idx in spans:
+    # 進場價虛線只在分段圖畫；整段圖逐筆模式可能有十幾條，會變成一片橫線。
+    for r, s_idx, e_idx in ([] if full_mode else spans):
         if r["entry_close"]:
             # 進場價虛線壓在 K 棒下層（zorder 比 K 棒低），只當參考線。
             ax.hlines(r["entry_close"], s_idx - 0.5, e_idx + 0.5, colors=NAVY, linestyles="--",
                       linewidth=1.6, alpha=0.55, zorder=1.8)
     if REPLAY_SHOW_VOLUME_PROFILE:
         add_weighted_volume_profile_overlay(ax, plot_df)
-    draw_event_lanes(ax, plot_df, spans, full_mode)
+    draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow)
     ax.yaxis.tick_right()
     ax.tick_params(axis="y", labelsize=26)
     for lab in ax.get_yticklabels():
@@ -1124,7 +1174,7 @@ def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels):
 def draw_volume_panel(ax, plot_df, x, spans, ticks):
     style_ax(ax)
     ax.set_xlim(-1, len(x))
-    for _r, s_idx, e_idx in spans:
+    for s_idx, e_idx in _span_union(spans):
         ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
     up = plot_df["Close"] >= plot_df["Open"]
     vol_lots = plot_df["Volume"] / 1000
@@ -1168,7 +1218,7 @@ def draw_flow_panel(ax, plot_df, x, stock_flow, spans, ticks, tick_labels):
     keys = list(plot_df.index.strftime("%Y/%m/%d"))
     buy = np.array([stock_flow.get(k, (0.0, 0.0))[0] for k in keys], dtype=float) / 1e4
     sell = np.array([stock_flow.get(k, (0.0, 0.0))[1] for k in keys], dtype=float) / 1e4
-    for _r, s_idx, e_idx in spans:
+    for s_idx, e_idx in _span_union(spans):
         ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
     ax.bar(x, buy, color=RED, width=0.72, alpha=0.85, zorder=3)
     ax.bar(x, -sell, color=GREEN, width=0.72, alpha=0.85, zorder=3)
@@ -1277,11 +1327,14 @@ def build_full_cards(chart_rounds):
     avg_w = _mean([r["warrant_pct"] for r in closed])
     avg_s = _mean([r["stock_pct"] for r in closed])
     top = max(chart_rounds, key=lambda r: class_rank(r["max_class"]))
-    pnl_sub = f"勝率 {wins / len(closed):.0%}（已出清 {len(closed)} 段）" if closed else "含減碼中已賣出部分"
-    avg_sub = "已出清波段平均" if closed else "選到的波段尚未出清"
+    # 逐筆模式的區間會重疊，最後一筆不一定最晚出清，起訖要取最小／最大。
+    first_start = min(r["start"] for r in chart_rounds)
+    last_end = max(r["end"] for r in chart_rounds)
+    pnl_sub = f"勝率 {wins / len(closed):.0%}（已出清 {len(closed)} {ROUND_UNIT}）" if closed else "含減碼中已賣出部分"
+    avg_sub = "已出清紀錄平均" if closed else "選到的紀錄尚未出清"
     return [
-        ("波段數", f"{len(chart_rounds)} 段",
-         f"{chart_rounds[0]['start'][2:]} → {chart_rounds[-1]['end'][2:]}", NAVY),
+        ("波段數" if REPLAY_MERGE_ROUNDS else "大額買進次數", f"{len(chart_rounds)} {ROUND_UNIT}",
+         f"{first_start[2:]} → {last_end[2:]}", NAVY),
         ("權證總買進", fmt_wan(sum(r["total_cost"] for r in chart_rounds)),
          f"最大 {top['max_class_text']}", RED),
         ("權證已實現損益", fmt_wan_signed(pnl), pnl_sub, pct_color(pnl)),
@@ -1299,7 +1352,11 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
                         habit_text, stock_flow, title, subtitle_prefix, cards, highlight_ids,
                         full_mode, right_text):
     """分段與整段共用的出圖流程。chart_rounds 必須依時間排序。"""
-    plot_df = slice_window(kdf, chart_rounds[0]["start"], chart_rounds[-1]["end"])
+    plot_df = slice_window(
+        kdf,
+        min(r["start"] for r in chart_rounds),
+        max(r["end"] for r in chart_rounds),
+    )
     if plot_df is None:
         log(f"⚠️ {stock_code}｜{title} 找不到對應的日 K，略過")
         return None
@@ -1350,7 +1407,7 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
         ("marker", GREEN, f"賣出權證（≥{fmt_wan(REPLAY_SELL_MARK_MIN_AMOUNT)}／出清）", "v"),
     ]
     if full_mode:
-        line1_items.append(("box", NAVY, "#N 波段編號", None))
+        line1_items.append(("box", NAVY, "#N＝下方表格編號", None))
     line2_items = [
         ("line", RED, _ma_label("5MA", plot_df["MA5"]), "-"),
         ("line", ORANGE, _ma_label("10MA", plot_df["MA10"]), "-"),
@@ -1359,7 +1416,7 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
         ("line", MUTED, "布林通道", "--"),
     ]
     draw_candle_head(axes["candle_head"], "股價趨勢｜K線、均線、布林", line1_items, line2_items, right_text)
-    draw_candle_panel(axes["candle"], plot_df, x, spans, full_mode, ticks, tick_labels)
+    draw_candle_panel(axes["candle"], plot_df, x, spans, full_mode, ticks, tick_labels, stock_flow)
 
     draw_panel_head(axes["volume_head"], "成交量（張）", [
         ("line", BLUE, "5日均量", "-"),
@@ -1374,7 +1431,8 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
     ])
     draw_flow_panel(axes["flow"], plot_df, x, stock_flow, spans, ticks, tick_labels)
 
-    draw_panel_head(axes["table_head"], f"{broker_label} 在 {stock_code} {stock_name} 的歷次波段")
+    table_kind = "歷次波段" if REPLAY_MERGE_ROUNDS else "歷次大額買進與出場"
+    draw_panel_head(axes["table_head"], f"{broker_label} 在 {stock_code} {stock_name} 的{table_kind}")
     draw_table_panel(axes["table"], table_rounds, highlight_ids, habit_text, footnote, table_ratio)
 
     add_center_watermarks(fig)
@@ -1405,17 +1463,19 @@ def plot_segment(stock_code, stock_name, broker_label, kdf, rnd, rounds, habit_t
 
 def plot_full(stock_code, stock_name, broker_label, kdf, chart_rounds, rounds, habit_text, stock_flow):
     first, last = chart_rounds[0], chart_rounds[-1]
+    first_start = min(r["start"] for r in chart_rounds)
+    last_end = max(r["end"] for r in chart_rounds)
     if len(chart_rounds) == len(rounds):
-        scope = f"全部 {len(rounds)} 段"
+        scope = f"全部 {len(rounds)} {ROUND_UNIT}"
         highlight_ids = set()  # 全部都選時整張表都亮等於沒亮，不標。
     elif len(chart_rounds) == 1:
-        scope = f"波段 #{first['no']}"
+        scope = f"#{first['no']}"
         highlight_ids = {id(first)}
     else:
-        scope = f"波段 #{first['no']}～#{last['no']}（選 {len(chart_rounds)} 段）"
+        scope = f"#{first['no']}～#{last['no']}（選 {len(chart_rounds)} {ROUND_UNIT}）"
         highlight_ids = {id(r) for r in chart_rounds}
 
-    last_bar = kdf[kdf.index.strftime("%Y/%m/%d") <= last["end"]]
+    last_bar = kdf[kdf.index.strftime("%Y/%m/%d") <= last_end]
     right_text = ""
     if len(last_bar) >= 2:
         close, prev = float(last_bar["Close"].iloc[-1]), float(last_bar["Close"].iloc[-2])
@@ -1427,7 +1487,7 @@ def plot_full(stock_code, stock_name, broker_label, kdf, chart_rounds, rounds, h
         stock_code=stock_code, stock_name=stock_name, broker_label=broker_label, kdf=kdf,
         chart_rounds=chart_rounds, rounds=rounds, habit_text=habit_text, stock_flow=stock_flow,
         title=f"{stock_code} {stock_name}｜{broker_label} 整段複盤",
-        subtitle_prefix=f"{scope}：{first['start']} → {last['end']}",
+        subtitle_prefix=f"{scope}：{first_start} → {last_end}",
         cards=build_full_cards(chart_rounds),
         highlight_ids=highlight_ids,
         full_mode=True,
@@ -1605,7 +1665,10 @@ def run_broker_replay():
     mode_label = "＋".join(label for key, label in (("segment", "分段"), ("full", "整段")) if key in chart_modes)
     log("=" * 100)
     log("啟動：分點權證波段複盤 K 線圖")
-    log(f"出圖方式：{mode_label}｜波段選擇：{REPLAY_ROUNDS or '全部'}｜最低級距：{REPLAY_MIN_CLASS}")
+    log(
+        f"出圖方式：{mode_label}｜切法：{'合併' if REPLAY_MERGE_ROUNDS else '逐筆'}｜"
+        f"選擇：{REPLAY_ROUNDS or '全部'}｜最低級距：{REPLAY_MIN_CLASS}"
+    )
     log("=" * 100)
 
     bt = load_backtest_module()
@@ -1634,7 +1697,7 @@ def run_broker_replay():
     image_count = 0
 
     for stock_code in stock_codes:
-        rounds = [summarize_round(r, latest_key, flow_df, stock_code) for r in group_rounds(events, stock_code)]
+        rounds = [summarize_round(r, latest_key) for r in group_rounds(events, stock_code)]
         rounds = [
             r for r in rounds
             if class_rank(r["max_class"]) >= class_rank(REPLAY_MIN_CLASS)
@@ -1666,7 +1729,7 @@ def run_broker_replay():
         selected_ids = {id(r) for r in selected}
         stock_meta[stock_code] = {"habit": habit, "full_images": []}
 
-        log(f"📊 {stock_code} {stock_name}｜共 {len(rounds)} 段｜本次選 {len(selected)} 段｜{habit}")
+        log(f"📊 {stock_code} {stock_name}｜共 {len(rounds)} {ROUND_UNIT}｜本次選 {len(selected)} {ROUND_UNIT}｜{habit}")
         for r in rounds:
             log(f"   {'✅' if id(r) in selected_ids else '  '} {format_round_line(r)}")
         append_step_summary(broker_label, stock_code, stock_name, rounds, selected_ids)
@@ -1705,9 +1768,11 @@ def run_broker_replay():
                 buf = None
             if buf is not None:
                 first, last = selected[0], selected[-1]
+                first_start = min(r["start"] for r in selected)
+                last_end = max(r["end"] for r in selected)
                 full_name = (
                     f"{stock_code}_full_{first['no']:02d}-{last['no']:02d}_"
-                    f"{first['start'].replace('/', '')}_{last['end'].replace('/', '')}.png"
+                    f"{first_start.replace('/', '')}_{last_end.replace('/', '')}.png"
                 )
                 save_png(buf, out_dir, full_name)
                 stock_meta[stock_code]["full_images"].append(full_name)
@@ -1716,7 +1781,7 @@ def run_broker_replay():
                     buf,
                     full_name,
                     f"📊 {stock_code} {stock_name}｜{broker_label} 整段複盤 #{first['no']}～#{last['no']}\n"
-                    f"{first['start']} → {last['end']}｜{habit}",
+                    f"{first_start} → {last_end}｜{habit}",
                 )
 
         records.extend(round_to_record(broker_label, broker_code, stock_code, r) for r in rounds)
