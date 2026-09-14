@@ -65,9 +65,17 @@ on:
           - "分段＋整段都要"
         default: "分段（每次買賣各一張）"
       rounds:
-        description: "第幾次買賣：最新／全部／3／1,3／2-4／近3（最近三段）／-2（倒數第二段）；編號看上一次執行的 Summary 頁"
+        description: "第幾次買賣：最新／全部／3／1,3／2-4／近3（近五、第3次也可）／-2（倒數第二次）；編號看上一次執行的 Summary 頁"
         required: false
         default: "最新"
+      round_split:
+        description: "怎麼算一次：逐筆＝每次大額買進各算一次（對應 ABCDE 表每一列）；合併＝還沒出清前的加碼併成一段"
+        required: false
+        type: choice
+        options:
+          - "逐筆（每次大額買進各算一次）"
+          - "合併（沒出清前的加碼併成一段）"
+        default: "逐筆（每次大額買進各算一次）"
       min_class:
         description: "只看最大級距達到這一級以上的波段（A=100萬起、B=160萬、C=250萬、D=500萬、E=1000萬）；編號會依篩選後重排"
         required: false
@@ -131,6 +139,7 @@ jobs:
       REPLAY_STOCKS: ${{ inputs.stock_codes }}
       REPLAY_CHART_MODE: ${{ inputs.chart_mode }}
       REPLAY_ROUNDS: ${{ inputs.rounds }}
+      REPLAY_ROUND_SPLIT: ${{ inputs.round_split }}
       REPLAY_MIN_CLASS: ${{ inputs.min_class }}
       REPLAY_INCLUDE_OPEN: "1"
       REPLAY_MAX_STOCKS: "10"
@@ -145,12 +154,13 @@ jobs:
       REPLAY_LEVERAGE_MIN_STOCK_PCT: "1.0"
       # K 線只畫單日賣出 ≥ 這個金額的 ▼（出清日一律畫）；小額分批賣出看下方權證買賣面板。
       REPLAY_SELL_MARK_MIN_AMOUNT: "1000000"
-      # 每段最多幾個賣出日加文字（金額大的優先）；整段圖段數多，每段標少一點。
+      # 最多幾個「非出清」賣出日加文字（金額大的優先，出清日一律標）。
+      # 分段圖＝單一筆的上限；整段圖＝整張圖合計上限（同一天只標一次）。
       REPLAY_SELL_LABEL_MAX: "8"
-      REPLAY_FULL_SELL_LABEL_MAX: "2"
+      REPLAY_FULL_SELL_LABEL_MAX: "4"
       # K 線上下標籤帶先開幾列；擠不下會左右找空位，真的沒空位才再加列，字不會重疊。
       REPLAY_LANE_MAX_ROWS: "4"
-      REPLAY_TABLE_MAX_ROWS: "12"
+      REPLAY_TABLE_MAX_ROWS: "15"
       REPLAY_SHOW_VOLUME_PROFILE: "1"
       REPLAY_HTML_INDEX_ENABLE: "1"
       REPLAY_MAX_ALLOWED_PRICE_ERRORS: "3"
