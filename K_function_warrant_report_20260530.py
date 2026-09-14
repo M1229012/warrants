@@ -85,6 +85,17 @@ TPEX_WARRANT_REGISTRY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_
 TWSE_STOCK_REGISTRY_OPENAPI_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TPEX_STOCK_REGISTRY_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 TWSE_HOLIDAY_OPENAPI_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?response=json&year={year}"
+# 官方參考資料抓不到時，允許改用「最後一份好副本」的天數上限。
+# 休市表是整年度的固定行程，一年內幾乎不變（颱風假是例外，但少列假日只會多查
+# 一天「當天無成交」，不會漏抓），所以可以放很長。
+WARRANT_HOLIDAY_SCHEDULE_STALE_MAX_DAYS = max(
+    0, int(os.getenv("WARRANT_HOLIDAY_SCHEDULE_STALE_MAX_DAYS", "400"))
+)
+# 股票代號→簡稱：用來比對權證的標的。更名極少，但一旦改名，舊名稱可能漏配權證，
+# 所以用了舊副本時本次會標記為不完整。
+WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS = max(
+    0, int(os.getenv("WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS", "30"))
+)
 
 
 # ============================================================
@@ -2879,6 +2890,101 @@ OPENAPI_RESUMABLE_MAX_RESUMES = max(
 )
 
 
+# 大檔案平行分段下載（預設關閉）。
+# 原本預期把 14MB 的 TPEx 上櫃名冊切成 1MB 小段、4 條同時抓會更快，但實測
+# 2026-09-14 結果相反：4 條同時連線時 TPEx 切得更兇，第一段 1MB 試 8 次只拿到
+# 201KB；同一時間改用單條逐段續傳，重連 6 次、6.6 秒就完整拿到。
+# 因此預設只用逐段續傳（失敗時也會自動退回它）。要試平行下載時，把門檻設成
+# 位元組數（例如 3145728），並可調整 OPENAPI_PARALLEL_RANGE_WORKERS。
+OPENAPI_PARALLEL_RANGE_THRESHOLD = max(
+    0, int(os.getenv("OPENAPI_PARALLEL_RANGE_THRESHOLD", "0"))
+)
+OPENAPI_PARALLEL_RANGE_CHUNK = max(
+    64 * 1024, int(os.getenv("OPENAPI_PARALLEL_RANGE_CHUNK", str(1024 * 1024)))
+)
+OPENAPI_PARALLEL_RANGE_WORKERS = max(
+    1, int(os.getenv("OPENAPI_PARALLEL_RANGE_WORKERS", "4"))
+)
+
+
+def _fetch_range_with_resume(url, headers, timeout, start: int, end: int, max_attempts: int = 8):
+    """抓 [start, end] 這一段（含 end）；中途斷掉就從斷點接著抓。回傳 (bytes, 額外重連次數)。"""
+    expected = end - start + 1
+    buf = bytearray()
+    attempts = 0
+    while len(buf) < expected:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                f"區段 {start}-{end} 重試 {max_attempts} 次仍不完整：{len(buf):,}/{expected:,}"
+            )
+        pos = start + len(buf)
+        req_headers = dict(headers or {})
+        req_headers["Range"] = f"bytes={pos}-{end}"
+        before = len(buf)
+        resp = _requests_get_with_aia_fallback(
+            get_thread_session(), url, headers=req_headers, timeout=timeout, stream=True
+        )
+        try:
+            content_range = str(resp.headers.get("Content-Range", "") or "")
+            encoding = str(resp.headers.get("Content-Encoding", "") or "").strip().lower()
+            if resp.status_code != 206 or not content_range.startswith(f"bytes {pos}-"):
+                raise RuntimeError(f"伺服器未照 Range 回應：HTTP {resp.status_code}｜{content_range or '-'}")
+            if encoding not in ("", "identity"):
+                raise RuntimeError(f"區段回應被壓縮（{encoding}），無法拼接")
+            raw = getattr(resp, "raw", None)
+            if raw is not None and hasattr(raw, "enforce_content_length"):
+                try:
+                    raw.enforce_content_length = False
+                except Exception:
+                    pass
+            for chunk in resp.iter_content(65536):
+                if chunk:
+                    buf.extend(chunk)
+                    if len(buf) > expected:
+                        raise RuntimeError(f"區段 {start}-{end} 回傳超過預期長度")
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if len(buf) == before:
+            time.sleep(0.3 * attempts)
+    return bytes(buf), attempts - 1
+
+
+def _download_ranges_parallel(url, headers, timeout, total: int) -> bytes:
+    """把整個檔案切成固定大小的區段平行下載，最後依序拼回並核對總長度。"""
+    chunk = max(64 * 1024, int(OPENAPI_PARALLEL_RANGE_CHUNK))
+    ranges = [(start, min(start + chunk, total) - 1) for start in range(0, total, chunk)]
+    started = time.perf_counter()
+    extra = [0]
+    lock = threading.Lock()
+
+    def _one(rng):
+        data, used = _fetch_range_with_resume(url, headers, timeout, rng[0], rng[1])
+        with lock:
+            extra[0] += used
+        return rng[0], data
+
+    parts = {}
+    workers = max(1, min(OPENAPI_PARALLEL_RANGE_WORKERS, len(ranges)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for start, data in executor.map(_one, ranges):
+            parts[start] = data
+    out = b"".join(parts[start] for start, _ in ranges)
+    if len(out) != total:
+        raise RuntimeError(f"平行分段下載長度不符：{len(out):,}/{total:,}")
+    host = urllib.parse.urlsplit(url).hostname or url
+    print(
+        f"📦 平行分段下載：{host}｜{total / 1_000_000:.1f}MB｜{len(ranges)} 段 × {workers} 條｜"
+        f"額外重連 {extra[0]} 次｜{time.perf_counter() - started:.1f} 秒"
+    )
+    return out
+
+
 def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None, max_resumes=None) -> bytes:
     """下載完整內容；連線中途被切斷時，用 Range 從斷點接著抓。
 
@@ -2898,10 +3004,14 @@ def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None,
     resumable = False
     last_error = None
     zero_progress = 0
+    parallel_tried = False
+    resumes_used = 0
+    started = time.perf_counter()
     for _attempt in range(max_resumes + 1):
         resuming = bool(buf) and resumable
         req_headers = dict(base_headers)
         if resuming:
+            resumes_used += 1
             req_headers["Range"] = f"bytes={len(buf)}-"
         else:
             buf = bytearray()
@@ -2930,6 +3040,28 @@ def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None,
                 plain = encoding in ("", "identity")
                 expected_total = int(length) if (plain and length.isdigit()) else None
                 resumable = bool(expected_total)
+                if (
+                    resumable
+                    and not parallel_tried
+                    and OPENAPI_PARALLEL_RANGE_THRESHOLD > 0
+                    and expected_total >= OPENAPI_PARALLEL_RANGE_THRESHOLD
+                    and "bytes" in str(resp.headers.get("Accept-Ranges", "") or "").lower()
+                ):
+                    # 大檔案：不等這條可能中途被切斷的長連線，直接改成平行分段下載。
+                    parallel_tried = True
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    try:
+                        return _download_ranges_parallel(url, base_headers, timeout, expected_total)
+                    except Exception as exc:
+                        print(
+                            f"⚠️ 平行分段下載失敗，改用逐段續傳：{type(exc).__name__}: {exc}"
+                        )
+                        buf = bytearray()
+                        last_error = exc
+                        continue
             if resumable:
                 # urllib3 預設在「收到的長度不足 Content-Length」時丟出 IncompleteRead，
                 # 而且會把這次已經讀進緩衝區、還沒交給呼叫端的位元組一起丟掉。
@@ -2957,6 +3089,12 @@ def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None,
 
         progress = len(buf) - before
         if not broke and (expected_total is None or len(buf) == expected_total):
+            if resumes_used:
+                host = urllib.parse.urlsplit(url).hostname or url
+                print(
+                    f"📦 斷點續傳完成：{host}｜{len(buf) / 1_000_000:.1f}MB｜"
+                    f"重連 {resumes_used} 次｜{time.perf_counter() - started:.1f} 秒"
+                )
             return bytes(buf)
         if expected_total is not None and len(buf) > expected_total:
             # 比宣告的長度還多：內容已不可信，從頭來。
@@ -2987,37 +3125,68 @@ def _requests_get_bytes_resumable(session, url: str, headers=None, timeout=None,
     )
 
 
-def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
-    """抓取官方 OpenAPI，針對暫時性斷線重試並回傳明確成功狀態。
+# ------------------------------------------------------------------
+# 官方參考資料的共用抓取：重試 → 最後一份好副本 → 由呼叫端決定安全替代
+#
+# 過去每個官方來源各有一套抓法：有的會重試、有的有磁碟備份、有的只試一次就讓
+# 整份報表失敗（2026-09-14 TWSE 休市表回了一頁不是 JSON 的內容，只試一次就中止）。
+# 這裡統一成一條路，所有「抓不到就會讓報表停下來」的官方來源都走這裡：
+#   1. 憑證鏈補抓＋斷點續傳＋多次重試（含退避）
+#   2. 回應不是 JSON、或格式驗證不過（維護頁、擋爬蟲頁）一律視為可重試的失敗，
+#      錯誤訊息附上實際收到內容的開頭，方便判斷是哪一種狀況
+#   3. 成功就存成「最後一份好副本」；全部失敗時，副本在允許天數內就改用它
+# ------------------------------------------------------------------
+# 本次執行中改用了舊副本、而且會影響資料完整度的來源：{來源名稱: 幾天前}。
+# 外層據此決定能不能寫完整快照。
+_STALE_REFERENCE_SOURCES: Dict[str, int] = {}
+_STALE_REFERENCE_LOCK = threading.Lock()
 
-    回傳值：
-    - data：官方 JSON list。
-    - fetch_ok：是否成功取得且解析為 list。
-    - error_text：最後一次失敗原因。
 
-    官方來源抓取失敗不能等同於「官方尚未發布」，因此呼叫端必須使用
-    fetch_ok 區分網路錯誤與真正沒有目標日資料。
+def _mark_reference_stale(source_name: str, age_days: int) -> None:
+    with _STALE_REFERENCE_LOCK:
+        _STALE_REFERENCE_SOURCES[str(source_name)] = int(age_days)
+
+
+def _describe_non_json_body(raw_bytes: bytes) -> str:
+    """把「不是 JSON」的回應整理成一小段可讀文字（通常是維護頁或擋爬蟲頁）。"""
+    text = (raw_bytes or b"")[:600].decode("utf-8", "ignore")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:80] or f"（空白內容，{len(raw_bytes or b'')} bytes）"
+
+
+def fetch_official_json(
+    url: str,
+    source_name: str,
+    *,
+    validate=None,
+    cache_name: str | None = None,
+    max_stale_days: int = 0,
+    headers: dict | None = None,
+):
+    """抓官方 JSON，回傳 ``(payload, ok, error_text, stale_age_days)``。
+
+    - ``validate(payload)``：回傳空字串／None 代表格式正確；回傳錯誤說明代表要重試。
+    - ``cache_name``：成功時存成最後一份好副本；全部失敗且副本在 ``max_stale_days``
+      天內時改用副本，``stale_age_days`` 為副本的天數（新抓成功時為 None）。
+    - 抓取失敗不能等同「官方尚未發布」，呼叫端必須看 ``ok``。
     """
     max_attempts = max(2, int(FINMIND_REQUEST_RETRIES))
     last_error = ""
     for attempt in range(1, max_attempts + 1):
         session = None
+        close_session = False
         try:
-            request_headers = dict(OPENAPI_WARRANT_HEADERS)
-            # 串流截斷改由 _requests_get_bytes_resumable 的 Range 斷點續傳處理。
-            # 原本「截斷時改用 identity 重試」實測無效：TPEx 不論哪種 Accept-Encoding
-            # 都會在前 16～106KB 切斷連線，identity 只是剛好出現在失敗的重試上。
+            request_headers = dict(headers or OPENAPI_WARRANT_HEADERS)
+            # 串流截斷由斷點續傳處理；不再切換 identity（實測無效）。
             request_headers["Accept-Encoding"] = "gzip, deflate"
             request_headers["Connection"] = "close"
-            # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的
-            # keep-alive 連線持續觸發 Response ended prematurely。
+            # 第一次沿用執行緒 Session；重試改用全新 Session，避免壞掉的 keep-alive 連線。
             if attempt == 1:
                 session = get_thread_session()
-                close_session = False
             else:
                 session = requests.Session()
                 close_session = True
-
             try:
                 raw_bytes = _requests_get_bytes_resumable(
                     session,
@@ -3025,30 +3194,82 @@ def fetch_openapi_json(url: str, source_name: str) -> tuple[list, bool, str]:
                     headers=request_headers,
                     timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
                 )
-                data = json.loads(raw_bytes.decode("utf-8-sig"))
             finally:
                 if close_session and session is not None:
                     session.close()
-
-            if not isinstance(data, list):
-                raise RuntimeError(f"官方回應不是 list：type={type(data).__name__}")
-
-            print(f"✅ {source_name} OpenAPI：{len(data):,} 筆")
-            return data, True, ""
+            try:
+                payload = json.loads(raw_bytes.decode("utf-8-sig"))
+            except Exception:
+                raise RuntimeError(
+                    "回應不是 JSON（可能是維護頁或擋爬蟲頁）："
+                    + _describe_non_json_body(raw_bytes)
+                )
+            if validate is not None:
+                problem = validate(payload)
+                if problem:
+                    raise RuntimeError(f"官方回應格式不正確：{problem}")
+            if cache_name:
+                _finmind_write_reference_json(cache_name, payload)
+            return payload, True, "", None
         except Exception as exc:
             last_error = str(exc or type(exc).__name__)
             if attempt < max_attempts:
                 wait_sec = min(8.0, FINMIND_RETRY_BASE_WAIT * attempt)
-                fallback_note = ""
                 print(
-                    f"⚠️ {source_name} OpenAPI 暫時失敗，準備重試 "
-                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}{fallback_note}"
+                    f"⚠️ {source_name} 暫時失敗，準備重試 "
+                    f"{attempt}/{max_attempts - 1}｜等待 {wait_sec:.1f} 秒｜{last_error}"
                 )
                 time.sleep(wait_sec)
                 continue
-            print(f"⚠️ {source_name} OpenAPI 抓取失敗：{last_error}")
+            print(f"⚠️ {source_name} 抓取失敗：{last_error}")
 
-    return [], False, last_error
+    if cache_name and max_stale_days > 0:
+        age = _finmind_reference_json_age_days(cache_name)
+        if age is not None and age <= max_stale_days:
+            payload = _finmind_read_reference_json(cache_name, max_age_days=max_stale_days)
+            if payload is not None:
+                print(
+                    f"⚠️ {source_name} 改用 {age} 日前的最後一份好副本｜"
+                    f"本次來源狀況：{last_error[:100]}"
+                )
+                return payload, True, "", age
+    return None, False, last_error, None
+
+
+def _official_stock_registry_cache_name(source_name: str) -> str:
+    """上市／上櫃股票基本資料的最後一份好副本檔名（兩個查詢函式共用）。"""
+    return "official_stock_registry_tpex" if "上櫃" in str(source_name) else "official_stock_registry_twse"
+
+
+def fetch_openapi_json(
+    url: str,
+    source_name: str,
+    cache_name: str | None = None,
+    max_stale_days: int = 0,
+) -> tuple[list, bool, str]:
+    """抓取官方 OpenAPI（回應必須是 list），回傳 ``(data, fetch_ok, error_text)``。
+
+    重試、憑證鏈補抓、斷點續傳、非 JSON 偵測全部交給 fetch_official_json。
+    有給 ``cache_name`` 時：成功就存最後一份好副本；抓不到時改用天數內的副本，
+    並記錄到 _STALE_REFERENCE_SOURCES（會讓本次標記為不完整）。
+    每日變動的資料（例如當日成交檔）不要給 cache_name——舊的一天不能冒充今天。
+
+    官方來源抓取失敗不能等同於「官方尚未發布」，呼叫端必須使用 fetch_ok 區分。
+    """
+    payload, ok, error, stale_age = fetch_official_json(
+        url,
+        source_name,
+        validate=lambda p: "" if isinstance(p, list) else f"官方回應不是 list：type={type(p).__name__}",
+        cache_name=cache_name,
+        max_stale_days=max_stale_days,
+    )
+    if not ok:
+        return [], False, error
+    if stale_age is not None:
+        _mark_reference_stale(source_name, stale_age)
+    else:
+        print(f"✅ {source_name} OpenAPI：{len(payload):,} 筆")
+    return payload, True, ""
 
 
 _OFFICIAL_STOCK_NAME_CACHE = None
@@ -3068,7 +3289,12 @@ def _official_stock_name_from_source(
     整份報告卡住數十秒。這裡維持官方來源與嚴格驗證，但先查 TWSE，查無
     目標代號才查 TPEx；上市股票因此不必等待另一個市場的網路傳輸。
     """
-    rows, ok, error = fetch_openapi_json(url, source_name)
+    rows, ok, error = fetch_openapi_json(
+        url,
+        source_name,
+        cache_name=_official_stock_registry_cache_name(source_name),
+        max_stale_days=WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS,
+    )
     if not ok:
         return "", error or "官方 OpenAPI 讀取失敗"
     for row in rows:
@@ -3099,7 +3325,13 @@ def _official_stock_name_map() -> Dict[str, str]:
         failures = []
         with ThreadPoolExecutor(max_workers=len(sources)) as executor:
             future_map = {
-                executor.submit(fetch_openapi_json, url, label): (label, code_col, name_col)
+                executor.submit(
+                    fetch_openapi_json,
+                    url,
+                    label,
+                    _official_stock_registry_cache_name(label),
+                    WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS,
+                ): (label, code_col, name_col)
                 for url, label, code_col, name_col in sources
             }
             results = []
@@ -15097,6 +15329,23 @@ def _finmind_read_reference_json(cache_name: str, max_age_days: int):
         return None
 
 
+def _finmind_reference_json_age_days(cache_name: str) -> int | None:
+    """JSON 參考副本距今幾天；不存在或讀不到回 None。"""
+    path = _finmind_reference_json_path(cache_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        updated = pd.to_datetime(payload.get("updated_at", ""), errors="coerce")
+        if pd.isna(updated):
+            return None
+        updated = pd.Timestamp(updated).tz_localize(None).normalize()
+        return int((get_taipei_today_ts() - updated).days)
+    except Exception:
+        return None
+
+
 def _finmind_write_reference_json(cache_name: str, data):
     path = _finmind_reference_json_path(cache_name)
     _ensure_dir(FINMIND_REFERENCE_CACHE_DIR)
@@ -15957,6 +16206,17 @@ def _twse_holiday_row_is_trading_day(name: str, note: str = "") -> bool:
     return False
 
 
+def _validate_twse_holiday_payload(payload) -> str:
+    """證交所休市表格式檢查；回空字串代表正確。"""
+    if not isinstance(payload, dict):
+        return f"不是物件（{type(payload).__name__}）"
+    if str(payload.get("stat", "")).lower() != "ok":
+        return f"stat={payload.get('stat')!r}"
+    if not isinstance(payload.get("data"), list):
+        return "缺少 data 清單"
+    return ""
+
+
 def _get_official_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
     """以 TWSE 官方休市表建立交易日，不使用 FinMind。
 
@@ -15988,17 +16248,20 @@ def _get_official_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
 
     holidays = set()
     official_trading_days = set()
+    holiday_fallback_years = []
     for year in range(start_ts.year, end_ts.year + 1):
         url = TWSE_HOLIDAY_OPENAPI_URL.format(year=year)
         try:
-            response = get_thread_session().get(
-                url, headers=OPENAPI_WARRANT_HEADERS,
-                timeout=(max(8.0, FINMIND_CONNECT_TIMEOUT), max(30.0, FINMIND_READ_TIMEOUT)),
+            # 走共用抓取層：重試、非 JSON 偵測、最後一份好副本（原本只試一次就中止）。
+            payload, ok, error, stale_age = fetch_official_json(
+                url,
+                f"TWSE 休市表（{year}）",
+                validate=_validate_twse_holiday_payload,
+                cache_name=f"twse_holiday_schedule_{year}",
+                max_stale_days=WARRANT_HOLIDAY_SCHEDULE_STALE_MAX_DAYS,
             )
-            response.raise_for_status()
-            payload = response.json()
-            if str(payload.get("stat", "")).lower() != "ok" or not isinstance(payload.get("data"), list):
-                raise RuntimeError("官方休市表格式不正確")
+            if not ok:
+                raise RuntimeError(error or "官方休市表讀取失敗")
             for row in payload["data"]:
                 if isinstance(row, dict):
                     cells = [row.get("日期", ""), row.get("名稱", ""), row.get("說明", "")]
@@ -16024,7 +16287,15 @@ def _get_official_trading_dates(start_date, end_date) -> List[pd.Timestamp]:
                     continue
                 holidays.add(pd.Timestamp(dt).normalize())
         except Exception as exc:
-            raise RuntimeError(f"TWSE 官方休市表讀取失敗（{year}）：{exc}") from exc
+            # 抓不到、也沒有可用副本：這一年改用平日（週一～五）推估。
+            # 國定假日會被當成交易日，但依本函式的設計只會多出「查無成交」的日期，
+            # 不會漏掉真正的交易日——多查是安全的，少查才會少算。
+            holiday_fallback_years.append(year)
+            print(
+                f"⚠️ TWSE 休市表（{year}）抓不到、也沒有可用副本，改用平日推估交易日｜"
+                f"原因：{str(exc)[:120]}｜國定假日會被當成交易日，"
+                "只會多查到「當天無成交」，不會漏抓真正的交易日"
+            )
 
     candidates = set(pd.Timestamp(day).normalize() for day in pd.bdate_range(start_ts, end_ts))
     candidates |= {
@@ -21555,12 +21826,15 @@ def fetch_warrant_events_full_market(stock_code: str, stock_name: str, start_dat
             # 只要有任何一支權證抓失敗就視為當次不完整，不寫回完整快照，
             # 避免把缺角的資料標成 complete 蓋掉試算表裡原本正確的快照。
             # 權證清單若用了舊的名冊副本，可能漏掉這幾天新掛牌的權證 → 同樣視為不完整。
-            registry_stale = bool(_OFFICIAL_REGISTRY_STALE_INFO)
+            # 股票名冊等「會影響權證比對」的參考資料若改用了舊副本，同樣視為不完整。
+            # （休市表不在此列：少列假日只會多查一天無成交，不影響完整度。）
+            registry_stale = bool(_OFFICIAL_REGISTRY_STALE_INFO) or bool(_STALE_REFERENCE_SOURCES)
             failed_dates = 1 if (
                 api4_failed or api5_failed or api4_incomplete_but_continued or registry_stale
             ) else 0
             stats = {
                 "registry_stale_markets": dict(_OFFICIAL_REGISTRY_STALE_INFO),
+                "stale_reference_sources": dict(_STALE_REFERENCE_SOURCES),
                 "total_dates": len(trading_dates),
                 "success_dates": len(event_days),
                 "empty_dates": max(0, len(trading_dates) - len(event_days)),
