@@ -18,6 +18,15 @@
 第幾次買賣由 REPLAY_ROUNDS 指定（最新／全部／3／1,3／2-4／近3／-2）。
 編號在 log、GitHub Actions 的 Summary 頁與圖內表格都看得到；第一次可先跑「全部」看清單。
 
+版面規則（為什麼不直接用 kline_core.plot_onepage_kline）：
+- 買賣註解要「不遮 K 棒、彼此不重疊」。K 線面板上下各保留一條標籤帶：
+  買進標在最低價下方的標籤帶、賣出標在最高價上方的標籤帶，K 棒到三角形之間用虛線連起來。
+  每個標籤依實際像素寬度排位置，擠不下就換下一列，所以字不會疊在一起。
+- 均線 legend、進出場資訊都移到面板上方的標題列，不壓在 K 棒上。
+- K 線面板下方直接標日期，只看圖也知道是哪一天。
+- 卡片、標題等固定寬度的文字，都依實測寬度自動縮字，不會超出框線。
+K 棒、均線、價量分布、卡片配色、浮水印仍沿用 kline_core（與 K_function 週報同一套視覺）。
+
 資料來源（全部沿用既有程式，判斷規則不重寫）：
 1. 分點歷史：warrant_backtest_moneydj 的本機歷史快取
    CACHE_DIR/broker_warrant_history_cache.csv(.parquet)，保留最近 HISTORY_RETENTION_TRADING_DAYS 個交易日。
@@ -25,7 +34,7 @@
    ——A~E 金額強度分類＋跨事件 FIFO 扣減，與 Google Sheet ABCDE 表是同一套定義。
 3. K 線：同一支程式的 _pattern_moneydj_price_dataframe()（MoneyDJ czkc1 日 K，免 token）。
    這是回測模組的內部函式，回測那邊改名時這裡要跟著改。
-4. 版型：kline_core.py（從 K_function 週報抽出的一頁式 K 線），放在本檔同一個資料夾。
+4. 視覺元件：kline_core.py（從 K_function 週報抽出的一頁式 K 線），放在本檔同一個資料夾。
 
 波段定義：
 - 起點：ABCDE 事件日——分點對該股任一權證單日買進 ≥ 100 萬，且同日同標的累積達 A 級以上。
@@ -52,13 +61,14 @@ GitHub Actions 建議 secrets：
 - REPLAY_DISCORD_WEBHOOK_URL（或沿用 DISCORD_WEBHOOK_URL_TEST／DISCORD_WEBHOOK_URL）
 
 必要套件：
-pip install requests pandas numpy matplotlib pillow pyarrow
+pip install requests pandas numpy matplotlib pillow pyarrow openpyxl
 """
 
 import bisect
 import glob
 import html
 import importlib.util
+import math
 import os
 import re
 import sys
@@ -72,8 +82,9 @@ import requests
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from matplotlib.ticker import FuncFormatter
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import FancyBboxPatch, Rectangle
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 # kline_core.py 與本檔放在同一個資料夾（從 onepage-kline skill 複製過來）。
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -81,18 +92,29 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from kline_core import (  # noqa: E402
-    GRID,
+    BG,
+    BLUE,
+    BRAND_NOTE_TEXT,
+    FIG_WIDTH_DEFAULT,
     GREEN,
+    GRID,
+    LIME,
     MUTED,
     NAVY,
+    ORANGE,
+    PANEL,
+    PURPLE,
     RED,
-    BLUE,
+    ROW_HEIGHT_SCALE,
     TEXT,
-    adjust_stacked_ylim,
+    add_center_watermarks,
+    add_weighted_volume_profile_overlay,
+    adjust_volume_ylim,
     calculate_indicators,
     fig_to_png_buffer,
     normalize_ohlcv,
-    plot_onepage_kline,
+    plot_candles,
+    style_ax,
 )
 
 
@@ -141,10 +163,15 @@ REPLAY_STOCK_RETURN_ADJUSTED = os.getenv("REPLAY_STOCK_RETURN_ADJUSTED", "1").st
 # 現股漲跌幅絕對值小於這個 % 時不算「權證／現股倍數」：分母太小，倍數會失真到幾百倍。
 REPLAY_LEVERAGE_MIN_STOCK_PCT = max(0.1, float(os.getenv("REPLAY_LEVERAGE_MIN_STOCK_PCT", "1.0")))
 
-# 賣出天數很多時（分批出場），只有金額最大的前幾天加文字標籤，其餘只畫三角形，避免字疊成一團。
-# 整段圖一次有好幾段，每段只標更少的賣出日。出清日一律標。
-REPLAY_SELL_LABEL_MAX = max(1, int(os.getenv("REPLAY_SELL_LABEL_MAX", "6")))
-REPLAY_FULL_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_FULL_SELL_LABEL_MAX", "1")))
+# K 線上只畫單日賣出達這個金額的 ▼（出清日一律畫）。
+# 分批出場常一天只賣幾萬，全部畫會變成一整排三角形；小額賣出看下方權證買賣面板就好。
+REPLAY_SELL_MARK_MIN_AMOUNT = max(0.0, float(os.getenv("REPLAY_SELL_MARK_MIN_AMOUNT", "1000000")))
+# 每段最多幾個賣出日加文字（金額大的優先，出清日一律加）；其餘只畫三角形。
+# 整段圖一次有好幾段，每段只標更少。
+REPLAY_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_SELL_LABEL_MAX", "8")))
+REPLAY_FULL_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_FULL_SELL_LABEL_MAX", "2")))
+# K 線上下標籤帶最多先開幾列；再擠不下會左右找空位，真的沒有空位才再加列（寧可變高也不重疊）。
+REPLAY_LANE_MAX_ROWS = max(1, int(os.getenv("REPLAY_LANE_MAX_ROWS", "4")))
 # 歷次波段表格最多列幾段；超過時以本段為中心取前後各半。
 REPLAY_TABLE_MAX_ROWS = max(3, int(os.getenv("REPLAY_TABLE_MAX_ROWS", "12")))
 # 長區間的加權價量分布是逐列迴圈，趕時間可以關掉。
@@ -165,7 +192,26 @@ DISCORD_WEBHOOK_URL = (
 REPLAY_DISCORD_SLEEP_SECONDS = max(0.0, float(os.getenv("REPLAY_DISCORD_SLEEP_SECONDS", "1.5")))
 
 AMOUNT_CLASS_ORDER = "ABCDE"
-CANDLE_TITLE = "股價趨勢｜K線、均線、布林｜▲ 大額買進權證　▼ 賣出權證"
+
+# ============================================================
+# 圖片版面設定
+# ============================================================
+
+# 左右留白比 kline_core 寬一點：權證買賣面板左右各有一組 Y 軸刻度，
+# 原本 0.035 會讓左側「-1.5億」這類刻度貼到圖片邊緣。
+FIG_LEFT = 0.055
+FIG_RIGHT = 0.945
+DATE_TICK_FMT = "%y/%m/%d"
+DATE_TICK_MAX = 11
+# K 線標籤帶尺寸（吋）。22pt 字加底框約 0.48 吋高，列高 0.58 吋讓上下兩列之間還有空隙。
+LANE_FONT_SIZE = 22
+LANE_ROW_IN = 0.58
+LANE_MARKER_IN = 0.42
+LANE_GAP_IN = 0.16
+LANE_EDGE_IN = 0.10
+LANE_LABEL_PAD = 0.22     # 標籤底框留白（字級倍數），也是 bbox 的 pad
+LANE_LABEL_SPACING_IN = 0.14   # 同一列兩個標籤之間至少留的距離
+
 # (欄名, x 位置, 對齊)。x 用 transAxes 0~1，寬 28 吋長圖、25pt 字實測不會互相壓到。
 TABLE_COLUMNS = [
     ("#", 0.012, "left"),
@@ -688,7 +734,510 @@ def format_round_line(r) -> str:
 
 
 # ============================================================
-# 繪圖層
+# 繪圖層：量字與排版工具
+# ------------------------------------------------------------
+# 與 K_function 週報同一個做法：文字一律先用 renderer 量實際像素寬度再決定位置／字級，
+# 不用「幾個字」去猜，中英數混排才不會超框或互相壓到。
+# ============================================================
+
+def _renderer(fig):
+    return fig.canvas.get_renderer()
+
+
+def _ax_px(ax):
+    bb = ax.get_window_extent(renderer=_renderer(ax.figure))
+    return bb.width, bb.height
+
+
+def _text_px(ax, text, fontsize, fontweight="bold"):
+    tmp = ax.text(0, 0, text, transform=ax.transAxes, fontsize=fontsize, fontweight=fontweight, alpha=0)
+    bb = tmp.get_window_extent(renderer=_renderer(ax.figure))
+    tmp.remove()
+    return bb.width, bb.height
+
+
+def _text_span_axes(ax, text_obj):
+    """文字實際佔用的 x 範圍（axes 座標）。"""
+    bb = text_obj.get_window_extent(renderer=_renderer(ax.figure))
+    inv = ax.transAxes.inverted()
+    (x0, _y0), (x1, _y1) = inv.transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+    return x0, x1
+
+
+def fit_text(ax, x, y, text, max_width, fontsize, min_fontsize=14, fontweight="bold", **kwargs):
+    """在 axes 座標畫字；實際寬度超過 max_width（axes 寬度比例）就等比例縮字級。"""
+    ax_w, _ = _ax_px(ax)
+    width, _ = _text_px(ax, text, fontsize, fontweight)
+    limit = max(max_width, 0.01) * ax_w
+    if width > limit:
+        fontsize = max(min_fontsize, fontsize * limit / width * 0.98)
+    return ax.text(x, y, text, transform=ax.transAxes, fontsize=fontsize, fontweight=fontweight, **kwargs)
+
+
+def draw_legend_row(ax, x0, y, items, fontsize=25, max_x=1.0):
+    """在 axes 座標由左往右排圖例；寬度不夠時整排等比例縮小。回傳結束的 x。
+
+    items：[(kind, color, label, style)]，kind = line（style 為線型）／marker（style 為標記）／box。
+    """
+    if not items:
+        return x0
+    ax_w, ax_h = _ax_px(ax)
+    dpi = ax.figure.dpi
+    icon_w = 0.42 * dpi / ax_w
+    icon_gap = 0.10 * dpi / ax_w
+    item_gap = 0.34 * dpi / ax_w
+    widths = [_text_px(ax, label, fontsize)[0] / ax_w for _kind, _color, label, _style in items]
+    total = sum(icon_w + icon_gap + w for w in widths) + item_gap * (len(items) - 1)
+    scale = 1.0
+    if total > 0 and x0 + total > max_x:
+        scale = max(0.55, (max_x - x0) / total)
+
+    x = x0
+    for (kind, color, label, style), w in zip(items, widths):
+        iw = icon_w * scale
+        if kind == "line":
+            ax.plot([x, x + iw], [y, y], transform=ax.transAxes, color=color, linewidth=3.2,
+                    linestyle=style or "-", clip_on=False)
+        elif kind == "marker":
+            ax.scatter([x + iw / 2], [y], transform=ax.transAxes, marker=style, s=320 * scale,
+                       color=color, edgecolors="white", linewidths=1.2, clip_on=False, zorder=5)
+        else:
+            box_h = 0.24 * dpi / ax_h
+            ax.add_patch(Rectangle((x + iw * 0.12, y - box_h / 2), iw * 0.76, box_h, transform=ax.transAxes,
+                                   facecolor=color, edgecolor=color, alpha=0.85, clip_on=False))
+        ax.text(x + iw + icon_gap * scale, y, label, transform=ax.transAxes, fontsize=fontsize * scale,
+                fontweight="bold", color=TEXT, ha="left", va="center")
+        x += iw + (icon_gap + w + item_gap) * scale
+    return x - item_gap * scale
+
+
+def draw_header(ax, title, subtitle):
+    ax.set_axis_off()
+    ax_w, _ = _ax_px(ax)
+    brand_w = _text_px(ax, BRAND_NOTE_TEXT, 30)[0] / ax_w
+    ax.text(1.0, 0.72, BRAND_NOTE_TEXT, transform=ax.transAxes, ha="right", va="center",
+            fontsize=30, color=NAVY, fontweight="bold")
+    fit_text(ax, 0.0, 0.68, title, 1.0 - brand_w - 0.03, 68, color=NAVY, ha="left", va="center")
+    fit_text(ax, 0.0, 0.16, subtitle, 1.0, 32, min_fontsize=18, fontweight="normal",
+             color=MUTED, ha="left", va="center")
+
+
+def draw_cards(ax, cards):
+    """摘要卡片：白底圓角＋上緣藏青 band（同 kline_core），但三行字的位置與字級依卡片實際大小決定。"""
+    ax.set_axis_off()
+    n = max(len(cards), 1)
+    gap = 0.012
+    card_w = (1.0 - gap * (n - 1)) / n
+    y, h = 0.04, 0.92
+    _ax_w, ax_h = _ax_px(ax)
+    band_h = 0.26 * ax.figure.dpi / ax_h
+    for j, (label, value, sub, color) in enumerate(cards):
+        x = j * (card_w + gap)
+        box = FancyBboxPatch((x, y), card_w, h, transform=ax.transAxes,
+                             boxstyle="round,pad=0.000,rounding_size=0.02",
+                             facecolor=PANEL, edgecolor=NAVY, linewidth=1.25, zorder=1)
+        ax.add_patch(box)
+        # band 一定要裁到外框圓角，否則左右會露出方角。
+        band = Rectangle((x, y + h - band_h), card_w, band_h, transform=ax.transAxes,
+                         facecolor=NAVY, edgecolor=NAVY, linewidth=0, alpha=0.96, zorder=2)
+        band.set_clip_path(box)
+        ax.add_patch(band)
+        inner = card_w * 0.90
+        cx = x + card_w / 2
+        fit_text(ax, cx, y + h * 0.72, label, inner, 29, color=MUTED, ha="center", va="center", zorder=4)
+        fit_text(ax, cx, y + h * 0.44, value, inner, 44, color=color, ha="center", va="center", zorder=4)
+        if sub:
+            fit_text(ax, cx, y + h * 0.15, sub, inner, 23, min_fontsize=15, color=MUTED,
+                     ha="center", va="center", zorder=4)
+
+
+def draw_panel_head(ax, title, items=None, fontsize=34):
+    """面板標題列：左邊標題、右邊接圖例。圖例放在面板外，不壓到柱子或 K 棒。"""
+    ax.set_axis_off()
+    t = fit_text(ax, 0.0, 0.42, title, 0.62 if items else 1.0, fontsize, color=NAVY, ha="left", va="center")
+    if items:
+        draw_legend_row(ax, _text_span_axes(ax, t)[1] + 0.02, 0.42, items, 24, max_x=1.0)
+
+
+def draw_candle_head(ax, title, line1_items, line2_items, right_text):
+    """K 線標題列兩行：①標題＋三角形說明 ②均線圖例＋進出場資訊（原本壓在 K 線左上角的東西都搬到這裡）。"""
+    ax.set_axis_off()
+    t = fit_text(ax, 0.0, 0.74, title, 0.42, 38, color=NAVY, ha="left", va="center")
+    draw_legend_row(ax, _text_span_axes(ax, t)[1] + 0.02, 0.74, line1_items, 25, max_x=1.0)
+    right_left = 1.0
+    if right_text:
+        rt = fit_text(ax, 1.0, 0.22, right_text, 0.45, 26, color=NAVY, ha="right", va="center")
+        right_left = _text_span_axes(ax, rt)[0]
+    draw_legend_row(ax, 0.0, 0.22, line2_items, 25, max_x=right_left - 0.02)
+
+
+def _date_ticks(plot_df):
+    n = len(plot_df)
+    interval = max(1, math.ceil(n / DATE_TICK_MAX))
+    ticks = list(range(0, n, interval))
+    return ticks, [plot_df.index[i].strftime(DATE_TICK_FMT) for i in ticks]
+
+
+def _set_date_ticks(ax, ticks, labels):
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels, rotation=0, ha="center", color=MUTED, fontsize=24, fontweight="bold")
+    ax.tick_params(axis="x", length=6, pad=8)
+
+
+def _fmt_wan_axis(v, _pos=None):
+    """金額軸（單位：萬）→ 5,000萬／1.5億。"""
+    if abs(v) < 1e-9:
+        return "0"
+    if abs(v) >= 10000:
+        return f"{v / 10000:.1f}".rstrip("0").rstrip(".") + "億"
+    return f"{v:,.0f}萬"
+
+
+def _fmt_lots_axis(v, _pos=None):
+    """成交量軸（單位：張）→ 20萬／8,500。"""
+    if abs(v) >= 10000:
+        return f"{v / 10000:.0f}萬"
+    return f"{v:,.0f}"
+
+
+# ============================================================
+# 繪圖層：K 線標籤帶（買進在下、賣出在上，不遮 K 棒、不互相重疊）
+# ============================================================
+
+def _slot_is_free(row, left, width, pad):
+    return all(left + width + pad <= a or left >= b + pad for a, b in row)
+
+
+def _nearest_free_slot(row, desired, width, pad, lo, hi):
+    candidates = [desired] + [b + pad for _a, b in row] + [a - pad - width for a, _b in row]
+    ok = [c for c in candidates if lo <= c <= hi - width and _slot_is_free(row, c, width, pad)]
+    return min(ok, key=lambda c: abs(c - desired)) if ok else None
+
+
+def assign_lane_rows(items, lo, hi, pad, max_rows):
+    """依 x 由左往右把標籤排進各列；回傳用了幾列。
+
+    1. 能放在三角形正上／正下方就放那裡（先找已有的列）。
+    2. 都被佔住且列數未滿就開新列。
+    3. 列數已滿就在各列找「離理想位置最近的空位」，標籤會稍微左右移，再用連接線指回三角形。
+    4. 真的沒有空位才再開一列——寧可標籤帶變高，也不讓字疊在一起。
+    """
+    rows = []
+    for it in sorted(items, key=lambda it: (it["x"], it.get("order", 0))):
+        width = min(it["w"], hi - lo)
+        desired = it["x"] if it.get("align") == "left" else it["x"] - width / 2
+        desired = min(max(desired, lo), hi - width)
+        choice = None
+        for ri, row in enumerate(rows):
+            if _slot_is_free(row, desired, width, pad):
+                choice = (ri, desired)
+                break
+        if choice is None and len(rows) < max_rows:
+            rows.append([])
+            choice = (len(rows) - 1, desired)
+        if choice is None:
+            candidates = []
+            for ri, row in enumerate(rows):
+                slot = _nearest_free_slot(row, desired, width, pad, lo, hi)
+                if slot is not None:
+                    candidates.append((abs(slot - desired), ri, slot))
+            if candidates:
+                _dist, ri, slot = min(candidates)
+                choice = (ri, slot)
+            else:
+                rows.append([])
+                choice = (len(rows) - 1, desired)
+        ri, left = choice
+        rows[ri].append((left, left + width))
+        it["row"], it["left"], it["w"] = ri, left, width
+    return len(rows)
+
+
+def build_lane_items(plot_df, spans, full_mode):
+    """整理 K 線上要標的事件：下方標籤帶＝大額買進，上方標籤帶＝賣出（與整段圖的波段編號）。"""
+    keys = list(plot_df.index.strftime("%Y/%m/%d"))
+    pos = {k: i for i, k in enumerate(keys)}
+    sell_label_cap = REPLAY_FULL_SELL_LABEL_MAX if full_mode else REPLAY_SELL_LABEL_MAX
+    bottom, top = [], []
+    for r, s_idx, _e_idx in spans:
+        for b in r["buy_days"]:
+            i = pos.get(b["date"])
+            if i is None:
+                continue
+            bottom.append({
+                "x": i, "marker": True, "final": False, "color": RED,
+                "text": f"{b['date'][5:]} {b['class']} {fmt_wan(b['amount'])}",
+            })
+
+        final_exit = "" if r["open"] else r["end"]
+        exits = [
+            e for e in r["exit_days"]
+            if e["date"] in pos and (e["amount"] >= REPLAY_SELL_MARK_MIN_AMOUNT or e["date"] == final_exit)
+        ]
+        labeled = {
+            e["date"] for e in sorted(exits, key=lambda e: e["amount"], reverse=True)[:sell_label_cap]
+        }
+        for e in exits:
+            is_final = e["date"] == final_exit
+            text = ""
+            if is_final or e["date"] in labeled:
+                text = f"{e['date'][5:]} {'出清' if is_final else '賣'} {fmt_wan(e['amount'])}"
+            top.append({"x": pos[e["date"]], "marker": True, "final": is_final, "color": GREEN, "text": text})
+
+        if full_mode:
+            top.append({
+                "x": s_idx, "marker": False, "final": False, "color": NAVY, "align": "left", "order": -1,
+                "text": f"#{r['no']}  {r['start'][5:]}→{r['end'][5:]}",
+            })
+    return bottom, top
+
+
+def draw_event_lanes(ax, plot_df, spans, full_mode):
+    """設定 K 線 Y 軸（上下各留標籤帶）並畫出三角形、虛線導引與標籤。"""
+    fig = ax.figure
+    dpi = fig.dpi
+    ax_w, ax_h = _ax_px(ax)
+    h_in = ax_h / dpi
+    x_lo, x_hi = ax.get_xlim()
+    data_per_px = (x_hi - x_lo) / ax_w
+    box_pad_px = LANE_LABEL_PAD * LANE_FONT_SIZE * dpi / 72
+
+    bottom, top = build_lane_items(plot_df, spans, full_mode)
+    for it in bottom + top:
+        if it["text"]:
+            w_px, _h = _text_px(ax, it["text"], LANE_FONT_SIZE)
+            it["w"] = (w_px + 2 * box_pad_px) * data_per_px
+    spacing = LANE_LABEL_SPACING_IN * dpi * data_per_px
+    bottom_labels = [it for it in bottom if it["text"]]
+    top_labels = [it for it in top if it["text"]]
+    n_bottom = assign_lane_rows(bottom_labels, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
+    n_top = assign_lane_rows(top_labels, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
+    m_bottom = LANE_MARKER_IN if any(it["marker"] for it in bottom) else 0.0
+    m_top = LANE_MARKER_IN if any(it["marker"] for it in top) else 0.0
+
+    def frac(inches):
+        return inches / h_in
+
+    f_bottom = frac(LANE_EDGE_IN + n_bottom * LANE_ROW_IN + m_bottom + LANE_GAP_IN)
+    f_top = frac(LANE_EDGE_IN + n_top * LANE_ROW_IN + m_top + LANE_GAP_IN)
+    f_price = max(0.35, 1.0 - f_bottom - f_top)
+
+    lows = plot_df["Low"].astype(float).values
+    highs = plot_df["High"].astype(float).values
+    p_min, p_max = float(np.nanmin(lows)), float(np.nanmax(highs))
+    p_span = max(p_max - p_min, abs(p_max) * 0.01, 1e-6)
+    # K 棒與標籤帶之間再留 2% 價格空間，最高／最低那根不會貼著三角形。
+    p_lo, p_hi = p_min - p_span * 0.02, p_max + p_span * 0.02
+    p_span = p_hi - p_lo
+    y0 = p_lo - p_span * f_bottom / f_price
+    y1 = p_hi + p_span * f_top / f_price
+    ax.set_ylim(y0, y1)
+
+    def to_y(axes_frac):
+        return y0 + axes_frac * (y1 - y0)
+
+    y_per_in = (y1 - y0) / h_in
+    b_marker_y = to_y(frac(LANE_EDGE_IN + n_bottom * LANE_ROW_IN + m_bottom / 2))
+    t_marker_y = to_y(1.0 - frac(LANE_EDGE_IN + n_top * LANE_ROW_IN + m_top / 2))
+    label_half = LANE_ROW_IN * 0.40 * y_per_in
+    guide_gap = 0.06 * y_per_in
+
+    bar_pt = ax_w / max(len(plot_df) + 1, 1) * 72 / dpi
+    marker_d = max(9.0, min(20.0, bar_pt * 0.85))
+
+    def label_box(color):
+        return dict(facecolor="white", edgecolor=color, linewidth=1.1, alpha=0.96,
+                    boxstyle=f"round,pad={LANE_LABEL_PAD}")
+
+    for it in bottom:
+        i = it["x"]
+        d = marker_d * (1.25 if it["final"] else 1.0)
+        half = d / 72 / 2 * y_per_in
+        ax.plot([i, i], [lows[i] - guide_gap, b_marker_y + half], color=it["color"], linestyle=":",
+                linewidth=1.5, alpha=0.65, zorder=2)
+        ax.scatter([i], [b_marker_y], marker="^", s=d ** 2, color=it["color"],
+                   edgecolors="white", linewidths=1.2, zorder=6)
+        if it["text"]:
+            label_y = to_y(frac(LANE_EDGE_IN + (n_bottom - it["row"] - 0.5) * LANE_ROW_IN))
+            cx = it["left"] + it["w"] / 2
+            ax.text(cx, label_y, it["text"], ha="center", va="center", fontsize=LANE_FONT_SIZE,
+                    fontweight="bold", color=it["color"], zorder=8, bbox=label_box(it["color"]))
+            anchor_x = min(max(i, it["left"] + it["w"] * 0.1), it["left"] + it["w"] * 0.9)
+            ax.plot([i, anchor_x], [b_marker_y - half, label_y + label_half], color=it["color"],
+                    linewidth=1.1, alpha=0.6, zorder=7)
+
+    for it in top:
+        if it["text"]:
+            label_y = to_y(1.0 - frac(LANE_EDGE_IN + (n_top - it["row"] - 0.5) * LANE_ROW_IN))
+            cx = it["left"] + it["w"] / 2
+            ax.text(cx, label_y, it["text"], ha="center", va="center", fontsize=LANE_FONT_SIZE,
+                    fontweight="bold", color=it["color"], zorder=8, bbox=label_box(it["color"]))
+        if not it["marker"]:
+            continue
+        i = it["x"]
+        d = marker_d * (1.25 if it["final"] else 1.0)
+        half = d / 72 / 2 * y_per_in
+        ax.plot([i, i], [highs[i] + guide_gap, t_marker_y - half], color=it["color"], linestyle=":",
+                linewidth=1.5, alpha=0.65, zorder=2)
+        ax.scatter([i], [t_marker_y], marker="v", s=d ** 2, color=it["color"],
+                   edgecolors="white", linewidths=1.2, zorder=6)
+        if it["text"]:
+            anchor_x = min(max(i, it["left"] + it["w"] * 0.1), it["left"] + it["w"] * 0.9)
+            ax.plot([i, anchor_x], [t_marker_y + half, label_y - label_half], color=it["color"],
+                    linewidth=1.1, alpha=0.6, zorder=7)
+
+    # Y 軸刻度只標在 K 棒價格範圍內，標籤帶旁邊不出現沒有意義的價位。
+    ticks = [t for t in MaxNLocator(nbins=7).tick_values(p_min, p_max) if p_min <= t <= p_max]
+    ax.set_yticks(ticks)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:,.0f}" if abs(v) >= 100 else f"{v:,.2f}"))
+
+
+# ============================================================
+# 繪圖層：各面板
+# ============================================================
+
+def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels):
+    style_ax(ax)
+    ax.set_xlim(-1, len(x))
+    for _r, s_idx, e_idx in spans:
+        ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
+    plot_candles(ax, plot_df, x)
+    for col, color in [("MA5", RED), ("MA10", ORANGE), ("MA20", LIME), ("MA60", BLUE)]:
+        ax.plot(x, plot_df[col], color=color, linewidth=2.1, zorder=2)
+    for col in ["BB_UPPER", "BB_LOWER"]:
+        ax.plot(x, plot_df[col], linestyle="--", color=MUTED, linewidth=1.4, alpha=0.9, zorder=2)
+    for r, s_idx, e_idx in spans:
+        if r["entry_close"]:
+            # 進場價虛線壓在 K 棒下層（zorder 比 K 棒低），只當參考線。
+            ax.hlines(r["entry_close"], s_idx - 0.5, e_idx + 0.5, colors=NAVY, linestyles="--",
+                      linewidth=1.6, alpha=0.55, zorder=1.8)
+    if REPLAY_SHOW_VOLUME_PROFILE:
+        add_weighted_volume_profile_overlay(ax, plot_df)
+    draw_event_lanes(ax, plot_df, spans, full_mode)
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y", labelsize=26)
+    for lab in ax.get_yticklabels():
+        lab.set_fontweight("bold")
+    _set_date_ticks(ax, ticks, tick_labels)
+
+
+def draw_volume_panel(ax, plot_df, x, spans, ticks):
+    style_ax(ax)
+    ax.set_xlim(-1, len(x))
+    for _r, s_idx, e_idx in spans:
+        ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
+    up = plot_df["Close"] >= plot_df["Open"]
+    vol_lots = plot_df["Volume"] / 1000
+    ax.bar([j for j in x if up.iloc[j]], vol_lots[up], color=RED, width=0.72, alpha=0.72)
+    ax.bar([j for j in x if not up.iloc[j]], vol_lots[~up], color=GREEN, width=0.72, alpha=0.72)
+    ax.plot(x, plot_df["MV5"] / 1000, color=BLUE, linewidth=2.1)
+    ax.plot(x, plot_df["MV20"] / 1000, color=PURPLE, linewidth=2.1)
+    adjust_volume_ylim(ax, plot_df)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.yaxis.set_major_formatter(FuncFormatter(_fmt_lots_axis))
+    ax.tick_params(axis="y", labelsize=22)
+    ax.set_xticks(ticks)
+    ax.tick_params(axis="x", labelbottom=False)
+
+
+def _align_zero_ylim(ax_a, lo_a, hi_a, ax_b, lo_b, hi_b, top_pad=0.12, bottom_pad=0.10):
+    """讓左右兩個 Y 軸的 0 在同一高度，避免「左軸 0 在中間、右軸 0 在下面」看錯方向。"""
+    def norm(lo, hi):
+        lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
+        if hi - lo <= 0:
+            hi = 1.0
+        return lo, hi
+
+    lo_a, hi_a = norm(lo_a, hi_a)
+    lo_b, hi_b = norm(lo_b, hi_b)
+    zero = min(max(-lo_a / (hi_a - lo_a), -lo_b / (hi_b - lo_b)), 0.9)
+
+    def limits(lo, hi):
+        total = max((-lo / zero) if zero > 0 else 0.0, hi / (1 - zero))
+        return -zero * total - bottom_pad * total, (1 - zero) * total + top_pad * total
+
+    ax_a.set_ylim(*limits(lo_a, hi_a))
+    ax_b.set_ylim(*limits(lo_b, hi_b))
+
+
+def draw_flow_panel(ax, plot_df, x, stock_flow, spans, ticks, tick_labels):
+    """分點權證每日買（紅）賣（綠）金額柱，右軸疊區間累計淨買折線。"""
+    style_ax(ax)
+    ax.set_xlim(-1, len(x))
+    keys = list(plot_df.index.strftime("%Y/%m/%d"))
+    buy = np.array([stock_flow.get(k, (0.0, 0.0))[0] for k in keys], dtype=float) / 1e4
+    sell = np.array([stock_flow.get(k, (0.0, 0.0))[1] for k in keys], dtype=float) / 1e4
+    for _r, s_idx, e_idx in spans:
+        ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.05, zorder=0)
+    ax.bar(x, buy, color=RED, width=0.72, alpha=0.85, zorder=3)
+    ax.bar(x, -sell, color=GREEN, width=0.72, alpha=0.85, zorder=3)
+    ax.axhline(0, color=MUTED, linewidth=1.0, alpha=0.6)
+
+    cum = np.cumsum(buy - sell)
+    ax2 = ax.twinx()
+    ax2.plot(x, cum, color=BLUE, linewidth=2.6, zorder=4)
+    _align_zero_ylim(ax, -float(sell.max(initial=0.0)), float(buy.max(initial=0.0)),
+                     ax2, float(cum.min(initial=0.0)), float(cum.max(initial=0.0)))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax2.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.yaxis.set_major_formatter(FuncFormatter(_fmt_wan_axis))
+    ax2.yaxis.set_major_formatter(FuncFormatter(_fmt_wan_axis))
+    # 左軸＝每日買賣（灰字）、右軸＝累計淨買（藍字，與折線同色），一眼分得出哪個刻度對哪條。
+    ax.tick_params(axis="y", labelsize=22, colors=MUTED)
+    ax2.tick_params(axis="y", labelsize=22, colors=BLUE)
+    for spine in ax2.spines.values():
+        spine.set_color(GRID)
+    _set_date_ticks(ax, ticks, tick_labels)
+
+
+def draw_table_panel(ax, table_rounds, highlight_ids, habit_text, footnote, ratio):
+    """歷次波段表格。全部用 axes 座標，列高依列數平均分配。"""
+    style_ax(ax)
+    ax.grid(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # 底部固定留約 1.1 個 ratio 單位（≈1.4 吋）放習性統計與註腳，不隨列數縮放。
+    top = 0.95
+    foot = min(0.45, 1.1 / max(ratio, 1e-6))
+    row_h = (top - foot) / (len(table_rounds) + 1)
+    y = top - row_h / 2
+
+    for title, cx, ha in TABLE_COLUMNS:
+        ax.text(cx, y, title, transform=ax.transAxes, ha=ha, va="center",
+                fontsize=24, color=MUTED, fontweight="bold")
+    ax.plot([0.008, 0.992], [top - row_h, top - row_h], transform=ax.transAxes, color=GRID, linewidth=1.2)
+
+    for r in table_rounds:
+        y -= row_h
+        marked = id(r) in highlight_ids
+        if marked:
+            ax.add_patch(Rectangle((0.006, y - row_h / 2), 0.988, row_h, transform=ax.transAxes,
+                                   facecolor=NAVY, alpha=0.08, edgecolor="none", zorder=0))
+        cells = [
+            (f"▶{r['no']}" if marked else str(r["no"]), NAVY),
+            (r["start"], TEXT),
+            (r["end"], TEXT),
+            (f"{r['hold_days']} 天", TEXT),
+            (r["max_class_text"], NAVY),
+            (fmt_wan(r["total_cost"]), TEXT),
+            (fmt_pct(r["warrant_pct"]), pct_color(r["warrant_pct"])),
+            (fmt_pct(r["stock_pct"]), pct_color(r["stock_pct"])),
+            (fmt_pct(r["peak_pct"]), pct_color(r["peak_pct"])),
+            (r["status"], MUTED if r["open"] else NAVY),
+        ]
+        for (text, color), (_title, cx, ha) in zip(cells, TABLE_COLUMNS):
+            ax.text(cx, y, text, transform=ax.transAxes, ha=ha, va="center",
+                    fontsize=25, color=color, fontweight="bold")
+
+    fit_text(ax, 0.012, foot * 0.66, habit_text, 0.976, 27, color=NAVY, ha="left", va="center")
+    fit_text(ax, 0.012, foot * 0.24, footnote, 0.976, 21, fontweight="normal", color=MUTED,
+             ha="left", va="center")
+
+
+# ============================================================
+# 繪圖層：組版
 # ============================================================
 
 def build_segment_cards(rnd):
@@ -714,7 +1263,7 @@ def build_segment_cards(rnd):
         ("波段期間", f"{rnd['hold_days']} 天",
          f"{rnd['start'][5:]} → {rnd['end'][5:]}｜{rnd['trading_days']} 交易日", NAVY),
         ("權證買進", fmt_wan(rnd["total_cost"]),
-         f"最大 {rnd['max_class_text']}｜{len(rnd['buy_days'])} 次", RED),
+         f"最大 {rnd['max_class_text']}｜{len(rnd['buy_days'])} 次大額買進", RED),
         ("分點權證報酬", fmt_pct(w), w_sub, pct_color(w)),
         ("同期現股報酬", fmt_pct(s), s_sub, pct_color(s)),
         ("權證／現股", lev_value, lev_sub, NAVY),
@@ -728,245 +1277,129 @@ def build_full_cards(chart_rounds):
     avg_w = _mean([r["warrant_pct"] for r in closed])
     avg_s = _mean([r["stock_pct"] for r in closed])
     top = max(chart_rounds, key=lambda r: class_rank(r["max_class"]))
-    win_sub = f"勝率 {wins / len(closed):.0%}（已出清 {len(closed)} 段）" if closed else "尚無已出清波段"
+    pnl_sub = f"勝率 {wins / len(closed):.0%}（已出清 {len(closed)} 段）" if closed else "含減碼中已賣出部分"
+    avg_sub = "已出清波段平均" if closed else "選到的波段尚未出清"
     return [
         ("波段數", f"{len(chart_rounds)} 段",
          f"{chart_rounds[0]['start'][2:]} → {chart_rounds[-1]['end'][2:]}", NAVY),
         ("權證總買進", fmt_wan(sum(r["total_cost"] for r in chart_rounds)),
          f"最大 {top['max_class_text']}", RED),
-        ("權證已實現損益", fmt_wan_signed(pnl), win_sub, pct_color(pnl)),
-        ("平均權證報酬", fmt_pct(avg_w), "已出清波段平均", pct_color(avg_w)),
-        ("平均同期現股", fmt_pct(avg_s), "已出清波段平均", pct_color(avg_s)),
+        ("權證已實現損益", fmt_wan_signed(pnl), pnl_sub, pct_color(pnl)),
+        ("平均權證報酬", fmt_pct(avg_w), avg_sub, pct_color(avg_w)),
+        ("平均同期現股", fmt_pct(avg_s), avg_sub, pct_color(avg_s)),
     ]
 
 
-def make_flow_drawer(stock_flow, spans):
-    """分點權證每日買（紅，正值）賣（綠，負值）金額柱，右軸疊區間累計淨買折線。"""
-    def draw(ax, plot_df, x):
-        keys = list(plot_df.index.strftime("%Y/%m/%d"))
-        buy = np.array([stock_flow.get(k, (0.0, 0.0))[0] for k in keys], dtype=float) / 1e4
-        sell = np.array([stock_flow.get(k, (0.0, 0.0))[1] for k in keys], dtype=float) / 1e4
-
-        for _r, s_idx, e_idx in spans:
-            ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.06, zorder=0)
-        ax.bar(x, buy, color=RED, width=0.72, alpha=0.85, label="權證買進", zorder=3)
-        ax.bar(x, -sell, color=GREEN, width=0.72, alpha=0.85, label="權證賣出", zorder=3)
-        ax.axhline(0, color=MUTED, linewidth=1.0, alpha=0.6)
-        adjust_stacked_ylim(ax, [buy, -sell])
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}"))
-
-        cum = np.cumsum(buy - sell)
-        ax2 = ax.twinx()
-        ax2.plot(x, cum, color=BLUE, linewidth=2.6, label="區間累計淨買", zorder=4)
-        lo, hi = min(float(cum.min()), 0.0), max(float(cum.max()), 0.0)
-        span = max(hi - lo, 1.0)
-        ax2.set_ylim(lo - span * 0.18, hi + span * 0.32)
-        ax2.tick_params(colors=MUTED, labelsize=24)
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}"))
-        for spine in ax2.spines.values():
-            spine.set_color(GRID)
-
-        handles, labels = [], []
-        for a in (ax, ax2):
-            h, lab = a.get_legend_handles_labels()
-            handles += h
-            labels += lab
-        # legend 掛在 ax2：畫在折線上層，才不會被累計線穿過。
-        ax2.legend(handles, labels, loc="upper left", ncol=3, frameon=False, fontsize=24, labelcolor=TEXT)
-    return draw
-
-
-def make_table_drawer(table_rounds, highlight_ids, habit_text, footnote, ratio):
-    """歷次波段表格。全部用 transAxes 座標，不受 kline_core 統一 set_xlim 影響。"""
-    def draw(ax, plot_df, x):
-        ax.grid(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-        # 底部固定留約 1.1 個 ratio 單位（≈1.4 吋）放習性統計與註腳，不隨列數縮放。
-        top = 0.95
-        foot = min(0.45, 1.1 / max(ratio, 1e-6))
-        row_h = (top - foot) / (len(table_rounds) + 1)
-        y = top - row_h / 2
-
-        for title, cx, ha in TABLE_COLUMNS:
-            ax.text(cx, y, title, transform=ax.transAxes, ha=ha, va="center",
-                    fontsize=24, color=MUTED, fontweight="bold")
-        ax.plot([0.008, 0.992], [top - row_h, top - row_h], transform=ax.transAxes,
-                color=GRID, linewidth=1.2)
-
-        for r in table_rounds:
-            y -= row_h
-            marked = id(r) in highlight_ids
-            if marked:
-                ax.add_patch(Rectangle((0.006, y - row_h / 2), 0.988, row_h, transform=ax.transAxes,
-                                       facecolor=NAVY, alpha=0.08, edgecolor="none", zorder=0))
-            cells = [
-                (f"▶{r['no']}" if marked else str(r["no"]), NAVY),
-                (r["start"], TEXT),
-                (r["end"], TEXT),
-                (f"{r['hold_days']} 天", TEXT),
-                (r["max_class_text"], NAVY),
-                (fmt_wan(r["total_cost"]), TEXT),
-                (fmt_pct(r["warrant_pct"]), pct_color(r["warrant_pct"])),
-                (fmt_pct(r["stock_pct"]), pct_color(r["stock_pct"])),
-                (fmt_pct(r["peak_pct"]), pct_color(r["peak_pct"])),
-                (r["status"], MUTED if r["open"] else NAVY),
-            ]
-            for (text, color), (_title, cx, ha) in zip(cells, TABLE_COLUMNS):
-                ax.text(cx, y, text, transform=ax.transAxes, ha=ha, va="center",
-                        fontsize=25, color=color, fontweight="bold")
-
-        ax.text(0.012, foot * 0.66, habit_text, transform=ax.transAxes, ha="left", va="center",
-                fontsize=27, color=NAVY, fontweight="bold")
-        ax.text(0.012, foot * 0.24, footnote, transform=ax.transAxes, ha="left", va="center",
-                fontsize=21, color=MUTED)
-    return draw
-
-
-def _expand_candle_ylim(ax):
-    """kline_core 的 Y 軸只留上 5%／下 11%，三角形與標籤會被裁掉，上下再多撐開一點。"""
-    y0, y1 = ax.get_ylim()
-    span = y1 - y0
-    ax.set_ylim(y0 - span * 0.07, y1 + span * 0.09)
-    return span
-
-
-def draw_round_marks(ax, plot_df, span, rnd, s_idx, e_idx, sell_label_max, tag=""):
-    """在 K 線上標出一段波段：區間底色、大額買進日（▲）、賣出日（▼）、進場價。"""
-    keys = list(plot_df.index.strftime("%Y/%m/%d"))
-    pos = {k: i for i, k in enumerate(keys)}
-    lows = plot_df["Low"].astype(float).values
-    highs = plot_df["High"].astype(float).values
-    label_box = dict(facecolor="white", edgecolor="none", alpha=0.85, boxstyle="round,pad=0.15")
-
-    ax.axvspan(s_idx - 0.5, e_idx + 0.5, color=NAVY, alpha=0.06, zorder=0)
-
-    for b in rnd["buy_days"]:
-        i = pos.get(b["date"])
-        if i is None:
-            continue
-        y = lows[i] - span * 0.035
-        ax.scatter([i], [y], marker="^", s=620, color=RED, edgecolors="white", linewidths=1.8, zorder=7)
-        ax.text(i, y - span * 0.03, f"{b['class']} {fmt_wan(b['amount'])}", ha="center", va="top",
-                fontsize=22, color=RED, fontweight="bold", zorder=7, bbox=label_box)
-
-    exits = [e for e in rnd["exit_days"] if e["date"] in pos]
-    final_exit = "" if rnd["open"] else rnd["end"]
-    labeled = {e["date"] for e in sorted(exits, key=lambda e: e["amount"], reverse=True)[:sell_label_max]}
-    for e in exits:
-        i = pos[e["date"]]
-        is_final = e["date"] == final_exit
-        y = highs[i] + span * 0.035
-        ax.scatter([i], [y], marker="v", s=760 if is_final else 520, color=GREEN,
-                   edgecolors="white", linewidths=1.8, zorder=7)
-        if is_final or e["date"] in labeled:
-            text = f"出清 {fmt_wan(e['amount'])}" if is_final else f"賣 {fmt_wan(e['amount'])}"
-            ax.text(i, y + span * 0.03, text, ha="center", va="bottom",
-                    fontsize=22, color=GREEN, fontweight="bold", zorder=7, bbox=label_box)
-
-    if rnd["entry_close"]:
-        ax.hlines(rnd["entry_close"], s_idx - 0.5, e_idx + 0.5, colors=NAVY, linestyles="--",
-                  linewidth=1.8, alpha=0.8, zorder=5)
-
-    if tag:
-        # 編號放在波段底部：頂部是均線 legend 與最新報價框，放上面會互相壓到。
-        ax.text(s_idx - 0.4, ax.get_ylim()[0] + span * 0.015, tag, ha="left", va="bottom",
-                fontsize=24, color=NAVY, fontweight="bold", zorder=8,
-                bbox=dict(facecolor="white", edgecolor=NAVY, alpha=0.9, boxstyle="round,pad=0.2"))
-
-
-def draw_entry_exit_box(ax, rnd):
-    if not rnd["entry_close"]:
-        return
-    exit_label = "最新" if rnd["open"] else "出場"
-    ax.text(0.988, 0.94,
-            f"進場 {rnd['entry_date'][5:]} 收 {rnd['entry_close']:.2f} → "
-            f"{exit_label} {rnd['exit_date'][5:]} 收 {rnd['exit_close']:.2f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=27, color=NAVY, fontweight="bold",
-            bbox=dict(facecolor="white", edgecolor=NAVY, boxstyle="round,pad=0.30", alpha=0.95))
-
-
-def _find_axis_by_title(fig, title):
-    for ax in fig.axes:
-        if ax.get_title(loc="left") == title:
-            return ax
-    return None
-
-
-def _move_date_labels(from_ax, to_ax, plot_df, max_xticks=12):
-    """kline_core 只在最後一列畫日期；表格面板排在最後，要把日期搬回資金流面板。"""
-    if from_ax is not None:
-        from_ax.set_xticks([])
-    if to_ax is None:
-        return
-    x = list(range(len(plot_df)))
-    # 波段可能跨年，日期標籤帶兩位數年份。
-    labels = [pd.Timestamp(d).strftime("%y/%m/%d") for d in plot_df.index]
-    interval = max(1, len(x) // max(1, max_xticks))
-    to_ax.set_xticks(x[::interval])
-    to_ax.set_xticklabels(labels[::interval], rotation=30, ha="right", color=MUTED, fontsize=26)
-    plt.setp(to_ax.get_xticklabels(), visible=True)
+def _ma_label(name, series):
+    value = float(series.iloc[-1]) if len(series) else float("nan")
+    return f"{name} {value:.2f}" if np.isfinite(value) else name
 
 
 def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_rounds, rounds,
                         habit_text, stock_flow, title, subtitle_prefix, cards, highlight_ids,
-                        full_mode):
+                        full_mode, right_text):
     """分段與整段共用的出圖流程。chart_rounds 必須依時間排序。"""
     plot_df = slice_window(kdf, chart_rounds[0]["start"], chart_rounds[-1]["end"])
     if plot_df is None:
         log(f"⚠️ {stock_code}｜{title} 找不到對應的日 K，略過")
         return None
+    x = list(range(len(plot_df)))
     spans = round_positions(plot_df, chart_rounds)
+    ticks, tick_labels = _date_ticks(plot_df)
 
     table_rounds = pick_table_rounds(rounds, chart_rounds[0])
-    table_ratio = 1.3 + 0.55 * (len(table_rounds) + 1)
-    flow_title = f"{broker_label} 權證買賣｜每日買進（紅）／賣出（綠）與區間累計淨買（萬元）"
-    table_title = f"{broker_label} 在 {stock_code} {stock_name} 的歷次波段"
+    table_ratio = 1.4 + 0.55 * (len(table_rounds) + 1)
     footnote = (
         f"現股報酬以{chart_rounds[0]['return_basis']}收盤計（進場日→出場日）｜權證報酬為 FIFO 已實現｜"
-        "期間最高＝波段內最高價相對進場收盤｜持有中波段算到快取最新交易日"
+        "期間最高＝波段內最高價相對進場收盤｜持有中波段算到快取最新交易日｜"
+        f"K 線只標單日賣出 ≥ {fmt_wan(REPLAY_SELL_MARK_MIN_AMOUNT)} 與出清日，完整賣出見權證買賣面板"
     )
 
-    fig = plot_onepage_kline(
-        plot_df,
-        title=title,
-        subtitle=(
-            f"{subtitle_prefix}｜K線區間：{plot_df.index[0]:%Y/%m/%d} - {plot_df.index[-1]:%Y/%m/%d}"
-            "｜資訊分享非投資建議"
-        ),
-        cards=cards,
-        candle_title=CANDLE_TITLE,
-        extra_panels=[
-            (5.0, flow_title, make_flow_drawer(stock_flow, spans)),
-            (table_ratio, table_title,
-             make_table_drawer(table_rounds, highlight_ids, habit_text, footnote, table_ratio)),
-        ],
-        show_volume_profile=REPLAY_SHOW_VOLUME_PROFILE,
-    )
+    # 每個面板都拆成「標題列＋圖＋日期列」三個 GridSpec row，hspace=0。
+    # 標題、圖例、日期都有自己的空間，不會像 kline_core 那樣靠 hspace 猜間距而互相壓到。
+    rows = [
+        ("header", 1.9),
+        ("cards", 2.8),
+        (None, 0.35),
+        ("candle_head", 1.35),
+        ("candle", 13.1),
+        (None, 0.75),
+        ("volume_head", 0.75),
+        ("volume", 2.6),
+        (None, 0.30),
+        ("flow_head", 0.75),
+        ("flow", 4.6),
+        (None, 0.75),
+        ("table_head", 0.75),
+        ("table", table_ratio),
+    ]
+    ratios = [ratio for _name, ratio in rows]
+    fig = plt.figure(figsize=(FIG_WIDTH_DEFAULT, sum(ratios) * ROW_HEIGHT_SCALE), facecolor=BG)
+    gs = GridSpec(len(rows), 1, figure=fig, height_ratios=ratios, hspace=0.0,
+                  left=FIG_LEFT, right=FIG_RIGHT, top=0.992, bottom=0.008)
+    axes = {name: fig.add_subplot(gs[i, 0]) for i, (name, _ratio) in enumerate(rows) if name}
 
-    candle_ax = _find_axis_by_title(fig, CANDLE_TITLE)
-    if candle_ax is not None:
-        span = _expand_candle_ylim(candle_ax)
-        sell_label_max = REPLAY_FULL_SELL_LABEL_MAX if full_mode else REPLAY_SELL_LABEL_MAX
-        for r, s_idx, e_idx in spans:
-            draw_round_marks(candle_ax, plot_df, span, r, s_idx, e_idx, sell_label_max,
-                             tag=f"#{r['no']}" if full_mode else "")
-        if not full_mode:
-            draw_entry_exit_box(candle_ax, chart_rounds[0])
-    _move_date_labels(_find_axis_by_title(fig, table_title), _find_axis_by_title(fig, flow_title), plot_df)
+    draw_header(
+        axes["header"], title,
+        f"{subtitle_prefix}｜K線區間：{plot_df.index[0]:%Y/%m/%d} - {plot_df.index[-1]:%Y/%m/%d}｜資訊分享非投資建議",
+    )
+    draw_cards(axes["cards"], cards)
+
+    line1_items = [
+        ("marker", RED, "大額買進權證（日期 級距 金額）", "^"),
+        ("marker", GREEN, f"賣出權證（≥{fmt_wan(REPLAY_SELL_MARK_MIN_AMOUNT)}／出清）", "v"),
+    ]
+    if full_mode:
+        line1_items.append(("box", NAVY, "#N 波段編號", None))
+    line2_items = [
+        ("line", RED, _ma_label("5MA", plot_df["MA5"]), "-"),
+        ("line", ORANGE, _ma_label("10MA", plot_df["MA10"]), "-"),
+        ("line", LIME, _ma_label("20MA", plot_df["MA20"]), "-"),
+        ("line", BLUE, _ma_label("60MA", plot_df["MA60"]), "-"),
+        ("line", MUTED, "布林通道", "--"),
+    ]
+    draw_candle_head(axes["candle_head"], "股價趨勢｜K線、均線、布林", line1_items, line2_items, right_text)
+    draw_candle_panel(axes["candle"], plot_df, x, spans, full_mode, ticks, tick_labels)
+
+    draw_panel_head(axes["volume_head"], "成交量（張）", [
+        ("line", BLUE, "5日均量", "-"),
+        ("line", PURPLE, "20日均量", "-"),
+    ])
+    draw_volume_panel(axes["volume"], plot_df, x, spans, ticks)
+
+    draw_panel_head(axes["flow_head"], f"{broker_label} 權證買賣｜每日買進／賣出與區間累計淨買", [
+        ("box", RED, "權證買進（左軸）", None),
+        ("box", GREEN, "權證賣出（左軸）", None),
+        ("line", BLUE, "區間累計淨買（右軸）", "-"),
+    ])
+    draw_flow_panel(axes["flow"], plot_df, x, stock_flow, spans, ticks, tick_labels)
+
+    draw_panel_head(axes["table_head"], f"{broker_label} 在 {stock_code} {stock_name} 的歷次波段")
+    draw_table_panel(axes["table"], table_rounds, highlight_ids, habit_text, footnote, table_ratio)
+
+    add_center_watermarks(fig)
     return fig_to_png_buffer(fig)
 
 
 def plot_segment(stock_code, stock_name, broker_label, kdf, rnd, rounds, habit_text, stock_flow):
+    right_text = ""
+    if rnd["entry_close"]:
+        exit_label = "最新" if rnd["open"] else "出場"
+        right_text = (
+            f"進場 {rnd['entry_date']} 收 {rnd['entry_close']:.2f} → "
+            f"{exit_label} {rnd['exit_date']} 收 {rnd['exit_close']:.2f}"
+        )
     return render_replay_chart(
         stock_code=stock_code, stock_name=stock_name, broker_label=broker_label, kdf=kdf,
         chart_rounds=[rnd], rounds=rounds, habit_text=habit_text, stock_flow=stock_flow,
         title=f"{stock_code} {stock_name}｜{broker_label} 波段複盤 #{rnd['no']}/{len(rounds)}",
-        subtitle_prefix=f"波段：{rnd['start']} → {rnd['end']}（{rnd['status']}）",
+        subtitle_prefix=(
+            f"波段 #{rnd['no']}：{rnd['start']} → {rnd['end']}（{rnd['status']}，持有 {rnd['hold_days']} 天）"
+        ),
         cards=build_segment_cards(rnd),
         highlight_ids={id(rnd)},
         full_mode=False,
+        right_text=right_text,
     )
 
 
@@ -975,9 +1408,21 @@ def plot_full(stock_code, stock_name, broker_label, kdf, chart_rounds, rounds, h
     if len(chart_rounds) == len(rounds):
         scope = f"全部 {len(rounds)} 段"
         highlight_ids = set()  # 全部都選時整張表都亮等於沒亮，不標。
+    elif len(chart_rounds) == 1:
+        scope = f"波段 #{first['no']}"
+        highlight_ids = {id(first)}
     else:
-        scope = f"#{first['no']}～#{last['no']}（選 {len(chart_rounds)} 段）"
+        scope = f"波段 #{first['no']}～#{last['no']}（選 {len(chart_rounds)} 段）"
         highlight_ids = {id(r) for r in chart_rounds}
+
+    last_bar = kdf[kdf.index.strftime("%Y/%m/%d") <= last["end"]]
+    right_text = ""
+    if len(last_bar) >= 2:
+        close, prev = float(last_bar["Close"].iloc[-1]), float(last_bar["Close"].iloc[-2])
+        right_text = (
+            f"區間最後一日 {last_bar.index[-1]:%Y/%m/%d} 收 {close:.2f}"
+            f"（{(close / prev - 1) * 100 if prev else 0:+.2f}%）"
+        )
     return render_replay_chart(
         stock_code=stock_code, stock_name=stock_name, broker_label=broker_label, kdf=kdf,
         chart_rounds=chart_rounds, rounds=rounds, habit_text=habit_text, stock_flow=stock_flow,
@@ -986,6 +1431,7 @@ def plot_full(stock_code, stock_name, broker_label, kdf, chart_rounds, rounds, h
         cards=build_full_cards(chart_rounds),
         highlight_ids=highlight_ids,
         full_mode=True,
+        right_text=right_text,
     )
 
 
