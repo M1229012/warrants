@@ -143,8 +143,13 @@ jobs:
       REPLAY_KLINE_LIMIT: "400"
       REPLAY_STOCK_RETURN_ADJUSTED: "1"
       REPLAY_LEVERAGE_MIN_STOCK_PCT: "1.0"
-      REPLAY_SELL_LABEL_MAX: "6"
-      REPLAY_FULL_SELL_LABEL_MAX: "1"
+      # K 線只畫單日賣出 ≥ 這個金額的 ▼（出清日一律畫）；小額分批賣出看下方權證買賣面板。
+      REPLAY_SELL_MARK_MIN_AMOUNT: "1000000"
+      # 每段最多幾個賣出日加文字（金額大的優先）；整段圖段數多，每段標少一點。
+      REPLAY_SELL_LABEL_MAX: "8"
+      REPLAY_FULL_SELL_LABEL_MAX: "2"
+      # K 線上下標籤帶先開幾列；擠不下會左右找空位，真的沒空位才再加列，字不會重疊。
+      REPLAY_LANE_MAX_ROWS: "4"
       REPLAY_TABLE_MAX_ROWS: "12"
       REPLAY_SHOW_VOLUME_PROFILE: "1"
       REPLAY_HTML_INDEX_ENABLE: "1"
