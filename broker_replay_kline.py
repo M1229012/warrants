@@ -19,9 +19,10 @@
 編號在 log、GitHub Actions 的 Summary 頁與圖內表格都看得到；第一次可先跑「全部」看清單。
 
 版面規則（為什麼不直接用 kline_core.plot_onepage_kline）：
-- 買賣註解要「不遮 K 棒、彼此不重疊」。K 線面板上下各保留一條標籤帶：
-  買進標在最低價下方的標籤帶、賣出標在最高價上方的標籤帶，K 棒到三角形之間用虛線連起來。
-  每個標籤依實際像素寬度排位置，擠不下就換下一列，所以字不會疊在一起。
+- 買賣註解要「不遮 K 棒、彼此不重疊、看得懂」。K 線面板上下各保留一條標籤帶：
+  買進 ▲ 在最低價下方、賣出 ▼ 在最高價上方，K 棒到三角形之間用虛線連起來。
+  K 線上只放「編號圓圈」，日期／級距／金額寫在 K 線正下方的「K 線標註明細」，依編號對照。
+  （上一版把完整文字直接排進標籤帶，事件一密集就疊成四列、斜線牽來牽去，反而看不懂。）
 - 均線 legend、進出場資訊都移到面板上方的標題列，不壓在 K 棒上。
 - K 線面板下方直接標日期，只看圖也知道是哪一天。
 - 卡片、標題等固定寬度的文字，都依實測寬度自動縮字，不會超出框線。
@@ -175,12 +176,8 @@ REPLAY_LEVERAGE_MIN_STOCK_PCT = max(0.1, float(os.getenv("REPLAY_LEVERAGE_MIN_ST
 # K 線上只畫單日賣出達這個金額的 ▼（出清日一律畫）。
 # 分批出場常一天只賣幾萬，全部畫會變成一整排三角形；小額賣出看下方權證買賣面板就好。
 REPLAY_SELL_MARK_MIN_AMOUNT = max(0.0, float(os.getenv("REPLAY_SELL_MARK_MIN_AMOUNT", "1000000")))
-# 最多幾個「非出清」賣出日加文字（金額大的優先；出清日一律加）；其餘只畫三角形。
-# 分段圖是單一筆的上限，整段圖是整張圖合計的上限（同一天的賣出只標一次）。
-REPLAY_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_SELL_LABEL_MAX", "8")))
-REPLAY_FULL_SELL_LABEL_MAX = max(0, int(os.getenv("REPLAY_FULL_SELL_LABEL_MAX", "4")))
-# K 線上下標籤帶最多先開幾列；再擠不下會左右找空位，真的沒有空位才再加列（寧可變高也不重疊）。
-REPLAY_LANE_MAX_ROWS = max(1, int(os.getenv("REPLAY_LANE_MAX_ROWS", "4")))
+# K 線上下標籤帶（編號圓圈）最多先開幾列；再擠不下會左右找空位，真的沒空位才再加列（寧可變高也不重疊）。
+REPLAY_LANE_MAX_ROWS = max(1, int(os.getenv("REPLAY_LANE_MAX_ROWS", "3")))
 # 歷次波段表格最多列幾段；超過時以本段為中心取前後各半。
 REPLAY_TABLE_MAX_ROWS = max(3, int(os.getenv("REPLAY_TABLE_MAX_ROWS", "15")))
 # 長區間的加權價量分布是逐列迴圈，趕時間可以關掉。
@@ -212,14 +209,20 @@ FIG_LEFT = 0.055
 FIG_RIGHT = 0.945
 DATE_TICK_FMT = "%y/%m/%d"
 DATE_TICK_MAX = 11
-# K 線標籤帶尺寸（吋）。22pt 字加底框約 0.48 吋高，列高 0.58 吋讓上下兩列之間還有空隙。
-LANE_FONT_SIZE = 22
-LANE_ROW_IN = 0.58
+# K 線標籤帶尺寸（吋）。編號圓圈直徑 0.36 吋、兩位數 16pt 白字剛好放得下；
+# 列高 0.46 吋讓上下兩列圓圈之間還有空隙。
 LANE_MARKER_IN = 0.42
 LANE_GAP_IN = 0.16
 LANE_EDGE_IN = 0.10
-LANE_LABEL_PAD = 0.22     # 標籤底框留白（字級倍數），也是 bbox 的 pad
-LANE_LABEL_SPACING_IN = 0.14   # 同一列兩個標籤之間至少留的距離
+LANE_BADGE_D_IN = 0.36
+LANE_BADGE_ROW_IN = 0.46
+LANE_BADGE_FONT = 16
+LANE_BADGE_SPACING_IN = 0.05   # 同一列兩個圓圈之間至少留的距離
+# K 線標註明細：一行一筆、預設三欄，欄內文字超寬會自動縮字。
+MARKS_COLUMNS = 3
+MARKS_ROW_IN = 0.56
+MARKS_PAD_IN = 0.16
+MARKS_FONT_SIZE = 24
 
 # (欄名, x 位置, 對齊)。x 用 transAxes 0~1，寬 28 吋長圖、25pt 字實測不會互相壓到。
 TABLE_COLUMNS = [
@@ -835,6 +838,9 @@ def draw_legend_row(ax, x0, y, items, fontsize=25, max_x=1.0):
         elif kind == "marker":
             ax.scatter([x + iw / 2], [y], transform=ax.transAxes, marker=style, s=320 * scale,
                        color=color, edgecolors="white", linewidths=1.2, clip_on=False, zorder=5)
+        elif kind == "badge":
+            _draw_badge(ax, x + iw / 2, y, style, color, diameter_in=0.30 * scale,
+                        transform=ax.transAxes, fontsize=13 * scale)
         else:
             box_h = 0.24 * dpi / ax_h
             ax.add_patch(Rectangle((x + iw * 0.12, y - box_h / 2), iw * 0.76, box_h, transform=ax.transAxes,
@@ -987,88 +993,97 @@ def assign_lane_rows(items, lo, hi, pad, max_rows):
     return len(rows)
 
 
-def build_lane_items(plot_df, spans, full_mode, stock_flow):
-    """整理 K 線上要標的事件：下方標籤帶＝大額買進，上方標籤帶＝賣出（與整段圖的編號）。
+def build_mark_items(plot_df, spans, full_mode, stock_flow):
+    """整理 K 線上要標的事件，依日期編號（買進在前）。K 線畫編號，明細面板寫文字。
 
-    賣出日依日期合併：逐筆模式下同一天常同時是好幾筆的出場日，只畫一個 ▼、一個標籤。
-    標籤金額＝分點當天對這檔的全部權證賣出，與下方權證買賣面板的綠柱同一個數字。
+    - 買進：金額＝那筆 ABCDE 事件的單日累積買進（同分點同標的同一天全部權證）。
+    - 賣出：同一天常同時是好幾筆的出場日（逐筆模式），依日期合併成一個 ▼、一個編號；
+      金額＝分點當天對這檔的全部權證賣出，與下方權證買賣面板的綠柱同一個數字。
+      只列單日賣出 ≥ REPLAY_SELL_MARK_MIN_AMOUNT 與出清日，小額分批賣出看權證買賣面板。
     """
     keys = list(plot_df.index.strftime("%Y/%m/%d"))
     pos = {k: i for i, k in enumerate(keys)}
-    bottom, top = [], []
+    items = []
     sell_days = {}
-    for r, s_idx, _e_idx in spans:
-        # 整段圖裡只有一個買進日的（逐筆模式一定是），編號直接寫在買進標籤上，不另外佔一列。
-        numbered = full_mode and len(r["buy_days"]) == 1
+    for r, _s_idx, _e_idx in spans:
         for b in r["buy_days"]:
             i = pos.get(b["date"])
             if i is None:
                 continue
-            prefix = f"#{r['no']} " if numbered else ""
-            bottom.append({
-                "x": i, "marker": True, "final": False, "color": RED,
-                "text": f"{prefix}{b['date'][5:]} {b['class']} {fmt_wan(b['amount'])}",
+            ref = f"（表格 #{r['no']}）" if full_mode else ""
+            items.append({
+                "x": i, "side": "buy", "final": False, "color": RED,
+                "detail": f"{b['date'][5:]} 買進 {b['class']}級 {fmt_wan(b['amount'])}{ref}",
             })
-        if full_mode and not numbered:
-            top.append({
-                "x": s_idx, "marker": False, "final": False, "color": NAVY, "align": "left", "order": -1,
-                "text": f"#{r['no']}  {r['start'][5:]}→{r['end'][5:]}",
-            })
-
         final_exit = "" if r["open"] else r["end"]
         for d in r["exit_days"]:
             if d not in pos:
                 continue
-            rec = sell_days.setdefault(d, [])
+            finals = sell_days.setdefault(d, [])
             if d == final_exit:
-                rec.append(r["no"])
+                finals.append(r["no"])
 
-    amount_of = {d: float(stock_flow.get(d, (0.0, 0.0))[1]) for d in sell_days}
-    shown = [d for d in sorted(sell_days) if amount_of[d] >= REPLAY_SELL_MARK_MIN_AMOUNT or sell_days[d]]
-    cap = REPLAY_FULL_SELL_LABEL_MAX if full_mode else REPLAY_SELL_LABEL_MAX
-    ranked = [d for d in sorted(shown, key=lambda d: amount_of[d], reverse=True) if not sell_days[d]]
-    labeled = set(ranked[:cap])
-    for d in shown:
+    for d in sorted(sell_days):
         finals = sell_days[d]
-        amount_text = f" {fmt_wan(amount_of[d])}" if amount_of[d] > 0 else ""
-        text = ""
+        amount = float(stock_flow.get(d, (0.0, 0.0))[1])
+        if amount < REPLAY_SELL_MARK_MIN_AMOUNT and not finals:
+            continue
         if finals:
-            who = ("、".join(f"#{n}" for n in finals) + " ") if full_mode else ""
-            text = f"{d[5:]} {who}出清{amount_text}"
-        elif d in labeled:
-            text = f"{d[5:]} 賣{amount_text}"
-        top.append({"x": pos[d], "marker": True, "final": bool(finals), "color": GREEN, "text": text})
-    return bottom, top
+            who = (" " + "、".join(f"#{n}" for n in finals)) if full_mode else ""
+            detail = f"{d[5:]} 出清{who}" + (f"（當日賣 {fmt_wan(amount)}）" if amount > 0 else "")
+        else:
+            detail = f"{d[5:]} 賣出 {fmt_wan(amount)}"
+        items.append({"x": pos[d], "side": "sell", "final": bool(finals), "color": GREEN, "detail": detail})
+
+    items.sort(key=lambda it: (it["x"], 0 if it["side"] == "buy" else 1))
+    for no, it in enumerate(items, start=1):
+        it["no"] = no
+    return items
 
 
-def draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow):
-    """設定 K 線 Y 軸（上下各留標籤帶）並畫出三角形、虛線導引與標籤。"""
+def _draw_badge(ax, x, y, number, color, diameter_in=LANE_BADGE_D_IN, transform=None,
+                fontsize=None, zorder=9):
+    """實心圓圈＋白色編號。K 線、明細面板、圖例共用，三處長得一模一樣才對得起來。"""
+    transform = transform or ax.transData
+    ax.scatter([x], [y], transform=transform, marker="o", s=(diameter_in * 72) ** 2, color=color,
+               edgecolors="white", linewidths=1.6, clip_on=False, zorder=zorder)
+    text = str(number)
+    if fontsize is None:
+        fontsize = LANE_BADGE_FONT * diameter_in / LANE_BADGE_D_IN
+    if len(text) >= 3:
+        fontsize *= 0.78
+    ax.text(x, y, text, transform=transform, ha="center", va="center", fontsize=fontsize,
+            color="white", fontweight="bold", zorder=zorder + 1, clip_on=False)
+
+
+def draw_event_lanes(ax, plot_df, items):
+    """設定 K 線 Y 軸（上下各留標籤帶），畫三角形、虛線導引與編號圓圈。
+
+    K 線上只放編號，日期、級距、金額全部寫在下方「K 線標註明細」。
+    圓圈只有 0.36 吋寬，事件再密集也頂多疊兩三列，不會再一大串斜線牽來牽去。
+    """
     fig = ax.figure
     dpi = fig.dpi
     ax_w, ax_h = _ax_px(ax)
     h_in = ax_h / dpi
     x_lo, x_hi = ax.get_xlim()
     data_per_px = (x_hi - x_lo) / ax_w
-    box_pad_px = LANE_LABEL_PAD * LANE_FONT_SIZE * dpi / 72
 
-    bottom, top = build_lane_items(plot_df, spans, full_mode, stock_flow)
-    for it in bottom + top:
-        if it["text"]:
-            w_px, _h = _text_px(ax, it["text"], LANE_FONT_SIZE)
-            it["w"] = (w_px + 2 * box_pad_px) * data_per_px
-    spacing = LANE_LABEL_SPACING_IN * dpi * data_per_px
-    bottom_labels = [it for it in bottom if it["text"]]
-    top_labels = [it for it in top if it["text"]]
-    n_bottom = assign_lane_rows(bottom_labels, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
-    n_top = assign_lane_rows(top_labels, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
-    m_bottom = LANE_MARKER_IN if any(it["marker"] for it in bottom) else 0.0
-    m_top = LANE_MARKER_IN if any(it["marker"] for it in top) else 0.0
+    bottom = [it for it in items if it["side"] == "buy"]
+    top = [it for it in items if it["side"] == "sell"]
+    for it in items:
+        it["w"] = LANE_BADGE_D_IN * dpi * data_per_px
+    spacing = LANE_BADGE_SPACING_IN * dpi * data_per_px
+    n_bottom = assign_lane_rows(bottom, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
+    n_top = assign_lane_rows(top, x_lo, x_hi, spacing, REPLAY_LANE_MAX_ROWS)
+    m_bottom = LANE_MARKER_IN if bottom else 0.0
+    m_top = LANE_MARKER_IN if top else 0.0
 
     def frac(inches):
         return inches / h_in
 
-    f_bottom = frac(LANE_EDGE_IN + n_bottom * LANE_ROW_IN + m_bottom + LANE_GAP_IN)
-    f_top = frac(LANE_EDGE_IN + n_top * LANE_ROW_IN + m_top + LANE_GAP_IN)
+    f_bottom = frac(LANE_EDGE_IN + n_bottom * LANE_BADGE_ROW_IN + m_bottom + LANE_GAP_IN)
+    f_top = frac(LANE_EDGE_IN + n_top * LANE_BADGE_ROW_IN + m_top + LANE_GAP_IN)
     f_price = max(0.35, 1.0 - f_bottom - f_top)
 
     lows = plot_df["Low"].astype(float).values
@@ -1086,54 +1101,36 @@ def draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow):
         return y0 + axes_frac * (y1 - y0)
 
     y_per_in = (y1 - y0) / h_in
-    b_marker_y = to_y(frac(LANE_EDGE_IN + n_bottom * LANE_ROW_IN + m_bottom / 2))
-    t_marker_y = to_y(1.0 - frac(LANE_EDGE_IN + n_top * LANE_ROW_IN + m_top / 2))
-    label_half = LANE_ROW_IN * 0.40 * y_per_in
+    b_marker_y = to_y(frac(LANE_EDGE_IN + n_bottom * LANE_BADGE_ROW_IN + m_bottom / 2))
+    t_marker_y = to_y(1.0 - frac(LANE_EDGE_IN + n_top * LANE_BADGE_ROW_IN + m_top / 2))
+    badge_half = LANE_BADGE_D_IN / 2 * y_per_in
     guide_gap = 0.06 * y_per_in
 
     bar_pt = ax_w / max(len(plot_df) + 1, 1) * 72 / dpi
     marker_d = max(9.0, min(20.0, bar_pt * 0.85))
 
-    def label_box(color):
-        return dict(facecolor="white", edgecolor=color, linewidth=1.1, alpha=0.96,
-                    boxstyle=f"round,pad={LANE_LABEL_PAD}")
-
-    for it in bottom:
+    for it in items:
         i = it["x"]
+        is_buy = it["side"] == "buy"
         d = marker_d * (1.25 if it["final"] else 1.0)
         half = d / 72 / 2 * y_per_in
-        ax.plot([i, i], [lows[i] - guide_gap, b_marker_y + half], color=it["color"], linestyle=":",
-                linewidth=1.5, alpha=0.65, zorder=2)
-        ax.scatter([i], [b_marker_y], marker="^", s=d ** 2, color=it["color"],
+        if is_buy:
+            marker_y = b_marker_y
+            badge_y = to_y(frac(LANE_EDGE_IN + (n_bottom - it["row"] - 0.5) * LANE_BADGE_ROW_IN))
+            guide = [lows[i] - guide_gap, marker_y + half]
+            link = [marker_y - half, badge_y + badge_half]
+        else:
+            marker_y = t_marker_y
+            badge_y = to_y(1.0 - frac(LANE_EDGE_IN + (n_top - it["row"] - 0.5) * LANE_BADGE_ROW_IN))
+            guide = [highs[i] + guide_gap, marker_y - half]
+            link = [marker_y + half, badge_y - badge_half]
+        # K 棒 → 三角形：虛線；三角形 → 編號圓圈：細實線（圓圈被擠到旁邊時才看得出是誰的）。
+        ax.plot([i, i], guide, color=it["color"], linestyle=":", linewidth=1.5, alpha=0.65, zorder=2)
+        ax.scatter([i], [marker_y], marker="^" if is_buy else "v", s=d ** 2, color=it["color"],
                    edgecolors="white", linewidths=1.2, zorder=6)
-        if it["text"]:
-            label_y = to_y(frac(LANE_EDGE_IN + (n_bottom - it["row"] - 0.5) * LANE_ROW_IN))
-            cx = it["left"] + it["w"] / 2
-            ax.text(cx, label_y, it["text"], ha="center", va="center", fontsize=LANE_FONT_SIZE,
-                    fontweight="bold", color=it["color"], zorder=8, bbox=label_box(it["color"]))
-            anchor_x = min(max(i, it["left"] + it["w"] * 0.1), it["left"] + it["w"] * 0.9)
-            ax.plot([i, anchor_x], [b_marker_y - half, label_y + label_half], color=it["color"],
-                    linewidth=1.1, alpha=0.6, zorder=7)
-
-    for it in top:
-        if it["text"]:
-            label_y = to_y(1.0 - frac(LANE_EDGE_IN + (n_top - it["row"] - 0.5) * LANE_ROW_IN))
-            cx = it["left"] + it["w"] / 2
-            ax.text(cx, label_y, it["text"], ha="center", va="center", fontsize=LANE_FONT_SIZE,
-                    fontweight="bold", color=it["color"], zorder=8, bbox=label_box(it["color"]))
-        if not it["marker"]:
-            continue
-        i = it["x"]
-        d = marker_d * (1.25 if it["final"] else 1.0)
-        half = d / 72 / 2 * y_per_in
-        ax.plot([i, i], [highs[i] + guide_gap, t_marker_y - half], color=it["color"], linestyle=":",
-                linewidth=1.5, alpha=0.65, zorder=2)
-        ax.scatter([i], [t_marker_y], marker="v", s=d ** 2, color=it["color"],
-                   edgecolors="white", linewidths=1.2, zorder=6)
-        if it["text"]:
-            anchor_x = min(max(i, it["left"] + it["w"] * 0.1), it["left"] + it["w"] * 0.9)
-            ax.plot([i, anchor_x], [t_marker_y + half, label_y - label_half], color=it["color"],
-                    linewidth=1.1, alpha=0.6, zorder=7)
+        cx = it["left"] + it["w"] / 2
+        ax.plot([i, cx], link, color=it["color"], linewidth=1.1, alpha=0.6, zorder=7)
+        _draw_badge(ax, cx, badge_y, it["no"], it["color"])
 
     # Y 軸刻度只標在 K 棒價格範圍內，標籤帶旁邊不出現沒有意義的價位。
     ticks = [t for t in MaxNLocator(nbins=7).tick_values(p_min, p_max) if p_min <= t <= p_max]
@@ -1145,7 +1142,7 @@ def draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow):
 # 繪圖層：各面板
 # ============================================================
 
-def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels, stock_flow):
+def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels, items):
     style_ax(ax)
     ax.set_xlim(-1, len(x))
     for s_idx, e_idx in _span_union(spans):
@@ -1163,7 +1160,7 @@ def draw_candle_panel(ax, plot_df, x, spans, full_mode, ticks, tick_labels, stoc
                       linewidth=1.6, alpha=0.55, zorder=1.8)
     if REPLAY_SHOW_VOLUME_PROFILE:
         add_weighted_volume_profile_overlay(ax, plot_df)
-    draw_event_lanes(ax, plot_df, spans, full_mode, stock_flow)
+    draw_event_lanes(ax, plot_df, items)
     ax.yaxis.tick_right()
     ax.tick_params(axis="y", labelsize=26)
     for lab in ax.get_yticklabels():
@@ -1239,6 +1236,37 @@ def draw_flow_panel(ax, plot_df, x, stock_flow, spans, ticks, tick_labels):
     for spine in ax2.spines.values():
         spine.set_color(GRID)
     _set_date_ticks(ax, ticks, tick_labels)
+
+
+def _marks_layout(n):
+    """明細面板的 (欄數, 列數)。筆數少時不硬撐三欄，免得一行字被擠到只剩三分之一寬。"""
+    ncol = min(MARKS_COLUMNS, max(n, 1))
+    return ncol, max(1, math.ceil(n / ncol))
+
+
+def draw_marks_panel(ax, items):
+    """K 線標註明細：編號圓圈＋一行文字，由上往下、再由左往右排，順序與 K 線上的編號相同。"""
+    style_ax(ax)
+    ax.grid(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ncol, rows = _marks_layout(len(items))
+    ax_w, ax_h = _ax_px(ax)
+    dpi = ax.figure.dpi
+    row_h = MARKS_ROW_IN * dpi / ax_h
+    top = 1.0 - MARKS_PAD_IN * dpi / ax_h
+    col_w = 0.976 / ncol
+    badge_d_in = LANE_BADGE_D_IN * 1.1
+    badge_w = badge_d_in * dpi / ax_w
+    gap = 0.12 * dpi / ax_w
+    for idx, it in enumerate(items):
+        col, row = divmod(idx, rows)
+        x0 = 0.012 + col * col_w
+        y = top - (row + 0.5) * row_h
+        _draw_badge(ax, x0 + badge_w / 2, y, it["no"], it["color"], diameter_in=badge_d_in,
+                    transform=ax.transAxes)
+        fit_text(ax, x0 + badge_w + gap, y, it["detail"], col_w - badge_w - gap - 0.012,
+                 MARKS_FONT_SIZE, min_fontsize=16, color=TEXT, ha="left", va="center")
 
 
 def draw_table_panel(ax, table_rounds, highlight_ids, habit_text, footnote, ratio):
@@ -1374,6 +1402,10 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
 
     # 每個面板都拆成「標題列＋圖＋日期列」三個 GridSpec row，hspace=0。
     # 標題、圖例、日期都有自己的空間，不會像 kline_core 那樣靠 hspace 猜間距而互相壓到。
+    items = build_mark_items(plot_df, spans, full_mode, stock_flow)
+    _marks_ncol, marks_rows = _marks_layout(len(items))
+    marks_ratio = (marks_rows * MARKS_ROW_IN + 2 * MARKS_PAD_IN) / ROW_HEIGHT_SCALE
+
     rows = [
         ("header", 1.9),
         ("cards", 2.8),
@@ -1381,6 +1413,10 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
         ("candle_head", 1.35),
         ("candle", 13.1),
         (None, 0.75),
+    ]
+    if items:
+        rows += [("marks_head", 0.75), ("marks", marks_ratio), (None, 0.30)]
+    rows += [
         ("volume_head", 0.75),
         ("volume", 2.6),
         (None, 0.30),
@@ -1403,11 +1439,10 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
     draw_cards(axes["cards"], cards)
 
     line1_items = [
-        ("marker", RED, "大額買進權證（日期 級距 金額）", "^"),
+        ("marker", RED, "大額買進權證", "^"),
         ("marker", GREEN, f"賣出權證（≥{fmt_wan(REPLAY_SELL_MARK_MIN_AMOUNT)}／出清）", "v"),
+        ("badge", NAVY, "數字＝下方標註明細編號", "1"),
     ]
-    if full_mode:
-        line1_items.append(("box", NAVY, "#N＝下方表格編號", None))
     line2_items = [
         ("line", RED, _ma_label("5MA", plot_df["MA5"]), "-"),
         ("line", ORANGE, _ma_label("10MA", plot_df["MA10"]), "-"),
@@ -1416,7 +1451,10 @@ def render_replay_chart(*, stock_code, stock_name, broker_label, kdf, chart_roun
         ("line", MUTED, "布林通道", "--"),
     ]
     draw_candle_head(axes["candle_head"], "股價趨勢｜K線、均線、布林", line1_items, line2_items, right_text)
-    draw_candle_panel(axes["candle"], plot_df, x, spans, full_mode, ticks, tick_labels, stock_flow)
+    draw_candle_panel(axes["candle"], plot_df, x, spans, full_mode, ticks, tick_labels, items)
+    if items:
+        draw_panel_head(axes["marks_head"], "K 線標註明細｜圓圈數字對應 K 線上的 ▲ 買進／▼ 賣出")
+        draw_marks_panel(axes["marks"], items)
 
     draw_panel_head(axes["volume_head"], "成交量（張）", [
         ("line", BLUE, "5日均量", "-"),
