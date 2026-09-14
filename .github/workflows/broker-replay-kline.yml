@@ -1,0 +1,275 @@
+name: Broker Replay K-Line - 分點權證波段複盤
+
+# 用法：
+# 1. 第一次先選「全部」＋「分段」跑一次，到這次執行的 Summary 頁看波段清單（#1、#2…）。
+# 2. 之後依編號挑想看的那一次（例如 3、2-4、近3），圖就只畫那一段，不會拉很長。
+# 3. 想看分點來回操作的節奏，改選「整段」，選到的波段會畫在同一張。
+#
+# 資料來自回測 workflow（warrant-backtest-moneydj.yml）每天存下的 warrant_cache，
+# 這裡只「還原、唯讀」，絕不存回，避免蓋掉回測自己的快取。
+# 所以一定要先有回測跑成功過至少一次；分點歷史約保留 200 個交易日。
+
+on:
+  workflow_dispatch:
+    inputs:
+      broker:
+        description: "分點（回測分點清單內）"
+        required: true
+        type: choice
+        options:
+          - "元大南屯"
+          - "華南永昌台中"
+          - "富邦敦南"
+          - "永豐金內湖"
+          - "新光"
+          - "富邦公益"
+          - "富邦仁愛"
+          - "富邦台中"
+          - "美好"
+          - "永豐金竹北"
+          - "永豐金竹科"
+          - "永豐金市政"
+          - "永豐金信義"
+          - "華南永昌淡水"
+          - "福邦證券"
+          - "群益東大"
+          - "群益金鼎古亭"
+          - "群益金鼎新竹"
+          - "群益金鼎中壢"
+          - "元大內湖民權"
+          - "元大汐止"
+          - "元大虎尾"
+          - "元大向上"
+          - "元大西屯"
+          - "元大西螺"
+          - "元大彰化民生"
+          - "兆豐板橋"
+          - "凱基士林"
+          - "凱基中山"
+          - "國票敦北法人"
+          - "國票台南"
+          - "統一三多"
+          - "第一金中壢"
+        default: "元大南屯"
+      stock_codes:
+        description: "股票代號，可用逗號分隔，例如 2408 或 2408,2330；留空＝該分點最近有大額買進的前 10 檔"
+        required: false
+        default: "2408"
+      chart_mode:
+        description: "出圖方式"
+        required: false
+        type: choice
+        options:
+          - "分段（每次買賣各一張）"
+          - "整段（選到的買賣畫在同一張）"
+          - "分段＋整段都要"
+        default: "分段（每次買賣各一張）"
+      rounds:
+        description: "第幾次買賣：最新／全部／3／1,3／2-4／近3（最近三段）／-2（倒數第二段）；編號看上一次執行的 Summary 頁"
+        required: false
+        default: "最新"
+      min_class:
+        description: "只看最大級距達到這一級以上的波段（A=100萬起、B=160萬、C=250萬、D=500萬、E=1000萬）；編號會依篩選後重排"
+        required: false
+        type: choice
+        options:
+          - "A"
+          - "B"
+          - "C"
+          - "D"
+          - "E"
+        default: "A"
+      push_discord:
+        description: "是否推 Discord（1=推；先確認圖沒問題再開）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
+
+permissions:
+  contents: read
+
+# 同分支同時只跑一個複盤，避免兩次手動觸發互搶輸出。
+concurrency:
+  group: broker-replay-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  broker-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: .cache/matplotlib
+      # kline_core.py 從這個資料夾註冊 NotoSansCJKtc；ubuntu runner 預設沒有中文字型。
+      REPORT_FONT_DIR: .cache/report-fonts
+
+      # ============================================================
+      # 回測模組設定（必須與 warrant-backtest-moneydj.yml 一致）
+      # ============================================================
+      OUTPUT_DIR: output
+      CACHE_DIR: warrant_cache
+      USE_CACHE: "1"
+      FORCE_FULL_CACHE_REFRESH: "0"
+      # load_history_cache 會依這個值剪掉保留窗口外的日期，和回測設不一樣會少資料。
+      HISTORY_RETENTION_TRADING_DAYS: "200"
+      # 本機快取不在時，回測的 read_cache_csv 會嘗試讀 Google Sheet 舊快取；
+      # 這裡沒有給憑證，關掉讓它直接報「讀不到快取」，不要卡在 Sheet 連線。
+      GSHEET_CACHE_ENABLED: "0"
+      SUPABASE_CACHE_ENABLED: "0"
+
+      # ============================================================
+      # 複盤設定
+      # ============================================================
+      REPLAY_BACKTEST_PATH: warrant_backtest_moneydj.py
+      REPLAY_BROKER: ${{ inputs.broker }}
+      REPLAY_STOCKS: ${{ inputs.stock_codes }}
+      REPLAY_CHART_MODE: ${{ inputs.chart_mode }}
+      REPLAY_ROUNDS: ${{ inputs.rounds }}
+      REPLAY_MIN_CLASS: ${{ inputs.min_class }}
+      REPLAY_INCLUDE_OPEN: "1"
+      REPLAY_MAX_STOCKS: "10"
+
+      # 分段圖前後留白：前面看進場前的位置，後面看出場後有沒有續漲。
+      REPLAY_PAD_BEFORE_BARS: "20"
+      REPLAY_PAD_AFTER_BARS: "10"
+      REPLAY_MIN_WINDOW_BARS: "45"
+      # MoneyDJ 日 K 根數：200 交易日歷史＋MA60 暖身＋留白，240 不夠。
+      REPLAY_KLINE_LIMIT: "400"
+      REPLAY_STOCK_RETURN_ADJUSTED: "1"
+      REPLAY_LEVERAGE_MIN_STOCK_PCT: "1.0"
+      REPLAY_SELL_LABEL_MAX: "6"
+      REPLAY_FULL_SELL_LABEL_MAX: "1"
+      REPLAY_TABLE_MAX_ROWS: "12"
+      REPLAY_SHOW_VOLUME_PROFILE: "1"
+      REPLAY_HTML_INDEX_ENABLE: "1"
+      REPLAY_MAX_ALLOWED_PRICE_ERRORS: "3"
+
+      # 28 吋畫布直接以接近最終 2400px 的 DPI 輸出，與週報 workflow 相同，避免先產大圖再縮。
+      REPORT_OUTPUT_DPI: "84"
+      SCREENSHOT_OUTPUT_MAX_WIDTH: "2400"
+
+      REPLAY_DISCORD_ENABLE: ${{ inputs.push_discord }}
+      REPLAY_DISCORD_WEBHOOK_URL: ${{ secrets.REPLAY_DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL_TEST }}
+      REPLAY_DISCORD_SLEEP_SECONDS: "1.5"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in broker_replay_kline.py kline_core.py "$REPLAY_BACKTEST_PATH"; do
+            if [[ ! -f "$f" ]]; then
+              echo "❌ 找不到 $f"
+              missing=1
+            fi
+          done
+          if [[ "$missing" == "1" ]]; then
+            echo "目前倉庫內的 Python 檔案："
+            find . -maxdepth 2 -type f -name "*.py" -print
+            exit 1
+          fi
+          grep -n "PROGRAM_BUILD_ID = " "$REPLAY_BACKTEST_PATH" || true
+
+      # 只還原、不存回。key 刻意帶 replay-readonly 讓它永遠不會完全命中，
+      # 一律走 restore-keys 取「回測最近一次存的快取」。
+      - name: Restore backtest warrant cache (read-only)
+        uses: actions/cache/restore@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-replay-readonly-${{ github.run_id }}
+          restore-keys: |
+            warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+            warrant-cache-moneydj-v10-${{ runner.os }}-
+          fail-on-cache-miss: true
+
+      - name: Show cache contents
+        shell: bash
+        run: |
+          du -sh warrant_cache 2>/dev/null || true
+          ls -la warrant_cache | grep -E "broker_warrant_history_cache" || echo "⚠️ 快取裡沒有 broker_warrant_history_cache，請先跑一次回測 workflow"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 回測程式在模組層就 import openpyxl，只是載入它的函式也要裝。
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            requests \
+            pandas \
+            numpy \
+            pyarrow \
+            openpyxl \
+            lxml \
+            beautifulsoup4 \
+            gspread \
+            google-auth \
+            matplotlib \
+            pillow
+
+      - name: Restore report fonts
+        uses: actions/cache@v4
+        with:
+          path: .cache/report-fonts
+          key: broker-replay-fonts-noto-cjk-tc-Sans2.004
+
+      - name: Download Noto CJK TC fonts if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          FONT_DIR="$REPORT_FONT_DIR"
+          NOTO_CJK_REF="Sans2.004"
+          mkdir -p "$FONT_DIR" .cache/matplotlib
+          for FILE in NotoSansCJKtc-Regular.otf NotoSansCJKtc-Bold.otf; do
+            if [[ ! -s "$FONT_DIR/$FILE" ]]; then
+              echo "下載字型：$FILE"
+              curl --fail --location --retry 4 --retry-delay 2 \
+                --connect-timeout 10 --max-time 120 \
+                --output "$FONT_DIR/$FILE" \
+                "https://raw.githubusercontent.com/notofonts/noto-cjk/${NOTO_CJK_REF}/Sans/OTF/TraditionalChinese/${FILE}"
+            fi
+            test -s "$FONT_DIR/$FILE"
+          done
+          echo "✅ 中文字型就緒"
+
+      - name: Run broker replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          echo "=========================================="
+          echo "分點：$REPLAY_BROKER"
+          echo "股票：${REPLAY_STOCKS:-（自動挑最近有大額買進的前 $REPLAY_MAX_STOCKS 檔）}"
+          echo "出圖方式：$REPLAY_CHART_MODE"
+          echo "第幾次買賣：$REPLAY_ROUNDS"
+          echo "最低級距：$REPLAY_MIN_CLASS"
+          echo "推 Discord：$REPLAY_DISCORD_ENABLE"
+          echo "=========================================="
+          python -u broker_replay_kline.py
+
+      # PNG 本身已壓縮，compression-level 0 省時間。
+      # 下載後打開 index.html 就是複盤網頁（點縮圖看完整長圖）。
+      - name: Upload replay output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-replay-${{ github.run_number }}
+          path: output/broker_replay/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
