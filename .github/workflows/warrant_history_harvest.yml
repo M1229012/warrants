@@ -1,0 +1,172 @@
+# 放到 repo 的 .github/workflows/warrant_history_harvest.yml
+#
+# 這份 workflow 的核心是「跨次保存」：Actions 每次都是全新的機器，
+# 累積庫和快取跑完就消失。所以流程一定是
+#     下載上一次的狀態 → 抓資料 → 併進累積庫 → 傳回去
+# 少掉第一步或最後一步，就等於每天從零開始，而且會眼睜睜看著
+# MoneyDJ 把 2023 年的資料滾掉（實測保留底線 2023/09/11）。
+#
+# 狀態存在一個固定 tag 的 Release（data-store）：
+#     broker_warrant_history_store.parquet   分點明細累積庫（訓練用這份）
+#     price_store.parquet                    價格累積庫
+#     warrants_store.parquet                 權證主檔累積庫（代號×生命週期）
+#     warrant_meta_store.parquet             權證靜態屬性（履約價、行使比例、到期日）
+#     ohlcv_store_<年>.parquet               全市場 OHLCV，分年（每年約 225 MB）
+#     warrant_cache.tar.gz                   主程式的工作快取，用來續跑
+#
+# 兩種跑法（workflow_dispatch 的 mode 參數）：
+#     daily     只抓增量，約 30–60 分鐘，排程每天跑
+#     backfill  深度回補，跑滿 6 小時可能還沒完 —— 沒關係，
+#               快取有存回去，再按一次會從上次斷掉的地方接著跑
+
+name: 權證分點歷史累積
+
+on:
+  schedule:
+    # 台灣時間每天 18:30（UTC 10:30），收盤後
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "daily=只抓增量｜backfill=深度回補"
+        type: choice
+        options: [daily, backfill]
+        default: daily
+      retention_days:
+        description: "回補幾個交易日（800 約 3.2 年，已是 MoneyDJ 上限）"
+        default: "800"
+
+permissions:
+  contents: write        # gh release upload 需要
+
+env:
+  STORE_TAG: data-store
+  OUTPUT_DIR: output
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350        # Actions 單 job 上限 360，留 10 分鐘給收尾上傳
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝依賴
+        run: pip install --quiet requests pandas openpyxl pyarrow
+
+      - name: 下載上一次的累積庫與快取
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p output/warrant_history_store output/warrant_cache
+          if gh release view "$STORE_TAG" >/dev/null 2>&1; then
+            gh release download "$STORE_TAG" \
+              --dir output/warrant_history_store \
+              --pattern "*.parquet" --clobber || true
+            gh release download "$STORE_TAG" \
+              --dir /tmp --pattern "warrant_cache.tar.gz" --clobber || true
+            if [ -f /tmp/warrant_cache.tar.gz ]; then
+              tar -xzf /tmp/warrant_cache.tar.gz -C output/
+              echo "已還原工作快取"
+            fi
+          else
+            echo "還沒有 $STORE_TAG release，這是第一次執行"
+          fi
+          echo "--- 還原後的狀態 ---"
+          ls -la output/warrant_history_store/ || true
+          du -sh output/warrant_cache/ 2>/dev/null || true
+
+      - name: 抓取資料
+        env:
+          # ── 無 Sheet：結果只落地成 xlsx，快取只留本機 Parquet ──
+          GSHEET_RESULT_ENABLED: "0"
+          GSHEET_CACHE_ENABLED: "0"
+          SHEETLESS_MODE: "1"
+
+          # ── 全分點（30 個），不是精選 5 個 ──
+          RUN_MODE: "2"
+
+          # ── 保留期：設大就不會被剪掉。這是「一邊抓一邊丟」的根源 ──
+          HISTORY_RETENTION_TRADING_DAYS: ${{ github.event.inputs.retention_days || '800' }}
+          PRICE_RETENTION_TRADING_DAYS: ${{ github.event.inputs.retention_days || '800' }}
+          MONEYDJ_API5_HISTORY_LIMIT: ${{ github.event.inputs.retention_days || '800' }}
+
+          # backfill 用 repair 重建整個窗口；daily 只補當天
+          WORKFLOW_MODE: ${{ github.event.inputs.mode == 'backfill' && 'repair' || 'daily' }}
+
+          # 深度回補請用 API6（指定區間），不要讓 API5 用 5→50→200 逐步擴大回查
+          MONEYDJ_REPAIR_USE_API6: "1"
+
+          OUTPUT_DIR: output
+        run: |
+          python warrant_harvest/warrant_backtest_nosheet_history.py || {
+            echo "⚠️ 主程式非正常結束（可能是 6 小時上限）。"
+            echo "   快取仍會存回去，下次執行會接續。"
+          }
+
+      - name: 抓參考資料（權證靜態屬性 ＋ 全市場 OHLCV）
+        if: always()
+        env:
+          OUTPUT_DIR: output
+        run: |
+          # 靜態屬性每天抓：t187ap37_L 只列現行有效權證，
+          # 已到期權證的履約價事後補不回來，跟籌碼一樣不抓就沒了。
+          python warrant_harvest/warrant_reference_harvest.py meta
+
+          if [ "${{ github.event.inputs.mode }}" = "backfill" ]; then
+            # 已抓過的日期會自動跳過，中斷重跑就是續抓
+            python warrant_harvest/warrant_reference_harvest.py ohlcv --start 2023/09/11
+          else
+            python warrant_harvest/warrant_reference_harvest.py ohlcv --recent 10
+          fi
+          python warrant_harvest/warrant_reference_harvest.py report
+
+      - name: 併進累積庫（只進不出）
+        if: always()
+        run: |
+          python warrant_harvest/warrant_history_store.py merge
+          python warrant_harvest/warrant_history_store.py report
+
+      - name: 匯出 Excel
+        if: always()
+        run: |
+          python warrant_harvest/warrant_history_store.py export --scope recent
+          python warrant_harvest/warrant_history_store.py export --scope summary
+
+      - name: 打包工作快取
+        if: always()
+        run: |
+          tar -czf /tmp/warrant_cache.tar.gz -C output warrant_cache
+          ls -lh /tmp/warrant_cache.tar.gz
+
+      - name: 傳回累積庫
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$STORE_TAG" >/dev/null 2>&1; then
+            gh release create "$STORE_TAG" \
+              --title "權證分點歷史累積庫" \
+              --notes "只進不出的累積庫。訓練請讀 broker_warrant_history_store.parquet。" \
+              --latest=false
+          fi
+          gh release upload "$STORE_TAG" \
+            output/warrant_history_store/*.parquet \
+            /tmp/warrant_cache.tar.gz \
+            --clobber
+
+      - name: 保留本次產出
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warrant-output-${{ github.run_number }}
+          # artifacts 預設 90 天過期，只當本次檢查用；
+          # 真正的保存在上面那個 Release。
+          path: |
+            output/*.xlsx
+          retention-days: 30
+          if-no-files-found: warn
