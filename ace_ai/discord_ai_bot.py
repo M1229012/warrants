@@ -52,6 +52,11 @@ def _parse_id_set(raw: str) -> Set[int]:
     return ids
 
 
+def _is_allow_all(raw: str) -> bool:
+    """DISCORD_AI_ALLOWED_USER_IDS 設為 * 或 all 時，不限制使用者。"""
+    return str(raw or "").strip().lower() in ("*", "all")
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
@@ -73,12 +78,13 @@ class BotConfig:
     slash_command_name: str = "ask"
     guild_ids: Set[int] = field(default_factory=set)
     ephemeral: bool = False
+    allow_all_users: bool = False
 
     @classmethod
     def from_env(cls) -> "BotConfig":
         return cls(
             token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
-            allowed_user_ids=_parse_id_set(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
+            allowed_user_ids=set() if _is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")) else _parse_id_set(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
             allowed_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_ALLOWED_CHANNEL_IDS", "")),
             debug=_env_flag("DISCORD_AI_DEBUG"),
             command_prefix=os.getenv("DISCORD_AI_COMMAND_PREFIX", "!ace").strip() or "!ace",
@@ -90,6 +96,7 @@ class BotConfig:
             slash_command_name=(os.getenv("DISCORD_AI_SLASH_COMMAND", "ask").strip().lower() or "ask"),
             guild_ids=_parse_id_set(os.getenv("DISCORD_AI_GUILD_IDS", "")),
             ephemeral=_env_flag("DISCORD_AI_EPHEMERAL"),
+            allow_all_users=_is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
         )
 
 
@@ -1408,9 +1415,18 @@ class AccessGuard:
         self._running: Set[int] = set()
         self._lock = threading.Lock()
 
-    def check_permission(self, user_id: int, channel_id: int) -> str:
-        """回傳拒絕訊息；允許時回傳空字串。"""
-        if user_id not in self.config.allowed_user_ids:
+    def check_permission(self, user_id: int, channel_id: int, guild_id: Optional[int] = None) -> str:
+        """回傳拒絕訊息；允許時回傳空字串。
+
+        DISCORD_AI_ALLOWED_USER_IDS=* 時不限使用者，但只接受伺服器內的訊息（不接受私訊），
+        且有設定 DISCORD_AI_GUILD_IDS 時只限那些伺服器，避免 Bot 被加到其他伺服器後被陌生人使用。
+        """
+        if self.config.allow_all_users:
+            if guild_id is None:
+                return "請在伺服器頻道內使用艾斯 AI。"
+            if self.config.guild_ids and guild_id not in self.config.guild_ids:
+                return NOT_OPEN_MESSAGE
+        elif user_id not in self.config.allowed_user_ids:
             return NOT_OPEN_MESSAGE
         if self.config.allowed_channel_ids and channel_id not in self.config.allowed_channel_ids:
             return "請在指定的 AI 測試頻道使用艾斯 AI。"
@@ -1451,7 +1467,10 @@ def run_discord_bot(config: BotConfig) -> None:
 
     if not config.token:
         raise SystemExit("❌ 未設定 DISCORD_BOT_TOKEN，無法啟動 Discord Bot")
-    if not config.allowed_user_ids:
+    if config.allow_all_users:
+        scope = f"伺服器 {sorted(config.guild_ids)}" if config.guild_ids else "Bot 所在的所有伺服器"
+        print(f"ℹ️ DISCORD_AI_ALLOWED_USER_IDS=*：不限使用者，只限 {scope} 內使用（不接受私訊）")
+    elif not config.allowed_user_ids:
         print("⚠️ DISCORD_AI_ALLOWED_USER_IDS 未設定：所有人呼叫都會收到「尚未開放」")
 
     tools.core()
@@ -1487,7 +1506,7 @@ def run_discord_bot(config: BotConfig) -> None:
     async def on_ready() -> None:
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name} 與 {config.command_prefix}｜"
-            f"允許使用者 {len(config.allowed_user_ids)} 人｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
+            f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
             f"debug={config.debug}",
             flush=True,
         )
@@ -1496,7 +1515,7 @@ def run_discord_bot(config: BotConfig) -> None:
     @app_commands.describe(question="例如：2344現在技術面怎麼樣／永豐金內湖D事件勝率／本週精選")
     async def ask_command(interaction: "discord.Interaction", question: str) -> None:
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
-        denied = guard.check_permission(user_id, channel_id)
+        denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await interaction.response.send_message(denied, ephemeral=True)
@@ -1535,7 +1554,7 @@ def run_discord_bot(config: BotConfig) -> None:
         question = content[len(prefix):].strip()
         user_id, channel_id = message.author.id, message.channel.id
 
-        denied = guard.check_permission(user_id, channel_id)
+        denied = guard.check_permission(user_id, channel_id, message.guild.id if message.guild else None)
         if denied:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await message.reply(denied, mention_author=False, allowed_mentions=no_mentions)
