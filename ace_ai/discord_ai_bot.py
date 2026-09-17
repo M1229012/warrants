@@ -128,7 +128,9 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "technical": ("技術面", "技術", "均線", "MA5", "MA10", "MA20", "MA60", "月線", "季線", "週線",
                   "KD", "MACD", "OSC", "布林", "指標", "黃金交叉", "死亡交叉", "乖離",
                   "BOLL", "壓縮", "收窄", "擴張", "橫盤", "上軌", "下軌", "中軌", "沿軌"),
-    "volume_profile": ("大量區", "量區", "成本區", "籌碼密集", "支撐", "壓力", "套牢", "價量"),
+    "volume_profile": ("大量區", "量區", "成本區", "籌碼密集", "支撐", "壓力", "套牢", "價量",
+                       "型態", "線型", "K線", "走勢", "趨勢", "盤整", "整理"),
+    "cost": ("成本", "均價", "買在", "被套", "停損", "停利", "要不要賣", "該賣", "續抱", "抱著"),
     "warrant": ("權證", "分點", "籌碼", "主力", "加碼", "買超", "賣超", "大戶", "進場"),
     "win_rate": ("勝率", "績效", "歷史表現", "表現", "報酬率", "準不準", "準確"),
     "rank": ("排行", "排名", "前幾", "最準"),
@@ -138,6 +140,7 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "behavior": ("習性", "節奏", "風格", "操作模式", "近況", "動態", "最近怎樣", "最近如何", "最近在做什麼"),
     "position": ("部位", "還在", "出清", "出場", "賣掉", "賣了", "持有", "抱著", "庫存", "留倉", "還有沒有"),
     "analysis": ("分析", "怎麼樣", "怎樣", "怎麼看", "如何", "看法", "觀察", "解讀", "評估", "綜合",
+                 "好嗎", "好不好", "可以買", "能買", "該不該", "操作", "建議", "怎麼辦",
                  "整體", "呼應", "合理", "注意", "意義", "健康", "強不強", "弱不弱"),
 }
 
@@ -159,6 +162,7 @@ BROKER_PREFIXES = (
 )
 
 STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年月日])")
+COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價)\s*(?:在|是|為|約|大約)?\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
 DAYS_RE = re.compile(r"(?:近|最近)?\s*(\d{1,2})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
 EVENT_RE = re.compile(r"(?<![A-Z])([A-E])\s*(?:類|事件|級|型)|事件\s*([A-E])(?![A-Z])")
 EVENT_NAME_MAP = {"基礎買超": "A", "明顯買超": "B", "強勢買超": "C", "大額布局": "D", "超大額布局": "E"}
@@ -176,6 +180,7 @@ class ParsedQuestion:
     branch_candidates: List[str] = field(default_factory=list)
     days: int = 5
     days_specified: bool = False
+    cost_price: Optional[float] = None
     event_type: str = ""
     notes: List[str] = field(default_factory=list)
 
@@ -210,6 +215,11 @@ class QuestionParser:
         text_upper = question.upper()
         parsed = ParsedQuestion(original=question, intents=self.detect_intents(text_upper))
 
+        cost_match = COST_RE.search(question)
+        if cost_match:
+            parsed.cost_price = float(cost_match.group(1))
+            parsed.intents.add("cost")
+            question = question.replace(cost_match.group(0), " ")
         days_match = DAYS_RE.search(question)
         if days_match:
             parsed.days = max(1, min(int(days_match.group(1)), 20))
@@ -383,7 +393,7 @@ PLANNER_TOOLS = (
     "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
     "get_branch_stock_history", "get_branch_winrate_rank", "get_recent_news", "query_google_sheet",
     "get_branch_event_performance", "get_branch_recent_behavior", "detect_current_branch_events",
-    "get_sheet_stock_chips", "get_branch_stock_position",
+    "get_sheet_stock_chips", "get_branch_stock_position", "get_cost_position_context",
 )
 
 
@@ -410,6 +420,8 @@ class QueryRouter:
         analysis = "analysis" in intents
         if parsed.branches:
             return self._branch_plan(parsed, categories, analysis)
+        if parsed.stocks and ("cost" in intents or "volume_profile" in categories and analysis):
+            return self._pattern_plan(parsed)
         if parsed.stocks:
             if categories:
                 return self._stock_plan(parsed, categories, analysis)
@@ -491,6 +503,19 @@ class QueryRouter:
             "news": bool(categories & {"news"}),
         }
         plan.need_final_llm = analysis or sum(groups.values()) >= 2 or len(parsed.stocks) > 1
+        return plan
+
+    def _pattern_plan(self, parsed: ParsedQuestion) -> QueryPlan:
+        """型態／持股成本／操作類：型態＋大量區＋均線＋布林（有成本就加成本位置），交給 AI 寫客觀觀察重點。"""
+        plan = QueryPlan(route="rule_pattern", need_final_llm=True)
+        for code, _ in parsed.stocks:
+            plan.add("get_stock_overview", stock_code=code)
+            plan.add("get_technical_analysis", stock_code=code)
+            plan.add("get_volume_profile", stock_code=code)
+            if parsed.cost_price is not None:
+                plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
+            if "warrant" in parsed.intents:
+                plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
         return plan
 
     def _default_bundle(self, parsed: ParsedQuestion) -> QueryPlan:
@@ -777,7 +802,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 8. 語氣自然、口語、不要過度艱深。
 9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
-11. 不提供沒有資料支持的目標價、報酬預測或買賣建議。
+11. 不提供目標價、報酬預測或「買進／賣出」這類直接指令；但使用者問型態、成本或操作時，不可拒答，必須依序用型態、大量區、均線（再來才是布林與籌碼）給出客觀觀察重點：目前位置、關鍵支撐與壓力價位（只能使用 tool_results 的價位）、以及「若守住／若跌破／若站回」各代表什麼，並寫在【觀察重點】。有成本價時要說明成本相對現價、均線與大量區的位置。
 12. 涉及新聞時，只能引用 tool_results 裡的新聞標題與摘要。
 13. 不要把「買超」直接等同「看多必漲」。
 14. 不要把「高歷史勝率」直接說成這次一定成功。
@@ -787,7 +812,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
-接著只放相關區塊，區塊標題依序使用：【籌碼】、【技術面】、【大量區】、【新聞】、【綜合觀察】
+接著只放相關區塊。型態、成本、操作類問題依序使用：【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞】、【綜合觀察】
 最後一行：「資料時間：」列出各類資料的日期或統計期間。"""
 
 

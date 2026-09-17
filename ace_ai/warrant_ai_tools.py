@@ -2518,6 +2518,60 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
 
 
 # ============================================================
+# 持股成本位置（型態／操作類問題用；只整理價位，不下買賣指令）
+# ============================================================
+
+def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, Any]:
+    """成本價相對現價、均線、大量區、布林的位置，以及現價上下方的關鍵價位（全部 Python 計算）。"""
+    code, name = _stock_identity(stock_code)
+    cost = float(cost_price)
+    if cost <= 0:
+        raise ToolDataError("成本價必須大於 0")
+    tech = get_technical_analysis(code)
+    vp = get_volume_profile(code)
+    close = _num(tech.get("close"))
+    levels: List[Dict[str, Any]] = []
+
+    def add(label: str, value: Any) -> None:
+        price = _num(value)
+        if price is not None and price > 0:
+            levels.append({"label": label, "price": price})
+
+    for key, info in (tech.get("moving_averages") or {}).items():
+        add(key, (info or {}).get("value"))
+    for key, label in (("maximum_volume_zone", "最大量區"), ("second_volume_zone", "第二大量區")):
+        zone = vp.get(key) or {}
+        add(f"{label}下緣", zone.get("price_low"))
+        add(f"{label}上緣", zone.get("price_high"))
+    bb = tech.get("bollinger") or {}
+    add("布林上軌", bb.get("upper"))
+    add("布林中軌", bb.get("mid"))
+    add("布林下軌", bb.get("lower"))
+
+    def relation(price: float) -> str:
+        return "高於" if cost > price else "低於" if cost < price else "等於"
+
+    supports = sorted([lv for lv in levels if close is not None and lv["price"] <= close], key=lambda lv: -lv["price"])[:4]
+    resistances = sorted([lv for lv in levels if close is not None and lv["price"] > close], key=lambda lv: lv["price"])[:3]
+    for lv in supports + resistances:
+        lv["distance_from_close_pct"] = _pct(lv["price"], close)
+    return {
+        "stock_code": code,
+        "stock_name": name,
+        "data_date": tech.get("data_date"),
+        "cost_price": _num(cost),
+        "close": close,
+        "unrealized_pct": _pct(close, cost),
+        "cost_vs_levels": [{"label": lv["label"], "price": lv["price"], "cost_is": relation(lv["price"])} for lv in levels],
+        "pattern_label": vp.get("pattern_label"),
+        "ma_alignment": tech.get("ma_alignment"),
+        "supports_below_close": supports,
+        "resistances_above_close": resistances,
+        "note": "價位全部來自日K收盤計算的均線、大量區與布林；僅供觀察，不是買賣指令或目標價",
+    }
+
+
+# ============================================================
 # Tool 註冊表
 # ============================================================
 
@@ -2577,6 +2631,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
+    "get_cost_position_context": get_cost_position_context,
     "get_branch_stock_position": get_branch_stock_position,
     "get_stock_overview": get_stock_overview,
     "get_technical_analysis": get_technical_analysis,
@@ -2597,6 +2652,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
 _CANCELLABLE_TOOLS = {"get_warrant_branch", "get_high_winrate_branches_buying"}
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "get_cost_position_context": "持股成本相對現價、均線、大量區、布林的位置與上下關鍵價位（參數 stock_code, cost_price）",
     "get_sheet_stock_chips": "個股權證籌碼（Google Sheet 優先）：回測追蹤分點近期 A~E 事件、部位狀態、減碼出清、勝率（參數 stock_code, days）",
     "get_branch_stock_position": "分點在某股票的部位是否還在（回測 FIFO 狀態＋每日賣出明細）（參數 branch_name, stock_code）",
     "get_stock_overview": "股價概況：收盤、漲跌幅、成交量、均量、量比（參數 stock_code）",
@@ -2616,6 +2672,7 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 _TOOL_FAILURE_MESSAGES.update({
+    "get_cost_position_context": "成本位置資料目前無法取得",
     "get_sheet_stock_chips": "Google Sheet 分點籌碼目前無法取得",
     "get_branch_stock_position": "分點部位資料目前無法取得",
     "get_branch_event_performance": "分點事件別績效目前無法取得",
