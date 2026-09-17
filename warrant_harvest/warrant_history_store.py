@@ -51,6 +51,9 @@ for _s in (sys.stdout, sys.stderr):
 # 路徑：與主程式的規則保持一致，避免兩邊各自為政
 # ══════════════════════════════════════════════════════════════════════
 
+# 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。改任何一支都要一起升。
+HARVEST_BUILD = "2026-09-18.1"
+
 DEFAULT_OUTPUT_DIR = (
     "output"
     if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
@@ -166,6 +169,19 @@ def load_store(kind):
 # 合併：聯集，只進不出
 # ══════════════════════════════════════════════════════════════════════
 
+# 鍵欄位之間的分隔字元：選一個不可能出現在代號、日期、價格裡的控制字元。
+# 用 chr() 明寫，不要直接把控制字元貼進原始碼 —— 看不見，很容易被誤改。
+KEY_SEPARATOR = chr(1)
+
+
+def _row_keys(df, keys):
+    """把多個鍵欄位接成一個字串鍵（向量化）。浮點鍵 astype(str) 後兩邊格式一致。"""
+    parts = [df[k].astype(str) for k in keys]
+    if len(parts) == 1:
+        return parts[0].reset_index(drop=True)
+    return parts[0].str.cat(parts[1:], sep=KEY_SEPARATOR).reset_index(drop=True)
+
+
 def merge_frames(existing, incoming, keys, date_column, run_stamp=None):
     """
     append-only 合併的本體。抽出來讓參考資料那支程式共用 ——
@@ -208,21 +224,27 @@ def merge_frames(existing, incoming, keys, date_column, run_stamp=None):
         stats["合併後"] = len(merged)
         return merged, stats
 
-    existing, _ = _normalize_dates(existing, date_column)
+    # 既有累積庫的日期在寫入時就已經正規化過，不再對幾百萬列重跑一次 to_datetime。
 
     # 用鍵做左右比對，判斷哪些是全新的、哪些是既有列的新版本。
-    existing_keys = existing[keys].astype(str).agg("\u0001".join, axis=1)
-    incoming_keys = incoming[keys].astype(str).agg("\u0001".join, axis=1)
-    known = set(existing_keys)
-    is_new = ~incoming_keys.isin(known)
+    # 鍵必須向量化組出來：舊版逐列 .agg(join, axis=1) 是在跑 Python 迴圈，
+    # 實測 293 萬列要 51 秒、2.57 GB，而且隨累積庫變大線性惡化。
+    existing_keys = _row_keys(existing, keys)
+    incoming_keys = _row_keys(incoming, keys)
+    is_new = ~incoming_keys.isin(existing_keys)
     stats["新增"] = int(is_new.sum())
     stats["更新"] = int((~is_new).sum())
 
-    # 既有列的首次入庫要保留；新列才蓋今天。
-    first_seen = dict(zip(existing_keys, existing.get("首次入庫", pd.Series(dtype=str))))
-    incoming["首次入庫"] = [
-        first_seen.get(k) or run_stamp for k in incoming_keys
-    ]
+    # 既有列的首次入庫要保留；新列（或舊檔沒有這欄）才蓋今天。
+    if "首次入庫" in existing.columns:
+        lookup = pd.Series(existing["首次入庫"].to_numpy(), index=existing_keys.to_numpy())
+        lookup = lookup[~lookup.index.duplicated(keep="first")]
+        first_seen = incoming_keys.map(lookup)
+        incoming["首次入庫"] = first_seen.where(
+            first_seen.notna() & (first_seen.astype(str) != ""), run_stamp
+        ).to_numpy()
+    else:
+        incoming["首次入庫"] = run_stamp
 
     # concat 後 keep="last"：同一把鑰匙以本次為準（MoneyDJ 可能事後修正），
     # 但沒有出現在本次批次的舊列會原封不動留著 —— 這就是 append-only。
@@ -272,7 +294,7 @@ def save_store(kind, merged, previous_rows):
 def cmd_merge(args):
     run_stamp = datetime.today().strftime("%Y/%m/%d")
     print("=" * 74)
-    print(f"📥 併入累積庫｜{run_stamp}")
+    print(f"📥 併入累積庫｜{run_stamp}｜程式版本 {HARVEST_BUILD}")
     print(f"   快取來源 {CACHE_DIR}")
     print(f"   累積庫   {STORE_DIR}")
     print("=" * 74)
