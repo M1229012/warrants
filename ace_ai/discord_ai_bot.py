@@ -82,6 +82,8 @@ class BotConfig:
     guild_ids: Set[int] = field(default_factory=set)
     ephemeral: bool = False
     allow_all_users: bool = False
+    # 本週精選限定使用者（Discord 使用者 ID，逗號分隔）；沒設定時任何人都不能用。
+    weekly_pick_user_ids: Set[int] = field(default_factory=set)
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -100,6 +102,7 @@ class BotConfig:
             guild_ids=_parse_id_set(os.getenv("DISCORD_AI_GUILD_IDS", "")),
             ephemeral=_env_flag("DISCORD_AI_EPHEMERAL"),
             allow_all_users=_is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
+            weekly_pick_user_ids=_parse_id_set(os.getenv("DISCORD_AI_WEEKLY_PICK_USER_IDS", "")),
         )
 
 
@@ -375,7 +378,7 @@ class QueryPlan:
 
 HELP_MESSAGE = (
     "我可以幫你查股票與權證分點資料（`/ask 問題` 或 `!ace 問題` 都可以），例如：\n"
-    "• `/ask 本週精選`（可加：勝率70%以上／只看D事件／永豐金內湖／買超1000萬以上／靠近月線／排除漲太多／refresh）\n"
+    "• `/ask 本週精選`（管理員限定；可加：勝率70%以上／只看D事件／永豐金內湖／買超1000萬以上／靠近月線／排除漲太多／refresh）\n"
     "• `/ask 永豐金內湖D事件勝率`\n"
     "• `!ace 2344股價`\n"
     "• `!ace 2344現在技術面怎麼樣`\n"
@@ -805,7 +808,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 8. 語氣自然、口語、不要過度艱深。
 9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
-11. 不提供目標價、報酬預測或「買進／賣出」這類直接指令；但使用者問型態、成本或操作時，不可拒答，必須依序用型態、大量區、均線（再來才是布林與籌碼）給出客觀觀察重點：目前位置、關鍵支撐與壓力價位（只能使用 tool_results 的價位）、以及「若守住／若跌破／若站回」各代表什麼，並寫在【觀察重點】。有成本價時要說明成本相對現價、均線與大量區的位置。
+11. 不提供目標價、報酬預測或「買進／賣出／加碼／停損價」這類替使用者下決定的指令；但使用者問型態、成本或「怎麼操作」時，不可拒答，也不可只丟資料不回答。一定要先寫【回答】，用 2～4 句直接回應使用者的問題（照使用者的問法回答，例如問「成本 143 怎麼操作參考」就先說成本相對現價的位置與帳面損益 unrealized_pct，再用條件句給操作參考框架：「若守住 A 價位，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位與自己的風險承受度；若站上 C，…」，A／B／C 只能用 tool_results 的價位，說的是一般市場參與者的觀察方式，不是替使用者決定）。問「型態好嗎」就先直接說好或不好及分數與最主要的一個原因。其餘段落再依序用型態、大量區、均線（再來才是布林與籌碼）補充；有成本價時說明成本相對現價、均線與大量區的位置。
 12. 涉及新聞時，只能引用 tool_results 裡 get_recent_news 的 title、summary、content、summary_points（鉅亨網的「公司名:本公司…」標題是公司重大訊息公告，屬正式事實），不可補充其他來源或自己知道的消息。新聞統整規則：
    - 不要逐條重列標題。先把同一件事（event_key 相同或內容明顯是同一事件的多家報導）合併，整理成 2～4 個重點，每個重點寫清楚：發生什麼事、關鍵數字（金額、比例、時程、產品、客戶，只能用 content／summary 出現過的數字）、消息來源與日期。
    - 標題中的聳動字眼（例如「暴賺」「超狂」「開炸」）不是事實，不可照抄成結論；法人或分析師的目標價、獲利預估要寫明「某某機構估計」，屬於看法不是事實。
@@ -818,7 +821,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 16. 布林判讀依 bollinger.rules 的本專案門檻；null 或資料不足不可判定有／沒有。影線穿越不等於收盤突破；持續軌外不等於本日首次突破。
 17. 壓縮只代表波動收斂，不預測突破方向；觸軌不單獨推論反轉，未符合橫盤條件不可稱為橫盤。若資料不足60個有效帶寬，不可宣稱壓縮已成立。
 18. 有 get_pattern_scorecard 時，圖片上方已經另外畫出「型態評分卡」（分數與五大項、得分依據／失分原因、均線扣抵表、關鍵價位表、追蹤分點動向表），文字不要逐項重抄：
-   - 【型態】第一句寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要得分與失分的項目（components、plus_reasons、minus_reasons）。分數只代表技術結構，不可寫成推薦或看多看空結論。
+   - 【型態】（若【回答】已寫分數就不再重複分數）寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要得分與失分的項目（components、plus_reasons、minus_reasons）。分數只代表技術結構，不可寫成推薦或看多看空結論。
    - 【均線與大量區】要依 get_technical_analysis 的 ma_deduction 說明 MA20（必要時 MA60）目前方向與扣抵狀況（signal）；推算是「收盤維持不變」的條件推算，不可寫成預測。
    - 【觀察重點】不可重複【型態】【均線與大量區】已經寫過的描述，改寫成 3～4 行，每行以「・」開頭：
      ・價位：挑 1 個最近的支撐與 1 個最近的壓力（resistances_above_close／supports_below_close），說明「守住／跌破／站回」各代表型態會怎麼變化。
@@ -828,7 +831,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
-接著只放相關區塊。型態、成本、操作類問題依序使用：【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】；只問新聞的問題依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】（沒有新聞資料就省略新聞相關區塊）
+接著只放相關區塊。型態、成本、操作類問題依序使用：【回答】、【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】（【回答】已寫過的結論，後面段落不要重複）；只問新聞的問題依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】（沒有新聞資料就省略新聞相關區塊）
 最後一行：「資料時間：」列出各類資料的日期或統計期間。"""
 
 
@@ -1679,6 +1682,12 @@ class AccessGuard:
             return "請在指定的 AI 測試頻道使用艾斯 AI。"
         return ""
 
+    def check_weekly_pick(self, user_id: int) -> str:
+        """本週精選只開放 DISCORD_AI_WEEKLY_PICK_USER_IDS 內的使用者；回傳拒絕訊息，允許時回傳空字串。"""
+        if user_id in self.config.weekly_pick_user_ids:
+            return ""
+        return "「本週精選」目前只開放管理員使用；一般個股、權證分點問題可以照常詢問。"
+
     def acquire(self, user_id: int) -> str:
         """冷卻與重複執行檢查；允許時回傳空字串並登記執行中。"""
         now = time.time()
@@ -1752,6 +1761,10 @@ def run_discord_bot(config: BotConfig) -> None:
         print(f"ℹ️ DISCORD_AI_ALLOWED_USER_IDS=*：不限使用者，只限 {scope} 內使用（不接受私訊）")
     elif not config.allowed_user_ids:
         print("⚠️ DISCORD_AI_ALLOWED_USER_IDS 未設定：所有人呼叫都會收到「尚未開放」")
+    if config.weekly_pick_user_ids:
+        print(f"🔒 本週精選限定使用者：{sorted(config.weekly_pick_user_ids)}")
+    else:
+        print("⚠️ DISCORD_AI_WEEKLY_PICK_USER_IDS 未設定：任何人都不能使用本週精選")
 
     answer_image.font(29)  # Fail early if CJK fonts were not installed.
     tools.core()
@@ -1855,6 +1868,12 @@ def run_discord_bot(config: BotConfig) -> None:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
+        if is_weekly_pick_question(question):
+            weekly_denied = guard.check_weekly_pick(user_id)
+            if weekly_denied:
+                engine.log(f"本週精選拒絕使用者 {user_id}")
+                await interaction_image(interaction, "使用權限", weekly_denied, ephemeral=True)
+                return
         busy = guard.acquire(user_id)
         if busy:
             await interaction_image(interaction, "請稍候", busy, ephemeral=True)
@@ -1897,6 +1916,12 @@ def run_discord_bot(config: BotConfig) -> None:
         if not question:
             await reply_image(message, "!ace 使用說明", HELP_MESSAGE)
             return
+        if is_weekly_pick_question(question):
+            weekly_denied = guard.check_weekly_pick(user_id)
+            if weekly_denied:
+                engine.log(f"本週精選拒絕使用者 {user_id}")
+                await reply_image(message, "使用權限", weekly_denied)
+                return
         busy = guard.acquire(user_id)
         if busy:
             await reply_image(message, "請稍候", busy)
