@@ -794,45 +794,35 @@ class GeminiGateway:
 # 最終回答 Prompt 與數字核對
 # ============================================================
 
-FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
-你只能依照系統提供的 tool_results 回答。
-
+FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能依 tool_results 回答。
 規則：
-1. 不得自行創造任何數據（股價、勝率、分點、金額、均線、大量區、法人資料、新聞都一樣）。
-2. 數字必須完全使用 tool_results 裡的數值或文字，金額沿用原本的「萬／億」寫法；不可四捨五入成約數（例如原文 354 億不可寫成約 350 億），不同報導數字不一致時照各自原文寫並註明來源。
-3. 如果資料缺失（available=false、found=false 或欄位為空），明確指出「目前沒有取得足夠資料」，不可猜測。
-4. 分清楚：客觀數據、系統統計、AI 解讀；AI 解讀請加上「AI 解讀：」開頭。
-5. 不要把「歷史勝率」描述成未來保證。
-6. small_sample=true 或樣本數少時，要主動提醒樣本數偏少。
-7. 資料日期要說清楚，並提醒股價為日K收盤資料、不是盤中即時。
-8. 語氣自然、口語、不要過度艱深。
-9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
-10. 優先回答使用者真正問的問題，只放相關區塊。
-11. 不提供目標價、報酬預測或「買進／賣出／加碼／停損價」這類替使用者下決定的指令；但使用者問型態、成本或「怎麼操作」時，不可拒答，也不可只丟資料不回答。一定要先寫【回答】，用 2～4 句直接回應使用者的問題（照使用者的問法回答，例如問「成本 143 怎麼操作參考」就先說成本相對現價的位置與帳面損益 unrealized_pct，再用條件句給操作參考框架：「若守住 A 價位，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位與自己的風險承受度；若站上 C，…」，A／B／C 只能用 tool_results 的價位，說的是一般市場參與者的觀察方式，不是替使用者決定）。問「型態好嗎」就先直接說好或不好及分數與最主要的一個原因。其餘段落再依序用型態、大量區、均線（再來才是布林與籌碼）補充；有成本價時說明成本相對現價、均線與大量區的位置。
-12. 涉及新聞時，只能引用 tool_results 裡 get_recent_news 的 title、summary、content、summary_points（鉅亨網的「公司名:本公司…」標題是公司重大訊息公告，屬正式事實），不可補充其他來源或自己知道的消息。新聞統整規則：
-   - 不要逐條重列標題。先把同一件事（event_key 相同或內容明顯是同一事件的多家報導）合併，整理成 2～4 個重點，每個重點寫清楚：發生什麼事、關鍵數字（金額、比例、時程、產品、客戶，只能用 content／summary 出現過的數字）、消息來源與日期。
-   - 標題中的聳動字眼（例如「暴賺」「超狂」「開炸」）不是事實，不可照抄成結論；法人或分析師的目標價、獲利預估要寫明「某某機構估計」，屬於看法不是事實。
-   - 利多／利空一定要客觀，分開寫：【可能利多】寫新聞中對公司營運有正面影響的具體因素；【可能利空／風險】寫同一批新聞裡的成本、稀釋、整合、競爭、執行時程、資金壓力等風險，新聞沒有提到的風險不可自行推測，沒有就寫「新聞內容未提及明顯利空，但資訊有限」。
-   - 最後【綜合觀察】用 1～2 句說明利多利空的相對份量與還需要確認的資訊（例如交易細節、主管機關核准、完成時程），不可下「買進／賣出」或「一定漲／跌」的結論；有 get_stock_overview 時可說明資料日收盤與漲跌幅作為市場當下反應，但不可推論因果。
-   - content_source 為「鉅亨網原文」才是文章內文；「RSS 摘要」內容較少、「僅標題」只有標題，這兩種只能描述標題寫到的事實，不可過度解讀或自行補充細節。
-13. 不要把「買超」直接等同「看多必漲」。
-14. 不要把「高歷史勝率」直接說成這次一定成功。
-15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
-16. 布林判讀依 bollinger.rules 的本專案門檻；null 或資料不足不可判定有／沒有。影線穿越不等於收盤突破；持續軌外不等於本日首次突破。
-17. 壓縮只代表波動收斂，不預測突破方向；觸軌不單獨推論反轉，未符合橫盤條件不可稱為橫盤。若資料不足60個有效帶寬，不可宣稱壓縮已成立。
-18. 有 get_pattern_scorecard 時，圖片上方已經另外畫出「型態評分卡」（分數與五大項、得分依據／失分原因、均線扣抵表、關鍵價位表、追蹤分點動向表），文字不要逐項重抄：
-   - 【型態】（若【回答】已寫分數就不再重複分數）寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要得分與失分的項目（components、plus_reasons、minus_reasons）。分數只代表技術結構，不可寫成推薦或看多看空結論。
-   - 【均線與大量區】要依 get_technical_analysis 的 ma_deduction 說明 MA20（必要時 MA60）目前方向與扣抵狀況（signal）；推算是「收盤維持不變」的條件推算，不可寫成預測。
-   - 【觀察重點】不可重複【型態】【均線與大量區】已經寫過的描述，改寫成 3～4 行，每行以「・」開頭：
-     ・價位：挑 1 個最近的支撐與 1 個最近的壓力（resistances_above_close／supports_below_close），說明「守住／跌破／站回」各代表型態會怎麼變化。
-     ・分數：依 minus_reasons 說明哪個失分條件改善就能補回分數（例如站回 MA20、MA20 扣抵後不再下彎），或 plus_reasons 中哪個條件消失會失分，只說條件，不預測會不會發生。
-     ・扣抵：若 ma_deduction 的 MA20 或 MA60 有 turn（轉下彎／轉上揚），寫出「明日收盤需高於 tomorrow_close_needed_to_rise 均線才會上揚」與 turn_day；沒有 turn 就省略這行。
-     ・分點：依 tracked_branches 點名 1～2 個值得追蹤的分點（高勝率、仍持有中者優先），寫出它最近的事件與部位狀態，以及「後續若出現減碼／出清或再加碼」代表籌碼面的變化；tracked_branches 為空時寫「近 20 個交易日追蹤分點沒有 A～E 事件」。
+1. 不可自創任何數據；數字照 tool_results 原樣寫（萬／億寫法不變、不可四捨五入成約數）。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。
+2. AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
+3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
+4. 回答排進圖片，口語、精簡，每段 1～3 句；同一件事只講一次，不同段落不可重複相同的數字或結論。
+5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間（股價為日K收盤資料）。"""
 
-輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
-第一行：**股票名稱（代號）** 或 **分點名稱**
-接著只放相關區塊。型態、成本、操作類問題依序使用：【回答】、【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】（【回答】已寫過的結論，後面段落不要重複）；只問新聞的問題依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】（沒有新聞資料就省略新聞相關區塊）
-最後一行：「資料時間：」列出各類資料的日期或統計期間。"""
+FINAL_TECH_RULES = """技術面規則：布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀；null 不可判定有或沒有。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
+
+FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
+- 同一事件的多篇報導合併，整理成 2～4 點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、來源與日期；不要逐條重列標題。
+- 聳動字眼不是事實；法人目標價、獲利預估要寫「某機構估計」。content_source 為「RSS 摘要」或「僅標題」時只描述標題寫到的事實。
+- 【可能利多】【可能利空／風險】分開寫，只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。【綜合觀察】1～2 句說明份量與待確認資訊，不下漲跌結論。"""
+
+FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
+圖片上已畫出 K 線（均線、布林、大量區、分點買賣標註）與型態評分卡（分數、五大項、主要得分失分、均線扣抵、關鍵價位、追蹤分點動向），這些內容不要逐項重抄。只寫兩個區塊：
+【回答】3～5 句直接回應問題、不可拒答：
+- 問成本／操作：先說成本相對現價與帳面損益 unrealized_pct，再用條件句給參考框架「若守住 A，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位；若站上 C，…」。A／B／C 只能用 supports_below_close／resistances_above_close 的價位，是一般觀察方式，不是替使用者決定。
+- 問型態好不好：直接說好或不好、型態分數 pattern_score／100（grade），以及影響最大的一個得分與一個失分原因。
+- 分數只代表技術結構，不可說成推薦。
+【觀察重點】最多 3 行，每行以「・」開頭，只寫圖上沒有的「條件與意義」：
+・扣抵／均線：ma_deduction 的 MA20 或 MA60 有 turn 時，寫「明日收盤需高於 tomorrow_close_needed_to_rise 均線才會上揚」與 turn_day；沒有 turn 時改寫 minus_reasons 中哪個條件改善可補回分數。
+・技術訊號：只有 bollinger（壓縮、沿軌、突破）或 kd／macd signals 有明確訊號時才寫一句，沒有就省略這行。
+・分點：點名 1～2 個 tracked_branches（高勝率、持有中優先），說明後續減碼／出清或再加碼代表的籌碼變化；沒有就寫「近 20 個交易日追蹤分點沒有 A～E 事件」。"""
+
+FINAL_FORMAT_GENERAL = """區塊依序使用（只放有資料、和問題相關的）：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
+FINAL_FORMAT_NEWS = """區塊依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
+FINAL_FORMAT_PATTERN = """區塊只用：【回答】、【觀察重點】。"""
 
 
 def _prune_empty(value: Any) -> Any:
@@ -845,20 +835,87 @@ def _prune_empty(value: Any) -> Any:
     return value
 
 
+# 送進 Gemini 前拿掉的欄位：說明文字（規則已寫在 prompt）、圖片專用或重複的欄位。
+_PAYLOAD_DROP_KEYS = {
+    "data_source", "indicator_definition", "volume_unit_note", "definition_note", "note", "rules", "method",
+    "source_type", "summary_points_source", "url", "squeeze_reference_count", "squeeze_threshold_pct",
+    "mid_change_10d_pct", "close_range_10d_pct", "volume_ratio_prior20",
+}
+_BOLLINGER_KEEP = {"upper", "mid", "lower", "percent_b", "width_pct_of_mid", "position", "signals", "width_trend",
+                   "width_change_5d_pct", "squeeze", "sideways", "band_walk", "breakout_up", "breakout_down",
+                   "return_inside", "squeeze_breakout"}
+
+
+def _drop_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_keys(v) for k, v in value.items() if k not in _PAYLOAD_DROP_KEYS}
+    if isinstance(value, list):
+        return [_drop_keys(v) for v in value]
+    return value
+
+
+def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> Optional[Dict[str, Any]]:
+    """依問題類型精簡 Tool 資料；回傳 None 表示這份資料已被型態評分卡涵蓋，不必再送。"""
+    if has_scorecard and name in ("get_cost_position_context", "get_sheet_stock_chips", "get_volume_profile"):
+        return None  # 成本位置、支撐壓力、追蹤分點、量區型態都已整理在評分卡
+    data = dict(data)
+    if name == "get_technical_analysis":
+        data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
+        if has_scorecard:
+            # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
+            data = {k: data.get(k) for k in ("stock_code", "data_date", "kd", "macd", "bollinger", "ma20_cross_recent_3_days", "ma_kline_signals")}
+            data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
+            data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
+        else:
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn", "turn_day", "tomorrow_close_needed_to_rise")}
+                                    for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
+    elif name == "get_pattern_scorecard":
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn", "turn_day", "tomorrow_close_needed_to_rise")}
+                                for k, v in (data.get("ma_deduction") or {}).items()}
+        data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
+        data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
+    elif name == "get_stock_overview" and has_scorecard:
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "close", "change_pct", "volume_lots", "volume_ratio_vs_mv5")}
+    elif name == "get_recent_news":
+        data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
+                            for a in data.get("articles") or []]
+    return _drop_keys(data)
+
+
 def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
+    has_scorecard = any(r.ok and r.name == "get_pattern_scorecard" for r in results)
     tool_results: Dict[str, Any] = {}
     for result in results:
+        if result.ok:
+            data = _compact_tool_data(result.name, result.data, has_scorecard)
+            if data is None:
+                continue
+        else:
+            data = result.to_payload()
         key = result.name
         suffix = result.data.get("stock_code") or result.data.get("branch") or ""
         if key in tool_results or suffix:
             key = f"{key}:{suffix}" if suffix else f"{key}:{len(tool_results)}"
-        tool_results[key] = result.to_payload()
+        tool_results[key] = data
     return _prune_empty({"question": question, "tool_results": tool_results})
 
 
 def build_final_prompt(payload: Dict[str, Any]) -> str:
-    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return f"{FINAL_SYSTEM_PROMPT}\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
+    """只放這題用得到的規則：技術面、新聞、型態評分卡各自一段，避免每題都送全部規則。"""
+    names = {key.split(":", 1)[0] for key in (payload.get("tool_results") or {})}
+    sections = [FINAL_BASE_PROMPT]
+    if names & {"get_technical_analysis", "get_pattern_scorecard", "get_volume_profile"}:
+        sections.append(FINAL_TECH_RULES)
+    if "get_recent_news" in names:
+        sections.append(FINAL_NEWS_RULES)
+    if "get_pattern_scorecard" in names:
+        sections += [FINAL_PATTERN_RULES, FINAL_FORMAT_PATTERN]
+    elif names == {"get_recent_news"} or names == {"get_recent_news", "get_stock_overview"}:
+        sections.append(FINAL_FORMAT_NEWS)
+    else:
+        sections.append(FINAL_FORMAT_GENERAL)
+    payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
 
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])[-+]?\d[\d,]*(?:\.\d+)?")
