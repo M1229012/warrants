@@ -846,7 +846,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         },
         "support_reasons": (stock.get("score_reasons") or {}).get("support"),
         "technical_reasons": (stock.get("score_reasons") or {}).get("technical"),
-        "quality_flags": stock["quality_flags"],
+        "quality_notes": [_FLAG_TEXT.get(f, f) for f in stock["quality_flags"]],
     }
 
 
@@ -855,36 +855,62 @@ WEEKLY_PICK_SYSTEM_PROMPT = """你是我的私人台股研究助理。
 TOP5 已由 Python 依分數排好，你只負責解釋，不得更改排名、不得新增或刪除股票。
 只能根據 tool_results 提供的資料回答，不得自行補充不存在的數據（股價、勝率、分點、金額、均線、大量區、新聞都一樣）。
 
-分析權證分點時的優先順序：
-1. 本次 matched A/B/C/D/E 事件的 adjusted_win_rate（修正勝率）
-2. 本次事件 raw_win_rate 與樣本數 sample_included
-3. weighted_return（加權報酬）
-4. recent_behavior（近期操作）
-5. overall_background（總勝率，只能當背景）
-規則：
-- overall 很高但本次事件勝率差（flag overall_high_but_event_weak），必須提醒。
-- overall 普通但本次事件歷史表現很好（flag event_strong_overall_average），也要指出。
-- 近期操作只能當 context，不得因最近幾筆成功就說分點勝率很高。提到近期案例時必須同時寫出已有結果筆數、勝敗與仍未完成筆數，例如「最近10筆案例中，6筆已有結果，其中4勝2敗；另4筆仍未完成」。
-- 未完成案例不能算成功。
-- 有 low_sample、unresolved_cases_high、extended_price、overhead_resistance、branch_recently_reducing、conflicting_signals 等 flag 時要寫進【注意】。
-- 不要把買超等同看多必漲，不要把高歷史勝率說成這次一定成功，不提供目標價或報酬預測。
-- 金額沿用資料中的「萬／億」文字。
+每檔股票的判讀順序（一定照這個順序思考與撰寫）：
+1. 型態：先用 volume_profile.pattern_label 與 recent_maximum_zone_event 判斷目前價格型態好壞。
+2. 大量區與均線：現價相對第一／第二大量區的位置、是否有支撐或壓力；均線排列、MA20／MA60 位置與距離。
+3. 布林：technical.bollinger 的位置、帶寬變化、是否沿軌（壓縮不預測方向，影線穿越不等於收盤突破）。
+4. 權證籌碼：本次事件的修正勝率與樣本數優先，其次加權報酬；總勝率（overall_background）只能當背景。
+5. 分點近期操作：只能當參考；提到近期案例時必須同時寫出已有結果筆數、勝敗與仍未完成筆數。
 
-輸出格式（Discord 訊息，不要表格、不要程式碼區塊）：
-📊 艾斯 AI｜本週精選候選
-第一名用完整格式：
-🥇 代號 名稱
-綜合分數：xx / 100
-【權證】主力分點與本次買進、本次符合的事件、各事件歷史（勝率｜n=樣本）、總勝率（背景）、本次主要加分來源
-【分點近期操作】是否持續加碼／減碼、近期案例 completed 與 unresolved
-【技術面】3～4 點
-【優點】2～4 點
-【注意】1～3 點
-【適合週報的原因】1～2 句
-第二～五名（🥈🥉4️⃣5️⃣）用精簡格式：分數、權證一句、事件勝率一句、技術一句、注意一句。
-全文控制在 2500 字以內。"""
+寫作規則：
+- 全部使用繁體中文。嚴禁輸出任何英文欄位名稱或程式代碼（例如 adjusted_win_rate、quality_flags、unresolved 等），需要時改用中文說法（修正勝率、樣本數、未完成案例）。
+- quality_notes 是已翻成中文的提醒，負面項目寫進 cautions，正面項目可寫進 strengths。
+- 總勝率高但本次事件勝率偏弱、或總勝率普通但本次事件表現佳時，要在 warrant 中點出。
+- 未完成案例不能算成功；不要把買超等同看多必漲；不要把高歷史勝率說成這次一定成功；不提供目標價或報酬預測。
+- 金額沿用資料中的「萬／億」文字，數字只能使用資料中出現過的數值。
+- 每個欄位 1～2 句、口語清楚；strengths 與 cautions 各 1～3 點、每點 25 字以內；headline 18 字以內。
 
-WEEKLY_PICK_SYSTEM_PROMPT += "\n技術面需參考 bollinger.signals、squeeze、sideways、width_trend 與 band_walk；依 rules 門檻解讀，null 為資料不足；壓縮不預測方向，影線穿越不等於收盤突破。"
+只輸出符合 JSON Schema 的 JSON：
+overview：一句話總結這份 TOP5 的共同特徵（40 字以內）
+candidates：依 TOP5 順序，每檔包含 stock_code、headline、pattern、volume_and_ma、bollinger、warrant、branch_behavior、strengths、cautions、why_for_report。"""
+
+
+WEEKLY_CARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overview": {"type": "string"},
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "stock_code": {"type": "string"},
+                    "headline": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "volume_and_ma": {"type": "string"},
+                    "bollinger": {"type": "string"},
+                    "warrant": {"type": "string"},
+                    "branch_behavior": {"type": "string"},
+                    "strengths": {"type": "array", "items": {"type": "string"}},
+                    "cautions": {"type": "array", "items": {"type": "string"}},
+                    "why_for_report": {"type": "string"},
+                },
+                "required": ["stock_code", "headline", "pattern", "volume_and_ma", "bollinger", "warrant",
+                             "branch_behavior", "strengths", "cautions", "why_for_report"],
+            },
+        },
+    },
+    "required": ["overview", "candidates"],
+}
+
+CARD_TEXT_FIELDS = ("headline", "pattern", "volume_and_ma", "bollinger", "warrant", "branch_behavior", "why_for_report")
+_ENGLISH_CODE_RE = re.compile(r"[（(]?\s*\b[a-z]+(?:_[a-z0-9]+)+\b\s*[）)]?")
+
+
+def strip_english_codes(text: str) -> str:
+    """保險：移除 AI 誤抄的英文欄位代碼（例如「（unresolved_cases_high）」）。"""
+    cleaned = _ENGLISH_CODE_RE.sub("", str(text or ""))
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
 def build_gemini_prompt(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -903,7 +929,7 @@ def build_gemini_prompt(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return f"{WEEKLY_PICK_SYSTEM_PROMPT}\n\ntool_results（JSON）：\n{text}\n", payload
 
 
-_KEEP_EMPTY_KEYS = {"quality_flags", "triggered_events"}
+_KEEP_EMPTY_KEYS = {"quality_flags", "quality_notes", "triggered_events"}
 
 
 def tools_prune(value: Any) -> Any:
@@ -1020,6 +1046,166 @@ def format_rule_based(result: Dict[str, Any]) -> str:
 
 
 # ============================================================
+# 卡片資料（圖片版面用）
+# ============================================================
+
+SCORE_PARTS = (
+    ("event_performance_score", "事件績效", 25),
+    ("recent_branch_behavior_score", "近期操作", 10),
+    ("warrant_amount_score", "權證金額", 25),
+    ("technical_score", "技術型態", 25),
+    ("support_score", "支撐品質", 15),
+)
+
+
+def mark_branches(stock: Dict[str, Any]) -> List[str]:
+    """K 線要標註的分點＝這檔候選實際用來評分的分點（主力＋高品質分點）。"""
+    names = [stock["lead"]["branch"]] + [p["branch"] for p in stock.get("high_quality_pairs") or []]
+    return list(dict.fromkeys(names))[:4]
+
+
+def card_facts(stock: Dict[str, Any]) -> Dict[str, Any]:
+    """卡片上的固定數據（全部來自 Python 計算，不經過 AI）。"""
+    lead = stock["lead"]
+    tech = stock.get("technical") or {}
+    vp = stock.get("volume_profile") or {}
+    ma20 = (tech.get("moving_averages") or {}).get("MA20") or {}
+    overall = lead.get("overall") or {}
+    event_lines = []
+    for code, m in lead["event_performance"].items():
+        if m.get("raw_win_rate") is None and m.get("adjusted_win_rate") is None:
+            event_lines.append(f"{code} 事件｜勝率統計無資料")
+            continue
+        line = f"{code} 事件｜勝率 {m.get('raw_win_rate')}%（修正 {m.get('adjusted_win_rate')}%）｜樣本 {_count_text(m.get('included_count'))}"
+        if m.get("unresolved_count"):
+            line += f"｜未完成 {_count_text(m.get('unresolved_count'))}"
+        event_lines.append(line)
+    return {
+        "rank": stock["rank"],
+        "stock_code": stock["stock_code"],
+        "stock_name": stock.get("stock_name", ""),
+        "score": stock["score"],
+        "score_parts": [
+            {"label": label, "value": stock["score_breakdown"].get(key, 0), "max": maximum}
+            for key, label, maximum in SCORE_PARTS
+        ],
+        "pattern_label": vp.get("pattern_label") or "型態資料不足",
+        "ma_alignment": tech.get("ma_alignment") or "-",
+        "ma20_text": f"MA20 {ma20.get('position', '-')} {ma20.get('distance_pct')}%" if ma20.get("distance_pct") is not None else "",
+        "lead_branch": lead["branch"],
+        "lead_amount_text": lead["event_buy_amount_text"],
+        "triggered_events": lead["triggered_events"],
+        "event_lines": event_lines,
+        "overall_line": f"總勝率（背景）{overall.get('raw_win_rate', '-')}%｜樣本 {_count_text(overall.get('included_count'))}",
+        "other_branches": [p["branch"] for p in stock.get("high_quality_pairs") or [] if p["branch"] != lead["branch"]][:3],
+        "mark_branches": mark_branches(stock),
+        "data_date": tech.get("data_date", ""),
+    }
+
+
+def rule_card_text(stock: Dict[str, Any]) -> Dict[str, Any]:
+    """Gemini 不可用時的中文卡片內容（只整理數據，不做 AI 解讀）。"""
+    lead = stock["lead"]
+    tech = stock.get("technical") or {}
+    vp = stock.get("volume_profile") or {}
+    mas = tech.get("moving_averages") or {}
+    ma20, ma60 = mas.get("MA20") or {}, mas.get("MA60") or {}
+    mz = vp.get("maximum_volume_zone") or {}
+    behavior = stock.get("behavior") or {}
+    recent = behavior.get("branch_recent") or {}
+    flags = stock.get("quality_flags") or []
+    events = "、".join(lead["triggered_events"])
+    return {
+        "headline": f"{vp.get('pattern_label') or '型態待確認'}｜{events} 事件",
+        "pattern": f"目前型態為「{vp.get('pattern_label') or '資料不足'}」；{vp.get('recent_maximum_zone_event') or '近期沒有明確穿越最大量區'}。",
+        "volume_and_ma": (
+            f"{vp.get('position_vs_two_zones') or '大量區位置資料不足'}；最大量區 {mz.get('price_low', '-')}～{mz.get('price_high', '-')}。"
+            f"均線{tech.get('ma_alignment', '資料不足')}，MA20 {ma20.get('position', '-')}（{ma20.get('distance_pct', '-')}%），"
+            f"MA60 {ma60.get('position', '-')}（{ma60.get('distance_pct', '-')}%）。"
+        ),
+        "bollinger": "；".join((tech.get("bollinger") or {}).get("signals") or ["布林資料不足"]) + "。",
+        "warrant": f"{lead['branch']} 本次事件買進 {lead['event_buy_amount_text']}，符合 {events} 事件。",
+        "branch_behavior": (recent.get("recent_cases_sentence") or "近期操作資料不足。") + "（近期案例僅供參考）",
+        "strengths": [_FLAG_TEXT[f] for f in flags if f in _POSITIVE_FLAGS],
+        "cautions": [_FLAG_TEXT.get(f, f) for f in flags if f not in _POSITIVE_FLAGS],
+        "why_for_report": f"綜合分數 {stock['score']}，型態、支撐與權證事件都有可追蹤的內容。",
+    }
+
+
+def build_cards(result: Dict[str, Any], ai: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+    """合併 Python 事實與 AI 文字；AI 少給或給錯股票時該檔改用系統整理內容。"""
+    ai_by_code = {}
+    for item in (ai or {}).get("candidates") or []:
+        if isinstance(item, dict) and item.get("stock_code"):
+            ai_by_code[str(item["stock_code"]).strip()] = item
+    cards = []
+    for stock in result["top"]:
+        facts = card_facts(stock)
+        text = rule_card_text(stock)
+        item = ai_by_code.get(stock["stock_code"])
+        source = "rule"
+        if item:
+            source = "ai"
+            for key in CARD_TEXT_FIELDS:
+                if str(item.get(key) or "").strip():
+                    text[key] = strip_english_codes(item[key])
+            for key in ("strengths", "cautions"):
+                values = [strip_english_codes(v) for v in (item.get(key) or []) if str(v).strip()]
+                if values:
+                    text[key] = values[:3]
+        cards.append({**facts, **text, "text_source": source})
+    overview = strip_english_codes((ai or {}).get("overview") or "")
+    return cards, overview
+
+
+def cards_ai_text(cards: List[Dict[str, Any]], overview: str) -> str:
+    """把 AI 寫的文字串起來做數字核對。"""
+    parts = [overview]
+    for card in cards:
+        if card.get("text_source") != "ai":
+            continue
+        parts += [str(card.get(k, "")) for k in CARD_TEXT_FIELDS] + list(card.get("strengths") or []) + list(card.get("cautions") or [])
+    return "\n".join(p for p in parts if p)
+
+
+def cards_to_text(cards: List[Dict[str, Any]], overview: str, meta: Dict[str, Any]) -> str:
+    """文字版（CLI／圖片失敗時備用），順序與圖片一致。"""
+    lines = ["艾斯 AI｜本週精選候選"]
+    if overview:
+        lines.append(overview)
+    for card in cards:
+        lines += [
+            "",
+            f"#{card['rank']} {card['stock_code']} {card['stock_name']}｜綜合分數 {card['score']} / 100",
+            f"【型態】{card['pattern']}",
+            f"【大量區與均線】{card['volume_and_ma']}",
+            f"【布林】{card['bollinger']}",
+            f"【權證籌碼】{card['warrant']}",
+            *[f"　{line}" for line in card["event_lines"]],
+            f"　{card['overall_line']}",
+            f"【分點近期操作】{card['branch_behavior']}",
+        ]
+        if card.get("strengths"):
+            lines.append("【優點】" + "；".join(card["strengths"]))
+        if card.get("cautions"):
+            lines.append("【注意】" + "；".join(card["cautions"]))
+        lines.append(f"【適合週報的原因】{card['why_for_report']}")
+    lines += ["", meta.get("data_time", ""), meta.get("disclaimer", "")]
+    return "\n".join(line for line in lines if line is not None)
+
+
+def weekly_meta(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "filters": result.get("filters") or [],
+        "data_time": (
+            f"資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
+            f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
+        ),
+        "disclaimer": "※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。",
+    }
+
+
+# ============================================================
 # 快取與對外入口
 # ============================================================
 
@@ -1083,11 +1269,15 @@ class WeeklyPickAnswer:
     cache_hit: bool
     elapsed: float
     stock_codes: List[str] = field(default_factory=list)
+    cards: List[Dict[str, Any]] = field(default_factory=list)
+    overview: str = ""
+    meta: Dict[str, Any] = field(default_factory=dict)
+    notice: str = ""
 
 
 def run_weekly_pick(
     question: str,
-    generate: Callable[[str], Any],
+    generate: Callable[..., Any],
     find_ungrounded: Callable[[str, Dict[str, Any]], List[str]],
     rate_limit_message: str,
     log: Callable[[str], None] = print,
@@ -1108,46 +1298,62 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_bollinger_v1",
+        "weekly_pick_cards_v2",
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),
         str(config.min_event_win_rate),
         str(config.top_n),
     ])
+
+    def answer(item: Dict[str, Any], calls: int, cache_hit: bool, notice: str = "") -> WeeklyPickAnswer:
+        result = item["result"]
+        cards, overview, meta = item.get("cards") or [], item.get("overview", ""), weekly_meta(result)
+        text = cards_to_text(cards, overview, meta) if cards else format_rule_based(result)
+        if notice:
+            text = f"{notice}\n\n{text}"
+        return WeeklyPickAnswer(
+            text, calls, cache_hit, time.perf_counter() - started,
+            [c["stock_code"] for c in cards], cards, overview, meta, notice,
+        )
+
     cached = None if filters.refresh else _load_cache(config, cache_key)
-    if cached and cached.get("text"):
+    if cached and cached.get("ai_ok") and cached.get("cards"):
         stage_log("快取命中（同一份事件資料與條件），不重新計算、不呼叫 Gemini")
-        return WeeklyPickAnswer(cached["text"], 0, True, time.perf_counter() - started, [s["stock_code"] for s in cached.get("result", {}).get("top", [])])
+        return answer(cached, 0, True)
 
     engine = WeeklyPickEngine(config, log)
     result = cached["result"] if cached and cached.get("result") else engine.run(filters)
-    stock_codes = [s["stock_code"] for s in result["top"]]
-    rule_text = format_rule_based(result)
     if not result["top"]:
-        _save_cache(config, cache_key, {"result": result, "text": rule_text})
-        return WeeklyPickAnswer(rule_text, 0, False, time.perf_counter() - started)
+        item = {"result": result, "cards": [], "overview": "", "ai_ok": True}
+        _save_cache(config, cache_key, item)
+        return answer(item, 0, False)
 
     prompt, payload = build_gemini_prompt(result)
-    stage_log(f"Gemini prompt {len(prompt):,} 字（TOP{len(result['top'])}，1 次呼叫）")
-    response = generate(prompt)
+    stage_log(f"Gemini prompt {len(prompt):,} 字（TOP{len(result['top'])}，1 次呼叫，結構化卡片）")
+    response = generate(prompt, WEEKLY_CARD_SCHEMA)
     calls = 1
+    rule_cards, _ = build_cards(result, None)
     if not getattr(response, "ok", False):
         stage_log(f"Gemini 失敗：{getattr(response, 'error', '')}")
-        prefix = rate_limit_message if getattr(response, "rate_limited", False) else "AI 說明暫時無法使用，以下先提供系統計算結果。"
-        _save_cache(config, cache_key, {"result": result, "text": ""})
-        return WeeklyPickAnswer(f"{prefix}\n\n{rule_text}", calls, False, time.perf_counter() - started, stock_codes)
-    text = str(response.text or "").strip()
-    ungrounded = find_ungrounded(text, payload)
+        notice = rate_limit_message if getattr(response, "rate_limited", False) else "AI 說明暫時無法使用，以下為系統計算結果。"
+        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
+        _save_cache(config, cache_key, item)
+        return answer(item, calls, False, notice)
+    data = tools.core()._extract_json_from_text(response.text)
+    if not isinstance(data, dict):
+        stage_log("Gemini 回傳不是合法 JSON，改用系統整理內容")
+        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
+        _save_cache(config, cache_key, item)
+        return answer(item, calls, False, "AI 說明格式錯誤，以下為系統計算結果。")
+    cards, overview = build_cards(result, data)
+    ungrounded = find_ungrounded(cards_ai_text(cards, overview), payload)
     if ungrounded:
         stage_log(f"數字核對未通過：{ungrounded[:10]}")
-        _save_cache(config, cache_key, {"result": result, "text": ""})
-        return WeeklyPickAnswer(f"（AI 說明中有數字無法對應到原始資料，改顯示系統計算結果）\n\n{rule_text}", calls, False, time.perf_counter() - started, stock_codes)
-    text += (
-        f"\n\n資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
-        f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
-        "\n※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。"
-    )
-    _save_cache(config, cache_key, {"result": result, "text": text})
+        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
+        _save_cache(config, cache_key, item)
+        return answer(item, calls, False, "AI 說明中有數字無法對應到原始資料，以下為系統計算結果。")
+    item = {"result": result, "cards": cards, "overview": overview, "ai_ok": True}
+    _save_cache(config, cache_key, item)
     stage_log(f"完成｜Gemini {calls} 次｜總耗時 {time.perf_counter() - started:.1f}s")
-    return WeeklyPickAnswer(text, calls, False, time.perf_counter() - started, stock_codes)
+    return answer(item, calls, False)

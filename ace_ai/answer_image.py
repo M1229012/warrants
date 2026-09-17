@@ -22,6 +22,8 @@ WIDTH = 1440
 MARGIN = 64
 CONTENT = WIDTH - MARGIN * 2
 CHART_HEIGHT = 790
+# K 棒價格區加高（原本約 300px，加上標籤帶後 K 棒會被壓扁）。
+CHART_PRICE_EXTRA = 240
 # 分點買賣標註：K 線上下各留一條標籤帶（▲／▼＋最多 3 列編號圓圈），不和 K 棒重疊。
 MARK_LANE = 104
 MARK_BADGE_R = 11
@@ -193,9 +195,17 @@ def _mark_legend_layout(panel: dict) -> tuple[list[str], list[list[str]], int]:
     return title_lines, wrapped, height
 
 
+def mark_lanes(panel: dict) -> tuple[int, int]:
+    """（上方標籤帶, 下方標籤帶）高度：有出清／減碼才留上方，有買進才留下方，避免空白。"""
+    dates = {bar['date'] for bar in (panel or {}).get('bars') or []}
+    events = _mark_events(panel)
+    top = any(e.get('exit_date') in dates or e.get('reduce_date') in dates for e in events if e.get('exit_date') or e.get('reduce_date'))
+    bottom = any(e.get('buy_date') in dates for e in events)
+    return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
+
+
 def panel_height(panel: dict) -> int:
-    extra = 2 * MARK_LANE if _mark_events(panel) else 0
-    return CHART_HEIGHT + extra + _mark_legend_layout(panel)[2]
+    return CHART_HEIGHT + CHART_PRICE_EXTRA + sum(mark_lanes(panel)) + _mark_legend_layout(panel)[2]
 
 
 def _assign_rows(badges: list[dict]) -> None:
@@ -320,10 +330,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     band_colors = {'BB_UPPER': '#667085', 'BB_MID': '#76879A', 'BB_LOWER': '#667085'}
     for i, (key, label) in enumerate((('BB_UPPER', '布林上軌'), ('BB_MID', '中軌 = MA20'), ('BB_LOWER', '布林下軌'))):
         text_at(draw, (x0 + 34 + i * 400, y + 168), f'{label}  {number(last.get(key))}', 22, band_colors[key])
-    extra = 2 * MARK_LANE if _mark_events(panel) else 0
+    lane_top, lane_bottom = mark_lanes(panel)
+    extra = lane_top + lane_bottom + CHART_PRICE_EXTRA
     left, right, top, bottom = x0 + 36, x1 - 118, y + 225, y + 531 + extra
-    # 有標註時價格只畫在中間，上下標籤帶放 ▼／▲ 與編號圓圈。
-    price_top, price_bottom = (top + MARK_LANE, bottom - MARK_LANE) if extra else (top, bottom)
+    # 有標註時價格只畫在中間，上方標籤帶放 ▼／綠圈、下方標籤帶放 ▲／紅圈（沒有就不留白）。
+    price_top, price_bottom = top + lane_top, bottom - lane_bottom
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
     for b in bars:

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import warrant_ai_tools as tools
 import weekly_pick
 import answer_image
+import weekly_image
 from weekly_pick import is_weekly_pick_question
 
 
@@ -632,7 +633,7 @@ def tools_json_loads(text: str) -> Any:
 
 
 def build_planner_prompt(parsed: ParsedQuestion, sheet_metadata: List[Dict[str, Any]]) -> str:
-    tool_lines = "\n".join(f"- {name}：{tools.TOOL_DESCRIPTIONS[name]}" for name in PLANNER_TOOLS)
+    tool_lines = "\n".join(f"- {name}：{tools.TOOL_DESCRIPTIONS.get(name, name)}" for name in PLANNER_TOOLS)
     sheet_lines = "\n".join(
         f"- {s['worksheet']}：{s['description']}｜欄位：{'、'.join(s.get('columns', [])[:25])}"
         for s in sheet_metadata
@@ -1336,6 +1337,8 @@ class AnswerResult:
     cache_hit: bool = False
     cacheable: bool = False
     panels: List[Dict[str, Any]] = field(default_factory=list)
+    layout: str = "text"
+    weekly: Dict[str, Any] = field(default_factory=dict)
 
 
 class AceQueryEngine:
@@ -1373,9 +1376,10 @@ class AceQueryEngine:
         stats = AnswerStats()
         self.log(f"本週精選問題：{question}")
         panels = []
+        weekly: Dict[str, Any] = {}
 
-        def generate(prompt: str) -> GeminiResult:
-            result = self.gateway.generate(prompt, purpose="weekly_pick", temperature=0.3)
+        def generate(prompt: str, schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+            result = self.gateway.generate(prompt, purpose="weekly_pick", schema=schema, temperature=0.3)
             stats.record_gemini(result)
             return result
 
@@ -1388,7 +1392,10 @@ class AceQueryEngine:
                 log=self.log,
             )
             text, cache_hit = answer.text, answer.cache_hit
-            panels = self._get_chart_panels(answer.stock_codes)
+            branches = {card["stock_code"]: card.get("mark_branches") or [] for card in answer.cards}
+            panels = self._get_chart_panels(answer.stock_codes, branches)
+            if answer.cards:
+                weekly = {"cards": answer.cards, "overview": answer.overview, "meta": answer.meta, "notice": answer.notice}
         except tools.ToolDataError as exc:
             text, cache_hit = f"本週精選目前無法計算：{exc}", False
         except Exception as exc:  # 計算流程任何例外都不可讓 Bot 中斷
@@ -1396,11 +1403,18 @@ class AceQueryEngine:
             text, cache_hit = "本週精選計算時發生錯誤，請稍後再試（詳細原因已記錄在 console）。", False
         elapsed = time.perf_counter() - started
         self.log(f"本週精選完成｜Gemini 呼叫 {stats.gemini_calls} 次｜快取={cache_hit}｜總耗時 {elapsed:.1f}s")
-        return AnswerResult(text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit, panels=panels)
+        return AnswerResult(
+            text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit,
+            panels=panels, layout="weekly_pick" if weekly else "text", weekly=weekly,
+        )
 
-    def _get_chart_panels(self, codes: List[str]) -> List[Dict[str, Any]]:
+    def _get_chart_panels(self, codes: List[str], branches: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
         codes = list(dict.fromkeys(codes))
-        results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code}) for code in codes])
+        calls = []
+        for code in codes:
+            names = (branches or {}).get(code) or []
+            calls.append(ToolCall("get_chart_panel", {"stock_code": code, **({"branch_name": ",".join(names)} if names else {})}))
+        results = self._run_tools(calls)
         return [r.data if r.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
                 for code, r in zip(codes, results)]
 
@@ -1620,47 +1634,58 @@ def run_discord_bot(config: BotConfig) -> None:
     no_mentions = discord.AllowedMentions.none()
     prefix = config.command_prefix.lower()
 
-    async def image_file(question: str, text: str, panels=None, guild=None):
+    async def image_files(question: str, text: str, panels=None, guild=None, weekly=None):
+        """回傳 discord.File 清單；本週精選會拆成多張（每張最多 3 檔股票）。"""
         limit = min(7_500_000, getattr(guild, "filesize_limit", 7_500_000))
         try:
-            data, extension = await asyncio.to_thread(answer_image.make_attachment, question, text, panels, max_bytes=limit)
+            if weekly:
+                images = await asyncio.to_thread(weekly_image.make_weekly_attachments, question, weekly, panels, max_bytes=limit)
+            else:
+                images = [await asyncio.to_thread(answer_image.make_attachment, question, text, panels, max_bytes=limit)]
         except Exception as exc:
-            print(f"⚠️ 圖片產生失敗：{type(exc).__name__}", flush=True)
-            data, extension = await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
-                "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)
-        return discord.File(io.BytesIO(data), filename=f"ace-answer.{extension}")
+            print(f"⚠️ 圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
+            images = [await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
+                      "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)]
+        return [
+            discord.File(io.BytesIO(data), filename=f"ace-answer-{i}.{extension}" if len(images) > 1 else f"ace-answer.{extension}")
+            for i, (data, extension) in enumerate(images, 1)
+        ]
 
-    async def reply_image(message, question: str, text: str, panels=None, *, pending=None):
-        file = await image_file(question, text, panels, message.guild)
+    async def reply_image(message, question: str, text: str, panels=None, *, pending=None, weekly=None):
+        files = await image_files(question, text, panels, message.guild, weekly)
         try:
             if pending is not None:
                 try:
                     # Replace all old attachments, including the waiting image.
-                    return await pending.edit(content=None, attachments=[file], allowed_mentions=no_mentions)
+                    return await pending.edit(content=None, attachments=files, allowed_mentions=no_mentions)
                 except discord.NotFound as exc:
                     if exc.code != 10008:  # Only recreate a manually deleted message.
                         raise
-                    file.reset()
-            return await message.reply(file=file, mention_author=False, allowed_mentions=no_mentions)
+                    for file in files:
+                        file.reset()
+            return await message.reply(files=files, mention_author=False, allowed_mentions=no_mentions)
         finally:
-            file.close()
+            for file in files:
+                file.close()
 
-    async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False):
+    async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False, weekly=None):
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-        file = await image_file(question, text, panels, interaction.guild)
+        files = await image_files(question, text, panels, interaction.guild, weekly)
         try:
             try:
                 # The deferred original reply is the single message for this query.
                 # This also supports ephemeral replies without exposing them publicly.
-                return await interaction.edit_original_response(content=None, attachments=[file], allowed_mentions=no_mentions)
+                return await interaction.edit_original_response(content=None, attachments=files, allowed_mentions=no_mentions)
             except discord.NotFound as exc:
                 if exc.code != 10008 or interaction.is_expired():
                     raise
-                file.reset()
-                return await interaction.followup.send(file=file, ephemeral=ephemeral, allowed_mentions=no_mentions, wait=True)
+                for file in files:
+                    file.reset()
+                return await interaction.followup.send(files=files, ephemeral=ephemeral, allowed_mentions=no_mentions, wait=True)
         finally:
-            file.close()
+            for file in files:
+                file.close()
 
     class AceClient(discord.Client):
         def __init__(self) -> None:
@@ -1710,7 +1735,8 @@ def run_discord_bot(config: BotConfig) -> None:
             if is_weekly_pick_question(question):
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
             result = await asyncio.to_thread(engine.answer, question)
-            await interaction_image(interaction, question, result.text, result.panels, ephemeral=config.ephemeral)
+            await interaction_image(interaction, question, result.text, result.panels, ephemeral=config.ephemeral,
+                                    weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord /{config.slash_command_name} 回覆圖片已更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
@@ -1752,7 +1778,8 @@ def run_discord_bot(config: BotConfig) -> None:
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 result = await asyncio.to_thread(engine.answer, question)
-            await reply_image(message, question, result.text, result.panels, pending=pending)
+            await reply_image(message, question, result.text, result.panels, pending=pending,
+                              weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord {config.command_prefix} 回覆圖片已送出／更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord 訊息送出失敗：{exc}", flush=True)
@@ -1801,8 +1828,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         engine = AceQueryEngine(config)
         result = engine.answer(args.ask)
         if args.image_output:
-            answer_image.render_answer(args.ask, result.text, result.panels).save(args.image_output)
-            print(f"圖片已儲存：{args.image_output}")
+            if result.layout == "weekly_pick":
+                base, ext = os.path.splitext(args.image_output)
+                for i, image in enumerate(weekly_image.render_weekly_pages(args.ask, result.weekly, result.panels), 1):
+                    path = f"{base}-{i}{ext or '.png'}"
+                    image.save(path)
+                    print(f"圖片已儲存：{path}")
+            else:
+                answer_image.render_answer(args.ask, result.text, result.panels).save(args.image_output)
+                print(f"圖片已儲存：{args.image_output}")
         print("=" * 60)
         for index, chunk in enumerate(split_discord_message(result.text, config.max_message_chars), 1):
             print(f"--- Discord 訊息 {index} ---")
