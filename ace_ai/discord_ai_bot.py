@@ -796,12 +796,12 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 
 規則：
 1. 不得自行創造任何數據（股價、勝率、分點、金額、均線、大量區、法人資料、新聞都一樣）。
-2. 數字必須完全使用 tool_results 裡的數值或文字，金額沿用原本的「萬／億」寫法。
+2. 數字必須完全使用 tool_results 裡的數值或文字，金額沿用原本的「萬／億」寫法；不可四捨五入成約數（例如原文 354 億不可寫成約 350 億），不同報導數字不一致時照各自原文寫並註明來源。
 3. 如果資料缺失（available=false、found=false 或欄位為空），明確指出「目前沒有取得足夠資料」，不可猜測。
 4. 分清楚：客觀數據、系統統計、AI 解讀；AI 解讀請加上「AI 解讀：」開頭。
 5. 不要把「歷史勝率」描述成未來保證。
 6. small_sample=true 或樣本數少時，要主動提醒樣本數偏少。
-7. 資料日期要說清楚，並提醒股價為日K收盤資料、不是盤中即時。
+7. 資料日期要說清楚：data_source 或 intraday.is_live 顯示「盤中」時，要提醒股價是盤中即時報價、尚未收盤，今天的 K 棒、成交量、均線與技術指標都含未收盤資料，收盤前會變動（成交量只是到目前為止的累計量，量比偏低很正常）；否則提醒是日K收盤資料。
 8. 語氣自然、口語、不要過度艱深。
 9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
@@ -907,6 +907,39 @@ def find_ungrounded_numbers(answer: str, payload: Dict[str, Any]) -> List[str]:
             continue
         ungrounded.append(token)
     return ungrounded
+
+
+_SENTENCE_RE = re.compile(r"[^。！？；\n]*[。！？；]?")
+
+
+def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """逐行逐句檢查，刪除含有 tool_results 對不上數字的句子；標題行（【…】）保留。回傳（刪減後文字, 被刪的句子）。"""
+    kept_lines, removed = [], []
+    for line in answer.split("\n"):
+        stripped = line.strip()
+        if not stripped or re.fullmatch(r"【[^】]+】", stripped):
+            kept_lines.append(line)
+            continue
+        kept = []
+        for sentence in _SENTENCE_RE.findall(line):
+            if not sentence.strip():
+                continue
+            if find_ungrounded_numbers(sentence, payload):
+                removed.append(sentence.strip())
+            else:
+                kept.append(sentence)
+        text = "".join(kept).strip()
+        if text and text not in ("・", "•", "-"):
+            kept_lines.append(text)
+    # 內容被刪光的區塊標題一併移除，避免留下空標題。
+    cleaned: List[str] = []
+    for i, line in enumerate(kept_lines):
+        is_heading = bool(re.fullmatch(r"【[^】]+】", line.strip()))
+        next_content = next((l for l in kept_lines[i + 1:] if l.strip()), "")
+        if is_heading and (not next_content or re.fullmatch(r"【[^】]+】", next_content.strip())):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip(), removed
 
 
 # ============================================================
@@ -1121,8 +1154,12 @@ def format_news(d: Dict[str, Any]) -> str:
     for item in (d.get("articles") or [])[:5]:
         date = f"{item['date']}｜" if item.get("date") else ""
         lines.append(f"• {date}{item.get('title')}（{item.get('source')}）")
-        if item.get("summary") and item.get("summary") != item.get("title"):
-            lines.append(f"　{item['summary']}")
+        # 有原文段落就列前 120 字；RSS 摘要常常只是標題＋媒體名，跟標題重複就不列。
+        detail = item.get("content") if item.get("content_source", "").startswith("原文") else item.get("summary")
+        detail = str(detail or "").strip()
+        title = str(item.get("title") or "")
+        if detail and not detail.startswith(title[:20]):
+            lines.append(f"　{detail[:120]}{'…' if len(detail) > 120 else ''}")
     return "\n".join(lines)
 
 
@@ -1313,7 +1350,13 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             continue
         d = r.data
         if r.name in ("get_stock_overview", "get_technical_analysis", "get_volume_profile") and d.get("data_date"):
-            add(f"股價截至 {d['data_date']}（日K收盤）")
+            intraday = d.get("intraday") or {}
+            if intraday.get("is_live"):
+                add(f"股價為 {intraday['date']} {intraday['time']} 盤中即時報價（證交所，尚未收盤）")
+            elif intraday:
+                add(f"股價為 {intraday['date']} 今日收盤（證交所即時報價）")
+            else:
+                add(f"股價截至 {d['data_date']}（日K收盤）")
         elif r.name in ("get_warrant_branch", "get_high_winrate_branches_buying") and d.get("period_start"):
             add(f"權證分點 {d['period_start']}～{d['period_end']}（{d.get('actual_trading_days')} 個交易日）")
         elif r.name == "get_branch_performance" and d.get("found"):
@@ -1424,7 +1467,11 @@ class AceQueryEngine:
             result = self._answer_uncached(question, started)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         if result.cacheable:
-            self._answer_cache.set(normalized, result, self.config.answer_cache_seconds)
+            # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
+            seconds = self.config.answer_cache_seconds
+            if tools.INTRADAY_ENABLE and tools.intraday_session_now():
+                seconds = min(seconds, tools.TTL_INTRADAY_SECONDS)
+            self._answer_cache.set(normalized, result, seconds)
         return result
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
@@ -1598,8 +1645,13 @@ class AceQueryEngine:
         answer = result.text
         ungrounded = find_ungrounded_numbers(answer, payload)
         if ungrounded:
-            self.log(f"數字核對未通過，改用規則式回答：{ungrounded[:10]}")
-            return f"（AI 文字中有數字無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+            # 只刪掉含有對不上數字的句子；刪太多（剩不到六成）才整篇改用系統整理的資料。
+            pruned, removed = prune_ungrounded_sentences(answer, payload)
+            self.log(f"數字核對：對不上的數字 {ungrounded[:10]}｜刪除 {len(removed)} 句：{removed[:5]}")
+            if not pruned or len(pruned) < len(answer) * 0.6 or find_ungrounded_numbers(pruned, payload):
+                self.log("數字核對未通過，改用規則式回答")
+                return f"（AI 文字中有數字無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+            answer = pruned
         if "資料時間" not in answer:
             time_line = build_data_time_line(results)
             if time_line:

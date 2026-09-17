@@ -83,6 +83,7 @@ NEWS_BODY_FETCH_ENABLE = os.getenv("DISCORD_AI_NEWS_BODY_FETCH_ENABLE", "1").str
 NEWS_BODY_FETCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_FETCH_TIMEOUT", 6.0)
 NEWS_BODY_FETCH_MAX_BYTES = _env_int("DISCORD_AI_NEWS_BODY_FETCH_MAX_BYTES", 600_000)
 NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 900)
+NEWS_BODY_CANDIDATES = _env_int("DISCORD_AI_NEWS_BODY_CANDIDATES", 10)
 TEXT_CELL_MAX_CHARS = 120
 
 # Bot 行程強制唯讀。這些值只影響 Discord Bot 自己的 process，不影響 GitHub Actions。
@@ -115,6 +116,9 @@ _BOT_DEFAULT_ENV = {
     "WARRANT_HYBRID_MONEYDJ_API4_WORKERS": "12",
     "WARRANT_HYBRID_MONEYDJ_API5_WORKERS": "12",
     "WARRANT_SELECTED_BRANCH_FLOW_ENABLE": "0",
+    # 新聞原文：Google News RSS 連結要先解碼成原始網址才抓得到內文（週報極速模式不會走到這裡）。
+    "WARRANT_NEWS_GNEWSDECODER_ENABLE": "1",
+    "WARRANT_NEWS_GNEWSDECODER_TIMEOUT": "5",
 }
 
 
@@ -909,20 +913,134 @@ def get_available_sheet_metadata() -> Dict[str, Any]:
 # 價格資料（Tool 1～3 共用，同一檔股票 10 分鐘內只抓一次）
 # ============================================================
 
+# ------------------------------------------------------------
+# 盤中即時報價：FinMind 日K要收盤後才有當天資料，盤中改用證交所 MIS 即時報價補上「今天這一根」。
+# MIS 同時涵蓋上市（tse）與上櫃（otc），延遲約數秒；興櫃不支援。失敗時照舊只用日K。
+# ------------------------------------------------------------
+INTRADAY_ENABLE = os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
+MIS_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+MIS_INDEX_URL = "https://mis.twse.com.tw/stock/index.jsp"
+TAIPEI_TZ = timezone(timedelta(hours=8))
+MARKET_CLOSE_HHMM = (13, 30)
+
+
+def taipei_now() -> datetime:
+    return datetime.now(TAIPEI_TZ)
+
+
+def intraday_session_now(now: Optional[datetime] = None) -> bool:
+    """平日 08:55～13:35 視為盤中（快取縮短、需要即時報價）；國定休市日 MIS 不會有當日資料，自然略過。"""
+    now = now or taipei_now()
+    return now.weekday() < 5 and (8, 55) <= (now.hour, now.minute) <= (13, 35)
+
+
+def _mis_price(value: Any) -> Optional[float]:
+    try:
+        number = float(str(value).split("_")[0])
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def fetch_intraday_quote(stock_code: str) -> Dict[str, Any]:
+    """證交所 MIS 即時報價；還沒有成交（開盤前）或查不到時回傳空 dict。"""
+    kf = core()
+    code = kf._normalize_stock_name_code_key(stock_code)
+    session = kf.get_thread_session()
+    headers = {"User-Agent": kf.HDR["User-Agent"], "Referer": MIS_INDEX_URL, "Accept": "application/json,text/plain,*/*"}
+    url = f"{MIS_QUOTE_URL}?ex_ch=tse_{code}.tw|otc_{code}.tw&json=1&delay=0&_={int(time.time() * 1000)}"
+    items: List[Dict[str, Any]] = []
+    for attempt in range(2):
+        response = session.get(url, headers=headers, timeout=(4, 6))
+        response.raise_for_status()
+        items = [i for i in (response.json().get("msgArray") or []) if str(i.get("c", "")) == code]
+        if items or attempt:
+            break
+        session.get(MIS_INDEX_URL, headers=headers, timeout=(4, 6))  # 第一次常因沒有 cookie 回空陣列，取 cookie 後重試
+    for item in items:
+        # z＝最新成交價；該瞬間沒有成交時是「-」，改用 pz（前一筆成交價）。
+        close = _mis_price(item.get("z")) or _mis_price(item.get("pz"))
+        day = str(item.get("d", ""))
+        if close is None or not re.fullmatch(r"\d{8}", day):
+            continue
+        open_ = _mis_price(item.get("o")) or close
+        high = max(_mis_price(item.get("h")) or close, open_, close)
+        low = min(_mis_price(item.get("l")) or close, open_, close)
+        lots = _mis_price(item.get("v")) or 0.0
+        clock = str(item.get("t", "") or "")
+        return {
+            "date": pd.Timestamp(f"{day[:4]}-{day[4:6]}-{day[6:]}"),
+            "time": clock[:5],
+            "open": open_, "high": high, "low": low, "close": close,
+            "volume_shares": lots * 1000,
+            "prev_close": _mis_price(item.get("y")),
+            "exchange": str(item.get("ex", "")),
+            "is_live": bool(re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", clock)) and tuple(map(int, clock[:5].split(":"))) < MARKET_CLOSE_HHMM,
+        }
+    return {}
+
+
+def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """FinMind 還沒有今天的日K時，把即時報價接成今天這一根（盤中為暫定 K 棒，收盤前會變動）。"""
+    now = taipei_now()
+    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (8, 55):
+        return stock_df, {}
+    last_date = pd.Timestamp(stock_df.index.max()).normalize()
+    if last_date >= pd.Timestamp(now.date()):
+        return stock_df, {}
+    try:
+        quote = fetch_intraday_quote(code)
+    except Exception as exc:  # 即時報價失敗不影響日K
+        print(f"⚠️ {code} 盤中即時報價略過：{type(exc).__name__}: {exc}", flush=True)
+        return stock_df, {}
+    if not quote or quote["date"].normalize() <= last_date:
+        return stock_df, {}
+    bar = pd.DataFrame(
+        [[quote["open"], quote["high"], quote["low"], quote["close"], quote["volume_shares"]]],
+        index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
+    )
+    merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
+    info = {
+        "date": _fmt_date(quote["date"]),
+        "time": quote["time"],
+        "is_live": quote["is_live"],
+        "source": "證交所 MIS 即時報價",
+    }
+    print(f"⏱️ {code} 接上即時報價：{info['date']} {info['time']}｜收 {quote['close']}｜{'盤中' if info['is_live'] else '今日收盤（FinMind 尚未更新）'}", flush=True)
+    return merged, info
+
+
+def price_source_note(bundle: Dict[str, Any]) -> str:
+    info = bundle.get("intraday") or {}
+    if not info:
+        return PRICE_SOURCE_NOTE
+    if info.get("is_live"):
+        return f"FinMind 日K＋{info['source']}（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
+    return f"FinMind 日K＋{info['source']}（{info['date']} 今日收盤，FinMind 尚未更新）"
+
+
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
-    """重用 fetch_stock_data_yf + calculate_indicators，與週報產圖相同的抓取區間。"""
+    """重用 fetch_stock_data_yf + calculate_indicators，與週報產圖相同的抓取區間；盤中接上即時報價。"""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
 
-    def build() -> Dict[str, Any]:
+    def daily() -> Tuple[pd.DataFrame, str]:
         stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
         if stock_df is None or stock_df.empty:
             raise ToolDataError(f"{code} 沒有股價資料")
+        return stock_df, str(market or "")
+
+    def build() -> Dict[str, Any]:
+        # 日K（FinMind）照原本 10 分鐘快取，盤中只有即時報價與指標每分鐘重算，不會狂打 FinMind。
+        stock_df, market = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        stock_df, intraday = _append_intraday_bar(code, stock_df)
         df = kf.calculate_indicators(stock_df)
         df["Close_prev"] = df["Close"].shift(1)
-        return {"df": df, "market": str(market or "")}
+        return {"df": df, "market": market, "intraday": intraday}
 
-    return _cached(f"price_{code}", TTL_PRICE_SECONDS, build)
+    ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
+    return _cached(f"price_{code}", ttl, build)
 
 
 def _stock_identity(stock_code: str) -> Tuple[str, str]:
@@ -960,7 +1078,8 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "market": bundle["market"],
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": PRICE_SOURCE_NOTE,
+        "data_source": price_source_note(bundle),
+        "intraday": bundle.get("intraday") or {},
         "open": _num(latest.get("Open")),
         "high": _num(latest.get("High")),
         "low": _num(latest.get("Low")),
@@ -1110,7 +1229,8 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
     """重用 calculate_indicators 與既有 KD／MACD／均線訊號函式，整理最新技術面。"""
     kf = core()
     code, name = _stock_identity(stock_code)
-    df = _load_price_bundle(code)["df"]
+    bundle = _load_price_bundle(code)
+    df = bundle["df"]
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
     close = _num(latest.get("Close"))
@@ -1137,7 +1257,8 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_code": code,
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": PRICE_SOURCE_NOTE,
+        "data_source": price_source_note(bundle),
+        "intraday": bundle.get("intraday") or {},
         "close": close,
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
         "ma_alignment": _ma_alignment(ma_values),
@@ -1784,21 +1905,25 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
         articles = kf._dedupe_news_articles_by_event(
             list(articles or []), code, name, log_label="Discord AI 新聞"
         )
-        picked = []
+        candidates = []
         for article in articles:
             title = kf._clean_news_title(article.get("title", ""))
             description = kf._normalize_news_text(article.get("description", "") or article.get("content", ""))
             if not title or kf._is_price_only_news_without_fundamentals(f"{title} {description}"):
                 continue
-            picked.append((article, title, description))
-            if len(picked) >= max(1, int(limit)):
+            candidates.append((article, title, description))
+            if len(candidates) >= NEWS_BODY_CANDIDATES:
                 break
-        # 原文並行抓取（每篇有硬截止時間），總等待約等於單篇逾時。
+        # 多抓幾篇候選的原文（並行，每篇有硬截止時間），有原文的優先，維持原本相關度排序。
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max(1, len(picked)), thread_name_prefix="ace-news") as pool:
-            contents = list(pool.map(lambda p: article_content(*p), picked)) if picked else []
+        with ThreadPoolExecutor(max_workers=max(1, len(candidates)), thread_name_prefix="ace-news") as pool:
+            contents = list(pool.map(lambda p: article_content(*p), candidates)) if candidates else []
+        body_count = sum(1 for _, source in contents if source.startswith("原文"))
+        print(f"📰 {code} 新聞候選 {len(candidates)} 篇｜抓到原文 {body_count} 篇｜"
+              + "；".join(f"{t[:18]}={s}({len(c)}字)" for (_, t, _), (c, s) in zip(candidates, contents)), flush=True)
+        ranked = sorted(zip(candidates, contents), key=lambda pair: not pair[1][1].startswith("原文"))
         items = []
-        for (article, title, description), (content, content_source) in zip(picked, contents):
+        for (article, title, description), (content, content_source) in ranked[: max(1, int(limit))]:
             items.append({
                 "date": _news_date(article.get("published", "")),
                 "title": title,
@@ -2690,7 +2815,8 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
-    df = _load_price_bundle(code)["df"].copy().sort_index()
+    bundle = _load_price_bundle(code)
+    df = bundle["df"].copy().sort_index()
     df = df[~df.index.duplicated(keep="last")]
     required = ["Open", "High", "Low", "Close"]
     chart_columns = required + ["Volume", "MV5", "MV20", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER"]
@@ -2734,7 +2860,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
         print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
-            "volume_profile": profile, "marks": marks,
+            "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
             "bollinger": analyze_bollinger(df),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 

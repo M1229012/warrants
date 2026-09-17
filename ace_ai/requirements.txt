@@ -6,3 +6,5 @@
 discord.py>=2.4,<3
 
 Pillow>=10.4,<13
+# Google News RSS 連結解碼成原始新聞網址，Bot 抓新聞原文用（週報極速模式不需要）。
+googlenewsdecoder==0.1.7

@@ -1194,7 +1194,7 @@ def format_rule_based(result: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         f"資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
-        f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
+        f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為最新日K（盤中時含證交所即時報價）"
     )
     lines.append("※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。")
     return "\n".join(lines)
@@ -1353,7 +1353,7 @@ def weekly_meta(result: Dict[str, Any]) -> Dict[str, Any]:
         "filters": result.get("filters") or [],
         "data_time": (
             f"資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
-            f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
+            f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為最新日K（盤中時含證交所即時報價）"
         ),
         "disclaimer": "※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。",
     }

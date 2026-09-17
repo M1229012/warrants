@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 from answer_image import (
     ACCENT, BG, CONTENT, INK, LINE, MARGIN, MUTED, WIDTH,
-    clean, draw_chart, encode_image, font, panel_height, text_at, wrap,
+    clean, draw_chart, encode_image, font, panel_height, price_footer, text_at, wrap,
 )
 
 WEEKLY_PER_PAGE = 3
@@ -265,7 +265,7 @@ def page_footer(draw, y: int, meta: dict, last: bool, dry: bool) -> int:
         h += 16
     if not dry:
         draw.line((MARGIN, y + h + 10, WIDTH - MARGIN, y + h + 10), fill=LINE)
-        text_at(draw, (MARGIN, y + h + 32), '股市艾斯  /  日 K 為收盤資料，非盤中即時行情', 20, MUTED)
+        text_at(draw, (MARGIN, y + h + 32), price_footer(meta.get('panels')), 20, MUTED)
     return h + 80
 
 
@@ -288,7 +288,7 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
                 blocks.append(lambda d, yy, dry: overview_card(d, yy, cards, weekly, dry) + 36)
         for card in page_cards:
             blocks.append(lambda d, yy, dry, c=card: candidate_group(d, yy, c, panel_by_code.get(c['stock_code']), dry) + 40)
-        blocks.append(lambda d, yy, dry, last=last: page_footer(d, yy, weekly.get('meta') or {}, last, dry))
+        blocks.append(lambda d, yy, dry, last=last: page_footer(d, yy, {**(weekly.get('meta') or {}), 'panels': panels}, last, dry))
         probe = ImageDraw.Draw(Image.new('RGB', (10, 10)))
         height = 0
         for block in blocks:
