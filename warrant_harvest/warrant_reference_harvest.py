@@ -41,6 +41,9 @@ import time
 from datetime import datetime, timedelta
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import requests
 
 # append-only 的合併與守衛只有一份實作，從累積庫那支共用過來。
@@ -58,8 +61,19 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
+# 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。
+# 2026-09-17 發生過只更新了一部分檔案、新舊混跑，log 完全看不出來。
+# 改任何一支都要一起升版號。
+HARVEST_BUILD = "2026-09-18.1"
+
 META_STORE_PATH = os.path.join(STORE_DIR, "warrant_meta_store.parquet")
 OHLCV_DIR = os.path.join(STORE_DIR, "ohlcv")
+# 已確認休市的平日（春節、國定假日等）。放在 ohlcv/ 外面：
+# 回補與分析程式會把 ohlcv/ 裡的 parquet 都當成行情檔讀。
+NO_TRADING_DATES_PATH = os.path.join(STORE_DIR, "ohlcv_no_trading_dates.parquet")
+# 兩個市場都回空、而且至少是這麼多天以前的日子，才記成休市。
+# 最近幾天回空可能只是還沒發布，不能永久跳過。
+NO_TRADING_CONFIRM_DAYS = int(os.getenv("NO_TRADING_CONFIRM_DAYS", "7"))
 REQUEST_SLEEP = float(os.getenv("REFERENCE_SLEEP_SECONDS", "0.6"))
 REQUEST_TIMEOUT = (8, 60)
 MAX_ATTEMPTS = int(os.getenv("REFERENCE_MAX_ATTEMPTS", "4"))
@@ -225,7 +239,7 @@ def fetch_meta_tpex():
 
 def cmd_meta(args):
     print("=" * 74)
-    print("📋 權證靜態屬性")
+    print(f"📋 權證靜態屬性｜程式版本 {HARVEST_BUILD}")
     print("=" * 74)
 
     frames = []
@@ -372,11 +386,66 @@ def fetch_ohlcv_tpex(target_dt):
 
 
 def _existing_dates(year):
+    """只讀日期這一欄，而且用 Arrow 讀：745 萬列的字串欄轉成 pandas 物件很吃記憶體。"""
     path = _ohlcv_path(year)
     if not os.path.exists(path):
         return set(), 0
-    df = pd.read_parquet(path, columns=["日期"])
-    return set(df["日期"].astype(str)), len(df)
+    table = pq.read_table(path, columns=["日期"])
+    return set(pc.unique(table["日期"]).to_pylist()), table.num_rows
+
+
+def append_ohlcv_days(path, incoming, run_stamp=None):
+    """
+    把新的交易日附加到年檔，不做逐列鍵比對。
+
+    為什麼不用 merge_frames：OHLCV 的一列是「某代號某日的成交」，事後不會變。
+    cmd_ohlcv 的待抓清單本來就排除了既有日期，新資料與既有資料不可能撞鍵，
+    合併在這裡等於白做。實測（2026-09-17，真實資料 293 萬列）merge_frames 峰值多用
+    2.57 GB、51 秒，外推到 2026 年檔 745 萬列約 6.5 GB、2.2 分鐘 ——
+    每天只補 4.6 萬列卻整年重讀重寫，到 12 月會逼近 10 GB。
+
+    這裡整段留在 Arrow 裡：既有檔讀成 Arrow Table，新資料接在後面，一次寫出。
+    回傳 (附加前列數, 附加後列數)。
+    """
+    run_stamp = run_stamp or datetime.today().strftime("%Y/%m/%d")
+    incoming = coerce_numeric(incoming.copy(), NUMERIC_OHLCV_COLUMNS)
+    incoming = incoming.drop_duplicates(subset=["代號", "日期", "市場"], keep="last")
+    incoming["最後更新"] = run_stamp
+    incoming["首次入庫"] = run_stamp
+
+    if not os.path.exists(path):
+        table = pa.Table.from_pandas(incoming, preserve_index=False)
+        _atomic_write_table(table, path)
+        return 0, table.num_rows
+
+    existing = pq.read_table(path)
+    # 安全閥：萬一上游日期判斷出錯，已經存在的日期一律不重複附加。
+    existing_dates = set(pc.unique(existing["日期"]).to_pylist())
+    incoming = incoming[~incoming["日期"].isin(existing_dates)]
+    if incoming.empty:
+        return existing.num_rows, existing.num_rows
+
+    # 欄位順序與型別對齊既有檔；既有檔有、新資料沒有的欄位補空值。
+    for name in existing.schema.names:
+        if name not in incoming.columns:
+            incoming[name] = None
+    new_table = pa.Table.from_pandas(
+        incoming[existing.schema.names], preserve_index=False
+    ).cast(existing.schema.remove_metadata()).replace_schema_metadata(existing.schema.metadata)
+
+    combined = pa.concat_tables([existing, new_table])
+    if combined.num_rows < existing.num_rows:
+        raise RuntimeError("附加後列數變少，已中止寫入（不應該發生）")
+    _atomic_write_table(combined, path)
+    return existing.num_rows, combined.num_rows
+
+
+def _atomic_write_table(table, path):
+    """先寫暫存再置換：中途被砍掉不會留下半份壞掉的年檔。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    pq.write_table(table, tmp)
+    os.replace(tmp, path)
 
 
 def cmd_ohlcv(args):
@@ -388,9 +457,13 @@ def cmd_ohlcv(args):
         end_dt = datetime.strptime(args.end, "%Y/%m/%d")
 
     print("=" * 74)
-    print(f"📈 全市場 OHLCV｜{start_dt:%Y/%m/%d} ~ {end_dt:%Y/%m/%d}")
+    print(f"📈 全市場 OHLCV｜{start_dt:%Y/%m/%d} ~ {end_dt:%Y/%m/%d}｜程式版本 {HARVEST_BUILD}")
     print("   已抓過的日期會自動跳過，中斷後直接重跑即可續抓。")
     print("=" * 74)
+
+    known_closed = load_no_trading_dates()
+    newly_closed = set()
+    confirm_before = (datetime.today() - timedelta(days=NO_TRADING_CONFIRM_DAYS)).date()
 
     # 一次處理一年，避免把好幾年的資料同時攤在記憶體裡，
     # 也讓每個 parquet 檔維持在可以當 Release asset 上傳的大小。
@@ -400,14 +473,20 @@ def cmd_ohlcv(args):
         done, previous_rows = _existing_dates(year)
 
         pending = []
+        skipped_closed = 0
         cursor = year_start
         while cursor <= year_end:
-            if cursor.weekday() < 5 and cursor.strftime("%Y/%m/%d") not in done:
-                pending.append(cursor)
+            key = cursor.strftime("%Y/%m/%d")
+            if cursor.weekday() < 5 and key not in done:
+                if key in known_closed:
+                    skipped_closed += 1
+                else:
+                    pending.append(cursor)
             cursor += timedelta(days=1)
 
+        closed_note = f"｜已知休市略過 {skipped_closed} 天" if skipped_closed else ""
         print(f"\n  ── {year} ──  既有 {previous_rows:,} 列／{len(done)} 天"
-              f"｜待抓 {len(pending)} 天")
+              f"｜待抓 {len(pending)} 天{closed_note}")
         if not pending:
             continue
 
@@ -415,15 +494,20 @@ def cmd_ohlcv(args):
         failures = []
         for i, day in enumerate(pending, start=1):
             frames = []
+            had_error = False
             for label, fetcher in (("TWSE", fetch_ohlcv_twse), ("TPEx", fetch_ohlcv_tpex)):
                 df, error = fetcher(day)
                 if error:
+                    had_error = True
                     failures.append(f"{day:%Y/%m/%d} {label} {error}")
                 elif not df.empty:
                     frames.append(df)
                 time.sleep(REQUEST_SLEEP)
             if frames:
                 collected.append(pd.concat(frames, ignore_index=True))
+            elif not had_error and day.date() <= confirm_before:
+                # 兩個市場都正常回應、都沒有資料、而且不是最近幾天 → 休市
+                newly_closed.add(day.strftime("%Y/%m/%d"))
             if i % 20 == 0 or i == len(pending):
                 total = sum(len(f) for f in collected)
                 print(f"    {i}/{len(pending)} 天｜已收集 {total:,} 列", flush=True)
@@ -433,23 +517,30 @@ def cmd_ohlcv(args):
             continue
 
         incoming = pd.concat(collected, ignore_index=True)
-        existing = pd.DataFrame()
-        if os.path.exists(_ohlcv_path(year)):
-            # 同上：OHLCV 約一半的列是當天沒成交、收盤價為 NaN，
-            # 用 .fillna("") 讀進來，下一次往同一年補新日期時一定會拒寫。
-            existing = load_numeric_store(_ohlcv_path(year), NUMERIC_OHLCV_COLUMNS)
-
-        merged, stats = merge_frames(
-            existing, incoming, keys=["代號", "日期", "市場"], date_column="日期"
-        )
-        merged = coerce_numeric(merged, NUMERIC_OHLCV_COLUMNS)
-        if guarded_write(merged, _ohlcv_path(year), previous_rows, f"{year} "):
-            print(f"    ✅ {previous_rows:,} → {stats['合併後']:,} 列"
-                  f"（新增 {stats['新增']:,}）")
+        before, after = append_ohlcv_days(_ohlcv_path(year), incoming)
+        print(f"    ✅ {before:,} → {after:,} 列（新增 {after - before:,}）")
         if failures:
             print(f"    ⚠️ {len(failures)} 次抓取失敗（重跑會自動補）：{failures[:3]}")
 
+    if newly_closed:
+        save_no_trading_dates(known_closed | newly_closed)
+        print(f"\n  📅 新確認休市 {len(newly_closed)} 天，之後不再重查"
+              f"（累計 {len(known_closed | newly_closed)} 天）")
     return 0
+
+
+def load_no_trading_dates():
+    if not os.path.exists(NO_TRADING_DATES_PATH):
+        return set()
+    return set(pq.read_table(NO_TRADING_DATES_PATH, columns=["日期"])["日期"].to_pylist())
+
+
+def save_no_trading_dates(dates):
+    """
+    休市日清單。只會變多不會變少。
+    萬一哪天被誤判成休市（例如官方那天暫時回空），刪掉這個檔案重跑就會重新確認。
+    """
+    _atomic_write_table(pa.table({"日期": sorted(dates)}), NO_TRADING_DATES_PATH)
 
 
 def cmd_report(args):
@@ -477,10 +568,16 @@ def cmd_report(args):
             if not name.endswith(".parquet"):
                 continue
             path = os.path.join(OHLCV_DIR, name)
-            df = pd.read_parquet(path, columns=["日期", "代號"])
+            # 用 Arrow 算：2024 年檔 1,184 萬列，兩個字串欄讀進 pandas 要好幾 GB。
+            table = pq.read_table(path, columns=["日期", "代號"])
             size = os.path.getsize(path) / 1024 / 1024
-            print(f"    {name}｜{len(df):,} 列｜{df['日期'].nunique()} 個交易日"
-                  f"｜{df['代號'].nunique():,} 檔｜{size:,.1f} MB")
+            print(f"    {name}｜{table.num_rows:,} 列"
+                  f"｜{pc.count_distinct(table['日期']).as_py()} 個交易日"
+                  f"｜{pc.count_distinct(table['代號']).as_py():,} 檔｜{size:,.1f} MB")
+            del table
+        closed = load_no_trading_dates()
+        if closed:
+            print(f"    已確認休市平日：{len(closed)} 天")
     else:
         print("\n  全市場 OHLCV：尚未建立")
     print("=" * 74)
