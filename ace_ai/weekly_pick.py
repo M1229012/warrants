@@ -7,7 +7,7 @@
     Stage 1  回測官方 A～E 事件表 → 最近 N 個交易日有事件的「分點 × 股票」
     Stage 2  分點 × 本次事件的歷史績效（Bayesian 修正勝率）＋ 事件買進金額 → 預排序，縮到 10～20 檔
     Stage 3  只對候選抓技術面、大量區、分點近期操作（含 MoneyDJ 近20日流水）
-    Score    事件績效 25 ＋ 近期操作 10 ＋ 權證金額 25 ＋ 型態評分 40（100 分制型態分數 × 0.4）＝ 100
+    Score    型態＋大量區支撐 60（100 分制型態分數 × 0.6）＋ 事件績效 20 ＋ 權證金額 12 ＋ 近期操作 8 ＝ 100
     TOP5     由 Python 決定，Gemini 只負責解釋（正常 1 次呼叫）
 
 新聞不列入分數；只有 Discord AI 已有新聞快取時才附上補充。
@@ -42,7 +42,9 @@ class WeeklyPickConfig:
     event_window_trading_days: int = tools._env_int("WEEKLY_PICK_EVENT_WINDOW_DAYS", 5)
     min_event_win_rate: float = tools._env_float("WEEKLY_PICK_MIN_EVENT_WIN_RATE", 60.0)
     min_event_sample: int = tools._env_int("WEEKLY_PICK_MIN_EVENT_SAMPLE", 10)
-    shortlist_size: int = tools._env_int("WEEKLY_PICK_SHORTLIST_SIZE", 12)
+    shortlist_size: int = tools._env_int("WEEKLY_PICK_SHORTLIST_SIZE", 20)
+    # 本週精選固定排除的股票代號（逗號分隔），預設排除 2330。
+    exclude_codes: Tuple[str, ...] = tuple(c.strip() for c in os.getenv("WEEKLY_PICK_EXCLUDE_CODES", "2330").split(",") if c.strip())
     top_n: int = tools._env_int("WEEKLY_PICK_TOP_N", 5)
     recent_behavior_days: int = tools._env_int("WEEKLY_PICK_RECENT_BEHAVIOR_DAYS", 30)
     recent_case_count: int = tools._env_int("WEEKLY_PICK_RECENT_CASE_COUNT", 10)
@@ -358,12 +360,15 @@ def _technical_extras(stock_code: str) -> Dict[str, Any]:
 # ============================================================
 # 型態評分（100 分制；本週精選與一般問答共用）
 # 五大項各自從 0 分算到滿分，全部滿分＝100；同一件事只在一個項目計分。
-#   均線趨勢 30｜價格位置 20｜量區結構 25｜下方支撐 15｜布林 10
+#   換算權重：量區結構 35｜下方支撐 25｜均線趨勢 20｜價格位置 12｜布林 8（型態與大量區支撐優先）
 # ============================================================
 
 PATTERN_GRADES = ((70.0, "結構偏強"), (40.0, "結構中性"), (0.0, "結構偏弱"))
-PATTERN_WEIGHT = 40.0  # 本週精選綜合分數中型態評分的權重
+PATTERN_WEIGHT = 60.0  # 本週精選綜合分數中型態評分（含大量區支撐）的權重
+EVENT_WEIGHT, AMOUNT_WEIGHT, RECENT_WEIGHT = 20.0, 12.0, 8.0  # 事件績效、權證金額、近期操作（原始滿分 25／25／10）
+# 各項原始滿分（細項加總用）與換算後權重（型態分數 100 分）：以型態與大量區支撐為主要依據。
 PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構", 25), ("下方支撐", 15), ("布林", 10))
+PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 20, "價格位置": 12, "量區結構": 35, "下方支撐": 25, "布林": 8}
 
 
 def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
@@ -545,8 +550,9 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
 
     components = []
     for name, maximum in PATTERN_COMPONENTS:
-        value = round(sum(i["points"] for i in items if i["component"] == name), 1)
-        components.append({"label": name, "value": value, "max": maximum})
+        raw = sum(i["points"] for i in items if i["component"] == name)
+        weight = PATTERN_COMPONENT_WEIGHTS[name]
+        components.append({"label": name, "value": round(raw / maximum * weight, 1), "max": weight})
     return {
         "score": round(sum(c["value"] for c in components), 1),
         "components": components,
@@ -593,7 +599,9 @@ def build_pattern_scorecard(
     levels = tools.key_price_levels(tech, vp)
     close = levels["close"]
     branches = []
-    for row in ((chips or {}).get("branches") or [])[:5]:
+    high, selected = tools.display_branch_set()
+    shown = [row for row in (chips or {}).get("branches") or [] if row.get("branch") in high | selected]
+    for row in shown[:5]:
         events = row.get("events_recent") or []
         last = events[-1] if events else {}
         sells = row.get("reduce_or_exit_lookback") or []
@@ -623,7 +631,7 @@ def build_pattern_scorecard(
         "supports_below_close": levels["supports"],
         "tracked_branches": branches,
         "tracked_branches_period": (chips or {}).get("period_lookback", ""),
-        "method": "型態分數 100 分＝均線趨勢 30＋價格位置 20＋量區結構 25＋下方支撐 15＋布林 10，每項從 0 分算起，規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
+        "method": "型態分數 100 分＝量區結構 35＋下方支撐 25＋均線趨勢 20＋價格位置 12＋布林 8（型態與大量區支撐優先），規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
     }
     if cost_price:
         card["cost_price"] = tools._num(cost_price)
@@ -653,6 +661,9 @@ class WeeklyPickEngine:
         start, end = tools._recent_event_dates(latest, config.event_window_trading_days, events)
         window = events[(events["event_date"] >= start) & (events["event_date"] <= end)].copy()
         self.log(f"事件視窗 {tools._fmt_date(start)}～{tools._fmt_date(end)}｜初始事件 {len(window):,} 筆｜股票 {window['stock_code'].nunique():,} 檔")
+        if config.exclude_codes:
+            window = window[~window["stock_code"].isin(config.exclude_codes)]
+            self.log(f"固定排除：{'、'.join(config.exclude_codes)}｜剩 {window['stock_code'].nunique():,} 檔")
         if filters.branch:
             window = window[window["branch"] == filters.branch]
         if filters.event_types:
@@ -766,9 +777,13 @@ class WeeklyPickEngine:
 
         breakdown: Dict[str, float] = {}
         reasons: Dict[str, List[str]] = {}
-        breakdown["event_performance_score"], reasons["event_performance"] = lead["event_score"], lead["event_score_reasons"]
-        breakdown["recent_branch_behavior_score"], reasons["recent_branch_behavior"] = score_recent_behavior(behavior, config)
-        breakdown["warrant_amount_score"], reasons["warrant_amount"] = score_warrant_amount(stock, lead_live)
+        # 各項原始分數照舊計算，再換算成新權重（型態 60＋事件 20＋金額 12＋近期 8＝100）。
+        recent_raw, reasons["recent_branch_behavior"] = score_recent_behavior(behavior, config)
+        amount_raw, reasons["warrant_amount"] = score_warrant_amount(stock, lead_live)
+        reasons["event_performance"] = lead["event_score_reasons"]
+        breakdown["event_performance_score"] = round(lead["event_score"] * EVENT_WEIGHT / 25, 2)
+        breakdown["recent_branch_behavior_score"] = round(recent_raw * RECENT_WEIGHT / 10, 2)
+        breakdown["warrant_amount_score"] = round(amount_raw * AMOUNT_WEIGHT / 25, 2)
         # 型態評分（100 分制，與一般問答共用）換算成 40 分計入綜合分數。
         pattern: Dict[str, Any] = {}
         if tech and vp:
@@ -806,7 +821,7 @@ class WeeklyPickEngine:
             flags.add("overhead_resistance")
         if lead_live.get("reducing_recently"):
             flags.add("branch_recently_reducing")
-        if (breakdown["event_performance_score"] >= 18 and pattern.get("score", 0) < 40) or (
+        if (lead["event_score"] >= 18 and pattern.get("score", 0) < 40) or (
             lead_live.get("has_trades") and (_f(lead_live.get("net_buy_5d")) or 0) <= 0
         ):
             flags.add("conflicting_signals")
@@ -879,8 +894,8 @@ class WeeklyPickEngine:
             f"completed={recent.get('completed_cases')} (W{recent.get('wins')}/L{recent.get('losses')}) unresolved={recent.get('unresolved_cases')}"
         )
         self.log(
-            f"   event_performance_score = {b['event_performance_score']} / 25｜recent_branch_behavior_score = {b['recent_branch_behavior_score']} / 10｜"
-            f"warrant_amount_score = {b['warrant_amount_score']} / 25｜pattern_score = {b['pattern_score']} / {PATTERN_WEIGHT:g}"
+            f"   event_performance_score = {b['event_performance_score']} / {EVENT_WEIGHT:g}｜recent_branch_behavior_score = {b['recent_branch_behavior_score']} / {RECENT_WEIGHT:g}｜"
+            f"warrant_amount_score = {b['warrant_amount_score']} / {AMOUNT_WEIGHT:g}｜pattern_score = {b['pattern_score']} / {PATTERN_WEIGHT:g}"
             f"（型態 {(stock.get('pattern') or {}).get('score')} / 100）｜total = {stock['score']} / 100"
         )
         self.log(f"   flags={stock['quality_flags']}")
@@ -1007,7 +1022,8 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
 
 WEEKLY_PICK_SYSTEM_PROMPT = """你是我的私人台股研究助理。
 你的工作不是推薦我買股票，而是協助我找出「本週最值得進一步研究、最適合撰寫 Discord 本週精選週報的候選股票」。
-TOP5 已由 Python 依分數排好，你只負責解釋，不得更改排名、不得新增或刪除股票。
+TOP5 已由 Python 依分數排好（型態＋大量區支撐占 60 分為主要依據，事件績效、權證金額、近期操作為輔），你只負責解釋，不得更改排名、不得新增或刪除股票。
+why_for_report 先說型態與大量區支撐的理由，再補充籌碼。
 只能根據 tool_results 提供的資料回答，不得自行補充不存在的數據（股價、勝率、分點、金額、均線、大量區、新聞都一樣）。
 
 每檔股票的判讀順序（一定照這個順序思考與撰寫）：
@@ -1205,10 +1221,10 @@ def format_rule_based(result: Dict[str, Any]) -> str:
 # ============================================================
 
 SCORE_PARTS = (
-    ("event_performance_score", "事件績效", 25),
-    ("recent_branch_behavior_score", "近期操作", 10),
-    ("warrant_amount_score", "權證金額", 25),
-    ("pattern_score", "型態評分", 40),
+    ("pattern_score", "型態＋大量區支撐", PATTERN_WEIGHT),
+    ("event_performance_score", "事件績效", EVENT_WEIGHT),
+    ("warrant_amount_score", "權證金額", AMOUNT_WEIGHT),
+    ("recent_branch_behavior_score", "近期操作", RECENT_WEIGHT),
 )
 
 
@@ -1452,7 +1468,7 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_cards_v3",  # v3：型態評分改 100 分制，舊快取的分數欄位不同
+        "weekly_pick_cards_v4",  # v4：型態＋大量區支撐 60 分為主，排除 2330，舊快取分數不同
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),

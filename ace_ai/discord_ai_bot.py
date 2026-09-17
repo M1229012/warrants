@@ -1584,8 +1584,8 @@ class AceQueryEngine:
                 log=self.log,
             )
             text, cache_hit = answer.text, answer.cache_hit
-            branches = {card["stock_code"]: card.get("mark_branches") or [] for card in answer.cards}
-            panels = self._get_chart_panels(answer.stock_codes, branches)
+            # K 線標註一律只標高勝率分點＋精選五分點（與一般問答相同）。
+            panels = self._get_chart_panels(answer.stock_codes)
             if answer.cards:
                 weekly = {"cards": answer.cards, "overview": answer.overview, "meta": answer.meta, "notice": answer.notice}
         except tools.ToolDataError as exc:
@@ -1651,7 +1651,6 @@ class AceQueryEngine:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 if card:
                     panel["scorecard"] = card
-                    self._mark_table_branches(panel, card)
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started
@@ -1680,17 +1679,6 @@ class AceQueryEngine:
         except Exception as exc:  # 評分失敗只少一張卡，不影響回答
             self.log(f"型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
             return {}
-
-    def _mark_table_branches(self, panel: Dict[str, Any], card: Dict[str, Any]) -> None:
-        """K 線標註補上「追蹤分點動向」表的分點，避免表上持有中、K 線卻沒標（例如非高勝率分點）。"""
-        names = [b["branch"] for b in card.get("tracked_branches") or [] if b.get("branch")]
-        bars = panel.get("bars") or []
-        if not names or not bars:
-            return
-        try:
-            panel["marks"] = tools.chart_marks_for_stock(panel["stock_code"], [b["date"] for b in bars], extra_branches=names)
-        except Exception as exc:  # 補標失敗就保留原本的高勝率標註
-            self.log(f"K 線補標分點略過：{panel['stock_code']}｜{type(exc).__name__}: {exc}")
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
         cancel_event = threading.Event()

@@ -2574,6 +2574,27 @@ def _high_win_rate_branches(perf: Dict[str, Any]) -> List[str]:
     )
 
 
+def selected_five_branches() -> List[str]:
+    """週報主程式的精選五分點（WARRANT_SELECTED_BRANCH_FLOW_BRANCHES，預設 華南永昌台中、元大南屯、新光、永豐金內湖、富邦敦南）。"""
+    kf = core()
+    raw = str(getattr(kf, "SELECTED_BRANCH_FLOW_BRANCHES", "") or "")
+    return list(dict.fromkeys(kf.normalize_branch_name(x) for x in re.split(r"[,，、]", raw) if x.strip()))
+
+
+def display_branch_set() -> Tuple[set, set]:
+    """圖片上要顯示的分點（高勝率分點, 精選五分點）；K 線標註與分點動向表共用，兩邊一致。"""
+    try:
+        high = set(_high_win_rate_branches(read_branch_event_performance()))
+    except Exception as exc:  # Sheet 讀不到時不標高勝率分點，K 線照畫
+        print(f"⚠️ 高勝率分點清單略過：{type(exc).__name__}: {exc}", flush=True)
+        high = set()
+    try:
+        selected = set(selected_five_branches())
+    except Exception:  # 主程式沒有這個設定時只用高勝率分點
+        selected = set()
+    return high, selected
+
+
 def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
     """每日賣出明細（減碼／出清）；讀不到時回傳空表，不讓主要回答失敗。"""
     kf = core()
@@ -2762,13 +2783,11 @@ def _day_trade_mask(rows: pd.DataFrame) -> pd.Series:
     return rows.apply(is_day_trade, axis=1).astype(bool)
 
 
-def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "",
-                          extra_branches: Sequence[str] = ()) -> Dict[str, Any]:
+def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
     """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
 
     指定分點時只標那些分點（可用逗號傳多個，例如本週精選的主力＋高品質分點）；
-    否則標「勝率統計總勝率 ≥ 高勝率門檻」的回測追蹤分點，再加上 extra_branches
-    （型態評分卡「追蹤分點動向」表列出的分點，讓表上持有中的分點在 K 線上也看得到）。
+    否則只標「勝率統計總勝率 ≥ 高勝率門檻」的追蹤分點與精選五分點（本週精選也一樣）。
     買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
     """
     kf = core()
@@ -2788,13 +2807,9 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
         rows = rows[rows["branch"].isin(targets)]
         rule = f"分點：{'、'.join(targets)}"
     else:
-        try:
-            high = set(_high_win_rate_branches(read_branch_event_performance()))
-        except ToolDataError:
-            high = set()
-        extra = set(extra_branches) - high
-        rows = rows[rows["branch"].isin(high | extra)]
-        rule = f"總勝率 {HIGH_WIN_RATE_PCT:g}% 以上的追蹤分點" + ("＋下方分點動向表的分點" if extra else "")
+        high, selected = display_branch_set()
+        rows = rows[rows["branch"].isin(high | selected)]
+        rule = f"總勝率 {HIGH_WIN_RATE_PCT:g}% 以上的追蹤分點" + ("＋精選五分點" if selected else "")
 
     def in_window(value: Any) -> bool:
         return value is not None and not pd.isna(value) and start <= value <= end
