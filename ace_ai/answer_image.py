@@ -651,7 +651,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 # 型態評分卡（型態／成本／操作類問題；數字全部來自 weekly_pick.build_pattern_scorecard）
 # ============================================================
 
-GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '結構中性': (TILE_BG, '#344054'), '結構偏弱': (WARN_BG, WARN_INK)}
+GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '中性偏多': ('#F1F8F5', GOOD_INK), '結構中性': (TILE_BG, '#344054'),
+               '中性偏弱': ('#FEF8F0', WARN_INK), '結構偏弱': (WARN_BG, WARN_INK)}
 LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
 LEVEL_ROW_H = 38
 LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 2, 3, 4, 3

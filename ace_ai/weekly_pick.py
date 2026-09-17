@@ -7,7 +7,7 @@
     Stage 1  回測官方 A～E 事件表 → 最近 N 個交易日有事件的「分點 × 股票」
     Stage 2  分點 × 本次事件的歷史績效（Bayesian 修正勝率）＋ 事件買進金額 → 預排序，縮到 10～20 檔
     Stage 3  只對候選抓技術面、大量區、分點近期操作（含 MoneyDJ 近20日流水）
-    Score    型態＋大量區支撐 60（100 分制型態分數 × 0.6）＋ 事件績效 20 ＋ 權證金額 12 ＋ 近期操作 8 ＝ 100
+    Score    型態＋大量區支撐 50（100 分制型態分數 × 0.5）＋ 事件績效 22 ＋ 權證金額 16 ＋ 近期操作 12 ＝ 100
     TOP5     由 Python 決定，Gemini 只負責解釋（正常 1 次呼叫）
 
 新聞不列入分數；只有 Discord AI 已有新聞快取時才附上補充。
@@ -360,15 +360,15 @@ def _technical_extras(stock_code: str) -> Dict[str, Any]:
 # ============================================================
 # 型態評分（100 分制；本週精選與一般問答共用）
 # 五大項各自從 0 分算到滿分，全部滿分＝100；同一件事只在一個項目計分。
-#   換算權重：量區結構 35｜下方支撐 25｜均線趨勢 20｜價格位置 12｜布林 8（型態與大量區支撐優先）
+#   換算權重：量區結構 25｜下方支撐 25｜均線趨勢 25｜價格位置 15｜布林 10（量區＋支撐合計 50）
 # ============================================================
 
-PATTERN_GRADES = ((70.0, "結構偏強"), (40.0, "結構中性"), (0.0, "結構偏弱"))
-PATTERN_WEIGHT = 60.0  # 本週精選綜合分數中型態評分（含大量區支撐）的權重
-EVENT_WEIGHT, AMOUNT_WEIGHT, RECENT_WEIGHT = 20.0, 12.0, 8.0  # 事件績效、權證金額、近期操作（原始滿分 25／25／10）
+PATTERN_GRADES = ((75.0, "結構偏強"), (60.0, "中性偏多"), (45.0, "結構中性"), (30.0, "中性偏弱"), (0.0, "結構偏弱"))
+PATTERN_WEIGHT = 50.0  # 本週精選綜合分數中型態評分（含大量區支撐）的權重：仍是最大項，但保留籌碼面的影響力
+EVENT_WEIGHT, AMOUNT_WEIGHT, RECENT_WEIGHT = 22.0, 16.0, 12.0  # 事件績效、權證金額、近期操作（原始滿分 25／25／10）
 # 各項原始滿分（細項加總用）與換算後權重（型態分數 100 分）：以型態與大量區支撐為主要依據。
 PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構", 25), ("下方支撐", 15), ("布林", 10))
-PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 20, "價格位置": 12, "量區結構": 35, "下方支撐": 25, "布林": 8}
+PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 25, "價格位置": 15, "量區結構": 25, "下方支撐": 25, "布林": 10}
 
 
 def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
@@ -414,6 +414,9 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("均線趨勢", "均線排列", 2, 12, "短期空頭 MA5<MA10<MA20")
     elif alignment == "資料不足":
         add("均線趨勢", "均線排列", 6, 12, "均線資料不足，給一半")
+    elif all((mas.get(k) or {}).get("position") == "站上" for k in ("MA5", "MA10", "MA20", "MA60")) and values["MA20"] > values["MA60"]:
+        # 短均線只差一點沒排好，但股價站上所有均線且月線在季線之上，結構接近多頭，不該跟真正糾結同分。
+        add("均線趨勢", "均線排列", 8, 12, "站上所有均線，MA20 在 MA60 之上，短均線尚未排齊")
     else:
         add("均線趨勢", "均線排列", 4, 12, "均線糾結")
     deduction = tech.get("ma_deduction") or {}
@@ -459,30 +462,8 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
     add("價格位置", "追高風險", chase, 4, "、".join(notes) if notes else "沒有急漲、衝出上軌或爆量長黑")
 
     # ---------- 量區結構 25：相對兩大量區 10＋最大量區事件 9＋上方量區壓力 6 ----------
+    # 依「離量區多遠」給分，不再全有全無：貼著量區下緣測試，和深跌在量區下方不同分。
     close = _f(vp.get("close")) or _f(tech.get("close"))
-    position = str(vp.get("position_vs_two_zones", ""))
-    if "之上" in position:
-        add("量區結構", "相對兩大量區", 10, 10, "收盤在兩大量區之上")
-    elif "之下" in position:
-        add("量區結構", "相對兩大量區", 0, 10, "收盤在兩大量區之下")
-    elif "之間" in position:
-        add("量區結構", "相對兩大量區", 5, 10, "收盤在兩大量區之間")
-    else:
-        add("量區結構", "相對兩大量區", 5, 10, "量區位置資料不足，給一半")
-    relation = str((vp.get("maximum_volume_zone") or {}).get("close_relation", ""))
-    if "上方" in relation:
-        points, note = 5, "站在最大量區上方"
-        if vp.get("recent_breakout"):
-            points, note = 7, "近期突破最大量區並站穩"
-            if vp.get("retest_after_breakout"):
-                points, note = 9, "近期突破最大量區，回踩未破"
-        add("量區結構", "最大量區", points, 9, note)
-    elif "量區內" in relation:
-        add("量區結構", "最大量區", 3, 9, "在最大量區內整理")
-    elif "下方" in relation:
-        add("量區結構", "最大量區", 0, 9, "近期跌破最大量區且未站回" if vp.get("recent_breakdown") else "在最大量區下方")
-    else:
-        add("量區結構", "最大量區", 4.5, 9, "最大量區資料不足，給一半")
     overhead = None
     for key in ("maximum_volume_zone", "second_volume_zone"):
         zone = vp.get(key) or {}
@@ -491,18 +472,50 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
             gap = (low / close - 1) * 100
             if overhead is None or gap < overhead[0]:
                 overhead = (gap, zone.get("label") or "大量區", low)
+    position = str(vp.get("position_vs_two_zones", ""))
+    if "之上" in position:
+        add("量區結構", "相對兩大量區", 10, 10, "收盤在兩大量區之上")
+    elif "之間" in position:
+        add("量區結構", "相對兩大量區", 6, 10, "收盤在兩大量區之間")
+    elif "之下" in position and overhead and overhead[0] <= 3:
+        add("量區結構", "相對兩大量區", 4, 10, f"收盤在兩大量區之下，但距{overhead[1]}下緣只有 {overhead[0]:.1f}%，正在測試量區")
+    elif "之下" in position and overhead and overhead[0] <= config.support_zone_pct:
+        add("量區結構", "相對兩大量區", 2, 10, f"收盤在兩大量區之下，距{overhead[1]}下緣 {overhead[0]:.1f}%")
+    elif "之下" in position:
+        add("量區結構", "相對兩大量區", 0, 10, "收盤在兩大量區之下且距離較遠")
+    else:
+        add("量區結構", "相對兩大量區", 5, 10, "量區位置資料不足，給一半")
+    relation = str((vp.get("maximum_volume_zone") or {}).get("close_relation", ""))
+    max_low = _f((vp.get("maximum_volume_zone") or {}).get("price_low"))
+    max_gap = (max_low / close - 1) * 100 if close and max_low and max_low > close else None
+    if "上方" in relation:
+        points, note = 5, "站在最大量區上方"
+        if vp.get("recent_breakout"):
+            points, note = 7, "近期突破最大量區並站穩"
+            if vp.get("retest_after_breakout"):
+                points, note = 9, "近期突破最大量區，回踩未破"
+        add("量區結構", "最大量區", points, 9, note)
+    elif "量區內" in relation:
+        add("量區結構", "最大量區", 4, 9, "在最大量區內整理")
+    elif "下方" in relation and (vp.get("rebound_test_after_breakdown") or (max_gap is not None and max_gap <= 3)):
+        add("量區結構", "最大量區", 3, 9, f"在最大量區下方，已反彈到量區附近（距下緣 {max_gap:.1f}%）" if max_gap is not None else "跌破最大量區後反彈測試中")
+    elif "下方" in relation:
+        add("量區結構", "最大量區", 0, 9, "近期跌破最大量區且未站回" if vp.get("recent_breakdown") else "在最大量區下方")
+    else:
+        add("量區結構", "最大量區", 4.5, 9, "最大量區資料不足，給一半")
+    # 上方壓力只看「壓力有多近」，和上面兩項是不同面向；貼近量區仍給少量分數，不重複歸零。
     if overhead is None:
         add("量區結構", "上方量區壓力", 6, 6, "上方沒有大量區")
     elif overhead[0] <= config.overhead_zone_pct:
         marks["overhead"] = True
-        add("量區結構", "上方量區壓力", 0, 6, f"上方{overhead[1]} {overhead[2]:g} 只差 {overhead[0]:.1f}%，形成壓力")
+        add("量區結構", "上方量區壓力", 2, 6, f"上方{overhead[1]} {overhead[2]:g} 只差 {overhead[0]:.1f}%，有壓力")
     else:
-        add("量區結構", "上方量區壓力", 3, 6, f"上方{overhead[1]} {overhead[2]:g} 距離 {overhead[0]:.1f}%")
+        add("量區結構", "上方量區壓力", 4, 6, f"上方{overhead[1]} {overhead[2]:g} 距離 {overhead[0]:.1f}%")
 
     # ---------- 下方支撐 15：最近支撐距離 11＋8% 內支撐數 4 ----------
     supports = []
     if close:
-        for label, level in (("MA20", values["MA20"]), ("MA60", values["MA60"])):
+        for label, level in (("MA10", values["MA10"]), ("MA20", values["MA20"]), ("MA60", values["MA60"])):
             if level and level <= close:
                 supports.append(((close / level - 1) * 100, label))
         for key in ("maximum_volume_zone", "second_volume_zone"):
@@ -631,7 +644,7 @@ def build_pattern_scorecard(
         "supports_below_close": levels["supports"],
         "tracked_branches": branches,
         "tracked_branches_period": (chips or {}).get("period_lookback", ""),
-        "method": "型態分數 100 分＝量區結構 35＋下方支撐 25＋均線趨勢 20＋價格位置 12＋布林 8（型態與大量區支撐優先），規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
+        "method": "型態分數 100 分＝量區結構 25＋下方支撐 25＋均線趨勢 25＋價格位置 15＋布林 10（量區與支撐合計 50），規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
     }
     if cost_price:
         card["cost_price"] = tools._num(cost_price)
@@ -777,7 +790,7 @@ class WeeklyPickEngine:
 
         breakdown: Dict[str, float] = {}
         reasons: Dict[str, List[str]] = {}
-        # 各項原始分數照舊計算，再換算成新權重（型態 60＋事件 20＋金額 12＋近期 8＝100）。
+        # 各項原始分數照舊計算，再換算成新權重（型態 50＋事件 22＋金額 16＋近期 12＝100）。
         recent_raw, reasons["recent_branch_behavior"] = score_recent_behavior(behavior, config)
         amount_raw, reasons["warrant_amount"] = score_warrant_amount(stock, lead_live)
         reasons["event_performance"] = lead["event_score_reasons"]
@@ -1022,7 +1035,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
 
 WEEKLY_PICK_SYSTEM_PROMPT = """你是我的私人台股研究助理。
 你的工作不是推薦我買股票，而是協助我找出「本週最值得進一步研究、最適合撰寫 Discord 本週精選週報的候選股票」。
-TOP5 已由 Python 依分數排好（型態＋大量區支撐占 60 分為主要依據，事件績效、權證金額、近期操作為輔），你只負責解釋，不得更改排名、不得新增或刪除股票。
+TOP5 已由 Python 依分數排好（型態＋大量區支撐占 50 分為主要依據，事件績效、權證金額、近期操作為輔），你只負責解釋，不得更改排名、不得新增或刪除股票。
 why_for_report 先說型態與大量區支撐的理由，再補充籌碼。
 只能根據 tool_results 提供的資料回答，不得自行補充不存在的數據（股價、勝率、分點、金額、均線、大量區、新聞都一樣）。
 
@@ -1468,7 +1481,7 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_cards_v4",  # v4：型態＋大量區支撐 60 分為主，排除 2330，舊快取分數不同
+        "weekly_pick_cards_v5",  # v5：型態評分改漸進給分、權重平衡（型態 50），舊快取分數不同
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),
