@@ -1510,7 +1510,7 @@ def _startup_warmup() -> None:
     print(f"🔥 預熱完成｜{time.perf_counter() - started:.1f} 秒", flush=True)
 
 
-WEEKLY_PICK_ACK = "📊 收到，本週精選候選計算中（第一次約需 1～3 分鐘；同一份資料再問會直接用快取）…"
+WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
 
 
 def run_discord_bot(config: BotConfig) -> None:
@@ -1553,10 +1553,18 @@ def run_discord_bot(config: BotConfig) -> None:
                 "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)
         return discord.File(io.BytesIO(data), filename=f"ace-answer.{extension}")
 
-    async def reply_image(message, question: str, text: str, panels=None):
+    async def reply_image(message, question: str, text: str, panels=None, *, pending=None):
         file = await image_file(question, text, panels, message.guild)
         try:
-            await message.reply(file=file, mention_author=False, allowed_mentions=no_mentions)
+            if pending is not None:
+                try:
+                    # Replace all old attachments, including the waiting image.
+                    return await pending.edit(content=None, attachments=[file], allowed_mentions=no_mentions)
+                except discord.NotFound as exc:
+                    if exc.code != 10008:  # Only recreate a manually deleted message.
+                        raise
+                    file.reset()
+            return await message.reply(file=file, mention_author=False, allowed_mentions=no_mentions)
         finally:
             file.close()
 
@@ -1565,7 +1573,15 @@ def run_discord_bot(config: BotConfig) -> None:
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         file = await image_file(question, text, panels, interaction.guild)
         try:
-            await interaction.followup.send(file=file, ephemeral=ephemeral, allowed_mentions=no_mentions)
+            try:
+                # The deferred original reply is the single message for this query.
+                # This also supports ephemeral replies without exposing them publicly.
+                return await interaction.edit_original_response(content=None, attachments=[file], allowed_mentions=no_mentions)
+            except discord.NotFound as exc:
+                if exc.code != 10008 or interaction.is_expired():
+                    raise
+                file.reset()
+                return await interaction.followup.send(file=file, ephemeral=ephemeral, allowed_mentions=no_mentions, wait=True)
         finally:
             file.close()
 
@@ -1618,6 +1634,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
             result = await asyncio.to_thread(engine.answer, question)
             await interaction_image(interaction, question, result.text, result.panels, ephemeral=config.ephemeral)
+            print(f"✅ Discord /{config.slash_command_name} 回覆圖片已更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
@@ -1652,18 +1669,20 @@ def run_discord_bot(config: BotConfig) -> None:
         if busy:
             await reply_image(message, "請稍候", busy)
             return
+        pending = None
         try:
             if is_weekly_pick_question(question):
-                await reply_image(message, question, WEEKLY_PICK_ACK)
+                pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 result = await asyncio.to_thread(engine.answer, question)
-            await reply_image(message, question, result.text, result.panels)
+            await reply_image(message, question, result.text, result.panels, pending=pending)
+            print(f"✅ Discord {config.command_prefix} 回覆圖片已送出／更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord 訊息送出失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI 處理問題失敗：{type(exc).__name__}: {exc}", flush=True)
             try:
-                await reply_image(message, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。")
+                await reply_image(message, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。", pending=pending)
             except discord.HTTPException as send_exc:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
