@@ -2521,14 +2521,8 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
 # 持股成本位置（型態／操作類問題用；只整理價位，不下買賣指令）
 # ============================================================
 
-def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, Any]:
-    """成本價相對現價、均線、大量區、布林的位置，以及現價上下方的關鍵價位（全部 Python 計算）。"""
-    code, name = _stock_identity(stock_code)
-    cost = float(cost_price)
-    if cost <= 0:
-        raise ToolDataError("成本價必須大於 0")
-    tech = get_technical_analysis(code)
-    vp = get_volume_profile(code)
+def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]:
+    """現價上下方的關鍵價位（均線、兩大量區上下緣、布林三軌），附距現價 %；全部來自既有計算結果。"""
     close = _num(tech.get("close"))
     levels: List[Dict[str, Any]] = []
 
@@ -2547,14 +2541,28 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
     add("布林上軌", bb.get("upper"))
     add("布林中軌", bb.get("mid"))
     add("布林下軌", bb.get("lower"))
-
-    def relation(price: float) -> str:
-        return "高於" if cost > price else "低於" if cost < price else "等於"
-
     supports = sorted([lv for lv in levels if close is not None and lv["price"] <= close], key=lambda lv: -lv["price"])[:4]
     resistances = sorted([lv for lv in levels if close is not None and lv["price"] > close], key=lambda lv: lv["price"])[:3]
     for lv in supports + resistances:
         lv["distance_from_close_pct"] = _pct(lv["price"], close)
+    return {"close": close, "levels": levels, "supports": supports, "resistances": resistances}
+
+
+def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, Any]:
+    """成本價相對現價、均線、大量區、布林的位置，以及現價上下方的關鍵價位（全部 Python 計算）。"""
+    code, name = _stock_identity(stock_code)
+    cost = float(cost_price)
+    if cost <= 0:
+        raise ToolDataError("成本價必須大於 0")
+    tech = get_technical_analysis(code)
+    vp = get_volume_profile(code)
+    key_levels = key_price_levels(tech, vp)
+    close, levels = key_levels["close"], key_levels["levels"]
+
+    def relation(price: float) -> str:
+        return "高於" if cost > price else "低於" if cost < price else "等於"
+
+    supports, resistances = key_levels["supports"], key_levels["resistances"]
     return {
         "stock_code": code,
         "stock_name": name,

@@ -514,8 +514,8 @@ class QueryRouter:
             plan.add("get_volume_profile", stock_code=code)
             if parsed.cost_price is not None:
                 plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
-            if "warrant" in parsed.intents:
-                plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
+            # 型態評分卡的「追蹤分點動向」要看近 20 個交易日的事件與賣出（只讀 Sheet）。
+            plan.add("get_sheet_stock_chips", stock_code=code, days=20)
         return plan
 
     def _default_bundle(self, parsed: ParsedQuestion) -> QueryPlan:
@@ -809,6 +809,12 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
 16. 布林判讀依 bollinger.rules 的本專案門檻；null 或資料不足不可判定有／沒有。影線穿越不等於收盤突破；持續軌外不等於本日首次突破。
 17. 壓縮只代表波動收斂，不預測突破方向；觸軌不單獨推論反轉，未符合橫盤條件不可稱為橫盤。若資料不足60個有效帶寬，不可宣稱壓縮已成立。
+18. 有 get_pattern_scorecard 時，圖片上方已經另外畫出「型態評分卡」（分數、加分／扣分項目、關鍵價位表、追蹤分點動向表），文字不要逐項重抄：
+   - 【型態】第一句寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要加分與扣分原因。分數只代表技術結構，不可寫成推薦或看多看空結論。
+   - 【觀察重點】不可重複【型態】【均線與大量區】已經寫過的描述，改寫成 3 行，每行以「・」開頭：
+     ・價位：挑 1 個最近的支撐與 1 個最近的壓力（resistances_above_close／supports_below_close），說明「守住／跌破／站回」各代表型態會怎麼變化。
+     ・分數：依 minus_reasons／plus_reasons 說明哪個條件改變會讓型態分數加分或扣分（例如站回 MA20 可解除「跌破 MA20」扣分），只說條件，不預測會不會發生。
+     ・分點：依 tracked_branches 點名 1～2 個值得追蹤的分點（高勝率、仍持有中者優先），寫出它最近的事件與部位狀態，以及「後續若出現減碼／出清或再加碼」代表籌碼面的變化；tracked_branches 為空時寫「近 20 個交易日追蹤分點沒有 A～E 事件」。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
@@ -1260,7 +1266,17 @@ def format_branch_stock_position(d: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_pattern_scorecard(d: Dict[str, Any]) -> str:
+    """評分細節已畫在圖片的型態評分卡；文字只留一行總結，避免重複。"""
+    return (
+        f"【型態評分】型態分數 {_v(d.get('pattern_score'))} / 100（{d.get('grade')}）｜"
+        f"技術型態 {_v(d.get('technical_score'))} / 25｜支撐品質 {_v(d.get('support_score'))} / 15"
+        "\n※ 只評技術結構，不含籌碼，不是買賣建議。"
+    )
+
+
 FORMATTERS.update({
+    "get_pattern_scorecard": format_pattern_scorecard,
     "get_sheet_stock_chips": format_sheet_stock_chips,
     "get_branch_stock_position": format_branch_stock_position,
     "get_branch_event_performance": format_branch_event_performance,
@@ -1479,6 +1495,12 @@ class AceQueryEngine:
         for code, chart in zip(codes, chart_results):
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
             panels.append(panel)
+        if plan.route == "rule_pattern":
+            for panel in panels:
+                card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
+                if card:
+                    panel["scorecard"] = card
+                    results.append(tools.ToolResult("get_pattern_scorecard", True, card))
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started
         self.log(
@@ -1493,6 +1515,19 @@ class AceQueryEngine:
             cacheable=llm_ok and all(r.ok for r in combined),
             panels=panels,
         )
+
+    def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
+        """型態評分卡：沿用本週精選的技術型態＋支撐品質規則（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
+        found = {r.name: r.data for r in results if r.ok and r.data.get("stock_code") == code}
+        tech, vp = found.get("get_technical_analysis"), found.get("get_volume_profile")
+        if not tech or not vp:
+            return {}
+        try:
+            extras = weekly_pick._technical_extras(code)
+            return weekly_pick.build_pattern_scorecard(tech, vp, extras, found.get("get_sheet_stock_chips"), cost_price)
+        except Exception as exc:  # 評分失敗只少一張卡，不影響回答
+            self.log(f"型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
+            return {}
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
         cancel_event = threading.Event()

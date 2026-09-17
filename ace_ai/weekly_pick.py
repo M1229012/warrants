@@ -485,6 +485,92 @@ def score_support(tech: Dict[str, Any], vp: Dict[str, Any], config: WeeklyPickCo
 
 
 # ============================================================
+# 個股型態評分卡（一般問答「型態／成本／操作」類問題用；沿用本週精選的技術型態＋支撐品質規則）
+# ============================================================
+
+PATTERN_GRADES = ((70.0, "結構偏強"), (45.0, "結構中性"), (0.0, "結構偏弱"))
+_REASON_POINTS_RE = re.compile(r"\s([+-]\d+(?:\.\d+)?)$")
+
+
+def _split_reasons(reasons: List[str]) -> Tuple[List[str], List[str]]:
+    """「MA5>MA10>MA20 +3」→ 加分；「跌破 MA20（-2.1%）-3」→ 扣分；基準與無分數說明略過。"""
+    plus, minus = [], []
+    for reason in reasons:
+        match = _REASON_POINTS_RE.search(reason)
+        if not match:
+            continue
+        (plus if float(match.group(1)) > 0 else minus).append(reason)
+    return plus, minus
+
+
+def _branch_status(row: Dict[str, Any]) -> str:
+    sells = row.get("reduce_or_exit_lookback") or []
+    if row.get("open_event_count"):
+        return "持有中・近期有賣出" if sells else "持有中"
+    if row.get("events_recent") or row.get("event_buy_amount_lookback_text") not in (None, "", "-"):
+        return "已出清"
+    return "只有賣出紀錄"
+
+
+def build_pattern_scorecard(
+    tech: Dict[str, Any],
+    vp: Dict[str, Any],
+    extras: Dict[str, Any],
+    chips: Optional[Dict[str, Any]] = None,
+    cost_price: Optional[float] = None,
+    config: Optional[WeeklyPickConfig] = None,
+) -> Dict[str, Any]:
+    """型態分數＝（技術型態 25 ＋ 支撐品質 15）換算成 100 分；只評技術結構，不含權證籌碼、不是買賣建議。"""
+    config = config or WeeklyPickConfig()
+    technical, tech_reasons, _marks = score_technical(tech, vp, extras, config)
+    support, support_reasons = score_support(tech, vp, config)
+    score = round((technical + support) / 40 * 100, 1)
+    grade = next(label for floor, label in PATTERN_GRADES if score >= floor)
+    plus, minus = _split_reasons(tech_reasons + support_reasons)
+    levels = tools.key_price_levels(tech, vp)
+    close = levels["close"]
+    branches = []
+    for row in ((chips or {}).get("branches") or [])[:5]:
+        events = row.get("events_recent") or []
+        last = events[-1] if events else {}
+        sells = row.get("reduce_or_exit_lookback") or []
+        branches.append({
+            "branch": row.get("branch", ""),
+            "is_high_win_rate": bool(row.get("is_high_win_rate")),
+            "overall_win_rate": row.get("overall_win_rate_background"),
+            "latest_event": (f"{last.get('event')} {str(last.get('event_date', ''))[5:]} 買 {last.get('buy_amount_text', '')}"
+                             if last else "區間內無 A～E 事件"),
+            "event_buy_amount_text": row.get("event_buy_amount_lookback_text", "-"),
+            "status": _branch_status(row),
+            "latest_sell": (f"{sells[-1]['date'][5:]} {sells[-1]['action']} {sells[-1]['sell_amount_text']}" if sells else ""),
+        })
+    card = {
+        "stock_code": tech.get("stock_code") or vp.get("stock_code", ""),
+        "data_date": tech.get("data_date"),
+        "pattern_score": score,
+        "grade": grade,
+        "technical_score": technical,
+        "technical_max": 25,
+        "support_score": support,
+        "support_max": 15,
+        "plus_reasons": plus,
+        "minus_reasons": minus,
+        "pattern_label": vp.get("pattern_label") or "型態資料不足",
+        "ma_alignment": tech.get("ma_alignment", ""),
+        "close": close,
+        "resistances_above_close": levels["resistances"],
+        "supports_below_close": levels["supports"],
+        "tracked_branches": branches,
+        "tracked_branches_period": (chips or {}).get("period_lookback", ""),
+        "method": "型態分數＝（技術型態 25 分＋支撐品質 15 分）÷ 40 × 100，規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
+    }
+    if cost_price:
+        card["cost_price"] = tools._num(cost_price)
+        card["unrealized_pct"] = tools._pct(close, cost_price)
+    return card
+
+
+# ============================================================
 # 主流程
 # ============================================================
 
