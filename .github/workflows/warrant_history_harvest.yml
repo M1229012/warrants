@@ -10,6 +10,7 @@
 #     warrants_store.parquet                 權證主檔累積庫（代號×生命週期）
 #     warrant_meta_store.parquet             權證靜態屬性（履約價、行使比例、到期日）
 #     ohlcv_store_<年>.parquet               全市場 OHLCV，分年（每年約 225 MB）
+#     ohlcv_no_trading_dates.parquet         已確認休市的平日，之後不再重查
 #     warrant_cache.tar.gz                   工作快取（含 backfill 的 checkpoint）
 #
 # 兩種跑法：
@@ -20,6 +21,13 @@
 #               沒跑完會自動觸發下一段（只要手動按第一次），直到完成為止。
 #               安全閥：這一段完全沒進度、上傳失敗、或已連續接續 MAX_CHAIN 段，就停止接續。
 #               回補期間排程的 daily 可能會被排隊中的下一段取代而略過，這是預期的。
+#
+# 三道保護（每一道都是實際出過事才加的）：
+#     1. 版本一致：三支程式的 HARVEST_BUILD 必須等於這裡的 HARVEST_BUILD，
+#        否則一開始就停。2026-09-17 只更新了部分檔案，新舊混跑兩次都死在同一個地方。
+#     2. 還原要完整：下載失敗就停，不可以用空的累積庫往下跑。
+#     3. 上傳前比列數：任何一個累積檔比還原時少，就拒絕上傳，
+#        不讓一次異常的執行把 Release 上的完整資料覆蓋掉。
 #
 # 為什麼 backfill 不用主程式的 repair：
 #   repair 每個 API4 請求都查 1,300 天、沒有續跑、任何一組失敗就整輪作廢，
@@ -44,8 +52,7 @@ on:
 
 # 同一時間只能有一個在跑。
 # 兩個 run 會各自下載同一份累積庫、各自加資料、各自 --clobber 上傳，
-# 後傳的會把先傳的整份蓋掉 —— 累積庫的只進不出守衛只防得了單次執行內部，
-# 防不了跨 run 的競態。排程的 daily 碰上手動的 backfill 就會發生。
+# 後傳的會把先傳的整份蓋掉。排程的 daily 碰上手動的 backfill 就會發生。
 concurrency:
   group: warrant-history-store
   cancel-in-progress: false
@@ -55,6 +62,8 @@ permissions:
   actions: write         # 回補沒跑完時 gh workflow run 自動觸發下一段需要
 
 env:
+  # 必須與 warrant_harvest/ 底下三支程式的 HARVEST_BUILD 相同
+  HARVEST_BUILD: "2026-09-18.1"
   STORE_TAG: data-store
   OUTPUT_DIR: output
   JOB_TIMEOUT_MINUTES: "350"
@@ -72,6 +81,26 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: 檢查程式版本一致
+        id: version
+        run: |
+          mismatch=0
+          for f in warrant_harvest/warrant_backfill.py \
+                   warrant_harvest/warrant_history_store.py \
+                   warrant_harvest/warrant_reference_harvest.py; do
+            v=$(sed -n 's/^HARVEST_BUILD = "\([^"]*\)".*/\1/p' "$f" | head -1)
+            if [ "$v" = "$HARVEST_BUILD" ]; then
+              echo "  ✅ $f  $v"
+            else
+              echo "  ❌ $f  ${v:-（沒有版本號＝舊版）}"
+              mismatch=1
+            fi
+          done
+          if [ "$mismatch" = "1" ]; then
+            echo "::error::程式版本不一致（workflow 要求 $HARVEST_BUILD）。請把標 ❌ 的檔案換成最新版再重跑。這次不抓也不上傳任何東西。"
+            exit 1
+          fi
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -80,21 +109,28 @@ jobs:
         run: pip install --quiet requests pandas openpyxl pyarrow
 
       - name: 下載上一次的累積庫與快取
+        id: restore
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p output/warrant_history_store/ohlcv output/warrant_cache
           if gh release view "$STORE_TAG" >/dev/null 2>&1; then
-            gh release download "$STORE_TAG" \
-              --dir output/warrant_history_store \
-              --pattern "*.parquet" --clobber || true
+            # 下載失敗一定要讓這一步失敗，絕不可以 || true 吞掉：
+            # 吞掉的話，後面會拿「空的累積庫＋這一輪的資料」去 --clobber 覆蓋 Release，
+            # 三年的累積一次清空。
+            assets=$(gh release view "$STORE_TAG" --json assets --jq '.assets[].name')
+            if echo "$assets" | grep -q '\.parquet$'; then
+              gh release download "$STORE_TAG" \
+                --dir output/warrant_history_store \
+                --pattern "*.parquet" --clobber
+            fi
             # Release 的 asset 是平的，OHLCV 分年檔要還原回子目錄
             for f in output/warrant_history_store/ohlcv_store_*.parquet; do
-              [ -e "$f" ] && mv "$f" output/warrant_history_store/ohlcv/
+              if [ -e "$f" ]; then mv "$f" output/warrant_history_store/ohlcv/; fi
             done
-            gh release download "$STORE_TAG" \
-              --dir /tmp --pattern "warrant_cache.tar.gz" --clobber || true
-            if [ -f /tmp/warrant_cache.tar.gz ]; then
+            if echo "$assets" | grep -qx 'warrant_cache.tar.gz'; then
+              gh release download "$STORE_TAG" \
+                --dir /tmp --pattern "warrant_cache.tar.gz" --clobber
               tar -xzf /tmp/warrant_cache.tar.gz -C output/
               echo "已還原工作快取"
             fi
@@ -109,21 +145,40 @@ jobs:
           ls -la output/warrant_history_store/ output/warrant_history_store/ohlcv/ || true
           du -sh output/warrant_cache/ 2>/dev/null || true
 
-      # ── 以下每一步都用 !cancelled()：任何一步失敗都不該擋住後面彼此獨立的步驟 ──
-      # （2026-09-17 靜態屬性寫入失敗，回補步驟因此被整個跳過。）
+          # 記下還原時每個累積檔的列數（只讀 parquet 檔尾，很快），上傳前比對。
+          python - <<'PY'
+          import glob, json, os
+          import pyarrow.parquet as pq
+          paths = (
+              glob.glob("output/warrant_history_store/*.parquet")
+              + glob.glob("output/warrant_history_store/ohlcv/*.parquet")
+              + [p for p in (
+                  "output/warrant_cache/backfill/api4_state.parquet",
+                  "output/warrant_cache/backfill/api6_state.parquet",
+                  "output/warrant_cache/backfill/candidates.parquet",
+              ) if os.path.exists(p)]
+          )
+          manifest = {p: pq.ParquetFile(p).metadata.num_rows for p in sorted(paths)}
+          with open("/tmp/restore_manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, ensure_ascii=False, indent=2)
+          print(f"已記錄 {len(manifest)} 個累積檔的列數，上傳前會比對")
+          PY
+
+      # ── 抓資料的步驟用 !cancelled()：彼此獨立，一步失敗不該擋住其他步驟。
+      #    但一律要求「還原成功」，否則是在空的累積庫上做事。
 
       - name: 抓權證靜態屬性
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
         run: |
           # t187ap37_L 只列現行有效權證，已到期權證的履約價事後補不回來，所以每天抓。
           python warrant_harvest/warrant_reference_harvest.py meta
 
       # backfill 要靠 OHLCV 建立 2023–2025 的歷史權證母體，所以排在回補前面
       - name: 抓全市場 OHLCV
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
         run: |
           if [ "${{ github.event.inputs.mode }}" = "backfill" ]; then
-            # 已抓過的日期會自動跳過；第一次約 80 分鐘，之後幾乎是零
+            # 已抓過的日期與已知休市日會自動跳過
             python warrant_harvest/warrant_reference_harvest.py ohlcv --start 2023/09/11
           else
             python warrant_harvest/warrant_reference_harvest.py ohlcv --recent 10
@@ -131,7 +186,7 @@ jobs:
           python warrant_harvest/warrant_reference_harvest.py report
 
       - name: 深度回補（backfill）
-        if: ${{ !cancelled() && github.event.inputs.mode == 'backfill' }}
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' && github.event.inputs.mode == 'backfill' }}
         run: |
           # 時間預算＝ job 上限 − 已用掉的 − 收尾保留。
           # 由 workflow 算而不是寫死，因為 OHLCV 第一次跟之後的耗時差很多。
@@ -145,7 +200,7 @@ jobs:
           fi
 
       - name: 每日增量（daily）
-        if: ${{ !cancelled() && github.event.inputs.mode != 'backfill' }}
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' && github.event.inputs.mode != 'backfill' }}
         env:
           GSHEET_RESULT_ENABLED: "0"
           GSHEET_CACHE_ENABLED: "0"
@@ -161,27 +216,58 @@ jobs:
             echo "⚠️ 主程式非正常結束，已抓到的快取仍會存回去。"
           }
 
+      # ── 收尾步驟用 always()：前面失敗也要把已經抓到的存回去。
+      #    但同樣要求還原成功，而且上傳前必須通過列數檢查。
+
       - name: 併進累積庫（只進不出）
-        if: always()
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         run: |
           python warrant_harvest/warrant_history_store.py merge
           python warrant_harvest/warrant_history_store.py report
 
       - name: 匯出 Excel
-        if: always()
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         run: |
           python warrant_harvest/warrant_history_store.py export --scope recent
           python warrant_harvest/warrant_history_store.py export --scope summary
 
+      - name: 上傳前檢查（累積庫不可以比還原時少）
+        id: guard
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          import pyarrow.parquet as pq
+          with open("/tmp/restore_manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+          problems = []
+          for path, before in manifest.items():
+              if not os.path.exists(path):
+                  problems.append(f"{path}：還原時 {before:,} 列，現在檔案不見了")
+                  continue
+              now = pq.ParquetFile(path).metadata.num_rows
+              mark = "✅" if now >= before else "❌"
+              print(f"  {mark} {path}：{before:,} → {now:,} 列")
+              if now < before:
+                  problems.append(f"{path}：{before:,} → {now:,} 列")
+          if problems:
+              print("::error::累積檔比還原時少，拒絕上傳，Release 上的資料維持原狀：")
+              for item in problems:
+                  print(f"  {item}")
+              sys.exit(1)
+          print(f"檢查通過：{len(manifest)} 個累積檔都沒有變少")
+          PY
+
       - name: 打包工作快取
-        if: always()
+        id: pack
+        if: ${{ always() && steps.guard.outcome == 'success' }}
         run: |
           tar -czf /tmp/warrant_cache.tar.gz -C output warrant_cache
           ls -lh /tmp/warrant_cache.tar.gz
 
       - name: 傳回累積庫
         id: upload
-        if: always()
+        if: ${{ always() && steps.guard.outcome == 'success' && steps.pack.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -200,13 +286,13 @@ jobs:
           gh release upload "$STORE_TAG" "${files[@]}" --clobber
 
       - name: 回補進度
-        if: always() && github.event.inputs.mode == 'backfill'
+        if: ${{ always() && steps.restore.outcome == 'success' && github.event.inputs.mode == 'backfill' }}
         run: python warrant_harvest/warrant_backfill.py --status
 
       # 只有上傳成功才接續：checkpoint 沒存回 Release 的話，
       # 下一段會從舊狀態重做，白白燒掉一整段。
       - name: 自動接續下一段回補
-        if: always() && github.event.inputs.mode == 'backfill' && steps.upload.outcome == 'success'
+        if: ${{ always() && github.event.inputs.mode == 'backfill' && steps.upload.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CHAIN: ${{ github.event.inputs.chain || '0' }}
