@@ -76,14 +76,33 @@ def clean(text: str) -> str:
     return text.replace('**', '').replace('`', '').strip()
 
 
+_WRAP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.,%+\-/_:~]*|\s+|.", re.S)
+_NO_LINE_START = set('，。、；：！？）」』】〉》,.;:!?)]}%…～·')
+_NO_LINE_END = set('（「『【〈《([{')
+
+
 def wrap(text: str, size: int, width: int, bold: bool = False) -> list[str]:
+    """換行：數字與英文單字整段不拆、標點不放在行首、左括號不留在行尾；單段比整行還寬才逐字切。"""
     face = font(size, bold)
+    units: list[str] = []
+    for token in _WRAP_TOKEN_RE.findall(text):
+        if units and (token[0] in _NO_LINE_START or units[-1][-1] in _NO_LINE_END):
+            units[-1] += token
+        else:
+            units.append(token)
     lines, current = [], ''
-    for char in text:
-        if current and face.getlength(current + char) > width:
+    for unit in units:
+        if current and face.getlength(current + unit) > width:
             lines.append(current)
             current = ''
-        current += char
+        if face.getlength(unit) <= width:
+            current += unit
+            continue
+        for char in unit:
+            if current and face.getlength(current + char) > width:
+                lines.append(current)
+                current = ''
+            current += char
     if current:
         lines.append(current)
     return lines or ['']
@@ -689,7 +708,9 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
 def _deduction_outlook(info: dict) -> tuple[str, str]:
     """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
     if info.get('turn'):
-        return f"第 {info.get('turn_day')} 日{info['turn']}", WARN_INK if info['turn'] == '轉下彎' else GOOD_INK
+        day = info.get('turn_day')
+        text = info.get('turn_text') or f"{ {1: '明天起', 2: '後天起'}.get(day, f'{day} 個交易日後') }{info['turn']}"
+        return text, WARN_INK if info['turn'] == '轉下彎' else GOOD_INK
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 

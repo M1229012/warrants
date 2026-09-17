@@ -423,17 +423,15 @@ class QueryRouter:
         analysis = "analysis" in intents
         if parsed.branches:
             return self._branch_plan(parsed, categories, analysis)
-        if parsed.stocks and ("cost" in intents or "volume_profile" in categories and analysis):
+        # 有股票的問題一律交給 AI 客觀回答：型態／成本／K 棒／漲跌看法／技術面／沒有特定類別的問題走型態路由
+        # （K 線＋型態評分卡＋AI 回答）；新聞、權證、勝率等指定類別才走各自的資料組合，只問股價才直接排版。
+        other_categories = categories - {"price", "technical", "volume_profile"}
+        if parsed.stocks and ("cost" in intents or not other_categories):
+            if categories == {"price"} and not analysis and "cost" not in intents:
+                return self._stock_plan(parsed, categories, analysis)
             return self._pattern_plan(parsed)
         if parsed.stocks:
-            if categories:
-                return self._stock_plan(parsed, categories, analysis)
-            if not analysis:
-                plan = QueryPlan(route="rule_stock_default")
-                for code, _ in parsed.stocks:
-                    plan.add("get_stock_overview", stock_code=code)
-                    plan.add("get_technical_analysis", stock_code=code)
-                return plan
+            return self._stock_plan(parsed, categories, analysis)
         if not parsed.stocks and "win_rate" in intents and ("rank" in intents or "高" in parsed.original):
             plan = QueryPlan(route="rule_winrate_rank")
             plan.add("get_branch_winrate_rank")
@@ -500,15 +498,8 @@ class QueryRouter:
                 plan.add("get_recent_news", stock_code=code)
                 # 新聞統整時附上當日收盤與漲跌，讓 AI 能說明股價當下的反應（快取資料，幾乎不增加時間）。
                 plan.add("get_stock_overview", stock_code=code)
-        # 權證分點與勝率 join 屬於同一類「籌碼」資料，不因此多呼叫 Gemini。
-        groups = {
-            "technical": bool(categories & {"technical"}),
-            "volume_profile": bool(categories & {"volume_profile"}),
-            "chips": bool(categories & {"warrant", "win_rate", "recent_trades"}),
-            "news": bool(categories & {"news"}),
-        }
-        # 新聞一律交給 AI 統整重點與利多／利空（1 次 Gemini）；只列標題對使用者沒有幫助。
-        plan.need_final_llm = analysis or groups["news"] or sum(groups.values()) >= 2 or len(parsed.stocks) > 1
+        # 只問股價（例如「2344股價多少」）才直接排版數字，其餘都交給 AI 回答。
+        plan.need_final_llm = analysis or bool(categories - {"price"}) or len(parsed.stocks) > 1
         return plan
 
     def _pattern_plan(self, parsed: ParsedQuestion) -> QueryPlan:
@@ -796,11 +787,12 @@ class GeminiGateway:
 
 FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能依 tool_results 回答。
 規則：
-1. 不可自創任何數據；數字照 tool_results 原樣寫（萬／億寫法不變、不可四捨五入成約數）。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。
-2. AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
+1. 不可自創任何數據；數字照 tool_results 原樣寫，大金額可以精確換算成「萬／億」（例如 1,120,000,000 寫成 11.2 億），但不可四捨五入成約數。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。
+2. 保持客觀中性：用「偏多條件／偏空條件」描述，每個判斷都附上依據，有利與不利的條件都要寫；不用「強勢、看好、危險、暴漲、慘」等帶情緒或暗示方向的字眼。AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
 3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
-4. 回答排進圖片，口語、精簡，每段 1～3 句；同一件事只講一次，不同段落不可重複相同的數字或結論。
-5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間（股價為日K收盤資料）。"""
+4. 回答排進圖片，口語、精簡，每段 1～3 句，每句要完整通順（不要用刪節號、不要半句）；同一件事只講一次。圖片已顯示股價、均線、布林、KD、MACD、成交量、大量區與分點標註，文字不可逐項列出這些數值，要寫「代表什麼」並回答問題；只有說明條件時才引用 1～2 個關鍵價位。
+5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間（股價為日K收盤資料）。
+6. 一定先寫【回答】直接回應使用者問的事。問「明天會不會漲、漲的機率」這類預測：說明無法預測漲跌或給機率，改用型態分數、今天 K 棒、量能與關鍵價位客觀說明偏多與偏空的條件。問 K 棒型態（例如仙人指路、長上影、長下影、十字線、吞噬）：依 get_stock_overview.candle（實體、上影線、下影線占前日收盤 %、收盤在當日區間的位置）、量比與型態評分卡（是否剛突破、相對位置），對照該型態的常見定義說明符合或不符合與常見解讀，不可斷言後續走勢。"""
 
 FINAL_TECH_RULES = """技術面規則：布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀；null 不可判定有或沒有。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
 
@@ -811,17 +803,17 @@ FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summa
 
 FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
 圖片上已畫出 K 線（均線、布林、大量區、分點買賣標註）與型態評分卡（分數、五大項、主要得分失分、均線扣抵、關鍵價位、追蹤分點動向），這些內容不要逐項重抄。只寫兩個區塊：
-【回答】3～5 句直接回應問題、不可拒答：
+【回答】3～5 句直接回應問題、不可拒答（預測、K 棒型態等其他問法依規則 6 回答）：
 - 問成本／操作：先說成本相對現價與帳面損益 unrealized_pct，再用條件句給參考框架「若守住 A，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位；若站上 C，…」。A／B／C 只能用 supports_below_close／resistances_above_close 的價位，是一般觀察方式，不是替使用者決定。
 - 問型態好不好：直接說好或不好、型態分數 pattern_score／100（grade），以及影響最大的一個得分與一個失分原因。
 - 分數只代表技術結構，不可說成推薦。
 【觀察重點】最多 3 行，每行以「・」開頭，只寫圖上沒有的「條件與意義」：
-・扣抵／均線：ma_deduction 的 MA20 或 MA60 有 turn 時，寫「明日收盤需高於 tomorrow_close_needed_to_rise 均線才會上揚」與 turn_day；沒有 turn 時改寫 minus_reasons 中哪個條件改善可補回分數。
+・扣抵／均線：ma_deduction 的 MA20 或 MA60 有 turn_text 時，寫「明日收盤需高於 tomorrow_close_needed_to_rise，均線才會上揚」並照 turn_text 的用語說明（例如「收盤若持平，後天起轉下彎」，不要寫成「第 N 日」）；沒有 turn 時改寫 minus_reasons 中哪個條件改善可補回分數。
 ・技術訊號：只有 bollinger（壓縮、沿軌、突破）或 kd／macd signals 有明確訊號時才寫一句，沒有就省略這行。
 ・分點：點名 1～2 個 tracked_branches（高勝率、持有中優先），說明後續減碼／出清或再加碼代表的籌碼變化；沒有就寫「近 20 個交易日追蹤分點沒有 A～E 事件」。"""
 
-FINAL_FORMAT_GENERAL = """區塊依序使用（只放有資料、和問題相關的）：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
-FINAL_FORMAT_NEWS = """區塊依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
+FINAL_FORMAT_GENERAL = """區塊依序使用（只放有資料、和問題相關的）：【回答】、【籌碼】、【技術解讀】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
+FINAL_FORMAT_NEWS = """區塊依序使用：【回答】（1～2 句直接說整體偏利多、偏利空或好壞參半）、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
 FINAL_FORMAT_PATTERN = """區塊只用：【回答】、【觀察重點】。"""
 
 
@@ -854,6 +846,25 @@ def _drop_keys(value: Any) -> Any:
     return value
 
 
+def _candle_shape(d: Dict[str, Any]) -> Dict[str, Any]:
+    """今天 K 棒結構（Python 計算）：實體、上影線、下影線占前日收盤 %，給 AI 判斷仙人指路、長上影等型態。"""
+    o, h, l, c, prev = (d.get(k) for k in ("open", "high", "low", "close", "prev_close"))
+    if None in (o, h, l, c) or not prev:
+        return {}
+
+    def pct(value: float) -> float:
+        return round(value / prev * 100, 2)
+
+    return {
+        "color": "紅K" if c > o else "黑K" if c < o else "十字／平盤",
+        "body_pct": pct(abs(c - o)),
+        "upper_shadow_pct": pct(h - max(o, c)),
+        "lower_shadow_pct": pct(min(o, c) - l),
+        "range_pct": pct(h - l),
+        "close_position_in_range_pct": round((c - l) / (h - l) * 100, 1) if h > l else None,
+    }
+
+
 def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> Optional[Dict[str, Any]]:
     """依問題類型精簡 Tool 資料；回傳 None 表示這份資料已被型態評分卡涵蓋，不必再送。"""
     if has_scorecard and name in ("get_cost_position_context", "get_sheet_stock_chips", "get_volume_profile"):
@@ -867,15 +878,17 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
-            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn", "turn_day", "tomorrow_close_needed_to_rise")}
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "tomorrow_close_needed_to_rise")}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn", "turn_day", "tomorrow_close_needed_to_rise")}
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "tomorrow_close_needed_to_rise")}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
-    elif name == "get_stock_overview" and has_scorecard:
-        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "close", "change_pct", "volume_lots", "volume_ratio_vs_mv5")}
+    elif name == "get_stock_overview":
+        candle = _candle_shape(data)
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "close", "change_pct", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
+        data["candle"] = candle
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -945,12 +958,29 @@ def _number_variants(token: str) -> Set[str]:
     return variants
 
 
+def _unit_variants(token: str) -> Set[str]:
+    """大金額換算成「萬／億」的寫法：1,120,000,000 → 11.2（億）、112000（萬），不是四捨五入的約數。"""
+    try:
+        value = float(token.replace(",", "").lstrip("+"))
+    except ValueError:
+        return set()
+    variants: Set[str] = set()
+    for unit in (1e4, 1e8):
+        if abs(value) >= unit:
+            scaled = value / unit
+            for digits in (0, 1, 2):
+                if abs(round(scaled, digits) - scaled) < 1e-9:  # 只接受換算後剛好整除到該位數，避免把四捨五入當成對得上
+                    variants |= _number_variants(f"{round(scaled, digits):.{digits}f}")
+    return variants
+
+
 def find_ungrounded_numbers(answer: str, payload: Dict[str, Any]) -> List[str]:
-    """找出回答中不存在於 tool_results 的數字（小於等於 10 的整數視為一般敘述用字）。"""
+    """找出回答中不存在於 tool_results 的數字（小於等於 10 的整數視為一般敘述用字；大金額允許精確換算成萬／億）。"""
     source = json.dumps(payload, ensure_ascii=False)
     allowed: Set[str] = set()
     for token in _NUMBER_RE.findall(source):
         allowed |= _number_variants(token)
+        allowed |= _unit_variants(token)
     text = answer
     for pattern in _EXEMPT_PATTERNS:
         text = pattern.sub(" ", text)
@@ -1032,6 +1062,14 @@ def format_overview(d: Dict[str, Any]) -> str:
     )
 
 
+def _deduction_line(deduction: Dict[str, Any]) -> str:
+    """均線扣抵合併成一行：MA5 續揚、MA20 第 2 日轉下彎…（細節數字在圖片的評分卡）。"""
+    words = {"上揚": "續揚", "下彎": "續彎"}
+    parts = [f"{key} {info.get('turn_text') or tools.turn_phrase(info['turn'], info.get('turn_day'))}" if info.get("turn")
+             else f"{key} {words.get(info.get('direction_now'), '走平')}" for key, info in deduction.items()]
+    return ("\n扣抵（收盤不變推算）：" + "、".join(parts)) if parts else ""
+
+
 def format_technical(d: Dict[str, Any]) -> str:
     ma_parts = [
         f"{name} {_v(info.get('value'))}（{info.get('position')}）"
@@ -1050,8 +1088,7 @@ def format_technical(d: Dict[str, Any]) -> str:
         f"均線：{'｜'.join(ma_parts)}\n"
         f"排列：{d.get('ma_alignment')}；{cross_text}"
         + (f"；{d.get('ma_kline_signals')}" if d.get("ma_kline_signals") else "")
-        + "".join(f"\n扣抵：{info['signal']}" for key, info in (d.get("ma_deduction") or {}).items()
-                  if key in ("MA20", "MA60") and info.get("signal"))
+        + _deduction_line(d.get("ma_deduction") or {})
         + f"\nKD：K {_v(kd.get('K9'))}／D {_v(kd.get('D9'))}（{kd.get('signals') or '無特殊訊號'}）\n"
         f"MACD：DIF {_v(macd.get('DIF'))}／MACD {_v(macd.get('MACD'))}／OSC {_v(macd.get('OSC'))}"
         f"（{macd.get('osc_trend')}{'；' + macd.get('signals') if macd.get('signals') else ''}）\n"
@@ -1219,7 +1256,7 @@ def format_news(d: Dict[str, Any]) -> str:
         detail = re.sub(r"\s+", " ", str(detail or "")).strip()
         title = str(item.get("title") or "")
         if detail and not detail.startswith(title[:20]):
-            lines.append(f"　{detail[:120]}{'…' if len(detail) > 120 else ''}")
+            lines.append(f"　{tools._truncate_sentences(detail, 160)}")
     return "\n".join(lines)
 
 

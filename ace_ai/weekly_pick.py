@@ -373,16 +373,16 @@ def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
         return full / 2, "資料不足，給一半"
     if now == "上揚":
         if turn == "轉下彎":
-            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，收盤不變第 {day} 日起轉下彎"
+            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，收盤不變{tools.turn_phrase(turn, day)}"
         return full, "上揚，扣抵後仍續揚"
     if now == "下彎":
         if turn == "轉上揚":
-            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，收盤不變第 {day} 日起轉上揚"
+            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，收盤不變{tools.turn_phrase(turn, day)}"
         return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
     if turn == "轉上揚":
-        return round(full * 0.7, 1), f"走平，收盤不變第 {day} 日起轉上揚"
+        return round(full * 0.7, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
     if turn == "轉下彎":
-        return round(full * 0.2, 1), f"走平，收盤不變第 {day} 日起轉下彎"
+        return round(full * 0.2, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
     return full / 2, "走平"
 
 

@@ -373,6 +373,26 @@ def _truncate(text: Any, limit: int = TEXT_CELL_MAX_CHARS) -> str:
     return s if len(s) <= limit else s[: max(0, limit - 1)] + "…"
 
 
+def _truncate_sentences(text: Any, limit: int) -> str:
+    """長文截斷時停在句號、分號或換行，不把句子或數字切一半；找不到斷點才硬切並加「…」。"""
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    cut = max(head.rfind(mark) for mark in ("。", "！", "？", "；", "\n"))
+    if cut >= limit * 0.5:
+        return head[: cut + 1].strip()
+    return head.rstrip() + "…"
+
+
+def turn_phrase(turn: str, day: Optional[int]) -> str:
+    """均線轉向的時間用語：1＝明天、2＝後天、其餘「N 個交易日後」。"""
+    if not turn or not day:
+        return ""
+    when = {1: "明天起", 2: "後天起"}.get(int(day), f"{int(day)} 個交易日後")
+    return f"{when}{turn}"
+
+
 def _money_text(value: Any) -> str:
     """沿用主程式 fmt_money 的「萬／億」金額格式。"""
     number = _num(value, 4)
@@ -1084,10 +1104,10 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
         above_close = ma > close
         if turn == "轉下彎":
             signal = (f"MA{n} 目前{now}，但未來 {k} 日扣抵價最高 {high:,.2f} 高於現價；收盤若維持 {close:,.2f}，"
-                      f"第 {turn_day} 個交易日起轉下彎" + ("，且均線在股價上方，下彎後容易形成壓力" if above_close else ""))
+                      f"{turn_phrase(turn, turn_day)}" + ("，且均線在股價上方，下彎後容易形成壓力" if above_close else ""))
         elif turn == "轉上揚":
             signal = (f"MA{n} 目前{now}，未來 {k} 日扣抵價最低 {low:,.2f} 低於現價；收盤若維持 {close:,.2f}，"
-                      f"第 {turn_day} 個交易日起轉上揚")
+                      f"{turn_phrase(turn, turn_day)}")
         elif now == "上揚":
             signal = f"MA{n} 上揚，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不高於現價，收盤維持不變時仍續揚"
         elif now == "下彎":
@@ -1108,6 +1128,7 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "projected_value_if_close_unchanged": _num(projected),
             "turn": turn,
             "turn_day": turn_day,
+            "turn_text": turn_phrase(turn, turn_day),
             "ma_above_close": above_close,
             "signal": signal,
         }
@@ -1821,6 +1842,36 @@ def fetch_cnyes_article_text(news_id: str) -> str:
     return content
 
 
+_FILING_META_RE = re.compile(r"^(第\d+款|公司代號|公司名稱|發言日期|發言時間|發言人|發言人職稱|發言人電話|符合條款)")
+_FILING_EMPTY_VALUES = {"不適用", "無", "NA", "N/A", "none", "None"}
+
+
+def _compact_filing_text(text: str) -> str:
+    """公司重大訊息公告：拿掉制式抬頭（公司代號、發言人…），並把「1.欄位名稱:值」逐項分段，
+    值是空的或「不適用／無」的整項拿掉，讓金額、交易對象等重點不被截掉，也不留下沒有內容的欄位名稱。"""
+    head: List[str] = []
+    items: List[List[str]] = []
+    for raw in str(text or "").split("\n"):
+        line = raw.strip()
+        if not line or _FILING_META_RE.match(line):
+            continue
+        if re.match(r"^\d{1,2}[.．、]", line):
+            items.append([line])
+        elif items:
+            items[-1].append(line)
+        else:
+            head.append(line)
+    kept = list(head)
+    for item in items:
+        block = "\n".join(item)
+        parts = re.split(r"[:：]", block, maxsplit=1)
+        value = parts[1].strip(" \n。") if len(parts) == 2 else ""
+        if len(parts) == 2 and (not value or value in _FILING_EMPTY_VALUES):
+            continue
+        kept.append(block)
+    return "\n".join(kept)
+
+
 def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
     """鉅亨網新聞搜尋 API（用股票代號查），只留標題／標籤明確提到本公司、且在回看天數內的新聞，前幾篇抓內文。"""
     kf = core()
@@ -1864,12 +1915,14 @@ def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
             except Exception as exc:  # 單篇失敗只少內文
                 print(f"⚠️ 鉅亨新聞內文略過：{news_id}｜{type(exc).__name__}: {exc}", flush=True)
         summary = _cnyes_html_to_text(item.get("summary") or "")
+        if content and re.match(r"^[^:：]{1,12}[:：]本公司", item["title"]):
+            content = _compact_filing_text(content)
         articles.append({
             "date": datetime.fromtimestamp(float(item["publishAt"]), TAIPEI_TZ).strftime("%Y/%m/%d"),
             "title": item["title"].strip(),
             "source": "鉅亨網",
-            "summary": _truncate(summary, NEWS_SUMMARY_MAX_CHARS),
-            "content": _truncate(content, NEWS_CONTENT_MAX_CHARS) if content else "",
+            "summary": _truncate_sentences(summary, NEWS_SUMMARY_MAX_CHARS),
+            "content": _truncate_sentences(content, NEWS_CONTENT_MAX_CHARS) if content else "",
             "content_source": "鉅亨網原文" if content else "僅標題",
             "url": CNYES_NEWS_PAGE_URL.format(news_id),
             "event_key": f"cnyes_{news_id}",
@@ -1914,8 +1967,8 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
                 "date": _news_date(article.get("published", "")),
                 "title": title,
                 "source": str(article.get("source", "") or ""),
-                "summary": _truncate(detail, NEWS_SUMMARY_MAX_CHARS),
-                "content": _truncate(detail, NEWS_CONTENT_MAX_CHARS),
+                "summary": _truncate_sentences(detail, NEWS_SUMMARY_MAX_CHARS),
+                "content": _truncate_sentences(detail, NEWS_CONTENT_MAX_CHARS),
                 "content_source": "RSS 摘要" if detail else "僅標題",
                 "url": str(article.get("url", "") or ""),
                 "event_key": kf._news_article_event_key(article, code, name),
