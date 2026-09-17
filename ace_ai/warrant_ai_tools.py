@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import json
 import math
 import os
 import re
@@ -127,8 +128,54 @@ def _resolve_core_script_path() -> str:
     return next((path for path in candidates if os.path.isfile(path)), candidates[0])
 
 
+def normalize_gcp_service_key_env() -> None:
+    """容錯整理 GCP_SERVICE_KEY：去掉誤貼的變數名稱、前後引號與三引號，驗證是合法 JSON 後壓成一行。
+
+    Railway 等平台的變數值不適合多行，常見誤貼會讓主程式出現「GCP_SERVICE_KEY 解析失敗」。
+    這裡只印出狀態與 client_email，絕不印出金鑰內容。
+    """
+    raw = os.environ.get("GCP_SERVICE_KEY", "")
+    if not raw.strip():
+        print("❌ GCP_SERVICE_KEY 未設定：Google Sheet 相關功能（分點勝率、A～E 事件、本週精選）無法使用")
+        return
+    text = raw.strip()
+    text = re.sub(r"^\s*GCP_SERVICE_KEY\s*=\s*", "", text)
+    # 整段被當成 JSON 字串存起來（外層雙引號＋內層 \"）時，先解一層字串。
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, str):
+            text = decoded.strip()
+    except json.JSONDecodeError:
+        pass
+    for _ in range(3):
+        stripped = text.strip()
+        for quote in ("'''", '"""', '"', "'"):
+            if len(stripped) > 2 * len(quote) and stripped.startswith(quote) and stripped.endswith(quote):
+                stripped = stripped[len(quote):-len(quote)].strip()
+        if stripped == text:
+            break
+        text = stripped
+    try:
+        info = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            info = json.loads(text.encode("utf-8").decode("unicode_escape"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            print(
+                f"❌ GCP_SERVICE_KEY 不是完整 JSON（長度 {len(raw)} 字元，開頭 {raw.strip()[:3]!r}）｜{exc}｜"
+                "請把 JSON 壓成單行後重新貼上"
+            )
+            return
+    if not isinstance(info, dict) or info.get("type") != "service_account" or "private_key" not in info:
+        print("❌ GCP_SERVICE_KEY 內容不是服務帳號金鑰（缺少 type=service_account 或 private_key）")
+        return
+    os.environ["GCP_SERVICE_KEY"] = json.dumps(info, ensure_ascii=False, separators=(",", ":"))
+    print(f"✅ GCP_SERVICE_KEY 格式正確｜服務帳號 {info.get('client_email', '-')}（請確認試算表已共用給這個 email）")
+
+
 def apply_bot_process_env() -> Dict[str, str]:
     """在載入主程式前設定 Bot 行程專用環境變數，回傳被強制覆寫的項目。"""
+    normalize_gcp_service_key_env()
     overridden = {}
     for key, value in _READ_ONLY_FORCED_ENV.items():
         previous = os.environ.get(key)
