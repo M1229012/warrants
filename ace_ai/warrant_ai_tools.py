@@ -2275,7 +2275,37 @@ def get_branch_recent_behavior(
 # Tool 註冊表
 # ============================================================
 
+def get_chart_panel(stock_code: str) -> Dict[str, Any]:
+    """Only Python OHLC data enters the chart; never parse prices from AI text."""
+    code = core()._normalize_stock_name_code_key(stock_code)
+    df = _load_price_bundle(code)["df"].copy().sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    required = ["Open", "High", "Low", "Close"]
+    for column in required + ["Volume", "MA5", "MA10", "MA20", "MA60"]:
+        if column in df:
+            df[column] = pd.to_numeric(df[column], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
+    df = df.dropna(subset=required)
+    df = df[(df["High"] >= df[["Open", "Close", "Low"]].max(axis=1)) &
+            (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))]
+    if df.empty:
+        raise ToolDataError("沒有有效的 OHLC 資料")
+    # Keep the reference report's 70-day display window.
+    bars = []
+    for date, row in df.tail(70).iterrows():
+        bars.append({"date": _fmt_date(date), **{
+            key: _num(row.get(key), 6) for key in required + ["Volume", "MA5", "MA10", "MA20", "MA60"]
+        }})
+    try:
+        name = resolve_stock_name(code)
+    except Exception:
+        name = ""
+    previous = df["Close"].iloc[-2] if len(df) > 1 else None
+    return {"stock_code": code, "stock_name": name, "bars": bars,
+            "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
+    "get_chart_panel": get_chart_panel,
     "get_stock_overview": get_stock_overview,
     "get_technical_analysis": get_technical_analysis,
     "get_volume_profile": get_volume_profile,
