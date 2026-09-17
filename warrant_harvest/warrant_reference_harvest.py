@@ -46,6 +46,7 @@ import requests
 # append-only 的合併與守衛只有一份實作，從累積庫那支共用過來。
 from warrant_history_store import (
     STORE_DIR,
+    fill_object_na,
     guarded_write,
     merge_frames,
 )
@@ -131,6 +132,16 @@ def coerce_numeric(df, columns):
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
     return df
+
+
+def load_numeric_store(path, numeric_columns):
+    """
+    讀既有累積庫：文字欄補空字串、數值欄維持 float。
+
+    順便把數值欄重新轉型一次 —— 如果哪一版程式曾經寫進混型別的檔案，
+    讀進來就修正，不讓錯誤一路傳下去。
+    """
+    return coerce_numeric(fill_object_na(pd.read_parquet(path)), numeric_columns)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -234,7 +245,10 @@ def cmd_meta(args):
 
     existing = pd.DataFrame()
     if os.path.exists(META_STORE_PATH):
-        existing = pd.read_parquet(META_STORE_PATH).fillna("")
+        # 不可以 .fillna("")：數值欄的 NaN 會變成空字串，整欄變成 float／str 混合，
+        # 只要有任何一列舊資料沒被本次批次取代（權證下市、履約價調整），parquet 就拒寫。
+        # 2026-09-17 在 Actions 上實際炸過（已註銷單位_仟）。
+        existing = load_numeric_store(META_STORE_PATH, NUMERIC_META_COLUMNS)
     previous_rows = len(existing)
 
     # 鍵含履約價與行使比例：除息調整會產生新的一列，而不是把舊的蓋掉。
@@ -249,6 +263,7 @@ def cmd_meta(args):
         print(f"  ⏭ {stats['略過']}")
         return 0
 
+    merged = coerce_numeric(merged, NUMERIC_META_COLUMNS)
     if guarded_write(merged, META_STORE_PATH, previous_rows):
         print(
             f"  ✅ 既有 {stats['既有']:,} → {stats['合併後']:,} 列"
@@ -420,11 +435,14 @@ def cmd_ohlcv(args):
         incoming = pd.concat(collected, ignore_index=True)
         existing = pd.DataFrame()
         if os.path.exists(_ohlcv_path(year)):
-            existing = pd.read_parquet(_ohlcv_path(year)).fillna("")
+            # 同上：OHLCV 約一半的列是當天沒成交、收盤價為 NaN，
+            # 用 .fillna("") 讀進來，下一次往同一年補新日期時一定會拒寫。
+            existing = load_numeric_store(_ohlcv_path(year), NUMERIC_OHLCV_COLUMNS)
 
         merged, stats = merge_frames(
             existing, incoming, keys=["代號", "日期", "市場"], date_column="日期"
         )
+        merged = coerce_numeric(merged, NUMERIC_OHLCV_COLUMNS)
         if guarded_write(merged, _ohlcv_path(year), previous_rows, f"{year} "):
             print(f"    ✅ {previous_rows:,} → {stats['合併後']:,} 列"
                   f"（新增 {stats['新增']:,}）")
