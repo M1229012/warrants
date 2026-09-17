@@ -61,8 +61,19 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
+# 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。
+# 2026-09-17 發生過只更新了一部分檔案、新舊混跑，log 完全看不出來。
+# 改任何一支都要一起升版號。
+HARVEST_BUILD = "2026-09-18.1"
+
 META_STORE_PATH = os.path.join(STORE_DIR, "warrant_meta_store.parquet")
 OHLCV_DIR = os.path.join(STORE_DIR, "ohlcv")
+# 已確認休市的平日（春節、國定假日等）。放在 ohlcv/ 外面：
+# 回補與分析程式會把 ohlcv/ 裡的 parquet 都當成行情檔讀。
+NO_TRADING_DATES_PATH = os.path.join(STORE_DIR, "ohlcv_no_trading_dates.parquet")
+# 兩個市場都回空、而且至少是這麼多天以前的日子，才記成休市。
+# 最近幾天回空可能只是還沒發布，不能永久跳過。
+NO_TRADING_CONFIRM_DAYS = int(os.getenv("NO_TRADING_CONFIRM_DAYS", "7"))
 REQUEST_SLEEP = float(os.getenv("REFERENCE_SLEEP_SECONDS", "0.6"))
 REQUEST_TIMEOUT = (8, 60)
 MAX_ATTEMPTS = int(os.getenv("REFERENCE_MAX_ATTEMPTS", "4"))
@@ -228,7 +239,7 @@ def fetch_meta_tpex():
 
 def cmd_meta(args):
     print("=" * 74)
-    print("📋 權證靜態屬性")
+    print(f"📋 權證靜態屬性｜程式版本 {HARVEST_BUILD}")
     print("=" * 74)
 
     frames = []
@@ -446,9 +457,13 @@ def cmd_ohlcv(args):
         end_dt = datetime.strptime(args.end, "%Y/%m/%d")
 
     print("=" * 74)
-    print(f"📈 全市場 OHLCV｜{start_dt:%Y/%m/%d} ~ {end_dt:%Y/%m/%d}")
+    print(f"📈 全市場 OHLCV｜{start_dt:%Y/%m/%d} ~ {end_dt:%Y/%m/%d}｜程式版本 {HARVEST_BUILD}")
     print("   已抓過的日期會自動跳過，中斷後直接重跑即可續抓。")
     print("=" * 74)
+
+    known_closed = load_no_trading_dates()
+    newly_closed = set()
+    confirm_before = (datetime.today() - timedelta(days=NO_TRADING_CONFIRM_DAYS)).date()
 
     # 一次處理一年，避免把好幾年的資料同時攤在記憶體裡，
     # 也讓每個 parquet 檔維持在可以當 Release asset 上傳的大小。
@@ -458,14 +473,20 @@ def cmd_ohlcv(args):
         done, previous_rows = _existing_dates(year)
 
         pending = []
+        skipped_closed = 0
         cursor = year_start
         while cursor <= year_end:
-            if cursor.weekday() < 5 and cursor.strftime("%Y/%m/%d") not in done:
-                pending.append(cursor)
+            key = cursor.strftime("%Y/%m/%d")
+            if cursor.weekday() < 5 and key not in done:
+                if key in known_closed:
+                    skipped_closed += 1
+                else:
+                    pending.append(cursor)
             cursor += timedelta(days=1)
 
+        closed_note = f"｜已知休市略過 {skipped_closed} 天" if skipped_closed else ""
         print(f"\n  ── {year} ──  既有 {previous_rows:,} 列／{len(done)} 天"
-              f"｜待抓 {len(pending)} 天")
+              f"｜待抓 {len(pending)} 天{closed_note}")
         if not pending:
             continue
 
@@ -473,15 +494,20 @@ def cmd_ohlcv(args):
         failures = []
         for i, day in enumerate(pending, start=1):
             frames = []
+            had_error = False
             for label, fetcher in (("TWSE", fetch_ohlcv_twse), ("TPEx", fetch_ohlcv_tpex)):
                 df, error = fetcher(day)
                 if error:
+                    had_error = True
                     failures.append(f"{day:%Y/%m/%d} {label} {error}")
                 elif not df.empty:
                     frames.append(df)
                 time.sleep(REQUEST_SLEEP)
             if frames:
                 collected.append(pd.concat(frames, ignore_index=True))
+            elif not had_error and day.date() <= confirm_before:
+                # 兩個市場都正常回應、都沒有資料、而且不是最近幾天 → 休市
+                newly_closed.add(day.strftime("%Y/%m/%d"))
             if i % 20 == 0 or i == len(pending):
                 total = sum(len(f) for f in collected)
                 print(f"    {i}/{len(pending)} 天｜已收集 {total:,} 列", flush=True)
@@ -496,7 +522,25 @@ def cmd_ohlcv(args):
         if failures:
             print(f"    ⚠️ {len(failures)} 次抓取失敗（重跑會自動補）：{failures[:3]}")
 
+    if newly_closed:
+        save_no_trading_dates(known_closed | newly_closed)
+        print(f"\n  📅 新確認休市 {len(newly_closed)} 天，之後不再重查"
+              f"（累計 {len(known_closed | newly_closed)} 天）")
     return 0
+
+
+def load_no_trading_dates():
+    if not os.path.exists(NO_TRADING_DATES_PATH):
+        return set()
+    return set(pq.read_table(NO_TRADING_DATES_PATH, columns=["日期"])["日期"].to_pylist())
+
+
+def save_no_trading_dates(dates):
+    """
+    休市日清單。只會變多不會變少。
+    萬一哪天被誤判成休市（例如官方那天暫時回空），刪掉這個檔案重跑就會重新確認。
+    """
+    _atomic_write_table(pa.table({"日期": sorted(dates)}), NO_TRADING_DATES_PATH)
 
 
 def cmd_report(args):
@@ -524,10 +568,16 @@ def cmd_report(args):
             if not name.endswith(".parquet"):
                 continue
             path = os.path.join(OHLCV_DIR, name)
-            df = pd.read_parquet(path, columns=["日期", "代號"])
+            # 用 Arrow 算：2024 年檔 1,184 萬列，兩個字串欄讀進 pandas 要好幾 GB。
+            table = pq.read_table(path, columns=["日期", "代號"])
             size = os.path.getsize(path) / 1024 / 1024
-            print(f"    {name}｜{len(df):,} 列｜{df['日期'].nunique()} 個交易日"
-                  f"｜{df['代號'].nunique():,} 檔｜{size:,.1f} MB")
+            print(f"    {name}｜{table.num_rows:,} 列"
+                  f"｜{pc.count_distinct(table['日期']).as_py()} 個交易日"
+                  f"｜{pc.count_distinct(table['代號']).as_py():,} 檔｜{size:,.1f} MB")
+            del table
+        closed = load_no_trading_dates()
+        if closed:
+            print(f"    已確認休市平日：{len(closed)} 天")
     else:
         print("\n  全市場 OHLCV：尚未建立")
     print("=" * 74)

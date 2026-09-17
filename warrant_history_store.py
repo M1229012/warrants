@@ -51,6 +51,9 @@ for _s in (sys.stdout, sys.stderr):
 # 路徑：與主程式的規則保持一致，避免兩邊各自為政
 # ══════════════════════════════════════════════════════════════════════
 
+# 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。改任何一支都要一起升。
+HARVEST_BUILD = "2026-09-18.1"
+
 DEFAULT_OUTPUT_DIR = (
     "output"
     if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
@@ -291,7 +294,7 @@ def save_store(kind, merged, previous_rows):
 def cmd_merge(args):
     run_stamp = datetime.today().strftime("%Y/%m/%d")
     print("=" * 74)
-    print(f"📥 併入累積庫｜{run_stamp}")
+    print(f"📥 併入累積庫｜{run_stamp}｜程式版本 {HARVEST_BUILD}")
     print(f"   快取來源 {CACHE_DIR}")
     print(f"   累積庫   {STORE_DIR}")
     print("=" * 74)
