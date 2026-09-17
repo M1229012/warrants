@@ -46,7 +46,8 @@ class WeeklyPickConfig:
     top_n: int = tools._env_int("WEEKLY_PICK_TOP_N", 5)
     recent_behavior_days: int = tools._env_int("WEEKLY_PICK_RECENT_BEHAVIOR_DAYS", 30)
     recent_case_count: int = tools._env_int("WEEKLY_PICK_RECENT_CASE_COUNT", 10)
-    live_flow_enable: bool = os.getenv("WEEKLY_PICK_LIVE_FLOW_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+    # 預設關閉：每檔候選即時抓 MoneyDJ 近20日流水很吃記憶體，Railway 會 out of memory。
+    live_flow_enable: bool = os.getenv("WEEKLY_PICK_LIVE_FLOW_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
     workers: int = max(1, tools._env_int("WEEKLY_PICK_WORKERS", 3))
     near_ma20_pct: float = tools._env_float("WEEKLY_PICK_NEAR_MA20_PCT", 5.0)
     extended_ma20_pct: float = tools._env_float("WEEKLY_PICK_EXTENDED_MA20_PCT", 12.0)

@@ -22,6 +22,13 @@ WIDTH = 1440
 MARGIN = 64
 CONTENT = WIDTH - MARGIN * 2
 CHART_HEIGHT = 790
+# 分點買賣標註：K 線上下各留一條標籤帶（▲／▼＋最多 3 列編號圓圈），不和 K 棒重疊。
+MARK_LANE = 104
+MARK_BADGE_R = 11
+MARK_BADGE_ROW = 26
+MARK_MAX_ROWS = 3
+MARK_LEGEND_SIZE = 20
+MARK_LEGEND_LINE = 30
 
 
 @lru_cache(maxsize=32)
@@ -137,9 +144,162 @@ def volume_profile_rectangles(profile: dict, left, right, py, low, high):
     return rectangles
 
 
+def _mark_events(panel: dict) -> list[dict]:
+    return list(((panel or {}).get('marks') or {}).get('events') or [])
+
+
+def _has_mark_section(panel: dict) -> bool:
+    return bool((panel or {}).get('bars')) and bool((panel or {}).get('marks'))
+
+
+def _single_branch(panel: dict) -> str:
+    branches = {e['branch'] for e in _mark_events(panel)}
+    return next(iter(branches)) if len(branches) == 1 else ''
+
+
+def _mark_legend_entries(panel: dict) -> list[str]:
+    entries = []
+    single = _single_branch(panel)
+    for e in _mark_events(panel):
+        who = '' if single else f"{e['branch']}｜"
+        text = f"{e['no']}  {who}{e['event']} {e['buy_date'][5:]} 買 {e.get('buy_amount_text', '')}"
+        if e.get('exit_date'):
+            text += f" → {e['exit_date'][5:]} 出清"
+        elif e.get('reduce_date'):
+            text += f" → {e['reduce_date'][5:]} 減碼未出清"
+        else:
+            text += f"｜{e.get('status', '')}"
+        entries.append(text)
+    return entries
+
+
+def _mark_legend_layout(panel: dict) -> tuple[list[str], list[list[str]], int]:
+    """回傳（標題行、每筆換行後的文字、總高度）。先量測再配置畫布，文字不截斷、不互疊。"""
+    if not _has_mark_section(panel):
+        return [], [], 0
+    marks = panel.get('marks') or {}
+    rule = marks.get('rule', '')
+    if _mark_events(panel):
+        title = f"分點買賣標註｜{rule}：紅圈 N＝A～E 事件買進日　綠圈 N＝該筆出清日　▼ 無數字＝減碼日（不含報酬率）"
+    else:
+        title = f"分點買賣標註｜{rule}：圖表區間內沒有 A～E 事件"
+    title_lines = wrap(title, MARK_LEGEND_SIZE, CONTENT - 80)
+    column = (CONTENT - 80 - 24) // 2
+    wrapped = [wrap(entry, MARK_LEGEND_SIZE, column) for entry in _mark_legend_entries(panel)]
+    rows_height = 0
+    for i in range(0, len(wrapped), 2):
+        rows_height += max(len(item) for item in wrapped[i:i + 2]) * MARK_LEGEND_LINE
+    height = 16 + len(title_lines) * MARK_LEGEND_LINE + rows_height + 8
+    return title_lines, wrapped, height
+
+
+def panel_height(panel: dict) -> int:
+    extra = 2 * MARK_LANE if _mark_events(panel) else 0
+    return CHART_HEIGHT + extra + _mark_legend_layout(panel)[2]
+
+
+def _assign_rows(badges: list[dict]) -> None:
+    """同一側的編號圓圈依 x 排列，擠在一起時往下一列放（最多 3 列）。"""
+    last = [-1e9] * MARK_MAX_ROWS
+    gap = MARK_BADGE_R * 2 + 4
+    for badge in sorted(badges, key=lambda b: b['cx']):
+        row = next((r for r in range(MARK_MAX_ROWS) if badge['cx'] - last[r] >= gap), None)
+        if row is None:
+            # 三列都擠滿：放進最空的一列並往右挪到不重疊的位置，細線仍連回自己的三角形。
+            row = min(range(MARK_MAX_ROWS), key=lambda r: last[r])
+            badge['cx'] = last[row] + gap
+        badge['row'] = row
+        last[row] = badge['cx']
+
+
+def _draw_badge(draw, cx, cy, number_text, color):
+    draw.ellipse((cx - MARK_BADGE_R, cy - MARK_BADGE_R, cx + MARK_BADGE_R, cy + MARK_BADGE_R),
+                 fill=color, outline='white', width=2)
+    size = 14 if len(str(number_text)) < 2 else 12
+    draw.text((cx, cy), str(number_text), font=font(size, True), fill='white', anchor='mm')
+
+
+def _dotted(draw, x, y_from, y_to, color):
+    step = 5 if y_to >= y_from else -5
+    for yy in range(int(y_from), int(y_to), step * 2):
+        draw.line((x, yy, x, yy + step), fill=color, width=1)
+
+
+def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_bottom: float) -> None:
+    """broker_replay_kline 同款標註：▲＋紅圈 N 在買進日、▼＋綠圈 N 在出清日、▼ 無數字＝減碼日。不寫報酬率。"""
+    bars = panel.get('bars') or []
+    index = {bar['date']: i for i, bar in enumerate(bars)}
+    events = _mark_events(panel)
+    if not events:
+        return
+    half = max(5, min(9, step * 0.45))
+    buy_badges, sell_badges = [], []
+    sell_days: dict[int, list[int]] = {}
+    reduce_days: set[int] = set()
+    buy_days: set[int] = set()
+    for e in events:
+        i = index.get(e['buy_date'])
+        if i is not None:
+            buy_days.add(i)
+            buy_badges.append({'x': px(i), 'cx': px(i), 'no': e['no']})
+        j = index.get(e.get('exit_date') or '')
+        if j is not None:
+            sell_days.setdefault(j, []).append(e['no'])
+        k = index.get(e.get('reduce_date') or '')
+        if k is not None and k != j:
+            reduce_days.add(k)
+    for j, numbers in sell_days.items():
+        for n, no in enumerate(sorted(numbers)):
+            offset = (n - (len(numbers) - 1) / 2) * (MARK_BADGE_R * 2 + 3)
+            sell_badges.append({'x': px(j), 'cx': px(j) + offset, 'no': no})
+    _assign_rows(buy_badges)
+    _assign_rows(sell_badges)
+
+    tri_bottom = price_bottom + 14
+    for i in sorted(buy_days):
+        x = px(i)
+        _dotted(draw, x, py(bars[i]['Low']) + 4, tri_bottom - half, UP)
+        draw.polygon([(x, tri_bottom - half), (x - half, tri_bottom + half), (x + half, tri_bottom + half)],
+                     fill=UP, outline='white')
+    tri_top = price_top - 14
+    for j in sorted(set(sell_days) | reduce_days):
+        x = px(j)
+        _dotted(draw, x, py(bars[j]['High']) - 4, tri_top + half, DOWN)
+        draw.polygon([(x - half, tri_top - half), (x + half, tri_top - half), (x, tri_top + half)],
+                     fill=DOWN, outline='white')
+    for badge in buy_badges:
+        cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
+        if abs(badge['cx'] - badge['x']) > 1 or badge['row']:
+            draw.line((badge['x'], tri_bottom + half, badge['cx'], cy - MARK_BADGE_R), fill=UP, width=1)
+        _draw_badge(draw, badge['cx'], cy, badge['no'], UP)
+    for badge in sell_badges:
+        cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
+        if abs(badge['cx'] - badge['x']) > 1 or badge['row']:
+            draw.line((badge['x'], tri_top - half, badge['cx'], cy + MARK_BADGE_R), fill=DOWN, width=1)
+        _draw_badge(draw, badge['cx'], cy, badge['no'], DOWN)
+
+
+def draw_mark_legend(draw, panel: dict, top: int) -> None:
+    title_lines, wrapped, _height = _mark_legend_layout(panel)
+    if not title_lines:
+        return
+    x0 = MARGIN + 36
+    y = top + 16
+    for line in title_lines:
+        text_at(draw, (x0, y), line, MARK_LEGEND_SIZE, INK, bold=True)
+        y += MARK_LEGEND_LINE
+    column = (CONTENT - 80 - 24) // 2
+    for i in range(0, len(wrapped), 2):
+        pair = wrapped[i:i + 2]
+        for c, lines in enumerate(pair):
+            for k, line in enumerate(lines):
+                text_at(draw, (x0 + c * (column + 24), y + k * MARK_LEGEND_LINE), line, MARK_LEGEND_SIZE, INK)
+        y += max(len(lines) for lines in pair) * MARK_LEGEND_LINE
+
+
 def draw_chart(draw, y: int, panel: dict) -> None:
     x0, x1 = MARGIN, WIDTH - MARGIN
-    draw.rounded_rectangle((x0, y, x1, y + CHART_HEIGHT), radius=20, fill='white', outline=LINE)
+    draw.rounded_rectangle((x0, y, x1, y + panel_height(panel)), radius=20, fill='white', outline=LINE)
     code, name = panel.get('stock_code', ''), panel.get('stock_name', '')
     text_at(draw, (x0 + 32, y + 26), f'{code} {name}｜日 K', 31, bold=True)
     bars = panel.get('bars') or []
@@ -160,7 +320,10 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     band_colors = {'BB_UPPER': '#667085', 'BB_MID': '#76879A', 'BB_LOWER': '#667085'}
     for i, (key, label) in enumerate((('BB_UPPER', '布林上軌'), ('BB_MID', '中軌 = MA20'), ('BB_LOWER', '布林下軌'))):
         text_at(draw, (x0 + 34 + i * 400, y + 168), f'{label}  {number(last.get(key))}', 22, band_colors[key])
-    left, right, top, bottom = x0 + 36, x1 - 118, y + 225, y + 531
+    extra = 2 * MARK_LANE if _mark_events(panel) else 0
+    left, right, top, bottom = x0 + 36, x1 - 118, y + 225, y + 531 + extra
+    # 有標註時價格只畫在中間，上下標籤帶放 ▼／▲ 與編號圓圈。
+    price_top, price_bottom = (top + MARK_LANE, bottom - MARK_LANE) if extra else (top, bottom)
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
     for b in bars:
@@ -170,7 +333,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     low, high = min(lows), max(highs)
     padding = max((high - low) * .08, abs(high) * .005, .01)
     low -= padding; high += padding
-    py = lambda value: bottom - (value - low) / (high - low) * (bottom - top)
+    py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
     px = lambda i: left + (i + .5) * step
     profile_rectangles = volume_profile_rectangles(panel.get('volume_profile') or {}, left, right, py, low, high)
@@ -181,6 +344,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
+    draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
         color = UP if bar['Close'] >= bar['Open'] else DOWN
         center = px(i)
@@ -211,20 +375,21 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             for start in range(0, max(1, math.ceil(distance)), 12):
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=color, width=2)
-    vtop, vbottom = y + 580, y + 640
+    vtop, vbottom = y + 580 + extra, y + 640 + extra
     maximum = max([b.get('Volume') or 0 for b in bars] + [1])
     for i, bar in enumerate(bars):
         height = max(0, (bar.get('Volume') or 0) / maximum * (vbottom - vtop))
         draw.rectangle((px(i) - step * .3, vbottom - height, px(i) + step * .3, vbottom),
                        fill=UP if bar['Close'] >= bar['Open'] else DOWN)
-    text_at(draw, (left, y + 549), '成交量', 20, MUTED)
+    text_at(draw, (left, y + 549 + extra), '成交量', 20, MUTED)
     for i in sorted({0, len(bars) // 3, 2 * len(bars) // 3, len(bars) - 1}):
-        text_at(draw, (max(left, min(px(i) - 32, right - 66)), y + 655), bars[i]['date'][5:], 20, MUTED)
+        text_at(draw, (max(left, min(px(i) - 32, right - 66)), y + 655 + extra), bars[i]['date'][5:], 20, MUTED)
     legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
-    text_at(draw, (left, y + 691), legend + '  /  虛線：布林軌道', 18, MUTED)
+    text_at(draw, (left, y + 691 + extra), legend + '  /  虛線：布林軌道', 18, MUTED)
     state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
     for i, line in enumerate(wrap(state, 20, CONTENT - 80)[:2]):
-        text_at(draw, (left, y + 729 + i * 28), line, 20, INK)
+        text_at(draw, (left, y + 729 + extra + i * 28), line, 20, INK)
+    draw_mark_legend(draw, panel, y + CHART_HEIGHT + extra - 4)
 
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
@@ -234,7 +399,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     header_height = 155 + len(question_lines) * 47
     blocks = body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68
-    height = header_height + len(panels) * (CHART_HEIGHT + 24) + body_height + 112
+    height = header_height + sum(panel_height(p) + 24 for p in panels) + body_height + 112
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
@@ -245,7 +410,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     y = header_height
     for panel in panels:
         draw_chart(draw, y, panel)
-        y += CHART_HEIGHT + 24
+        y += panel_height(panel) + 24
     draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
     for block in blocks:

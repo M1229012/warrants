@@ -135,6 +135,7 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "history": ("過去", "歷史", "以前", "之前", "相比", "比較", "對比"),
     "recent_trades": ("買什麼", "在買", "買了", "最近買", "賣什麼", "在賣", "操作", "進出", "布局", "佈局"),
     "behavior": ("習性", "節奏", "風格", "操作模式", "近況", "動態", "最近怎樣", "最近如何", "最近在做什麼"),
+    "position": ("部位", "還在", "出清", "出場", "賣掉", "賣了", "持有", "抱著", "庫存", "留倉", "還有沒有"),
     "analysis": ("分析", "怎麼樣", "怎樣", "怎麼看", "如何", "看法", "觀察", "解讀", "評估", "綜合",
                  "整體", "呼應", "合理", "注意", "意義", "健康", "強不強", "弱不弱"),
 }
@@ -381,6 +382,7 @@ PLANNER_TOOLS = (
     "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
     "get_branch_stock_history", "get_branch_winrate_rank", "get_recent_news", "query_google_sheet",
     "get_branch_event_performance", "get_branch_recent_behavior", "detect_current_branch_events",
+    "get_sheet_stock_chips", "get_branch_stock_position",
 )
 
 
@@ -434,8 +436,14 @@ class QueryRouter:
         branch = parsed.branches[0]
         if parsed.stocks:
             code = parsed.stocks[0][0]
+            if "position" in parsed.intents:
+                # 「部位還在嗎」：直接讀回測 FIFO 狀態，0 次 Gemini，不抓 MoneyDJ。
+                plan = QueryPlan(route="rule_branch_position", need_final_llm=analysis)
+                plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
+                return plan
             plan = QueryPlan(route="rule_branch_stock", need_final_llm=True)
             plan.add("detect_current_branch_events", stock_code=code, branch_name=branch)
+            plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
             plan.add("get_branch_event_performance", branch_name=branch)
             plan.add("get_branch_recent_behavior", branch_name=branch, stock_code=code)
             plan.add("get_branch_stock_history", branch_name=branch, stock_code=code)
@@ -467,10 +475,11 @@ class QueryRouter:
                     plan.add("get_volume_profile", stock_code=code)
             if "volume_profile" in categories:
                 plan.add("get_volume_profile", stock_code=code)
-            if "win_rate" in categories or ("warrant" in categories and "高" in parsed.original and "勝" in parsed.original):
-                plan.add("get_high_winrate_branches_buying", stock_code=code, days=parsed.days)
-            elif categories & {"warrant", "recent_trades"}:
-                plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
+            if categories & {"warrant", "recent_trades", "win_rate"}:
+                # 權證問題第一步一律看 Google Sheet 的追蹤分點（A～E 事件、賣出、勝率）。
+                plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
+                if tools.MONEYDJ_TOP_ENABLE:
+                    plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
             if "news" in categories:
                 plan.add("get_recent_news", stock_code=code)
         # 權證分點與勝率 join 屬於同一類「籌碼」資料，不因此多呼叫 Gemini。
@@ -489,7 +498,9 @@ class QueryRouter:
             plan.add("get_stock_overview", stock_code=code)
             plan.add("get_technical_analysis", stock_code=code)
             plan.add("get_volume_profile", stock_code=code)
-            plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
+            plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
+            if tools.MONEYDJ_TOP_ENABLE:
+                plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
             plan.add("get_recent_news", stock_code=code)
         return plan
 
@@ -542,9 +553,13 @@ class QueryRouter:
             if name in ("get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_recent_news"):
                 for code in stocks[:2]:
                     plan.add(name, stock_code=code)
-            elif name in ("get_warrant_branch", "get_high_winrate_branches_buying"):
+            elif name in ("get_warrant_branch", "get_high_winrate_branches_buying", "get_sheet_stock_chips"):
                 for code in stocks[:2]:
-                    plan.add(name, stock_code=code, days=days)
+                    plan.add("get_sheet_stock_chips", stock_code=code, days=days)
+                    if name != "get_sheet_stock_chips" and tools.MONEYDJ_TOP_ENABLE:
+                        plan.add(name, stock_code=code, days=days)
+            elif name == "get_branch_stock_position" and branches and stocks:
+                plan.add(name, branch_name=branches[0], stock_code=stocks[0])
             elif name in ("get_branch_performance",):
                 for branch in branches[:2]:
                     plan.add(name, branch_name=branch, event_type=event_type)
@@ -1163,7 +1178,65 @@ def format_recent_behavior(d: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _event_short(e: Dict[str, Any]) -> str:
+    return f"{e.get('event')} {str(e.get('event_date', ''))[5:]} {e.get('buy_amount_text', '')}（{e.get('status', '')}）"
+
+
+def format_sheet_stock_chips(d: Dict[str, Any]) -> str:
+    if not d.get("available"):
+        return f"【追蹤分點籌碼】{d.get('reason', '目前沒有取得足夠資料')}"
+    lines = [f"【追蹤分點籌碼】A～E 事件 {d.get('period_recent')}｜賣出與部位 {d.get('period_lookback')}"]
+    for row in d.get("branches") or []:
+        tag = "（高勝率）" if row.get("is_high_win_rate") else ""
+        win = row.get("overall_win_rate_background")
+        perf = "；".join(
+            f"{code}事件 {_v(p.get('raw_win_rate'), '%')}｜n={_v(p.get('sample_included'))}"
+            for code, p in (row.get("event_performance") or {}).items()
+        )
+        recent_events = row.get("events_recent") or []
+        lines.append(
+            f"• {row['branch']}{tag}："
+            + (f"近期事件買進 {row.get('event_buy_amount_recent_text')}［{'、'.join(_event_short(e) for e in recent_events[:3])}］"
+               if recent_events else ("近期無 A～E 事件" + (f"（觀察期間事件買進 {row.get('event_buy_amount_lookback_text')}）"
+                                                           if row.get("event_buy_amount_lookback_text") not in (None, "", "-") else "")))
+        )
+        lines.append(
+            f"　{row.get('position_status')}"
+            + (f"｜總勝率（背景）{_v(win, '%')}" if win is not None else "")
+            + (f"｜{perf}" if perf else "")
+        )
+        sells = row.get("reduce_or_exit_lookback") or []
+        if sells:
+            lines.append("　賣出：" + "、".join(f"{s['date'][5:]} {s['action']} {s['sell_amount_text']}" for s in sells[-3:]))
+    lines.append("※ 只涵蓋回測追蹤分點；勝率為歷史統計，不代表這次一定成功。")
+    return "\n".join(lines)
+
+
+def format_branch_stock_position(d: Dict[str, Any]) -> str:
+    if not d.get("found"):
+        candidates = "、".join(d.get("candidates") or [])
+        return f"【部位】{d.get('reason', '找不到資料')}" + (f"（候選：{candidates}）" if candidates else "")
+    lines = [
+        f"【部位】{d.get('branch')} × {d.get('stock_name')}（{d.get('stock_code')}）",
+        d.get("position_status", ""),
+    ]
+    for e in d.get("open_events") or []:
+        lines.append(f"• 未出清：{_event_short(e)}")
+    for e in (d.get("recent_closed_events") or [])[-3:]:
+        lines.append(f"• 已出清：{e.get('event')} {str(e.get('event_date', ''))[5:]} 買進 → {str(e.get('exit_date', ''))[5:]} 出清")
+    sells = d.get("recent_sells") or []
+    if sells:
+        lines.append("【近期賣出】" + "、".join(f"{s['date'][5:]} {s['action']} {s['sell_amount_text']}" for s in sells[-5:]))
+    perf = d.get("branch_performance") or {}
+    if perf.get("overall_raw_win_rate") is not None:
+        lines.append(f"總勝率（背景）{_v(perf.get('overall_raw_win_rate'), '%')}｜n={_v(perf.get('overall_sample_included'))}")
+    lines.append(f"※ {d.get('definition_note', '')}")
+    return "\n".join(lines)
+
+
 FORMATTERS.update({
+    "get_sheet_stock_chips": format_sheet_stock_chips,
+    "get_branch_stock_position": format_branch_stock_position,
     "get_branch_event_performance": format_branch_event_performance,
     "detect_current_branch_events": format_current_events,
     "get_branch_recent_behavior": format_recent_behavior,
@@ -1194,6 +1267,8 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add(f"ABCDE 事件（Sheet 更新 {d.get('sheet_updated_at') or '時間未知'}）")
         elif r.name == "get_recent_news" and d.get("available"):
             add("新聞為近期六來源抓取結果")
+        elif r.name in ("get_sheet_stock_chips", "get_branch_stock_position") and d.get("data_latest_event_date"):
+            add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}（Google Sheet）")
     return "資料時間：" + "｜".join(parts) if parts else ""
 
 
@@ -1356,7 +1431,9 @@ class AceQueryEngine:
 
         codes = list(dict.fromkeys([code for code, _ in parsed.stocks] +
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
-        combined = self._run_tools(plan.tool_calls + [ToolCall("get_chart_panel", {"stock_code": c}) for c in codes])
+        chart_branch = parsed.branches[0] if parsed.branches else ""
+        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, **({"branch_name": chart_branch} if chart_branch else {})}) for c in codes]
+        combined = self._run_tools(plan.tool_calls + chart_calls)
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []

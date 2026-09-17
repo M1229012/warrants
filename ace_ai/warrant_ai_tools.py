@@ -68,6 +68,12 @@ TTL_REFERENCE_SECONDS = _env_int("DISCORD_AI_TTL_REFERENCE_SECONDS", 43200)
 WARRANT_TOPN = _env_int("DISCORD_AI_WARRANT_TOPN", 8)
 WARRANT_JOIN_TOPN = _env_int("DISCORD_AI_WARRANT_JOIN_TOPN", 15)
 HIGH_WIN_RATE_PCT = _env_float("DISCORD_AI_HIGH_WIN_RATE_PCT", 60.0)
+# 分點相關問題一律先讀 Google Sheet（回測追蹤分點、A～E 事件、每日賣出明細）。
+# MoneyDJ 即時逐權證抓取很吃記憶體與時間，只在明確開啟時才用。
+LIVE_FLOW_ENABLE = os.getenv("DISCORD_AI_LIVE_FLOW_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+MONEYDJ_TOP_ENABLE = os.getenv("DISCORD_AI_MONEYDJ_TOP_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+CHART_MARK_MAX_EVENTS = _env_int("DISCORD_AI_CHART_MARK_MAX_EVENTS", 12)
+SHEET_CHIPS_MIN_SELL_AMOUNT = _env_float("DISCORD_AI_SHEET_CHIPS_MIN_SELL_AMOUNT", 100_000.0)
 SMALL_SAMPLE_EVENTS = _env_int("DISCORD_AI_SMALL_SAMPLE_EVENTS", 10)
 SHEET_QUERY_MAX_ROWS = 100
 NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 5)
@@ -97,6 +103,13 @@ _BOT_DEFAULT_ENV = {
     "WARRANT_GEMINI_RETRY_TIMES": "2",
     "WARRANT_GEMINI_RETRY_BASE_WAIT": "2",
     "WARRANT_REPORT_TIMING_ENABLE": "0",
+    # Railway 記憶體遠小於 GitHub Actions runner：MoneyDJ 併發從週報的 40／50 降到 12，
+    # 並關閉「精選五分點 × 每支權證」補查（週報圖卡專用，單檔股票可多出上千組請求）。
+    "WARRANT_MONEYDJ_RANGE_API4_WORKERS": "12",
+    "WARRANT_MONEYDJ_RANGE_API5_WORKERS": "12",
+    "WARRANT_HYBRID_MONEYDJ_API4_WORKERS": "12",
+    "WARRANT_HYBRID_MONEYDJ_API5_WORKERS": "12",
+    "WARRANT_SELECTED_BRANCH_FLOW_ENABLE": "0",
 }
 
 
@@ -2136,7 +2149,7 @@ def get_branch_recent_behavior(
     stock_code: str = "",
     lookback_days: int = 30,
     recent_case_count: int = 10,
-    include_live_flow: bool = True,
+    include_live_flow: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """分點近期操作習性（Recent Behavior Context，不是長期統計證據）。
 
@@ -2242,7 +2255,7 @@ def get_branch_recent_behavior(
             ] if not stock_sells.empty else [],
             "stock_history_cases": _outcome_summary(stock_events),
         }
-        if include_live_flow:
+        if LIVE_FLOW_ENABLE if include_live_flow is None else include_live_flow:
             try:
                 same_stock["live_flow"] = _live_same_stock_flow(code, canonical)
             except Exception as exc:  # MoneyDJ 失敗時仍保留 Sheet 事件資料
@@ -2257,11 +2270,254 @@ def get_branch_recent_behavior(
     }
 
 
+
+# ============================================================
+# Google Sheet 優先：個股追蹤分點籌碼、分點部位、K 線標註
+# ============================================================
+
+def _branch_perf_brief(perf: Dict[str, Any], branch: str, codes: List[str]) -> Dict[str, Any]:
+    """分點總勝率（背景）＋本次事件別勝率；perf 讀取失敗時回傳空結構。"""
+    records = (perf.get("branches") or {}).get(branch) or {}
+    overall = records.get("overall") or {}
+    events = {}
+    for code in codes:
+        rec = records.get(code)
+        if rec:
+            events[code] = {
+                "raw_win_rate": rec.get("raw_win_rate"),
+                "adjusted_win_rate": rec.get("adjusted_win_rate"),
+                "sample_included": _num(rec.get("included_count"), 0),
+                "unresolved_count": _num(rec.get("unresolved_count"), 0),
+                "weighted_return": rec.get("weighted_return"),
+            }
+    return {
+        "overall_raw_win_rate": overall.get("raw_win_rate"),
+        "overall_adjusted_win_rate": overall.get("adjusted_win_rate"),
+        "overall_sample_included": _num(overall.get("included_count"), 0),
+        "event_performance": events,
+    }
+
+
+def _high_win_rate_branches(perf: Dict[str, Any]) -> List[str]:
+    return sorted(
+        branch for branch, records in (perf.get("branches") or {}).items()
+        if ((records.get("overall") or {}).get("raw_win_rate") or 0) >= HIGH_WIN_RATE_PCT
+    )
+
+
+def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
+    """每日賣出明細（減碼／出清）；讀不到時回傳空表，不讓主要回答失敗。"""
+    kf = core()
+    try:
+        df = read_sheet_table("每日賣出明細")["df"]
+    except ToolDataError as exc:
+        print(f"⚠️ Discord AI 每日賣出明細略過：{exc}")
+        return pd.DataFrame()
+    if df.empty or not {"分點", "標的股", "日期"}.issubset(df.columns):
+        return pd.DataFrame()
+    work = df.copy()
+    work["_branch"] = work["分點"].map(kf.normalize_branch_name)
+    work["_code"] = work["標的股"].map(kf._normalize_stock_name_code_key)
+    if stock_code:
+        work = work[work["_code"] == kf._normalize_stock_name_code_key(stock_code)]
+    if branch:
+        work = work[work["_branch"] == branch]
+    work["_date"] = work["日期"].map(_parse_sheet_date)
+    amounts = work["賣出金額"] if "賣出金額" in work.columns else pd.Series([""] * len(work), index=work.index)
+    work["_amount"] = amounts.map(_count_value).fillna(0.0)
+    return work.dropna(subset=["_date"]).sort_values("_date")
+
+
+def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 20) -> Dict[str, Any]:
+    """個股的「回測追蹤分點」權證籌碼（全部讀 Google Sheet，不即時抓 MoneyDJ）。
+
+    - 最近 N 個交易日的 A～E 大額買進事件（事件定義＝回測程式）
+    - 近 20 個交易日的減碼／出清（每日賣出明細）與目前未出清事件（FIFO）
+    - 每個分點的總勝率（背景）與本次事件別勝率
+    """
+    code, name = _stock_identity(stock_code)
+    days = max(1, int(days or 5))
+    lookback_days = max(int(lookback_days or 20), days)
+    bundle = load_abcde_event_rows()
+    events, latest = bundle["events"], bundle["latest_event_date"]
+    if latest is None:
+        raise SheetUnavailableError("A～E 事件表沒有資料")
+    start_n, end = _recent_event_dates(latest, days, events)
+    start_long, _ = _recent_event_dates(latest, lookback_days, events)
+    stock_events = events[events["stock_code"] == code]
+    try:
+        perf = read_branch_event_performance()
+    except ToolDataError as exc:
+        print(f"⚠️ Discord AI 勝率統計略過：{exc}")
+        perf = {}
+    high_set = set(_high_win_rate_branches(perf))
+    sells = _sell_rows(code)
+    sells_long = sells[sells["_date"] >= start_long] if not sells.empty else sells
+    # 零星小額賣出（例如幾千元出清尾單）不列入，避免清單被雜訊塞滿。
+    if not sells_long.empty:
+        sells_long = sells_long[sells_long["_amount"] >= SHEET_CHIPS_MIN_SELL_AMOUNT]
+
+    branches = set(stock_events.loc[stock_events["event_date"] >= start_long, "branch"])
+    if not sells_long.empty:
+        branches |= set(sells_long["_branch"])
+    rows: List[Dict[str, Any]] = []
+    for branch in sorted(branches):
+        b_events = stock_events[stock_events["branch"] == branch]
+        recent = b_events[b_events["event_date"] >= start_n]
+        long_events = b_events[b_events["event_date"] >= start_long]
+        open_events = b_events[b_events["status"] != "已出清"]
+        b_sells = sells_long[sells_long["_branch"] == branch] if not sells_long.empty else sells_long
+        codes = [c for c in EVENT_CODES if c in set(recent["event_code"])] or [
+            c for c in EVENT_CODES if c in set(long_events["event_code"])
+        ]
+        brief = _branch_perf_brief(perf, branch, codes)
+        if not open_events.empty:
+            position = f"仍有 {len(open_events)} 筆 A～E 事件未出清（最早 {_fmt_date(open_events['event_date'].min())}）"
+        elif not b_events.empty:
+            position = "A～E 事件已全部出清"
+        else:
+            position = "只有賣出紀錄，沒有 A～E 買進事件"
+        rows.append({
+            "branch": branch,
+            "is_high_win_rate": branch in high_set,
+            "events_recent": [_event_record(r) for _, r in recent.iterrows()],
+            "event_buy_amount_recent_text": _money_text(recent["buy_amount"].sum()) if not recent.empty else "-",
+            "event_buy_amount_lookback_text": _money_text(long_events["buy_amount"].sum()) if not long_events.empty else "-",
+            "_sort_recent": float(recent["buy_amount"].sum()) if not recent.empty else 0.0,
+            "_sort_long": float(long_events["buy_amount"].sum()) if not long_events.empty else 0.0,
+            "open_event_count": int(len(open_events)),
+            "position_status": position,
+            "reduce_or_exit_lookback": [
+                {"date": _fmt_date(r["_date"]), "action": _clean_cell(r.get("狀態", "")), "sell_amount_text": _money_text(r["_amount"])}
+                for _, r in b_sells.tail(5).iterrows()
+            ] if not b_sells.empty else [],
+            "overall_win_rate_background": brief.get("overall_raw_win_rate"),
+            "overall_sample_included": brief.get("overall_sample_included"),
+            "event_performance": brief.get("event_performance"),
+        })
+    # 只留「近期有 A～E 事件」或「區間內有事件／有效賣出」的分點；高勝率與近期金額優先。
+    rows = [r for r in rows if r["_sort_recent"] > 0 or r["_sort_long"] > 0 or r["reduce_or_exit_lookback"]]
+    rows.sort(key=lambda r: (r["_sort_recent"] > 0, r["is_high_win_rate"], r["_sort_recent"], r["_sort_long"]), reverse=True)
+    for row in rows:
+        row.pop("_sort_recent", None)
+        row.pop("_sort_long", None)
+    return {
+        "stock_code": code,
+        "stock_name": name,
+        "available": bool(rows),
+        "reason": "" if rows else f"近 {lookback_days} 個交易日，回測追蹤分點在這檔股票沒有 A～E 事件或賣出紀錄",
+        "period_recent": f"{_fmt_date(start_n)}～{_fmt_date(end)}（{days} 個交易日）",
+        "period_lookback": f"{_fmt_date(start_long)}～{_fmt_date(end)}（{lookback_days} 個交易日）",
+        "data_latest_event_date": _fmt_date(latest),
+        "high_win_rate_threshold_pct": HIGH_WIN_RATE_PCT,
+        "branches": rows[:8],
+        "data_source": "Google Sheet：回測追蹤分點的 A～E 事件（單日權證買進≥100萬）、每日賣出明細、勝率統計",
+        "definition_note": "只涵蓋回測追蹤的分點；未達 A～E 門檻的小額買進不在事件表內；勝率為歷史統計，不代表未來結果",
+    }
+
+
+def get_branch_stock_position(branch_name: str, stock_code: str) -> Dict[str, Any]:
+    """分點在某股票的部位是否還在：依回測 FIFO 的 A～E 事件狀態與每日賣出明細判斷（只讀 Sheet）。"""
+    canonical, candidates = resolve_branch(branch_name)
+    if not canonical:
+        return {"found": False, "query": branch_name, "candidates": candidates, "reason": "找不到唯一符合的分點"}
+    code, name = _stock_identity(stock_code)
+    bundle = load_abcde_event_rows()
+    events, latest = bundle["events"], bundle["latest_event_date"]
+    if latest is None:
+        raise SheetUnavailableError("A～E 事件表沒有資料")
+    rows = events[(events["branch"] == canonical) & (events["stock_code"] == code)].sort_values("event_date")
+    open_rows = rows[rows["status"] != "已出清"]
+    closed_rows = rows[rows["status"] == "已出清"]
+    sells = _sell_rows(code, canonical)
+    if not open_rows.empty:
+        reduced = int((open_rows["status"] == "已減碼未出清").sum())
+        status = (
+            f"部位仍在：{len(open_rows)} 筆 A～E 事件尚未出清（最早 {_fmt_date(open_rows['event_date'].min())}"
+            + (f"，其中 {reduced} 筆已減碼" if reduced else "") + "）"
+        )
+    elif not rows.empty:
+        last_exit = closed_rows["exit_date"].dropna().max() if not closed_rows.empty else None
+        status = f"A～E 事件部位已全部出清（最後出清 {_fmt_date(last_exit)}）"
+    else:
+        status = "回測事件表沒有這個分點在這檔股票的 A～E 事件"
+    try:
+        perf = read_branch_event_performance()
+    except ToolDataError:
+        perf = {}
+    return {
+        "found": True,
+        "branch": canonical,
+        "stock_code": code,
+        "stock_name": name,
+        "position_status": status,
+        "open_events": [_event_record(r) for _, r in open_rows.tail(10).iterrows()],
+        "recent_closed_events": [
+            {**_event_record(r), "exit_date": _fmt_date(r["exit_date"])} for _, r in closed_rows.tail(5).iterrows()
+        ],
+        "recent_sells": [
+            {"date": _fmt_date(r["_date"]), "action": _clean_cell(r.get("狀態", "")), "event": _clean_cell(r.get("事件", "")),
+             "warrant": _clean_cell(r.get("權證名稱", "")), "sell_amount_text": _money_text(r["_amount"])}
+            for _, r in sells.tail(8).iterrows()
+        ] if not sells.empty else [],
+        "branch_performance": _branch_perf_brief(perf, canonical, [c for c in EVENT_CODES if c in set(rows["event_code"])]),
+        "data_latest_event_date": _fmt_date(latest),
+        "data_source": "Google Sheet：A～E 事件表（回測 FIFO 狀態）與每日賣出明細",
+        "definition_note": "部位依回測 FIFO 追蹤「達 A～E 門檻的事件」；未達門檻的小額買進不在內，因此不是券商實際庫存",
+    }
+
+
+def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
+    """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
+
+    指定分點時只標該分點；否則標「勝率統計總勝率 ≥ 高勝率門檻」的回測追蹤分點。
+    買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
+    """
+    kf = core()
+    if not dates:
+        return {}
+    code = kf._normalize_stock_name_code_key(stock_code)
+    start, end = _parse_sheet_date(dates[0]), _parse_sheet_date(dates[-1])
+    bundle = load_abcde_event_rows()
+    events = bundle["events"]
+    rows = events[(events["stock_code"] == code) & (events["event_date"] >= start) & (events["event_date"] <= end)]
+    if branch_name:
+        canonical, _ = resolve_branch(branch_name)
+        target = canonical or kf.normalize_branch_name(branch_name)
+        rows = rows[rows["branch"] == target]
+        rule = f"分點：{target}"
+    else:
+        try:
+            high = set(_high_win_rate_branches(read_branch_event_performance()))
+        except ToolDataError:
+            high = set()
+        rows = rows[rows["branch"].isin(high)]
+        rule = f"總勝率 {HIGH_WIN_RATE_PCT:g}% 以上的追蹤分點"
+
+    def in_window(value: Any) -> bool:
+        return value is not None and not pd.isna(value) and start <= value <= end
+
+    rows = rows.sort_values("event_date").tail(max(1, CHART_MARK_MAX_EVENTS))
+    marks = []
+    for no, (_, r) in enumerate(rows.iterrows(), 1):
+        marks.append({
+            "no": no,
+            "branch": r["branch"],
+            "event": r["event_code"],
+            "buy_date": _fmt_date(r["event_date"]),
+            "buy_amount_text": _money_text(r["buy_amount"]),
+            "reduce_date": _fmt_date(r["reduce_date"]) if in_window(r["reduce_date"]) else "",
+            "exit_date": _fmt_date(r["exit_date"]) if in_window(r["exit_date"]) else "",
+            "status": r["status"],
+        })
+    return {"rule": rule, "events": marks, "data_latest_event_date": _fmt_date(bundle["latest_event_date"])}
+
+
 # ============================================================
 # Tool 註冊表
 # ============================================================
 
-def get_chart_panel(stock_code: str) -> Dict[str, Any]:
+def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
@@ -2303,14 +2559,21 @@ def get_chart_panel(stock_code: str) -> Dict[str, Any]:
             }
     except Exception as exc:
         print(f"⚠️ {code} 價量分布取得失敗：{type(exc).__name__}", flush=True)
+    marks: Dict[str, Any] = {}
+    try:
+        marks = chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name)
+    except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
+        print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
-            "volume_profile": profile,
+            "volume_profile": profile, "marks": marks,
             "bollinger": analyze_bollinger(df),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
 
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
+    "get_sheet_stock_chips": get_sheet_stock_chips,
+    "get_branch_stock_position": get_branch_stock_position,
     "get_stock_overview": get_stock_overview,
     "get_technical_analysis": get_technical_analysis,
     "get_volume_profile": get_volume_profile,
@@ -2347,6 +2610,8 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 _TOOL_FAILURE_MESSAGES.update({
+    "get_sheet_stock_chips": "Google Sheet 分點籌碼目前無法取得",
+    "get_branch_stock_position": "分點部位資料目前無法取得",
     "get_branch_event_performance": "分點事件別績效目前無法取得",
     "detect_current_branch_events": "分點目前事件資料無法取得",
     "get_branch_recent_behavior": "分點近期操作資料無法取得",
