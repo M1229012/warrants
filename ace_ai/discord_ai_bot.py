@@ -90,7 +90,7 @@ class BotConfig:
             command_prefix=os.getenv("DISCORD_AI_COMMAND_PREFIX", "!ace").strip() or "!ace",
             user_cooldown_seconds=tools._env_float("DISCORD_AI_USER_COOLDOWN_SECONDS", 8.0),
             answer_cache_seconds=tools._env_int("DISCORD_AI_ANSWER_CACHE_SECONDS", 300),
-            tool_timeout_seconds=tools._env_float("DISCORD_AI_TOOL_TIMEOUT_SECONDS", 120.0),
+            tool_timeout_seconds=tools._env_float("DISCORD_AI_TOOL_TIMEOUT_SECONDS", 180.0),
             max_message_chars=max(500, min(1950, tools._env_int("DISCORD_AI_MAX_MESSAGE_CHARS", 1900))),
             planner_enabled=_env_flag("DISCORD_AI_PLANNER_ENABLE", "1"),
             slash_command_name=(os.getenv("DISCORD_AI_SLASH_COMMAND", "ask").strip().lower() or "ask"),
@@ -131,7 +131,7 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "news": ("新聞", "消息", "題材", "公告", "營收", "法說", "重訊", "利多", "利空"),
     "history": ("過去", "歷史", "以前", "之前", "相比", "比較", "對比"),
     "recent_trades": ("買什麼", "在買", "買了", "最近買", "賣什麼", "在賣", "操作", "進出", "布局", "佈局"),
-    "behavior": ("習性", "節奏", "風格", "操作模式"),
+    "behavior": ("習性", "節奏", "風格", "操作模式", "近況", "動態", "最近怎樣", "最近如何", "最近在做什麼"),
     "analysis": ("分析", "怎麼樣", "怎樣", "怎麼看", "如何", "看法", "觀察", "解讀", "評估", "綜合",
                  "整體", "呼應", "合理", "注意", "意義", "健康", "強不強", "弱不弱"),
 }
@@ -291,7 +291,7 @@ class QuestionParser:
         return [c for c in re.findall(r"[一-鿿A-Z]{2,8}", work)]
 
     def _fuzzy_branch(self, work: str, parsed: ParsedQuestion) -> None:
-        wants_branch = bool(parsed.intents & {"win_rate", "recent_trades", "warrant", "history"})
+        wants_branch = bool(parsed.intents & {"win_rate", "recent_trades", "warrant", "history", "behavior"})
         if parsed.branches or not wants_branch:
             return
         for chunk in self._leftover_chunks(work):
@@ -447,7 +447,7 @@ class QueryRouter:
             plan.add("get_branch_performance", branch_name=branch)
         if wants_behavior:
             plan.add("get_branch_recent_behavior", branch_name=branch)
-        if wants_trades or not (wants_perf or wants_behavior):
+        if wants_trades or wants_behavior or not wants_perf:
             plan.add("get_branch_recent_trades", branch_name=branch)
         plan.need_final_llm = analysis or not (wants_perf or wants_trades or wants_behavior)
         return plan
@@ -1450,6 +1450,39 @@ class AccessGuard:
             self._running.discard(user_id)
 
 
+def _startup_warmup() -> None:
+    """背景預熱並自我檢查：股票名冊、分點清單（含 Google Sheet 連線）、官方權證發行商資料。
+
+    結果只寫在 console，方便部署後直接從 Railway Logs 確認資料來源是否正常。
+    """
+    started = time.perf_counter()
+    try:
+        print(f"🔥 預熱：股票名冊 {len(tools.get_stock_name_map()):,} 檔", flush=True)
+    except Exception as exc:  # 預熱失敗不影響 Bot 上線
+        print(f"⚠️ 預熱：股票名冊失敗｜{type(exc).__name__}: {exc}", flush=True)
+    try:
+        tools.get_known_branches()
+    except Exception as exc:
+        print(f"⚠️ 預熱：分點清單失敗｜{type(exc).__name__}: {exc}", flush=True)
+    try:
+        table = tools.read_sheet_table("勝率統計")
+        print(f"✅ 自我檢查：Google Sheet 可讀取（勝率統計 {len(table['df']):,} 列，Sheet 更新 {table['sheet_updated_at'] or '時間未知'}）", flush=True)
+    except Exception as exc:
+        print(f"❌ 自我檢查：Google Sheet 讀取失敗，分點勝率／A～E 事件／本週精選將無法使用｜{type(exc).__name__}: {exc}", flush=True)
+    try:
+        tools.core()._finmind_start_official_warrant_issuer_prefetch()
+    except Exception as exc:
+        print(f"⚠️ 預熱：官方權證發行商資料失敗｜{type(exc).__name__}: {exc}", flush=True)
+    # 權證分點查詢一定要用官方權證名冊；TPEx 海外連線常回 520 並觸發長時間重試，
+    # 啟動時先抓好（成功後主程式會留本機副本），避免第一個問權證的人等到逾時。
+    try:
+        registry = tools.core()._load_official_warrant_registry()
+        print(f"🔥 預熱：官方權證名冊 {len(registry):,} 筆", flush=True)
+    except Exception as exc:
+        print(f"⚠️ 預熱：官方權證名冊失敗（權證分點查詢可能較慢）｜{type(exc).__name__}: {exc}", flush=True)
+    print(f"🔥 預熱完成｜{time.perf_counter() - started:.1f} 秒", flush=True)
+
+
 WEEKLY_PICK_ACK = "📊 收到，本週精選候選計算中（第一次約需 1～3 分鐘；同一份資料再問會直接用快取）…"
 
 
@@ -1474,6 +1507,7 @@ def run_discord_bot(config: BotConfig) -> None:
         print("⚠️ DISCORD_AI_ALLOWED_USER_IDS 未設定：所有人呼叫都會收到「尚未開放」")
 
     tools.core()
+    threading.Thread(target=_startup_warmup, name="ace-warmup", daemon=True).start()
     engine = AceQueryEngine(config)
     guard = AccessGuard(config)
     intents = discord.Intents.default()
