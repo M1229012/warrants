@@ -52,10 +52,44 @@ class ImageTests(unittest.TestCase):
         ], index=pd.to_datetime(['2026-01-02', '2026-01-01', '2026-01-03']))
         core = Mock()
         core._normalize_stock_name_code_key.side_effect = str
+        core.CHART_LOOKBACK = 70
+        core._calculate_weighted_volume_profile_stats.return_value = {}
         with patch.object(tools, 'core', return_value=core), patch.object(tools, '_load_price_bundle', return_value={'df': df}), patch.object(tools, 'resolve_stock_name', return_value='測試'):
             panel = tools.get_chart_panel('1234')
         self.assertEqual([b['Close'] for b in panel['bars']], [11, 13])
         self.assertAlmostEqual(panel['change_pct'], (13/11-1)*100)
+
+    def test_full_volume_profile_uses_reference_function(self):
+        sample = sample_panel()
+        df = pd.DataFrame(sample['bars']).set_index('date')
+        df.index = pd.to_datetime(df.index)
+        stats = sample['volume_profile']
+        core = Mock()
+        core._normalize_stock_name_code_key.side_effect = str
+        core.CHART_LOOKBACK = 70
+        core._calculate_weighted_volume_profile_stats.return_value = stats
+        with patch.object(tools, 'core', return_value=core), patch.object(tools, '_load_price_bundle', return_value={'df': df}), patch.object(tools, 'resolve_stock_name', return_value='示範'):
+            panel = tools.get_chart_panel('1234')
+        self.assertEqual(panel['volume_profile'], stats)
+        args, kwargs = core._calculate_weighted_volume_profile_stats.call_args
+        self.assertEqual(kwargs, {'n_bins': 40})
+        self.assertEqual(len(args[0]), 70)
+        self.assertEqual(len(panel['volume_profile']['profile']), 40)
+        for actual, original in zip(panel['bars'], sample['bars']):
+            for key in ('BB_UPPER', 'BB_MID', 'BB_LOWER'):
+                self.assertEqual(actual[key], original[key])
+        self.assertEqual(panel['bollinger']['upper'], round(sample['bars'][-1]['BB_UPPER'], 4))
+
+    def test_profile_bar_width_colors_and_price_bounds(self):
+        profile = {'bins': [10, 20, 30, 40], 'profile': [25, 100, 50], 'max_idx': 1, 'second_idx': 2}
+        rectangles = image.volume_profile_rectangles(profile, 10, 1090, lambda x: 500-x*10, 10, 40)
+        self.assertEqual([round(rect[2]-rect[0]) for rect, _ in rectangles], [250, 1000, 500])
+        self.assertEqual([color for _, color in rectangles], [(225, 245, 254), (248, 212, 212), (253, 236, 206)])
+        self.assertEqual(rectangles[0][0][1::2], (300, 400))
+
+    def test_missing_or_invalid_profile_never_fabricates_bands(self):
+        for profile in ({}, {'bins': [1, 2], 'profile': [0]}, {'bins': [2, 1], 'profile': [5]}, {'bins': [1, 2], 'profile': [float('nan')]}):
+            self.assertEqual(image.volume_profile_rectangles(profile, 0, 100, lambda x: x, 0, 10), [])
 
     def test_cache_preserves_panels_without_network(self):
         engine = bot.AceQueryEngine(bot.BotConfig.from_env())

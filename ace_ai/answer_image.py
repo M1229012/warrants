@@ -21,6 +21,7 @@ DOWN = '#2CB39A'
 WIDTH = 1440
 MARGIN = 64
 CONTENT = WIDTH - MARGIN * 2
+CHART_HEIGHT = 790
 
 
 @lru_cache(maxsize=32)
@@ -105,9 +106,40 @@ def text_at(draw, xy, text, size=29, fill=INK, bold=False):
     draw.text(xy, str(text), font=font(size, bold), fill=fill, anchor='lt')
 
 
+def volume_profile_rectangles(profile: dict, left, right, py, low, high):
+    """Reference overlay geometry: width = relative volume * axis width / 1.08.
+
+    Blend the reference alpha against the white card; draw behind grid/candles.
+    No replacement bands are fabricated when the profile is unavailable.
+    """
+    bins = profile.get('bins') or []
+    values = profile.get('profile') or []
+    if not values or len(bins) != len(values) + 1:
+        return []
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in bins + values):
+        return []
+    if any(b <= a for a, b in zip(bins, bins[1:])) or max(values) <= 0:
+        return []
+    maximum = max(values)
+    rectangles = []
+    for i, value in enumerate(values):
+        if value <= 0 or bins[i + 1] <= low or bins[i] >= high:
+            continue
+        if i == profile.get('max_idx'):
+            rgb, alpha = (220, 38, 38), .20
+        elif i == profile.get('second_idx'):
+            rgb, alpha = (245, 158, 11), .20
+        else:
+            rgb, alpha = (56, 189, 248), .15
+        fill = tuple(round(255 * (1-alpha) + c * alpha) for c in rgb)
+        width = value / maximum * (right - left) / 1.08
+        rectangles.append(((left, py(min(high, bins[i+1])), left + width, py(max(low, bins[i]))), fill))
+    return rectangles
+
+
 def draw_chart(draw, y: int, panel: dict) -> None:
     x0, x1 = MARGIN, WIDTH - MARGIN
-    draw.rounded_rectangle((x0, y, x1, y + 670), radius=20, fill='white', outline=LINE)
+    draw.rounded_rectangle((x0, y, x1, y + CHART_HEIGHT), radius=20, fill='white', outline=LINE)
     code, name = panel.get('stock_code', ''), panel.get('stock_name', '')
     text_at(draw, (x0 + 32, y + 26), f'{code} {name}｜日 K', 31, bold=True)
     bars = panel.get('bars') or []
@@ -125,11 +157,14 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     colors = {'MA5': UP, 'MA10': '#D99836', 'MA20': '#6C8B46', 'MA60': '#777AC4'}
     for i, (key, color) in enumerate(colors.items()):
         text_at(draw, (x0 + 34 + i * 292, y + 125), f'{key}  {number(last.get(key))}', 23, color)
-    left, right, top, bottom = x0 + 36, x1 - 118, y + 180, y + 486
+    band_colors = {'BB_UPPER': '#667085', 'BB_MID': '#76879A', 'BB_LOWER': '#667085'}
+    for i, (key, label) in enumerate((('BB_UPPER', '布林上軌'), ('BB_MID', '中軌 = MA20'), ('BB_LOWER', '布林下軌'))):
+        text_at(draw, (x0 + 34 + i * 400, y + 168), f'{label}  {number(last.get(key))}', 22, band_colors[key])
+    left, right, top, bottom = x0 + 36, x1 - 118, y + 225, y + 531
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
     for b in bars:
-        for key in colors:
+        for key in list(colors) + list(band_colors):
             if b.get(key) is not None:
                 lows.append(b[key]); highs.append(b[key])
     low, high = min(lows), max(highs)
@@ -138,16 +173,14 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     py = lambda value: bottom - (value - low) / (high - low) * (bottom - top)
     step = (right - left) / len(bars)
     px = lambda i: left + (i + .5) * step
+    profile_rectangles = volume_profile_rectangles(panel.get('volume_profile') or {}, left, right, py, low, high)
+    for rectangle, fill in profile_rectangles:
+        draw.rectangle(rectangle, fill=fill)
     for i in range(5):
         value = low + (high - low) * i / 4
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
-    zones = panel.get('zones') or []
-    for zone_index, zone in enumerate(zones):
-        a, b = zone.get('price_low'), zone.get('price_high')
-        if a is not None and b is not None and a <= high and b >= low:
-            draw.rectangle((left, py(min(b, high)), right, py(max(a, low))), fill='#FCEAEA' if zone_index == 0 else '#FFF1DC')
     for i, bar in enumerate(bars):
         color = UP if bar['Close'] >= bar['Open'] else DOWN
         center = px(i)
@@ -166,17 +199,32 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                 segment.append((px(i), py(bar[key])))
         if len(segment) > 1:
             draw.line(segment, fill=color, width=2)
-    vtop, vbottom = y + 535, y + 595
+    # Dashed bands, including the middle band, use report-supplied values.
+    # A missing rolling value breaks the line instead of joining across a gap.
+    for key, color in band_colors.items():
+        for i in range(1, len(bars)):
+            a, b = bars[i-1].get(key), bars[i].get(key)
+            if a is None or b is None:
+                continue
+            xa, ya, xb, yb = px(i-1), py(a), px(i), py(b)
+            distance = math.hypot(xb-xa, yb-ya)
+            for start in range(0, max(1, math.ceil(distance)), 12):
+                t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
+                draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=color, width=2)
+    vtop, vbottom = y + 580, y + 640
     maximum = max([b.get('Volume') or 0 for b in bars] + [1])
     for i, bar in enumerate(bars):
         height = max(0, (bar.get('Volume') or 0) / maximum * (vbottom - vtop))
         draw.rectangle((px(i) - step * .3, vbottom - height, px(i) + step * .3, vbottom),
                        fill=UP if bar['Close'] >= bar['Open'] else DOWN)
-    text_at(draw, (left, y + 504), '成交量', 20, MUTED)
+    text_at(draw, (left, y + 549), '成交量', 20, MUTED)
     for i in sorted({0, len(bars) // 3, 2 * len(bars) // 3, len(bars) - 1}):
-        text_at(draw, (max(left, min(px(i) - 32, right - 66)), y + 610), bars[i]['date'][5:], 20, MUTED)
-    if zones:
-        text_at(draw, (right - 620, y + 646), '淡紅：最大量區  /  淡橘：第二大量區', 18, MUTED)
+        text_at(draw, (max(left, min(px(i) - 32, right - 66)), y + 655), bars[i]['date'][5:], 20, MUTED)
+    legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
+    text_at(draw, (left, y + 691), legend + '  /  虛線：布林軌道', 18, MUTED)
+    state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
+    for i, line in enumerate(wrap(state, 20, CONTENT - 80)[:2]):
+        text_at(draw, (left, y + 729 + i * 28), line, 20, INK)
 
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
@@ -186,7 +234,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     header_height = 155 + len(question_lines) * 47
     blocks = body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68
-    height = header_height + len(panels) * 694 + body_height + 112
+    height = header_height + len(panels) * (CHART_HEIGHT + 24) + body_height + 112
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
@@ -197,7 +245,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     y = header_height
     for panel in panels:
         draw_chart(draw, y, panel)
-        y += 694
+        y += CHART_HEIGHT + 24
     draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
     for block in blocks:

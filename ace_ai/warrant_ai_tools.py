@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from bollinger_analysis import analyze_bollinger
 
 
 # ============================================================
@@ -1026,13 +1027,6 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
     prev = df.iloc[-2] if len(df) >= 2 else latest
     close = _num(latest.get("Close"))
     ma_values = {n: _num(latest.get(f"MA{n}")) for n in (5, 10, 20, 60)}
-    upper, mid, lower = (_num(latest.get(c)) for c in ("BB_UPPER", "BB_MID", "BB_LOWER"))
-    width = _num(latest.get("BB_WIDTH"))
-    percent_b = (
-        _num((close - lower) / (upper - lower) * 100)
-        if None not in (close, upper, lower) and upper != lower
-        else None
-    )
     osc, prev_osc = _num(latest.get("OSC"), 4), _num(prev.get("OSC"), 4)
     if osc is None or prev_osc is None:
         osc_trend = "資料不足"
@@ -1074,15 +1068,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
             "osc_trend": osc_trend,
             "signals": safe_signal(kf.get_macd_signals),
         },
-        "bollinger": {
-            "upper": upper,
-            "mid": mid,
-            "lower": lower,
-            "width": width,
-            "width_pct_of_mid": _num(width / mid * 100) if width is not None and mid else None,
-            "percent_b": percent_b,
-            "position": _bollinger_position(close, upper, mid, lower),
-        },
+        "bollinger": analyze_bollinger(df),
         "ma_kline_signals": safe_signal(kf.get_ma_kline_signals),
         "indicator_definition": "MA＝收盤簡單均線；KD＝9日RSV；MACD＝12/26/9；布林＝20日±2倍標準差（與週報相同）",
     }
@@ -2277,11 +2263,13 @@ def get_branch_recent_behavior(
 
 def get_chart_panel(stock_code: str) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
-    code = core()._normalize_stock_name_code_key(stock_code)
+    kf = core()
+    code = kf._normalize_stock_name_code_key(stock_code)
     df = _load_price_bundle(code)["df"].copy().sort_index()
     df = df[~df.index.duplicated(keep="last")]
     required = ["Open", "High", "Low", "Close"]
-    for column in required + ["Volume", "MA5", "MA10", "MA20", "MA60"]:
+    chart_columns = required + ["Volume", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER"]
+    for column in chart_columns:
         if column in df:
             df[column] = pd.to_numeric(df[column], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
     df = df.dropna(subset=required)
@@ -2289,18 +2277,35 @@ def get_chart_panel(stock_code: str) -> Dict[str, Any]:
             (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))]
     if df.empty:
         raise ToolDataError("沒有有效的 OHLC 資料")
-    # Keep the reference report's 70-day display window.
+    # Same window as the reference report (70 by default).
+    plot_df = df.tail(max(1, int(getattr(kf, "CHART_LOOKBACK", 70))))
     bars = []
-    for date, row in df.tail(70).iterrows():
+    for date, row in plot_df.iterrows():
         bars.append({"date": _fmt_date(date), **{
-            key: _num(row.get(key), 6) for key in required + ["Volume", "MA5", "MA10", "MA20", "MA60"]
+            key: _num(row.get(key), 6) for key in chart_columns
         }})
     try:
         name = resolve_stock_name(code)
     except Exception:
         name = ""
     previous = df["Close"].iloc[-2] if len(df) > 1 else None
+    profile = {}
+    try:
+        # Same 20% lower wick / 60% body / 20% upper wick allocation as the
+        # reference report. Keep every bin and the original ranking indices.
+        stats = kf._calculate_weighted_volume_profile_stats(plot_df, n_bins=40)
+        if stats:
+            profile = {
+                "bins": [float(v) for v in stats["bins"]],
+                "profile": [float(v) for v in stats["profile"]],
+                "max_idx": int(stats["max_idx"]),
+                "second_idx": int(stats["second_idx"]),
+            }
+    except Exception as exc:
+        print(f"⚠️ {code} 價量分布取得失敗：{type(exc).__name__}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
+            "volume_profile": profile,
+            "bollinger": analyze_bollinger(df),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
 

@@ -125,7 +125,8 @@ class DebugLog:
 INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "price": ("股價", "價格", "收盤", "多少錢", "漲跌", "漲幅", "跌幅", "成交量", "量比", "報價"),
     "technical": ("技術面", "技術", "均線", "MA5", "MA10", "MA20", "MA60", "月線", "季線", "週線",
-                  "KD", "MACD", "OSC", "布林", "指標", "黃金交叉", "死亡交叉", "乖離"),
+                  "KD", "MACD", "OSC", "布林", "指標", "黃金交叉", "死亡交叉", "乖離",
+                  "BOLL", "壓縮", "收窄", "擴張", "橫盤", "上軌", "下軌", "中軌", "沿軌"),
     "volume_profile": ("大量區", "量區", "成本區", "籌碼密集", "支撐", "壓力", "套牢", "價量"),
     "warrant": ("權證", "分點", "籌碼", "主力", "加碼", "買超", "賣超", "大戶", "進場"),
     "win_rate": ("勝率", "績效", "歷史表現", "表現", "報酬率", "準不準", "準確"),
@@ -764,6 +765,9 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 12. 涉及新聞時，只能引用 tool_results 裡的新聞標題與摘要。
 13. 不要把「買超」直接等同「看多必漲」。
 14. 不要把「高歷史勝率」直接說成這次一定成功。
+15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
+16. 布林判讀依 bollinger.rules 的本專案門檻；null 或資料不足不可判定有／沒有。影線穿越不等於收盤突破；持續軌外不等於本日首次突破。
+17. 壓縮只代表波動收斂，不預測突破方向；觸軌不單獨推論反轉，未符合橫盤條件不可稱為橫盤。若資料不足60個有效帶寬，不可宣稱壓縮已成立。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
@@ -901,6 +905,9 @@ def format_technical(d: Dict[str, Any]) -> str:
         f"（{macd.get('osc_trend')}{'；' + macd.get('signals') if macd.get('signals') else ''}）\n"
         f"布林：上軌 {_v(bb.get('upper'))}／中軌 {_v(bb.get('mid'))}／下軌 {_v(bb.get('lower'))}，"
         f"{bb.get('position')}（%B {_v(bb.get('percent_b'))}）"
+        + f"\n【布林觀察】{'；'.join(bb.get('signals') or ['資料不足'])}"
+        + f"\n帶寬 {_v(bb.get('width_pct_of_mid'), '%')}｜相對5日前變化 {_v(bb.get('width_change_5d_pct'), '%', signed=True)}"
+        + "\n※ 壓縮與橫盤依本專案規則判定；觸軌不代表反轉，壓縮不代表突破方向。"
     )
 
 
@@ -1355,8 +1362,6 @@ class AceQueryEngine:
         panels = []
         for code, chart in zip(codes, chart_results):
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
-            vp = next((r.data for r in results if r.ok and r.name == "get_volume_profile" and r.data.get("stock_code") == code), {})
-            panel["zones"] = [vp[key] for key in ("maximum_volume_zone", "second_volume_zone") if vp.get(key)]
             panels.append(panel)
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started

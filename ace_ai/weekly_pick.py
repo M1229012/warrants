@@ -416,7 +416,7 @@ def score_technical(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, 
     if bb.get("position") == "位於中軌與上軌之間":
         score += 1
         reasons.append("布林中軌與上軌之間 +1")
-    if extras.get("bb_mid_rising") and bb.get("position") in ("位於中軌與上軌之間", "突破上軌"):
+    if extras.get("bb_mid_rising") and bb.get("position") in ("位於中軌與上軌之間", "突破上軌", "收盤位於上軌外"):
         score += 1
         reasons.append("布林中軌向上 +1")
     if percent_b is not None and percent_b > 105:
@@ -833,6 +833,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
             "kd_signals": (tech.get("kd") or {}).get("signals"),
             "macd_osc_trend": (tech.get("macd") or {}).get("osc_trend"),
             "bollinger_position": (tech.get("bollinger") or {}).get("position"),
+            "bollinger": tech.get("bollinger"),
             "return_5d_pct": (stock.get("technical_extras") or {}).get("return_5d_pct"),
         },
         "volume_profile": {
@@ -881,6 +882,8 @@ TOP5 已由 Python 依分數排好，你只負責解釋，不得更改排名、�
 【適合週報的原因】1～2 句
 第二～五名（🥈🥉4️⃣5️⃣）用精簡格式：分數、權證一句、事件勝率一句、技術一句、注意一句。
 全文控制在 2500 字以內。"""
+
+WEEKLY_PICK_SYSTEM_PROMPT += "\n技術面需參考 bollinger.signals、squeeze、sideways、width_trend 與 band_walk；依 rules 門檻解讀，null 為資料不足；壓縮不預測方向，影線穿越不等於收盤突破。"
 
 
 def build_gemini_prompt(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -999,6 +1002,7 @@ def format_rule_based(result: Dict[str, Any]) -> str:
                 f"【技術面】{tech.get('data_date')} 收盤 {tech.get('close')}｜{tech.get('ma_alignment')}｜"
                 f"MA20 {ma20.get('position')}（{ma20.get('distance_pct')}%）｜大量區型態：{vp.get('pattern_label', '-')}"
             )
+            lines.append("【布林觀察】" + "；".join((tech.get("bollinger") or {}).get("signals") or ["資料不足"]))
         good = [_FLAG_TEXT[f] for f in stock["quality_flags"] if f in _POSITIVE_FLAGS]
         warn = [_FLAG_TEXT.get(f, f) for f in stock["quality_flags"] if f not in _POSITIVE_FLAGS]
         if good:
@@ -1103,7 +1107,7 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick",
+        "weekly_pick_bollinger_v1",
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),
