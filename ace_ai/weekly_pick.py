@@ -521,22 +521,27 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("下方支撐", "最近支撐", 0, 11, "下方沒有均線或大量區支撐")
         add("下方支撐", "支撐密度", 0, 4, "下方沒有支撐")
 
-    # ---------- 布林 10：位置 5＋通道狀態 5（中軌方向已算在 MA20，不重複） ----------
+    # ---------- 布林 10：開布林 7＋位置 3（中軌方向已算在 MA20，不重複） ----------
+    # 開布林＝帶寬擴張（5 日帶寬增加 ≥10%，本專案規則）；向上開口時股價延續性較強，向下開口為 0。
     bb_position = str(bb.get("position", ""))
-    bb_points = {"位於中軌與上軌之間": 5, "收盤位於上軌外": 3, "突破上軌": 3, "位於下軌與中軌之間": 2}.get(bb_position, 0)
-    add("布林", "通道位置", bb_points if bb_position != "資料不足" else 2.5, 5, bb_position or "資料不足")
     walk, squeeze_break, width_trend = bb.get("band_walk"), bb.get("squeeze_breakout"), bb.get("width_trend")
     above_mid = bb_position in ("位於中軌與上軌之間", "收盤位於上軌外", "突破上軌")
-    if walk == "沿上軌" or squeeze_break == "壓縮後向上突破":
-        add("布林", "通道狀態", 5, 5, "沿上軌" if walk == "沿上軌" else "壓縮後向上突破")
-    elif walk == "沿下軌" or squeeze_break == "壓縮後向下跌破":
-        add("布林", "通道狀態", 0, 5, "沿下軌" if walk == "沿下軌" else "壓縮後向下跌破")
-    elif width_trend == "擴張":
-        add("布林", "通道狀態", 4 if above_mid else 1, 5, f"帶寬擴張，股價在中軌{'上方' if above_mid else '下方'}")
+    width_change = _f(bb.get("width_change_5d_pct"))
+    width_text = f"（5 日帶寬 {width_change:+.1f}%）" if width_change is not None else ""
+    if squeeze_break == "壓縮後向上突破":
+        add("布林", "開布林", 7, 7, "壓縮後向上突破，布林向上開口")
+    elif width_trend == "擴張" and above_mid and (walk == "沿上軌" or (_f(bb.get("percent_b")) or 0) >= 80):
+        add("布林", "開布林", 7, 7, f"布林向上開口且股價貼著上軌{width_text}")
+    elif width_trend == "擴張" and above_mid:
+        add("布林", "開布林", 5, 7, f"布林開口，股價在中軌上方{width_text}")
+    elif walk == "沿下軌" or squeeze_break == "壓縮後向下跌破" or (width_trend == "擴張" and not above_mid):
+        add("布林", "開布林", 0, 7, f"布林向下開口{width_text}")
     elif width_trend in ("收窄", "持平") or bb.get("squeeze"):
-        add("布林", "通道狀態", 3, 5, "帶寬收斂／持平，方向未定")
+        add("布林", "開布林", 3, 7, f"布林未開口（帶寬{'壓縮' if bb.get('squeeze') else width_trend}）{width_text}")
     else:
-        add("布林", "通道狀態", 2.5, 5, "布林資料不足，給一半")
+        add("布林", "開布林", 3.5, 7, "布林資料不足，給一半")
+    bb_points = {"位於中軌與上軌之間": 3, "收盤位於上軌外": 3, "突破上軌": 3, "位於下軌與中軌之間": 1}.get(bb_position, 0)
+    add("布林", "通道位置", bb_points if bb_position not in ("", "資料不足") else 1.5, 3, bb_position or "資料不足")
 
     components = []
     for name, maximum in PATTERN_COMPONENTS:

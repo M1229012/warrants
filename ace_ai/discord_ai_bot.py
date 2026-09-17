@@ -1275,7 +1275,7 @@ def format_pattern_scorecard(d: Dict[str, Any]) -> str:
     return (
         f"【型態評分】型態分數 {_v(d.get('pattern_score'))} / 100（{d.get('grade')}）｜"
         + "｜".join(f"{c['label']} {_v(c['value'])} / {c['max']}" for c in d.get("components") or [])
-        "\n※ 只評技術結構，不含籌碼，不是買賣建議。"
+        + "\n※ 只評技術結構，不含籌碼，不是買賣建議。"
     )
 
 
