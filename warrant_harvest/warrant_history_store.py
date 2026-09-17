@@ -393,8 +393,10 @@ def cmd_export(args):
 
     history = load_store("history")
     if history.empty:
-        print("  ⛔ 累積庫是空的，沒有東西可以匯出。先跑 merge。")
-        return 1
+        # 回補初期（API6 還沒抓到任何明細）累積庫本來就是空的，這不是錯誤。
+        # 回傳 1 會讓 workflow 標紅，看起來像整輪失敗。
+        print("  ℹ️ 分點累積庫目前是空的，這次沒有 Excel 可以匯出。")
+        return 0
 
     date_column = STORES["history"]["日期欄"]
 
