@@ -16,8 +16,10 @@
 #     daily     主程式 daily 模式，只抓增量。排程每天跑。
 #     backfill  warrant_backfill.py 深度回補到 2023/09/11（MoneyDJ 實測底線）。
 #               有 checkpoint 與時間預算：時間到會自己收手、落盤、正常結束，
-#               後面的合併與上傳照常執行。沒跑完就再按一次，會從斷點接續。
-#               log 最後的「回補進度」會告訴你還剩多少。
+#               後面的合併與上傳照常執行。
+#               沒跑完會自動觸發下一段（只要手動按第一次），直到完成為止。
+#               安全閥：這一段完全沒進度、上傳失敗、或已連續接續 MAX_CHAIN 段，就停止接續。
+#               回補期間排程的 daily 可能會被排隊中的下一段取代而略過，這是預期的。
 #
 # 為什麼 backfill 不用主程式的 repair：
 #   repair 每個 API4 請求都查 1,300 天、沒有續跑、任何一組失敗就整輪作廢，
@@ -36,6 +38,9 @@ on:
         type: choice
         options: [daily, backfill]
         default: daily
+      chain:
+        description: "自動接續用的段數計數，手動觸發時不用改"
+        default: "0"
 
 # 同一時間只能有一個在跑。
 # 兩個 run 會各自下載同一份累積庫、各自加資料、各自 --clobber 上傳，
@@ -47,6 +52,7 @@ concurrency:
 
 permissions:
   contents: write        # gh release upload 需要
+  actions: write         # 回補沒跑完時 gh workflow run 自動觸發下一段需要
 
 env:
   STORE_TAG: data-store
@@ -117,6 +123,9 @@ jobs:
       - name: 深度回補（backfill）
         if: github.event.inputs.mode == 'backfill'
         run: |
+          # 先刪掉上一段留下的紀錄：這一段若因時間不足而沒跑，
+          # 不能拿上一段的「有進度」去觸發下一段，否則會變成空轉迴圈。
+          rm -f output/warrant_cache/backfill/last_run.json
           # 時間預算＝ job 上限 − 已用掉的 − 收尾保留。
           # 由 workflow 算而不是寫死，因為 OHLCV 第一次跟之後的耗時差很多。
           elapsed=$(( ( $(date +%s) - JOB_START_EPOCH ) / 60 ))
@@ -164,6 +173,7 @@ jobs:
           ls -lh /tmp/warrant_cache.tar.gz
 
       - name: 傳回累積庫
+        id: upload
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -185,6 +195,43 @@ jobs:
       - name: 回補進度
         if: always() && github.event.inputs.mode == 'backfill'
         run: python warrant_harvest/warrant_backfill.py --status
+
+      # 只有上傳成功才接續：checkpoint 沒存回 Release 的話，
+      # 下一段會從舊狀態重做，白白燒掉一整段。
+      - name: 自動接續下一段回補
+        if: always() && github.event.inputs.mode == 'backfill' && steps.upload.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHAIN: ${{ github.event.inputs.chain || '0' }}
+          MAX_CHAIN: "30"
+        run: |
+          state=output/warrant_cache/backfill/last_run.json
+          if [ ! -f "$state" ]; then
+            echo "這一段沒有執行回補（可能時間不足），不自動接續；請手動再觸發一次。"
+            exit 0
+          fi
+          read -r complete progressed < <(python -c "
+          import json
+          d = json.load(open('$state', encoding='utf-8'))
+          print(int(bool(d.get('complete'))), int(d.get('api4_done_this_run', 0)) + int(d.get('api6_done_this_run', 0)))
+          " | tr -d '\r')
+          if [ "$complete" = "1" ]; then
+            echo "✅ 回補完成，不再接續。之後讓排程的 daily 每天增量即可。"
+            exit 0
+          fi
+          if [ "$progressed" = "0" ]; then
+            echo "⚠️ 這一段完全沒有進度，停止自動接續以免空轉。請看上面的 log 找原因。"
+            exit 0
+          fi
+          next=$((CHAIN + 1))
+          if [ "$next" -gt "$MAX_CHAIN" ]; then
+            echo "⚠️ 已連續接續 ${CHAIN} 段仍未完成，達上限停止。確認進度正常的話手動再觸發一次即可。"
+            exit 0
+          fi
+          gh workflow run warrant_history_harvest.yml \
+            --ref "${{ github.ref_name }}" \
+            -f mode=backfill -f chain="$next"
+          echo "🔁 本段處理 ${progressed} 筆，已自動觸發第 ${next} 段"
 
       - name: 保留本次產出
         if: always()
