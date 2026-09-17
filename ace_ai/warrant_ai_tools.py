@@ -74,6 +74,8 @@ HIGH_WIN_RATE_PCT = _env_float("DISCORD_AI_HIGH_WIN_RATE_PCT", 60.0)
 LIVE_FLOW_ENABLE = os.getenv("DISCORD_AI_LIVE_FLOW_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
 MONEYDJ_TOP_ENABLE = os.getenv("DISCORD_AI_MONEYDJ_TOP_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
 CHART_MARK_MAX_EVENTS = _env_int("DISCORD_AI_CHART_MARK_MAX_EVENTS", 12)
+# 隔日衝：買進後 N 個交易日內就「全部出清」的 A～E 事件，不在 K 線標註與分點動向表顯示（只影響顯示，不改回測勝率與評分）。
+DAYTRADE_MAX_HOLD_DAYS = _env_int("DISCORD_AI_DAYTRADE_MAX_HOLD_DAYS", 2)
 SHEET_CHIPS_MIN_SELL_AMOUNT = _env_float("DISCORD_AI_SHEET_CHIPS_MIN_SELL_AMOUNT", 100_000.0)
 SMALL_SAMPLE_EVENTS = _env_int("DISCORD_AI_SMALL_SAMPLE_EVENTS", 10)
 SHEET_QUERY_MAX_ROWS = 100
@@ -2612,6 +2614,14 @@ def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 2
     start_n, end = _recent_event_dates(latest, days, events)
     start_long, _ = _recent_event_dates(latest, lookback_days, events)
     stock_events = events[events["stock_code"] == code]
+    # 隔日衝事件連同它當天的減碼／出清賣出紀錄一起排除，避免分點動向表出現「只有賣出紀錄」的隔日衝分點。
+    day_trades = stock_events[_day_trade_mask(stock_events)]
+    day_trade_sell_keys = {
+        (r["branch"], pd.Timestamp(d).normalize())
+        for _, r in day_trades.iterrows() for d in (r.get("exit_date"), r.get("reduce_date"))
+        if d is not None and not pd.isna(d)
+    }
+    stock_events = stock_events.drop(day_trades.index)
     try:
         perf = read_branch_event_performance()
     except ToolDataError as exc:
@@ -2619,6 +2629,9 @@ def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 2
         perf = {}
     high_set = set(_high_win_rate_branches(perf))
     sells = _sell_rows(code)
+    if day_trade_sell_keys and not sells.empty:
+        keys = list(zip(sells["_branch"], pd.to_datetime(sells["_date"]).dt.normalize()))
+        sells = sells[[key not in day_trade_sell_keys for key in keys]]
     sells_long = sells[sells["_date"] >= start_long] if not sells.empty else sells
     # 零星小額賣出（例如幾千元出清尾單）不列入，避免清單被雜訊塞滿。
     if not sells_long.empty:
@@ -2734,6 +2747,21 @@ def get_branch_stock_position(branch_name: str, stock_code: str) -> Dict[str, An
     }
 
 
+def _day_trade_mask(rows: pd.DataFrame) -> pd.Series:
+    """隔日衝事件：已出清，且出清日距買進日 ≤ DAYTRADE_MAX_HOLD_DAYS 個交易日（以平日計，1＝隔一個交易日就出清）。"""
+    if rows.empty or DAYTRADE_MAX_HOLD_DAYS <= 0:
+        return pd.Series(False, index=rows.index)
+
+    def is_day_trade(row: pd.Series) -> bool:
+        buy, exit_ = row.get("event_date"), row.get("exit_date")
+        if row.get("status") != "已出清" or buy is None or exit_ is None or pd.isna(buy) or pd.isna(exit_):
+            return False
+        held = int(np.busday_count(pd.Timestamp(buy).date(), pd.Timestamp(exit_).date()))
+        return 0 <= held <= DAYTRADE_MAX_HOLD_DAYS
+
+    return rows.apply(is_day_trade, axis=1).astype(bool)
+
+
 def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "",
                           extra_branches: Sequence[str] = ()) -> Dict[str, Any]:
     """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
@@ -2771,6 +2799,10 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     def in_window(value: Any) -> bool:
         return value is not None and not pd.isna(value) and start <= value <= end
 
+    day_trades = _day_trade_mask(rows)
+    if day_trades.any():
+        rule += f"（已排除 {DAYTRADE_MAX_HOLD_DAYS} 個交易日內出清的隔日衝 {int(day_trades.sum())} 筆）"
+    rows = rows[~day_trades]
     rows = rows.sort_values("event_date").tail(max(1, CHART_MARK_MAX_EVENTS))
     marks = []
     for no, (_, r) in enumerate(rows.iterrows(), 1):

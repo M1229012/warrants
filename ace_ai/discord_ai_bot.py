@@ -861,6 +861,8 @@ def _candle_shape(d: Dict[str, Any]) -> Dict[str, Any]:
         "upper_shadow_pct": pct(h - max(o, c)),
         "lower_shadow_pct": pct(min(o, c) - l),
         "range_pct": pct(h - l),
+        "body_share_of_range_pct": round(abs(c - o) / (h - l) * 100, 1) if h > l else None,
+        "upper_shadow_share_of_range_pct": round((h - max(o, c)) / (h - l) * 100, 1) if h > l else None,
         "close_position_in_range_pct": round((c - l) / (h - l) * 100, 1) if h > l else None,
     }
 
