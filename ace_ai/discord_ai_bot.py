@@ -801,17 +801,17 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 4. 分清楚：客觀數據、系統統計、AI 解讀；AI 解讀請加上「AI 解讀：」開頭。
 5. 不要把「歷史勝率」描述成未來保證。
 6. small_sample=true 或樣本數少時，要主動提醒樣本數偏少。
-7. 資料日期要說清楚：data_source 或 intraday.is_live 顯示「盤中」時，要提醒股價是盤中即時報價、尚未收盤，今天的 K 棒、成交量、均線與技術指標都含未收盤資料，收盤前會變動（成交量只是到目前為止的累計量，量比偏低很正常）；否則提醒是日K收盤資料。
+7. 資料日期要說清楚，並提醒股價為日K收盤資料、不是盤中即時。
 8. 語氣自然、口語、不要過度艱深。
 9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
 11. 不提供目標價、報酬預測或「買進／賣出」這類直接指令；但使用者問型態、成本或操作時，不可拒答，必須依序用型態、大量區、均線（再來才是布林與籌碼）給出客觀觀察重點：目前位置、關鍵支撐與壓力價位（只能使用 tool_results 的價位）、以及「若守住／若跌破／若站回」各代表什麼，並寫在【觀察重點】。有成本價時要說明成本相對現價、均線與大量區的位置。
-12. 涉及新聞時，只能引用 tool_results 裡 get_recent_news 的 title、summary、content、summary_points，不可補充其他來源或自己知道的消息。新聞統整規則：
+12. 涉及新聞時，只能引用 tool_results 裡 get_recent_news 的 title、summary、content、summary_points（鉅亨網的「公司名:本公司…」標題是公司重大訊息公告，屬正式事實），不可補充其他來源或自己知道的消息。新聞統整規則：
    - 不要逐條重列標題。先把同一件事（event_key 相同或內容明顯是同一事件的多家報導）合併，整理成 2～4 個重點，每個重點寫清楚：發生什麼事、關鍵數字（金額、比例、時程、產品、客戶，只能用 content／summary 出現過的數字）、消息來源與日期。
    - 標題中的聳動字眼（例如「暴賺」「超狂」「開炸」）不是事實，不可照抄成結論；法人或分析師的目標價、獲利預估要寫明「某某機構估計」，屬於看法不是事實。
    - 利多／利空一定要客觀，分開寫：【可能利多】寫新聞中對公司營運有正面影響的具體因素；【可能利空／風險】寫同一批新聞裡的成本、稀釋、整合、競爭、執行時程、資金壓力等風險，新聞沒有提到的風險不可自行推測，沒有就寫「新聞內容未提及明顯利空，但資訊有限」。
    - 最後【綜合觀察】用 1～2 句說明利多利空的相對份量與還需要確認的資訊（例如交易細節、主管機關核准、完成時程），不可下「買進／賣出」或「一定漲／跌」的結論；有 get_stock_overview 時可說明資料日收盤與漲跌幅作為市場當下反應，但不可推論因果。
-   - content_source 為「RSS 摘要」時內容較少，要避免過度解讀。
+   - content_source 為「鉅亨網原文」才是文章內文；「RSS 摘要」內容較少、「僅標題」只有標題，這兩種只能描述標題寫到的事實，不可過度解讀或自行補充細節。
 13. 不要把「買超」直接等同「看多必漲」。
 14. 不要把「高歷史勝率」直接說成這次一定成功。
 15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
@@ -1155,8 +1155,8 @@ def format_news(d: Dict[str, Any]) -> str:
         date = f"{item['date']}｜" if item.get("date") else ""
         lines.append(f"• {date}{item.get('title')}（{item.get('source')}）")
         # 有原文段落就列前 120 字；RSS 摘要常常只是標題＋媒體名，跟標題重複就不列。
-        detail = item.get("content") if item.get("content_source", "").startswith("原文") else item.get("summary")
-        detail = str(detail or "").strip()
+        detail = item.get("content") if "原文" in item.get("content_source", "") else item.get("summary")
+        detail = re.sub(r"\s+", " ", str(detail or "")).strip()
         title = str(item.get("title") or "")
         if detail and not detail.startswith(title[:20]):
             lines.append(f"　{detail[:120]}{'…' if len(detail) > 120 else ''}")
@@ -1350,13 +1350,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             continue
         d = r.data
         if r.name in ("get_stock_overview", "get_technical_analysis", "get_volume_profile") and d.get("data_date"):
-            intraday = d.get("intraday") or {}
-            if intraday.get("is_live"):
-                add(f"股價為 {intraday['date']} {intraday['time']} 盤中即時報價（證交所，尚未收盤）")
-            elif intraday:
-                add(f"股價為 {intraday['date']} 今日收盤（證交所即時報價）")
-            else:
-                add(f"股價截至 {d['data_date']}（日K收盤）")
+            add(f"股價截至 {d['data_date']}（日K收盤）")
         elif r.name in ("get_warrant_branch", "get_high_winrate_branches_buying") and d.get("period_start"):
             add(f"權證分點 {d['period_start']}～{d['period_end']}（{d.get('actual_trading_days')} 個交易日）")
         elif r.name == "get_branch_performance" and d.get("found"):
@@ -1467,11 +1461,7 @@ class AceQueryEngine:
             result = self._answer_uncached(question, started)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         if result.cacheable:
-            # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
-            seconds = self.config.answer_cache_seconds
-            if tools.INTRADAY_ENABLE and tools.intraday_session_now():
-                seconds = min(seconds, tools.TTL_INTRADAY_SECONDS)
-            self._answer_cache.set(normalized, result, seconds)
+            self._answer_cache.set(normalized, result, self.config.answer_cache_seconds)
         return result
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:

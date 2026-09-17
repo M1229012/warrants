@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import html
 import json
 import math
 import os
@@ -76,14 +77,20 @@ CHART_MARK_MAX_EVENTS = _env_int("DISCORD_AI_CHART_MARK_MAX_EVENTS", 12)
 SHEET_CHIPS_MIN_SELL_AMOUNT = _env_float("DISCORD_AI_SHEET_CHIPS_MIN_SELL_AMOUNT", 100_000.0)
 SMALL_SAMPLE_EVENTS = _env_int("DISCORD_AI_SMALL_SAMPLE_EVENTS", 10)
 SHEET_QUERY_MAX_ROWS = 100
-NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 5)
+NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 8)
 NEWS_SUMMARY_MAX_CHARS = 160
-# 新聞內文：只對前幾篇抓原文，並只保留和本公司有關的段落，限制長度給 Gemini 統整。
-NEWS_BODY_FETCH_ENABLE = os.getenv("DISCORD_AI_NEWS_BODY_FETCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-NEWS_BODY_FETCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_FETCH_TIMEOUT", 6.0)
-NEWS_BODY_FETCH_MAX_BYTES = _env_int("DISCORD_AI_NEWS_BODY_FETCH_MAX_BYTES", 600_000)
-NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 900)
-NEWS_BODY_CANDIDATES = _env_int("DISCORD_AI_NEWS_BODY_CANDIDATES", 10)
+# 新聞：鉅亨網新聞搜尋 API（用股票代號查，含內文）優先，再補既有六來源標題。
+# 不再抓一般新聞網站原文：Google News 連結解碼會卡住，大量解析網頁也曾讓 Discord 心跳逾時斷線。
+NEWS_CNYES_ENABLE = os.getenv("DISCORD_AI_NEWS_CNYES_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+CNYES_SEARCH_URL = "https://ess.api.cnyes.com/ess/api/v1/news/keyword"
+CNYES_NEWS_PAGE_URL = "https://news.cnyes.com/news/id/{}"
+NEWS_LOOKBACK_DAYS = _env_int("DISCORD_AI_NEWS_LOOKBACK_DAYS", 14)
+NEWS_CNYES_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_MAX_ITEMS", 8)
+NEWS_CNYES_BODY_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_BODY_ITEMS", 5)
+NEWS_ARTICLE_TIMEOUT = _env_float("DISCORD_AI_NEWS_ARTICLE_TIMEOUT", 6.0)
+NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 8.0)
+NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 1500)
+TAIPEI_TZ = timezone(timedelta(hours=8))
 TEXT_CELL_MAX_CHARS = 120
 
 # Bot 行程強制唯讀。這些值只影響 Discord Bot 自己的 process，不影響 GitHub Actions。
@@ -116,9 +123,6 @@ _BOT_DEFAULT_ENV = {
     "WARRANT_HYBRID_MONEYDJ_API4_WORKERS": "12",
     "WARRANT_HYBRID_MONEYDJ_API5_WORKERS": "12",
     "WARRANT_SELECTED_BRANCH_FLOW_ENABLE": "0",
-    # 新聞原文：Google News RSS 連結要先解碼成原始網址才抓得到內文（週報極速模式不會走到這裡）。
-    "WARRANT_NEWS_GNEWSDECODER_ENABLE": "1",
-    "WARRANT_NEWS_GNEWSDECODER_TIMEOUT": "5",
 }
 
 
@@ -913,134 +917,20 @@ def get_available_sheet_metadata() -> Dict[str, Any]:
 # 價格資料（Tool 1～3 共用，同一檔股票 10 分鐘內只抓一次）
 # ============================================================
 
-# ------------------------------------------------------------
-# 盤中即時報價：FinMind 日K要收盤後才有當天資料，盤中改用證交所 MIS 即時報價補上「今天這一根」。
-# MIS 同時涵蓋上市（tse）與上櫃（otc），延遲約數秒；興櫃不支援。失敗時照舊只用日K。
-# ------------------------------------------------------------
-INTRADAY_ENABLE = os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
-MIS_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-MIS_INDEX_URL = "https://mis.twse.com.tw/stock/index.jsp"
-TAIPEI_TZ = timezone(timedelta(hours=8))
-MARKET_CLOSE_HHMM = (13, 30)
-
-
-def taipei_now() -> datetime:
-    return datetime.now(TAIPEI_TZ)
-
-
-def intraday_session_now(now: Optional[datetime] = None) -> bool:
-    """平日 08:55～13:35 視為盤中（快取縮短、需要即時報價）；國定休市日 MIS 不會有當日資料，自然略過。"""
-    now = now or taipei_now()
-    return now.weekday() < 5 and (8, 55) <= (now.hour, now.minute) <= (13, 35)
-
-
-def _mis_price(value: Any) -> Optional[float]:
-    try:
-        number = float(str(value).split("_")[0])
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) and number > 0 else None
-
-
-def fetch_intraday_quote(stock_code: str) -> Dict[str, Any]:
-    """證交所 MIS 即時報價；還沒有成交（開盤前）或查不到時回傳空 dict。"""
-    kf = core()
-    code = kf._normalize_stock_name_code_key(stock_code)
-    session = kf.get_thread_session()
-    headers = {"User-Agent": kf.HDR["User-Agent"], "Referer": MIS_INDEX_URL, "Accept": "application/json,text/plain,*/*"}
-    url = f"{MIS_QUOTE_URL}?ex_ch=tse_{code}.tw|otc_{code}.tw&json=1&delay=0&_={int(time.time() * 1000)}"
-    items: List[Dict[str, Any]] = []
-    for attempt in range(2):
-        response = session.get(url, headers=headers, timeout=(4, 6))
-        response.raise_for_status()
-        items = [i for i in (response.json().get("msgArray") or []) if str(i.get("c", "")) == code]
-        if items or attempt:
-            break
-        session.get(MIS_INDEX_URL, headers=headers, timeout=(4, 6))  # 第一次常因沒有 cookie 回空陣列，取 cookie 後重試
-    for item in items:
-        # z＝最新成交價；該瞬間沒有成交時是「-」，改用 pz（前一筆成交價）。
-        close = _mis_price(item.get("z")) or _mis_price(item.get("pz"))
-        day = str(item.get("d", ""))
-        if close is None or not re.fullmatch(r"\d{8}", day):
-            continue
-        open_ = _mis_price(item.get("o")) or close
-        high = max(_mis_price(item.get("h")) or close, open_, close)
-        low = min(_mis_price(item.get("l")) or close, open_, close)
-        lots = _mis_price(item.get("v")) or 0.0
-        clock = str(item.get("t", "") or "")
-        return {
-            "date": pd.Timestamp(f"{day[:4]}-{day[4:6]}-{day[6:]}"),
-            "time": clock[:5],
-            "open": open_, "high": high, "low": low, "close": close,
-            "volume_shares": lots * 1000,
-            "prev_close": _mis_price(item.get("y")),
-            "exchange": str(item.get("ex", "")),
-            "is_live": bool(re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", clock)) and tuple(map(int, clock[:5].split(":"))) < MARKET_CLOSE_HHMM,
-        }
-    return {}
-
-
-def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """FinMind 還沒有今天的日K時，把即時報價接成今天這一根（盤中為暫定 K 棒，收盤前會變動）。"""
-    now = taipei_now()
-    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (8, 55):
-        return stock_df, {}
-    last_date = pd.Timestamp(stock_df.index.max()).normalize()
-    if last_date >= pd.Timestamp(now.date()):
-        return stock_df, {}
-    try:
-        quote = fetch_intraday_quote(code)
-    except Exception as exc:  # 即時報價失敗不影響日K
-        print(f"⚠️ {code} 盤中即時報價略過：{type(exc).__name__}: {exc}", flush=True)
-        return stock_df, {}
-    if not quote or quote["date"].normalize() <= last_date:
-        return stock_df, {}
-    bar = pd.DataFrame(
-        [[quote["open"], quote["high"], quote["low"], quote["close"], quote["volume_shares"]]],
-        index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
-    )
-    merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
-    info = {
-        "date": _fmt_date(quote["date"]),
-        "time": quote["time"],
-        "is_live": quote["is_live"],
-        "source": "證交所 MIS 即時報價",
-    }
-    print(f"⏱️ {code} 接上即時報價：{info['date']} {info['time']}｜收 {quote['close']}｜{'盤中' if info['is_live'] else '今日收盤（FinMind 尚未更新）'}", flush=True)
-    return merged, info
-
-
-def price_source_note(bundle: Dict[str, Any]) -> str:
-    info = bundle.get("intraday") or {}
-    if not info:
-        return PRICE_SOURCE_NOTE
-    if info.get("is_live"):
-        return f"FinMind 日K＋{info['source']}（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
-    return f"FinMind 日K＋{info['source']}（{info['date']} 今日收盤，FinMind 尚未更新）"
-
-
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
-    """重用 fetch_stock_data_yf + calculate_indicators，與週報產圖相同的抓取區間；盤中接上即時報價。"""
+    """重用 fetch_stock_data_yf + calculate_indicators，與週報產圖相同的抓取區間。"""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
 
-    def daily() -> Tuple[pd.DataFrame, str]:
+    def build() -> Dict[str, Any]:
         stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
         if stock_df is None or stock_df.empty:
             raise ToolDataError(f"{code} 沒有股價資料")
-        return stock_df, str(market or "")
-
-    def build() -> Dict[str, Any]:
-        # 日K（FinMind）照原本 10 分鐘快取，盤中只有即時報價與指標每分鐘重算，不會狂打 FinMind。
-        stock_df, market = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
-        stock_df, intraday = _append_intraday_bar(code, stock_df)
         df = kf.calculate_indicators(stock_df)
         df["Close_prev"] = df["Close"].shift(1)
-        return {"df": df, "market": market, "intraday": intraday}
+        return {"df": df, "market": str(market or "")}
 
-    ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
-    return _cached(f"price_{code}", ttl, build)
+    return _cached(f"price_{code}", TTL_PRICE_SECONDS, build)
 
 
 def _stock_identity(stock_code: str) -> Tuple[str, str]:
@@ -1078,8 +968,7 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "market": bundle["market"],
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": price_source_note(bundle),
-        "intraday": bundle.get("intraday") or {},
+        "data_source": PRICE_SOURCE_NOTE,
         "open": _num(latest.get("Open")),
         "high": _num(latest.get("High")),
         "low": _num(latest.get("Low")),
@@ -1257,8 +1146,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_code": code,
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": price_source_note(bundle),
-        "intraday": bundle.get("intraday") or {},
+        "data_source": PRICE_SOURCE_NOTE,
         "close": close,
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
         "ma_alignment": _ma_alignment(ma_values),
@@ -1870,74 +1758,175 @@ def _news_date(value: Any) -> str:
     return ts.tz_convert("Asia/Taipei").strftime("%Y/%m/%d")
 
 
+def _cnyes_html_to_text(value: str) -> str:
+    """鉅亨文章內容是一小段 HTML：只對這段做簡單去標籤（不掃整個網頁，避免長時間佔住 GIL 卡住 Discord 心跳）。"""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", str(value or ""))
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</tr>|</h\d>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t　\xa0]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+_RSC_PUSH_MARK = 'self.__next_f.push([1,'
+_RSC_TEXT_ROW_RE = re.compile(r'(?:^|\n)([0-9a-z]+):T([0-9a-f]+),')
+
+
+def _cnyes_rsc_article_html(page: str) -> str:
+    """鉅亨文章頁（Next.js App Router）：內文在 self.__next_f.push 的文字列（id:T長度,內容）。
+
+    只用 str.find＋json raw_decode 解出字串（C 實作，單頁約數毫秒），不對整頁跑複雜正規式。
+    同頁另有 JSON-LD 文字列（以 { 開頭），略過；取剩下最長的一段。長度單位是 UTF-8 位元組。
+    """
+    decoder = json.JSONDecoder()
+    chunks, pos = [], 0
+    while True:
+        index = page.find(_RSC_PUSH_MARK, pos)
+        if index < 0:
+            break
+        try:
+            value, pos = decoder.raw_decode(page, index + len(_RSC_PUSH_MARK))
+        except ValueError:
+            break
+        if isinstance(value, str):
+            chunks.append(value)
+    joined = "".join(chunks)
+    best = ""
+    for match in _RSC_TEXT_ROW_RE.finditer(joined):
+        size = int(match.group(2), 16)
+        segment = joined[match.end(): match.end() + size].encode("utf-8")[:size].decode("utf-8", errors="ignore")
+        if segment.lstrip().startswith("{"):
+            continue
+        if len(segment) > len(best):
+            best = segment
+    return html.unescape(best)
+
+
+def fetch_cnyes_article_text(news_id: str) -> str:
+    """鉅亨文章內文；找不到時退回頁面 meta description。"""
+    kf = core()
+    response = kf.get_thread_session().get(
+        CNYES_NEWS_PAGE_URL.format(news_id),
+        headers={"User-Agent": kf.HDR["User-Agent"], "Accept": "text/html"},
+        timeout=(4, NEWS_ARTICLE_TIMEOUT),
+    )
+    response.raise_for_status()
+    page = response.text
+    content = _cnyes_html_to_text(_cnyes_rsc_article_html(page))
+    match = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]*)"', page[:30000])
+    description = html.unescape(match.group(1)).strip() if match else ""
+    # 內文是表格時（例如 FactSet 預估），導言只在 description，補在前面。
+    if description and description[:20] not in content:
+        content = (description + "\n" + content).strip()
+    return content
+
+
+def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
+    """鉅亨網新聞搜尋 API（用股票代號查），只留標題／標籤明確提到本公司、且在回看天數內的新聞，前幾篇抓內文。"""
+    kf = core()
+    response = kf.get_thread_session().get(
+        CNYES_SEARCH_URL,
+        params={"q": code, "limit": 30, "page": 1},
+        headers={"User-Agent": kf.HDR["User-Agent"], "Accept": "application/json"},
+        timeout=(4, 8),
+    )
+    response.raise_for_status()
+    raw_items = ((response.json() or {}).get("data") or {}).get("items") or []
+    cutoff = time.time() - NEWS_LOOKBACK_DAYS * 86400
+    picked = []
+    for item in raw_items:
+        # 搜尋 API 的標題會帶 <mark> 高亮標籤，先去掉。
+        title = re.sub(r"<[^>]+>", "", html.unescape(str(item.get("title", "") or ""))).strip()
+        item["title"] = title
+        published = float(item.get("publishAt") or 0)
+        tags = " ".join(str(t) for t in item.get("keywordForTag") or [])
+        related = name in title or code in title or name in tags or f"TWS:{code}:STOCK" in json.dumps(item, ensure_ascii=False)
+        if not title or not item.get("newsId") or published < cutoff or not related:
+            continue
+        picked.append(item)
+        if len(picked) >= NEWS_CNYES_MAX_ITEMS:
+            break
+    # 內文並行抓取；整批有總時限，逾時的直接放棄（不等待），不拖住回答。
+    from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+    pool = ThreadPoolExecutor(max_workers=max(1, NEWS_CNYES_BODY_ITEMS), thread_name_prefix="ace-cnyes")
+    futures = {str(item["newsId"]): pool.submit(fetch_cnyes_article_text, str(item["newsId"]))
+               for item in picked[:NEWS_CNYES_BODY_ITEMS]}
+    futures_wait(list(futures.values()), timeout=NEWS_BODY_BATCH_TIMEOUT)
+    pool.shutdown(wait=False, cancel_futures=True)
+    articles = []
+    for item in picked:
+        news_id = str(item["newsId"])
+        future = futures.get(news_id)
+        content = ""
+        if future is not None and future.done():
+            try:
+                content = future.result()
+            except Exception as exc:  # 單篇失敗只少內文
+                print(f"⚠️ 鉅亨新聞內文略過：{news_id}｜{type(exc).__name__}: {exc}", flush=True)
+        summary = _cnyes_html_to_text(item.get("summary") or "")
+        articles.append({
+            "date": datetime.fromtimestamp(float(item["publishAt"]), TAIPEI_TZ).strftime("%Y/%m/%d"),
+            "title": item["title"].strip(),
+            "source": "鉅亨網",
+            "summary": _truncate(summary, NEWS_SUMMARY_MAX_CHARS),
+            "content": _truncate(content, NEWS_CONTENT_MAX_CHARS) if content else "",
+            "content_source": "鉅亨網原文" if content else "僅標題",
+            "url": CNYES_NEWS_PAGE_URL.format(news_id),
+            "event_key": f"cnyes_{news_id}",
+        })
+    return articles
+
+
 def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, Any]:
-    """近期公司新聞：先用週報當日新聞摘要快取，沒有才走既有多來源新聞抓取（不呼叫 Gemini）。"""
+    """近期公司新聞：鉅亨網（有內文）優先，再補既有六來源新聞標題；不抓一般網站原文（曾卡住 Discord 心跳）。"""
     kf = core()
     code, name = _stock_identity(stock_code)
     if not name:
         raise ToolDataError(f"查不到 {code} 的公司名稱，無法安全比對新聞")
 
-    def article_content(article: Dict[str, Any], title: str, description: str) -> Tuple[str, str]:
-        """（內容, 來源）：先抓原文並只留本公司相關段落；抓不到就用 RSS 摘要。"""
-        body = ""
-        if article.get("body_ok"):
-            body = str(article.get("content", "") or "")
-        elif NEWS_BODY_FETCH_ENABLE and article.get("url"):
-            try:
-                body = kf._fetch_article_body(
-                    article["url"], request_timeout=NEWS_BODY_FETCH_TIMEOUT,
-                    max_bytes=NEWS_BODY_FETCH_MAX_BYTES, hard_deadline_seconds=NEWS_BODY_FETCH_TIMEOUT,
-                )
-            except Exception as exc:  # 單篇原文失敗就退回摘要
-                print(f"⚠️ Discord AI 新聞原文略過：{title}｜{type(exc).__name__}: {exc}", flush=True)
-                body = ""
-            if body and not kf._is_valid_article_body(body, title=title, description=description):
-                body = ""
-        if body:
-            focused = kf._normalize_news_text(kf._extract_target_focused_news_body(body, code, name))
-            if len(focused) >= 60:
-                return _truncate(focused, NEWS_CONTENT_MAX_CHARS), "原文（本公司相關段落）"
-        return _truncate(description, NEWS_CONTENT_MAX_CHARS), "RSS 摘要"
-
     def build() -> Dict[str, Any]:
         cached_points = kf._load_gsheet_news_points_cache_for_display(code, name, allow_stale=False)
-        articles = kf.fetch_multi_source_news_articles(code, name, max_items=kf.NEWS_GOOGLE_MAX_ITEMS)
-        articles = kf._dedupe_news_articles_by_event(
-            list(articles or []), code, name, log_label="Discord AI 新聞"
-        )
-        candidates = []
+        cnyes: List[Dict[str, Any]] = []
+        if NEWS_CNYES_ENABLE:
+            try:
+                cnyes = fetch_cnyes_news(code, name)
+            except Exception as exc:  # 鉅亨失敗時仍有六來源標題
+                print(f"⚠️ {code} 鉅亨新聞略過：{type(exc).__name__}: {exc}", flush=True)
+        others = []
+        try:
+            articles = kf.fetch_multi_source_news_articles(code, name, max_items=kf.NEWS_GOOGLE_MAX_ITEMS)
+            articles = kf._dedupe_news_articles_by_event(list(articles or []), code, name, log_label="Discord AI 新聞")
+        except Exception as exc:
+            print(f"⚠️ {code} 六來源新聞略過：{type(exc).__name__}: {exc}", flush=True)
+            articles = []
+        seen = [a["title"][:14] for a in cnyes]
         for article in articles:
             title = kf._clean_news_title(article.get("title", ""))
-            description = kf._normalize_news_text(article.get("description", "") or article.get("content", ""))
+            description = kf._normalize_news_text(article.get("description", ""))
             if not title or kf._is_price_only_news_without_fundamentals(f"{title} {description}"):
                 continue
-            candidates.append((article, title, description))
-            if len(candidates) >= NEWS_BODY_CANDIDATES:
-                break
-        # 多抓幾篇候選的原文（並行，每篇有硬截止時間），有原文的優先，維持原本相關度排序。
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max(1, len(candidates)), thread_name_prefix="ace-news") as pool:
-            contents = list(pool.map(lambda p: article_content(*p), candidates)) if candidates else []
-        body_count = sum(1 for _, source in contents if source.startswith("原文"))
-        print(f"📰 {code} 新聞候選 {len(candidates)} 篇｜抓到原文 {body_count} 篇｜"
-              + "；".join(f"{t[:18]}={s}({len(c)}字)" for (_, t, _), (c, s) in zip(candidates, contents)), flush=True)
-        ranked = sorted(zip(candidates, contents), key=lambda pair: not pair[1][1].startswith("原文"))
-        items = []
-        for (article, title, description), (content, content_source) in ranked[: max(1, int(limit))]:
-            items.append({
+            if any(prefix and prefix in title for prefix in seen):
+                continue
+            seen.append(title[:14])
+            # RSS 摘要常常只是「標題＋媒體名」，跟標題重複時不當內容。
+            detail = "" if not description or description.startswith(title[:14]) else description
+            others.append({
                 "date": _news_date(article.get("published", "")),
                 "title": title,
                 "source": str(article.get("source", "") or ""),
-                "summary": _truncate(description, NEWS_SUMMARY_MAX_CHARS),
-                "content": content,
-                "content_source": content_source,
+                "summary": _truncate(detail, NEWS_SUMMARY_MAX_CHARS),
+                "content": _truncate(detail, NEWS_CONTENT_MAX_CHARS),
+                "content_source": "RSS 摘要" if detail else "僅標題",
                 "url": str(article.get("url", "") or ""),
                 "event_key": kf._news_article_event_key(article, code, name),
             })
+        with_body = [a for a in cnyes if a["content"]]
+        items = (with_body + [a for a in cnyes if not a["content"]] + others)[: max(1, int(limit))]
+        print(f"📰 {code} 新聞｜鉅亨 {len(cnyes)} 篇（有內文 {len(with_body)} 篇）｜六來源標題 {len(others)} 篇｜採用 {len(items)} 篇", flush=True)
         return {
             "stock_code": code,
             "stock_name": name,
-            "source_type": "既有六來源新聞管線（公司主體過濾＋事件去重）；前幾篇嘗試抓原文並只留本公司相關段落",
+            "source_type": "鉅亨網新聞搜尋（含內文）＋既有六來源新聞標題（公司主體過濾＋事件去重）",
             "summary_points": list(cached_points or [])[:3],
             "summary_points_source": "週報當日新聞重點快取（已通過既有 grounding 驗證）" if cached_points else "",
             "articles": items,
@@ -2860,7 +2849,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
         print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
-            "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
+            "volume_profile": profile, "marks": marks,
             "bollinger": analyze_bollinger(df),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
