@@ -1,0 +1,6 @@
+# 艾斯 AI Discord Bot 專用依賴。
+# 刻意不修改 repo 根目錄的 requirements.txt：generate_warrant_report.yml 的 runtime 快取 key
+# 綁定 hashFiles('requirements.txt')，改動會讓週報 workflow 重建環境。
+# 這裡沿用週報全部依賴（路徑相對於本檔），再加上 Discord 套件。
+-r ../requirements.txt
+discord.py>=2.4,<3

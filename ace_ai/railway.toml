@@ -1,0 +1,19 @@
+# 艾斯 AI Discord Bot 專用 Railway 設定。
+# Railway Service → Settings：
+#   Root Directory：留空（使用 repo 根目錄）
+#   Config-as-code → Config File Path：/ace_ai/railway.toml
+# Discord Bot 不是 HTTP 服務，因此不設定 healthcheck。
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "ace_ai/Dockerfile"
+# 回測每天會更新 repo 很多次；只有這些檔案變動才重新部署 Bot。
+watchPatterns = [
+  "ace_ai/**",
+  "K_function_warrant_report_20260530.py",
+  "requirements.txt",
+]
+
+[deploy]
+startCommand = "python -u ace_ai/discord_ai_bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
