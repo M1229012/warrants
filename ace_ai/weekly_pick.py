@@ -1077,6 +1077,7 @@ class WeeklyPickAnswer:
     gemini_calls: int
     cache_hit: bool
     elapsed: float
+    stock_codes: List[str] = field(default_factory=list)
 
 
 def run_weekly_pick(
@@ -1112,10 +1113,11 @@ def run_weekly_pick(
     cached = None if filters.refresh else _load_cache(config, cache_key)
     if cached and cached.get("text"):
         stage_log("快取命中（同一份事件資料與條件），不重新計算、不呼叫 Gemini")
-        return WeeklyPickAnswer(cached["text"], 0, True, time.perf_counter() - started)
+        return WeeklyPickAnswer(cached["text"], 0, True, time.perf_counter() - started, [s["stock_code"] for s in cached.get("result", {}).get("top", [])])
 
     engine = WeeklyPickEngine(config, log)
     result = cached["result"] if cached and cached.get("result") else engine.run(filters)
+    stock_codes = [s["stock_code"] for s in result["top"]]
     rule_text = format_rule_based(result)
     if not result["top"]:
         _save_cache(config, cache_key, {"result": result, "text": rule_text})
@@ -1129,13 +1131,13 @@ def run_weekly_pick(
         stage_log(f"Gemini 失敗：{getattr(response, 'error', '')}")
         prefix = rate_limit_message if getattr(response, "rate_limited", False) else "AI 說明暫時無法使用，以下先提供系統計算結果。"
         _save_cache(config, cache_key, {"result": result, "text": ""})
-        return WeeklyPickAnswer(f"{prefix}\n\n{rule_text}", calls, False, time.perf_counter() - started)
+        return WeeklyPickAnswer(f"{prefix}\n\n{rule_text}", calls, False, time.perf_counter() - started, stock_codes)
     text = str(response.text or "").strip()
     ungrounded = find_ungrounded(text, payload)
     if ungrounded:
         stage_log(f"數字核對未通過：{ungrounded[:10]}")
         _save_cache(config, cache_key, {"result": result, "text": ""})
-        return WeeklyPickAnswer(f"（AI 說明中有數字無法對應到原始資料，改顯示系統計算結果）\n\n{rule_text}", calls, False, time.perf_counter() - started)
+        return WeeklyPickAnswer(f"（AI 說明中有數字無法對應到原始資料，改顯示系統計算結果）\n\n{rule_text}", calls, False, time.perf_counter() - started, stock_codes)
     text += (
         f"\n\n資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
         f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
@@ -1143,4 +1145,4 @@ def run_weekly_pick(
     )
     _save_cache(config, cache_key, {"result": result, "text": text})
     stage_log(f"完成｜Gemini {calls} 次｜總耗時 {time.perf_counter() - started:.1f}s")
-    return WeeklyPickAnswer(text, calls, False, time.perf_counter() - started)
+    return WeeklyPickAnswer(text, calls, False, time.perf_counter() - started, stock_codes)

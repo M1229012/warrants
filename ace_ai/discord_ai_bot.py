@@ -6,7 +6,7 @@
     → 規則式實體與意圖解析（必要時才用 Gemini Planner）
     → warrant_ai_tools 取得並篩選資料（重用週報主程式函式）
     → 精簡 JSON → Gemini 最終回答（簡單查詢直接由 Python 排版，不呼叫 Gemini）
-    → 數字核對 → 切段回覆 Discord
+    → 數字核對 → 一頁式圖片回覆 Discord
 
 本機測試（不連 Discord）：
     python discord_ai_bot.py --ask "2344現在技術面怎麼樣"
@@ -21,16 +21,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import io
 import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import warrant_ai_tools as tools
 import weekly_pick
+import answer_image
 from weekly_pick import is_weekly_pick_question
 
 
@@ -756,16 +758,16 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 6. small_sample=true 或樣本數少時，要主動提醒樣本數偏少。
 7. 資料日期要說清楚，並提醒股價為日K收盤資料、不是盤中即時。
 8. 語氣自然、口語、不要過度艱深。
-9. 不要寫超長答案，約 300～800 個中文字，最多 1000 字。
+9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
 11. 不提供沒有資料支持的目標價、報酬預測或買賣建議。
 12. 涉及新聞時，只能引用 tool_results 裡的新聞標題與摘要。
 13. 不要把「買超」直接等同「看多必漲」。
 14. 不要把「高歷史勝率」直接說成這次一定成功。
 
-輸出格式（Discord 訊息，不要用表格、不要用程式碼區塊）：
+輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
-接著只放相關區塊，區塊標題依序使用：📌 籌碼、📈 技術面、📊 大量區、📰 新聞、🔎 綜合觀察
+接著只放相關區塊，區塊標題依序使用：【籌碼】、【技術面】、【大量區】、【新聞】、【綜合觀察】
 最後一行：「資料時間：」列出各類資料的日期或統計期間。"""
 
 
@@ -1251,6 +1253,7 @@ class AnswerResult:
     elapsed: float
     cache_hit: bool = False
     cacheable: bool = False
+    panels: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class AceQueryEngine:
@@ -1272,7 +1275,7 @@ class AceQueryEngine:
         hit, cached = self._answer_cache.get(normalized)
         if hit:
             self.log(f"回答快取命中：{question}")
-            return AnswerResult(text=cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started, cache_hit=True)
+            return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started, cache_hit=True)
         if is_weekly_pick_question(question):
             with self._engine_lock:
                 return self._answer_weekly_pick(question, started)
@@ -1280,13 +1283,14 @@ class AceQueryEngine:
             result = self._answer_uncached(question, started)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         if result.cacheable:
-            self._answer_cache.set(normalized, result.text, self.config.answer_cache_seconds)
+            self._answer_cache.set(normalized, result, self.config.answer_cache_seconds)
         return result
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選：Python 算 TOP5，正常只呼叫 Gemini 一次；有自己的 weekly_pick 快取。"""
         stats = AnswerStats()
         self.log(f"本週精選問題：{question}")
+        panels = []
 
         def generate(prompt: str) -> GeminiResult:
             result = self.gateway.generate(prompt, purpose="weekly_pick", temperature=0.3)
@@ -1302,6 +1306,7 @@ class AceQueryEngine:
                 log=self.log,
             )
             text, cache_hit = answer.text, answer.cache_hit
+            panels = self._get_chart_panels(answer.stock_codes)
         except tools.ToolDataError as exc:
             text, cache_hit = f"本週精選目前無法計算：{exc}", False
         except Exception as exc:  # 計算流程任何例外都不可讓 Bot 中斷
@@ -1309,7 +1314,13 @@ class AceQueryEngine:
             text, cache_hit = "本週精選計算時發生錯誤，請稍後再試（詳細原因已記錄在 console）。", False
         elapsed = time.perf_counter() - started
         self.log(f"本週精選完成｜Gemini 呼叫 {stats.gemini_calls} 次｜快取={cache_hit}｜總耗時 {elapsed:.1f}s")
-        return AnswerResult(text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit)
+        return AnswerResult(text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit, panels=panels)
+
+    def _get_chart_panels(self, codes: List[str]) -> List[Dict[str, Any]]:
+        codes = list(dict.fromkeys(codes))
+        results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code}) for code in codes])
+        return [r.data if r.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+                for code, r in zip(codes, results)]
 
     def plan_only(self, question: str) -> Tuple[ParsedQuestion, QueryPlan, AnswerStats]:
         stats = AnswerStats()
@@ -1336,7 +1347,17 @@ class AceQueryEngine:
         if plan.clarification:
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
 
-        results = self._run_tools(plan.tool_calls)
+        codes = list(dict.fromkeys([code for code, _ in parsed.stocks] +
+                     [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
+        combined = self._run_tools(plan.tool_calls + [ToolCall("get_chart_panel", {"stock_code": c}) for c in codes])
+        results = [r for r in combined if r.name != "get_chart_panel"]
+        chart_results = [r for r in combined if r.name == "get_chart_panel"]
+        panels = []
+        for code, chart in zip(codes, chart_results):
+            panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+            vp = next((r.data for r in results if r.ok and r.name == "get_volume_profile" and r.data.get("stock_code") == code), {})
+            panel["zones"] = [vp[key] for key in ("maximum_volume_zone", "second_volume_zone") if vp.get(key)]
+            panels.append(panel)
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started
         self.log(
@@ -1348,7 +1369,8 @@ class AceQueryEngine:
             route=plan.route,
             gemini_calls=stats.gemini_calls,
             elapsed=elapsed,
-            cacheable=llm_ok and all(r.ok for r in results),
+            cacheable=llm_ok and all(r.ok for r in combined),
+            panels=panels,
         )
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
@@ -1506,6 +1528,7 @@ def run_discord_bot(config: BotConfig) -> None:
     elif not config.allowed_user_ids:
         print("⚠️ DISCORD_AI_ALLOWED_USER_IDS 未設定：所有人呼叫都會收到「尚未開放」")
 
+    answer_image.font(29)  # Fail early if CJK fonts were not installed.
     tools.core()
     threading.Thread(target=_startup_warmup, name="ace-warmup", daemon=True).start()
     engine = AceQueryEngine(config)
@@ -1514,6 +1537,32 @@ def run_discord_bot(config: BotConfig) -> None:
     intents.message_content = True
     no_mentions = discord.AllowedMentions.none()
     prefix = config.command_prefix.lower()
+
+    async def image_file(question: str, text: str, panels=None, guild=None):
+        limit = min(7_500_000, getattr(guild, "filesize_limit", 7_500_000))
+        try:
+            data, extension = await asyncio.to_thread(answer_image.make_attachment, question, text, panels, max_bytes=limit)
+        except Exception as exc:
+            print(f"⚠️ 圖片產生失敗：{type(exc).__name__}", flush=True)
+            data, extension = await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
+                "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)
+        return discord.File(io.BytesIO(data), filename=f"ace-answer.{extension}")
+
+    async def reply_image(message, question: str, text: str, panels=None):
+        file = await image_file(question, text, panels, message.guild)
+        try:
+            await message.reply(file=file, mention_author=False, allowed_mentions=no_mentions)
+        finally:
+            file.close()
+
+    async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False):
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        file = await image_file(question, text, panels, interaction.guild)
+        try:
+            await interaction.followup.send(file=file, ephemeral=ephemeral, allowed_mentions=no_mentions)
+        finally:
+            file.close()
 
     class AceClient(discord.Client):
         def __init__(self) -> None:
@@ -1552,26 +1601,24 @@ def run_discord_bot(config: BotConfig) -> None:
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
-            await interaction.response.send_message(denied, ephemeral=True)
+            await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
         busy = guard.acquire(user_id)
         if busy:
-            await interaction.response.send_message(busy, ephemeral=True)
+            await interaction_image(interaction, "請稍候", busy, ephemeral=True)
             return
         try:
             await interaction.response.defer(thinking=True, ephemeral=config.ephemeral)
             if is_weekly_pick_question(question):
-                await interaction.followup.send(WEEKLY_PICK_ACK, ephemeral=config.ephemeral, allowed_mentions=no_mentions)
+                await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
             result = await asyncio.to_thread(engine.answer, question)
-            chunks = split_discord_message(f"❓ {question}\n\n{result.text}", config.max_message_chars)
-            for chunk in chunks:
-                await interaction.followup.send(chunk, ephemeral=config.ephemeral, allowed_mentions=no_mentions, suppress_embeds=True)
+            await interaction_image(interaction, question, result.text, result.panels, ephemeral=config.ephemeral)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
             try:
-                await interaction.followup.send("處理問題時發生錯誤，請稍後再試。", ephemeral=True)
+                await interaction_image(interaction, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。", ephemeral=config.ephemeral)
             except discord.HTTPException as send_exc:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
@@ -1591,30 +1638,27 @@ def run_discord_bot(config: BotConfig) -> None:
         denied = guard.check_permission(user_id, channel_id, message.guild.id if message.guild else None)
         if denied:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
-            await message.reply(denied, mention_author=False, allowed_mentions=no_mentions)
+            await reply_image(message, "使用權限", denied)
             return
         if not question:
-            await message.reply(HELP_MESSAGE, mention_author=False, allowed_mentions=no_mentions)
+            await reply_image(message, "!ace 使用說明", HELP_MESSAGE)
             return
         busy = guard.acquire(user_id)
         if busy:
-            await message.reply(busy, mention_author=False, allowed_mentions=no_mentions)
+            await reply_image(message, "請稍候", busy)
             return
         try:
             if is_weekly_pick_question(question):
-                await message.reply(WEEKLY_PICK_ACK, mention_author=False, allowed_mentions=no_mentions)
+                await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 result = await asyncio.to_thread(engine.answer, question)
-            chunks = split_discord_message(result.text, config.max_message_chars)
-            await message.reply(chunks[0], mention_author=False, allowed_mentions=no_mentions, suppress_embeds=True)
-            for chunk in chunks[1:]:
-                await message.channel.send(chunk, allowed_mentions=no_mentions, suppress_embeds=True)
+            await reply_image(message, question, result.text, result.panels)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord 訊息送出失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI 處理問題失敗：{type(exc).__name__}: {exc}", flush=True)
             try:
-                await message.reply("處理問題時發生錯誤，請稍後再試。", mention_author=False, allowed_mentions=no_mentions)
+                await reply_image(message, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。")
             except discord.HTTPException as send_exc:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
@@ -1631,6 +1675,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="艾斯 AI Discord 問答機器人")
     parser.add_argument("--ask", help="不連 Discord，直接在 console 回答一個問題")
     parser.add_argument("--plan", help="只顯示問題解析與路由，不抓資料、不呼叫 Gemini（Planner 路由除外）")
+    parser.add_argument("--image-output", help="搭配 --ask 將完整回答另存 PNG 圖片")
     parser.add_argument("--debug", action="store_true", help="等同 DISCORD_AI_DEBUG=1")
     args = parser.parse_args(argv)
 
@@ -1654,6 +1699,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.ask:
         engine = AceQueryEngine(config)
         result = engine.answer(args.ask)
+        if args.image_output:
+            answer_image.render_answer(args.ask, result.text, result.panels).save(args.image_output)
+            print(f"圖片已儲存：{args.image_output}")
         print("=" * 60)
         for index, chunk in enumerate(split_discord_message(result.text, config.max_message_chars), 1):
             print(f"--- Discord 訊息 {index} ---")

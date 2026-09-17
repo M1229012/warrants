@@ -4,3 +4,5 @@
 # 這裡沿用週報全部依賴（路徑相對於本檔），再加上 Discord 套件。
 -r ../requirements.txt
 discord.py>=2.4,<3
+
+Pillow>=10.4,<13
