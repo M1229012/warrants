@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1031,6 +1031,76 @@ def _bollinger_position(close: Optional[float], upper: Optional[float], mid: Opt
     return "跌破下軌"
 
 
+MA_DEDUCTION_DAYS = _env_int("DISCORD_AI_MA_DEDUCTION_DAYS", 5)
+
+
+def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 60), days: int = MA_DEDUCTION_DAYS) -> Dict[str, Any]:
+    """均線扣抵：明天的 MA_n 會移除 n 個交易日前那根收盤（扣抵價）。
+
+    明日均線變化 ＝（明日收盤 − 扣抵價）÷ n，所以收盤高於扣抵價均線才會上揚。
+    推算假設「收盤維持今天價位」，逐日扣掉未來 days 根扣抵價，找出均線是否會轉向；只是條件推算，不是預測。
+    """
+    closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return {}
+    close = float(closes.iloc[-1])
+    result: Dict[str, Any] = {}
+    for n in periods:
+        if len(closes) < n + 1:
+            continue
+        start = len(closes) - n
+        ma = float(closes.iloc[start:].mean())
+        flat = abs(ma) * 0.0002
+        k = max(1, min(days, n))
+        deductions = [float(v) for v in closes.iloc[start:start + k]]
+        dates = [_fmt_date(d) for d in closes.index[start:start + k]]
+        changes = [(close - d) / n for d in deductions]
+
+        def direction(change: float) -> str:
+            return "上揚" if change > flat else "下彎" if change < -flat else "走平"
+
+        now = direction((close - float(closes.iloc[start - 1])) / n)
+        turn, turn_day = "", None
+        for day, change in enumerate(changes, 1):
+            future = direction(change)
+            if future != "走平" and future != now:
+                turn, turn_day = ("轉下彎" if future == "下彎" else "轉上揚"), day
+                break
+        projected = ma + sum(changes)
+        high, low = max(deductions), min(deductions)
+        above_close = ma > close
+        if turn == "轉下彎":
+            signal = (f"MA{n} 目前{now}，但未來 {k} 日扣抵價最高 {high:,.2f} 高於現價；收盤若維持 {close:,.2f}，"
+                      f"第 {turn_day} 個交易日起轉下彎" + ("，且均線在股價上方，下彎後容易形成壓力" if above_close else ""))
+        elif turn == "轉上揚":
+            signal = (f"MA{n} 目前{now}，未來 {k} 日扣抵價最低 {low:,.2f} 低於現價；收盤若維持 {close:,.2f}，"
+                      f"第 {turn_day} 個交易日起轉上揚")
+        elif now == "上揚":
+            signal = f"MA{n} 上揚，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不高於現價，收盤維持不變時仍續揚"
+        elif now == "下彎":
+            signal = (f"MA{n} 下彎，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不低於現價，收盤維持不變時仍續彎"
+                      + ("，均線在股價上方，壓力未解除" if above_close else ""))
+        else:
+            signal = f"MA{n} 走平，未來 {k} 日扣抵價 {low:,.2f}～{high:,.2f}"
+        result[f"MA{n}"] = {
+            "value": _num(ma),
+            "direction_now": now,
+            "next_deduction_price": _num(deductions[0]),
+            "next_deduction_date": dates[0],
+            "tomorrow_close_needed_to_rise": _num(deductions[0]),
+            "deduction_days": k,
+            "deduction_prices": [_num(v) for v in deductions],
+            "deduction_high": _num(high),
+            "deduction_low": _num(low),
+            "projected_value_if_close_unchanged": _num(projected),
+            "turn": turn,
+            "turn_day": turn_day,
+            "ma_above_close": above_close,
+            "signal": signal,
+        }
+    return result
+
+
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
     """重用 calculate_indicators 與既有 KD／MACD／均線訊號函式，整理最新技術面。"""
     kf = core()
@@ -1067,6 +1137,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
         "ma_alignment": _ma_alignment(ma_values),
         "ma20_cross_recent_3_days": _recent_ma_cross(df, "MA20"),
+        "ma_deduction": analyze_ma_deduction(df),
         "kd": {
             "K9": k9,
             "D9": d9,
@@ -2467,11 +2538,13 @@ def get_branch_stock_position(branch_name: str, stock_code: str) -> Dict[str, An
     }
 
 
-def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
+def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "",
+                          extra_branches: Sequence[str] = ()) -> Dict[str, Any]:
     """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
 
     指定分點時只標那些分點（可用逗號傳多個，例如本週精選的主力＋高品質分點）；
-    否則標「勝率統計總勝率 ≥ 高勝率門檻」的回測追蹤分點。
+    否則標「勝率統計總勝率 ≥ 高勝率門檻」的回測追蹤分點，再加上 extra_branches
+    （型態評分卡「追蹤分點動向」表列出的分點，讓表上持有中的分點在 K 線上也看得到）。
     買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
     """
     kf = core()
@@ -2495,8 +2568,9 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             high = set(_high_win_rate_branches(read_branch_event_performance()))
         except ToolDataError:
             high = set()
-        rows = rows[rows["branch"].isin(high)]
-        rule = f"總勝率 {HIGH_WIN_RATE_PCT:g}% 以上的追蹤分點"
+        extra = set(extra_branches) - high
+        rows = rows[rows["branch"].isin(high | extra)]
+        rule = f"總勝率 {HIGH_WIN_RATE_PCT:g}% 以上的追蹤分點" + ("＋下方分點動向表的分點" if extra else "")
 
     def in_window(value: Any) -> bool:
         return value is not None and not pd.isna(value) and start <= value <= end
@@ -2590,7 +2664,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     df = _load_price_bundle(code)["df"].copy().sort_index()
     df = df[~df.index.duplicated(keep="last")]
     required = ["Open", "High", "Low", "Close"]
-    chart_columns = required + ["Volume", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER"]
+    chart_columns = required + ["Volume", "MV5", "MV20", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER"]
     for column in chart_columns:
         if column in df:
             df[column] = pd.to_numeric(df[column], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))

@@ -31,7 +31,7 @@ CONTENT = WIDTH - MARGIN * 2
 # K 線卡片垂直配置：標題＋收盤＋均線／布林數值卡｜價格區｜日期軸＋成交量｜價量分布圖例＋布林狀態。
 CHART_HEAD = 260
 CHART_PRICE_BASE = 306
-CHART_VOLUME_BLOCK = 136
+CHART_VOLUME_BLOCK = 156
 CHART_FOOT = 114
 CHART_HEIGHT = CHART_HEAD + CHART_PRICE_BASE + CHART_VOLUME_BLOCK + CHART_FOOT
 # K 棒價格區加高（原本約 300px，加上標籤帶後 K 棒會被壓扁）。
@@ -40,6 +40,8 @@ TILE_H = 98
 MA_COLORS = {'MA5': UP, 'MA10': '#D99836', 'MA20': '#6C8B46', 'MA60': '#777AC4'}
 BAND_COLORS = {'BB_UPPER': '#667085', 'BB_MID': '#76879A', 'BB_LOWER': '#667085'}
 BAND_LABELS = {'BB_UPPER': '布林上軌', 'BB_MID': '中軌 MA20', 'BB_LOWER': '布林下軌'}
+# 均量線：避開紅綠量柱的顏色。
+MV_COLORS = {'MV5': '#E0A030', 'MV20': '#5B6BBF'}
 # 分點買賣標註：K 線上下各留一條標籤帶（▲／▼＋最多 3 列編號圓圈），不和 K 棒重疊。
 MARK_LANE = 104
 MARK_BADGE_R = 11
@@ -574,15 +576,41 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.text((label_x, axis_y + 9), bars[i]['date'][5:], font=font(18, new_month),
                   fill=INK if new_month else MUTED, anchor='mt')
 
-    text_at(draw, (left, bottom + 46), '成交量', 20, MUTED)
-    vtop, vbottom = bottom + 76, bottom + CHART_VOLUME_BLOCK
+    # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
+    label_y = bottom + 58
+    draw.text((left, label_y), '成交量', font=font(20), fill=MUTED, anchor='lm')
+    lx = left + font(20).getlength('成交量') + 18
+    today_volume = _finite(last.get('Volume'))
+    if today_volume is not None:
+        text = f'今日 {today_volume / 1000:,.0f} 張'
+        draw.text((lx, label_y), text, font=font(19, True), fill=INK, anchor='lm')
+        lx += font(19, True).getlength(text) + 24
+    for key, mv_color in MV_COLORS.items():
+        value = _finite(last.get(key))
+        draw.line((lx, label_y, lx + 20, label_y), fill=mv_color, width=3)
+        text = f"{key} {value / 1000:,.0f} 張" if value is not None else f'{key} —'
+        draw.text((lx + 28, label_y), text, font=font(19), fill=INK, anchor='lm')
+        lx += 28 + font(19).getlength(text) + 24
+    vtop, vbottom = bottom + 84, bottom + CHART_VOLUME_BLOCK
     for i in ticks:
         draw.line((px(i), vtop, px(i), vbottom), fill=GRID, width=1)
-    maximum = max([b.get('Volume') or 0 for b in bars] + [1])
+    maximum = max([b.get('Volume') or 0 for b in bars] + [b.get(k) or 0 for b in bars for k in MV_COLORS] + [1])
+    vy = lambda value: vbottom - max(0, value) / maximum * (vbottom - vtop)
     for i, bar in enumerate(bars):
-        height = max(0, (bar.get('Volume') or 0) / maximum * (vbottom - vtop))
-        draw.rectangle((px(i) - step * .3, vbottom - height, px(i) + step * .3, vbottom),
+        draw.rectangle((px(i) - step * .3, vy(bar.get('Volume') or 0), px(i) + step * .3, vbottom),
                        fill=UP if bar['Close'] >= bar['Open'] else DOWN)
+    for key, mv_color in MV_COLORS.items():
+        segment = []
+        for i, bar in enumerate(bars):
+            value = _finite(bar.get(key))
+            if value is None:
+                if len(segment) > 1:
+                    draw.line(segment, fill=mv_color, width=2)
+                segment = []
+            else:
+                segment.append((px(i), vy(value)))
+        if len(segment) > 1:
+            draw.line(segment, fill=mv_color, width=2)
     legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
     text_at(draw, (left, vbottom + 18), legend + '  /  虛線：布林軌道', 18, MUTED)
     state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
@@ -598,6 +626,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '結構中性': (TILE_BG, '#344054'), '結構偏弱': (WARN_BG, WARN_INK)}
 LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
 LEVEL_ROW_H = 44
+SCORE_ROW_H = 40
 BRANCH_ROW_H = 44
 
 
@@ -663,18 +692,34 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
     return sorted(rows, key=lambda r: (-float(r[2]), order[r[0]]))
 
 
-def _draw_level_table(draw, x, y, width, rows) -> None:
-    columns = (('類型', 0), ('名稱', 104), ('價位', 330), ('距現價', 500), ('距離示意（相對現價）', 600))
+def _deduction_outlook(info: dict) -> tuple[str, str]:
+    """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
+    if info.get('turn'):
+        return f"第 {info.get('turn_day')} 日{info['turn']}", WARN_INK if info['turn'] == '轉下彎' else GOOD_INK
+    return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
+
+
+def _level_note(label: str, card: dict) -> tuple[str, str]:
+    """關鍵價位「說明」欄：均線寫方向與扣抵推算，量區／布林寫價位性質。"""
+    info = (card.get('ma_deduction') or {}).get('MA20' if label == '布林中軌' else label)
+    if info:
+        outlook, color = _deduction_outlook(info)
+        return f"{'MA20 ' if label == '布林中軌' else ''}目前{info.get('direction_now', '')}｜收盤不變：{outlook}", color
+    if '量區' in label:
+        return '成交密集區邊緣（籌碼成本區）', MUTED
+    if '布林' in label:
+        return '布林通道軌道（20 日 ±2 倍標準差）', MUTED
+    if label == '持股成本':
+        return '使用者輸入的成本價', MUTED
+    return '', MUTED
+
+
+def _draw_level_table(draw, x, y, width, rows, card) -> None:
     draw.rounded_rectangle((x, y, x + width, y + TABLE_HEAD_H), radius=8, fill=TILE_BG)
-    for label, offset in columns:
-        if label in ('價位', '距現價'):
-            draw.text((x + offset + (140 if label == '價位' else 80), y + TABLE_HEAD_H / 2), label, font=font(17), fill=MUTED, anchor='rm')
-        else:
-            draw.text((x + offset + 10, y + TABLE_HEAD_H / 2), label, font=font(17), fill=MUTED, anchor='lm')
-    bar_left, bar_right = x + 620, x + width - 20
-    center = (bar_left + bar_right) / 2
-    span = (bar_right - bar_left) / 2 - 8
-    scale = max([abs(float(r[3])) for r in rows if r[3] is not None] + [5.0])
+    mid_head = y + TABLE_HEAD_H / 2
+    for label, lx, anchor in (('類型', x + 10, 'lm'), ('名稱', x + 114, 'lm'), ('價位', x + 470, 'rm'),
+                              ('距現價', x + 590, 'rm'), ('說明（均線含扣抵推算）', x + 640, 'lm')):
+        draw.text((lx, mid_head), label, font=font(17), fill=MUTED, anchor=anchor)
     ry = y + TABLE_HEAD_H
     for kind, label, price, pct in rows:
         mid = ry + LEVEL_ROW_H / 2
@@ -688,14 +733,53 @@ def _draw_level_table(draw, x, y, width, rows) -> None:
         draw.text((x + 470, mid), number(price), font=font(22, True), fill=INK, anchor='rm')
         if kind != '現價' and pct is not None:
             pct = float(pct)
-            draw.text((x + 580, mid), f'{pct:+.2f}%', font=font(20), fill=UP if pct > 0 else DOWN if pct < 0 else MUTED, anchor='rm')
-            length = min(1.0, abs(pct) / scale) * span
-            if length >= 2:
-                a, b = (center, center + length) if pct > 0 else (center - length, center)
-                draw.rounded_rectangle((a, mid - 6, b, mid + 6), radius=6, fill=UP if pct > 0 else DOWN)
+            draw.text((x + 590, mid), f'{pct:+.2f}%', font=font(20), fill=UP if pct > 0 else DOWN if pct < 0 else MUTED, anchor='rm')
+        if kind != '現價':
+            note, color = _level_note(label, card)
+            if note:
+                text, size = fit(note, 19, width - 660, color != MUTED)
+                draw.text((x + 640, mid), text, font=font(size, color != MUTED), fill=color, anchor='lm')
         draw.line((x, ry + LEVEL_ROW_H, x + width, ry + LEVEL_ROW_H), fill=LINE)
         ry += LEVEL_ROW_H
-    draw.line((center, y + TABLE_HEAD_H + 4, center, ry - 4), fill='#D0D5DD', width=2)
+
+
+def _draw_deduction_table(draw, x, y, width, card) -> None:
+    columns = (('均線', 110), ('目前方向', 130), ('明日扣抵價', 170), ('扣抵日', 120),
+               ('未來扣抵價區間', 270), ('收盤不變時均線', 220), ('推算結果', width - 1020))
+    draw.rounded_rectangle((x, y, x + width, y + TABLE_HEAD_H), radius=8, fill=TILE_BG)
+    cx = x
+    for label, w in columns:
+        draw.text((cx + 10, y + TABLE_HEAD_H / 2), label, font=font(17), fill=MUTED, anchor='lm')
+        cx += w
+    ry = y + TABLE_HEAD_H
+    for key, info in (card.get('ma_deduction') or {}).items():
+        mid = ry + LEVEL_ROW_H / 2
+        now = str(info.get('direction_now', ''))
+        outlook, outlook_color = _deduction_outlook(info)
+        days = info.get('deduction_days') or ''
+        cells = [
+            (key, 21, INK, True),
+            None,
+            (number(info.get('next_deduction_price')), 21, INK, True),
+            (str(info.get('next_deduction_date', ''))[5:], 20, MUTED, False),
+            (f"{days} 日：{number(info.get('deduction_low'))}～{number(info.get('deduction_high'))}", 20, INK, False),
+            (f"{number(info.get('value'))} → {number(info.get('projected_value_if_close_unchanged'))}", 20, INK, False),
+            (outlook, 20, outlook_color, outlook_color != INK),
+        ]
+        cx = x
+        for (label, w), cell in zip(columns, cells):
+            if cell is None:
+                bg, ink = {'上揚': (UP_BG, UP), '下彎': (DOWN_BG, DOWN)}.get(now, (TILE_BG, MUTED))
+                chip_w = font(18, True).getlength(now) + 28
+                draw.rounded_rectangle((cx + 10, mid - 15, cx + 10 + chip_w, mid + 15), radius=15, fill=bg)
+                draw.text((cx + 10 + chip_w / 2, mid), now, font=font(18, True), fill=ink, anchor='mm')
+            else:
+                value, size, color, bold = cell
+                text, size = fit(value, size, w - 20, bold)
+                draw.text((cx + 10, mid), text, font=font(size, bold), fill=color, anchor='lm')
+            cx += w
+        draw.line((x, ry + LEVEL_ROW_H, x + width, ry + LEVEL_ROW_H), fill=LINE)
+        ry += LEVEL_ROW_H
 
 
 def _draw_branch_table(draw, x, y, width, branches) -> None:
@@ -739,7 +823,7 @@ def _draw_branch_table(draw, x, y, width, branches) -> None:
 
 
 def scorecard(draw, y: float, card: dict, dry: bool) -> int:
-    """型態分數＋加分／扣分＋關鍵價位＋追蹤分點動向；dry=True 只量測高度。"""
+    """型態分數＋五大項＋得分依據／失分原因＋均線扣抵＋關鍵價位＋追蹤分點動向；dry=True 只量測高度。"""
     x0, x1, pad = MARGIN, WIDTH - MARGIN, 36
     px, width = x0 + pad, CONTENT - pad * 2
     if not dry:
@@ -755,6 +839,7 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         unrealized = _finite(card.get('unrealized_pct'))
         tags.append(('持股成本', f'{number(cost)}（現價相對成本 {unrealized:+.2f}%）' if unrealized is not None else number(cost)))
     tag_rows = _tag_rows(tags, width)
+    score_block = max(158, 12 + len(card.get('components') or []) * SCORE_ROW_H + 10)
     if not dry:
         sy = y + h
         score_text = f'{score:.1f}'
@@ -765,17 +850,18 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         draw.rounded_rectangle((px, sy + 98, px + grade_w, sy + 138), radius=20, fill=bg)
         draw.text((px + grade_w / 2, sy + 118), grade, font=font(22, True), fill=ink, anchor='mm')
         rx, rw = px + 380, width - 380
-        for k, (label, key, maximum) in enumerate((('技術型態', 'technical_score', card.get('technical_max', 25)),
-                                                   ('支撐品質', 'support_score', card.get('support_max', 15)))):
-            by = sy + 4 + k * 66
-            value, maximum = _finite(card.get(key)) or 0.0, float(maximum or 1)
-            text_at(draw, (rx, by), label, 21, MUTED)
-            draw.text((rx + rw, by), f'{value:.1f} / {maximum:g}', font=font(21, True), fill=INK, anchor='rt')
-            draw.rounded_rectangle((rx, by + 36, rx + rw, by + 48), radius=6, fill=LINE)
-            filled = max(0.0, min(1.0, value / maximum)) * rw
+        # 五大項：左側項目名、中間進度條、右側得分，一項一列。
+        for k, component in enumerate(card.get('components') or []):
+            cy = sy + 12 + k * SCORE_ROW_H
+            value, maximum = _finite(component.get('value')) or 0.0, float(component.get('max') or 1)
+            draw.text((rx, cy), str(component.get('label', '')), font=font(20), fill=MUTED, anchor='lm')
+            bar_left, bar_right = rx + 110, rx + rw - 120
+            draw.rounded_rectangle((bar_left, cy - 6, bar_right, cy + 6), radius=6, fill=LINE)
+            filled = max(0.0, min(1.0, value / maximum)) * (bar_right - bar_left)
             if filled > 12:
-                draw.rounded_rectangle((rx, by + 36, rx + filled, by + 48), radius=6, fill=ACCENT)
-        ty = sy + 158
+                draw.rounded_rectangle((bar_left, cy - 6, bar_left + filled, cy + 6), radius=6, fill=ACCENT)
+            draw.text((rx + rw, cy), f'{value:g} / {maximum:g}', font=font(20, True), fill=INK, anchor='rm')
+        ty = sy + score_block
         for row in tag_rows:
             tx = px
             for key, value, w in row:
@@ -785,22 +871,29 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
                 draw.text((tx + 14 + font(21).getlength(f'{key}｜'), ty + 19), text, font=font(size, True), fill=INK, anchor='lm')
                 tx += w + 10
             ty += 48
-    h += 158 + len(tag_rows) * 48 + 14
+    h += score_block + len(tag_rows) * 48 + 14
 
     half = (width - 20) / 2
     plus, minus = card.get('plus_reasons'), card.get('minus_reasons')
-    box_h = max(_bullet_box(None, 0, 0, half, '加分項目', plus, GOOD_BG, GOOD_INK, '沒有加分項目', True),
-                _bullet_box(None, 0, 0, half, '扣分項目', minus, WARN_BG, WARN_INK, '沒有扣分項目', True))
+    box_h = max(_bullet_box(None, 0, 0, half, '得分依據', plus, GOOD_BG, GOOD_INK, '沒有拿到一半以上的項目', True),
+                _bullet_box(None, 0, 0, half, '失分原因', minus, WARN_BG, WARN_INK, '各項都拿到一半以上', True))
     if not dry:
-        _bullet_box(draw, px, y + h, half, '加分項目', plus, GOOD_BG, GOOD_INK, '沒有加分項目', False, box_h)
-        _bullet_box(draw, px + half + 20, y + h, half, '扣分項目', minus, WARN_BG, WARN_INK, '沒有扣分項目', False, box_h)
+        _bullet_box(draw, px, y + h, half, '得分依據', plus, GOOD_BG, GOOD_INK, '沒有拿到一半以上的項目', False, box_h)
+        _bullet_box(draw, px + half + 20, y + h, half, '失分原因', minus, WARN_BG, WARN_INK, '各項都拿到一半以上', False, box_h)
     h += box_h + 34
+
+    deduction = card.get('ma_deduction') or {}
+    if deduction:
+        h += _sub_heading(draw, px, y + h, '均線扣抵', '明日收盤高於扣抵價，均線才會上揚；推算假設收盤維持今天價位，不是預測', width, dry)
+        if not dry:
+            _draw_deduction_table(draw, px, y + h, width, card)
+        h += TABLE_HEAD_H + len(deduction) * LEVEL_ROW_H + 34
 
     levels = _level_rows(card)
     h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、兩大量區上下緣、布林三軌中，離收盤最近的壓力與支撐', width, dry)
     if levels:
         if not dry:
-            _draw_level_table(draw, px, y + h, width, levels)
+            _draw_level_table(draw, px, y + h, width, levels, card)
         h += TABLE_HEAD_H + len(levels) * LEVEL_ROW_H + 34
     else:
         if not dry:

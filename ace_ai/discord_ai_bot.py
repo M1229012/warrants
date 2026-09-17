@@ -809,11 +809,13 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
 16. 布林判讀依 bollinger.rules 的本專案門檻；null 或資料不足不可判定有／沒有。影線穿越不等於收盤突破；持續軌外不等於本日首次突破。
 17. 壓縮只代表波動收斂，不預測突破方向；觸軌不單獨推論反轉，未符合橫盤條件不可稱為橫盤。若資料不足60個有效帶寬，不可宣稱壓縮已成立。
-18. 有 get_pattern_scorecard 時，圖片上方已經另外畫出「型態評分卡」（分數、加分／扣分項目、關鍵價位表、追蹤分點動向表），文字不要逐項重抄：
-   - 【型態】第一句寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要加分與扣分原因。分數只代表技術結構，不可寫成推薦或看多看空結論。
-   - 【觀察重點】不可重複【型態】【均線與大量區】已經寫過的描述，改寫成 3 行，每行以「・」開頭：
+18. 有 get_pattern_scorecard 時，圖片上方已經另外畫出「型態評分卡」（分數與五大項、得分依據／失分原因、均線扣抵表、關鍵價位表、追蹤分點動向表），文字不要逐項重抄：
+   - 【型態】第一句寫「型態分數 pattern_score / 100（grade）」，再用 1～2 句說明主要得分與失分的項目（components、plus_reasons、minus_reasons）。分數只代表技術結構，不可寫成推薦或看多看空結論。
+   - 【均線與大量區】要依 get_technical_analysis 的 ma_deduction 說明 MA20（必要時 MA60）目前方向與扣抵狀況（signal）；推算是「收盤維持不變」的條件推算，不可寫成預測。
+   - 【觀察重點】不可重複【型態】【均線與大量區】已經寫過的描述，改寫成 3～4 行，每行以「・」開頭：
      ・價位：挑 1 個最近的支撐與 1 個最近的壓力（resistances_above_close／supports_below_close），說明「守住／跌破／站回」各代表型態會怎麼變化。
-     ・分數：依 minus_reasons／plus_reasons 說明哪個條件改變會讓型態分數加分或扣分（例如站回 MA20 可解除「跌破 MA20」扣分），只說條件，不預測會不會發生。
+     ・分數：依 minus_reasons 說明哪個失分條件改善就能補回分數（例如站回 MA20、MA20 扣抵後不再下彎），或 plus_reasons 中哪個條件消失會失分，只說條件，不預測會不會發生。
+     ・扣抵：若 ma_deduction 的 MA20 或 MA60 有 turn（轉下彎／轉上揚），寫出「明日收盤需高於 tomorrow_close_needed_to_rise 均線才會上揚」與 turn_day；沒有 turn 就省略這行。
      ・分點：依 tracked_branches 點名 1～2 個值得追蹤的分點（高勝率、仍持有中者優先），寫出它最近的事件與部位狀態，以及「後續若出現減碼／出清或再加碼」代表籌碼面的變化；tracked_branches 為空時寫「近 20 個交易日追蹤分點沒有 A～E 事件」。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
@@ -947,6 +949,8 @@ def format_technical(d: Dict[str, Any]) -> str:
         f"均線：{'｜'.join(ma_parts)}\n"
         f"排列：{d.get('ma_alignment')}；{cross_text}"
         + (f"；{d.get('ma_kline_signals')}" if d.get("ma_kline_signals") else "")
+        + "".join(f"\n扣抵：{info['signal']}" for key, info in (d.get("ma_deduction") or {}).items()
+                  if key in ("MA20", "MA60") and info.get("signal"))
         + f"\nKD：K {_v(kd.get('K9'))}／D {_v(kd.get('D9'))}（{kd.get('signals') or '無特殊訊號'}）\n"
         f"MACD：DIF {_v(macd.get('DIF'))}／MACD {_v(macd.get('MACD'))}／OSC {_v(macd.get('OSC'))}"
         f"（{macd.get('osc_trend')}{'；' + macd.get('signals') if macd.get('signals') else ''}）\n"
@@ -1270,7 +1274,7 @@ def format_pattern_scorecard(d: Dict[str, Any]) -> str:
     """評分細節已畫在圖片的型態評分卡；文字只留一行總結，避免重複。"""
     return (
         f"【型態評分】型態分數 {_v(d.get('pattern_score'))} / 100（{d.get('grade')}）｜"
-        f"技術型態 {_v(d.get('technical_score'))} / 25｜支撐品質 {_v(d.get('support_score'))} / 15"
+        + "｜".join(f"{c['label']} {_v(c['value'])} / {c['max']}" for c in d.get("components") or [])
         "\n※ 只評技術結構，不含籌碼，不是買賣建議。"
     )
 
@@ -1500,6 +1504,7 @@ class AceQueryEngine:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 if card:
                     panel["scorecard"] = card
+                    self._mark_table_branches(panel, card)
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started
@@ -1517,7 +1522,7 @@ class AceQueryEngine:
         )
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
-        """型態評分卡：沿用本週精選的技術型態＋支撐品質規則（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
+        """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
         found = {r.name: r.data for r in results if r.ok and r.data.get("stock_code") == code}
         tech, vp = found.get("get_technical_analysis"), found.get("get_volume_profile")
         if not tech or not vp:
@@ -1528,6 +1533,17 @@ class AceQueryEngine:
         except Exception as exc:  # 評分失敗只少一張卡，不影響回答
             self.log(f"型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
             return {}
+
+    def _mark_table_branches(self, panel: Dict[str, Any], card: Dict[str, Any]) -> None:
+        """K 線標註補上「追蹤分點動向」表的分點，避免表上持有中、K 線卻沒標（例如非高勝率分點）。"""
+        names = [b["branch"] for b in card.get("tracked_branches") or [] if b.get("branch")]
+        bars = panel.get("bars") or []
+        if not names or not bars:
+            return
+        try:
+            panel["marks"] = tools.chart_marks_for_stock(panel["stock_code"], [b["date"] for b in bars], extra_branches=names)
+        except Exception as exc:  # 補標失敗就保留原本的高勝率標註
+            self.log(f"K 線補標分點略過：{panel['stock_code']}｜{type(exc).__name__}: {exc}")
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
         cancel_event = threading.Event()

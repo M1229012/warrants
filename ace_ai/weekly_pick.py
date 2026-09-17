@@ -7,7 +7,7 @@
     Stage 1  回測官方 A～E 事件表 → 最近 N 個交易日有事件的「分點 × 股票」
     Stage 2  分點 × 本次事件的歷史績效（Bayesian 修正勝率）＋ 事件買進金額 → 預排序，縮到 10～20 檔
     Stage 3  只對候選抓技術面、大量區、分點近期操作（含 MoneyDJ 近20日流水）
-    Score    事件績效 25 ＋ 近期操作 10 ＋ 權證金額 25 ＋ 技術型態 25 ＋ 支撐 15 ＝ 100
+    Score    事件績效 25 ＋ 近期操作 10 ＋ 權證金額 25 ＋ 型態評分 40（100 分制型態分數 × 0.4）＝ 100
     TOP5     由 Python 決定，Gemini 只負責解釋（正常 1 次呼叫）
 
 新聞不列入分數；只有 Discord AI 已有新聞快取時才附上補充。
@@ -355,152 +355,213 @@ def _technical_extras(stock_code: str) -> Dict[str, Any]:
     }
 
 
-def score_technical(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, Any], config: WeeklyPickConfig) -> Tuple[float, List[str], Dict[str, bool]]:
-    """D. 技術型態（25）：基準 12.5，依均線、MA20 位置、大量區型態、布林與追高風險加減。"""
-    score, reasons, marks = 12.5, ["基準 12.5"], {"extended": False, "overhead": False}
+# ============================================================
+# 型態評分（100 分制；本週精選與一般問答共用）
+# 五大項各自從 0 分算到滿分，全部滿分＝100；同一件事只在一個項目計分。
+#   均線趨勢 30｜價格位置 20｜量區結構 25｜下方支撐 15｜布林 10
+# ============================================================
+
+PATTERN_GRADES = ((70.0, "結構偏強"), (40.0, "結構中性"), (0.0, "結構偏弱"))
+PATTERN_WEIGHT = 40.0  # 本週精選綜合分數中型態評分的權重
+PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構", 25), ("下方支撐", 15), ("布林", 10))
+
+
+def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
+    """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
+    now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
+    if not now:
+        return full / 2, "資料不足，給一半"
+    if now == "上揚":
+        if turn == "轉下彎":
+            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，收盤不變第 {day} 日起轉下彎"
+        return full, "上揚，扣抵後仍續揚"
+    if now == "下彎":
+        if turn == "轉上揚":
+            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，收盤不變第 {day} 日起轉上揚"
+        return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
+    if turn == "轉上揚":
+        return round(full * 0.7, 1), f"走平，收盤不變第 {day} 日起轉上揚"
+    if turn == "轉下彎":
+        return round(full * 0.2, 1), f"走平，收盤不變第 {day} 日起轉下彎"
+    return full / 2, "走平"
+
+
+def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, Any], config: WeeklyPickConfig) -> Dict[str, Any]:
+    """回傳 {score, components, items, marks}；items 每筆＝（項目, 小項, 得分, 滿分, 說明）。"""
+    marks = {"extended": False, "overhead": False}
+    items: List[Dict[str, Any]] = []
+
+    def add(component: str, label: str, points: float, maximum: float, note: str) -> None:
+        items.append({"component": component, "label": label, "points": round(max(0.0, min(maximum, points)), 1),
+                      "max": maximum, "note": note})
+
+    # ---------- 均線趨勢 30：排列 12＋MA20 方向 10＋MA60 方向 8 ----------
     mas = tech.get("moving_averages") or {}
     values = {k: _f((mas.get(k) or {}).get("value")) for k in ("MA5", "MA10", "MA20", "MA60")}
     alignment = tech.get("ma_alignment", "")
     if alignment == "多頭排列":
-        score += 5
-        reasons.append("MA5>MA10>MA20>MA60 +5")
-    elif None not in (values["MA5"], values["MA10"], values["MA20"]) and values["MA5"] > values["MA10"] > values["MA20"]:
-        score += 3
-        reasons.append("MA5>MA10>MA20 +3")
+        add("均線趨勢", "均線排列", 12, 12, "多頭排列 MA5>MA10>MA20>MA60")
     elif alignment == "空頭排列":
-        score -= 6
-        reasons.append("空頭排列 -6")
-    positions = [(mas.get(k) or {}).get("position") for k in ("MA5", "MA10", "MA20", "MA60")]
-    if positions and all(p == "跌破" for p in positions):
-        score -= 5
-        reasons.append("全面跌破 MA5/10/20/60 -5")
+        add("均線趨勢", "均線排列", 0, 12, "空頭排列 MA5<MA10<MA20<MA60")
+    elif None not in (values["MA5"], values["MA10"], values["MA20"]) and values["MA5"] > values["MA10"] > values["MA20"]:
+        add("均線趨勢", "均線排列", 8, 12, "短期多頭 MA5>MA10>MA20，MA60 尚未排好")
+    elif None not in (values["MA5"], values["MA10"], values["MA20"]) and values["MA5"] < values["MA10"] < values["MA20"]:
+        add("均線趨勢", "均線排列", 2, 12, "短期空頭 MA5<MA10<MA20")
+    elif alignment == "資料不足":
+        add("均線趨勢", "均線排列", 6, 12, "均線資料不足，給一半")
+    else:
+        add("均線趨勢", "均線排列", 4, 12, "均線糾結")
+    deduction = tech.get("ma_deduction") or {}
+    for key, full in (("MA20", 10), ("MA60", 8)):
+        points, note = _direction_points(deduction.get(key) or {}, full)
+        add("均線趨勢", f"{key} 方向", points, full, f"{key} {note}")
+
+    # ---------- 價格位置 20：距 MA20 12＋站上 MA60 4＋追高風險 4 ----------
     dist20 = _f((mas.get("MA20") or {}).get("distance_pct"))
-    cross = tech.get("ma20_cross_recent_3_days") or {}
-    if cross.get("just_broke_above"):
-        score += 3
-        reasons.append("近3日剛站上 MA20 +3")
-    elif dist20 is not None and 0 <= dist20 <= config.near_ma20_pct:
-        score += 3
-        reasons.append(f"位於 MA20 上方 {dist20:.1f}%（不遠）+3")
-    elif dist20 is not None and config.near_ma20_pct < dist20 <= config.extended_ma20_pct:
-        score += 1
-        reasons.append(f"位於 MA20 上方 {dist20:.1f}% +1")
-    if dist20 is not None and dist20 > config.extended_ma20_pct:
-        score -= 4
+    dist60 = _f((mas.get("MA60") or {}).get("distance_pct"))
+    if dist20 is None:
+        add("價格位置", "距 MA20", 6, 12, "MA20 資料不足，給一半")
+    elif 0 <= dist20 <= config.near_ma20_pct:
+        add("價格位置", "距 MA20", 12, 12, f"在 MA20 上方 {dist20:.1f}%，貼近月線")
+    elif config.near_ma20_pct < dist20 <= config.extended_ma20_pct:
+        add("價格位置", "距 MA20", 8, 12, f"在 MA20 上方 {dist20:.1f}%，稍有乖離")
+    elif dist20 > config.extended_ma20_pct:
         marks["extended"] = True
-        reasons.append(f"距 MA20 {dist20:.1f}% 過遠 -4")
-    elif dist20 is not None and dist20 < 0 and not all(p == "跌破" for p in positions):
-        score -= 3
-        reasons.append(f"跌破 MA20（{dist20:.1f}%）-3")
-
-    max_zone = vp.get("maximum_volume_zone") or {}
-    position = str(vp.get("position_vs_two_zones", ""))
-    above_max = "上方" in str(max_zone.get("close_relation", ""))
-    if vp.get("recent_breakout") and above_max:
-        score += 3
-        reasons.append("近期突破最大量區且站穩 +3")
-        if vp.get("retest_after_breakout"):
-            score += 2
-            reasons.append("突破後回踩未破 +2")
-    if "之上" in position:
-        score += 2
-        reasons.append("股價在兩個大量區之上 +2")
-    elif "之下" in position:
-        score -= 3
-        reasons.append("股價在兩個大量區之下 -3")
-    if vp.get("recent_breakdown") and not above_max:
-        score -= 5
-        reasons.append("近期跌破最大量區且未站回 -5")
-
+        add("價格位置", "距 MA20", 3, 12, f"在 MA20 上方 {dist20:.1f}%，乖離過大")
+    elif dist20 >= -3:
+        add("價格位置", "距 MA20", 5, 12, f"跌破 MA20 {abs(dist20):.1f}%，仍在月線附近")
+    else:
+        add("價格位置", "距 MA20", 0, 12, f"跌破 MA20 {abs(dist20):.1f}%")
+    if dist60 is None:
+        add("價格位置", "MA60", 2, 4, "MA60 資料不足，給一半")
+    else:
+        add("價格位置", "MA60", 4 if dist60 >= 0 else 0, 4, f"{'站上' if dist60 >= 0 else '跌破'} MA60（{dist60:+.1f}%）")
+    chase, notes = 4.0, []
     bb = tech.get("bollinger") or {}
     percent_b = _f(bb.get("percent_b"))
-    if bb.get("position") == "位於中軌與上軌之間":
-        score += 1
-        reasons.append("布林中軌與上軌之間 +1")
-    if extras.get("bb_mid_rising") and bb.get("position") in ("位於中軌與上軌之間", "突破上軌", "收盤位於上軌外"):
-        score += 1
-        reasons.append("布林中軌向上 +1")
-    if percent_b is not None and percent_b > 105:
-        score -= 2
-        marks["extended"] = True
-        reasons.append(f"布林 %B {percent_b:.0f} 上軌乖離過高 -2")
     ret5 = _f(extras.get("return_5d_pct"))
     if ret5 is not None and ret5 > config.surge_5d_pct:
-        score -= 3
+        chase -= 2
         marks["extended"] = True
-        reasons.append(f"近5日已漲 {ret5:.1f}% -3")
+        notes.append(f"近5日已漲 {ret5:.1f}%")
+    if percent_b is not None and percent_b > 105:
+        chase -= 2
+        marks["extended"] = True
+        notes.append(f"布林 %B {percent_b:.0f} 衝出上軌")
     if extras.get("heavy_volume_long_black"):
-        score -= 4
-        reasons.append("爆量長黑 -4")
-    close = _f(vp.get("close"))
+        chase = 0
+        notes.append("爆量長黑")
+    add("價格位置", "追高風險", chase, 4, "、".join(notes) if notes else "沒有急漲、衝出上軌或爆量長黑")
+
+    # ---------- 量區結構 25：相對兩大量區 10＋最大量區事件 9＋上方量區壓力 6 ----------
+    close = _f(vp.get("close")) or _f(tech.get("close"))
+    position = str(vp.get("position_vs_two_zones", ""))
+    if "之上" in position:
+        add("量區結構", "相對兩大量區", 10, 10, "收盤在兩大量區之上")
+    elif "之下" in position:
+        add("量區結構", "相對兩大量區", 0, 10, "收盤在兩大量區之下")
+    elif "之間" in position:
+        add("量區結構", "相對兩大量區", 5, 10, "收盤在兩大量區之間")
+    else:
+        add("量區結構", "相對兩大量區", 5, 10, "量區位置資料不足，給一半")
+    relation = str((vp.get("maximum_volume_zone") or {}).get("close_relation", ""))
+    if "上方" in relation:
+        points, note = 5, "站在最大量區上方"
+        if vp.get("recent_breakout"):
+            points, note = 7, "近期突破最大量區並站穩"
+            if vp.get("retest_after_breakout"):
+                points, note = 9, "近期突破最大量區，回踩未破"
+        add("量區結構", "最大量區", points, 9, note)
+    elif "量區內" in relation:
+        add("量區結構", "最大量區", 3, 9, "在最大量區內整理")
+    elif "下方" in relation:
+        add("量區結構", "最大量區", 0, 9, "近期跌破最大量區且未站回" if vp.get("recent_breakdown") else "在最大量區下方")
+    else:
+        add("量區結構", "最大量區", 4.5, 9, "最大量區資料不足，給一半")
+    overhead = None
     for key in ("maximum_volume_zone", "second_volume_zone"):
         zone = vp.get(key) or {}
         low = _f(zone.get("price_low"))
-        if close and low and low > close and (low / close - 1) * 100 <= config.overhead_zone_pct:
-            score -= 2
-            marks["overhead"] = True
-            reasons.append(f"上方 {zone.get('label')} {low:g} 距離 {((low / close - 1) * 100):.1f}% 形成壓力 -2")
-            break
-    return round(min(25.0, max(0.0, score)), 2), reasons, marks
+        if close and low and low > close:
+            gap = (low / close - 1) * 100
+            if overhead is None or gap < overhead[0]:
+                overhead = (gap, zone.get("label") or "大量區", low)
+    if overhead is None:
+        add("量區結構", "上方量區壓力", 6, 6, "上方沒有大量區")
+    elif overhead[0] <= config.overhead_zone_pct:
+        marks["overhead"] = True
+        add("量區結構", "上方量區壓力", 0, 6, f"上方{overhead[1]} {overhead[2]:g} 只差 {overhead[0]:.1f}%，形成壓力")
+    else:
+        add("量區結構", "上方量區壓力", 3, 6, f"上方{overhead[1]} {overhead[2]:g} 距離 {overhead[0]:.1f}%")
+
+    # ---------- 下方支撐 15：最近支撐距離 11＋8% 內支撐數 4 ----------
+    supports = []
+    if close:
+        for label, level in (("MA20", values["MA20"]), ("MA60", values["MA60"])):
+            if level and level <= close:
+                supports.append(((close / level - 1) * 100, label))
+        for key in ("maximum_volume_zone", "second_volume_zone"):
+            zone = vp.get(key) or {}
+            low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
+            if low is None or high is None:
+                continue
+            if high <= close:
+                supports.append(((close / high - 1) * 100, f"{zone.get('label') or '大量區'}上緣"))
+            elif low <= close:
+                supports.append((0.0, f"{zone.get('label') or '大量區'}（股價在區內）"))
+    if supports:
+        gap, label = min(supports)
+        points = 11 if gap <= 3 else 9 if gap <= 5 else 6 if gap <= config.support_zone_pct else 3 if gap <= 12 else 1
+        add("下方支撐", "最近支撐", points, 11, f"最近支撐 {label} 在下方 {gap:.1f}%")
+        near = sorted({lb for g, lb in supports if g <= config.support_zone_pct})
+        count_points = 4 if len(near) >= 3 else 2 if len(near) == 2 else 0
+        add("下方支撐", "支撐密度", count_points, 4,
+            f"下方 {config.support_zone_pct:g}% 內有 {len(near)} 道支撐" + (f"（{'、'.join(near)}）" if near else ""))
+    else:
+        add("下方支撐", "最近支撐", 0, 11, "下方沒有均線或大量區支撐")
+        add("下方支撐", "支撐密度", 0, 4, "下方沒有支撐")
+
+    # ---------- 布林 10：位置 5＋通道狀態 5（中軌方向已算在 MA20，不重複） ----------
+    bb_position = str(bb.get("position", ""))
+    bb_points = {"位於中軌與上軌之間": 5, "收盤位於上軌外": 3, "突破上軌": 3, "位於下軌與中軌之間": 2}.get(bb_position, 0)
+    add("布林", "通道位置", bb_points if bb_position != "資料不足" else 2.5, 5, bb_position or "資料不足")
+    walk, squeeze_break, width_trend = bb.get("band_walk"), bb.get("squeeze_breakout"), bb.get("width_trend")
+    above_mid = bb_position in ("位於中軌與上軌之間", "收盤位於上軌外", "突破上軌")
+    if walk == "沿上軌" or squeeze_break == "壓縮後向上突破":
+        add("布林", "通道狀態", 5, 5, "沿上軌" if walk == "沿上軌" else "壓縮後向上突破")
+    elif walk == "沿下軌" or squeeze_break == "壓縮後向下跌破":
+        add("布林", "通道狀態", 0, 5, "沿下軌" if walk == "沿下軌" else "壓縮後向下跌破")
+    elif width_trend == "擴張":
+        add("布林", "通道狀態", 4 if above_mid else 1, 5, f"帶寬擴張，股價在中軌{'上方' if above_mid else '下方'}")
+    elif width_trend in ("收窄", "持平") or bb.get("squeeze"):
+        add("布林", "通道狀態", 3, 5, "帶寬收斂／持平，方向未定")
+    else:
+        add("布林", "通道狀態", 2.5, 5, "布林資料不足，給一半")
+
+    components = []
+    for name, maximum in PATTERN_COMPONENTS:
+        value = round(sum(i["points"] for i in items if i["component"] == name), 1)
+        components.append({"label": name, "value": value, "max": maximum})
+    return {
+        "score": round(sum(c["value"] for c in components), 1),
+        "components": components,
+        "items": items,
+        "marks": marks,
+    }
 
 
-def score_support(tech: Dict[str, Any], vp: Dict[str, Any], config: WeeklyPickConfig) -> Tuple[float, List[str]]:
-    """E. 支撐品質（15）：MA20 5 ＋ MA60 3 ＋ 最大量區 4 ＋ 第二大量區 3。"""
-    score, reasons = 0.0, []
-    mas = tech.get("moving_averages") or {}
-    dist20 = _f((mas.get("MA20") or {}).get("distance_pct"))
-    dist60 = _f((mas.get("MA60") or {}).get("distance_pct"))
-    if dist20 is not None and 0 <= dist20 <= 3:
-        score += 5
-        reasons.append(f"MA20 在下方 {dist20:.1f}% +5")
-    elif dist20 is not None and 3 < dist20 <= 6:
-        score += 3
-        reasons.append(f"MA20 在下方 {dist20:.1f}% +3")
-    elif dist20 is not None and 6 < dist20 <= 10:
-        score += 1
-        reasons.append(f"MA20 在下方 {dist20:.1f}% +1")
-    if dist60 is not None and 0 <= dist60 <= 8:
-        score += 3
-        reasons.append(f"MA60 在下方 {dist60:.1f}% +3")
-    elif dist60 is not None and dist60 > 8:
-        score += 1
-        reasons.append(f"MA60 在下方較遠（{dist60:.1f}%）+1")
-    close = _f(vp.get("close"))
-    for key, near_points, far_points, inside_points in (("maximum_volume_zone", 4, 2, 2), ("second_volume_zone", 3, 1, 1)):
-        zone = vp.get(key) or {}
-        low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
-        if not close or low is None or high is None:
-            continue
-        if high <= close:
-            gap = (close / high - 1) * 100
-            points = near_points if gap <= config.support_zone_pct else far_points
-            score += points
-            reasons.append(f"{zone.get('label')} {low:g}～{high:g} 在下方 {gap:.1f}% +{points}")
-        elif low <= close <= high:
-            score += inside_points
-            reasons.append(f"股價位於{zone.get('label')}內 +{inside_points}")
-    if not reasons:
-        reasons.append("下方沒有明確支撐")
-    return round(min(15.0, score), 2), reasons
+
+def pattern_reason_lists(items: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    """得分依據＝拿到一半以上的小項；失分原因＝拿不到一半的小項（每個小項只出現一次）。"""
+    good, bad = [], []
+    for item in items:
+        text = f"{item['note']}（{item['label']} {item['points']:g}/{item['max']:g}）"
+        (good if item["points"] >= item["max"] / 2 else bad).append(text)
+    return good, bad
 
 
-# ============================================================
-# 個股型態評分卡（一般問答「型態／成本／操作」類問題用；沿用本週精選的技術型態＋支撐品質規則）
-# ============================================================
-
-PATTERN_GRADES = ((70.0, "結構偏強"), (45.0, "結構中性"), (0.0, "結構偏弱"))
-_REASON_POINTS_RE = re.compile(r"\s([+-]\d+(?:\.\d+)?)$")
-
-
-def _split_reasons(reasons: List[str]) -> Tuple[List[str], List[str]]:
-    """「MA5>MA10>MA20 +3」→ 加分；「跌破 MA20（-2.1%）-3」→ 扣分；基準與無分數說明略過。"""
-    plus, minus = [], []
-    for reason in reasons:
-        match = _REASON_POINTS_RE.search(reason)
-        if not match:
-            continue
-        (plus if float(match.group(1)) > 0 else minus).append(reason)
-    return plus, minus
+def pattern_grade(score: float) -> str:
+    return next(label for floor, label in PATTERN_GRADES if score >= floor)
 
 
 def _branch_status(row: Dict[str, Any]) -> str:
@@ -520,13 +581,10 @@ def build_pattern_scorecard(
     cost_price: Optional[float] = None,
     config: Optional[WeeklyPickConfig] = None,
 ) -> Dict[str, Any]:
-    """型態分數＝（技術型態 25 ＋ 支撐品質 15）換算成 100 分；只評技術結構，不含權證籌碼、不是買賣建議。"""
+    """一般問答的型態評分卡：分數規則與本週精選相同（score_pattern）；只評技術結構，不含權證籌碼、不是買賣建議。"""
     config = config or WeeklyPickConfig()
-    technical, tech_reasons, _marks = score_technical(tech, vp, extras, config)
-    support, support_reasons = score_support(tech, vp, config)
-    score = round((technical + support) / 40 * 100, 1)
-    grade = next(label for floor, label in PATTERN_GRADES if score >= floor)
-    plus, minus = _split_reasons(tech_reasons + support_reasons)
+    pattern = score_pattern(tech, vp, extras, config)
+    good, bad = pattern_reason_lists(pattern["items"])
     levels = tools.key_price_levels(tech, vp)
     close = levels["close"]
     branches = []
@@ -547,22 +605,20 @@ def build_pattern_scorecard(
     card = {
         "stock_code": tech.get("stock_code") or vp.get("stock_code", ""),
         "data_date": tech.get("data_date"),
-        "pattern_score": score,
-        "grade": grade,
-        "technical_score": technical,
-        "technical_max": 25,
-        "support_score": support,
-        "support_max": 15,
-        "plus_reasons": plus,
-        "minus_reasons": minus,
+        "pattern_score": pattern["score"],
+        "grade": pattern_grade(pattern["score"]),
+        "components": pattern["components"],
+        "plus_reasons": good,
+        "minus_reasons": bad,
         "pattern_label": vp.get("pattern_label") or "型態資料不足",
         "ma_alignment": tech.get("ma_alignment", ""),
+        "ma_deduction": tech.get("ma_deduction") or {},
         "close": close,
         "resistances_above_close": levels["resistances"],
         "supports_below_close": levels["supports"],
         "tracked_branches": branches,
         "tracked_branches_period": (chips or {}).get("period_lookback", ""),
-        "method": "型態分數＝（技術型態 25 分＋支撐品質 15 分）÷ 40 × 100，規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
+        "method": "型態分數 100 分＝均線趨勢 30＋價格位置 20＋量區結構 25＋下方支撐 15＋布林 10，每項從 0 分算起，規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
     }
     if cost_price:
         card["cost_price"] = tools._num(cost_price)
@@ -708,13 +764,18 @@ class WeeklyPickEngine:
         breakdown["event_performance_score"], reasons["event_performance"] = lead["event_score"], lead["event_score_reasons"]
         breakdown["recent_branch_behavior_score"], reasons["recent_branch_behavior"] = score_recent_behavior(behavior, config)
         breakdown["warrant_amount_score"], reasons["warrant_amount"] = score_warrant_amount(stock, lead_live)
+        # 型態評分（100 分制，與一般問答共用）換算成 40 分計入綜合分數。
+        pattern: Dict[str, Any] = {}
         if tech and vp:
-            breakdown["technical_score"], reasons["technical"], marks = score_technical(tech, vp, extras, config)
-            breakdown["support_score"], reasons["support"] = score_support(tech, vp, config)
+            pattern = score_pattern(tech, vp, extras, config)
+            breakdown["pattern_score"] = round(pattern["score"] * PATTERN_WEIGHT / 100, 2)
+            good, bad = pattern_reason_lists(pattern["items"])
+            reasons["pattern"] = good + bad
+            marks = pattern["marks"]
         else:
-            breakdown["technical_score"], reasons["technical"], marks = 0.0, ["技術資料取得失敗"], {"extended": False, "overhead": False}
-            breakdown["support_score"], reasons["support"] = 0.0, ["技術資料取得失敗"]
+            breakdown["pattern_score"], reasons["pattern"], marks = 0.0, ["技術資料取得失敗"], {"extended": False, "overhead": False}
         total = round(sum(breakdown.values()), 1)
+        support_points = next((c["value"] for c in pattern.get("components", []) if c["label"] == "下方支撐"), 0.0)
 
         n = lead["matched_included_count"] or 0
         adj = lead["matched_adjusted_win_rate"] or 0
@@ -740,11 +801,11 @@ class WeeklyPickEngine:
             flags.add("overhead_resistance")
         if lead_live.get("reducing_recently"):
             flags.add("branch_recently_reducing")
-        if (breakdown["event_performance_score"] >= 18 and breakdown["technical_score"] <= 8) or (
+        if (breakdown["event_performance_score"] >= 18 and pattern.get("score", 0) < 40) or (
             lead_live.get("has_trades") and (_f(lead_live.get("net_buy_5d")) or 0) <= 0
         ):
             flags.add("conflicting_signals")
-        if breakdown["support_score"] >= 11:
+        if support_points >= 11:
             flags.add("strong_support")
         if stock["high_quality_branch_count"] >= 2:
             flags.add("multi_branch_confirmation")
@@ -753,6 +814,7 @@ class WeeklyPickEngine:
             "score": total,
             "score_breakdown": breakdown,
             "score_reasons": reasons,
+            "pattern": pattern,
             "quality_flags": sorted(flags),
             "behavior": behavior,
             "technical": tech,
@@ -813,8 +875,8 @@ class WeeklyPickEngine:
         )
         self.log(
             f"   event_performance_score = {b['event_performance_score']} / 25｜recent_branch_behavior_score = {b['recent_branch_behavior_score']} / 10｜"
-            f"warrant_amount_score = {b['warrant_amount_score']} / 25｜technical_score = {b['technical_score']} / 25｜"
-            f"support_score = {b['support_score']} / 15｜total = {stock['score']} / 100"
+            f"warrant_amount_score = {b['warrant_amount_score']} / 25｜pattern_score = {b['pattern_score']} / {PATTERN_WEIGHT:g}"
+            f"（型態 {(stock.get('pattern') or {}).get('score')} / 100）｜total = {stock['score']} / 100"
         )
         self.log(f"   flags={stock['quality_flags']}")
 
@@ -930,8 +992,10 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
             "pattern_label": vp.get("pattern_label"),
             "recent_maximum_zone_event": vp.get("recent_maximum_zone_event"),
         },
-        "support_reasons": (stock.get("score_reasons") or {}).get("support"),
-        "technical_reasons": (stock.get("score_reasons") or {}).get("technical"),
+        "pattern_score_100": (stock.get("pattern") or {}).get("score"),
+        "pattern_grade": pattern_grade((stock.get("pattern") or {}).get("score") or 0),
+        "pattern_components": (stock.get("pattern") or {}).get("components"),
+        "pattern_reasons": (stock.get("score_reasons") or {}).get("pattern"),
         "quality_notes": [_FLAG_TEXT.get(f, f) for f in stock["quality_flags"]],
     }
 
@@ -1086,7 +1150,7 @@ def format_rule_based(result: Dict[str, Any]) -> str:
         lines.append(f"{medal} {stock['stock_code']} {stock.get('stock_name', '')}")
         lines.append(
             f"綜合分數：{stock['score']} / 100（事件 {b['event_performance_score']}｜近期 {b['recent_branch_behavior_score']}｜"
-            f"金額 {b['warrant_amount_score']}｜技術 {b['technical_score']}｜支撐 {b['support_score']}）"
+            f"金額 {b['warrant_amount_score']}｜型態 {b['pattern_score']}）"
         )
         lines.append(
             f"【權證】{lead['branch']} 本次事件買進 {lead['event_buy_amount_text']}"
@@ -1139,8 +1203,7 @@ SCORE_PARTS = (
     ("event_performance_score", "事件績效", 25),
     ("recent_branch_behavior_score", "近期操作", 10),
     ("warrant_amount_score", "權證金額", 25),
-    ("technical_score", "技術型態", 25),
-    ("support_score", "支撐品質", 15),
+    ("pattern_score", "型態評分", 40),
 )
 
 
@@ -1384,7 +1447,7 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_cards_v2",
+        "weekly_pick_cards_v3",  # v3：型態評分改 100 分制，舊快取的分數欄位不同
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),
