@@ -495,6 +495,8 @@ class QueryRouter:
                     plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
             if "news" in categories:
                 plan.add("get_recent_news", stock_code=code)
+                # 新聞統整時附上當日收盤與漲跌，讓 AI 能說明股價當下的反應（快取資料，幾乎不增加時間）。
+                plan.add("get_stock_overview", stock_code=code)
         # 權證分點與勝率 join 屬於同一類「籌碼」資料，不因此多呼叫 Gemini。
         groups = {
             "technical": bool(categories & {"technical"}),
@@ -502,7 +504,8 @@ class QueryRouter:
             "chips": bool(categories & {"warrant", "win_rate", "recent_trades"}),
             "news": bool(categories & {"news"}),
         }
-        plan.need_final_llm = analysis or sum(groups.values()) >= 2 or len(parsed.stocks) > 1
+        # 新聞一律交給 AI 統整重點與利多／利空（1 次 Gemini）；只列標題對使用者沒有幫助。
+        plan.need_final_llm = analysis or groups["news"] or sum(groups.values()) >= 2 or len(parsed.stocks) > 1
         return plan
 
     def _pattern_plan(self, parsed: ParsedQuestion) -> QueryPlan:
@@ -803,7 +806,12 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 9. 回答將排進一頁式圖片，約 200～450 個中文字，必要時最多 800 字。每段 1～3 句。
 10. 優先回答使用者真正問的問題，只放相關區塊。
 11. 不提供目標價、報酬預測或「買進／賣出」這類直接指令；但使用者問型態、成本或操作時，不可拒答，必須依序用型態、大量區、均線（再來才是布林與籌碼）給出客觀觀察重點：目前位置、關鍵支撐與壓力價位（只能使用 tool_results 的價位）、以及「若守住／若跌破／若站回」各代表什麼，並寫在【觀察重點】。有成本價時要說明成本相對現價、均線與大量區的位置。
-12. 涉及新聞時，只能引用 tool_results 裡的新聞標題與摘要。
+12. 涉及新聞時，只能引用 tool_results 裡 get_recent_news 的 title、summary、content、summary_points，不可補充其他來源或自己知道的消息。新聞統整規則：
+   - 不要逐條重列標題。先把同一件事（event_key 相同或內容明顯是同一事件的多家報導）合併，整理成 2～4 個重點，每個重點寫清楚：發生什麼事、關鍵數字（金額、比例、時程、產品、客戶，只能用 content／summary 出現過的數字）、消息來源與日期。
+   - 標題中的聳動字眼（例如「暴賺」「超狂」「開炸」）不是事實，不可照抄成結論；法人或分析師的目標價、獲利預估要寫明「某某機構估計」，屬於看法不是事實。
+   - 利多／利空一定要客觀，分開寫：【可能利多】寫新聞中對公司營運有正面影響的具體因素；【可能利空／風險】寫同一批新聞裡的成本、稀釋、整合、競爭、執行時程、資金壓力等風險，新聞沒有提到的風險不可自行推測，沒有就寫「新聞內容未提及明顯利空，但資訊有限」。
+   - 最後【綜合觀察】用 1～2 句說明利多利空的相對份量與還需要確認的資訊（例如交易細節、主管機關核准、完成時程），不可下「買進／賣出」或「一定漲／跌」的結論；有 get_stock_overview 時可說明資料日收盤與漲跌幅作為市場當下反應，但不可推論因果。
+   - content_source 為「RSS 摘要」時內容較少，要避免過度解讀。
 13. 不要把「買超」直接等同「看多必漲」。
 14. 不要把「高歷史勝率」直接說成這次一定成功。
 15. 技術面必須參考 bollinger 的 position、signals、width_trend、squeeze、sideways、band_walk 與 breakout 旗標；問題提到布林時使用【布林觀察】區塊。
@@ -820,7 +828,7 @@ FINAL_SYSTEM_PROMPT = """你是「艾斯 AI 台股資料分析助手」。
 
 輸出格式（圖片內文，不要用表格、不要用程式碼區塊）：
 第一行：**股票名稱（代號）** 或 **分點名稱**
-接著只放相關區塊。型態、成本、操作類問題依序使用：【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞】、【綜合觀察】
+接著只放相關區塊。型態、成本、操作類問題依序使用：【型態】、【均線與大量區】、【布林】、【籌碼】、【觀察重點】；只問新聞的問題依序使用：【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】；其他問題依序使用：【籌碼】、【技術面】、【大量區】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】（沒有新聞資料就省略新聞相關區塊）
 最後一行：「資料時間：」列出各類資料的日期或統計期間。"""
 
 
@@ -1111,7 +1119,10 @@ def format_news(d: Dict[str, Any]) -> str:
     for point in d.get("summary_points") or []:
         lines.append(f"• {point}")
     for item in (d.get("articles") or [])[:5]:
-        lines.append(f"• {item.get('date')}｜{item.get('title')}（{item.get('source')}）")
+        date = f"{item['date']}｜" if item.get("date") else ""
+        lines.append(f"• {date}{item.get('title')}（{item.get('source')}）")
+        if item.get("summary") and item.get("summary") != item.get("title"):
+            lines.append(f"　{item['summary']}")
     return "\n".join(lines)
 
 

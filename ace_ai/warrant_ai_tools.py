@@ -78,6 +78,11 @@ SMALL_SAMPLE_EVENTS = _env_int("DISCORD_AI_SMALL_SAMPLE_EVENTS", 10)
 SHEET_QUERY_MAX_ROWS = 100
 NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 5)
 NEWS_SUMMARY_MAX_CHARS = 160
+# 新聞內文：只對前幾篇抓原文，並只保留和本公司有關的段落，限制長度給 Gemini 統整。
+NEWS_BODY_FETCH_ENABLE = os.getenv("DISCORD_AI_NEWS_BODY_FETCH_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+NEWS_BODY_FETCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_FETCH_TIMEOUT", 6.0)
+NEWS_BODY_FETCH_MAX_BYTES = _env_int("DISCORD_AI_NEWS_BODY_FETCH_MAX_BYTES", 600_000)
+NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 900)
 TEXT_CELL_MAX_CHARS = 120
 
 # Bot 行程強制唯讀。這些值只影響 Discord Bot 自己的 process，不影響 GitHub Actions。
@@ -1751,41 +1756,65 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
     if not name:
         raise ToolDataError(f"查不到 {code} 的公司名稱，無法安全比對新聞")
 
+    def article_content(article: Dict[str, Any], title: str, description: str) -> Tuple[str, str]:
+        """（內容, 來源）：先抓原文並只留本公司相關段落；抓不到就用 RSS 摘要。"""
+        body = ""
+        if article.get("body_ok"):
+            body = str(article.get("content", "") or "")
+        elif NEWS_BODY_FETCH_ENABLE and article.get("url"):
+            try:
+                body = kf._fetch_article_body(
+                    article["url"], request_timeout=NEWS_BODY_FETCH_TIMEOUT,
+                    max_bytes=NEWS_BODY_FETCH_MAX_BYTES, hard_deadline_seconds=NEWS_BODY_FETCH_TIMEOUT,
+                )
+            except Exception as exc:  # 單篇原文失敗就退回摘要
+                print(f"⚠️ Discord AI 新聞原文略過：{title}｜{type(exc).__name__}: {exc}", flush=True)
+                body = ""
+            if body and not kf._is_valid_article_body(body, title=title, description=description):
+                body = ""
+        if body:
+            focused = kf._normalize_news_text(kf._extract_target_focused_news_body(body, code, name))
+            if len(focused) >= 60:
+                return _truncate(focused, NEWS_CONTENT_MAX_CHARS), "原文（本公司相關段落）"
+        return _truncate(description, NEWS_CONTENT_MAX_CHARS), "RSS 摘要"
+
     def build() -> Dict[str, Any]:
         cached_points = kf._load_gsheet_news_points_cache_for_display(code, name, allow_stale=False)
-        if cached_points:
-            return {
-                "stock_code": code,
-                "stock_name": name,
-                "source_type": "週報當日新聞重點快取（已通過既有 grounding 驗證）",
-                "summary_points": list(cached_points)[:3],
-                "articles": [],
-            }
         articles = kf.fetch_multi_source_news_articles(code, name, max_items=kf.NEWS_GOOGLE_MAX_ITEMS)
         articles = kf._dedupe_news_articles_by_event(
             list(articles or []), code, name, log_label="Discord AI 新聞"
         )
-        items = []
+        picked = []
         for article in articles:
             title = kf._clean_news_title(article.get("title", ""))
-            summary = kf._normalize_news_text(article.get("description", "") or article.get("content", ""))
-            if not title or kf._is_price_only_news_without_fundamentals(f"{title} {summary}"):
+            description = kf._normalize_news_text(article.get("description", "") or article.get("content", ""))
+            if not title or kf._is_price_only_news_without_fundamentals(f"{title} {description}"):
                 continue
+            picked.append((article, title, description))
+            if len(picked) >= max(1, int(limit)):
+                break
+        # 原文並行抓取（每篇有硬截止時間），總等待約等於單篇逾時。
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max(1, len(picked)), thread_name_prefix="ace-news") as pool:
+            contents = list(pool.map(lambda p: article_content(*p), picked)) if picked else []
+        items = []
+        for (article, title, description), (content, content_source) in zip(picked, contents):
             items.append({
                 "date": _news_date(article.get("published", "")),
                 "title": title,
                 "source": str(article.get("source", "") or ""),
-                "summary": _truncate(summary, NEWS_SUMMARY_MAX_CHARS),
+                "summary": _truncate(description, NEWS_SUMMARY_MAX_CHARS),
+                "content": content,
+                "content_source": content_source,
                 "url": str(article.get("url", "") or ""),
                 "event_key": kf._news_article_event_key(article, code, name),
             })
-            if len(items) >= max(1, int(limit)):
-                break
         return {
             "stock_code": code,
             "stock_name": name,
-            "source_type": "既有六來源新聞管線（公司主體過濾＋事件去重，未經 Gemini 摘要）",
-            "summary_points": [],
+            "source_type": "既有六來源新聞管線（公司主體過濾＋事件去重）；前幾篇嘗試抓原文並只留本公司相關段落",
+            "summary_points": list(cached_points or [])[:3],
+            "summary_points_source": "週報當日新聞重點快取（已通過既有 grounding 驗證）" if cached_points else "",
             "articles": items,
         }
 

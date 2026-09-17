@@ -946,7 +946,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     cursor = y + 30
     for block in blocks:
         if block.kind == 'heading':
-            draw.rectangle((MARGIN + 30, cursor + 4, MARGIN + 34, cursor + 29), fill=ACCENT)
+            # 利多／利空區塊用台股慣用紅／綠色條區分，其餘維持金色。
+            heading = ''.join(block.lines)
+            bar = DOWN if '利空' in heading else UP if '利多' in heading else ACCENT
+            draw.rectangle((MARGIN + 30, cursor + 4, MARGIN + 34, cursor + 29), fill=bar)
             for i, line in enumerate(block.lines):
                 text_at(draw, (MARGIN + 48, cursor + i * 42), line, 29, bold=True)
         else:
