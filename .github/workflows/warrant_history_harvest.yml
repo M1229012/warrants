@@ -98,6 +98,10 @@ jobs:
               tar -xzf /tmp/warrant_cache.tar.gz -C output/
               echo "已還原工作快取"
             fi
+            # 上一段的回補紀錄一還原就刪掉。
+            # 這一段如果在回補之前就失敗，接續步驟不能拿上一段的「有進度」
+            # 去觸發下一段 —— 那會在同一個錯誤上空轉到 MAX_CHAIN。
+            rm -f output/warrant_cache/backfill/last_run.json
           else
             echo "還沒有 $STORE_TAG release，這是第一次執行"
           fi
@@ -105,15 +109,21 @@ jobs:
           ls -la output/warrant_history_store/ output/warrant_history_store/ohlcv/ || true
           du -sh output/warrant_cache/ 2>/dev/null || true
 
-      # ── 參考資料先抓：backfill 要靠 OHLCV 建立 2023–2025 的歷史權證母體 ──
-      - name: 抓參考資料（權證靜態屬性 ＋ 全市場 OHLCV）
+      # ── 以下每一步都用 !cancelled()：任何一步失敗都不該擋住後面彼此獨立的步驟 ──
+      # （2026-09-17 靜態屬性寫入失敗，回補步驟因此被整個跳過。）
+
+      - name: 抓權證靜態屬性
+        if: ${{ !cancelled() }}
         run: |
-          # 靜態屬性每天抓：t187ap37_L 只列現行有效權證，
-          # 已到期權證的履約價事後補不回來。
+          # t187ap37_L 只列現行有效權證，已到期權證的履約價事後補不回來，所以每天抓。
           python warrant_harvest/warrant_reference_harvest.py meta
 
+      # backfill 要靠 OHLCV 建立 2023–2025 的歷史權證母體，所以排在回補前面
+      - name: 抓全市場 OHLCV
+        if: ${{ !cancelled() }}
+        run: |
           if [ "${{ github.event.inputs.mode }}" = "backfill" ]; then
-            # 已抓過的日期會自動跳過；第一次約 40 分鐘，之後幾乎是零
+            # 已抓過的日期會自動跳過；第一次約 80 分鐘，之後幾乎是零
             python warrant_harvest/warrant_reference_harvest.py ohlcv --start 2023/09/11
           else
             python warrant_harvest/warrant_reference_harvest.py ohlcv --recent 10
@@ -121,11 +131,8 @@ jobs:
           python warrant_harvest/warrant_reference_harvest.py report
 
       - name: 深度回補（backfill）
-        if: github.event.inputs.mode == 'backfill'
+        if: ${{ !cancelled() && github.event.inputs.mode == 'backfill' }}
         run: |
-          # 先刪掉上一段留下的紀錄：這一段若因時間不足而沒跑，
-          # 不能拿上一段的「有進度」去觸發下一段，否則會變成空轉迴圈。
-          rm -f output/warrant_cache/backfill/last_run.json
           # 時間預算＝ job 上限 − 已用掉的 − 收尾保留。
           # 由 workflow 算而不是寫死，因為 OHLCV 第一次跟之後的耗時差很多。
           elapsed=$(( ( $(date +%s) - JOB_START_EPOCH ) / 60 ))
@@ -138,7 +145,7 @@ jobs:
           fi
 
       - name: 每日增量（daily）
-        if: github.event.inputs.mode != 'backfill'
+        if: ${{ !cancelled() && github.event.inputs.mode != 'backfill' }}
         env:
           GSHEET_RESULT_ENABLED: "0"
           GSHEET_CACHE_ENABLED: "0"
