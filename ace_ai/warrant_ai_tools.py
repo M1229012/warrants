@@ -454,7 +454,7 @@ def get_known_branches() -> Dict[str, str]:
     if hit:
         return cached
 
-    def build() -> Dict[str, str]:
+    def build() -> Tuple[Dict[str, str], int]:
         kf = core()
         aliases: Dict[str, str] = {}
 
@@ -467,10 +467,12 @@ def get_known_branches() -> Dict[str, str]:
             if display_norm:
                 aliases.setdefault(display_norm, canonical)
 
+        sheet_sources_ok = 0
         try:
             perf = _read_branch_perf_df()
             for _, row in perf.iterrows():
                 add(row.get("branch", ""), row.get("branch_display", ""))
+            sheet_sources_ok += 1
         except Exception as exc:
             print(f"⚠️ Discord AI 分點清單（勝率統計）讀取失敗：{type(exc).__name__}: {exc}")
         for title in ("快取_近10日分點買賣明細", "股票ABCDE查詢資料"):
@@ -480,12 +482,25 @@ def get_known_branches() -> Dict[str, str]:
                     names = table.get("分點名稱", pd.Series([""] * len(table)))
                     for branch, display in set(zip(table["分點"], names)):
                         add(branch, display)
+                sheet_sources_ok += 1
             except Exception as exc:
                 print(f"⚠️ Discord AI 分點清單（{title}）讀取失敗：{type(exc).__name__}: {exc}")
-        return aliases
+        # 官方證券商分點名冊（repo 內 securities_trader_seed.csv.gz，不依賴 Google Sheet）。
+        # 只收「券商-分點」層級；總公司簡稱（例如「永豐金」）與股票名稱容易撞名，不列入。
+        seed_count = 0
+        try:
+            for name in kf._load_trader_name_map().values():
+                if "-" in str(name) and len(kf.normalize_branch_name(name)) >= 3:
+                    add(name)
+                    seed_count += 1
+        except Exception as exc:
+            print(f"⚠️ Discord AI 官方分點名冊讀取失敗：{type(exc).__name__}: {exc}")
+        print(f"📋 Discord AI 分點清單：{len(set(aliases.values())):,} 個分點｜Google Sheet 來源成功 {sheet_sources_ok}/3｜官方名冊 {seed_count:,} 筆")
+        return aliases, sheet_sources_ok
 
-    aliases = build()
-    CACHE.set("known_branches", aliases, TTL_BRANCH_PERF_SECONDS if aliases else 120)
+    aliases, sheet_sources_ok = build()
+    # Sheet 全部讀取失敗時只快取 5 分鐘，之後重試；官方名冊部分仍可正常辨識分點。
+    CACHE.set("known_branches", aliases, TTL_BRANCH_PERF_SECONDS if sheet_sources_ok else 300)
     return aliases
 
 
