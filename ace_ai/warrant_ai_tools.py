@@ -2717,6 +2717,89 @@ def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 2
     }
 
 
+TOP_WARRANT_LIMIT = _env_int("DISCORD_AI_TOP_WARRANT_LIMIT", 5)
+TOP15_SHEET = "快取_TOP15共識淨買超"
+TOP15_SCOPE = os.getenv("DISCORD_AI_TOP15_SCOPE", "全分點").strip() or "全分點"
+
+
+def _sheet_number(value: Any) -> Optional[float]:
+    text = _clean_cell(value).replace(",", "").replace("%", "").replace("*", "").strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _top15_return_text(row: Any) -> str:
+    """報酬率欄位有時是「-15.65%*」文字、有時是 -0.0404 這種比例，統一成百分比文字（*＝含備援估價）。"""
+    text = _clean_cell(row.get("報酬率文字", ""))
+    if "%" in text:
+        return text
+    number = _sheet_number(row.get("報酬率文字")) if text else None
+    if number is None:
+        number = _sheet_number(row.get("報酬率"))
+    if number is None:
+        return ""
+    if abs(number) <= 1:  # 比例（-0.0404）轉成百分比
+        number *= 100
+    return f"{number:+.2f}%"
+
+
+def get_top_warrant_buy_stocks(limit: int = TOP_WARRANT_LIMIT) -> Dict[str, Any]:
+    """權證共識淨買超排行：直接讀使用者統計好的「快取_TOP15共識淨買超」，取統計日期最新的一批（預設資料範圍＝全分點）。"""
+    kf = core()
+    limit = max(1, min(int(limit or TOP_WARRANT_LIMIT), 15))
+    df = read_sheet_table(TOP15_SHEET)["df"].copy()
+    required = {"資料範圍", "統計日期", "排名", "標的股"}
+    if df.empty or not required.issubset(df.columns):
+        raise SheetUnavailableError(f"{TOP15_SHEET} 沒有資料或欄位不足")
+    df["_date"] = df["統計日期"].map(_parse_sheet_date)
+    df["_rank"] = df["排名"].map(_sheet_number)
+    scoped = df[(df["資料範圍"].map(_clean_cell) == TOP15_SCOPE) & df["_date"].notna() & df["_rank"].notna()]
+    if scoped.empty:
+        raise SheetUnavailableError(f"{TOP15_SHEET} 沒有「{TOP15_SCOPE}」的資料")
+    latest_date = scoped["_date"].max()
+    latest = scoped[scoped["_date"] == latest_date]
+    if "更新時間" in latest.columns and "run_id" in latest.columns:
+        # 同一統計日期若重跑多次，只取最後一次 run 的結果。
+        last_run = latest.sort_values("更新時間")["run_id"].iloc[-1]
+        latest = latest[latest["run_id"] == last_run]
+    latest = latest.sort_values("_rank").drop_duplicates(subset=["標的股"], keep="first").head(limit)
+    high, selected = display_branch_set()
+    rows = []
+    for _, r in latest.iterrows():
+        branches = []
+        for line in [x.strip() for x in _clean_cell(r.get("參與分點明細", "")).split("\n") if x.strip()][:3]:
+            name = line.split(" ", 1)[0]
+            normalized = kf.normalize_branch_name(name)
+            branches.append({"detail": line, "is_high_win_rate": normalized in high, "is_selected_five": normalized in selected})
+        net = _sheet_number(r.get("淨買超成本"))
+        rows.append({
+            "rank": int(r["_rank"]),
+            "stock_code": kf._normalize_stock_name_code_key(_clean_cell(r["標的股"])),
+            "stock_name": _clean_cell(r.get("標的名稱", "")),
+            "net_buy_cost_text": _money_text(net) if net is not None else _clean_cell(r.get("淨買超成本", "")),
+            "branch_count": _sheet_number(r.get("參與分點數")),
+            "top_branches": branches,
+            "events": _clean_cell(r.get("事件", "")),
+            "warrant_count": _sheet_number(r.get("權證檔數")),
+            "unrealized_return_text": _top15_return_text(r),
+            "sheet_pattern": _clean_cell(r.get("型態", "")),
+        })
+    first = latest.iloc[0] if not latest.empty else {}
+    return {
+        "available": bool(rows),
+        "reason": "" if rows else f"{TOP15_SHEET} 最新一批沒有資料",
+        "source": f"Google Sheet「{TOP15_SHEET}」（資料範圍：{TOP15_SCOPE}）",
+        "stat_date": _fmt_date(latest_date),
+        "period": _clean_cell(first.get("統計期間", "")) if len(rows) else "",
+        "valid_trading_days": _sheet_number(first.get("有效交易日數")) if len(rows) else None,
+        "stocks": rows,
+        "definition_note": "追蹤分點在統計期間內的權證共識淨買超（淨買超成本＝買進成本扣除賣出），報酬率為這些部位目前的估計未實現損益；不是全市場權證買超",
+    }
+
+
 def get_branch_stock_position(branch_name: str, stock_code: str) -> Dict[str, Any]:
     """分點在某股票的部位是否還在：依回測 FIFO 的 A～E 事件狀態與每日賣出明細判斷（只讀 Sheet）。"""
     canonical, candidates = resolve_branch(branch_name)
@@ -2957,6 +3040,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
+    "get_top_warrant_buy_stocks": get_top_warrant_buy_stocks,
     "get_cost_position_context": get_cost_position_context,
     "get_branch_stock_position": get_branch_stock_position,
     "get_stock_overview": get_stock_overview,
@@ -2978,6 +3062,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
 _CANCELLABLE_TOOLS = {"get_warrant_branch", "get_high_winrate_branches_buying"}
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "get_top_warrant_buy_stocks": "權證共識淨買超排行：讀「快取_TOP15共識淨買超」最新統計日期的名次（參數 limit）",
     "get_cost_position_context": "持股成本相對現價、均線、大量區、布林的位置與上下關鍵價位（參數 stock_code, cost_price）",
     "get_sheet_stock_chips": "個股權證籌碼（Google Sheet 優先）：回測追蹤分點近期 A~E 事件、部位狀態、減碼出清、勝率（參數 stock_code, days）",
     "get_branch_stock_position": "分點在某股票的部位是否還在（回測 FIFO 狀態＋每日賣出明細）（參數 branch_name, stock_code）",
@@ -2998,6 +3083,7 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 _TOOL_FAILURE_MESSAGES.update({
+    "get_top_warrant_buy_stocks": "權證共識淨買超排行目前無法取得",
     "get_cost_position_context": "成本位置資料目前無法取得",
     "get_sheet_stock_chips": "Google Sheet 分點籌碼目前無法取得",
     "get_branch_stock_position": "分點部位資料目前無法取得",

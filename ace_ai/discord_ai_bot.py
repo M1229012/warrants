@@ -84,6 +84,8 @@ class BotConfig:
     allow_all_users: bool = False
     # 本週精選限定使用者（Discord 使用者 ID，逗號分隔）；沒設定時任何人都不能用。
     weekly_pick_user_ids: Set[int] = field(default_factory=set)
+    # !ace 文字指令（預設關閉，只用 /ask）
+    prefix_command_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -103,6 +105,7 @@ class BotConfig:
             ephemeral=_env_flag("DISCORD_AI_EPHEMERAL"),
             allow_all_users=_is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
             weekly_pick_user_ids=_parse_id_set(os.getenv("DISCORD_AI_WEEKLY_PICK_USER_IDS", "")),
+            prefix_command_enabled=_env_flag("DISCORD_AI_PREFIX_COMMAND_ENABLE", "0"),
         )
 
 
@@ -377,18 +380,18 @@ class QueryPlan:
 
 
 HELP_MESSAGE = (
-    "我可以幫你查股票與權證分點資料（`/ask 問題` 或 `!ace 問題` 都可以），例如：\n"
-    "• `/ask 本週精選`（管理員限定；可加：勝率70%以上／只看D事件／永豐金內湖／買超1000萬以上／靠近月線／排除漲太多／refresh）\n"
+    "我可以幫你查股票與權證分點資料，請用 `/ask 問題`，例如：\n"
+    "• `/ask 2344現在型態好嗎`\n"
+    "• `/ask 我2303成本143可以怎麼觀察`\n"
+    "• `/ask 2344現在技術面怎麼樣`\n"
+    "• `/ask 華邦電現在在大量區哪裡`\n"
+    "• `/ask 2344最近有哪些分點在加碼`\n"
+    "• `/ask 2344有哪些高勝率分點最近在加碼`\n"
+    "• `/ask 永豐金內湖勝率多少`\n"
     "• `/ask 永豐金內湖D事件勝率`\n"
-    "• `!ace 2344股價`\n"
-    "• `!ace 2344現在技術面怎麼樣`\n"
-    "• `!ace 華邦電現在在大量區哪裡`\n"
-    "• `!ace 2344最近有哪些分點在加碼`\n"
-    "• `!ace 2344有哪些高勝率分點最近在加碼`\n"
-    "• `!ace 永豐金內湖勝率多少`\n"
-    "• `!ace 永豐金內湖最近在買什麼`\n"
-    "• `!ace 2344最近有什麼新聞`\n"
-    "• `!ace 分析2344目前權證籌碼、技術面、大量區與近期新聞`"
+    "• `/ask 永豐金內湖最近在買什麼`\n"
+    "• `/ask 2344最近有什麼新聞，偏利多還是利空`\n"
+    "• `/ask 目前權證買超金額最大的是誰？技術面如何`"
 )
 
 PLANNER_TOOLS = (
@@ -398,6 +401,15 @@ PLANNER_TOOLS = (
     "get_branch_event_performance", "get_branch_recent_behavior", "detect_current_branch_events",
     "get_sheet_stock_chips", "get_branch_stock_position", "get_cost_position_context",
 )
+
+
+_TOP_WORDS_RE = re.compile(r"最大|最多|最高|排行|排名|前\s*\d*\s*名|前幾|第一名|哪一?檔|哪些股票|誰")
+
+
+def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
+    """沒有指定股票、問權證買超／買進金額排行（例如「目前權證買超金額最大的是誰」）。勝率排行走原本路由。"""
+    text = parsed.original
+    return ("warrant" in parsed.intents or "權證" in text) and bool(_TOP_WORDS_RE.search(text)) and "win_rate" not in parsed.intents
 
 
 class QueryRouter:
@@ -432,6 +444,11 @@ class QueryRouter:
             return self._pattern_plan(parsed)
         if parsed.stocks:
             return self._stock_plan(parsed, categories, analysis)
+        if not parsed.stocks and is_top_warrant_question(parsed):
+            # 「權證買超金額最大的是誰」：先讀 TOP15 共識淨買超排行，引擎再對第一名補型態資料與 K 線（仍只呼叫 1 次 Gemini）。
+            plan = QueryPlan(route="rule_top_warrant", need_final_llm=True)
+            plan.add("get_top_warrant_buy_stocks")
+            return plan
         if not parsed.stocks and "win_rate" in intents and ("rank" in intents or "高" in parsed.original):
             plan = QueryPlan(route="rule_winrate_rank")
             plan.add("get_branch_winrate_rank")
@@ -812,6 +829,12 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 ・技術訊號：只有 bollinger（壓縮、沿軌、突破）或 kd／macd signals 有明確訊號時才寫一句，沒有就省略這行。
 ・分點：點名 1～2 個 tracked_branches（高勝率、持有中優先），說明後續減碼／出清或再加碼代表的籌碼變化；沒有就寫「近 20 個交易日追蹤分點沒有 A～E 事件」。"""
 
+FINAL_RANK_RULES = """權證共識淨買超排行（有 get_top_warrant_buy_stocks）：
+【回答】先寫排行的統計期間與資料範圍，並註明這是追蹤分點的權證共識淨買超，不是全市場權證買超；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
+unrealized_return_text 是這些分點目前部位的估計未實現損益，要說明是估計值、不是已實現。
+接著針對第一名，依型態評分卡回答技術面（型態分數、grade 與最主要的一個得分與一個失分原因）。
+【觀察重點】照型態／成本／操作問題的規則，針對第一名撰寫。"""
+
 FINAL_FORMAT_GENERAL = """區塊依序使用（只放有資料、和問題相關的）：【回答】、【籌碼】、【技術解讀】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
 FINAL_FORMAT_NEWS = """區塊依序使用：【回答】（1～2 句直接說整體偏利多、偏利空或好壞參半）、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
 FINAL_FORMAT_PATTERN = """區塊只用：【回答】、【觀察重點】。"""
@@ -923,6 +946,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_TECH_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
+    if "get_top_warrant_buy_stocks" in names:
+        sections.append(FINAL_RANK_RULES)
     if "get_pattern_scorecard" in names:
         sections += [FINAL_PATTERN_RULES, FINAL_FORMAT_PATTERN]
     elif names == {"get_recent_news"} or names == {"get_recent_news", "get_stock_overview"}:
@@ -1417,6 +1442,23 @@ def format_branch_stock_position(d: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_top_warrant(d: Dict[str, Any]) -> str:
+    if not d.get("available"):
+        return f"【權證共識淨買超排行】{d.get('reason', '目前沒有取得足夠資料')}"
+    lines = [f"【權證共識淨買超排行】統計日 {d.get('stat_date')}｜{d.get('period')}｜{d.get('source')}"]
+    for row in d.get("stocks") or []:
+        branches = "；".join(b.get("detail", "") for b in row.get("top_branches") or [])
+        lines.append(
+            f"{row['rank']}. {row.get('stock_name', '')}（{row['stock_code']}）淨買超 {row.get('net_buy_cost_text')}"
+            f"｜分點 {_v(row.get('branch_count'))} 家｜事件 {row.get('events') or '-'}｜權證 {_v(row.get('warrant_count'))} 檔"
+            + (f"｜估計報酬 {row['unrealized_return_text']}" if row.get("unrealized_return_text") else "")
+        )
+        if branches:
+            lines.append(f"　{branches}")
+    lines.append("※ 只涵蓋追蹤分點的權證共識淨買超，估計報酬為未實現估值，不是全市場權證買超。")
+    return "\n".join(lines)
+
+
 def format_pattern_scorecard(d: Dict[str, Any]) -> str:
     """評分細節已畫在圖片的型態評分卡；文字只留一行總結，避免重複。"""
     return (
@@ -1428,6 +1470,7 @@ def format_pattern_scorecard(d: Dict[str, Any]) -> str:
 
 FORMATTERS.update({
     "get_pattern_scorecard": format_pattern_scorecard,
+    "get_top_warrant_buy_stocks": format_top_warrant,
     "get_sheet_stock_chips": format_sheet_stock_chips,
     "get_branch_stock_position": format_branch_stock_position,
     "get_branch_event_performance": format_branch_event_performance,
@@ -1635,18 +1678,30 @@ class AceQueryEngine:
         if plan.clarification:
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
 
+        pre_results: List[tools.ToolResult] = []
+        if plan.route == "rule_top_warrant":
+            pre_results = self._run_tools(plan.tool_calls)
+            ranking = pre_results[0] if pre_results else None
+            stocks = (ranking.data.get("stocks") or []) if ranking is not None and ranking.ok else []
+            plan = QueryPlan(route="rule_top_warrant", need_final_llm=True)
+            if stocks:
+                top = stocks[0]
+                pattern = self.router._pattern_plan(ParsedQuestion(original=question, intents=set(), stocks=[(top["stock_code"], top.get("stock_name", ""))]))
+                plan.tool_calls = list(pattern.tool_calls)
+                self.log(f"權證買進排行第一名：{top['stock_code']} {top.get('stock_name', '')}｜{top.get('event_buy_amount_text')}")
+
         codes = list(dict.fromkeys([code for code, _ in parsed.stocks] +
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
         chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, **({"branch_name": chart_branch} if chart_branch else {})}) for c in codes]
-        combined = self._run_tools(plan.tool_calls + chart_calls)
+        combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []
         for code, chart in zip(codes, chart_results):
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
             panels.append(panel)
-        if plan.route == "rule_pattern":
+        if plan.route in ("rule_pattern", "rule_top_warrant"):
             for panel in panels:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 if card:
@@ -1937,14 +1992,14 @@ def run_discord_bot(config: BotConfig) -> None:
     @client.event
     async def on_ready() -> None:
         print(
-            f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name} 與 {config.command_prefix}｜"
+            f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
             f"debug={config.debug}",
             flush=True,
         )
 
-    @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票、權證分點，或輸入「本週精選」")
-    @app_commands.describe(question="例如：2344現在技術面怎麼樣／永豐金內湖D事件勝率／本週精選")
+    @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
+    @app_commands.describe(question="例如：2344現在型態好嗎／永豐金內湖D事件勝率／2344最近有什麼新聞")
     async def ask_command(interaction: "discord.Interaction", question: str) -> None:
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
@@ -1983,7 +2038,8 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_message(message: "discord.Message") -> None:
-        if message.author.bot:
+        # 指令統一用 /ask；!ace 文字指令預設關閉（DISCORD_AI_PREFIX_COMMAND_ENABLE=1 才開）。
+        if not config.prefix_command_enabled or message.author.bot:
             return
         content = (message.content or "").strip()
         lowered = content.lower()
