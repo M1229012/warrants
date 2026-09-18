@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "說明": "answer_any＝完整模式下【回答】必須出現其中一個詞（例如比較題要下結論）；艾斯 AI 固定評測題。route 可寫多個（任一符合即通過）；stocks 依順序比對；llm＝是否需要 AI 撰寫；cost＝應解析出的成本；note＝追問記憶說明需包含的字；fast_only＝只在快速模式測（例如本週精選）。同一個 case 的多個 turns 共用同一位使用者的追問記憶。",
+  "cases": [
+    {"id": "P01", "group": "型態", "turns": [{"q": "2409現在型態好嗎", "route": ["rule_pattern"], "stocks": ["2409"], "llm": true}]},
+    {"id": "P02", "group": "型態", "turns": [{"q": "華邦電技術面如何", "route": ["rule_pattern"], "stocks": ["2344"], "llm": true}]},
+    {"id": "P03", "group": "型態", "turns": [{"q": "2303可以買嗎", "route": ["rule_pattern"], "stocks": ["2303"], "llm": true}]},
+    {"id": "P04", "group": "型態", "turns": [{"q": "3481 今天的K棒代表什麼", "route": ["rule_pattern"], "stocks": ["3481"], "llm": true}]},
+    {"id": "P05", "group": "型態", "turns": [{"q": "聯發科大量區在哪裡", "route": ["rule_pattern", "rule_stock"], "stocks": ["2454"], "llm": true}]},
+    {"id": "P06", "group": "型態", "turns": [{"q": "2317 月線和季線的位置", "route": ["rule_pattern"], "stocks": ["2317"], "llm": true}]},
+
+    {"id": "C01", "group": "成本", "turns": [{"q": "我2409成本30元該怎麼看", "route": ["rule_pattern"], "stocks": ["2409"], "cost": 30, "llm": true}]},
+    {"id": "C02", "group": "成本", "turns": [{"q": "華邦電均價45.5 還要抱嗎", "route": ["rule_pattern"], "stocks": ["2344"], "cost": 45.5, "llm": true}]},
+    {"id": "C03", "group": "成本", "turns": [{"q": "如果2303跌到40塊要停損嗎", "route": ["rule_pattern"], "stocks": ["2303"], "llm": true}]},
+
+    {"id": "S01", "group": "只問股價", "turns": [{"q": "2330股價多少", "route": ["rule_stock"], "stocks": ["2330"], "llm": false}]},
+    {"id": "S02", "group": "只問股價", "turns": [{"q": "友達收盤價", "route": ["rule_stock"], "stocks": ["2409"], "llm": false}]},
+
+    {"id": "N01", "group": "新聞", "turns": [{"q": "2344最近有什麼新聞", "route": ["rule_stock"], "stocks": ["2344"], "llm": true}]},
+    {"id": "N02", "group": "新聞", "turns": [{"q": "旺宏新聞利多還是利空", "route": ["rule_stock"], "stocks": ["2337"], "llm": true}]},
+
+    {"id": "W01", "group": "權證", "turns": [{"q": "2409權證分點買賣", "route": ["rule_stock"], "stocks": ["2409"], "llm": true}]},
+    {"id": "W02", "group": "權證排行", "turns": [{"q": "目前權證買超金額最大的是誰", "route": ["rule_top_warrant"], "stocks": [], "llm": true}]},
+    {"id": "W03", "group": "權證排行", "turns": [{"q": "權證淨買超排行前幾名技術面如何", "route": ["rule_top_warrant"], "stocks": [], "llm": true}]},
+
+    {"id": "B01", "group": "分點", "turns": [{"q": "永豐金內湖勝率", "route": ["rule_branch"], "stocks": []}]},
+    {"id": "B02", "group": "分點", "turns": [{"q": "永豐金內湖最近在買什麼", "route": ["rule_branch"], "stocks": []}]},
+    {"id": "B03", "group": "分點", "turns": [{"q": "永豐金內湖D事件勝率", "route": ["rule_branch"], "stocks": []}]},
+    {"id": "B04", "group": "分點", "turns": [{"q": "永豐金內湖2409部位還在嗎", "route": ["rule_branch_position"], "stocks": ["2409"]}]},
+    {"id": "B05", "group": "分點", "turns": [{"q": "永豐金內湖在2344的操作", "route": ["rule_branch_stock", "rule_branch_position"], "stocks": ["2344"], "llm": true}]},
+    {"id": "B06", "group": "分點排行", "turns": [{"q": "勝率最高的分點有哪些", "route": ["rule_winrate_rank", "planner"], "stocks": []}]},
+
+    {"id": "M01", "group": "比較", "turns": [{"q": "2344跟2337哪個型態比較好", "route": ["rule_pattern"], "stocks": ["2344", "2337"], "llm": true, "answer_any": ["比華邦電", "比旺宏", "差不多", "較好", "較佳", "較強"]}]},
+    {"id": "M02", "group": "比較", "turns": [{"q": "2330 2317 2454 比較", "route": ["clarify"]}]},
+
+    {"id": "F01", "group": "追問", "turns": [
+      {"q": "幫我分析華邦電", "route": ["rule_pattern"], "stocks": ["2344"]},
+      {"q": "那它的壓力在哪", "route": ["rule_pattern", "rule_stock"], "stocks": ["2344"], "note": "延續上一題"},
+      {"q": "跟旺宏比呢", "route": ["rule_pattern"], "stocks": ["2344", "2337"], "note": "比較", "answer_any": ["比華邦電", "比旺宏", "差不多", "較好", "較佳", "較強"]}
+    ]},
+    {"id": "F02", "group": "追問", "turns": [
+      {"q": "2409成本30", "route": ["rule_pattern"], "stocks": ["2409"], "cost": 30},
+      {"q": "那成本要怎麼看", "route": ["rule_pattern"], "stocks": ["2409"], "cost": 30, "note": "延續上一題"}
+    ]},
+    {"id": "F03", "group": "追問", "turns": [
+      {"q": "2303型態", "route": ["rule_pattern"], "stocks": ["2303"]},
+      {"q": "它最近有新聞嗎", "route": ["rule_stock"], "stocks": ["2303"], "note": "延續上一題"}
+    ]},
+    {"id": "F04", "group": "追問", "turns": [
+      {"q": "2344型態", "route": ["rule_pattern"], "stocks": ["2344"]},
+      {"q": "重新開始", "route": ["memory_reset"]},
+      {"q": "那它的壓力在哪", "stocks": [], "note": ""}
+    ]},
+    {"id": "F05", "group": "追問", "turns": [
+      {"q": "友達技術面", "route": ["rule_pattern"], "stocks": ["2409"]},
+      {"q": "目前權證買超金額最大的是誰", "route": ["rule_top_warrant"], "stocks": [], "note": ""}
+    ]},
+    {"id": "F06", "group": "追問", "turns": [
+      {"q": "友達技術面", "route": ["rule_pattern"], "stocks": ["2409"]},
+      {"q": "永豐金內湖最近在買什麼", "route": ["rule_branch"], "stocks": [], "note": ""}
+    ]},
+    {"id": "F07", "group": "追問", "turns": [
+      {"q": "2330型態", "route": ["rule_pattern"], "stocks": ["2330"]},
+      {"q": "你好", "stocks": [], "note": ""}
+    ]},
+    {"id": "F08", "group": "追問", "turns": [
+      {"q": "2344型態", "route": ["rule_pattern"], "stocks": ["2344"]},
+      {"q": "改看2409", "route": ["rule_pattern"], "stocks": ["2409"], "note": ""}
+    ]},
+
+    {"id": "I01", "group": "盤中", "turns": [{"q": "2409現在站上月線了嗎", "route": ["rule_pattern"], "stocks": ["2409"], "llm": true}]},
+    {"id": "I02", "group": "盤中", "turns": [{"q": "華邦電今天量有放大嗎", "route": ["rule_pattern", "rule_stock"], "stocks": ["2344"], "llm": true}]},
+    {"id": "I03", "group": "盤中", "turns": [{"q": "2303今天漲多少", "route": ["rule_stock", "rule_pattern"], "stocks": ["2303"]}]},
+
+    {"id": "E01", "group": "缺資料", "turns": [{"q": "9999型態好嗎", "route": ["help", "clarify", "planner"], "stocks": []}]},
+    {"id": "E02", "group": "缺資料", "turns": [{"q": "今天天氣如何", "route": ["help"], "stocks": []}]},
+    {"id": "E03", "group": "說明", "turns": [{"q": "你可以做什麼", "route": ["help"], "stocks": []}]},
+
+    {"id": "K01", "group": "本週精選", "fast_only": true, "turns": [{"q": "本週精選", "route": ["weekly_pick"]}]},
+    {"id": "G01", "group": "族群", "turns": [{"q": "請問記憶體產業 現在誰的形態最強", "route": ["rule_sector"], "stocks": [], "answer_any": ["1. "]}]},
+    {"id": "G02", "group": "族群", "turns": [{"q": "航運股今天誰漲最多", "route": ["rule_sector"], "stocks": []}]},
+    {"id": "G03", "group": "族群", "turns": [{"q": "有哪些族群", "route": ["rule_sector"], "stocks": []}]},
+    {"id": "K02", "group": "布林", "turns": [{"q": "2317布林通道開口了嗎", "route": ["rule_pattern"], "stocks": ["2317"], "llm": true}]}
+  ]
+}
