@@ -808,7 +808,7 @@ FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能�
 2. 保持客觀中性：用「偏多條件／偏空條件」描述，每個判斷都附上依據，有利與不利的條件都要寫；不用「強勢、看好、危險、暴漲、慘」等帶情緒或暗示方向的字眼。AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
 3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
 4. 回答排進圖片，口語、精簡，每段 1～3 句，每句要完整通順（不要用刪節號、不要半句）；同一件事只講一次。圖片已顯示股價、均線、布林、KD、MACD、成交量、大量區與分點標註，文字不可逐項列出這些數值，要寫「代表什麼」並回答問題；只有說明條件時才引用 1～2 個關鍵價位。
-5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間。data_source 或 intraday.is_live 顯示「盤中」時，要提醒今天的 K 棒、均線、指標與成交量都是盤中暫定值、收盤前會變動（成交量只是目前累計，量比偏低很正常）；否則註明是日K收盤資料。
+5. 不要提到資料供應商或系統名稱（例如富果、FinMind、Google Sheet、工作表名稱），需要時只說「日K收盤資料」「盤中即時報價」「追蹤分點統計」；新聞的媒體名稱可以照寫。輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間。data_source 或 intraday.is_live 顯示「盤中」時，要提醒今天的 K 棒、均線、指標與成交量都是盤中暫定值、收盤前會變動（成交量只是目前累計，量比偏低很正常）；否則註明是日K收盤資料。
 6. 一定先寫【回答】直接回應使用者問的事。問「明天會不會漲、漲的機率」這類預測：說明無法預測漲跌或給機率，改用型態分數、今天 K 棒、量能與關鍵價位客觀說明偏多與偏空的條件。問 K 棒型態（例如仙人指路、長上影、長下影、十字線、吞噬）：依 get_stock_overview.candle（實體、上影線、下影線占前日收盤 %、收盤在當日區間的位置）、量比與型態評分卡（是否剛突破、相對位置），對照該型態的常見定義說明符合或不符合與常見解讀，不可斷言後續走勢。"""
 
 FINAL_TECH_RULES = """技術面規則：布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀；null 不可判定有或沒有。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
@@ -830,7 +830,7 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 ・分點：點名 1～2 個 tracked_branches（高勝率、持有中優先），說明後續減碼／出清或再加碼代表的籌碼變化；沒有就寫「近 20 個交易日追蹤分點沒有 A～E 事件」。"""
 
 FINAL_RANK_RULES = """權證共識淨買超排行（有 get_top_warrant_buy_stocks）：
-【回答】先寫排行的統計期間與資料範圍，並註明這是追蹤分點的權證共識淨買超，不是全市場權證買超；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
+【回答】先寫排行名稱與統計期間（照 source 與 period 寫，不要自己改名，也不要用「共識」「全分點」等字眼），並註明統計範圍是追蹤的分點、不是全市場；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
 unrealized_return_text 是這些分點目前部位的估計未實現損益，要說明是估計值、不是已實現。
 接著針對第一名，依型態評分卡回答技術面（型態分數、grade 與最主要的一個得分與一個失分原因）。
 【觀察重點】照型態／成本／操作問題的規則，針對第一名撰寫。"""
@@ -852,7 +852,7 @@ def _prune_empty(value: Any) -> Any:
 
 # 送進 Gemini 前拿掉的欄位：說明文字（規則已寫在 prompt）、圖片專用或重複的欄位。
 _PAYLOAD_DROP_KEYS = {
-    "data_source", "indicator_definition", "volume_unit_note", "definition_note", "note", "rules", "method",
+    "data_source", "indicator_definition", "volume_unit_note", "definition_note", "note", "rules", "method", "worksheet",
     "source_type", "summary_points_source", "url", "squeeze_reference_count", "squeeze_threshold_pct",
     "mid_change_10d_pct", "close_range_10d_pct", "volume_ratio_prior20",
 }
@@ -1288,7 +1288,8 @@ def format_news(d: Dict[str, Any]) -> str:
 
 
 def format_sheet_query(d: Dict[str, Any]) -> str:
-    lines = [f"📌 {d.get('worksheet')}：符合 {d.get('matched_rows')} 筆，顯示 {d.get('returned_rows')} 筆"]
+    label = tools.SHEET_REGISTRY.get(d.get("worksheet"), "查詢結果")
+    lines = [f"📌 {label}：符合 {d.get('matched_rows')} 筆，顯示 {d.get('returned_rows')} 筆"]
     for row in (d.get("rows") or [])[:8]:
         lines.append("• " + "｜".join(f"{v}" for v in list(row.values())[:6] if v))
     return "\n".join(lines)
@@ -1444,8 +1445,8 @@ def format_branch_stock_position(d: Dict[str, Any]) -> str:
 
 def format_top_warrant(d: Dict[str, Any]) -> str:
     if not d.get("available"):
-        return f"【權證共識淨買超排行】{d.get('reason', '目前沒有取得足夠資料')}"
-    lines = [f"【權證共識淨買超排行】統計日 {d.get('stat_date')}｜{d.get('period')}｜{d.get('source')}"]
+        return f"【權證淨買超排行】{d.get('reason', '目前沒有取得足夠資料')}"
+    lines = [f"【{d.get('source') or '權證淨買超排行'}】{d.get('period')}（統計至 {d.get('stat_date')}）"]
     for row in d.get("stocks") or []:
         branches = "；".join(b.get("detail", "") for b in row.get("top_branches") or [])
         lines.append(
@@ -1455,7 +1456,7 @@ def format_top_warrant(d: Dict[str, Any]) -> str:
         )
         if branches:
             lines.append(f"　{branches}")
-    lines.append("※ 只涵蓋追蹤分點的權證共識淨買超，估計報酬為未實現估值，不是全市場權證買超。")
+    lines.append("※ 統計範圍為追蹤的分點，不是全市場；估計報酬為未實現估值。")
     return "\n".join(lines)
 
 
@@ -1494,23 +1495,23 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
         if r.name in ("get_stock_overview", "get_technical_analysis", "get_volume_profile") and d.get("data_date"):
             intraday = d.get("intraday") or {}
             if intraday.get("is_live"):
-                add(f"股價為 {intraday['date']} {intraday['time']} 盤中即時報價（富果，尚未收盤）")
+                add(f"股價為 {intraday['date']} {intraday['time']} 盤中即時報價（尚未收盤）")
             elif intraday:
-                add(f"股價為 {intraday['date']} 今日收盤（富果即時報價）")
+                add(f"股價為 {intraday['date']} 今日收盤")
             else:
                 add(f"股價截至 {d['data_date']}（日K收盤）")
         elif r.name in ("get_warrant_branch", "get_high_winrate_branches_buying") and d.get("period_start"):
             add(f"權證分點 {d['period_start']}～{d['period_end']}（{d.get('actual_trading_days')} 個交易日）")
         elif r.name == "get_branch_performance" and d.get("found"):
-            add(f"勝率統計（Sheet 更新 {d.get('sheet_updated_at') or '時間未知'}）")
+            add(f"勝率統計（更新 {d.get('sheet_updated_at') or '時間未知'}）")
         elif r.name in ("get_branch_recent_trades", "get_branch_winrate_rank") and (d.get("period") or d.get("snapshot_date")):
             add(f"近10日分點統計 {d.get('period') or d.get('snapshot_date')}")
         elif r.name == "get_branch_stock_history" and d.get("found"):
-            add(f"ABCDE 事件（Sheet 更新 {d.get('sheet_updated_at') or '時間未知'}）")
+            add(f"ABCDE 事件（更新 {d.get('sheet_updated_at') or '時間未知'}）")
         elif r.name == "get_recent_news" and d.get("available"):
-            add("新聞為近期六來源抓取結果")
+            add("新聞為近期報導整理")
         elif r.name in ("get_sheet_stock_chips", "get_branch_stock_position") and d.get("data_latest_event_date"):
-            add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}（Google Sheet）")
+            add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
     return "資料時間：" + "｜".join(parts) if parts else ""
 
 
@@ -1642,7 +1643,9 @@ class AceQueryEngine:
             if answer.cards:
                 weekly = {"cards": answer.cards, "overview": answer.overview, "meta": answer.meta, "notice": answer.notice}
         except tools.ToolDataError as exc:
-            text, cache_hit = f"本週精選目前無法計算：{exc}", False
+            self.log(f"本週精選無法計算：{exc}")
+            detail = tools._public_detail(exc)
+            text, cache_hit = "本週精選目前無法計算" + (f"：{detail}" if detail else "，資料暫時無法取得，請稍後再試。"), False
         except Exception as exc:  # 計算流程任何例外都不可讓 Bot 中斷
             print(f"❌ 本週精選計算失敗：{type(exc).__name__}: {exc}", flush=True)
             text, cache_hit = "本週精選計算時發生錯誤，請稍後再試（詳細原因已記錄在 console）。", False
@@ -1678,7 +1681,8 @@ class AceQueryEngine:
         try:
             parsed = self.parser.parse(question)
         except tools.ToolDataError as exc:
-            return AnswerResult(text=f"目前無法解析問題所需的基本資料（{exc}），請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
+            self.log(f"問題解析失敗：{exc}")
+            return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         plan = self.router.plan(parsed, stats)
         self.log(

@@ -954,13 +954,20 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     return int(h)
 
 
+def header_brand(draw, title: str, size: int, brand: str = 'ACE / RESEARCH') -> None:
+    """頁首：左邊標題、右邊品牌字，右緣對齊下方卡片（WIDTH - MARGIN），兩者同一條文字基線。"""
+    baseline = 66 + font(size, True).getmetrics()[0]
+    draw.text((MARGIN, baseline), title, font=font(size, True), fill=INK, anchor='ls')
+    draw.text((WIDTH - MARGIN, baseline), brand, font=font(20), fill=ACCENT, anchor='rs')
+
+
 def price_footer(panels: list[dict] | None) -> str:
     """頁尾資料說明：有任何一檔接上盤中即時報價就改寫，避免圖上寫「收盤資料」卻是盤中價格。"""
     infos = [(p or {}).get('intraday') or {} for p in panels or []]
     if any(i.get('is_live') for i in infos):
-        return '股市艾斯  /  最新一根 K 棒為富果盤中即時報價，收盤前會變動'
+        return '股市艾斯  /  最新一根 K 棒為盤中即時報價，收盤前會變動'
     if any(infos):
-        return '股市艾斯  /  最新一根 K 棒為富果今日收盤報價，其餘為日 K 收盤資料'
+        return '股市艾斯  /  最新一根 K 棒為今日收盤報價，其餘為日 K 收盤資料'
     return '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
 
 
@@ -980,8 +987,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
-    text_at(draw, (MARGIN, 66), title, 28, bold=True)
-    text_at(draw, (WIDTH - 350, 73), '示範資料・非真實行情' if demo else 'ACE / RESEARCH', 20, ACCENT)
+    header_brand(draw, title, 28, '示範資料・非真實行情' if demo else 'ACE / RESEARCH')
     for i, line in enumerate(question_lines):
         text_at(draw, (MARGIN, 124 + i * 47), line, 31, bold=True)
     y = header_height

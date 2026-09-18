@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 from answer_image import (
     ACCENT, BG, CONTENT, INK, LINE, MARGIN, MUTED, WIDTH,
-    clean, draw_chart, encode_image, font, panel_height, price_footer, text_at, wrap,
+    clean, draw_chart, encode_image, font, header_brand, panel_height, price_footer, text_at, wrap,
 )
 
 WEEKLY_PER_PAGE = 3
@@ -40,8 +40,7 @@ def paragraph(draw, x, y, text, size, width, fill=INK, bold=False, line=None, dr
 def page_header(draw, question: str, page_label: str, dry: bool) -> int:
     if not dry:
         draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
-        text_at(draw, (MARGIN, 66), '艾斯 AI｜本週精選候選', 30, bold=True)
-        text_at(draw, (WIDTH - 350, 73), 'ACE / RESEARCH', 20, ACCENT)
+        header_brand(draw, '艾斯 AI｜本週精選候選', 30)
     y = 124
     y += paragraph(draw, MARGIN, y, question, 28, CONTENT, INK, True, 42, dry)
     if not dry:

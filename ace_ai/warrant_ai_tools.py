@@ -442,8 +442,17 @@ _TOOL_FAILURE_MESSAGES = {
     "get_branch_stock_history": "分點歷史事件資料目前無法取得",
     "get_recent_news": "目前新聞資料取得失敗",
     "get_branch_winrate_rank": "近10日分點勝率排行目前無法取得",
-    "query_google_sheet": "Google Sheet 查詢失敗",
+    "query_google_sheet": "資料查詢失敗",
 }
+
+
+_INTERNAL_WORDS = ("Sheet", "sheet", "工作表", "試算表", "GCP", "FinMind", "富果", "Fugle", "MoneyDJ", "gspread")
+
+
+def _public_detail(exc: Exception) -> str:
+    """錯誤原因可以給使用者看才附上（例如找不到分點）；含系統或資料供應商名稱的內部訊息一律不顯示。"""
+    text = str(exc).strip()
+    return "" if not text or any(word in text for word in _INTERNAL_WORDS) else text
 
 
 def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading.Event] = None) -> ToolResult:
@@ -463,11 +472,12 @@ def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading
         user_message = ""
     except SheetUnavailableError as exc:
         data, ok, error = {}, False, str(exc)
-        user_message = f"{_TOOL_FAILURE_MESSAGES.get(name, '資料取得失敗')}（{exc}）"
+        user_message = _TOOL_FAILURE_MESSAGES.get(name, "資料取得失敗")
         print(f"⚠️ Discord AI Tool 失敗：{name}｜Google Sheet｜{exc}")
     except ToolDataError as exc:
         data, ok, error = {}, False, str(exc)
-        user_message = f"{_TOOL_FAILURE_MESSAGES.get(name, '資料取得失敗')}（{exc}）"
+        detail = _public_detail(exc)
+        user_message = _TOOL_FAILURE_MESSAGES.get(name, "資料取得失敗") + (f"（{detail}）" if detail else "")
         print(f"⚠️ Discord AI Tool 失敗：{name}｜{exc}")
     except Exception as exc:  # 既有函式可能丟出 requests / gspread / pandas 等各種例外
         data, ok = {}, False
@@ -1056,19 +1066,19 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFram
         index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
     )
     merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
-    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"], "source": "富果即時報價"}
+    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"]}
     print(f"⏱️ {code} 接上富果即時報價：{info['date']} {info['time']}｜{quote['close']}｜{'盤中' if info['is_live'] else '今日收盤'}", flush=True)
     return merged, info
 
 
 def price_source_note(bundle: Dict[str, Any]) -> str:
+    """給 AI 與圖片看的資料說明（不寫資料供應商名稱；實際來源只記在 Log 與 bundle["daily_source"]）。"""
     info = bundle.get("intraday") or {}
-    base = bundle.get("daily_source") or "FinMind 日K"
     if not info:
-        return f"{base}收盤資料（非盤中即時）"
+        return "日K收盤資料（非盤中即時）"
     if info.get("is_live"):
-        return f"{base}＋{info['source']}（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
-    return f"{base}＋{info['source']}（{info['date']} 今日收盤，日K資料尚未更新）"
+        return f"日K＋盤中即時報價（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
+    return f"日K＋今日收盤報價（{info['date']}）"
 
 
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
@@ -1113,7 +1123,7 @@ def _stock_identity(stock_code: str) -> Tuple[str, str]:
     return code, name
 
 
-PRICE_SOURCE_NOTE = "FinMind 日K收盤資料（非盤中即時）"
+PRICE_SOURCE_NOTE = "日K收盤資料（非盤中即時）"
 
 
 # ============================================================
@@ -1566,9 +1576,9 @@ def get_warrant_branch(
         "top_buy_branches": buy_rows,
         "top_sell_branches": sell_rows,
         "abcde_note": (
-            f"ABCDE 事件取自回測 Google Sheet，只涵蓋回測追蹤的分點（{abcde_error}）"
+            "ABCDE 事件只涵蓋回測追蹤的分點（事件資料暫時無法取得）"
             if abcde_error
-            else "ABCDE 事件取自回測 Google Sheet，只涵蓋回測追蹤的分點"
+            else "ABCDE 事件只涵蓋回測追蹤的分點"
         ),
     }
 
@@ -1665,7 +1675,7 @@ def get_branch_performance(branch_name: str, event_type: str = "") -> Dict[str, 
         "requested_event_type": EVENT_TYPE_LABELS.get(_event_letter(event_type), ""),
         "overall_all_events": overall,
         "by_event_type": by_event,
-        "data_source": "Google Sheet「勝率統計」（回測程式產生）",
+        "data_source": "回測勝率統計",
         "sheet_updated_at": sheet_updated_at,
         "definition_note": "勝率含實際出清與持有滿60日後估值的事件；歷史勝率不代表未來結果",
         "small_sample_threshold": SMALL_SAMPLE_EVENTS,
@@ -1730,7 +1740,7 @@ def get_high_winrate_branches_buying(
         "joined_branches": joined[:10],
         "high_win_rate_count": sum(1 for x in joined if x["is_high_win_rate"]),
         "branches_without_history": unmatched[:10],
-        "data_source": "近期買超：MoneyDJ 權證分點（週報TOP同口徑）；歷史勝率：Google Sheet「勝率統計」",
+        "data_source": "近期買超：權證分點（週報同口徑）；歷史勝率：回測勝率統計",
         "definition_note": "「加碼」指查詢區間內權證淨買超；高勝率門檻為歷史勝率 ≥ 門檻值，不代表這次一定成功",
     }
 
@@ -1827,7 +1837,7 @@ def get_branch_recent_trades(branch_name: str, stock_code: str = "", limit: int 
         "net_sell_stocks": sell_items,
         "branch_10d_stats": branch_stats,
         "recent_abcde_events_30d": recent_events,
-        "data_source": "Google Sheet「快取_近10日分點買賣明細」與「股票ABCDE查詢資料」（回測程式產生，只涵蓋回測追蹤的分點）",
+        "data_source": "近10日分點買賣明細與 ABCDE 事件（只涵蓋回測追蹤的分點）",
         "definition_note": "近10日勝率為10日窗口定義，與勝率統計的歷史勝率不同",
         "sheet_updated_at": table["sheet_updated_at"],
     }
@@ -1886,7 +1896,7 @@ def get_branch_stock_history(branch_name: str, stock_code: str, limit: int = 15)
         "avg_holding_days": _num(float(np.mean(holding)), 1) if holding else None,
         "small_sample": total < SMALL_SAMPLE_EVENTS,
         "latest_events": events,
-        "data_source": "Google Sheet「股票ABCDE查詢資料」（回測程式產生）",
+        "data_source": "回測 ABCDE 事件",
         "definition_note": "勝敗筆數直接採用回測結果欄；出清獲利平均為已出清事件的簡單平均，非加權報酬",
         "sheet_updated_at": table["sheet_updated_at"],
     }
@@ -1910,7 +1920,7 @@ def get_branch_winrate_rank(limit: int = 10) -> Dict[str, Any]:
         "snapshot_date": snapshot_date,
         "period": df["統計期間"].iloc[0] if "統計期間" in df.columns else "",
         "rows": rows,
-        "data_source": "Google Sheet「快取_近10日分點勝率排行」（回測程式產生，只涵蓋回測追蹤的分點）",
+        "data_source": "近10日分點勝率排行（只涵蓋回測追蹤的分點）",
         "definition_note": "近10日勝率為10日窗口定義，樣本少時波動大",
         "sheet_updated_at": table["sheet_updated_at"],
     }
@@ -2861,7 +2871,7 @@ def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 2
         "data_latest_event_date": _fmt_date(latest),
         "high_win_rate_threshold_pct": HIGH_WIN_RATE_PCT,
         "branches": rows[:8],
-        "data_source": "Google Sheet：回測追蹤分點的 A～E 事件（單日權證買進≥100萬）、每日賣出明細、勝率統計",
+        "data_source": "回測追蹤分點的 A～E 事件（單日權證買進≥100萬）、每日賣出明細、勝率統計",
         "definition_note": "只涵蓋回測追蹤的分點；未達 A～E 門檻的小額買進不在事件表內；勝率為歷史統計，不代表未來結果",
     }
 
@@ -2878,6 +2888,12 @@ def _sheet_number(value: Any) -> Optional[float]:
     except ValueError:
         return None
     return number if math.isfinite(number) else None
+
+
+def top15_title(trading_days: Optional[float]) -> str:
+    """給使用者看的排行名稱：不用「共識／全分點」等內部術語，改用統計期間描述。"""
+    prefix = "權證淨買超排行" if TOP15_SCOPE == "全分點" else "精選分點權證淨買超排行"
+    return f"{prefix}（近 {int(trading_days)} 個交易日）" if trading_days else prefix
 
 
 def _top15_return_text(row: Any) -> str:
@@ -2940,7 +2956,7 @@ def get_top_warrant_buy_stocks(limit: int = TOP_WARRANT_LIMIT) -> Dict[str, Any]
     return {
         "available": bool(rows),
         "reason": "" if rows else f"{TOP15_SHEET} 最新一批沒有資料",
-        "source": f"Google Sheet「{TOP15_SHEET}」（資料範圍：{TOP15_SCOPE}）",
+        "source": top15_title(_sheet_number(first.get("有效交易日數")) if len(rows) else None),
         "stat_date": _fmt_date(latest_date),
         "period": _clean_cell(first.get("統計期間", "")) if len(rows) else "",
         "valid_trading_days": _sheet_number(first.get("有效交易日數")) if len(rows) else None,
@@ -2995,7 +3011,7 @@ def get_branch_stock_position(branch_name: str, stock_code: str) -> Dict[str, An
         ] if not sells.empty else [],
         "branch_performance": _branch_perf_brief(perf, canonical, [c for c in EVENT_CODES if c in set(rows["event_code"])]),
         "data_latest_event_date": _fmt_date(latest),
-        "data_source": "Google Sheet：A～E 事件表（回測 FIFO 狀態）與每日賣出明細",
+        "data_source": "A～E 事件（回測 FIFO 狀態）與每日賣出明細",
         "definition_note": "部位依回測 FIFO 追蹤「達 A～E 門檻的事件」；未達門檻的小額買進不在內，因此不是券商實際庫存",
     }
 
@@ -3232,9 +3248,9 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 _TOOL_FAILURE_MESSAGES.update({
-    "get_top_warrant_buy_stocks": "權證共識淨買超排行目前無法取得",
+    "get_top_warrant_buy_stocks": "權證淨買超排行目前無法取得",
     "get_cost_position_context": "成本位置資料目前無法取得",
-    "get_sheet_stock_chips": "Google Sheet 分點籌碼目前無法取得",
+    "get_sheet_stock_chips": "分點籌碼資料目前無法取得",
     "get_branch_stock_position": "分點部位資料目前無法取得",
     "get_branch_event_performance": "分點事件別績效目前無法取得",
     "detect_current_branch_events": "分點目前事件資料無法取得",
