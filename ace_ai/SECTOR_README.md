@@ -49,6 +49,9 @@
 | `DISCORD_AI_SECTOR_RESULT_TTL` | 300 | 個股比較資料及完整族群結果快取秒數 |
 | `DISCORD_AI_SECTOR_TIMEOUT` | 90 | 一輪族群股票掃描時間上限，名冊取得和 AI 解讀時間另計 |
 | `DISCORD_AI_SECTOR_REQUEST_GAP` | 1.5 | 未命中族群個股快取時的最小啟動間隔秒數，不可低於 1.5 |
+| `DISCORD_AI_SECTOR_LIQUIDITY_DAYS` | 20 | 流動性門檻的計算天數（已收盤交易日） |
+| `DISCORD_AI_SECTOR_MIN_AVG_VALUE` | 50000000 | 排行門檻：平均成交金額（元）；未達者不列入排行 |
+| `DISCORD_AI_SECTOR_MIN_AVG_LOTS` | 500 | 排行門檻：平均成交量（張）；與成交金額兩個條件都要達到 |
 | `DISCORD_AI_FINE_MEMBERS_TTL` | 86400 | 細分類網頁名冊更新間隔秒數 |
 | `DISCORD_AI_FINE_MEMBERS_TIMEOUT` | 12 | 每次公開名冊 HTTP 請求逾時秒數 |
 | `DISCORD_AI_FINE_CATALOG_CACHE` | `.cache/fine_sector_catalog.json` | 細分名冊快取檔；預設相對於程式資料夾，可改為可寫入的絕對路徑 |

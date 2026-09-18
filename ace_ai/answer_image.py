@@ -1267,6 +1267,7 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
         stamp_bg, stamp_ink = TILE_BG, MUTED
     subtitle = ('依型態分數排序｜滿分 100，只評技術結構，不是買賣建議' if technical
                 else '依最新漲跌幅排序｜漲幅領先不代表型態最好')
+    liquidity = str(data.get('liquidity_note') or '')
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
         text_at(draw, (px + 18, y + h), title, 32, INK, True)
@@ -1275,7 +1276,9 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
         text_at(draw, (px, y + h + 56), subtitle, 20, MUTED)
-    h += 56 + 46
+        if liquidity:
+            text_at(draw, (px, y + h + 86), liquidity, 20, MUTED)
+    h += 56 + 46 + (30 if liquidity else 0)
     if not rows:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)

@@ -137,8 +137,9 @@
 
 大產業分類用 FinMind `TaiwanStockInfo`（富果 `TSE`／`OTC` 名冊備援）；30 個細分族群用證交所／櫃買中心公開產業價值鏈網頁，合併上市、上櫃並依代號去重，網站失敗時用 `fine_sector_seed.json` 快照。
 
-- 「形態／型態／比較好」依型態分數排名；「盤中／漲幅／誰最強」依最新漲跌幅排名。每次列前三名，並寫出名冊總數、實際完成比較數與缺資料數；沒掃完整份名冊時不宣稱是全族群前三名。
+- 「形態／型態／比較好」依型態分數排名；「盤中／漲幅／誰最強」依最新漲跌幅排名。圖上顯示前三名卡片與第 4～5 名；有個股缺資料時只加一行小字說明，不宣稱是全族群前三名。
 - 技術排行只比較同一個收盤日期的評分；盤中漲幅排行排除非當日或超過 15 分鐘的報價。
+- **排除成交清淡的個股**：近 20 個交易日平均成交金額 5,000 萬元以上、且平均成交量 500 張以上才列入排行（兩個條件都要達到），避免把沒什麼人交易的冷門股排到前面；門檻寫在圖卡副標題。可用 `DISCORD_AI_SECTOR_MIN_AVG_VALUE`、`DISCORD_AI_SECTOR_MIN_AVG_LOTS`、`DISCORD_AI_SECTOR_LIQUIDITY_DAYS` 調整。
 - 排名、分數、價格與時間由 Python 輸出，AI 最多呼叫一次補充每檔解讀，且逐檔經過事實核對。
 - HBM、CPO、AI 伺服器等沒有精確公開分類的題材，會提示未支援，不套用較大的分類。
 
@@ -237,6 +238,7 @@
 | `DISCORD_AI_PREFIX_COMMAND_ENABLE`（0） | 1＝開啟 `!ace` 文字指令（需開 Message Content Intent） |
 | `DISCORD_AI_TOP15_SCOPE`（全分點） | 權證淨買超排行的統計範圍，可改「精選五分點」 |
 | `WEEKLY_PICK_EXCLUDE_CODES`（2330） | 本週精選排除的股票 |
+| `DISCORD_AI_SECTOR_MIN_AVG_VALUE`（50000000）、`DISCORD_AI_SECTOR_MIN_AVG_LOTS`（500）、`DISCORD_AI_SECTOR_LIQUIDITY_DAYS`（20） | 族群排行的流動性門檻：平均成交金額（元）、平均成交量（張）、計算天數 |
 | `DISCORD_AI_LIVE_FLOW_ENABLE`、`DISCORD_AI_MONEYDJ_TOP_ENABLE`、`WEEKLY_PICK_LIVE_FLOW_ENABLE`（0） | 即時抓 MoneyDJ；很吃記憶體，Railway 容易 out of memory，建議保持 0 |
 
 ---
