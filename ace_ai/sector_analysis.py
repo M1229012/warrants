@@ -16,6 +16,7 @@ import pandas as pd
 
 import warrant_ai_tools as tools
 import weekly_pick
+import fine_sector_catalog as fine_catalog
 
 
 # 只對照分類名稱與官方代碼，成分股一律從資料來源取得。
@@ -38,8 +39,6 @@ INDUSTRIES = {
     "35": ("綠能環保",), "36": ("數位雲端",),
     "37": ("運動休閒",), "38": ("居家生活",),
 }
-FINE_GROUPS = ("記憶體", "散熱", "PCB", "印刷電路板", "機器人", "AI概念", "AI伺服器",
-               "人工智慧", "低軌衛星", "CPO", "矽光子", "COwOS", "先進封裝", "金控", "DRAM", "NAND")
 MEMBER_TTL = max(60, tools._env_int("DISCORD_AI_SECTOR_MEMBERS_TTL", 86400))
 RESULT_TTL = max(10, tools._env_int("DISCORD_AI_SECTOR_RESULT_TTL", 300))
 SCAN_TIMEOUT = max(1.0, tools._env_float("DISCORD_AI_SECTOR_TIMEOUT", 90.0))
@@ -59,7 +58,7 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
         return None
     if re.search(r"(?:支援|可以查|可查).*(?:族群|產業)|(?:有哪些|哪些)(?:族群|產業)|族群列表|產業列表", text):
         return {"mode": "catalog", "industry": "", "name": "產業分類"}
-    group_question = bool(re.search(r"族群|類股|產業|概念股|哪[一幾些]?[檔支家]|誰|排行|排名|成分|名單|比較|最強|最好|有哪些", text))
+    group_question = bool(re.search(r"族群|類股|產業|概念股|哪[一幾些]?[檔支家個]|誰|排行|排名|成分|名單|名冊|比較|最強|最好|有哪些", text))
     matches = []
     remaining = text
     aliases = sorted(((alias.upper(), code) for code, names in INDUSTRIES.items() for alias in names), key=lambda x: -len(x[0]))
@@ -68,10 +67,17 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
             if code not in matches:
                 matches.append(code)
             remaining = remaining.replace(alias, "")
-    fine = next((name for name in FINE_GROUPS if name.upper() in text), "")
-    if fine and (group_question or text == fine.upper() or fine.upper() + "股" in text):
-        return {"mode": "unsupported", "industry": "", "name": fine,
-                "message": f"「{fine}」屬於細分族群，目前免費產業名冊沒有這個分類，不能用較大的產業代替。可先問「半導體族群哪檔型態比較好」或「有哪些族群」。"}
+    fine = fine_catalog.match_group(text)
+    narrow = next((name for name in fine_catalog.UNMAPPED if name.upper() in text), "")
+    if narrow and (group_question or text == narrow.upper() or narrow.upper() + "股" in text):
+        return {"mode": "unsupported", "industry": "", "name": narrow,
+                "message": f"「{narrow}」目前沒有可精確對應的公開細分類，不會混用較大的族群。可問「有哪些族群」查看已支援的細分名冊。"}
+    if fine and (group_question or any(text == alias.upper() or alias.upper() + "股" in text
+                                     for key in fine for alias in fine_catalog.GROUPS[key][1])):
+        if len(fine) > 1:
+            return {"mode": "unsupported", "industry": "", "name": "多個族群",
+                    "message": "這次提到多個細分族群，請一次指定一個族群比較。"}
+        return _request_mode(text, "fine:" + fine[0], fine_catalog.GROUPS[fine[0]][0])
     if len(matches) > 1:
         return {"mode": "unsupported", "industry": "", "name": "多個族群",
                 "message": "這次提到多個產業，請一次指定一個族群比較。"}
@@ -81,16 +87,20 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
                     "message": "目前沒有辨識到支援的產業分類。請問「有哪些族群」查看清單；細分概念股不會自動套用較大的產業。"}
         return None
     code = matches[0]
-    listing = bool(re.search(r"成分|名單|有哪些|包含|有哪[些幾]", text))
-    comparing = bool(re.search(r"比較|好|強|排行|排名|漲|技術|型態|均線|支撐|布林", text))
+    return _request_mode(text, code, INDUSTRIES[code][0])
+
+
+def _request_mode(text, code, name):
+    listing = bool(re.search(r"成分|名單|名冊|有哪些|包含|有哪[些幾]", text))
+    comparing = bool(re.search(r"比較|好|強|排行|排名|漲|技術|型態|形態|均線|支撐|布林", text))
     mode = "members" if listing and not comparing else "technical"
-    explicit_technical = bool(re.search(r"型態|技術|均線|支撐|布林", text))
+    explicit_technical = bool(re.search(r"型態|形態|技術|均線|支撐|布林", text))
     if mode != "members" and not explicit_technical and re.search(r"漲幅|漲跌|盤中|最強|漲最|漲得|今天.*強|今日.*強", text):
         mode = "momentum"
     if re.search(r"分點|籌碼|買超|賣超|新聞|營收|基本面|便宜|估值|勝率", text):
-        return {"mode": "unsupported", "industry": code, "name": INDUSTRIES[code][0],
+        return {"mode": "unsupported", "industry": code, "name": name,
                 "message": "族群比較目前支援成分股名單、技術型態評分及最新漲幅排行；分點、新聞與基本面請先指定個股查詢。"}
-    return {"mode": mode, "industry": code, "name": INDUSTRIES[code][0]}
+    return {"mode": mode, "industry": code, "name": name}
 
 
 def _finmind_catalog() -> pd.DataFrame:
@@ -112,6 +122,8 @@ def _finmind_catalog() -> pd.DataFrame:
 
 
 def get_members(industry: str) -> Dict[str, Any]:
+    if industry.startswith("fine:"):
+        return fine_catalog.get_members(industry[5:])
     if industry not in INDUSTRIES:
         raise tools.ToolDataError("不支援的產業分類")
     key = "members:" + industry
@@ -281,6 +293,9 @@ def get_ranking(industry: str, mode: str) -> Dict[str, Any]:
                   "unprocessed_count": len(members["stocks"]) - len(rows) - len(failed),
                   "comparison_date": date, "generated_at": tools.taipei_now().strftime("%Y-%m-%d %H:%M"),
                   "rows": top}
+        for field in ("market_counts", "scope", "catalog_note", "source_urls", "stale", "missing_categories"):
+            if field in members:
+                result[field] = members[field]
         # 空結果不長時間快取，部分結果短暫共用；個股成功快取讓後續查詢可繼續補齊。
         if top:
             complete = members["complete"] and len(eligible) == len(members["stocks"])
@@ -301,12 +316,14 @@ def format_ranking(data: Dict[str, Any]) -> str:
     total, count = data["total_count"], data["compared_count"]
     lines = [f"**{data['name']}｜{metric}比較**", "【回答】",
              f"名冊共 {total} 檔，符合本次比較條件 {count} 檔。"]
+    if data.get("market_counts"):
+        lines.append(f"名冊涵蓋：上市 {data['market_counts']['twse']} 檔、上櫃 {data['market_counts']['tpex']} 檔。")
     if data["mode"] == "technical":
         lines.append("依既有型態分數排序；分數使用已收盤日K，盤中報價另外列出。")
     else:
         lines.append("依最新漲跌幅由高到低排序；漲幅領先不代表技術型態或未來報酬最佳。")
     if not data["members_complete"]:
-        lines.append("名冊未完整取得上市及上櫃市場，本次僅比較已取得的名單。")
+        lines.append("部分市場或細分類名冊未取得，本次僅比較已取得的名單，不能視為完整族群排行。")
     if count != total:
         lines.append(f"資料失敗 {data['failed_count']} 檔、日期／時效不符 {data['excluded_count']} 檔、未完成 {data['unprocessed_count']} 檔；以下僅為已完成範圍排行，不能視為整個族群前三名。")
     if not data["rows"]:
@@ -321,8 +338,16 @@ def format_ranking(data: Dict[str, Any]) -> str:
                 if row.get(field):
                     lines.append(f"　{label}：{row[field][0]}")
     lines.append(f"資料時間：比較日期 {data['comparison_date'] or '無可用日期'}｜整理於 {data['generated_at']}｜產業名冊 {data['members_updated_at']}")
+    lines.extend(_catalog_details(data))
     lines.append("※ 比較範圍為上市櫃普通股；型態分數不是上漲機率，盤中資料尚待收盤確認。")
     return "\n".join(lines)
+
+
+def _catalog_details(data):
+    if not data.get("scope"):
+        return []
+    return [f"名冊分類：{data['scope']}", data["catalog_note"],
+            "名冊來源：證交所／櫃買中心產業價值鏈資訊平台"]
 
 
 def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
@@ -331,13 +356,21 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         return {"text": request["message"], "calls": 0, "cacheable": True}
     if mode == "catalog":
         names = "、".join(names[0] for names in INDUSTRIES.values())
-        return {"text": f"【可查詢的產業族群】\n{names}\n\n例如：半導體族群哪檔型態比較好、航運股今天誰漲最多、金融股有哪些。\n目前採產業分類，記憶體、散熱等細分概念族群尚未涵蓋。", "calls": 0, "cacheable": True}
+        fine_names = "、".join(group[0] for group in fine_catalog.GROUPS.values())
+        return {"text": f"【可查詢的細分族群】\n{fine_names}\n\n【大產業分類】\n{names}\n\n同時查詢上市、上櫃普通股；細分類依公開產業鏈名冊範圍。\n例如：記憶體族群現在誰形態最好、散熱股今天誰漲最多、PCB族群有哪些。", "calls": 0, "cacheable": True}
     try:
         if mode == "members":
             data = get_members(request["industry"])
-            names = "、".join(f"{s['stock_name']}（{s['stock_code']}）" for s in data["stocks"])
-            warning = "\n部分市場名冊未取得，以下不是完整族群。" if not data["complete"] else ""
-            return {"text": f"**{data['name']}｜成分股名單**\n共 {len(data['stocks'])} 檔上市櫃普通股。{warning}\n{names}\n資料時間：產業名冊 {data['updated_at']}", "calls": 0, "cacheable": data["complete"]}
+            lines = [f"**{data['name']}｜成分股名單**", f"共 {len(data['stocks'])} 檔上市櫃普通股。"]
+            if not data["complete"]:
+                lines.append("部分市場或細分類名冊未取得，以下不是完整族群。")
+            for label, markets in (("上市", ("twse", "TSE")), ("上櫃", ("tpex", "OTC"))):
+                stocks = [s for s in data["stocks"] if s["market"] in markets]
+                names = "、".join(f"{s['stock_name']}（{s['stock_code']}）" for s in stocks)
+                lines.append(f"{label} {len(stocks)} 檔：{names or '來源名冊未列出符合者'}")
+            lines.append(f"資料時間：產業名冊 {data['updated_at']}")
+            lines.extend(_catalog_details(data))
+            return {"text": "\n".join(lines), "calls": 0, "cacheable": data["complete"] and not data.get("stale")}
         data = get_ranking(request["industry"], mode)
     except Exception as exc:
         print(f"族群查詢失敗：{type(exc).__name__}", flush=True)
