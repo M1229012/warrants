@@ -16,8 +16,12 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 COPY ace_ai/requirements.txt /app/ace_ai/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /app/ace_ai/requirements.txt
+# 在 ace_ai/ 目錄內安裝：requirements.txt 裡的 -r ../requirements.txt 不論 pip 以「檔案位置」或
+# 「目前目錄」解析都會指到 /app/requirements.txt（pip 26.2 以目前目錄解析，曾找成 /requirements.txt）。
+# 不再每次升級 pip，避免新版 pip 行為改變讓部署失敗。
+WORKDIR /app/ace_ai
+RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
 COPY . /app
 RUN mkdir -p /app/.cache/matplotlib

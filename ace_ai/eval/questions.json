@@ -77,6 +77,9 @@
     {"id": "E03", "group": "說明", "turns": [{"q": "你可以做什麼", "route": ["help"], "stocks": []}]},
 
     {"id": "K01", "group": "本週精選", "fast_only": true, "turns": [{"q": "本週精選", "route": ["weekly_pick"]}]},
+    {"id": "G01", "group": "族群", "turns": [{"q": "請問記憶體產業 現在誰的形態最強", "route": ["rule_sector"], "stocks": [], "answer_any": ["1. "]}]},
+    {"id": "G02", "group": "族群", "turns": [{"q": "航運股今天誰漲最多", "route": ["rule_sector"], "stocks": []}]},
+    {"id": "G03", "group": "族群", "turns": [{"q": "有哪些族群", "route": ["rule_sector"], "stocks": []}]},
     {"id": "K02", "group": "布林", "turns": [{"q": "2317布林通道開口了嗎", "route": ["rule_pattern"], "stocks": ["2317"], "llm": true}]}
   ]
 }

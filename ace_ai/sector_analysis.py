@@ -180,6 +180,18 @@ def _wait_turn(deadline: float, cancel: threading.Event) -> None:
         raise TimeoutError("族群查詢已取消")
 
 
+def _iso_date(value: Any) -> str:
+    """統一成 YYYY-MM-DD 再比較：既有工具輸出 YYYY/MM/DD，直接和今天的 YYYY-MM-DD 比字串，
+    「/」排在「-」後面，會把每一檔都誤判成未來日期而全部排除。"""
+    if not value:
+        return ""
+    try:
+        stamp = pd.Timestamp(str(value).strip())
+    except (TypeError, ValueError):
+        return ""
+    return "" if pd.isna(stamp) else stamp.strftime("%Y-%m-%d")
+
+
 def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: threading.Event) -> Dict[str, Any]:
     code = stock["stock_code"]
     key = f"stock:{code}:{mode}"
@@ -190,8 +202,11 @@ def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: thread
     overview = tools.get_stock_overview(code)
     if cancel.is_set() or time.monotonic() >= deadline:
         raise TimeoutError("族群查詢已達時間上限")
+    intraday = dict(overview.get("intraday") or {})
+    if intraday.get("date"):
+        intraday["date"] = _iso_date(intraday["date"])
     row = {**stock, "close": overview.get("close"), "change_pct": overview.get("change_pct"),
-           "quote_date": overview.get("data_date"), "intraday": overview.get("intraday") or {}}
+           "quote_date": _iso_date(overview.get("data_date")), "intraday": intraday}
     if (any(v is None or not math.isfinite(float(v)) for v in (row["close"], row["change_pct"]))
             or row["close"] <= 0 or not row["quote_date"]):
         raise tools.ToolDataError("缺少報價或漲跌幅")
@@ -210,7 +225,7 @@ def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: thread
             raise tools.ToolDataError("型態分數無效")
         good, bad = weekly_pick.pattern_reason_lists(score["items"])
         row.update(pattern_score=score["score"], grade=weekly_pick.pattern_grade(score["score"]),
-                   score_date=tech["data_date"], plus_reasons=good[:2], minus_reasons=bad[:2],
+                   score_date=_iso_date(tech["data_date"]), plus_reasons=good[:2], minus_reasons=bad[:2],
                    moving_averages=tech.get("moving_averages", {}),
                    intraday_observation=tech.get("intraday_observation", {}))
     CACHE.set(key, row, RESULT_TTL)
@@ -221,7 +236,9 @@ def _eligible(rows, mode):
     if not rows:
         return [], 0, ""
     field = "score_date" if mode == "technical" else "quote_date"
-    valid = [r for r in rows if str(r.get(field, "")) <= tools.taipei_now().strftime("%Y-%m-%d")]
+    rows = [dict(r, **{field: _iso_date(r.get(field))}) for r in rows]
+    today = tools.taipei_now().strftime("%Y-%m-%d")
+    valid = [r for r in rows if r[field] and r[field] <= today]
     if mode == "momentum" and tools.intraday_session_now():
         # 盤中排行不可把昨收備援混成今天漲幅，也不把過舊成交視為現在。
         now = tools.taipei_now()
@@ -337,8 +354,8 @@ def format_ranking(data: Dict[str, Any]) -> str:
             for label, field in (("得分依據", "plus_reasons"), ("留意", "minus_reasons")):
                 if row.get(field):
                     lines.append(f"　{label}：{row[field][0]}")
-    lines.append(f"資料時間：比較日期 {data['comparison_date'] or '無可用日期'}｜整理於 {data['generated_at']}｜產業名冊 {data['members_updated_at']}")
     lines.extend(_catalog_details(data))
+    lines.append(f"資料時間：比較日期 {data['comparison_date'] or '無可用日期'}｜整理於 {data['generated_at']}｜產業名冊 {data['members_updated_at']}")
     lines.append("※ 比較範圍為上市櫃普通股；型態分數不是上漲機率，盤中資料尚待收盤確認。")
     return "\n".join(lines)
 
