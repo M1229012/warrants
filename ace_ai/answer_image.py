@@ -1078,6 +1078,280 @@ def _compare_mode(panels: list[dict]) -> bool:
     return len(panels) >= 2 and all(p.get('scorecard') and p.get('bars') for p in panels)
 
 
+# ============================================================
+# 族群排行／成分股卡片（會員看的版面：不放名冊來源、檔數統計等執行細節）
+# ============================================================
+
+RANK_COLORS = {1: '#A17936', 2: '#7C8698', 3: '#B0784A'}
+SECTOR_PAD = 36
+SECTOR_INNER = 26
+SECTOR_REASON_SIZE = 22
+SECTOR_REASON_LINE = 33
+SECTOR_OTHER_ROW_H = 46
+
+
+def _display_name(name) -> str:
+    return str(name or '').rstrip('*＊').strip()
+
+
+def _market_label(market) -> str:
+    return '上市' if str(market) in ('twse', 'TSE') else '上櫃' if str(market) in ('tpex', 'OTC') else ''
+
+
+def _plain_reason(text: str) -> str:
+    """「站上所有均線（均線排列 8/12）」→「站上所有均線」：會員版不顯示小項配分。"""
+    return _REASON_POINTS_RE.sub('', str(text or '')).strip()
+
+
+def _sector_date(date: str) -> str:
+    return str(date or '')[5:].replace('-', '/') if date else ''
+
+
+def _labeled_lines(label_w: float, width: float, items: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, list[str]]]:
+    """（標籤, 標籤底色, 文字色, 文字）→ 依寬度換行後的結果。"""
+    return [(label, bg, ink, wrap(text, SECTOR_REASON_SIZE, width - label_w - 14))
+            for label, bg, ink, text in items if text]
+
+
+def _rank_card_items(row: dict, technical: bool) -> list[tuple[str, str, str, str]]:
+    items = []
+    if technical:
+        plus = [_plain_reason(t) for t in row.get('plus_reasons') or []][:1]
+        minus = [_plain_reason(t) for t in row.get('minus_reasons') or []][:1]
+        items += [('優勢', GOOD_BG, GOOD_INK, t) for t in plus]
+        items += [('留意', WARN_BG, WARN_INK, t) for t in minus]
+    if row.get('observation'):
+        items.append(('解讀', ACCENT_BG, INK, str(row['observation'])))
+    return items
+
+
+def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: bool, dry: bool) -> int:
+    """前三名卡片：名次徽章＋股名／代號／市場＋分數（或漲幅）＋分數條＋優勢／留意／AI 解讀。"""
+    rank = int(row.get('rank') or 0)
+    label_w = 64
+    lines = _labeled_lines(label_w, width - SECTOR_INNER * 2, _rank_card_items(row, technical))
+    body_h = sum(max(1, len(ls)) * SECTOR_REASON_LINE + 10 for *_, ls in lines)
+    head_h = 178 if technical else 150   # 名稱列＋價格列（＋分數條），和下方說明至少隔 20px
+    height = int(head_h + body_h + SECTOR_INNER - 10)
+    if dry:
+        return height
+    first = rank == 1
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=18,
+                           fill=ACCENT_BG if first else TILE_BG, outline=ACCENT if first else LINE, width=2 if first else 1)
+    ix, right = x + SECTOR_INNER, x + width - SECTOR_INNER
+    # 名次徽章
+    color = RANK_COLORS.get(rank, MUTED)
+    cx, cy = ix + 28, y + SECTOR_INNER + 30
+    draw.ellipse((cx - 28, cy - 28, cx + 28, cy + 28), fill=color)
+    draw.text((cx, cy), str(rank), font=font(30, True), fill='white', anchor='mm')
+    # 股名＋代號＋市場
+    nx = ix + 74
+    name = _display_name(row.get('stock_name'))
+    draw.text((nx, cy + 12), name, font=font(34, True), fill=INK, anchor='ls')
+    tx = nx + font(34, True).getlength(name) + 14
+    code = str(row.get('stock_code', ''))
+    draw.text((tx, cy + 12), code, font=font(24), fill=MUTED, anchor='ls')
+    tx += font(24).getlength(code) + 12
+    market = _market_label(row.get('market'))
+    if market:
+        mw = font(17, True).getlength(market) + 18
+        draw.rounded_rectangle((tx, cy - 9, tx + mw, cy + 15), radius=12, fill='white', outline=LINE)
+        draw.text((tx + mw / 2, cy + 3), market, font=font(17, True), fill=MUTED, anchor='mm')
+    # 右側：分數＋分級（型態排行）或漲跌幅（漲幅排行）
+    change = _finite(row.get('change_pct'))
+    change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+    if technical:
+        grade = str(row.get('grade', ''))
+        bg, ink = GRADE_STYLE.get(grade, (TILE_BG, INK))
+        gw = font(20, True).getlength(grade) + 30
+        draw.rounded_rectangle((right - gw, cy - 16, right, cy + 20), radius=18, fill=bg)
+        draw.text((right - gw / 2, cy + 2), grade, font=font(20, True), fill=ink, anchor='mm')
+        sx = right - gw - 16
+        draw.text((sx, cy + 18), '/ 100', font=font(20), fill=MUTED, anchor='rs')
+        sx -= font(20).getlength('/ 100') + 8
+        score = _finite(row.get('pattern_score')) or 0.0
+        draw.text((sx, cy + 18), f'{score:.1f}', font=font(48, True), fill=ACCENT if first else INK, anchor='rs')
+    else:
+        text = f'{change:+.2f}%' if change is not None else '—'
+        draw.text((right, cy + 18), text, font=font(48, True), fill=change_color, anchor='rs')
+    # 第二行：股價與漲跌
+    live = (row.get('intraday') or {}).get('is_live')
+    price_label = '成交' if live else '收盤'
+    ly = y + SECTOR_INNER + 92
+    close = _finite(row.get('close'))
+    draw.text((nx, ly), f'{price_label} {number(close) if close is not None else "—"}', font=font(22), fill=INK, anchor='ls')
+    px_ = nx + font(22).getlength(f'{price_label} {number(close) if close is not None else "—"}') + 18
+    if technical and change is not None:
+        draw.text((px_, ly), f'{change:+.2f}%', font=font(22, True), fill=change_color, anchor='ls')
+    elif not technical:
+        info = row.get('intraday') or {}
+        when = f"盤中 {info.get('time', '')}" if live else f"{_sector_date(row.get('quote_date'))} 收盤"
+        draw.text((px_, ly), when, font=font(20), fill=MUTED, anchor='ls')
+    # 分數條
+    if technical:
+        by = y + SECTOR_INNER + 122
+        score = _finite(row.get('pattern_score')) or 0.0
+        draw.rounded_rectangle((nx, by, right, by + 10), radius=5, fill=LINE)
+        filled = max(0.0, min(1.0, score / 100)) * (right - nx)
+        if filled > 10:
+            draw.rounded_rectangle((nx, by, nx + filled, by + 10), radius=5, fill=color if not first else ACCENT)
+    # 優勢／留意／AI 解讀
+    ry = y + head_h
+    for label, bg, ink, ls in lines:
+        # 顏色只放在標籤，說明文字一律深色，比較好讀。
+        draw.rounded_rectangle((ix, ry - 1, ix + label_w, ry + 27), radius=14, fill=bg if bg != ACCENT_BG or not first else 'white')
+        draw.text((ix + label_w / 2, ry + 13), label, font=font(18, True), fill=ink if label != '解讀' else ACCENT, anchor='mm')
+        for i, line in enumerate(ls):
+            text_at(draw, (ix + label_w + 14, ry + i * SECTOR_REASON_LINE), line, SECTOR_REASON_SIZE, INK)
+        ry += max(1, len(ls)) * SECTOR_REASON_LINE + 10
+    return height
+
+
+def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], technical: bool, dry: bool) -> int:
+    height = TABLE_HEAD_H + len(rows) * SECTOR_OTHER_ROW_H
+    if dry:
+        return height
+    draw.rounded_rectangle((x, y, x + width, y + TABLE_HEAD_H), radius=8, fill=TILE_BG)
+    heads = (('名次', x + 16, 'lm'), ('個股', x + 96, 'lm'))
+    if technical:
+        heads += (('型態分數', x + 470, 'lm'), ('分級', x + width - 330, 'lm'), ('漲跌', x + width - 16, 'rm'))
+    else:
+        heads += (('價格', x + width - 200, 'rm'), ('漲跌', x + width - 16, 'rm'))
+    for label, lx, anchor in heads:
+        draw.text((lx, y + TABLE_HEAD_H / 2), label, font=font(17), fill=MUTED, anchor=anchor)
+    ry = y + TABLE_HEAD_H
+    for row in rows:
+        mid = ry + SECTOR_OTHER_ROW_H / 2
+        draw.text((x + 34, mid), str(row.get('rank', '')), font=font(21, True), fill=MUTED, anchor='mm')
+        name = f"{_display_name(row.get('stock_name'))}  {row.get('stock_code', '')}"
+        text, size = fit(name, 22, 360, False)
+        draw.text((x + 96, mid), text, font=font(size), fill=INK, anchor='lm')
+        change = _finite(row.get('change_pct'))
+        change_text = f'{change:+.2f}%' if change is not None else '—'
+        change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+        if technical:
+            score = _finite(row.get('pattern_score')) or 0.0
+            bar_l, bar_r = x + 470, x + width - 430
+            draw.rounded_rectangle((bar_l, mid - 5, bar_r, mid + 5), radius=5, fill=LINE)
+            filled = max(0.0, min(1.0, score / 100)) * (bar_r - bar_l)
+            if filled > 10:
+                draw.rounded_rectangle((bar_l, mid - 5, bar_l + filled, mid + 5), radius=5, fill='#C9B48E')
+            draw.text((bar_r + 70, mid), f'{score:.1f}', font=font(21, True), fill=INK, anchor='rm')
+            grade = str(row.get('grade', ''))
+            bg, ink = GRADE_STYLE.get(grade, (TILE_BG, INK))
+            gw = font(17, True).getlength(grade) + 22
+            gx = x + width - 330
+            draw.rounded_rectangle((gx, mid - 14, gx + gw, mid + 14), radius=14, fill=bg)
+            draw.text((gx + gw / 2, mid), grade, font=font(17, True), fill=ink, anchor='mm')
+        else:
+            close = _finite(row.get('close'))
+            draw.text((x + width - 200, mid), number(close) if close is not None else '—', font=font(21), fill=INK, anchor='rm')
+        draw.text((x + width - 16, mid), change_text, font=font(21, True), fill=change_color, anchor='rm')
+        draw.line((x, ry + SECTOR_OTHER_ROW_H, x + width, ry + SECTOR_OTHER_ROW_H), fill=LINE)
+        ry += SECTOR_OTHER_ROW_H
+    return height
+
+
+def sector_card(draw, y: float, data: dict, dry: bool) -> int:
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    px, width = x0 + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
+    technical = data.get('mode') == 'technical'
+    rows = data.get('rows') or []
+    h = 34
+    title = f"{data.get('name', '')}｜{'型態排行' if technical else '漲幅排行'}"
+    if data.get('live_time') and not technical:
+        stamp = f"盤中 {data['live_time']}｜收盤前會變動"
+        stamp_bg, stamp_ink = WARN_BG, WARN_INK
+    else:
+        stamp = f"{_sector_date(data.get('comparison_date'))} 收盤" if data.get('comparison_date') else ''
+        stamp_bg, stamp_ink = TILE_BG, MUTED
+    subtitle = ('依型態分數排序｜滿分 100，只評技術結構，不是買賣建議' if technical
+                else '依最新漲跌幅排序｜漲幅領先不代表型態最好')
+    if not dry:
+        draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
+        text_at(draw, (px + 18, y + h), title, 32, INK, True)
+        if stamp:
+            sw = font(19, True).getlength(stamp) + 30
+            draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
+            draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
+        text_at(draw, (px, y + h + 56), subtitle, 20, MUTED)
+    h += 56 + 46
+    if not rows:
+        if not dry:
+            text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)
+        h += 60
+    for row in rows:
+        h += _rank_card(draw, px, y + h, width, row, technical, dry) + 18
+    others = data.get('others') or []
+    if others:
+        h += 10
+        h += _sub_heading(draw, px, y + h, '其他排名', '', width, dry)
+        h += _other_rows_table(draw, px, y + h, width, others, technical, dry) + 18
+    note = str(data.get('coverage_note') or '')
+    if note:
+        if not dry:
+            text_at(draw, (px, y + h + 4), f'※ {note}', 19, MUTED)
+        h += 36
+    h += 22
+    return int(h)
+
+
+def members_card(draw, y: float, data: dict, dry: bool) -> int:
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    px, width = x0 + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
+    twse, tpex = data.get('twse') or [], data.get('tpex') or []
+    h = 34
+    if not dry:
+        draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
+        text_at(draw, (px + 18, y + h), f"{data.get('name', '')}｜成分股", 32, INK, True)
+        text_at(draw, (px, y + h + 56), f'共 {len(twse) + len(tpex)} 檔：上市 {len(twse)} 檔、上櫃 {len(tpex)} 檔', 20, MUTED)
+    h += 56 + 50
+    chip_h, gap = 42, 10
+    for label, stocks in (('上市', twse), ('上櫃', tpex)):
+        if not dry:
+            text_at(draw, (px, y + h), f'{label}  {len(stocks)} 檔', 23, INK, True)
+        h += 42
+        if not stocks:
+            if not dry:
+                text_at(draw, (px, y + h), '此分類沒有這個市場的個股', 21, MUTED)
+            h += 44
+            continue
+        widths = [font(21, True).getlength(_display_name(s['stock_name'])) + font(18).getlength(s['stock_code']) + 44 for s in stocks]
+        cx, cy = px, y + h
+        for s, w in zip(stocks, widths):
+            if cx > px and cx + w > px + width:
+                cx, cy = px, cy + chip_h + gap
+            if not dry:
+                draw.rounded_rectangle((cx, cy, cx + w, cy + chip_h), radius=21, fill=TILE_BG, outline=LINE)
+                name = _display_name(s['stock_name'])
+                draw.text((cx + 16, cy + chip_h / 2), name, font=font(21, True), fill=INK, anchor='lm')
+                draw.text((cx + 16 + font(21, True).getlength(name) + 10, cy + chip_h / 2), s['stock_code'],
+                          font=font(18), fill=MUTED, anchor='lm')
+            cx += w + gap
+        h += _flow_rows(widths, width, gap) * (chip_h + gap) + 18
+    note = str(data.get('coverage_note') or '')
+    if note:
+        if not dry:
+            text_at(draw, (px, y + h), f'※ {note}', 19, MUTED)
+        h += 36
+    h += 18
+    return int(h)
+
+
+def _sector_block(draw, y: float, panel: dict, dry: bool) -> int:
+    """先量高度、畫白底卡片，再畫內容（避免底色蓋掉文字）。"""
+    fn, data = (sector_card, panel['sector']) if panel.get('sector') else (members_card, panel['sector_members'])
+    height = fn(None, 0, data, True)
+    if not dry:
+        draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + height), radius=20, fill='white', outline=LINE)
+        fn(draw, y, data, False)
+    return height
+
+
+def _is_sector_panel(panel: dict) -> bool:
+    return bool((panel or {}).get('sector') or (panel or {}).get('sector_members'))
+
+
 def header_brand(draw, title: str, size: int, brand: str = 'ACE / RESEARCH') -> None:
     """頁首：左邊標題、右邊品牌字，右緣對齊下方卡片（WIDTH - MARGIN），兩者同一條文字基線。"""
     baseline = 66 + font(size, True).getmetrics()[0]
@@ -1103,18 +1377,22 @@ def panel_block_height(panel: dict) -> int:
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯 AI｜研究筆記', demo: bool = False) -> Image.Image:
     panels = panels or []
+    # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
+    sector_panels = [p for p in panels if _is_sector_panel(p)]
+    panels = [p for p in panels if not _is_sector_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
         panels = [{**p, 'compact': True} for p in panels]
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
-    blocks = body_blocks(answer)
-    body_height = sum(b.height for b in blocks) + 68
+    blocks = [] if sector_panels else body_blocks(answer)
+    body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
     else:
         panels_height = sum(panel_block_height(p) for p in panels)
+    panels_height += sum(_sector_block(None, 0, p, True) + 24 for p in sector_panels)
     height = header_height + panels_height + body_height + 112
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
@@ -1131,7 +1409,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
             y += scorecard(None, 0, panel['scorecard'], True) + 24
     if compare:
         y += compare_card(draw, y, panels, False) + 24
-    draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
+    for panel in sector_panels:
+        y += _sector_block(draw, y, panel, False) + 24
+    if blocks:
+        draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
     for block in blocks:
         if block.kind == 'heading':
@@ -1148,7 +1429,12 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
     draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
-    text_at(draw, (MARGIN, height - 49), price_footer(panels) if panels else '股市艾斯  /  AI 資料整理', 20, MUTED)
+    if sector_panels:
+        live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
+        footer = '股市艾斯  /  盤中漲幅為暫定值，收盤前會變動' if live else '股市艾斯  /  族群排行依日 K 收盤資料計算'
+    else:
+        footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'
+    text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
     return image
 
 

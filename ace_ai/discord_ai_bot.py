@@ -2181,8 +2181,10 @@ class AceQueryEngine:
             return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
 
         result = sector_analysis.answer(request, self.gateway, validate)
+        # 會員看到的是 panels 畫出的族群卡片；text 保留給 Log 與 --ask。
         return AnswerResult(text=result["text"], route="rule_sector", gemini_calls=result["calls"],
-                            elapsed=time.perf_counter() - started, cacheable=result["cacheable"])
+                            elapsed=time.perf_counter() - started, cacheable=result["cacheable"],
+                            panels=result.get("panels") or [])
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
         """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""

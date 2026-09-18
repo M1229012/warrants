@@ -303,13 +303,15 @@ def get_ranking(industry: str, mode: str) -> Dict[str, Any]:
         metric = "pattern_score" if mode == "technical" else "change_pct"
         eligible.sort(key=lambda row: (-row[metric], row["stock_code"]))
         top = [dict(row, rank=i + 1) for i, row in enumerate(eligible[:3])]
+        others = [{"rank": i + 4, **{k: row.get(k) for k in ("stock_code", "stock_name", "market", "close", "change_pct", "pattern_score", "grade")}}
+                  for i, row in enumerate(eligible[3:5])]  # 圖上最多顯示到第 5 名
         result = {"name": members["name"], "mode": mode, "source": members["source"],
                   "members_updated_at": members["updated_at"], "members_complete": members["complete"],
                   "missing_markets": members["missing_markets"], "total_count": len(members["stocks"]),
                   "compared_count": len(eligible), "failed_count": len(failed), "excluded_count": excluded,
                   "unprocessed_count": len(members["stocks"]) - len(rows) - len(failed),
                   "comparison_date": date, "generated_at": tools.taipei_now().strftime("%Y-%m-%d %H:%M"),
-                  "rows": top}
+                  "rows": top, "others": others}
         for field in ("market_counts", "scope", "catalog_note", "source_urls", "stale", "missing_categories"):
             if field in members:
                 result[field] = members[field]
@@ -367,6 +369,36 @@ def _catalog_details(data):
             "名冊來源：證交所／櫃買中心產業價值鏈資訊平台"]
 
 
+_PANEL_ROW_FIELDS = ("rank", "stock_code", "stock_name", "market", "close", "change_pct", "pattern_score", "grade",
+                     "plus_reasons", "minus_reasons", "quote_date", "intraday")
+
+
+def ranking_panel(data: Dict[str, Any], observations: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """族群排行圖卡資料：前三名（含 AI 解讀）＋第 4～5 名；只在沒掃完整份名冊時附一句涵蓋說明。"""
+    observations = observations or {}
+    rows = [dict({k: row.get(k) for k in _PANEL_ROW_FIELDS}, observation=observations.get(row["stock_code"], ""))
+            for row in data["rows"]]
+    missing = data["total_count"] - data["compared_count"]
+    note = ""
+    if not data["members_complete"]:
+        note = "部分成分股名單暫時無法取得，排行只涵蓋已取得的個股"
+    elif missing > 0:
+        note = f"{missing} 檔暫無同日資料，未列入排行"
+    live = [r.get("intraday") or {} for r in rows]
+    return {"sector": {"name": data["name"], "mode": data["mode"], "comparison_date": data["comparison_date"],
+                       "rows": rows, "others": data.get("others") or [], "coverage_note": note,
+                       "live_time": next((i.get("time", "") for i in live if i.get("is_live")), "")}}
+
+
+def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
+    markets = {"twse": [], "tpex": []}
+    for s in data["stocks"]:
+        markets["twse" if s["market"] in ("twse", "TSE") else "tpex"].append({"stock_code": s["stock_code"], "stock_name": s["stock_name"]})
+    note = "" if data["complete"] else "部分成分股名單暫時無法取得，以下不是完整名單"
+    return {"sector_members": {"name": data["name"], "twse": markets["twse"], "tpex": markets["tpex"],
+                               "updated_at": data.get("updated_at", ""), "coverage_note": note}}
+
+
 def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     mode = request["mode"]
     if mode == "unsupported":
@@ -387,14 +419,15 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
                 lines.append(f"{label} {len(stocks)} 檔：{names or '來源名冊未列出符合者'}")
             lines.append(f"資料時間：產業名冊 {data['updated_at']}")
             lines.extend(_catalog_details(data))
-            return {"text": "\n".join(lines), "calls": 0, "cacheable": data["complete"] and not data.get("stale")}
+            return {"text": "\n".join(lines), "calls": 0, "cacheable": data["complete"] and not data.get("stale"),
+                    "panels": [members_panel(data)]}
         data = get_ranking(request["industry"], mode)
     except Exception as exc:
         print(f"族群查詢失敗：{type(exc).__name__}", flush=True)
         return {"text": "族群名冊或行情暫時無法取得，請稍後再試；其他個股查詢仍可使用。", "calls": 0, "cacheable": False}
     text = format_ranking(data)
     if not data["rows"]:
-        return {"text": text, "calls": 0, "cacheable": False}
+        return {"text": text, "calls": 0, "cacheable": False, "panels": [ranking_panel(data)]}
     # 排名、數字、時間及涵蓋率由 Python 固定輸出；AI 只補充各檔的解讀。
     schema = {"type": "object", "properties": {"observations": {"type": "array", "items": {
         "type": "object", "properties": {"stock_code": {"type": "string"}, "text": {"type": "string"}},
@@ -405,7 +438,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
               "若只有漲幅資料，只能解釋漲幅相對位置，不得推測資金、主力、新聞或均線；所有漲幅都負值時不可稱上漲。"
               "資料不足就說不足；不是全族群完整排行時不能宣稱全族群最佳。\n" + json.dumps(data, ensure_ascii=False))
     result = gateway.generate(prompt, purpose="sector_answer", schema=schema, temperature=0.2)
-    accepted = []
+    accepted, observations = [], {}
     if result.ok:
         try:
             payload = json.loads(result.text)
@@ -420,6 +453,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
                 row = by_code[code]
                 if validate(explanation, row):
                     accepted.append((row["rank"], f"・{row['stock_name']}（{code}）：{explanation.strip()}"))
+                    observations[code] = explanation.strip()
                     seen.add(code)
         except (ValueError, TypeError, AttributeError):
             pass
@@ -427,4 +461,5 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         text += "\n\n【AI 解讀】\n" + "\n".join(item[1] for item in sorted(accepted))
     elif not result.ok:
         text += "\n\nAI 解讀暫時無法使用，以上為程式計算結果。"
-    return {"text": text, "calls": 1, "cacheable": data["members_complete"] and data["compared_count"] == data["total_count"] and bool(accepted)}
+    return {"text": text, "calls": 1, "panels": [ranking_panel(data, observations)],
+            "cacheable": data["members_complete"] and data["compared_count"] == data["total_count"] and bool(accepted)}
