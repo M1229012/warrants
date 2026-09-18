@@ -26,9 +26,10 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import warrant_ai_tools as tools
 import weekly_pick
@@ -391,7 +392,8 @@ HELP_MESSAGE = (
     "• `/ask 永豐金內湖D事件勝率`\n"
     "• `/ask 永豐金內湖最近在買什麼`\n"
     "• `/ask 2344最近有什麼新聞，偏利多還是利空`\n"
-    "• `/ask 目前權證買超金額最大的是誰？技術面如何`"
+    "• `/ask 目前權證買超金額最大的是誰？技術面如何`\n"
+    "可以接著追問，例如先問「幫我分析華邦電」，再問「那它的壓力在哪」「跟旺宏比呢」；輸入「重新開始」可清除上一題。"
 )
 
 PLANNER_TOOLS = (
@@ -748,12 +750,12 @@ class GeminiGateway:
     """重用 _call_gemini_with_retry（多 Key fallback、retry、structured output）。
 
     - cache_task 留空、write_cache=False：不讀寫週報的 Google Sheet Gemini 快取，也不寫本機 prompt 快取。
-    - 同一時間只允許一個 Gemini 呼叫，避免 Free Tier 被併發打爆。
+    - 同一時間最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 2）個 Gemini 呼叫，避免被併發打爆額度。
     """
 
     def __init__(self, log: DebugLog) -> None:
         self.log = log
-        self._lock = threading.Lock()
+        self._lock = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_CONCURRENCY", 2)))
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         kf = tools.core()
@@ -804,14 +806,17 @@ class GeminiGateway:
 
 FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能依 tool_results 回答。
 規則：
-1. 不可自創任何數據；數字照 tool_results 原樣寫，大金額可以精確換算成「萬／億」（例如 1,120,000,000 寫成 11.2 億），但不可四捨五入成約數。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。
+1. 不可自創任何數據；數字照 tool_results 原樣寫，大金額可以精確換算成「萬／億」（例如 1,120,000,000 寫成 11.2 億），但不可四捨五入成約數。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。使用者在問題裡說的價格（成本、假設跌到多少）要寫成「你的成本」「假設跌到」，不可當成現價或報價；比較兩檔時，每句的數字只能用該句股票自己的資料；「站上／跌破」某條均線要和資料一致（moving_averages 的 position，或評分卡關鍵價位在現價下方＝站上、上方＝跌破），盤中與收盤不同時照技術面規則寫「盤中暫時」。系統會逐句核對，不符合的句子會被刪除。
 2. 保持客觀中性：用「偏多條件／偏空條件」描述，每個判斷都附上依據，有利與不利的條件都要寫；不用「強勢、看好、危險、暴漲、慘」等帶情緒或暗示方向的字眼。AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
 3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
 4. 回答排進圖片，口語、精簡，每段 1～3 句，每句要完整通順（不要用刪節號、不要半句）；同一件事只講一次。圖片已顯示股價、均線、布林、KD、MACD、成交量、大量區與分點標註，文字不可逐項列出這些數值，要寫「代表什麼」並回答問題；只有說明條件時才引用 1～2 個關鍵價位。
 5. 不要提到資料供應商或系統名稱（例如富果、FinMind、Google Sheet、工作表名稱），需要時只說「日K收盤資料」「盤中即時報價」「追蹤分點統計」；新聞的媒體名稱可以照寫。輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間。data_source 或 intraday.is_live 顯示「盤中」時，要提醒今天的 K 棒、均線、指標與成交量都是盤中暫定值、收盤前會變動（成交量只是目前累計，量比偏低很正常）；否則註明是日K收盤資料。
 6. 一定先寫【回答】直接回應使用者問的事。問「明天會不會漲、漲的機率」這類預測：說明無法預測漲跌或給機率，改用型態分數、今天 K 棒、量能與關鍵價位客觀說明偏多與偏空的條件。問 K 棒型態（例如仙人指路、長上影、長下影、十字線、吞噬）：依 get_stock_overview.candle（實體、上影線、下影線占前日收盤 %、收盤在當日區間的位置）、量比與型態評分卡（是否剛突破、相對位置），對照該型態的常見定義說明符合或不符合與常見解讀，不可斷言後續走勢。"""
 
-FINAL_TECH_RULES = """技術面規則：布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀；null 不可判定有或沒有。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
+FINAL_TECH_RULES = """技術面規則：
+- 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
+- 盤中累計成交量不可和日均量比較，也不可據此判斷量縮、量增或爆量；volume_suspect=true 時不解讀量能。
+- 布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
 
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
 - 同一事件的多篇報導合併，整理成 2～4 點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、來源與日期；不要逐條重列標題。
@@ -899,7 +904,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         if has_scorecard:
             # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
-            data = {k: data.get(k) for k in ("stock_code", "data_date", "kd", "macd", "bollinger", "ma20_cross_recent_3_days", "ma_kline_signals")}
+            data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger", "ma20_cross_recent_3_days", "ma_kline_signals")}
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
@@ -912,7 +917,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
     elif name == "get_stock_overview":
         candle = _candle_shape(data)
-        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_status", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
         data["candle"] = candle
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
@@ -1029,11 +1034,253 @@ def find_ungrounded_numbers(answer: str, payload: Dict[str, Any]) -> List[str]:
 _SENTENCE_RE = re.compile(r"[^。！？；\n]*[。！？；]?")
 
 
-def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any]) -> Tuple[str, List[str]]:
-    """逐行逐句檢查，刪除含有 tool_results 對不上數字的句子；標題行（【…】）保留。回傳（刪減後文字, 被刪的句子）。"""
-    kept_lines, removed = [], []
+# ============================================================
+# 事實核對：數字之外，再核對「股票歸屬、均線標籤與數值、站上／跌破方向、題目假設價」
+# 全部用 Python 規則比對 Tool 原始結果，不另外呼叫 Gemini；只刪有問題的句子。
+# ============================================================
+
+_USER_INPUT_KEYS = {"cost_price"}          # 這些欄位的數字來自使用者輸入，不是市場資料
+_MA_ALIAS = {"週線": "MA5", "周線": "MA5", "雙週線": "MA10", "月線": "MA20", "季線": "MA60", "半年線": "MA120", "年線": "MA240"}
+_MA_ALL_WORDS = ("所有均線", "全部均線", "各均線", "各條均線")
+_MA_NAME = r"(?:(?<![A-Za-z])MA\s?\d{1,3}|雙週線|週線|周線|月線|季線|半年線|年線)"
+_MA_LABEL = r"(?:" + _MA_NAME + r"|所有均線|全部均線|各均線|各條均線)"
+# 「月線 31.2 元」「MA20（31.2）」「季線約 45」：標籤後面緊接的價格；後面接 %／日／張等單位的是距離或天數，不核對。
+_MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d+(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
+_DIRECTION_RE = re.compile(
+    r"(站上|站穩|站回|突破|守住|守穩|跌破|失守|跌落|摜破)\s*((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)")
+_UP_WORDS = {"站上", "站穩", "站回", "突破", "守住", "守穩"}
+# 條件、否定、未來、過去的句子不是在陳述「現在的位置」，不核對方向，避免誤刪。
+_DIRECTION_SKIP_RE = re.compile(
+    r"若|如果|一旦|假如|倘若|假設|需|須|必須|要|能否|是否|未|沒|不|等待|等|觀察|才|可能|恐|會|將|可望|機會|留意|注意|關注|避免|"
+    r"之前|前一|先前|日前|前天|前幾|之後|以後|後續|隨後|明天|明日|後天|再|否|曾|過去|昨|試圖|嘗試|挑戰|接近|逼近|測試|回測")
+_PRICE_SUBJECT_RE = re.compile(r"股價|價格|收盤|現價|盤中|K\s?棒|報價|今日|今天|目前")
+_NON_PRICE_SUBJECT_RE = re.compile(r"成本|均價|買點|目標|扣抵")
+_INTRADAY_WORD_RE = re.compile(r"盤中|暫時|即時|目前|現在|今日|今天|此刻|最新成交")
+_ASSUME_RE = re.compile(r"成本|假設|假如|如果|若|倘若|買在|買進|買入|進場|均價|持有|持股|部位|停損|套在|套牢|攤平|帳面|損益|虧損|獲利|報酬|你|您|題目|設定")
+_CLAUSE_SPLIT_RE = re.compile(r"[，,：:]")
+_PAREN_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
+_HEADING_RE = re.compile(r"^(?:\*\*|【|#)")
+
+
+def _strip_keys(value: Any, keys: Set[str]) -> Any:
+    if isinstance(value, dict):
+        return {k: _strip_keys(v, keys) for k, v in value.items() if k not in keys}
+    if isinstance(value, list):
+        return [_strip_keys(v, keys) for v in value]
+    return value
+
+
+def _find_values(value: Any, key: str) -> List[Any]:
+    found: List[Any] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == key and v is not None:
+                found.append(v)
+            found += _find_values(v, key)
+    elif isinstance(value, list):
+        for v in value:
+            found += _find_values(v, key)
+    return found
+
+
+def _variants_of(text: str) -> Set[str]:
+    variants: Set[str] = set()
+    for token in set(_NUMBER_RE.findall(text)):
+        variants |= _number_variants(token)
+        variants |= _unit_variants(token)
+    return variants
+
+
+def _ma_key(label: str) -> str:
+    label = re.sub(r"\s+", "", label)
+    return _MA_ALIAS.get(label, label.upper())
+
+
+def _numeric_values(value: Any) -> List[float]:
+    numbers: List[float] = []
+    if isinstance(value, bool):
+        return numbers
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, dict):
+        for v in value.values():
+            numbers += _numeric_values(v)
+    elif isinstance(value, list):
+        for v in value:
+            numbers += _numeric_values(v)
+    return numbers
+
+
+class FactSheet:
+    """從 Tool 原始結果整理可核對的事實：每檔股票的數字、均線數值、收盤確認與盤中的均線位置。"""
+
+    def __init__(self, question: str, results: Sequence[tools.ToolResult], payload: Dict[str, Any]) -> None:
+        self.stocks: Dict[str, str] = {}
+        self.stock_numbers: Dict[str, Set[str]] = {}
+        self.shared_numbers: Set[str] = set()
+        self.ma_values: Dict[str, Dict[str, List[float]]] = {}
+        self.closed_pos: Dict[str, Dict[str, str]] = {}
+        self.live_pos: Dict[str, Dict[str, str]] = {}
+        tool_results = payload.get("tool_results") or {}
+        self.market = _variants_of(json.dumps(_strip_keys(tool_results, _USER_INPUT_KEYS), ensure_ascii=False, default=str))
+        user_text = " ".join([question] + [str(v) for v in _find_values(tool_results, "cost_price")])
+        self.user_only = _variants_of(user_text) - self.market
+        for result in results:
+            if result.ok and isinstance(result.data, dict):
+                self._add_result(result.name, result.data)
+
+    def _add_result(self, name: str, data: Dict[str, Any]) -> None:
+        code = str(data.get("stock_code") or "")
+        numbers = _variants_of(json.dumps(_strip_keys(data, _USER_INPUT_KEYS), ensure_ascii=False, default=str))
+        if not code:
+            self.shared_numbers |= numbers
+            return
+        self.stock_numbers.setdefault(code, set()).update(numbers)
+        if data.get("stock_name"):
+            self.stocks[code] = str(data["stock_name"])
+        else:
+            self.stocks.setdefault(code, "")
+        values = self.ma_values.setdefault(code, {})
+        closed = self.closed_pos.setdefault(code, {})
+        for key, info in (data.get("moving_averages") or {}).items():
+            if isinstance(info, dict):
+                if info.get("value") is not None:
+                    values.setdefault(key, []).append(float(info["value"]))
+                if info.get("position") in ("站上", "跌破", "持平"):
+                    closed[key] = info["position"]
+        for key, info in (data.get("ma_deduction") or {}).items():
+            values.setdefault(key, []).extend(_numeric_values(info))  # 扣抵價、明天需收在多少才上彎等
+        # 型態評分卡沒有 moving_averages：用關鍵價位表補（現價下方＝站上、上方＝跌破）。
+        for field_name, position in (("supports_below_close", "站上"), ("resistances_above_close", "跌破")):
+            for level in data.get(field_name) or []:
+                label = str((level or {}).get("label") or "")
+                if re.fullmatch(r"MA\d+", label) and level.get("price") is not None:
+                    values.setdefault(label, []).append(float(level["price"]))
+                    closed.setdefault(label, position)
+        live = (data.get("intraday_observation") or {}).get("ma_positions") or {}
+        if live:
+            self.live_pos.setdefault(code, {}).update({k: v for k, v in live.items() if v in ("站上", "跌破", "持平")})
+
+    # ---------- 股票辨識 ----------
+    def mentioned(self, text: str) -> List[str]:
+        found = []
+        for code, name in self.stocks.items():
+            if (name and name in text) or re.search(rf"(?<!\d){re.escape(code)}(?!\d)", text):
+                found.append(code)
+        return found
+
+    def heading_stock(self, line: str, current: str) -> str:
+        """「**友達（2409）**」「【華邦電】」這類段落標題：之後沒寫股票名的句子都算這檔。"""
+        stripped = line.strip()
+        if _HEADING_RE.match(stripped) or stripped.endswith(("：", ":")):
+            codes = self.mentioned(stripped)
+            if len(codes) == 1:
+                return codes[0]
+        return current
+
+    # ---------- 單句核對 ----------
+    def sentence_issues(self, sentence: str, current: str = "") -> List[str]:
+        issues: List[str] = []
+        codes = self.mentioned(sentence)
+        subject = codes[0] if len(codes) == 1 else (current if not codes else "")
+        if not subject and len(self.stocks) == 1 and not codes:
+            subject = next(iter(self.stocks))
+        issues += self._number_issues(sentence, codes)
+        if subject:
+            issues += self._ma_value_issues(sentence, subject)
+            issues += self._direction_issues(sentence, subject)
+        return issues
+
+    def _number_issues(self, sentence: str, codes: List[str]) -> List[str]:
+        text = sentence
+        for pattern in _EXEMPT_PATTERNS:
+            text = pattern.sub(" ", text)
+        issues = []
+        for token in _NUMBER_RE.findall(text):
+            cleaned = token.replace(",", "").lstrip("+")
+            try:
+                value = float(cleaned)
+            except ValueError:
+                continue
+            if value.is_integer() and abs(value) <= 10:
+                continue
+            forms = {cleaned, cleaned.lstrip("-")}
+            if forms & self.market:
+                # 句子只講一檔股票時，數字不可以只屬於另一檔股票。
+                if len(codes) == 1 and len(self.stock_numbers) >= 2:
+                    own = self.stock_numbers.get(codes[0], set()) | self.shared_numbers
+                    if not forms & own and any(forms & nums for c, nums in self.stock_numbers.items() if c != codes[0]):
+                        issues.append(f"數字 {token} 屬於另一檔股票")
+                continue
+            if forms & self.user_only:
+                if not _ASSUME_RE.search(sentence):
+                    issues.append(f"題目提供的數字 {token} 沒標明是成本／假設，不能當成實際報價")
+                continue
+            issues.append(f"對不上的數字 {token}")
+        return issues
+
+    def _ma_value_issues(self, sentence: str, code: str) -> List[str]:
+        issues = []
+        values = self.ma_values.get(code) or {}
+        for label, number in _MA_VALUE_RE.findall(sentence):
+            key = _ma_key(label)
+            known = values.get(key)
+            if not known:
+                continue
+            written = float(number)
+            if not any(abs(written - v) <= max(abs(v) * 0.006, 0.011) for v in known):
+                issues.append(f"{key} 數值不符（寫 {number}，資料為 {known[0]:g}）")
+        return issues
+
+    def _direction_issues(self, sentence: str, code: str) -> List[str]:
+        closed = self.closed_pos.get(code) or {}
+        live = self.live_pos.get(code) or {}
+        if not closed:
+            return []
+        issues = []
+        plain = _PAREN_RE.sub("", sentence)
+        for clause in _CLAUSE_SPLIT_RE.split(plain):
+            for match in _DIRECTION_RE.finditer(clause):
+                prefix = clause[:match.start()]
+                if _DIRECTION_SKIP_RE.search(clause):
+                    continue
+                if _NON_PRICE_SUBJECT_RE.search(prefix):
+                    continue  # 成本／扣抵價與均線的比較，不是股價位置
+                if re.search(_MA_LABEL, prefix) and not _PRICE_SUBJECT_RE.search(prefix):
+                    continue  # 「MA5 跌破 MA20」是均線彼此交叉，不是股價位置
+                claimed = "站上" if match.group(1) in _UP_WORDS else "跌破"
+                labels = re.findall(_MA_LABEL, match.group(2))
+                keys: List[str] = []
+                for label in labels:
+                    keys += [k for k in ("MA5", "MA10", "MA20", "MA60") if k in closed] if label in _MA_ALL_WORDS else [_ma_key(label)]
+                intraday_ok = bool(live) and bool(_INTRADAY_WORD_RE.search(sentence))
+                for key in keys:
+                    actual = closed.get(key)
+                    if actual not in ("站上", "跌破") or actual == claimed:
+                        continue
+                    if intraday_ok and live.get(key) == claimed:
+                        continue
+                    if live.get(key) == claimed:
+                        issues.append(f"盤中{claimed} {key} 被寫成已確認（收盤為{actual}）")
+                    else:
+                        issues.append(f"方向不符：寫{claimed} {key}，收盤實際為{actual}")
+        return issues
+
+    def check(self, answer: str) -> List[Tuple[str, List[str]]]:
+        _, removed = _scan_sentences(answer, self.sentence_issues, self.heading_stock)
+        return removed
+
+
+def _scan_sentences(answer: str, checker: Callable[[str, str], List[str]],
+                    heading: Optional[Callable[[str, str], str]] = None) -> Tuple[str, List[Tuple[str, List[str]]]]:
+    """逐行逐句核對；標題行（【…】）保留。回傳（刪減後文字, [(被刪的句子, 原因)]）。"""
+    kept_lines: List[str] = []
+    removed: List[Tuple[str, List[str]]] = []
+    current = ""
     for line in answer.split("\n"):
         stripped = line.strip()
+        if heading:
+            current = heading(stripped, current)
         if not stripped or re.fullmatch(r"【[^】]+】", stripped):
             kept_lines.append(line)
             continue
@@ -1041,8 +1288,9 @@ def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any]) -> Tuple[st
         for sentence in _SENTENCE_RE.findall(line):
             if not sentence.strip():
                 continue
-            if find_ungrounded_numbers(sentence, payload):
-                removed.append(sentence.strip())
+            reasons = checker(sentence, current)
+            if reasons:
+                removed.append((sentence.strip(), reasons))
             else:
                 kept.append(sentence)
         text = "".join(kept).strip()
@@ -1057,6 +1305,15 @@ def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any]) -> Tuple[st
             continue
         cleaned.append(line)
     return "\n".join(cleaned).strip(), removed
+
+
+def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any], facts: Optional[FactSheet] = None) -> Tuple[str, List[str]]:
+    """刪除有問題的句子：有 facts 時做完整事實核對，否則只核對數字。回傳（刪減後文字, 被刪的句子）。"""
+    if facts is not None:
+        text, removed = _scan_sentences(answer, facts.sentence_issues, facts.heading_stock)
+    else:
+        text, removed = _scan_sentences(answer, lambda sentence, _current: find_ungrounded_numbers(sentence, payload))
+    return text, [sentence for sentence, _ in removed]
 
 
 # ============================================================
@@ -1581,6 +1838,102 @@ class AnswerResult:
     panels: List[Dict[str, Any]] = field(default_factory=list)
     layout: str = "text"
     weekly: Dict[str, Any] = field(default_factory=dict)
+    context_note: str = ""
+
+
+# ============================================================
+# 短期追問記憶（依 伺服器＋頻道＋使用者 隔離，只存股票／成本／分點，不存對話原文）
+# ============================================================
+
+MEMORY_MINUTES = tools._env_int("DISCORD_AI_MEMORY_MINUTES", 30)
+MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
+MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
+_FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
+_COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
+
+
+@dataclass
+class MemoryEntry:
+    stocks: List[Tuple[str, str]]
+    cost_price: Optional[float]
+    branches: List[str]
+    updated_at: float
+
+
+class ConversationMemory:
+    """同一位使用者在同一頻道的最近股票與成本；30 分鐘沒追問就忘記，最多保留 5,000 筆（最舊的先刪）。"""
+
+    def __init__(self, minutes: int = MEMORY_MINUTES, max_entries: int = MEMORY_MAX_ENTRIES) -> None:
+        self.ttl = max(1, minutes) * 60
+        self.max_entries = max(100, max_entries)
+        self._data: "OrderedDict[str, MemoryEntry]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[MemoryEntry]:
+        if not key:
+            return None
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            if time.time() - entry.updated_at > self.ttl:
+                self._data.pop(key, None)
+                return None
+            return entry
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            self._data.pop(key, None)
+
+    def update(self, key: str, parsed: ParsedQuestion) -> None:
+        if not key or not parsed.stocks:
+            return
+        previous = self.get(key)
+        cost = parsed.cost_price
+        if cost is None and previous and previous.cost_price and previous.stocks[:1] == parsed.stocks[:1]:
+            cost = previous.cost_price  # 同一檔股票沿用之前說過的成本
+        with self._lock:
+            self._data[key] = MemoryEntry(list(parsed.stocks[:2]), cost, list(parsed.branches[:1]), time.time())
+            self._data.move_to_end(key)
+            while len(self._data) > self.max_entries:
+                self._data.popitem(last=False)
+
+    def resolve(self, key: str, parsed: ParsedQuestion) -> str:
+        """問題沒寫股票、但看得出是追問時，補上上一題的股票（就地修改 parsed），回傳顯示給使用者的說明。"""
+        entry = self.get(key)
+        if entry is None or not entry.stocks:
+            return ""
+        text = parsed.original
+        names = "、".join(f"{name or code}（{code}）" for code, name in entry.stocks)
+        if parsed.stocks:
+            if len(parsed.stocks) == 1 and _COMPARE_RE.search(text) and parsed.stocks[0][0] != entry.stocks[0][0]:
+                parsed.stocks = [entry.stocks[0], parsed.stocks[0]]
+                return f"延續上一題：{entry.stocks[0][1] or entry.stocks[0][0]} 與 {parsed.stocks[1][1] or parsed.stocks[1][0]} 比較"
+            if (parsed.cost_price is None and entry.cost_price and parsed.stocks[0][0] == entry.stocks[0][0]
+                    and ("cost" in parsed.intents or "成本" in text)):
+                parsed.cost_price = entry.cost_price
+                parsed.intents.add("cost")
+                return f"沿用上一題的成本 {entry.cost_price:g}"
+            return ""
+        if is_top_warrant_question(parsed) or ("win_rate" in parsed.intents and parsed.branches):
+            return ""  # 排行、分點勝率這類問題本來就不針對單一股票
+        if parsed.branches and "position" not in parsed.intents and not _FOLLOWUP_HINT_RE.search(text):
+            return ""  # 例如「永豐金內湖最近在買什麼」：問的是分點本身
+        if not (parsed.intents - {"rank"}) and not _FOLLOWUP_HINT_RE.search(text) and parsed.cost_price is None:
+            return ""  # 看不出是股票問題（例如打招呼），不要硬接上一題
+        parsed.stocks = list(entry.stocks)
+        if parsed.cost_price is None and entry.cost_price and ("cost" in parsed.intents or "成本" in text):
+            parsed.cost_price = entry.cost_price
+        return f"延續上一題：{names}"
+
+
+# ============================================================
+# 排隊與並行（取代原本「整個流程一把鎖」）
+# ============================================================
+
+ANSWER_CONCURRENCY = max(1, tools._env_int("DISCORD_AI_ANSWER_CONCURRENCY", 3))
+ANSWER_QUEUE_LIMIT = max(1, tools._env_int("DISCORD_AI_QUEUE_LIMIT", 20))
+QUEUE_FULL_MESSAGE = "目前使用人數較多，排隊已滿，請過一兩分鐘再問一次。"
 
 
 class AceQueryEngine:
@@ -1592,30 +1945,89 @@ class AceQueryEngine:
         self.parser = QuestionParser()
         self.gateway = GeminiGateway(self.log)
         self.router = QueryRouter(self.gateway, config, self.log)
-        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ace-tool")
+        # 同時處理多題時資料工具也要夠用（每題約 4～6 個工具）。
+        self.executor = ThreadPoolExecutor(max_workers=max(4, tools._env_int("DISCORD_AI_TOOL_WORKERS", 10)), thread_name_prefix="ace-tool")
         self._answer_cache = tools.TTLCache("discord_ai_answer")
-        self._engine_lock = threading.Lock()
+        self.memory = ConversationMemory()
+        self._slots = threading.BoundedSemaphore(ANSWER_CONCURRENCY)   # 一般問答最多同時 N 題
+        self._weekly_lock = threading.Lock()                           # 本週精選獨立排隊、一次一個
+        self._queue_lock = threading.Lock()
+        self._inflight: Dict[str, Future] = {}                          # 同一個問題同時進來共用一次計算
+        self._pending = 0                                               # 排隊中＋處理中的題數
 
-    def answer(self, question: str) -> AnswerResult:
+    def queue_size(self) -> int:
+        with self._queue_lock:
+            return self._pending
+
+    def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None) -> AnswerResult:
+        """context_key＝伺服器:頻道:使用者，用來記住追問；on_queue(前面還有幾題) 在需要排隊時呼叫一次。"""
         started = time.perf_counter()
-        normalized = re.sub(r"\s+", "", question)
-        hit, cached = self._answer_cache.get(normalized)
+        compact = re.sub(r"\s+", "", question)
+        if any(word in compact for word in MEMORY_RESET_WORDS):
+            self.memory.clear(context_key)
+            return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
+        if is_weekly_pick_question(question):
+            hit, cached = self._answer_cache.get(compact)
+            if hit:
+                return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started, cache_hit=True)
+            if self._weekly_lock.locked() and on_queue:
+                on_queue(1)
+            with self._weekly_lock:
+                return self._answer_weekly_pick(question, started)
+        try:
+            parsed = self.parser.parse(question)
+        except tools.ToolDataError as exc:
+            self.log(f"問題解析失敗：{exc}")
+            return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
+        note = self.memory.resolve(context_key, parsed)
+        if note:
+            self.log(f"追問記憶：{note}")
+        # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案。
+        key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches)])
+        hit, cached = self._answer_cache.get(key)
         if hit:
             self.log(f"回答快取命中：{question}")
-            return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started, cache_hit=True)
-        if is_weekly_pick_question(question):
-            with self._engine_lock:
-                return self._answer_weekly_pick(question, started)
-        with self._engine_lock:
-            result = self._answer_uncached(question, started)
+            self.memory.update(context_key, parsed)
+            return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started,
+                           cache_hit=True, context_note=note)
+
+        with self._queue_lock:
+            shared = self._inflight.get(key)
+            if shared is None:
+                if self._pending >= ANSWER_CONCURRENCY + ANSWER_QUEUE_LIMIT:
+                    return AnswerResult(text=QUEUE_FULL_MESSAGE, route="queue_full", gemini_calls=0, elapsed=0.0)
+                ahead = max(0, self._pending - ANSWER_CONCURRENCY + 1)
+                self._pending += 1
+                future: Future = Future()
+                self._inflight[key] = future
+        if shared is not None:
+            self.log(f"相同問題正在計算，共用結果：{question}")
+            result = shared.result(timeout=self.config.tool_timeout_seconds + 120)
+            self.memory.update(context_key, parsed)
+            return replace(result, context_note=note)
+
+        try:
+            if ahead and on_queue:
+                on_queue(ahead)
+            with self._slots:
+                result = self._answer_uncached(question, started, parsed)
+            future.set_result(result)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            with self._queue_lock:
+                self._pending -= 1
+                self._inflight.pop(key, None)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         if result.cacheable:
             # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
             seconds = self.config.answer_cache_seconds
             if tools.INTRADAY_ENABLE and tools.intraday_session_now():
                 seconds = min(seconds, tools.TTL_INTRADAY_SECONDS)
-            self._answer_cache.set(normalized, result, seconds)
-        return result
+            self._answer_cache.set(key, result, seconds)
+        self.memory.update(context_key, parsed)
+        return replace(result, context_note=note)
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選：Python 算 TOP5，正常只呼叫 Gemini 一次；有自己的 weekly_pick 快取。"""
@@ -1675,14 +2087,15 @@ class AceQueryEngine:
         parsed = self.parser.parse(question)
         return parsed, self.router.plan(parsed, stats), stats
 
-    def _answer_uncached(self, question: str, started: float) -> AnswerResult:
+    def _answer_uncached(self, question: str, started: float, parsed: Optional[ParsedQuestion] = None) -> AnswerResult:
         stats = AnswerStats()
         self.log(f"使用者問題：{question}")
-        try:
-            parsed = self.parser.parse(question)
-        except tools.ToolDataError as exc:
-            self.log(f"問題解析失敗：{exc}")
-            return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
+        if parsed is None:
+            try:
+                parsed = self.parser.parse(question)
+            except tools.ToolDataError as exc:
+                self.log(f"問題解析失敗：{exc}")
+                return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         plan = self.router.plan(parsed, stats)
         self.log(
@@ -1707,7 +2120,9 @@ class AceQueryEngine:
         codes = list(dict.fromkeys([code for code, _ in parsed.stocks] +
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
-        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, **({"branch_name": chart_branch} if chart_branch else {})}) for c in codes]
+        light = plan.route == "rule_stock" and not plan.need_final_llm   # 只問股價：走輕量流程
+        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, **({"branch_name": chart_branch} if chart_branch else {}),
+                                                    **({"with_marks": False} if light else {})}) for c in codes]
         combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
@@ -1789,14 +2204,17 @@ class AceQueryEngine:
             prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 分析暫時無法使用，以下先提供系統整理的資料。"
             return f"{prefix}\n\n{rule_answer}", False
         answer = result.text
-        ungrounded = find_ungrounded_numbers(answer, payload)
-        if ungrounded:
-            # 只刪掉含有對不上數字的句子；刪太多（剩不到六成）才整篇改用系統整理的資料。
-            pruned, removed = prune_ungrounded_sentences(answer, payload)
-            self.log(f"數字核對：對不上的數字 {ungrounded[:10]}｜刪除 {len(removed)} 句：{removed[:5]}")
-            if not pruned or len(pruned) < len(answer) * 0.6 or find_ungrounded_numbers(pruned, payload):
-                self.log("數字核對未通過，改用規則式回答")
-                return f"（AI 文字中有數字無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+        facts = FactSheet(question, results, payload)
+        issues = facts.check(answer)
+        if issues:
+            # 只刪掉有問題的句子（數字對不上、張冠李戴、均線數值或站上／跌破方向寫錯、把題目假設價當報價）；
+            # 刪太多（剩不到六成）才整篇改用系統整理的資料。
+            pruned, removed = prune_ungrounded_sentences(answer, payload, facts)
+            detail = "；".join(f"{sentence[:40]}（{'、'.join(reasons[:2])}）" for sentence, reasons in issues[:6])
+            self.log(f"事實核對：刪除 {len(removed)} 句｜{detail}")
+            if not pruned or len(pruned) < len(answer) * 0.6 or facts.check(pruned):
+                self.log("事實核對未通過，改用規則式回答")
+                return f"（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
             answer = pruned
         if "資料時間" not in answer:
             time_line = build_data_time_line(results)
@@ -1889,7 +2307,19 @@ def _startup_warmup() -> None:
         print(f"🔥 預熱：官方權證名冊 {len(registry):,} 筆", flush=True)
     except Exception as exc:
         print(f"⚠️ 預熱：官方權證名冊失敗（權證分點查詢可能較慢）｜{type(exc).__name__}: {exc}", flush=True)
+    if tools.FUGLE_API_KEY:
+        try:
+            print(f"📏 富果成交量單位校正：{tools.calibrate_fugle_volume_unit()}", flush=True)
+        except Exception as exc:  # 校正失敗不影響上線
+            print(f"⚠️ 富果成交量單位校正略過：{type(exc).__name__}: {exc}", flush=True)
     print(f"🔥 預熱完成｜{time.perf_counter() - started:.1f} 秒", flush=True)
+
+
+def with_context_note(result: "AnswerResult") -> str:
+    """延續上一題時，在回答最上面用小字標出 Bot 是怎麼理解這題的（例如「延續上一題：華邦電（2344）」）。"""
+    if not result.context_note:
+        return result.text
+    return f"※ {result.context_note}（輸入「重新開始」可清除）\n{result.text}"
 
 
 WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
@@ -2035,8 +2465,17 @@ def run_discord_bot(config: BotConfig) -> None:
             await interaction.response.defer(thinking=True, ephemeral=config.ephemeral)
             if is_weekly_pick_question(question):
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
-            result = await asyncio.to_thread(engine.answer, question)
-            await interaction_image(interaction, question, result.text, result.panels, ephemeral=config.ephemeral,
+            loop = asyncio.get_running_loop()
+
+            def on_queue(ahead: int) -> None:
+                # 在工作執行緒被呼叫：把「排隊中」圖片丟回 Discord 事件迴圈送出，不等待結果。
+                message = f"目前前面還有 {ahead} 個問題在處理，輪到你時會自動更新這則回覆。"
+                asyncio.run_coroutine_threadsafe(
+                    interaction_image(interaction, question, message, ephemeral=config.ephemeral), loop)
+
+            context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
+            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue)
+            await interaction_image(interaction, question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
                                     weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord /{config.slash_command_name} 回覆圖片已更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
@@ -2085,8 +2524,9 @@ def run_discord_bot(config: BotConfig) -> None:
             if is_weekly_pick_question(question):
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
-                result = await asyncio.to_thread(engine.answer, question)
-            await reply_image(message, question, result.text, result.panels, pending=pending,
+                context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
+                result = await asyncio.to_thread(engine.answer, question, context_key)
+            await reply_image(message, question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord {config.command_prefix} 回覆圖片已送出／更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:

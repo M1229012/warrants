@@ -337,7 +337,7 @@ def score_recent_behavior(behavior: Dict[str, Any], config: WeeklyPickConfig) ->
 
 def _technical_extras(stock_code: str) -> Dict[str, Any]:
     """從既有 calculate_indicators 結果取出評分需要的序列資訊（不另算指標）。"""
-    df = tools._load_price_bundle(stock_code)["df"]
+    df = tools.closed_frame(tools._load_price_bundle(stock_code))  # 評分只用已收盤 K 棒
     latest = df.iloc[-1]
     close = _f(latest.get("Close"))
     close_5 = _f(df["Close"].iloc[-6]) if len(df) >= 6 else None
@@ -639,6 +639,8 @@ def build_pattern_scorecard(
         "pattern_label": vp.get("pattern_label") or "型態資料不足",
         "ma_alignment": tech.get("ma_alignment", ""),
         "ma_deduction": tech.get("ma_deduction") or {},
+        "score_basis": tech.get("signal_status") or "收盤確認",
+        "intraday_changes": ((tech.get("intraday_observation") or {}).get("changes") or [])[:4],
         "close": close,
         "resistances_above_close": levels["resistances"],
         "supports_below_close": levels["supports"],

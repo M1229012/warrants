@@ -27,21 +27,22 @@ def handlers():
             node = copy.deepcopy(node)
             node.decorator_list = []
             nodes.append(node)
-    config = SimpleNamespace(ephemeral=False, slash_command_name='ask', command_prefix='!ace')
+    config = SimpleNamespace(ephemeral=False, slash_command_name='ask', command_prefix='!ace', prefix_command_enabled=True)
     engine = Mock()
     engine.answer.return_value = bot.AnswerResult('結果', 'weekly_pick', 1, 3.0)
     guard = Mock()
     guard.check_permission.return_value = ''
     guard.acquire.return_value = ''
+    guard.check_weekly_pick.return_value = ''
     files = []
 
-    async def image_file(*args, **kwargs):
+    async def image_files(*args, **kwargs):
         file = Mock()
         files.append(file)
-        return file
+        return [file]
 
     env = dict(asyncio=asyncio, print=Mock(), discord=SimpleNamespace(NotFound=NotFound, HTTPException=HttpError),
-               image_file=image_file, no_mentions=object(), engine=engine, config=config, guard=guard,
+               image_files=image_files, with_context_note=bot.with_context_note, no_mentions=object(), engine=engine, config=config, guard=guard,
                is_weekly_pick_question=bot.is_weekly_pick_question, WEEKLY_PICK_ACK=bot.WEEKLY_PICK_ACK,
                HELP_MESSAGE=bot.HELP_MESSAGE, prefix='!ace')
     exec(compile(ast.Module(body=nodes, type_ignores=[]), '<actual-discord-handlers>', 'exec'), env)
@@ -86,6 +87,13 @@ class WaitingReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.edit_original_response.call_args.kwargs['attachments'], [env['files'][-1]])
         self.assertNotEqual(item.edit_original_response.call_args_list[0].kwargs['attachments'], item.edit_original_response.call_args.kwargs['attachments'])
         env['guard'].release.assert_called_once_with(1)
+
+    async def test_slash_passes_memory_key_and_queue_callback(self):
+        env, item = handlers(), interaction()
+        await env['ask_command'](item, '2409型態')
+        args = env['engine'].answer.call_args.args
+        self.assertEqual(args[1], '3:2:1')   # 伺服器:頻道:使用者
+        self.assertTrue(callable(args[2]))
 
     async def test_prefix_edits_wait_message_instead_of_sending_again(self):
         env = handlers()

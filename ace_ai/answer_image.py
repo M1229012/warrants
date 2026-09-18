@@ -871,7 +871,8 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     if not dry:
         draw.rounded_rectangle((x0, y, x1, y + scorecard(None, 0, card, True)), radius=20, fill='white', outline=LINE)
     h = 30
-    h += _sub_heading(draw, px, y + h, '型態評分', '規則同本週精選｜只評技術結構，不含籌碼，不是買賣建議', width, dry) + 10
+    basis = str(card.get('score_basis') or '收盤確認')
+    h += _sub_heading(draw, px, y + h, '型態評分', f'{basis}｜只評技術結構，不含籌碼，不是買賣建議', width, dry) + 10
 
     score = _finite(card.get('pattern_score')) or 0.0
     grade = str(card.get('grade', ''))
@@ -914,6 +915,15 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
                 tx += w + 10
             ty += 48
     h += score_block + len(tag_rows) * 48 + 14
+
+    # 盤中觀察：分數固定以收盤計算，盤中和收盤不同的地方另外列出，標明尚待收盤確認。
+    live_changes = [str(t) for t in card.get('intraday_changes') or []]
+    if live_changes:
+        box_h = _reason_column(None, 0, 0, width - 48, '盤中觀察（尚待收盤確認，不計入分數）', live_changes, WARN_INK, '', True) + 32
+        if not dry:
+            draw.rounded_rectangle((px, y + h, px + width, y + h + box_h), radius=14, fill=WARN_BG)
+            _reason_column(draw, px + 24, y + h + 16, width - 48, '盤中觀察（尚待收盤確認，不計入分數）', live_changes, WARN_INK, '', False)
+        h += box_h + 20
 
     half = (width - 40) / 2
     plus = _short_reasons(card.get('plus_reasons'), lost=False)

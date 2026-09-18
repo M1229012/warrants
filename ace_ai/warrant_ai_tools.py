@@ -1016,14 +1016,45 @@ def fetch_fugle_quote(stock_code: str) -> Dict[str, Any]:
     }
 
 
-def _volume_in_shares(trade_volume: float, stock_df: pd.DataFrame) -> float:
-    """盤中累計量換成「股」：官方範例單位不明確，拿近 20 日均量比對，選和均量比例最接近的單位（張×1000 或股）。"""
-    if trade_volume <= 0:
-        return 0.0
+# 富果盤中報價 total.tradeVolume 的單位（固定換算，不靠成交量大小猜）：lots＝張（×1000 換成股）、shares＝股。
+# 上線後看啟動 Log「富果成交量單位校正」確認；結果和預設不同時用 Railway 變數 FUGLE_QUOTE_VOLUME_UNIT 改。
+FUGLE_QUOTE_VOLUME_UNIT = os.getenv("FUGLE_QUOTE_VOLUME_UNIT", "lots").strip().lower()
+VOLUME_SUSPECT_HIGH_RATIO = _env_float("DISCORD_AI_VOLUME_SUSPECT_HIGH", 30.0)
+VOLUME_SUSPECT_LOW_RATIO = _env_float("DISCORD_AI_VOLUME_SUSPECT_LOW", 0.001)
+
+
+def _quote_volume_shares(trade_volume: float) -> float:
+    """盤中累計量依設定的固定單位換成「股」。"""
+    return float(trade_volume or 0) * (1 if FUGLE_QUOTE_VOLUME_UNIT in ("shares", "share", "股") else 1000)
+
+
+def _volume_suspect(volume_shares: float, stock_df: pd.DataFrame) -> bool:
+    """換算後和近 20 日均量差距離譜（例如 30 倍以上或千分之一以下）只標記為可疑，不拿來切換單位。"""
     recent = pd.to_numeric(stock_df["Volume"], errors="coerce").tail(20).mean()
-    if not recent or not math.isfinite(recent) or recent <= 0:
-        return trade_volume * 1000
-    return min((trade_volume * 1000, trade_volume), key=lambda v: abs(math.log(v / recent)))
+    if not volume_shares or not recent or not math.isfinite(recent) or recent <= 0:
+        return False
+    ratio = volume_shares / recent
+    return ratio > VOLUME_SUSPECT_HIGH_RATIO or ratio < VOLUME_SUSPECT_LOW_RATIO
+
+
+def calibrate_fugle_volume_unit(stock_code: str = "2330") -> str:
+    """收盤後比對同一天「盤中報價累計量」與「日K成交量（股）」，確認盤中量的單位；只寫 Log，不改設定。"""
+    if not FUGLE_API_KEY:
+        return "未設定 FUGLE_API_KEY，略過"
+    quote = _fugle_get(f"intraday/quote/{stock_code}")
+    if not quote.get("isClose"):
+        return "今天尚未收盤（或非交易日），收盤後重新部署才能校正"
+    day = str(quote.get("date") or "")
+    candles = _fugle_get(f"historical/candles/{stock_code}", {"from": day, "to": day, "timeframe": "D", "fields": "volume"})
+    rows = candles.get("data") or []
+    trade_volume = _num((quote.get("total") or {}).get("tradeVolume"), 0)
+    daily_volume = _num(rows[0].get("volume"), 0) if rows else None
+    if not trade_volume or not daily_volume:
+        return f"{day} 資料不足，無法校正"
+    ratio = daily_volume / trade_volume
+    unit = "lots" if 500 <= ratio <= 2000 else "shares" if 0.5 <= ratio <= 2 else "unknown"
+    verdict = "與設定一致" if unit == FUGLE_QUOTE_VOLUME_UNIT else f"與設定不同，請把 FUGLE_QUOTE_VOLUME_UNIT 設為 {unit}"
+    return f"{stock_code} {day}：盤中累計量 {trade_volume:,.0f}、日K成交量 {daily_volume:,.0f} 股，比例 {ratio:,.1f} → 單位 {unit}（目前設定 {FUGLE_QUOTE_VOLUME_UNIT}，{verdict}）"
 
 
 def fetch_fugle_daily(stock_code: str, calendar_days: int) -> pd.DataFrame:
@@ -1061,12 +1092,17 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFram
         return stock_df, {}
     if not quote or quote["date"] <= last_date:
         return stock_df, {}
+    volume_shares = _quote_volume_shares(quote["trade_volume"])
     bar = pd.DataFrame(
-        [[quote["open"], quote["high"], quote["low"], quote["close"], _volume_in_shares(quote["trade_volume"], stock_df)]],
+        [[quote["open"], quote["high"], quote["low"], quote["close"], volume_shares]],
         index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
     )
     merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
-    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"]}
+    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"],
+            "cumulative_volume_lots": _num(volume_shares / 1000, 0),
+            "volume_suspect": _volume_suspect(volume_shares, stock_df)}
+    if info["volume_suspect"]:
+        print(f"⚠️ {code} 盤中累計量和近 20 日均量差距異常（{volume_shares:,.0f} 股），已標記為可疑", flush=True)
     print(f"⏱️ {code} 接上富果即時報價：{info['date']} {info['time']}｜{quote['close']}｜{'盤中' if info['is_live'] else '今日收盤'}", flush=True)
     return merged, info
 
@@ -1102,14 +1138,65 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
 
     def build() -> Dict[str, Any]:
         # 日K 照原本 10 分鐘快取；盤中只有即時報價與指標每分鐘重算，不會頻繁呼叫 FinMind。
-        stock_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
-        stock_df, intraday = _append_intraday_bar(code, stock_df)
-        df = kf.calculate_indicators(stock_df)
+        daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        merged, intraday = _append_intraday_bar(code, daily_df)
+        closed = kf.calculate_indicators(daily_df)
+        closed["Close_prev"] = closed["Close"].shift(1)
+        if not intraday:
+            return {"df": closed, "closed_df": closed, "market": market, "intraday": {}, "daily_source": daily_source}
+        df = kf.calculate_indicators(merged)
         df["Close_prev"] = df["Close"].shift(1)
-        return {"df": df, "market": market, "intraday": intraday, "daily_source": daily_source}
+        # 均量只用已收盤的日子：盤中累計量不算進 MV5／MV20（早盤會把均量拉低、量比失真）。
+        for column in ("MV5", "MV20"):
+            if column in df.columns and len(df) > 1:
+                df.iloc[-1, df.columns.get_loc(column)] = df[column].iloc[-2]
+        return {"df": df, "closed_df": closed, "market": market, "intraday": intraday, "daily_source": daily_source}
 
     ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
     return _cached(f"price_{code}", ttl, build)
+
+
+def closed_frame(bundle: Dict[str, Any]) -> pd.DataFrame:
+    """評分、訊號、大量區用：只含已收盤 K 棒（盤中暫定 K 棒另外當作「盤中觀察」）。"""
+    return bundle.get("closed_df") if bundle.get("closed_df") is not None else bundle["df"]
+
+
+def intraday_observation(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    """盤中狀態和前一日收盤確認狀態的差異：只描述「盤中暫時」，一律標註尚待收盤確認。"""
+    info = bundle.get("intraday") or {}
+    if not info:
+        return {}
+    df, closed = bundle["df"], closed_frame(bundle)
+    now, last = df.iloc[-1], closed.iloc[-1]
+    price, closed_close = _num(now.get("Close")), _num(last.get("Close"))
+    changes: List[str] = []
+    positions: Dict[str, str] = {}
+    for n in (5, 10, 20, 60):
+        key = f"MA{n}"
+        live_ma, closed_ma = _num(now.get(key)), _num(last.get(key))
+        if price is None or live_ma is None:
+            continue
+        live_pos = _ma_position(price, live_ma)["position"]
+        positions[key] = live_pos
+        closed_pos = _ma_position(closed_close, closed_ma)["position"] if closed_close is not None and closed_ma is not None else "資料不足"
+        if live_pos != closed_pos and live_pos in ("站上", "跌破"):
+            changes.append(f"盤中暫時{live_pos} {key}（前一日收盤為{closed_pos}），尚待收盤確認")
+    upper, lower = _num(now.get("BB_UPPER")), _num(now.get("BB_LOWER"))
+    if price is not None and upper is not None and price > upper:
+        changes.append("盤中暫時站上布林上軌，尚待收盤確認")
+    elif price is not None and lower is not None and price < lower:
+        changes.append("盤中暫時跌破布林下軌，尚待收盤確認")
+    return {
+        "status": "盤中暫時" if info.get("is_live") else "今日收盤（日K尚未更新）",
+        "time": info.get("time", ""),
+        "price": price,
+        "change_pct": _pct(price, closed_close),
+        "ma_positions": positions,
+        "changes": changes,
+        "cumulative_volume_lots": info.get("cumulative_volume_lots"),
+        "volume_suspect": bool(info.get("volume_suspect")),
+        "volume_note": "盤中累計量不和日均量比較，也不據此判斷量縮或量增" if info.get("is_live") else "",
+    }
 
 
 def _stock_identity(stock_code: str) -> Tuple[str, str]:
@@ -1142,6 +1229,14 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
     volume = _num(latest.get("Volume"), 4)
     mv5 = _num(latest.get("MV5"), 4)
     mv20 = _num(latest.get("MV20"), 4)
+    live = bool((bundle.get("intraday") or {}).get("is_live"))
+    suspect = bool((bundle.get("intraday") or {}).get("volume_suspect"))
+    if live or suspect:
+        # 盤中累計量不和全日均量比較；可疑量能也不計算量比。
+        ratio5 = ratio20 = None
+    else:
+        ratio5 = _num(volume / mv5) if volume is not None and mv5 else None
+        ratio20 = _num(volume / mv20) if volume is not None and mv20 else None
     return {
         "stock_code": code,
         "stock_name": name,
@@ -1159,9 +1254,10 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "volume_lots": _num(volume / 1000, 0) if volume is not None else None,
         "mv5_lots": _num(mv5 / 1000, 0) if mv5 is not None else None,
         "mv20_lots": _num(mv20 / 1000, 0) if mv20 is not None else None,
-        "volume_ratio_vs_mv5": _num(volume / mv5) if volume is not None and mv5 else None,
-        "volume_ratio_vs_mv20": _num(volume / mv20) if volume is not None and mv20 else None,
-        "volume_unit_note": "成交量與均量單位為張（FinMind 股數 ÷ 1000）；量比＝當日量 ÷ 均量（均量含當日）",
+        "volume_ratio_vs_mv5": ratio5,
+        "volume_ratio_vs_mv20": ratio20,
+        "volume_status": "盤中累計量（尚未收盤）" if live else ("量能資料可疑，不判讀" if suspect else "收盤成交量"),
+        "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中不計算量比",
     }
 
 
@@ -1300,7 +1396,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
     kf = core()
     code, name = _stock_identity(stock_code)
     bundle = _load_price_bundle(code)
-    df = bundle["df"]
+    df = closed_frame(bundle)  # 訊號與評分只用已收盤 K 棒；盤中變化放在 intraday_observation
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
     close = _num(latest.get("Close"))
@@ -1329,6 +1425,8 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
         "intraday": bundle.get("intraday") or {},
+        "signal_status": f"收盤確認（{_fmt_date(df.index[-1])} 收盤）",
+        "intraday_observation": intraday_observation(bundle),
         "close": close,
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
         "ma_alignment": _ma_alignment(ma_values),
@@ -1377,7 +1475,8 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
     """
     kf = core()
     code, name = _stock_identity(stock_code)
-    df = _load_price_bundle(code)["df"]
+    bundle = _load_price_bundle(code)
+    df = closed_frame(bundle)  # 大量區不含盤中累計量（累計量會讓今天那格量能失真）
     ctx = kf.build_weekly_context(df, pd.DataFrame(), kf.WEEK_TRADING_DAYS)
     plot_df = ctx["plot_df"]
     stats = kf._calculate_weighted_volume_profile_stats(plot_df, n_bins=40)
@@ -3148,7 +3247,7 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 # Tool 註冊表
 # ============================================================
 
-def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
+def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
@@ -3181,7 +3280,8 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     try:
         # Same 20% lower wick / 60% body / 20% upper wick allocation as the
         # reference report. Keep every bin and the original ranking indices.
-        stats = kf._calculate_weighted_volume_profile_stats(plot_df, n_bins=40)
+        closed_plot = closed_frame(bundle).tail(len(plot_df) - (1 if bundle.get("intraday") else 0))
+        stats = kf._calculate_weighted_volume_profile_stats(closed_plot if not closed_plot.empty else plot_df, n_bins=40)
         if stats:
             profile = {
                 "bins": [float(v) for v in stats["bins"]],
@@ -3192,13 +3292,14 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     except Exception as exc:
         print(f"⚠️ {code} 價量分布取得失敗：{type(exc).__name__}", flush=True)
     marks: Dict[str, Any] = {}
-    try:
-        marks = chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name)
-    except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
-        print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
+    if with_marks:
+        try:
+            marks = chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name)
+        except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
+            print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
             "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
-            "bollinger": analyze_bollinger(df),
+            "bollinger": analyze_bollinger(closed_frame(bundle)),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
 
