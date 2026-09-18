@@ -105,7 +105,8 @@ class WeeklyPickFilters:
         return parts
 
 
-WEEKLY_PICK_TRIGGERS = ("本週精選", "本周精選", "這週精選", "這周精選", "精選候選")
+WEEKLY_PICK_TRIGGERS = ("本週精選", "本周精選", "本州精選", "這週精選", "這周精選", "每週精選", "每周精選",
+                        "精選股票", "精選個股", "精選候選")
 _WEEKLY_REPORT_WORDS = ("週報", "周報")
 
 
@@ -676,6 +677,11 @@ class WeeklyPickEngine:
         start, end = tools._recent_event_dates(latest, config.event_window_trading_days, events)
         window = events[(events["event_date"] >= start) & (events["event_date"] <= end)].copy()
         self.log(f"事件視窗 {tools._fmt_date(start)}～{tools._fmt_date(end)}｜初始事件 {len(window):,} 筆｜股票 {window['stock_code'].nunique():,} 檔")
+        common = window["stock_code"].astype(str).str.fullmatch(r"[1-9]\d{3}")
+        if (~common).any():
+            self.log(f"排除 ETF／非普通股：{'、'.join(sorted(window.loc[~common, 'stock_code'].astype(str).unique())[:10])}"
+                     f"｜{window.loc[~common, 'stock_code'].nunique()} 檔")
+            window = window[common]
         if config.exclude_codes:
             window = window[~window["stock_code"].isin(config.exclude_codes)]
             self.log(f"固定排除：{'、'.join(config.exclude_codes)}｜剩 {window['stock_code'].nunique():,} 檔")
@@ -1483,7 +1489,7 @@ def run_weekly_pick(
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_cards_v5",  # v5：型態評分改漸進給分、權重平衡（型態 50），舊快取分數不同
+        "weekly_pick_cards_v6",  # v6：排除 ETF（v5：型態評分改漸進給分、權重平衡），舊快取可能含 ETF
         tools._fmt_date(bundle["latest_event_date"]),
         str(perf.get("sheet_updated_at", "")),
         filters.signature(),

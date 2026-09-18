@@ -41,7 +41,7 @@
 
 回答最上面會用小字標出「※ 延續上一題：華邦電（2344）」，讓使用者知道 Bot 是怎麼理解這題的。
 
-**本週精選**（`/ask 本週精選`、`/ask 本週精選 只看D事件 勝率70%以上`）只開放給 `DISCORD_AI_WEEKLY_PICK_USER_IDS` 裡的管理員，使用說明也不會顯示這項功能。
+**本週精選**（`/ask 本週精選`、`/ask 本週精選 只看D事件 勝率70%以上`；也可以打「本周精選」「本州精選」「每週精選」「每周精選」「精選股票」「精選個股」）只開放給**伺服器管理員**（有「管理員」或「管理伺服器」權限的人）以及 `DISCORD_AI_WEEKLY_PICK_USER_IDS` 裡的使用者，使用說明不會顯示這項功能。候選只看 1～9 開頭的 4 碼普通股，**ETF（0 開頭，例如 0050、00878、00631L）一律排除**。
 
 ---
 
@@ -189,7 +189,7 @@
 | `sector_analysis.py` | 族群路由、名冊、技術／漲幅排行、AI 解讀與覆蓋率說明 |
 | `fine_sector_catalog.py`、`fine_sector_seed.json` | 30 個細分族群的公開名冊解析、快取與備援快照 |
 | `SECTOR_README.md` | 族群功能詳細說明 |
-| `eval/questions.json`、`eval/run_eval.py` | 固定評測題（44 題、53 輪）與執行程式 |
+| `eval/questions.json`、`eval/run_eval.py` | 固定評測題（45 題、56 輪）與執行程式 |
 | `test_*.py` | 離線單元測試 |
 | `requirements.txt` | 根目錄 requirements.txt ＋ discord.py、Pillow |
 | `Dockerfile`、`railway.toml` | Railway 部署設定（Dockerfile 安裝 Noto CJK 中文字型） |
@@ -225,7 +225,8 @@
 | 建議設定 | 說明 |
 |---|---|
 | `FUGLE_API_KEY` | 盤中即時報價；沒設就只用日 K |
-| `DISCORD_AI_WEEKLY_PICK_USER_IDS` | 可使用本週精選的管理員 User ID；沒設就沒人能用 |
+| `DISCORD_AI_WEEKLY_PICK_USER_IDS` | 額外可使用本週精選的 User ID（伺服器管理員不用列）；逗號分隔 |
+| `DISCORD_AI_WEEKLY_PICK_ALLOW_ADMINS` | 預設 1＝伺服器管理員都能用本週精選；0＝只限上面名單 |
 | `FUGLE_QUOTE_VOLUME_UNIT` | `lots`（預設，張）或 `shares`（股），依 📏 校正 Log 決定 |
 
 | 可選（預設值） | 說明 |

@@ -86,6 +86,7 @@ class BotConfig:
     allow_all_users: bool = False
     # 本週精選限定使用者（Discord 使用者 ID，逗號分隔）；沒設定時任何人都不能用。
     weekly_pick_user_ids: Set[int] = field(default_factory=set)
+    weekly_pick_allow_admins: bool = True
     # !ace 文字指令（預設關閉，只用 /ask）
     prefix_command_enabled: bool = False
 
@@ -107,6 +108,7 @@ class BotConfig:
             ephemeral=_env_flag("DISCORD_AI_EPHEMERAL"),
             allow_all_users=_is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
             weekly_pick_user_ids=_parse_id_set(os.getenv("DISCORD_AI_WEEKLY_PICK_USER_IDS", "")),
+            weekly_pick_allow_admins=_env_flag("DISCORD_AI_WEEKLY_PICK_ALLOW_ADMINS", "1"),
             prefix_command_enabled=_env_flag("DISCORD_AI_PREFIX_COMMAND_ENABLE", "0"),
         )
 
@@ -2288,9 +2290,10 @@ class AccessGuard:
             return "請在指定的 AI 測試頻道使用艾斯 AI。"
         return ""
 
-    def check_weekly_pick(self, user_id: int) -> str:
-        """本週精選只開放 DISCORD_AI_WEEKLY_PICK_USER_IDS 內的使用者；回傳拒絕訊息，允許時回傳空字串。"""
-        if user_id in self.config.weekly_pick_user_ids:
+    def check_weekly_pick(self, user_id: int, is_admin: bool = False) -> str:
+        """本週精選開放給伺服器管理員（管理員或管理伺服器權限）與 DISCORD_AI_WEEKLY_PICK_USER_IDS 內的使用者；
+        回傳拒絕訊息，允許時回傳空字串。"""
+        if user_id in self.config.weekly_pick_user_ids or (is_admin and self.config.weekly_pick_allow_admins):
             return ""
         return "「本週精選」目前只開放管理員使用；一般個股、權證分點問題可以照常詢問。"
 
@@ -2357,6 +2360,12 @@ def with_context_note(result: "AnswerResult") -> str:
     return f"※ {result.context_note}（輸入「重新開始」可清除）\n{result.text}"
 
 
+def _is_guild_admin(member) -> bool:
+    """Discord 伺服器管理員：有「管理員」或「管理伺服器」權限（私訊或取不到權限時為 False）。"""
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms is not None and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)))
+
+
 WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
 
 
@@ -2379,10 +2388,12 @@ def run_discord_bot(config: BotConfig) -> None:
         print(f"ℹ️ DISCORD_AI_ALLOWED_USER_IDS=*：不限使用者，只限 {scope} 內使用（不接受私訊）")
     elif not config.allowed_user_ids:
         print("⚠️ DISCORD_AI_ALLOWED_USER_IDS 未設定：所有人呼叫都會收到「尚未開放」")
-    if config.weekly_pick_user_ids:
-        print(f"🔒 本週精選限定使用者：{sorted(config.weekly_pick_user_ids)}")
+    admins = "伺服器管理員（管理員／管理伺服器權限）" if config.weekly_pick_allow_admins else ""
+    users = f"指定使用者 {sorted(config.weekly_pick_user_ids)}" if config.weekly_pick_user_ids else ""
+    if admins or users:
+        print(f"🔒 本週精選開放：{'＋'.join(x for x in (admins, users) if x)}")
     else:
-        print("⚠️ DISCORD_AI_WEEKLY_PICK_USER_IDS 未設定：任何人都不能使用本週精選")
+        print("⚠️ 本週精選：未開放管理員、也沒設定 DISCORD_AI_WEEKLY_PICK_USER_IDS，任何人都不能使用")
 
     answer_image.font(29)  # Fail early if CJK fonts were not installed.
     tools.core()
@@ -2487,7 +2498,7 @@ def run_discord_bot(config: BotConfig) -> None:
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
         if is_weekly_pick_question(question):
-            weekly_denied = guard.check_weekly_pick(user_id)
+            weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(interaction.user))
             if weekly_denied:
                 engine.log(f"本週精選拒絕使用者 {user_id}")
                 await interaction_image(interaction, "使用權限", weekly_denied, ephemeral=True)
@@ -2545,7 +2556,7 @@ def run_discord_bot(config: BotConfig) -> None:
             await reply_image(message, "!ace 使用說明", HELP_MESSAGE)
             return
         if is_weekly_pick_question(question):
-            weekly_denied = guard.check_weekly_pick(user_id)
+            weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(message.author))
             if weekly_denied:
                 engine.log(f"本週精選拒絕使用者 {user_id}")
                 await reply_image(message, "使用權限", weekly_denied)
