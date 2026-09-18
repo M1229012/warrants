@@ -117,6 +117,8 @@ def check_turn(expect: Dict[str, Any], got: Dict[str, Any], full: bool) -> List[
             problems.append("事實核對未通過，整篇改用系統整理資料")
         if expect.get("llm") and route in PATTERN_ROUTES and "【回答】" not in text:
             problems.append("缺少【回答】段落")
+        if expect.get("answer_any") and not any(word in text for word in expect["answer_any"]):
+            problems.append(f"沒有直接回答（應出現 {'／'.join(expect['answer_any'])} 其中之一）")
     return problems
 
 

@@ -3203,8 +3203,7 @@ def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]
         add(f"{label}上緣", zone.get("price_high"))
     bb = tech.get("bollinger") or {}
     add("布林上軌", bb.get("upper"))
-    add("布林中軌", bb.get("mid"))
-    add("布林下軌", bb.get("lower"))
+    add("布林下軌", bb.get("lower"))  # 布林中軌就是 MA20，不重複列
     supports = sorted([lv for lv in levels if close is not None and lv["price"] <= close], key=lambda lv: -lv["price"])[:4]
     resistances = sorted([lv for lv in levels if close is not None and lv["price"] > close], key=lambda lv: lv["price"])[:3]
     for lv in supports + resistances:

@@ -36,6 +36,8 @@ CHART_FOOT = 114
 CHART_HEIGHT = CHART_HEAD + CHART_PRICE_BASE + CHART_VOLUME_BLOCK + CHART_FOOT
 # K 棒價格區加高（原本約 300px，加上標籤帶後 K 棒會被壓扁）。
 CHART_PRICE_EXTRA = 240
+COMPACT_PRICE_EXTRA = 40      # 兩檔比較時 K 線價格區縮短
+TILE_BANDS = ('BB_UPPER', 'BB_LOWER')   # 布林中軌就是 MA20，數值卡與線條都不重複
 TILE_H = 98
 MA_COLORS = {'MA5': UP, 'MA10': '#D99836', 'MA20': '#6C8B46', 'MA60': '#777AC4'}
 BAND_COLORS = {'BB_UPPER': '#667085', 'BB_MID': '#76879A', 'BB_LOWER': '#667085'}
@@ -214,7 +216,7 @@ def _mark_events(panel: dict) -> list[dict]:
 
 
 def _has_mark_section(panel: dict) -> bool:
-    return bool((panel or {}).get('bars')) and bool((panel or {}).get('marks'))
+    return bool((panel or {}).get('bars')) and bool((panel or {}).get('marks')) and not (panel or {}).get('compact')
 
 
 def _mark_action(e: dict) -> tuple[str, str]:
@@ -370,6 +372,8 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
 
 def mark_lanes(panel: dict) -> tuple[int, int]:
     """（上方標籤帶, 下方標籤帶）高度：有出清／減碼才留上方，有買進才留下方，避免空白。"""
+    if (panel or {}).get('compact'):
+        return 0, 0
     dates = {bar['date'] for bar in (panel or {}).get('bars') or []}
     events = _mark_events(panel)
     top = any(e.get('exit_date') in dates or e.get('reduce_date') in dates for e in events if e.get('exit_date') or e.get('reduce_date'))
@@ -377,8 +381,12 @@ def mark_lanes(panel: dict) -> tuple[int, int]:
     return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
 
 
+def _price_extra(panel: dict) -> int:
+    return COMPACT_PRICE_EXTRA if (panel or {}).get('compact') else CHART_PRICE_EXTRA
+
+
 def panel_height(panel: dict) -> int:
-    return CHART_HEIGHT + CHART_PRICE_EXTRA + sum(mark_lanes(panel)) + mark_legend(None, panel, 0, True)
+    return CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + mark_legend(None, panel, 0, True)
 
 
 def _assign_rows(badges: list[dict]) -> None:
@@ -467,8 +475,9 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
 # ============================================================
 
 def draw_value_tiles(draw, x: float, y: float, width: float, last: dict) -> None:
-    """均線 4 格＋布林 3 格數值卡：色線圖例、數值、收盤相對位置（站上／跌破、高於／低於）。"""
-    tiles = [(k, k, c, False) for k, c in MA_COLORS.items()] + [(k, BAND_LABELS[k], c, True) for k, c in BAND_COLORS.items()]
+    """均線 4 格＋布林上下軌 2 格數值卡：色線圖例、數值、收盤相對位置（站上／跌破、高於／低於）。"""
+    tiles = ([(k, 'MA20／中軌' if k == 'MA20' else k, c, False) for k, c in MA_COLORS.items()]
+             + [(k, BAND_LABELS[k], BAND_COLORS[k], True) for k in TILE_BANDS])
     gap, group_gap = 10, 28
     w = (width - group_gap - gap * (len(tiles) - 2)) / len(tiles)
     close = _finite(last.get('Close'))
@@ -540,7 +549,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last)
 
     lane_top, lane_bottom = mark_lanes(panel)
-    extra = lane_top + lane_bottom + CHART_PRICE_EXTRA
+    extra = lane_top + lane_bottom + _price_extra(panel)
     left, right = x0 + 36, x1 - 118
     top = y + CHART_HEAD
     bottom = top + CHART_PRICE_BASE + extra
@@ -569,7 +578,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
-    draw_marks(draw, panel, px, py, step, price_top, price_bottom)
+    if not panel.get('compact'):
+        draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
         candle = UP if bar['Close'] >= bar['Open'] else DOWN
         center = px(i)
@@ -588,9 +598,10 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                 segment.append((px(i), py(bar[key])))
         if len(segment) > 1:
             draw.line(segment, fill=line_color, width=2)
-    # Dashed bands, including the middle band, use report-supplied values.
+    # Dashed upper/lower bands (the middle band is the MA20 line) use report-supplied values.
     # A missing rolling value breaks the line instead of joining across a gap.
-    for key, band_color in BAND_COLORS.items():
+    for key in TILE_BANDS:
+        band_color = BAND_COLORS[key]
         for i in range(1, len(bars)):
             a, b = bars[i-1].get(key), bars[i].get(key)
             if a is None or b is None:
@@ -755,7 +766,7 @@ def _draw_level_table(draw, x, y, width, rows, card) -> None:
             draw.rectangle((x, ry, x + width, ry + LEVEL_ROW_H), fill='#FBF8F2')
         draw.rounded_rectangle((x + 10, mid - 15, x + 76, mid + 15), radius=15, fill=bg)
         draw.text((x + 43, mid), kind, font=font(18, True), fill=ink, anchor='mm')
-        text, size = fit(label, 21, 210, kind == '現價')
+        text, size = fit('MA20（布林中軌）' if label == 'MA20' else label, 21, 210, kind == '現價')
         draw.text((x + 114, mid), text, font=font(size, kind == '現價'), fill=INK, anchor='lm')
         draw.text((x + 470, mid), number(price), font=font(22, True), fill=INK, anchor='rm')
         if kind != '現價' and pct is not None:
@@ -939,7 +950,7 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)
-    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、兩大量區上下緣、布林三軌中，離收盤最近的壓力與支撐', width, dry)
+    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、兩大量區上下緣、布林上下軌中，離收盤最近的壓力與支撐', width, dry)
     if levels:
         if not dry:
             _draw_level_table(draw, px, y + h, width, levels, card)
@@ -962,6 +973,109 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
             text_at(draw, (px, y + h), '近 20 個交易日追蹤分點在這檔股票沒有 A～E 事件或賣出紀錄', 21, MUTED)
         h += 34 + 30
     return int(h)
+
+
+COMPARE_LABEL_W = 210
+COMPARE_ROW_H = 42
+COMPARE_SCORE_H = 76
+
+
+def _branch_summary(card: dict) -> str:
+    rows = card.get('tracked_branches') or []
+    if not rows:
+        return '近 20 個交易日無 A～E 事件'
+    holding = [r for r in rows if str(r.get('status', '')).startswith('持有中')]
+    high = [r for r in holding if r.get('is_high_win_rate')]
+    text = f"{len(rows)} 家有事件｜持有中 {len(holding)} 家"
+    return text + (f"（高勝率 {len(high)}）" if high else '')
+
+
+def _nearest_level(card: dict, key: str) -> str:
+    levels = card.get(key) or []
+    if not levels:
+        return '—'
+    lv = levels[0]
+    label = 'MA20（中軌）' if lv.get('label') == 'MA20' else str(lv.get('label', ''))
+    pct = _finite(lv.get('distance_from_close_pct'))
+    return f"{label} {number(lv.get('price'))}" + (f"（{pct:+.1f}%）" if pct is not None else '')
+
+
+def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
+    """兩檔比較：分數、五大項、型態、均線、最近壓力／支撐、追蹤分點並排成一張表，取代兩張完整評分卡。"""
+    cards = [p['scorecard'] for p in panels]
+    x0, x1, pad = MARGIN, WIDTH - MARGIN, 36
+    px, width = x0 + pad, CONTENT - pad * 2
+    col_w = (width - COMPARE_LABEL_W) / len(cards)
+    labels = [str(c.get('label', '')) for c in cards[0].get('components') or []]
+    rows = [('分數', None)] + [(label, 'component') for label in labels] + [
+        ('型態', lambda c: str(c.get('pattern_label') or '—')),
+        ('均線', lambda c: str(c.get('ma_alignment') or '—')),
+        ('最近壓力', lambda c: _nearest_level(c, 'resistances_above_close')),
+        ('最近支撐', lambda c: _nearest_level(c, 'supports_below_close')),
+        ('追蹤分點', _branch_summary),
+    ]
+    if any(c.get('intraday_changes') for c in cards):
+        rows.append(('盤中觀察', lambda c: '；'.join(str(t).replace('，尚待收盤確認', '') for t in (c.get('intraday_changes') or [])[:2]) or '—'))
+    basis = str(cards[0].get('score_basis') or '收盤確認')
+    head_h = _sub_heading(None, px, 0, '型態比較', f'{basis}｜只評技術結構，不含籌碼，不是買賣建議', width, True)
+    body_h = TABLE_HEAD_H + COMPARE_SCORE_H + (len(rows) - 1) * COMPARE_ROW_H
+    total = int(30 + head_h + 6 + body_h + 30)
+    if dry:
+        return total
+    draw.rounded_rectangle((x0, y, x1, y + total), radius=20, fill='white', outline=LINE)
+    h = 30
+    h += _sub_heading(draw, px, y + h, '型態比較', f'{basis}｜只評技術結構，不含籌碼，不是買賣建議', width, False) + 6
+    ty = y + h
+    scores = [_finite(c.get('pattern_score')) or 0.0 for c in cards]
+    best = max(range(len(cards)), key=lambda i: scores[i]) if len(set(scores)) > 1 else None
+    draw.rounded_rectangle((px, ty, px + width, ty + TABLE_HEAD_H), radius=8, fill=TILE_BG)
+    draw.text((px + 12, ty + TABLE_HEAD_H / 2), '項目', font=font(18), fill=MUTED, anchor='lm')
+    for i, panel in enumerate(panels):
+        cx = px + COMPARE_LABEL_W + i * col_w
+        text, size = fit(f"{panel.get('stock_code', '')} {panel.get('stock_name', '')}", 21, col_w - 24, True)
+        draw.text((cx + 12, ty + TABLE_HEAD_H / 2), text, font=font(size, True), fill=INK, anchor='lm')
+    ry = ty + TABLE_HEAD_H
+    for label, getter in rows:
+        row_h = COMPARE_SCORE_H if getter is None else COMPARE_ROW_H
+        mid = ry + row_h / 2
+        draw.text((px + 12, mid), label, font=font(20, getter is None), fill=MUTED if getter else INK, anchor='lm')
+        for i, card in enumerate(cards):
+            cx = px + COMPARE_LABEL_W + i * col_w + 12
+            cw = col_w - 24
+            if getter is None:
+                score_text = f'{scores[i]:.1f}'
+                color = ACCENT if best is None or best == i else MUTED
+                draw.text((cx, mid + 18), score_text, font=font(46, True), fill=color, anchor='ls')
+                sx = cx + font(46, True).getlength(score_text) + 8
+                draw.text((sx, mid + 18), '/ 100', font=font(19), fill=MUTED, anchor='ls')
+                grade = str(card.get('grade', ''))
+                bg, ink = GRADE_STYLE.get(grade, (TILE_BG, INK))
+                gx = sx + font(19).getlength('/ 100') + 16
+                gw = font(19, True).getlength(grade) + 28
+                draw.rounded_rectangle((gx, mid - 3, gx + gw, mid + 29), radius=16, fill=bg)
+                draw.text((gx + gw / 2, mid + 13), grade, font=font(19, True), fill=ink, anchor='mm')
+            elif getter == 'component':
+                comp = next((c for c in card.get('components') or [] if c.get('label') == label), {})
+                value, maximum = _finite(comp.get('value')) or 0.0, float(comp.get('max') or 1)
+                bar_right = cx + cw - 110
+                draw.rounded_rectangle((cx, mid - 6, bar_right, mid + 6), radius=6, fill=LINE)
+                filled = max(0.0, min(1.0, value / maximum)) * (bar_right - cx)
+                if filled > 12:
+                    draw.rounded_rectangle((cx, mid - 6, cx + filled, mid + 6), radius=6, fill=ACCENT)
+                draw.text((cx + cw, mid), f'{value:g} / {maximum:g}', font=font(19, True), fill=INK, anchor='rm')
+            else:
+                text, size = fit(getter(card), 20, cw, False)
+                draw.text((cx, mid), text, font=font(size), fill=INK, anchor='lm')
+        draw.line((px, ry + row_h, px + width, ry + row_h), fill=LINE)
+        ry += row_h
+    for i in range(1, len(cards)):
+        lx = px + COMPARE_LABEL_W + i * col_w
+        draw.line((lx, ty + TABLE_HEAD_H, lx, ry), fill=LINE)
+    return total
+
+
+def _compare_mode(panels: list[dict]) -> bool:
+    return len(panels) >= 2 and all(p.get('scorecard') and p.get('bars') for p in panels)
 
 
 def header_brand(draw, title: str, size: int, brand: str = 'ACE / RESEARCH') -> None:
@@ -989,11 +1103,19 @@ def panel_block_height(panel: dict) -> int:
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯 AI｜研究筆記', demo: bool = False) -> Image.Image:
     panels = panels or []
+    compare = _compare_mode(panels)
+    if compare:
+        # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
+        panels = [{**p, 'compact': True} for p in panels]
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
     blocks = body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68
-    height = header_height + sum(panel_block_height(p) for p in panels) + body_height + 112
+    if compare:
+        panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
+    else:
+        panels_height = sum(panel_block_height(p) for p in panels)
+    height = header_height + panels_height + body_height + 112
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
@@ -1004,9 +1126,11 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     for panel in panels:
         draw_chart(draw, y, panel)
         y += panel_height(panel) + 24
-        if panel.get('scorecard'):
+        if panel.get('scorecard') and not compare:
             scorecard(draw, y, panel['scorecard'], False)
             y += scorecard(None, 0, panel['scorecard'], True) + 24
+    if compare:
+        y += compare_card(draw, y, panels, False) + 24
     draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
     for block in blocks:

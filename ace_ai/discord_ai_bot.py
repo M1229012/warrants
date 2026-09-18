@@ -828,6 +828,7 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 【回答】3～5 句直接回應問題、不可拒答（預測、K 棒型態等其他問法依規則 6 回答）：
 - 問成本／操作：先說成本相對現價與帳面損益 unrealized_pct，再用條件句給參考框架「若守住 A，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位；若站上 C，…」。A／B／C 只能用 supports_below_close／resistances_above_close 的價位，是一般觀察方式，不是替使用者決定。
 - 問型態好不好：直接說好或不好、型態分數 pattern_score／100（grade），以及影響最大的一個得分與一個失分原因。
+- 比較兩檔（有兩份 get_pattern_scorecard，或問「誰比較好、哪個好、比較呢」）：【回答】第一句直接下結論「就技術結構來看，X 比 Y 好」（pattern_score 相差不到 5 分就寫「兩檔差不多」，並說在哪一點分出高下），第二句說明差距最大的 1～2 個項目（components 的 label，例如下方支撐、均線趨勢），第三句各點出一個不利條件；不要把兩檔的分數、價位逐項重抄（圖上已有並排比較表），也不可說成推薦買哪一檔。【觀察重點】最多 3 行，寫「哪個條件改變會讓比較結果翻轉」（例如較弱那檔站回哪條均線、較強那檔跌破哪個支撐）。
 - 分數只代表技術結構，不可說成推薦。
 【觀察重點】最多 3 行，每行以「・」開頭，只寫圖上沒有的「條件與意義」：
 ・扣抵／均線：ma_deduction 的 MA20 或 MA60 有 turn_text 時，寫「明日收盤需高於 tomorrow_close_needed_to_rise，均線才會上揚」並照 turn_text 的用語說明（例如「收盤若持平，後天起轉下彎」，不要寫成「第 N 日」）；沒有 turn 時改寫 minus_reasons 中哪個條件改善可補回分數。
@@ -2010,7 +2011,8 @@ class AceQueryEngine:
             if ahead and on_queue:
                 on_queue(ahead)
             with self._slots:
-                result = self._answer_uncached(question, started, parsed)
+                effective = f"{question}（{note}）" if note else question
+                result = self._answer_uncached(effective, started, parsed)
             future.set_result(result)
         except BaseException as exc:
             future.set_exception(exc)
