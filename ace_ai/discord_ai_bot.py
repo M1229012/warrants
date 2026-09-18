@@ -808,7 +808,7 @@ FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能�
 2. 保持客觀中性：用「偏多條件／偏空條件」描述，每個判斷都附上依據，有利與不利的條件都要寫；不用「強勢、看好、危險、暴漲、慘」等帶情緒或暗示方向的字眼。AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
 3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
 4. 回答排進圖片，口語、精簡，每段 1～3 句，每句要完整通順（不要用刪節號、不要半句）；同一件事只講一次。圖片已顯示股價、均線、布林、KD、MACD、成交量、大量區與分點標註，文字不可逐項列出這些數值，要寫「代表什麼」並回答問題；只有說明條件時才引用 1～2 個關鍵價位。
-5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間（股價為日K收盤資料）。
+5. 輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間。data_source 或 intraday.is_live 顯示「盤中」時，要提醒今天的 K 棒、均線、指標與成交量都是盤中暫定值、收盤前會變動（成交量只是目前累計，量比偏低很正常）；否則註明是日K收盤資料。
 6. 一定先寫【回答】直接回應使用者問的事。問「明天會不會漲、漲的機率」這類預測：說明無法預測漲跌或給機率，改用型態分數、今天 K 棒、量能與關鍵價位客觀說明偏多與偏空的條件。問 K 棒型態（例如仙人指路、長上影、長下影、十字線、吞噬）：依 get_stock_overview.candle（實體、上影線、下影線占前日收盤 %、收盤在當日區間的位置）、量比與型態評分卡（是否剛突破、相對位置），對照該型態的常見定義說明符合或不符合與常見解讀，不可斷言後續走勢。"""
 
 FINAL_TECH_RULES = """技術面規則：布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀；null 不可判定有或沒有。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
@@ -912,7 +912,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
     elif name == "get_stock_overview":
         candle = _candle_shape(data)
-        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "close", "change_pct", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
         data["candle"] = candle
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
@@ -1492,7 +1492,13 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             continue
         d = r.data
         if r.name in ("get_stock_overview", "get_technical_analysis", "get_volume_profile") and d.get("data_date"):
-            add(f"股價截至 {d['data_date']}（日K收盤）")
+            intraday = d.get("intraday") or {}
+            if intraday.get("is_live"):
+                add(f"股價為 {intraday['date']} {intraday['time']} 盤中即時報價（富果，尚未收盤）")
+            elif intraday:
+                add(f"股價為 {intraday['date']} 今日收盤（富果即時報價）")
+            else:
+                add(f"股價截至 {d['data_date']}（日K收盤）")
         elif r.name in ("get_warrant_branch", "get_high_winrate_branches_buying") and d.get("period_start"):
             add(f"權證分點 {d['period_start']}～{d['period_end']}（{d.get('actual_trading_days')} 個交易日）")
         elif r.name == "get_branch_performance" and d.get("found"):
@@ -1603,7 +1609,11 @@ class AceQueryEngine:
             result = self._answer_uncached(question, started)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         if result.cacheable:
-            self._answer_cache.set(normalized, result, self.config.answer_cache_seconds)
+            # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
+            seconds = self.config.answer_cache_seconds
+            if tools.INTRADAY_ENABLE and tools.intraday_session_now():
+                seconds = min(seconds, tools.TTL_INTRADAY_SECONDS)
+            self._answer_cache.set(normalized, result, seconds)
         return result
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:

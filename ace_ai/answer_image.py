@@ -514,10 +514,21 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         return
     last = bars[-1]
     change = panel.get('change_pct')
-    draw.text((x1 - 32, y + 34), f"資料至 {last['date']}", font=font(22), fill=MUTED, anchor='rt')
+    intraday = panel.get('intraday') or {}
+    live = bool(intraday.get('is_live'))
+    if live:
+        # 盤中：右上角改成醒目的「盤中 HH:MM」膠囊，價格標籤改「成交」。
+        stamp = f"盤中 {intraday.get('time', '')}｜收盤前會變動"
+        stamp_w = font(20, True).getlength(stamp) + 28
+        draw.rounded_rectangle((x1 - 32 - stamp_w, y + 26, x1 - 32, y + 60), radius=17, fill=WARN_BG)
+        draw.text((x1 - 32 - stamp_w / 2, y + 43), stamp, font=font(20, True), fill=WARN_INK, anchor='mm')
+        draw.text((x1 - 32, y + 70), f"資料至 {last['date']} {intraday.get('time', '')}", font=font(18), fill=MUTED, anchor='rt')
+    else:
+        draw.text((x1 - 32, y + 34), f"資料至 {last['date']}", font=font(22), fill=MUTED, anchor='rt')
     color = UP if (change or 0) >= 0 else DOWN
-    draw.text((x0 + 32, y + 112), '收盤', font=font(22), fill=MUTED, anchor='ls')
-    price_x = x0 + 32 + font(22).getlength('收盤') + 12
+    price_label = '成交' if live else '收盤'
+    draw.text((x0 + 32, y + 112), price_label, font=font(22), fill=MUTED, anchor='ls')
+    price_x = x0 + 32 + font(22).getlength(price_label) + 12
     price = number(last['Close'])
     draw.text((price_x, y + 112), price, font=font(40, True), fill=color, anchor='ls')
     if change is not None:
@@ -943,6 +954,16 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     return int(h)
 
 
+def price_footer(panels: list[dict] | None) -> str:
+    """頁尾資料說明：有任何一檔接上盤中即時報價就改寫，避免圖上寫「收盤資料」卻是盤中價格。"""
+    infos = [(p or {}).get('intraday') or {} for p in panels or []]
+    if any(i.get('is_live') for i in infos):
+        return '股市艾斯  /  最新一根 K 棒為富果盤中即時報價，收盤前會變動'
+    if any(infos):
+        return '股市艾斯  /  最新一根 K 棒為富果今日收盤報價，其餘為日 K 收盤資料'
+    return '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
+
+
 def panel_block_height(panel: dict) -> int:
     card = panel.get('scorecard')
     return panel_height(panel) + 24 + (scorecard(None, 0, card, True) + 24 if card else 0)
@@ -987,7 +1008,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
     draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
-    text_at(draw, (MARGIN, height - 49), '股市艾斯  /  日 K 為收盤資料，非盤中即時行情' if panels else '股市艾斯  /  AI 資料整理', 20, MUTED)
+    text_at(draw, (MARGIN, height - 49), price_footer(panels) if panels else '股市艾斯  /  AI 資料整理', 20, MUTED)
     return image
 
 

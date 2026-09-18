@@ -939,20 +939,167 @@ def get_available_sheet_metadata() -> Dict[str, Any]:
 # 價格資料（Tool 1～3 共用，同一檔股票 10 分鐘內只抓一次）
 # ============================================================
 
+# ------------------------------------------------------------
+# 富果（Fugle）行情：盤中用即時報價補上「今天這一根」；FinMind 日K抓不到時改用富果日K，K 線不留白。
+# 需要 Railway 變數 FUGLE_API_KEY；沒設定就完全照舊只用 FinMind。
+# ------------------------------------------------------------
+FUGLE_API_KEY = os.getenv("FUGLE_API_KEY", "").strip()
+FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
+FUGLE_TIMEOUT = _env_float("DISCORD_AI_FUGLE_TIMEOUT", 6.0)
+INTRADAY_ENABLE = bool(FUGLE_API_KEY) and os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
+MARKET_CLOSE_HHMM = (13, 30)
+
+
+def taipei_now() -> datetime:
+    return datetime.now(TAIPEI_TZ)
+
+
+def intraday_session_now(now: Optional[datetime] = None) -> bool:
+    """平日 08:55～13:35 視為盤中（股價與回答快取縮短為 1 分鐘）。國定休市日富果不會有當日資料，自然略過。"""
+    now = now or taipei_now()
+    return now.weekday() < 5 and (8, 55) <= (now.hour, now.minute) <= (13, 35)
+
+
+def _fugle_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    kf = core()
+    response = kf.get_thread_session().get(
+        f"{FUGLE_BASE_URL}/{path}", params=params or {},
+        headers={"X-API-KEY": FUGLE_API_KEY, "Accept": "application/json"},
+        timeout=(4, FUGLE_TIMEOUT),
+    )
+    if response.status_code == 429:
+        raise ToolDataError("富果 API 超過每分鐘呼叫上限")
+    response.raise_for_status()
+    return response.json() or {}
+
+
+def _fugle_timestamp(value: Any) -> Optional[datetime]:
+    """lastUpdated 可能是毫秒或微秒的 Unix 時間。"""
+    number = _num(value, 0)
+    if not number:
+        return None
+    seconds = number / 1e6 if number > 1e14 else number / 1e3
+    return datetime.fromtimestamp(seconds, TAIPEI_TZ)
+
+
+def fetch_fugle_quote(stock_code: str) -> Dict[str, Any]:
+    """富果盤中即時報價（intraday/quote）；還沒有成交（開盤前、試撮中）或查不到時回傳空 dict。"""
+    data = _fugle_get(f"intraday/quote/{stock_code}")
+    if data.get("isTrial"):
+        return {}
+    close = _num(data.get("closePrice")) or _num(data.get("lastPrice"))
+    day = _parse_sheet_date(data.get("date"))
+    if not close or day is None:
+        return {}
+    open_ = _num(data.get("openPrice")) or close
+    high = max(_num(data.get("highPrice")) or close, open_, close)
+    low = min(_num(data.get("lowPrice")) or close, open_, close)
+    updated = _fugle_timestamp(data.get("lastUpdated"))
+    live = not data.get("isClose") and (updated is None or (updated.hour, updated.minute) < MARKET_CLOSE_HHMM)
+    return {
+        "date": pd.Timestamp(day).normalize(),
+        "time": updated.strftime("%H:%M") if updated else "",
+        "open": open_, "high": high, "low": low, "close": close,
+        "trade_volume": _num((data.get("total") or {}).get("tradeVolume"), 0) or 0.0,
+        "is_live": bool(live),
+    }
+
+
+def _volume_in_shares(trade_volume: float, stock_df: pd.DataFrame) -> float:
+    """盤中累計量換成「股」：官方範例單位不明確，拿近 20 日均量比對，選和均量比例最接近的單位（張×1000 或股）。"""
+    if trade_volume <= 0:
+        return 0.0
+    recent = pd.to_numeric(stock_df["Volume"], errors="coerce").tail(20).mean()
+    if not recent or not math.isfinite(recent) or recent <= 0:
+        return trade_volume * 1000
+    return min((trade_volume * 1000, trade_volume), key=lambda v: abs(math.log(v / recent)))
+
+
+def fetch_fugle_daily(stock_code: str, calendar_days: int) -> pd.DataFrame:
+    """富果日K（historical/candles，免費方案可用；日K成交量單位為股，和 FinMind 相同）。FinMind 失敗時的備援。"""
+    end = taipei_now().date()
+    start = end - timedelta(days=min(int(calendar_days), 360))
+    data = _fugle_get(f"historical/candles/{stock_code}", {
+        "from": start.isoformat(), "to": end.isoformat(), "timeframe": "D",
+        "fields": "open,high,low,close,volume", "sort": "asc",
+    })
+    rows = data.get("data") or []
+    if not rows:
+        raise ToolDataError(f"{stock_code} 富果日K沒有資料")
+    df = pd.DataFrame(rows).rename(columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        df[column] = pd.to_numeric(df.get(column), errors="coerce")
+    return (df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+            .drop_duplicates(subset=["Date"], keep="last").sort_values("Date").set_index("Date")
+            [["Open", "High", "Low", "Close", "Volume"]])
+
+
+def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """日K還沒有今天這一根時，接上富果即時報價（盤中為暫定 K 棒，收盤前會變動）；任何失敗都保留原本日K。"""
+    now = taipei_now()
+    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
+        return stock_df, {}
+    last_date = pd.Timestamp(stock_df.index.max()).normalize()
+    if last_date >= pd.Timestamp(now.date()):
+        return stock_df, {}
+    try:
+        quote = fetch_fugle_quote(code)
+    except Exception as exc:  # 富果失敗不影響日K
+        print(f"⚠️ {code} 富果即時報價略過，改用 FinMind 日K：{type(exc).__name__}: {exc}", flush=True)
+        return stock_df, {}
+    if not quote or quote["date"] <= last_date:
+        return stock_df, {}
+    bar = pd.DataFrame(
+        [[quote["open"], quote["high"], quote["low"], quote["close"], _volume_in_shares(quote["trade_volume"], stock_df)]],
+        index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
+    )
+    merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
+    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"], "source": "富果即時報價"}
+    print(f"⏱️ {code} 接上富果即時報價：{info['date']} {info['time']}｜{quote['close']}｜{'盤中' if info['is_live'] else '今日收盤'}", flush=True)
+    return merged, info
+
+
+def price_source_note(bundle: Dict[str, Any]) -> str:
+    info = bundle.get("intraday") or {}
+    base = bundle.get("daily_source") or "FinMind 日K"
+    if not info:
+        return f"{base}收盤資料（非盤中即時）"
+    if info.get("is_live"):
+        return f"{base}＋{info['source']}（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
+    return f"{base}＋{info['source']}（{info['date']} 今日收盤，日K資料尚未更新）"
+
+
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
-    """重用 fetch_stock_data_yf + calculate_indicators，與週報產圖相同的抓取區間。"""
+    """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
 
+    def daily() -> Tuple[pd.DataFrame, str, str]:
+        try:
+            stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
+            if stock_df is not None and not stock_df.empty:
+                return stock_df, str(market or ""), "FinMind 日K"
+            error: Exception = ToolDataError(f"{code} FinMind 沒有股價資料")
+        except Exception as exc:  # FinMind 失敗時改用富果日K，K 線不留白
+            error = exc
+        if not FUGLE_API_KEY:
+            raise ToolDataError(f"{code} 沒有股價資料：{type(error).__name__}: {error}")
+        print(f"⚠️ {code} FinMind 股價失敗，改用富果日K：{type(error).__name__}: {error}", flush=True)
+        days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
+        return fetch_fugle_daily(code, days), "", "富果日K"
+
     def build() -> Dict[str, Any]:
-        stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
-        if stock_df is None or stock_df.empty:
-            raise ToolDataError(f"{code} 沒有股價資料")
+        # 日K 照原本 10 分鐘快取；盤中只有即時報價與指標每分鐘重算，不會頻繁呼叫 FinMind。
+        stock_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        stock_df, intraday = _append_intraday_bar(code, stock_df)
         df = kf.calculate_indicators(stock_df)
         df["Close_prev"] = df["Close"].shift(1)
-        return {"df": df, "market": str(market or "")}
+        return {"df": df, "market": market, "intraday": intraday, "daily_source": daily_source}
 
-    return _cached(f"price_{code}", TTL_PRICE_SECONDS, build)
+    ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
+    return _cached(f"price_{code}", ttl, build)
 
 
 def _stock_identity(stock_code: str) -> Tuple[str, str]:
@@ -990,7 +1137,8 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "market": bundle["market"],
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": PRICE_SOURCE_NOTE,
+        "data_source": price_source_note(bundle),
+        "intraday": bundle.get("intraday") or {},
         "open": _num(latest.get("Open")),
         "high": _num(latest.get("High")),
         "low": _num(latest.get("Low")),
@@ -1169,7 +1317,8 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_code": code,
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
-        "data_source": PRICE_SOURCE_NOTE,
+        "data_source": price_source_note(bundle),
+        "intraday": bundle.get("intraday") or {},
         "close": close,
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
         "ma_alignment": _ma_alignment(ma_values),
@@ -3032,7 +3181,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "") -> Dict[str, Any]:
     except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
         print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
     return {"stock_code": code, "stock_name": name, "bars": bars,
-            "volume_profile": profile, "marks": marks,
+            "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
             "bollinger": analyze_bollinger(df),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
