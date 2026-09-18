@@ -35,6 +35,7 @@ import warrant_ai_tools as tools
 import weekly_pick
 import answer_image
 import weekly_image
+import sector_analysis
 from weekly_pick import is_weekly_pick_question
 
 
@@ -190,6 +191,7 @@ class ParsedQuestion:
     cost_price: Optional[float] = None
     event_type: str = ""
     notes: List[str] = field(default_factory=list)
+    sector: Optional[Dict[str, str]] = None
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -201,6 +203,7 @@ class ParsedQuestion:
             "days": self.days,
             "event_type": self.event_type,
             "notes": self.notes,
+            "sector": self.sector,
         }
 
 
@@ -218,6 +221,9 @@ class QuestionParser:
         }
 
     def parse(self, question: str) -> ParsedQuestion:
+        sector = sector_analysis.detect_request(question)
+        if sector is not None:
+            return ParsedQuestion(original=question, intents={"sector"}, sector=sector)
         kf = tools.core()
         text_upper = question.upper()
         parsed = ParsedQuestion(original=question, intents=self.detect_intents(text_upper))
@@ -383,6 +389,9 @@ class QueryPlan:
 HELP_MESSAGE = (
     "我可以幫你查股票與權證分點資料，請用 `/ask 問題`，例如：\n"
     "• `/ask 2344現在型態好嗎`\n"
+    "• `/ask 半導體族群哪檔型態比較好`\n"
+    "• `/ask 航運股今天誰漲最多`\n"
+    "• `/ask 金融股有哪些`\n"
     "• `/ask 我2303成本143可以怎麼觀察`\n"
     "• `/ask 2344現在技術面怎麼樣`\n"
     "• `/ask 華邦電現在在大量區哪裡`\n"
@@ -423,6 +432,8 @@ class QueryRouter:
         self.log = log
 
     def plan(self, parsed: ParsedQuestion, stats: "AnswerStats") -> QueryPlan:
+        if parsed.sector is not None:
+            return QueryPlan(route="rule_sector", need_final_llm=parsed.sector["mode"] in ("technical", "momentum"))
         if parsed.stock_candidates and not parsed.stocks:
             options = "、".join(f"{name}（{code}）" for code, name in parsed.stock_candidates)
             return QueryPlan(route="clarify", clarification=f"找到多檔可能的股票：{options}\n請用股票代號重新詢問。")
@@ -1887,6 +1898,9 @@ class ConversationMemory:
             self._data.pop(key, None)
 
     def update(self, key: str, parsed: ParsedQuestion) -> None:
+        if parsed.sector is not None:
+            self.clear(key)
+            return
         if not key or not parsed.stocks:
             return
         previous = self.get(key)
@@ -1901,6 +1915,8 @@ class ConversationMemory:
 
     def resolve(self, key: str, parsed: ParsedQuestion) -> str:
         """問題沒寫股票、但看得出是追問時，補上上一題的股票（就地修改 parsed），回傳顯示給使用者的說明。"""
+        if parsed.sector is not None:
+            return ""
         entry = self.get(key)
         if entry is None or not entry.stocks:
             return ""
@@ -2107,6 +2123,9 @@ class AceQueryEngine:
         if plan.clarification:
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
 
+        if plan.route == "rule_sector":
+            return self._answer_sector(parsed.sector, started)
+
         pre_results: List[tools.ToolResult] = []
         if plan.route == "rule_top_warrant":
             pre_results = self._run_tools(plan.tool_calls)
@@ -2152,6 +2171,18 @@ class AceQueryEngine:
             cacheable=llm_ok and all(r.ok for r in combined),
             panels=panels,
         )
+
+    def _answer_sector(self, request: Dict[str, str], started: float) -> AnswerResult:
+        def validate(explanation: str, row: Dict[str, Any]) -> bool:
+            result = tools.ToolResult("get_sector_candidate", True, row)
+            payload = {"tool_results": {"get_sector_candidate": row}}
+            facts = FactSheet("", [result], payload)
+            # 一次只核對這檔股票，防止其他成分股的數字通過核對。
+            return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
+
+        result = sector_analysis.answer(request, self.gateway, validate)
+        return AnswerResult(text=result["text"], route="rule_sector", gemini_calls=result["calls"],
+                            elapsed=time.perf_counter() - started, cacheable=result["cacheable"])
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
         """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
