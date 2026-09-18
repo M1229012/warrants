@@ -799,10 +799,31 @@ def _first_column(df: pd.DataFrame, candidates: Tuple[str, ...]) -> str:
 
 
 def _event_letter(value: Any) -> str:
-    """事件類型字串 → A~E 代碼；無法判斷時回傳空字串。"""
+    """事件類型字串 → 單一 A~E 代碼；無法判斷時回傳空字串。"""
     text = _clean_cell(value).upper()
     match = re.match(r"^([A-E])(?:$|[-_\s])", text)
     return match.group(1) if match else ""
+
+
+def _event_key(value: Any) -> str:
+    """事件類型字串 → 正規化事件 key。
+
+    支援單一事件（A～E）與 Sheet 內既有的複合事件（例如 A+C、A/C、A、C、A+C+E）。
+    「全部」類列正規化為 ``overall``。這個函式只負責讀取 Sheet 已存在的統計名稱，
+    不自行創造複合事件。
+    """
+    text = _clean_cell(value).upper().replace('＋', '+')
+    if text.startswith('全部'):
+        return 'overall'
+    # 先抓獨立的 A～E 字母；避免把一般英文單字中的字母誤判成事件。
+    letters = re.findall(r'(?<![A-Z])([A-E])(?![A-Z])', text)
+    if not letters:
+        single = _event_letter(text)
+        return single
+    # 複合事件一律依 A→E 排序，讓 Sheet 寫 C+A、A/C 或 A＋C 都能匹配同一個 A+C key。
+    unique = set(letters)
+    ordered = [code for code in EVENT_CODES if code in unique]
+    return '+'.join(ordered)
 
 
 def _parse_sheet_date(value: Any) -> Optional[pd.Timestamp]:
@@ -1542,7 +1563,7 @@ def _warrant_flow_frame(
     """抓取指定股票最近 N 個交易日的權證分點事件，並套用週報 TOP5 的排除規則。"""
     kf = core()
     code, name = _stock_identity(stock_code)
-    days = max(1, min(int(days or 5), 20))
+    days = max(1, min(int(days or 5), _env_int("WARRANT_FLOW_MAX_DAYS", 60)))
 
     def build() -> Dict[str, Any]:
         today = kf.get_taipei_today_ts()
@@ -2311,10 +2332,11 @@ def read_branch_event_performance(prior_strength: float = EVENT_PRIOR_STRENGTH) 
         revised_col = _find_column(columns, exact="修正勝率")
 
         branches: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        pooled: Dict[str, List[float]] = {code: [0.0, 0.0] for code in (*EVENT_CODES, "overall")}
+        # pooled 需保留 Sheet 內既有的複合事件 key（例如 A+C），不能只預建 A～E。
+        pooled: Dict[str, List[float]] = {}
         for _, row in df.iterrows():
             event_label = _clean_cell(row.get("事件類型", ""))
-            code = "overall" if event_label.startswith("全部") else _event_letter(event_label)
+            code = _event_key(event_label)
             branch = kf.normalize_branch_name(row.get("分點", ""))
             if not code or not branch:
                 continue
@@ -2346,8 +2368,9 @@ def read_branch_event_performance(prior_strength: float = EVENT_PRIOR_STRENGTH) 
             }
             branches.setdefault(branch, {})[code] = record
             if wins is not None and included > 0:
-                pooled[code][0] += wins
-                pooled[code][1] += included
+                bucket = pooled.setdefault(code, [0.0, 0.0])
+                bucket[0] += wins
+                bucket[1] += included
 
         priors = {
             code: round(w / n * 100.0, 2) if n > 0 else 50.0
@@ -2413,22 +2436,23 @@ def get_branch_event_performance(branch_name: str, event_type: str = "") -> Dict
         "missing_columns": data["missing_columns"],
         "sheet_updated_at": data["sheet_updated_at"],
     }
-    letter = _event_letter(event_type)
+    event_key = _event_key(event_type)
     overall = records.get("overall")
-    if letter:
-        rec = records.get(letter)
+    if event_key and event_key != "overall":
+        rec = records.get(event_key)
         if not rec:
-            return {"found": False, "branch": canonical, "event_type": letter, "reason": f"勝率統計沒有 {letter} 事件資料"}
+            return {"found": False, "branch": canonical, "event_type": event_key, "reason": f"勝率統計沒有 {event_key} 事件資料"}
         return {
             "found": True,
-            **_event_perf_payload(canonical, letter, rec),
+            **_event_perf_payload(canonical, event_key, rec),
             "overall_background": _event_perf_payload(canonical, "overall", overall) if overall else {},
             **meta,
         }
+    event_keys = [k for k in records.keys() if k != "overall"]
     return {
         "found": True,
         "branch": canonical,
-        **{code: _event_perf_payload(canonical, code, records[code]) for code in EVENT_CODES if code in records},
+        **{code: _event_perf_payload(canonical, code, records[code]) for code in event_keys},
         "overall": _event_perf_payload(canonical, "overall", overall) if overall else {},
         **meta,
     }
@@ -3144,7 +3168,9 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     start, end = _parse_sheet_date(dates[0]), _parse_sheet_date(dates[-1])
     bundle = load_abcde_event_rows()
     events = bundle["events"]
-    rows = events[(events["stock_code"] == code) & (events["event_date"] >= start) & (events["event_date"] <= end)]
+    stock_rows = events[events["stock_code"] == code]
+    rows = stock_rows[(stock_rows["event_date"] >= start) & (stock_rows["event_date"] <= end)]
+    window_count = len(rows)
     if branch_name:
         targets = []
         for raw in [x for x in str(branch_name).split(",") if x.strip()]:
@@ -3161,6 +3187,7 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     def in_window(value: Any) -> bool:
         return value is not None and not pd.isna(value) and start <= value <= end
 
+    branch_count = len(rows)
     day_trades = _day_trade_mask(rows)
     if day_trades.any():
         rule += f"（已排除 {DAYTRADE_MAX_HOLD_DAYS} 個交易日內出清的隔日衝 {int(day_trades.sum())} 筆）"
@@ -3178,7 +3205,86 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             "exit_date": _fmt_date(r["exit_date"]) if in_window(r["exit_date"]) else "",
             "status": r["status"],
         })
-    return {"rule": rule, "events": marks, "data_latest_event_date": _fmt_date(bundle["latest_event_date"])}
+    reason = ""
+    if not marks:
+        if stock_rows.empty:
+            reason = "事件資料內沒有這檔股票的 A～E 買進紀錄；不代表沒有其他權證交易。"
+        elif not window_count:
+            reason = f"這檔股票有 {len(stock_rows)} 筆 A～E 事件，但買進日都不在本圖日期範圍；目前標記以區間內買進事件為準。"
+        elif not branch_count:
+            reason = (f"圖表區間有 {window_count} 筆 A～E 事件，但沒有符合指定分點的事件。" if branch_name else
+                      f"圖表區間有 {window_count} 筆 A～E 事件，但所屬分點未列入總勝率 {HIGH_WIN_RATE_PCT:g}% 以上或精選分點名單。"
+                      "單一事件的調整後勝率不等於分點總勝率；勝率資料未取得也可能影響名單。")
+        else:
+            reason = f"符合分點條件的 {branch_count} 筆 A～E 事件皆屬 {DAYTRADE_MAX_HOLD_DAYS} 個交易日內出清，已依隔日衝排除規則略過。"
+    return {"rule": rule, "events": marks, "data_latest_event_date": _fmt_date(bundle["latest_event_date"]),
+            "empty_reason": reason,
+            "filter_counts": {"stock_events": len(stock_rows), "in_window": window_count,
+                              "eligible_branch": branch_count, "excluded_day_trades": int(day_trades.sum()),
+                              "displayed": len(marks)}}
+
+
+def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
+    """K 線用「實際權證流水」買賣超點位。
+
+    與 A～E 事件回放分開：先以「分點 × 股票 × 日期」聚合 MoneyDJ 淨額，
+    同日不同權證的一買一賣會先互抵，降低換倉造成的假雙訊號。
+    未指定分點時，只取區間累積絕對淨額最大的前幾個分點，避免圖面過度擁擠。
+    """
+    kf = core()
+    if not dates:
+        return {"mode": "flow", "events": []}
+    code = kf._normalize_stock_name_code_key(stock_code)
+    start, end = _parse_sheet_date(dates[0]), _parse_sheet_date(dates[-1])
+    lookback = min(max(1, len(dates)), _env_int("WARRANT_FLOW_MAX_DAYS", 60))
+    try:
+        bundle = _warrant_flow_frame(code, lookback)
+        flow = bundle.get("flow")
+    except Exception as exc:
+        print(f"⚠️ {code} 權證流水標註取得失敗：{type(exc).__name__}: {exc}", flush=True)
+        return {"mode": "flow", "events": []}
+    if flow is None or flow.empty:
+        print(f"ℹ️ {code} 權證流水標註：區間內無資料", flush=True)
+        return {"mode": "flow", "events": []}
+    rows = flow.copy()
+    rows["Date"] = pd.to_datetime(rows["Date"], errors="coerce").dt.normalize()
+    rows = rows[rows["Date"].notna() & (rows["Date"] >= start) & (rows["Date"] <= end)]
+    if branch_name:
+        targets = []
+        for raw in [x for x in re.split(r"[,，、]", str(branch_name)) if x.strip()]:
+            canonical, _ = resolve_branch(raw)
+            targets.append(canonical or kf.normalize_branch_name(raw))
+        targets = list(dict.fromkeys(targets))
+        rows = rows[rows["branch"].isin(targets)]
+    else:
+        topn = max(1, _env_int("CHART_FLOW_TOP_BRANCHES", 4))
+        totals = rows.groupby("branch")["net_amount"].sum().abs().sort_values(ascending=False)
+        rows = rows[rows["branch"].isin(list(totals.head(topn).index))]
+    if rows.empty:
+        print(f"ℹ️ {code} 權證流水標註：指定分點／篩選後無資料", flush=True)
+        return {"mode": "flow", "events": []}
+    daily = rows.groupby(["branch", "Date"], as_index=False)["net_amount"].sum()
+    min_abs = max(0.0, _env_float("CHART_FLOW_MIN_ABS_AMOUNT", 100_000.0))
+    daily = daily[daily["net_amount"].abs() >= min_abs]
+    if daily.empty:
+        print(f"ℹ️ {code} 權證流水標註：全部低於顯示門檻 {min_abs:g}", flush=True)
+        return {"mode": "flow", "events": []}
+    max_marks = max(1, _env_int("CHART_FLOW_MAX_MARKS", 14))
+    # 優先保留大額點位；最後再依日期排序，圖面閱讀較自然。
+    daily = daily.assign(_abs=daily["net_amount"].abs()).nlargest(max_marks, "_abs").sort_values("Date")
+    marks = []
+    for no, (_, row) in enumerate(daily.iterrows(), 1):
+        amount = float(row["net_amount"])
+        marks.append({
+            "no": no,
+            "branch": row["branch"],
+            "action": "buy" if amount > 0 else "sell",
+            "action_text": "買超" if amount > 0 else "賣超",
+            "action_date": _fmt_date(row["Date"]),
+            "net_amount": _num(amount, 0),
+            "net_amount_text": _money_text(amount),
+        })
+    return {"mode": "flow", "events": marks}
 
 
 # ============================================================
@@ -3246,7 +3352,7 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 # Tool 註冊表
 # ============================================================
 
-def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True) -> Dict[str, Any]:
+def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event") -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
@@ -3293,9 +3399,10 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
     marks: Dict[str, Any] = {}
     if with_marks:
         try:
-            marks = chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name)
+            marks = (chart_flow_marks_for_stock(code, [bar["date"] for bar in bars], branch_name) if str(mark_mode).lower() == "flow" else chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name))
         except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
             print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
+            marks = {"mode": str(mark_mode).lower(), "events": []}
     return {"stock_code": code, "stock_name": name, "bars": bars,
             "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
             "bollinger": analyze_bollinger(closed_frame(bundle)),

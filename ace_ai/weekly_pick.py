@@ -1,16 +1,15 @@
 """艾斯 AI｜本週精選候選股（私人研究用）。
 
-目的不是替使用者選股，而是每週從權證資料找出最適合撰寫 Discord「本週精選」週報的
-3～5 檔候選，最後由使用者自己決定。
+定位：先從 Google Sheet 權證事件中找出近 60 個交易日仍有未出清權證大戶部位的普通股，
+所有分點以同一套規則比較；精選五分點只標記、不加分。排除 ETF／非普通股與預設 2330。
 
-流程（效能由粗到細）：
-    Stage 1  回測官方 A～E 事件表 → 最近 N 個交易日有事件的「分點 × 股票」
-    Stage 2  分點 × 本次事件的歷史績效（Bayesian 修正勝率）＋ 事件買進金額 → 預排序，縮到 10～20 檔
-    Stage 3  只對候選抓技術面、大量區、分點近期操作（含 MoneyDJ 近20日流水）
-    Score    型態＋大量區支撐 50（100 分制型態分數 × 0.5）＋ 事件績效 22 ＋ 權證金額 16 ＋ 近期操作 12 ＝ 100
-    TOP5     由 Python 決定，Gemini 只負責解釋（正常 1 次呼叫）
+排名：技術面 50 ＋ 權證面 50。權證面＝本次事件／精確複合事件歷史績效 20
+＋有效權證部位金額 15 ＋ 持倉／操作狀態 15。0～60 日只決定資格，不做新鮮度扣分。
+勝率優先使用 Sheet 已存在的精確複合事件（如 A+C）；找不到時才退回單事件資料，
+總勝率只保留為背景資訊。
 
-新聞不列入分數；只有 Discord AI 已有新聞快取時才附上補充。
+操作流程：先以「本週精選排名」取得 Top10；管理員再指定「3034 幫我生成週精選文字」，
+人工修改確認後輸入「這版確認，生成圖片」。排名階段 0 次 Gemini，AI 只負責文字解讀與改寫。
 """
 
 from __future__ import annotations
@@ -39,13 +38,13 @@ import warrant_ai_tools as tools
 class WeeklyPickConfig:
     """本週精選所有門檻與權重參數集中在這裡，全部可用環境變數覆寫。"""
 
-    event_window_trading_days: int = tools._env_int("WEEKLY_PICK_EVENT_WINDOW_DAYS", 5)
+    event_window_trading_days: int = tools._env_int("WEEKLY_PICK_EVENT_WINDOW_DAYS", 60)
     min_event_win_rate: float = tools._env_float("WEEKLY_PICK_MIN_EVENT_WIN_RATE", 60.0)
     min_event_sample: int = tools._env_int("WEEKLY_PICK_MIN_EVENT_SAMPLE", 10)
-    shortlist_size: int = tools._env_int("WEEKLY_PICK_SHORTLIST_SIZE", 20)
+    shortlist_size: int = tools._env_int("WEEKLY_PICK_SHORTLIST_SIZE", 0)  # 0＝所有符合資格股票公平進入完整評分
     # 本週精選固定排除的股票代號（逗號分隔），預設排除 2330。
     exclude_codes: Tuple[str, ...] = tuple(c.strip() for c in os.getenv("WEEKLY_PICK_EXCLUDE_CODES", "2330").split(",") if c.strip())
-    top_n: int = tools._env_int("WEEKLY_PICK_TOP_N", 5)
+    top_n: int = tools._env_int("WEEKLY_PICK_TOP_N", 10)
     recent_behavior_days: int = tools._env_int("WEEKLY_PICK_RECENT_BEHAVIOR_DAYS", 30)
     recent_case_count: int = tools._env_int("WEEKLY_PICK_RECENT_CASE_COUNT", 10)
     # 預設關閉：每檔候選即時抓 MoneyDJ 近20日流水很吃記憶體，Railway 會 out of memory。
@@ -184,19 +183,24 @@ def evaluate_pair(
     config: WeeklyPickConfig,
     min_win_rate: float,
 ) -> Dict[str, Any]:
-    """整理「分點 × 股票」本次觸發的事件與事件別歷史績效。
+    """整理「分點 × 股票」目前仍有效的這一輪事件與歷史績效。
 
-    避免 double counting：同一筆「分點 × 股票」只算一次事件績效。
-    若區間內觸發多個等級（不同交易日的多筆事件），以各等級「本次買進金額占比」加權平均，
-    權重合計為 1，不會把 A、C、D 的勝率各加一次分。
+    排名優先使用 Sheet 已存在的「精確複合事件」統計，例如目前未出清事件為 A、C，
+    且勝率統計存在 A+C，就直接採 A+C；只有找不到精確組合時，才退回單事件加權。
+    已出清的舊事件不拿來湊目前事件組合，避免把不同輪布局錯組成 A+C。
     """
     records = perf["branches"].get(branch, {})
-    amount_by_code = pair_events.groupby("event_code")["buy_amount"].sum()
-    total_amount = float(amount_by_code.sum())
+    active = pair_events[pair_events.get("status", "") != "已出清"].copy() if "status" in pair_events else pair_events.copy()
+    # 每週精選的定位是找「權證大戶仍在場」的股票；已全數出清的 pair 留作紀錄但不進候選。
+    active_pair = not active.empty
+    basis = active if active_pair else pair_events.sort_values("event_date").tail(1)
+    amount_by_code = basis.groupby("event_code")["buy_amount"].sum() if not basis.empty else pd.Series(dtype=float)
+    total_amount = float(amount_by_code.sum()) if len(amount_by_code) else 0.0
+    triggered = [c for c in tools.EVENT_CODES if c in amount_by_code.index]
+    combo_key = "+".join(triggered)
+
     matched: Dict[str, Dict[str, Any]] = {}
-    for code in tools.EVENT_CODES:
-        if code not in amount_by_code.index:
-            continue
+    for code in triggered:
         rec = records.get(code)
         share = float(amount_by_code[code]) / total_amount if total_amount > 0 else 0.0
         entry = {"amount_share": round(share, 3), "event_buy_amount_text": tools._money_text(amount_by_code[code])}
@@ -215,29 +219,63 @@ def evaluate_pair(
             entry["missing_history"] = True
         matched[code] = entry
 
+    exact = records.get(combo_key) if combo_key and "+" in combo_key else None
+
     def weighted(key: str) -> Optional[float]:
         pairs = [(m["amount_share"], _f(m.get(key))) for m in matched.values()]
         pairs = [(w, v) for w, v in pairs if v is not None and w > 0]
         weight = sum(w for w, _ in pairs)
         return sum(w * v for w, v in pairs) / weight if weight > 0 else None
 
+    if exact:
+        raw = _f(exact.get("raw_win_rate"))
+        adjusted = _f(exact.get("adjusted_win_rate"))
+        included = _f(exact.get("included_count"))
+        weighted_return = _f(exact.get("weighted_return"))
+        unresolved_ratio = _f(exact.get("unresolved_ratio"))
+        performance_source = "exact_combo"
+        performance_key = combo_key
+        exact_payload = {
+            "raw_win_rate": exact.get("raw_win_rate"),
+            "adjusted_win_rate": exact.get("adjusted_win_rate"),
+            "included_count": tools._num(exact.get("included_count"), 0),
+            "event_count": tools._num(exact.get("event_count"), 0),
+            "unresolved_count": tools._num(exact.get("unresolved_count"), 0),
+            "weighted_return": exact.get("weighted_return"),
+            "avg_holding_days": exact.get("avg_holding_days"),
+            "unresolved_ratio": exact.get("unresolved_ratio"),
+        }
+    else:
+        raw = weighted("raw_win_rate")
+        adjusted = weighted("adjusted_win_rate")
+        included = weighted("included_count")
+        weighted_return = weighted("weighted_return")
+        unresolved_ratio = weighted("unresolved_ratio")
+        performance_source = "single_event_fallback" if len(triggered) > 1 else "single_event"
+        performance_key = combo_key or (triggered[0] if triggered else "")
+        exact_payload = {}
+
     overall = records.get("overall") or {}
-    raw = weighted("raw_win_rate")
     dominant = max(matched, key=lambda c: matched[c]["amount_share"]) if matched else ""
     return {
         "branch": branch,
         "stock_code": stock_code,
-        "triggered_events": list(matched.keys()),
+        "active_pair": active_pair,
+        "triggered_events": triggered,
+        "event_combo_key": combo_key,
+        "performance_key": performance_key,
+        "performance_source": performance_source,
+        "exact_combo_performance": exact_payload,
         "dominant_event": dominant,
-        "event_dates": sorted({tools._fmt_date(d) for d in pair_events["event_date"]}),
+        "event_dates": sorted({tools._fmt_date(d) for d in basis["event_date"]}) if not basis.empty else [],
         "event_buy_amount": total_amount,
         "event_buy_amount_text": tools._money_text(total_amount),
         "event_performance": matched,
         "matched_raw_win_rate": _round(raw, 2),
-        "matched_adjusted_win_rate": _round(weighted("adjusted_win_rate"), 2),
-        "matched_included_count": _round(weighted("included_count"), 1),
-        "matched_weighted_return": _round(weighted("weighted_return"), 2),
-        "matched_unresolved_ratio": _round(weighted("unresolved_ratio"), 3),
+        "matched_adjusted_win_rate": _round(adjusted, 2),
+        "matched_included_count": _round(included, 1),
+        "matched_weighted_return": _round(weighted_return, 2),
+        "matched_unresolved_ratio": _round(unresolved_ratio, 3),
         "overall": {
             "raw_win_rate": overall.get("raw_win_rate"),
             "adjusted_win_rate": overall.get("adjusted_win_rate"),
@@ -247,7 +285,8 @@ def evaluate_pair(
             "weighted_return": overall.get("weighted_return"),
         },
         "primary": bool(raw is not None and raw >= min_win_rate),
-        "has_history": any(not m.get("missing_history") for m in matched.values()),
+        "has_history": bool(exact or any(not m.get("missing_history") for m in matched.values())),
+        "is_selected_five": branch in set(tools.selected_five_branches()),
     }
 
 
@@ -264,30 +303,24 @@ def score_event_performance(pair: Dict[str, Any], config: WeeklyPickConfig, min_
     return_part = 5.0 * _clip01(((ret if ret is not None else 5.0) + 10.0) / 40.0)
     score = win_part + sample_part + return_part
     reasons = [f"修正勝率 {adj:.1f}% → {win_part:.1f}", f"樣本 {n:.0f} 筆 → {sample_part:.1f}", f"加權報酬 {ret if ret is not None else '-'}% → {return_part:.1f}"]
-    if raw is not None and raw < min_win_rate:
-        score *= 0.7
-        reasons.append(f"本次事件原始勝率 {raw:.1f}% 低於門檻 {min_win_rate:g}%，×0.7")
     return round(min(25.0, score), 2), reasons
 
 
 def score_warrant_amount(stock: Dict[str, Any], lead_live: Dict[str, Any]) -> Tuple[float, List[str]]:
-    """C. 權證買超金額（25）：總事件買進 12 ＋ 高品質分點買進 8 ＋ 多分點共振 5（log scaling、上限封頂）。"""
-    total = stock["event_buy_amount_total"]
-    hq_amount = stock["high_quality_amount"]
-    hq_count = stock["high_quality_branch_count"]
-    total_part = 12.0 * _clip01(math.log10(max(total, 1.0) / 1e6) / math.log10(50.0))
-    hq_part = 8.0 * _clip01(math.log10(max(hq_amount, 1.0) / 1e6) / math.log10(30.0))
-    resonance = 0.0 if hq_count <= 1 else 3.0 if hq_count == 2 else 5.0
-    score = total_part + hq_part + resonance
+    """權證買超／持有金額（原始 25 分）：金額 20＋多分點共振 5。
+
+    不因最後買超距今 41～60 日而扣分；時間只作為資訊，不是排名因子。
+    事件勝率已在另一個分項計算，這裡不再用「高勝率分點金額」重複加權。
+    """
+    total = float(stock.get("event_buy_amount_total") or 0.0)
+    branch_count = int(stock.get("active_branch_count") or len(stock.get("pairs") or []))
+    amount_part = 20.0 * _clip01(math.log10(max(total, 1.0) / 1e6) / math.log10(50.0))
+    resonance = 0.0 if branch_count <= 1 else 3.0 if branch_count == 2 else 5.0
+    score = amount_part + resonance
     reasons = [
-        f"事件買進合計 {tools._money_text(total)} → {total_part:.1f}",
-        f"高品質分點買進 {tools._money_text(hq_amount)} → {hq_part:.1f}",
-        f"高品質分點 {hq_count} 家 → {resonance:.1f}",
+        f"目前有效事件買進合計 {tools._money_text(total)} → {amount_part:.1f}",
+        f"仍在場分點 {branch_count} 家 → {resonance:.1f}",
     ]
-    net5 = _f(lead_live.get("net_buy_5d")) if lead_live.get("has_trades") else None
-    if net5 is not None and net5 <= 0:
-        score -= 3.0
-        reasons.append(f"主力分點近5日淨額 {lead_live.get('net_buy_5d_text')}（非淨買）→ -3")
     return round(min(25.0, max(0.0, score)), 2), reasons
 
 
@@ -365,8 +398,8 @@ def _technical_extras(stock_code: str) -> Dict[str, Any]:
 # ============================================================
 
 PATTERN_GRADES = ((75.0, "結構偏強"), (60.0, "中性偏多"), (45.0, "結構中性"), (30.0, "中性偏弱"), (0.0, "結構偏弱"))
-PATTERN_WEIGHT = 50.0  # 本週精選綜合分數中型態評分（含大量區支撐）的權重：仍是最大項，但保留籌碼面的影響力
-EVENT_WEIGHT, AMOUNT_WEIGHT, RECENT_WEIGHT = 22.0, 16.0, 12.0  # 事件績效、權證金額、近期操作（原始滿分 25／25／10）
+PATTERN_WEIGHT = 50.0  # 技術面合計 50；不讓型態或權證任何單一面向極端主導
+EVENT_WEIGHT, AMOUNT_WEIGHT, RECENT_WEIGHT = 20.0, 15.0, 15.0  # 權證面合計 50：事件績效／部位金額／持倉操作狀態
 # 各項原始滿分（細項加總用）與換算後權重（型態分數 100 分）：以型態與大量區支撐為主要依據。
 PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構", 25), ("下方支撐", 15), ("布林", 10))
 PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 25, "價格位置": 15, "量區結構": 25, "下方支撐": 25, "布林": 10}
@@ -700,10 +733,12 @@ class WeeklyPickEngine:
         stocks: Dict[str, Dict[str, Any]] = {}
         for pair in pairs:
             pair["event_score"], pair["event_score_reasons"] = score_event_performance(pair, config, min_win_rate)
+            if not pair.get("active_pair"):
+                continue  # 已完全出清的舊布局不算「權證大戶仍在場」
             stock = stocks.setdefault(pair["stock_code"], {"stock_code": pair["stock_code"], "pairs": []})
             stock["pairs"].append(pair)
         for stock in stocks.values():
-            ranked = sorted(stock["pairs"], key=lambda p: (p["primary"], p["event_score"], p["event_buy_amount"]), reverse=True)
+            ranked = sorted(stock["pairs"], key=lambda p: (p["event_score"], p["event_buy_amount"]), reverse=True)
             stock["pairs"] = ranked
             high_quality = [
                 p for p in ranked
@@ -712,6 +747,7 @@ class WeeklyPickEngine:
             stock["lead"] = ranked[0]
             stock["high_quality_pairs"] = high_quality
             stock["event_buy_amount_total"] = float(sum(p["event_buy_amount"] for p in ranked))
+            stock["active_branch_count"] = len(ranked)
             stock["high_quality_amount"] = float(sum(p["event_buy_amount"] for p in high_quality))
             stock["high_quality_branch_count"] = len(high_quality)
             stock["max_high_quality_single"] = max((p["event_buy_amount"] for p in high_quality), default=0.0)
@@ -740,14 +776,20 @@ class WeeklyPickEngine:
         }
 
     def shortlist(self, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """用不需要抓價的分數（事件績效＋金額）預排序，主要候選優先，縮到 shortlist_size。"""
-        for stock in pool:
-            stock["pre_amount_score"], _ = score_warrant_amount(stock, {})
-            stock["pre_score"] = stock["lead"]["event_score"] + stock["pre_amount_score"]
-        ranked = sorted(pool, key=lambda s: (s["has_primary"], s["pre_score"]), reverse=True)
-        chosen = ranked[: max(self.config.top_n, self.config.shortlist_size)]
-        self.log(f"預排序後進入技術面計算：{len(chosen)} 檔 → {', '.join(s['stock_code'] for s in chosen)}")
-        return chosen
+        """所有符合資格股票原則上都進完整評分，避免先用權證條件預排序造成候選偏誤。
+
+        WEEKLY_PICK_SHORTLIST_SIZE=0（預設）代表不截斷；若部署資源有限，可由環境變數設定安全上限。
+        """
+        if self.config.shortlist_size and self.config.shortlist_size > 0:
+            for stock in pool:
+                stock["pre_amount_score"], _ = score_warrant_amount(stock, {})
+                stock["pre_score"] = stock["lead"]["event_score"] + stock["pre_amount_score"]
+            ranked = sorted(pool, key=lambda s: s["pre_score"], reverse=True)
+            chosen = ranked[: max(self.config.top_n, self.config.shortlist_size)]
+            self.log(f"部署安全上限啟用：{len(pool)} → {len(chosen)} 檔進完整評分")
+            return chosen
+        self.log(f"公平比較模式：{len(pool)} 檔全部進入完整技術＋權證評分")
+        return list(pool)
 
     # ---------------- Stage 3 ----------------
     def enrich_and_score(self, stock: Dict[str, Any], min_win_rate: float) -> Dict[str, Any]:
@@ -798,14 +840,14 @@ class WeeklyPickEngine:
 
         breakdown: Dict[str, float] = {}
         reasons: Dict[str, List[str]] = {}
-        # 各項原始分數照舊計算，再換算成新權重（型態 50＋事件 22＋金額 16＋近期 12＝100）。
+        # 各項原始分數照舊計算，再換算成新權重（技術面 50＋事件績效 20＋權證金額 15＋持倉操作 15＝100）。
         recent_raw, reasons["recent_branch_behavior"] = score_recent_behavior(behavior, config)
         amount_raw, reasons["warrant_amount"] = score_warrant_amount(stock, lead_live)
         reasons["event_performance"] = lead["event_score_reasons"]
         breakdown["event_performance_score"] = round(lead["event_score"] * EVENT_WEIGHT / 25, 2)
         breakdown["recent_branch_behavior_score"] = round(recent_raw * RECENT_WEIGHT / 10, 2)
         breakdown["warrant_amount_score"] = round(amount_raw * AMOUNT_WEIGHT / 25, 2)
-        # 型態評分（100 分制，與一般問答共用）換算成 40 分計入綜合分數。
+        # 型態評分（100 分制，與一般問答共用）換算成 50 分計入綜合分數。
         pattern: Dict[str, Any] = {}
         if tech and vp:
             pattern = score_pattern(tech, vp, extras, config)
@@ -861,6 +903,7 @@ class WeeklyPickEngine:
             "technical": tech,
             "volume_profile": vp,
             "technical_extras": extras,
+            "selected_five_branches": [p["branch"] for p in stock.get("pairs", []) if p.get("is_selected_five")],
         })
         return stock
 
@@ -960,6 +1003,9 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
             "net_buy_5d_text": live.get("net_buy_5d_text") if live.get("has_trades") else None,
             "event_dates": lead["event_dates"],
             "triggered_events": lead["triggered_events"],
+            "performance_key": lead.get("performance_key"),
+            "performance_source": lead.get("performance_source"),
+            "exact_combo_performance": lead.get("exact_combo_performance") or {},
             "event_performance": {c: _perf_brief(m) for c, m in lead["event_performance"].items()},
             "matched_weighted": {
                 "raw_win_rate": lead["matched_raw_win_rate"],
@@ -968,6 +1014,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
                 "weighted_return": lead["matched_weighted_return"],
             },
             "overall_background": lead["overall"],
+            "is_selected_five": lead.get("is_selected_five", False),
         },
         "other_high_quality_branches": [
             {
@@ -1230,7 +1277,7 @@ def format_rule_based(result: Dict[str, Any]) -> str:
             lines.append("【注意】" + "、".join(warn))
     lines.append("")
     lines.append(
-        f"資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
+        f"資料時間：近 60 個交易日權證事件 {result['window_start']}～{result['window_end']}｜"
         f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
     )
     lines.append("※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。")
@@ -1242,35 +1289,37 @@ def format_rule_based(result: Dict[str, Any]) -> str:
 # ============================================================
 
 SCORE_PARTS = (
-    ("pattern_score", "型態＋大量區支撐", PATTERN_WEIGHT),
+    ("pattern_score", "技術面", PATTERN_WEIGHT),
     ("event_performance_score", "事件績效", EVENT_WEIGHT),
-    ("warrant_amount_score", "權證金額", AMOUNT_WEIGHT),
-    ("recent_branch_behavior_score", "近期操作", RECENT_WEIGHT),
+    ("warrant_amount_score", "權證部位", AMOUNT_WEIGHT),
+    ("recent_branch_behavior_score", "持倉操作", RECENT_WEIGHT),
 )
 
 
 def mark_branches(stock: Dict[str, Any]) -> List[str]:
     """K 線要標註的分點＝這檔候選實際用來評分的分點（主力＋高品質分點）。"""
-    names = [stock["lead"]["branch"]] + [p["branch"] for p in stock.get("high_quality_pairs") or []]
+    names = [stock["lead"]["branch"]] + [p["branch"] for p in stock.get("pairs") or []]
     return list(dict.fromkeys(names))[:4]
 
 
 def card_facts(stock: Dict[str, Any]) -> Dict[str, Any]:
-    """卡片上的固定數據（全部來自 Python 計算，不經過 AI）。"""
+    """排名卡固定數據；精選五分點只標記、不加分。"""
     lead = stock["lead"]
     tech = stock.get("technical") or {}
     vp = stock.get("volume_profile") or {}
     ma20 = (tech.get("moving_averages") or {}).get("MA20") or {}
-    overall = lead.get("overall") or {}
     event_lines = []
-    for code, m in lead["event_performance"].items():
-        if m.get("raw_win_rate") is None and m.get("adjusted_win_rate") is None:
-            event_lines.append(f"{code} 事件｜勝率統計無資料")
-            continue
-        line = f"{code} 事件｜勝率 {m.get('raw_win_rate')}%（修正 {m.get('adjusted_win_rate')}%）｜樣本 {_count_text(m.get('included_count'))}"
-        if m.get("unresolved_count"):
-            line += f"｜未完成 {_count_text(m.get('unresolved_count'))}"
-        event_lines.append(line)
+    exact = lead.get("exact_combo_performance") or {}
+    if exact:
+        event_lines.append(
+            f"{lead.get('performance_key')} 組合｜勝率 {exact.get('raw_win_rate')}%（修正 {exact.get('adjusted_win_rate')}%）｜樣本 {_count_text(exact.get('included_count'))}"
+        )
+    else:
+        for code, m in lead["event_performance"].items():
+            if m.get("raw_win_rate") is None and m.get("adjusted_win_rate") is None:
+                continue
+            event_lines.append(f"{code} 事件｜勝率 {m.get('raw_win_rate')}%（修正 {m.get('adjusted_win_rate')}%）｜樣本 {_count_text(m.get('included_count'))}")
+    selected = bool(lead.get("is_selected_five"))
     return {
         "rank": stock["rank"],
         "stock_code": stock["stock_code"],
@@ -1284,11 +1333,17 @@ def card_facts(stock: Dict[str, Any]) -> Dict[str, Any]:
         "ma_alignment": tech.get("ma_alignment") or "-",
         "ma20_text": f"MA20 {ma20.get('position', '-')} {ma20.get('distance_pct')}%" if ma20.get("distance_pct") is not None else "",
         "lead_branch": lead["branch"],
+        "lead_branch_selected": selected,
+        "lead_branch_label": ("⭐ " if selected else "") + lead["branch"],
         "lead_amount_text": lead["event_buy_amount_text"],
+        "event_combo_key": lead.get("performance_key") or "+".join(lead.get("triggered_events") or []),
+        "event_performance_source": lead.get("performance_source"),
+        "event_win_rate": lead.get("matched_raw_win_rate"),
+        "event_adjusted_win_rate": lead.get("matched_adjusted_win_rate"),
+        "event_sample": lead.get("matched_included_count"),
         "triggered_events": lead["triggered_events"],
         "event_lines": event_lines,
-        "overall_line": f"總勝率（背景）{overall.get('raw_win_rate', '-')}%｜樣本 {_count_text(overall.get('included_count'))}",
-        "other_branches": [p["branch"] for p in stock.get("high_quality_pairs") or [] if p["branch"] != lead["branch"]][:3],
+        "other_branches": [(("⭐ " if p.get("is_selected_five") else "") + p["branch"]) for p in stock.get("pairs") or [] if p["branch"] != lead["branch"]][:3],
         "mark_branches": mark_branches(stock),
         "data_date": tech.get("data_date", ""),
     }
@@ -1385,11 +1440,30 @@ def cards_to_text(cards: List[Dict[str, Any]], overview: str, meta: Dict[str, An
     return "\n".join(line for line in lines if line is not None)
 
 
+def ranking_to_text(cards: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
+    lines = ["📊 權證分點觀察｜本週精選 Top 10"]
+    for card in cards:
+        star = "⭐" if card.get("lead_branch_selected") else ""
+        event = card.get("event_combo_key") or "-"
+        win = card.get("event_win_rate")
+        sample = card.get("event_sample")
+        win_text = f"{win}% / n={_count_text(sample)}" if win is not None else "事件勝率資料不足"
+        parts = {p["label"]: p["value"] for p in card.get("score_parts") or []}
+        lines.append(
+            f"{card['rank']}. {card['stock_code']} {card.get('stock_name','')}｜{card['score']:.1f}分｜"
+            f"技術 {parts.get('技術面',0):.1f}/50｜權證 {max(0.0, float(card.get('score') or 0)-parts.get('技術面',0)):.1f}/50｜"
+            f"{star}{card.get('lead_branch','')}｜{event} {win_text}｜{card.get('lead_amount_text','')}"
+        )
+    if meta.get("data_time"):
+        lines += ["", meta["data_time"]]
+    return "\n".join(lines)
+
+
 def weekly_meta(result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "filters": result.get("filters") or [],
         "data_time": (
-            f"資料時間：A～E 事件 {result['window_start']}～{result['window_end']}｜"
+            f"資料時間：近 60 個交易日權證事件 {result['window_start']}～{result['window_end']}｜"
             f"勝率統計更新 {result['perf_sheet_updated_at'] or '時間未知'}｜股價為日K收盤資料"
         ),
         "disclaimer": "※ 本週精選是研究候選清單，不是買賣建議；最後由你自行判斷。",
@@ -1474,10 +1548,7 @@ def run_weekly_pick(
     log: Callable[[str], None] = print,
     config: Optional[WeeklyPickConfig] = None,
 ) -> WeeklyPickAnswer:
-    """Discord 入口：Python 算 TOP5 → 一次 Gemini 說明 → 數字核對；結果依資料日期快取。
-
-    generate(prompt) 必須回傳具有 ok / text / rate_limited / error 屬性的物件。
-    """
+    """Discord 排名入口：純 Python 排出 Top 10，不呼叫 Gemini、不自動生成長篇週報。"""
     started = time.perf_counter()
     config = config or WeeklyPickConfig()
     stage_log = StageLog(log)
@@ -1485,66 +1556,166 @@ def run_weekly_pick(
     if filters.refresh:
         _clear_tool_caches()
         stage_log("refresh：清除事件表、勝率統計與本週精選快取")
-
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
     cache_key = "|".join([
-        "weekly_pick_cards_v6",  # v6：排除 ETF（v5：型態評分改漸進給分、權重平衡），舊快取可能含 ETF
-        tools._fmt_date(bundle["latest_event_date"]),
-        str(perf.get("sheet_updated_at", "")),
-        filters.signature(),
-        str(config.min_event_win_rate),
-        str(config.top_n),
+        "weekly_pick_rank_v8", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
+        filters.signature(), str(config.event_window_trading_days), str(config.top_n),
     ])
-
-    def answer(item: Dict[str, Any], calls: int, cache_hit: bool, notice: str = "") -> WeeklyPickAnswer:
-        result = item["result"]
-        cards, overview, meta = item.get("cards") or [], item.get("overview", ""), weekly_meta(result)
-        text = cards_to_text(cards, overview, meta) if cards else format_rule_based(result)
-        if notice:
-            text = f"{notice}\n\n{text}"
-        return WeeklyPickAnswer(
-            text, calls, cache_hit, time.perf_counter() - started,
-            [c["stock_code"] for c in cards], cards, overview, meta, notice,
-        )
-
     cached = None if filters.refresh else _load_cache(config, cache_key)
-    if cached and cached.get("ai_ok") and cached.get("cards"):
-        stage_log("快取命中（同一份事件資料與條件），不重新計算、不呼叫 Gemini")
-        return answer(cached, 0, True)
+    if cached and cached.get("result"):
+        result = cached["result"]
+        stage_log("排名快取命中，不重新計算")
+        cache_hit = True
+    else:
+        result = WeeklyPickEngine(config, log).run(filters)
+        _save_cache(config, cache_key, {"result": result, "ai_ok": True})
+        cache_hit = False
+    cards, _ = build_cards(result, None)
+    meta = weekly_meta(result)
+    text = ranking_to_text(cards, meta)
+    return WeeklyPickAnswer(
+        text=text, gemini_calls=0, cache_hit=cache_hit, elapsed=time.perf_counter()-started,
+        stock_codes=[c["stock_code"] for c in cards], cards=cards, overview="", meta=meta, notice="",
+    )
 
-    engine = WeeklyPickEngine(config, log)
-    result = cached["result"] if cached and cached.get("result") else engine.run(filters)
-    if not result["top"]:
-        item = {"result": result, "cards": [], "overview": "", "ai_ok": True}
-        _save_cache(config, cache_key, item)
-        return answer(item, 0, False)
 
-    prompt, payload = build_gemini_prompt(result)
-    stage_log(f"Gemini prompt {len(prompt):,} 字（TOP{len(result['top'])}，1 次呼叫，結構化卡片）")
-    response = generate(prompt, WEEKLY_CARD_SCHEMA)
-    calls = 1
-    rule_cards, _ = build_cards(result, None)
+# ============================================================
+# 管理員週精選文字編輯流程
+# ============================================================
+
+_WEEKLY_STYLE_FILE = os.path.join(os.path.dirname(__file__), "weekly_style_examples.txt")
+
+
+def load_weekly_style_examples(max_chars: int = 9000) -> str:
+    """載入使用者過往週精選文案，僅作語氣／結構參考。"""
+    try:
+        text = open(_WEEKLY_STYLE_FILE, "r", encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+    return text[:max(1000, int(max_chars))]
+
+
+WEEKLY_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {"draft": {"type": "string"}},
+    "required": ["draft"],
+}
+
+
+WEEKLY_DRAFT_SYSTEM_PROMPT = """你是「權證分點觀察｜週精選」文字編輯助理。
+你的任務是根據 fact_data 寫出一篇可直接貼到 Discord 的週精選草稿，文風要貼近 style_examples，但所有事實與數字只能來自 fact_data。
+
+寫作原則：
+1. 使用繁體中文、自然口語、像長期觀察台股與權證分點的人在寫投資筆記，不要像制式研究報告或客服。
+2. 開頭固定兩行：
+   權證分點觀察｜週精選 📌
+   📌 股票代號 股票名稱
+3. 主文通常 1 個緊湊段落、約 4～7 句。優先挑真正有辨識度的重點，不要把所有欄位逐項念完。
+4. 常見順序是「技術型態／大量區 → 權證分點操作 → 對應事件或複合事件歷史績效 → 後續觀察」，但若權證操作本身最特殊，可以先講權證再回到技術面。
+5. 勝率優先使用 branch.performance_key 對應的精確複合事件資料；若 performance_source=single_event_fallback，必須寫成「依單一事件資料綜合觀察」，不可假裝 Sheet 有該複合事件統計。總勝率 overall_background 只作背景，除非使用者明確要求，正文不要拿總勝率取代事件勝率。
+6. 精選五分點只代表標記，不代表比較高分，不要寫成因為是精選分點所以更好。
+7. 只在資料真的支持時提到外資、現股分點、週K、族群或布林；fact_data 沒有就完全不要補。
+8. 不要固定塞「優點／注意／回答／觀察重點」等標題；不要寫英文欄位名；不要解釋系統規則。
+9. 可以使用「後續可持續留意／可以觀察／短線不必急著追價」這種投資筆記語氣，但不要保證漲跌或寫目標價。
+10. 結尾固定：
+   ⚠️ 僅為個人投資筆記
+   🧡 非任何買賣建議
+11. 若 instruction 有修改要求，必須在不改動原始事實的前提下改寫；若 previous_draft 存在，優先延續其內容與語氣，不要整篇改成另一種風格。
+
+只輸出 JSON：{"draft":"完整草稿"}。"""
+
+
+def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", previous_draft: str = "") -> Tuple[str, Dict[str, Any]]:
+    facts = candidate_payload(candidate)
+    style = load_weekly_style_examples()
+    payload = {
+        "fact_data": tools_prune(facts),
+        "instruction": str(instruction or "").strip(),
+        "previous_draft": str(previous_draft or "").strip(),
+    }
+    prompt = (
+        WEEKLY_DRAFT_SYSTEM_PROMPT
+        + "\n\nstyle_examples（只學語氣與結構，不可抄其中舊數字）：\n"
+        + style
+        + "\n\ninput_data（JSON）：\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    return prompt, facts
+
+
+def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, config: Optional[WeeklyPickConfig] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """依目前 Top10 規則找指定股票；只允許對當期排名候選生成正式週精選草稿。"""
+    config = config or WeeklyPickConfig()
+    result = WeeklyPickEngine(config, log).run(WeeklyPickFilters())
+    code = tools.core()._normalize_stock_name_code_key(stock_code)
+    stock = next((s for s in result.get("top") or [] if s.get("stock_code") == code), None)
+    return stock, result
+
+
+def generate_weekly_draft(
+    stock_code: str,
+    generate: Callable[..., Any],
+    find_ungrounded: Callable[[str, Dict[str, Any]], List[str]],
+    instruction: str = "",
+    previous_draft: str = "",
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """產生／修改單檔週精選文字。回傳 draft、candidate 與畫圖要用的分點。"""
+    stock, ranking = find_weekly_candidate(stock_code, log=log)
+    if not stock:
+        return {
+            "ok": False,
+            "reason": f"{stock_code} 目前不在本週 Top10 候選內；請先查看本週精選排名，再選擇候選股。",
+            "ranking": ranking,
+        }
+    prompt, facts = build_weekly_draft_prompt(stock, instruction=instruction, previous_draft=previous_draft)
+    response = generate(prompt, WEEKLY_DRAFT_SCHEMA)
     if not getattr(response, "ok", False):
-        stage_log(f"Gemini 失敗：{getattr(response, 'error', '')}")
-        notice = rate_limit_message if getattr(response, "rate_limited", False) else "AI 說明暫時無法使用，以下為系統計算結果。"
-        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
-        _save_cache(config, cache_key, item)
-        return answer(item, calls, False, notice)
+        return {"ok": False, "reason": getattr(response, "error", "AI 文字生成失敗") or "AI 文字生成失敗"}
     data = tools.core()._extract_json_from_text(response.text)
-    if not isinstance(data, dict):
-        stage_log("Gemini 回傳不是合法 JSON，改用系統整理內容")
-        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
-        _save_cache(config, cache_key, item)
-        return answer(item, calls, False, "AI 說明格式錯誤，以下為系統計算結果。")
-    cards, overview = build_cards(result, data)
-    ungrounded = find_ungrounded(cards_ai_text(cards, overview), payload)
+    draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
+    if not draft:
+        return {"ok": False, "reason": "AI 回傳格式不完整，沒有取得週精選文字。"}
+    ungrounded = find_ungrounded(draft, {"candidate": facts})
     if ungrounded:
-        stage_log(f"數字核對未通過：{ungrounded[:10]}")
-        item = {"result": result, "cards": rule_cards, "overview": "", "ai_ok": False}
-        _save_cache(config, cache_key, item)
-        return answer(item, calls, False, "AI 說明中有數字無法對應到原始資料，以下為系統計算結果。")
-    item = {"result": result, "cards": cards, "overview": overview, "ai_ok": True}
-    _save_cache(config, cache_key, item)
-    stage_log(f"完成｜Gemini {calls} 次｜總耗時 {time.perf_counter() - started:.1f}s")
-    return answer(item, calls, False)
+        return {"ok": False, "reason": "AI 草稿中有數字無法對應原始資料，已阻止送出。", "issues": ungrounded[:10]}
+    return {
+        "ok": True,
+        "draft": draft,
+        "stock_code": stock["stock_code"],
+        "stock_name": stock.get("stock_name", ""),
+        "candidate": stock,
+        "facts": facts,
+        "mark_branches": mark_branches(stock),
+    }
+
+_WEEKLY_DRAFT_PATTERNS = (
+    "週精選文字", "周精選文字", "精選文字", "週精選文案", "周精選文案", "生成精選文字", "產生精選文字"
+)
+_WEEKLY_IMAGE_PATTERNS = ("生成週精選圖片", "生成周精選圖片", "週精選圖片", "周精選圖片", "轉成圖片", "做成圖片", "生成圖片")
+_WEEKLY_REVISION_WORDS = ("改", "修改", "短一點", "長一點", "口語", "刪", "補", "強調", "不要寫", "這版", "上一版", "第二段", "第一段")
+
+
+def extract_stock_code(text: str) -> str:
+    match = re.search(r"(?<!\d)([1-9]\d{3})(?!\d)", str(text or ""))
+    return match.group(1) if match else ""
+
+
+def is_weekly_draft_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return bool(extract_stock_code(compact) and any(k in compact for k in _WEEKLY_DRAFT_PATTERNS))
+
+
+def is_weekly_image_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return any(k in compact for k in _WEEKLY_IMAGE_PATTERNS)
+
+
+def is_weekly_revision_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return any(k in compact for k in _WEEKLY_REVISION_WORDS)
+
+
+def is_weekly_admin_feature_question(text: str) -> bool:
+    return is_weekly_pick_question(text) or is_weekly_draft_question(text) or is_weekly_image_question(text)

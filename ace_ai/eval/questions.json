@@ -77,6 +77,11 @@
     {"id": "E03", "group": "說明", "turns": [{"q": "你可以做什麼", "route": ["help"], "stocks": []}]},
 
     {"id": "K01", "group": "本週精選", "fast_only": true, "turns": [{"q": "本週精選", "route": ["weekly_pick"]}]},
+    {"id": "K03", "group": "本週精選", "fast_only": true, "turns": [
+      {"q": "本州精選", "route": ["weekly_pick"]},
+      {"q": "每周精選", "route": ["weekly_pick"]},
+      {"q": "精選股票", "route": ["weekly_pick"]}
+    ]},
     {"id": "G01", "group": "族群", "turns": [{"q": "請問記憶體產業 現在誰的形態最強", "route": ["rule_sector"], "stocks": [], "answer_any": ["1. "]}]},
     {"id": "G02", "group": "族群", "turns": [{"q": "航運股今天誰漲最多", "route": ["rule_sector"], "stocks": []}]},
     {"id": "G03", "group": "族群", "turns": [{"q": "有哪些族群", "route": ["rule_sector"], "stocks": []}]},

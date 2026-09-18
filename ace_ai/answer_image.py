@@ -53,6 +53,12 @@ MARK_MAX_ROWS = 3
 MARK_TABLE_SINGLE_MAX = 3
 MARK_ROW_H = 40
 TABLE_HEAD_H = 34
+# 與週報 add_center_watermarks 相同的文字、藏青色、透明度與角度。
+CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
+CENTER_WATERMARK_COLOR = '#1D2B44'
+CENTER_WATERMARK_ALPHA = 0.06
+CENTER_WATERMARK_FONT_SIZE = 200
+CENTER_WATERMARK_ROTATION = 18
 
 
 @lru_cache(maxsize=32)
@@ -216,7 +222,7 @@ def _mark_events(panel: dict) -> list[dict]:
 
 
 def _has_mark_section(panel: dict) -> bool:
-    return bool((panel or {}).get('bars')) and bool((panel or {}).get('marks')) and not (panel or {}).get('compact')
+    return bool((panel or {}).get('bars')) and bool(_mark_events(panel)) and not (panel or {}).get('compact')
 
 
 def _mark_action(e: dict) -> tuple[str, str]:
@@ -260,67 +266,70 @@ def _mark_symbol_items() -> list[tuple[str, str, float]]:
 
 
 def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
-    """K 線卡片底部的「分點權證買賣標註」：標題＋圖示說明＋明細表（先量測再配置，文字不互疊）。"""
+    """K 線卡片底部只顯示實際有資料的分點明細；無資料時整段不畫。"""
     if not _has_mark_section(panel):
         return 0
     marks = panel.get('marks') or {}
     events = _mark_events(panel)
+    mode = str(marks.get('mode') or 'event')
     x0, width = MARGIN + 36, CONTENT - 72
     h = 22
-    title = '分點權證買賣標註'
-    title_w = font(24, True).getlength(title)
-    rule = str(marks.get('rule', ''))
-    inline = font(18).getlength(rule) <= width - title_w - 20
-    rule_lines = [] if inline else wrap(rule, 18, width)
+    title = '權證分點買賣超點位' if mode == 'flow' else '權證分點買賣點位'
     if not dry:
         draw.line((MARGIN + 32, top + 4, WIDTH - MARGIN - 32, top + 4), fill=LINE)
         draw.rectangle((x0, top + h + 4, x0 + 4, top + h + 28), fill=ACCENT)
         text_at(draw, (x0 + 14, top + h), title, 24, INK, True)
-        if inline:
-            draw.text((x0 + 14 + title_w + 14, top + h + 16), rule, font=font(18), fill=MUTED, anchor='lm')
-    h += 40
-    for line in rule_lines:
+    h += 48
+    table_top = top + h
+    if mode == 'flow':
+        row_h, head_h = 44, 38
         if not dry:
-            text_at(draw, (x0, top + h), line, 18, MUTED)
-        h += 28
-    items = _mark_symbol_items()
-    rows = _flow_rows([w for _, _, w in items], width, 28)
-    if not dry:
-        sx, sy = x0, top + h + 14
-        for kind, text, w in items:
-            if sx > x0 and sx + w > x0 + width:
-                sx, sy = x0, sy + 32
-            cx = sx
-            if kind in ('buy', 'exit', 'reduce'):
-                color = UP if kind == 'buy' else DOWN
-                half = 7
-                if kind == 'buy':
-                    draw.polygon([(cx + half, sy - half), (cx, sy + half), (cx + 2 * half, sy + half)], fill=color)
-                else:
-                    draw.polygon([(cx, sy - half), (cx + 2 * half, sy - half), (cx + half, sy + half)], fill=color)
-                cx += 18
-                if kind != 'reduce':
-                    _draw_badge(draw, cx + 4 + MARK_BADGE_R, sy, 'N', color)
-                    cx += 26
-                cx += 8
-            draw.text((cx, sy), text, font=font(18), fill=MUTED if kind == 'note' else INK, anchor='lm')
-            sx += w + 28
-    h += rows * 32 + 8
-    if not events:
-        if not dry:
-            text_at(draw, (x0, top + h + 4), '圖表區間內沒有符合條件的 A～E 事件', 20, MUTED)
-        return int(h + 36 + 18)
+            _draw_flow_mark_table(draw, x0, table_top, width, events, head_h, row_h)
+        h += head_h + len(events) * row_h + 18
+        return int(h)
     split = len(events) > MARK_TABLE_SINGLE_MAX
     groups = [events[:math.ceil(len(events) / 2)], events[math.ceil(len(events) / 2):]] if split else [events]
     gap = 32
     table_w = (width - gap) / 2 if split else width
-    table_top = top + h + 4
     if not dry:
         for g, group in enumerate(groups):
             tx = x0 + g * (table_w + gap)
             _draw_mark_table(draw, tx, table_top, table_w, group)
-    h += 4 + TABLE_HEAD_H + len(groups[0]) * MARK_ROW_H + 18
+    h += TABLE_HEAD_H + len(groups[0]) * MARK_ROW_H + 18
     return int(h)
+
+
+def _draw_flow_mark_table(draw, x: float, y: float, width: float, events: list[dict], head_h: int = 38, row_h: int = 44) -> None:
+    columns = [('編號', 70), ('分點', 230), ('日期', 110), ('方向', 100), ('淨買賣超', 170)]
+    total = sum(w for _, w in columns)
+    columns = [(label, w * width / total) for label, w in columns]
+    draw.rounded_rectangle((x, y, x + width, y + head_h), radius=8, fill=TILE_BG)
+    cx = x
+    for label, w in columns:
+        draw.text((cx + (w / 2 if label in ('編號', '方向') else 10), y + head_h / 2), label, font=font(17), fill=MUTED, anchor='mm' if label in ('編號', '方向') else 'lm')
+        cx += w
+    ry = y + head_h
+    for e in events:
+        mid = ry + row_h / 2
+        action = str(e.get('action') or '')
+        color = UP if action == 'buy' else DOWN
+        values = {
+            '分點': str(e.get('branch') or ''),
+            '日期': str(e.get('action_date') or '')[5:],
+            '方向': str(e.get('action_text') or ('買超' if action == 'buy' else '賣超')),
+            '淨買賣超': str(e.get('net_amount_text') or ''),
+        }
+        cx = x
+        for label, w in columns:
+            if label == '編號':
+                _draw_badge(draw, cx + w / 2, mid, e.get('no', ''), color)
+            else:
+                anchor = 'mm' if label == '方向' else 'lm'
+                tx = cx + (w / 2 if anchor == 'mm' else 10)
+                draw.text((tx, mid), values[label], font=font(18, label in ('分點','淨買賣超')), fill=color if label in ('方向','淨買賣超') else INK, anchor=anchor)
+            cx += w
+        draw.line((x, ry + row_h, x + width, ry + row_h), fill=LINE)
+        ry += row_h
 
 
 def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict]) -> None:
@@ -417,19 +426,47 @@ def _dotted(draw, x, y_from, y_to, color):
 
 
 def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_bottom: float) -> None:
-    """broker_replay_kline 同款標註：▲＋紅圈 N 在買進日、▼＋綠圈 N 在出清日、▼ 無數字＝減碼日。不寫報酬率。"""
+    """K 線分點標註。event 模式畫事件回放；flow 模式畫每日分點淨買／淨賣。"""
     bars = panel.get('bars') or []
     index = {bar['date']: i for i, bar in enumerate(bars)}
     events = _mark_events(panel)
     if not events:
         return
+    mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
     half = max(5, min(9, step * 0.45))
+    if mode == 'flow':
+        buy_badges, sell_badges = [], []
+        for e in events:
+            i = index.get(e.get('action_date') or '')
+            if i is None:
+                continue
+            item = {'x': px(i), 'cx': px(i), 'no': e.get('no', '')}
+            if e.get('action') == 'buy':
+                buy_badges.append(item)
+            else:
+                sell_badges.append(item)
+        _assign_rows(buy_badges); _assign_rows(sell_badges)
+        tri_bottom, tri_top = price_bottom + 14, price_top - 14
+        for badge in buy_badges:
+            i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
+            _dotted(draw, badge['x'], py(bars[i]['Low']) + 4, tri_bottom - half, UP)
+            draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=UP, outline='white')
+            cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
+            _draw_badge(draw, badge['cx'], cy, badge['no'], UP)
+        for badge in sell_badges:
+            i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
+            _dotted(draw, badge['x'], py(bars[i]['High']) - 4, tri_top + half, DOWN)
+            draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=DOWN, outline='white')
+            cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
+            _draw_badge(draw, badge['cx'], cy, badge['no'], DOWN)
+        return
+
     buy_badges, sell_badges = [], []
     sell_days: dict[int, list[int]] = {}
     reduce_days: set[int] = set()
     buy_days: set[int] = set()
     for e in events:
-        i = index.get(e['buy_date'])
+        i = index.get(e.get('buy_date') or '')
         if i is not None:
             buy_days.add(i)
             buy_badges.append({'x': px(i), 'cx': px(i), 'no': e['no']})
@@ -443,30 +480,20 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         for n, no in enumerate(sorted(numbers)):
             offset = (n - (len(numbers) - 1) / 2) * (MARK_BADGE_R * 2 + 3)
             sell_badges.append({'x': px(j), 'cx': px(j) + offset, 'no': no})
-    _assign_rows(buy_badges)
-    _assign_rows(sell_badges)
-
+    _assign_rows(buy_badges); _assign_rows(sell_badges)
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):
-        x = px(i)
-        _dotted(draw, x, py(bars[i]['Low']) + 4, tri_bottom - half, UP)
-        draw.polygon([(x, tri_bottom - half), (x - half, tri_bottom + half), (x + half, tri_bottom + half)],
-                     fill=UP, outline='white')
+        x = px(i); _dotted(draw, x, py(bars[i]['Low']) + 4, tri_bottom - half, UP)
+        draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=UP, outline='white')
     tri_top = price_top - 14
     for j in sorted(set(sell_days) | reduce_days):
-        x = px(j)
-        _dotted(draw, x, py(bars[j]['High']) - 4, tri_top + half, DOWN)
-        draw.polygon([(x - half, tri_top - half), (x + half, tri_top - half), (x, tri_top + half)],
-                     fill=DOWN, outline='white')
+        x = px(j); _dotted(draw, x, py(bars[j]['High']) - 4, tri_top + half, DOWN)
+        draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=DOWN, outline='white')
     for badge in buy_badges:
         cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
-        if abs(badge['cx'] - badge['x']) > 1 or badge['row']:
-            draw.line((badge['x'], tri_bottom + half, badge['cx'], cy - MARK_BADGE_R), fill=UP, width=1)
         _draw_badge(draw, badge['cx'], cy, badge['no'], UP)
     for badge in sell_badges:
         cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
-        if abs(badge['cx'] - badge['x']) > 1 or badge['row']:
-            draw.line((badge['x'], tri_top - half, badge['cx'], cy + MARK_BADGE_R), fill=DOWN, width=1)
         _draw_badge(draw, badge['cx'], cy, badge['no'], DOWN)
 
 
@@ -1290,11 +1317,6 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
         h += 10
         h += _sub_heading(draw, px, y + h, '其他排名', '', width, dry)
         h += _other_rows_table(draw, px, y + h, width, others, technical, dry) + 18
-    note = str(data.get('coverage_note') or '')
-    if note:
-        if not dry:
-            text_at(draw, (px, y + h + 4), f'※ {note}', 19, MUTED)
-        h += 36
     h += 22
     return int(h)
 
@@ -1332,11 +1354,6 @@ def members_card(draw, y: float, data: dict, dry: bool) -> int:
                           font=font(18), fill=MUTED, anchor='lm')
             cx += w + gap
         h += _flow_rows(widths, width, gap) * (chip_h + gap) + 18
-    note = str(data.get('coverage_note') or '')
-    if note:
-        if not dry:
-            text_at(draw, (px, y + h), f'※ {note}', 19, MUTED)
-        h += 36
     h += 18
     return int(h)
 
@@ -1375,6 +1392,32 @@ def price_footer(panels: list[dict] | None) -> str:
 def panel_block_height(panel: dict) -> int:
     card = panel.get('scorecard')
     return panel_height(panel) + 24 + (scorecard(None, 0, card, True) + 24 if card else 0)
+
+
+def add_center_watermarks(image: Image.Image) -> Image.Image:
+    """合成到成品上方：長圖上下各一枚，短圖一枚；僅縮放字樣、不更動內容。"""
+    if not CENTER_WATERMARK_TEXT:
+        return image
+    # 週報 fig 座標原點在左下；Pillow 左上，所以 0.66/0.31 對應 0.34/0.69。
+    centers = (0.34, 0.69) if image.height >= image.width * 0.85 else (0.55,)
+    face = font(CENTER_WATERMARK_FONT_SIZE, True)
+    probe = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
+    spacing = round(CENTER_WATERMARK_FONT_SIZE * 0.12)
+    bounds = probe.multiline_textbbox((0, 0), CENTER_WATERMARK_TEXT, font=face, spacing=spacing, align='center')
+    stamp = Image.new('RGBA', (math.ceil(bounds[2] - bounds[0]) + 16, math.ceil(bounds[3] - bounds[1]) + 16))
+    ImageDraw.Draw(stamp).multiline_text((8 - bounds[0], 8 - bounds[1]), CENTER_WATERMARK_TEXT,
+                                       font=face, spacing=spacing, align='center', fill=CENTER_WATERMARK_COLOR)
+    stamp = stamp.rotate(CENTER_WATERMARK_ROTATION, resample=Image.Resampling.BICUBIC, expand=True)
+    max_height = image.height * (0.29 if len(centers) == 2 else 0.42)
+    scale = min(1.0, image.width * 0.82 / stamp.width, max_height / stamp.height)
+    if scale < 1:
+        stamp = stamp.resize((max(1, round(stamp.width * scale)), max(1, round(stamp.height * scale))), Image.Resampling.LANCZOS)
+    stamp.putalpha(stamp.getchannel('A').point(lambda alpha: round(alpha * CENTER_WATERMARK_ALPHA)))
+    # 小區塊合成，避免為長圖另外配置整張 RGBA 浮水印圖層。
+    for center in centers:
+        xy = ((image.width - stamp.width) // 2, round(image.height * center - stamp.height / 2))
+        image.paste(stamp, xy, stamp)
+    return image
 
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
@@ -1438,7 +1481,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     else:
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'
     text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
-    return image
+    return add_center_watermarks(image)
 
 
 def encode_image(image: Image.Image, max_bytes: int = 7_500_000) -> tuple[bytes, str]:

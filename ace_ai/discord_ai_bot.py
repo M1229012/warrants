@@ -817,14 +817,17 @@ class GeminiGateway:
 # 最終回答 Prompt 與數字核對
 # ============================================================
 
-FINAL_BASE_PROMPT = """你是「艾斯 AI 台股資料分析助手」，只能依 tool_results 回答。
+FINAL_BASE_PROMPT = """你是「艾斯 AI 台股數據研究助手」。你的回答要像熟悉台股技術面、價量、大量區與權證分點的研究者：先理解使用者真正想問什麼，再從 tool_results 挑最有判別力的證據回答，不要像模板客服，也不要把所有欄位逐項朗讀。
+
 規則：
-1. 不可自創任何數據；數字照 tool_results 原樣寫，大金額可以精確換算成「萬／億」（例如 1,120,000,000 寫成 11.2 億），但不可四捨五入成約數。資料缺失（available=false、found=false、欄位空）就說「目前沒有取得足夠資料」。使用者在問題裡說的價格（成本、假設跌到多少）要寫成「你的成本」「假設跌到」，不可當成現價或報價；比較兩檔時，每句的數字只能用該句股票自己的資料；「站上／跌破」某條均線要和資料一致（moving_averages 的 position，或評分卡關鍵價位在現價下方＝站上、上方＝跌破），盤中與收盤不同時照技術面規則寫「盤中暫時」。系統會逐句核對，不符合的句子會被刪除。
-2. 保持客觀中性：用「偏多條件／偏空條件」描述，每個判斷都附上依據，有利與不利的條件都要寫；不用「強勢、看好、危險、暴漲、慘」等帶情緒或暗示方向的字眼。AI 推論以「AI 解讀：」開頭；歷史勝率不是未來保證，small_sample=true 要提醒樣本少；買超不等於必漲。
-3. 不給目標價、報酬預測，也不替使用者下「買進／賣出／加碼／停損價」決定。
-4. 回答排進圖片，口語、精簡，每段 1～3 句，每句要完整通順（不要用刪節號、不要半句）；同一件事只講一次。圖片已顯示股價、均線、布林、KD、MACD、成交量、大量區與分點標註，文字不可逐項列出這些數值，要寫「代表什麼」並回答問題；只有說明條件時才引用 1～2 個關鍵價位。
-5. 不要提到資料供應商或系統名稱（例如富果、FinMind、Google Sheet、工作表名稱），需要時只說「日K收盤資料」「盤中即時報價」「追蹤分點統計」；新聞的媒體名稱可以照寫。輸出不要用表格或程式碼區塊。第一行：**股票名稱（代號）** 或 **分點名稱**；最後一行：「資料時間：」列出資料日期或統計期間。data_source 或 intraday.is_live 顯示「盤中」時，要提醒今天的 K 棒、均線、指標與成交量都是盤中暫定值、收盤前會變動（成交量只是目前累計，量比偏低很正常）；否則註明是日K收盤資料。
-6. 一定先寫【回答】直接回應使用者問的事。問「明天會不會漲、漲的機率」這類預測：說明無法預測漲跌或給機率，改用型態分數、今天 K 棒、量能與關鍵價位客觀說明偏多與偏空的條件。問 K 棒型態（例如仙人指路、長上影、長下影、十字線、吞噬）：依 get_stock_overview.candle（實體、上影線、下影線占前日收盤 %、收盤在當日區間的位置）、量比與型態評分卡（是否剛突破、相對位置），對照該型態的常見定義說明符合或不符合與常見解讀，不可斷言後續走勢。"""
+1. 只能依 tool_results 的事實與數字回答，不可自創資料。使用者自己提供的成本或假設價格必須明確標成「你的成本／假設價格」，不可當成現價。
+2. 保持客觀。可以直接說目前結構偏強、偏弱、轉強、承壓、支撐較明確等，但每個判斷都要緊接數據或型態依據；同時點出最重要的不利條件。買超、高勝率都不是未來保證。
+3. 不給目標價或報酬保證，不替使用者做最後買賣決定。
+4. 回答以問題為中心：通常先用 1～2 句直接回答，再補 2～3 個最重要證據，最後視需要說後續最值得觀察什麼。不要固定套【回答】【觀察重點】；除非資訊很多，否則自然分段即可。
+5. 圖片本身已顯示 K 線、均線、布林、大量區與分點標記，文字不要再逐項報數；只引用真正影響判斷的 1～3 個數據。沒有資料的欄位直接略過，不要在回答中列一串系統缺漏原因。
+6. 不要提資料供應商、Google Sheet、工作表或內部系統名稱。需要時說「日K資料」「權證分點統計」「歷史事件統計」。
+7. 問未來漲跌或機率時，不自行預測；改說目前有哪些偏多／偏空條件，以及哪個條件變化最值得追蹤。K 棒型態則依實體、影線、量能與所處位置說明是否符合常見定義，不斷言後續。
+8. 全部使用繁體中文，語氣自然、精簡、有分析感；同一件事不要重複。"""
 
 FINAL_TECH_RULES = """技術面規則：
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
@@ -837,16 +840,12 @@ FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summa
 - 【可能利多】【可能利空／風險】分開寫，只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。【綜合觀察】1～2 句說明份量與待確認資訊，不下漲跌結論。"""
 
 FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
-圖片上已畫出 K 線（均線、布林、大量區、分點買賣標註）與型態評分卡（分數、五大項、主要得分失分、均線扣抵、關鍵價位、追蹤分點動向），這些內容不要逐項重抄。只寫兩個區塊：
-【回答】3～5 句直接回應問題、不可拒答（預測、K 棒型態等其他問法依規則 6 回答）：
-- 問成本／操作：先說成本相對現價與帳面損益 unrealized_pct，再用條件句給參考框架「若守住 A，型態維持，持有者多以續抱觀察為主；若跌破 B 且站不回，型態轉弱，持有者通常會重新評估部位；若站上 C，…」。A／B／C 只能用 supports_below_close／resistances_above_close 的價位，是一般觀察方式，不是替使用者決定。
-- 問型態好不好：直接說好或不好、型態分數 pattern_score／100（grade），以及影響最大的一個得分與一個失分原因。
-- 比較兩檔（有兩份 get_pattern_scorecard，或問「誰比較好、哪個好、比較呢」）：【回答】第一句直接下結論「就技術結構來看，X 比 Y 好」（pattern_score 相差不到 5 分就寫「兩檔差不多」，並說在哪一點分出高下），第二句說明差距最大的 1～2 個項目（components 的 label，例如下方支撐、均線趨勢），第三句各點出一個不利條件；不要把兩檔的分數、價位逐項重抄（圖上已有並排比較表），也不可說成推薦買哪一檔。【觀察重點】最多 3 行，寫「哪個條件改變會讓比較結果翻轉」（例如較弱那檔站回哪條均線、較強那檔跌破哪個支撐）。
-- 分數只代表技術結構，不可說成推薦。
-【觀察重點】最多 3 行，每行以「・」開頭，只寫圖上沒有的「條件與意義」：
-・扣抵／均線：ma_deduction 的 MA20 或 MA60 有 turn_text 時，寫「明日收盤需高於 tomorrow_close_needed_to_rise，均線才會上揚」並照 turn_text 的用語說明（例如「收盤若持平，後天起轉下彎」，不要寫成「第 N 日」）；沒有 turn 時改寫 minus_reasons 中哪個條件改善可補回分數。
-・技術訊號：只有 bollinger（壓縮、沿軌、突破）或 kd／macd signals 有明確訊號時才寫一句，沒有就省略這行。
-・分點：點名 1～2 個 tracked_branches（高勝率、持有中優先），說明後續減碼／出清或再加碼代表的籌碼變化；沒有就寫「近 20 個交易日追蹤分點沒有 A～E 事件」。"""
+- 先直接回答使用者真正問的問題，再挑影響最大的型態、大量區／支撐、均線或權證分點證據。不要把評分卡五大項逐一念完。
+- 問成本／操作：可說成本相對現價與帳面損益，再用「若守住／若跌破／若重新站回」的條件式框架說明，不替使用者下買賣決定。
+- 問型態：可以直接說目前結構偏強、偏弱或中性，並引用型態分數及最關鍵的一個加分、一個壓力。
+- 比較兩檔：描述兩者技術結構差異與各自風險，不提供投資選擇或推薦。
+- 分點資料有價值時，優先說「在哪個型態／大量區附近布局、目前是否仍持有、對應事件歷史表現」；不要只報總勝率。
+- 沒有明確訊號或沒有資料的項目直接省略，不要硬湊固定段落。"""
 
 FINAL_RANK_RULES = """權證共識淨買超排行（有 get_top_warrant_buy_stocks）：
 【回答】先寫排行名稱與統計期間（照 source 與 period 寫，不要自己改名，也不要用「共識」「全分點」等字眼），並註明統計範圍是追蹤的分點、不是全市場；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
@@ -854,9 +853,9 @@ unrealized_return_text 是這些分點目前部位的估計未實現損益，要
 接著針對第一名，依型態評分卡回答技術面（型態分數、grade 與最主要的一個得分與一個失分原因）。
 【觀察重點】照型態／成本／操作問題的規則，針對第一名撰寫。"""
 
-FINAL_FORMAT_GENERAL = """區塊依序使用（只放有資料、和問題相關的）：【回答】、【籌碼】、【技術解讀】、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
+FINAL_FORMAT_GENERAL = """依問題自然組織 2～4 個短段落；只有新聞或多主題真的需要分組時才使用小標題，不要每題固定套同一組標題。"""
 FINAL_FORMAT_NEWS = """區塊依序使用：【回答】（1～2 句直接說整體偏利多、偏利空或好壞參半）、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
-FINAL_FORMAT_PATTERN = """區塊只用：【回答】、【觀察重點】。"""
+FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先回答，再給最重要證據與後續觀察條件。"""
 
 
 def _prune_empty(value: Any) -> Any:
@@ -1970,6 +1969,8 @@ class AceQueryEngine:
         self.memory = ConversationMemory()
         self._slots = threading.BoundedSemaphore(ANSWER_CONCURRENCY)   # 一般問答最多同時 N 題
         self._weekly_lock = threading.Lock()                           # 本週精選獨立排隊、一次一個
+        self._weekly_draft_lock = threading.Lock()
+        self._weekly_drafts: Dict[str, Dict[str, Any]] = {}            # context_key → 正在編輯的週精選草稿
         self._queue_lock = threading.Lock()
         self._inflight: Dict[str, Future] = {}                          # 同一個問題同時進來共用一次計算
         self._pending = 0                                               # 排隊中＋處理中的題數
@@ -1984,7 +1985,19 @@ class AceQueryEngine:
         compact = re.sub(r"\s+", "", question)
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
+            with self._weekly_draft_lock:
+                self._weekly_drafts.pop(context_key, None)
             return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
+        # 週精選採兩段式：先排名，再選單檔產文字；草稿確認後才轉圖片。
+        if weekly_pick.is_weekly_draft_question(question):
+            with self._weekly_lock:
+                return self._answer_weekly_draft(question, context_key, started)
+        with self._weekly_draft_lock:
+            draft_session = self._weekly_drafts.get(context_key)
+        if draft_session and weekly_pick.is_weekly_image_question(question):
+            return self._answer_weekly_article_image(context_key, started)
+        if draft_session and weekly_pick.is_weekly_revision_question(question):
+            return self._answer_weekly_revision(question, context_key, started)
         if is_weekly_pick_question(question):
             hit, cached = self._answer_cache.get(compact)
             if hit:
@@ -2050,7 +2063,7 @@ class AceQueryEngine:
         return replace(result, context_note=note)
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
-        """本週精選：Python 算 TOP5，正常只呼叫 Gemini 一次；有自己的 weekly_pick 快取。"""
+        """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
         stats = AnswerStats()
         self.log(f"本週精選問題：{question}")
         panels = []
@@ -2070,8 +2083,8 @@ class AceQueryEngine:
                 log=self.log,
             )
             text, cache_hit = answer.text, answer.cache_hit
-            # K 線標註一律只標高勝率分點＋精選五分點（與一般問答相同）。
-            panels = self._get_chart_panels(answer.stock_codes)
+            # 排名階段只顯示 Top10，不產十張 K 線；選定個股後再生成週精選文字／圖片。
+            panels = []
             if answer.cards:
                 weekly = {"cards": answer.cards, "overview": answer.overview, "meta": answer.meta, "notice": answer.notice}
         except tools.ToolDataError as exc:
@@ -2088,12 +2101,80 @@ class AceQueryEngine:
             panels=panels, layout="weekly_pick" if weekly else "text", weekly=weekly,
         )
 
-    def _get_chart_panels(self, codes: List[str], branches: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
+    def _answer_weekly_draft(self, question: str, context_key: str, started: float) -> AnswerResult:
+        """管理員：從 Top10 選一檔，先產生可人工修改的週精選純文字。"""
+        stats = AnswerStats()
+        code = weekly_pick.extract_stock_code(question)
+        if not code:
+            return AnswerResult(text="請指定股票代號，例如：3034 幫我生成週精選文字。", route="weekly_draft", gemini_calls=0, elapsed=time.perf_counter()-started)
+
+        def generate(prompt: str, schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+            result = self.gateway.generate(prompt, purpose="weekly_draft", schema=schema, temperature=0.35)
+            stats.record_gemini(result)
+            return result
+
+        data = weekly_pick.generate_weekly_draft(
+            code, generate=generate, find_ungrounded=find_ungrounded_numbers, log=self.log
+        )
+        if not data.get("ok"):
+            return AnswerResult(text=str(data.get("reason") or "週精選文字目前無法生成。"), route="weekly_draft",
+                                gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        session = {
+            "stock_code": data["stock_code"], "stock_name": data.get("stock_name", ""),
+            "draft": data["draft"], "candidate": data["candidate"], "facts": data["facts"],
+            "mark_branches": data.get("mark_branches") or [],
+        }
+        with self._weekly_draft_lock:
+            self._weekly_drafts[context_key] = session
+        text = data["draft"] + "\n\n※ 這是草稿。你可以直接說「權證部分短一點／大量區再強調／不要寫某段」；確認後再說「這版確認，生成圖片」。"
+        return AnswerResult(text=text, route="weekly_draft", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+
+    def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
+        """管理員：延續同一檔週精選草稿做文字修改。"""
+        with self._weekly_draft_lock:
+            session = dict(self._weekly_drafts.get(context_key) or {})
+        if not session:
+            return AnswerResult(text="目前沒有正在編輯的週精選草稿。請先輸入「股票代號＋幫我生成週精選文字」。", route="weekly_draft_revision", gemini_calls=0, elapsed=time.perf_counter()-started)
+        stats = AnswerStats()
+        prompt, facts = weekly_pick.build_weekly_draft_prompt(session["candidate"], instruction=question, previous_draft=session["draft"])
+        response = self.gateway.generate(prompt, purpose="weekly_draft_revision", schema=weekly_pick.WEEKLY_DRAFT_SCHEMA, temperature=0.3)
+        stats.record_gemini(response)
+        if not response.ok:
+            return AnswerResult(text=RATE_LIMIT_MESSAGE if response.rate_limited else "週精選文字修改失敗，原草稿已保留。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        data = tools.core()._extract_json_from_text(response.text)
+        draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
+        if not draft:
+            return AnswerResult(text="這次修改沒有取得完整文字，原草稿已保留。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        issues = find_ungrounded_numbers(draft, {"candidate": facts})
+        if issues:
+            self.log(f"週精選草稿修改數字核對未通過：{issues[:10]}")
+            return AnswerResult(text="修改稿中出現無法對應原始資料的數字，因此沒有覆蓋原草稿。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        session["draft"] = draft
+        with self._weekly_draft_lock:
+            self._weekly_drafts[context_key] = session
+        return AnswerResult(text=draft + "\n\n※ 如果這版確認，可以直接說「這版確認，生成圖片」。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+
+    def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
+        """管理員確認草稿後：K 線＋實際權證分點流水點位＋確認文字，交給既有圖片引擎排版。"""
+        with self._weekly_draft_lock:
+            session = dict(self._weekly_drafts.get(context_key) or {})
+        if not session:
+            return AnswerResult(text="目前沒有已確認的週精選草稿。請先生成並修改文字。", route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started)
+        code = session["stock_code"]
+        branches = session.get("mark_branches") or []
+        panels = self._get_chart_panels([code], {code: branches}, mark_mode="flow")
+        title = f"權證分點觀察｜週精選｜{code} {session.get('stock_name','')}"
+        return AnswerResult(
+            text=session["draft"], route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
+            cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
+        )
+
+    def _get_chart_panels(self, codes: List[str], branches: Optional[Dict[str, List[str]]] = None, mark_mode: str = "event") -> List[Dict[str, Any]]:
         codes = list(dict.fromkeys(codes))
         calls = []
         for code in codes:
             names = (branches or {}).get(code) or []
-            calls.append(ToolCall("get_chart_panel", {"stock_code": code, **({"branch_name": ",".join(names)} if names else {})}))
+            calls.append(ToolCall("get_chart_panel", {"stock_code": code, "mark_mode": mark_mode, **({"branch_name": ",".join(names)} if names else {})}))
         results = self._run_tools(calls)
         return [r.data if r.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
                 for code, r in zip(codes, results)]
@@ -2144,7 +2225,9 @@ class AceQueryEngine:
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
         light = plan.route == "rule_stock" and not plan.need_final_llm   # 只問股價：走輕量流程
-        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, **({"branch_name": chart_branch} if chart_branch else {}),
+        flow_mark_query = any(k in question for k in ("權證買賣超", "買賣超點位", "分點買賣", "買在哪", "賣在哪", "進出點位"))
+        mark_mode = "flow" if flow_mark_query else "event"
+        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, "mark_mode": mark_mode, **({"branch_name": chart_branch} if chart_branch else {}),
                                                     **({"with_marks": False} if light else {})}) for c in codes]
         combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
         results = [r for r in combined if r.name != "get_chart_panel"]
@@ -2497,7 +2580,7 @@ def run_discord_bot(config: BotConfig) -> None:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
-        if is_weekly_pick_question(question):
+        if weekly_pick.is_weekly_admin_feature_question(question):
             weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(interaction.user))
             if weekly_denied:
                 engine.log(f"本週精選拒絕使用者 {user_id}")
@@ -2509,7 +2592,7 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         try:
             await interaction.response.defer(thinking=True, ephemeral=config.ephemeral)
-            if is_weekly_pick_question(question):
+            if is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
             loop = asyncio.get_running_loop()
 
@@ -2521,7 +2604,8 @@ def run_discord_bot(config: BotConfig) -> None:
 
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
             result = await asyncio.to_thread(engine.answer, question, context_key, on_queue)
-            await interaction_image(interaction, question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
+            image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
                                     weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord /{config.slash_command_name} 回覆圖片已更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
@@ -2555,7 +2639,7 @@ def run_discord_bot(config: BotConfig) -> None:
         if not question:
             await reply_image(message, "!ace 使用說明", HELP_MESSAGE)
             return
-        if is_weekly_pick_question(question):
+        if weekly_pick.is_weekly_admin_feature_question(question):
             weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(message.author))
             if weekly_denied:
                 engine.log(f"本週精選拒絕使用者 {user_id}")
@@ -2567,12 +2651,13 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         pending = None
         try:
-            if is_weekly_pick_question(question):
+            if is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
                 result = await asyncio.to_thread(engine.answer, question, context_key)
-            await reply_image(message, question, with_context_note(result), result.panels, pending=pending,
+            image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
             print(f"✅ Discord {config.command_prefix} 回覆圖片已送出／更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
         except discord.HTTPException as exc:
