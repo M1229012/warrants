@@ -405,6 +405,19 @@ PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構
 PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 25, "價格位置": 15, "量區結構": 25, "下方支撐": 25, "布林": 10}
 
 
+def weekly_technical_score(pattern_score_100: Any) -> float:
+    """把唯一的 100 分型態評分等比例換算成週精選技術面 50 分。
+
+    重要：週精選不得再維護第二套技術評分。一般個股的型態評分與本週精選
+    必須共用 score_pattern()；此函式只做 100 -> 50 的線性換算。
+    """
+    value = _f(pattern_score_100)
+    if value is None:
+        return 0.0
+    value = max(0.0, min(100.0, value))
+    return round(value * PATTERN_WEIGHT / 100.0, 2)
+
+
 def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
     """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
     now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
@@ -863,13 +876,21 @@ class WeeklyPickEngine:
         pattern: Dict[str, Any] = {}
         if tech and vp:
             pattern = score_pattern(tech, vp, extras, config)
-            breakdown["pattern_score"] = round(pattern["score"] * PATTERN_WEIGHT / 100, 2)
+            breakdown["pattern_score"] = weekly_technical_score(pattern["score"])
             good, bad = pattern_reason_lists(pattern["items"])
             reasons["pattern"] = good + bad
             marks = pattern["marks"]
         else:
             breakdown["pattern_score"], reasons["pattern"], marks = 0.0, ["技術資料取得失敗"], {"extended": False, "overhead": False}
         total = round(sum(breakdown.values()), 1)
+        pattern_score_100 = round(float(pattern.get("score") or 0.0), 1)
+        technical_score_50 = round(float(breakdown.get("pattern_score") or 0.0), 2)
+        warrant_score_50 = round(
+            float(breakdown.get("event_performance_score") or 0.0)
+            + float(breakdown.get("warrant_amount_score") or 0.0)
+            + float(breakdown.get("recent_branch_behavior_score") or 0.0),
+            2,
+        )
         support_points = next((c["value"] for c in pattern.get("components", []) if c["label"] == "下方支撐"), 0.0)
 
         n = lead["matched_included_count"] or 0
@@ -908,6 +929,10 @@ class WeeklyPickEngine:
         stock.update({
             "score": total,
             "score_breakdown": breakdown,
+            # 單一來源：型態 100 分與週精選技術 50 分是同一套規則，只做等比例換算。
+            "pattern_score_100": pattern_score_100,
+            "technical_score_50": technical_score_50,
+            "warrant_score_50": warrant_score_50,
             "score_reasons": reasons,
             "pattern": pattern,
             "quality_flags": sorted(flags),
@@ -1009,6 +1034,14 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         "stock_name": stock.get("stock_name", ""),
         "score": stock["score"],
         "score_breakdown": stock["score_breakdown"],
+        "score_summary": {
+            "pattern_score_100": stock.get("pattern_score_100", (stock.get("pattern") or {}).get("score")),
+            "technical_score_50": stock.get("technical_score_50", stock["score_breakdown"].get("pattern_score", 0)),
+            "warrant_score_50": stock.get("warrant_score_50", round(
+                float(stock["score_breakdown"].get("event_performance_score", 0) or 0)
+                + float(stock["score_breakdown"].get("warrant_amount_score", 0) or 0)
+                + float(stock["score_breakdown"].get("recent_branch_behavior_score", 0) or 0), 2)),
+        },
         "branch": {
             "name": lead["branch"],
             "event_buy_amount_in_window_text": lead["event_buy_amount_text"],
@@ -1102,7 +1135,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
 
 WEEKLY_PICK_SYSTEM_PROMPT = """你是我的私人台股研究助理。
 你的工作不是推薦我買股票，而是協助我找出「本週最值得進一步研究、最適合撰寫 Discord 本週精選週報的候選股票」。
-TOP5 已由 Python 依分數排好（型態＋大量區支撐占 50 分為主要依據，事件績效、權證金額、近期操作為輔），你只負責解釋，不得更改排名、不得新增或刪除股票。
+Top 10 已由 Python 依分數排好（型態＋大量區支撐占 50 分為主要依據，事件績效、權證金額、近期操作為輔），你只負責解釋，不得更改排名、不得新增或刪除股票。
 why_for_report 先說型態與大量區支撐的理由，再補充籌碼。
 只能根據 tool_results 提供的資料回答，不得自行補充不存在的數據（股價、勝率、分點、金額、均線、大量區、新聞都一樣）。
 
@@ -1122,7 +1155,7 @@ why_for_report 先說型態與大量區支撐的理由，再補充籌碼。
 - 每個欄位 1～2 句、口語清楚；strengths 與 cautions 各 1～3 點、每點 25 字以內；headline 18 字以內。
 
 只輸出符合 JSON Schema 的 JSON：
-overview：一句話總結這份 TOP5 的共同特徵（40 字以內）
+overview：一句話總結這份 Top 10 的共同特徵（40 字以內）
 candidates：依 TOP5 順序，每檔包含 stock_code、headline、pattern、volume_and_ma、bollinger、warrant、branch_behavior、strengths、cautions、why_for_report。"""
 
 
@@ -1249,9 +1282,18 @@ def format_rule_based(result: Dict[str, Any]) -> str:
         medal = _MEDALS[stock["rank"] - 1] if stock["rank"] <= len(_MEDALS) else f"{stock['rank']}."
         lines.append("")
         lines.append(f"{medal} {stock['stock_code']} {stock.get('stock_name', '')}")
+        raw_pattern = stock.get("pattern_score_100", (stock.get("pattern") or {}).get("score", 0))
+        technical_50 = stock.get("technical_score_50", b.get("pattern_score", 0))
+        warrant_50 = stock.get("warrant_score_50", round(
+            float(b.get("event_performance_score", 0) or 0)
+            + float(b.get("warrant_amount_score", 0) or 0)
+            + float(b.get("recent_branch_behavior_score", 0) or 0), 2))
         lines.append(
-            f"綜合分數：{stock['score']} / 100（事件 {b['event_performance_score']}｜近期 {b['recent_branch_behavior_score']}｜"
-            f"金額 {b['warrant_amount_score']}｜型態 {b['pattern_score']}）"
+            f"綜合分數：{stock['score']} / 100（技術 {technical_50:g}/50＝型態 {float(raw_pattern or 0):g}/100 × 0.5｜權證 {warrant_50:g}/50）"
+        )
+        lines.append(
+            f"　權證細項：事件 {b['event_performance_score']}/{EVENT_WEIGHT:g}｜部位 {b['warrant_amount_score']}/{AMOUNT_WEIGHT:g}｜"
+            f"持倉操作 {b['recent_branch_behavior_score']}/{RECENT_WEIGHT:g}"
         )
         lines.append(
             f"【權證】{lead['branch']} 本次事件買進 {lead['event_buy_amount_text']}"
@@ -1349,6 +1391,12 @@ def card_facts(stock: Dict[str, Any]) -> Dict[str, Any]:
         "stock_code": stock["stock_code"],
         "stock_name": stock.get("stock_name", ""),
         "score": stock["score"],
+        "pattern_score_100": stock.get("pattern_score_100", (stock.get("pattern") or {}).get("score")),
+        "technical_score_50": stock.get("technical_score_50", stock["score_breakdown"].get("pattern_score", 0)),
+        "warrant_score_50": stock.get("warrant_score_50", round(
+            float(stock["score_breakdown"].get("event_performance_score", 0) or 0)
+            + float(stock["score_breakdown"].get("warrant_amount_score", 0) or 0)
+            + float(stock["score_breakdown"].get("recent_branch_behavior_score", 0) or 0), 2)),
         "score_parts": [
             {"label": label, "value": stock["score_breakdown"].get(key, 0), "max": maximum}
             for key, label, maximum in SCORE_PARTS

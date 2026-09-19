@@ -38,7 +38,7 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
     cards = list(weekly.get("cards") or [])[:10]
     meta = weekly.get("meta") or {}
     top = 124
-    title_h = 56
+    title_h = 84
     table_y = top + title_h + 24
     table_h = HEAD_H + max(1, len(cards)) * ROW_H
     footer_h = 105
@@ -49,7 +49,8 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
     header_brand(draw, "權證分點觀察｜本週精選 Top 10", 30)
     text_at(draw, (MARGIN, top), "近 60 個交易日仍有權證大戶部位的候選股，所有分點採相同規則評分。", 22, MUTED)
-    text_at(draw, (MARGIN, top + 34), "★＝精選五分點（僅標記、不加分）", 20, MUTED)
+    text_at(draw, (MARGIN, top + 34), "技術 50＝一般個股型態評分 100 × 0.5；週精選不使用第二套技術評分。", 20, MUTED)
+    text_at(draw, (MARGIN, top + 64), "★＝精選五分點（僅標記、不加分）", 20, MUTED)
 
     x0, x1 = MARGIN, WIDTH - MARGIN
     draw.rounded_rectangle((x0, table_y, x1, table_y + table_h), radius=18, fill="white", outline=LINE)
@@ -71,8 +72,8 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
         y = table_y + HEAD_H + i * ROW_H
         if i:
             draw.line((x0 + 12, y, x1 - 12, y), fill=LINE)
-        tech = _score_part(card, "技術面")
-        warrant = max(0.0, float(card.get("score") or 0) - tech)
+        tech = float(card.get("technical_score_50") if card.get("technical_score_50") is not None else _score_part(card, "技術面"))
+        warrant = float(card.get("warrant_score_50") if card.get("warrant_score_50") is not None else max(0.0, float(card.get("score") or 0) - tech))
         branch = ("★ " if card.get("lead_branch_selected") else "") + str(card.get("lead_branch") or "")
         values = [
             str(card.get("rank") or i + 1),
