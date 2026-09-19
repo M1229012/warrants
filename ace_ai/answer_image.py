@@ -1336,9 +1336,6 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     else:
         stamp = f"{_sector_date(data.get('comparison_date'))} 收盤" if data.get('comparison_date') else ''
         stamp_bg, stamp_ink = TILE_BG, MUTED
-    subtitle = ('依型態分數排序｜滿分 100，只評技術結構' if technical
-                else '依最新漲跌幅排序｜漲幅領先不代表型態最好')
-    liquidity = str(data.get('liquidity_note') or '')
     disclaimer = '※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。'
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
@@ -1347,13 +1344,8 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             sw = font(19, True).getlength(stamp) + 30
             draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
-        text_at(draw, (px, y + h + 56), subtitle, 20, MUTED)
-        next_y = y + h + 86
-        if liquidity:
-            text_at(draw, (px, next_y), liquidity, 20, MUTED)
-            next_y += 30
-        text_at(draw, (px, next_y), disclaimer, 18, MUTED)
-    h += 56 + 46 + (30 if liquidity else 0) + 30
+        text_at(draw, (px, y + h + 58), disclaimer, 18, MUTED)
+    h += 56 + 38
     if not rows:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)
@@ -1406,9 +1398,46 @@ def members_card(draw, y: float, data: dict, dry: bool) -> int:
     return int(h)
 
 
+def catalog_card(draw, y: float, data: dict, dry: bool) -> int:
+    """族群清單：用多欄 chip 排版，不顯示資料來源、抓取規則或 fallback 說明。"""
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    px, width = x0 + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
+    h = 34
+    if not dry:
+        draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
+        text_at(draw, (px + 18, y + h), '族群清單', 32, INK, True)
+    h += 58
+    chip_h, gap_x, gap_y = 38, 10, 10
+    cols = 5
+    col_w = (width - gap_x * (cols - 1)) / cols
+    for section in data.get('sections') or []:
+        items = [str(v).strip() for v in (section.get('items') or []) if str(v).strip()]
+        if not items:
+            continue
+        if not dry:
+            draw.rectangle((px, y + h + 5, px + 4, y + h + 31), fill=ACCENT)
+            text_at(draw, (px + 15, y + h), str(section.get('title') or ''), 24, INK, True)
+        h += 42
+        rows = (len(items) + cols - 1) // cols
+        if not dry:
+            for idx, item in enumerate(items):
+                r, c = divmod(idx, cols)
+                cx = px + c * (col_w + gap_x)
+                cy = y + h + r * (chip_h + gap_y)
+                draw.rounded_rectangle((cx, cy, cx + col_w, cy + chip_h), radius=12, fill=TILE_BG, outline=LINE)
+                label, size = fit(item, 18, col_w - 22, True)
+                draw.text((cx + 11, cy + chip_h / 2), label, font=font(size, True), fill=INK, anchor='lm')
+        h += rows * (chip_h + gap_y) + 20
+    return int(h + 8)
+
 def _sector_block(draw, y: float, panel: dict, dry: bool) -> int:
     """先量高度、畫白底卡片，再畫內容（避免底色蓋掉文字）。"""
-    fn, data = (sector_card, panel['sector']) if panel.get('sector') else (members_card, panel['sector_members'])
+    if panel.get('sector'):
+        fn, data = sector_card, panel['sector']
+    elif panel.get('sector_members'):
+        fn, data = members_card, panel['sector_members']
+    else:
+        fn, data = catalog_card, panel['sector_catalog']
     height = fn(None, 0, data, True)
     if not dry:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + height), radius=20, fill='white', outline=LINE)
@@ -1417,7 +1446,7 @@ def _sector_block(draw, y: float, panel: dict, dry: bool) -> int:
 
 
 def _is_sector_panel(panel: dict) -> bool:
-    return bool((panel or {}).get('sector') or (panel or {}).get('sector_members'))
+    return bool((panel or {}).get('sector') or (panel or {}).get('sector_members') or (panel or {}).get('sector_catalog'))
 
 
 def header_brand(draw, title: str, size: int, brand: str = 'ACE / RESEARCH') -> None:

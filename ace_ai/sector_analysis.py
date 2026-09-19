@@ -113,7 +113,7 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     if not matches:
         if re.search(r"族群|類股|概念股|產業", text):
             return {"mode": "unsupported", "industry": "", "name": "未辨識族群",
-                    "message": "目前沒有找到可精確對應的族群名冊。可以問「有哪些族群」查看清單；文字會容錯，但不會用較大的產業冒充細題材。"}
+                    "message": "目前找不到這個族群的可用成分名冊，可以先查看族群清單。"}
         return None
     code = matches[0]
     return _request_mode(text, code, INDUSTRIES[code][0])
@@ -444,18 +444,20 @@ def format_ranking(data: Dict[str, Any]) -> str:
             for label, field in (("得分依據", "plus_reasons"), ("留意", "minus_reasons")):
                 if row.get(field):
                     lines.append(f"　{label}：{row[field][0]}")
-    lines.extend(_catalog_details(data))
     lines.append(f"資料時間：比較日期 {data['comparison_date'] or '無可用日期'}｜整理於 {data['generated_at']}｜產業名冊 {data['members_updated_at']}")
     lines.append("※ 比較範圍為上市櫃普通股；型態分數不是上漲機率，盤中資料尚待收盤確認。")
     return "\n".join(lines)
 
 
 def _catalog_details(data):
-    if not data.get("scope"):
-        return []
-    source = data.get("source", "")
-    source_text = "CMoney 產業／概念分類" if source == "CMoney" else "證交所／櫃買中心產業價值鏈資訊平台"
-    return [f"名冊分類：{data['scope']}", data.get("catalog_note", ""), f"名冊來源：{source_text}"]
+    # 保留 scope/catalog_note 給內部文字與既有測試使用；圖片有 sector panel 時不會畫這段。
+    # 資料來源名稱不再回傳給會員。
+    out = []
+    if data.get("scope"):
+        out.append(f"名冊分類：{data['scope']}")
+    if data.get("catalog_note"):
+        out.append(str(data.get("catalog_note")))
+    return out
 
 
 _PANEL_ROW_FIELDS = ("rank", "stock_code", "stock_name", "market", "close", "change_pct", "pattern_score", "grade",
@@ -490,6 +492,28 @@ def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
                                "updated_at": data.get("updated_at", ""), "coverage_note": note}}
 
 
+def catalog_panel() -> Dict[str, Any]:
+    """會員看的族群清單：不顯示資料來源與內部規則，只做整齊分類。"""
+    try:
+        cm = cmoney_catalog.get_catalog()
+        groups = list((cm.get("groups") or {}).values())
+    except Exception:
+        groups = []
+    concepts = sorted({str(g.get("name") or "").strip() for g in groups if g.get("kind") == "concept" and g.get("name")})
+    industries = sorted({str(g.get("name") or "").strip() for g in groups if g.get("kind") == "industry" and g.get("name")})
+    existing = sorted({str(group[0]).strip() for group in fine_catalog.GROUPS.values() if group and group[0]})
+    broad = sorted({str(name).strip() for name in INDUSTRIES.values() if name})
+    known = set(concepts) | set(industries)
+    supplements = [name for name in existing if name not in known]
+    return {"sector_catalog": {
+        "sections": [
+            {"title": "概念題材", "items": concepts},
+            {"title": "細產業", "items": industries},
+            {"title": "補充族群", "items": supplements},
+            {"title": "大產業", "items": broad},
+        ]
+    }}
+
 def _market_radar_answer(mode: str) -> Dict[str, Any]:
     try:
         radar = cmoney_catalog.get_live_radar()
@@ -500,7 +524,7 @@ def _market_radar_answer(mode: str) -> Dict[str, Any]:
         return {"text": "目前沒有可用的盤中族群排行資料。", "calls": 0, "cacheable": False}
     if mode == "market_momentum":
         top = rows[:10]
-        lines = ["**目前族群強勢排行｜盤中雷達**", "依 CMoney 產業／概念當日漲幅整理；這是盤面強弱，不等於技術型態分數。"]
+        lines = ["**目前族群強勢排行｜盤中雷達**"]
         lines += [f"{i}. {r['name']}｜{r['change_pct']:+.2f}%" for i, r in enumerate(top, 1)]
         lines += [f"資料時間：{radar.get('updated_at','')}", "※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。"]
         return {"text": "\n".join(lines), "calls": 0, "cacheable": True}
@@ -542,16 +566,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     if mode in ("market_momentum", "market_technical"):
         return _market_radar_answer(mode)
     if mode == "catalog":
-        names = "、".join(names[0] for names in INDUSTRIES.values())
-        fine_names = "、".join(group[0] for group in fine_catalog.GROUPS.values())
-        try:
-            cm = cmoney_catalog.get_catalog()
-            cm_names = [g.get("name", "") for g in (cm.get("groups") or {}).values() if g.get("name")]
-            preview = "、".join(cm_names[:80]) + ("…" if len(cm_names) > 80 else "")
-            cm_line = f"【CMoney 細產業／概念（{len(cm_names)} 類）】\n{preview}\n\n"
-        except Exception:
-            cm_line = ""
-        return {"text": f"{cm_line}【既有細分族群】\n{fine_names}\n\n【大產業分類】\n{names}\n\n輸入可以容錯，但實際股票成分一定使用對應族群名冊，不會把較窄題材自動擴成大產業。", "calls": 0, "cacheable": True}
+        return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     try:
         if mode == "members":
             data = get_members(request["industry"])

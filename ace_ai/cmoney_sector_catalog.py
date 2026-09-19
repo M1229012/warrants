@@ -29,7 +29,11 @@ INDUSTRY_INDEX = BASE + "/finance/f00072.aspx"
 # 新版 forum 頁作備援。實際使用時只要其中一個可解析即可。
 INDUSTRY_INDEX_URLS = [INDUSTRY_INDEX, BASE + "/forum/category"]
 CONCEPT_INDEX_URLS = [BASE + "/forum/concept", BASE + "/finance/concept.aspx"]
-GROUP_URLS = [BASE + "/finance/f00072.aspx?b=1&t={code}&o=1", BASE + "/forum/category/{code}"]
+GROUP_URLS_BY_KIND = {
+    "concept": [BASE + "/forum/concept/{code}"],
+    "industry": [BASE + "/forum/category/{code}", BASE + "/finance/f00072.aspx?b=1&t={code}&o=1"],
+}
+CACHE_SCHEMA_VERSION = 2
 TTL = max(300, tools._env_int("DISCORD_AI_CMONEY_CATALOG_TTL", 43200))
 RADAR_TTL = max(60, tools._env_int("DISCORD_AI_CMONEY_RADAR_TTL", 300))
 TIMEOUT = max(2.0, tools._env_float("DISCORD_AI_CMONEY_TIMEOUT", 8.0))
@@ -139,7 +143,15 @@ def parse_catalog_html(html: str, kind: str) -> Dict[str, Dict[str, str]]:
 def _read_disk() -> Dict[str, Any]:
     try:
         data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        # v8 的成分股 parser 可能把頁面其他股票誤當成族群成分股。
+        # 升級 schema 時保留族群目錄，但清掉舊 members，避免錯誤名冊延續。
+        if int(data.get("schema_version") or 0) != CACHE_SCHEMA_VERSION:
+            data = dict(data)
+            data.pop("members", None)
+            data["schema_version"] = CACHE_SCHEMA_VERSION
+        return data
     except Exception:
         return {}
 
@@ -195,7 +207,7 @@ def get_catalog(refresh: bool = False) -> Dict[str, Any]:
             with _LOCK: _MEM[key] = (time.time(), result)
             return result
         raise ValueError("CMoney 族群目錄無法解析")
-    result = {"updated_at": datetime.now(timezone.utc).isoformat(), "groups": groups, "stale": bool(errors), "errors": errors}
+    result = {"schema_version": CACHE_SCHEMA_VERSION, "updated_at": datetime.now(timezone.utc).isoformat(), "groups": groups, "stale": bool(errors), "errors": errors}
     _write_disk(result)
     with _LOCK: _MEM[key] = (time.time(), result)
     print(f"✅ CMoney 族群目錄：{len(groups)} 類｜errors={errors or '-'}", flush=True)
@@ -213,35 +225,31 @@ def _stock_from_text(text: str) -> Optional[Tuple[str, str]]:
     return code, name
 
 
-def parse_members_html(html: str) -> List[Dict[str, str]]:
-    parser = LinkParser(); parser.feed(html)
+def parse_members_html(html: str, expected_group_name: str = "") -> List[Dict[str, str]]:
+    """只從真正的成分股表格解析股票；不再掃整頁任意連結。
+
+    CMoney 頁面包含討論區、熱門股票與導覽連結，直接掃所有 <a> 會把無關股票
+    （例如 2330）誤認成族群成分。這裡要求表格欄位明確包含「個股名稱／股票名稱」。
+    """
     found: Dict[str, Dict[str, str]] = {}
-    for href, label in parser.links:
-        joined = f"{href} {label}"
-        row = _stock_from_text(joined)
-        if not row:
-            # Common CMoney links often carry stock ID in a query argument.
-            q = parse_qs(urlsplit(urljoin(BASE, href)).query)
-            code = next((str(v[0]) for k, v in q.items() if k.lower() in {"s", "stock", "stockid", "stock_id", "code"} and v and re.fullmatch(r"[1-9]\d{3}", str(v[0]))), "")
-            if not code:
-                continue
-            row = (code, re.sub(r"\s+", "", label))
-        code, name = row
-        if code not in found:
-            found[code] = {"stock_code": code, "stock_name": name or code, "market": ""}
-    if len(found) >= 2:
-        return sorted(found.values(), key=lambda r: r["stock_code"])
-    # Defensive table fallback. It is intentionally generic because CMoney table headings have changed before.
     try:
-        for frame in pd.read_html(StringIO(html)):
-            for _, series in frame.iterrows():
-                text = " ".join(str(v) for v in series.tolist() if pd.notna(v))
-                row = _stock_from_text(text)
-                if row:
-                    code, name = row
-                    found.setdefault(code, {"stock_code": code, "stock_name": name or code, "market": ""})
+        frames = pd.read_html(StringIO(html))
     except Exception:
-        pass
+        frames = []
+    for frame in frames:
+        columns = [str(c).strip() for c in frame.columns]
+        name_col = next((c for c in frame.columns if any(k in str(c) for k in ("個股名稱", "股票名稱", "個股", "股票"))), None)
+        if name_col is None:
+            continue
+        # 避免誤吃討論區或排行表：成分股表通常同時含股價/漲跌/成交量其中至少一欄。
+        if not any(any(k in col for k in ("股價", "漲跌", "成交", "本益比")) for col in columns):
+            continue
+        for value in frame[name_col].tolist():
+            row = _stock_from_text(str(value))
+            if not row:
+                continue
+            code, name = row
+            found.setdefault(code, {"stock_code": code, "stock_name": name or code, "market": ""})
     return sorted(found.values(), key=lambda r: r["stock_code"])
 
 
@@ -261,26 +269,35 @@ def get_members(code: str, refresh: bool = False) -> Dict[str, Any]:
     try:
         stocks = []
         last_error = None
-        for template in GROUP_URLS:
+        used_url = ""
+        kind = str(group.get("kind") or "industry")
+        templates = GROUP_URLS_BY_KIND.get(kind) or GROUP_URLS_BY_KIND["industry"]
+        for template in templates:
+            url = template.format(code=code)
             try:
-                stocks = parse_members_html(_get(template.format(code=code)))
-                if stocks:
+                candidate = parse_members_html(_get(url), group.get("name", ""))
+                # 一個正常族群至少應有 2 檔；只有 1 檔時寧可視為解析失敗，避免誤抓頁面雜訊。
+                if len(candidate) >= 2:
+                    stocks = candidate
+                    used_url = url
                     break
             except Exception as exc:
                 last_error = exc
-        if not stocks:
-            raise ValueError("CMoney 成分股頁面沒有解析到股票") from last_error
+        if len(stocks) < 2:
+            raise ValueError("CMoney 成分股頁面沒有解析到有效成分表") from last_error
         result = {"industry": "cmoney:" + code, "name": group["name"], "stocks": stocks, "source": "CMoney",
                   "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), "complete": True,
-                  "missing_markets": [], "scope": group.get("kind", ""), "catalog_note": "CMoney 產業／概念分類"}
+                  "missing_markets": [], "scope": group.get("kind", ""), "catalog_note": "", "source_url": used_url}
         disk = disk if isinstance(disk, dict) else {}
+        disk["schema_version"] = CACHE_SCHEMA_VERSION
         disk.setdefault("groups", catalog.get("groups") or {})
         disk.setdefault("members", {})[code] = result
         disk["updated_at"] = catalog.get("updated_at")
         _write_disk(disk)
+        print(f"✅ 族群成分名冊：{code} {group['name']}｜kind={kind}｜stocks={len(stocks)}｜url={used_url}", flush=True)
     except Exception as exc:
         if disk_members.get("stocks"):
-            result = dict(disk_members, complete=False, stale=True, catalog_note="CMoney 快取名冊（本次更新失敗）")
+            result = dict(disk_members, complete=False, stale=True, catalog_note="")
             print(f"⚠️ CMoney 成分股更新失敗，使用快取：{code}｜{type(exc).__name__}", flush=True)
         else:
             raise
