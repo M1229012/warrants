@@ -24,11 +24,13 @@ import json
 import io
 import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import warrant_ai_tools as tools
@@ -36,6 +38,7 @@ import weekly_pick
 import answer_image
 import weekly_image
 import sector_analysis
+import local_market_cache
 from weekly_pick import is_weekly_pick_question
 
 
@@ -389,22 +392,23 @@ class QueryPlan:
 
 
 HELP_MESSAGE = (
-    "我可以幫你查股票與權證分點資料，請用 `/ask 問題`，例如：\n"
-    "• `/ask 2344現在型態好嗎`\n"
+    "我可以幫你查股票、族群與權證分點資料，請用 `/ask 問題`，例如：\n"
+    "• `/ask 2330現在型態好嗎`\n"
     "• `/ask 半導體族群哪檔型態比較好`\n"
+    "• `/ask 現在所有族群誰最強`\n"
     "• `/ask 航運股今天誰漲最多`\n"
     "• `/ask 金融股有哪些`\n"
-    "• `/ask 我2303成本143可以怎麼觀察`\n"
-    "• `/ask 2344現在技術面怎麼樣`\n"
-    "• `/ask 華邦電現在在大量區哪裡`\n"
-    "• `/ask 2344最近有哪些分點在加碼`\n"
-    "• `/ask 2344有哪些高勝率分點最近在加碼`\n"
+    "• `/ask 我2330成本2000可以怎麼觀察`\n"
+    "• `/ask 2330現在技術面怎麼樣`\n"
+    "• `/ask 2330現在在大量區哪裡`\n"
+    "• `/ask 2330最近有哪些分點在加碼`\n"
+    "• `/ask 2330有哪些高勝率分點最近在加碼`\n"
     "• `/ask 永豐金內湖勝率多少`\n"
     "• `/ask 永豐金內湖D事件勝率`\n"
     "• `/ask 永豐金內湖最近在買什麼`\n"
-    "• `/ask 2344最近有什麼新聞，偏利多還是利空`\n"
+    "• `/ask 2330最近有什麼新聞，偏利多還是利空`\n"
     "• `/ask 目前權證買超金額最大的是誰？技術面如何`\n"
-    "可以接著追問，例如先問「幫我分析華邦電」，再問「那它的壓力在哪」「跟旺宏比呢」；輸入「重新開始」可清除上一題。"
+    "可以接著追問，例如先問「幫我分析2330」，再問「那它的壓力在哪」「跟聯發科比呢」；輸入「重新開始」可清除上一題。"
 )
 
 PLANNER_TOOLS = (
@@ -801,6 +805,7 @@ class GeminiGateway:
             f"Gemini 呼叫｜用途={purpose}｜model={kf.GEMINI_MODEL}｜latency={latency:.2f}s｜"
             f"prompt={len(prompt):,} 字｜結果={'成功' if text else '失敗'}"
         )
+        tools.record_api_event("Gemini", status=200 if text else 500, latency=latency, detail=purpose)
         if text:
             return GeminiResult(ok=True, text=str(text).strip(), latency=latency, purpose=purpose)
         rate_limited = any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
@@ -1898,6 +1903,14 @@ class ConversationMemory:
         with self._lock:
             self._data.pop(key, None)
 
+    def stats(self) -> Dict[str, int]:
+        now = time.time()
+        with self._lock:
+            expired = [key for key, entry in self._data.items() if now - entry.updated_at > self.ttl]
+            for key in expired:
+                self._data.pop(key, None)
+            return {"entries": len(self._data), "max_entries": self.max_entries, "ttl_minutes": int(self.ttl / 60)}
+
     def update(self, key: str, parsed: ParsedQuestion) -> None:
         if parsed.sector is not None:
             self.clear(key)
@@ -2448,6 +2461,11 @@ def _startup_warmup() -> None:
     except Exception as exc:
         print(f"⚠️ 預熱：分點清單失敗｜{type(exc).__name__}: {exc}", flush=True)
     try:
+        catalog = sector_analysis.cmoney_catalog.get_catalog()
+        print(f"🔥 預熱：CMoney 細產業／概念 {len(catalog.get('groups') or {}):,} 類", flush=True)
+    except Exception as exc:
+        print(f"⚠️ 預熱：CMoney 族群目錄失敗（既有族群名冊仍可用）｜{type(exc).__name__}: {exc}", flush=True)
+    try:
         table = tools.read_sheet_table("勝率統計")
         print(f"✅ 自我檢查：Google Sheet 可讀取（勝率統計 {len(table['df']):,} 列，Sheet 更新 {table['sheet_updated_at'] or '時間未知'}）", flush=True)
     except Exception as exc:
@@ -2485,6 +2503,100 @@ def _is_guild_admin(member) -> bool:
 
 
 WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
+
+USAGE_LOG_SECONDS = max(60, tools._env_int("DISCORD_AI_USAGE_LOG_SECONDS", 300))
+BACKGROUND_TICK_SECONDS = max(30, tools._env_int("DISCORD_AI_BACKGROUND_TICK_SECONDS", 60))
+CMONEY_MEMBER_WARMUP_PER_TICK = max(0, tools._env_int("DISCORD_AI_CMONEY_MEMBER_WARMUP_PER_TICK", 1))
+
+def _process_resource_snapshot(previous_cpu: Optional[Tuple[float, float]] = None) -> Tuple[Dict[str, Any], Tuple[float, float]]:
+    """不用額外套件，從 Linux /proc 與磁碟統計目前 Bot 資源；非 Linux 時安全退化。"""
+    wall = time.monotonic(); cpu = time.process_time()
+    cpu_pct = None
+    if previous_cpu:
+        wall_delta = max(1e-6, wall - previous_cpu[0])
+        cpu_pct = max(0.0, (cpu - previous_cpu[1]) / wall_delta * 100.0)
+    rss = 0
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        rss = pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        pass
+    disk_path = "/data" if os.path.exists("/data") else str(Path(__file__).parent)
+    try:
+        disk = shutil.disk_usage(disk_path)
+        disk_info = {"used": disk.used, "total": disk.total, "free": disk.free, "path": disk_path}
+    except Exception:
+        disk_info = {"used": 0, "total": 0, "free": 0, "path": disk_path}
+    return {"rss_bytes": rss, "cpu_pct": cpu_pct, "disk": disk_info}, (wall, cpu)
+
+def _fmt_mb(value: Any) -> str:
+    try:
+        return f"{float(value) / 1024 / 1024:.1f}MB"
+    except Exception:
+        return "-"
+
+def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None:
+    """Railway 背景監控：API 用量、記憶體、快取與延遲收盤重查。
+
+    只做低頻 CMoney 雷達與「已被問過且仍暫定收盤」的 Fugle 重查；
+    不做 Fugle 全市場預抓。
+    """
+    previous_cpu = None
+    last_log = 0.0
+    last_cmoney = 0.0
+    while not stop.wait(BACKGROUND_TICK_SECONDS):
+        now = tools.taipei_now()
+        # 盤中 CMoney 雷達先在背景暖好，會員問「現在族群誰最強」時直接讀快取。
+        minutes = now.hour * 60 + now.minute
+        if now.weekday() < 5 and 8 * 60 + 50 <= minutes <= 13 * 60 + 45:
+            if time.time() - last_cmoney >= max(60, getattr(sector_analysis.cmoney_catalog, "RADAR_TTL", 300)):
+                try:
+                    sector_analysis.cmoney_catalog.get_live_radar(refresh=True)
+                except Exception as exc:
+                    print(f"⚠️ CMoney 盤中族群雷達背景更新失敗｜{type(exc).__name__}", flush=True)
+                last_cmoney = time.time()
+        # CMoney 分類屬低頻靜態資料：每個 tick 只補少量尚未存到 Persistent Volume 的族群，
+        # 逐步把細產業／概念成分股抓齊，不影響 Fugle 額度。
+        if CMONEY_MEMBER_WARMUP_PER_TICK > 0:
+            try:
+                sector_analysis.cmoney_catalog.warm_member_catalog_batch(CMONEY_MEMBER_WARMUP_PER_TICK)
+            except Exception as exc:
+                print(f"⚠️ CMoney 成分股名冊背景補齊失敗｜{type(exc).__name__}", flush=True)
+        # 只重查曾被問過、13:30 後仍未正式收盤的股票。
+        try:
+            recheck = tools.recheck_provisional_closes(max_items=5)
+            if recheck.get("checked"):
+                print(f"🔁 盤後收盤查核｜checked={recheck['checked']}｜confirmed={recheck['confirmed']}｜pending={recheck['pending']}", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 盤後收盤查核失敗｜{type(exc).__name__}", flush=True)
+        if time.time() - last_log < USAGE_LOG_SECONDS:
+            continue
+        resources, previous_cpu = _process_resource_snapshot(previous_cpu)
+        usage = tools.api_usage_snapshot()
+        fm = tools.finmind_usage()
+        mem = engine.memory.stats()
+        market_cache = local_market_cache.stats()
+        fugle = usage.get("Fugle", {})
+        cm_stats = sector_analysis.cmoney_catalog.cache_stats()
+        lines = [
+            "📊 ACE USAGE",
+            f"  Railway process｜RAM {_fmt_mb(resources['rss_bytes'])}｜CPU {resources['cpu_pct']:.1f}%" if resources['cpu_pct'] is not None else f"  Railway process｜RAM {_fmt_mb(resources['rss_bytes'])}｜CPU warming",
+            f"  Railway disk｜{_fmt_mb(resources['disk']['used'])} / {_fmt_mb(resources['disk']['total'])}｜path={resources['disk']['path']}",
+            f"  Memory sessions｜{mem['entries']} / {mem['max_entries']}｜TTL={mem['ttl_minutes']}m｜queue={engine.queue_size()} / {ANSWER_QUEUE_LIMIT}",
+            f"  Local market cache｜stocks={market_cache['stocks']}｜bars={market_cache['bars']}｜scores={market_cache['scores']}｜size={_fmt_mb(market_cache['bytes'])}",
+            f"  CMoney catalog cache｜groups={cm_stats.get('groups', 0)}｜member_groups={cm_stats.get('member_groups', 0)}",
+            f"  Fugle intraday｜{fugle.get('last_60s', 0)} / 60 requests/min｜10m={fugle.get('last_10m', 0)}｜errors={fugle.get('errors', 0)}｜background cap={tools.FUGLE_BACKGROUND_LIMIT_PER_MIN}/min｜hard={tools.FUGLE_HARD_LIMIT_PER_MIN}/min",
+            f"  Fugle provisional close｜{tools.provisional_close_stats().get('count', 0)} pending",
+        ]
+        if fm.get("available"):
+            lines.append(f"  FinMind official｜{fm.get('used', 0)} / {fm.get('limit', 0)}｜remaining={fm.get('remaining', '-')}")
+        else:
+            lines.append(f"  FinMind official｜usage unavailable ({fm.get('reason', 'unknown')})")
+        for provider in ("FinMindData", "CMoney", "MoneyDJFlow", "GoogleSheet", "Gemini"):
+            row = usage.get(provider, {})
+            lines.append(f"  {provider}｜60s={row.get('last_60s', 0)}｜10m={row.get('last_10m', 0)}｜process={row.get('process_total', 0)}｜errors={row.get('errors', 0)}｜avg={row.get('avg_latency', 0):.2f}s")
+        print("\n".join(lines), flush=True)
+        last_log = time.time()
 
 
 def run_discord_bot(config: BotConfig) -> None:
@@ -2596,9 +2708,14 @@ def run_discord_bot(config: BotConfig) -> None:
                 print(f"⚠️ Slash 指令同步失敗：{exc}", flush=True)
 
     client = AceClient()
+    usage_stop = threading.Event()
+    usage_monitor_started = threading.Event()
 
     @client.event
     async def on_ready() -> None:
+        if not usage_monitor_started.is_set():
+            usage_monitor_started.set()
+            threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
@@ -2607,7 +2724,7 @@ def run_discord_bot(config: BotConfig) -> None:
         )
 
     @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
-    @app_commands.describe(question="例如：2344現在型態好嗎／永豐金內湖D事件勝率／2344最近有什麼新聞")
+    @app_commands.describe(question="例如：2330現在型態好嗎／永豐金內湖D事件勝率／2330最近有什麼新聞")
     async def ask_command(interaction: "discord.Interaction", question: str) -> None:
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
@@ -2706,7 +2823,10 @@ def run_discord_bot(config: BotConfig) -> None:
         finally:
             guard.release(user_id)
 
-    client.run(config.token)
+    try:
+        client.run(config.token)
+    finally:
+        usage_stop.set()
 
 
 # ============================================================

@@ -22,6 +22,8 @@ import re
 import sys
 import threading
 import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -29,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from bollinger_analysis import analyze_bollinger
+import local_market_cache
 
 
 # ============================================================
@@ -94,6 +97,97 @@ NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 8.0)
 NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 1500)
 TAIPEI_TZ = timezone(timedelta(hours=8))
 TEXT_CELL_MAX_CHARS = 120
+
+# ============================================================
+# API 使用量 / 背景額度保護
+# ============================================================
+
+_API_LOCK = threading.RLock()
+_API_EVENTS = defaultdict(lambda: deque(maxlen=5000))
+_API_TOTALS = defaultdict(int)
+_API_ERRORS = defaultdict(int)
+_API_LATENCY = defaultdict(lambda: [0.0, 0])
+_API_PRIORITY = threading.local()
+FUGLE_BACKGROUND_LIMIT_PER_MIN = max(1, _env_int("DISCORD_AI_FUGLE_BACKGROUND_LIMIT_PER_MIN", 15))
+FUGLE_USER_RESERVE_PER_MIN = max(1, _env_int("DISCORD_AI_FUGLE_USER_RESERVE_PER_MIN", 20))
+FUGLE_HARD_LIMIT_PER_MIN = min(59, max(10, _env_int("DISCORD_AI_FUGLE_HARD_LIMIT_PER_MIN", 55)))
+FINMIND_USAGE_TTL = max(60, _env_int("DISCORD_AI_FINMIND_USAGE_TTL", 300))
+_FINMIND_USAGE_CACHE = {"at": 0.0, "data": {}}
+
+
+def record_api_event(provider: str, *, status: int = 200, latency: float = 0.0, detail: str = "") -> None:
+    now = time.time()
+    key = str(provider or "unknown")
+    with _API_LOCK:
+        _API_TOTALS[key] += 1
+        _API_EVENTS[key].append(now)
+        if status and int(status) >= 400:
+            _API_ERRORS[key] += 1
+        bucket = _API_LATENCY[key]
+        bucket[0] += max(0.0, float(latency or 0.0)); bucket[1] += 1
+
+
+def api_usage_snapshot() -> Dict[str, Any]:
+    now = time.time()
+    with _API_LOCK:
+        result = {}
+        for key in set(_API_TOTALS) | set(_API_EVENTS):
+            events = _API_EVENTS[key]
+            per_min = sum(1 for ts in events if now - ts <= 60)
+            per_10m = sum(1 for ts in events if now - ts <= 600)
+            total_latency, count = _API_LATENCY[key]
+            result[key] = {"last_60s": per_min, "last_10m": per_10m, "process_total": _API_TOTALS[key],
+                           "errors": _API_ERRORS[key], "avg_latency": round(total_latency / count, 3) if count else 0.0}
+        return result
+
+
+@contextmanager
+def api_priority(priority: str):
+    old = getattr(_API_PRIORITY, "value", "user")
+    _API_PRIORITY.value = priority
+    try:
+        yield
+    finally:
+        _API_PRIORITY.value = old
+
+
+def current_api_priority() -> str:
+    return getattr(_API_PRIORITY, "value", "user")
+
+
+def fugle_background_allowed() -> bool:
+    snap = api_usage_snapshot().get("Fugle", {})
+    used = int(snap.get("last_60s", 0))
+    return used < min(FUGLE_BACKGROUND_LIMIT_PER_MIN, max(1, 60 - FUGLE_USER_RESERVE_PER_MIN))
+
+
+def finmind_usage(force: bool = False) -> Dict[str, Any]:
+    token = os.getenv("FINMIND_API_TOKEN", "").strip()
+    if not token:
+        return {"available": False, "reason": "no_token"}
+    now = time.time()
+    with _API_LOCK:
+        if not force and now - float(_FINMIND_USAGE_CACHE.get("at", 0)) < FINMIND_USAGE_TTL:
+            return dict(_FINMIND_USAGE_CACHE.get("data") or {})
+    try:
+        kf = core()
+        started = time.perf_counter()
+        response = kf.get_thread_session().get(
+            "https://api.web.finmindtrade.com/v2/user_info",
+            headers={"Authorization": f"Bearer {token}"}, timeout=(4, 6))
+        status = int(response.status_code)
+        record_api_event("FinMindUsage", status=status, latency=time.perf_counter()-started)
+        response.raise_for_status()
+        payload = response.json() or {}
+        data = {"available": True, "used": int(payload.get("user_count") or 0),
+                "limit": int(payload.get("api_request_limit") or 0)}
+        data["remaining"] = max(0, data["limit"] - data["used"]) if data["limit"] else None
+    except Exception as exc:
+        data = {"available": False, "reason": type(exc).__name__}
+    with _API_LOCK:
+        _FINMIND_USAGE_CACHE["at"] = now; _FINMIND_USAGE_CACHE["data"] = dict(data)
+    return data
+
 
 # Bot 行程強制唯讀。這些值只影響 Discord Bot 自己的 process，不影響 GitHub Actions。
 # - 關閉 Action 主控並啟用純 Live：fetch_warrant_events_full_market 不讀也不寫 Google Sheet 權證快照。
@@ -771,10 +865,13 @@ def read_sheet_table(title: str) -> Dict[str, Any]:
 
     def build() -> Dict[str, Any]:
         sh = _open_main_spreadsheet()
+        started = time.perf_counter()
         try:
             ws = sh.worksheet(title)
             values = ws.get_all_values()
+            record_api_event("GoogleSheet", status=200, latency=time.perf_counter() - started)
         except Exception as exc:
+            record_api_event("GoogleSheet", status=500, latency=time.perf_counter() - started)
             raise SheetUnavailableError(f"工作表「{title}」讀取失敗：{type(exc).__name__}") from exc
         if title in _BLOCK_TABLE_SHEETS:
             df = _block_table_to_frame(values)
@@ -979,6 +1076,7 @@ FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FUGLE_TIMEOUT = _env_float("DISCORD_AI_FUGLE_TIMEOUT", 6.0)
 INTRADAY_ENABLE = bool(FUGLE_API_KEY) and os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
+LIVE_PATTERN_SCORE = os.getenv("DISCORD_AI_LIVE_PATTERN_SCORE", "1").strip().lower() in ("1","true","yes","on")
 MARKET_CLOSE_HHMM = (13, 30)
 
 
@@ -986,23 +1084,65 @@ def taipei_now() -> datetime:
     return datetime.now(TAIPEI_TZ)
 
 
+POST_CLOSE_RECHECK_MINUTES = max(15, _env_int("DISCORD_AI_POST_CLOSE_RECHECK_MINUTES", 15))
+POST_CLOSE_QUERY_WINDOW_MINUTES = max(POST_CLOSE_RECHECK_MINUTES, _env_int("DISCORD_AI_POST_CLOSE_QUERY_WINDOW_MINUTES", 120))
+_PROVISIONAL_CLOSE_LOCK = threading.RLock()
+_PROVISIONAL_CLOSES: Dict[str, Dict[str, Any]] = {}
+
 def intraday_session_now(now: Optional[datetime] = None) -> bool:
-    """平日 08:55～13:35 視為盤中（股價與回答快取縮短為 1 分鐘）。國定休市日富果不會有當日資料，自然略過。"""
+    """平日 08:55～收盤後查核視窗都維持短快取。
+
+    13:30 後先視為「盤後暫定」。查核視窗預設延長到 15:30：
+    - 使用者下一次再問同一股票時，短快取到期後會再向富果確認 isClose。
+    - 已看過但仍未正式收盤的股票，背景每 15 分鐘最多再確認一次。
+    這只針對曾被查詢的股票，不做全市場富果預抓。
+    """
     now = now or taipei_now()
-    return now.weekday() < 5 and (8, 55) <= (now.hour, now.minute) <= (13, 35)
+    if now.weekday() >= 5:
+        return False
+    end_minutes = 13 * 60 + 30 + POST_CLOSE_QUERY_WINDOW_MINUTES
+    minutes = now.hour * 60 + now.minute
+    return 8 * 60 + 55 <= minutes <= end_minutes
+
+
+def _wait_for_fugle_user_slot(max_wait: float = 12.0) -> None:
+    """避免直接使用者查詢把 Basic 60/min 撞到 429；背景工作不等待，直接讓位。"""
+    started = time.monotonic()
+    while True:
+        now = time.time()
+        with _API_LOCK:
+            events = list(_API_EVENTS.get("Fugle", ()))
+        recent = [ts for ts in events if now - ts <= 60]
+        if len(recent) < FUGLE_HARD_LIMIT_PER_MIN:
+            return
+        if time.monotonic() - started >= max_wait:
+            raise ToolDataError("富果即時行情額度暫時繁忙，已保留避免超過每分鐘限制")
+        oldest = min(recent)
+        wait_for = max(0.2, min(2.0, 60.05 - (now - oldest)))
+        time.sleep(wait_for)
 
 
 def _fugle_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if current_api_priority() == "background":
+        if not fugle_background_allowed():
+            raise ToolDataError("富果背景額度已保留給使用者查詢")
+    else:
+        _wait_for_fugle_user_slot()
     kf = core()
-    response = kf.get_thread_session().get(
-        f"{FUGLE_BASE_URL}/{path}", params=params or {},
-        headers={"X-API-KEY": FUGLE_API_KEY, "Accept": "application/json"},
-        timeout=(4, FUGLE_TIMEOUT),
-    )
-    if response.status_code == 429:
-        raise ToolDataError("富果 API 超過每分鐘呼叫上限")
-    response.raise_for_status()
-    return response.json() or {}
+    started = time.perf_counter(); status = 0
+    try:
+        response = kf.get_thread_session().get(
+            f"{FUGLE_BASE_URL}/{path}", params=params or {},
+            headers={"X-API-KEY": FUGLE_API_KEY, "Accept": "application/json"},
+            timeout=(4, FUGLE_TIMEOUT),
+        )
+        status = int(response.status_code)
+        if status == 429:
+            raise ToolDataError("富果 API 超過每分鐘呼叫上限")
+        response.raise_for_status()
+        return response.json() or {}
+    finally:
+        record_api_event("Fugle", status=status, latency=time.perf_counter()-started)
 
 
 def _fugle_timestamp(value: Any) -> Optional[datetime]:
@@ -1027,13 +1167,15 @@ def fetch_fugle_quote(stock_code: str) -> Dict[str, Any]:
     high = max(_num(data.get("highPrice")) or close, open_, close)
     low = min(_num(data.get("lowPrice")) or close, open_, close)
     updated = _fugle_timestamp(data.get("lastUpdated"))
-    live = not data.get("isClose") and (updated is None or (updated.hour, updated.minute) < MARKET_CLOSE_HHMM)
+    close_confirmed = bool(data.get("isClose"))
+    # 不再用 13:30 時鐘硬判收盤；延遲收盤時只要 isClose 尚未成立，就仍屬暫定資料。
+    live = not close_confirmed
     return {
         "date": pd.Timestamp(day).normalize(),
         "time": updated.strftime("%H:%M") if updated else "",
         "open": open_, "high": high, "low": low, "close": close,
         "trade_volume": _num((data.get("total") or {}).get("tradeVolume"), 0) or 0.0,
-        "is_live": bool(live),
+        "is_live": bool(live), "is_close_confirmed": close_confirmed,
     }
 
 
@@ -1098,8 +1240,12 @@ def fetch_fugle_daily(stock_code: str, calendar_days: int) -> pd.DataFrame:
             [["Open", "High", "Low", "Close", "Volume"]])
 
 
-def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """日K還沒有今天這一根時，接上富果即時報價（盤中為暫定 K 棒，收盤前會變動）；任何失敗都保留原本日K。"""
+def _append_intraday_bar(code: str, stock_df: pd.DataFrame, market: str = "") -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """日K還沒有今天這一根時，按需接上富果「今天」的 OHLCV。
+
+    富果只抓使用者正在問／背景允許的股票，不做全市場預抓。13:30 後若 isClose 尚未確認，
+    仍保留為盤後暫定並在短快取失效後重新確認。只有 isClose=True 才寫入持久化日K。
+    """
     now = taipei_now()
     if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
         return stock_df, {}
@@ -1108,8 +1254,8 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFram
         return stock_df, {}
     try:
         quote = fetch_fugle_quote(code)
-    except Exception as exc:  # 富果失敗不影響日K
-        print(f"⚠️ {code} 富果即時報價略過，改用 FinMind 日K：{type(exc).__name__}: {exc}", flush=True)
+    except Exception as exc:  # 富果失敗不影響既有日K
+        print(f"⚠️ {code} 富果即時報價略過：{type(exc).__name__}: {exc}", flush=True)
         return stock_df, {}
     if not quote or quote["date"] <= last_date:
         return stock_df, {}
@@ -1119,23 +1265,83 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame) -> Tuple[pd.DataFram
         index=pd.DatetimeIndex([quote["date"]]), columns=["Open", "High", "Low", "Close", "Volume"],
     )
     merged = pd.concat([stock_df[["Open", "High", "Low", "Close", "Volume"]], bar])
+    confirmed = bool(quote.get("is_close_confirmed"))
     info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": quote["is_live"],
+            "is_close_confirmed": confirmed,
+            "post_close_provisional": bool(not confirmed and (now.hour, now.minute) >= MARKET_CLOSE_HHMM),
             "cumulative_volume_lots": _num(volume_shares / 1000, 0),
             "volume_suspect": _volume_suspect(volume_shares, stock_df)}
+    if confirmed:
+        local_market_cache.save_confirmed_bar(code, quote["date"], quote["open"], quote["high"], quote["low"],
+                                              quote["close"], volume_shares, market=market, source="Fugle-close")
+        with _PROVISIONAL_CLOSE_LOCK:
+            _PROVISIONAL_CLOSES.pop(code, None)
+    elif info["post_close_provisional"]:
+        with _PROVISIONAL_CLOSE_LOCK:
+            _PROVISIONAL_CLOSES[code] = {"last_checked": time.time(), "market": market, "date": quote.get("date", "")}
     if info["volume_suspect"]:
         print(f"⚠️ {code} 盤中累計量和近 20 日均量差距異常（{volume_shares:,.0f} 股），已標記為可疑", flush=True)
-    print(f"⏱️ {code} 接上富果即時報價：{info['date']} {info['time']}｜{quote['close']}｜{'盤中' if info['is_live'] else '今日收盤'}", flush=True)
+    state = "正式收盤" if confirmed else ("盤後暫定" if info["post_close_provisional"] else "盤中暫定")
+    print(f"⏱️ {code} 接上富果即時報價：{info['date']} {info['time']}｜{quote['close']}｜{state}", flush=True)
     return merged, info
 
 
+def provisional_close_stats() -> Dict[str, Any]:
+    with _PROVISIONAL_CLOSE_LOCK:
+        return {"count": len(_PROVISIONAL_CLOSES), "codes": list(_PROVISIONAL_CLOSES)[:20]}
+
+def recheck_provisional_closes(max_items: int = 5) -> Dict[str, int]:
+    """背景只重查「今天已被使用者問過、13:30 後仍未確認收盤」的股票。
+
+    每檔至少隔 POST_CLOSE_RECHECK_MINUTES 才再查一次，且走 background API budget；
+    不掃全市場，因此不會用這個功能把 Fugle 60/min 吃滿。
+    """
+    now = taipei_now()
+    if now.weekday() >= 5 or (now.hour * 60 + now.minute) < 13 * 60 + 30:
+        return {"checked": 0, "confirmed": 0, "pending": provisional_close_stats()["count"]}
+    due_before = time.time() - POST_CLOSE_RECHECK_MINUTES * 60
+    with _PROVISIONAL_CLOSE_LOCK:
+        due = [(code, dict(info)) for code, info in _PROVISIONAL_CLOSES.items() if float(info.get("last_checked", 0)) <= due_before]
+    checked = confirmed_count = 0
+    for code, info in due[:max(1, int(max_items))]:
+        if not fugle_background_allowed():
+            break
+        try:
+            with api_priority("background"):
+                quote = fetch_fugle_quote(code)
+            checked += 1
+            if quote.get("is_close_confirmed"):
+                volume_shares = _quote_volume_shares(float(quote.get("trade_volume") or 0))
+                local_market_cache.save_confirmed_bar(
+                    code, quote["date"], quote["open"], quote["high"], quote["low"], quote["close"],
+                    volume_shares, market=str(info.get("market") or ""), source="Fugle-close-recheck")
+                with _PROVISIONAL_CLOSE_LOCK:
+                    _PROVISIONAL_CLOSES.pop(code, None)
+                confirmed_count += 1
+                print(f"✅ {code} 延遲收盤重新確認完成｜{quote.get('date')} {quote.get('time')}", flush=True)
+            else:
+                with _PROVISIONAL_CLOSE_LOCK:
+                    if code in _PROVISIONAL_CLOSES:
+                        _PROVISIONAL_CLOSES[code]["last_checked"] = time.time()
+                print(f"⏳ {code} 延遲收盤仍未確認｜{quote.get('date')} {quote.get('time')}", flush=True)
+        except Exception as exc:
+            with _PROVISIONAL_CLOSE_LOCK:
+                if code in _PROVISIONAL_CLOSES:
+                    _PROVISIONAL_CLOSES[code]["last_checked"] = time.time()
+            print(f"⚠️ {code} 延遲收盤重新確認失敗｜{type(exc).__name__}", flush=True)
+    return {"checked": checked, "confirmed": confirmed_count, "pending": provisional_close_stats()["count"]}
+
+
 def price_source_note(bundle: Dict[str, Any]) -> str:
-    """給 AI 與圖片看的資料說明（不寫資料供應商名稱；實際來源只記在 Log 與 bundle["daily_source"]）。"""
+    """給 AI 與圖片看的資料說明；盤中／盤後暫定都明確標示。"""
     info = bundle.get("intraday") or {}
     if not info:
         return "日K收盤資料（非盤中即時）"
+    if info.get("post_close_provisional"):
+        return f"日K＋今日盤後暫定報價（{info['date']} {info['time']}；將再次確認是否完成收盤）"
     if info.get("is_live"):
-        return f"日K＋盤中即時報價（{info['date']} {info['time']} 盤中，尚未收盤，今天的 K 棒、均線與指標收盤前都會變動）"
-    return f"日K＋今日收盤報價（{info['date']}）"
+        return f"日K＋盤中即時報價（{info['date']} {info['time']}，今天的 K 棒、均線與型態分數仍會變動；最終以收盤為準）"
+    return f"日K＋今日正式收盤報價（{info['date']}）"
 
 
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
@@ -1144,23 +1350,34 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     code = kf._normalize_stock_name_code_key(stock_code)
 
     def daily() -> Tuple[pd.DataFrame, str, str]:
+        # 先讀 Persistent Volume / 本機 SQLite 的最近 70 日。只要資料仍夠新，就不再打 FinMind。
+        persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
+        if persistent and persistent.get("count", 0) >= 69:
+            gap = (pd.Timestamp(taipei_now().date()) - persistent["last_date"]).days
+            if gap <= 5:
+                return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
         try:
+            started = time.perf_counter()
             stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
+            record_api_event("FinMindData", status=200, latency=time.perf_counter()-started)
             if stock_df is not None and not stock_df.empty:
+                local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 return stock_df, str(market or ""), "FinMind 日K"
             error: Exception = ToolDataError(f"{code} FinMind 沒有股價資料")
-        except Exception as exc:  # FinMind 失敗時改用富果日K，K 線不留白
+        except Exception as exc:  # FinMind 失敗時才以富果歷史日K備援；正常盤中不拿富果做歷史預抓。
+            record_api_event("FinMindData", status=500)
             error = exc
         if not FUGLE_API_KEY:
             raise ToolDataError(f"{code} 沒有股價資料：{type(error).__name__}: {error}")
-        print(f"⚠️ {code} FinMind 股價失敗，改用富果日K：{type(error).__name__}: {error}", flush=True)
+        print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
-        return fetch_fugle_daily(code, days), "", "富果日K"
+        frame = fetch_fugle_daily(code, days)
+        local_market_cache.save_bars(code, frame, market="", source="Fugle-history-fallback", confirmed=True)
+        return frame, "", "富果日K備援"
 
     def build() -> Dict[str, Any]:
-        # 日K 照原本 10 分鐘快取；盤中只有即時報價與指標每分鐘重算，不會頻繁呼叫 FinMind。
         daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
-        merged, intraday = _append_intraday_bar(code, daily_df)
+        merged, intraday = _append_intraday_bar(code, daily_df, market)
         closed = kf.calculate_indicators(daily_df)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:
@@ -1413,11 +1630,16 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
 
 
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
-    """重用 calculate_indicators 與既有 KD／MACD／均線訊號函式，整理最新技術面。"""
+    """重用既有指標；若已取得今日即時 K，型態相關數值採當下暫定 K 重新計算。
+
+    盤中分數的用途是「現在此刻的技術結構」，不是正式收盤訊號；回傳欄位會明確標示盤中/盤後暫定。
+    """
     kf = core()
     code, name = _stock_identity(stock_code)
     bundle = _load_price_bundle(code)
-    df = closed_frame(bundle)  # 訊號與評分只用已收盤 K 棒；盤中變化放在 intraday_observation
+    intraday = bundle.get("intraday") or {}
+    use_live = bool(LIVE_PATTERN_SCORE and intraday)
+    df = bundle["df"] if use_live else closed_frame(bundle)
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
     close = _num(latest.get("Close"))
@@ -1445,8 +1667,10 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
-        "intraday": bundle.get("intraday") or {},
-        "signal_status": f"收盤確認（{_fmt_date(df.index[-1])} 收盤）",
+        "intraday": intraday,
+        "signal_status": (f"盤後暫定（{_fmt_date(df.index[-1])}；將再次確認收盤）" if intraday.get("post_close_provisional")
+                          else f"盤中暫定（{_fmt_date(df.index[-1])} {intraday.get('time','')}；最終以收盤為準）" if use_live and intraday.get("is_live")
+                          else f"收盤確認（{_fmt_date(df.index[-1])} 收盤）"),
         "intraday_observation": intraday_observation(bundle),
         "close": close,
         "moving_averages": {f"MA{n}": _ma_position(close, v) for n, v in ma_values.items()},
@@ -1497,7 +1721,9 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
     kf = core()
     code, name = _stock_identity(stock_code)
     bundle = _load_price_bundle(code)
-    df = closed_frame(bundle)  # 大量區不含盤中累計量（累計量會讓今天那格量能失真）
+    # 大量區的「成交量分布」仍只用已收盤日，避免早盤累計量扭曲成本區；
+    # 但股價相對量區的位置改用今日盤中/盤後暫定價格，讓型態分數能即時變動。
+    df = closed_frame(bundle)
     ctx = kf.build_weekly_context(df, pd.DataFrame(), kf.WEEK_TRADING_DAYS)
     plot_df = ctx["plot_df"]
     stats = kf._calculate_weighted_volume_profile_stats(plot_df, n_bins=40)
@@ -1507,7 +1733,9 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
 
     bins, centers, profile = stats["bins"], stats["centers"], stats["profile"]
     max_idx, second_idx = int(stats["max_idx"]), int(stats["second_idx"])
-    close = float(stats["work"]["Close"].iloc[-1])
+    closed_close = float(stats["work"]["Close"].iloc[-1])
+    live_df = bundle.get("df")
+    close = float(live_df["Close"].iloc[-1]) if LIVE_PATTERN_SCORE and bundle.get("intraday") and live_df is not None and not live_df.empty else closed_close
 
     def zone(idx: int, label: str, color: str) -> Dict[str, Any]:
         if idx < 0 or idx >= len(centers):
@@ -1524,11 +1752,24 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
             "relative_strength_pct": _num(profile[idx] / profile[max_idx] * 100) if profile[max_idx] > 0 else None,
         }
 
+    def current_position() -> str:
+        zones = []
+        for idx in (max_idx, second_idx):
+            if 0 <= idx < len(centers):
+                zones.append((float(bins[idx]), float(bins[idx + 1])))
+        if len(zones) < 2:
+            return str(pattern.get("latest_position_relative_to_two_zones", "") or "")
+        if close > max(z[1] for z in zones):
+            return "收盤在兩大量區之上" if not bundle.get("intraday") else "現價在兩大量區之上"
+        if close < min(z[0] for z in zones):
+            return "收盤在兩大量區之下" if not bundle.get("intraday") else "現價在兩大量區之下"
+        return "收盤在兩大量區之間" if not bundle.get("intraday") else "現價在兩大量區之間"
+
     recent_event = str(pattern.get("recent_maximum_zone_pattern", "") or "")
     return {
         "stock_code": code,
         "stock_name": name,
-        "data_date": _fmt_date(plot_df.index[-1]),
+        "data_date": _fmt_date(bundle["df"].index[-1] if LIVE_PATTERN_SCORE and bundle.get("intraday") else plot_df.index[-1]),
         "analysis_window": {
             "start": _fmt_date(plot_df.index[0]),
             "end": _fmt_date(plot_df.index[-1]),
@@ -1538,7 +1779,7 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
         "close": _num(close),
         "maximum_volume_zone": zone(max_idx, "最大量區", "紅色"),
         "second_volume_zone": zone(second_idx, "第二大量區", "橘色"),
-        "position_vs_two_zones": pattern.get("latest_position_relative_to_two_zones", ""),
+        "position_vs_two_zones": current_position(),
         "recent_maximum_zone_event": recent_event,
         **_event_flags(recent_event),
         "pattern_label": pattern.get("current_pattern_label", ""),
@@ -1547,7 +1788,7 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
         "recent_swing_structure": pattern.get("recent_swing_structure", ""),
         "weekly_price_volume_relationship": pattern.get("weekly_price_volume_relationship", ""),
         "system_interpretation": pattern.get("neutral_zone_interpretation", ""),
-        "algorithm_note": "與週報圖卡相同：近70根日K、40個價格區間，上下影線各分配20%、實體60%成交量",
+        "algorithm_note": "大量區分布仍用近70根已收盤日K；盤中只更新現價相對量區位置，避免未收盤累計量扭曲成本區",
     }
 
 
@@ -1576,9 +1817,15 @@ def _warrant_flow_frame(
             raise ToolDataError("交易日曆暫時無法取得")
         # 多抓一個交易日：盤中或盤後資料尚未發布時，仍能湊滿 N 個有資料的交易日。
         request_dates = trading_dates[-(days + 1):]
-        events = kf.fetch_warrant_events_full_market(
-            code, name, request_dates[0], request_dates[-1], cancel_event
-        )
+        started = time.perf_counter()
+        try:
+            events = kf.fetch_warrant_events_full_market(
+                code, name, request_dates[0], request_dates[-1], cancel_event
+            )
+            record_api_event("MoneyDJFlow", status=200, latency=time.perf_counter() - started)
+        except Exception:
+            record_api_event("MoneyDJFlow", status=500, latency=time.perf_counter() - started)
+            raise
         if events is None or events.empty:
             return {"flow": pd.DataFrame(), "window_dates": [], "latest_date": None}
         e = events.copy()

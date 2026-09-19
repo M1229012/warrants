@@ -370,8 +370,9 @@ def score_recent_behavior(behavior: Dict[str, Any], config: WeeklyPickConfig) ->
 
 
 def _technical_extras(stock_code: str) -> Dict[str, Any]:
-    """從既有 calculate_indicators 結果取出評分需要的序列資訊（不另算指標）。"""
-    df = tools.closed_frame(tools._load_price_bundle(stock_code))  # 評分只用已收盤 K 棒
+    """從既有 calculate_indicators 結果取出評分序列；盤中開啟時使用今日暫定 K。"""
+    bundle = tools._load_price_bundle(stock_code)
+    df = bundle["df"] if tools.LIVE_PATTERN_SCORE and bundle.get("intraday") else tools.closed_frame(bundle)
     latest = df.iloc[-1]
     close = _f(latest.get("Close"))
     close_5 = _f(df["Close"].iloc[-6]) if len(df) >= 6 else None
@@ -656,6 +657,16 @@ def build_pattern_scorecard(
     """一般問答的型態評分卡：分數規則與本週精選相同（score_pattern）；只評技術結構，不含權證籌碼、不是買賣建議。"""
     config = config or WeeklyPickConfig()
     pattern = score_pattern(tech, vp, extras, config)
+    try:
+        import local_market_cache
+        local_market_cache.save_pattern_score(
+            str(tech.get("stock_code") or vp.get("stock_code") or ""),
+            str(tech.get("data_date") or vp.get("data_date") or ""),
+            pattern["score"], pattern_grade(pattern["score"]), pattern.get("components"),
+            str(tech.get("signal_status") or ""),
+        )
+    except Exception:
+        pass
     good, bad = pattern_reason_lists(pattern["items"])
     levels = tools.key_price_levels(tech, vp)
     close = levels["close"]
