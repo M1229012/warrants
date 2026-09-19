@@ -766,10 +766,25 @@ def _tag_rows(tags: list[tuple[str, str]], width: float) -> list[list[tuple[str,
 
 
 def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
+    def _pick(levels, base_limit):
+        picked = list((levels or [])[:base_limit])
+        seen = {(str(lv.get('label', '')), float(lv.get('price'))) for lv in picked if _finite(lv.get('price')) is not None}
+        # 大量區若距現價不遠，工具層已先保留；這裡再確保不要因表格列數上限被截掉。
+        for lv in (levels or [])[base_limit:]:
+            label = str(lv.get('label', ''))
+            price = _finite(lv.get('price'))
+            if price is None:
+                continue
+            key = (label, float(price))
+            if '量區' in label and key not in seen:
+                picked.append(lv)
+                seen.add(key)
+        return picked
+
     rows = []
-    for lv in (card.get('resistances_above_close') or [])[:LEVEL_MAX_RESISTANCES]:
+    for lv in _pick(card.get('resistances_above_close') or [], LEVEL_MAX_RESISTANCES):
         rows.append(('壓力', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
-    for lv in (card.get('supports_below_close') or [])[:LEVEL_MAX_SUPPORTS]:
+    for lv in _pick(card.get('supports_below_close') or [], LEVEL_MAX_SUPPORTS):
         rows.append(('支撐', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
     close = _finite(card.get('close'))
     if close:
@@ -1004,7 +1019,7 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)
-    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、兩大量區上下緣、布林上下軌中，離收盤最近的壓力與支撐', width, dry)
+    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、附近大量區上下緣、布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）', width, dry)
     if levels:
         if not dry:
             _draw_level_table(draw, px, y + h, width, levels, card)

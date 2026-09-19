@@ -3292,29 +3292,60 @@ def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 # ============================================================
 
 def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]:
-    """現價上下方的關鍵價位（均線、兩大量區上下緣、布林三軌），附距現價 %；全部來自既有計算結果。"""
+    """現價上下方的關鍵價位（均線、兩大量區上下緣、布林三軌），附距現價 %；全部來自既有計算結果。
+
+    大量區希望在各種報告與週精選圖片中優先保留，因此：
+    1. 先把均線、兩大量區上下緣、布林上下軌全部整理成 levels。
+    2. 若大量區距現價太遠（預設超過 12%），則省略，避免干擾閱讀。
+    3. 若大量區距現價不遠，則即使不是最近 4 個支撐／3 個壓力，也會補進關鍵價位清單。
+    """
     close = _num(tech.get("close"))
     levels: List[Dict[str, Any]] = []
+    zone_keep_pct = max(0.0, float(_env_float("KEY_LEVEL_ZONE_MAX_DISTANCE_PCT", 12.0)))
 
-    def add(label: str, value: Any) -> None:
+    def add(label: str, value: Any, source: str) -> None:
         price = _num(value)
         if price is not None and price > 0:
-            levels.append({"label": label, "price": price})
+            levels.append({"label": label, "price": price, "source": source})
 
     for key, info in (tech.get("moving_averages") or {}).items():
-        add(key, (info or {}).get("value"))
+        add(key, (info or {}).get("value"), "ma")
     for key, label in (("maximum_volume_zone", "最大量區"), ("second_volume_zone", "第二大量區")):
         zone = vp.get(key) or {}
-        add(f"{label}下緣", zone.get("price_low"))
-        add(f"{label}上緣", zone.get("price_high"))
+        add(f"{label}下緣", zone.get("price_low"), "volume_zone")
+        add(f"{label}上緣", zone.get("price_high"), "volume_zone")
     bb = tech.get("bollinger") or {}
-    add("布林上軌", bb.get("upper"))
-    add("布林下軌", bb.get("lower"))  # 布林中軌就是 MA20，不重複列
-    supports = sorted([lv for lv in levels if close is not None and lv["price"] <= close], key=lambda lv: -lv["price"])[:4]
-    resistances = sorted([lv for lv in levels if close is not None and lv["price"] > close], key=lambda lv: lv["price"])[:3]
-    for lv in supports + resistances:
-        lv["distance_from_close_pct"] = _pct(lv["price"], close)
-    return {"close": close, "levels": levels, "supports": supports, "resistances": resistances}
+    add("布林上軌", bb.get("upper"), "bollinger")
+    add("布林下軌", bb.get("lower"), "bollinger")  # 布林中軌就是 MA20，不重複列
+
+    if close is not None:
+        for lv in levels:
+            lv["distance_from_close_pct"] = _pct(lv["price"], close)
+
+    def _keep_volume_zone(lv: Dict[str, Any]) -> bool:
+        if lv.get("source") != "volume_zone":
+            return True
+        dist = lv.get("distance_from_close_pct")
+        return dist is not None and abs(float(dist)) <= zone_keep_pct
+
+    def _finalize(items: List[Dict[str, Any]], *, support: bool, base_limit: int) -> List[Dict[str, Any]]:
+        ordered = sorted(items, key=(lambda lv: -lv["price"]) if support else (lambda lv: lv["price"]))
+        base = list(ordered[:base_limit])
+        seen = {(str(lv.get("label")), float(lv.get("price"))) for lv in base}
+        extras = []
+        for lv in ordered[base_limit:]:
+            key = (str(lv.get("label")), float(lv.get("price")))
+            if lv.get("source") == "volume_zone" and key not in seen:
+                extras.append(lv)
+                seen.add(key)
+        return base + extras
+
+    supports_pool = [lv for lv in levels if close is not None and lv["price"] <= close and _keep_volume_zone(lv)]
+    resistances_pool = [lv for lv in levels if close is not None and lv["price"] > close and _keep_volume_zone(lv)]
+    supports = _finalize(supports_pool, support=True, base_limit=4)
+    resistances = _finalize(resistances_pool, support=False, base_limit=3)
+    return {"close": close, "levels": levels, "supports": supports, "resistances": resistances,
+            "zone_keep_pct": zone_keep_pct}
 
 
 def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, Any]:
