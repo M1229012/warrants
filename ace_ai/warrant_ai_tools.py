@@ -108,6 +108,10 @@ _API_TOTALS = defaultdict(int)
 _API_ERRORS = defaultdict(int)
 _API_LATENCY = defaultdict(lambda: [0.0, 0])
 _API_PRIORITY = threading.local()
+_API_REQUEST_LOCAL = threading.local()
+_API_REQUEST_COUNTS = defaultdict(lambda: defaultdict(int))
+_API_REQUEST_LATENCY = defaultdict(lambda: defaultdict(float))
+_API_REQUEST_LOCK = threading.RLock()
 FUGLE_BACKGROUND_LIMIT_PER_MIN = max(1, _env_int("DISCORD_AI_FUGLE_BACKGROUND_LIMIT_PER_MIN", 15))
 FUGLE_USER_RESERVE_PER_MIN = max(1, _env_int("DISCORD_AI_FUGLE_USER_RESERVE_PER_MIN", 20))
 FUGLE_HARD_LIMIT_PER_MIN = min(59, max(10, _env_int("DISCORD_AI_FUGLE_HARD_LIMIT_PER_MIN", 55)))
@@ -125,6 +129,43 @@ def record_api_event(provider: str, *, status: int = 200, latency: float = 0.0, 
             _API_ERRORS[key] += 1
         bucket = _API_LATENCY[key]
         bucket[0] += max(0.0, float(latency or 0.0)); bucket[1] += 1
+    request_id = str(getattr(_API_REQUEST_LOCAL, "request_id", "") or "")
+    if request_id:
+        with _API_REQUEST_LOCK:
+            _API_REQUEST_COUNTS[request_id][key] += 1
+            _API_REQUEST_LATENCY[request_id][key] += max(0.0, float(latency or 0.0))
+
+
+
+
+@contextmanager
+def api_request_scope(request_id: str):
+    """把 API 呼叫歸到單次 Discord 問答；worker thread 也可顯式帶入同一 request_id。"""
+    old = str(getattr(_API_REQUEST_LOCAL, "request_id", "") or "")
+    _API_REQUEST_LOCAL.request_id = str(request_id or "")
+    try:
+        yield
+    finally:
+        _API_REQUEST_LOCAL.request_id = old
+
+
+def request_api_usage(request_id: str, *, clear: bool = False) -> Dict[str, Any]:
+    rid = str(request_id or "")
+    if not rid:
+        return {}
+    with _API_REQUEST_LOCK:
+        counts = dict(_API_REQUEST_COUNTS.get(rid) or {})
+        latency = dict(_API_REQUEST_LATENCY.get(rid) or {})
+        result = {k: {"calls": int(v), "latency": round(float(latency.get(k, 0.0)), 3)} for k, v in counts.items()}
+        if clear:
+            _API_REQUEST_COUNTS.pop(rid, None)
+            _API_REQUEST_LATENCY.pop(rid, None)
+        return result
+
+
+def run_tool_scoped(name: str, kwargs: Dict[str, Any], cancel_event: threading.Event, request_id: str = "") -> "ToolResult":
+    with api_request_scope(request_id):
+        return run_tool(name, kwargs, cancel_event)
 
 
 def api_usage_snapshot() -> Dict[str, Any]:
@@ -3471,7 +3512,97 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
                               "displayed": len(marks)}}
 
 
-def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
+def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
+    """K 線權證分點買賣標註：只讀 Google Sheet。
+
+    買進：A～E 事件表的事件日/單日累積買進金額。
+    賣出：每日賣出明細的日期/賣出金額。
+    同一分點同日若同時有買賣會先淨額互抵；圖上只畫最重要的點位。
+    """
+    kf = core()
+    if not dates:
+        return {"mode": "flow", "source": "sheet", "events": []}
+    if str(branch_name or "").strip() == "__NO_WEEKLY_BRANCH__":
+        return {"mode": "flow", "source": "sheet", "events": []}
+    code = kf._normalize_stock_name_code_key(stock_code)
+    start, end = _parse_sheet_date(dates[0]), _parse_sheet_date(dates[-1])
+    if start is None or end is None:
+        return {"mode": "flow", "source": "sheet", "events": []}
+    bundle = load_abcde_event_rows()
+    events = bundle["events"]
+    rows = events[(events["stock_code"] == code) & (events["event_date"] >= start) & (events["event_date"] <= end)].copy()
+
+    targets: List[str] = []
+    if branch_name:
+        for raw in [x for x in re.split(r"[,，、]", str(branch_name)) if x.strip()]:
+            canonical, _ = resolve_branch(raw)
+            if canonical:
+                targets.append(canonical)
+            else:
+                normalized = kf.normalize_branch_name(raw)
+                if normalized:
+                    targets.append(normalized)
+        targets = list(dict.fromkeys(targets))
+        if targets:
+            rows = rows[rows["branch"].isin(targets)]
+
+    daily: Dict[Tuple[str, pd.Timestamp], Dict[str, Any]] = {}
+    for _, row in rows.iterrows():
+        day = pd.Timestamp(row["event_date"]).normalize()
+        key = (str(row["branch"]), day)
+        item = daily.setdefault(key, {"net_amount": 0.0, "events": set()})
+        item["net_amount"] += float(row.get("buy_amount") or 0.0)
+        if row.get("event_code"):
+            item["events"].add(str(row["event_code"]))
+
+    sells = _sell_rows(code)
+    if not sells.empty:
+        sells = sells[(sells["_date"] >= start) & (sells["_date"] <= end)]
+        if targets:
+            sells = sells[sells["_branch"].isin(targets)]
+        for _, row in sells.iterrows():
+            day = pd.Timestamp(row["_date"]).normalize()
+            key = (str(row["_branch"]), day)
+            item = daily.setdefault(key, {"net_amount": 0.0, "events": set()})
+            item["net_amount"] -= float(row.get("_amount") or 0.0)
+
+    if not daily:
+        print(f"ℹ️ {code} Google Sheet 權證標註：指定分點/期間無資料", flush=True)
+        return {"mode": "flow", "source": "sheet", "events": []}
+
+    frame = pd.DataFrame([
+        {"branch": branch, "Date": day, "net_amount": info["net_amount"],
+         "event_codes": "+".join(sorted(info["events"]))}
+        for (branch, day), info in daily.items()
+    ])
+    if not targets:
+        topn = max(1, _env_int("CHART_FLOW_TOP_BRANCHES", 4))
+        totals = frame.groupby("branch")["net_amount"].sum().abs().sort_values(ascending=False)
+        frame = frame[frame["branch"].isin(list(totals.head(topn).index))]
+    min_abs = max(0.0, _env_float("CHART_FLOW_MIN_ABS_AMOUNT", 100_000.0))
+    frame = frame[frame["net_amount"].abs() >= min_abs]
+    if frame.empty:
+        return {"mode": "flow", "source": "sheet", "events": []}
+    max_marks = max(1, _env_int("CHART_FLOW_MAX_MARKS", 14))
+    frame = frame.assign(_abs=frame["net_amount"].abs()).nlargest(max_marks, "_abs").sort_values("Date")
+    marks = []
+    for no, (_, row) in enumerate(frame.iterrows(), 1):
+        amount = float(row["net_amount"])
+        marks.append({
+            "no": no,
+            "branch": row["branch"],
+            "event_codes": row.get("event_codes", ""),
+            "action": "buy" if amount > 0 else "sell",
+            "action_text": "買超" if amount > 0 else "賣超",
+            "action_date": _fmt_date(row["Date"]),
+            "net_amount": _num(amount, 0),
+            "net_amount_text": _money_text(amount),
+        })
+    print(f"✅ {code} Google Sheet 權證標註｜branches={targets or 'auto'}｜marks={len(marks)}", flush=True)
+    return {"mode": "flow", "source": "sheet", "events": marks, "data_latest_event_date": _fmt_date(bundle.get("latest_event_date"))}
+
+
+def moneydj_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
     """K 線用「實際權證流水」買賣超點位。
 
     與 A～E 事件回放分開：先以「分點 × 股票 × 日期」聚合 MoneyDJ 淨額，
@@ -3497,11 +3628,9 @@ def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
     rows["Date"] = pd.to_datetime(rows["Date"], errors="coerce").dt.normalize()
     rows = rows[rows["Date"].notna() & (rows["Date"] >= start) & (rows["Date"] <= end)]
     if branch_name:
-        targets = []
-        for raw in [x for x in re.split(r"[,，、]", str(branch_name)) if x.strip()]:
-            canonical, _ = resolve_branch(raw)
-            targets.append(canonical or kf.normalize_branch_name(raw))
-        targets = list(dict.fromkeys(targets))
+        # MoneyDJ 備援是處理 Sheet 名冊外分點，不能用 Sheet 的 fuzzy resolve；直接正規化後精確篩選。
+        targets = [kf.normalize_branch_name(raw) for raw in re.split(r"[,，、]", str(branch_name)) if raw.strip()]
+        targets = list(dict.fromkeys(x for x in targets if x))
         rows = rows[rows["branch"].isin(targets)]
     else:
         topn = max(1, _env_int("CHART_FLOW_TOP_BRANCHES", 4))
@@ -3532,6 +3661,30 @@ def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
             "net_amount_text": _money_text(amount),
         })
     return {"mode": "flow", "events": marks}
+
+
+
+def chart_flow_marks_for_stock(
+    stock_code: str,
+    dates: List[str],
+    branch_name: str = "",
+    *,
+    source: str = "sheet",
+    allow_moneydj_fallback: bool = False,
+) -> Dict[str, Any]:
+    """權證買賣點位入口。一般會員/週精選固定 Sheet；MoneyDJ 只給管理員明確備援。"""
+    requested = str(source or "sheet").lower()
+    if requested == "moneydj":
+        result = moneydj_flow_marks_for_stock(stock_code, dates, branch_name)
+        result["source"] = "moneydj_admin_fallback"
+        return result
+    result = sheet_flow_marks_for_stock(stock_code, dates, branch_name)
+    if result.get("events") or not allow_moneydj_fallback:
+        return result
+    print(f"⚠️ {stock_code} Sheet 無權證標註，管理員備援改用 MoneyDJ｜branch={branch_name}", flush=True)
+    fallback = moneydj_flow_marks_for_stock(stock_code, dates, branch_name)
+    fallback["source"] = "moneydj_admin_fallback"
+    return fallback
 
 
 # ============================================================
@@ -3648,7 +3801,7 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 # Tool 註冊表
 # ============================================================
 
-def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event") -> Dict[str, Any]:
+def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event", flow_source: str = "sheet", allow_moneydj_fallback: bool = False) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
@@ -3695,7 +3848,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
     marks: Dict[str, Any] = {}
     if with_marks:
         try:
-            marks = (chart_flow_marks_for_stock(code, [bar["date"] for bar in bars], branch_name) if str(mark_mode).lower() == "flow" else chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name))
+            marks = (chart_flow_marks_for_stock(code, [bar["date"] for bar in bars], branch_name, source=flow_source, allow_moneydj_fallback=allow_moneydj_fallback) if str(mark_mode).lower() == "flow" else chart_marks_for_stock(code, [bar["date"] for bar in bars], branch_name))
         except Exception as exc:  # Sheet 失敗時 K 線照畫，只是沒有分點標註
             print(f"⚠️ {code} 分點買賣標註略過：{type(exc).__name__}: {exc}", flush=True)
             marks = {"mode": str(mark_mode).lower(), "events": []}

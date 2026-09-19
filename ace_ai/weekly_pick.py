@@ -232,6 +232,7 @@ def evaluate_pair(
         adjusted = _f(exact.get("adjusted_win_rate"))
         included = _f(exact.get("included_count"))
         weighted_return = _f(exact.get("weighted_return"))
+        avg_holding_days = _f(exact.get("avg_holding_days"))
         unresolved_ratio = _f(exact.get("unresolved_ratio"))
         performance_source = "exact_combo"
         performance_key = combo_key
@@ -250,6 +251,7 @@ def evaluate_pair(
         adjusted = weighted("adjusted_win_rate")
         included = weighted("included_count")
         weighted_return = weighted("weighted_return")
+        avg_holding_days = weighted("avg_holding_days")
         unresolved_ratio = weighted("unresolved_ratio")
         performance_source = "single_event_fallback" if len(triggered) > 1 else "single_event"
         performance_key = combo_key or (triggered[0] if triggered else "")
@@ -275,6 +277,7 @@ def evaluate_pair(
         "matched_adjusted_win_rate": _round(adjusted, 2),
         "matched_included_count": _round(included, 1),
         "matched_weighted_return": _round(weighted_return, 2),
+        "matched_avg_holding_days": _round(avg_holding_days, 2),
         "matched_unresolved_ratio": _round(unresolved_ratio, 3),
         "overall": {
             "raw_win_rate": overall.get("raw_win_rate"),
@@ -1068,6 +1071,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
                 "adjusted_win_rate": lead["matched_adjusted_win_rate"],
                 "sample_included": lead["matched_included_count"],
                 "weighted_return": lead["matched_weighted_return"],
+                "avg_holding_days": lead.get("matched_avg_holding_days"),
             },
             "overall_background": lead["overall"],
             "is_selected_five": lead.get("is_selected_five", False),
@@ -1076,14 +1080,23 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "name": p["branch"],
                 "triggered_events": p["triggered_events"],
-                "matched_raw_win_rate": p["matched_raw_win_rate"],
-                "matched_adjusted_win_rate": p["matched_adjusted_win_rate"],
-                "sample_included": p["matched_included_count"],
-                "event_buy_amount_text": p["event_buy_amount_text"],
-                "net_buy_5d_text": p.get("net_buy_5d_text"),
+                "performance_key": p.get("performance_key"),
+                "performance_source": p.get("performance_source"),
+                "exact_combo_performance": p.get("exact_combo_performance") or {},
+                "event_performance": {c: _perf_brief(m) for c, m in (p.get("event_performance") or {}).items()},
+                "matched_raw_win_rate": p.get("matched_raw_win_rate"),
+                "matched_adjusted_win_rate": p.get("matched_adjusted_win_rate"),
+                "sample_included": p.get("matched_included_count"),
+                "weighted_return": p.get("matched_weighted_return"),
+                "avg_holding_days": p.get("matched_avg_holding_days"),
+                "overall_background": p.get("overall") or {},
+                "event_buy_amount_text": p.get("event_buy_amount_text"),
+                "event_dates": p.get("event_dates") or [],
+                "active_pair": p.get("active_pair"),
+                "is_selected_five": p.get("is_selected_five", False),
             }
-            for p in stock["high_quality_pairs"] if p["branch"] != lead["branch"]
-        ][:3],
+            for p in (stock.get("pairs") or stock.get("high_quality_pairs") or []) if p.get("branch") != lead["branch"]
+        ],
         "warrant": {
             "event_buy_amount_total_text": tools._money_text(stock["event_buy_amount_total"]),
             "high_quality_amount_text": tools._money_text(stock["high_quality_amount"]),
@@ -1687,33 +1700,41 @@ WEEKLY_DRAFT_SCHEMA = {
 
 
 WEEKLY_DRAFT_SYSTEM_PROMPT = """你是「權證分點觀察｜週精選」文字編輯助理。
-你的任務是根據 fact_data 寫出一篇可直接貼到 Discord 的週精選草稿，文風要貼近 style_examples，但所有事實與數字只能來自 fact_data。
+你的任務是根據 fact_data 寫出一篇可直接貼到 Discord 的週精選草稿，文風要貼近 style_examples，但所有客觀數字與權證分點資料只能來自 fact_data；admin_notes 是管理員自己補充的事實，可自然融入文章。
 
 寫作原則：
-1. 使用繁體中文、自然口語、像長期觀察台股與權證分點的人在寫投資筆記，不要像制式研究報告或客服。
+1. 使用繁體中文、自然口語，像長期觀察台股與權證分點的人在寫自己的投資筆記；不要像制式研究報告、客服或把欄位逐項念完。
 2. 開頭固定兩行：
    權證分點觀察｜週精選 📌
    📌 股票代號 股票名稱
-3. 主文通常 1 個緊湊段落、約 4～7 句。優先挑真正有辨識度的重點，不要把所有欄位逐項念完。
-4. 常見順序是「技術型態／大量區 → 權證分點操作 → 對應事件或複合事件歷史績效 → 後續觀察」，但若權證操作本身最特殊，可以先講權證再回到技術面。
-5. 勝率優先使用 branch.performance_key 對應的精確複合事件資料；若 performance_source=single_event_fallback，必須寫成「依單一事件資料綜合觀察」，不可假裝 Sheet 有該複合事件統計。總勝率 overall_background 只作背景，除非使用者明確要求，正文不要拿總勝率取代事件勝率。
-6. 精選五分點只代表標記，不代表比較高分，不要寫成因為是精選分點所以更好。
-7. 只在資料真的支持時提到外資、現股分點、週K、族群或布林；fact_data 沒有就完全不要補。
-8. 不要固定塞「優點／注意／回答／觀察重點」等標題；不要寫英文欄位名；不要解釋系統規則。
-9. 可以使用「後續可持續留意／可以觀察／短線不必急著追價」這種投資筆記語氣，但不要保證漲跌或寫目標價。
-10. 結尾固定：
+3. 不使用固定模板硬塞所有指標。先從資料中挑出「這檔目前最值得講的 3～5 件事」再寫；沒有辨識度的資訊可以完全省略。
+4. 技術面要有選擇性：
+   - 股價接近大量區、剛突破/回踩大量區時，大量區應成為文章重點並寫出相關價位。
+   - 均線排列、扣抵、布林、量能若沒有特別訊號，不必每篇都寫。
+   - 若某一項才是這檔最重要的技術特徵，可以多寫一點，不必維持固定順序。
+5. 權證分點也是依重要性選材。文章提到幾個分點，就可以分別寫各自的事件勝率、樣本、平均持有天數、加權報酬或目前部位，但只挑對這篇有意義的數據，不需要每個欄位全部列出。
+6. 若有精確複合事件統計（例如 A+C），優先使用該組合。若只有單事件資料可參考，直接用自然文字說明是哪幾個事件的歷史表現，不要寫「依單一事件資料綜合觀察」這種系統語句，也不能假裝有不存在的複合事件統計。
+7. 總勝率只作背景；若本次事件勝率更有代表性，就以本次事件為主。
+8. 精選五分點只代表標記，不代表比較高分，不要寫成因為是精選分點所以更好。
+9. 只有 fact_data 或 admin_notes 真的有資料時，才能提到外資、投信、法人、現股分點、族群或週 K；沒有就不要補。
+10. 主文通常 1 個緊湊段落、約 4～7 句，可依資料增減。常見但非固定的結構是「最重要的技術位置 → 權證分點 → 歷史績效 → 後續觀察」。
+11. 語氣可使用「後續可以觀察／持續留意／短線不必急著追價」等筆記式說法，但不要保證漲跌、寫目標價或把歷史勝率當成未來機率。
+12. 結尾維持過往寫法：
    ⚠️ 僅為個人投資筆記
    🧡 非任何買賣建議
-11. 若 instruction 有修改要求，必須在不改動原始事實的前提下改寫；若 previous_draft 存在，優先延續其內容與語氣，不要整篇改成另一種風格。
+13. 若 instruction 是修改要求，必須延續 previous_draft 的內容與語氣，只改使用者指定的地方；例如「把華南永昌台中的勝率與平均持有補上」就真的補進去，不要把整篇重寫成另一套模板。
+14. admin_notes 若有管理員補充的外資、法人或現股籌碼資訊，可以自然放進最適合的位置；不得延伸出 admin_notes 沒說的數字。
 
 只輸出 JSON：{"draft":"完整草稿"}。"""
 
 
-def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", previous_draft: str = "") -> Tuple[str, Dict[str, Any]]:
+def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", previous_draft: str = "", admin_notes: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
     facts = candidate_payload(candidate)
     style = load_weekly_style_examples()
+    notes = [str(x).strip() for x in (admin_notes or []) if str(x).strip()]
     payload = {
         "fact_data": tools_prune(facts),
+        "admin_notes": notes,
         "instruction": str(instruction or "").strip(),
         "previous_draft": str(previous_draft or "").strip(),
     }
@@ -1724,7 +1745,7 @@ def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", 
         + "\n\ninput_data（JSON）：\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
-    return prompt, facts
+    return prompt, {"fact_data": facts, "admin_notes": notes, "instruction": str(instruction or "").strip()}
 
 
 def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, config: Optional[WeeklyPickConfig] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -1755,7 +1776,18 @@ def weekly_image_text(draft: str, stock_code: str, stock_name: str = "") -> str:
         lines.pop(0)
     while lines and not lines[0].strip():
         lines.pop(0)
-    body = "\n".join(lines).strip()
+    # 圖片版把免責兩行從正文移到同一個小字 note，保留原本措辭，只調整版面。
+    disclaimers = []
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"):
+            disclaimers.append(stripped)
+        else:
+            kept.append(line)
+    body = "\n".join(kept).strip()
+    if disclaimers:
+        body = (body + "\n\n" if body else "") + "　｜　".join(disclaimers)
     label = f"{stock_name}（{code}）" if stock_name else code
     return (label + ("\n\n" + body if body else "")).strip()
 
@@ -1776,7 +1808,7 @@ def generate_weekly_draft(
             "reason": f"{stock_code} 目前不在本週 Top10 候選內；請先查看本週精選排名，再選擇候選股。",
             "ranking": ranking,
         }
-    prompt, facts = build_weekly_draft_prompt(stock, instruction=instruction, previous_draft=previous_draft)
+    prompt, facts = build_weekly_draft_prompt(stock, instruction=instruction, previous_draft=previous_draft, admin_notes=[])
     response = generate(prompt, WEEKLY_DRAFT_SCHEMA)
     if not getattr(response, "ok", False):
         return {"ok": False, "reason": getattr(response, "error", "AI 文字生成失敗") or "AI 文字生成失敗"}
@@ -1784,7 +1816,7 @@ def generate_weekly_draft(
     draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
     if not draft:
         return {"ok": False, "reason": "AI 回傳格式不完整，沒有取得週精選文字。"}
-    ungrounded = find_ungrounded(draft, {"candidate": facts})
+    ungrounded = find_ungrounded(draft, facts)
     if ungrounded:
         return {"ok": False, "reason": "AI 草稿中有數字無法對應原始資料，已阻止送出。", "issues": ungrounded[:10]}
     return {
@@ -1801,7 +1833,12 @@ _WEEKLY_DRAFT_PATTERNS = (
     "週精選文字", "周精選文字", "精選文字", "週精選文案", "周精選文案", "生成精選文字", "產生精選文字"
 )
 _WEEKLY_IMAGE_PATTERNS = ("生成週精選圖片", "生成周精選圖片", "週精選圖片", "周精選圖片", "轉成圖片", "做成圖片", "生成圖片")
-_WEEKLY_REVISION_WORDS = ("改", "修改", "短一點", "長一點", "口語", "刪", "補", "強調", "不要寫", "這版", "上一版", "第二段", "第一段")
+_WEEKLY_REVISION_WORDS = (
+    "改", "修改", "短一點", "長一點", "口語", "刪", "刪掉", "拿掉", "省略", "補", "補上", "補充",
+    "加上", "加入", "加進去", "寫上", "寫進去", "強調", "不要寫", "換成", "重寫", "重整", "順一下",
+    "這版", "上一版", "這段", "第二段", "第一段", "也要", "也寫", "再加", "再補",
+)
+_WEEKLY_EDIT_FIELDS = ("勝率", "平均持有", "持有天數", "加權報酬", "大量區", "均線", "布林", "權證", "分點", "外資", "投信", "法人", "現股籌碼", "技術面")
 
 
 def extract_stock_code(text: str) -> str:
@@ -1824,5 +1861,36 @@ def is_weekly_revision_question(text: str) -> bool:
     return any(k in compact for k in _WEEKLY_REVISION_WORDS)
 
 
+def is_weekly_session_followup(text: str, current_stock_code: str = "") -> bool:
+    """已有週精選草稿時，辨識「不用再重打股號」的修改追問。
+
+    只有明顯帶修改語氣才接週精選；單純問「新光勝率多少」仍保留一般問答路由。
+    """
+    compact = re.sub(r"\s+", "", str(text or ""))
+    code = extract_stock_code(compact)
+    if code and current_stock_code and code != str(current_stock_code):
+        return False
+    if is_weekly_revision_question(compact):
+        return True
+    has_field = any(k in compact for k in _WEEKLY_EDIT_FIELDS)
+    edit_cue = any(k in compact for k in ("也", "再", "幫我", "請把", "把", "要寫", "要加", "多寫", "少寫"))
+    return has_field and edit_cue
+
+
+def is_admin_moneydj_image_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or "")).upper()
+    return bool(extract_stock_code(compact) and ("MONEYDJ" in compact or "備援" in compact) and any(k in compact for k in ("圖片", "產圖", "K線", "分點")))
+
+
+def extract_admin_moneydj_branch(text: str) -> str:
+    """管理員備援圖片的原始分點名稱；允許該分點不在 Google Sheet 名冊。"""
+    value = str(text or "")
+    value = re.sub(r"(?<!\d)[1-9]\d{3}(?!\d)", " ", value)
+    value = re.sub(r"(?i)moneydj", " ", value)
+    for word in ("用", "使用", "備援", "生成", "產生", "產圖", "圖片", "K線圖", "K線", "權證", "分點", "幫我", "請"):
+        value = value.replace(word, " ")
+    return re.sub(r"[，,、：:\s]+", " ", value).strip()
+
+
 def is_weekly_admin_feature_question(text: str) -> bool:
-    return is_weekly_pick_question(text) or is_weekly_draft_question(text) or is_weekly_image_question(text)
+    return is_weekly_pick_question(text) or is_weekly_draft_question(text) or is_weekly_image_question(text) or is_admin_moneydj_image_question(text)

@@ -27,6 +27,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
@@ -526,10 +527,8 @@ class QueryRouter:
             if "volume_profile" in categories:
                 plan.add("get_volume_profile", stock_code=code)
             if categories & {"warrant", "recent_trades", "win_rate"}:
-                # 權證問題第一步一律看 Google Sheet 的追蹤分點（A～E 事件、賣出、勝率）。
+                # 所有一般權證問題只讀 Google Sheet；MoneyDJ 僅限管理員明確啟用的備援圖片。
                 plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
-                if tools.MONEYDJ_TOP_ENABLE:
-                    plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
             if "news" in categories:
                 plan.add("get_recent_news", stock_code=code)
                 # 新聞統整時附上當日收盤與漲跌，讓 AI 能說明股價當下的反應（快取資料，幾乎不增加時間）。
@@ -547,8 +546,7 @@ class QueryRouter:
             plan.add("get_volume_profile", stock_code=code)
             if parsed.cost_price is not None:
                 plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
-            # 型態評分卡的「追蹤分點動向」要看近 20 個交易日的事件與賣出（只讀 Sheet）。
-            plan.add("get_sheet_stock_chips", stock_code=code, days=20)
+            # 純型態問題只算技術結構，不讀權證分點，避免圖片過長與不必要的 Sheet 呼叫。
         return plan
 
     def _default_bundle(self, parsed: ParsedQuestion) -> QueryPlan:
@@ -558,8 +556,6 @@ class QueryRouter:
             plan.add("get_technical_analysis", stock_code=code)
             plan.add("get_volume_profile", stock_code=code)
             plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
-            if tools.MONEYDJ_TOP_ENABLE:
-                plan.add("get_warrant_branch", stock_code=code, days=parsed.days)
             plan.add("get_recent_news", stock_code=code)
         return plan
 
@@ -613,10 +609,9 @@ class QueryRouter:
                 for code in stocks[:2]:
                     plan.add(name, stock_code=code)
             elif name in ("get_warrant_branch", "get_high_winrate_branches_buying", "get_sheet_stock_chips"):
+                # Planner 即使選到 MoneyDJ 類工具，一般會員路由也強制落回 Google Sheet。
                 for code in stocks[:2]:
                     plan.add("get_sheet_stock_chips", stock_code=code, days=days)
-                    if name != "get_sheet_stock_chips" and tools.MONEYDJ_TOP_ENABLE:
-                        plan.add(name, stock_code=code, days=days)
             elif name == "get_branch_stock_position" and branches and stocks:
                 plan.add(name, branch_name=branches[0], stock_code=stocks[0])
             elif name in ("get_branch_performance",):
@@ -734,6 +729,10 @@ class GeminiResult:
     rate_limited: bool = False
     latency: float = 0.0
     purpose: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    token_source: str = "none"
 
 
 _GEMINI_ERROR_STATE = threading.local()
@@ -801,13 +800,22 @@ class GeminiGateway:
                 _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
         latency = time.perf_counter() - started
         last_error = str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")
+        # 目前主程式的 _call_gemini_with_retry 只回傳文字，不暴露 usage_metadata；
+        # 因此這裡誠實標記為 estimated。之後若主程式改成回傳官方 usage，可直接替換本段。
+        output_text = str(text).strip() if text else ""
+        input_tokens = max(1, round(len(prompt) / 4)) if prompt else 0
+        output_tokens = max(1, round(len(output_text) / 4)) if output_text else 0
+        total_tokens = input_tokens + output_tokens
         self.log(
             f"Gemini 呼叫｜用途={purpose}｜model={kf.GEMINI_MODEL}｜latency={latency:.2f}s｜"
-            f"prompt={len(prompt):,} 字｜結果={'成功' if text else '失敗'}"
+            f"prompt={len(prompt):,} 字｜tokens≈{input_tokens}+{output_tokens}={total_tokens}（estimated）｜"
+            f"結果={'成功' if text else '失敗'}"
         )
         tools.record_api_event("Gemini", status=200 if text else 500, latency=latency, detail=purpose)
         if text:
-            return GeminiResult(ok=True, text=str(text).strip(), latency=latency, purpose=purpose)
+            return GeminiResult(ok=True, text=output_text, latency=latency, purpose=purpose,
+                                input_tokens=input_tokens, output_tokens=output_tokens,
+                                total_tokens=total_tokens, token_source="estimated")
         rate_limited = any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
         return GeminiResult(
             ok=False,
@@ -815,6 +823,10 @@ class GeminiGateway:
             rate_limited=rate_limited,
             latency=latency,
             purpose=purpose,
+            input_tokens=input_tokens,
+            output_tokens=0,
+            total_tokens=input_tokens,
+            token_source="estimated",
         )
 
 
@@ -1839,10 +1851,19 @@ class AnswerStats:
     gemini_calls: int = 0
     gemini_latency: float = 0.0
     prompt_chars: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    token_source: str = "none"
 
     def record_gemini(self, result: GeminiResult) -> None:
         self.gemini_calls += 1
         self.gemini_latency += result.latency
+        self.input_tokens += int(result.input_tokens or 0)
+        self.output_tokens += int(result.output_tokens or 0)
+        self.total_tokens += int(result.total_tokens or 0)
+        if result.token_source and result.token_source != "none":
+            self.token_source = result.token_source
 
 
 @dataclass
@@ -1857,6 +1878,12 @@ class AnswerResult:
     layout: str = "text"
     weekly: Dict[str, Any] = field(default_factory=dict)
     context_note: str = ""
+    request_id: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    token_source: str = "none"
+    api_usage: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================
@@ -1987,12 +2014,13 @@ class AceQueryEngine:
         self._queue_lock = threading.Lock()
         self._inflight: Dict[str, Future] = {}                          # 同一個問題同時進來共用一次計算
         self._pending = 0                                               # 排隊中＋處理中的題數
+        self._request_local = threading.local()                          # 單次問答 request_id，供 API 計量
 
     def queue_size(self) -> int:
         with self._queue_lock:
             return self._pending
 
-    def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None) -> AnswerResult:
+    def _answer_impl(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None, is_admin: bool = False) -> AnswerResult:
         """context_key＝伺服器:頻道:使用者，用來記住追問；on_queue(前面還有幾題) 在需要排隊時呼叫一次。"""
         started = time.perf_counter()
         compact = re.sub(r"\s+", "", question)
@@ -2001,15 +2029,25 @@ class AceQueryEngine:
             with self._weekly_draft_lock:
                 self._weekly_drafts.pop(context_key, None)
             return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
-        # 週精選採兩段式：先排名，再選單檔產文字；草稿確認後才轉圖片。
+        # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
+        if weekly_pick.is_admin_moneydj_image_question(question):
+            if not is_admin:
+                return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
+            return self._answer_admin_moneydj_image(question, started)
+
+        # 週精選採獨立編輯 session。已有草稿時，後續「加上／補上／短一點／把…也寫進去」
+        # 直接承接同一篇，不再要求使用者重打股號，也不讓一般 2330/2454 追問記憶搶走路由。
         if weekly_pick.is_weekly_draft_question(question):
             with self._weekly_lock:
                 return self._answer_weekly_draft(question, context_key, started)
         with self._weekly_draft_lock:
             draft_session = self._weekly_drafts.get(context_key)
+            if draft_session and time.time() - float(draft_session.get("updated_at", 0) or 0) > MEMORY_MINUTES * 60:
+                self._weekly_drafts.pop(context_key, None)
+                draft_session = None
         if draft_session and weekly_pick.is_weekly_image_question(question):
             return self._answer_weekly_article_image(context_key, started)
-        if draft_session and weekly_pick.is_weekly_revision_question(question):
+        if draft_session and weekly_pick.is_weekly_session_followup(question, draft_session.get("stock_code", "")):
             return self._answer_weekly_revision(question, context_key, started)
         if is_weekly_pick_question(question):
             hit, cached = self._answer_cache.get(compact)
@@ -2075,6 +2113,19 @@ class AceQueryEngine:
         self.memory.update(context_key, parsed)
         return replace(result, context_note=note)
 
+    def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
+               is_admin: bool = False) -> AnswerResult:
+        """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
+        request_id = uuid.uuid4().hex[:10]
+        self._request_local.request_id = request_id
+        try:
+            with tools.api_request_scope(request_id):
+                result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin)
+            usage = tools.request_api_usage(request_id, clear=True)
+            return replace(result, request_id=request_id, api_usage=usage)
+        finally:
+            self._request_local.request_id = ""
+
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
         stats = AnswerStats()
@@ -2112,6 +2163,8 @@ class AceQueryEngine:
         return AnswerResult(
             text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit,
             panels=panels, layout="weekly_pick" if weekly else "text", weekly=weekly,
+            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+            total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
     def _answer_weekly_draft(self, question: str, context_key: str, started: float) -> AnswerResult:
@@ -2136,11 +2189,14 @@ class AceQueryEngine:
             "stock_code": data["stock_code"], "stock_name": data.get("stock_name", ""),
             "draft": data["draft"], "candidate": data["candidate"], "facts": data["facts"],
             "mark_branches": data.get("mark_branches") or [],
+            "admin_notes": [], "updated_at": time.time(),
         }
         with self._weekly_draft_lock:
             self._weekly_drafts[context_key] = session
         text = data["draft"] + "\n\n※ 這是草稿。你可以直接說「權證部分短一點／大量區再強調／不要寫某段」；確認後再說「這版確認，生成圖片」。"
-        return AnswerResult(text=text, route="weekly_draft", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        return AnswerResult(text=text, route="weekly_draft", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False,
+                            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+                            total_tokens=stats.total_tokens, token_source=stats.token_source)
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：延續同一檔週精選草稿做文字修改。"""
@@ -2149,7 +2205,15 @@ class AceQueryEngine:
         if not session:
             return AnswerResult(text="目前沒有正在編輯的週精選草稿。請先輸入「股票代號＋幫我生成週精選文字」。", route="weekly_draft_revision", gemini_calls=0, elapsed=time.perf_counter()-started)
         stats = AnswerStats()
-        prompt, facts = weekly_pick.build_weekly_draft_prompt(session["candidate"], instruction=question, previous_draft=session["draft"])
+        # 週精選是管理員限定：若管理員手動補充外資／法人／現股籌碼等事實，也保留在本篇 session，
+        # 讓後續修改能自然融入，而不是每次重打。一般風格指令也可以安全留存。
+        admin_notes = list(session.get("admin_notes") or [])
+        if any(k in question for k in ("外資", "投信", "法人", "現股籌碼", "成本", "買超", "賣超")):
+            admin_notes.append(question.strip())
+            admin_notes = admin_notes[-12:]
+        prompt, facts = weekly_pick.build_weekly_draft_prompt(
+            session["candidate"], instruction=question, previous_draft=session["draft"], admin_notes=admin_notes
+        )
         response = self.gateway.generate(prompt, purpose="weekly_draft_revision", schema=weekly_pick.WEEKLY_DRAFT_SCHEMA, temperature=0.3)
         stats.record_gemini(response)
         if not response.ok:
@@ -2158,14 +2222,19 @@ class AceQueryEngine:
         draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
         if not draft:
             return AnswerResult(text="這次修改沒有取得完整文字，原草稿已保留。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
-        issues = find_ungrounded_numbers(draft, {"candidate": facts})
+        issues = find_ungrounded_numbers(draft, facts)
         if issues:
             self.log(f"週精選草稿修改數字核對未通過：{issues[:10]}")
             return AnswerResult(text="修改稿中出現無法對應原始資料的數字，因此沒有覆蓋原草稿。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
         session["draft"] = draft
+        session["facts"] = facts
+        session["admin_notes"] = admin_notes
+        session["updated_at"] = time.time()
         with self._weekly_draft_lock:
             self._weekly_drafts[context_key] = session
-        return AnswerResult(text=draft + "\n\n※ 如果這版確認，可以直接說「這版確認，生成圖片」。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
+        return AnswerResult(text=draft + "\n\n※ 如果這版確認，可以直接說「這版確認，生成圖片」。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False,
+                            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+                            total_tokens=stats.total_tokens, token_source=stats.token_source)
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
         """管理員確認草稿後，沿用一般個股（3034）版型產生週精選圖片。
@@ -2187,7 +2256,7 @@ class AceQueryEngine:
             self.log(f"週精選圖片：{code} 最終文字未提到候選分點，K 線不畫權證流水標記，追蹤分點區塊隱藏")
         # branch_name 未指定時 flow 模式會自動挑 Top 分點，因此空清單時用 sentinel 強制得到 0 筆標記。
         chart_branches = branches or ["__NO_WEEKLY_BRANCH__"]
-        panels = self._get_chart_panels([code], {code: chart_branches}, mark_mode="flow")
+        panels = self._get_chart_panels([code], {code: chart_branches}, mark_mode="flow", flow_source="sheet")
 
         # 週精選候選在排名階段已取得同一套技術資料，直接沿用來建 3034 版型的型態評分卡。
         # 「關鍵價位」照一般 3034 卡保留；「追蹤分點動向」只顯示文章提到的分點。
@@ -2217,15 +2286,54 @@ class AceQueryEngine:
             cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
         )
 
-    def _get_chart_panels(self, codes: List[str], branches: Optional[Dict[str, List[str]]] = None, mark_mode: str = "event") -> List[Dict[str, Any]]:
+    def _answer_admin_moneydj_image(self, question: str, started: float) -> AnswerResult:
+        """管理員限定：Sheet 沒有指定分點時，明確要求 MoneyDJ 備援權證點位圖。"""
+        code = weekly_pick.extract_stock_code(question)
+        branch = weekly_pick.extract_admin_moneydj_branch(question)
+        if not code or not branch:
+            return AnswerResult(text="請指定股票代號與分點，例如：3006 新光 MoneyDJ備援產圖。",
+                                route="admin_moneydj_image", gemini_calls=0, elapsed=time.perf_counter()-started)
+        kf = tools.core()
+        normalized = kf.normalize_branch_name(branch)
+        known = {kf.normalize_branch_name(x): x for x in tools.get_known_branches()}
+        if normalized in known:
+            canonical = known[normalized]
+            self.log(f"管理員備援請求：{canonical} 已存在 Google Sheet，直接使用 Sheet，不啟動 MoneyDJ")
+            panels = self._get_chart_panels([code], {code: [canonical]}, mark_mode="flow", flow_source="sheet")
+            text = f"{code}｜{canonical} 權證分點圖"
+        else:
+            self.log(f"管理員 MoneyDJ 備援啟動｜stock={code}｜branch={branch}")
+            panels = self._get_chart_panels([code], {code: [branch]}, mark_mode="flow", flow_source="moneydj")
+            text = f"{code}｜{branch} 權證分點備援圖"
+        return AnswerResult(text=text, route="admin_moneydj_image",
+                            gemini_calls=0, elapsed=time.perf_counter()-started, panels=panels, cacheable=False)
+
+    def _get_chart_panels(self, codes: List[str], branches: Optional[Dict[str, List[str]]] = None,
+                          mark_mode: str = "event", flow_source: str = "sheet",
+                          allow_moneydj_fallback: bool = False) -> List[Dict[str, Any]]:
         codes = list(dict.fromkeys(codes))
         calls = []
         for code in codes:
             names = (branches or {}).get(code) or []
-            calls.append(ToolCall("get_chart_panel", {"stock_code": code, "mark_mode": mark_mode, **({"branch_name": ",".join(names)} if names else {})}))
+            kwargs = {"stock_code": code, "mark_mode": mark_mode, "flow_source": flow_source,
+                      "allow_moneydj_fallback": allow_moneydj_fallback}
+            if names:
+                kwargs["branch_name"] = ",".join(names)
+            calls.append(ToolCall("get_chart_panel", kwargs))
         results = self._run_tools(calls)
-        return [r.data if r.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
-                for code, r in zip(codes, results)]
+        panels: List[Dict[str, Any]] = []
+        for code, result in zip(codes, results):
+            if result.ok:
+                panels.append(result.data)
+                continue
+            # 權證標註失敗不能拖垮整張圖；立即重試純 K 線。
+            retry = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False})])[0]
+            if retry.ok:
+                self.log(f"K 線重試成功：{code}｜權證標註略過")
+                panels.append(retry.data)
+            else:
+                panels.append({"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"})
+        return panels
 
     def plan_only(self, question: str) -> Tuple[ParsedQuestion, QueryPlan, AnswerStats]:
         stats = AnswerStats()
@@ -2274,9 +2382,16 @@ class AceQueryEngine:
         chart_branch = parsed.branches[0] if parsed.branches else ""
         light = plan.route == "rule_stock" and not plan.need_final_llm   # 只問股價：走輕量流程
         flow_mark_query = any(k in question for k in ("權證買賣超", "買賣超點位", "分點買賣", "買在哪", "賣在哪", "進出點位"))
+        warrant_visual_query = bool(parsed.branches) or any(k in question for k in ("權證", "分點", "籌碼", "買賣超")) or plan.route == "rule_top_warrant"
         mark_mode = "flow" if flow_mark_query else "event"
-        chart_calls = [ToolCall("get_chart_panel", {"stock_code": c, "mark_mode": mark_mode, **({"branch_name": chart_branch} if chart_branch else {}),
-                                                    **({"with_marks": False} if light else {})}) for c in codes]
+        chart_calls = []
+        for c in codes:
+            kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
+            if chart_branch:
+                kwargs["branch_name"] = chart_branch
+            if light or plan.route == "rule_pattern" or not warrant_visual_query:
+                kwargs["with_marks"] = False
+            chart_calls.append(ToolCall("get_chart_panel", kwargs))
         combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
@@ -2303,6 +2418,10 @@ class AceQueryEngine:
             elapsed=elapsed,
             cacheable=llm_ok and all(r.ok for r in combined),
             panels=panels,
+            input_tokens=stats.input_tokens,
+            output_tokens=stats.output_tokens,
+            total_tokens=stats.total_tokens,
+            token_source=stats.token_source,
         )
 
     def _answer_sector(self, request: Dict[str, str], started: float) -> AnswerResult:
@@ -2317,7 +2436,11 @@ class AceQueryEngine:
         # 會員看到的是 panels 畫出的族群卡片；text 保留給 Log 與 --ask。
         return AnswerResult(text=result["text"], route="rule_sector", gemini_calls=result["calls"],
                             elapsed=time.perf_counter() - started, cacheable=result["cacheable"],
-                            panels=result.get("panels") or [])
+                            panels=result.get("panels") or [],
+                            input_tokens=int(result.get("input_tokens") or 0),
+                            output_tokens=int(result.get("output_tokens") or 0),
+                            total_tokens=int(result.get("total_tokens") or 0),
+                            token_source=str(result.get("token_source") or "none"))
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
         """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
@@ -2334,7 +2457,8 @@ class AceQueryEngine:
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
         cancel_event = threading.Event()
-        futures = [(call, self.executor.submit(tools.run_tool, call.name, call.kwargs, cancel_event)) for call in calls]
+        request_id = str(getattr(self._request_local, "request_id", "") or "")
+        futures = [(call, self.executor.submit(tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
         done, _ = wait([f for _, f in futures], timeout=self.config.tool_timeout_seconds)
         results: List[tools.ToolResult] = []
         for call, future in futures:
@@ -2638,6 +2762,7 @@ def run_discord_bot(config: BotConfig) -> None:
     async def image_files(question: str, text: str, panels=None, guild=None, weekly=None):
         """回傳 discord.File 清單；本週精選會拆成多張（每張最多 3 檔股票）。"""
         limit = min(7_500_000, getattr(guild, "filesize_limit", 7_500_000))
+        render_started = asyncio.get_running_loop().time()
         try:
             if weekly:
                 images = await asyncio.to_thread(weekly_image.make_weekly_attachments, question, weekly, panels, max_bytes=limit)
@@ -2647,6 +2772,9 @@ def run_discord_bot(config: BotConfig) -> None:
             print(f"⚠️ 圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
             images = [await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
                       "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)]
+        render_elapsed = asyncio.get_running_loop().time() - render_started
+        total_bytes = sum(len(data) for data, _ in images)
+        print(f"🖼️ 圖片產生完成｜張數={len(images)}｜render={render_elapsed:.2f}s｜大小={total_bytes/1024:.1f}KB", flush=True)
         return [
             discord.File(io.BytesIO(data), filename=f"ace-answer-{i}.{extension}" if len(images) > 1 else f"ace-answer.{extension}")
             for i, (data, extension) in enumerate(images, 1)
@@ -2726,7 +2854,9 @@ def run_discord_bot(config: BotConfig) -> None:
     @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
     @app_commands.describe(question="例如：2330現在型態好嗎／永豐金內湖D事件勝率／2330最近有什麼新聞")
     async def ask_command(interaction: "discord.Interaction", question: str) -> None:
+        request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
+        is_admin = _is_guild_admin(interaction.user)
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
@@ -2755,11 +2885,18 @@ def run_discord_bot(config: BotConfig) -> None:
                     interaction_image(interaction, question, message, ephemeral=config.ephemeral), loop)
 
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
-            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue)
+            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin)
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            upload_started = asyncio.get_running_loop().time()
             await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
                                     weekly=result.weekly if result.layout == "weekly_pick" else None)
-            print(f"✅ Discord /{config.slash_command_name} 回覆圖片已更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
+            upload_elapsed = asyncio.get_running_loop().time() - upload_started
+            total_elapsed = asyncio.get_running_loop().time() - request_started
+            print(
+                f"📊 REQUEST METRICS｜id={result.request_id}｜route={result.route}｜compute={result.elapsed:.2f}s｜"
+                f"render+upload={upload_elapsed:.2f}s｜end_to_end={total_elapsed:.2f}s｜cache={result.cache_hit}｜"
+                f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
+                f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
@@ -2773,6 +2910,7 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_message(message: "discord.Message") -> None:
+        request_started = asyncio.get_running_loop().time()
         # 指令統一用 /ask；!ace 文字指令預設關閉（DISCORD_AI_PREFIX_COMMAND_ENABLE=1 才開）。
         if not config.prefix_command_enabled or message.author.bot:
             return
@@ -2807,11 +2945,18 @@ def run_discord_bot(config: BotConfig) -> None:
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
-                result = await asyncio.to_thread(engine.answer, question, context_key)
+                result = await asyncio.to_thread(engine.answer, question, context_key, None, _is_guild_admin(message.author))
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            upload_started = asyncio.get_running_loop().time()
             await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
-            print(f"✅ Discord {config.command_prefix} 回覆圖片已送出／更新｜route={result.route}｜計算 {result.elapsed:.1f}s｜快取={result.cache_hit}", flush=True)
+            upload_elapsed = asyncio.get_running_loop().time() - upload_started
+            total_elapsed = asyncio.get_running_loop().time() - request_started
+            print(
+                f"📊 REQUEST METRICS｜id={result.request_id}｜route={result.route}｜compute={result.elapsed:.2f}s｜"
+                f"render+upload={upload_elapsed:.2f}s｜end_to_end={total_elapsed:.2f}s｜cache={result.cache_hit}｜"
+                f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
+                f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
             print(f"⚠️ Discord 訊息送出失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷

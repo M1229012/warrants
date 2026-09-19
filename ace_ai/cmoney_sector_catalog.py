@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from io import StringIO
@@ -33,10 +34,12 @@ GROUP_URLS_BY_KIND = {
     "concept": [BASE + "/forum/concept/{code}"],
     "industry": [BASE + "/forum/category/{code}", BASE + "/finance/f00072.aspx?b=1&t={code}&o=1"],
 }
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 TTL = max(300, tools._env_int("DISCORD_AI_CMONEY_CATALOG_TTL", 43200))
 RADAR_TTL = max(60, tools._env_int("DISCORD_AI_CMONEY_RADAR_TTL", 300))
 TIMEOUT = max(2.0, tools._env_float("DISCORD_AI_CMONEY_TIMEOUT", 8.0))
+EXPAND_WORKERS = max(1, min(12, tools._env_int("DISCORD_AI_CMONEY_EXPAND_WORKERS", 6)))
+EXPAND_MAX_CANDIDATES = max(8, tools._env_int("DISCORD_AI_CMONEY_EXPAND_MAX_CANDIDATES", 60))
 DEFAULT_PATH = "/data/cmoney_sector_catalog.json" if Path("/data").exists() else str(Path(__file__).parent / ".cache" / "cmoney_sector_catalog.json")
 CACHE_PATH = Path(os.getenv("DISCORD_AI_CMONEY_CACHE", DEFAULT_PATH))
 _LOCK = threading.RLock()
@@ -253,6 +256,99 @@ def parse_members_html(html: str, expected_group_name: str = "") -> List[Dict[st
     return sorted(found.values(), key=lambda r: r["stock_code"])
 
 
+
+def _hidden_member_count(html: str) -> int:
+    """CMoney 首屏通常只顯示 8 檔，若出現「查看其他 N 檔股票」就代表目前表格不是完整名冊。"""
+    match = re.search(r"查看其他\s*([0-9,]+)\s*檔股票", str(html or ""), re.I)
+    if not match:
+        return 0
+    try:
+        return max(0, int(match.group(1).replace(",", "")))
+    except ValueError:
+        return 0
+
+
+def _seed_candidates_for_group(group_name: str) -> List[Dict[str, str]]:
+    """用既有細分名冊只當『候選池』，最後仍會逐檔回 CMoney 個股頁確認該 group code。
+
+    這不是直接把大分類塞進來；候選只用來找 CMoney 首屏未展開的股票。
+    """
+    try:
+        import fine_sector_catalog as fine_catalog
+    except Exception:
+        return []
+    target = normalize_text(group_name)
+    if not target:
+        return []
+    candidates: List[Dict[str, str]] = []
+    for key, item in getattr(fine_catalog, "GROUPS", {}).items():
+        if not item:
+            continue
+        name = str(item[0] or "")
+        clean = normalize_text(name)
+        # 允許「光通訊」↔「光通訊設備」這種非常接近的名稱，但不做大產業模糊擴張。
+        close = clean == target or (min(len(clean), len(target)) >= 3 and (clean in target or target in clean) and abs(len(clean)-len(target)) <= 4)
+        if not close:
+            continue
+        try:
+            data = fine_catalog.get_members(key)
+        except Exception:
+            continue
+        for stock in data.get("stocks") or []:
+            code = str(stock.get("stock_code") or "").strip()
+            if re.fullmatch(r"[1-9]\d{3}", code):
+                candidates.append({"stock_code": code, "stock_name": str(stock.get("stock_name") or code), "market": str(stock.get("market") or "")})
+    by_code = {s["stock_code"]: s for s in candidates}
+    return [by_code[k] for k in sorted(by_code)]
+
+
+def _stock_has_group_link(stock_code: str, group_code: str, kind: str) -> bool:
+    """逐檔用 CMoney 個股頁的分類連結確認成分，避免討論區文字造成誤判。"""
+    url = f"https://api.cmoney.tw/forum/stock/{stock_code}"
+    html = _get(url)
+    parser = LinkParser(); parser.feed(html)
+    target = str(group_code or "").upper()
+    for href, _label in parser.links:
+        code = _code_from_url(href)
+        if code == target:
+            path = urlsplit(urljoin(BASE, href)).path.lower()
+            if kind == "concept" and "/concept/" not in path:
+                continue
+            if kind == "industry" and "/category/" not in path and "f00072" not in path:
+                continue
+            return True
+    return False
+
+
+def _expand_incomplete_members(group: Dict[str, Any], visible: List[Dict[str, str]], expected_total: int) -> Tuple[List[Dict[str, str]], bool, str]:
+    """CMoney 首屏不完整時，以本地細分名冊作候選，再逐檔回 CMoney 個股頁驗證 exact group code。
+
+    若候選池不足或網路失敗，寧可標記 complete=False，也不假裝只抓到的 8 檔就是完整名冊。
+    """
+    code = str(group.get("code") or "").upper()
+    kind = str(group.get("kind") or "industry")
+    seed = _seed_candidates_for_group(str(group.get("name") or ""))[:EXPAND_MAX_CANDIDATES]
+    known = {s["stock_code"]: dict(s) for s in visible}
+    todo = [s for s in seed if s["stock_code"] not in known]
+    if not todo:
+        return list(known.values()), len(known) >= expected_total, "首屏未完整，沒有可用的本地候選池"
+    matched: Dict[str, Dict[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=EXPAND_WORKERS, thread_name_prefix="cmoney-expand") as pool:
+        futures = {pool.submit(_stock_has_group_link, s["stock_code"], code, kind): s for s in todo}
+        for future in as_completed(futures):
+            stock = futures[future]
+            try:
+                if future.result():
+                    matched[stock["stock_code"]] = stock
+            except Exception:
+                continue
+    known.update(matched)
+    stocks = [known[k] for k in sorted(known)]
+    complete = len(stocks) >= expected_total
+    note = f"首屏 {len(visible)} 檔＋驗證補回 {len(matched)} 檔；頁面預期 {expected_total} 檔"
+    return stocks, complete, note
+
+
 def get_members(code: str, refresh: bool = False) -> Dict[str, Any]:
     code = str(code).upper().strip()
     catalog = get_catalog()
@@ -267,41 +363,73 @@ def get_members(code: str, refresh: bool = False) -> Dict[str, Any]:
     disk = _read_disk()
     disk_members = ((disk.get("members") or {}).get(code) or {}) if isinstance(disk.get("members"), dict) else {}
     try:
-        stocks = []
+        stocks: List[Dict[str, str]] = []
         last_error = None
         used_url = ""
         kind = str(group.get("kind") or "industry")
         templates = GROUP_URLS_BY_KIND.get(kind) or GROUP_URLS_BY_KIND["industry"]
+        parse_complete = False
+        expected_total = 0
+        catalog_note = ""
         for template in templates:
             url = template.format(code=code)
             try:
-                candidate = parse_members_html(_get(url), group.get("name", ""))
-                # 一個正常族群至少應有 2 檔；只有 1 檔時寧可視為解析失敗，避免誤抓頁面雜訊。
-                if len(candidate) >= 2:
-                    stocks = candidate
-                    used_url = url
+                html = _get(url)
+                candidate = parse_members_html(html, group.get("name", ""))
+                if len(candidate) < 2:
+                    continue
+                hidden = _hidden_member_count(html)
+                candidate_expected = len(candidate) + hidden
+                if len(candidate) > len(stocks):
+                    stocks, used_url, expected_total = candidate, url, candidate_expected
+                if hidden == 0:
+                    stocks, used_url, expected_total = candidate, url, len(candidate)
+                    parse_complete = True
                     break
             except Exception as exc:
                 last_error = exc
         if len(stocks) < 2:
             raise ValueError("CMoney 成分股頁面沒有解析到有效成分表") from last_error
-        result = {"industry": "cmoney:" + code, "name": group["name"], "stocks": stocks, "source": "CMoney",
-                  "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), "complete": True,
-                  "missing_markets": [], "scope": group.get("kind", ""), "catalog_note": "", "source_url": used_url}
+        if not parse_complete and expected_total > len(stocks):
+            expanded, parse_complete, note = _expand_incomplete_members(
+                {**group, "code": code}, stocks, expected_total)
+            if len(expanded) > len(stocks):
+                stocks = expanded
+            catalog_note = note
+        result = {
+            "industry": "cmoney:" + code,
+            "name": group["name"],
+            "stocks": stocks,
+            "source": "CMoney",
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "complete": bool(parse_complete),
+            "expected_total": expected_total or len(stocks),
+            "missing_count": max(0, (expected_total or len(stocks)) - len(stocks)),
+            "missing_markets": [],
+            "scope": group.get("kind", ""),
+            "catalog_note": catalog_note,
+            "source_url": used_url,
+        }
         disk = disk if isinstance(disk, dict) else {}
         disk["schema_version"] = CACHE_SCHEMA_VERSION
         disk.setdefault("groups", catalog.get("groups") or {})
         disk.setdefault("members", {})[code] = result
         disk["updated_at"] = catalog.get("updated_at")
         _write_disk(disk)
-        print(f"✅ 族群成分名冊：{code} {group['name']}｜kind={kind}｜stocks={len(stocks)}｜url={used_url}", flush=True)
+        print(
+            f"✅ 族群成分名冊：{code} {group['name']}｜kind={kind}｜stocks={len(stocks)}"
+            f"｜expected={result['expected_total']}｜complete={result['complete']}｜url={used_url}"
+            + (f"｜{catalog_note}" if catalog_note else ""),
+            flush=True,
+        )
     except Exception as exc:
         if disk_members.get("stocks"):
             result = dict(disk_members, complete=False, stale=True, catalog_note="")
             print(f"⚠️ CMoney 成分股更新失敗，使用快取：{code}｜{type(exc).__name__}", flush=True)
         else:
             raise
-    with _LOCK: _MEM[key] = (time.time(), result)
+    with _LOCK:
+        _MEM[key] = (time.time(), result)
     return result
 
 

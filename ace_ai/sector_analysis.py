@@ -465,22 +465,27 @@ _PANEL_ROW_FIELDS = ("rank", "stock_code", "stock_name", "market", "close", "cha
 
 
 def ranking_panel(data: Dict[str, Any], observations: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """族群排行圖卡資料：前三名（含 AI 解讀）＋第 4～5 名；只在沒掃完整份名冊時附一句涵蓋說明。"""
+    """族群排行圖卡資料：圖片只放排行本身；涵蓋率/流動性診斷只寫 Log。"""
     observations = observations or {}
     rows = [dict({k: row.get(k) for k in _PANEL_ROW_FIELDS}, observation=observations.get(row["stock_code"], ""))
             for row in data["rows"]]
-    missing = data["total_count"] - data["compared_count"] - data.get("illiquid_count", 0)
-    note = ""
-    if not data["members_complete"]:
-        note = "部分成分股名單暫時無法取得，排行只涵蓋已取得的個股"
-    elif missing > 0:
-        note = f"{missing} 檔暫無同日資料，未列入排行"
+    total = int(data.get("total_count") or 0)
+    compared = int(data.get("compared_count") or 0)
+    illiquid = int(data.get("illiquid_count") or 0)
+    failed = int(data.get("failed_count") or 0)
+    print(
+        f"📚 族群排行診斷｜{data.get('name','')}｜名冊={total}｜納入={compared}｜"
+        f"流動性排除={illiquid}｜資料失敗={failed}｜complete={data.get('members_complete')}｜"
+        f"rule={data.get('liquidity_rule','')}",
+        flush=True,
+    )
     live = [r.get("intraday") or {} for r in rows]
-    liquidity_note = f"只比較{data['liquidity_rule']}的個股" if data.get("liquidity_rule") else ""
-    return {"sector": {"name": data["name"], "mode": data["mode"], "comparison_date": data["comparison_date"],
-                       "rows": rows, "others": data.get("others") or [], "coverage_note": note,
-                       "liquidity_note": liquidity_note,
-                       "live_time": next((i.get("time", "") for i in live if i.get("is_live")), "")}}
+    return {"sector": {
+        "name": data["name"], "mode": data["mode"], "comparison_date": data["comparison_date"],
+        "rows": rows, "others": data.get("others") or [],
+        "coverage_note": "", "liquidity_note": "",
+        "live_time": next((i.get("time", "") for i in live if i.get("is_live")), ""),
+    }}
 
 
 def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,69 +498,104 @@ def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def catalog_panel() -> Dict[str, Any]:
-    """會員看的族群清單：不顯示資料來源與內部規則，只做整齊分類。"""
+    """會員圖片只列細產業，避免概念題材/大產業全部塞進一張超長圖。"""
     try:
         cm = cmoney_catalog.get_catalog()
         groups = list((cm.get("groups") or {}).values())
     except Exception:
         groups = []
-    concepts = sorted({str(g.get("name") or "").strip() for g in groups if g.get("kind") == "concept" and g.get("name")})
     industries = sorted({str(g.get("name") or "").strip() for g in groups if g.get("kind") == "industry" and g.get("name")})
-    existing = sorted({str(group[0]).strip() for group in fine_catalog.GROUPS.values() if group and group[0]})
-    broad = sorted({str(name).strip() for name in INDUSTRIES.values() if name})
-    known = set(concepts) | set(industries)
-    supplements = [name for name in existing if name not in known]
-    return {"sector_catalog": {
-        "sections": [
-            {"title": "概念題材", "items": concepts},
-            {"title": "細產業", "items": industries},
-            {"title": "補充族群", "items": supplements},
-            {"title": "大產業", "items": broad},
-        ]
-    }}
+    # CMoney 目錄暫時失敗時才以既有細分名冊補空白；不在圖片顯示來源或規則。
+    if not industries:
+        industries = sorted({str(group[0]).strip() for group in fine_catalog.GROUPS.values() if group and group[0]})
+    return {"sector_catalog": {"title": "細產業名單", "sections": [{"title": "細產業", "items": industries}]}}
+
+
+def _median(values: List[float]) -> float:
+    values = sorted(float(v) for v in values)
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def _post_close_market_rows(mode: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """盤後用 Persistent Volume 內已快取的最新日 K / 型態分數排族群，不為單題打滿行情 API。"""
+    catalog = cmoney_catalog.get_catalog()
+    scored: List[Dict[str, Any]] = []
+    for code, group in (catalog.get("groups") or {}).items():
+        members = cmoney_catalog.get_cached_members(code)
+        if not members or not (members.get("stocks") or []):
+            continue
+        member_rows = []
+        for stock in members.get("stocks") or []:
+            hist = local_market_cache.load_bars(stock["stock_code"], limit=3)
+            if not hist or int(hist.get("count") or 0) < 2:
+                continue
+            df = hist["df"]
+            try:
+                close = float(df["Close"].iloc[-1]); prev = float(df["Close"].iloc[-2])
+            except Exception:
+                continue
+            score = local_market_cache.latest_pattern_score(stock["stock_code"])
+            member_rows.append({
+                "stock_code": stock["stock_code"], "stock_name": stock.get("stock_name", ""),
+                "change_pct": ((close / prev) - 1) * 100 if prev else None,
+                "pattern_score": float(score["score"]) if score and score.get("score") is not None else None,
+            })
+        total = len(members.get("stocks") or [])
+        if mode == "market_momentum":
+            values = [r["change_pct"] for r in member_rows if r.get("change_pct") is not None]
+            if len(values) < max(3, math.ceil(total * 0.4)):
+                continue
+            leader = max((r for r in member_rows if r.get("change_pct") is not None), key=lambda r: r["change_pct"], default={})
+            scored.append({"name": group.get("name", code), "score": _median(values),
+                           "change_pct": _median(values), "up_ratio": sum(v > 0 for v in values) / len(values) * 100,
+                           "coverage": len(values), "total": total, "top_stock": leader})
+        else:
+            values = [r["pattern_score"] for r in member_rows if r.get("pattern_score") is not None]
+            if len(values) < max(3, math.ceil(total * 0.4)):
+                continue
+            leader = max((r for r in member_rows if r.get("pattern_score") is not None), key=lambda r: r["pattern_score"], default={})
+            scored.append({"name": group.get("name", code), "score": _median(values),
+                           "pattern_score": _median(values), "strong_ratio": sum(v >= 75 for v in values) / len(values) * 100,
+                           "coverage": len(values), "total": total, "top_stock": leader})
+    scored.sort(key=lambda r: (-float(r.get("score") or 0), r["name"]))
+    for idx, row in enumerate(scored[:limit], 1):
+        row["rank"] = idx
+    return scored[:limit]
+
 
 def _market_radar_answer(mode: str) -> Dict[str, Any]:
+    """盤中優先即時雷達；盤後/即時雷達無資料時改用最新收盤快取。"""
+    radar: Dict[str, Any] = {}
+    rows: List[Dict[str, Any]] = []
     try:
         radar = cmoney_catalog.get_live_radar()
-    except Exception as exc:
-        return {"text": f"盤中族群雷達暫時無法取得（{type(exc).__name__}），個別族群與個股查詢仍可使用。", "calls": 0, "cacheable": False}
-    rows = list(radar.get("rows") or [])
-    if not rows:
-        return {"text": "目前沒有可用的盤中族群排行資料。", "calls": 0, "cacheable": False}
-    if mode == "market_momentum":
+        rows = list(radar.get("rows") or [])
+    except Exception:
+        rows = []
+    now = tools.taipei_now()
+    minutes = now.hour * 60 + now.minute
+    in_session = now.weekday() < 5 and 9 * 60 <= minutes <= 13 * 60 + 30
+    if mode == "market_momentum" and rows and in_session:
         top = rows[:10]
-        lines = ["**目前族群強勢排行｜盤中雷達**"]
+        lines = ["**目前族群強勢排行｜盤中**"]
         lines += [f"{i}. {r['name']}｜{r['change_pct']:+.2f}%" for i, r in enumerate(top, 1)]
         lines += [f"資料時間：{radar.get('updated_at','')}", "※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。"]
         return {"text": "\n".join(lines), "calls": 0, "cacheable": True}
-    # 全市場「型態最好」需要各族群足夠成分股的最新型態快取。先從已經累積的資料做保守比較，
-    # 不為了回答一次問題瞬間打滿 Fugle/FinMind。
-    catalog = cmoney_catalog.get_catalog()
-    scored = []
-    for code, group in (catalog.get("groups") or {}).items():
-        # 跨全市場型態排行只能讀「已經在 Persistent Volume 的名冊」，
-        # 不允許一題使用者查詢瞬間抓數百個 CMoney group page。
-        members = cmoney_catalog.get_cached_members(code)
-        if not members:
-            continue
-        values = []
-        for stock in members.get("stocks") or []:
-            cached = local_market_cache.latest_pattern_score(stock["stock_code"])
-            if cached:
-                values.append(float(cached["score"]))
-        total = len(members.get("stocks") or [])
-        if total and len(values) >= max(3, math.ceil(total * 0.5)):
-            values.sort()
-            mid = values[len(values)//2] if len(values)%2 else (values[len(values)//2-1]+values[len(values)//2])/2
-            scored.append({"name": group.get("name", code), "median": mid, "coverage": len(values), "total": total,
-                           "strong_ratio": sum(v >= 75 for v in values)/len(values)*100})
-    scored.sort(key=lambda r: (-r["median"], -r["strong_ratio"], r["name"]))
-    if not scored:
-        return {"text": "目前全族群型態快取涵蓋率還不足；系統會隨日常查詢與背景快取逐步累積，不會為了這題打滿行情 API。", "calls": 0, "cacheable": False}
-    lines = ["**目前族群型態排行｜快取涵蓋足夠的族群**", "依族群成分股型態分數中位數排序，不用單一最強股代表整個族群。"]
-    for i, row in enumerate(scored[:10], 1):
-        lines.append(f"{i}. {row['name']}｜中位型態 {row['median']:.1f}｜75分以上 {row['strong_ratio']:.0f}%｜涵蓋 {row['coverage']}/{row['total']}")
-    lines.append("※ 排名僅供研究與觀察參考；快取未達50%的族群不列入，不代表未列族群較弱。")
+
+    fallback = _post_close_market_rows(mode)
+    if not fallback:
+        return {"text": "目前族群快取涵蓋仍不足，請稍後再試；系統不會為了單一問題瞬間掃完整個市場。", "calls": 0, "cacheable": False}
+    if mode == "market_momentum":
+        lines = ["**目前族群強勢排行｜盤後/收盤版**"]
+        for r in fallback:
+            lines.append(f"{r['rank']}. {r['name']}｜中位漲幅 {r['change_pct']:+.2f}%｜上漲家數比 {r['up_ratio']:.0f}%")
+        lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
+        return {"text": "\n".join(lines), "calls": 0, "cacheable": False}
+    lines = ["**目前族群型態排行｜收盤快取版**"]
+    for r in fallback:
+        lines.append(f"{r['rank']}. {r['name']}｜中位型態 {r['pattern_score']:.1f}｜75分以上 {r['strong_ratio']:.0f}%")
+    lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False}
 
 
@@ -623,5 +663,9 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     elif not result.ok:
         text += "\n\nAI 解讀暫時無法使用，以上為程式計算結果。"
     return {"text": text, "calls": 1, "panels": [ranking_panel(data, observations)],
+            "input_tokens": int(getattr(result, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(result, "output_tokens", 0) or 0),
+            "total_tokens": int(getattr(result, "total_tokens", 0) or 0),
+            "token_source": str(getattr(result, "token_source", "none") or "none"),
             "cacheable": (data["members_complete"] and bool(accepted)
                           and data["compared_count"] + data.get("illiquid_count", 0) == data["total_count"])}

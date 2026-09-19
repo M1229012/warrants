@@ -171,7 +171,7 @@ def body_blocks(text: str) -> list[Block]:
             blocks.append(Block('heading', lines, len(lines) * 42 + 22))
             raw = heading.group(3).strip()
         if raw:
-            small = raw.startswith(('資料時間', '※', '資料來源'))
+            small = raw.startswith(('資料時間', '※', '資料來源', '⚠️', '🧡'))
             size, line_height = (23, 36) if small else (29, 45)
             lines = wrap(raw, size, CONTENT - 80)
             blocks.append(Block('note' if small else 'text', lines, len(lines) * line_height + 10))
@@ -1405,10 +1405,10 @@ def catalog_card(draw, y: float, data: dict, dry: bool) -> int:
     h = 34
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
-        text_at(draw, (px + 18, y + h), '族群清單', 32, INK, True)
+        text_at(draw, (px + 18, y + h), str(data.get('title') or '細產業名單'), 32, INK, True)
     h += 58
-    chip_h, gap_x, gap_y = 38, 10, 10
-    cols = 5
+    chip_h, gap_x, gap_y = 34, 8, 8
+    cols = 6
     col_w = (width - gap_x * (cols - 1)) / cols
     for section in data.get('sections') or []:
         items = [str(v).strip() for v in (section.get('items') or []) if str(v).strip()]
