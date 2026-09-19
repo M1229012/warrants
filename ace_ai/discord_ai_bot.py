@@ -2155,17 +2155,52 @@ class AceQueryEngine:
         return AnswerResult(text=draft + "\n\n※ 如果這版確認，可以直接說「這版確認，生成圖片」。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
-        """管理員確認草稿後：K 線＋實際權證分點流水點位＋確認文字，交給既有圖片引擎排版。"""
+        """管理員確認草稿後，沿用一般個股（3034）版型產生週精選圖片。
+
+        結構固定為：K 線＋精簡權證買賣超標註 → 型態評分（含關鍵價位＋文章提及分點動向） → 已確認週精選文字。
+        權證逐日流水只畫在 K 線，不再展開長明細表；分點範圍完全以最終文字實際提到者為準。
+        """
         with self._weekly_draft_lock:
             session = dict(self._weekly_drafts.get(context_key) or {})
         if not session:
             return AnswerResult(text="目前沒有已確認的週精選草稿。請先生成並修改文字。", route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started)
         code = session["stock_code"]
-        branches = session.get("mark_branches") or []
-        panels = self._get_chart_panels([code], {code: branches}, mark_mode="flow")
-        title = f"權證分點觀察｜週精選｜{code} {session.get('stock_name','')}"
+        name = session.get("stock_name", "")
+        candidate = session.get("candidate") or {}
+        # 最終圖片只顯示「管理員最後確認文字中實際提到」的分點。
+        # 不因其他分點金額大、勝率高或屬精選五分點而自動補入。
+        branches = weekly_pick.mentioned_branches(session.get("draft", ""), candidate)
+        if not branches:
+            self.log(f"週精選圖片：{code} 最終文字未提到候選分點，K 線不畫權證流水標記，追蹤分點區塊隱藏")
+        # branch_name 未指定時 flow 模式會自動挑 Top 分點，因此空清單時用 sentinel 強制得到 0 筆標記。
+        chart_branches = branches or ["__NO_WEEKLY_BRANCH__"]
+        panels = self._get_chart_panels([code], {code: chart_branches}, mark_mode="flow")
+
+        # 週精選候選在排名階段已取得同一套技術資料，直接沿用來建 3034 版型的型態評分卡。
+        # 「關鍵價位」照一般 3034 卡保留；「追蹤分點動向」只顯示文章提到的分點。
+        if panels:
+            tech = candidate.get("technical") or {}
+            vp = candidate.get("volume_profile") or {}
+            extras = candidate.get("technical_extras") or {}
+            chips = None
+            try:
+                chip_results = self._run_tools([ToolCall("get_sheet_stock_chips", {"stock_code": code, "days": 20})])
+                if chip_results and chip_results[0].ok:
+                    chips = chip_results[0].data
+            except Exception as exc:
+                self.log(f"週精選圖片分點評分列略過：{code}｜{type(exc).__name__}: {exc}")
+            if tech and vp:
+                try:
+                    panels[0]["scorecard"] = weekly_pick.build_pattern_scorecard(
+                        tech, vp, extras, chips, tracked_branch_names=branches
+                    )
+                except Exception as exc:
+                    self.log(f"週精選圖片型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
+
+        title = f"權證分點觀察｜週精選｜{code} {name}"
+        image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
         return AnswerResult(
-            text=session["draft"], route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
+            text=image_text, route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
             cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
         )
 

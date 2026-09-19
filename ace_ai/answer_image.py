@@ -266,7 +266,12 @@ def _mark_symbol_items() -> list[tuple[str, str, float]]:
 
 
 def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
-    """K 線卡片底部只顯示實際有資料的分點明細；無資料時整段不畫。"""
+    """K 線卡片底部的分點標註說明。
+
+    無資料時整段不畫。flow（實際買賣超點位）採 3034 版型的精簡圖例，
+    不再把逐日流水展開成長表；詳細資料留在 LOG／文字分析，避免週精選圖片被表格撐長。
+    event 模式仍保留既有事件明細表。
+    """
     if not _has_mark_section(panel):
         return 0
     marks = panel.get('marks') or {}
@@ -274,19 +279,31 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
     mode = str(marks.get('mode') or 'event')
     x0, width = MARGIN + 36, CONTENT - 72
     h = 22
-    title = '權證分點買賣超點位' if mode == 'flow' else '權證分點買賣點位'
     if not dry:
         draw.line((MARGIN + 32, top + 4, WIDTH - MARGIN - 32, top + 4), fill=LINE)
         draw.rectangle((x0, top + h + 4, x0 + 4, top + h + 28), fill=ACCENT)
-        text_at(draw, (x0 + 14, top + h), title, 24, INK, True)
-    h += 48
-    table_top = top + h
+        text_at(draw, (x0 + 14, top + h), '分點權證買賣標註', 24, INK, True)
+    h += 44
+
     if mode == 'flow':
-        row_h, head_h = 44, 38
+        # 週精選／明確詢問買賣超點位：只保留 3034 風格的簡潔圖例。
+        # 買賣日期與編號已直接標在 K 線上，不再另外展開逐日明細表。
         if not dry:
-            _draw_flow_mark_table(draw, x0, table_top, width, events, head_h, row_h)
-        h += head_h + len(events) * row_h + 18
-        return int(h)
+            sy = top + h + 7
+            sx = x0
+            half = 7
+            draw.polygon([(sx + half, sy - half), (sx, sy + half), (sx + 2 * half, sy + half)], fill=UP)
+            _draw_badge(draw, sx + 18 + MARK_BADGE_R, sy, 'N', UP)
+            draw.text((sx + 18 + 2 * MARK_BADGE_R + 10, sy), '買超', font=font(18), fill=INK, anchor='lm')
+            sx += 128
+            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
+            _draw_badge(draw, sx + 18 + MARK_BADGE_R, sy, 'N', DOWN)
+            draw.text((sx + 18 + 2 * MARK_BADGE_R + 10, sy), '賣超', font=font(18), fill=INK, anchor='lm')
+            note = '編號僅對應 K 線上的買賣超點位'
+            draw.text((x0 + 270, sy), note, font=font(18), fill=MUTED, anchor='lm')
+        return int(h + 38)
+
+    table_top = top + h
     split = len(events) > MARK_TABLE_SINGLE_MAX
     groups = [events[:math.ceil(len(events) / 2)], events[math.ceil(len(events) / 2):]] if split else [events]
     gap = 32
@@ -380,13 +397,23 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
 
 
 def mark_lanes(panel: dict) -> tuple[int, int]:
-    """（上方標籤帶, 下方標籤帶）高度：有出清／減碼才留上方，有買進才留下方，避免空白。"""
+    """（上方標籤帶, 下方標籤帶）高度。
+
+    event 模式：出清／減碼在上、買進在下。
+    flow 模式：賣超在上、買超在下。兩種模式都必須預留標記空間，
+    避免三角形與編號圓圈壓到均線數值卡或 K 棒。
+    """
     if (panel or {}).get('compact'):
         return 0, 0
     dates = {bar['date'] for bar in (panel or {}).get('bars') or []}
     events = _mark_events(panel)
-    top = any(e.get('exit_date') in dates or e.get('reduce_date') in dates for e in events if e.get('exit_date') or e.get('reduce_date'))
-    bottom = any(e.get('buy_date') in dates for e in events)
+    mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
+    if mode == 'flow':
+        top = any(e.get('action') == 'sell' and e.get('action_date') in dates for e in events)
+        bottom = any(e.get('action') == 'buy' and e.get('action_date') in dates for e in events)
+    else:
+        top = any(e.get('exit_date') in dates or e.get('reduce_date') in dates for e in events if e.get('exit_date') or e.get('reduce_date'))
+        bottom = any(e.get('buy_date') in dates for e in events)
     return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
 
 
@@ -988,17 +1015,19 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         h += 34 + 34
 
     branches = (card.get('tracked_branches') or [])[:BRANCH_MAX_ROWS]
-    period = card.get('tracked_branches_period') or ''
-    note = '回測追蹤分點（高勝率優先）' + (f'｜{period}' if period else '')
-    h += _sub_heading(draw, px, y + h, '追蹤分點動向', note, width, dry)
-    if branches:
-        if not dry:
-            _draw_branch_table(draw, px, y + h, width, branches)
-        h += TABLE_HEAD_H + len(branches) * BRANCH_ROW_H + 30
-    else:
-        if not dry:
-            text_at(draw, (px, y + h), '近 20 個交易日追蹤分點在這檔股票沒有 A～E 事件或賣出紀錄', 21, MUTED)
-        h += 34 + 30
+    show_tracked = bool(card.get('show_tracked_branches', True))
+    if show_tracked:
+        period = card.get('tracked_branches_period') or ''
+        # 不在圖片上寫「高勝率優先」等系統篩選說明；週精選只呈現文章實際提到的分點。
+        note = (f'{period}' if period else '')
+        h += _sub_heading(draw, px, y + h, '追蹤分點動向', note, width, dry)
+        if branches:
+            if not dry:
+                _draw_branch_table(draw, px, y + h, width, branches)
+            h += TABLE_HEAD_H + len(branches) * BRANCH_ROW_H + 30
+        else:
+            # 一般個股分析保留區塊高度；缺資料原因不顯示在圖片上，只由上游寫 LOG。
+            h += 16
     return int(h)
 
 

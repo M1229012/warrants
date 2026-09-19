@@ -638,6 +638,7 @@ def build_pattern_scorecard(
     chips: Optional[Dict[str, Any]] = None,
     cost_price: Optional[float] = None,
     config: Optional[WeeklyPickConfig] = None,
+    tracked_branch_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """一般問答的型態評分卡：分數規則與本週精選相同（score_pattern）；只評技術結構，不含權證籌碼、不是買賣建議。"""
     config = config or WeeklyPickConfig()
@@ -646,8 +647,17 @@ def build_pattern_scorecard(
     levels = tools.key_price_levels(tech, vp)
     close = levels["close"]
     branches = []
-    high, selected = tools.display_branch_set()
-    shown = [row for row in (chips or {}).get("branches") or [] if row.get("branch") in high | selected]
+    chip_rows = list((chips or {}).get("branches") or [])
+    if tracked_branch_names is None:
+        # 一般個股分析維持原邏輯：顯示高勝率追蹤分點與精選五分點。
+        high, selected = tools.display_branch_set()
+        shown = [row for row in chip_rows if row.get("branch") in high | selected]
+    else:
+        # 週精選最終圖片：只顯示管理員最後確認文字中「實際提到」的分點。
+        # 不因金額、勝率、精選標記自動補其他分點，避免圖文不一致。
+        wanted = list(dict.fromkeys(str(x).strip() for x in tracked_branch_names if str(x).strip()))
+        by_name = {str(row.get("branch", "")).strip(): row for row in chip_rows}
+        shown = [by_name[name] for name in wanted if name in by_name]
     for row in shown[:5]:
         events = row.get("events_recent") or []
         last = events[-1] if events else {}
@@ -680,6 +690,8 @@ def build_pattern_scorecard(
         "supports_below_close": levels["supports"],
         "tracked_branches": branches,
         "tracked_branches_period": (chips or {}).get("period_lookback", ""),
+        # 有分點資料才顯示；沒有就整段隱藏，原因只寫 Log，不在圖片補註解。
+        "show_tracked_branches": bool(branches),
         "method": "型態分數 100 分＝量區結構 25＋下方支撐 25＋均線趨勢 25＋價格位置 15＋布林 10（量區與支撐合計 50），規則與本週精選相同；只評技術結構，不含籌碼，不是買賣建議",
     }
     if cost_price:
@@ -1297,9 +1309,21 @@ SCORE_PARTS = (
 
 
 def mark_branches(stock: Dict[str, Any]) -> List[str]:
-    """K 線要標註的分點＝這檔候選實際用來評分的分點（主力＋高品質分點）。"""
+    """候選股可用的權證分點清單；正式週精選圖片仍會再依最終文章內容過濾。"""
     names = [stock["lead"]["branch"]] + [p["branch"] for p in stock.get("pairs") or []]
     return list(dict.fromkeys(names))[:4]
+
+
+def mentioned_branches(draft: str, stock: Dict[str, Any]) -> List[str]:
+    """回傳「最終週精選文字中實際提到」的候選分點，保持候選資料原順序。
+
+    週精選圖片的 K 線流水標記與「追蹤分點動向」都只能使用這份清單；
+    不會因其他分點買超更大、勝率更高或屬精選五分點而自動補入。
+    """
+    text = str(draft or "")
+    candidates = [stock.get("lead", {}).get("branch", "")] + [p.get("branch", "") for p in stock.get("pairs") or []]
+    candidates = list(dict.fromkeys(name for name in candidates if name))
+    return [name for name in candidates if name in text]
 
 
 def card_facts(stock: Dict[str, Any]) -> Dict[str, Any]:
@@ -1651,6 +1675,30 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
     code = tools.core()._normalize_stock_name_code_key(stock_code)
     stock = next((s for s in result.get("top") or [] if s.get("stock_code") == code), None)
     return stock, result
+
+
+def weekly_image_text(draft: str, stock_code: str, stock_name: str = "") -> str:
+    """週精選圖片專用文字。
+
+    Discord 草稿保留「權證分點觀察｜週精選」與 📌 股票標頭，方便直接貼文；
+    圖片上方本來就已經有週精選標題，因此圖片內移除重複的前兩行，
+    改成和一般 3034 分析圖相同的「股票名稱（代號）＋正文」結構。
+    """
+    lines = [line.rstrip() for line in str(draft or "").splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and "權證分點觀察" in lines[0] and ("週精選" in lines[0] or "周精選" in lines[0]):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    code = str(stock_code or "").strip()
+    if lines and code and code in lines[0]:
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    body = "\n".join(lines).strip()
+    label = f"{stock_name}（{code}）" if stock_name else code
+    return (label + ("\n\n" + body if body else "")).strip()
 
 
 def generate_weekly_draft(
