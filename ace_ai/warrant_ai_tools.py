@@ -3292,12 +3292,14 @@ def chart_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 # ============================================================
 
 def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]:
-    """現價上下方的關鍵價位（均線、兩大量區上下緣、布林三軌），附距現價 %；全部來自既有計算結果。
+    """現價上下方的關鍵價位（均線、附近大量區、布林三軌），附距現價 %；全部來自既有計算結果。
 
-    大量區希望在各種報告與週精選圖片中優先保留，因此：
-    1. 先把均線、兩大量區上下緣、布林上下軌全部整理成 levels。
-    2. 若大量區距現價太遠（預設超過 12%），則省略，避免干擾閱讀。
-    3. 若大量區距現價不遠，則即使不是最近 4 個支撐／3 個壓力，也會補進關鍵價位清單。
+    關鍵價位要保留大量區，但版面也要精簡，因此：
+    1. 大量區太遠（預設超過 12%）就省略。
+    2. 若股價在大量區上方，只保留該大量區「上緣」作為支撐參考。
+    3. 若股價在大量區下方，只保留該大量區「下緣」作為壓力參考。
+    4. 只有當股價落在大量區內時，才同時保留上下緣。
+    5. 量區若符合條件，即使不在最近幾個均線價位內，也會額外保留。
     """
     close = _num(tech.get("close"))
     levels: List[Dict[str, Any]] = []
@@ -3308,12 +3310,28 @@ def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]
         if price is not None and price > 0:
             levels.append({"label": label, "price": price, "source": source})
 
+    def add_zone(label: str, low: Any, high: Any) -> None:
+        low_p = _num(low)
+        high_p = _num(high)
+        if low_p is None or high_p is None or low_p <= 0 or high_p <= 0:
+            return
+        # 沒有 close 時保守保留兩端；有 close 時依相對位置精簡。
+        if close is None:
+            add(f"{label}下緣", low_p, "volume_zone")
+            add(f"{label}上緣", high_p, "volume_zone")
+        elif close > high_p:
+            add(f"{label}上緣", high_p, "volume_zone")
+        elif close < low_p:
+            add(f"{label}下緣", low_p, "volume_zone")
+        else:
+            add(f"{label}下緣", low_p, "volume_zone")
+            add(f"{label}上緣", high_p, "volume_zone")
+
     for key, info in (tech.get("moving_averages") or {}).items():
         add(key, (info or {}).get("value"), "ma")
     for key, label in (("maximum_volume_zone", "最大量區"), ("second_volume_zone", "第二大量區")):
         zone = vp.get(key) or {}
-        add(f"{label}下緣", zone.get("price_low"), "volume_zone")
-        add(f"{label}上緣", zone.get("price_high"), "volume_zone")
+        add_zone(label, zone.get("price_low"), zone.get("price_high"))
     bb = tech.get("bollinger") or {}
     add("布林上軌", bb.get("upper"), "bollinger")
     add("布林下軌", bb.get("lower"), "bollinger")  # 布林中軌就是 MA20，不重複列
@@ -3342,8 +3360,8 @@ def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]
 
     supports_pool = [lv for lv in levels if close is not None and lv["price"] <= close and _keep_volume_zone(lv)]
     resistances_pool = [lv for lv in levels if close is not None and lv["price"] > close and _keep_volume_zone(lv)]
-    supports = _finalize(supports_pool, support=True, base_limit=4)
-    resistances = _finalize(resistances_pool, support=False, base_limit=3)
+    supports = _finalize(supports_pool, support=True, base_limit=3)
+    resistances = _finalize(resistances_pool, support=False, base_limit=2)
     return {"close": close, "levels": levels, "supports": supports, "resistances": resistances,
             "zone_keep_pct": zone_keep_pct}
 

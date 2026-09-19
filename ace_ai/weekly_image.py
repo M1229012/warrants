@@ -38,7 +38,7 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
     cards = list(weekly.get("cards") or [])[:10]
     meta = weekly.get("meta") or {}
     top = 124
-    title_h = 84
+    title_h = 114
     table_y = top + title_h + 24
     table_h = HEAD_H + max(1, len(cards)) * ROW_H
     footer_h = 105
@@ -51,6 +51,7 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
     text_at(draw, (MARGIN, top), "近 60 個交易日仍有權證大戶部位的候選股，所有分點採相同規則評分。", 22, MUTED)
     text_at(draw, (MARGIN, top + 34), "技術 50＝一般個股型態評分 100 × 0.5；週精選不使用第二套技術評分。", 20, MUTED)
     text_at(draw, (MARGIN, top + 64), "★＝精選五分點（僅標記、不加分）", 20, MUTED)
+    text_at(draw, (MARGIN, top + 94), "※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。", 18, MUTED)
 
     x0, x1 = MARGIN, WIDTH - MARGIN
     draw.rounded_rectangle((x0, table_y, x1, table_y + table_h), radius=18, fill="white", outline=LINE)

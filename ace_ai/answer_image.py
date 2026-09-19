@@ -731,7 +731,7 @@ GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '中性偏多': ('#F1F8F5', 
                '中性偏弱': ('#FEF8F0', WARN_INK), '結構偏弱': (WARN_BG, WARN_INK)}
 LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
 LEVEL_ROW_H = 38
-LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 2, 3, 4, 3
+LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 1, 2, 4, 3
 SCORE_ROW_H = 30
 BRANCH_ROW_H = 38
 
@@ -1019,7 +1019,7 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)
-    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、附近大量區上下緣、布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）', width, dry)
+    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、附近大量區與布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）', width, dry)
     if levels:
         if not dry:
             _draw_level_table(draw, px, y + h, width, levels, card)
@@ -1336,9 +1336,10 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     else:
         stamp = f"{_sector_date(data.get('comparison_date'))} 收盤" if data.get('comparison_date') else ''
         stamp_bg, stamp_ink = TILE_BG, MUTED
-    subtitle = ('依型態分數排序｜滿分 100，只評技術結構，不是買賣建議' if technical
+    subtitle = ('依型態分數排序｜滿分 100，只評技術結構' if technical
                 else '依最新漲跌幅排序｜漲幅領先不代表型態最好')
     liquidity = str(data.get('liquidity_note') or '')
+    disclaimer = '※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。'
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
         text_at(draw, (px + 18, y + h), title, 32, INK, True)
@@ -1347,9 +1348,12 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
         text_at(draw, (px, y + h + 56), subtitle, 20, MUTED)
+        next_y = y + h + 86
         if liquidity:
-            text_at(draw, (px, y + h + 86), liquidity, 20, MUTED)
-    h += 56 + 46 + (30 if liquidity else 0)
+            text_at(draw, (px, next_y), liquidity, 20, MUTED)
+            next_y += 30
+        text_at(draw, (px, next_y), disclaimer, 18, MUTED)
+    h += 56 + 46 + (30 if liquidity else 0) + 30
     if not rows:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)
