@@ -3232,6 +3232,8 @@ def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
 
 
 CHIPS_DAYS = max(5, _env_int("DISCORD_AI_CHIPS_DAYS", 70))          # 和 K 線圖一樣看近 70 個交易日
+# K 線上的賣出標記門檻：低於這個金額的減碼／零星賣出不畫（事件出清不受限制，再小也要標）。
+MIN_SELL_MARK_AMOUNT = max(0.0, _env_float("DISCORD_AI_CHART_MIN_SELL_AMOUNT", 200_000.0))
 
 
 def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days: int = CHIPS_DAYS) -> Dict[str, Any]:
@@ -3615,10 +3617,16 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 
     marks: List[Dict[str, Any]] = []
     paired_sells: set = set()
-    ordered = rows.sort_values(["event_date", "branch"])
-    for no, row in enumerate(ordered.itertuples(), 1):
+    ordered = list(rows.sort_values(["event_date", "branch"]).itertuples())
+    # 編號只用在「買進 → 出清」這種成對的事件；還沒出清（只有減碼或仍持有）就不給數字。
+    numbering: Dict[int, int] = {}
+    for row in ordered:
+        if in_chart(getattr(row, "exit_date", None)):
+            numbering[id(row)] = len(numbering) + 1
+    for row in ordered:
         branch = str(row.branch)
         event_code = str(getattr(row, "event_code", "") or "")
+        no = numbering.get(id(row), "")
         buy_day = in_chart(row.event_date)
         if buy_day:
             amount = float(getattr(row, "buy_amount", 0.0) or 0.0)
@@ -3631,6 +3639,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
             key = (branch, pd.Timestamp(exit_date).normalize())
             amount = sell_amounts.get(key, 0.0)
             paired_sells.add(key)
+            # 出清一定標，金額再小也要畫（「那 20 萬賣完就出清」）。
             marks.append({"no": no, "branch": branch, "event_codes": event_code, "kind": "event_exit",
                           "action": "sell", "action_text": "事件出清", "action_date": exit_day,
                           "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount) if amount else ""})
@@ -3640,15 +3649,15 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
             key = (branch, pd.Timestamp(reduce_date).normalize())
             amount = sell_amounts.get(key, 0.0)
             paired_sells.add(key)
-            # 減碼不是事件出清 → 不給編號
-            marks.append({"no": "", "branch": branch, "event_codes": event_code, "kind": "reduce",
-                          "action": "sell", "action_text": "減碼", "action_date": reduce_day,
-                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount) if amount else ""})
+            # 減碼不是出清 → 不給編號；金額太小的也不畫，避免圖面被零股級賣單塞滿。
+            if amount >= MIN_SELL_MARK_AMOUNT:
+                marks.append({"no": "", "branch": branch, "event_codes": event_code, "kind": "reduce",
+                              "action": "sell", "action_text": "減碼", "action_date": reduce_day,
+                              "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
 
     known_branches = {str(b) for b in rows["branch"].unique()} if not rows.empty else set()
-    min_abs = max(0.0, _env_float("CHART_FLOW_MIN_ABS_AMOUNT", 100_000.0))
     for (branch, day), amount in sorted(sell_amounts.items(), key=lambda item: -item[1]):
-        if (branch, day) in paired_sells or amount < min_abs:
+        if (branch, day) in paired_sells or amount < MIN_SELL_MARK_AMOUNT:
             continue
         if targets and branch not in targets:
             continue

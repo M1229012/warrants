@@ -309,11 +309,13 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             buys = [e for e in items if e.get('action') == 'buy']
             exits = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) != '']
             plain = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) == '']
+            holding = [e for e in buys if str(e.get('no', '')) == '']
             detail = "　".join(x for x in (
                 f"事件買進 {len(buys)} 筆" if buys else "",
-                f"事件出清 {len(exits)} 筆" if exits else "",
-                f"減碼／零星賣出 {len(plain)} 筆" if plain else "") if x)
-            prefix = "編號 " + "、".join(str(n) for n in numbered) if numbered else "無事件編號"
+                f"已出清 {len(exits)} 筆" if exits else "",
+                f"未出清 {len(holding)} 筆" if holding else "",
+                f"減碼 {len(plain)} 筆" if plain else "") if x)
+            prefix = "編號 " + "、".join(str(n) for n in numbered) if numbered else "本期無已出清事件"
             rows.append((name, color, f"{prefix}｜{detail}" if detail else prefix))
         if not dry:
             sy = top + h + 7
@@ -323,7 +325,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             sx = x0 + 110
             draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            draw.text((x0 + 232, sy), '編號＝A～E 事件（出清與買進同號）；無編號＝減碼或零星賣出',
+            draw.text((x0 + 232, sy), '編號＝已出清的事件（買進與出清同號）；無編號＝尚未出清或減碼',
                       font=font(18), fill=MUTED, anchor='lm')
             ly = sy + 30
             for name, color, detail in rows:
