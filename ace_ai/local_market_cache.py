@@ -13,11 +13,11 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
-KEEP_DAYS = max(70, int(os.getenv("DISCORD_AI_PATTERN_HISTORY_DAYS", "70") or 70))
+KEEP_DAYS = max(70, int(os.getenv("DISCORD_AI_PATTERN_HISTORY_DAYS", "150") or 150))
 DEFAULT_PATH = "/data/ace_ai_market_cache.sqlite3" if Path("/data").exists() else str(Path(__file__).parent / ".cache" / "ace_ai_market_cache.sqlite3")
 DB_PATH = Path(os.getenv("DISCORD_AI_MARKET_CACHE_DB", DEFAULT_PATH))
 _LOCK = threading.RLock()
@@ -53,6 +53,14 @@ def _connect() -> sqlite3.Connection:
                         PRIMARY KEY (stock_code, date)
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS kv (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_code_date ON daily_bars(stock_code, date DESC)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_scores_code_date ON pattern_scores(stock_code, date DESC)")
                 conn.commit()
@@ -190,14 +198,199 @@ def latest_pattern_score(stock_code: str) -> Optional[Dict[str, Any]]:
     return {"date": row[0], "score": row[1], "grade": row[2], "basis": row[3], "components": components}
 
 
+def save_market_day(rows: Iterable[Dict[str, Any]], date: str, source: str = "") -> int:
+    """整個市場某一天的收盤一次寫入（證交所／櫃買每日行情）。回傳實際寫入筆數。"""
+    day = str(date).strip()
+    if not day:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for row in rows:
+        try:
+            code = str(row["stock_code"]).strip()
+            values = [float(row[k]) for k in ("open", "high", "low", "close")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not code or any(v <= 0 for v in values):
+            continue
+        try:
+            volume = float(row.get("volume") or 0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        payload.append((code, day, *values, volume, str(row.get("market") or ""), source, 1, now))
+    if not payload:
+        return 0
+    with _LOCK:
+        with _db() as conn:
+            conn.executemany("""
+                INSERT INTO daily_bars(stock_code,date,open,high,low,close,volume,market,source,confirmed,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(stock_code,date) DO UPDATE SET
+                  open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
+                  volume=excluded.volume,
+                  market=CASE WHEN excluded.market<>'' THEN excluded.market ELSE daily_bars.market END,
+                  source=excluded.source, confirmed=1, updated_at=excluded.updated_at
+            """, payload)
+            conn.commit()
+    return len(payload)
+
+
+def trim_history(keep_days: int = KEEP_DAYS) -> int:
+    """只留最近 keep_days 個交易日（全市場共用同一批日期），避免 SQLite 無限長大。"""
+    with _LOCK:
+        with _db() as conn:
+            row = conn.execute("SELECT date FROM daily_bars GROUP BY date ORDER BY date DESC LIMIT 1 OFFSET ?",
+                               (max(1, int(keep_days)) - 1,)).fetchone()
+            if not row:
+                return 0
+            cursor = conn.execute("DELETE FROM daily_bars WHERE date<?", (row[0],))
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
+
+def known_dates(limit: int = 400) -> List[str]:
+    """已存在的交易日（新到舊）。"""
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute("SELECT date FROM daily_bars GROUP BY date ORDER BY date DESC LIMIT ?",
+                                    (int(limit),)).fetchall()
+        return [str(r[0]) for r in rows]
+    except Exception:
+        return []
+
+
+def codes_with_history(min_rows: int = 69) -> List[str]:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute("SELECT stock_code FROM daily_bars GROUP BY stock_code HAVING COUNT(*)>=? ORDER BY stock_code",
+                                    (int(min_rows),)).fetchall()
+        return [str(r[0]) for r in rows]
+    except Exception:
+        return []
+
+
+def latest_changes(codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """每檔最新兩根收盤 → 收盤價與漲跌幅（純本地，不打任何 API）。"""
+    wanted = [str(c).strip() for c in codes if str(c).strip()]
+    if not wanted:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        with _LOCK:
+            with _db() as conn:
+                for chunk_start in range(0, len(wanted), 400):
+                    chunk = wanted[chunk_start:chunk_start + 400]
+                    marks = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"""SELECT stock_code, date, close, volume FROM daily_bars
+                            WHERE stock_code IN ({marks}) AND confirmed=1
+                            ORDER BY stock_code, date DESC""", chunk).fetchall()
+                    grouped: Dict[str, List[Any]] = {}
+                    for code, date, close, volume in rows:
+                        bucket = grouped.setdefault(str(code), [])
+                        if len(bucket) < 2:
+                            bucket.append((str(date), float(close), float(volume or 0)))
+                    for code, bucket in grouped.items():
+                        if len(bucket) < 2 or not bucket[1][1]:
+                            continue
+                        out[code] = {"date": bucket[0][0], "close": bucket[0][1],
+                                     "change_pct": (bucket[0][1] / bucket[1][1] - 1) * 100,
+                                     "volume": bucket[0][2]}
+    except Exception:
+        return out
+    return out
+
+
+def pattern_scores_for(codes: Iterable[str], max_age_days: int = 5) -> Dict[str, Dict[str, Any]]:
+    """多檔最新型態分數（只讀本地）。"""
+    wanted = [str(c).strip() for c in codes if str(c).strip()]
+    if not wanted:
+        return {}
+    cutoff = (pd.Timestamp.now(tz="Asia/Taipei").tz_localize(None).normalize()
+              - pd.Timedelta(days=max(1, int(max_age_days)))).strftime("%Y-%m-%d")
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        with _LOCK:
+            with _db() as conn:
+                for chunk_start in range(0, len(wanted), 400):
+                    chunk = wanted[chunk_start:chunk_start + 400]
+                    marks = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"""SELECT stock_code, date, score, grade FROM pattern_scores
+                            WHERE stock_code IN ({marks}) AND date>=? ORDER BY stock_code, date DESC""",
+                        chunk + [cutoff]).fetchall()
+                    for code, date, score, grade in rows:
+                        out.setdefault(str(code), {"date": str(date), "score": float(score), "grade": str(grade or "")})
+    except Exception:
+        return out
+    return out
+
+
+def liquidity_map(days: int = 20) -> Dict[str, Dict[str, float]]:
+    """近 N 個交易日的平均成交量（張）與平均成交金額（元）；一次 SQL 算完全市場。"""
+    dates = known_dates(limit=max(1, int(days)))
+    if not dates:
+        return {}
+    marks = ",".join("?" * len(dates))
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute(
+                    f"""SELECT stock_code, AVG(volume)/1000.0, AVG(volume*close), COUNT(*)
+                        FROM daily_bars WHERE date IN ({marks}) GROUP BY stock_code""", dates).fetchall()
+    except Exception:
+        return {}
+    return {str(code): {"avg_lots": float(lots or 0), "avg_value": float(value or 0), "days": int(count or 0)}
+            for code, lots, value, count in rows}
+
+
+def get_state(key: str, default: Any = None) -> Any:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
+        return json.loads(row[0]) if row else default
+    except Exception:
+        return default
+
+
+def set_state(key: str, value: Any) -> None:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                conn.execute("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                             (str(key), json.dumps(value, ensure_ascii=False, default=str),
+                              datetime.now(timezone.utc).isoformat()))
+                conn.commit()
+    except Exception:
+        return
+
+
+def delete_state(key: str) -> None:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                conn.execute("DELETE FROM kv WHERE key=?", (str(key),))
+                conn.commit()
+    except Exception:
+        return
+
+
 def stats() -> Dict[str, Any]:
     try:
         with _LOCK:
             with _db() as conn:
                 bars = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
                 stocks = conn.execute("SELECT COUNT(DISTINCT stock_code) FROM daily_bars").fetchone()[0]
-                scores = conn.execute("SELECT COUNT(*) FROM pattern_scores").fetchone()[0]
+                scores = conn.execute("SELECT COUNT(DISTINCT stock_code) FROM pattern_scores").fetchone()[0]
+                days = conn.execute("SELECT COUNT(DISTINCT date) FROM daily_bars").fetchone()[0]
+                last_day = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
         size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
-        return {"bars": bars, "stocks": stocks, "scores": scores, "bytes": size, "path": str(DB_PATH)}
+        return {"bars": bars, "stocks": stocks, "scores": scores, "days": days, "last_day": last_day,
+                "bytes": size, "path": str(DB_PATH), "persistent": str(DB_PATH).startswith("/data")}
     except Exception:
-        return {"bars": 0, "stocks": 0, "scores": 0, "bytes": 0, "path": str(DB_PATH)}
+        return {"bars": 0, "stocks": 0, "scores": 0, "days": 0, "last_day": "", "bytes": 0,
+                "path": str(DB_PATH), "persistent": str(DB_PATH).startswith("/data")}

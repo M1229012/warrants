@@ -1636,6 +1636,16 @@ class WeeklyPickAnswer:
     notice: str = ""
 
 
+def rank_cache_key(config: "WeeklyPickConfig", filters: "WeeklyPickFilters") -> str:
+    """排名快取鍵值：事件表與勝率統計沒更新、條件相同時，草稿與排名共用同一份結果。"""
+    bundle = tools.load_abcde_event_rows()
+    perf = tools.read_branch_event_performance()
+    return "|".join([
+        "weekly_pick_rank_v8", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
+        filters.signature(), str(config.event_window_trading_days), str(config.top_n),
+    ])
+
+
 def run_weekly_pick(
     question: str,
     generate: Callable[..., Any],
@@ -1652,12 +1662,7 @@ def run_weekly_pick(
     if filters.refresh:
         _clear_tool_caches()
         stage_log("refresh：清除事件表、勝率統計與本週精選快取")
-    bundle = tools.load_abcde_event_rows()
-    perf = tools.read_branch_event_performance()
-    cache_key = "|".join([
-        "weekly_pick_rank_v8", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
-        filters.signature(), str(config.event_window_trading_days), str(config.top_n),
-    ])
+    cache_key = rank_cache_key(config, filters)
     cached = None if filters.refresh else _load_cache(config, cache_key)
     if cached and cached.get("result"):
         result = cached["result"]
@@ -1728,6 +1733,46 @@ WEEKLY_DRAFT_SYSTEM_PROMPT = """你是「權證分點觀察｜週精選」文字
 只輸出 JSON：{"draft":"完整草稿"}。"""
 
 
+WEEKLY_REVISION_SCHEMA = {
+    "type": "object",
+    "properties": {"draft": {"type": "string"}, "changed": {"type": "string"}},
+    "required": ["draft"],
+}
+
+WEEKLY_REVISION_SYSTEM_PROMPT = """你是「權證分點觀察｜週精選」文字編輯。現在是**修改既有草稿**，不是重寫一篇新文章。
+
+最重要的三條：
+1. 以 current_draft 為準，**沒有被指示到的句子必須一字不改**照抄回來（包含開頭兩行、結尾兩行、標點與換行）。
+2. instruction 說什麼就改什麼，而且一定要真的改到；例如「不要提到均線」就把均線那句整句刪掉、「短一點」就刪掉次要句子、「補上某分點的勝率」就從 fact_data 找該分點的數字寫進去。
+3. 數字只能來自 fact_data 或 admin_notes；找不到資料就在 changed 說明「資料沒有這項」，不要自己編，也不要改動其他數字。
+
+其他規則：
+- 不要因為這次修改就把文章改回制式模板、也不要重新排列段落順序。
+- 不新增 instruction 沒要求的內容；不寫目標價、不保證漲跌。
+- 結尾固定保留：⚠️ 僅為個人投資筆記 / 🧡 非任何買賣建議。
+
+輸出 JSON：{"draft":"修改後的完整文章","changed":"一句話說明這次改了什麼"}。"""
+
+
+def build_weekly_revision_prompt(candidate: Dict[str, Any], previous_draft: str, instruction: str,
+                                 admin_notes: Optional[List[str]] = None, strict: bool = False) -> Tuple[str, Dict[str, Any]]:
+    """修改既有草稿用：不送風格範例（前一版本身就是風格），只送事實與指令，token 約為重寫的三分之一。"""
+    facts = candidate_payload(candidate)
+    notes = [str(x).strip() for x in (admin_notes or []) if str(x).strip()]
+    payload = {
+        "current_draft": str(previous_draft or "").strip(),
+        "instruction": str(instruction or "").strip(),
+        "admin_notes": notes,
+        "fact_data": tools_prune(facts),
+    }
+    extra = ("\n\n上一次的修改因為出現對不上原始資料的數字而被退回，"
+             "這次除了 instruction 指定的地方以外，其他數字請原封不動照抄 current_draft。") if strict else ""
+    prompt = (WEEKLY_REVISION_SYSTEM_PROMPT + extra + "\n\ninput_data（JSON）：\n"
+              + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return prompt, {"fact_data": facts, "admin_notes": notes, "instruction": str(instruction or "").strip(),
+                    "previous_draft": str(previous_draft or "").strip()}
+
+
 def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", previous_draft: str = "", admin_notes: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
     facts = candidate_payload(candidate)
     style = load_weekly_style_examples()
@@ -1749,9 +1794,20 @@ def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", 
 
 
 def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, config: Optional[WeeklyPickConfig] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """依目前 Top10 規則找指定股票；只允許對當期排名候選生成正式週精選草稿。"""
+    """依目前 Top10 規則找指定股票；只允許對當期排名候選生成正式週精選草稿。
+
+    排名很貴（近百檔完整評分），所以先吃當期快取；快取沒有才重算。
+    """
     config = config or WeeklyPickConfig()
-    result = WeeklyPickEngine(config, log).run(WeeklyPickFilters())
+    filters = WeeklyPickFilters()
+    cache_key = rank_cache_key(config, filters)
+    cached = _load_cache(config, cache_key)
+    result = (cached or {}).get("result") if isinstance(cached, dict) else None
+    if not isinstance(result, dict) or not result.get("top"):
+        result = WeeklyPickEngine(config, log).run(filters)
+        _save_cache(config, cache_key, {"result": result, "ai_ok": True})
+    else:
+        log("週精選草稿：沿用當期排名快取，未重新計算")
     code = tools.core()._normalize_stock_name_code_key(stock_code)
     stock = next((s for s in result.get("top") or [] if s.get("stock_code") == code), None)
     return stock, result
@@ -1861,20 +1917,43 @@ def is_weekly_revision_question(text: str) -> bool:
     return any(k in compact for k in _WEEKLY_REVISION_WORDS)
 
 
-def is_weekly_session_followup(text: str, current_stock_code: str = "") -> bool:
-    """已有週精選草稿時，辨識「不用再重打股號」的修改追問。
+# 草稿編輯中，出現這些字通常代表「使用者換題目了」……
+_OTHER_TOPIC_PATTERNS = (
+    "族群", "類股", "概念股", "排行", "排名", "本週精選", "本周精選", "精選股票", "精選個股",
+    "勝率", "分點", "新聞", "股價多少", "收盤價", "有哪些", "誰最強", "誰型態", "怎麼用", "使用說明",
+    "系統狀態", "更新名冊", "更新底庫",
+)
+# ……但同一句若帶有修改語氣（「把新光的勝率補上」），仍然是在改這篇草稿。
+_EDIT_CUE_PATTERNS = (
+    "改", "修", "短", "長", "刪", "拿掉", "去掉", "省略", "補", "加", "寫", "強調", "不要", "不用", "別",
+    "換", "口語", "語氣", "段", "句", "標題", "開頭", "結尾", "重寫", "重整", "順", "簡單", "詳細",
+    "這版", "上一版", "多一點", "少一點", "也要", "再",
+)
 
-    只有明顯帶修改語氣才接週精選；單純問「新光勝率多少」仍保留一般問答路由。
+
+_QUANTITY_AFTER_NUMBER = re.compile(r"(?<!\d)([1-9]\d{3})(?=\s*(?:張|股|元|塊|萬|億|％|%|點|筆|口|人))")
+
+
+def _code_in_edit_text(text: str) -> str:
+    """改稿句子裡的 4 位數：後面接張／元／萬等單位的是數量，不是股票代號。"""
+    return extract_stock_code(_QUANTITY_AFTER_NUMBER.sub(" ", str(text or "")))
+
+
+def is_weekly_session_followup(text: str, current_stock_code: str = "") -> bool:
+    """已有週精選草稿時，**預設把訊息當成改稿指令**；只有明顯是別的題目才放行給一般問答。
+
+    舊版用關鍵字白名單判斷「這句是不是在改稿」，像「不要提到均線」「這樣太長了」「換個說法」
+    都會漏接，草稿完全沒被修改，使用者會以為 Bot 不理人。
     """
     compact = re.sub(r"\s+", "", str(text or ""))
-    code = extract_stock_code(compact)
-    if code and current_stock_code and code != str(current_stock_code):
+    if not compact:
         return False
-    if is_weekly_revision_question(compact):
-        return True
-    has_field = any(k in compact for k in _WEEKLY_EDIT_FIELDS)
-    edit_cue = any(k in compact for k in ("也", "再", "幫我", "請把", "把", "要寫", "要加", "多寫", "少寫"))
-    return has_field and edit_cue
+    code = _code_in_edit_text(compact)
+    if code and current_stock_code and code != str(current_stock_code):
+        return False          # 明確問另一檔股票
+    if any(k in compact for k in _OTHER_TOPIC_PATTERNS) and not any(k in compact for k in _EDIT_CUE_PATTERNS):
+        return False          # 換成族群／分點／排名等其他功能（沒有任何修改語氣）
+    return True
 
 
 def is_admin_moneydj_image_question(text: str) -> bool:

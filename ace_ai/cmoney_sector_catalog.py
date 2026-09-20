@@ -70,7 +70,9 @@ def _get(url: str) -> str:
         response = session.get(url, headers={"User-Agent": "Mozilla/5.0 AceAI/1.0", "Accept": "text/html,application/xhtml+xml"}, timeout=(4, TIMEOUT))
         status = int(response.status_code)
         response.raise_for_status()
-        response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+        # CMoney 頁面一律 UTF-8；apparent_encoding 在部分環境會猜成 cp1252，族群名稱就會變亂碼。
+        declared = (response.headers.get("Content-Type") or "").lower()
+        response.encoding = "utf-8" if "charset=" not in declared else response.encoding
         return response.text
     finally:
         try:

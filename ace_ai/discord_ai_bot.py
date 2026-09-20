@@ -39,6 +39,9 @@ import weekly_pick
 import answer_image
 import weekly_image
 import sector_analysis
+import market_data
+import market_scan
+import sector_roster
 import local_market_cache
 from weekly_pick import is_weekly_pick_question
 
@@ -1891,6 +1894,8 @@ class AnswerResult:
 # ============================================================
 
 MEMORY_MINUTES = tools._env_int("DISCORD_AI_MEMORY_MINUTES", 30)
+# 週精選草稿編輯 session 比一般追問長很多：管理員常常改一改、去看盤、再回來改。
+WEEKLY_DRAFT_MINUTES = max(10, tools._env_int("DISCORD_AI_WEEKLY_DRAFT_MINUTES", 120))
 MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 _FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
@@ -2026,8 +2031,7 @@ class AceQueryEngine:
         compact = re.sub(r"\s+", "", question)
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
-            with self._weekly_draft_lock:
-                self._weekly_drafts.pop(context_key, None)
+            self._clear_draft_session(context_key)
             return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
         # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
         if weekly_pick.is_admin_moneydj_image_question(question):
@@ -2040,13 +2044,24 @@ class AceQueryEngine:
         if weekly_pick.is_weekly_draft_question(question):
             with self._weekly_lock:
                 return self._answer_weekly_draft(question, context_key, started)
-        with self._weekly_draft_lock:
-            draft_session = self._weekly_drafts.get(context_key)
-            if draft_session and time.time() - float(draft_session.get("updated_at", 0) or 0) > MEMORY_MINUTES * 60:
-                self._weekly_drafts.pop(context_key, None)
-                draft_session = None
+        if is_admin:
+            admin_reply = self._answer_admin_command(question, started)
+            if admin_reply is not None:
+                return admin_reply
+        draft_session = self._load_draft_session(context_key)
+        if draft_session and time.time() - float(draft_session.get("updated_at", 0) or 0) > WEEKLY_DRAFT_MINUTES * 60:
+            self._clear_draft_session(context_key)
+            draft_session = {}
         if draft_session and weekly_pick.is_weekly_image_question(question):
             return self._answer_weekly_article_image(context_key, started)
+        if draft_session and re.sub(r"\s+", "", question) in ("還原上一版", "回到上一版", "復原上一版", "undo"):
+            previous = str(draft_session.get("previous_draft") or "")
+            if not previous:
+                return AnswerResult(text="沒有可還原的上一版草稿。", route="weekly_draft_revision", gemini_calls=0, elapsed=time.perf_counter()-started)
+            draft_session.update(draft=previous, previous_draft="", updated_at=time.time())
+            self._save_draft_session(context_key, draft_session)
+            return AnswerResult(text=previous + "\n\n※ 已還原上一版。", route="weekly_draft_revision", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False)
         if draft_session and weekly_pick.is_weekly_session_followup(question, draft_session.get("stock_code", "")):
             return self._answer_weekly_revision(question, context_key, started)
         if is_weekly_pick_question(question):
@@ -2167,6 +2182,39 @@ class AceQueryEngine:
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
+    def _answer_admin_command(self, question: str, started: float) -> Optional[AnswerResult]:
+        """管理員維護指令：更新市場底庫／更新族群名冊／系統狀態。找不到對應指令時回 None。"""
+        compact = re.sub(r"\s+", "", question)
+        if compact in ("系統狀態", "狀態", "底庫狀態", "資料狀態"):
+            info = market_scan.status()
+            lines = [
+                "**系統狀態**",
+                f"族群名冊：{info['roster_groups']} 類｜建立於 {info['roster_built_at'] or '尚未建立'}",
+                f"日K底庫：{info['bars_stocks']:,} 檔 × {info['bars_days']} 日｜最新 {info['last_day'] or '-'}",
+                f"型態分數：{info['scored_stocks']:,} 檔｜{(info['score_scan'] or {}).get('at', '尚未計算')}",
+                f"永久磁碟：{'已掛載 /data' if info['persistent'] else '未掛載（重新部署會清空）'}",
+            ]
+            return AnswerResult(text="\n".join(lines), route="admin_status", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("更新市場底庫", "重建市場底庫", "更新底庫"):
+            def job() -> None:
+                result = market_data.sync(log=self.log)
+                self.log(f"市場底庫更新完成：{result}")
+                market_scan.score_pending(log=self.log)
+            threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
+            return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
+                                route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("更新族群名冊", "重建族群名冊", "更新名冊"):
+            def job() -> None:
+                try:
+                    sector_roster.build(log=self.log)
+                except Exception as exc:
+                    self.log(f"族群名冊建立失敗：{type(exc).__name__}: {exc}")
+            threading.Thread(target=job, name="ace-roster-build", daemon=True).start()
+            return AnswerResult(text="已開始在背景重建族群名冊（掃描全市場約 10～20 分鐘）。完成後可用「系統狀態」查看。",
+                                route="admin_roster_build", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        return None
+
     def _answer_weekly_draft(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：從 Top10 選一檔，先產生可人工修改的週精選純文字。"""
         stats = AnswerStats()
@@ -2191,50 +2239,115 @@ class AceQueryEngine:
             "mark_branches": data.get("mark_branches") or [],
             "admin_notes": [], "updated_at": time.time(),
         }
-        with self._weekly_draft_lock:
-            self._weekly_drafts[context_key] = session
+        self._save_draft_session(context_key, session)
         text = data["draft"] + "\n\n※ 這是草稿。你可以直接說「權證部分短一點／大量區再強調／不要寫某段」；確認後再說「這版確認，生成圖片」。"
         return AnswerResult(text=text, route="weekly_draft", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
                             total_tokens=stats.total_tokens, token_source=stats.token_source)
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
-        """管理員：延續同一檔週精選草稿做文字修改。"""
-        with self._weekly_draft_lock:
-            session = dict(self._weekly_drafts.get(context_key) or {})
+        """管理員：延續同一檔週精選草稿做文字修改。
+
+        修訂用專屬 prompt（前一版擺最前面、未指示處逐字保留），不再重送風格範例；
+        數字核對沒過時先重試一次，再不行才只刪有問題的句子，不整篇丟掉修改。
+        """
+        session = self._load_draft_session(context_key, with_candidate=True)
         if not session:
             return AnswerResult(text="目前沒有正在編輯的週精選草稿。請先輸入「股票代號＋幫我生成週精選文字」。", route="weekly_draft_revision", gemini_calls=0, elapsed=time.perf_counter()-started)
         stats = AnswerStats()
-        # 週精選是管理員限定：若管理員手動補充外資／法人／現股籌碼等事實，也保留在本篇 session，
-        # 讓後續修改能自然融入，而不是每次重打。一般風格指令也可以安全留存。
+        # 管理員自己補充的事實（外資、法人、現股籌碼…）留在本篇 session，後續修改可自然融入。
         admin_notes = list(session.get("admin_notes") or [])
-        if any(k in question for k in ("外資", "投信", "法人", "現股籌碼", "成本", "買超", "賣超")):
+        if any(k in question for k in ("外資", "投信", "法人", "現股籌碼", "成本", "買超", "賣超")) or re.search(r"\d", question):
             admin_notes.append(question.strip())
             admin_notes = admin_notes[-12:]
-        prompt, facts = weekly_pick.build_weekly_draft_prompt(
-            session["candidate"], instruction=question, previous_draft=session["draft"], admin_notes=admin_notes
-        )
-        response = self.gateway.generate(prompt, purpose="weekly_draft_revision", schema=weekly_pick.WEEKLY_DRAFT_SCHEMA, temperature=0.3)
-        stats.record_gemini(response)
-        if not response.ok:
-            return AnswerResult(text=RATE_LIMIT_MESSAGE if response.rate_limited else "週精選文字修改失敗，原草稿已保留。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
-        data = tools.core()._extract_json_from_text(response.text)
-        draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
+
+        previous = str(session.get("draft") or "")
+        draft, changed, facts = "", "", {}
+        for attempt in range(2):
+            prompt, facts = weekly_pick.build_weekly_revision_prompt(
+                session["candidate"], previous_draft=previous, instruction=question,
+                admin_notes=admin_notes, strict=attempt > 0)
+            response = self.gateway.generate(prompt, purpose="weekly_draft_revision",
+                                             schema=weekly_pick.WEEKLY_REVISION_SCHEMA, temperature=0.15)
+            stats.record_gemini(response)
+            if not response.ok:
+                return AnswerResult(text=RATE_LIMIT_MESSAGE if response.rate_limited else "週精選文字修改失敗，原草稿已保留。",
+                                    route="weekly_draft_revision", gemini_calls=stats.gemini_calls,
+                                    elapsed=time.perf_counter()-started, cacheable=False)
+            data = tools.core()._extract_json_from_text(response.text)
+            candidate_draft = str((data or {}).get("draft") or "").strip() if isinstance(data, dict) else ""
+            changed = str((data or {}).get("changed") or "").strip() if isinstance(data, dict) else ""
+            if not candidate_draft:
+                continue
+            issues = find_ungrounded_numbers(candidate_draft, facts)
+            if not issues:
+                draft = candidate_draft
+                break
+            self.log(f"週精選草稿修改數字核對未通過（第 {attempt+1} 次）：{issues[:10]}")
+            if attempt:
+                pruned, removed = prune_ungrounded_sentences(candidate_draft, facts)
+                if pruned and len(pruned) >= len(candidate_draft) * 0.6:
+                    draft = pruned
+                    changed = (changed + "；" if changed else "") + f"另刪掉 {len(removed)} 句對不上資料的內容"
         if not draft:
-            return AnswerResult(text="這次修改沒有取得完整文字，原草稿已保留。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
-        issues = find_ungrounded_numbers(draft, facts)
-        if issues:
-            self.log(f"週精選草稿修改數字核對未通過：{issues[:10]}")
-            return AnswerResult(text="修改稿中出現無法對應原始資料的數字，因此沒有覆蓋原草稿。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False)
-        session["draft"] = draft
-        session["facts"] = facts
-        session["admin_notes"] = admin_notes
-        session["updated_at"] = time.time()
-        with self._weekly_draft_lock:
-            self._weekly_drafts[context_key] = session
-        return AnswerResult(text=draft + "\n\n※ 如果這版確認，可以直接說「這版確認，生成圖片」。", route="weekly_draft_revision", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False,
+            return AnswerResult(text="這次修改沒有取得可用的文字（可能是出現對不上原始資料的數字），原草稿已保留，可以換個說法再試一次。",
+                                route="weekly_draft_revision", gemini_calls=stats.gemini_calls,
+                                elapsed=time.perf_counter()-started, cacheable=False)
+        if re.sub(r"\s+", "", draft) == re.sub(r"\s+", "", previous):
+            changed = "這次沒有任何變更（模型認為原文已符合指示）"
+        session.update(draft=draft, facts=facts, admin_notes=admin_notes,
+                       previous_draft=previous, updated_at=time.time())
+        self._save_draft_session(context_key, session)
+        footer = f"\n\n※ 本次修改：{changed}" if changed else ""
+        return AnswerResult(text=draft + footer + "\n※ 可繼續修改、說「還原上一版」，或說「這版確認，生成圖片」。",
+                            route="weekly_draft_revision", gemini_calls=stats.gemini_calls,
+                            elapsed=time.perf_counter()-started, cacheable=False,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
                             total_tokens=stats.total_tokens, token_source=stats.token_source)
+
+    # ---------- 草稿 session：記憶體＋SQLite，重新部署不會不見 ----------
+    def _draft_state_key(self, context_key: str) -> str:
+        return f"weekly_draft:{context_key}"
+
+    def _load_draft_session(self, context_key: str, with_candidate: bool = False) -> Dict[str, Any]:
+        """草稿 session：記憶體優先，沒有就讀本機儲存。
+
+        候選資料（排名結果）只有真的要改稿／產圖時才補回來，
+        免得一般問答也被還原流程拖慢。
+        """
+        with self._weekly_draft_lock:
+            session = dict(self._weekly_drafts.get(context_key) or {})
+        if not session:
+            stored = local_market_cache.get_state(self._draft_state_key(context_key), {}) or {}
+            if not stored or time.time() - float(stored.get("updated_at") or 0) > WEEKLY_DRAFT_MINUTES * 60:
+                return {}
+            session = dict(stored)
+        if not with_candidate or session.get("candidate"):
+            return session
+        try:
+            candidate, _ = weekly_pick.find_weekly_candidate(str(session.get("stock_code") or ""), log=self.log)
+        except Exception as exc:
+            self.log(f"草稿還原失敗：{type(exc).__name__}: {exc}")
+            return {}
+        if not candidate:
+            return {}
+        session = {**session, "candidate": candidate, "mark_branches": weekly_pick.mark_branches(candidate)}
+        with self._weekly_draft_lock:
+            self._weekly_drafts[context_key] = session
+        self.log(f"草稿已從本地還原：{session.get('stock_code')}")
+        return session
+
+    def _save_draft_session(self, context_key: str, session: Dict[str, Any]) -> None:
+        with self._weekly_draft_lock:
+            self._weekly_drafts[context_key] = session
+        local_market_cache.set_state(self._draft_state_key(context_key), {
+            k: session.get(k) for k in ("stock_code", "stock_name", "draft", "previous_draft", "admin_notes", "updated_at")
+        })
+
+    def _clear_draft_session(self, context_key: str) -> None:
+        with self._weekly_draft_lock:
+            self._weekly_drafts.pop(context_key, None)
+        local_market_cache.delete_state(self._draft_state_key(context_key))
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
         """管理員確認草稿後，沿用一般個股（3034）版型產生週精選圖片。
@@ -2242,8 +2355,7 @@ class AceQueryEngine:
         結構固定為：K 線＋精簡權證買賣超標註 → 型態評分（含關鍵價位＋文章提及分點動向） → 已確認週精選文字。
         權證逐日流水只畫在 K 線，不再展開長明細表；分點範圍完全以最終文字實際提到者為準。
         """
-        with self._weekly_draft_lock:
-            session = dict(self._weekly_drafts.get(context_key) or {})
+        session = self._load_draft_session(context_key, with_candidate=True)
         if not session:
             return AnswerResult(text="目前沒有已確認的週精選草稿。請先生成並修改文字。", route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started)
         code = session["stock_code"]
@@ -2631,6 +2743,10 @@ WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股�
 USAGE_LOG_SECONDS = max(60, tools._env_int("DISCORD_AI_USAGE_LOG_SECONDS", 300))
 BACKGROUND_TICK_SECONDS = max(30, tools._env_int("DISCORD_AI_BACKGROUND_TICK_SECONDS", 60))
 CMONEY_MEMBER_WARMUP_PER_TICK = max(0, tools._env_int("DISCORD_AI_CMONEY_MEMBER_WARMUP_PER_TICK", 1))
+# 全市場日K底庫：證交所／櫃買官方資料，每個交易日 2 個請求，不吃 FinMind 額度。
+MARKET_SYNC_ENABLE = _env_flag("DISCORD_AI_MARKET_SYNC_ENABLE", "1")
+MARKET_SYNC_BUDGET = max(60.0, tools._env_float("DISCORD_AI_MARKET_SYNC_BUDGET", 600.0))
+MARKET_SCORE_BUDGET = max(30.0, tools._env_float("DISCORD_AI_MARKET_SCORE_BUDGET", 240.0))
 
 def _process_resource_snapshot(previous_cpu: Optional[Tuple[float, float]] = None) -> Tuple[Dict[str, Any], Tuple[float, float]]:
     """不用額外套件，從 Linux /proc 與磁碟統計目前 Bot 資源；非 Linux 時安全退化。"""
@@ -2658,6 +2774,34 @@ def _fmt_mb(value: Any) -> str:
         return f"{float(value) / 1024 / 1024:.1f}MB"
     except Exception:
         return "-"
+
+def _market_maintenance_loop(stop: threading.Event) -> None:
+    """背景維護全市場底庫：開機補齊歷史、每個交易日收盤後補當天，再把型態分數算完。
+
+    全部只用官方每日行情（2 個請求／交易日）與本地 CPU，不會為了單一問題掃市場。
+    """
+    last_attempt = ""
+    while not stop.is_set():
+        try:
+            info = market_data.coverage()
+            now = tools.taipei_now()
+            today = now.strftime("%Y-%m-%d")
+            minutes = now.hour * 60 + now.minute
+            after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5
+            need_history = int(info.get("days") or 0) < 60
+            need_today = after_close and str(info.get("last_day") or "") < today and last_attempt != today
+            if need_history or need_today:
+                last_attempt = today if need_today else last_attempt
+                result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
+                print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
+                      f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+            if int(market_data.coverage().get("days") or 0) >= 20:
+                market_scan.score_pending(budget_seconds=MARKET_SCORE_BUDGET)
+        except Exception as exc:
+            print(f"⚠️ 市場底庫背景維護失敗｜{type(exc).__name__}: {exc}", flush=True)
+        if stop.wait(300):
+            break
+
 
 def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None:
     """Railway 背景監控：API 用量、記憶體、快取與延遲收盤重查。
@@ -2709,6 +2853,10 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
             f"  Memory sessions｜{mem['entries']} / {mem['max_entries']}｜TTL={mem['ttl_minutes']}m｜queue={engine.queue_size()} / {ANSWER_QUEUE_LIMIT}",
             f"  Local market cache｜stocks={market_cache['stocks']}｜bars={market_cache['bars']}｜scores={market_cache['scores']}｜size={_fmt_mb(market_cache['bytes'])}",
             f"  CMoney catalog cache｜groups={cm_stats.get('groups', 0)}｜member_groups={cm_stats.get('member_groups', 0)}",
+            f"  Sector roster｜groups={len(sector_roster.catalog())}｜built={sector_roster.built_at() or '尚未建立'}",
+            f"  Market base｜{market_cache.get('stocks', 0):,} 檔 × {market_cache.get('days', 0)} 日｜"
+            f"最新 {market_cache.get('last_day', '-') or '-'}｜型態分數 {market_cache.get('scores', 0):,} 檔｜"
+            f"{'persistent /data' if market_cache.get('persistent') else 'EPHEMERAL（未掛 Volume，重新部署會清空）'}",
             f"  Fugle intraday｜{fugle.get('last_60s', 0)} / 60 requests/min｜10m={fugle.get('last_10m', 0)}｜errors={fugle.get('errors', 0)}｜background cap={tools.FUGLE_BACKGROUND_LIMIT_PER_MIN}/min｜hard={tools.FUGLE_HARD_LIMIT_PER_MIN}/min",
             f"  Fugle provisional close｜{tools.provisional_close_stats().get('count', 0)} pending",
         ]
@@ -2844,6 +2992,8 @@ def run_discord_bot(config: BotConfig) -> None:
         if not usage_monitor_started.is_set():
             usage_monitor_started.set()
             threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
+            if MARKET_SYNC_ENABLE:
+                threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
