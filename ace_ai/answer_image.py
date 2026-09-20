@@ -45,6 +45,8 @@ BAND_LABELS = {'BB_UPPER': '布林上軌', 'BB_MID': '中軌 MA20', 'BB_LOWER': 
 # 均量線：避開紅綠量柱的顏色。
 MV_COLORS = {'MV5': '#E0A030', 'MV20': '#5B6BBF'}
 # 分點買賣標註：K 線上下各留一條標籤帶（▲／▼＋最多 3 列編號圓圈），不和 K 棒重疊。
+# 每個分點一個顏色：K 線上的三角形與編號都用這個顏色，圖例才看得出誰是誰。
+BRANCH_COLORS = ('#C2410C', '#1D4ED8', '#047857', '#7C3AED', '#B45309', '#BE185D')
 MARK_LANE = 104
 MARK_BADGE_R = 11
 MARK_BADGE_ROW = 26
@@ -217,6 +219,18 @@ def volume_profile_rectangles(profile: dict, left, right, py, low, high):
 # 分點買賣標註（K 線上的 ▲／▼＋編號圓圈，明細表在 K 線卡片底部）
 # ============================================================
 
+def _branch_palette(events: list[dict]) -> dict:
+    """依出現順序配色；分點多於配色數時循環使用。"""
+    names, palette = [], {}
+    for event in events or []:
+        name = str(event.get('branch') or '').strip()
+        if name and name not in names:
+            names.append(name)
+    for index, name in enumerate(names):
+        palette[name] = BRANCH_COLORS[index % len(BRANCH_COLORS)]
+    return palette
+
+
 def _mark_events(panel: dict) -> list[dict]:
     return list(((panel or {}).get('marks') or {}).get('events') or [])
 
@@ -286,22 +300,35 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
     h += 44
 
     if mode == 'flow':
-        # 週精選／明確詢問買賣超點位：只保留 3034 風格的簡潔圖例。
-        # 買賣日期與編號已直接標在 K 線上，不再另外展開逐日明細表。
+        # 週精選／明確詢問買賣超點位：一個分點一個顏色，圖例直接對應 K 線上的編號。
+        palette = _branch_palette(events)
+        rows = []
+        for name, color in palette.items():
+            items = [e for e in events if str(e.get('branch') or '').strip() == name]
+            buys = [e for e in items if e.get('action') == 'buy']
+            sells = [e for e in items if e.get('action') != 'buy']
+            numbers = "、".join(str(e.get('no', '')) for e in sorted(items, key=lambda x: int(x.get('no') or 0)))
+            detail = "　".join(x for x in (
+                f"買超 {len(buys)} 筆" if buys else "",
+                f"賣超 {len(sells)} 筆" if sells else "") if x)
+            rows.append((name, color, f"編號 {numbers}｜{detail}" if detail else f"編號 {numbers}"))
         if not dry:
             sy = top + h + 7
-            sx = x0
             half = 7
-            draw.polygon([(sx + half, sy - half), (sx, sy + half), (sx + 2 * half, sy + half)], fill=UP)
-            _draw_badge(draw, sx + 18 + MARK_BADGE_R, sy, 'N', UP)
-            draw.text((sx + 18 + 2 * MARK_BADGE_R + 10, sy), '買超', font=font(18), fill=INK, anchor='lm')
-            sx += 128
-            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
-            _draw_badge(draw, sx + 18 + MARK_BADGE_R, sy, 'N', DOWN)
-            draw.text((sx + 18 + 2 * MARK_BADGE_R + 10, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            note = '編號僅對應 K 線上的買賣超點位'
-            draw.text((x0 + 270, sy), note, font=font(18), fill=MUTED, anchor='lm')
-        return int(h + 38)
+            draw.polygon([(x0 + half, sy - half), (x0, sy + half), (x0 + 2 * half, sy + half)], fill=MUTED)
+            draw.text((x0 + 22, sy), '買超', font=font(18), fill=INK, anchor='lm')
+            sx = x0 + 110
+            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
+            draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
+            draw.text((x0 + 232, sy), '顏色與編號對應下方分點', font=font(18), fill=MUTED, anchor='lm')
+            ly = sy + 30
+            for name, color, detail in rows:
+                draw.ellipse((x0, ly - 7, x0 + 14, ly + 7), fill=color)
+                draw.text((x0 + 24, ly), name, font=font(19, True), fill=INK, anchor='lm')
+                draw.text((x0 + 24 + font(19, True).getlength(name) + 16, ly), detail,
+                          font=font(18), fill=MUTED, anchor='lm')
+                ly += 30
+        return int(h + 38 + len(rows) * 30)
 
     table_top = top + h
     split = len(events) > MARK_TABLE_SINGLE_MAX
@@ -462,12 +489,14 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
     half = max(5, min(9, step * 0.45))
     if mode == 'flow':
+        palette = _branch_palette(events)
         buy_badges, sell_badges = [], []
         for e in events:
             i = index.get(e.get('action_date') or '')
             if i is None:
                 continue
-            item = {'x': px(i), 'cx': px(i), 'no': e.get('no', '')}
+            item = {'x': px(i), 'cx': px(i), 'no': e.get('no', ''),
+                    'color': palette.get(str(e.get('branch') or '').strip())}
             if e.get('action') == 'buy':
                 buy_badges.append(item)
             else:
@@ -475,17 +504,19 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         _assign_rows(buy_badges); _assign_rows(sell_badges)
         tri_bottom, tri_top = price_bottom + 14, price_top - 14
         for badge in buy_badges:
+            color = badge.get('color') or UP
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
-            _dotted(draw, badge['x'], py(bars[i]['Low']) + 4, tri_bottom - half, UP)
-            draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=UP, outline='white')
+            _dotted(draw, badge['x'], py(bars[i]['Low']) + 4, tri_bottom - half, color)
+            draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=color, outline='white')
             cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
-            _draw_badge(draw, badge['cx'], cy, badge['no'], UP)
+            _draw_badge(draw, badge['cx'], cy, badge['no'], color)
         for badge in sell_badges:
+            color = badge.get('color') or DOWN
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
-            _dotted(draw, badge['x'], py(bars[i]['High']) - 4, tri_top + half, DOWN)
-            draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=DOWN, outline='white')
+            _dotted(draw, badge['x'], py(bars[i]['High']) - 4, tri_top + half, color)
+            draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=color, outline='white')
             cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
-            _draw_badge(draw, badge['cx'], cy, badge['no'], DOWN)
+            _draw_badge(draw, badge['cx'], cy, badge['no'], color)
         return
 
     buy_badges, sell_badges = [], []
@@ -1359,7 +1390,6 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     px, width = x0 + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
     mode = str(data.get('mode') or '')
     technical = mode.endswith('technical')
-    group_rows = any(str(r.get('row_kind') or '') == 'sector_group' for r in (data.get('rows') or []))
     rows = data.get('rows') or []
     h = 34
     title = f"{data.get('name', '')}｜{'型態排行' if technical else '漲幅排行'}"
@@ -1481,6 +1511,64 @@ def _sector_block(draw, y: float, panel: dict, dry: bool) -> int:
     return height
 
 
+ARTICLE_PAD = 44
+ARTICLE_BODY_SIZE = 30      # 精選文章內文比一般回答再大一級，手機上也好讀
+ARTICLE_LINE = 50
+ARTICLE_PARAGRAPH_GAP = 22
+
+
+def _article_paragraphs(body: str) -> list[str]:
+    return [p.strip() for p in re.split(r"\n{1,}", str(body or "")) if p.strip()]
+
+
+def article_card(draw, y: float, data: dict, dry: bool) -> int:
+    """週精選文章版面：標題列＋分段內文＋底部免責，行距與留白比一般回答寬。"""
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    px, width = x0 + ARTICLE_PAD, CONTENT - ARTICLE_PAD * 2
+    title = str(data.get('title') or '')
+    subtitle = str(data.get('subtitle') or '')
+    paragraphs = [wrap(p, ARTICLE_BODY_SIZE, width) for p in _article_paragraphs(data.get('body'))]
+    disclaimers = [str(x) for x in (data.get('disclaimers') or []) if str(x).strip()]
+    h = 38
+    if title:
+        h += 58
+    if subtitle:
+        h += 36
+    h += 20
+    for lines in paragraphs:
+        h += len(lines) * ARTICLE_LINE + ARTICLE_PARAGRAPH_GAP
+    if disclaimers:
+        h += 34
+    h += 36
+    if dry:
+        return int(h)
+
+    draw.rounded_rectangle((x0, y, x1, y + h), radius=20, fill='white', outline=LINE)
+    cursor = y + 38
+    if title:
+        draw.rectangle((px, cursor + 8, px + 6, cursor + 44), fill=ACCENT)
+        text_at(draw, (px + 20, cursor), title, 34, INK, True)
+        cursor += 58
+    if subtitle:
+        text_at(draw, (px + 20 if title else px, cursor), subtitle, 21, MUTED)
+        cursor += 36
+    cursor += 20
+    for lines in paragraphs:
+        for line in lines:
+            text_at(draw, (px, cursor), line, ARTICLE_BODY_SIZE, INK)
+            cursor += ARTICLE_LINE
+        cursor += ARTICLE_PARAGRAPH_GAP
+    if disclaimers:
+        cursor += 2
+        draw.line((px, cursor, px + width, cursor), fill=LINE)
+        text_at(draw, (px, cursor + 10), "　｜　".join(clean(d) for d in disclaimers), 21, MUTED)
+    return int(h)
+
+
+def _is_article_panel(panel: dict) -> bool:
+    return bool((panel or {}).get('article'))
+
+
 def _is_sector_panel(panel: dict) -> bool:
     return bool((panel or {}).get('sector') or (panel or {}).get('sector_members') or (panel or {}).get('sector_catalog'))
 
@@ -1538,20 +1626,22 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels = panels or []
     # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
     sector_panels = [p for p in panels if _is_sector_panel(p)]
-    panels = [p for p in panels if not _is_sector_panel(p)]
+    article_panels = [p for p in panels if _is_article_panel(p)]
+    panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
         panels = [{**p, 'compact': True} for p in panels]
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
-    blocks = [] if sector_panels else body_blocks(answer)
+    blocks = [] if (sector_panels or article_panels) else body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
     else:
         panels_height = sum(panel_block_height(p) for p in panels)
     panels_height += sum(_sector_block(None, 0, p, True) + 24 for p in sector_panels)
+    panels_height += sum(article_card(None, 0, p['article'], True) + 24 for p in article_panels)
     height = header_height + panels_height + body_height + 112
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
@@ -1570,6 +1660,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += compare_card(draw, y, panels, False) + 24
     for panel in sector_panels:
         y += _sector_block(draw, y, panel, False) + 24
+    for panel in article_panels:
+        y += article_card(draw, y, panel['article'], False) + 24
     if blocks:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
@@ -1588,7 +1680,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
     draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
-    if sector_panels:
+    if article_panels:
+        footer = '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
+    elif sector_panels:
         live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
         footer = '股市艾斯  /  盤中漲幅為暫定值，收盤前會變動' if live else '股市艾斯  /  族群排行依日 K 收盤資料計算'
     else:

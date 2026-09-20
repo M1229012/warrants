@@ -126,9 +126,21 @@ def _market_map() -> Dict[str, str]:
     return markets
 
 
-def get_members(code: str) -> Dict[str, Any]:
+def get_members(code: str, display_name: str = "") -> Dict[str, Any]:
     groups = _load().get("groups") or {}
-    group = groups.get(str(code).upper())
+    key = str(code)
+    if key.lower().startswith("multi:"):
+        parts = [c.strip().upper() for c in key.split(":", 1)[1].split(",") if c.strip()]
+        merged = [groups.get(c) for c in parts if groups.get(c)]
+        if not merged:
+            raise tools.ToolDataError(f"族群名冊沒有 {code}")
+        group = {
+            "name": display_name or "＋".join(str(g.get("name") or "") for g in merged),
+            "kind": "merged",
+            "stocks": sorted({s for g in merged for s in (g.get("stocks") or [])}),
+        }
+    else:
+        group = groups.get(key.upper())
     if not group:
         raise tools.ToolDataError(f"族群名冊沒有 {code}")
     names, markets = _name_map(), _market_map()
@@ -136,7 +148,7 @@ def get_members(code: str) -> Dict[str, Any]:
               for c in group.get("stocks") or []]
     stocks = [s for s in stocks if re.fullmatch(r"[1-9]\d{3}", s["stock_code"])]
     return {
-        "industry": "roster:" + str(code).upper(),
+        "industry": "roster:" + (key if key.lower().startswith("multi:") else key.upper()),
         "name": group.get("name", code),
         "stocks": sorted(stocks, key=lambda s: s["stock_code"]),
         "source": "roster",
@@ -200,10 +212,19 @@ def match_group(text: str) -> Optional[Dict[str, str]]:
             continue
         partial = [(not key.startswith(candidate), kind != "industry", -size, code, name, kind)
                    for code, name, key, kind, size in entries if key and candidate in key]
-        if partial:
-            partial.sort()
-            *_, code, name, kind = partial[0]
-            return {"code": code, "name": name, "kind": kind, "match": "partial"}
+        if not partial:
+            continue
+        partial.sort()
+        prefixed = [row for row in partial if not row[0]]
+        # 「散熱」同時對到散熱零組件與散熱模組時，合併成一個族群一起比較，
+        # 否則像奇鋐（在散熱模組）這種代表股會被排除在外。
+        if len(prefixed) > 1:
+            codes = [row[3] for row in prefixed]
+            names = "＋".join(row[4] for row in prefixed)
+            return {"code": "multi:" + ",".join(codes), "name": candidate, "kind": "merged",
+                    "match": "merged", "merged_names": names}
+        *_, code, name, kind = partial[0]
+        return {"code": code, "name": name, "kind": kind, "match": "partial"}
     return None
 
 

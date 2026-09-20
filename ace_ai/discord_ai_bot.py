@@ -88,6 +88,7 @@ class BotConfig:
     max_message_chars: int
     planner_enabled: bool
     slash_command_name: str = "ask"
+    admin_command_name: str = "ace"
     guild_ids: Set[int] = field(default_factory=set)
     ephemeral: bool = False
     allow_all_users: bool = False
@@ -111,6 +112,7 @@ class BotConfig:
             max_message_chars=max(500, min(1950, tools._env_int("DISCORD_AI_MAX_MESSAGE_CHARS", 1900))),
             planner_enabled=_env_flag("DISCORD_AI_PLANNER_ENABLE", "1"),
             slash_command_name=(os.getenv("DISCORD_AI_SLASH_COMMAND", "ask").strip().lower() or "ask"),
+            admin_command_name=(os.getenv("DISCORD_AI_ADMIN_COMMAND", "ace").strip().lower() or "ace"),
             guild_ids=_parse_id_set(os.getenv("DISCORD_AI_GUILD_IDS", "")),
             ephemeral=_env_flag("DISCORD_AI_EPHEMERAL"),
             allow_all_users=_is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
@@ -531,7 +533,13 @@ class QueryRouter:
                 plan.add("get_volume_profile", stock_code=code)
             if categories & {"warrant", "recent_trades", "win_rate"}:
                 # 所有一般權證問題只讀 Google Sheet；MoneyDJ 僅限管理員明確啟用的備援圖片。
-                plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
+                # 天數和 K 線圖一致（近 70 個交易日）；使用者明講「近 10 日」才用指定天數。
+                plan.add("get_sheet_stock_chips", stock_code=code,
+                         days=parsed.days if parsed.days_specified else tools.CHIPS_DAYS)
+                # 沒有分點事件時，AI 至少要能用量能與位置把話講完整，不要只寫「沒有偵測到」。
+                plan.add("get_stock_overview", stock_code=code)
+                plan.add("get_technical_analysis", stock_code=code)
+                plan.add("get_volume_profile", stock_code=code)
             if "news" in categories:
                 plan.add("get_recent_news", stock_code=code)
                 # 新聞統整時附上當日收盤與漲跌，讓 AI 能說明股價當下的反應（快取資料，幾乎不增加時間）。
@@ -558,7 +566,8 @@ class QueryRouter:
             plan.add("get_stock_overview", stock_code=code)
             plan.add("get_technical_analysis", stock_code=code)
             plan.add("get_volume_profile", stock_code=code)
-            plan.add("get_sheet_stock_chips", stock_code=code, days=parsed.days)
+            plan.add("get_sheet_stock_chips", stock_code=code,
+                     days=parsed.days if parsed.days_specified else tools.CHIPS_DAYS)
             plan.add("get_recent_news", stock_code=code)
         return plan
 
@@ -867,6 +876,12 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 - 分點資料有價值時，優先說「在哪個型態／大量區附近布局、目前是否仍持有、對應事件歷史表現」；不要只報總勝率。
 - 沒有明確訊號或沒有資料的項目直接省略，不要硬湊固定段落。"""
 
+FINAL_CHIPS_RULES = """權證分點問題（有 get_sheet_stock_chips）：
+- 第一句直接回答有沒有追蹤分點的 A～E 事件：有就點名分點、事件別、買進金額、目前部位與勝率；沒有就一句話帶過「近 N 個交易日沒有追蹤分點的大額買進紀錄」，不要解釋系統怎麼定義，也不要寫「我們系統」「缺乏訊號」「先行指標」這類空話。
+- 沒有分點事件時，改用技術面把話講完整，像技術分析者在看盤：先用 volume_trend 說量能（近 5 日均量是前 20 日的幾倍、連續放大幾天、是不是 20 日最大量），再說價格位置（站上哪些均線、相對兩大量區、布林狀態）。
+- volume_trend.level 是「明顯放大」或「溫和放大」時，不可以寫成量能平穩或「市場自然供需」，也不要叫使用者「觀察量能是否放大」——資料已經放大就直接說出來，並說明配合的價格位置代表什麼。
+- 沒有分點資料不等於利多或利空，但也不可以因此省略技術面說明。"""
+
 FINAL_RANK_RULES = """權證共識淨買超排行（有 get_top_warrant_buy_stocks）：
 【回答】先寫排行名稱與統計期間（照 source 與 period 寫，不要自己改名，也不要用「共識」「全分點」等字眼），並註明統計範圍是追蹤的分點、不是全市場；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
 unrealized_return_text 是這些分點目前部位的估計未實現損益，要說明是估計值、不是已實現。
@@ -950,7 +965,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
     elif name == "get_stock_overview":
         candle = _candle_shape(data)
-        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_status", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_status", "volume_trend", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
         data["candle"] = candle
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
@@ -984,6 +999,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_TECH_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
+    if "get_sheet_stock_chips" in names:
+        sections.append(FINAL_CHIPS_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
     if "get_pattern_scorecard" in names:
@@ -1881,6 +1898,7 @@ class AnswerResult:
     layout: str = "text"
     weekly: Dict[str, Any] = field(default_factory=dict)
     context_note: str = ""
+    as_text: bool = False          # True＝用純文字訊息回覆（草稿要能直接複製，不能只給圖片）
     request_id: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -1908,6 +1926,7 @@ class MemoryEntry:
     cost_price: Optional[float]
     branches: List[str]
     updated_at: float
+    sector: Optional[Dict[str, str]] = None      # 上一題問的族群，供「那誰型態最好」接續
 
 
 class ConversationMemory:
@@ -1945,7 +1964,18 @@ class ConversationMemory:
 
     def update(self, key: str, parsed: ParsedQuestion) -> None:
         if parsed.sector is not None:
-            self.clear(key)
+            # 族群問題：記住這個族群，後續「那誰型態最好」才接得起來；個股記憶則清掉。
+            sector = parsed.sector
+            if not key or sector.get("mode") in ("catalog", "unsupported") or not sector.get("industry"):
+                self.clear(key)
+                return
+            with self._lock:
+                self._data[key] = MemoryEntry([], None, [], time.time(),
+                                              {"industry": sector["industry"], "name": sector.get("name", ""),
+                                               "mode": sector.get("mode", "technical")})
+                self._data.move_to_end(key)
+                while len(self._data) > self.max_entries:
+                    self._data.popitem(last=False)
             return
         if not key or not parsed.stocks:
             return
@@ -1964,7 +1994,15 @@ class ConversationMemory:
         if parsed.sector is not None:
             return ""
         entry = self.get(key)
-        if entry is None or not entry.stocks:
+        if entry is None:
+            return ""
+        if entry.sector and not parsed.stocks and not parsed.branches and sector_analysis.is_sector_follow_up(parsed.original):
+            follow_up = sector_analysis.follow_up_request(parsed.original, entry.sector)
+            if follow_up:
+                parsed.sector = follow_up
+                parsed.intents = set(parsed.intents) | {"sector"}
+                return f"延續上一題的族群：{entry.sector.get('name', '')}"
+        if not entry.stocks:
             return ""
         text = parsed.original
         names = "、".join(f"{name or code}（{code}）" for code, name in entry.stocks)
@@ -2025,8 +2063,13 @@ class AceQueryEngine:
         with self._queue_lock:
             return self._pending
 
-    def _answer_impl(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None, is_admin: bool = False) -> AnswerResult:
-        """context_key＝伺服器:頻道:使用者，用來記住追問；on_queue(前面還有幾題) 在需要排隊時呼叫一次。"""
+    def _answer_impl(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
+                     is_admin: bool = False, admin_mode: bool = False) -> AnswerResult:
+        """context_key＝伺服器:頻道:使用者，用來記住追問；on_queue(前面還有幾題) 在需要排隊時呼叫一次。
+
+        admin_mode=True 代表這題來自管理員專用指令（本週精選、草稿、維護）；
+        一般 /ask 永遠不會進到那些流程，避免草稿編輯把正常問題吃掉。
+        """
         started = time.perf_counter()
         compact = re.sub(r"\s+", "", question)
         if any(word in compact for word in MEMORY_RESET_WORDS):
@@ -2039,15 +2082,23 @@ class AceQueryEngine:
                 return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
             return self._answer_admin_moneydj_image(question, started)
 
-        # 週精選採獨立編輯 session。已有草稿時，後續「加上／補上／短一點／把…也寫進去」
-        # 直接承接同一篇，不再要求使用者重打股號，也不讓一般 2330/2454 追問記憶搶走路由。
+        if not admin_mode:
+            # /ask 只做一般問答；精選相關的字眼直接導向管理員指令，不進草稿流程。
+            if is_weekly_pick_question(question) or weekly_pick.is_weekly_admin_feature_question(question):
+                hint = f"本週精選與草稿請改用 /{self.config.admin_command_name}（管理員專用）。"
+                return AnswerResult(text=hint if is_admin else "「本週精選」目前只開放管理員使用；一般個股、族群、權證分點問題可以照常詢問。",
+                                    route="weekly_pick_hint", gemini_calls=0, elapsed=time.perf_counter() - started)
+            return self._answer_general(question, context_key, on_queue, started, compact)
+        admin_reply = self._answer_admin_command(question, started, context_key)
+        if admin_reply is not None:
+            return admin_reply
+        # 管理員自己貼文字：直接當成目前草稿，不經過 AI，也不做數字核對（文字是人寫的）。
+        if weekly_pick.is_manual_draft_question(question):
+            return self._answer_weekly_manual_draft(question, context_key, started)
+        # 週精選草稿是獨立的編輯 session，只有管理員指令會進到這裡。
         if weekly_pick.is_weekly_draft_question(question):
             with self._weekly_lock:
                 return self._answer_weekly_draft(question, context_key, started)
-        if is_admin:
-            admin_reply = self._answer_admin_command(question, started)
-            if admin_reply is not None:
-                return admin_reply
         draft_session = self._load_draft_session(context_key)
         if draft_session and time.time() - float(draft_session.get("updated_at", 0) or 0) > WEEKLY_DRAFT_MINUTES * 60:
             self._clear_draft_session(context_key)
@@ -2072,6 +2123,12 @@ class AceQueryEngine:
                 on_queue(1)
             with self._weekly_lock:
                 return self._answer_weekly_pick(question, started)
+        # 管理員指令裡的一般問題（例如先看排名再問個股）仍然走一般問答。
+        return self._answer_general(question, context_key, on_queue, started, compact)
+
+    def _answer_general(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
+                        started: float, compact: str) -> AnswerResult:
+        """一般問答：解析 → 追問記憶 → 快取 → 排隊 → 計算。"""
         try:
             parsed = self.parser.parse(question)
         except tools.ToolDataError as exc:
@@ -2128,16 +2185,21 @@ class AceQueryEngine:
         self.memory.update(context_key, parsed)
         return replace(result, context_note=note)
 
+    # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
+    TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
+                   "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint"}
+
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
-               is_admin: bool = False) -> AnswerResult:
+               is_admin: bool = False, admin_mode: bool = False) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
         request_id = uuid.uuid4().hex[:10]
         self._request_local.request_id = request_id
         try:
             with tools.api_request_scope(request_id):
-                result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin)
+                result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode)
             usage = tools.request_api_usage(request_id, clear=True)
-            return replace(result, request_id=request_id, api_usage=usage)
+            return replace(result, request_id=request_id, api_usage=usage,
+                           as_text=result.as_text or result.route in self.TEXT_ROUTES)
         finally:
             self._request_local.request_id = ""
 
@@ -2182,9 +2244,21 @@ class AceQueryEngine:
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
-    def _answer_admin_command(self, question: str, started: float) -> Optional[AnswerResult]:
+    def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
+        """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
+        return self._admin_command(question, started, context_key)
+
+    def _admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令：更新市場底庫／更新族群名冊／系統狀態。找不到對應指令時回 None。"""
         compact = re.sub(r"\s+", "", question)
+        if compact in ("說明", "help", "HELP", "指令", "使用說明"):
+            return AnswerResult(text=ADMIN_HELP_MESSAGE, route="admin_help", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("目前草稿", "現在草稿", "看草稿"):
+            session = self._load_draft_session(context_key)
+            text = str((session or {}).get("draft") or "")
+            return AnswerResult(text=text or "目前沒有編輯中的草稿。", route="weekly_draft_show",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
         if compact in ("系統狀態", "狀態", "底庫狀態", "資料狀態"):
             info = market_scan.status()
             lines = [
@@ -2240,10 +2314,42 @@ class AceQueryEngine:
             "admin_notes": [], "updated_at": time.time(),
         }
         self._save_draft_session(context_key, session)
-        text = data["draft"] + "\n\n※ 這是草稿。你可以直接說「權證部分短一點／大量區再強調／不要寫某段」；確認後再說「這版確認，生成圖片」。"
+        text = data["draft"] + "\n\n※ 這是草稿（純文字，可直接複製保存）。你可以直接說「權證部分短一點／大量區再強調／不要寫某段」；確認後再說「這版確認，生成圖片」。"
         return AnswerResult(text=text, route="weekly_draft", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started, cacheable=False,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
                             total_tokens=stats.total_tokens, token_source=stats.token_source)
+
+    def _answer_weekly_manual_draft(self, question: str, context_key: str, started: float) -> AnswerResult:
+        """管理員直接貼上文章：原文照收，成為目前草稿，可以接著修改或直接產圖。"""
+        code, draft = weekly_pick.extract_manual_draft(question)
+        if not code:
+            return AnswerResult(text="請附上股票代號，例如：3006 套用文字 <貼上整篇>。", route="weekly_manual_draft",
+                                gemini_calls=0, elapsed=time.perf_counter()-started)
+        if len(draft) < 30:
+            return AnswerResult(text="沒有讀到文章內容。用法：`3006 套用文字` 後面直接貼上整篇；"
+                                     "slash 指令打不出換行時，可以用 // 代表分段。",
+                                route="weekly_manual_draft", gemini_calls=0, elapsed=time.perf_counter()-started)
+        try:
+            candidate, _ = weekly_pick.find_weekly_candidate(code, log=self.log)
+        except Exception as exc:
+            self.log(f"套用文字時取得候選失敗：{type(exc).__name__}: {exc}")
+            candidate = None
+        if not candidate:
+            return AnswerResult(text=f"{code} 不在當期本週精選 Top 10，沒有對應的權證分點資料可以畫圖。"
+                                     "可以先用「本週精選排名」確認候選股。",
+                                route="weekly_manual_draft", gemini_calls=0, elapsed=time.perf_counter()-started)
+        session = {
+            "stock_code": candidate["stock_code"], "stock_name": candidate.get("stock_name", ""),
+            "draft": draft, "candidate": candidate, "facts": {},
+            "mark_branches": weekly_pick.mark_branches(candidate),
+            "admin_notes": [], "previous_draft": "", "updated_at": time.time(),
+        }
+        self._save_draft_session(context_key, session)
+        branches = weekly_pick.mentioned_branches(draft, candidate)
+        note = f"（文章提到的分點：{'、'.join(branches)}）" if branches else "（文章沒有提到追蹤分點，圖上不會畫買賣標註）"
+        return AnswerResult(
+            text=draft + f"\n\n※ 已套用為目前草稿{note}。可以接著修改，或說「這版確認，生成圖片」。",
+            route="weekly_manual_draft", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：延續同一檔週精選草稿做文字修改。
@@ -2393,6 +2499,9 @@ class AceQueryEngine:
 
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
+        article = weekly_pick.weekly_article_parts(session["draft"], code, name)
+        article["subtitle"] = f"資料日 {(candidate.get('technical') or {}).get('data_date', '')}｜僅為個人投資筆記，非買賣建議".strip("｜")
+        panels = list(panels) + [{"article": article}]
         return AnswerResult(
             text=image_text, route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
             cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
@@ -2738,6 +2847,25 @@ def _is_guild_admin(member) -> bool:
     return bool(perms is not None and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)))
 
 
+ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能使用）
+
+【本週精選】
+• `本週精選排名`：算出當期 Top 10
+• `3006 幫我生成週精選文字`：挑一檔生成草稿
+• 接著直接說修改需求：`權證部分短一點`、`不要提到均線`、`把新光的勝率補上`
+• `還原上一版`：回到修改前
+• `這版確認，生成圖片`：產出精選圖片
+• `3006 套用文字 <貼上整篇>`：直接沿用自己寫好的文章（不經過 AI；slash 打不出換行時用 // 分段）
+• `目前草稿`：看現在編輯中的文章
+
+【資料維護】
+• `系統狀態`：名冊、日K底庫、型態分數、是否永久保存
+• `更新市場底庫`：補齊全市場日K（每個交易日 2 個請求）
+• `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
+
+一般個股、族群、權證分點問題請照常用 /ask。"""
+
+
 WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
 
 USAGE_LOG_SECONDS = max(60, tools._env_int("DISCORD_AI_USAGE_LOG_SECONDS", 300))
@@ -2945,6 +3073,15 @@ def run_discord_bot(config: BotConfig) -> None:
             for file in files:
                 file.close()
 
+    async def interaction_text(interaction, text: str, *, ephemeral=False):
+        """草稿與維護指令用純文字回覆；太長時自動分段，方便直接複製。"""
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        chunks = split_discord_message(text or "（沒有內容）", 1900)
+        await interaction.edit_original_response(content=chunks[0], attachments=[], allowed_mentions=no_mentions)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(content=chunk, ephemeral=ephemeral, allowed_mentions=no_mentions)
+
     async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False, weekly=None):
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
@@ -2995,15 +3132,13 @@ def run_discord_bot(config: BotConfig) -> None:
             if MARKET_SYNC_ENABLE:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
         print(
-            f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
+            f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
             f"debug={config.debug}",
             flush=True,
         )
 
-    @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
-    @app_commands.describe(question="例如：2330現在型態好嗎／永豐金內湖D事件勝率／2330最近有什麼新聞")
-    async def ask_command(interaction: "discord.Interaction", question: str) -> None:
+    async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         is_admin = _is_guild_admin(interaction.user)
@@ -3012,11 +3147,11 @@ def run_discord_bot(config: BotConfig) -> None:
             engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
-        if weekly_pick.is_weekly_admin_feature_question(question):
-            weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(interaction.user))
-            if weekly_denied:
-                engine.log(f"本週精選拒絕使用者 {user_id}")
-                await interaction_image(interaction, "使用權限", weekly_denied, ephemeral=True)
+        if admin_mode:
+            admin_denied = guard.check_weekly_pick(user_id, is_admin)
+            if admin_denied:
+                engine.log(f"管理員指令拒絕使用者 {user_id}")
+                await interaction_image(interaction, "使用權限", admin_denied, ephemeral=True)
                 return
         busy = guard.acquire(user_id)
         if busy:
@@ -3024,7 +3159,7 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         try:
             await interaction.response.defer(thinking=True, ephemeral=config.ephemeral)
-            if is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
+            if admin_mode and is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
             loop = asyncio.get_running_loop()
 
@@ -3035,11 +3170,14 @@ def run_discord_bot(config: BotConfig) -> None:
                     interaction_image(interaction, question, message, ephemeral=config.ephemeral), loop)
 
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
-            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin)
+            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode)
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             upload_started = asyncio.get_running_loop().time()
-            await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
-                                    weekly=result.weekly if result.layout == "weekly_pick" else None)
+            if result.as_text:
+                await interaction_text(interaction, with_context_note(result), ephemeral=config.ephemeral)
+            else:
+                await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
+                                        weekly=result.weekly if result.layout == "weekly_pick" else None)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
             print(
@@ -3057,6 +3195,16 @@ def run_discord_bot(config: BotConfig) -> None:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
             guard.release(user_id)
+
+    @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
+    @app_commands.describe(question="例如：2330現在型態好嗎／記憶體族群誰型態最好／2330最近有什麼新聞")
+    async def ask_command(interaction: "discord.Interaction", question: str) -> None:
+        await handle_question(interaction, question, admin_mode=False)
+
+    @client.tree.command(name=config.admin_command_name, description="艾斯 AI 管理員：本週精選、草稿編輯與資料維護")
+    @app_commands.describe(question="例如：本週精選排名／3006 幫我生成週精選文字／系統狀態／說明")
+    async def admin_command(interaction: "discord.Interaction", question: str) -> None:
+        await handle_question(interaction, question, admin_mode=True)
 
     @client.event
     async def on_message(message: "discord.Message") -> None:

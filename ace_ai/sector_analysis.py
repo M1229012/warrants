@@ -84,6 +84,8 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     hit = sector_roster.match_group(text) if sector_roster.available() else None
     if hit:
         request = _request_mode(text, "roster:" + hit["code"], hit["name"])
+        if hit.get("merged_names"):
+            request["merged_names"] = hit["merged_names"]
         if hit.get("match") != "exact":
             request["matched_by"] = f"對應族群：{hit['name']}"
         return request
@@ -129,6 +131,40 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     return _request_mode(text, code, INDUSTRIES[code][0])
 
 
+_FOLLOW_UP_RE = re.compile(r"誰|哪[一幾]?[檔支家個]|最強|最好|最弱|排行|排名|型態|形態|技術|漲幅|漲跌|漲最|成分|名單|名冊|有哪些")
+
+
+def mode_from_text(text: str, default: str = "technical") -> str:
+    """從追問句判斷要看型態還是漲幅（沒講就沿用上一次）。"""
+    value = cmoney_catalog.normalize_text(text)
+    if re.search(r"成分|名單|名冊|有哪些", value) and not re.search(r"比較|排行|排名|最強|最好|型態|形態|漲", value):
+        return "members"
+    if re.search(r"型態|形態|技術|均線|支撐|布林", value):
+        return "technical"
+    if re.search(r"漲幅|漲跌|漲最|最強|強勢|盤中", value):
+        return "momentum"
+    return default
+
+
+def is_sector_follow_up(text: str) -> bool:
+    """沒指定族群、但看得出是在追問同一個族群（「那誰型態最好」）。"""
+    value = cmoney_catalog.normalize_text(text)
+    if re.search(r"(?<![A-Z0-9])\d{4,6}[A-Z]?(?![A-Z0-9])", value):
+        return False
+    return bool(_FOLLOW_UP_RE.search(value))
+
+
+def follow_up_request(text: str, remembered: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """把上一次的族群 + 這次的問法組成新的查詢。"""
+    if not remembered or not remembered.get("industry"):
+        return None
+    mode = mode_from_text(text, default=str(remembered.get("mode") or "technical"))
+    if mode not in ("technical", "momentum", "members"):
+        mode = "technical"
+    return {"mode": mode, "industry": remembered["industry"], "name": remembered.get("name", ""),
+            "followed_up": True}
+
+
 def _request_mode(text, code, name):
     listing = bool(re.search(r"成分|名單|名冊|有哪些|包含|有哪[些幾]", text))
     comparing = bool(re.search(r"比較|好|強|排行|排名|漲|技術|型態|形態|均線|支撐|布林", text))
@@ -160,9 +196,9 @@ def _finmind_catalog() -> pd.DataFrame:
     return CACHE.get_or_compute("finmind_catalog", MEMBER_TTL, load)[0]
 
 
-def get_members(industry: str) -> Dict[str, Any]:
+def get_members(industry: str, display_name: str = "") -> Dict[str, Any]:
     if industry.startswith("roster:"):
-        return sector_roster.get_members(industry[7:])
+        return sector_roster.get_members(industry[7:], display_name=display_name)
     if industry.startswith("cmoney:"):
         result = dict(cmoney_catalog.get_members(industry[7:]))
         # CMoney 細分類負責「誰屬於這個族群」；上市／上櫃與普通股資格再用既有官方/FinMind
@@ -351,7 +387,7 @@ def _eligible(rows, mode):
     return eligible, len(rows) - len(eligible), date
 
 
-def get_ranking(industry: str, mode: str) -> Dict[str, Any]:
+def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, Any]:
     if mode not in ("technical", "momentum"):
         raise tools.ToolDataError("不支援的比較方式")
     key = f"ranking:{industry}:{mode}"
@@ -365,7 +401,7 @@ def get_ranking(industry: str, mode: str) -> Dict[str, Any]:
         hit, result = CACHE.get(key)
         if hit:
             return result
-        members = get_members(industry)
+        members = get_members(industry, display_name=display_name)
         deadline = time.monotonic() + SCAN_TIMEOUT
         cancel = threading.Event()
         remaining = iter(members["stocks"])
@@ -623,7 +659,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     try:
         if mode == "members":
-            data = get_members(request["industry"])
+            data = get_members(request["industry"], display_name=str(request.get("name") or ""))
             lines = [f"**{data['name']}｜成分股名單**", f"共 {len(data['stocks'])} 檔上市櫃普通股。"]
             if not data["complete"]:
                 lines.append("部分市場或細分類名冊未取得，以下不是完整族群。")
@@ -635,7 +671,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
             lines.extend(_catalog_details(data))
             return {"text": "\n".join(lines), "calls": 0, "cacheable": data["complete"] and not data.get("stale"),
                     "panels": [members_panel(data)]}
-        data = get_ranking(request["industry"], mode)
+        data = get_ranking(request["industry"], mode, display_name=str(request.get("name") or ""))
     except Exception as exc:
         print(f"族群查詢失敗：{type(exc).__name__}", flush=True)
         return {"text": "族群名冊或行情暫時無法取得，請稍後再試；其他個股查詢仍可使用。", "calls": 0, "cacheable": False}

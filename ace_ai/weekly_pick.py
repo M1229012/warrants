@@ -1813,6 +1813,33 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
     return stock, result
 
 
+def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> Dict[str, Any]:
+    """把草稿拆成圖片版面要用的三段：標題、內文、免責。
+
+    圖片上方已經有「權證分點觀察｜週精選」標題，所以這裡不重複；
+    免責兩行移到卡片底部，內文只留正文段落。
+    """
+    lines = [line.rstrip() for line in str(draft or "").splitlines()]
+    code = str(stock_code or "").strip()
+    body, disclaimers = [], []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            body.append("")
+            continue
+        if "權證分點觀察" in stripped and ("週精選" in stripped or "周精選" in stripped):
+            continue
+        if code and code in stripped and len(stripped) <= 24:
+            continue                      # 「📌 3006 晶豪科」這種標頭
+        if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議") or stripped.startswith(("⚠️", "🧡")):
+            disclaimers.append(stripped)
+            continue
+        body.append(stripped)
+    text = "\n".join(body).strip()
+    title = f"{stock_name}（{code}）" if stock_name else code
+    return {"title": title, "body": text, "disclaimers": disclaimers or ["⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"]}
+
+
 def weekly_image_text(draft: str, stock_code: str, stock_name: str = "") -> str:
     """週精選圖片專用文字。
 
@@ -1900,6 +1927,50 @@ _WEEKLY_EDIT_FIELDS = ("勝率", "平均持有", "持有天數", "加權報酬",
 def extract_stock_code(text: str) -> str:
     match = re.search(r"(?<!\d)([1-9]\d{3})(?!\d)", str(text or ""))
     return match.group(1) if match else ""
+
+
+# 管理員自己寫好（或想沿用舊版）的文字：直接套用，不經過 AI 重寫。
+_MANUAL_DRAFT_PATTERNS = ("套用文字", "套用這段", "套用草稿", "用這段文字", "使用這段文字",
+                          "直接用這段", "貼上文字", "沿用文字", "手動文字")
+# Discord slash 指令的輸入框打不出換行，所以也接受這些符號當段落分隔。
+_PARAGRAPH_MARKS = ("\\n", "//", "｜｜", "||")
+
+
+def normalize_draft_text(text: str) -> str:
+    """把手動貼上的文字整理成段落：支援真正的換行，或用 \\n、//、｜｜ 當分段符號。"""
+    value = str(text or "").strip()
+    for mark in _PARAGRAPH_MARKS:
+        value = value.replace(mark, "\n")
+    value = re.sub(r"[ \t]*\n[ \t]*", "\n", value)
+    return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def is_manual_draft_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not extract_stock_code(compact):
+        return False
+    return any(k in compact for k in _MANUAL_DRAFT_PATTERNS) or "權證分點觀察" in compact
+
+
+def extract_manual_draft(text: str) -> Tuple[str, str]:
+    """回傳（股票代號, 文章內容）；抓不到內容時回傳空字串。"""
+    raw = str(text or "")
+    code = extract_stock_code(re.sub(r"\s+", "", raw))
+    if not code:
+        return "", ""
+    body = raw
+    for keyword in _MANUAL_DRAFT_PATTERNS:
+        position = body.find(keyword)
+        if position >= 0:
+            body = body[position + len(keyword):]
+            break
+    else:
+        # 直接貼整篇（開頭就是「權證分點觀察｜週精選」）：把指令前綴切掉
+        position = body.find("權證分點觀察")
+        if position > 0:
+            body = body[position:]
+    body = re.sub(r"^[\s:：，,、。\-–—]+", "", body)
+    return code, normalize_draft_text(body)
 
 
 def is_weekly_draft_question(text: str) -> bool:

@@ -1496,6 +1496,48 @@ PRICE_SOURCE_NOTE = "日K收盤資料（非盤中即時）"
 # Tool 1：股價概況
 # ============================================================
 
+def _volume_trend(df: pd.DataFrame) -> Dict[str, Any]:
+    """量能趨勢（只用已收盤日）：近 5 日均量相對前 20 日、連續放大天數、20 日內最大量。
+
+    讓 AI 不必自己從 K 線猜「量有沒有放大」；這些都是 Python 算好的事實。
+    """
+    try:
+        volume = pd.to_numeric(df["Volume"], errors="coerce").dropna()
+    except (KeyError, TypeError):
+        return {}
+    if len(volume) < 25:
+        return {}
+    recent5 = float(volume.iloc[-5:].mean())
+    prior20 = float(volume.iloc[-25:-5].mean())
+    today = float(volume.iloc[-1])
+    rising = 0
+    for i in range(len(volume) - 1, 0, -1):
+        if volume.iloc[i] > volume.iloc[i - 1]:
+            rising += 1
+        else:
+            break
+    ratio = recent5 / prior20 if prior20 else None
+    if ratio is None:
+        level = "資料不足"
+    elif ratio >= 2.0:
+        level = "明顯放大"
+    elif ratio >= 1.3:
+        level = "溫和放大"
+    elif ratio <= 0.7:
+        level = "明顯萎縮"
+    else:
+        level = "持平"
+    return {
+        "today_lots": _num(today / 1000, 0),
+        "avg5_lots": _num(recent5 / 1000, 0),
+        "prior20_avg_lots": _num(prior20 / 1000, 0),
+        "recent5_vs_prior20": _num(ratio, 2),
+        "level": level,
+        "rising_streak_days": rising,
+        "is_20d_high_volume": bool(today >= float(volume.iloc[-20:].max())),
+    }
+
+
 def get_stock_overview(stock_code: str) -> Dict[str, Any]:
     """最新一根日K的收盤、漲跌幅、成交量（張）、5／20日均量與量比。"""
     code, name = _stock_identity(stock_code)
@@ -1535,6 +1577,7 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "mv20_lots": _num(mv20 / 1000, 0) if mv20 is not None else None,
         "volume_ratio_vs_mv5": ratio5,
         "volume_ratio_vs_mv20": ratio20,
+        "volume_trend": _volume_trend(closed_frame(bundle)) if not suspect else {},
         "volume_status": "盤中累計量（尚未收盤）" if live else ("量能資料可疑，不判讀" if suspect else "收盤成交量"),
         "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中不計算量比",
     }
@@ -3188,7 +3231,10 @@ def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
     return work.dropna(subset=["_date"]).sort_values("_date")
 
 
-def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 20) -> Dict[str, Any]:
+CHIPS_DAYS = max(5, _env_int("DISCORD_AI_CHIPS_DAYS", 70))          # 和 K 線圖一樣看近 70 個交易日
+
+
+def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days: int = CHIPS_DAYS) -> Dict[str, Any]:
     """個股的「回測追蹤分點」權證籌碼（全部讀 Google Sheet，不即時抓 MoneyDJ）。
 
     - 最近 N 個交易日的 A～E 大額買進事件（事件定義＝回測程式）
@@ -3196,8 +3242,8 @@ def get_sheet_stock_chips(stock_code: str, days: int = 5, lookback_days: int = 2
     - 每個分點的總勝率（背景）與本次事件別勝率
     """
     code, name = _stock_identity(stock_code)
-    days = max(1, int(days or 5))
-    lookback_days = max(int(lookback_days or 20), days)
+    days = max(1, int(days or CHIPS_DAYS))
+    lookback_days = max(int(lookback_days or CHIPS_DAYS), days)
     bundle = load_abcde_event_rows()
     events, latest = bundle["events"], bundle["latest_event_date"]
     if latest is None:
