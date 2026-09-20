@@ -18,9 +18,11 @@ import local_market_cache
 import sector_roster
 import weekly_pick
 
-# 族群排行的最低要求：成員太少或涵蓋率太低就不列入，避免用 3 檔代表整個族群。
+# 漲幅排行仍保留流動性與涵蓋率門檻；純型態排行改用完整族群名冊，
+# 只排除真的沒有型態分數的股票，避免把「族群型態」變成「高流動性個股型態」。
 MIN_MEMBERS = max(3, tools._env_int("DISCORD_AI_MARKET_MIN_MEMBERS", 5))
 MIN_COVERAGE = min(1.0, max(0.2, tools._env_float("DISCORD_AI_MARKET_MIN_COVERAGE", 0.6)))
+TECH_MIN_VALID = max(1, tools._env_int("DISCORD_AI_MARKET_TECH_MIN_VALID", 3))
 LIQUIDITY_DAYS = max(5, tools._env_int("DISCORD_AI_SECTOR_LIQUIDITY_DAYS", 20))
 MIN_AVG_VALUE = max(0.0, tools._env_float("DISCORD_AI_SECTOR_MIN_AVG_VALUE", 50_000_000.0))
 MIN_AVG_LOTS = max(0.0, tools._env_float("DISCORD_AI_SECTOR_MIN_AVG_LOTS", 500.0))
@@ -63,18 +65,33 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
     names = sector_roster._name_map()
     rows: List[Dict[str, Any]] = []
     for group_code, info in catalog.items():
-        codes = [c for c in members.get(group_code, []) if c in liquid]
-        if len(codes) < MIN_MEMBERS:
+        all_codes = list(dict.fromkeys(members.get(group_code, [])))
+        if not all_codes:
             continue
-        pairs = [(c, pick(values[c])) for c in codes if c in values and pick(values[c]) is not None]
-        if len(pairs) < MIN_MEMBERS or len(pairs) / len(codes) < MIN_COVERAGE:
-            continue
+
+        if mode == "market_technical":
+            # 純型態排行：完整族群名冊都參加，不先套成交量／成交金額門檻。
+            codes = all_codes
+            pairs = [(c, pick(values[c])) for c in codes if c in values and pick(values[c]) is not None]
+            # 一般族群至少 3 檔有效型態；若族群本身不到 3 檔，則要求全部都有資料。
+            required = min(TECH_MIN_VALID, len(codes))
+            if len(pairs) < required:
+                continue
+        else:
+            # 漲幅／強勢排行保留原本流動性規則，避免冷門股對短線強勢排名造成過度影響。
+            codes = [c for c in all_codes if c in liquid]
+            if len(codes) < MIN_MEMBERS:
+                continue
+            pairs = [(c, pick(values[c])) for c in codes if c in values and pick(values[c]) is not None]
+            if len(pairs) < MIN_MEMBERS or len(pairs) / len(codes) < MIN_COVERAGE:
+                continue
+
         numbers = [v for _, v in pairs]
         leader_code, leader_value = max(pairs, key=lambda x: x[1])
         rows.append({
             "group_code": group_code, "name": info["name"], "kind": info["kind"],
             "median": round(statistics.median(numbers), 2),
-            "coverage": len(pairs), "members": len(codes), "total_members": info["size"],
+            "coverage": len(pairs), "members": len(codes), "total_members": len(all_codes),
             "strong_ratio": round(sum(1 for v in numbers if v >= 75) / len(numbers) * 100, 0) if mode == "market_technical"
             else round(sum(1 for v in numbers if v > 0) / len(numbers) * 100, 0),
             "leader_code": leader_code, "leader_name": names.get(leader_code, ""),
@@ -86,7 +103,8 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
     dates = local_market_cache.known_dates(limit=1)
     return {"mode": mode, "rows": rows[:limit], "groups_total": len(catalog), "groups_ranked": len(rows),
             "as_of": dates[0] if dates else "", "scored_stocks": len(values),
-            "liquidity_rule": f"近 {LIQUIDITY_DAYS} 日平均成交金額 {MIN_AVG_VALUE/1e4:,.0f} 萬元、平均成交量 {MIN_AVG_LOTS:,.0f} 張以上",
+            "liquidity_rule": ("" if mode == "market_technical" else
+                               f"近 {LIQUIDITY_DAYS} 日平均成交金額 {MIN_AVG_VALUE/1e4:,.0f} 萬元、平均成交量 {MIN_AVG_LOTS:,.0f} 張以上"),
             "reason": "" if rows else ("no_scores" if mode == "market_technical" and not values else "low_coverage")}
 
 

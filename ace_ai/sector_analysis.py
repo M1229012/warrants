@@ -67,7 +67,17 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     # 明確個股代號仍走原本個股流程。
     if re.search(r"(?<![A-Z0-9])\d{4,6}[A-Z]?(?![A-Z0-9])", text):
         return None
-    if re.search(r"(?:支援|可以查|可查).*(?:族群|產業)|(?:有哪[些個]|哪些|那些)(?:族群|產業)|族群列表|產業列表", text):
+    # 泛指「有哪些族群／查看族群清單」時直接顯示族群目錄。
+    # 這裡只吃「沒有指定特定族群名稱」的清單問法，避免把「散熱族群有哪些股票」誤判成總清單。
+    catalog_patterns = (
+        r"(?:查看|查詢|看|顯示|列出|打開|給我|想看)?(?:全部|所有|目前|現在)?(?:可查詢|可查|支援)?(?:的)?(?:族群|類股|產業)(?:清單|列表|名冊|分類)",
+        r"(?:有哪[些個]|有哪些|有那些|有什麼|有啥|哪些|那些)(?:族群|類股|產業)",
+        r"(?:支援|可以查|可查|能查|可查詢).*(?:哪些|那些|什麼|哪一些)?(?:族群|類股|產業)",
+        r"(?:族群|類股|產業)(?:有哪[些個]|有哪些|有那些|有什麼|有啥)$",
+        r"(?:查看|查詢|看|顯示|列出|打開|給我|想看)(?:全部|所有|目前|現在)?(?:的)?(?:族群|類股|產業)$",
+        r"^(?:全部|所有)(?:族群|類股|產業)$",
+    )
+    if any(re.search(pattern, text) for pattern in catalog_patterns):
         return {"mode": "catalog", "industry": "", "name": "產業分類"}
 
     # 全市場族群問題，不要求先指定單一族群。
@@ -574,7 +584,8 @@ def _market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
         "market": "", "row_kind": "sector_group",
         "pattern_score": row["median"] if technical else None,
         "change_pct": None if technical else row["median"],
-        "coverage_text": f"納入 {row['coverage']} / {row['members']} 檔",
+        "coverage_text": (f"型態有效 {row['coverage']} / {row.get('total_members', row['members'])} 檔"
+                          if technical else f"納入 {row['coverage']} / {row['members']} 檔"),
         "ratio_text": (f"75 分以上 {row['strong_ratio']:.0f}%" if technical else f"上漲家數比 {row['strong_ratio']:.0f}%"),
         "leader_text": (f"代表股 {row['leader_name']}（{row['leader_code']}）" if row.get("leader_code") else ""),
     } for row in data.get("rows") or []]
@@ -643,7 +654,10 @@ def _market_radar_answer(mode: str) -> Dict[str, Any]:
     lines = [f"**全市場族群{metric}排行**"]
     for row in data["rows"]:
         value = f"中位型態 {row['median']:.1f}" if mode == "market_technical" else f"中位漲幅 {row['median']:+.2f}%"
-        lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔")
+        if mode == "market_technical":
+            lines.append(f"{row['rank']}. {row['name']}｜{value}｜型態有效 {row['coverage']}/{row.get('total_members', row['members'])} 檔")
+        else:
+            lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔")
     lines.append(f"資料時間：{data.get('as_of', '')} 收盤")
     lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [_market_panel(data)]}
