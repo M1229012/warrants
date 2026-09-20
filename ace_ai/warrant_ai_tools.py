@@ -3617,16 +3617,12 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 
     marks: List[Dict[str, Any]] = []
     paired_sells: set = set()
+    unverified: List[str] = []
     ordered = list(rows.sort_values(["event_date", "branch"]).itertuples())
-    # 編號只用在「買進 → 出清」這種成對的事件；還沒出清（只有減碼或仍持有）就不給數字。
-    numbering: Dict[int, int] = {}
-    for row in ordered:
-        if in_chart(getattr(row, "exit_date", None)):
-            numbering[id(row)] = len(numbering) + 1
-    for row in ordered:
+    # A～E 事件的買進一律給編號；同一筆事件的出清沿用同一個編號。
+    for no, row in enumerate(ordered, 1):
         branch = str(row.branch)
         event_code = str(getattr(row, "event_code", "") or "")
-        no = numbering.get(id(row), "")
         buy_day = in_chart(row.event_date)
         if buy_day:
             amount = float(getattr(row, "buy_amount", 0.0) or 0.0)
@@ -3638,11 +3634,16 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         if exit_day:
             key = (branch, pd.Timestamp(exit_date).normalize())
             amount = sell_amounts.get(key, 0.0)
+            # 出清要「兩張表都對得上」：A～E 事件表有出清日，每日賣出明細也真的有當天的賣出，
+            # 否則只是事件表的欄位，圖上不畫，避免和追蹤分點動向的「持有中」互相矛盾。
+            if amount <= 0:
+                unverified.append(f"{branch} {exit_day}")
+                continue
             paired_sells.add(key)
-            # 出清一定標，金額再小也要畫（「那 20 萬賣完就出清」）。
+            # 已確認的出清一定標，金額再小也要畫（「那 20 萬賣完就出清」）。
             marks.append({"no": no, "branch": branch, "event_codes": event_code, "kind": "event_exit",
                           "action": "sell", "action_text": "事件出清", "action_date": exit_day,
-                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount) if amount else ""})
+                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
         reduce_date = getattr(row, "reduce_date", None)
         reduce_day = in_chart(reduce_date)
         if reduce_day and reduce_day != exit_day:
@@ -3691,8 +3692,12 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         extras.sort(key=lambda m: -abs(float(m.get("net_amount") or 0.0)))
         marks = numbered[:max_marks] + extras[: max(0, max_marks - len(numbered))]
     marks.sort(key=lambda m: (m["action_date"], str(m["no"])))
+    if unverified:
+        print(f"⚠️ {code} 事件表有出清日、但每日賣出明細沒有對應賣出，圖上不標：{'、'.join(unverified[:6])}", flush=True)
     print(f"✅ {code} Google Sheet 權證標註｜branches={targets or 'auto'}｜"
-          f"事件 {sum(1 for m in marks if m['no'] != '')} 個｜非事件賣出 {sum(1 for m in marks if m['no'] == '')} 個", flush=True)
+          f"事件買進 {sum(1 for m in marks if m['kind'] == 'event_buy')} 個｜"
+          f"已核對出清 {sum(1 for m in marks if m['kind'] == 'event_exit')} 個｜"
+          f"減碼／零星賣出 {sum(1 for m in marks if m['kind'] == 'reduce')} 個", flush=True)
     return {"mode": "flow", "source": "sheet", "events": marks,
             "data_latest_event_date": _fmt_date(bundle.get("latest_event_date"))}
 
