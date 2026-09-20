@@ -11,7 +11,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -60,6 +60,22 @@ def _connect() -> sqlite3.Connection:
                         updated_at TEXT NOT NULL
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS usage_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,
+                        day TEXT NOT NULL,
+                        route TEXT DEFAULT '',
+                        gemini_calls INTEGER DEFAULT 0,
+                        input_tokens INTEGER DEFAULT 0,
+                        output_tokens INTEGER DEFAULT 0,
+                        token_source TEXT DEFAULT '',
+                        api_json TEXT DEFAULT '{}',
+                        elapsed REAL DEFAULT 0,
+                        cache_hit INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_log(day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_code_date ON daily_bars(stock_code, date DESC)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_scores_code_date ON pattern_scores(stock_code, date DESC)")
@@ -394,3 +410,73 @@ def stats() -> Dict[str, Any]:
     except Exception:
         return {"bars": 0, "stocks": 0, "scores": 0, "days": 0, "last_day": "", "bytes": 0,
                 "path": str(DB_PATH), "persistent": str(DB_PATH).startswith("/data")}
+
+
+# ============================================================
+# 使用量記錄（Gemini 與各 API，供「/ace 用量」與負載評估）
+# ============================================================
+
+USAGE_KEEP_DAYS = 30
+
+
+def log_usage(route: str, gemini_calls: int, input_tokens: int, output_tokens: int,
+              token_source: str, api_usage: Any, elapsed: float, cache_hit: bool) -> None:
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    try:
+        with _LOCK:
+            with _db() as conn:
+                conn.execute(
+                    "INSERT INTO usage_log (ts,day,route,gemini_calls,input_tokens,output_tokens,"
+                    "token_source,api_json,elapsed,cache_hit) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"), str(route or ""),
+                     int(gemini_calls or 0), int(input_tokens or 0), int(output_tokens or 0),
+                     str(token_source or ""), json.dumps(api_usage or {}, ensure_ascii=False),
+                     float(elapsed or 0.0), 1 if cache_hit else 0))
+                conn.execute("DELETE FROM usage_log WHERE day < ?",
+                             ((now - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d"),))
+                conn.commit()
+    except Exception:
+        pass
+
+
+def usage_summary(day: str = "") -> Dict[str, Any]:
+    """單日用量統計：題數、Gemini 次數與 token、各 API 次數、快取命中率、平均耗時。"""
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    target = day or now.strftime("%Y-%m-%d")
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute(
+                    "SELECT gemini_calls,input_tokens,output_tokens,api_json,elapsed,cache_hit,route,ts "
+                    "FROM usage_log WHERE day=?", (target,)).fetchall()
+    except Exception:
+        rows = []
+    api_counts: Dict[str, int] = {}
+    routes: Dict[str, int] = {}
+    hours: Dict[str, int] = {}
+    total_elapsed = 0.0
+    slowest = 0.0
+    for gemini, tin, tout, api_json, elapsed, cache_hit, route, ts in rows:
+        try:
+            for name, info in (json.loads(api_json or "{}") or {}).items():
+                api_counts[name] = api_counts.get(name, 0) + int((info or {}).get("calls") or 0)
+        except Exception:
+            pass
+        routes[str(route or "")] = routes.get(str(route or ""), 0) + 1
+        hours[str(ts or "")[11:13]] = hours.get(str(ts or "")[11:13], 0) + 1
+        total_elapsed += float(elapsed or 0.0)
+        slowest = max(slowest, float(elapsed or 0.0))
+    count = len(rows)
+    return {
+        "day": target, "questions": count,
+        "gemini_calls": sum(int(r[0] or 0) for r in rows),
+        "input_tokens": sum(int(r[1] or 0) for r in rows),
+        "output_tokens": sum(int(r[2] or 0) for r in rows),
+        "cache_hits": sum(1 for r in rows if int(r[5] or 0)),
+        "cache_hit_rate": round(sum(1 for r in rows if int(r[5] or 0)) / count * 100, 1) if count else 0.0,
+        "avg_elapsed": round(total_elapsed / count, 2) if count else 0.0,
+        "slowest": round(slowest, 2),
+        "api_counts": dict(sorted(api_counts.items(), key=lambda x: -x[1])),
+        "routes": dict(sorted(routes.items(), key=lambda x: -x[1])),
+        "busiest_hour": max(hours.items(), key=lambda x: x[1])[0] + ":00" if hours else "",
+    }

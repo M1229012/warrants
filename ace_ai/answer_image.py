@@ -305,12 +305,12 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
         rows = []
         for name, color in palette.items():
             items = [e for e in events if str(e.get('branch') or '').strip() == name]
-            numbered = sorted({int(e['no']) for e in items if str(e.get('no', '')) != ''})
+            numbered = sorted({n for e in items for n in _mark_numbers(e)})
             buys = [e for e in items if e.get('action') == 'buy']
-            exits = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) != '']
-            plain = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) == '']
-            exited = {int(e['no']) for e in exits if str(e.get('no', '')) != ''}
-            holding = [e for e in buys if str(e.get('no', '')) != '' and int(e['no']) not in exited]
+            exits = [e for e in items if e.get('action') != 'buy' and _mark_numbers(e)]
+            plain = [e for e in items if e.get('action') != 'buy' and not _mark_numbers(e)]
+            exited = {n for e in exits for n in _mark_numbers(e)}
+            holding = [e for e in buys if _mark_numbers(e) and not set(_mark_numbers(e)) & exited]
             detail = "　".join(x for x in (
                 f"事件買進 {len(buys)} 筆" if buys else "",
                 f"已出清 {len(exits)} 筆" if exits else "",
@@ -326,7 +326,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             sx = x0 + 110
             draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            draw.text((x0 + 232, sy), '編號＝A～E 事件（出清與買進同號）；無編號＝減碼或零星賣出',
+            draw.text((x0 + 232, sy), '編號＝A～E 事件；賣出標的編號＝當天被清掉的那幾筆；無編號＝減碼或零星賣出',
                       font=font(18), fill=MUTED, anchor='lm')
             ly = sy + 30
             for name, color, detail in rows:
@@ -473,11 +473,23 @@ def _assign_rows(badges: list[dict]) -> None:
         last[row] = badge['cx']
 
 
+def _mark_numbers(mark: dict) -> list:
+    """標記上的編號；出清標記可能一次清掉多筆（no='1、3'，no_list=[1,3]）。"""
+    values = mark.get('no_list') or []
+    if values:
+        return [int(v) for v in values]
+    raw = str(mark.get('no', '')).strip()
+    return [int(raw)] if raw.isdigit() else []
+
+
 def _draw_badge(draw, cx, cy, number_text, color):
-    draw.ellipse((cx - MARK_BADGE_R, cy - MARK_BADGE_R, cx + MARK_BADGE_R, cy + MARK_BADGE_R),
-                 fill=color, outline='white', width=2)
-    size = 14 if len(str(number_text)) < 2 else 12
-    draw.text((cx, cy), str(number_text), font=font(size, True), fill='white', anchor='mm')
+    """一次清掉多筆時編號會是「1、3」，膠囊要跟著加寬，字才不會被圓圈切掉。"""
+    text = str(number_text)
+    size = 14 if len(text) < 2 else (12 if len(text) < 4 else 11)
+    half = max(MARK_BADGE_R, font(size, True).getlength(text) / 2 + 5)
+    draw.rounded_rectangle((cx - half, cy - MARK_BADGE_R, cx + half, cy + MARK_BADGE_R),
+                           radius=MARK_BADGE_R, fill=color, outline='white', width=2)
+    draw.text((cx, cy), text, font=font(size, True), fill='white', anchor='mm')
 
 
 def _dotted(draw, x, y_from, y_to, color):
@@ -1075,7 +1087,7 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     if show_tracked:
         period = card.get('tracked_branches_period') or ''
         # 不在圖片上寫「高勝率優先」等系統篩選說明；週精選只呈現文章實際提到的分點。
-        note = (f'{period}' if period else '')
+        note = (f'{period}｜剩餘部位為金額估算，僅供參考' if period else '剩餘部位為金額估算，僅供參考')
         h += _sub_heading(draw, px, y + h, '追蹤分點動向', note, width, dry)
         if branches:
             if not dry:
@@ -1095,7 +1107,7 @@ COMPARE_SCORE_H = 76
 def _branch_summary(card: dict) -> str:
     rows = card.get('tracked_branches') or []
     if not rows:
-        return '近 20 個交易日無 A～E 事件'
+        return '—'
     holding = [r for r in rows if str(r.get('status', '')).startswith('持有中')]
     high = [r for r in holding if r.get('is_high_win_rate')]
     text = f"{len(rows)} 家有事件｜持有中 {len(holding)} 家"
@@ -1124,8 +1136,10 @@ def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
         ('均線', lambda c: str(c.get('ma_alignment') or '—')),
         ('最近壓力', lambda c: _nearest_level(c, 'resistances_above_close')),
         ('最近支撐', lambda c: _nearest_level(c, 'supports_below_close')),
-        ('追蹤分點', _branch_summary),
     ]
+    # 兩檔都沒有 A～E 事件時（例如純比較型態的問題）不畫這一列，避免出現「無事件」這種與題目無關的字。
+    if any(c.get('tracked_branches') for c in cards):
+        rows.append(('追蹤分點', _branch_summary))
     if any(c.get('intraday_changes') for c in cards):
         rows.append(('盤中觀察', lambda c: '；'.join(str(t).replace('，尚待收盤確認', '') for t in (c.get('intraday_changes') or [])[:2]) or '—'))
     basis = str(cards[0].get('score_basis') or '收盤確認')

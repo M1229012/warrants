@@ -570,6 +570,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_stock_overview": "目前股價資料取得失敗",
     "get_technical_analysis": "目前股價／技術指標資料取得失敗",
     "get_volume_profile": "目前大量區資料取得失敗",
+    "get_futures_positions": "台指期未平倉資料取得失敗",
     "get_warrant_branch": "目前權證分點資料取得失敗",
     "get_high_winrate_branches_buying": "目前高勝率分點資料取得失敗",
     "get_branch_performance": "歷史分點統計目前無法取得",
@@ -1113,9 +1114,26 @@ def get_available_sheet_metadata() -> Dict[str, Any]:
 # 需要 Railway 變數 FUGLE_API_KEY；沒設定就完全照舊只用 FinMind。
 # ------------------------------------------------------------
 FUGLE_API_KEY = os.getenv("FUGLE_API_KEY", "").strip()
+# 備援金鑰：主鑰額度用盡（429）或被拒（401/403）時自動換下一支，換完一輪才放棄。
+FUGLE_API_KEYS = [k for k in (os.getenv(name, "").strip() for name in
+                              ("FUGLE_API_KEY", "FUGLE_API_KEY_2", "FUGLE_API_KEY_3")) if k]
+_FUGLE_KEY_INDEX = [0]
+
+
+def _fugle_key() -> str:
+    return FUGLE_API_KEYS[_FUGLE_KEY_INDEX[0] % len(FUGLE_API_KEYS)] if FUGLE_API_KEYS else FUGLE_API_KEY
+
+
+def _fugle_rotate_key() -> bool:
+    """換下一支金鑰；只剩一支就回 False。"""
+    if len(FUGLE_API_KEYS) <= 1:
+        return False
+    _FUGLE_KEY_INDEX[0] = (_FUGLE_KEY_INDEX[0] + 1) % len(FUGLE_API_KEYS)
+    print(f"🔁 富果改用備援金鑰 #{_FUGLE_KEY_INDEX[0] + 1}", flush=True)
+    return True
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FUGLE_TIMEOUT = _env_float("DISCORD_AI_FUGLE_TIMEOUT", 6.0)
-INTRADAY_ENABLE = bool(FUGLE_API_KEY) and os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+INTRADAY_ENABLE = bool(FUGLE_API_KEYS or FUGLE_API_KEY) and os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
 TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
 LIVE_PATTERN_SCORE = os.getenv("DISCORD_AI_LIVE_PATTERN_SCORE", "1").strip().lower() in ("1","true","yes","on")
 MARKET_CLOSE_HHMM = (13, 30)
@@ -1170,20 +1188,27 @@ def _fugle_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     else:
         _wait_for_fugle_user_slot()
     kf = core()
-    started = time.perf_counter(); status = 0
-    try:
-        response = kf.get_thread_session().get(
-            f"{FUGLE_BASE_URL}/{path}", params=params or {},
-            headers={"X-API-KEY": FUGLE_API_KEY, "Accept": "application/json"},
-            timeout=(4, FUGLE_TIMEOUT),
-        )
-        status = int(response.status_code)
-        if status == 429:
-            raise ToolDataError("富果 API 超過每分鐘呼叫上限")
-        response.raise_for_status()
-        return response.json() or {}
-    finally:
-        record_api_event("Fugle", status=status, latency=time.perf_counter()-started)
+    attempts = max(1, len(FUGLE_API_KEYS) or 1)
+    last_error: Optional[Exception] = None
+    for _ in range(attempts):
+        started = time.perf_counter(); status = 0
+        try:
+            response = kf.get_thread_session().get(
+                f"{FUGLE_BASE_URL}/{path}", params=params or {},
+                headers={"X-API-KEY": _fugle_key(), "Accept": "application/json"},
+                timeout=(4, FUGLE_TIMEOUT),
+            )
+            status = int(response.status_code)
+            if status in (401, 403, 429):
+                last_error = ToolDataError(f"富果 API 回應 {status}")
+                if _fugle_rotate_key():
+                    continue
+                raise ToolDataError("富果 API 超過每分鐘呼叫上限" if status == 429 else f"富果 API 金鑰被拒（{status}）")
+            response.raise_for_status()
+            return response.json() or {}
+        finally:
+            record_api_event("Fugle", status=status, latency=time.perf_counter()-started)
+    raise last_error or ToolDataError("富果 API 無可用金鑰")
 
 
 def _fugle_timestamp(value: Any) -> Optional[datetime]:
@@ -1243,7 +1268,7 @@ def _volume_suspect(volume_shares: float, stock_df: pd.DataFrame) -> bool:
 
 def calibrate_fugle_volume_unit(stock_code: str = "2330") -> str:
     """收盤後比對同一天「盤中報價累計量」與「日K成交量（股）」，確認盤中量的單位；只寫 Log，不改設定。"""
-    if not FUGLE_API_KEY:
+    if not (FUGLE_API_KEYS or FUGLE_API_KEY):
         return "未設定 FUGLE_API_KEY，略過"
     quote = _fugle_get(f"intraday/quote/{stock_code}")
     if not quote.get("isClose"):
@@ -1385,9 +1410,142 @@ def price_source_note(bundle: Dict[str, Any]) -> str:
     return f"日K＋今日正式收盤報價（{info['date']}）"
 
 
+
+# ============================================================
+# 大盤／櫃買指數（FinMind TaiwanStockPrice 的 TAIEX／TPEx，與個股同一條資料線）
+# ============================================================
+
+INDEX_CODES = {"TAIEX": "加權指數", "TPEX": "櫃買指數"}
+INDEX_FINMIND_ID = {"TAIEX": "TAIEX", "TPEX": "TPEx"}
+_INDEX_ALIASES = (
+    ("TAIEX", ("大盤", "加權指數", "加權", "台股指數", "台股大盤", "集中市場", "TAIEX", "台積電權值")),
+    ("TPEX", ("櫃買", "櫃買指數", "上櫃指數", "OTC指數", "櫃檯買賣", "TPEX", "OTC")),
+)
+
+
+def resolve_index_code(text: str) -> str:
+    """問句裡有沒有指到大盤或櫃買；兩個都提到時以先出現的為準。"""
+    value = str(text or "").upper()
+    found = []
+    for code, names in _INDEX_ALIASES:
+        for name in names:
+            position = value.find(str(name).upper())
+            if position >= 0:
+                found.append((position, code))
+                break
+    return min(found)[1] if found else ""
+
+
+def _fetch_index_daily(code: str) -> pd.DataFrame:
+    """指數日K：欄位與個股完全相同，後面所有指標、型態評分都能直接沿用。"""
+    kf = core()
+    end = taipei_now()
+    start = end - timedelta(days=400)
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data(
+            "TaiwanStockPrice", data_id=INDEX_FINMIND_ID.get(code, code),
+            start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d"), allow_empty=False,
+        ).fillna(0)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise
+    frame = raw.rename(columns={"date": "Date", "open": "Open", "max": "High", "min": "Low",
+                                "close": "Close", "Trading_Volume": "Volume"})
+    missing = {"Date", "Open", "High", "Low", "Close"} - set(frame.columns)
+    if missing:
+        raise ToolDataError("指數資料欄位不足：" + str(sorted(missing)))
+    if "Volume" not in frame.columns:
+        frame["Volume"] = 0.0
+    frame = frame[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (frame.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+             .drop_duplicates(subset=["Date"], keep="last").sort_values("Date").set_index("Date"))
+    if frame.empty:
+        raise ToolDataError(INDEX_CODES.get(code, code) + " 沒有可用的日K資料")
+    return frame
+
+
+def _load_index_bundle(code: str) -> Dict[str, Any]:
+    kf = core()
+
+    def build() -> Dict[str, Any]:
+        frame = _cached("index_daily_" + code, TTL_PRICE_SECONDS, lambda: _fetch_index_daily(code))
+        closed = kf.calculate_indicators(frame)
+        closed["Close_prev"] = closed["Close"].shift(1)
+        return {"df": closed, "closed_df": closed, "market": "index", "intraday": {},
+                "daily_source": "指數日K收盤資料"}
+
+    return _cached("price_" + code, TTL_PRICE_SECONDS, build)
+
+
+FUTURES_ID = os.getenv("DISCORD_AI_FUTURES_ID", "TX").strip() or "TX"
+
+
+def get_futures_positions(days: int = 10) -> Dict[str, Any]:
+    """三大法人台指期未平倉（FinMind）。只陳述口數與變化，不作多空判斷。"""
+    kf = core()
+    end = taipei_now()
+    start = end - timedelta(days=max(5, int(days or 10)) * 2 + 10)
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data(
+            "TaiwanFuturesInstitutionalInvestors", data_id=FUTURES_ID,
+            start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError("台指期未平倉資料暫時無法取得") from exc
+    if raw is None or raw.empty:
+        raise ToolDataError("台指期未平倉沒有資料")
+    frame = raw.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame.dropna(subset=["date"]).sort_values("date")
+    dates = sorted({d for d in frame["date"]})
+    if not dates:
+        raise ToolDataError("台指期未平倉沒有有效日期")
+    latest, previous = dates[-1], (dates[-2] if len(dates) > 1 else None)
+
+    def rows_for(day) -> Dict[str, Dict[str, float]]:
+        out = {}
+        subset = frame[frame["date"] == day]
+        for _, row in subset.iterrows():
+            name = str(row.get("institutional_investors") or "")
+            long_oi = float(row.get("long_open_interest_balance_volume") or 0.0)
+            short_oi = float(row.get("short_open_interest_balance_volume") or 0.0)
+            out[name] = {"long": long_oi, "short": short_oi, "net": long_oi - short_oi}
+        return out
+
+    today_rows = rows_for(latest)
+    prev_rows = rows_for(previous) if previous is not None else {}
+    investors = []
+    for name in ("外資", "外資及陸資", "投信", "自營商"):
+        info = today_rows.get(name)
+        if not info:
+            continue
+        before = (prev_rows.get(name) or {}).get("net")
+        investors.append({
+            "investor": name,
+            "long_oi": int(info["long"]), "short_oi": int(info["short"]), "net_oi": int(info["net"]),
+            "net_text": ("淨多 " if info["net"] >= 0 else "淨空 ") + format(int(abs(info["net"])), ","),
+            "change_vs_prev": int(info["net"] - before) if before is not None else None,
+        })
+    return {
+        "futures_id": FUTURES_ID, "data_date": latest.strftime("%Y/%m/%d"),
+        "previous_date": previous.strftime("%Y/%m/%d") if previous is not None else "",
+        "investors": investors,
+        "definition_note": "未平倉口數含現貨避險部位，不能單獨當作多空訊號；僅供參考",
+    }
+
+
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
+    if str(stock_code or "").strip().upper() in INDEX_CODES:
+        return _load_index_bundle(str(stock_code).strip().upper())
     code = kf._normalize_stock_name_code_key(stock_code)
 
     def daily() -> Tuple[pd.DataFrame, str, str]:
@@ -1408,7 +1566,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         except Exception as exc:  # FinMind 失敗時才以富果歷史日K備援；正常盤中不拿富果做歷史預抓。
             record_api_event("FinMindData", status=500)
             error = exc
-        if not FUGLE_API_KEY:
+        if not (FUGLE_API_KEYS or FUGLE_API_KEY):
             raise ToolDataError(f"{code} 沒有股價資料：{type(error).__name__}: {error}")
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
@@ -1479,6 +1637,9 @@ def intraday_observation(bundle: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _stock_identity(stock_code: str) -> Tuple[str, str]:
+    raw = str(stock_code or "").strip().upper()
+    if raw in INDEX_CODES:
+        return raw, INDEX_CODES[raw]
     code = core()._normalize_stock_name_code_key(stock_code)
     if not code:
         raise ToolDataError("股票代號不可為空")
@@ -3240,7 +3401,7 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
     """個股的「回測追蹤分點」權證籌碼（全部讀 Google Sheet，不即時抓 MoneyDJ）。
 
     - 最近 N 個交易日的 A～E 大額買進事件（事件定義＝回測程式）
-    - 近 20 個交易日的減碼／出清（每日賣出明細）與目前未出清事件（FIFO）
+    - 同一視窗內的減碼／出清（每日賣出明細）與未出清事件（出清需與賣出明細對得上）
     - 每個分點的總勝率（背景）與本次事件別勝率
     """
     code, name = _stock_identity(stock_code)
@@ -3272,9 +3433,15 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
         keys = list(zip(sells["_branch"], pd.to_datetime(sells["_date"]).dt.normalize()))
         sells = sells[[key not in day_trade_sell_keys for key in keys]]
     sells_long = sells[sells["_date"] >= start_long] if not sells.empty else sells
-    # 零星小額賣出（例如幾千元出清尾單）不列入，避免清單被雜訊塞滿。
+    # 出清核對用的原始賣出（不套金額門檻），與 K 線標註同一套規則，避免圖文不一致。
+    verified_sell_keys = set()
     if not sells_long.empty:
-        sells_long = sells_long[sells_long["_amount"] >= SHEET_CHIPS_MIN_SELL_AMOUNT]
+        for _, srow in sells_long.iterrows():
+            if float(srow.get("_amount") or 0.0) > 0:
+                verified_sell_keys.add((str(srow["_branch"]), pd.Timestamp(srow["_date"]).normalize()))
+    # 顯示用的賣出門檻與 K 線標註一致（低於門檻的零星賣出不列）。
+    if not sells_long.empty:
+        sells_long = sells_long[sells_long["_amount"] >= MIN_SELL_MARK_AMOUNT]
 
     branches = set(stock_events.loc[stock_events["event_date"] >= start_long, "branch"])
     if not sells_long.empty:
@@ -3290,12 +3457,30 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
             c for c in EVENT_CODES if c in set(long_events["event_code"])
         ]
         brief = _branch_perf_brief(perf, branch, codes)
-        if not open_events.empty:
-            position = f"仍有 {len(open_events)} 筆 A～E 事件未出清（最早 {_fmt_date(open_events['event_date'].min())}）"
-        elif not b_events.empty:
-            position = "A～E 事件已全部出清"
-        else:
+        # 視窗內的事件才算數，而且「出清」要和每日賣出明細對得上（與 K 線標註同一套規則）。
+        window_events = long_events
+        exited = 0
+        for _, erow in window_events.iterrows():
+            exit_date = erow.get("exit_date")
+            if exit_date is None or pd.isna(exit_date):
+                continue
+            if (branch, pd.Timestamp(exit_date).normalize()) in verified_sell_keys:
+                exited += 1
+        total_events = int(len(window_events))
+        holding = max(0, total_events - exited)
+        buy_sum = float(window_events["buy_amount"].sum()) if total_events else 0.0
+        sell_sum = float(b_sells["_amount"].sum()) if not b_sells.empty else 0.0
+        remain_pct = None
+        if buy_sum > 0:
+            remain_pct = max(0.0, min(100.0, (1.0 - sell_sum / buy_sum) * 100.0))
+        if total_events == 0:
             position = "只有賣出紀錄，沒有 A～E 買進事件"
+        elif holding <= 0:
+            position = f"{total_events} 筆 A～E 事件已全部出清"
+        else:
+            position = f"持有中 {holding}/{total_events} 筆"
+            if remain_pct is not None and sell_sum > 0:
+                position += f"・估剩約 {remain_pct:.0f}%（僅供參考）"
         rows.append({
             "branch": branch,
             "is_high_win_rate": branch in high_set,
@@ -3304,7 +3489,10 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
             "event_buy_amount_lookback_text": _money_text(long_events["buy_amount"].sum()) if not long_events.empty else "-",
             "_sort_recent": float(recent["buy_amount"].sum()) if not recent.empty else 0.0,
             "_sort_long": float(long_events["buy_amount"].sum()) if not long_events.empty else 0.0,
-            "open_event_count": int(len(open_events)),
+            "open_event_count": int(holding),
+            "event_count_lookback": int(total_events),
+            "exited_count_lookback": int(exited),
+            "remaining_pct_estimate": _num(remain_pct) if remain_pct is not None else None,
             "position_status": position,
             "reduce_or_exit_lookback": [
                 {"date": _fmt_date(r["_date"]), "action": _clean_cell(r.get("狀態", "")), "sell_amount_text": _money_text(r["_amount"])}
@@ -3497,6 +3685,8 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     否則只標「勝率統計總勝率 ≥ 高勝率門檻」的追蹤分點與精選五分點（本週精選也一樣）。
     買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
     """
+    if str(stock_code or "").strip().upper() in INDEX_CODES:
+        return {"mode": "flow", "source": "index", "events": []}
     kf = core()
     if not dates:
         return {}
@@ -3618,6 +3808,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
     marks: List[Dict[str, Any]] = []
     paired_sells: set = set()
     unverified: List[str] = []
+    exit_groups: Dict[Tuple[str, pd.Timestamp], Dict[str, Any]] = {}
     ordered = list(rows.sort_values(["event_date", "branch"]).itertuples())
     # A～E 事件的買進一律給編號；同一筆事件的出清沿用同一個編號。
     for no, row in enumerate(ordered, 1):
@@ -3640,10 +3831,12 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
                 unverified.append(f"{branch} {exit_day}")
                 continue
             paired_sells.add(key)
-            # 已確認的出清一定標，金額再小也要畫（「那 20 萬賣完就出清」）。
-            marks.append({"no": no, "branch": branch, "event_codes": event_code, "kind": "event_exit",
-                          "action": "sell", "action_text": "事件出清", "action_date": exit_day,
-                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
+            # 同一天同一個分點可能一次清掉好幾筆事件：合併成一個標記，編號列出被清掉的那幾筆，
+            # 金額只算一次（當日該分點的賣出合計），否則同一筆賣出會被重複計算。
+            group = exit_groups.setdefault(key, {"nos": [], "codes": [], "day": exit_day, "amount": amount})
+            group["nos"].append(no)
+            if event_code and event_code not in group["codes"]:
+                group["codes"].append(event_code)
         reduce_date = getattr(row, "reduce_date", None)
         reduce_day = in_chart(reduce_date)
         if reduce_day and reduce_day != exit_day:
@@ -3655,6 +3848,16 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
                 marks.append({"no": "", "branch": branch, "event_codes": event_code, "kind": "reduce",
                               "action": "sell", "action_text": "減碼", "action_date": reduce_day,
                               "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
+
+    # 出清標記：一個分點、同一天只畫一個 ▼，編號＝當天被清掉的那幾筆買進的號碼。
+    for (branch, _day), group in exit_groups.items():
+        nos = sorted(group["nos"])
+        label = "、".join(str(n) for n in nos[:3]) + (f"…共{len(nos)}筆" if len(nos) > 3 else "")
+        amount = float(group["amount"] or 0.0)
+        marks.append({"no": label, "no_list": nos, "branch": branch, "event_codes": "＋".join(group["codes"]),
+                      "kind": "event_exit", "action": "sell", "action_text": "事件出清",
+                      "action_date": group["day"], "net_amount": _num(-amount, 0),
+                      "net_amount_text": _money_text(-amount)})
 
     known_branches = {str(b) for b in rows["branch"].unique()} if not rows.empty else set()
     for (branch, day), amount in sorted(sell_amounts.items(), key=lambda item: -item[1]):
@@ -3967,6 +4170,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_stock_overview": get_stock_overview,
     "get_technical_analysis": get_technical_analysis,
     "get_volume_profile": get_volume_profile,
+    "get_futures_positions": get_futures_positions,
     "get_warrant_branch": get_warrant_branch,
     "get_high_winrate_branches_buying": get_high_winrate_branches_buying,
     "get_branch_performance": get_branch_performance,
@@ -3989,6 +4193,7 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
     "get_branch_stock_position": "分點在某股票的部位是否還在（回測 FIFO 狀態＋每日賣出明細）（參數 branch_name, stock_code）",
     "get_stock_overview": "股價概況：收盤、漲跌幅、成交量、均量、量比（參數 stock_code）",
     "get_technical_analysis": "技術面：MA5/10/20/60、均線排列、MA20突破跌破、KD、MACD、OSC、布林（參數 stock_code）",
+    "get_futures_positions": "三大法人台指期未平倉口數與前一日變化（不需參數）；含避險部位，僅供參考",
     "get_volume_profile": "大量區：最大／第二大量區價格、現價位置、突破跌破回踩、價量型態（參數 stock_code）",
     "get_warrant_branch": "個股近N日權證分點買賣超排行與ABCDE事件（參數 stock_code, days=5/10/20）",
     "get_high_winrate_branches_buying": "個股近期買超分點 join 歷史勝率（參數 stock_code, days）",

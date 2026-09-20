@@ -39,6 +39,32 @@ import weekly_pick
 import answer_image
 import weekly_image
 import sector_analysis
+import sys
+
+import sector_match
+import sector_radar
+
+# 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
+# 這裡只在 Bot 行程過濾，不動主程式，週報與回測的輸出完全不受影響。
+_LOG_MUTE_PATTERNS = tuple(x for x in os.getenv("DISCORD_AI_LOG_MUTE", "週報統計區間").split("|") if x)
+
+
+class _FilteredStdout:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        if _LOG_MUTE_PATTERNS and any(p in text for p in _LOG_MUTE_PATTERNS):
+            return len(text)
+        return self._stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if _LOG_MUTE_PATTERNS and not isinstance(sys.stdout, _FilteredStdout):
+    sys.stdout = _FilteredStdout(sys.stdout)
+
 import market_data
 import market_scan
 import sector_roster
@@ -153,6 +179,8 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "warrant": ("權證", "分點", "籌碼", "主力", "加碼", "買超", "賣超", "大戶", "進場"),
     "win_rate": ("勝率", "績效", "歷史表現", "表現", "報酬率", "準不準", "準確"),
     "rank": ("排行", "排名", "前幾", "最準"),
+    "volume": ("爆量", "量能", "均量", "放量", "量縮", "量增", "帶量", "窒息量"),
+    "futures": ("台指期", "期貨", "未平倉", "空單", "多單", "三大法人期貨", "外資期貨"),
     "news": ("新聞", "消息", "題材", "公告", "營收", "法說", "重訊", "利多", "利空"),
     "history": ("過去", "歷史", "以前", "之前", "相比", "比較", "對比"),
     "recent_trades": ("買什麼", "在買", "買了", "最近買", "賣什麼", "在賣", "操作", "進出", "布局", "佈局"),
@@ -238,6 +266,12 @@ class QuestionParser:
         kf = tools.core()
         text_upper = question.upper()
         parsed = ParsedQuestion(original=question, intents=self.detect_intents(text_upper))
+        index_code = tools.resolve_index_code(question)
+        if index_code:
+            # 大盤／櫃買走和個股完全相同的型態流程（K 線＋評分卡＋AI），資料來自指數日K。
+            parsed.stocks = [(index_code, tools.INDEX_CODES[index_code])]
+            parsed.intents.add("index")
+            return parsed
 
         cost_match = COST_RE.search(question)
         if cost_match:
@@ -469,6 +503,13 @@ class QueryRouter:
             return self._pattern_plan(parsed)
         if parsed.stocks:
             return self._stock_plan(parsed, categories, analysis)
+        if "futures" in intents and not parsed.branches:
+            plan = QueryPlan(route="rule_futures", need_final_llm=True)
+            plan.add("get_futures_positions")
+            for code, _ in parsed.stocks[:1]:
+                plan.add("get_stock_overview", stock_code=code)
+                plan.add("get_technical_analysis", stock_code=code)
+            return plan
         if not parsed.stocks and is_top_warrant_question(parsed):
             # 「權證買超金額最大的是誰」：先讀 TOP15 共識淨買超排行，引擎再對第一名補型態資料與 K 線（仍只呼叫 1 次 Gemini）。
             plan = QueryPlan(route="rule_top_warrant", need_final_llm=True)
@@ -557,6 +598,9 @@ class QueryRouter:
             plan.add("get_volume_profile", stock_code=code)
             if parsed.cost_price is not None:
                 plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
+            if code in tools.INDEX_CODES:
+                # 大盤／櫃買固定附上三大法人台指期未平倉（僅供參考，不做多空判斷）。
+                plan.add("get_futures_positions")
             # 純型態問題只算技術結構，不讀權證分點，避免圖片過長與不必要的 Sheet 呼叫。
         return plan
 
@@ -781,11 +825,32 @@ class GeminiGateway:
     - 同一時間最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 2）個 Gemini 呼叫，避免被併發打爆額度。
     """
 
+    DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_GEMINI_DAILY_LIMIT", 0))   # 0＝不限
+
     def __init__(self, log: DebugLog) -> None:
         self.log = log
         self._lock = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_CONCURRENCY", 2)))
+        self._day = ""
+        self._day_calls = 0
+        self._count_lock = threading.Lock()
+
+    def _quota_left(self) -> bool:
+        """免費方案有每日請求上限；超過軟上限就只出規則式內容，不再呼叫 AI。"""
+        if not self.DAILY_LIMIT:
+            return True
+        today = tools.taipei_now().strftime("%Y-%m-%d")
+        with self._count_lock:
+            if self._day != today:
+                self._day, self._day_calls = today, 0
+            if self._day_calls >= self.DAILY_LIMIT:
+                return False
+            self._day_calls += 1
+            return True
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
+        if not self._quota_left():
+            self.log(f"Gemini 今日次數已達上限 {self.DAILY_LIMIT}，改用規則式輸出：{purpose}")
+            return GeminiResult(ok=False, text="", error="daily_limit")
         kf = tools.core()
         _install_gemini_error_recorder(kf)
         if not kf.GEMINI_ENABLE:
@@ -991,6 +1056,9 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
     return _prune_empty({"question": question, "tool_results": tool_results})
 
 
+FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
+
+
 def build_final_prompt(payload: Dict[str, Any]) -> str:
     """只放這題用得到的規則：技術面、新聞、型態評分卡各自一段，避免每題都送全部規則。"""
     names = {key.split(":", 1)[0] for key in (payload.get("tool_results") or {})}
@@ -1001,6 +1069,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
         sections.append(FINAL_CHIPS_RULES)
+    if "get_futures_positions" in names:
+        sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
     if "get_pattern_scorecard" in names:
@@ -1434,6 +1504,19 @@ def format_technical(d: Dict[str, Any]) -> str:
     )
 
 
+def format_futures(data: Dict[str, Any]) -> str:
+    rows = data.get("investors") or []
+    lines = [f"**三大法人台指期未平倉｜{data.get('data_date', '')}**"]
+    for row in rows:
+        change = row.get("change_vs_prev")
+        delta = ""
+        if change is not None:
+            delta = f"（較前一日{'增加' if change > 0 else '減少'} {abs(int(change)):,} 口）" if change else "（與前一日相同）"
+        lines.append(f"・{row['investor']}：{row['net_text']} 口{delta}")
+    lines.append("※ 未平倉含現貨避險部位，僅供參考，不作多空判斷。")
+    return chr(10).join(lines)
+
+
 def format_volume_profile(d: Dict[str, Any]) -> str:
     window = d.get("analysis_window") or {}
     lines = [f"📊 大量區（{window.get('start')}～{window.get('end')}，{window.get('trading_days')} 根日K）"]
@@ -1605,6 +1688,7 @@ def format_sheet_query(d: Dict[str, Any]) -> str:
 FORMATTERS = {
     "get_stock_overview": format_overview,
     "get_technical_analysis": format_technical,
+    "get_futures_positions": format_futures,
     "get_volume_profile": format_volume_profile,
     "get_warrant_branch": format_warrant,
     "get_high_winrate_branches_buying": format_high_winrate,
@@ -1915,8 +1999,14 @@ MEMORY_MINUTES = tools._env_int("DISCORD_AI_MEMORY_MINUTES", 30)
 # 週精選草稿編輯 session 比一般追問長很多：管理員常常改一改、去看盤、再回來改。
 WEEKLY_DRAFT_MINUTES = max(10, tools._env_int("DISCORD_AI_WEEKLY_DRAFT_MINUTES", 120))
 MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
+INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 _FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
+# 打招呼、閒聊這類不該接上一題的句子。
+_SMALLTALK_RE = re.compile(r"^(你好|哈囉|hi|hello|在嗎|嗨|謝謝|感謝|早安|午安|晚安|測試)")
+_ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十1-9])\s*名?|冠軍|榜首|龍頭|亞軍|季軍")
+_ORDINAL_WORDS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_SECTOR_ROWS_TTL = 1800
 _COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
 
 
@@ -1936,7 +2026,38 @@ class ConversationMemory:
         self.ttl = max(1, minutes) * 60
         self.max_entries = max(100, max_entries)
         self._data: "OrderedDict[str, MemoryEntry]" = OrderedDict()
+        self._sector_rows: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
         self._lock = threading.Lock()
+
+    def remember_sector_rows(self, industry: str, rows: List[Tuple[str, str]]) -> None:
+        """記住某族群排行的前幾名，讓「第一名的壓力在哪」接得起來（只存代號與名稱）。"""
+        if not industry or not rows:
+            return
+        with self._lock:
+            self._sector_rows[str(industry)] = (time.time(), list(rows)[:5])
+            for key in [k for k, (stamp, _) in self._sector_rows.items() if time.time() - stamp > _SECTOR_ROWS_TTL]:
+                self._sector_rows.pop(key, None)
+
+    def sector_rows(self, industry: str) -> List[Tuple[str, str]]:
+        with self._lock:
+            stamp, rows = self._sector_rows.get(str(industry), (0.0, []))
+        return list(rows) if stamp and time.time() - stamp <= _SECTOR_ROWS_TTL else []
+
+    def _ordinal_stocks(self, text: str, entry: "MemoryEntry") -> List[Tuple[str, str]]:
+        """把「第一名」「跟第二名比呢」換成上一題族群排行的個股（最多 2 檔）。"""
+        rows = self.sector_rows(str((entry.sector or {}).get("industry") or ""))
+        if not rows:
+            return []
+        picks: List[Tuple[str, str]] = []
+        for match in _ORDINAL_RE.finditer(text):
+            token, digit = match.group(0), match.group(1)
+            if digit:
+                index = int(digit) if digit.isdigit() else _ORDINAL_WORDS.get(digit, 0)
+            else:
+                index = {"冠軍": 1, "榜首": 1, "龍頭": 1, "亞軍": 2, "季軍": 3}.get(token, 0)
+            if 1 <= index <= len(rows) and rows[index - 1] not in picks:
+                picks.append(rows[index - 1])
+        return picks[:2]
 
     def get(self, key: str) -> Optional[MemoryEntry]:
         if not key:
@@ -1966,7 +2087,7 @@ class ConversationMemory:
         if parsed.sector is not None:
             # 族群問題：記住這個族群，後續「那誰型態最好」才接得起來；個股記憶則清掉。
             sector = parsed.sector
-            if not key or sector.get("mode") in ("catalog", "unsupported") or not sector.get("industry"):
+            if not key or sector.get("mode") in ("catalog", "unsupported", "belongs") or not sector.get("industry"):
                 self.clear(key)
                 return
             with self._lock:
@@ -1996,15 +2117,23 @@ class ConversationMemory:
         entry = self.get(key)
         if entry is None:
             return ""
-        if entry.sector and not parsed.stocks and not parsed.branches and sector_analysis.is_sector_follow_up(parsed.original):
-            follow_up = sector_analysis.follow_up_request(parsed.original, entry.sector)
-            if follow_up:
-                parsed.sector = follow_up
-                parsed.intents = set(parsed.intents) | {"sector"}
-                return f"延續上一題的族群：{entry.sector.get('name', '')}"
+        text = parsed.original
+        if entry.sector and not parsed.stocks and not parsed.branches:
+            # 「第一名的壓力在哪」「跟第二名比呢」：把名次換成上一題排行的個股。
+            picked = self._ordinal_stocks(text, entry)
+            if picked:
+                parsed.stocks = picked
+                names = "、".join(f"{n or c}（{c}）" for c, n in picked)
+                return f"延續上一題的族群排行：{names}"
+            if sector_analysis.is_sector_follow_up(text):
+                follow_up = sector_analysis.follow_up_request(text, entry.sector)
+                if follow_up:
+                    parsed.sector = follow_up
+                    parsed.intents = set(parsed.intents) | {"sector"}
+                    return f"延續上一題的族群：{entry.sector.get('name', '')}"
+            return ""
         if not entry.stocks:
             return ""
-        text = parsed.original
         names = "、".join(f"{name or code}（{code}）" for code, name in entry.stocks)
         if parsed.stocks:
             if len(parsed.stocks) == 1 and _COMPARE_RE.search(text) and parsed.stocks[0][0] != entry.stocks[0][0]:
@@ -2020,8 +2149,11 @@ class ConversationMemory:
             return ""  # 排行、分點勝率這類問題本來就不針對單一股票
         if parsed.branches and "position" not in parsed.intents and not _FOLLOWUP_HINT_RE.search(text):
             return ""  # 例如「永豐金內湖最近在買什麼」：問的是分點本身
-        if not (parsed.intents - {"rank"}) and not _FOLLOWUP_HINT_RE.search(text) and parsed.cost_price is None:
-            return ""  # 看不出是股票問題（例如打招呼），不要硬接上一題
+        # 預設沿用上一題的股票；只有打招呼、或句子裡出現「新主題」（別的族群／專有名詞）時才不接。
+        if _SMALLTALK_RE.match(text.strip()):
+            return ""
+        if sector_match.has_new_topic(text) and not _FOLLOWUP_HINT_RE.search(text):
+            return ""
         parsed.stocks = list(entry.stocks)
         if parsed.cost_price is None and entry.cost_price and ("cost" in parsed.intents or "成本" in text):
             parsed.cost_price = entry.cost_price
@@ -2187,7 +2319,8 @@ class AceQueryEngine:
 
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
     TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
-                   "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint"}
+                   "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
+                   "admin_usage"}
 
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False) -> AnswerResult:
@@ -2198,6 +2331,17 @@ class AceQueryEngine:
             with tools.api_request_scope(request_id):
                 result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode)
             usage = tools.request_api_usage(request_id, clear=True)
+            # 每題的用量寫進本地 SQLite（保留 30 天），「/ace 用量」與負載評估都讀這張表。
+            try:
+                local_market_cache.log_usage(result.route, result.gemini_calls, result.input_tokens,
+                                             result.output_tokens, result.token_source, usage,
+                                             result.elapsed, result.cache_hit)
+            except Exception:
+                pass
+            print(f"📊 usage｜route={result.route}｜cache={'hit' if result.cache_hit else 'miss'}｜"
+                  f"{result.elapsed:.1f}s｜Gemini {result.gemini_calls} 次"
+                  f"（in {result.input_tokens:,} / out {result.output_tokens:,} / {result.token_source}）｜"
+                  f"API {usage}", flush=True)
             return replace(result, request_id=request_id, api_usage=usage,
                            as_text=result.as_text or result.route in self.TEXT_ROUTES)
         finally:
@@ -2278,6 +2422,24 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("用量", "使用量", "今日用量", "usage"):
+            info = local_market_cache.usage_summary()
+            api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
+            text = (f"**用量｜{info['day']}**" + chr(10) +
+                    f"題數 {info['questions']}｜快取命中 {info['cache_hits']}（{info['cache_hit_rate']}%）" + chr(10) +
+                    f"Gemini {info['gemini_calls']} 次｜tokens in {info['input_tokens']:,} / out {info['output_tokens']:,}" + chr(10) +
+                    f"API：{api_text}" + chr(10) +
+                    f"平均耗時 {info['avg_elapsed']}s｜最慢 {info['slowest']}s｜尖峰 {info.get('busiest_hour') or '-'}")
+            return AnswerResult(text=text, route="admin_usage", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("族群資金流向", "資金流向", "轉強族群", "族群轉強", "轉弱族群", "族群雷達", "哪個族群在轉強", "哪些族群在轉強"):
+            if not sector_radar.ready_for_query():
+                sector_radar.tick()
+            data = sector_radar.report()
+            panels = sector_radar.panels(data) if data.get("available") else []
+            return AnswerResult(text=sector_radar.format_report(data), route="admin_radar", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
+                                as_text=not panels)
         if compact in ("更新族群名冊", "重建族群名冊", "更新名冊"):
             def job() -> None:
                 try:
@@ -2565,6 +2727,53 @@ class AceQueryEngine:
         parsed = self.parser.parse(question)
         return parsed, self.router.plan(parsed, stats), stats
 
+    def _classify_fallback(self, question: str, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[QueryPlan]:
+        """規則認不出來時，花 1 次 Gemini 只做「主題／動作」分類（不產生任何數字）。"""
+        if not INTENT_FALLBACK_ENABLE:
+            return None
+        schema = {"type": "object", "properties": {
+            "subject": {"type": "string"}, "action": {"type": "string"}, "target": {"type": "string"}},
+            "required": ["subject", "action", "target"]}
+        prompt = ("你是台股問句分類器，只輸出 JSON，不要解釋、不要回答問題本身。\n"
+                  'subject 從 ["stock","sector","market","branch","none"] 擇一；'
+                  'action 從 ["pattern","members","rank","compare","chips","news","price","none"] 擇一；'
+                  "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串。\n問題：" + question)
+        result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+        stats.record_gemini(result)
+        if not result.ok:
+            return None
+        try:
+            payload = json.loads(result.text)
+        except (ValueError, TypeError):
+            return None
+        subject = str(payload.get("subject") or "").strip()
+        action = str(payload.get("action") or "").strip()
+        target = str(payload.get("target") or "").strip()
+        self.log(f"🧭 AI 分類：subject={subject}｜action={action}｜target={target}")
+        if subject == "sector" and target:
+            hit = sector_match.match(target)
+            if hit:
+                mode = {"members": "members", "rank": "technical", "pattern": "technical"}.get(action, "technical")
+                parsed.sector = {"mode": mode, "industry": hit["industry"], "name": hit["name"]}
+                parsed.intents = set(parsed.intents) | {"sector"}
+                return QueryPlan(route="rule_sector", need_final_llm=mode in ("technical", "momentum"))
+        if subject == "stock" and target:
+            try:
+                retry = self.parser.parse(target)
+            except Exception:
+                retry = None
+            if retry is not None and retry.stocks:
+                parsed.stocks = list(retry.stocks[:2])
+                parsed.intents = set(parsed.intents) | set(retry.intents)
+                return self.router.plan(parsed, stats)
+        near = sector_match.suggest(target or question)
+        if near:
+            options = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(near[:3]))
+            return QueryPlan(route="clarify",
+                             clarification=f"不太確定你要問的是哪一個，是不是這幾個族群之一？\n{options}\n"
+                                           "可以直接輸入族群名稱，或用股票代號問我。")
+        return None
+
     def _answer_uncached(self, question: str, started: float, parsed: Optional[ParsedQuestion] = None) -> AnswerResult:
         stats = AnswerStats()
         self.log(f"使用者問題：{question}")
@@ -2576,6 +2785,12 @@ class AceQueryEngine:
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         plan = self.router.plan(parsed, stats)
+        if plan.route == "help":
+            plan = self._classify_fallback(question, parsed, stats) or plan
+        self.log(
+            f"🧭 主題={'族群:' + str((parsed.sector or {}).get('name', '')) if parsed.sector else ('個股:' + ','.join(c for c, _ in parsed.stocks) if parsed.stocks else ('分點:' + ','.join(parsed.branches) if parsed.branches else '無'))}"
+            f"｜動作={(parsed.sector or {}).get('mode', '') or ','.join(sorted(parsed.intents)) or '-'}"
+        )
         self.log(
             f"路由={plan.route}｜planner={plan.planner_used}｜final_llm={plan.need_final_llm}｜"
             f"tools={[c.name + json.dumps(c.kwargs, ensure_ascii=False) for c in plan.tool_calls]}"
@@ -2654,6 +2869,15 @@ class AceQueryEngine:
             return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
 
         result = sector_analysis.answer(request, self.gateway, validate)
+        # 記住排行前幾名，讓「第一名的壓力在哪」「跟第二名比呢」接得起來。
+        try:
+            sector_panel = ((result.get("panels") or [{}])[0] or {}).get("sector") or {}
+            rows = [(str(r.get("stock_code") or ""), str(r.get("stock_name") or ""))
+                    for r in (list(sector_panel.get("rows") or []) + list(sector_panel.get("others") or []))
+                    if r.get("stock_code")]
+            self.memory.remember_sector_rows(str(request.get("industry") or ""), rows)
+        except Exception:
+            pass
         # 會員看到的是 panels 畫出的族群卡片；text 保留給 Log 與 --ask。
         return AnswerResult(text=result["text"], route="rule_sector", gemini_calls=result["calls"],
                             elapsed=time.perf_counter() - started, cacheable=result["cacheable"],
@@ -2862,6 +3086,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `系統狀態`：名冊、日K底庫、型態分數、是否永久保存
 • `更新市場底庫`：補齊全市場日K（每個交易日 2 個請求）
 • `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
+• `族群資金流向`：盤中轉強／轉弱族群名次變化
+• `用量`：今日 Gemini 與各 API 使用量
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
 
@@ -2913,6 +3139,12 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
         try:
             info = market_data.coverage()
             now = tools.taipei_now()
+            # 盤中每隔幾分鐘存一張族群漲幅快照（2 個請求、0 次 Gemini），供轉強／轉弱雷達比較。
+            if sector_radar.session_open(now):
+                try:
+                    sector_radar.tick()
+                except Exception as exc:
+                    print(f"⚠️ 族群雷達快照略過｜{type(exc).__name__}", flush=True)
             today = now.strftime("%Y-%m-%d")
             minutes = now.hour * 60 + now.minute
             after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5

@@ -22,6 +22,7 @@ import cmoney_sector_catalog as cmoney_catalog
 import local_market_cache
 import market_scan
 import sector_roster
+import sector_match
 
 
 # 只對照分類名稱與官方代碼，成分股一律從資料來源取得。
@@ -61,107 +62,84 @@ MIN_AVG_VALUE = max(0.0, tools._env_float("DISCORD_AI_SECTOR_MIN_AVG_VALUE", 50_
 MIN_AVG_LOTS = max(0.0, tools._env_float("DISCORD_AI_SECTOR_MIN_AVG_LOTS", 500.0))            # 張
 
 
+_FOLLOW_UP_RE = re.compile(r"誰|哪[一幾]?[檔支家個]|最強|最好|最弱|排行|排名|型態|形態|技術|漲幅|漲跌|漲最|成分|名單|名冊|有哪些|有什麼|壓力|支撐|大量區|爆量")
+
+
+def _residual(question: str, pattern: str) -> str:
+    """把問句裡的通用字拿掉之後還剩什麼；還有殘字＝句子裡有特定主題，不能當成全市場或清單問題。"""
+    value = sector_match.core_topic(question)
+    for _ in range(3):
+        trimmed = re.sub(pattern, "", value)
+        if trimmed == value:
+            break
+        value = trimmed
+    return value
+
+
 def detect_request(question: str) -> Optional[Dict[str, str]]:
-    # 先做使用者輸入容錯；只修文字，不改股票池。
-    text = cmoney_catalog.normalize_text(question)
-    # 明確個股代號仍走原本個股流程。
-    if re.search(r"(?<![A-Z0-9])\d{4,6}[A-Z]?(?![A-Z0-9])", text):
-        return None
-    # 泛指「有哪些族群／查看族群清單」時直接顯示族群目錄。
-    # 這裡只吃「沒有指定特定族群名稱」的清單問法，避免把「散熱族群有哪些股票」誤判成總清單。
-    catalog_patterns = (
-        r"(?:查看|查詢|看|顯示|列出|打開|給我|想看)?(?:全部|所有|目前|現在)?(?:可查詢|可查|支援)?(?:的)?(?:族群|類股|產業)(?:清單|列表|名冊|分類)",
-        r"(?:有哪[些個]|有哪些|有那些|有什麼|有啥|哪些|那些)(?:族群|類股|產業)",
-        r"(?:支援|可以查|可查|能查|可查詢).*(?:哪些|那些|什麼|哪一些)?(?:族群|類股|產業)",
-        r"(?:族群|類股|產業)(?:有哪[些個]|有哪些|有那些|有什麼|有啥)$",
-        r"(?:查看|查詢|看|顯示|列出|打開|給我|想看)(?:全部|所有|目前|現在)?(?:的)?(?:族群|類股|產業)$",
-        r"^(?:全部|所有)(?:族群|類股|產業)$",
-    )
-    if any(re.search(pattern, text) for pattern in catalog_patterns):
-        return {"mode": "catalog", "industry": "", "name": "產業分類"}
-
-    # 全市場族群問題，不要求先指定單一族群。
-    if re.search(r"(?:所有|全部|整體|目前|現在).*(?:族群|類股|產業).*(?:最強|最好|排行|排名)", text) or re.search(r"(?:哪個|哪些|誰)(?:族群|類股|產業).*(?:最強|最好|漲最|漲幅)", text):
-        if re.search(r"型態|形態|技術", text):
-            return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
-        return {"mode": "market_momentum", "industry": "", "name": "全市場族群"}
-
-    group_question = bool(re.search(r"族群|類股|產業|概念股|哪[一幾些個]?[檔支家個]|誰|排行|排名|成分|名單|名冊|比較|最強|最好|有哪些", text))
-    if not group_question:
+    """判斷這題是不是族群問題；族群名稱一律由 sector_match 決定（全系統唯一入口）。"""
+    text = sector_match.normalize(question)
+    action = sector_match.action_of(question, default="")
+    code_match = re.search(r"(?<![A-Z0-9])(\d{4,6}[A-Z]?)(?![A-Z0-9])", text)
+    if code_match:
+        # 「2330屬於什麼族群」＝反查；其餘帶代號的問題仍走個股流程。
+        if action == "belongs":
+            code = code_match.group(1)
+            return {"mode": "belongs", "industry": "", "name": code, "stock_code": code}
         return None
 
-    # 自建名冊優先：名冊是掃全市場建的，成分完整，而且查詢時不用連外。
-    hit = sector_roster.match_group(text) if sector_roster.available() else None
+    hit = sector_match.match(question)
     if hit:
-        request = _request_mode(text, "roster:" + hit["code"], hit["name"])
+        if action == "blocked":
+            return {"mode": "unsupported", "industry": "", "name": hit["name"],
+                    "message": "族群目前支援成分股名單、技術型態與漲幅排行；分點、權證、新聞與基本面請指定個股查詢。"}
+        mode = action if action in ("members", "technical", "momentum") else "technical"
+        request = {"mode": mode, "industry": hit["industry"], "name": hit["name"]}
         if hit.get("merged_names"):
             request["merged_names"] = hit["merged_names"]
-        if hit.get("match") != "exact":
+        if hit.get("confidence") == "fuzzy":
             request["matched_by"] = f"對應族群：{hit['name']}"
         return request
 
-    # 名冊還沒建立時才退回 CMoney 即時查詢（首屏可能不完整）。
-    cm = cmoney_catalog.match_group(text)
-    if cm:
-        request = _request_mode(text, "cmoney:" + cm["code"], cm["name"])
-        if cm.get("fallback"):
-            request["catalog_fallback"] = cm.get("parent_name", "")
-        if cm.get("match") == "fuzzy":
-            request["matched_by"] = f"模糊辨識 {cm.get('matched_text','')}→{cm.get('name','')}"
-        return request
+    # 全市場族群排行：問的是「所有族群」，句子裡不能還留著某個特定族群名稱。
+    market_residual = _residual(question, r"整體|全部|所有|市場|台股|現在|目前|今天|最大|最多|最高|比較|的|所|些|個|強|弱|好|差|誰")
+    if (re.search(r"族群|類股|產業", text) and not market_residual
+            and re.search(r"最強|最好|最弱|排行|排名|轉強|轉弱|結構|強勢|較強|強的|弱的|漲幅|漲最|最大", text)):
+        if re.search(r"漲幅|漲跌|漲最|盤中", text) and not re.search(r"型態|結構|技術", text):
+            return {"mode": "market_momentum", "industry": "", "name": "全市場族群"}
+        return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
 
-    matches = []
-    remaining = text
-    aliases = sorted(((alias.upper(), code) for code, names in INDUSTRIES.items() for alias in names), key=lambda x: -len(x[0]))
-    for alias, code in aliases:
-        if alias in remaining and (group_question or text == alias or alias + "股" in text):
-            if code not in matches:
-                matches.append(code)
-            remaining = remaining.replace(alias, "")
-    fine = fine_catalog.match_group(text)
-    narrow = next((name for name in fine_catalog.UNMAPPED if name.upper() in text), "")
-    if narrow and (group_question or text == narrow.upper() or narrow.upper() + "股" in text):
-        return {"mode": "unsupported", "industry": "", "name": narrow,
-                "message": f"「{narrow}」目前沒有可精確對應的族群成分名冊；系統不會自動套用較大的產業。"}
-    if fine and (group_question or any(text == alias.upper() or alias.upper() + "股" in text
-                                     for key in fine for alias in fine_catalog.GROUPS[key][1])):
-        if len(fine) > 1:
-            return {"mode": "unsupported", "industry": "", "name": "多個族群",
-                    "message": "這次提到多個細分族群，請一次指定一個族群比較。"}
-        return _request_mode(text, "fine:" + fine[0], fine_catalog.GROUPS[fine[0]][0])
-    if len(matches) > 1:
-        return {"mode": "unsupported", "industry": "", "name": "多個族群",
-                "message": "這次提到多個產業，請一次指定一個族群比較。"}
-    if not matches:
-        if re.search(r"族群|類股|概念股|產業", text):
-            return {"mode": "unsupported", "industry": "", "name": "未辨識族群",
-                    "message": "目前找不到這個族群的可用成分名冊，可以先查看族群清單。"}
-        return None
-    code = matches[0]
-    return _request_mode(text, code, INDUSTRIES[code][0])
+    # 族群清單放到最後判斷：句子裡不能有排行字眼，也不能還留著一個沒對到的族群名稱
+    # （「火箭燃料族群有哪些股票」要回查不到，不是丟出整份清單）。
+    catalog_residual = _residual(question, r"查詢|查看|可以查|可查|能查|清單|列表|分類|名冊|支援|列出|全部|所有|可以|詢|查|看|些|個|所")
+    if (re.search(r"族群|類股|產業", text) and not catalog_residual
+            and re.search(r"清單|列表|分類|名冊|支援|可以查|可查|有哪些|有什麼", text)
+            and not re.search(r"最強|最好|型態|排行|排名|漲", text)):
+        return {"mode": "catalog", "industry": "", "name": "產業分類"}
 
-
-_FOLLOW_UP_RE = re.compile(r"誰|哪[一幾]?[檔支家個]|最強|最好|最弱|排行|排名|型態|形態|技術|漲幅|漲跌|漲最|成分|名單|名冊|有哪些")
+    # 看得出在問族群、但名冊對不到：誠實說查不到，並給相近名稱，不亂猜。
+    if re.search(r"族群|類股|概念股|產業", text) or action in ("members", "belongs"):
+        topic = sector_match.core_topic(question) or question
+        near = sector_match.suggest(question)
+        tail = ("相近的有：" + "、".join(near)) if near else "可以輸入「族群清單」看看目前有哪些族群。"
+        return {"mode": "unsupported", "industry": "", "name": topic,
+                "message": f"查不到「{topic}」這個族群。{tail}"}
+    return None
 
 
 def mode_from_text(text: str, default: str = "technical") -> str:
-    """從追問句判斷要看型態還是漲幅（沒講就沿用上一次）。"""
-    value = cmoney_catalog.normalize_text(text)
-    if re.search(r"成分|名單|名冊|有哪些", value) and not re.search(r"比較|排行|排名|最強|最好|型態|形態|漲", value):
-        return "members"
-    if re.search(r"型態|形態|技術|均線|支撐|布林", value):
-        return "technical"
-    if re.search(r"漲幅|漲跌|漲最|最強|強勢|盤中", value):
-        return "momentum"
-    return default
+    """追問句要看型態、漲幅還是成分股（沒講就沿用上一次）。"""
+    action = sector_match.action_of(text, default=default)
+    return action if action in ("technical", "momentum", "members") else default
 
 
 def is_sector_follow_up(text: str) -> bool:
-    """沒指定族群、但看得出是在追問同一個族群（「那誰型態最好」）。"""
-    value = cmoney_catalog.normalize_text(text)
-    if re.search(r"(?<![A-Z0-9])\d{4,6}[A-Z]?(?![A-Z0-9])", value):
+    """沒指定族群、而且沒有提到任何新主題時，才算在追問同一個族群。"""
+    if re.search(r"(?<![A-Z0-9])\d{4,6}[A-Z]?(?![A-Z0-9])", sector_match.normalize(text)):
         return False
-    return bool(_FOLLOW_UP_RE.search(value))
+    if sector_match.has_new_topic(text):
+        return False
+    return bool(_FOLLOW_UP_RE.search(sector_match.normalize(text)))
 
 
 def follow_up_request(text: str, remembered: Dict[str, str]) -> Optional[Dict[str, str]]:
@@ -169,23 +147,8 @@ def follow_up_request(text: str, remembered: Dict[str, str]) -> Optional[Dict[st
     if not remembered or not remembered.get("industry"):
         return None
     mode = mode_from_text(text, default=str(remembered.get("mode") or "technical"))
-    if mode not in ("technical", "momentum", "members"):
-        mode = "technical"
     return {"mode": mode, "industry": remembered["industry"], "name": remembered.get("name", ""),
             "followed_up": True}
-
-
-def _request_mode(text, code, name):
-    listing = bool(re.search(r"成分|名單|名冊|有哪些|包含|有哪[些幾]", text))
-    comparing = bool(re.search(r"比較|好|強|排行|排名|漲|技術|型態|形態|均線|支撐|布林", text))
-    mode = "members" if listing and not comparing else "technical"
-    explicit_technical = bool(re.search(r"型態|形態|技術|均線|支撐|布林", text))
-    if mode != "members" and not explicit_technical and re.search(r"漲幅|漲跌|盤中|最強|漲最|漲得|今天.*強|今日.*強", text):
-        mode = "momentum"
-    if re.search(r"分點|籌碼|買超|賣超|新聞|營收|基本面|便宜|估值|勝率", text):
-        return {"mode": "unsupported", "industry": code, "name": name,
-                "message": "族群比較目前支援成分股名單、技術型態評分及最新漲幅排行；分點、新聞與基本面請先指定個股查詢。"}
-    return {"mode": mode, "industry": code, "name": name}
 
 
 def _finmind_catalog() -> pd.DataFrame:
@@ -207,6 +170,8 @@ def _finmind_catalog() -> pd.DataFrame:
 
 
 def get_members(industry: str, display_name: str = "") -> Dict[str, Any]:
+    if industry.startswith("custom:"):
+        return sector_match.custom_members(industry[7:])
     if industry.startswith("roster:"):
         return sector_roster.get_members(industry[7:], display_name=display_name)
     if industry.startswith("cmoney:"):
@@ -671,6 +636,18 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         return _market_radar_answer(mode)
     if mode == "catalog":
         return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
+    if mode == "belongs":
+        code = str(request.get("stock_code") or request.get("name") or "")
+        names = sector_match.groups_of(code)
+        try:
+            label = tools.get_stock_name_map().get(code, "") or code
+        except Exception:
+            label = code
+        if not names:
+            return {"text": f"名冊裡查不到 {label}（{code}）所屬的族群。", "calls": 0, "cacheable": False}
+        lines = [f"**{label}（{code}）｜所屬族群**", f"共 {len(names)} 個族群：", "、".join(names),
+                 "※ 族群分類僅供研究參考，不代表買賣建議。"]
+        return {"text": "\n".join(lines), "calls": 0, "cacheable": True}
     try:
         if mode == "members":
             data = get_members(request["industry"], display_name=str(request.get("name") or ""))

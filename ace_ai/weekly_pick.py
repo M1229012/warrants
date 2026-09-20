@@ -641,10 +641,18 @@ def pattern_grade(score: float) -> str:
 
 def _branch_status(row: Dict[str, Any]) -> str:
     sells = row.get("reduce_or_exit_lookback") or []
-    if row.get("open_event_count"):
+    holding = int(row.get("open_event_count") or 0)
+    total = int(row.get("event_count_lookback") or 0)
+    pct = row.get("remaining_pct_estimate")
+    if holding and total:
+        text = f"持有中 {holding}/{total} 筆"
+        if pct is not None and sells:
+            text += f"・估剩約 {pct:.0f}%"
+        return text
+    if holding:
         return "持有中・近期有賣出" if sells else "持有中"
-    if row.get("events_recent") or row.get("event_buy_amount_lookback_text") not in (None, "", "-"):
-        return "已出清"
+    if total or row.get("events_recent") or row.get("event_buy_amount_lookback_text") not in (None, "", "-"):
+        return "已全部出清"
     return "只有賣出紀錄"
 
 

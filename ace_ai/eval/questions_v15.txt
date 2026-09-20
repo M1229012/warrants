@@ -1,0 +1,88 @@
+# 族群辨識與路由迴歸題庫（v15）｜格式：問題|期望模式|期望族群（可留空）
+# 期望模式：members 成分股／technical 型態排行／momentum 漲幅排行／catalog 族群清單／
+#           belongs 反查／unsupported 查不到或不支援／market_technical、market_momentum 全市場／
+#           none 不是族群問題（要交給個股或其他路由）
+# 期望族群留空＝只檢查模式。族群名稱用名冊顯示名，合併族群寫其中一個關鍵字即可（比對用「包含」）。
+
+# --- 族群成分股 ---
+散熱有哪些股票|members|散熱
+水冷有哪些股票|members|散熱
+液冷概念股有哪些|members|散熱
+IP ASIC有哪些股票|members|IP
+CPO有什麼股票|members|光通訊
+矽光子有哪些股|members|光通訊
+光通訊有哪些|members|光通訊
+電源供應器類股有哪些|members|電源供應器
+記憶體族群有誰|members|記憶體
+金融股有哪些|members|金融
+AI伺服器有哪些股票|members|AI伺服器
+儲能族群有哪些|members|儲能
+重電有哪些股票|members|重電
+HBM概念股有哪些|members|HBM
+先進封裝有哪些股|members|
+蘋概股有哪些|members|Apple
+
+# --- 錯字與口語 ---
+ip asic族些股票|members|IP
+散熱有哪寫股票|members|散熱
+電供有哪些股|members|電源供應器
+記意體族群有誰|members|記憶體
+散熱這邊有哪些股票啊|members|散熱
+
+# --- 族群排行 ---
+散熱族群誰最強|technical|散熱
+散熱族群誰型態最好|technical|散熱
+IP ASIC誰型態最好|technical|IP
+記憶體現在誰最強|technical|記憶體
+電源供應器型態前三名|technical|電源供應器
+散熱現在好嗎|technical|散熱
+CPO族群結構如何|technical|光通訊
+記憶體今天誰漲最多|momentum|記憶體
+
+# --- 全市場 ---
+現在所有族群誰最強|market_technical|
+所有族群誰型態最好|market_technical|
+現在哪些族群整體結構最強|market_technical|
+最近型態比較強的族群有哪些|market_technical|
+今天哪個族群漲幅最大|market_momentum|
+
+# --- 族群清單 ---
+有哪些族群可以查|catalog|
+族群清單|catalog|
+可以查詢哪些類股|catalog|
+
+# --- 反查 ---
+2330屬於什麼族群|belongs|
+3017有哪些族群|belongs|
+2344屬於哪些族群|belongs|
+
+# --- 查不到／不支援 ---
+火箭燃料族群有哪些股票|unsupported|
+量子電腦族群誰最強|unsupported|
+散熱族群的分點籌碼如何|unsupported|
+記憶體族群最近的新聞|unsupported|
+
+# --- 不是族群問題（必須交給個股或其他路由）---
+2330現在型態怎麼樣|none|
+聯發科現在強嗎|none|
+2344技術面如何|none|
+晶豪科現在是在整理還是轉弱|none|
+6199最近是不是爆量|none|
+2330現在支撐在哪|none|
+2330上面壓力在哪|none|
+2330跌破哪裡型態會轉弱|none|
+台積電最近是不是有點漲不動|none|
+華邦電現在這個位置算高嗎|none|
+2330跟2454誰型態比較強|none|
+奇鋐跟雙鴻現在技術面差在哪|none|
+3006最近有哪些權證分點|none|
+3006最近哪些分點在加碼|none|
+永豐金內湖勝率多少|none|
+永豐金內湖A+C事件勝率|none|
+新光最近有買3006嗎|none|
+我2330成本2000現在怎麼看|none|
+大盤現在怎麼看|none|
+櫃買比較強嗎|none|
+台指期外資空單多少|none|
+你好|none|
+幫我看一下|none|
