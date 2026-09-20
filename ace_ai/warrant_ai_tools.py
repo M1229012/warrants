@@ -3559,21 +3559,25 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
 
 
 def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
-    """K 線權證分點買賣標註：只讀 Google Sheet。
+    """K 線權證分點買賣標註（事件配對版，只讀 Google Sheet）。
 
-    買進：A～E 事件表的事件日/單日累積買進金額。
-    賣出：每日賣出明細的日期/賣出金額。
-    同一分點同日若同時有買賣會先淨額互抵；圖上只畫最重要的點位。
+    規則：
+    - **有編號的一定是 A～E 事件**：事件買進日標編號，同一筆事件的出清日標「同一個編號」。
+    - 不是事件出清的賣出（小幅減碼、零星賣出）只畫三角形、不給編號，避免看起來像事件出清。
+    - 金額用每日賣出明細的當日賣出金額；買進用事件的單日累積買進金額。
     """
     kf = core()
+    empty = {"mode": "flow", "source": "sheet", "events": []}
     if not dates:
-        return {"mode": "flow", "source": "sheet", "events": []}
+        return empty
     if str(branch_name or "").strip() == "__NO_WEEKLY_BRANCH__":
-        return {"mode": "flow", "source": "sheet", "events": []}
+        return empty
     code = kf._normalize_stock_name_code_key(stock_code)
     start, end = _parse_sheet_date(dates[0]), _parse_sheet_date(dates[-1])
     if start is None or end is None:
-        return {"mode": "flow", "source": "sheet", "events": []}
+        return empty
+    visible = {str(d) for d in dates}
+
     bundle = load_abcde_event_rows()
     events = bundle["events"]
     rows = events[(events["stock_code"] == code) & (events["event_date"] >= start) & (events["event_date"] <= end)].copy()
@@ -3592,60 +3596,96 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         if targets:
             rows = rows[rows["branch"].isin(targets)]
 
-    daily: Dict[Tuple[str, pd.Timestamp], Dict[str, Any]] = {}
-    for _, row in rows.iterrows():
-        day = pd.Timestamp(row["event_date"]).normalize()
-        key = (str(row["branch"]), day)
-        item = daily.setdefault(key, {"net_amount": 0.0, "events": set()})
-        item["net_amount"] += float(row.get("buy_amount") or 0.0)
-        if row.get("event_code"):
-            item["events"].add(str(row["event_code"]))
-
     sells = _sell_rows(code)
+    sell_amounts: Dict[Tuple[str, pd.Timestamp], float] = {}
     if not sells.empty:
         sells = sells[(sells["_date"] >= start) & (sells["_date"] <= end)]
         if targets:
             sells = sells[sells["_branch"].isin(targets)]
         for _, row in sells.iterrows():
-            day = pd.Timestamp(row["_date"]).normalize()
-            key = (str(row["_branch"]), day)
-            item = daily.setdefault(key, {"net_amount": 0.0, "events": set()})
-            item["net_amount"] -= float(row.get("_amount") or 0.0)
+            key = (str(row["_branch"]), pd.Timestamp(row["_date"]).normalize())
+            sell_amounts[key] = sell_amounts.get(key, 0.0) + float(row.get("_amount") or 0.0)
 
-    if not daily:
-        print(f"ℹ️ {code} Google Sheet 權證標註：指定分點/期間無資料", flush=True)
-        return {"mode": "flow", "source": "sheet", "events": []}
+    def in_chart(day: Any) -> str:
+        """回傳圖上對應的日期字串；不在這 70 根 K 棒內就回空字串。"""
+        if day is None or pd.isna(day):
+            return ""
+        text = _fmt_date(day)
+        return text if text in visible else ""
 
-    frame = pd.DataFrame([
-        {"branch": branch, "Date": day, "net_amount": info["net_amount"],
-         "event_codes": "+".join(sorted(info["events"]))}
-        for (branch, day), info in daily.items()
-    ])
-    if not targets:
-        topn = max(1, _env_int("CHART_FLOW_TOP_BRANCHES", 4))
-        totals = frame.groupby("branch")["net_amount"].sum().abs().sort_values(ascending=False)
-        frame = frame[frame["branch"].isin(list(totals.head(topn).index))]
+    marks: List[Dict[str, Any]] = []
+    paired_sells: set = set()
+    ordered = rows.sort_values(["event_date", "branch"])
+    for no, row in enumerate(ordered.itertuples(), 1):
+        branch = str(row.branch)
+        event_code = str(getattr(row, "event_code", "") or "")
+        buy_day = in_chart(row.event_date)
+        if buy_day:
+            amount = float(getattr(row, "buy_amount", 0.0) or 0.0)
+            marks.append({"no": no, "branch": branch, "event_codes": event_code, "kind": "event_buy",
+                          "action": "buy", "action_text": "事件買進", "action_date": buy_day,
+                          "net_amount": _num(amount, 0), "net_amount_text": _money_text(amount)})
+        exit_date = getattr(row, "exit_date", None)
+        exit_day = in_chart(exit_date)
+        if exit_day:
+            key = (branch, pd.Timestamp(exit_date).normalize())
+            amount = sell_amounts.get(key, 0.0)
+            paired_sells.add(key)
+            marks.append({"no": no, "branch": branch, "event_codes": event_code, "kind": "event_exit",
+                          "action": "sell", "action_text": "事件出清", "action_date": exit_day,
+                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount) if amount else ""})
+        reduce_date = getattr(row, "reduce_date", None)
+        reduce_day = in_chart(reduce_date)
+        if reduce_day and reduce_day != exit_day:
+            key = (branch, pd.Timestamp(reduce_date).normalize())
+            amount = sell_amounts.get(key, 0.0)
+            paired_sells.add(key)
+            # 減碼不是事件出清 → 不給編號
+            marks.append({"no": "", "branch": branch, "event_codes": event_code, "kind": "reduce",
+                          "action": "sell", "action_text": "減碼", "action_date": reduce_day,
+                          "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount) if amount else ""})
+
+    known_branches = {str(b) for b in rows["branch"].unique()} if not rows.empty else set()
     min_abs = max(0.0, _env_float("CHART_FLOW_MIN_ABS_AMOUNT", 100_000.0))
-    frame = frame[frame["net_amount"].abs() >= min_abs]
-    if frame.empty:
-        return {"mode": "flow", "source": "sheet", "events": []}
+    for (branch, day), amount in sorted(sell_amounts.items(), key=lambda item: -item[1]):
+        if (branch, day) in paired_sells or amount < min_abs:
+            continue
+        if targets and branch not in targets:
+            continue
+        if not targets and branch not in known_branches:
+            continue
+        day_text = in_chart(day)
+        if not day_text:
+            continue
+        marks.append({"no": "", "branch": branch, "event_codes": "", "kind": "reduce",
+                      "action": "sell", "action_text": "賣出（非事件）", "action_date": day_text,
+                      "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
+
+    if not marks:
+        print(f"ℹ️ {code} Google Sheet 權證標註：指定分點/期間無事件", flush=True)
+        return empty
+
+    if not targets:
+        # 沒指定分點時只留累積金額最大的幾個分點，避免圖面過度擁擠。
+        topn = max(1, _env_int("CHART_FLOW_TOP_BRANCHES", 4))
+        totals: Dict[str, float] = {}
+        for mark in marks:
+            totals[mark["branch"]] = totals.get(mark["branch"], 0.0) + abs(float(mark.get("net_amount") or 0.0))
+        keep = {name for name, _ in sorted(totals.items(), key=lambda item: -item[1])[:topn]}
+        marks = [m for m in marks if m["branch"] in keep]
+
     max_marks = max(1, _env_int("CHART_FLOW_MAX_MARKS", 14))
-    frame = frame.assign(_abs=frame["net_amount"].abs()).nlargest(max_marks, "_abs").sort_values("Date")
-    marks = []
-    for no, (_, row) in enumerate(frame.iterrows(), 1):
-        amount = float(row["net_amount"])
-        marks.append({
-            "no": no,
-            "branch": row["branch"],
-            "event_codes": row.get("event_codes", ""),
-            "action": "buy" if amount > 0 else "sell",
-            "action_text": "買超" if amount > 0 else "賣超",
-            "action_date": _fmt_date(row["Date"]),
-            "net_amount": _num(amount, 0),
-            "net_amount_text": _money_text(amount),
-        })
-    print(f"✅ {code} Google Sheet 權證標註｜branches={targets or 'auto'}｜marks={len(marks)}", flush=True)
-    return {"mode": "flow", "source": "sheet", "events": marks, "data_latest_event_date": _fmt_date(bundle.get("latest_event_date"))}
+    if len(marks) > max_marks:
+        # 超量時先砍沒有編號的零星賣出，事件買賣一定保留。
+        numbered = [m for m in marks if m["no"] != ""]
+        extras = [m for m in marks if m["no"] == ""]
+        extras.sort(key=lambda m: -abs(float(m.get("net_amount") or 0.0)))
+        marks = numbered[:max_marks] + extras[: max(0, max_marks - len(numbered))]
+    marks.sort(key=lambda m: (m["action_date"], str(m["no"])))
+    print(f"✅ {code} Google Sheet 權證標註｜branches={targets or 'auto'}｜"
+          f"事件 {sum(1 for m in marks if m['no'] != '')} 個｜非事件賣出 {sum(1 for m in marks if m['no'] == '')} 個", flush=True)
+    return {"mode": "flow", "source": "sheet", "events": marks,
+            "data_latest_event_date": _fmt_date(bundle.get("latest_event_date"))}
 
 
 def moneydj_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:

@@ -305,13 +305,16 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
         rows = []
         for name, color in palette.items():
             items = [e for e in events if str(e.get('branch') or '').strip() == name]
+            numbered = sorted({int(e['no']) for e in items if str(e.get('no', '')) != ''})
             buys = [e for e in items if e.get('action') == 'buy']
-            sells = [e for e in items if e.get('action') != 'buy']
-            numbers = "、".join(str(e.get('no', '')) for e in sorted(items, key=lambda x: int(x.get('no') or 0)))
+            exits = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) != '']
+            plain = [e for e in items if e.get('action') != 'buy' and str(e.get('no', '')) == '']
             detail = "　".join(x for x in (
-                f"買超 {len(buys)} 筆" if buys else "",
-                f"賣超 {len(sells)} 筆" if sells else "") if x)
-            rows.append((name, color, f"編號 {numbers}｜{detail}" if detail else f"編號 {numbers}"))
+                f"事件買進 {len(buys)} 筆" if buys else "",
+                f"事件出清 {len(exits)} 筆" if exits else "",
+                f"減碼／零星賣出 {len(plain)} 筆" if plain else "") if x)
+            prefix = "編號 " + "、".join(str(n) for n in numbered) if numbered else "無事件編號"
+            rows.append((name, color, f"{prefix}｜{detail}" if detail else prefix))
         if not dry:
             sy = top + h + 7
             half = 7
@@ -320,7 +323,8 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             sx = x0 + 110
             draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            draw.text((x0 + 232, sy), '顏色與編號對應下方分點', font=font(18), fill=MUTED, anchor='lm')
+            draw.text((x0 + 232, sy), '編號＝A～E 事件（出清與買進同號）；無編號＝減碼或零星賣出',
+                      font=font(18), fill=MUTED, anchor='lm')
             ly = sy + 30
             for name, color, detail in rows:
                 draw.ellipse((x0, ly - 7, x0 + 14, ly + 7), fill=color)
@@ -508,15 +512,18 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
             _dotted(draw, badge['x'], py(bars[i]['Low']) + 4, tri_bottom - half, color)
             draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=color, outline='white')
-            cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
-            _draw_badge(draw, badge['cx'], cy, badge['no'], color)
+            if str(badge.get('no', '')) != '':
+                cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
+                _draw_badge(draw, badge['cx'], cy, badge['no'], color)
         for badge in sell_badges:
             color = badge.get('color') or DOWN
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
             _dotted(draw, badge['x'], py(bars[i]['High']) - 4, tri_top + half, color)
             draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=color, outline='white')
-            cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
-            _draw_badge(draw, badge['cx'], cy, badge['no'], color)
+            # 有編號＝A～E 事件（出清沿用買進編號）；沒編號＝小幅減碼／零星賣出。
+            if str(badge.get('no', '')) != '':
+                cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
+                _draw_badge(draw, badge['cx'], cy, badge['no'], color)
         return
 
     buy_badges, sell_badges = [], []
