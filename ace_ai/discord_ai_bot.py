@@ -1121,7 +1121,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FORMAT_NEWS)
     else:
         sections.append(FINAL_FORMAT_GENERAL)
-    payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"))
+    payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
 
@@ -2041,6 +2041,9 @@ MEMORY_MINUTES = tools._env_int("DISCORD_AI_MEMORY_MINUTES", 30)
 # 週精選草稿編輯 session 比一般追問長很多：管理員常常改一改、去看盤、再回來改。
 WEEKLY_DRAFT_MINUTES = max(10, tools._env_int("DISCORD_AI_WEEKLY_DRAFT_MINUTES", 120))
 MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
+# 使用者把「/ace 族群資金流向」整串打進 /ask 的輸入框時，前綴不能被當成族群名稱。
+_SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
+
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 _FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
@@ -2245,6 +2248,12 @@ class AceQueryEngine:
         一般 /ask 永遠不會進到那些流程，避免草稿編輯把正常問題吃掉。
         """
         started = time.perf_counter()
+        # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
+        prefix = _SLASH_PREFIX_RE.match(question)
+        if prefix:
+            question = _SLASH_PREFIX_RE.sub("", question, count=1)
+            if prefix.group(1).lower() == str(self.config.admin_command_name).lower() and is_admin:
+                admin_mode = True
         compact = re.sub(r"\s+", "", question)
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
@@ -2475,8 +2484,7 @@ class AceQueryEngine:
             return AnswerResult(text=text, route="admin_usage", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
         if compact in ("族群資金流向", "資金流向", "轉強族群", "族群轉強", "轉弱族群", "族群雷達", "哪個族群在轉強", "哪些族群在轉強"):
-            if not sector_radar.ready_for_query():
-                sector_radar.tick()
+            sector_radar.ensure_snapshot()
             data = sector_radar.report()
             panels = sector_radar.panels(data) if data.get("available") else []
             return AnswerResult(text=sector_radar.format_report(data), route="admin_radar", gemini_calls=0,

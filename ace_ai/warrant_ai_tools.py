@@ -119,6 +119,18 @@ FINMIND_USAGE_TTL = max(60, _env_int("DISCORD_AI_FINMIND_USAGE_TTL", 300))
 _FINMIND_USAGE_CACHE = {"at": 0.0, "data": {}}
 
 
+def json_safe(value: Any) -> Any:
+    """json.dumps 的 default：numpy 的 bool_／int64／float64／陣列都不是 JSON 型別，
+    直接丟進去會出現「Object of type bool is not JSON serializable」。"""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return str(value)
+    return str(value)
+
+
 def record_api_event(provider: str, *, status: int = 200, latency: float = 0.0, detail: str = "") -> None:
     now = time.time()
     key = str(provider or "unknown")

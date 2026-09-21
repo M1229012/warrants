@@ -678,7 +678,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
               "只回傳 observations，每檔以 stock_code 對應一段最多兩句的繁體中文解讀，說明相對優點與限制；"
               "不要重列價格或分數、不給買賣指令或上漲機率。技術評分盤中可隨今日即時K變動，盤中結果僅供當下觀察，最終仍以收盤確認。"
               "若只有漲幅資料，只能解釋漲幅相對位置，不得推測資金、主力、新聞或均線；所有漲幅都負值時不可稱上漲。"
-              "資料不足就說不足；不是全族群完整排行時不能宣稱全族群最佳。\n" + json.dumps(data, ensure_ascii=False))
+              "資料不足就說不足；不是全族群完整排行時不能宣稱全族群最佳。\n" + json.dumps(data, ensure_ascii=False, default=tools.json_safe))
     result = gateway.generate(prompt, purpose="sector_answer", schema=schema, temperature=0.2)
     accepted, observations = [], {}
     if result.ok:
