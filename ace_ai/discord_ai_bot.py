@@ -42,6 +42,8 @@ import sector_analysis
 import sys
 import traceback
 
+import numpy as np
+
 import sector_match
 import sector_radar
 
@@ -51,12 +53,26 @@ _LOG_MUTE_PATTERNS = tuple(x for x in os.getenv("DISCORD_AI_LOG_MUTE", "週報�
 
 
 class _FilteredStdout:
+    """過濾指定關鍵字的 stdout。
+
+    print() 會分成「訊息」與「換行」兩次 write，所以擋掉訊息之後要把緊接著的換行一起吃掉，
+    否則 log 會留下一堆只有時間戳的空行，真正要看的訊息反而被洗掉。
+    """
+
     def __init__(self, stream):
         self._stream = stream
+        self._drop_newline = False
+        self._lock = threading.Lock()
 
     def write(self, text):
-        if _LOG_MUTE_PATTERNS and any(p in text for p in _LOG_MUTE_PATTERNS):
-            return len(text)
+        with self._lock:
+            if self._drop_newline and text in (chr(10), chr(13) + chr(10), ""):
+                self._drop_newline = False
+                return len(text)
+            if _LOG_MUTE_PATTERNS and any(pattern in text for pattern in _LOG_MUTE_PATTERNS):
+                self._drop_newline = not text.endswith(chr(10))
+                return len(text)
+            self._drop_newline = False
         return self._stream.write(text)
 
     def __getattr__(self, name):
@@ -959,13 +975,38 @@ FINAL_FORMAT_NEWS = """區塊依序使用：【回答】（1～2 句直接說整
 FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先回答，再給最重要證據與後續觀察條件。"""
 
 
+def _is_empty_value(value: Any) -> bool:
+    """判斷是不是空值。
+
+    不能用 `value not in (None, "", [], {})`：numpy 陣列會逐元素比較、回傳陣列，
+    Python 判斷真假時就會丟出「The truth value of an empty array is ambiguous」。
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, np.ndarray):
+        return value.size == 0
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) == 0
+    return False
+
+
 def _prune_empty(value: Any) -> Any:
-    """移除空值，縮小送給 Gemini 的 JSON。"""
+    """移除空值，縮小送給 Gemini 的 JSON。numpy 型別一併換成 Python 原生型別，
+    否則後面 json.dumps 會直接失敗。"""
     if isinstance(value, dict):
+        for key, raw in value.items():
+            if isinstance(raw, np.ndarray):   # 哪個工具回傳陣列要留紀錄，之後可以在來源就改成清單
+                print(f"⚠️ tool_results 欄位是 numpy 陣列，已自動轉換：{key}｜長度 {raw.size}", flush=True)
         pruned = {k: _prune_empty(v) for k, v in value.items()}
-        return {k: v for k, v in pruned.items() if v not in (None, "", [], {})}
+        return {k: v for k, v in pruned.items() if not _is_empty_value(v)}
     if isinstance(value, list):
-        return [v for v in (_prune_empty(i) for i in value) if v not in (None, "", [], {})]
+        return [v for v in (_prune_empty(i) for i in value) if not _is_empty_value(v)]
+    if isinstance(value, np.ndarray):
+        return [_prune_empty(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
     return value
 
 
@@ -3186,7 +3227,8 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
                 last_cmoney = time.time()
         # CMoney 分類屬低頻靜態資料：每個 tick 只補少量尚未存到 Persistent Volume 的族群，
         # 逐步把細產業／概念成分股抓齊，不影響 Fugle 額度。
-        if CMONEY_MEMBER_WARMUP_PER_TICK > 0:
+        # 自建名冊在的時候，CMoney 成分股只是舊備援，不需要在背景一直補（也少打它的網站）。
+        if CMONEY_MEMBER_WARMUP_PER_TICK > 0 and not sector_roster.available():
             try:
                 sector_analysis.cmoney_catalog.warm_member_catalog_batch(CMONEY_MEMBER_WARMUP_PER_TICK)
             except Exception as exc:

@@ -44,6 +44,9 @@ DEFAULT_PATH = "/data/cmoney_sector_catalog.json" if Path("/data").exists() else
 CACHE_PATH = Path(os.getenv("DISCORD_AI_CMONEY_CACHE", DEFAULT_PATH))
 _LOCK = threading.RLock()
 _MEM: Dict[str, Tuple[float, Any]] = {}
+# 背景補齊成分股時連續失敗的族群（CMoney 頁面格式變動、族群已下架等），超過次數就跳過。
+_MEMBER_WARM_FAILED: Dict[str, int] = {}
+MEMBER_WARM_MAX_RETRY = max(1, tools._env_int("DISCORD_AI_CMONEY_WARM_MAX_RETRY", 3))
 
 # Only spelling/market-language aliases. They do not silently broaden stock membership.
 TEXT_NORMALIZE = {
@@ -577,14 +580,20 @@ def warm_member_catalog_batch(limit: int = 1) -> Dict[str, int]:
     groups = catalog.get("groups") or {}
     disk = _read_disk()
     existing = set((disk.get("members") or {}).keys()) if isinstance(disk.get("members"), dict) else set()
-    missing = [code for code in groups if code not in existing]
+    # 連續失敗的族群要跳過，否則每一輪都卡在同一個代碼，後面的族群永遠補不到。
+    missing = [code for code in groups if code not in existing and _MEMBER_WARM_FAILED.get(code, 0) < MEMBER_WARM_MAX_RETRY]
     attempted = loaded = 0
     for code in missing[:max(0, int(limit))]:
         attempted += 1
         try:
             if get_members(code, refresh=True).get("stocks"):
                 loaded += 1
+            _MEMBER_WARM_FAILED.pop(code, None)
         except Exception as exc:
-            print(f"⚠️ CMoney 成分股背景補齊失敗：{code}｜{type(exc).__name__}", flush=True)
+            fails = _MEMBER_WARM_FAILED.get(code, 0) + 1
+            _MEMBER_WARM_FAILED[code] = fails
+            name = str((groups.get(code) or {}).get("name") or "")
+            stop = "，不再重試" if fails >= MEMBER_WARM_MAX_RETRY else ""
+            print(f"⚠️ CMoney 成分股背景補齊失敗：{code} {name}｜{type(exc).__name__}: {exc}｜第 {fails} 次{stop}", flush=True)
     stats = cache_stats()
     return {"attempted": attempted, "loaded": loaded, **stats}
