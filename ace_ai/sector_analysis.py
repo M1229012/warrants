@@ -593,9 +593,35 @@ def catalog_panel() -> Dict[str, Any]:
     return {"sector_catalog": {"title": "可查詢的族群", "sections": sections}}
 
 
+def _top_stocks_text(row: Dict[str, Any]) -> str:
+    return "・".join(f"{s['name']} {s['score']:.0f}" for s in row.get("top_stocks") or [])
+
+
+def _technical_market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
+    """大族群型態排行 TOP5（v2）：右側＝綜合分數；第二行＝中位型態＋75 分以上家數；下面一列型態 TOP5 個股。"""
+    rows = [{
+        "rank": row["rank"], "stock_code": row["group_code"], "stock_name": row["name"],
+        "market": "", "row_kind": "sector_group",
+        "pattern_score": row["composite"], "change_pct": None,
+        "coverage_text": (f"中位型態 {row['median']:.1f}｜75 分以上 {row['strong_count']}/{row['coverage']}"
+                          f"（{row['strong_ratio']:.0f}%）"),
+        "ratio_text": "", "leader_text": "",
+        "extra_labels": [("TOP5", "accent", _top_stocks_text(row))] if row.get("top_stocks") else [],
+    } for row in data.get("rows") or []]
+    return {"sector": {
+        "name": "大族群", "mode": "market_technical", "title_suffix": "型態排行 TOP5",
+        "comparison_date": data.get("as_of", ""), "rows": rows[:5], "others": [],
+        "coverage_note": "",
+        "liquidity_note": f"僅比較成分股 ≥{market_scan.TECH_BIG_MIN} 檔之族群｜綜合＝70% 中位型態＋30% 75 分以上占比",
+        "live_time": "",
+    }}
+
+
 def _market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     """全市場族群排行圖卡；只放排行本身，涵蓋率寫 Log。"""
     technical = data["mode"] == "market_technical"
+    if technical:
+        return _technical_market_panel(data)
     rows = [{
         "rank": row["rank"], "stock_code": row["group_code"], "stock_name": row["name"],
         "market": "", "row_kind": "sector_group",
@@ -668,11 +694,14 @@ def _market_radar_answer(mode: str) -> Dict[str, Any]:
         return {"text": _MARKET_HELP.get(str(data.get("reason") or ""), _MARKET_HELP["low_coverage"]),
                 "calls": 0, "cacheable": False}
     metric = "型態" if mode == "market_technical" else "漲幅"
-    lines = [f"**全市場族群{metric}排行**"]
+    lines = ([f"**大族群型態排行 TOP5**（僅比較成分股 ≥{market_scan.TECH_BIG_MIN} 檔之族群）"]
+             if mode == "market_technical" else [f"**全市場族群{metric}排行**"])
     for row in data["rows"]:
         value = f"中位型態 {row['median']:.1f}" if mode == "market_technical" else f"中位漲幅 {row['median']:+.2f}%"
         if mode == "market_technical":
-            lines.append(f"{row['rank']}. {row['name']}｜{value}｜型態有效 {row['coverage']}/{row.get('total_members', row['members'])} 檔")
+            lines.append(f"{row['rank']}. {row['name']}｜綜合 {row['composite']:.1f}｜{value}｜"
+                         f"75 分以上 {row['strong_count']}/{row['coverage']}（{row['strong_ratio']:.0f}%）｜"
+                         f"TOP5 {_top_stocks_text(row)}")
         else:
             lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔")
     lines.append(f"資料時間：{data.get('as_of', '')} 收盤")

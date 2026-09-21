@@ -54,20 +54,56 @@ _REGISTRY: Dict[str, Any] = {"at": 0.0, "rows": []}
 _REGISTRY_LOCK = threading.Lock()
 
 
-def _twse_registry() -> list:
-    """證交所上市公司基本資料（t187ap03_L）；走主程式的官方抓取＋最後好副本，記憶體快取 12 小時。"""
+_REFRESHING = [False]
+
+
+def _fetch_registry() -> list:
+    core = tools.core()
+    label = "上市股票基本資料"
+    rows, ok, error = core.fetch_openapi_json(
+        core.TWSE_STOCK_REGISTRY_OPENAPI_URL, label,
+        core._official_stock_registry_cache_name(label), core.WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS)
+    if not ok or not rows:
+        raise tools.ToolDataError(error or "證交所上市公司基本資料為空")
+    rows = [r for r in rows if isinstance(r, dict)]
     with _REGISTRY_LOCK:
-        if _REGISTRY["rows"] and time.time() - _REGISTRY["at"] < _REGISTRY_TTL:
-            return _REGISTRY["rows"]
-        core = tools.core()
-        label = "上市股票基本資料"
-        rows, ok, error = core.fetch_openapi_json(
-            core.TWSE_STOCK_REGISTRY_OPENAPI_URL, label,
-            core._official_stock_registry_cache_name(label), core.WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS)
-        if not ok or not rows:
-            raise tools.ToolDataError(error or "證交所上市公司基本資料為空")
-        _REGISTRY.update({"at": time.time(), "rows": [r for r in rows if isinstance(r, dict)]})
-        return _REGISTRY["rows"]
+        _REGISTRY.update({"at": time.time(), "rows": rows})
+    return rows
+
+
+def _refresh_background() -> None:
+    with _REGISTRY_LOCK:
+        if _REFRESHING[0]:
+            return
+        _REFRESHING[0] = True
+
+    def worker() -> None:
+        try:
+            _fetch_registry()
+        except Exception as exc:
+            print(f"⚠️ 證交所上市公司基本資料背景更新失敗，沿用舊資料｜{type(exc).__name__}", flush=True)
+        finally:
+            with _REGISTRY_LOCK:
+                _REFRESHING[0] = False
+
+    threading.Thread(target=worker, name="ace-twse-registry", daemon=True).start()
+
+
+def warm_registry() -> None:
+    """開機背景預載；之後查詢一律先讀快取，不在使用者查詢時等官方端點。"""
+    _refresh_background()
+
+
+def _twse_registry() -> list:
+    """證交所上市公司基本資料（t187ap03_L）；stale-while-revalidate：
+    有資料就立刻回（過 12 小時才在背景更新），完全沒資料時才同步抓一次。"""
+    with _REGISTRY_LOCK:
+        rows, age = _REGISTRY["rows"], time.time() - _REGISTRY["at"]
+    if rows:
+        if age >= _REGISTRY_TTL:
+            _refresh_background()
+        return rows
+    return _fetch_registry()
 
 
 def _industry_names(code: str) -> tuple:

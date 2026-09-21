@@ -29,6 +29,15 @@ MIN_AVG_LOTS = max(0.0, tools._env_float("DISCORD_AI_SECTOR_MIN_AVG_LOTS", 500.0
 SCORE_BUDGET = max(30.0, tools._env_float("DISCORD_AI_MARKET_SCORE_BUDGET", 480.0))
 _SCORE_LOCK = threading.Lock()
 
+# 全市場型態排行 v2：只比大族群（細產業／概念 ≥20 檔），綜合分數＝70% 中位＋30% 高分股占比，
+# 再去掉高度重疊的族群（重疊率＝交集 ÷ 較小族群檔數 > 70% 保留分數高者）。
+TECH_BIG_MIN = max(1, tools._env_int("DISCORD_AI_MARKET_TECH_BIG_MIN", 20))
+TECH_MIN_COVERAGE = min(1.0, max(0.0, tools._env_float("DISCORD_AI_MARKET_TECH_MIN_COVERAGE", 0.8)))
+TECH_STRONG_SCORE = 75
+TECH_MEDIAN_WEIGHT = 0.7
+TECH_OVERLAP_MAX = min(1.0, max(0.1, tools._env_float("DISCORD_AI_MARKET_TECH_OVERLAP", 0.7)))
+TECH_TOP_STOCKS = 5
+
 
 def _liquid_codes() -> set:
     """近 N 日平均成交金額／成交量達標的股票（一次 SQL，不打 API）。"""
@@ -46,6 +55,28 @@ def _member_codes() -> Dict[str, List[str]]:
         except Exception:
             continue
     return out
+
+
+def _dedupe_overlap(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """依綜合分數由高到低，和已保留族群重疊率 > 70% 的就去掉（保留分數較高者）；去重名單只寫 log。"""
+    kept: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    for row in rows:
+        codes = row.pop("_codes", set())
+        clash = next((k for k in kept
+                      if codes and k["_member_set"]
+                      and len(codes & k["_member_set"]) / min(len(codes), len(k["_member_set"])) > TECH_OVERLAP_MAX), None)
+        if clash:
+            dropped.append(f"{row['name']}→{clash['name']}")
+            continue
+        row["_member_set"] = codes
+        kept.append(row)
+    for row in kept:
+        row.pop("_member_set", None)
+    if dropped:
+        print(f"📚 型態排行去重（重疊率 >{TECH_OVERLAP_MAX:.0%}）：{'、'.join(dropped[:30])}"
+              + (f"…共 {len(dropped)} 個" if len(dropped) > 30 else ""), flush=True)
+    return kept
 
 
 def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
@@ -71,10 +102,12 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
 
         if mode == "market_technical":
             # 純型態排行：完整族群名冊都參加，不先套成交量／成交金額門檻。
+            # v2：只比 ≥20 檔的大族群，且型態有效檔數要達 80%，小族群不會因 3 檔全高分衝到第一。
             codes = all_codes
+            if len(codes) < TECH_BIG_MIN:
+                continue
             pairs = [(c, pick(values[c])) for c in codes if c in values and pick(values[c]) is not None]
-            # 一般族群至少 3 檔有效型態；若族群本身不到 3 檔，則要求全部都有資料。
-            required = min(TECH_MIN_VALID, len(codes))
+            required = max(min(TECH_MIN_VALID, len(codes)), math.ceil(len(codes) * TECH_MIN_COVERAGE))
             if len(pairs) < required:
                 continue
         else:
@@ -88,7 +121,7 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
 
         numbers = [v for _, v in pairs]
         leader_code, leader_value = max(pairs, key=lambda x: x[1])
-        rows.append({
+        row = {
             "group_code": group_code, "name": info["name"], "kind": info["kind"],
             "median": round(statistics.median(numbers), 2),
             "coverage": len(pairs), "members": len(codes), "total_members": len(all_codes),
@@ -96,8 +129,23 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
             else round(sum(1 for v in numbers if v > 0) / len(numbers) * 100, 0),
             "leader_code": leader_code, "leader_name": names.get(leader_code, ""),
             "leader_value": round(leader_value, 2),
-        })
-    rows.sort(key=lambda r: (-r["median"], r["name"]))
+        }
+        if mode == "market_technical":
+            strong_count = sum(1 for v in numbers if v >= TECH_STRONG_SCORE)
+            strong_pct = strong_count / len(numbers) * 100
+            top = sorted(pairs, key=lambda x: -x[1])[:TECH_TOP_STOCKS]
+            row.update({
+                "strong_count": strong_count,
+                "composite": round(TECH_MEDIAN_WEIGHT * row["median"] + (1 - TECH_MEDIAN_WEIGHT) * strong_pct, 1),
+                "top_stocks": [{"code": c, "name": names.get(c, c), "score": round(v, 1)} for c, v in top],
+                "_codes": set(all_codes),
+            })
+        rows.append(row)
+    if mode == "market_technical":
+        rows.sort(key=lambda r: (-r["composite"], -r["median"], r["name"]))
+        rows = _dedupe_overlap(rows)
+    else:
+        rows.sort(key=lambda r: (-r["median"], r["name"]))
     for index, row in enumerate(rows[:limit], 1):
         row["rank"] = index
     dates = local_market_cache.known_dates(limit=1)

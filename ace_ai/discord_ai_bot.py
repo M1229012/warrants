@@ -2441,7 +2441,8 @@ class AceQueryEngine:
         # 否則「正在轉強」會被當成族群名稱去查。
         radar = sector_radar.detect_intent(compact)
         if radar:
-            return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"))
+            return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"),
+                                      view=radar.get("view", "all"))
         try:
             parsed = self.parser.parse(question)
         except tools.ToolDataError as exc:
@@ -2569,9 +2570,10 @@ class AceQueryEngine:
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
-    def _answer_radar(self, direction: str, started: float, route: str, scope: str = "all") -> AnswerResult:
-        """族群雷達（v1.3：先依規模分組、再組內比較）；/ace 與 /ask 共用。scope＝all／main／small。"""
-        result = sector_radar.answer(direction, scope=scope)
+    def _answer_radar(self, direction: str, started: float, route: str, scope: str = "all",
+                      view: str = "all") -> AnswerResult:
+        """族群雷達（大族群 ≥20 檔）；/ace 與 /ask 共用。view＝all／strong／weak（單獨問目前強勢或弱勢）。"""
+        result = sector_radar.answer(direction, scope=scope, view=view)
         panels = result.get("panels") or []
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
@@ -2623,7 +2625,8 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter()-started, cacheable=False)
         radar = sector_radar.detect_intent(compact)
         if radar:
-            return self._answer_radar(radar["direction"], started, route="admin_radar", scope=radar.get("scope", "all"))
+            return self._answer_radar(radar["direction"], started, route="admin_radar", scope=radar.get("scope", "all"),
+                                      view=radar.get("view", "all"))
         if compact in ("更新族群名冊", "重建族群名冊", "更新名冊"):
             def job() -> None:
                 try:
@@ -3343,6 +3346,11 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
     全部只用官方每日行情（2 個請求／交易日）與本地 CPU，不會為了單一問題掃市場。
     """
     last_attempt = ""
+    try:
+        import official_sector_members
+        official_sector_members.warm_registry()   # 族群雷達的官方成員名冊：開機背景預載，查詢時不再等 10 秒
+    except Exception as exc:
+        print(f"⚠️ 官方類股成員名冊預載略過｜{type(exc).__name__}", flush=True)
     while not stop.is_set():
         try:
             info = market_data.coverage()

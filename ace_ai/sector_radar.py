@@ -370,13 +370,14 @@ def _rank_map(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 # 意圖判斷：先判斷是不是「雷達」，不是才交給族群名稱解析
 # ============================================================
 
-_RADAR_WORD_RE = re.compile(r"轉強|轉弱|資金流向|雷達")
-_RADAR_SCOPE_RE = re.compile(r"族群|類股|產業|資金流向|雷達")
+_RADAR_WORD_RE = re.compile(r"轉強|轉弱|資金流向|雷達|強勢|弱勢")
+_RADAR_SCOPE_RE = re.compile(r"族群|類股|產業|資金流向|雷達|TOP|排行|排名", re.IGNORECASE)
 # 拿掉這些通用字後還有殘字（例如「半導體」「記憶體」），就代表在問特定族群，不是雷達。
 _RADAR_GENERIC_RE = re.compile(
     r"有哪些|哪幾個|哪一個|哪些|哪個|什麼|有沒有|目前|現在|今天|今日|盤中|正在|開始|主要|大型|小型|"
-    r"族群|類股|產業|轉強|轉弱|資金流向|資金|流向|雷達|比較|列出|一下|看看|看|查|"
-    r"的|是|嗎|呢|了|在|有|誰|和|與|跟|及|、|[?？!！。,，\s]")
+    r"族群|類股|產業|轉強|轉弱|強勢|弱勢|資金流向|資金|流向|雷達|比較|列出|一下|看看|看|查|"
+    r"TOP\d*|前[一二三四五1-5]名?|排行|排名|近30分鐘?|近三十分鐘?|近期|最近|"
+    r"的|是|嗎|呢|了|在|有|誰|和|與|跟|及|、|[?？!！。,，\s]", re.IGNORECASE)
 
 
 def detect_intent(text: str) -> Optional[Dict[str, str]]:
@@ -389,7 +390,15 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
     up, down = "轉強" in value, "轉弱" in value
     # v1.3：「小型族群雷達」只看小型組；「主要／大型族群雷達」只看主要組；其餘兩組都出
     scope = "small" if "小型" in value else ("main" if re.search(r"主要|大型", value) else "all")
-    return {"direction": "up" if up and not down else "down" if down and not up else "both", "scope": scope}
+    # 單獨問「目前弱勢／強勢」＝現在跌（漲）最多，不是「近30分轉弱（轉強）」，只回那一張
+    view = "all"
+    if not (up or down):
+        if "弱勢" in value and "強勢" not in value:
+            view = "weak"
+        elif "強勢" in value and "弱勢" not in value:
+            view = "strong"
+    return {"direction": "up" if up and not down else "down" if down and not up else "both",
+            "scope": scope, "view": view}
 
 
 # ============================================================
@@ -751,7 +760,8 @@ def enrich(rows: List[Dict[str, Any]], data: Dict[str, Any]) -> bool:
 # L1 輸出（L2 代表股驗證接上前的暫時版：只列指數層級）
 # ============================================================
 
-_MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down", "moves": "moves"}
+_MODE_NAMES = {"strong": "strongest", "weak": "weakest", "up": "turning_up", "down": "turning_down",
+               "moves": "moves"}
 RADAR_NOTE = "只比較官方成分股 ≥20 檔的大族群｜領漲／領跌取流動性達標成分股"
 L1_ONLY_NOTE = "未取得成分股資料，僅指數層級"
 STRONG_TOP = 3
@@ -805,6 +815,8 @@ def _title(section: str, data: Dict[str, Any], tier: str = "main") -> str:
     prefix = TIER_NAMES.get(tier, "族群雷達")
     if section == "strong":
         return f"{prefix}｜目前強勢 TOP3"
+    if section == "weak":
+        return f"{prefix}｜目前弱勢 TOP3"
     if section == "moves":
         return f"{prefix}｜異動 TOP3"
     word = "轉強" if section == "up" else "轉弱"
@@ -903,7 +915,7 @@ def _verdict(row: Dict[str, Any], section: str, stage: str) -> Tuple[str, str]:
 
 def _side(row: Dict[str, Any], section: str) -> str:
     """領漲或領跌：轉弱區固定領跌；異動區依族群自己的漲跌方向。"""
-    if section == "down" or (section == "moves" and float(row["change_pct"]) < 0):
+    if section in ("down", "weak") or (section == "moves" and float(row["change_pct"]) < 0):
         return "down"
     return "up"
 
@@ -973,8 +985,14 @@ def _is_concentrated(row: Dict[str, Any], stage: str) -> bool:
 
 
 def _plan(data: Dict[str, Any], scope: str, main: List[Dict[str, Any]], small: List[Dict[str, Any]],
-          tiny: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, str, Dict[str, Any], str]], List[Dict[str, Any]]]:
-    """決定要出哪些區塊 → ([(tier, section, 候選結果, 理由)], 需要成員資料的族群)。"""
+          tiny: List[Dict[str, Any]], view: str = "all") -> Tuple[List[Tuple[str, str, Dict[str, Any], str]], List[Dict[str, Any]]]:
+    """決定要出哪些區塊 → ([(tier, section, 候選結果, 理由)], 需要成員資料的族群)。
+
+    view＝weak：只回「目前弱勢 TOP3」（現在跌最多，≠ 近30分轉弱）；view＝strong：只回目前強勢。
+    """
+    if view in ("weak", "strong"):
+        ordered = sorted(main, key=lambda r: r["change_pct"] if view == "weak" else -r["change_pct"])[:STRONG_TOP]
+        return [("main", view, {"rows": ordered}, "")], ordered
     plan, targets = [], []
     if scope in ("all", "main"):
         by_change = sorted(main, key=lambda r: -r["change_pct"])
@@ -996,7 +1014,7 @@ def _plan(data: Dict[str, Any], scope: str, main: List[Dict[str, Any]], small: L
     return plan, targets
 
 
-def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, Any]:
+def answer(direction: str = "both", scope: str = "all", now=None, view: str = "all") -> Dict[str, Any]:
     """Discord 入口：回 {text, panels, title}。
 
     v1.3 先依規模分組，再在組內比較：
@@ -1032,7 +1050,7 @@ def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, A
             tiers[group].append(row)
     _tier_ranks(tiers["main"])
     _tier_ranks(tiers["small"])
-    plan, targets = _plan(data, scope, tiers["main"], tiers["small"], tiers["tiny"])
+    plan, targets = _plan(data, scope, tiers["main"], tiers["small"], tiers["tiny"], view)
     tiny = sorted(tiers["tiny"], key=lambda r: -abs(r["change_pct"]))[:TINY_SHOW] if scope != "main" else []
     unique = {id(r): r for r in targets + tiny}
     member_ok = enrich(list(unique.values()), data)
