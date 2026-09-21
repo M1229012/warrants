@@ -3,12 +3,16 @@
 - 對照固定寫死：MIS 類股 channel → 產業代碼，程式不靠名稱猜；MIS 名稱只拿來做一致性檢查。
 - MIS 目前只抓 tse_t01～t31（上市類股指數），所以成員名單一律只取 market == twse，
   index universe 與 sample universe 才會一致。
-- 目前成員來源是 FinMind 產業別（source=finmind_proxy），log 會註明，卡片不顯示。
-- 每次解析結果存進 SQLite；FinMind 暫時失敗時沿用上次成功的版本（標 stale）。
+- 成員來源優先用證交所上市公司基本資料的「產業別」（source=twse_official），和類股指數同一套分類；
+  取不到才退回 FinMind 產業別（source=finmind_proxy）。FinMind 同一檔會有多個分類列，
+  去重後常只留到非主產業那列（例：半導體只剩 26 檔），所以只當備援。
+- 每次解析結果存進 SQLite；來源暫時失敗時沿用上次成功的版本（標 stale）。
 """
 from __future__ import annotations
 
 import hashlib
+import re
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -43,6 +47,27 @@ SECTOR_MAP: Dict[str, Optional[tuple]] = {
 AGGREGATE_IDS = frozenset(k for k, v in SECTOR_MAP.items() if v is None)
 # sector_match 沒收錄的產業名稱在這裡補（FinMind industry_category 的寫法）
 _EXTRA_INDUSTRY_NAMES = {"18": ("貿易百貨", "貿易百貨業")}
+
+
+_REGISTRY_TTL = 12 * 3600
+_REGISTRY: Dict[str, Any] = {"at": 0.0, "rows": []}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def _twse_registry() -> list:
+    """證交所上市公司基本資料（t187ap03_L）；走主程式的官方抓取＋最後好副本，記憶體快取 12 小時。"""
+    with _REGISTRY_LOCK:
+        if _REGISTRY["rows"] and time.time() - _REGISTRY["at"] < _REGISTRY_TTL:
+            return _REGISTRY["rows"]
+        core = tools.core()
+        label = "上市股票基本資料"
+        rows, ok, error = core.fetch_openapi_json(
+            core.TWSE_STOCK_REGISTRY_OPENAPI_URL, label,
+            core._official_stock_registry_cache_name(label), core.WARRANT_STOCK_REGISTRY_STALE_MAX_DAYS)
+        if not ok or not rows:
+            raise tools.ToolDataError(error or "證交所上市公司基本資料為空")
+        _REGISTRY.update({"at": time.time(), "rows": [r for r in rows if isinstance(r, dict)]})
+        return _REGISTRY["rows"]
 
 
 def _industry_names(code: str) -> tuple:
@@ -84,7 +109,11 @@ class OfficialSectorMemberResolver:
         industry = entry[0]
         key = _STATE_PREFIX + sector_id
         try:
-            result = self._from_finmind(sector_id, industry)
+            try:
+                result = self._from_twse(sector_id, industry)
+            except Exception as exc:
+                print(f"⚠️ 證交所產業別取不到，改用 FinMind｜{sector_id}｜{type(exc).__name__}", flush=True)
+                result = self._from_finmind(sector_id, industry)
             previous = local_market_cache.get_state(key, {}) or {}
             if previous.get("version") != result["version"]:   # 版本有變才寫入與印 log，避免每次查詢洗版
                 local_market_cache.set_state(key, result)
@@ -98,6 +127,22 @@ class OfficialSectorMemberResolver:
                       f"｜{type(exc).__name__}", flush=True)
                 return dict(stored, stale=True)
             return {"available": False, "sector_id": sector_id, "reason": "成員名單取不到"}
+
+    def _from_twse(self, sector_id: str, industry: str) -> Dict[str, Any]:
+        """證交所上市公司基本資料的「產業別」代碼＝類股指數的編制分類，index／sample universe 同源。"""
+        rows = _twse_registry()
+        codes = sorted({str(r.get("公司代號") or "").strip() for r in rows
+                        if str(r.get("產業別") or "").strip() == industry})
+        codes = [c for c in codes if re.fullmatch(r"[1-9]\d{3}", c)]
+        if not codes:
+            raise tools.ToolDataError("證交所名冊沒有此產業別的普通股")
+        digest = hashlib.sha1((MAP_VERSION + "|" + ",".join(codes)).encode("utf-8")).hexdigest()[:10]
+        return {
+            "available": True, "sector_id": sector_id, "industry": industry, "market": self.market,
+            "member_codes": codes, "source": "twse_official",
+            "version": f"{MAP_VERSION}:{digest}",
+            "updated_at": time.strftime("%Y-%m-%d"), "resolved_at": time.time(),
+        }
 
     def _from_finmind(self, sector_id: str, industry: str) -> Dict[str, Any]:
         import sector_analysis                    # 延後載入：共用它已快取的 FinMind 名冊

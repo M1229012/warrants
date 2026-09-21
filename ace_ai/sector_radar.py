@@ -432,15 +432,23 @@ def attach_leaders(sections: List[Tuple[str, List[Dict[str, Any]], str]]) -> Non
                 if not sid or row["name"] in members:
                     continue
                 info = resolver.resolve(sid, row["name"])
-                codes = [c for c in info.get("member_codes") or []
+                all_codes = info.get("member_codes") or []
+                codes = [c for c in all_codes
                          if float((liquidity.get(c) or {}).get("avg_value") or 0) >= MIN_AVG_VALUE
                          and float((liquidity.get(c) or {}).get("avg_lots") or 0) >= MIN_AVG_LOTS]
                 members[row["name"]] = codes
+                print(f"   {row['name']}｜{sid}｜member_source={info.get('source', '-')}"
+                      f"｜成員 {len(all_codes)}｜流動性達標 {len(codes)}", flush=True)
         wanted = sorted({c for codes in members.values() for c in codes})
         quotes = _quotes_for(wanted) if wanted else {}
         for section, rows, _ in sections:
             for row in rows:
                 priced = [(c, quotes[c]) for c in members.get(row["name"], []) if c in quotes]
+                # 「領漲」只收上漲股、「領跌」只收下跌股；方向不同的不硬湊（例：台汽電 -0.50% 不能叫領漲）
+                if section == "down":
+                    priced = [p for p in priced if p[1]["change_pct"] < 0]
+                else:
+                    priced = [p for p in priced if p[1]["change_pct"] > 0]
                 priced.sort(key=lambda p: p[1]["change_pct"], reverse=(section != "down"))
                 # 同一族群可能同時在「最強」與「轉弱」區，依區分開存，免得互相覆蓋
                 row.setdefault("leaders_by", {})[section] = [
