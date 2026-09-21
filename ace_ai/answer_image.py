@@ -1411,8 +1411,9 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         draw.text((px_, ly), f'{change:+.2f}%', font=font(22, True), fill=change_color, anchor='ls')
     elif not technical:
         info = row.get('intraday') or {}
-        when = f"盤中 {info.get('time', '')}" if live else f"{_sector_date(row.get('quote_date'))} 收盤"
-        draw.text((px_, ly), when, font=font(20), fill=MUTED, anchor='ls')
+        when = f"盤中 {info.get('time', '')}".strip() if live else f"{_sector_date(row.get('quote_date'))} 收盤".strip()
+        if when and when != '收盤':
+            draw.text((px_, ly), when, font=font(20), fill=MUTED, anchor='ls')
     # 分數條
     if technical:
         by = y + SECTOR_INNER + 122

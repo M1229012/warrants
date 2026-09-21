@@ -4557,7 +4557,8 @@ def get_market_breadth() -> Dict[str, Any]:
             pct = _num(overview.get("change_pct"))
             if pct is None:
                 continue
-            heavy.append({"name": overview.get("stock_name") or code, "code": code, "change_pct": round(pct, 2)})
+            heavy.append({"name": overview.get("stock_name") or code, "code": code,
+                          "change_pct": round(pct, 2), "close": _num(overview.get("close"))})
         if heavy or benchmarks:
             heavy_values = sorted(r["change_pct"] for r in heavy)
             heavy_sorted = sorted(heavy, key=lambda r: -r["change_pct"])
@@ -4568,6 +4569,7 @@ def get_market_breadth() -> Dict[str, Any]:
                 "taiex_change_pct": benchmarks.get("加權"), "tpex_change_pct": benchmarks.get("櫃買"),
                 "heavyweight_sample": len(heavy),
                 "heavyweight_median_pct": round(heavy_values[len(heavy_values) // 2], 2) if heavy_values else None,
+                "heavyweights": heavy_sorted,
                 "heavyweight_top": heavy_sorted[:3],
                 "heavyweight_bottom": heavy_sorted[-3:] if len(heavy_sorted) > 3 else [],
                 "others_label": "櫃買指數（中小型股為主）", "others_change_pct": benchmarks.get("櫃買"),
@@ -4605,6 +4607,8 @@ def get_market_breadth() -> Dict[str, Any]:
             "taiex_change_pct": None, "tpex_change_pct": None,
             "heavyweight_sample": len(heavy_values),
             "heavyweight_median_pct": round(heavy_values[len(heavy_values) // 2], 2) if heavy_values else None,
+            "heavyweights": [{"name": names.get(c, c), "code": c, "change_pct": round(v, 2),
+                              "close": _num((changes_map.get(c) or {}).get("close"))} for c, v in heavy_sorted],
             "heavyweight_top": [{"name": names.get(c, c), "code": c, "change_pct": round(v, 2)}
                                 for c, v in heavy_sorted[:3]],
             "heavyweight_bottom": [{"name": names.get(c, c), "code": c, "change_pct": round(v, 2)}

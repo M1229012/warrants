@@ -1561,24 +1561,43 @@ def format_technical(d: Dict[str, Any]) -> str:
 
 
 def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
-    """盤面廣度卡片：沿用族群排行版型，上半最強類股、下半最弱類股，副標寫權值股與對照組。"""
-    def rows(items, start=1):
+    """盤面結構卡片：主體列「權值股漲幅排行」（問的就是權值股）；抓不到權值股報價時才退回類股。"""
+    heavy = list(data.get("heavyweights") or [])
+
+    live = str(data.get("basis") or "") == "盤中即時"
+    intraday = {"is_live": True, "time": str(data.get("time") or "")} if live else {}
+
+    def stock_rows(items, start=1):
+        return [{"rank": i, "stock_code": str(x.get("code") or ""), "stock_name": str(x.get("name") or ""),
+                 "market": "", "pattern_score": None, "close": x.get("close"),
+                 "change_pct": float(x.get("change_pct") or 0.0), "intraday": intraday, "quote_date": ""}
+                for i, x in enumerate(items, start)]
+
+    def group_rows(items, start=1):
         return [{"rank": i, "stock_code": "", "stock_name": str(x.get("name") or ""), "market": "",
                  "row_kind": "sector_group", "pattern_score": None,
                  "change_pct": float(x.get("change_pct") or 0.0),
                  "coverage_text": "", "ratio_text": "", "leader_text": ""}
                 for i, x in enumerate(items, start)]
+
     parts = []
     if data.get("taiex_change_pct") is not None:
         parts.append("加權 {:+.2f}%".format(data["taiex_change_pct"]))
     if data.get("tpex_change_pct") is not None:
         parts.append("櫃買 {:+.2f}%".format(data["tpex_change_pct"]))
     if data.get("heavyweight_median_pct") is not None:
-        parts.append("權值股 {:+.2f}%".format(data["heavyweight_median_pct"]))
-    note = str(data.get("verdict") or "")
-    return {"sector": {"name": "盤面結構｜" + "｜".join(parts), "mode": "market_momentum",
-                       "comparison_date": "", "rows": rows(data.get("strongest") or [])[:3],
-                       "others": rows(data.get("weakest") or [], start=4)[:3],
+        parts.append("權值股中位 {:+.2f}%".format(data["heavyweight_median_pct"]))
+    note = "｜".join(parts)
+    if data.get("advance_ratio_pct") is not None:
+        note += f"｜上漲類股 {data.get('sector_advancing', 0)}/{data.get('sector_total', 0)}"
+    if heavy:
+        rows, others = stock_rows(heavy[:3]), stock_rows(heavy[3:8], start=4)
+        title = "盤面結構｜權值股"
+    else:
+        rows, others = group_rows(data.get("strongest") or [])[:3], group_rows(data.get("weakest") or [], start=4)[:3]
+        title = "盤面結構｜類股"
+    return {"sector": {"name": title, "mode": "market_momentum",
+                       "comparison_date": "", "rows": rows, "others": others,
                        "coverage_note": "", "liquidity_note": note,
                        "live_time": str(data.get("time") or "")}}
 
