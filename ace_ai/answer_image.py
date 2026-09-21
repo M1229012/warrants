@@ -567,6 +567,17 @@ def _draw_badge(draw, cx, cy, number_text, color):
     draw.text((cx, cy), text, font=font(size, True), fill='white', anchor='mm')
 
 
+def _split_badges(x: float, numbers: list, **extra) -> list[dict]:
+    """同一天有好幾個編號時，每個編號各畫一顆圓圈、以三角形為中心左右並排（不合併成「1、2」）。
+
+    間距剛好是 _assign_rows 的最小間隔，並排的幾顆會落在同一列；和鄰近日期擠到時才換列。
+    """
+    ordered = sorted(set(numbers))
+    gap = 2 * max((_badge_half(str(n)) for n in ordered), default=MARK_BADGE_R) + 6   # 兩位數編號較寬
+    offset = (len(ordered) - 1) / 2
+    return [{'x': x, 'cx': x + (k - offset) * gap, 'no': str(n), **extra} for k, n in enumerate(ordered)]
+
+
 def _dotted(draw, x, y_from, y_to, color):
     step = 5 if y_to >= y_from else -5
     for yy in range(int(y_from), int(y_to), step * 2):
@@ -589,12 +600,12 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
             i = index.get(e.get('action_date') or '')
             if i is None:
                 continue
-            item = {'x': px(i), 'cx': px(i), 'no': e.get('no', ''),
-                    'color': palette.get(str(e.get('branch') or '').strip())}
-            if e.get('action') == 'buy':
-                buy_badges.append(item)
-            else:
-                sell_badges.append(item)
+            color = palette.get(str(e.get('branch') or '').strip())
+            numbers = _mark_numbers(e)
+            # 一次清掉多筆（no='1、2'）拆成各自的圓圈；沒編號的減碼仍是單一個三角形
+            items = (_split_badges(px(i), numbers, color=color) if numbers
+                     else [{'x': px(i), 'cx': px(i), 'no': '', 'color': color}])
+            (buy_badges if e.get('action') == 'buy' else sell_badges).extend(items)
         _assign_rows(buy_badges); _assign_rows(sell_badges)
         tri_bottom, tri_top = price_bottom + 14, price_top - 14
         for badge in buy_badges:
@@ -632,16 +643,11 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
             reduce_days.add(k)
     buy_days = set(buy_days_numbers)
 
-    def _merged_label(numbers: list[int]) -> str:
-        """同一天有好幾筆時合併成一個標記（1、2），不要兩個圓圈擠在一起、一高一低。"""
-        ordered = sorted(set(numbers))
-        head = '、'.join(str(n) for n in ordered[:3])
-        return head + (f'…共{len(ordered)}筆' if len(ordered) > 3 else '')
-
+    # 同一天有好幾筆：每個編號各自一顆圓圈、並排在同一列（不合併成「1、2」膠囊）
     for i, numbers in buy_days_numbers.items():
-        buy_badges.append({'x': px(i), 'cx': px(i), 'no': _merged_label(numbers)})
+        buy_badges.extend(_split_badges(px(i), numbers))
     for j, numbers in sell_days.items():
-        sell_badges.append({'x': px(j), 'cx': px(j), 'no': _merged_label(numbers)})
+        sell_badges.extend(_split_badges(px(j), numbers))
     _assign_rows(buy_badges); _assign_rows(sell_badges)
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):

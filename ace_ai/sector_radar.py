@@ -314,16 +314,21 @@ def deltas(now=None) -> Dict[str, Any]:
 
 
 def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None,
-               data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """轉強／轉弱候選：Δ 分位數 ＋ 最低絕對變化量，兩者同時滿足。data＝已算好的 deltas()，可省一次讀取。"""
+               data: Optional[Dict[str, Any]] = None, rows: Optional[List[Dict[str, Any]]] = None,
+               use_percentile: bool = True) -> Dict[str, Any]:
+    """轉強／轉弱候選：Δ 分位數 ＋ 最低絕對變化量，兩者同時滿足。
+
+    data＝已算好的 deltas()；rows＝只在這一組族群內比較（v1.3 規模分組）；
+    use_percentile=False＝小型族群只看 ±0.20 ppt 絕對門檻（組內家數太少，10% 分位數沒有統計意義）。
+    """
     data = data if data is not None else deltas(now)
     if not data.get("available"):
         return {"available": False, "reason": data.get("reason"), "phase": data.get("phase")}
-    rows = list(data["rows"])
+    rows = sorted(rows if rows is not None else data["rows"], key=lambda r: -r["delta_ppt"])
     total = len(rows)
-    cut = max(1, int(round(total * DELTA_PERCENTILE)))
+    cut = max(1, int(round(total * DELTA_PERCENTILE))) if use_percentile else total
     if direction == "down":
-        pool = rows[-cut:]
+        pool = rows[-cut:] if cut else []
         picked = [r for r in pool if (r["delta_ppt"] or 0) <= -DELTA_MIN_PPT]
         picked.sort(key=lambda r: r["delta_ppt"])
     else:
@@ -337,7 +342,9 @@ def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None,
         "phase": data["phase"],
         "groups": total, "cut_size": cut, "min_ppt": DELTA_MIN_PPT,
         "candidates": picked[:limit],
-        "reason": "" if picked else f"目前沒有族群同時滿足前後 {data['percentile_cut']}% 與 {DELTA_MIN_PPT} ppt 門檻",
+        "reason": "" if picked else (
+            f"目前沒有族群同時滿足前後 {data['percentile_cut']}% 與 {DELTA_MIN_PPT} ppt 門檻" if use_percentile
+            else f"目前沒有族群近期變化達 ±{DELTA_MIN_PPT} ppt"),
     }
 
 
@@ -367,7 +374,7 @@ _RADAR_WORD_RE = re.compile(r"轉強|轉弱|資金流向|雷達")
 _RADAR_SCOPE_RE = re.compile(r"族群|類股|產業|資金流向|雷達")
 # 拿掉這些通用字後還有殘字（例如「半導體」「記憶體」），就代表在問特定族群，不是雷達。
 _RADAR_GENERIC_RE = re.compile(
-    r"有哪些|哪幾個|哪一個|哪些|哪個|什麼|有沒有|目前|現在|今天|今日|盤中|正在|開始|"
+    r"有哪些|哪幾個|哪一個|哪些|哪個|什麼|有沒有|目前|現在|今天|今日|盤中|正在|開始|主要|大型|小型|"
     r"族群|類股|產業|轉強|轉弱|資金流向|資金|流向|雷達|比較|列出|一下|看看|看|查|"
     r"的|是|嗎|呢|了|在|有|誰|和|與|跟|及|、|[?？!！。,，\s]")
 
@@ -380,7 +387,9 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
     if _RADAR_GENERIC_RE.sub("", value):
         return None
     up, down = "轉強" in value, "轉弱" in value
-    return {"direction": "up" if up and not down else "down" if down and not up else "both"}
+    # v1.3：「小型族群雷達」只看小型組；「主要／大型族群雷達」只看主要組；其餘兩組都出
+    scope = "small" if "小型" in value else ("main" if re.search(r"主要|大型", value) else "all")
+    return {"direction": "up" if up and not down else "down" if down and not up else "both", "scope": scope}
 
 
 # ============================================================
@@ -702,26 +711,67 @@ def enrich(rows: List[Dict[str, Any]], data: Dict[str, Any]) -> bool:
 # L1 輸出（L2 代表股驗證接上前的暫時版：只列指數層級）
 # ============================================================
 
-_MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down"}
-RADAR_NOTE = "擴散度以全部上市成分股計算｜成交熱度比較歷史同時點"
+_MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down", "moves": "moves"}
+RADAR_NOTE = "主要族群＝成分股 >10 檔、小型族群＝3～10 檔，各自組內比較"
 L1_ONLY_NOTE = "未取得成分股資料，僅指數層級"
 STRONG_TOP = 3
 STRONG_POOL = 8          # 強勢區先看類股漲幅前 8 名，剔除集中拉抬後取 3
 CONCENTRATED_POOL = 5    # 集中型異動：只從類股漲幅前 5 名挑
 CONCENTRATED_MAX = 2
 
+# v1.3 規模分組：依官方完整成員檔數（不看報價成功數），整個交易日固定
+SMALL_MAX = 10           # ≤10 檔＝小型族群
+TINY_MAX = 2             # ≤2 檔＝極小型，不參與正式排名
+TINY_SHOW = 2
+TIER_NAMES = {"main": "主要族群", "small": "小型族群"}
+_SIZE_PREFIX = "radar_size:"
 
-def _title(section: str, data: Dict[str, Any]) -> str:
-    """強勢＝依目前漲幅（剔除集中拉抬）；轉強／轉弱＝依 Δ（不是漲幅排行，標題要講清楚）。"""
+
+def size_groups(rows: List[Dict[str, Any]]) -> Dict[str, Tuple[str, int]]:
+    """sector_id → (main/small/tiny, 官方成員檔數)。當天第一次算完就存起來，盤中不換組。"""
+    day = _now().strftime("%Y-%m-%d")
+    key = _SIZE_PREFIX + day
+    counts = dict(local_market_cache.get_state(key, {}) or {})
+    missing = [r for r in rows if r.get("sector_id") and r["sector_id"] not in counts]
+    if missing:
+        resolver = _resolver()
+        for row in missing:
+            count = len(resolver.resolve(row["sector_id"], row["name"]).get("member_codes") or [])
+            if count:                                   # 取不到成員的不寫入，下次再試
+                counts[row["sector_id"]] = count
+        local_market_cache.set_state(key, counts)
+    groups = {sid: ("main" if n > SMALL_MAX else "small" if n > TINY_MAX else "tiny", n)
+              for sid, n in counts.items()}
+    by_group: Dict[str, List[str]] = {}
+    for row in rows:
+        group = groups.get(row.get("sector_id") or "", ("unknown", 0))
+        by_group.setdefault(group[0], []).append(f"{row['name']}({group[1]})")
+    _log_once("size_groups", "📡 sector radar size groups｜" + "｜".join(
+        f"{g}={len(v)}：{'、'.join(v) if g != 'main' else len(v)}" for g, v in sorted(by_group.items())))
+    return groups
+
+
+def _tier_ranks(rows: List[Dict[str, Any]]) -> None:
+    """組內名次（現在／基準），「排名 7 → 5」只跟同一組比。"""
+    for key, field in (("tier_rank", "change_pct"), ("tier_rank_before", "base_change_pct")):
+        for index, row in enumerate(sorted(rows, key=lambda r: -float(r.get(field) or 0.0)), 1):
+            row[key] = index
+
+
+def _title(section: str, data: Dict[str, Any], tier: str = "main") -> str:
+    """強勢＝依目前漲幅；轉強／轉弱＝依 Δ（不是漲幅排行，標題要講清楚）；異動＝依漲跌幅絕對值。"""
+    prefix = TIER_NAMES.get(tier, "族群雷達")
     if section == "strong":
-        return "族群雷達｜目前強勢 TOP3"
+        return f"{prefix}｜目前強勢 TOP3"
+    if section == "moves":
+        return f"{prefix}｜異動 TOP3"
     word = "轉強" if section == "up" else "轉弱"
     stage = data["phase"].get("phase")
     if stage == "opening":
-        return f"族群雷達｜開盤觀察・{data['basis_label']}{word}"
+        return f"{prefix}｜開盤觀察・{data['basis_label']}{word}"
     if stage == "early":
-        return f"族群雷達｜初步{word}・{data['basis_label']}"
-    return f"族群雷達｜{data['basis_label']}{word} TOP3"
+        return f"{prefix}｜初步{word}・{data['basis_label']}"
+    return f"{prefix}｜{data['basis_label']}{word} TOP3"
 
 
 def _stamp(data: Dict[str, Any]) -> Tuple[str, bool]:
@@ -732,7 +782,10 @@ def _stamp(data: Dict[str, Any]) -> Tuple[str, bool]:
 
 
 def _rank_text(row: Dict[str, Any]) -> str:
-    return f"排名 {row['rank_before']} → {row['rank']}" if row.get("rank_before") else f"排名 {row['rank']}"
+    """有組內名次就用組內名次（v1.3），沒有才退回全類股名次。"""
+    now_rank = row.get("tier_rank") or row["rank"]
+    before = row.get("tier_rank_before") if row.get("tier_rank") else row.get("rank_before")
+    return f"排名 {before} → {now_rank}" if before else f"排名 {now_rank}"
 
 
 def _delta_text(row: Dict[str, Any], data: Dict[str, Any]) -> str:
@@ -793,45 +846,59 @@ def _verdict(row: Dict[str, Any], section: str, stage: str) -> Tuple[str, str]:
     return judge(row.get("stat") or {}, change, row.get("heat"), stage)
 
 
-def _card_row(index: int, row: Dict[str, Any], section: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _side(row: Dict[str, Any], section: str) -> str:
+    """領漲或領跌：轉弱區固定領跌；異動區依族群自己的漲跌方向。"""
+    if section == "down" or (section == "moves" and float(row["change_pct"]) < 0):
+        return "down"
+    return "up"
+
+
+def _card_row(index: int, row: Dict[str, Any], section: str, data: Dict[str, Any],
+              tier: str = "main") -> Dict[str, Any]:
+    """圖片卡：不放 Δ ppt 與擴散度那一行（只留在文字回覆與 log）；小型族群第二行固定寫檔數＋主導股。"""
     stage = data["phase"].get("phase")
+    side = _side(row, section)
     labels = []
-    breadth = _breadth_text(row, section, stage)
-    if breadth:
-        labels.append(("擴散", "neutral", breadth))
-    leaders = _leaders_text(row, section)
+    leaders = _leaders_text(row, side)
     if leaders:
-        labels.append((_leaders_label(section), "down" if section == "down" else "up", leaders))
+        labels.append((_leaders_label(side), side, leaders))
     verdict, sentence = _verdict(row, section, stage)
     if verdict or sentence:
         labels.append(("判讀", "accent", f"{verdict}：{sentence}" if verdict else sentence))
+    stat = row.get("stat") or {}
+    coverage = ""
+    if tier == "small":
+        members = stat.get("members") or row.get("member_count") or 0
+        coverage = "｜".join(x for x in (f"成分股 {members} 檔" if members else "",
+                                         f"{stat['driver']}主導" if stat.get("driver") else "") if x)
     return {
         "rank": index, "stock_code": "", "stock_name": row["name"], "market": "",
         "row_kind": "sector_group", "pattern_score": None,
         "change_pct": row["change_pct"],
-        "coverage_text": _delta_text(row, data),
-        # 強勢卡本來就依漲幅排，名次移動只在轉強／轉弱卡當輔助
-        "ratio_text": "" if section == "strong" else _rank_text(row),
+        "coverage_text": coverage,
+        # 名次移動只在轉強／轉弱卡當輔助（組內名次）
+        "ratio_text": _rank_text(row) if section in ("up", "down") else "",
         "leader_text": "",
         "extra_labels": labels,
     }
 
 
-def _concentrated_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    stat = row["stat"]
+def _concentrated_row(row: Dict[str, Any], label: str = "") -> Dict[str, Any]:
+    stat = row.get("stat") or {}
     driver = (stat.get("driver") or "少數權值股")[:5]
     return {"rank": "", "stock_code": "", "stock_name": row["name"], "market": "",
             "row_kind": "sector_group", "pattern_score": None, "change_pct": row["change_pct"],
-            "coverage_text": f"上漲 {stat['up']}/{stat['priced']}｜{driver}主導"}
+            "coverage_text": label or f"{driver}主導"}
 
 
 def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]], member_ok: bool,
-           concentrated: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    items = [_card_row(index, row, section, data) for index, row in enumerate(rows, 1)]
+           concentrated: Optional[List[Dict[str, Any]]] = None, tier: str = "main",
+           tiny: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    items = [_card_row(index, row, section, data, tier) for index, row in enumerate(rows, 1)]
     note = RADAR_NOTE if member_ok else L1_ONLY_NOTE
     stamp, live = _stamp(data)
     panel = {
-        "name": _title(section, data), "mode": "market_momentum", "comparison_date": "",
+        "name": _title(section, data, tier), "mode": "market_momentum", "comparison_date": "",
         "title_suffix": "",                 # 不加「漲幅排行」：轉強／轉弱卡是依 Δ 排序
         "stamp_text": stamp, "stamp_live": live,
         "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動" if live
@@ -842,7 +909,10 @@ def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]], membe
     }
     if concentrated:
         panel.update({"others": [_concentrated_row(r) for r in concentrated],
-                      "others_title": "集中型異動", "others_heads": ("類股漲幅", "擴散／主導")})
+                      "others_title": "集中型異動", "others_heads": ("類股漲幅", "主導")})
+    elif tiny:
+        panel.update({"others": [_concentrated_row(r, f"成分股 {r.get('member_count', 0)} 檔") for r in tiny],
+                      "others_title": "極小型異動（容易受單一成分股影響）", "others_heads": ("類股漲幅", "檔數")})
     return {"sector": panel}
 
 
@@ -850,51 +920,106 @@ def _is_concentrated(row: Dict[str, Any], stage: str) -> bool:
     return judge(row.get("stat") or {}, float(row["change_pct"]), row.get("heat"), stage)[0].endswith("集中拉抬")
 
 
-def answer(direction: str = "both", now=None) -> Dict[str, Any]:
-    """Discord 入口：回 {text, panels}。
+def _plan(data: Dict[str, Any], scope: str, main: List[Dict[str, Any]], small: List[Dict[str, Any]],
+          tiny: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, str, Dict[str, Any], str]], List[Dict[str, Any]]]:
+    """決定要出哪些區塊 → ([(tier, section, 候選結果, 理由)], 需要成員資料的族群)。"""
+    plan, targets = [], []
+    if scope in ("all", "main"):
+        by_change = sorted(main, key=lambda r: -r["change_pct"])
+        ups = candidates("up", data=data, rows=main)
+        downs = candidates("down", data=data, rows=main)
+        plan += [("main", "strong", {"pool": by_change[:STRONG_POOL]}, ""),
+                 ("main", "up", {"rows": ups["candidates"]}, ups["reason"]),
+                 ("main", "down", {"rows": downs["candidates"]}, downs["reason"])]
+        targets += by_change[:STRONG_POOL] + ups["candidates"] + downs["candidates"]
+    if scope == "all":
+        moves = sorted(small, key=lambda r: -abs(r["change_pct"]))[:STRONG_TOP]
+        plan.append(("small", "moves", {"rows": moves}, "今天沒有小型族群資料"))
+        targets += moves
+    if scope == "small":
+        ups = candidates("up", data=data, rows=small, use_percentile=False)
+        downs = candidates("down", data=data, rows=small, use_percentile=False)
+        strong = sorted(small, key=lambda r: -r["change_pct"])[:STRONG_TOP]
+        plan += [("small", "strong", {"rows": strong}, ""),
+                 ("small", "up", {"rows": ups["candidates"]}, ups["reason"]),
+                 ("small", "down", {"rows": downs["candidates"]}, downs["reason"])]
+        targets += strong + ups["candidates"] + downs["candidates"]
+    return plan, targets
 
-    畫面固定三區：目前強勢 TOP3（依類股漲幅，剔除集中拉抬，另列「集中型異動」）
-    → 轉強 TOP3（依 Δ）→ 轉弱 TOP3（依 Δ）。direction 目前只保留介面。
+
+def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, Any]:
+    """Discord 入口：回 {text, panels, title}。
+
+    v1.3 先依規模分組，再在組內比較：
+    - all  ：主要族群 強勢／轉強／轉弱 ＋ 小型族群 異動 TOP3（依漲跌幅絕對值）
+    - main ：只有主要族群三張
+    - small：小型族群 強勢／轉強／轉弱（轉強轉弱只看 ±0.20 ppt，不用分位數）
+    主要族群的強勢區剔除集中拉抬（另列「集中型異動」）；小型族群不剔除，直接標出來。
+    direction 目前只保留介面。
     """
+    title = {"main": "主要族群雷達", "small": "小型族群雷達"}.get(scope, "族群雷達")
     ensure_snapshot()
     data = deltas(now)
     if not data.get("available"):
         _log_l1("strong", data, [])
-        return {"text": str(data.get("reason") or "目前沒有可用的族群雷達資料。"), "panels": []}
+        return {"text": str(data.get("reason") or "目前沒有可用的族群雷達資料。"), "panels": [], "title": title}
     stage = data["phase"].get("phase")
-    by_change = sorted(data["rows"], key=lambda r: -r["change_pct"])
-    ups = candidates("up", data=data)
-    downs = candidates("down", data=data)
-    pool = by_change[:STRONG_POOL]
-    targets = {r["name"]: r for r in pool + ups["candidates"] + downs["candidates"]}
-    member_ok = enrich(list(targets.values()), data)
-    concentrated = [r for r in by_change[:CONCENTRATED_POOL]
-                    if r["change_pct"] > 0 and _is_concentrated(r, stage)][:CONCENTRATED_MAX]
-    strong = [r for r in pool if r not in concentrated and not _is_concentrated(r, stage)][:STRONG_TOP]
-    sections = [("strong", strong, ""), ("up", ups["candidates"], ups["reason"]),
-                ("down", downs["candidates"], downs["reason"])]
+    try:
+        resolver = _resolver()
+        for row in data["rows"]:
+            row["sector_id"] = row.get("sector_id") or resolver.id_for_name(row["name"])
+        groups = size_groups(data["rows"])
+    except Exception as exc:
+        print(f"⚠️ 族群規模分組失敗，全部當主要族群｜{type(exc).__name__}: {exc}", flush=True)
+        groups = {}
+    tiers: Dict[str, List[Dict[str, Any]]] = {"main": [], "small": [], "tiny": []}
+    for row in data["rows"]:
+        group, count = groups.get(row.get("sector_id") or "", ("main" if not groups else "", 0))
+        if group in tiers:
+            row.update({"size_group": group, "member_count": count})
+            tiers[group].append(row)
+    _tier_ranks(tiers["main"])
+    _tier_ranks(tiers["small"])
+    plan, targets = _plan(data, scope, tiers["main"], tiers["small"], tiers["tiny"])
+    tiny = sorted(tiers["tiny"], key=lambda r: -abs(r["change_pct"]))[:TINY_SHOW] if scope != "main" else []
+    unique = {id(r): r for r in targets + tiny}
+    member_ok = enrich(list(unique.values()), data)
+
     stamp, _ = _stamp(data)
-    lines = [f"**族群雷達｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
+    lines = [f"**{title}｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
     panel_list: List[Dict[str, Any]] = []
-    for section, rows, reason in sections:
-        _log_l1(section, data, rows)
-        lines.append(f"【{_title(section, data).split('｜', 1)[1]}】")
-        extra = concentrated if section == "strong" else None
-        if not rows and not extra:
+    for index_plan, (tier, section, picked, reason) in enumerate(plan):
+        concentrated: List[Dict[str, Any]] = []
+        if tier == "main" and section == "strong":
+            pool = picked["pool"]
+            concentrated = [r for r in pool[:CONCENTRATED_POOL]
+                            if r["change_pct"] > 0 and _is_concentrated(r, stage)][:CONCENTRATED_MAX]
+            rows = [r for r in pool if not _is_concentrated(r, stage)][:STRONG_TOP]
+        else:
+            rows = picked["rows"]
+        # 極小型族群掛在最後一張小型卡下面（不參與正式排名）
+        tiny_here = tiny if tier == "small" and index_plan == len(plan) - 1 else []
+        _log_l1(section, dict(data, groups=len(tiers[tier])), rows)
+        lines.append(f"【{_title(section, data, tier)}】")
+        if not rows and not concentrated and not tiny_here:
             lines.append(reason or "目前沒有符合的族群")
             continue
         for index, row in enumerate(rows, 1):
-            tail = "" if section == "strong" else f"｜{_rank_text(row)}"
-            breadth = _breadth_text(row, section, stage)
-            leaders = _leaders_text(row, section)
+            side = _side(row, section)
+            tail = f"｜{_rank_text(row)}" if section in ("up", "down") else ""
+            breadth = _breadth_text(row, "down" if side == "down" else "up", stage)
+            leaders = _leaders_text(row, side)
             verdict, sentence = _verdict(row, section, stage)
             tail += f"｜{breadth}" if breadth else ""
-            tail += f"｜{_leaders_label(section)} {leaders}" if leaders else ""
+            tail += f"｜{_leaders_label(side)} {leaders}" if leaders else ""
             tail += f"｜{verdict or sentence}" if (verdict or sentence) else ""
             lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜{_delta_text(row, data)}{tail}")
-        if extra:
+        if concentrated:
             lines.append("集中型異動：" + "；".join(
-                f"{r['name']} {r['change_pct']:+.2f}%（{_concentrated_row(r)['coverage_text']}）" for r in extra))
-        panel_list.append(_panel(section, data, rows, member_ok, extra))
+                f"{r['name']} {r['change_pct']:+.2f}%（{_concentrated_row(r)['coverage_text']}）" for r in concentrated))
+        if tiny_here:
+            lines.append("極小型異動（容易受單一成分股影響）：" + "；".join(
+                f"{r['name']} {r['change_pct']:+.2f}%（成分股 {r.get('member_count', 0)} 檔）" for r in tiny_here))
+        panel_list.append(_panel(section, data, rows, member_ok, concentrated, tier, tiny_here))
     lines.append(f"※ {RADAR_NOTE if member_ok else L1_ONLY_NOTE}；盤中變化快，僅供當下觀察，不代表未來表現。")
-    return {"text": "\n".join(lines), "panels": panel_list}
+    return {"text": "\n".join(lines), "panels": panel_list, "title": title}

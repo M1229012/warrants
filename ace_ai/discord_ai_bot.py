@@ -2441,7 +2441,7 @@ class AceQueryEngine:
         # 否則「正在轉強」會被當成族群名稱去查。
         radar = sector_radar.detect_intent(compact)
         if radar:
-            return self._answer_radar(radar["direction"], started, route="rule_radar")
+            return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"))
         try:
             parsed = self.parser.parse(question)
         except tools.ToolDataError as exc:
@@ -2569,13 +2569,13 @@ class AceQueryEngine:
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
-    def _answer_radar(self, direction: str, started: float, route: str) -> AnswerResult:
-        """族群雷達（新 L1：Δ30m＋分位數門檻）；/ace 與 /ask 共用。"""
-        result = sector_radar.answer(direction)
+    def _answer_radar(self, direction: str, started: float, route: str, scope: str = "all") -> AnswerResult:
+        """族群雷達（v1.3：先依規模分組、再組內比較）；/ace 與 /ask 共用。scope＝all／main／small。"""
+        result = sector_radar.answer(direction, scope=scope)
         panels = result.get("panels") or []
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
-                            as_text=not panels, image_title="族群雷達")
+                            as_text=not panels, image_title=result.get("title") or "族群雷達")
 
     def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
@@ -2623,7 +2623,7 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter()-started, cacheable=False)
         radar = sector_radar.detect_intent(compact)
         if radar:
-            return self._answer_radar(radar["direction"], started, route="admin_radar")
+            return self._answer_radar(radar["direction"], started, route="admin_radar", scope=radar.get("scope", "all"))
         if compact in ("更新族群名冊", "重建族群名冊", "更新名冊"):
             def job() -> None:
                 try:
@@ -3290,7 +3290,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `系統狀態`：名冊、日K底庫、型態分數、是否永久保存
 • `更新市場底庫`：補齊全市場日K（每個交易日 2 個請求）
 • `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
-• `族群雷達`／`轉強族群`／`轉弱族群`：盤中類股指數近 30 分鐘變化（Δ ppt），/ask 也可問「哪些族群正在轉強」
+• `族群雷達`／`轉強族群`／`轉弱族群`：主要族群（>10 檔）強勢／轉強／轉弱＋小型族群異動，/ask 也可問「哪些族群正在轉強」
+• `主要族群雷達`（或 `大型族群雷達`）／`小型族群雷達`：只看其中一組，組內比較
 • `用量`：今日 Gemini 與各 API 使用量
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
