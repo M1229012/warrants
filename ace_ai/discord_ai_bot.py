@@ -40,6 +40,7 @@ import answer_image
 import weekly_image
 import sector_analysis
 import sys
+import traceback
 
 import sector_match
 import sector_radar
@@ -3421,6 +3422,7 @@ def run_discord_bot(config: BotConfig) -> None:
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()   # 印出檔名與行號，numpy/pandas 這類例外沒有堆疊就無法定位
             try:
                 await interaction_image(interaction, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。", ephemeral=config.ephemeral)
             except discord.HTTPException as send_exc:
@@ -3491,6 +3493,7 @@ def run_discord_bot(config: BotConfig) -> None:
             print(f"⚠️ Discord 訊息送出失敗：{exc}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI 處理問題失敗：{type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
             try:
                 await reply_image(message, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。", pending=pending)
             except discord.HTTPException as send_exc:
