@@ -6,19 +6,18 @@
 - 資料來源：證交所 MIS 即時行情，一個請求就拿到全部類股指數＋加權＋櫃買（官方、免金鑰）。
 - 轉強：名次往前；相鄰兩張快照都往前＝「持續」，只動一次＝「剛發動」。轉弱同理。
 - 抓不到即時資料就說沒有，不用昨天的資料頂替。
+- 這條序列只收 MIS 官方類股指數；CMoney 概念族群屬另一套 universe，不得混入（規格全域規則 1）。
 """
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import warrant_ai_tools as tools
-import cmoney_sector_catalog as cmoney_catalog
 import local_market_cache
 
 SNAPSHOT_MINUTES = max(2, tools._env_int("DISCORD_AI_RADAR_SNAPSHOT_MINUTES", 5))
 COMPARE_MINUTES = max(5, tools._env_int("DISCORD_AI_RADAR_COMPARE_MINUTES", 30))
-OPEN_GRACE_MINUTES = max(0, tools._env_int("DISCORD_AI_RADAR_OPEN_GRACE", 15))
 TOP_N = max(3, tools._env_int("DISCORD_AI_RADAR_TOP", 5))
 # 「電子工業」是半導體＋光電＋電腦週邊…等類股的總和，放進排名等於重複計算，也查不到成分股；
 # 「其他」「綜合」則沒有分析意義。
@@ -74,7 +73,8 @@ def fetch_sector_quotes() -> Dict[str, Any]:
             continue
         if label in EXCLUDE_NAMES:
             continue
-        rows.append({"name": label, "change_pct": pct})
+        # sector_id＝MIS channel（如 t24），給 OfficialSectorMemberResolver 對照成員用，不靠名稱
+        rows.append({"sector_id": channel.split(".")[0], "name": label, "change_pct": pct})
     return {"rows": rows, "benchmarks": benchmarks, "time": stamp}
 
 
@@ -93,9 +93,8 @@ def session_open(now=None) -> bool:
 
 
 def ready_for_query(now=None) -> bool:
-    """開盤前 15 分鐘雜訊太大，不給排名。"""
-    now = now or _now()
-    return session_open(now) and _minutes(now) >= 9 * 60 + OPEN_GRACE_MINUTES
+    """盤中 09:00 起即可查詢；能否下「明顯轉強／轉弱」由 phase() 控制（v1.1）。"""
+    return session_open(now)
 
 
 def _key(day: str) -> str:
@@ -129,28 +128,159 @@ def tick(force: bool = False) -> Dict[str, Any]:
         rows = list(quotes.get("rows") or [])
         benchmarks = dict(quotes.get("benchmarks") or {})
     except Exception as exc:
-        print(f"⚠️ 類股即時指數取得失敗，改用備援｜{type(exc).__name__}", flush=True)
-    if not rows:   # 備援：CMoney 族群漲跌（格式常變，解析不到就放棄這一輪）
-        try:
-            radar = cmoney_catalog.get_live_radar(refresh=True)
-            rows = [{"name": str(r.get("name") or ""), "change_pct": float(r.get("change_pct") or 0.0)}
-                    for r in (radar.get("rows") or []) if str(r.get("name") or "") not in EXCLUDE_NAMES]
-        except Exception as exc:
-            print(f"⚠️ 族群雷達快照失敗｜{type(exc).__name__}", flush=True)
-            return {"saved": False, "reason": "抓取失敗"}
-    if not rows:
-        return {"saved": False, "reason": "沒有可用資料"}
+        print(f"⚠️ 官方類股指數取得失敗，本輪不存快照｜{type(exc).__name__}", flush=True)
+    if not rows:   # 不用 CMoney 補：概念族群不能替代官方類股指數（兩套 universe 不混用）
+        return {"saved": False, "reason": "官方類股指數取得失敗"}
     rows.sort(key=lambda r: -float(r.get("change_pct") or 0.0))
     snapshot = {
         "time": now.strftime("%H:%M"),
         "benchmarks": benchmarks,
-        "rows": [{"name": str(r.get("name") or ""), "rank": index,
+        "rows": [{"sector_id": str(r.get("sector_id") or ""), "name": str(r.get("name") or ""), "rank": index,
                   "change_pct": round(float(r.get("change_pct") or 0.0), 2)}
                  for index, r in enumerate(rows, 1)],
     }
     snaps.append(snapshot)
-    local_market_cache.set_state(_key(day), snaps[-60:])
+    # 保留當日第一張（Δ 的退路基準），其餘只留最近 60 張；重啟後仍讀得到。
+    kept = snaps[-60:]
+    if snaps and snaps[0] not in kept:
+        kept = [snaps[0]] + kept[1:]
+    local_market_cache.set_state(_key(day), kept)
     return {"saved": True, "time": snapshot["time"], "groups": len(snapshot["rows"])}
+
+
+
+# ============================================================
+# L1：Δ30m、開盤模式、候選族群（規格書第 2 章、v1.1 第 4 點）
+# ============================================================
+
+DELTA_MINUTES = max(10, tools._env_int("DISCORD_AI_RADAR_DELTA_MINUTES", 30))
+DELTA_TOLERANCE = max(3, tools._env_int("DISCORD_AI_RADAR_DELTA_TOLERANCE", 8))
+DELTA_MIN_PPT = max(0.05, tools._env_float("DISCORD_AI_RADAR_DELTA_MIN_PPT", 0.20))
+DELTA_PERCENTILE = min(0.4, max(0.02, tools._env_float("DISCORD_AI_RADAR_DELTA_PCT", 0.10)))
+CANDIDATE_LIMIT = max(1, tools._env_int("DISCORD_AI_RADAR_CANDIDATES", 3))
+BASE_SNAPSHOT_CUTOFF = 9 * 60 + 5     # 基準快照晚於這個時間就不能說「開盤以來」
+
+
+def _minutes_of(stamp: str) -> Optional[int]:
+    try:
+        return int(str(stamp)[:2]) * 60 + int(str(stamp)[3:5])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def phase(now=None) -> Dict[str, Any]:
+    """開盤模式：09:00–09:14 只能觀察、09:15–09:29 初步、09:30 起正式。"""
+    now = now or _now()
+    minutes = _minutes(now)
+    if not session_open(now):
+        return {"phase": "closed", "label": "非盤中", "allow_strong": False, "prefix": ""}
+    if minutes < 9 * 60 + 15:
+        return {"phase": "opening", "label": "開盤觀察", "allow_strong": False, "prefix": "開盤觀察"}
+    if minutes < 9 * 60 + 30:
+        return {"phase": "early", "label": "初步", "allow_strong": False, "prefix": "初步"}
+    return {"phase": "normal", "label": "正式", "allow_strong": True, "prefix": ""}
+
+
+def _baseline(snaps: List[Dict[str, Any]], latest_minutes: int) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """取 Δ 的基準快照 → (快照, 文案, basis_kind)。
+
+    時間窗以「最新快照時間」為準（不是現在時間），MIS 中途斷線時 Δ 仍是真正的 30 分鐘。
+    優先「最接近 latest−30 分鐘、誤差 ≤8 分鐘」且早於 latest 的快照；找不到才退回當日第一張。
+    basis_kind："30m" / "open"（首張 ≤09:05）/ "first_observation"。
+    """
+    if not snaps:
+        return None, "", ""
+    target = latest_minutes - DELTA_MINUTES
+    best, best_gap = None, None
+    for snap in snaps:
+        stamp = _minutes_of(snap.get("time", ""))
+        if stamp is None or stamp >= latest_minutes:
+            continue
+        gap = abs(stamp - target)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = snap, gap
+    if best is not None and best_gap is not None and best_gap <= DELTA_TOLERANCE:
+        return best, f"近{DELTA_MINUTES}分", "30m"
+    first = snaps[0]
+    first_minutes = _minutes_of(first.get("time", ""))
+    if first_minutes is not None and first_minutes <= BASE_SNAPSHOT_CUTOFF:
+        return first, "開盤以來", "open"
+    return first, f"自首次觀測（{first.get('time', '')}）以來", "first_observation"
+
+
+def deltas(now=None) -> Dict[str, Any]:
+    """L1 主結果：每個類股的現在漲幅、基準漲幅、Δ30m、名次與分位數。"""
+    now = now or _now()
+    day = now.strftime("%Y-%m-%d")
+    snaps = _load_day(day)
+    if not snaps:
+        return {"available": False, "reason": "今天還沒有盤中快照", "phase": phase(now)}
+    if len(snaps) < 2:   # 只有一張時不自己比自己，免得假裝有「開盤以來 Δ=0」
+        return {"available": False, "reason": "已記錄今日第一張快照，等待下一張快照後才能計算變化",
+                "snapshots": len(snaps), "phase": phase(now)}
+    latest = snaps[-1]
+    latest_minutes = _minutes_of(latest.get("time", ""))
+    if latest_minutes is None:
+        return {"available": False, "reason": "最新快照時間格式錯誤", "phase": phase(now)}
+    base, basis_label, basis_kind = _baseline(snaps[:-1], latest_minutes)
+    base_minutes = _minutes_of((base or {}).get("time", ""))
+    actual_minutes = latest_minutes - base_minutes if base_minutes is not None else None
+    base_map = _rank_map(base or {})
+    rows: List[Dict[str, Any]] = []
+    for row in latest.get("rows") or []:
+        name = row.get("name")
+        before = base_map.get(name) or {}
+        change = float(row.get("change_pct") or 0.0)
+        base_change = float(before.get("change_pct")) if before.get("change_pct") is not None else None
+        rows.append({
+            "sector_id": row.get("sector_id") or "",      # 舊快照沒有這欄，L2 會跳過
+            "name": name,
+            "change_pct": change,
+            "base_change_pct": base_change,
+            "delta_ppt": round(change - base_change, 2) if base_change is not None else None,
+            "rank": int(row.get("rank") or 0),
+            "rank_before": int(before.get("rank") or 0) or None,
+        })
+    graded = [r for r in rows if r["delta_ppt"] is not None]
+    graded.sort(key=lambda r: -r["delta_ppt"])
+    total = len(graded)
+    for index, row in enumerate(graded):
+        row["delta_percentile"] = round((index + 1) / total * 100, 1) if total else None
+    return {
+        "available": True, "time": latest.get("time", ""), "basis_label": basis_label,
+        "basis_kind": basis_kind, "actual_delta_minutes": actual_minutes,
+        "base_time": (base or {}).get("time", ""), "snapshots": len(snaps),
+        "phase": phase(now), "groups": total, "rows": graded,
+        "delta_minutes": DELTA_MINUTES, "min_ppt": DELTA_MIN_PPT,
+        "percentile_cut": round(DELTA_PERCENTILE * 100, 1),
+    }
+
+
+def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None) -> Dict[str, Any]:
+    """轉強／轉弱候選：Δ 分位數 ＋ 最低絕對變化量，兩者同時滿足。"""
+    data = deltas(now)
+    if not data.get("available"):
+        return {"available": False, "reason": data.get("reason"), "phase": data.get("phase")}
+    rows = list(data["rows"])
+    total = len(rows)
+    cut = max(1, int(round(total * DELTA_PERCENTILE)))
+    if direction == "down":
+        pool = rows[-cut:]
+        picked = [r for r in pool if (r["delta_ppt"] or 0) <= -DELTA_MIN_PPT]
+        picked.sort(key=lambda r: r["delta_ppt"])
+    else:
+        pool = rows[:cut]
+        picked = [r for r in pool if (r["delta_ppt"] or 0) >= DELTA_MIN_PPT]
+        picked.sort(key=lambda r: -r["delta_ppt"])
+    return {
+        "available": True, "direction": direction, "time": data["time"],
+        "basis_label": data["basis_label"], "basis_kind": data["basis_kind"],
+        "actual_delta_minutes": data["actual_delta_minutes"], "base_time": data["base_time"],
+        "phase": data["phase"],
+        "groups": total, "cut_size": cut, "min_ppt": DELTA_MIN_PPT,
+        "candidates": picked[:limit],
+        "reason": "" if picked else f"目前沒有族群同時滿足前後 {data['percentile_cut']}% 與 {DELTA_MIN_PPT} ppt 門檻",
+    }
 
 
 def ensure_snapshot() -> Dict[str, Any]:

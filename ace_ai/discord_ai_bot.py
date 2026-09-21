@@ -950,7 +950,7 @@ FINAL_BASE_PROMPT = """你是「艾斯 AI 台股數據研究助手」。你的�
 
 FINAL_TECH_RULES = """技術面規則：
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
-- 盤中累計成交量不可和日均量比較，也不可據此判斷量縮、量增或爆量；volume_suspect=true 時不解讀量能。
+- 盤中量能看 intraday_volume_estimate：以 vs_mv20_pct（對 20 日均量）為主要判讀，再補 vs_mv5_pct 與 vs_prev_day_pct；昨日本身可能是異常量，不可只跟昨日比。一律講明是估算、收盤前會變動，並照 confidence（初步／估算／可靠）調整語氣：「初步」時不要給肯定結論。沒有這個欄位就不拿盤中累計量和日均量比較；volume_suspect=true 不解讀量能。
 - 布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
 
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
@@ -3323,6 +3323,9 @@ def _fmt_mb(value: Any) -> str:
     except Exception:
         return "-"
 
+_volume_curve_day = [""]
+
+
 def _market_maintenance_loop(stop: threading.Event) -> None:
     """背景維護全市場底庫：開機補齊歷史、每個交易日收盤後補當天，再把型態分數算完。
 
@@ -3339,7 +3342,25 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                     sector_radar.tick()
                 except Exception as exc:
                     print(f"⚠️ 族群雷達快照略過｜{type(exc).__name__}", flush=True)
+                try:
+                    import intraday_volume
+                    intraday_volume.sample_basket()      # 基準籃子取樣（走背景額度）
+                except Exception as exc:
+                    print(f"⚠️ 盤中量能取樣略過｜{type(exc).__name__}", flush=True)
             today = now.strftime("%Y-%m-%d")
+            # 收盤後用當日實際成交量回算時段係數，讓盤中量能估算越用越準（每天一次）。
+            if _volume_curve_day[0] != today and now.hour * 60 + now.minute >= 15 * 60:
+                _volume_curve_day[0] = today
+                try:
+                    import intraday_volume
+                    codes = local_market_cache.codes_with_history(2)
+                    lots = {c: (v.get("volume") or 0) / 1000
+                            for c, v in local_market_cache.latest_changes(codes).items()}
+                    avg20 = {c: float((v or {}).get("avg_lots") or 0)
+                             for c, v in local_market_cache.liquidity_map(20).items()}
+                    intraday_volume.calibrate(lots, avg20, day=today)
+                except Exception as exc:
+                    print(f"⚠️ 盤中量能曲線校正略過｜{type(exc).__name__}", flush=True)
             minutes = now.hour * 60 + now.minute
             after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5
             need_history = int(info.get("days") or 0) < 60

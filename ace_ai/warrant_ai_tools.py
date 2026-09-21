@@ -1820,7 +1820,7 @@ def intraday_observation(bundle: Dict[str, Any]) -> Dict[str, Any]:
         "changes": changes,
         "cumulative_volume_lots": info.get("cumulative_volume_lots"),
         "volume_suspect": bool(info.get("volume_suspect")),
-        "volume_note": "盤中累計量不和日均量比較，也不據此判斷量縮或量增" if info.get("is_live") else "",
+        "volume_note": "盤中累計量用時段分布推估全日量（估算值，收盤前會變動）" if info.get("is_live") else "",
     }
 
 
@@ -1887,6 +1887,27 @@ def _volume_trend(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _intraday_volume_estimate(code: str, bundle: Dict[str, Any], live: bool, suspect: bool) -> Dict[str, Any]:
+    """盤中用時段量能分布估今日全日量，並和昨日、5 日均量、20 日均量比較。"""
+    if not live or suspect:
+        return {}
+    try:
+        import intraday_volume
+        closed = closed_frame(bundle)
+        if closed is None or closed.empty:
+            return {}
+        last = closed.iloc[-1]
+        lots = lambda v: float(v) / 1000 if v is not None and float(v) > 0 else None
+        cumulative = _num((bundle.get("intraday") or {}).get("cumulative_volume_lots"))
+        return intraday_volume.estimate(
+            code, str(bundle.get("market") or "twse"), cumulative,
+            prev_day_lots=lots(_num(last.get("Volume"))),
+            mv5_lots=lots(_num(last.get("MV5"))), mv20_lots=lots(_num(last.get("MV20"))))
+    except Exception as exc:
+        print(f"⚠️ {code} 盤中量能估算略過：{type(exc).__name__}", flush=True)
+        return {}
+
+
 def get_stock_overview(stock_code: str) -> Dict[str, Any]:
     """最新一根日K的收盤、漲跌幅、成交量（張）、5／20日均量與量比。"""
     code, name = _stock_identity(stock_code)
@@ -1927,8 +1948,9 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "volume_ratio_vs_mv5": ratio5,
         "volume_ratio_vs_mv20": ratio20,
         "volume_trend": _volume_trend(closed_frame(bundle)) if not suspect else {},
+        "intraday_volume_estimate": _intraday_volume_estimate(code, bundle, live, suspect),
         "volume_status": "盤中累計量（尚未收盤）" if live else ("量能資料可疑，不判讀" if suspect else "收盤成交量"),
-        "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中不計算量比",
+        "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中改用時段分布估算全日量",
     }
 
 
