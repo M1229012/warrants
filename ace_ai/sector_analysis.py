@@ -60,6 +60,8 @@ def _residual(question: str, pattern: str) -> str:
 
 def detect_request(question: str) -> Optional[Dict[str, str]]:
     """判斷這題是不是族群問題；族群名稱一律由 sector_match 決定（全系統唯一入口）。"""
+    if sector_match.is_market_level(question):
+        return None          # 「哪些股票拖累大盤」這種問題屬於盤面結構，不是族群查詢
     text = sector_match.normalize(question)
     action = sector_match.action_of(question, default="")
     code_match = re.search(r"(?<![A-Z0-9])(\d{4,6}[A-Z]?)(?![A-Z0-9])", text)

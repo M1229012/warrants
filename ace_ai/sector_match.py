@@ -171,6 +171,17 @@ def _custom(name: str, confidence: str) -> Dict[str, Any]:
 # 主要入口
 # ============================================================
 
+# 大盤層級的問題（指數貢獻、盤面廣度）不屬於族群查詢，必須讓它走盤面結構路由。
+_MARKET_SCOPE_RE = re.compile(r"大盤|加權|櫃買|指數|盤面|盤感|權值|全市場")
+_MARKET_ACTION_RE = re.compile(r"廣度|權值股|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓|拉升|拖累|加.{0,4}點|扣.{0,4}點|普漲|齊漲|沒跟上|只有.{0,4}股")
+
+
+def is_market_level(text: str) -> bool:
+    """同時出現「大盤層級對象」與「廣度／貢獻問法」時，不是族群問題。"""
+    value = normalize(text)
+    return bool(_MARKET_SCOPE_RE.search(value) and _MARKET_ACTION_RE.search(value))
+
+
 def _official_match(core: str, value: str) -> Optional[Dict[str, Any]]:
     """官方 28 類股比對：完全相同或整個出現在問句裡才算，避免和概念族群搶。"""
     best = None

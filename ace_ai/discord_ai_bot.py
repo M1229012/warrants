@@ -277,7 +277,7 @@ class QuestionParser:
         }
 
     def parse(self, question: str) -> ParsedQuestion:
-        sector = sector_analysis.detect_request(question)
+        sector = sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
         if sector is not None:
             return ParsedQuestion(original=question, intents={"sector"}, sector=sector)
         kf = tools.core()
@@ -2164,6 +2164,8 @@ _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
 
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
 # 「是不是只有權值股在動」這類盤面結構問題。
+# 句子同時出現「大盤層級的對象」與「廣度／貢獻的問法」時，一律走盤面結構，不進族群解析。
+_MARKET_SCOPE_RE = re.compile(r"大盤|加權|櫃買|指數|盤面|盤感|權值|市場")
 _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓大盤|加.{0,4}點|扣.{0,4}點|拉升|拖累|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
