@@ -1627,7 +1627,7 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
                     for x in items[:5]))
             else:
                 lines.append(label + "：目前沒有可列出的成分股")
-    lines.append("※ 盤中為官方即時報價估算；收盤後才用全市場日K完整計算。")
+    lines.append("※ 盤中為官方即時報價估算；收盤後改用交易所全市場收盤快照完整計算。")
     return chr(10).join(lines)
 
 

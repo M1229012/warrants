@@ -34,6 +34,10 @@ import warrant_ai_tools as tools
 TWSE_INFO_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TPEX_INFO_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 TPEX_CONSTITUENTS_URL = "https://www.tpex.org.tw/openapi/v1/tpex_index_consti"
+TWSE_CLOSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TWSE_INDEX_CLOSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
+TPEX_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+TPEX_INDEX_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_index"
 TWSE_NEWLIST_CSV_URL = "https://www.twse.com.tw/company/newlisting?response=open_data"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 HEADERS = {"User-Agent": "Mozilla/5.0 AceAI/1.0", "Accept": "application/json"}
@@ -42,7 +46,7 @@ MIS_HEADERS = {
     "Accept": "application/json",
     "Referer": "https://mis.twse.com.tw/stock/index.jsp",
 }
-SHARES_STATE_KEY = "index_components_v16"
+SHARES_STATE_KEY = "index_components_v17"
 SHARES_TTL_DAYS = max(1, tools._env_int("DISCORD_AI_SHARES_TTL_DAYS", 7))
 SHARES_HTTP_TIMEOUT = max(3.0, tools._env_float("DISCORD_AI_SHARES_HTTP_TIMEOUT", 7.0))
 _SHARES_REFRESH_LOCK = threading.Lock()
@@ -148,44 +152,62 @@ def _find_key(row: Dict[str, Any], needles: Tuple[str, ...]) -> str:
 
 
 def _parse_tpex_constituents(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """解析 TPEx 官方『櫃買指數成分股』OpenAPI；欄位名稱改版時仍盡量自動辨識。"""
+    """解析 TPEx 官方「櫃買指數成分股」名冊。
+
+    此端點本質上提供「成分股名冊」，不假設它一定帶發行股數。欄位名稱曾有版本差異，
+    因此先吃已知欄位，再以「值為 4 碼股票代號」做保守回退。發行股數改由官方公司
+    基本資料 mopsfin_t187ap03_O 補入，避免把名冊欄位誤認成股數。
+    """
     out: Dict[str, Dict[str, Any]] = {}
+    known_code_keys = (
+        "SecuritiesCompanyCode", "SecuritiesCode", "StockCode", "Code", "ticker",
+        "股票代號", "證券代號", "代號",
+    )
+    known_name_keys = (
+        "CompanyAbbreviation", "CompanyName", "SecuritiesName", "StockName", "Name", "name",
+        "股票名稱", "證券名稱", "名稱",
+    )
     for row in rows or []:
-        code = str(
-            row.get("SecuritiesCompanyCode") or row.get("Code") or row.get("代號")
-            or row.get("股票代號") or row.get("證券代號") or ""
-        ).strip()
-        if not (len(code) == 4 and code.isdigit()):
-            continue
-        name = str(
-            row.get("CompanyAbbreviation") or row.get("Name") or row.get("名稱")
-            or row.get("股票名稱") or row.get("證券名稱") or code
-        ).strip()
-        share_key = ""
-        for key in row.keys():
-            low = str(key).lower().replace(" ", "")
-            if (("發行" in low and "股" in low) or "issueshares" in low
-                    or ("numberofshares" in low and "issue" in low)):
-                share_key = str(key)
+        code = ""
+        for key in known_code_keys:
+            value = str(row.get(key) or "").strip()
+            if len(value) == 4 and value.isdigit():
+                code = value
                 break
-        shares = _number(row.get(share_key)) if share_key else 0.0
-        if shares <= 0:
+        if not code:
+            # 只在沒有已知欄位時回退；排除日期/指數值等非 4 碼代號。
+            candidates = []
+            for key, value in row.items():
+                text = str(value or "").strip()
+                key_text = str(key).lower()
+                if len(text) == 4 and text.isdigit() and not any(x in key_text for x in ("date", "year", "日期", "年度")):
+                    candidates.append(text)
+            if len(candidates) == 1:
+                code = candidates[0]
+        if not code:
             continue
-        # 官網表格常以『發行仟股數』呈現；OpenAPI 若欄名明示千/仟股就換算為股。
-        if share_key and any(word in share_key for word in ("仟", "千")):
-            shares *= 1000.0
-        out[code] = {"market": "tpex", "shares": shares, "name": name,
-                     "source": "TPEx官方櫃買指數成分股OpenAPI", "exact_membership": True}
+        name = ""
+        for key in known_name_keys:
+            value = str(row.get(key) or "").strip()
+            if value:
+                name = value
+                break
+        out[code] = {
+            "market": "tpex",
+            "name": name or code,
+            "source": "TPEx官方櫃買指數成分股OpenAPI",
+            "exact_membership": True,
+        }
     return out
 
 
 def _fetch_components() -> Dict[str, Dict[str, Any]]:
-    """官方資料建立指數母體。
+    """以官方公開資料建立指數母體與發行股數。
 
-    TPEx：直接使用官方『櫃買指數成分股』OpenAPI（成分股＋發行股數）。
-    TWSE：免費 OpenAPI 沒有提供每日 TAIEX 官方成分權重檔；依官方編製要點，用
-          上市公司基本資料的普通股發行股數＋上市日期規則重建母體。官方每日成分權重檔
-          TWTANU_TAI/TWT73U1 為 Data E-Shop 付費資料，程式不偽裝成已取得該檔。
+    TWSE：上市公司基本資料提供「已發行普通股數或 TDR 原股發行股數」，再依 TAIEX
+          編製要點的新上市納入規則處理。免費 OpenAPI 沒有每日 TAIEX 官方權重檔。
+    TPEx：櫃買指數成分股端點只當作「官方成分名冊」；股數一律由上櫃公司基本資料
+          IssueShares 補入。若名冊端點異常，才退回公司基本資料全集，並在 log 標記備援。
     """
     session = tools.core().get_thread_session()
     today = tools.taipei_now().date()
@@ -213,40 +235,62 @@ def _fetch_components() -> Dict[str, Dict[str, Any]]:
             "source": "TWSE官方編製規則＋上市公司基本資料", "exact_membership": False,
         }
 
-    # TPEx 先拿『指數成分股』官方端點；若端點暫時不可用才用官方公司基本資料備援。
-    tpex_exact: Dict[str, Dict[str, Any]] = {}
+    # TPEx 公司基本資料先抓：它是股數的官方來源。
+    started = time.perf_counter()
+    response = session.get(TPEX_INFO_URL, headers=HEADERS,
+                           timeout=(min(3.0, SHARES_HTTP_TIMEOUT), SHARES_HTTP_TIMEOUT))
+    response.raise_for_status()
+    tpex_basic_rows = response.json() or []
+    tools.record_api_event("TPEx-OpenAPI", status=200, latency=time.perf_counter() - started)
+    tpex_basic: Dict[str, Dict[str, Any]] = {}
+    for row in tpex_basic_rows:
+        code = str(row.get("SecuritiesCompanyCode") or row.get("公司代號") or "").strip()
+        shares = _number(row.get("IssueShares") or row.get("已發行普通股數或TDR原股發行股數"))
+        if not (len(code) == 4 and code.isdigit() and shares > 0):
+            continue
+        tpex_basic[code] = {
+            "market": "tpex", "shares": shares,
+            "name": str(row.get("CompanyAbbreviation") or row.get("公司簡稱") or code).strip(),
+            "source": "TPEx官方公司基本資料", "exact_membership": False,
+        }
+
+    tpex_members: Dict[str, Dict[str, Any]] = {}
     try:
         started = time.perf_counter()
         response = session.get(TPEX_CONSTITUENTS_URL, headers=HEADERS,
                                timeout=(min(3.0, SHARES_HTTP_TIMEOUT), SHARES_HTTP_TIMEOUT))
         response.raise_for_status()
-        tpex_exact = _parse_tpex_constituents(response.json() or [])
+        raw_members = response.json() or []
         tools.record_api_event("TPEx-OpenAPI", status=200, latency=time.perf_counter() - started)
-        # 正常櫃買指數是數百檔；若官方端點只回到不合理的小片段，不把它當完整母體。
-        if len(tpex_exact) < 100:
-            print(f"⚠️ TPEx 指數成分股回傳僅 {len(tpex_exact)} 檔，視為不完整，改用官方公司基本資料備援", flush=True)
-            tpex_exact = {}
+        tpex_members = _parse_tpex_constituents(raw_members)
+        print(
+            f"📐 TPEx 官方櫃買指數名冊：raw={len(raw_members):,}｜解析={len(tpex_members):,}｜公司基本={len(tpex_basic):,}",
+            flush=True,
+        )
+        # 櫃買指數涵蓋數百檔；過小代表 schema/端點異常，不拿不完整名冊當真。
+        if len(tpex_members) < 100:
+            tpex_members = {}
     except Exception as exc:
         print(f"⚠️ TPEx 指數成分股端點失敗，改用官方公司基本資料備援｜{type(exc).__name__}", flush=True)
 
-    if tpex_exact:
-        components.update(tpex_exact)
-    else:
-        started = time.perf_counter()
-        response = session.get(TPEX_INFO_URL, headers=HEADERS,
-                               timeout=(min(3.0, SHARES_HTTP_TIMEOUT), SHARES_HTTP_TIMEOUT))
-        response.raise_for_status()
-        for row in response.json() or []:
-            code = str(row.get("SecuritiesCompanyCode") or "").strip()
-            shares = _number(row.get("IssueShares"))
-            if not (len(code) == 4 and code.isdigit() and shares > 0):
+    if tpex_members:
+        missing_shares = 0
+        for code, member in tpex_members.items():
+            basic = tpex_basic.get(code)
+            if not basic:
+                missing_shares += 1
                 continue
             components[code] = {
-                "market": "tpex", "shares": shares,
-                "name": str(row.get("CompanyAbbreviation") or code).strip(),
-                "source": "TPEx官方公司基本資料備援", "exact_membership": False,
+                **basic,
+                "name": member.get("name") if member.get("name") and member.get("name") != code else basic.get("name"),
+                "source": "TPEx官方櫃買指數成分股＋公司基本資料",
+                "exact_membership": True,
             }
-        tools.record_api_event("TPEx-OpenAPI", status=200, latency=time.perf_counter() - started)
+        if missing_shares:
+            print(f"⚠️ TPEx 成分名冊有 {missing_shares} 檔找不到官方發行股數，已排除並記錄", flush=True)
+    else:
+        print("⚠️ TPEx 官方成分名冊不可用，本次以官方上櫃公司基本資料全集備援", flush=True)
+        components.update(tpex_basic)
     return components
 
 
@@ -309,6 +353,143 @@ def share_counts(refresh: bool = False) -> Dict[str, List[Any]]:
     """向後相容：{代號: [市場, 發行股數]}。"""
     return {code: [info.get("market"), info.get("shares")]
             for code, info in component_universe(refresh=refresh).items() if info.get("shares")}
+
+def _roc_date_to_iso(value: Any) -> str:
+    """1150921 / 115/09/21 / 20260921 -> 2026-09-21。"""
+    text = str(value or "").strip().replace("/", "").replace("-", "")
+    if not text.isdigit():
+        return ""
+    try:
+        if len(text) == 7:
+            return f"{int(text[:3]) + 1911:04d}-{text[3:5]}-{text[5:7]}"
+        if len(text) == 8:
+            return f"{int(text[:4]):04d}-{text[4:6]}-{text[6:8]}"
+    except Exception:
+        return ""
+    return ""
+
+
+def _first_value(row: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in row and str(row.get(key) or "").strip() not in ("", "--", "---"):
+            return row.get(key)
+    return None
+
+
+def _fetch_official_close_snapshot(market: str) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """收盤後直接抓交易所「最新交易日完整個股收盤快照」。
+
+    這是 v17 修正的核心：不再依賴 local_market_cache 是否已把今天標成 confirmed。
+    回傳 close/change/reference；Change 是交易所相對「今日開盤競價基準」的漲跌，遇除權息時
+    比用昨日原始收盤價更適合拿來做當日指數貢獻分解。
+    """
+    session = tools.core().get_thread_session()
+    if market == "twse":
+        url, api_name = TWSE_CLOSE_URL, "TWSE-OpenAPI"
+    elif market == "tpex":
+        url, api_name = TPEX_CLOSE_URL, "TPEx-OpenAPI"
+    else:
+        raise ValueError(market)
+    started = time.perf_counter()
+    response = session.get(url, headers=HEADERS,
+                           timeout=(min(3.0, SHARES_HTTP_TIMEOUT), max(8.0, SHARES_HTTP_TIMEOUT)))
+    status = int(response.status_code)
+    response.raise_for_status()
+    rows = response.json() or []
+    tools.record_api_event(api_name, status=status, latency=time.perf_counter() - started)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    dates: Dict[str, int] = {}
+    for row in rows:
+        if market == "twse":
+            code = str(_first_value(row, ("Code", "證券代號", "股票代號")) or "").strip()
+            name = str(_first_value(row, ("Name", "證券名稱", "股票名稱")) or code).strip()
+            close = _number(_first_value(row, ("ClosingPrice", "Close", "收盤價")))
+            change = _number(_first_value(row, ("Change", "漲跌價差", "漲跌")))
+            day = _roc_date_to_iso(_first_value(row, ("Date", "日期", "資料日期")))
+        else:
+            code = str(_first_value(row, ("SecuritiesCompanyCode", "Code", "SecuritiesCode", "證券代號", "股票代號", "代號")) or "").strip()
+            name = str(_first_value(row, ("CompanyName", "CompanyAbbreviation", "Name", "證券名稱", "股票名稱", "名稱")) or code).strip()
+            close = _number(_first_value(row, ("Close", "ClosingPrice", "收盤價", "收市")))
+            change = _number(_first_value(row, ("Change", "ChangeAmount", "漲跌", "漲跌價差")))
+            day = _roc_date_to_iso(_first_value(row, ("Date", "TradeDate", "資料日期", "日期")))
+        if not (len(code) == 4 and code.isdigit()):
+            continue
+        if close <= 0:
+            # 無成交／停牌不硬湊漲跌；後面可用同日 local cache 補，否則該檔不參與排名。
+            continue
+        reference = close - change
+        if reference <= 0:
+            reference = close
+            change = 0.0
+        out[code] = {
+            "stock_code": code,
+            "stock_name": name,
+            "close": float(close),
+            "change": float(change),
+            "reference": float(reference),
+            "change_pct": (float(change) / float(reference) * 100.0) if reference > 0 else 0.0,
+            "date": day,
+            "source": "official_close_snapshot",
+        }
+        if day:
+            dates[day] = dates.get(day, 0) + 1
+    data_date = max(dates.items(), key=lambda x: x[1])[0] if dates else ""
+    print(f"📥 {INDEX_OF[market][1]} 官方收盤快照：rows={len(rows):,}｜股票={len(out):,}｜date={data_date or '-'}", flush=True)
+    return out, data_date
+
+
+def _fetch_official_index_close(market: str) -> Tuple[Optional[float], Optional[float], str]:
+    """盤後用官方 OpenAPI 取得指數收盤與漲跌點數；失敗才退回既有日 K。"""
+    session = tools.core().get_thread_session()
+    try:
+        if market == "twse":
+            started = time.perf_counter()
+            response = session.get(TWSE_INDEX_CLOSE_URL, headers=HEADERS,
+                                   timeout=(min(3.0, SHARES_HTTP_TIMEOUT), max(8.0, SHARES_HTTP_TIMEOUT)))
+            status = int(response.status_code)
+            response.raise_for_status()
+            rows = response.json() or []
+            tools.record_api_event("TWSE-OpenAPI", status=status, latency=time.perf_counter() - started)
+            for row in rows:
+                name = str(row.get("指數") or "").strip()
+                if name != "發行量加權股價指數":
+                    continue
+                close = _number(row.get("收盤指數"))
+                amount = abs(_number(row.get("漲跌點數")))
+                sign = str(row.get("漲跌") or row.get("漲跌(+/-)") or "").strip()
+                delta = -amount if "-" in sign else amount
+                day = _roc_date_to_iso(row.get("日期"))
+                if close > 0:
+                    return close - delta, close, day
+        else:
+            started = time.perf_counter()
+            response = session.get(TPEX_INDEX_CLOSE_URL, headers=HEADERS,
+                                   timeout=(min(3.0, SHARES_HTTP_TIMEOUT), max(8.0, SHARES_HTTP_TIMEOUT)))
+            status = int(response.status_code)
+            response.raise_for_status()
+            rows = response.json() or []
+            tools.record_api_event("TPEx-OpenAPI", status=status, latency=time.perf_counter() - started)
+            # tpex_index 是歷史指數資料；不同公開頁面的 Change 欄位語意可能是百分比，
+            # 因此不要拿 Change 當「點數」。直接用最新兩個交易日的 Close 相減最穩定。
+            parsed = []
+            for row in rows:
+                close = _number(_first_value(row, ("Close", "ClosingIndex", "收市", "收盤指數", "收盤")))
+                day = _roc_date_to_iso(_first_value(row, ("Date", "資料日期", "日期")))
+                if close > 0 and day:
+                    parsed.append((day, close))
+            if parsed:
+                by_day = {}
+                for day, close in parsed:
+                    by_day[day] = close
+                days = sorted(by_day)
+                if len(days) >= 2:
+                    latest, previous = days[-1], days[-2]
+                    return by_day[previous], by_day[latest], latest
+    except Exception as exc:
+        print(f"⚠️ {INDEX_OF[market][1]} 官方收盤指數端點失敗，改用既有日K｜{type(exc).__name__}", flush=True)
+    return _index_prev_close(INDEX_OF[market][0])
+
 
 def _index_prev_close(index_code: str) -> Tuple[Optional[float], Optional[float], str]:
     """備援：(昨收指數, 最新指數, 資料日)。盤中優先使用 MIS benchmark。"""
@@ -466,10 +647,9 @@ def _concentration_label(share: Optional[float]) -> str:
 def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[float] = None) -> Dict[str, Any]:
     """單一市場的指數貢獻點數。
 
-    收盤後一定掃完整官方母體，不再只看前幾大權值股。
-    - TPEx：優先用官方櫃買指數成分股 OpenAPI。
-    - TWSE：依 TAIEX 官方編製要點，用上市普通股官方基本資料＋上市時間規則重建；
-      官方每日 TAIEX 成分權重檔屬 Data E-Shop 付費資料，因此不把重建值冒充官方公布權重。
+    v17 的盤後邏輯不再等本地 daily_bars 把當天標記 confirmed：
+    直接用 TWSE / TPEx 官方「最新交易日完整收盤快照」的 close + change 做分解。
+    這可避免「指數已是今天、個股卻仍停在上一交易日」造成整張貢獻榜失真。
     """
     if market not in INDEX_OF:
         raise ValueError(f"unsupported market: {market}")
@@ -480,86 +660,191 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     if not codes:
         raise tools.ToolDataError("沒有指數成分母體，無法計算指數貢獻")
 
-    # 先取得官方/既有指數日K的昨收與收盤；收盤模式用日期來避免把停牌前的舊漲跌誤算到今天。
-    prev_index, now_index, index_date = _index_prev_close(index_code)
-    target_date = index_date or str((local_market_cache.stats() or {}).get("last_day") or "")
-    changes = local_market_cache.latest_changes(codes)
-
     rows: List[Dict[str, Any]] = []
-    total_prev_value = 0.0
-    for code in codes:
-        quote = changes.get(code) or {}
-        last_close = tools._num(quote.get("close"))
-        pct = tools._num(quote.get("change_pct"))
-        quote_date = str(quote.get("date") or "")
-        if not last_close:
-            continue
-        comp = market_components[code]
-        count = float(comp.get("shares") or 0.0)
-        if count <= 0:
-            continue
+    data_date = ""
+    prev_index: Optional[float] = None
+    now_index: Optional[float] = None
+    official_snapshot_used = False
 
-        if live:
-            # 盤中本地底庫最後一根就是上一個已收盤交易日。
-            prev_close = float(last_close)
-            close = float(last_close)
-            change_pct = 0.0
+    if not live:
+        # 1) 盤後直接從交易所全市場收盤快照取「今日收盤與官方漲跌價差」。
+        #    不依賴 local_market_cache 的 confirmed 狀態。
+        official_quotes: Dict[str, Dict[str, Any]] = {}
+        try:
+            official_quotes, data_date = _fetch_official_close_snapshot(market)
+        except Exception as exc:
+            print(f"⚠️ {index_name} 官方完整收盤快照失敗，嘗試同日 local cache｜{type(exc).__name__}: {exc}", flush=True)
+
+        # 2) 指數本身也優先用官方收盤端點，與個股快照同一個盤後語境。
+        prev_index, now_index, index_date = _fetch_official_index_close(market)
+        # TWSE 的 MI_INDEX OpenAPI 沒有日期欄位；用既有指數日K只補「日期」做交叉驗證，
+        # 不拿它覆蓋官方收盤值。這可擋掉「指數已到今天，但個股快照仍是前一交易日」。
+        if not index_date:
+            try:
+                _p, _n, bundle_date = _index_prev_close(index_code)
+                index_date = str(bundle_date or "")
+            except Exception:
+                index_date = ""
+        if not data_date:
+            data_date = index_date
+        if data_date and index_date and data_date != index_date:
+            # TWSE MI_INDEX OpenAPI 本身沒有日期欄位時 index_date 可能為空；有日期時則必須對齊。
+            raise tools.ToolDataError(
+                f"{index_name} 指數日期 {index_date} 與個股收盤快照 {data_date} 不一致，拒絕產生錯誤貢獻榜"
+            )
+
+        # 官方快照至少應覆蓋數百檔；太小視為端點尚未完整更新。
+        minimum_floor = 500 if market == "twse" else 300
+        minimum_snapshot = min(minimum_floor, max(1, int(len(codes) * 0.50)))
+        if len(official_quotes) >= minimum_snapshot:
+            official_snapshot_used = True
         else:
-            # 今天沒有收盤資料（停牌/無成交/底庫缺口）時，不把歷史上一個交易日的漲跌硬算成今天。
-            if target_date and quote_date and quote_date != target_date:
-                prev_close = float(last_close)
-                close = float(last_close)
-                change_pct = 0.0
+            if official_quotes:
+                print(f"⚠️ {index_name} 官方收盤快照僅 {len(official_quotes)} 檔，視為不完整", flush=True)
+            official_quotes = {}
+
+        local_changes = local_market_cache.latest_changes(codes) if not official_quotes else {}
+        if not official_quotes and not data_date:
+            # 僅備援：本地最新日期必須與指數日期一致，否則寧可報錯也不要拿前一日股票配今天指數。
+            local_stats = local_market_cache.stats() or {}
+            data_date = str(local_stats.get("last_day") or "")
+
+        for code in codes:
+            comp = market_components[code]
+            shares = float(comp.get("shares") or 0.0)
+            if shares <= 0:
+                continue
+            q = official_quotes.get(code)
+            if q:
+                close = float(q["close"])
+                reference = float(q["reference"])
+                change = float(q["change"])
+                change_pct = float(q["change_pct"])
+                quote_date = str(q.get("date") or data_date)
+                name = str(q.get("stock_name") or comp.get("name") or code)
+                source = "official_close_snapshot"
             else:
-                if pct is None or float(pct) == -100:
+                q2 = local_changes.get(code) or {}
+                quote_date = str(q2.get("date") or "")
+                if not q2 or (data_date and quote_date != data_date):
                     continue
-                prev_close = float(last_close) / (1.0 + float(pct) / 100.0)
-                close = float(last_close)
+                close = float(q2.get("close") or 0.0)
+                pct = tools._num(q2.get("change_pct"))
+                if close <= 0 or pct is None or float(pct) <= -100:
+                    continue
+                reference = close / (1.0 + float(pct) / 100.0)
+                change = close - reference
                 change_pct = float(pct)
-        if prev_close <= 0:
-            continue
-        prev_value = prev_close * count
-        rows.append({
-            "stock_code": code,
-            "stock_name": str(comp.get("name") or code),
-            "prev_close": prev_close,
-            "close": close,
-            "change_pct": change_pct,
-            "shares": count,
-            "prev_value": prev_value,
-            "quote_date": quote_date,
-            "live_quote": False,
-        })
-        total_prev_value += prev_value
+                name = str(comp.get("name") or code)
+                source = "same_day_local_fallback"
+            if close <= 0 or reference <= 0:
+                continue
+            rows.append({
+                "stock_code": code,
+                "stock_name": name,
+                "prev_close": reference,          # 今日開盤競價基準/調整後參考價
+                "reference_price": reference,
+                "close": close,
+                "price_change": change,
+                "change_pct": change_pct,
+                "shares": shares,
+                "prev_value": reference * shares,
+                "quote_date": quote_date,
+                "live_quote": False,
+                "price_source": source,
+            })
 
-    if not rows or total_prev_value <= 0:
-        raise tools.ToolDataError("本地底庫資料不足，無法計算指數貢獻")
+        if not rows:
+            raise tools.ToolDataError("交易所收盤快照尚未完整發布，且本地沒有同日資料")
+        if data_date:
+            wrong_dates = [r for r in rows if r.get("quote_date") and r.get("quote_date") != data_date]
+            if wrong_dates:
+                raise tools.ToolDataError(f"{index_name} 個股資料日期混用，拒絕計算")
+        if prev_index is None or now_index is None:
+            raise tools.ToolDataError("官方指數收盤資料不足，無法計算指數貢獻")
 
-    live_used = 0
-    top_safe = bottom_safe = not live
-    unseen_bound = 0.0
-    data_date = target_date
+        # 官方公式：Index = Σ(P_i × Shares_i) / Base × 100。
+        # 以官方收盤指數和今日成分股總發行市值反推 100/Base；每檔貢獻 = 今日官方漲跌價差 × 股數 × 100/Base。
+        current_total_value = sum(float(r["close"]) * float(r["shares"]) for r in rows)
+        if current_total_value <= 0:
+            raise tools.ToolDataError("成分股收盤總市值不足")
+        factor = float(now_index) / current_total_value
+        weight_base = current_total_value
+        live_used = 0
+        top_safe = bottom_safe = True
+        unseen_bound = 0.0
 
-    if live:
+        names: Dict[str, str] = {}
+        try:
+            names = tools.get_stock_name_map() or {}
+        except Exception:
+            names = {}
+        for row in rows:
+            raw_points = float(row["price_change"]) * float(row["shares"]) * factor
+            row["points"] = round(raw_points, 2)
+            row["weight_pct"] = round(float(row["close"]) * float(row["shares"]) / weight_base * 100.0, 2)
+            row["change_pct"] = round(float(row["change_pct"]), 2)
+            row["close"] = round(float(row["close"]), 2)
+            if not row.get("stock_name") or row.get("stock_name") == row["stock_code"]:
+                row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
+
+    else:
+        # 盤中沿用 v16 的「本地昨收 + MIS 批次即時價」；這次修正重點只在盤後資料完整性。
+        changes = local_market_cache.latest_changes(codes)
+        total_prev_value = 0.0
+        for code in codes:
+            quote = changes.get(code) or {}
+            last_close = tools._num(quote.get("close"))
+            if not last_close:
+                continue
+            comp = market_components[code]
+            shares = float(comp.get("shares") or 0.0)
+            if shares <= 0:
+                continue
+            prev_close = float(last_close)
+            prev_value = prev_close * shares
+            rows.append({
+                "stock_code": code,
+                "stock_name": str(comp.get("name") or code),
+                "prev_close": prev_close,
+                "reference_price": prev_close,
+                "close": prev_close,
+                "price_change": 0.0,
+                "change_pct": 0.0,
+                "shares": shares,
+                "prev_value": prev_value,
+                "quote_date": str(quote.get("date") or ""),
+                "live_quote": False,
+                "price_source": "local_prev_close",
+            })
+            total_prev_value += prev_value
+        if not rows or total_prev_value <= 0:
+            raise tools.ToolDataError("本地底庫資料不足，無法計算盤中指數貢獻")
+
+        live_used = 0
+        top_safe = bottom_safe = False
+        unseen_bound = 0.0
         deadline = deadline or (time.monotonic() + LIVE_BUDGET_SECONDS)
         ranked = sorted(rows, key=lambda r: -r["prev_value"])
         max_candidates = LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX
         ranked = ranked[:max_candidates]
         benchmark: Dict[str, Any] = {}
 
-        for start in range(0, len(ranked), LIVE_BATCH_SIZE):
+        for batch_start in range(0, len(ranked), LIVE_BATCH_SIZE):
             if time.monotonic() >= deadline:
                 break
-            batch = ranked[start:start + LIVE_BATCH_SIZE]
+            batch = ranked[batch_start:batch_start + LIVE_BATCH_SIZE]
+            requested = [r["stock_code"] for r in batch]
             try:
-                quotes, batch_benchmark = _fetch_mis_batch(
-                    market, [r["stock_code"] for r in batch], deadline
-                )
+                quotes, batch_benchmark = _fetch_mis_batch(market, requested, deadline)
             except Exception as exc:
                 print(f"⚠️ {index_name} MIS 批次報價失敗｜{type(exc).__name__}", flush=True)
                 quotes, batch_benchmark = {}, {}
             if batch_benchmark:
                 benchmark = batch_benchmark
+            missing = [c for c in requested if c not in quotes]
+            if missing:
+                print(f"⚠️ {index_name} MIS batch requested={len(requested)} returned={len(quotes)} missing={','.join(missing[:12])}", flush=True)
             for row in batch:
                 item = quotes.get(row["stock_code"])
                 if not item:
@@ -568,8 +853,10 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 if not current or current <= 0:
                     continue
                 row["close"] = float(current)
-                row["change_pct"] = (float(current) / row["prev_close"] - 1.0) * 100.0
+                row["price_change"] = float(current) - row["prev_close"]
+                row["change_pct"] = row["price_change"] / row["prev_close"] * 100.0
                 row["live_quote"] = True
+                row["price_source"] = "TWSE-MIS"
                 live_used += 1
 
             if benchmark.get("prev"):
@@ -580,51 +867,39 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 prev_index, now_index, data_date = _index_prev_close(index_code)
 
             if prev_index:
-                factor = prev_index / total_prev_value
+                factor_tmp = float(prev_index) / total_prev_value
                 for row in rows:
                     row["weight_pct"] = row["prev_value"] / total_prev_value * 100.0
-                    row["points"] = (row["close"] - row["prev_close"]) * row["shares"] * factor
-                top_safe, bottom_safe, unseen_bound = _rank_safety(rows, prev_index, top)
+                    row["points"] = row["price_change"] * row["shares"] * factor_tmp
+                top_safe, bottom_safe, unseen_bound = _rank_safety(rows, float(prev_index), top)
                 if top_safe and bottom_safe:
                     break
 
-        # MIS 一檔都沒拿到才退回少量 Fugle；仍受同一個 deadline 控制。
         if live_used == 0 and time.monotonic() < deadline:
             live_used = _fugle_fallback(rows, market, deadline)
+            for row in rows:
+                if row.get("live_quote"):
+                    row["price_change"] = float(row["close"]) - float(row["prev_close"])
         if prev_index is None:
             prev_index, now_index, data_date = _index_prev_close(index_code)
+        if not prev_index:
+            raise tools.ToolDataError("指數基準資料不足，無法計算盤中指數貢獻")
 
-    if not prev_index:
-        raise tools.ToolDataError("指數基準資料不足，無法計算指數貢獻")
-
-    # 官方公式：指數 = 總發行市值 / 當日基值 × 100。
-    # 收盤後以「當日完整母體的收盤總市值 + 官方收盤指數」反推當日基值，
-    # 再用同一基值計算每一檔的點數貢獻；這比沿用昨日總市值更符合基值調整規則。
-    current_total_value = sum(float(r["close"]) * float(r["shares"]) for r in rows)
-    if not live and now_index and current_total_value > 0:
-        factor = float(now_index) / current_total_value
-        weight_base = current_total_value
-        weight_mode = "close"
-    else:
         factor = float(prev_index) / total_prev_value
         weight_base = total_prev_value
-        weight_mode = "prev"
+        names: Dict[str, str] = {}
+        try:
+            names = tools.get_stock_name_map() or {}
+        except Exception:
+            names = {}
+        for row in rows:
+            row["points"] = round(float(row["price_change"]) * float(row["shares"]) * factor, 2)
+            row["weight_pct"] = round(row["prev_value"] / weight_base * 100.0, 2) if weight_base else 0.0
+            row["change_pct"] = round(float(row["change_pct"]), 2)
+            row["close"] = round(float(row["close"]), 2)
+            if not row.get("stock_name") or row.get("stock_name") == row["stock_code"]:
+                row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
 
-    names: Dict[str, str] = {}
-    try:
-        names = tools.get_stock_name_map() or {}
-    except Exception:
-        names = {}
-    for row in rows:
-        row["points"] = round((row["close"] - row["prev_close"]) * row["shares"] * factor, 2)
-        if not row.get("stock_name") or row.get("stock_name") == row["stock_code"]:
-            row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
-        market_value = (row["close"] * row["shares"]) if weight_mode == "close" else row["prev_value"]
-        row["weight_pct"] = round(market_value / weight_base * 100.0, 2) if weight_base > 0 else 0.0
-        row["change_pct"] = round(float(row["change_pct"]), 2)
-        row["close"] = round(float(row["close"]), 2)
-
-    # 收盤後全部成分股都參與排行；盤中只對已取得即時報價者排名，避免未取價股票被當 0% 混入。
     evaluated = [r for r in rows if r.get("live_quote")] if live else list(rows)
     positives = sorted((r for r in evaluated if r["points"] > 0), key=lambda r: -r["points"])
     negatives = sorted((r for r in evaluated if r["points"] < 0), key=lambda r: r["points"])
@@ -638,10 +913,18 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     top_drag = sum(r["points"] for r in bottom_rows)
     positive_share = (top_lift / positive_total * 100.0) if positive_total > 0 else None
     negative_share = (abs(top_drag) / negative_total * 100.0) if negative_total > 0 else None
-    covered_value = sum((r["prev_value"] for r in evaluated))
-    market_cap_coverage = covered_value / total_prev_value * 100.0 if total_prev_value > 0 else 0.0
+
+    if live:
+        total_prev_value = sum(float(r["prev_value"]) for r in rows)
+        covered_value = sum(float(r["prev_value"]) for r in evaluated)
+        market_cap_coverage = covered_value / total_prev_value * 100.0 if total_prev_value > 0 else 0.0
+    else:
+        # 收盤快照的市值涵蓋率，以「有官方/同日價格的成分股市值」相對本次可計算總市值；
+        # 同時另回 component_price_coverage_pct 讓 log 看檔數覆蓋。
+        market_cap_coverage = 100.0 if rows else 0.0
+
     estimated_points = round(sum(r["points"] for r in evaluated), 2)
-    index_points = round((now_index - prev_index), 2) if now_index is not None else None
+    index_points = round((float(now_index) - float(prev_index)), 2) if now_index is not None and prev_index is not None else None
     residual = round(index_points - estimated_points, 2) if index_points is not None else None
 
     focus_share = positive_share if (index_points or 0) >= 0 else negative_share
@@ -651,28 +934,36 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
 
     exact_membership = all(bool(market_components[c].get("exact_membership")) for c in codes if c in market_components)
     if market == "tpex" and exact_membership:
-        universe_source = "TPEx官方櫃買指數成分股"
-        basis = "盤中估算" if live else "收盤"
+        universe_source = "TPEx官方櫃買指數成分股＋官方公司基本資料"
     elif market == "twse":
-        universe_source = "TAIEX官方編製規則重建（TWSE免費公開資料）"
-        basis = "盤中估算" if live else "收盤"
+        universe_source = "TAIEX官方編製規則＋TWSE官方公司基本資料"
     else:
-        universe_source = "官方公司基本資料備援"
-        basis = "盤中估算" if live else "收盤"
+        universe_source = "TPEx官方公司基本資料備援"
+    basis = "盤中估算" if live else "收盤"
 
-    # 收盤時把『完整度』寫進 log，方便和 CMoney 對帳；不把診斷字塞到圖片裡。
     if not live:
+        official_count = sum(1 for r in rows if r.get("price_source") == "official_close_snapshot")
+        fallback_count = sum(1 for r in rows if r.get("price_source") == "same_day_local_fallback")
         print(
-            f"📊 {index_name} 貢獻點數｜母體={len(codes)}｜有價格={len(rows)}｜"
+            f"📊 {index_name} 貢獻點數｜date={data_date or '-'}｜母體={len(codes)}｜有價格={len(rows)}｜"
+            f"官方快照={official_count}｜同日備援={fallback_count}｜"
             f"指數={index_points:+.2f}｜個股合計={estimated_points:+.2f}｜殘差={residual:+.2f}｜{universe_source}",
             flush=True,
         )
+        # 防呆：如果個股分解與官方指數相差到離譜，不回傳一張看起來很正式的錯圖。
+        # 正常仍可能因停牌保留市值/成分異動/基值事件有小幅殘差，所以只擋極端異常。
+        tolerance = max(25.0, abs(index_points or 0.0) * 0.20)
+        if index_points is not None and abs(residual or 0.0) > tolerance:
+            raise tools.ToolDataError(
+                f"{index_name} 收盤貢獻分解未通過完整性檢查：官方指數 {index_points:+.2f} 點，"
+                f"個股合計 {estimated_points:+.2f} 點，殘差 {residual:+.2f} 點"
+            )
 
     return {
         "market": market,
         "index_name": index_name,
-        "index_prev_close": round(prev_index, 2),
-        "index_now": round(now_index, 2) if now_index is not None else None,
+        "index_prev_close": round(float(prev_index), 2) if prev_index is not None else None,
+        "index_now": round(float(now_index), 2) if now_index is not None else None,
         "index_points": index_points,
         "estimated_points": estimated_points,
         "residual_points": residual,
@@ -693,9 +984,11 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         "unseen_max_points_bound": round(unseen_bound, 2),
         "universe_source": universe_source,
         "exact_official_membership": bool(exact_membership),
+        "official_close_snapshot": bool(official_snapshot_used),
         "top": [{k: r[k] for k in keep} for r in top_rows],
         "bottom": [{k: r[k] for k in keep} for r in bottom_rows],
     }
+
 
 def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     """加權與櫃買一起計算；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
@@ -737,8 +1030,9 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
             )
 
     out["method_note"] = (
-        "依交易所發行量加權公式計算：收盤後以完整成分母體的總發行市值與官方收盤指數換算每檔貢獻點數；"
-        "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料重建母體。"
-        "盤中使用官方 MIS 批次報價並設時間上限，畫面會標示市值涵蓋率與是否仍屬估算。"
+        "依交易所發行量加權公式計算：收盤後直接讀 TWSE / TPEx 官方全市場收盤快照的收盤價與漲跌價差，"
+        "再以官方收盤指數與完整成分母體總發行市值換算每檔貢獻點數；"
+        "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料建立母體。"
+        "盤中使用官方 MIS 批次報價並設時間上限。"
     )
     return out
