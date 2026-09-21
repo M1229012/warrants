@@ -3135,6 +3135,16 @@ def get_branch_event_performance(branch_name: str, event_type: str = "") -> Dict
     }
 
 
+def _amount_or_zero(value: Any) -> float:
+    """金額欄位可能是空字串或 NaN；NaN 是 truthy，直接用 `or` 會把 NaN 傳下去。"""
+    number = _count_value(value) if isinstance(value, str) else _num(value)
+    try:
+        number = float(number)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number == number and number > 0 else 0.0
+
+
 def load_abcde_event_rows() -> Dict[str, Any]:
     """讀取回測輸出的 A_～E_ 事件表，整理成單一 DataFrame（同事件跨資料範圍去重，全分點優先）。
 
@@ -3167,6 +3177,9 @@ def load_abcde_event_rows() -> Dict[str, Any]:
                 "warrant_list": df.get("權證清單", pd.Series([""] * len(df))).map(_clean_cell),
                 "max_single_warrant": df.get("最大單筆權證", pd.Series([""] * len(df))).map(_clean_cell),
                 "reduce_date": df.get("減碼日", pd.Series([""] * len(df))).map(_parse_sheet_date),
+                # 事件表同一列就有賣出金額，出清／減碼不必再去跟「每日賣出明細」對帳。
+                "reduce_amount": df.get("減碼賣出金額", pd.Series([""] * len(df))).map(_count_value),
+                "exit_amount": df.get("出清賣出金額", pd.Series([""] * len(df))).map(_count_value),
                 "exit_date": df.get("出清日", pd.Series([""] * len(df))).map(_parse_sheet_date),
                 "exit_return": df.get("出清獲利%", pd.Series([""] * len(df))).map(_pct_value),
                 "settle_method": df.get("勝率結算方式", pd.Series([""] * len(df))).map(_clean_cell),
@@ -3255,6 +3268,7 @@ def _event_record(row: pd.Series) -> Dict[str, Any]:
         "resolution": row["resolution"],
         "result": row["result"],
         "result_return_pct": _num(row["result_return"]),
+        "exit_amount_text": _money_text(_amount_or_zero(row.get("exit_amount"))) if _amount_or_zero(row.get("exit_amount")) else "",
     }
 
 
@@ -3554,6 +3568,24 @@ def display_branch_set() -> Tuple[set, set]:
     return high, selected
 
 
+def sell_detail_coverage() -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], int]:
+    """「每日賣出明細」整張表的日期涵蓋範圍。
+
+    這張表可能只保留近期資料，所以比涵蓋範圍更早的出清日「對不到賣出紀錄」是正常的，
+    不能當成資料矛盾。分成三種狀態處理：對得上、太舊（表上本來就沒有）、真的缺。
+    """
+    try:
+        df = read_sheet_table("每日賣出明細")["df"]
+    except ToolDataError:
+        return None, None, 0
+    if df is None or df.empty or "日期" not in df.columns:
+        return None, None, 0
+    dates = df["日期"].map(_parse_sheet_date).dropna()
+    if dates.empty:
+        return None, None, 0
+    return dates.min(), dates.max(), int(len(df))
+
+
 def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
     """每日賣出明細（減碼／出清）；讀不到時回傳空表，不讓主要回答失敗。"""
     kf = core()
@@ -3619,6 +3651,7 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
         sells = sells[[key not in day_trade_sell_keys for key in keys]]
     sells_long = sells[sells["_date"] >= start_long] if not sells.empty else sells
     # 出清核對用的原始賣出（不套金額門檻），與 K 線標註同一套規則，避免圖文不一致。
+    chips_cover_start, _, _ = sell_detail_coverage()
     verified_sell_keys = set()
     if not sells_long.empty:
         for _, srow in sells_long.iterrows():
@@ -3649,7 +3682,11 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
             exit_date = erow.get("exit_date")
             if exit_date is None or pd.isna(exit_date):
                 continue
-            if (branch, pd.Timestamp(exit_date).normalize()) in verified_sell_keys:
+            moment = pd.Timestamp(exit_date).normalize()
+            own_exit = _amount_or_zero(erow.get("exit_amount"))
+            # 事件表自己有出清金額最優先；其次比對每日賣出明細；再不然就是那段期間表上沒資料。
+            if own_exit > 0 or (branch, moment) in verified_sell_keys or (
+                    chips_cover_start is not None and moment < chips_cover_start):
                 exited += 1
         total_events = int(len(window_events))
         holding = max(0, total_events - exited)
@@ -3914,25 +3951,40 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             key = (str(srow["_branch"]), pd.Timestamp(srow["_date"]).normalize())
             sell_amounts[key] = sell_amounts.get(key, 0.0) + float(srow.get("_amount") or 0.0)
 
-    def sell_amount_on(branch: str, day: Any) -> float:
+    cover_start, cover_end, cover_rows = sell_detail_coverage()
+
+    def sell_state(branch: str, day: Any, own_amount: Any = None) -> Tuple[str, float]:
+        """verified＝有賣出金額（事件表自己的欄位優先，其次每日賣出明細）｜
+        uncovered＝早於賣出明細涵蓋範圍且事件表沒填金額｜missing＝該有卻沒有。"""
         if day is None or pd.isna(day):
-            return 0.0
-        return float(sell_amounts.get((str(branch), pd.Timestamp(day).normalize()), 0.0))
+            return "none", 0.0
+        own = _amount_or_zero(own_amount)
+        if own > 0:
+            return "verified", own
+        moment = pd.Timestamp(day).normalize()
+        amount = float(sell_amounts.get((str(branch), moment), 0.0))
+        if amount > 0:
+            return "verified", amount
+        if cover_start is not None and moment < cover_start:
+            return "uncovered", 0.0
+        return "missing", 0.0
 
     marks = []
-    unverified: List[str] = []
-    verified_exits = reduce_marks = 0
+    missing: List[str] = []
+    verified_exits = uncovered_exits = reduce_marks = 0
     for no, (_, r) in enumerate(rows.iterrows(), 1):
         branch = str(r["branch"])
-        exit_in_window = in_window(r["exit_date"])
-        exit_amount = sell_amount_on(branch, r["exit_date"]) if exit_in_window else 0.0
-        exit_ok = exit_in_window and exit_amount > 0
-        if exit_in_window and not exit_ok:
-            unverified.append(f"{branch} {_fmt_date(r['exit_date'])}")
+        exit_state, exit_amount = (sell_state(branch, r["exit_date"], r.get("exit_amount"))
+                                   if in_window(r["exit_date"]) else ("none", 0.0))
+        if exit_state == "missing":
+            missing.append(f"{branch} {_fmt_date(r['exit_date'])}")
+        show_exit = exit_state in ("verified", "uncovered")
+        verified_exits += 1 if exit_state == "verified" else 0
+        uncovered_exits += 1 if exit_state == "uncovered" else 0
         reduce_in_window = in_window(r["reduce_date"]) and _fmt_date(r["reduce_date"]) != _fmt_date(r["exit_date"])
-        reduce_amount = sell_amount_on(branch, r["reduce_date"]) if reduce_in_window else 0.0
-        reduce_ok = reduce_in_window and reduce_amount >= MIN_SELL_MARK_AMOUNT
-        verified_exits += 1 if exit_ok else 0
+        reduce_state, reduce_amount = (sell_state(branch, r["reduce_date"], r.get("reduce_amount"))
+                                       if reduce_in_window else ("none", 0.0))
+        reduce_ok = (reduce_state == "verified" and reduce_amount >= MIN_SELL_MARK_AMOUNT) or reduce_state == "uncovered"
         reduce_marks += 1 if reduce_ok else 0
         marks.append({
             "no": no,
@@ -3941,19 +3993,23 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             "buy_date": _fmt_date(r["event_date"]),
             "buy_amount_text": _money_text(r["buy_amount"]),
             "reduce_date": _fmt_date(r["reduce_date"]) if reduce_ok else "",
-            "reduce_amount_text": _money_text(-reduce_amount) if reduce_ok else "",
-            "exit_date": _fmt_date(r["exit_date"]) if exit_ok else "",
-            "exit_amount_text": _money_text(-exit_amount) if exit_ok else "",
-            "exit_unverified": bool(exit_in_window and not exit_ok),
+            "reduce_amount_text": _money_text(-reduce_amount) if reduce_amount else "",
+            "exit_date": _fmt_date(r["exit_date"]) if show_exit else "",
+            "exit_amount_text": _money_text(-exit_amount) if exit_amount else "",
+            "exit_unverified": exit_state == "missing",
             "status": r["status"],
         })
     if marks:
         print(f"✅ {code} 事件標註｜事件 {len(marks)} 筆｜已核對出清 {verified_exits} 筆｜"
-              f"減碼 {reduce_marks} 筆" + (f"｜未核對出清 {len(unverified)} 筆（不標）" if unverified else ""),
-              flush=True)
-    if unverified:
-        print(f"⚠️ {code} 事件表有出清日、但每日賣出明細沒有對應賣出，圖上不標為出清："
-              + "、".join(unverified[:6]), flush=True)
+              f"未涵蓋期間的出清 {uncovered_exits} 筆｜減碼 {reduce_marks} 筆"
+              + (f"｜對不上的出清 {len(missing)} 筆（不標）" if missing else ""), flush=True)
+    if uncovered_exits or missing:
+        span = (f"{_fmt_date(cover_start)}～{_fmt_date(cover_end)}（{cover_rows:,} 列）"
+                if cover_start is not None else "讀不到")
+        print(f"ℹ️ {code} 每日賣出明細涵蓋 {span}；比這個範圍早的出清日無法對帳，仍依事件表標示", flush=True)
+    if missing:
+        print(f"⚠️ {code} 出清日在賣出明細涵蓋範圍內、卻沒有對應賣出紀錄，圖上不標為出清："
+              + "、".join(missing[:6]), flush=True)
     reason = ""
     if not marks:
         if stock_rows.empty:
@@ -4028,6 +4084,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         text = _fmt_date(day)
         return text if text in visible else ""
 
+    flow_cover_start, _, _ = sell_detail_coverage()
     marks: List[Dict[str, Any]] = []
     paired_sells: set = set()
     unverified: List[str] = []
@@ -4047,12 +4104,14 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         exit_day = in_chart(exit_date)
         if exit_day:
             key = (branch, pd.Timestamp(exit_date).normalize())
-            amount = sell_amounts.get(key, 0.0)
-            # 出清要「兩張表都對得上」：A～E 事件表有出清日，每日賣出明細也真的有當天的賣出，
-            # 否則只是事件表的欄位，圖上不畫，避免和追蹤分點動向的「持有中」互相矛盾。
+            own_exit = _amount_or_zero(getattr(row, "exit_amount", None))
+            amount = own_exit or sell_amounts.get(key, 0.0)
+            # 出清要「兩張表都對得上」：A～E 事件表有出清日，每日賣出明細也真的有當天的賣出。
+            # 例外是出清日早於賣出明細的涵蓋範圍（那張表只保留近期資料），這種情況依事件表標示。
             if amount <= 0:
-                unverified.append(f"{branch} {exit_day}")
-                continue
+                if flow_cover_start is None or pd.Timestamp(exit_date).normalize() >= flow_cover_start:
+                    unverified.append(f"{branch} {exit_day}")
+                    continue
             paired_sells.add(key)
             # 同一天同一個分點可能一次清掉好幾筆事件：合併成一個標記，編號列出被清掉的那幾筆，
             # 金額只算一次（當日該分點的賣出合計），否則同一筆賣出會被重複計算。
@@ -4119,7 +4178,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         marks = numbered[:max_marks] + extras[: max(0, max_marks - len(numbered))]
     marks.sort(key=lambda m: (m["action_date"], str(m["no"])))
     if unverified:
-        print(f"⚠️ {code} 事件表有出清日、但每日賣出明細沒有對應賣出，圖上不標：{'、'.join(unverified[:6])}", flush=True)
+        print(f"⚠️ {code} 出清日在賣出明細涵蓋範圍內、卻沒有對應賣出，圖上不標：{'、'.join(unverified[:6])}", flush=True)
     print(f"✅ {code} Google Sheet 權證標註｜branches={targets or 'auto'}｜"
           f"事件買進 {sum(1 for m in marks if m['kind'] == 'event_buy')} 個｜"
           f"已核對出清 {sum(1 for m in marks if m['kind'] == 'event_exit')} 個｜"

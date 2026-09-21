@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -344,6 +344,42 @@ def _eligible(rows, mode):
     return eligible, len(rows) - len(eligible), date
 
 
+def _local_rows(stocks: list) -> tuple:
+    """完全用本地底庫組出排行資料（型態分數由背景算好），不打任何行情 API。
+
+    型態分數本來就只用已收盤 K 棒，所以盤中逐檔抓即時報價對排名毫無影響，
+    只會吃掉富果每分鐘額度、把使用者的個股查詢擠掉。這裡先用本地資料排名，
+    再由 get_ranking 對前幾名補上盤中報價與加減分原因。
+    """
+    codes = [str(s.get("stock_code") or "") for s in stocks]
+    scores = local_market_cache.pattern_scores_for(codes)
+    changes = local_market_cache.latest_changes(codes)
+    liquidity = local_market_cache.liquidity_map(LIQUIDITY_DAYS)
+    rows, missing = [], []
+    for stock in stocks:
+        code = str(stock.get("stock_code") or "")
+        score, change = scores.get(code), changes.get(code)
+        if not score or not change or not change.get("close"):
+            missing.append(stock)
+            continue
+        liq = liquidity.get(code) or {}
+        rows.append({
+            **stock,
+            "close": round(float(change["close"]), 2),
+            "change_pct": round(float(change.get("change_pct") or 0.0), 2),
+            "quote_date": _iso_date(change.get("date")),
+            "intraday": {},
+            "avg_volume_lots": round(float(liq.get("avg_lots") or 0.0), 1) or None,
+            "avg_trade_value": round(float(liq.get("avg_value") or 0.0)) or None,
+            "pattern_score": float(score["score"]),
+            "grade": str(score.get("grade") or ""),
+            "score_date": _iso_date(score.get("date")),
+            "plus_reasons": [], "minus_reasons": [], "moving_averages": {},
+            "score_basis": "收盤確認", "intraday_observation": {},
+        })
+    return rows, missing
+
+
 def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, Any]:
     if mode not in ("technical", "momentum"):
         raise tools.ToolDataError("不支援的比較方式")
@@ -361,7 +397,21 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
         members = get_members(industry, display_name=display_name)
         deadline = time.monotonic() + SCAN_TIMEOUT
         cancel = threading.Event()
-        remaining = iter(members["stocks"])
+        pool = list(members["stocks"])
+        local_rows: List[Dict[str, Any]] = []
+        if mode == "technical":
+            # 型態排行：先用本地底庫排完，只有本地缺資料的股票才走 API。
+            local_rows, pool = _local_rows(pool)
+        elif mode == "momentum":
+            # 漲幅排行：先用本地底庫篩掉流動性不達標的，不要抓了 35 檔最後只留 8 檔。
+            liquidity = local_market_cache.liquidity_map(LIQUIDITY_DAYS)
+            if liquidity:
+                liquid_pool = [s for s in pool
+                               if _is_liquid({"avg_volume_lots": (liquidity.get(s["stock_code"]) or {}).get("avg_lots"),
+                                              "avg_trade_value": (liquidity.get(s["stock_code"]) or {}).get("avg_value")})]
+                if liquid_pool:
+                    pool = liquid_pool
+        remaining = iter(pool)
         pending, rows, failed = {}, [], []
         try:
             while time.monotonic() < deadline:
@@ -386,6 +436,7 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
             cancel.set()
             for future in pending:
                 future.cancel()
+        rows = local_rows + rows
         eligible, excluded, date = _eligible(rows, mode)
         liquid = [r for r in eligible if _is_liquid(r)]
         illiquid = len(eligible) - len(liquid)
@@ -393,6 +444,22 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
         metric = "pattern_score" if mode == "technical" else "change_pct"
         eligible.sort(key=lambda row: (-row[metric], row["stock_code"]))
         top = [dict(row, rank=i + 1) for i, row in enumerate(eligible[:3])]
+        # 只對前 3 名補完整資料：加減分原因、均線與盤中即時價（最多 3 次即時報價）。
+        for row in top:
+            if row.get("plus_reasons") or row.get("minus_reasons"):
+                continue
+            try:
+                full = _stock_row({"stock_code": row["stock_code"], "stock_name": row.get("stock_name", ""),
+                                   "market": row.get("market", "")}, mode, time.monotonic() + 20, threading.Event())
+            except Exception as exc:
+                print(f"族群前段補資料略過 {row['stock_code']}：{type(exc).__name__}", flush=True)
+                continue
+            rank, keep_score = row["rank"], row.get("pattern_score")
+            row.update(full)
+            row["rank"] = rank
+            if mode == "technical" and keep_score is not None:
+                # 分數一律以收盤 K 棒為準，不因盤中價變動。
+                row["pattern_score"] = keep_score
         others = [{"rank": i + 4, **{k: row.get(k) for k in ("stock_code", "stock_name", "market", "close", "change_pct", "pattern_score", "grade")}}
                   for i, row in enumerate(eligible[3:5])]  # 圖上最多顯示到第 5 名
         result = {"name": members["name"], "mode": mode, "source": members["source"],
@@ -400,7 +467,8 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
                   "missing_markets": members["missing_markets"], "total_count": len(members["stocks"]),
                   "compared_count": len(eligible), "failed_count": len(failed), "excluded_count": excluded,
                   "illiquid_count": illiquid, "liquidity_rule": liquidity_rule_text(),
-                  "unprocessed_count": len(members["stocks"]) - len(rows) - len(failed),
+                  "unprocessed_count": max(0, len(members["stocks"]) - len(rows) - len(failed)),
+                  "local_rows": len(local_rows),
                   "comparison_date": date, "generated_at": tools.taipei_now().strftime("%Y-%m-%d %H:%M"),
                   "rows": top, "others": others}
         for field in ("market_counts", "scope", "catalog_note", "source_urls", "stale", "missing_categories"):
