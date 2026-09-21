@@ -1485,6 +1485,160 @@ def _fetch_index_daily(code: str) -> pd.DataFrame:
     return frame
 
 
+
+# 大盤／櫃買盤中即時指數：證交所 MIS，一個請求、免金鑰，不佔富果每分鐘額度。
+MIS_INDEX_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+MIS_INDEX_CHANNEL = {"TAIEX": "tse_t00.tw", "TPEX": "otc_o00.tw"}
+MIS_INDEX_HEADERS = {"User-Agent": "Mozilla/5.0 AceAI/1.0", "Accept": "application/json",
+                     "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
+# 指數盤中報價優先用富果（和個股同一套來源）；富果沒有或失敗時自動改用證交所 MIS。
+FUGLE_INDEX_BASE_URL = FUGLE_BASE_URL.rsplit("/", 1)[0] + "/index"
+FUGLE_INDEX_SYMBOL = {
+    "TAIEX": os.getenv("DISCORD_AI_FUGLE_INDEX_TAIEX", "IX0001").strip() or "IX0001",
+    "TPEX": os.getenv("DISCORD_AI_FUGLE_INDEX_TPEX", "IX0118").strip() or "IX0118",
+}
+
+
+def _fugle_index_get(path: str) -> Dict[str, Any]:
+    """和 _fugle_get 相同的金鑰輪替與額度控管，只是走 index 端點。"""
+    if current_api_priority() == "background":
+        if not fugle_background_allowed():
+            raise ToolDataError("富果背景額度已保留給使用者查詢")
+    else:
+        _wait_for_fugle_user_slot()
+    kf = core()
+    attempts = max(1, len(FUGLE_API_KEYS) or 1)
+    last_error: Optional[Exception] = None
+    for _ in range(attempts):
+        started = time.perf_counter(); status = 0
+        try:
+            response = kf.get_thread_session().get(
+                f"{FUGLE_INDEX_BASE_URL}/{path}",
+                headers={"X-API-KEY": _fugle_key(), "Accept": "application/json"},
+                timeout=(4, FUGLE_TIMEOUT),
+            )
+            status = int(response.status_code)
+            if status in (401, 403, 429):
+                last_error = ToolDataError(f"富果 API 回應 {status}")
+                if _fugle_rotate_key():
+                    continue
+                raise last_error
+            response.raise_for_status()
+            return response.json() or {}
+        finally:
+            record_api_event("Fugle", status=status, latency=time.perf_counter() - started)
+    raise last_error or ToolDataError("富果指數 API 無可用金鑰")
+
+
+def _first_number(data: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _num(data.get(key))
+        if value:
+            return value
+    return None
+
+
+def fetch_fugle_index_quote(code: str) -> Dict[str, Any]:
+    """富果盤中指數報價；欄位名稱在不同版本略有差異，所以多給幾個候選鍵。"""
+    symbol = FUGLE_INDEX_SYMBOL.get(str(code).upper())
+    if not symbol:
+        raise ToolDataError(f"沒有對應的富果指數代碼：{code}")
+    data = _fugle_index_get(f"intraday/quote/{symbol}")
+    close = _first_number(data, "index", "lastPrice", "closePrice", "price", "previousClose")
+    day = _parse_sheet_date(data.get("date"))
+    if not close or day is None:
+        raise ToolDataError("富果指數報價缺少指數或日期")
+    open_ = _first_number(data, "openIndex", "open", "openPrice") or close
+    high = _first_number(data, "highIndex", "high", "highPrice") or close
+    low = _first_number(data, "lowIndex", "low", "lowPrice") or close
+    stamp = str(data.get("lastUpdated") or "")
+    try:
+        moment = datetime.fromtimestamp(int(stamp) / (1_000_000 if len(stamp) > 13 else 1_000), TAIPEI_TZ)
+        clock = moment.strftime("%H:%M")
+    except (TypeError, ValueError, OSError):
+        clock = taipei_now().strftime("%H:%M")
+    return {"date": pd.Timestamp(day).normalize(), "time": clock, "open": open_, "high": high,
+            "low": low, "close": close,
+            "previous_close": _first_number(data, "previousClose") or 0.0, "source": "富果"}
+
+
+
+def fetch_index_quote(code: str) -> Dict[str, Any]:
+    """指數盤中報價：先用富果（和個股同一個來源），失敗才用證交所 MIS。"""
+    if FUGLE_API_KEYS or FUGLE_API_KEY:
+        try:
+            return fetch_fugle_index_quote(code)
+        except Exception as exc:
+            print(f"⚠️ {code} 富果指數報價失敗，改用證交所即時指數：{type(exc).__name__}: {exc}", flush=True)
+    return fetch_mis_index_quote(code)
+
+
+def fetch_mis_index_quote(code: str) -> Dict[str, Any]:
+    """證交所 MIS 指數報價（免金鑰、不佔富果額度）。"""
+    channel = MIS_INDEX_CHANNEL.get(str(code).upper())
+    if not channel:
+        raise ToolDataError(f"不支援的指數代碼：{code}")
+    started = time.perf_counter()
+    status = 0
+    try:
+        session = core().get_thread_session()
+        response = session.get(MIS_INDEX_URL, params={"ex_ch": channel, "json": "1", "delay": "0"},
+                               headers=MIS_INDEX_HEADERS, timeout=(4, 8))
+        status = int(response.status_code)
+        response.raise_for_status()
+        payload = response.json() or {}
+    finally:
+        record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
+    rows = payload.get("msgArray") or []
+    if not rows:
+        raise ToolDataError("指數即時報價沒有資料")
+    row = rows[0]
+    try:
+        close = float(row.get("z") or row.get("o") or 0)
+        open_ = float(row.get("o") or close)
+        high = float(row.get("h") or close)
+        low = float(row.get("l") or close)
+        previous = float(row.get("y") or 0)
+        day = pd.Timestamp(str(row.get("d") or "")).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ToolDataError("指數即時報價格式不符") from exc
+    if close <= 0 or pd.isna(day):
+        raise ToolDataError("指數即時報價無效")
+    return {"date": day, "time": str(row.get("t") or "")[:5], "open": open_, "high": high,
+            "low": low, "close": close, "previous_close": previous, "source": "證交所"}
+
+
+def _append_index_intraday(code: str, frame: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """日K還沒有今天這一根時，接上 MIS 的盤中指數。指數沒有成交量，量留 0。"""
+    now = taipei_now()
+    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
+        return frame, {}
+    if current_api_priority() == "background":
+        return frame, {}
+    last_date = pd.Timestamp(frame.index.max()).normalize()
+    if last_date >= pd.Timestamp(now.date()):
+        return frame, {}
+    try:
+        quote = _cached(f"index_quote_{code}", max(20, TTL_INTRADAY_SECONDS), lambda: fetch_index_quote(code))
+    except Exception as exc:
+        print(f"⚠️ {code} 指數即時報價略過：{type(exc).__name__}: {exc}", flush=True)
+        return frame, {}
+    if quote["date"] <= last_date:
+        return frame, {}
+    bar = pd.DataFrame([[quote["open"], quote["high"], quote["low"], quote["close"], 0.0]],
+                       index=pd.DatetimeIndex([quote["date"]]),
+                       columns=["Open", "High", "Low", "Close", "Volume"])
+    merged = pd.concat([frame[["Open", "High", "Low", "Close", "Volume"]], bar])
+    live = (now.hour * 60 + now.minute) <= MARKET_CLOSE_HHMM[0] * 60 + MARKET_CLOSE_HHMM[1]
+    info = {"date": _fmt_date(quote["date"]), "time": quote["time"], "is_live": live,
+            "is_close_confirmed": False, "post_close_provisional": not live,
+            "cumulative_volume_lots": None, "volume_suspect": False,
+            "volume_note": "指數沒有成交量資料，今天這根不判斷量能"}
+    print(f"⏱️ {code} 接上指數即時報價（{quote.get('source', '-')}）：{info['date']} {info['time']}｜{quote['close']}｜"
+          + ("盤中暫定" if live else "盤後暫定"), flush=True)
+    return merged, info
+
+
 def _load_index_bundle(code: str) -> Dict[str, Any]:
     kf = core()
 
@@ -1492,10 +1646,22 @@ def _load_index_bundle(code: str) -> Dict[str, Any]:
         frame = _cached("index_daily_" + code, TTL_PRICE_SECONDS, lambda: _fetch_index_daily(code))
         closed = kf.calculate_indicators(frame)
         closed["Close_prev"] = closed["Close"].shift(1)
-        return {"df": closed, "closed_df": closed, "market": "index", "intraday": {},
+        merged, intraday = _append_index_intraday(code, frame)
+        if not intraday:
+            return {"df": closed, "closed_df": closed, "market": "index", "intraday": {},
+                    "daily_source": "指數日K收盤資料"}
+        df = kf.calculate_indicators(merged)
+        df["Close_prev"] = df["Close"].shift(1)
+        # 指數盤中沒有量，均量沿用前一日，不讓今天這根把均量拉成 0。
+        for column in ("MV5", "MV20"):
+            if column in df.columns and len(df) > 1:
+                df.iloc[-1, df.columns.get_loc(column)] = df[column].iloc[-2]
+        return {"df": df, "closed_df": closed, "market": "index", "intraday": intraday,
                 "daily_source": "指數日K收盤資料"}
 
-    return _cached("price_" + code, TTL_PRICE_SECONDS, build)
+    ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
+    prefix = "price_closed_" if current_api_priority() == "background" else "price_"
+    return _cached(prefix + code, ttl, build)
 
 
 FUTURES_ID = os.getenv("DISCORD_AI_FUTURES_ID", "TX").strip() or "TX"

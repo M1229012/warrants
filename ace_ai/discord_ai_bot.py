@@ -1207,7 +1207,9 @@ _MA_ALL_WORDS = ("所有均線", "全部均線", "各均線", "各條均線")
 _MA_NAME = r"(?:(?<![A-Za-z])MA\s?\d{1,3}|雙週線|週線|周線|月線|季線|半年線|年線)"
 _MA_LABEL = r"(?:" + _MA_NAME + r"|所有均線|全部均線|各均線|各條均線)"
 # 「月線 31.2 元」「MA20（31.2）」「季線約 45」：標籤後面緊接的價格；後面接 %／日／張等單位的是距離或天數，不核對。
-_MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d+(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
+# 指數（加權、櫃買）動輒五位數，寫法會有千分位逗號；不吃逗號的話「46,543」會被讀成「46」，
+# 事實核對就會把正確的句子當成數字錯誤刪掉。
+_MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d[\d,]*(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
 _DIRECTION_RE = re.compile(
     r"(站上|站穩|站回|突破|守住|守穩|跌破|失守|跌落|摜破)\s*((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)")
 _UP_WORDS = {"站上", "站穩", "站回", "突破", "守住", "守穩"}
@@ -1389,7 +1391,7 @@ class FactSheet:
             known = values.get(key)
             if not known:
                 continue
-            written = float(number)
+            written = float(str(number).replace(",", ""))
             if not any(abs(written - v) <= max(abs(v) * 0.006, 0.011) for v in known):
                 issues.append(f"{key} 數值不符（寫 {number}，資料為 {known[0]:g}）")
         return issues
