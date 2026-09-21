@@ -2046,6 +2046,8 @@ MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
 # 使用者把「/ace 族群資金流向」整串打進 /ask 的輸入框時，前綴不能被當成族群名稱。
 _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
 
+# /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
+ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 _FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
@@ -2734,7 +2736,7 @@ class AceQueryEngine:
         if normalized in known:
             canonical = known[normalized]
             self.log(f"管理員備援請求：{canonical} 已存在 Google Sheet，直接使用 Sheet，不啟動 MoneyDJ")
-            panels = self._get_chart_panels([code], {code: [canonical]}, mark_mode="flow", flow_source="sheet")
+            panels = self._get_chart_panels([code], {code: [canonical]}, mark_mode=ASK_MARK_MODE, flow_source="sheet")
             text = f"{code}｜{canonical} 權證分點圖"
         else:
             self.log(f"管理員 MoneyDJ 備援啟動｜stock={code}｜branch={branch}")
@@ -2869,9 +2871,9 @@ class AceQueryEngine:
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
         light = plan.route == "rule_stock" and not plan.need_final_llm   # 只問股價：走輕量流程
-        flow_mark_query = any(k in question for k in ("權證買賣超", "買賣超點位", "分點買賣", "買在哪", "賣在哪", "進出點位"))
         warrant_visual_query = bool(parsed.branches) or any(k in question for k in ("權證", "分點", "籌碼", "買賣超")) or plan.route == "rule_top_warrant"
-        mark_mode = "flow" if flow_mark_query else "event"
+        # 一般問答的權證圖一律用同一種版型（編號＋分點明細表），不再依問法在兩種版型之間跳。
+        mark_mode = ASK_MARK_MODE
         chart_calls = []
         for c in codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}

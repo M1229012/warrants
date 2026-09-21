@@ -244,6 +244,8 @@ def _mark_action(e: dict) -> tuple[str, str]:
     status = str(e.get('status', ''))
     if e.get('exit_date'):
         amount = str(e.get('exit_amount_text') or '')
+        if not amount and e.get('exit_shared_with'):
+            return f"{e['exit_date'][5:]} 出清（與編號 {e['exit_shared_with']} 同筆）", DOWN
         return f"{e['exit_date'][5:]} 出清 {amount}".strip(), DOWN
     if e.get('exit_unverified'):
         # 事件表寫已出清，但每日賣出明細當天沒有對應賣出：照實說待對帳，不寫成出清也不寫成持有中。
@@ -282,6 +284,49 @@ def _mark_symbol_items() -> list[tuple[str, str, float]]:
         icon = {'buy': 44, 'exit': 44, 'reduce': 18, 'note': 0}[kind]
         items.append((kind, text, icon + (8 if icon else 0) + font(18).getlength(text)))
     return items
+
+
+def _flow_table_rows(events: list[dict]) -> list[dict]:
+    """把 flow 標記（每個動作一筆）折成明細表用的「每個事件一列」。
+
+    週精選和一般問答改用同一張明細表，欄位與判讀規則才會一致；
+    分點配色圖例仍然保留，顏色對應 K 線上的標記。
+    """
+    rows: dict[int, dict] = {}
+    extras: list[dict] = []
+    for e in events:
+        numbers = _mark_numbers(e)
+        branch = str(e.get('branch') or '')
+        if e.get('action') == 'buy' and numbers:
+            row = rows.setdefault(numbers[0], {'no': numbers[0], 'branch': branch})
+            row.update({'branch': branch, 'event': str(e.get('event_codes') or ''),
+                        'buy_date': str(e.get('action_date') or ''),
+                        'buy_amount_text': str(e.get('net_amount_text') or ''),
+                        'status': row.get('status') or '持有中'})
+        elif numbers:
+            # 一筆賣出同時清掉好幾個編號時，金額只掛在第一個編號那列，
+            # 其餘列註明「與編號 N 同筆」，避免同一筆金額被重複計算。
+            for index, number in enumerate(numbers):
+                row = rows.setdefault(number, {'no': number, 'branch': branch})
+                row['exit_date'] = str(e.get('action_date') or '')
+                row['status'] = '已出清'
+                if index == 0:
+                    row['exit_amount_text'] = str(e.get('net_amount_text') or '')
+                else:
+                    row['exit_amount_text'] = ''
+                    row['exit_shared_with'] = numbers[0]
+        else:
+            extras.append({'no': '', 'branch': branch, 'event': '', 'buy_date': '', 'buy_amount_text': '',
+                           'reduce_date': str(e.get('action_date') or ''),
+                           'reduce_amount_text': str(e.get('net_amount_text') or ''),
+                           'status': str(e.get('action_text') or '減碼')})
+    ordered = [rows[key] for key in sorted(rows)]
+    for row in ordered:
+        row.setdefault('event', '')
+        row.setdefault('buy_date', '')
+        row.setdefault('buy_amount_text', '')
+        row.setdefault('status', '持有中')
+    return ordered + extras
 
 
 def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
@@ -340,7 +385,20 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
                 draw.text((x0 + 24 + font(19, True).getlength(name) + 16, ly), detail,
                           font=font(18), fill=MUTED, anchor='lm')
                 ly += 30
-        return int(h + 38 + len(rows) * 30)
+        h += 38 + len(rows) * 30
+        # 圖例下方接上和一般問答相同的明細表（編號／分點／事件／買進日／金額／後續動作）。
+        table_rows = _flow_table_rows(events)
+        if table_rows:
+            split = len(table_rows) > MARK_TABLE_SINGLE_MAX
+            half_count = math.ceil(len(table_rows) / 2)
+            groups = [table_rows[:half_count], table_rows[half_count:]] if split else [table_rows]
+            gap = 32
+            table_w = (width - gap) / 2 if split else width
+            if not dry:
+                for g, group in enumerate(groups):
+                    _draw_mark_table(draw, x0 + g * (table_w + gap), top + h, table_w, group)
+            h += TABLE_HEAD_H + len(groups[0]) * MARK_ROW_H + 18
+        return int(h)
 
     table_top = top + h
     split = len(events) > MARK_TABLE_SINGLE_MAX
@@ -464,11 +522,18 @@ def panel_height(panel: dict) -> int:
     return CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + mark_legend(None, panel, 0, True)
 
 
+def _badge_half(number_text) -> float:
+    """編號膠囊的半寬；合併後的「1、2」比單一數字寬，排版要用實際寬度算間距。"""
+    text = str(number_text)
+    size = 14 if len(text) < 2 else (12 if len(text) < 4 else 11)
+    return max(MARK_BADGE_R, font(size, True).getlength(text) / 2 + 5)
+
+
 def _assign_rows(badges: list[dict]) -> None:
     """同一側的編號圓圈依 x 排列，擠在一起時往下一列放（最多 3 列）。"""
     last = [-1e9] * MARK_MAX_ROWS
-    gap = MARK_BADGE_R * 2 + 4
     for badge in sorted(badges, key=lambda b: b['cx']):
+        gap = _badge_half(badge.get('no', '')) * 2 + 4
         row = next((r for r in range(MARK_MAX_ROWS) if badge['cx'] - last[r] >= gap), None)
         if row is None:
             # 三列都擠滿：放進最空的一列並往右挪到不重疊的位置，細線仍連回自己的三角形。
@@ -491,7 +556,7 @@ def _draw_badge(draw, cx, cy, number_text, color):
     """一次清掉多筆時編號會是「1、3」，膠囊要跟著加寬，字才不會被圓圈切掉。"""
     text = str(number_text)
     size = 14 if len(text) < 2 else (12 if len(text) < 4 else 11)
-    half = max(MARK_BADGE_R, font(size, True).getlength(text) / 2 + 5)
+    half = _badge_half(text)
     draw.rounded_rectangle((cx - half, cy - MARK_BADGE_R, cx + half, cy + MARK_BADGE_R),
                            radius=MARK_BADGE_R, fill=color, outline='white', width=2)
     draw.text((cx, cy), text, font=font(size, True), fill='white', anchor='mm')
@@ -547,24 +612,31 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         return
 
     buy_badges, sell_badges = [], []
+    buy_days_numbers: dict[int, list[int]] = {}
     sell_days: dict[int, list[int]] = {}
     reduce_days: set[int] = set()
-    buy_days: set[int] = set()
     for e in events:
         i = index.get(e.get('buy_date') or '')
         if i is not None:
-            buy_days.add(i)
-            buy_badges.append({'x': px(i), 'cx': px(i), 'no': e['no']})
+            buy_days_numbers.setdefault(i, []).append(e['no'])
         j = index.get(e.get('exit_date') or '')
         if j is not None:
             sell_days.setdefault(j, []).append(e['no'])
         k = index.get(e.get('reduce_date') or '')
         if k is not None and k != j:
             reduce_days.add(k)
+    buy_days = set(buy_days_numbers)
+
+    def _merged_label(numbers: list[int]) -> str:
+        """同一天有好幾筆時合併成一個標記（1、2），不要兩個圓圈擠在一起、一高一低。"""
+        ordered = sorted(set(numbers))
+        head = '、'.join(str(n) for n in ordered[:3])
+        return head + (f'…共{len(ordered)}筆' if len(ordered) > 3 else '')
+
+    for i, numbers in buy_days_numbers.items():
+        buy_badges.append({'x': px(i), 'cx': px(i), 'no': _merged_label(numbers)})
     for j, numbers in sell_days.items():
-        for n, no in enumerate(sorted(numbers)):
-            offset = (n - (len(numbers) - 1) / 2) * (MARK_BADGE_R * 2 + 3)
-            sell_badges.append({'x': px(j), 'cx': px(j) + offset, 'no': no})
+        sell_badges.append({'x': px(j), 'cx': px(j), 'no': _merged_label(numbers)})
     _assign_rows(buy_badges); _assign_rows(sell_badges)
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):
