@@ -57,6 +57,14 @@ class OfficialSectorMemberResolver:
             raise ValueError("官方類股雷達目前只有上市類股指數，成員只能取 twse")
         self.market = market
 
+    @staticmethod
+    def id_for_name(label: str) -> str:
+        """舊快照沒存 sector_id 時用：只接受對照表裡 MIS 名稱的**完全相同**寫法，不做模糊比對。"""
+        for sector_id, entry in SECTOR_MAP.items():
+            if entry and label in entry[1]:
+                return sector_id
+        return ""
+
     def name_matches(self, sector_id: str, mis_name: str) -> bool:
         """MIS 回來的名稱是否符合對照表（防 channel 編號被官方調整時默默對錯）。"""
         entry = SECTOR_MAP.get(sector_id)
@@ -77,9 +85,11 @@ class OfficialSectorMemberResolver:
         key = _STATE_PREFIX + sector_id
         try:
             result = self._from_finmind(sector_id, industry)
-            local_market_cache.set_state(key, result)
-            print(f"🗂️ 類股成員｜{sector_id}｜member_source={result['source']}｜"
-                  f"{len(result['member_codes'])} 檔｜{result['version']}", flush=True)
+            previous = local_market_cache.get_state(key, {}) or {}
+            if previous.get("version") != result["version"]:   # 版本有變才寫入與印 log，避免每次查詢洗版
+                local_market_cache.set_state(key, result)
+                print(f"🗂️ 類股成員｜{sector_id}｜member_source={result['source']}｜"
+                      f"{len(result['member_codes'])} 檔｜{result['version']}", flush=True)
             return result
         except Exception as exc:
             stored = local_market_cache.get_state(key, {}) or {}

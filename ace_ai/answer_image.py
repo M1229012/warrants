@@ -1330,6 +1330,10 @@ def _rank_card_items(row: dict, technical: bool) -> list[tuple[str, str, str, st
         items += [('留意', WARN_BG, WARN_INK, t) for t in minus]
     if row.get('observation'):
         items.append(('解讀', ACCENT_BG, INK, str(row['observation'])))
+    if row.get('leaders_text'):   # 族群雷達：族群內領漲／領跌個股（台股慣例：漲紅跌綠）
+        label = str(row.get('leaders_label') or '領漲')
+        bg, ink = (GOOD_BG, GOOD_INK) if label == '領跌' else ('#FDECEC', '#C24141')
+        items.append((label, bg, ink, str(row['leaders_text'])))
     return items
 
 
@@ -1400,6 +1404,7 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         parts = [str(row.get('coverage_text') or ''), str(row.get('ratio_text') or ''), str(row.get('leader_text') or '')]
         text, size = fit('　｜　'.join(p for p in parts if p), 22, width - SECTOR_INNER * 2 - 74)
         draw.text((nx, gy), text, font=font(size), fill=MUTED, anchor='ls')
+        _draw_card_labels(draw, ix, y + head_h, label_w, lines, first)   # 族群雷達的領漲／領跌列
         return height
     live = (row.get('intraday') or {}).get('is_live')
     price_label = '成交' if live else '收盤'
@@ -1423,7 +1428,11 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         if filled > 10:
             draw.rounded_rectangle((nx, by, nx + filled, by + 10), radius=5, fill=color if not first else ACCENT)
     # 優勢／留意／AI 解讀
-    ry = y + head_h
+    _draw_card_labels(draw, ix, y + head_h, label_w, lines, first)
+    return height
+
+
+def _draw_card_labels(draw, ix: float, ry: float, label_w: int, lines: list, first: bool) -> None:
     for label, bg, ink, ls in lines:
         # 顏色只放在標籤，說明文字一律深色，比較好讀。
         draw.rounded_rectangle((ix, ry - 1, ix + label_w, ry + 27), radius=14, fill=bg if bg != ACCENT_BG or not first else 'white')
@@ -1431,7 +1440,6 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         for i, line in enumerate(ls):
             text_at(draw, (ix + label_w + 14, ry + i * SECTOR_REASON_LINE), line, SECTOR_REASON_SIZE, INK)
         ry += max(1, len(ls)) * SECTOR_REASON_LINE + 10
-    return height
 
 
 def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], technical: bool, dry: bool) -> int:

@@ -338,11 +338,133 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
 
 
 # ============================================================
+# 族群內領漲／領跌個股（每族群前 2 名）
+# 成員＝OfficialSectorMemberResolver（上市、finmind_proxy）→ 流動性達標 → MIS 批次報價。
+# 一個 MIS 請求可帶多檔，整次查詢只打幾個請求，不佔富果額度；失敗就不列，不影響卡片。
+# ============================================================
+
+LEADER_TOP = 2
+LEADER_BATCH = 50                   # 每個 MIS 請求帶幾檔
+LEADER_DEADLINE = 10.0              # 整次個股報價的時間上限（秒），不能拖住 Discord 回覆
+_LEADER_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}   # {5 分鐘桶: {代號: 報價}}
+_LEADER_LOCK = threading.Lock()
+
+
+def _mis_price(item: Dict[str, Any]) -> float:
+    """z＝最新成交；盤中瞬間沒有成交時是 "-"，退回最佳買價第一檔。"""
+    for raw in (item.get("z"), str(item.get("b") or "").split("_")[0]):
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    try:
+        session = tools.core().get_thread_session()
+    except Exception:
+        import requests
+        session = requests
+    out: Dict[str, Dict[str, Any]] = {}
+    deadline = time.perf_counter() + LEADER_DEADLINE
+    for start in range(0, len(codes), LEADER_BATCH):
+        if time.perf_counter() > deadline:
+            print(f"⚠️ 族群個股報價逾時，只取到 {len(out)} 檔", flush=True)
+            break
+        batch = codes[start:start + LEADER_BATCH]
+        began, status = time.perf_counter(), 0
+        try:
+            response = session.get(MIS_URL, params={"ex_ch": "|".join(f"tse_{c}.tw" for c in batch),
+                                                    "json": "1", "delay": "0"},
+                                   headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
+            status = int(response.status_code)
+            response.raise_for_status()
+            items = (response.json() or {}).get("msgArray") or []
+        except Exception as exc:
+            print(f"⚠️ 族群個股報價失敗｜{type(exc).__name__}", flush=True)
+            continue
+        finally:
+            try:
+                tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - began)
+            except Exception:
+                pass
+        for item in items:
+            code = str(item.get("c") or "")
+            price = _mis_price(item)
+            try:
+                previous = float(item.get("y") or 0)
+            except (TypeError, ValueError):
+                previous = 0.0
+            if code and price > 0 and previous > 0:
+                out[code] = {"name": str(item.get("n") or code),
+                             "change_pct": round((price / previous - 1) * 100, 2)}
+    return out
+
+
+def _quotes_for(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """同一個 5 分鐘桶內重複查詢共用報價；只補抓還沒有的代號。"""
+    now = _now()
+    bucket = now.strftime("%Y%m%d") + ("close" if not session_open(now) else "%04d" % (_minutes(now) // 5 * 5))
+    with _LEADER_LOCK:
+        for key in [k for k in _LEADER_CACHE if k != bucket]:
+            _LEADER_CACHE.pop(key, None)
+        cached = _LEADER_CACHE.setdefault(bucket, {})
+        missing = [c for c in codes if c not in cached]
+        if missing:
+            cached.update(_fetch_stock_quotes(missing))
+        return {c: cached[c] for c in codes if c in cached}
+
+
+def attach_leaders(sections: List[Tuple[str, List[Dict[str, Any]], str]]) -> None:
+    """替每個族群列補 leaders（轉弱區取最弱 2 檔，其餘取最強 2 檔）；任何失敗都只是不顯示。"""
+    try:
+        from official_sector_members import OfficialSectorMemberResolver
+        from representative_basket import MIN_AVG_LOTS, MIN_AVG_VALUE
+        resolver = OfficialSectorMemberResolver()
+        liquidity = local_market_cache.liquidity_map(20)
+        members: Dict[str, List[str]] = {}
+        for _, rows, _ in sections:
+            for row in rows:
+                sid = row.get("sector_id") or resolver.id_for_name(row["name"])
+                if not sid or row["name"] in members:
+                    continue
+                info = resolver.resolve(sid, row["name"])
+                codes = [c for c in info.get("member_codes") or []
+                         if float((liquidity.get(c) or {}).get("avg_value") or 0) >= MIN_AVG_VALUE
+                         and float((liquidity.get(c) or {}).get("avg_lots") or 0) >= MIN_AVG_LOTS]
+                members[row["name"]] = codes
+        wanted = sorted({c for codes in members.values() for c in codes})
+        quotes = _quotes_for(wanted) if wanted else {}
+        for section, rows, _ in sections:
+            for row in rows:
+                priced = [(c, quotes[c]) for c in members.get(row["name"], []) if c in quotes]
+                priced.sort(key=lambda p: p[1]["change_pct"], reverse=(section != "down"))
+                # 同一族群可能同時在「最強」與「轉弱」區，依區分開存，免得互相覆蓋
+                row.setdefault("leaders_by", {})[section] = [
+                    {"code": c, "name": q["name"], "change_pct": q["change_pct"]} for c, q in priced[:LEADER_TOP]]
+        print(f"📡 sector radar leaders｜sectors={len(members)}｜stocks={len(wanted)}｜priced={len(quotes)}",
+              flush=True)
+    except Exception as exc:
+        print(f"⚠️ 族群領漲股略過｜{type(exc).__name__}: {exc}", flush=True)
+
+
+def _leaders_text(row: Dict[str, Any], section: str) -> str:
+    return "・".join(f"{s['name']} {s['change_pct']:+.2f}%" for s in (row.get("leaders_by") or {}).get(section) or [])
+
+
+def _leaders_label(section: str) -> str:
+    return "領跌" if section == "down" else "領漲"
+
+
+# ============================================================
 # L1 輸出（L2 代表股驗證接上前的暫時版：只列指數層級）
 # ============================================================
 
 _MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down"}
-L1_ONLY_NOTE = "僅指數層級，未驗證個股"
+L1_ONLY_NOTE = "領漲／領跌取流動性達標的上市成員，尚未做擴散驗證"
 STRONG_TOP = 3
 
 
@@ -398,6 +520,8 @@ def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]]) -> Di
             # 最強卡本來就依漲幅排，名次移動只在轉強／轉弱卡當輔助
             "ratio_text": "" if section == "strong" else _rank_text(row),
             "leader_text": "",
+            "leaders_label": _leaders_label(section),
+            "leaders_text": _leaders_text(row, section),
         })
     note = L1_ONLY_NOTE
     if section != "strong" and data["phase"].get("phase") == "opening":
@@ -430,6 +554,7 @@ def answer(direction: str = "both", now=None) -> Dict[str, Any]:
     for mode in ("up", "down"):
         picked = candidates(mode, data=data)
         sections.append((mode, picked["candidates"], picked["reason"]))
+    attach_leaders(sections)
     stamp, _ = _stamp(data)
     lines = [f"**族群雷達｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
     panel_list: List[Dict[str, Any]] = []
@@ -441,6 +566,8 @@ def answer(direction: str = "both", now=None) -> Dict[str, Any]:
             continue
         for index, row in enumerate(rows, 1):
             tail = "" if section == "strong" else f"｜{_rank_text(row)}"
+            leaders = _leaders_text(row, section)
+            tail += f"｜{_leaders_label(section)} {leaders}" if leaders else ""
             lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜{_delta_text(row, data)}{tail}")
         panel_list.append(_panel(section, data, rows))
     lines.append(f"※ {L1_ONLY_NOTE}；盤中變化快，僅供當下觀察，不代表未來表現。")
