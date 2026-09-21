@@ -57,6 +57,9 @@ LIVE_TOP_TWSE = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TWSE", 12))
 LIVE_TOP_TPEX = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TPEX", 6))
 
 # 盤中批次抓取：總時間預算是「加權＋櫃買合計」，避免網路慢時 Discord 逾時。
+# 收盤後、官方收盤檔尚未發布（約 13:30～15:00）時要不要給估算榜。
+# 預設關閉：只計市值前段的榜無法和交易所／CMoney 對帳，寧可請使用者稍後再查。
+PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 0))
 LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 9.0))
 LIVE_BATCH_SIZE = max(20, tools._env_int("DISCORD_AI_CONTRIB_BATCH_SIZE", 70))
 LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 350))
@@ -679,18 +682,19 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         prev_index, now_index, index_date = _fetch_official_index_close(market)
         # TWSE 的 MI_INDEX OpenAPI 沒有日期欄位；用既有指數日K只補「日期」做交叉驗證，
         # 不拿它覆蓋官方收盤值。這可擋掉「指數已到今天，但個股快照仍是前一交易日」。
-        if not index_date:
-            try:
-                _p, _n, bundle_date = _index_prev_close(index_code)
-                index_date = str(bundle_date or "")
-            except Exception:
-                index_date = ""
+        # 一律以「指數日K的最新交易日」為對齊基準。只比對同一批快照自己的日期會漏掉
+        # 「今天已收盤、但全市場收盤檔還沒發布」的情況，結果就會拿昨天的榜當今天用。
+        try:
+            _p, _n, bundle_date = _index_prev_close(index_code)
+        except Exception:
+            bundle_date = ""
+        index_date = str(bundle_date or index_date or "")
         if not data_date:
             data_date = index_date
         if data_date and index_date and data_date != index_date:
-            # TWSE MI_INDEX OpenAPI 本身沒有日期欄位時 index_date 可能為空；有日期時則必須對齊。
             raise tools.ToolDataError(
-                f"{index_name} 指數日期 {index_date} 與個股收盤快照 {data_date} 不一致，拒絕產生錯誤貢獻榜"
+                f"{index_name} 最新交易日為 {index_date}，但全市場收盤資料只到 {data_date}；"
+                f"今日收盤檔通常 15:00 後才發布，稍後再查才會是今天的貢獻榜"
             )
 
         # 官方快照至少應覆蓋數百檔；太小視為端點尚未完整更新。
@@ -995,6 +999,7 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     if live is None:
         now = tools.taipei_now()
         live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
+    reasons: List[str] = []
     out: Dict[str, Any] = {"basis": "盤中估算" if live else "收盤精算", "markets": []}
     overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS if live else None
     markets_order = ("twse", "tpex")
@@ -1010,9 +1015,24 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         try:
             out["markets"].append(contribution(market, live=bool(live), top=top, deadline=market_deadline))
         except Exception as exc:
+            # 已收盤、但交易所當天的全市場收盤檔還沒發布時，改用即時報價估算今天的貢獻，
+            # 而不是回頭拿前一個交易日的榜（那會變成昨天的答案）。
+            if not live and PENDING_CLOSE_ESTIMATE:
+                try:
+                    row = contribution(market, live=True, top=top,
+                                       deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
+                    row["basis"] = "收盤暫定・僅計市值前段"
+                    row["pending_official_close"] = True
+                    out["markets"].append(row)
+                    print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+                    continue
+                except Exception as retry_exc:
+                    exc = retry_exc
+            reasons.append(str(exc))
             print(f"⚠️ {INDEX_OF[market][1]} 貢獻點數略過：{type(exc).__name__}: {exc}", flush=True)
     if not out["markets"]:
-        raise tools.ToolDataError("目前無法計算指數貢獻點數")
+        # 把真正的原因帶給使用者（多半是「今天的收盤檔還沒發布」），不要只說算不出來。
+        raise tools.ToolDataError(reasons[0] if reasons else "目前無法計算指數貢獻點數")
 
     twse = next((m for m in out["markets"] if m.get("market") == "twse"), None)
     tpex = next((m for m in out["markets"] if m.get("market") == "tpex"), None)
