@@ -1,15 +1,18 @@
-"""盤中族群資金流向雷達（轉強／轉弱）。
+"""盤中族群雷達（轉強／轉弱），規格見 SECTOR_RADAR_SPEC.md。
 
-做法：盤中每隔幾分鐘存一張「類股即時漲跌排名」快照，查詢時只讀本地快照算名次移動，
-比較的是**同一天盤中對盤中**（現在 vs 約 30 分鐘前 vs 今天第一張），不拿昨天的收盤湊數。
+做法：盤中每 5 分鐘存一張「類股即時漲跌」快照，查詢時只讀本地快照算 Δ30m（ppt），
+比較的是**同一天盤中對盤中**，不拿昨天的收盤湊數。名次只當輔助小字。
 
 - 資料來源：證交所 MIS 即時行情，一個請求就拿到全部類股指數＋加權＋櫃買（官方、免金鑰）。
-- 轉強：名次往前；相鄰兩張快照都往前＝「持續」，只動一次＝「剛發動」。轉弱同理。
+- 候選：Δ 在全類股前／後 10% 且 |Δ| ≥ 0.20 ppt（兩者同時滿足）。
+- 目前只到 L1（指數層級），卡片標「僅指數層級，未驗證個股」；L2 代表股驗證之後接上。
 - 抓不到即時資料就說沒有，不用昨天的資料頂替。
 - 這條序列只收 MIS 官方類股指數；CMoney 概念族群屬另一套 universe，不得混入（規格全域規則 1）。
 """
 from __future__ import annotations
 
+import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,8 +20,7 @@ import warrant_ai_tools as tools
 import local_market_cache
 
 SNAPSHOT_MINUTES = max(2, tools._env_int("DISCORD_AI_RADAR_SNAPSHOT_MINUTES", 5))
-COMPARE_MINUTES = max(5, tools._env_int("DISCORD_AI_RADAR_COMPARE_MINUTES", 30))
-TOP_N = max(3, tools._env_int("DISCORD_AI_RADAR_TOP", 5))
+_TICK_LOCK = threading.Lock()     # 背景 tick 與查詢時補抓不要同時各存一張
 # 「電子工業」是半導體＋光電＋電腦週邊…等類股的總和，放進排名等於重複計算，也查不到成分股；
 # 「其他」「綜合」則沒有分析意義。
 EXCLUDE_NAMES = {"其他", "其他電子", "綜合", "電子工業"}
@@ -108,6 +110,11 @@ def _load_day(day: str) -> List[Dict[str, Any]]:
 
 def tick(force: bool = False) -> Dict[str, Any]:
     """存一張快照；還沒到間隔時間就跳過。回傳這次的狀態摘要。"""
+    with _TICK_LOCK:
+        return _tick(force)
+
+
+def _tick(force: bool) -> Dict[str, Any]:
     now = _now()
     if not force and not session_open(now):
         return {"saved": False, "reason": "非盤中"}
@@ -214,7 +221,9 @@ def deltas(now=None) -> Dict[str, Any]:
     day = now.strftime("%Y-%m-%d")
     snaps = _load_day(day)
     if not snaps:
-        return {"available": False, "reason": "今天還沒有盤中快照", "phase": phase(now)}
+        reason = ("今天還沒有盤中快照，約 5 分鐘後再問一次。" if session_open(now)
+                  else "現在不是盤中（09:00～13:35），今天也沒有盤中快照可比較。")
+        return {"available": False, "reason": reason, "phase": phase(now)}
     if len(snaps) < 2:   # 只有一張時不自己比自己，免得假裝有「開盤以來 Δ=0」
         return {"available": False, "reason": "已記錄今日第一張快照，等待下一張快照後才能計算變化",
                 "snapshots": len(snaps), "phase": phase(now)}
@@ -284,110 +293,114 @@ def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None) ->
 
 
 def ensure_snapshot() -> Dict[str, Any]:
-    """查詢時順手補一張快照：今天還沒有任何快照就立刻抓一張，其餘照原本的間隔。"""
-    return tick(force=not _load_day(_now().strftime("%Y-%m-%d")))
+    """查詢時順手補一張快照（只在盤中）：今天還沒有任何快照就立刻抓，其餘照原本的間隔。"""
+    now = _now()
+    if not session_open(now):
+        return {"saved": False, "reason": "非盤中"}
+    return tick(force=not _load_day(now.strftime("%Y-%m-%d")))
 
 
 def _rank_map(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {row["name"]: row for row in snapshot.get("rows") or []}
 
 
-def report(top: int = TOP_N) -> Dict[str, Any]:
-    """回傳今日盤中的轉強／轉弱族群（名次移動）。"""
-    now = _now()
-    day = now.strftime("%Y-%m-%d")
-    snaps = _load_day(day)
-    if len(snaps) < 2:
-        if session_open(now):
-            reason = (f"已經記錄今天第 {len(snaps)} 張盤中快照，要有兩張才能比較名次變化；"
-                      f"約 {SNAPSHOT_MINUTES} 分鐘後再問一次就會有結果。")
-        else:
-            reason = "現在不是盤中（09:00～13:35），沒有即時的類股資金流向資料。"
-        return {"available": False, "reason": reason, "snapshots": len(snaps)}
-    latest = snaps[-1]
-    steps = max(1, round(COMPARE_MINUTES / SNAPSHOT_MINUTES))
-    base = snaps[-(steps + 1)] if len(snaps) > steps else snaps[0]
-    first = snaps[0]
-    now_map, base_map, first_map = _rank_map(latest), _rank_map(base), _rank_map(first)
-    previous = _rank_map(snaps[-2])
-    total = max(1, len(latest.get("rows") or []))
-    changes = [float(r.get("change_pct") or 0.0) for r in latest.get("rows") or []]
-    market_median = sorted(changes)[len(changes) // 2] if changes else 0.0
+# ============================================================
+# 意圖判斷：先判斷是不是「雷達」，不是才交給族群名稱解析
+# ============================================================
 
-    rows: List[Dict[str, Any]] = []
-    for name, row in now_map.items():
-        before = base_map.get(name)
-        if not before:
-            continue
-        move = int(before["rank"]) - int(row["rank"])            # 正＝名次往前
-        last_move = int(previous.get(name, {}).get("rank", row["rank"])) - int(row["rank"])
-        open_move = int(first_map.get(name, {}).get("rank", row["rank"])) - int(row["rank"])
+_RADAR_WORD_RE = re.compile(r"轉強|轉弱|資金流向|雷達")
+_RADAR_SCOPE_RE = re.compile(r"族群|類股|產業|資金流向|雷達")
+# 拿掉這些通用字後還有殘字（例如「半導體」「記憶體」），就代表在問特定族群，不是雷達。
+_RADAR_GENERIC_RE = re.compile(
+    r"有哪些|哪幾個|哪一個|哪些|哪個|什麼|有沒有|目前|現在|今天|今日|盤中|正在|開始|"
+    r"族群|類股|產業|轉強|轉弱|資金流向|資金|流向|雷達|比較|列出|一下|看看|看|查|"
+    r"的|是|嗎|呢|了|在|有|誰|和|與|跟|及|、|[?？!！。,，\s]")
+
+
+def detect_intent(text: str) -> Optional[Dict[str, str]]:
+    """「哪些族群正在轉強」→ {direction: up}；「記憶體族群有誰」→ None（交給族群解析）。"""
+    value = str(text or "").strip()
+    if not _RADAR_WORD_RE.search(value) or not _RADAR_SCOPE_RE.search(value):
+        return None
+    if _RADAR_GENERIC_RE.sub("", value):
+        return None
+    up, down = "轉強" in value, "轉弱" in value
+    return {"direction": "up" if up and not down else "down" if down and not up else "both"}
+
+
+# ============================================================
+# L1 輸出（L2 代表股驗證接上前的暫時版：只列指數層級）
+# ============================================================
+
+_MODE_NAMES = {"up": "turning_up", "down": "turning_down"}
+L1_ONLY_NOTE = "僅指數層級，未驗證個股"
+
+
+def _title(direction: str, phase_info: Dict[str, Any]) -> str:
+    word = "轉強" if direction == "up" else "轉弱"
+    stage = phase_info.get("phase")
+    if stage == "opening":
+        return f"族群雷達｜開盤觀察（{word}）"
+    if stage == "early":
+        return f"族群雷達｜初步{word}"
+    return f"族群雷達｜{word}"
+
+
+def _rank_text(row: Dict[str, Any]) -> str:
+    return f"排名 {row['rank_before']} → {row['rank']}" if row.get("rank_before") else f"排名 {row['rank']}"
+
+
+def _log_l1(direction: str, data: Dict[str, Any]) -> None:
+    if not data.get("available"):
+        print(f"📡 sector radar L1｜mode={_MODE_NAMES[direction]}｜unavailable｜{data.get('reason')}", flush=True)
+        return
+    print(f"📡 sector radar L1｜mode={_MODE_NAMES[direction]}｜snapshot={data['time']}｜base={data['base_time']}"
+          f"｜basis_kind={data['basis_kind']}｜actual_delta_minutes={data['actual_delta_minutes']}"
+          f"｜phase={data['phase'].get('phase')}｜groups={data['groups']}｜candidates={len(data['candidates'])}",
+          flush=True)
+
+
+def _panel(direction: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    rows = []
+    for index, row in enumerate(data["candidates"], 1):
         rows.append({
-            "name": name, "rank": int(row["rank"]), "rank_before": int(before["rank"]),
-            "move": move, "last_move": last_move, "open_move": open_move,
-            "change_pct": float(row.get("change_pct") or 0.0),
-            "total_groups": total,
-            "continuous": (move > 0 and last_move > 0) or (move < 0 and last_move < 0),
-        })
-
-    strong = [r for r in rows if r["move"] > 0 and r["change_pct"] > market_median]
-    weak = [r for r in rows if r["move"] < 0 and r["change_pct"] < market_median]
-    strong.sort(key=lambda r: (-r["move"], -r["change_pct"]))
-    weak.sort(key=lambda r: (r["move"], r["change_pct"]))
-    return {
-        "available": True, "time": latest.get("time", ""), "base_time": base.get("time", ""),
-        "open_time": first.get("time", ""), "groups": total,
-        "market_median": round(market_median, 2),
-        "strong": strong[:top], "weak": weak[:top],
-        "snapshots": len(snaps),
-    }
-
-
-def _panel_rows(rows: List[Dict[str, Any]], rising: bool) -> List[Dict[str, Any]]:
-    out = []
-    for index, row in enumerate(rows, 1):
-        arrow = "↑" if row["move"] > 0 else "↓"
-        tag = "持續" if row.get("continuous") else "剛發動"
-        out.append({
             "rank": index, "stock_code": "", "stock_name": row["name"], "market": "",
             "row_kind": "sector_group", "pattern_score": None,
             "change_pct": row["change_pct"],
-            "coverage_text": f"第{row['rank_before']}名 → 第{row['rank']}名",
-            "ratio_text": f"{arrow}{abs(row['move'])} 名・{tag}",
-            "leader_text": f"開盤以來 {'↑' if row['open_move'] > 0 else '↓'}{abs(row['open_move'])} 名"
-                           if row.get("open_move") else "",
+            "coverage_text": f"{data['basis_label']} {row['delta_ppt']:+.2f} ppt",
+            "ratio_text": _rank_text(row),
+            "leader_text": "",
         })
-    return out
+    note = L1_ONLY_NOTE
+    if data["phase"].get("phase") == "opening":
+        note = "開盤初期波動大，僅先列入觀察｜" + L1_ONLY_NOTE
+    return {"sector": {
+        "name": _title(direction, data["phase"]), "mode": "market_momentum", "comparison_date": "",
+        "rows": rows[:3], "others": rows[3:5],
+        "coverage_note": "", "liquidity_note": note,
+        "live_time": str(data.get("time", "")),
+    }}
 
 
-def panels(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """做成和族群排行一樣的卡片（轉強一張、轉弱一張），圖上不寫資料來源與方法。"""
-    result = []
-    for rows, title, rising in ((data.get("strong") or [], "族群資金流向｜轉強", True),
-                                (data.get("weak") or [], "族群資金流向｜轉弱", False)):
-        if not rows:
+def answer(direction: str = "both", now=None) -> Dict[str, Any]:
+    """Discord 入口：回 {text, panels}。direction：up / down / both。"""
+    ensure_snapshot()
+    modes = ["up", "down"] if direction == "both" else [direction]
+    lines: List[str] = []
+    panel_list: List[Dict[str, Any]] = []
+    for mode in modes:
+        data = candidates(mode, now=now)
+        _log_l1(mode, data)
+        if not data.get("available"):
+            return {"text": str(data.get("reason") or "目前沒有可用的族群雷達資料。"), "panels": []}
+        title = _title(mode, data["phase"])
+        lines.append(f"**{title}｜{data['time']}（{data['basis_label']}，基準 {data['base_time']}）**")
+        if not data["candidates"]:
+            lines.append(data["reason"])
             continue
-        panel_rows = _panel_rows(rows, rising)
-        result.append({"sector": {
-            "name": title, "mode": "market_momentum", "comparison_date": "",
-            "rows": panel_rows[:3], "others": panel_rows[3:5],
-            "coverage_note": "", "liquidity_note": f"與 {data.get('base_time', '')} 相比的名次變化",
-            "live_time": str(data.get("time", "")),
-        }})
-    return result
-
-
-def format_report(data: Dict[str, Any]) -> str:
-    if not data.get("available"):
-        return str(data.get("reason") or "目前沒有可用的族群資金流向資料。")
-    lines = [f"**族群資金流向｜{data.get('time', '')}（與 {data.get('base_time', '')} 相比）**"]
-    for label, key in (("轉強", "strong"), ("轉弱", "weak")):
-        rows = data.get(key) or []
-        lines.append(f"【{label}】" + ("" if rows else "無明顯變化"))
-        for index, row in enumerate(rows, 1):
-            arrow = "↑" if row["move"] > 0 else "↓"
-            tag = "持續" if row.get("continuous") else "剛發動"
-            lines.append(f"{index}. {row['name']}｜第{row['rank_before']}名 → 第{row['rank']}名"
-                         f"（{arrow}{abs(row['move'])}・{tag}）｜族群漲幅 {row['change_pct']:+.2f}%")
-    lines.append("※ 盤中名次會持續變動，僅供當下觀察，不代表未來表現。")
-    return "\n".join(lines)
+        for index, row in enumerate(data["candidates"], 1):
+            lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜"
+                         f"{data['basis_label']} {row['delta_ppt']:+.2f} ppt｜{_rank_text(row)}")
+        panel_list.append(_panel(mode, data))
+    lines.append(f"※ {L1_ONLY_NOTE}；盤中變化快，僅供當下觀察，不代表未來表現。")
+    return {"text": "\n".join(lines), "panels": panel_list}

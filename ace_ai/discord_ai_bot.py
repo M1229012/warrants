@@ -2436,6 +2436,11 @@ class AceQueryEngine:
     def _answer_general(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
                         started: float, compact: str) -> AnswerResult:
         """一般問答：解析 → 追問記憶 → 快取 → 排隊 → 計算。"""
+        # 先判斷是不是族群雷達（「哪些族群正在轉強」），不是才解析族群名稱，
+        # 否則「正在轉強」會被當成族群名稱去查。
+        radar = sector_radar.detect_intent(compact)
+        if radar:
+            return self._answer_radar(radar["direction"], started, route="rule_radar")
         try:
             parsed = self.parser.parse(question)
         except tools.ToolDataError as exc:
@@ -2563,6 +2568,14 @@ class AceQueryEngine:
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
 
+    def _answer_radar(self, direction: str, started: float, route: str) -> AnswerResult:
+        """族群雷達（新 L1：Δ30m＋分位數門檻）；/ace 與 /ask 共用。"""
+        result = sector_radar.answer(direction)
+        panels = result.get("panels") or []
+        return AnswerResult(text=result["text"], route=route, gemini_calls=0,
+                            elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
+                            as_text=not panels)
+
     def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
         return self._admin_command(question, started, context_key)
@@ -2607,13 +2620,9 @@ class AceQueryEngine:
                     f"平均耗時 {info['avg_elapsed']}s｜最慢 {info['slowest']}s｜尖峰 {info.get('busiest_hour') or '-'}")
             return AnswerResult(text=text, route="admin_usage", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
-        if compact in ("族群資金流向", "資金流向", "轉強族群", "族群轉強", "轉弱族群", "族群雷達", "哪個族群在轉強", "哪些族群在轉強"):
-            sector_radar.ensure_snapshot()
-            data = sector_radar.report()
-            panels = sector_radar.panels(data) if data.get("available") else []
-            return AnswerResult(text=sector_radar.format_report(data), route="admin_radar", gemini_calls=0,
-                                elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
-                                as_text=not panels)
+        radar = sector_radar.detect_intent(compact)
+        if radar:
+            return self._answer_radar(radar["direction"], started, route="admin_radar")
         if compact in ("更新族群名冊", "重建族群名冊", "更新名冊"):
             def job() -> None:
                 try:
@@ -3280,7 +3289,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `系統狀態`：名冊、日K底庫、型態分數、是否永久保存
 • `更新市場底庫`：補齊全市場日K（每個交易日 2 個請求）
 • `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
-• `族群資金流向`：盤中轉強／轉弱族群名次變化
+• `族群雷達`／`轉強族群`／`轉弱族群`：盤中類股指數近 30 分鐘變化（Δ ppt），/ask 也可問「哪些族群正在轉強」
 • `用量`：今日 Gemini 與各 API 使用量
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
