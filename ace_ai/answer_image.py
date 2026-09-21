@@ -1499,8 +1499,13 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     technical = mode.endswith('technical')
     rows = data.get('rows') or []
     h = 34
-    title = f"{data.get('name', '')}｜{'型態排行' if technical else '漲幅排行'}"
-    if data.get('live_time') and not technical:
+    # 族群雷達會自帶 title_suffix（空字串＝不加後綴）與 stamp_text（收盤後不可寫「收盤前會變動」）
+    suffix = data['title_suffix'] if 'title_suffix' in data else ('型態排行' if technical else '漲幅排行')
+    title = f"{data.get('name', '')}｜{suffix}" if suffix else str(data.get('name', ''))
+    if data.get('stamp_text'):
+        stamp = str(data['stamp_text'])
+        stamp_bg, stamp_ink = (WARN_BG, WARN_INK) if data.get('stamp_live') else (TILE_BG, MUTED)
+    elif data.get('live_time') and not technical:
         stamp = f"盤中 {data['live_time']}｜收盤前會變動"
         stamp_bg, stamp_ink = WARN_BG, WARN_INK
     else:
@@ -1897,6 +1902,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     elif sector_panels:
         live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
         footer = '股市艾斯  /  盤中漲幅為暫定值，收盤前會變動' if live else '股市艾斯  /  族群排行依日 K 收盤資料計算'
+        custom = next(((p.get('sector') or {}).get('footer_text') for p in sector_panels
+                       if (p.get('sector') or {}).get('footer_text')), '')
+        footer = custom or footer
     elif contribution_panels:
         live = any(str((p.get('contribution') or {}).get('basis') or '').startswith('盤中') for p in contribution_panels)
         footer = ('股市艾斯  /  指數貢獻為盤中估算，收盤前會變動' if live

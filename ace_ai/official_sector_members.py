@@ -36,7 +36,11 @@ SECTOR_MAP: Dict[str, Optional[tuple]] = {
     "t24": ("24", ("半導體",)), "t25": ("25", ("電腦及週邊設備", "電腦週邊")),
     "t26": ("26", ("光電",)), "t27": ("27", ("通信網路",)), "t28": ("28", ("電子零組件",)),
     "t29": ("29", ("電子通路",)), "t30": ("30", ("資訊服務",)), "t31": None,   # 其他電子
+    "t35": ("35", ("綠能環保",)), "t36": ("36", ("數位雲端",)),
+    "t37": ("37", ("運動休閒",)), "t38": ("38", ("居家生活",)),
 }
+# 總和型／無分析意義：雷達 L1 直接依 sector_id 排除
+AGGREGATE_IDS = frozenset(k for k, v in SECTOR_MAP.items() if v is None)
 # sector_match 沒收錄的產業名稱在這裡補（FinMind industry_category 的寫法）
 _EXTRA_INDUSTRY_NAMES = {"18": ("貿易百貨", "貿易百貨業")}
 

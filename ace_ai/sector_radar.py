@@ -18,17 +18,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import warrant_ai_tools as tools
 import local_market_cache
+from official_sector_members import AGGREGATE_IDS
 
 SNAPSHOT_MINUTES = max(2, tools._env_int("DISCORD_AI_RADAR_SNAPSHOT_MINUTES", 5))
 _TICK_LOCK = threading.Lock()     # 背景 tick 與查詢時補抓不要同時各存一張
-# 「電子工業」是半導體＋光電＋電腦週邊…等類股的總和，放進排名等於重複計算，也查不到成分股；
-# 「其他」「綜合」則沒有分析意義。
-EXCLUDE_NAMES = {"其他", "其他電子", "綜合", "電子工業"}
+# 總和型（電子工業、化學生技醫療）會和子類股重複計算，「其他」「綜合」沒有分析意義。
+# 主要依 sector_id（AGGREGATE_IDS）排除；名稱只給沒有 sector_id 的舊快照用。
+EXCLUDE_NAMES = {"其他", "其他電子", "綜合", "電子工業", "電子", "化學生技醫療"}
 # 證交所 MIS 即時行情：一個請求就能拿到全部類股指數＋加權＋櫃買，官方來源、免金鑰。
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 MIS_HEADERS = {"User-Agent": "Mozilla/5.0 AceAI/1.0", "Accept": "application/json",
                "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
-MIS_CHANNELS = ["tse_t%02d.tw" % i for i in range(1, 32)]
+# t35～t38＝綠能環保／數位雲端／運動休閒／居家生活；MIS 沒有的 channel 只會不回傳，不影響其他類股。
+MIS_CHANNELS = ["tse_t%02d.tw" % i for i in range(1, 39)]
 MIS_BENCHMARKS = {"t00.tw": "加權指數", "o00.tw": "櫃買指數"}
 MIS_TIMEOUT = max(3.0, tools._env_float("DISCORD_AI_RADAR_TIMEOUT", 8.0))
 _STATE_PREFIX = "radar_snap:"
@@ -73,7 +75,7 @@ def fetch_sector_quotes() -> Dict[str, Any]:
         if channel in MIS_BENCHMARKS:
             benchmarks[MIS_BENCHMARKS[channel]] = pct
             continue
-        if label in EXCLUDE_NAMES:
+        if label in EXCLUDE_NAMES or channel.split(".")[0] in AGGREGATE_IDS:
             continue
         # sector_id＝MIS channel（如 t24），給 OfficialSectorMemberResolver 對照成員用，不靠名稱
         rows.append({"sector_id": channel.split(".")[0], "name": label, "change_pct": pct})
@@ -236,7 +238,7 @@ def deltas(now=None) -> Dict[str, Any]:
     actual_minutes = latest_minutes - base_minutes if base_minutes is not None else None
     base_map = _rank_map(base or {})
     rows: List[Dict[str, Any]] = []
-    for row in latest.get("rows") or []:
+    for row in _rank_map(latest).values():
         name = row.get("name")
         before = base_map.get(name) or {}
         change = float(row.get("change_pct") or 0.0)
@@ -265,9 +267,10 @@ def deltas(now=None) -> Dict[str, Any]:
     }
 
 
-def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None) -> Dict[str, Any]:
-    """轉強／轉弱候選：Δ 分位數 ＋ 最低絕對變化量，兩者同時滿足。"""
-    data = deltas(now)
+def candidates(direction: str = "up", limit: int = CANDIDATE_LIMIT, now=None,
+               data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """轉強／轉弱候選：Δ 分位數 ＋ 最低絕對變化量，兩者同時滿足。data＝已算好的 deltas()，可省一次讀取。"""
+    data = data if data is not None else deltas(now)
     if not data.get("available"):
         return {"available": False, "reason": data.get("reason"), "phase": data.get("phase")}
     rows = list(data["rows"])
@@ -301,7 +304,13 @@ def ensure_snapshot() -> Dict[str, Any]:
 
 
 def _rank_map(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    return {row["name"]: row for row in snapshot.get("rows") or []}
+    """排除總和型指數後依漲幅重新排名（舊快照可能還存著化學生技醫療，名次要重算才不會錯位）。"""
+    kept = [dict(row) for row in snapshot.get("rows") or []
+            if row.get("name") not in EXCLUDE_NAMES and row.get("sector_id") not in AGGREGATE_IDS]
+    kept.sort(key=lambda r: -float(r.get("change_pct") or 0.0))
+    for index, row in enumerate(kept, 1):
+        row["rank"] = index
+    return {row["name"]: row for row in kept}
 
 
 # ============================================================
@@ -332,75 +341,107 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
 # L1 輸出（L2 代表股驗證接上前的暫時版：只列指數層級）
 # ============================================================
 
-_MODE_NAMES = {"up": "turning_up", "down": "turning_down"}
+_MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down"}
 L1_ONLY_NOTE = "僅指數層級，未驗證個股"
+STRONG_TOP = 3
 
 
-def _title(direction: str, phase_info: Dict[str, Any]) -> str:
-    word = "轉強" if direction == "up" else "轉弱"
-    stage = phase_info.get("phase")
+def _title(section: str, data: Dict[str, Any]) -> str:
+    """最強＝依目前漲幅；轉強／轉弱＝依 Δ（不是漲幅排行，標題要講清楚）。"""
+    if section == "strong":
+        return "族群雷達｜目前最強 TOP3"
+    word = "轉強" if section == "up" else "轉弱"
+    stage = data["phase"].get("phase")
     if stage == "opening":
-        return f"族群雷達｜開盤觀察（{word}）"
+        return f"族群雷達｜開盤觀察・{data['basis_label']}{word}"
     if stage == "early":
-        return f"族群雷達｜初步{word}"
-    return f"族群雷達｜{word}"
+        return f"族群雷達｜初步{word}・{data['basis_label']}"
+    return f"族群雷達｜{data['basis_label']}{word} TOP3"
+
+
+def _stamp(data: Dict[str, Any]) -> Tuple[str, bool]:
+    """右上角：盤中寫「收盤前會變動」；收盤後改寫「收盤｜最後快照」。"""
+    if data["phase"].get("phase") == "closed":
+        return f"收盤｜最後快照 {data['time']}", False
+    return f"盤中 {data['time']}｜收盤前會變動", True
 
 
 def _rank_text(row: Dict[str, Any]) -> str:
     return f"排名 {row['rank_before']} → {row['rank']}" if row.get("rank_before") else f"排名 {row['rank']}"
 
 
-def _log_l1(direction: str, data: Dict[str, Any]) -> None:
+def _delta_text(row: Dict[str, Any], data: Dict[str, Any]) -> str:
+    return f"{data['basis_label']} {row['delta_ppt']:+.2f} ppt"
+
+
+def _log_l1(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]]) -> None:
     if not data.get("available"):
-        print(f"📡 sector radar L1｜mode={_MODE_NAMES[direction]}｜unavailable｜{data.get('reason')}", flush=True)
+        print(f"📡 sector radar L1｜mode={_MODE_NAMES[section]}｜unavailable｜{data.get('reason')}", flush=True)
         return
-    print(f"📡 sector radar L1｜mode={_MODE_NAMES[direction]}｜snapshot={data['time']}｜base={data['base_time']}"
+    print(f"📡 sector radar L1｜mode={_MODE_NAMES[section]}｜snapshot={data['time']}｜base={data['base_time']}"
           f"｜basis_kind={data['basis_kind']}｜actual_delta_minutes={data['actual_delta_minutes']}"
-          f"｜phase={data['phase'].get('phase')}｜groups={data['groups']}｜candidates={len(data['candidates'])}",
-          flush=True)
+          f"｜phase={data['phase'].get('phase')}｜groups={data['groups']}｜candidates={len(rows)}", flush=True)
+    for row in rows:   # 逐筆印出基準與現在漲幅，方便對照證交所歷史快照驗算
+        print(f"   {row['name']}｜{data['base_time']} {row['base_change_pct']:+.2f}% → "
+              f"{data['time']} {row['change_pct']:+.2f}%｜Δ {row['delta_ppt']:+.2f} ppt｜{_rank_text(row)}",
+              flush=True)
 
 
-def _panel(direction: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    rows = []
-    for index, row in enumerate(data["candidates"], 1):
-        rows.append({
+def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    items = []
+    for index, row in enumerate(rows, 1):
+        items.append({
             "rank": index, "stock_code": "", "stock_name": row["name"], "market": "",
             "row_kind": "sector_group", "pattern_score": None,
             "change_pct": row["change_pct"],
-            "coverage_text": f"{data['basis_label']} {row['delta_ppt']:+.2f} ppt",
-            "ratio_text": _rank_text(row),
+            "coverage_text": _delta_text(row, data),
+            # 最強卡本來就依漲幅排，名次移動只在轉強／轉弱卡當輔助
+            "ratio_text": "" if section == "strong" else _rank_text(row),
             "leader_text": "",
         })
     note = L1_ONLY_NOTE
-    if data["phase"].get("phase") == "opening":
+    if section != "strong" and data["phase"].get("phase") == "opening":
         note = "開盤初期波動大，僅先列入觀察｜" + L1_ONLY_NOTE
+    stamp, live = _stamp(data)
     return {"sector": {
-        "name": _title(direction, data["phase"]), "mode": "market_momentum", "comparison_date": "",
-        "rows": rows[:3], "others": rows[3:5],
+        "name": _title(section, data), "mode": "market_momentum", "comparison_date": "",
+        "title_suffix": "",                 # 不加「漲幅排行」：轉強／轉弱卡是依 Δ 排序
+        "stamp_text": stamp, "stamp_live": live,
+        "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動" if live
+                        else "股市艾斯  /  類股指數為當日最後一張盤中快照"),
+        "rows": items[:3], "others": items[3:5],
         "coverage_note": "", "liquidity_note": note,
         "live_time": str(data.get("time", "")),
     }}
 
 
 def answer(direction: str = "both", now=None) -> Dict[str, Any]:
-    """Discord 入口：回 {text, panels}。direction：up / down / both。"""
+    """Discord 入口：回 {text, panels}。
+
+    畫面固定三區：目前最強 TOP3（依漲幅）→ 轉強 TOP3（依 Δ）→ 轉弱 TOP3（依 Δ），
+    一張圖同時回答「誰最強／誰正在變強／誰正在變弱」。direction 目前只保留介面。
+    """
     ensure_snapshot()
-    modes = ["up", "down"] if direction == "both" else [direction]
-    lines: List[str] = []
+    data = deltas(now)
+    if not data.get("available"):
+        _log_l1("strong", data, [])
+        return {"text": str(data.get("reason") or "目前沒有可用的族群雷達資料。"), "panels": []}
+    sections = [("strong", sorted(data["rows"], key=lambda r: -r["change_pct"])[:STRONG_TOP], "")]
+    for mode in ("up", "down"):
+        picked = candidates(mode, data=data)
+        sections.append((mode, picked["candidates"], picked["reason"]))
+    stamp, _ = _stamp(data)
+    lines = [f"**族群雷達｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
     panel_list: List[Dict[str, Any]] = []
-    for mode in modes:
-        data = candidates(mode, now=now)
-        _log_l1(mode, data)
-        if not data.get("available"):
-            return {"text": str(data.get("reason") or "目前沒有可用的族群雷達資料。"), "panels": []}
-        title = _title(mode, data["phase"])
-        lines.append(f"**{title}｜{data['time']}（{data['basis_label']}，基準 {data['base_time']}）**")
-        if not data["candidates"]:
-            lines.append(data["reason"])
+    for section, rows, reason in sections:
+        _log_l1(section, data, rows)
+        lines.append(f"【{_title(section, data).split('｜', 1)[1]}】")
+        if not rows:
+            lines.append(reason or "目前沒有符合的族群")
             continue
-        for index, row in enumerate(data["candidates"], 1):
-            lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜"
-                         f"{data['basis_label']} {row['delta_ppt']:+.2f} ppt｜{_rank_text(row)}")
-        panel_list.append(_panel(mode, data))
+        for index, row in enumerate(rows, 1):
+            tail = "" if section == "strong" else f"｜{_rank_text(row)}"
+            lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜{_delta_text(row, data)}{tail}")
+        panel_list.append(_panel(section, data, rows))
     lines.append(f"※ {L1_ONLY_NOTE}；盤中變化快，僅供當下觀察，不代表未來表現。")
     return {"text": "\n".join(lines), "panels": panel_list}
