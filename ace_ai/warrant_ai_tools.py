@@ -1315,6 +1315,10 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame, market: str = "") ->
     now = taipei_now()
     if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
         return stock_df, {}
+    if current_api_priority() == "background":
+        # 背景掃描（型態分數、底庫維護）一律只用已收盤 K 棒，
+        # 否則全市場逐檔抓即時報價會把每分鐘額度吃光，使用者問的那一檔反而拿不到。
+        return stock_df, {}
     last_date = pd.Timestamp(stock_df.index.max()).normalize()
     if last_date >= pd.Timestamp(now.date()):
         return stock_df, {}
@@ -1590,7 +1594,10 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         return {"df": df, "closed_df": closed, "market": market, "intraday": intraday, "daily_source": daily_source}
 
     ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
-    return _cached(f"price_{code}", ttl, build)
+    # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
+    # 拿到背景剛寫進去、沒有即時價的版本。
+    prefix = "price_closed_" if current_api_priority() == "background" else "price_"
+    return _cached(f"{prefix}{code}", ttl, build)
 
 
 def closed_frame(bundle: Dict[str, Any]) -> pd.DataFrame:

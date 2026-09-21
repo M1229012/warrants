@@ -128,9 +128,11 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
             if time.monotonic() - started > budget_seconds:
                 break
             try:
-                tech = tools.get_technical_analysis(code)
-                vp = tools.get_volume_profile(code)
-                extras = weekly_pick._technical_extras(code)
+                # 背景優先權：不搶使用者的即時行情額度，也不接盤中報價（分數只用收盤 K 棒）。
+                with tools.api_priority("background"):
+                    tech = tools.get_technical_analysis(code)
+                    vp = tools.get_volume_profile(code)
+                    extras = weekly_pick._technical_extras(code)
                 score = weekly_pick.score_pattern(tech, vp, extras, weekly_pick.WeeklyPickConfig())
                 if not math.isfinite(float(score["score"])):
                     raise ValueError("score not finite")
