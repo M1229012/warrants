@@ -1330,10 +1330,13 @@ def _rank_card_items(row: dict, technical: bool) -> list[tuple[str, str, str, st
         items += [('留意', WARN_BG, WARN_INK, t) for t in minus]
     if row.get('observation'):
         items.append(('解讀', ACCENT_BG, INK, str(row['observation'])))
-    if row.get('leaders_text'):   # 族群雷達：族群內領漲／領跌個股（台股慣例：漲紅跌綠）
-        label = str(row.get('leaders_label') or '領漲')
-        bg, ink = (GOOD_BG, GOOD_INK) if label == '領跌' else ('#FDECEC', '#C24141')
-        items.append((label, bg, ink, str(row['leaders_text'])))
+    # 族群雷達：擴散／領漲／領跌／判讀列；tone 決定標籤顏色（台股慣例：漲紅跌綠）
+    tones = {'up': ('#FDECEC', '#C24141'), 'down': (GOOD_BG, GOOD_INK),
+             'accent': (ACCENT_BG, ACCENT), 'neutral': ('white', MUTED)}
+    for label, tone, text in row.get('extra_labels') or []:
+        if text:
+            bg, ink = tones.get(tone, tones['neutral'])
+            items.append((str(label), bg, ink, str(text)))
     return items
 
 
@@ -1442,7 +1445,9 @@ def _draw_card_labels(draw, ix: float, ry: float, label_w: int, lines: list, fir
         ry += max(1, len(ls)) * SECTOR_REASON_LINE + 10
 
 
-def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], technical: bool, dry: bool) -> int:
+def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], technical: bool, dry: bool,
+                      column_heads=None) -> int:
+    """column_heads＝族群列右側兩欄的表頭（族群雷達「集中型異動」用），沒給就用原本的表頭。"""
     height = TABLE_HEAD_H + len(rows) * SECTOR_OTHER_ROW_H
     if dry:
         return height
@@ -1450,7 +1455,8 @@ def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], 
     group_rows = any(str(r.get('row_kind') or '') == 'sector_group' for r in rows)
     heads = (('名次', x + 16, 'lm'), ('族群' if group_rows else '個股', x + 96, 'lm'))
     if group_rows:
-        heads += ((('中位型態' if technical else '中位漲幅'), x + width - 330, 'rm'), ('納入檔數', x + width - 16, 'rm'))
+        col3, col4 = column_heads or (('中位型態' if technical else '中位漲幅'), '納入檔數')
+        heads += ((col3, x + width - 330, 'rm'), (col4, x + width - 16, 'rm'))
     elif technical:
         heads += (('型態分數', x + 470, 'lm'), ('分級', x + width - 330, 'lm'), ('漲跌', x + width - 16, 'rm'))
     else:
@@ -1473,7 +1479,8 @@ def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], 
             value = f'{median:.1f}' if median is not None else change_text
             draw.text((x + width - 330, mid), value, font=font(21, True),
                       fill=INK if median is not None else change_color, anchor='rm')
-            draw.text((x + width - 16, mid), str(row.get('coverage_text') or '—'), font=font(20), fill=MUTED, anchor='rm')
+            cover, cover_size = fit(str(row.get('coverage_text') or '—'), 20, 300, False)   # 不可壓到左側漲幅欄
+            draw.text((x + width - 16, mid), cover, font=font(cover_size), fill=MUTED, anchor='rm')
             draw.line((x, ry + SECTOR_OTHER_ROW_H, x + width, ry + SECTOR_OTHER_ROW_H), fill=LINE)
             ry += SECTOR_OTHER_ROW_H
             continue
@@ -1541,8 +1548,9 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     others = data.get('others') or []
     if others:
         h += 10
-        h += _sub_heading(draw, px, y + h, '其他排名', '', width, dry)
-        h += _other_rows_table(draw, px, y + h, width, others, technical, dry) + 18
+        h += _sub_heading(draw, px, y + h, str(data.get('others_title') or '其他排名'), '', width, dry)
+        h += _other_rows_table(draw, px, y + h, width, others, technical, dry,
+                               column_heads=data.get('others_heads')) + 18
     h += 22
     return int(h)
 

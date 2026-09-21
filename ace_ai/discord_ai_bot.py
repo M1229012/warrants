@@ -2149,6 +2149,7 @@ class AnswerResult:
     total_tokens: int = 0
     token_source: str = "none"
     api_usage: Dict[str, Any] = field(default_factory=dict)
+    image_title: str = ""          # 圖片頁首標題；空字串＝沿用使用者問句（族群雷達固定寫「族群雷達」）
 
 
 # ============================================================
@@ -2574,7 +2575,7 @@ class AceQueryEngine:
         panels = result.get("panels") or []
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
-                            as_text=not panels)
+                            as_text=not panels, image_title="族群雷達")
 
     def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
@@ -3629,6 +3630,7 @@ def run_discord_bot(config: BotConfig) -> None:
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
             result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode)
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
             if result.as_text:
                 await interaction_text(interaction, with_context_note(result), ephemeral=config.ephemeral)
@@ -3703,6 +3705,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
                 result = await asyncio.to_thread(engine.answer, question, context_key, None, _is_guild_admin(message.author))
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
+            image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
             await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
