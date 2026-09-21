@@ -583,7 +583,9 @@ _TOOL_FAILURE_MESSAGES = {
     "get_technical_analysis": "目前股價／技術指標資料取得失敗",
     "get_volume_profile": "目前大量區資料取得失敗",
     "get_futures_positions": "台指期未平倉資料取得失敗",
+    "get_index_contribution": "指數貢獻點數：加權與櫃買各自的拉升 TOP5 與拖累 TOP5（權重 × 漲跌，非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
+    "get_index_contribution": "指數貢獻點數計算失敗",
     "get_warrant_branch": "目前權證分點資料取得失敗",
     "get_high_winrate_branches_buying": "目前高勝率分點資料取得失敗",
     "get_branch_performance": "歷史分點統計目前無法取得",
@@ -4635,6 +4637,12 @@ def get_market_breadth() -> Dict[str, Any]:
     return result
 
 
+def get_index_contribution(top: int = 5) -> Dict[str, Any]:
+    """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。"""
+    import index_contribution
+    return index_contribution.report(top=max(3, int(top or 5)))
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -4646,6 +4654,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_volume_profile": get_volume_profile,
     "get_futures_positions": get_futures_positions,
     "get_market_breadth": get_market_breadth,
+    "get_index_contribution": get_index_contribution,
     "get_warrant_branch": get_warrant_branch,
     "get_high_winrate_branches_buying": get_high_winrate_branches_buying,
     "get_branch_performance": get_branch_performance,

@@ -500,6 +500,7 @@ class QueryRouter:
         if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
             # 盤面廣度：指數漲跌 vs 多數個股，不需要任何個股資料。
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
+            plan.add("get_index_contribution")
             plan.add("get_market_breadth")
             if "futures" in parsed.intents:
                 plan.add("get_futures_positions")
@@ -1105,7 +1106,7 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
     return _prune_empty({"question": question, "tool_results": tool_results})
 
 
-FINAL_BREADTH_RULES = ("【盤面結構】先用一句話回答「是不是只有權值股在動」，依據是 heavyweight_median_pct（權值股中位漲跌）與 others_change_pct（對照組，盤中是櫃買指數、收盤後是其餘個股中位數）的差距；沒有 heavyweight_median_pct 時就用加權與櫃買的差距說明，並講明是用櫃買代表中小型股。接著補充上漲比率與最強／最弱類股。類股指數本身是市值加權，不要拿它當「一般個股」的代表。盤中是暫定值，要說明收盤前會變動；不預測指數點位，也不給買賣建議。")
+FINAL_BREADTH_RULES = ("【盤面結構】回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再分別列加權與櫃買的拉升 TOP5、拖累 TOP5；每檔優先引用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
 
 
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
@@ -1602,6 +1603,34 @@ def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
                        "live_time": str(data.get("time") or "")}}
 
 
+def format_index_contribution(data: Dict[str, Any]) -> str:
+    lines = [f"**指數貢獻點數｜{data.get('basis', '')}**"]
+    if data.get("structure_summary"):
+        lines.append(str(data["structure_summary"]))
+    for market in data.get("markets") or []:
+        points = market.get("index_points")
+        head = f"{market.get('index_name', '')}"
+        if points is not None:
+            head += f" {points:+.2f} 點"
+        coverage = market.get("market_cap_coverage_pct")
+        if coverage is not None and str(market.get("basis") or "").startswith("盤中"):
+            head += f"｜市值涵蓋 {coverage:.1f}%"
+        lines.append(f"**{head}**")
+        pos_share = market.get("top5_positive_share_pct")
+        if pos_share is not None:
+            lines.append(f"拉升集中度：TOP5 占已涵蓋正貢獻 {pos_share:.1f}%｜{market.get('concentration', '')}")
+        for label, key in (("拉升", "top"), ("拖累", "bottom")):
+            items = list(market.get(key) or [])
+            if items:
+                lines.append(label + "：" + "、".join(
+                    f"{x['stock_name']}({x['stock_code']}) {x['points']:+.2f}點 / 權重{x.get('weight_pct', 0):.2f}% / {x.get('change_pct', 0):+.2f}%"
+                    for x in items[:5]))
+            else:
+                lines.append(label + "：目前沒有可列出的成分股")
+    lines.append("※ 盤中為官方即時報價估算；收盤後才用全市場日K完整計算。")
+    return chr(10).join(lines)
+
+
 def format_market_breadth(data: Dict[str, Any]) -> str:
     """AI 失敗時的規則式輸出；欄位與工具回傳一致。"""
     stamp = f" {data.get('time')}" if data.get("time") else ""
@@ -1819,6 +1848,7 @@ FORMATTERS = {
     "get_technical_analysis": format_technical,
     "get_futures_positions": format_futures,
     "get_market_breadth": format_market_breadth,
+    "get_index_contribution": format_index_contribution,
     "get_volume_profile": format_volume_profile,
     "get_warrant_branch": format_warrant,
     "get_high_winrate_branches_buying": format_high_winrate,
@@ -2134,7 +2164,7 @@ _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
 
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
 # 「是不是只有權值股在動」這類盤面結構問題。
-_BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
+_BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓大盤|加.{0,4}點|扣.{0,4}點|拉升|拖累|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
@@ -2983,8 +3013,13 @@ class AceQueryEngine:
                 if card:
                     panel["scorecard"] = card
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+        contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
+        for market in (contribution or {}).get("markets") or []:
+            panels.append({"contribution": market})
         breadth = next((r.data for r in results if r.name == "get_market_breadth" and r.ok), None)
-        if breadth and (breadth.get("strongest") or breadth.get("weakest")):
+        # 問「誰在拉／拖累指數」時，貢獻點數卡片已直接回答問題；
+        # breadth 仍提供給 AI 做市場廣度補充，但不要再塞一張「權值股漲跌幅排行」混淆主題。
+        if breadth and not contribution and (breadth.get("strongest") or breadth.get("weakest")):
             panels.append(_breadth_panel(breadth))
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started

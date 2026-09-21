@@ -1672,6 +1672,106 @@ def article_card(draw, y: float, data: dict, dry: bool) -> int:
     return int(h)
 
 
+CONTRIB_ROW_H = 46
+CONTRIB_HEAD_H = 40
+
+
+def _is_contribution_panel(panel: dict) -> bool:
+    return isinstance(panel, dict) and isinstance(panel.get('contribution'), dict)
+
+
+def _contrib_rows(items: list, positive: bool) -> list[dict]:
+    rows = []
+    for item in items or []:
+        points = _finite(item.get('points'))
+        if points is None or (positive and points <= 0) or (not positive and points >= 0):
+            continue
+        rows.append(item)
+    return rows
+
+
+def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
+    """單一市場指數貢獻：拉升 TOP5／拖累 TOP5，直接顯示漲跌、權重與貢獻點數。"""
+    top = _contrib_rows(data.get('top'), True)[:5]
+    bottom = _contrib_rows(data.get('bottom'), False)[:5]
+    lines = max(len(top), len(bottom), 1)
+    summary_h = 48
+    height = int(96 + summary_h + CONTRIB_HEAD_H + lines * CONTRIB_ROW_H + 28)
+    if dry:
+        return height
+
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    draw.rounded_rectangle((x0, y, x1, y + height), radius=20, fill='white', outline=LINE)
+    ix, right = x0 + 36, x1 - 36
+    draw.rectangle((ix, y + 30, ix + 5, y + 58), fill=ACCENT)
+
+    points = _finite(data.get('index_points'))
+    title = f"{data.get('index_name', '')}"
+    text_at(draw, (ix + 16, y + 26), title, 26, INK, True)
+    if points is not None:
+        color = UP if points > 0 else DOWN if points < 0 else MUTED
+        tx = ix + 16 + font(26, True).getlength(title) + 14
+        draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
+
+    note = str(data.get('basis') or '')
+    coverage = _finite(data.get('market_cap_coverage_pct'))
+    if coverage is not None and str(data.get('basis') or '').startswith('盤中'):
+        note += f"｜市值涵蓋 {coverage:.1f}%"
+    draw.text((right, y + 44), note, font=font(19), fill=MUTED, anchor='rm')
+
+    # 集中度摘要：真正回答「是不是只靠少數權值股拉指數」。
+    sy = y + 78
+    draw.rounded_rectangle((ix, sy, right, sy + summary_h - 8), radius=9, fill=TILE_BG)
+    lift = _finite(data.get('top5_lift_points'))
+    drag = _finite(data.get('top5_drag_points'))
+    share = _finite(data.get('top5_positive_share_pct'))
+    concentration = str(data.get('concentration') or '')
+    summary = []
+    if lift is not None:
+        summary.append(f"拉升TOP5 {lift:+.2f}點")
+    if drag is not None:
+        summary.append(f"拖累TOP5 {drag:+.2f}點")
+    if share is not None:
+        summary.append(f"占已涵蓋正貢獻 {share:.0f}%")
+    if concentration:
+        summary.append(concentration)
+    text, size = fit('　｜　'.join(summary) if summary else '盤中貢獻資料整理中', 19, right - ix - 24)
+    draw.text((ix + 12, sy + (summary_h - 8) / 2), text, font=font(size, True), fill=INK, anchor='lm')
+
+    half = (right - ix - 40) / 2
+    table_y = sy + summary_h
+    for column, (items, label, color) in enumerate(((top, '拉升指數 TOP5', UP), (bottom, '拖累指數 TOP5', DOWN))):
+        cx = ix + column * (half + 40)
+        draw.rounded_rectangle((cx, table_y, cx + half, table_y + CONTRIB_HEAD_H), radius=8, fill=TILE_BG)
+        draw.text((cx + 12, table_y + CONTRIB_HEAD_H / 2), label, font=font(19, True), fill=color, anchor='lm')
+        # 右側欄名，讓會員知道不是單純漲跌幅排行。
+        draw.text((cx + half - 205, table_y + CONTRIB_HEAD_H / 2), '漲跌', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 112, table_y + CONTRIB_HEAD_H / 2), '權重', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 10, table_y + CONTRIB_HEAD_H / 2), '貢獻', font=font(15), fill=MUTED, anchor='rm')
+
+        ry = table_y + CONTRIB_HEAD_H
+        for item in items:
+            mid = ry + CONTRIB_ROW_H / 2
+            name = _display_name(item.get('stock_name'))
+            text, size = fit(f"{name}  {item.get('stock_code', '')}", 20, half - 300)
+            draw.text((cx + 12, mid), text, font=font(size), fill=INK, anchor='lm')
+            change = _finite(item.get('change_pct'))
+            if change is not None:
+                draw.text((cx + half - 205, mid), f'{change:+.2f}%', font=font(17),
+                          fill=UP if change > 0 else DOWN if change < 0 else MUTED, anchor='rm')
+            weight = _finite(item.get('weight_pct'))
+            if weight is not None:
+                draw.text((cx + half - 112, mid), f'{weight:.2f}%', font=font(17), fill=MUTED, anchor='rm')
+            value = _finite(item.get('points')) or 0.0
+            draw.text((cx + half - 10, mid), f'{value:+.2f}', font=font(21, True), fill=color, anchor='rm')
+            draw.line((cx, ry + CONTRIB_ROW_H, cx + half, ry + CONTRIB_ROW_H), fill=LINE)
+            ry += CONTRIB_ROW_H
+        if not items:
+            draw.text((cx + 12, ry + CONTRIB_ROW_H / 2), '目前沒有可列出的成分股',
+                      font=font(19), fill=MUTED, anchor='lm')
+    return height
+
+
 def _is_article_panel(panel: dict) -> bool:
     return bool((panel or {}).get('article'))
 
@@ -1734,7 +1834,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
     sector_panels = [p for p in panels if _is_sector_panel(p)]
     article_panels = [p for p in panels if _is_article_panel(p)]
-    panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)]
+    contribution_panels = [p for p in panels if _is_contribution_panel(p)]
+    panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)
+              and not _is_contribution_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
@@ -1747,6 +1849,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
     else:
         panels_height = sum(panel_block_height(p) for p in panels)
+    panels_height += sum(contribution_card(None, 0, p['contribution'], True) + 24 for p in contribution_panels)
     panels_height += sum(_sector_block(None, 0, p, True) + 24 for p in sector_panels)
     panels_height += sum(article_card(None, 0, p['article'], True) + 24 for p in article_panels)
     height = header_height + panels_height + body_height + 112
@@ -1765,6 +1868,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
             y += scorecard(None, 0, panel['scorecard'], True) + 24
     if compare:
         y += compare_card(draw, y, panels, False) + 24
+    for panel in contribution_panels:
+        y += contribution_card(draw, y, panel['contribution'], False) + 24
     for panel in sector_panels:
         y += _sector_block(draw, y, panel, False) + 24
     for panel in article_panels:
@@ -1792,6 +1897,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     elif sector_panels:
         live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
         footer = '股市艾斯  /  盤中漲幅為暫定值，收盤前會變動' if live else '股市艾斯  /  族群排行依日 K 收盤資料計算'
+    elif contribution_panels:
+        live = any(str((p.get('contribution') or {}).get('basis') or '').startswith('盤中') for p in contribution_panels)
+        footer = ('股市艾斯  /  指數貢獻為盤中估算，收盤前會變動' if live
+                  else '股市艾斯  /  指數貢獻依收盤資料計算')
     else:
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'
     text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
