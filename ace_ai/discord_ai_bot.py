@@ -3016,12 +3016,20 @@ class AceQueryEngine:
                     panel["scorecard"] = card
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
-        for market in (contribution or {}).get("markets") or []:
+        markets = list((contribution or {}).get("markets") or [])
+        # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
+        want = "tpex" if re.search(r"櫃買|上櫃|OTC", question, re.I) else (
+            "twse" if re.search(r"大盤|加權|台股", question) else "")
+        if want:
+            markets = [m for m in markets if m.get("market") == want]
+        for market in markets:
             panels.append({"contribution": market})
         breadth = next((r.data for r in results if r.name == "get_market_breadth" and r.ok), None)
         # 問「誰在拉／拖累指數」時，貢獻點數卡片已直接回答問題；
         # breadth 仍提供給 AI 做市場廣度補充，但不要再塞一張「權值股漲跌幅排行」混淆主題。
-        if breadth and not contribution and (breadth.get("strongest") or breadth.get("weakest")):
+        # 問「加幾點／貢獻」時，貢獻榜出不來就不要用漲幅排行卡充數（那不是答案）。
+        points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤", question))
+        if breadth and not markets and not points_question and (breadth.get("strongest") or breadth.get("weakest")):
             panels.append(_breadth_panel(breadth))
         text, llm_ok = self._compose(question, plan, results, stats)
         if plan.route == "rule_breadth" and not any(r.name == "get_index_contribution" and r.ok for r in results):

@@ -954,6 +954,12 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             f"指數={index_points:+.2f}｜個股合計={estimated_points:+.2f}｜殘差={residual:+.2f}｜{universe_source}",
             flush=True,
         )
+        # 涵蓋率不足（例如只有 3 檔有價格）時，榜單毫無代表性，直接拒絕。
+        if len(rows) < max(50, int(len(codes) * 0.7)):
+            raise tools.ToolDataError(
+                f"{index_name} 今天只取得 {len(rows)}/{len(codes)} 檔收盤價，資料不足以計算貢獻榜；"
+                f"今日收盤檔通常 15:00 後才發布"
+            )
         # 防呆：如果個股分解與官方指數相差到離譜，不回傳一張看起來很正式的錯圖。
         # 正常仍可能因停牌保留市值/成分異動/基值事件有小幅殘差，所以只擋極端異常。
         tolerance = max(25.0, abs(index_points or 0.0) * 0.20)
