@@ -497,6 +497,13 @@ class QueryRouter:
     def plan(self, parsed: ParsedQuestion, stats: "AnswerStats") -> QueryPlan:
         if parsed.sector is not None:
             return QueryPlan(route="rule_sector", need_final_llm=parsed.sector["mode"] in ("technical", "momentum"))
+        if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
+            # 盤面廣度：指數漲跌 vs 多數個股，不需要任何個股資料。
+            plan = QueryPlan(route="rule_breadth", need_final_llm=True)
+            plan.add("get_market_breadth")
+            if "futures" in parsed.intents:
+                plan.add("get_futures_positions")
+            return plan
         if parsed.stock_candidates and not parsed.stocks:
             options = "、".join(f"{name}（{code}）" for code, name in parsed.stock_candidates)
             return QueryPlan(route="clarify", clarification=f"找到多檔可能的股票：{options}\n請用股票代號重新詢問。")
@@ -1098,6 +1105,9 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
     return _prune_empty({"question": question, "tool_results": tool_results})
 
 
+FINAL_BREADTH_RULES = ("【盤面結構】先用一句話回答「是不是只有權值股在動」，依據是 heavyweight_median_pct（權值股中位漲跌）與 others_change_pct（對照組，盤中是櫃買指數、收盤後是其餘個股中位數）的差距；沒有 heavyweight_median_pct 時就用加權與櫃買的差距說明，並講明是用櫃買代表中小型股。接著補充上漲比率與最強／最弱類股。類股指數本身是市值加權，不要拿它當「一般個股」的代表。盤中是暫定值，要說明收盤前會變動；不預測指數點位，也不給買賣建議。")
+
+
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
 
 
@@ -1111,6 +1121,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
         sections.append(FINAL_CHIPS_RULES)
+    if "get_market_breadth" in names:
+        sections.append(FINAL_BREADTH_RULES)
     if "get_futures_positions" in names:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
@@ -1548,6 +1560,60 @@ def format_technical(d: Dict[str, Any]) -> str:
     )
 
 
+def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
+    """盤面廣度卡片：沿用族群排行版型，上半最強類股、下半最弱類股，副標寫權值股與對照組。"""
+    def rows(items, start=1):
+        return [{"rank": i, "stock_code": "", "stock_name": str(x.get("name") or ""), "market": "",
+                 "row_kind": "sector_group", "pattern_score": None,
+                 "change_pct": float(x.get("change_pct") or 0.0),
+                 "coverage_text": "", "ratio_text": "", "leader_text": ""}
+                for i, x in enumerate(items, start)]
+    parts = []
+    if data.get("taiex_change_pct") is not None:
+        parts.append("加權 {:+.2f}%".format(data["taiex_change_pct"]))
+    if data.get("tpex_change_pct") is not None:
+        parts.append("櫃買 {:+.2f}%".format(data["tpex_change_pct"]))
+    if data.get("heavyweight_median_pct") is not None:
+        parts.append("權值股 {:+.2f}%".format(data["heavyweight_median_pct"]))
+    note = str(data.get("verdict") or "")
+    return {"sector": {"name": "盤面結構｜" + "｜".join(parts), "mode": "market_momentum",
+                       "comparison_date": "", "rows": rows(data.get("strongest") or [])[:3],
+                       "others": rows(data.get("weakest") or [], start=4)[:3],
+                       "coverage_note": "", "liquidity_note": note,
+                       "live_time": str(data.get("time") or "")}}
+
+
+def format_market_breadth(data: Dict[str, Any]) -> str:
+    """AI 失敗時的規則式輸出；欄位與工具回傳一致。"""
+    stamp = f" {data.get('time')}" if data.get("time") else ""
+    lines = [f"**盤面結構｜{data.get('basis', '')}{stamp}**"]
+    index_bits = []
+    if data.get("taiex_change_pct") is not None:
+        index_bits.append(f"加權指數 {data['taiex_change_pct']:+.2f}%")
+    if data.get("tpex_change_pct") is not None:
+        index_bits.append(f"櫃買指數 {data['tpex_change_pct']:+.2f}%")
+    if index_bits:
+        lines.append("｜".join(index_bits))
+    if data.get("heavyweight_median_pct") is not None:
+        lines.append(f"權值股 {data.get('heavyweight_sample', 0)} 檔中位 {data['heavyweight_median_pct']:+.2f}%"
+                     + (f"｜對照：{data.get('others_label', '')} {data['others_change_pct']:+.2f}%"
+                        if data.get("others_change_pct") is not None else ""))
+        top = data.get("heavyweight_top") or []
+        if top:
+            lines.append("權值股表現：" + "、".join(f"{x['name']} {x['change_pct']:+.2f}%" for x in top))
+    if data.get("sector_total"):
+        lines.append(f"類股 {data['sector_total']} 個｜上漲 {data.get('sector_advancing', 0)}"
+                     f"（上漲比率 {data.get('advance_ratio_pct', 0)}%）"
+                     + (f"｜中位 {data['sector_median_pct']:+.2f}%" if data.get("sector_median_pct") is not None else ""))
+    if data.get("strongest"):
+        lines.append("最強類股：" + "、".join(f"{x['name']} {x['change_pct']:+.2f}%" for x in data["strongest"]))
+    if data.get("weakest"):
+        lines.append("最弱類股：" + "、".join(f"{x['name']} {x['change_pct']:+.2f}%" for x in data["weakest"]))
+    lines.append(f"判讀：{data.get('verdict', '')}")
+    lines.append("※ 以上為當下盤面結構描述，不代表未來表現。")
+    return chr(10).join(lines)
+
+
 def format_futures(data: Dict[str, Any]) -> str:
     rows = data.get("investors") or []
     lines = [f"**三大法人台指期未平倉｜{data.get('data_date', '')}**"]
@@ -1733,6 +1799,7 @@ FORMATTERS = {
     "get_stock_overview": format_overview,
     "get_technical_analysis": format_technical,
     "get_futures_positions": format_futures,
+    "get_market_breadth": format_market_breadth,
     "get_volume_profile": format_volume_profile,
     "get_warrant_branch": format_warrant,
     "get_high_winrate_branches_buying": format_high_winrate,
@@ -2047,6 +2114,8 @@ MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
 _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
 
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
+# 「是不是只有權值股在動」這類盤面結構問題。
+_BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
@@ -2895,6 +2964,9 @@ class AceQueryEngine:
                 if card:
                     panel["scorecard"] = card
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+        breadth = next((r.data for r in results if r.name == "get_market_breadth" and r.ok), None)
+        if breadth and (breadth.get("strongest") or breadth.get("weakest")):
+            panels.append(_breadth_panel(breadth))
         text, llm_ok = self._compose(question, plan, results, stats)
         elapsed = time.perf_counter() - started
         self.log(

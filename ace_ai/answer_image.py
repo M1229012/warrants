@@ -252,7 +252,7 @@ def _mark_action(e: dict) -> tuple[str, str]:
         return '出清待對帳', WARN_INK
     if e.get('reduce_date'):
         amount = str(e.get('reduce_amount_text') or '')
-        return f"{e['reduce_date'][5:]} 減碼 {amount}・持有".replace("  ", " "), WARN_INK
+        return f"{e['reduce_date'][5:]} 減碼 {amount}".strip(), WARN_INK
     if status == '已出清':
         return '已出清', DOWN
     if '減碼' in status:
@@ -261,7 +261,7 @@ def _mark_action(e: dict) -> tuple[str, str]:
 
 
 def _mark_columns(table_width: float) -> list[tuple[str, float]]:
-    weights = (('K線編號', 68), ('分點', 136), ('事件', 44), ('買進日', 64), ('權證買進金額', 110), ('後續動作', 182))
+    weights = (('編號', 62), ('分點', 126), ('事件', 40), ('買進日', 58), ('權證買進金額', 100), ('後續動作', 218))
     total = sum(w for _, w in weights)
     return [(label, w * table_width / total) for label, w in weights]
 
@@ -278,7 +278,7 @@ def _flow_rows(items: list[float], width: float, gap: float) -> int:
 def _mark_symbol_items() -> list[tuple[str, str, float]]:
     """（圖示種類, 文字, 寬度）；圖示用畫的，不依賴字型有沒有 ▲▼ 字形。"""
     specs = (('buy', '買進日（A～E 事件）'), ('exit', '同編號出清日'), ('reduce', '減碼日'),
-             ('note', 'K 線上的編號＝下表「K線編號」，同一個編號就是同一筆事件；金額＝當日買進權證金額，不含報酬率'))
+             ('note', 'K 線上的編號＝下表「編號」，同一個編號就是同一筆事件；金額＝當日買進權證金額'))
     items = []
     for kind, text in specs:
         icon = {'buy': 44, 'exit': 44, 'reduce': 18, 'note': 0}[kind]
@@ -452,7 +452,7 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
     cx = x
     for label, w in columns:
         text, size = fit(label, 17, w - 12)
-        if label == 'K線編號':
+        if label == '編號':
             draw.text((cx + w / 2, y + TABLE_HEAD_H / 2), text, font=font(size), fill=MUTED, anchor='mm')
         else:
             draw.text((cx + 8, y + TABLE_HEAD_H / 2), text, font=font(size), fill=MUTED, anchor='lm')
@@ -469,7 +469,7 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         }
         cx = x
         for label, w in columns:
-            if label == 'K線編號':
+            if label == '編號':
                 _draw_badge(draw, cx + w / 2, mid, e.get('no', ''), UP)
             elif label == '事件':
                 code = str(e.get('event', ''))
@@ -530,17 +530,22 @@ def _badge_half(number_text) -> float:
 
 
 def _assign_rows(badges: list[dict]) -> None:
-    """同一側的編號圓圈依 x 排列，擠在一起時往下一列放（最多 3 列）。"""
-    last = [-1e9] * MARK_MAX_ROWS
+    """同一側的編號依 x 排列，擠在一起時往下一列放（最多 3 列）。
+
+    間距要用「前一個標記的右緣」和「這一個標記的左緣」來算：合併後的膠囊（1、2）比
+    單一數字寬很多，只看自己的寬度會讓寬膠囊和後面的圓圈咬在一起。
+    """
+    pad = 6
+    right = [-1e9] * MARK_MAX_ROWS       # 每一列目前最右邊被佔到的位置
     for badge in sorted(badges, key=lambda b: b['cx']):
-        gap = _badge_half(badge.get('no', '')) * 2 + 4
-        row = next((r for r in range(MARK_MAX_ROWS) if badge['cx'] - last[r] >= gap), None)
+        half = _badge_half(badge.get('no', ''))
+        row = next((r for r in range(MARK_MAX_ROWS) if badge['cx'] - half >= right[r] + pad), None)
         if row is None:
             # 三列都擠滿：放進最空的一列並往右挪到不重疊的位置，細線仍連回自己的三角形。
-            row = min(range(MARK_MAX_ROWS), key=lambda r: last[r])
-            badge['cx'] = last[row] + gap
+            row = min(range(MARK_MAX_ROWS), key=lambda r: right[r])
+            badge['cx'] = right[row] + pad + half
         badge['row'] = row
-        last[row] = badge['cx']
+        right[row] = badge['cx'] + half
 
 
 def _mark_numbers(mark: dict) -> list:

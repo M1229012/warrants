@@ -583,6 +583,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_technical_analysis": "目前股價／技術指標資料取得失敗",
     "get_volume_profile": "目前大量區資料取得失敗",
     "get_futures_positions": "台指期未平倉資料取得失敗",
+    "get_market_breadth": "盤面廣度資料取得失敗",
     "get_warrant_branch": "目前權證分點資料取得失敗",
     "get_high_winrate_branches_buying": "目前高勝率分點資料取得失敗",
     "get_branch_performance": "歷史分點統計目前無法取得",
@@ -4443,6 +4444,193 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 
 
+
+# ============================================================
+# 市場廣度：指數是不是只靠權值股撐住
+# ============================================================
+
+# 市值前段的權值股（等權平均，只用來對照「權值股 vs 其他股票」，不是指數權重計算）。
+HEAVYWEIGHT_LIMIT = max(3, _env_int("DISCORD_AI_HEAVYWEIGHT_LIMIT", 8))   # 盤中最多抓幾檔權值股
+# 報價慢的時候不要拖住整題：抓到幾檔算幾檔，剩下的用已取得的樣本計算。
+HEAVYWEIGHT_BUDGET_SECONDS = max(2.0, _env_float("DISCORD_AI_HEAVYWEIGHT_BUDGET", 6.0))
+HEAVYWEIGHT_CODES = [c.strip() for c in os.getenv(
+    "DISCORD_AI_HEAVYWEIGHTS", "2330,2317,2454,2308,2382,2881,2882,2891,3711,2303,1216,2412").split(",") if c.strip()]
+
+
+def _mis_quotes(channels: List[str]) -> List[Dict[str, Any]]:
+    """證交所 MIS 批次報價：一個請求可以同時要指數與個股，回傳 [{key, name, change_pct, time}]。"""
+    if not channels:
+        return []
+    started = time.perf_counter()
+    status = 0
+    try:
+        session = core().get_thread_session()
+        # 個股報價要帶時間戳，否則 MIS 只會回指數、個股那幾筆會整批消失。
+        response = session.get(MIS_INDEX_URL,
+                               params={"ex_ch": "|".join(channels), "json": "1", "delay": "0",
+                                       "_": str(int(time.time() * 1000))},
+                               headers=MIS_INDEX_HEADERS, timeout=(4, 8))
+        status = int(response.status_code)
+        response.raise_for_status()
+        payload = response.json() or {}
+    finally:
+        record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
+    rows = []
+    for item in payload.get("msgArray") or []:
+        try:
+            close = float(item.get("z") or item.get("o") or 0)
+            previous = float(item.get("y") or 0)
+        except (TypeError, ValueError):
+            continue
+        if close <= 0 or previous <= 0:
+            continue
+        rows.append({"key": str(item.get("ch") or "").split(".")[0], "name": str(item.get("n") or ""),
+                     "change_pct": round((close / previous - 1) * 100, 2), "close": close,
+                     "time": str(item.get("t") or "")[:5]})
+    return rows
+
+
+def _breadth_verdict(data: Dict[str, Any]) -> str:
+    """回答「是不是只有權值股在動」：先比權值股 vs 其他股票，抓不到權值股時退回加權 vs 櫃買。"""
+    heavy = data.get("heavyweight_median_pct")
+    others = data.get("others_change_pct")
+    taiex, tpex = data.get("taiex_change_pct"), data.get("tpex_change_pct")
+    ratio = data.get("advance_ratio_pct")
+    label = "其他股票"
+    if heavy is None:
+        heavy, others, label = taiex, tpex, "櫃買指數"
+        if heavy is None or others is None:
+            return "資料不足，無法判斷是不是權值股單獨表現"
+    if others is None:
+        return "只取得權值股報價，沒有可比較的對照組"
+    gap = float(heavy) - float(others)
+    wide = ratio is not None and ratio >= 55
+    narrow = ratio is not None and ratio < 45
+    if gap >= 0.5 and (narrow or not wide):
+        return f"權值股明顯強過{label}（差距 {gap:+.2f} 個百分點），指數主要靠權值股撐住"
+    if gap >= 0.5:
+        return f"權值股較強（比{label}多 {gap:+.2f} 個百分點），但上漲類股仍過半，不是只有權值股在漲"
+    if gap <= -0.5:
+        return f"權值股反而弱於{label}（差距 {gap:+.2f} 個百分點），資金偏向中小型股"
+    return f"權值股和{label}表現接近（差距 {gap:+.2f} 個百分點），盤面沒有明顯偏食"
+
+
+def get_market_breadth() -> Dict[str, Any]:
+    """盤面廣度：權值股 vs 其他股票，用來回答「是不是只有權值股在動」。
+
+    盤中：證交所 MIS 一個請求同時取加權、櫃買、權值股與類股指數（不佔富果額度）。
+    非盤中：本地日K底庫算全市場個股（0 個請求），廣度用真正的上漲家數。
+    """
+    now = taipei_now()
+    live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
+    result: Dict[str, Any] = {}
+    if live:
+        sectors: List[Dict[str, Any]] = []
+        benchmarks: Dict[str, float] = {}
+        stamp = ""
+        try:
+            # 指數（加權、櫃買、類股）走 MIS：一個請求、穩定、免金鑰。
+            rows = _mis_quotes(["tse_t00.tw", "otc_o00.tw"] + [f"tse_t{i:02d}.tw" for i in range(1, 32)])
+            for row in rows:
+                stamp = row.get("time") or stamp
+                label = str(row.get("name") or "").replace("類指數", "").replace("指數", "")
+                if row["key"] == "t00":
+                    benchmarks["加權"] = row["change_pct"]
+                elif row["key"] == "o00":
+                    benchmarks["櫃買"] = row["change_pct"]
+                elif label not in ("其他", "其他電子", "電子工業"):
+                    sectors.append({"name": label, "change_pct": row["change_pct"]})
+        except Exception as exc:
+            print(f"⚠️ 盤面廣度取指數失敗：{type(exc).__name__}", flush=True)
+        # 權值股走富果（MIS 的個股報價要 session、又會限流，抓不穩）；只取前幾檔，並沿用既有快取。
+        heavy: List[Dict[str, Any]] = []
+        deadline = time.monotonic() + HEAVYWEIGHT_BUDGET_SECONDS
+        for code in HEAVYWEIGHT_CODES[:HEAVYWEIGHT_LIMIT]:
+            if time.monotonic() >= deadline:
+                print(f"⚠️ 盤面廣度：權值股報價已達 {HEAVYWEIGHT_BUDGET_SECONDS:.0f} 秒上限，"
+                      f"改用已取得的 {len(heavy)} 檔", flush=True)
+                break
+            try:
+                overview = get_stock_overview(code)
+            except Exception:
+                continue
+            pct = _num(overview.get("change_pct"))
+            if pct is None:
+                continue
+            heavy.append({"name": overview.get("stock_name") or code, "code": code, "change_pct": round(pct, 2)})
+        if heavy or benchmarks:
+            heavy_values = sorted(r["change_pct"] for r in heavy)
+            heavy_sorted = sorted(heavy, key=lambda r: -r["change_pct"])
+            sector_values = sorted(r["change_pct"] for r in sectors)
+            advancing = sum(1 for v in sector_values if v > 0)
+            result = {
+                "basis": "盤中即時", "time": stamp,
+                "taiex_change_pct": benchmarks.get("加權"), "tpex_change_pct": benchmarks.get("櫃買"),
+                "heavyweight_sample": len(heavy),
+                "heavyweight_median_pct": round(heavy_values[len(heavy_values) // 2], 2) if heavy_values else None,
+                "heavyweight_top": heavy_sorted[:3],
+                "heavyweight_bottom": heavy_sorted[-3:] if len(heavy_sorted) > 3 else [],
+                "others_label": "櫃買指數（中小型股為主）", "others_change_pct": benchmarks.get("櫃買"),
+                "sector_sample": len(sectors),
+                "sector_median_pct": round(sector_values[len(sector_values) // 2], 2) if sector_values else None,
+                "sector_advancing": advancing, "sector_total": len(sector_values),
+                "advance_ratio_pct": round(advancing / len(sector_values) * 100, 1) if sector_values else None,
+                "strongest": [{"name": r["name"], "change_pct": r["change_pct"]}
+                              for r in sorted(sectors, key=lambda r: -r["change_pct"])[:3]],
+                "weakest": [{"name": r["name"], "change_pct": r["change_pct"]}
+                            for r in sorted(sectors, key=lambda r: -r["change_pct"])[-3:]],
+            }
+    if not result:
+        try:
+            import local_market_cache
+            codes = local_market_cache.codes_with_history(69)
+            changes_map = local_market_cache.latest_changes(codes)
+        except Exception as exc:
+            raise ToolDataError("目前沒有可用的全市場漲跌資料") from exc
+        pairs = [(code, float((info or {}).get("change_pct") or 0.0)) for code, info in changes_map.items()]
+        if not pairs:
+            raise ToolDataError("本地底庫沒有可用的全市場漲跌資料")
+        heavy_pairs = [(c, v) for c, v in pairs if c in HEAVYWEIGHT_CODES]
+        other_values = sorted(v for c, v in pairs if c not in HEAVYWEIGHT_CODES)
+        heavy_values = sorted(v for _, v in heavy_pairs)
+        advancing = sum(1 for v in other_values if v > 0)
+        names = {}
+        try:
+            names = get_stock_name_map() or {}
+        except Exception:
+            names = {}
+        heavy_sorted = sorted(heavy_pairs, key=lambda x: -x[1])
+        result = {
+            "basis": "收盤資料", "time": "",
+            "taiex_change_pct": None, "tpex_change_pct": None,
+            "heavyweight_sample": len(heavy_values),
+            "heavyweight_median_pct": round(heavy_values[len(heavy_values) // 2], 2) if heavy_values else None,
+            "heavyweight_top": [{"name": names.get(c, c), "code": c, "change_pct": round(v, 2)}
+                                for c, v in heavy_sorted[:3]],
+            "heavyweight_bottom": [{"name": names.get(c, c), "code": c, "change_pct": round(v, 2)}
+                                   for c, v in heavy_sorted[-3:]],
+            "others_label": f"其餘 {len(other_values):,} 檔個股中位數",
+            "others_change_pct": round(other_values[len(other_values) // 2], 2) if other_values else None,
+            "sector_sample": 0, "sector_median_pct": None,
+            "sector_advancing": advancing, "sector_total": len(other_values),
+            "advance_ratio_pct": round(advancing / len(other_values) * 100, 1) if other_values else None,
+            "strongest": [], "weakest": [],
+        }
+        for code in ("TAIEX", "TPEX"):
+            try:
+                frame = closed_frame(_load_price_bundle(code))
+                if len(frame) >= 2:
+                    pct = round(float(frame["Close"].iloc[-1] / frame["Close"].iloc[-2] - 1) * 100, 2)
+                    result["taiex_change_pct" if code == "TAIEX" else "tpex_change_pct"] = pct
+            except Exception:
+                continue
+    result["verdict"] = _breadth_verdict(result)
+    result["definition_note"] = (
+        "權值股＝市值前段的 " + str(len(HEAVYWEIGHT_CODES)) + " 檔（等權比較，非指數權重計算）；"
+        "盤中以櫃買指數代表中小型股，收盤後改用全市場其餘個股的中位數與上漲家數")
+    return result
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -4453,6 +4641,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_technical_analysis": get_technical_analysis,
     "get_volume_profile": get_volume_profile,
     "get_futures_positions": get_futures_positions,
+    "get_market_breadth": get_market_breadth,
     "get_warrant_branch": get_warrant_branch,
     "get_high_winrate_branches_buying": get_high_winrate_branches_buying,
     "get_branch_performance": get_branch_performance,
@@ -4476,6 +4665,7 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
     "get_stock_overview": "股價概況：收盤、漲跌幅、成交量、均量、量比（參數 stock_code）",
     "get_technical_analysis": "技術面：MA5/10/20/60、均線排列、MA20突破跌破、KD、MACD、OSC、布林（參數 stock_code）",
     "get_futures_positions": "三大法人台指期未平倉口數與前一日變化（不需參數）；含避險部位，僅供參考",
+    "get_market_breadth": "盤面廣度：加權／櫃買漲跌 vs 多數個股（或類股）中位數漲跌、上漲家數，用來回答「是不是只有權值股在動」（不需參數）",
     "get_volume_profile": "大量區：最大／第二大量區價格、現價位置、突破跌破回踩、價量型態（參數 stock_code）",
     "get_warrant_branch": "個股近N日權證分點買賣超排行與ABCDE事件（參數 stock_code, days=5/10/20）",
     "get_high_winrate_branches_buying": "個股近期買超分點 join 歷史勝率（參數 stock_code, days）",
