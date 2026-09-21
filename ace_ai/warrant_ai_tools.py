@@ -4524,7 +4524,11 @@ def get_market_breadth() -> Dict[str, Any]:
     非盤中：本地日K底庫算全市場個股（0 個請求），廣度用真正的上漲家數。
     """
     now = taipei_now()
-    live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
+    minutes = now.hour * 60 + now.minute
+    session = now.weekday() < 5 and 9 * 60 <= minutes <= 13 * 60 + 35
+    # 收盤後本地底庫通常還沒有今天的日K，直接拿會變成昨天的漲跌；
+    # 交易日 09:00～20:00 一律用即時報價（收盤後取到的就是今天的收盤價）。
+    live = now.weekday() < 5 and 9 * 60 <= minutes <= 20 * 60
     result: Dict[str, Any] = {}
     if live:
         sectors: List[Dict[str, Any]] = []
@@ -4567,7 +4571,7 @@ def get_market_breadth() -> Dict[str, Any]:
             sector_values = sorted(r["change_pct"] for r in sectors)
             advancing = sum(1 for v in sector_values if v > 0)
             result = {
-                "basis": "盤中即時", "time": stamp,
+                "basis": "盤中即時" if session else "今日收盤", "time": stamp,
                 "taiex_change_pct": benchmarks.get("加權"), "tpex_change_pct": benchmarks.get("櫃買"),
                 "heavyweight_sample": len(heavy),
                 "heavyweight_median_pct": round(heavy_values[len(heavy_values) // 2], 2) if heavy_values else None,
