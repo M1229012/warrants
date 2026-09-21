@@ -243,9 +243,14 @@ def _mark_action(e: dict) -> tuple[str, str]:
     """明細表「後續動作」欄：出清日／減碼日落在圖表區間內就寫日期，否則寫目前狀態。"""
     status = str(e.get('status', ''))
     if e.get('exit_date'):
-        return f"{e['exit_date'][5:]} 出清", DOWN
+        amount = str(e.get('exit_amount_text') or '')
+        return f"{e['exit_date'][5:]} 出清 {amount}".strip(), DOWN
+    if e.get('exit_unverified'):
+        # 事件表寫已出清，但每日賣出明細當天沒有對應賣出：照實說待對帳，不寫成出清也不寫成持有中。
+        return '出清待對帳', WARN_INK
     if e.get('reduce_date'):
-        return f"{e['reduce_date'][5:]} 減碼・持有", WARN_INK
+        amount = str(e.get('reduce_amount_text') or '')
+        return f"{e['reduce_date'][5:]} 減碼 {amount}・持有".replace("  ", " "), WARN_INK
     if status == '已出清':
         return '已出清', DOWN
     if '減碼' in status:

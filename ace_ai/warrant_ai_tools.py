@@ -3904,18 +3904,56 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
         rule += f"（已排除 {DAYTRADE_MAX_HOLD_DAYS} 個交易日內出清的隔日衝 {int(day_trades.sum())} 筆）"
     rows = rows[~day_trades]
     rows = rows.sort_values("event_date").tail(max(1, CHART_MARK_MAX_EVENTS))
+    # 出清要「兩張表都對得上」：事件表有出清日，每日賣出明細當天該分點也真的有賣出金額。
+    # 只信事件表的話，圖上會出現「已出清」但實際沒有對應賣出紀錄的矛盾（和分點動向表打架）。
+    sells = _sell_rows(code)
+    sell_amounts: Dict[Tuple[str, pd.Timestamp], float] = {}
+    if not sells.empty:
+        window = sells[(sells["_date"] >= start) & (sells["_date"] <= end)]
+        for _, srow in window.iterrows():
+            key = (str(srow["_branch"]), pd.Timestamp(srow["_date"]).normalize())
+            sell_amounts[key] = sell_amounts.get(key, 0.0) + float(srow.get("_amount") or 0.0)
+
+    def sell_amount_on(branch: str, day: Any) -> float:
+        if day is None or pd.isna(day):
+            return 0.0
+        return float(sell_amounts.get((str(branch), pd.Timestamp(day).normalize()), 0.0))
+
     marks = []
+    unverified: List[str] = []
+    verified_exits = reduce_marks = 0
     for no, (_, r) in enumerate(rows.iterrows(), 1):
+        branch = str(r["branch"])
+        exit_in_window = in_window(r["exit_date"])
+        exit_amount = sell_amount_on(branch, r["exit_date"]) if exit_in_window else 0.0
+        exit_ok = exit_in_window and exit_amount > 0
+        if exit_in_window and not exit_ok:
+            unverified.append(f"{branch} {_fmt_date(r['exit_date'])}")
+        reduce_in_window = in_window(r["reduce_date"]) and _fmt_date(r["reduce_date"]) != _fmt_date(r["exit_date"])
+        reduce_amount = sell_amount_on(branch, r["reduce_date"]) if reduce_in_window else 0.0
+        reduce_ok = reduce_in_window and reduce_amount >= MIN_SELL_MARK_AMOUNT
+        verified_exits += 1 if exit_ok else 0
+        reduce_marks += 1 if reduce_ok else 0
         marks.append({
             "no": no,
-            "branch": r["branch"],
+            "branch": branch,
             "event": r["event_code"],
             "buy_date": _fmt_date(r["event_date"]),
             "buy_amount_text": _money_text(r["buy_amount"]),
-            "reduce_date": _fmt_date(r["reduce_date"]) if in_window(r["reduce_date"]) else "",
-            "exit_date": _fmt_date(r["exit_date"]) if in_window(r["exit_date"]) else "",
+            "reduce_date": _fmt_date(r["reduce_date"]) if reduce_ok else "",
+            "reduce_amount_text": _money_text(-reduce_amount) if reduce_ok else "",
+            "exit_date": _fmt_date(r["exit_date"]) if exit_ok else "",
+            "exit_amount_text": _money_text(-exit_amount) if exit_ok else "",
+            "exit_unverified": bool(exit_in_window and not exit_ok),
             "status": r["status"],
         })
+    if marks:
+        print(f"✅ {code} 事件標註｜事件 {len(marks)} 筆｜已核對出清 {verified_exits} 筆｜"
+              f"減碼 {reduce_marks} 筆" + (f"｜未核對出清 {len(unverified)} 筆（不標）" if unverified else ""),
+              flush=True)
+    if unverified:
+        print(f"⚠️ {code} 事件表有出清日、但每日賣出明細沒有對應賣出，圖上不標為出清："
+              + "、".join(unverified[:6]), flush=True)
     reason = ""
     if not marks:
         if stock_rows.empty:

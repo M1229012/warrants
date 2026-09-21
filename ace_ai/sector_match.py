@@ -35,6 +35,28 @@ _PRONOUN = re.compile(r"^(它|他|她|這|那|這檔|那檔|這支|那支|該股
 _TOPIC_TAIL = re.compile(r"(族群|類股|概念股|概念|產業|個股|股票|股)+$")
 
 
+# 官方產業別（證交所 28 類股）：盤中資金流向雷達用的就是這一套名稱，
+# 所以「電子通路有誰」必須查得到——成分股由官方／FinMind 產業名冊提供，比概念名冊精準。
+OFFICIAL_INDUSTRIES = {
+    "01": ("水泥工業", "水泥"), "02": ("食品工業", "食品"),
+    "03": ("塑膠工業", "塑膠"), "04": ("紡織纖維", "紡織"),
+    "05": ("電機機械",), "06": ("電器電纜", "電線電纜"),
+    "08": ("玻璃陶瓷",), "09": ("造紙工業", "造紙"),
+    "10": ("鋼鐵工業", "鋼鐵"), "11": ("橡膠工業", "橡膠"),
+    "12": ("汽車工業", "汽車"), "14": ("建材營造", "營建"),
+    "15": ("航運業", "航運"), "16": ("觀光餐旅", "觀光事業", "觀光", "餐旅"),
+    "17": ("金融保險", "金融", "金融保險業"), "19": ("綜合",),
+    "20": ("其他",), "21": ("化學工業", "化工"),
+    "22": ("生技醫療業", "生技醫療", "生技"), "23": ("油電燃氣業", "油電燃氣"),
+    "24": ("半導體業", "半導體"), "25": ("電腦及週邊設備業", "電腦及週邊設備", "電腦週邊"),
+    "26": ("光電業", "光電"), "27": ("通信網路業", "通信網路", "通訊網路"),
+    "28": ("電子零組件業", "電子零組件"), "29": ("電子通路業", "電子通路"),
+    "30": ("資訊服務業", "資訊服務"), "31": ("其他電子業", "其他電子"),
+    "32": ("文化創意業", "文化創意", "文創"), "33": ("農業科技業", "農業科技"),
+    "35": ("綠能環保",), "36": ("數位雲端",),
+    "37": ("運動休閒",), "38": ("居家生活",),
+}
+
 def _data() -> Dict[str, Any]:
     with _LOCK:
         if _CACHE.get("ready"):
@@ -149,6 +171,23 @@ def _custom(name: str, confidence: str) -> Dict[str, Any]:
 # 主要入口
 # ============================================================
 
+def _official_match(core: str, value: str) -> Optional[Dict[str, Any]]:
+    """官方 28 類股比對：完全相同或整個出現在問句裡才算，避免和概念族群搶。"""
+    best = None
+    for code, names in OFFICIAL_INDUSTRIES.items():
+        for name in names:
+            key = normalize(name)
+            if not key:
+                continue
+            if key == core or key == value:
+                return {"industry": code, "name": names[0], "confidence": "exact"}
+            if len(key) >= 3 and key in value and (best is None or len(key) > best[0]):
+                best = (len(key), code, names[0])
+    if best:
+        return {"industry": best[1], "name": best[2], "confidence": "alias"}
+    return None
+
+
 def match(text: str) -> Optional[Dict[str, Any]]:
     """從問句找族群；對不到回 None（上層要誠實說查不到）。"""
     value = normalize(text)
@@ -196,7 +235,11 @@ def match(text: str) -> Optional[Dict[str, Any]]:
         if len(codes) > 1:  # 同名兩類（電源供應器＝產業＋概念）取聯集
             return _pack(codes, same[0][3], "merged", "＋".join(dict.fromkeys(r[3] for r in same)))
         return _pack([contains[0][2]], contains[0][3], "alias")
-    # 5. 主題字是族群名的一部分（散熱 → 散熱模組＋散熱零組件）
+    # 5. 官方 28 類股（雷達用的分類名稱，例如「電子通路」「電腦及週邊設備」）
+    official = _official_match(core, value)
+    if official:
+        return official
+    # 6. 主題字是族群名的一部分（散熱 → 散熱模組＋散熱零組件）
     if len(core) >= 2:
         partial = [(code, name) for key, code, name, _, _ in index if core in key]
         if partial:
@@ -204,7 +247,7 @@ def match(text: str) -> Optional[Dict[str, Any]]:
             if len(codes) > 1:
                 return _pack(codes, core, "merged", "＋".join(n for _, n in partial))
             return _pack(codes, partial[0][1], "alias")
-    # 6. 最後才用編輯距離，且要求夠像、夠唯一
+    # 7. 最後才用編輯距離，且要求夠像、夠唯一
     if len(core) >= 2:
         scored = sorted(((difflib.SequenceMatcher(None, core, key).ratio(), code, name)
                          for key, code, name, _, _ in index), reverse=True)

@@ -20,7 +20,9 @@ SNAPSHOT_MINUTES = max(2, tools._env_int("DISCORD_AI_RADAR_SNAPSHOT_MINUTES", 5)
 COMPARE_MINUTES = max(5, tools._env_int("DISCORD_AI_RADAR_COMPARE_MINUTES", 30))
 OPEN_GRACE_MINUTES = max(0, tools._env_int("DISCORD_AI_RADAR_OPEN_GRACE", 15))
 TOP_N = max(3, tools._env_int("DISCORD_AI_RADAR_TOP", 5))
-EXCLUDE_NAMES = {"其他", "其他電子", "綜合"}
+# 「電子工業」是半導體＋光電＋電腦週邊…等類股的總和，放進排名等於重複計算，也查不到成分股；
+# 「其他」「綜合」則沒有分析意義。
+EXCLUDE_NAMES = {"其他", "其他電子", "綜合", "電子工業"}
 # 證交所 MIS 即時行情：一個請求就能拿到全部類股指數＋加權＋櫃買，官方來源、免金鑰。
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 MIS_HEADERS = {"User-Agent": "Mozilla/5.0 AceAI/1.0", "Accept": "application/json",
