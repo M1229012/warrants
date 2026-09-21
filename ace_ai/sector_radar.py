@@ -398,7 +398,8 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
 # 一個 MIS 請求帶 50 檔，不佔富果額度；每批驗 requested／returned，缺的小批重試一次。
 # ============================================================
 
-LEADER_TOP = 2
+LEADER_TOP = 5                      # v1.4：每族群領漲／領跌 TOP5（不硬湊反方向）
+MEMBER_WORKERS = 4                  # MIS 批次並行數（循序打 13 批要 10 秒以上）
 MEMBER_BATCH = 50                   # 每個 MIS 請求帶幾檔
 MEMBER_RETRY_BATCH = 10             # 缺漏代號的重試批量
 MEMBER_DEADLINE = 12.0              # 整次成員報價的時間上限（秒），不能拖住 Discord 回覆
@@ -450,7 +451,28 @@ def _num_field(item: Dict[str, Any], key: str) -> float:
         return 0.0
 
 
+def _thread_session():
+    try:
+        return tools.core().get_thread_session()      # 每條執行緒各自的連線
+    except Exception:
+        import requests
+        return requests
+
+
+_HTTP_LOCK = threading.Lock()
+_HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
+
+
+def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """工作執行緒沒有主執行緒的 thread-local request_id，要顯式帶入，這一題的 API 用量才不會少計。"""
+    with tools.api_request_scope(request_id):
+        return _fetch_batch(None, codes)
+
+
 def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    session = session or _thread_session()               # 並行時傳 None，各執行緒用自己的 session
+    with _HTTP_LOCK:
+        _HTTP_SENT[0] += 1
     began, status, items = time.perf_counter(), 0, []
     try:
         response = session.get(MIS_URL, params={"ex_ch": "|".join(f"tse_{c}.tw" for c in codes),
@@ -486,19 +508,37 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         import requests
         session = requests
     out: Dict[str, Dict[str, Any]] = {}
-    deadline = time.perf_counter() + MEMBER_DEADLINE
-    for start in range(0, len(codes), MEMBER_BATCH):
-        if time.perf_counter() > deadline:
-            print("⚠️ MIS 成員報價逾時，後續批次略過", flush=True)
-            break
-        out.update(_fetch_batch(session, codes[start:start + MEMBER_BATCH]))
+    began = time.perf_counter()
+    deadline = began + MEMBER_DEADLINE
+    with _HTTP_LOCK:
+        sent_before = _HTTP_SENT[0]
+    request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
+    batches = [codes[start:start + MEMBER_BATCH] for start in range(0, len(codes), MEMBER_BATCH)]
+    # 有限並行（4 條）＋整體時限；逾時的批次直接放棄，缺的代號交給下面的小批重試
+    from concurrent.futures import ThreadPoolExecutor, wait
+    pool = ThreadPoolExecutor(max_workers=MEMBER_WORKERS, thread_name_prefix="ace-radar-mis")
+    try:
+        futures = [pool.submit(_fetch_batch_scoped, request_id, batch) for batch in batches]
+        done, pending = wait(futures, timeout=max(1.0, deadline - time.perf_counter()))
+        for future in done:
+            try:
+                out.update(future.result())
+            except Exception:
+                pass
+        if pending:
+            print(f"⚠️ MIS 成員報價逾時，{len(pending)} 批略過", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     retry = [c for c in codes if c not in out]
     for start in range(0, len(retry), MEMBER_RETRY_BATCH):
         if time.perf_counter() > deadline:
             break
         out.update(_fetch_batch(session, retry[start:start + MEMBER_RETRY_BATCH]))
     missing = [c for c in codes if c not in out]
+    with _HTTP_LOCK:
+        sent = _HTTP_SENT[0] - sent_before     # 同時有其他查詢在抓時會一起算進來，屬上限值
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
+          f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)
     return out
 
@@ -712,18 +752,20 @@ def enrich(rows: List[Dict[str, Any]], data: Dict[str, Any]) -> bool:
 # ============================================================
 
 _MODE_NAMES = {"strong": "strongest", "up": "turning_up", "down": "turning_down", "moves": "moves"}
-RADAR_NOTE = "主要族群＝成分股 >10 檔、小型族群＝3～10 檔，各自組內比較"
+RADAR_NOTE = "只比較官方成分股 ≥20 檔的大族群｜領漲／領跌取流動性達標成分股"
 L1_ONLY_NOTE = "未取得成分股資料，僅指數層級"
 STRONG_TOP = 3
 STRONG_POOL = 8          # 強勢區先看類股漲幅前 8 名，剔除集中拉抬後取 3
 CONCENTRATED_POOL = 5    # 集中型異動：只從類股漲幅前 5 名挑
 CONCENTRATED_MAX = 2
 
-# v1.3 規模分組：依官方完整成員檔數（不看報價成功數），整個交易日固定
-SMALL_MAX = 10           # ≤10 檔＝小型族群
-TINY_MAX = 2             # ≤2 檔＝極小型，不參與正式排名
+# 規模分組：依官方完整成員檔數（不看報價成功數），整個交易日固定。
+# v1.4：初期只看大族群（≥20 檔）；小族群被單一個股左右的程度太大，先不上畫面。
+BIG_MIN = 20             # ≥20 檔＝大族群（main）
+SMALL_MAX = BIG_MIN - 1  # 其餘為小族群，v1.4 不顯示
+TINY_MAX = 2
 TINY_SHOW = 2
-TIER_NAMES = {"main": "主要族群", "small": "小型族群"}
+TIER_NAMES = {"main": "族群雷達", "small": "小型族群"}
 _SIZE_PREFIX = "radar_size:"
 
 
@@ -740,7 +782,7 @@ def size_groups(rows: List[Dict[str, Any]]) -> Dict[str, Tuple[str, int]]:
             if count:                                   # 取不到成員的不寫入，下次再試
                 counts[row["sector_id"]] = count
         local_market_cache.set_state(key, counts)
-    groups = {sid: ("main" if n > SMALL_MAX else "small" if n > TINY_MAX else "tiny", n)
+    groups = {sid: ("main" if n >= BIG_MIN else "small" if n > TINY_MAX else "tiny", n)
               for sid, n in counts.items()}
     by_group: Dict[str, List[str]] = {}
     for row in rows:
@@ -814,18 +856,31 @@ def _heat_text(row: Dict[str, Any], stage: str) -> str:
     return "成交熱度 —"
 
 
-def _breadth_text(row: Dict[str, Any], section: str, stage: str) -> str:
+def _breadth_text(row: Dict[str, Any], section: str, stage: str, with_heat: bool = False) -> str:
+    """上漲（或下跌）家數＋中位漲幅；成交熱度 v1.4 延後，預設不顯示。"""
     stat = row.get("stat") or {}
     if not stat.get("available"):
         return ""
     count = (f"下跌 {stat['down']}/{stat['priced']}" if section == "down"
              else f"上漲 {stat['up']}/{stat['priced']}")
-    parts = [count, f"中位 {stat['median']:+.2f}%", _heat_text(row, stage)]
-    if stat["members"] < SMALL_SECTOR:
-        parts.append(f"成分股 {stat['members']} 檔")
+    parts = [count, f"中位 {stat['median']:+.2f}%"]
+    if with_heat:
+        parts.append(_heat_text(row, stage))
     if stat["priced"] < stat["members"]:
         parts.append(f"報價 {stat['priced']}/{stat['members']}")
     return "｜".join(parts)
+
+
+def _tag(row: Dict[str, Any], section: str, stage: str) -> str:
+    """集中度小標籤：集中／廣泛（取代整句判讀與「集中型異動」區塊）。"""
+    verdict, sentence = _verdict(row, section, stage)
+    if "集中" in verdict:
+        return "集中"
+    if "廣泛" in verdict or "全面" in verdict:
+        return "廣泛"
+    if not verdict and sentence.startswith("成分股報價"):
+        return "報價不足"
+    return ""
 
 
 def _leaders_text(row: Dict[str, Any], section: str) -> str:
@@ -855,30 +910,27 @@ def _side(row: Dict[str, Any], section: str) -> str:
 
 def _card_row(index: int, row: Dict[str, Any], section: str, data: Dict[str, Any],
               tier: str = "main") -> Dict[str, Any]:
-    """圖片卡：不放 Δ ppt 與擴散度那一行（只留在文字回覆與 log）；小型族群第二行固定寫檔數＋主導股。"""
+    """圖片卡（v1.4）：
+    強勢卡　第二行＝上漲 n/N｜中位｜集中／廣泛
+    轉強／弱＝近30分 Δ｜上漲（下跌）n/N｜中位｜排名變化｜集中／廣泛（依 Δ 排序，Δ 一定要看得到）
+    下面一列領漲／領跌 TOP5。"""
     stage = data["phase"].get("phase")
     side = _side(row, section)
     labels = []
     leaders = _leaders_text(row, side)
     if leaders:
-        labels.append((_leaders_label(side), side, leaders))
-    verdict, sentence = _verdict(row, section, stage)
-    if verdict or sentence:
-        labels.append(("判讀", "accent", f"{verdict}：{sentence}" if verdict else sentence))
-    stat = row.get("stat") or {}
-    coverage = ""
-    if tier == "small":
-        members = stat.get("members") or row.get("member_count") or 0
-        coverage = "｜".join(x for x in (f"成分股 {members} 檔" if members else "",
-                                         f"{stat['driver']}主導" if stat.get("driver") else "") if x)
+        labels.append((f"{_leaders_label(side)}", side, leaders))
+    breadth = _breadth_text(row, side, stage)
+    if section in ("up", "down"):
+        breadth = "｜".join(x for x in (_delta_text(row, data), breadth) if x)
     return {
         "rank": index, "stock_code": "", "stock_name": row["name"], "market": "",
         "row_kind": "sector_group", "pattern_score": None,
         "change_pct": row["change_pct"],
-        "coverage_text": coverage,
+        "coverage_text": breadth,
         # 名次移動只在轉強／轉弱卡當輔助（組內名次）
         "ratio_text": _rank_text(row) if section in ("up", "down") else "",
-        "leader_text": "",
+        "leader_text": _tag(row, section, stage),
         "extra_labels": labels,
     }
 
@@ -928,15 +980,12 @@ def _plan(data: Dict[str, Any], scope: str, main: List[Dict[str, Any]], small: L
         by_change = sorted(main, key=lambda r: -r["change_pct"])
         ups = candidates("up", data=data, rows=main)
         downs = candidates("down", data=data, rows=main)
-        plan += [("main", "strong", {"pool": by_change[:STRONG_POOL]}, ""),
+        # v1.4：強勢區直接依類股漲幅取 TOP3，不再剔除集中拉抬（改用「集中」小標籤）
+        plan += [("main", "strong", {"rows": by_change[:STRONG_TOP]}, ""),
                  ("main", "up", {"rows": ups["candidates"]}, ups["reason"]),
                  ("main", "down", {"rows": downs["candidates"]}, downs["reason"])]
-        targets += by_change[:STRONG_POOL] + ups["candidates"] + downs["candidates"]
-    if scope == "all":
-        moves = sorted(small, key=lambda r: -abs(r["change_pct"]))[:STRONG_TOP]
-        plan.append(("small", "moves", {"rows": moves}, "今天沒有小型族群資料"))
-        targets += moves
-    if scope == "small":
+        targets += by_change[:STRONG_TOP] + ups["candidates"] + downs["candidates"]
+    if scope == "small":   # v1.4 不開放（answer 會把 scope 改成 main），保留給之後
         ups = candidates("up", data=data, rows=small, use_percentile=False)
         downs = candidates("down", data=data, rows=small, use_percentile=False)
         strong = sorted(small, key=lambda r: -r["change_pct"])[:STRONG_TOP]
@@ -957,7 +1006,10 @@ def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, A
     主要族群的強勢區剔除集中拉抬（另列「集中型異動」）；小型族群不剔除，直接標出來。
     direction 目前只保留介面。
     """
-    title = {"main": "主要族群雷達", "small": "小型族群雷達"}.get(scope, "族群雷達")
+    # v1.4：初期只看大族群（≥20 檔），「小型／主要族群雷達」都回同一份；問小型／主要時文字先講清楚
+    notice = "目前族群雷達暫以官方成分股 ≥20 檔的大族群為主。" if scope in ("small", "main") else ""
+    scope = "main"
+    title = "族群雷達"
     ensure_snapshot()
     data = deltas(now)
     if not data.get("available"):
@@ -986,17 +1038,11 @@ def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, A
     member_ok = enrich(list(unique.values()), data)
 
     stamp, _ = _stamp(data)
-    lines = [f"**{title}｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
+    lines = ([notice] if notice else []) + [f"**{title}｜{stamp}（{data['basis_label']}，基準 {data['base_time']}）**"]
     panel_list: List[Dict[str, Any]] = []
     for index_plan, (tier, section, picked, reason) in enumerate(plan):
-        concentrated: List[Dict[str, Any]] = []
-        if tier == "main" and section == "strong":
-            pool = picked["pool"]
-            concentrated = [r for r in pool[:CONCENTRATED_POOL]
-                            if r["change_pct"] > 0 and _is_concentrated(r, stage)][:CONCENTRATED_MAX]
-            rows = [r for r in pool if not _is_concentrated(r, stage)][:STRONG_TOP]
-        else:
-            rows = picked["rows"]
+        concentrated: List[Dict[str, Any]] = []      # v1.4 不再另列「集中型異動」
+        rows = picked["rows"]
         # 極小型族群掛在最後一張小型卡下面（不參與正式排名）
         tiny_here = tiny if tier == "small" and index_plan == len(plan) - 1 else []
         _log_l1(section, dict(data, groups=len(tiers[tier])), rows)
@@ -1009,10 +1055,10 @@ def answer(direction: str = "both", scope: str = "all", now=None) -> Dict[str, A
             tail = f"｜{_rank_text(row)}" if section in ("up", "down") else ""
             breadth = _breadth_text(row, "down" if side == "down" else "up", stage)
             leaders = _leaders_text(row, side)
-            verdict, sentence = _verdict(row, section, stage)
+            tag = _tag(row, section, stage)
             tail += f"｜{breadth}" if breadth else ""
+            tail += f"｜{tag}" if tag else ""
             tail += f"｜{_leaders_label(side)} {leaders}" if leaders else ""
-            tail += f"｜{verdict or sentence}" if (verdict or sentence) else ""
             lines.append(f"{index}. {row['name']} {row['change_pct']:+.2f}%｜{_delta_text(row, data)}{tail}")
         if concentrated:
             lines.append("集中型異動：" + "；".join(
