@@ -2590,7 +2590,8 @@ class AceQueryEngine:
         if missing:
             return AnswerResult(
                 text=(f"覆盤還缺：{'、'.join(missing)}。\n範例：覆盤 2454 9/1 買進 1285，理由：站上月線、外資連三天買超\n"
-                      "（價格、張數、賣出日可省略；沒寫價格就用買進日收盤價）"),
+                      "已賣出：覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…\n"
+                      "（價格、張數、賣出日可省略；沒寫價格就用當天收盤價）"),
                 route="review_help", gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
         self.log(f"覆盤｜{req['code']} {req.get('name', '')}｜買進 {req['buy_date']}｜賣出 {req.get('sell_date') or '-'}"
                  f"｜價格 {req.get('price') or '收盤'}｜抓權證={req['need_warrant']}｜抓法人={req['need_inst']}")
@@ -2602,23 +2603,38 @@ class AceQueryEngine:
         payload, panel = built["payload"], built["panel"]
         for check in payload["reason_checks"]:
             self.log(f"   理由核對 {check['status']} {check['claim']}｜{check['evidence']}")
+        # 摘要／進場理由／理由核對由程式寫；Gemini 只寫進場後發展、本次覆盤、目前觀察或賣出檢討（JSON 欄位）
         stats = AnswerStats()
-        result = self.gateway.generate(trade_review.build_prompt(payload), purpose="trade_review", temperature=0.3)
+        fallback = trade_review.rule_fields(payload)
+        result = self.gateway.generate(trade_review.build_prompt(payload), purpose="trade_review",
+                                       schema=trade_review.ai_schema(payload["mode"]), temperature=0.3)
         stats.record_gemini(result)
+        fields: Dict[str, str] = {}
+        prefix = ""
         if result.ok:
-            note, removed = prune_ungrounded_sentences(result.text, payload)
-            if removed:
-                self.log(f"覆盤事實核對：刪除 {len(removed)} 句｜" + "；".join(s[:40] for s in removed[:4]))
-            if not note or len(note) < len(result.text) * 0.6:
-                note = "（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n" + trade_review.rule_note(payload)
+            try:
+                data = json.loads(result.text)
+            except (TypeError, ValueError):
+                data = tools.core()._extract_json_from_text(result.text) or {}
+            for key, fallback_text in fallback.items():
+                text_value = str((data or {}).get(key) or "").strip() if isinstance(data, dict) else ""
+                pruned, removed = prune_ungrounded_sentences(text_value, payload)
+                pruned, hindsight = trade_review.strip_hindsight(pruned)
+                if removed or hindsight:
+                    self.log(f"覆盤核對｜{key}｜刪除 數字 {len(removed)} 句、事後歸因 {len(hindsight)} 句｜"
+                             + "；".join(s[:30] for s in (removed + hindsight)[:3]))
+                fields[key] = pruned or fallback_text
         else:
             prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 覆盤暫時無法使用，以下先提供系統整理的資料。"
-            note = f"{prefix}\n\n{trade_review.rule_note(payload)}"
+            fields = fallback
+        note = trade_review.compose(payload, fields)
+        if prefix:
+            note = f"{prefix}\n\n{note}"
         trade_review.save_note(context_key, payload, note)
-        name = payload["stock"]["name"]
-        text = f"**{name}（{payload['stock']['code']}）覆盤筆記**\n\n{note}\n\n{DISCLAIMER}"
+        heading = trade_review.title(payload)
+        text = f"**{heading}（{payload['stock']['code']}）**\n\n{note}\n\n{DISCLAIMER}"
         return AnswerResult(text=text, route="trade_review", gemini_calls=stats.gemini_calls, elapsed=elapsed(),
-                            cacheable=False, panels=[panel], image_title=f"{name} 覆盤筆記",
+                            cacheable=False, panels=[panel], image_title=heading,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
                             total_tokens=stats.total_tokens, token_source=stats.token_source)
 
@@ -3347,7 +3363,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
 • `族群雷達`／`轉強族群`／`轉弱族群`：主要族群（>10 檔）強勢／轉強／轉弱＋小型族群異動，/ask 也可問「哪些族群正在轉強」
 • `主要族群雷達`（或 `大型族群雷達`）／`小型族群雷達`：只看其中一組，組內比較
-• `覆盤 2454 9/1 買進 1285，理由：…`：個人交易覆盤筆記（K 線下方紫色 ▲「買」標買點）；`我的覆盤` 列出紀錄
+• `覆盤 2454 9/1 買進 1285，理由：…`：持倉中覆盤（K 線下方紫色 ▲「買」標買點）；`我的覆盤` 列出紀錄
+• `覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…`：完整交易覆盤（含 MFE／MAE、賣後 5 日）
 • `用量`：今日 Gemini 與各 API 使用量
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
