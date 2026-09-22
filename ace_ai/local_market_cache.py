@@ -6,14 +6,17 @@ small: only the latest N trading days per stock are kept.
 """
 from __future__ import annotations
 
+import gzip
+import io
 import json
+import math
 import os
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -75,6 +78,27 @@ def _connect() -> sqlite3.Connection:
                         cache_hit INTEGER DEFAULT 0
                     )
                 """)
+                # 盤中高頻資料一律「一筆一列」往後加，不再每 5 分鐘整包重寫 JSON（降低底層區塊重寫量）
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS radar_snapshots (
+                        day TEXT NOT NULL, time TEXT NOT NULL, data TEXT NOT NULL,
+                        PRIMARY KEY (day, time)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS radar_turnover (
+                        day TEXT NOT NULL, bucket TEXT NOT NULL, data TEXT NOT NULL,
+                        PRIMARY KEY (day, bucket)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ivol_samples (
+                        day TEXT NOT NULL, code TEXT NOT NULL, bucket INTEGER NOT NULL,
+                        market TEXT DEFAULT 'twse', lots REAL, pred REAL,
+                        PRIMARY KEY (day, code, bucket)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_radar_turnover_bucket ON radar_turnover(bucket, day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_log(day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_code_date ON daily_bars(stock_code, date DESC)")
@@ -395,6 +419,384 @@ def delete_state(key: str) -> None:
         return
 
 
+# ============================================================
+# 盤中高頻資料（append-only）：族群雷達快照、成交占比、盤中量能原始取樣
+# ============================================================
+
+def _write(sql: str, params: tuple) -> None:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                conn.execute(sql, params)
+                conn.commit()
+    except Exception:
+        return
+
+
+def _read(sql: str, params: tuple) -> List[tuple]:
+    try:
+        with _LOCK:
+            with _db() as conn:
+                return conn.execute(sql, params).fetchall()
+    except Exception:
+        return []
+
+
+def append_radar_snapshot(day: str, snapshot: Dict[str, Any]) -> None:
+    _write("INSERT INTO radar_snapshots(day,time,data) VALUES(?,?,?) "
+           "ON CONFLICT(day,time) DO UPDATE SET data=excluded.data",
+           (day, str(snapshot.get("time") or ""), json.dumps(snapshot, ensure_ascii=False, default=str)))
+
+
+def load_radar_snapshots(day: str) -> List[Dict[str, Any]]:
+    return [json.loads(r[0]) for r in _read("SELECT data FROM radar_snapshots WHERE day=? ORDER BY time", (day,))]
+
+
+def save_radar_turnover(day: str, bucket: str, data: Dict[str, Any]) -> None:
+    _write("INSERT INTO radar_turnover(day,bucket,data) VALUES(?,?,?) "
+           "ON CONFLICT(day,bucket) DO UPDATE SET data=excluded.data",
+           (day, bucket, json.dumps(data, ensure_ascii=False, default=str)))
+
+
+def load_radar_turnover(bucket: str, before_day: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """同一個 5 分鐘桶、今天以前的成交占比歷史（新到舊）。"""
+    rows = _read("SELECT data FROM radar_turnover WHERE bucket=? AND day<? ORDER BY day DESC LIMIT ?",
+                 (bucket, before_day, int(limit)))
+    return [json.loads(r[0]) for r in rows]
+
+
+def ivol_record(day: str, code: str, market: str, bucket: int, lots: float,
+                pred: Optional[float] = None) -> None:
+    _write("INSERT INTO ivol_samples(day,code,bucket,market,lots,pred) VALUES(?,?,?,?,?,?) "
+           "ON CONFLICT(day,code,bucket) DO UPDATE SET lots=excluded.lots, market=excluded.market, "
+           "pred=COALESCE(excluded.pred,ivol_samples.pred)",
+           (day, str(code), int(bucket), market, float(lots), float(pred) if pred is not None else None))
+
+
+def ivol_record_pred(day: str, code: str, bucket: int, pred: float) -> None:
+    _write("UPDATE ivol_samples SET pred=? WHERE day=? AND code=? AND bucket=?", (float(pred), day, str(code), int(bucket)))
+
+
+def ivol_load_day(day: str) -> Dict[str, Dict[str, Any]]:
+    """{代號: {market, points: {bucket: 累積張數}, pred: {bucket: 當時預估全日量}}}（和舊 JSON 格式相同）。"""
+    out: Dict[str, Dict[str, Any]] = {}
+    for code, bucket, market, lots, pred in _read(
+            "SELECT code,bucket,market,lots,pred FROM ivol_samples WHERE day=?", (day,)):
+        entry = out.setdefault(str(code), {"market": market or "twse", "points": {}})
+        if lots is not None:
+            entry["points"][str(bucket)] = float(lots)
+        if pred is not None:
+            entry.setdefault("pred", {})[str(bucket)] = float(pred)
+    return out
+
+
+def ivol_delete_day(day: str) -> None:
+    _write("DELETE FROM ivol_samples WHERE day=?", (day,))
+
+
+def ivol_pending_days(today: str) -> List[str]:
+    cutoff, today = _retention_window(IVOL_RAW_KEEP_DAYS, today)
+    days = {r[0] for r in _read("SELECT DISTINCT day FROM ivol_samples WHERE day>=? AND day<=?", (cutoff, today))}
+    days.update(d for d in (get_state("ivol_samples", {}) or {}) if cutoff <= d <= today)
+    return sorted(days)
+
+
+def volume_calibration_inputs(day: str) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """只用指定日期的正式收盤量；重試舊樣本時不能誤用今天的量。"""
+    rows = _read("""WITH ranked AS (
+        SELECT stock_code,date,volume,
+               ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY date DESC) AS rn
+        FROM daily_bars WHERE confirmed=1 AND date<=?
+    ) SELECT stock_code,MAX(CASE WHEN date=? THEN volume END)/1000.0,AVG(volume)/1000.0
+      FROM ranked WHERE rn<=20 GROUP BY stock_code""", (day, day))
+    return ({code: lots for code, lots, _ in rows if lots is not None},
+            {code: avg for code, _, avg in rows if avg is not None})
+
+
+def _put_states(conn: sqlite3.Connection, state: Dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn.executemany("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                     [(key, json.dumps(value, ensure_ascii=False, allow_nan=False), now)
+                      for key, value in state.items()])
+
+
+def save_ivol_learning_state(day: str, daily: dict, curves: dict,
+                             errors: dict, errors_hist: dict) -> None:
+    """學習結果、讀回確認與新舊原始樣本清除共用一個 transaction；失敗向上拋出並回滾。"""
+    state = {"ivol_daily_medians": daily, "ivol_curves": curves,
+             "ivol_errors": errors, "ivol_errors_hist": errors_hist}
+    with _LOCK, _db() as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _put_states(conn, state)
+        for key, value in state.items():
+            row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            if row is None or json.loads(row[0]) != value:
+                raise RuntimeError(f"量能學習寫入驗證失敗：{key}")
+        conn.execute("DELETE FROM ivol_samples WHERE day=?", (day,))
+        row = conn.execute("SELECT value FROM kv WHERE key='ivol_samples'").fetchone()
+        if row:
+            legacy = json.loads(row[0])
+            legacy.pop(day, None)
+            if legacy:
+                _put_states(conn, {"ivol_samples": legacy})
+            else:
+                conn.execute("DELETE FROM kv WHERE key='ivol_samples'")
+
+
+# ============================================================
+# 每日維護：所有過期資料集中在這裡一天清一次，最後做 WAL checkpoint（不做 VACUUM）
+# ============================================================
+
+RADAR_KEEP_DAYS = 3          # 族群雷達快照只用當天，多留幾天方便查問題
+IVOL_RAW_KEEP_DAYS = 3       # 盤中量能原始取樣：收盤校正後就刪，這裡只是保險
+TURNOVER_KEEP_DAYS = 45      # 同時點成交占比歷史（成交熱度基準）
+
+
+def _retention_window(days: int, today: str = "") -> Tuple[str, str]:
+    today = today or (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    return cutoff, today
+
+
+def _recent_turnover(conn: sqlite3.Connection, today: str = "") -> List[Dict[str, Any]]:
+    """新舊格式合併，同日同桶以新表為準，保留與每日維護相同的日曆日範圍。"""
+    cutoff, today = _retention_window(TURNOVER_KEEP_DAYS, today)
+    entries = {}
+    for key, value in conn.execute("SELECT key,value FROM kv WHERE key GLOB 'radar_turnover:*'"):
+        day = key.split(":", 1)[1]
+        if cutoff <= day <= today:
+            for bucket, data in json.loads(value).items():
+                entries[(day, bucket)] = data
+    for day, bucket, data in conn.execute(
+            "SELECT day,bucket,data FROM radar_turnover WHERE day>=? AND day<=?", (cutoff, today)):
+        entries[(day, bucket)] = json.loads(data)
+    return [{"day": day, "bucket": bucket, "data": data}
+            for (day, bucket), data in sorted(entries.items())]
+
+
+def daily_maintenance(today: str = "") -> Dict[str, int]:
+    """清過期的雷達快照／量能原始取樣／成交占比／用量紀錄／舊版 JSON 快照，裁掉超過保留天數的日 K，
+    最後 PRAGMA wal_checkpoint(TRUNCATE)。刻意不 VACUUM：整顆重寫反而放大底層區塊重寫量。"""
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    today = today or now.strftime("%Y-%m-%d")
+    base = datetime.strptime(today, "%Y-%m-%d")
+    cut = lambda days: (base - timedelta(days=days)).strftime("%Y-%m-%d")
+    removed: Dict[str, int] = {}
+    try:
+        with _LOCK:
+            with _db() as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                # 舊成交占比不能重建，先搬到新表才清 JSON；新表已有的桶不覆蓋。
+                conn.executemany("INSERT INTO radar_turnover(day,bucket,data) VALUES(?,?,?) "
+                                 "ON CONFLICT(day,bucket) DO NOTHING",
+                                 [(r["day"], r["bucket"], json.dumps(r["data"], ensure_ascii=False))
+                                  for r in _recent_turnover(conn, today)])
+                row = conn.execute("SELECT value FROM kv WHERE key='ivol_samples'").fetchone()
+                removed["legacy_ivol_samples"] = 0
+                if row:
+                    legacy = json.loads(row[0])
+                    kept = {d: v for d, v in legacy.items() if d >= cut(IVOL_RAW_KEEP_DAYS)}
+                    removed["legacy_ivol_samples"] = len(legacy) - len(kept)
+                    if not kept:
+                        conn.execute("DELETE FROM kv WHERE key='ivol_samples'")
+                    elif kept != legacy:
+                        _put_states(conn, {"ivol_samples": kept})
+                for label, sql, arg in (
+                        ("radar_snapshots", "DELETE FROM radar_snapshots WHERE day < ?", cut(RADAR_KEEP_DAYS)),
+                        ("ivol_samples", "DELETE FROM ivol_samples WHERE day < ?", cut(IVOL_RAW_KEEP_DAYS)),
+                        ("radar_turnover", "DELETE FROM radar_turnover WHERE day < ?", cut(TURNOVER_KEEP_DAYS)),
+                        ("usage_log", "DELETE FROM usage_log WHERE day < ?", cut(USAGE_KEEP_DAYS)),
+                        # 舊版每 5 分鐘整包重寫的 JSON（改成資料表後就不再使用）；當天的先留著給當天讀
+                        ("legacy_radar_snap", "DELETE FROM kv WHERE key LIKE 'radar_snap:%' AND key < ?",
+                         "radar_snap:" + today),
+                        ("legacy_radar_turnover", "DELETE FROM kv WHERE key GLOB 'radar_turnover:*' AND key <= ?",
+                         "radar_turnover:" + today)):
+                    removed[label] = conn.execute(sql, (arg,)).rowcount
+                conn.commit()
+        removed["daily_bars"] = trim_history(KEEP_DAYS)
+        with _LOCK:
+            with _db() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as exc:
+        print(f"⚠️ 本地資料庫每日維護失敗｜{type(exc).__name__}: {exc}", flush=True)
+        return removed
+    size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    print("🧹 本地資料庫每日維護｜" + "｜".join(f"{k} -{v}" for k, v in removed.items())
+          + f"｜檔案 {size / 1024 / 1024:.1f}MB（WAL 已 checkpoint）", flush=True)
+    return removed
+
+
+# ============================================================
+# 狀態匯出／匯入：只搬「不能重建」的資料（使用者覆盤、盤中量能學習結果、成交占比），
+# 日 K、型態分數、雷達快照、用量紀錄、名冊都會自己重建，不搬。
+# ============================================================
+
+EXPORT_PREFIXES = ("trade_review:",)
+EXPORT_KEYS = ("ivol_daily_medians", "ivol_curves", "ivol_errors", "ivol_errors_hist")
+EXPORT_VERSION = 2
+STATE_FILE_MAX_BYTES = 10 * 1024 * 1024
+STATE_JSON_MAX_BYTES = 50 * 1024 * 1024  # 解壓時也設上限，避免小 gzip 展開耗盡記憶體
+
+
+def _exportable(key: str) -> bool:
+    return key in EXPORT_KEYS or any(key.startswith(p) for p in EXPORT_PREFIXES)
+
+
+def export_state() -> Tuple[bytes, Dict[str, Any]]:
+    """回傳 (gzip 後的 JSON, 摘要)。"""
+    with _LOCK, _db() as conn, conn:
+        conn.execute("BEGIN")
+        rows = conn.execute("SELECT key,value FROM kv").fetchall()
+        state = {k: json.loads(v) for k, v in rows if _exportable(k)}
+        turnover = _recent_turnover(conn)
+    payload = {"version": EXPORT_VERSION, "exported_at": datetime.now(timezone.utc).isoformat(),
+               "kv": state, "radar_turnover": turnover}
+    raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if len(raw) > STATE_JSON_MAX_BYTES:
+        raise ValueError("狀態內容超過解壓後 50MB 上限")
+    data = gzip.compress(raw)
+    if len(data) > STATE_FILE_MAX_BYTES:
+        raise ValueError("狀態匯出檔超過 10MB 上限")
+    return data, _state_summary(state, turnover)
+
+
+def _state_summary(state: Dict[str, Any], turnover: Optional[List[dict]] = None) -> Dict[str, Any]:
+    reviews = {k: v for k, v in state.items() if k.startswith("trade_review:")}
+    curves = state.get("ivol_curves") or {}
+    return {"users": len(reviews), "reviews": sum(len(v or []) for v in reviews.values()),
+            "ivol_days": max([int((curves.get(m) or {}).get("days") or 0) for m in ("twse", "tpex")] or [0]),
+            "other_keys": sum(1 for k in state if k in EXPORT_KEYS),
+            "turnover_rows": len(turnover or []),
+            "turnover_days": len({r["day"] for r in turnover or []})}
+
+
+def _valid_day(value: Any) -> bool:
+    try:
+        return isinstance(value, str) and datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
+    except ValueError:
+        return False
+
+
+def _finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _validate_state_payload(payload: Any) -> None:
+    """所有結構與白名單在交易開始前驗證，錯誤檔不能造成部分匯入。"""
+    def require(condition: bool) -> None:
+        if not condition:
+            raise ValueError("檔案格式、版本或資料不符，請用 /ace 匯出狀態 產生的檔案")
+
+    def points(value: Any, ratio: bool = False) -> None:
+        require(isinstance(value, dict))
+        for bucket, number in value.items():
+            require(bucket.isascii() and bucket.isdigit() and 540 <= int(bucket) <= 810 and int(bucket) % 5 == 0)
+            require(_finite_number(number) and number >= 0 and (not ratio or number <= 1))
+
+    require(isinstance(payload, dict))
+    require(type(payload.get("version")) is int and payload["version"] in (1, EXPORT_VERSION))
+    require(set(payload) <= {"version", "exported_at", "kv", "radar_turnover"})
+    require(isinstance(payload.get("exported_at"), str) and isinstance(payload.get("kv"), dict))
+    require(payload["version"] == 1 or "radar_turnover" in payload)
+    for key, value in payload["kv"].items():
+        require(_exportable(key))
+        if key.startswith("trade_review:"):
+            require(bool(key.removeprefix("trade_review:")) and isinstance(value, list))
+            for record in value:
+                require(isinstance(record, dict))
+                require(isinstance(record.get("trade_id"), str) and bool(record["trade_id"]))
+                require(_finite_number(record.get("at", 0)))
+            continue
+        require(isinstance(value, dict) and set(value) <= {"twse", "tpex"})
+        for market, entry in value.items():
+            require(isinstance(entry, dict))
+            if key == "ivol_curves":
+                require(set(entry) <= {"days", "points", "at"})
+                require(type(entry.get("days")) is int and entry["days"] >= 0)
+                require(_finite_number(entry.get("at", 0)))
+                points(entry.get("points", {}), ratio=True)
+            elif key == "ivol_errors":
+                points(entry)
+            else:
+                for day, values in entry.items():
+                    require(_valid_day(day))
+                    points(values, ratio=key == "ivol_daily_medians")
+    require(isinstance(payload.get("radar_turnover", []), list))
+    for row in payload.get("radar_turnover", []):
+        require(isinstance(row, dict) and set(row) == {"day", "bucket", "data"})
+        require(_valid_day(row["day"]))
+        bucket = row["bucket"]
+        require(isinstance(bucket, str) and len(bucket) == 4 and bucket.isascii() and bucket.isdigit())
+        require(int(bucket[:2]) < 24 and int(bucket[2:]) < 60 and int(bucket[2:]) % 5 == 0)
+        entry = row["data"]
+        require(isinstance(entry, dict) and set(entry) == {"market", "sectors"})
+        require(_finite_number(entry["market"]) and entry["market"] > 0)
+        require(isinstance(entry["sectors"], dict))
+        require(all(sid and _finite_number(v) and v >= 0 for sid, v in entry["sectors"].items()))
+
+
+def import_state(data: bytes) -> Dict[str, Any]:
+    """覆盤與成交占比只補缺漏；量能依市場比較日數，四份學習狀態一起更新。"""
+    if len(data) > STATE_FILE_MAX_BYTES:
+        raise ValueError("檔案太大（上限 10MB）")
+    try:
+        if data[:2] == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+                raw = stream.read(STATE_JSON_MAX_BYTES + 1)
+        else:
+            raw = data
+        if len(raw) > STATE_JSON_MAX_BYTES:
+            raise ValueError("解壓後超過 50MB 上限")
+        payload = json.loads(raw.decode("utf-8"))
+        _validate_state_payload(payload)
+    except Exception as exc:
+        raise ValueError(f"檔案不是有效的狀態匯出檔：{exc}") from exc
+    incoming = payload["kv"]
+    cutoff, today = _retention_window(TURNOVER_KEEP_DAYS)
+    turnover = [r for r in payload.get("radar_turnover", []) if cutoff <= r["day"] <= today]
+    with _LOCK, _db() as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = {k: json.loads(v) for k, v in conn.execute("SELECT key,value FROM kv") if _exportable(k)}
+        updates = {}
+        for key, value in incoming.items():
+            if not key.startswith("trade_review:"):
+                continue
+            existing = list(current.get(key) or [])
+            merged = list(existing)
+            seen = {r.get("trade_id") for r in existing}
+            for record in value:
+                if record["trade_id"] not in seen:
+                    merged.append(record)
+                    seen.add(record["trade_id"])
+            if len(merged) != len(existing):
+                updates[key] = sorted(merged, key=lambda r: float(r.get("at") or 0))
+        for market in ("twse", "tpex"):
+            curve = (incoming.get("ivol_curves") or {}).get(market) or {}
+            old_curve = (current.get("ivol_curves") or {}).get(market) or {}
+            if int(curve.get("days") or 0) <= int(old_curve.get("days") or 0):
+                continue
+            for key in EXPORT_KEYS:
+                updated = dict(updates.get(key, current.get(key)) or {})
+                if market in incoming.get(key, {}):
+                    updated[market] = incoming[key][market]
+                else:
+                    updated.pop(market, None)  # 舊版不完整檔不沿用另一條曲線的學習歷史
+                if updated != current.get(key, {}):
+                    updates[key] = updated
+        _put_states(conn, updates)
+        written_turnover = 0
+        for row in turnover:
+            written_turnover += conn.execute(
+                "INSERT INTO radar_turnover(day,bucket,data) VALUES(?,?,?) ON CONFLICT(day,bucket) DO NOTHING",
+                (row["day"], row["bucket"], json.dumps(row["data"], ensure_ascii=False))).rowcount
+        current.update(updates)
+        summary = _state_summary(current, _recent_turnover(conn, today))
+    summary.update({"written_keys": len(updates), "written_turnover": written_turnover,
+                    "exported_at": payload["exported_at"]})
+    return summary
+
+
 def stats() -> Dict[str, Any]:
     try:
         with _LOCK:
@@ -432,8 +834,7 @@ def log_usage(route: str, gemini_calls: int, input_tokens: int, output_tokens: i
                      int(gemini_calls or 0), int(input_tokens or 0), int(output_tokens or 0),
                      str(token_source or ""), json.dumps(api_usage or {}, ensure_ascii=False),
                      float(elapsed or 0.0), 1 if cache_hit else 0))
-                conn.execute("DELETE FROM usage_log WHERE day < ?",
-                             ((now - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d"),))
+                # 舊紀錄不在每題刪：統一由 daily_maintenance() 一天清一次
                 conn.commit()
     except Exception:
         pass

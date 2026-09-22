@@ -32,7 +32,7 @@ MAX_STEP = 0.02             # 單日每個時點最多調整 2 個百分點
 ABNORMAL_VOLUME_X = 3.0     # 當日量 > 20 日均量的幾倍就不拿來訓練曲線
 MIN_TRAIN_LOTS = 500        # 成交量過低的股票不訓練曲線
 BASKET_PER_MARKET = 10
-SAMPLES_KEY = "ivol_samples"        # 當日原始樣本，收盤校正後清掉
+SAMPLES_KEY = "ivol_samples"        # 舊版：當日原始樣本整包 JSON（改存 ivol_samples 資料表，只剩部署當天相容讀取）
 DAILY_KEY = "ivol_daily_medians"    # 每日×市場×時點中位數（保留 KEEP_DAYS 日）
 CURVE_KEY = "ivol_curves"           # 目前使用的曲線
 ERROR_KEY = "ivol_errors"           # 各時點歷史預測誤差
@@ -126,7 +126,8 @@ def _confidence(error_pct: Optional[float]) -> Tuple[str, str]:
 # 盤中記錄與估算
 # ============================================================
 
-def record_sample(code: str, market: str, cumulative_lots: float, now=None) -> None:
+def record_sample(code: str, market: str, cumulative_lots: float, now=None,
+                  pred: Optional[float] = None) -> None:
     """同股票×同日×同 5 分鐘只存一筆（覆蓋更新）。"""
     if not code or not cumulative_lots or cumulative_lots <= 0:
         return
@@ -134,14 +135,11 @@ def record_sample(code: str, market: str, cumulative_lots: float, now=None) -> N
     minutes = now.hour * 60 + now.minute
     if not (OPEN_MINUTES <= minutes <= CLOSE_MINUTES):
         return
-    day = now.strftime("%Y-%m-%d")
-    samples = _state(SAMPLES_KEY, {})
-    today = samples.setdefault(day, {})
-    entry = today.setdefault(str(code), {"market": market if market in DEFAULT_CURVES else "twse", "points": {}})
-    entry["points"][str(_bucket(minutes))] = round(float(cumulative_lots), 1)
-    for old in sorted(samples)[:-3]:            # 原始樣本只留最近幾天
-        samples.pop(old, None)
-    local_market_cache.set_state(SAMPLES_KEY, samples)
+    # 一檔×一個時點一列（ivol_samples 表），不再每次把「當天所有股票的樣本」整包 JSON 重寫
+    local_market_cache.ivol_record(now.strftime("%Y-%m-%d"), str(code),
+                                   market if market in DEFAULT_CURVES else "twse",
+                                   _bucket(minutes), round(float(cumulative_lots), 1),
+                                   pred=round(float(pred), 1) if pred is not None else None)
 
 
 def estimate(code: str, market: str, cumulative_lots: Optional[float],
@@ -183,20 +181,10 @@ def estimate(code: str, market: str, cumulative_lots: Optional[float],
                            else "明顯量縮" if main <= -30 else "溫和量縮" if main <= -10 else "與常態相當")
         result["baseline"] = "20日均量"
     try:
-        record_sample(code, market, float(cumulative_lots), now)
-        _record_prediction(code, market, minutes, estimated, now)
+        record_sample(code, market, float(cumulative_lots), now, pred=estimated)
     except Exception:
         pass
     return result
-
-
-def _record_prediction(code: str, market: str, minutes: int, estimated: float, now) -> None:
-    samples = _state(SAMPLES_KEY, {})
-    entry = (samples.get(now.strftime("%Y-%m-%d")) or {}).get(str(code))
-    if entry is None:
-        return
-    entry.setdefault("pred", {})[str(_bucket(minutes))] = round(float(estimated), 1)
-    local_market_cache.set_state(SAMPLES_KEY, samples)
 
 
 # ============================================================
@@ -287,14 +275,19 @@ def calibrate(full_day_lots: Dict[str, float], avg20_lots: Dict[str, float],
               day: str = "", session_ok: bool = True) -> Dict[str, Any]:
     """收盤後回算真實係數並更新曲線與誤差統計。"""
     day = day or tools.taipei_now().strftime("%Y-%m-%d")
-    samples = _state(SAMPLES_KEY, {})
-    today = samples.get(day) or {}
+    today = _state(SAMPLES_KEY, {}).get(day) or {}
+    for code, entry in local_market_cache.ivol_load_day(day).items():
+        legacy = today.get(code) or {}
+        today[code] = {**legacy, **entry,
+                       "points": {**(legacy.get("points") or {}), **(entry.get("points") or {})},
+                       "pred": {**(legacy.get("pred") or {}), **(entry.get("pred") or {})}}
     if not today:
         return {"updated": 0, "reason": "no_samples"}
     if not session_ok:
-        samples.pop(day, None)
-        local_market_cache.set_state(SAMPLES_KEY, samples)
+        local_market_cache.ivol_delete_day(day)
         return {"updated": 0, "reason": "非正常交易日，不納入訓練"}
+    if not any(float(full_day_lots.get(code) or 0) > 0 for code in today):
+        return {"updated": 0, "reason": "尚無當日正式收盤量，保留樣本待重試"}
 
     ratios: Dict[str, Dict[int, List[float]]] = {"twse": {}, "tpex": {}}
     errors: Dict[str, Dict[int, List[float]]] = {"twse": {}, "tpex": {}}
@@ -330,7 +323,6 @@ def calibrate(full_day_lots: Dict[str, float], avg20_lots: Dict[str, float],
         per_day[day] = {str(b): round(statistics.median(v), 4) for b, v in buckets.items() if len(v) >= 3}
         for old in sorted(per_day)[:-KEEP_DAYS]:
             per_day.pop(old, None)
-    local_market_cache.set_state(DAILY_KEY, daily)
 
     curves = _state(CURVE_KEY, {})
     summary = {}
@@ -365,7 +357,6 @@ def calibrate(full_day_lots: Dict[str, float], avg20_lots: Dict[str, float],
         curves[market] = {"points": {str(k): v for k, v in points.items()},
                           "days": len(per_day), "at": time.time()}
         summary[market] = f"{len(points)} 個時點｜樣本 {len(per_day)} 日"
-    local_market_cache.set_state(CURVE_KEY, curves)
 
     # 誤差統計（近 KEEP_DAYS 日中位數），用來決定輸出語氣
     error_state = _state(ERROR_KEY, {})
@@ -380,11 +371,8 @@ def calibrate(full_day_lots: Dict[str, float], avg20_lots: Dict[str, float],
             for bucket, err in values.items():
                 merged.setdefault(bucket, []).append(float(err))
         error_state[market] = {b: round(statistics.median(v), 2) for b, v in merged.items() if v}
-    local_market_cache.set_state(ERROR_KEY + "_hist", error_hist)
-    local_market_cache.set_state(ERROR_KEY, error_state)
-
-    samples.pop(day, None)                                # 原始樣本用完就刪
-    local_market_cache.set_state(SAMPLES_KEY, samples)
+    # 四份學習結果與新舊樣本刪除一起提交；寫入或清除失敗時全部回滾。
+    local_market_cache.save_ivol_learning_state(day, daily, curves, error_state, error_hist)
     print(f"📏 盤中量能曲線校正｜{day}｜訓練 {trained} 檔／排除 {skipped} 檔｜" +
           "｜".join(f"{m}：{t}" for m, t in summary.items()), flush=True)
     return {"updated": len(summary), "trained": trained, "skipped": skipped, "summary": summary}

@@ -3382,6 +3382,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `覆盤 2454 9/1 買進 1285，理由：…`：持倉中覆盤（K 線下方紫色 ▲「買」標買點）；`我的覆盤` 列出紀錄
 • `覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…`：完整交易覆盤（含 MFE／MAE、賣後 5 日）
 • `用量`：今日 Gemini 與各 API 使用量
+• `匯出狀態`：打包覆盤紀錄、盤中量能學習結果與近 45 天成交占比（只有自己看得到，換 Volume 前用）
+• `匯入狀態`＋attachment：匯回上面的檔案（已存在的紀錄不覆蓋）
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
 
@@ -3423,7 +3425,7 @@ def _fmt_mb(value: Any) -> str:
     except Exception:
         return "-"
 
-_volume_curve_day = [""]
+_db_maintenance_day = [""]
 
 
 def _market_maintenance_loop(stop: threading.Event) -> None:
@@ -3453,28 +3455,28 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                 except Exception as exc:
                     print(f"⚠️ 盤中量能取樣略過｜{type(exc).__name__}", flush=True)
             today = now.strftime("%Y-%m-%d")
-            # 收盤後用當日實際成交量回算時段係數，讓盤中量能估算越用越準（每天一次）。
-            if _volume_curve_day[0] != today and now.hour * 60 + now.minute >= 15 * 60:
-                _volume_curve_day[0] = today
-                try:
-                    import intraday_volume
-                    codes = local_market_cache.codes_with_history(2)
-                    lots = {c: (v.get("volume") or 0) / 1000
-                            for c, v in local_market_cache.latest_changes(codes).items()}
-                    avg20 = {c: float((v or {}).get("avg_lots") or 0)
-                             for c, v in local_market_cache.liquidity_map(20).items()}
-                    intraday_volume.calibrate(lots, avg20, day=today)
-                except Exception as exc:
-                    print(f"⚠️ 盤中量能曲線校正略過｜{type(exc).__name__}", flush=True)
             minutes = now.hour * 60 + now.minute
             after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5
-            need_history = int(info.get("days") or 0) < 60
+            need_history = int(info.get("days") or 0) < market_data.HISTORY_DAYS
             need_today = after_close and str(info.get("last_day") or "") < today and last_attempt != today
             if need_history or need_today:
                 last_attempt = today if need_today else last_attempt
                 result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
                 print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
                       f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+            # 先同步正式收盤，再校正保留期內未完成的日期；成功後樣本已刪，自然不重跑。
+            if minutes >= 15 * 60:
+                import intraday_volume
+                for day in local_market_cache.ivol_pending_days(today):
+                    try:
+                        lots, avg20 = local_market_cache.volume_calibration_inputs(day)
+                        intraday_volume.calibrate(lots, avg20, day=day)
+                    except Exception as exc:
+                        print(f"⚠️ 盤中量能曲線校正略過｜{day}｜{type(exc).__name__}: {exc}", flush=True)
+            # 每日清過期資料＋WAL checkpoint，不 VACUUM。
+            if _db_maintenance_day[0] != today and minutes >= 15 * 60 + 30:
+                _db_maintenance_day[0] = today
+                local_market_cache.daily_maintenance(today)
             if int(market_data.coverage().get("days") or 0) >= 20:
                 market_scan.score_pending(budget_seconds=MARKET_SCORE_BUDGET)
         except Exception as exc:
@@ -3561,6 +3563,9 @@ def run_discord_bot(config: BotConfig) -> None:
     注意：Slash 指令走 Gateway。這個 Bot 所屬的 Discord Application 不可設定
     Interactions Endpoint URL（現有 Cloudflare Worker 的 /w、/ww 用的是另一個 Application）。
     """
+    # 綁到模組全域：slash 指令參數型別（例如 attachment: Optional[discord.Attachment]）在
+    # `from __future__ import annotations` 下是字串，discord.py 會用模組全域解析，找不到 discord 會註冊失敗。
+    global discord
     import discord
     from discord import app_commands
 
@@ -3757,9 +3762,59 @@ def run_discord_bot(config: BotConfig) -> None:
         await handle_question(interaction, question, admin_mode=False)
 
     @client.tree.command(name=config.admin_command_name, description="艾斯 AI 管理員：本週精選、草稿編輯與資料維護")
-    @app_commands.describe(question="例如：本週精選排名／3006 幫我生成週精選文字／系統狀態／說明")
-    async def admin_command(interaction: "discord.Interaction", question: str) -> None:
+    @app_commands.describe(question="例如：本週精選排名／3006 幫我生成週精選文字／系統狀態／說明",
+                           attachment="只有「匯入狀態」需要：附上「匯出狀態」產生的 .json.gz 檔")
+    async def admin_command(interaction: "discord.Interaction", question: str,
+                            attachment: Optional[discord.Attachment] = None) -> None:
+        compact = re.sub(r"\s+", "", question or "")
+        if compact in ("匯出狀態", "匯入狀態", "導出狀態", "導入狀態"):
+            await handle_state_command(interaction, compact, attachment)
+            return
         await handle_question(interaction, question, admin_mode=True)
+
+    async def handle_state_command(interaction: "discord.Interaction", command: str,
+                                   attachment: Optional["discord.Attachment"]) -> None:
+        """搬 Volume 用：匯出／匯入使用者覆盤、盤中量能學習結果與近 45 天成交占比。
+        內容含會員交易資料 → 只限伺服器管理員，回覆一律只有自己看得到，不會進 Git。"""
+        if not _is_guild_admin(interaction.user):
+            await interaction.response.send_message("此功能只限伺服器管理員使用。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            if command in ("匯出狀態", "導出狀態"):
+                data, summary = await asyncio.to_thread(local_market_cache.export_state)
+                name = f"ace_state_{tools.taipei_now():%Y%m%d_%H%M}.json.gz"
+                text = (f"✅ 狀態匯出完成｜{len(data) / 1024:.1f}KB\n"
+                        f"覆盤紀錄：{summary['reviews']} 筆｜使用者：{summary['users']} 人｜"
+                        f"盤中量能學習：{summary['ivol_days']} 日｜其他永久狀態：{summary['other_keys']} 項\n"
+                        f"成交占比：{summary['turnover_days']} 天／{summary['turnover_rows']} 筆\n"
+                        "檔案含會員交易紀錄，請自行保存，不要放進 Git。換新 Volume 後用「/ace 匯入狀態」附上這個檔。")
+                await interaction.followup.send(content=text, file=discord.File(io.BytesIO(data), filename=name),
+                                                ephemeral=True)
+                print(f"📦 狀態匯出｜{summary}｜{len(data)} bytes｜by {interaction.user.id}", flush=True)
+                return
+            if attachment is None:
+                await interaction.followup.send("請在「attachment」欄位附上「/ace 匯出狀態」產生的 .json.gz 檔。", ephemeral=True)
+                return
+            if attachment.size > local_market_cache.STATE_FILE_MAX_BYTES:
+                await interaction.followup.send("檔案太大（上限 10MB），請確認是「匯出狀態」產生的檔案。", ephemeral=True)
+                return
+            raw = await attachment.read()
+            summary = await asyncio.to_thread(local_market_cache.import_state, raw)
+            await interaction.followup.send(
+                f"✅ 狀態匯入完成（匯出時間 {summary.get('exported_at', '')[:16]}）\n"
+                f"覆盤紀錄：{summary['reviews']} 筆｜使用者：{summary['users']} 人｜"
+                f"盤中量能學習：{summary['ivol_days']} 日｜其他永久狀態：{summary['other_keys']} 項｜"
+                f"實際寫入 {summary['written_keys']} 項\n"
+                f"成交占比：{summary['turnover_days']} 天／{summary['turnover_rows']} 筆，新增 {summary['written_turnover']} 筆"
+                "（已存在的紀錄不覆蓋）", ephemeral=True)
+            print(f"📦 狀態匯入｜{summary}｜by {interaction.user.id}", flush=True)
+        except ValueError as exc:
+            await interaction.followup.send(f"匯入失敗：{exc}", ephemeral=True)
+        except Exception as exc:
+            print(f"❌ 狀態{command}失敗：{type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
+            await interaction.followup.send("處理失敗，請稍後再試（詳見 log）。", ephemeral=True)
 
     @client.event
     async def on_message(message: "discord.Message") -> None:
