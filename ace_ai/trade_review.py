@@ -184,6 +184,14 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
         bollinger = tools.analyze_bollinger(part)
     except Exception:
         bollinger = {}
+    # 最近 3 根（含當天）收盤站上布林上軌的是第幾天前：0＝當天、None＝沒有
+    upper_break = None
+    for back in range(0, min(3, len(part))):
+        r = part.iloc[len(part) - 1 - back]
+        c, u = _f(r.get("Close")), _f(r.get("BB_UPPER"))
+        if c is not None and u is not None and c >= u:
+            upper_break = back
+            break
     return {
         "date": tools._fmt_date(part.index[-1]), "close": close,
         "change_pct": _f((row["Close"] / prev["Close"] - 1) * 100) if len(part) > 1 and prev.get("Close") else None,
@@ -191,7 +199,8 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
         "ma_alignment": tools._ma_alignment(mas),
         "bollinger": {"upper": upper, "lower": lower, "mid": mas[20],
                       "bandwidth_pct": _f(widths[-1]) if widths and widths[-1] is not None else None,
-                      "bandwidth_trend": widths, "signals": (bollinger or {}).get("signals", [])},
+                      "bandwidth_trend": widths, "signals": (bollinger or {}).get("signals", []),
+                      "upper_break_days_ago": upper_break},
         "kd": {"K9": _f(row.get("K9")), "D9": _f(row.get("D9")), "cross_days_ago": _kd_cross_days_ago(part)},
         "volume_lots": round(volume / 1000) if volume else None,
         "mv5_lots": round(_f(row.get("MV5"), 0) / 1000) if _f(row.get("MV5"), 0) else None,
@@ -323,10 +332,24 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
             ups = sum(1 for a, b in zip(trend[-3:], trend[-2:]) if b > a)
             status = "✅" if ups == 2 else "⚠️" if ups == 1 else "❌"
             return _result(claim, status, "帶寬 " + " → ".join(f"{w:.1f}%" for w in trend[-3:]))
-        if re.search(r"上軌", claim) and bb.get("upper") and close is not None:
+        if re.search(r"下軌", claim) and bb.get("lower") and close is not None:
+            below = close <= bb["lower"]
+            want_below = bool(re.search(r"跌破|跌落|失守|低於", claim))
+            return _result(claim, "✅" if below == want_below else "❌",
+                           f"{day} 收盤 {close:g}，下軌 {bb['lower']:g}")
+        # 「突破布林」「布林突破」「站上布林上軌」「布林壓縮突破」都當成向上突破上軌來核對
+        if (re.search(r"上軌", claim) or re.search(r"突破|站上|衝出|噴出", claim)) and bb.get("upper") and close is not None:
             gap = (close / bb["upper"] - 1) * 100
-            status = "✅" if gap >= 0 else "⚠️" if gap >= -1 else "❌"
-            return _result(claim, status, f"{day} 收盤 {close:g}，上軌 {bb['upper']:g}")
+            ago = bb.get("upper_break_days_ago")
+            evidence = f"{day} 收盤 {close:g}，布林上軌 {bb['upper']:g}（{gap:+.2f}%）"
+            squeeze = any("壓縮" in str(s) and "突破" in str(s) for s in bb.get("signals") or [])
+            if gap >= 0:
+                return _result(claim, "✅", evidence + ("，壓縮後向上突破" if squeeze else ""))
+            if ago is not None:
+                return _result(claim, "⚠️", evidence + f"，{ago} 天前收盤曾站上上軌，當天已回到軌道內")
+            if gap >= -1:
+                return _result(claim, "⚠️", evidence + "，貼近上軌但收盤未站上")
+            return _result(claim, "❌", evidence + "，收盤仍在上軌之下")
     if re.search(r"爆量|量增|放量|出量|大量", claim):
         vol, mv5 = snap.get("volume_lots"), snap.get("mv5_lots")
         if not vol or not mv5:
