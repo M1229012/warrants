@@ -257,9 +257,13 @@ def fetch_institutional(code: str, days: int) -> pd.DataFrame:
     return frame
 
 
+INST_KEEP_DAYS = 30          # 理由常見最長寫到「近一個月」＝20 個交易日，多留一些緩衝
+
+
 def inst_summary(frame: pd.DataFrame, buy_day: pd.Timestamp) -> Dict[str, Any]:
     before = frame[frame["Date"] <= buy_day].tail(5)
     after = frame[frame["Date"] > buy_day]
+    history = frame[frame["Date"] <= buy_day].tail(INST_KEEP_DAYS)
 
     def streak(col: str) -> int:
         count = 0
@@ -277,6 +281,10 @@ def inst_summary(frame: pd.DataFrame, buy_day: pd.Timestamp) -> Dict[str, Any]:
         out["before_5d_sum"][label] = round(float(before[col].sum())) if not before.empty else None
         out["buy_streak_days"][label] = streak(col) if not before.empty else None
         out["after_sum"][label] = round(float(after[col].sum())) if not after.empty else None
+    # 買進日（含）以前每日買賣超，給「近 N 日」核對用（舊→新）
+    out["recent"] = [{"date": tools._fmt_date(r.Date), "外資": round(float(r.foreign)),
+                      "投信": round(float(r.invest)), "自營商": round(float(r.dealer))}
+                     for r in history.itertuples()]
     out["unit"] = "張"
     return out
 
@@ -295,12 +303,68 @@ def _split_claims(reason: str) -> List[str]:
     return [p.strip() for p in parts if len(p.strip()) >= 2]
 
 
+def _cn_int(raw: str) -> Optional[int]:
+    """「3」「三」「十」「十五」「二十」→ 整數。"""
+    if raw.isdigit():
+        return int(raw)
+    if "十" in raw:
+        head, _, tail = raw.partition("十")
+        return (_CN_NUM.get(head, 1) if head else 1) * 10 + (_CN_NUM.get(tail, 0) if tail else 0)
+    return _CN_NUM.get(raw)
+
+
 def _n_days(text: str) -> int:
-    hit = re.search(r"連\s*(\d+|[一二兩三四五六七八九十])\s*[天日]", text)
+    hit = re.search(r"連\s*(\d+|[一二兩三四五六七八九十]+)\s*[天日]", text)
     if not hit:
         return 1
-    raw = hit.group(1)
-    return int(raw) if raw.isdigit() else _CN_NUM.get(raw, 1)
+    return _cn_int(hit.group(1)) or 1
+
+
+def _window_days(text: str) -> Optional[int]:
+    """理由裡寫的期間：近5日／近10天／最近3日／5日內／一週＝5／兩週＝10／一個月＝20；沒寫回 None。"""
+    hit = re.search(r"(?:近|最近|過去)\s*(\d+|[一二兩三四五六七八九十]+)\s*(?:個)?(?:交易)?[日天]|"
+                    r"(\d+|[一二兩三四五六七八九十]+)\s*(?:個)?(?:交易)?[日天]內", text)
+    if hit:
+        return _cn_int(hit.group(1) or hit.group(2))
+    if re.search(r"兩週|二週|兩周|雙週", text):
+        return 10
+    if re.search(r"一週|本週|這週|一周|近週", text):
+        return 5
+    if re.search(r"一個月|近月|這個月|本月", text):
+        return 20
+    return None
+
+
+def _inst_window(inst: Dict[str, Any], label: str, days: int) -> Optional[Dict[str, Any]]:
+    rows = (inst.get("recent") or [])[-days:]
+    if not rows:
+        return None
+    values = [r.get(label) or 0 for r in rows]
+    return {"days": len(rows), "sum": sum(values), "buy_days": sum(1 for v in values if v > 0),
+            "sell_days": sum(1 for v in values if v < 0),
+            "start": str(rows[0]["date"])[5:], "end": str(rows[-1]["date"])[5:]}
+
+
+def _check_inst_window(claim: str, label: str, inst: Dict[str, Any], day: str, value: int,
+                       windows: List[int]) -> Dict[str, str]:
+    """期間型法人理由：寫幾天就看幾天；沒寫就算 5 日與 10 日，取合計買超（或賣超）較明顯的那個。"""
+    selling = "賣" in claim
+    stats = [w for w in (_inst_window(inst, label, n) for n in windows) if w]
+    if not stats:
+        return _result(claim, "❓", f"{label}資料不足")
+    pick = (min if selling else max)(stats, key=lambda w: w["sum"])
+    side_days = pick["sell_days"] if selling else pick["buy_days"]
+    evidence = (f"{pick['start']}～{pick['end']} 近 {pick['days']} 日{label}合計"
+                f"{'買' if pick['sum'] >= 0 else '賣'}超 {abs(pick['sum']):,} 張，"
+                f"{pick['days']} 天中 {side_days} 天{'賣' if selling else '買'}超")
+    if value and ((value < 0) != selling):
+        evidence += f"（買進當天{'買' if value > 0 else '賣'}超 {abs(value):,} 張）"
+    ok_sum = pick["sum"] < 0 if selling else pick["sum"] > 0
+    if ok_sum and side_days >= pick["days"] * 0.6:
+        return _result(claim, "✅", evidence)
+    if ok_sum:
+        return _result(claim, "⚠️", evidence)
+    return _result(claim, "❌", evidence)
 
 
 def _result(claim: str, status: str, evidence: str) -> Dict[str, str]:
@@ -381,19 +445,30 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
         if label[:2] in claim and re.search(r"買超|賣超|買|賣", claim):
             if not inst:
                 return _result(claim, "❓", "三大法人資料取不到")
-            need = _n_days(claim)
-            streak = inst["buy_streak_days"].get(label)
             value = inst["buy_day"].get(label)
             if value is None:
                 return _result(claim, "❓", f"{label}資料不足")
-            evidence = f"{day} {label}{'買' if value >= 0 else '賣'}超 {abs(value):,} 張，連續買超 {streak} 天"
-            if "賣" in claim:
-                return _result(claim, "✅" if value < 0 else "❌", evidence)
-            if streak is not None and streak >= need:
-                return _result(claim, "✅", evidence)
-            if value > 0:
-                return _result(claim, "⚠️", evidence + f"（理由寫連 {need} 天）")
-            return _result(claim, "❌", evidence)
+            # ① 「連 N 天」：看到買進日為止連續買超幾天
+            if re.search(r"連\s*(\d+|[一二兩三四五六七八九十]+)\s*[天日]", claim):
+                need = _n_days(claim)
+                streak = inst["buy_streak_days"].get(label)
+                evidence = f"{day} {label}{'買' if value >= 0 else '賣'}超 {abs(value):,} 張，連續買超 {streak} 天"
+                if "賣" in claim:
+                    return _result(claim, "✅" if value < 0 else "❌", evidence)
+                if streak is not None and streak >= need:
+                    return _result(claim, "✅", evidence)
+                if value > 0:
+                    return _result(claim, "⚠️", evidence + f"（理由寫連 {need} 天）")
+                return _result(claim, "❌", evidence)
+            # ② 「當天／當日」：只看買進日
+            if re.search(r"當天|當日|今天|今日", claim):
+                selling = "賣" in claim
+                ok = value < 0 if selling else value > 0
+                return _result(claim, "✅" if ok else "❌",
+                               f"{day} {label}{'買' if value >= 0 else '賣'}超 {abs(value):,} 張")
+            # ③ 寫了「近 N 日」就看 N 日；沒寫就算 5 日與 10 日，取較明顯的那個
+            window = _window_days(claim)
+            return _check_inst_window(claim, label, inst, day, value, [window] if window else [5, 10])
     if _WARRANT_RE.search(claim):
         if warrant_events is None:
             return _result(claim, "❓", "權證分點資料取不到")
