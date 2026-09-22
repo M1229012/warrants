@@ -1030,9 +1030,11 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
         return picked
 
     rows = []
-    for lv in _pick(card.get('resistances_above_close') or [], LEVEL_MAX_RESISTANCES):
+    # 覆盤卡會帶 level_limits（多列幾道支撐），讓成本與各均線距現價多少都看得到
+    max_res, max_sup = card.get('level_limits') or (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS)
+    for lv in _pick(card.get('resistances_above_close') or [], max_res):
         rows.append(('壓力', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
-    for lv in _pick(card.get('supports_below_close') or [], LEVEL_MAX_SUPPORTS):
+    for lv in _pick(card.get('supports_below_close') or [], max_sup):
         rows.append(('支撐', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
     close = _finite(card.get('close'))
     if close:
@@ -1200,7 +1202,11 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         draw.rounded_rectangle((x0, y, x1, y + scorecard(None, 0, card, True)), radius=20, fill='white', outline=LINE)
     h = 30
     basis = str(card.get('score_basis') or '收盤確認')
-    h += _sub_heading(draw, px, y + h, '型態評分', f'{basis}｜只評技術結構，不含籌碼，不是買賣建議', width, dry) + 10
+    # hide_score＝覆盤的「持股狀態」卡：同一套價位／扣抵／盤中觀察，但不顯示分數、五大項與得分失分
+    hide_score = bool(card.get('hide_score'))
+    title = str(card.get('card_title') or '型態評分')
+    note = str(card.get('card_note') or f'{basis}｜只評技術結構，不含籌碼，不是買賣建議')
+    h += _sub_heading(draw, px, y + h, title, note, width, dry) + 10
 
     score = _finite(card.get('pattern_score')) or 0.0
     grade = str(card.get('grade', ''))
@@ -1209,9 +1215,21 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     if cost:
         unrealized = _finite(card.get('unrealized_pct'))
         tags.append(('持股成本', f'{number(cost)}（現價相對成本 {unrealized:+.2f}%）' if unrealized is not None else number(cost)))
+    tags += [(str(k), str(v)) for k, v in card.get('extra_tags') or []]
     tag_rows = _tag_rows(tags, width)
-    score_block = max(146, 12 + len(card.get('components') or []) * SCORE_ROW_H + 8)
-    if not dry:
+    score_block = 0 if hide_score else max(146, 12 + len(card.get('components') or []) * SCORE_ROW_H + 8)
+    if not dry and hide_score:
+        ty = y + h
+        for row in tag_rows:
+            tx = px
+            for key, value, w in row:
+                draw.rounded_rectangle((tx, ty, tx + w, ty + 38), radius=19, fill=TILE_BG, outline=LINE)
+                draw.text((tx + 14, ty + 19), f'{key}｜', font=font(21), fill=MUTED, anchor='lm')
+                text, size = fit(value, 21, w - 28 - font(21).getlength(f'{key}｜'), True)
+                draw.text((tx + 14 + font(21).getlength(f'{key}｜'), ty + 19), text, font=font(size, True), fill=INK, anchor='lm')
+                tx += w + 10
+            ty += 48
+    if not dry and not hide_score:
         sy = y + h
         score_text = f'{score:.1f}'
         draw.text((px, sy + 76), score_text, font=font(72, True), fill=ACCENT, anchor='ls')
@@ -1247,12 +1265,15 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     # 盤中觀察：分數固定以收盤計算，盤中和收盤不同的地方另外列出，標明尚待收盤確認。
     live_changes = [str(t) for t in card.get('intraday_changes') or []]
     if live_changes:
-        box_h = _reason_column(None, 0, 0, width - 48, '盤中觀察（尚待收盤確認，不計入分數）', live_changes, WARN_INK, '', True) + 32
+        live_title = '盤中觀察（尚待收盤確認）' if hide_score else '盤中觀察（尚待收盤確認，不計入分數）'
+        box_h = _reason_column(None, 0, 0, width - 48, live_title, live_changes, WARN_INK, '', True) + 32
         if not dry:
             draw.rounded_rectangle((px, y + h, px + width, y + h + box_h), radius=14, fill=WARN_BG)
-            _reason_column(draw, px + 24, y + h + 16, width - 48, '盤中觀察（尚待收盤確認，不計入分數）', live_changes, WARN_INK, '', False)
+            _reason_column(draw, px + 24, y + h + 16, width - 48, live_title, live_changes, WARN_INK, '', False)
         h += box_h + 20
 
+    if hide_score:
+        return _scorecard_tail(draw, y, h, px, width, card, dry)
     half = (width - 40) / 2
     plus = _short_reasons(card.get('plus_reasons'), lost=False)
     minus = _short_reasons(card.get('minus_reasons'), lost=True)
@@ -1264,6 +1285,11 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         _reason_column(draw, px + 20, y + h + 18, half - 24, '主要得分', plus, GOOD_INK, '沒有拿到一半以上的項目', False)
         _reason_column(draw, px + half + 60, y + h + 18, half - 24, '主要失分', minus, WARN_INK, '各項都拿到一半以上', False)
     h += reasons_h + 20
+    return _scorecard_tail(draw, y, h, px, width, card, dry)
+
+
+def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dict, dry: bool) -> int:
+    """均線扣抵＋關鍵價位＋追蹤分點；型態評分卡與覆盤持股狀態卡共用。"""
     h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)

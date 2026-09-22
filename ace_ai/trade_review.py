@@ -315,33 +315,51 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
 
 
 # ============================================================
-# 防守參考位（全部來自現有資料：均線、布林中軌、大量區、買進成本）
+# 持股狀態卡：沿用一般個股的型態評分卡（同一套關鍵價位、均線扣抵、盤中觀察），但不顯示分數
 # ============================================================
 
-def _defense_levels(code: str, now: Dict[str, Any], cost: float) -> List[Dict[str, Any]]:
-    """現價下方的支撐參考，由近到遠排序；只列資料，不下停損指令。"""
-    close = now.get("close")
-    levels: List[Dict[str, Any]] = [{"label": "買進成本", "price": round(cost, 2)}]
-    for key, label in (("MA10", "10 日線"), ("MA20", "月線（MA20／布林中軌）"), ("MA60", "季線")):
-        value = (now["moving_averages"].get(key) or {}).get("value")
-        if value is not None:
-            levels.append({"label": label, "price": value})
+def _position_card(code: str, cost: float, result: Dict[str, Any], need_warrant: bool
+                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """回傳 (卡片, 給 Gemini 的現況資料)。任何一步失敗只少這張卡，筆記照寫。"""
+    import weekly_pick
     try:
+        tech = tools.get_technical_analysis(code)
         vp = tools.get_volume_profile(code)
-        for zone_key in ("maximum_volume_zone", "second_volume_zone"):
-            zone = vp.get(zone_key) or {}
-            if zone.get("price_low") is not None:
-                levels.append({"label": f"{zone.get('label')}（{zone['price_low']:g}～{zone['price_high']:g}）",
-                               "price": zone["price_low"]})
+        extras = weekly_pick._technical_extras(code)
+        chips = tools.get_sheet_stock_chips(code) if need_warrant else None
+        card = weekly_pick.build_pattern_scorecard(tech, vp, extras, chips, cost)
     except Exception as exc:
-        print(f"⚠️ 覆盤大量區略過｜{code}｜{type(exc).__name__}", flush=True)
-    if close is not None:
-        for level in levels:
-            level["distance_pct"] = round((level["price"] / close - 1) * 100, 2)
-            level["below_price"] = level["price"] < close
-    below = sorted([l for l in levels if l.get("below_price")], key=lambda l: -l["price"])
-    above = sorted([l for l in levels if not l.get("below_price")], key=lambda l: l["price"])
-    return below + above
+        print(f"⚠️ 覆盤持股狀態卡略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
+        return {}, {}
+    card.update({
+        "hide_score": True,                        # 覆盤不給評分：拿掉分數、五大項與得分／失分
+        "level_limits": (2, 6),                    # 關鍵價位多列幾道支撐（均線、量區、布林）
+        "card_title": "持股狀態",
+        "card_note": f"{card.get('score_basis') or '收盤確認'}｜成本與均線、量區、布林的距離",
+        "show_tracked_branches": bool(card.get("show_tracked_branches")) and need_warrant,
+        "extra_tags": [
+            ("買進", f"{result.get('buy_date_text', '')}（持有 {result['trading_days']} 個交易日）"),
+            ("區間", f"最大漲幅 {result['max_gain_pct']:+.2f}%｜最大回檔 {result['max_drawdown_pct']:+.2f}%"),
+        ],
+    })
+    current = {
+        "data_basis": card.get("score_basis"),
+        "close": card.get("close"),
+        "cost_price": card.get("cost_price"),
+        "unrealized_pct": card.get("unrealized_pct"),
+        "pattern_label": card.get("pattern_label"),
+        "ma_alignment": card.get("ma_alignment"),
+        "moving_averages": tech.get("moving_averages"),
+        "ma_deduction": card.get("ma_deduction"),
+        "bollinger": tech.get("bollinger"),
+        "kd": {k: (tech.get("kd") or {}).get(k) for k in ("K9", "D9", "signals")},
+        "volume_zones": {k: vp.get(k) for k in ("maximum_volume_zone", "second_volume_zone",
+                                               "position_vs_two_zones", "recent_maximum_zone_event")},
+        "resistances_above": card.get("resistances_above_close"),
+        "supports_below": card.get("supports_below_close"),
+        "intraday_changes": card.get("intraday_changes"),
+    }
+    return card, current
 
 
 # ============================================================
@@ -372,9 +390,8 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
     intraday = bundle.get("intraday") or {}
     result["price_basis"] = (f"盤中暫定（{intraday.get('time', '')}）" if intraday.get("is_live") and sell_idx is None
                              else "收盤")
-    now = snapshot_at(live, len(live) - 1)
     buy_day = pd.Timestamp(df.index[idx]).normalize()
-    defense = _defense_levels(code, now, buy_price)
+    result["buy_date_text"] = tools._fmt_date(buy_day)[5:]
 
     # 圖表視窗：從買進日往前 20 根一直畫到今天（至少 70、最多 140 根）
     bars_needed = min(CHART_MAX_BARS, max(CHART_MIN_BARS, len(df) - idx + CHART_BEFORE))
@@ -414,6 +431,10 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
                               + (f"｜{trades[1]['date'][5:]} 賣出 {trades[1]['price']:g}" if len(trades) > 1 else "")
                               + f"｜{basis} {result['return_pct']:+.2f}%")
 
+    card, current = _position_card(code, buy_price, result, req["need_warrant"])
+    if card:
+        panel["scorecard"] = card
+
     checks = [check_claim(c, snap, inst, warrant_events) for c in _split_claims(req["reason"])]
     payload = {
         "stock": {"code": code, "name": req.get("name") or panel.get("stock_name", "")},
@@ -423,8 +444,7 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
                   "sell_date": trades[1]["date"] if len(trades) > 1 else None},
         "at_buy": snap,
         "after_buy": result,
-        "now": now,
-        "defense_levels": defense,
+        "current": current,
         "reason_checks": checks,
         "institutional": inst,
         "warrant_events_near_buy": [
@@ -432,6 +452,9 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
                                    "net_amount_text", "status") if e.get(k) not in (None, "")}
             for e in (warrant_events or [])][:10] if warrant_events is not None else None,
     }
+    # 轉成純 JSON（numpy 數值、Timestamp 都先轉掉），後面的事實核對會直接 json.dumps(payload)
+    import json
+    payload = json.loads(json.dumps(payload, ensure_ascii=False, default=tools.json_safe))
     return {"payload": payload, "panel": panel}
 
 
@@ -439,25 +462,27 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 # Gemini prompt 與保存
 # ============================================================
 
-REVIEW_PROMPT = """請依 review_data 寫一份交易覆盤筆記，像交易者自己的盤後紀錄：直接、客觀、就事論事。
+REVIEW_PROMPT = """請依 review_data 寫一篇持股覆盤筆記。圖片已經列出成本、均線、量區、布林與距現價的百分比，
+文字不要逐項照抄數字，而是解讀這些數字「代表什麼」：像有經驗的交易者在寫自己的覆盤，有判斷、有取捨。
 
-語氣規則（很重要）：
-- 開頭直接講結果，不要打招呼、不要自我介紹、不要寫「你好」「我是艾斯 AI」「針對你的交易」。
-- 不要說教：不要寫「請務必」「建議你」「你應該」「未來請」「持續優化」這類教導語句，也不要寫結語勉勵。
-- 用陳述句描述狀況，例如「目前報酬 +24.9%，股價仍在月線之上」「跌破 4,480（月線）代表短線結構轉弱」。
+要寫出來的重點：
+- 這筆部位現在處在什麼狀態：獲利緩衝有多厚（現價與成本之間隔了哪幾道支撐）、目前走勢屬於哪個階段
+  （例如突破後延續、高檔乖離、回測支撐、跌回成本附近）。
+- 當初的理由到現在是否還成立：理由對的部分帶到後續走勢；理由不成立（❌）的部分，說明這筆交易實際是靠什麼走出來的。
+- 目前結構最大的優勢與最大的風險各是什麼（例如多頭排列但月線乖離過大、布林上軌外、量能沒有跟上）。
+- 防守：依 supports_below 由近到遠，說明跌破哪個價位、代表什麼意義（例如跌破 10 日線＝短線轉弱、跌破成本＝獲利歸零）。
+
+語氣：
+- 直接進入內容；不要打招呼、不要自我介紹、不要寫「您好」「我是艾斯 AI」「針對您的部位」。
+- 不說教、不寫勉勵：不要「請務必」「建議你應該」「持續優化」這類句子。用陳述句寫判斷與條件。
+- 不給目標價、不下買賣指令；可以描述「若…代表…」的條件。
 
 資料規則：
-1. 只能使用 review_data 的事實與數字，不可自創；沒有的資料直接略過。
+1. 只能使用 review_data 的事實與數字，不可自創；沒有的資料略過，不要寫系統缺什麼。
 2. reason_checks 已由程式核對（✅ 符合／❌ 不符／⚪ 無法驗證），照結果寫、不可改判；⚪ 只說「無資料可驗證」。
-3. after_buy.price_basis 若是盤中暫定，報酬要註明「盤中」。
-4. 防守只根據 defense_levels 描述「跌破哪個價位代表什麼」，由近到遠最多 3 個，不給目標價、不下買賣指令。
-5. 繁體中文，總長 250～400 字。
-
-固定結構（用這些小標題）：
-【目前損益】買進日與成本、到現在的報酬、期間最大漲幅與最大回檔。
-【當初理由】一句帶過各理由的核對結果（✅／❌／⚪）。
-【現在型態】依 now：均線排列與位置、布林、量能，1～3 句。
-【防守參考】依 defense_levels，列 2～3 個價位與意義。
+3. current.data_basis 若是盤中暫定，談到現價與報酬要註明「盤中」。
+4. at_buy 是買進當天收盤時看得到的盤面，不可用之後的走勢回頭說「當時就知道」。
+5. 繁體中文，300～500 字，用這四個小標題：【持股狀態】【當初理由回顧】【目前結構】【防守與觀察】。
 
 review_data：
 """
@@ -470,14 +495,14 @@ def build_prompt(payload: Dict[str, Any]) -> str:
 
 def rule_note(payload: Dict[str, Any]) -> str:
     """Gemini 失敗時的規則式筆記（只列資料）。"""
-    t, a, n = payload["trade"], payload["after_buy"], payload["now"]
-    lines = [f"【目前損益】{t['buy_date']} 買進 {t['buy_price']:g}，至 {a['until']}（{a['price_basis']}）報酬 "
+    t, a, c = payload["trade"], payload["after_buy"], payload.get("current") or {}
+    supports = [f"{lv.get('label')} {lv.get('price'):g}" for lv in (c.get("supports_below") or [])[:3]
+                if lv.get("price") is not None]
+    lines = [f"【持股狀態】{t['buy_date']} 買進 {t['buy_price']:g}，至 {a['until']}（{a['price_basis']}）報酬 "
              f"{a['return_pct']:+.2f}%｜最大漲幅 {a['max_gain_pct']:+.2f}%｜最大回檔 {a['max_drawdown_pct']:+.2f}%",
-             "【當初理由】" + "；".join(f"{c['status']} {c['claim']}" for c in payload["reason_checks"]),
-             f"【現在型態】收盤 {n['close']:g}｜均線 {n['ma_alignment']}",
-             "【防守參考】" + ("；".join(f"{l['label']} {l['price']:g}（{l['distance_pct']:+.2f}%）"
-                                     for l in [l for l in payload["defense_levels"] if l.get("below_price")][:3])
-                            or "現價下方沒有可參考的均線或量區")]
+             "【當初理由回顧】" + "；".join(f"{x['status']} {x['claim']}" for x in payload["reason_checks"]),
+             f"【目前結構】{c.get('pattern_label') or '—'}｜均線 {c.get('ma_alignment') or '—'}",
+             "【防守與觀察】" + ("；".join(supports) or "現價下方沒有可參考的均線或量區")]
     return "\n".join(lines)
 
 
