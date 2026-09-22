@@ -46,6 +46,7 @@ import numpy as np
 
 import sector_match
 import sector_radar
+import trade_review
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
 # 這裡只在 Bot 行程過濾，不動主程式，週報與回測的輸出完全不受影響。
@@ -2389,6 +2390,9 @@ class AceQueryEngine:
             if not is_admin:
                 return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
             return self._answer_admin_moneydj_image(question, started)
+        # 覆盤筆記：/ask 與 /ace 都可用；個人紀錄依 Discord 使用者分開存
+        if trade_review.is_review_request(question) or trade_review.is_list_request(question):
+            return self._answer_review(question, context_key, started)
 
         if not admin_mode:
             # /ask 只做一般問答；精選相關的字眼直接導向管理員指令，不進草稿流程。
@@ -2569,6 +2573,54 @@ class AceQueryEngine:
             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
+
+    def _answer_review(self, question: str, context_key: str, started: float) -> AnswerResult:
+        """覆盤筆記：解析股票／買進日／理由 → 程式補當時盤面與後續走勢 → Gemini 寫筆記 → 數字核對 → 存檔。"""
+        elapsed = lambda: time.perf_counter() - started
+        # 「我的覆盤／覆盤清單」且沒有帶股票或日期＝列出紀錄
+        if trade_review.is_list_request(question) and not re.search(r"\d", question):
+            return AnswerResult(text=trade_review.list_notes(context_key), route="review_list", gemini_calls=0,
+                                elapsed=elapsed(), cacheable=False, as_text=True)
+        try:
+            req = trade_review.parse_request(question)
+        except tools.ToolDataError as exc:
+            return AnswerResult(text=f"股票名冊暫時無法讀取，請稍後再試（{exc}）", route="review_error",
+                                gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
+        missing = trade_review.missing_fields(req)
+        if missing:
+            return AnswerResult(
+                text=(f"覆盤還缺：{'、'.join(missing)}。\n範例：覆盤 2454 9/1 買進 1285，理由：站上月線、外資連三天買超\n"
+                      "（價格、張數、賣出日可省略；沒寫價格就用買進日收盤價）"),
+                route="review_help", gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
+        self.log(f"覆盤｜{req['code']} {req.get('name', '')}｜買進 {req['buy_date']}｜賣出 {req.get('sell_date') or '-'}"
+                 f"｜價格 {req.get('price') or '收盤'}｜抓權證={req['need_warrant']}｜抓法人={req['need_inst']}")
+        try:
+            built = trade_review.build_review(req)
+        except tools.ToolDataError as exc:
+            return AnswerResult(text=f"無法建立覆盤：{exc}", route="review_error", gemini_calls=0,
+                                elapsed=elapsed(), cacheable=False, as_text=True)
+        payload, panel = built["payload"], built["panel"]
+        for check in payload["reason_checks"]:
+            self.log(f"   理由核對 {check['status']} {check['claim']}｜{check['evidence']}")
+        stats = AnswerStats()
+        result = self.gateway.generate(trade_review.build_prompt(payload), purpose="trade_review", temperature=0.3)
+        stats.record_gemini(result)
+        if result.ok:
+            note, removed = prune_ungrounded_sentences(result.text, payload)
+            if removed:
+                self.log(f"覆盤事實核對：刪除 {len(removed)} 句｜" + "；".join(s[:40] for s in removed[:4]))
+            if not note or len(note) < len(result.text) * 0.6:
+                note = "（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n" + trade_review.rule_note(payload)
+        else:
+            prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 覆盤暫時無法使用，以下先提供系統整理的資料。"
+            note = f"{prefix}\n\n{trade_review.rule_note(payload)}"
+        trade_review.save_note(context_key, payload, note)
+        name = payload["stock"]["name"]
+        text = f"**{name}（{payload['stock']['code']}）覆盤筆記**\n\n{note}\n\n{DISCLAIMER}"
+        return AnswerResult(text=text, route="trade_review", gemini_calls=stats.gemini_calls, elapsed=elapsed(),
+                            cacheable=False, panels=[panel], image_title=f"{name} 覆盤筆記",
+                            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+                            total_tokens=stats.total_tokens, token_source=stats.token_source)
 
     def _answer_radar(self, direction: str, started: float, route: str, scope: str = "all",
                       view: str = "all") -> AnswerResult:
@@ -3295,6 +3347,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `更新族群名冊`：重新掃描族群成分股（約 10～20 分鐘）
 • `族群雷達`／`轉強族群`／`轉弱族群`：主要族群（>10 檔）強勢／轉強／轉弱＋小型族群異動，/ask 也可問「哪些族群正在轉強」
 • `主要族群雷達`（或 `大型族群雷達`）／`小型族群雷達`：只看其中一組，組內比較
+• `覆盤 2454 9/1 買進 1285，理由：…`：個人交易覆盤筆記（K 線紫色 ◆ 標買點）；`我的覆盤` 列出紀錄
 • `用量`：今日 Gemini 與各 API 使用量
 
 一般個股、族群、權證分點問題請照常用 /ask。"""

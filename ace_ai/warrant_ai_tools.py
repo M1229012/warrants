@@ -4411,7 +4411,7 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 # Tool 註冊表
 # ============================================================
 
-def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event", flow_source: str = "sheet", allow_moneydj_fallback: bool = False) -> Dict[str, Any]:
+def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event", flow_source: str = "sheet", allow_moneydj_fallback: bool = False, lookback: int = 0) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
     code = kf._normalize_stock_name_code_key(stock_code)
@@ -4428,8 +4428,8 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))]
     if df.empty:
         raise ToolDataError("沒有有效的 OHLC 資料")
-    # Same window as the reference report (70 by default).
-    plot_df = df.tail(max(1, int(getattr(kf, "CHART_LOOKBACK", 70))))
+    # Same window as the reference report (70 by default)；覆盤筆記會傳 lookback 讓買進日落在圖內。
+    plot_df = df.tail(max(1, int(lookback or getattr(kf, "CHART_LOOKBACK", 70))))
     bars = []
     for date, row in plot_df.iterrows():
         bars.append({"date": _fmt_date(date), **{

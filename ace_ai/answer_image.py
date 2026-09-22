@@ -518,8 +518,102 @@ def _price_extra(panel: dict) -> int:
     return COMPACT_PRICE_EXTRA if (panel or {}).get('compact') else CHART_PRICE_EXTRA
 
 
+# 我的交易（覆盤筆記）：紫色 ◆＋成本虛線，和權證分點的紅綠 ▲▼／編號圓圈、三大法人的藍橘灰都不撞色
+TRADE_COLOR = '#6D28D9'
+TRADE_LINE = '#A78BFA'
+TRADE_LEGEND_H = 46
+# 三大法人買賣超面板（照週報主程式 plot_institutional_stacked_bars 的配色與堆疊方式）
+INST_COLORS = (('foreign', '外資', '#7CB5EC'), ('invest', '投信', '#F59E0B'), ('dealer', '自營商', '#9CA3AF'))
+INST_BLOCK_H = 250
+
+
+def _inst_height(panel: dict) -> int:
+    return INST_BLOCK_H if (panel or {}).get('institutional') else 0
+
+
+def _trade_height(panel: dict) -> int:
+    return TRADE_LEGEND_H if (panel or {}).get('trades') else 0
+
+
 def panel_height(panel: dict) -> int:
-    return CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + mark_legend(None, panel, 0, True)
+    return (CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel)
+            + _trade_height(panel) + mark_legend(None, panel, 0, True))
+
+
+def draw_trades(draw, panel: dict, px, py, bars: list, right: float) -> None:
+    """紫色 ◆ 畫在成交價高度，上方小膠囊寫「買／賣」，買進價往右拉一條成本虛線。"""
+    index = {bar['date']: i for i, bar in enumerate(bars)}
+    for trade in panel.get('trades') or []:
+        i = index.get(trade.get('date'))
+        price = _finite(trade.get('price'))
+        if i is None or price is None:
+            continue
+        x, y = px(i), py(price)
+        if trade.get('side') == 'buy':
+            for sx in range(int(x + 12), int(right), 14):
+                draw.line((sx, y, min(sx + 7, right), y), fill=TRADE_LINE, width=2)
+        r = 10
+        draw.polygon([(x, y - r), (x + r, y), (x, y + r), (x - r, y)], fill=TRADE_COLOR, outline='white')
+        label = '買' if trade.get('side') == 'buy' else '賣'
+        lw = font(17, True).getlength(label) + 14
+        draw.rounded_rectangle((x - lw / 2, y - r - 30, x + lw / 2, y - r - 6), radius=10,
+                               fill=TRADE_COLOR, outline='white', width=2)
+        draw.text((x, y - r - 18), label, font=font(17, True), fill='white', anchor='mm')
+
+
+def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list) -> None:
+    """三大法人買賣超：正負堆疊柱（單位張），金色虛線零軸，表頭顯示最新一日各法人與合計。"""
+    by_date = {r['date']: r for r in rows}
+    text_at(draw, (left, top + 6), '三大法人買賣超', 22, INK, True)
+    last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
+    lx = left + font(22, True).getlength('三大法人買賣超') + 28
+    total = 0.0
+    for key, label, color in INST_COLORS:
+        value = float(last.get(key) or 0)
+        total += value
+        draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
+        text = f'{label} {value:+,.0f}張'
+        draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
+        lx += 22 + font(19).getlength(text) + 22
+    draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=ACCENT)
+    draw.text((lx + 22, top + 20), f'合計 {total:+,.0f}張', font=font(19, True), fill=INK, anchor='lm')
+    ctop, cbottom = top + 48, top + INST_BLOCK_H - 22
+    mid = (ctop + cbottom) / 2
+    values = [abs(float(r.get(k) or 0)) for r in rows for k, *_ in INST_COLORS]
+    pos_neg = []
+    for r in rows:
+        pos = sum(max(0.0, float(r.get(k) or 0)) for k, *_ in INST_COLORS)
+        neg = sum(min(0.0, float(r.get(k) or 0)) for k, *_ in INST_COLORS)
+        pos_neg += [pos, -neg]
+    peak = max(pos_neg + values + [1.0]) * 1.35
+    scale = (cbottom - ctop) / 2 / peak
+    for i, bar in enumerate(bars):
+        row = by_date.get(bar['date'])
+        if not row:
+            continue
+        x, half = px(i), max(1, step * .36)
+        up, down = mid, mid
+        for key, _, color in INST_COLORS:
+            value = float(row.get(key) or 0)
+            if value > 0:
+                draw.rectangle((x - half, up - value * scale, x + half, up), fill=color)
+                up -= value * scale
+            elif value < 0:
+                draw.rectangle((x - half, down, x + half, down - value * scale), fill=color)
+                down -= value * scale
+    for sx in range(int(left), int(right), 12):
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=ACCENT, width=1)
+    for value, yy in ((peak / 1.35, mid - peak / 1.35 * scale), (0, mid), (-peak / 1.35, mid + peak / 1.35 * scale)):
+        text_at(draw, (right + 14, yy - 10), f'{value:+,.0f}張' if value else '0', 18, MUTED)
+
+
+def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
+    r = 8
+    cy = top + 20
+    draw.polygon([(left + r, cy - r), (left + 2 * r, cy), (left + r, cy + r), (left, cy)], fill=TRADE_COLOR)
+    text = str(panel.get('trade_summary') or '我的交易')
+    text, size = fit(text, 21, CONTENT - 120, True)
+    draw.text((left + 2 * r + 12, cy), text, font=font(size, True), fill=TRADE_COLOR, anchor='lm')
 
 
 def _badge_half(number_text) -> float:
@@ -756,6 +850,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         for key in list(MA_COLORS) + list(BAND_COLORS):
             if b.get(key) is not None:
                 lows.append(b[key]); highs.append(b[key])
+    for trade in panel.get('trades') or []:          # 使用者自填的買進價可能超出 K 線範圍，一併納入
+        if _finite(trade.get('price')) is not None:
+            lows.append(float(trade['price'])); highs.append(float(trade['price']))
     low, high = min(lows), max(highs)
     padding = max((high - low) * .08, abs(high) * .005, .01)
     low -= padding; high += padding
@@ -806,6 +903,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             for start in range(0, max(1, math.ceil(distance)), 12):
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=band_color, width=2)
+    if panel.get('trades'):
+        draw_trades(draw, panel, px, py, bars, right)   # 畫在 K 棒與均線之上，才不會被蓋住
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
@@ -861,7 +960,14 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
     for i, line in enumerate(wrap(state, 20, CONTENT - 80)[:2]):
         text_at(draw, (left, vbottom + 54 + i * 28), line, 20, INK)
-    mark_legend(draw, panel, y + CHART_HEIGHT + extra, False)
+    below = y + CHART_HEIGHT + extra
+    if panel.get('institutional'):
+        draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'])
+        below += INST_BLOCK_H
+    if panel.get('trades'):
+        draw_trade_legend(draw, below, left, panel)
+        below += TRADE_LEGEND_H
+    mark_legend(draw, panel, below, False)
 
 
 # ============================================================
