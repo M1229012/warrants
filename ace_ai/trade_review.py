@@ -315,6 +315,36 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
 
 
 # ============================================================
+# 防守參考位（全部來自現有資料：均線、布林中軌、大量區、買進成本）
+# ============================================================
+
+def _defense_levels(code: str, now: Dict[str, Any], cost: float) -> List[Dict[str, Any]]:
+    """現價下方的支撐參考，由近到遠排序；只列資料，不下停損指令。"""
+    close = now.get("close")
+    levels: List[Dict[str, Any]] = [{"label": "買進成本", "price": round(cost, 2)}]
+    for key, label in (("MA10", "10 日線"), ("MA20", "月線（MA20／布林中軌）"), ("MA60", "季線")):
+        value = (now["moving_averages"].get(key) or {}).get("value")
+        if value is not None:
+            levels.append({"label": label, "price": value})
+    try:
+        vp = tools.get_volume_profile(code)
+        for zone_key in ("maximum_volume_zone", "second_volume_zone"):
+            zone = vp.get(zone_key) or {}
+            if zone.get("price_low") is not None:
+                levels.append({"label": f"{zone.get('label')}（{zone['price_low']:g}～{zone['price_high']:g}）",
+                               "price": zone["price_low"]})
+    except Exception as exc:
+        print(f"⚠️ 覆盤大量區略過｜{code}｜{type(exc).__name__}", flush=True)
+    if close is not None:
+        for level in levels:
+            level["distance_pct"] = round((level["price"] / close - 1) * 100, 2)
+            level["below_price"] = level["price"] < close
+    below = sorted([l for l in levels if l.get("below_price")], key=lambda l: -l["price"])
+    above = sorted([l for l in levels if not l.get("below_price")], key=lambda l: l["price"])
+    return below + above
+
+
+# ============================================================
 # 組資料
 # ============================================================
 
@@ -322,20 +352,29 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
     """回傳 {payload, panel, trades}；payload 給 Gemini 與事實核對，panel 給 K 線圖卡。"""
     code = req["code"]
     bundle = tools._load_price_bundle(code)
+    # 買進當時用已收盤 K 棒；「到現在」用含盤中即時 K 的完整資料，損益才會和圖上的現價一致
     df = tools.closed_frame(bundle).sort_index()
     df = df[~df.index.duplicated(keep="last")]
+    live = bundle["df"].sort_index()
+    live = live[~live.index.duplicated(keep="last")]
     idx = _index_on_or_after(df, req["buy_date"])
     if idx is None:
         raise tools.ToolDataError("買進日晚於目前最新的日 K 資料")
     if idx == 0:
         raise tools.ToolDataError(f"本地日 K 只回溯到 {tools._fmt_date(df.index[0])}，買進日太早，無法覆盤")
-    sell_idx = _index_on_or_after(df, req["sell_date"]) if req.get("sell_date") else None
-    if sell_idx is not None and sell_idx <= idx:      # 賣出日早於（或等於）買進日：視為沒填
+    live_idx = _index_on_or_after(live, req["buy_date"])
+    sell_idx = _index_on_or_after(live, req["sell_date"]) if req.get("sell_date") else None
+    if sell_idx is not None and sell_idx <= live_idx:  # 賣出日早於（或等於）買進日：視為沒填
         sell_idx = None
     buy_price = float(req.get("price") or df["Close"].iloc[idx])
     snap = snapshot_at(df, idx)
-    result = after_buy(df, idx, buy_price, sell_idx)
+    result = after_buy(live, live_idx, buy_price, sell_idx)
+    intraday = bundle.get("intraday") or {}
+    result["price_basis"] = (f"盤中暫定（{intraday.get('time', '')}）" if intraday.get("is_live") and sell_idx is None
+                             else "收盤")
+    now = snapshot_at(live, len(live) - 1)
     buy_day = pd.Timestamp(df.index[idx]).normalize()
+    defense = _defense_levels(code, now, buy_price)
 
     # 圖表視窗：從買進日往前 20 根一直畫到今天（至少 70、最多 140 根）
     bars_needed = min(CHART_MAX_BARS, max(CHART_MIN_BARS, len(df) - idx + CHART_BEFORE))
@@ -367,12 +406,13 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 
     trades = [{"date": tools._fmt_date(buy_day), "price": buy_price, "side": "buy"}]
     if sell_idx is not None:
-        trades.append({"date": tools._fmt_date(df.index[sell_idx]), "price": float(df["Close"].iloc[sell_idx]),
+        trades.append({"date": tools._fmt_date(live.index[sell_idx]), "price": float(live["Close"].iloc[sell_idx]),
                        "side": "sell"})
     panel["trades"] = trades
+    basis = "出場" if result["closed_trade"] else ("盤中" if result["price_basis"].startswith("盤中") else "至今")
     panel["trade_summary"] = (f"我的交易｜{trades[0]['date'][5:]} 買進 {buy_price:g}"
                               + (f"｜{trades[1]['date'][5:]} 賣出 {trades[1]['price']:g}" if len(trades) > 1 else "")
-                              + f"｜{'出場' if result['closed_trade'] else '至今'} {result['return_pct']:+.2f}%")
+                              + f"｜{basis} {result['return_pct']:+.2f}%")
 
     checks = [check_claim(c, snap, inst, warrant_events) for c in _split_claims(req["reason"])]
     payload = {
@@ -383,6 +423,8 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
                   "sell_date": trades[1]["date"] if len(trades) > 1 else None},
         "at_buy": snap,
         "after_buy": result,
+        "now": now,
+        "defense_levels": defense,
         "reason_checks": checks,
         "institutional": inst,
         "warrant_events_near_buy": [
@@ -397,22 +439,25 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 # Gemini prompt 與保存
 # ============================================================
 
-REVIEW_PROMPT = """你是「艾斯 AI」的交易覆盤教練。請依 review_data 為使用者寫一篇覆盤筆記。
+REVIEW_PROMPT = """請依 review_data 寫一份交易覆盤筆記，像交易者自己的盤後紀錄：直接、客觀、就事論事。
 
-規則：
-1. 只能使用 review_data 裡的事實與數字，不可自創資料；沒有的資料直接略過，不要猜。
-2. reason_checks 已經由程式逐條核對（✅ 符合／❌ 不符／⚪ 無法驗證）。照這個結果寫，不可自己改判；⚪ 的理由要說明「系統沒有資料可驗證」，不能說它錯。
-3. 「買進當時」只談 at_buy（買進日收盤時看得到的盤面），不可用 after_buy 的結果回頭說當時就該知道。
-4. 語氣像教練：肯定做對的地方，具體指出可以改進的地方（例如進場位置、風險控管、該觀察卻沒寫到的條件），不給目標價、不保證未來。
-5. 繁體中文，精簡，總長 350～550 字。
+語氣規則（很重要）：
+- 開頭直接講結果，不要打招呼、不要自我介紹、不要寫「你好」「我是艾斯 AI」「針對你的交易」。
+- 不要說教：不要寫「請務必」「建議你」「你應該」「未來請」「持續優化」這類教導語句，也不要寫結語勉勵。
+- 用陳述句描述狀況，例如「目前報酬 +24.9%，股價仍在月線之上」「跌破 4,480（月線）代表短線結構轉弱」。
+
+資料規則：
+1. 只能使用 review_data 的事實與數字，不可自創；沒有的資料直接略過。
+2. reason_checks 已由程式核對（✅ 符合／❌ 不符／⚪ 無法驗證），照結果寫、不可改判；⚪ 只說「無資料可驗證」。
+3. after_buy.price_basis 若是盤中暫定，報酬要註明「盤中」。
+4. 防守只根據 defense_levels 描述「跌破哪個價位代表什麼」，由近到遠最多 3 個，不給目標價、不下買賣指令。
+5. 繁體中文，總長 250～400 字。
 
 固定結構（用這些小標題）：
-【買進理由】一句話重述。
-【當時盤面】1～3 個最關鍵的數據。
-【理由核對】逐條列出 ✅／❌／⚪ 與依據。
-【買進後走勢】報酬、最大漲幅、最大回檔。
-【做得好的地方】
-【可以改進的地方】
+【目前損益】買進日與成本、到現在的報酬、期間最大漲幅與最大回檔。
+【當初理由】一句帶過各理由的核對結果（✅／❌／⚪）。
+【現在型態】依 now：均線排列與位置、布林、量能，1～3 句。
+【防守參考】依 defense_levels，列 2～3 個價位與意義。
 
 review_data：
 """
@@ -425,13 +470,14 @@ def build_prompt(payload: Dict[str, Any]) -> str:
 
 def rule_note(payload: Dict[str, Any]) -> str:
     """Gemini 失敗時的規則式筆記（只列資料）。"""
-    t, a, s = payload["trade"], payload["after_buy"], payload["at_buy"]
-    lines = [f"【買進理由】{t['reason']}",
-             f"【當時盤面】{s['date']} 收盤 {s['close']:g}｜均線 {s['ma_alignment']}",
-             "【理由核對】"]
-    lines += [f"{c['status']} {c['claim']}：{c['evidence']}" for c in payload["reason_checks"]]
-    lines.append(f"【買進後走勢】至 {a['until']}（{a['trading_days']} 個交易日）報酬 {a['return_pct']:+.2f}%｜"
-                 f"最大漲幅 {a['max_gain_pct']:+.2f}%｜最大回檔 {a['max_drawdown_pct']:+.2f}%")
+    t, a, n = payload["trade"], payload["after_buy"], payload["now"]
+    lines = [f"【目前損益】{t['buy_date']} 買進 {t['buy_price']:g}，至 {a['until']}（{a['price_basis']}）報酬 "
+             f"{a['return_pct']:+.2f}%｜最大漲幅 {a['max_gain_pct']:+.2f}%｜最大回檔 {a['max_drawdown_pct']:+.2f}%",
+             "【當初理由】" + "；".join(f"{c['status']} {c['claim']}" for c in payload["reason_checks"]),
+             f"【現在型態】收盤 {n['close']:g}｜均線 {n['ma_alignment']}",
+             "【防守參考】" + ("；".join(f"{l['label']} {l['price']:g}（{l['distance_pct']:+.2f}%）"
+                                     for l in [l for l in payload["defense_levels"] if l.get("below_price")][:3])
+                            or "現價下方沒有可參考的均線或量區")]
     return "\n".join(lines)
 
 

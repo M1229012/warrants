@@ -511,6 +511,10 @@ def mark_lanes(panel: dict) -> tuple[int, int]:
     else:
         top = any(e.get('exit_date') in dates or e.get('reduce_date') in dates for e in events if e.get('exit_date') or e.get('reduce_date'))
         bottom = any(e.get('buy_date') in dates for e in events)
+    # 我的交易（覆盤）與權證標記共用同一條標記帶：買進在下、賣出在上
+    trades = [t for t in (panel or {}).get('trades') or [] if t.get('date') in dates]
+    top = top or any(t.get('side') == 'sell' for t in trades)
+    bottom = bottom or any(t.get('side') == 'buy' for t in trades)
     return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
 
 
@@ -518,9 +522,9 @@ def _price_extra(panel: dict) -> int:
     return COMPACT_PRICE_EXTRA if (panel or {}).get('compact') else CHART_PRICE_EXTRA
 
 
-# 我的交易（覆盤筆記）：紫色 ◆＋成本虛線，和權證分點的紅綠 ▲▼／編號圓圈、三大法人的藍橘灰都不撞色
+# 我的交易（覆盤筆記）：和權證分點同一套 ▲▼＋圓圈畫法，但固定紫色、圓圈寫「買／賣」，
+# 和權證分點的紅綠、三大法人的藍橘灰都不撞色；畫在 K 線上下的標記帶，不壓在 K 棒上
 TRADE_COLOR = '#6D28D9'
-TRADE_LINE = '#A78BFA'
 TRADE_LEGEND_H = 46
 # 三大法人買賣超面板（照週報主程式 plot_institutional_stacked_bars 的配色與堆疊方式）
 INST_COLORS = (('foreign', '外資', '#7CB5EC'), ('invest', '投信', '#F59E0B'), ('dealer', '自營商', '#9CA3AF'))
@@ -540,25 +544,17 @@ def panel_height(panel: dict) -> int:
             + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
 
-def draw_trades(draw, panel: dict, px, py, bars: list, right: float) -> None:
-    """紫色 ◆ 畫在成交價高度，上方小膠囊寫「買／賣」，買進價往右拉一條成本虛線。"""
-    index = {bar['date']: i for i, bar in enumerate(bars)}
+def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]:
+    """我的交易：和權證標記同一套畫法（三角形＋虛線＋圓圈），但顏色固定紫色、圓圈內寫「買／賣」。"""
+    buys, sells = [], []
     for trade in panel.get('trades') or []:
         i = index.get(trade.get('date'))
-        price = _finite(trade.get('price'))
-        if i is None or price is None:
+        if i is None:
             continue
-        x, y = px(i), py(price)
-        if trade.get('side') == 'buy':
-            for sx in range(int(x + 12), int(right), 14):
-                draw.line((sx, y, min(sx + 7, right), y), fill=TRADE_LINE, width=2)
-        r = 10
-        draw.polygon([(x, y - r), (x + r, y), (x, y + r), (x - r, y)], fill=TRADE_COLOR, outline='white')
-        label = '買' if trade.get('side') == 'buy' else '賣'
-        lw = font(17, True).getlength(label) + 14
-        draw.rounded_rectangle((x - lw / 2, y - r - 30, x + lw / 2, y - r - 6), radius=10,
-                               fill=TRADE_COLOR, outline='white', width=2)
-        draw.text((x, y - r - 18), label, font=font(17, True), fill='white', anchor='mm')
+        item = {'x': px(i), 'cx': px(i), 'i': i, 'color': TRADE_COLOR, 'trade': True,
+                'no': '買' if trade.get('side') == 'buy' else '賣'}
+        (buys if trade.get('side') == 'buy' else sells).append(item)
+    return buys, sells
 
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list) -> None:
@@ -610,7 +606,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
 def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
     r = 8
     cy = top + 20
-    draw.polygon([(left + r, cy - r), (left + 2 * r, cy), (left + r, cy + r), (left, cy)], fill=TRADE_COLOR)
+    draw.polygon([(left + r, cy - r), (left + 2 * r, cy + r), (left, cy + r)], fill=TRADE_COLOR)   # 同 K 線上的 ▲
     text = str(panel.get('trade_summary') or '我的交易')
     text, size = fit(text, 21, CONTENT - 120, True)
     draw.text((left + 2 * r + 12, cy), text, font=font(size, True), fill=TRADE_COLOR, anchor='lm')
@@ -683,13 +679,14 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     bars = panel.get('bars') or []
     index = {bar['date']: i for i, bar in enumerate(bars)}
     events = _mark_events(panel)
-    if not events:
+    trade_buys, trade_sells = _trade_badges(panel, index, px)
+    if not events and not trade_buys and not trade_sells:
         return
     mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
     half = max(5, min(9, step * 0.45))
-    if mode == 'flow':
+    if mode == 'flow' or not events:
         palette = _branch_palette(events)
-        buy_badges, sell_badges = [], []
+        buy_badges, sell_badges = list(trade_buys), list(trade_sells)
         for e in events:
             i = index.get(e.get('action_date') or '')
             if i is None:
@@ -742,6 +739,9 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         buy_badges.extend(_split_badges(px(i), numbers))
     for j, numbers in sell_days.items():
         sell_badges.extend(_split_badges(px(j), numbers))
+    # 我的交易一起排列，和同一天的分點編號擠到時自動換列，不會互相蓋住
+    buy_badges += trade_buys
+    sell_badges += trade_sells
     _assign_rows(buy_badges); _assign_rows(sell_badges)
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):
@@ -751,12 +751,18 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     for j in sorted(set(sell_days) | reduce_days):
         x = px(j); _dotted(draw, x, py(bars[j]['High']) - 4, tri_top + half, DOWN)
         draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=DOWN, outline='white')
+    for badge in trade_buys:
+        x = badge['x']; _dotted(draw, x, py(bars[badge['i']]['Low']) + 4, tri_bottom - half, TRADE_COLOR)
+        draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=TRADE_COLOR, outline='white')
+    for badge in trade_sells:
+        x = badge['x']; _dotted(draw, x, py(bars[badge['i']]['High']) - 4, tri_top + half, TRADE_COLOR)
+        draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=TRADE_COLOR, outline='white')
     for badge in buy_badges:
         cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
-        _draw_badge(draw, badge['cx'], cy, badge['no'], UP)
+        _draw_badge(draw, badge['cx'], cy, badge['no'], badge.get('color') or UP)
     for badge in sell_badges:
         cy = tri_top - half - 6 - MARK_BADGE_R - badge['row'] * MARK_BADGE_ROW
-        _draw_badge(draw, badge['cx'], cy, badge['no'], DOWN)
+        _draw_badge(draw, badge['cx'], cy, badge['no'], badge.get('color') or DOWN)
 
 
 # ============================================================
@@ -850,9 +856,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         for key in list(MA_COLORS) + list(BAND_COLORS):
             if b.get(key) is not None:
                 lows.append(b[key]); highs.append(b[key])
-    for trade in panel.get('trades') or []:          # 使用者自填的買進價可能超出 K 線範圍，一併納入
-        if _finite(trade.get('price')) is not None:
-            lows.append(float(trade['price'])); highs.append(float(trade['price']))
     low, high = min(lows), max(highs)
     padding = max((high - low) * .08, abs(high) * .005, .01)
     low -= padding; high += padding
@@ -903,8 +906,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             for start in range(0, max(1, math.ceil(distance)), 12):
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=band_color, width=2)
-    if panel.get('trades'):
-        draw_trades(draw, panel, px, py, bars, right)   # 畫在 K 棒與均線之上，才不會被蓋住
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
