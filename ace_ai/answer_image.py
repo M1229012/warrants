@@ -2016,14 +2016,17 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     draw.text((px + 62, cy + 24), str(data.get('title', '')), font=font(30, True), fill=INK, anchor='lm')
     cy += 50 + 12
 
-    if summary:                                               # 09/11 @30.2｜現價 36.65（盤中）｜+21.36%｜MFE…
+    if summary:                                               # 09/11 買進 30.2｜現價 36.65（盤中）｜報酬 +21.36%｜…
+        size = 21                                             # 太長就整行一起縮字，不換行、不超出卡片
+        while size > 16 and sum(font(size, True).getlength(t) for t, _ in summary) + 30 * (len(summary) - 1) > width:
+            size -= 1
         sx = px
         for i, (text, color) in enumerate(summary):
             if i:
-                draw.text((sx + 8, cy + 14), '｜', font=font(21), fill=LINE, anchor='lm')
+                draw.text((sx + 8, cy + 14), '｜', font=font(size), fill=LINE, anchor='lm')
                 sx += 30
-            draw.text((sx, cy + 14), text, font=font(21, True), fill=color, anchor='lm')
-            sx += font(21, True).getlength(text)
+            draw.text((sx, cy + 14), text, font=font(size, True), fill=color, anchor='lm')
+            sx += font(size, True).getlength(text)
         cy += 40
 
     cy += 22                                                  # 我的理由＋逐條核對
@@ -2057,8 +2060,8 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
         ty += 33
     cy += box_h
 
-    cy += 18                                                  # 本次記住：理由／過程／學習
-    text_at(draw, (px, cy), '本次記住', 22, INK, True)
+    cy += 18                                                  # 交易心得：理由／過程／學習
+    text_at(draw, (px, cy), '交易心得', 22, INK, True)
     cy += 38
     for i, lines in enumerate(highlights):
         _status_icon(draw, px + 14, cy + 15, icons[i] if i < len(icons) else '✅', r=11)

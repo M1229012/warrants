@@ -2595,16 +2595,29 @@ class AceQueryEngine:
                 route="review_help", gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
         self.log(f"覆盤｜{req['code']} {req.get('name', '')}｜買進 {req['buy_date']}｜賣出 {req.get('sell_date') or '-'}"
                  f"｜價格 {req.get('price') or '收盤'}｜抓權證={req['need_warrant']}｜抓法人={req['need_inst']}")
+        stats = AnswerStats()
+
+        def mapper(claims: List[str]) -> Dict[str, Any]:
+            """規則認不得的白話理由 → Gemini 對應到標準說法（只翻意思，不判對錯），再由程式核對。"""
+            mapped = self.gateway.generate(trade_review.claim_map_prompt(claims), purpose="review_claim_map",
+                                           schema=trade_review.CLAIM_MAP_SCHEMA, temperature=0.0)
+            stats.record_gemini(mapped)
+            if not mapped.ok:
+                return {}
+            try:
+                return json.loads(mapped.text)
+            except (TypeError, ValueError):
+                return tools.core()._extract_json_from_text(mapped.text) or {}
+
         try:
-            built = trade_review.build_review(req)
+            built = trade_review.build_review(req, mapper=mapper)
         except tools.ToolDataError as exc:
-            return AnswerResult(text=f"無法建立覆盤：{exc}", route="review_error", gemini_calls=0,
+            return AnswerResult(text=f"無法建立覆盤：{exc}", route="review_error", gemini_calls=stats.gemini_calls,
                                 elapsed=elapsed(), cacheable=False, as_text=True)
         payload, panel = built["payload"], built["panel"]
         for check in payload["reason_checks"] + (payload.get("sell_reason_checks") or []):
             self.log(f"   理由核對 {check['status']} {check['claim']}｜{check['evidence']}")
         # 事實與理由核對由程式產生；Gemini 讀事實寫 headline／body／highlights／watch（或 lesson）
-        stats = AnswerStats()
         result = self.gateway.generate(trade_review.build_prompt(payload), purpose="trade_review",
                                        schema=trade_review.ai_schema(payload["mode"]), temperature=0.4)
         stats.record_gemini(result)

@@ -27,7 +27,7 @@ import local_market_cache
 
 _TRIGGER_RE = re.compile(r"覆盤|复盘|復盤")
 _WARRANT_RE = re.compile(r"權證|分點|主力|券商|大戶|[A-E]\s*事件|ABCDE", re.IGNORECASE)
-_INST_RE = re.compile(r"外資|投信|自營|法人")
+_INST_RE = re.compile(r"外資|投信|自營|法人|老外|外國人|外人|投顧|大戶投信")
 # 日期分隔只認 / - 月（不認小數點，免得「買在 12.5」被當成 12 月 5 日）
 _DATE_RE = re.compile(r"(?<!\d)(?:(20\d{2})[/\-年])?(\d{1,2})[/\-月](\d{1,2})日?(?!\d)")
 _PRICE_RE = re.compile(r"(?:買在|買進價|買進|買入|成本|價格|均價|@)\s*(\d+(?:\.\d+)?)(?![\d.]|\s*張)|(\d+(?:\.\d+)?)\s*元")
@@ -187,6 +187,19 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
         bollinger = tools.analyze_bollinger(part)
     except Exception:
         bollinger = {}
+    # 布林帶寬近 60 日歷史（壓縮＝目前帶寬在近期低檔）
+    width_hist = []
+    for _, r in part.tail(60).iterrows():
+        u, l, m = _f(r.get("BB_UPPER")), _f(r.get("BB_LOWER")), _f(r.get("MA20"))
+        if None not in (u, l, m) and m:
+            width_hist.append((u - l) / m * 100)
+    # 均線方向：和 3 根前比；MA5／MA20 交叉用最近 4 根
+    back = part.iloc[-4] if len(part) >= 4 else part.iloc[0]
+    ma_prev3 = {f"MA{n}": _f(back.get(f"MA{n}")) for n in (5, 10, 20, 60)}
+    ma5_hist = [_f(v) for v in part["MA5"].tail(4)] if "MA5" in part else []
+    ma20_hist = [_f(v) for v in part["MA20"].tail(4)] if "MA20" in part else []
+    osc_hist = [_f(v, 4) for v in part["OSC"].tail(4)] if "OSC" in part else []
+    prior = part.iloc[:-1]
     # 最近 3 根（含當天）收盤站上布林上軌的是第幾天前：0＝當天、None＝沒有
     upper_break = None
     for back in range(0, min(3, len(part))):
@@ -210,6 +223,14 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
                "K_last3": [_f(v) for v in part["K9"].tail(3)] if "K9" in part else [],
                "cross_days_ago": _kd_cross_days_ago(part),
                "death_cross_days_ago": _kd_cross_days_ago(part, down=True)},
+        "ma_prev3": ma_prev3, "ma5_hist": ma5_hist, "ma20_hist": ma20_hist,
+        "bb_width_hist": [round(w, 3) for w in width_hist],
+        "osc_hist": osc_hist,
+        "open": _f(row.get("Open")), "low": _f(row.get("Low")), "high": _f(row.get("High")),
+        "prev_close": _f(prev.get("Close")) if len(part) > 1 else None,
+        "prev_high": _f(prev.get("High")) if len(part) > 1 else None,
+        "prior_high_20d": _f(prior["High"].tail(20).max()) if len(prior) else None,
+        "prior_high_60d": _f(prior["High"].tail(60).max()) if len(prior) else None,
         "volume_lots": round(volume / 1000) if volume else None,
         "mv5_lots": round(_f(row.get("MV5"), 0) / 1000) if _f(row.get("MV5"), 0) else None,
         "mv20_lots": round(_f(row.get("MV20"), 0) / 1000) if _f(row.get("MV20"), 0) else None,
@@ -479,11 +500,18 @@ def _check_kd(claim: str, kd: Dict[str, Any], day: str) -> Dict[str, str]:
 
 
 def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]],
-                warrant_events: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+                warrant_events: Optional[Dict[str, Any]]) -> Dict[str, str]:
     close = snap.get("close")
     day = str(snap.get("date") or "")[5:]
+    if re.search(_NOT_AUTO_RE, claim):                    # 「營收創新高」「W底」不能當成價格新高／均線來判
+        return _result(claim, "❓", "屬於型態／基本面／消息面理由，系統不自動核對")
+    concept = _check_concepts(claim, snap, day)          # 均線方向／糾結／交叉、布林壓縮、量縮、K 棒、MACD…
+    if concept:
+        return concept
     for key, pattern in _MA_WORDS:
         if re.search(pattern, claim):
+            if re.search(_SLOPE_WORDS, claim) and not re.search(r"站上|跌破|站回|失守|突破|回測|守住", claim):
+                return _check_ma_slope(claim, snap, [key], day)
             ma = (snap["moving_averages"].get(key) or {}).get("value")
             if ma is None or close is None:
                 return _result(claim, "❓", f"{key} 資料不足")
@@ -565,13 +593,239 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
             # ③ 寫了「近 N 日」就看 N 日；沒寫就算 5 日與 10 日，取較明顯的那個
             window = _window_days(claim)
             return _check_inst_window(claim, label, inst, day, value, [window] if window else [5, 10])
-    if _WARRANT_RE.search(claim):
-        if warrant_events is None:
-            return _result(claim, "❓", "權證分點資料取不到")
-        return _result(claim, "✅" if warrant_events else "❌",
-                       f"買進日前後 10 個交易日有 {len(warrant_events)} 筆分點事件" if warrant_events
-                       else "買進日前後 10 個交易日沒有 A～E 分點事件")
-    return _result(claim, "❓", "系統沒有可對照的資料")
+    if _WARRANT_RE.search(claim) or (isinstance(warrant_events, dict)
+                                     and any(str(e.get("branch") or "") and str(e.get("branch")) in claim
+                                             for e in warrant_events.get("all") or [])):
+        return _check_warrant(claim, warrant_events)
+    return dict(_result(claim, "❓", "系統沒有可對照的資料"), unmatched=True)
+
+
+# ============================================================
+# 常見技術面說法（規則層）：全部只用買進日（含）以前的資料
+# ============================================================
+
+_SLOPE_WORDS = r"上揚|向上|翻揚|走揚|上彎|揚升|抬頭|翻多|下彎|向下|走平|翻空|下滑|走弱|轉弱|轉強"
+_NOT_AUTO_RE = r"W底|M頭|頭肩|杯柄|旗形|三角收斂|營收|財報|EPS|法說|新聞|消息|題材|利多|政策|感覺|直覺"
+
+
+def _slope(snap: Dict[str, Any], key: str) -> Optional[float]:
+    now = (snap["moving_averages"].get(key) or {}).get("value")
+    before = (snap.get("ma_prev3") or {}).get(key)
+    return None if now is None or before is None else now - before
+
+
+def _check_ma_slope(claim: str, snap: Dict[str, Any], keys: List[str], day: str) -> Dict[str, str]:
+    """均線方向（和 3 根前比）：單一均線看它自己；「均線向上」看 MA5／MA10／MA20 幾條在上揚。"""
+    down = bool(re.search(r"下彎|向下|翻空|下滑|走弱|轉弱", claim))
+    parts, moving = [], 0
+    for key in keys:
+        s = _slope(snap, key)
+        value = (snap["moving_averages"].get(key) or {}).get("value")
+        if s is None or not value:
+            continue
+        flat = abs(s) / value < 0.001
+        state = "走平" if flat else ("上揚" if s > 0 else "下彎")
+        parts.append(f"{key} {state}（3 日 {s:+.2f}）")
+        moving += 1 if (not flat and ((s < 0) if down else (s > 0))) else 0
+    if not parts:
+        return _result(claim, "❓", "均線資料不足")
+    evidence = f"{day} " + "、".join(parts)
+    if moving == len(parts):
+        return _result(claim, "✅", evidence)
+    return _result(claim, "⚠️" if moving else "❌", evidence)
+
+
+def _check_concepts(claim: str, snap: Dict[str, Any], day: str) -> Optional[Dict[str, str]]:
+    """規則認得的常見說法；認不得回 None，交給原本的均線／布林／KD／法人判斷。"""
+    close = snap.get("close")
+    mas = {k: (v or {}).get("value") for k, v in (snap.get("moving_averages") or {}).items()}
+    # 均線整體方向：均線向上／均線上揚／均線翻揚（沒指定哪一條）
+    if re.search(r"均線", claim) and re.search(_SLOPE_WORDS, claim) and not re.search(r"排列|糾結|交叉", claim):
+        return _check_ma_slope(claim, snap, ["MA5", "MA10", "MA20"], day)
+    if re.search(r"均線.*(糾結|黏合|收斂|整理)|(糾結|黏合)", claim):
+        vals = [mas.get(k) for k in ("MA5", "MA10", "MA20")]
+        if None in vals or not close:
+            return _result(claim, "❓", "均線資料不足")
+        spread = (max(vals) - min(vals)) / close * 100
+        status = "✅" if spread <= 3 else "⚠️" if spread <= 5 else "❌"
+        return _result(claim, status, f"{day} MA5／MA10／MA20 最大差距 {spread:.1f}%（3% 內算糾結）")
+    if re.search(r"均線", claim) and re.search(r"黃金交叉|金叉|死亡交叉|死叉", claim):
+        a, b = snap.get("ma5_hist") or [], snap.get("ma20_hist") or []
+        if len(a) < 2 or len(b) < 2 or None in a + b:
+            return _result(claim, "❓", "均線資料不足")
+        up = not re.search(r"死亡|死叉", claim)
+        crossed = any(((a[i - 1] <= b[i - 1] and a[i] > b[i]) if up else (a[i - 1] >= b[i - 1] and a[i] < b[i]))
+                      for i in range(1, len(a)))
+        side = a[-1] > b[-1] if up else a[-1] < b[-1]
+        evidence = f"{day} MA5 {a[-1]:g}／MA20 {b[-1]:g}"
+        if crossed:
+            return _result(claim, "✅", evidence + f"，近 3 日 MA5 {'上穿' if up else '下穿'} MA20")
+        return _result(claim, "⚠️" if side else "❌", evidence + "，近 3 日沒有交叉")
+    # 布林壓縮／收斂／收窄／帶寬縮小
+    if re.search(r"布林", claim) and re.search(r"壓縮|收斂|收窄|縮口|帶寬縮|帶寬低|窄", claim):
+        hist = snap.get("bb_width_hist") or []
+        if len(hist) < 20:
+            return _result(claim, "❓", "布林帶寬歷史不足")
+        now = hist[-1]
+        rank = sum(1 for w in hist if w <= now) / len(hist) * 100
+        status = "✅" if rank <= 20 else "⚠️" if rank <= 35 else "❌"
+        return _result(claim, status, f"{day} 帶寬 {now:.1f}%，在近 {len(hist)} 日由窄到寬排第 {rank:.0f} 百分位"
+                                      "（20 以內算壓縮）")
+    vol, mv5 = snap.get("volume_lots"), snap.get("mv5_lots")
+    if re.search(r"量縮|量能萎縮|窒息量|量能縮|縮量|量少", claim):
+        if not vol or not mv5:
+            return _result(claim, "❓", "成交量資料不足")
+        ratio = vol / mv5
+        status = "✅" if ratio <= 0.7 else "⚠️" if ratio <= 0.85 else "❌"
+        return _result(claim, status, f"{day} 成交 {vol:,} 張，為 5 日均量 {mv5:,} 張的 {ratio:.2f} 倍")
+    if re.search(r"價漲量增|量價齊揚|帶量上漲|帶量", claim):
+        change = snap.get("change_pct")
+        if not vol or not mv5 or change is None:
+            return _result(claim, "❓", "量價資料不足")
+        ok_price, ok_vol = change > 0, vol > mv5
+        status = "✅" if ok_price and ok_vol else "⚠️" if ok_price or ok_vol else "❌"
+        return _result(claim, status, f"{day} 漲跌 {change:+.2f}%，成交量為 5 日均量 {vol / mv5:.2f} 倍")
+    if re.search(r"長紅|大紅K|紅K|紅棒|大漲|漲停", claim):
+        change, open_ = snap.get("change_pct"), snap.get("open")
+        if change is None or open_ is None or close is None:
+            return _result(claim, "❓", "K 棒資料不足")
+        red = close > open_
+        need = 9.5 if "漲停" in claim else 3 if re.search(r"長紅|大紅|大漲", claim) else 0
+        ok = red and change >= need
+        status = "✅" if ok else "⚠️" if red or change > 0 else "❌"
+        return _result(claim, status, f"{day} 開 {open_:g}、收 {close:g}，漲跌 {change:+.2f}%")
+    if re.search(r"跳空|缺口", claim):
+        low, prev_high = snap.get("low"), snap.get("prev_high")
+        if low is None or prev_high is None:
+            return _result(claim, "❓", "K 棒資料不足")
+        return _result(claim, "✅" if low > prev_high else "❌",
+                       f"{day} 最低 {low:g}，前一日最高 {prev_high:g}（{'有' if low > prev_high else '沒有'}向上跳空）")
+    if re.search(r"創新高|新高|創高", claim):
+        high = snap.get("prior_high_60d")
+        if high is None or close is None:
+            return _result(claim, "❓", "資料不足")
+        gap = (close / high - 1) * 100
+        status = "✅" if gap >= 0 else "⚠️" if gap >= -1 else "❌"
+        return _result(claim, status, f"{day} 收盤 {close:g}，前 60 日最高 {high:g}（{gap:+.2f}%）")
+    if re.search(r"突破.*(整理|盤整|區間|箱型|平台|壓力)", claim):
+        high = snap.get("prior_high_20d")
+        if high is None or close is None:
+            return _result(claim, "❓", "資料不足")
+        gap = (close / high - 1) * 100
+        status = "✅" if gap >= 0 else "⚠️" if gap >= -1 else "❌"
+        return _result(claim, status, f"{day} 收盤 {close:g}，前 20 日最高 {high:g}（{gap:+.2f}%）")
+    if re.search(r"回測|拉回|回踩", claim):
+        key = next((k for k, pat in _MA_WORDS if re.search(pat, claim)), "MA20")
+        ma, low = mas.get(key), snap.get("low")
+        if ma is None or low is None or close is None:
+            return _result(claim, "❓", "資料不足")
+        touched = low <= ma * 1.015
+        held = close >= ma
+        status = "✅" if touched and held else "⚠️" if held else "❌"
+        return _result(claim, status, f"{day} 最低 {low:g}、收盤 {close:g}，{key} {ma:g}"
+                                      f"（{'有' if touched else '沒有'}回測到、{'守住' if held else '跌破'}）")
+    if re.search(r"MACD|柱狀體|OSC", claim, re.IGNORECASE):
+        osc = [v for v in snap.get("osc_hist") or [] if v is not None]
+        if len(osc) < 2:
+            return _result(claim, "❓", "MACD 資料不足")
+        down = bool(re.search(r"翻綠|轉負|死亡交叉|死叉|向下|轉弱", claim))
+        turned = any(((osc[i - 1] <= 0 < osc[i]) if not down else (osc[i - 1] >= 0 > osc[i]))
+                     for i in range(1, len(osc)))
+        on_side = osc[-1] < 0 if down else osc[-1] > 0
+        evidence = f"{day} MACD 柱狀體 {osc[-1]:+.3f}"
+        if turned:
+            return _result(claim, "✅", evidence + f"，近 3 日{'翻綠' if down else '翻紅'}")
+        return _result(claim, "⚠️" if on_side else "❌", evidence + "，近 3 日沒有翻轉")
+    return None
+
+
+# AI 翻譯層：規則認不得的說法，請 Gemini 對應到下面其中一個「標準說法」，再用規則判斷。
+# Gemini 只負責「這句話是什麼意思」，對錯仍由程式用數字決定。
+CANONICAL_CLAIMS = (
+    "站上5日線", "站上10日線", "站上月線", "站上季線", "跌破5日線", "跌破月線", "跌破季線",
+    "均線向上", "均線向下", "5日線上揚", "月線上揚", "季線上揚", "月線下彎",
+    "均線多頭排列", "均線空頭排列", "均線糾結", "均線黃金交叉", "均線死亡交叉",
+    "布林壓縮", "布林開口", "突破布林上軌", "跌破布林下軌", "站上布林中軌",
+    "爆量", "量縮", "價漲量增", "長紅K", "紅K", "漲停", "跳空缺口",
+    "突破整理區", "突破前高", "創新高", "回測月線不破", "回測10日線不破",
+    "KD黃金交叉", "KD死亡交叉", "KD向上", "KD向下", "KD高檔鈍化", "KD低檔",
+    "MACD翻紅", "MACD翻綠",
+    "外資買超", "外資賣超", "投信買超", "投信賣超", "三大法人買超", "權證分點買進",
+    "無法核對",
+)
+
+
+def claim_map_prompt(claims: List[str]) -> str:
+    return ("以下是台股投資人寫的進場理由片段。請把每一句對應到 options 裡意思最接近的一個標準說法；"
+            "意思不在清單裡、或屬於型態、基本面、消息面、主觀感覺的，填「無法核對」。不要自己判斷對錯。\n"
+            f"options：{json.dumps(list(CANONICAL_CLAIMS), ensure_ascii=False)}\n"
+            f"claims：{json.dumps(claims, ensure_ascii=False)}\n回傳 JSON。")
+
+
+CLAIM_MAP_SCHEMA = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"claim": {"type": "string"}, "canonical": {"type": "string", "enum": list(CANONICAL_CLAIMS)}},
+        "required": ["claim", "canonical"]}}},
+    "required": ["items"],
+}
+
+
+def remap_unmatched(checks: List[Dict[str, Any]], mapper, snap: Dict[str, Any], inst: Optional[Dict[str, Any]],
+                    warrant_events: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把規則認不得的理由交給 mapper（Gemini）翻成標準說法後重新核對；mapper 失敗就維持 ❓。"""
+    pending = [c["claim"] for c in checks if c.get("unmatched")]
+    if not pending or mapper is None:
+        return checks
+    try:
+        mapping = {str(i.get("claim")): str(i.get("canonical")) for i in (mapper(pending) or {}).get("items") or []}
+    except Exception as exc:
+        print(f"⚠️ 理由翻譯略過｜{type(exc).__name__}: {exc}", flush=True)
+        return checks
+    out = []
+    for c in checks:
+        canonical = mapping.get(c["claim"])
+        if c.get("unmatched") and canonical in CANONICAL_CLAIMS and canonical != "無法核對":
+            again = check_claim(canonical, snap, inst, warrant_events)
+            if not again.get("unmatched"):
+                again = dict(again, claim=c["claim"], evidence=f"依「{canonical}」核對｜{again['evidence']}",
+                             mapped_to=canonical)
+                print(f"   理由翻譯｜{c['claim']} → {canonical}｜{again['status']}", flush=True)
+                out.append(again)
+                continue
+        out.append({k: v for k, v in c.items() if k != "unmatched"})
+    return out
+
+
+def _event_text(e: Dict[str, Any]) -> str:
+    return f"{str(e.get('buy_date') or '')[5:]} {e.get('event') or ''} {e.get('buy_amount_text') or ''}".strip()
+
+
+def _check_warrant(claim: str, info: Any) -> Dict[str, str]:
+    """權證分點理由：理由有點名分點（例：國票台南）就只看那個分點；只算買進日（含）以前 10 個交易日的 A～E 買進。"""
+    if not isinstance(info, dict):
+        return _result(claim, "❓", "權證分點資料取不到")
+    window, every = info.get("window") or [], info.get("all") or []
+    named = sorted({str(e.get("branch")) for e in every if e.get("branch") and str(e.get("branch")) in claim},
+                   key=len, reverse=True)
+    if named:
+        branch = named[0]
+        hits = [e for e in window if str(e.get("branch")) == branch]
+        if hits:
+            big = any(str(e.get("event") or "") in ("D", "E") for e in hits)
+            text = f"{branch} 買進前 10 日有 {len(hits)} 筆事件：" + "、".join(_event_text(e) for e in hits[:3])
+            # 理由寫「大買／大額」但只有 A～C 小額事件＝部分成立
+            if re.search(r"大買|大額|重押|大量買", claim) and not big:
+                return _result(claim, "⚠️", text + "（沒有 D／E 大額事件）")
+            return _result(claim, "✅", text)
+        later = [e for e in every if str(e.get("branch")) == branch and str(e.get("buy_date")) > str(info.get("buy_date"))]
+        return _result(claim, "❌", f"{branch} 買進前 10 日沒有 A～E 事件"
+                       + (f"（買進後才出現：{_event_text(later[0])}，下單時看不到）" if later else ""))
+    if window:
+        return _result(claim, "✅", f"買進前 10 日有 {len(window)} 筆分點事件：" + "、".join(
+            f"{e.get('branch')} {_event_text(e)}" for e in window[:2]))
+    return _result(claim, "❌", "買進前 10 日沒有 A～E 分點事件")
 
 
 # ============================================================
@@ -597,7 +851,9 @@ def _current_facts(code: str, cost: float) -> Dict[str, Any]:
         "ma20_distance_pct": ((tech.get("moving_averages") or {}).get("MA20") or {}).get("distance_pct"),
         "bollinger_signals": (tech.get("bollinger") or {}).get("signals"),
         "position_vs_two_zones": vp.get("position_vs_two_zones"),
-        "nearest_supports": (levels.get("supports") or [])[:2],
+        # 目前觀察只拿均線／量區當防守位；布林上軌是強勢時的「壓力／通道」，拿來當防守位不自然
+        "nearest_supports": [lv for lv in levels.get("supports") or []
+                             if "上軌" not in str(lv.get("label", ""))][:2],
     }
 
 
@@ -620,8 +876,9 @@ def _summary_lines(result: Dict[str, Any], buy_price: float, trades: List[Dict[s
 # 組資料
 # ============================================================
 
-def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
-    """回傳 {payload, panel}；payload 給 Gemini 與事實核對，panel 給 K 線圖卡。"""
+def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
+    """回傳 {payload, panel}；payload 給 Gemini 與事實核對，panel 給 K 線圖卡。
+    mapper(claims) → {"items": [{claim, canonical}]}：規則認不得的理由交給 Gemini 翻成標準說法（可省略）。"""
     code = req["code"]
     bundle = tools._load_price_bundle(code)
     # 買進當時用已收盤 K 棒；「到現在」用含盤中即時 K 的完整資料，損益才會和圖上的現價一致
@@ -657,14 +914,16 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 
     warrant_events = None
     if req["need_warrant"]:
+        # 只算買進日（含）以前 10 個交易日內的分點買進：買進之後才出現的事件，下單當下看不到，不能拿來證明理由
         dates = [bar["date"] for bar in panel.get("bars") or []]
         buy_text = tools._fmt_date(buy_day)
         window = set()
         if buy_text in dates:
             pos = dates.index(buy_text)
-            window = set(dates[max(0, pos - 10):pos + 11])
-        warrant_events = [e for e in (panel.get("marks") or {}).get("events") or []
-                          if e.get("buy_date") in window or e.get("action_date") in window]
+            window = set(dates[max(0, pos - 10):pos + 1])
+        every = [e for e in (panel.get("marks") or {}).get("events") or [] if e.get("buy_date")]
+        warrant_events = {"window": [e for e in every if e.get("buy_date") in window],
+                          "all": every, "buy_date": buy_text}
 
     inst = frame = None
     need_inst = req["need_inst"] or bool(_INST_RE.search(req.get("sell_reason") or ""))
@@ -690,6 +949,7 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
     current = {} if closed else _current_facts(code, buy_price)
 
     checks = [check_claim(c, snap, inst, warrant_events) for c in _split_claims(req["reason"])]
+    checks = remap_unmatched(checks, mapper, snap, inst, warrant_events)
     sell_checks = []
     if closed and req.get("sell_reason"):
         # 出場理由也用「賣出當天（含）以前」的資料核對，不看賣後走勢
@@ -699,6 +959,7 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
             sell_inst = inst_summary(frame, pd.Timestamp(df.index[sell_close_idx]).normalize()) \
                 if frame is not None else None
             sell_checks = [check_claim(c, sell_snap, sell_inst, None) for c in _split_claims(req["sell_reason"])]
+            sell_checks = remap_unmatched(sell_checks, mapper, sell_snap, sell_inst, None)
     payload = {
         "mode": "closed" if closed else "holding",
         "trade_id": f"{code}-{buy_day:%Y%m%d}-{int(time.time())}",
@@ -716,10 +977,10 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
         "current": current or None,
         "reason_checks": checks,
         "institutional": inst,
-        "warrant_events_near_buy": [
-            {k: e.get(k) for k in ("no", "branch", "event_codes", "buy_date", "action_date", "action_text",
-                                   "net_amount_text", "status") if e.get(k) not in (None, "")}
-            for e in (warrant_events or [])][:10] if warrant_events is not None else None,
+        "warrant_events_before_buy": [
+            {k: e.get(k) for k in ("no", "branch", "event", "buy_date", "buy_amount_text", "status")
+             if e.get(k) not in (None, "")}
+            for e in warrant_events["window"]][:10] if warrant_events is not None else None,
     }
     # 轉成純 JSON（numpy 數值、Timestamp 都先轉掉），後面的事實核對會直接 json.dumps(payload)
     payload = json.loads(json.dumps(payload, ensure_ascii=False, default=tools.json_safe))
@@ -750,6 +1011,7 @@ REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」�
 
 回傳 JSON：
 - headline：一句話的覆盤結論，15～28 字，例如「分點籌碼理由有對到，但進場後仍經歷明顯震盪」。
+  不要用「成功」「完美」「精準」「迎來」這類替結果打分數的字眼；結論講的是判斷，不是結果。
 - body：60～100 字，像投資人自己寫的交易日記，自然、簡潔、客觀、台灣投資人口吻。
   講這筆交易的核心邏輯有沒有對到、進場後實際承受了什麼、最值得記住的一件事。
   統計列已有的數字最多只引用一個（通常是最大回撤），不要逐一列出日期、價格、報酬。
@@ -761,7 +1023,7 @@ REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」�
   不要把「目前報酬多少」當成一條重點。
 - watch（持倉中）：目前最值得觀察的「一件事」，最多 35 字，要具體、自然。
   若要提價位，只從 current.nearest_supports 挑最近的一個（例如「突破後能否守住 10 日線」）；
-  不要用「跌破布林上軌」當風險條件，也不要列一串條件。
+  不要拿布林上軌當防守位或風險條件，也不要列一串條件。
 - lesson（已賣出）：這筆交易下次最值得沿用或修正的一件事，最多 35 字。
 
 一定要遵守：
@@ -780,18 +1042,37 @@ review_data：
 """
 
 
+_PROMPT_DROP = ("bb_width_hist", "osc_hist", "ma5_hist", "ma20_hist", "K_last3", "bandwidth_trend", "ma_prev3",
+                "recent")
+
+
+def _slim(value: Any) -> Any:
+    """給 Gemini 的資料拿掉核對用的長序列（帶寬歷史、每日法人…），省 token；核對結果已經在 reason_checks。"""
+    if isinstance(value, dict):
+        return {k: _slim(v) for k, v in value.items() if k not in _PROMPT_DROP}
+    if isinstance(value, list):
+        return [_slim(v) for v in value]
+    return value
+
+
 def build_prompt(payload: Dict[str, Any]) -> str:
-    return REVIEW_PROMPT + json.dumps(payload, ensure_ascii=False, default=str)
+    return REVIEW_PROMPT + json.dumps(_slim(payload), ensure_ascii=False, default=str)
 
 
 def _clip(text: str, limit: int) -> str:
-    """超過字數就在最後一個句讀處截斷，沒有句讀就硬截並加「…」（圖片不可無限往下長）。"""
+    """超過字數就截在最後一個完整句子（。！？；）；找不到才截在逗號並改成句號。
+    不讓正文停在「…呈現多頭排列，」這種半句話。"""
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(value) <= limit:
         return value
     cut = value[:limit]
-    stop = max(cut.rfind(p) for p in "。；，")
-    return cut[:stop + 1] if stop >= limit * 0.6 else cut.rstrip("，、；") + "…"
+    stop = max(cut.rfind(p) for p in "。！？；")
+    if stop >= limit * 0.45:
+        return cut[:stop + 1]
+    comma = cut.rfind("，")
+    if comma >= limit * 0.45:
+        return cut[:comma] + "。"
+    return cut.rstrip("，、；") + "…"
 
 
 def strip_hindsight(text: str) -> Tuple[str, List[str]]:
@@ -873,7 +1154,7 @@ def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
     summary = "｜".join(text for text, _ in review_summary(payload))
     lines = [summary, "", f"我的理由｜{payload['trade'].get('entry_reason_raw', '')}"]
     lines += [f"{c['status']} {c['claim']}｜{c['evidence']}" for c in payload["reason_checks"]]
-    lines += ["", review["headline"], review["body"], "", "本次記住"]
+    lines += ["", review["headline"], review["body"], "", "交易心得"]
     lines += [f"• {h}" for h in review["highlights"]]
     lines += ["", f"{last_label}｜{review.get(last_key, '')}"]
     return "\n".join(lines).strip()
@@ -899,15 +1180,16 @@ def review_summary(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     t, a = payload["trade"], payload["after_buy"]
     live = "（盤中）" if str(a.get("price_basis", "")).startswith("盤中") else ""
     if payload["mode"] == "closed":
-        parts = [(f"{t['buy_date'][5:]} @{_price(t['buy_price'])} → {str(t.get('sell_date') or '')[5:]} "
-                  f"@{_price(t.get('sell_price'))}", ""),
-                 (f"實現 {a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
+        parts = [(f"{t['buy_date'][5:]} 買進 {_price(t['buy_price'])}", ""),
+                 (f"{str(t.get('sell_date') or '')[5:]} 賣出 {_price(t.get('sell_price'))}", ""),
+                 (f"實現報酬 {a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
     else:
-        parts = [(f"{t['buy_date'][5:]} @{_price(t['buy_price'])}", ""),
+        parts = [(f"{t['buy_date'][5:]} 買進 {_price(t['buy_price'])}", ""),
                  (f"現價 {_price(a.get('last_price'))}{live}", ""),
-                 (f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
-    parts += [(f"MFE {a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
-              (f"MAE {a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
+                 (f"報酬 {a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
+    # 用中文寫：最大浮盈＝持有期間最高曾賺多少（MFE）、最大回撤＝持有期間最低曾虧多少（MAE）
+    parts += [(f"最大浮盈 {a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
+              (f"最大回撤 {a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
               (f"持有 {a['trading_days']} 日", "")]
     return parts
 
