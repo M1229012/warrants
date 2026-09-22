@@ -2601,40 +2601,43 @@ class AceQueryEngine:
             return AnswerResult(text=f"無法建立覆盤：{exc}", route="review_error", gemini_calls=0,
                                 elapsed=elapsed(), cacheable=False, as_text=True)
         payload, panel = built["payload"], built["panel"]
-        for check in payload["reason_checks"]:
+        for check in payload["reason_checks"] + (payload.get("sell_reason_checks") or []):
             self.log(f"   理由核對 {check['status']} {check['claim']}｜{check['evidence']}")
-        # 摘要／進場理由／理由核對由程式寫；Gemini 只寫進場後發展、本次覆盤、目前觀察或賣出檢討（JSON 欄位）
+        # 事實與理由核對由程式產生；Gemini 讀事實寫 headline／body／highlights／watch（或 lesson）
         stats = AnswerStats()
-        fallback = trade_review.rule_fields(payload)
         result = self.gateway.generate(trade_review.build_prompt(payload), purpose="trade_review",
-                                       schema=trade_review.ai_schema(payload["mode"]), temperature=0.3)
+                                       schema=trade_review.ai_schema(payload["mode"]), temperature=0.4)
         stats.record_gemini(result)
-        fields: Dict[str, str] = {}
-        prefix = ""
+        source, removed = "fallback", []
         if result.ok:
             try:
                 data = json.loads(result.text)
             except (TypeError, ValueError):
                 data = tools.core()._extract_json_from_text(result.text) or {}
-            for key, fallback_text in fallback.items():
-                text_value = str((data or {}).get(key) or "").strip() if isinstance(data, dict) else ""
-                pruned, removed = prune_ungrounded_sentences(text_value, payload)
-                pruned, hindsight = trade_review.strip_hindsight(pruned)
-                if removed or hindsight:
-                    self.log(f"覆盤核對｜{key}｜刪除 數字 {len(removed)} 句、事後歸因 {len(hindsight)} 句｜"
-                             + "；".join(s[:30] for s in (removed + hindsight)[:3]))
-                fields[key] = pruned or fallback_text
+            review, removed = trade_review.sanitize_review(data, payload, prune_ungrounded_sentences)
+            source = "success"
+            if removed:
+                self.log(f"   覆盤核對：刪除 {len(removed)} 句（數字對不上或事後歸因）｜"
+                         + "；".join(s[:30] for s in removed[:3]))
         else:
-            prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 覆盤暫時無法使用，以下先提供系統整理的資料。"
-            fields = fallback
-        note = trade_review.compose(payload, fields)
-        if prefix:
-            note = f"{prefix}\n\n{note}"
-        trade_review.save_note(context_key, payload, note)
+            review = trade_review.fallback_review(payload)
+            self.log(f"   覆盤 Gemini 失敗，改用程式版｜{result.error}")
+        record = trade_review.save_note(context_key, payload, review, source, raw_input=question)
         heading = trade_review.title(payload)
-        text = f"**{heading}（{payload['stock']['code']}）**\n\n{note}\n\n{DISCLAIMER}"
+        body = trade_review.review_text(payload, review)
+        self.log(
+            f"📝 交易覆盤｜{payload['stock']['code']}｜trade_id={record.get('trade_id')}"
+            f"｜原始理由={payload['trade'].get('entry_reason_raw', '')}"
+            f"｜核對資料日期={payload['at_buy'].get('date', '')}"
+            f"｜Gemini={source}｜prompt tokens={stats.input_tokens}｜output tokens={stats.output_tokens}"
+            f"｜review chars={len(body)}"
+        )
+        prefix = "" if source == "success" else (
+            RATE_LIMIT_MESSAGE if result.rate_limited else "AI 覆盤暫時無法使用，以下為系統整理的簡短版本。")
+        text = f"**{heading}**\n\n" + (f"{prefix}\n\n" if prefix else "") + f"{body}\n\n{DISCLAIMER}"
+        panels = [panel, trade_review.review_panel(payload, review, source)]
         return AnswerResult(text=text, route="trade_review", gemini_calls=stats.gemini_calls, elapsed=elapsed(),
-                            cacheable=False, panels=[panel], image_title=heading,
+                            cacheable=False, panels=panels, image_title=heading,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
                             total_tokens=stats.total_tokens, token_source=stats.token_source)
 

@@ -536,7 +536,11 @@ def _inst_height(panel: dict) -> int:
 
 
 def _trade_height(panel: dict) -> int:
-    return TRADE_LEGEND_H if (panel or {}).get('trades') else 0
+    # 覆盤卡已有統計列時，K 線下方不再重複畫交易摘要列
+    if not (panel or {}).get('trades') or (panel or {}).get('hide_trade_legend'):
+        return 0
+    lines = (panel or {}).get('trade_summary_lines') or []
+    return TRADE_LEGEND_H + max(0, len(lines) - 1) * 32
 
 
 def panel_height(panel: dict) -> int:
@@ -604,12 +608,15 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
 
 
 def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
+    """K 線下方的交易摘要列：第一行（紫色▲）買進／持有／現價／報酬，第二行最大浮盈／最大回撤。"""
     r = 8
     cy = top + 20
     draw.polygon([(left + r, cy - r), (left + 2 * r, cy + r), (left, cy + r)], fill=TRADE_COLOR)   # 同 K 線上的 ▲
-    text = str(panel.get('trade_summary') or '我的交易')
-    text, size = fit(text, 21, CONTENT - 120, True)
-    draw.text((left + 2 * r + 12, cy), text, font=font(size, True), fill=TRADE_COLOR, anchor='lm')
+    lines = [str(t) for t in panel.get('trade_summary_lines') or []] or [str(panel.get('trade_summary') or '我的交易')]
+    for i, line in enumerate(lines[:2]):
+        text, size = fit(line, 21 if i == 0 else 19, CONTENT - 120, i == 0)
+        draw.text((left + 2 * r + 12, cy + i * 32), text, font=font(size, i == 0),
+                  fill=TRADE_COLOR if i == 0 else MUTED, anchor='lm')
 
 
 def _badge_half(number_text) -> float:
@@ -965,9 +972,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'])
         below += INST_BLOCK_H
-    if panel.get('trades'):
+    if _trade_height(panel):
         draw_trade_legend(draw, below, left, panel)
-        below += TRADE_LEGEND_H
+        below += _trade_height(panel)
     mark_legend(draw, panel, below, False)
 
 
@@ -1932,6 +1939,177 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
     return height
 
 
+# ============================================================
+# 交易覆盤卡：標題＋一句結論＋正文（最多 4 行）＋重點（每條最多 2 行）＋目前觀察／下次（最多 2 行）
+# 行數上限寫死，文字再長也不會把圖片無限往下拉。
+# ============================================================
+
+REVIEW_PAD = 36
+REVIEW_LEFT_W = 470                  # 左欄：原始理由＋理由核對；右欄：AI 覆盤筆記＋本次重點／目前觀察
+REVIEW_GAP = 28
+REVIEW_TILE_H = 86
+REVIEW_BODY_MAX, REVIEW_HL_MAX, REVIEW_LAST_MAX, REVIEW_EVID_MAX = 4, 2, 3, 2
+STATUS_STYLE = {'✅': (GOOD_BG, GOOD_INK), '⚠️': (WARN_BG, WARN_INK), '❌': ('#FDECEC', '#C24141'), '❓': (TILE_BG, MUTED)}
+NOTE_BG, NOTE_INK = '#FFF4E8', '#B45309'           # AI 覆盤筆記的暖色底
+HL_BG, WATCH_BG = '#EEF4FF', '#F3F0FF'
+
+
+def _is_review_panel(panel: dict) -> bool:
+    return isinstance((panel or {}).get('review'), dict)
+
+
+def _capped_lines(text: str, size: int, width: float, limit: int, bold: bool = False) -> list[str]:
+    lines = wrap(clean(text), size, width, bold)
+    if len(lines) <= limit:
+        return lines
+    kept = lines[:limit]
+    kept[-1] = kept[-1].rstrip('，、。；') + '…'
+    return kept
+
+
+def _status_icon(draw, cx: float, cy: float, status: str, r: int = 12) -> None:
+    """Noto CJK 沒有 emoji 字形：用圓形＋線條畫 ✓／!／×／?。"""
+    _, ink = STATUS_STYLE.get(status, STATUS_STYLE['❓'])
+    fill = {'✅': '#16A34A', '⚠️': '#F59E0B', '❌': '#DC2626'}.get(status, '#98A2B3')
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=fill)
+    if status == '✅':
+        draw.line((cx - 6, cy, cx - 1, cy + 5, cx + 7, cy - 5), fill='white', width=3)
+    elif status == '❌':
+        draw.line((cx - 5, cy - 5, cx + 5, cy + 5), fill='white', width=3)
+        draw.line((cx - 5, cy + 5, cx + 5, cy - 5), fill='white', width=3)
+    elif status == '⚠️':
+        draw.line((cx, cy - 6, cx, cy + 2), fill='white', width=3)
+        draw.ellipse((cx - 2, cy + 4, cx + 2, cy + 8), fill='white')
+    else:
+        draw.text((cx, cy), '?', font=font(16, True), fill='white', anchor='mm')
+
+
+def _highlight_status(text: str) -> str:
+    """重點前面的小圖示：講不符／不成立＝紅、需修正／並非＝橘、其餘＝綠。只是視覺提示，不改內容。"""
+    if re.search(r'不符|不成立|錯誤|賣超', text):
+        return '❌'
+    if re.search(r'並非|不是|需修正|部分|缺|不足', text):
+        return '⚠️'
+    return '✅'
+
+
+def _review_stats(data: dict) -> list[tuple[str, str, str]]:
+    return [(str(k), str(v), str(c or INK)) for k, v, c in data.get('stats') or []]
+
+
+def review_card(draw, y: float, data: dict, dry: bool) -> int:
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    px, width = x0 + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
+    lw, rw = REVIEW_LEFT_W, width - REVIEW_LEFT_W - REVIEW_GAP
+    rx = px + lw + REVIEW_GAP
+    stats = _review_stats(data)
+
+    # ---- 左欄：原始進場理由（引號框）＋理由核對 ----
+    quote = _capped_lines(f"「{data.get('reason_raw', '')}」", 23, lw - 60, 2)
+    checks = []
+    for c in (data.get('checks') or [])[:4]:
+        evid = _capped_lines(str(c.get('evidence', '')), 20, lw - 64, REVIEW_EVID_MAX)
+        checks.append((c, evid))
+    left_h = 40 + (len(quote) * 34 + 30) + 22 + 40
+    left_h += sum(40 + len(e) * 30 + 16 for _, e in checks) + 6
+
+    # ---- 右欄：AI 覆盤筆記（headline＋body）＋本次重點／目前觀察 ----
+    headline = _capped_lines(data.get('headline', ''), 25, rw - 40, 2, True)
+    body = _capped_lines(data.get('body', ''), 22, rw - 40, REVIEW_BODY_MAX)
+    half = (rw - 16) / 2
+    highlights = [(h, _capped_lines(h, 18, half - 60, REVIEW_HL_MAX)) for h in (data.get('highlights') or [])[:3]]
+    last = _capped_lines(data.get('last_text', ''), 20, half - 36, REVIEW_LAST_MAX)
+    note_h = len(headline) * 36 + len(body) * 33 + 34
+    hl_h = 46 + sum(len(lines) * 27 + 10 for _, lines in highlights) + 8
+    watch_h = 46 + len(last) * 30 + 14
+    right_h = 40 + note_h + 14 + max(hl_h, watch_h)
+
+    h = 26 + 54 + 16                                       # 標題列
+    h += (REVIEW_TILE_H + 22) if stats else 0              # 統計列
+    h += max(left_h, right_h) + (26 if data.get('source') == 'fallback' else 0) + 24
+    if dry:
+        return int(h)
+
+    draw.rounded_rectangle((x0, y, x1, y + h), radius=20, fill='white', outline=LINE)
+    # 標題列：紫色圓徽＋「2454 聯發科｜持倉中覆盤」
+    cy = y + 26
+    draw.ellipse((px, cy, px + 50, cy + 50), fill=TRADE_COLOR)
+    draw.text((px + 25, cy + 25), '覆', font=font(24, True), fill='white', anchor='mm')
+    draw.text((px + 66, cy + 25), str(data.get('title', '')), font=font(32, True), fill=INK, anchor='lm')
+    cy += 54 + 16
+
+    # 統計列：買進日期／買進價格／現價／帳面報酬／最大浮盈／最大回撤／持有天數
+    if stats:
+        draw.rounded_rectangle((px, cy, px + width, cy + REVIEW_TILE_H), radius=14, fill=TILE_BG)
+        cell = width / len(stats)
+        for i, (label, value, color) in enumerate(stats):
+            cx = px + i * cell
+            if i:
+                draw.line((cx, cy + 16, cx, cy + REVIEW_TILE_H - 16), fill=LINE, width=1)
+            draw.text((cx + 20, cy + 26), label, font=font(18), fill=MUTED, anchor='lm')
+            text, size = fit(value, 25, cell - 30, True)
+            draw.text((cx + 20, cy + 58), text, font=font(size, True), fill=color, anchor='lm')
+        cy += REVIEW_TILE_H + 22
+
+    # 左欄
+    ly = cy
+    text_at(draw, (px, ly), '原始進場理由（我的紀錄）', 22, INK, True)
+    ly += 40
+    box_h = len(quote) * 34 + 30
+    draw.rounded_rectangle((px, ly, px + lw, ly + box_h), radius=12, fill=TILE_BG)
+    for i, line in enumerate(quote):
+        text_at(draw, (px + 26, ly + 14 + i * 34), line, 23, INK)
+    ly += box_h + 22
+    text_at(draw, (px, ly), '進場理由核對', 22, INK, True)
+    ly += 40
+    for c, evid in checks:
+        status = str(c.get('status', '❓'))
+        bg, ink = STATUS_STYLE.get(status, STATUS_STYLE['❓'])
+        _status_icon(draw, px + 16, ly + 16, status)
+        claim, size = fit(str(c.get('claim', '')), 22, lw - 170, True)
+        draw.text((px + 40, ly + 16), claim, font=font(size, True), fill=INK, anchor='lm')
+        chip = str(c.get('status_text', ''))
+        chip_x = px + 40 + font(size, True).getlength(claim) + 12
+        chip_w = font(18, True).getlength(chip) + 22
+        draw.rounded_rectangle((chip_x, ly + 2, chip_x + chip_w, ly + 30), radius=14, fill=bg)
+        draw.text((chip_x + chip_w / 2, ly + 16), chip, font=font(18, True), fill=ink, anchor='mm')
+        for i, line in enumerate(evid):
+            text_at(draw, (px + 40, ly + 38 + i * 30), line, 20, MUTED)
+        ly += 40 + len(evid) * 30 + 16
+
+    # 右欄
+    ry = cy
+    text_at(draw, (rx, ry), 'AI 覆盤筆記', 22, INK, True)
+    ry += 40
+    draw.rounded_rectangle((rx, ry, rx + rw, ry + note_h), radius=14, fill=NOTE_BG)
+    ty = ry + 16
+    for line in headline:
+        text_at(draw, (rx + 20, ty), line, 25, NOTE_INK, True)
+        ty += 36
+    for line in body:
+        text_at(draw, (rx + 20, ty), line, 22, INK)
+        ty += 33
+    ry += note_h + 14
+    box_h = max(hl_h, watch_h)
+    draw.rounded_rectangle((rx, ry, rx + half, ry + box_h), radius=14, fill=HL_BG)
+    text_at(draw, (rx + 18, ry + 12), '本次重點', 21, '#1D4ED8', True)
+    hy = ry + 46
+    for text, lines in highlights:
+        _status_icon(draw, rx + 30, hy + 12, _highlight_status(text), r=10)
+        for i, line in enumerate(lines):
+            text_at(draw, (rx + 50, hy + i * 27), line, 18, INK)
+        hy += len(lines) * 27 + 10
+    wx = rx + half + 16
+    draw.rounded_rectangle((wx, ry, rx + rw, ry + box_h), radius=14, fill=WATCH_BG)
+    text_at(draw, (wx + 18, ry + 12), str(data.get('last_label') or '目前觀察'), 21, TRADE_COLOR, True)
+    for i, line in enumerate(last):
+        text_at(draw, (wx + 18, ry + 50 + i * 30), line, 20, INK)
+
+    if data.get('source') == 'fallback':
+        text_at(draw, (px, y + h - 44), 'AI 摘要暫時無法使用，以上為系統整理的簡短版本', 18, MUTED)
+    return int(h)
+
+
 def _is_article_panel(panel: dict) -> bool:
     return bool((panel or {}).get('article'))
 
@@ -1995,15 +2173,17 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     sector_panels = [p for p in panels if _is_sector_panel(p)]
     article_panels = [p for p in panels if _is_article_panel(p)]
     contribution_panels = [p for p in panels if _is_contribution_panel(p)]
+    review_panels = [p for p in panels if _is_review_panel(p)]
     panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)
-              and not _is_contribution_panel(p)]
+              and not _is_contribution_panel(p) and not _is_review_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
         panels = [{**p, 'compact': True} for p in panels]
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
-    blocks = [] if (sector_panels or article_panels) else body_blocks(answer)
+    # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
+    blocks = [] if (sector_panels or article_panels or review_panels) else body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
@@ -2012,7 +2192,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(contribution_card(None, 0, p['contribution'], True) + 24 for p in contribution_panels)
     panels_height += sum(_sector_block(None, 0, p, True) + 24 for p in sector_panels)
     panels_height += sum(article_card(None, 0, p['article'], True) + 24 for p in article_panels)
+    panels_height += sum(review_card(None, 0, p['review'], True) + 24 for p in review_panels)
     height = header_height + panels_height + body_height + 112
+    if review_panels:
+        print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
@@ -2034,6 +2217,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += _sector_block(draw, y, panel, False) + 24
     for panel in article_panels:
         y += article_card(draw, y, panel['article'], False) + 24
+    for panel in review_panels:
+        y += review_card(draw, y, panel['review'], False) + 24
     if blocks:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30

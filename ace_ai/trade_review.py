@@ -1,13 +1,11 @@
-"""個人交易覆盤筆記：使用者只給「股票＋買進日＋買進理由」（賣出日／賣出理由可選），
-程式補齊當時盤面、進場後走勢與目前結構，再請 Gemini 寫「只有 AI 才需要寫」的幾段。
+"""個人交易覆盤筆記：使用者只給「股票＋買進日＋買進理由」（賣出日／賣出理由可選）。
 
-覆盤結構（持倉中／完整交易分開）：
-  ① 交易摘要　　　　程式產生
-  ② 我的進場理由　　程式產生：只列使用者當時講過的理由，不替他補理由
-  ③ 理由核對　　　　程式產生：✅ 成立／⚠️ 部分成立／❌ 不成立／❓ 資料不足
-  ④ 進場後發展　　　Gemini：只記錄進場後出現的事實，明確標示「不是原始進場理由」，禁止「主要歸功於」這類事後歸因
-  ⑤ 本次覆盤　　　　Gemini：做對／修正／下次，各一兩句
-  持倉中 → 目前觀察（Gemini 一兩句）；已賣出 → 賣出檢討（實現報酬、MFE／MAE、賣後 5 日、賣太早或太晚）
+兩層分工：
+  Python：事實（買賣價、報酬、持有日、MFE／MAE、原始理由、進場當日技術與法人、進場後走勢、目前結構）
+          ＋ 理由核對（✅ 成立／⚠️ 部分成立／❌ 不成立／❓ 資料不足）
+  Gemini：讀事實、挑 2～4 個值得記錄的重點，寫成投資人自己的覆盤筆記，固定 JSON：
+          headline／body／highlights（2～3 條）／watch（持倉中）或 lesson（已賣出）
+          每欄都做數字核對、刪事後歸因句、限字數；Gemini 失敗就用程式版 fallback，同一個格式。
 
 原則：
 - 「買進當時」只用買進日（含）以前的日 K 計算，不混入之後才知道的資料。
@@ -383,46 +381,45 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
 
 
 # ============================================================
-# 持股狀態卡：沿用一般個股的型態評分卡（同一套關鍵價位、均線扣抵、盤中觀察），但不顯示分數
+# 目前結構（只給 Gemini 寫「目前觀察」用；圖片上不再另列一張持股狀態卡，K 線數值卡已經有這些數字）
 # ============================================================
 
-def _position_card(code: str, cost: float, result: Dict[str, Any], need_warrant: bool
-                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """回傳 (卡片, 給 Gemini 的現況資料)。任何一步失敗只少這張卡，筆記照寫。"""
-    import weekly_pick
+def _current_facts(code: str, cost: float) -> Dict[str, Any]:
+    """現在的型態、均線、布林與最近支撐；任何一步失敗就回空 dict，筆記照寫。"""
     try:
         tech = tools.get_technical_analysis(code)
         vp = tools.get_volume_profile(code)
-        extras = weekly_pick._technical_extras(code)
-        chips = tools.get_sheet_stock_chips(code) if need_warrant else None
-        card = weekly_pick.build_pattern_scorecard(tech, vp, extras, chips, cost)
+        levels = tools.key_price_levels(tech, vp)
     except Exception as exc:
-        print(f"⚠️ 覆盤持股狀態卡略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
-        return {}, {}
-    card.update({
-        "hide_score": True,                        # 覆盤不給評分：拿掉分數、五大項與得分／失分
-        "level_limits": (2, 6),                    # 關鍵價位多列幾道支撐（均線、量區、布林）
-        "card_title": "持股狀態",
-        "card_note": f"{card.get('score_basis') or '收盤確認'}｜成本與均線、量區、布林的距離",
-        "show_tracked_branches": bool(card.get("show_tracked_branches")) and need_warrant,
-        "extra_tags": [
-            ("買進", f"{result.get('buy_date_text', '')}（持有 {result['trading_days']} 個交易日）"),
-            ("區間", f"最大浮盈 {result['max_gain_pct']:+.2f}%｜最大回撤 {result['max_drawdown_pct']:+.2f}%"),
-        ],
-    })
-    current = {
-        "data_basis": card.get("score_basis"),
-        "close": card.get("close"),
-        "unrealized_pct": card.get("unrealized_pct"),
-        "pattern_label": card.get("pattern_label"),
-        "ma_alignment": card.get("ma_alignment"),
-        "moving_averages": tech.get("moving_averages"),
+        print(f"⚠️ 覆盤目前結構略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
+        return {}
+    close = levels.get("close")
+    return {
+        "data_basis": tech.get("signal_status"),
+        "close": close,
+        "unrealized_pct": tools._pct(close, cost) if close else None,
+        "pattern_label": vp.get("pattern_label"),
+        "ma_alignment": tech.get("ma_alignment"),
+        "ma20_distance_pct": ((tech.get("moving_averages") or {}).get("MA20") or {}).get("distance_pct"),
         "bollinger_signals": (tech.get("bollinger") or {}).get("signals"),
         "position_vs_two_zones": vp.get("position_vs_two_zones"),
-        "supports_below": card.get("supports_below_close"),
-        "intraday_changes": card.get("intraday_changes"),
+        "nearest_supports": (levels.get("supports") or [])[:2],
     }
-    return card, current
+
+
+def _summary_lines(result: Dict[str, Any], buy_price: float, trades: List[Dict[str, Any]], closed: bool) -> List[str]:
+    """K 線下方的小交易摘要列（兩行），取代原本整張「持股狀態」卡。"""
+    buy = f"{trades[0]['date'][5:]} 買進 {buy_price:,.0f}" if buy_price >= 100 else f"{trades[0]['date'][5:]} 買進 {buy_price:g}"
+    if closed:
+        sell = trades[1]
+        first = (f"{buy}｜{sell['date'][5:]} 賣出 {sell['price']:,.6g}｜持有 {result['trading_days']} 日"
+                 f"｜實現 {result['return_pct']:+.2f}%")
+    else:
+        live = "（盤中）" if str(result.get("price_basis", "")).startswith("盤中") else ""
+        first = (f"{buy}｜持有 {result['trading_days']} 日｜現價 {result['last_price']:,.6g}{live}"
+                 f"｜{result['return_pct']:+.2f}%")
+    second = f"最大浮盈 {result['max_gain_pct']:+.2f}%｜最大回撤 {result['max_drawdown_pct']:+.2f}%"
+    return [first, second]
 
 
 # ============================================================
@@ -475,8 +472,9 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
         warrant_events = [e for e in (panel.get("marks") or {}).get("events") or []
                           if e.get("buy_date") in window or e.get("action_date") in window]
 
-    inst = None
-    if req["need_inst"]:
+    inst = frame = None
+    need_inst = req["need_inst"] or bool(_INST_RE.search(req.get("sell_reason") or ""))
+    if need_inst:
         try:
             frame = fetch_institutional(code, days=bars_needed + 10)
             inst = inst_summary(frame, buy_day)
@@ -492,26 +490,32 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
     if closed:
         trades.append({"date": tools._fmt_date(live.index[sell_idx]), "price": sell_price, "side": "sell"})
     panel["trades"] = trades
-    basis = "實現" if closed else ("盤中" if result["price_basis"].startswith("盤中") else "至今")
-    panel["trade_summary"] = (f"我的交易｜{trades[0]['date'][5:]} 買進 {buy_price:g}"
-                              + (f"｜{trades[1]['date'][5:]} 賣出 {sell_price:g}" if closed else "")
-                              + f"｜{basis} {result['return_pct']:+.2f}%")
+    panel["trade_summary_lines"] = _summary_lines(result, buy_price, trades, closed)
+    panel["hide_trade_legend"] = True        # 覆盤卡的統計列已經有這些數字，K 線下方不重複
 
-    current = {}
-    if not closed:                                   # 已賣出就不需要「持股狀態」卡
-        card, current = _position_card(code, buy_price, result, req["need_warrant"])
-        if card:
-            panel["scorecard"] = card
+    current = {} if closed else _current_facts(code, buy_price)
 
     checks = [check_claim(c, snap, inst, warrant_events) for c in _split_claims(req["reason"])]
+    sell_checks = []
+    if closed and req.get("sell_reason"):
+        # 出場理由也用「賣出當天（含）以前」的資料核對，不看賣後走勢
+        sell_close_idx = _index_on_or_after(df, live.index[sell_idx].date())
+        if sell_close_idx is not None:
+            sell_snap = snapshot_at(df, sell_close_idx)
+            sell_inst = inst_summary(frame, pd.Timestamp(df.index[sell_close_idx]).normalize()) \
+                if frame is not None else None
+            sell_checks = [check_claim(c, sell_snap, sell_inst, None) for c in _split_claims(req["sell_reason"])]
     payload = {
         "mode": "closed" if closed else "holding",
+        "trade_id": f"{code}-{buy_day:%Y%m%d}-{int(time.time())}",
         "stock": {"code": code, "name": req.get("name") or panel.get("stock_name", "")},
         "trade": {"buy_date": tools._fmt_date(buy_day), "buy_price": buy_price,
                   "buy_price_source": "使用者提供" if req.get("price") else "買進日收盤價",
                   "lots": req.get("lots"), "entry_reasons": _split_claims(req["reason"]),
+                  "entry_reason_raw": req["reason"],
                   "sell_date": trades[1]["date"] if closed else None, "sell_price": sell_price,
                   "sell_reason": req.get("sell_reason") or None},
+        "sell_reason_checks": sell_checks,
         "at_buy": snap,
         "after_buy": result,
         "after_sell": after_sell(live, sell_idx, sell_price) if closed else None,
@@ -529,42 +533,61 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# Gemini：只寫「進場後發展／本次覆盤／目前觀察或賣出檢討」，其餘由程式組
+# Gemini：讀結構化事實，挑 2～4 個值得記錄的重點，寫成投資人自己的覆盤筆記（固定 JSON 欄位）
 # ============================================================
 
-AI_FIELDS_HOLDING = ("after_entry", "did_right", "to_fix", "next_time", "watch")
-AI_FIELDS_CLOSED = ("after_entry", "did_right", "to_fix", "next_time", "sell_review")
+HEADLINE_MAX, BODY_MAX, HIGHLIGHT_MAX, WATCH_MAX = 40, 170, 40, 50
 
 
 def ai_schema(mode: str) -> Dict[str, Any]:
-    fields = AI_FIELDS_CLOSED if mode == "closed" else AI_FIELDS_HOLDING
-    return {"type": "object", "properties": {f: {"type": "string"} for f in fields}, "required": list(fields)}
+    last = "lesson" if mode == "closed" else "watch"
+    return {"type": "object",
+            "properties": {"headline": {"type": "string"}, "body": {"type": "string"},
+                           "highlights": {"type": "array", "items": {"type": "string"}},
+                           last: {"type": "string"}},
+            "required": ["headline", "body", "highlights", last]}
 
 
-REVIEW_PROMPT = """你在幫交易者寫交易日記的其中幾段。交易摘要、進場理由、理由核對已經由程式寫好，你只負責下面的欄位，
-每個欄位 1～2 句、繁體中文、陳述句，像交易者寫給半年後的自己看，20 秒內要能讀完。
+REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」。review_data 是程式整理好的事實，你只負責讀懂、挑重點、用自然的話寫出來。
 
-欄位：
-- after_entry（進場後發展）：只記錄進場後「實際發生的事實」，例如最大回撤、之後的價格走勢、進場後才出現的均線或布林變化。
-  最後要清楚標示「這些是進場後出現的現象，不是原始進場理由」。
-- did_right（做對的）：只能根據 reason_checks 裡 ✅／⚠️ 的理由，或進場位置的品質（例如進場後最大回撤很小）。
-- to_fix（需要修正的）：針對 ❌／⚠️／❓ 的理由，具體說哪一條與當日資料不符、差在哪裡；全部成立就寫進場理由上可以再補的確認條件。
-- next_time（下次可沿用）：一句可以直接執行的做法，例如「KD 黃金交叉搭配整理區突破或量能確認後再進場」。
-- watch（目前觀察，只有持倉中）：依 current 用一兩句說目前趨勢與最值得觀察的一件事，不要列一串價位。
-- sell_review（賣出檢討，只有已賣出）：依 trade.sell_reason 與 after_sell，說明賣出理由是否站得住、賣後 5 日走勢顯示是賣早還是賣晚；沒寫賣出理由就只談時機。
+先想清楚這筆交易真正值得記下的 2～4 件事（例如：原始理由和當天資料不符、進場位置好不好、進場後回撤大不大、
+籌碼判斷有沒有對到事實），其他沒價值的就不要寫。每筆交易重點不同，寫出來的內容也要不同，不要套同一個模板。
 
-嚴格禁止：
-- 事後歸因：不可寫「主要歸功於」「多虧」「正是因為」「證明了」「果然」，也不可把進場後才出現的現象說成當初的買進原因。
-- 替交易者補理由：只談 trade.entry_reasons 裡的理由。
-- 打招呼、自我介紹、說教（「請務必」「建議你應該」「持續優化」）、勉勵、目標價、買賣指令。
-- 使用 review_data 以外的數字；reason_checks 的結果不可改判。
+回傳 JSON：
+- headline：一句話的覆盤結論，20～35 字。
+- body：覆盤正文 90～150 字，像投資人自己寫的交易日記：自然、簡潔、客觀，台灣投資人的口吻。
+- highlights：2～3 條，每條最多 35 字，是這筆交易最值得記錄的重點（不必分成做對／做錯）。
+- watch（持倉中）：目前最值得觀察的一件事，最多 45 字。
+- lesson（已賣出）：這筆交易下次最值得沿用或修正的一件事，最多 45 字。
 
-回傳 JSON。review_data：
+一定要遵守：
+1. 所有數字（價格、報酬、KD、法人張數、日期）只能照抄 review_data，不能自己算、不能自己編。
+2. 原始理由只看 trade.entry_reasons 與 reason_checks；reason_checks 的結果（✅ 成立／⚠️ 部分成立／❌ 不成立／❓ 資料不足）
+   不能改判。不成立就直接講，資料不足就說資料不足，不要猜。
+3. 避免事後諸葛：after_buy、current 是「進場後」才發生的事，只能寫成進場後的發展，
+   不能說成當初買進正確的原因；不要因為最後賺錢，就把錯的進場理由合理化。
+   禁止「主要歸功於」「多虧」「正是因為」「證明了」「果然」這類沒辦法證明的因果句。
+4. 持倉中（mode=holding）不要寫最終交易結論；已賣出（mode=closed）才談實現報酬與出場理由（sell_reason_checks）。
+5. 不要列一串 MA5、MA10、MA20，不要把每個指標都講一次；只留真正影響這筆判斷的資訊。
+6. 不打招呼、不自我介紹、不說教（「請務必」「建議你應該」）、不勉勵、不給目標價或買賣指令。
+7. after_buy.price_basis 是盤中暫定時，提到現價或報酬要註明「盤中」。
+
+review_data：
 """
 
 
 def build_prompt(payload: Dict[str, Any]) -> str:
     return REVIEW_PROMPT + json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _clip(text: str, limit: int) -> str:
+    """超過字數就在最後一個句讀處截斷，沒有句讀就硬截並加「…」（圖片不可無限往下長）。"""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    cut = value[:limit]
+    stop = max(cut.rfind(p) for p in "。；，")
+    return cut[:stop + 1] if stop >= limit * 0.6 else cut.rstrip("，、；") + "…"
 
 
 def strip_hindsight(text: str) -> Tuple[str, List[str]]:
@@ -575,68 +598,129 @@ def strip_hindsight(text: str) -> Tuple[str, List[str]]:
     return "".join(kept).strip(), removed
 
 
-def rule_fields(payload: Dict[str, Any]) -> Dict[str, str]:
-    """Gemini 失敗或被核對刪光時用的規則式內容。"""
-    a = payload["after_buy"]
+def fallback_review(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Gemini 失敗時的程式版本：原始理由＋核對結果＋目前觀察，一樣是 headline/body/highlights 格式。"""
+    a, t = payload["after_buy"], payload["trade"]
     checks = payload["reason_checks"]
-    good = [c["claim"] for c in checks if c["status"] in ("✅", "⚠️")]
-    bad = [f"{c['claim']}（{c['status_text']}）" for c in checks if c["status"] in ("❌", "❓")]
-    out = {
-        "after_entry": (f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%，最大浮盈 {a['max_gain_pct']:+.2f}%，"
-                        f"{'出場' if a['closed_trade'] else '目前'}報酬 {a['return_pct']:+.2f}%。"
-                        "以上是進場後的走勢，不是原始進場理由。"),
-        "did_right": ("成立的理由：" + "、".join(good) + "。") if good else "進場理由沒有一條被資料確認。",
-        "to_fix": ("與資料不符或無法驗證：" + "、".join(bad) + "。") if bad else "各項理由都與當日資料相符。",
-        "next_time": "",
-    }
+    bad = [c for c in checks if c["status"] in ("❌", "⚠️")]
+    unknown = [c for c in checks if c["status"] == "❓"]
+    if not checks:
+        headline = "沒有可核對的進場理由"
+    elif bad:
+        headline = f"{len(bad)} 項進場理由與當天資料不完全相符"
+    elif unknown:
+        headline = "部分進場理由缺資料，無法核對"
+    else:
+        headline = "進場理由都與當天資料相符"
+    state = "實現" if payload["mode"] == "closed" else "目前"
+    body = (f"原始理由：{t.get('entry_reason_raw') or '、'.join(t['entry_reasons'])}。"
+            f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%、最大浮盈 {a['max_gain_pct']:+.2f}%，"
+            f"{state}報酬 {a['return_pct']:+.2f}%（進場後走勢，不是原始理由）。")
+    highlights = [f"{c['status']} {c['claim']}：{c['evidence']}" for c in checks][:3]
+    if len(highlights) < 2:
+        highlights.append(f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%")
     current = payload.get("current") or {}
-    supports = [f"{lv.get('label')} {lv.get('price'):g}" for lv in (current.get("supports_below") or [])[:2]
-                if lv.get("price") is not None]
-    out["watch"] = (f"目前{current.get('pattern_label') or ''}，均線{current.get('ma_alignment') or ''}"
-                    + (f"；下方最近支撐 {'、'.join(supports)}。" if supports else "。")) if current else ""
-    post = payload.get("after_sell") or {}
-    out["sell_review"] = (f"賣出後 {post['days_available']} 個交易日收盤相對賣價 {post['close_change_pct']:+.2f}%，"
-                          f"期間最高 {post['max_gain_after_pct']:+.2f}%、最低 {post['max_drop_after_pct']:+.2f}%。"
-                          if post.get("days_available") else "賣出後還沒有足夠的交易日可以比較。")
-    return out
+    review = {"headline": headline, "body": body, "highlights": highlights}
+    if payload["mode"] == "closed":
+        post = payload.get("after_sell") or {}
+        review["lesson"] = (f"賣出後 {post['days_available']} 個交易日收盤相對賣價 {post['close_change_pct']:+.2f}%"
+                            if post.get("days_available") else "賣出後還沒有足夠的交易日可以比較")
+    else:
+        review["watch"] = (f"目前{current.get('pattern_label') or '結構'}，均線{current.get('ma_alignment') or '—'}"
+                           if current else "目前結構資料暫時取不到")
+    return review
 
 
-def compose(payload: Dict[str, Any], fields: Dict[str, str]) -> str:
-    """把程式寫的段落與 Gemini 的欄位組成最終筆記。"""
+def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str, Any], List[str]]:
+    """Gemini JSON → 每欄做數字核對（prune＝discord_ai_bot.prune_ungrounded_sentences）、刪事後歸因、限字數；
+    某欄刪光就用 fallback 的同欄補，highlights 不足 2 條也補。回傳 (review, 被刪句子)。"""
+    fallback = fallback_review(payload)
+    data = data if isinstance(data, dict) else {}
+    last = "lesson" if payload["mode"] == "closed" else "watch"
+    removed_all: List[str] = []
+
+    def clean(text: Any, limit: int) -> str:
+        pruned, removed = prune(str(text or ""), payload)
+        pruned, hindsight = strip_hindsight(pruned)
+        removed_all.extend(removed + hindsight)
+        return _clip(pruned, limit)
+
+    review = {
+        "headline": clean(data.get("headline"), HEADLINE_MAX) or fallback["headline"],
+        "body": clean(data.get("body"), BODY_MAX) or fallback["body"],
+        last: clean(data.get(last), WATCH_MAX) or fallback[last],
+    }
+    highlights = [clean(h, HIGHLIGHT_MAX) for h in (data.get("highlights") or [])[:3]]
+    highlights = [h for h in highlights if h]
+    for extra in fallback["highlights"]:
+        if len(highlights) >= 2:
+            break
+        highlights.append(_clip(extra, HIGHLIGHT_MAX))
+    review["highlights"] = highlights[:3]
+    return review, removed_all
+
+
+def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
+    """Discord 文字版（圖片以外的純文字、LOG 與存檔用）。"""
+    last_label, last_key = (("下次", "lesson") if payload["mode"] == "closed" else ("目前觀察", "watch"))
+    lines = [review["headline"], "", review["body"], ""]
+    lines += [f"• {h}" for h in review["highlights"]]
+    lines += ["", f"{last_label}｜{review.get(last_key, '')}"]
+    return "\n".join(lines).strip()
+
+
+_UP_COLOR, _DOWN_COLOR = "#E85D5D", "#2CB39A"      # 台股慣例：漲紅跌綠（和 K 線同色）
+
+
+def _pct_color(value: Optional[float]) -> str:
+    return _UP_COLOR if (value or 0) > 0 else _DOWN_COLOR if (value or 0) < 0 else "#101828"
+
+
+def _price(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.0f}" if value >= 100 else f"{value:g}"
+
+
+def review_stats(payload: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """覆盤卡最上面的統計列（程式數字，不經 AI）。"""
     t, a = payload["trade"], payload["after_buy"]
     closed = payload["mode"] == "closed"
-    live_note = "（盤中）" if str(a.get("price_basis", "")).startswith("盤中") else ""
+    live = str(a.get("price_basis", "")).startswith("盤中")
+    stats = [("買進日期", t["buy_date"][5:], ""), ("買進價格", _price(t["buy_price"]), "")]
     if closed:
-        summary = [f"{t['buy_date'][5:]} 買進 {t['buy_price']:g}｜{t['sell_date'][5:]} 賣出 {t['sell_price']:g}"
-                   f"｜實現報酬 {a['return_pct']:+.2f}%",
-                   f"持有 {a['trading_days']} 個交易日｜最大浮盈 {a['max_gain_pct']:+.2f}%（MFE）"
-                   f"｜最大回撤 {a['max_drawdown_pct']:+.2f}%（MAE）"]
+        stats += [(f"賣出 {str(t.get('sell_date') or '')[5:]}", _price(t.get("sell_price")), ""),
+                  ("實現報酬", f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
     else:
-        summary = [f"{t['buy_date'][5:]} 買進 {t['buy_price']:g}｜現價 {a['last_price']:g}{live_note}"
-                   f"｜{a['return_pct']:+.2f}%",
-                   f"持有 {a['trading_days']} 個交易日｜最大浮盈 {a['max_gain_pct']:+.2f}%"
-                   f"｜最大回撤 {a['max_drawdown_pct']:+.2f}%"]
-    lines = ["【交易摘要】", *summary,
-             "【我的進場理由】", "｜".join(t["entry_reasons"]) or t.get("reason", ""),
-             "【理由核對】"]
-    lines += [f"{c['status']} {c['claim']}：{c['status_text']}｜{c['evidence']}" for c in payload["reason_checks"]]
-    lines += ["【進場後發展】", fields.get("after_entry", "")]
-    lines += ["【本次覆盤】"]
-    for key, label in (("did_right", "做對"), ("to_fix", "修正"), ("next_time", "下次")):
-        if fields.get(key):
-            lines.append(f"{label}：{fields[key]}")
-    if closed:
-        lines += ["【賣出檢討】"]
-        if t.get("sell_reason"):
-            lines.append(f"賣出理由：{t['sell_reason']}")
-        lines.append(fields.get("sell_review", ""))
-    elif fields.get("watch"):
-        lines += ["【目前觀察】", fields["watch"]]
-    return "\n".join(line for line in lines if line is not None)
+        stats += [("現價（盤中）" if live else "現價", _price(a.get("last_price")), ""),
+                  ("帳面報酬", f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
+    stats += [("最大浮盈", f"{a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
+              ("最大回撤", f"{a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
+              ("持有天數", f"{a['trading_days']} 日", "")]
+    return stats
+
+
+def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -> Dict[str, Any]:
+    """圖片用的覆盤卡資料（answer_image.review_card 畫）。已賣出時，出場理由核對接在進場理由後面。"""
+    closed = payload["mode"] == "closed"
+    checks = list(payload["reason_checks"])
+    checks += [dict(c, claim=f"出場｜{c['claim']}") for c in payload.get("sell_reason_checks") or []]
+    return {"review": {
+        "title": title(payload), "headline": review["headline"], "body": review["body"],
+        "highlights": review["highlights"],
+        "last_label": "下次" if closed else "目前觀察",
+        "last_text": review.get("lesson" if closed else "watch", ""),
+        "source": source,
+        "reason_raw": payload["trade"].get("entry_reason_raw", ""),
+        "stats": review_stats(payload),
+        "checks": checks,
+    }}
 
 
 def title(payload: Dict[str, Any]) -> str:
-    return f"{payload['stock']['name']}｜{'完整交易覆盤' if payload['mode'] == 'closed' else '持倉中覆盤'}"
+    """持倉中＝「2454 聯發科｜持倉中覆盤」；已賣出＝「2454 聯發科｜交易覆盤」。"""
+    stock = payload["stock"]
+    return f"{stock['code']} {stock['name']}｜{'交易覆盤' if payload['mode'] == 'closed' else '持倉中覆盤'}"
 
 
 # ============================================================
@@ -647,20 +731,33 @@ def _user_key(context_key: str) -> str:
     return STATE_PREFIX + (str(context_key or "").split(":")[-1] or "anonymous")
 
 
-def save_note(context_key: str, payload: Dict[str, Any], note: str) -> None:
+def save_note(context_key: str, payload: Dict[str, Any], review: Dict[str, Any], source: str,
+              raw_input: str = "") -> Dict[str, Any]:
+    """使用者原始輸入（user_entry_reason_raw／user_input_raw）與 Gemini 覆盤（gemini_review）分開存，
+    Gemini 的結果永遠不會覆蓋使用者原文。回傳存進去的那一筆。"""
     key = _user_key(context_key)
     notes = list(local_market_cache.get_state(key, []) or [])
-    notes.append({"at": time.time(), "code": payload["stock"]["code"], "name": payload["stock"]["name"],
-                  "mode": payload["mode"], "buy_date": payload["trade"]["buy_date"],
-                  "buy_price": payload["trade"]["buy_price"], "sell_date": payload["trade"].get("sell_date"),
-                  "sell_price": payload["trade"].get("sell_price"),
-                  "reasons": payload["trade"]["entry_reasons"],
-                  # 每條理由的核對結果都存下來，之後可以統計「哪種理由常常不成立」
-                  "checks": [{"claim": c["claim"], "status": c["status"]} for c in payload["reason_checks"]],
-                  "return_pct": payload["after_buy"]["return_pct"],
-                  "mfe_pct": payload["after_buy"]["max_gain_pct"], "mae_pct": payload["after_buy"]["max_drawdown_pct"],
-                  "note": note})
+    trade = payload["trade"]
+    record = {
+        "trade_id": payload.get("trade_id"), "at": time.time(),
+        "code": payload["stock"]["code"], "name": payload["stock"]["name"], "mode": payload["mode"],
+        "buy_date": trade["buy_date"], "buy_price": trade["buy_price"],
+        "sell_date": trade.get("sell_date"), "sell_price": trade.get("sell_price"),
+        # ↓ 使用者原文：永久保留、不經改寫
+        "user_input_raw": raw_input,
+        "user_entry_reason_raw": trade.get("entry_reason_raw", ""),
+        "user_sell_reason_raw": trade.get("sell_reason") or "",
+        # ↓ 程式核對結果（每條理由的狀態，之後可統計「哪種理由常常不成立」）
+        "checks": [{"claim": c["claim"], "status": c["status"]} for c in payload["reason_checks"]],
+        "sell_checks": [{"claim": c["claim"], "status": c["status"]} for c in payload.get("sell_reason_checks") or []],
+        "return_pct": payload["after_buy"]["return_pct"],
+        "mfe_pct": payload["after_buy"]["max_gain_pct"], "mae_pct": payload["after_buy"]["max_drawdown_pct"],
+        # ↓ AI 產生的覆盤：另外一欄
+        "gemini_review": review, "review_source": source,
+    }
+    notes.append(record)
     local_market_cache.set_state(key, notes[-KEEP_NOTES:])
+    return record
 
 
 def list_notes(context_key: str) -> str:
@@ -672,6 +769,7 @@ def list_notes(context_key: str) -> str:
         when = datetime.fromtimestamp(n["at"]).strftime("%m/%d")
         marks = "".join(c["status"] for c in n.get("checks") or [])
         state = "已賣出" if n.get("mode") == "closed" else "持倉中"
+        headline = str((n.get("gemini_review") or {}).get("headline") or "")
         lines.append(f"• {n['name']}（{n['code']}）{n['buy_date']} 買進 {n['buy_price']:g}｜{state} "
-                     f"{n['return_pct']:+.2f}%｜理由 {marks}｜{when} 建立")
+                     f"{n['return_pct']:+.2f}%｜理由 {marks}｜{when} 建立" + (f"｜{headline}" if headline else ""))
     return "\n".join(lines)
