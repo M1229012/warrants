@@ -313,6 +313,18 @@ def codes_with_history(min_rows: int = 69) -> List[str]:
         return []
 
 
+def last_bar_dates() -> Dict[str, str]:
+    """每檔自己最後一根收盤的日期。停牌股不會跟全市場最新日一致，拿來判斷「算過了沒」才不會每輪重算。"""
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute("SELECT stock_code,MAX(date) FROM daily_bars WHERE confirmed=1 "
+                                    "GROUP BY stock_code").fetchall()
+        return {str(code): str(date) for code, date in rows if date}
+    except Exception:
+        return {}
+
+
 def latest_changes(codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     """每檔最新兩根收盤 → 收盤價與漲跌幅（純本地，不打任何 API）。"""
     wanted = [str(c).strip() for c in codes if str(c).strip()]
@@ -340,6 +352,27 @@ def latest_changes(codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
                         out[code] = {"date": bucket[0][0], "close": bucket[0][1],
                                      "change_pct": (bucket[0][1] / bucket[1][1] - 1) * 100,
                                      "volume": bucket[0][2]}
+    except Exception:
+        return out
+    return out
+
+
+def latest_pattern_score_dates(codes: Iterable[str]) -> Dict[str, str]:
+    """指定股票各自最新的型態分數日期；純本地查詢，不限制日期範圍。"""
+    wanted = list(dict.fromkeys(str(c).strip() for c in codes if str(c).strip()))
+    out: Dict[str, str] = {}
+    if not wanted:
+        return out
+    try:
+        with _LOCK:
+            with _db() as conn:
+                for chunk_start in range(0, len(wanted), 400):
+                    chunk = wanted[chunk_start:chunk_start + 400]
+                    marks = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT stock_code, MAX(date) FROM pattern_scores "
+                        f"WHERE stock_code IN ({marks}) GROUP BY stock_code", chunk).fetchall()
+                    out.update({str(code): str(date) for code, date in rows if date})
     except Exception:
         return out
     return out

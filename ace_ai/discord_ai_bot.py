@@ -34,6 +34,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+import discord_access as access_policy
+from discord_access import GENERAL_AI_ROLES, WARRANT_AI_ROLES
+
 import warrant_ai_tools as tools
 import weekly_pick
 import answer_image
@@ -141,10 +144,14 @@ class BotConfig:
     weekly_pick_allow_admins: bool = True
     # !ace 文字指令（預設關閉，只用 /ask）
     prefix_command_enabled: bool = False
+    superuser_ids: Set[int] = field(default_factory=set)
+    beta_tester_ids: Set[int] = field(default_factory=set)
 
     @classmethod
     def from_env(cls) -> "BotConfig":
         return cls(
+            superuser_ids=_parse_id_set(os.getenv("DISCORD_AI_SUPERUSER_IDS", "")),
+            beta_tester_ids=_parse_id_set(os.getenv("DISCORD_AI_BETA_TESTER_IDS", "")),
             token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
             allowed_user_ids=set() if _is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")) else _parse_id_set(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
             allowed_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_ALLOWED_CHANNEL_IDS", "")),
@@ -209,6 +216,45 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
                  "整體", "呼應", "合理", "注意", "意義", "健康", "強不強", "弱不弱"),
 }
 
+# 集中式口語同義詞：只在原句後「附加」標準關鍵字給意圖判斷，原句（股票名稱／代號／分點）一字不改。
+_MA_WORD = r"(?:\d{1,3}\s*日(?:均?線)?|週線|月線|季線|半年線|年線)"
+_MA_SYNONYM_RE = re.compile(_MA_WORD + r".{0,4}(?:守|站|跌破|掉|撐|壓|上面|下面|之上|之下|在哪)|(?:站穩|站上|站回|掉到|跌到|跌破|守住|還在).{0,3}" + _MA_WORD)
+INTENT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"強嗎|硬不硬|夠不夠硬|偏強|偏弱|轉強|轉弱|線型漂亮|型態漂亮|漂亮嗎"), "型態 技術面 強不強"),
+    (re.compile(r"還在整理|在整理|整理完"), "型態 盤整"),
+    (_MA_SYNONYM_RE, "均線 支撐"),
+    (re.compile(r"有壓|壓在|哪裡有撐|有撐|撐在|撐得住|卡在|大量區.{0,3}[上下]|[上下]面.{0,3}大量區"), "壓力 支撐 大量區"),
+    (re.compile(r"量有?出來|量有?放大|爆量|量縮|帶量|放量|量增"), "量能 價量"),
+)
+WARRANT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"吃貨|誰在買|誰在收|誰在加碼|哪些分點|分點在買|在加碼"), "分點 在買"),
+    (re.compile(r"跑了沒|跑了嗎|跑掉了|落跑|下車了沒|部位還在"), "分點 部位"),
+)
+# 三大法人／一般籌碼不是權證分點；句中沒有明確權證字眼時，不附加也不保留 warrant。
+_INSTITUTIONAL_RE = re.compile(r"外資|投信|自營商|三大法人|法人|一般籌碼|現股籌碼")
+_EXPLICIT_WARRANT_RE = re.compile(r"權證|分點|主力|大戶|吃貨")
+
+
+def normalize_intent_text(question: str) -> str:
+    """回傳「原句｜標準關鍵字」；只供意圖判斷與權證辨識用。"""
+    text = question or ""
+    institutional = bool(_INSTITUTIONAL_RE.search(text)) and not _EXPLICIT_WARRANT_RE.search(text)
+    rules = INTENT_SYNONYMS + (() if institutional else WARRANT_SYNONYMS)
+    tags = [tag for pattern, tag in rules if pattern.search(text)]
+    return text + ("｜" + " ".join(tags) if tags else "")
+
+
+def detect_question_intents(question: str) -> Tuple[str, Set[str]]:
+    normalized = normalize_intent_text(question)
+    upper = normalized.upper()
+    intents = {intent for intent, words in INTENT_KEYWORDS.items() if any(w.upper() in upper for w in words)}
+    if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
+        intents.discard("warrant")   # 外資買超、投信買超、自營商、三大法人不是權證
+    if "部位" not in normalized and (_MA_SYNONYM_RE.search(question or "") or "整理" in (question or "")):
+        intents.discard("position")  # 「還在月線上嗎」「還在整理嗎」的「還在」不是問分點部位
+    return normalized, intents
+
+
 CATEGORY_INTENTS = ("price", "technical", "volume_profile", "warrant", "win_rate", "news", "recent_trades")
 
 FILLER_WORDS = (
@@ -249,6 +295,8 @@ class ParsedQuestion:
     event_type: str = ""
     notes: List[str] = field(default_factory=list)
     sector: Optional[Dict[str, str]] = None
+    access: Optional[access_policy.AccessContext] = None
+    normalized: str = ""  # 原句＋同義詞標準關鍵字（normalize_intent_text）
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -277,13 +325,20 @@ class QuestionParser:
             if any(word.upper() in text_upper for word in words)
         }
 
-    def parse(self, question: str) -> ParsedQuestion:
+    def parse(self, question: str, access=None) -> ParsedQuestion:
         sector = sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
         if sector is not None:
-            return ParsedQuestion(original=question, intents={"sector"}, sector=sector)
+            return ParsedQuestion(original=question, intents={"sector"}, sector=sector, access=access)
         kf = tools.core()
         text_upper = question.upper()
-        parsed = ParsedQuestion(original=question, intents=self.detect_intents(text_upper))
+        normalized, intents = detect_question_intents(question)
+        parsed = ParsedQuestion(original=question, intents=intents, access=access, normalized=normalized)
+        compare_codes = index_compare_codes(question)
+        if compare_codes:
+            # 「大盤和櫃買誰比較強」：兩個指數都要抓，走雙指數比較。
+            parsed.stocks = [(code, tools.INDEX_CODES[code]) for code in compare_codes]
+            parsed.intents |= {"index", "index_compare"}
+            return parsed
         index_code = tools.resolve_index_code(question)
         if index_code:
             # 大盤／櫃買走和個股完全相同的型態流程（K 線＋評分卡＋AI），資料來自指數日K。
@@ -321,7 +376,8 @@ class QuestionParser:
 
     def _extract_branches(self, work: str, parsed: ParsedQuestion) -> str:
         try:
-            known = tools.get_known_branches()
+            known = (tools.get_cached_known_branches() if parsed.access is not None and not parsed.access.entitlement.warrant
+                     else tools.get_known_branches())
         except Exception as exc:  # Google Sheet 失敗時仍可處理股票類問題
             parsed.notes.append(f"分點清單暫時無法取得：{type(exc).__name__}")
             return work
@@ -383,6 +439,8 @@ class QuestionParser:
 
     def _fuzzy_branch(self, work: str, parsed: ParsedQuestion) -> None:
         wants_branch = bool(parsed.intents & {"win_rate", "recent_trades", "warrant", "history", "behavior"})
+        if parsed.access is not None and not parsed.access.entitlement.warrant:
+            return
         if parsed.branches or not wants_branch:
             return
         for chunk in self._leftover_chunks(work):
@@ -442,6 +500,7 @@ class QueryPlan:
     need_final_llm: bool = False
     clarification: str = ""
     planner_used: bool = False
+    beta_fallback: Optional["QueryPlan"] = None  # beta_only route 的正式舊 route；非 tester 靜默改走這個
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -480,6 +539,95 @@ PLANNER_TOOLS = (
 
 _TOP_WORDS_RE = re.compile(r"最大|最多|最高|排行|排名|前\s*\d*\s*名|前幾|第一名|哪一?檔|哪些股票|誰")
 
+# 權證分點資料的唯一開關：句子裡要有「權證」「分點」，或直接指名分點。
+# 「籌碼」「主力」「買超」這類字刻意不算，因為之後要加現股籌碼，這些字兩邊都會沾到。
+WARRANT_TOOLS = frozenset((
+    "get_sheet_stock_chips", "get_top_warrant_buy_stocks", "get_warrant_branch", "query_google_sheet",
+    "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
+    "get_branch_stock_history", "get_branch_winrate_rank", "get_branch_event_performance",
+    "get_branch_recent_behavior", "detect_current_branch_events", "get_branch_stock_position",
+))
+
+
+def warrant_allowed(parsed: "ParsedQuestion") -> bool:
+    """明確詢問權證／分點或辨識到分點，才允許權證資料與 K 線標註。"""
+    text = parsed.normalized or normalize_intent_text(parsed.original)
+    return bool(parsed.branches or parsed.branch_candidates or any(word in text for word in ("權證", "分點")))
+
+
+def index_compare_codes(question: str) -> List[str]:
+    """同一句同時提到加權與櫃買（大盤／加權／TAIEX 與 櫃買／OTC／TPEX）→ ["TAIEX", "TPEX"]。"""
+    value = str(question or "").upper()
+    found = [code for code, names in tools._INDEX_ALIASES if any(str(n).upper() in value for n in names)]
+    return ["TAIEX", "TPEX"] if {"TAIEX", "TPEX"} <= set(found) else []
+
+
+_INDEX_MAS = ("MA5", "MA10", "MA20", "MA60")
+
+
+def build_index_comparison(results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
+    """純 Python 整理加權／櫃買兩邊的數字；時間點不同時不判強弱。"""
+    found: Dict[str, Dict[str, Any]] = {}
+    for r in results:
+        code = (r.data or {}).get("stock_code") if r.ok else None
+        if code in tools.INDEX_CODES:
+            found.setdefault(code, {})[r.name] = r.data
+    sides = []
+    for code in ("TAIEX", "TPEX"):
+        got = found.get(code, {})
+        overview, tech = got.get("get_stock_overview") or {}, got.get("get_technical_analysis") or {}
+        card = got.get("get_pattern_scorecard") or {}
+        intraday = overview.get("intraday") or tech.get("intraday") or {}
+        date = overview.get("data_date") or tech.get("data_date") or ""
+        live = bool(intraday.get("is_live"))
+        clock = str(intraday.get("time") or "")
+        mas = tech.get("moving_averages") or {}
+        sides.append({
+            "code": code, "name": tools.INDEX_CODES[code], "available": bool(overview or tech),
+            "data_date": date, "is_live": live,
+            "timestamp": (f"{date} {clock}（盤中）" if live else f"{date} 收盤") if date else "",
+            "change_pct": overview.get("change_pct"),
+            "moving_averages": {ma: (mas.get(ma) or {}).get("position", "資料不足") for ma in _INDEX_MAS},
+            "pattern_score": card.get("pattern_score"), "grade": card.get("grade", ""),
+            "volume_ratio_vs_mv5": overview.get("volume_ratio_vs_mv5"),
+            "volume_status": overview.get("volume_status", ""),
+        })
+    a, b = sides
+    same_time = (a["available"] and b["available"] and bool(a["data_date"])
+                 and (a["data_date"], a["is_live"], a["timestamp"]) == (b["data_date"], b["is_live"], b["timestamp"]))
+    stronger = {}
+    if same_time:
+        for field_name in ("change_pct", "pattern_score"):
+            x, y = a[field_name], b[field_name]
+            if x is not None and y is not None and x != y:
+                stronger[field_name] = a["name"] if x > y else b["name"]
+    return {"sides": sides, "same_time": same_time, "stronger": stronger,
+            "rule": "兩邊資料時間點相同才比較強弱；時間點不同只能分別描述，不得說現在哪一邊比較強。"}
+
+
+def format_index_comparison(comparison: Dict[str, Any]) -> str:
+    lines = ["**加權 vs 櫃買**"]
+    for side in comparison["sides"]:
+        if not side["available"]:
+            lines.append(f"{side['name']}｜資料暫時無法取得")
+            continue
+        pct = side["change_pct"]
+        ma = "、".join(f"{k} {v}" for k, v in side["moving_averages"].items())
+        score = f"{side['pattern_score']:g} 分（{side['grade']}）" if side["pattern_score"] is not None else "資料不足"
+        ratio = side["volume_ratio_vs_mv5"]
+        volume = f"量比(5日) {ratio:g}" if ratio is not None else (side["volume_status"] or "量能資料不足")
+        lines.append(f"{side['name']}｜{side['timestamp']}｜漲跌 {pct:+.2f}%｜{ma}｜型態 {score}｜{volume}"
+                     if pct is not None else f"{side['name']}｜{side['timestamp']}｜漲跌 資料不足｜{ma}｜型態 {score}｜{volume}")
+    a, b = comparison["sides"]
+    if not comparison["same_time"]:
+        lines.append(f"⚠️ 兩邊資料時間點不同（{a['name']}：{a['timestamp'] or '無'}；{b['name']}：{b['timestamp'] or '無'}），"
+                     "只能分別描述，不能直接判斷現在哪一邊比較強。")
+    else:
+        labels = {"change_pct": "漲跌幅", "pattern_score": "型態分數"}
+        verdict = "；".join(f"{labels[k]}：{v}較強" for k, v in comparison["stronger"].items())
+        lines.append(f"同一時間點（{a['timestamp']}）比較：{verdict or '兩邊相同或資料不足'}")
+    return chr(10).join(lines)
+
 
 def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
     """沒有指定股票、問權證買超／買進金額排行（例如「目前權證買超金額最大的是誰」）。勝率排行走原本路由。"""
@@ -496,6 +644,10 @@ class QueryRouter:
         self.log = log
 
     def plan(self, parsed: ParsedQuestion, stats: "AnswerStats") -> QueryPlan:
+        access_policy.require_question(parsed.access, parsed.normalized or parsed.original,
+                                       tools.get_cached_known_branches(), parsed)
+        if "index_compare" in parsed.intents:
+            return self._index_compare_plan(parsed)
         if parsed.sector is not None:
             return QueryPlan(route="rule_sector", need_final_llm=parsed.sector["mode"] in ("technical", "momentum"))
         if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
@@ -515,6 +667,9 @@ class QueryRouter:
         if len(parsed.stocks) > 2:
             return QueryPlan(route="clarify", clarification="一次最多比較 2 檔股票，請縮小範圍後再問。")
 
+        if not warrant_allowed(parsed):
+            # 「怎麼操作」這種一般問題不該被當成問權證分點。
+            parsed.intents = parsed.intents - {"warrant", "recent_trades"}
         intents = parsed.intents
         categories = intents & set(CATEGORY_INTENTS)
         analysis = "analysis" in intents
@@ -615,6 +770,15 @@ class QueryRouter:
         plan.need_final_llm = analysis or bool(categories - {"price"}) or len(parsed.stocks) > 1
         return plan
 
+    def _index_compare_plan(self, parsed: ParsedQuestion) -> QueryPlan:
+        """加權 vs 櫃買：兩邊都抓報價、均線、大量區；型態分數由評分卡補上（GENERAL，不讀權證）。"""
+        plan = QueryPlan(route="rule_index_compare", need_final_llm=True)
+        for code, _ in parsed.stocks:
+            plan.add("get_stock_overview", stock_code=code)
+            plan.add("get_technical_analysis", stock_code=code)
+            plan.add("get_volume_profile", stock_code=code)
+        return plan
+
     def _pattern_plan(self, parsed: ParsedQuestion) -> QueryPlan:
         """型態／持股成本／操作類：型態＋大量區＋均線＋布林（有成本就加成本位置），交給 AI 寫客觀觀察重點。"""
         plan = QueryPlan(route="rule_pattern", need_final_llm=True)
@@ -643,7 +807,8 @@ class QueryRouter:
 
     def _planner_plan(self, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[QueryPlan]:
         try:
-            metadata = tools.get_available_sheet_metadata()["sheets"]
+            metadata = ([] if parsed.access is not None and not parsed.access.entitlement.warrant
+                        else tools.get_available_sheet_metadata()["sheets"])
         except Exception as exc:  # 沒有 Sheet 欄位資訊時，Planner 仍可選擇一般 Tool
             self.log(f"Planner 略過工作表欄位：{type(exc).__name__}: {exc}")
             metadata = [{"worksheet": k, "description": v, "columns": []} for k, v in tools.SHEET_REGISTRY.items()]
@@ -661,6 +826,9 @@ class QueryRouter:
         return self._validate_planner(parsed, data)
 
     def _validate_planner(self, parsed: ParsedQuestion, data: Dict[str, Any]) -> Optional[QueryPlan]:
+        if (data.get("branches") or data.get("event_type") or data.get("sheet_queries")
+                or any(name in WARRANT_TOOLS for name in data.get("tools", []) or [])):
+            access_policy.require_feature(parsed.access, access_policy.FeaturePolicy("WARRANT"))
         kf = tools.core()
         stocks = [code for code, _ in parsed.stocks]
         try:
@@ -844,6 +1012,11 @@ def _install_gemini_error_recorder(kf: Any) -> None:
     kf._discord_ai_error_recorder_installed = True
 
 
+# 503 是模型本身塞車，換 API Key 沒用，只能換模型再試一次（數字都是 Python 算的，換模型只影響文字風格）。
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+_OVERLOADED_RE = re.compile(r"503|UNAVAILABLE|overloaded|high demand|429|RESOURCE_EXHAUSTED", re.IGNORECASE)
+
+
 class GeminiGateway:
     """重用 _call_gemini_with_retry（多 Key fallback、retry、structured output）。
 
@@ -887,20 +1060,35 @@ class GeminiGateway:
             return GeminiResult(ok=False, error="未設定 WARRANTS_API_KEY", purpose=purpose)
         _GEMINI_ERROR_STATE.last = ""
         started = time.perf_counter()
-        with self._lock:
+
+        def call() -> Optional[str]:
+            with self._lock:
+                try:
+                    return kf._call_gemini_with_retry(
+                        prompt,
+                        cache_task="",
+                        stock_code="",
+                        stock_name="",
+                        write_cache=False,
+                        response_schema=schema,
+                        temperature=temperature,
+                    )
+                except Exception as exc:  # google-genai 例外型別眾多，統一轉成失敗結果
+                    _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
+                    return None
+
+        text = call()
+        model_used = kf.GEMINI_MODEL
+        if (not text and GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != kf.GEMINI_MODEL
+                and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or ""))):
+            self.log(f"主模型 {kf.GEMINI_MODEL} 塞車或限流，改用備援模型 {GEMINI_FALLBACK_MODEL} 再試一次")
+            primary, model_used = kf.GEMINI_MODEL, GEMINI_FALLBACK_MODEL
+            kf.GEMINI_MODEL = GEMINI_FALLBACK_MODEL
             try:
-                text = kf._call_gemini_with_retry(
-                    prompt,
-                    cache_task="",
-                    stock_code="",
-                    stock_name="",
-                    write_cache=False,
-                    response_schema=schema,
-                    temperature=temperature,
-                )
-            except Exception as exc:  # google-genai 例外型別眾多，統一轉成失敗結果
-                text = None
-                _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
+                _GEMINI_ERROR_STATE.last = ""
+                text = call()
+            finally:
+                kf.GEMINI_MODEL = primary
         latency = time.perf_counter() - started
         last_error = str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")
         # 目前主程式的 _call_gemini_with_retry 只回傳文字，不暴露 usage_metadata；
@@ -910,7 +1098,8 @@ class GeminiGateway:
         output_tokens = max(1, round(len(output_text) / 4)) if output_text else 0
         total_tokens = input_tokens + output_tokens
         self.log(
-            f"Gemini 呼叫｜用途={purpose}｜model={kf.GEMINI_MODEL}｜latency={latency:.2f}s｜"
+            f"Gemini 呼叫｜用途={purpose}｜model={model_used}"
+            f"{'（備援）' if model_used != kf.GEMINI_MODEL else ''}｜latency={latency:.2f}s｜"
             f"prompt={len(prompt):,} 字｜tokens≈{input_tokens}+{output_tokens}={total_tokens}（estimated）｜"
             f"結果={'成功' if text else '失敗'}"
         )
@@ -2150,6 +2339,7 @@ class AnswerResult:
     total_tokens: int = 0
     token_source: str = "none"
     api_usage: Dict[str, Any] = field(default_factory=dict)
+    denied_feature: str = ""
     image_title: str = ""          # 圖片頁首標題；空字串＝沿用使用者問句（族群雷達固定寫「族群雷達」）
 
 
@@ -2162,7 +2352,7 @@ MEMORY_MINUTES = tools._env_int("DISCORD_AI_MEMORY_MINUTES", 30)
 WEEKLY_DRAFT_MINUTES = max(10, tools._env_int("DISCORD_AI_WEEKLY_DRAFT_MINUTES", 120))
 MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
 # 使用者把「/ace 族群資金流向」整串打進 /ask 的輸入框時，前綴不能被當成族群名稱。
-_SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)[:：,，]?\s*", re.IGNORECASE)
+_SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)\b[:：,，]?\s*", re.IGNORECASE)
 
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
 # 「是不是只有權值股在動」這類盤面結構問題。
@@ -2178,6 +2368,10 @@ _SMALLTALK_RE = re.compile(r"^(你好|哈囉|hi|hello|在嗎|嗨|謝謝|感謝|�
 _ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十1-9])\s*名?|冠軍|榜首|龍頭|亞軍|季軍")
 _ORDINAL_WORDS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 _SECTOR_ROWS_TTL = 1800
+_BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
+# 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
+_PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
+NO_CONTEXT_MESSAGE = "請告訴我股票名稱或代號，例如：2344 現在技術面怎麼樣。"
 _COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
 
 
@@ -2269,11 +2463,11 @@ class ConversationMemory:
                 while len(self._data) > self.max_entries:
                     self._data.popitem(last=False)
             return
-        if not key or not parsed.stocks:
+        if not key or not (parsed.stocks or parsed.branches):
             return
         previous = self.get(key)
         cost = parsed.cost_price
-        if cost is None and previous and previous.cost_price and previous.stocks[:1] == parsed.stocks[:1]:
+        if cost is None and previous and previous.cost_price and parsed.stocks and previous.stocks[:1] == parsed.stocks[:1]:
             cost = previous.cost_price  # 同一檔股票沿用之前說過的成本
         with self._lock:
             self._data[key] = MemoryEntry(list(parsed.stocks[:2]), cost, list(parsed.branches[:1]), time.time())
@@ -2303,8 +2497,18 @@ class ConversationMemory:
                     parsed.intents = set(parsed.intents) | {"sector"}
                     return f"延續上一題的族群：{entry.sector.get('name', '')}"
             return ""
+        branch_note = ""
+        if (entry.branches and not parsed.branches and not parsed.stocks
+                and parsed.intents & _BRANCH_FOLLOWUP_INTENTS and not _SMALLTALK_RE.match(text.strip())):
+            # 「那它跑了沒」：只繼承分點名稱；權限每題由目前 AccessContext 重新判斷。
+            parsed.branches = list(entry.branches)
+            branch_note = f"延續上一題的分點：{entry.branches[0]}"
         if not entry.stocks:
-            return ""
+            return branch_note
+        stock_note = self._resolve_stocks(entry, parsed, text)
+        return "｜".join(note for note in (stock_note, branch_note) if note)
+
+    def _resolve_stocks(self, entry: "MemoryEntry", parsed: ParsedQuestion, text: str) -> str:
         names = "、".join(f"{name or code}（{code}）" for code, name in entry.stocks)
         if parsed.stocks:
             if len(parsed.stocks) == 1 and _COMPARE_RE.search(text) and parsed.stocks[0][0] != entry.stocks[0][0]:
@@ -2373,13 +2577,13 @@ class AceQueryEngine:
         admin_mode=True 代表這題來自管理員專用指令（本週精選、草稿、維護）；
         一般 /ask 永遠不會進到那些流程，避免草稿編輯把正常問題吃掉。
         """
+        if admin_mode:
+            access_policy.require_feature(self._access(), access_policy.FeaturePolicy("ADMIN"))
         started = time.perf_counter()
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         prefix = _SLASH_PREFIX_RE.match(question)
         if prefix:
             question = _SLASH_PREFIX_RE.sub("", question, count=1)
-            if prefix.group(1).lower() == str(self.config.admin_command_name).lower() and is_admin:
-                admin_mode = True
         compact = re.sub(r"\s+", "", question)
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
@@ -2387,7 +2591,7 @@ class AceQueryEngine:
             return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
         # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
         if weekly_pick.is_admin_moneydj_image_question(question):
-            if not is_admin:
+            if not (is_admin and admin_mode):
                 return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
             return self._answer_admin_moneydj_image(question, started)
         # 覆盤筆記：/ask 與 /ace 都可用；個人紀錄依 Discord 使用者分開存
@@ -2428,7 +2632,7 @@ class AceQueryEngine:
         if draft_session and weekly_pick.is_weekly_session_followup(question, draft_session.get("stock_code", "")):
             return self._answer_weekly_revision(question, context_key, started)
         if is_weekly_pick_question(question):
-            hit, cached = self._answer_cache.get(compact)
+            hit, cached = self._cached_answer(compact)
             if hit:
                 return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started, cache_hit=True)
             if self._weekly_lock.locked() and on_queue:
@@ -2448,16 +2652,23 @@ class AceQueryEngine:
             return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"),
                                       view=radar.get("view", "all"))
         try:
-            parsed = self.parser.parse(question)
+            parsed = self.parser.parse(question, access=self._access())
         except tools.ToolDataError as exc:
             self.log(f"問題解析失敗：{exc}")
             return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         note = self.memory.resolve(context_key, parsed)
+        access_policy.require_question(self._access(), question, tools.get_cached_known_branches(), parsed)
+        if (_PRONOUN_RE.search(question) and not (parsed.stocks or parsed.branches or parsed.sector)
+                and not parsed.stock_candidates and not parsed.branch_candidates):
+            # 「這檔強嗎」但沒有上一題可接：不猜，也不花 Tool／Gemini（clarify 走 ephemeral）。
+            return AnswerResult(text=NO_CONTEXT_MESSAGE, route="clarify", gemini_calls=0,
+                                elapsed=time.perf_counter() - started, as_text=True)
         if note:
             self.log(f"追問記憶：{note}")
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案。
         key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches)])
-        hit, cached = self._answer_cache.get(key)
+        key = self._access_cache_key(key)
+        hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
             self.log(f"回答快取命中：{question}")
             self.memory.update(context_key, parsed)
@@ -2494,7 +2705,7 @@ class AceQueryEngine:
                 self._pending -= 1
                 self._inflight.pop(key, None)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
-        if result.cacheable:
+        if result.cacheable and not (self._access() and self._access().simulation):
             # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
             seconds = self.config.answer_cache_seconds
             if tools.INTRADAY_ENABLE and tools.intraday_session_now():
@@ -2508,14 +2719,45 @@ class AceQueryEngine:
                    "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
                    "admin_usage"}
 
+    def _access(self):
+        return getattr(getattr(self, "_request_local", None), "access", None)
+
+    def _warrant_entitled(self):
+        access = self._access()
+        return access is None or access.entitlement.warrant
+
+    def _access_cache_key(self, key):
+        access = self._access()
+        return f"{access.partition}|{key}" if access is not None else key
+
+    def _cached_answer(self, key, partitioned=False):
+        if self._access() and self._access().simulation:
+            return False, None
+        return self._answer_cache.get(key if partitioned else self._access_cache_key(key))
+
+    @staticmethod
+    def _denied_result(exc):
+        return AnswerResult(str(exc), "access_denied", 0, 0.0, as_text=True, denied_feature=exc.required)
+
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
-               is_admin: bool = False, admin_mode: bool = False) -> AnswerResult:
+               is_admin: bool = False, admin_mode: bool = False, access=None) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
+        try:
+            access_policy.require_question(access, question, tools.get_cached_known_branches())
+        except access_policy.AccessDenied as exc:
+            return self._denied_result(exc)
+        if access is not None:
+            is_admin = admin_mode = access.admin_mode
+            context_key = access.memory_key(context_key)
+        self._request_local.access = access
         request_id = uuid.uuid4().hex[:10]
         self._request_local.request_id = request_id
         try:
             with tools.api_request_scope(request_id):
-                result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode)
+                try:
+                    result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode)
+                except access_policy.AccessDenied as exc:
+                    result = self._denied_result(exc)
             usage = tools.request_api_usage(request_id, clear=True)
             # 每題的用量寫進本地 SQLite（保留 30 天），「/ace 用量」與負載評估都讀這張表。
             try:
@@ -2532,6 +2774,9 @@ class AceQueryEngine:
                            as_text=result.as_text or result.route in self.TEXT_ROUTES)
         finally:
             self._request_local.request_id = ""
+            self._request_local.access = None
+            if access and access.simulation:
+                self.memory.clear(context_key)
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
@@ -2586,6 +2831,8 @@ class AceQueryEngine:
         except tools.ToolDataError as exc:
             return AnswerResult(text=f"股票名冊暫時無法讀取，請稍後再試（{exc}）", route="review_error",
                                 gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
+        if req.get("need_warrant"):
+            access_policy.require_feature(self._access(), access_policy.FeaturePolicy("WARRANT"))
         missing = trade_review.missing_fields(req)
         if missing:
             return AnswerResult(
@@ -3030,7 +3277,7 @@ class AceQueryEngine:
                 return QueryPlan(route="rule_sector", need_final_llm=mode in ("technical", "momentum"))
         if subject == "stock" and target:
             try:
-                retry = self.parser.parse(target)
+                retry = self.parser.parse(target, access=self._access())
             except Exception:
                 retry = None
             if retry is not None and retry.stocks:
@@ -3050,14 +3297,23 @@ class AceQueryEngine:
         self.log(f"使用者問題：{question}")
         if parsed is None:
             try:
-                parsed = self.parser.parse(question)
+                parsed = self.parser.parse(question, access=self._access())
             except tools.ToolDataError as exc:
                 self.log(f"問題解析失敗：{exc}")
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
+        parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         plan = self.router.plan(parsed, stats)
         if plan.route == "help":
             plan = self._classify_fallback(question, parsed, stats) or plan
+        if access_policy.beta_blocked(self._access(), plan.route):
+            # Beta gate 在 Tool／Gemini 之前：非 tester 不提示 Beta，有舊 route 走舊 route，沒有就走一般 fallback。
+            plan = plan.beta_fallback
+            while plan is not None and access_policy.beta_blocked(self._access(), plan.route):
+                plan = plan.beta_fallback
+            plan = plan or (self.router._default_bundle(parsed) if parsed.stocks
+                            else QueryPlan(route="help", clarification=HELP_MESSAGE))
+        access_policy.require_feature(self._access(), access_policy.FEATURE_POLICIES.get(plan.route, access_policy.FeaturePolicy()))
         self.log(
             f"🧭 主題={'族群:' + str((parsed.sector or {}).get('name', '')) if parsed.sector else ('個股:' + ','.join(c for c, _ in parsed.stocks) if parsed.stocks else ('分點:' + ','.join(parsed.branches) if parsed.branches else '無'))}"
             f"｜動作={(parsed.sector or {}).get('mode', '') or ','.join(sorted(parsed.intents)) or '-'}"
@@ -3088,7 +3344,15 @@ class AceQueryEngine:
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
         light = plan.route == "rule_stock" and not plan.need_final_llm   # 只問股價：走輕量流程
-        warrant_visual_query = bool(parsed.branches) or any(k in question for k in ("權證", "分點", "籌碼", "買賣超")) or plan.route == "rule_top_warrant"
+        # 權證資料要同時符合：問題明確問權證／分點，且這次請求的 AccessContext 有 WARRANT。
+        warrant_ok = (warrant_allowed(parsed) or plan.route == "rule_top_warrant") and self._warrant_entitled()
+        if not warrant_ok:
+            # Planner／追問記憶也可能排進權證工具，這裡是最後一道關。
+            dropped = [c.name for c in plan.tool_calls if c.name in WARRANT_TOOLS]
+            if dropped:
+                plan.tool_calls = [c for c in plan.tool_calls if c.name not in WARRANT_TOOLS]
+                self.log(f"沒提到權證也沒指名分點，略過權證工具：{'、'.join(dict.fromkeys(dropped))}")
+        warrant_visual_query = warrant_ok
         # 一般問答的權證圖一律用同一種版型（編號＋分點明細表），不再依問法在兩種版型之間跳。
         mark_mode = ASK_MARK_MODE
         chart_calls = []
@@ -3100,13 +3364,18 @@ class AceQueryEngine:
                 kwargs["with_marks"] = False
             chart_calls.append(ToolCall("get_chart_panel", kwargs))
         combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
+        if not warrant_ok:
+            # 最後防線：權證 ToolResult 不進 payload／Gemini prompt／回答。
+            combined = [r for r in combined if r.name not in WARRANT_TOOLS]
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []
         for code, chart in zip(codes, chart_results):
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+            if not warrant_ok:
+                panel["marks"] = {}  # 圖上不畫分點標記
             panels.append(panel)
-        if plan.route in ("rule_pattern", "rule_top_warrant"):
+        if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
             for panel in panels:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 if card:
@@ -3128,7 +3397,16 @@ class AceQueryEngine:
         points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤", question))
         if breadth and not markets and not points_question and (breadth.get("strongest") or breadth.get("weakest")):
             panels.append(_breadth_panel(breadth))
+        comparison = None
+        if plan.route == "rule_index_compare":
+            comparison = build_index_comparison(results)
+            results.append(tools.ToolResult("get_index_comparison", True, comparison))
+            # 兩邊時間點不同時不交給 AI，避免寫出「現在 A 比 B 強」。
+            plan.need_final_llm = bool(comparison["same_time"])
         text, llm_ok = self._compose(question, plan, results, stats)
+        if comparison is not None:
+            header = format_index_comparison(comparison)
+            text = header + chr(10) + chr(10) + text if comparison["same_time"] else header
         if plan.route == "rule_breadth" and not any(r.name == "get_index_contribution" and r.ok for r in results):
             # 貢獻榜算不出來時要講清楚，不能讓 AI 拿漲幅或舊資料當答案。
             text = ("※ 今天的指數貢獻榜要等交易所收盤檔發布（約 15:00）後才有；"
@@ -3192,6 +3470,8 @@ class AceQueryEngine:
             return {}
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
+        if any(c.name in WARRANT_TOOLS or (c.name == "get_chart_panel" and c.kwargs.get("with_marks", True)) for c in calls):
+            access_policy.require_feature(self._access(), access_policy.FeaturePolicy("WARRANT"))
         cancel_event = threading.Event()
         request_id = str(getattr(self._request_local, "request_id", "") or "")
         futures = [(call, self.executor.submit(tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
@@ -3255,6 +3535,49 @@ class AceQueryEngine:
 # Discord Bot
 # ============================================================
 
+PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
+# /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
+_ADMIN_PRIVATE_RE = re.compile(r"狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
+
+
+def is_public_answer(result) -> bool:
+    """只有正式 /ask 成功的分析公開；錯誤、說明、澄清、覆盤、Gemini／API 失敗一律只給本人看。"""
+    if result.denied_feature or not (result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES):
+        return False
+    return result.route == "rule_radar" or result.cacheable or result.cache_hit
+
+
+async def send_access_denial(interaction, text, required, public=False):
+    """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。"""
+    import discord
+    options = {"content": text, "ephemeral": not public}
+    edit_original = public and interaction.response.is_done()
+    if required == "WARRANT" and not interaction.response.is_done():
+        # 未解鎖圖要 render（約 1 秒）：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
+        await interaction.response.defer(thinking=True, ephemeral=not public)
+        edit_original = True
+    if required == "WARRANT":
+        # 圖片只是視覺提示；可點的網址與 Link Button 一定放在訊息本身。
+        options["content"] += "\n\n網址：\n" + access_policy.UNLOCK_URL
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="🔓 前往解鎖權證系統", url=access_policy.UNLOCK_URL))
+        options["view"] = view
+        try:
+            data, extension = await asyncio.to_thread(answer_image.make_locked_attachment)
+            options["file"] = discord.File(io.BytesIO(data), filename=f"ace-locked.{extension}")
+        except Exception as exc:  # 圖片失敗仍送文字＋按鈕
+            print(f"⚠️ 未解鎖圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
+    if edit_original:
+        file = options.pop("file", None)
+        options.pop("ephemeral")
+        await interaction.edit_original_response(attachments=[file] if file else [], **options)
+    elif interaction.response.is_done():
+        await interaction.delete_original_response()
+        await interaction.followup.send(**options)
+    else:
+        await interaction.response.send_message(**options)
+
+
 class AccessGuard:
     """私人測試權限、頻道限制與使用者冷卻。"""
 
@@ -3265,17 +3588,10 @@ class AccessGuard:
         self._lock = threading.Lock()
 
     def check_permission(self, user_id: int, channel_id: int, guild_id: Optional[int] = None) -> str:
-        """回傳拒絕訊息；允許時回傳空字串。
-
-        DISCORD_AI_ALLOWED_USER_IDS=* 時不限使用者，但只接受伺服器內的訊息（不接受私訊），
-        且有設定 DISCORD_AI_GUILD_IDS 時只限那些伺服器，避免 Bot 被加到其他伺服器後被陌生人使用。
-        """
-        if self.config.allow_all_users:
-            if guild_id is None:
-                return "請在伺服器頻道內使用艾斯 AI。"
-            if self.config.guild_ids and guild_id not in self.config.guild_ids:
-                return NOT_OPEN_MESSAGE
-        elif user_id not in self.config.allowed_user_ids:
+        """只檢查伺服器與頻道；會員／管理員權限由 AccessContext 判斷。"""
+        if guild_id is None:
+            return "請在伺服器頻道內使用艾斯 AI。"
+        if self.config.guild_ids and guild_id not in self.config.guild_ids:
             return NOT_OPEN_MESSAGE
         if self.config.allowed_channel_ids and channel_id not in self.config.allowed_channel_ids:
             return "請在指定的 AI 測試頻道使用艾斯 AI。"
@@ -3358,11 +3674,11 @@ def with_context_note(result: "AnswerResult") -> str:
 
 def _is_guild_admin(member) -> bool:
     """Discord 伺服器管理員：有「管理員」或「管理伺服器」權限（私訊或取不到權限時為 False）。"""
-    perms = getattr(member, "guild_permissions", None)
-    return bool(perms is not None and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)))
+    return access_policy.UserEntitlement.from_member(member).admin
 
 
 ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能使用）
+會員模擬：/ace 測試 guest|general|warrant|beta|superuser <問題>（僅自己可見）
 
 【本週精選】
 • `本週精選排名`：算出當期 Top 10
@@ -3631,20 +3947,26 @@ def run_discord_bot(config: BotConfig) -> None:
             for file in files:
                 file.close()
 
-    async def interaction_text(interaction, text: str, *, ephemeral=False):
-        """草稿與維護指令用純文字回覆；太長時自動分段，方便直接複製。"""
+    async def interaction_text(interaction, text: str, *, ephemeral=False, followup=False):
+        """草稿與維護指令用純文字回覆；太長時自動分段，方便直接複製。followup＝原回覆已刪，改用 followup 送。"""
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         chunks = split_discord_message(text or "（沒有內容）", 1900)
-        await interaction.edit_original_response(content=chunks[0], attachments=[], allowed_mentions=no_mentions)
+        if followup:
+            await interaction.followup.send(content=chunks[0], ephemeral=ephemeral, allowed_mentions=no_mentions)
+        else:
+            await interaction.edit_original_response(content=chunks[0], attachments=[], allowed_mentions=no_mentions)
         for chunk in chunks[1:]:
             await interaction.followup.send(content=chunk, ephemeral=ephemeral, allowed_mentions=no_mentions)
 
-    async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False, weekly=None):
+    async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False, weekly=None,
+                                followup=False):
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         files = await image_files(question, text, panels, interaction.guild, weekly)
         try:
+            if followup:
+                return await interaction.followup.send(files=files, ephemeral=ephemeral, allowed_mentions=no_mentions, wait=True)
             try:
                 # The deferred original reply is the single message for this query.
                 # This also supports ephemeral replies without exposing them publicly.
@@ -3699,43 +4021,77 @@ def run_discord_bot(config: BotConfig) -> None:
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
-        is_admin = _is_guild_admin(interaction.user)
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
-            engine.log(f"拒絕使用者 {user_id}｜頻道 {channel_id}｜{denied}")
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
-        if admin_mode:
-            admin_denied = guard.check_weekly_pick(user_id, is_admin)
-            if admin_denied:
-                engine.log(f"管理員指令拒絕使用者 {user_id}")
-                await interaction_image(interaction, "使用權限", admin_denied, ephemeral=True)
-                return
+        try:
+            access, question = access_policy.resolve_access(interaction.user, config.superuser_ids,
+                                                           question, admin_entry=admin_mode,
+                                                           beta_ids=config.beta_tester_ids)
+        except access_policy.AccessDenied as exc:
+            await send_access_denial(interaction, str(exc), exc.required)
+            return
+        # /ace 測試模式的未解鎖畫面公開，方便管理員在群組展示；其他拒絕一律只給本人看。
+        demo = bool(access.simulation)
+        try:
+            access_policy.require_question(access, question, tools.get_cached_known_branches())
+        except access_policy.AccessDenied as exc:
+            await send_access_denial(interaction, str(exc), exc.required, public=demo)
+            return
+        is_admin = admin_mode = access.admin_mode
+        # /ask 與 /ace 的成功分析公開；/ace 管理指令（狀態、用量、底庫、維護、debug…）一開始就只給本人看，
+        # 其他失敗類與管理類回覆在結果出來後改成只有本人看得到。
+        ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and _ADMIN_PRIVATE_RE.search(question)))
+
+        async def send_private(title, text, panels=None, as_text=False):
+            followup = not ephemeral and interaction.response.is_done()
+            if followup:
+                await interaction.delete_original_response()
+            if as_text:
+                await interaction_text(interaction, text, ephemeral=True, followup=followup)
+            else:
+                await interaction_image(interaction, title, text, panels, ephemeral=True, followup=followup)
         busy = guard.acquire(user_id)
         if busy:
             await interaction_image(interaction, "請稍候", busy, ephemeral=True)
             return
         try:
-            await interaction.response.defer(thinking=True, ephemeral=config.ephemeral)
+            # 10062（此互動已失效）代表 3 秒內沒能 defer。defer 前只做不需 await 的量測，不讓出事件迴圈：
+            # delivery=使用者按下到 Bot 收到；pre_defer=Bot 收到到呼叫 defer；loop_lag 在 defer 之後才量。
+            delivery = (discord.utils.utcnow() - interaction.created_at).total_seconds()
+            pre_defer = asyncio.get_running_loop().time() - request_started
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+            probe = asyncio.get_running_loop().time()
+            await asyncio.sleep(0)
+            loop_lag = asyncio.get_running_loop().time() - probe
+            if delivery > 1.0 or pre_defer > 0.5 or loop_lag > 0.5:
+                print(f"⏱️ Discord 互動延遲｜delivery={delivery:.2f}s｜pre_defer={pre_defer:.2f}s｜"
+                      f"loop_lag={loop_lag:.2f}s｜{question[:20]}", flush=True)
             if admin_mode and is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
-                await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=config.ephemeral)
+                await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=ephemeral)
             loop = asyncio.get_running_loop()
 
             def on_queue(ahead: int) -> None:
                 # 在工作執行緒被呼叫：把「排隊中」圖片丟回 Discord 事件迴圈送出，不等待結果。
                 message = f"目前前面還有 {ahead} 個問題在處理，輪到你時會自動更新這則回覆。"
                 asyncio.run_coroutine_threadsafe(
-                    interaction_image(interaction, question, message, ephemeral=config.ephemeral), loop)
+                    interaction_image(interaction, question, message, ephemeral=ephemeral), loop)
 
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
-            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode)
+            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access)
+            if result.denied_feature:
+                await send_access_denial(interaction, result.text, result.denied_feature, public=demo)
+                return
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
-            if result.as_text:
-                await interaction_text(interaction, with_context_note(result), ephemeral=config.ephemeral)
+            if not ephemeral and not is_public_answer(result):
+                await send_private(image_question, with_context_note(result), result.panels, result.as_text)
+            elif result.as_text:
+                await interaction_text(interaction, with_context_note(result), ephemeral=ephemeral)
             else:
-                await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=config.ephemeral,
+                await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=ephemeral,
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
@@ -3745,12 +4101,14 @@ def run_discord_bot(config: BotConfig) -> None:
                 f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
                 f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
-            print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}", flush=True)
+            lag = (f"｜delivery={locals().get('delivery', -1):.2f}s｜pre_defer={locals().get('pre_defer', -1):.2f}s"
+                   f"｜loop_lag={locals().get('loop_lag', -1):.2f}s｜deferred={interaction.response.is_done()}")
+            print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}{lag}", flush=True)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()   # 印出檔名與行號，numpy/pandas 這類例外沒有堆疊就無法定位
             try:
-                await interaction_image(interaction, "暫時無法完成", "處理問題時發生錯誤，請稍後再試。", ephemeral=config.ephemeral)
+                await send_private("暫時無法完成", "處理問題時發生錯誤，請稍後再試。")
             except discord.HTTPException as send_exc:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
@@ -3776,8 +4134,14 @@ def run_discord_bot(config: BotConfig) -> None:
                                    attachment: Optional["discord.Attachment"]) -> None:
         """搬 Volume 用：匯出／匯入使用者覆盤、盤中量能學習結果與近 45 天成交占比。
         內容含會員交易資料 → 只限伺服器管理員，回覆一律只有自己看得到，不會進 Git。"""
-        if not _is_guild_admin(interaction.user):
-            await interaction.response.send_message("此功能只限伺服器管理員使用。", ephemeral=True)
+        denied = guard.check_permission(interaction.user.id, interaction.channel_id or 0, interaction.guild_id)
+        if denied:
+            await interaction.response.send_message(denied, ephemeral=True)
+            return
+        try:
+            access_policy.resolve_access(interaction.user, config.superuser_ids, command, admin_entry=True)
+        except access_policy.AccessDenied as exc:
+            await send_access_denial(interaction, str(exc), exc.required)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
@@ -3837,12 +4201,13 @@ def run_discord_bot(config: BotConfig) -> None:
         if not question:
             await reply_image(message, "!ace 使用說明", HELP_MESSAGE)
             return
-        if weekly_pick.is_weekly_admin_feature_question(question):
-            weekly_denied = guard.check_weekly_pick(user_id, _is_guild_admin(message.author))
-            if weekly_denied:
-                engine.log(f"本週精選拒絕使用者 {user_id}")
-                await reply_image(message, "使用權限", weekly_denied)
-                return
+        access, question = access_policy.resolve_access(message.author, config.superuser_ids, question,
+                                                       beta_ids=config.beta_tester_ids)
+        try:
+            access_policy.require_question(access, question, tools.get_cached_known_branches())
+        except access_policy.AccessDenied as exc:
+            await message.author.send(str(exc) + ("\n" + access_policy.UNLOCK_URL if exc.required == "WARRANT" else ""))
+            return
         busy = guard.acquire(user_id)
         if busy:
             await reply_image(message, "請稍候", busy)
@@ -3853,7 +4218,10 @@ def run_discord_bot(config: BotConfig) -> None:
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
-                result = await asyncio.to_thread(engine.answer, question, context_key, None, _is_guild_admin(message.author))
+                result = await asyncio.to_thread(engine.answer, question, context_key, None, False, False, access)
+            if result.denied_feature:
+                await message.author.send(result.text + ("\n" + access_policy.UNLOCK_URL if result.denied_feature == "WARRANT" else ""))
+                return
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()

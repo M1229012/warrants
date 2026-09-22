@@ -158,20 +158,21 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
 
 def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], None] = print,
                   codes: Optional[List[str]] = None) -> Dict[str, Any]:
-    """把還沒有『最新交易日型態分數』的股票補算完；純 CPU，可分多輪執行。"""
+    """補算分數日期與個股最後收盤 K 棒不一致的股票，可分多輪執行。"""
     if not _SCORE_LOCK.acquire(blocking=False):
         return {"skipped": "already_running"}
     started = time.monotonic()
     done = failed = 0
     try:
-        dates = local_market_cache.known_dates(limit=1)
-        if not dates:
+        last_bars = local_market_cache.last_bar_dates()
+        if not last_bars:
             return {"done": 0, "failed": 0, "pending": 0, "reason": "no_bars"}
-        latest = dates[0]
+        latest = max(last_bars.values())  # 僅供狀態顯示，不參與個股是否重算的判斷。
         universe = codes or sorted({c for codes_ in _member_codes().values() for c in codes_}) or \
             local_market_cache.codes_with_history(69)
-        scored = local_market_cache.pattern_scores_for(universe, max_age_days=1)
-        todo = [c for c in universe if (scored.get(c) or {}).get("date") != latest]
+        scored = local_market_cache.latest_pattern_score_dates(universe)
+        todo = [c for c in universe
+                if not last_bars.get(c) or scored.get(c) != last_bars[c]]
         for code in todo:
             if time.monotonic() - started > budget_seconds:
                 break
@@ -184,8 +185,11 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
                 score = weekly_pick.score_pattern(tech, vp, extras, weekly_pick.WeeklyPickConfig())
                 if not math.isfinite(float(score["score"])):
                     raise ValueError("score not finite")
+                score_date = tech.get("data_date") or last_bars.get(code)
+                if not score_date:
+                    raise ValueError("missing stock bar date")
                 local_market_cache.save_pattern_score(
-                    code, str(tech.get("data_date") or latest).replace("/", "-"), float(score["score"]),
+                    code, str(score_date).replace("/", "-"), float(score["score"]),
                     weekly_pick.pattern_grade(score["score"]), score.get("components"),
                     str(tech.get("signal_status") or ""))
                 done += 1

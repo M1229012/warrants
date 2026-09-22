@@ -2239,5 +2239,77 @@ def encode_image(image: Image.Image, max_bytes: int = 7_500_000) -> tuple[bytes,
     raise ValueError('回答圖片超過附件容量，請縮小查詢範圍')
 
 
+NAVY = CENTER_WATERMARK_COLOR
+LOCKED_TITLE = '解鎖艾斯DC權證系統'
+LOCKED_SUBTITLE = '開啟權證分點、事件勝率、分點部位與籌碼追蹤功能'
+LOCKED_FEATURES = ('權證分點追蹤', '高勝率事件統計', '分點買賣與部位觀察', '每日精選分點追蹤')
+LOCKED_CTA = ('購買艾斯DC權證系統', '立即前往解鎖')
+
+
+def _draw_lock(draw, x: float, y: float, size: float, color: str) -> None:
+    """鎖頭圖示（不用 emoji，避免字型缺字）：上方鎖環＋下方鎖身＋鑰匙孔。"""
+    ring = size * 0.62
+    rx = x + (size - ring) / 2
+    draw.arc((rx, y, rx + ring, y + ring), 180, 360, fill=color, width=max(6, int(size * 0.11)))
+    draw.line((rx + size * 0.055, y + ring / 2, rx + size * 0.055, y + size * 0.5), fill=color, width=max(6, int(size * 0.11)))
+    draw.line((rx + ring - size * 0.055, y + ring / 2, rx + ring - size * 0.055, y + size * 0.5), fill=color, width=max(6, int(size * 0.11)))
+    draw.rounded_rectangle((x, y + size * 0.46, x + size, y + size * 1.2), radius=int(size * 0.12), fill=color)
+    cx, cy = x + size / 2, y + size * 0.78
+    draw.ellipse((cx - size * 0.08, cy - size * 0.08, cx + size * 0.08, cy + size * 0.08), fill=NAVY)
+    draw.rectangle((cx - size * 0.035, cy, cx + size * 0.035, cy + size * 0.2), fill=NAVY)
+
+
+def _draw_check(draw, cx: float, cy: float, r: float) -> None:
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=ACCENT)
+    draw.line((cx - r * 0.45, cy + r * 0.02, cx - r * 0.1, cy + r * 0.38, cx + r * 0.5, cy - r * 0.35), fill='white', width=5, joint='curve')
+
+
+def render_locked_warrant() -> Image.Image:
+    """「權證未解鎖」導購圖：深藍主視覺＋可讀賣點＋CTA。可點網址與 Link Button 放在 Discord 訊息本身。"""
+    height = 990
+    image = Image.new('RGB', (WIDTH, height), BG)
+    draw = ImageDraw.Draw(image)
+    left, right = MARGIN, WIDTH - MARGIN
+    # 主視覺：深藍卡片、金色鎖頭、進階功能標籤、主標與副標。
+    draw.rounded_rectangle((left, 56, right, 376), radius=28, fill=NAVY)
+    draw.rectangle((left + 48, 56, left + 144, 62), fill=ACCENT)
+    _draw_lock(draw, left + 64, 150, 120, ACCENT)
+    tx = left + 240
+    pill = '進階功能｜尚未解鎖'
+    pill_w = draw.textlength(pill, font=font(24, True)) + 36
+    draw.rounded_rectangle((tx, 100, tx + pill_w, 142), radius=21, outline=ACCENT, width=2)
+    text_at(draw, (tx + 18, 107), pill, 24, ACCENT, True)
+    text_at(draw, (tx, 160), LOCKED_TITLE, 64, 'white', True)
+    text_at(draw, (tx, 250), LOCKED_SUBTITLE, 30, '#C9D3E3')
+    text_at(draw, (tx, 300), '目前帳號尚未開通「權證／權證2」權限', 24, '#9FB0C8')
+    # 賣點：2×2 卡片。
+    draw.rectangle((left, 420, left + 6, 452), fill=ACCENT)
+    text_at(draw, (left + 22, 418), '解鎖後可使用', 30, INK, True)
+    tile_w, tile_h, gap = (CONTENT - 24) / 2, 110, 24
+    for index, feature in enumerate(LOCKED_FEATURES):
+        x = left + (index % 2) * (tile_w + gap)
+        y = 476 + (index // 2) * (tile_h + gap)
+        draw.rounded_rectangle((x, y, x + tile_w, y + tile_h), radius=18, fill='white', outline=LINE, width=2)
+        _draw_check(draw, x + 60, y + tile_h / 2, 26)
+        draw.text((x + 110, y + tile_h / 2), feature, font=font(34, True), fill=INK, anchor='lm')
+    # CTA：購買文案＋金色按鈕。
+    cta_top, cta_bottom = 760, 900
+    draw.rounded_rectangle((left, cta_top, right, cta_bottom), radius=22, fill=ACCENT_BG, outline=ACCENT, width=3)
+    text_at(draw, (left + 40, cta_top + 30), LOCKED_CTA[0], 38, INK, True)
+    text_at(draw, (left + 40, cta_top + 88), '購買後即可解鎖上述權證功能｜請點訊息下方按鈕前往', 24, MUTED)
+    button_w, button_h = 380, 84
+    bx, by = right - 40 - button_w, cta_top + (cta_bottom - cta_top - button_h) / 2
+    draw.rounded_rectangle((bx, by, bx + button_w, by + button_h), radius=42, fill=ACCENT)
+    draw.text((bx + button_w / 2, by + button_h / 2), LOCKED_CTA[1] + ' →', font=font(34, True), fill='white', anchor='mm')
+    draw.line((left, 930, right, 930), fill=LINE, width=2)
+    text_at(draw, (left, 948), '股市艾斯  /  AI 資料整理', 22, MUTED)
+    return add_center_watermarks(image).convert('RGB')
+
+
+def make_locked_attachment(*, max_bytes=7_500_000):
+    """權證功能未解鎖導購圖；可點的網址與按鈕放在 Discord 訊息本身。"""
+    return encode_image(render_locked_warrant(), max_bytes)
+
+
 def make_attachment(question: str, answer: str, panels=None, *, max_bytes=7_500_000):
     return encode_image(render_answer(question, answer, panels), max_bytes)

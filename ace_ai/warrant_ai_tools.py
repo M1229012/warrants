@@ -700,15 +700,25 @@ def resolve_stock_name(stock_code: str) -> str:
     return name
 
 
+_KNOWN_BRANCHES_SNAPSHOT: Dict[str, str] = {}
+
+
+def get_cached_known_branches() -> Dict[str, str]:
+    """權限檢查只讀最後成功的名冊，不因 TTL 到期觸發 Google Sheet。"""
+    return dict(_KNOWN_BRANCHES_SNAPSHOT)
+
+
 def get_known_branches() -> Dict[str, str]:
     """已知分點別名 → 正式分點名稱（皆已 normalize_branch_name）。
 
     來源：週報使用的勝率統計、回測的近10日分點明細與股票ABCDE查詢資料。
     任一來源失敗只略過該來源；三個來源全部失敗時只快取 2 分鐘，避免 Sheet 暫時斷線後 6 小時都認不出分點。
     """
+    global _KNOWN_BRANCHES_SNAPSHOT
     hit, cached = CACHE.get("known_branches")
     _mark_cache(hit)
     if hit:
+        _KNOWN_BRANCHES_SNAPSHOT = dict(cached)
         return cached
 
     def build() -> Tuple[Dict[str, str], int]:
@@ -758,6 +768,8 @@ def get_known_branches() -> Dict[str, str]:
     aliases, sheet_sources_ok = build()
     # Sheet 全部讀取失敗時只快取 5 分鐘，之後重試；官方名冊部分仍可正常辨識分點。
     CACHE.set("known_branches", aliases, TTL_BRANCH_PERF_SECONDS if sheet_sources_ok else 300)
+    if aliases:
+        _KNOWN_BRANCHES_SNAPSHOT = dict(aliases)
     return aliases
 
 
@@ -1726,6 +1738,57 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
     }
 
 
+# 已確認來源沒有更新資料的股票（停牌等）：code -> (日期, 本地最後一根 K 棒日期)，當天不再重抓。
+_STALE_CHECKED: Dict[str, Tuple[str, str]] = {}
+
+
+def _missing_trading_days(df: pd.DataFrame) -> List[str]:
+    """用官方交易日表檢查日K 中間有沒有缺交易日（只看內部缺口，停牌股尾端沒資料不算）。
+
+    均線、布林、KD 都是「往前數 N 根」算的，缺一天不會報錯只會算錯，所以這一關要擋在出圖前面。
+    日曆取不到時回傳空清單，不因為檢查失敗而擋住回答。
+    """
+    try:
+        if df is None or len(df) < 2:
+            return []
+        index = pd.DatetimeIndex(df.index).normalize()
+        first, last = index[max(0, len(index) - 70)], index[-1]
+        have = set(index)
+        return [d.strftime("%Y-%m-%d") for d in
+                (pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last))
+                if d not in have]
+    except Exception as exc:   # 休市表失敗時照常回答，只是少了這道檢查
+        print(f"⚠️ 交易日連續性檢查略過：{type(exc).__name__}: {exc}", flush=True)
+        return []
+
+
+def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str) -> Tuple[pd.DataFrame, str]:
+    """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。"""
+    columns = ["Open", "High", "Low", "Close", "Volume"]
+    frames, labels = [df[columns]], [source]
+    try:
+        persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
+        if persistent and persistent.get("count"):
+            frames.append(persistent["df"][columns])
+            labels.append("本地底庫")
+    except Exception as exc:
+        print(f"⚠️ {code} 缺口補資料：本地底庫失敗｜{type(exc).__name__}: {exc}", flush=True)
+    try:
+        stock_df, market, _ = core().fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
+        if stock_df is not None and not stock_df.empty:
+            local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
+            frames.append(stock_df[columns])
+            labels.append("FinMind")
+    except Exception as exc:
+        print(f"⚠️ {code} 缺口補資料：FinMind 失敗｜{type(exc).__name__}: {exc}", flush=True)
+    merged = pd.concat(frames)
+    merged = merged[~pd.DatetimeIndex(merged.index).normalize().duplicated(keep="first")].sort_index()
+    remain = _missing_trading_days(merged)
+    print(f"🩹 {code} 日K 缺 {'、'.join(gaps)}（來源 {source}）｜嘗試 {'＋'.join(labels[1:]) or '無其他來源'}｜"
+          + ("已補齊" if not remain else f"仍缺 {'、'.join(remain)}"), flush=True)
+    return merged, ("＋".join(labels[:2]) if len(labels) > 1 else source)
+
+
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
@@ -1736,9 +1799,13 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     def daily() -> Tuple[pd.DataFrame, str, str]:
         # 先讀 Persistent Volume / 本機 SQLite 的最近 70 日。只要資料仍夠新，就不再打 FinMind。
         persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
+        today = taipei_now().strftime("%Y-%m-%d")
+        local_last = ""
         if persistent and persistent.get("count", 0) >= 69:
+            local_last = pd.Timestamp(persistent["last_date"]).strftime("%Y-%m-%d")
             gap = (pd.Timestamp(taipei_now().date()) - persistent["last_date"]).days
-            if gap <= 5:
+            # 停牌股永遠 gap>5，每次都重抓 FinMind 也拿不到新的；今天確認過一次就不再問。
+            if gap <= 5 or _STALE_CHECKED.get(code) == (today, local_last):
                 return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
         try:
             started = time.perf_counter()
@@ -1746,6 +1813,8 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             record_api_event("FinMindData", status=200, latency=time.perf_counter()-started)
             if stock_df is not None and not stock_df.empty:
                 local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
+                if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
+                    _STALE_CHECKED[code] = (today, local_last)
                 return stock_df, str(market or ""), "FinMind 日K"
             error: Exception = ToolDataError(f"{code} FinMind 沒有股價資料")
         except Exception as exc:  # FinMind 失敗時才以富果歷史日K備援；正常盤中不拿富果做歷史預抓。
@@ -1762,6 +1831,15 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     def build() -> Dict[str, Any]:
         daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
+        gaps = _missing_trading_days(merged)
+        if gaps:
+            # 缺一天就補；補不到寧可不答，也不要送出一張看起來正常、但均線全錯的圖。
+            daily_df, daily_source = _repair_daily(code, daily_df, gaps, daily_source)
+            CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
+            merged, intraday = _append_intraday_bar(code, daily_df, market)
+            gaps = _missing_trading_days(merged)
+            if gaps:
+                raise ToolDataError(f"{code} 日K 缺少 {'、'.join(gaps)} 的資料，資料不完整，暫時無法分析")
         closed = kf.calculate_indicators(daily_df)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:
@@ -4424,8 +4502,12 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
         if column in df:
             df[column] = pd.to_numeric(df[column], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
     df = df.dropna(subset=required)
-    df = df[(df["High"] >= df[["Open", "Close", "Low"]].max(axis=1)) &
-            (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))]
+    valid = ((df["High"] >= df[["Open", "Close", "Low"]].max(axis=1)) &
+             (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1)))
+    if not valid.all():   # 不合理的 K 棒以前是無聲刪除，缺一根圖上看不出來
+        print(f"⚠️ {code} 有 {int((~valid).sum())} 根 K 棒數值不合理已排除："
+              f"{'、'.join(_fmt_date(d) for d in df.index[~valid][-5:])}", flush=True)
+    df = df[valid]
     if df.empty:
         raise ToolDataError("沒有有效的 OHLC 資料")
     # Same window as the reference report (70 by default)；覆盤筆記會傳 lookback 讓買進日落在圖內。
