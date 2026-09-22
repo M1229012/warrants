@@ -7,6 +7,7 @@ small: only the latest N trading days per stock are kept.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -15,6 +16,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -643,12 +645,51 @@ def _exportable(key: str) -> bool:
     return key in EXPORT_KEYS or any(key.startswith(p) for p in EXPORT_PREFIXES)
 
 
+def _normalize_trade_reviews(key: str, records: Any) -> List[Dict[str, Any]]:
+    """匯出、匯入及目標資料庫共用 legacy ID；不修改原紀錄或已存在的 ID。"""
+    if not key.removeprefix("trade_review:") or not isinstance(records, list):
+        raise ValueError("覆盤資料必須是使用者的紀錄清單")
+    normalized = []
+    used = {r["trade_id"] for r in records if isinstance(r, dict) and isinstance(r.get("trade_id"), str)}
+    occurrences: Dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict) or not _finite_number(record.get("at", 0)):
+            raise ValueError("覆盤紀錄或 at 時間格式不符")
+        trade_id = record.get("trade_id")
+        if trade_id is None or trade_id == "":
+            stamp = Decimal(str(record.get("at", 0)))
+            timestamp_ms = int(stamp * 1000)
+            # 加上內容雜湊，避免同一毫秒的不同舊紀錄在合併時被丟棄。
+            # 排序欄位並統一 timestamp 表示法，JSON 欄位順序、1 與 1.0 不影響 ID。
+            identity = {k: v for k, v in record.items() if k not in ("trade_id", "at")}
+            identity["at"] = str(stamp.normalize())
+            digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                                                separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+            user_id = key.removeprefix("trade_review:")
+            base_id = f"legacy-{user_id}-{timestamp_ms}-{digest}"
+            # 完全相同的舊紀錄也保留原筆數；同一備份重跑時序號仍相同。
+            occurrence = occurrences.get(base_id, 0) + 1
+            trade_id = base_id if occurrence == 1 else f"{base_id}-{occurrence}"
+            while trade_id in used:
+                occurrence += 1
+                trade_id = f"{base_id}-{occurrence}"
+            occurrences[base_id] = occurrence
+            used.add(trade_id)
+            record = {**record, "trade_id": trade_id}
+        elif not isinstance(trade_id, str):
+            raise ValueError("覆盤 trade_id 格式不符")
+        normalized.append(record)
+    return normalized
+
+
 def export_state() -> Tuple[bytes, Dict[str, Any]]:
     """回傳 (gzip 後的 JSON, 摘要)。"""
     with _LOCK, _db() as conn, conn:
         conn.execute("BEGIN")
         rows = conn.execute("SELECT key,value FROM kv").fetchall()
         state = {k: json.loads(v) for k, v in rows if _exportable(k)}
+        state = {k: _normalize_trade_reviews(k, v) if k.startswith("trade_review:") else v
+                 for k, v in state.items()}
         turnover = _recent_turnover(conn)
     payload = {"version": EXPORT_VERSION, "exported_at": datetime.now(timezone.utc).isoformat(),
                "kv": state, "radar_turnover": turnover}
@@ -683,7 +724,7 @@ def _finite_number(value: Any) -> bool:
 
 
 def _validate_state_payload(payload: Any) -> None:
-    """所有結構與白名單在交易開始前驗證，錯誤檔不能造成部分匯入。"""
+    """交易開始前驗證結構與白名單並補齊 legacy ID，錯誤檔不能造成部分匯入。"""
     def require(condition: bool) -> None:
         if not condition:
             raise ValueError("檔案格式、版本或資料不符，請用 /ace 匯出狀態 產生的檔案")
@@ -702,11 +743,7 @@ def _validate_state_payload(payload: Any) -> None:
     for key, value in payload["kv"].items():
         require(_exportable(key))
         if key.startswith("trade_review:"):
-            require(bool(key.removeprefix("trade_review:")) and isinstance(value, list))
-            for record in value:
-                require(isinstance(record, dict))
-                require(isinstance(record.get("trade_id"), str) and bool(record["trade_id"]))
-                require(_finite_number(record.get("at", 0)))
+            payload["kv"][key] = _normalize_trade_reviews(key, value)
             continue
         require(isinstance(value, dict) and set(value) <= {"twse", "tpex"})
         for market, entry in value.items():
@@ -762,14 +799,15 @@ def import_state(data: bytes) -> Dict[str, Any]:
         for key, value in incoming.items():
             if not key.startswith("trade_review:"):
                 continue
-            existing = list(current.get(key) or [])
+            original = list(current.get(key) or [])
+            existing = _normalize_trade_reviews(key, original)
             merged = list(existing)
             seen = {r.get("trade_id") for r in existing}
             for record in value:
                 if record["trade_id"] not in seen:
                     merged.append(record)
                     seen.add(record["trade_id"])
-            if len(merged) != len(existing):
+            if merged != original:
                 updates[key] = sorted(merged, key=lambda r: float(r.get("at") or 0))
         for market in ("twse", "tpex"):
             curve = (incoming.get("ivol_curves") or {}).get(market) or {}
