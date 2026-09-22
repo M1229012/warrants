@@ -2306,8 +2306,18 @@ def render_locked_warrant() -> Image.Image:
     return add_center_watermarks(image).convert('RGB')
 
 
+LOCKED_ASSET = Path(__file__).with_name('assets') / 'warrant_unlock.webp'
+
+
 def make_locked_attachment(*, max_bytes=7_500_000):
-    """權證功能未解鎖導購圖；可點的網址與按鈕放在 Discord 訊息本身。"""
+    """權證功能未解鎖導購圖：優先用設計好的固定圖檔（不需 render）；檔案不在時才用程式繪製版。
+    可點的網址與按鈕放在 Discord 訊息本身。"""
+    try:
+        data = LOCKED_ASSET.read_bytes()
+        if data and len(data) <= max_bytes:
+            return data, LOCKED_ASSET.suffix.lstrip('.')
+    except OSError:
+        pass
     return encode_image(render_locked_warrant(), max_bytes)
 
 
