@@ -1940,18 +1940,14 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
 
 
 # ============================================================
-# 交易覆盤卡：標題＋一句結論＋正文（最多 4 行）＋重點（每條最多 2 行）＋目前觀察／下次（最多 2 行）
-# 行數上限寫死，文字再長也不會把圖片無限往下拉。
+# 交易覆盤卡：單欄由上往下，每一塊都有行數上限（結論 2、正文 3、每條核對與重點 1），
+# 文字再長也不會把圖片無限往下拉。
 # ============================================================
 
 REVIEW_PAD = 36
-REVIEW_LEFT_W = 470                  # 左欄：原始理由＋理由核對；右欄：AI 覆盤筆記＋本次重點／目前觀察
-REVIEW_GAP = 28
-REVIEW_TILE_H = 86
-REVIEW_BODY_MAX, REVIEW_HL_MAX, REVIEW_LAST_MAX, REVIEW_EVID_MAX = 4, 2, 3, 2
 STATUS_STYLE = {'✅': (GOOD_BG, GOOD_INK), '⚠️': (WARN_BG, WARN_INK), '❌': ('#FDECEC', '#C24141'), '❓': (TILE_BG, MUTED)}
-NOTE_BG, NOTE_INK = '#FFF4E8', '#B45309'           # AI 覆盤筆記的暖色底
-HL_BG, WATCH_BG = '#EEF4FF', '#F3F0FF'
+NOTE_BG, NOTE_INK = '#FFF4E8', '#B45309'           # AI 覆盤的暖色底
+WATCH_BG = '#F3F0FF'
 
 
 def _is_review_panel(panel: dict) -> bool:
@@ -1980,133 +1976,105 @@ def _status_icon(draw, cx: float, cy: float, status: str, r: int = 12) -> None:
     elif status == '⚠️':
         draw.line((cx, cy - 6, cx, cy + 2), fill='white', width=3)
         draw.ellipse((cx - 2, cy + 4, cx + 2, cy + 8), fill='white')
+    elif status == '💡':                                  # 學習：藍色圓＋小寫 i
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill='#2563EB')
+        draw.ellipse((cx - 2, cy - 7, cx + 2, cy - 3), fill='white')
+        draw.line((cx, cy - 1, cx, cy + 7), fill='white', width=3)
     else:
         draw.text((cx, cy), '?', font=font(16, True), fill='white', anchor='mm')
 
 
-def _highlight_status(text: str) -> str:
-    """重點前面的小圖示：講不符／不成立＝紅、需修正／並非＝橘、其餘＝綠。只是視覺提示，不改內容。"""
-    if re.search(r'不符|不成立|錯誤|賣超', text):
-        return '❌'
-    if re.search(r'並非|不是|需修正|部分|缺|不足', text):
-        return '⚠️'
-    return '✅'
-
-
-def _review_stats(data: dict) -> list[tuple[str, str, str]]:
-    return [(str(k), str(v), str(c or INK)) for k, v, c in data.get('stats') or []]
-
-
 def review_card(draw, y: float, data: dict, dry: bool) -> int:
+    """交易覆盤卡（定案版，由上往下單欄）：
+    標題 → 一行摘要 → 我的理由＋逐條核對（每條兩行）→ AI 覆盤（結論＋正文）→ 本次記住（理由／過程／學習）→ 目前觀察。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
     px, width = x0 + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
-    lw, rw = REVIEW_LEFT_W, width - REVIEW_LEFT_W - REVIEW_GAP
-    rx = px + lw + REVIEW_GAP
-    stats = _review_stats(data)
+    summary = [(str(t), str(c or INK)) for t, c in data.get('summary') or []]
+    checks = [(c, _capped_lines(f"{c.get('status_text', '')}｜{c.get('evidence', '')}", 20, width - 60, 1))
+              for c in (data.get('checks') or [])[:4]]
+    headline = _capped_lines(data.get('headline', ''), 26, width - 40, 2, True)
+    body = _capped_lines(data.get('body', ''), 23, width - 40, 3)
+    icons = list(data.get('highlight_icons') or [])
+    highlights = [_capped_lines(h, 22, width - 56, 1) for h in (data.get('highlights') or [])[:3]]
+    label = str(data.get('last_label') or '目前觀察')
+    last = _capped_lines(data.get('last_text', ''), 22, width - 40 - font(22, True).getlength(f'{label}｜'), 1)
 
-    # ---- 左欄：原始進場理由（引號框）＋理由核對 ----
-    quote = _capped_lines(f"「{data.get('reason_raw', '')}」", 23, lw - 60, 2)
-    checks = []
-    for c in (data.get('checks') or [])[:4]:
-        evid = _capped_lines(str(c.get('evidence', '')), 20, lw - 64, REVIEW_EVID_MAX)
-        checks.append((c, evid))
-    left_h = 40 + (len(quote) * 34 + 30) + 22 + 40
-    left_h += sum(40 + len(e) * 30 + 16 for _, e in checks) + 6
-
-    # ---- 右欄：AI 覆盤筆記（headline＋body）＋本次重點／目前觀察 ----
-    headline = _capped_lines(data.get('headline', ''), 25, rw - 40, 2, True)
-    body = _capped_lines(data.get('body', ''), 22, rw - 40, REVIEW_BODY_MAX)
-    half = (rw - 16) / 2
-    highlights = [(h, _capped_lines(h, 18, half - 60, REVIEW_HL_MAX)) for h in (data.get('highlights') or [])[:3]]
-    last = _capped_lines(data.get('last_text', ''), 20, half - 36, REVIEW_LAST_MAX)
-    note_h = len(headline) * 36 + len(body) * 33 + 34
-    hl_h = 46 + sum(len(lines) * 27 + 10 for _, lines in highlights) + 8
-    watch_h = 46 + len(last) * 30 + 14
-    right_h = 40 + note_h + 14 + max(hl_h, watch_h)
-
-    h = 26 + 54 + 16                                       # 標題列
-    h += (REVIEW_TILE_H + 22) if stats else 0              # 統計列
-    h += max(left_h, right_h) + (26 if data.get('source') == 'fallback' else 0) + 24
+    h = 24 + 50 + 12                                         # 標題列
+    h += 40 if summary else 0                                # 一行摘要
+    h += 22 + 38 + len(checks) * 64 + 8                      # 我的理由＋核對
+    h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
+    h += 18 + 38 + len(highlights) * 38                      # 本次記住
+    h += (18 + 52) if last else 0                            # 目前觀察
+    h += (26 if data.get('source') == 'fallback' else 0) + 22
     if dry:
         return int(h)
 
     draw.rounded_rectangle((x0, y, x1, y + h), radius=20, fill='white', outline=LINE)
-    # 標題列：紫色圓徽＋「2454 聯發科｜持倉中覆盤」
-    cy = y + 26
-    draw.ellipse((px, cy, px + 50, cy + 50), fill=TRADE_COLOR)
-    draw.text((px + 25, cy + 25), '覆', font=font(24, True), fill='white', anchor='mm')
-    draw.text((px + 66, cy + 25), str(data.get('title', '')), font=font(32, True), fill=INK, anchor='lm')
-    cy += 54 + 16
+    cy = y + 24
+    draw.ellipse((px, cy, px + 48, cy + 48), fill=TRADE_COLOR)
+    draw.text((px + 24, cy + 24), '覆', font=font(23, True), fill='white', anchor='mm')
+    draw.text((px + 62, cy + 24), str(data.get('title', '')), font=font(30, True), fill=INK, anchor='lm')
+    cy += 50 + 12
 
-    # 統計列：買進日期／買進價格／現價／帳面報酬／最大浮盈／最大回撤／持有天數
-    if stats:
-        draw.rounded_rectangle((px, cy, px + width, cy + REVIEW_TILE_H), radius=14, fill=TILE_BG)
-        cell = width / len(stats)
-        for i, (label, value, color) in enumerate(stats):
-            cx = px + i * cell
+    if summary:                                               # 09/11 @30.2｜現價 36.65（盤中）｜+21.36%｜MFE…
+        sx = px
+        for i, (text, color) in enumerate(summary):
             if i:
-                draw.line((cx, cy + 16, cx, cy + REVIEW_TILE_H - 16), fill=LINE, width=1)
-            draw.text((cx + 20, cy + 26), label, font=font(18), fill=MUTED, anchor='lm')
-            text, size = fit(value, 25, cell - 30, True)
-            draw.text((cx + 20, cy + 58), text, font=font(size, True), fill=color, anchor='lm')
-        cy += REVIEW_TILE_H + 22
+                draw.text((sx + 8, cy + 14), '｜', font=font(21), fill=LINE, anchor='lm')
+                sx += 30
+            draw.text((sx, cy + 14), text, font=font(21, True), fill=color, anchor='lm')
+            sx += font(21, True).getlength(text)
+        cy += 40
 
-    # 左欄
-    ly = cy
-    text_at(draw, (px, ly), '原始進場理由（我的紀錄）', 22, INK, True)
-    ly += 40
-    box_h = len(quote) * 34 + 30
-    draw.rounded_rectangle((px, ly, px + lw, ly + box_h), radius=12, fill=TILE_BG)
-    for i, line in enumerate(quote):
-        text_at(draw, (px + 26, ly + 14 + i * 34), line, 23, INK)
-    ly += box_h + 22
-    text_at(draw, (px, ly), '進場理由核對', 22, INK, True)
-    ly += 40
-    for c, evid in checks:
+    cy += 22                                                  # 我的理由＋逐條核對
+    draw.rectangle((px, cy + 4, px + 4, cy + 28), fill=TRADE_COLOR)
+    head = '我的理由｜'
+    draw.text((px + 16, cy + 16), head, font=font(22, True), fill=MUTED, anchor='lm')
+    reason, size = fit(str(data.get('reason_raw', '')), 22, width - 16 - font(22, True).getlength(head), True)
+    draw.text((px + 16 + font(22, True).getlength(head), cy + 16), reason, font=font(size, True), fill=INK, anchor='lm')
+    cy += 38
+    for c, lines in checks:
         status = str(c.get('status', '❓'))
-        bg, ink = STATUS_STYLE.get(status, STATUS_STYLE['❓'])
-        _status_icon(draw, px + 16, ly + 16, status)
-        claim, size = fit(str(c.get('claim', '')), 22, lw - 170, True)
-        draw.text((px + 40, ly + 16), claim, font=font(size, True), fill=INK, anchor='lm')
-        chip = str(c.get('status_text', ''))
-        chip_x = px + 40 + font(size, True).getlength(claim) + 12
-        chip_w = font(18, True).getlength(chip) + 22
-        draw.rounded_rectangle((chip_x, ly + 2, chip_x + chip_w, ly + 30), radius=14, fill=bg)
-        draw.text((chip_x + chip_w / 2, ly + 16), chip, font=font(18, True), fill=ink, anchor='mm')
-        for i, line in enumerate(evid):
-            text_at(draw, (px + 40, ly + 38 + i * 30), line, 20, MUTED)
-        ly += 40 + len(evid) * 30 + 16
+        _status_icon(draw, px + 28, cy + 16, status, r=11)
+        claim, size = fit(str(c.get('claim', '')), 21, width - 60, True)
+        draw.text((px + 50, cy + 16), claim, font=font(size, True), fill=INK, anchor='lm')
+        for line in lines:
+            text_at(draw, (px + 50, cy + 32), line, 20, MUTED)
+        cy += 64
+    cy += 8
 
-    # 右欄
-    ry = cy
-    text_at(draw, (rx, ry), 'AI 覆盤筆記', 22, INK, True)
-    ry += 40
-    draw.rounded_rectangle((rx, ry, rx + rw, ry + note_h), radius=14, fill=NOTE_BG)
-    ty = ry + 16
+    cy += 18                                                  # AI 覆盤
+    text_at(draw, (px, cy), 'AI 覆盤', 22, INK, True)
+    cy += 40
+    box_h = len(headline) * 34 + len(body) * 33 + 26
+    draw.rounded_rectangle((px, cy, px + width, cy + box_h), radius=14, fill=NOTE_BG)
+    ty = cy + 13
     for line in headline:
-        text_at(draw, (rx + 20, ty), line, 25, NOTE_INK, True)
-        ty += 36
+        text_at(draw, (px + 20, ty), line, 26, NOTE_INK, True)
+        ty += 34
     for line in body:
-        text_at(draw, (rx + 20, ty), line, 22, INK)
+        text_at(draw, (px + 20, ty), line, 23, INK)
         ty += 33
-    ry += note_h + 14
-    box_h = max(hl_h, watch_h)
-    draw.rounded_rectangle((rx, ry, rx + half, ry + box_h), radius=14, fill=HL_BG)
-    text_at(draw, (rx + 18, ry + 12), '本次重點', 21, '#1D4ED8', True)
-    hy = ry + 46
-    for text, lines in highlights:
-        _status_icon(draw, rx + 30, hy + 12, _highlight_status(text), r=10)
-        for i, line in enumerate(lines):
-            text_at(draw, (rx + 50, hy + i * 27), line, 18, INK)
-        hy += len(lines) * 27 + 10
-    wx = rx + half + 16
-    draw.rounded_rectangle((wx, ry, rx + rw, ry + box_h), radius=14, fill=WATCH_BG)
-    text_at(draw, (wx + 18, ry + 12), str(data.get('last_label') or '目前觀察'), 21, TRADE_COLOR, True)
-    for i, line in enumerate(last):
-        text_at(draw, (wx + 18, ry + 50 + i * 30), line, 20, INK)
+    cy += box_h
+
+    cy += 18                                                  # 本次記住：理由／過程／學習
+    text_at(draw, (px, cy), '本次記住', 22, INK, True)
+    cy += 38
+    for i, lines in enumerate(highlights):
+        _status_icon(draw, px + 14, cy + 15, icons[i] if i < len(icons) else '✅', r=11)
+        for line in lines:
+            text_at(draw, (px + 36, cy + 1), line, 22, INK)
+        cy += 38
+
+    if last:                                                  # 目前觀察（只講一件事）
+        cy += 18
+        draw.rounded_rectangle((px, cy, px + width, cy + 46), radius=12, fill=WATCH_BG)
+        draw.text((px + 18, cy + 23), f'{label}｜', font=font(22, True), fill=TRADE_COLOR, anchor='lm')
+        draw.text((px + 18 + font(22, True).getlength(f'{label}｜'), cy + 23), last[0], font=font(22), fill=INK, anchor='lm')
+        cy += 52
 
     if data.get('source') == 'fallback':
-        text_at(draw, (px, y + h - 44), 'AI 摘要暫時無法使用，以上為系統整理的簡短版本', 18, MUTED)
+        text_at(draw, (px, cy + 6), 'AI 摘要暫時無法使用，以上為系統整理的簡短版本', 18, MUTED)
     return int(h)
 
 

@@ -155,15 +155,18 @@ def _index_on_or_after(df: pd.DataFrame, day: date) -> Optional[int]:
     return hits[0] if hits else None
 
 
-def _kd_cross_days_ago(part: pd.DataFrame, lookback: int = 3) -> Optional[int]:
-    """最近幾根內 K 由下往上穿過 D：0＝當天、1＝前一天…；沒有交叉回 None。"""
+def _kd_cross_days_ago(part: pd.DataFrame, lookback: int = 3, down: bool = False) -> Optional[int]:
+    """最近幾根內 K 穿過 D：down=False 由下往上（黃金交叉）、True 由上往下（死亡交叉）；
+    0＝當天、1＝前一天…；沒有交叉回 None。"""
     k, d = part.get("K9"), part.get("D9")
     if k is None or d is None or len(part) < 2:
         return None
     for back in range(0, min(lookback, len(part) - 1)):
         i = len(part) - 1 - back
         k0, d0, k1, d1 = _f(k.iloc[i - 1]), _f(d.iloc[i - 1]), _f(k.iloc[i]), _f(d.iloc[i])
-        if None not in (k0, d0, k1, d1) and k0 <= d0 and k1 > d1:
+        if None in (k0, d0, k1, d1):
+            continue
+        if (not down and k0 <= d0 and k1 > d1) or (down and k0 >= d0 and k1 < d1):
             return back
     return None
 
@@ -201,7 +204,12 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
                       "bandwidth_pct": _f(widths[-1]) if widths and widths[-1] is not None else None,
                       "bandwidth_trend": widths, "signals": (bollinger or {}).get("signals", []),
                       "upper_break_days_ago": upper_break},
-        "kd": {"K9": _f(row.get("K9")), "D9": _f(row.get("D9")), "cross_days_ago": _kd_cross_days_ago(part)},
+        "kd": {"K9": _f(row.get("K9")), "D9": _f(row.get("D9")),
+               "K_prev": _f(prev.get("K9")) if len(part) > 1 else None,
+               "D_prev": _f(prev.get("D9")) if len(part) > 1 else None,
+               "K_last3": [_f(v) for v in part["K9"].tail(3)] if "K9" in part else [],
+               "cross_days_ago": _kd_cross_days_ago(part),
+               "death_cross_days_ago": _kd_cross_days_ago(part, down=True)},
         "volume_lots": round(volume / 1000) if volume else None,
         "mv5_lots": round(_f(row.get("MV5"), 0) / 1000) if _f(row.get("MV5"), 0) else None,
         "mv20_lots": round(_f(row.get("MV20"), 0) / 1000) if _f(row.get("MV20"), 0) else None,
@@ -261,13 +269,10 @@ INST_KEEP_DAYS = 30          # 理由常見最長寫到「近一個月」＝20 �
 
 
 def inst_summary(frame: pd.DataFrame, buy_day: pd.Timestamp) -> Dict[str, Any]:
-    before = frame[frame["Date"] <= buy_day].tail(5)
-    after = frame[frame["Date"] > buy_day]
-    history = frame[frame["Date"] <= buy_day].tail(INST_KEEP_DAYS)
-
     def streak(col: str) -> int:
+        """到買進日為止連續買超幾天（最多看 INST_KEEP_DAYS 天，「連 7 天」也算得出來）。"""
         count = 0
-        for value in reversed(before[col].tolist()):
+        for value in reversed(history[col].tolist()):
             if value > 0:
                 count += 1
             else:
@@ -275,15 +280,20 @@ def inst_summary(frame: pd.DataFrame, buy_day: pd.Timestamp) -> Dict[str, Any]:
         return count
 
     out = {"buy_day": {}, "before_5d_sum": {}, "buy_streak_days": {}, "after_sum": {}}
+    frame = frame.assign(total=frame["foreign"] + frame["invest"] + frame["dealer"])
+    before = frame[frame["Date"] <= buy_day].tail(5)
+    after = frame[frame["Date"] > buy_day]
+    history = frame[frame["Date"] <= buy_day].tail(INST_KEEP_DAYS)
     last = before.iloc[-1] if not before.empty else None
-    for col, label in (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商")):
+    for col, label in (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商"), ("total", "三大法人")):
         out["buy_day"][label] = round(float(last[col])) if last is not None else None
         out["before_5d_sum"][label] = round(float(before[col].sum())) if not before.empty else None
         out["buy_streak_days"][label] = streak(col) if not before.empty else None
         out["after_sum"][label] = round(float(after[col].sum())) if not after.empty else None
     # 買進日（含）以前每日買賣超，給「近 N 日」核對用（舊→新）
     out["recent"] = [{"date": tools._fmt_date(r.Date), "外資": round(float(r.foreign)),
-                      "投信": round(float(r.invest)), "自營商": round(float(r.dealer))}
+                      "投信": round(float(r.invest)), "自營商": round(float(r.dealer)),
+                      "三大法人": round(float(r.total))}
                      for r in history.itertuples()]
     out["unit"] = "張"
     return out
@@ -298,9 +308,59 @@ _MA_WORDS = (("MA5", r"5日線|五日線|週線|周線|MA5"), ("MA10", r"10日�
              ("MA20", r"月線|20日線|二十日線|MA20|中軌"), ("MA60", r"季線|60日線|六十日線|MA60"))
 
 
+# 自動斷詞用的「主題錨點」：一條理由通常圍繞一個錨點（KD、布林、外資、月線…）。長的寫前面，
+# 「均線多頭排列」才不會被拆成「均線」＋「多頭排列」。
+_ANCHOR_RE = re.compile(
+    r"均線多頭排列|均線空頭排列|多頭排列|空頭排列|KD|K值|D值|MACD|布林|外資|投信|自營商?|三大法人|法人|"
+    r"5日線|五日線|10日線|十日線|20日線|60日線|週線|周線|月線|季線|半年線|年線|MA\d+|均線|"
+    r"爆量|量增|放量|出量|大量|前高|新高|頸線|缺口|權證|分點|主力|券商|大戶",
+    re.IGNORECASE)
+# 放在錨點前面的動作詞屬於「後面」那個錨點：「KD向上突破布林」→「KD向上」＋「突破布林」
+_PREFIX_VERB_RE = re.compile(r"(突破|站上|站回|跌破|跌落|失守|守住|回測|回踩|沿著|沿|貼著|碰到|觸及)$")
+_CONNECTOR_ONLY_RE = re.compile(r"^(和|與|跟|及|、|還有|以及)?$")
+_FAMILIES = (("權證", "分點", "主力", "券商", "大戶"),)
+
+
+def _same_family(a: str, b: str) -> bool:
+    return any(a in fam and b in fam for fam in _FAMILIES)
+
+
+def _segment(text: str) -> List[str]:
+    """一段沒有標點的理由依錨點切開。兩個錨點中間的字，句尾是動作詞就歸後面，其餘歸前面。"""
+    anchors = list(_ANCHOR_RE.finditer(text))
+    if len(anchors) <= 1:
+        return [text] if text else []
+    cuts = [0]
+    for prev, nxt in zip(anchors, anchors[1:]):
+        gap = text[prev.end():nxt.start()]
+        if not gap and _same_family(prev.group(0), nxt.group(0)):
+            continue                                  # 「權證分點」「主力券商」是同一件事，不拆
+        verb = _PREFIX_VERB_RE.search(gap)
+        cuts.append(prev.end() + verb.start() if verb else nxt.start())
+    cuts.append(len(text))
+    pieces = [text[a:b] for a, b in zip(cuts, cuts[1:])]
+    # 「外資和投信買超」→ 前一段只有錨點＋連接詞，就借用後一段的述語 →「外資買超」「投信買超」
+    out: List[str] = []
+    for i, piece in enumerate(pieces):
+        hit = _ANCHOR_RE.search(piece)
+        rest = piece[hit.end():] if hit else piece
+        if hit and _CONNECTOR_ONLY_RE.match(rest) and i + 1 < len(pieces):
+            nxt = _ANCHOR_RE.search(pieces[i + 1])
+            if nxt:
+                piece = piece[:hit.end()] + pieces[i + 1][nxt.end():]
+        out.append(piece)
+    return out
+
+
 def _split_claims(reason: str) -> List[str]:
-    parts = re.split(r"[，,、；;。\n]|以及|並且|而且|加上|還有", reason)
-    return [p.strip() for p in parts if len(p.strip()) >= 2]
+    """理由拆成一條一條：先依標點／連接詞切，每段再去掉空白後依錨點自動斷詞。
+    「KD 黃金交叉」（空白）仍是一條；「KD向上 突破布林」「KD黃金交叉外資買超」會拆成兩條。"""
+    parts = re.split(r"[，,、；;。\n/／|｜]|以及|並且|而且|加上|還有", str(reason or ""))
+    claims: List[str] = []
+    for part in parts:
+        compact = re.sub(r"\s+", "", part)
+        claims += [c for c in _segment(compact) if len(c) >= 2]
+    return claims
 
 
 def _cn_int(raw: str) -> Optional[int]:
@@ -371,6 +431,53 @@ def _result(claim: str, status: str, evidence: str) -> Dict[str, str]:
     return {"claim": claim, "status": status, "status_text": STATUS_TEXT[status], "evidence": evidence}
 
 
+def _check_kd(claim: str, kd: Dict[str, Any], day: str) -> Dict[str, str]:
+    """KD 各種說法：黃金交叉／死亡交叉／高檔鈍化／低檔／向下；其餘（向上、翻揚、轉強、只寫 KD）當成向上。"""
+    k, d, kp = kd.get("K9"), kd.get("D9"), kd.get("K_prev")
+    if k is None or d is None:
+        return _result(claim, "❓", "KD 資料不足")
+    values = f"{day} K {k:.1f}／D {d:.1f}"
+    if re.search(r"金叉|黃金交叉|交叉向上", claim):
+        ago = kd.get("cross_days_ago")
+        if ago is not None:
+            return _result(claim, "✅", f"{values}，{'當日' if ago == 0 else f'{ago} 天前'}黃金交叉")
+        if k > d:
+            return _result(claim, "⚠️", f"{values}，K 在 D 之上，但近 3 日沒有交叉")
+        return _result(claim, "❌", f"{values}，K 仍在 D 之下")
+    if re.search(r"死叉|死亡交叉|交叉向下", claim):
+        ago = kd.get("death_cross_days_ago")
+        if ago is not None:
+            return _result(claim, "✅", f"{values}，{'當日' if ago == 0 else f'{ago} 天前'}死亡交叉")
+        if k < d:
+            return _result(claim, "⚠️", f"{values}，K 在 D 之下，但近 3 日沒有交叉")
+        return _result(claim, "❌", f"{values}，K 仍在 D 之上")
+    if re.search(r"高檔|鈍化|超買", claim):
+        last3 = [v for v in kd.get("K_last3") or [] if v is not None]
+        if len(last3) >= 3 and min(last3) >= 80:
+            return _result(claim, "✅", f"{values}，K 連 3 日在 80 以上（高檔鈍化）")
+        if k >= 80:
+            return _result(claim, "⚠️", f"{values}，K 在 80 以上，但未連 3 日")
+        return _result(claim, "❌", f"{values}，K 未達 80")
+    if re.search(r"低檔|超賣", claim):
+        return _result(claim, "✅" if k <= 20 else "⚠️" if k <= 30 else "❌", f"{values}，K 值 {k:.1f}")
+    if kp is None:
+        return _result(claim, "❓", "缺前一日 KD，無法判斷方向")
+    rising = k > kp
+    move = f"{values}（前一日 K {kp:.1f}），K 值{'上升' if rising else '下降' if k < kp else '持平'}"
+    if re.search(r"向下|下彎|轉弱|翻空|走弱|往下", claim):
+        falling = k < kp
+        if falling and k < d:
+            return _result(claim, "✅", move + "，且 K 在 D 之下")
+        return _result(claim, "⚠️" if falling or k < d else "❌", move + f"，K {'在' if k < d else '高於'} D")
+    # 向上／翻揚／轉強／上揚／勾頭／只寫 KD：K 值上升＋K 在 D 之上＝成立，只符合一項＝部分成立
+    above = k > d
+    if rising and above:
+        return _result(claim, "✅", move + "，且 K 在 D 之上")
+    if rising or above:
+        return _result(claim, "⚠️", move + f"，K {'在 D 之上' if above else '仍低於 D'}")
+    return _result(claim, "❌", move + "，且 K 低於 D")
+
+
 def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]],
                 warrant_events: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
     close = snap.get("close")
@@ -421,19 +528,8 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
         ratio = vol / mv5
         status = "✅" if ratio >= 1.5 else "⚠️" if ratio >= 1.2 else "❌"
         return _result(claim, status, f"{day} 成交 {vol:,} 張，為 5 日均量 {mv5:,} 張的 {ratio:.1f} 倍")
-    if re.search(r"KD", claim, re.IGNORECASE) and re.search(r"金叉|黃金交叉|交叉向上", claim):
-        kd = snap.get("kd") or {}
-        if kd.get("K9") is None or kd.get("D9") is None:
-            return _result(claim, "❓", "KD 資料不足")
-        ago = kd.get("cross_days_ago")
-        values = f"K {kd['K9']:.1f}／D {kd['D9']:.1f}"
-        if ago == 0:
-            return _result(claim, "✅", f"{day} {values}，當日黃金交叉")
-        if ago is not None:
-            return _result(claim, "✅", f"{day} {values}，{ago} 天前黃金交叉")
-        if kd["K9"] > kd["D9"]:
-            return _result(claim, "⚠️", f"{day} {values}，K 在 D 之上，但近 3 日沒有交叉")
-        return _result(claim, "❌", f"{day} {values}，K 仍在 D 之下")
+    if re.search(r"KD|K值|K線值|D值", claim, re.IGNORECASE):
+        return _check_kd(claim, snap.get("kd") or {}, day)
     if re.search(r"突破.*(前高|新高|20日高)", claim):
         high = snap.get("high_20d")
         if high is None or close is None:
@@ -441,8 +537,8 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
         gap = (close / high - 1) * 100
         status = "✅" if gap >= 0 else "⚠️" if gap >= -1 else "❌"
         return _result(claim, status, f"{day} 收盤 {close:g}，近 20 日高 {high:g}")
-    for label in ("外資", "投信", "自營商"):
-        if label[:2] in claim and re.search(r"買超|賣超|買|賣", claim):
+    for label, keyword in (("外資", "外資"), ("投信", "投信"), ("自營商", "自營"), ("三大法人", "法人")):
+        if keyword in claim and re.search(r"買超|賣超|買|賣", claim):
             if not inst:
                 return _result(claim, "❓", "三大法人資料取不到")
             value = inst["buy_day"].get(label)
@@ -634,7 +730,8 @@ def build_review(req: Dict[str, Any]) -> Dict[str, Any]:
 # Gemini：讀結構化事實，挑 2～4 個值得記錄的重點，寫成投資人自己的覆盤筆記（固定 JSON 欄位）
 # ============================================================
 
-HEADLINE_MAX, BODY_MAX, HIGHLIGHT_MAX, WATCH_MAX = 40, 170, 40, 50
+HEADLINE_MAX, BODY_MAX, HIGHLIGHT_MAX, WATCH_MAX = 32, 120, 34, 40
+HIGHLIGHT_FACETS = ("理由", "過程", "學習")     # 本次記住的三條固定分別講這三件事
 
 
 def ai_schema(mode: str) -> Dict[str, Any]:
@@ -648,15 +745,24 @@ def ai_schema(mode: str) -> Dict[str, Any]:
 
 REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」。review_data 是程式整理好的事實，你只負責讀懂、挑重點、用自然的話寫出來。
 
-先想清楚這筆交易真正值得記下的 2～4 件事（例如：原始理由和當天資料不符、進場位置好不好、進場後回撤大不大、
-籌碼判斷有沒有對到事實），其他沒價值的就不要寫。每筆交易重點不同，寫出來的內容也要不同，不要套同一個模板。
+圖片上已經有統計列（買進日、買進價、現價、報酬、最大浮盈、最大回撤、持有天數）和逐條理由核對，
+文字不要再把這些數字重報一次；要寫的是「這些數字代表什麼」。每筆交易重點不同，不要套同一個模板。
 
 回傳 JSON：
-- headline：一句話的覆盤結論，20～35 字。
-- body：覆盤正文 90～150 字，像投資人自己寫的交易日記：自然、簡潔、客觀，台灣投資人的口吻。
-- highlights：2～3 條，每條最多 35 字，是這筆交易最值得記錄的重點（不必分成做對／做錯）。
-- watch（持倉中）：目前最值得觀察的一件事，最多 45 字。
-- lesson（已賣出）：這筆交易下次最值得沿用或修正的一件事，最多 45 字。
+- headline：一句話的覆盤結論，15～28 字，例如「分點籌碼理由有對到，但進場後仍經歷明顯震盪」。
+- body：60～100 字，像投資人自己寫的交易日記，自然、簡潔、客觀、台灣投資人口吻。
+  講這筆交易的核心邏輯有沒有對到、進場後實際承受了什麼、最值得記住的一件事。
+  統計列已有的數字最多只引用一個（通常是最大回撤），不要逐一列出日期、價格、報酬。
+  好的例子：「這筆進場的核心是國票台南分點訊號，回頭核對確實有對到。進場後並不是一路上漲，中間最大回撤約 8%，之後才重新轉強。比較值得記的是，籌碼理由成立，但進場位置仍有不小的震盪空間。」
+- highlights：剛好 3 條、每條最多 30 字，順序固定、三條講不同的事，不要三條都在講結果：
+  1. 理由：原始進場邏輯是否成立（依 reason_checks）。
+  2. 過程：這筆交易進場後真正承受了什麼風險（例如回撤多深、震盪多久）。
+  3. 學習：下次同類型進場要注意或可沿用什麼。
+  不要把「目前報酬多少」當成一條重點。
+- watch（持倉中）：目前最值得觀察的「一件事」，最多 35 字，要具體、自然。
+  若要提價位，只從 current.nearest_supports 挑最近的一個（例如「突破後能否守住 10 日線」）；
+  不要用「跌破布林上軌」當風險條件，也不要列一串條件。
+- lesson（已賣出）：這筆交易下次最值得沿用或修正的一件事，最多 35 字。
 
 一定要遵守：
 1. 所有數字（價格、報酬、KD、法人張數、日期）只能照抄 review_data，不能自己算、不能自己編。
@@ -710,13 +816,16 @@ def fallback_review(payload: Dict[str, Any]) -> Dict[str, Any]:
         headline = "部分進場理由缺資料，無法核對"
     else:
         headline = "進場理由都與當天資料相符"
-    state = "實現" if payload["mode"] == "closed" else "目前"
-    body = (f"原始理由：{t.get('entry_reason_raw') or '、'.join(t['entry_reasons'])}。"
-            f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%、最大浮盈 {a['max_gain_pct']:+.2f}%，"
-            f"{state}報酬 {a['return_pct']:+.2f}%（進場後走勢，不是原始理由）。")
-    highlights = [f"{c['status']} {c['claim']}：{c['evidence']}" for c in checks][:3]
-    if len(highlights) < 2:
-        highlights.append(f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%")
+    body = (f"原始理由是{t.get('entry_reason_raw') or '、'.join(t['entry_reasons'])}，"
+            f"核對結果見上方。進場後最大回撤 {a['max_drawdown_pct']:+.2f}%，這是進場後的走勢，不是原始理由。")
+    good = [c["claim"] for c in checks if c["status"] == "✅"]
+    wrong = [c["claim"] for c in checks if c["status"] in ("❌", "⚠️")]
+    reason_line = (f"{'、'.join(wrong[:2])}與當天資料不完全相符" if wrong
+                   else f"{'、'.join(good[:2])}有對到" if good else "進場理由缺資料可核對")
+    process_line = (f"進場後曾回撤 {a['max_drawdown_pct']:+.2f}%，並非低風險位置" if a["max_drawdown_pct"] <= -5
+                    else f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%，過程相對平穩")
+    learn_line = (f"下次下單前先核對{wrong[0]}" if wrong else "訊號成立時，再搭配價格結構確認進場位置")
+    highlights = [reason_line, process_line, learn_line]
     current = payload.get("current") or {}
     review = {"headline": headline, "body": body, "highlights": highlights}
     if payload["mode"] == "closed":
@@ -724,7 +833,9 @@ def fallback_review(payload: Dict[str, Any]) -> Dict[str, Any]:
         review["lesson"] = (f"賣出後 {post['days_available']} 個交易日收盤相對賣價 {post['close_change_pct']:+.2f}%"
                             if post.get("days_available") else "賣出後還沒有足夠的交易日可以比較")
     else:
-        review["watch"] = (f"目前{current.get('pattern_label') or '結構'}，均線{current.get('ma_alignment') or '—'}"
+        support = next((s for s in current.get("nearest_supports") or [] if s.get("label")), None)
+        review["watch"] = (f"能否守住{support['label']}（{support['price']:g}）" if support and support.get("price")
+                           else f"目前{current.get('pattern_label') or '結構'}，觀察突破後結構是否能維持"
                            if current else "目前結構資料暫時取不到")
     return review
 
@@ -748,20 +859,21 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
         "body": clean(data.get("body"), BODY_MAX) or fallback["body"],
         last: clean(data.get(last), WATCH_MAX) or fallback[last],
     }
-    highlights = [clean(h, HIGHLIGHT_MAX) for h in (data.get("highlights") or [])[:3]]
-    highlights = [h for h in highlights if h]
-    for extra in fallback["highlights"]:
-        if len(highlights) >= 2:
-            break
-        highlights.append(_clip(extra, HIGHLIGHT_MAX))
-    review["highlights"] = highlights[:3]
+    # 三條依序是 理由／過程／學習：哪一條被刪光，就用 fallback 同一個位置補，順序不亂
+    raw = list(data.get("highlights") or [])[:3]
+    raw += [""] * (3 - len(raw))
+    review["highlights"] = [clean(h, HIGHLIGHT_MAX) or _clip(fb, HIGHLIGHT_MAX)
+                            for h, fb in zip(raw, fallback["highlights"])]
     return review, removed_all
 
 
 def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
     """Discord 文字版（圖片以外的純文字、LOG 與存檔用）。"""
     last_label, last_key = (("下次", "lesson") if payload["mode"] == "closed" else ("目前觀察", "watch"))
-    lines = [review["headline"], "", review["body"], ""]
+    summary = "｜".join(text for text, _ in review_summary(payload))
+    lines = [summary, "", f"我的理由｜{payload['trade'].get('entry_reason_raw', '')}"]
+    lines += [f"{c['status']} {c['claim']}｜{c['evidence']}" for c in payload["reason_checks"]]
+    lines += ["", review["headline"], review["body"], "", "本次記住"]
     lines += [f"• {h}" for h in review["highlights"]]
     lines += ["", f"{last_label}｜{review.get(last_key, '')}"]
     return "\n".join(lines).strip()
@@ -780,22 +892,36 @@ def _price(value: Optional[float]) -> str:
     return f"{value:,.0f}" if value >= 100 else f"{value:g}"
 
 
-def review_stats(payload: Dict[str, Any]) -> List[Tuple[str, str, str]]:
-    """覆盤卡最上面的統計列（程式數字，不經 AI）。"""
+def review_summary(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """覆盤卡標題下的一行摘要（程式數字，不經 AI）：[(文字, 顏色)]，渲染端用「｜」串起來。
+    持倉中：09/11 @30.2｜現價 36.65（盤中）｜+21.36%｜MFE +21.36%｜MAE -8.11%｜持有 7 日
+    已賣出：09/11 @30.2 → 09/20 @36.5｜實現 +20.86%｜MFE …｜MAE …｜持有 …"""
     t, a = payload["trade"], payload["after_buy"]
-    closed = payload["mode"] == "closed"
-    live = str(a.get("price_basis", "")).startswith("盤中")
-    stats = [("買進日期", t["buy_date"][5:], ""), ("買進價格", _price(t["buy_price"]), "")]
-    if closed:
-        stats += [(f"賣出 {str(t.get('sell_date') or '')[5:]}", _price(t.get("sell_price")), ""),
-                  ("實現報酬", f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
+    live = "（盤中）" if str(a.get("price_basis", "")).startswith("盤中") else ""
+    if payload["mode"] == "closed":
+        parts = [(f"{t['buy_date'][5:]} @{_price(t['buy_price'])} → {str(t.get('sell_date') or '')[5:]} "
+                  f"@{_price(t.get('sell_price'))}", ""),
+                 (f"實現 {a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
     else:
-        stats += [("現價（盤中）" if live else "現價", _price(a.get("last_price")), ""),
-                  ("帳面報酬", f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
-    stats += [("最大浮盈", f"{a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
-              ("最大回撤", f"{a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
-              ("持有天數", f"{a['trading_days']} 日", "")]
-    return stats
+        parts = [(f"{t['buy_date'][5:]} @{_price(t['buy_price'])}", ""),
+                 (f"現價 {_price(a.get('last_price'))}{live}", ""),
+                 (f"{a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
+    parts += [(f"MFE {a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
+              (f"MAE {a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
+              (f"持有 {a['trading_days']} 日", "")]
+    return parts
+
+
+_STATUS_RANK = {"❌": 3, "⚠️": 2, "❓": 1, "✅": 0}
+
+
+def highlight_icons(payload: Dict[str, Any]) -> List[str]:
+    """本次記住三條的圖示（程式決定，不看 AI 文字）：理由＝理由核對裡最差的狀態、
+    過程＝最大回撤 ≤ -5% 為 ⚠️ 否則 ✅、學習＝💡。"""
+    checks = payload.get("reason_checks") or []
+    reason = max((c["status"] for c in checks), key=lambda s: _STATUS_RANK.get(s, 1)) if checks else "❓"
+    process = "⚠️" if payload["after_buy"]["max_drawdown_pct"] <= -5 else "✅"
+    return [reason, process, "💡"]
 
 
 def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -> Dict[str, Any]:
@@ -810,7 +936,8 @@ def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -
         "last_text": review.get("lesson" if closed else "watch", ""),
         "source": source,
         "reason_raw": payload["trade"].get("entry_reason_raw", ""),
-        "stats": review_stats(payload),
+        "summary": review_summary(payload),
+        "highlight_icons": highlight_icons(payload),
         "checks": checks,
     }}
 
