@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import io
+import math
 import os
 import re
 import shutil
@@ -255,6 +256,9 @@ def detect_question_intents(question: str) -> Tuple[str, Set[str]]:
     intents = {intent for intent, words in INTENT_KEYWORDS.items() if any(w.upper() in upper for w in words)}
     if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
         intents.discard("warrant")   # 外資買超、投信買超、自營商、三大法人不是權證
+    if (_INSTITUTIONAL_RE.search(question or "") or "籌碼" in (question or "")) and not _EXPLICIT_WARRANT_RE.search(question or ""):
+        intents.add("institutional")  # 「2330籌碼最近怎麼樣」「外資今天買超多少」→ 三大法人（一般會員可用）
+        intents.discard("warrant")    # 沒提權證／分點的「籌碼」是三大法人，不是權證分點
     if "部位" not in normalized and (_MA_SYNONYM_RE.search(question or "") or "整理" in (question or "")):
         intents.discard("position")  # 「還在月線上嗎」「還在整理嗎」的「還在」不是問分點部位
     return normalized, intents
@@ -632,6 +636,115 @@ def format_index_comparison(comparison: Dict[str, Any]) -> str:
         verdict = "；".join(f"{labels[k]}：{v}較強" for k, v in comparison["stronger"].items())
         lines.append(f"同一時間點（{a['timestamp']}）比較：{verdict or '兩邊相同或資料不足'}")
     return chr(10).join(lines)
+
+
+def _num(value: Any) -> Optional[float]:
+    try:
+        number = float(str(value).replace("%", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pct_cell(value: Any, signed: bool = False) -> str:
+    number = _num(value)
+    if number is None:
+        return "-" if value in (None, "") else str(value)
+    return f"{number:+.2f}%" if signed else f"{number:.2f}%"
+
+
+def _days_cell(value: Any) -> str:
+    number = _num(value)
+    return "-" if number is None else f"{number:.1f} 天"
+
+
+def _perf_tiles(p: Dict[str, Any]) -> List[Dict[str, str]]:
+    count = f"{_num(p.get('included_count')) or 0:.0f} 筆"
+    if _num(p.get("unresolved_count")):
+        count += f"（未完成 {_num(p.get('unresolved_count')):.0f}）"
+    return [
+        {"label": "勝率", "value": _pct_cell(p.get("raw_win_rate")), "tone": "accent"},
+        {"label": "修正勝率", "value": _pct_cell(p.get("adjusted_win_rate")), "tone": "ink"},
+        {"label": "加權報酬", "value": _pct_cell(p.get("weighted_return"), True), "tone": "signed"},
+        {"label": "平均持有", "value": _days_cell(p.get("avg_holding_days")), "tone": "ink"},
+        {"label": "納入樣本", "value": count, "tone": "ink"},
+    ]
+
+
+def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str, Any]]:
+    """分點問題（勝率／近期買賣）的圖卡資料：數字卡＋比較條＋表格＋買賣超清單，和其他研究筆記同一套視覺。"""
+    card: Dict[str, Any] = {"branch": "", "tags": [], "sections": []}
+    sections = card["sections"]
+    for r in results:
+        d = r.data if r.ok else {}
+        if not d.get("found"):
+            continue
+        card["branch"] = card["branch"] or str(d.get("branch") or "")
+        if r.name == "get_branch_event_performance":
+            event = str(d.get("event_type") or "")
+            if event and event != "overall":
+                background = d.get("overall_background") or {}
+                card["tags"].append(f"{event} 事件勝率")
+                sections.append({"type": "heading", "text": f"{event} 事件歷史績效"})
+                sections.append({"type": "tiles", "items": _perf_tiles(d)})
+                sections.append({"type": "bars", "title": "勝率比較（修正前）", "items": [
+                    {"label": f"{event} 事件", "value": _num(d.get("raw_win_rate")), "main": True},
+                    {"label": "全部事件（背景）", "value": _num(background.get("raw_win_rate")), "main": False}]})
+                if background:
+                    sections.append({"type": "note", "text": (
+                        f"全部事件背景：勝率 {_pct_cell(background.get('raw_win_rate'))}（修正 {_pct_cell(background.get('adjusted_win_rate'))}）"
+                        f"｜納入 {_num(background.get('included_count')) or 0:.0f} 筆｜加權報酬 {_pct_cell(background.get('weighted_return'), True)}"
+                        f"｜平均持有 {_days_cell(background.get('avg_holding_days'))}")})
+                if d.get("small_sample"):
+                    sections.append({"type": "badge", "text": "樣本少：勝率只供參考"})
+            else:
+                card["tags"].append("A～E 事件勝率")
+                rows = [[f"{code} 事件", _pct_cell(d[code].get("raw_win_rate")), _pct_cell(d[code].get("adjusted_win_rate")),
+                         _pct_cell(d[code].get("weighted_return"), True), f"{_num(d[code].get('included_count')) or 0:.0f}",
+                         _days_cell(d[code].get("avg_holding_days"))] for code in tools.EVENT_CODES if d.get(code)]
+                overall = d.get("overall") or {}
+                if overall:
+                    rows.append(["全部合併", _pct_cell(overall.get("raw_win_rate")), _pct_cell(overall.get("adjusted_win_rate")),
+                                 _pct_cell(overall.get("weighted_return"), True), f"{_num(overall.get('included_count')) or 0:.0f}",
+                                 _days_cell(overall.get("avg_holding_days"))])
+                sections.append({"type": "heading", "text": "A～E 事件歷史績效"})
+                sections.append({"type": "table", "columns": ["事件", "勝率", "修正勝率", "加權報酬", "筆數", "平均持有"],
+                                 "rows": rows})
+            if d.get("adjusted_method"):
+                sections.append({"type": "note", "text": f"※ {d['adjusted_method']}；未完成事件不算勝。"})
+        elif r.name == "get_branch_performance":
+            overall = d.get("overall_all_events") or {}
+            card["tags"].append("歷史績效")
+            sections.append({"type": "heading", "text": "歷史績效（全部事件）"})
+            if overall:
+                sections.append({"type": "tiles", "items": [
+                    {"label": "勝率", "value": _pct_cell(overall.get("win_rate_pct")), "tone": "accent"},
+                    {"label": "加權報酬", "value": _pct_cell(overall.get("weighted_return_pct"), True), "tone": "signed"},
+                    {"label": "事件數", "value": f"{_num(overall.get('event_count')) or 0:.0f} 筆", "tone": "ink"},
+                    {"label": "平均持有", "value": _days_cell(overall.get("avg_holding_days")), "tone": "ink"}]})
+            rows = [[str(row.get("event_type") or ""), _pct_cell(row.get("win_rate")), _pct_cell(row.get("weighted_return"), True),
+                     f"{_num(row.get('event_count')) or 0:.0f}", _days_cell(row.get("avg_holding_days"))]
+                    for row in d.get("by_event_type") or [] if not str(row.get("event_type", "")).startswith("全部")]
+            if rows:
+                sections.append({"type": "table", "columns": ["事件", "勝率", "加權報酬", "筆數", "平均持有"], "rows": rows})
+            sections.append({"type": "note", "text": "※ 勝率含實際出清與持有滿60日估值；歷史勝率不代表未來結果。"})
+        elif r.name == "get_branch_recent_trades":
+            card["tags"].append("近期權證買賣")
+            sections.append({"type": "heading", "text": f"近10日權證買賣（{d.get('period') or d.get('snapshot_date') or '-'}）"})
+            sections.append({"type": "lists", "items": [
+                {"title": "淨買超", "tone": "up", "rows": [
+                    {"name": f"{x.get('stock_name', '')}（{x.get('stock_code', '')}）", "value": str(x.get("net_amount_text") or "-"),
+                     "extra": f"權證 {x.get('warrant_count')} 檔" if x.get("warrant_count") else ""}
+                    for x in (d.get("net_buy_stocks") or [])[:8]]},
+                {"title": "淨賣超", "tone": "down", "rows": [
+                    {"name": f"{x.get('stock_name', '')}（{x.get('stock_code', '')}）", "value": str(x.get("net_amount_text") or "-"),
+                     "extra": ""}
+                    for x in (d.get("net_sell_stocks") or [])[:8]]}]})
+            events = d.get("recent_abcde_events_30d") or []
+            if events:
+                sections.append({"type": "chips", "title": "近30日 A～E 事件", "items": [
+                    f"{e.get('標的名稱', '')} {e.get('事件代碼', '')}｜{str(e.get('事件日', ''))[5:]}" for e in events[:8]]})
+    return card if sections else None
 
 
 def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
@@ -1298,7 +1411,30 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
         if key in tool_results or suffix:
             key = f"{key}:{suffix}" if suffix else f"{key}:{len(tool_results)}"
         tool_results[key] = data
-    return _prune_empty({"question": question, "tool_results": tool_results})
+    return _prune_empty({"question": question, "question_focus": question_focus(question), "tool_results": tool_results})
+
+
+_FOCUS_RULES = (
+    (re.compile(r"量有?出來|量有?放大|爆量|量縮|帶量|放量|量增|量能|成交量|量比|窒息量"), "量能"),
+    (re.compile(r"外資|投信|自營商|三大法人|法人|籌碼"), "三大法人籌碼"),
+    (re.compile(r"支撐|壓力|有撐|有壓|撐在|壓在|卡在"), "支撐壓力"),
+    (re.compile(r"月線|季線|週線|年線|均線|[0-9]{1,3}日線?"), "均線位置"),
+)
+
+
+def question_focus(question: str) -> List[str]:
+    """使用者真正問的重點；最終回答第一段要先直接回答這些，不能只寫一般技術面。"""
+    text = re.sub(r"（延續上一題[^）]*）", "", question or "")
+    if re.search(r"權證|分點", text):
+        text = re.sub(r"籌碼", "", text)   # 權證分點籌碼走權證規則，不是三大法人
+    return [label for pattern, label in _FOCUS_RULES if pattern.search(text)]
+
+
+FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
+                     "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
+                     "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
+                     "明講偏買或偏賣，並註明是收盤後資料；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
+                     "重點需要的資料若失敗或沒有，第一句就說明取不到，不可改寫成一般技術面來帶過。")
 
 
 FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要 15:00 後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再分別列加權與櫃買的拉升 TOP5、拖累 TOP5；每檔優先引用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
@@ -1311,6 +1447,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     """只放這題用得到的規則：技術面、新聞、型態評分卡各自一段，避免每題都送全部規則。"""
     names = {key.split(":", 1)[0] for key in (payload.get("tool_results") or {})}
     sections = [FINAL_BASE_PROMPT]
+    if payload.get("question_focus"):
+        sections.append(FINAL_FOCUS_RULES)
     if names & {"get_technical_analysis", "get_pattern_scorecard", "get_volume_profile"}:
         sections.append(FINAL_TECH_RULES)
     if "get_recent_news" in names:
@@ -2368,6 +2506,7 @@ _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|�
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
+MEMORY_RESET_MESSAGE = "🔄 已重新開始：上一題的股票與分點不會再自動延續，請直接輸入想問的股票。"
 _FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
 # 打招呼、閒聊這類不該接上一題的句子。
 _SMALLTALK_RE = re.compile(r"^(你好|哈囉|hi|hello|在嗎|嗨|謝謝|感謝|早安|午安|晚安|測試)")
@@ -2594,7 +2733,7 @@ class AceQueryEngine:
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
             self._clear_draft_session(context_key)
-            return AnswerResult(text="好的，已清除上一題的內容，接下來請直接輸入想問的股票。", route="memory_reset", gemini_calls=0, elapsed=0.0)
+            return AnswerResult(text=MEMORY_RESET_MESSAGE, route="memory_reset", gemini_calls=0, elapsed=0.0, as_text=True)
         # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
         if weekly_pick.is_admin_moneydj_image_question(question):
             if not (is_admin and admin_mode):
@@ -3333,6 +3472,12 @@ class AceQueryEngine:
         )
         if plan.clarification:
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
+        if "institutional" in parsed.intents and plan.route != "rule_sector":
+            planned = {(c.name, c.kwargs.get("stock_code")) for c in plan.tool_calls}
+            for code, _ in parsed.stocks:
+                if code not in tools.INDEX_CODES and ("get_institutional_flow", code) not in planned:
+                    plan.add("get_institutional_flow", stock_code=code)
+                    plan.need_final_llm = True
 
         if plan.route == "rule_sector":
             return self._answer_sector(parsed.sector, started)
@@ -3384,6 +3529,17 @@ class AceQueryEngine:
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
             panels.append(panel)
+        if plan.route == "rule_branch":
+            branch_card = build_branch_card(results)
+            if branch_card:
+                # 規則式回答時只顯示圖卡（文字版留給 Log）；有 AI 分析時圖卡下方再接文字。
+                panels.append({"branch_card": branch_card, "hide_text": not plan.need_final_llm})
+        for panel in panels:
+            flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"
+                         and r.data.get("stock_code") == panel.get("stock_code")), None)
+            if flow and panel.get("bars"):
+                dates = {bar["date"] for bar in panel["bars"]}
+                panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
             for panel in panels:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
@@ -3675,32 +3831,40 @@ def queue_admin_alert(client, config: "BotConfig", kind: str, detail: str, *, us
 
 
 async def send_access_denial(interaction, text, required, public=False):
-    """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。"""
+    """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。
+    WARRANT＝權證解鎖圖＋網址＋按鈕；GENERAL（guest）＝會員專屬圖（不放購買連結）；圖片失敗才退回完整文字。"""
     import discord
     options = {"content": text, "ephemeral": not public}
+    render = {"WARRANT": answer_image.make_locked_attachment,
+              "GENERAL": answer_image.make_member_only_attachment}.get(required)
     edit_original = public and interaction.response.is_done()
-    if required == "WARRANT" and not interaction.response.is_done():
-        # 未解鎖圖要 render（約 1 秒）：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
+    if render and not interaction.response.is_done():
+        # 圖片要讀檔或 render：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
         await interaction.response.defer(thinking=True, ephemeral=not public)
         edit_original = True
     if required == "WARRANT":
-        # 圖片只是視覺提示；可點的網址與 Link Button 一定放在訊息本身。
+        # 可點的網址與 Link Button 一定放在訊息本身。
         options["content"] += "\n\n網址：\n" + access_policy.UNLOCK_URL
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="🔓 前往解鎖權證系統", url=access_policy.UNLOCK_URL))
         options["view"] = view
+    if render:
         try:
-            data, extension = await asyncio.to_thread(answer_image.make_locked_attachment)
-            options["file"] = discord.File(io.BytesIO(data), filename=f"ace-locked.{extension}")
-            # 有圖時只貼圖＋網址（<> 關掉 Skool 連結預覽），說明文字都在圖上。
-            options["content"] = f"<{access_policy.UNLOCK_URL}>"
-        except Exception as exc:  # 圖片失敗仍送完整文字＋網址＋按鈕
-            print(f"⚠️ 未解鎖圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
+            data, extension = await asyncio.to_thread(render)
+            name = "ace-locked" if required == "WARRANT" else "ace-members-only"
+            options["file"] = discord.File(io.BytesIO(data), filename=f"{name}.{extension}")
+            # 有圖時說明文字都在圖上：權證只留網址（<> 關掉連結預覽），guest 只貼圖。
+            options["content"] = f"<{access_policy.UNLOCK_URL}>" if required == "WARRANT" else None
+        except Exception as exc:  # 圖片失敗仍送完整文字（權證另有網址＋按鈕）
+            print(f"⚠️ 權限提示圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
     if edit_original:
         file = options.pop("file", None)
         options.pop("ephemeral")
         await interaction.edit_original_response(attachments=[file] if file else [], **options)
-    elif interaction.response.is_done():
+        return
+    if options.get("content") is None:
+        options.pop("content", None)
+    if interaction.response.is_done():
         await interaction.delete_original_response()
         await interaction.followup.send(**options)
     else:
@@ -4239,7 +4403,11 @@ def run_discord_bot(config: BotConfig) -> None:
             lag = (f"｜delivery={locals().get('delivery', -1):.2f}s｜pre_defer={locals().get('pre_defer', -1):.2f}s"
                    f"｜loop_lag={locals().get('loop_lag', -1):.2f}s｜deferred={interaction.response.is_done()}")
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}{lag}", flush=True)
-            queue_admin_alert(client, config, "Discord 回覆失敗", f"{exc}{lag}", user=who, question=question)
+            hint = ""
+            if getattr(exc, "code", None) == 10062 and 0 <= locals().get("delivery", -1) < 1 and not interaction.response.is_done():
+                # 1 秒內就 defer 卻說互動不存在：幾乎都是另一個 Bot 程式（舊部署／本機）用同一個 Token 先回覆了。
+                hint = "｜送達很快仍失效：通常是有另一個 Bot 程式用同一個 Token 在執行（舊部署、另一個 Railway 服務或本機）"
+            queue_admin_alert(client, config, "Discord 回覆失敗", f"{exc}{lag}{hint}", user=who, question=question)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()   # 印出檔名與行號，numpy/pandas 這類例外沒有堆疊就無法定位

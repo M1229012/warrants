@@ -1950,6 +1950,168 @@ NOTE_BG, NOTE_INK = '#FFF4E8', '#B45309'           # AI 覆盤的暖色底
 WATCH_BG = '#F3F0FF'
 
 
+def _is_branch_panel(panel: dict) -> bool:
+    return isinstance((panel or {}).get('branch_card'), dict)
+
+
+def _tone_color(text: str, tone: str) -> str:
+    if tone == 'accent':
+        return ACCENT
+    if tone in ('signed', 'auto'):
+        value = str(text).strip()
+        return UP if value.startswith('+') else DOWN if value.startswith('-') and value != '-' else INK
+    return {'up': UP, 'down': DOWN}.get(tone, INK)
+
+
+def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bool) -> int:
+    """分點圖卡的單一區塊；回傳高度。dry=True 只算高度。"""
+    kind = section.get('type')
+    width = x1 - x0
+    if kind == 'heading':
+        if not dry:
+            draw.rectangle((x0, y + 8, x0 + 5, y + 36), fill=ACCENT)
+            text_at(draw, (x0 + 18, y + 4), section['text'], 27, INK, True)
+        return 54
+    if kind == 'tiles':
+        items = section.get('items') or []
+        gap, tile_h = 14, 112
+        tile_w = (width - gap * (len(items) - 1)) / max(1, len(items))
+        if not dry:
+            for i, item in enumerate(items):
+                tx = x0 + i * (tile_w + gap)
+                draw.rounded_rectangle((tx, y, tx + tile_w, y + tile_h), radius=14, fill=TILE_BG)
+                text_at(draw, (tx + 20, y + 16), item['label'], 20, MUTED)
+                value, size = fit(item['value'], 38, tile_w - 36, True, 22)
+                text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
+        return tile_h + 22
+    if kind == 'bars':
+        items = section.get('items') or []
+        head, row_h = 36, 46
+        if not dry:
+            text_at(draw, (x0, y + 4), section.get('title', ''), 21, MUTED, True)
+            label_w, value_w = 250, 120
+            for i, item in enumerate(items):
+                ry = y + head + i * row_h
+                text_at(draw, (x0, ry + 8), item['label'], 23, INK, bool(item.get('main')))
+                bx0, bx1 = x0 + label_w, x1 - value_w
+                draw.rounded_rectangle((bx0, ry + 10, bx1, ry + 34), radius=12, fill=TILE_BG)
+                value = item.get('value')
+                if value is not None:
+                    fill = bx0 + (bx1 - bx0) * max(0.0, min(100.0, float(value))) / 100
+                    if fill > bx0 + 4:
+                        draw.rounded_rectangle((bx0, ry + 10, fill, ry + 34), radius=12,
+                                               fill=ACCENT if item.get('main') else '#9AA4B2')
+                draw.text((x1, ry + 22), f'{value:.2f}%' if value is not None else '-', font=font(23, True),
+                          fill=INK, anchor='rm')
+        return head + len(items) * row_h + 10
+    if kind == 'table':
+        columns, rows = section.get('columns') or [], section.get('rows') or []
+        head_h, row_h = 42, 46
+        first = width * 0.24
+        rest = (width - first) / max(1, len(columns) - 1)
+        if not dry:
+            draw.rounded_rectangle((x0, y, x1, y + head_h), radius=10, fill=TILE_BG)
+            for c, name in enumerate(columns):
+                cx = x0 + 18 if c == 0 else x0 + first + rest * c - 18
+                draw.text((cx, y + head_h / 2), name, font=font(20, True), fill=MUTED, anchor='lm' if c == 0 else 'rm')
+            for r, row in enumerate(rows):
+                ry = y + head_h + r * row_h
+                if r % 2:
+                    draw.rectangle((x0, ry, x1, ry + row_h), fill='#FAFBFC')
+                bold = str(row[0]).startswith('全部')
+                for c, cell in enumerate(row):
+                    cx = x0 + 18 if c == 0 else x0 + first + rest * c - 18
+                    color = _tone_color(cell, 'auto') if columns[c] == '加權報酬' else (ACCENT if columns[c] == '勝率' else INK)
+                    draw.text((cx, ry + row_h / 2), str(cell), font=font(22, c == 0 or bold or columns[c] == '勝率'),
+                              fill=color, anchor='lm' if c == 0 else 'rm')
+                draw.line((x0, ry + row_h, x1, ry + row_h), fill=GRID)
+        return head_h + len(rows) * row_h + 20
+    if kind == 'lists':
+        boxes = section.get('items') or []
+        gap, row_h, head_h = 20, 44, 52
+        count = max([len(b.get('rows') or []) for b in boxes] + [1])
+        height = head_h + count * row_h + 16
+        if not dry:
+            box_w = (width - gap * (len(boxes) - 1)) / max(1, len(boxes))
+            for i, box in enumerate(boxes):
+                bx = x0 + i * (box_w + gap)
+                color = _tone_color('', box.get('tone', 'ink'))
+                draw.rounded_rectangle((bx, y, bx + box_w, y + height), radius=14, fill='white', outline=LINE, width=2)
+                draw.rounded_rectangle((bx, y, bx + box_w, y + head_h - 8), radius=14, fill=UP_BG if box.get('tone') == 'up' else DOWN_BG)
+                draw.rectangle((bx, y + head_h - 22, bx + box_w, y + head_h - 8), fill=UP_BG if box.get('tone') == 'up' else DOWN_BG)
+                text_at(draw, (bx + 18, y + 10), box['title'], 23, color, True)
+                rows = box.get('rows') or []
+                if not rows:
+                    text_at(draw, (bx + 18, y + head_h + 8), '這段期間沒有紀錄', 21, MUTED)
+                for r, row in enumerate(rows):
+                    ry = y + head_h + r * row_h
+                    draw.ellipse((bx + 18, ry + 9, bx + 44, ry + 35), fill=ACCENT_BG)
+                    draw.text((bx + 31, ry + 22), str(r + 1), font=font(17, True), fill=ACCENT, anchor='mm')
+                    value_w = font(22, True).getlength(row['value'])
+                    name, size = fit(row['name'], 22, box_w - 90 - value_w - 20, False, 16)
+                    text_at(draw, (bx + 56, ry + 10), name, size, INK)
+                    draw.text((bx + box_w - 18, ry + 22), row['value'], font=font(22, True), fill=color, anchor='rm')
+        return height + 22
+    if kind == 'chips':
+        items = section.get('items') or []
+        title_h, chip_h, gap = 34, 38, 10
+        rows, line_w = 1, 0.0
+        for item in items:
+            w = font(20).getlength(item) + 28
+            if line_w and line_w + w > width:
+                rows, line_w = rows + 1, 0.0
+            line_w += w + gap
+        height = title_h + rows * (chip_h + gap) + 8
+        if not dry:
+            text_at(draw, (x0, y + 2), section.get('title', ''), 21, MUTED, True)
+            cx, cy = x0, y + title_h
+            for item in items:
+                w = font(20).getlength(item) + 28
+                if cx > x0 and cx + w > x1:
+                    cx, cy = x0, cy + chip_h + gap
+                draw.rounded_rectangle((cx, cy, cx + w, cy + chip_h), radius=19, fill=ACCENT_BG)
+                draw.text((cx + w / 2, cy + chip_h / 2), item, font=font(20), fill=ACCENT, anchor='mm')
+                cx += w + gap
+        return height + 10
+    if kind == 'badge':
+        if not dry:
+            w = font(20, True).getlength(section['text']) + 32
+            draw.rounded_rectangle((x0, y, x0 + w, y + 36), radius=18, fill=WARN_BG)
+            draw.text((x0 + w / 2, y + 18), section['text'], font=font(20, True), fill=WARN_INK, anchor='mm')
+        return 50
+    if kind == 'note':
+        lines = wrap(section.get('text', ''), 20, width, False)
+        if not dry:
+            for i, line in enumerate(lines):
+                text_at(draw, (x0, y + i * 30), line, 20, MUTED)
+        return len(lines) * 30 + 12
+    return 0
+
+
+def branch_card(draw, y: float, data: dict, dry: bool) -> int:
+    """分點勝率／近期買賣圖卡：數字卡、勝率比較條、事件表、買賣超清單，和 K 線／評分卡同一套卡片風格。"""
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    ix0, ix1 = x0 + 36, x1 - 36
+    head_h = 96
+    body = sum(_branch_section(None, ix0, ix1, 0, s, True) for s in data.get('sections') or [])
+    height = int(head_h + body + 24)
+    if dry:
+        return height
+    draw.rounded_rectangle((x0, y, x1, y + height), radius=20, fill='white', outline=LINE)
+    text_at(draw, (ix0, y + 28), data.get('branch') or '分點', 32, INK, True)
+    tag_x = ix0 + font(32, True).getlength(data.get('branch') or '分點') + 18
+    for tag in dict.fromkeys(data.get('tags') or []):
+        w = font(19, True).getlength(tag) + 26
+        draw.rounded_rectangle((tag_x, y + 32, tag_x + w, y + 64), radius=16, fill=ACCENT_BG)
+        draw.text((tag_x + w / 2, y + 48), tag, font=font(19, True), fill=ACCENT, anchor='mm')
+        tag_x += w + 10
+    draw.text((ix1, y + 48), '權證分點', font=font(20), fill=MUTED, anchor='rm')
+    cursor = y + head_h
+    for section in data.get('sections') or []:
+        cursor += _branch_section(draw, ix0, ix1, cursor, section, False)
+    return height
+
+
 def _is_review_panel(panel: dict) -> bool:
     return isinstance((panel or {}).get('review'), dict)
 
@@ -2145,8 +2307,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     article_panels = [p for p in panels if _is_article_panel(p)]
     contribution_panels = [p for p in panels if _is_contribution_panel(p)]
     review_panels = [p for p in panels if _is_review_panel(p)]
+    branch_panels = [p for p in panels if _is_branch_panel(p)]
     panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)
-              and not _is_contribution_panel(p) and not _is_review_panel(p)]
+              and not _is_contribution_panel(p) and not _is_review_panel(p) and not _is_branch_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
@@ -2154,7 +2317,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
     # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
-    blocks = [] if (sector_panels or article_panels or review_panels) else body_blocks(answer)
+    hide_text = sector_panels or article_panels or review_panels or any(p.get('hide_text') for p in branch_panels)
+    blocks = [] if hide_text else body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24
@@ -2164,6 +2328,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(_sector_block(None, 0, p, True) + 24 for p in sector_panels)
     panels_height += sum(article_card(None, 0, p['article'], True) + 24 for p in article_panels)
     panels_height += sum(review_card(None, 0, p['review'], True) + 24 for p in review_panels)
+    panels_height += sum(branch_card(None, 0, p['branch_card'], True) + 24 for p in branch_panels)
     height = header_height + panels_height + body_height + 112
     if review_panels:
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
@@ -2190,6 +2355,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += article_card(draw, y, panel['article'], False) + 24
     for panel in review_panels:
         y += review_card(draw, y, panel['review'], False) + 24
+    for panel in branch_panels:
+        y += branch_card(draw, y, panel['branch_card'], False) + 24
     if blocks:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
@@ -2304,6 +2471,106 @@ def render_locked_warrant() -> Image.Image:
     draw.line((left, 930, right, 930), fill=LINE, width=2)
     text_at(draw, (left, 948), '股市艾斯  /  AI 資料整理', 22, MUTED)
     return add_center_watermarks(image).convert('RGB')
+
+
+MEMBER_ASSET = Path(__file__).with_name('assets') / 'member_only.webp'
+MEMBER_TITLE = ('艾斯 AI ', '會員專屬', '功能')
+MEMBER_SUBTITLE = '此 AI 分析功能僅開放艾斯會員使用。'
+MEMBER_FEATURES = (('個股技術分析', '型態評分與關鍵價位', 'candle'),
+                   ('大盤與族群觀察', '加權櫃買、族群強弱', 'bars'),
+                   ('盤中即時追問', '支撐壓力、量能變化', 'chat'))
+MEMBER_HINT = '已是艾斯會員？請確認 Discord 身分組後再試一次'
+
+
+def _member_icon(draw, cx: float, cy: float, kind: str, color: str) -> None:
+    if kind == 'candle':
+        for dx, top, bottom, body_top, body_bottom in ((-26, -34, 30, -18, 14), (0, -40, 22, -30, 4), (26, -24, 36, -8, 24)):
+            draw.line((cx + dx, cy + top, cx + dx, cy + bottom), fill=color, width=4)
+            draw.rounded_rectangle((cx + dx - 9, cy + body_top, cx + dx + 9, cy + body_bottom), radius=3, fill=color)
+    elif kind == 'bars':
+        for i, h in enumerate((26, 44, 62)):
+            x = cx - 36 + i * 28
+            draw.rounded_rectangle((x, cy + 32 - h, x + 18, cy + 32), radius=4, fill=color)
+        draw.line((cx - 42, cy + 36, cx + 44, cy + 36), fill=color, width=4)
+    else:
+        draw.rounded_rectangle((cx - 42, cy - 32, cx + 42, cy + 22), radius=16, outline=color, width=5)
+        draw.polygon((cx - 18, cy + 20, cx - 30, cy + 40, cx - 2, cy + 22), fill=color)
+        for dx in (-18, 0, 18):
+            draw.ellipse((cx + dx - 5, cy - 10, cx + dx + 5, cy), fill=color)
+
+
+def render_member_only() -> Image.Image:
+    """無會員權限（guest）提示圖：深藍科技風，和權證解鎖圖同一系列；不放購買連結，避免誤導成一定要買權證。"""
+    from PIL import ImageFilter
+    w, h = 1672, 941
+    base = Image.new('RGB', (w, h))
+    top_c, bottom_c = (7, 18, 43), (13, 35, 82)
+    grad = ImageDraw.Draw(base)
+    for y in range(h):
+        t = y / (h - 1)
+        grad.line((0, y, w, y), fill=tuple(int(a + (b - a) * t) for a, b in zip(top_c, bottom_c)))
+    layer = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    for x in range(0, w, 64):
+        ld.line((x, 0, x, h), fill=(90, 140, 255, 16))
+    for y in range(0, h, 64):
+        ld.line((0, y, w, y), fill=(90, 140, 255, 16))
+    for i in range(26):   # 很淡的 K 棒，只當背景紋理
+        x = 1060 + i * 23
+        mid = 640 - 120 * math.sin(i / 4.0) - i * 6
+        ld.line((x, mid - 60, x, mid + 60), fill=(80, 150, 255, 38), width=2)
+        ld.rectangle((x - 7, mid - 30, x + 7, mid + 26), fill=(80, 150, 255, 30))
+    base = Image.alpha_composite(base.convert('RGBA'), layer)
+    glow = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((110, 250, 530, 670), fill=(255, 196, 64, 110))
+    ImageDraw.Draw(glow).ellipse((20, 180, 620, 760), fill=(40, 110, 255, 60))
+    base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(70)))
+    draw = ImageDraw.Draw(base)
+    gold, gold_dark, navy = (242, 190, 72), (196, 140, 40), (10, 24, 56)
+    # 鎖頭：底座＋金色鎖身＋鎖環＋鑰匙孔。
+    draw.rounded_rectangle((120, 640, 520, 720), radius=18, fill=(22, 52, 120), outline=(70, 130, 255), width=3)
+    draw.arc((205, 250, 435, 480), 180, 360, fill=gold_dark, width=40)
+    draw.line((225, 365, 225, 440), fill=gold_dark, width=40)
+    draw.line((415, 365, 415, 440), fill=gold_dark, width=40)
+    draw.rounded_rectangle((170, 420, 470, 640), radius=34, fill=gold)
+    draw.rounded_rectangle((170, 420, 470, 470), radius=34, fill=(252, 214, 110))
+    draw.ellipse((292, 480, 348, 536), fill=navy)
+    draw.polygon((302, 520, 338, 520, 330, 590, 310, 590), fill=navy)
+    # 文字：小標、主標（會員專屬金色）、副標。
+    x0 = 640
+    text_at(draw, (x0, 110), '艾斯 AI・會員專屬研究功能', 34, (190, 205, 235))
+    draw.line((x0, 168, x0 + 420, 168), fill=(70, 130, 255), width=2)
+    tx = x0
+    for part, color in zip(MEMBER_TITLE, ((255, 255, 255), gold, (255, 255, 255))):
+        draw.text((tx + 3, 203), part, font=font(92, True), fill=(0, 0, 0), anchor='lt')
+        draw.text((tx, 200), part, font=font(92, True), fill=color, anchor='lt')
+        tx += font(92, True).getlength(part)
+    text_at(draw, (x0, 330), MEMBER_SUBTITLE, 40, (150, 200, 255), True)
+    # 三張功能卡。
+    card_w, card_h, gap, cy0 = 300, 250, 30, 420
+    for i, (title, sub, icon) in enumerate(MEMBER_FEATURES):
+        cx = x0 + i * (card_w + gap)
+        draw.rounded_rectangle((cx, cy0, cx + card_w, cy0 + card_h), radius=22, fill=(14, 36, 86), outline=(70, 130, 255), width=2)
+        _member_icon(draw, cx + card_w / 2, cy0 + 72, icon, (110, 175, 255))
+        draw.text((cx + card_w / 2, cy0 + 150), title, font=font(34, True), fill=gold, anchor='mm')
+        draw.text((cx + card_w / 2, cy0 + 198), sub, font=font(24), fill=(200, 212, 235), anchor='mm')
+    # 提示列（不是購買按鈕）。
+    hy = 730
+    draw.rounded_rectangle((x0, hy, x0 + 3 * card_w + 2 * gap, hy + 84), radius=42, fill=(18, 44, 100), outline=gold, width=3)
+    draw.text((x0 + (3 * card_w + 2 * gap) / 2, hy + 42), MEMBER_HINT, font=font(32, True), fill=(255, 255, 255), anchor='mm')
+    draw.text((w - 48, h - 36), 'ACE AI  ×  台股投資  ×  有意思實驗室', font=font(24), fill=(120, 150, 200), anchor='rm')
+    return base.convert('RGB')
+
+
+def make_member_only_attachment(*, max_bytes=7_500_000):
+    """guest（無會員身分）提示圖：有設計好的 assets/member_only.webp 就用，沒有就程式繪製。"""
+    try:
+        data = MEMBER_ASSET.read_bytes()
+        if data and len(data) <= max_bytes:
+            return data, MEMBER_ASSET.suffix.lstrip('.')
+    except OSError:
+        pass
+    return encode_image(render_member_only(), max_bytes)
 
 
 LOCKED_ASSET = Path(__file__).with_name('assets') / 'warrant_unlock.webp'

@@ -215,7 +215,7 @@ def fugle_background_allowed() -> bool:
 
 
 def finmind_usage(force: bool = False) -> Dict[str, Any]:
-    token = os.getenv("FINMIND_API_TOKEN", "").strip()
+    token = current_finmind_token()
     if not token:
         return {"available": False, "reason": "no_token"}
     now = time.time()
@@ -363,6 +363,93 @@ def apply_bot_process_env() -> Dict[str, str]:
     return overridden
 
 
+# ============================================================
+# FinMind 多組 Token：第一支失效（Token 錯誤、授權失敗）自動改用下一支
+# 只在 Bot 行程內包裝主程式的函式，不修改主程式檔，GitHub Actions 週報不受影響。
+# ============================================================
+
+_FINMIND_TOKEN_LOCK = threading.Lock()
+_FINMIND_TOKEN_STATE = {"index": 0}
+
+
+def finmind_tokens() -> List[str]:
+    """FINMIND_API_TOKEN（可用逗號／空白／換行放多支）＋FINMIND_API_TOKEN_2；順序即優先順序，重複的只算一次。"""
+    tokens: List[str] = []
+    for name in ("FINMIND_API_TOKEN", "FINMIND_API_TOKEN_2"):
+        for part in re.split(r"[,;\s]+", os.getenv(name, "").strip()):
+            if part and part.lower() != "bearer" and part not in tokens:
+                tokens.append(part)
+    return tokens
+
+
+def current_finmind_token() -> str:
+    tokens = finmind_tokens()
+    if not tokens:
+        return ""
+    with _FINMIND_TOKEN_LOCK:
+        return tokens[_FINMIND_TOKEN_STATE["index"] % len(tokens)]
+
+
+def _finmind_token_failed(kf, exc: BaseException) -> bool:
+    """Token 本身的問題才換下一支；參數錯、查無資料、網路逾時換 Token 也沒用。"""
+    auth_error = getattr(kf, "FinMindAuthorizationError", None)
+    if auth_error is not None and isinstance(exc, auth_error):
+        return True
+    message = str(exc).lower()
+    return "token" in message and any(word in message for word in ("illegal", "invalid", "expired", "not found"))
+
+
+def rotate_finmind_token(reason: str = "", failed: str = "") -> bool:
+    """換到下一支 Token；只有一支時回傳 False。failed＝剛失敗的 Token，避免多執行緒同時失敗時連跳兩支。"""
+    tokens = finmind_tokens()
+    if len(tokens) < 2:
+        return False
+    with _FINMIND_TOKEN_LOCK:
+        now = _FINMIND_TOKEN_STATE["index"] % len(tokens)
+        if failed and tokens[now] != failed:
+            return True   # 別的執行緒已經換過了，直接用新的重試
+        _FINMIND_TOKEN_STATE["index"] = now + 1
+        after = (now + 1) % len(tokens)
+    print(f"⚠️ FinMind Token #{now + 1} 失敗，改用 #{after + 1}｜{str(reason)[:160]}", flush=True)
+    return True
+
+
+def install_finmind_failover(kf) -> None:
+    """包裝主程式的 _require_finmind_token／_finmind_get_data：主程式所有 FinMind 請求都會讀目前這支 Token，
+    Token 失效時換下一支重試（每支最多試一次）。"""
+    if getattr(kf, "_ace_finmind_failover", False) or not hasattr(kf, "_finmind_get_data"):
+        return
+    original_require = getattr(kf, "_require_finmind_token", None)
+    original_get = kf._finmind_get_data
+
+    def require_token() -> str:
+        token = current_finmind_token()
+        if token:
+            return token
+        if original_require is None:
+            raise RuntimeError("找不到 FINMIND_API_TOKEN")
+        return original_require()
+
+    def get_with_failover(*args, **kwargs):
+        attempts = max(1, len(finmind_tokens()))
+        for attempt in range(attempts):
+            token = current_finmind_token()
+            try:
+                return original_get(*args, **kwargs)
+            except Exception as exc:
+                if attempt + 1 >= attempts or not _finmind_token_failed(kf, exc):
+                    raise
+                if not rotate_finmind_token(str(exc), failed=token):
+                    raise
+
+    kf._require_finmind_token = require_token
+    kf._finmind_get_data = get_with_failover
+    kf._ace_finmind_failover = True
+    count = len(finmind_tokens())
+    if count > 1:
+        print(f"🔑 FinMind Token：共 {count} 支，第一支失效時自動改用下一支", flush=True)
+
+
 def core():
     """載入並回傳週報主程式模組（整個行程只載入一次）。
 
@@ -394,6 +481,7 @@ def core():
         except Exception:
             sys.modules.pop(CORE_MODULE_NAME, None)
             raise
+        install_finmind_failover(module)
         _CORE_MODULE = module
         print(
             f"✅ Discord AI 已載入週報主程式：{os.path.basename(path)}｜"
@@ -583,6 +671,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_technical_analysis": "目前股價／技術指標資料取得失敗",
     "get_volume_profile": "目前大量區資料取得失敗",
     "get_futures_positions": "台指期未平倉資料取得失敗",
+    "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_index_contribution": "指數貢獻點數：加權與櫃買各自的拉升 TOP5 與拖累 TOP5（權重 × 漲跌，非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
     "get_index_contribution": "指數貢獻點數計算失敗",
@@ -4775,6 +4864,59 @@ def get_index_contribution(top: int = 5) -> Dict[str, Any]:
     return index_contribution.report(top=max(3, int(top or 5)))
 
 
+def get_institutional_flow(stock_code: str, days: int = 20) -> Dict[str, Any]:
+    """個股三大法人買賣超（FinMind，單位：張）：最新一日、近5／近20日合計、連買連賣天數。GENERAL 可用，不是權證分點。"""
+    code, name = _stock_identity(stock_code)
+    kf = core()
+    fetch = getattr(kf, "fetch_inst_60d_from_finmind_token", None)
+    if fetch is None:
+        raise ToolDataError("主程式沒有三大法人函式")
+    started = time.perf_counter()
+    try:
+        frame = fetch(code, days=max(25, int(days or 20) + 5))
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError(f"{code} 三大法人資料暫時無法取得：{type(exc).__name__}: {exc}") from exc
+    if frame is None or frame.empty:
+        raise ToolDataError(f"{code} 三大法人沒有資料")
+    frame = frame.copy()
+    frame["Date"] = pd.to_datetime(frame["Date"]).dt.normalize()
+    frame = frame.sort_values("Date").tail(max(5, int(days or 20)))
+    labels = (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商"))
+
+    def streak(values: List[float]) -> int:
+        """正數＝連買天數、負數＝連賣天數（從最新一天往回數）。"""
+        count, sign = 0, 0
+        for value in reversed(values):
+            now = 1 if value > 0 else -1 if value < 0 else 0
+            if now == 0 or (sign and now != sign):
+                break
+            sign, count = now, count + 1
+        return count * sign
+
+    investors = []
+    for key, label in labels:
+        values = [float(v or 0) for v in frame[key].tolist()]
+        investors.append({
+            "investor": label,
+            "latest_lots": int(round(values[-1])),
+            "sum_5d_lots": int(round(sum(values[-5:]))),
+            "sum_20d_lots": int(round(sum(values[-20:]))),
+            "streak_days": streak(values),
+        })
+    total = [float(sum(float(getattr(r, k) or 0) for k, _ in labels)) for r in frame.itertuples()]
+    return {
+        "stock_code": code, "stock_name": name, "unit": "張",
+        "data_date": _fmt_date(frame["Date"].iloc[-1]),
+        "investors": investors,
+        "total_latest_lots": int(round(total[-1])), "total_5d_lots": int(round(sum(total[-5:]))),
+        "rows": [{"date": _fmt_date(r.Date), "foreign": float(r.foreign), "invest": float(r.invest),
+                  "dealer": float(r.dealer)} for r in frame.itertuples()],
+        "definition_note": "三大法人為交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是權證分點資料",
+    }
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -4785,6 +4927,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_technical_analysis": get_technical_analysis,
     "get_volume_profile": get_volume_profile,
     "get_futures_positions": get_futures_positions,
+    "get_institutional_flow": get_institutional_flow,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
     "get_warrant_branch": get_warrant_branch,
