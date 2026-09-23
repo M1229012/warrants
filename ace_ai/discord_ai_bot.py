@@ -4323,19 +4323,20 @@ def queue_admin_alert(client, config: "BotConfig", kind: str, detail: str, *, us
         return None
 
 
-DENIAL_BUTTON_LABELS = {"WARRANT": "🔓 前往解鎖權證系統", "GENERAL": "🔓 加入艾斯會員"}
+DENIAL_BUTTON_LABELS = {"WARRANT": "🔓 前往解鎖權證系統", "GENERAL": "🔓 加入艾斯會員", "SPOT": "🔓 加入艾斯會員"}
 
 
+# 現股分點未解鎖＝和 guest 同一張會員專屬圖＋同一個網址與按鈕（現股只開放已訂閱會員）
 DENIAL_RENDERERS = {"WARRANT": lambda: answer_image.make_locked_attachment(),
                     "GENERAL": lambda: answer_image.make_member_only_attachment(),
-                    "SPOT": lambda: answer_image.make_spot_locked_attachment()}
+                    "SPOT": lambda: answer_image.make_member_only_attachment()}
 DENIAL_TEXTS = {"WARRANT": access_policy.WARRANT_DENIED, "GENERAL": access_policy.GENERAL_DENIED,
                 "SPOT": access_policy.SPOT_DENIED}
-DENIAL_FILE_NAMES = {"WARRANT": "ace-locked", "GENERAL": "ace-members-only", "SPOT": "ace-spot-locked"}
+DENIAL_FILE_NAMES = {"WARRANT": "ace-locked", "GENERAL": "ace-members-only", "SPOT": "ace-members-only"}
 
 
 async def _denial_options(text: str, required: str, ephemeral: bool) -> Dict[str, Any]:
-    """權限提示訊息內容：WARRANT／GENERAL＝圖＋Skool 網址＋按鈕；SPOT＝只有圖（目前沒有現股購買網址，不放 CTA）。"""
+    """權限提示訊息內容：WARRANT＝權證解鎖圖、GENERAL／SPOT＝會員專屬圖；都附 Skool 網址＋按鈕。"""
     import discord
     options: Dict[str, Any] = {"content": text, "ephemeral": ephemeral}
     render = DENIAL_RENDERERS.get(required)
@@ -4350,7 +4351,7 @@ async def _denial_options(text: str, required: str, ephemeral: bool) -> Dict[str
         try:
             data, extension = await asyncio.to_thread(render)
             options["file"] = discord.File(io.BytesIO(data), filename=f"{DENIAL_FILE_NAMES[required]}.{extension}")
-            # 有圖時說明文字都在圖上：有 CTA 的只留網址（<> 關掉連結預覽），SPOT 只貼圖。
+            # 有圖時說明文字都在圖上：有 CTA 的只留網址（<> 關掉連結預覽），沒有 CTA 的只貼圖。
             options["content"] = f"<{access_policy.UNLOCK_URL}>" if with_cta else None
         except Exception as exc:  # 圖片失敗仍送完整文字（有 CTA 的另有網址＋按鈕）
             print(f"⚠️ 權限提示圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
