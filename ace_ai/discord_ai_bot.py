@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import discord_access as access_policy
-from discord_access import GENERAL_AI_ROLES, WARRANT_AI_ROLES
 
 import warrant_ai_tools as tools
 import weekly_pick
@@ -92,6 +91,7 @@ import market_data
 import market_scan
 import sector_roster
 import local_market_cache
+import spot_chip
 from weekly_pick import is_weekly_pick_question
 
 
@@ -256,8 +256,8 @@ def detect_question_intents(question: str) -> Tuple[str, Set[str]]:
     intents = {intent for intent, words in INTENT_KEYWORDS.items() if any(w.upper() in upper for w in words)}
     if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
         intents.discard("warrant")   # 外資買超、投信買超、自營商、三大法人不是權證
-    if (_INSTITUTIONAL_RE.search(question or "") or "籌碼" in (question or "")) and not _EXPLICIT_WARRANT_RE.search(question or ""):
-        intents.add("institutional")  # 「2330籌碼最近怎麼樣」「外資今天買超多少」→ 三大法人（一般會員可用）
+    if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
+        intents.add("institutional")  # 「外資今天買超多少」「三大法人偏買還偏賣」→ 三大法人（不是券商分點）
         intents.discard("warrant")    # 沒提權證／分點的「籌碼」是三大法人，不是權證分點
     if "部位" not in normalized and (_MA_SYNONYM_RE.search(question or "") or "整理" in (question or "")):
         intents.discard("position")  # 「還在月線上嗎」「還在整理嗎」的「還在」不是問分點部位
@@ -306,6 +306,8 @@ class ParsedQuestion:
     sector: Optional[Dict[str, str]] = None
     access: Optional[access_policy.AccessContext] = None
     normalized: str = ""  # 原句＋同義詞標準關鍵字（normalize_intent_text）
+    chip: str = ""        # 籌碼類型：spot（現股分點）／warrant（權證分點）／combined／""（非籌碼題）
+    spot_branch: str = "" # 用現股資料庫分點名單辨識出的分點（和權證分點名單分開）
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -560,6 +562,10 @@ WARRANT_TOOLS = frozenset((
 
 def warrant_allowed(parsed: "ParsedQuestion") -> bool:
     """明確詢問權證／分點或辨識到分點，才允許權證資料與 K 線標註。"""
+    if getattr(parsed, "chip", "") == "warrant":
+        return True
+    if getattr(parsed, "chip", "") == "spot":
+        return False
     text = parsed.normalized or normalize_intent_text(parsed.original)
     return bool(parsed.branches or parsed.branch_candidates or any(word in text for word in ("權證", "分點")))
 
@@ -2617,6 +2623,8 @@ class AnswerResult:
     denied_feature: str = ""
     image_title: str = ""          # 圖片頁首標題；空字串＝沿用使用者問句（族群雷達固定寫「族群雷達」）
     errors: List[str] = field(default_factory=list)   # 這題失敗的工具／Gemini（管理員錯誤通知用）
+    followups: List["AnswerResult"] = field(default_factory=list)   # 「兩種一起看」：第二張圖（權證分點籌碼）
+    denial_followups: List[str] = field(default_factory=list)       # 「兩種一起看」但缺一邊權限：另送鎖定卡（SPOT／WARRANT）
 
 
 # ============================================================
@@ -2639,7 +2647,7 @@ ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() 
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 MEMORY_RESET_MESSAGE = "🔄 已重新開始：上一題的股票與分點不會再自動延續，請直接輸入想問的股票。"
-_FOLLOWUP_HINT_RE = re.compile(r"它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
+_FOLLOWUP_HINT_RE = re.compile(r"^那|它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
 # 打招呼、閒聊這類不該接上一題的句子。
 _SMALLTALK_RE = re.compile(r"^(你好|哈囉|hi|hello|在嗎|嗨|謝謝|感謝|早安|午安|晚安|測試)")
 _ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十1-9])\s*名?|冠軍|榜首|龍頭|亞軍|季軍")
@@ -2647,6 +2655,8 @@ _ORDINAL_WORDS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "�
 _SECTOR_ROWS_TTL = 1800
 _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
 # 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
+# 只問最新一天的現股分點（不 backfill 70 日）
+_SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
 _PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
 NO_CONTEXT_MESSAGE = "請告訴我股票名稱或代號，例如：2344 現在技術面怎麼樣。"
 _COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
@@ -2659,6 +2669,7 @@ class MemoryEntry:
     branches: List[str]
     updated_at: float
     sector: Optional[Dict[str, str]] = None      # 上一題問的族群，供「那誰型態最好」接續
+    chip_context: str = ""                       # 上一題的籌碼類型（spot／warrant／combined）；權限每題重新判斷
 
 
 class ConversationMemory:
@@ -2740,14 +2751,16 @@ class ConversationMemory:
                 while len(self._data) > self.max_entries:
                     self._data.popitem(last=False)
             return
-        if not key or not (parsed.stocks or parsed.branches):
+        if not key or not (parsed.stocks or parsed.branches or getattr(parsed, "spot_branch", "")):
             return
         previous = self.get(key)
         cost = parsed.cost_price
         if cost is None and previous and previous.cost_price and parsed.stocks and previous.stocks[:1] == parsed.stocks[:1]:
             cost = previous.cost_price  # 同一檔股票沿用之前說過的成本
         with self._lock:
-            self._data[key] = MemoryEntry(list(parsed.stocks[:2]), cost, list(parsed.branches[:1]), time.time())
+            branches = list(parsed.branches[:1]) or ([parsed.spot_branch] if getattr(parsed, "spot_branch", "") else [])
+            self._data[key] = MemoryEntry(list(parsed.stocks[:2]), cost, branches, time.time(),
+                                          chip_context=getattr(parsed, "chip", "") or "")
             self._data.move_to_end(key)
             while len(self._data) > self.max_entries:
                 self._data.popitem(last=False)
@@ -2865,7 +2878,7 @@ class AceQueryEngine:
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
             self._clear_draft_session(context_key)
-            return AnswerResult(text=MEMORY_RESET_MESSAGE, route="memory_reset", gemini_calls=0, elapsed=0.0, as_text=True)
+            return AnswerResult(text=MEMORY_RESET_MESSAGE, route="memory_reset", gemini_calls=0, elapsed=0.0, image_title="重新開始")
         # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
         if weekly_pick.is_admin_moneydj_image_question(question):
             if not (is_admin and admin_mode):
@@ -2937,7 +2950,15 @@ class AceQueryEngine:
             self.log(f"問題解析失敗：{exc}")
             return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         note = self.memory.resolve(context_key, parsed)
-        access_policy.require_question(self._access(), question, tools.get_cached_known_branches(), parsed)
+        remembered = self.memory.get(context_key)
+        access = self._access()
+        # 現股分點名稱用現股資料庫自己的名單辨識；權證分點仍用原本的權證名單（parsed.branches）。
+        parsed.spot_branch = spot_chip.match_branch(question)
+        parsed.chip = access_policy.chip_type(question, access.entitlement if access else None,
+                                              known_branch=bool(parsed.branches or parsed.branch_candidates or parsed.spot_branch),
+                                              # 只有真的追問（沿用上一題的股票／分點）才沿用上一題的籌碼類型
+                                              remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
+        access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
         if (_PRONOUN_RE.search(question) and not (parsed.stocks or parsed.branches or parsed.sector)
                 and not parsed.stock_candidates and not parsed.branch_candidates):
             # 「這檔強嗎」但沒有上一題可接：不猜，也不花 Tool／Gemini（clarify 走 ephemeral）。
@@ -2945,8 +2966,17 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started, as_text=True)
         if note:
             self.log(f"追問記憶：{note}")
-        # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案。
-        key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches)])
+        if parsed.chip in ("spot", "combined"):
+            # 現股分點／兩種一起：自己的資料層與快取，不進一般問答的 Gemini 流程。
+            result = self._answer_chip(parsed.chip, parsed, question, started)
+            self.memory.update(context_key, parsed)
+            return replace(result, context_note=note)
+        if parsed.chip == "warrant":
+            question = f"{question}（權證分點籌碼）"
+            parsed.intents = set(parsed.intents) | {"warrant"}
+        # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
+        key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+                        "chip=" + parsed.chip])
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -2992,7 +3022,96 @@ class AceQueryEngine:
                 seconds = min(seconds, tools.TTL_INTRADAY_SECONDS)
             self._answer_cache.set(key, result, seconds)
         self.memory.update(context_key, parsed)
+        if parsed.chip == "warrant":
+            result = replace(result, image_title=self._chip_title(parsed, "權證分點籌碼"))
         return replace(result, context_note=note)
+
+    @staticmethod
+    def _chip_title(parsed: ParsedQuestion, label: str) -> str:
+        stocks = [(c, n) for c, n in parsed.stocks if c not in tools.INDEX_CODES]
+        if stocks:
+            return f"{stocks[0][0]} {stocks[0][1]}｜{label}"
+        if parsed.branches:
+            return f"{parsed.branches[0]}｜{label}"
+        return label
+
+    def _answer_chip(self, chip: str, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
+        """spot／combined。權限在任何 Tool 前檢查：combined 缺一邊權限時那一邊 0 次呼叫，另送鎖定卡。"""
+        access = self._access()
+        access_policy.require_chip(access, chip)
+        entitlement = access.entitlement if access else None
+        want_spot = entitlement is None or entitlement.spot
+        want_warrant = chip == "combined" and (entitlement is None or entitlement.warrant)
+        spot = self._answer_spot(parsed, question, started) if want_spot else None
+        warrant = self._answer_warrant_chip(parsed, question, started) if want_warrant else None
+        main = spot or warrant
+        denials = [] if chip != "combined" else [k for k, ok in (("SPOT", want_spot), ("WARRANT", want_warrant)) if not ok]
+        return replace(main, followups=[warrant] if spot and warrant else [], denial_followups=denials)
+
+    def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
+        access_policy.require_chip(self._access(), "warrant")
+        warrant_parsed = replace(parsed, intents=set(parsed.intents) | {"warrant"}, chip="warrant")
+        result = self._answer_uncached(f"{question}（權證分點籌碼）", started, warrant_parsed)
+        return replace(result, image_title=self._chip_title(parsed, "權證分點籌碼"))
+
+    def _spot_result(self, card: Dict[str, Any], title: str, ok: bool, started: float, text: str) -> AnswerResult:
+        return AnswerResult(text=text, route="rule_spot_chip", gemini_calls=0, elapsed=time.perf_counter() - started,
+                            cacheable=ok, image_title=title,
+                            panels=[{"branch_card": card, "hide_text": True, "footer_text": card.get("footer_text", "")}])
+
+    def _answer_spot(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
+        """現股分點籌碼：本地 SQLite 優先，缺的交易日才抓；一律回圖卡（不畫 K 線分點標記）。"""
+        access = self._access()
+        access_policy.require_chip(access, "spot")   # Tool 前檢查：沒權限 0 次抓取
+        title = self._chip_title(parsed, "現股分點籌碼")
+        stocks = [(c, n) for c, n in parsed.stocks if c not in tools.INDEX_CODES]
+        if not stocks:
+            branch = parsed.spot_branch or (parsed.branches[0] if parsed.branches else "")
+            if branch:
+                # 現股分點：用現股資料庫查；查不到就顯示「查無該現股分點資料」，不改走權證分點。
+                report = spot_chip.branch_report(branch)
+                try:
+                    names = tools.get_stock_name_map()
+                except Exception:
+                    names = {}
+                return self._spot_result(spot_chip.branch_card(report, names), f"{report.get('branch') or branch}｜現股分點籌碼",
+                                         bool(report.get("found")), started,
+                                         f"{branch} 現股分點：{'有資料' if report.get('found') else '查無資料'}")
+            card = spot_chip.message_card("現股分點籌碼", "請指定股票", "例如：2330現股籌碼最近怎樣、2330最新現股分點")
+            return self._spot_result(card, title, False, started, "現股分點籌碼需要指定股票")
+        code, name = stocks[0]
+        mode = "latest" if _SPOT_LATEST_RE.search(question) else "full"
+        simulation = bool(access and access.simulation)
+        dates, _ = spot_chip.candidate_dates()
+        statuses = local_market_cache.spot_day_status(code, dates)
+        complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
+        # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
+        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}")
+        if not simulation:
+            hit, cached = self._answer_cache.get(key)
+            if hit:
+                return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
+        report = spot_chip.build_report(code, mode)
+        latest = report.get("latest_complete_date")
+        if not latest:
+            if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
+                card = spot_chip.message_card(f"{code} {name}", "現股分點資料暫時無法取得",
+                                              "資料來源連線失敗，稍後再試；失敗的日期不會當成 0 計算。")
+            else:
+                card = spot_chip.progress_card(code, name, report)
+            return self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中")
+        card = spot_chip.report_card(report, code, name)
+        text = (f"{code} {name} 現股分點籌碼｜資料日期 {latest}｜歷史 {report.get('available_days')}/{report.get('requested_days')}｜"
+                f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
+                f"賣超 {', '.join(x['branch'] for x in report.get('latest_top_sell') or [])}")
+        result = self._spot_result(card, title, True, started, text)
+        full = mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
+        if full and not simulation:
+            complete_now = [d for d in dates if (local_market_cache.spot_day_status(code, [d]).get(d) or {}).get("status") == "complete"]
+            self._answer_cache.set(self._access_cache_key(
+                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}"), result,
+                self.config.answer_cache_seconds)
+        return result
 
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
     TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
@@ -4072,35 +4191,55 @@ def queue_admin_alert(client, config: "BotConfig", kind: str, detail: str, *, us
 DENIAL_BUTTON_LABELS = {"WARRANT": "🔓 前往解鎖權證系統", "GENERAL": "🔓 加入艾斯會員"}
 
 
-async def send_access_denial(interaction, text, required, public=False):
-    """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。
-    WARRANT＝權證解鎖圖＋網址＋按鈕；GENERAL（guest）＝會員專屬圖（不放購買連結）；圖片失敗才退回完整文字。"""
+DENIAL_RENDERERS = {"WARRANT": lambda: answer_image.make_locked_attachment(),
+                    "GENERAL": lambda: answer_image.make_member_only_attachment(),
+                    "SPOT": lambda: answer_image.make_spot_locked_attachment()}
+DENIAL_TEXTS = {"WARRANT": access_policy.WARRANT_DENIED, "GENERAL": access_policy.GENERAL_DENIED,
+                "SPOT": access_policy.SPOT_DENIED}
+DENIAL_FILE_NAMES = {"WARRANT": "ace-locked", "GENERAL": "ace-members-only", "SPOT": "ace-spot-locked"}
+
+
+async def _denial_options(text: str, required: str, ephemeral: bool) -> Dict[str, Any]:
+    """權限提示訊息內容：WARRANT／GENERAL＝圖＋Skool 網址＋按鈕；SPOT＝只有圖（目前沒有現股購買網址，不放 CTA）。"""
     import discord
-    options = {"content": text, "ephemeral": not public}
-    render = {"WARRANT": answer_image.make_locked_attachment,
-              "GENERAL": answer_image.make_member_only_attachment}.get(required)
-    edit_original = public and interaction.response.is_done()
-    if render and not interaction.response.is_done():
-        # 圖片要讀檔或 render：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
-        await interaction.response.defer(thinking=True, ephemeral=not public)
-        edit_original = True
-    if render:
+    options: Dict[str, Any] = {"content": text, "ephemeral": ephemeral}
+    render = DENIAL_RENDERERS.get(required)
+    with_cta = required in DENIAL_BUTTON_LABELS
+    if render and with_cta:
         # 可點的網址一定放在訊息本身（圖片失敗時也有）。
         options["content"] += "\n\n網址：\n" + access_policy.UNLOCK_URL
-    if render:
-        # 權證與 guest 都在圖片下方放 Link Button（同一個 Skool 網址，文字依身分不同）。
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label=DENIAL_BUTTON_LABELS[required], url=access_policy.UNLOCK_URL))
         options["view"] = view
     if render:
         try:
             data, extension = await asyncio.to_thread(render)
-            name = "ace-locked" if required == "WARRANT" else "ace-members-only"
-            options["file"] = discord.File(io.BytesIO(data), filename=f"{name}.{extension}")
-            # 有圖時說明文字都在圖上，訊息只留網址（<> 關掉連結預覽）。
-            options["content"] = f"<{access_policy.UNLOCK_URL}>"
-        except Exception as exc:  # 圖片失敗仍送完整文字＋網址（權證另有按鈕）
+            options["file"] = discord.File(io.BytesIO(data), filename=f"{DENIAL_FILE_NAMES[required]}.{extension}")
+            # 有圖時說明文字都在圖上：有 CTA 的只留網址（<> 關掉連結預覽），SPOT 只貼圖。
+            options["content"] = f"<{access_policy.UNLOCK_URL}>" if with_cta else None
+        except Exception as exc:  # 圖片失敗仍送完整文字（有 CTA 的另有網址＋按鈕）
             print(f"⚠️ 權限提示圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
+    return options
+
+
+async def send_denial_followup(interaction, required: str, ephemeral: bool) -> None:
+    """「兩種一起看」但只有一邊權限：沒權限的那一半用鎖定卡另外送一則（沿用各自的 CTA 規則）。"""
+    options = await _denial_options(DENIAL_TEXTS.get(required, ""), required, ephemeral)
+    if options.get("content") is None:
+        options.pop("content", None)
+    await interaction.followup.send(**options)
+
+
+async def send_access_denial(interaction, text, required, public=False):
+    """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。
+    WARRANT＝權證解鎖圖＋網址＋按鈕；GENERAL（guest）＝會員專屬圖（不放購買連結）；圖片失敗才退回完整文字。"""
+    render = DENIAL_RENDERERS.get(required)
+    edit_original = public and interaction.response.is_done()
+    if render and not interaction.response.is_done():
+        # 圖片要讀檔或 render：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
+        await interaction.response.defer(thinking=True, ephemeral=not public)
+        edit_original = True
+    options = await _denial_options(text, required, not public)
     if edit_original:
         file = options.pop("file", None)
         options.pop("ephemeral")
@@ -4269,7 +4408,7 @@ def _is_guild_admin(member) -> bool:
 
 
 ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能使用）
-會員模擬：/ace 測試 guest|general|warrant|beta|superuser <問題>（結果公開，可在群組展示）
+會員模擬：/ace 測試 guest|general|warrant|both|beta|superuser <問題>（結果公開，可在群組展示）
 
 【本週精選】
 • `本週精選排名`：算出當期 Top 10
@@ -4696,6 +4835,12 @@ def run_discord_bot(config: BotConfig) -> None:
             else:
                 await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
+            for extra in result.followups:
+                # 「兩種一起看」：第 1 張現股分點籌碼、第 2 張權證分點籌碼，不硬塞成一張超長圖。
+                await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
+                                        panels_with_context(extra), ephemeral=ephemeral, followup=True)
+            for required in result.denial_followups:
+                await send_denial_followup(interaction, required, ephemeral)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
             reason = alert_reason(result)

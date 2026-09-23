@@ -100,6 +100,25 @@ def _connect() -> sqlite3.Connection:
                         PRIMARY KEY (day, code, bucket)
                     )
                 """)
+                # 現股券商分點：每交易日 × 每股票 × 每分點一列（net = buy - sell，正＝買超、負＝賣超），UPSERT 不刪舊資料。
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS spot_branch_daily (
+                        stock_code TEXT NOT NULL, date TEXT NOT NULL, branch_name TEXT NOT NULL,
+                        buy REAL NOT NULL DEFAULT 0, sell REAL NOT NULL DEFAULT 0, net REAL NOT NULL DEFAULT 0,
+                        source TEXT DEFAULT '', updated_at TEXT NOT NULL,
+                        PRIMARY KEY (stock_code, date, branch_name)
+                    )
+                """)
+                # 每股票每交易日的抓取狀態：complete／pending_update／market_closed／stock_no_trade／source_error／retry
+                # （查不到資料不能當成 0，也不能一律當停牌）。
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS spot_branch_days (
+                        stock_code TEXT NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL,
+                        checked_at TEXT NOT NULL, source TEXT DEFAULT '', rows INTEGER DEFAULT 0, detail TEXT DEFAULT '',
+                        PRIMARY KEY (stock_code, date)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_spot_branch_daily_branch ON spot_branch_daily(branch_name, date)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_radar_turnover_bucket ON radar_turnover(bucket, day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_log(day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)")
@@ -477,6 +496,70 @@ def _read(sql: str, params: tuple) -> List[tuple]:
         return []
 
 
+SPOT_STATUSES = ("complete", "pending_update", "market_closed", "stock_no_trade", "source_error", "retry")
+SPOT_KEEP_CALENDAR_DAYS = 160   # 約 110 個交易日，足夠 70 日統計＋延續性／事件回測
+
+
+def save_spot_day(stock_code: str, date: str, rows: Iterable[Dict[str, Any]], status: str,
+                  source: str = "", detail: str = "") -> int:
+    """寫入單一股票單一交易日的現股分點（UPSERT）與狀態；同一交易內完成，中途失敗不會留下半天資料。"""
+    if status not in SPOT_STATUSES:
+        raise ValueError(f"unknown spot status: {status}")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    items = []
+    for row in rows or []:
+        name = str(row.get("branch_name") or "").strip()
+        if not name:
+            continue
+        buy, sell = float(row.get("buy") or 0), float(row.get("sell") or 0)
+        net = float(row["net"]) if row.get("net") is not None else buy - sell
+        items.append((str(stock_code), str(date), name, buy, sell, net, source, now))
+    with _LOCK:
+        with _db() as conn, conn:
+            conn.executemany(
+                "INSERT INTO spot_branch_daily(stock_code,date,branch_name,buy,sell,net,source,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stock_code,date,branch_name) DO UPDATE SET "
+                "buy=excluded.buy, sell=excluded.sell, net=excluded.net, source=excluded.source, updated_at=excluded.updated_at",
+                items)
+            conn.execute(
+                "INSERT INTO spot_branch_days(stock_code,date,status,checked_at,source,rows,detail) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(stock_code,date) DO UPDATE SET status=excluded.status, checked_at=excluded.checked_at, "
+                "source=excluded.source, rows=excluded.rows, detail=excluded.detail",
+                (str(stock_code), str(date), status, now, source, len(items), str(detail)[:300]))
+    return len(items)
+
+
+def spot_day_status(stock_code: str, dates: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    dates = [str(d) for d in dates]
+    if not dates:
+        return {}
+    marks = ",".join("?" * len(dates))
+    rows = _read(f"SELECT date,status,checked_at,rows FROM spot_branch_days WHERE stock_code=? AND date IN ({marks})",
+                 (str(stock_code), *dates))
+    return {r[0]: {"status": r[1], "checked_at": r[2], "rows": int(r[3] or 0)} for r in rows}
+
+
+def load_spot_rows(stock_code: str, dates: Iterable[str]) -> List[Dict[str, Any]]:
+    dates = [str(d) for d in dates]
+    if not dates:
+        return []
+    marks = ",".join("?" * len(dates))
+    rows = _read(f"SELECT date,branch_name,buy,sell,net FROM spot_branch_daily WHERE stock_code=? AND date IN ({marks})",
+                 (str(stock_code), *dates))
+    return [{"date": r[0], "branch_name": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
+
+
+def spot_branch_history(branch_name: str, since: str) -> List[Dict[str, Any]]:
+    """某分點在本地已有的所有股票現股紀錄（只含已建置過的股票）。"""
+    rows = _read("SELECT stock_code,date,buy,sell,net FROM spot_branch_daily WHERE branch_name=? AND date>=? ORDER BY date",
+                 (str(branch_name).strip(), str(since)))
+    return [{"stock_code": r[0], "date": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
+
+
+def spot_branch_names() -> List[str]:
+    return [r[0] for r in _read("SELECT DISTINCT branch_name FROM spot_branch_daily", ())]
+
+
 def append_radar_snapshot(day: str, snapshot: Dict[str, Any]) -> None:
     _write("INSERT INTO radar_snapshots(day,time,data) VALUES(?,?,?) "
            "ON CONFLICT(day,time) DO UPDATE SET data=excluded.data",
@@ -642,6 +725,8 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                         ("ivol_samples", "DELETE FROM ivol_samples WHERE day < ?", cut(IVOL_RAW_KEEP_DAYS)),
                         ("radar_turnover", "DELETE FROM radar_turnover WHERE day < ?", cut(TURNOVER_KEEP_DAYS)),
                         ("usage_log", "DELETE FROM usage_log WHERE day < ?", cut(USAGE_KEEP_DAYS)),
+                        ("spot_branch_daily", "DELETE FROM spot_branch_daily WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
+                        ("spot_branch_days", "DELETE FROM spot_branch_days WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         # 舊版每 5 分鐘整包重寫的 JSON（改成資料表後就不再使用）；當天的先留著給當天讀
                         ("legacy_radar_snap", "DELETE FROM kv WHERE key LIKE 'radar_snap:%' AND key < ?",
                          "radar_snap:" + today),
