@@ -258,10 +258,36 @@ def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
             "last_day": stats.get("last_day", ""), "elapsed": time.monotonic() - started}
 
 
+def unchecked_days(target_days: int = HISTORY_DAYS) -> int:
+    """歷史範圍內「上市或上櫃完整性從沒記錄過」的平日數（舊版底庫升級後會有一整批，需要補查一次）。"""
+    keys = [d.strftime("%Y-%m-%d") for d in _candidate_days(int(target_days * 1.5))[1:]]   # 不含今天
+    try:
+        status = local_market_cache.market_status(keys)
+    except local_market_cache.DBError:
+        return 0
+    return sum(1 for k in keys if any(status[k][m] == "unknown" for m in local_market_cache.MARKETS))
+
+
+def verify_days(days: List[str], limit: int = 3) -> None:
+    """查詢時遇到日K缺口、而那天市場完整性從沒記錄：當場向交易所查證（每天最多 2 個請求，結果存 DB 不重查）。"""
+    try:
+        status = local_market_cache.market_status(days)
+    except local_market_cache.DBError:
+        return
+    today = _now_date().strftime("%Y-%m-%d")
+    pending = [d for d in sorted(days) if d < today and any(status[d][m] == "unknown" for m in local_market_cache.MARKETS)]
+    for key in pending[:limit]:
+        need = tuple(m for m in local_market_cache.MARKETS if status[key][m] == "unknown")
+        try:
+            sync_day(_date.fromisoformat(key), need)
+        except Exception as exc:
+            print(f"⚠️ 市場完整性查證失敗｜{key}｜{type(exc).__name__}: {exc}", flush=True)
+
+
 def coverage() -> Dict[str, Any]:
     stats = local_market_cache.stats()
     state = local_market_cache.get_state("market_sync", {}) or {}
-    return {"days": stats.get("days", 0), "stocks": stats.get("stocks", 0),
+    return {"days": stats.get("days", 0), "stocks": stats.get("stocks", 0), "unchecked_days": unchecked_days(),
             "scored_stocks": stats.get("scores", 0), "last_day": stats.get("last_day", ""),
             "synced_at": state.get("at", ""), "persistent": stats.get("persistent", False),
             "ready": int(stats.get("days", 0)) >= 60 and int(stats.get("stocks", 0)) >= 800}

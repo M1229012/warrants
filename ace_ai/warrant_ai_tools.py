@@ -1929,6 +1929,11 @@ def legal_gap_days(code: str, gaps: List[str]) -> List[str]:
     if not gaps:
         return []
     try:
+        import market_data   # 延遲載入（market_data 也 import 本模組）
+        market_data.verify_days(list(gaps))   # 從沒查過的日子當場向交易所查證（例如颱風假），結果存 DB
+    except Exception as exc:
+        print(f"⚠️ {code} 缺口查證略過｜{type(exc).__name__}: {exc}", flush=True)
+    try:
         closed = set(local_market_cache.market_closed_days(gaps))
         absent = set(local_market_cache.stock_absent_confirmed(code, [d for d in gaps if d not in closed]))
     except local_market_cache.DBError:

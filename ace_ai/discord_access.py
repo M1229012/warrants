@@ -146,7 +146,8 @@ def require_feature(access, policy=FeaturePolicy()):
 # ============================================================
 
 # 裸「勝率」不算權證（「2330型態勝率」「外資勝率」不是權證）；要有 A～E 事件、事件勝率、權證勝率，或權證分點名稱＋勝率。
-_EXPLICIT_WARRANT_CHIP_RE = re.compile(r"權證|ABCDE|事件勝率|(?<![A-Z])[A-E](?:事件|類|級|型)|事件[A-E]|[A-E][～~至][A-E]")
+# 「00981A型態」的 A 是 ETF 代號尾碼、「型態」不是 A 型事件：字母前面不可是英數字，「型」後面不可接「態」
+_EXPLICIT_WARRANT_CHIP_RE = re.compile(r"權證|ABCDE|事件勝率|(?<![A-Z0-9])[A-E](?:事件|類|級|型(?!態))|事件[A-E]|[A-E][～~至][A-E]")
 _WIN_RATE_RE = re.compile(r"勝率")
 _EXPLICIT_SPOT_CHIP_RE = re.compile(r"現股|券商分點|集中度")
 _COMBINED_CHIP_RE = re.compile(r"(?:兩種|兩個|二種|雙).{0,6}(?:籌碼|分點)?.{0,4}(?:一起|比較|對照)|(?:一起|比較|對照).{0,4}(?:兩種|兩個)")

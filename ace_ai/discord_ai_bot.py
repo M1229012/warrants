@@ -284,7 +284,8 @@ BROKER_PREFIXES = (
 STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年月日])")
 COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價)\s*(?:在|是|為|約|大約)?\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
 DAYS_RE = re.compile(r"(?:近|最近)?\s*(\d{1,2})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
-EVENT_RE = re.compile(r"(?<![A-Z])([A-E])\s*(?:類|事件|級|型)|事件\s*([A-E])(?![A-Z])")
+# 字母前面不可是英數字（00981A 的 A 是代號）、「型」後面不可接「態」（「型態」不是 A 型事件）
+EVENT_RE = re.compile(r"(?<![A-Z0-9])([A-E])\s*(?:類|事件|級|型(?!態))|事件\s*([A-E])(?![A-Z])")
 EVENT_NAME_MAP = {"基礎買超": "A", "明顯買超": "B", "強勢買超": "C", "大額布局": "D", "超大額布局": "E"}
 
 
@@ -4676,7 +4677,9 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
             after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5
             need_history = int(info.get("days") or 0) < market_data.HISTORY_DAYS
             need_today = after_close and str(info.get("last_day") or "") < today and last_attempt != today
-            if need_history or need_today:
+            # 升級後舊底庫沒有上市／上櫃完整性紀錄（含颱風假是否休市）：補查到全部有紀錄為止
+            need_status = int(info.get("unchecked_days") or 0) > 0 and not sector_radar.session_open(now)
+            if need_history or need_today or need_status:
                 last_attempt = today if need_today else last_attempt
                 result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
                 print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
