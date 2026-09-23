@@ -283,7 +283,8 @@ BROKER_PREFIXES = (
 
 STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年月日])")
 COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價)\s*(?:在|是|為|約|大約)?\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
-DAYS_RE = re.compile(r"(?:近|最近)?\s*(\d{1,2})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
+# 前面不可是數字（「3006日K」不是 6 日）；最多 3 位數（「近120天」）
+DAYS_RE = re.compile(r"(?<!\d)(?:近|最近)?\s*(\d{1,3})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
 # 字母前面不可是英數字（00981A 的 A 是代號）、「型」後面不可接「態」（「型態」不是 A 型事件）
 EVENT_RE = re.compile(r"(?<![A-Z0-9])([A-E])\s*(?:類|事件|級|型(?!態))|事件\s*([A-E])(?![A-Z])")
 EVENT_NAME_MAP = {"基礎買超": "A", "明顯買超": "B", "強勢買超": "C", "大額布局": "D", "超大額布局": "E"}
@@ -301,6 +302,7 @@ class ParsedQuestion:
     branch_candidates: List[str] = field(default_factory=list)
     days: int = 5
     days_specified: bool = False
+    window_days: int = 0      # 使用者寫的天數（不設 20 天上限；分點權證布局用）
     cost_price: Optional[float] = None
     event_type: str = ""
     notes: List[str] = field(default_factory=list)
@@ -367,6 +369,7 @@ class QuestionParser:
         days_match = DAYS_RE.search(question)
         if days_match:
             parsed.days = max(1, min(int(days_match.group(1)), 20))
+            parsed.window_days = int(days_match.group(1))
             parsed.days_specified = True
         event_match = EVENT_RE.search(text_upper)
         if event_match:
@@ -559,6 +562,7 @@ WARRANT_TOOLS = frozenset((
     "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
     "get_branch_stock_history", "get_branch_winrate_rank", "get_branch_event_performance",
     "get_branch_recent_behavior", "detect_current_branch_events", "get_branch_stock_position",
+    "get_branch_event_window",
 ))
 
 
@@ -761,7 +765,56 @@ def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str,
             if events:
                 sections.append({"type": "chips", "title": "近30日 A～E 事件", "items": [
                     f"{e.get('標的名稱', '')} {e.get('事件代碼', '')}｜{str(e.get('事件日', ''))[5:]}" for e in events[:8]]})
+        elif r.name == "get_branch_event_window" and d.get("found"):
+            card["branch"] = card["branch"] or d.get("branch", "")
+            card["tags"].append(f"近{d.get('trading_days')}日權證布局")
+            sections.extend(branch_window_sections(d))
     return card if sections else None
+
+
+def branch_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """分點近 N 日權證布局圖卡：期間、數字卡、事件買進 vs 減碼出清、各標的明細、最近事件、口徑說明。"""
+    period = f"近 {d.get('trading_days')} 個交易日｜{d.get('period_start')}～{d.get('period_end')}"
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": period}]
+    if not d.get("available"):
+        sections.append({"type": "note", "text": d.get("reason") or "這段期間沒有紀錄"})
+        return sections
+    buy_text = str(d.get("buy_amount_text") or "0")
+    sell_text = str(d.get("sell_amount_text") or "0")
+    sections.append({"type": "tiles", "items": [
+        {"label": "A～E 事件", "value": f"{d.get('event_count', 0)} 筆", "tone": "ink"},
+        {"label": "事件買進金額", "value": ("+" + buy_text) if buy_text != "0" else "0", "tone": "signed"},
+        {"label": "減碼／出清", "value": ("-" + sell_text) if sell_text != "0" else "0", "tone": "signed"},
+        {"label": "仍持有", "value": f"{d.get('holding_count', 0)} 筆", "tone": "accent"}]})
+    sections.append({"type": "heading", "text": "事件買進 vs 減碼出清（依金額）"})
+    sections.append({"type": "lists", "items": [
+        {"title": "事件買進", "tone": "up", "rows": [
+            {"name": f"{x['label']}｜{x['event_codes']}", "value": f"+{x['buy_amount_text']}", "extra": ""}
+            for x in d.get("buy_stocks") or []]},
+        {"title": "減碼／出清", "tone": "down", "rows": [
+            {"name": f"{x['label']}｜{x['sell_action']}",
+             "value": f"-{x['sell_amount_text']}" if x.get("sell_amount") else "金額未記錄", "extra": ""}
+            for x in d.get("sell_stocks") or []]}]})
+    table = [[x.get("stock_name") or x["stock_code"], x.get("event_codes") or "-", (x.get("first_event_date") or "-")[5:] or "-",
+              (x.get("last_event_date") or "-")[5:] or "-",
+              f"+{x['buy_amount_text']}" if x.get("buy_amount") else "-",
+              f"-{x['sell_amount_text']}" if x.get("sell_amount") else "-", x.get("state") or "-"]
+             for x in d.get("stocks") or []]
+    if table:
+        sections.append({"type": "heading", "text": "各標的事件明細"})
+        sections.append({"type": "table", "columns": ["標的", "事件", "首次", "最近", "買進", "賣出", "狀態"],
+                         "rows": table, "signed": ("買進", "賣出"), "accent": ("狀態",)})
+    events = d.get("recent_events") or []
+    if events:
+        sections.append({"type": "chips", "title": "最近 A～E 事件", "items": [
+            f"{e.get('stock_label', '')} {e.get('event', '')}｜{str(e.get('event_date', ''))[5:]}" for e in events]})
+    note = "※ 只含回測追蹤的 A～E 事件（單日權證買進 100 萬以上），小額買進不在事件表內，口徑和「近10日權證買賣」不同；減碼／出清金額取自事件表；隔日衝已排除。"
+    if d.get("coverage_note"):
+        note += f"{d['coverage_note']}。"
+    if int(d.get("requested_days") or 0) > int(d.get("trading_days") or 0):
+        note += f"天數上限 {d.get('trading_days')} 個交易日。"
+    sections.append({"type": "note", "text": note})
+    return sections
 
 
 # ============================================================
@@ -907,7 +960,10 @@ class QueryRouter:
             plan.add("get_branch_performance", branch_name=branch)
         if wants_behavior:
             plan.add("get_branch_recent_behavior", branch_name=branch)
-        if wants_trades or wants_behavior or not wants_perf:
+        if wants_trades and parsed.days_specified and parsed.window_days and parsed.window_days != 10:
+            # 「近70日買哪些權證」：近10日明細表只有固定 10 天，其他天數改用 A～E 事件表加總
+            plan.add("get_branch_event_window", branch_name=branch, days=parsed.window_days)
+        elif wants_trades or wants_behavior or not wants_perf:
             plan.add("get_branch_recent_trades", branch_name=branch)
         plan.need_final_llm = analysis or not (wants_perf or wants_trades or wants_behavior)
         return plan
@@ -2543,7 +2599,21 @@ def format_spot_branch_flow(d: Dict[str, Any]) -> str:
             f"近20日買超 {d.get('buy_days_20', 0)} 天、賣超 {d.get('sell_days_20', 0)} 天；上榜 {d.get('listed_days')}/{d.get('window_days')} 天")
 
 
+def format_branch_event_window(d: Dict[str, Any]) -> str:
+    """分點近 N 日權證布局的文字版（Log／AI 失敗時）。"""
+    if not d.get("found"):
+        return f"找不到分點：{d.get('query', '')}"
+    lines = [f"📌 {d.get('branch')} 近 {d.get('trading_days')} 日權證布局（{d.get('period_start')}～{d.get('period_end')}）",
+             f"A～E 事件 {d.get('event_count', 0)} 筆｜事件買進 {d.get('buy_amount_text')}｜減碼／出清 {d.get('sell_amount_text')}｜"
+             f"仍持有 {d.get('holding_count', 0)} 筆"]
+    for x in (d.get("buy_stocks") or [])[:5]:
+        lines.append(f"• {x['label']} {x['event_codes']}｜買進 {x['buy_amount_text']}｜{x['state']}")
+    lines.append("※ 只含 A～E 事件（單日權證買進 100 萬以上），小額買進不在事件表內。")
+    return "\n".join(lines)
+
+
 FORMATTERS.update({
+    "get_branch_event_window": format_branch_event_window,
     "get_spot_branch_flow": format_spot_branch_flow,
     "get_pattern_scorecard": format_pattern_scorecard,
     "get_top_warrant_buy_stocks": format_top_warrant,
@@ -2587,6 +2657,8 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add("新聞為近期報導整理")
         elif r.name in ("get_sheet_stock_chips", "get_branch_stock_position") and d.get("data_latest_event_date"):
             add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
+        elif r.name == "get_branch_event_window" and d.get("period_start"):
+            add(f"權證 A～E 事件 {d['period_start']}～{d['period_end']}")
         elif r.name == "get_spot_branch_flow" and d.get("data_date"):
             add(f"現股分點截至 {d['data_date']}（每日前段分點近似）")
             if d.get("price_date"):

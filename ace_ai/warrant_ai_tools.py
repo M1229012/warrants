@@ -4213,6 +4213,115 @@ def _day_trade_mask(rows: pd.DataFrame) -> pd.Series:
     return rows.apply(is_day_trade, axis=1).astype(bool)
 
 
+BRANCH_WINDOW_MAX_DAYS = max(10, _env_int("DISCORD_AI_BRANCH_WINDOW_MAX_DAYS", 250))
+
+
+def _event_codes_text(codes: List[str]) -> str:
+    """["B", "A", "B"] → "A、B×2"（依 A～E 排序）。"""
+    counts: Dict[str, int] = {}
+    for code in codes:
+        counts[code] = counts.get(code, 0) + 1
+    return "、".join(f"{c}×{n}" if n > 1 else c for c, n in sorted(counts.items()))
+
+
+def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[str, Any]:
+    """指定分點近 N 個交易日的權證布局（只讀 Sheet）：
+    - 買進＝視窗內的 A～E 事件（單日權證買進 100 萬以上；小額買進不在事件表）
+    - 減碼／出清＝事件表同一列的減碼／出清日期與金額（視窗內發生的，含視窗前買進的事件）
+    - 隔日衝事件排除（和個股權證籌碼同一套規則）"""
+    canonical, candidates = resolve_branch(branch_name)
+    if not canonical:
+        return {"found": False, "query": branch_name, "candidates": candidates, "reason": "找不到唯一符合的分點"}
+    requested = max(1, int(days or CHIPS_DAYS))
+    days = min(requested, BRANCH_WINDOW_MAX_DAYS)
+    bundle = load_abcde_event_rows()
+    events, latest = bundle["events"], bundle["latest_event_date"]
+    if latest is None:
+        raise SheetUnavailableError("A～E 事件表沒有資料")
+    start, end = _recent_event_dates(latest, days, events)
+    earliest = events["event_date"].min()
+    mine = events[events["branch"] == canonical]
+    mine = mine.drop(mine[_day_trade_mask(mine)].index)
+    try:
+        names = get_stock_name_map()
+    except Exception:
+        names = {}
+
+    def inside(value: Any) -> bool:
+        return value is not None and not pd.isna(value) and start <= pd.Timestamp(value).normalize() <= end
+
+    bought = mine[(mine["event_date"] >= start) & (mine["event_date"] <= end)]
+    stocks: Dict[str, Dict[str, Any]] = {}
+
+    def entry(code: str) -> Dict[str, Any]:
+        return stocks.setdefault(code, {"stock_code": code, "stock_name": names.get(code, ""), "codes": [], "dates": [],
+                                        "buy": 0.0, "sell": 0.0, "events": 0, "holding": 0, "exited_any": False,
+                                        "reduced_any": False})
+
+    for _, row in bought.iterrows():
+        item = entry(row["stock_code"])
+        item["codes"].append(row["event_code"])
+        item["dates"].append(pd.Timestamp(row["event_date"]))
+        item["buy"] += float(row["buy_amount"] or 0.0)
+        item["events"] += 1
+        item["holding"] += int(row["status"] != "已出清")
+    for _, row in mine.iterrows():
+        if inside(row.get("reduce_date")):
+            item = entry(row["stock_code"])
+            item["sell"] += _amount_or_zero(row.get("reduce_amount"))
+            item["reduced_any"] = True
+        if inside(row.get("exit_date")):
+            item = entry(row["stock_code"])
+            item["sell"] += _amount_or_zero(row.get("exit_amount"))
+            item["exited_any"] = True
+
+    def label(item: Dict[str, Any]) -> str:
+        return f"{item['stock_name']}（{item['stock_code']}）" if item["stock_name"] else item["stock_code"]
+
+    def state(item: Dict[str, Any]) -> str:
+        if item["events"]:
+            return "已出清" if item["holding"] == 0 else f"持有 {item['holding']}/{item['events']}"
+        return "出清" if item["exited_any"] else "減碼"
+
+    rows = []
+    for item in stocks.values():
+        rows.append({
+            "stock_code": item["stock_code"], "stock_name": item["stock_name"], "label": label(item),
+            "event_codes": _event_codes_text(item["codes"]), "event_count": item["events"],
+            "first_event_date": _fmt_date(min(item["dates"])) if item["dates"] else "",
+            "last_event_date": _fmt_date(max(item["dates"])) if item["dates"] else "",
+            "buy_amount": _num(item["buy"], 0), "buy_amount_text": _money_text(item["buy"]) if item["buy"] else "-",
+            "sell_amount": _num(item["sell"], 0), "sell_amount_text": _money_text(item["sell"]) if item["sell"] else "-",
+            "holding_count": item["holding"], "state": state(item),
+            "sell_action": "出清" if item["exited_any"] else "減碼" if item["reduced_any"] else "",
+        })
+    buys = sorted([r for r in rows if r["event_count"]], key=lambda r: (-r["buy_amount"], r["stock_code"]))
+    sells = sorted([r for r in rows if r["sell_action"]], key=lambda r: (-r["sell_amount"], r["stock_code"]))
+    recent = bought.sort_values("event_date", ascending=False).head(8)
+    total_buy = float(bought["buy_amount"].sum()) if not bought.empty else 0.0
+    total_sell = sum(r["sell_amount"] or 0.0 for r in rows)
+    note = ""
+    if earliest is not None and not pd.isna(earliest) and pd.Timestamp(start) < pd.Timestamp(earliest):
+        note = f"事件表最早只到 {_fmt_date(earliest)}，更早的事件不在表內"
+    return {
+        "found": True, "branch": canonical, "requested_days": requested, "trading_days": days,
+        "period_start": _fmt_date(start), "period_end": _fmt_date(end),
+        "period": f"{_fmt_date(start)}～{_fmt_date(end)}（{days} 個交易日）",
+        "data_latest_event_date": _fmt_date(latest), "coverage_note": note,
+        "event_count": int(len(bought)), "buy_amount_text": _money_text(total_buy) if total_buy else "0",
+        "sell_amount_text": _money_text(total_sell) if total_sell else "0",
+        "holding_count": int(sum(r["holding_count"] for r in rows)),
+        "buy_stocks": buys[:8], "sell_stocks": sells[:8],
+        "stocks": (buys + [r for r in sells if not r["event_count"]])[:10],
+        "recent_events": [{"stock_label": names.get(r["stock_code"], r["stock_code"]), "event": r["event_code"],
+                           "event_date": _fmt_date(r["event_date"])} for _, r in recent.iterrows()],
+        "available": bool(rows),
+        "reason": "" if rows else f"近 {days} 個交易日，{canonical} 沒有 A～E 權證事件或減碼出清紀錄",
+        "data_source": "回測 A～E 事件表（含每筆事件的減碼／出清金額）",
+        "definition_note": "只含回測追蹤的 A～E 事件（單日權證買進 100 萬以上），小額買進不在事件表內；隔日衝事件已排除",
+    }
+
+
 def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
     """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
 
@@ -5039,6 +5148,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_high_winrate_branches_buying": get_high_winrate_branches_buying,
     "get_branch_performance": get_branch_performance,
     "get_branch_recent_trades": get_branch_recent_trades,
+    "get_branch_event_window": get_branch_event_window,
     "get_branch_stock_history": get_branch_stock_history,
     "get_branch_winrate_rank": get_branch_winrate_rank,
     "get_recent_news": get_recent_news,
