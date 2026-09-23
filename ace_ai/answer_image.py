@@ -1021,8 +1021,12 @@ def _tag_rows(tags: list[tuple[str, str]], width: float) -> list[list[tuple[str,
 
 
 def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
+    compact = bool(card.get('compact'))
+
     def _pick(levels, base_limit):
         picked = list((levels or [])[:base_limit])
+        if compact:
+            return picked
         seen = {(str(lv.get('label', '')), float(lv.get('price'))) for lv in picked if _finite(lv.get('price')) is not None}
         # 大量區若距現價不遠，工具層已先保留；這裡再確保不要因表格列數上限被截掉。
         for lv in (levels or [])[base_limit:]:
@@ -1038,7 +1042,7 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
 
     rows = []
     # 覆盤卡會帶 level_limits（多列幾道支撐），讓成本與各均線距現價多少都看得到
-    max_res, max_sup = card.get('level_limits') or (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS)
+    max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS))
     for lv in _pick(card.get('resistances_above_close') or [], max_res):
         rows.append(('壓力', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
     for lv in _pick(card.get('supports_below_close') or [], max_sup):
@@ -1297,10 +1301,14 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
 
 def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dict, dry: bool) -> int:
     """均線扣抵＋關鍵價位＋追蹤分點；型態評分卡與覆盤持股狀態卡共用。"""
-    h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
+    compact = bool(card.get('compact'))
+    if not compact:   # 整合頁（型態＋籌碼）不放均線扣抵列
+        h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)
-    h += _sub_heading(draw, px, y + h, '關鍵價位', '均線、附近大量區與布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）', width, dry)
+    note = ('離收盤最近的壓力與支撐' if compact
+            else '均線、附近大量區與布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）')
+    h += _sub_heading(draw, px, y + h, '關鍵價位', note, width, dry)
     if levels:
         if not dry:
             _draw_level_table(draw, px, y + h, width, levels, card)
@@ -2484,6 +2492,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'
     custom_footer = next((p.get('footer_text') for p in branch_panels if p.get('footer_text')), '')
     footer = custom_footer or footer
+    suffix = next((p.get('footer_suffix') for p in branch_panels if p.get('footer_suffix')), '')
+    if suffix:
+        footer = f'{footer}｜{suffix}'
     text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
     return add_center_watermarks(image)
 

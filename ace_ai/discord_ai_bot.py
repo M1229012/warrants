@@ -237,7 +237,7 @@ WARRANT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
     (re.compile(r"跑了沒|跑了嗎|跑掉了|落跑|下車了沒|部位還在"), "分點 部位"),
 )
 # 三大法人／一般籌碼不是權證分點；句中沒有明確權證字眼時，不附加也不保留 warrant。
-_INSTITUTIONAL_RE = re.compile(r"外資|投信|自營商|三大法人|法人|一般籌碼|現股籌碼")
+_INSTITUTIONAL_RE = re.compile(r"外資|投信|自營商|三大法人|法人|一般籌碼")
 _EXPLICIT_WARRANT_RE = re.compile(r"權證|分點|主力|大戶|吃貨")
 
 
@@ -3081,7 +3081,8 @@ class AceQueryEngine:
             card = spot_chip.message_card("籌碼重點", "現股分點資料建置中",
                                           f"已建立 {report.get('available_days', 0)} / {report.get('requested_days', 70)} 個交易日，稍後再問即可看到。")
             return {"branch_card": card, "hide_text": False}, None
-        return {"branch_card": spot_chip.summary_card(report), "hide_text": False}, spot_chip.summary_payload(report)
+        return ({"branch_card": spot_chip.summary_card(report), "hide_text": False,
+                 "footer_suffix": "現股分點為每日前段分點近似統計"}, spot_chip.summary_payload(report))
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
         access_policy.require_chip(self._access(), "warrant")
@@ -3839,6 +3840,8 @@ class AceQueryEngine:
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
+                if card and getattr(parsed, "spot_combo", False):
+                    card = dict(card, compact=True)   # 型態＋籌碼整合頁：評分卡精簡（無均線扣抵、價位只留最近 1＋1）
                 if card:
                     panel["scorecard"] = card
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))

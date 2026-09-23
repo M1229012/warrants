@@ -700,16 +700,16 @@ def summary_payload(report: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:
-    """型態分析頁裡的「籌碼重點」：兩欄 Top5＋一列傾向／成本＋主要累積買超，不放大表格。"""
+    """型態分析頁裡的「籌碼重點」：兩欄 Top3＋一列傾向／成本（精簡版；完整資料在現股籌碼頁）。"""
     latest = report.get("latest_complete_date") or ""
     sections: List[Dict[str, Any]] = []
     if report.get("date_note"):
         sections.append({"type": "note", "text": report["date_note"]})
     sections.append({"type": "lists", "items": [
-        {"title": "最新 TOP5 買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
-                                                        for x in report.get("latest_top_buy") or []]},
-        {"title": "最新 TOP5 賣超", "tone": "down", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
-                                                          for x in report.get("latest_top_sell") or []]}]})
+        {"title": "最新 TOP3 買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                        for x in (report.get("latest_top_buy") or [])[:3]]},
+        {"title": "最新 TOP3 賣超", "tone": "down", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                          for x in (report.get("latest_top_sell") or [])[:3]]}]})
     periods = {p["days"]: p for p in report.get("periods") or [] if not p.get("insufficient")}
     tiles = []
     for n in (5, 20):
@@ -725,14 +725,6 @@ def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:
         if vwap.get("gap_pct") is not None:
             tiles.append({"label": "現價與均價差距", "value": f"{vwap['gap_pct']:+.2f}%", "tone": "signed"})
     sections.append({"type": "tiles", "items": tiles})
-    top3 = (report.get("cumulative_buy") or [])[:3]
-    if top3:
-        costs = {c["branch"]: c.get("est_cost") for c in report.get("continuity") or []}
-        sections.append({"type": "chips", "title": f"近{report.get('cumulative_days', 20)}日主要累積買超",
-                         "items": [f"{x['branch']} {_lots(x['net'])}" + (f"｜估算成本 {costs[x['branch']]:,.2f}"
-                                                                         if costs.get(x["branch"]) else "") for x in top3]})
-    sections.append({"type": "note", "text": f"※ 淨集中度＝Top15 買超減 Top15 賣超占成交量；{SOURCE_LIMITATION}。"
-                                             f"完整分點頁可問「代號＋現股籌碼」。"})
     return {"branch": "籌碼重點", "tags": [f"現股分點｜{_slash(latest)}"] if latest else ["現股分點"],
             "label": f"歷史 {report.get('available_days', 0)} / {report.get('requested_days', REQUESTED_DAYS)} 個交易日",
             "sections": sections}
