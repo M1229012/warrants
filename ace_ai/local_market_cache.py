@@ -27,6 +27,33 @@ DEFAULT_PATH = "/data/ace_ai_market_cache.sqlite3" if Path("/data").exists() els
 DB_PATH = Path(os.getenv("DISCORD_AI_MARKET_CACHE_DB", DEFAULT_PATH))
 _LOCK = threading.RLock()
 _INITIALIZED = False
+# 單日最高／最低價比值上限（台股漲跌幅 10%，新上市前 5 日無漲跌幅；超過這個比值視為來源錯誤）
+BAR_MAX_RANGE = max(1.2, float(os.getenv("DISCORD_AI_BAR_MAX_RANGE", "2.0") or 2.0))
+
+
+class DBError(Exception):
+    """SQLite 讀寫失敗（database locked、disk I/O、損毀）；和「查無資料」不同，呼叫端不可當成空結果。"""
+
+
+class StateCorrupt(DBError):
+    """kv 裡的 JSON 無法解析或型別不對；不可當成空清單覆蓋。"""
+
+
+def _warn(action: str, exc: BaseException) -> None:
+    print(f"⚠️ 本地資料庫{action}失敗｜{type(exc).__name__}: {exc}", flush=True)
+
+
+def valid_bar(open_: Any, high: Any, low: Any, close: Any, volume: Any = 0.0) -> bool:
+    """OHLCV 合理性：有限數字、價格 > 0、量 ≥ 0、High ≥ max(O,C,L)、Low ≤ min(O,C)、High／Low 不超過 BAR_MAX_RANGE。"""
+    try:
+        o, h, l, c, v = (float(x) for x in (open_, high, low, close, volume))
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(x) for x in (o, h, l, c, v)):
+        return False
+    if min(o, h, l, c) <= 0 or v < 0:
+        return False
+    return h >= max(o, c, l) and l <= min(o, c) and h / l <= BAR_MAX_RANGE
 
 
 def _connect() -> sqlite3.Connection:
@@ -118,6 +145,15 @@ def _connect() -> sqlite3.Connection:
                         PRIMARY KEY (stock_code, date)
                     )
                 """)
+                # 全市場收盤完整性：上市（twse）與上櫃（tpex）分開記錄，一邊成功不代表另一邊完整。
+                # status：complete／closed（交易所明確回覆當天無交易＝休市）／source_error／pending／unknown
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS market_days (
+                        date TEXT NOT NULL, market TEXT NOT NULL, status TEXT NOT NULL,
+                        rows INTEGER DEFAULT 0, source TEXT DEFAULT '', checked_at TEXT NOT NULL, detail TEXT DEFAULT '',
+                        PRIMARY KEY (date, market)
+                    )
+                """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_spot_branch_daily_branch ON spot_branch_daily(branch_name, date)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_radar_turnover_bucket ON radar_turnover(bucket, day)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_log(day)")
@@ -144,26 +180,36 @@ def save_bars(stock_code: str, df: pd.DataFrame, market: str = "", source: str =
     code = str(stock_code).strip()
     frame = df.tail(max(KEEP_DAYS + 10, 90)).copy()
     now = datetime.now(timezone.utc).isoformat()
-    rows = []
+    rows, rejected = [], 0
     for idx, row in frame.iterrows():
         try:
             date = pd.Timestamp(idx).strftime("%Y-%m-%d")
             values = [float(row.get(c)) for c in ("Open", "High", "Low", "Close")]
-            volume = float(row.get("Volume") or 0)
+            raw_volume = row.get("Volume")
+            volume = 0.0 if raw_volume is None else float(raw_volume)
         except Exception:
+            rejected += 1
+            continue
+        if not valid_bar(*values, volume):
+            rejected += 1   # NaN／Inf／負價格／OHLC 矛盾／區間不合理：不入庫
             continue
         rows.append((code, date, *values, volume, str(market or ""), str(source or ""), int(bool(confirmed)), now))
+    if rejected:
+        print(f"⚠️ {code} 日K 有 {rejected} 根數值不合理，未寫入本地底庫（來源 {source or '-'}）", flush=True)
     if not rows:
         return
     with _LOCK:
         with _db() as conn:
+            # 暫定（confirmed=0）行情不可覆蓋已確認的正式收盤；正式收盤可以覆蓋暫定。
             conn.executemany("""
                 INSERT INTO daily_bars(stock_code,date,open,high,low,close,volume,market,source,confirmed,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(stock_code,date) DO UPDATE SET
                   open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
-                  volume=excluded.volume, market=excluded.market, source=excluded.source,
-                  confirmed=excluded.confirmed, updated_at=excluded.updated_at
+                  volume=excluded.volume,
+                  market=CASE WHEN excluded.market<>'' THEN excluded.market ELSE daily_bars.market END,
+                  source=excluded.source, confirmed=excluded.confirmed, updated_at=excluded.updated_at
+                WHERE excluded.confirmed=1 OR daily_bars.confirmed=0
             """, rows)
             # Keep a little calendar headroom; exact trading-day cleanup is handled by row count.
             old = conn.execute("SELECT date FROM daily_bars WHERE stock_code=? ORDER BY date DESC LIMIT 1 OFFSET ?", (code, KEEP_DAYS + 9)).fetchone()
@@ -189,7 +235,8 @@ def load_bars(stock_code: str, limit: int = KEEP_DAYS, confirmed_only: bool = Tr
                     sql += " AND confirmed=1"
                 sql += " ORDER BY date DESC LIMIT ?"
                 rows = conn.execute(sql, (code, int(limit))).fetchall()
-    except Exception:
+    except Exception as exc:
+        _warn(f"讀取日K（{code}）", exc)
         return None
     if not rows:
         return None
@@ -272,12 +319,12 @@ def save_market_day(rows: Iterable[Dict[str, Any]], date: str, source: str = "")
             values = [float(row[k]) for k in ("open", "high", "low", "close")]
         except (KeyError, TypeError, ValueError):
             continue
-        if not code or any(v <= 0 for v in values):
-            continue
         try:
             volume = float(row.get("volume") or 0)
         except (TypeError, ValueError):
             volume = 0.0
+        if not code or not valid_bar(*values, volume):
+            continue
         payload.append((code, day, *values, volume, str(row.get("market") or ""), source, 1, now))
     if not payload:
         return 0
@@ -446,7 +493,8 @@ def get_state(key: str, default: Any = None) -> Any:
             with _db() as conn:
                 row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
         return json.loads(row[0]) if row else default
-    except Exception:
+    except Exception as exc:
+        _warn(f"讀取狀態（{key}）", exc)
         return default
 
 
@@ -459,8 +507,46 @@ def set_state(key: str, value: Any) -> None:
                              (str(key), json.dumps(value, ensure_ascii=False, default=str),
                               datetime.now(timezone.utc).isoformat()))
                 conn.commit()
-    except Exception:
+    except Exception as exc:
+        _warn(f"寫入狀態（{key}）", exc)
         return
+
+
+def append_state_list(key: str, record: Any, keep: int = 0) -> List[Any]:
+    """在同一個 SQLite transaction 內 讀 → 附加 → 寫 → commit（BEGIN IMMEDIATE 先取得寫入鎖），
+    兩個請求同時新增時不會後寫蓋掉前寫。原資料壞掉（JSON 錯誤或不是清單）時丟 StateCorrupt，不當成空清單覆蓋。"""
+    with _LOCK:
+        try:
+            with _db() as conn:
+                conn.isolation_level = None
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
+                    if row:
+                        try:
+                            items = json.loads(row[0])
+                        except (TypeError, ValueError) as exc:
+                            raise StateCorrupt(f"{key} 內容無法解析：{exc}") from exc
+                        if not isinstance(items, list):
+                            raise StateCorrupt(f"{key} 不是清單（{type(items).__name__}）")
+                    else:
+                        items = []
+                    items.append(record)
+                    if keep:
+                        items = items[-int(keep):]
+                    conn.execute("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                                 (str(key), json.dumps(items, ensure_ascii=False, default=str),
+                                  datetime.now(timezone.utc).isoformat()))
+                    conn.execute("COMMIT")
+                    return items
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+        except DBError:
+            raise
+        except sqlite3.Error as exc:
+            raise DBError(f"寫入 {key} 失敗：{exc}") from exc
 
 
 def delete_state(key: str) -> None:
@@ -483,16 +569,27 @@ def _write(sql: str, params: tuple) -> None:
             with _db() as conn:
                 conn.execute(sql, params)
                 conn.commit()
-    except Exception:
+    except Exception as exc:
+        _warn("寫入", exc)
         return
 
 
-def _read(sql: str, params: tuple) -> List[tuple]:
+def _read_strict(sql: str, params: tuple) -> List[tuple]:
+    """讀取失敗丟 DBError（查無資料＝空清單；DB 壞掉／被鎖＝DBError，兩者不可混用）。"""
     try:
         with _LOCK:
             with _db() as conn:
                 return conn.execute(sql, params).fetchall()
-    except Exception:
+    except Exception as exc:
+        _warn("讀取", exc)
+        raise DBError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _read(sql: str, params: tuple) -> List[tuple]:
+    """非關鍵資料的讀取：失敗記 Log 後回空清單（盤中雷達、量能取樣這類可以晚點再試的資料）。"""
+    try:
+        return _read_strict(sql, params)
+    except DBError:
         return []
 
 
@@ -502,40 +599,47 @@ SPOT_KEEP_CALENDAR_DAYS = 160   # 約 110 個交易日，足夠 70 日統計＋�
 
 def save_spot_day(stock_code: str, date: str, rows: Iterable[Dict[str, Any]], status: str,
                   source: str = "", detail: str = "") -> int:
-    """寫入單一股票單一交易日的現股分點（UPSERT）與狀態；同一交易內完成，中途失敗不會留下半天資料。"""
+    """寫入單一股票單一交易日的現股分點與狀態（同一個 transaction）。
+    - complete：先刪掉該股該日所有舊分點，再寫入這次完整 snapshot（來源更正後不會殘留舊分點）。
+    - 其他狀態（pending_update／retry／source_error…）：不動分點資料；已經是 complete 的日子也不會被降級。"""
     if status not in SPOT_STATUSES:
         raise ValueError(f"unknown spot status: {status}")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     items = []
-    for row in rows or []:
-        name = str(row.get("branch_name") or "").strip()
-        if not name:
-            continue
-        buy, sell = float(row.get("buy") or 0), float(row.get("sell") or 0)
-        net = float(row["net"]) if row.get("net") is not None else buy - sell
-        items.append((str(stock_code), str(date), name, buy, sell, net, source, now))
+    if status == "complete":
+        for row in rows or []:
+            name = str(row.get("branch_name") or "").strip()
+            if not name:
+                continue
+            buy, sell = float(row.get("buy") or 0), float(row.get("sell") or 0)
+            net = float(row["net"]) if row.get("net") is not None else buy - sell
+            items.append((str(stock_code), str(date), name, buy, sell, net, source, now))
     with _LOCK:
         with _db() as conn, conn:
-            conn.executemany(
-                "INSERT INTO spot_branch_daily(stock_code,date,branch_name,buy,sell,net,source,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stock_code,date,branch_name) DO UPDATE SET "
-                "buy=excluded.buy, sell=excluded.sell, net=excluded.net, source=excluded.source, updated_at=excluded.updated_at",
-                items)
+            if status == "complete":
+                conn.execute("DELETE FROM spot_branch_daily WHERE stock_code=? AND date=?", (str(stock_code), str(date)))
+                conn.executemany(
+                    "INSERT INTO spot_branch_daily(stock_code,date,branch_name,buy,sell,net,source,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stock_code,date,branch_name) DO UPDATE SET "
+                    "buy=excluded.buy, sell=excluded.sell, net=excluded.net, source=excluded.source, updated_at=excluded.updated_at",
+                    items)
             conn.execute(
                 "INSERT INTO spot_branch_days(stock_code,date,status,checked_at,source,rows,detail) VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(stock_code,date) DO UPDATE SET status=excluded.status, checked_at=excluded.checked_at, "
-                "source=excluded.source, rows=excluded.rows, detail=excluded.detail",
+                "source=excluded.source, rows=excluded.rows, detail=excluded.detail "
+                "WHERE excluded.status='complete' OR spot_branch_days.status<>'complete'",
                 (str(stock_code), str(date), status, now, source, len(items), str(detail)[:300]))
     return len(items)
 
 
 def spot_day_status(stock_code: str, dates: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """讀取失敗丟 DBError（不可當成「都還沒抓」而整批重抓富邦）。"""
     dates = [str(d) for d in dates]
     if not dates:
         return {}
     marks = ",".join("?" * len(dates))
-    rows = _read(f"SELECT date,status,checked_at,rows FROM spot_branch_days WHERE stock_code=? AND date IN ({marks})",
-                 (str(stock_code), *dates))
+    rows = _read_strict(f"SELECT date,status,checked_at,rows FROM spot_branch_days WHERE stock_code=? AND date IN ({marks})",
+                        (str(stock_code), *dates))
     return {r[0]: {"status": r[1], "checked_at": r[2], "rows": int(r[3] or 0)} for r in rows}
 
 
@@ -544,8 +648,8 @@ def load_spot_rows(stock_code: str, dates: Iterable[str]) -> List[Dict[str, Any]
     if not dates:
         return []
     marks = ",".join("?" * len(dates))
-    rows = _read(f"SELECT date,branch_name,buy,sell,net FROM spot_branch_daily WHERE stock_code=? AND date IN ({marks})",
-                 (str(stock_code), *dates))
+    rows = _read_strict(f"SELECT date,branch_name,buy,sell,net FROM spot_branch_daily WHERE stock_code=? AND date IN ({marks})",
+                        (str(stock_code), *dates))
     return [{"date": r[0], "branch_name": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
 
 
@@ -558,6 +662,78 @@ def spot_branch_history(branch_name: str, since: str) -> List[Dict[str, Any]]:
 
 def spot_branch_names() -> List[str]:
     return [r[0] for r in _read("SELECT DISTINCT branch_name FROM spot_branch_daily", ())]
+
+
+# ============================================================
+# 全市場收盤完整性（上市／上櫃分開）
+# ============================================================
+
+MARKETS = ("twse", "tpex")
+MARKET_STATUSES = ("complete", "closed", "source_error", "pending", "unknown")
+
+
+def save_market_status(date: str, market: str, status: str, rows: int = 0, source: str = "", detail: str = "") -> None:
+    if market not in MARKETS or status not in MARKET_STATUSES:
+        raise ValueError(f"unknown market status: {market}/{status}")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _LOCK:
+        with _db() as conn, conn:
+            # 已確認 complete 的日子不會被之後一次失敗的重抓降級
+            conn.execute(
+                "INSERT INTO market_days(date,market,status,rows,source,checked_at,detail) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(date,market) DO UPDATE SET status=excluded.status, rows=excluded.rows, source=excluded.source, "
+                "checked_at=excluded.checked_at, detail=excluded.detail "
+                "WHERE excluded.status='complete' OR market_days.status<>'complete'",
+                (str(date), market, status, int(rows or 0), str(source or ""), now, str(detail or "")[:300]))
+
+
+def market_status(dates: Iterable[str]) -> Dict[str, Dict[str, str]]:
+    """{date: {"twse": status, "tpex": status}}；沒記錄的市場＝unknown。讀取失敗丟 DBError。"""
+    dates = [str(d) for d in dates]
+    out = {d: {m: "unknown" for m in MARKETS} for d in dates}
+    for start in range(0, len(dates), 400):
+        chunk = dates[start:start + 400]
+        marks = ",".join("?" * len(chunk))
+        for date, market, status in _read_strict(
+                f"SELECT date,market,status FROM market_days WHERE date IN ({marks})", tuple(chunk)):
+            if date in out and market in MARKETS:
+                out[date][market] = status
+    return out
+
+
+def market_closed_days(dates: Iterable[str]) -> List[str]:
+    """上市與上櫃都「明確回覆當天無交易」才算全市場休市（颱風假等）；只有一邊或沒紀錄都不算。"""
+    status = market_status(dates)
+    return [d for d, s in status.items() if all(s[m] == "closed" for m in MARKETS)]
+
+
+def stock_market(stock_code: str) -> str:
+    """這檔股票屬於上市（twse）還是上櫃（tpex）：以全市場底庫寫入的 market 欄為準；不知道回空字串。"""
+    rows = _read_strict("SELECT market FROM daily_bars WHERE stock_code=? AND market IN ('twse','tpex') "
+                        "ORDER BY date DESC LIMIT 1", (str(stock_code).strip(),))
+    return str(rows[0][0]) if rows else ""
+
+
+def bar_dates(stock_code: str, dates: Iterable[str]) -> List[str]:
+    """指定日期中，本地底庫有這檔日K 的日子。"""
+    dates = [str(d) for d in dates]
+    if not dates:
+        return []
+    marks = ",".join("?" * len(dates))
+    return [str(r[0]) for r in _read_strict(
+        f"SELECT date FROM daily_bars WHERE stock_code=? AND date IN ({marks})", (str(stock_code).strip(), *dates))]
+
+
+def stock_absent_confirmed(stock_code: str, dates: Iterable[str]) -> List[str]:
+    """「市場有開、這檔確定沒成交」的日子：該股所屬市場當天收盤快照 complete，而快照裡沒有這檔。
+    不知道所屬市場、或該市場當天不是 complete（例如櫃買抓失敗）一律不算，交給呼叫端 retry。"""
+    dates = [str(d) for d in dates]
+    market = stock_market(stock_code)
+    if not dates or market not in MARKETS:
+        return []
+    status = market_status(dates)
+    have = set(bar_dates(stock_code, dates))
+    return [d for d in dates if status[d][market] == "complete" and d not in have]
 
 
 def append_radar_snapshot(day: str, snapshot: Dict[str, Any]) -> None:

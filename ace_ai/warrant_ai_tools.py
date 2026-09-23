@@ -369,7 +369,32 @@ def apply_bot_process_env() -> Dict[str, str]:
 # ============================================================
 
 _FINMIND_TOKEN_LOCK = threading.Lock()
-_FINMIND_TOKEN_STATE = {"index": 0}
+# blocked：token → (解除時間 monotonic, 原因)。授權失敗（illegal／401／403）停用較久；429／逾時／5xx 只短暫冷卻。
+_FINMIND_TOKEN_STATE: Dict[str, Any] = {"index": 0, "blocked": {}}
+FINMIND_AUTH_COOLDOWN = _env_float("DISCORD_AI_FINMIND_AUTH_COOLDOWN", 12 * 3600.0)
+FINMIND_TRANSIENT_COOLDOWN = _env_float("DISCORD_AI_FINMIND_TRANSIENT_COOLDOWN", 60.0)
+_FINMIND_TRANSIENT_RE = re.compile(r"429|too many|rate limit|timed? ?out|timeout|50[0-4]|connection|temporarily", re.I)
+
+
+class FinMindUnavailable(RuntimeError):
+    """所有 FinMind Token 都在停用／冷卻中：直接快速失敗，改走備援，不再每個請求重撞一次。"""
+
+
+def _token_healthy(token: str) -> bool:
+    blocked = _FINMIND_TOKEN_STATE.setdefault("blocked", {}).get(token)
+    return not blocked or blocked[0] <= time.monotonic()
+
+
+def mark_finmind_token(token: str, reason: str, transient: bool) -> None:
+    """授權失敗＝這個行程內長時間停用；暫時性錯誤（429／逾時／5xx）＝短暫冷卻，不判定 Token 無效。"""
+    if not token:
+        return
+    seconds = FINMIND_TRANSIENT_COOLDOWN if transient else FINMIND_AUTH_COOLDOWN
+    with _FINMIND_TOKEN_LOCK:
+        _FINMIND_TOKEN_STATE.setdefault("blocked", {})[token] = (time.monotonic() + seconds, str(reason)[:160])
+    tokens = finmind_tokens()
+    label = f"#{tokens.index(token) + 1}" if token in tokens else "?"
+    print(f"⚠️ FinMind Token {label} {'暫時冷卻' if transient else '停用'} {seconds:.0f} 秒｜{str(reason)[:160]}", flush=True)
 
 
 def finmind_tokens() -> List[str]:
@@ -383,11 +408,17 @@ def finmind_tokens() -> List[str]:
 
 
 def current_finmind_token() -> str:
+    """目前優先的 Token；跳過停用／冷卻中的。全部不可用時回空字串。"""
     tokens = finmind_tokens()
     if not tokens:
         return ""
     with _FINMIND_TOKEN_LOCK:
-        return tokens[_FINMIND_TOKEN_STATE["index"] % len(tokens)]
+        start = _FINMIND_TOKEN_STATE["index"] % len(tokens)
+        for offset in range(len(tokens)):
+            token = tokens[(start + offset) % len(tokens)]
+            if _token_healthy(token):
+                return token
+    return ""
 
 
 def _finmind_token_failed(kf, exc: BaseException) -> bool:
@@ -426,20 +457,32 @@ def install_finmind_failover(kf) -> None:
         token = current_finmind_token()
         if token:
             return token
+        if finmind_tokens():
+            raise FinMindUnavailable("FinMind Token 全部停用或冷卻中")
         if original_require is None:
             raise RuntimeError("找不到 FINMIND_API_TOKEN")
         return original_require()
 
     def get_with_failover(*args, **kwargs):
-        attempts = max(1, len(finmind_tokens()))
+        tokens = finmind_tokens()
+        attempts = max(1, len(tokens))
         for attempt in range(attempts):
             token = current_finmind_token()
+            if tokens and not token:
+                # Circuit breaker：全部 Token 都不可用，快速失敗讓呼叫端改走備援，不再每題重撞
+                raise FinMindUnavailable("FinMind Token 全部停用或冷卻中，略過 FinMind")
             try:
                 return original_get(*args, **kwargs)
+            except FinMindUnavailable:
+                raise
             except Exception as exc:
-                if attempt + 1 >= attempts or not _finmind_token_failed(kf, exc):
+                if _finmind_token_failed(kf, exc):
+                    mark_finmind_token(token, str(exc), transient=False)
+                elif len(tokens) > 1 and _FINMIND_TRANSIENT_RE.search(f"{type(exc).__name__} {exc}"):
+                    mark_finmind_token(token, str(exc), transient=True)   # 429／逾時／5xx：短暫冷卻，不判定無效
+                else:
                     raise
-                if not rotate_finmind_token(str(exc), failed=token):
+                if attempt + 1 >= attempts:
                     raise
 
     kf._require_finmind_token = require_token
@@ -1445,6 +1488,10 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame, market: str = "") ->
         return stock_df, {}
     if not quote or quote["date"] <= last_date:
         return stock_df, {}
+    if quote["date"] != pd.Timestamp(now.date()):
+        # 來源日期不是今天（例如開盤前富果仍回昨天的報價）：不可當成今天的盤中行情
+        print(f"⚠️ {code} 富果報價日期 {_fmt_date(quote['date'])} 不是今天，不接盤中K棒", flush=True)
+        return stock_df, {}
     volume_shares = _quote_volume_shares(quote["trade_volume"])
     bar = pd.DataFrame(
         [[quote["open"], quote["high"], quote["low"], quote["close"], volume_shares]],
@@ -1685,6 +1732,14 @@ def fetch_index_quote(code: str) -> Dict[str, Any]:
     return fetch_mis_index_quote(code)
 
 
+def mis_item_is_today(item: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    """MIS 每筆報價的 d（YYYYMMDD）要是今天；帶了日期但不是今天＝前一交易日資料。沒帶日期時無法判斷，不擋。"""
+    day = str((item or {}).get("d") or "").strip()
+    if not day:
+        return True
+    return day == (now or taipei_now()).strftime("%Y%m%d")
+
+
 def fetch_mis_index_quote(code: str) -> Dict[str, Any]:
     """證交所 MIS 指數報價（免金鑰、不佔富果額度）。"""
     channel = MIS_INDEX_CHANNEL.get(str(code).upper())
@@ -1736,6 +1791,9 @@ def _append_index_intraday(code: str, frame: pd.DataFrame) -> Tuple[pd.DataFrame
         print(f"⚠️ {code} 指數即時報價略過：{type(exc).__name__}: {exc}", flush=True)
         return frame, {}
     if quote["date"] <= last_date:
+        return frame, {}
+    if quote["date"] != pd.Timestamp(now.date()):
+        print(f"⚠️ {code} 指數報價日期 {_fmt_date(quote['date'])} 不是今天，不接盤中K棒", flush=True)
         return frame, {}
     bar = pd.DataFrame([[quote["open"], quote["high"], quote["low"], quote["close"], 0.0]],
                        index=pd.DatetimeIndex([quote["date"]]),
@@ -1865,6 +1923,19 @@ MAX_ACCEPTED_GAPS = 3
 _ACCEPTED_GAPS: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
 
 
+def legal_gap_days(code: str, gaps: List[str]) -> List[str]:
+    """能證明合法的缺口：全市場確認休市（上市＋上櫃都明確回覆無交易），或該股所屬市場當天收盤快照 complete
+    卻沒有這檔（交易所快照＋其他來源都沒有＝確定沒成交）。其餘一律不算（包含 DB 讀不到）。"""
+    if not gaps:
+        return []
+    try:
+        closed = set(local_market_cache.market_closed_days(gaps))
+        absent = set(local_market_cache.stock_absent_confirmed(code, [d for d in gaps if d not in closed]))
+    except local_market_cache.DBError:
+        return []
+    return [d for d in gaps if d in closed or d in absent]
+
+
 def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str) -> Tuple[pd.DataFrame, str]:
     """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。"""
     columns = ["Open", "High", "Low", "Close", "Volume"]
@@ -1944,13 +2015,14 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
             merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
-            if len(gaps) > MAX_ACCEPTED_GAPS:
-                # 缺太多天多半是資料源壞掉，均線會全錯，寧可不答。
-                raise ToolDataError(f"{code} 日K 缺少 {'、'.join(gaps)} 的資料，資料不完整，暫時無法分析")
+            unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps))]
+            if len(gaps) > MAX_ACCEPTED_GAPS or unproven:
+                # 補不回來、又沒有休市或停牌證據的缺口：均線／布林會算錯，寧可不答（不假設是停牌或休市）。
+                raise ToolDataError(f"{code} 日K 缺少 {'、'.join(unproven or gaps)} 的資料，資料不完整，暫時無法做技術分析")
             if gaps:
-                # 各來源都確定沒有這幾天（停牌、颱風假、無成交）：視為該股無交易日，照常分析並標註。
+                # 有證據的缺口（全市場確認休市，或所屬市場收盤快照完整卻沒有這檔＝確定沒成交）才照常分析並標註。
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
-                print(f"⚠️ {code} 日K {'、'.join(gaps)} 各來源都沒有資料，視為該股無交易日（停牌／休市／無成交），照常分析", flush=True)
+                print(f"⚠️ {code} 日K {'、'.join(gaps)} 已確認為休市或該股無成交，照常分析", flush=True)
         closed = kf.calculate_indicators(daily_df)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:
@@ -4696,6 +4768,8 @@ def _mis_quotes(channels: List[str]) -> List[Dict[str, Any]]:
         record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
     rows = []
     for item in payload.get("msgArray") or []:
+        if not mis_item_is_today(item):
+            continue   # 昨天的報價不可當今天盤中
         try:
             close = float(item.get("z") or item.get("o") or 0)
             previous = float(item.get("y") or 0)

@@ -1254,6 +1254,23 @@ class GeminiGateway:
         return GeminiResult(ok=False, error=last_error or "Gemini 讀圖失敗", latency=latency, purpose=purpose,
                             rate_limited=bool(re.search(r"429|RESOURCE_EXHAUSTED|quota", last_error, re.I)))
 
+    @staticmethod
+    def _generate_with_model(kf: Any, model: str, prompt: str, schema: Optional[Dict[str, Any]],
+                             temperature: float) -> Optional[str]:
+        """指定模型呼叫一次（逐一換 API Key）；模型只當這次呼叫的參數，不動任何全域設定。"""
+        config: Dict[str, Any] = {"temperature": max(0.0, min(2.0, float(temperature)))}
+        if schema and getattr(kf, "GEMINI_STRUCTURED_OUTPUT_ENABLE", True):
+            config.update(response_mime_type="application/json", response_schema=schema)
+        for key in kf._get_warrants_api_keys():
+            try:
+                response = kf.genai.Client(api_key=key).models.generate_content(model=model, contents=prompt, config=config)
+                text = str(response.text or "")
+                if text:
+                    return text
+            except Exception as exc:  # google-genai 例外型別眾多，換下一支 Key
+                _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
+        return None
+
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         if not self._quota_left():
             self.log(f"Gemini 今日次數已達上限 {self.DAILY_LIMIT}，改用規則式輸出：{purpose}")
@@ -1286,17 +1303,16 @@ class GeminiGateway:
                     return None
 
         text = call()
-        model_used = kf.GEMINI_MODEL
-        if (not text and GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != kf.GEMINI_MODEL
+        primary = model_used = kf.GEMINI_MODEL
+        if (not text and GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != primary
                 and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or ""))):
-            self.log(f"主模型 {kf.GEMINI_MODEL} 塞車或限流，改用備援模型 {GEMINI_FALLBACK_MODEL} 再試一次")
-            primary, model_used = kf.GEMINI_MODEL, GEMINI_FALLBACK_MODEL
-            kf.GEMINI_MODEL = GEMINI_FALLBACK_MODEL
-            try:
-                _GEMINI_ERROR_STATE.last = ""
-                text = call()
-            finally:
-                kf.GEMINI_MODEL = primary
+            # 備援模型只用在這一次呼叫（per-call 指定 model），不改主程式的全域 GEMINI_MODEL，
+            # 否則同時進行的其他請求會被迫用錯模型。
+            self.log(f"主模型 {primary} 塞車或限流，改用備援模型 {GEMINI_FALLBACK_MODEL} 再試一次")
+            model_used = GEMINI_FALLBACK_MODEL
+            _GEMINI_ERROR_STATE.last = ""
+            with self._lock:
+                text = self._generate_with_model(kf, GEMINI_FALLBACK_MODEL, prompt, schema, temperature)
         latency = time.perf_counter() - started
         last_error = str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")
         # 目前主程式的 _call_gemini_with_retry 只回傳文字，不暴露 usage_metadata；
@@ -1307,7 +1323,7 @@ class GeminiGateway:
         total_tokens = input_tokens + output_tokens
         self.log(
             f"Gemini 呼叫｜用途={purpose}｜model={model_used}"
-            f"{'（備援）' if model_used != kf.GEMINI_MODEL else ''}｜latency={latency:.2f}s｜"
+            f"{'（備援）' if model_used != primary else ''}｜latency={latency:.2f}s｜"
             f"prompt={len(prompt):,} 字｜tokens≈{input_tokens}+{output_tokens}={total_tokens}（estimated）｜"
             f"結果={'成功' if text else '失敗'}"
         )
@@ -1585,7 +1601,7 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
 
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
                     "解讀要同時整合技術面與籌碼面：why 先說技術結構，再用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
-                    "主要累積買超分點、VWAP 與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
+                    "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
                     "只引用 1～3 個關鍵籌碼數字，不要逐一念分點；外資券商分點不等於外資法人；資料日期不是今天時要說明資料截至哪天。")
 
 
@@ -2996,6 +3012,7 @@ class AceQueryEngine:
         parsed.spot_branch = spot_chip.match_branch(question)
         parsed.chip = access_policy.chip_type(question, access.entitlement if access else None,
                                               known_branch=bool(parsed.branches or parsed.branch_candidates or parsed.spot_branch),
+                                              warrant_branch=bool(parsed.branches or parsed.branch_candidates),
                                               # 只有真的追問（沿用上一題的股票／分點）才沿用上一題的籌碼類型
                                               remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
         access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
@@ -3021,8 +3038,11 @@ class AceQueryEngine:
             question = f"{question}（權證分點籌碼）"
             parsed.intents = set(parsed.intents) | {"warrant"}
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
+        # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
+        sector = parsed.sector or {}
         key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
-                        "chip=" + parsed.chip])
+                        "chip=" + parsed.chip,
+                        "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -3088,7 +3108,14 @@ class AceQueryEngine:
         entitlement = access.entitlement if access else None
         want_spot = entitlement is None or entitlement.spot
         want_warrant = chip == "combined" and (entitlement is None or entitlement.warrant)
-        spot = self._answer_spot(parsed, question, started) if want_spot else None
+        try:
+            spot = self._answer_spot(parsed, question, started) if want_spot else None
+        except local_market_cache.DBError as exc:
+            # 本地資料庫讀不到≠沒資料：不重抓富邦，直接告知暫時無法讀取（錯誤只給本人看）
+            self.log(f"現股分點本地資料庫錯誤：{exc}")
+            card = spot_chip.message_card("現股分點籌碼", "本地資料暫時無法讀取", "資料庫忙碌或異常，請稍後再試。")
+            spot = self._spot_result(card, self._chip_title(parsed, "現股分點籌碼"), False, started, "現股分點本地資料庫錯誤")
+            spot = replace(spot, errors=[f"SpotDB：{exc}"])
         warrant = self._answer_warrant_chip(parsed, question, started) if want_warrant else None
         main = spot or warrant
         denials = [] if chip != "combined" else [k for k, ok in (("SPOT", want_spot), ("WARRANT", want_warrant)) if not ok]
@@ -3099,7 +3126,8 @@ class AceQueryEngine:
         access_policy.require_chip(self._access(), "spot")
         code = next(c for c, _ in parsed.stocks if c not in tools.INDEX_CODES)
         try:
-            report = spot_chip.build_report(code, "full")
+            # quick：只等最近完整日幾秒，70 日歷史交給背景補；圖上標「歷史 x / 70」，不讓整合頁卡 20～60 秒
+            report = spot_chip.build_report(code, "quick")
         except Exception as exc:
             self.log(f"籌碼重點略過：{type(exc).__name__}: {exc}")
             return None, None
@@ -3409,7 +3437,12 @@ class AceQueryEngine:
         else:
             review = trade_review.fallback_review(payload)
             self.log(f"   覆盤 Gemini 失敗，改用程式版｜{result.error}")
-        record = trade_review.save_note(context_key, payload, review, source, raw_input=question)
+        try:
+            record = trade_review.save_note(context_key, payload, review, source, raw_input=question)
+        except local_market_cache.DBError as exc:
+            # 覆盤紀錄損壞或資料庫忙碌：不覆蓋舊紀錄，這次覆盤照常顯示但不存
+            self.log(f"⚠️ 覆盤紀錄未儲存｜{type(exc).__name__}: {exc}")
+            record = {"trade_id": payload.get("trade_id"), "save_error": str(exc)}
         heading = trade_review.title(payload)
         body = trade_review.review_text(payload, review)
         self.log(

@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -35,6 +36,8 @@ REQUEST_GAP = float(os.getenv("DISCORD_AI_SPOT_REQUEST_GAP", "0.2") or 0.2)
 # 會員這一題最多等幾秒補歷史；沒補完的日期在背景繼續補，下一題就是完整資料。
 BACKFILL_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKFILL_BUDGET", "25") or 25)
 BACKGROUND_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKGROUND_BUDGET", "600") or 600)
+# 型態＋籌碼整合頁：只等最近完整日這幾秒，歷史全部背景補
+QUICK_BUDGET = float(os.getenv("DISCORD_AI_SPOT_QUICK_BUDGET", "8") or 8)
 TODAY_READY = os.getenv("DISCORD_AI_SPOT_TODAY_READY", "15:30").strip() or "15:30"
 # 狀態：complete（有可信分點）／pending_update（最新交易日富邦尚未更新）／market_closed（全市場休市）
 # ／stock_no_trade（市場有開、個股沒成交）／source_error（抓取失敗）／retry（歷史日有成交但來源仍無資料）。
@@ -108,11 +111,25 @@ def _number(text: str) -> Optional[float]:
         return None
 
 
-def parse_zco_html(html: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """回傳 (status, rows)。status：complete（有分點）、no_data（頁面正常但當日沒有資料）、source_error（找不到表格）。
+# 被擋／錯誤頁的特徵（不用「登入」：正常頁首也有登入連結）
+_BLOCK_MARKERS = ("captcha", "驗證碼", "access denied", "request rejected", "403 forbidden", "too many requests",
+                  "請輸入驗證", "系統忙碌", "service unavailable")
+
+
+def validate_spot_snapshot(html: str, stock_code: str = "") -> Tuple[str, List[Dict[str, Any]], str]:
+    """富邦 zco 頁完整性驗證 → (status, rows, detail)。
+    complete：有買超／賣超表頭、兩側都有分點、每列買進／賣出都能解析、頁面沒被截斷、（有給代號時）頁面是這檔股票。
+    no_data：頁面正常但當天沒有任何分點（富邦尚未更新或個股沒成交，由呼叫端依日期與市場資料判斷）。
+    partial：只有一側、欄位解析異常或 HTML 被截斷；blocked：被擋／錯誤頁；source_error：找不到分點表格。
     買超側與賣超側都完整保留（不做 Top50 截斷）；net 一律用 買進−賣出 重算，不沿用來源的正負號或絕對值。"""
+    text = str(html or "")
+    low = text.lower()
+    if not text.strip():
+        return "source_error", [], "空白頁"
+    if any(marker in low for marker in _BLOCK_MARKERS):
+        return "blocked", [], "疑似被擋或錯誤頁"
     parser = _TableRows()
-    parser.feed(str(html or ""))
+    parser.feed(text)
     header_index = buy_col = sell_col = -1
     for index, row in enumerate(parser.rows):
         if any("買超券商" in c for c in row) and any("賣超券商" in c for c in row):
@@ -121,20 +138,43 @@ def parse_zco_html(html: str) -> Tuple[str, List[Dict[str, Any]]]:
             sell_col = next(i for i, c in enumerate(row) if "賣超券商" in c)
             break
     if header_index < 0:
-        return ("no_data" if "查無" in str(html or "") or "無資料" in str(html or "") else "source_error"), []
+        if "查無" in text or "無資料" in text:
+            return "no_data", [], "來源回覆查無資料"
+        return "source_error", [], "找不到分點表格"
+    if "</table>" not in low[low.find("買超券商".lower()):] or "</html>" not in low:
+        return "partial", [], "HTML 被截斷"
     merged: Dict[str, Dict[str, Any]] = {}
+    sides = {buy_col: 0, sell_col: 0}
+    bad = 0
     for row in parser.rows[header_index + 1:]:
         for start in (buy_col, sell_col):
-            if len(row) < start + 4:
+            if len(row) <= start:
                 continue
             name = row[start].strip()
             if not name or any(word in name for word in ("合計", "平均", "買超券商", "賣超券商")):
                 continue
-            buy, sell = _number(row[start + 1]), _number(row[start + 2])
+            buy = _number(row[start + 1]) if len(row) > start + 1 else None
+            sell = _number(row[start + 2]) if len(row) > start + 2 else None
             if buy is None or sell is None:
+                bad += 1
                 continue
+            sides[start] += 1
             merged[name] = {"branch_name": name, "buy": buy, "sell": sell, "net": buy - sell}
-    return ("complete" if merged else "no_data"), list(merged.values())
+    if bad:
+        return "partial", [], f"{bad} 列買進／賣出欄位無法解析"
+    if not merged:
+        return "no_data", [], "頁面正常但沒有分點"
+    if not sides[buy_col] or not sides[sell_col]:
+        return "partial", [], "只有買超側" if sides[buy_col] else "只有賣超側"
+    if stock_code and str(stock_code) not in text:
+        return "source_error", [], "頁面內容不是這檔股票"
+    return "complete", list(merged.values()), ""
+
+
+def parse_zco_html(html: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """相容舊介面：回傳 (status, rows)；status 同 validate_spot_snapshot。"""
+    status, rows, _ = validate_spot_snapshot(html)
+    return status, rows
 
 
 # ============================================================
@@ -147,22 +187,29 @@ def _source_url(stock_code: str, date: str) -> str:
 
 @contextmanager
 def open_source() -> Iterator[Callable[[str, str], str]]:
-    """yield fetch(stock_code, date) -> html。HTTP 預設；selenium 模式整輪只開一個 Chrome。"""
+    """yield fetch(stock_code, date) -> html。HTTP 預設；selenium 模式整輪只開一個 Chrome。
+    正式 Docker 沒有 Chromium／selenium：設成 selenium 但環境不支援時記 Log 並改用 HTTP，不讓整個功能崩潰。"""
+    driver = None
     if FETCHER == "selenium":
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.webdriver.support.ui import WebDriverWait
-        options = Options()
-        for flag in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                     "--blink-settings=imagesEnabled=false", "--window-size=960,720"):
-            options.add_argument(flag)
-        if os.getenv("CHROME_BIN", "").strip():
-            options.binary_location = os.getenv("CHROME_BIN", "").strip()
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(int(os.getenv("PAGE_LOAD_TIMEOUT", "25")))
-
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support import expected_conditions as EC
+            from selenium.webdriver.support.ui import WebDriverWait
+            options = Options()
+            for flag in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                         "--blink-settings=imagesEnabled=false", "--window-size=960,720"):
+                options.add_argument(flag)
+            if os.getenv("CHROME_BIN", "").strip():
+                options.binary_location = os.getenv("CHROME_BIN", "").strip()
+            driver = webdriver.Chrome(options=options)
+            driver.set_page_load_timeout(int(os.getenv("PAGE_LOAD_TIMEOUT", "25")))
+        except Exception as exc:
+            print(f"⚠️ DISCORD_AI_SPOT_FETCHER=selenium 但環境沒有可用的 selenium／Chromium，改用 HTTP｜"
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            driver = None
+    if driver is not None:
         def fetch(stock_code: str, date: str) -> str:
             driver.get(_source_url(stock_code, date))
             WebDriverWait(driver, int(os.getenv("WAIT_TABLE_SEC", "10"))).until(
@@ -202,20 +249,16 @@ def _stock_lock(stock_code: str) -> threading.Lock:
 # ============================================================
 
 def market_closed_dates(official: Sequence[str]) -> List[str]:
-    """行事曆上是交易日、但全市場日 K 底庫在它的涵蓋範圍內沒有任何行情的日子（颱風假等臨時休市）。
-    底庫涵蓋不完整時（例如剛部署、還在補歷史）不判定，避免把還沒同步的日子誤當休市。"""
-    base = set(local_market_cache.known_dates(400))
-    if not base:
+    """預定交易日中「實際全市場休市」的日子（颱風假、臨時停止交易）：必須上市與上櫃都有交易所明確回覆
+    當天無交易（local_market_cache.market_days = closed）。本地底庫沒資料不是休市證據，不會自行推論。"""
+    try:
+        return local_market_cache.market_closed_days(official)
+    except local_market_cache.DBError:
         return []
-    lo, hi = min(base), max(base)
-    inside = [d for d in official if lo <= d <= hi]
-    if not inside or len([d for d in inside if d in base]) / len(inside) < 0.9:
-        return []
-    return [d for d in inside if d not in base]
 
 
 def trading_dates(end: datetime, count: int) -> List[str]:
-    """實際開市日（不含週末、國定假日、臨時休市）；官方行事曆失敗時改用本地日 K 底庫已有的交易日。"""
+    """實際開市日（預定交易日扣掉確認休市日）；官方行事曆失敗時改用本地日 K 底庫已有的交易日。"""
     start = end - timedelta(days=int(count * 1.7) + 20)
     try:
         days = [_iso(d) for d in tools.core()._get_official_trading_dates(start, end)]
@@ -228,17 +271,22 @@ def trading_dates(end: datetime, count: int) -> List[str]:
     return [d for d in days if d not in closed][-count:]
 
 
+# 最新日還沒更新時，70 日窗口以最近完整日為終點往前數，所以多準備幾天舊日期
+WINDOW_BUFFER = 3
+
+
 def candidate_dates(now: Optional[datetime] = None) -> Tuple[List[str], str]:
-    """最近的實際交易日（舊→新，最多 71 天：今天若還沒更新，70 日窗口仍可以昨天為終點）＋今天的狀態：
+    """最近的實際交易日（舊→新，70＋緩衝天數）＋今天的狀態：
     today_ready（時間到了可以「嘗試」抓今天，不代表一定完成）／intraday（盤中或未到時間，不抓今天）／closed_day。"""
     now = now or tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
-    days = trading_dates(now, REQUESTED_DAYS + 1)
+    want = REQUESTED_DAYS + WINDOW_BUFFER
+    days = trading_dates(now, want + 1)
     if today not in days:
-        return days[-REQUESTED_DAYS:], "closed_day"
+        return days[-want:], "closed_day"
     if now.strftime("%H:%M") < TODAY_READY:
-        return [d for d in days if d != today][-REQUESTED_DAYS:], "intraday"
-    return days[-(REQUESTED_DAYS + 1):], "today_ready"
+        return [d for d in days if d != today][-want:], "intraday"
+    return days[-(want + 1):], "today_ready"
 
 
 def _needs_fetch(info: Optional[Dict[str, Any]], date: str, today: str, now: datetime) -> bool:
@@ -259,26 +307,39 @@ def _needs_fetch(info: Optional[Dict[str, Any]], date: str, today: str, now: dat
     return (datetime.now(timezone.utc) - checked).total_seconds() >= wait
 
 
-def _no_data_status(date: str, latest_date: str, bar_dates: Sequence[str]) -> str:
-    """來源查不到分點時：最新交易日＝富邦可能還沒更新（pending_update）；
-    歷史日且日 K 底庫確認個股當天沒成交＝stock_no_trade；歷史日但個股有成交（或無法確認）＝retry，之後再試。"""
+def _no_data_status(stock_code: str, date: str, latest_date: str) -> str:
+    """富邦頁面正常但沒有分點時：
+    - 最新交易日＝富邦可能還沒更新 → pending_update（不是停牌、不是 0 張）
+    - 歷史日：該股所屬市場當天收盤快照 complete、快照裡確實沒有這檔（交易所＋富邦兩個來源都沒有）→ stock_no_trade
+    - 其他（市場快照不完整、不知道所屬市場）→ retry，之後再確認"""
     if date >= latest_date:
         return "pending_update"
-    bars = set(bar_dates or ())
-    if bars and min(bars) <= date <= max(bars) and date not in bars:
+    if date in local_market_cache.stock_absent_confirmed(stock_code, [date]):
         return "stock_no_trade"
     return "retry"
+
+
+def _fetch_status(state: str, stock_code: str, date: str, latest_date: str) -> str:
+    """validate_spot_snapshot 的結果 → spot_branch_days 狀態。"""
+    if state == "complete":
+        return "complete"
+    if state == "no_data":
+        return _no_data_status(stock_code, date, latest_date)
+    if state == "partial":
+        return "pending_update" if date >= latest_date else "retry"   # 疑似不完整：不存 complete
+    return "source_error"                                             # blocked／錯誤頁／找不到表格
 
 
 def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None) -> Dict[str, int]:
-    """只補缺少的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補，全域同時最多 MAX_CONCURRENCY。
-    latest_date＝目前最新交易日（查不到資料時判 pending_update）；bar_dates＝個股日 K 日期（判斷停牌）。"""
+    """只補還沒確認的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補（拿到鎖後重讀狀態，
+    同一 stock＋date 不會重抓），全域同時最多 MAX_CONCURRENCY。latest_date＝目前最新交易日（查不到資料時判 pending_update）。
+    回傳的 remaining 是「重新讀 DB 後仍未確認」的天數（嘗試過≠完成）。bar_dates 保留相容，不再用來判斷停牌。
+    DB 讀取失敗（DBError）直接往上丟，不會因此整批重抓富邦。"""
     now = now or tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
     latest_date = latest_date or (max(dates) if dates else today)
-    bar_dates = list(bar_dates) if bar_dates is not None else list(_bars(stock_code).keys())
     lock = _stock_lock(stock_code)
     # 背景正在補同一檔時，會員這一題不排隊等它：直接用資料庫已有的資料回答。
     if not lock.acquire(timeout=max(0.0, budget if lock_wait is None else lock_wait)):
@@ -286,49 +347,65 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
     try:
         status = local_market_cache.spot_day_status(stock_code, dates)
         missing = sorted((d for d in dates if _needs_fetch(status.get(d), d, today, now)), reverse=True)
-        bars = set(bar_dates)
-        for date in list(missing):
-            # 市場有開、個股日 K 確認當天沒成交（停牌）：不必問富邦，直接確認
-            if date < latest_date and bars and min(bars) <= date <= max(bars) and date not in bars:
-                local_market_cache.save_spot_day(stock_code, date, [], "stock_no_trade", "daily_bars")
-                missing.remove(date)
-        if not missing:
-            return {"fetched": 0, "remaining": 0}
-        deadline = time.monotonic() + budget
         fetched = errors = 0
-        if not _SEMAPHORE.acquire(timeout=max(1.0, budget)):
-            return {"fetched": 0, "remaining": len(missing), "busy": 1}
-        try:
-            with fetch_source() as fetch:
-                for date in missing:
-                    if time.monotonic() >= deadline:
-                        break
-                    started = time.perf_counter()
-                    try:
-                        state, rows = parse_zco_html(fetch(stock_code, date))
-                        if state == "no_data":
-                            state = _no_data_status(date, latest_date, bar_dates)
-                        local_market_cache.save_spot_day(stock_code, date, rows, state, SOURCE_NAME)
-                        tools.record_api_event("SpotBranch", status=200, latency=time.perf_counter() - started)
+        if missing:
+            deadline = time.monotonic() + budget
+            if not _SEMAPHORE.acquire(timeout=max(1.0, budget)):
+                return {"fetched": 0, "remaining": _unresolved(stock_code, dates), "busy": 1}
+            try:
+                with fetch_source() as fetch:
+                    for date in missing:
+                        if time.monotonic() >= deadline:
+                            break
+                        started = time.perf_counter()
+                        try:
+                            state, rows, detail = validate_spot_snapshot(fetch(stock_code, date), stock_code)
+                            final = _fetch_status(state, stock_code, date, latest_date)
+                            local_market_cache.save_spot_day(stock_code, date, rows if final == "complete" else [],
+                                                             final, SOURCE_NAME, detail)
+                            tools.record_api_event("SpotBranch", status=200, latency=time.perf_counter() - started)
+                            if state in ("blocked", "source_error"):
+                                errors += 1
+                        except local_market_cache.DBError:
+                            raise
+                        except Exception as exc:   # 失敗不當成 0：記 source_error，已完成的日期保留
+                            errors += 1
+                            local_market_cache.save_spot_day(stock_code, date, [], "source_error", SOURCE_NAME,
+                                                             f"{type(exc).__name__}: {exc}")
+                            tools.record_api_event("SpotBranch", status=500, latency=time.perf_counter() - started)
                         fetched += 1
-                    except Exception as exc:   # 失敗不當成 0：記 source_error，已完成的日期保留
-                        errors += 1
-                        local_market_cache.save_spot_day(stock_code, date, [], "source_error", SOURCE_NAME,
-                                                         f"{type(exc).__name__}: {exc}")
-                        tools.record_api_event("SpotBranch", status=500, latency=time.perf_counter() - started)
                         if errors >= 3:
-                            break   # 來源異常時不要一路打完 70 天
-                    time.sleep(REQUEST_GAP)
-        finally:
-            _SEMAPHORE.release()
-        return {"fetched": fetched, "remaining": max(0, len(missing) - fetched), "errors": errors}
+                            break   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
+                        time.sleep(REQUEST_GAP)
+            finally:
+                _SEMAPHORE.release()
+        return {"fetched": fetched, "remaining": _unresolved(stock_code, dates), "errors": errors}
     finally:
         lock.release()
 
 
+def _unresolved(stock_code: str, dates: Sequence[str]) -> int:
+    """重新讀 DB：還沒 complete／stock_no_trade／market_closed 的天數。"""
+    status = local_market_cache.spot_day_status(stock_code, dates)
+    return sum(1 for d in dates if (status.get(d) or {}).get("status") not in CONFIRMED_STATUSES)
+
+
+# 背景補資料：固定 worker 數的執行緒池（不再每檔開一條新 Thread），同一檔排隊中／執行中只算一次。
+BACKGROUND_WORKERS = max(1, int(os.getenv("DISCORD_AI_SPOT_BACKGROUND_WORKERS", "1") or 1))
+_BACKGROUND_POOL: Optional[ThreadPoolExecutor] = None
+
+
+def _background_pool() -> ThreadPoolExecutor:
+    global _BACKGROUND_POOL
+    with _BACKGROUND_GUARD:
+        if _BACKGROUND_POOL is None:
+            _BACKGROUND_POOL = ThreadPoolExecutor(max_workers=BACKGROUND_WORKERS, thread_name_prefix="spot-backfill")
+        return _BACKGROUND_POOL
+
+
 def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: str,
-                           bar_dates: Sequence[str], fetch_source=open_source) -> bool:
-    """這一題的時間用完但還有日期沒補：背景繼續補（同一檔只開一條），不擋住 Discord 回覆。"""
+                           bar_dates: Sequence[str] = (), fetch_source=open_source) -> bool:
+    """這一題的時間用完但還有日期沒補：交給背景 worker 繼續補（同一檔同時只排一次），不擋住 Discord 回覆。"""
     code = str(stock_code)
     with _BACKGROUND_GUARD:
         if code in _BACKGROUND:
@@ -338,15 +415,20 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
     def run() -> None:
         try:
             result = ensure_days(code, dates, budget=BACKGROUND_BUDGET, fetch_source=fetch_source,
-                                 latest_date=latest_date, bar_dates=bar_dates, lock_wait=BACKGROUND_BUDGET)
-            print(f"📚 現股分點背景補資料｜{code}｜新增 {result.get('fetched', 0)} 日｜尚缺 {result.get('remaining', 0)}", flush=True)
+                                 latest_date=latest_date, lock_wait=BACKGROUND_BUDGET)
+            print(f"📚 現股分點背景補資料｜{code}｜嘗試 {result.get('fetched', 0)} 日｜仍未確認 {result.get('remaining', 0)}", flush=True)
         except Exception as exc:
             print(f"⚠️ 現股分點背景補資料失敗｜{code}｜{type(exc).__name__}: {exc}", flush=True)
         finally:
             with _BACKGROUND_GUARD:
                 _BACKGROUND.discard(code)
 
-    threading.Thread(target=run, name=f"spot-backfill-{code}", daemon=True).start()
+    try:
+        _background_pool().submit(run)
+    except RuntimeError:   # 行程關閉中
+        with _BACKGROUND_GUARD:
+            _BACKGROUND.discard(code)
+        return False
     return True
 
 
@@ -394,18 +476,41 @@ def scenario(buy_ratio: float, sell_ratio: float, net_conc: float) -> str:
     return "中性"
 
 
+def listing_days(stock_code: str, dates: Sequence[str], bars: Dict[str, Tuple[float, float]]) -> Optional[int]:
+    """新上市股票：有可靠證據（第一根日K 之前，所屬市場收盤快照 complete 卻沒有這檔）才回傳上市後的交易日數；
+    否則回 None（requested_days 固定 70，不因行事曆暫時不足而縮短）。"""
+    if not bars:
+        return None
+    first = min(bars)
+    before = [d for d in dates if d < first]
+    if not before:
+        return None
+    try:
+        absent = local_market_cache.stock_absent_confirmed(stock_code, before[-3:])
+    except local_market_cache.DBError:
+        return None
+    if len(absent) < min(3, len(before[-3:])):
+        return None
+    return sum(1 for d in dates if d >= first)
+
+
 def analyze(stock_code: str, dates: Sequence[str], statuses: Dict[str, Dict[str, Any]],
-            rows: Sequence[Dict[str, Any]], bars: Dict[str, Tuple[float, float]]) -> Dict[str, Any]:
+            rows: Sequence[Dict[str, Any]], bars: Dict[str, Tuple[float, float]],
+            requested: Optional[int] = None) -> Dict[str, Any]:
     complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
     latest = complete[-1] if complete else ""
-    # 70 日窗口一律以「最新完整日」為終點：今天還沒更新時不把今天塞進窗口（不會變成 69/70）
-    dates = [d for d in dates if not latest or d <= latest][-REQUESTED_DAYS:]
+    requested = int(requested or REQUESTED_DAYS)
+    # 70 日窗口一律以「最近完整日」為終點往前數 70 個實際交易日：今天 pending_update 時不把今天塞進窗口（不會變成 69/70）
+    dates = [d for d in dates if not latest or d <= latest][-requested:]
     complete = [d for d in complete if d in dates]
     confirmed = [d for d in dates if (statuses.get(d) or {}).get("status") in ("complete", "stock_no_trade")]
     by_date: Dict[str, Dict[str, float]] = defaultdict(dict)
     for row in rows:
         by_date[row["date"]][row["branch_name"]] = row["net"]
-    report: Dict[str, Any] = {"requested_days": min(REQUESTED_DAYS, len(dates)) if dates else REQUESTED_DAYS,
+    # requested＝應有天數（行事曆暫時不足時不縮短）；resolved＝complete＋確認沒成交；data＝有分點資料；
+    # unresolved＝pending_update／source_error／retry／還沒抓（含行事曆缺的天數）。market_closed 根本不在窗口裡。
+    report: Dict[str, Any] = {"requested_days": requested, "resolved_days": len(confirmed), "data_days": len(complete),
+                              "unresolved_days": max(0, requested - len(confirmed)),
                               "available_days": len(confirmed), "latest_complete_date": latest, "periods": [],
                               "source_limitation": SOURCE_LIMITATION,
                               "window_dates": list(dates), "complete_dates": list(complete)}   # 單一分點明細用
@@ -425,9 +530,13 @@ def analyze(stock_code: str, dates: Sequence[str], statuses: Dict[str, Dict[str,
         net = _sum_by_branch(rows, window)
         buy15 = sum(v for _, v in _top(net, True, 15))
         sell15 = -sum(v for _, v in _top(net, False, 15))
+        # 分母完整性：窗口內每個有分點資料的日子都要有成交量，否則比例會被高估，不計算集中度
+        volume_complete = all((bars.get(d) or (0, 0))[1] > 0 for d in window if d in complete)
         volume = sum((bars.get(d) or (0, 0))[1] for d in window)
         item.update(top15_buy=buy15, top15_sell=sell15)
-        if volume > 0:
+        if not volume_complete:
+            item["ratio_unavailable"] = True
+        elif volume > 0:
             buy_ratio, sell_ratio = buy15 / volume * 100, sell15 / volume * 100
             net_conc = (buy15 - sell15) / volume * 100
             item.update(buy_ratio=round(buy_ratio, 2), sell_ratio=round(sell_ratio, 2), net_concentration=round(net_conc, 2),
@@ -490,30 +599,39 @@ def branch_history(buyers: Sequence[Dict[str, Any]], dates: Sequence[str], compl
 
 def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = None,
                  budget: float = BACKFILL_BUDGET, fetch_source=open_source) -> Dict[str, Any]:
-    """mode=full：補齊最近 70 個交易日後分析；mode=latest：只確保最近一個完整交易日（不 backfill 70 日）。"""
+    """mode=full：補最近 70 個交易日後分析（有時間上限，沒補完的交給背景）；
+    mode=latest：只確保最近一個完整交易日；
+    mode=quick：型態＋籌碼整合頁用，只確保最近完整日（幾秒內），其餘歷史一律交給背景，先用本地已有資料回答。
+    本地資料庫讀取失敗時丟 local_market_cache.DBError（不當成沒資料去整批重抓）。"""
     now = now or tools.taipei_now()
     dates, today_state = candidate_dates(now)
     if not dates:
         return {"error": "trading_calendar", "requested_days": REQUESTED_DAYS, "available_days": 0}
-    bar_dates = list(_bars(stock_code).keys())
-    if mode == "latest":
+    if mode in ("latest", "quick"):
         progress = {"fetched": 0, "remaining": 0}
+        step_budget = min(budget, 30 if mode == "latest" else QUICK_BUDGET)
         for date in reversed(dates[-4:]):   # 最新一天還沒更新（pending_update）才往前找，最多 4 天
-            step = ensure_days(stock_code, [date], budget=min(budget, 30), now=now, fetch_source=fetch_source,
-                               latest_date=dates[-1], bar_dates=bar_dates)
+            step = ensure_days(stock_code, [date], budget=step_budget, now=now, fetch_source=fetch_source,
+                               latest_date=dates[-1], lock_wait=0.5 if mode == "quick" else None)
             progress["fetched"] += step.get("fetched", 0)
             if (local_market_cache.spot_day_status(stock_code, [date]).get(date) or {}).get("status") == "complete":
                 break
+        if mode == "quick":
+            progress["remaining"] = _unresolved(stock_code, dates)
+            if progress["remaining"]:
+                progress["background"] = continue_in_background(stock_code, dates, dates[-1], (), fetch_source)
     else:
         progress = ensure_days(stock_code, dates, budget=budget, now=now, fetch_source=fetch_source,
-                               latest_date=dates[-1], bar_dates=bar_dates, lock_wait=2.0)
+                               latest_date=dates[-1], lock_wait=2.0)
         if progress.get("remaining") and not progress.get("errors"):
             # 時間用完（或背景正在補）：剩下的日期背景繼續，這一題先用已有的資料回答
-            progress["background"] = continue_in_background(stock_code, dates, dates[-1], bar_dates, fetch_source)
+            progress["background"] = continue_in_background(stock_code, dates, dates[-1], (), fetch_source)
     statuses = local_market_cache.spot_day_status(stock_code, dates)
     complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
     rows = local_market_cache.load_spot_rows(stock_code, complete)
-    report = analyze(stock_code, dates, statuses, rows, _bars(stock_code))
+    bars = _bars(stock_code)
+    report = analyze(stock_code, dates, statuses, rows, bars,
+                     requested=min(REQUESTED_DAYS, listing_days(stock_code, dates, bars) or REQUESTED_DAYS))
     today = now.strftime("%Y-%m-%d")
     report["pending_update"] = [d for d in dates if (statuses.get(d) or {}).get("status") == "pending_update"]
     report.update(mode=mode, today_state=today_state, progress=progress,
@@ -627,7 +745,10 @@ def _branch_label(item: Dict[str, Any]) -> str:
 
 def history_footer(report: Dict[str, Any]) -> str:
     have, want = int(report.get("available_days") or 0), int(report.get("requested_days") or REQUESTED_DAYS)
-    state = f"歷史資料｜{have} / {want} 個交易日" if have >= want else f"歷史資料建置中｜{have} / {want} 個交易日"
+    data = int(report.get("data_days", have) or 0)
+    # 已確認＝有分點資料＋確認當天沒成交；例如 69 天有資料＋1 天停牌＝70/70 已確認、有效分點 69 日
+    state = (f"歷史日期｜{have} / {want} 已確認｜有效分點資料｜{data} 日" if have >= want
+             else f"歷史資料建置中｜{have} / {want} 個交易日")
     until = report.get("latest_complete_date")
     return f"股市艾斯  /  現股券商分點資料｜{state}" + (f"｜資料截至 {_slash(until)}" if until else "")
 
@@ -687,7 +808,7 @@ def report_card(report: Dict[str, Any], stock_code: str, stock_name: str) -> Dic
             gap = vwap.get("gap_pct")
             sections.append({"type": "heading", "text": "成本"})
             sections.append({"type": "tiles", "items": [
-                {"label": f"近{vwap['days']}日均價（VWAP）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"},
+                {"label": f"近{vwap['days']}日量價加權均價（估）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"},
                 {"label": "最新收盤", "value": f"{vwap['close']:,.2f}", "tone": "ink"},
                 {"label": "與均價差距", "value": f"{gap:+.2f}%" if gap is not None else "-", "tone": "signed"}]})
         if report.get("history"):
@@ -729,7 +850,7 @@ def branch_card(report: Dict[str, Any], names: Dict[str, str]) -> Dict[str, Any]
 
 
 def summary_payload(report: Dict[str, Any]) -> Dict[str, Any]:
-    """給 AI 解讀用的精簡現股籌碼（最新 Top5、5／20 日傾向、主要累積買超、VWAP）。"""
+    """給 AI 解讀用的精簡現股籌碼（最新 Top5、5／20 日傾向、主要累積買超、量價加權均價（估））。"""
     periods = {p["days"]: p for p in report.get("periods") or [] if not p.get("insufficient")}
     return {
         "type": "現股券商分點籌碼（不是三大法人）",
@@ -835,7 +956,7 @@ def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:
             tiles.append({"label": f"近{n}日", "value": "資料不足", "tone": "ink"})
     vwap = report.get("vwap") or {}
     if vwap.get("vwap"):
-        tiles.append({"label": f"近{vwap['days']}日均價（VWAP）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"})
+        tiles.append({"label": f"近{vwap['days']}日量價加權均價（估）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"})
         if vwap.get("gap_pct") is not None:
             tiles.append({"label": "現價與均價差距", "value": f"{vwap['gap_pct']:+.2f}%", "tone": "signed"})
     sections.append({"type": "tiles", "items": tiles})

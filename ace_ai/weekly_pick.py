@@ -1699,7 +1699,8 @@ _WEEKLY_STYLE_FILE = os.path.join(os.path.dirname(__file__), "weekly_style_examp
 def load_weekly_style_examples(max_chars: int = 9000) -> str:
     """載入使用者過往週精選文案，僅作語氣／結構參考。"""
     try:
-        text = open(_WEEKLY_STYLE_FILE, "r", encoding="utf-8").read().strip()
+        with open(_WEEKLY_STYLE_FILE, "r", encoding="utf-8") as handle:
+            text = handle.read().strip()
     except OSError:
         return ""
     return text[:max(1000, int(max_chars))]

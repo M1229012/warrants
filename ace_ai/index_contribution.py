@@ -563,6 +563,8 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
 
         for item in payload.get("msgArray") or []:
             channel = str(item.get("ch") or "")
+            if not tools.mis_item_is_today(item):
+                continue   # 前一交易日的報價不可當今天盤中
             if channel == MIS_BENCHMARK[market]:
                 prev = _number(item.get("y"))
                 current = _number(item.get("z")) or _number(item.get("o"))

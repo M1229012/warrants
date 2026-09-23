@@ -145,22 +145,26 @@ def require_feature(access, policy=FeaturePolicy()):
 # 籌碼類型：現股分點（SPOT）／權證分點（WARRANT）／兩種一起（COMBINED）
 # ============================================================
 
-_EXPLICIT_WARRANT_CHIP_RE = re.compile(r"權證|ABCDE|事件勝率|(?<![A-Z])[A-E](?:事件|類|級|型)|事件[A-E]|[A-E][～~至][A-E]|勝率")
+# 裸「勝率」不算權證（「2330型態勝率」「外資勝率」不是權證）；要有 A～E 事件、事件勝率、權證勝率，或權證分點名稱＋勝率。
+_EXPLICIT_WARRANT_CHIP_RE = re.compile(r"權證|ABCDE|事件勝率|(?<![A-Z])[A-E](?:事件|類|級|型)|事件[A-E]|[A-E][～~至][A-E]")
+_WIN_RATE_RE = re.compile(r"勝率")
 _EXPLICIT_SPOT_CHIP_RE = re.compile(r"現股|券商分點|集中度")
 _COMBINED_CHIP_RE = re.compile(r"(?:兩種|兩個|二種|雙).{0,6}(?:籌碼|分點)?.{0,4}(?:一起|比較|對照)|(?:一起|比較|對照).{0,4}(?:兩種|兩個)")
 _AMBIGUOUS_CHIP_RE = re.compile(r"籌碼|分點|主力|誰.{0,2}在?買|誰.{0,2}買最多|吃貨|有沒有進|加碼|減碼|大戶|布局|佈局|在買什麼|買什麼|跑了沒|出貨|部位")
 _INSTITUTIONAL_ONLY_RE = re.compile(r"外資|投信|自營商|三大法人|法人")
 
 
-def chip_type(question, entitlement=None, known_branch=False, remembered=""):
+def chip_type(question, entitlement=None, known_branch=False, remembered="", warrant_branch=False):
     """回傳 "spot" / "warrant" / "combined" / ""（不是籌碼題）。
 
-    明確字眼優先（現股＋權證或「兩種一起」＝combined；權證／A～E 事件／勝率＝warrant；現股／券商分點＝spot）；
-    模糊的「籌碼、分點、主力、誰在買」：有 SPOT 權限就 spot，只有 WARRANT 才 warrant；追問沿用 remembered。
+    明確字眼優先（現股＋權證或「兩種一起」＝combined；權證／A～E 事件／事件勝率＝warrant；現股／券商分點＝spot）；
+    「勝率」只有搭配權證分點名稱（warrant_branch）才算權證；模糊的「籌碼、分點、主力、誰在買」：
+    有 SPOT 權限就 spot，只有 WARRANT 才 warrant；追問沿用 remembered。
     外資／投信／三大法人是法人籌碼（institutional），不是券商分點。
     """
     value = re.sub(r"[\s_－-]+", "", str(question or "")).upper()
-    warrant = bool(_EXPLICIT_WARRANT_CHIP_RE.search(value))
+    warrant = bool(_EXPLICIT_WARRANT_CHIP_RE.search(value)) or (
+        warrant_branch and bool(_WIN_RATE_RE.search(value)) and not _EXPLICIT_SPOT_CHIP_RE.search(value))
     spot = bool(_EXPLICIT_SPOT_CHIP_RE.search(value))
     if (warrant and spot) or _COMBINED_CHIP_RE.search(value):
         return "combined"
@@ -203,8 +207,9 @@ def require_question(access, question, known_branches=(), parsed=None):
     named = any(len(alias) >= 3 and re.sub(r"[\s_－-]+", "", alias).upper() in value
                 for alias in known_branches)
     remembered = getattr(parsed, "chip", "") if parsed is not None else ""
-    kind = chip_type(question, access.entitlement, known_branch=named or bool(parsed and (parsed.branches or parsed.branch_candidates)),
-                     remembered=remembered)
+    warrant_named = named or bool(parsed and (parsed.branches or parsed.branch_candidates))
+    kind = chip_type(question, access.entitlement, known_branch=warrant_named, remembered=remembered,
+                     warrant_branch=warrant_named)
     if not kind and parsed is not None and getattr(parsed, "event_type", ""):
         kind = "warrant"
     require_chip(access, kind)

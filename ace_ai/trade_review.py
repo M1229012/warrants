@@ -1243,7 +1243,6 @@ def save_note(context_key: str, payload: Dict[str, Any], review: Dict[str, Any],
     """使用者原始輸入（user_entry_reason_raw／user_input_raw）與 Gemini 覆盤（gemini_review）分開存，
     Gemini 的結果永遠不會覆蓋使用者原文。回傳存進去的那一筆。"""
     key = _user_key(context_key)
-    notes = list(local_market_cache.get_state(key, []) or [])
     trade = payload["trade"]
     record = {
         "trade_id": payload.get("trade_id"), "at": time.time(),
@@ -1262,8 +1261,8 @@ def save_note(context_key: str, payload: Dict[str, Any], review: Dict[str, Any],
         # ↓ AI 產生的覆盤：另外一欄
         "gemini_review": review, "review_source": source,
     }
-    notes.append(record)
-    local_market_cache.set_state(key, notes[-KEEP_NOTES:])
+    # 同一個 SQLite transaction 內讀→附加→寫；原紀錄損壞時丟 StateCorrupt，不會當空清單覆蓋掉
+    local_market_cache.append_state_list(key, record, keep=KEEP_NOTES)
     return record
 
 

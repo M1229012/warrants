@@ -64,8 +64,8 @@ def fetch_sector_quotes() -> Dict[str, Any]:
     market_turnover: Optional[float] = None
     for item in payload.get("msgArray") or []:
         channel, name = str(item.get("ch") or ""), str(item.get("n") or "")
-        if not channel or not name:
-            continue
+        if not channel or not name or not tools.mis_item_is_today(item):
+            continue   # 前一交易日的報價不可當今天盤中
         if channel == "t00.tw":
             _log_t00_payload(item)
             market_turnover = _market_turnover(item)
@@ -139,6 +139,11 @@ def _key(day: str) -> str:
 
 
 def _load_day(day: str) -> List[Dict[str, Any]]:
+    """當天所有快照（舊→新）。一張快照一列（radar_snapshots），不再整包 JSON 重寫；
+    部署當天若新表還沒有資料，退回讀舊版 kv 快照。"""
+    rows = local_market_cache.load_radar_snapshots(day)
+    if rows:
+        return rows
     data = local_market_cache.get_state(_key(day), []) or []
     return data if isinstance(data, list) else []
 
@@ -184,12 +189,11 @@ def _tick(force: bool) -> Dict[str, Any]:
                   "change_pct": round(float(r.get("change_pct") or 0.0), 2)}
                  for index, r in enumerate(rows, 1)],
     }
-    snaps.append(snapshot)
-    # 保留當日第一張（Δ 的退路基準），其餘只留最近 60 張；重啟後仍讀得到。
-    kept = snaps[-60:]
-    if snaps and snaps[0] not in kept:
-        kept = [snaps[0]] + kept[1:]
-    local_market_cache.set_state(_key(day), kept)
+    # 只新增這一張（append-only）；當天第一張自然保留，重啟後仍讀得到。過期資料由每日維護清除。
+    if not local_market_cache.load_radar_snapshots(day):
+        for old in snaps:                                  # 部署當天：先把舊版 kv 裡今天的快照搬進新表
+            local_market_cache.append_radar_snapshot(day, old)
+    local_market_cache.append_radar_snapshot(day, snapshot)
     if market_turnover:
         # 分母可用時才做全類股成員掃描並存同時點成交占比歷史（成交熱度的基準）；
         # 同一 5 分鐘桶的報價查詢時直接共用，不會再打一次。
@@ -417,8 +421,6 @@ SMALL_SECTOR = 10                   # 成分股少於此數，卡片註明檔數
 BROAD_MIN, SPLIT_MIN, GAP_MIN = 0.60, 0.50, 0.80
 HEAT_HOT, HEAT_COLD = 1.2, 1.0
 HEAT_MIN_DAYS, HEAT_MAX_DAYS = 5, 20
-TURNOVER_KEEP_DAYS = 45             # 日曆天；成交占比歷史保留
-_TURNOVER_PREFIX = "radar_turnover:"
 _QUOTE_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}   # {5 分鐘桶: {代號: 報價}}
 _QUOTE_LOCK = threading.Lock()
 _ONCE: Dict[str, str] = {}
@@ -501,7 +503,7 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
     for item in items:
         code = str(item.get("c") or "")
         price, previous = _mis_price(item), _num_field(item, "y")
-        if code and price > 0 and previous > 0:
+        if code and price > 0 and previous > 0 and tools.mis_item_is_today(item):
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
@@ -595,25 +597,13 @@ def save_turnover_history(day: str, bucket: str, market_turnover: float) -> None
         priced = [c for c in codes if c in quotes]
         if priced and len(priced) / len(codes) >= MIN_COVERAGE:
             sectors[sid] = round(sum(quotes[c]["value"] for c in priced))
-    key = _TURNOVER_PREFIX + day
-    data = local_market_cache.get_state(key, {}) or {}
-    data[bucket] = {"market": market_turnover, "sectors": sectors}
-    local_market_cache.set_state(key, data)
-    from datetime import timedelta
-    old = (_now() - timedelta(days=TURNOVER_KEEP_DAYS)).strftime("%Y-%m-%d")
-    local_market_cache.delete_state(_TURNOVER_PREFIX + old)
+    # 一個時點一列（radar_turnover），過期資料由每日維護清除
+    local_market_cache.save_radar_turnover(day, bucket, {"market": market_turnover, "sectors": sectors})
 
 
-def _turnover_history(today: str) -> List[Dict[str, Any]]:
-    """今天以前的成交占比歷史（新到舊，最多往回 40 個日曆天）。"""
-    from datetime import datetime, timedelta
-    base = datetime.strptime(today, "%Y-%m-%d")
-    out = []
-    for back in range(1, 41):
-        data = local_market_cache.get_state(_TURNOVER_PREFIX + (base - timedelta(days=back)).strftime("%Y-%m-%d"))
-        if data:
-            out.append(data)
-    return out
+def _turnover_history(today: str, bucket: str) -> List[Dict[str, Any]]:
+    """今天以前、同一個 5 分鐘桶的成交占比歷史（新到舊），格式 [{bucket: {market, sectors}}]。"""
+    return [{bucket: data} for data in local_market_cache.load_radar_turnover(bucket, today, limit=HEAT_MAX_DAYS)]
 
 
 def _turnover_heat(sid: str, bucket: str, share_now: Optional[float],
@@ -735,7 +725,7 @@ def enrich(rows: List[Dict[str, Any]], data: Dict[str, Any]) -> bool:
         quotes = _quotes_for(sorted({c for codes in members.values() for c in codes}))
         market = data.get("market_turnover")
         bucket = _bucket_of(data.get("time", ""))
-        history = _turnover_history(_now().strftime("%Y-%m-%d")) if market else []
+        history = _turnover_history(_now().strftime("%Y-%m-%d"), bucket) if market else []
         for row in rows:
             stat = sector_stats(row, members.get(row["sector_id"], []), quotes, liquid, shares)
             share = stat["turnover"] / market if stat.get("available") and market else None

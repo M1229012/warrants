@@ -13,7 +13,7 @@ import json
 import re
 import time
 from datetime import date as _date, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import warrant_ai_tools as tools
 import local_market_cache
@@ -126,25 +126,83 @@ def _rows_from_tpex(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+# 一個市場當天普通股少於這個數量，視為回應不完整（正常上市約 1,000 檔、上櫃約 800 檔）。
+MIN_ROWS = {"twse": max(1, tools._env_int("DISCORD_AI_MARKET_MIN_ROWS_TWSE", 500)),
+            "tpex": max(1, tools._env_int("DISCORD_AI_MARKET_MIN_ROWS_TPEX", 300))}
+
+
+def _twse_empty(payload: Dict[str, Any]) -> bool:
+    """證交所明確回覆「沒有符合條件的資料」（休市日）；其他非 OK 狀態不算。"""
+    return "沒有符合條件" in str(payload.get("stat") or "")
+
+
+def _tpex_empty(payload: Dict[str, Any]) -> bool:
+    tables = payload.get("tables")
+    if str(payload.get("stat") or "ok").lower() not in ("ok", ""):
+        return False
+    return isinstance(tables, list) and all(not (t.get("data") or []) for t in tables)
+
+
+def fetch_market(day: _date, market: str) -> Tuple[str, List[Dict[str, Any]], str]:
+    """單一市場單日收盤 → (status, rows, detail)。
+    complete＝列數達門檻；empty＝交易所明確回覆當天沒有資料；source_error＝連線失敗、格式不符或列數不足。"""
+    try:
+        if market == "twse":
+            payload = _get_json(TWSE_DAY_URL.format(date=day.strftime("%Y%m%d")), "TWSE")
+            rows, empty = _rows_from_twse(payload), _twse_empty(payload)
+        else:
+            payload = _get_json(TPEX_DAY_URL.format(date=day.strftime("%Y/%m/%d")), "TPEx")
+            rows, empty = _rows_from_tpex(payload), _tpex_empty(payload)
+    except Exception as exc:
+        print(f"⚠️ 市場底庫：{'上市' if market == 'twse' else '上櫃'} {day} 取得失敗｜{type(exc).__name__}", flush=True)
+        return "source_error", [], f"{type(exc).__name__}: {exc}"
+    if len(rows) >= MIN_ROWS[market]:
+        return "complete", rows, ""
+    if not rows and empty:
+        return "empty", [], "交易所回覆當天無資料"
+    return "source_error", rows, f"只有 {len(rows)} 檔（門檻 {MIN_ROWS[market]}），視為回應不完整"
+
+
 def fetch_day(day: _date) -> List[Dict[str, Any]]:
-    """單一交易日的全市場收盤（上市＋上櫃普通股）；非交易日回傳空清單。"""
+    """單一交易日的全市場收盤（上市＋上櫃普通股，只含 complete 的市場）；非交易日回傳空清單。"""
     rows: List[Dict[str, Any]] = []
-    try:
-        rows += _rows_from_twse(_get_json(TWSE_DAY_URL.format(date=day.strftime("%Y%m%d")), "TWSE"))
-    except Exception as exc:
-        print(f"⚠️ 市場底庫：上市 {day} 取得失敗｜{type(exc).__name__}", flush=True)
-    try:
-        rows += _rows_from_tpex(_get_json(TPEX_DAY_URL.format(date=day.strftime("%Y/%m/%d")), "TPEx"))
-    except Exception as exc:
-        print(f"⚠️ 市場底庫：上櫃 {day} 取得失敗｜{type(exc).__name__}", flush=True)
+    for market in local_market_cache.MARKETS:
+        status, got, _ = fetch_market(day, market)
+        if status == "complete":
+            rows += got
     return rows
 
 
-def sync_day(day: _date) -> int:
-    rows = fetch_day(day)
-    if not rows:
-        return 0
-    saved = local_market_cache.save_market_day(rows, day.strftime("%Y-%m-%d"), source="TWSE/TPEx")
+def _now_date() -> _date:
+    return tools.taipei_now().date()
+
+
+def sync_day(day: _date, markets: Tuple[str, ...] = ("twse", "tpex")) -> int:
+    """抓指定市場並記錄各自的完整性。兩邊都明確回覆無資料、且日期已過＝closed（颱風假等全市場休市）；
+    只有一邊無資料＝那一邊 source_error（不能拿一邊的成功代表全市場）；今天還沒資料＝pending。"""
+    key = day.strftime("%Y-%m-%d")
+    results = {m: fetch_market(day, m) for m in markets}
+    past = day < _now_date()
+    known = local_market_cache.market_status([key])[key]
+    saved = 0
+    for market, (status, rows, detail) in results.items():
+        if status == "complete":
+            saved += local_market_cache.save_market_day(rows, key, source="TWSE" if market == "twse" else "TPEx")
+            local_market_cache.save_market_status(key, market, "complete", len(rows), "TWSE/TPEx")
+            continue
+        if status == "empty":
+            others = [results[m][0] if m in results else ("empty" if known[m] == "closed" else known[m])
+                      for m in local_market_cache.MARKETS if m != market]
+            if not past:
+                final = "pending"
+            elif all(o == "empty" for o in others):
+                final = "closed"
+            else:
+                final = "source_error"
+                detail = "另一個市場當天有資料，這一邊卻回覆無資料"
+        else:
+            final = "source_error"
+        local_market_cache.save_market_status(key, market, final, len(rows), "TWSE/TPEx", detail)
     return saved
 
 
@@ -161,26 +219,33 @@ def _candidate_days(count: int, end: Optional[_date] = None) -> List[_date]:
 
 def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
          log: Callable[[str], None] = print, force: bool = False) -> Dict[str, Any]:
-    """把底庫補到 target_days 個交易日。已存在的日期直接跳過，因此每天只會多抓 1 天。"""
+    """把底庫補到 target_days 個交易日。上市、上櫃分開判斷：兩邊都 complete（或都確認休市）才跳過，
+    只有一邊成功的日子下一輪只重抓失敗的那一邊。"""
     started = time.monotonic()
-    have = set(local_market_cache.known_dates(limit=target_days * 2))
+    candidates = _candidate_days(int(target_days * 1.5))
+    keys = [d.strftime("%Y-%m-%d") for d in candidates]
+    status = local_market_cache.market_status(keys)
+    done ={k for k in keys if all(status[k][m] == "complete" for m in local_market_cache.MARKETS)}
     fetched = saved = holidays = 0
-    for day in _candidate_days(int(target_days * 1.5)):
+    for day, key in zip(candidates, keys):
         if time.monotonic() - started > budget_seconds:
             log(f"市場底庫：達到本輪時間上限（{budget_seconds:.0f} 秒），下一輪續補")
             break
-        if len({d for d in have if d}) >= target_days:
+        if len(done) >= target_days:
             break
-        key = day.strftime("%Y-%m-%d")
-        if key in have and not force:
+        if not force and (key in done or all(status[key][m] == "closed" for m in local_market_cache.MARKETS)):
             continue
-        count = sync_day(day)
-        fetched += 1
+        # 只重抓還沒 complete／closed 的那一邊（舊版底庫沒有完整性紀錄的日子會兩邊各重抓一次）
+        need = tuple(m for m in local_market_cache.MARKETS if force or status[key][m] not in ("complete", "closed"))
+        count = sync_day(day, need)
+        fetched += len(need)
+        status[key] = local_market_cache.market_status([key])[key]
+        if all(status[key][m] == "complete" for m in local_market_cache.MARKETS):
+            done.add(key)
         if count:
             saved += count
-            have.add(key)
-            log(f"市場底庫：{key} 收盤 {count:,} 檔")
-        else:
+            log(f"市場底庫：{key} 收盤 {count:,} 檔（上市 {status[key]['twse']}／上櫃 {status[key]['tpex']}）")
+        elif all(status[key][m] == "closed" for m in local_market_cache.MARKETS):
             holidays += 1
     local_market_cache.trim_history(local_market_cache.KEEP_DAYS)
     stats = local_market_cache.stats()
@@ -188,7 +253,7 @@ def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
         "at": tools.taipei_now().strftime("%Y-%m-%d %H:%M"), "days": stats.get("days", 0),
         "stocks": stats.get("stocks", 0), "last_day": stats.get("last_day", ""),
     })
-    return {"requests": fetched * 2, "days_saved": len(have), "rows_saved": saved,
+    return {"requests": fetched, "days_saved": len(done), "rows_saved": saved,
             "non_trading_days": holidays, "days": stats.get("days", 0), "stocks": stats.get("stocks", 0),
             "last_day": stats.get("last_day", ""), "elapsed": time.monotonic() - started}
 

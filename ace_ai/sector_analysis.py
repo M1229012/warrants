@@ -292,8 +292,10 @@ def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: thread
                        score_date=_iso_date(tech["data_date"]), plus_reasons=good[:2], minus_reasons=bad[:2],
                        moving_averages=tech.get("moving_averages", {}), score_basis=tech.get("signal_status", ""),
                        intraday_observation=tech.get("intraday_observation", {}))
-            local_market_cache.save_pattern_score(code, row["score_date"], score["score"], grade, score.get("components"),
-                                                  str(tech.get("signal_status") or ""))
+            if not intraday or intraday.get("is_close_confirmed"):
+                # 盤中暫定 K 棒算出的分數不寫進本地分數底庫（底庫只放收盤確認的快照）
+                local_market_cache.save_pattern_score(code, row["score_date"], score["score"], grade, score.get("components"),
+                                                      str(tech.get("signal_status") or ""))
     CACHE.set(key, row, RESULT_TTL if not intraday.get("is_live") else min(60, RESULT_TTL))
     return row
 
@@ -456,12 +458,19 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
             except Exception as exc:
                 print(f"族群前段補資料略過 {row['stock_code']}：{type(exc).__name__}", flush=True)
                 continue
-            rank, keep_score = row["rank"], row.get("pattern_score")
+            rank = row["rank"]
+            if mode == "technical":
+                # 分數、等級、原因、報價、日期要來自同一個快照：只有重算結果和本地分數是同一天、同一分數時，
+                # 才補上加減分原因；否則維持本地快照原樣（不把新價格或新原因混進舊分數）。
+                same = (_iso_date(full.get("score_date")) == row.get("score_date")
+                        and full.get("pattern_score") is not None and row.get("pattern_score") is not None
+                        and abs(float(full["pattern_score"]) - float(row["pattern_score"])) < 0.5)
+                if same:
+                    row.update({k: full.get(k) for k in ("plus_reasons", "minus_reasons", "moving_averages", "grade")
+                                if full.get(k) is not None})
+                continue
             row.update(full)
             row["rank"] = rank
-            if mode == "technical" and keep_score is not None:
-                # 分數一律以收盤 K 棒為準，不因盤中價變動。
-                row["pattern_score"] = keep_score
         others = [{"rank": i + 4, **{k: row.get(k) for k in ("stock_code", "stock_name", "market", "close", "change_pct", "pattern_score", "grade")}}
                   for i, row in enumerate(eligible[3:5])]  # 圖上最多顯示到第 5 名
         result = {"name": members["name"], "mode": mode, "source": members["source"],
