@@ -823,7 +823,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     h = d.get("habits") or {}
     money, tenor, lev = h.get("moneyness_at_buy_median"), h.get("tenor_at_buy_median"), h.get("leverage_at_buy_median")
     sections.append({"type": "tiles", "items": [
-        {"label": "認購／認售", "value": f"{h.get('call_count', 0)}／{h.get('put_count', 0)}", "tone": "ink"},
+        {"label": "權證檔數", "value": f"{h.get('warrant_count', d.get('warrant_count', 0)):,} 檔", "tone": "ink"},
         {"label": "買進時天期", "value": f"{tenor:.0f} 天" if tenor is not None else "-", "tone": "ink"},
         {"label": "買進時價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-", "tone": "ink"},
         {"label": "估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
@@ -834,13 +834,14 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows = []
         for w in group["warrants"][:4]:
             days_left, money_now, lev_now = w.get("days_left"), w.get("moneyness_now"), w.get("leverage_now")
-            rows.append([f"{w['warrant_code']} {w['warrant_name']}".strip(),
-                         w["remaining_text"] + (f" {w['remaining_pct']}%" if w.get("remaining_lots") else ""),
+            rows.append([f"{w['warrant_code']} {w['warrant_name']}".strip(), w["remaining_text"],
+                         f"{w['remaining_pct']}%" if w.get("remaining_lots") else "-",
                          ("已到期" if days_left <= 0 else f"{days_left}天") if days_left is not None else "-",
                          f"{'價內' if money_now >= 0 else '價外'}{abs(money_now):.0f}%" if money_now is not None else "-",
                          f"{lev_now:.1f}倍" if lev_now is not None else "-"])
-        sections.append({"type": "table", "columns": ["權證", "剩餘", "天期", "價內外", "槓桿"],
-                         "widths": (0.40, 0.18, 0.12, 0.15, 0.15), "signed": (), "accent": ("剩餘", "槓桿"), "rows": rows})
+        sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘%", "天期", "價內外", "槓桿"],
+                         "widths": (0.34, 0.16, 0.11, 0.11, 0.14, 0.14), "signed": (),
+                         "accent": ("剩餘張數", "剩餘%", "槓桿"), "rows": rows})
     hidden = len(d.get("hidden_stocks") or []) + max(0, len(d.get("groups") or []) - 3)
     tail = f"另有 {hidden} 檔標的未列出，可問「{d.get('branch')} 代號 買哪些權證」。" if hidden else ""
     if d.get("near_expiry_holdings"):
@@ -1360,6 +1361,8 @@ def _install_gemini_error_recorder(kf: Any) -> None:
 # 503 是模型本身塞車，換 API Key 沒用，只能換模型再試一次（數字都是 Python 算的，換模型只影響文字風格）。
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
 _OVERLOADED_RE = re.compile(r"503|UNAVAILABLE|overloaded|high demand|429|RESOURCE_EXHAUSTED", re.IGNORECASE)
+# 主模型塞車後幾秒內，後續題目直接用備援模型（主程式會把 3 支 Key 都試過再等 2 秒重試，每題白等 30 幾秒）
+GEMINI_PRIMARY_COOLDOWN = max(0, tools._env_int("DISCORD_AI_GEMINI_PRIMARY_COOLDOWN", 300))
 
 
 class GeminiGateway:
@@ -1377,6 +1380,7 @@ class GeminiGateway:
         self._day = ""
         self._day_calls = 0
         self._count_lock = threading.Lock()
+        self._primary_down_until = 0.0
 
     def _quota_left(self) -> bool:
         """免費方案有每日請求上限；超過軟上限就只出規則式內容，不再呼叫 AI。"""
@@ -1479,9 +1483,23 @@ class GeminiGateway:
                     _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
                     return None
 
-        text = call()
         primary = model_used = kf.GEMINI_MODEL
-        if (not text and GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != primary
+        has_fallback = bool(GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != primary)
+        text = None
+        tried_fallback = False
+        if has_fallback and time.monotonic() < self._primary_down_until:
+            # 主模型剛塞車過：這段時間直接用備援，不再先等主模型把每支 Key 試完
+            self.log(f"主模型 {primary} 近期塞車，直接使用備援模型 {GEMINI_FALLBACK_MODEL}")
+            model_used, tried_fallback = GEMINI_FALLBACK_MODEL, True
+            with self._lock:
+                text = self._generate_with_model(kf, GEMINI_FALLBACK_MODEL, prompt, schema, temperature)
+            if not text:
+                model_used = primary
+        if not text:
+            text = call()
+            if not text and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")):
+                self._primary_down_until = time.monotonic() + GEMINI_PRIMARY_COOLDOWN
+        if (not text and has_fallback and not tried_fallback
                 and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or ""))):
             # 備援模型只用在這一次呼叫（per-call 指定 model），不改主程式的全域 GEMINI_MODEL，
             # 否則同時進行的其他請求會被迫用錯模型。
@@ -1802,7 +1820,7 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
 
 
 FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
-                             "（認購／認售檔數、天期、價內外、估算槓桿的中位數），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
+                             "（權證檔數、天期、價內外、估算槓桿的中位數；資料只含認購，不要談認售），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
                              "解讀這個分點的操作風格：偏好長天期還是短天期、價內還是價外、高槓桿還是低槓桿，代表押波段、押短線或是保守；"
                              "目前主力部位在哪一檔標的、剩多少；哪些持有中的權證快到期（near_expiry_holdings）要注意時間價值流失。"
                              "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"

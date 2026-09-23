@@ -4587,9 +4587,12 @@ def _event_window_from_store(canonical: str, requested: int, days: int) -> Optio
         item["buy_amt"] += buy_amt
         item["sell_amt"] += sell_amt
         item["last"] = max(item["last"], last)
+        # 剩餘% 的分母：這段期間有進出的所有權證「本輪」買進張數（已賣光的權證也算），
+        # 否則只剩幾檔沒賣過的權證時會顯示 100%，和旁邊的買進／賣出欄對不起來
+        if not p["expired"]:
+            item["cycle"] += p["cycle_bought"]
         if holding:
             item["remaining"] += p["remaining"]
-            item["cycle"] += p["cycle_bought"]
             item["cost"] += p["remaining_cost"]
             item["warrants"] += 1
         elif p["expired"]:
@@ -4790,7 +4793,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
                        "spot": _num(spot_now, 2), "sigma_pct": _num(sigma_now * 100 if sigma_now else None, 0),
                        "warrant_count": len(rows), "warrants": rows[:warrant_limit]})
     median = lambda xs: float(pd.Series(xs).median()) if xs else None
-    habits = {"call_count": habit["call"], "put_count": habit["put"],
+    # Sheet 只抓認購（不抓認售），不顯示認購／認售；改列這段期間買進的權證檔數
+    habits = {"warrant_count": sum(len(v) for v in bought.values()),
               "tenor_at_buy_median": _num(median(habit["tenor"]), 0),
               "moneyness_at_buy_median": _num(median(habit["money"]), 1),
               "leverage_at_buy_median": _num(median(habit["lev"]), 1)}
