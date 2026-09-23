@@ -2177,12 +2177,19 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
     if kind == 'table':
         columns, rows = section.get('columns') or [], section.get('rows') or []
         head_h, row_h = 42, 46
-        first = width * 0.24
+        first = width * float(section.get('first_ratio', 0.24))   # 第一欄較長（例如權證代號＋名稱）時可加寬
         rest = (width - first) / max(1, len(columns) - 1)
+        ratios = section.get('widths')
+        if ratios and len(ratios) == len(columns):
+            # 自訂各欄寬度比例（例如「14,164張 100%」這種長欄位要寬一點）；其餘欄右對齊到自己的右緣
+            total = float(sum(ratios))
+            edges = [x0 + width * sum(ratios[:i + 1]) / total for i in range(len(columns))]
+        else:
+            edges = [x0 + first + rest * c for c in range(len(columns))]
         if not dry:
             draw.rounded_rectangle((x0, y, x1, y + head_h), radius=10, fill=TILE_BG)
             for c, name in enumerate(columns):
-                cx = x0 + 18 if c == 0 else x0 + first + rest * c - 18
+                cx = x0 + 18 if c == 0 else edges[c] - 18
                 draw.text((cx, y + head_h / 2), name, font=font(20, True), fill=MUTED, anchor='lm' if c == 0 else 'rm')
             for r, row in enumerate(rows):
                 ry = y + head_h + r * row_h
@@ -2190,7 +2197,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     draw.rectangle((x0, ry, x1, ry + row_h), fill='#FAFBFC')
                 bold = str(row[0]).startswith('全部')
                 for c, cell in enumerate(row):
-                    cx = x0 + 18 if c == 0 else x0 + first + rest * c - 18
+                    cx = x0 + 18 if c == 0 else edges[c] - 18
                     signed = section.get('signed', ('加權報酬',))
                     accent = section.get('accent', ('勝率',))
                     color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
@@ -2208,9 +2215,10 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             for i, box in enumerate(boxes):
                 bx = x0 + i * (box_w + gap)
                 color = _tone_color('', box.get('tone', 'ink'))
+                head_bg = {'up': UP_BG, 'accent': ACCENT_BG}.get(box.get('tone'), DOWN_BG)   # accent＝持有中（金色）
                 draw.rounded_rectangle((bx, y, bx + box_w, y + height), radius=14, fill='white', outline=LINE, width=2)
-                draw.rounded_rectangle((bx, y, bx + box_w, y + head_h - 8), radius=14, fill=UP_BG if box.get('tone') == 'up' else DOWN_BG)
-                draw.rectangle((bx, y + head_h - 22, bx + box_w, y + head_h - 8), fill=UP_BG if box.get('tone') == 'up' else DOWN_BG)
+                draw.rounded_rectangle((bx, y, bx + box_w, y + head_h - 8), radius=14, fill=head_bg)
+                draw.rectangle((bx, y + head_h - 22, bx + box_w, y + head_h - 8), fill=head_bg)
                 text_at(draw, (bx + 18, y + 10), box['title'], 23, color, True)
                 rows = box.get('rows') or []
                 if not rows:

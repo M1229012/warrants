@@ -3489,6 +3489,7 @@ def load_abcde_event_rows() -> Dict[str, Any]:
                 "warrant_count": df.get("涵蓋權證數", pd.Series([""] * len(df))).map(_count_value),
                 "warrant_list": df.get("權證清單", pd.Series([""] * len(df))).map(_clean_cell),
                 "max_single_warrant": df.get("最大單筆權證", pd.Series([""] * len(df))).map(_clean_cell),
+                "max_single_amount": df.get("最大單筆金額", pd.Series([""] * len(df))).map(_count_value),
                 "reduce_date": df.get("減碼日", pd.Series([""] * len(df))).map(_parse_sheet_date),
                 # 事件表同一列就有賣出金額，出清／減碼不必再去跟「每日賣出明細」對帳。
                 "reduce_amount": df.get("減碼賣出金額", pd.Series([""] * len(df))).map(_count_value),
@@ -4216,6 +4217,12 @@ def _day_trade_mask(rows: pd.DataFrame) -> pd.Series:
 BRANCH_WINDOW_MAX_DAYS = max(10, _env_int("DISCORD_AI_BRANCH_WINDOW_MAX_DAYS", 250))
 
 
+def _plain_money(value: Any) -> str:
+    """不帶正負號的金額文字（主程式 fmt_money 會自帶 +／-，圖卡自己加號才不會變成「++」「-+」）。"""
+    text = str(_money_text(abs(float(value or 0.0)))).lstrip("+-")
+    return text if any(unit in text for unit in ("萬", "億", "元")) else f"{text}元"   # 不到 1 萬時主程式不帶單位
+
+
 def _event_codes_text(codes: List[str]) -> str:
     """["B", "A", "B"] → "A、B×2"（依 A～E 排序）。"""
     counts: Dict[str, int] = {}
@@ -4224,7 +4231,7 @@ def _event_codes_text(codes: List[str]) -> str:
     return "、".join(f"{c}×{n}" if n > 1 else c for c, n in sorted(counts.items()))
 
 
-def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[str, Any]:
+def _event_window_from_events(branch_name: str, days: int = CHIPS_DAYS) -> Dict[str, Any]:
     """指定分點近 N 個交易日的權證布局（只讀 Sheet）：
     - 買進＝視窗內的 A～E 事件（單日權證買進 100 萬以上；小額買進不在事件表）
     - 減碼／出清＝事件表同一列的減碼／出清日期與金額（視窗內發生的，含視窗前買進的事件）
@@ -4290,8 +4297,8 @@ def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[st
             "event_codes": _event_codes_text(item["codes"]), "event_count": item["events"],
             "first_event_date": _fmt_date(min(item["dates"])) if item["dates"] else "",
             "last_event_date": _fmt_date(max(item["dates"])) if item["dates"] else "",
-            "buy_amount": _num(item["buy"], 0), "buy_amount_text": _money_text(item["buy"]) if item["buy"] else "-",
-            "sell_amount": _num(item["sell"], 0), "sell_amount_text": _money_text(item["sell"]) if item["sell"] else "-",
+            "buy_amount": _num(item["buy"], 0), "buy_amount_text": _plain_money(item["buy"]) if item["buy"] else "-",
+            "sell_amount": _num(item["sell"], 0), "sell_amount_text": _plain_money(item["sell"]) if item["sell"] else "-",
             "holding_count": item["holding"], "state": state(item),
             "sell_action": "出清" if item["exited_any"] else "減碼" if item["reduced_any"] else "",
         })
@@ -4304,12 +4311,12 @@ def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[st
     if earliest is not None and not pd.isna(earliest) and pd.Timestamp(start) < pd.Timestamp(earliest):
         note = f"事件表最早只到 {_fmt_date(earliest)}，更早的事件不在表內"
     return {
-        "found": True, "branch": canonical, "requested_days": requested, "trading_days": days,
+        "found": True, "source": "events", "branch": canonical, "requested_days": requested, "trading_days": days,
         "period_start": _fmt_date(start), "period_end": _fmt_date(end),
         "period": f"{_fmt_date(start)}～{_fmt_date(end)}（{days} 個交易日）",
         "data_latest_event_date": _fmt_date(latest), "coverage_note": note,
-        "event_count": int(len(bought)), "buy_amount_text": _money_text(total_buy) if total_buy else "0",
-        "sell_amount_text": _money_text(total_sell) if total_sell else "0",
+        "event_count": int(len(bought)), "buy_amount_text": _plain_money(total_buy) if total_buy else "0",
+        "sell_amount_text": _plain_money(total_sell) if total_sell else "0",
         "holding_count": int(sum(r["holding_count"] for r in rows)),
         "buy_stocks": buys[:8], "sell_stocks": sells[:8],
         "stocks": (buys + [r for r in sells if not r["event_count"]])[:10],
@@ -4320,6 +4327,494 @@ def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[st
         "data_source": "回測 A～E 事件表（含每筆事件的減碼／出清金額）",
         "definition_note": "只含回測追蹤的 A～E 事件（單日權證買進 100 萬以上），小額買進不在事件表內；隔日衝事件已排除",
     }
+
+
+_WARRANT_ITEM_RE = re.compile(r"^\s*([0-9A-Za-z]{4,8})\s+(.+?)\s*$")
+
+
+def _warrant_items(row: pd.Series) -> List[Tuple[str, str]]:
+    """事件的「權證清單」（055918 元金2X元富58購05；045034 東元元富55購01）→ [(代號, 名稱)]；清單空白時用最大單筆權證。"""
+    text = _clean_cell(row.get("warrant_list", "")) or _clean_cell(row.get("max_single_warrant", ""))
+    items = []
+    for part in re.split(r"[；;\n]+", text):
+        part = part.strip()
+        if not part:
+            continue
+        match = _WARRANT_ITEM_RE.match(part)
+        items.append((match.group(1), match.group(2)) if match else (part, ""))
+    return items
+
+
+def _event_state(row: pd.Series) -> str:
+    if row.get("status") == "已出清" and row.get("exit_date") is not None and not pd.isna(row.get("exit_date")):
+        return f"出清 {_fmt_date(row['exit_date'])[5:]}"
+    if row.get("status") == "已減碼未出清" and row.get("reduce_date") is not None and not pd.isna(row.get("reduce_date")):
+        return f"減碼 {_fmt_date(row['reduce_date'])[5:]}"
+    return "持有"
+
+
+def _warrant_detail_from_events(branch_name: str, days: int = CHIPS_DAYS, stock_code: str = "") -> Dict[str, Any]:
+    """指定分點近 N 個交易日買了哪些權證（代號＋名稱），依標的分組（只讀 A～E 事件表的權證清單）。
+    權證清單沒有逐檔金額；只有「最大單筆權證」有金額，其餘顯示「-」。"""
+    summary = _event_window_from_events(branch_name, days)
+    if not summary.get("found"):
+        return summary
+    canonical = summary["branch"]
+    start, end = pd.Timestamp(summary["period_start"]), pd.Timestamp(summary["period_end"])
+    events = load_abcde_event_rows()["events"]
+    mine = events[events["branch"] == canonical]
+    mine = mine.drop(mine[_day_trade_mask(mine)].index)
+    bought = mine[(mine["event_date"] >= start) & (mine["event_date"] <= end)].sort_values("event_date")
+    code = core()._normalize_stock_name_code_key(stock_code) if stock_code else ""
+    if code:
+        bought = bought[bought["stock_code"] == code]
+    warrants: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for _, row in bought.iterrows():
+        max_code = _clean_cell(row.get("max_single_warrant", "")).split(" ")[0]
+        for wcode, wname in _warrant_items(row):
+            item = warrants.setdefault((row["stock_code"], wcode), {
+                "warrant_code": wcode, "warrant_name": wname, "codes": [], "dates": [], "max_amount": 0.0, "state": "持有"})
+            item["warrant_name"] = item["warrant_name"] or wname
+            item["codes"].append(row["event_code"])
+            item["dates"].append(pd.Timestamp(row["event_date"]))
+            item["state"] = _event_state(row)                     # 依事件日排序，最後一筆事件的狀態為準
+            if wcode == max_code:
+                item["max_amount"] = max(item["max_amount"], float(row.get("max_single_amount") or 0.0))
+    by_stock: Dict[str, List[Dict[str, Any]]] = {}
+    for (stock, _), item in warrants.items():
+        by_stock.setdefault(stock, []).append({
+            "warrant_code": item["warrant_code"], "warrant_name": item["warrant_name"],
+            "event_codes": _event_codes_text(item["codes"]),
+            "first_date": _fmt_date(min(item["dates"])), "last_date": _fmt_date(max(item["dates"])),
+            "max_amount_text": _plain_money(item["max_amount"]) if item["max_amount"] else "-", "state": item["state"],
+            "_last": max(item["dates"]), "_amount": item["max_amount"]})
+    stock_rows = {r["stock_code"]: r for r in summary.get("stocks") or []}
+    for r in summary.get("buy_stocks") or []:
+        stock_rows.setdefault(r["stock_code"], r)
+    order = [r["stock_code"] for r in summary.get("buy_stocks") or []] + sorted(set(by_stock) - {r["stock_code"] for r in summary.get("buy_stocks") or []})
+    group_limit, warrant_limit = (1, 20) if code else (4, 6)
+    groups, hidden_stocks, hidden_warrants = [], [], 0
+    for stock in [s for s in order if s in by_stock]:
+        rows = sorted(by_stock[stock], key=lambda r: (r["_last"], r["_amount"]), reverse=True)
+        if len(groups) >= group_limit:
+            hidden_stocks.append(stock_rows.get(stock, {}).get("label") or stock)
+            continue
+        hidden_warrants += max(0, len(rows) - warrant_limit)
+        info = stock_rows.get(stock, {})
+        groups.append({"stock_code": stock, "label": info.get("label") or stock,
+                       "event_codes": info.get("event_codes", ""), "buy_amount_text": info.get("buy_amount_text", "-"),
+                       "state": info.get("state", ""), "warrant_count": len(rows),
+                       "warrants": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows[:warrant_limit]]})
+    return {
+        "found": True, "source": "events", "branch": canonical, "stock_code": code, "requested_days": summary["requested_days"],
+        "trading_days": summary["trading_days"], "period_start": summary["period_start"], "period_end": summary["period_end"],
+        "coverage_note": summary.get("coverage_note", ""), "warrant_count": len(warrants), "groups": groups,
+        "hidden_stocks": hidden_stocks, "hidden_warrants": hidden_warrants, "available": bool(groups),
+        "reason": "" if groups else (f"近 {summary['trading_days']} 個交易日，{canonical}"
+                                     + (f" 在 {code}" if code else "") + " 沒有 A～E 權證事件"),
+        "data_source": "回測 A～E 事件表的權證清單與最大單筆權證",
+        "definition_note": "權證代號與名稱取自 A～E 事件（單日權證買進 100 萬以上）的權證清單；清單沒有逐檔金額，只有最大單筆權證有金額；狀態依該權證最後一筆事件",
+    }
+
+
+# ============================================================
+# 分點權證部位（release data-store 逐日買賣＋Sheet 補最近幾天）：FIFO 算剩餘張數與剩餘成本
+# ============================================================
+
+def _lots_text(shares: float) -> str:
+    return f"{shares / 1000:,.0f}張"
+
+
+def _branch_positions(canonical: str) -> Optional[Dict[str, Any]]:
+    """分點每檔權證的 FIFO 部位。歷史來自 release（warrant_store）；release 之後的日子用 Sheet 補：
+    賣出＝每日賣出明細（逐檔、有張數）；買進＝A～E 事件（100 萬以上；單一權證的事件直接記到該檔，
+    多檔權證的事件張數無法拆分，記成該標的的「未拆分」部位）。release 還沒同步時回 None（呼叫端退回事件表算法）。"""
+    import warrant_store
+    try:
+        if not warrant_store.available():
+            return None
+        history = warrant_store.branch_history(canonical)
+        store_max = warrant_store.latest_date()
+    except local_market_cache.DBError as exc:
+        print(f"⚠️ 權證分點歷史庫讀取失敗，改用事件表：{exc}", flush=True)
+        return None
+    kf = core()
+    records = [dict(r, source="store") for r in history]
+    cutoff = pd.Timestamp(store_max) if store_max else None
+    sells = _sell_rows(branch=canonical)
+    if cutoff is not None and not sells.empty:
+        for _, row in sells[sells["_date"] > cutoff].iterrows():
+            code = _clean_cell(row.get("權證代號", ""))
+            if not code:
+                continue
+            shares = _count_value(row.get("賣出股數", "")) or (_count_value(row.get("賣出張數", "")) or 0.0) * 1000
+            records.append({"warrant": code, "stock": row["_code"], "date": _fmt_date(row["_date"]).replace("/", "-"),
+                            "buy_sh": 0, "sell_sh": int(shares or 0), "buy_amt": 0, "sell_amt": int(row["_amount"] or 0),
+                            "source": "sheet"})
+    pseudo: Dict[str, Dict[str, str]] = {}
+    try:
+        events = load_abcde_event_rows()["events"]
+    except ToolDataError:
+        events = pd.DataFrame()
+    if cutoff is not None and not events.empty:
+        gap = events[(events["branch"] == canonical) & (events["event_date"] > cutoff)]
+        for _, row in gap.iterrows():
+            items = _warrant_items(row)
+            day = _fmt_date(row["event_date"]).replace("/", "-")
+            shares = int(float(row.get("lots") or 0) * 1000)
+            if len(items) == 1:
+                code = items[0][0]
+            else:
+                code = f"~{row['stock_code']}~{day}~{row['event_code']}"
+                pseudo[code] = {"name": f"（{row['event_code']} 事件 {len(items)} 檔權證，張數未拆分）", "stock": row["stock_code"]}
+            records.append({"warrant": code, "stock": row["stock_code"], "date": day, "buy_sh": shares, "sell_sh": 0,
+                            "buy_amt": int(float(row.get("buy_amount") or 0)), "sell_amt": 0, "source": "sheet_event"})
+    records.sort(key=lambda r: (r["date"], r["warrant"]))
+    # 標的：歷史庫有些列的標的股是空的 → 先用權證名稱表，再用權證基本資料的標的名稱反查代號
+    real_codes = [r["warrant"] for r in records if not r["warrant"].startswith("~")]
+    warrant_names = warrant_store.names(real_codes)
+    metas = warrant_store.meta(real_codes)
+    stock_name_map, stock_code_by_name = warrant_store.stock_names()
+
+    def stock_of(rec: Dict[str, Any]) -> str:
+        stock = kf._normalize_stock_name_code_key(rec["stock"]) if rec["stock"] else ""
+        if stock:
+            return stock
+        info = warrant_names.get(rec["warrant"]) or {}
+        return (info.get("stock") or stock_code_by_name.get((metas.get(rec["warrant"]) or {}).get("stock_name", ""), "")
+                or stock_code_by_name.get(info.get("stock_name", ""), ""))
+
+    # 權證代號會回收重用：部位以「權證代號＋標的」為單位，避免新舊兩檔權證的張數混在一起
+    positions: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        stock = stock_of(rec)
+        key = f"{rec['warrant']}|{stock}"
+        p = positions.setdefault(key, {"warrant": rec["warrant"], "stock": stock,
+                                       "lots": deque(), "remaining": 0.0, "cycle_bought": 0.0, "days": []})
+        if rec["buy_sh"] > 0:
+            if p["remaining"] <= 0:
+                p["cycle_bought"] = 0.0          # 新的一輪持有：剩餘比例以這一輪買進的張數為分母
+            p["lots"].append([float(rec["buy_sh"]), float(rec["buy_amt"])])
+            p["remaining"] += rec["buy_sh"]
+            p["cycle_bought"] += rec["buy_sh"]
+        need = float(min(rec["sell_sh"], p["remaining"])) if rec["sell_sh"] > 0 else 0.0   # 賣超過庫存（資料不一致）時只扣到 0
+        while need > 1e-9 and p["lots"]:
+            lot = p["lots"][0]
+            take = min(need, lot[0])
+            lot[1] -= lot[1] * take / lot[0]
+            lot[0] -= take
+            need -= take
+            p["remaining"] -= take
+            if lot[0] <= 1e-9:
+                p["lots"].popleft()
+        p["days"].append((rec["date"], rec["buy_sh"], rec["sell_sh"], rec["buy_amt"], rec["sell_amt"]))
+    today = taipei_now().strftime("%Y-%m-%d")
+    snapshot = warrant_store.meta_snapshot_date()
+    for p in positions.values():
+        code = p["warrant"]
+        info = warrant_names.get(code) or pseudo.get(code) or {}
+        meta_info = metas.get(code) or {}
+        # 名稱表是這個代號「最後一次」的權證；標的對不上時代表代號已被重用，改用基本資料或留空
+        same = not info.get("stock") or info.get("stock") == p["stock"]
+        p["name"] = (info.get("name") if same else "") or meta_info.get("name", "") or info.get("name", "")
+        p["stock_name"] = stock_name_map.get(p["stock"], "") or (info.get("stock_name", "") if same else "")
+        p["meta"] = meta_info if (not meta_info.get("stock_name") or meta_info.get("stock_name") == p["stock_name"]) else {}
+        p["remaining_cost"] = sum(lot[1] for lot in p["lots"])
+        last_trade = p["meta"].get("last_trade") or ""
+        last_activity = max((d[0] for d in p["days"]), default="")
+        # 基本資料快照裡沒有這檔、而且快照日前就有交易＝已下市／到期（快照後才掛牌的新權證不受影響）
+        delisted = (not code.startswith("~") and code not in metas and bool(snapshot) and last_activity < snapshot)
+        p["expired"] = bool(p["remaining"] > 0 and ((last_trade and last_trade < today) or delisted))
+    dates = [r["date"] for r in records]
+    return {"positions": positions, "store_max": store_max, "latest": max(dates) if dates else store_max,
+            "gap_dates": sorted({r["date"] for r in records if r["source"] != "store"})}
+
+
+def _window_sums(p: Dict[str, Any], start: str, end: str) -> Tuple[float, float, float, float, str]:
+    """視窗內買進股數、賣出股數、買進金額、賣出金額、最近買進日。"""
+    buy_sh = sell_sh = buy_amt = sell_amt = 0.0
+    last = ""
+    for day, b_sh, s_sh, b_amt, s_amt in p["days"]:
+        if start <= day <= end:
+            buy_sh, sell_sh, buy_amt, sell_amt = buy_sh + b_sh, sell_sh + s_sh, buy_amt + b_amt, sell_amt + s_amt
+            if b_sh > 0:
+                last = max(last, day)
+    return buy_sh, sell_sh, buy_amt, sell_amt, last
+
+
+def _store_window(canonical: str, days: int) -> Optional[Dict[str, Any]]:
+    """共用：部位＋視窗期間＋視窗內 A～E 事件（隔日衝排除）。"""
+    pos = _branch_positions(canonical)
+    if pos is None:
+        return None
+    try:
+        events = load_abcde_event_rows()["events"]
+    except ToolDataError:
+        events = pd.DataFrame(columns=["branch", "event_date", "stock_code", "event_code"])
+    latest = pd.Timestamp(pos["latest"] or taipei_now().strftime("%Y-%m-%d"))
+    start, end = _recent_event_dates(latest, days, events)
+    mine = events[events["branch"] == canonical] if not events.empty else events
+    if not mine.empty:
+        mine = mine.drop(mine[_day_trade_mask(mine)].index)
+        mine = mine[(mine["event_date"] >= start) & (mine["event_date"] <= end)]
+    return {"pos": pos, "start": start, "end": end, "s": start.strftime("%Y-%m-%d"), "e": end.strftime("%Y-%m-%d"),
+            "events": mine}
+
+
+def _store_notes(pos: Dict[str, Any]) -> str:
+    note = f"張數與金額取自權證分點歷史庫（至 {pos['store_max'].replace('-', '/')}）"
+    if pos["gap_dates"]:
+        note += (f"，{pos['gap_dates'][0][5:].replace('-', '/')} 之後用 Sheet 補（賣出＝每日賣出明細；"
+                 "買進只含 A～E 事件，小額買進要等歷史庫更新）")
+    return note
+
+
+def _event_window_from_store(canonical: str, requested: int, days: int) -> Optional[Dict[str, Any]]:
+    ctx = _store_window(canonical, days)
+    if ctx is None:
+        return None
+    pos, s, e, events = ctx["pos"], ctx["s"], ctx["e"], ctx["events"]
+    stocks: Dict[str, Dict[str, Any]] = {}
+    for p in pos["positions"].values():
+        buy_sh, sell_sh, buy_amt, sell_amt, last = _window_sums(p, s, e)
+        holding = p["remaining"] > 0 and not p["expired"]
+        if not (buy_sh or sell_sh or holding):
+            continue
+        item = stocks.setdefault(p["stock"], {"stock_code": p["stock"], "stock_name": p["stock_name"], "buy_amt": 0.0,
+                                              "sell_amt": 0.0, "remaining": 0.0, "cycle": 0.0, "cost": 0.0, "last": "",
+                                              "warrants": 0, "expired": 0})
+        item["stock_name"] = item["stock_name"] or p["stock_name"]
+        item["buy_amt"] += buy_amt
+        item["sell_amt"] += sell_amt
+        item["last"] = max(item["last"], last)
+        if holding:
+            item["remaining"] += p["remaining"]
+            item["cycle"] += p["cycle_bought"]
+            item["cost"] += p["remaining_cost"]
+            item["warrants"] += 1
+        elif p["expired"]:
+            item["expired"] += 1
+    codes_by_stock: Dict[str, List[str]] = defaultdict(list)
+    for _, row in events.iterrows():
+        codes_by_stock[row["stock_code"]].append(row["event_code"])
+    rows = []
+    for code, item in stocks.items():
+        label = f"{item['stock_name']}（{code}）" if item["stock_name"] else code
+        pct = item["remaining"] / item["cycle"] * 100 if item["cycle"] else 0.0
+        state = (f"持有 {_lots_text(item['remaining'])}" if item["remaining"] > 0
+                 else "已到期" if item["expired"] else "已出清")
+        rows.append({"stock_code": code, "stock_name": item["stock_name"], "label": label,
+                     "event_codes": _event_codes_text(codes_by_stock.get(code, [])),
+                     "buy_amount": item["buy_amt"], "buy_amount_text": _plain_money(item["buy_amt"]) if item["buy_amt"] else "-",
+                     "sell_amount": item["sell_amt"], "sell_amount_text": _plain_money(item["sell_amt"]) if item["sell_amt"] else "-",
+                     "remaining_lots": round(item["remaining"] / 1000), "remaining_lots_text": _lots_text(item["remaining"]) if item["remaining"] else "0",
+                     "remaining_pct": round(pct), "remaining_cost": item["cost"],
+                     "remaining_cost_text": _plain_money(item["cost"]) if item["cost"] else "0",
+                     "holding_warrants": item["warrants"], "last_buy_date": item["last"].replace("-", "/"), "state": state})
+    buys = sorted([r for r in rows if r["buy_amount"]], key=lambda r: -r["buy_amount"])
+    holds = sorted([r for r in rows if r["remaining_lots"] > 0], key=lambda r: -r["remaining_cost"])
+    table = buys + [r for r in rows if not r["buy_amount"]]
+    table.sort(key=lambda r: (-r["buy_amount"], -r["remaining_cost"]))
+    recent = events.sort_values("event_date", ascending=False).head(8) if not events.empty else events
+    total_buy = sum(r["buy_amount"] for r in rows)
+    total_sell = sum(r["sell_amount"] for r in rows)
+    total_cost = sum(r["remaining_cost"] for r in rows)
+    return {
+        "found": True, "source": "store", "branch": canonical, "requested_days": requested, "trading_days": days,
+        "period_start": ctx["start"].strftime("%Y/%m/%d"), "period_end": ctx["end"].strftime("%Y/%m/%d"),
+        "period": f"{ctx['start'].strftime('%Y/%m/%d')}～{ctx['end'].strftime('%Y/%m/%d')}（{days} 個交易日）",
+        "store_date": pos["store_max"], "gap_dates": pos["gap_dates"], "data_note": _store_notes(pos),
+        "event_count": int(len(events)),
+        "buy_amount_text": _plain_money(total_buy) if total_buy else "0",
+        "sell_amount_text": _plain_money(total_sell) if total_sell else "0",
+        "holding_warrants": int(sum(r["holding_warrants"] for r in rows)),
+        "holding_cost_text": _plain_money(total_cost) if total_cost else "0",
+        "buy_stocks": buys[:8], "hold_stocks": holds[:8], "stocks": table[:10],
+        "recent_events": [{"stock_label": (stocks.get(r["stock_code"]) or {}).get("stock_name") or r["stock_code"],
+                           "event": r["event_code"], "event_date": _fmt_date(r["event_date"])} for _, r in recent.iterrows()],
+        "available": bool(rows),
+        "reason": "" if rows else f"近 {days} 個交易日，{canonical} 沒有權證買賣，也沒有持有中的部位",
+        "data_source": "權證分點歷史庫（逐日逐檔買賣）＋Sheet（每日賣出明細、A～E 事件）",
+        "definition_note": "買進／賣出＝這段期間全部權證買賣（賣出為市值，含損益）；剩餘張數以 FIFO 計；剩餘成本＝剩下部位的買進成本；已到期權證不算持有",
+    }
+
+
+def get_branch_event_window(branch_name: str, days: int = CHIPS_DAYS) -> Dict[str, Any]:
+    """分點近 N 日權證布局：優先用權證分點歷史庫（精確張數）；歷史庫還沒同步時退回 A～E 事件表算法。"""
+    canonical, candidates = resolve_branch(branch_name)
+    if not canonical:
+        return {"found": False, "query": branch_name, "candidates": candidates, "reason": "找不到唯一符合的分點"}
+    requested = max(1, int(days or CHIPS_DAYS))
+    result = _event_window_from_store(canonical, requested, min(requested, BRANCH_WINDOW_MAX_DAYS))
+    return result if result is not None else _event_window_from_events(branch_name, days)
+
+
+# ---------- 權證明細：天期、價內外、估算槓桿 ----------
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def estimate_leverage(spot: Optional[float], strike: Optional[float], days: Optional[int], sigma: Optional[float],
+                      call: bool) -> Optional[float]:
+    """Black-Scholes 實質槓桿＝|Delta|×標的價÷權證理論價（行使比例會互相抵消）。波動率用標的歷史波動率代替，屬估算值。"""
+    if not spot or not strike or not sigma or not days or days <= 0 or spot <= 0 or strike <= 0 or sigma <= 0:
+        return None
+    t = days / 365.0
+    d1 = (math.log(spot / strike) + 0.5 * sigma * sigma * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    price = spot * _norm_cdf(d1) - strike * _norm_cdf(d2) if call else strike * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+    delta = _norm_cdf(d1) if call else _norm_cdf(d1) - 1.0
+    return abs(delta) * spot / price if price > spot * 1e-6 else None
+
+
+def _closes(stock_code: str) -> Dict[str, float]:
+    """標的收盤（YYYY-MM-DD → 收盤），讀本地底庫／既有日K快取；失敗回空。"""
+    try:
+        frame = _load_price_bundle(stock_code)["closed_df"]
+        return {pd.Timestamp(d).strftime("%Y-%m-%d"): float(v) for d, v in frame["Close"].dropna().items()}
+    except Exception as exc:
+        print(f"⚠️ {stock_code} 權證估算略過（取不到標的價格）：{type(exc).__name__}: {exc}", flush=True)
+        return {}
+
+
+def _price_on(closes: Dict[str, float], day: str) -> Tuple[Optional[float], Optional[float]]:
+    """某日（含）以前最後一個收盤，與到那天為止的 60 日年化歷史波動率。"""
+    dates = [d for d in sorted(closes) if d <= day]
+    if not dates:
+        return None, None
+    series = [closes[d] for d in dates[-61:]]
+    rets = [math.log(b / a) for a, b in zip(series[:-1], series[1:]) if a > 0 and b > 0]
+    if len(rets) < 20:
+        return series[-1], None
+    mean = sum(rets) / len(rets)
+    sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / len(rets)) * math.sqrt(252)
+    return series[-1], sigma
+
+
+def _tier(value: Optional[float], low: float, high: float, names: str) -> str:
+    if value is None:
+        return ""
+    return names[0] if value < low else names[2] if value > high else names[1]
+
+
+def _warrant_metrics(p: Dict[str, Any], closes: Dict[str, float], buy_day: str, today: str) -> Dict[str, Any]:
+    meta = p.get("meta") or {}
+    call = "售" not in str(meta.get("type") or p.get("name") or "")
+    strike, expiry = meta.get("strike"), meta.get("expiry") or ""
+    out: Dict[str, Any] = {"call": call}
+
+    def at(day: str) -> Dict[str, Any]:
+        spot, sigma = _price_on(closes, day)
+        days_left = (pd.Timestamp(expiry) - pd.Timestamp(day)).days if expiry else None
+        money = None
+        if spot and strike:
+            money = (spot / strike - 1) * 100 if call else (strike / spot - 1) * 100
+        lev = estimate_leverage(spot, strike, days_left, sigma, call)
+        return {"spot": spot, "sigma": sigma, "days": days_left, "money": money, "leverage": lev}
+    if buy_day:
+        out["buy"] = at(buy_day)
+    out["now"] = at(today)
+    return out
+
+
+def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_code: str = "") -> Optional[Dict[str, Any]]:
+    ctx = _store_window(canonical, days)
+    if ctx is None:
+        return None
+    pos, s, e, events = ctx["pos"], ctx["s"], ctx["e"], ctx["events"]
+    code = core()._normalize_stock_name_code_key(stock_code) if stock_code else ""
+    today = taipei_now().strftime("%Y-%m-%d")
+    event_codes: Dict[str, List[str]] = defaultdict(list)       # 每檔權證出現在哪些事件
+    stock_events: Dict[str, List[str]] = defaultdict(list)      # 每檔標的的事件（一筆事件只算一次）
+    for _, row in events.iterrows():
+        stock_events[row["stock_code"]].append(row["event_code"])
+        for wcode, _ in _warrant_items(row):
+            event_codes[wcode].append(row["event_code"])
+    bought: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for p in pos["positions"].values():
+        buy_sh, sell_sh, buy_amt, sell_amt, last = _window_sums(p, s, e)
+        if buy_sh <= 0 or (code and p["stock"] != code):
+            continue
+        bought[p["stock"]].append({"p": p, "buy_sh": buy_sh, "buy_amt": buy_amt, "last": last})
+    order = sorted(bought, key=lambda k: -sum(x["buy_amt"] for x in bought[k]))
+    group_limit, warrant_limit = (1, 20) if code else (4, 6)
+    habit = {"call": 0, "put": 0, "tenor": [], "money": [], "lev": []}
+    groups, hidden, near_expiry = [], [], []
+    for index, stock in enumerate(order):
+        items = sorted(bought[stock], key=lambda x: (x["last"], x["buy_amt"]), reverse=True)
+        label = f"{items[0]['p']['stock_name']}（{stock}）" if items[0]["p"]["stock_name"] else stock
+        if index >= max(group_limit, 6):
+            hidden.append(label)      # 習慣統計只取買進金額前 6 檔標的（每檔要讀一次標的價格）
+            continue
+        closes = _closes(stock) if not stock.startswith("~") else {}
+        spot_now, sigma_now = _price_on(closes, today) if closes else (None, None)
+        rows = []
+        for x in items:
+            p = x["p"]
+            if p["warrant"].startswith("~"):
+                metrics = {"call": True, "now": {}}
+            else:
+                metrics = _warrant_metrics(p, closes, x["last"], today)
+            buy = metrics.get("buy") or {}
+            if not p["warrant"].startswith("~"):
+                habit["call" if metrics["call"] else "put"] += 1
+                for key, value in (("tenor", buy.get("days")), ("money", buy.get("money")), ("lev", buy.get("leverage"))):
+                    if value is not None:
+                        habit[key].append(value)
+            now = metrics.get("now") or {}
+            holding = p["remaining"] > 0 and not p["expired"]
+            if holding and now.get("days") is not None and now["days"] <= 30:
+                near_expiry.append(f"{p['warrant']} {p['name']}（剩 {now['days']} 天）")
+            rows.append({
+                "warrant_code": "" if p["warrant"].startswith("~") else p["warrant"], "warrant_name": p["name"],
+                "call": metrics["call"], "event_codes": _event_codes_text(event_codes.get(p["warrant"], [])),
+                "last_buy_date": x["last"].replace("-", "/"), "buy_lots": round(x["buy_sh"] / 1000),
+                "remaining_lots": round(p["remaining"] / 1000) if holding else 0,
+                "remaining_text": (_lots_text(p["remaining"]) if holding else "已到期" if p["expired"] else "已出清"),
+                "remaining_pct": round(p["remaining"] / p["cycle_bought"] * 100) if holding and p["cycle_bought"] else 0,
+                "days_left": now.get("days"), "tenor_tier": _tier(now.get("days"), 60, 180, "短中長"),
+                "moneyness_now": _num(now.get("money"), 1), "leverage_now": _num(now.get("leverage"), 1),
+                "leverage_tier": _tier(now.get("leverage"), 4, 8, "低中高"),
+                "tenor_at_buy": buy.get("days"), "moneyness_at_buy": _num(buy.get("money"), 1),
+                "leverage_at_buy": _num(buy.get("leverage"), 1)})
+        if len(groups) >= group_limit:
+            hidden.append(label)
+            continue
+        remaining = sum(x["p"]["remaining"] for x in items if x["p"]["remaining"] > 0 and not x["p"]["expired"])
+        groups.append({"stock_code": stock, "label": label,
+                       # 同一筆事件常同時買好幾檔權證，標題要數「事件」不是「權證×事件」，否則次數會被灌大
+                       "event_codes": _event_codes_text(stock_events.get(stock, [])),
+                       "buy_amount_text": _plain_money(sum(x["buy_amt"] for x in items)),
+                       "remaining_text": _lots_text(remaining) if remaining else "已全部賣出",
+                       "spot": _num(spot_now, 2), "sigma_pct": _num(sigma_now * 100 if sigma_now else None, 0),
+                       "warrant_count": len(rows), "warrants": rows[:warrant_limit]})
+    median = lambda xs: float(pd.Series(xs).median()) if xs else None
+    habits = {"call_count": habit["call"], "put_count": habit["put"],
+              "tenor_at_buy_median": _num(median(habit["tenor"]), 0),
+              "moneyness_at_buy_median": _num(median(habit["money"]), 1),
+              "leverage_at_buy_median": _num(median(habit["lev"]), 1)}
+    return {
+        "found": True, "source": "store", "branch": canonical, "stock_code": code, "requested_days": requested,
+        "trading_days": days, "period_start": ctx["start"].strftime("%Y/%m/%d"), "period_end": ctx["end"].strftime("%Y/%m/%d"),
+        "store_date": pos["store_max"], "data_note": _store_notes(pos),
+        "warrant_count": sum(len(v) for v in bought.values()), "groups": groups, "hidden_stocks": hidden,
+        "habits": habits, "near_expiry_holdings": near_expiry[:6], "available": bool(groups),
+        "reason": "" if groups else f"近 {days} 個交易日，{canonical}" + (f" 在 {code}" if code else "") + " 沒有買進權證",
+        "data_source": "權證分點歷史庫＋權證基本資料（含已下市）＋標的日K",
+        "definition_note": ("天期＝距到期日天數；價內外＝標的價相對履約價；估算槓桿用標的近 60 日歷史波動率套 Black-Scholes，"
+                            "不是市場實際隱含波動率；習慣統計用買進當下（最近一次買進日）的數值"),
+    }
+
+
+def get_branch_warrant_detail(branch_name: str, days: int = CHIPS_DAYS, stock_code: str = "") -> Dict[str, Any]:
+    """分點近 N 日買了哪些權證：優先用權證分點歷史庫（剩餘張數＋天期／價內外／估算槓桿）；沒同步時退回事件表權證清單。"""
+    canonical, candidates = resolve_branch(branch_name)
+    if not canonical:
+        return {"found": False, "query": branch_name, "candidates": candidates, "reason": "找不到唯一符合的分點"}
+    requested = max(1, int(days or CHIPS_DAYS))
+    result = _warrant_detail_from_store(canonical, requested, min(requested, BRANCH_WINDOW_MAX_DAYS), stock_code)
+    return result if result is not None else _warrant_detail_from_events(branch_name, days, stock_code)
 
 
 def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
@@ -5149,6 +5644,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_branch_performance": get_branch_performance,
     "get_branch_recent_trades": get_branch_recent_trades,
     "get_branch_event_window": get_branch_event_window,
+    "get_branch_warrant_detail": get_branch_warrant_detail,
     "get_branch_stock_history": get_branch_stock_history,
     "get_branch_winrate_rank": get_branch_winrate_rank,
     "get_recent_news": get_recent_news,

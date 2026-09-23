@@ -562,8 +562,10 @@ WARRANT_TOOLS = frozenset((
     "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
     "get_branch_stock_history", "get_branch_winrate_rank", "get_branch_event_performance",
     "get_branch_recent_behavior", "detect_current_branch_events", "get_branch_stock_position",
-    "get_branch_event_window",
+    "get_branch_event_window", "get_branch_warrant_detail",
 ))
+# 「買了哪些權證／權證代號／權證名稱」：列出權證本身（不是標的股）。「哪些股票的權證」仍是標的清單。
+_WARRANT_DETAIL_RE = re.compile(r"(?:哪些|哪幾檔|哪幾支|哪檔|哪支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)")
 
 
 def warrant_allowed(parsed: "ParsedQuestion") -> bool:
@@ -765,11 +767,119 @@ def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str,
             if events:
                 sections.append({"type": "chips", "title": "近30日 A～E 事件", "items": [
                     f"{e.get('標的名稱', '')} {e.get('事件代碼', '')}｜{str(e.get('事件日', ''))[5:]}" for e in events[:8]]})
+        elif r.name == "get_branch_warrant_detail" and d.get("found"):
+            card["branch"] = card["branch"] or d.get("branch", "")
+            card["tags"].append(f"權證明細｜近 {d.get('trading_days')} 日")
+            sections.extend(branch_store_warrant_sections(d) if d.get("source") == "store" else branch_warrant_sections(d))
         elif r.name == "get_branch_event_window" and d.get("found"):
             card["branch"] = card["branch"] or d.get("branch", "")
             card["tags"].append(f"近{d.get('trading_days')}日權證布局")
-            sections.extend(branch_window_sections(d))
+            sections.extend(branch_store_window_sections(d) if d.get("source") == "store" else branch_window_sections(d))
     return card if sections else None
+
+
+def _pct_text(value: Any) -> str:
+    return f"{float(value):.0f}%" if value is not None else "-"
+
+
+def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """近 N 日權證布局（歷史庫版，精簡）：3 格數字 → 左買進／右仍持有 → 5 欄明細 → 一行註解。"""
+    days = d.get("trading_days")
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": f"近 {days} 個交易日｜{d.get('period_start')}～{d.get('period_end')}"}]
+    if not d.get("available"):
+        sections.append({"type": "note", "text": d.get("reason") or "這段期間沒有紀錄"})
+        return sections
+    buy_text, sell_text = str(d.get("buy_amount_text") or "0"), str(d.get("sell_amount_text") or "0")
+    sections.append({"type": "tiles", "items": [
+        {"label": f"近{days}日買進", "value": ("+" + buy_text) if buy_text != "0" else "0", "tone": "signed"},
+        {"label": "賣出（市值）", "value": ("-" + sell_text) if sell_text != "0" else "0", "tone": "signed"},
+        {"label": f"仍持有成本（{d.get('holding_warrants', 0)} 檔權證）", "value": d.get("holding_cost_text", "0"), "tone": "accent"}]})
+    sections.append({"type": "lists", "items": [
+        {"title": f"近{days}日買進", "tone": "up", "rows": [
+            {"name": f"{x['label']}｜{x['event_codes']}" if x.get("event_codes") else x["label"],
+             "value": f"+{x['buy_amount_text']}", "extra": ""} for x in (d.get("buy_stocks") or [])[:6]]},
+        {"title": "目前仍持有（剩餘成本）", "tone": "accent", "rows": [
+            {"name": f"{x['label']}｜{x['remaining_pct']}%", "value": x["remaining_cost_text"], "extra": ""}
+            for x in (d.get("hold_stocks") or [])[:6]]}]})
+    table = [[x.get("stock_name") or x["stock_code"],
+              f"+{x['buy_amount_text']}" if x.get("buy_amount") else "-",
+              f"-{x['sell_amount_text']}" if x.get("sell_amount") else "-",
+              x["remaining_lots_text"] if x.get("remaining_lots") else x.get("state", "-"),
+              _pct_text(x.get("remaining_pct")) if x.get("remaining_lots") else "-"] for x in (d.get("stocks") or [])[:8]]
+    if table:
+        sections.append({"type": "table", "columns": ["標的", "買進", "賣出", "剩餘張數", "剩餘%"],
+                         "rows": table, "signed": ("買進", "賣出"), "accent": ("剩餘張數", "剩餘%")})
+    sections.append({"type": "note", "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
+                                             "之後以 Sheet 補。"})
+    return sections
+
+
+def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """買了哪些權證（歷史庫版，精簡）：習慣 4 格 → 每檔標的一張 5 欄表（權證、剩餘、天期、價內外、槓桿）→ 一行註解。"""
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": f"近 {d.get('trading_days')} 個交易日｜{d.get('period_start')}～{d.get('period_end')}"}]
+    if not d.get("available"):
+        sections.append({"type": "note", "text": d.get("reason") or "這段期間沒有紀錄"})
+        return sections
+    h = d.get("habits") or {}
+    money, tenor, lev = h.get("moneyness_at_buy_median"), h.get("tenor_at_buy_median"), h.get("leverage_at_buy_median")
+    sections.append({"type": "tiles", "items": [
+        {"label": "認購／認售", "value": f"{h.get('call_count', 0)}／{h.get('put_count', 0)}", "tone": "ink"},
+        {"label": "買進時天期", "value": f"{tenor:.0f} 天" if tenor is not None else "-", "tone": "ink"},
+        {"label": "買進時價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-", "tone": "ink"},
+        {"label": "估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
+    for group in (d.get("groups") or [])[:3]:
+        remaining = group.get("remaining_text") or ""
+        head = [group["label"], group.get("event_codes") or "", remaining if remaining == "已全部賣出" else f"剩 {remaining}"]
+        sections.append({"type": "heading", "text": "｜".join(x for x in head if x)})
+        rows = []
+        for w in group["warrants"][:4]:
+            days_left, money_now, lev_now = w.get("days_left"), w.get("moneyness_now"), w.get("leverage_now")
+            rows.append([f"{w['warrant_code']} {w['warrant_name']}".strip(),
+                         w["remaining_text"] + (f" {w['remaining_pct']}%" if w.get("remaining_lots") else ""),
+                         ("已到期" if days_left <= 0 else f"{days_left}天") if days_left is not None else "-",
+                         f"{'價內' if money_now >= 0 else '價外'}{abs(money_now):.0f}%" if money_now is not None else "-",
+                         f"{lev_now:.1f}倍" if lev_now is not None else "-"])
+        sections.append({"type": "table", "columns": ["權證", "剩餘", "天期", "價內外", "槓桿"],
+                         "widths": (0.40, 0.18, 0.12, 0.15, 0.15), "signed": (), "accent": ("剩餘", "槓桿"), "rows": rows})
+    hidden = len(d.get("hidden_stocks") or []) + max(0, len(d.get("groups") or []) - 3)
+    tail = f"另有 {hidden} 檔標的未列出，可問「{d.get('branch')} 代號 買哪些權證」。" if hidden else ""
+    if d.get("near_expiry_holdings"):
+        tail += f"快到期仍持有：{'、'.join(x.split(' ')[0] for x in d['near_expiry_holdings'][:3])}。"
+    sections.append({"type": "note", "text": f"※ 天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算。{tail}"})
+    return sections
+
+
+def branch_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """分點買了哪些權證：依標的分組，每組一張表（權證代號＋名稱、事件、首次／最近買進、最大單筆、狀態）。"""
+    badge = f"近 {d.get('trading_days')} 個交易日｜{d.get('period_start')}～{d.get('period_end')}｜權證 {d.get('warrant_count', 0)} 檔"
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": badge}]
+    if not d.get("available"):
+        sections.append({"type": "note", "text": d.get("reason") or "這段期間沒有紀錄"})
+        return sections
+    for group in d.get("groups") or []:
+        head = [group["label"], group.get("event_codes") or ""]
+        if group.get("buy_amount_text") and group["buy_amount_text"] != "-":
+            head.append(f"+{group['buy_amount_text']}")
+        if group.get("state"):
+            head.append(group["state"])
+        sections.append({"type": "heading", "text": "｜".join(x for x in head if x)})
+        sections.append({"type": "table", "columns": ["權證", "事件", "首次", "最近", "最大單筆", "狀態"],
+                         "signed": (), "accent": ("狀態",), "first_ratio": 0.34, "rows": [
+                             [f"{w['warrant_code']} {w['warrant_name']}".strip(), w["event_codes"], w["first_date"][5:],
+                              w["last_date"][5:], w["max_amount_text"], w["state"]] for w in group["warrants"]]})
+        extra = group.get("warrant_count", 0) - len(group["warrants"])
+        if extra > 0:
+            sections.append({"type": "note", "text": f"這檔另有 {extra} 檔權證未列出。"})
+    if d.get("hidden_stocks"):
+        names = "、".join(d["hidden_stocks"][:4]) + ("…" if len(d["hidden_stocks"]) > 4 else "")
+        sections.append({"type": "note", "text": f"另有 {len(d['hidden_stocks'])} 檔標的（{names}）未列出；"
+                                                 f"可問「{d.get('branch')} 代號 買哪些權證」只看單一標的。"})
+    note = ("※ 權證代號與名稱取自回測 A～E 事件（單日權證買進 100 萬以上）的權證清單；清單沒有逐檔金額，"
+            "只有「最大單筆」那一檔有金額；狀態依該權證最後一筆事件；隔日衝已排除。")
+    if d.get("coverage_note"):
+        note += f"{d['coverage_note']}。"
+    sections.append({"type": "note", "text": note})
+    return sections
 
 
 def branch_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -936,6 +1046,14 @@ class QueryRouter:
 
     def _branch_plan(self, parsed: ParsedQuestion, categories: Set[str], analysis: bool) -> QueryPlan:
         branch = parsed.branches[0]
+        if _WARRANT_DETAIL_RE.search(parsed.original or ""):
+            # 「第一金中壢近70日買了哪些權證」「第一金中壢 7788 買哪幾檔權證」：列出權證代號與名稱，
+            # 另請 AI 解讀這個分點挑權證的習慣（天期、價內外、槓桿）
+            plan = QueryPlan(route="rule_branch", need_final_llm=True)
+            days = parsed.window_days if parsed.days_specified and parsed.window_days else tools.CHIPS_DAYS
+            plan.add("get_branch_warrant_detail", branch_name=branch, days=days,
+                     stock_code=parsed.stocks[0][0] if parsed.stocks else "")
+            return plan
         if parsed.stocks:
             code = parsed.stocks[0][0]
             if "position" in parsed.intents:
@@ -1589,6 +1707,15 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         candle = _candle_shape(data)
         data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_status", "volume_trend", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
         data["candle"] = candle
+    elif name == "get_branch_warrant_detail":
+        # 給 AI 的權證明細：保留習慣統計、快到期、各組重點與每檔的關鍵數字（圖上已有完整表格）
+        keep = ("warrant_code", "warrant_name", "call", "event_codes", "last_buy_date", "remaining_text", "days_left",
+                "moneyness_now", "leverage_now", "tenor_at_buy", "moneyness_at_buy", "leverage_at_buy")
+        groups = data.get("groups") or []
+        data = {k: data.get(k) for k in ("branch", "trading_days", "period_start", "period_end", "warrant_count", "habits",
+                                          "near_expiry_holdings", "definition_note", "store_date")}
+        data["groups"] = [{**{k: g.get(k) for k in ("label", "event_codes", "buy_amount_text", "remaining_text", "spot", "sigma_pct")},
+                           "warrants": [{k: w.get(k) for k in keep} for w in g.get("warrants") or []]} for g in groups]
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -1674,6 +1801,15 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
                            "summary 一句說接下來要觀察什麼（可用均線或估算成本當觀察價位），不可給買賣指令。")
 
 
+FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
+                             "（認購／認售檔數、天期、價內外、估算槓桿的中位數），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
+                             "解讀這個分點的操作風格：偏好長天期還是短天期、價內還是價外、高槓桿還是低槓桿，代表押波段、押短線或是保守；"
+                             "目前主力部位在哪一檔標的、剩多少；哪些持有中的權證快到期（near_expiry_holdings）要注意時間價值流失。"
+                             "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"
+                             "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝一句話講這個分點的挑權證風格；why 2～3 句；scenarios 給空陣列；"
+                             "summary 一句說接下來要留意什麼。")
+
+
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
 
 
@@ -1699,6 +1835,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_SPOT_RULES)
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
+    if "get_branch_warrant_detail" in names:
+        sections.append(FINAL_WARRANT_HABIT_RULES)
     if "get_index_comparison" in names:
         sections.append(FINAL_INDEX_COMPARE_RULES)
     elif "get_pattern_scorecard" in names:
@@ -2599,6 +2737,15 @@ def format_spot_branch_flow(d: Dict[str, Any]) -> str:
             f"近20日買超 {d.get('buy_days_20', 0)} 天、賣超 {d.get('sell_days_20', 0)} 天；上榜 {d.get('listed_days')}/{d.get('window_days')} 天")
 
 
+def format_branch_warrant_detail(d: Dict[str, Any]) -> str:
+    if not d.get("found"):
+        return f"找不到分點：{d.get('query', '')}"
+    lines = [f"📌 {d.get('branch')} 近 {d.get('trading_days')} 日買進的權證（{d.get('period_start')}～{d.get('period_end')}）"]
+    for group in d.get("groups") or []:
+        lines.append(f"【{group['label']}】" + "、".join(f"{w['warrant_code']} {w['warrant_name']}" for w in group["warrants"]))
+    return "\n".join(lines)
+
+
 def format_branch_event_window(d: Dict[str, Any]) -> str:
     """分點近 N 日權證布局的文字版（Log／AI 失敗時）。"""
     if not d.get("found"):
@@ -2614,6 +2761,7 @@ def format_branch_event_window(d: Dict[str, Any]) -> str:
 
 FORMATTERS.update({
     "get_branch_event_window": format_branch_event_window,
+    "get_branch_warrant_detail": format_branch_warrant_detail,
     "get_spot_branch_flow": format_spot_branch_flow,
     "get_pattern_scorecard": format_pattern_scorecard,
     "get_top_warrant_buy_stocks": format_top_warrant,
@@ -2657,7 +2805,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add("新聞為近期報導整理")
         elif r.name in ("get_sheet_stock_chips", "get_branch_stock_position") and d.get("data_latest_event_date"):
             add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
-        elif r.name == "get_branch_event_window" and d.get("period_start"):
+        elif r.name in ("get_branch_event_window", "get_branch_warrant_detail") and d.get("period_start"):
             add(f"權證 A～E 事件 {d['period_start']}～{d['period_end']}")
         elif r.name == "get_spot_branch_flow" and d.get("data_date"):
             add(f"現股分點截至 {d['data_date']}（每日前段分點近似）")
@@ -4758,6 +4906,13 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                 result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
                 print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
                       f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+            # 權證分點歷史庫（GitHub release）：有更新才下載；寫入約 20 秒會佔用資料庫，盤中只在本地還沒有資料時才做
+            try:
+                import warrant_store
+                if not sector_radar.session_open(now) or not warrant_store.available():
+                    warrant_store.maybe_sync(log=lambda m: print(f"🗃️ {m}", flush=True))
+            except Exception as exc:
+                print(f"⚠️ 權證分點歷史庫同步略過｜{type(exc).__name__}: {exc}", flush=True)
             # 先同步正式收盤，再校正保留期內未完成的日期；成功後樣本已刪，自然不重跑。
             if minutes >= 15 * 60:
                 import intraday_volume

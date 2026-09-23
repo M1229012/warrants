@@ -6,3 +6,5 @@
 discord.py>=2.4,<3
 
 Pillow>=10.4,<13
+# 權證分點歷史庫（GitHub release 的 parquet）讀取
+pyarrow>=14
