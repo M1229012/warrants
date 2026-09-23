@@ -3931,6 +3931,9 @@ def queue_admin_alert(client, config: "BotConfig", kind: str, detail: str, *, us
         return None
 
 
+DENIAL_BUTTON_LABELS = {"WARRANT": "🔓 前往解鎖權證系統", "GENERAL": "🔓 加入艾斯會員"}
+
+
 async def send_access_denial(interaction, text, required, public=False):
     """public=True 只給 /ace 測試模式：管理員要在群組直接展示未解鎖畫面。
     WARRANT＝權證解鎖圖＋網址＋按鈕；GENERAL（guest）＝會員專屬圖（不放購買連結）；圖片失敗才退回完整文字。"""
@@ -3946,9 +3949,10 @@ async def send_access_denial(interaction, text, required, public=False):
     if render:
         # 可點的網址一定放在訊息本身（圖片失敗時也有）。
         options["content"] += "\n\n網址：\n" + access_policy.UNLOCK_URL
-    if required == "WARRANT":
+    if render:
+        # 權證與 guest 都在圖片下方放 Link Button（同一個 Skool 網址，文字依身分不同）。
         view = discord.ui.View()
-        view.add_item(discord.ui.Button(label="🔓 前往解鎖權證系統", url=access_policy.UNLOCK_URL))
+        view.add_item(discord.ui.Button(label=DENIAL_BUTTON_LABELS[required], url=access_policy.UNLOCK_URL))
         options["view"] = view
     if render:
         try:
