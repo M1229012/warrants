@@ -1430,7 +1430,15 @@ def recheck_provisional_closes(max_items: int = 5) -> Dict[str, int]:
 
 
 def price_source_note(bundle: Dict[str, Any]) -> str:
-    """給 AI 與圖片看的資料說明；盤中／盤後暫定都明確標示。"""
+    """給 AI 與圖片看的資料說明；盤中／盤後暫定都明確標示，個股無交易日也寫出來。"""
+    note = _price_source_base(bundle)
+    gaps = bundle.get("data_gaps") or []
+    if gaps:
+        note += f"；{'、'.join(gaps)} 該股無交易資料（可能停牌、休市或無成交），均線以實際交易日計算"
+    return note
+
+
+def _price_source_base(bundle: Dict[str, Any]) -> str:
     info = bundle.get("intraday") or {}
     if not info:
         return "日K收盤資料（非盤中即時）"
@@ -1762,6 +1770,12 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
         return []
 
 
+# 補不回來的缺口（停牌、颱風假、無成交）最多容忍幾天；超過就當資料源異常。
+MAX_ACCEPTED_GAPS = 3
+# code → (日期, 已確認無資料的交易日)：同一天不再為同一個缺口重抓 FinMind。
+_ACCEPTED_GAPS: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+
+
 def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str) -> Tuple[pd.DataFrame, str]:
     """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。"""
     columns = ["Open", "High", "Low", "Close", "Volume"]
@@ -1832,25 +1846,35 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
         gaps = _missing_trading_days(merged)
-        if gaps:
-            # 缺一天就補；補不到寧可不答，也不要送出一張看起來正常、但均線全錯的圖。
+        today = taipei_now().strftime("%Y-%m-%d")
+        accepted = _ACCEPTED_GAPS.get(code)
+        known = set(accepted[1]) if accepted and accepted[0] == today else set()
+        if set(gaps) - known:
+            # 缺一天先用本地底庫＋FinMind 補；抓取失敗造成的缺口通常補得回來。
             daily_df, daily_source = _repair_daily(code, daily_df, gaps, daily_source)
             CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
             merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
-            if gaps:
+            if len(gaps) > MAX_ACCEPTED_GAPS:
+                # 缺太多天多半是資料源壞掉，均線會全錯，寧可不答。
                 raise ToolDataError(f"{code} 日K 缺少 {'、'.join(gaps)} 的資料，資料不完整，暫時無法分析")
+            if gaps:
+                # 各來源都確定沒有這幾天（停牌、颱風假、無成交）：視為該股無交易日，照常分析並標註。
+                _ACCEPTED_GAPS[code] = (today, tuple(gaps))
+                print(f"⚠️ {code} 日K {'、'.join(gaps)} 各來源都沒有資料，視為該股無交易日（停牌／休市／無成交），照常分析", flush=True)
         closed = kf.calculate_indicators(daily_df)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:
-            return {"df": closed, "closed_df": closed, "market": market, "intraday": {}, "daily_source": daily_source}
+            return {"df": closed, "closed_df": closed, "market": market, "intraday": {}, "daily_source": daily_source,
+                    "data_gaps": list(gaps)}
         df = kf.calculate_indicators(merged)
         df["Close_prev"] = df["Close"].shift(1)
         # 均量只用已收盤的日子：盤中累計量不算進 MV5／MV20（早盤會把均量拉低、量比失真）。
         for column in ("MV5", "MV20"):
             if column in df.columns and len(df) > 1:
                 df.iloc[-1, df.columns.get_loc(column)] = df[column].iloc[-2]
-        return {"df": df, "closed_df": closed, "market": market, "intraday": intraday, "daily_source": daily_source}
+        return {"df": df, "closed_df": closed, "market": market, "intraday": intraday, "daily_source": daily_source,
+                "data_gaps": list(gaps)}
 
     ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
     # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
