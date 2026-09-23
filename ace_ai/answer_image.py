@@ -1950,6 +1950,90 @@ NOTE_BG, NOTE_INK = '#FFF4E8', '#B45309'           # AI 覆盤的暖色底
 WATCH_BG = '#F3F0FF'
 
 
+def _is_ai_card_panel(panel: dict) -> bool:
+    return isinstance((panel or {}).get('ai_card'), dict)
+
+
+def _para(draw, x: float, y: float, text: str, size: int, color, width: float, bold: bool = False) -> int:
+    """多行文字（保留段落換行）；draw=None 只算高度。"""
+    step = int(size * 1.62)
+    lines = [line for part in str(text or '').split('\n') for line in (wrap(part, size, width, bold) or [''])]
+    if draw is not None:
+        for i, line in enumerate(lines):
+            text_at(draw, (x, y + i * step), line, size, color, bold)
+    return len(lines) * step
+
+
+AI_SCENARIO_TONES = {'good': (GOOD_INK, GOOD_BG), 'warn': (WARN_INK, WARN_BG), 'neutral': (INK, TILE_BG)}
+
+
+def ai_card(draw, y: float, data: dict, dry: bool) -> int:
+    """艾斯 AI 解讀卡：一句話回答 → 為什麼這樣看 → 接下來可能的兩種走法 → 一句話總結。"""
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    ix0, ix1 = x0 + 36, x1 - 36
+    width = ix1 - ix0
+    pen = None if dry else draw
+    cy = y + 26
+    if data.get('context'):
+        cy += _para(pen, ix0, cy, data['context'], 20, MUTED, width) + 8
+    if data.get('notice'):
+        h = _para(None, 0, 0, data['notice'], 21, WARN_INK, width - 40) + 24
+        if pen:
+            draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=WARN_BG)
+        _para(pen, ix0 + 20, cy + 12, data['notice'], 21, WARN_INK, width - 40)
+        cy += h + 14
+    badge_w = font(20, True).getlength('艾斯 AI 解讀') + 58
+    if pen:
+        draw.rounded_rectangle((ix0, cy, ix0 + badge_w, cy + 38), radius=19, fill=INK)
+        draw.ellipse((ix0 + 14, cy + 12, ix0 + 28, cy + 26), fill=ACCENT)
+        text_at(draw, (ix0 + 38, cy + 8), '艾斯 AI 解讀', 20, 'white', True)
+    cy += 58
+    cy += _para(pen, ix0, cy, data.get('answer', ''), 32, INK, width, True) + 18
+
+    def section(title: str) -> int:
+        if pen:
+            draw.rectangle((ix0, cy + 8, ix0 + 5, cy + 32), fill=ACCENT)
+            text_at(draw, (ix0 + 16, cy + 4), title, 24, INK, True)
+        return 46
+
+    if data.get('why'):
+        cy += section('為什麼這樣看')
+        cy += _para(pen, ix0, cy, data['why'], 25, INK, width) + 16
+    scenarios = [s for s in data.get('scenarios') or [] if s.get('text')][:2]
+    if scenarios:
+        cy += section('接下來可能的走法' if len(scenarios) == 1 else '接下來可能的兩種走法')
+        gap = 20
+        col = (width - gap * (len(scenarios) - 1)) / len(scenarios)
+        box_h = max(_para(None, 0, 0, s['text'], 23, INK, col - 44) for s in scenarios) + 76
+        for i, item in enumerate(scenarios):
+            fg, bg = AI_SCENARIO_TONES.get(item.get('tone'), AI_SCENARIO_TONES['neutral'])
+            bx = ix0 + i * (col + gap)
+            if pen:
+                draw.rounded_rectangle((bx, cy, bx + col, cy + box_h), radius=14, fill=bg)
+                title, size = fit(item.get('title', ''), 23, col - 44, True, 16)
+                text_at(draw, (bx + 22, cy + 16), title, size, fg, True)
+            _para(pen, bx + 22, cy + 56, item['text'], 23, INK, col - 44)
+        cy += box_h + 18
+    if data.get('summary'):
+        label_w = font(24, True).getlength('一句話總結') + 36
+        h = _para(None, 0, 0, data['summary'], 25, INK, width - label_w - 24, True) + 30
+        if pen:
+            draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=ACCENT_BG)
+            text_at(draw, (ix0 + 20, cy + 16), '一句話總結', 24, ACCENT, True)
+        _para(pen, ix0 + label_w, cy + 15, data['summary'], 25, INK, width - label_w - 24, True)
+        cy += h + 16
+    if data.get('footer'):
+        cy += _para(pen, ix0, cy, data['footer'], 20, MUTED, width) + 4
+    return int(cy - y + 22)
+
+
+def draw_ai_card(draw, y: float, data: dict) -> int:
+    height = ai_card(None, y, data, True)
+    draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + height), radius=20, fill='white', outline=LINE)
+    ai_card(draw, y, data, False)
+    return height
+
+
 def _is_branch_panel(panel: dict) -> bool:
     return isinstance((panel or {}).get('branch_card'), dict)
 
@@ -2308,8 +2392,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     contribution_panels = [p for p in panels if _is_contribution_panel(p)]
     review_panels = [p for p in panels if _is_review_panel(p)]
     branch_panels = [p for p in panels if _is_branch_panel(p)]
+    ai_panels = [p for p in panels if _is_ai_card_panel(p)]
     panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)
-              and not _is_contribution_panel(p) and not _is_review_panel(p) and not _is_branch_panel(p)]
+              and not _is_contribution_panel(p) and not _is_review_panel(p) and not _is_branch_panel(p)
+              and not _is_ai_card_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
@@ -2317,7 +2403,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     question_lines = wrap(clean(question), 31, CONTENT - 12, True)
     header_height = 155 + len(question_lines) * 47
     # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
-    hide_text = sector_panels or article_panels or review_panels or any(p.get('hide_text') for p in branch_panels)
+    # AI 解讀卡已包含回答全文（含延續上一題與資料時間），不再另外排文字區塊。
+    hide_text = (sector_panels or article_panels or review_panels or ai_panels
+                 or any(p.get('hide_text') for p in branch_panels))
     blocks = [] if hide_text else body_blocks(answer)
     body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
@@ -2329,6 +2417,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(article_card(None, 0, p['article'], True) + 24 for p in article_panels)
     panels_height += sum(review_card(None, 0, p['review'], True) + 24 for p in review_panels)
     panels_height += sum(branch_card(None, 0, p['branch_card'], True) + 24 for p in branch_panels)
+    panels_height += sum(ai_card(None, 0, p['ai_card'], True) + 24 for p in ai_panels)
     height = header_height + panels_height + body_height + 112
     if review_panels:
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
@@ -2357,6 +2446,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += review_card(draw, y, panel['review'], False) + 24
     for panel in branch_panels:
         y += branch_card(draw, y, panel['branch_card'], False) + 24
+    for panel in ai_panels:
+        y += draw_ai_card(draw, y, panel['ai_card']) + 24
     if blocks:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30

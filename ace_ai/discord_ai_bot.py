@@ -614,7 +614,16 @@ def build_index_comparison(results: Sequence[tools.ToolResult]) -> Dict[str, Any
             "rule": "兩邊資料時間點相同才比較強弱；時間點不同只能分別描述，不得說現在哪一邊比較強。"}
 
 
-def format_index_comparison(comparison: Dict[str, Any]) -> str:
+def format_index_comparison(comparison: Dict[str, Any], brief: bool = False) -> str:
+    """brief=True 只回傳結論一句（圖上已有兩邊的數字），完整版留給 Log 與測試。"""
+    a, b = comparison["sides"]
+    if brief:
+        if not comparison["same_time"]:
+            return (f"⚠️ 兩邊資料時間點不同（{a['name']}：{a['timestamp'] or '無'}；{b['name']}：{b['timestamp'] or '無'}），"
+                    "只能分別描述，不能直接判斷現在哪一邊比較強。")
+        labels = {"change_pct": "漲跌幅", "pattern_score": "型態分數"}
+        verdict = "；".join(f"{labels[k]}：{v}較強" for k, v in comparison["stronger"].items())
+        return f"同一時間點（{a['timestamp']}）比較：{verdict or '兩邊相同或資料不足'}"
     lines = ["**加權 vs 櫃買**"]
     for side in comparison["sides"]:
         if not side["available"]:
@@ -1264,7 +1273,7 @@ FINAL_TECH_RULES = """技術面規則：
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
 - 同一事件的多篇報導合併，整理成 2～4 點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、來源與日期；不要逐條重列標題。
 - 聳動字眼不是事實；法人目標價、獲利預估要寫「某機構估計」。content_source 為「RSS 摘要」或「僅標題」時只描述標題寫到的事實。
-- 【可能利多】【可能利空／風險】分開寫，只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。【綜合觀察】1～2 句說明份量與待確認資訊，不下漲跌結論。"""
+- 可能利多、可能利空／風險分開說明（寫在 why 裡，不用【】標題），只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。summary 用 1 句說明份量與待確認資訊，不下漲跌結論。"""
 
 FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
 - 先直接回答使用者真正問的問題，再挑影響最大的型態、大量區／支撐、均線或權證分點證據。不要把評分卡五大項逐一念完。
@@ -1289,6 +1298,35 @@ unrealized_return_text 是這些分點目前部位的估計未實現損益，要
 FINAL_FORMAT_GENERAL = """依問題自然組織 2～4 個短段落；只有新聞或多主題真的需要分組時才使用小標題，不要每題固定套同一組標題。"""
 FINAL_FORMAT_NEWS = """區塊依序使用：【回答】（1～2 句直接說整體偏利多、偏利空或好壞參半）、【新聞重點】、【可能利多】、【可能利空／風險】、【綜合觀察】。"""
 FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先回答，再給最重要證據與後續觀察條件。"""
+
+# 「艾斯 AI 解讀」卡：Gemini 依 schema 回 JSON，程式負責排版（回答→為什麼→兩種走法→一句話總結）。
+AI_CARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "why": {"type": "string"},
+        "scenarios": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "tone": {"type": "string", "enum": ["good", "warn", "neutral"]},
+                    "text": {"type": "string"},
+                },
+                "required": ["title", "tone", "text"],
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["answer", "why", "scenarios", "summary"],
+}
+
+FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
+- answer：一句話直接回答使用者的問題（20～50 字），像分析師的判斷，例如「趨勢是強的，但現在這個位置不適合追」。
+- why：「為什麼這樣看」2～4 句（60～180 字）。說明關鍵訊號代表什麼、彼此怎麼互相印證或矛盾；只引用 1～3 個真正影響判斷的數字，不要逐項重列均線、分數或價位。
+- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- summary：一句話總結（15～40 字），點出最重要的判斷，可以用簡單比喻，但不可給買賣指令或保證。"""
 
 
 def _is_empty_value(value: Any) -> bool:
@@ -1440,6 +1478,13 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
 FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要 15:00 後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再分別列加權與櫃買的拉升 TOP5、拖累 TOP5；每檔優先引用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
 
 
+FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K 線、均線與型態分數比較表，文字只寫結論：第一句直接回答哪一邊比較強"
+                             "（依 get_index_comparison.stronger，也就是同一時間點的漲跌幅與型態分數；兩者方向不一致要講清楚）。"
+                             "接著最多 2 句說明關鍵原因（例如均線排列、是否站上或跌破關鍵均線）。全文不超過 120 字；"
+                             "不要逐項重列數值、均線清單或各項分數，不要小標題、不要條列，不要預測、不要買賣建議；盤中要提醒以收盤確認。"
+                             "輸出解讀卡時：answer＝結論；why 最多 2 句；scenarios 給空陣列；summary 一句。")
+
+
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
 
 
@@ -1461,12 +1506,11 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
-    if "get_pattern_scorecard" in names:
-        sections += [FINAL_PATTERN_RULES, FINAL_FORMAT_PATTERN]
-    elif names == {"get_recent_news"} or names == {"get_recent_news", "get_stock_overview"}:
-        sections.append(FINAL_FORMAT_NEWS)
-    else:
-        sections.append(FINAL_FORMAT_GENERAL)
+    if "get_index_comparison" in names:
+        sections.append(FINAL_INDEX_COMPARE_RULES)
+    elif "get_pattern_scorecard" in names:
+        sections.append(FINAL_PATTERN_RULES)
+    sections.append(FINAL_CARD_FORMAT)
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -3569,13 +3613,22 @@ class AceQueryEngine:
             # 兩邊時間點不同時不交給 AI，避免寫出「現在 A 比 B 強」。
             plan.need_final_llm = bool(comparison["same_time"])
         text, llm_ok = self._compose(question, plan, results, stats)
+        ai_card = self._take_ai_card()
         if comparison is not None:
-            header = format_index_comparison(comparison)
-            text = header + chr(10) + chr(10) + text if comparison["same_time"] else header
+            # 圖上已有兩邊的 K 線與型態比較表，文字只放結論：AI 結論，AI 失敗或時間點不同時放一句規則結論。
+            self.log(format_index_comparison(comparison))
+            if not (comparison["same_time"] and llm_ok and plan.need_final_llm):
+                text = format_index_comparison(comparison, brief=True)
+                ai_card = None
         if plan.route == "rule_breadth" and not any(r.name == "get_index_contribution" and r.ok for r in results):
             # 貢獻榜算不出來時要講清楚，不能讓 AI 拿漲幅或舊資料當答案。
-            text = ("※ 今天的指數貢獻榜要等交易所收盤檔發布（約 15:00）後才有；"
-                    "以下只是權值股漲幅與盤面廣度，不是貢獻點數排名。" + chr(10) + chr(10) + text)
+            notice = ("※ 今天的指數貢獻榜要等交易所收盤檔發布（約 15:00）後才有；"
+                      "以下只是權值股漲幅與盤面廣度，不是貢獻點數排名。")
+            text = notice + chr(10) + chr(10) + text
+            if ai_card:
+                ai_card["notice"] = notice
+        if ai_card:
+            panels.append({"ai_card": ai_card})
         elapsed = time.perf_counter() - started
         self.log(
             f"完成｜Gemini 呼叫 {stats.gemini_calls} 次（{stats.gemini_latency:.2f}s）｜"
@@ -3664,22 +3717,70 @@ class AceQueryEngine:
             results.append(result)
         return results
 
+    def _set_ai_card(self, card: Optional[Dict[str, Any]]) -> None:
+        local = getattr(self, "_request_local", None)
+        if local is not None:
+            local.ai_card = card
+
+    def _take_ai_card(self) -> Optional[Dict[str, Any]]:
+        local = getattr(self, "_request_local", None)
+        card = getattr(local, "ai_card", None) if local is not None else None
+        self._set_ai_card(None)
+        return card
+
+    def _check_ai_card(self, card: Dict[str, Any], payload: Dict[str, Any], facts: "FactSheet") -> Optional[Dict[str, Any]]:
+        """每個欄位各自做事實核對：刪掉對不上原始資料的句子；結論被刪光或刪太多就整張不用。"""
+        before = len(ai_card_text(card))
+        removed_all: List[str] = []
+
+        def clean(text: str) -> str:
+            if not text or not facts.check(text):
+                return text
+            pruned, removed = prune_ungrounded_sentences(text, payload, facts)
+            removed_all.extend(removed)
+            return pruned.strip() if pruned and not facts.check(pruned) else ""
+
+        card = dict(card)
+        card["answer"], card["why"], card["summary"] = clean(card["answer"]), clean(card.get("why", "")), clean(card.get("summary", ""))
+        card["scenarios"] = [dict(s, text=clean(s["text"])) for s in card.get("scenarios") or []]
+        card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
+        if removed_all:
+            self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r[:40] for r in removed_all[:6])}")
+        if not card["answer"] or len(ai_card_text(card)) < before * 0.6:
+            self.log("事實核對未通過（解讀卡），改用規則式回答")
+            return None
+        return card
+
     def _compose(self, question: str, plan: QueryPlan, results: List[tools.ToolResult], stats: AnswerStats) -> Tuple[str, bool]:
-        """回傳 (回答文字, 是否可快取)。"""
+        """回傳 (回答文字, 是否可快取)；AI 解讀卡另存在 _request_local.ai_card，由 _answer_uncached 取走。"""
+        self._set_ai_card(None)
         rule_answer = build_rule_based_answer(results)
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
-        result = self.gateway.generate(prompt, purpose="final_answer", temperature=0.3)
+        result = self.gateway.generate(prompt, purpose="final_answer", schema=AI_CARD_SCHEMA, temperature=0.3)
         stats.record_gemini(result)
         if not result.ok:
             self.log(f"最終回答 Gemini 失敗：{result.error}")
             prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 分析暫時無法使用，以下先提供系統整理的資料。"
             return f"{prefix}\n\n{rule_answer}", False
-        answer = result.text
         facts = FactSheet(question, results, payload)
+        card = parse_ai_card(result.text)
+        if card is None and str(result.text or "").lstrip().startswith("{"):
+            self.log("AI 解讀卡 JSON 無法解析，改用規則式回答")
+            return f"（AI 回覆格式異常，改顯示系統整理的資料）\n\n{rule_answer}", False
+        if card is not None:
+            card = self._check_ai_card(card, payload, facts)
+            if card is None:
+                return f"（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+            time_line = build_data_time_line(results)
+            card["footer"] = "｜".join(x for x in (time_line, "AI 解讀僅供參考，不構成投資建議。") if x)
+            self._set_ai_card(card)
+            text = ai_card_text(card)
+            return f"{text}\n\n{time_line}\n\n{DISCLAIMER}" if time_line else f"{text}\n\n{DISCLAIMER}", True
+        answer = result.text
         issues = facts.check(answer)
         if issues:
             # 只刪掉有問題的句子（數字對不上、張冠李戴、均線數值或站上／跌破方向寫錯、把題目假設價當報價）；
@@ -3842,9 +3943,10 @@ async def send_access_denial(interaction, text, required, public=False):
         # 圖片要讀檔或 render：先 defer 佔住 3 秒期限，再產圖、編輯原回覆。
         await interaction.response.defer(thinking=True, ephemeral=not public)
         edit_original = True
-    if required == "WARRANT":
-        # 可點的網址與 Link Button 一定放在訊息本身。
+    if render:
+        # 可點的網址一定放在訊息本身（圖片失敗時也有）。
         options["content"] += "\n\n網址：\n" + access_policy.UNLOCK_URL
+    if required == "WARRANT":
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="🔓 前往解鎖權證系統", url=access_policy.UNLOCK_URL))
         options["view"] = view
@@ -3853,9 +3955,9 @@ async def send_access_denial(interaction, text, required, public=False):
             data, extension = await asyncio.to_thread(render)
             name = "ace-locked" if required == "WARRANT" else "ace-members-only"
             options["file"] = discord.File(io.BytesIO(data), filename=f"{name}.{extension}")
-            # 有圖時說明文字都在圖上：權證只留網址（<> 關掉連結預覽），guest 只貼圖。
-            options["content"] = f"<{access_policy.UNLOCK_URL}>" if required == "WARRANT" else None
-        except Exception as exc:  # 圖片失敗仍送完整文字（權證另有網址＋按鈕）
+            # 有圖時說明文字都在圖上，訊息只留網址（<> 關掉連結預覽）。
+            options["content"] = f"<{access_policy.UNLOCK_URL}>"
+        except Exception as exc:  # 圖片失敗仍送完整文字＋網址（權證另有按鈕）
             print(f"⚠️ 權限提示圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
     if edit_original:
         file = options.pop("file", None)
@@ -3956,6 +4058,60 @@ def _startup_warmup() -> None:
         except Exception as exc:  # 校正失敗不影響上線
             print(f"⚠️ 富果成交量單位校正略過：{type(exc).__name__}: {exc}", flush=True)
     print(f"🔥 預熱完成｜{time.perf_counter() - started:.1f} 秒", flush=True)
+
+
+def _clean_card_text(value: Any, limit: int) -> str:
+    text = re.sub(r"\*+|^#+\s*|【[^】]*】", "", str(value or "")).strip()
+    return text[:limit]
+
+
+def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
+    """Gemini 回傳的解讀卡 JSON；格式不對回 None（改走一般文字）。"""
+    data: Any = None
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        try:
+            data = tools_json_loads(text)
+        except Exception:
+            data = None
+    if not isinstance(data, dict):
+        return None
+    answer = _clean_card_text(data.get("answer"), 120)
+    why = _clean_card_text(data.get("why"), 600)
+    summary = _clean_card_text(data.get("summary"), 120)
+    scenarios = []
+    for item in data.get("scenarios") or []:
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            continue
+        tone = str(item.get("tone") or "neutral")
+        scenarios.append({"title": _clean_card_text(item.get("title"), 24) or "情境",
+                          "tone": tone if tone in ("good", "warn", "neutral") else "neutral",
+                          "text": _clean_card_text(item.get("text"), 200)})
+    if not answer or not (why or summary):
+        return None
+    return {"answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
+
+
+def ai_card_text(card: Dict[str, Any]) -> str:
+    """解讀卡的文字版：Log、快取、純文字回覆與事實核對用。"""
+    parts = [card["answer"]]
+    if card.get("why"):
+        parts.append("為什麼這樣看：" + card["why"])
+    for item in card.get("scenarios") or []:
+        parts.append(f"{item['title']}：{item['text']}")
+    if card.get("summary"):
+        parts.append("一句話總結：" + card["summary"])
+    return (chr(10) * 2).join(parts)
+
+
+def panels_with_context(result: "AnswerResult") -> List[Dict[str, Any]]:
+    """延續上一題時，把「延續上一題：…」放進解讀卡最上方（卡片模式不顯示文字區塊）。"""
+    if not result.context_note:
+        return result.panels
+    note = f"※ {result.context_note}（輸入「重新開始」可清除）"
+    return [{**p, "ai_card": {**p["ai_card"], "context": note}} if isinstance(p.get("ai_card"), dict) else p
+            for p in result.panels]
 
 
 def with_context_note(result: "AnswerResult") -> str:
@@ -4386,7 +4542,7 @@ def run_discord_bot(config: BotConfig) -> None:
             elif result.as_text:
                 await interaction_text(interaction, with_context_note(result), ephemeral=ephemeral)
             else:
-                await interaction_image(interaction, image_question, with_context_note(result), result.panels, ephemeral=ephemeral,
+                await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started

@@ -4864,6 +4864,10 @@ def get_index_contribution(top: int = 5) -> Dict[str, Any]:
     return index_contribution.report(top=max(3, int(top or 5)))
 
 
+# K 線圖大約 3 個月；三大法人柱狀圖要蓋滿整張 K 線，所以抓的天數比統計用的 20 日多。
+INST_CHART_DAYS = 90
+
+
 def get_institutional_flow(stock_code: str, days: int = 20) -> Dict[str, Any]:
     """個股三大法人買賣超（FinMind，單位：張）：最新一日、近5／近20日合計、連買連賣天數。GENERAL 可用，不是權證分點。"""
     code, name = _stock_identity(stock_code)
@@ -4873,16 +4877,18 @@ def get_institutional_flow(stock_code: str, days: int = 20) -> Dict[str, Any]:
         raise ToolDataError("主程式沒有三大法人函式")
     started = time.perf_counter()
     try:
-        frame = fetch(code, days=max(25, int(days or 20) + 5))
+        frame = fetch(code, days=max(int(days or 20), INST_CHART_DAYS) + 10)
         record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
     except Exception as exc:
         record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
         raise ToolDataError(f"{code} 三大法人資料暫時無法取得：{type(exc).__name__}: {exc}") from exc
     if frame is None or frame.empty:
         raise ToolDataError(f"{code} 三大法人沒有資料")
-    frame = frame.copy()
-    frame["Date"] = pd.to_datetime(frame["Date"]).dt.normalize()
-    frame = frame.sort_values("Date").tail(max(5, int(days or 20)))
+    full = frame.copy()
+    full["Date"] = pd.to_datetime(full["Date"]).dt.normalize()
+    full = full.sort_values("Date")
+    frame = full.tail(max(5, int(days or 20)))          # 統計：最新一日、近5／近20日、連買連賣
+    chart = full.tail(INST_CHART_DAYS)                   # 圖：整段 K 線期間
     labels = (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商"))
 
     def streak(values: List[float]) -> int:
@@ -4912,7 +4918,7 @@ def get_institutional_flow(stock_code: str, days: int = 20) -> Dict[str, Any]:
         "investors": investors,
         "total_latest_lots": int(round(total[-1])), "total_5d_lots": int(round(sum(total[-5:]))),
         "rows": [{"date": _fmt_date(r.Date), "foreign": float(r.foreign), "invest": float(r.invest),
-                  "dealer": float(r.dealer)} for r in frame.itertuples()],
+                  "dealer": float(r.dealer)} for r in chart.itertuples()],
         "definition_note": "三大法人為交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是權證分點資料",
     }
 
