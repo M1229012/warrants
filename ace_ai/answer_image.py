@@ -2105,8 +2105,10 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 bold = str(row[0]).startswith('全部')
                 for c, cell in enumerate(row):
                     cx = x0 + 18 if c == 0 else x0 + first + rest * c - 18
-                    color = _tone_color(cell, 'auto') if columns[c] == '加權報酬' else (ACCENT if columns[c] == '勝率' else INK)
-                    draw.text((cx, ry + row_h / 2), str(cell), font=font(22, c == 0 or bold or columns[c] == '勝率'),
+                    signed = section.get('signed', ('加權報酬',))
+                    accent = section.get('accent', ('勝率',))
+                    color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
+                    draw.text((cx, ry + row_h / 2), str(cell), font=font(22, c == 0 or bold or columns[c] in accent),
                               fill=color, anchor='lm' if c == 0 else 'rm')
                 draw.line((x0, ry + row_h, x1, ry + row_h), fill=GRID)
         return head_h + len(rows) * row_h + 20
@@ -2189,7 +2191,7 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.rounded_rectangle((tag_x, y + 32, tag_x + w, y + 64), radius=16, fill=ACCENT_BG)
         draw.text((tag_x + w / 2, y + 48), tag, font=font(19, True), fill=ACCENT, anchor='mm')
         tag_x += w + 10
-    draw.text((ix1, y + 48), '權證分點', font=font(20), fill=MUTED, anchor='rm')
+    draw.text((ix1, y + 48), data.get('label', '權證分點'), font=font(20), fill=MUTED, anchor='rm')
     cursor = y + head_h
     for section in data.get('sections') or []:
         cursor += _branch_section(draw, ix0, ix1, cursor, section, False)
@@ -2480,6 +2482,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   else '股市艾斯  /  指數貢獻依收盤資料計算')
     else:
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'
+    custom_footer = next((p.get('footer_text') for p in branch_panels if p.get('footer_text')), '')
+    footer = custom_footer or footer
     text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
     return add_center_watermarks(image)
 
@@ -2662,6 +2666,18 @@ def make_member_only_attachment(*, max_bytes=7_500_000):
     except OSError:
         pass
     return encode_image(render_member_only(), max_bytes)
+
+
+def render_spot_locked() -> Image.Image:
+    """現股分點籌碼沒有權限：ACE / RESEARCH 卡片（目前沒有現股購買網址，所以不放 CTA）。"""
+    card = {'branch': '現股分點籌碼', 'tags': [], 'label': 'ACE / RESEARCH',
+            'sections': [{'type': 'badge', 'text': '此功能目前沒有使用權限'},
+                         {'type': 'note', 'text': '現股券商分點籌碼（最新分點動向、集中度、累積分點與延續性）目前未開放給這個帳號。'}]}
+    return render_answer('現股分點籌碼', '', [{'branch_card': card, 'hide_text': True}]).convert('RGB')
+
+
+def make_spot_locked_attachment(*, max_bytes=7_500_000):
+    return encode_image(render_spot_locked(), max_bytes)
 
 
 LOCKED_ASSET = Path(__file__).with_name('assets') / 'warrant_unlock.webp'
