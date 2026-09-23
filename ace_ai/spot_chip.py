@@ -30,8 +30,11 @@ REQUESTED_DAYS = 70
 PERIODS = (3, 5, 10, 20, 70)
 FETCHER = os.getenv("DISCORD_AI_SPOT_FETCHER", "http").strip().lower() or "http"
 MAX_CONCURRENCY = max(1, int(os.getenv("DISCORD_AI_SPOT_CONCURRENCY", "1") or 1))
-REQUEST_GAP = float(os.getenv("DISCORD_AI_SPOT_REQUEST_GAP", "0.6") or 0.6)
-BACKFILL_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKFILL_BUDGET", "60") or 60)
+# 每頁間隔：原本 0.6 秒 × 71 頁光等待就 43 秒（實際抓取只要約 17 秒），改成 0.2 秒。
+REQUEST_GAP = float(os.getenv("DISCORD_AI_SPOT_REQUEST_GAP", "0.2") or 0.2)
+# 會員這一題最多等幾秒補歷史；沒補完的日期在背景繼續補，下一題就是完整資料。
+BACKFILL_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKFILL_BUDGET", "25") or 25)
+BACKGROUND_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKGROUND_BUDGET", "600") or 600)
 TODAY_READY = os.getenv("DISCORD_AI_SPOT_TODAY_READY", "15:30").strip() or "15:30"
 # 狀態：complete（有可信分點）／pending_update（最新交易日富邦尚未更新）／market_closed（全市場休市）
 # ／stock_no_trade（市場有開、個股沒成交）／source_error（抓取失敗）／retry（歷史日有成交但來源仍無資料）。
@@ -50,6 +53,8 @@ BROKER_TAGS = {
 }
 
 _SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENCY)
+_BACKGROUND: set = set()
+_BACKGROUND_GUARD = threading.Lock()
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
 _STOCK_LOCKS_GUARD = threading.Lock()
 
@@ -267,7 +272,7 @@ def _no_data_status(date: str, latest_date: str, bar_dates: Sequence[str]) -> st
 
 def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
-                bar_dates: Optional[Sequence[str]] = None) -> Dict[str, int]:
+                bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None) -> Dict[str, int]:
     """只補缺少的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補，全域同時最多 MAX_CONCURRENCY。
     latest_date＝目前最新交易日（查不到資料時判 pending_update）；bar_dates＝個股日 K 日期（判斷停牌）。"""
     now = now or tools.taipei_now()
@@ -275,7 +280,8 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
     latest_date = latest_date or (max(dates) if dates else today)
     bar_dates = list(bar_dates) if bar_dates is not None else list(_bars(stock_code).keys())
     lock = _stock_lock(stock_code)
-    if not lock.acquire(timeout=max(1.0, budget)):
+    # 背景正在補同一檔時，會員這一題不排隊等它：直接用資料庫已有的資料回答。
+    if not lock.acquire(timeout=max(0.0, budget if lock_wait is None else lock_wait)):
         return {"fetched": 0, "remaining": len(dates), "busy": 1}
     try:
         status = local_market_cache.spot_day_status(stock_code, dates)
@@ -318,6 +324,30 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
         return {"fetched": fetched, "remaining": max(0, len(missing) - fetched), "errors": errors}
     finally:
         lock.release()
+
+
+def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: str,
+                           bar_dates: Sequence[str], fetch_source=open_source) -> bool:
+    """這一題的時間用完但還有日期沒補：背景繼續補（同一檔只開一條），不擋住 Discord 回覆。"""
+    code = str(stock_code)
+    with _BACKGROUND_GUARD:
+        if code in _BACKGROUND:
+            return False
+        _BACKGROUND.add(code)
+
+    def run() -> None:
+        try:
+            result = ensure_days(code, dates, budget=BACKGROUND_BUDGET, fetch_source=fetch_source,
+                                 latest_date=latest_date, bar_dates=bar_dates, lock_wait=BACKGROUND_BUDGET)
+            print(f"📚 現股分點背景補資料｜{code}｜新增 {result.get('fetched', 0)} 日｜尚缺 {result.get('remaining', 0)}", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 現股分點背景補資料失敗｜{code}｜{type(exc).__name__}: {exc}", flush=True)
+        finally:
+            with _BACKGROUND_GUARD:
+                _BACKGROUND.discard(code)
+
+    threading.Thread(target=run, name=f"spot-backfill-{code}", daemon=True).start()
+    return True
 
 
 # ============================================================
@@ -475,7 +505,10 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
                 break
     else:
         progress = ensure_days(stock_code, dates, budget=budget, now=now, fetch_source=fetch_source,
-                               latest_date=dates[-1], bar_dates=bar_dates)
+                               latest_date=dates[-1], bar_dates=bar_dates, lock_wait=2.0)
+        if progress.get("remaining") and not progress.get("errors"):
+            # 時間用完（或背景正在補）：剩下的日期背景繼續，這一題先用已有的資料回答
+            progress["background"] = continue_in_background(stock_code, dates, dates[-1], bar_dates, fetch_source)
     statuses = local_market_cache.spot_day_status(stock_code, dates)
     complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
     rows = local_market_cache.load_spot_rows(stock_code, complete)
@@ -647,6 +680,62 @@ def branch_card(report: Dict[str, Any], names: Dict[str, str]) -> Dict[str, Any]
             {"title": "淨買超", "tone": "up", "rows": [{"name": label(c), "value": _lots(v), "extra": ""} for c, v in report["buy"]]},
             {"title": "淨賣超", "tone": "down", "rows": [{"name": label(c), "value": _lots(v), "extra": ""} for c, v in report["sell"]]}]},
         {"type": "note", "text": "※ 只含本地已建置過的股票，不是該分點全市場進出。"}]}
+
+
+def summary_payload(report: Dict[str, Any]) -> Dict[str, Any]:
+    """給 AI 解讀用的精簡現股籌碼（最新 Top5、5／20 日傾向、主要累積買超、VWAP）。"""
+    periods = {p["days"]: p for p in report.get("periods") or [] if not p.get("insufficient")}
+    return {
+        "type": "現股券商分點籌碼（不是三大法人）",
+        "data_date": report.get("latest_complete_date"), "date_note": report.get("date_note", ""),
+        "history_days": f"{report.get('available_days', 0)}/{report.get('requested_days', REQUESTED_DAYS)}",
+        "latest_top_buy": [{"branch": x["branch"], "net_lots": x["net"]} for x in report.get("latest_top_buy") or []],
+        "latest_top_sell": [{"branch": x["branch"], "net_lots": x["net"]} for x in report.get("latest_top_sell") or []],
+        "tendency": {f"{n}d": {k: periods[n].get(k) for k in ("buy_ratio", "sell_ratio", "net_concentration", "scenario")}
+                     for n in (5, 20) if n in periods},
+        "cumulative_buy_top3": [{"branch": x["branch"], "net_lots": x["net"]} for x in (report.get("cumulative_buy") or [])[:3]],
+        "vwap": report.get("vwap"),
+        "note": SOURCE_LIMITATION,
+    }
+
+
+def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:
+    """型態分析頁裡的「籌碼重點」：兩欄 Top5＋一列傾向／成本＋主要累積買超，不放大表格。"""
+    latest = report.get("latest_complete_date") or ""
+    sections: List[Dict[str, Any]] = []
+    if report.get("date_note"):
+        sections.append({"type": "note", "text": report["date_note"]})
+    sections.append({"type": "lists", "items": [
+        {"title": "最新 TOP5 買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                        for x in report.get("latest_top_buy") or []]},
+        {"title": "最新 TOP5 賣超", "tone": "down", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                          for x in report.get("latest_top_sell") or []]}]})
+    periods = {p["days"]: p for p in report.get("periods") or [] if not p.get("insufficient")}
+    tiles = []
+    for n in (5, 20):
+        p = periods.get(n)
+        if p and p.get("net_concentration") is not None:
+            tiles.append({"label": f"近{n}日｜{p.get('scenario') or '中性'}", "value": f"{p['net_concentration']:+.2f}%",
+                          "tone": "signed"})
+        else:
+            tiles.append({"label": f"近{n}日", "value": "資料不足", "tone": "ink"})
+    vwap = report.get("vwap") or {}
+    if vwap.get("vwap"):
+        tiles.append({"label": f"近{vwap['days']}日均價（VWAP）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"})
+        if vwap.get("gap_pct") is not None:
+            tiles.append({"label": "現價與均價差距", "value": f"{vwap['gap_pct']:+.2f}%", "tone": "signed"})
+    sections.append({"type": "tiles", "items": tiles})
+    top3 = (report.get("cumulative_buy") or [])[:3]
+    if top3:
+        costs = {c["branch"]: c.get("est_cost") for c in report.get("continuity") or []}
+        sections.append({"type": "chips", "title": f"近{report.get('cumulative_days', 20)}日主要累積買超",
+                         "items": [f"{x['branch']} {_lots(x['net'])}" + (f"｜估算成本 {costs[x['branch']]:,.2f}"
+                                                                         if costs.get(x["branch"]) else "") for x in top3]})
+    sections.append({"type": "note", "text": f"※ 淨集中度＝Top15 買超減 Top15 賣超占成交量；{SOURCE_LIMITATION}。"
+                                             f"完整分點頁可問「代號＋現股籌碼」。"})
+    return {"branch": "籌碼重點", "tags": [f"現股分點｜{_slash(latest)}"] if latest else ["現股分點"],
+            "label": f"歷史 {report.get('available_days', 0)} / {report.get('requested_days', REQUESTED_DAYS)} 個交易日",
+            "sections": sections}
 
 
 def message_card(title: str, badge: str, note: str = "") -> Dict[str, Any]:

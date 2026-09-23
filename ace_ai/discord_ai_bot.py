@@ -308,6 +308,7 @@ class ParsedQuestion:
     normalized: str = ""  # 原句＋同義詞標準關鍵字（normalize_intent_text）
     chip: str = ""        # 籌碼類型：spot（現股分點）／warrant（權證分點）／combined／""（非籌碼題）
     spot_branch: str = "" # 用現股資料庫分點名單辨識出的分點（和權證分點名單分開）
+    spot_combo: bool = False  # 同時問型態＋現股籌碼：型態分析頁加一段精簡「籌碼重點」
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -1540,7 +1541,8 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
 _FOCUS_RULES = (
     (re.compile(r"權證|分點|主力|大戶|吃貨|加碼|布局|佈局|跑了沒|部位"), "權證分點"),
     (re.compile(r"量有?出來|量有?放大|爆量|量縮|帶量|放量|量增|量能|成交量|量比|窒息量"), "量能"),
-    (re.compile(r"外資|投信|自營商|三大法人|法人|籌碼"), "三大法人籌碼"),
+    (re.compile(r"外資|投信|自營商|三大法人|法人"), "三大法人籌碼"),
+    (re.compile(r"現股|券商分點"), "現股分點籌碼"),
     (re.compile(r"支撐|壓力|有撐|有壓|撐在|壓在|卡在"), "支撐壓力"),
     (re.compile(r"月線|季線|週線|年線|均線|[0-9]{1,3}日線?"), "均線位置"),
 )
@@ -1554,6 +1556,8 @@ def question_focus(question: str) -> List[str]:
     labels = [label for pattern, label in _FOCUS_RULES if pattern.search(text)]
     if "權證分點" in labels and _INSTITUTIONAL_RE.search(text) and not _EXPLICIT_WARRANT_RE.search(text):
         labels.remove("權證分點")   # 「外資在加碼」是三大法人，不是權證分點
+    if "權證分點" in labels and "現股分點籌碼" in labels and "權證" not in text:
+        labels.remove("權證分點")   # 「現股分點」不是權證分點
     return labels
 
 
@@ -1579,6 +1583,12 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
                              "輸出解讀卡時：answer＝結論；why 最多 2 句；scenarios 給空陣列；summary 一句。")
 
 
+FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
+                    "解讀要同時整合技術面與籌碼面：why 先說技術結構，再用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
+                    "主要累積買超分點、VWAP 與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
+                    "只引用 1～3 個關鍵籌碼數字，不要逐一念分點；外資券商分點不等於外資法人；資料日期不是今天時要說明資料截至哪天。")
+
+
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
 
 
@@ -1600,6 +1610,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
+    if "get_spot_chip_summary" in names:
+        sections.append(FINAL_SPOT_RULES)
     if "get_index_comparison" in names:
         sections.append(FINAL_INDEX_COMPARE_RULES)
     elif "get_pattern_scorecard" in names:
@@ -2655,6 +2667,8 @@ _ORDINAL_WORDS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "�
 _SECTOR_ROWS_TTL = 1800
 _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
 # 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
+# 同時問型態／技術／操作＋籌碼 → 型態分析頁加「籌碼重點」
+_PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|怎麼看|走勢|K線|策略|均線|支撐|壓力|強不強|怎麼樣")
 # 只問最新一天的現股分點（不 backfill 70 日）
 _SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
 _PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
@@ -2966,7 +2980,13 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started, as_text=True)
         if note:
             self.log(f"追問記憶：{note}")
-        if parsed.chip in ("spot", "combined"):
+        if (parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)
+                and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
+            # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋評分卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
+            access_policy.require_chip(access, "spot")
+            parsed.spot_combo = True
+            question = f"{question}（現股分點籌碼）"
+        elif parsed.chip in ("spot", "combined"):
             # 現股分點／兩種一起：自己的資料層與快取，不進一般問答的 Gemini 流程。
             result = self._answer_chip(parsed.chip, parsed, question, started)
             self.memory.update(context_key, parsed)
@@ -3047,6 +3067,21 @@ class AceQueryEngine:
         main = spot or warrant
         denials = [] if chip != "combined" else [k for k, ok in (("SPOT", want_spot), ("WARRANT", want_warrant)) if not ok]
         return replace(main, followups=[warrant] if spot and warrant else [], denial_followups=denials)
+
+    def _spot_combo_section(self, parsed: ParsedQuestion) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """型態分析頁裡的「籌碼重點」區塊與給 AI 的精簡資料；權限在抓取前檢查。"""
+        access_policy.require_chip(self._access(), "spot")
+        code = next(c for c, _ in parsed.stocks if c not in tools.INDEX_CODES)
+        try:
+            report = spot_chip.build_report(code, "full")
+        except Exception as exc:
+            self.log(f"籌碼重點略過：{type(exc).__name__}: {exc}")
+            return None, None
+        if not report.get("latest_complete_date"):
+            card = spot_chip.message_card("籌碼重點", "現股分點資料建置中",
+                                          f"已建立 {report.get('available_days', 0)} / {report.get('requested_days', 70)} 個交易日，稍後再問即可看到。")
+            return {"branch_card": card, "hide_text": False}, None
+        return {"branch_card": spot_chip.summary_card(report), "hide_text": False}, spot_chip.summary_payload(report)
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
         access_policy.require_chip(self._access(), "warrant")
@@ -3784,6 +3819,12 @@ class AceQueryEngine:
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
             panels.append(panel)
+        if getattr(parsed, "spot_combo", False):
+            spot_panel, spot_data = self._spot_combo_section(parsed)
+            if spot_data:
+                results.append(tools.ToolResult("get_spot_chip_summary", True, spot_data))
+            if spot_panel:
+                panels.append(spot_panel)
         if plan.route == "rule_branch":
             branch_card = build_branch_card(results)
             if branch_card:
@@ -3796,7 +3837,7 @@ class AceQueryEngine:
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
-            for panel in panels:
+            for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 if card:
                     panel["scorecard"] = card
