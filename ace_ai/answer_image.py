@@ -543,9 +543,18 @@ def _trade_height(panel: dict) -> int:
     return TRADE_LEGEND_H + max(0, len(lines) - 1) * 32
 
 
+# 單一現股分點明細（K 線下方）：每日買賣超柱（紅買綠賣）＋累積買賣超金線；右側雙刻度（灰＝柱、金＝線），零軸共用
+FLOW_BLOCK_H = 340
+
+
+def _flow_height(panel: dict) -> int:
+    panel = panel or {}
+    return FLOW_BLOCK_H if panel.get('branch_flow') and panel.get('bars') else 0
+
+
 def panel_height(panel: dict) -> int:
     return (CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel)
-            + _trade_height(panel) + mark_legend(None, panel, 0, True))
+            + _flow_height(panel) + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
 
 def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]:
@@ -605,6 +614,72 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
         draw.line((sx, mid, min(sx + 6, right), mid), fill=ACCENT, width=1)
     for value, yy in ((peak / 1.35, mid - peak / 1.35 * scale), (0, mid), (-peak / 1.35, mid + peak / 1.35 * scale)):
         text_at(draw, (right + 14, yy - 10), f'{value:+,.0f}張' if value else '0', 18, MUTED)
+
+
+def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
+    """單一現股分點：每日買賣超柱＋累積線（分點日期 YYYY-MM-DD，K 棒日期 YYYY/MM/DD）。
+    沒上榜的日子不畫柱；累積線在分點窗口開始前不畫，窗口之後（例如今天分點未更新）沿用最後一個值。"""
+    daily = flow.get('daily') or {}
+    cumulative = flow.get('cumulative') or {}
+    title = f"{flow.get('branch', '')}｜現股分點買賣超"
+    text_at(draw, (left, top + 6), title, 22, INK, True)
+    lx = left + font(22, True).getlength(title) + 28
+    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
+    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
+    text = str(flow.get('latest_label') or '')
+    draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
+    lx += 22 + font(19).getlength(text) + 26
+    draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
+    draw.text((lx + 30, top + 20), str(flow.get('total_label') or ''), font=font(19, True), fill=INK, anchor='lm')
+    stats, size = fit(flow.get('stats') or '', 18, right - left)
+    text_at(draw, (left, top + 40), stats, size, MUTED)
+
+    ordered = sorted(cumulative)
+    cums, j, value = [], 0, None
+    for bar in bars:
+        iso = bar['date'].replace('/', '-')
+        while j < len(ordered) and ordered[j] <= iso:
+            value = cumulative[ordered[j]]
+            j += 1
+        cums.append(value)
+    values = [daily.get(bar['date'].replace('/', '-')) for bar in bars]
+    ctop, cbottom = top + 84, top + FLOW_BLOCK_H - 68
+    mid = (ctop + cbottom) / 2
+    ticks = _date_ticks(bars, step)
+    for i in ticks:
+        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
+    bar_peak = max([abs(v) for v in values if v] + [1.0]) * 1.15
+    cum_peak = max([abs(v) for v in cums if v is not None] + [1.0]) * 1.15
+    half_h = (cbottom - ctop) / 2
+    for i, v in enumerate(values):
+        if not v:
+            continue
+        a, b = sorted((mid, mid - v / bar_peak * half_h))
+        draw.rectangle((px(i) - max(1, step * .32), a, px(i) + max(1, step * .32), max(a + 1, b)), fill=UP if v > 0 else DOWN)
+    for sx in range(int(left), int(right), 12):
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
+    segment = []
+    for i, v in enumerate(cums):
+        if v is None:
+            continue
+        segment.append((px(i), mid - v / cum_peak * half_h))
+    if len(segment) > 1:
+        draw.line(segment, fill=ACCENT, width=3)
+    if segment:
+        ex, ey = segment[-1]
+        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+    edge = half_h / 1.15
+    for sign, yy in ((1, mid - edge), (-1, mid + edge)):
+        text_at(draw, (right + 10, yy - 22), f'{sign * bar_peak / 1.15:+,.0f}', 16, MUTED)
+        text_at(draw, (right + 10, yy - 2), f'{sign * cum_peak / 1.15:+,.0f}', 16, ACCENT)
+    text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
+    axis_y = cbottom + 4
+    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
+    for i in ticks:
+        label_x = max(left + 26, min(px(i), right - 26))
+        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
+    note, size = fit(flow.get('note') or '', 16, right - left)
+    text_at(draw, (left, axis_y + 36), note, size, MUTED)
 
 
 def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
@@ -972,6 +1047,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'])
         below += INST_BLOCK_H
+    if _flow_height(panel):
+        draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
+        below += _flow_height(panel)
     if _trade_height(panel):
         draw_trade_legend(draw, below, left, panel)
         below += _trade_height(panel)

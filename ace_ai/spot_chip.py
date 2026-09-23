@@ -407,7 +407,8 @@ def analyze(stock_code: str, dates: Sequence[str], statuses: Dict[str, Dict[str,
         by_date[row["date"]][row["branch_name"]] = row["net"]
     report: Dict[str, Any] = {"requested_days": min(REQUESTED_DAYS, len(dates)) if dates else REQUESTED_DAYS,
                               "available_days": len(confirmed), "latest_complete_date": latest, "periods": [],
-                              "source_limitation": SOURCE_LIMITATION}
+                              "source_limitation": SOURCE_LIMITATION,
+                              "window_dates": list(dates), "complete_dates": list(complete)}   # 單一分點明細用
     if not latest:
         return report
     report["latest_top_buy"] = [{"branch": b, "net": v, "tag": broker_tag(b)} for b, v in _top(by_date[latest], True, 5)]
@@ -539,13 +540,14 @@ def known_branch_names() -> List[str]:
     return list(_BRANCH_NAMES_CACHE["names"])
 
 
-def match_branch(question: str, names: Optional[Sequence[str]] = None) -> str:
-    """從問句找現股分點名稱（忽略空白與「-」，取最長的符合）；找不到回空字串。"""
+def match_branch(question: str, names: Optional[Sequence[str]] = None, min_len: int = 3) -> str:
+    """從問句找現股分點名稱（忽略空白與「-」，取最長的符合）；找不到回空字串。
+    min_len=2 只給「已拿掉股票名稱」的問句用（美林、野村這類兩字分點）。"""
     key = _branch_key(question)
     best = ""
     for name in (names if names is not None else known_branch_names()):
         k = _branch_key(name)
-        if len(k) >= 3 and k in key and len(k) > len(_branch_key(best)):
+        if len(k) >= min_len and k in key and len(k) > len(_branch_key(best)):
             best = name
     return best
 
@@ -561,6 +563,50 @@ def branch_report(branch_name: str, now: Optional[datetime] = None) -> Dict[str,
         total[row["stock_code"]] += row["net"]
     return {"branch": branch_name, "days": len(dates), "dates": [dates[0], dates[-1]] if dates else [],
             "buy": _top(dict(total), True, 8), "sell": _top(dict(total), False, 8), "found": bool(rows)}
+
+
+def branch_flow(stock_code: str, branch_name: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """指定分點在本檔 70 日窗口（build_report 的窗口）的每日買賣超＋統計；K 線副圖與 AI 解讀共用。
+    沒上榜的日子不是 0 張而是「不在前段」：柱狀圖不畫，累積與區間合計以 0 計（近似值）。"""
+    dates = list(report.get("window_dates") or [])
+    window = set(dates)
+    complete = [d for d in report.get("complete_dates") or [] if d in window]
+    key = _branch_key(branch_name)
+    rows = [r for r in local_market_cache.load_spot_rows(stock_code, complete) if _branch_key(r["branch_name"]) == key]
+    daily = {r["date"]: r["net"] for r in rows}
+    cumulative, running = {}, 0.0
+    for d in dates:
+        running += daily.get(d, 0.0)
+        cumulative[d] = running
+
+    def total(n: int) -> float:
+        return sum(daily.get(d, 0.0) for d in dates[-n:])
+
+    recent = [daily.get(d, 0.0) for d in dates[-20:]]
+    streak = sign = 0
+    for d in reversed(dates):   # 從最新一天往回數：連續買超為正、連續賣超為負，沒上榜就中斷
+        now = 1 if daily.get(d, 0.0) > 0 else -1 if daily.get(d, 0.0) < 0 else 0
+        if now == 0 or (sign and now != sign):
+            break
+        sign, streak = now, streak + now
+    bars = _bars(stock_code)
+    buys = [(bars[d][0], daily[d]) for d in dates[-20:] if daily.get(d, 0.0) > 0 and d in bars]
+    cost = sum(p * v for p, v in buys) / sum(v for _, v in buys) if buys else None
+    top_buy = max(daily.items(), key=lambda kv: kv[1]) if daily else None
+    top_sell = min(daily.items(), key=lambda kv: kv[1]) if daily else None
+    name = rows[0]["branch_name"] if rows else branch_name
+    return {"found": bool(rows), "branch": name, "tag": broker_tag(name),
+            "latest_date": report.get("latest_complete_date") or "", "date_note": report.get("date_note", ""),
+            "latest_net": daily.get(report.get("latest_complete_date") or ""),
+            "daily": daily, "cumulative": cumulative, "window_days": len(dates), "listed_days": len(daily),
+            "available_days": report.get("available_days", 0), "requested_days": report.get("requested_days", REQUESTED_DAYS),
+            "total_5d": total(5), "total_20d": total(20), "total_window": total(len(dates)),
+            "buy_days_20": sum(1 for v in recent if v > 0), "sell_days_20": sum(1 for v in recent if v < 0),
+            "streak": streak, "est_cost_20d": round(cost, 2) if cost else None,
+            "largest_buy": top_buy if top_buy and top_buy[1] > 0 else None,
+            "largest_sell": top_sell if top_sell and top_sell[1] < 0 else None,
+            "cumulative_peak": max(cumulative.items(), key=lambda kv: kv[1]) if cumulative else None,
+            "cumulative_trough": min(cumulative.items(), key=lambda kv: kv[1]) if cumulative else None}
 
 
 # ============================================================
@@ -697,6 +743,74 @@ def summary_payload(report: Dict[str, Any]) -> Dict[str, Any]:
         "vwap": report.get("vwap"),
         "note": SOURCE_LIMITATION,
     }
+
+
+def _int(value: float) -> int:
+    return int(round(float(value or 0)))
+
+
+def branch_flow_payload(flow: Dict[str, Any], stock_code: str, stock_name: str, bars: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """給 AI 解讀用：分點每日買賣超（只列上榜日）、轉折點、區間合計＋同期股價路徑與均線位置（bars＝K 線面板）。"""
+    closes = {str(b.get("date", "")).replace("/", "-"): float(b["Close"]) for b in bars or [] if b.get("Close") is not None}
+    last = dict((bars or [{}])[-1])
+    close = last.get("Close")
+    moving = {k: {"value": round(float(last[k]), 2), "position": "站上" if close >= last[k] else "跌破"}
+              for k in ("MA5", "MA10", "MA20", "MA60") if last.get(k) and close}
+
+    def at(item) -> Optional[Dict[str, Any]]:
+        if not item:
+            return None
+        date, lots = item
+        out = {"date": date, "lots": _int(lots)}
+        if date in closes:
+            out["close"] = round(closes[date], 2)
+        return out
+
+    window = [d for d in flow.get("cumulative") or {} if d in closes]
+    path = {}
+    if window:
+        high, low = max(window, key=closes.get), min(window, key=closes.get)
+        path = {"window_start": {"date": window[0], "close": round(closes[window[0]], 2)},
+                "window_high": {"date": high, "close": round(closes[high], 2)},
+                "window_low": {"date": low, "close": round(closes[low], 2)}}
+    streak = int(flow.get("streak") or 0)
+    return {
+        "type": "單一現股券商分點在本檔的每日買賣超（張），不是三大法人、也不是權證分點",
+        "stock_code": stock_code, "stock_name": stock_name, "branch": flow.get("branch"),
+        "broker_type": f"{flow['tag']}券商" if flow.get("tag") else "",
+        "data_date": flow.get("latest_date"), "date_note": flow.get("date_note", ""),
+        "history_days": f"{flow.get('available_days', 0)}/{flow.get('requested_days', REQUESTED_DAYS)}",
+        "window_days": flow.get("window_days"), "listed_days": flow.get("listed_days"),
+        "latest_net_lots": _int(flow["latest_net"]) if flow.get("latest_net") is not None else "最新一日未上榜",
+        "total_5d_lots": _int(flow.get("total_5d")), "total_20d_lots": _int(flow.get("total_20d")),
+        "total_window_lots": _int(flow.get("total_window")),
+        "buy_days_20": flow.get("buy_days_20"), "sell_days_20": flow.get("sell_days_20"),
+        "streak": f"連續買超 {streak} 天" if streak > 0 else f"連續賣超 {-streak} 天" if streak < 0 else "",
+        "largest_buy": at(flow.get("largest_buy")), "largest_sell": at(flow.get("largest_sell")),
+        "cumulative_peak": at(flow.get("cumulative_peak")), "cumulative_trough": at(flow.get("cumulative_trough")),
+        "est_cost_20d": flow.get("est_cost_20d"),
+        "daily_net_lots": [{"date": d, "net": _int(v)} for d, v in sorted((flow.get("daily") or {}).items())],
+        "price_date": str(last.get("date", "")).replace("/", "-"), "close": close,
+        "moving_averages": moving, "price_path": path,
+    }
+
+
+def branch_flow_panel(flow: Dict[str, Any]) -> Dict[str, Any]:
+    """K 線面板的 branch_flow 欄位（answer_image.draw_branch_flow 畫）。"""
+    n = int(flow.get("window_days") or 0)
+    latest = flow.get("latest_date") or ""
+    parts = [f"近5日 {_lots(flow.get('total_5d') or 0)}",
+             f"近20日 {_lots(flow.get('total_20d') or 0)}（買超 {flow.get('buy_days_20', 0)} 天／賣超 {flow.get('sell_days_20', 0)} 天）",
+             f"上榜 {flow.get('listed_days', 0)}/{n} 天"]
+    if int(flow.get("available_days") or 0) < int(flow.get("requested_days") or REQUESTED_DAYS):
+        parts.append(f"歷史建置中 {flow.get('available_days', 0)}/{flow.get('requested_days', REQUESTED_DAYS)}")
+    net = flow.get("latest_net")
+    return {"branch": _branch_label(flow), "daily": dict(flow.get("daily") or {}), "cumulative": dict(flow.get("cumulative") or {}),
+            "latest_label": f"最新 {_slash(latest)[5:]} " + (_lots(net) if net is not None else "未上榜"),
+            "total_label": f"{n}日累積 {_lots(flow.get('total_window') or 0)}",
+            "stats": "　".join(parts),
+            "note": "※ 來源每日只列買賣超前段分點；未上榜的日子不畫柱、累積以 0 計（近似值）"
+                    + ("；外資券商不等於外資法人" if flow.get("tag") == "外資" else "")}
 
 
 def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:

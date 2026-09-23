@@ -1589,6 +1589,16 @@ FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分�
                     "只引用 1～3 個關鍵籌碼數字，不要逐一念分點；外資券商分點不等於外資法人；資料日期不是今天時要說明資料截至哪天。")
 
 
+FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某一個券商分點在這檔股票每日的買賣超（單位：張），不是三大法人，也不是權證分點；"
+                           "來源每日只列前段分點，沒上榜的日子視為 0，是近似值；外資券商分點不等於外資法人。"
+                           "圖上已經有每日買賣超柱與累積線，文字要解讀這個分點在做什麼（布局、加碼、調節、出貨或短進短出），不要逐日念數字："
+                           "累積線的高低點（cumulative_peak／cumulative_trough）落在哪段時間、和同期股價（price_path、close）是否同步；"
+                           "最近 5／20 日是在延續還是轉向；估算成本 est_cost_20d 與現價的關係；股價相對均線的位置只當背景一句。"
+                           "只引用 1～3 個關鍵數字；資料日期不是今天時要說明資料截至哪天。"
+                           "輸出解讀卡時：answer＝一句話判斷這個分點的動向；why 2～3 句；scenarios 給空陣列；"
+                           "summary 一句說接下來要觀察什麼（可用均線或估算成本當觀察價位），不可給買賣指令。")
+
+
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
 
 
@@ -1612,6 +1622,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_RANK_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
+    if "get_spot_branch_flow" in names:
+        sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_index_comparison" in names:
         sections.append(FINAL_INDEX_COMPARE_RULES)
     elif "get_pattern_scorecard" in names:
@@ -2503,7 +2515,17 @@ def format_pattern_scorecard(d: Dict[str, Any]) -> str:
     )
 
 
+def format_spot_branch_flow(d: Dict[str, Any]) -> str:
+    """Gemini 失敗時的規則式文字（圖上已有柱狀與累積線，這裡只列合計）。"""
+    return (f"🏦 {d.get('branch')} 現股分點（資料截至 {d.get('data_date')}）\n"
+            f"最新一日 {_v(d.get('latest_net_lots'), ' 張', signed=isinstance(d.get('latest_net_lots'), (int, float)))}｜"
+            f"近5日 {_v(d.get('total_5d_lots'), ' 張', signed=True)}｜近20日 {_v(d.get('total_20d_lots'), ' 張', signed=True)}｜"
+            f"{d.get('window_days')}日累積 {_v(d.get('total_window_lots'), ' 張', signed=True)}\n"
+            f"近20日買超 {d.get('buy_days_20', 0)} 天、賣超 {d.get('sell_days_20', 0)} 天；上榜 {d.get('listed_days')}/{d.get('window_days')} 天")
+
+
 FORMATTERS.update({
+    "get_spot_branch_flow": format_spot_branch_flow,
     "get_pattern_scorecard": format_pattern_scorecard,
     "get_top_warrant_buy_stocks": format_top_warrant,
     "get_sheet_stock_chips": format_sheet_stock_chips,
@@ -2546,6 +2568,10 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add("新聞為近期報導整理")
         elif r.name in ("get_sheet_stock_chips", "get_branch_stock_position") and d.get("data_latest_event_date"):
             add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
+        elif r.name == "get_spot_branch_flow" and d.get("data_date"):
+            add(f"現股分點截至 {d['data_date']}（每日前段分點近似）")
+            if d.get("price_date"):
+                add(f"股價截至 {d['price_date']}（日K收盤）")
     return "資料時間：" + "｜".join(parts) if parts else ""
 
 
@@ -3116,6 +3142,16 @@ class AceQueryEngine:
             card = spot_chip.message_card("現股分點籌碼", "請指定股票", "例如：2330現股籌碼最近怎樣、2330最新現股分點")
             return self._spot_result(card, title, False, started, "現股分點籌碼需要指定股票")
         code, name = stocks[0]
+        # 指定分點：改成該分點明細（K 線＋每日買賣超柱＋累積線＋AI 解讀）。
+        # 比對前拿掉股票名稱與代號，避免股名剛好含分點名稱；拿掉之後才允許「美林」這類兩字分點。
+        plain = question
+        for c, n in stocks:
+            for token in (c, n):
+                if token:
+                    plain = plain.replace(token, " ")
+        branch = spot_chip.match_branch(plain, min_len=2)
+        if branch:
+            return self._answer_spot_branch(code, name, branch, question, started)
         mode = "latest" if _SPOT_LATEST_RE.search(question) else "full"
         simulation = bool(access and access.simulation)
         dates, _ = spot_chip.candidate_dates()
@@ -3147,6 +3183,61 @@ class AceQueryEngine:
             self._answer_cache.set(self._access_cache_key(
                 f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}"), result,
                 self.config.answer_cache_seconds)
+        return result
+
+    def _answer_spot_branch(self, code: str, name: str, branch: str, question: str, started: float) -> AnswerResult:
+        """指定分點的現股明細：K 線下方畫該分點每日買賣超柱＋累積線，最下方簡短 AI 解讀（1 次 Gemini）。"""
+        access = self._access()
+        simulation = bool(access and access.simulation)
+        title = f"{code} {name}｜{branch} 現股分點".strip()
+        dates, _ = spot_chip.candidate_dates()
+
+        def cache_key() -> str:
+            statuses = local_market_cache.spot_day_status(code, dates)
+            complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
+            return self._access_cache_key(f"spot_branch|{code}|{spot_chip._branch_key(branch)}|"
+                                          f"{complete[-1] if complete else ''}|{len(complete)}")
+        if not simulation:
+            hit, cached = self._answer_cache.get(cache_key())
+            if hit:
+                return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
+        report = spot_chip.build_report(code, "full")
+        if not report.get("latest_complete_date"):
+            if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
+                card = spot_chip.message_card(f"{code} {name}", "現股分點資料暫時無法取得",
+                                              "資料來源連線失敗，稍後再試；失敗的日期不會當成 0 計算。")
+            else:
+                card = spot_chip.progress_card(code, name, report)
+            return self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中")
+        flow = spot_chip.branch_flow(code, branch, report)
+        if not flow["found"]:
+            card = spot_chip.message_card(f"{code} {name}", f"{branch}｜近 {flow['window_days']} 個交易日沒有上榜",
+                                          "來源每日只列買賣超前段分點，這段期間該分點都不在前段。")
+            return self._spot_result(card, title, False, started, f"{code} {branch} 現股分點：近期未上榜")
+        chart = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False})])[0]
+        panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留分點解讀。"}
+        panel["marks"] = {}
+        panel["branch_flow"] = spot_chip.branch_flow_panel(flow)
+        name = name or panel.get("stock_name", "")
+        payload = spot_chip.branch_flow_payload(flow, code, name, panel.get("bars") or [])
+        results = [tools.ToolResult("get_spot_branch_flow", True, payload)]
+        stats = AnswerStats()
+        text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_branch", need_final_llm=True), results, stats)
+        ai_card = self._take_ai_card()
+        panels = [panel] + ([{"ai_card": ai_card}] if ai_card else [])
+        elapsed = time.perf_counter() - started
+        self.log(f"現股分點明細｜{code} {flow['branch']}｜上榜 {flow['listed_days']}/{flow['window_days']}｜"
+                 f"Gemini {stats.gemini_calls} 次｜總耗時 {elapsed:.2f}s")
+        result = AnswerResult(
+            text=text, route="rule_spot_branch", gemini_calls=stats.gemini_calls, elapsed=elapsed,
+            cacheable=llm_ok and chart.ok, panels=panels, image_title=title,
+            errors=([] if chart.ok else [f"get_chart_panel：{chart.error or chart.user_message}"])
+                   + ([] if llm_ok else ["Gemini 最終回答失敗"]),
+            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+            total_tokens=stats.total_tokens, token_source=stats.token_source)
+        full = report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
+        if result.cacheable and full and not simulation:
+            self._answer_cache.set(cache_key(), result, self.config.answer_cache_seconds)
         return result
 
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
