@@ -756,6 +756,42 @@ def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str,
     return card if sections else None
 
 
+# ============================================================
+# 管理員：自訂清單（截圖或代號）型態排行
+# ============================================================
+
+CUSTOM_RANK_MAX = 40
+_CUSTOM_RANK_WORDS_RE = re.compile(r"型態|排名|排行|誰.{0,4}(?:最好|最強|比較好)|比較|排序")
+_CODE_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z])(\d{4,6}[A-Z]?)(?![0-9A-Za-z])")
+IMAGE_STOCKS_SCHEMA = {"type": "object", "properties": {"stocks": {"type": "array", "items": {
+    "type": "object", "properties": {"code": {"type": "string"}, "name": {"type": "string"}}, "required": ["code"]}}},
+    "required": ["stocks"]}
+IMAGE_STOCKS_PROMPT = ("這張圖片是台股的股票清單截圖（例如 Discord 訊息或策略結果）。"
+                       "依圖中由上到下的順序，列出所有台股股票代號（4～6 位數字，可能帶一個英文字母）與圖中寫的名稱。"
+                       "只列股票，不要列價格、日期或其他數字；看不清楚的代號不要猜。只回 JSON。")
+
+
+def is_custom_ranking_question(question: str) -> bool:
+    """「1528 2303 2441 … 誰型態最好」：至少 3 個代號＋排名字眼（2 檔比較仍走原本的比較流程）。"""
+    return len(set(_CODE_TOKEN_RE.findall(question or ""))) >= 3 and bool(_CUSTOM_RANK_WORDS_RE.search(question or ""))
+
+
+def normalize_custom_stocks(items: Sequence[Tuple[str, str]], name_map: Optional[Dict[str, str]] = None) -> Tuple[List[Dict[str, str]], List[str]]:
+    """去重、保留順序、用股票名稱表驗證代號；回傳 (可排名的股票, 認不出的代號)。"""
+    stocks, unknown, seen = [], [], set()
+    for code, name in items:
+        code = str(code or "").strip().upper()
+        if not re.fullmatch(r"\d{4,6}[A-Z]?", code) or code in seen:
+            continue
+        seen.add(code)
+        if name_map and code not in name_map:
+            unknown.append(f"{name or ''}（{code}）")
+            continue
+        stocks.append({"stock_code": code, "stock_name": (name_map or {}).get(code) or str(name or "").strip() or code,
+                       "market": ""})
+    return stocks[:CUSTOM_RANK_MAX], unknown
+
+
 def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
     """沒有指定股票、問權證買超／買進金額排行（例如「目前權證買超金額最大的是誰」）。勝率排行走原本路由。"""
     text = parsed.original
@@ -1172,6 +1208,44 @@ class GeminiGateway:
                 return False
             self._day_calls += 1
             return True
+
+    def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
+                            schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+        """圖片＋文字（例如讀截圖裡的股票清單）；主程式的 Gemini 函式只收文字，這裡直接用 google-genai，
+        沿用同一組 WARRANTS_API_KEY（失敗換下一支）與同一個模型。"""
+        if not self._quota_left():
+            return GeminiResult(ok=False, error="daily_limit", purpose=purpose)
+        kf = tools.core()
+        if not kf.GEMINI_ENABLE or kf.genai is None or not kf._get_warrants_api_keys():
+            return GeminiResult(ok=False, error="Gemini 未啟用或未設定金鑰", purpose=purpose)
+        from google.genai import types as genai_types
+        config: Dict[str, Any] = {"temperature": 0.0}
+        if schema:
+            config.update(response_mime_type="application/json", response_schema=schema)
+        started, last_error = time.perf_counter(), ""
+        with self._lock:
+            for index, key in enumerate(kf._get_warrants_api_keys(), 1):
+                for model in dict.fromkeys(m for m in (kf.GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m):
+                    try:
+                        client = kf.genai.Client(api_key=key)
+                        response = client.models.generate_content(
+                            model=model, contents=[genai_types.Part.from_bytes(data=image, mime_type=mime_type), prompt],
+                            config=config)
+                        text = str(response.text or "").strip()
+                        latency = time.perf_counter() - started
+                        tools.record_api_event("Gemini", status=200, latency=latency)
+                        self.log(f"Gemini 讀圖｜用途={purpose}｜model={model}｜key {index}｜latency={latency:.2f}s｜結果=成功")
+                        return GeminiResult(ok=bool(text), text=text, latency=latency, purpose=purpose,
+                                            input_tokens=max(1, round(len(prompt) / 4)) + 258,
+                                            output_tokens=max(1, round(len(text) / 4)) if text else 0,
+                                            total_tokens=0, token_source="estimated")
+                    except Exception as exc:  # google-genai 例外型別眾多，逐一換模型、換金鑰
+                        last_error = f"{type(exc).__name__}: {exc}"
+                        self.log(f"Gemini 讀圖失敗｜model={model}｜key {index}｜{last_error[:160]}")
+        latency = time.perf_counter() - started
+        tools.record_api_event("Gemini", status=500, latency=latency)
+        return GeminiResult(ok=False, error=last_error or "Gemini 讀圖失敗", latency=latency, purpose=purpose,
+                            rate_limited=bool(re.search(r"429|RESOURCE_EXHAUSTED|quota", last_error, re.I)))
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         if not self._quota_left():
@@ -2774,7 +2848,7 @@ class AceQueryEngine:
             return self._pending
 
     def _answer_impl(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
-                     is_admin: bool = False, admin_mode: bool = False) -> AnswerResult:
+                     is_admin: bool = False, admin_mode: bool = False, image=None) -> AnswerResult:
         """context_key＝伺服器:頻道:使用者，用來記住追問；on_queue(前面還有幾題) 在需要排隊時呼叫一次。
 
         admin_mode=True 代表這題來自管理員專用指令（本週精選、草稿、維護）；
@@ -2808,6 +2882,9 @@ class AceQueryEngine:
                 return AnswerResult(text=hint if is_admin else "「本週精選」目前只開放管理員使用；一般個股、族群、權證分點問題可以照常詢問。",
                                     route="weekly_pick_hint", gemini_calls=0, elapsed=time.perf_counter() - started)
             return self._answer_general(question, context_key, on_queue, started, compact)
+        # 管理員上傳股票清單截圖，或一次給 3 檔以上代號問誰型態最好 → 自訂清單型態排行。
+        if image is not None or is_custom_ranking_question(question):
+            return self._answer_custom_ranking(question, image, started)
         admin_reply = self._answer_admin_command(question, started, context_key)
         if admin_reply is not None:
             return admin_reply
@@ -2943,7 +3020,7 @@ class AceQueryEngine:
         return AnswerResult(str(exc), "access_denied", 0, 0.0, as_text=True, denied_feature=exc.required)
 
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
-               is_admin: bool = False, admin_mode: bool = False, access=None) -> AnswerResult:
+               is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
@@ -2958,7 +3035,8 @@ class AceQueryEngine:
         try:
             with tools.api_request_scope(request_id):
                 try:
-                    result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode)
+                    result = self._answer_impl(question, context_key, on_queue, is_admin=is_admin, admin_mode=admin_mode,
+                                               image=image)
                 except access_policy.AccessDenied as exc:
                     result = self._denied_result(exc)
             usage = tools.request_api_usage(request_id, clear=True)
@@ -3663,6 +3741,52 @@ class AceQueryEngine:
             token_source=stats.token_source,
         )
 
+    def _answer_custom_ranking(self, question: str, image, started: float) -> AnswerResult:
+        """管理員自訂清單：截圖交給 Gemini 讀代號（或直接從文字抓代號）→ 型態分數排行 → 前 3 名 AI 解讀。"""
+        stats = AnswerStats()
+        try:
+            name_map = tools.get_stock_name_map()
+        except Exception:
+            name_map = {}
+        items = [(code, "") for code in _CODE_TOKEN_RE.findall(question or "")]
+        if image is not None:
+            data, mime_type = image
+            result = self.gateway.generate_with_image(IMAGE_STOCKS_PROMPT, data, mime_type or "image/png",
+                                                      purpose="custom_rank_ocr", schema=IMAGE_STOCKS_SCHEMA)
+            stats.record_gemini(result)
+            if not result.ok:
+                return AnswerResult(text="圖片辨識暫時無法使用，請稍後再試，或直接輸入代號，例如：/ace 1528 2303 2441 誰型態最好",
+                                    route="error", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
+            try:
+                payload = json.loads(result.text)
+                items += [(str(x.get("code") or ""), str(x.get("name") or "")) for x in payload.get("stocks") or []
+                          if isinstance(x, dict)]
+            except (ValueError, TypeError, AttributeError):
+                self.log(f"截圖股票清單 JSON 無法解析：{result.text[:120]}")
+        stocks, unknown = normalize_custom_stocks(items, name_map)
+        self.log(f"自訂清單型態排行｜{len(stocks)} 檔｜{'、'.join(s['stock_code'] for s in stocks)}"
+                 + (f"｜認不出：{'、'.join(unknown)}" if unknown else ""))
+        if len(stocks) < 2:
+            return AnswerResult(text="圖片或文字裡找不到 2 檔以上可辨識的股票代號，請換一張清楚的截圖，或直接輸入代號。",
+                                route="clarify", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
+
+        def validate(explanation: str, row: Dict[str, Any]) -> bool:
+            result = tools.ToolResult("get_sector_candidate", True, row)
+            return not FactSheet("", [result], {"tool_results": {"get_sector_candidate": row}}).check(
+                f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
+
+        name = f"自訂清單 {len(stocks)} 檔"
+        answer = sector_analysis.answer_custom(stocks, name, self.gateway, validate)
+        text = answer["text"] + (f"\n無法辨識的代號：{'、'.join(unknown)}" if unknown else "")
+        return AnswerResult(text=text, route="rule_custom_ranking",
+                            gemini_calls=stats.gemini_calls + int(answer.get("calls") or 0),
+                            elapsed=time.perf_counter() - started, cacheable=bool(answer.get("ai_ok")),
+                            panels=answer.get("panels") or [], image_title=f"{name}｜誰型態最好",
+                            input_tokens=stats.input_tokens + int(answer.get("input_tokens") or 0),
+                            output_tokens=stats.output_tokens + int(answer.get("output_tokens") or 0),
+                            total_tokens=stats.total_tokens + int(answer.get("total_tokens") or 0),
+                            token_source=str(answer.get("token_source") or stats.token_source))
+
     def _answer_sector(self, request: Dict[str, str], started: float) -> AnswerResult:
         def validate(explanation: str, row: Dict[str, Any]) -> bool:
             result = tools.ToolResult("get_sector_candidate", True, row)
@@ -4165,6 +4289,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `覆盤 2454 9/1 買進 1285，理由：…`：持倉中覆盤（K 線下方紫色 ▲「買」標買點）；`我的覆盤` 列出紀錄
 • `覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…`：完整交易覆盤（含 MFE／MAE、賣後 5 日）
 • `用量`：今日 Gemini 與各 API 使用量
+• `型態排名`＋attachment 附上股票清單截圖（或直接打 `1528 2303 2441 誰型態最好`）：清單內依型態分數排名，前 3 名附 AI 解讀
 • `錯誤紀錄`：最近 24 小時會員遇到的錯誤（即時通知另送到管理員頻道）
 • `匯出狀態`：打包覆盤紀錄、盤中量能學習結果與近 45 天成交占比（只有自己看得到，換 Volume 前用）
 • `匯入狀態`＋attachment：匯回上面的檔案（已存在的紀錄不覆蓋）
@@ -4486,7 +4611,8 @@ def run_discord_bot(config: BotConfig) -> None:
             flush=True,
         )
 
-    async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool) -> None:
+    async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
+                              attachment=None) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
@@ -4548,7 +4674,15 @@ def run_discord_bot(config: BotConfig) -> None:
                     interaction_image(interaction, question, message, ephemeral=ephemeral), loop)
 
             context_key = f"{interaction.guild_id or 0}:{channel_id}:{user_id}"
-            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access)
+            image = None
+            if attachment is not None and admin_mode:
+                # 圖片在 defer 之後才下載，避免 3 秒內來不及回應；只有正常 /ace（管理員）會用到。
+                if int(getattr(attachment, "size", 0) or 0) > 8 * 1024 * 1024:
+                    await send_private("圖片太大", "圖片超過 8MB，請裁切後再上傳。")
+                    return
+                image = (await attachment.read(), str(getattr(attachment, "content_type", "") or "image/png"))
+            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access,
+                                             image=image)
             if result.denied_feature:
                 await send_access_denial(interaction, result.text, result.denied_feature, public=demo)
                 return
@@ -4600,14 +4734,16 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.tree.command(name=config.admin_command_name, description="艾斯 AI 管理員：本週精選、草稿編輯與資料維護")
     @app_commands.describe(question="例如：本週精選排名／3006 幫我生成週精選文字／系統狀態／說明",
-                           attachment="只有「匯入狀態」需要：附上「匯出狀態」產生的 .json.gz 檔")
+                           attachment="匯入狀態：附上 .json.gz 檔；型態排行：附上股票清單截圖")
     async def admin_command(interaction: "discord.Interaction", question: str,
                             attachment: Optional[discord.Attachment] = None) -> None:
         compact = re.sub(r"\s+", "", question or "")
         if compact in ("匯出狀態", "匯入狀態", "導出狀態", "導入狀態"):
             await handle_state_command(interaction, compact, attachment)
             return
-        await handle_question(interaction, question, admin_mode=True)
+        # 附上圖片（例如策略結果截圖）＝自訂清單型態排行；其他附件忽略。
+        is_image = attachment is not None and str(getattr(attachment, "content_type", "") or "").startswith("image/")
+        await handle_question(interaction, question, admin_mode=True, attachment=attachment if is_image else None)
 
     async def handle_state_command(interaction: "discord.Interaction", command: str,
                                    attachment: Optional["discord.Attachment"]) -> None:
