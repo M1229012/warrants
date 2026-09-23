@@ -2316,8 +2316,10 @@ def make_locked_attachment(*, max_bytes=7_500_000):
         data = LOCKED_ASSET.read_bytes()
         if data and len(data) <= max_bytes:
             return data, LOCKED_ASSET.suffix.lstrip('.')
-    except OSError:
-        pass
+        print(f'⚠️ 未解鎖圖檔大小不符（{len(data)} bytes），改用程式繪製版', flush=True)
+    except OSError as exc:
+        # 部署時漏傳 ace_ai/assets/warrant_unlock.webp 就會走到這裡；看到這行請補上傳圖檔。
+        print(f'⚠️ 找不到未解鎖圖檔 {LOCKED_ASSET}（{type(exc).__name__}），改用程式繪製版', flush=True)
     return encode_image(render_locked_warrant(), max_bytes)
 
 

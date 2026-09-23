@@ -28,7 +28,8 @@ import shutil
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -146,12 +147,16 @@ class BotConfig:
     prefix_command_enabled: bool = False
     superuser_ids: Set[int] = field(default_factory=set)
     beta_tester_ids: Set[int] = field(default_factory=set)
+    alert_channel_id: int = 0                                  # 管理員錯誤通知頻道；0＝不通知
+    alert_mention_ids: Set[int] = field(default_factory=set)   # 嚴重錯誤要 @ 的使用者
 
     @classmethod
     def from_env(cls) -> "BotConfig":
         return cls(
             superuser_ids=_parse_id_set(os.getenv("DISCORD_AI_SUPERUSER_IDS", "")),
             beta_tester_ids=_parse_id_set(os.getenv("DISCORD_AI_BETA_TESTER_IDS", "")),
+            alert_channel_id=next(iter(_parse_id_set(os.getenv("DISCORD_AI_ALERT_CHANNEL_ID", ""))), 0),
+            alert_mention_ids=_parse_id_set(os.getenv("DISCORD_AI_ALERT_MENTION_IDS", "")),
             token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
             allowed_user_ids=set() if _is_allow_all(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")) else _parse_id_set(os.getenv("DISCORD_AI_ALLOWED_USER_IDS", "")),
             allowed_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_ALLOWED_CHANNEL_IDS", "")),
@@ -2341,6 +2346,7 @@ class AnswerResult:
     api_usage: Dict[str, Any] = field(default_factory=dict)
     denied_feature: str = ""
     image_title: str = ""          # 圖片頁首標題；空字串＝沿用使用者問句（族群雷達固定寫「族群雷達」）
+    errors: List[str] = field(default_factory=list)   # 這題失敗的工具／Gemini（管理員錯誤通知用）
 
 
 # ============================================================
@@ -2717,7 +2723,7 @@ class AceQueryEngine:
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
     TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
                    "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
-                   "admin_usage"}
+                   "admin_usage", "admin_errors"}
 
     def _access(self):
         return getattr(getattr(self, "_request_local", None), "access", None)
@@ -2944,6 +2950,9 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("錯誤紀錄", "錯誤記錄", "錯誤", "errors"):
+            return AnswerResult(text=ADMIN_ALERTS.summary(), route="admin_errors", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False)
         if compact in ("用量", "使用量", "今日用量", "usage"):
             info = local_market_cache.usage_summary()
             api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
@@ -3422,6 +3431,8 @@ class AceQueryEngine:
             gemini_calls=stats.gemini_calls,
             elapsed=elapsed,
             cacheable=llm_ok and all(r.ok for r in combined),
+            errors=[f"{r.name}：{r.error or r.user_message}" for r in combined if not r.ok]
+                   + (["Gemini 最終回答失敗"] if plan.need_final_llm and not llm_ok else []),
             panels=panels,
             input_tokens=stats.input_tokens,
             output_tokens=stats.output_tokens,
@@ -3537,7 +3548,7 @@ class AceQueryEngine:
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
-_ADMIN_PRIVATE_RE = re.compile(r"狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
+_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
 
 def is_public_answer(result) -> bool:
@@ -3545,6 +3556,122 @@ def is_public_answer(result) -> bool:
     if result.denied_feature or not (result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES):
         return False
     return result.route == "rule_radar" or result.cacheable or result.cache_hit
+
+
+# ============================================================
+# 管理員錯誤通知：會員看到的錯誤是 ephemeral，管理員靠這裡知道
+# ============================================================
+
+ALERT_WINDOW_SECONDS = 600
+ALERT_KEEP = 200
+# 這兩類代表 Bot 本身或 AI 服務出問題；有設 DISCORD_AI_ALERT_MENTION_IDS 時才 @ 人。
+ALERT_CRITICAL_KINDS = frozenset({"程式例外", "Gemini 失敗"})
+_TAIPEI_TZ = timezone(timedelta(hours=8))
+
+
+def alert_reason(result: "AnswerResult") -> Optional[Tuple[str, str]]:
+    """哪些回覆要通知管理員；權限拒絕、未解鎖、澄清、說明這類正常流程不通知。"""
+    if result.denied_feature:
+        return None
+    if result.route == "queue_full":
+        return "排隊已滿", result.text
+    if result.route == "error":
+        return "資料錯誤", result.text
+    if result.errors:
+        kind = "Gemini 失敗" if any(e.startswith("Gemini") for e in result.errors) else "資料錯誤"
+        return kind, "；".join(result.errors)
+    return None
+
+
+class AdminAlertLog:
+    """同類錯誤 10 分鐘內只通知一次（之後合併成「另有 N 次」）；保留最近 200 筆給「/ace 錯誤紀錄」。
+    只存在記憶體，Bot 重啟後清空。"""
+
+    def __init__(self, window: int = ALERT_WINDOW_SECONDS, keep: int = ALERT_KEEP) -> None:
+        self.window = window
+        self._recent: "deque[Dict[str, Any]]" = deque(maxlen=keep)
+        self._last_sent: Dict[str, float] = {}
+        self._suppressed: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def record(self, kind: str, detail: str, *, user: str = "", question: str = "", route: str = "",
+               request_id: str = "", now: Optional[float] = None) -> Optional[str]:
+        """記錄一筆錯誤；需要通知時回傳訊息文字，被合併時回傳 None。"""
+        now = time.time() if now is None else now
+        entry = {"at": now, "kind": kind, "detail": str(detail or ""), "user": user, "question": question,
+                 "route": route, "request_id": request_id}
+        # 股票代號、日期、秒數不同仍算同一類錯誤。
+        key = kind + "|" + re.sub(r"[0-9]+", "#", entry["detail"])[:80]
+        with self._lock:
+            self._recent.append(entry)
+            last = self._last_sent.get(key)
+            if last is not None and now - last < self.window:
+                self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                return None
+            self._last_sent[key] = now
+            merged = self._suppressed.pop(key, 0)
+        return format_admin_alert(entry, merged)
+
+    def summary(self, hours: int = 24, limit: int = 10, now: Optional[float] = None) -> str:
+        now = time.time() if now is None else now
+        with self._lock:
+            entries = [e for e in self._recent if now - e["at"] <= hours * 3600]
+        if not entries:
+            return f"最近 {hours} 小時沒有錯誤紀錄。（只記錄這次 Bot 啟動後的錯誤）"
+        counts: Dict[str, int] = {}
+        for e in entries:
+            counts[e["kind"]] = counts.get(e["kind"], 0) + 1
+        lines = [f"**最近 {hours} 小時錯誤：{len(entries)} 次**",
+                 "｜".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])),
+                 "", f"最新 {min(limit, len(entries))} 筆："]
+        for e in reversed(entries[-limit:]):
+            stamp = datetime.fromtimestamp(e["at"], _TAIPEI_TZ).strftime("%m/%d %H:%M")
+            lines.append(f"• {stamp}｜{e['kind']}｜{e['user'] or '-'}｜{e['question'][:30] or '-'}｜{e['detail'][:100]}")
+        lines.append("（只記錄這次 Bot 啟動後的錯誤）")
+        return chr(10).join(lines)
+
+
+def format_admin_alert(entry: Dict[str, Any], merged: int = 0) -> str:
+    stamp = datetime.fromtimestamp(entry["at"], _TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [f"⚠️ {entry['kind']}｜{entry['user'] or '-'}｜{stamp}"]
+    if entry["question"]:
+        lines.append(f"問題：{entry['question'][:120]}")
+    lines.append(f"原因：{entry['detail'][:600]}")
+    tail = "｜".join(x for x in (f"route：{entry['route']}" if entry["route"] else "",
+                                 f"request_id：{entry['request_id']}" if entry["request_id"] else "") if x)
+    if tail:
+        lines.append(tail)
+    if merged:
+        lines.append(f"（前 {ALERT_WINDOW_SECONDS // 60} 分鐘內同類錯誤另有 {merged} 次，已合併）")
+    return chr(10).join(lines)
+
+
+ADMIN_ALERTS = AdminAlertLog()
+
+
+async def _post_admin_alert(client, channel_id: int, text: str) -> None:
+    try:
+        import discord
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+        await channel.send(text[:1900], allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True))
+    except Exception as exc:  # 通知失敗只記 log，不影響會員回覆
+        print(f"⚠️ 管理員錯誤通知送出失敗：{type(exc).__name__}: {exc}", flush=True)
+
+
+def queue_admin_alert(client, config: "BotConfig", kind: str, detail: str, *, user: str = "", question: str = "",
+                      route: str = "", request_id: str = ""):
+    """記錄錯誤並在背景送到管理員頻道；不等待、不拋錯，不拖慢會員回覆。"""
+    try:
+        text = ADMIN_ALERTS.record(kind, detail, user=user, question=question, route=route, request_id=request_id)
+        print(f"🚨 管理員通知｜{kind}｜{'送出' if text else '合併'}｜{str(detail)[:120]}", flush=True)
+        if not text or not config.alert_channel_id or client is None:
+            return None
+        if kind in ALERT_CRITICAL_KINDS and config.alert_mention_ids:
+            text = " ".join(f"<@{uid}>" for uid in sorted(config.alert_mention_ids)) + chr(10) + text
+        return asyncio.get_running_loop().create_task(_post_admin_alert(client, config.alert_channel_id, text))
+    except Exception as exc:
+        print(f"⚠️ 管理員錯誤通知略過：{type(exc).__name__}: {exc}", flush=True)
+        return None
 
 
 async def send_access_denial(interaction, text, required, public=False):
@@ -3565,7 +3692,9 @@ async def send_access_denial(interaction, text, required, public=False):
         try:
             data, extension = await asyncio.to_thread(answer_image.make_locked_attachment)
             options["file"] = discord.File(io.BytesIO(data), filename=f"ace-locked.{extension}")
-        except Exception as exc:  # 圖片失敗仍送文字＋按鈕
+            # 有圖時只貼圖＋網址（<> 關掉 Skool 連結預覽），說明文字都在圖上。
+            options["content"] = f"<{access_policy.UNLOCK_URL}>"
+        except Exception as exc:  # 圖片失敗仍送完整文字＋網址＋按鈕
             print(f"⚠️ 未解鎖圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
     if edit_original:
         file = options.pop("file", None)
@@ -3678,7 +3807,7 @@ def _is_guild_admin(member) -> bool:
 
 
 ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能使用）
-會員模擬：/ace 測試 guest|general|warrant|beta|superuser <問題>（僅自己可見）
+會員模擬：/ace 測試 guest|general|warrant|beta|superuser <問題>（結果公開，可在群組展示）
 
 【本週精選】
 • `本週精選排名`：算出當期 Top 10
@@ -3698,6 +3827,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `覆盤 2454 9/1 買進 1285，理由：…`：持倉中覆盤（K 線下方紫色 ▲「買」標買點）；`我的覆盤` 列出紀錄
 • `覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…`：完整交易覆盤（含 MFE／MAE、賣後 5 日）
 • `用量`：今日 Gemini 與各 API 使用量
+• `錯誤紀錄`：最近 24 小時會員遇到的錯誤（即時通知另送到管理員頻道）
 • `匯出狀態`：打包覆盤紀錄、盤中量能學習結果與近 45 天成交占比（只有自己看得到，換 Volume 前用）
 • `匯入狀態`＋attachment：匯回上面的檔案（已存在的紀錄不覆蓋）
 
@@ -4021,6 +4151,7 @@ def run_discord_bot(config: BotConfig) -> None:
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
+        who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
@@ -4095,6 +4226,10 @@ def run_discord_bot(config: BotConfig) -> None:
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
+            reason = alert_reason(result)
+            if reason:
+                queue_admin_alert(client, config, reason[0], reason[1], user=who, question=question,
+                                  route=result.route, request_id=result.request_id)
             print(
                 f"📊 REQUEST METRICS｜id={result.request_id}｜route={result.route}｜compute={result.elapsed:.2f}s｜"
                 f"render+upload={upload_elapsed:.2f}s｜end_to_end={total_elapsed:.2f}s｜cache={result.cache_hit}｜"
@@ -4104,9 +4239,11 @@ def run_discord_bot(config: BotConfig) -> None:
             lag = (f"｜delivery={locals().get('delivery', -1):.2f}s｜pre_defer={locals().get('pre_defer', -1):.2f}s"
                    f"｜loop_lag={locals().get('loop_lag', -1):.2f}s｜deferred={interaction.response.is_done()}")
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}{lag}", flush=True)
+            queue_admin_alert(client, config, "Discord 回覆失敗", f"{exc}{lag}", user=who, question=question)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()   # 印出檔名與行號，numpy/pandas 這類例外沒有堆疊就無法定位
+            queue_admin_alert(client, config, "程式例外", f"{type(exc).__name__}: {exc}", user=who, question=question)
             try:
                 await send_private("暫時無法完成", "處理問題時發生錯誤，請稍後再試。")
             except discord.HTTPException as send_exc:
