@@ -374,6 +374,12 @@ _FINMIND_TOKEN_STATE: Dict[str, Any] = {"index": 0, "blocked": {}}
 FINMIND_AUTH_COOLDOWN = _env_float("DISCORD_AI_FINMIND_AUTH_COOLDOWN", 12 * 3600.0)
 FINMIND_TRANSIENT_COOLDOWN = _env_float("DISCORD_AI_FINMIND_TRANSIENT_COOLDOWN", 60.0)
 _FINMIND_TRANSIENT_RE = re.compile(r"429|too many|rate limit|timed? ?out|timeout|50[0-4]|connection|temporarily", re.I)
+# 每小時額度用完（Requests reach the upper limit）：冷卻到額度大致恢復，期間直接改走備援，不再等
+_FINMIND_QUOTA_RE = re.compile(r"upper limit|額度超限|RateLimit", re.I)
+FINMIND_QUOTA_COOLDOWN = _env_float("DISCORD_AI_FINMIND_QUOTA_COOLDOWN", 600.0)
+# 主程式遇到額度超限會「所有 worker 暫停」60→300 秒重試 4 次（週報批次合理，但會員一題會卡十幾分鐘）；
+# Bot 行程內改成不等待、直接丟錯，由上面的冷卻＋富果日K備援接手。GitHub Actions 不受影響。
+BOT_FINMIND_RATE_LIMIT_RETRIES = max(0, _env_int("DISCORD_AI_FINMIND_RATE_LIMIT_RETRIES", 0))
 
 
 class FinMindUnavailable(RuntimeError):
@@ -385,11 +391,11 @@ def _token_healthy(token: str) -> bool:
     return not blocked or blocked[0] <= time.monotonic()
 
 
-def mark_finmind_token(token: str, reason: str, transient: bool) -> None:
+def mark_finmind_token(token: str, reason: str, transient: bool, seconds: Optional[float] = None) -> None:
     """授權失敗＝這個行程內長時間停用；暫時性錯誤（429／逾時／5xx）＝短暫冷卻，不判定 Token 無效。"""
     if not token:
         return
-    seconds = FINMIND_TRANSIENT_COOLDOWN if transient else FINMIND_AUTH_COOLDOWN
+    seconds = float(seconds if seconds is not None else FINMIND_TRANSIENT_COOLDOWN if transient else FINMIND_AUTH_COOLDOWN)
     with _FINMIND_TOKEN_LOCK:
         _FINMIND_TOKEN_STATE.setdefault("blocked", {})[token] = (time.monotonic() + seconds, str(reason)[:160])
     tokens = finmind_tokens()
@@ -478,6 +484,9 @@ def install_finmind_failover(kf) -> None:
             except Exception as exc:
                 if _finmind_token_failed(kf, exc):
                     mark_finmind_token(token, str(exc), transient=False)
+                elif tokens and _FINMIND_QUOTA_RE.search(f"{type(exc).__name__} {exc}"):
+                    # 額度用完：單一 Token 也冷卻，冷卻期間所有請求直接走備援（不再每題重撞、也不卡住）
+                    mark_finmind_token(token, str(exc), transient=True, seconds=FINMIND_QUOTA_COOLDOWN)
                 elif len(tokens) > 1 and _FINMIND_TRANSIENT_RE.search(f"{type(exc).__name__} {exc}"):
                     mark_finmind_token(token, str(exc), transient=True)   # 429／逾時／5xx：短暫冷卻，不判定無效
                 else:
@@ -488,6 +497,8 @@ def install_finmind_failover(kf) -> None:
     kf._require_finmind_token = require_token
     kf._finmind_get_data = get_with_failover
     kf._ace_finmind_failover = True
+    if hasattr(kf, "FINMIND_RATE_LIMIT_RETRIES"):
+        kf.FINMIND_RATE_LIMIT_RETRIES = BOT_FINMIND_RATE_LIMIT_RETRIES
     count = len(finmind_tokens())
     if count > 1:
         print(f"🔑 FinMind Token：共 {count} 支，第一支失效時自動改用下一支", flush=True)
@@ -1941,8 +1952,10 @@ def legal_gap_days(code: str, gaps: List[str]) -> List[str]:
     return [d for d in gaps if d in closed or d in absent]
 
 
-def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str) -> Tuple[pd.DataFrame, str]:
-    """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。"""
+def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
+                  allow_finmind: bool = True) -> Tuple[pd.DataFrame, str]:
+    """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。
+    背景工作（allow_finmind=False）只用本地底庫，不佔會員查詢要用的 FinMind 額度。"""
     columns = ["Open", "High", "Low", "Close", "Volume"]
     frames, labels = [df[columns]], [source]
     try:
@@ -1953,13 +1966,15 @@ def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str) -> 
     except Exception as exc:
         print(f"⚠️ {code} 缺口補資料：本地底庫失敗｜{type(exc).__name__}: {exc}", flush=True)
     try:
+        if not allow_finmind:
+            raise ToolDataError("背景工作不用 FinMind 補缺口")
         stock_df, market, _ = core().fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
         if stock_df is not None and not stock_df.empty:
             local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
             frames.append(stock_df[columns])
             labels.append("FinMind")
     except Exception as exc:
-        print(f"⚠️ {code} 缺口補資料：FinMind 失敗｜{type(exc).__name__}: {exc}", flush=True)
+        print(f"⚠️ {code} 缺口補資料：FinMind 略過｜{type(exc).__name__}: {exc}", flush=True)
     merged = pd.concat(frames)
     merged = merged[~pd.DatetimeIndex(merged.index).normalize().duplicated(keep="first")].sort_index()
     remain = _missing_trading_days(merged)
@@ -2015,10 +2030,15 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         accepted = _ACCEPTED_GAPS.get(code)
         known = set(accepted[1]) if accepted and accepted[0] == today else set()
         if set(gaps) - known:
-            # 缺一天先用本地底庫＋FinMind 補；抓取失敗造成的缺口通常補得回來。
-            daily_df, daily_source = _repair_daily(code, daily_df, gaps, daily_source)
-            CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
-            merged, intraday = _append_intraday_bar(code, daily_df, market)
+            # 已證實合法的缺口（颱風假等全市場休市、確定沒成交）不必補；只有沒證據的缺口才用本地底庫＋FinMind 補。
+            # 以前每檔股票的 7/10 颱風假都會各打一次 FinMind，背景型態分數一跑就把每小時額度吃光。
+            legal = set(legal_gap_days(code, gaps))
+            unproven = [d for d in gaps if d not in legal]
+            if unproven:
+                daily_df, daily_source = _repair_daily(code, daily_df, unproven, daily_source,
+                                                       allow_finmind=current_api_priority() != "background")
+                CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
+                merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
             unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps))]
             if len(gaps) > MAX_ACCEPTED_GAPS or unproven:

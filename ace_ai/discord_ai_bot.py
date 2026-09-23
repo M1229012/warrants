@@ -1264,7 +1264,9 @@ class GeminiGateway:
             config.update(response_mime_type="application/json", response_schema=schema)
         for key in kf._get_warrants_api_keys():
             try:
-                response = kf.genai.Client(api_key=key).models.generate_content(model=model, contents=prompt, config=config)
+                # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉（Cannot send a request, as the client has been closed）
+                client = kf.genai.Client(api_key=key)
+                response = client.models.generate_content(model=model, contents=prompt, config=config)
                 text = str(response.text or "")
                 if text:
                     return text
