@@ -1453,6 +1453,7 @@ def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> D
 
 
 _FOCUS_RULES = (
+    (re.compile(r"權證|分點|主力|大戶|吃貨|加碼|布局|佈局|跑了沒|部位"), "權證分點"),
     (re.compile(r"量有?出來|量有?放大|爆量|量縮|帶量|放量|量增|量能|成交量|量比|窒息量"), "量能"),
     (re.compile(r"外資|投信|自營商|三大法人|法人|籌碼"), "三大法人籌碼"),
     (re.compile(r"支撐|壓力|有撐|有壓|撐在|壓在|卡在"), "支撐壓力"),
@@ -1465,13 +1466,19 @@ def question_focus(question: str) -> List[str]:
     text = re.sub(r"（延續上一題[^）]*）", "", question or "")
     if re.search(r"權證|分點", text):
         text = re.sub(r"籌碼", "", text)   # 權證分點籌碼走權證規則，不是三大法人
-    return [label for pattern, label in _FOCUS_RULES if pattern.search(text)]
+    labels = [label for pattern, label in _FOCUS_RULES if pattern.search(text)]
+    if "權證分點" in labels and _INSTITUTIONAL_RE.search(text) and not _EXPLICIT_WARRANT_RE.search(text):
+        labels.remove("權證分點")   # 「外資在加碼」是三大法人，不是權證分點
+    return labels
 
 
 FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
                      "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
                      "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
                      "明講偏買或偏賣，並註明是收盤後資料；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
+                     "權證分點＝整張解讀都以權證分點為主：answer 直接說目前分點籌碼偏買、偏賣或已大多出清；why 說明哪些分點、觸發哪個 A～E 事件、"
+                     "買進金額、後續是出清還是仍持有、分點的歷史事件勝率，以及分點買在什麼價位或量區附近；技術面最多一句當背景，不可整段改寫成技術面分析。"
+                     "scenarios 用分點條件，例如「若仍持有的分點繼續加碼／開始出清」「股價守住或跌破分點進場的量區」。"
                      "重點需要的資料若失敗或沒有，第一句就說明取不到，不可改寫成一般技術面來帶過。")
 
 
