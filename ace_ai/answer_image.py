@@ -2201,7 +2201,10 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     signed = section.get('signed', ('加權報酬',))
                     accent = section.get('accent', ('勝率',))
                     color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
-                    draw.text((cx, ry + row_h / 2), str(cell), font=font(22, c == 0 or bold or columns[c] in accent),
+                    strong = c == 0 or bold or columns[c] in accent
+                    room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
+                    text, size = fit(str(cell), 22, max(40, room), strong, 15)
+                    draw.text((cx, ry + row_h / 2), text, font=font(size, strong),
                               fill=color, anchor='lm' if c == 0 else 'rm')
                 draw.line((x0, ry + row_h, x1, ry + row_h), fill=GRID)
         return head_h + len(rows) * row_h + 20
@@ -2253,6 +2256,34 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 draw.text((cx + w / 2, cy + chip_h / 2), item, font=font(20), fill=ACCENT, anchor='mm')
                 cx += w + gap
         return height + 10
+    if kind == 'rows':
+        # 一行一格的淺底資料列：前段（名稱）粗體、後段各項用「｜」分隔；數字正負用紅綠
+        total = 0
+        lead_w = min(width * 0.30, max([font(23, True).getlength(r.get('lead', '')) for r in section.get('items') or []] + [0]) + 28)
+        for item in section.get('items') or []:
+            body = '｜'.join(item.get('parts') or [])
+            lines = wrap(body, 23, width - lead_w - 40, False) if body else ['']
+            lead_lines = wrap(item.get('lead', ''), 23, lead_w - 12, True) if item.get('lead') else []
+            h = max(len(lines), len(lead_lines), 1) * 34 + 20
+            top = y + total + 14   # 文字在淺底列裡垂直置中
+            if not dry:
+                draw.rounded_rectangle((x0, y + total, x1, y + total + h), radius=12, fill=TILE_BG)
+                for i, line in enumerate(lead_lines):
+                    text_at(draw, (x0 + 18, top + i * 34), line, 23, INK, True)
+                for i, line in enumerate(lines):
+                    tx = x0 + (lead_w if lead_lines else 18)
+                    for j, piece in enumerate(re.split(r'(｜)', line)):
+                        color = MUTED if piece == '｜' else _tone_color(piece.split(' ')[-1] if piece else '', 'auto')
+                        text_at(draw, (tx, top + i * 34), piece, 23, color if piece != '｜' else MUTED)
+                        tx += font(23).getlength(piece)
+            total += h + 10
+        return total + 8
+    if kind == 'paragraph':
+        lines = wrap(section.get('text', ''), 25, width, False)
+        if not dry:
+            for i, line in enumerate(lines):
+                text_at(draw, (x0, y + i * 38), line, 25, INK)
+        return len(lines) * 38 + 14
     if kind == 'badge':
         if not dry:
             w = font(20, True).getlength(section['text']) + 32
@@ -2479,6 +2510,61 @@ def add_center_watermarks(image: Image.Image) -> Image.Image:
     return image
 
 
+_NOTE_PREFIX = ('資料時間', '※', '資料來源', '⚠️', '🧡', '(', '（')
+
+
+def text_card(text: str) -> dict:
+    """把規則式／系統文字轉成和其他研究筆記一致的卡片：**標題**→卡片標題、【小標】→金色小標、
+    「名稱：a｜b」或含「｜」的行→資料列、※／資料時間→註解，其餘句子→段落。"""
+    text = re.sub(r'(?m)^\s*[💹📈📊📌📰🔎📝🧭]\s*([^\n]+)', r'【\1】', str(text or ''))
+    title, sections, rows = '', [], []
+
+    def flush() -> None:
+        if rows:
+            sections.append({'type': 'rows', 'items': list(rows)})
+            rows.clear()
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            flush()
+            continue
+        bold = re.fullmatch(r'\*\*(.+?)\*\*', raw)
+        if bold:
+            flush()
+            if title:
+                sections.append({'type': 'heading', 'text': clean(bold.group(1))})
+            else:
+                title = clean(bold.group(1))
+            continue
+        heading = re.match(r'^(?:【([^】]+)】|#{1,6}\s+(.+)$)(.*)', raw)
+        if heading:
+            flush()
+            sections.append({'type': 'heading', 'text': clean(heading.group(1) or heading.group(2))})
+            raw = heading.group(3).strip()
+            if not raw:
+                continue
+        raw = clean(raw)
+        if raw.startswith(_NOTE_PREFIX):
+            flush()
+            sections.append({'type': 'note', 'text': raw})
+            continue
+        line = re.sub(r'^[・•\-]\s*', '', raw)
+        colon = re.search(r'[：:]', line)
+        if '｜' in line or (colon and colon.start() <= 12 and line != raw):
+            if colon and colon.start() <= 12:
+                lead, rest = line[:colon.start()], line[colon.end():]
+            else:
+                lead, rest = line.split('｜', 1)
+            rows.append({'lead': lead.strip(), 'parts': [p.strip() for p in rest.split('｜') if p.strip()]})
+            continue
+        flush()
+        sections.append({'type': 'paragraph', 'text': raw})
+    flush()
+    if not title:   # 只有一兩句話（排隊、錯誤、提醒）＝提醒卡；有資料列的才叫重點整理
+        title = '提醒' if all(x['type'] in ('paragraph', 'note') for x in sections) else '重點整理'
+    return {'branch': title, 'tags': [], 'label': '', 'sections': sections}
+
+
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯 AI｜研究筆記', demo: bool = False) -> Image.Image:
     panels = panels or []
@@ -2502,7 +2588,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     # AI 解讀卡已包含回答全文（含延續上一題與資料時間），不再另外排文字區塊。
     hide_text = (sector_panels or article_panels or review_panels or ai_panels
                  or any(p.get('hide_text') for p in branch_panels))
-    blocks = [] if hide_text else body_blocks(answer)
+    blocks = []
+    if not hide_text and str(answer or '').strip():
+        branch_panels.append({'branch_card': text_card(answer)})   # 文字一律轉成卡片（標題、小標、資料列、註解）
     body_height = sum(b.height for b in blocks) + 68 if blocks else 0
     if compare:
         panels_height = sum(panel_height(p) + 24 for p in panels) + compare_card(None, 0, panels, True) + 24

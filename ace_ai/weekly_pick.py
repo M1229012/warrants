@@ -1563,6 +1563,25 @@ def ranking_to_text(cards: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def ranking_card(cards: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
+    """本週精選排名圖卡（和其他研究筆記同一套）：Top 10 表格＋一行資料時間。精選五分點用 ★（字型有這個字形，不用 emoji）。"""
+    rows = []
+    for card in cards:
+        parts = {p["label"]: p["value"] for p in card.get("score_parts") or []}
+        tech = float(parts.get("技術面", 0) or 0)
+        score = float(card.get("score") or 0)
+        win = card.get("event_win_rate")
+        event = card.get("event_combo_key") or "-"
+        win_text = f"{event} {win}%（n={_count_text(card.get('event_sample'))}）" if win is not None else "資料不足"
+        rows.append([str(card["rank"]), f"{card['stock_code']} {card.get('stock_name', '')}", f"{score:.1f}", f"{tech:.1f}",
+                     f"{max(0.0, score - tech):.1f}", ("★" if card.get("lead_branch_selected") else "") + str(card.get("lead_branch", "")),
+                     win_text, str(card.get("lead_amount_text", ""))])
+    return {"branch": "本週精選 Top 10", "tags": ["權證分點觀察"], "label": "排名", "sections": [
+        {"type": "table", "columns": ["#", "股票", "總分", "技術/50", "權證/50", "主力分點", "事件勝率", "權證金額"], "rows": rows,
+         "widths": (0.05, 0.15, 0.08, 0.09, 0.09, 0.17, 0.24, 0.13), "accent": ("總分",), "signed": ("權證金額",)},
+        {"type": "note", "text": "★＝精選五分點｜" + str(meta.get("data_time", ""))}]}
+
+
 def weekly_meta(result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "filters": result.get("filters") or [],

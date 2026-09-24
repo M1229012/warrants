@@ -3731,6 +3731,8 @@ class AceQueryEngine:
             panels = []
             if answer.cards:
                 weekly = {"cards": answer.cards, "overview": answer.overview, "meta": answer.meta, "notice": answer.notice}
+                # 排名清單也用卡片（表格）呈現，和其他圖片同一套風格
+                panels = [{"branch_card": weekly_pick.ranking_card(answer.cards, answer.meta), "hide_text": True}]
         except tools.ToolDataError as exc:
             self.log(f"本週精選無法計算：{exc}")
             detail = tools._public_detail(exc)
@@ -3742,7 +3744,7 @@ class AceQueryEngine:
         self.log(f"本週精選完成｜Gemini 呼叫 {stats.gemini_calls} 次｜快取={cache_hit}｜總耗時 {elapsed:.1f}s")
         return AnswerResult(
             text=text, route="weekly_pick", gemini_calls=stats.gemini_calls, elapsed=elapsed, cache_hit=cache_hit,
-            panels=panels, layout="weekly_pick" if weekly else "text", weekly=weekly,
+            panels=panels, layout="text", weekly=weekly,
             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
             total_tokens=stats.total_tokens, token_source=stats.token_source,
         )
