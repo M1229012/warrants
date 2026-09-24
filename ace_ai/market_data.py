@@ -131,6 +131,22 @@ MIN_ROWS = {"twse": max(1, tools._env_int("DISCORD_AI_MARKET_MIN_ROWS_TWSE", 500
             "tpex": max(1, tools._env_int("DISCORD_AI_MARKET_MIN_ROWS_TPEX", 300))}
 
 
+# 除了絕對門檻，還要達到「近期完整日筆數中位數」的這個比例（避免正常 1,000 檔、來源只回 500 檔也算完整）
+COVERAGE_RATIO = min(1.0, max(0.0, tools._env_float("DISCORD_AI_MARKET_MIN_COVERAGE_RATIO", 0.9)))
+# 還沒有足夠歷史基準（<5 個完整日）時用的保守門檻
+STATIC_MIN_ROWS = {"twse": max(1, tools._env_int("DISCORD_AI_MARKET_STATIC_MIN_ROWS_TWSE", 800)),
+                   "tpex": max(1, tools._env_int("DISCORD_AI_MARKET_STATIC_MIN_ROWS_TPEX", 650))}
+
+
+def complete_threshold(market: str, before: str = "") -> int:
+    """complete 需要的最少筆數：max(絕對門檻, 近 20 個完整日中位數 × COVERAGE_RATIO)；基準不足時用保守門檻。"""
+    history = [n for d, n in local_market_cache.market_row_history(market, 21) if not before or d != before][:20]
+    if len(history) < 5:
+        return max(MIN_ROWS[market], STATIC_MIN_ROWS[market])
+    history.sort()
+    return max(MIN_ROWS[market], int(history[len(history) // 2] * COVERAGE_RATIO))
+
+
 def _twse_empty(payload: Dict[str, Any]) -> bool:
     """證交所明確回覆「沒有符合條件的資料」（休市日）；其他非 OK 狀態不算。"""
     return "沒有符合條件" in str(payload.get("stat") or "")
@@ -156,11 +172,12 @@ def fetch_market(day: _date, market: str) -> Tuple[str, List[Dict[str, Any]], st
     except Exception as exc:
         print(f"⚠️ 市場底庫：{'上市' if market == 'twse' else '上櫃'} {day} 取得失敗｜{type(exc).__name__}", flush=True)
         return "source_error", [], f"{type(exc).__name__}: {exc}"
-    if len(rows) >= MIN_ROWS[market]:
+    need = complete_threshold(market, day.strftime("%Y-%m-%d"))
+    if len(rows) >= need:
         return "complete", rows, ""
     if not rows and empty:
         return "empty", [], "交易所回覆當天無資料"
-    return "source_error", rows, f"只有 {len(rows)} 檔（門檻 {MIN_ROWS[market]}），視為回應不完整"
+    return "source_error", rows, f"只有 {len(rows)} 檔（門檻 {need}），視為回應不完整"
 
 
 def fetch_day(day: _date) -> List[Dict[str, Any]]:
@@ -278,6 +295,12 @@ def incomplete_days(target_days: int = HISTORY_DAYS) -> List[str]:
     sync() 已完整天數一到 target_days 就停，更早抓失敗的日子（例如某天櫃買回應不完整）輪不到重抓，
     那天所有沒成交的冷門股都無法證明「確定沒成交」，會被當成資料缺漏；由背景維護用這份清單補查。"""
     keys = [d.strftime("%Y-%m-%d") for d in _candidate_days(int(target_days * 1.5))[1:]]
+    # 舊版低門檻時被判 complete、筆數卻明顯不足的日子：改回 source_error 重查（少掉的股票不能當成「沒成交」）
+    for market in local_market_cache.MARKETS:
+        rows = dict(local_market_cache.market_row_history(market, 400))
+        for day, count in rows.items():
+            if day in keys and count < complete_threshold(market, day):
+                local_market_cache.reset_market_status(day, market, "source_error", f"只有 {count} 檔，低於近期基準")
     try:
         status = local_market_cache.market_status(keys)
     except local_market_cache.DBError:

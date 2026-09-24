@@ -601,14 +601,23 @@ def save_spot_day(stock_code: str, date: str, rows: Iterable[Dict[str, Any]], st
         raise ValueError(f"unknown spot status: {status}")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     items = []
+    invalid = 0
     if status == "complete":
         for row in rows or []:
             name = str(row.get("branch_name") or "").strip()
             if not name:
                 continue
-            buy, sell = float(row.get("buy") or 0), float(row.get("sell") or 0)
-            net = float(row["net"]) if row.get("net") is not None else buy - sell
-            items.append((str(stock_code), str(date), name, buy, sell, net, source, now))
+            try:
+                buy, sell = float(row.get("buy") or 0), float(row.get("sell") or 0)
+            except (TypeError, ValueError):
+                buy = sell = float("nan")
+            if not (math.isfinite(buy) and math.isfinite(sell)) or buy < 0 or sell < 0:
+                invalid += 1
+                continue
+            items.append((str(stock_code), str(date), name, buy, sell, buy - sell, source, now))   # net 一律重算
+        if invalid:
+            print(f"⚠️ {stock_code} {date} 現股分點有 {invalid} 列數值不合理，這一天不標完整、稍後重抓", flush=True)
+            status, items, detail = "retry", [], f"{invalid} 列數值不合理"
     with _LOCK:
         with _db() as conn, conn:
             if status == "complete":
@@ -694,6 +703,20 @@ def market_status(dates: Iterable[str]) -> Dict[str, Dict[str, str]]:
             if date in out and market in MARKETS:
                 out[date][market] = status
     return out
+
+
+def market_row_history(market: str, limit: int = 20) -> List[Tuple[str, int]]:
+    """某市場最近 limit 個 complete 日的 (日期, 普通股筆數)，新到舊；讀取失敗回空。"""
+    return [(str(d), int(n or 0)) for d, n in _read(
+        "SELECT date, rows FROM market_days WHERE market=? AND status='complete' AND rows>0 ORDER BY date DESC LIMIT ?",
+        (str(market), int(limit)))]
+
+
+def reset_market_status(date: str, market: str, status: str, detail: str = "") -> None:
+    """把某市場某日的完整性改回可重查的狀態（含 complete 降級）：事後發現筆數明顯不足時使用。"""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _write("UPDATE market_days SET status=?, checked_at=?, detail=? WHERE date=? AND market=?",
+           (status, now, str(detail)[:300], str(date), str(market)))
 
 
 def market_closed_days(dates: Iterable[str]) -> List[str]:

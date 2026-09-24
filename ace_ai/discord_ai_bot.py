@@ -1458,12 +1458,18 @@ class GeminiGateway:
         return None
 
     DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
+    # 同時存在的 Gemini 背景工作上限（含逾時後仍在跑的）；滿了直接改規則式，不再開新執行緒
+    _OUTSTANDING = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_OUTSTANDING", 6)))
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         """整體時限 DEADLINE 秒：超過就回失敗（呼叫端改用規則式內容），不讓一題卡在 Gemini 重試上。
         逾時的那次呼叫在背景跑完後丟棄。"""
         if not self.DEADLINE:
             return self._generate(prompt, purpose, schema, temperature)
+        gate = self._OUTSTANDING          # 拿哪一顆就 release 同一顆
+        if not gate.acquire(blocking=False):
+            self.log(f"Gemini 背景工作已滿，改用規則式內容：{purpose}")
+            return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
         request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
         box: Dict[str, GeminiResult] = {}
         done = threading.Event()
@@ -1475,6 +1481,7 @@ class GeminiGateway:
             except Exception as exc:
                 box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
             finally:
+                gate.release()
                 done.set()
         threading.Thread(target=run, name="ace-gemini", daemon=True).start()
         if not done.wait(self.DEADLINE):
@@ -3288,7 +3295,11 @@ class AceQueryEngine:
         remembered = self.memory.get(context_key)
         access = self._access()
         # 現股分點名稱用現股資料庫自己的名單辨識；權證分點仍用原本的權證名單（parsed.branches）。
-        parsed.spot_branch = spot_chip.match_branch(question)
+        try:
+            parsed.spot_branch = spot_chip.match_branch(question)
+        except Exception as exc:   # 只是路由輔助：讀不到現股分點名單就當作沒有指定分點，一般題照常回答
+            self.log(f"現股分點名稱比對略過：{type(exc).__name__}: {exc}")
+            parsed.spot_branch = ""
         parsed.chip = access_policy.chip_type(question, access.entitlement if access else None,
                                               known_branch=bool(parsed.branches or parsed.branch_candidates or parsed.spot_branch),
                                               warrant_branch=bool(parsed.branches or parsed.branch_candidates),

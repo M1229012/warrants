@@ -576,9 +576,25 @@ class TTLCache:
                 return False, None
             return True, value
 
+    MAX_ENTRIES = max(100, _env_int("DISCORD_AI_CACHE_MAX_ENTRIES", 5000))
+
     def set(self, key: str, value: Any, ttl_seconds: float) -> None:
         with self._lock:
             self._data[self._full_key(key)] = (time.time() + max(1.0, float(ttl_seconds)), value)
+            if len(self._data) > self.MAX_ENTRIES:
+                self._evict()
+
+    def _evict(self) -> None:
+        """超過上限：先清過期，仍超過就淘汰最快到期的，留到上限的九成；沒在用的 key lock 一併清掉。呼叫端持有 _lock。"""
+        now = time.time()
+        for k in [k for k, (exp, _) in self._data.items() if exp < now]:
+            del self._data[k]
+        extra = len(self._data) - int(self.MAX_ENTRIES * 0.9)
+        if extra > 0:
+            for k, _ in sorted(self._data.items(), key=lambda kv: kv[1][0])[:extra]:
+                del self._data[k]
+        for k in [k for k, lock in self._key_locks.items() if k not in self._data and not lock.locked()]:
+            del self._key_locks[k]
 
     def get_or_compute(self, key: str, ttl_seconds: float, compute: Callable[[], Any]) -> Tuple[Any, bool]:
         """命中就回傳快取；否則執行 compute 並寫入。回傳 (值, 是否命中)。"""
@@ -588,13 +604,21 @@ class TTLCache:
         full_key = self._full_key(key)
         with self._lock:
             key_lock = self._key_locks.setdefault(full_key, threading.Lock())
-        with key_lock:
-            hit, value = self.get(key)
-            if hit:
-                return value, True
-            value = compute()
-            self.set(key, value, ttl_seconds)
-            return value, False
+        try:
+            with key_lock:
+                hit, value = self.get(key)
+                if hit:
+                    return value, True
+                value = compute()
+                self.set(key, value, ttl_seconds)
+                return value, False
+        except Exception:
+            # 失敗沒有快取值：這個 key lock 若沒人在用（沒有其他執行緒拿著）就清掉，不讓失敗的 key 永久留下 lock
+            with self._lock:
+                if (full_key not in self._data and self._key_locks.get(full_key) is key_lock
+                        and not key_lock.locked()):
+                    del self._key_locks[full_key]
+            raise
 
 
 CACHE = TTLCache("discord_ai")

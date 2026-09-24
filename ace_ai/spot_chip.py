@@ -71,7 +71,8 @@ _BACKGROUND: set = set()
 _BACKGROUND_GUARD = threading.Lock()
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
 _STOCK_LOCKS_GUARD = threading.Lock()
-_SOURCE_STATE = {"down_until": 0.0}
+_SOURCE_STATE = {"down_until": 0.0, "fails": 0}
+_FETCH_DEADLINE = threading.local()   # 這一頁抓取的截止時間（HTTP 逾時依剩餘時間縮短）
 _SOURCE_GUARD = threading.Lock()
 
 
@@ -102,6 +103,18 @@ def _acquire_source(deadline: float, background: bool) -> bool:
     finally:
         with _SOURCE_GUARD:
             _FOREGROUND_WAITING[0] -= 1
+
+
+def _note_source(ok: bool) -> bool:
+    """全程式累計富邦連續失敗次數（不同會員、不同請求都算）；達 SOURCE_FAIL_LIMIT 就冷卻，成功就歸零。回傳是否剛觸發冷卻。"""
+    with _SOURCE_GUARD:
+        _SOURCE_STATE["fails"] = 0 if ok else _SOURCE_STATE.get("fails", 0) + 1
+        tripped = _SOURCE_STATE["fails"] >= SOURCE_FAIL_LIMIT
+        if tripped:
+            _SOURCE_STATE["fails"] = 0
+    if tripped:
+        _trip_source()
+    return tripped
 
 
 def _trip_source() -> None:
@@ -164,7 +177,12 @@ _BLOCK_MARKERS = ("captcha", "驗證碼", "access denied", "request rejected", "
                   "請輸入驗證", "系統忙碌", "service unavailable")
 
 
-def validate_spot_snapshot(html: str, stock_code: str = "") -> Tuple[str, List[Dict[str, Any]], str]:
+_TITLE_CODE_RE = re.compile(r"<title>\s*主力賣買超-([0-9A-Za-z]+)\s*</title>")
+_QUERY_DATE_RE = re.compile(r"getYMD([12])\s*=\s*'(\d{4}/\d{2}/\d{2})'")
+_UPDATE_DATE_RE = re.compile(r"最後更新日：(\d{4}/\d{2}/\d{2})")
+
+
+def validate_spot_snapshot(html: str, stock_code: str = "", date: str = "") -> Tuple[str, List[Dict[str, Any]], str]:
     """富邦 zco 頁完整性驗證 → (status, rows, detail)。
     complete：有買超／賣超表頭、兩側都有分點、每列買進／賣出都能解析、頁面沒被截斷、（有給代號時）頁面是這檔股票。
     no_data：頁面正常但當天沒有任何分點（富邦尚未更新或個股沒成交，由呼叫端依日期與市場資料判斷）。
@@ -199,7 +217,7 @@ def validate_spot_snapshot(html: str, stock_code: str = "") -> Tuple[str, List[D
             if len(row) <= start:
                 continue
             name = row[start].strip()
-            if not name or any(word in name for word in ("合計", "平均", "買超券商", "賣超券商")):
+            if not name or any(word in name for word in ("合計", "平均", "買超券商", "賣超券商", "查無")):   # 「查無(台積電2330)…」列＝沒資料
                 continue
             buy = _number(row[start + 1]) if len(row) > start + 1 else None
             sell = _number(row[start + 2]) if len(row) > start + 2 else None
@@ -214,8 +232,21 @@ def validate_spot_snapshot(html: str, stock_code: str = "") -> Tuple[str, List[D
         return "no_data", [], "頁面正常但沒有分點"
     if not sides[buy_col] or not sides[sell_col]:
         return "partial", [], "只有買超側" if sides[buy_col] else "只有賣超側"
-    if stock_code and str(stock_code) not in text:
-        return "source_error", [], "頁面內容不是這檔股票"
+    if stock_code:
+        # 用頁面明確欄位驗證（<title>主力賣買超-代號</title>），不在全文找代號；找不到欄位就不能當完整
+        found = _TITLE_CODE_RE.search(text)
+        if not found:
+            return "partial", [], "頁面沒有股票代號欄位"
+        if found.group(1) != str(stock_code):
+            return "source_error", [], f"頁面是 {found.group(1)}，不是這檔股票"
+    if date:
+        want = str(date).replace("-", "/")
+        queried = dict(_QUERY_DATE_RE.findall(text))
+        if not queried:
+            return "partial", [], "頁面沒有查詢日期欄位"
+        updated = _UPDATE_DATE_RE.search(text)
+        if set(queried.values()) != {want} or (updated and updated.group(1) != want):
+            return "source_error", [], f"頁面日期不是 {want}"
     return "complete", list(merged.values()), ""
 
 
@@ -277,7 +308,10 @@ def open_source() -> Iterator[Callable[[str, str], str]]:
                                      "Chrome/122 Safari/537.36")
 
     def fetch(stock_code: str, date: str) -> str:
-        response = session.get(_source_url(stock_code, date), timeout=(5, HTTP_READ_TIMEOUT))
+        # 逾時依這一題剩餘時間縮短：一頁很慢時不會把會員那一題拖過時限
+        left = getattr(_FETCH_DEADLINE, "at", 0.0) - time.monotonic() if getattr(_FETCH_DEADLINE, "at", 0.0) else HTTP_READ_TIMEOUT
+        read = max(1.0, min(HTTP_READ_TIMEOUT, left))
+        response = session.get(_source_url(stock_code, date), timeout=(min(5.0, read), read))
         response.raise_for_status()
         response.encoding = response.apparent_encoding or "big5"
         return response.text
@@ -409,6 +443,13 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
 
             def work() -> None:
+                _FETCH_DEADLINE.at = deadline
+                try:
+                    _work()
+                finally:
+                    _FETCH_DEADLINE.at = 0.0   # 單一連線時在呼叫端執行緒跑，不能把截止時間留給下一題
+
+            def _work() -> None:
                 with tools.api_request_scope(request_id), fetch_source() as fetch:
                     while True:
                         with guard:
@@ -422,6 +463,9 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                             with guard:
                                 state["busy"], state["stop"] = 1, True
                             return
+                        if time.monotonic() >= deadline:   # 等名額時時間已到：不再開始新的抓取
+                            _SEMAPHORE.release()
+                            return
                         try:
                             failed = _fetch_one(fetch, stock_code, date, latest_date)
                         except local_market_cache.DBError as exc:
@@ -431,13 +475,15 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                             return
                         finally:
                             _SEMAPHORE.release()
+                        tripped = _note_source(not failed)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
                         with guard:
                             state["fetched"] += 1
                             state["errors"] += int(failed)
                             state["streak"] = state["streak"] + 1 if failed else 0
-                            if state["streak"] >= SOURCE_FAIL_LIMIT and not state["stop"]:
+                            if (tripped or state["streak"] >= SOURCE_FAIL_LIMIT) and not state["stop"]:
                                 state["stop"] = True
-                                _trip_source()   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
+                                if not tripped:
+                                    _trip_source()   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
                             elif state["errors"] >= 3:
                                 state["stop"] = True
                         time.sleep(REQUEST_GAP)
@@ -448,8 +494,9 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                 threads = [threading.Thread(target=work, name=f"spot-fetch-{i}", daemon=True) for i in range(workers)]
                 for thread in threads:
                     thread.start()
+                wait_until = deadline + 1.0   # 所有連線共用同一個等待截止（逾時已依剩餘時間縮短，這裡再給 1 秒緩衝）
                 for thread in threads:
-                    thread.join()
+                    thread.join(max(0.0, wait_until - time.monotonic()))
             if failure:
                 raise failure[0]
             fetched, errors, busy = state["fetched"], state["errors"], state["busy"]
@@ -468,7 +515,7 @@ def _fetch_one(fetch, stock_code: str, date: str, latest_date: str) -> bool:
     """抓一天、驗證、寫入（同一個 transaction）；回傳 True＝來源失敗。DBError 往上丟。"""
     started = time.perf_counter()
     try:
-        state, rows, detail = validate_spot_snapshot(fetch(stock_code, date), stock_code)
+        state, rows, detail = validate_spot_snapshot(fetch(stock_code, date), stock_code, date)
         final = _fetch_status(state, stock_code, date, latest_date)
         local_market_cache.save_spot_day(stock_code, date, rows if final == "complete" else [],
                                          final, SOURCE_NAME, detail)
