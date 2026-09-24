@@ -4547,7 +4547,9 @@ class AceQueryEngine:
                     numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
             card = branch_stock_events_card(history, numbers) if history else None
             if card:
-                panels.append({"branch_card": card})
+                # K 線點位＋全部事件清單已經說清楚：不再呼叫 Gemini、也不排文字區塊（省 5～10 秒）
+                panels.append({"branch_card": card, "hide_text": True})
+                plan.need_final_llm = False
                 if chart_panel:
                     chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
         elif "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
