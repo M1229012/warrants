@@ -695,6 +695,30 @@ def _perf_tiles(p: Dict[str, Any]) -> List[Dict[str, str]]:
     ]
 
 
+def institutional_card(data: Dict[str, Any]) -> Dict[str, Any]:
+    """三大法人買賣超圖卡：今日四格（外資／投信／自營商／合計）＋近 5／20 日與連買賣表格。"""
+    def signed(value: Any) -> str:
+        value = int(value or 0)
+        return f"{value:+,}" if value else "0"
+
+    def streak(days: Any) -> str:
+        days = int(days or 0)
+        return f"連買 {days} 天" if days > 0 else f"連賣 {-days} 天" if days < 0 else "-"
+    investors = data.get("investors") or []
+    tiles = [{"label": f"{x['investor']}今日", "value": f"{signed(x.get('latest_lots'))} 張", "tone": "signed"} for x in investors]
+    tiles.append({"label": "三大法人合計", "value": f"{signed(data.get('total_latest_lots'))} 張", "tone": "signed"})
+    rows = [[x["investor"], signed(x.get("latest_lots")), signed(x.get("sum_5d_lots")), signed(x.get("sum_20d_lots")),
+             streak(x.get("streak_days"))] for x in investors]
+    rows.append(["合計", signed(data.get("total_latest_lots")), signed(data.get("total_5d_lots")), "-", "-"])
+    name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
+    return {"branch": name, "tags": ["三大法人"], "label": "法人籌碼", "sections": [
+        {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：張（正＝買超、負＝賣超）"},
+        {"type": "tiles", "items": tiles},
+        {"type": "table", "columns": ["法人", "今日", "近 5 日", "近 20 日", "連續"], "rows": rows,
+         "signed": ("今日", "近 5 日", "近 20 日")},
+        {"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"}]}
+
+
 def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str, Any]]:
     """分點問題（勝率／近期買賣）的圖卡資料：數字卡＋比較條＋表格＋買賣超清單，和其他研究筆記同一套視覺。"""
     card: Dict[str, Any] = {"branch": "", "tags": [], "sections": []}
@@ -4210,7 +4234,7 @@ class AceQueryEngine:
         if ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
                 and stocks_only and len(stocks_only) == len(parsed.stocks) and not parsed.sector
                 and not _INSTITUTIONAL_ANALYSIS_RE.search(question)):
-            plan = QueryPlan(route="rule_institutional", need_final_llm=False)
+            plan = QueryPlan(route="rule_institutional", need_final_llm=True)
             for code in stocks_only:
                 plan.add("get_institutional_flow", stock_code=code)
         else:
@@ -4298,6 +4322,10 @@ class AceQueryEngine:
                 results.append(tools.ToolResult("get_spot_chip_summary", True, spot_data))
             if spot_panel:
                 panels.append(spot_panel)
+        if plan.route == "rule_institutional":
+            flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
+            if flow:
+                panels.append({"branch_card": institutional_card(flow), "hide_text": True})
         if plan.route == "rule_branch":
             branch_card = build_branch_card(results)
             if branch_card:
