@@ -1,5 +1,6 @@
 """Discord 單次請求權限；只讀 Discord 身分，不保存會員資格。"""
 from dataclasses import dataclass
+import os
 import re
 import uuid
 
@@ -13,6 +14,14 @@ WARRANT_DENIED = ("🔒 此功能尚未解鎖\n\n權證分點、事件勝率、�
                   "\n僅開放權證會員使用。\n\n購買艾斯DC權證系統即可解鎖此功能。")
 ADMIN_DENIED = "此功能只限伺服器管理員或 SUPERUSER 使用，請使用真正的 /ace 指令。"
 SPOT_DENIED = "現股分點籌碼｜此功能目前沒有使用權限。"
+SECTOR_DENIED = "族群分析目前調整中，暫不開放，完成後會再通知。"
+# 族群（族群排行／族群雷達）暫停開放給會員（管理員不受限）；Railway 設 DISCORD_AI_SECTOR_OPEN=1 即重新開放。
+SECTOR_OPEN = os.getenv("DISCORD_AI_SECTOR_OPEN", "0").strip() == "1"
+
+
+def require_sector(access):
+    if not SECTOR_OPEN and access is not None and not access.entitlement.admin:
+        raise AccessDenied(SECTOR_DENIED, "SECTOR")
 
 
 def is_warrant_role(role_name) -> bool:

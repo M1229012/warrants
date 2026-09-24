@@ -575,9 +575,13 @@ ADMIN_HELP_GROUPS = (
 
 def help_card(admin: bool = False) -> Dict[str, Any]:
     """指令表圖卡：分組＋範例，和其他研究筆記同一套卡片。"""
+    groups = HELP_GROUPS
+    if not admin and not access_policy.SECTOR_OPEN:   # 族群暫停開放：會員版不列族群範例
+        groups = [("大盤" if name == "族群大盤" else name, tuple(e for e in examples if "族群" not in e))
+                  for name, examples in HELP_GROUPS]
     sections: List[Dict[str, Any]] = [
         {"type": "badge", "text": "輸入 /ask 加上問題，白話問就可以"},
-        {"type": "rows", "items": [{"lead": name, "parts": list(examples)} for name, examples in HELP_GROUPS]}]
+        {"type": "rows", "items": [{"lead": name, "parts": list(examples)} for name, examples in groups]}]
     if admin:
         sections += [{"type": "heading", "text": "管理員（/ace）"},
                      {"type": "rows", "items": [{"lead": name, "parts": list(examples)} for name, examples in ADMIN_HELP_GROUPS]}]
@@ -1550,7 +1554,7 @@ def _install_gemini_error_recorder(kf: Any) -> None:
 
 
 # 503 是模型本身塞車，換 API Key 沒用，只能換模型再試一次（數字都是 Python 算的，換模型只影響文字風格）。
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
 _OVERLOADED_RE = re.compile(r"503|UNAVAILABLE|overloaded|high demand|429|RESOURCE_EXHAUSTED", re.IGNORECASE)
 # 主模型塞車後幾秒內，後續題目直接用備援模型（主程式會把 3 支 Key 都試過再等 2 秒重試，每題白等 30 幾秒）
 GEMINI_PRIMARY_COOLDOWN = max(0, tools._env_int("DISCORD_AI_GEMINI_PRIMARY_COOLDOWN", 300))
@@ -3519,6 +3523,7 @@ class AceQueryEngine:
         # 否則「正在轉強」會被當成族群名稱去查。
         radar = sector_radar.detect_intent(compact)
         if radar:
+            access_policy.require_sector(self._access())
             return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"),
                                       view=radar.get("view", "all"))
         router_started = time.perf_counter()
@@ -4470,6 +4475,7 @@ class AceQueryEngine:
                     plan.need_final_llm = True
 
         if plan.route == "rule_sector":
+            access_policy.require_sector(self._access())
             return self._answer_sector(parsed.sector, started)
 
         pre_results: List[tools.ToolResult] = []

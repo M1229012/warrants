@@ -524,6 +524,8 @@ def core():
         overridden = apply_bot_process_env()
         for key, previous in overridden.items():
             print(f"🔒 Discord AI 唯讀保護：{key} 原值 {previous!r} 已改為 {_READ_ONLY_FORCED_ENV[key]!r}")
+        # Bot 主模型預設 3.5 Flash Lite（主程式預設 3.1 給週報用）；Railway 設 GEMINI_MODEL 可覆蓋
+        os.environ.setdefault("GEMINI_MODEL", "gemini-3.5-flash-lite")
         started = time.perf_counter()
         spec = importlib.util.spec_from_file_location(CORE_MODULE_NAME, path)
         if spec is None or spec.loader is None:
