@@ -3031,7 +3031,20 @@ def get_branch_stock_history(branch_name: str, stock_code: str, limit: int = 15)
             record["單日累積買進金額"] = _money_text(kf._parse_number_like_value(record["單日累積買進金額"]))
         events.append(record)
     total = int(len(rows))
+    # 全部 A～E 事件（不限 K 線 70 日）：含權證清單與目前狀態；讀已快取的事件表，不另打 API
+    all_events: List[Dict[str, Any]] = []
+    try:
+        event_rows = load_abcde_event_rows()["events"]
+        mine = event_rows[(event_rows["branch"] == canonical) & (event_rows["stock_code"] == code)].sort_values("event_date")
+        for _, r in mine.tail(30).iterrows():
+            all_events.append({"event": r["event_code"], "date": _fmt_date(r["event_date"]),
+                               "buy_amount_text": _money_text(r["buy_amount"]),
+                               "warrants": [f"{c} {n}".strip() for c, n in _warrant_items(r)],
+                               "state": _event_state(r), "result_return_pct": _num(r.get("result_return"))})
+    except ToolDataError:
+        all_events = []
     return {
+        "all_events": all_events,
         "found": True,
         "branch": canonical,
         "stock_code": code,

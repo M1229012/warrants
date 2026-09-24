@@ -545,6 +545,53 @@ HELP_MESSAGE = (
     "可以接著追問，例如先問「幫我分析2330」，再問「那它的壓力在哪」「跟聯發科比呢」；輸入「重新開始」可清除上一題。"
 )
 
+# 指令表：help、說明、指令、怎麼用，或白話問「有什麼指令／可以問什麼」都回同一張卡（問句裡有股票代號就不算）
+_HELP_RE = re.compile(
+    r"^(?:/?help|/?h|說明|使用說明|指令|指令表|指令清單|幫助|功能|教學|怎麼用|如何使用|使用方式)[?？!！。]*$"
+    r"|有(?:甚麼|什麼|哪些|啥)(?:指令|功能)|可以問(?:甚麼|什麼|哪些|啥)|能問(?:甚麼|什麼|哪些|啥)"
+    r"|(?:要|該)?怎麼(?:用|使用|問)|如何(?:使用|問)|指令表|使用說明|help", re.IGNORECASE)
+
+
+def is_help_question(question: str) -> bool:
+    text = re.sub(r"\s+", "", str(question or ""))
+    return bool(text) and not re.search(r"\d{4}", text) and bool(_HELP_RE.search(text))
+
+
+HELP_GROUPS = (
+    ("個股型態", ("2330型態", "2330技術面怎麼樣", "我2330成本2000怎麼看")),
+    ("現股籌碼", ("2330現股籌碼", "2330今天誰買最多", "華邦電現股籌碼美林的明細")),
+    ("權證分點", ("2344權證籌碼", "永豐金內湖勝率", "權證永豐金內湖在3042的完整點位")),
+    ("三大法人", ("2330外資最近買超多少", "2330三大法人今天買賣超")),
+    ("族群大盤", ("AI伺服器族群誰型態最好", "哪些族群正在轉強", "大盤今天量縮嗎")),
+    ("新聞", ("2330最近有什麼新聞",)),
+)
+ADMIN_HELP_GROUPS = (
+    ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
+    ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
+    ("資料維護", ("系統狀態", "用量", "錯誤紀錄", "更新市場底庫")),
+    ("其他", ("族群雷達", "型態排名＋截圖", "測試 guest <問題>")),
+)
+
+
+def help_card(admin: bool = False) -> Dict[str, Any]:
+    """指令表圖卡：分組＋範例，和其他研究筆記同一套卡片。"""
+    sections: List[Dict[str, Any]] = [
+        {"type": "badge", "text": "輸入 /ask 加上問題，白話問就可以"},
+        {"type": "rows", "items": [{"lead": name, "parts": list(examples)} for name, examples in HELP_GROUPS]}]
+    if admin:
+        sections += [{"type": "heading", "text": "管理員（/ace）"},
+                     {"type": "rows", "items": [{"lead": name, "parts": list(examples)} for name, examples in ADMIN_HELP_GROUPS]}]
+    sections.append({"type": "note", "text": "※ 可以接著追問（例如「那它的壓力在哪」「跟聯發科比呢」）；輸入「重新開始」清除上一題。"
+                                             "現股籌碼、權證分點依會員身分開放。"})
+    return {"branch": "指令表", "tags": ["艾斯 AI"], "label": "使用說明", "sections": sections}
+
+
+def help_result(started: float, admin: bool = False) -> "AnswerResult":
+    return AnswerResult(text=ADMIN_HELP_MESSAGE if admin else HELP_MESSAGE, route="admin_help" if admin else "help",
+                        gemini_calls=0, elapsed=time.perf_counter() - started, image_title="指令表",
+                        panels=[{"branch_card": help_card(admin), "hide_text": True}])
+
+
 PLANNER_TOOLS = (
     "get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_warrant_branch",
     "get_high_winrate_branches_buying", "get_branch_performance", "get_branch_recent_trades",
@@ -713,11 +760,17 @@ def _direction(latest: float, sum5: float, sum20: float) -> str:
     return "一致偏買" if signs == {1} else "一致偏賣" if signs == {-1} else "短中期分歧"
 
 
-def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
-    """三大法人圖卡：只問單一法人時以該法人為主；數字格＋近 20 日柱狀圖＋1～3 行規則式重點（不另呼叫 Gemini）。"""
-    investors = {x["investor"]: x for x in data.get("investors") or []}
+def institutional_focus(question: str, data: Dict[str, Any]) -> str:
+    """問句只提到一個法人（外資／投信／自營）且不是問三大法人時，回傳該法人名稱。"""
+    investors = {x["investor"] for x in data.get("investors") or []}
     asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
-    focus = asked[0] if len(asked) == 1 and "三大法人" not in str(question) and asked[0] in investors else ""
+    return asked[0] if len(asked) == 1 and "三大法人" not in str(question) and asked[0] in investors else ""
+
+
+def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+    """三大法人圖卡：只問單一法人時以該法人為主；數字格＋1～3 行規則式重點（每日柱與累積線畫在 K 線下方、日期對齊）。"""
+    investors = {x["investor"]: x for x in data.get("investors") or []}
+    focus = institutional_focus(question, data)
     rows = list(data.get("rows") or [])[-20:]
     if focus:
         who, info, key = focus, investors[focus], _INVESTOR_KEYS[focus]
@@ -753,10 +806,6 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
             {"label": "合計近 20 日", "value": _signed_lots(sum20), "tone": "signed"},
             {"label": "連續", "value": _streak_text(streak), "tone": "ink"},
             {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]})
-    if len(series) >= 5:
-        sections.append({"type": "vbars", "title": f"近 {len(series)} 日{who}買賣超（張）",
-                         "items": [{"label": str(r.get("date", ""))[5:], "value": v, "text": _signed_lots(v)}
-                                   for r, v in zip(rows, series)]})
     word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
     points = [f"{who}今日{word(latest)} {abs(latest):,.0f} 張" + (f"，{_streak_text(streak)}。" if streak else "。"),
               f"近 5 日累積{word(sum5)} {abs(sum5):,.0f} 張，近 20 日累積{word(sum20)} {abs(sum20):,.0f} 張"
@@ -765,6 +814,37 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
     sections.append({"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
     return {"branch": name, "tags": [focus or "三大法人"], "label": "法人籌碼", "sections": sections}
+
+
+def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
+    """某分點在某檔股票的全部 A～E 事件（不限 K 線 70 日）：新到舊，每筆列金額、權證、狀態。
+    numbers＝{事件日: K 線上的編號}：K 線範圍內的事件在前面加上和圖上相同的圈號。"""
+    numbers = numbers or {}
+    events = list(reversed(data.get("all_events") or []))
+    if not events:
+        return None
+    holding = sum(1 for e in events if not str(e.get("state", "")).startswith("出清"))
+    tiles = [{"label": "事件總數", "value": f"{len(events)} 筆", "tone": "ink"},
+             {"label": "未出清", "value": f"{holding} 筆", "tone": "accent"},
+             {"label": "已出清", "value": f"{len(events) - holding} 筆", "tone": "ink"}]
+    if data.get("avg_holding_days") is not None:
+        tiles.append({"label": "平均持有", "value": f"{float(data['avg_holding_days']):.0f} 天", "tone": "ink"})
+    rows = []
+    for e in events:
+        warrants = e.get("warrants") or []
+        warrant_text = "、".join(warrants[:3]) + (f" 等 {len(warrants)} 檔" if len(warrants) > 3 else "")
+        state = str(e.get("state") or "")
+        if state.startswith("出清") and e.get("result_return_pct") is not None:
+            state += f"（{float(e['result_return_pct']):+.1f}%）"
+        no = numbers.get(str(e.get("date") or ""))
+        mark = (chr(0x2460 + no - 1) if 1 <= no <= 20 else f"#{no}") + " " if no else ""
+        rows.append({"lead": f"{mark}{e.get('date', '')}｜{e.get('event', '')}",
+                     "parts": [p for p in (str(e.get("buy_amount_text") or ""), warrant_text, state) if p]})
+    name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
+    return {"branch": f"{data.get('branch', '')}｜{name}", "tags": ["全部 A～E 事件"], "label": "權證分點", "sections": [
+        {"type": "tiles", "items": tiles},
+        {"type": "rows", "items": rows},
+        {"type": "note", "text": "※ 列出此分點在這檔股票的所有 A～E 事件（新到舊）；K 線只涵蓋近 70 個交易日，圈號＝K 線上的標記編號。"}]}
 
 
 def warrant_summary_card(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3127,6 +3207,28 @@ _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "b
 # 同時問型態／技術／操作＋籌碼 → 型態分析頁加「籌碼重點」
 _PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|走勢|K線|策略|均線|支撐|壓力")
 # 三大法人：問「怎麼看／分析／搭配技術面」才交給 AI；只問數字（買超多少、近 5 日）直接排版，0 次 Gemini
+# 分點×個股：問「完整／全部／所有／半年／180」時，K 線拉長到涵蓋該分點在這檔的所有事件（最多回推 180 個日曆日）
+_FULL_MARKS_RE = re.compile(r"完整|全部|所有|半年|180")
+FULL_MARKS_MAX_CALENDAR_DAYS = 180
+
+
+def branch_event_lookback(branch_name: str, stock_code: str, today: Optional[datetime] = None) -> int:
+    """K 線要畫幾根，才能把「分點在這檔股票的所有事件」標在圖上：第一筆事件前 5 天起算，
+    最多回推 180 個日曆日（約 120 個交易日），最少 70 根（和一般 K 線一樣）。查不到事件回 0＝用預設。"""
+    import pandas as pd
+    canonical, _ = tools.resolve_branch(branch_name)
+    if not canonical:
+        return 0
+    events = tools.load_abcde_event_rows()["events"]
+    mine = events[(events["branch"] == canonical) & (events["stock_code"] == str(stock_code))]
+    if mine.empty:
+        return 0
+    now = pd.Timestamp(today or tools.taipei_now()).tz_localize(None).normalize()
+    start = max(pd.Timestamp(mine["event_date"].min()) - pd.Timedelta(days=5),
+                now - pd.Timedelta(days=FULL_MARKS_MAX_CALENDAR_DAYS))
+    return max(70, len(pd.bdate_range(start, now)))
+
+
 _INSTITUTIONAL_ANALYSIS_RE = re.compile(r"怎麼看|怎麼樣|分析|技術|型態|搭配|一起|走勢|支撐|壓力|操作|看法|解讀|為什麼|原因|影響|建議")
 # 只問最新一天的現股分點（不 backfill 70 日）
 _SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
@@ -3352,6 +3454,8 @@ class AceQueryEngine:
             self.memory.clear(context_key)
             self._clear_draft_session(context_key)
             return AnswerResult(text=MEMORY_RESET_MESSAGE, route="memory_reset", gemini_calls=0, elapsed=0.0, image_title="重新開始")
+        if is_help_question(question):
+            return help_result(started, admin=self._show_admin_help(admin_mode))
         # MoneyDJ 只允許管理員明確要求備援圖片；一般問答／週精選不會自動碰 MoneyDJ。
         if weekly_pick.is_admin_moneydj_image_question(question):
             if not (is_admin and admin_mode):
@@ -3716,11 +3820,16 @@ class AceQueryEngine:
 
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
     TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
-                   "admin_help", "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
+                   "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
                    "admin_usage", "admin_errors"}
 
     def _access(self):
         return getattr(getattr(self, "_request_local", None), "access", None)
+
+    def _show_admin_help(self, admin_mode: bool) -> bool:
+        """指令表的管理員分組只給「真的管理員、非模擬」看：/ace 測試（模擬會員，結果公開在頻道）一律用會員版。"""
+        access = self._access()
+        return bool(admin_mode) and not (access is not None and access.simulation)
 
     def _perf_add(self, stage: str, seconds: float) -> None:
         perf = getattr(getattr(self, "_request_local", None), "perf", None)
@@ -3935,8 +4044,7 @@ class AceQueryEngine:
         """管理員維護指令：更新市場底庫／更新族群名冊／系統狀態。找不到對應指令時回 None。"""
         compact = re.sub(r"\s+", "", question)
         if compact in ("說明", "help", "HELP", "指令", "使用說明"):
-            return AnswerResult(text=ADMIN_HELP_MESSAGE, route="admin_help", gemini_calls=0,
-                                elapsed=time.perf_counter()-started, cacheable=False)
+            return help_result(started, admin=self._show_admin_help(True))
         if compact in ("目前草稿", "現在草稿", "看草稿"):
             session = self._load_draft_session(context_key)
             text = str((session or {}).get("draft") or "")
@@ -4351,6 +4459,8 @@ class AceQueryEngine:
             f"tools={[c.name + json.dumps(c.kwargs, ensure_ascii=False) for c in plan.tool_calls]}"
         )
         if plan.clarification:
+            if plan.route == "help":   # 看不懂的問題：回同一張指令表
+                return replace(help_result(started), gemini_calls=stats.gemini_calls)
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
         if "institutional" in parsed.intents and plan.route not in ("rule_sector", "rule_institutional"):
             planned = {(c.name, c.kwargs.get("stock_code")) for c in plan.tool_calls}
@@ -4390,8 +4500,17 @@ class AceQueryEngine:
         # 一般問答的權證圖一律用同一種版型（編號＋分點明細表），不再依問法在兩種版型之間跳。
         mark_mode = ASK_MARK_MODE
         chart_calls = []
+        lookback = 0
+        if plan.route == "rule_branch_stock" and chart_branch and codes and _FULL_MARKS_RE.search(question):
+            try:
+                lookback = branch_event_lookback(chart_branch, codes[0])
+                self.log(f"完整點位：K 線拉長到 {lookback} 根（涵蓋 {chart_branch} 在 {codes[0]} 的事件，最多回推 180 天）")
+            except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
+                self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
         for c in codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
+            if lookback:
+                kwargs["lookback"] = lookback
             if chart_branch:
                 kwargs["branch_name"] = chart_branch
             if light or plan.route == "rule_pattern" or not warrant_visual_query:
@@ -4419,7 +4538,19 @@ class AceQueryEngine:
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
             if flow:
                 panels.append({"branch_card": institutional_card(flow, question), "hide_text": True})
-        if "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
+        if plan.route == "rule_branch_stock" and warrant_ok:
+            history = next((r.data for r in results if r.ok and r.name == "get_branch_stock_history"), None)
+            chart_panel = next((p for p in panels if p.get("stock_code") and p.get("bars")), None)
+            numbers: Dict[str, int] = {}
+            for mark in answer_image._mark_events(chart_panel) if chart_panel else []:
+                if mark.get("no") and mark.get("buy_date"):
+                    numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
+            card = branch_stock_events_card(history, numbers) if history else None
+            if card:
+                panels.append({"branch_card": card})
+                if chart_panel:
+                    chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
+        elif "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
             chips = next((r.data for r in results if r.ok and r.name == "get_sheet_stock_chips"), None)
             summary = warrant_summary_card(chips) if chips else None
             if summary:
@@ -4432,9 +4563,12 @@ class AceQueryEngine:
         for panel in panels:
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"
                          and r.data.get("stock_code") == panel.get("stock_code")), None)
-            if flow and panel.get("bars") and plan.route != "rule_institutional":
+            if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
+                focus = institutional_focus(question, flow)
+                if focus:
+                    panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
@@ -4480,6 +4614,10 @@ class AceQueryEngine:
             text = notice + chr(10) + chr(10) + text
             if ai_card:
                 ai_card["notice"] = notice
+        if ai_card and any(p.get("branch_card", {}).get("tags") == ["全部 A～E 事件"] for p in panels):
+            # 下方已有完整事件清單：AI 解讀只留一句回答、一個理由、一句總結，圖片不會太長
+            first = re.split(r"(?<=[。！？])", str(ai_card.get("why") or ""), maxsplit=1)[0]
+            ai_card = dict(ai_card, why=first, scenarios=[])
         if ai_card:
             panels.append({"ai_card": ai_card})
         elapsed = time.perf_counter() - started

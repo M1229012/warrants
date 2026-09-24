@@ -236,7 +236,8 @@ def _mark_events(panel: dict) -> list[dict]:
 
 
 def _has_mark_section(panel: dict) -> bool:
-    return bool((panel or {}).get('bars')) and bool(_mark_events(panel)) and not (panel or {}).get('compact')
+    return (bool((panel or {}).get('bars')) and bool(_mark_events(panel)) and not (panel or {}).get('compact')
+            and not (panel or {}).get('hide_mark_table'))   # 下方另有完整事件清單時，K 線下不再畫只有 70 日的標註表
 
 
 def _mark_action(e: dict) -> tuple[str, str]:
@@ -528,7 +529,7 @@ TRADE_COLOR = '#6D28D9'
 TRADE_LEGEND_H = 46
 # 三大法人買賣超面板（照週報主程式 plot_institutional_stacked_bars 的配色與堆疊方式）
 INST_COLORS = (('foreign', '外資', '#7CB5EC'), ('invest', '投信', '#F59E0B'), ('dealer', '自營商', '#9CA3AF'))
-INST_BLOCK_H = 250
+INST_BLOCK_H = 290
 
 
 def _inst_height(panel: dict) -> int:
@@ -570,50 +571,83 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
     return buys, sells
 
 
-def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list) -> None:
-    """三大法人買賣超：正負堆疊柱（單位張），金色虛線零軸，表頭顯示最新一日各法人與合計。"""
+def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
+                       focus: str = '') -> None:
+    """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
+    右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
-    text_at(draw, (left, top + 6), '三大法人買賣超', 22, INK, True)
+    series = [c for c in INST_COLORS if c[0] == focus] or list(INST_COLORS)
+    single = len(series) == 1
+    title = f'{series[0][1]}買賣超' if single else '三大法人買賣超'
+    text_at(draw, (left, top + 6), title, 22, INK, True)
     last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
-    lx = left + font(22, True).getlength('三大法人買賣超') + 28
-    total = 0.0
-    for key, label, color in INST_COLORS:
+    lx = left + font(22, True).getlength(title) + 28
+    for key, label, color in series:
         value = float(last.get(key) or 0)
-        total += value
-        draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
-        text = f'{label} {value:+,.0f}張'
+        if single:
+            draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
+            draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
+        else:
+            draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
+        text = f'{"今日" if single else label} {value:+,.0f}張'
         draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
         lx += 22 + font(19).getlength(text) + 22
-    draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=ACCENT)
-    draw.text((lx + 22, top + 20), f'合計 {total:+,.0f}張', font=font(19, True), fill=INK, anchor='lm')
-    ctop, cbottom = top + 48, top + INST_BLOCK_H - 22
+    daily = [None if bar['date'] not in by_date else sum(float(by_date[bar['date']].get(k) or 0) for k, *_ in series)
+             for bar in bars]
+    cums, running = [], 0.0
+    for value in daily:
+        if value is not None:
+            running += value
+        cums.append(running if any(v is not None for v in daily[:len(cums) + 1]) else None)
+    draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
+    draw.text((lx + 30, top + 20), f'累積 {running:+,.0f}張', font=font(19, True), fill=INK, anchor='lm')
+    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
     mid = (ctop + cbottom) / 2
-    values = [abs(float(r.get(k) or 0)) for r in rows for k, *_ in INST_COLORS]
+    half_h = (cbottom - ctop) / 2
+    ticks = _date_ticks(bars, step)
+    for i in ticks:
+        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
     pos_neg = []
-    for r in rows:
-        pos = sum(max(0.0, float(r.get(k) or 0)) for k, *_ in INST_COLORS)
-        neg = sum(min(0.0, float(r.get(k) or 0)) for k, *_ in INST_COLORS)
-        pos_neg += [pos, -neg]
-    peak = max(pos_neg + values + [1.0]) * 1.35
-    scale = (cbottom - ctop) / 2 / peak
+    for bar in bars:
+        row = by_date.get(bar['date']) or {}
+        pos_neg += [sum(max(0.0, float(row.get(k) or 0)) for k, *_ in series),
+                    -sum(min(0.0, float(row.get(k) or 0)) for k, *_ in series)]
+    peak = max(pos_neg + [1.0]) * 1.15
+    scale = half_h / peak
     for i, bar in enumerate(bars):
         row = by_date.get(bar['date'])
         if not row:
             continue
-        x, half = px(i), max(1, step * .36)
+        x, half = px(i), max(1, step * .34)
         up, down = mid, mid
-        for key, _, color in INST_COLORS:
+        for key, _, color in series:
             value = float(row.get(key) or 0)
+            fill = (UP if value > 0 else DOWN) if single else color
             if value > 0:
-                draw.rectangle((x - half, up - value * scale, x + half, up), fill=color)
+                draw.rectangle((x - half, up - value * scale, x + half, up), fill=fill)
                 up -= value * scale
             elif value < 0:
-                draw.rectangle((x - half, down, x + half, down - value * scale), fill=color)
+                draw.rectangle((x - half, down, x + half, down - value * scale), fill=fill)
                 down -= value * scale
     for sx in range(int(left), int(right), 12):
-        draw.line((sx, mid, min(sx + 6, right), mid), fill=ACCENT, width=1)
-    for value, yy in ((peak / 1.35, mid - peak / 1.35 * scale), (0, mid), (-peak / 1.35, mid + peak / 1.35 * scale)):
-        text_at(draw, (right + 14, yy - 10), f'{value:+,.0f}張' if value else '0', 18, MUTED)
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
+    cum_peak = max([abs(v) for v in cums if v is not None] + [1.0]) * 1.15
+    points = [(px(i), mid - v / cum_peak * half_h) for i, v in enumerate(cums) if v is not None]
+    if len(points) > 1:
+        draw.line(points, fill=ACCENT, width=3)
+    if points:
+        ex, ey = points[-1]
+        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+    edge = half_h / 1.15
+    for sign, yy in ((1, mid - edge), (-1, mid + edge)):
+        text_at(draw, (right + 10, yy - 22), f'{sign * peak / 1.15:+,.0f}', 16, MUTED)
+        text_at(draw, (right + 10, yy - 2), f'{sign * cum_peak / 1.15:+,.0f}', 16, ACCENT)
+    text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
+    axis_y = cbottom + 4
+    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
+    for i in ticks:
+        label_x = max(left + 26, min(px(i), right - 26))
+        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
 
 def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
@@ -1045,7 +1079,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         text_at(draw, (left, vbottom + 54 + i * 28), line, 20, INK)
     below = y + CHART_HEIGHT + extra
     if panel.get('institutional'):
-        draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'])
+        draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'],
+                           panel.get('institutional_focus', ''))
         below += INST_BLOCK_H
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
@@ -2348,7 +2383,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
     if kind == 'rows':
         # 一行一格的淺底資料列：前段（名稱）粗體、後段各項用「｜」分隔；數字正負用紅綠
         total = 0
-        lead_w = min(width * 0.30, max([font(23, True).getlength(r.get('lead', '')) for r in section.get('items') or []] + [0]) + 28)
+        lead_w = min(width * 0.30, max([font(23, True).getlength(r.get('lead', '')) for r in section.get('items') or []] + [0]) + 46)
         for item in section.get('items') or []:
             body = '｜'.join(item.get('parts') or [])
             lines = wrap(body, 23, width - lead_w - 40, False) if body else ['']
