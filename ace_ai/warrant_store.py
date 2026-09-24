@@ -76,13 +76,21 @@ def _float(value: Any) -> Optional[float]:
     return number if number == number else None
 
 
+_TABLES_READY = ""   # 已建表的資料庫路徑（測試會換路徑）
+
+
 def _query(sql: str, params: tuple = ()) -> List[tuple]:
     """讀取失敗丟 local_market_cache.DBError（查無＝空清單）。"""
+    global _TABLES_READY
     try:
-        with local_market_cache._LOCK:
-            with local_market_cache._db() as conn:
-                _ensure_tables(conn)
-                return conn.execute(sql, params).fetchall()
+        if _TABLES_READY != str(local_market_cache.DB_PATH):
+            with local_market_cache._LOCK:
+                with local_market_cache._db() as conn:
+                    _ensure_tables(conn)
+                    conn.commit()
+            _TABLES_READY = str(local_market_cache.DB_PATH)
+        with local_market_cache._db() as conn:
+            return conn.execute(sql, params).fetchall()
     except Exception as exc:
         raise local_market_cache.DBError(f"{type(exc).__name__}: {exc}") from exc
 

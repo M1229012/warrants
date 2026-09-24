@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import json
 import io
 import math
@@ -1452,7 +1453,33 @@ class GeminiGateway:
                 _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
         return None
 
+    DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
+
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
+        """整體時限 DEADLINE 秒：超過就回失敗（呼叫端改用規則式內容），不讓一題卡在 Gemini 重試上。
+        逾時的那次呼叫在背景跑完後丟棄。"""
+        if not self.DEADLINE:
+            return self._generate(prompt, purpose, schema, temperature)
+        request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
+        box: Dict[str, GeminiResult] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                with tools.api_request_scope(request_id):
+                    box["result"] = self._generate(prompt, purpose, schema, temperature)
+            except Exception as exc:
+                box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
+            finally:
+                done.set()
+        threading.Thread(target=run, name="ace-gemini", daemon=True).start()
+        if not done.wait(self.DEADLINE):
+            self.log(f"Gemini 超過 {self.DEADLINE:.0f} 秒，改用規則式內容：{purpose}")
+            tools.record_api_event("Gemini", status=504, latency=self.DEADLINE, detail=purpose)
+            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose)
+        return box["result"]
+
+    def _generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         if not self._quota_left():
             self.log(f"Gemini 今日次數已達上限 {self.DAILY_LIMIT}，改用規則式輸出：{purpose}")
             return GeminiResult(ok=False, text="", error="daily_limit")
@@ -2896,6 +2923,10 @@ class AnswerStats:
             self.token_source = result.token_source
 
 
+# 每一題的圖片產生秒數（Discord handler 所在的 asyncio task 內累加，併進 PERF 行）
+render_seconds: "contextvars.ContextVar[float]" = contextvars.ContextVar("ace_render_seconds", default=0.0)
+
+
 @dataclass
 class AnswerResult:
     text: str
@@ -2920,6 +2951,7 @@ class AnswerResult:
     errors: List[str] = field(default_factory=list)   # 這題失敗的工具／Gemini（管理員錯誤通知用）
     followups: List["AnswerResult"] = field(default_factory=list)   # 「兩種一起看」：第二張圖（權證分點籌碼）
     denial_followups: List[str] = field(default_factory=list)       # 「兩種一起看」但缺一邊權限：另送鎖定卡（SPOT／WARRANT）
+    timings: Dict[str, float] = field(default_factory=dict)          # 各階段耗時（PERF log 用）
 
 
 # ============================================================
@@ -3241,11 +3273,13 @@ class AceQueryEngine:
         if radar:
             return self._answer_radar(radar["direction"], started, route="rule_radar", scope=radar.get("scope", "all"),
                                       view=radar.get("view", "all"))
+        router_started = time.perf_counter()
         try:
             parsed = self.parser.parse(question, access=self._access())
         except tools.ToolDataError as exc:
             self.log(f"問題解析失敗：{exc}")
             return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
+        self._perf_add("router", time.perf_counter() - router_started)
         note = self.memory.resolve(context_key, parsed)
         remembered = self.memory.get(context_key)
         access = self._access()
@@ -3368,7 +3402,9 @@ class AceQueryEngine:
         code = next(c for c, _ in parsed.stocks if c not in tools.INDEX_CODES)
         try:
             # quick：只等最近完整日幾秒，70 日歷史交給背景補；圖上標「歷史 x / 70」，不讓整合頁卡 20～60 秒
-            report = spot_chip.build_report(code, "quick")
+            access = self._access()
+            report = spot_chip.build_report(code, "quick", record=not (access and access.simulation))
+            self._spot_timing(report)
         except Exception as exc:
             self.log(f"籌碼重點略過：{type(exc).__name__}: {exc}")
             return None, None
@@ -3382,8 +3418,14 @@ class AceQueryEngine:
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
         access_policy.require_chip(self._access(), "warrant")
         warrant_parsed = replace(parsed, intents=set(parsed.intents) | {"warrant"}, chip="warrant")
+        warrant_started = time.perf_counter()
         result = self._answer_uncached(f"{question}（權證分點籌碼）", started, warrant_parsed)
+        self._perf_add("warrant", time.perf_counter() - warrant_started)
         return replace(result, image_title=self._chip_title(parsed, "權證分點籌碼"))
+
+    def _spot_timing(self, report: Dict[str, Any]) -> None:
+        for stage, seconds in (report.get("timing") or {}).items():
+            self._perf_add(stage, seconds)
 
     def _spot_result(self, card: Dict[str, Any], title: str, ok: bool, started: float, text: str) -> AnswerResult:
         return AnswerResult(text=text, route="rule_spot_chip", gemini_calls=0, elapsed=time.perf_counter() - started,
@@ -3423,8 +3465,11 @@ class AceQueryEngine:
             return self._answer_spot_branch(code, name, branch, question, started)
         mode = "latest" if _SPOT_LATEST_RE.search(question) else "full"
         simulation = bool(access and access.simulation)
-        dates, _ = spot_chip.candidate_dates()
+        prepare_started = time.perf_counter()
+        calendar = spot_chip.candidate_dates()
+        dates = calendar[0]
         statuses = local_market_cache.spot_day_status(code, dates)
+        self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
         key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}")
@@ -3432,7 +3477,8 @@ class AceQueryEngine:
             hit, cached = self._answer_cache.get(key)
             if hit:
                 return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
-        report = spot_chip.build_report(code, mode)
+        report = spot_chip.build_report(code, mode, calendar=calendar, record=not simulation)   # /ace 測試不計入查詢次數
+        self._spot_timing(report)
         latest = report.get("latest_complete_date")
         if not latest:
             if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
@@ -3448,7 +3494,11 @@ class AceQueryEngine:
         result = self._spot_result(card, title, True, started, text)
         full = mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
         if full and not simulation:
-            complete_now = [d for d in dates if (local_market_cache.spot_day_status(code, [d]).get(d) or {}).get("status") == "complete"]
+            # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
+            complete_now = (list(report["complete_all"]) if "complete_all" in report else
+                            [d for d, info in local_market_cache.spot_day_status(code, dates).items()
+                             if (info or {}).get("status") == "complete"])
+            complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
                 f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}"), result,
                 self.config.answer_cache_seconds)
@@ -3459,7 +3509,8 @@ class AceQueryEngine:
         access = self._access()
         simulation = bool(access and access.simulation)
         title = f"{code} {name}｜{branch} 現股分點".strip()
-        dates, _ = spot_chip.candidate_dates()
+        calendar = spot_chip.candidate_dates()
+        dates = calendar[0]
 
         def cache_key() -> str:
             statuses = local_market_cache.spot_day_status(code, dates)
@@ -3470,7 +3521,8 @@ class AceQueryEngine:
             hit, cached = self._answer_cache.get(cache_key())
             if hit:
                 return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
-        report = spot_chip.build_report(code, "full")
+        report = spot_chip.build_report(code, "full", calendar=calendar, record=not simulation)
+        self._spot_timing(report)
         if not report.get("latest_complete_date"):
             if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
                 card = spot_chip.message_card(f"{code} {name}", "現股分點資料暫時無法取得",
@@ -3517,6 +3569,11 @@ class AceQueryEngine:
     def _access(self):
         return getattr(getattr(self, "_request_local", None), "access", None)
 
+    def _perf_add(self, stage: str, seconds: float) -> None:
+        perf = getattr(getattr(self, "_request_local", None), "perf", None)
+        if perf is not None:
+            perf[stage] = perf.get(stage, 0.0) + max(0.0, float(seconds or 0))
+
     def _warrant_entitled(self):
         access = self._access()
         return access is None or access.entitlement.warrant
@@ -3537,10 +3594,13 @@ class AceQueryEngine:
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
+        self._request_local.perf = perf = {}
+        permission_started = time.perf_counter()
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
         except access_policy.AccessDenied as exc:
             return self._denied_result(exc)
+        perf["permission"] = time.perf_counter() - permission_started
         if access is not None:
             is_admin = admin_mode = access.admin_mode
             context_key = access.memory_key(context_key)
@@ -3567,7 +3627,8 @@ class AceQueryEngine:
                   f"（in {result.input_tokens:,} / out {result.output_tokens:,} / {result.token_source}）｜"
                   f"API {usage}", flush=True)
             return replace(result, request_id=request_id, api_usage=usage,
-                           as_text=result.as_text or result.route in self.TEXT_ROUTES)
+                           as_text=result.as_text or result.route in self.TEXT_ROUTES,
+                           timings={k: round(v, 2) for k, v in perf.items() if v >= 0.005})
         finally:
             self._request_local.request_id = ""
             self._request_local.access = None
@@ -4361,7 +4422,9 @@ class AceQueryEngine:
         cancel_event = threading.Event()
         request_id = str(getattr(self._request_local, "request_id", "") or "")
         futures = [(call, self.executor.submit(tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
+        tools_started = time.perf_counter()
         done, _ = wait([f for _, f in futures], timeout=self.config.tool_timeout_seconds)
+        self._perf_add("tools", time.perf_counter() - tools_started)
         results: List[tools.ToolResult] = []
         for call, future in futures:
             if future in done:
@@ -4426,7 +4489,9 @@ class AceQueryEngine:
         payload = build_final_payload(question, results)
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
+        gemini_started = time.perf_counter()
         result = self.gateway.generate(prompt, purpose="final_answer", schema=AI_CARD_SCHEMA, temperature=0.3)
+        self._perf_add("gemini", time.perf_counter() - gemini_started)
         stats.record_gemini(result)
         if not result.ok:
             self.log(f"最終回答 Gemini 失敗：{result.error}")
@@ -4723,6 +4788,10 @@ def _startup_warmup() -> None:
     except Exception as exc:
         print(f"⚠️ 預熱：分點清單失敗｜{type(exc).__name__}: {exc}", flush=True)
     try:
+        spot_chip.known_branch_names()   # 現股分點名單先載好，第一個會員問題不用等 SELECT DISTINCT
+    except Exception as exc:
+        print(f"⚠️ 預熱：現股分點名單失敗｜{type(exc).__name__}: {exc}", flush=True)
+    try:
         catalog = sector_analysis.cmoney_catalog.get_catalog()
         print(f"🔥 預熱：CMoney 細產業／概念 {len(catalog.get('groups') or {}):,} 類", flush=True)
     except Exception as exc:
@@ -4946,6 +5015,11 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                 local_market_cache.daily_maintenance(today)
             if int(market_data.coverage().get("days") or 0) >= 20:
                 market_scan.score_pending(budget_seconds=MARKET_SCORE_BUDGET)
+            # 夜間（預設 22:00～08:30）先建好熱門股的 70 日現股分點；只用富邦分點頁，不佔 FinMind／富果額度
+            try:
+                spot_chip.prewarm_tick(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
+            except Exception as exc:
+                print(f"⚠️ 現股分點夜間預建略過｜{type(exc).__name__}: {exc}", flush=True)
         except Exception as exc:
             print(f"⚠️ 市場底庫背景維護失敗｜{type(exc).__name__}: {exc}", flush=True)
         if stop.wait(300):
@@ -5074,8 +5148,7 @@ def run_discord_bot(config: BotConfig) -> None:
             images = [await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
                       "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)]
         render_elapsed = asyncio.get_running_loop().time() - render_started
-        total_bytes = sum(len(data) for data, _ in images)
-        print(f"🖼️ 圖片產生完成｜張數={len(images)}｜render={render_elapsed:.2f}s｜大小={total_bytes/1024:.1f}KB", flush=True)
+        render_seconds.set(render_seconds.get() + render_elapsed)   # 併入該題的 PERF 行，不另印一行
         return [
             discord.File(io.BytesIO(data), filename=f"ace-answer-{i}.{extension}" if len(images) > 1 else f"ace-answer.{extension}")
             for i, (data, extension) in enumerate(images, 1)
@@ -5247,6 +5320,7 @@ def run_discord_bot(config: BotConfig) -> None:
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
+            render_seconds.set(0.0)
             if not ephemeral and not is_public_answer(result):
                 await send_private(image_question, with_context_note(result), result.panels, result.as_text)
             elif result.as_text:
@@ -5266,9 +5340,12 @@ def run_discord_bot(config: BotConfig) -> None:
             if reason:
                 queue_admin_alert(client, config, reason[0], reason[1], user=who, question=question,
                                   route=result.route, request_id=result.request_id)
+            render_elapsed = render_seconds.get()
+            stages = "".join(f"｜{k}={v:.2f}" for k, v in result.timings.items())
             print(
-                f"📊 REQUEST METRICS｜id={result.request_id}｜route={result.route}｜compute={result.elapsed:.2f}s｜"
-                f"render+upload={upload_elapsed:.2f}s｜end_to_end={total_elapsed:.2f}s｜cache={result.cache_hit}｜"
+                f"PERF｜id={result.request_id}｜route={result.route}{stages}｜compute={result.elapsed:.2f}｜"
+                f"render={render_elapsed:.2f}｜discord_upload={max(0.0, upload_elapsed - render_elapsed):.2f}｜"
+                f"total={total_elapsed:.2f}｜cache={result.cache_hit}｜"
                 f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
                 f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
@@ -5404,13 +5481,17 @@ def run_discord_bot(config: BotConfig) -> None:
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
+            render_seconds.set(0.0)
             await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
+            render_elapsed = render_seconds.get()
+            stages = "".join(f"｜{k}={v:.2f}" for k, v in result.timings.items())
             print(
-                f"📊 REQUEST METRICS｜id={result.request_id}｜route={result.route}｜compute={result.elapsed:.2f}s｜"
-                f"render+upload={upload_elapsed:.2f}s｜end_to_end={total_elapsed:.2f}s｜cache={result.cache_hit}｜"
+                f"PERF｜id={result.request_id}｜route={result.route}{stages}｜compute={result.elapsed:.2f}｜"
+                f"render={render_elapsed:.2f}｜discord_upload={max(0.0, upload_elapsed - render_elapsed):.2f}｜"
+                f"total={total_elapsed:.2f}｜cache={result.cache_hit}｜"
                 f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
                 f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
