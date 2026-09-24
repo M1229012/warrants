@@ -845,9 +845,13 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
                          "accent": ("剩餘張數", "剩餘%", "槓桿"), "rows": rows})
     hidden = len(d.get("hidden_stocks") or []) + max(0, len(d.get("groups") or []) - 3)
     tail = f"另有 {hidden} 檔標的未列出，可問「{d.get('branch')} 代號 買哪些權證」。" if hidden else ""
+    if d.get("other_warrants"):
+        tail += f"另有 {d['other_warrants']} 檔未達事件門檻的零星買進未列出。"
+    if d.get("store_missing"):
+        tail += f"{'、'.join(d['store_missing'][:3])} 張數依事件表。"
     if d.get("near_expiry_holdings"):
         tail += f"快到期仍持有：{'、'.join(x.split(' ')[0] for x in d['near_expiry_holdings'][:3])}。"
-    sections.append({"type": "note", "text": f"※ 天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算。{tail}"})
+    sections.append({"type": "note", "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算。{tail}"})
     return sections
 
 

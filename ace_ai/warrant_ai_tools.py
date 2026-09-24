@@ -4457,6 +4457,12 @@ def _branch_positions(canonical: str) -> Optional[Dict[str, Any]]:
         events = load_abcde_event_rows()["events"]
     except ToolDataError:
         events = pd.DataFrame()
+    # Sheet A～E 事件的權證清單：權證代號 → 標的（新掛牌權證名稱表還沒有時的最後備援，新事件優先）
+    event_stock: Dict[str, str] = {}
+    if not events.empty:
+        for _, row in events[events["branch"] == canonical].sort_values("event_date").iterrows():
+            for wcode, _ in _warrant_items(row):
+                event_stock[wcode] = row["stock_code"]
     if cutoff is not None and not events.empty:
         gap = events[(events["branch"] == canonical) & (events["event_date"] > cutoff)]
         for _, row in gap.iterrows():
@@ -4483,7 +4489,7 @@ def _branch_positions(canonical: str) -> Optional[Dict[str, Any]]:
             return stock
         info = warrant_names.get(rec["warrant"]) or {}
         return (info.get("stock") or stock_code_by_name.get((metas.get(rec["warrant"]) or {}).get("stock_name", ""), "")
-                or stock_code_by_name.get(info.get("stock_name", ""), ""))
+                or stock_code_by_name.get(info.get("stock_name", ""), "") or event_stock.get(rec["warrant"], ""))
 
     # 權證代號會回收重用：部位以「權證代號＋標的」為單位，避免新舊兩檔權證的張數混在一起
     positions: Dict[str, Dict[str, Any]] = {}
@@ -4729,24 +4735,72 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
     pos, s, e, events = ctx["pos"], ctx["s"], ctx["e"], ctx["events"]
     code = core()._normalize_stock_name_code_key(stock_code) if stock_code else ""
     today = taipei_now().strftime("%Y-%m-%d")
+    # 以 Sheet A～E 事件為準：只列視窗內事件的權證清單（事件的標的、金額、狀態都照 Sheet），
+    # 剩餘張數才用歷史庫 FIFO 對；歷史庫對不到的權證（新掛牌、歷史庫落後）顯示事件表狀態。
+    # 未達事件門檻的零星買進不進表格，只計數寫在註解。
+    import warrant_store
     event_codes: Dict[str, List[str]] = defaultdict(list)       # 每檔權證出現在哪些事件
     stock_events: Dict[str, List[str]] = defaultdict(list)      # 每檔標的的事件（一筆事件只算一次）
-    for _, row in events.iterrows():
-        stock_events[row["stock_code"]].append(row["event_code"])
-        for wcode, _ in _warrant_items(row):
-            event_codes[wcode].append(row["event_code"])
-    bought: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for p in pos["positions"].values():
-        buy_sh, sell_sh, buy_amt, sell_amt, last = _window_sums(p, s, e)
-        if buy_sh <= 0 or (code and p["stock"] != code):
+    event_warrants: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for _, row in events.sort_values("event_date").iterrows():
+        if code and row["stock_code"] != code:
             continue
-        bought[p["stock"]].append({"p": p, "buy_sh": buy_sh, "buy_amt": buy_amt, "last": last})
+        stock_events[row["stock_code"]].append(row["event_code"])
+        max_code = _clean_cell(row.get("max_single_warrant", "")).split(" ")[0]
+        day = _fmt_date(row["event_date"]).replace("/", "-")
+        items = _warrant_items(row)
+        for wcode, wname in items:
+            event_codes[wcode].append(row["event_code"])
+            info = event_warrants.setdefault((row["stock_code"], wcode), {"name": wname, "amount": 0.0, "last": "", "state": "",
+                                                                         "lots": 0.0, "lots_exact": True})
+            # 事件張數只有「單一權證事件」才能歸到這檔；同一筆事件買好幾檔時張數無法拆分
+            if len(items) == 1:
+                info["lots"] += float(row.get("lots") or 0.0)
+            else:
+                info["lots_exact"] = False
+            info["name"] = info["name"] or wname
+            info["last"] = max(info["last"], day)
+            info["state"] = _event_state(row)                     # 依事件日排序，最後一筆事件的狀態為準
+            if wcode == max_code:
+                info["amount"] += float(row.get("max_single_amount") or 0.0)   # 事件表只有最大單筆權證有金額
+    by_code: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for p in pos["positions"].values():
+        by_code[p["warrant"]].append(p)
+    stock_name_map = warrant_store.stock_names()[0]
+    store_missing: List[str] = []
+    bought: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for (stock, wcode), info in event_warrants.items():
+        candidates = by_code.get(wcode, [])
+        p = (next((x for x in candidates if x["stock"] == stock), None)
+             or next((x for x in candidates if not x["stock"]), None)
+             or (candidates[0] if len(candidates) == 1 else None))
+        if p is not None:
+            buy_sh, _, buy_amt, _, _ = _window_sums(p, s, e)
+            p = dict(p, stock=stock, name=p["name"] or info["name"],
+                     stock_name=p["stock_name"] or stock_name_map.get(stock, ""))
+        else:
+            # 歷史庫沒有這檔（新掛牌權證可能還沒被收進歷史庫）：張數改用 Sheet 事件表。
+            # 只有「都是單一權證事件、狀態仍是持有（沒有減碼／出清）」時，事件張數加總就是剩餘張數；否則只顯示狀態。
+            buy_sh, buy_amt = 0.0, 0.0
+            lots = info["lots"] * 1000 if info["lots_exact"] and info["state"] == "持有" else 0.0
+            store_missing.append(wcode)
+            p = {"warrant": wcode, "name": info["name"], "stock": stock, "stock_name": stock_name_map.get(stock, ""),
+                 "remaining": lots, "cycle_bought": lots, "expired": False, "event_only": True,
+                 "meta": warrant_store.meta([wcode]).get(wcode, {})}
+        bought[stock].append({"p": p, "buy_sh": buy_sh, "buy_amt": info["amount"] or buy_amt, "last": info["last"],
+                              "event_state": info["state"]})
+    others: Dict[str, int] = defaultdict(int)                  # 視窗內有買、但不在任何事件清單的零星權證
+    for p in pos["positions"].values():
+        if (p["stock"], p["warrant"]) in event_warrants or p["warrant"] in {w for _, w in event_warrants}:
+            continue
+        if (not code or p["stock"] == code) and _window_sums(p, s, e)[0] > 0:
+            others[p["stock"]] += 1
     order = sorted(bought, key=lambda k: -sum(x["buy_amt"] for x in bought[k]))
     group_limit, warrant_limit = (1, 20) if code else (4, 6)
     habit = {"call": 0, "put": 0, "tenor": [], "money": [], "lev": []}
     groups, hidden, near_expiry = [], [], []
     for index, stock in enumerate(order):
-        items = sorted(bought[stock], key=lambda x: (x["last"], x["buy_amt"]), reverse=True)
+        items = sorted(bought[stock], key=lambda x: (x["buy_amt"], x["last"]), reverse=True)   # 事件金額大的在前
         label = f"{items[0]['p']['stock_name']}（{stock}）" if items[0]["p"]["stock_name"] else stock
         if index >= max(group_limit, 6):
             hidden.append(label)      # 習慣統計只取買進金額前 6 檔標的（每檔要讀一次標的價格）
@@ -4775,7 +4829,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
                 "call": metrics["call"], "event_codes": _event_codes_text(event_codes.get(p["warrant"], [])),
                 "last_buy_date": x["last"].replace("-", "/"), "buy_lots": round(x["buy_sh"] / 1000),
                 "remaining_lots": round(p["remaining"] / 1000) if holding else 0,
-                "remaining_text": (_lots_text(p["remaining"]) if holding else "已到期" if p["expired"] else "已出清"),
+                "remaining_text": (_lots_text(p["remaining"]) if holding else "已到期" if p["expired"]
+                                   else x["event_state"] if p.get("event_only") else "已出清"),
                 "remaining_pct": round(p["remaining"] / p["cycle_bought"] * 100) if holding and p["cycle_bought"] else 0,
                 "days_left": now.get("days"), "tenor_tier": _tier(now.get("days"), 60, 180, "短中長"),
                 "moneyness_now": _num(now.get("money"), 1), "leverage_now": _num(now.get("leverage"), 1),
@@ -4792,7 +4847,7 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
                        "buy_amount_text": _plain_money(sum(x["buy_amt"] for x in items)),
                        "remaining_text": _lots_text(remaining) if remaining else "已全部賣出",
                        "spot": _num(spot_now, 2), "sigma_pct": _num(sigma_now * 100 if sigma_now else None, 0),
-                       "warrant_count": len(rows), "warrants": rows[:warrant_limit]})
+                       "warrant_count": len(rows), "warrants": rows[:warrant_limit], "other_warrants": others.get(stock, 0)})
     median = lambda xs: float(pd.Series(xs).median()) if xs else None
     # Sheet 只抓認購（不抓認售），不顯示認購／認售；改列這段期間買進的權證檔數
     habits = {"warrant_count": sum(len(v) for v in bought.values()),
@@ -4805,8 +4860,10 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         "store_date": pos["store_max"], "data_note": _store_notes(pos),
         "warrant_count": sum(len(v) for v in bought.values()), "groups": groups, "hidden_stocks": hidden,
         "habits": habits, "near_expiry_holdings": near_expiry[:6], "available": bool(groups),
-        "reason": "" if groups else f"近 {days} 個交易日，{canonical}" + (f" 在 {code}" if code else "") + " 沒有買進權證",
-        "data_source": "權證分點歷史庫＋權證基本資料（含已下市）＋標的日K",
+        "other_warrants": int(sum(others.values())),
+        "store_missing": store_missing,     # 歷史庫沒有、張數依 Sheet 事件表的權證
+        "reason": "" if groups else f"近 {days} 個交易日，{canonical}" + (f" 在 {code}" if code else "") + " 沒有 A～E 權證事件",
+        "data_source": "Sheet A～E 事件的權證清單＋權證分點歷史庫（剩餘張數）＋權證基本資料＋標的日K",
         "definition_note": ("天期＝距到期日天數；價內外＝標的價相對履約價；估算槓桿用標的近 60 日歷史波動率套 Black-Scholes，"
                             "不是市場實際隱含波動率；習慣統計用買進當下（最近一次買進日）的數值"),
     }
