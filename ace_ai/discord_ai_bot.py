@@ -2815,7 +2815,23 @@ def format_branch_event_window(d: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_institutional(data: Dict[str, Any]) -> str:
+    """三大法人買賣超（張）：最新一日、近 5 日、近 20 日、連買／連賣天數。"""
+    def lots(value: Any) -> str:
+        value = int(value or 0)
+        return f"{'買超' if value > 0 else '賣超' if value < 0 else '持平'} {abs(value):,} 張"
+    lines = [f"【三大法人】{data.get('stock_name', '')}（{data.get('stock_code', '')}）｜資料日期 {data.get('data_date', '-')}"]
+    for x in data.get("investors") or []:
+        streak = int(x.get("streak_days") or 0)
+        tail = f"｜連買 {streak} 天" if streak > 0 else f"｜連賣 {-streak} 天" if streak < 0 else ""
+        lines.append(f"・{x['investor']}：今日 {lots(x.get('latest_lots'))}｜近 5 日 {lots(x.get('sum_5d_lots'))}"
+                     f"｜近 20 日 {lots(x.get('sum_20d_lots'))}{tail}")
+    lines.append(f"・三大法人合計：今日 {lots(data.get('total_latest_lots'))}｜近 5 日 {lots(data.get('total_5d_lots'))}")
+    return "\n".join(lines)
+
+
 FORMATTERS.update({
+    "get_institutional_flow": format_institutional,
     "get_branch_event_window": format_branch_event_window,
     "get_branch_warrant_detail": format_branch_warrant_detail,
     "get_spot_branch_flow": format_spot_branch_flow,
@@ -2994,7 +3010,9 @@ _SECTOR_ROWS_TTL = 1800
 _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
 # 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
 # 同時問型態／技術／操作＋籌碼 → 型態分析頁加「籌碼重點」
-_PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|怎麼看|走勢|K線|策略|均線|支撐|壓力|強不強|怎麼樣")
+_PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|走勢|K線|策略|均線|支撐|壓力")
+# 三大法人：問「怎麼看／分析／搭配技術面」才交給 AI；只問數字（買超多少、近 5 日）直接排版，0 次 Gemini
+_INSTITUTIONAL_ANALYSIS_RE = re.compile(r"怎麼看|怎麼樣|分析|技術|型態|搭配|一起|走勢|支撐|壓力|操作|看法|解讀|為什麼|原因|影響|建議")
 # 只問最新一天的現股分點（不 backfill 70 日）
 _SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
 _PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
@@ -3341,6 +3359,7 @@ class AceQueryEngine:
             return replace(cached, route="answer_cache", gemini_calls=0, elapsed=time.perf_counter() - started,
                            cache_hit=True, context_note=note)
 
+        self._request_local.spot_partial = False
         with self._queue_lock:
             shared = self._inflight.get(key)
             if shared is None:
@@ -3371,7 +3390,9 @@ class AceQueryEngine:
                 self._pending -= 1
                 self._inflight.pop(key, None)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
-        if result.cacheable and not (self._access() and self._access().simulation):
+        # 現股歷史還沒補完的整合頁不快取：背景補完後下一題要看到完整 70 日，不能拿到舊的 1/70
+        if (result.cacheable and not (self._access() and self._access().simulation)
+                and not getattr(self._request_local, "spot_partial", False)):
             # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
             seconds = self.config.answer_cache_seconds
             if tools.INTRADAY_ENABLE and tools.intraday_session_now():
@@ -3419,6 +3440,8 @@ class AceQueryEngine:
             # quick：只等最近完整日幾秒，70 日歷史交給背景補；圖上標「歷史 x / 70」，不讓整合頁卡 20～60 秒
             report = spot_chip.build_report(code, "quick")
             self._spot_timing(report)
+            self._request_local.spot_partial = (report.get("available_days", 0) < report.get("requested_days", spot_chip.REQUESTED_DAYS)
+                                                or bool((report.get("progress") or {}).get("background")))
         except Exception as exc:
             self.log(f"籌碼重點略過：{type(exc).__name__}: {exc}")
             return None, None
@@ -3506,7 +3529,8 @@ class AceQueryEngine:
                 f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
                 f"賣超 {', '.join(x['branch'] for x in report.get('latest_top_sell') or [])}")
         result = self._spot_result(card, title, True, started, text)
-        full = mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
+        full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
+                and not (report.get("progress") or {}).get("background"))
         if full and not simulation:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
@@ -4182,7 +4206,15 @@ class AceQueryEngine:
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
-        plan = self.router.plan(parsed, stats)
+        stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
+        if ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
+                and stocks_only and len(stocks_only) == len(parsed.stocks) and not parsed.sector
+                and not _INSTITUTIONAL_ANALYSIS_RE.search(question)):
+            plan = QueryPlan(route="rule_institutional", need_final_llm=False)
+            for code in stocks_only:
+                plan.add("get_institutional_flow", stock_code=code)
+        else:
+            plan = self.router.plan(parsed, stats)
         if plan.route == "help":
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
@@ -4203,7 +4235,7 @@ class AceQueryEngine:
         )
         if plan.clarification:
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
-        if "institutional" in parsed.intents and plan.route != "rule_sector":
+        if "institutional" in parsed.intents and plan.route not in ("rule_sector", "rule_institutional"):
             planned = {(c.name, c.kwargs.get("stock_code")) for c in plan.tool_calls}
             for code, _ in parsed.stocks:
                 if code not in tools.INDEX_CODES and ("get_institutional_flow", code) not in planned:
