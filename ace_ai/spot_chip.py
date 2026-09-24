@@ -381,7 +381,7 @@ def _fetch_status(state: str, stock_code: str, date: str, latest_date: str) -> s
 def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None,
-                background: bool = False, gap: Optional[float] = None) -> Dict[str, int]:
+                background: bool = False) -> Dict[str, int]:
     """只補還沒確認的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補（拿到鎖後重讀狀態，
     同一 stock＋date 不會重抓），全域同時最多 MAX_CONCURRENCY。latest_date＝目前最新交易日（查不到資料時判 pending_update）。
     回傳的 remaining 是「重新讀 DB 後仍未確認」的天數（嘗試過≠完成）。bar_dates 保留相容，不再用來判斷停牌。
@@ -440,7 +440,7 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                                 _trip_source()   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
                             elif state["errors"] >= 3:
                                 state["stop"] = True
-                        time.sleep(REQUEST_GAP if gap is None else gap)
+                        time.sleep(REQUEST_GAP)
 
             if workers == 1:
                 work()
@@ -701,7 +701,7 @@ def branch_history(buyers: Sequence[Dict[str, Any]], dates: Sequence[str], compl
 
 def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = None,
                  budget: float = BACKFILL_BUDGET, fetch_source=open_source,
-                 calendar: Optional[Tuple[List[str], str]] = None, record: bool = True) -> Dict[str, Any]:
+                 calendar: Optional[Tuple[List[str], str]] = None) -> Dict[str, Any]:
     """先回答、再背景補歷史：
     mode=full：先確保最近完整日，剩下的同步時間（總上限 SYNC_BUDGET）用 PARALLEL 條連線並行補 70 日，補不完的交給背景；
     mode=quick：只確保最近完整日（總上限 QUICK_BUDGET），歷史全部交給背景；
@@ -711,8 +711,6 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     本地資料庫讀取失敗時丟 local_market_cache.DBError（不當成沒資料去整批重抓）。"""
     now = now or tools.taipei_now()
     t0 = time.perf_counter()
-    if record:
-        local_market_cache.record_spot_query(stock_code, now.strftime("%Y-%m-%d"))
     dates, today_state = calendar if calendar is not None else candidate_dates(now)
     if not dates:
         return {"error": "trading_calendar", "requested_days": REQUESTED_DAYS, "available_days": 0}
@@ -763,78 +761,77 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     elif today_state == "today_ready" and latest and latest != today:
         report["date_note"] = "今日分點資料尚未更新・目前顯示最近完整交易日"
     report["complete_all"] = complete   # 整個候選窗口的完整日（呼叫端算快取鍵用，不必再查 DB）
+    if today_state in ("intraday", "today_ready") and latest != today:
+        remember_for_today(stock_code, now)   # 今天資料還沒出來時被查過：資料一出來就先抓
     report["timing"] = {"spot_prepare": round(t_prepared - t0, 3), "spot_fetch": round(t_fetched - t_prepared, 3),
                         "spot_db": round(time.perf_counter() - t_fetched, 3)}
     return report
 
 
 # ============================================================
-# 夜間預建熱門股（只用富邦分點頁＋本地底庫，不用 FinMind／富果／Gemini）
+# 今日待抓：當天資料出來前被查過的股票，富邦一更新就先抓當天那一頁
+# （只用富邦分點頁，不用 FinMind／富果／Gemini）
 # ============================================================
 
-PREWARM_ENABLE = os.getenv("DISCORD_AI_SPOT_PREWARM_ENABLE", "1").strip() != "0"
-PREWARM_TOP = max(1, int(os.getenv("DISCORD_AI_SPOT_PREWARM_TOP", "100") or 100))
-PREWARM_LOOKBACK_DAYS = max(1, int(os.getenv("DISCORD_AI_SPOT_PREWARM_LOOKBACK_DAYS", "20") or 20))
-PREWARM_MIN_QUERIES = max(1, int(os.getenv("DISCORD_AI_SPOT_PREWARM_MIN_QUERIES", "2") or 2))
-# 固定每晚一定預建的股票（逗號分隔，排最前面、不佔 PREWARM_TOP 名額）
-PREWARM_ALWAYS = [c.strip() for c in os.getenv("DISCORD_AI_SPOT_PREWARM_ALWAYS", "2330").split(",") if c.strip()]
-PREWARM_START = os.getenv("DISCORD_AI_SPOT_PREWARM_START", "22:00").strip() or "22:00"
-PREWARM_END = os.getenv("DISCORD_AI_SPOT_PREWARM_END", "08:30").strip() or "08:30"
-PREWARM_NIGHT_PAGES = max(0, int(os.getenv("DISCORD_AI_SPOT_PREWARM_NIGHT_PAGES", "3500") or 3500))
-PREWARM_TICK_BUDGET = float(os.getenv("DISCORD_AI_SPOT_PREWARM_TICK_BUDGET", "240") or 240)
-PREWARM_GAP = float(os.getenv("DISCORD_AI_SPOT_PREWARM_GAP", "0.5") or 0.5)
+TODAY_PREFETCH_ENABLE = os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_ENABLE", "1").strip() != "0"
+TODAY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_TODAY_QUEUE_MAX", "300") or 300))
+TODAY_PREFETCH_BUDGET = float(os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_BUDGET", "120") or 120)
+_QUEUE_KEY = "spot_today_queue"
+_QUEUE_GUARD = threading.Lock()
 
 
-def prewarm_night(now: datetime) -> str:
-    """在預建時段內回傳「哪一晚」（跨午夜算前一天）；不在時段內回空字串。"""
-    hm = now.strftime("%H:%M")
-    if hm >= PREWARM_START:
-        return now.strftime("%Y-%m-%d")
-    if hm < PREWARM_END:
-        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    return ""
+def remember_for_today(stock_code: str, now: Optional[datetime] = None) -> None:
+    """記進今日待抓清單（存 SQLite kv，重啟不會不見；隔天自動換新清單）。失敗只略過，不影響回答。"""
+    if not TODAY_PREFETCH_ENABLE:
+        return
+    today = (now or tools.taipei_now()).strftime("%Y-%m-%d")
+    code = str(stock_code)
+    try:
+        with _QUEUE_GUARD:
+            state = local_market_cache.get_state(_QUEUE_KEY, {}) or {}
+            codes = list(state.get("codes") or []) if state.get("day") == today else []
+            if code in codes or len(codes) >= TODAY_QUEUE_MAX:
+                return
+            local_market_cache.set_state(_QUEUE_KEY, {"day": today, "codes": codes + [code]})
+    except Exception as exc:
+        print(f"⚠️ 今日待抓清單寫入略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
 
 
-def prewarm_candidates(limit: int = PREWARM_TOP, now: Optional[datetime] = None) -> List[str]:
-    """近 PREWARM_LOOKBACK_DAYS 天內現股籌碼被查 ≥ PREWARM_MIN_QUERIES 次的股票（最多 limit 檔，次數多的優先）。
-    這些股票被查時已存好歷史，夜間通常只需補當天一頁。"""
+def prefetch_today(now: Optional[datetime] = None, fetch_source=open_source,
+                   log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """背景維護每輪呼叫：TODAY_READY 後，依序抓待抓清單上每檔的「今天」一頁。
+    第一檔還是 pending_update（富邦還沒更新）就停，等 ensure_days 的 15 分鐘重試間隔到了再試；
+    1 條連線、會員優先、會員正在查的那檔跳過、來源冷卻或出錯就停。"""
     now = now or tools.taipei_now()
-    since = (now - timedelta(days=PREWARM_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    hot = local_market_cache.hot_spot_stocks(since, PREWARM_MIN_QUERIES, limit)
-    return list(dict.fromkeys(PREWARM_ALWAYS + hot))   # 固定名額（預設 2330）一定抓、排最前面
-
-
-def prewarm_tick(now: Optional[datetime] = None, fetch_source=open_source,
-                 log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """背景維護每輪呼叫一次：夜間時段內把「近期常被查」的股票的 70 日現股分點補到最新（1 條連線、慢速、會員優先、
-    來源冷卻中不跑、每晚頁數上限）。會員白天查這些股票時就是完整資料，不用等。"""
-    now = now or tools.taipei_now()
-    night = prewarm_night(now)
-    if not PREWARM_ENABLE or not night or not PREWARM_NIGHT_PAGES or source_cooling():
+    today = now.strftime("%Y-%m-%d")
+    if not TODAY_PREFETCH_ENABLE or now.strftime("%H:%M") < TODAY_READY or source_cooling():
         return {"skipped": True}
-    state = local_market_cache.get_state("spot_prewarm", {}) or {}
-    used = int(state.get("pages") or 0) if state.get("night") == night else 0
-    if used >= PREWARM_NIGHT_PAGES:
-        return {"skipped": True, "pages": used}
-    dates, _ = candidate_dates(now)
-    if not dates:
+    state = local_market_cache.get_state(_QUEUE_KEY, {}) or {}
+    if state.get("day") != today or not state.get("codes"):
         return {"skipped": True}
-    deadline, fetched, touched = time.monotonic() + PREWARM_TICK_BUDGET, 0, 0
-    for code in prewarm_candidates(now=now):
+    dates, today_state = candidate_dates(now)
+    if today_state != "today_ready" or not dates or dates[-1] != today:
+        return {"skipped": True}   # 今天不是交易日
+    deadline, fetched, done, waiting = time.monotonic() + TODAY_PREFETCH_BUDGET, 0, 0, False
+    for code in state["codes"]:
         left = deadline - time.monotonic()
-        if left <= 1 or used + fetched >= PREWARM_NIGHT_PAGES or source_cooling():
+        if left <= 1 or source_cooling():
             break
-        # lock_wait=0：會員正在查同一檔就跳過；background=True：來源名額讓給會員
-        result = ensure_days(code, dates, budget=left, now=now, fetch_source=fetch_source, latest_date=dates[-1],
-                             lock_wait=0, background=True, gap=PREWARM_GAP)
+        result = ensure_days(code, [today], budget=left, now=now, fetch_source=fetch_source, latest_date=today,
+                             lock_wait=0, background=True)
         fetched += result.get("fetched", 0)
-        touched += 1 if result.get("fetched") else 0
+        status = ((result.get("statuses") or {}).get(today) or {}).get("status")
+        if status in CONFIRMED_STATUSES:
+            done += 1
+        elif status == "pending_update":
+            waiting = True
+            break   # 富邦今天還沒更新：其他股票也不用試
         if result.get("errors"):
             break
-    local_market_cache.set_state("spot_prewarm", {"night": night, "pages": used + fetched})
     if fetched:
-        log(f"🌙 現股分點夜間預建｜{touched} 檔｜本輪 {fetched} 頁｜今晚累計 {used + fetched}/{PREWARM_NIGHT_PAGES}")
-    return {"pages": used + fetched, "fetched": fetched, "stocks": touched}
+        log(f"⚡ 現股分點今日待抓｜今日已完成 {done}/{len(state['codes'])} 檔｜本輪抓 {fetched} 頁"
+            + ("｜富邦尚未更新，稍後再試" if waiting else ""))
+    return {"fetched": fetched, "done": done, "waiting": waiting, "queued": len(state["codes"])}
 
 
 _BRANCH_NAMES_CACHE: Dict[str, Any] = {"at": 0.0, "names": []}

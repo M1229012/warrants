@@ -1581,7 +1581,8 @@ def price_source_note(bundle: Dict[str, Any]) -> str:
     note = _price_source_base(bundle)
     gaps = bundle.get("data_gaps") or []
     if gaps:
-        note += f"；{'、'.join(gaps)} 該股無交易資料（可能停牌、休市或無成交），均線以實際交易日計算"
+        shown = "、".join(gaps) if len(gaps) <= 3 else f"近期有 {len(gaps)} 個交易日"
+        note += f"；{shown} 該股無交易資料（可能暫停交易、休市或無成交），均線以實際交易日計算"
     return note
 
 
@@ -1928,8 +1929,6 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
         return []
 
 
-# 補不回來的缺口（停牌、颱風假、無成交）最多容忍幾天；超過就當資料源異常。
-MAX_ACCEPTED_GAPS = 3
 # code → (日期, 已確認無資料的交易日)：同一天不再為同一個缺口重抓 FinMind。
 _ACCEPTED_GAPS: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
 
@@ -2041,13 +2040,15 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
                 merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
             unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps))]
-            if len(gaps) > MAX_ACCEPTED_GAPS or unproven:
+            if unproven:
                 # 補不回來、又沒有休市或停牌證據的缺口：均線／布林會算錯，寧可不答（不假設是停牌或休市）。
+                # 有證據的缺口不限天數：冷門股常常好幾天沒成交、重大訊息暫停交易也可能連續好幾天沒有價格。
                 raise ToolDataError(f"{code} 日K 缺少 {'、'.join(unproven or gaps)} 的資料，資料不完整，暫時無法做技術分析")
             if gaps:
                 # 有證據的缺口（全市場確認休市，或所屬市場收盤快照完整卻沒有這檔＝確定沒成交）才照常分析並標註。
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
-                print(f"⚠️ {code} 日K {'、'.join(gaps)} 已確認為休市或該股無成交，照常分析", flush=True)
+                shown = "、".join(gaps) if len(gaps) <= 3 else f"{gaps[0]} 等 {len(gaps)} 天"
+                print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
         closed = kf.calculate_indicators(daily_df)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:

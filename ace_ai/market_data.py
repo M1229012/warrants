@@ -268,16 +268,34 @@ def unchecked_days(target_days: int = HISTORY_DAYS) -> int:
     return sum(1 for k in keys if any(status[k][m] == "unknown" for m in local_market_cache.MARKETS))
 
 
-def verify_days(days: List[str], limit: int = 3) -> None:
-    """查詢時遇到日K缺口、而那天市場完整性從沒記錄：當場向交易所查證（每天最多 2 個請求，結果存 DB 不重查）。"""
+# 背景重查的市場完整性狀態：抓取失敗、資料不完整待確認（complete／closed 不再重查；
+# 從沒記錄過的 unknown 由 unchecked_days→sync 與會員查詢時的 verify_days 處理）
+RETRY_STATUSES = ("source_error", "pending")
+
+
+def incomplete_days(target_days: int = HISTORY_DAYS) -> List[str]:
+    """歷史範圍內（不含今天）上市或上櫃抓取失敗／不完整的日子，新到舊。
+    sync() 已完整天數一到 target_days 就停，更早抓失敗的日子（例如某天櫃買回應不完整）輪不到重抓，
+    那天所有沒成交的冷門股都無法證明「確定沒成交」，會被當成資料缺漏；由背景維護用這份清單補查。"""
+    keys = [d.strftime("%Y-%m-%d") for d in _candidate_days(int(target_days * 1.5))[1:]]
+    try:
+        status = local_market_cache.market_status(keys)
+    except local_market_cache.DBError:
+        return []
+    return [k for k in keys if any(status[k][m] in RETRY_STATUSES for m in local_market_cache.MARKETS)]
+
+
+def verify_days(days: List[str], limit: int = 3, retry: tuple = ("unknown",)) -> None:
+    """查詢時遇到日K缺口、而那天市場完整性從沒記錄：當場向交易所查證（每天最多 2 個請求，結果存 DB 不重查）。
+    retry＝要重查的狀態；會員查詢只查「從沒記錄」的日子，背景維護另外重查抓取失敗／不完整的日子。"""
     try:
         status = local_market_cache.market_status(days)
     except local_market_cache.DBError:
         return
     today = _now_date().strftime("%Y-%m-%d")
-    pending = [d for d in sorted(days) if d < today and any(status[d][m] == "unknown" for m in local_market_cache.MARKETS)]
+    pending = [d for d in sorted(days) if d < today and any(status[d][m] in retry for m in local_market_cache.MARKETS)]
     for key in pending[:limit]:
-        need = tuple(m for m in local_market_cache.MARKETS if status[key][m] == "unknown")
+        need = tuple(m for m in local_market_cache.MARKETS if status[key][m] in retry)
         try:
             sync_day(_date.fromisoformat(key), need)
         except Exception as exc:

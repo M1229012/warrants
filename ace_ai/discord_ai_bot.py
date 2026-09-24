@@ -3402,8 +3402,7 @@ class AceQueryEngine:
         code = next(c for c, _ in parsed.stocks if c not in tools.INDEX_CODES)
         try:
             # quick：只等最近完整日幾秒，70 日歷史交給背景補；圖上標「歷史 x / 70」，不讓整合頁卡 20～60 秒
-            access = self._access()
-            report = spot_chip.build_report(code, "quick", record=not (access and access.simulation))
+            report = spot_chip.build_report(code, "quick")
             self._spot_timing(report)
         except Exception as exc:
             self.log(f"籌碼重點略過：{type(exc).__name__}: {exc}")
@@ -3477,7 +3476,7 @@ class AceQueryEngine:
             hit, cached = self._answer_cache.get(key)
             if hit:
                 return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
-        report = spot_chip.build_report(code, mode, calendar=calendar, record=not simulation)   # /ace 測試不計入查詢次數
+        report = spot_chip.build_report(code, mode, calendar=calendar)
         self._spot_timing(report)
         latest = report.get("latest_complete_date")
         if not latest:
@@ -3521,7 +3520,7 @@ class AceQueryEngine:
             hit, cached = self._answer_cache.get(cache_key())
             if hit:
                 return replace(cached, cache_hit=True, gemini_calls=0, elapsed=time.perf_counter() - started)
-        report = spot_chip.build_report(code, "full", calendar=calendar, record=not simulation)
+        report = spot_chip.build_report(code, "full", calendar=calendar)
         self._spot_timing(report)
         if not report.get("latest_complete_date"):
             if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
@@ -4993,6 +4992,18 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                 result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
                 print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
                       f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+            # 抓取失敗／不完整的市場日（sync 輪不到的舊日子）：盤後每輪最多重查 5 天，
+            # 補完後那天沒成交的冷門股、暫停交易股才能被證明「確定沒成交」，不再被當成資料缺漏
+            if not sector_radar.session_open(now):
+                try:
+                    bad = market_data.incomplete_days()
+                    if bad:
+                        market_data.verify_days(bad, limit=5, retry=market_data.RETRY_STATUSES)
+                        fixed = len(bad) - len(market_data.incomplete_days())
+                        if fixed > 0:
+                            print(f"🗂️ 市場完整性重查：補好 {fixed} 天｜仍待確認 {len(bad) - fixed} 天", flush=True)
+                except Exception as exc:
+                    print(f"⚠️ 市場完整性重查略過｜{type(exc).__name__}: {exc}", flush=True)
             # 權證分點歷史庫（GitHub release）：有更新才下載；寫入約 20 秒會佔用資料庫，盤中只在本地還沒有資料時才做
             try:
                 import warrant_store
@@ -5013,13 +5024,13 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
             if _db_maintenance_day[0] != today and minutes >= 15 * 60 + 30:
                 _db_maintenance_day[0] = today
                 local_market_cache.daily_maintenance(today)
+            # 當天資料出來前被查過的現股分點：富邦一更新就先抓當天那頁（只用富邦，不佔 FinMind／富果額度）
+            try:
+                spot_chip.prefetch_today(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
+            except Exception as exc:
+                print(f"⚠️ 現股分點今日待抓略過｜{type(exc).__name__}: {exc}", flush=True)
             if int(market_data.coverage().get("days") or 0) >= 20:
                 market_scan.score_pending(budget_seconds=MARKET_SCORE_BUDGET)
-            # 夜間（預設 22:00～08:30）先建好熱門股的 70 日現股分點；只用富邦分點頁，不佔 FinMind／富果額度
-            try:
-                spot_chip.prewarm_tick(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
-            except Exception as exc:
-                print(f"⚠️ 現股分點夜間預建略過｜{type(exc).__name__}: {exc}", flush=True)
         except Exception as exc:
             print(f"⚠️ 市場底庫背景維護失敗｜{type(exc).__name__}: {exc}", flush=True)
         if stop.wait(300):

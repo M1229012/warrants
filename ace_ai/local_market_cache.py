@@ -138,9 +138,6 @@ def _connect() -> sqlite3.Connection:
                 """)
                 # 每股票每交易日的抓取狀態：complete／pending_update／market_closed／stock_no_trade／source_error／retry
                 # （查不到資料不能當成 0，也不能一律當停牌）。
-                # 現股籌碼查詢次數（每天每檔一列，只存代號與次數，不存使用者）：夜間預建挑「常被查」的股票
-                conn.execute("CREATE TABLE IF NOT EXISTS spot_query_log (day TEXT NOT NULL, stock_code TEXT NOT NULL, "
-                             "count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, stock_code))")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS spot_branch_days (
                         stock_code TEXT NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL,
@@ -658,22 +655,6 @@ def spot_branch_history(branch_name: str, since: str) -> List[Dict[str, Any]]:
     return [{"stock_code": r[0], "date": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
 
 
-SPOT_QUERY_KEEP_DAYS = 45
-
-
-def record_spot_query(stock_code: str, day: str) -> None:
-    """現股籌碼被查一次就 +1（失敗只記 Log，不影響回答）。"""
-    _write("INSERT INTO spot_query_log(day,stock_code,count) VALUES(?,?,1) "
-           "ON CONFLICT(day,stock_code) DO UPDATE SET count=count+1", (str(day), str(stock_code).strip()))
-
-
-def hot_spot_stocks(since: str, min_count: int = 2, limit: int = 100) -> List[str]:
-    """since（含）以來現股籌碼查詢次數 ≥ min_count 的股票，次數多的在前。"""
-    rows = _read("SELECT stock_code, SUM(count) AS n FROM spot_query_log WHERE day >= ? GROUP BY stock_code "
-                 "HAVING n >= ? ORDER BY n DESC, stock_code LIMIT ?", (str(since), int(min_count), int(limit)))
-    return [str(r[0]) for r in rows]
-
-
 def spot_branch_names() -> List[str]:
     return [r[0] for r in _read("SELECT DISTINCT branch_name FROM spot_branch_daily", ())]
 
@@ -917,7 +898,6 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                         ("usage_log", "DELETE FROM usage_log WHERE day < ?", cut(USAGE_KEEP_DAYS)),
                         ("spot_branch_daily", "DELETE FROM spot_branch_daily WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         ("spot_branch_days", "DELETE FROM spot_branch_days WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
-                        ("spot_query_log", "DELETE FROM spot_query_log WHERE day < ?", cut(SPOT_QUERY_KEEP_DAYS)),
                         # 舊版每 5 分鐘整包重寫的 JSON（改成資料表後就不再使用）；當天的先留著給當天讀
                         ("legacy_radar_snap", "DELETE FROM kv WHERE key LIKE 'radar_snap:%' AND key < ?",
                          "radar_snap:" + today),

@@ -156,6 +156,11 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
             "reason": "" if rows else ("no_scores" if mode == "market_technical" and not values else "low_coverage")}
 
 
+# 算失敗的股票：code → 當時最後一根 K 棒日期。同一根 K 棒不再每輪重算（有新 K 棒才再試），
+# 避免資料不足的冷門股每 5 分鐘重跑一次、Log 一直刷。
+_FAILED_AT: Dict[str, str] = {}
+
+
 def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], None] = print,
                   codes: Optional[List[str]] = None) -> Dict[str, Any]:
     """補算分數日期與個股最後收盤 K 棒不一致的股票，可分多輪執行。"""
@@ -172,7 +177,8 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
             local_market_cache.codes_with_history(69)
         scored = local_market_cache.latest_pattern_score_dates(universe)
         todo = [c for c in universe
-                if not last_bars.get(c) or scored.get(c) != last_bars[c]]
+                if (not last_bars.get(c) or scored.get(c) != last_bars[c])
+                and not (last_bars.get(c) and _FAILED_AT.get(c) == last_bars[c])]
         for code in todo:
             if time.monotonic() - started > budget_seconds:
                 break
@@ -193,8 +199,13 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
                     weekly_pick.pattern_grade(score["score"]), score.get("components"),
                     str(tech.get("signal_status") or ""))
                 done += 1
+                _FAILED_AT.pop(code, None)
+                if last_bars.get(code) and str(score_date).replace("/", "-") != last_bars[code]:
+                    _FAILED_AT[code] = last_bars[code]   # 算得出但日期對不上最後 K 棒：同一根 K 棒不再每輪重算
             except Exception:
                 failed += 1
+                if last_bars.get(code):
+                    _FAILED_AT[code] = last_bars[code]
         pending = max(0, len(todo) - done - failed)
         if done or failed:
             log(f"📈 型態分數底庫：新增 {done} 檔｜失敗 {failed}｜尚待 {pending}｜{time.monotonic()-started:.0f} 秒")
