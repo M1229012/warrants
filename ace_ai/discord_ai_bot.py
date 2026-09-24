@@ -1555,6 +1555,19 @@ def _install_gemini_error_recorder(kf: Any) -> None:
 
 # 503 是模型本身塞車，換 API Key 沒用，只能換模型再試一次（數字都是 Python 算的，換模型只影響文字風格）。
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
+# 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數、照舊走主程式呼叫
+GEMINI_THINKING = os.getenv("DISCORD_AI_GEMINI_THINKING", "minimal").strip().lower()
+_THINKING_UNSUPPORTED: set = set()
+
+
+def _thinking_config(model: str) -> Optional[Dict[str, Any]]:
+    if GEMINI_THINKING in ("", "default") or model in _THINKING_UNSUPPORTED:
+        return None
+    if re.match(r"gemini-2\.5-(flash|flash-lite)\b", model):
+        return {"thinking_budget": 0}
+    if re.match(r"gemini-[3-9]", model):
+        return {"thinking_level": GEMINI_THINKING}
+    return None
 _OVERLOADED_RE = re.compile(r"503|UNAVAILABLE|overloaded|high demand|429|RESOURCE_EXHAUSTED", re.IGNORECASE)
 # 主模型塞車後幾秒內，後續題目直接用備援模型（主程式會把 3 支 Key 都試過再等 2 秒重試，每題白等 30 幾秒）
 GEMINI_PRIMARY_COOLDOWN = max(0, tools._env_int("DISCORD_AI_GEMINI_PRIMARY_COOLDOWN", 300))
@@ -1635,16 +1648,26 @@ class GeminiGateway:
         config: Dict[str, Any] = {"temperature": max(0.0, min(2.0, float(temperature)))}
         if schema and getattr(kf, "GEMINI_STRUCTURED_OUTPUT_ENABLE", True):
             config.update(response_mime_type="application/json", response_schema=schema)
+        thinking = _thinking_config(model)
         for key in kf._get_warrants_api_keys():
-            try:
-                # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉（Cannot send a request, as the client has been closed）
-                client = kf.genai.Client(api_key=key)
-                response = client.models.generate_content(model=model, contents=prompt, config=config)
-                text = str(response.text or "")
-                if text:
-                    return text
-            except Exception as exc:  # google-genai 例外型別眾多，換下一支 Key
-                _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
+            for attempt in range(2):
+                use = dict(config, thinking_config=thinking) if thinking and attempt == 0 else config
+                try:
+                    # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉（Cannot send a request, as the client has been closed）
+                    client = kf.genai.Client(api_key=key)
+                    response = client.models.generate_content(model=model, contents=prompt, config=use)
+                    text = str(response.text or "")
+                    if text:
+                        return text
+                    break
+                except Exception as exc:  # google-genai 例外型別眾多，換下一支 Key
+                    _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
+                    if use is config or "thinking" not in str(exc).lower():
+                        break
+                    # SDK 或模型不支援這個思考參數：這個模型之後都不帶，這次立刻不帶重試
+                    _THINKING_UNSUPPORTED.add(model)
+                    thinking = None
+                    print(f"⚠️ {model} 不支援思考參數，改用模型預設：{str(exc)[:160]}")
         return None
 
     DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
@@ -1697,6 +1720,9 @@ class GeminiGateway:
 
         def call() -> Optional[str]:
             with self._lock:
+                if _thinking_config(kf.GEMINI_MODEL):
+                    # 要調思考程度時主模型也走 Bot 自己的呼叫（主程式不帶思考參數、不能改）
+                    return self._generate_with_model(kf, kf.GEMINI_MODEL, prompt, schema, temperature)
                 try:
                     return kf._call_gemini_with_retry(
                         prompt,
