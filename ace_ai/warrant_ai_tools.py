@@ -1440,6 +1440,8 @@ def calibrate_fugle_volume_unit(stock_code: str = "2330") -> str:
     """收盤後比對同一天「盤中報價累計量」與「日K成交量（股）」，確認盤中量的單位；只寫 Log，不改設定。"""
     if not (FUGLE_API_KEYS or FUGLE_API_KEY):
         return "未設定 FUGLE_API_KEY，略過"
+    if taipei_now().strftime("%H:%M") < "14:30":
+        return "當天日K 14:30 後才會產生，之後重新部署才能校正"
     quote = _fugle_get(f"intraday/quote/{stock_code}")
     if not quote.get("isClose"):
         return "今天尚未收盤（或非交易日），收盤後重新部署才能校正"
@@ -1968,6 +1970,7 @@ def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
         if not allow_finmind:
             raise ToolDataError("背景工作不用 FinMind 補缺口")
         stock_df, market, _ = core().fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
+        stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
         if stock_df is not None and not stock_df.empty:
             local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
             frames.append(stock_df[columns])
@@ -1980,6 +1983,19 @@ def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
     print(f"🩹 {code} 日K 缺 {'、'.join(gaps)}（來源 {source}）｜嘗試 {'＋'.join(labels[1:]) or '無其他來源'}｜"
           + ("已補齊" if not remain else f"仍缺 {'、'.join(remain)}"), flush=True)
     return merged, ("＋".join(labels[:2]) if len(labels) > 1 else source)
+
+
+def _drop_invalid_bars(code: str, frame: pd.DataFrame, source: str) -> pd.DataFrame:
+    """拿掉價格為 0／NaN、OHLC 矛盾的 K 棒（冷門股沒成交的日子 FinMind 會回 0 價），和本地底庫同一套 valid_bar 規則。
+    拿掉的日子變成缺口，交給 legal_gap_days 用「所屬市場收盤完整、卻沒有這檔」證明確定沒成交。"""
+    if frame is None or frame.empty:
+        return frame
+    ok = [local_market_cache.valid_bar(r.Open, r.High, r.Low, r.Close, 0.0 if pd.isna(r.Volume) else r.Volume)
+          for r in frame[["Open", "High", "Low", "Close", "Volume"]].itertuples(index=False)]
+    bad = len(ok) - sum(ok)
+    if bad:
+        print(f"⚠️ {code} 日K 拿掉 {bad} 根不合理的 K 棒（來源 {source}，多為無成交日回 0 價），不拿來算均線", flush=True)
+    return frame[ok] if bad else frame
 
 
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
@@ -2004,6 +2020,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             started = time.perf_counter()
             stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
             record_api_event("FinMindData", status=200, latency=time.perf_counter()-started)
+            stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
             if stock_df is not None and not stock_df.empty:
                 local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
@@ -2017,7 +2034,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             raise ToolDataError(f"{code} 沒有股價資料：{type(error).__name__}: {error}")
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
-        frame = fetch_fugle_daily(code, days)
+        frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")
         local_market_cache.save_bars(code, frame, market="", source="Fugle-history-fallback", confirmed=True)
         return frame, "", "富果日K備援"
 
