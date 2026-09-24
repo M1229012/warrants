@@ -1934,6 +1934,7 @@ _EXEMPT_PATTERNS = (
     re.compile(r"\d{1,2}/\d{1,2}"),
     re.compile(r"12/26/9"),
     re.compile(r"/\s*(?:100|25|15|10)(?![\d.])"),
+    re.compile(r"(?<![\d.,])\d{1,3}\s*(?:個)?(?:交易)?(?:日|天|週|周)(?![\d])"),   # 「20 日均量」「近 60 天」是期間，不是資料數字
 )
 
 
@@ -1950,6 +1951,8 @@ def _number_variants(token: str) -> Set[str]:
             rounded = round(number, digits)
             variants.add(f"{rounded:g}")
             variants.add(f"{rounded:.{digits}f}")
+            truncated = math.trunc(number * 10 ** digits) / 10 ** digits   # 直接去掉小數：48,342.55 → 48,342
+            variants.add(f"{truncated:.{digits}f}")
     return variants
 
 
@@ -2053,6 +2056,12 @@ def _variants_of(text: str) -> Set[str]:
     for token in set(_NUMBER_RE.findall(text)):
         variants |= _number_variants(token)
         variants |= _unit_variants(token)
+        try:
+            value = float(token.replace(",", "").lstrip("+"))
+        except ValueError:
+            continue
+        if 0 < abs(value) < 10 and not value.is_integer():
+            variants |= _number_variants(f"{value * 100:.4f}")   # 倍數寫成百分比：量比 0.79 倍＝79%
     return variants
 
 
@@ -4558,6 +4567,10 @@ class AceQueryEngine:
         """回傳 (回答文字, 是否可快取)；AI 解讀卡另存在 _request_local.ai_card，由 _answer_uncached 取走。"""
         self._set_ai_card(None)
         rule_answer = build_rule_based_answer(results)
+        if plan.route in ("rule_pattern", "rule_index_compare"):
+            brief = [r for r in results if r.name in ("get_stock_overview", "get_futures_positions", "get_institutional_flow")]
+            if brief:
+                rule_answer = build_rule_based_answer(brief)
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
