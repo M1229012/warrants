@@ -1018,6 +1018,18 @@ def report_card(report: Dict[str, Any], stock_code: str, stock_name: str) -> Dic
     if report.get("mode") != "latest" and int(report.get("available_days") or 0) < want:
         sections.append({"type": "note", "text": f"歷史資料建置中｜{report.get('available_days', 0)} / {want} 個交易日"
                                                  "（下次查詢會從中斷處繼續補齊）"})
+    if report.get("mode") != "latest":
+        # 籌碼摘要：近 5／20 日 Top15 分點淨買賣超、量價加權均價與收盤差距（沒資料的格子直接省略）
+        periods = {p["days"]: p for p in report.get("periods") or [] if not p.get("insufficient")}
+        tiles = [{"label": f"近{n}日 Top15 淨買賣", "value": _lots(periods[n]["top15_buy"] - periods[n]["top15_sell"]),
+                  "tone": "signed"} for n in (5, 20) if n in periods]
+        vwap = report.get("vwap") or {}
+        if vwap.get("vwap"):
+            tiles.append({"label": f"近{vwap['days']}日量價加權均價（估）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"})
+            if vwap.get("gap_pct") is not None:
+                tiles.append({"label": "收盤與均價差距", "value": f"{vwap['gap_pct']:+.2f}%", "tone": "signed"})
+        if tiles:
+            sections.append({"type": "tiles", "items": tiles})
     sections.append({"type": "heading", "text": f"最新現股分點動向｜{_slash(latest)}"})
     sections.append({"type": "lists", "items": [
         {"title": "TOP5 買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
@@ -1030,35 +1042,26 @@ def report_card(report: Dict[str, Any], stock_code: str, stock_name: str) -> Dic
             rows = []
             for p in periods:
                 if p.get("insufficient"):
-                    rows.append([f"{p['days']}日", f"資料不足 {p['available']}/{p['days']}", "-", "-", "-", "-", "-"])
-                    continue
+                    continue   # 資料不足的期間直接省略，不顯示空列
                 rows.append([f"{p['days']}日", _lots(p["top15_buy"]), _lots(-p["top15_sell"]), _ratio(p, "buy_ratio"),
                              _ratio(p, "sell_ratio"), _ratio(p, "net_concentration", True), p.get("scenario") or "-"])
             sections.append({"type": "heading", "text": "籌碼集中度（Top15 分點）"})
             sections.append({"type": "table", "columns": ["期間", "Top15買超", "Top15賣超", "買超比", "賣超比", "淨集中度", "判讀"],
                              "rows": rows, "signed": ("Top15買超", "Top15賣超", "淨集中度"), "accent": ()})
         if report.get("cumulative_buy") or report.get("cumulative_sell"):
+            # 近 20 日主要分點方向：買超／賣超合併取絕對值最大的 5 個，正負橫條（取代兩欄清單）
             n = report.get("cumulative_days", 20)
-            sections.append({"type": "heading", "text": f"主要累積分點（近{n}日）"})
-            sections.append({"type": "lists", "items": [
-                {"title": "累積買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
-                                                           for x in report.get("cumulative_buy") or []]},
-                {"title": "累積賣超", "tone": "down", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
-                                                             for x in report.get("cumulative_sell") or []]}]})
+            top = sorted((report.get("cumulative_buy") or []) + (report.get("cumulative_sell") or []),
+                         key=lambda x: -abs(x["net"]))[:5]
+            sections.append({"type": "heading", "text": f"近{n}日主要分點方向"})
+            sections.append({"type": "hbars", "items": [{"label": _branch_label(x), "value": x["net"], "text": _lots(x["net"])}
+                                                        for x in top]})
         if report.get("continuity"):
             sections.append({"type": "heading", "text": "分點延續性（主要累積買超）"})
             sections.append({"type": "table", "columns": ["分點", "近20日買超天數", "近5日買超天數", "狀態", "估算成本"],
                              "rows": [[c["branch"], f"{c['appear_20']} 天", f"{c['appear_5']} 天", c["state"] or "-",
                                        f"{c['est_cost']:,.2f}" if c.get("est_cost") else "-"] for c in report["continuity"]],
                              "signed": (), "accent": ("狀態",)})
-        vwap = report.get("vwap")
-        if vwap and vwap.get("vwap"):
-            gap = vwap.get("gap_pct")
-            sections.append({"type": "heading", "text": "成本"})
-            sections.append({"type": "tiles", "items": [
-                {"label": f"近{vwap['days']}日量價加權均價（估）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"},
-                {"label": "最新收盤", "value": f"{vwap['close']:,.2f}", "tone": "ink"},
-                {"label": "與均價差距", "value": f"{gap:+.2f}%" if gap is not None else "-", "tone": "signed"}]})
         if report.get("history"):
             sections.append({"type": "heading", "text": "主要分點歷史表現（本檔，本地資料）"})
             sections.append({"type": "table", "columns": ["分點", "進買超前20名次數", "5日後上漲比例", "5日平均報酬"],
@@ -1200,14 +1203,14 @@ def summary_card(report: Dict[str, Any]) -> Dict[str, Any]:
         if p and p.get("net_concentration") is not None:
             tiles.append({"label": f"近{n}日｜{p.get('scenario') or '中性'}", "value": f"{p['net_concentration']:+.2f}%",
                           "tone": "signed"})
-        else:
-            tiles.append({"label": f"近{n}日", "value": "資料不足", "tone": "ink"})
+
     vwap = report.get("vwap") or {}
     if vwap.get("vwap"):
         tiles.append({"label": f"近{vwap['days']}日量價加權均價（估）", "value": f"{vwap['vwap']:,.2f}", "tone": "ink"})
         if vwap.get("gap_pct") is not None:
             tiles.append({"label": "現價與均價差距", "value": f"{vwap['gap_pct']:+.2f}%", "tone": "signed"})
-    sections.append({"type": "tiles", "items": tiles})
+    if tiles:
+        sections.append({"type": "tiles", "items": tiles})
     return {"branch": "籌碼重點", "tags": [f"現股分點｜{_slash(latest)}"] if latest else ["現股分點"],
             "label": f"歷史 {report.get('available_days', 0)} / {report.get('requested_days', REQUESTED_DAYS)} 個交易日",
             "sections": sections}

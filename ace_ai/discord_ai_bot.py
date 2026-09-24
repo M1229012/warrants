@@ -695,28 +695,110 @@ def _perf_tiles(p: Dict[str, Any]) -> List[Dict[str, str]]:
     ]
 
 
-def institutional_card(data: Dict[str, Any]) -> Dict[str, Any]:
-    """三大法人買賣超圖卡：今日四格（外資／投信／自營商／合計）＋近 5／20 日與連買賣表格。"""
-    def signed(value: Any) -> str:
-        value = int(value or 0)
-        return f"{value:+,}" if value else "0"
+_INVESTOR_KEYS = {"外資": "foreign", "投信": "invest", "自營商": "dealer"}
 
-    def streak(days: Any) -> str:
-        days = int(days or 0)
-        return f"連買 {days} 天" if days > 0 else f"連賣 {-days} 天" if days < 0 else "-"
-    investors = data.get("investors") or []
-    tiles = [{"label": f"{x['investor']}今日", "value": f"{signed(x.get('latest_lots'))} 張", "tone": "signed"} for x in investors]
-    tiles.append({"label": "三大法人合計", "value": f"{signed(data.get('total_latest_lots'))} 張", "tone": "signed"})
-    rows = [[x["investor"], signed(x.get("latest_lots")), signed(x.get("sum_5d_lots")), signed(x.get("sum_20d_lots")),
-             streak(x.get("streak_days"))] for x in investors]
-    rows.append(["合計", signed(data.get("total_latest_lots")), signed(data.get("total_5d_lots")), "-", "-"])
+
+def _signed_lots(value: Any) -> str:
+    value = int(round(float(value or 0)))
+    return f"{value:+,}" if value else "0"
+
+
+def _streak_text(days: Any) -> str:
+    days = int(days or 0)
+    return f"連買 {days} 天" if days > 0 else f"連賣 {-days} 天" if days < 0 else "無連續"
+
+
+def _direction(latest: float, sum5: float, sum20: float) -> str:
+    signs = {1 if v > 0 else -1 if v < 0 else 0 for v in (latest, sum5, sum20)} - {0}
+    return "一致偏買" if signs == {1} else "一致偏賣" if signs == {-1} else "短中期分歧"
+
+
+def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+    """三大法人圖卡：只問單一法人時以該法人為主；數字格＋近 20 日柱狀圖＋1～3 行規則式重點（不另呼叫 Gemini）。"""
+    investors = {x["investor"]: x for x in data.get("investors") or []}
+    asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
+    focus = asked[0] if len(asked) == 1 and "三大法人" not in str(question) and asked[0] in investors else ""
+    rows = list(data.get("rows") or [])[-20:]
+    if focus:
+        who, info, key = focus, investors[focus], _INVESTOR_KEYS[focus]
+        series = [float(r.get(key) or 0) for r in rows]
+        latest, sum5, sum20, streak = (float(info.get("latest_lots") or 0), float(info.get("sum_5d_lots") or 0),
+                                       float(info.get("sum_20d_lots") or 0), info.get("streak_days"))
+    else:
+        who = "三大法人合計"
+        series = [float(r.get("foreign") or 0) + float(r.get("invest") or 0) + float(r.get("dealer") or 0) for r in rows]
+        latest, sum5 = float(data.get("total_latest_lots") or 0), float(data.get("total_5d_lots") or 0)
+        sum20 = sum(series)
+        streak = 0
+        for value in reversed(series):
+            if value == 0 or (streak and (value > 0) != (streak > 0)):
+                break
+            streak += 1 if value > 0 else -1
+    sections: List[Dict[str, Any]] = [
+        {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：張（正＝買超、負＝賣超）"}]
+    if focus:
+        sections.append({"type": "tiles", "items": [
+            {"label": f"{who}今日", "value": f"{_signed_lots(latest)} 張", "tone": "signed"},
+            {"label": "近 5 日累積", "value": _signed_lots(sum5), "tone": "signed"},
+            {"label": "近 20 日累積", "value": _signed_lots(sum20), "tone": "signed"},
+            {"label": "連續", "value": _streak_text(streak), "tone": "ink"}]})
+        others = [f"{n}今日 {_signed_lots(x.get('latest_lots'))}" for n, x in investors.items() if n != focus]
+        sections.append({"type": "note", "text": "其他法人｜" + "｜".join(others + [f"合計 {_signed_lots(data.get('total_latest_lots'))} 張"])})
+    else:
+        sections.append({"type": "tiles", "items": [
+            {"label": f"{n}今日", "value": f"{_signed_lots(x.get('latest_lots'))} 張", "tone": "signed"} for n, x in investors.items()]
+            + [{"label": "三大法人合計", "value": f"{_signed_lots(latest)} 張", "tone": "signed"}]})
+        sections.append({"type": "tiles", "items": [
+            {"label": "合計近 5 日", "value": _signed_lots(sum5), "tone": "signed"},
+            {"label": "合計近 20 日", "value": _signed_lots(sum20), "tone": "signed"},
+            {"label": "連續", "value": _streak_text(streak), "tone": "ink"},
+            {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]})
+    if len(series) >= 5:
+        sections.append({"type": "vbars", "title": f"近 {len(series)} 日{who}買賣超（張）",
+                         "items": [{"label": str(r.get("date", ""))[5:], "value": v, "text": _signed_lots(v)}
+                                   for r, v in zip(rows, series)]})
+    word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
+    points = [f"{who}今日{word(latest)} {abs(latest):,.0f} 張" + (f"，{_streak_text(streak)}。" if streak else "。"),
+              f"近 5 日累積{word(sum5)} {abs(sum5):,.0f} 張，近 20 日累積{word(sum20)} {abs(sum20):,.0f} 張"
+              + ("，短中期方向一致。" if (sum5 > 0) == (sum20 > 0) and sum5 and sum20 else "，短中期方向不同，仍待確認。")]
+    sections.append({"type": "points", "items": points})
+    sections.append({"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
-    return {"branch": name, "tags": ["三大法人"], "label": "法人籌碼", "sections": [
-        {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：張（正＝買超、負＝賣超）"},
-        {"type": "tiles", "items": tiles},
-        {"type": "table", "columns": ["法人", "今日", "近 5 日", "近 20 日", "連續"], "rows": rows,
-         "signed": ("今日", "近 5 日", "近 20 日")},
-        {"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"}]}
+    return {"branch": name, "tags": [focus or "三大法人"], "label": "法人籌碼", "sections": sections}
+
+
+def warrant_summary_card(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """權證籌碼摘要：最新事件／事件買進金額／事件勝率／樣本 4 格＋主要分點（最多 3 個）狀態列。沒有事件就不出卡。"""
+    branches = [b for b in data.get("branches") or [] if b.get("events_recent") or b.get("event_count_lookback")]
+    if not data.get("available") or not branches:
+        return None
+    events = [(e, b) for b in branches for e in b.get("events_recent") or []]
+    tiles = []
+    if events:
+        event, owner = max(events, key=lambda x: str(x[0].get("event_date") or ""))
+        perf = (owner.get("event_performance") or {}).get(event.get("event")) or {}
+        tiles = [{"label": "最新事件", "value": f"{event.get('event')}｜{str(event.get('event_date', ''))[5:]}", "tone": "accent"},
+                 {"label": "事件買進金額", "value": str(event.get("buy_amount_text") or "-"), "tone": "ink"}]
+        if perf.get("raw_win_rate") is not None:
+            tiles.append({"label": f"{owner['branch']}｜{event.get('event')} 事件勝率", "value": f"{float(perf['raw_win_rate']):.1f}%",
+                          "tone": "accent"})
+            tiles.append({"label": "樣本數", "value": f"{int(perf.get('sample_included') or 0)} 筆", "tone": "ink"})
+    rows = []
+    for b in branches[:3]:
+        parts = [str(b.get("position_status") or "")]
+        actions = b.get("reduce_or_exit_lookback") or []
+        parts.append(f"最近 {actions[-1]['date'][5:]} {actions[-1]['action']}" if actions else "近期無賣出")
+        if b.get("overall_win_rate_background") is not None:
+            parts.append(f"總勝率 {float(b['overall_win_rate_background']):.1f}%（n={int(b.get('overall_sample_included') or 0)}）")
+        rows.append({"lead": ("★" if b.get("is_high_win_rate") else "") + str(b["branch"]), "parts": [p for p in parts if p]})
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": f"近期｜{data.get('period_recent', '')}"}]
+    if tiles:
+        sections.append({"type": "tiles", "items": tiles})
+    sections.append({"type": "heading", "text": "主要分點狀態"})
+    sections.append({"type": "rows", "items": rows})
+    sections.append({"type": "note", "text": "★＝總勝率達高勝率門檻的追蹤分點｜只涵蓋回測追蹤分點的 A～E 事件（單日權證買進≥100萬）"})
+    name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
+    return {"branch": name, "tags": ["權證事件摘要"], "label": "權證分點", "sections": sections}
 
 
 def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str, Any]]:
@@ -4336,7 +4418,12 @@ class AceQueryEngine:
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
             if flow:
-                panels.append({"branch_card": institutional_card(flow), "hide_text": True})
+                panels.append({"branch_card": institutional_card(flow, question), "hide_text": True})
+        if "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
+            chips = next((r.data for r in results if r.ok and r.name == "get_sheet_stock_chips"), None)
+            summary = warrant_summary_card(chips) if chips else None
+            if summary:
+                panels.append({"branch_card": summary})
         if plan.route == "rule_branch":
             branch_card = build_branch_card(results)
             if branch_card:
@@ -4345,7 +4432,7 @@ class AceQueryEngine:
         for panel in panels:
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"
                          and r.data.get("stock_code") == panel.get("stock_code")), None)
-            if flow and panel.get("bars"):
+            if flow and panel.get("bars") and plan.route != "rule_institutional":
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):

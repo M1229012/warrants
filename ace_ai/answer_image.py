@@ -1771,6 +1771,16 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
         text_at(draw, (px, y + h + 58), disclaimer, 18, MUTED)
     h += 56 + 38
+    bars = []
+    for row in (rows + list(data.get('others') or []))[:5]:
+        value = row.get('pattern_score', row.get('score')) if technical else row.get('change_pct', row.get('delta'))
+        if isinstance(value, (int, float)):
+            label = str(row.get('stock_name') or row.get('name') or row.get('stock_code') or '')
+            bars.append({'label': label, 'value': float(value),
+                         'text': f'{value:.1f} 分' if technical else f'{value:+.2f}%'})
+    if len(bars) >= 2:
+        section = {'type': 'hbars', 'items': bars, 'title': 'Top5 一覽'}
+        h += _branch_section(draw, px, px + width, y + h, section, dry) + 6
     if not rows:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)
@@ -2256,6 +2266,85 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 draw.text((cx + w / 2, cy + chip_h / 2), item, font=font(20), fill=ACCENT, anchor='mm')
                 cx += w + gap
         return height + 10
+    if kind == 'hbars':
+        # 正負橫條（最多 5 列）：買超紅、賣超綠，有負值時以中線為 0
+        items = (section.get('items') or [])[:5]
+        if not items:
+            return 0
+        title_h, row_h = (34 if section.get('title') else 0), 42
+        height = title_h + len(items) * row_h + 14
+        if not dry:
+            if section.get('title'):
+                text_at(draw, (x0, y + 2), section['title'], 21, MUTED, True)
+            label_w = min(width * 0.30, max(font(22).getlength(str(it['label'])) for it in items) + 24)
+            bx0, bx1 = x0 + label_w, x1 - 190
+            signed = any(float(it['value']) < 0 for it in items)
+            mid = (bx0 + bx1) / 2 if signed else bx0
+            half = bx1 - mid
+            scale = max(abs(float(it['value'])) for it in items) or 1.0
+            if signed:
+                draw.line((mid, y + title_h + 4, mid, y + height - 14), fill=GRID, width=2)
+            for i, it in enumerate(items):
+                ry = y + title_h + i * row_h
+                value = float(it['value'])
+                color = UP if value > 0 else DOWN if value < 0 else MUTED
+                label, size = fit(str(it['label']), 22, label_w - 16, False, 16)
+                text_at(draw, (x0, ry + 8), label, size, INK)
+                length = max(3.0, half * abs(value) / scale)
+                box = (mid, ry + 11, mid + length, ry + 31) if value >= 0 else (mid - length, ry + 11, mid, ry + 31)
+                draw.rounded_rectangle(box, radius=6, fill=color)
+                draw.text((x1, ry + 21), str(it.get('text') or f'{value:+,.0f}'), font=font(22, True), fill=color, anchor='rm')
+        return height
+    if kind == 'vbars':
+        # 小型正負柱狀圖（例如近 20 日法人買賣超）：日期只標頭、中、尾，最新一天標數值
+        items = section.get('items') or []
+        if len(items) < 2:
+            return 0
+        title_h, chart_h, label_h = (34 if section.get('title') else 0), 150, 30
+        height = title_h + chart_h + label_h + 12
+        if not dry:
+            if section.get('title'):
+                text_at(draw, (x0, y + 2), section['title'], 21, MUTED, True)
+            top = y + title_h + 8
+            values = [float(it['value']) for it in items]
+            signed = any(v < 0 for v in values)
+            base = top + chart_h / 2 if signed else top + chart_h - 10
+            room = chart_h / 2 - 16 if signed else chart_h - 26
+            scale = max(abs(v) for v in values) or 1.0
+            slot = width / len(items)
+            draw.line((x0, base, x1, base), fill=GRID, width=2)
+            for i, (it, value) in enumerate(zip(items, values)):
+                cx = x0 + slot * (i + 0.5)
+                bar = max(2.0, room * abs(value) / scale)
+                last = i == len(items) - 1
+                color = UP if value > 0 else DOWN if value < 0 else MUTED
+                w = max(4.0, slot * 0.62)
+                box = (cx - w / 2, base - bar, cx + w / 2, base) if value >= 0 else (cx - w / 2, base, cx + w / 2, base + bar)
+                draw.rectangle(box, fill=color)
+                if last:
+                    draw.rectangle(box, outline=ACCENT, width=3)
+                    # 最新一天的數值放在標題列右側，不壓到柱子或日期
+                    draw.text((x1, y + 2), f"最新 {it.get('label', '')}｜{it.get('text') or f'{value:+,.0f}'}",
+                              font=font(21, True), fill=color, anchor='rt')
+            for i in sorted({0, len(items) // 2, len(items) - 1}):
+                cx = x0 + slot * (i + 0.5)
+                draw.text((cx, top + chart_h + 6), str(items[i].get('label', '')), font=font(17), fill=MUTED,
+                          anchor='lt' if i == 0 else 'rt' if i == len(items) - 1 else 'mt')
+        return height
+    if kind == 'points':
+        # 1～3 行重點（金色圓點），取代大段文字
+        items = [str(t) for t in (section.get('items') or []) if str(t).strip()][:3]
+        if not items:
+            return 0
+        total = 0
+        for item in items:
+            lines = wrap(item, 24, width - 30, False)
+            if not dry:
+                draw.ellipse((x0 + 2, y + total + 12, x0 + 12, y + total + 22), fill=ACCENT)
+                for i, line in enumerate(lines):
+                    text_at(draw, (x0 + 26, y + total + i * 36), line, 24, INK)
+            total += len(lines) * 36 + 8
+        return total + 10
     if kind == 'rows':
         # 一行一格的淺底資料列：前段（名稱）粗體、後段各項用「｜」分隔；數字正負用紅綠
         total = 0
@@ -2513,6 +2602,15 @@ def add_center_watermarks(image: Image.Image) -> Image.Image:
 _NOTE_PREFIX = ('資料時間', '※', '資料來源', '⚠️', '🧡', '(', '（')
 
 
+def _brief_ai(data: dict) -> dict:
+    """AI 解讀卡最多 2 個理由、2 個情境（圖上已有的數字不再長篇重述）。"""
+    data = dict(data or {})
+    for key in ('why', 'scenarios'):
+        if isinstance(data.get(key), list):
+            data[key] = data[key][:2]
+    return data
+
+
 def text_card(text: str) -> dict:
     """把規則式／系統文字轉成和其他研究筆記一致的卡片：**標題**→卡片標題、【小標】→金色小標、
     「名稱：a｜b」或含「｜」的行→資料列、※／資料時間→註解，其餘句子→段落。"""
@@ -2586,6 +2684,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     header_height = 155 + len(question_lines) * 47
     # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
     # AI 解讀卡已包含回答全文（含延續上一題與資料時間），不再另外排文字區塊。
+    ai_panels = [dict(p, ai_card=_brief_ai(p['ai_card'])) for p in ai_panels]
     hide_text = (sector_panels or article_panels or review_panels or ai_panels
                  or any(p.get('hide_text') for p in branch_panels))
     blocks = []
