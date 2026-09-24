@@ -1,0 +1,239 @@
+name: Broker Winrate Quick - 分點勝率速查
+
+# 用法：
+# 1. Actions → 本 workflow → Run workflow，填分點（可一次填多間，逗號分隔）。
+#      元大-台南=9851,凱基-松山
+#    「名稱=券商代號」最準；代號大小寫敏感（9A9g 永豐金內湖 ≠ 9A9G 永豐金天母）。
+#    只給名稱會先用近 5 日樣本權證探索代號，找不到會請你補代號。
+# 2. 跑完到這次執行的 Summary 頁看「全部＋A/B/C/D/E」勝率表，CSV 在 Artifacts。
+#
+# 耗時：
+# - 已在回測分點清單內的分點：直接用回測快取，幾分鐘內結束。
+# - 新分點：MoneyDJ API4 以權證為單位，必須把窗口內全市場權證掃一遍才找得到它
+#   做過哪些權證，15 req/s 下約 1 小時。多間分點一起查成本一樣，建議合併成一次。
+#
+# 快取：
+# - 回測的 warrant_cache 只「還原、唯讀」，絕不存回，避免蓋掉回測自己的快取。
+# - 本工具自己的結果快取用獨立前綴 broker-winrate-quick-，只存 quick_winrate 子資料夾。
+#   前綴刻意不以 warrant-cache-moneydj- 開頭：否則回測的 restore-keys 會把這份
+#   「只有幾間分點」的快取當成最新快取還原，daily 會以為歷史被砍光。
+
+on:
+  workflow_dispatch:
+    inputs:
+      brokers:
+        description: "分點，逗號分隔；格式 名稱=券商代號（代號可省略），例如 元大-台南=9851,凱基-松山"
+        required: true
+        type: string
+      days:
+        description: "回溯交易日數（預設 200＝與回測勝率統計相同；MoneyDJ 資料最早只到 2023/09/11）"
+        required: false
+        default: "200"
+        type: string
+      mark_to_market:
+        description: "持有滿 60 日未出清按權證市價估值（1＝與 repair 勝率一致）"
+        required: false
+        type: choice
+        options:
+          - "1"
+          - "0"
+        default: "1"
+      force_refetch:
+        description: "忽略快取重抓 MoneyDJ（1＝重抓）"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+        default: "0"
+
+permissions:
+  contents: read
+
+# 同分支同時只跑一個速查：兩個都在掃 API4 會一起被 MoneyDJ 限流。
+concurrency:
+  group: broker-winrate-quick-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  broker-winrate-quick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+
+      # ============================================================
+      # 回測模組設定（必須與 warrant-backtest-moneydj.yml 一致）
+      # ============================================================
+      OUTPUT_DIR: output
+      CACHE_DIR: warrant_cache
+      USE_CACHE: "1"
+      FORCE_FULL_CACHE_REFRESH: "0"
+      # load_history_cache 會依這個值剪掉保留窗口外的日期，和回測設不一樣會少資料。
+      HISTORY_RETENTION_TRADING_DAYS: "200"
+      PRICE_RETENTION_TRADING_DAYS: "260"
+      # 本機快取不在時，回測的 read_cache_csv 會嘗試讀 Google Sheet 舊快取；
+      # 這裡沒有給憑證，關掉讓它直接報「讀不到快取」，不要卡在 Sheet 連線。
+      GSHEET_CACHE_ENABLED: "0"
+      SUPABASE_CACHE_ENABLED: "0"
+
+      # ============================================================
+      # MoneyDJ 併發與限流（照抄回測 workflow 的實證值，不要往上調）
+      # ------------------------------------------------------------
+      #   15 req/s → 23,892 筆全數跑完，0 次限流
+      #   25 req/s → 約 4,000 筆就被擋，之後全程卡在冷卻
+      # 程式預設 workers=80，不在這裡壓下來一定會被擋。
+      # ============================================================
+      MONEYDJ_DYNAMIC_HASH_ENABLED: "1"
+      MONEYDJ_PRESCAN_WORKERS: "20"
+      MONEYDJ_HISTORY_WORKERS: "20"
+      MONEYDJ_MAX_RETRIES: "3"
+      MONEYDJ_RETRY_BASE_SECONDS: "1.0"
+      MONEYDJ_RATE_LIMIT_ENABLED: "1"
+      MONEYDJ_RATE_START_PER_SECOND: "15"
+      MONEYDJ_RATE_MIN_PER_SECOND: "5"
+      MONEYDJ_RATE_MAX_PER_SECOND: "15"
+      MONEYDJ_THROTTLE_DETECT_ENABLED: "1"
+      MONEYDJ_THROTTLE_ESCALATE_MIN_GAP: "10"
+      MONEYDJ_THROTTLE_BASE_COOLDOWN: "15"
+      MONEYDJ_THROTTLE_MAX_COOLDOWN: "45"
+      MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS: "6"
+      MONEYDJ_FAILURE_SAMPLE_PRINTS: "3"
+
+      # 滿 60 日估值補抓權證價格用，與回測相同。
+      LONGTERM_PRICE_LOOKBACK_DAYS: "420"
+      LONGTERM_PRICE_STALE_DAYS: "10"
+      WINRATE_DELISTED_MISSING_PRICE: "0"
+      PRICE_WORKERS: "60"
+
+      # ============================================================
+      # 速查設定
+      # ============================================================
+      QUICK_BACKTEST_PATH: warrant_backtest_moneydj.py
+      QUICK_BROKERS: ${{ inputs.brokers }}
+      QUICK_DAYS: ${{ inputs.days }}
+      QUICK_MARK_TO_MARKET: ${{ inputs.mark_to_market }}
+      QUICK_FORCE_REFETCH: ${{ inputs.force_refetch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in broker_winrate_quick.py "$QUICK_BACKTEST_PATH"; do
+            if [[ ! -f "$f" ]]; then
+              echo "❌ 找不到 $f"
+              missing=1
+            fi
+          done
+          if [[ "$missing" == "1" ]]; then
+            echo "目前倉庫內的 Python 檔案："
+            find . -maxdepth 2 -type f -name "*.py" -print
+            exit 1
+          fi
+          grep -n "PROGRAM_BUILD_ID = " "$QUICK_BACKTEST_PATH" || true
+
+      # 只還原、不存回。key 帶 run_id 讓它永遠不會完全命中，一律走 restore-keys
+      # 取「回測最近一次存的快取」。沒有也照跑（權證母體會重抓、已在清單的分點也要重掃），
+      # 只是慢，所以不設 fail-on-cache-miss。
+      - name: Restore backtest warrant cache (read-only)
+        id: backtest-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: warrant_cache
+          key: warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-winrate-readonly-${{ github.run_id }}
+          restore-keys: |
+            warrant-cache-moneydj-v10-${{ runner.os }}-${{ github.ref_name }}-
+            warrant-cache-moneydj-v10-${{ runner.os }}-
+
+      # 必須在回測快取之後還原：兩者路徑重疊，後還原的才不會被蓋掉。
+      - name: Restore quick winrate cache
+        uses: actions/cache/restore@v4
+        with:
+          path: warrant_cache/quick_winrate
+          key: broker-winrate-quick-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            broker-winrate-quick-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Show cache contents
+        shell: bash
+        run: |
+          du -sh warrant_cache 2>/dev/null || true
+          if [[ -f warrant_cache/broker_warrant_history_cache.csv ]]; then
+            echo "✅ 回測歷史快取就緒"
+          else
+            echo "⚠️ 沒有回測歷史快取：所有分點都會走 MoneyDJ 全市場掃描，耗時較長"
+          fi
+          ls warrant_cache/quick_winrate 2>/dev/null || echo "（尚無速查快取）"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 回測程式在模組層就 import openpyxl 等套件，只是載入它的函式也要裝。
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            requests \
+            pandas \
+            numpy \
+            pyarrow \
+            openpyxl \
+            lxml \
+            html5lib \
+            beautifulsoup4 \
+            gspread \
+            google-auth
+
+      - name: Run broker winrate quick
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output warrant_cache
+          echo "=========================================="
+          echo "分點：$QUICK_BROKERS"
+          echo "回溯交易日：$QUICK_DAYS"
+          echo "滿 60 日市價估值：$QUICK_MARK_TO_MARKET"
+          echo "強制重抓：$QUICK_FORCE_REFETCH"
+          echo "=========================================="
+          python -u broker_winrate_quick.py
+
+      # 程式只在 API5 全部取回時才落地速查快取，所以失敗的那次不會存到半套資料。
+      - name: Save quick winrate cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: warrant_cache/quick_winrate
+          key: broker-winrate-quick-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+        continue-on-error: true
+
+      - name: Upload winrate CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-winrate-quick-${{ github.run_number }}
+          path: output/broker_winrate_quick_*.csv
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 出事時看是哪幾檔權證、哪種失敗被 MoneyDJ 擋掉。
+      - name: Upload MoneyDJ diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-winrate-quick-diagnostics-${{ github.run_number }}
+          path: |
+            warrant_cache/moneydj_request_failures_*.jsonl
+            warrant_cache/prescan_failed_codes.csv
+          if-no-files-found: ignore
+          retention-days: 7
