@@ -1049,13 +1049,14 @@ def report_card(report: Dict[str, Any], stock_code: str, stock_name: str) -> Dic
             sections.append({"type": "table", "columns": ["期間", "Top15買超", "Top15賣超", "買超比", "賣超比", "淨集中度", "判讀"],
                              "rows": rows, "signed": ("Top15買超", "Top15賣超", "淨集中度"), "accent": ()})
         if report.get("cumulative_buy") or report.get("cumulative_sell"):
-            # 近 20 日主要分點方向：買超／賣超合併取絕對值最大的 5 個，正負橫條（取代兩欄清單）
+            # 兩欄清單（和上方最新 TOP5 同一種樣式）；試過正負橫條，放在兩欄清單中間太突兀，改回
             n = report.get("cumulative_days", 20)
-            top = sorted((report.get("cumulative_buy") or []) + (report.get("cumulative_sell") or []),
-                         key=lambda x: -abs(x["net"]))[:5]
-            sections.append({"type": "heading", "text": f"近{n}日主要分點方向"})
-            sections.append({"type": "hbars", "items": [{"label": _branch_label(x), "value": x["net"], "text": _lots(x["net"])}
-                                                        for x in top]})
+            sections.append({"type": "heading", "text": f"主要累積分點（近{n}日）"})
+            sections.append({"type": "lists", "items": [
+                {"title": "累積買超", "tone": "up", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                           for x in report.get("cumulative_buy") or []]},
+                {"title": "累積賣超", "tone": "down", "rows": [{"name": _branch_label(x), "value": _lots(x["net"]), "extra": ""}
+                                                             for x in report.get("cumulative_sell") or []]}]})
         if report.get("continuity"):
             sections.append({"type": "heading", "text": "分點延續性（主要累積買超）"})
             sections.append({"type": "table", "columns": ["分點", "近20日買超天數", "近5日買超天數", "狀態", "估算成本"],
