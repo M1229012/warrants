@@ -845,9 +845,10 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         j = index.get(e.get('exit_date') or '')
         if j is not None:
             sell_days.setdefault(j, []).append(e['no'])
-        k = index.get(e.get('reduce_date') or '')
-        if k is not None and k != j:
-            reduce_days.add(k)
+        for day in set(e.get('reduce_dates') or []) | {e.get('reduce_date') or ''}:   # 同一筆事件可能分好幾天減碼
+            k = index.get(day)
+            if k is not None and k != j:
+                reduce_days.add(k)
     buy_days = set(buy_days_numbers)
 
     # 同一天有好幾筆：每個編號各自一顆圓圈、並排在同一列（不合併成「1、2」膠囊）

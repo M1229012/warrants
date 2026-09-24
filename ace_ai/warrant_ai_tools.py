@@ -3966,6 +3966,9 @@ def _sell_rows(stock_code: str = "", branch: str = "") -> pd.DataFrame:
     if df.empty or not {"分點", "標的股", "日期"}.issubset(df.columns):
         return pd.DataFrame()
     work = df.copy()
+    keys = [c for c in ("分點", "標的股", "日期", "權證代號", "狀態", "賣出股數", "賣出金額", "事件日") if c in work.columns]
+    if keys:
+        work = work.drop_duplicates(subset=keys)
     work["_branch"] = work["分點"].map(kf.normalize_branch_name)
     work["_code"] = work["標的股"].map(kf._normalize_stock_name_code_key)
     if stock_code:
@@ -5019,7 +5022,7 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
                                        if reduce_in_window else ("none", 0.0))
         reduce_ok = (reduce_state == "verified" and reduce_amount >= MIN_SELL_MARK_AMOUNT) or reduce_state == "uncovered"
         reduce_marks += 1 if reduce_ok else 0
-        marks.append({
+        mark = {
             "no": no,
             "branch": branch,
             "event": r["event_code"],
@@ -5031,7 +5034,9 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             "exit_amount_text": _money_text(-exit_amount) if exit_amount else "",
             "exit_unverified": exit_state == "missing",
             "status": r["status"],
-        })
+        }
+        _apply_later_sells(mark, r, sells, start, end)
+        marks.append(mark)
     if marks:
         print(f"✅ {code} 事件標註｜事件 {len(marks)} 筆｜已核對出清 {verified_exits} 筆｜"
               f"未涵蓋期間的出清 {uncovered_exits} 筆｜減碼 {reduce_marks} 筆"
@@ -5060,6 +5065,36 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
             "filter_counts": {"stock_events": len(stock_rows), "in_window": window_count,
                               "eligible_branch": branch_count, "excluded_day_trades": int(day_trades.sum()),
                               "displayed": len(marks)}}
+
+
+def _apply_later_sells(mark: Dict[str, Any], event: pd.Series, sells: pd.DataFrame, start: Any, end: Any) -> None:
+    """事件表的減碼日／出清日只記第一次；圖表區間內之後的賣出用每日賣出明細補上（依「事件日」對應這筆事件）：
+    單日賣出 ≥ MIN_SELL_MARK_AMOUNT 的日子都標減碼（reduce_dates）；事件買的權證全部都有「出清」紀錄時標出清（沿用事件編號）。
+    後續動作欄改寫最新一次動作。"""
+    if sells is None or sells.empty or "事件日" not in sells.columns:
+        return
+    event_day = pd.Timestamp(event["event_date"]).normalize()
+    own = sells[(sells["_branch"] == mark["branch"]) & (sells["事件日"].map(_parse_sheet_date) == event_day)]
+    own = own[(own["_date"] >= start) & (own["_date"] <= end)]
+    if own.empty:
+        return
+    by_day = own.groupby(own["_date"].map(lambda d: pd.Timestamp(d).normalize()))["_amount"].sum()
+    warrants = {code for code, _ in _warrant_items(event)}
+    cleared = own[own.get("狀態", pd.Series("", index=own.index)).astype(str).str.contains("出清")]
+    if not mark["exit_date"] and warrants and warrants <= set(cleared.get("權證代號", pd.Series(dtype=str)).astype(str).str.strip()):
+        day = pd.Timestamp(cleared["_date"].max()).normalize()
+        mark["exit_date"] = _fmt_date(day)
+        mark["exit_amount_text"] = _money_text(-float(by_day.get(day, 0.0)))
+        mark["exit_unverified"] = False
+    exit_day = mark["exit_date"]
+    reduces = [(day, amount) for day, amount in by_day.items()
+               if amount >= MIN_SELL_MARK_AMOUNT and _fmt_date(day) != exit_day]
+    if reduces:
+        mark["reduce_dates"] = sorted({_fmt_date(day) for day, _ in reduces} | ({mark["reduce_date"]} if mark["reduce_date"] else set()))
+        last_day, last_amount = max(reduces, key=lambda x: x[0])
+        if not mark["reduce_date"] or _fmt_date(last_day) > mark["reduce_date"]:
+            mark["reduce_date"] = _fmt_date(last_day)
+            mark["reduce_amount_text"] = _money_text(-float(last_amount))
 
 
 def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
