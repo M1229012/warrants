@@ -1897,9 +1897,9 @@ LAYOUT_SCHEMA = {
 }
 _LAYOUT_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _LAYOUT_STRIP_RE = re.compile(r"[\s*`，。、；：:,.!?！？（）()「」『』【】《》〈〉…\-—～~｜|/／%％]+")
-LAYOUT_LEFTOVER_RATIO = 0.25     # 原文沒被段落涵蓋的部分（移到資料列的句子、刪掉的開頭語）最多占全文比例
+LAYOUT_LEFTOVER_RATIO = 0.12     # 扣掉段落與資料列後原文剩下的字（刪掉的開頭語、資料列改寫的名稱）最多占全文比例
 LAYOUT_MAX_ROWS = 4
-LAYOUT_MAX_LABEL = 10
+LAYOUT_MAX_LABEL = 14
 
 
 def layout_prompt(body: str, retry_reason: str = "") -> str:
@@ -1943,7 +1943,10 @@ def parse_layout(data: Any) -> Optional[Dict[str, Any]]:
 
 
 def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
-    """排版結果逐字核對：數字完全一致、每段都是原文的連續片段、沒被涵蓋的原文不超過一定比例。"""
+    """排版結果逐句核對：
+    - 段落拆成子句（，；。），每個子句都要是原文逐字的片段（中間抽走一句到資料列可以，改寫、新增字不行）
+    - 原文每個數字都要出現、不能有原文沒有的數字（重複可以，由 tidy_layout 去重）
+    - 扣掉段落子句與資料列內容後，原文剩下沒被呈現的字不超過一定比例（不能整句丟掉）"""
     paragraphs = [p for s in layout["sections"] for p in s["paragraphs"]]
     rows = [r for s in layout["sections"] for r in s["rows"]]
     if len(rows) > LAYOUT_MAX_ROWS:
@@ -1951,7 +1954,6 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
     if long_label:
         return False, f"資料列名稱太長：{long_label}"
-    # 原文每個數字都要出現、不能出現原文沒有的數字；同一數字重複出現（段落＋資料列）由 tidy_layout 去重
     expected = set(_layout_numbers([body]))
     actual = set(_layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows]))
     if expected != actual:
@@ -1961,12 +1963,20 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     original = _layout_norm(body)
     leftover = original
     for paragraph in paragraphs:
-        piece = _layout_norm(paragraph)
-        if not piece or piece not in original:
-            return False, f"段落不是原文：{paragraph[:20]}"
-        leftover = leftover.replace(piece, "", 1)
+        for clause in _CLAUSE_RE.findall(paragraph):
+            piece = _layout_norm(clause)
+            if not piece:
+                continue
+            if piece not in original:
+                return False, f"句子不是原文：{clause[:24]}"
+            leftover = leftover.replace(piece, "", 1)
+    for row in rows:                      # 搬到資料列的內容也算有呈現
+        for part in (row["value"], row["label"]):
+            piece = _layout_norm(part)
+            if piece and piece in leftover:
+                leftover = leftover.replace(piece, "", 1)
     if len(leftover) > max(30, len(original) * LAYOUT_LEFTOVER_RATIO):
-        return False, f"有 {len(leftover)} 字原文沒有出現在排版結果"
+        return False, f"有 {len(leftover)} 字原文沒有出現在排版結果：{leftover[:20]}"
     return True, ""
 
 
@@ -2018,6 +2028,115 @@ def tidy_layout(layout: Dict[str, Any]) -> Dict[str, Any]:
     for k, (i, row) in enumerate(rows):
         if k not in dropped_rows:
             sections[i]["rows"].append(_tidy_row(row))
+    return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
+
+
+_LEAD_IN_RE = re.compile(r"^(?:權證籌碼方面|權證籌碼上|權證籌碼|權證方面|籌碼方面|籌碼面|籌碼上|技術面上|技術面|技術上|"
+                         r"型態上|型態面|操作建議|操作方面|操作面|操作上)(?:來看|而言|方面|部分|上)?[，,：:、\s]*")
+# 小標關鍵字與權重：「突破」「整理」「操作」這類各段都會出現的通用詞權重低
+_HEADING_WORDS = {
+    "技術面": {"均線": 1, "型態": 1, "布林": 1, "季線": 1, "月線": 1, "年線": 1, "K線": 1, "扣抵": 1, "趨勢": 1,
+            "盤整": 1, "震盪": 1, "量能": 1, "大量區": 1, "翻揚": 1, "下彎": 1, "上揚": 1, "多頭": 1, "空頭": 1,
+            "長紅": 1, "長黑": 1, "突破": 0.5, "整理": 0.5},
+    "籌碼面": {"分點": 1, "權證": 1, "籌碼": 1, "買進": 1, "買超": 1, "賣超": 1, "勝率": 1, "持有": 1, "事件": 1,
+            "部位": 1, "主力": 1, "外資": 1, "投信": 1, "法人": 1, "加碼": 1, "減碼": 1, "追打": 1, "布局": 1, "佈局": 1},
+    "操作觀察": {"追價": 1.5, "追高": 1.5, "拉回": 1.5, "回檔": 1.5, "觀察": 1.5, "停損": 1.5, "跌破": 1.5, "進場": 1.5,
+             "出場": 1.5, "等待": 1.5, "可等": 1.5, "不急": 1.5, "失效": 1.5, "失敗": 1.5, "風險": 1.5, "留意": 1.5,
+             "注意": 1.5, "操作": 0.5},
+}
+_ROW_WORDS = ("買進", "買超", "賣超", "賣出", "勝率", "持有", "報酬", "金額", "張數")
+_ROW_LABEL_TRIM = re.compile(r"^(?:目前|該分點|其中|共|而|並)+|的$")
+LAYOUT_SPLIT_CHARS = 70          # 段落超過這麼長而且有兩句以上，從中間的句號拆成兩段
+
+
+def _heading_scores(text: str) -> Dict[str, float]:
+    return {h: sum(text.count(w) * weight for w, weight in words.items()) for h, words in _HEADING_WORDS.items()}
+
+
+def _heading_of(text: str) -> str:
+    scores = _heading_scores(text)
+    best = max(LAYOUT_HEADINGS, key=lambda h: (scores[h], -LAYOUT_HEADINGS.index(h)))
+    return best if scores[best] > 0 else ""
+
+
+def _ordered_headings(blocks: List[str]) -> List[str]:
+    """整篇沒分段時逐句判斷：小標只往下走（技術面→籌碼面→操作觀察），往回跳的句子歸到下一句的小標（或目前的小標）。"""
+    raw = [_heading_of(b) for b in blocks]
+    out: List[str] = []
+    current = 0
+    for i, heading in enumerate(raw):
+        idx = LAYOUT_HEADINGS.index(heading) if heading else current
+        if idx < current:
+            following = next((LAYOUT_HEADINGS.index(h) for h in raw[i + 1:] if h), current)
+            idx = max(current, following)
+        current = idx
+        out.append(LAYOUT_HEADINGS[idx])
+    return out
+
+
+def _split_long(paragraph: str) -> List[str]:
+    sentences = re.findall(r"[^。]+。?", paragraph)
+    if len(paragraph) <= LAYOUT_SPLIT_CHARS or len(sentences) < 2:
+        return [paragraph]
+    total, best, cut = len(paragraph), None, 1
+    for i in range(1, len(sentences)):
+        gap = abs(len("".join(sentences[:i])) - total / 2)
+        if best is None or gap < best:
+            best, cut = gap, i
+    return ["".join(sentences[:cut]).strip(), "".join(sentences[cut:]).strip()]
+
+
+def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]:
+    rows, kept = [], []
+    for clause in _CLAUSE_RE.findall(paragraph):
+        core = clause.strip("，,；;。 ")
+        match = _ROW_TAIL_RE.match(core)
+        label = _ROW_LABEL_TRIM.sub("", match.group(1).strip()) if match else ""
+        if (match and len(rows) < room and label and len(label) <= LAYOUT_MAX_LABEL
+                and any(w in core for w in _ROW_WORDS) and _LAYOUT_NUMBER_RE.search(match.group(2))):
+            rows.append({"label": label, "value": match.group(2).strip()})
+            continue
+        kept.append(clause)
+    text = "".join(kept).strip()
+    if text and text[-1] in "，,；;":
+        text = text[:-1] + "。"
+    return text, rows
+
+
+def rule_layout(body: str) -> Optional[Dict[str, Any]]:
+    """不靠 AI 的排版：依關鍵字判斷小標、刪掉和小標重複的開頭語、籌碼數字抽成資料列、長段落拆開。只刪減與搬動原句。"""
+    blocks = [re.sub(r"\*\*|`", "", b).strip() for b in re.split(r"\n+", str(body or "")) if b.strip()]
+    single = len(blocks) == 1
+    if single:                            # 整篇只有一段：逐句判斷，連續同小標的句子合成一段
+        blocks = [x.strip() for x in re.findall(r"[^。]+。?", blocks[0]) if x.strip()]
+    sections: List[Dict[str, Any]] = []
+    headings = _ordered_headings(blocks) if single else [
+        _heading_of(b) or "" for b in blocks]
+    for block, heading in zip(blocks, headings):
+        heading = heading or (sections[-1]["heading"] if sections else LAYOUT_HEADINGS[0])
+        text = _LEAD_IN_RE.sub("", block).strip()
+        if not text:
+            continue
+        if sections and sections[-1]["heading"] == heading:
+            # 原本就分段的文章保留段落；整篇一段時逐句判斷，同小標的句子接回同一段
+            if single:
+                sections[-1]["paragraphs"][-1] += text
+            else:
+                sections[-1]["paragraphs"].append(text)
+        else:
+            sections.append({"heading": heading, "paragraphs": [text], "rows": []})
+    if not sections:
+        return None
+    for sec in sections:
+        if sec["heading"] == "籌碼面":
+            paragraphs = []
+            for paragraph in sec["paragraphs"]:
+                text, rows = _extract_rows(paragraph, LAYOUT_MAX_ROWS - len(sec["rows"]))
+                sec["rows"] += rows
+                if text:
+                    paragraphs.append(text)
+            sec["paragraphs"] = paragraphs
+        sec["paragraphs"] = [q for p in sec["paragraphs"] for q in _split_long(p) if q]
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 

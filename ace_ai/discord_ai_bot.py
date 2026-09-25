@@ -4260,8 +4260,9 @@ class AceQueryEngine:
             result = self.gateway.generate(weekly_pick.layout_prompt(body, reason), "weekly_layout",
                                            schema=weekly_pick.LAYOUT_SCHEMA, temperature=0.1)
             if not result.ok:
-                self.log(f"週精選自動排版略過：Gemini 失敗｜{result.error}")
-                return None, "自動排版暫時無法使用（AI 忙碌），這張圖使用原文排版。", calls
+                reason = f"Gemini 失敗：{result.error}"
+                self.log(f"週精選自動排版：{reason}")
+                break
             try:
                 data = json.loads(result.text)
             except (TypeError, ValueError):
@@ -4269,14 +4270,23 @@ class AceQueryEngine:
             layout = weekly_pick.parse_layout(data)
             ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
             if ok:
-                layout = weekly_pick.tidy_layout(layout)
-                session.update(layout=layout, layout_for=key)
-                self._save_draft_session(context_key, session)
-                self.log(f"週精選自動排版完成｜{len(layout['sections'])} 段｜第 {calls} 次")
-                return layout, "", calls
+                return self._keep_layout(context_key, session, key, weekly_pick.tidy_layout(layout), f"Gemini 第 {calls} 次"), "", calls
             rows = [f"{r['label']}={r['value']}" for s in (layout or {}).get("sections", []) for r in s["rows"]]
             self.log(f"週精選自動排版未通過核對（第 {calls} 次）：{reason}｜資料列：{rows or '-'}")
-        return None, f"自動排版未通過逐字核對（{reason}），這張圖使用原文排版。", calls
+        # Gemini 沒排好：改用程式規則排版（只刪減與搬動原句，同一套逐句核對）
+        layout = weekly_pick.rule_layout(body)
+        ok, rule_reason = weekly_pick.verify_layout(body, layout) if layout else (False, "無法分段")
+        if ok:
+            return self._keep_layout(context_key, session, key, weekly_pick.tidy_layout(layout), "程式規則"), "", calls
+        self.log(f"週精選程式排版也未通過核對：{rule_reason}")
+        return None, f"自動排版未通過逐字核對（{rule_reason}），這張圖使用原文排版。", calls
+
+    def _keep_layout(self, context_key: str, session: Dict[str, Any], key: str, layout: Dict[str, Any], source: str) -> Dict[str, Any]:
+        session.update(layout=layout, layout_for=key)
+        self._save_draft_session(context_key, session)
+        rows = sum(len(s["rows"]) for s in layout["sections"])
+        self.log(f"週精選自動排版完成（{source}）｜{len(layout['sections'])} 段｜資料列 {rows}")
+        return layout
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：延續同一檔週精選草稿做文字修改。
@@ -4374,7 +4384,8 @@ class AceQueryEngine:
         with self._weekly_draft_lock:
             self._weekly_drafts[context_key] = session
         local_market_cache.set_state(self._draft_state_key(context_key), {
-            k: session.get(k) for k in ("stock_code", "stock_name", "draft", "previous_draft", "admin_notes", "updated_at")
+            k: session.get(k) for k in ("stock_code", "stock_name", "draft", "previous_draft", "admin_notes", "updated_at",
+                                        "manual", "layout_off", "layout", "layout_for")   # 重新部署後自動排版設定不遺失
         })
 
     def _clear_draft_session(self, context_key: str) -> None:
