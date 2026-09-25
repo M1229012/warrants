@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1664,11 +1665,18 @@ class WeeklyPickAnswer:
 
 
 def rank_cache_key(config: "WeeklyPickConfig", filters: "WeeklyPickFilters") -> str:
-    """排名快取鍵值：事件表與勝率統計沒更新、條件相同時，草稿與排名共用同一份結果。"""
+    """排名快取鍵值：事件表、勝率統計、行情日期都沒變且條件相同時，草稿與排名共用同一份結果。
+    行情日期（本地底庫最新交易日＋今天）納入鍵值：收盤行情更新後技術分數會變，不能沿用舊排名。"""
     bundle = tools.load_abcde_event_rows()
     perf = tools.read_branch_event_performance()
+    try:
+        import local_market_cache
+        bar_day = (local_market_cache.known_dates(1) or [""])[0]
+    except Exception:
+        bar_day = ""
     return "|".join([
-        "weekly_pick_rank_v8", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
+        "weekly_pick_rank_v9", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
+        bar_day, tools.taipei_now().strftime("%Y-%m-%d"),
         filters.signature(), str(config.event_window_trading_days), str(config.top_n),
     ])
 
@@ -1866,6 +1874,101 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
     text = "\n".join(body).strip()
     title = f"{stock_name}（{code}）" if stock_name else code
     return {"title": title, "body": text, "disclaimers": disclaimers or ["⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"]}
+
+
+# ============================================================
+# 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
+# ============================================================
+
+LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
+LAYOUT_SCHEMA = {
+    "type": "object",
+    "properties": {"sections": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "heading": {"type": "string", "enum": list(LAYOUT_HEADINGS)},
+            "paragraphs": {"type": "array", "items": {"type": "string"}},
+            "rows": {"type": "array", "items": {"type": "object", "properties": {
+                "label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"]}},
+        },
+        "required": ["heading", "paragraphs"],
+    }}},
+    "required": ["sections"],
+}
+_LAYOUT_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_LAYOUT_STRIP_RE = re.compile(r"[\s*`，。、；：:,.!?！？（）()「」『』【】《》〈〉…\-—～~｜|/／%％]+")
+LAYOUT_LEFTOVER_RATIO = 0.25     # 原文沒被段落涵蓋的部分（移到資料列的句子、刪掉的開頭語）最多占全文比例
+
+
+def layout_prompt(body: str) -> str:
+    return (
+        "你是排版編輯。下面是一篇已經寫好的個股觀察文章，請只做排版，輸出 JSON。\n"
+        f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。\n"
+        "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
+        "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
+        "4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 3 個可以整理成 rows：label 為 2～6 字的名稱，"
+        "value 逐字照抄原文含數字的那一小段；放進 rows 的數字不要再留在段落裡，其他數字一律留在段落。\n"
+        "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n\n"
+        f"原文：\n{body}"
+    )
+
+
+def _layout_norm(text: str) -> str:
+    return _LAYOUT_STRIP_RE.sub("", _LAYOUT_NUMBER_RE.sub(lambda m: m.group().replace(",", ""), str(text or "")))
+
+
+def _layout_numbers(texts) -> Counter:
+    return Counter(n.replace(",", "") for t in texts for n in _LAYOUT_NUMBER_RE.findall(str(t or "")))
+
+
+def parse_layout(data: Any) -> Optional[Dict[str, Any]]:
+    """Gemini 回傳的排版結構正規化；格式不對回 None。"""
+    if not isinstance(data, dict) or not isinstance(data.get("sections"), list):
+        return None
+    sections = []
+    for sec in data["sections"]:
+        if not isinstance(sec, dict) or sec.get("heading") not in LAYOUT_HEADINGS:
+            return None
+        paragraphs = [str(p).replace("**", "").strip() for p in sec.get("paragraphs") or [] if str(p).strip()]
+        rows = [{"label": str(r.get("label") or "").strip(), "value": str(r.get("value") or "").replace("**", "").strip()}
+                for r in sec.get("rows") or [] if isinstance(r, dict)]
+        rows = [r for r in rows if r["label"] and r["value"]]
+        if paragraphs or rows:
+            sections.append({"heading": sec["heading"], "paragraphs": paragraphs, "rows": rows})
+    return {"sections": sections} if sections else None
+
+
+def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
+    """排版結果逐字核對：數字完全一致、每段都是原文的連續片段、沒被涵蓋的原文不超過一定比例。"""
+    paragraphs = [p for s in layout["sections"] for p in s["paragraphs"]]
+    rows = [r for s in layout["sections"] for r in s["rows"]]
+    if len(rows) > 3 or any(len(r["label"]) > 8 or _LAYOUT_NUMBER_RE.search(r["label"]) for r in rows):
+        return False, "資料列格式不符"
+    if _layout_numbers([body]) != _layout_numbers(paragraphs + [r["value"] for r in rows]):
+        return False, "數字和原文不一致"
+    original = _layout_norm(body)
+    leftover = original
+    for paragraph in paragraphs:
+        piece = _layout_norm(paragraph)
+        if not piece or piece not in original:
+            return False, f"段落不是原文：{paragraph[:20]}"
+        leftover = leftover.replace(piece, "", 1)
+    if len(leftover) > max(30, len(original) * LAYOUT_LEFTOVER_RATIO):
+        return False, f"有 {len(leftover)} 字原文沒有出現在排版結果"
+    return True, ""
+
+
+def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str]) -> Dict[str, Any]:
+    """排版結果 → 和其他研究筆記同一套卡片（金色小標、段落、淺底資料列、註解）。"""
+    sections: List[Dict[str, Any]] = []
+    for sec in layout["sections"]:
+        sections.append({"type": "heading", "text": sec["heading"]})
+        sections += [{"type": "paragraph", "text": p} for p in sec["paragraphs"]]
+        if sec["rows"]:
+            sections.append({"type": "rows", "items": [{"lead": r["label"], "parts": [r["value"]]} for r in sec["rows"]]})
+    notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in disclaimers]
+    sections.append({"type": "note", "text": "※ " + "｜".join(n for n in notes if n)})
+    return {"branch": title, "tags": ["權證分點觀察", "週精選"], "label": label, "sections": sections}
 
 
 def weekly_image_text(draft: str, stock_code: str, stock_name: str = "") -> str:

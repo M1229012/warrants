@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextvars
+import hashlib
 import json
 import io
 import math
@@ -1605,8 +1606,38 @@ class GeminiGateway:
 
     def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
                             schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+        """圖片＋文字；總時限和文字路徑相同（DEADLINE 秒），多模型×多金鑰依序重試時不讓這題無限等待。"""
+        if not self.DEADLINE:
+            return self._generate_with_image(prompt, image, mime_type, purpose, schema)
+        gate = self._OUTSTANDING
+        if not gate.acquire(blocking=False):
+            self.log(f"Gemini 背景工作已滿，略過讀圖：{purpose}")
+            return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
+        request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
+        deadline = time.monotonic() + self.DEADLINE
+        box: Dict[str, GeminiResult] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                with tools.api_request_scope(request_id):
+                    box["result"] = self._generate_with_image(prompt, image, mime_type, purpose, schema, deadline)
+            except Exception as exc:
+                box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
+            finally:
+                gate.release()
+                done.set()
+        threading.Thread(target=run, name="ace-gemini-image", daemon=True).start()
+        if not done.wait(self.DEADLINE):
+            self.log(f"Gemini 讀圖超過 {self.DEADLINE:.0f} 秒，放棄：{purpose}")
+            tools.record_api_event("Gemini", status=504, latency=self.DEADLINE, detail=purpose)
+            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose)
+        return box["result"]
+
+    def _generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
+                             schema: Optional[Dict[str, Any]] = None, deadline: float = 0.0) -> GeminiResult:
         """圖片＋文字（例如讀截圖裡的股票清單）；主程式的 Gemini 函式只收文字，這裡直接用 google-genai，
-        沿用同一組 WARRANTS_API_KEY（失敗換下一支）與同一個模型。"""
+        沿用同一組 WARRANTS_API_KEY（失敗換下一支）與同一個模型。deadline 到了就不再開始新的嘗試。"""
         if not self._quota_left():
             return GeminiResult(ok=False, error="daily_limit", purpose=purpose)
         kf = tools.core()
@@ -1620,6 +1651,9 @@ class GeminiGateway:
         with self._lock:
             for index, key in enumerate(kf._get_warrants_api_keys(), 1):
                 for model in dict.fromkeys(m for m in (kf.GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m):
+                    if deadline and time.monotonic() >= deadline:
+                        last_error = last_error or "deadline"
+                        break
                     try:
                         client = kf.genai.Client(api_key=key)
                         response = client.models.generate_content(
@@ -2119,6 +2153,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
 
 
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])[-+]?\d[\d,]*(?:\.\d+)?")
+_PERCENT_AFTER_RE = re.compile(r"\s*[%％]")
 _EXEMPT_PATTERNS = (
     re.compile(r"\b(?:MA|MV|BB|K|D|J)\d+\b", re.IGNORECASE),
     re.compile(r"D\+\d+"),
@@ -2205,6 +2240,7 @@ _MA_LABEL = r"(?:" + _MA_NAME + r"|所有均線|全部均線|各均線|各條均
 # 「月線 31.2 元」「MA20（31.2）」「季線約 45」：標籤後面緊接的價格；後面接 %／日／張等單位的是距離或天數，不核對。
 # 指數（加權、櫃買）動輒五位數，寫法會有千分位逗號；不吃逗號的話「46,543」會被讀成「46」，
 # 事實核對就會把正確的句子當成數字錯誤刪掉。
+_MA_DEDUCTION_TALK_RE = re.compile(r"扣抵|扣除|上彎|下彎|翻揚|翻多|翻空|走平|需收|要收|收在|收上|收回")
 _MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d[\d,]*(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
 _DIRECTION_RE = re.compile(
     r"(站上|站穩|站回|突破|守住|守穩|跌破|失守|跌落|摜破)\s*((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)")
@@ -2285,6 +2321,8 @@ class FactSheet:
         self.stock_numbers: Dict[str, Set[str]] = {}
         self.shared_numbers: Set[str] = set()
         self.ma_values: Dict[str, Dict[str, List[float]]] = {}
+        # 扣抵價、明天需收在多少才上彎等「和均線有關但不是均線本身」的數字：只在句子講扣抵／上彎時才接受
+        self.ma_aux: Dict[str, Dict[str, List[float]]] = {}
         self.closed_pos: Dict[str, Dict[str, str]] = {}
         self.live_pos: Dict[str, Dict[str, str]] = {}
         tool_results = payload.get("tool_results") or {}
@@ -2314,8 +2352,9 @@ class FactSheet:
                     values.setdefault(key, []).append(float(info["value"]))
                 if info.get("position") in ("站上", "跌破", "持平"):
                     closed[key] = info["position"]
+        aux = self.ma_aux.setdefault(code, {})
         for key, info in (data.get("ma_deduction") or {}).items():
-            values.setdefault(key, []).extend(_numeric_values(info))  # 扣抵價、明天需收在多少才上彎等
+            aux.setdefault(key, []).extend(_numeric_values(info))  # 扣抵價、明天需收在多少才上彎等（不算均線值）
         # 型態評分卡沒有 moving_averages：用關鍵價位表補（現價下方＝站上、上方＝跌破）。
         for field_name, position in (("supports_below_close", "站上"), ("resistances_above_close", "跌破")):
             for level in data.get(field_name) or []:
@@ -2362,13 +2401,15 @@ class FactSheet:
         for pattern in _EXEMPT_PATTERNS:
             text = pattern.sub(" ", text)
         issues = []
-        for token in _NUMBER_RE.findall(text):
+        for match in _NUMBER_RE.finditer(text):
+            token = match.group()
             cleaned = token.replace(",", "").lstrip("+")
             try:
                 value = float(cleaned)
             except ValueError:
                 continue
-            if value.is_integer() and abs(value) <= 10:
+            # 1～10 的整數多半是天數、檔數（「3 天」「5 日」）不核對；但後面接 % 的是漲跌幅，照樣要對得上資料
+            if value.is_integer() and abs(value) <= 10 and not _PERCENT_AFTER_RE.match(text, match.end()):
                 continue
             forms = {cleaned, cleaned.lstrip("-")}
             if forms & self.market:
@@ -2388,9 +2429,13 @@ class FactSheet:
     def _ma_value_issues(self, sentence: str, code: str) -> List[str]:
         issues = []
         values = self.ma_values.get(code) or {}
+        aux = self.ma_aux.get(code) or {}
+        deduction_talk = bool(_MA_DEDUCTION_TALK_RE.search(sentence))
         for label, number in _MA_VALUE_RE.findall(sentence):
             key = _ma_key(label)
-            known = values.get(key)
+            known = list(values.get(key) or [])
+            if deduction_talk:
+                known += aux.get(key) or []
             if not known:
                 continue
             written = float(str(number).replace(",", ""))
@@ -2602,7 +2647,7 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
         if points is not None:
             head += f" {points:+.2f} 點"
         coverage = market.get("market_cap_coverage_pct")
-        if coverage is not None and str(market.get("basis") or "").startswith("盤中"):
+        if coverage is not None and (str(market.get("basis") or "").startswith("盤中") or coverage < 99.9):
             head += f"｜市值涵蓋 {coverage:.1f}%"
         lines.append(f"**{head}**")
         pos_share = market.get("top5_positive_share_pct")
@@ -2616,7 +2661,7 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
                     for x in items[:5]))
             else:
                 lines.append(label + "：目前沒有可列出的成分股")
-    lines.append("※ 盤中為官方即時報價估算；收盤後改用交易所全市場收盤快照完整計算。")
+    lines.append("※ 盤中為官方即時報價估算；收盤後改用交易所全市場收盤快照計算，缺價成分股以最近收盤計入市值、不計貢獻。")
     return chr(10).join(lines)
 
 
@@ -3521,6 +3566,12 @@ class AceQueryEngine:
             draft_session = {}
         if draft_session and weekly_pick.is_weekly_image_question(question):
             return self._answer_weekly_article_image(context_key, started)
+        if draft_session and re.sub(r"\s+", "", question) in ("用原文排版", "不要排版", "原文排版", "自動排版", "重新排版"):
+            off = re.sub(r"\s+", "", question) in ("用原文排版", "不要排版", "原文排版")
+            draft_session.update(layout_off=off, layout=None, layout_for="")
+            self._save_draft_session(context_key, draft_session)
+            return AnswerResult(text=("已改用原文排版" if off else "已開啟自動排版") + "；說「這版確認，生成圖片」產生新圖。",
+                                route="weekly_draft_revision", gemini_calls=0, elapsed=time.perf_counter()-started)
         if draft_session and re.sub(r"\s+", "", question) in ("還原上一版", "回到上一版", "復原上一版", "undo"):
             previous = str(draft_session.get("previous_draft") or "")
             if not previous:
@@ -4034,8 +4085,13 @@ class AceQueryEngine:
         else:
             review = trade_review.fallback_review(payload)
             self.log(f"   覆盤 Gemini 失敗，改用程式版｜{result.error}")
+        access = self._access()
         try:
-            record = trade_review.save_note(context_key, payload, review, source, raw_input=question)
+            if access is not None and access.simulation:
+                # /ace 測試（模擬身分）：覆盤照常顯示，但不寫進資料庫，不留下一次性測試紀錄
+                record = {"trade_id": payload.get("trade_id"), "simulation": True}
+            else:
+                record = trade_review.save_note(context_key, payload, review, source, raw_input=question)
         except local_market_cache.DBError as exc:
             # 覆盤紀錄損壞或資料庫忙碌：不覆蓋舊紀錄，這次覆盤照常顯示但不存
             self.log(f"⚠️ 覆盤紀錄未儲存｜{type(exc).__name__}: {exc}")
@@ -4182,13 +4238,40 @@ class AceQueryEngine:
             "draft": draft, "candidate": candidate, "facts": {},
             "mark_branches": weekly_pick.mark_branches(candidate),
             "admin_notes": [], "previous_draft": "", "updated_at": time.time(),
+            "manual": True,          # 人工文章：產圖時由 Gemini 自動排版（逐字核對），「用原文排版」可關閉
         }
         self._save_draft_session(context_key, session)
         branches = weekly_pick.mentioned_branches(draft, candidate)
         note = f"（文章提到的分點：{'、'.join(branches)}）" if branches else "（文章沒有提到追蹤分點，圖上不會畫買賣標註）"
         return AnswerResult(
-            text=draft + f"\n\n※ 已套用為目前草稿{note}。可以接著修改，或說「這版確認，生成圖片」。",
+            text=draft + f"\n\n※ 已套用為目前草稿{note}。可以接著修改，或說「這版確認，生成圖片」"
+                         "（圖片會自動排版成技術面／籌碼面／操作觀察，不改文字；不要排版就說「用原文排版」）。",
             route="weekly_manual_draft", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+
+    def _weekly_layout(self, context_key: str, session: Dict[str, Any], body: str) -> Tuple[Optional[Dict[str, Any]], str, int]:
+        """人工文章的圖片排版：同一版文字只排一次（存在草稿 session）；Gemini 失敗或逐字核對沒過就回 None 用原文排版。
+        回傳 (排版, 給管理員的提示, Gemini 次數)。"""
+        key = hashlib.sha1(body.encode("utf-8")).hexdigest()
+        if session.get("layout") and session.get("layout_for") == key:
+            return session["layout"], "", 0
+        result = self.gateway.generate(weekly_pick.layout_prompt(body), "weekly_layout",
+                                       schema=weekly_pick.LAYOUT_SCHEMA, temperature=0.1)
+        if not result.ok:
+            self.log(f"週精選自動排版略過：Gemini 失敗｜{result.error}")
+            return None, "自動排版暫時無法使用（AI 忙碌），這張圖使用原文排版。", 1
+        try:
+            data = json.loads(result.text)
+        except (TypeError, ValueError):
+            data = tools.core()._extract_json_from_text(result.text) or {}
+        layout = weekly_pick.parse_layout(data)
+        ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
+        if not ok:
+            self.log(f"週精選自動排版未通過核對：{reason}")
+            return None, f"自動排版未通過逐字核對（{reason}），這張圖使用原文排版。", 1
+        session.update(layout=layout, layout_for=key)
+        self._save_draft_session(context_key, session)
+        self.log(f"週精選自動排版完成｜{len(layout['sections'])} 段")
+        return layout, "", 1
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：延續同一檔週精選草稿做文字修改。
@@ -4339,10 +4422,21 @@ class AceQueryEngine:
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
         article = weekly_pick.weekly_article_parts(session["draft"], code, name)
-        article["subtitle"] = f"資料日 {(candidate.get('technical') or {}).get('data_date', '')}｜僅為個人投資筆記，非買賣建議".strip("｜")
-        panels = list(panels) + [{"article": article}]
+        data_date = (candidate.get('technical') or {}).get('data_date', '')
+        article["subtitle"] = f"資料日 {data_date}｜僅為個人投資筆記，非買賣建議".strip("｜")
+        layout, layout_note, layout_calls = None, "", 0
+        if session.get("manual") and not session.get("layout_off"):
+            layout, layout_note, layout_calls = self._weekly_layout(context_key, session, article["body"])
+        if layout:
+            card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"])
+            panels = list(panels) + [{"branch_card": card, "hide_text": True,
+                                      "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
+        else:
+            panels = list(panels) + [{"article": article}]
+        if layout_note:
+            image_text += f"\n\n※ {layout_note}"
         return AnswerResult(
-            text=image_text, route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
+            text=image_text, route="weekly_article_image", gemini_calls=layout_calls, elapsed=time.perf_counter()-started,
             cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
         )
 
@@ -4774,7 +4868,8 @@ class AceQueryEngine:
             if future in done:
                 result = future.result()
             else:
-                cancel_event.set()
+                cancel_event.set()        # 已在跑的工具自行檢查這個旗標收手
+                future.cancel()           # 還在排隊、沒開始的工具直接取消，不佔執行緒
                 result = tools.ToolResult(
                     name=call.name,
                     ok=False,
@@ -5243,7 +5338,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • 接著直接說修改需求：`權證部分短一點`、`不要提到均線`、`把新光的勝率補上`
 • `還原上一版`：回到修改前
 • `這版確認，生成圖片`：產出精選圖片
-• `3006 套用文字 <貼上整篇>`：直接沿用自己寫好的文章（不經過 AI；slash 打不出換行時用 // 分段）
+• `3006 套用文字 <貼上整篇>`：直接沿用自己寫好的文章（文字不經過 AI；slash 打不出換行時用 // 分段）
+• `用原文排版`／`自動排版`：套用文字產圖時，是否由 AI 自動分段加小標（預設自動，逐字核對不改內容）
 • `目前草稿`：看現在編輯中的文章
 
 【資料維護】
@@ -5301,6 +5397,35 @@ def _fmt_mb(value: Any) -> str:
         return "-"
 
 _db_maintenance_day = [""]
+_db_maintenance_tries = {"day": "", "count": 0}
+DB_MAINTENANCE_MAX_TRIES = 3
+TODAY_SYNC_RETRY_SECONDS = 600            # 收盤後當天行情還沒拿到：每 10 分鐘重試
+TODAY_SYNC_LAST_MINUTE = 21 * 60          # 21:00 後當天不再重試（休市日交給隔天判定 closed）
+INTRADAY_SAMPLE_SECONDS = 300             # 盤中量能基準籃子取樣間隔
+
+
+def _intraday_sampling_loop(stop: threading.Event) -> None:
+    """盤中定時取樣（族群雷達快照、量能基準籃子）獨立一條執行緒，不被底庫同步、型態評分等長工作延後。"""
+    last_basket = 0.0
+    while not stop.is_set():
+        try:
+            if sector_radar.session_open(tools.taipei_now()):
+                # 族群漲幅快照（2 個請求、0 次 Gemini）；間隔由 tick 自己控制
+                try:
+                    sector_radar.tick()
+                except Exception as exc:
+                    print(f"⚠️ 族群雷達快照略過｜{type(exc).__name__}", flush=True)
+                if time.monotonic() - last_basket >= INTRADAY_SAMPLE_SECONDS:
+                    last_basket = time.monotonic()
+                    try:
+                        import intraday_volume
+                        intraday_volume.sample_basket()      # 基準籃子取樣（走背景額度）
+                    except Exception as exc:
+                        print(f"⚠️ 盤中量能取樣略過｜{type(exc).__name__}", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 盤中取樣迴圈略過｜{type(exc).__name__}: {exc}", flush=True)
+        if stop.wait(60):
+            break
 
 
 def _market_maintenance_loop(stop: threading.Event) -> None:
@@ -5308,7 +5433,7 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
 
     全部只用官方每日行情（2 個請求／交易日）與本地 CPU，不會為了單一問題掃市場。
     """
-    last_attempt = ""
+    next_today_try = 0.0
     try:
         import official_sector_members
         official_sector_members.warm_registry()   # 族群雷達的官方成員名冊：開機背景預載，查詢時不再等 10 秒
@@ -5318,29 +5443,22 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
         try:
             info = market_data.coverage()
             now = tools.taipei_now()
-            # 盤中每隔幾分鐘存一張族群漲幅快照（2 個請求、0 次 Gemini），供轉強／轉弱雷達比較。
-            if sector_radar.session_open(now):
-                try:
-                    sector_radar.tick()
-                except Exception as exc:
-                    print(f"⚠️ 族群雷達快照略過｜{type(exc).__name__}", flush=True)
-                try:
-                    import intraday_volume
-                    intraday_volume.sample_basket()      # 基準籃子取樣（走背景額度）
-                except Exception as exc:
-                    print(f"⚠️ 盤中量能取樣略過｜{type(exc).__name__}", flush=True)
             today = now.strftime("%Y-%m-%d")
             minutes = now.hour * 60 + now.minute
-            after_close = now.weekday() < 5 and minutes >= 14 * 60 + 5
+            after_close = now.weekday() < 5 and 14 * 60 + 5 <= minutes < TODAY_SYNC_LAST_MINUTE
             need_history = int(info.get("days") or 0) < market_data.HISTORY_DAYS
-            need_today = after_close and str(info.get("last_day") or "") < today and last_attempt != today
+            # 當天行情：同步後仍沒拿到（官方檔案未備妥、連線失敗）就 10 分鐘後再試，不是試一次就放棄
+            need_today = (after_close and str(info.get("last_day") or "") < today
+                          and time.monotonic() >= next_today_try)
             # 升級後舊底庫沒有上市／上櫃完整性紀錄（含颱風假是否休市）：補查到全部有紀錄為止
             need_status = int(info.get("unchecked_days") or 0) > 0 and not sector_radar.session_open(now)
             if need_history or need_today or need_status:
-                last_attempt = today if need_today else last_attempt
                 result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
                 print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
                       f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+                if need_today and str(result.get("last_day") or "") < today:
+                    next_today_try = time.monotonic() + TODAY_SYNC_RETRY_SECONDS
+                    print(f"🗂️ 市場底庫：{today} 行情尚未取得，{TODAY_SYNC_RETRY_SECONDS // 60} 分鐘後重試", flush=True)
             # 抓取失敗／不完整的市場日（sync 輪不到的舊日子）：盤後每輪最多重查 5 天，
             # 補完後那天沒成交的冷門股、暫停交易股才能被證明「確定沒成交」，不再被當成資料缺漏
             if not sector_radar.session_open(now):
@@ -5369,10 +5487,15 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                         intraday_volume.calibrate(lots, avg20, day=day)
                     except Exception as exc:
                         print(f"⚠️ 盤中量能曲線校正略過｜{day}｜{type(exc).__name__}: {exc}", flush=True)
-            # 每日清過期資料＋WAL checkpoint，不 VACUUM。
+            # 每日清過期資料＋WAL checkpoint，不 VACUUM。成功才算今天做過；失敗當天最多再試 DB_MAINTENANCE_MAX_TRIES 次
             if _db_maintenance_day[0] != today and minutes >= 15 * 60 + 30:
-                _db_maintenance_day[0] = today
-                local_market_cache.daily_maintenance(today)
+                if _db_maintenance_tries["day"] != today:
+                    _db_maintenance_tries.update(day=today, count=0)
+                if _db_maintenance_tries["count"] < DB_MAINTENANCE_MAX_TRIES:
+                    _db_maintenance_tries["count"] += 1
+                    outcome = local_market_cache.daily_maintenance(today)
+                    if not (outcome or {}).get("failed"):
+                        _db_maintenance_day[0] = today
             # 當天資料出來前被查過的現股分點：富邦一更新就先抓當天那頁（只用富邦，不佔 FinMind／富果額度）
             try:
                 spot_chip.prefetch_today(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
@@ -5595,6 +5718,7 @@ def run_discord_bot(config: BotConfig) -> None:
             threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
             if MARKET_SYNC_ENABLE:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
+                threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
