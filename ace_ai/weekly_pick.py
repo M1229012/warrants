@@ -1898,16 +1898,20 @@ LAYOUT_SCHEMA = {
 _LAYOUT_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _LAYOUT_STRIP_RE = re.compile(r"[\s*`，。、；：:,.!?！？（）()「」『』【】《》〈〉…\-—～~｜|/／%％]+")
 LAYOUT_LEFTOVER_RATIO = 0.25     # 原文沒被段落涵蓋的部分（移到資料列的句子、刪掉的開頭語）最多占全文比例
+LAYOUT_MAX_ROWS = 4
+LAYOUT_MAX_LABEL = 10
 
 
-def layout_prompt(body: str) -> str:
-    return (
+def layout_prompt(body: str, retry_reason: str = "") -> str:
+    retry = f"\n※ 上一次排版沒通過核對：{retry_reason}。請修正後重新輸出，仍然只能照抄原文。\n" if retry_reason else ""
+    return (retry +
         "你是排版編輯。下面是一篇已經寫好的個股觀察文章，請只做排版，輸出 JSON。\n"
         f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。\n"
         "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
         "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
-        "4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 3 個可以整理成 rows：label 為 2～6 字的名稱，"
-        "value 逐字照抄原文含數字的那一小段；放進 rows 的數字不要再留在段落裡，其他數字一律留在段落。\n"
+        f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 為 2～8 字的名稱"
+        "（例如「事件買進」「調整後勝率」「平均持有」），value 逐字照抄原文含數字的那一小段；"
+        "放進 rows 的數字不要再留在段落裡，每個數字在整份輸出只能出現一次，其他數字一律留在段落。\n"
         "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n\n"
         f"原文：\n{body}"
     )
@@ -1942,10 +1946,18 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     """排版結果逐字核對：數字完全一致、每段都是原文的連續片段、沒被涵蓋的原文不超過一定比例。"""
     paragraphs = [p for s in layout["sections"] for p in s["paragraphs"]]
     rows = [r for s in layout["sections"] for r in s["rows"]]
-    if len(rows) > 3 or any(len(r["label"]) > 8 or _LAYOUT_NUMBER_RE.search(r["label"]) for r in rows):
-        return False, "資料列格式不符"
-    if _layout_numbers([body]) != _layout_numbers(paragraphs + [r["value"] for r in rows]):
-        return False, "數字和原文不一致"
+    if len(rows) > LAYOUT_MAX_ROWS:
+        return False, f"資料列 {len(rows)} 列，最多 {LAYOUT_MAX_ROWS} 列"
+    long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
+    if long_label:
+        return False, f"資料列名稱太長：{long_label}"
+    # 資料列名稱可以帶數字（例如「近70日事件買進」），一樣要和原文的數字一一對得上
+    expected = _layout_numbers([body])
+    actual = _layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows])
+    if expected != actual:
+        missing = list((expected - actual).elements())[:3]
+        extra = list((actual - expected).elements())[:3]
+        return False, f"數字和原文不一致（少了 {missing or '-'}，多了 {extra or '-'}）"
     original = _layout_norm(body)
     leftover = original
     for paragraph in paragraphs:

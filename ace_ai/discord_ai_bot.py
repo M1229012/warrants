@@ -4254,24 +4254,28 @@ class AceQueryEngine:
         key = hashlib.sha1(body.encode("utf-8")).hexdigest()
         if session.get("layout") and session.get("layout_for") == key:
             return session["layout"], "", 0
-        result = self.gateway.generate(weekly_pick.layout_prompt(body), "weekly_layout",
-                                       schema=weekly_pick.LAYOUT_SCHEMA, temperature=0.1)
-        if not result.ok:
-            self.log(f"週精選自動排版略過：Gemini 失敗｜{result.error}")
-            return None, "自動排版暫時無法使用（AI 忙碌），這張圖使用原文排版。", 1
-        try:
-            data = json.loads(result.text)
-        except (TypeError, ValueError):
-            data = tools.core()._extract_json_from_text(result.text) or {}
-        layout = weekly_pick.parse_layout(data)
-        ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
-        if not ok:
-            self.log(f"週精選自動排版未通過核對：{reason}")
-            return None, f"自動排版未通過逐字核對（{reason}），這張圖使用原文排版。", 1
-        session.update(layout=layout, layout_for=key)
-        self._save_draft_session(context_key, session)
-        self.log(f"週精選自動排版完成｜{len(layout['sections'])} 段")
-        return layout, "", 1
+        reason, calls = "", 0
+        for _attempt in range(2):          # 沒通過核對時把原因告訴 Gemini 重排一次
+            calls += 1
+            result = self.gateway.generate(weekly_pick.layout_prompt(body, reason), "weekly_layout",
+                                           schema=weekly_pick.LAYOUT_SCHEMA, temperature=0.1)
+            if not result.ok:
+                self.log(f"週精選自動排版略過：Gemini 失敗｜{result.error}")
+                return None, "自動排版暫時無法使用（AI 忙碌），這張圖使用原文排版。", calls
+            try:
+                data = json.loads(result.text)
+            except (TypeError, ValueError):
+                data = tools.core()._extract_json_from_text(result.text) or {}
+            layout = weekly_pick.parse_layout(data)
+            ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
+            if ok:
+                session.update(layout=layout, layout_for=key)
+                self._save_draft_session(context_key, session)
+                self.log(f"週精選自動排版完成｜{len(layout['sections'])} 段｜第 {calls} 次")
+                return layout, "", calls
+            rows = [f"{r['label']}={r['value']}" for s in (layout or {}).get("sections", []) for r in s["rows"]]
+            self.log(f"週精選自動排版未通過核對（第 {calls} 次）：{reason}｜資料列：{rows or '-'}")
+        return None, f"自動排版未通過逐字核對（{reason}），這張圖使用原文排版。", calls
 
     def _answer_weekly_revision(self, question: str, context_key: str, started: float) -> AnswerResult:
         """管理員：延續同一檔週精選草稿做文字修改。
