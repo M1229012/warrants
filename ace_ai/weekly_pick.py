@@ -2046,7 +2046,6 @@ _HEADING_WORDS = {
 }
 _ROW_WORDS = ("買進", "買超", "賣超", "賣出", "勝率", "持有", "報酬", "金額", "張數")
 _ROW_LABEL_TRIM = re.compile(r"^(?:目前|該分點|其中|共|而|並)+|的$")
-LAYOUT_SPLIT_CHARS = 70          # 段落超過這麼長而且有兩句以上，從中間的句號拆成兩段
 
 
 def _heading_scores(text: str) -> Dict[str, float]:
@@ -2074,18 +2073,6 @@ def _ordered_headings(blocks: List[str]) -> List[str]:
     return out
 
 
-def _split_long(paragraph: str) -> List[str]:
-    sentences = re.findall(r"[^。]+。?", paragraph)
-    if len(paragraph) <= LAYOUT_SPLIT_CHARS or len(sentences) < 2:
-        return [paragraph]
-    total, best, cut = len(paragraph), None, 1
-    for i in range(1, len(sentences)):
-        gap = abs(len("".join(sentences[:i])) - total / 2)
-        if best is None or gap < best:
-            best, cut = gap, i
-    return ["".join(sentences[:cut]).strip(), "".join(sentences[cut:]).strip()]
-
-
 def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]:
     rows, kept = [], []
     for clause in _CLAUSE_RE.findall(paragraph):
@@ -2104,7 +2091,7 @@ def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]
 
 
 def rule_layout(body: str) -> Optional[Dict[str, Any]]:
-    """不靠 AI 的排版：依關鍵字判斷小標、刪掉和小標重複的開頭語、籌碼數字抽成資料列、長段落拆開。只刪減與搬動原句。"""
+    """不靠 AI 的排版：依關鍵字判斷小標、刪掉和小標重複的開頭語、籌碼數字抽成資料列。只刪減與搬動原句。"""
     blocks = [re.sub(r"\*\*|`", "", b).strip() for b in re.split(r"\n+", str(body or "")) if b.strip()]
     single = len(blocks) == 1
     if single:                            # 整篇只有一段：逐句判斷，連續同小標的句子合成一段
@@ -2136,7 +2123,6 @@ def rule_layout(body: str) -> Optional[Dict[str, Any]]:
                 if text:
                     paragraphs.append(text)
             sec["paragraphs"] = paragraphs
-        sec["paragraphs"] = [q for p in sec["paragraphs"] for q in _split_long(p) if q]
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 
@@ -2145,7 +2131,10 @@ def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: Lis
     sections: List[Dict[str, Any]] = []
     for sec in layout["sections"]:
         sections.append({"type": "heading", "text": sec["heading"]})
-        sections += [{"type": "paragraph", "text": p} for p in sec["paragraphs"]]
+        # 每個小標底下一段完整文字：句子接在一起自然換行，不在句號處拆成好幾段（看起來零碎）
+        merged = "".join(p.strip() for p in sec["paragraphs"] if p.strip())
+        if merged:
+            sections.append({"type": "paragraph", "text": merged})
         if sec["rows"]:
             sections.append({"type": "rows", "items": [{"lead": r["label"], "parts": [r["value"]]} for r in sec["rows"]]})
     notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in disclaimers]
