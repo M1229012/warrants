@@ -4269,6 +4269,7 @@ class AceQueryEngine:
             layout = weekly_pick.parse_layout(data)
             ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
             if ok:
+                layout = weekly_pick.tidy_layout(layout)
                 session.update(layout=layout, layout_for=key)
                 self._save_draft_session(context_key, session)
                 self.log(f"週精選自動排版完成｜{len(layout['sections'])} 段｜第 {calls} 次")

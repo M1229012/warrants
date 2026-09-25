@@ -1909,9 +1909,9 @@ def layout_prompt(body: str, retry_reason: str = "") -> str:
         f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。\n"
         "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
         "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
-        f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 為 2～8 字的名稱"
-        "（例如「事件買進」「調整後勝率」「平均持有」），value 逐字照抄原文含數字的那一小段；"
-        "放進 rows 的數字不要再留在段落裡，每個數字在整份輸出只能出現一次，其他數字一律留在段落。\n"
+        f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
+        "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
+        "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。\n"
         "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n\n"
         f"原文：\n{body}"
     )
@@ -1951,12 +1951,12 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
     if long_label:
         return False, f"資料列名稱太長：{long_label}"
-    # 資料列名稱可以帶數字（例如「近70日事件買進」），一樣要和原文的數字一一對得上
-    expected = _layout_numbers([body])
-    actual = _layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows])
+    # 原文每個數字都要出現、不能出現原文沒有的數字；同一數字重複出現（段落＋資料列）由 tidy_layout 去重
+    expected = set(_layout_numbers([body]))
+    actual = set(_layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows]))
     if expected != actual:
-        missing = list((expected - actual).elements())[:3]
-        extra = list((actual - expected).elements())[:3]
+        missing = sorted(expected - actual)[:3]
+        extra = sorted(actual - expected)[:3]
         return False, f"數字和原文不一致（少了 {missing or '-'}，多了 {extra or '-'}）"
     original = _layout_norm(body)
     leftover = original
@@ -1968,6 +1968,57 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     if len(leftover) > max(30, len(original) * LAYOUT_LEFTOVER_RATIO):
         return False, f"有 {len(leftover)} 字原文沒有出現在排版結果"
     return True, ""
+
+
+# 子句：以，；。或逗號分隔，但「2,120」這種數字中間的逗號不切
+_CLAUSE_RE = re.compile(r"(?:[^，,；;。]|(?<=\d),(?=\d))+[，,；;。]?")
+
+
+# 資料列內容結尾的「數字＋單位」：「調整後勝率約67%」→ 名稱「調整後勝率」、數值「約67%」
+_ROW_TAIL_RE = re.compile(r"^(.*?)((?:約|近|達|共|逾)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:萬元|億元|元|萬張|萬|億|%|％|天|日|張|筆|倍|點|檔)?)$")
+
+
+def _tidy_row(row: Dict[str, str]) -> Dict[str, str]:
+    match = _ROW_TAIL_RE.match(row["value"].strip("，,；;。 "))
+    if match and match.group(1).strip() and len(match.group(1).strip()) <= 14:
+        return {"label": match.group(1).strip("，,；;的 "), "value": match.group(2).strip()}
+    return row
+
+
+def tidy_layout(layout: Dict[str, Any]) -> Dict[str, Any]:
+    """去掉重複，但不遺失資訊：
+    - 段落子句的數字都在某一列資料列上：子句文字完全被那一列涵蓋→刪子句；子句還有別的內容（例如「A、B、E事件的」）→保留子句、刪那一列
+    - 最後資料列內容前面的文字改當名稱、只留數字＋單位"""
+    rows = [(i, r) for i, sec in enumerate(layout["sections"]) for r in sec["rows"]]
+    dropped_rows: Set[int] = set()
+    sections = []
+    for sec in layout["sections"]:
+        paragraphs = []
+        for paragraph in sec["paragraphs"]:
+            kept = []
+            for clause in _CLAUSE_RE.findall(paragraph):
+                numbers = set(_layout_numbers([clause]))
+                match = next((k for k, (_, r) in enumerate(rows) if numbers
+                              and numbers <= set(_layout_numbers([r["label"], r["value"]]))), None)
+                if match is None:
+                    kept.append(clause)
+                    continue
+                row = rows[match][1]
+                if _layout_norm(clause) in _layout_norm(row["label"] + row["value"]) or \
+                        _layout_norm(clause) in _layout_norm(row["value"]):
+                    continue                  # 資料列已完整呈現這一句
+                kept.append(clause)
+                dropped_rows.add(match)       # 子句資訊比資料列多：留子句、不重複列資料列
+            text = "".join(kept).strip()
+            if text and text[-1] in "，,；;":
+                text = text[:-1] + "。"
+            if text:
+                paragraphs.append(text)
+        sections.append(dict(sec, paragraphs=paragraphs, rows=[]))
+    for k, (i, row) in enumerate(rows):
+        if k not in dropped_rows:
+            sections[i]["rows"].append(_tidy_row(row))
+    return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 
 def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str]) -> Dict[str, Any]:
