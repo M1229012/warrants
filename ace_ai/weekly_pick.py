@@ -2304,6 +2304,14 @@ _EDIT_CUE_PATTERNS = (
 )
 
 
+# 草稿開著時的判斷順序：別檔股票→離開；明確改稿語氣→改稿；問句／查明細→一般問答；帶代號查資料→一般問答；其餘→改稿
+_STRONG_EDIT_RE = re.compile(
+    r"改成|改為|改一下|修改|刪掉|刪除|拿掉|去掉|省略|不要寫|不要提|不用寫|不用提|別寫|別提|補上|補進|寫進|加上|加入|寫成|"
+    r"強調|換個|口語|語氣|重寫|太長|太短|短一點|長一點|精簡|簡短|詳細一點|多一點|少一點|多寫|少寫|"
+    r"這段|那段|這句|這篇|第[一二三四五1-5]段|第[一二三四五1-5]句|開頭|結尾|標題|結論|上一版|草稿|文章")
+_QUESTION_RE = re.compile(r"[？?]|嗎|多少|哪些|哪幾|哪一|誰|如何|怎麼看|怎麼樣|是否|有沒有|明細|查詢|查一下|列出|給我看")
+_DATA_TOPIC_WORDS = ("買賣超", "明細", "籌碼", "現股", "外資", "投信", "法人", "K線", "技術面", "型態", "新聞",
+                     "權證", "分點", "勝率", "大量區", "支撐", "壓力")
 _QUANTITY_AFTER_NUMBER = re.compile(r"(?<!\d)([1-9]\d{3})(?=\s*(?:張|股|元|塊|萬|億|％|%|點|筆|口|人))")
 
 
@@ -2324,6 +2332,12 @@ def is_weekly_session_followup(text: str, current_stock_code: str = "") -> bool:
     code = _code_in_edit_text(compact)
     if code and current_stock_code and code != str(current_stock_code):
         return False          # 明確問另一檔股票
+    if _STRONG_EDIT_RE.search(compact):
+        return True           # 明確的改稿語氣（「把新光的勝率補上」「權證那段短一點」）
+    if _QUESTION_RE.search(compact):
+        return False          # 在問問題／查明細（「3042 買賣超明細」「永豐金內湖勝率多少」）
+    if code and any(w in compact for w in _DATA_TOPIC_WORDS):
+        return False          # 帶代號查資料（「3042 現股籌碼」）
     if any(k in compact for k in _OTHER_TOPIC_PATTERNS) and not any(k in compact for k in _EDIT_CUE_PATTERNS):
         return False          # 換成族群／分點／排名等其他功能（沒有任何修改語氣）
     return True

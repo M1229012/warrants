@@ -3525,6 +3525,8 @@ class AceQueryEngine:
         if prefix:
             question = _SLASH_PREFIX_RE.sub("", question, count=1)
         compact = re.sub(r"\s+", "", question)
+        if admin_mode:
+            self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
         if any(word in compact for word in MEMORY_RESET_WORDS):
             self.memory.clear(context_key)
             self._clear_draft_session(context_key)
