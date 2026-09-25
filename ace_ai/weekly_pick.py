@@ -1911,7 +1911,8 @@ def layout_prompt(body: str, retry_reason: str = "") -> str:
         "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
         f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
         "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
-        "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。\n"
+        "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
+        "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
         "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n\n"
         f"原文：\n{body}"
     )
@@ -2075,11 +2076,17 @@ def _ordered_headings(blocks: List[str]) -> List[str]:
 
 def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]:
     rows, kept = [], []
-    for clause in _CLAUSE_RE.findall(paragraph):
+    clauses = _CLAUSE_RE.findall(paragraph)
+    for i, clause in enumerate(clauses):
         core = clause.strip("，,；;。 ")
         match = _ROW_TAIL_RE.match(core)
         label = _ROW_LABEL_TRIM.sub("", match.group(1).strip()) if match else ""
+        # 後面還接著補充說明（「…約2,120萬元，目前仍持有」）就不抽：抽走會讓補充說明改指前一句、意思跑掉
+        following = clauses[i + 1].strip("，,；;。 ") if i + 1 < len(clauses) else ""
+        ends_sentence = clause.rstrip().endswith(("。", "；", ";")) or not following
+        next_is_row = bool(following and _ROW_TAIL_RE.match(following) and any(w in following for w in _ROW_WORDS))
         if (match and len(rows) < room and label and len(label) <= LAYOUT_MAX_LABEL
+                and (ends_sentence or next_is_row)
                 and any(w in core for w in _ROW_WORDS) and _LAYOUT_NUMBER_RE.search(match.group(2))):
             rows.append({"label": label, "value": match.group(2).strip()})
             continue
@@ -2136,7 +2143,8 @@ def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: Lis
         if merged:
             sections.append({"type": "paragraph", "text": merged})
         if sec["rows"]:
-            sections.append({"type": "rows", "items": [{"lead": r["label"], "parts": [r["value"]]} for r in sec["rows"]]})
+            # 數字並排成一列小格（原本一列一筆太佔空間）
+            sections.append({"type": "stats", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})
     notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in disclaimers]
     sections.append({"type": "note", "text": "※ " + "｜".join(n for n in notes if n)})
     return {"branch": title, "tags": ["權證分點觀察", "週精選"], "label": label, "sections": sections}

@@ -3538,8 +3538,12 @@ class AceQueryEngine:
             if not (is_admin and admin_mode):
                 return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
             return self._answer_admin_moneydj_image(question, started)
-        # 覆盤筆記：/ask 與 /ace 都可用；個人紀錄依 Discord 使用者分開存
+        # 覆盤筆記：目前只開放管理員（SUPERUSER／伺服器管理員，/ask 或 /ace 皆可）；個人紀錄依 Discord 使用者分開存
         if trade_review.is_review_request(question) or trade_review.is_list_request(question):
+            access = self._access()
+            if access is not None and not access.entitlement.admin:
+                return AnswerResult(text="「交易覆盤」目前只開放管理員使用，開放後會再通知。", route="review_locked",
+                                    gemini_calls=0, elapsed=time.perf_counter() - started, as_text=True)
             return self._answer_review(question, context_key, started)
 
         if not admin_mode:
@@ -4434,6 +4438,9 @@ class AceQueryEngine:
                     panels[0]["scorecard"] = weekly_pick.build_pattern_scorecard(
                         tech, vp, extras, chips, tracked_branch_names=branches
                     )
+                    # 精選圖精簡：主要得分／失分交給文章解讀、追蹤分點動向和 K 線標註表與文章重複，都不畫
+                    if panels[0]["scorecard"]:
+                        panels[0]["scorecard"].update(hide_reasons=True, show_tracked_branches=False)
                 except Exception as exc:
                     self.log(f"週精選圖片型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
 
@@ -5000,11 +5007,19 @@ PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
 
+# 週精選（只有管理員能用）：排名、草稿、改稿、套用文字、精選圖片都公開，不會因為 ephemeral 重新整理後消失
+PUBLIC_WEEKLY_ROUTES = frozenset(("weekly_pick", "weekly_draft", "weekly_draft_revision", "weekly_manual_draft",
+                                  "weekly_article_image",
+                                  "trade_review", "review_list"))   # 覆盤目前只開放管理員，結果也公開
+
+
 def is_public_answer(result) -> bool:
-    """只有正式 /ask 成功的分析公開；錯誤、說明、澄清、覆盤、Gemini／API 失敗一律只給本人看。"""
-    if result.denied_feature or not (result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES):
+    """成功的分析一律公開（不論能不能快取：現股歷史補資料中、AI 失敗改規則式內容也一樣），週精選也公開；
+    覆盤（目前只開放管理員）也公開；錯誤、說明、澄清、權限拒絕、管理指令只給本人看。"""
+    if result.denied_feature:
         return False
-    return result.route == "rule_radar" or result.cacheable or result.cache_hit
+    return (result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES
+            or result.route in PUBLIC_WEEKLY_ROUTES)
 
 
 # ============================================================

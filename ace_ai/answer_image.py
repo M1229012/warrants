@@ -1397,7 +1397,8 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
             _reason_column(draw, px + 24, y + h + 16, width - 48, live_title, live_changes, WARN_INK, '', False)
         h += box_h + 20
 
-    if hide_score:
+    # hide_reasons＝週精選：文章已經在解讀型態，不再重複列主要得分／失分（均線扣抵與關鍵價位保留）
+    if hide_score or card.get('hide_reasons'):
         return _scorecard_tail(draw, y, h, px, width, card, dry)
     half = (width - 40) / 2
     plus = _short_reasons(card.get('plus_reasons'), lost=False)
@@ -1924,15 +1925,16 @@ ARTICLE_PARAGRAPH_GAP = 22
 
 
 def _article_paragraphs(body: str) -> list[str]:
-    return [p.strip() for p in re.split(r"\n{1,}", str(body or "")) if p.strip()]
+    # 圖上不顯示 Markdown 粗體（**）、反引號與字型畫不出的 emoji；Discord 純文字草稿不經過這裡，粗體照常
+    return [clean(p) for p in re.split(r"\n{1,}", str(body or "")) if clean(p)]
 
 
 def article_card(draw, y: float, data: dict, dry: bool) -> int:
     """週精選文章版面：標題列＋分段內文＋底部免責，行距與留白比一般回答寬。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
     px, width = x0 + ARTICLE_PAD, CONTENT - ARTICLE_PAD * 2
-    title = str(data.get('title') or '')
-    subtitle = str(data.get('subtitle') or '')
+    title = clean(data.get('title') or '')
+    subtitle = clean(data.get('subtitle') or '')
     paragraphs = [wrap(p, ARTICLE_BODY_SIZE, width) for p in _article_paragraphs(data.get('body'))]
     disclaimers = [str(x) for x in (data.get('disclaimers') or []) if str(x).strip()]
     h = 38
@@ -2014,7 +2016,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
 
     note = str(data.get('basis') or '')
     coverage = _finite(data.get('market_cap_coverage_pct'))
-    if coverage is not None and str(data.get('basis') or '').startswith('盤中'):
+    if coverage is not None and (str(data.get('basis') or '').startswith('盤中') or coverage < 99.9):
         note += f"｜市值涵蓋 {coverage:.1f}%"
     draw.text((right, y + 44), note, font=font(19), fill=MUTED, anchor='rm')
 
@@ -2200,6 +2202,22 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 value, size = fit(item['value'], 38, tile_w - 36, True, 22)
                 text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
         return tile_h + 22
+    if kind == 'stats':
+        # 並排小格（和 K 線卡上方 MA 小格同風格）：上面小字名稱、下面粗體數值，一列放完
+        items = section.get('items') or []
+        if not items:
+            return 0
+        gap, tile_h = 12, 80
+        tile_w = (width - gap * (len(items) - 1)) / len(items)
+        if not dry:
+            for i, item in enumerate(items):
+                tx = x0 + i * (tile_w + gap)
+                draw.rounded_rectangle((tx, y, tx + tile_w, y + tile_h), radius=12, fill=TILE_BG)
+                label, lsize = fit(str(item.get('label', '')), 19, tile_w - 32, False, 14)
+                text_at(draw, (tx + 16, y + 10), label, lsize, MUTED)
+                value, vsize = fit(str(item.get('value', '')), 27, tile_w - 32, True, 18)
+                text_at(draw, (tx + 16, y + 38), value, vsize, INK, True)
+        return tile_h + 18
     if kind == 'bars':
         items = section.get('items') or []
         head, row_h = 36, 46
