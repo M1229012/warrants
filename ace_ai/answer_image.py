@@ -124,10 +124,35 @@ def fit(text, size: int, width: float, bold: bool = False, minimum: int = 14) ->
     while size > minimum and font(size, bold).getlength(text) > width:
         size -= 1
     if font(size, bold).getlength(text) > width:
+        _log_truncation(text)
         while text and font(size, bold).getlength(text + '…') > width:
             text = text[:-1]
         text += '…'
     return text, size
+
+
+_TRUNCATED_SEEN: set = set()
+
+
+def _log_truncation(text: str) -> None:
+    """圖片上的字被截斷時記一次（同一段文字只記一次），方便從 Log 找出還需要改成換行的欄位。"""
+    key = str(text)[:80]
+    if key not in _TRUNCATED_SEEN and len(_TRUNCATED_SEEN) < 500:
+        _TRUNCATED_SEEN.add(key)
+        print(f"⚠️ 圖片文字被截斷｜{key}", flush=True)
+
+
+def wrap_cell(text: str, size: int, width: float, bold: bool = False, minimum: int = 18, max_lines: int = 3) -> tuple[list[str], int]:
+    """表格／清單欄位用：先縮字（最多縮到 minimum），還放不下就換行（最多 max_lines 行），不截斷。"""
+    text = str(text)
+    while size > minimum and font(size, bold).getlength(text) > width:
+        size -= 1
+    lines = wrap(text, size, int(max(20, width)), bold) or ['']
+    if len(lines) > max_lines:
+        _log_truncation(text)
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip('，、。；') + '…'
+    return lines, size
 
 
 def number(value, digits=2):
@@ -1196,6 +1221,15 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
     return '', MUTED
 
 
+def _level_row_heights(rows, card, width) -> list[float]:
+    heights = []
+    for kind, label, price, pct in rows:
+        note = _level_note(label, card)[0] if kind != '現價' else ''
+        lines = wrap_cell(note, 19, width - 660, False, 17, 2)[0] if note else ['']
+        heights.append(max(LEVEL_ROW_H, len(lines) * 24 + 14))
+    return heights
+
+
 def _draw_level_table(draw, x, y, width, rows, card) -> None:
     draw.rounded_rectangle((x, y, x + width, y + TABLE_HEAD_H), radius=8, fill=TILE_BG)
     mid_head = y + TABLE_HEAD_H / 2
@@ -1203,11 +1237,11 @@ def _draw_level_table(draw, x, y, width, rows, card) -> None:
                               ('距現價', x + 590, 'rm'), ('說明（均線含扣抵推算）', x + 640, 'lm')):
         draw.text((lx, mid_head), label, font=font(17), fill=MUTED, anchor=anchor)
     ry = y + TABLE_HEAD_H
-    for kind, label, price, pct in rows:
-        mid = ry + LEVEL_ROW_H / 2
+    for (kind, label, price, pct), row_h in zip(rows, _level_row_heights(rows, card, width)):
+        mid = ry + row_h / 2
         bg, ink = LEVEL_STYLE[kind]
         if kind == '現價':
-            draw.rectangle((x, ry, x + width, ry + LEVEL_ROW_H), fill='#FBF8F2')
+            draw.rectangle((x, ry, x + width, ry + row_h), fill='#FBF8F2')
         draw.rounded_rectangle((x + 10, mid - 15, x + 76, mid + 15), radius=15, fill=bg)
         draw.text((x + 43, mid), kind, font=font(18, True), fill=ink, anchor='mm')
         text, size = fit('MA20（布林中軌）' if label == 'MA20' else label, 21, 210, kind == '現價')
@@ -1219,10 +1253,12 @@ def _draw_level_table(draw, x, y, width, rows, card) -> None:
         if kind != '現價':
             note, color = _level_note(label, card)
             if note:
-                text, size = fit(note, 19, width - 660, color != MUTED)
-                draw.text((x + 640, mid), text, font=font(size, color != MUTED), fill=color, anchor='lm')
-        draw.line((x, ry + LEVEL_ROW_H, x + width, ry + LEVEL_ROW_H), fill=LINE)
-        ry += LEVEL_ROW_H
+                lines, size = wrap_cell(note, 19, width - 660, color != MUTED, 17, 2)
+                for i, line in enumerate(lines):
+                    draw.text((x + 640, mid - (len(lines) - 1) * 12 + i * 24), line, font=font(size, color != MUTED),
+                              fill=color, anchor='lm')
+        draw.line((x, ry + row_h, x + width, ry + row_h), fill=LINE)
+        ry += row_h
 
 
 _REASON_POINTS_RE = re.compile(r"（([^（）]*) ([\d.]+)/([\d.]+)）$")
@@ -1427,7 +1463,7 @@ def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dic
     if levels:
         if not dry:
             _draw_level_table(draw, px, y + h, width, levels, card)
-        h += TABLE_HEAD_H + len(levels) * LEVEL_ROW_H + 26
+        h += TABLE_HEAD_H + sum(_level_row_heights(levels, card, width)) + 26
     else:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有可用的價位資料', 21, MUTED)
@@ -2203,21 +2239,34 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
         return tile_h + 22
     if kind == 'stats':
-        # 並排小格（和 K 線卡上方 MA 小格同風格）：上面小字名稱、下面粗體數值，一列放完
+        # 並排小格（和 K 線卡上方 MA 小格同風格）：上面小字名稱、下面粗體數值。
+        # 每列最多 3 格；名稱、數值太長就換行（不截斷），同一列的格子一起長高。
         items = section.get('items') or []
         if not items:
             return 0
-        gap, tile_h = 12, 80
-        tile_w = (width - gap * (len(items) - 1)) / len(items)
-        if not dry:
-            for i, item in enumerate(items):
-                tx = x0 + i * (tile_w + gap)
-                draw.rounded_rectangle((tx, y, tx + tile_w, y + tile_h), radius=12, fill=TILE_BG)
-                label, lsize = fit(str(item.get('label', '')), 19, tile_w - 32, False, 14)
-                text_at(draw, (tx + 16, y + 10), label, lsize, MUTED)
-                value, vsize = fit(str(item.get('value', '')), 27, tile_w - 32, True, 18)
-                text_at(draw, (tx + 16, y + 38), value, vsize, INK, True)
-        return tile_h + 18
+        gap, per_row = 12, 3
+        total = 0
+        for start in range(0, len(items), per_row):
+            chunk = items[start:start + per_row]
+            tile_w = (width - gap * (len(chunk) - 1)) / len(chunk)
+            cells = []
+            for item in chunk:
+                labels, lsize = wrap_cell(str(item.get('label', '')), 19, tile_w - 32, False, 16, 2)
+                values, vsize = wrap_cell(str(item.get('value', '')), 27, tile_w - 32, True, 20, 3)
+                cells.append((labels, lsize, values, vsize))
+            tile_h = max(18 + len(l) * 26 + len(v) * 34 + 10 for l, _, v, _ in cells)
+            if not dry:
+                ty = y + total
+                for i, (labels, lsize, values, vsize) in enumerate(cells):
+                    tx = x0 + i * (tile_w + gap)
+                    draw.rounded_rectangle((tx, ty, tx + tile_w, ty + tile_h), radius=12, fill=TILE_BG)
+                    for j, line in enumerate(labels):
+                        text_at(draw, (tx + 16, ty + 10 + j * 26), line, lsize, MUTED)
+                    vy = ty + 12 + len(labels) * 26
+                    for j, line in enumerate(values):
+                        text_at(draw, (tx + 16, vy + j * 34), line, vsize, INK, True)
+            total += tile_h + 12
+        return total + 6
     if kind == 'bars':
         items = section.get('items') or []
         head, row_h = 36, 46
@@ -2250,28 +2299,38 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             edges = [x0 + width * sum(ratios[:i + 1]) / total for i in range(len(columns))]
         else:
             edges = [x0 + first + rest * c for c in range(len(columns))]
+        signed = section.get('signed', ('加權報酬',))
+        accent = section.get('accent', ('勝率',))
+        # 每格先縮字、放不下就換行（不截斷）；一列的高度取該列最多行的那一格
+        layout = []
+        for row in rows:
+            bold = str(row[0]).startswith('全部')
+            cells = []
+            for c, cell in enumerate(row):
+                strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
+                room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
+                lines, size = wrap_cell(str(cell), 22, max(40, room), strong)
+                cells.append((lines, size, strong))
+            layout.append((max(row_h, max((len(l) for l, _, _ in cells), default=1) * 28 + 18), cells))
         if not dry:
             draw.rounded_rectangle((x0, y, x1, y + head_h), radius=10, fill=TILE_BG)
             for c, name in enumerate(columns):
                 cx = x0 + 18 if c == 0 else edges[c] - 18
                 draw.text((cx, y + head_h / 2), name, font=font(20, True), fill=MUTED, anchor='lm' if c == 0 else 'rm')
-            for r, row in enumerate(rows):
-                ry = y + head_h + r * row_h
+            ry = y + head_h
+            for r, (row, (height, cells)) in enumerate(zip(rows, layout)):
                 if r % 2:
-                    draw.rectangle((x0, ry, x1, ry + row_h), fill='#FAFBFC')
-                bold = str(row[0]).startswith('全部')
-                for c, cell in enumerate(row):
+                    draw.rectangle((x0, ry, x1, ry + height), fill='#FAFBFC')
+                for c, (cell, (lines, size, strong)) in enumerate(zip(row, cells)):
                     cx = x0 + 18 if c == 0 else edges[c] - 18
-                    signed = section.get('signed', ('加權報酬',))
-                    accent = section.get('accent', ('勝率',))
                     color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
-                    strong = c == 0 or bold or columns[c] in accent
-                    room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
-                    text, size = fit(str(cell), 22, max(40, room), strong, 15)
-                    draw.text((cx, ry + row_h / 2), text, font=font(size, strong),
-                              fill=color, anchor='lm' if c == 0 else 'rm')
-                draw.line((x0, ry + row_h, x1, ry + row_h), fill=GRID)
-        return head_h + len(rows) * row_h + 20
+                    top = ry + height / 2 - (len(lines) - 1) * 14
+                    for i, line in enumerate(lines):
+                        draw.text((cx, top + i * 28), line, font=font(size, strong),
+                                  fill=color, anchor='lm' if c == 0 else 'rm')
+                draw.line((x0, ry + height, x1, ry + height), fill=GRID)
+                ry += height
+        return head_h + sum(h for h, _ in layout) + 20
     if kind == 'lists':
         boxes = section.get('items') or []
         gap, row_h, head_h = 20, 44, 52
@@ -2476,6 +2535,7 @@ def _capped_lines(text: str, size: int, width: float, limit: int, bold: bool = F
         return lines
     kept = lines[:limit]
     kept[-1] = kept[-1].rstrip('，、。；') + '…'
+    _log_truncation(text)
     return kept
 
 
@@ -2506,8 +2566,11 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     x0, x1 = MARGIN, WIDTH - MARGIN
     px, width = x0 + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
     summary = [(str(t), str(c or INK)) for t, c in data.get('summary') or []]
-    checks = [(c, _capped_lines(f"{c.get('status_text', '')}｜{c.get('evidence', '')}", 20, width - 60, 1))
+    checks = [(c, _capped_lines(str(c.get('claim', '')), 21, width - 60, 2, True),
+               _capped_lines(f"{c.get('status_text', '')}｜{c.get('evidence', '')}", 20, width - 60, 2))
               for c in (data.get('checks') or [])[:4]]
+    reason_head = '我的理由｜'
+    reason_lines = _capped_lines(str(data.get('reason_raw', '')), 22, width - 16 - font(22, True).getlength(reason_head), 2, True)
     headline = _capped_lines(data.get('headline', ''), 26, width - 40, 2, True)
     body = _capped_lines(data.get('body', ''), 23, width - 40, 3)
     icons = list(data.get('highlight_icons') or [])
@@ -2517,7 +2580,8 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
 
     h = 24 + 50 + 12                                         # 標題列
     h += 40 if summary else 0                                # 一行摘要
-    h += 22 + 38 + len(checks) * 64 + 8                      # 我的理由＋核對
+    h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（最多兩行）
+    h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（各最多兩行）
     h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
     h += 18 + 38 + len(highlights) * 38                      # 本次記住
     h += (18 + 52) if last else 0                            # 目前觀察
@@ -2547,19 +2611,20 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
 
     cy += 22                                                  # 我的理由＋逐條核對
     draw.rectangle((px, cy + 4, px + 4, cy + 28), fill=TRADE_COLOR)
-    head = '我的理由｜'
-    draw.text((px + 16, cy + 16), head, font=font(22, True), fill=MUTED, anchor='lm')
-    reason, size = fit(str(data.get('reason_raw', '')), 22, width - 16 - font(22, True).getlength(head), True)
-    draw.text((px + 16 + font(22, True).getlength(head), cy + 16), reason, font=font(size, True), fill=INK, anchor='lm')
-    cy += 38
-    for c, lines in checks:
+    draw.text((px + 16, cy + 16), reason_head, font=font(22, True), fill=MUTED, anchor='lm')
+    for i, line in enumerate(reason_lines or ['']):
+        draw.text((px + 16 + font(22, True).getlength(reason_head), cy + 16 + i * 32), line, font=font(22, True),
+                  fill=INK, anchor='lm')
+    cy += 8 + max(1, len(reason_lines)) * 32 + 6
+    for c, claim_lines, evidence_lines in checks:
         status = str(c.get('status', '❓'))
         _status_icon(draw, px + 28, cy + 16, status, r=11)
-        claim, size = fit(str(c.get('claim', '')), 21, width - 60, True)
-        draw.text((px + 50, cy + 16), claim, font=font(size, True), fill=INK, anchor='lm')
-        for line in lines:
-            text_at(draw, (px + 50, cy + 32), line, 20, MUTED)
-        cy += 64
+        for i, line in enumerate(claim_lines):
+            draw.text((px + 50, cy + 16 + i * 30), line, font=font(21, True), fill=INK, anchor='lm')
+        ey = cy + len(claim_lines) * 30 + 2
+        for i, line in enumerate(evidence_lines):
+            text_at(draw, (px + 50, ey + i * 28), line, 20, MUTED)
+        cy += len(claim_lines) * 30 + len(evidence_lines) * 28 + 10
     cy += 8
 
     cy += 18                                                  # AI 覆盤

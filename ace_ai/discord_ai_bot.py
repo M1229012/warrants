@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextvars
+import contextlib
 import hashlib
 import json
 import io
@@ -36,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import discord_access as access_policy
 
@@ -565,11 +566,13 @@ HELP_GROUPS = (
     ("三大法人", ("2330外資最近買超多少", "2330三大法人今天買賣超")),
     ("族群大盤", ("AI伺服器族群誰型態最好", "哪些族群正在轉強", "大盤今天量縮嗎")),
     ("新聞", ("2330最近有什麼新聞",)),
+    ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
-    ("資料維護", ("系統狀態", "用量", "錯誤紀錄", "更新市場底庫")),
+    ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫")),
+    ("測試員", ("新增測試員 <ID或@人>", "移除測試員 <ID>", "測試員名單")),
     ("其他", ("族群雷達", "型態排名＋截圖", "測試 guest <問題>")),
 )
 
@@ -1527,36 +1530,7 @@ class GeminiResult:
     token_source: str = "none"
 
 
-_GEMINI_ERROR_STATE = threading.local()
-_RATE_LIMIT_KEYWORDS = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit", "exceeded")
-
-
-def _install_gemini_error_recorder(kf: Any) -> None:
-    """包裝主程式的 Gemini 錯誤判斷函式，讓 Bot 能分辨「限流」與其他失敗。
-
-    只在 Bot 行程內包裝；原判斷邏輯完全保留（wrapper 直接回傳原函式結果）。
-    """
-    if getattr(kf, "_discord_ai_error_recorder_installed", False):
-        return
-    original_retryable = kf._is_retryable_gemini_error
-    original_switch = kf._should_switch_gemini_key
-
-    def retryable(err: Any) -> bool:
-        _GEMINI_ERROR_STATE.last = str(err)
-        return original_retryable(err)
-
-    def switch(err: Any) -> bool:
-        _GEMINI_ERROR_STATE.last = str(err)
-        return original_switch(err)
-
-    kf._is_retryable_gemini_error = retryable
-    kf._should_switch_gemini_key = switch
-    kf._discord_ai_error_recorder_installed = True
-
-
-# 503 是模型本身塞車，換 API Key 沒用，只能換模型再試一次（數字都是 Python 算的，換模型只影響文字風格）。
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
-# 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數、照舊走主程式呼叫
+# 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數
 GEMINI_THINKING = os.getenv("DISCORD_AI_GEMINI_THINKING", "minimal").strip().lower()
 _THINKING_UNSUPPORTED: set = set()
 
@@ -1569,30 +1543,215 @@ def _thinking_config(model: str) -> Optional[Dict[str, Any]]:
     if re.match(r"gemini-[3-9]", model):
         return {"thinking_level": GEMINI_THINKING}
     return None
-_OVERLOADED_RE = re.compile(r"503|UNAVAILABLE|overloaded|high demand|429|RESOURCE_EXHAUSTED", re.IGNORECASE)
-# 主模型塞車後幾秒內，後續題目直接用備援模型（主程式會把 3 支 Key 都試過再等 2 秒重試，每題白等 30 幾秒）
-GEMINI_PRIMARY_COOLDOWN = max(0, tools._env_int("DISCORD_AI_GEMINI_PRIMARY_COOLDOWN", 300))
+
+
+# ============================================================
+# Gemini 模型鏈＋每個「金鑰×模型」的額度狀態
+# ============================================================
+
+# 固定順序：快的在前、額度大的最後保險（3.5 Flash Lite 慢約 20 秒，但每天額度大）
+GEMINI_MODEL_CHAIN = [m.strip() for m in os.getenv(
+    "DISCORD_AI_GEMINI_MODELS", "gemini-3.1-flash-lite,gemini-2.5-flash,gemini-3.5-flash-lite").split(",") if m.strip()]
+# 免費方案每個專案的（每分鐘, 每天）請求上限；可用 DISCORD_AI_GEMINI_LIMITS="模型=RPM/RPD;…" 覆蓋
+_DEFAULT_MODEL_LIMITS = {"gemini-3.1-flash-lite": (15, 500), "gemini-2.5-flash": (5, 20), "gemini-3.5-flash-lite": (15, 500)}
+GEMINI_QUOTA_MARGIN = min(1.0, max(0.5, tools._env_float("DISCORD_AI_GEMINI_QUOTA_MARGIN", 0.9)))   # 只用到上限的 9 成
+GEMINI_OVERLOAD_COOLDOWN = max(10, tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 120))       # 503 塞車：整個模型暫停
+GEMINI_MINUTE_COOLDOWN = 60                                                                           # 每分鐘限流：這把金鑰×模型暫停
+_OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
+_RATE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|exceeded", re.IGNORECASE)
+_DAILY_RE = re.compile(r"PerDay|per day|daily|RequestsPerDay", re.IGNORECASE)
+_MISSING_MODEL_RE = re.compile(r"\b404\b|NOT_FOUND|is not found|no longer available", re.IGNORECASE)
+_BAD_KEY_RE = re.compile(r"API_KEY_INVALID|API key not valid|PERMISSION_DENIED|\b403\b", re.IGNORECASE)
+_RATE_LIMIT_KEYWORDS = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit", "exceeded")
+
+
+def _model_limits(model: str) -> Tuple[int, int]:
+    for part in os.getenv("DISCORD_AI_GEMINI_LIMITS", "").split(";"):
+        name, _, value = part.partition("=")
+        if name.strip() == model and "/" in value:
+            try:
+                rpm, rpd = value.split("/")
+                return max(1, int(rpm)), max(1, int(rpd))
+            except ValueError:
+                pass
+    return _DEFAULT_MODEL_LIMITS.get(model, (10, 250))
+
+
+def _pacific_day(now: Optional[datetime] = None) -> str:
+    """Gemini 每日額度在美國太平洋時間午夜重置；固定用 UTC-8（夏令時比實際晚 1 小時重置＝保守）。"""
+    now = now or datetime.now(timezone.utc)
+    return (now - timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+class GeminiQuota:
+    """本地追蹤每個「金鑰×模型」的每分鐘／每天用量（實際打出去的每一次請求都算，含重試），
+    額度用完（429 每日）停到太平洋時間午夜、每分鐘限流停 60 秒、模型塞車（503）整個模型停一段時間。
+    金鑰輪流使用，分散各專案的每分鐘額度。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._minute: Dict[Tuple[int, str], deque] = {}
+        self._day: Dict[Tuple[int, str], int] = {}
+        self._day_key = _pacific_day()
+        self._load_day()
+        self._blocked: Dict[Tuple[int, str], float] = {}      # (金鑰, 模型) 暫停到何時（monotonic）；inf＝今天用完
+        self._model_down: Dict[str, float] = {}               # 模型塞車暫停到何時
+        self._disabled: set = set()                           # 找不到的模型（設定錯誤）
+        self._bad_keys: Dict[int, float] = {}                 # 金鑰無效
+        self._rr = 0
+
+    def _load_day(self) -> None:
+        """重新部署後接回今天（太平洋日）已用的次數，剩餘比例與額度判斷才不會歸零重算。"""
+        try:
+            stored = local_market_cache.get_state(f"gemini_quota:{self._day_key}", {}) or {}
+            for name, count in stored.items():
+                key, _, model = str(name).partition("|")
+                self._day[(int(key), model)] = int(count)
+        except Exception:
+            pass
+
+    def _save_day(self) -> None:
+        try:
+            local_market_cache.set_state(f"gemini_quota:{self._day_key}",
+                                         {f"{k}|{m}": v for (k, m), v in self._day.items()})
+        except Exception:
+            pass
+
+    def _roll(self) -> None:
+        day = _pacific_day()
+        if day != self._day_key:
+            self._day_key = day
+            self._day.clear()
+            self._blocked = {k: v for k, v in self._blocked.items() if v != float("inf")}
+            self._load_day()
+
+    def model_ready(self, model: str) -> bool:
+        with self._lock:
+            return model not in self._disabled and time.monotonic() >= self._model_down.get(model, 0.0)
+
+    def key_order(self, model: str, n_keys: int) -> List[int]:
+        """這個模型目前可用的金鑰（輪流起點）；已用完、限流中、無效的跳過。"""
+        with self._lock:
+            self._roll()
+            start = self._rr % max(1, n_keys)
+            self._rr += 1
+            now = time.monotonic()
+            order = [(start + i) % n_keys for i in range(n_keys)]
+            return [k for k in order if now >= self._bad_keys.get(k, 0.0) and now >= self._blocked.get((k, model), 0.0)]
+
+    def acquire(self, key: int, model: str) -> bool:
+        """真的要打之前登記一次；超過每分鐘／每天的保留上限就不打（換下一把金鑰或下一個模型）。"""
+        rpm, rpd = _model_limits(model)
+        with self._lock:
+            self._roll()
+            now = time.monotonic()
+            window = self._minute.setdefault((key, model), deque())
+            while window and now - window[0] >= 60:
+                window.popleft()
+            if len(window) >= max(1, int(rpm * GEMINI_QUOTA_MARGIN)):
+                return False
+            if self._day.get((key, model), 0) >= max(1, int(rpd * GEMINI_QUOTA_MARGIN)):
+                self._blocked[(key, model)] = float("inf")
+                return False
+            window.append(now)
+            self._day[(key, model)] = self._day.get((key, model), 0) + 1
+            self._save_day()
+            return True
+
+    def remaining_ratio(self, n_keys: int, model: str = "") -> float:
+        """主模型（模型鏈第一個）今天還剩多少比例（以 9 成保留上限為分母）；下午加開、緊急縮減用。"""
+        model = model or (GEMINI_MODEL_CHAIN[0] if GEMINI_MODEL_CHAIN else "")
+        if not model or n_keys <= 0:
+            return 0.0
+        _, rpd = _model_limits(model)
+        capacity = max(1, int(rpd * GEMINI_QUOTA_MARGIN)) * n_keys
+        with self._lock:
+            self._roll()
+            used = sum(self._day.get((k, model), 0) for k in range(n_keys))
+        return max(0.0, 1.0 - used / capacity)
+
+    def note_error(self, key: int, model: str, error: str) -> str:
+        """依錯誤種類調整狀態，回傳 overloaded／daily／minute／missing_model／bad_key／other。"""
+        with self._lock:
+            now = time.monotonic()
+            if _MISSING_MODEL_RE.search(error):
+                self._disabled.add(model)
+                return "missing_model"
+            if _BAD_KEY_RE.search(error):
+                self._bad_keys[key] = now + 3600
+                return "bad_key"
+            if _RATE_RE.search(error):
+                if _DAILY_RE.search(error):
+                    self._blocked[(key, model)] = float("inf")
+                    return "daily"
+                self._blocked[(key, model)] = now + GEMINI_MINUTE_COOLDOWN
+                return "minute"
+            if _OVERLOAD_RE.search(error):
+                self._model_down[model] = now + GEMINI_OVERLOAD_COOLDOWN
+                return "overloaded"
+            return "other"
+
+    def snapshot(self, n_keys: int) -> List[str]:
+        """「/ace 系統狀態」與 Log 用：每個模型今天用了多少、剩下幾把金鑰可用。"""
+        with self._lock:
+            self._roll()
+            now = time.monotonic()
+            lines = []
+            for model in GEMINI_MODEL_CHAIN:
+                rpm, rpd = _model_limits(model)
+                used = sum(self._day.get((k, model), 0) for k in range(n_keys))
+                ready = sum(1 for k in range(n_keys) if now >= self._blocked.get((k, model), 0.0) and now >= self._bad_keys.get(k, 0.0))
+                state = "停用（找不到模型）" if model in self._disabled else (
+                    f"塞車暫停 {int(self._model_down[model] - now)} 秒" if now < self._model_down.get(model, 0.0) else "正常")
+                lines.append(f"{model}｜今日 {used}/{rpd * n_keys}｜可用金鑰 {ready}/{n_keys}｜{state}")
+            return lines
+
+
+def _usage_tokens(response: Any) -> Tuple[int, int, str]:
+    """官方回傳的實際 token（含思考）；拿不到才用字數估算。"""
+    meta = getattr(response, "usage_metadata", None)
+    try:
+        prompt = int(getattr(meta, "prompt_token_count", 0) or 0)
+        output = int(getattr(meta, "candidates_token_count", 0) or 0) + int(getattr(meta, "thoughts_token_count", 0) or 0)
+        if prompt or output:
+            return prompt, output, "official"
+    except (TypeError, ValueError):
+        pass
+    return 0, 0, "estimated"
+
+
+_AI_GATE = threading.local()   # 每題：allowed＝還能用 AI 解讀、used＝這題真的用了、blocked＝因額度被跳過
+
+
+def _record_gemini_usage(model: str, ok: bool, in_tokens: int = 0, out_tokens: int = 0) -> None:
+    """每次實際打出去的 Gemini 請求都記到 SQLite（台北日期×模型）：估算額度與付費成本用。"""
+    day = tools.taipei_now().strftime("%Y-%m-%d")
+    local_market_cache.accumulate_state(f"gemini_usage:{day}", {model: {
+        "calls": 1, "ok": 1 if ok else 0, "fail": 0 if ok else 1, "in": int(in_tokens or 0), "out": int(out_tokens or 0)}})
 
 
 class GeminiGateway:
-    """重用 _call_gemini_with_retry（多 Key fallback、retry、structured output）。
+    """Bot 自己的 Gemini 呼叫（不再經過週報主程式）：
+    - 模型鏈 GEMINI_MODEL_CHAIN 依序嘗試；金鑰輪流用；每個金鑰×模型各自記錄額度與限流（GeminiQuota）
+    - 503 塞車整個模型暫停、429 每日額度用完停到太平洋時間午夜、每分鐘限流停 60 秒、404 模型停用
+    - 同時最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 4）個請求在路上；只在真的打 API 時佔名額，不會一題卡住全部
+    - 整體時限 DEADLINE；逾時的那次在背景跑完後丟棄"""
 
-    - cache_task 留空、write_cache=False：不讀寫週報的 Google Sheet Gemini 快取，也不寫本機 prompt 快取。
-    - 同一時間最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 2）個 Gemini 呼叫，避免被併發打爆額度。
-    """
-
-    DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_GEMINI_DAILY_LIMIT", 0))   # 0＝不限
+    DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_GEMINI_DAILY_LIMIT", 0))   # 全系統每日呼叫軟上限；0＝不限（各金鑰×模型另有額度追蹤）
+    DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
+    # 同時存在的 Gemini 背景工作上限（含逾時後仍在跑的）；滿了直接改規則式，不再開新執行緒
+    _OUTSTANDING = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_OUTSTANDING", 8)))
 
     def __init__(self, log: DebugLog) -> None:
         self.log = log
-        self._lock = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_CONCURRENCY", 2)))
+        self._slots = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_CONCURRENCY", 4)))
         self._day = ""
         self._day_calls = 0
         self._count_lock = threading.Lock()
-        self._primary_down_until = 0.0
+        self.quota = GeminiQuota()
 
     def _quota_left(self) -> bool:
-        """免費方案有每日請求上限；超過軟上限就只出規則式內容，不再呼叫 AI。"""
+        """全系統每日軟上限（DAILY_LIMIT）：超過就只出規則式內容，不再呼叫 AI。"""
         if not self.DAILY_LIMIT:
             return True
         today = tools.taipei_now().strftime("%Y-%m-%d")
@@ -1604,14 +1763,12 @@ class GeminiGateway:
             self._day_calls += 1
             return True
 
-    def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
-                            schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
-        """圖片＋文字；總時限和文字路徑相同（DEADLINE 秒），多模型×多金鑰依序重試時不讓這題無限等待。"""
+    def _run_with_deadline(self, purpose: str, work: Callable[[float], GeminiResult]) -> GeminiResult:
         if not self.DEADLINE:
-            return self._generate_with_image(prompt, image, mime_type, purpose, schema)
-        gate = self._OUTSTANDING
+            return work(0.0)
+        gate = self._OUTSTANDING          # 拿哪一顆就 release 同一顆
         if not gate.acquire(blocking=False):
-            self.log(f"Gemini 背景工作已滿，略過讀圖：{purpose}")
+            self.log(f"Gemini 背景工作已滿，改用規則式內容：{purpose}")
             return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
         request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
         deadline = time.monotonic() + self.DEADLINE
@@ -1621,110 +1778,7 @@ class GeminiGateway:
         def run() -> None:
             try:
                 with tools.api_request_scope(request_id):
-                    box["result"] = self._generate_with_image(prompt, image, mime_type, purpose, schema, deadline)
-            except Exception as exc:
-                box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
-            finally:
-                gate.release()
-                done.set()
-        threading.Thread(target=run, name="ace-gemini-image", daemon=True).start()
-        if not done.wait(self.DEADLINE):
-            self.log(f"Gemini 讀圖超過 {self.DEADLINE:.0f} 秒，放棄：{purpose}")
-            tools.record_api_event("Gemini", status=504, latency=self.DEADLINE, detail=purpose)
-            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose)
-        return box["result"]
-
-    def _generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
-                             schema: Optional[Dict[str, Any]] = None, deadline: float = 0.0) -> GeminiResult:
-        """圖片＋文字（例如讀截圖裡的股票清單）；主程式的 Gemini 函式只收文字，這裡直接用 google-genai，
-        沿用同一組 WARRANTS_API_KEY（失敗換下一支）與同一個模型。deadline 到了就不再開始新的嘗試。"""
-        if not self._quota_left():
-            return GeminiResult(ok=False, error="daily_limit", purpose=purpose)
-        kf = tools.core()
-        if not kf.GEMINI_ENABLE or kf.genai is None or not kf._get_warrants_api_keys():
-            return GeminiResult(ok=False, error="Gemini 未啟用或未設定金鑰", purpose=purpose)
-        from google.genai import types as genai_types
-        config: Dict[str, Any] = {"temperature": 0.0}
-        if schema:
-            config.update(response_mime_type="application/json", response_schema=schema)
-        started, last_error = time.perf_counter(), ""
-        with self._lock:
-            for index, key in enumerate(kf._get_warrants_api_keys(), 1):
-                for model in dict.fromkeys(m for m in (kf.GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m):
-                    if deadline and time.monotonic() >= deadline:
-                        last_error = last_error or "deadline"
-                        break
-                    try:
-                        client = kf.genai.Client(api_key=key)
-                        response = client.models.generate_content(
-                            model=model, contents=[genai_types.Part.from_bytes(data=image, mime_type=mime_type), prompt],
-                            config=config)
-                        text = str(response.text or "").strip()
-                        latency = time.perf_counter() - started
-                        tools.record_api_event("Gemini", status=200, latency=latency)
-                        self.log(f"Gemini 讀圖｜用途={purpose}｜model={model}｜key {index}｜latency={latency:.2f}s｜結果=成功")
-                        return GeminiResult(ok=bool(text), text=text, latency=latency, purpose=purpose,
-                                            input_tokens=max(1, round(len(prompt) / 4)) + 258,
-                                            output_tokens=max(1, round(len(text) / 4)) if text else 0,
-                                            total_tokens=0, token_source="estimated")
-                    except Exception as exc:  # google-genai 例外型別眾多，逐一換模型、換金鑰
-                        last_error = f"{type(exc).__name__}: {exc}"
-                        self.log(f"Gemini 讀圖失敗｜model={model}｜key {index}｜{last_error[:160]}")
-        latency = time.perf_counter() - started
-        tools.record_api_event("Gemini", status=500, latency=latency)
-        return GeminiResult(ok=False, error=last_error or "Gemini 讀圖失敗", latency=latency, purpose=purpose,
-                            rate_limited=bool(re.search(r"429|RESOURCE_EXHAUSTED|quota", last_error, re.I)))
-
-    @staticmethod
-    def _generate_with_model(kf: Any, model: str, prompt: str, schema: Optional[Dict[str, Any]],
-                             temperature: float) -> Optional[str]:
-        """指定模型呼叫一次（逐一換 API Key）；模型只當這次呼叫的參數，不動任何全域設定。"""
-        config: Dict[str, Any] = {"temperature": max(0.0, min(2.0, float(temperature)))}
-        if schema and getattr(kf, "GEMINI_STRUCTURED_OUTPUT_ENABLE", True):
-            config.update(response_mime_type="application/json", response_schema=schema)
-        thinking = _thinking_config(model)
-        for key in kf._get_warrants_api_keys():
-            for attempt in range(2):
-                use = dict(config, thinking_config=thinking) if thinking and attempt == 0 else config
-                try:
-                    # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉（Cannot send a request, as the client has been closed）
-                    client = kf.genai.Client(api_key=key)
-                    response = client.models.generate_content(model=model, contents=prompt, config=use)
-                    text = str(response.text or "")
-                    if text:
-                        return text
-                    break
-                except Exception as exc:  # google-genai 例外型別眾多，換下一支 Key
-                    _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
-                    if use is config or "thinking" not in str(exc).lower():
-                        break
-                    # SDK 或模型不支援這個思考參數：這個模型之後都不帶，這次立刻不帶重試
-                    _THINKING_UNSUPPORTED.add(model)
-                    thinking = None
-                    print(f"⚠️ {model} 不支援思考參數，改用模型預設：{str(exc)[:160]}")
-        return None
-
-    DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
-    # 同時存在的 Gemini 背景工作上限（含逾時後仍在跑的）；滿了直接改規則式，不再開新執行緒
-    _OUTSTANDING = threading.BoundedSemaphore(max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_OUTSTANDING", 6)))
-
-    def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
-        """整體時限 DEADLINE 秒：超過就回失敗（呼叫端改用規則式內容），不讓一題卡在 Gemini 重試上。
-        逾時的那次呼叫在背景跑完後丟棄。"""
-        if not self.DEADLINE:
-            return self._generate(prompt, purpose, schema, temperature)
-        gate = self._OUTSTANDING          # 拿哪一顆就 release 同一顆
-        if not gate.acquire(blocking=False):
-            self.log(f"Gemini 背景工作已滿，改用規則式內容：{purpose}")
-            return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
-        request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
-        box: Dict[str, GeminiResult] = {}
-        done = threading.Event()
-
-        def run() -> None:
-            try:
-                with tools.api_request_scope(request_id):
-                    box["result"] = self._generate(prompt, purpose, schema, temperature)
+                    box["result"] = work(deadline)
             except Exception as exc:
                 box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
             finally:
@@ -1737,96 +1791,109 @@ class GeminiGateway:
             return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose)
         return box["result"]
 
-    def _generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
+    def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
+        # 會員今日 AI 解讀用完：只放行判斷題意（planner），其他 AI 解讀直接跳過，回答改用圖表與數據
+        if purpose != "planner" and not getattr(_AI_GATE, "allowed", True):
+            _AI_GATE.blocked = True
+            return GeminiResult(ok=False, error="user_ai_quota", purpose=purpose)
+        result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
+        if result.ok and purpose != "planner":
+            _AI_GATE.used = True
+        return result
+
+    def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
+                            schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+        """圖片＋文字（例如讀截圖裡的股票清單）；同一套模型鏈、金鑰輪流與總時限。"""
+        def work(deadline: float) -> GeminiResult:
+            from google.genai import types as genai_types
+            contents = [genai_types.Part.from_bytes(data=image, mime_type=mime_type), prompt]
+            return self._generate(prompt, purpose, schema, 0.0, deadline, contents=contents)
+        return self._run_with_deadline(purpose, work)
+
+    @staticmethod
+    def _call_once(kf: Any, key: str, model: str, contents: Any, config: Dict[str, Any]) -> Any:
+        """打一次 API；模型不支援思考參數時，同一次不帶參數重打（之後這個模型都不帶）。"""
+        thinking = _thinking_config(model)
+        use = dict(config, thinking_config=thinking) if thinking else config
+        # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉
+        client = kf.genai.Client(api_key=key)
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=use)
+        except Exception as exc:
+            if not thinking or "thinking" not in str(exc).lower():
+                raise
+            _THINKING_UNSUPPORTED.add(model)
+            print(f"⚠️ {model} 不支援思考參數，改用模型預設：{str(exc)[:160]}", flush=True)
+            return client.models.generate_content(model=model, contents=contents, config=config)
+
+    def _generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3,
+                  deadline: float = 0.0, contents: Any = None) -> GeminiResult:
         if not self._quota_left():
             self.log(f"Gemini 今日次數已達上限 {self.DAILY_LIMIT}，改用規則式輸出：{purpose}")
-            return GeminiResult(ok=False, text="", error="daily_limit")
+            return GeminiResult(ok=False, text="", error="daily_limit", purpose=purpose)
         kf = tools.core()
-        _install_gemini_error_recorder(kf)
         if not kf.GEMINI_ENABLE:
             return GeminiResult(ok=False, error="WARRANT_GEMINI_ENABLE=0", purpose=purpose)
         if kf.genai is None:
             return GeminiResult(ok=False, error="google-genai 未安裝", purpose=purpose)
-        if not kf._get_warrants_api_keys():
+        keys = list(kf._get_warrants_api_keys() or [])
+        if not keys:
             return GeminiResult(ok=False, error="未設定 WARRANTS_API_KEY", purpose=purpose)
-        _GEMINI_ERROR_STATE.last = ""
-        started = time.perf_counter()
-
-        def call() -> Optional[str]:
-            with self._lock:
-                if _thinking_config(kf.GEMINI_MODEL):
-                    # 要調思考程度時主模型也走 Bot 自己的呼叫（主程式不帶思考參數、不能改）
-                    return self._generate_with_model(kf, kf.GEMINI_MODEL, prompt, schema, temperature)
+        config: Dict[str, Any] = {"temperature": max(0.0, min(2.0, float(temperature)))}
+        if schema and getattr(kf, "GEMINI_STRUCTURED_OUTPUT_ENABLE", True):
+            config.update(response_mime_type="application/json", response_schema=schema)
+        contents = prompt if contents is None else contents
+        started, attempts, last_error, kinds = time.perf_counter(), 0, "", []
+        for rank, model in enumerate(GEMINI_MODEL_CHAIN):
+            if not self.quota.model_ready(model):
+                continue
+            for key in self.quota.key_order(model, len(keys)):
+                if deadline and time.monotonic() >= deadline:
+                    last_error = last_error or "deadline"
+                    break
+                if not self.quota.acquire(key, model):
+                    continue
+                attempts += 1
+                call_started = time.perf_counter()
                 try:
-                    return kf._call_gemini_with_retry(
-                        prompt,
-                        cache_task="",
-                        stock_code="",
-                        stock_name="",
-                        write_cache=False,
-                        response_schema=schema,
-                        temperature=temperature,
-                    )
-                except Exception as exc:  # google-genai 例外型別眾多，統一轉成失敗結果
-                    _GEMINI_ERROR_STATE.last = f"{type(exc).__name__}: {exc}"
-                    return None
-
-        primary = model_used = kf.GEMINI_MODEL
-        has_fallback = bool(GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != primary)
-        text = None
-        tried_fallback = False
-        if has_fallback and time.monotonic() < self._primary_down_until:
-            # 主模型剛塞車過：這段時間直接用備援，不再先等主模型把每支 Key 試完
-            self.log(f"主模型 {primary} 近期塞車，直接使用備援模型 {GEMINI_FALLBACK_MODEL}")
-            model_used, tried_fallback = GEMINI_FALLBACK_MODEL, True
-            with self._lock:
-                text = self._generate_with_model(kf, GEMINI_FALLBACK_MODEL, prompt, schema, temperature)
-            if not text:
-                model_used = primary
-        if not text:
-            text = call()
-            if not text and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")):
-                self._primary_down_until = time.monotonic() + GEMINI_PRIMARY_COOLDOWN
-        if (not text and has_fallback and not tried_fallback
-                and _OVERLOADED_RE.search(str(getattr(_GEMINI_ERROR_STATE, "last", "") or ""))):
-            # 備援模型只用在這一次呼叫（per-call 指定 model），不改主程式的全域 GEMINI_MODEL，
-            # 否則同時進行的其他請求會被迫用錯模型。
-            self.log(f"主模型 {primary} 塞車或限流，改用備援模型 {GEMINI_FALLBACK_MODEL} 再試一次")
-            model_used = GEMINI_FALLBACK_MODEL
-            _GEMINI_ERROR_STATE.last = ""
-            with self._lock:
-                text = self._generate_with_model(kf, GEMINI_FALLBACK_MODEL, prompt, schema, temperature)
+                    with self._slots:
+                        response = self._call_once(kf, keys[key], model, contents, config)
+                except Exception as exc:  # google-genai 例外型別眾多：依錯誤種類換金鑰或換模型
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    kind = self.quota.note_error(key, model, last_error)
+                    kinds.append(kind)
+                    tools.record_api_event("Gemini", status=503 if kind == "overloaded" else 429 if kind in ("daily", "minute") else 500,
+                                           latency=time.perf_counter() - call_started, detail=f"{purpose}:{model}:{kind}")
+                    _record_gemini_usage(model, ok=False)
+                    self.log(f"Gemini 嘗試失敗｜{model}｜key {key + 1}｜{kind}｜{last_error[:120]}")
+                    if kind in ("overloaded", "missing_model"):
+                        break          # 整個模型的問題：換金鑰沒用，直接換下一個模型
+                    continue
+                text = str(getattr(response, "text", "") or "").strip()
+                latency = time.perf_counter() - started
+                tools.record_api_event("Gemini", status=200 if text else 500, latency=time.perf_counter() - call_started,
+                                       detail=f"{purpose}:{model}")
+                if not text:
+                    last_error = "Gemini 沒有回傳內容"
+                    continue
+                in_tokens, out_tokens, source = _usage_tokens(response)
+                if source != "official":
+                    in_tokens, out_tokens = max(1, round(len(prompt) / 4)), max(1, round(len(text) / 4))
+                _record_gemini_usage(model, ok=True, in_tokens=in_tokens, out_tokens=out_tokens)
+                self.log(f"Gemini 呼叫｜用途={purpose}｜model={model}{'（備援）' if rank else ''}｜key {key + 1}｜"
+                         f"latency={latency:.2f}s｜嘗試 {attempts} 次｜tokens {in_tokens}+{out_tokens}（{source}）｜結果=成功")
+                return GeminiResult(ok=True, text=text, latency=latency, purpose=purpose, input_tokens=in_tokens,
+                                    output_tokens=out_tokens, total_tokens=in_tokens + out_tokens, token_source=source)
+            if deadline and time.monotonic() >= deadline:
+                break
         latency = time.perf_counter() - started
-        last_error = str(getattr(_GEMINI_ERROR_STATE, "last", "") or "")
-        # 目前主程式的 _call_gemini_with_retry 只回傳文字，不暴露 usage_metadata；
-        # 因此這裡誠實標記為 estimated。之後若主程式改成回傳官方 usage，可直接替換本段。
-        output_text = str(text).strip() if text else ""
-        input_tokens = max(1, round(len(prompt) / 4)) if prompt else 0
-        output_tokens = max(1, round(len(output_text) / 4)) if output_text else 0
-        total_tokens = input_tokens + output_tokens
-        self.log(
-            f"Gemini 呼叫｜用途={purpose}｜model={model_used}"
-            f"{'（備援）' if model_used != primary else ''}｜latency={latency:.2f}s｜"
-            f"prompt={len(prompt):,} 字｜tokens≈{input_tokens}+{output_tokens}={total_tokens}（estimated）｜"
-            f"結果={'成功' if text else '失敗'}"
-        )
-        tools.record_api_event("Gemini", status=200 if text else 500, latency=latency, detail=purpose)
-        if text:
-            return GeminiResult(ok=True, text=output_text, latency=latency, purpose=purpose,
-                                input_tokens=input_tokens, output_tokens=output_tokens,
-                                total_tokens=total_tokens, token_source="estimated")
-        rate_limited = any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
-        return GeminiResult(
-            ok=False,
-            error=last_error or "Gemini 沒有回傳內容",
-            rate_limited=rate_limited,
-            latency=latency,
-            purpose=purpose,
-            input_tokens=input_tokens,
-            output_tokens=0,
-            total_tokens=input_tokens,
-            token_source="estimated",
-        )
+        if not attempts:
+            last_error = last_error or "所有模型與金鑰的額度都暫時用完或暫停中"
+        self.log(f"Gemini 呼叫｜用途={purpose}｜嘗試 {attempts} 次｜latency={latency:.2f}s｜結果=失敗｜{last_error[:160]}")
+        rate_limited = (not attempts) or any(k in ("daily", "minute") for k in kinds) or \
+            any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
+        return GeminiResult(ok=False, error=last_error or "Gemini 沒有回傳內容", rate_limited=rate_limited,
+                            latency=latency, purpose=purpose, token_source="none")
 
 
 # ============================================================
@@ -3236,6 +3303,7 @@ class AnswerResult:
     layout: str = "text"
     weekly: Dict[str, Any] = field(default_factory=dict)
     context_note: str = ""
+    private_notice: str = ""       # 另外發一則只有本人看得到的提醒（例如今日 AI 解讀已用完）
     as_text: bool = False          # True＝用純文字訊息回覆（草稿要能直接複製，不能只給圖片）
     request_id: str = ""
     input_tokens: int = 0
@@ -3481,6 +3549,362 @@ class ConversationMemory:
 
 ANSWER_CONCURRENCY = max(1, tools._env_int("DISCORD_AI_ANSWER_CONCURRENCY", 3))
 ANSWER_QUEUE_LIMIT = max(1, tools._env_int("DISCORD_AI_QUEUE_LIMIT", 20))
+# ============================================================
+# 會員額度（額度日＝台灣下午 4 點到隔天下午 4 點，和 Gemini 每日額度同步重置）
+# ============================================================
+QUOTA_COMMAND_NAME = os.getenv("DISCORD_AI_QUOTA_COMMAND", "額度").strip() or "額度"
+USER_AI_DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_USER_DAILY_LIMIT", 3))          # 每人每額度日 AI 解讀次數
+USER_PLAIN_DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_USER_PLAIN_LIMIT", 30))      # 不用 AI 的題目
+USER_MIN_INTERVAL = max(0.0, tools._env_float("DISCORD_AI_USER_MIN_INTERVAL", 8.0))    # 同一人兩題最短間隔（秒）
+BONUS_START_MINUTE = 12 * 60                                                           # 下午加開：12:00 到額度重置
+BONUS_EXTRA = max(0, tools._env_int("DISCORD_AI_BONUS_EXTRA", 3))
+BONUS_ON_RATIO = tools._env_float("DISCORD_AI_BONUS_ON_RATIO", 0.30)                   # 主模型剩 ≥30% 才加開
+BONUS_OFF_RATIO = tools._env_float("DISCORD_AI_BONUS_OFF_RATIO", 0.10)                 # 低於 10% 停止加開
+EMERGENCY_RATIO = tools._env_float("DISCORD_AI_EMERGENCY_RATIO", 0.20)                 # 加開時段以外剩 <20%：緊急縮減
+EMERGENCY_AI_LIMIT = max(0, tools._env_int("DISCORD_AI_EMERGENCY_AI_LIMIT", 1))
+QUOTA_RESET_LABEL = "每天下午 4 點"
+USER_LIMIT_MESSAGE = f"今天的提問次數已達上限，{QUOTA_RESET_LABEL}恢復。"
+USER_RATE_MESSAGE = "問得有點快，請稍等幾秒再問。"
+AI_EXHAUSTED_NOTICE = (f"今天的 AI 解讀次數已用完。你仍然可以繼續提問，回答會以圖表與數據為主，只是不附 AI 解讀；"
+                       f"{QUOTA_RESET_LABEL}恢復。")
+MY_QUOTA_WORDS = ("我的額度", "我的次數", "剩餘額度", "剩幾題", "查額度", "額度查詢")
+QUOTA_EXEMPT_KEY = "quota_exempt_users"
+QUOTA_GIFTS_KEY = "quota_gifts"            # [{id, type: user|role, target, amount, by, at}]
+QUOTA_GIFT_USED_KEY = "quota_gift_used"    # {使用者: {贈送 id: 已用}}
+QUOTA_ROLE_LIMIT_KEY = "quota_role_limits" # {身分組: 每日 AI 次數}
+
+
+def quota_exempt_ids() -> Set[str]:
+    """不限題數的測試員：Railway 變數 DISCORD_AI_UNLIMITED_USER_IDS ＋ 管理員用「新增測試員」加的名單。"""
+    ids = {x.strip() for x in os.getenv("DISCORD_AI_UNLIMITED_USER_IDS", "").split(",") if x.strip()}
+    try:
+        ids |= {str(x) for x in (local_market_cache.get_state(QUOTA_EXEMPT_KEY, []) or [])}
+    except Exception:
+        pass
+    return ids
+
+
+def _counts_toward_quota(result: "AnswerResult") -> bool:
+    """只有真的算出來的成功分析才計次；回答快取命中、說明、澄清、錯誤、排隊已滿、權限拒絕都不算。"""
+    if result.denied_feature or result.cache_hit or result.route == "answer_cache":
+        return False
+    return result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES
+
+
+class QuotaPolicy:
+    """會員額度：每額度日 AI 解讀 N 次（身分組可設更多、下午加開、緊急縮減、管理員贈送），不用 AI 的題目另計上限；
+    AI 用完照樣能問（只是沒有 AI 解讀）。資料都存 SQLite，重新部署不歸零。"""
+
+    def __init__(self, remaining_ratio: Callable[[], float] = lambda: 1.0) -> None:
+        self.remaining_ratio = remaining_ratio
+        self._lock = threading.Lock()
+        self._day = ""
+        self._usage: Dict[str, Dict[str, int]] = {}
+        self._last_ask: Dict[str, float] = {}
+        self.mode = "normal"            # normal／bonus／emergency（背景每 5 分鐘 refresh_mode 更新並通知管理員）
+
+    # ----- 額度日與儲存 -----
+    @staticmethod
+    def day() -> str:
+        return _pacific_day()
+
+    def _roll(self) -> None:
+        day = self.day()
+        if day == self._day:
+            return
+        self._day = day
+        try:
+            self._usage = {str(k): dict(v) for k, v in (local_market_cache.get_state(f"user_usage:{day}", {}) or {}).items()}
+        except Exception:
+            self._usage = {}
+
+    def _save(self) -> None:
+        try:
+            local_market_cache.set_state(f"user_usage:{self._day}", self._usage)
+        except Exception:
+            pass
+
+    # ----- 模式（下午加開／緊急縮減） -----
+    def current_mode(self, now: Optional[datetime] = None) -> str:
+        now = now or tools.taipei_now()
+        minutes = now.hour * 60 + now.minute
+        ratio = self.remaining_ratio()
+        in_window = BONUS_START_MINUTE <= minutes < 16 * 60
+        if in_window:
+            if self.mode == "bonus":
+                return "bonus" if ratio >= BONUS_OFF_RATIO else "normal"
+            return "bonus" if ratio >= BONUS_ON_RATIO else "normal"
+        return "emergency" if ratio < EMERGENCY_RATIO else "normal"
+
+    def refresh_mode(self) -> str:
+        """回傳模式變化的說明（給管理員群組與 Log）；沒變化回空字串。"""
+        new = self.current_mode()
+        if new == self.mode:
+            return ""
+        old, self.mode = self.mode, new
+        ratio = self.remaining_ratio()
+        texts = {"bonus": f"🎁 下午加開：Gemini 主模型剩 {ratio:.0%}，每人 AI 解讀多 {BONUS_EXTRA} 次（到下午 4 點）",
+                 "emergency": f"⚠️ 緊急縮減：Gemini 主模型只剩 {ratio:.0%}，每人 AI 解讀暫時降為 {EMERGENCY_AI_LIMIT} 次",
+                 "normal": f"✅ 額度恢復一般模式（Gemini 主模型剩 {ratio:.0%}，原本為 {old}）"}
+        return texts[new]
+
+    # ----- 額度計算 -----
+    def ai_limit(self, roles: Sequence[str] = ()) -> int:
+        base = USER_AI_DAILY_LIMIT
+        try:
+            role_limits = local_market_cache.get_state(QUOTA_ROLE_LIMIT_KEY, {}) or {}
+            base = max([base] + [int(role_limits[r]) for r in roles if str(r) in role_limits])
+        except Exception:
+            pass
+        mode = self.current_mode()
+        if mode == "bonus":
+            return base + BONUS_EXTRA
+        if mode == "emergency":
+            return min(base, EMERGENCY_AI_LIMIT)
+        return base
+
+    def _gifts_for(self, user: str, roles: Sequence[str]) -> List[Tuple[str, int]]:
+        """這個人可用的贈送額度 [(贈送 id, 剩幾次)]，先到期的先用（依建立順序）。"""
+        try:
+            gifts = local_market_cache.get_state(QUOTA_GIFTS_KEY, []) or []
+            used = (local_market_cache.get_state(QUOTA_GIFT_USED_KEY, {}) or {}).get(str(user), {})
+        except Exception:
+            return []
+        out = []
+        for gift in gifts:
+            if (gift.get("type") == "user" and str(gift.get("target")) == str(user)) or \
+                    (gift.get("type") == "role" and str(gift.get("target")) in {str(r) for r in roles}):
+                left = int(gift.get("amount") or 0) - int(used.get(str(gift.get("id")), 0))
+                if left > 0:
+                    out.append((str(gift.get("id")), left))
+        return out
+
+    def status(self, user: str, roles: Sequence[str] = ()) -> Dict[str, int]:
+        with self._lock:
+            self._roll()
+            row = self._usage.get(str(user), {})
+        limit = self.ai_limit(roles)
+        gift = sum(left for _, left in self._gifts_for(user, roles))
+        return {"ai_left": max(0, limit - int(row.get("ai", 0))), "gift_left": gift,
+                "plain_left": max(0, USER_PLAIN_DAILY_LIMIT - int(row.get("plain", 0))) if USER_PLAIN_DAILY_LIMIT else -1}
+
+    def check_entry(self, user: str, roles: Sequence[str] = ()) -> Tuple[bool, str, bool]:
+        """(可不可以問, 不行時的訊息, 這題能不能用 AI)。AI 用完照樣能問；只有 AI 用完＋一般題也用完才擋。"""
+        now = time.monotonic()
+        with self._lock:
+            last = self._last_ask.get(str(user), -1e9)
+            if USER_MIN_INTERVAL and now - last < USER_MIN_INTERVAL:
+                return False, USER_RATE_MESSAGE, False
+            self._last_ask[str(user)] = now
+            self._roll()
+            row = self._usage.get(str(user), {})
+        st = self.status(user, roles)
+        ai_ok = bool(not USER_AI_DAILY_LIMIT and not st["gift_left"]) or st["ai_left"] > 0 or st["gift_left"] > 0
+        if USER_PLAIN_DAILY_LIMIT and int(row.get("plain", 0)) >= USER_PLAIN_DAILY_LIMIT and not ai_ok:
+            return False, USER_LIMIT_MESSAGE, False
+        return True, "", ai_ok
+
+    def record(self, user: str, roles: Sequence[str], used_ai: bool) -> None:
+        """答完才計次：用了 AI 扣 AI 次數（每日用完再扣贈送），沒用 AI 扣一般題次數。"""
+        limit = self.ai_limit(roles)
+        gift_id = ""
+        with self._lock:
+            self._roll()
+            row = self._usage.setdefault(str(user), {})
+            if used_ai:
+                if int(row.get("ai", 0)) < limit:
+                    row["ai"] = int(row.get("ai", 0)) + 1
+                else:
+                    gifts = self._gifts_for(user, roles)
+                    gift_id = gifts[0][0] if gifts else ""
+                    row["ai_gift"] = int(row.get("ai_gift", 0)) + 1
+            else:
+                row["plain"] = int(row.get("plain", 0)) + 1
+            self._save()
+        if gift_id:
+            try:
+                used = local_market_cache.get_state(QUOTA_GIFT_USED_KEY, {}) or {}
+                mine = used.setdefault(str(user), {})
+                mine[gift_id] = int(mine.get(gift_id, 0)) + 1
+                local_market_cache.set_state(QUOTA_GIFT_USED_KEY, used)
+            except Exception:
+                pass
+
+    def first_ai_notice(self, user: str) -> bool:
+        """AI 用完的提醒每個額度日只發一次。"""
+        with self._lock:
+            self._roll()
+            row = self._usage.setdefault(str(user), {})
+            if row.get("notified"):
+                return False
+            row["notified"] = 1
+            self._save()
+            return True
+
+    # ----- 管理員 -----
+    @staticmethod
+    def gift(kind: str, target: str, amount: int, by: str) -> Dict[str, Any]:
+        gifts = list(local_market_cache.get_state(QUOTA_GIFTS_KEY, []) or [])
+        gift = {"id": uuid.uuid4().hex[:8], "type": kind, "target": str(target), "amount": int(amount), "by": str(by),
+                "at": tools.taipei_now().strftime("%Y-%m-%d %H:%M")}
+        gifts.append(gift)
+        local_market_cache.set_state(QUOTA_GIFTS_KEY, gifts)
+        return gift
+
+    @staticmethod
+    def set_role_limit(role: str, amount: Optional[int]) -> None:
+        limits = dict(local_market_cache.get_state(QUOTA_ROLE_LIMIT_KEY, {}) or {})
+        if amount is None:
+            limits.pop(str(role), None)
+        else:
+            limits[str(role)] = int(amount)
+        local_market_cache.set_state(QUOTA_ROLE_LIMIT_KEY, limits)
+
+
+QUOTA_MODE_LABELS = {"normal": "一般", "bonus": "下午加開", "emergency": "緊急縮減"}
+
+
+def my_quota_card(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[str], unlimited: bool,
+                  title: str = "我的額度") -> Dict[str, Any]:
+    if unlimited or policy is None:
+        items = [{"label": "今日 AI 解讀", "value": "不限"}, {"label": "一般提問", "value": "不限"}]
+        note = "※ 你的提問不限次數"
+    else:
+        st = policy.status(user, roles)
+        items = [{"label": "今日 AI 解讀", "value": f"剩 {st['ai_left'] + st['gift_left']} 次"}]
+        if st["gift_left"]:
+            items.append({"label": "其中贈送", "value": f"{st['gift_left']} 次"})
+        if st["plain_left"] >= 0:
+            items.append({"label": "一般提問（不含 AI）", "value": f"剩 {st['plain_left']} 題"})
+        note = "※ AI 解讀用完仍可以繼續提問，只是回答不附 AI 解讀"
+    return {"branch": title, "tags": ["艾斯 AI"], "label": f"{QUOTA_RESET_LABEL}恢復",
+            "sections": [{"type": "stats", "items": items}, {"type": "note", "text": note}]}
+
+
+def my_quota_text(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[str], unlimited: bool) -> str:
+    if unlimited or policy is None:
+        return "你的提問不限次數。"
+    st = policy.status(user, roles)
+    lines = [f"**我的額度**（{QUOTA_RESET_LABEL}恢復）",
+             f"今日 AI 解讀：剩 {st['ai_left'] + st['gift_left']} 次" + (f"（含贈送 {st['gift_left']} 次）" if st["gift_left"] else "")]
+    if st["plain_left"] >= 0:
+        lines.append(f"今日一般提問（不含 AI）：剩 {st['plain_left']} 題")
+    lines.append("AI 解讀用完仍可以繼續提問，只是回答不附 AI 解讀。")
+    return chr(10).join(lines)
+
+
+# 管理員群組通知（背景執行緒也能送）：啟動後由 on_ready 填入 client／config／loop
+_ADMIN_NOTICE: Dict[str, Any] = {}
+
+
+def notify_admin(text: str) -> None:
+    print(f"📣 管理員通知｜{text}", flush=True)
+    client, config, loop = (_ADMIN_NOTICE.get(k) for k in ("client", "config", "loop"))
+    if not client or not config or not loop or not getattr(config, "alert_channel_id", 0):
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_post_admin_alert(client, config.alert_channel_id, text), loop)
+    except Exception as exc:
+        print(f"⚠️ 管理員通知送出失敗：{type(exc).__name__}: {exc}", flush=True)
+
+
+# 付費方案估算用單價（美元）：Gemini 每百萬 tokens「輸入/輸出」、Railway 每月每 vCPU／每 GB 記憶體／每 GB 磁碟
+# 實際價格請依官方價目頁更新這兩個變數；免費方案實際花費為 0，這裡是「若改付費」的估算
+def _price_table(env: str, default: str) -> Dict[str, Tuple[float, float]]:
+    out: Dict[str, Tuple[float, float]] = {}
+    for part in (os.getenv(env, "") or default).split(";"):
+        name, _, value = part.partition("=")
+        try:
+            a, _, b = value.partition("/")
+            out[name.strip()] = (float(a), float(b or 0))
+        except ValueError:
+            continue
+    return out
+
+
+GEMINI_PRICE_DEFAULT = "gemini-3.1-flash-lite=0.25/1.50;gemini-2.5-flash=0.30/2.50;gemini-3.5-flash-lite=0.25/1.50"
+RAILWAY_PRICE_DEFAULT = "cpu=20/0;ram=10/0;disk=0.15/0"
+
+
+def cost_report_lines(days: int = 7) -> List[str]:
+    """「/ace 用量」：各模型今日／近 N 日請求與 token、若付費的月費估算；Railway 平均資源與月費估算。"""
+    lines: List[str] = []
+    prices = _price_table("DISCORD_AI_GEMINI_PRICES", GEMINI_PRICE_DEFAULT)
+    history = local_market_cache.recent_states("gemini_usage", days)
+    today = tools.taipei_now().strftime("%Y-%m-%d")
+    totals: Dict[str, Dict[str, float]] = {}
+    for day_data in history.values():
+        for model, info in day_data.items():
+            bucket = totals.setdefault(model, {})
+            for k in ("calls", "ok", "fail", "in", "out"):
+                bucket[k] = bucket.get(k, 0) + float((info or {}).get(k) or 0)
+    lines.append(f"**Gemini（實際請求，含重試）｜今日／近 {len(history) or 1} 日**")
+    month_cost = 0.0
+    for model in sorted(totals, key=lambda m: -totals[m].get("calls", 0)):
+        t, d = totals[model], (history.get(today, {}).get(model) or {})
+        pin, pout = prices.get(model, (0.0, 0.0))
+        cost = (t.get("in", 0) * pin + t.get("out", 0) * pout) / 1e6
+        month_cost += cost / max(1, len(history)) * 30
+        lines.append(f"{model}｜今日 {int(d.get('calls', 0))} 次（失敗 {int(d.get('fail', 0))}）｜近期 {int(t.get('calls', 0))} 次｜"
+                     f"tokens {int(t.get('in', 0)):,}+{int(t.get('out', 0)):,}｜若付費約 ${cost:.2f}")
+    if not totals:
+        lines.append("還沒有紀錄")
+    lines.append(f"若全部改付費：約 ${month_cost:.1f}／月（依近 {len(history) or 1} 日平均；單價用 DISCORD_AI_GEMINI_PRICES 調整）")
+    rail = local_market_cache.recent_states("railway_usage", days)
+    rp = _price_table("DISCORD_AI_RAILWAY_PRICES", RAILWAY_PRICE_DEFAULT)
+    samples = sum(float(v.get("samples") or 0) for v in rail.values())
+    if samples:
+        cpu = sum(float(v.get("cpu_pct_sum") or 0) for v in rail.values()) / samples / 100
+        ram = sum(float(v.get("rss_mb_sum") or 0) for v in rail.values()) / samples / 1024
+        peak = max(float(v.get("rss_mb_max") or 0) for v in rail.values())
+        disk = max(float(v.get("disk_mb_last") or 0) for v in rail.values()) / 1024
+        month = cpu * rp.get("cpu", (20, 0))[0] + ram * rp.get("ram", (10, 0))[0] + disk * rp.get("disk", (0.15, 0))[0]
+        lines.append(f"**Railway｜近 {len(rail)} 日平均**")
+        lines.append(f"CPU {cpu:.2f} vCPU｜記憶體 {ram * 1024:.0f}MB（最高 {peak:.0f}MB）｜磁碟 {disk * 1024:.0f}MB｜"
+                     f"估算約 ${month:.1f}／月（單價用 DISCORD_AI_RAILWAY_PRICES 調整）")
+    return lines
+
+
+def _record_railway_usage(resources: Dict[str, Any]) -> None:
+    """每 5 分鐘一筆（ACE USAGE 時）：CPU、記憶體、磁碟，給用量與月費估算。"""
+    try:
+        cpu = resources.get("cpu_pct")
+        rss_mb = float(resources.get("rss_bytes") or 0) / 1024 / 1024
+        disk_mb = float(((resources.get("disk") or {}).get("used")) or 0) / 1024 / 1024
+        if cpu is None or not rss_mb:
+            return
+        local_market_cache.accumulate_state(f"railway_usage:{tools.taipei_now().strftime('%Y-%m-%d')}", {
+            "samples": 1, "cpu_pct_sum": float(cpu), "rss_mb_sum": rss_mb, "rss_mb_max": rss_mb, "disk_mb_last": disk_mb})
+    except Exception:
+        pass
+
+
+def _gemini_quota_lines(engine: Any) -> List[str]:
+    """ACE USAGE 用：各模型今日用量與可用金鑰數；讀不到就略過（不影響其他統計）。"""
+    try:
+        return engine.gateway.quota.snapshot(len(tools.core()._get_warrants_api_keys() or []))
+    except Exception:
+        return []
+
+
+def _counts_toward_quota(result: "AnswerResult") -> bool:
+    """只有真的算出來的成功分析扣次數；回答快取命中、說明、澄清、錯誤、排隊已滿、權限拒絕都不扣。"""
+    if result.denied_feature or result.cache_hit or result.route == "answer_cache":
+        return False
+    return result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES
+
+
+QUOTA_EXEMPT_KEY = "quota_exempt_users"
+
+
+def quota_exempt_ids() -> Set[str]:
+    """不限題數的測試員：Railway 變數 DISCORD_AI_UNLIMITED_USER_IDS ＋ 管理員用「新增測試員」加的名單。"""
+    ids = {x.strip() for x in os.getenv("DISCORD_AI_UNLIMITED_USER_IDS", "").split(",") if x.strip()}
+    try:
+        ids |= {str(x) for x in (local_market_cache.get_state(QUOTA_EXEMPT_KEY, []) or [])}
+    except Exception:
+        pass
+    return ids
 QUEUE_FULL_MESSAGE = "目前使用人數較多，排隊已滿，請過一兩分鐘再問一次。"
 
 
@@ -3504,6 +3928,7 @@ class AceQueryEngine:
         self._queue_lock = threading.Lock()
         self._inflight: Dict[str, Future] = {}                          # 同一個問題同時進來共用一次計算
         self._pending = 0                                               # 排隊中＋處理中的題數
+        self._quota_policy = QuotaPolicy(self._gemini_remaining_ratio)  # 會員額度（管理員不限）
         self._request_local = threading.local()                          # 單次問答 request_id，供 API 計量
 
     def queue_size(self) -> int:
@@ -3667,13 +4092,15 @@ class AceQueryEngine:
                            cache_hit=True, context_note=note)
 
         self._request_local.spot_partial = False
+        priority = self._is_priority(self._access())       # 管理員：不排隊、不佔名額
         with self._queue_lock:
             shared = self._inflight.get(key)
             if shared is None:
-                if self._pending >= ANSWER_CONCURRENCY + ANSWER_QUEUE_LIMIT:
+                if not priority and self._pending >= ANSWER_CONCURRENCY + ANSWER_QUEUE_LIMIT:
                     return AnswerResult(text=QUEUE_FULL_MESSAGE, route="queue_full", gemini_calls=0, elapsed=0.0)
-                ahead = max(0, self._pending - ANSWER_CONCURRENCY + 1)
-                self._pending += 1
+                ahead = 0 if priority else max(0, self._pending - ANSWER_CONCURRENCY + 1)
+                if not priority:
+                    self._pending += 1
                 future: Future = Future()
                 self._inflight[key] = future
         if shared is not None:
@@ -3685,7 +4112,7 @@ class AceQueryEngine:
         try:
             if ahead and on_queue:
                 on_queue(ahead)
-            with self._slots:
+            with (contextlib.nullcontext() if priority else self._slots):
                 effective = f"{question}（{note}）" if note else question
                 result = self._answer_uncached(effective, started, parsed)
             future.set_result(result)
@@ -3694,12 +4121,14 @@ class AceQueryEngine:
             raise
         finally:
             with self._queue_lock:
-                self._pending -= 1
+                if not priority:
+                    self._pending -= 1
                 self._inflight.pop(key, None)
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         # 現股歷史還沒補完的整合頁不快取：背景補完後下一題要看到完整 70 日，不能拿到舊的 1/70
         if (result.cacheable and not (self._access() and self._access().simulation)
-                and not getattr(self._request_local, "spot_partial", False)):
+                and not getattr(self._request_local, "spot_partial", False)
+                and not getattr(_AI_GATE, "blocked", False)):
             # 盤中股價每分鐘在變，回答快取跟著縮短，避免同一題拿到幾分鐘前的價格。
             seconds = self.config.answer_cache_seconds
             if tools.INTRADAY_ENABLE and tools.intraday_session_now():
@@ -3951,6 +4380,23 @@ class AceQueryEngine:
         except access_policy.AccessDenied as exc:
             return self._denied_result(exc)
         perf["permission"] = time.perf_counter() - permission_started
+        # 入口把關（解析問題、呼叫任何 AI 之前）：查自己的額度、提問間隔、每日上限、排隊上限
+        quota_user = self._quota_user(access, context_key)
+        policy = getattr(self, "_quota_policy", None)
+        roles = tuple(getattr(access, "role_ids", ()) or ())
+        if any(w in re.sub(r"\s+", "", question) for w in MY_QUOTA_WORDS):
+            card = my_quota_card(policy, quota_user, roles, unlimited=not quota_user)
+            return AnswerResult(my_quota_text(policy, quota_user, roles, unlimited=not quota_user), "my_quota", 0, 0.0,
+                                image_title="我的額度", panels=[{"branch_card": card, "hide_text": True}])
+        _AI_GATE.allowed, _AI_GATE.used, _AI_GATE.blocked = True, False, False
+        if quota_user and policy is not None:
+            ok, message, ai_ok = policy.check_entry(quota_user, roles)
+            if not ok:   # 圖卡版提醒（只給本人看）
+                return AnswerResult(message, "user_limit", 0, 0.0, image_title="提問次數")
+            _AI_GATE.allowed = ai_ok
+        if not self._is_priority(access) and getattr(self, "_pending", 0) >= ANSWER_CONCURRENCY + ANSWER_QUEUE_LIMIT:
+            return AnswerResult(QUEUE_FULL_MESSAGE, "queue_full", 0, 0.0)
+        result = None
         if access is not None:
             is_admin = admin_mode = access.admin_mode
             context_key = access.memory_key(context_key)
@@ -3972,6 +4418,11 @@ class AceQueryEngine:
                                              result.elapsed, result.cache_hit)
             except Exception:
                 pass
+            # 答完才計次：用了 AI 扣 AI 次數、沒用 AI 扣一般題；AI 因額度被跳過時，另外私訊提醒一次
+            if quota_user and policy is not None and _counts_toward_quota(result):
+                policy.record(quota_user, roles, used_ai=bool(getattr(_AI_GATE, "used", False)))
+                if getattr(_AI_GATE, "blocked", False) and policy.first_ai_notice(quota_user):
+                    result = replace(result, private_notice=AI_EXHAUSTED_NOTICE)
             print(f"📊 usage｜route={result.route}｜cache={'hit' if result.cache_hit else 'miss'}｜"
                   f"{result.elapsed:.1f}s｜Gemini {result.gemini_calls} 次"
                   f"（in {result.input_tokens:,} / out {result.output_tokens:,} / {result.token_source}）｜"
@@ -3980,10 +4431,30 @@ class AceQueryEngine:
                            as_text=result.as_text or result.route in self.TEXT_ROUTES,
                            timings={k: round(v, 2) for k, v in perf.items() if v >= 0.005})
         finally:
+            _AI_GATE.allowed = True
             self._request_local.request_id = ""
             self._request_local.access = None
             if access and access.simulation:
                 self.memory.clear(context_key)
+
+    @staticmethod
+    def _quota_user(access, context_key: str) -> str:
+        """要計算每日題數的使用者；管理員、/ace、本機 CLI（沒有 access）、測試員不限。"""
+        if access is None or access.entry == "ace" or access.entitlement.admin:
+            return ""
+        user = str(context_key or "").split(":")[-1]
+        return "" if user in quota_exempt_ids() else user
+
+    def _gemini_remaining_ratio(self) -> float:
+        try:
+            return self.gateway.quota.remaining_ratio(len(tools.core()._get_warrants_api_keys() or []))
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _is_priority(access) -> bool:
+        """管理員（含 /ace）不排隊、不佔排隊名額。"""
+        return access is not None and (access.entry == "ace" or access.entitlement.admin)
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
@@ -4170,11 +4641,31 @@ class AceQueryEngine:
             api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
             text = (f"**用量｜{info['day']}**" + chr(10) +
                     f"題數 {info['questions']}｜快取命中 {info['cache_hits']}（{info['cache_hit_rate']}%）" + chr(10) +
-                    f"Gemini {info['gemini_calls']} 次｜tokens in {info['input_tokens']:,} / out {info['output_tokens']:,}" + chr(10) +
                     f"API：{api_text}" + chr(10) +
-                    f"平均耗時 {info['avg_elapsed']}s｜最慢 {info['slowest']}s｜尖峰 {info.get('busiest_hour') or '-'}")
+                    f"平均耗時 {info['avg_elapsed']}s｜最慢 {info['slowest']}s｜尖峰 {info.get('busiest_hour') or '-'}" + chr(10) +
+                    chr(10).join(cost_report_lines()))
             return AnswerResult(text=text, route="admin_usage", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
+        tester = re.match(r"^(新增|加入|移除|刪除)測試員(.*)$", compact)
+        if tester or compact in ("測試員名單", "測試員"):
+            names = [str(x) for x in (local_market_cache.get_state(QUOTA_EXEMPT_KEY, []) or [])]
+            if tester:
+                ids = re.findall(r"\d{5,}", tester.group(2))
+                if not ids:
+                    return AnswerResult(text="請附上 Discord 使用者 ID 或 @人，例如：新增測試員 123456789012345678",
+                                        route="admin_testers", gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
+                if tester.group(1) in ("新增", "加入"):
+                    names = sorted(set(names) | set(ids))
+                else:
+                    names = [n for n in names if n not in ids]
+                local_market_cache.set_state(QUOTA_EXEMPT_KEY, names)
+            env_ids = sorted({x.strip() for x in os.getenv("DISCORD_AI_UNLIMITED_USER_IDS", "").split(",") if x.strip()})
+            text = ("**不限題數的測試員**" + chr(10) + ("、".join(f"<@{n}>" for n in names) or "（名單是空的）") +
+                    (chr(10) + "Railway 變數另有：" + "、".join(env_ids) if env_ids else "") +
+                    chr(10) + f"一般會員每人每日 AI 解讀 {USER_AI_DAILY_LIMIT} 次、一般提問 {USER_PLAIN_DAILY_LIMIT} 題；"
+                    "管理員與 /ace 不限、不排隊")
+            return AnswerResult(text=text, route="admin_testers", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, as_text=True)
         radar = sector_radar.detect_intent(compact)
         if radar:
             return self._answer_radar(radar["direction"], started, route="admin_radar", scope=radar.get("scope", "all"),
@@ -5374,6 +5865,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `3006 套用文字 <貼上整篇>`：直接沿用自己寫好的文章（文字不經過 AI；slash 打不出換行時用 // 分段）
 • `用原文排版`／`自動排版`：套用文字產圖時，是否由 AI 自動分段加小標（預設自動，逐字核對不改內容）
 • `目前草稿`：看現在編輯中的文章
+• `新增測試員 <ID或@人>`／`移除測試員 <ID>`／`測試員名單`：不限每日題數的測試員
 
 【資料維護】
 • `系統狀態`：名冊、日K底庫、型態分數、是否永久保存
@@ -5586,11 +6078,17 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
         market_cache = local_market_cache.stats()
         fugle = usage.get("Fugle", {})
         cm_stats = sector_analysis.cmoney_catalog.cache_stats()
+        _record_railway_usage(resources)
+        change = engine._quota_policy.refresh_mode()      # 下午加開／緊急縮減：只通知管理員群組＋Log
+        if change:
+            notify_admin(change)
         lines = [
             "📊 ACE USAGE",
             f"  Railway process｜RAM {_fmt_mb(resources['rss_bytes'])}｜CPU {resources['cpu_pct']:.1f}%" if resources['cpu_pct'] is not None else f"  Railway process｜RAM {_fmt_mb(resources['rss_bytes'])}｜CPU warming",
             f"  Railway disk｜{_fmt_mb(resources['disk']['used'])} / {_fmt_mb(resources['disk']['total'])}｜path={resources['disk']['path']}",
             f"  Memory sessions｜{mem['entries']} / {mem['max_entries']}｜TTL={mem['ttl_minutes']}m｜queue={engine.queue_size()} / {ANSWER_QUEUE_LIMIT}",
+            f"  會員額度模式｜{engine._quota_policy.mode}｜主模型剩 {engine._gemini_remaining_ratio():.0%}",
+            *[f"  Gemini 額度｜{line}" for line in _gemini_quota_lines(engine)],
             f"  Local market cache｜stocks={market_cache['stocks']}｜bars={market_cache['bars']}｜scores={market_cache['scores']}｜size={_fmt_mb(market_cache['bytes'])}",
             f"  CMoney catalog cache｜groups={cm_stats.get('groups', 0)}｜member_groups={cm_stats.get('member_groups', 0)}",
             f"  Sector roster｜groups={len(sector_roster.catalog())}｜built={sector_roster.built_at() or '尚未建立'}",
@@ -5622,7 +6120,8 @@ def run_discord_bot(config: BotConfig) -> None:
     """
     # 綁到模組全域：slash 指令參數型別（例如 attachment: Optional[discord.Attachment]）在
     # `from __future__ import annotations` 下是字串，discord.py 會用模組全域解析，找不到 discord 會註冊失敗。
-    global discord
+    # app_commands 也要綁全域：/額度 的 action 參數型別是 app_commands.Choice[str]
+    global discord, app_commands
     import discord
     from discord import app_commands
 
@@ -5746,6 +6245,7 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_ready() -> None:
+        _ADMIN_NOTICE.update(client=client, config=config, loop=asyncio.get_running_loop())
         if not usage_monitor_started.is_set():
             usage_monitor_started.set()
             threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
@@ -5851,6 +6351,8 @@ def run_discord_bot(config: BotConfig) -> None:
                                         panels_with_context(extra), ephemeral=ephemeral, followup=True)
             for required in result.denial_followups:
                 await send_denial_followup(interaction, required, ephemeral)
+            if result.private_notice:
+                await interaction.followup.send(result.private_notice, ephemeral=True)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
             reason = alert_reason(result)
@@ -5884,6 +6386,58 @@ def run_discord_bot(config: BotConfig) -> None:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
             guard.release(user_id)
+
+    @client.tree.command(name=QUOTA_COMMAND_NAME, description="艾斯 AI 管理員：贈送／設定／查詢 AI 解讀額度")
+    @app_commands.describe(action="要做什麼", target="選使用者或身分組", amount="次數（贈送、身分組每日次數用）")
+    @app_commands.choices(action=[app_commands.Choice(name="贈送 AI 次數（用完為止）", value="gift"),
+                                  app_commands.Choice(name="設定身分組每日 AI 次數", value="role"),
+                                  app_commands.Choice(name="清除身分組每日設定", value="role_clear"),
+                                  app_commands.Choice(name="查詢", value="query")])
+    async def quota_command(interaction: "discord.Interaction", action: app_commands.Choice[str],
+                            target: Union[discord.Member, discord.Role], amount: Optional[int] = None) -> None:
+        if not access_policy.UserEntitlement.from_member(interaction.user, config.superuser_ids).admin:
+            await interaction.response.send_message("這個指令只限管理員使用。", ephemeral=True)
+            return
+        is_role = isinstance(target, discord.Role)
+        name = f"身分組 {target.name}" if is_role else f"{target.display_name}"
+        try:
+            if action.value == "gift":
+                if not amount or amount <= 0:
+                    raise ValueError("請填入要贈送的次數")
+                QuotaPolicy.gift("role" if is_role else "user", str(target.id), amount, str(interaction.user.id))
+                text = f"已贈送 {name} AI 解讀 {amount} 次" + ("（身分組每位成員各 {0} 次）".format(amount) if is_role else "") + "，用完為止。"
+            elif action.value == "role":
+                if not is_role or amount is None or amount < 0:
+                    raise ValueError("請選身分組並填入每日次數")
+                QuotaPolicy.set_role_limit(str(target.id), amount)
+                text = f"已設定 {name} 每日 AI 解讀 {amount} 次（{QUOTA_RESET_LABEL}重置）。"
+            elif action.value == "role_clear":
+                if not is_role:
+                    raise ValueError("請選身分組")
+                QuotaPolicy.set_role_limit(str(target.id), None)
+                text = f"已清除 {name} 的每日次數設定，回到預設 {USER_AI_DAILY_LIMIT} 次。"
+            else:
+                if is_role:
+                    limits = local_market_cache.get_state(QUOTA_ROLE_LIMIT_KEY, {}) or {}
+                    text = f"{name}：每日 AI 解讀 {limits.get(str(target.id), USER_AI_DAILY_LIMIT)} 次"
+                else:
+                    roles = tuple(str(r.id) for r in getattr(target, "roles", ()))
+                    text = my_quota_text(engine._quota_policy, str(target.id), roles, unlimited=str(target.id) in quota_exempt_ids())
+                    text = text.replace("**我的額度**", f"**{name} 的額度**")
+                text += f"{chr(10)}目前模式：{QUOTA_MODE_LABELS.get(engine._quota_policy.mode, engine._quota_policy.mode)}" \
+                        f"（主模型剩 {engine._gemini_remaining_ratio():.0%}）"
+        except ValueError as exc:
+            text = str(exc)
+        print(f"🎟️ 額度指令｜{interaction.user.id}｜{action.value}｜{name}｜{amount}｜{text[:80]}", flush=True)
+        panels = None
+        if action.value == "query" and not is_role:
+            roles = tuple(str(r.id) for r in getattr(target, "roles", ()))
+            card = my_quota_card(engine._quota_policy, str(target.id), roles, unlimited=str(target.id) in quota_exempt_ids(),
+                                 title=f"{name} 的額度")
+            mode = QUOTA_MODE_LABELS.get(engine._quota_policy.mode, engine._quota_policy.mode)
+            card["sections"].append({"type": "note", "text": f"※ 目前模式：{mode}（Gemini 主模型剩 {engine._gemini_remaining_ratio():.0%}）"})
+            panels = [{"branch_card": card, "hide_text": True}]
+        await interaction_image(interaction, "額度管理", text, panels, ephemeral=True)
 
     @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
     @app_commands.describe(question="例如：2330現在型態好嗎／記憶體族群誰型態最好／2330最近有什麼新聞")
