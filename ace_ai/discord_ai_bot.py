@@ -203,7 +203,8 @@ class DebugLog:
 # ============================================================
 
 INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
-    "price": ("股價", "價格", "收盤", "多少錢", "漲跌", "漲幅", "跌幅", "成交量", "量比", "報價"),
+    "price": ("股價", "價格", "收盤", "多少錢", "漲跌", "漲幅", "跌幅", "成交量", "量比", "報價",
+              "漲多少", "跌多少", "收多少", "漲幾", "跌幾", "多少點"),
     "technical": ("技術面", "技術", "均線", "MA5", "MA10", "MA20", "MA60", "月線", "季線", "週線",
                   "KD", "MACD", "OSC", "布林", "指標", "黃金交叉", "死亡交叉", "乖離",
                   "BOLL", "壓縮", "收窄", "擴張", "橫盤", "上軌", "下軌", "中軌", "沿軌"),
@@ -284,8 +285,9 @@ BROKER_PREFIXES = (
     "安泰", "大展", "口袋", "高橋", "北城", "元富",
 )
 
-STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年月日])")
-COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價)\s*(?:在|是|為|約|大約)?\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
+STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年])(?![月日](?![K線營均]))")
+COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價|套在|接在)\s*(?:在|是|為|約|大約|大概|大概是|差不多|約莫)?"
+                     r"\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
 # 前面不可是數字（「3006日K」不是 6 日）；最多 3 位數（「近120天」）
 DAYS_RE = re.compile(r"(?<!\d)(?:近|最近)?\s*(\d{1,3})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
 # 字母前面不可是英數字（00981A 的 A 是代號）、「型」後面不可接「態」（「型態」不是 A 型事件）
@@ -315,6 +317,7 @@ class ParsedQuestion:
     chip: str = ""        # 籌碼類型：spot（現股分點）／warrant（權證分點）／combined／""（非籌碼題）
     spot_branch: str = "" # 用現股資料庫分點名單辨識出的分點（和權證分點名單分開）
     spot_combo: bool = False  # 同時問型態＋現股籌碼：型態分析頁加一段精簡「籌碼重點」
+    unknown_terms: List[str] = field(default_factory=list)   # 沒有對到股票／分點的剩餘字（反問「找不到 X」用）
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -328,6 +331,27 @@ class ParsedQuestion:
             "notes": self.notes,
             "sector": self.sector,
         }
+
+
+# 族群名稱裡有公司名（「鴻海MIH電動車平台」）：問句點名的是個股、又沒有族群字眼時，當個股問題（「鴻海型態」不是族群）
+_SECTOR_WORD_RE = re.compile(r"族群|類股|概念|產業|集團|供應鏈|有哪些|有誰|哪幾檔|哪些股|成分股|排行|排名|前[三五十幾]名|最強|最弱|誰.{0,4}(?:型態|漲|強)")
+# 沒有指定股票時代表「問大盤」的口語
+_MARKET_WORD_RE = re.compile(r"台股|盤勢|大環境|整體市場|股市|市場氣氛")
+_NOT_A_NAME = {"大盤", "櫃買", "指數", "股票", "個股", "推薦", "明天", "今天", "現在", "最近", "這樣", "那樣", "應該", "可能"}
+
+
+def _stock_named_instead(question: str) -> bool:
+    """問句有股票代號或完整股名、且沒有族群字眼 → 以個股為準（族群比對到的只是名稱的一部分）。"""
+    if _SECTOR_WORD_RE.search(question or ""):
+        return False
+    try:
+        name_map = tools.get_stock_name_map()
+    except Exception:
+        return False
+    if any(tools.core()._normalize_stock_name_code_key(code) in name_map for code in STOCK_CODE_RE.findall(str(question).upper())):
+        return True
+    text = str(question or "").upper()
+    return any(len(name) >= 2 and name.upper() in text for name in name_map.values())
 
 
 def _blank_out(text: str, token: str) -> str:
@@ -345,7 +369,7 @@ class QuestionParser:
 
     def parse(self, question: str, access=None) -> ParsedQuestion:
         sector = sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
-        if sector is not None:
+        if sector is not None and not _stock_named_instead(question):
             return ParsedQuestion(original=question, intents={"sector"}, sector=sector, access=access)
         kf = tools.core()
         text_upper = question.upper()
@@ -391,6 +415,17 @@ class QuestionParser:
         self._fuzzy_branch(work, parsed)
         if not parsed.stocks and not parsed.stock_candidates and not parsed.branches:
             self._fuzzy_stock(work, parsed)
+        if len(parsed.stocks) > 1:
+            upper = question.upper()
+            parsed.stocks.sort(key=lambda s: min([i for i in (upper.find(s[0]), upper.find(str(s[1]).upper())) if i >= 0] or [len(upper)]))
+        if not parsed.stocks and not parsed.stock_candidates and not parsed.branches:
+            if _MARKET_WORD_RE.search(question):
+                # 「台股今天怎麼樣」「今天盤勢如何」：沒有指定股票時就是問大盤
+                parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
+                parsed.intents.add("index")
+            else:
+                parsed.unknown_terms = [c for c in self._leftover_chunks(work)
+                                        if not _INSTITUTIONAL_RE.search(c) and c not in _NOT_A_NAME]
         return parsed
 
     def _extract_branches(self, work: str, parsed: ParsedQuestion) -> str:
@@ -519,6 +554,7 @@ class QueryPlan:
     need_final_llm: bool = False
     clarification: str = ""
     planner_used: bool = False
+    pattern: bool = False       # 複合問題（例：分點部位＋型態）也要畫型態評分卡
     beta_fallback: Optional["QueryPlan"] = None  # beta_only route 的正式舊 route；非 tester 靜默改走這個
 
     def add(self, name: str, **kwargs: Any) -> None:
@@ -822,6 +858,51 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
     sections.append({"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
     return {"branch": name, "tags": [focus or "三大法人"], "label": "法人籌碼", "sections": sections}
+
+
+def _signed_yi(value: Any) -> str:
+    value = round(float(value or 0), 2)
+    return f"{value:+,.2f}" if value else "0"
+
+
+def market_institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+    """全市場（上市）三大法人：今日四格、近 5／20 日與連續、近 20 日柱狀；只問單一法人時以該法人為主。單位億元。"""
+    investors = {x["investor"]: x for x in data.get("investors") or []}
+    asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
+    focus = asked[0] if len(asked) == 1 and "三大法人" not in str(question) and asked[0] in investors else ""
+    rows = list(data.get("rows") or [])[-20:]
+    if focus:
+        info, key = investors[focus], _INVESTOR_KEYS[focus]
+        who, series = focus, [float(r.get(key) or 0) for r in rows]
+        latest, sum5, sum20, streak = info["latest_yi"], info["sum_5d_yi"], info["sum_20d_yi"], info["streak_days"]
+    else:
+        who = "三大法人合計"
+        series = [float(r.get("foreign") or 0) + float(r.get("invest") or 0) + float(r.get("dealer") or 0) for r in rows]
+        latest, sum5, sum20 = data.get("total_latest_yi"), data.get("total_5d_yi"), data.get("total_20d_yi")
+        streak = data.get("total_streak_days")
+    latest, sum5, sum20 = float(latest or 0), float(sum5 or 0), float(sum20 or 0)
+    sections: List[Dict[str, Any]] = [
+        {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：億元（正＝買超、負＝賣超）"},
+        {"type": "tiles", "items": [{"label": f"{n}今日", "value": _signed_yi(x.get("latest_yi")), "tone": "signed"}
+                                    for n, x in investors.items()]
+                                   + [{"label": "三大法人合計", "value": _signed_yi(data.get("total_latest_yi")), "tone": "signed"}]},
+        {"type": "tiles", "items": [
+            {"label": f"{who}近 5 日", "value": _signed_yi(sum5), "tone": "signed"},
+            {"label": f"{who}近 20 日", "value": _signed_yi(sum20), "tone": "signed"},
+            {"label": "連續", "value": _streak_text(streak), "tone": "ink"},
+            {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]},
+        {"type": "vbars", "title": f"{who}近 20 日買賣超（億元）",
+         "items": [{"label": str(r.get("date", ""))[5:], "value": v, "text": f"{v:+,.2f} 億"} for r, v in zip(rows, series)]}]
+    word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
+    sections.append({"type": "points", "items": [
+        f"{who}今日{word(latest)} {abs(latest):,.2f} 億元" + (f"，{_streak_text(streak)}。" if streak else "。"),
+        f"近 5 日累積{word(sum5)} {abs(sum5):,.2f} 億元，近 20 日累積{word(sum20)} {abs(sum20):,.2f} 億元"
+        + ("，短中期方向一致。" if sum5 and sum20 and (sum5 > 0) == (sum20 > 0) else "，短中期方向不同，仍待確認。")]})
+    note = "※ 交易所公布的上市（集中市場）三大法人買賣超金額，收盤後才更新；外資含外資自營商、自營商含避險。"
+    if re.search(r"櫃買|上櫃|OTC", str(question), re.I):
+        note += "上櫃三大法人目前沒有資料，這裡只有上市。"
+    sections.append({"type": "note", "text": note})
+    return {"branch": "全市場三大法人（上市）", "tags": [focus or "三大法人"], "label": "法人籌碼", "sections": sections}
 
 
 def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
@@ -1212,10 +1293,30 @@ class QueryRouter:
         # 有股票的問題一律交給 AI 客觀回答：型態／成本／K 棒／漲跌看法／技術面／沒有特定類別的問題走型態路由
         # （K 線＋型態評分卡＋AI 回答）；新聞、權證、勝率等指定類別才走各自的資料組合，只問股價才直接排版。
         other_categories = categories - {"price", "technical", "volume_profile"}
+        if (parsed.stocks and other_categories and not (other_categories - {"warrant", "recent_trades", "news"})
+                and ("cost" in intents or pattern_asked(parsed))):
+            # 一句問兩件事：「想問8103權證籌碼和型態」「我3006成本80，權證分點有在買嗎」「2330型態如何？最近有什麼新聞？」
+            # → 型態評分（有權證時精簡版）＋那一類資料一起給，AI 一次回答兩件事
+            plan = self._pattern_plan(parsed)
+            for code, _ in parsed.stocks:
+                if code in tools.INDEX_CODES:
+                    continue
+                if other_categories & {"warrant", "recent_trades"}:
+                    plan.add("get_sheet_stock_chips", stock_code=code,
+                             days=parsed.days if parsed.days_specified else tools.CHIPS_DAYS)
+                if "news" in other_categories:
+                    plan.add("get_recent_news", stock_code=code)
+            return plan
         if parsed.stocks and ("cost" in intents or not other_categories):
-            if categories == {"price"} and not analysis and "cost" not in intents:
+            if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
                 return self._stock_plan(parsed, categories, analysis)
-            return self._pattern_plan(parsed)
+            plan = self._pattern_plan(parsed)
+            if _WHY_MOVE_RE.search(parsed.original or ""):
+                # 「今天為什麼大跌」：型態＋近期新聞一起給 AI（仍只呼叫 1 次）
+                for code, _ in parsed.stocks:
+                    if code not in tools.INDEX_CODES:
+                        plan.add("get_recent_news", stock_code=code)
+            return plan
         if parsed.stocks:
             return self._stock_plan(parsed, categories, analysis)
         if "futures" in intents and not parsed.branches:
@@ -1260,6 +1361,8 @@ class QueryRouter:
                 # 「部位還在嗎」：直接讀回測 FIFO 狀態，0 次 Gemini，不抓 MoneyDJ。
                 plan = QueryPlan(route="rule_branch_position", need_final_llm=analysis)
                 plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
+                if pattern_asked(parsed):
+                    self._add_pattern(plan, parsed)   # 一句問兩件事：部位＋型態，兩個都答
                 return plan
             plan = QueryPlan(route="rule_branch_stock", need_final_llm=True)
             plan.add("detect_current_branch_events", stock_code=code, branch_name=branch)
@@ -1267,6 +1370,8 @@ class QueryRouter:
             plan.add("get_branch_event_performance", branch_name=branch)
             plan.add("get_branch_recent_behavior", branch_name=branch, stock_code=code)
             plan.add("get_branch_stock_history", branch_name=branch, stock_code=code)
+            if pattern_asked(parsed):
+                self._add_pattern(plan, parsed)
             return plan
         wants_behavior = "behavior" in parsed.intents
         wants_perf = "win_rate" in categories or "history" in parsed.intents or bool(parsed.event_type)
@@ -1285,6 +1390,13 @@ class QueryRouter:
             plan.add("get_branch_recent_trades", branch_name=branch)
         plan.need_final_llm = analysis or not (wants_perf or wants_trades or wants_behavior)
         return plan
+
+    def _add_pattern(self, plan: QueryPlan, parsed: ParsedQuestion) -> None:
+        """複合問題：在原本的計畫上加型態資料（K 線評分卡＋AI 一起解讀），仍只呼叫 1 次 Gemini。"""
+        for call in self._pattern_plan(parsed).tool_calls:
+            plan.add(call.name, **call.kwargs)
+        plan.pattern = True
+        plan.need_final_llm = True
 
     def _stock_plan(self, parsed: ParsedQuestion, categories: Set[str], analysis: bool) -> QueryPlan:
         plan = QueryPlan(route="rule_stock")
@@ -2058,8 +2170,9 @@ def _candle_shape(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> Optional[Dict[str, Any]]:
     """依問題類型精簡 Tool 資料；回傳 None 表示這份資料已被型態評分卡涵蓋，不必再送。"""
-    if has_scorecard and name in ("get_cost_position_context", "get_sheet_stock_chips", "get_volume_profile"):
-        return None  # 成本位置、支撐壓力、追蹤分點、量區型態都已整理在評分卡
+    if has_scorecard and name in ("get_cost_position_context", "get_volume_profile"):
+        return None  # 成本位置、支撐壓力、量區型態都已整理在評分卡
+    # 權證分點只在會員明確問權證時才和評分卡一起出現（「權證籌碼和型態」），要送給 AI，否則 AI 無法回答權證那一半
     data = dict(data)
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
@@ -2139,7 +2252,8 @@ def question_focus(question: str) -> List[str]:
 FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
                      "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
                      "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
-                     "明講偏買或偏賣，並註明是收盤後資料；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
+                     "明講偏買或偏賣，並註明是收盤後資料；全市場三大法人＝用 get_market_institutional（上市、單位億元，不含上櫃）"
+                     "說外資／投信／自營商最新一日、近5日、近20日買賣超金額與連買／連賣天數，不可換算成張數；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
                      "權證分點＝整張解讀都以權證分點為主：answer 直接說目前分點籌碼偏買、偏賣或已大多出清；why 說明哪些分點、觸發哪個 A～E 事件、"
                      "買進金額、後續是出清還是仍持有、分點的歷史事件勝率，以及分點買在什麼價位或量區附近；技術面最多一句當背景，不可整段改寫成技術面分析。"
                      "scenarios 用分點條件，例如「若仍持有的分點繼續加碼／開始出清」「股價守住或跌破分點進場的量區」。"
@@ -2936,6 +3050,18 @@ def format_news(d: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_news_titles(d: Dict[str, Any]) -> str:
+    """AI 不在時的新聞：只列日期＋標題（最多 5 則），不貼內文段落。"""
+    if not d.get("available"):
+        return "【新聞】" + chr(10) + "近期沒有取得與公司直接相關的新聞。"
+    lines = ["【新聞】"]
+    for item in (d.get("articles") or [])[:5]:
+        date = str(item.get("date") or "")[5:].replace("-", "/")
+        title = re.sub(r"[\x00-\x1f\ufffd\u25af]", "", str(item.get("title") or "")).strip()   # 控制字元與缺字方框
+        lines.append(f"• {date + '｜' if date else ''}{title}")
+    return chr(10).join(lines)
+
+
 def format_sheet_query(d: Dict[str, Any]) -> str:
     label = tools.SHEET_REGISTRY.get(d.get("worksheet"), "查詢結果")
     lines = [f"📌 {label}：符合 {d.get('matched_rows')} 筆，顯示 {d.get('returned_rows')} 筆"]
@@ -3167,7 +3293,23 @@ def format_institutional(data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_market_institutional(data: Dict[str, Any]) -> str:
+    """全市場（上市）三大法人買賣超（億元）。"""
+    def yi(value: Any) -> str:
+        value = float(value or 0)
+        return f"{'買超' if value > 0 else '賣超' if value < 0 else '持平'} {abs(value):,.2f} 億元"
+    lines = [f"【全市場三大法人（上市）】資料日期 {data.get('data_date', '-')}"]
+    for x in data.get("investors") or []:
+        streak = int(x.get("streak_days") or 0)
+        tail = f"｜連買 {streak} 天" if streak > 0 else f"｜連賣 {-streak} 天" if streak < 0 else ""
+        lines.append(f"・{x['investor']}：今日 {yi(x.get('latest_yi'))}｜近 5 日 {yi(x.get('sum_5d_yi'))}"
+                     f"｜近 20 日 {yi(x.get('sum_20d_yi'))}{tail}")
+    lines.append(f"・三大法人合計：今日 {yi(data.get('total_latest_yi'))}｜近 5 日 {yi(data.get('total_5d_yi'))}")
+    return "\n".join(lines)
+
+
 FORMATTERS.update({
+    "get_market_institutional": format_market_institutional,
     "get_institutional_flow": format_institutional,
     "get_branch_event_window": format_branch_event_window,
     "get_branch_warrant_detail": format_branch_warrant_detail,
@@ -3216,11 +3358,33 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
         elif r.name in ("get_branch_event_window", "get_branch_warrant_detail") and d.get("period_start"):
             add(f"權證 A～E 事件 {d['period_start']}～{d['period_end']}")
+        elif r.name == "get_market_institutional" and d.get("data_date"):
+            add(f"三大法人（上市）截至 {d['data_date']}（收盤後更新）")
         elif r.name == "get_spot_branch_flow" and d.get("data_date"):
             add(f"現股分點截至 {d['data_date']}（每日前段分點近似）")
             if d.get("price_date"):
                 add(f"股價截至 {d['price_date']}（日K收盤）")
     return "資料時間：" + "｜".join(parts) if parts else ""
+
+
+# 這些回答都有圖卡：K 線（股價、均線、布林、量）、型態評分卡、分點標註表、法人卡、權證摘要卡
+CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional",
+                         "rule_market_institutional", "rule_branch_position", "rule_branch_stock"))
+# 圖上已經畫出來的資料：AI 不在時不必再用文字重打一次
+DRAWN_TOOLS = frozenset(("get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_pattern_scorecard",
+                         "get_cost_position_context", "get_institutional_flow", "get_market_institutional",
+                         "get_sheet_stock_chips", "get_branch_stock_position", "get_branch_stock_history",
+                         "detect_current_branch_events", "get_spot_chip_summary", "get_index_contribution",
+                         "get_market_breadth", "get_index_comparison"))
+
+
+def brief_rule_answer(results: Sequence[tools.ToolResult]) -> str:
+    """有圖卡時的精簡文字：只列圖上沒有的資料（新聞、台指期…）與取不到的資料，最後附資料時間。"""
+    rest = [r for r in results if not (r.ok and r.name in DRAWN_TOOLS)]
+    sections = [(format_news_titles(r.data) if r.name == "get_recent_news" else FORMATTERS.get(r.name, format_sheet_query)(r.data))
+                if r.ok else f"⚠️ {r.user_message or '資料取得失敗'}" for r in rest]
+    time_line = build_data_time_line(results)
+    return "\n\n".join(x for x in sections + [time_line, DISCLAIMER] if x)
 
 
 def build_rule_based_answer(results: Sequence[tools.ToolResult]) -> str:
@@ -3375,6 +3539,134 @@ def branch_event_lookback(branch_name: str, stock_code: str, today: Optional[dat
 _INSTITUTIONAL_ANALYSIS_RE = re.compile(r"怎麼看|怎麼樣|分析|技術|型態|搭配|一起|走勢|支撐|壓力|操作|看法|解讀|為什麼|原因|影響|建議")
 # 只問最新一天的現股分點（不 backfill 70 日）
 _SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
+# 必要資料：這題的核心資料缺了就不交給 AI（避免 AI 用推測補上），直接說資料不足、只列已取得的部分
+_DATA_LABELS = {"get_stock_overview": "股價", "get_technical_analysis": "日K與技術指標", "get_volume_profile": "大量區",
+                "get_sheet_stock_chips": "權證分點資料", "get_recent_news": "近期新聞", "get_institutional_flow": "三大法人資料",
+                "get_futures_positions": "台指期未平倉", "get_cost_position_context": "成本位置",
+                "get_market_institutional": "全市場三大法人資料"}
+_CATEGORY_TOOLS = {"price": "get_stock_overview", "technical": "get_technical_analysis", "volume_profile": "get_volume_profile",
+                   "news": "get_recent_news", "warrant": "get_sheet_stock_chips", "recent_trades": "get_sheet_stock_chips",
+                   "win_rate": "get_sheet_stock_chips"}
+
+
+def required_tools(route: str, intents: Set[str], planned: Set[str]) -> Set[str]:
+    """每種回答的必要資料（只算這題有排到的工具）。"""
+    if route in ("rule_pattern", "rule_top_warrant"):
+        need = {"get_stock_overview", "get_technical_analysis", "get_sheet_stock_chips"}
+        need |= {_CATEGORY_TOOLS[c] for c in intents if c in ("news", "warrant", "recent_trades", "win_rate")}
+    elif route == "rule_stock":
+        need = {_CATEGORY_TOOLS[c] for c in intents if c in _CATEGORY_TOOLS} or {"get_stock_overview"}
+    elif route == "rule_institutional":
+        need = {"get_institutional_flow"}
+    elif route == "rule_market_institutional":
+        need = {"get_market_institutional"}
+    elif route == "rule_futures":
+        need = {"get_futures_positions"}
+    elif route.startswith("rule_branch") or route == "rule_winrate_rank":
+        need = set(planned)
+    else:
+        need = set()
+    return need & planned
+
+
+def missing_required(route: str, intents: Set[str], calls: Sequence["ToolCall"], results: Sequence[tools.ToolResult],
+                     names: Dict[str, str]) -> List[str]:
+    """回傳缺了哪些必要資料（例：「華邦電 日K與技術指標」）；calls 與 results 一一對應。"""
+    need = required_tools(route, intents, {c.name for c in calls})
+    missing = []
+    for call, result in zip(calls, results):
+        if call.name in need and not result.ok:
+            code = str(call.kwargs.get("stock_code") or "")
+            who = names.get(code) or code or str(call.kwargs.get("branch_name") or "")
+            missing.append(f"{who} {_DATA_LABELS.get(call.name, '資料')}".strip())
+    return list(dict.fromkeys(missing))
+
+
+def compare_date_notice(results: Sequence[tools.ToolResult], names: Dict[str, str]) -> str:
+    """兩檔比較：兩邊資料日期不同就不比強弱（和大盤 vs 櫃買同一個原則）。"""
+    dates = {}
+    for r in results:
+        if r.ok and r.name == "get_stock_overview" and r.data.get("stock_code"):
+            dates[str(r.data["stock_code"])] = str(r.data.get("data_date") or "")
+    if len(dates) != 2 or len(set(dates.values())) == 1:
+        return ""
+    detail = "；".join(f"{names.get(code) or code} 截至 {day or '無'}" for code, day in dates.items())
+    return f"【無法直接比較】{chr(10)}兩檔資料日期不同（{detail}），不直接比較強弱；以下分別列出兩檔的資料。"
+
+
+# 有沒有問型態／技術面（複合問題判斷用）
+_PATTERN_ASK_RE = re.compile(r"型態|形態|技術|走勢|K線|均線|支撐|壓力|線型|趨勢|月線|季線|操作|策略")
+
+
+def pattern_asked(parsed: "ParsedQuestion") -> bool:
+    return bool(_PATTERN_ASK_RE.search(parsed.original or ""))
+
+
+# 全市場三大法人：沒有指定個股（或只講大盤／台股）又問外資、投信、自營商
+_MARKET_INST_RE = re.compile(r"外資|投信|自營商|三大法人|法人")
+
+
+def market_institutional_wanted(parsed: "ParsedQuestion") -> bool:
+    if parsed.branches or parsed.sector or "futures" in parsed.intents or not _MARKET_INST_RE.search(parsed.original or ""):
+        return False
+    return not [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
+
+
+# 問原因：不能只回報價；問漲跌原因要附新聞
+_WHY_RE = re.compile(r"為什麼|為何|怎麼回事|原因|怎麼了|是不是|會不會")
+_WHY_MOVE_RE = re.compile(r"(?:為什麼|為何|怎麼會|什麼原因|原因).{0,6}(?:漲|跌|噴|殺|崩|拉|停)|(?:漲|跌|噴|殺|崩)(?:的)?原因")
+# 沒有的資料（基本面）：不能拿型態頁充數
+_FUNDAMENTAL_RE = re.compile(r"殖利率|股利|股息|配息|配股|除息|除權|填息|本益比|本淨比|EPS|每股盈餘|財報|毛利率|營益率|淨利率|ROE|股東會")
+# 報明牌：不提供
+_RECOMMEND_RE = re.compile(r"推薦|明牌|報牌|買(?:什麼|哪[一支檔些]).{0,3}(?:股票|好)|哪[一支檔些](?:股票)?.{0,4}會(?:漲|噴|飆)")
+_SUPPORTED_INTENTS = frozenset(("technical", "volume_profile", "warrant", "win_rate", "news", "recent_trades", "institutional",
+                                "cost", "volume", "futures", "position", "behavior"))
+
+
+def _examples_for(parsed: "ParsedQuestion") -> List[str]:
+    """反問時給的範例：依問句的意圖，股票用問句裡的（沒有就用 2330）。"""
+    code = next((c for c, _ in parsed.stocks if c not in tools.INDEX_CODES), "2330")
+    intents = set(parsed.intents)
+    pairs = [("institutional", f"{code} 三大法人買賣超"), ("news", f"{code} 最近有什麼新聞"),
+             ("warrant", f"{code} 權證分點"), ("recent_trades", f"{code} 權證分點"),
+             ("win_rate", "永豐金內湖勝率"), ("cost", f"我{code}成本600怎麼看"),
+             ("price", f"{code} 股價"), ("volume", f"{code} 量有出來嗎"),
+             ("technical", f"{code} 技術面怎麼樣"), ("volume_profile", f"{code} 型態好嗎")]
+    picked = [text for intent, text in pairs if intent in intents]
+    base = [f"{code} 型態好嗎", f"{code} 三大法人買賣超", f"{code} 最近有什麼新聞", "大盤現在怎麼看"]
+    return list(dict.fromkeys(picked + base))[:3]
+
+
+def clarify_message(parsed: "ParsedQuestion") -> str:
+    """看不懂題意時反問（不丟整張指令表）：缺股票就問哪一檔，名稱對不到就說找不到，並附 2～3 個可以直接照打的問法。"""
+    examples = "\n".join(f"• {x}" for x in _examples_for(parsed))
+    unknown = next((t for t in parsed.unknown_terms if 2 <= len(t) <= 8), "")
+    if unknown and not (parsed.intents & _SUPPORTED_INTENTS - {"technical", "volume_profile"}):
+        head = f"找不到「{unknown}」這檔股票或分點，可以確認名稱，或改用股票代號問我。"
+    elif parsed.intents - {"analysis"}:
+        head = "想問哪一檔股票呢？請加上股票名稱或代號。"
+    else:
+        head = "不太確定你想問什麼，可以用股票名稱或代號這樣問："
+    return f"**再確認一下**\n{head}\n{examples}\n※ 輸入「說明」可以看全部功能"
+
+
+def unsupported_message(parsed: "ParsedQuestion", question: str) -> str:
+    """沒有這類資料就直說，不拿別的內容充數。"""
+    examples = "\n".join(f"• {x}" for x in _examples_for(parsed))
+    if _RECOMMEND_RE.search(question) and not parsed.stocks:
+        return ("**不提供個股推薦**\n艾斯 AI 不報明牌；你可以問關心的股票，我整理型態、籌碼與新聞給你參考：\n"
+                f"{examples}")
+    word = _FUNDAMENTAL_RE.search(question).group(0) if _FUNDAMENTAL_RE.search(question) else "這類"
+    return (f"**目前沒有「{word}」資料**\n艾斯 AI 目前沒有殖利率、股利、EPS、財報這類基本面資料，這題沒辦法回答。可以改問：\n"
+            f"{examples}")
+
+
+def is_unsupported_question(parsed: "ParsedQuestion", question: str) -> bool:
+    if _RECOMMEND_RE.search(question) and not parsed.stocks and not parsed.branches:
+        return True
+    return bool(_FUNDAMENTAL_RE.search(question)) and not (parsed.intents & _SUPPORTED_INTENTS)
+
+
 _PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
 NO_CONTEXT_MESSAGE = "請告訴我股票名稱或代號，例如：2344 現在技術面怎麼樣。"
 _COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
@@ -3887,24 +4179,6 @@ def _gemini_quota_lines(engine: Any) -> List[str]:
         return []
 
 
-def _counts_toward_quota(result: "AnswerResult") -> bool:
-    """只有真的算出來的成功分析扣次數；回答快取命中、說明、澄清、錯誤、排隊已滿、權限拒絕都不扣。"""
-    if result.denied_feature or result.cache_hit or result.route == "answer_cache":
-        return False
-    return result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES
-
-
-QUOTA_EXEMPT_KEY = "quota_exempt_users"
-
-
-def quota_exempt_ids() -> Set[str]:
-    """不限題數的測試員：Railway 變數 DISCORD_AI_UNLIMITED_USER_IDS ＋ 管理員用「新增測試員」加的名單。"""
-    ids = {x.strip() for x in os.getenv("DISCORD_AI_UNLIMITED_USER_IDS", "").split(",") if x.strip()}
-    try:
-        ids |= {str(x) for x in (local_market_cache.get_state(QUOTA_EXEMPT_KEY, []) or [])}
-    except Exception:
-        pass
-    return ids
 QUEUE_FULL_MESSAGE = "目前使用人數較多，排隊已滿，請過一兩分鐘再問一次。"
 
 
@@ -4061,8 +4335,20 @@ class AceQueryEngine:
             # 「這檔強嗎」但沒有上一題可接：不猜，也不花 Tool／Gemini（clarify 走 ephemeral）。
             return AnswerResult(text=NO_CONTEXT_MESSAGE, route="clarify", gemini_calls=0,
                                 elapsed=time.perf_counter() - started, as_text=True)
+        if is_unsupported_question(parsed, question):
+            return AnswerResult(text=unsupported_message(parsed, question), route="unsupported", gemini_calls=0,
+                                elapsed=time.perf_counter() - started)
         if note:
             self.log(f"追問記憶：{note}")
+        if parsed.chip == "spot" and access_policy.chip_needs_choice(
+                question, access.entitlement if access else None, warrant_branch=bool(parsed.branches),
+                remembered=getattr(remembered, "chip_context", "") if remembered and note else ""):
+            # 權證追蹤分點＋模糊的「最近買什麼」，會員兩種都有：兩種資料完全不同，先問清楚，不猜
+            name = parsed.branches[0]
+            return AnswerResult(text=(f"**要看哪一種？**\n「{name}」有兩種資料，請選一種再問一次：\n"
+                                      f"• {name} 權證 最近買什麼（A～E 權證事件、部位）\n"
+                                      f"• {name} 現股 最近買什麼（券商分點現股買賣超）"),
+                                route="clarify", gemini_calls=0, elapsed=time.perf_counter() - started)
         if (parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋評分卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
@@ -5037,6 +5323,10 @@ class AceQueryEngine:
         action = str(payload.get("action") or "").strip()
         target = str(payload.get("target") or "").strip()
         self.log(f"🧭 AI 分類：subject={subject}｜action={action}｜target={target}")
+        if subject == "market":
+            parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
+            parsed.intents = set(parsed.intents) | {"index"}
+            return self.router.plan(parsed, stats)
         if subject == "sector" and target:
             hit = sector_match.match(target)
             if hit:
@@ -5073,7 +5363,13 @@ class AceQueryEngine:
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
-        if ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
+        market_inst = market_institutional_wanted(parsed)
+        if market_inst and not (parsed.stocks and pattern_asked(parsed)):
+            # 「外資今天買超多少」「今天三大法人買賣超」：全市場（上市）三大法人；只問數字不呼叫 AI
+            plan = QueryPlan(route="rule_market_institutional",
+                             need_final_llm=bool(_INSTITUTIONAL_ANALYSIS_RE.search(question) or "analysis" in parsed.intents))
+            plan.add("get_market_institutional")
+        elif ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
                 and stocks_only and len(stocks_only) == len(parsed.stocks) and not parsed.sector
                 and not _INSTITUTIONAL_ANALYSIS_RE.search(question)):
             plan = QueryPlan(route="rule_institutional", need_final_llm=True)
@@ -5081,6 +5377,8 @@ class AceQueryEngine:
                 plan.add("get_institutional_flow", stock_code=code)
         else:
             plan = self.router.plan(parsed, stats)
+            if market_inst and plan.route == "rule_pattern":
+                plan.add("get_market_institutional")   # 「大盤型態跟外資動向」：大盤型態頁＋全市場三大法人
         if plan.route == "help":
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
@@ -5100,8 +5398,10 @@ class AceQueryEngine:
             f"tools={[c.name + json.dumps(c.kwargs, ensure_ascii=False) for c in plan.tool_calls]}"
         )
         if plan.clarification:
-            if plan.route == "help":   # 看不懂的問題：回同一張指令表
-                return replace(help_result(started), gemini_calls=stats.gemini_calls)
+            if plan.route == "help":   # 看不懂的問題：反問缺什麼、附可以照打的問法（不丟整張指令表）
+                self.log(f"看不懂題意，反問｜意圖={sorted(parsed.intents)}｜未辨識={parsed.unknown_terms}")
+                return AnswerResult(text=clarify_message(parsed), route="clarify", gemini_calls=stats.gemini_calls,
+                                    elapsed=time.perf_counter() - started)
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
         if "institutional" in parsed.intents and plan.route not in ("rule_sector", "rule_institutional"):
             planned = {(c.name, c.kwargs.get("stock_code")) for c in plan.tool_calls}
@@ -5155,10 +5455,13 @@ class AceQueryEngine:
                 kwargs["lookback"] = lookback
             if chart_branch:
                 kwargs["branch_name"] = chart_branch
-            if light or plan.route == "rule_pattern" or not warrant_visual_query:
+            pattern_only = plan.route == "rule_pattern" and not any(x.name == "get_sheet_stock_chips" for x in plan.tool_calls)
+            if light or pattern_only or not warrant_visual_query:
                 kwargs["with_marks"] = False
             chart_calls.append(ToolCall("get_chart_panel", kwargs))
-        combined = pre_results + self._run_tools(plan.tool_calls + chart_calls)
+        planned_calls = list(plan.tool_calls)
+        run_results = self._run_tools(planned_calls + chart_calls)
+        combined = pre_results + run_results
         if not warrant_ok:
             # 最後防線：權證 ToolResult 不進 payload／Gemini prompt／回答。
             combined = [r for r in combined if r.name not in WARRANT_TOOLS]
@@ -5176,6 +5479,10 @@ class AceQueryEngine:
                 results.append(tools.ToolResult("get_spot_chip_summary", True, spot_data))
             if spot_panel:
                 panels.append(spot_panel)
+        market_flow = next((r.data for r in results if r.ok and r.name == "get_market_institutional"), None)
+        if market_flow:
+            panels.append({"branch_card": market_institutional_card(market_flow, question),
+                           "hide_text": plan.route == "rule_market_institutional"})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
             if flow:
@@ -5191,7 +5498,7 @@ class AceQueryEngine:
             if card:
                 # K 線點位＋全部事件清單已經說清楚：不再呼叫 Gemini、也不排文字區塊（省 5～10 秒）
                 panels.append({"branch_card": card, "hide_text": True})
-                plan.need_final_llm = False
+                plan.need_final_llm = plan.pattern   # 一起問了型態才需要 AI
                 if chart_panel:
                     chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
         elif "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
@@ -5213,10 +5520,11 @@ class AceQueryEngine:
                 focus = institutional_focus(question, flow)
                 if focus:
                     panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
-        if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare"):
+        if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
-                if card and getattr(parsed, "spot_combo", False):
+                with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
+                if card and (getattr(parsed, "spot_combo", False) or with_chips):
                     card = dict(card, compact=True)   # 型態＋籌碼整合頁：評分卡精簡（無均線扣抵、價位只留最近 1＋1）
                 if card:
                     panel["scorecard"] = card
@@ -5243,7 +5551,20 @@ class AceQueryEngine:
             results.append(tools.ToolResult("get_index_comparison", True, comparison))
             # 兩邊時間點不同時不交給 AI，避免寫出「現在 A 比 B 強」。
             plan.need_final_llm = bool(comparison["same_time"])
+        names = {code: name for code, name in parsed.stocks}
+        data_notice = ""
+        missing = missing_required(plan.route, set(parsed.intents), planned_calls, run_results, names)
+        if missing:
+            data_notice = ("【資料不足】" + chr(10) + "這題無法完整判斷：" + "、".join(missing) +
+                           " 暫時取得不到，不會用推測補上。以下只列出已取得的資料，請稍後再問一次。")
+        elif plan.route == "rule_pattern":
+            data_notice = compare_date_notice(results, names)
+        if data_notice and plan.need_final_llm:
+            plan.need_final_llm = False
+            self.log(f"必要資料檢查：不交給 AI｜{data_notice}")
         text, llm_ok = self._compose(question, plan, results, stats)
+        if data_notice:
+            text = f"{data_notice}\n\n{text}"
         ai_card = self._take_ai_card()
         if comparison is not None:
             # 圖上已有兩邊的 K 線與型態比較表，文字只放結論：AI 結論，AI 失敗或時間點不同時放一句規則結論。
@@ -5438,11 +5759,10 @@ class AceQueryEngine:
     def _compose(self, question: str, plan: QueryPlan, results: List[tools.ToolResult], stats: AnswerStats) -> Tuple[str, bool]:
         """回傳 (回答文字, 是否可快取)；AI 解讀卡另存在 _request_local.ai_card，由 _answer_uncached 取走。"""
         self._set_ai_card(None)
-        rule_answer = build_rule_based_answer(results)
-        if plan.route in ("rule_pattern", "rule_index_compare"):
-            brief = [r for r in results if r.name in ("get_stock_overview", "get_futures_positions", "get_institutional_flow")]
-            if brief:
-                rule_answer = build_rule_based_answer(brief)
+        # 有圖卡的回答（K 線、評分卡、分點標註、法人卡…）：AI 不在時文字只留「圖上沒有的」（新聞、台指期、取不到的資料），
+        # 不再把圖上數字整段重打一次（圖片變很長、內容跟圖重複）
+        brief = plan.route in CARD_ROUTES or plan.pattern
+        rule_answer = brief_rule_answer(results) if brief else build_rule_based_answer(results)
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
@@ -5454,17 +5774,22 @@ class AceQueryEngine:
         stats.record_gemini(result)
         if not result.ok:
             self.log(f"最終回答 Gemini 失敗：{result.error}")
-            prefix = RATE_LIMIT_MESSAGE if result.rate_limited else "AI 分析暫時無法使用，以下先提供系統整理的資料。"
+            if getattr(_AI_GATE, "blocked", False):
+                prefix = "今天的 AI 解讀次數已用完；圖表與數據照常，AI 解讀下午 4 點恢復。"
+            elif result.rate_limited:
+                prefix = RATE_LIMIT_MESSAGE
+            else:
+                prefix = "AI 解讀暫時無法使用" + ("；上方圖表與評分卡的資料照常可參考。" if brief else "，以下先提供系統整理的資料。")
             return f"{prefix}\n\n{rule_answer}", False
         facts = FactSheet(question, results, payload)
         card = parse_ai_card(result.text)
         if card is None and str(result.text or "").lstrip().startswith("{"):
             self.log("AI 解讀卡 JSON 無法解析，改用規則式回答")
-            return f"（AI 回覆格式異常，改顯示系統整理的資料）\n\n{rule_answer}", False
+            return f"（AI 回覆格式異常，這次不附 AI 解讀）\n\n{rule_answer}", False
         if card is not None:
             card = self._check_ai_card(card, payload, facts)
             if card is None:
-                return f"（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+                return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
             time_line = build_data_time_line(results)
             card["footer"] = "｜".join(x for x in (time_line, "AI 解讀僅供參考，不構成投資建議。") if x)
             self._set_ai_card(card)
@@ -5480,7 +5805,7 @@ class AceQueryEngine:
             self.log(f"事實核對：刪除 {len(removed)} 句｜{detail}")
             if not pruned or len(pruned) < len(answer) * 0.6 or facts.check(pruned):
                 self.log("事實核對未通過，改用規則式回答")
-                return f"（AI 文字中有內容無法對應到原始資料，改顯示系統整理的資料）\n\n{rule_answer}", False
+                return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
             answer = pruned
         if "資料時間" not in answer:
             time_line = build_data_time_line(results)

@@ -524,8 +524,6 @@ def core():
         overridden = apply_bot_process_env()
         for key, previous in overridden.items():
             print(f"🔒 Discord AI 唯讀保護：{key} 原值 {previous!r} 已改為 {_READ_ONLY_FORCED_ENV[key]!r}")
-        # Bot 主模型預設 3.5 Flash Lite（主程式預設 3.1 給週報用）；Railway 設 GEMINI_MODEL 可覆蓋
-        os.environ.setdefault("GEMINI_MODEL", "gemini-3.5-flash-lite")
         started = time.perf_counter()
         spec = importlib.util.spec_from_file_location(CORE_MODULE_NAME, path)
         if spec is None or spec.loader is None:
@@ -575,6 +573,10 @@ class TTLCache:
             expires_at, value = item
             if expires_at < time.time():
                 self._data.pop(full_key, None)
+                # 過期的 key 若沒有執行緒正在計算，一併清掉它的 lock（長期大量不同查詢時不累積）
+                key_lock = self._key_locks.get(full_key)
+                if key_lock is not None and not key_lock.locked():
+                    del self._key_locks[full_key]
                 return False, None
             return True, value
 
@@ -752,6 +754,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_volume_profile": "目前大量區資料取得失敗",
     "get_futures_positions": "台指期未平倉資料取得失敗",
     "get_institutional_flow": "目前三大法人資料取得失敗",
+    "get_market_institutional": "目前全市場三大法人資料取得失敗",
     "get_index_contribution": "指數貢獻點數：加權與櫃買各自的拉升 TOP5 與拖累 TOP5（權重 × 漲跌，非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
     "get_index_contribution": "指數貢獻點數計算失敗",
@@ -1214,6 +1217,9 @@ def query_google_sheet(
         if col:
             mask &= df[col].astype(str).str.strip() == str(stock_name).strip()
             applied["stock_name"] = str(stock_name).strip()
+        elif "stock_code" not in applied:
+            # 只給名稱、表上卻沒有名稱欄：不能悄悄回傳沒篩選的整張表
+            raise ToolDataError(f"工作表「{worksheet}」沒有股票名稱欄位，無法依名稱篩選")
     if branch:
         cols = [c for c in _BRANCH_COLUMNS if c in df.columns]
         if not cols:
@@ -1227,16 +1233,23 @@ def query_google_sheet(
     if event_type:
         letter = _event_letter(event_type)
         col = _first_column(df, _EVENT_COLUMNS)
-        if letter and col:
-            mask &= df[col].map(_event_letter) == letter
-            applied["event_type"] = letter
+        if not letter:
+            raise ToolDataError(f"看不懂事件類型「{event_type}」（應為 A～E）")
+        if not col:
+            raise ToolDataError(f"工作表「{worksheet}」沒有事件欄位，無法依事件篩選")
+        mask &= df[col].map(_event_letter) == letter
+        applied["event_type"] = letter
 
     date_col = _first_column(df, _DATE_COLUMNS)
+    if (date_start or date_end) and not date_col:
+        raise ToolDataError(f"工作表「{worksheet}」找不到日期欄位，無法依日期篩選")
     work = df[mask].copy()
     if date_col and not work.empty:
         work["_date"] = work[date_col].map(_parse_sheet_date)
         start_ts = _parse_sheet_date(date_start) if date_start else None
         end_ts = _parse_sheet_date(date_end) if date_end else None
+        if (date_start and start_ts is None) or (date_end and end_ts is None):
+            raise ToolDataError(f"看不懂查詢日期：{date_start or ''}～{date_end or ''}")
         if start_ts is not None:
             work = work[work["_date"].notna() & (work["_date"] >= start_ts)]
             applied["date_start"] = _fmt_date(start_ts)
@@ -3151,6 +3164,11 @@ def _cnyes_rsc_article_html(page: str) -> str:
     return html.unescape(best)
 
 
+def _code_in_title(code: str, title: str) -> bool:
+    """代號要是獨立的數字：「2330萬元」「12330」「2330年」「2330點」不算提到 2330。"""
+    return bool(re.search(rf"(?<![\d.,]){re.escape(code)}(?![\d.,]|\s*(?:萬|億|元|年|張|點|%|％))", title))
+
+
 def fetch_cnyes_article_text(news_id: str) -> str:
     """鉅亨文章內文；找不到時退回頁面 meta description。"""
     kf = core()
@@ -3219,7 +3237,7 @@ def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
         item["title"] = title
         published = float(item.get("publishAt") or 0)
         tags = " ".join(str(t) for t in item.get("keywordForTag") or [])
-        related = name in title or code in title or name in tags or f"TWS:{code}:STOCK" in json.dumps(item, ensure_ascii=False)
+        related = name in title or _code_in_title(code, title) or name in tags or f"TWS:{code}:STOCK" in json.dumps(item, ensure_ascii=False)
         if not title or not item.get("newsId") or published < cutoff or not related:
             continue
         picked.append(item)
@@ -5779,6 +5797,63 @@ def get_institutional_flow(stock_code: str, days: int = 20) -> Dict[str, Any]:
     }
 
 
+_MARKET_INST_NAMES = {"Foreign_Investor": "foreign", "Foreign_Dealer_Self": "foreign", "Investment_Trust": "invest",
+                      "Dealer_self": "dealer", "Dealer_Hedging": "dealer"}
+
+
+def _streak(values: List[float]) -> int:
+    """正數＝連買天數、負數＝連賣天數（從最新一天往回數）。"""
+    count, sign = 0, 0
+    for value in reversed(values):
+        now = 1 if value > 0 else -1 if value < 0 else 0
+        if now == 0 or (sign and now != sign):
+            break
+        sign, count = now, count + 1
+    return count * sign
+
+
+def get_market_institutional(days: int = 20) -> Dict[str, Any]:
+    """全市場（上市、集中市場）三大法人買賣超金額（FinMind TaiwanStockTotalInstitutionalInvestors，單位：億元）。
+    外資＝外資及陸資＋外資自營商；自營商＝自行買賣＋避險。收盤後才更新；不含上櫃。"""
+    kf = core()
+    end = taipei_now()
+    start = end - timedelta(days=max(10, int(days or 20)) * 2 + 10)
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data("TaiwanStockTotalInstitutionalInvestors", start_date=start.strftime("%Y-%m-%d"),
+                                   end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError("全市場三大法人資料暫時無法取得") from exc
+    if raw is None or raw.empty:
+        raise ToolDataError("全市場三大法人沒有資料")
+    daily: Dict[str, Dict[str, float]] = {}
+    for row in raw.to_dict("records"):
+        key = _MARKET_INST_NAMES.get(str(row.get("name") or ""))
+        day = str(row.get("date") or "")[:10]
+        if not key or not day:
+            continue
+        net = (float(row.get("buy") or 0) - float(row.get("sell") or 0)) / 1e8
+        daily.setdefault(day, {"foreign": 0.0, "invest": 0.0, "dealer": 0.0})[key] += net
+    dates = sorted(daily)[-max(5, int(days or 20)):]
+    if not dates:
+        raise ToolDataError("全市場三大法人沒有有效日期")
+    rows = [{"date": d.replace("-", "/"), **{k: round(v, 2) for k, v in daily[d].items()}} for d in dates]
+    investors = []
+    for key, label in (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商")):
+        values = [r[key] for r in rows]
+        investors.append({"investor": label, "latest_yi": round(values[-1], 2), "sum_5d_yi": round(sum(values[-5:]), 2),
+                          "sum_20d_yi": round(sum(values[-20:]), 2), "streak_days": _streak(values)})
+    total = [r["foreign"] + r["invest"] + r["dealer"] for r in rows]
+    return {
+        "scope": "上市（集中市場）", "unit": "億元", "data_date": rows[-1]["date"], "investors": investors,
+        "total_latest_yi": round(total[-1], 2), "total_5d_yi": round(sum(total[-5:]), 2),
+        "total_20d_yi": round(sum(total[-20:]), 2), "total_streak_days": _streak(total), "rows": rows,
+        "definition_note": "交易所公布的上市三大法人買賣超金額（億元），收盤後才更新；不含上櫃，不是券商分點資料",
+    }
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -5790,6 +5865,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_volume_profile": get_volume_profile,
     "get_futures_positions": get_futures_positions,
     "get_institutional_flow": get_institutional_flow,
+    "get_market_institutional": get_market_institutional,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
     "get_warrant_branch": get_warrant_branch,

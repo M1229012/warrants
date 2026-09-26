@@ -79,6 +79,7 @@ class AccessContext:
     entry: str = "ask"
     simulation: str = ""
     nonce: str = ""
+    role_ids: tuple = ()          # 使用者的 Discord 身分組 ID（身分組每日額度、贈送額度用）
 
     @property
     def admin_mode(self):
@@ -99,8 +100,9 @@ class AccessContext:
 
 def resolve_access(member, superuser_ids, question, *, admin_entry=False, beta_ids=()):
     real = UserEntitlement.from_member(member, superuser_ids, beta_ids)
+    roles = tuple(str(getattr(r, "id", "")) for r in getattr(member, "roles", ()) if getattr(r, "id", None))
     if not admin_entry:
-        return AccessContext(real), question
+        return AccessContext(real, role_ids=roles), question
     if not real.admin:
         raise AccessDenied(ADMIN_DENIED, "ADMIN")
     match = re.match(r"^\s*測試(?:\s|$)", question)
@@ -158,10 +160,14 @@ def require_feature(access, policy=FeaturePolicy()):
 # 「00981A型態」的 A 是 ETF 代號尾碼、「型態」不是 A 型事件：字母前面不可是英數字，「型」後面不可接「態」
 _EXPLICIT_WARRANT_CHIP_RE = re.compile(r"權證|ABCDE|事件勝率|(?<![A-Z0-9])[A-E](?:事件|類|級|型(?!態))|事件[A-E]|[A-E][～~至][A-E]")
 _WIN_RATE_RE = re.compile(r"勝率")
+_RANK_RE = re.compile(r"排行|排名|前幾|最高|最準")
+_CHIP_WORD_RE = re.compile(r"籌碼|分點|現股|權證")
 _EXPLICIT_SPOT_CHIP_RE = re.compile(r"現股|券商分點|集中度")
 _COMBINED_CHIP_RE = re.compile(r"(?:兩種|兩個|二種|雙).{0,6}(?:籌碼|分點)?.{0,4}(?:一起|比較|對照)|(?:一起|比較|對照).{0,4}(?:兩種|兩個)")
 _AMBIGUOUS_CHIP_RE = re.compile(r"籌碼|分點|主力|誰.{0,2}在?買|誰.{0,2}買最多|吃貨|有沒有進|加碼|減碼|大戶|布局|佈局|在買什麼|買什麼|跑了沒|出貨|部位")
 _INSTITUTIONAL_ONLY_RE = re.compile(r"外資|投信|自營商|三大法人|法人")
+# 「部位還在嗎／跑了沒／出清」是權證事件的 FIFO 部位；現股分點沒有部位，權證追蹤分點問這些一律是權證
+_POSITION_RE = re.compile(r"部位|跑了沒|跑了嗎|還在嗎|出清|還有沒有|庫存|留倉")
 
 
 def chip_type(question, entitlement=None, known_branch=False, remembered="", warrant_branch=False):
@@ -174,14 +180,18 @@ def chip_type(question, entitlement=None, known_branch=False, remembered="", war
     """
     value = re.sub(r"[\s_－-]+", "", str(question or "")).upper()
     warrant = bool(_EXPLICIT_WARRANT_CHIP_RE.search(value)) or (
-        warrant_branch and bool(_WIN_RATE_RE.search(value)) and not _EXPLICIT_SPOT_CHIP_RE.search(value))
+        (warrant_branch or bool(_RANK_RE.search(value))) and bool(_WIN_RATE_RE.search(value))
+        and not _EXPLICIT_SPOT_CHIP_RE.search(value))
     spot = bool(_EXPLICIT_SPOT_CHIP_RE.search(value))
-    if (warrant and spot) or _COMBINED_CHIP_RE.search(value):
+    chip_context = bool(_CHIP_WORD_RE.search(value)) or remembered in ("spot", "warrant", "combined")
+    if (warrant and spot) or (_COMBINED_CHIP_RE.search(value) and chip_context):
         return "combined"
     if warrant:
         return "warrant"
     if spot:
         return "spot"
+    if warrant_branch and _POSITION_RE.search(value):
+        return "warrant"
     ambiguous = bool(_AMBIGUOUS_CHIP_RE.search(value)) or known_branch
     if _INSTITUTIONAL_ONLY_RE.search(value) and not known_branch:
         return ""
@@ -193,6 +203,18 @@ def chip_type(question, entitlement=None, known_branch=False, remembered="", war
     if e is not None and not e.spot and e.warrant:
         return "warrant"
     return "spot"
+
+
+def chip_needs_choice(question, entitlement, warrant_branch=False, remembered=""):
+    """點名權證追蹤分點、問法又模糊（沒寫權證／現股，例如「永豐金內湖最近買什麼」），而會員兩種權限都有：
+    現股與權證是完全不同的資料，要先反問，不替會員選。追問沿用上一題就不問。"""
+    e = entitlement
+    if remembered or not warrant_branch or e is None or not (e.spot and e.warrant):
+        return False
+    value = re.sub(r"[\s_－-]+", "", str(question or "")).upper()
+    explicit = (_EXPLICIT_WARRANT_CHIP_RE.search(value) or _EXPLICIT_SPOT_CHIP_RE.search(value)
+                or _COMBINED_CHIP_RE.search(value) or _WIN_RATE_RE.search(value) or _POSITION_RE.search(value))
+    return not explicit
 
 
 def require_chip(access, kind):
