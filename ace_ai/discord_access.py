@@ -205,18 +205,6 @@ def chip_type(question, entitlement=None, known_branch=False, remembered="", war
     return "spot"
 
 
-def chip_needs_choice(question, entitlement, warrant_branch=False, remembered=""):
-    """點名權證追蹤分點、問法又模糊（沒寫權證／現股，例如「永豐金內湖最近買什麼」），而會員兩種權限都有：
-    現股與權證是完全不同的資料，要先反問，不替會員選。追問沿用上一題就不問。"""
-    e = entitlement
-    if remembered or not warrant_branch or e is None or not (e.spot and e.warrant):
-        return False
-    value = re.sub(r"[\s_－-]+", "", str(question or "")).upper()
-    explicit = (_EXPLICIT_WARRANT_CHIP_RE.search(value) or _EXPLICIT_SPOT_CHIP_RE.search(value)
-                or _COMBINED_CHIP_RE.search(value) or _WIN_RATE_RE.search(value) or _POSITION_RE.search(value))
-    return not explicit
-
-
 def require_chip(access, kind):
     """籌碼權限在任何 Tool 執行前檢查；combined 只要有一種權限就放行（沒權限的那一半由呼叫端不執行並顯示鎖定卡）。"""
     if access is None or not kind:

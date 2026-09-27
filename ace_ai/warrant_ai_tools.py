@@ -582,6 +582,12 @@ class TTLCache:
 
     MAX_ENTRIES = max(100, _env_int("DISCORD_AI_CACHE_MAX_ENTRIES", 5000))
 
+    def remaining(self, key: str) -> float:
+        """快取還剩幾秒到期（沒有＝0）；背景提前更新用。"""
+        with self._lock:
+            item = self._data.get(self._full_key(key))
+        return max(0.0, item[0] - time.time()) if item else 0.0
+
     def set(self, key: str, value: Any, ttl_seconds: float) -> None:
         with self._lock:
             self._data[self._full_key(key)] = (time.time() + max(1.0, float(ttl_seconds)), value)
@@ -828,28 +834,28 @@ def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading
 
 def get_stock_name_map() -> Dict[str, str]:
     """股票代號 → 名稱：TWSE／TPEx 官方基本資料為主，FinMind 股票清單補上 ETF 等其餘代號。"""
+    return _cached("stock_name_map", TTL_REFERENCE_SECONDS, _build_stock_name_map)
 
-    def build() -> Dict[str, str]:
-        kf = core()
-        mapping: Dict[str, str] = {}
-        try:
-            mapping.update({str(k): str(v) for k, v in kf._official_stock_name_map().items() if k and v})
-        except Exception as exc:  # 官方 OpenAPI 失敗時仍可使用 FinMind 清單
-            print(f"⚠️ Discord AI 官方股票名冊讀取失敗：{type(exc).__name__}: {exc}")
-        try:
-            info = kf._finmind_load_stock_info()
-            if info is not None and not info.empty and {"stock_id", "stock_name"}.issubset(info.columns):
-                for code, name in zip(info["stock_id"].astype(str), info["stock_name"].astype(str)):
-                    key = kf._normalize_stock_name_code_key(code)
-                    if key and name and key not in mapping:
-                        mapping[key] = name.strip()
-        except Exception as exc:  # FinMind token 缺少或 API 失敗
-            print(f"⚠️ Discord AI FinMind 股票清單讀取失敗：{type(exc).__name__}: {exc}")
-        if not mapping:
-            raise ToolDataError("股票名冊暫時無法取得")
-        return mapping
 
-    return _cached("stock_name_map", TTL_REFERENCE_SECONDS, build)
+def _build_stock_name_map() -> Dict[str, str]:
+    kf = core()
+    mapping: Dict[str, str] = {}
+    try:
+        mapping.update({str(k): str(v) for k, v in kf._official_stock_name_map().items() if k and v})
+    except Exception as exc:  # 官方 OpenAPI 失敗時仍可使用 FinMind 清單
+        print(f"⚠️ Discord AI 官方股票名冊讀取失敗：{type(exc).__name__}: {exc}")
+    try:
+        info = kf._finmind_load_stock_info()
+        if info is not None and not info.empty and {"stock_id", "stock_name"}.issubset(info.columns):
+            for code, name in zip(info["stock_id"].astype(str), info["stock_name"].astype(str)):
+                key = kf._normalize_stock_name_code_key(code)
+                if key and name and key not in mapping:
+                    mapping[key] = name.strip()
+    except Exception as exc:  # FinMind token 缺少或 API 失敗
+        print(f"⚠️ Discord AI FinMind 股票清單讀取失敗：{type(exc).__name__}: {exc}")
+    if not mapping:
+        raise ToolDataError("股票名冊暫時無法取得")
+    return mapping
 
 
 def resolve_stock_name(stock_code: str) -> str:
@@ -894,55 +900,83 @@ def get_known_branches() -> Dict[str, str]:
         _KNOWN_BRANCHES_SNAPSHOT = dict(cached)
         return cached
 
-    def build() -> Tuple[Dict[str, str], int]:
-        kf = core()
-        aliases: Dict[str, str] = {}
+    aliases, sheet_sources_ok = _build_known_branches()
+    _store_known_branches(aliases, sheet_sources_ok)
+    return aliases
 
-        def add(branch: Any, display: Any = "") -> None:
-            canonical = kf.normalize_branch_name(str(branch or ""))
-            if not canonical or canonical in ("未知分點",):
-                return
-            aliases.setdefault(canonical, canonical)
-            display_norm = kf.normalize_branch_name(str(display or ""))
-            if display_norm:
-                aliases.setdefault(display_norm, canonical)
 
-        sheet_sources_ok = 0
-        try:
-            perf = _read_branch_perf_df()
-            for _, row in perf.iterrows():
-                add(row.get("branch", ""), row.get("branch_display", ""))
-            sheet_sources_ok += 1
-        except Exception as exc:
-            print(f"⚠️ Discord AI 分點清單（勝率統計）讀取失敗：{type(exc).__name__}: {exc}")
-        for title in ("快取_近10日分點買賣明細", "股票ABCDE查詢資料"):
-            try:
-                table = read_sheet_table(title)["df"]
-                if "分點" in table.columns:
-                    names = table.get("分點名稱", pd.Series([""] * len(table)))
-                    for branch, display in set(zip(table["分點"], names)):
-                        add(branch, display)
-                sheet_sources_ok += 1
-            except Exception as exc:
-                print(f"⚠️ Discord AI 分點清單（{title}）讀取失敗：{type(exc).__name__}: {exc}")
-        # 官方證券商分點名冊（repo 內 securities_trader_seed.csv.gz，不依賴 Google Sheet）。
-        # 只收「券商-分點」層級；總公司簡稱（例如「永豐金」）與股票名稱容易撞名，不列入。
-        seed_count = 0
-        try:
-            for name in kf._load_trader_name_map().values():
-                if "-" in str(name) and len(kf.normalize_branch_name(name)) >= 3:
-                    add(name)
-                    seed_count += 1
-        except Exception as exc:
-            print(f"⚠️ Discord AI 官方分點名冊讀取失敗：{type(exc).__name__}: {exc}")
-        print(f"📋 Discord AI 分點清單：{len(set(aliases.values())):,} 個分點｜Google Sheet 來源成功 {sheet_sources_ok}/3｜官方名冊 {seed_count:,} 筆")
-        return aliases, sheet_sources_ok
-
-    aliases, sheet_sources_ok = build()
+def _store_known_branches(aliases: Dict[str, str], sheet_sources_ok: int) -> None:
+    global _KNOWN_BRANCHES_SNAPSHOT
     # Sheet 全部讀取失敗時只快取 5 分鐘，之後重試；官方名冊部分仍可正常辨識分點。
     CACHE.set("known_branches", aliases, TTL_BRANCH_PERF_SECONDS if sheet_sources_ok else 300)
     if aliases:
         _KNOWN_BRANCHES_SNAPSHOT = dict(aliases)
+
+
+def _build_known_branches() -> Tuple[Dict[str, str], int]:
+    kf = core()
+    aliases: Dict[str, str] = {}
+
+    def add(branch: Any, display: Any = "") -> None:
+        canonical = kf.normalize_branch_name(str(branch or ""))
+        if not canonical or canonical in ("未知分點",):
+            return
+        aliases.setdefault(canonical, canonical)
+        display_norm = kf.normalize_branch_name(str(display or ""))
+        if display_norm:
+            aliases.setdefault(display_norm, canonical)
+
+    sheet_sources_ok = 0
+    try:
+        perf = _read_branch_perf_df()
+        for _, row in perf.iterrows():
+            add(row.get("branch", ""), row.get("branch_display", ""))
+        sheet_sources_ok += 1
+    except Exception as exc:
+        print(f"⚠️ Discord AI 分點清單（勝率統計）讀取失敗：{type(exc).__name__}: {exc}")
+    for title in ("快取_近10日分點買賣明細", "股票ABCDE查詢資料"):
+        try:
+            table = read_sheet_table(title)["df"]
+            if "分點" in table.columns:
+                names = table.get("分點名稱", pd.Series([""] * len(table)))
+                for branch, display in set(zip(table["分點"], names)):
+                    add(branch, display)
+            sheet_sources_ok += 1
+        except Exception as exc:
+            print(f"⚠️ Discord AI 分點清單（{title}）讀取失敗：{type(exc).__name__}: {exc}")
+    # 官方證券商分點名冊（repo 內 securities_trader_seed.csv.gz，不依賴 Google Sheet）。
+    # 只收「券商-分點」層級；總公司簡稱（例如「永豐金」）與股票名稱容易撞名，不列入。
+    seed_count = 0
+    try:
+        for name in kf._load_trader_name_map().values():
+            if "-" in str(name) and len(kf.normalize_branch_name(name)) >= 3:
+                add(name)
+                seed_count += 1
+    except Exception as exc:
+        print(f"⚠️ Discord AI 官方分點名冊讀取失敗：{type(exc).__name__}: {exc}")
+    print(f"📋 Discord AI 分點清單：{len(set(aliases.values())):,} 個分點｜Google Sheet 來源成功 {sheet_sources_ok}/3｜官方名冊 {seed_count:,} 筆")
+    return aliases, sheet_sources_ok
+
+
+def refresh_reference_caches(ahead_seconds: float = 3600) -> List[str]:
+    """快到期（剩不到 ahead_seconds）的股票名冊、分點名冊先在背景重建：會員不會剛好碰到過期、自己等幾秒重建。
+    重建失敗保留舊值（舊值到期前還能用）。回傳這次更新了哪些。"""
+    done = []
+    if 0 < CACHE.remaining("stock_name_map") < ahead_seconds:
+        try:
+            CACHE.set("stock_name_map", _build_stock_name_map(), TTL_REFERENCE_SECONDS)
+            done.append("股票名冊")
+        except Exception as exc:
+            print(f"⚠️ 股票名冊背景更新失敗（沿用舊的）｜{type(exc).__name__}: {exc}", flush=True)
+    if 0 < CACHE.remaining("known_branches") < min(ahead_seconds, TTL_BRANCH_PERF_SECONDS / 2):
+        try:
+            aliases, ok = _build_known_branches()
+            if ok:
+                _store_known_branches(aliases, ok)
+                done.append("分點名冊")
+        except Exception as exc:
+            print(f"⚠️ 分點名冊背景更新失敗（沿用舊的）｜{type(exc).__name__}: {exc}", flush=True)
+    return done
     return aliases
 
 

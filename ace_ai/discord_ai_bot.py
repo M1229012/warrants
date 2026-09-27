@@ -2498,7 +2498,9 @@ _SENTENCE_RE = re.compile(r"[^。！？；\n]*[。！？；]?")
 _USER_INPUT_KEYS = {"cost_price"}          # 這些欄位的數字來自使用者輸入，不是市場資料
 _MA_ALIAS = {"週線": "MA5", "周線": "MA5", "雙週線": "MA10", "月線": "MA20", "季線": "MA60", "半年線": "MA120", "年線": "MA240"}
 _MA_ALL_WORDS = ("所有均線", "全部均線", "各均線", "各條均線")
-_MA_NAME = r"(?:(?<![A-Za-z])MA\s?\d{1,3}|雙週線|週線|周線|月線|季線|半年線|年線)"
+_MA_DAY_WORDS = {"五": 5, "十": 10, "二十": 20, "六十": 60, "一百二十": 120, "二百四十": 240, "兩百四十": 240}
+_MA_NAME = (r"(?:(?<![A-Za-z])MA\s?\d{1,3}|(?<![\d.])(?:5|10|20|60|120|240)\s?日均?線|"
+            r"(?:五|十|二十|六十|一百二十|二百四十|兩百四十)日均?線|雙週線|週線|周線|月線|季線|半年線|年線)")
 _MA_LABEL = r"(?:" + _MA_NAME + r"|所有均線|全部均線|各均線|各條均線)"
 # 「月線 31.2 元」「MA20（31.2）」「季線約 45」：標籤後面緊接的價格；後面接 %／日／張等單位的是距離或天數，不核對。
 # 指數（加權、櫃買）動輒五位數，寫法會有千分位逗號；不吃逗號的話「46,543」會被讀成「46」，
@@ -2507,7 +2509,13 @@ _MA_DEDUCTION_TALK_RE = re.compile(r"扣抵|扣除|上彎|下彎|翻揚|翻多|�
 _MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d[\d,]*(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
 _DIRECTION_RE = re.compile(
     r"(站上|站穩|站回|突破|守住|守穩|跌破|失守|跌落|摜破)\s*((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)")
-_UP_WORDS = {"站上", "站穩", "站回", "突破", "守住", "守穩"}
+_UP_WORDS = {"站上", "站穩", "站回", "突破", "守住", "守穩", "高於", "上方", "之上", "以上"}
+_LABELS_GROUP = r"((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)"
+_POSITION_WORD_RE = re.compile(
+    r"(?:位於|位在|處於|收在|收於|守在|站在|維持在|仍在|落在|在)\s*" + _LABELS_GROUP + r"\s*(上方|之上|以上|下方|之下|以下)"
+    r"|(高於|低於)\s*" + _LABELS_GROUP)
+# 同一個子句用「且／並／但」接兩件事時分開核對（「站穩 MA5 且不跌破 MA10」的「不」只管後半句）
+_CONNECTOR_SPLIT_RE = re.compile(r"並且|而且|但是|然而|不過|同時|且|並|但")
 # 條件、否定、未來、過去的句子不是在陳述「現在的位置」，不核對方向，避免誤刪。
 _DIRECTION_SKIP_RE = re.compile(
     r"若|如果|一旦|假如|倘若|假設|需|須|必須|要|能否|是否|未|沒|不|等待|等|觀察|才|可能|恐|會|將|可望|機會|留意|注意|關注|避免|"
@@ -2558,6 +2566,10 @@ def _variants_of(text: str) -> Set[str]:
 
 def _ma_key(label: str) -> str:
     label = re.sub(r"\s+", "", label)
+    day = re.fullmatch(r"(\d{1,3}|五|十|二十|六十|一百二十|二百四十|兩百四十)日均?線", label)
+    if day:
+        n = day.group(1)
+        return f"MA{int(n) if n.isdigit() else _MA_DAY_WORDS[n]}"
     return _MA_ALIAS.get(label, label.upper())
 
 
@@ -2713,17 +2725,24 @@ class FactSheet:
             return []
         issues = []
         plain = _PAREN_RE.sub("", sentence)
-        for clause in _CLAUSE_SPLIT_RE.split(plain):
-            for match in _DIRECTION_RE.finditer(clause):
-                prefix = clause[:match.start()]
+        clauses = [part for clause in _CLAUSE_SPLIT_RE.split(plain) for part in _CONNECTOR_SPLIT_RE.split(clause)]
+        for clause in clauses:
+            claims = [(m.start(), m.group(1), m.group(2)) for m in _DIRECTION_RE.finditer(clause)]
+            for m in _POSITION_WORD_RE.finditer(clause):
+                if m.group(1):
+                    claims.append((m.start(), m.group(2), m.group(1)))
+                else:
+                    claims.append((m.start(), "高於" if m.group(3) == "高於" else "低於", m.group(4)))
+            for start, verb, label_text in claims:
+                prefix = clause[:start]
                 if _DIRECTION_SKIP_RE.search(clause):
                     continue
                 if _NON_PRICE_SUBJECT_RE.search(prefix):
                     continue  # 成本／扣抵價與均線的比較，不是股價位置
                 if re.search(_MA_LABEL, prefix) and not _PRICE_SUBJECT_RE.search(prefix):
-                    continue  # 「MA5 跌破 MA20」是均線彼此交叉，不是股價位置
-                claimed = "站上" if match.group(1) in _UP_WORDS else "跌破"
-                labels = re.findall(_MA_LABEL, match.group(2))
+                    continue  # 「MA5 跌破 MA20」「MA5 在 MA20 之上」是均線彼此的位置，不是股價位置
+                claimed = "站上" if verb in _UP_WORDS else "跌破"
+                labels = re.findall(_MA_LABEL, label_text)
                 keys: List[str] = []
                 for label in labels:
                     keys += [k for k in ("MA5", "MA10", "MA20", "MA60") if k in closed] if label in _MA_ALL_WORDS else [_ma_key(label)]
@@ -3738,9 +3757,18 @@ def _examples_for(parsed: "ParsedQuestion") -> List[str]:
     return list(dict.fromkeys(picked + base))[:3]
 
 
+def unknown_codes(parsed: "ParsedQuestion") -> List[str]:
+    """問句裡寫了代號、但股票名冊查不到（例：0000、打錯的代號）。"""
+    return [n.split("名冊查無代號", 1)[1].strip() for n in parsed.notes if n.startswith("名冊查無代號")]
+
+
 def clarify_message(parsed: "ParsedQuestion") -> str:
     """看不懂題意時反問（不丟整張指令表）：缺股票就問哪一檔，名稱對不到就說找不到，並附 2～3 個可以直接照打的問法。"""
     examples = "\n".join(f"• {x}" for x in _examples_for(parsed))
+    codes = unknown_codes(parsed)
+    if codes and not parsed.stocks:
+        return (f"**查不到這個代號**\n股票名冊裡沒有「{'、'.join(codes)}」，請確認代號是否正確（上市櫃普通股、ETF 皆可），"
+                f"或改用股票名稱問我，例如：\n{examples}")
     unknown = next((t for t in parsed.unknown_terms if 2 <= len(t) <= 8), "")
     if unknown and not (parsed.intents & _SUPPORTED_INTENTS - {"technical", "volume_profile"}):
         head = f"找不到「{unknown}」這檔股票或分點，可以確認名稱，或改用股票代號問我。"
@@ -3957,7 +3985,8 @@ EMERGENCY_RATIO = tools._env_float("DISCORD_AI_EMERGENCY_RATIO", 0.20)          
 EMERGENCY_AI_LIMIT = max(0, tools._env_int("DISCORD_AI_EMERGENCY_AI_LIMIT", 1))
 QUOTA_RESET_LABEL = "每天下午 4 點"
 USER_LIMIT_MESSAGE = f"今天的提問次數已達上限，{QUOTA_RESET_LABEL}恢復。"
-USER_RATE_MESSAGE = "問得有點快，請稍等幾秒再問。"
+USER_RATE_MESSAGE = "上一題還在等候，這題請等上一題回覆後再問。"
+WAIT_TURN_MAX_SECONDS = 180      # 候位最多等多久（上一題卡住時不要一直等）
 AI_EXHAUSTED_NOTICE = (f"今天的 AI 解讀次數已用完。你仍然可以繼續提問，回答會以圖表與數據為主，只是不附 AI 解讀；"
                        f"{QUOTA_RESET_LABEL}恢復。")
 MY_QUOTA_WORDS = ("我的額度", "我的次數", "剩餘額度", "剩幾題", "查額度", "額度查詢")
@@ -3980,7 +4009,7 @@ def quota_exempt_ids() -> Set[str]:
 # 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
 REQUIRED_MODULE_API = {
     "local_market_cache": ("accumulate_state", "recent_states"),
-    "discord_access": ("chip_needs_choice", "require_sector"),
+    "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional",),
     "answer_image": ("wrap_cell",),
     "weekly_pick": ("layout_card", "verify_layout"),
@@ -4023,6 +4052,7 @@ class QuotaPolicy:
         self._day = ""
         self._usage: Dict[str, Dict[str, int]] = {}
         self._last_ask: Dict[str, float] = {}
+        self._waiting: Set[str] = set()      # 正在候位的使用者（每人最多 1 題）
         self.mode = "normal"            # normal／bonus／emergency（背景每 5 分鐘 refresh_mode 更新並通知管理員）
 
     # ----- 額度日與儲存 -----
@@ -4112,12 +4142,7 @@ class QuotaPolicy:
 
     def check_entry(self, user: str, roles: Sequence[str] = ()) -> Tuple[bool, str, bool]:
         """(可不可以問, 不行時的訊息, 這題能不能用 AI)。AI 用完照樣能問；只有 AI 用完＋一般題也用完才擋。"""
-        now = time.monotonic()
         with self._lock:
-            last = self._last_ask.get(str(user), -1e9)
-            if USER_MIN_INTERVAL and now - last < USER_MIN_INTERVAL:
-                return False, USER_RATE_MESSAGE, False
-            self._last_ask[str(user)] = now
             self._roll()
             row = self._usage.get(str(user), {})
         st = self.status(user, roles)
@@ -4125,6 +4150,26 @@ class QuotaPolicy:
         if USER_PLAIN_DAILY_LIMIT and int(row.get("plain", 0)) >= USER_PLAIN_DAILY_LIMIT and not ai_ok:
             return False, USER_LIMIT_MESSAGE, False
         return True, "", ai_ok
+
+    def wait_turn(self, user: str) -> Optional[float]:
+        """同一人兩題最短間隔：太快的那題先候位、時間到自動接著答（不用重打），回傳要等幾秒（0＝馬上）；
+        每人最多候位 1 題，已經有一題在等再問就回 None（請他等上一題回覆）。"""
+        now = time.monotonic()
+        with self._lock:
+            key = str(user)
+            last = self._last_ask.get(key, -1e9)
+            if not USER_MIN_INTERVAL or now - last >= USER_MIN_INTERVAL:
+                self._last_ask[key] = now
+                return 0.0
+            if key in self._waiting:
+                return None
+            self._waiting.add(key)
+            self._last_ask[key] = last + USER_MIN_INTERVAL
+            return last + USER_MIN_INTERVAL - now
+
+    def done_waiting(self, user: str) -> None:
+        with self._lock:
+            self._waiting.discard(str(user))
 
     def record(self, user: str, roles: Sequence[str], used_ai: bool) -> None:
         """答完才計次：用了 AI 扣 AI 次數（每日用完再扣贈送），沒用 AI 扣一般題次數。"""
@@ -4476,15 +4521,6 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started)
         if note:
             self.log(f"追問記憶：{note}")
-        if parsed.chip == "spot" and access_policy.chip_needs_choice(
-                question, access.entitlement if access else None, warrant_branch=bool(parsed.branches),
-                remembered=getattr(remembered, "chip_context", "") if remembered and note else ""):
-            # 權證追蹤分點＋模糊的「最近買什麼」，會員兩種都有：兩種資料完全不同，先問清楚，不猜
-            name = parsed.branches[0]
-            return AnswerResult(text=(f"**要看哪一種？**\n「{name}」有兩種資料，請選一種再問一次：\n"
-                                      f"• {name} 權證 最近買什麼（A～E 權證事件、部位）\n"
-                                      f"• {name} 現股 最近買什麼（券商分點現股買賣超）"),
-                                route="clarify", gemini_calls=0, elapsed=time.perf_counter() - started)
         if (parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋評分卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
@@ -4812,6 +4848,16 @@ class AceQueryEngine:
                                 image_title="我的額度", panels=[{"branch_card": card, "hide_text": True}])
         _AI_GATE.allowed, _AI_GATE.used, _AI_GATE.blocked = True, False, False
         if quota_user and policy is not None:
+            wait = policy.wait_turn(quota_user)
+            if wait is None:
+                return AnswerResult(USER_RATE_MESSAGE, "user_limit", 0, 0.0, image_title="提問次數")
+            if wait > 0:
+                if on_queue:
+                    on_queue(1)                 # 「前面還有 1 個問題」：自己的上一題
+                try:
+                    time.sleep(wait)
+                finally:
+                    policy.done_waiting(quota_user)
             ok, message, ai_ok = policy.check_entry(quota_user, roles)
             if not ok:   # 圖卡版提醒（只給本人看）
                 return AnswerResult(message, "user_limit", 0, 0.0, image_title="提問次數")
@@ -4875,8 +4921,8 @@ class AceQueryEngine:
 
     @staticmethod
     def _is_priority(access) -> bool:
-        """管理員（含 /ace）不排隊、不佔排隊名額。"""
-        return access is not None and (access.entry == "ace" or access.entitlement.admin)
+        """管理員（含 /ace）不排隊、不佔排隊名額；模擬會員身分（/ace 測試 …）照會員規則排隊。"""
+        return access is not None and not access.simulation and (access.entry == "ace" or access.entitlement.admin)
 
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
@@ -5479,7 +5525,7 @@ class AceQueryEngine:
                 parsed.stocks = list(retry.stocks[:2])
                 parsed.intents = set(parsed.intents) | set(retry.intents)
                 return self.router.plan(parsed, stats)
-        near = sector_match.suggest(target or question)
+        near = sector_match.suggest(target or question) if subject == "sector" else []
         if near:
             options = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(near[:3]))
             return QueryPlan(route="clarify",
@@ -5522,7 +5568,8 @@ class AceQueryEngine:
                 plan.add("get_market_institutional", market=market_of(parsed))
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
-        if plan.route == "help":
+        if plan.route == "help" and not (unknown_codes(parsed) and not parsed.stocks):
+            # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
             # Beta gate 在 Tool／Gemini 之前：非 tester 不提示 Beta，有舊 route 走舊 route，沒有就走一般 fallback。
@@ -6198,6 +6245,7 @@ class AccessGuard:
         self.config = config
         self._last_request: Dict[int, float] = {}
         self._running: Set[int] = set()
+        self._waiting: Set[int] = set()        # 候位中的使用者（每人最多 1 題）
         self._lock = threading.Lock()
 
     def check_permission(self, user_id: int, channel_id: int, guild_id: Optional[int] = None) -> str:
@@ -6229,6 +6277,34 @@ class AccessGuard:
             self._last_request[user_id] = now
             self._running.add(user_id)
             return ""
+
+    def enter(self, user_id: int) -> str:
+        """/ask 入口：go＝馬上開始；wait＝上一題還在跑或間隔未滿，這題候位（不用重打）；reject＝已經有一題在候位。"""
+        now = time.time()
+        with self._lock:
+            if user_id in self._waiting:
+                return "reject"
+            if user_id in self._running or now - self._last_request.get(user_id, 0.0) < self.config.user_cooldown_seconds:
+                self._waiting.add(user_id)
+                return "wait"
+            self._last_request[user_id] = now
+            self._running.add(user_id)
+            return "go"
+
+    def try_start_waiting(self, user_id: int) -> bool:
+        """候位的那一題：上一題答完、間隔也滿了才開始（登記執行中）。"""
+        now = time.time()
+        with self._lock:
+            if user_id in self._running or now - self._last_request.get(user_id, 0.0) < self.config.user_cooldown_seconds:
+                return False
+            self._waiting.discard(user_id)
+            self._last_request[user_id] = now
+            self._running.add(user_id)
+            return True
+
+    def cancel_wait(self, user_id: int) -> None:
+        with self._lock:
+            self._waiting.discard(user_id)
 
     def release(self, user_id: int) -> None:
         with self._lock:
@@ -6557,6 +6633,12 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
     last_cmoney = 0.0
     while not stop.wait(BACKGROUND_TICK_SECONDS):
         now = tools.taipei_now()
+        try:
+            refreshed = tools.refresh_reference_caches()
+            if refreshed:
+                print(f"♻️ 背景更新：{'、'.join(refreshed)}（會員不用等重建）", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 名冊背景更新略過｜{type(exc).__name__}: {exc}", flush=True)
         # 盤中 CMoney 雷達先在背景暖好，會員問「現在族群誰最強」時直接讀快取。
         minutes = now.hour * 60 + now.minute
         if now.weekday() < 5 and 8 * 60 + 50 <= minutes <= 13 * 60 + 45:
@@ -6814,10 +6896,11 @@ def run_discord_bot(config: BotConfig) -> None:
                 await interaction_text(interaction, text, ephemeral=True, followup=followup)
             else:
                 await interaction_image(interaction, title, text, panels, ephemeral=True, followup=followup)
-        busy = guard.acquire(user_id)
-        if busy:
-            await interaction_image(interaction, "請稍候", busy, ephemeral=True)
+        state = guard.enter(user_id)
+        if state == "reject":
+            await interaction_image(interaction, "請稍候", "你已經有一題在等候，請等上一題回覆後再問下一題。", ephemeral=True)
             return
+        started_turn = state == "go"
         try:
             # 10062（此互動已失效）代表 3 秒內沒能 defer。defer 前只做不需 await 的量測，不讓出事件迴圈：
             # delivery=使用者按下到 Bot 收到；pre_defer=Bot 收到到呼叫 defer；loop_lag 在 defer 之後才量。
@@ -6830,6 +6913,18 @@ def run_discord_bot(config: BotConfig) -> None:
             if delivery > 1.0 or pre_defer > 0.5 or loop_lag > 0.5:
                 print(f"⏱️ Discord 互動延遲｜delivery={delivery:.2f}s｜pre_defer={pre_defer:.2f}s｜"
                       f"loop_lag={loop_lag:.2f}s｜{question[:20]}", flush=True)
+            if not started_turn:
+                # 同一人連問：這題候位，等上一題答完（且間隔滿 8 秒）自動接著答，不用重打
+                await interaction_image(interaction, question, "你的上一題還在處理，這題會接著回答，請稍候。", ephemeral=ephemeral)
+                waited = 0.0
+                while not guard.try_start_waiting(user_id):
+                    if waited >= WAIT_TURN_MAX_SECONDS:
+                        guard.cancel_wait(user_id)
+                        await send_private("等候逾時", "上一題處理太久，這題沒有開始，請再問一次。")
+                        return
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+                started_turn = True
             if admin_mode and is_weekly_pick_question(question) and not weekly_pick.is_weekly_draft_question(question):
                 await interaction_image(interaction, question, WEEKLY_PICK_ACK, ephemeral=ephemeral)
             loop = asyncio.get_running_loop()
@@ -6904,7 +6999,10 @@ def run_discord_bot(config: BotConfig) -> None:
             except discord.HTTPException as send_exc:
                 print(f"⚠️ 錯誤訊息送出失敗：{send_exc}", flush=True)
         finally:
-            guard.release(user_id)
+            if started_turn:
+                guard.release(user_id)       # 只釋放自己的；候位逾時沒開始的不可以把上一題的執行中清掉
+            else:
+                guard.cancel_wait(user_id)
 
     @client.tree.command(name=QUOTA_COMMAND_NAME, description="艾斯 AI 管理員：贈送／設定／查詢 AI 解讀額度")
     @app_commands.describe(action="要做什麼", target="選使用者或身分組", amount="次數（贈送、身分組每日次數用）")
