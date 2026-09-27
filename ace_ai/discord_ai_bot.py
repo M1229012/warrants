@@ -922,6 +922,41 @@ def market_institutional_card(data: Dict[str, Any], question: str = "", with_cha
             "label": "法人籌碼", "sections": sections}
 
 
+def market_inst_extra(data: Dict[str, Any], question: str) -> str:
+    """大盤型態＋法人頁：副圖標題列右邊的一行（其他法人今日、主角近 5／20 日），取代另一張法人卡。"""
+    investors = {x["investor"]: x for x in data.get("investors") or []}
+    focus = institutional_focus(question, data) or "外資"
+    others = [f"{n} {_signed_yi(x.get('latest_yi'))}" for n, x in investors.items() if n != focus]
+    me = investors.get(focus) or {}
+    return "｜".join(others + [f"合計 {_signed_yi(data.get('total_latest_yi'))}",
+                               f"{focus}近5日 {_signed_yi(me.get('sum_5d_yi'))}", f"近20日 {_signed_yi(me.get('sum_20d_yi'))}"]) + " 億"
+
+
+def futures_focus(question: str) -> str:
+    asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
+    return asked[0] if len(asked) == 1 else "外資"
+
+
+def futures_extra(data: Dict[str, Any], focus: str) -> str:
+    others = [f"{x['investor']} {x['net_text']}" for x in data.get("investors") or [] if focus not in x["investor"]]
+    return "｜".join(others) + " 口" if others else ""
+
+
+def futures_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+    """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。"""
+    items = []
+    for x in data.get("investors") or []:
+        change = x.get("change_vs_prev")
+        delta = "" if change is None else f"較前日 {int(change):+,}"
+        items.append({"label": x["investor"], "value": f"{x['net_text']} 口", "tone": "signed" if x["net_oi"] else "ink",
+                      "sub": delta})
+    sections = [{"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜台指期（{data.get('futures_id', 'TX')}）三大法人未平倉"},
+                {"type": "stats", "items": [{"label": f"{i['label']}｜{i['sub']}" if i["sub"] else i["label"], "value": i["value"]}
+                                            for i in items]},
+                {"type": "note", "text": "※ 未平倉含現貨避險部位，不能單獨當作多空訊號；K 線下方紅柱＝淨多增加（空單減少）、綠柱＝淨空增加，金線＝淨未平倉。"}]
+    return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
+
+
 def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
     """某分點在某檔股票的全部 A～E 事件（不限 K 線 70 日）：新到舊，每筆列金額、權證、狀態。
     numbers＝{事件日: K 線上的編號}：K 線範圍內的事件在前面加上和圖上相同的圈號。"""
@@ -1324,6 +1359,14 @@ class QueryRouter:
                 if "news" in other_categories:
                     plan.add("get_recent_news", stock_code=code)
             return plan
+        if ("futures" in intents and not parsed.branches and not pattern_asked(parsed)
+                and all(c in tools.INDEX_CODES for c, _ in parsed.stocks)):
+            # 「台指期外資空單多少」「大盤外資期貨未平倉」：加權指數 K 線＋70 日淨未平倉副圖＋數字卡；只問數字不叫 AI
+            parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
+            plan = QueryPlan(route="rule_futures", need_final_llm=bool(
+                _INSTITUTIONAL_ANALYSIS_RE.search(parsed.original or "") or analysis))
+            plan.add("get_futures_positions")
+            return plan
         if parsed.stocks and ("cost" in intents or not other_categories):
             if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
                 return self._stock_plan(parsed, categories, analysis)
@@ -1462,8 +1505,8 @@ class QueryRouter:
             plan.add("get_volume_profile", stock_code=code)
             if parsed.cost_price is not None:
                 plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
-            if code in tools.INDEX_CODES:
-                # 大盤／櫃買固定附上三大法人台指期未平倉（僅供參考，不做多空判斷）。
+            if code == "TAIEX":
+                # 大盤固定附上三大法人台指期未平倉（僅供參考，不做多空判斷）；櫃買和台指期無關，不附
                 plan.add("get_futures_positions")
             # 純型態問題只算技術結構，不讀權證分點，避免圖片過長與不必要的 Sheet 呼叫。
         return plan
@@ -3393,7 +3436,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
 
 
 # 這些回答都有圖卡：K 線（股價、均線、布林、量）、型態評分卡、分點標註表、法人卡、權證摘要卡
-CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional",
+CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional", "rule_futures",
                          "rule_market_institutional", "rule_branch_position", "rule_branch_stock"))
 # 圖上已經畫出來的資料：AI 不在時不必再用文字重打一次
 DRAWN_TOOLS = frozenset(("get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_pattern_scorecard",
@@ -5451,6 +5494,8 @@ class AceQueryEngine:
             if market_inst and plan.route == "rule_pattern":
                 # 「大盤型態跟外資動向」「櫃買型態跟投信」：指數型態頁＋同一個市場的三大法人
                 plan.add("get_market_institutional", market=market_of(parsed))
+                if "futures" not in parsed.intents:
+                    plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
         if plan.route == "help":
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
@@ -5555,9 +5600,12 @@ class AceQueryEngine:
         if market_flow:
             index = "TPEX" if market_flow.get("market") == "tpex" else "TAIEX"
             has_chart = any(p.get("stock_code") == index and p.get("bars") for p in panels)
-            panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart,
-                                                                    compact=plan.route != "rule_market_institutional"),
-                           "hide_text": plan.route == "rule_market_institutional"})
+            if plan.route == "rule_market_institutional" or not has_chart:
+                panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart),
+                               "hide_text": plan.route == "rule_market_institutional"})
+        futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
+        if futures_data and plan.route == "rule_futures":
+            panels.append({"branch_card": futures_card(futures_data, question), "hide_text": True})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
             if flow:
@@ -5592,6 +5640,15 @@ class AceQueryEngine:
             if flow is None and market_flow and panel.get("stock_code") == ("TPEX" if market_flow.get("market") == "tpex" else "TAIEX"):
                 flow = market_flow
                 panel["institutional_unit"] = "億"
+                if plan.route != "rule_market_institutional":
+                    panel["institutional_extra"] = market_inst_extra(market_flow, question)
+            if (flow is None and futures_data and panel.get("stock_code") == "TAIEX" and panel.get("bars")
+                    and (plan.route == "rule_futures" or "futures" in parsed.intents)):
+                focus = futures_focus(question)
+                dates = {bar["date"] for bar in panel["bars"]}
+                panel["futures"] = {"rows": [r for r in futures_data.get("rows") or [] if r.get("date") in dates],
+                                    "focus": _INVESTOR_KEYS[focus], "label": focus,
+                                    "extra": "" if plan.route == "rule_futures" else futures_extra(futures_data, focus)}
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
@@ -5603,6 +5660,8 @@ class AceQueryEngine:
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
                 if card and (getattr(parsed, "spot_combo", False) or with_chips or market_flow):
+                    if market_flow and not with_chips:
+                        card = dict(card, hide_reasons=True)     # 大盤型態＋法人：不放得分／失分，圖片不要太長
                     card = dict(card, compact=True)   # 型態＋籌碼整合頁：評分卡精簡（無均線扣抵、價位只留最近 1＋1）
                 if card:
                     panel["scorecard"] = card
@@ -6428,10 +6487,6 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                     outcome = local_market_cache.daily_maintenance(today)
                     if not (outcome or {}).get("failed"):
                         _db_maintenance_day[0] = today
-            try:
-                tools.sync_tpex_institutional(log=lambda m: print(f"🏦 {m}", flush=True))
-            except Exception as exc:
-                print(f"⚠️ 上櫃三大法人補資料略過｜{type(exc).__name__}: {exc}", flush=True)
             # 當天資料出來前被查過的現股分點：富邦一更新就先抓當天那頁（只用富邦，不佔 FinMind／富果額度）
             try:
                 spot_chip.prefetch_today(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
@@ -6442,6 +6497,23 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
         except Exception as exc:
             print(f"⚠️ 市場底庫背景維護失敗｜{type(exc).__name__}: {exc}", flush=True)
         if stop.wait(300):
+            break
+
+
+def _tpex_institutional_loop(stop: threading.Event) -> None:
+    """上櫃三大法人（TPEx 一次一天）：開機後每分鐘補 40 天直到補滿近 90 個交易日，之後每 30 分鐘看有沒有新的一天。"""
+    while not stop.is_set():
+        fetched = 0
+        try:
+            fetched = tools.sync_tpex_institutional(max_requests=40, log=lambda m: print(f"🏦 {m}", flush=True))
+            full = tools.tpex_inst_days_available() >= tools.INST_CHART_DAYS
+        except Exception as exc:
+            print(f"⚠️ 上櫃三大法人補資料略過｜{type(exc).__name__}: {exc}", flush=True)
+            full = False
+        tools.TPEX_INST_KICK.clear()
+        if tools.TPEX_INST_KICK.wait(60 if (fetched or not full) else 1800) and stop.is_set():
+            break
+        if stop.is_set():
             break
 
 
@@ -6663,6 +6735,7 @@ def run_discord_bot(config: BotConfig) -> None:
             if MARKET_SYNC_ENABLE:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
                 threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
+                threading.Thread(target=_tpex_institutional_loop, args=(usage_stop,), name="ace-tpex-inst", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"

@@ -1894,7 +1894,7 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
     """三大法人台指期未平倉（FinMind）。只陳述口數與變化，不作多空判斷。"""
     kf = core()
     end = taipei_now()
-    start = end - timedelta(days=max(5, int(days or 10)) * 2 + 10)
+    start = end - timedelta(days=max(max(5, int(days or 10)) * 2 + 10, int(INST_CHART_DAYS * 1.5) + 10))
     started = time.perf_counter()
     try:
         raw = kf._finmind_get_data(
@@ -1938,7 +1938,18 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
             "net_text": ("淨多 " if info["net"] >= 0 else "淨空 ") + format(int(abs(info["net"])), ","),
             "change_vs_prev": int(info["net"] - before) if before is not None else None,
         })
+    def key_of(name: str) -> str:
+        return "foreign" if "外資" in name else "invest" if "投信" in name else "dealer" if "自營" in name else ""
+
+    rows = []
+    for day in dates[-INST_CHART_DAYS:]:
+        row: Dict[str, Any] = {"date": day.strftime("%Y/%m/%d")}
+        for name, info in rows_for(day).items():
+            if key_of(name) and key_of(name) not in row:
+                row[key_of(name)] = info["net"]
+        rows.append(row)
     return {
+        "rows": rows,
         "futures_id": FUTURES_ID, "data_date": latest.strftime("%Y/%m/%d"),
         "previous_date": previous.strftime("%Y/%m/%d") if previous is not None else "",
         "investors": investors,
@@ -5865,7 +5876,7 @@ def _tpex_candidate_days(count: int) -> List[datetime]:
 def sync_tpex_institutional(max_requests: int = 30, days: int = INST_CHART_DAYS,
                             log: Optional[Callable[[str], None]] = None) -> int:
     """背景補上櫃法人歷史（新到舊，每輪最多 max_requests 次）；回傳這輪抓了幾天。"""
-    fetched = 0
+    fetched, errors = 0, 0
     if not _TPEX_INST_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -5879,16 +5890,30 @@ def sync_tpex_institutional(max_requests: int = 30, days: int = INST_CHART_DAYS,
             try:
                 _tpex_inst_fetch(day)
             except Exception as exc:
+                errors += 1
                 if log:
                     log(f"上櫃三大法人補資料失敗｜{day:%Y-%m-%d}｜{type(exc).__name__}: {exc}")
-                break                                       # 來源有問題：這輪先停
+                if errors >= 3:
+                    break                                   # 連續出錯：來源有問題，這輪先停
+                continue
             fetched += 1
             time.sleep(0.3)
     finally:
         _TPEX_INST_LOCK.release()
-    if fetched and log:
-        log(f"上櫃三大法人｜本輪補 {fetched} 天")
+    if (fetched or errors) and log:
+        log(f"上櫃三大法人｜已有 {tpex_inst_days_available(days)}/{days} 個交易日｜本輪補 {fetched} 天｜失敗 {errors}")
     return fetched
+
+
+TPEX_INST_KICK = threading.Event()        # 會員查到缺資料時叫醒背景補資料執行緒
+
+
+def tpex_inst_days_available(days: int = INST_CHART_DAYS) -> int:
+    count = 0
+    for day in _tpex_candidate_days(days):
+        if local_market_cache.get_state(f"tpex_inst:{day.strftime('%Y-%m-%d')}"):
+            count += 1
+    return min(count, days)
 
 
 def _tpex_inst_daily(days: int) -> Tuple[Dict[str, Dict[str, float]], int]:
@@ -5910,6 +5935,8 @@ def _tpex_inst_daily(days: int) -> Tuple[Dict[str, Dict[str, float]], int]:
             daily[key] = value
         if len(daily) >= days:
             break
+    if missing:
+        TPEX_INST_KICK.set()
     return daily, missing
 
 

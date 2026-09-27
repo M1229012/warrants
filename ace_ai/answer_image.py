@@ -554,11 +554,12 @@ TRADE_COLOR = '#6D28D9'
 TRADE_LEGEND_H = 46
 # 三大法人買賣超面板（照週報主程式 plot_institutional_stacked_bars 的配色與堆疊方式）
 INST_COLORS = (('foreign', '外資', '#7CB5EC'), ('invest', '投信', '#F59E0B'), ('dealer', '自營商', '#9CA3AF'))
-INST_BLOCK_H = 290
+INST_BLOCK_H = 210     # 法人／台指期副圖：緊接在成交量下方
 
 
 def _inst_height(panel: dict) -> int:
-    return INST_BLOCK_H if (panel or {}).get('institutional') else 0
+    panel = panel or {}
+    return INST_BLOCK_H if (panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars') else 0
 
 
 def _trade_height(panel: dict) -> int:
@@ -597,13 +598,14 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
 
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
-                       focus: str = '', unit: str = '張') -> None:
+                       focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
+                       today_label: str = '今日', extra: str = '') -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
     series = [c for c in INST_COLORS if c[0] == focus] or list(INST_COLORS)
     single = len(series) == 1
-    title = f'{series[0][1]}買賣超' if single else '三大法人買賣超'
+    title = title or (f'{series[0][1]}買賣超' if single else '三大法人買賣超')
     text_at(draw, (left, top + 6), title, 22, INK, True)
     last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
     lx = left + font(22, True).getlength(title) + 28
@@ -614,7 +616,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
             draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
         else:
             draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
-        text = f'{"今日" if single else label} {_inst_num(value, unit)}{unit}'
+        text = f'{today_label if single else label} {_inst_num(value, unit)}{unit}'
         draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
         lx += 22 + font(19).getlength(text) + 22
     daily = [None if bar['date'] not in by_date else sum(float(by_date[bar['date']].get(k) or 0) for k, *_ in series)
@@ -624,8 +626,15 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
         if value is not None:
             running += value
         cums.append(running if any(v is not None for v in daily[:len(cums) + 1]) else None)
-    draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
-    draw.text((lx + 30, top + 20), f'累積 {_inst_num(running, unit)}{unit}', font=font(19, True), fill=INK, anchor='lm')
+    if cumulative:
+        draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
+        cum_text = f'累積 {_inst_num(running, unit)}{unit}'
+        draw.text((lx + 30, top + 20), cum_text, font=font(19, True), fill=INK, anchor='lm')
+        lx += 30 + font(19, True).getlength(cum_text) + 22
+    if extra:   # 其他法人今日、近 5／20 日（大盤型態頁不另外放法人卡）
+        room = right - lx
+        text, size = fit(extra, 18, max(80, room), False, 14)
+        draw.text((lx, top + 20), text, font=font(size), fill=MUTED, anchor='lm')
     ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
     mid = (ctop + cbottom) / 2
     half_h = (cbottom - ctop) / 2
@@ -657,7 +666,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     for sx in range(int(left), int(right), 12):
         draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
     cum_peak = max([abs(v) for v in cums if v is not None] + [1.0]) * 1.15
-    points = [(px(i), mid - v / cum_peak * half_h) for i, v in enumerate(cums) if v is not None]
+    points = [(px(i), mid - v / cum_peak * half_h) for i, v in enumerate(cums) if v is not None] if cumulative else []
     if len(points) > 1:
         draw.line(points, fill=ACCENT, width=3)
     if points:
@@ -665,8 +674,9 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
         draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
     edge = half_h / 1.15
     for sign, yy in ((1, mid - edge), (-1, mid + edge)):
-        text_at(draw, (right + 10, yy - 22), f'{sign * peak / 1.15:+,.0f}', 16, MUTED)
-        text_at(draw, (right + 10, yy - 2), f'{sign * cum_peak / 1.15:+,.0f}', 16, ACCENT)
+        text_at(draw, (right + 10, yy - 22 if cumulative else yy - 12), f'{sign * peak / 1.15:+,.0f}', 16, MUTED)
+        if cumulative:
+            text_at(draw, (right + 10, yy - 2), f'{sign * cum_peak / 1.15:+,.0f}', 16, ACCENT)
     text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
     axis_y = cbottom + 4
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
@@ -678,6 +688,70 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
 def _inst_num(value: float, unit: str) -> str:
     """張：整數；億：一位小數（全市場一天常是幾十到幾百億）。"""
     return f'{value:+,.1f}' if unit == '億' else f'{value:+,.0f}'
+
+
+def draw_futures(draw, top: float, left: float, right: float, px, step: float, bars: list, futures: dict) -> None:
+    """台指期淨未平倉（和 K 線同一組日期）：柱＝每日增減（紅＝淨多增加／空單減少、綠＝淨空增加），金線＝淨未平倉口數。
+    淨未平倉是「存量」，每天都差不多大，直接畫存量柱看不出變化，所以柱改畫增減、存量用線。"""
+    key = futures.get('focus', 'foreign')
+    by_date = {r['date']: r.get(key) for r in futures.get('rows') or [] if r.get(key) is not None}
+    levels = [by_date.get(bar['date']) for bar in bars]
+    changes, prev = [], None
+    for value in levels:
+        changes.append(None if value is None or prev is None else value - prev)
+        prev = value if value is not None else prev
+    known = [v for v in levels if v is not None]
+    title = f"{futures.get('label', '外資')}台指期淨未平倉"
+    text_at(draw, (left, top + 6), title, 22, INK, True)
+    lx = left + font(22, True).getlength(title) + 28
+    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
+    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
+    last_change = next((c for c in reversed(changes) if c is not None), None)
+    text = '每日增減' + (f' 最新 {last_change:+,.0f}口' if last_change is not None else '')
+    draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
+    lx += 22 + font(19).getlength(text) + 22
+    if known:
+        draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
+        level = known[-1]
+        text = f"淨未平倉 {'淨多' if level >= 0 else '淨空'} {abs(level):,.0f}口"
+        draw.text((lx + 30, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
+        lx += 30 + font(19, True).getlength(text) + 22
+    if futures.get('extra'):
+        text, size = fit(futures['extra'], 18, max(80, right - lx), False, 14)
+        draw.text((lx, top + 20), text, font=font(size), fill=MUTED, anchor='lm')
+    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
+    mid, half_h = (ctop + cbottom) / 2, (cbottom - ctop) / 2
+    ticks = _date_ticks(bars, step)
+    for i in ticks:
+        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
+    for sx in range(int(left), int(right), 12):
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
+    peak = max([abs(c) for c in changes if c is not None] + [1.0]) * 1.15
+    for i, change in enumerate(changes):
+        if not change:
+            continue
+        x, half = px(i), max(1, step * .34)
+        h = abs(change) / peak * half_h
+        draw.rectangle((x - half, mid - h if change > 0 else mid, x + half, mid if change > 0 else mid + h),
+                       fill=UP if change > 0 else DOWN)
+    if known:
+        lo, hi = min(known), max(known)
+        pad = max((hi - lo) * 0.12, abs(hi) * 0.01, 1.0)
+        lo, hi = lo - pad, hi + pad
+        ly = lambda v: cbottom - (v - lo) / (hi - lo) * (cbottom - ctop)
+        points = [(px(i), ly(v)) for i, v in enumerate(levels) if v is not None]
+        if len(points) > 1:
+            draw.line(points, fill=ACCENT, width=3)
+        ex, ey = points[-1]
+        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+        text_at(draw, (right + 10, ctop - 8), f'{hi:+,.0f}', 16, ACCENT)
+        text_at(draw, (right + 10, cbottom - 14), f'{lo:+,.0f}', 16, ACCENT)
+    text_at(draw, (right + 10, mid - 10), f'±{peak / 1.15:,.0f}', 16, MUTED)
+    axis_y = cbottom + 4
+    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
+    for i in ticks:
+        label_x = max(left + 26, min(px(i), right - 26))
+        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
 
 def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
@@ -1103,16 +1177,20 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                 segment.append((px(i), vy(value)))
         if len(segment) > 1:
             draw.line(segment, fill=mv_color, width=2)
+    inst_h = _inst_height(panel)
+    futures = panel.get('futures') or {}
+    if panel.get('institutional'):
+        draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
+                           panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
+                           extra=panel.get('institutional_extra', ''))
+    elif inst_h:
+        draw_futures(draw, vbottom + 14, left, right, px, step, bars, futures)
     legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
-    text_at(draw, (left, vbottom + 18), legend + '  /  虛線：布林軌道', 18, MUTED)
+    text_at(draw, (left, vbottom + inst_h + 18), legend + '  /  虛線：布林軌道', 18, MUTED)
     state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
     for i, line in enumerate(wrap(state, 20, CONTENT - 80)[:2]):
-        text_at(draw, (left, vbottom + 54 + i * 28), line, 20, INK)
-    below = y + CHART_HEIGHT + extra
-    if panel.get('institutional'):
-        draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'],
-                           panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'))
-        below += INST_BLOCK_H
+        text_at(draw, (left, vbottom + inst_h + 54 + i * 28), line, 20, INK)
+    below = y + CHART_HEIGHT + extra + inst_h
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
         below += _flow_height(panel)
