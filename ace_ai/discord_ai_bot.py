@@ -215,7 +215,8 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "win_rate": ("勝率", "績效", "歷史表現", "表現", "報酬率", "準不準", "準確"),
     "rank": ("排行", "排名", "前幾", "最準"),
     "volume": ("爆量", "量能", "均量", "放量", "量縮", "量增", "帶量", "窒息量"),
-    "futures": ("台指期", "期貨", "未平倉", "空單", "多單", "三大法人期貨", "外資期貨"),
+    "futures": ("台指期", "期貨", "未平倉", "空單", "多單", "三大法人期貨", "外資期貨", "小台", "微台", "散戶多空比",
+                "散戶多單", "散戶空單"),
     "news": ("新聞", "消息", "題材", "公告", "營收", "法說", "重訊", "利多", "利空"),
     "history": ("過去", "歷史", "以前", "之前", "相比", "比較", "對比"),
     "recent_trades": ("買什麼", "在買", "買了", "最近買", "賣什麼", "在賣", "操作", "進出", "布局", "佈局"),
@@ -942,7 +943,7 @@ def futures_extra(data: Dict[str, Any], focus: str) -> str:
     return "｜".join(others) + " 口" if others else ""
 
 
-def futures_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。"""
     items = []
     for x in data.get("investors") or []:
@@ -954,6 +955,15 @@ def futures_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
                 {"type": "stats", "items": [{"label": f"{i['label']}｜{i['sub']}" if i["sub"] else i["label"], "value": i["value"]}
                                             for i in items]},
                 {"type": "note", "text": "※ 未平倉含現貨避險部位，不能單獨當作多空訊號；K 線下方紅柱＝淨多增加（空單減少）、綠柱＝淨空增加，金線＝淨未平倉。"}]
+    if retail:
+        items = []
+        for c in retail.get("contracts") or []:
+            prev = c.get("ratio_prev_pct")
+            change = f"｜較前日 {c['ratio_pct'] - prev:+.2f}" if prev is not None else ""
+            items.append({"label": f"{c['name']}散戶多空比{change}",
+                          "value": f"{c['ratio_pct']:+.2f}%（多 {c['retail_long']:,}／空 {c['retail_short']:,}）"})
+        sections[-1:-1] = [{"type": "stats", "items": items}]
+        sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（藍線＝微台、柱＝小台）。"
     return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
 
 
@@ -1366,6 +1376,7 @@ class QueryRouter:
             plan = QueryPlan(route="rule_futures", need_final_llm=bool(
                 _INSTITUTIONAL_ANALYSIS_RE.search(parsed.original or "") or analysis))
             plan.add("get_futures_positions")
+            plan.add("get_retail_futures")          # 小台／微台散戶多空比（第二張副圖＋卡片一列）
             return plan
         if parsed.stocks and ("cost" in intents or not other_categories):
             if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
@@ -2270,6 +2281,8 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
                                           "near_expiry_holdings", "definition_note", "store_date")}
         data["groups"] = [{**{k: g.get(k) for k in ("label", "event_codes", "buy_amount_text", "remaining_text", "spot", "sigma_pct")},
                            "warrants": [{k: w.get(k) for k in keep} for w in g.get("warrants") or []]} for g in groups]
+    elif name in ("get_retail_futures", "get_futures_positions"):
+        data["rows"] = (data.get("rows") or [])[-5:]
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -2365,7 +2378,8 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
                              "summary 一句說接下來要留意什麼。")
 
 
-FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。")
+FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。"
+                       "get_retail_futures＝小台／微台散戶多空比（散戶＝全市場未平倉扣掉三大法人），只陳述比例、散戶多單／空單口數與前一日變化，不可當成反向指標下結論。")
 
 
 def build_final_prompt(payload: Dict[str, Any]) -> str:
@@ -2958,6 +2972,15 @@ def format_futures(data: Dict[str, Any]) -> str:
     return chr(10).join(lines)
 
 
+def format_retail_futures(data: Dict[str, Any]) -> str:
+    lines = [f"**小台／微台散戶多空比｜{data.get('data_date', '')}**"]
+    for c in data.get("contracts") or []:
+        lines.append(f"・{c['name']}：{c['ratio_pct']:+.2f}%（散戶多單 {c['retail_long']:,}、空單 {c['retail_short']:,}，"
+                     f"全市場未平倉 {c['open_interest']:,} 口）")
+    lines.append("※ 散戶＝全市場未平倉扣掉三大法人，僅供參考。")
+    return chr(10).join(lines)
+
+
 def format_volume_profile(d: Dict[str, Any]) -> str:
     window = d.get("analysis_window") or {}
     lines = [f"📊 大量區（{window.get('start')}～{window.get('end')}，{window.get('trading_days')} 根日K）"]
@@ -3142,6 +3165,7 @@ FORMATTERS = {
     "get_stock_overview": format_overview,
     "get_technical_analysis": format_technical,
     "get_futures_positions": format_futures,
+    "get_retail_futures": format_retail_futures,
     "get_market_breadth": format_market_breadth,
     "get_index_contribution": format_index_contribution,
     "get_volume_profile": format_volume_profile,
@@ -3426,6 +3450,8 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
             add(f"追蹤分點 A～E 事件截至 {d['data_latest_event_date']}")
         elif r.name in ("get_branch_event_window", "get_branch_warrant_detail") and d.get("period_start"):
             add(f"權證 A～E 事件 {d['period_start']}～{d['period_end']}")
+        elif r.name == "get_retail_futures" and d.get("data_date"):
+            add(f"散戶多空比截至 {d['data_date']}")
         elif r.name == "get_market_institutional" and d.get("data_date"):
             add(f"三大法人（{'上櫃' if d.get('market') == 'tpex' else '上市'}）截至 {d['data_date']}（收盤後更新）")
         elif r.name == "get_spot_branch_flow" and d.get("data_date"):
@@ -3439,7 +3465,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
 CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional", "rule_futures",
                          "rule_market_institutional", "rule_branch_position", "rule_branch_stock"))
 # 圖上已經畫出來的資料：AI 不在時不必再用文字重打一次
-DRAWN_TOOLS = frozenset(("get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_pattern_scorecard",
+DRAWN_TOOLS = frozenset(("get_retail_futures", "get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_pattern_scorecard",
                          "get_cost_position_context", "get_institutional_flow", "get_market_institutional",
                          "get_sheet_stock_chips", "get_branch_stock_position", "get_branch_stock_history",
                          "detect_current_branch_events", "get_spot_chip_summary", "get_index_contribution",
@@ -5604,8 +5630,9 @@ class AceQueryEngine:
                 panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart),
                                "hide_text": plan.route == "rule_market_institutional"})
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
+        retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
         if futures_data and plan.route == "rule_futures":
-            panels.append({"branch_card": futures_card(futures_data, question), "hide_text": True})
+            panels.append({"branch_card": futures_card(futures_data, question, retail_data), "hide_text": True})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
             if flow:
@@ -5649,6 +5676,8 @@ class AceQueryEngine:
                 panel["futures"] = {"rows": [r for r in futures_data.get("rows") or [] if r.get("date") in dates],
                                     "focus": _INVESTOR_KEYS[focus], "label": focus,
                                     "extra": "" if plan.route == "rule_futures" else futures_extra(futures_data, focus)}
+                if retail_data:
+                    panel["retail"] = dict(retail_data, rows=[r for r in retail_data.get("rows") or [] if r.get("date") in dates])
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]

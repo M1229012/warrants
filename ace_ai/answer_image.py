@@ -579,8 +579,13 @@ def _flow_height(panel: dict) -> int:
     return FLOW_BLOCK_H if panel.get('branch_flow') and panel.get('bars') else 0
 
 
+def _retail_height(panel: dict) -> int:
+    panel = panel or {}
+    return INST_BLOCK_H if (panel.get('retail') or {}).get('rows') and panel.get('bars') else 0
+
+
 def panel_height(panel: dict) -> int:
-    return (CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel)
+    return (CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel)
             + _flow_height(panel) + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
 
@@ -747,6 +752,61 @@ def draw_futures(draw, top: float, left: float, right: float, px, step: float, b
         text_at(draw, (right + 10, ctop - 8), f'{hi:+,.0f}', 16, ACCENT)
         text_at(draw, (right + 10, cbottom - 14), f'{lo:+,.0f}', 16, ACCENT)
     text_at(draw, (right + 10, mid - 10), f'±{peak / 1.15:,.0f}', 16, MUTED)
+    axis_y = cbottom + 4
+    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
+    for i in ticks:
+        label_x = max(left + 26, min(px(i), right - 26))
+        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
+
+
+RETAIL_LINE = '#2563EB'
+
+
+def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: float, bars: list, retail: dict) -> None:
+    """散戶多空比（％，和 K 線同一組日期）：柱＝小台（紅＝散戶偏多、綠＝散戶偏空），藍線＝微台；共用 0 軸與右側刻度。"""
+    rows = {r['date']: r for r in retail.get('rows') or []}
+    mtx = [(rows.get(bar['date']) or {}).get('MTX') for bar in bars]
+    tmf = [(rows.get(bar['date']) or {}).get('TMF') for bar in bars]
+    latest = {c['futures_id']: c for c in retail.get('contracts') or []}
+    title = '散戶多空比'
+    text_at(draw, (left, top + 6), title, 22, INK, True)
+    lx = left + font(22, True).getlength(title) + 28
+    m, t = latest.get('MTX') or {}, latest.get('TMF') or {}
+    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
+    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
+    text = f"小台 {m.get('ratio_pct', 0):+.2f}%"
+    draw.text((lx + 22, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
+    lx += 22 + font(19, True).getlength(text) + 22
+    draw.line((lx, top + 20, lx + 22, top + 20), fill=RETAIL_LINE, width=3)
+    text = f"微台 {t.get('ratio_pct', 0):+.2f}%"
+    draw.text((lx + 30, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
+    lx += 30 + font(19, True).getlength(text) + 22
+    note, size = fit('散戶＝全市場未平倉－三大法人', 18, max(80, right - lx), False, 14)
+    draw.text((lx, top + 20), note, font=font(size), fill=MUTED, anchor='lm')
+    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
+    mid, half_h = (ctop + cbottom) / 2, (cbottom - ctop) / 2
+    ticks = _date_ticks(bars, step)
+    for i in ticks:
+        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
+    for sx in range(int(left), int(right), 12):
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
+    peak = max([abs(v) for v in mtx + tmf if v is not None] + [1.0]) * 1.15
+    for i, value in enumerate(mtx):
+        if not value:
+            continue
+        x, half, h = px(i), max(1, step * .34), abs(value) / peak * half_h
+        draw.rectangle((x - half, mid - h if value > 0 else mid, x + half, mid if value > 0 else mid + h),
+                       fill=UP if value > 0 else DOWN)
+    points = [(px(i), mid - v / peak * half_h) for i, v in enumerate(tmf) if v is not None]
+    if len(points) > 1:
+        draw.line(points, fill=RETAIL_LINE, width=3)
+    if points:
+        ex, ey = points[-1]
+        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=RETAIL_LINE)
+    edge = half_h / 1.15
+    text_at(draw, (right + 10, mid - edge - 12), f'+{peak / 1.15:.0f}%', 16, MUTED)
+    text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
+    text_at(draw, (right + 10, mid + edge - 12), f'-{peak / 1.15:.0f}%', 16, MUTED)
     axis_y = cbottom + 4
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
     for i in ticks:
@@ -1185,6 +1245,10 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                            extra=panel.get('institutional_extra', ''))
     elif inst_h:
         draw_futures(draw, vbottom + 14, left, right, px, step, bars, futures)
+    retail_h = _retail_height(panel)
+    if retail_h:
+        draw_retail_ratio(draw, vbottom + 14 + inst_h, left, right, px, step, bars, panel['retail'])
+    inst_h += retail_h
     legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
     text_at(draw, (left, vbottom + inst_h + 18), legend + '  /  虛線：布林軌道', 18, MUTED)
     state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])

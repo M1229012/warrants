@@ -755,6 +755,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_futures_positions": "台指期未平倉資料取得失敗",
     "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_market_institutional": "目前全市場三大法人資料取得失敗",
+    "get_retail_futures": "目前散戶多空比資料取得失敗",
     "get_index_contribution": "指數貢獻點數：加權與櫃買各自的拉升 TOP5 與拖累 TOP5（權重 × 漲跌，非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
     "get_index_contribution": "指數貢獻點數計算失敗",
@@ -1955,6 +1956,63 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
         "investors": investors,
         "definition_note": "未平倉口數含現貨避險部位，不能單獨當作多空訊號；僅供參考",
     }
+
+
+RETAIL_FUTURES = (("MTX", "小台"), ("TMF", "微台"))
+
+
+def get_retail_futures(days: int = 0) -> Dict[str, Any]:
+    """小台（MTX）、微台（TMF）散戶多空比（FinMind，和永豐期貨同一套算法，09/24 實測數字完全一致）：
+    散戶多單＝全市場未平倉－三大法人多單；散戶空單＝全市場未平倉－三大法人空單；
+    散戶多空比＝(散戶多單－散戶空單)÷全市場未平倉×100%。全市場未平倉＝一般盤各月份契約加總（價差單不計）。"""
+    days = int(days or INST_CHART_DAYS)
+
+    def build() -> Dict[str, Any]:
+        kf = core()
+        end = taipei_now()
+        start = (end - timedelta(days=int(days * 1.5) + 10)).strftime("%Y-%m-%d")
+        out: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for futures_id, _ in RETAIL_FUTURES:
+            started = time.perf_counter()
+            try:
+                daily = kf._finmind_get_data("TaiwanFuturesDaily", data_id=futures_id, start_date=start,
+                                             end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+                inst = kf._finmind_get_data("TaiwanFuturesInstitutionalInvestors", data_id=futures_id, start_date=start,
+                                            end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+                record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+            except Exception as exc:
+                record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+                raise ToolDataError("散戶多空比資料暫時無法取得") from exc
+            oi: Dict[str, float] = defaultdict(float)
+            for row in daily.to_dict("records"):
+                if str(row.get("trading_session")) == "position" and "/" not in str(row.get("contract_date") or ""):
+                    oi[str(row.get("date"))[:10]] += float(row.get("open_interest") or 0)
+            longs: Dict[str, float] = defaultdict(float)
+            shorts: Dict[str, float] = defaultdict(float)
+            for row in inst.to_dict("records"):
+                day = str(row.get("date"))[:10]
+                longs[day] += float(row.get("long_open_interest_balance_volume") or 0)
+                shorts[day] += float(row.get("short_open_interest_balance_volume") or 0)
+            for day, total in oi.items():
+                if total > 0 and day in longs:
+                    rl, rs = total - longs[day], total - shorts[day]
+                    out.setdefault(day, {})[futures_id] = {"long": rl, "short": rs, "oi": total,
+                                                           "ratio": round((rl - rs) / total * 100, 2)}
+        dates = [d for d in sorted(out) if all(f in out[d] for f, _ in RETAIL_FUTURES)][-days:]
+        if not dates:
+            raise ToolDataError("散戶多空比沒有有效日期")
+        latest = out[dates[-1]]
+        return {
+            "data_date": dates[-1].replace("-", "/"),
+            "contracts": [{"futures_id": f, "name": n, "retail_long": int(latest[f]["long"]),
+                           "retail_short": int(latest[f]["short"]), "open_interest": int(latest[f]["oi"]),
+                           "ratio_pct": latest[f]["ratio"],
+                           "ratio_prev_pct": out[dates[-2]][f]["ratio"] if len(dates) > 1 else None}
+                          for f, n in RETAIL_FUTURES],
+            "rows": [{"date": d.replace("-", "/"), **{f: out[d][f]["ratio"] for f, _ in RETAIL_FUTURES}} for d in dates],
+            "definition_note": "散戶＝全市場未平倉扣掉三大法人；散戶多空比＝(散戶多單－散戶空單)÷全市場未平倉；僅供參考，不作多空判斷",
+        }
+    return _cached(f"retail_futures:{days}:{taipei_now():%Y-%m-%d-%H}", 1800, build)
 
 
 # 已確認來源沒有更新資料的股票（停牌等）：code -> (日期, 本地最後一根 K 棒日期)，當天不再重抓。
@@ -6004,6 +6062,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_futures_positions": get_futures_positions,
     "get_institutional_flow": get_institutional_flow,
     "get_market_institutional": get_market_institutional,
+    "get_retail_futures": get_retail_futures,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
     "get_warrant_branch": get_warrant_branch,
