@@ -1837,9 +1837,17 @@ _AI_GATE = threading.local()   # 每題：allowed＝還能用 AI 解讀、used�
 
 def _record_gemini_usage(model: str, ok: bool, in_tokens: int = 0, out_tokens: int = 0) -> None:
     """每次實際打出去的 Gemini 請求都記到 SQLite（台北日期×模型）：估算額度與付費成本用。"""
-    day = tools.taipei_now().strftime("%Y-%m-%d")
-    local_market_cache.accumulate_state(f"gemini_usage:{day}", {model: {
-        "calls": 1, "ok": 1 if ok else 0, "fail": 0 if ok else 1, "in": int(in_tokens or 0), "out": int(out_tokens or 0)}})
+    try:
+        day = tools.taipei_now().strftime("%Y-%m-%d")
+        local_market_cache.accumulate_state(f"gemini_usage:{day}", {model: {
+            "calls": 1, "ok": 1 if ok else 0, "fail": 0 if ok else 1, "in": int(in_tokens or 0), "out": int(out_tokens or 0)}})
+    except Exception as exc:   # 只是統計：寫不進去就記一次 Log，回答照常
+        if not _USAGE_WARNED:
+            _USAGE_WARNED.append(1)
+            print(f"⚠️ Gemini 用量紀錄寫入失敗（回答不受影響）｜{type(exc).__name__}: {exc}", flush=True)
+
+
+_USAGE_WARNED: List[int] = []
 
 
 class GeminiGateway:
@@ -3876,6 +3884,35 @@ def quota_exempt_ids() -> Set[str]:
     return ids
 
 
+# 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
+REQUIRED_MODULE_API = {
+    "local_market_cache": ("accumulate_state", "recent_states"),
+    "discord_access": ("chip_needs_choice", "require_sector"),
+    "warrant_ai_tools": ("get_market_institutional",),
+    "answer_image": ("wrap_cell",),
+    "weekly_pick": ("layout_card", "verify_layout"),
+    "market_data": ("RECENT_DAYS",),
+    "warrant_store": ("StoreShrunk",),
+    "spot_chip": ("_official_trading_dates",),
+}
+
+
+def module_version_problems() -> List[str]:
+    """回傳「檔案.py 缺少 a、b」清單；空清單＝全部是同一批。"""
+    import importlib
+    problems = []
+    for name, attrs in REQUIRED_MODULE_API.items():
+        try:
+            module = importlib.import_module(name)
+        except Exception as exc:
+            problems.append(f"{name}.py 無法載入（{type(exc).__name__}）")
+            continue
+        missing = [a for a in attrs if not hasattr(module, a)]
+        if missing:
+            problems.append(f"{name}.py 缺少 {'、'.join(missing)}")
+    return problems
+
+
 def _counts_toward_quota(result: "AnswerResult") -> bool:
     """只有真的算出來的成功分析才計次；回答快取命中、說明、澄清、錯誤、排隊已滿、權限拒絕都不算。"""
     if result.denied_feature or result.cache_hit or result.route == "answer_cache":
@@ -4122,7 +4159,10 @@ def cost_report_lines(days: int = 7) -> List[str]:
     """「/ace 用量」：各模型今日／近 N 日請求與 token、若付費的月費估算；Railway 平均資源與月費估算。"""
     lines: List[str] = []
     prices = _price_table("DISCORD_AI_GEMINI_PRICES", GEMINI_PRICE_DEFAULT)
-    history = local_market_cache.recent_states("gemini_usage", days)
+    try:
+        history = local_market_cache.recent_states("gemini_usage", days)
+    except Exception as exc:
+        return [f"用量與費用｜讀取失敗：{type(exc).__name__}: {exc}"]
     today = tools.taipei_now().strftime("%Y-%m-%d")
     totals: Dict[str, Dict[str, float]] = {}
     for day_data in history.values():
@@ -4142,7 +4182,10 @@ def cost_report_lines(days: int = 7) -> List[str]:
     if not totals:
         lines.append("還沒有紀錄")
     lines.append(f"若全部改付費：約 ${month_cost:.1f}／月（依近 {len(history) or 1} 日平均；單價用 DISCORD_AI_GEMINI_PRICES 調整）")
-    rail = local_market_cache.recent_states("railway_usage", days)
+    try:
+        rail = local_market_cache.recent_states("railway_usage", days)
+    except Exception:
+        rail = {}
     rp = _price_table("DISCORD_AI_RAILWAY_PRICES", RAILWAY_PRICE_DEFAULT)
     samples = sum(float(v.get("samples") or 0) for v in rail.values())
     if samples:
@@ -6583,6 +6626,12 @@ def run_discord_bot(config: BotConfig) -> None:
             f"debug={config.debug}",
             flush=True,
         )
+        stale = module_version_problems()
+        if stale:
+            # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
+            notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
+        else:
+            print("✅ 檔案版本檢查：ace_ai 各檔案是同一批", flush=True)
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
                               attachment=None) -> None:
