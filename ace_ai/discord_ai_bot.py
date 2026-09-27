@@ -3611,6 +3611,18 @@ WEEKLY_DRAFT_MINUTES = max(10, tools._env_int("DISCORD_AI_WEEKLY_DRAFT_MINUTES",
 MEMORY_MAX_ENTRIES = tools._env_int("DISCORD_AI_MEMORY_MAX_ENTRIES", 5000)
 # 使用者把「/ace 族群資金流向」整串打進 /ask 的輸入框時，前綴不能被當成族群名稱。
 _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)\b[:：,，]?\s*", re.IGNORECASE)
+# Discord 參數名稱被一起貼進輸入框：「question: 3006…」「問題：3006…」
+_PARAM_PREFIX_RE = re.compile(r"^\s*(?:question|問題)\s*[:：]\s*", re.IGNORECASE)
+
+
+def strip_command_prefix(question: str) -> str:
+    """拿掉使用者誤貼的「/ask」「/ace」「question:」前綴（可能疊在一起），其餘原樣保留。"""
+    text = str(question or "")
+    while True:
+        cleaned = _PARAM_PREFIX_RE.sub("", _SLASH_PREFIX_RE.sub("", text, count=1), count=1)
+        if cleaned == text:
+            return text
+        text = cleaned
 
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
 # 「是不是只有權值股在動」這類盤面結構問題。
@@ -4407,9 +4419,7 @@ class AceQueryEngine:
             access_policy.require_feature(self._access(), access_policy.FeaturePolicy("ADMIN"))
         started = time.perf_counter()
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
-        prefix = _SLASH_PREFIX_RE.match(question)
-        if prefix:
-            question = _SLASH_PREFIX_RE.sub("", question, count=1)
+        question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
         if admin_mode:
             self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
@@ -6891,6 +6901,7 @@ def run_discord_bot(config: BotConfig) -> None:
         if denied:
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
+        question = strip_command_prefix(question)      # 圖片標題、快取、記憶都用清乾淨的問句
         try:
             access, question = access_policy.resolve_access(interaction.user, config.superuser_ids,
                                                            question, admin_entry=admin_mode,
