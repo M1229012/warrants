@@ -2281,6 +2281,21 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
                                           "near_expiry_holdings", "definition_note", "store_date")}
         data["groups"] = [{**{k: g.get(k) for k in ("label", "event_codes", "buy_amount_text", "remaining_text", "spot", "sigma_pct")},
                            "warrants": [{k: w.get(k) for k in keep} for w in g.get("warrants") or []]} for g in groups]
+    elif name == "get_sheet_stock_chips":
+        # 分點多的股票這份最大（佔整個 prompt 一半以上）：拿掉和文字版重複的原始金額、和狀態重複的 resolution、
+        # 未完成筆數，以及和近期相同的回看金額；圖卡用的是完整資料，不受影響
+        branches = []
+        for branch in data.get("branches") or []:
+            branch = dict(branch)
+            branch["events_recent"] = [{k: (int(v) if k == "warrant_count" and v is not None else v)
+                                        for k, v in event.items() if k not in ("buy_amount", "resolution")}
+                                       for event in branch.get("events_recent") or []]
+            if branch.get("event_buy_amount_lookback_text") == branch.get("event_buy_amount_recent_text"):
+                branch.pop("event_buy_amount_lookback_text", None)
+            branch["event_performance"] = {code: {k: v for k, v in (perf or {}).items() if k != "unresolved_count"}
+                                           for code, perf in (branch.get("event_performance") or {}).items()}
+            branches.append(branch)
+        data["branches"] = branches
     elif name in ("get_retail_futures", "get_futures_positions"):
         data["rows"] = (data.get("rows") or [])[-5:]
     elif name == "get_recent_news":
