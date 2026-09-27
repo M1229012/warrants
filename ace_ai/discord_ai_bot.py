@@ -2516,6 +2516,8 @@ _POSITION_WORD_RE = re.compile(
     r"|(高於|低於)\s*" + _LABELS_GROUP)
 # 同一個子句用「且／並／但」接兩件事時分開核對（「站穩 MA5 且不跌破 MA10」的「不」只管後半句）
 _CONNECTOR_SPLIT_RE = re.compile(r"並且|而且|但是|然而|不過|同時|且|並|但")
+# 條件句的「若／如果…」管到整句結束（跨逗號）：「若量能回升…，且收盤站回MA20，才…」後半句也是假設，不核對
+_CONDITIONAL_RE = re.compile(r"若|如果|一旦|假如|倘若|假設|假使|只要|要是|除非")
 # 條件、否定、未來、過去的句子不是在陳述「現在的位置」，不核對方向，避免誤刪。
 _DIRECTION_SKIP_RE = re.compile(
     r"若|如果|一旦|假如|倘若|假設|需|須|必須|要|能否|是否|未|沒|不|等待|等|觀察|才|可能|恐|會|將|可望|機會|留意|注意|關注|避免|"
@@ -2725,6 +2727,9 @@ class FactSheet:
             return []
         issues = []
         plain = _PAREN_RE.sub("", sentence)
+        conditional = _CONDITIONAL_RE.search(plain)
+        if conditional:
+            plain = plain[:conditional.start()]        # 條件詞之後都是假設；之前的部分照常核對
         clauses = [part for clause in _CLAUSE_SPLIT_RE.split(plain) for part in _CONNECTOR_SPLIT_RE.split(clause)]
         for clause in clauses:
             claims = [(m.start(), m.group(1), m.group(2)) for m in _DIRECTION_RE.finditer(clause)]
