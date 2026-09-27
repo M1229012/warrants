@@ -804,6 +804,12 @@ def _direction(latest: float, sum5: float, sum20: float) -> str:
     return "一致偏買" if signs == {1} else "一致偏賣" if signs == {-1} else "短中期分歧"
 
 
+def _direction_sentence(latest: float, sum5: float, sum20: float) -> str:
+    """和「最近方向」格子同一套判斷：今日、近 5 日、近 20 日同向才算一致。"""
+    word = _direction(latest, sum5, sum20)
+    return {"一致偏買": "，今日與短中期都偏買。", "一致偏賣": "，今日與短中期都偏賣。"}.get(word, "，今日與短中期方向不一致，仍待確認。")
+
+
 def institutional_focus(question: str, data: Dict[str, Any]) -> str:
     """問句只提到一個法人（外資／投信／自營）且不是問三大法人時，回傳該法人名稱。"""
     investors = {x["investor"] for x in data.get("investors") or []}
@@ -853,7 +859,7 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
     word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
     points = [f"{who}今日{word(latest)} {abs(latest):,.0f} 張" + (f"，{_streak_text(streak)}。" if streak else "。"),
               f"近 5 日累積{word(sum5)} {abs(sum5):,.0f} 張，近 20 日累積{word(sum20)} {abs(sum20):,.0f} 張"
-              + ("，短中期方向一致。" if (sum5 > 0) == (sum20 > 0) and sum5 and sum20 else "，短中期方向不同，仍待確認。")]
+              + _direction_sentence(latest, sum5, sum20)]
     sections.append({"type": "points", "items": points})
     sections.append({"type": "note", "text": "※ 交易所公布的外資／投信／自營商買賣超，收盤後才更新；不是券商分點資料。"})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
@@ -865,7 +871,8 @@ def _signed_yi(value: Any) -> str:
     return f"{value:+,.2f}" if value else "0"
 
 
-def market_institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, Any]:
+def market_institutional_card(data: Dict[str, Any], question: str = "", with_chart: bool = False,
+                              compact: bool = False) -> Dict[str, Any]:
     """全市場（上市）三大法人：今日四格、近 5／20 日與連續、近 20 日柱狀；只問單一法人時以該法人為主。單位億元。"""
     investors = {x["investor"]: x for x in data.get("investors") or []}
     asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
@@ -890,19 +897,29 @@ def market_institutional_card(data: Dict[str, Any], question: str = "") -> Dict[
             {"label": f"{who}近 5 日", "value": _signed_yi(sum5), "tone": "signed"},
             {"label": f"{who}近 20 日", "value": _signed_yi(sum20), "tone": "signed"},
             {"label": "連續", "value": _streak_text(streak), "tone": "ink"},
-            {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]},
-        {"type": "vbars", "title": f"{who}近 20 日買賣超（億元）",
-         "items": [{"label": str(r.get("date", ""))[5:], "value": v, "text": f"{v:+,.2f} 億"} for r, v in zip(rows, series)]}]
+            {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]}]
+    if not with_chart:     # 沒有 K 線副圖時才畫小柱狀圖（有副圖就重複了）
+        sections.append({"type": "vbars", "title": f"{who}近 20 日買賣超（億元）",
+                         "items": [{"label": str(r.get("date", ""))[5:], "value": v, "text": f"{v:+,.2f} 億"}
+                                   for r, v in zip(rows, series)]})
+    if compact:
+        sections[2:] = [{"type": "note", "text": f"{who}近 5 日 {_signed_yi(sum5)} 億｜近 20 日 {_signed_yi(sum20)} 億｜"
+                                                  f"{_streak_text(streak)}｜{_direction(latest, sum5, sum20)}"}]
     word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
-    sections.append({"type": "points", "items": [
+    sections.append({"type": "points", "items": [] if compact else [
         f"{who}今日{word(latest)} {abs(latest):,.2f} 億元" + (f"，{_streak_text(streak)}。" if streak else "。"),
         f"近 5 日累積{word(sum5)} {abs(sum5):,.2f} 億元，近 20 日累積{word(sum20)} {abs(sum20):,.2f} 億元"
-        + ("，短中期方向一致。" if sum5 and sum20 and (sum5 > 0) == (sum20 > 0) else "，短中期方向不同，仍待確認。")]})
-    note = "※ 交易所公布的上市（集中市場）三大法人買賣超金額，收盤後才更新；外資含外資自營商、自營商含避險。"
-    if re.search(r"櫃買|上櫃|OTC", str(question), re.I):
-        note += "上櫃三大法人目前沒有資料，這裡只有上市。"
+        + _direction_sentence(latest, sum5, sum20)]})
+    tpex = data.get("market") == "tpex"
+    scope = "上櫃" if tpex else "上市"
+    note = (f"※ {scope}三大法人買賣超金額，收盤後更新" if compact else
+            f"※ 交易所公布的{scope}{'' if tpex else '（集中市場）'}三大法人買賣超金額，收盤後才更新；"
+            + ("外資不含外資自營商（已計入自營商）。" if tpex else "外資含外資自營商、自營商含避險。"))
+    if int(data.get("missing_days") or 0) > 3:
+        note += f"近期歷史資料補齊中（目前 {len(data.get('rows') or [])} 個交易日）。"
     sections.append({"type": "note", "text": note})
-    return {"branch": "全市場三大法人（上市）", "tags": [focus or "三大法人"], "label": "法人籌碼", "sections": sections}
+    return {"branch": f"全市場三大法人（{'上櫃' if data.get('market') == 'tpex' else '上市'}）", "tags": [focus or "三大法人"],
+            "label": "法人籌碼", "sections": sections}
 
 
 def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
@@ -2260,7 +2277,7 @@ def question_focus(question: str) -> List[str]:
 FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
                      "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
                      "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
-                     "明講偏買或偏賣，並註明是收盤後資料；全市場三大法人＝用 get_market_institutional（上市、單位億元，不含上櫃）"
+                     "明講偏買或偏賣，並註明是收盤後資料；全市場三大法人＝用 get_market_institutional（上市或上櫃看 scope，單位億元）"
                      "說外資／投信／自營商最新一日、近5日、近20日買賣超金額與連買／連賣天數，不可換算成張數；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
                      "權證分點＝整張解讀都以權證分點為主：answer 直接說目前分點籌碼偏買、偏賣或已大多出清；why 說明哪些分點、觸發哪個 A～E 事件、"
                      "買進金額、後續是出清還是仍持有、分點的歷史事件勝率，以及分點買在什麼價位或量區附近；技術面最多一句當背景，不可整段改寫成技術面分析。"
@@ -3306,7 +3323,7 @@ def format_market_institutional(data: Dict[str, Any]) -> str:
     def yi(value: Any) -> str:
         value = float(value or 0)
         return f"{'買超' if value > 0 else '賣超' if value < 0 else '持平'} {abs(value):,.2f} 億元"
-    lines = [f"【全市場三大法人（上市）】資料日期 {data.get('data_date', '-')}"]
+    lines = [f"【全市場三大法人（{'上櫃' if data.get('market') == 'tpex' else '上市'}）】資料日期 {data.get('data_date', '-')}"]
     for x in data.get("investors") or []:
         streak = int(x.get("streak_days") or 0)
         tail = f"｜連買 {streak} 天" if streak > 0 else f"｜連賣 {-streak} 天" if streak < 0 else ""
@@ -3367,7 +3384,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
         elif r.name in ("get_branch_event_window", "get_branch_warrant_detail") and d.get("period_start"):
             add(f"權證 A～E 事件 {d['period_start']}～{d['period_end']}")
         elif r.name == "get_market_institutional" and d.get("data_date"):
-            add(f"三大法人（上市）截至 {d['data_date']}（收盤後更新）")
+            add(f"三大法人（{'上櫃' if d.get('market') == 'tpex' else '上市'}）截至 {d['data_date']}（收盤後更新）")
         elif r.name == "get_spot_branch_flow" and d.get("data_date"):
             add(f"現股分點截至 {d['data_date']}（每日前段分點近似）")
             if d.get("price_date"):
@@ -3612,6 +3629,13 @@ def pattern_asked(parsed: "ParsedQuestion") -> bool:
 
 # 全市場三大法人：沒有指定個股（或只講大盤／台股）又問外資、投信、自營商
 _MARKET_INST_RE = re.compile(r"外資|投信|自營商|三大法人|法人")
+
+
+def market_of(parsed: "ParsedQuestion") -> str:
+    codes = [c for c, _ in parsed.stocks]
+    if codes == ["TPEX"] or (not codes and re.search(r"櫃買|上櫃|OTC", parsed.original or "", re.I)):
+        return "tpex"
+    return "twse"
 
 
 def market_institutional_wanted(parsed: "ParsedQuestion") -> bool:
@@ -5411,7 +5435,11 @@ class AceQueryEngine:
             # 「外資今天買超多少」「今天三大法人買賣超」：全市場（上市）三大法人；只問數字不呼叫 AI
             plan = QueryPlan(route="rule_market_institutional",
                              need_final_llm=bool(_INSTITUTIONAL_ANALYSIS_RE.search(question) or "analysis" in parsed.intents))
-            plan.add("get_market_institutional")
+            # 上市配加權指數、上櫃配櫃買指數 K 線（70 根），副圖畫法人買賣超、日期對齊
+            market = market_of(parsed)
+            plan.add("get_market_institutional", market=market)
+            index = "TPEX" if market == "tpex" else "TAIEX"
+            parsed.stocks = [(index, tools.INDEX_CODES[index])]
         elif ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
                 and stocks_only and len(stocks_only) == len(parsed.stocks) and not parsed.sector
                 and not _INSTITUTIONAL_ANALYSIS_RE.search(question)):
@@ -5421,7 +5449,8 @@ class AceQueryEngine:
         else:
             plan = self.router.plan(parsed, stats)
             if market_inst and plan.route == "rule_pattern":
-                plan.add("get_market_institutional")   # 「大盤型態跟外資動向」：大盤型態頁＋全市場三大法人
+                # 「大盤型態跟外資動向」「櫃買型態跟投信」：指數型態頁＋同一個市場的三大法人
+                plan.add("get_market_institutional", market=market_of(parsed))
         if plan.route == "help":
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
@@ -5524,7 +5553,10 @@ class AceQueryEngine:
                 panels.append(spot_panel)
         market_flow = next((r.data for r in results if r.ok and r.name == "get_market_institutional"), None)
         if market_flow:
-            panels.append({"branch_card": market_institutional_card(market_flow, question),
+            index = "TPEX" if market_flow.get("market") == "tpex" else "TAIEX"
+            has_chart = any(p.get("stock_code") == index and p.get("bars") for p in panels)
+            panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart,
+                                                                    compact=plan.route != "rule_market_institutional"),
                            "hide_text": plan.route == "rule_market_institutional"})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
@@ -5557,6 +5589,9 @@ class AceQueryEngine:
         for panel in panels:
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"
                          and r.data.get("stock_code") == panel.get("stock_code")), None)
+            if flow is None and market_flow and panel.get("stock_code") == ("TPEX" if market_flow.get("market") == "tpex" else "TAIEX"):
+                flow = market_flow
+                panel["institutional_unit"] = "億"
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
@@ -5567,7 +5602,7 @@ class AceQueryEngine:
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
-                if card and (getattr(parsed, "spot_combo", False) or with_chips):
+                if card and (getattr(parsed, "spot_combo", False) or with_chips or market_flow):
                     card = dict(card, compact=True)   # 型態＋籌碼整合頁：評分卡精簡（無均線扣抵、價位只留最近 1＋1）
                 if card:
                     panel["scorecard"] = card
@@ -5627,6 +5662,10 @@ class AceQueryEngine:
             first = re.split(r"(?<=[。！？])", str(ai_card.get("why") or ""), maxsplit=1)[0]
             ai_card = dict(ai_card, why=first, scenarios=[])
         if ai_card:
+            for panel in panels:
+                card = panel.get("branch_card") or {}
+                if card.get("label") == "法人籌碼":
+                    card["sections"] = [x for x in card.get("sections") or [] if x.get("type") != "points"]
             panels.append({"ai_card": ai_card})
         elapsed = time.perf_counter() - started
         self.log(
@@ -6389,6 +6428,10 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                     outcome = local_market_cache.daily_maintenance(today)
                     if not (outcome or {}).get("failed"):
                         _db_maintenance_day[0] = today
+            try:
+                tools.sync_tpex_institutional(log=lambda m: print(f"🏦 {m}", flush=True))
+            except Exception as exc:
+                print(f"⚠️ 上櫃三大法人補資料略過｜{type(exc).__name__}: {exc}", flush=True)
             # 當天資料出來前被查過的現股分點：富邦一更新就先抓當天那頁（只用富邦，不佔 FinMind／富果額度）
             try:
                 spot_chip.prefetch_today(now=tools.taipei_now(), log=lambda m: print(m, flush=True))

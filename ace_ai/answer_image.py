@@ -597,7 +597,7 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
 
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
-                       focus: str = '') -> None:
+                       focus: str = '', unit: str = '張') -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
@@ -614,7 +614,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
             draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
         else:
             draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
-        text = f'{"今日" if single else label} {value:+,.0f}張'
+        text = f'{"今日" if single else label} {_inst_num(value, unit)}{unit}'
         draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
         lx += 22 + font(19).getlength(text) + 22
     daily = [None if bar['date'] not in by_date else sum(float(by_date[bar['date']].get(k) or 0) for k, *_ in series)
@@ -625,7 +625,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
             running += value
         cums.append(running if any(v is not None for v in daily[:len(cums) + 1]) else None)
     draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
-    draw.text((lx + 30, top + 20), f'累積 {running:+,.0f}張', font=font(19, True), fill=INK, anchor='lm')
+    draw.text((lx + 30, top + 20), f'累積 {_inst_num(running, unit)}{unit}', font=font(19, True), fill=INK, anchor='lm')
     ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
     mid = (ctop + cbottom) / 2
     half_h = (cbottom - ctop) / 2
@@ -673,6 +673,11 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     for i in ticks:
         label_x = max(left + 26, min(px(i), right - 26))
         draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
+
+
+def _inst_num(value: float, unit: str) -> str:
+    """張：整數；億：一位小數（全市場一天常是幾十到幾百億）。"""
+    return f'{value:+,.1f}' if unit == '億' else f'{value:+,.0f}'
 
 
 def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
@@ -1106,7 +1111,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     below = y + CHART_HEIGHT + extra
     if panel.get('institutional'):
         draw_institutional(draw, below, left, right, px, step, bars, panel['institutional'],
-                           panel.get('institutional_focus', ''))
+                           panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'))
         below += INST_BLOCK_H
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])

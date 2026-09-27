@@ -929,6 +929,8 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                          "railway_usage:" + cut(USAGE_KEEP_DAYS)),
                         ("user_quota", "DELETE FROM kv WHERE key GLOB 'user_quota:*' AND key < ?",
                          "user_quota:" + cut(2)),
+                        ("tpex_inst", "DELETE FROM kv WHERE key GLOB 'tpex_inst:*' AND key < ?",
+                         "tpex_inst:" + cut(200)),
                         ("spot_branch_daily", "DELETE FROM spot_branch_daily WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         ("spot_branch_days", "DELETE FROM spot_branch_days WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         # 舊版每 5 分鐘整包重寫的 JSON（改成資料表後就不再使用）；當天的先留著給當天讀

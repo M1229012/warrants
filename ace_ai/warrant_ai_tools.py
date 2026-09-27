@@ -5812,9 +5812,115 @@ def _streak(values: List[float]) -> int:
     return count * sign
 
 
-def get_market_institutional(days: int = 20) -> Dict[str, Any]:
-    """全市場（上市、集中市場）三大法人買賣超金額（FinMind TaiwanStockTotalInstitutionalInvestors，單位：億元）。
-    外資＝外資及陸資＋外資自營商；自營商＝自行買賣＋避險。收盤後才更新；不含上櫃。"""
+# 上櫃三大法人：TPEx 只提供「單日」彙總（一次一天），所以每天抓一次存本地 kv（tpex_inst:日期），
+# 背景慢慢補齊近 90 個交易日；會員查詢時只補最近幾天。外資自營商已含在自營商合計裡（TPEx 註明），外資用「不含自營商」。
+TPEX_INST_URL = "https://www.tpex.org.tw/www/zh-tw/insti/summary?type=Daily&date={date}&response=json"
+_TPEX_INST_NAMES = {"外資及陸資(不含自營商)": "foreign", "投信": "invest", "自營商合計": "dealer"}
+TPEX_INST_QUERY_FETCH = max(0, _env_int("DISCORD_AI_TPEX_INST_QUERY_FETCH", 5))     # 會員查詢時最多補幾天
+_TPEX_INST_LOCK = threading.Lock()
+
+
+def _tpex_inst_fetch(day: datetime) -> Optional[Dict[str, float]]:
+    """抓一天（億元）；休市存 {}（之後不再抓）；今天還沒公布回 None（不存，之後再試）。"""
+    kf = core()
+    url = TPEX_INST_URL.format(date=day.strftime("%Y/%m/%d"))
+    session = kf.get_thread_session()
+    getter = getattr(kf, "_requests_get_with_aia_fallback", None)   # 海外連 TPEx 走 Cloudflare 缺中繼憑證：主程式依 AIA 補
+    started = time.perf_counter()
+    try:
+        kwargs = {"headers": {"User-Agent": "Mozilla/5.0 AceAI/1.0"}, "timeout": (4, 12)}
+        response = getter(session, url, **kwargs) if getter else session.get(url, **kwargs)
+        response.raise_for_status()
+        payload = response.json()
+        record_api_event("TPEx", status=200, latency=time.perf_counter() - started)
+    except Exception:
+        record_api_event("TPEx", status=500, latency=time.perf_counter() - started)
+        raise
+    rows = ((payload.get("tables") or [{}])[0] or {}).get("data") or []
+    out: Dict[str, float] = {}
+    for row in rows:
+        key = _TPEX_INST_NAMES.get(str(row[0] if row else "").strip("　 \t"))
+        if key and len(row) >= 4:
+            out[key] = round(float(str(row[3]).replace(",", "") or 0) / 1e8, 2)
+    day_key = f"tpex_inst:{day.strftime('%Y-%m-%d')}"
+    if len(out) == 3:
+        local_market_cache.set_state(day_key, out)
+        return out
+    if day.date() < taipei_now().date():
+        local_market_cache.set_state(day_key, {})          # 過去的日子沒資料＝休市，記下來不再抓
+    return None
+
+
+def _tpex_candidate_days(count: int) -> List[datetime]:
+    """近 count 個交易日的候選（平日，新到舊，多抓一些以涵蓋休市）。"""
+    day = taipei_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    out: List[datetime] = []
+    while len(out) < int(count * 1.35) + 10:
+        if day.weekday() < 5:
+            out.append(day)
+        day -= timedelta(days=1)
+    return out
+
+
+def sync_tpex_institutional(max_requests: int = 30, days: int = INST_CHART_DAYS,
+                            log: Optional[Callable[[str], None]] = None) -> int:
+    """背景補上櫃法人歷史（新到舊，每輪最多 max_requests 次）；回傳這輪抓了幾天。"""
+    fetched = 0
+    if not _TPEX_INST_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        for day in _tpex_candidate_days(days):
+            if fetched >= max_requests:
+                break
+            if local_market_cache.get_state(f"tpex_inst:{day.strftime('%Y-%m-%d')}") is not None:
+                continue
+            if day.date() == taipei_now().date() and taipei_now().hour < 15:
+                continue                                    # 今天收盤後才公布
+            try:
+                _tpex_inst_fetch(day)
+            except Exception as exc:
+                if log:
+                    log(f"上櫃三大法人補資料失敗｜{day:%Y-%m-%d}｜{type(exc).__name__}: {exc}")
+                break                                       # 來源有問題：這輪先停
+            fetched += 1
+            time.sleep(0.3)
+    finally:
+        _TPEX_INST_LOCK.release()
+    if fetched and log:
+        log(f"上櫃三大法人｜本輪補 {fetched} 天")
+    return fetched
+
+
+def _tpex_inst_daily(days: int) -> Tuple[Dict[str, Dict[str, float]], int]:
+    """讀本地上櫃法人（最近幾天沒有就當場補，最多 TPEX_INST_QUERY_FETCH 次）；回傳 ({日期: 值}, 還沒補到的天數)。"""
+    daily: Dict[str, Dict[str, float]] = {}
+    missing, budget = 0, TPEX_INST_QUERY_FETCH
+    for day in _tpex_candidate_days(days):
+        key = day.strftime("%Y-%m-%d")
+        value = local_market_cache.get_state(f"tpex_inst:{key}")
+        if value is None and budget > 0 and not (day.date() == taipei_now().date() and taipei_now().hour < 15):
+            budget -= 1
+            try:
+                value = _tpex_inst_fetch(day)
+            except Exception:
+                budget = 0                                  # 來源失敗：不再逐天重試，用已有的資料
+        if value is None:
+            missing += 1
+        elif value:
+            daily[key] = value
+        if len(daily) >= days:
+            break
+    return daily, missing
+
+
+def get_market_institutional(days: int = INST_CHART_DAYS, market: str = "twse") -> Dict[str, Any]:
+    """全市場三大法人買賣超金額（單位：億元）。market="twse" 上市：FinMind TaiwanStockTotalInstitutionalInvestors
+    （外資＝外資及陸資＋外資自營商；自營商＝自行買賣＋避險）；market="tpex" 上櫃：TPEx 每日彙總（本地累積）。收盤後才更新。"""
+    if str(market).lower() == "tpex":
+        daily, missing = _tpex_inst_daily(max(5, int(days or 20)))
+        if not daily:
+            raise ToolDataError("上櫃三大法人資料暫時無法取得")
+        return _market_inst_summary(daily, max(5, int(days or 20)), "上櫃", missing)
     kf = core()
     end = taipei_now()
     start = end - timedelta(days=max(10, int(days or 20)) * 2 + 10)
@@ -5836,9 +5942,13 @@ def get_market_institutional(days: int = 20) -> Dict[str, Any]:
             continue
         net = (float(row.get("buy") or 0) - float(row.get("sell") or 0)) / 1e8
         daily.setdefault(day, {"foreign": 0.0, "invest": 0.0, "dealer": 0.0})[key] += net
-    dates = sorted(daily)[-max(5, int(days or 20)):]
-    if not dates:
+    if not daily:
         raise ToolDataError("全市場三大法人沒有有效日期")
+    return _market_inst_summary(daily, max(5, int(days or 20)), "上市", 0)
+
+
+def _market_inst_summary(daily: Dict[str, Dict[str, float]], days: int, scope: str, missing: int) -> Dict[str, Any]:
+    dates = sorted(daily)[-days:]
     rows = [{"date": d.replace("-", "/"), **{k: round(v, 2) for k, v in daily[d].items()}} for d in dates]
     investors = []
     for key, label in (("foreign", "外資"), ("invest", "投信"), ("dealer", "自營商")):
@@ -5847,10 +5957,11 @@ def get_market_institutional(days: int = 20) -> Dict[str, Any]:
                           "sum_20d_yi": round(sum(values[-20:]), 2), "streak_days": _streak(values)})
     total = [r["foreign"] + r["invest"] + r["dealer"] for r in rows]
     return {
-        "scope": "上市（集中市場）", "unit": "億元", "data_date": rows[-1]["date"], "investors": investors,
+        "market": "tpex" if scope == "上櫃" else "twse", "missing_days": missing,
+        "scope": "上櫃" if scope == "上櫃" else "上市（集中市場）", "unit": "億元", "data_date": rows[-1]["date"], "investors": investors,
         "total_latest_yi": round(total[-1], 2), "total_5d_yi": round(sum(total[-5:]), 2),
         "total_20d_yi": round(sum(total[-20:]), 2), "total_streak_days": _streak(total), "rows": rows,
-        "definition_note": "交易所公布的上市三大法人買賣超金額（億元），收盤後才更新；不含上櫃，不是券商分點資料",
+        "definition_note": f"交易所公布的{scope}三大法人買賣超金額（億元），收盤後才更新；不是券商分點資料",
     }
 
 
