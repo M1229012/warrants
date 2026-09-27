@@ -1961,10 +1961,21 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
 RETAIL_FUTURES = (("MTX", "小台"), ("TMF", "微台"))
 
 
+def _contract_expiry(contract: str) -> str:
+    """期貨契約到期日（週三結算）：月契約＝該月第 3 個週三，週契約 YYYYMMWn＝第 n 個週三。無法判斷回空字串。"""
+    import calendar
+    m = re.fullmatch(r"(\d{4})(\d{2})(?:W(\d))?", str(contract or ""))
+    if not m:
+        return ""
+    year, month, nth = int(m.group(1)), int(m.group(2)), int(m.group(3) or 3)
+    weds = [d for d in range(1, calendar.monthrange(year, month)[1] + 1) if calendar.weekday(year, month, d) == 2]
+    return f"{year:04d}-{month:02d}-{weds[nth - 1]:02d}" if nth <= len(weds) else ""
+
+
 def get_retail_futures(days: int = 0) -> Dict[str, Any]:
     """小台（MTX）、微台（TMF）散戶多空比（FinMind，和永豐期貨同一套算法，09/24 實測數字完全一致）：
     散戶多單＝全市場未平倉－三大法人多單；散戶空單＝全市場未平倉－三大法人空單；
-    散戶多空比＝(散戶多單－散戶空單)÷全市場未平倉×100%。全市場未平倉＝一般盤各月份契約加總（價差單不計）。"""
+    散戶多空比＝(散戶多單－散戶空單)÷全市場未平倉×100%。全市場未平倉＝一般盤各契約加總（價差單、當天結算到期的契約不計）。"""
     days = int(days or INST_CHART_DAYS)
 
     def build() -> Dict[str, Any]:
@@ -1985,8 +1996,10 @@ def get_retail_futures(days: int = 0) -> Dict[str, Any]:
                 raise ToolDataError("散戶多空比資料暫時無法取得") from exc
             oi: Dict[str, float] = defaultdict(float)
             for row in daily.to_dict("records"):
-                if str(row.get("trading_session")) == "position" and "/" not in str(row.get("contract_date") or ""):
-                    oi[str(row.get("date"))[:10]] += float(row.get("open_interest") or 0)
+                contract, day = str(row.get("contract_date") or ""), str(row.get("date"))[:10]
+                if (str(row.get("trading_session")) == "position" and "/" not in contract
+                        and _contract_expiry(contract) != day):          # 當天結算到期的契約不算
+                    oi[day] += float(row.get("open_interest") or 0)
             longs: Dict[str, float] = defaultdict(float)
             shorts: Dict[str, float] = defaultdict(float)
             for row in inst.to_dict("records"):

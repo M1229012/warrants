@@ -963,7 +963,7 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
             items.append({"label": f"{c['name']}散戶多空比{change}",
                           "value": f"{c['ratio_pct']:+.2f}%（多 {c['retail_long']:,}／空 {c['retail_short']:,}）"})
         sections[-1:-1] = [{"type": "stats", "items": items}]
-        sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（藍線＝微台、柱＝小台）。"
+        sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（當天結算到期的契約不計）。"
     return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
 
 

@@ -579,9 +579,12 @@ def _flow_height(panel: dict) -> int:
     return FLOW_BLOCK_H if panel.get('branch_flow') and panel.get('bars') else 0
 
 
+RETAIL_BLOCK_H = 300    # 小台、微台散戶多空比各一列柱狀圖
+
+
 def _retail_height(panel: dict) -> int:
     panel = panel or {}
-    return INST_BLOCK_H if (panel.get('retail') or {}).get('rows') and panel.get('bars') else 0
+    return RETAIL_BLOCK_H if (panel.get('retail') or {}).get('rows') and panel.get('bars') else 0
 
 
 def panel_height(panel: dict) -> int:
@@ -763,55 +766,54 @@ RETAIL_LINE = '#2563EB'
 
 
 def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: float, bars: list, retail: dict) -> None:
-    """散戶多空比（％，和 K 線同一組日期）：柱＝小台（紅＝散戶偏多、綠＝散戶偏空），藍線＝微台；共用 0 軸與右側刻度。"""
+    """散戶多空比（％，和 K 線同一組日期）：小台一列、微台一列，各自的刻度（兩種契約波動幅度差很多，
+    放同一個軸會把小台壓扁）；紅＝散戶偏多、綠＝散戶偏空；只在最下面標日期。"""
     rows = {r['date']: r for r in retail.get('rows') or []}
-    mtx = [(rows.get(bar['date']) or {}).get('MTX') for bar in bars]
-    tmf = [(rows.get(bar['date']) or {}).get('TMF') for bar in bars]
     latest = {c['futures_id']: c for c in retail.get('contracts') or []}
-    title = '散戶多空比'
-    text_at(draw, (left, top + 6), title, 22, INK, True)
-    lx = left + font(22, True).getlength(title) + 28
-    m, t = latest.get('MTX') or {}, latest.get('TMF') or {}
-    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
-    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
-    text = f"小台 {m.get('ratio_pct', 0):+.2f}%"
-    draw.text((lx + 22, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
-    lx += 22 + font(19, True).getlength(text) + 22
-    draw.line((lx, top + 20, lx + 22, top + 20), fill=RETAIL_LINE, width=3)
-    text = f"微台 {t.get('ratio_pct', 0):+.2f}%"
-    draw.text((lx + 30, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
-    lx += 30 + font(19, True).getlength(text) + 22
-    note, size = fit('散戶＝全市場未平倉－三大法人', 18, max(80, right - lx), False, 14)
-    draw.text((lx, top + 20), note, font=font(size), fill=MUTED, anchor='lm')
-    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
-    mid, half_h = (ctop + cbottom) / 2, (cbottom - ctop) / 2
     ticks = _date_ticks(bars, step)
-    for i in ticks:
-        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
-    for sx in range(int(left), int(right), 12):
-        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
-    peak = max([abs(v) for v in mtx + tmf if v is not None] + [1.0]) * 1.15
-    for i, value in enumerate(mtx):
-        if not value:
-            continue
-        x, half, h = px(i), max(1, step * .34), abs(value) / peak * half_h
-        draw.rectangle((x - half, mid - h if value > 0 else mid, x + half, mid if value > 0 else mid + h),
-                       fill=UP if value > 0 else DOWN)
-    points = [(px(i), mid - v / peak * half_h) for i, v in enumerate(tmf) if v is not None]
-    if len(points) > 1:
-        draw.line(points, fill=RETAIL_LINE, width=3)
-    if points:
-        ex, ey = points[-1]
-        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=RETAIL_LINE)
-    edge = half_h / 1.15
-    text_at(draw, (right + 10, mid - edge - 12), f'+{peak / 1.15:.0f}%', 16, MUTED)
-    text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
-    text_at(draw, (right + 10, mid + edge - 12), f'-{peak / 1.15:.0f}%', 16, MUTED)
-    axis_y = cbottom + 4
+    row_h = (RETAIL_BLOCK_H - 30) / 2
+    for n, (fid, name) in enumerate((('MTX', '小台'), ('TMF', '微台'))):
+        y0 = top + n * row_h
+        values = [(rows.get(bar['date']) or {}).get(fid) for bar in bars]
+        info = latest.get(fid) or {}
+        title = f'{name}散戶多空比'
+        text_at(draw, (left, y0 + 4), title, 21, INK, True)
+        lx = left + font(21, True).getlength(title) + 18
+        ratio = float(info.get('ratio_pct') or 0)
+        text = f'{ratio:+.2f}%'
+        draw.text((lx, y0 + 17), text, font=font(21, True), fill=UP if ratio > 0 else DOWN if ratio < 0 else INK, anchor='lm')
+        lx += font(21, True).getlength(text) + 16
+        detail = f"散戶多 {int(info.get('retail_long') or 0):,}／空 {int(info.get('retail_short') or 0):,} 口"
+        if n == 0:
+            detail += '｜散戶＝全市場未平倉－三大法人'
+        detail, size = fit(detail, 18, max(80, right - lx), False, 14)
+        draw.text((lx, y0 + 17), detail, font=font(size), fill=MUTED, anchor='lm')
+        ctop, cbottom = y0 + 40, y0 + row_h - 8
+        for i in ticks:
+            draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
+        hi = max([v for v in values if v is not None] + [0.0])
+        lo = min([v for v in values if v is not None] + [0.0])
+        span = max(hi - lo, 1.0) * 1.1
+        zero = ctop + (max(hi, 0) * 1.05 / span) * (cbottom - ctop) if span else (ctop + cbottom) / 2
+        zero = min(max(zero, ctop), cbottom)
+        scale = (cbottom - ctop) / span
+        draw.line((left, zero, right, zero), fill=LINE, width=1)
+        for i, value in enumerate(values):
+            if not value:
+                continue
+            x, half, h = px(i), max(1, step * .34), abs(value) * scale
+            draw.rectangle((x - half, zero - h if value > 0 else zero, x + half, zero if value > 0 else zero + h),
+                           fill=UP if value > 0 else DOWN)
+        text_at(draw, (right + 10, ctop - 8), f'{hi:+.0f}%', 16, MUTED)
+        if lo < 0:
+            text_at(draw, (right + 10, cbottom - 14), f'{lo:+.0f}%', 16, MUTED)
+        if not (lo < 0 and cbottom - 14 - (zero - 10) < 20) and zero - 10 - (ctop - 8) >= 20:
+            text_at(draw, (right + 10, zero - 10), '0', 16, MUTED)     # 和上下刻度太近就不標 0
+    axis_y = top + RETAIL_BLOCK_H - 30
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
     for i in ticks:
         label_x = max(left + 26, min(px(i), right - 26))
-        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
+        draw.text((label_x, axis_y + 6), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
 
 def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
