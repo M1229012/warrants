@@ -208,10 +208,46 @@ def current_api_priority() -> str:
     return getattr(_API_PRIORITY, "value", "user")
 
 
+# 富果每分鐘名額：先預留再打（原本「先看最近 60 秒打了幾次、答完才記一筆」，多條執行緒同時查會一起通過檢查而超用）。
+# 每次實際送出的請求（含換金鑰重試）都先拿一個名額；使用者最多等 12 秒，背景工作拿不到就讓位。
+_FUGLE_SLOTS: "deque[float]" = deque()
+_FUGLE_SLOT_LOCK = threading.Lock()
+
+
+def _fugle_background_cap() -> int:
+    return min(FUGLE_BACKGROUND_LIMIT_PER_MIN, max(1, 60 - FUGLE_USER_RESERVE_PER_MIN))
+
+
+def _fugle_slots_used(now: Optional[float] = None) -> int:
+    now = time.monotonic() if now is None else now
+    with _FUGLE_SLOT_LOCK:
+        while _FUGLE_SLOTS and now - _FUGLE_SLOTS[0] > 60:
+            _FUGLE_SLOTS.popleft()
+        return len(_FUGLE_SLOTS)
+
+
+def _reserve_fugle_slot(max_wait: float = 12.0) -> None:
+    background = current_api_priority() == "background"
+    cap = _fugle_background_cap() if background else FUGLE_HARD_LIMIT_PER_MIN
+    started = time.monotonic()
+    while True:
+        now = time.monotonic()
+        with _FUGLE_SLOT_LOCK:
+            while _FUGLE_SLOTS and now - _FUGLE_SLOTS[0] > 60:
+                _FUGLE_SLOTS.popleft()
+            if len(_FUGLE_SLOTS) < cap:
+                _FUGLE_SLOTS.append(now)
+                return
+            wait_for = 60.05 - (now - _FUGLE_SLOTS[0])
+        if background:
+            raise ToolDataError("富果背景額度已保留給使用者查詢")
+        if time.monotonic() - started >= max_wait:
+            raise ToolDataError("富果即時行情額度暫時繁忙，已保留避免超過每分鐘限制")
+        time.sleep(max(0.2, min(2.0, wait_for)))
+
+
 def fugle_background_allowed() -> bool:
-    snap = api_usage_snapshot().get("Fugle", {})
-    used = int(snap.get("last_60s", 0))
-    return used < min(FUGLE_BACKGROUND_LIMIT_PER_MIN, max(1, 60 - FUGLE_USER_RESERVE_PER_MIN))
+    return _fugle_slots_used() < _fugle_background_cap()
 
 
 def finmind_usage(force: bool = False) -> Dict[str, Any]:
@@ -581,6 +617,15 @@ class TTLCache:
             return True, value
 
     MAX_ENTRIES = max(100, _env_int("DISCORD_AI_CACHE_MAX_ENTRIES", 5000))
+
+    def invalidate(self, prefixes: Sequence[str]) -> int:
+        """刪掉 key 以這些前綴開頭的快取；回傳刪了幾筆。"""
+        heads = tuple(self._full_key(p) for p in prefixes)
+        with self._lock:
+            doomed = [k for k in self._data if k.startswith(heads)]
+            for k in doomed:
+                del self._data[k]
+        return len(doomed)
 
     def remaining(self, key: str) -> float:
         """快取還剩幾秒到期（沒有＝0）；背景提前更新用。"""
@@ -958,6 +1003,54 @@ def _build_known_branches() -> Tuple[Dict[str, str], int]:
     return aliases, sheet_sources_ok
 
 
+# 試算表版本：回測更新 Google Sheet（或手動修正事件）後，本週精選排名、權證分點、勝率要跟著更新，
+# 不能等 30 分鐘～6 小時的快取自然過期。背景每 3 分鐘讀一次試算表最後更新時間（1 次輕量 metadata 請求）；
+# 新版本要「連續兩次都一樣」才算寫完（回測會連續寫好幾張表，寫到一半不要去讀），才清掉由 Sheet 算出來的快取。
+SHEET_CACHE_PREFIXES = ("sheet_", "abcde_event_rows", "branch_event_perf_", "known_branches")
+_SHEET_VERSION: Dict[str, str] = {"current": "", "pending": ""}
+SHEET_CHANGE_LISTENERS: List[Callable[[], None]] = []
+
+
+def check_sheet_version(version: Optional[str] = None) -> bool:
+    """回傳 True＝試算表確定有新版本、已清掉 Sheet 相關快取（呼叫端接著在背景預載）。"""
+    if version is None:
+        version = _spreadsheet_last_updated(_open_main_spreadsheet())
+    if not version:
+        return False
+    state = _SHEET_VERSION
+    if not state["current"]:
+        state["current"] = version               # 開機第一次：只記下來
+        return False
+    if version == state["current"]:
+        state["pending"] = ""
+        return False
+    if version != state["pending"]:
+        state["pending"] = version               # 剛變：等下一次確認寫完
+        return False
+    state["current"], state["pending"] = version, ""
+    removed = CACHE.invalidate(SHEET_CACHE_PREFIXES)
+    for listener in list(SHEET_CHANGE_LISTENERS):
+        try:
+            listener()
+        except Exception as exc:
+            print(f"⚠️ 試算表更新通知失敗｜{type(exc).__name__}: {exc}", flush=True)
+    print(f"🔄 試算表已更新（{version}）：清掉 {removed} 筆 Sheet 快取，背景重新載入", flush=True)
+    return True
+
+
+def preload_sheet_data() -> None:
+    """試算表更新後在背景先讀好常用的表（事件表、勝率統計、分點名冊），會員下一題不用等。"""
+    try:
+        prefetch_sheet_tables(HOT_SHEETS, force=True)
+    except Exception as exc:
+        print(f"⚠️ 工作表預載略過｜{type(exc).__name__}: {exc}", flush=True)
+    for loader in (load_abcde_event_rows, read_branch_event_performance, get_known_branches):
+        try:
+            loader()
+        except Exception as exc:
+            print(f"⚠️ 試算表預載略過｜{getattr(loader, '__name__', loader)}｜{type(exc).__name__}: {exc}", flush=True)
+
+
 def refresh_reference_caches(ahead_seconds: float = 3600) -> List[str]:
     """快到期（剩不到 ahead_seconds）的股票名冊、分點名冊先在背景重建：會員不會剛好碰到過期、自己等幾秒重建。
     重建失敗保留舊值（舊值到期前還能用）。回傳這次更新了哪些。"""
@@ -1149,19 +1242,59 @@ def read_sheet_table(title: str) -> Dict[str, Any]:
         except Exception as exc:
             record_api_event("GoogleSheet", status=500, latency=time.perf_counter() - started)
             raise SheetUnavailableError(f"工作表「{title}」讀取失敗：{type(exc).__name__}") from exc
-        if title in _BLOCK_TABLE_SHEETS:
-            df = _block_table_to_frame(values)
-        else:
-            header_idx = _detect_header_row(values)
-            df = _values_to_frame(values, header_idx) if header_idx >= 0 else pd.DataFrame()
-        print(f"📥 Discord AI 讀取工作表：{title}｜{len(df):,} 列")
-        return {
-            "df": df,
-            "loaded_at": _taipei_now().strftime("%Y/%m/%d %H:%M"),
-            "sheet_updated_at": _spreadsheet_last_updated(sh),
-        }
+        return _sheet_table(title, values, _spreadsheet_last_updated(sh))
 
     return _cached(f"sheet_{title}", TTL_SHEET_SECONDS, build)
+
+
+def _sheet_table(title: str, values: List[List[str]], updated: str) -> Dict[str, Any]:
+    if title in _BLOCK_TABLE_SHEETS:
+        df = _block_table_to_frame(values)
+    else:
+        header_idx = _detect_header_row(values)
+        df = _values_to_frame(values, header_idx) if header_idx >= 0 else pd.DataFrame()
+    print(f"📥 Discord AI 讀取工作表：{title}｜{len(df):,} 列")
+    return {"df": df, "loaded_at": _taipei_now().strftime("%Y/%m/%d %H:%M"), "sheet_updated_at": updated}
+
+
+# 常用工作表：一次 batch 讀完（1 個請求取代 9 個；實測 5 張事件表＋賣出明細 5.2 秒 → 1.4 秒，內容相同）
+HOT_SHEETS = (tuple(AMOUNT_CLASS_SHEETS.values()) +
+              ("每日賣出明細", "勝率統計", "快取_近10日分點買賣明細", "股票ABCDE查詢資料"))
+SHEET_WARM_AHEAD_SECONDS = 300
+
+
+def prefetch_sheet_tables(titles: Sequence[str], force: bool = False) -> int:
+    """把還沒快取（force＝全部）的工作表用一次 batch 讀好放進快取；失敗就算了（之後照舊逐張讀）。回傳讀了幾張。"""
+    titles = [t for t in dict.fromkeys(titles) if t in SHEET_REGISTRY and (force or not CACHE.get(f"sheet_{t}")[0])]
+    if not titles:
+        return 0
+    sh = _open_main_spreadsheet()
+    started = time.perf_counter()
+    try:
+        result = sh.values_batch_get([f"'{t}'" for t in titles])
+        record_api_event("GoogleSheet", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("GoogleSheet", status=500, latency=time.perf_counter() - started)
+        print(f"⚠️ 工作表批次讀取失敗，改逐張讀取｜{type(exc).__name__}: {exc}", flush=True)
+        return 0
+    ranges = result.get("valueRanges") or []
+    if len(ranges) != len(titles):
+        return 0
+    updated = _spreadsheet_last_updated(sh)
+    for title, block in zip(titles, ranges):
+        values = block.get("values") or []
+        width = max((len(r) for r in values), default=0)
+        values = [list(r) + [""] * (width - len(r)) for r in values]      # 和 get_all_values 一樣補齊欄位
+        CACHE.set(f"sheet_{title}", _sheet_table(title, values, updated), TTL_SHEET_SECONDS)
+    return len(titles)
+
+
+def keep_sheets_warm() -> int:
+    """常用工作表快到期（剩不到 5 分鐘）或還沒讀過時，背景先整批重讀；會員不用等 Google Sheet。"""
+    remaining = [CACHE.remaining(f"sheet_{t}") for t in HOT_SHEETS]
+    if min(remaining) >= SHEET_WARM_AHEAD_SECONDS:
+        return 0
+    return prefetch_sheet_tables(HOT_SHEETS, force=True)
 
 
 def _first_column(df: pd.DataFrame, candidates: Tuple[str, ...]) -> str:
@@ -1408,33 +1541,12 @@ def intraday_session_now(now: Optional[datetime] = None) -> bool:
     return 8 * 60 + 55 <= minutes <= end_minutes
 
 
-def _wait_for_fugle_user_slot(max_wait: float = 12.0) -> None:
-    """避免直接使用者查詢把 Basic 60/min 撞到 429；背景工作不等待，直接讓位。"""
-    started = time.monotonic()
-    while True:
-        now = time.time()
-        with _API_LOCK:
-            events = list(_API_EVENTS.get("Fugle", ()))
-        recent = [ts for ts in events if now - ts <= 60]
-        if len(recent) < FUGLE_HARD_LIMIT_PER_MIN:
-            return
-        if time.monotonic() - started >= max_wait:
-            raise ToolDataError("富果即時行情額度暫時繁忙，已保留避免超過每分鐘限制")
-        oldest = min(recent)
-        wait_for = max(0.2, min(2.0, 60.05 - (now - oldest)))
-        time.sleep(wait_for)
-
-
 def _fugle_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if current_api_priority() == "background":
-        if not fugle_background_allowed():
-            raise ToolDataError("富果背景額度已保留給使用者查詢")
-    else:
-        _wait_for_fugle_user_slot()
     kf = core()
     attempts = max(1, len(FUGLE_API_KEYS) or 1)
     last_error: Optional[Exception] = None
     for _ in range(attempts):
+        _reserve_fugle_slot()                   # 每次送出（含換金鑰重試）都先預留名額
         started = time.perf_counter(); status = 0
         try:
             response = kf.get_thread_session().get(
@@ -1748,15 +1860,11 @@ FUGLE_INDEX_SYMBOL = {
 
 def _fugle_index_get(path: str) -> Dict[str, Any]:
     """和 _fugle_get 相同的金鑰輪替與額度控管，只是走 index 端點。"""
-    if current_api_priority() == "background":
-        if not fugle_background_allowed():
-            raise ToolDataError("富果背景額度已保留給使用者查詢")
-    else:
-        _wait_for_fugle_user_slot()
     kf = core()
     attempts = max(1, len(FUGLE_API_KEYS) or 1)
     last_error: Optional[Exception] = None
     for _ in range(attempts):
+        _reserve_fugle_slot()
         started = time.perf_counter(); status = 0
         try:
             response = kf.get_thread_session().get(
@@ -3661,6 +3769,10 @@ def load_abcde_event_rows() -> Dict[str, Any]:
     def build() -> Dict[str, Any]:
         kf = core()
         frames, errors = [], []
+        try:
+            prefetch_sheet_tables(list(AMOUNT_CLASS_SHEETS.values()) + ["每日賣出明細"])   # 一次讀 6 張
+        except Exception as exc:
+            print(f"⚠️ 事件表批次讀取略過｜{type(exc).__name__}: {exc}", flush=True)
         for code, title in AMOUNT_CLASS_SHEETS.items():
             try:
                 df = read_sheet_table(title)["df"]

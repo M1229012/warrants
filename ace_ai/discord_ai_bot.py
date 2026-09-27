@@ -4010,7 +4010,7 @@ def quota_exempt_ids() -> Set[str]:
 REQUIRED_MODULE_API = {
     "local_market_cache": ("accumulate_state", "recent_states"),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
-    "warrant_ai_tools": ("get_market_institutional",),
+    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version"),
     "answer_image": ("wrap_cell",),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
@@ -4360,6 +4360,7 @@ def _gemini_quota_lines(engine: Any) -> List[str]:
         return []
 
 
+SHEET_VERSION_CHECK_SECONDS = max(60, tools._env_int("DISCORD_AI_SHEET_VERSION_CHECK_SECONDS", 180))
 QUEUE_FULL_MESSAGE = "目前使用人數較多，排隊已滿，請過一兩分鐘再問一次。"
 
 
@@ -6631,6 +6632,9 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
     previous_cpu = None
     last_log = 0.0
     last_cmoney = 0.0
+    last_sheet_check = 0.0
+    # 試算表更新：回答快取也一起清（裡面可能有舊的權證分點／勝率內容）
+    tools.SHEET_CHANGE_LISTENERS[:] = [lambda: engine._answer_cache.invalidate(("",))]
     while not stop.wait(BACKGROUND_TICK_SECONDS):
         now = tools.taipei_now()
         try:
@@ -6639,6 +6643,19 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
                 print(f"♻️ 背景更新：{'、'.join(refreshed)}（會員不用等重建）", flush=True)
         except Exception as exc:
             print(f"⚠️ 名冊背景更新略過｜{type(exc).__name__}: {exc}", flush=True)
+        try:
+            warmed = tools.keep_sheets_warm()
+            if warmed:
+                print(f"♻️ 背景預讀工作表 {warmed} 張（一次批次讀取，會員不用等 Google Sheet）", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 工作表預讀略過｜{type(exc).__name__}: {exc}", flush=True)
+        if time.monotonic() - last_sheet_check >= SHEET_VERSION_CHECK_SECONDS:
+            last_sheet_check = time.monotonic()
+            try:
+                if tools.check_sheet_version():
+                    tools.preload_sheet_data()
+            except Exception as exc:
+                print(f"⚠️ 試算表版本檢查略過｜{type(exc).__name__}: {exc}", flush=True)
         # 盤中 CMoney 雷達先在背景暖好，會員問「現在族群誰最強」時直接讀快取。
         minutes = now.hour * 60 + now.minute
         if now.weekday() < 5 and 8 * 60 + 50 <= minutes <= 13 * 60 + 45:
