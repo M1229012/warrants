@@ -774,6 +774,30 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         current_total_value = sum(float(r["close"]) * float(r["shares"]) for r in rows)
         if current_total_value <= 0:
             raise tools.ToolDataError("成分股收盤總市值不足")
+        # 缺價成分股（沒成交、快照缺漏）仍在指數市值裡：用最近收盤計入分母（視為不漲不跌、貢獻 0），
+        # 否則只用有價股票反推 100/Base 會把每檔貢獻點數一起放大。
+        priced = {r["stock_code"] for r in rows}
+        missing = [c for c in codes if float(market_components[c].get("shares") or 0.0) > 0 and c not in priced]
+        missing_value, unpriced = 0.0, []
+        if missing:
+            last = local_market_cache.latest_changes(missing)
+            for code in missing:
+                px = tools._num((last.get(code) or {}).get("close"))
+                if px and float(px) > 0:
+                    missing_value += float(px) * float(market_components[code].get("shares") or 0.0)
+                else:
+                    unpriced.append(code)
+        present_value = current_total_value
+        current_total_value += missing_value
+        close_cap_coverage = present_value / current_total_value * 100.0
+        if missing:
+            print(f"⚠️ {index_name} 收盤缺價 {len(missing)} 檔（以最近收盤計入市值 {len(missing) - len(unpriced)} 檔、"
+                  f"查無價格 {len(unpriced)} 檔）｜市值涵蓋 {close_cap_coverage:.2f}%", flush=True)
+        if unpriced and len(unpriced) > max(3, int(len(codes) * 0.01)):
+            raise tools.ToolDataError(f"{index_name} 有 {len(unpriced)} 檔成分股查無任何價格，無法正確換算貢獻點數")
+        if close_cap_coverage < 95.0:
+            raise tools.ToolDataError(f"{index_name} 今天取得收盤價的成分股只占市值 {close_cap_coverage:.1f}%，"
+                                      f"資料不足以計算貢獻榜；今日收盤檔通常 15:00 後才發布")
         factor = float(now_index) / current_total_value
         weight_base = current_total_value
         live_used = 0
@@ -925,9 +949,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         covered_value = sum(float(r["prev_value"]) for r in evaluated)
         market_cap_coverage = covered_value / total_prev_value * 100.0 if total_prev_value > 0 else 0.0
     else:
-        # 收盤快照的市值涵蓋率，以「有官方/同日價格的成分股市值」相對本次可計算總市值；
+        # 收盤快照的市值涵蓋率：有今日價格的成分股市值 ÷ 全部成分股市值（缺價股以最近收盤計）；
         # 同時另回 component_price_coverage_pct 讓 log 看檔數覆蓋。
-        market_cap_coverage = 100.0 if rows else 0.0
+        market_cap_coverage = close_cap_coverage if rows else 0.0
 
     estimated_points = round(sum(r["points"] for r in evaluated), 2)
     index_points = round((float(now_index) - float(prev_index)), 2) if now_index is not None and prev_index is not None else None

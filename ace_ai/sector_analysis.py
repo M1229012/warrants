@@ -357,13 +357,16 @@ def _local_rows(stocks: list) -> tuple:
     """
     codes = [str(s.get("stock_code") or "") for s in stocks]
     scores = local_market_cache.pattern_scores_for(codes)
-    changes = local_market_cache.latest_changes(codes)
+    # 價格取「型態分數那一天」的收盤：分數還沒更新到最新 K 棒時，不把較新的報價和舊分數並列
+    score_days = {c: _iso_date(v.get("date")) for c, v in scores.items() if v and v.get("date")}
+    changes = local_market_cache.latest_changes(codes, as_of=score_days)
     liquidity = local_market_cache.liquidity_map(LIQUIDITY_DAYS)
     rows, missing = [], []
     for stock in stocks:
         code = str(stock.get("stock_code") or "")
         score, change = scores.get(code), changes.get(code)
-        if not score or not change or not change.get("close"):
+        if (not score or not change or not change.get("close")
+                or _iso_date(change.get("date")) != _iso_date(score.get("date"))):
             missing.append(stock)
             continue
         liq = liquidity.get(code) or {}
@@ -452,9 +455,14 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
         for row in top:
             if row.get("plus_reasons") or row.get("minus_reasons"):
                 continue
+            # 補資料和掃描共用同一個總時限（SCAN_TIMEOUT），不在 90 秒之後再各加 20 秒
+            if deadline - time.monotonic() < 1.0:
+                print(f"族群前段補資料略過（總時限已到）：{row['stock_code']}", flush=True)
+                continue
             try:
                 full = _stock_row({"stock_code": row["stock_code"], "stock_name": row.get("stock_name", ""),
-                                   "market": row.get("market", "")}, mode, time.monotonic() + 20, threading.Event())
+                                   "market": row.get("market", "")}, mode, min(time.monotonic() + 20, deadline),
+                                  threading.Event())
             except Exception as exc:
                 print(f"族群前段補資料略過 {row['stock_code']}：{type(exc).__name__}", flush=True)
                 continue

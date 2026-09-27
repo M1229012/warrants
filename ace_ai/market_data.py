@@ -204,8 +204,14 @@ def sync_day(day: _date, markets: Tuple[str, ...] = ("twse", "tpex")) -> int:
     saved = 0
     for market, (status, rows, detail) in results.items():
         if status == "complete":
-            saved += local_market_cache.save_market_day(rows, key, source="TWSE" if market == "twse" else "TPEx")
-            local_market_cache.save_market_status(key, market, "complete", len(rows), "TWSE/TPEx")
+            written = local_market_cache.save_market_day(rows, key, source="TWSE" if market == "twse" else "TPEx")
+            saved += written
+            # 寫入時會剔除不合理的 K 棒：剔除後低於門檻就不能算完整（狀態記實際寫入筆數）
+            if written < len(rows) and written < complete_threshold(market, key):
+                local_market_cache.save_market_status(key, market, "source_error", written, "TWSE/TPEx",
+                                                      f"解析 {len(rows)} 檔、有效 {written} 檔，低於門檻")
+            else:
+                local_market_cache.save_market_status(key, market, "complete", written, "TWSE/TPEx")
             continue
         if status == "empty":
             others = [results[m][0] if m in results else ("empty" if known[m] == "closed" else known[m])
@@ -234,6 +240,9 @@ def _candidate_days(count: int, end: Optional[_date] = None) -> List[_date]:
     return days
 
 
+RECENT_DAYS = 5   # sync 每輪必看的最近平日數（含今天）
+
+
 def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
          log: Callable[[str], None] = print, force: bool = False) -> Dict[str, Any]:
     """把底庫補到 target_days 個交易日。上市、上櫃分開判斷：兩邊都 complete（或都確認休市）才跳過，
@@ -244,11 +253,12 @@ def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
     status = local_market_cache.market_status(keys)
     done ={k for k in keys if all(status[k][m] == "complete" for m in local_market_cache.MARKETS)}
     fetched = saved = holidays = 0
-    for day, key in zip(candidates, keys):
+    for index, (day, key) in enumerate(zip(candidates, keys)):
         if time.monotonic() - started > budget_seconds:
             log(f"市場底庫：達到本輪時間上限（{budget_seconds:.0f} 秒），下一輪續補")
             break
-        if len(done) >= target_days:
+        # 歷史天數夠了也一定先處理最近幾個平日（含今天）；否則舊資料一滿 target_days，今天永遠不會被抓
+        if len(done) >= target_days and index >= RECENT_DAYS:
             break
         if not force and (key in done or all(status[key][m] == "closed" for m in local_market_cache.MARKETS)):
             continue

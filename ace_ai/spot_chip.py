@@ -14,7 +14,7 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -339,15 +339,50 @@ def market_closed_dates(official: Sequence[str]) -> List[str]:
         return []
 
 
+# 官方休市表（主程式會重試）遇到證交所維護可能卡十幾秒：最多等 CALENDAR_TIMEOUT 秒，逾時改用本地交易日；
+# 成功結果快取 CALENDAR_TTL 秒，逾時的那次在背景跑完後也會寫進快取
+CALENDAR_TIMEOUT = max(1.0, float(os.getenv("DISCORD_AI_SPOT_CALENDAR_TIMEOUT", "4") or 4))
+CALENDAR_TTL = 1800.0
+_CALENDAR_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spot-calendar")
+_CALENDAR_CACHE: Dict[Any, Tuple[float, List[str]]] = {}
+
+
+def _official_trading_dates(start: datetime, end: datetime) -> List[str]:
+    core = tools.core()
+    key = (id(core), start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    hit = _CALENDAR_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < CALENDAR_TTL:
+        return list(hit[1])
+
+    def fetch() -> List[str]:
+        days = [_iso(d) for d in core._get_official_trading_dates(start, end)]
+        if days:
+            _CALENDAR_CACHE[key] = (time.monotonic(), days)
+        return days
+    future = _CALENDAR_POOL.submit(fetch)
+    try:
+        return future.result(timeout=CALENDAR_TIMEOUT)
+    except FuturesTimeout:
+        print(f"⚠️ 官方交易日曆超過 {CALENDAR_TIMEOUT:.0f} 秒，這題改用本地日 K 交易日", flush=True)
+        return []
+
+
 def trading_dates(end: datetime, count: int) -> List[str]:
-    """實際開市日（預定交易日扣掉確認休市日）；官方行事曆失敗時改用本地日 K 底庫已有的交易日。"""
+    """實際開市日（預定交易日扣掉確認休市日）；官方行事曆失敗或太慢時改用本地日 K 底庫已有的交易日。"""
     start = end - timedelta(days=int(count * 1.7) + 20)
     try:
-        days = [_iso(d) for d in tools.core()._get_official_trading_dates(start, end)]
+        days = _official_trading_dates(start, end)
     except Exception:
         days = []
     if not days:
         days = [d for d in sorted(local_market_cache.known_dates(400)) if d <= end.strftime("%Y-%m-%d")]
+        # 本地日 K 還沒有的最近平日（例如盤中的今天）先當交易日，休市與否交給下面的 market_closed_dates
+        if days:
+            cursor = datetime.strptime(days[-1], "%Y-%m-%d").date() + timedelta(days=1)
+            while cursor <= end.date():
+                if cursor.weekday() < 5:
+                    days.append(cursor.strftime("%Y-%m-%d"))
+                cursor += timedelta(days=1)
     days = sorted({_iso(d) for d in days})
     closed = set(market_closed_dates(days))
     return [d for d in days if d not in closed][-count:]
@@ -427,6 +462,7 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
     # 背景正在補同一檔時，會員這一題不排隊等它：直接用資料庫已有的資料回答。
     if not lock.acquire(timeout=max(0.0, budget if lock_wait is None else lock_wait)):
         return {"fetched": 0, "remaining": len(dates), "busy": 1}
+    handoff: List[threading.Thread] = []   # 時限到了仍在收尾的抓取連線：鎖等它們結束才放
     try:
         status = local_market_cache.spot_day_status(stock_code, dates)
         missing = sorted((d for d in dates if _needs_fetch(status.get(d), d, today, now)), reverse=True)
@@ -497,6 +533,11 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                 wait_until = deadline + 1.0   # 所有連線共用同一個等待截止（逾時已依剩餘時間縮短，這裡再給 1 秒緩衝）
                 for thread in threads:
                     thread.join(max(0.0, wait_until - time.monotonic()))
+                alive = [t for t in threads if t.is_alive()]
+                if alive:
+                    with guard:
+                        state["stop"] = True      # 收尾中的連線寫完這一頁就停，不再開始新的一天
+                    handoff.extend(alive)
             if failure:
                 raise failure[0]
             fetched, errors, busy = state["fetched"], state["errors"], state["busy"]
@@ -508,7 +549,15 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             result["busy"] = 1
         return result
     finally:
-        lock.release()
+        if handoff:
+            # 先回答會員，但同一檔的下一次補資料要等舊連線寫完才能開始（不會兩批工作同時寫同一檔）
+            def _release_after(workers=tuple(handoff)) -> None:
+                for worker in workers:
+                    worker.join()
+                lock.release()
+            threading.Thread(target=_release_after, name="spot-lock-release", daemon=True).start()
+        else:
+            lock.release()
 
 
 def _fetch_one(fetch, stock_code: str, date: str, latest_date: str) -> bool:
@@ -764,7 +813,8 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     t_prepared = time.perf_counter()
     progress: Dict[str, Any] = {"fetched": 0, "remaining": 0, "errors": 0}
     total = min(budget, QUICK_BUDGET if mode == "quick" else SYNC_BUDGET)
-    deadline = time.monotonic() + total
+    # 準備交易日曆的時間也算在這一題的預算內（預算＝會員實際等待上限）
+    deadline = time.monotonic() + max(0.0, total - (t_prepared - t0))
     statuses: Optional[Dict[str, Dict[str, Any]]] = None
     for date in reversed(dates[-4:]):   # 最新一天還沒更新（pending_update）才往前找，最多 4 天
         left = deadline - time.monotonic()

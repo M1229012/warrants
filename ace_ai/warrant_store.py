@@ -27,7 +27,23 @@ CHECK_SECONDS = max(300, int(os.getenv("DISCORD_AI_WARRANT_STORE_CHECK_SECONDS",
 BATCH_ROWS = 100_000
 # 只保留近 N 個日曆日：權證存續期多在一年內，更早買進的部位早已到期歸零，不影響剩餘張數（DB 約減半）
 KEEP_DAYS = max(200, int(os.getenv("DISCORD_AI_WARRANT_STORE_KEEP_DAYS", "550") or 550))
+# 新檔比舊資料明顯縮水（格式正確但內容少了）就不替換：舊資料至少這麼多筆時才檢查
+SHRINK_MIN_BASE = 1000
+SHRINK_RATIO = 0.7
 _SYNC_LOCK = threading.Lock()
+
+
+class StoreShrunk(Exception):
+    """release 檔案內容異常縮水：整批回滾、保留舊資料。"""
+
+
+def _guard_shrink(table: str, before: int, after: int, before_max: str = "", after_max: str = "") -> None:
+    if before < SHRINK_MIN_BASE:
+        return
+    if after < before * SHRINK_RATIO:
+        raise StoreShrunk(f"{table} 新檔 {after:,} 列，舊資料 {before:,} 列，縮水超過 {1 - SHRINK_RATIO:.0%}")
+    if before_max and after_max and after_max < before_max:
+        raise StoreShrunk(f"{table} 新檔最新日期 {after_max} 早於舊資料 {before_max}")
 _LAST_CHECK = [0.0]
 
 _HISTORY_COLUMNS = ["權證代號", "權證名稱", "標的股", "標的名稱", "分點", "日期", "買進股數", "賣出股數", "買進金額", "賣出金額"]
@@ -119,8 +135,9 @@ def _download(url: str, timeout: float = 180.0) -> Path:
     return Path(name)
 
 
-def load_history(path: Path) -> int:
-    """逐批（10 萬列）寫進 bw_daily／bw_names；整份在同一個 transaction 內替換，失敗全部回滾。"""
+def load_history(path: Path, allow_shrink: bool = False) -> int:
+    """逐批（10 萬列）寫進 bw_daily／bw_names；整份在同一個 transaction 內替換，失敗全部回滾。
+    新檔明顯縮水（筆數 < 舊資料 7 成，或最新日期倒退）丟 StoreShrunk 並回滾，除非 allow_shrink。"""
     import pyarrow.parquet as pq
     parquet = pq.ParquetFile(str(path))
     count, names = 0, {}
@@ -128,6 +145,7 @@ def load_history(path: Path) -> int:
     with local_market_cache._LOCK:
         with local_market_cache._db() as conn, conn:
             _ensure_tables(conn)
+            before, before_max = conn.execute("SELECT COUNT(*), COALESCE(MAX(date),'') FROM bw_daily").fetchone()
             conn.execute("DELETE FROM bw_daily")
             for batch in parquet.iter_batches(batch_size=BATCH_ROWS, columns=_HISTORY_COLUMNS):
                 data = batch.to_pydict()
@@ -146,12 +164,15 @@ def load_history(path: Path) -> int:
                                  _int(data["買進金額"][i]), _int(data["賣出金額"][i])))
                 conn.executemany("INSERT OR REPLACE INTO bw_daily VALUES(?,?,?,?,?,?,?,?)", rows)
                 count += len(rows)
+            if not allow_shrink:
+                after_max = conn.execute("SELECT COALESCE(MAX(date),'') FROM bw_daily").fetchone()[0]
+                _guard_shrink("權證分點歷史", int(before or 0), count, str(before_max or ""), str(after_max or ""))
             conn.execute("DELETE FROM bw_names")
             conn.executemany("INSERT OR REPLACE INTO bw_names VALUES(?,?,?,?)", list(names.values()))
     return count
 
 
-def load_meta(path: Path) -> int:
+def load_meta(path: Path, allow_shrink: bool = False) -> int:
     import pyarrow.parquet as pq
     parquet = pq.ParquetFile(str(path))
     columns = [c for c in _META_COLUMNS if c in parquet.schema_arrow.names]
@@ -169,6 +190,9 @@ def load_meta(path: Path) -> int:
     with local_market_cache._LOCK:
         with local_market_cache._db() as conn, conn:
             _ensure_tables(conn)
+            before = conn.execute("SELECT COUNT(*) FROM warrant_meta").fetchone()[0]
+            if not allow_shrink:
+                _guard_shrink("權證基本資料", int(before or 0), len({r[0] for r in rows}))
             conn.execute("DELETE FROM warrant_meta")
             conn.executemany("INSERT OR REPLACE INTO warrant_meta VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
     local_market_cache.set_state("warrant_meta_snapshot", snapshot)
@@ -192,12 +216,17 @@ def sync(force: bool = False, log: Callable[[str], None] = print,
         done = {}
         for kind, name, loader in (("history", HISTORY_FILE, load_history), ("meta", META_FILE, load_meta)):
             asset = assets.get(name)
-            if not asset or (not force and state.get(kind) == asset.get("updated_at")):
+            if not asset or (not force and asset.get("updated_at") in (state.get(kind), state.get(f"{kind}_rejected"))):
                 continue
             started = time.monotonic()
             path = download(asset["url"])
             try:
-                rows = loader(path)
+                rows = loader(path, allow_shrink=force)
+            except StoreShrunk as exc:
+                # 保留舊資料；同一版檔案不再重複下載，release 更新或管理員強制同步才再試
+                state[f"{kind}_rejected"] = asset.get("updated_at")
+                log(f"⚠️ 權證分點歷史庫：{name} 內容異常，保留舊資料｜{exc}")
+                continue
             finally:
                 try:
                     Path(path).unlink()

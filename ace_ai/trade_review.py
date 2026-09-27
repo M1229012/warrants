@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -962,7 +963,7 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
             sell_checks = remap_unmatched(sell_checks, mapper, sell_snap, sell_inst, None)
     payload = {
         "mode": "closed" if closed else "holding",
-        "trade_id": f"{code}-{buy_day:%Y%m%d}-{int(time.time())}",
+        "trade_id": f"{code}-{buy_day:%Y%m%d}-{int(time.time())}-{uuid.uuid4().hex[:6]}",   # 同秒建立也不撞號
         "stock": {"code": code, "name": req.get("name") or panel.get("stock_name", "")},
         "trade": {"buy_date": tools._fmt_date(buy_day), "buy_price": buy_price,
                   "buy_price_source": "使用者提供" if req.get("price") else "買進日收盤價",

@@ -388,8 +388,9 @@ def last_bar_dates() -> Dict[str, str]:
         return {}
 
 
-def latest_changes(codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    """每檔最新兩根收盤 → 收盤價與漲跌幅（純本地，不打任何 API）。"""
+def latest_changes(codes: Iterable[str], as_of: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+    """每檔最新兩根收盤 → 收盤價與漲跌幅（純本地，不打任何 API）。
+    as_of＝{代號: 日期}：只看該日（含）以前的 K 棒，讓價格和同一天算的型態分數對齊。"""
     wanted = [str(c).strip() for c in codes if str(c).strip()]
     if not wanted:
         return {}
@@ -406,6 +407,9 @@ def latest_changes(codes: Iterable[str]) -> Dict[str, Dict[str, Any]]:
                             ORDER BY stock_code, date DESC""", chunk).fetchall()
                     grouped: Dict[str, List[Any]] = {}
                     for code, date, close, volume in rows:
+                        limit = (as_of or {}).get(str(code))
+                        if limit and str(date) > limit:
+                            continue
                         bucket = grouped.setdefault(str(code), [])
                         if len(bucket) < 2:
                             bucket.append((str(date), float(close), float(volume or 0)))
@@ -919,6 +923,12 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                         ("ivol_samples", "DELETE FROM ivol_samples WHERE day < ?", cut(IVOL_RAW_KEEP_DAYS)),
                         ("radar_turnover", "DELETE FROM radar_turnover WHERE day < ?", cut(TURNOVER_KEEP_DAYS)),
                         ("usage_log", "DELETE FROM usage_log WHERE day < ?", cut(USAGE_KEEP_DAYS)),
+                        ("gemini_usage", "DELETE FROM kv WHERE key GLOB 'gemini_usage:*' AND key < ?",
+                         "gemini_usage:" + cut(USAGE_KEEP_DAYS)),
+                        ("railway_usage", "DELETE FROM kv WHERE key GLOB 'railway_usage:*' AND key < ?",
+                         "railway_usage:" + cut(USAGE_KEEP_DAYS)),
+                        ("user_quota", "DELETE FROM kv WHERE key GLOB 'user_quota:*' AND key < ?",
+                         "user_quota:" + cut(2)),
                         ("spot_branch_daily", "DELETE FROM spot_branch_daily WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         ("spot_branch_days", "DELETE FROM spot_branch_days WHERE date < ?", cut(SPOT_KEEP_CALENDAR_DAYS)),
                         # 舊版每 5 分鐘整包重寫的 JSON（改成資料表後就不再使用）；當天的先留著給當天讀
@@ -934,6 +944,7 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception as exc:
         print(f"⚠️ 本地資料庫每日維護失敗｜{type(exc).__name__}: {exc}", flush=True)
+        removed["failed"] = 1   # 呼叫端據此當天重試，不當成已完成
         return removed
     size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
     print("🧹 本地資料庫每日維護｜" + "｜".join(f"{k} -{v}" for k, v in removed.items())
@@ -1188,6 +1199,47 @@ def log_usage(route: str, gemini_calls: int, input_tokens: int, output_tokens: i
                 conn.commit()
     except Exception:
         pass
+
+
+def _merge_counts(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict):
+            base[key] = _merge_counts(dict(base.get(key) or {}), value)
+        elif isinstance(value, (int, float)):
+            if key.endswith("_max"):
+                base[key] = max(float(base.get(key) or 0), float(value))
+            elif key.endswith("_last"):
+                base[key] = value
+            else:
+                base[key] = (base.get(key) or 0) + value
+    return base
+
+
+def accumulate_state(key: str, updates: Dict[str, Any]) -> None:
+    """每日用量計數器（Gemini 各模型、Railway 資源）：數字相加、*_max 取最大、*_last 覆蓋；失敗不影響主流程。"""
+    try:
+        with _LOCK:
+            with _db() as conn, conn:
+                row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
+                current = json.loads(row[0]) if row else {}
+                merged = _merge_counts(current if isinstance(current, dict) else {}, updates)
+                conn.execute("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                             (str(key), json.dumps(merged, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+    except Exception as exc:
+        _warn(f"累計用量（{key}）", exc)
+
+
+def recent_states(prefix: str, days: int = 7) -> Dict[str, Dict[str, Any]]:
+    """最近 N 天的 {日期: 計數器}（新到舊）。"""
+    today = datetime.now(timezone.utc) + timedelta(hours=8)
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(max(1, days)):
+        day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        value = get_state(f"{prefix}:{day}", None)
+        if isinstance(value, dict):
+            out[day] = value
+    return out
 
 
 def usage_summary(day: str = "") -> Dict[str, Any]:
