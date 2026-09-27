@@ -33,6 +33,7 @@ CHART_HEAD = 260
 CHART_PRICE_BASE = 306
 CHART_VOLUME_BLOCK = 156
 CHART_FOOT = 114
+CAPTION_H = 62         # 價量分布圖例＋布林狀態（畫在價格區日期軸下方、成交量上方），從 CHART_FOOT 撥出來
 CHART_HEIGHT = CHART_HEAD + CHART_PRICE_BASE + CHART_VOLUME_BLOCK + CHART_FOOT
 # K 棒價格區加高（原本約 300px，加上標籤帶後 K 棒會被壓扁）。
 CHART_PRICE_EXTRA = 240
@@ -559,7 +560,9 @@ INST_BLOCK_H = 210     # 法人／台指期副圖：緊接在成交量下方
 
 def _inst_height(panel: dict) -> int:
     panel = panel or {}
-    return INST_BLOCK_H if (panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars') else 0
+    if not ((panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars')):
+        return 0
+    return INST_BLOCK_H - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
 
 
 def _trade_height(panel: dict) -> int:
@@ -607,7 +610,7 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
                        focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
-                       today_label: str = '今日', extra: str = '') -> None:
+                       today_label: str = '今日', extra: str = '', dates: bool = True) -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
@@ -688,7 +691,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
     axis_y = cbottom + 4
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
-    for i in ticks:
+    for i in (ticks if dates else ()):
         label_x = max(left + 26, min(px(i), right - 26))
         draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
@@ -754,10 +757,9 @@ def draw_futures(draw, top: float, left: float, right: float, px, step: float, b
         draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
         text_at(draw, (right + 10, ctop - 8), f'{hi:+,.0f}', 16, ACCENT)
         text_at(draw, (right + 10, cbottom - 14), f'{lo:+,.0f}', 16, ACCENT)
-    text_at(draw, (right + 10, mid - 10), f'±{peak / 1.15:,.0f}', 16, MUTED)
     axis_y = cbottom + 4
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
-    for i in ticks:
+    for i in (ticks if futures.get('_dates', True) else ()):
         label_x = max(left + 26, min(px(i), right - 26))
         draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
@@ -804,11 +806,11 @@ def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: flo
             x, half, h = px(i), max(1, step * .34), abs(value) * scale
             draw.rectangle((x - half, zero - h if value > 0 else zero, x + half, zero if value > 0 else zero + h),
                            fill=UP if value > 0 else DOWN)
-        text_at(draw, (right + 10, ctop - 8), f'{hi:+.0f}%', 16, MUTED)
-        if lo < 0:
+        if zero - 10 - (ctop - 8) >= 20:
+            text_at(draw, (right + 10, ctop - 8), f'{hi:+.0f}%', 16, MUTED)
+        text_at(draw, (right + 10, zero - 10), '0', 16, MUTED)
+        if lo < 0 and (cbottom - 14) - (zero - 10) >= 20:                 # 太靠近 0 就不標，避免兩個刻度疊在一起
             text_at(draw, (right + 10, cbottom - 14), f'{lo:+.0f}%', 16, MUTED)
-        if not (lo < 0 and cbottom - 14 - (zero - 10) < 20) and zero - 10 - (ctop - 8) >= 20:
-            text_at(draw, (right + 10, zero - 10), '0', 16, MUTED)     # 和上下刻度太近就不標 0
     axis_y = top + RETAIL_BLOCK_H - 30
     draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
     for i in ticks:
@@ -1205,6 +1207,12 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                   fill=INK if new_month else MUTED, anchor='mt')
 
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
+    legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
+    text_at(draw, (left, bottom + 40), legend + '  /  虛線：布林軌道', 17, MUTED)
+    state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
+    state, state_size = fit(state, 20, CONTENT - 80, False, 16)
+    text_at(draw, (left, bottom + 66), state, state_size, INK)
+    bottom += CAPTION_H
     label_y = bottom + 58
     draw.text((left, label_y), '成交量', font=font(20), fill=MUTED, anchor='lm')
     lx = left + font(20).getlength('成交量') + 18
@@ -1241,21 +1249,17 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             draw.line(segment, fill=mv_color, width=2)
     inst_h = _inst_height(panel)
     futures = panel.get('futures') or {}
+    last_sub = not _retail_height(panel)
     if panel.get('institutional'):
         draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
-                           extra=panel.get('institutional_extra', ''))
+                           extra=panel.get('institutional_extra', ''), dates=last_sub)
     elif inst_h:
-        draw_futures(draw, vbottom + 14, left, right, px, step, bars, futures)
+        draw_futures(draw, vbottom + 14, left, right, px, step, bars, dict(futures, _dates=last_sub))
     retail_h = _retail_height(panel)
     if retail_h:
         draw_retail_ratio(draw, vbottom + 14 + inst_h, left, right, px, step, bars, panel['retail'])
     inst_h += retail_h
-    legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
-    text_at(draw, (left, vbottom + inst_h + 18), legend + '  /  虛線：布林軌道', 18, MUTED)
-    state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
-    for i, line in enumerate(wrap(state, 20, CONTENT - 80)[:2]):
-        text_at(draw, (left, vbottom + inst_h + 54 + i * 28), line, 20, INK)
     below = y + CHART_HEIGHT + extra + inst_h
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
