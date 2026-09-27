@@ -3630,9 +3630,14 @@ _SLASH_PREFIX_RE = re.compile(r"^\s*/(ask|ace)\b[:：,，]?\s*", re.IGNORECASE)
 _PARAM_PREFIX_RE = re.compile(r"^\s*(?:question|問題)\s*[:：]\s*", re.IGNORECASE)
 
 
+# 中文輸入法常打出全形數字／英文（「２３３０」）：轉成半形，否則股票代號、MA20 都認不出來
+_FULLWIDTH_TABLE = {code: code - 0xFEE0 for code in list(range(0xFF10, 0xFF1A)) + list(range(0xFF21, 0xFF3B)) + list(range(0xFF41, 0xFF5B))}
+_FULLWIDTH_TABLE[0x3000] = 0x20
+
+
 def strip_command_prefix(question: str) -> str:
-    """拿掉使用者誤貼的「/ask」「/ace」「question:」前綴（可能疊在一起），其餘原樣保留。"""
-    text = str(question or "")
+    """拿掉使用者誤貼的「/ask」「/ace」「question:」前綴（可能疊在一起），全形數字／英文轉半形，其餘原樣保留。"""
+    text = str(question or "").translate(_FULLWIDTH_TABLE)
     while True:
         cleaned = _PARAM_PREFIX_RE.sub("", _SLASH_PREFIX_RE.sub("", text, count=1), count=1)
         if cleaned == text:
@@ -3688,7 +3693,13 @@ _SPOT_LATEST_RE = re.compile(r"今天|今日|最新|昨天|昨日")
 _DATA_LABELS = {"get_stock_overview": "股價", "get_technical_analysis": "日K與技術指標", "get_volume_profile": "大量區",
                 "get_sheet_stock_chips": "權證分點資料", "get_recent_news": "近期新聞", "get_institutional_flow": "三大法人資料",
                 "get_futures_positions": "台指期未平倉", "get_cost_position_context": "成本位置",
-                "get_market_institutional": "全市場三大法人資料"}
+                "get_market_institutional": "全市場三大法人資料",
+                "get_branch_performance": "歷史勝率", "get_branch_recent_trades": "近期買賣", "get_branch_stock_position": "部位",
+                "get_branch_event_performance": "事件勝率", "get_branch_warrant_detail": "權證明細",
+                "get_branch_event_window": "權證事件", "get_branch_stock_history": "事件紀錄",
+                "detect_current_branch_events": "近期事件", "get_branch_recent_behavior": "近期操作",
+                "get_branch_winrate_rank": "勝率排行", "get_top_warrant_buy_stocks": "權證淨買超排行",
+                "get_retail_futures": "散戶多空比"}
 _CATEGORY_TOOLS = {"price": "get_stock_overview", "technical": "get_technical_analysis", "volume_profile": "get_volume_profile",
                    "news": "get_recent_news", "warrant": "get_sheet_stock_chips", "recent_trades": "get_sheet_stock_chips",
                    "win_rate": "get_sheet_stock_chips"}
@@ -3718,13 +3729,15 @@ def missing_required(route: str, intents: Set[str], calls: Sequence["ToolCall"],
                      names: Dict[str, str]) -> List[str]:
     """回傳缺了哪些必要資料（例：「華邦電 日K與技術指標」）；calls 與 results 一一對應。"""
     need = required_tools(route, intents, {c.name for c in calls})
-    missing = []
+    grouped: Dict[str, List[str]] = {}
     for call, result in zip(calls, results):
         if call.name in need and not result.ok:
             code = str(call.kwargs.get("stock_code") or "")
             who = names.get(code) or code or str(call.kwargs.get("branch_name") or "")
-            missing.append(f"{who} {_DATA_LABELS.get(call.name, '資料')}".strip())
-    return list(dict.fromkeys(missing))
+            label = _DATA_LABELS.get(call.name, "資料")
+            if label not in grouped.setdefault(who, []):
+                grouped[who].append(label)
+    return [f"{who} {'、'.join(labels)}".strip() for who, labels in grouped.items()]
 
 
 def compare_date_notice(results: Sequence[tools.ToolResult], names: Dict[str, str]) -> str:
@@ -4689,6 +4702,12 @@ class AceQueryEngine:
         for stage, seconds in (report.get("timing") or {}).items():
             self._perf_add(stage, seconds)
 
+    @staticmethod
+    def _spot_alert(result: AnswerResult, report: Dict[str, Any], code: str) -> AnswerResult:
+        """富邦分點頁連線失敗（被擋、維護）：通知管理員（同類 10 分鐘合併一次），會員那邊照常顯示。"""
+        errors = int((report.get("progress") or {}).get("errors") or 0)       # 只算這一題抓取時的失敗（不算以前留下的）
+        return replace(result, errors=list(result.errors) + [f"現股分點來源連線失敗：{code}｜{errors} 頁"]) if errors else result
+
     def _spot_result(self, card: Dict[str, Any], title: str, ok: bool, started: float, text: str) -> AnswerResult:
         return AnswerResult(text=text, route="rule_spot_chip", gemini_calls=0, elapsed=time.perf_counter() - started,
                             cacheable=ok, image_title=title,
@@ -4743,12 +4762,13 @@ class AceQueryEngine:
         self._spot_timing(report)
         latest = report.get("latest_complete_date")
         if not latest:
-            if report.get("source_errors") and not (report.get("progress") or {}).get("fetched"):
+            # 來源連不上、手上又一天都沒有：直接說暫時無法取得（不要寫「建置中」讓會員以為等一下就有）
+            if report.get("source_errors") and not report.get("available_days"):
                 card = spot_chip.message_card(f"{code} {name}", "現股分點資料暫時無法取得",
-                                              "資料來源連線失敗，稍後再試；失敗的日期不會當成 0 計算。")
+                                              "券商分點資料來源暫時無法連線，請稍後再問一次；失敗的日期不會當成 0 計算。")
             else:
                 card = spot_chip.progress_card(code, name, report)
-            return self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中")
+            return self._spot_alert(self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中"), report, code)
         card = spot_chip.report_card(report, code, name)
         text = (f"{code} {name} 現股分點籌碼｜資料日期 {latest}｜歷史 {report.get('available_days')}/{report.get('requested_days')}｜"
                 f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
@@ -5799,15 +5819,25 @@ class AceQueryEngine:
         data_notice = ""
         missing = missing_required(plan.route, set(parsed.intents), planned_calls, run_results, names)
         if missing:
-            data_notice = ("【資料不足】" + chr(10) + "這題無法完整判斷：" + "、".join(missing) +
-                           " 暫時取得不到，不會用推測補上。以下只列出已取得的資料，請稍後再問一次。")
+            data_notice = ("【資料不足】" + chr(10) + "這題無法完整判斷：" + "；".join(missing) +
+                           " 暫時取得不到，不會用推測補上。")
         elif plan.route == "rule_pattern":
             data_notice = compare_date_notice(results, names)
         if data_notice and plan.need_final_llm:
             plan.need_final_llm = False
             self.log(f"必要資料檢查：不交給 AI｜{data_notice}")
         text, llm_ok = self._compose(question, plan, results, stats)
-        if data_notice:
+        if missing:
+            obtained = [r for r in results if r.ok]
+            if obtained:
+                card_page = plan.route in CARD_ROUTES or plan.pattern
+                data_notice += ("圖上是已取得的資料，" if card_page else "以下只列出已取得的資料，") + "請稍後再問一次。"
+                body = brief_rule_answer(obtained) if card_page else build_rule_based_answer(obtained)
+            else:
+                data_notice += "請稍後再問一次。"
+                body = DISCLAIMER
+            text = f"{data_notice}\n\n{body}"          # 缺什麼上面已經寫了，不再逐項重複一次
+        elif data_notice:
             text = f"{data_notice}\n\n{text}"
         ai_card = self._take_ai_card()
         if comparison is not None:
