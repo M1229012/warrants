@@ -27925,6 +27925,13 @@ def rebuild_full_history_from_moneydj(warrants, broker_map, history_df, target_d
     if not target_dt:
         return baseline, {"accepted": False, "reason": "invalid_target_date"}
 
+    universe_problems = _moneydj_scan_universe_problems(broker_map)
+    if universe_problems:
+        print("  ⛔ repair 放棄重建：掃描清單不完整，重建會漏掉權證或分點。")
+        for reason in universe_problems:
+            print(f"    - {reason}")
+        return baseline, {"accepted": False, "reason": "scan_universe_incomplete"}
+
     # 交易日換算日曆日再加緩衝，確保 API4 區間確實蓋滿保留窗口。
     scan_days = max(int(HISTORY_RETENTION_TRADING_DAYS * 1.6) + 20, 90)
     window_start_dt = target_dt - timedelta(days=scan_days)
@@ -28763,6 +28770,69 @@ def _moneydj_today_first_candidates(warrants, broker_map, history_df, target_dat
     return known_pairs + discovered, latest_market_date, stats
 
 
+def _moneydj_scan_universe_problems(broker_map):
+    """掃描母體（權證清單＋追蹤分點代號）是否完整；回傳不完整的原因清單。"""
+    reasons = []
+    missing_brokers = sorted(set(TARGET_PATTERNS.keys()) - set((broker_map or {}).keys()))
+    if missing_brokers:
+        reasons.append(
+            f"追蹤分點代號不完整：缺少 {len(missing_brokers)} 個（{'、'.join(missing_brokers[:10])}）"
+        )
+    if not LIVE_WARRANT_SNAPSHOT_READY:
+        reasons.append(
+            "權證母體未更新：官方權證來源本次失敗、沿用舊快取，新上市權證不在掃描範圍內"
+        )
+    return reasons
+
+
+# daily／repair 開始抓目標日前，先檢查最近 N 個日曆日內「官方有開市、但快取幾乎沒有資料」
+# 的交易日，依日期先補抓。某一天 MoneyDJ 或網路失敗時，那天的買賣不會永久缺漏，
+# FIFO 也不會跳過那天的賣出。交易日以 TWSE＋TPEx 當日行情都有資料為準（含補班日）；
+# 行情取不到的日子一律不補，避免把休市日當成缺資料。
+MONEYDJ_DAILY_GAP_FILL_ENABLED = os.getenv(
+    "MONEYDJ_DAILY_GAP_FILL_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_DAILY_GAP_FILL_LOOKBACK_DAYS = max(
+    int(os.getenv("MONEYDJ_DAILY_GAP_FILL_LOOKBACK_DAYS", "14")),
+    1,
+)
+MONEYDJ_DAILY_GAP_FILL_MAX_DAYS = max(
+    int(os.getenv("MONEYDJ_DAILY_GAP_FILL_MAX_DAYS", "5")),
+    1,
+)
+
+
+def find_missing_history_trading_dates(history_df, target_date):
+    """回傳目標日之前、回看窗口內快取缺資料的官方交易日（由舊到新，最多 MAX 天）。"""
+    target_dt = parse_date(target_date)
+    if (
+        target_dt is None
+        or history_df is None
+        or history_df.empty
+        or "日期" not in history_df.columns
+    ):
+        return []
+
+    rows_by_date = history_df["日期"].map(normalize_date_str).value_counts().to_dict()
+    history_dates = sorted(d for d in rows_by_date if parse_date(d))
+    if not history_dates:
+        return []
+    history_start = history_dates[0]
+
+    missing = []
+    for offset in range(MONEYDJ_DAILY_GAP_FILL_LOOKBACK_DAYS, 0, -1):
+        day_key = (target_dt - timedelta(days=offset)).strftime("%Y/%m/%d")
+        if day_key < history_start:
+            continue
+        if rows_by_date.get(day_key, 0) >= MONEYDJ_DEGRADED_MIN_ROWS:
+            continue
+        _fetch_market_close_snapshot_for_date(day_key)
+        if not _market_close_snapshot_fully_cached(day_key):
+            continue
+        missing.append(day_key)
+    return missing[:MONEYDJ_DAILY_GAP_FILL_MAX_DAYS]
+
+
 def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     global _MONEYDJ_TARGET_DATE, _MONEYDJ_TARGET_DATE_OK, _MONEYDJ_API5_FAILED_COUNT
     global _MONEYDJ_API5_MISSING_TARGET_COUNT, _MONEYDJ_API5_UNCOVERED_TARGET_COUNT
@@ -28775,7 +28845,21 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     _MONEYDJ_API5_EXPANDED_RETRY_COUNT = 0
     baseline = history_df.copy() if history_df is not None else pd.DataFrame()
 
-    if MONEYDJ_DAILY_TODAY_FIRST:
+    # 掃描清單不完整時，抓得再順也會漏掉新上市權證或整個分點。
+    # 舊版先抓先存、事後才判定不完整，漏掉的那天之後也不會再補；
+    # 這裡在發出任何 API4 之前就停下，不寫入目標日，交由降級模式與下次缺日補抓處理。
+    universe_problems = _moneydj_scan_universe_problems(broker_map)
+    if universe_problems:
+        print(
+            f"  ⛔ {_MONEYDJ_TARGET_DATE} 掃描清單不完整，本次不抓也不寫入這一天"
+            "（避免漏掉新上市權證／分點後被當成完整資料）："
+        )
+        for reason in universe_problems:
+            print(f"    - {reason}")
+        return baseline
+
+    # 今日優先只查最近出現過的組合，分點第一次買的權證會漏掉；repair 一律完整預篩。
+    if MONEYDJ_DAILY_TODAY_FIRST and not workflow_is_repair():
         candidates, latest_market_date, today_first_stats = (
             _moneydj_today_first_candidates(
                 warrants,
@@ -28965,7 +29049,7 @@ def refresh_history_from_moneydj(warrants, broker_map, history_df, target_date):
     #   1. 第一階段的市場發布驗證（確認目標日對方真的有資料）
     #   2. API5／API6 的連線失敗計數（MONEYDJ_API5_STRICT）
     # 這兩道守住，兩者都沒有被放寬。
-    if MONEYDJ_DAILY_TODAY_FIRST and missing_target_pairs:
+    if MONEYDJ_DAILY_TODAY_FIRST and not workflow_is_repair() and missing_target_pairs:
         print(
             f"  ℹ️ 今日優先模式：{len(missing_target_pairs):,} 組今天沒有交易紀錄，"
             "屬正常情形（候選來自歷史活躍組合，非當日確認）。"
@@ -29460,6 +29544,36 @@ def _main_impl():
             if history_cache_df is None:
                 print_moneydj_health_report()
                 return EXIT_CODE_ABORTED
+
+        # 【缺日補抓】前幾次執行失敗或沒跑的交易日，依日期先補，再抓目標日。
+        # 補抓沿用與目標日完全相同的抓取與驗證流程；某天補抓未通過時不寫入那天，
+        # 下次執行會再偵測到並重試。
+        if MONEYDJ_DAILY_GAP_FILL_ENABLED:
+            _stage_t = time.perf_counter()
+            gap_dates = find_missing_history_trading_dates(history_cache_df, target_date)
+            record_stage_seconds("Step3-G 缺日偵測", time.perf_counter() - _stage_t)
+            if gap_dates:
+                print(
+                    f"\n🩹 分點歷史缺少 {len(gap_dates)} 個官方交易日：{'、'.join(gap_dates)}；"
+                    f"先依日期補抓，再抓 {target_date}。"
+                )
+                for gap_date in gap_dates:
+                    _stage_t = time.perf_counter()
+                    history_cache_df = refresh_history_from_moneydj(
+                        warrants,
+                        broker_map,
+                        history_cache_df,
+                        gap_date,
+                    )
+                    record_stage_seconds("Step3-G 缺日補抓", time.perf_counter() - _stage_t)
+                    if _MONEYDJ_TARGET_DATE_OK:
+                        print(f"  ✅ 缺日補抓完成：{gap_date}")
+                    else:
+                        count_event("缺日補抓未通過")
+                        print(
+                            f"  ⚠️ 缺日補抓未通過：{gap_date}（未寫入任何一列）；"
+                            "下次執行會再自動補抓。"
+                        )
 
         _stage_t = time.perf_counter()
         history_cache_df = refresh_history_from_moneydj(
