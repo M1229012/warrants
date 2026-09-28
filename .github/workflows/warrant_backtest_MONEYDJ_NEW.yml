@@ -28,6 +28,13 @@ permissions:
   actions: write
 
 
+# 同一時間只允許一個回測在跑（daily、repair、longterm 共用同一份快取）。
+# 兩個同時跑會各自讀舊快取、各自寫回，後寫完的會把先寫完的新資料蓋掉。
+# 後觸發的會排隊等前一個跑完，不會被取消。
+concurrency:
+  group: warrant-backtest-moneydj-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
@@ -330,9 +337,11 @@ jobs:
           echo "執行方案：$PLAN"
           echo "WORKFLOW_MODE：$WORKFLOW_MODE"
           echo "RUN_MODE：$RUN_MODE"
-          if [[ "$WORKFLOW_MODE" == "daily" ]]; then
-            echo "抓取策略：今日優先兩階段（MONEYDJ_DAILY_TODAY_FIRST=${MONEYDJ_DAILY_TODAY_FIRST}）"
+          if [[ "$WORKFLOW_MODE" == "daily" && "${MONEYDJ_DAILY_TODAY_FIRST}" == "1" ]]; then
+            echo "抓取策略：今日優先兩階段（MONEYDJ_DAILY_TODAY_FIRST=1）"
             echo "探索預算：${MONEYDJ_DISCOVERY_BUDGET}（0＝只查已知組合）"
+          elif [[ "$WORKFLOW_MODE" == "daily" ]]; then
+            echo "抓取策略：完整預篩（只掃目標日有成交的權證，每次抽查自我驗證）＋自動補缺日"
           else
             echo "抓取策略：完整掃描（repair／longterm 不受今日優先影響）"
           fi
