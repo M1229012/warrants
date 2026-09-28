@@ -1997,16 +1997,7 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
         text_at(draw, (px, y + h + 58), disclaimer, 18, MUTED)
     h += 56 + 38
-    bars = []
-    for row in (rows + list(data.get('others') or []))[:5]:
-        value = row.get('pattern_score', row.get('score')) if technical else row.get('change_pct', row.get('delta'))
-        if isinstance(value, (int, float)):
-            label = str(row.get('stock_name') or row.get('name') or row.get('stock_code') or '')
-            bars.append({'label': label, 'value': float(value),
-                         'text': f'{value:.1f} 分' if technical else f'{value:+.2f}%'})
-    if len(bars) >= 2:
-        section = {'type': 'hbars', 'items': bars, 'title': 'Top5 一覽'}
-        h += _branch_section(draw, px, px + width, y + h, section, dry) + 6
+    # 不另畫「Top5 一覽」橫條：前三名卡片＋其他名次表已經列出同樣的分數，重複又拉長圖片
     if not rows:
         if not dry:
             text_at(draw, (px, y + h), '目前沒有足夠的同日資料可以排名，請稍後再試。', 24, MUTED)
