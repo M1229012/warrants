@@ -4446,6 +4446,21 @@ def gsheet_api_call(description, func, *args, **kwargs):
     2. 遇到 429／RESOURCE_EXHAUSTED、500／502／503／504 或短暫斷線自動等待重試。
     3. 暫時性 API 錯誤會在 API 層重試，不會被誤判成值不一致。
     """
+    return _gsheet_call_with_retry(description, func, args, kwargs, retry_ambiguous=True)
+
+
+def gsheet_structural_call(description, func, *args, **kwargs):
+    """
+    插列／刪列這類「重送一次就會多做一次」的操作專用。
+
+    只重試 429／配額錯誤（請求被拒、確定沒執行）。逾時、5xx、斷線時伺服器
+    可能已經執行，盲目重送會多插一次或刪到下一列；這類錯誤直接拋出，
+    由呼叫端重新讀表、以最新列號重算後再處理。
+    """
+    return _gsheet_call_with_retry(description, func, args, kwargs, retry_ambiguous=False)
+
+
+def _gsheet_call_with_retry(description, func, args, kwargs, retry_ambiguous=True):
     last_error = None
 
     for attempt in range(1, GSHEET_MAX_RETRIES + 1):
@@ -4469,6 +4484,9 @@ def gsheet_api_call(description, func, *args, **kwargs):
             last_error = e
 
             if not is_gsheet_retryable_error(e):
+                raise
+            if not retry_ambiguous and not is_gsheet_quota_error(e):
+                count_event("Google Sheet 結構操作結果不確定（不重送）")
                 raise
 
             if attempt >= GSHEET_MAX_RETRIES:
@@ -9312,7 +9330,7 @@ def _insert_rows_below_header(ws, rows):
 
     try:
         for chunk in reversed(chunks):
-            gsheet_api_call(
+            gsheet_structural_call(
                 f"增量插入工作表資料 {ws.title}",
                 ws.insert_rows,
                 chunk,
@@ -9727,7 +9745,7 @@ def replace_daily_date_rows_in_worksheet(
     row_shift = len(rows_to_insert)
     shifted_old_rows = [row_no + row_shift for row_no in old_target_rows]
     for start_row, end_row in reversed(_contiguous_data_row_ranges(shifted_old_rows)):
-        gsheet_api_call(
+        gsheet_structural_call(
             f"刪除 daily 舊日期快照 {safe_worksheet_title(title)} {start_row}-{end_row}",
             ws.delete_rows,
             start_row,
@@ -10065,7 +10083,7 @@ def remove_existing_duplicate_increment_rows(ws, title, existing_values):
 
     # 由下往上刪除，避免上方列號因先刪除而位移。
     for start_row, end_row in reversed(_contiguous_data_row_ranges(duplicate_rows)):
-        gsheet_api_call(
+        gsheet_structural_call(
             f"刪除既有重複列 {safe_worksheet_title(title)} {start_row}-{end_row}",
             ws.delete_rows,
             start_row,
@@ -10493,6 +10511,8 @@ def upload_excel_to_google_sheet(
     completed = set()
     failures = {}
     rollback_snapshots = {}
+    # 開始整表覆蓋（會先 clear）的工作表；失敗的表可能已被清空或寫到一半，回滾也必須涵蓋。
+    touched_titles = set()
 
     # repair 一致性快照：寫入前先把 21 張結果表的現況讀進記憶體當回滾點。
     # 舊版是「一張一張寫，第 10 張失敗就前 9 張新、其餘舊」，最後拋錯也救不回來，
@@ -10545,7 +10565,7 @@ def upload_excel_to_google_sheet(
             return [], []
 
         restored, restore_failed = [], []
-        for title in sorted(completed & set(rollback_snapshots)):
+        for title in sorted((completed | touched_titles) & set(rollback_snapshots)):
             snapshot = rollback_snapshots.get(title) or {}
             try:
                 gws, _created = _existing_result_sheet(primary_sh, title)
@@ -10587,6 +10607,7 @@ def upload_excel_to_google_sheet(
         # repair 完整結果快照必須先於歷史保護安全門判斷；既有表與本次
         # 新建立的表都走同一套「完整寫入 → 格式重建 → 回讀驗證」。
         if should_overwrite_result_sheet_in_repair(title):
+            touched_titles.add(title)
             overwrite_repair_result_sheet_from_excel(
                 ws_xlsx,
                 gws,
@@ -10789,7 +10810,8 @@ def upload_excel_to_google_sheet(
             if rollback_snapshots:
                 print(
                     f"  ↩️ repair 有 {len(missing_completed):,} 張未完成，"
-                    f"開始回滾已寫入的 {len(completed & set(rollback_snapshots)):,} 張..."
+                    f"開始回滾已寫入或寫到一半的 "
+                    f"{len((completed | touched_titles) & set(rollback_snapshots)):,} 張..."
                 )
                 restored, restore_failed = rollback_repair_publish()
                 if restore_failed:
@@ -12245,6 +12267,10 @@ def build_underlying_resolver_from_stock_master(
             alias_norm = normalize_stock_name_text(alias)
             add_candidate(alias_norm, code, name, alias_norm == name_norm)
 
+    # 先依前綴字典序、股號排好再做主排序（穩定排序），同分候選的先後才固定。
+    # 舊版候選來自 set，同分項目的順序隨 Python 每次執行的雜湊種子改變；
+    # 同長前綴指向不同股號時，第一個命中者可能每天不同，同一權證會被解析成不同標的。
+    candidates.sort(key=lambda rec: (rec["prefix"], str(rec["stock_code"])))
     candidates.sort(
         key=lambda rec: (
             rec["prefix_len"],
@@ -13123,13 +13149,22 @@ def cleanup_deleted_broker_rows_in_existing_worksheets():
             total_renamed += len(cell_updates)
 
         # 必須由後往前刪除，否則前面刪列後會改變後續列號。
-        for start_row, end_row in reversed(_contiguous_sheet_row_ranges(rows_to_delete)):
-            gsheet_api_call(
-                f"清除失效分點舊資料 {ws.title} R{start_row}:R{end_row}",
-                ws.delete_rows,
-                start_row,
-                end_row,
+        # 刪列結果不確定時不重送、也不中斷整個同步：這張表本次停止清理，
+        # 下次執行會重新讀表、以最新列號再清。
+        try:
+            for start_row, end_row in reversed(_contiguous_sheet_row_ranges(rows_to_delete)):
+                gsheet_structural_call(
+                    f"清除失效分點舊資料 {ws.title} R{start_row}:R{end_row}",
+                    ws.delete_rows,
+                    start_row,
+                    end_row,
+                )
+        except Exception as exc:
+            print(
+                f"  ⚠️ 失效分點舊資料清理中斷：{ws.title}｜{type(exc).__name__}: {exc}｜"
+                "下次執行會重新讀表後再清理。"
             )
+            continue
 
         total_deleted += len(rows_to_delete)
         print(
@@ -14122,6 +14157,7 @@ def build_official_warrant_summary_dataframe(
     stats = {
         "official_codes": len(official_metadata_by_code or {}),
         "official_active_codes": len(official_active_codes),
+        "official_active_code_set": set(official_active_codes),
         "cached_only_rows": cached_only_rows,
         "cached_only_active": cached_only_active,
         "total_rows": len(summary_df),
@@ -14762,19 +14798,29 @@ def get_all_call_warrants_live(cached_warrants=None):
             "  ⛔ 無法驗證權證母體覆蓋率：官方現行代號為 0。"
             "這代表母體只剩快取，等同舊版 FinMind 失效時的漏抓風險，請優先排查官方 API。"
         )
-    if official_current > 0:
-        coverage = len(active_codes) / official_current
+    # 分母用「官方資料中今天仍在交易期間」的代號。官方現行清單在到期結算前仍會列出
+    # 最後交易日已過的權證（實測約 12%），舊版拿它當分母，每天都報「覆蓋率偏低」假警報。
+    official_active_set = set(universe_stats.get("official_active_code_set") or ())
+    if official_current > 0 and official_active_set:
+        missing_active = sorted(official_active_set - active_codes)
+        coverage = 1 - len(missing_active) / len(official_active_set)
         if coverage < WARRANT_UNIVERSE_MIN_OFFICIAL_COVERAGE:
             print(
-                f"  ⚠️ 權證母體覆蓋率偏低：今日有效 {len(active_codes):,} / "
-                f"官方現行 {official_current:,} = {coverage:.1%}，"
-                f"低於門檻 {WARRANT_UNIVERSE_MIN_OFFICIAL_COVERAGE:.0%}。"
+                f"  ⚠️ 權證母體覆蓋率偏低：官方今日有效 {len(official_active_set):,} 檔中"
+                f"有 {len(missing_active):,} 檔不在掃描母體（覆蓋 {coverage:.1%}，"
+                f"門檻 {WARRANT_UNIVERSE_MIN_OFFICIAL_COVERAGE:.0%}）｜樣本："
+                f"{'、'.join(missing_active[:15])}。"
                 "請確認 TWSE／TPEx 官方權證基本資料是否有欄位異動或單一市場失敗。"
             )
         else:
             print(
-                f"  ✅ 權證母體覆蓋率：今日有效 {len(active_codes):,} / "
-                f"官方現行 {official_current:,} = {coverage:.1%}"
+                f"  ✅ 權證母體覆蓋率：官方今日有效 {len(official_active_set):,} 檔｜"
+                f"納入掃描 {len(official_active_set) - len(missing_active):,} 檔 = {coverage:.1%}"
+                + (
+                    f"｜未納入 {len(missing_active):,} 檔：{'、'.join(missing_active[:10])}"
+                    if missing_active
+                    else ""
+                )
             )
     return warrants
 
@@ -14978,60 +15024,82 @@ def _event_warrant_identity_from_meta(
     }
 
 
+def make_dated_warrant_identity_resolver():
+    """
+    回傳 resolve(item_fields, trade_date)：依「權證代號＋交易日」決定當天的權證名稱與標的，
+    規則與 _event_warrant_identity_for_date() 完全相同（ABCDE、近兩月排行共用）。
+
+    item_fields 為 item_identity_fields(item) 的結果。
+    【效能】結果只取決於 item 的身分欄位與「當天有效的主檔紀錄」，同一權證同一生命週期內
+    每天都一樣，因此以（身分欄位, 主檔紀錄物件）記憶；主檔查詢也依日期記憶。
+    """
+    interval_records = _CURRENT_WARRANT_INTERVAL_RECORDS
+    lookup_by_date = {}
+    identity_cache = {}
+
+    def resolve(item_fields, trade_date):
+        warrant_code, warrant_name, underlying_code, underlying_name = item_fields
+        dated_meta = None
+        if warrant_code and interval_records:
+            try:
+                lookup = lookup_by_date[trade_date]
+            except (KeyError, TypeError):
+                lookup = _warrant_lookup(interval_records, trade_date)
+                try:
+                    lookup_by_date[trade_date] = lookup
+                except TypeError:
+                    pass
+            dated_meta = lookup.get(warrant_code)
+
+        cache_key = (
+            warrant_code,
+            warrant_name,
+            underlying_code,
+            underlying_name,
+            id(dated_meta) if dated_meta is not None else None,
+        )
+        identity = identity_cache.get(cache_key)
+        if identity is None:
+            identity = _event_warrant_identity_from_meta(
+                warrant_code,
+                warrant_name,
+                underlying_code,
+                underlying_name,
+                dated_meta,
+            )
+            identity_cache[cache_key] = identity
+        return identity
+
+    return resolve
+
+
+def item_identity_fields(item):
+    """_event_warrant_identity_for_date() 使用的 item 身分欄位（已正規化）。"""
+    return (
+        _normalize_warrant_code_for_identity(item.get("warrant_code", "")),
+        str(item.get("warrant_name", "") or "").strip(),
+        normalize_security_code_text(item.get("underlying_code", "")),
+        str(item.get("underlying_name", "") or "").strip(),
+    )
+
+
 def build_daily_records(items):
     daily_records = []
     identity_corrected = 0
 
-    # 【效能】逐列身分防錯（名稱解析、標的比對）只取決於 item 的身分欄位與
-    # 「當天有效的主檔紀錄」。同一權證同一生命週期內每天結果都一樣，
-    # 因此以（身分欄位, 主檔紀錄物件）記憶結果；主檔查詢也依日期記憶。
-    # 舊版 69 萬列逐列重算並逐列建立 namedtuple，約 3～4 分鐘。
-    interval_records = _CURRENT_WARRANT_INTERVAL_RECORDS
-    lookup_by_date = {}
-    identity_cache = {}
+    # 舊版 69 萬列逐列重算身分並逐列建立 namedtuple，約 3～4 分鐘；改用共用的記憶化解析。
+    resolve_identity = make_dated_warrant_identity_resolver()
     value_columns = ("買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額")
 
     for item in items:
         if not item["underlying_code"]:
             continue
 
-        warrant_code = _normalize_warrant_code_for_identity(item.get("warrant_code", ""))
-        warrant_name = str(item.get("warrant_name", "") or "").strip()
-        underlying_code = normalize_security_code_text(item.get("underlying_code", ""))
-        underlying_name = str(item.get("underlying_name", "") or "").strip()
-
+        fields = item_identity_fields(item)
         df = item["df"]
         columns = [df["日期"].tolist()] + [df[column].tolist() for column in value_columns]
         for trade_date, buy_s, sell_s, buy_a, sell_a, net_s, net_a in zip(*columns):
-            dated_meta = None
-            if warrant_code and interval_records:
-                try:
-                    lookup = lookup_by_date[trade_date]
-                except (KeyError, TypeError):
-                    lookup = _warrant_lookup(interval_records, trade_date)
-                    try:
-                        lookup_by_date[trade_date] = lookup
-                    except TypeError:
-                        pass
-                dated_meta = lookup.get(warrant_code)
-
-            cache_key = (
-                warrant_code,
-                warrant_name,
-                underlying_code,
-                underlying_name,
-                id(dated_meta) if dated_meta is not None else None,
-            )
-            identity = identity_cache.get(cache_key)
-            if identity is None:
-                identity = _event_warrant_identity_from_meta(
-                    warrant_code,
-                    warrant_name,
-                    underlying_code,
-                    underlying_name,
-                    dated_meta,
-                )
-                identity_cache[cache_key] = identity
+            identity = resolve_identity(fields, trade_date)
 
             if identity["changed"]:
                 identity_corrected += 1
@@ -16370,7 +16438,13 @@ def make_group_day_cells(ev, price_cache):
     u_prices = get_price_series_from_cache(price_cache, ev["標的股"])
     base_date = normalize_date_str(ev["結束日"])
 
-    buy_u = get_price_on_or_before(u_prices, base_date) if u_prices else None
+    if DPLUS_STRICT_MARKET_CALENDAR:
+        # 基準價與 D+N 同一規則：事件日當天沒有收盤價就視為缺基準，D+ 全部顯示缺值。
+        # 舊版 D+N 已要求精確日期，D0 卻仍用 get_price_on_or_before()，
+        # 事件日缺價時會拿前一個交易日當基準，算出的其實不是「事件日之後」的漲跌。
+        buy_u = safe_price_float(u_prices.get(base_date)) if u_prices else None
+    else:
+        buy_u = get_price_on_or_before(u_prices, base_date) if u_prices else None
 
     future_dates = build_dplus_dates(
         base_date,
@@ -22029,16 +22103,19 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
 
     ws.append(headers)
 
-    cutoff_dt = datetime.today() - timedelta(days=RECENT_RANKING_DAYS)
+    # 窗口以報表統計日為準（與每日賣出明細相同）。舊版用執行當天，補跑舊日期或
+    # 降級模式時窗口會跟其他報表不同，同一份資料不同天跑結果也不同。
+    report_dt = parse_date(_PRICE_PLAN_MAX_PUBLISHED_DATE) or datetime.today()
+    report_dt = datetime(report_dt.year, report_dt.month, report_dt.day)
+    cutoff_dt = report_dt - timedelta(days=RECENT_RANKING_DAYS)
     last_5_dates, last_20_dates = collect_recent_trade_date_sets(items, cutoff_dt)
     ranking_map = {}
+    resolve_identity = make_dated_warrant_identity_resolver()
 
     for item in items:
         warrant_code = item["warrant_code"]
-        warrant_name = item["warrant_name"]
-        underlying_code = item["underlying_code"]
-        underlying_name = item.get("underlying_name", "")
         broker_label = item["broker_label"]
+        identity_fields = item_identity_fields(item)
 
         df = item["df"]
 
@@ -22058,6 +22135,13 @@ def write_recent_warrant_amount_ranking_sheet(wb, items):
 
             if buy_amount <= 0 and sell_amount <= 0:
                 continue
+
+            # 每一筆交易用「交易當天有效」的權證身分歸屬標的（與 ABCDE 相同規則）。
+            # 舊版整組只用最後一次出現的標的，代號重用時舊權證的買賣會被算到新標的底下。
+            identity = resolve_identity(identity_fields, row_dict["日期"])
+            warrant_name = identity["warrant_name"]
+            underlying_code = identity["underlying_code"]
+            underlying_name = identity["underlying_name"]
 
             # 排名單位是標的股：同一標的底下所有權證合計成一筆。
             key = normalize_underlying_code_for_group(underlying_code) or str(underlying_code).strip()
@@ -23184,12 +23268,12 @@ def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None
         fallback_price = None
 
     def fallback_unit_cost(sell_price):
+        # 只用這組分點×權證自己過去的平均買價估成本。
+        # 舊版在沒有任何買進紀錄時改用「最新權證價格」甚至「賣價」當成本，
+        # 等於替沒有成本的賣出捏造報酬（賣價當成本＝0%、行情價當成本＝任意值），
+        # 而且成本不足股數仍記 0。現在這類賣出一律計入成本不足，不進入實現報酬。
         if historical_buy_qty > 0 and historical_buy_amount > 0:
             return historical_buy_amount / historical_buy_qty
-        if fallback_price is not None and fallback_price > 0:
-            return fallback_price
-        if sell_price and sell_price > 0:
-            return sell_price
         return None
 
     for row in df.itertuples(index=False):
@@ -23206,10 +23290,11 @@ def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None
         # 權證不能當沖：同一天先處理賣出，只能扣舊庫存。
         if sell_amount > 0:
             if sell_qty <= 0:
-                # API 異常時仍保留數據，不讓近10日賣超報酬率變空白。
+                # 有賣出金額卻沒有股數＝資料異常，無法配對成本。
+                # 舊版把金額同時記成收入與成本，等於硬塞一筆 0% 報酬、稀釋真實報酬；
+                # 現在計入成本不足金額，報酬率只由可配對的賣出計算。
                 if in_window:
-                    revenue += sell_amount
-                    cost += sell_amount
+                    unmatched_amount += sell_amount
                 sell_qty = 0
             else:
                 sell_price = sell_amount / sell_qty
@@ -23237,7 +23322,8 @@ def _sell_return_summary_for_item(item, start_dt, target_dt, fallback_price=None
                     if fallback_cost_price is not None and fallback_cost_price > 0:
                         allocated_revenue += sell_left * sell_price
                         allocated_cost += sell_left * fallback_cost_price
-                    else:
+                    elif in_window:
+                        # 與收入／成本相同，只統計窗口內的賣出。
                         unmatched_qty += sell_left
                         unmatched_amount += sell_left * sell_price
 
@@ -28236,7 +28322,7 @@ def _collect_api5_preflight_pairs(history_df, broker_map, sample_size):
 
     pairs = []
     seen = set()
-    for _dt, warrant_code, broker_code in work[
+    for row_dt, warrant_code, broker_code in work[
         ["_dt", "權證代號", "券商代號"]
     ].itertuples(index=False, name=None):
         warrant_key = _normalize_warrant_code_for_identity(warrant_code)
@@ -28248,7 +28334,8 @@ def _collect_api5_preflight_pairs(history_df, broker_map, sample_size):
         if (warrant_key, broker_key) in seen:
             continue
         seen.add((warrant_key, broker_key))
-        pairs.append((warrant_key, broker_key))
+        # 一併帶出這組最近一次有交易的日期，API6 探測查那一天，確定一定有資料。
+        pairs.append((warrant_key, broker_key, row_dt.strftime("%Y/%m/%d")))
         if len(pairs) >= sample_size:
             break
     return pairs
@@ -28276,6 +28363,11 @@ def preflight_check_moneydj_api5(history_df, broker_map):
         # 沒有歷史快取可挑樣本（例如第一次跑），不擋，讓主流程自己判斷。
         return True, "歷史快取無可用樣本，略過探測"
 
+    # 探測 daily 實際會用的端點：預設 daily 走 API6（指定日期區間）；
+    # 舊版一律探 API5，API5 正常不代表 API6 正常，反之亦然。
+    use_api6 = bool(MONEYDJ_DAILY_USE_API6 and MONEYDJ_DYNAMIC_HASH_ENABLED)
+    api_label = "API6" if use_api6 else "API5"
+
     total_rounds = MONEYDJ_API5_PREFLIGHT_RETRY_ROUNDS + 1
     for round_no in range(1, total_rounds + 1):
         started = time.perf_counter()
@@ -28283,30 +28375,41 @@ def preflight_check_moneydj_api5(history_df, broker_map):
         failures = 0
         elapsed_samples = []
 
-        for warrant_code, broker_code in pairs:
+        for warrant_code, broker_code, last_trade_date in pairs:
             call_started = time.perf_counter()
-            rows, ok = api5_get_with_status(
-                warrant_code,
-                broker_code,
-                history_limit=MONEYDJ_DAILY_API5_LIMIT,
-            )
+            if use_api6:
+                rows, ok = api6_get_with_status(
+                    warrant_code,
+                    broker_code,
+                    last_trade_date,
+                    last_trade_date,
+                )
+            else:
+                rows, ok = api5_get_with_status(
+                    warrant_code,
+                    broker_code,
+                    history_limit=MONEYDJ_DAILY_API5_LIMIT,
+                )
             elapsed_samples.append(time.perf_counter() - call_started)
             if ok:
                 successes += 1
             else:
                 failures += 1
+            # 已達通過門檻就不必把剩下的樣本打完。
+            if successes >= MONEYDJ_API5_PREFLIGHT_MIN_SUCCESS:
+                break
 
         avg_elapsed = (
             sum(elapsed_samples) / len(elapsed_samples) if elapsed_samples else 0.0
         )
         round_seconds = time.perf_counter() - started
         summary = (
-            f"樣本 {len(pairs)}｜成功 {successes}｜失敗 {failures}｜"
+            f"{api_label}｜樣本 {len(pairs)}｜成功 {successes}｜失敗 {failures}｜"
             f"平均 {avg_elapsed:.2f}s｜本輪 {round_seconds:.1f}s"
         )
 
         if successes >= MONEYDJ_API5_PREFLIGHT_MIN_SUCCESS:
-            print(f"  ✅ MoneyDJ API5 前置探測通過（第 {round_no} 輪）：{summary}")
+            print(f"  ✅ MoneyDJ {api_label} 前置探測通過（第 {round_no} 輪）：{summary}")
             if avg_elapsed >= MONEYDJ_THROTTLE_SLOW_SECONDS:
                 print(
                     f"  ⚠️ 但平均回應 {avg_elapsed:.1f} 秒偏慢"
@@ -28314,7 +28417,7 @@ def preflight_check_moneydj_api5(history_df, broker_map):
                 )
             return True, summary
 
-        print(f"  ⚠️ MoneyDJ API5 前置探測失敗（第 {round_no}/{total_rounds} 輪）：{summary}")
+        print(f"  ⚠️ MoneyDJ {api_label} 前置探測失敗（第 {round_no}/{total_rounds} 輪）：{summary}")
         if round_no < total_rounds and MONEYDJ_API5_PREFLIGHT_RETRY_WAIT > 0:
             print(
                 f"  ⏳ 等 {MONEYDJ_API5_PREFLIGHT_RETRY_WAIT:.0f} 秒後再探一次"
