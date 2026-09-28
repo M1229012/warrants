@@ -3238,6 +3238,9 @@ def get_branch_recent_trades(branch_name: str, stock_code: str = "", limit: int 
 # 分點 × 股票歷史事件
 # ============================================================
 
+ALL_EVENTS_SHOWN = 30
+
+
 def get_branch_stock_history(branch_name: str, stock_code: str, limit: int = 15) -> Dict[str, Any]:
     """分點在指定股票的 ABCDE 歷史事件，並依回測「結果」欄統計勝敗筆數。"""
     kf = core()
@@ -3272,10 +3275,13 @@ def get_branch_stock_history(branch_name: str, stock_code: str, limit: int = 15)
     total = int(len(rows))
     # 全部 A～E 事件（不限 K 線 70 日）：含權證清單與目前狀態；讀已快取的事件表，不另打 API
     all_events: List[Dict[str, Any]] = []
+    all_total = all_open = 0
     try:
         event_rows = load_abcde_event_rows()["events"]
         mine = event_rows[(event_rows["branch"] == canonical) & (event_rows["stock_code"] == code)].sort_values("event_date")
-        for _, r in mine.tail(30).iterrows():
+        all_total = int(len(mine))
+        all_open = sum(1 for _, r in mine.iterrows() if not str(_event_state(r)).startswith("出清"))
+        for _, r in mine.tail(ALL_EVENTS_SHOWN).iterrows():         # 圖上最多列最近 30 筆，統計用全部
             all_events.append({"event": r["event_code"], "date": _fmt_date(r["event_date"]),
                                "buy_amount_text": _money_text(r["buy_amount"]),
                                "warrants": [f"{c} {n}".strip() for c, n in _warrant_items(r)],
@@ -3283,7 +3289,7 @@ def get_branch_stock_history(branch_name: str, stock_code: str, limit: int = 15)
     except ToolDataError:
         all_events = []
     return {
-        "all_events": all_events,
+        "all_events": all_events, "all_events_total": all_total, "all_events_open": all_open,
         "found": True,
         "branch": canonical,
         "stock_code": code,

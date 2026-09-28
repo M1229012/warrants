@@ -1253,6 +1253,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
+                           today_label=panel.get('institutional_day', '今日'),
                            extra=panel.get('institutional_extra', ''), dates=last_sub)
     elif inst_h:
         draw_futures(draw, vbottom + 14, left, right, px, step, bars, dict(futures, _dates=last_sub))

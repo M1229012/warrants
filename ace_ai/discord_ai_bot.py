@@ -805,10 +805,16 @@ def _direction(latest: float, sum5: float, sum20: float) -> str:
     return "一致偏買" if signs == {1} else "一致偏賣" if signs == {-1} else "短中期分歧"
 
 
+def _day_label(data_date: Any) -> str:
+    """法人資料日期是今天才叫「今日」，否則寫 MM/DD（資料還沒更新到今天時不誤導）。"""
+    text = str(data_date or "").replace("-", "/")
+    return "今日" if text == tools.taipei_now().strftime("%Y/%m/%d") or not text else text[5:]
+
+
 def _direction_sentence(latest: float, sum5: float, sum20: float) -> str:
     """和「最近方向」格子同一套判斷：今日、近 5 日、近 20 日同向才算一致。"""
     word = _direction(latest, sum5, sum20)
-    return {"一致偏買": "，今日與短中期都偏買。", "一致偏賣": "，今日與短中期都偏賣。"}.get(word, "，今日與短中期方向不一致，仍待確認。")
+    return {"一致偏買": "，最新一日與短中期都偏買。", "一致偏賣": "，最新一日與短中期都偏賣。"}.get(word, "，最新一日與短中期方向不一致，仍待確認。")
 
 
 def institutional_focus(question: str, data: Dict[str, Any]) -> str:
@@ -822,6 +828,7 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
     """三大法人圖卡：只問單一法人時以該法人為主；數字格＋1～3 行規則式重點（每日柱與累積線畫在 K 線下方、日期對齊）。"""
     investors = {x["investor"]: x for x in data.get("investors") or []}
     focus = institutional_focus(question, data)
+    day = _day_label(data.get("data_date"))
     rows = list(data.get("rows") or [])[-20:]
     if focus:
         who, info, key = focus, investors[focus], _INVESTOR_KEYS[focus]
@@ -842,15 +849,15 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
         {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：張（正＝買超、負＝賣超）"}]
     if focus:
         sections.append({"type": "tiles", "items": [
-            {"label": f"{who}今日", "value": f"{_signed_lots(latest)} 張", "tone": "signed"},
+            {"label": f"{who}{day}", "value": f"{_signed_lots(latest)} 張", "tone": "signed"},
             {"label": "近 5 日累積", "value": _signed_lots(sum5), "tone": "signed"},
             {"label": "近 20 日累積", "value": _signed_lots(sum20), "tone": "signed"},
             {"label": "連續", "value": _streak_text(streak), "tone": "ink"}]})
-        others = [f"{n}今日 {_signed_lots(x.get('latest_lots'))}" for n, x in investors.items() if n != focus]
+        others = [f"{n}{day} {_signed_lots(x.get('latest_lots'))}" for n, x in investors.items() if n != focus]
         sections.append({"type": "note", "text": "其他法人｜" + "｜".join(others + [f"合計 {_signed_lots(data.get('total_latest_lots'))} 張"])})
     else:
         sections.append({"type": "tiles", "items": [
-            {"label": f"{n}今日", "value": f"{_signed_lots(x.get('latest_lots'))} 張", "tone": "signed"} for n, x in investors.items()]
+            {"label": f"{n}{day}", "value": f"{_signed_lots(x.get('latest_lots'))} 張", "tone": "signed"} for n, x in investors.items()]
             + [{"label": "三大法人合計", "value": f"{_signed_lots(latest)} 張", "tone": "signed"}]})
         sections.append({"type": "tiles", "items": [
             {"label": "合計近 5 日", "value": _signed_lots(sum5), "tone": "signed"},
@@ -858,7 +865,7 @@ def institutional_card(data: Dict[str, Any], question: str = "") -> Dict[str, An
             {"label": "連續", "value": _streak_text(streak), "tone": "ink"},
             {"label": "最近方向", "value": _direction(latest, sum5, sum20), "tone": "accent"}]})
     word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
-    points = [f"{who}今日{word(latest)} {abs(latest):,.0f} 張" + (f"，{_streak_text(streak)}。" if streak else "。"),
+    points = [f"{who}{day}{word(latest)} {abs(latest):,.0f} 張" + (f"，{_streak_text(streak)}。" if streak else "。"),
               f"近 5 日累積{word(sum5)} {abs(sum5):,.0f} 張，近 20 日累積{word(sum20)} {abs(sum20):,.0f} 張"
               + _direction_sentence(latest, sum5, sum20)]
     sections.append({"type": "points", "items": points})
@@ -879,6 +886,7 @@ def market_institutional_card(data: Dict[str, Any], question: str = "", with_cha
     asked = [n for n in _INVESTOR_KEYS if n.replace("商", "") in str(question)]
     focus = asked[0] if len(asked) == 1 and "三大法人" not in str(question) and asked[0] in investors else ""
     rows = list(data.get("rows") or [])[-20:]
+    day = _day_label(data.get("data_date"))
     if focus:
         info, key = investors[focus], _INVESTOR_KEYS[focus]
         who, series = focus, [float(r.get(key) or 0) for r in rows]
@@ -891,7 +899,7 @@ def market_institutional_card(data: Dict[str, Any], question: str = "", with_cha
     latest, sum5, sum20 = float(latest or 0), float(sum5 or 0), float(sum20 or 0)
     sections: List[Dict[str, Any]] = [
         {"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜單位：億元（正＝買超、負＝賣超）"},
-        {"type": "tiles", "items": [{"label": f"{n}今日", "value": _signed_yi(x.get("latest_yi")), "tone": "signed"}
+        {"type": "tiles", "items": [{"label": f"{n}{day}", "value": _signed_yi(x.get("latest_yi")), "tone": "signed"}
                                     for n, x in investors.items()]
                                    + [{"label": "三大法人合計", "value": _signed_yi(data.get("total_latest_yi")), "tone": "signed"}]},
         {"type": "tiles", "items": [
@@ -908,7 +916,7 @@ def market_institutional_card(data: Dict[str, Any], question: str = "", with_cha
                                                   f"{_streak_text(streak)}｜{_direction(latest, sum5, sum20)}"}]
     word = lambda v: "買超" if v > 0 else "賣超" if v < 0 else "持平"
     sections.append({"type": "points", "items": [] if compact else [
-        f"{who}今日{word(latest)} {abs(latest):,.2f} 億元" + (f"，{_streak_text(streak)}。" if streak else "。"),
+        f"{who}{day}{word(latest)} {abs(latest):,.2f} 億元" + (f"，{_streak_text(streak)}。" if streak else "。"),
         f"近 5 日累積{word(sum5)} {abs(sum5):,.2f} 億元，近 20 日累積{word(sum20)} {abs(sum20):,.2f} 億元"
         + _direction_sentence(latest, sum5, sum20)]})
     tpex = data.get("market") == "tpex"
@@ -967,17 +975,20 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
     return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
 
 
-def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
+def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None,
+                             chart_bars: int = 0) -> Optional[Dict[str, Any]]:
     """某分點在某檔股票的全部 A～E 事件（不限 K 線 70 日）：新到舊，每筆列金額、權證、狀態。
     numbers＝{事件日: K 線上的編號}：K 線範圍內的事件在前面加上和圖上相同的圈號。"""
     numbers = numbers or {}
     events = list(reversed(data.get("all_events") or []))
     if not events:
         return None
-    holding = sum(1 for e in events if not str(e.get("state", "")).startswith("出清"))
-    tiles = [{"label": "事件總數", "value": f"{len(events)} 筆", "tone": "ink"},
+    total = int(data.get("all_events_total") or len(events))         # 用全部事件算，不是只算圖上列出的 30 筆
+    holding = int(data["all_events_open"]) if data.get("all_events_total") else \
+        sum(1 for e in events if not str(e.get("state", "")).startswith("出清"))
+    tiles = [{"label": "事件總數", "value": f"{total} 筆", "tone": "ink"},
              {"label": "未出清", "value": f"{holding} 筆", "tone": "accent"},
-             {"label": "已出清", "value": f"{len(events) - holding} 筆", "tone": "ink"}]
+             {"label": "已出清", "value": f"{total - holding} 筆", "tone": "ink"}]
     if data.get("avg_holding_days") is not None:
         tiles.append({"label": "平均持有", "value": f"{float(data['avg_holding_days']):.0f} 天", "tone": "ink"})
     rows = []
@@ -995,7 +1006,9 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
     return {"branch": f"{data.get('branch', '')}｜{name}", "tags": ["全部 A～E 事件"], "label": "權證分點", "sections": [
         {"type": "tiles", "items": tiles},
         {"type": "rows", "items": rows},
-        {"type": "note", "text": "※ 列出此分點在這檔股票的所有 A～E 事件（新到舊）；K 線只涵蓋近 70 個交易日，圈號＝K 線上的標記編號。"}]}
+        {"type": "note", "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
+                                          else f"共 {total} 筆，列出最近 {len(events)} 筆（新到舊）")
+                                 + (f"；K 線涵蓋近 {chart_bars} 個交易日" if chart_bars else "") + "，圈號＝K 線上的標記編號。"}]}
 
 
 def warrant_summary_card(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3418,9 +3431,9 @@ def format_institutional(data: Dict[str, Any]) -> str:
     for x in data.get("investors") or []:
         streak = int(x.get("streak_days") or 0)
         tail = f"｜連買 {streak} 天" if streak > 0 else f"｜連賣 {-streak} 天" if streak < 0 else ""
-        lines.append(f"・{x['investor']}：今日 {lots(x.get('latest_lots'))}｜近 5 日 {lots(x.get('sum_5d_lots'))}"
+        lines.append(f"・{x['investor']}：{_day_label(data.get('data_date'))} {lots(x.get('latest_lots'))}｜近 5 日 {lots(x.get('sum_5d_lots'))}"
                      f"｜近 20 日 {lots(x.get('sum_20d_lots'))}{tail}")
-    lines.append(f"・三大法人合計：今日 {lots(data.get('total_latest_lots'))}｜近 5 日 {lots(data.get('total_5d_lots'))}")
+    lines.append(f"・三大法人合計：{_day_label(data.get('data_date'))} {lots(data.get('total_latest_lots'))}｜近 5 日 {lots(data.get('total_5d_lots'))}")
     return "\n".join(lines)
 
 
@@ -3433,9 +3446,9 @@ def format_market_institutional(data: Dict[str, Any]) -> str:
     for x in data.get("investors") or []:
         streak = int(x.get("streak_days") or 0)
         tail = f"｜連買 {streak} 天" if streak > 0 else f"｜連賣 {-streak} 天" if streak < 0 else ""
-        lines.append(f"・{x['investor']}：今日 {yi(x.get('latest_yi'))}｜近 5 日 {yi(x.get('sum_5d_yi'))}"
+        lines.append(f"・{x['investor']}：{_day_label(data.get('data_date'))} {yi(x.get('latest_yi'))}｜近 5 日 {yi(x.get('sum_5d_yi'))}"
                      f"｜近 20 日 {yi(x.get('sum_20d_yi'))}{tail}")
-    lines.append(f"・三大法人合計：今日 {yi(data.get('total_latest_yi'))}｜近 5 日 {yi(data.get('total_5d_yi'))}")
+    lines.append(f"・三大法人合計：{_day_label(data.get('data_date'))} {yi(data.get('total_latest_yi'))}｜近 5 日 {yi(data.get('total_5d_yi'))}")
     return "\n".join(lines)
 
 
@@ -5609,7 +5622,8 @@ class AceQueryEngine:
         elif ("institutional" in parsed.intents and parsed.intents <= {"institutional", "recent_trades", "price"}
                 and stocks_only and len(stocks_only) == len(parsed.stocks) and not parsed.sector
                 and not _INSTITUTIONAL_ANALYSIS_RE.search(question)):
-            plan = QueryPlan(route="rule_institutional", need_final_llm=True)
+            plan = QueryPlan(route="rule_institutional",
+                             need_final_llm=bool(_INSTITUTIONAL_ANALYSIS_RE.search(question) or "analysis" in parsed.intents))
             for code in stocks_only:
                 plan.add("get_institutional_flow", stock_code=code)
         else:
@@ -5742,7 +5756,7 @@ class AceQueryEngine:
             for mark in answer_image._mark_events(chart_panel) if chart_panel else []:
                 if mark.get("no") and mark.get("buy_date"):
                     numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
-            card = branch_stock_events_card(history, numbers) if history else None
+            card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or [])) if history else None
             if card:
                 # K 線點位＋全部事件清單已經說清楚：不再呼叫 Gemini、也不排文字區塊（省 5～10 秒）
                 panels.append({"branch_card": card, "hide_text": True})
@@ -5762,9 +5776,12 @@ class AceQueryEngine:
         for panel in panels:
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"
                          and r.data.get("stock_code") == panel.get("stock_code")), None)
+            if flow is not None:
+                panel["institutional_day"] = _day_label(flow.get("data_date"))
             if flow is None and market_flow and panel.get("stock_code") == ("TPEX" if market_flow.get("market") == "tpex" else "TAIEX"):
                 flow = market_flow
                 panel["institutional_unit"] = "億"
+                panel["institutional_day"] = _day_label(flow.get("data_date"))
                 if plan.route != "rule_market_institutional":
                     panel["institutional_extra"] = market_inst_extra(market_flow, question)
             if (flow is None and futures_data and panel.get("stock_code") == "TAIEX" and panel.get("bars")
