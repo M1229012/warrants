@@ -115,11 +115,30 @@ def _query(sql: str, params: tuple = ()) -> List[tuple]:
 # 同步：release 有更新才下載
 # ============================================================
 
+def _github_token() -> str:
+    """私人 repo 的 release 必須帶權杖才讀得到；公開 repo 不設也可以。"""
+    for name in ("DISCORD_AI_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _auth_headers(accept: str) -> Dict[str, str]:
+    headers = {"Accept": accept}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def release_assets(timeout: float = 20.0) -> Dict[str, Dict[str, Any]]:
     import requests
-    response = requests.get(RELEASE_API, timeout=timeout, headers={"Accept": "application/vnd.github+json"})
+    response = requests.get(RELEASE_API, timeout=timeout, headers=_auth_headers("application/vnd.github+json"))
     response.raise_for_status()
-    return {a["name"]: {"url": a["browser_download_url"], "updated_at": a.get("updated_at", ""), "size": a.get("size", 0)}
+    # 有權杖時改用 API 資產網址下載：私人 repo 的 browser_download_url 不接受權杖。
+    url_key = "url" if _github_token() else "browser_download_url"
+    return {a["name"]: {"url": a[url_key], "updated_at": a.get("updated_at", ""), "size": a.get("size", 0)}
             for a in response.json().get("assets") or []}
 
 
@@ -127,7 +146,10 @@ def _download(url: str, timeout: float = 180.0) -> Path:
     import requests
     handle, name = tempfile.mkstemp(suffix=".parquet", prefix="ace-warrant-store-")
     os.close(handle)
-    with requests.get(url, stream=True, timeout=timeout) as response:
+    # API 資產網址會轉址到 GitHub 的檔案主機；requests 換主機時會自動移除 Authorization，
+    # 權杖不會送到儲存主機。沒有權杖時與舊版相同（不帶任何標頭）。
+    headers = _auth_headers("application/octet-stream") if _github_token() else None
+    with requests.get(url, stream=True, timeout=timeout, headers=headers) as response:
         response.raise_for_status()
         with open(name, "wb") as out:
             for chunk in response.iter_content(chunk_size=1 << 20):
