@@ -31,7 +31,8 @@ _SCORE_LOCK = threading.Lock()
 
 # 全市場型態排行 v2：只比大族群（細產業／概念 ≥20 檔），綜合分數＝70% 中位＋30% 高分股占比，
 # 再去掉高度重疊的族群（重疊率＝交集 ÷ 較小族群檔數 > 70% 保留分數高者）。
-TECH_BIG_MIN = max(1, tools._env_int("DISCORD_AI_MARKET_TECH_BIG_MIN", 20))
+TECH_MIN_LIQUID = max(1, tools._env_int("DISCORD_AI_MARKET_TECH_MIN_LIQUID", 8))                       # 族群至少幾檔有量
+TECH_GROUP_MIN_VALUE = max(0.0, tools._env_float("DISCORD_AI_MARKET_TECH_GROUP_MIN_VALUE", 500_000_000.0))  # 有效股合計日均成交額
 TECH_MIN_COVERAGE = min(1.0, max(0.0, tools._env_float("DISCORD_AI_MARKET_TECH_MIN_COVERAGE", 0.8)))
 TECH_STRONG_SCORE = 75
 TECH_MEDIAN_WEIGHT = 0.7
@@ -87,6 +88,9 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
     members = _member_codes()
     universe = sorted({code for codes in members.values() for code in codes})
     liquid = _liquid_codes()
+    stats = local_market_cache.liquidity_map(LIQUIDITY_DAYS) if mode == "market_technical" else {}
+    # 型態排行只看成交金額（不看張數，高價股不吃虧）
+    value_liquid = {c for c, r in stats.items() if (r.get("avg_value") or 0) >= MIN_AVG_VALUE}
     if mode == "market_technical":
         values = local_market_cache.pattern_scores_for(universe)
         pick: Callable[[Dict[str, Any]], Optional[float]] = lambda row: row.get("score")
@@ -101,10 +105,10 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
             continue
 
         if mode == "market_technical":
-            # 純型態排行：完整族群名冊都參加，不先套成交量／成交金額門檻。
-            # v2：只比 ≥20 檔的大族群，且型態有效檔數要達 80%，小族群不會因 3 檔全高分衝到第一。
-            codes = all_codes
-            if len(codes) < TECH_BIG_MIN:
+            # v3：只用近 20 日均成交額達標的成分股計分（冷門股不拉分、不當代表股）；
+            # 有效股要夠多、合計成交額要夠大，名目檔數多但多半冷門的族群進不了榜。
+            codes = [c for c in all_codes if c in value_liquid]
+            if len(codes) < TECH_MIN_LIQUID or sum(stats[c]["avg_value"] for c in codes) < TECH_GROUP_MIN_VALUE:
                 continue
             pairs = [(c, pick(values[c])) for c in codes if c in values and pick(values[c]) is not None]
             required = max(min(TECH_MIN_VALID, len(codes)), math.ceil(len(codes) * TECH_MIN_COVERAGE))

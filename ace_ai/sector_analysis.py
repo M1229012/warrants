@@ -89,9 +89,10 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     market_residual = _residual(question, r"整體|全部|所有|市場|台股|現在|目前|今天|最大|最多|最高|比較|的|所|些|個|強|弱|好|差|誰")
     if (re.search(r"族群|類股|產業", text) and not market_residual
             and re.search(r"最強|最好|最弱|排行|排名|轉強|轉弱|結構|強勢|較強|強的|弱的|漲幅|漲最|最大", text)):
-        if re.search(r"漲幅|漲跌|漲最|盤中", text) and not re.search(r"型態|結構|技術", text):
-            return {"mode": "market_momentum", "industry": "", "name": "全市場族群"}
-        return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
+        # 預設＝漲跌幅排行（盤中即時、收盤後用最新日）；明講型態／結構／技術才走型態排行
+        if re.search(r"型態|結構|技術|線型|趨勢", text):
+            return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
+        return {"mode": "market_momentum", "industry": "", "name": "全市場族群"}
 
     # 族群清單放到最後判斷：句子裡不能有排行字眼，也不能還留著一個沒對到的族群名稱
     # （「火箭燃料族群有哪些股票」要回查不到，不是丟出整份清單）。
@@ -621,15 +622,16 @@ def _technical_market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
         "market": "", "row_kind": "sector_group",
         "pattern_score": row["composite"], "change_pct": None,
         "coverage_text": (f"中位型態 {row['median']:.1f}｜75 分以上 {row['strong_count']}/{row['coverage']}"
-                          f"（{row['strong_ratio']:.0f}%）"),
+                          f"（{row['strong_ratio']:.0f}%）｜有效 {row['members']}/{row['total_members']} 檔"),
         "ratio_text": "", "leader_text": "",
-        "extra_labels": [("TOP5", "accent", _top_stocks_text(row))] if row.get("top_stocks") else [],
+        "extra_labels": [("代表股", "accent", _top_stocks_text(row))] if row.get("top_stocks") else [],
     } for row in data.get("rows") or []]
     return {"sector": {
         "name": "大族群", "mode": "market_technical", "title_suffix": "型態排行 TOP5",
         "comparison_date": data.get("as_of", ""), "rows": rows[:5], "others": [],
         "coverage_note": "",
-        "liquidity_note": f"僅比較成分股 ≥{market_scan.TECH_BIG_MIN} 檔之族群｜綜合＝70% 中位型態＋30% 75 分以上占比",
+        "liquidity_note": (f"只計日均成交額 ≥{market_scan.MIN_AVG_VALUE / 1e4:,.0f} 萬的成分股｜"
+                           "綜合＝70% 中位型態＋30% 75 分以上占比"),
         "live_time": "",
     }}
 
@@ -711,14 +713,14 @@ def _market_radar_answer(mode: str) -> Dict[str, Any]:
         return {"text": _MARKET_HELP.get(str(data.get("reason") or ""), _MARKET_HELP["low_coverage"]),
                 "calls": 0, "cacheable": False}
     metric = "型態" if mode == "market_technical" else "漲幅"
-    lines = ([f"**大族群型態排行 TOP5**（僅比較成分股 ≥{market_scan.TECH_BIG_MIN} 檔之族群）"]
+    lines = ([f"**大族群型態排行 TOP5**（只計有成交額的成分股，有效 ≥{market_scan.TECH_MIN_LIQUID} 檔）"]
              if mode == "market_technical" else [f"**全市場族群{metric}排行**"])
     for row in data["rows"]:
         value = f"中位型態 {row['median']:.1f}" if mode == "market_technical" else f"中位漲幅 {row['median']:+.2f}%"
         if mode == "market_technical":
             lines.append(f"{row['rank']}. {row['name']}｜綜合 {row['composite']:.1f}｜{value}｜"
                          f"75 分以上 {row['strong_count']}/{row['coverage']}（{row['strong_ratio']:.0f}%）｜"
-                         f"TOP5 {_top_stocks_text(row)}")
+                         f"代表股 {_top_stocks_text(row)}")
         else:
             lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔")
     lines.append(f"資料時間：{data.get('as_of', '')} 收盤")
