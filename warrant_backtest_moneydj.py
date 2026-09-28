@@ -36,6 +36,7 @@ daily 預設採歷史保護模式：只替換指定交易日／統計日快照�
 
 import json, re, time, os, math, sys, unicodedata
 import hashlib
+import random
 import threading
 from bisect import bisect_right
 from collections import Counter, defaultdict, deque
@@ -8926,15 +8927,16 @@ def worksheet_values_for_gsheet(ws_xlsx):
     return values or [[""]]
 
 
-def read_excel_values_by_title(xlsx_path, allowed_titles=None):
-    """只讀本機 Excel，整理成 {工作表名稱: values}，不呼叫 Google Sheet API。"""
-    from openpyxl import load_workbook
+def read_excel_values_by_title(xlsx_path, allowed_titles=None, workbook=None):
+    """只讀本機 Excel，整理成 {工作表名稱: values}，不呼叫 Google Sheet API。
 
+    有傳入剛存檔的記憶體工作簿時直接沿用（先對齊成讀回後的內容）。
+    """
     allowed = None
     if allowed_titles is not None:
         allowed = {safe_worksheet_title(x) for x in allowed_titles}
 
-    wb = load_workbook(xlsx_path, data_only=False)
+    wb = _workbook_for_gsheet_upload(xlsx_path, workbook)
     result = {}
 
     for ws_xlsx in wb.worksheets:
@@ -10194,6 +10196,122 @@ def insert_missing_result_rows_to_worksheet(ws, title, new_values, data_scope=No
     )
     return len(rows_to_insert)
 
+GSHEET_REUSE_IN_MEMORY_WORKBOOK = os.getenv(
+    "GSHEET_REUSE_IN_MEMORY_WORKBOOK", "1"
+).strip().lower() not in ("0", "false", "no")
+
+
+def emulate_xlsx_reload_in_memory(wb):
+    """
+    讓「剛存檔的記憶體工作簿」變成跟 load_workbook() 讀回來完全相同的內容，
+    省掉整份工作簿（200 萬格以上）從磁碟再解析一次的時間。
+
+    必須在 wb.save() 之後呼叫；這裡會直接修改 wb，存檔內容不受影響。
+    規則逐條對照 openpyxl 3.1 的 worksheet/_writer.py 與 _reader.py：
+    1. 值為 None 且無樣式、無註解的儲存格不會寫進檔案 → 刪除，
+       max_row／max_column 才會跟讀回來一樣。
+    2. 空字串寫成無內容的 inlineStr → 讀回是 None。
+    3. 數字以 "%.16g" 寫出再轉回 int／float；NaN／inf 寫成空值 → None；
+       numpy 型別因此變回 Python 原生型別。
+    4. 日期先轉 Excel 序號；讀回時只有日期格式的儲存格才轉回 datetime
+       （date 會變成 datetime，數字放在日期格式裡也會變成 datetime）。
+    5. 布林值寫成 1／0 再讀回 bool；公式、錯誤值與合併儲存格維持原樣。
+    任何一步不符預期就拋錯，由呼叫端退回舊的「從磁碟讀回」流程。
+    """
+    from openpyxl.cell.cell import MergedCell
+    from openpyxl.compat import safe_string
+    from openpyxl.styles.numbers import is_date_format, is_timedelta_format
+    from openpyxl.utils.datetime import from_excel, to_excel
+    from openpyxl.worksheet._reader import _cast_number
+
+    if getattr(wb, "iso_dates", False):
+        raise RuntimeError("工作簿使用 iso_dates，無法保證與讀回結果一致")
+
+    epoch = wb.epoch
+    stats = {"removed": 0, "converted": 0}
+    for ws in wb.worksheets:
+        cells = ws._cells
+        if not isinstance(cells, dict):
+            raise RuntimeError(f"openpyxl 內部結構不符預期：{ws.title}")
+
+        for key, cell in list(cells.items()):
+            if isinstance(cell, MergedCell):
+                continue
+
+            value = cell._value
+            if value is None:
+                if not cell.has_style and not getattr(cell, "_comment", None):
+                    del cells[key]
+                    stats["removed"] += 1
+                continue
+
+            data_type = cell.data_type
+            if data_type == "s":
+                if value == "":
+                    new_value, new_type = None, "inlineStr"
+                elif type(value) is str:
+                    continue
+                else:
+                    new_value, new_type = str(value), "s"
+            elif data_type in ("n", "d"):
+                numeric = to_excel(value, epoch) if data_type == "d" else value
+                text = safe_string(numeric)
+                if text == "":
+                    new_value, new_type = None, "n"
+                else:
+                    number = _cast_number(text)
+                    number_format = cell.number_format
+                    if is_date_format(number_format):
+                        new_value = from_excel(
+                            number,
+                            epoch,
+                            timedelta=is_timedelta_format(number_format),
+                        )
+                        new_type = "d"
+                    else:
+                        new_value, new_type = number, "n"
+            elif data_type == "b":
+                new_value, new_type = bool(int(safe_string(value))), "b"
+            else:
+                # 公式（f）、錯誤值（e）讀回後與原值相同。
+                continue
+
+            if (
+                new_type == data_type
+                and type(new_value) is type(value)
+                and new_value == value
+            ):
+                continue
+            cell._value = new_value
+            cell.data_type = new_type
+            stats["converted"] += 1
+
+    return stats
+
+
+def _workbook_for_gsheet_upload(xlsx_path, workbook=None):
+    """優先沿用記憶體工作簿；無法保證一致時退回從磁碟讀回。"""
+    from openpyxl import load_workbook
+
+    if workbook is not None and GSHEET_REUSE_IN_MEMORY_WORKBOOK:
+        try:
+            with stage_timer("Step6a 沿用記憶體工作簿"):
+                stats = emulate_xlsx_reload_in_memory(workbook)
+            print(
+                f"  ⚡ 沿用記憶體工作簿（不重讀 xlsx）：{len(workbook.sheetnames)} 張工作表｜"
+                f"移除空白格 {stats['removed']:,}｜型別對齊 {stats['converted']:,}"
+            )
+            return workbook
+        except Exception as exc:
+            print(
+                f"  ⚠️ 記憶體工作簿無法確認與存檔一致，改回從磁碟讀回："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    with stage_timer("Step6a 讀回 xlsx 工作簿"):
+        return load_workbook(xlsx_path, data_only=False)
+
+
 def upload_excel_to_google_sheet(
     xlsx_path,
     data_scope=None,
@@ -10201,6 +10319,7 @@ def upload_excel_to_google_sheet(
     extra_scope_values=None,
     refresh_date=None,
     top15_refresh_pairs=None,
+    workbook=None,
 ):
     """
     Google Sheet 同步規則：
@@ -10230,20 +10349,17 @@ def upload_excel_to_google_sheet(
         print(f"  ⚠️ {message}")
         return {"completed": [], "failed": {}}
 
-    from openpyxl import load_workbook
-
     current_scope = str(data_scope or get_result_data_scope()).strip()
     allowed = None
     if allowed_titles is not None:
         allowed = {safe_worksheet_title(x) for x in allowed_titles}
     extra_scope_values = extra_scope_values or {}
 
-    # 【儀表】從「已存 xlsx」到「已鎖定 Google Sheet」中間實測約 303 秒沒有任何
-    # 輸出，是整段流程唯一的黑箱。絕大部分應該就耗在這裡：把剛寫好的整份
-    # 工作簿（200 萬格以上）再從磁碟讀回一次。先量出來，才知道值不值得改成
-    # 直接沿用記憶體中的 wb。
-    with stage_timer("Step6a 讀回 xlsx 工作簿"):
-        wb = load_workbook(xlsx_path, data_only=False)
+    # 從「已存 xlsx」到「已鎖定 Google Sheet」中間實測約 303 秒沒有任何輸出，
+    # 主要耗在把剛寫好的整份工作簿（200 萬格以上）再從磁碟讀回一次。
+    # 有傳入記憶體中的 wb 時直接沿用（先對齊成讀回後的內容），
+    # 無法確認一致才退回舊流程；可設 GSHEET_REUSE_IN_MEMORY_WORKBOOK=0 強制舊流程。
+    wb = _workbook_for_gsheet_upload(xlsx_path, workbook)
     try:
         xlsx_size_mb = os.path.getsize(xlsx_path) / 1024 / 1024
     except Exception:
@@ -10762,6 +10878,33 @@ def invalidate_cache_file_read_cache(path=None):
             _CACHE_FILE_READ_CACHE.pop(str(path), None)
 
 
+class HistoryCacheUnreadableError(RuntimeError):
+    """分點歷史快取檔存在但讀不出來（損壞或格式不符）。"""
+
+
+def ensure_history_cache_readable():
+    """
+    流程一開始就確認分點歷史快取讀得出來，讀不出來立刻停止。
+
+    放在最前面是為了不要先花幾十分鐘抓權證母體、API4 之後才發現歷史壞掉。
+    成功讀取的結果會進同進程讀取快取，後面的讀取直接命中，不會多讀一次。
+    """
+    try:
+        read_cache_csv(HISTORY_CACHE_PATH)
+    except HistoryCacheUnreadableError as exc:
+        print(f"  ⛔ 分點歷史快取損壞，無法讀取：{exc}")
+        print(
+            "     為避免用錯誤或過期的歷史計算 FIFO／勝率並覆蓋快取，本次停止，"
+            "不修改快取與 Google Sheet。"
+        )
+        print(
+            "     處理方式：改用上一份正常的 Actions cache（刪除最新那份 cache 後重跑），"
+            "或把該檔移走後以 REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED=1 執行完整修補重建。"
+        )
+        return False
+    return True
+
+
 def read_cache_csv(path):
     if not cache_enabled():
         return pd.DataFrame()
@@ -10786,12 +10929,21 @@ def read_cache_csv(path):
                 _CACHE_FILE_READ_CACHE[str(path)] = (signature, df.copy())
         return df
 
+    is_history_cache = os.path.abspath(str(path)) == os.path.abspath(str(HISTORY_CACHE_PATH))
+
     if os.path.exists(parquet_path):
         try:
             count_event("快取檔實際磁碟讀取")
             return remember(pd.read_parquet(parquet_path).fillna(""))
         except Exception as exc:
             print(f"  ⚠️ Parquet 快取讀取失敗：{parquet_path}｜{type(exc).__name__}: {exc}")
+            # 分點歷史是 FIFO 的唯一來源：讀不到時不可退回舊 CSV／舊 Google Sheet 快取，
+            # 否則本輪會拿舊歷史算完再存檔，把 200 天歷史悄悄蓋回舊版本；
+            # 也不可當成空快取，否則會被誤判成「尚未建立歷史」。
+            if is_history_cache:
+                raise HistoryCacheUnreadableError(
+                    f"{parquet_path}｜{type(exc).__name__}: {exc}"
+                ) from exc
 
     # 相容既有 CSV；成功讀取後會在下一次寫入時自動遷移成 Parquet。
     if os.path.exists(path):
@@ -10804,7 +10956,8 @@ def read_cache_csv(path):
             print(f"  ⚠️ CSV 快取讀取失敗：{path}｜{type(exc).__name__}: {exc}")
 
     # 只保留一次性遷移能力；正式架構不再把原始大型快取存進 Google Sheet。
-    if GSHEET_CACHE_ENABLED:
+    # 分點歷史不走這條：Google Sheet 上的舊快取早已停止更新，讀回來只會是舊資料。
+    if GSHEET_CACHE_ENABLED and not is_history_cache:
         df_from_gsheet = read_cache_from_gsheet(path)
         if df_from_gsheet is not None and not df_from_gsheet.empty:
             try:
@@ -11610,9 +11763,28 @@ def items_from_history_cache(history_df, candidate_filter=None):
 
     _label_to_code, configured_code_to_label = configured_broker_pair_maps_for_scope("all")
 
-    for key, g in df.groupby(["_券商代號鍵", "_權證代號鍵"], dropna=False, sort=False):
-        broker_code_key, warrant_code = key
-        g = g.sort_values("_日期鍵").reset_index(drop=True)
+    # 【效能】df 已依（券商代號鍵, 權證代號鍵, 日期鍵）排序且每組日期唯一，
+    # 同一組的列本來就連續且按日期排好。舊版對 15 萬組逐組 groupby → 排序 → 複製 → 改名
+    # → 再排序，約 2～3 分鐘；這裡一次算出每組的起訖位置，直接切出同樣的逐日 df。
+    # 組的順序（排序後首次出現）、欄位、型別與 0 起算的索引都與舊版相同。
+    value_frame = df[[
+        "_日期鍵", "買進股數", "賣出股數",
+        "買進金額", "賣出金額", "買超股數", "買超金額"
+    ]].rename(columns={"_日期鍵": "日期"}).reset_index(drop=True)
+    broker_keys = df["_券商代號鍵"].tolist()
+    warrant_keys = df["_權證代號鍵"].tolist()
+    group_starts = [
+        idx for idx in range(len(broker_keys))
+        if idx == 0
+        or broker_keys[idx] != broker_keys[idx - 1]
+        or warrant_keys[idx] != warrant_keys[idx - 1]
+    ]
+    group_ends = group_starts[1:] + [len(broker_keys)]
+
+    for group_start, group_end in zip(group_starts, group_ends):
+        broker_code_key = broker_keys[group_start]
+        warrant_code = warrant_keys[group_start]
+        key = (broker_code_key, warrant_code)
 
         configured_broker = configured_code_to_label.get(broker_code_key)
         if configured_broker:
@@ -11630,13 +11802,8 @@ def items_from_history_cache(history_df, candidate_filter=None):
         underlying_code = latest_display_value(key, "標的股")
         underlying_name = latest_display_value(key, "標的名稱")
 
-        item_df = g[[
-            "_日期鍵", "買進股數", "賣出股數",
-            "買進金額", "賣出金額", "買超股數", "買超金額"
-        ]].copy()
-
-        item_df = item_df.rename(columns={"_日期鍵": "日期"})
-        item_df = item_df.sort_values("日期").reset_index(drop=True)
+        item_df = value_frame.iloc[group_start:group_end].copy()
+        item_df.reset_index(drop=True, inplace=True)
 
         item = {
             "warrant_code": warrant_code,
@@ -12175,6 +12342,27 @@ def resolve_underlying_from_warrant_name(warrant_name, resolver=None):
     return result
 
 
+class _NormalizedCodeCounts(Counter):
+    """已經過 normalized_preferred_code_counts() 正規化的標的次數表。"""
+
+
+def normalized_preferred_code_counts(preferred_code_counts):
+    """
+    標的代號次數表的正規化（代號去空白、轉大寫、去 .0；空代號剔除）。
+
+    【效能】reconcile_underlying_identity() 每檔權證都會呼叫一次，舊版每次都把
+    整份次數表重新正規化（4.9 萬檔 × 數百個代號，Step1 約 70 秒）。
+    正規化是冪等的，已正規化的表直接沿用，結果完全相同。
+    """
+    if isinstance(preferred_code_counts, _NormalizedCodeCounts):
+        return preferred_code_counts
+    return _NormalizedCodeCounts({
+        normalize_security_code_text(code): int(count or 0)
+        for code, count in dict(preferred_code_counts or {}).items()
+        if normalize_security_code_text(code)
+    })
+
+
 def reconcile_underlying_identity(
     warrant_name,
     underlying_code="",
@@ -12191,11 +12379,7 @@ def reconcile_underlying_identity(
     """
     code_to_name = code_to_name if code_to_name is not None else _CURRENT_STOCK_CODE_TO_NAME
     resolver = resolver if resolver is not None else _CURRENT_UNDERLYING_RESOLVER
-    preferred_counts = Counter({
-        normalize_security_code_text(code): int(count or 0)
-        for code, count in dict(preferred_code_counts or {}).items()
-        if normalize_security_code_text(code)
-    })
+    preferred_counts = normalized_preferred_code_counts(preferred_code_counts)
     raw_code = normalize_security_code_text(underlying_code)
     raw_name = str(underlying_name or "").strip()
     master_name = str((code_to_name or {}).get(raw_code, "")).strip()
@@ -14107,6 +14291,10 @@ def get_all_call_warrants_live(cached_warrants=None):
     warrant_security_codes, preferred_underlying_counts = (
         _warrant_summary_identity_preferences(summary_df)
     )
+    # 只正規化一次，後續每檔權證的標的交叉驗證直接沿用。
+    preferred_underlying_counts = normalized_preferred_code_counts(
+        preferred_underlying_counts
+    )
 
     # 先建立唯一股號／股名主檔，禁止再用 dict(zip) 的最後一列任意覆蓋。
     # 官方全市場日行情為主；ISIN 與本機快取只做補充，權證代號一律排除。
@@ -14687,35 +14875,50 @@ def _event_warrant_identity_for_date(item, trade_date):
     warrant_code = _normalize_warrant_code_for_identity(
         item.get("warrant_code", "")
     )
-    warrant_name = str(item.get("warrant_name", "") or "").strip()
-    underlying_code = normalize_security_code_text(item.get("underlying_code", ""))
-    underlying_name = str(item.get("underlying_name", "") or "").strip()
-    changed = False
-    dated_identity_authoritative = False
-
+    dated_meta = None
     if warrant_code and _CURRENT_WARRANT_INTERVAL_RECORDS:
         dated_meta = _warrant_lookup(
             _CURRENT_WARRANT_INTERVAL_RECORDS,
             trade_date,
         ).get(warrant_code)
-        if isinstance(dated_meta, dict):
-            dated_identity_authoritative = True
-            meta_name = str(dated_meta.get("名稱", "") or "").strip()
-            meta_underlying = normalize_security_code_text(
-                dated_meta.get("標的股", "")
-            )
-            meta_underlying_name = str(
-                dated_meta.get("標的名稱", "") or ""
-            ).strip()
-            if meta_name and meta_name != warrant_name:
-                warrant_name = meta_name
-                changed = True
-            if meta_underlying and meta_underlying != underlying_code:
-                underlying_code = meta_underlying
-                changed = True
-            if meta_underlying_name and meta_underlying_name != underlying_name:
-                underlying_name = meta_underlying_name
-                changed = True
+    return _event_warrant_identity_from_meta(
+        warrant_code,
+        str(item.get("warrant_name", "") or "").strip(),
+        normalize_security_code_text(item.get("underlying_code", "")),
+        str(item.get("underlying_name", "") or "").strip(),
+        dated_meta,
+    )
+
+
+def _event_warrant_identity_from_meta(
+    warrant_code,
+    warrant_name,
+    underlying_code,
+    underlying_name,
+    dated_meta,
+):
+    """_event_warrant_identity_for_date 的純計算部分：只依輸入與本輪固定的主檔決定結果。"""
+    changed = False
+    dated_identity_authoritative = False
+
+    if isinstance(dated_meta, dict):
+        dated_identity_authoritative = True
+        meta_name = str(dated_meta.get("名稱", "") or "").strip()
+        meta_underlying = normalize_security_code_text(
+            dated_meta.get("標的股", "")
+        )
+        meta_underlying_name = str(
+            dated_meta.get("標的名稱", "") or ""
+        ).strip()
+        if meta_name and meta_name != warrant_name:
+            warrant_name = meta_name
+            changed = True
+        if meta_underlying and meta_underlying != underlying_code:
+            underlying_code = meta_underlying
+            changed = True
+        if meta_underlying_name and meta_underlying_name != underlying_name:
+            underlying_name = meta_underlying_name
+            changed = True
 
     resolved = resolve_underlying_from_warrant_name(
         warrant_name,
@@ -14779,22 +14982,63 @@ def build_daily_records(items):
     daily_records = []
     identity_corrected = 0
 
+    # 【效能】逐列身分防錯（名稱解析、標的比對）只取決於 item 的身分欄位與
+    # 「當天有效的主檔紀錄」。同一權證同一生命週期內每天結果都一樣，
+    # 因此以（身分欄位, 主檔紀錄物件）記憶結果；主檔查詢也依日期記憶。
+    # 舊版 69 萬列逐列重算並逐列建立 namedtuple，約 3～4 分鐘。
+    interval_records = _CURRENT_WARRANT_INTERVAL_RECORDS
+    lookup_by_date = {}
+    identity_cache = {}
+    value_columns = ("買進股數", "賣出股數", "買進金額", "賣出金額", "買超股數", "買超金額")
+
     for item in items:
         if not item["underlying_code"]:
             continue
 
-        for row in item["df"].itertuples(index=False):
-            row_dict = row._asdict()
-            identity = _event_warrant_identity_for_date(
-                item,
-                row_dict["日期"],
+        warrant_code = _normalize_warrant_code_for_identity(item.get("warrant_code", ""))
+        warrant_name = str(item.get("warrant_name", "") or "").strip()
+        underlying_code = normalize_security_code_text(item.get("underlying_code", ""))
+        underlying_name = str(item.get("underlying_name", "") or "").strip()
+
+        df = item["df"]
+        columns = [df["日期"].tolist()] + [df[column].tolist() for column in value_columns]
+        for trade_date, buy_s, sell_s, buy_a, sell_a, net_s, net_a in zip(*columns):
+            dated_meta = None
+            if warrant_code and interval_records:
+                try:
+                    lookup = lookup_by_date[trade_date]
+                except (KeyError, TypeError):
+                    lookup = _warrant_lookup(interval_records, trade_date)
+                    try:
+                        lookup_by_date[trade_date] = lookup
+                    except TypeError:
+                        pass
+                dated_meta = lookup.get(warrant_code)
+
+            cache_key = (
+                warrant_code,
+                warrant_name,
+                underlying_code,
+                underlying_name,
+                id(dated_meta) if dated_meta is not None else None,
             )
+            identity = identity_cache.get(cache_key)
+            if identity is None:
+                identity = _event_warrant_identity_from_meta(
+                    warrant_code,
+                    warrant_name,
+                    underlying_code,
+                    underlying_name,
+                    dated_meta,
+                )
+                identity_cache[cache_key] = identity
+
             if identity["changed"]:
                 identity_corrected += 1
             if not identity["underlying_code"] or not identity["warrant_code"]:
                 continue
             daily_records.append({
-                "日期": row_dict["日期"],
+                "日期": trade_date,
                 "分點": item["broker_label"],
                 "分點名稱": item["broker_name"],
                 "券商代號": item["broker_code"],
@@ -14802,12 +15046,12 @@ def build_daily_records(items):
                 "權證名稱": identity["warrant_name"],
                 "標的股": identity["underlying_code"],
                 "標的名稱": identity["underlying_name"],
-                "買進股數": int(row_dict["買進股數"]),
-                "賣出股數": int(row_dict["賣出股數"]),
-                "買進金額": int(row_dict["買進金額"]),
-                "賣出金額": int(row_dict["賣出金額"]),
-                "買超股數": int(row_dict["買超股數"]),
-                "買超金額": int(row_dict["買超金額"]),
+                "買進股數": int(buy_s),
+                "賣出股數": int(sell_s),
+                "買進金額": int(buy_a),
+                "賣出金額": int(sell_a),
+                "買超股數": int(net_s),
+                "買超金額": int(net_a),
             })
 
     if identity_corrected:
@@ -14962,6 +15206,21 @@ def build_amount_class_events(daily_records, item_map):
 
     _label_to_code, code_to_label = configured_broker_pair_maps_for_scope("all")
     group_cols = ["_券商代號鍵", "_標的股鍵", "_日期鍵"]
+
+    # 【效能】資格預篩：與迴圈第一道判斷完全相同的定義——
+    # 「同分點×同標的×同一天」內，各權證買進金額合計的最大值 < AMOUNT_THRESH 就不成立事件。
+    # 舊版對每一組（數十萬組）都跑一次 pandas groupby 才發現不合格，約 9 分鐘；
+    # 這裡一次向量化算完，只把可能成立的組（數千組）交給下面原本的逐組邏輯。
+    # 過濾只刪除整組，不改變保留組的列內容與出現順序，因此事件結果與順序不變。
+    per_warrant_buy = df.groupby(
+        group_cols + ["權證代號"], dropna=False, sort=False
+    )["買進金額"].transform("sum")
+    group_max_buy = per_warrant_buy.groupby(
+        [df[column] for column in group_cols], dropna=False, sort=False
+    ).transform("max")
+    df = df[group_max_buy >= AMOUNT_THRESH]
+    if df.empty:
+        return {code: [] for code in AMOUNT_CLASS_CODES}
 
     for key, g in df.groupby(group_cols, dropna=False, sort=False):
         broker_code_key, underlying_code, date = key
@@ -20156,6 +20415,23 @@ def _style_top15_cache_sheet(ws, col_widths, return_col_name="報酬率", status
 # Excel 樣式
 # ══════════════════════════════════════════════════════════════════════
 
+def _cell_style_ids(cell, keys):
+    """讀出儲存格目前的樣式編號（openpyxl 設定樣式時實際寫入的就是這些編號）。"""
+    style = cell._style
+    return tuple((key, getattr(style, key)) for key in keys)
+
+
+def _apply_cell_style_ids(cell, style_ids):
+    """把 _cell_style_ids() 取得的樣式編號套到另一格；等同於指定相同的樣式物件。"""
+    # 與 openpyxl StyleDescriptor.__set__ 相同：新建的空儲存格沒有樣式陣列，先補一個。
+    if not cell._style:
+        from openpyxl.styles.cell_style import StyleArray
+        cell._style = StyleArray()
+    style = cell._style
+    for key, value in style_ids:
+        setattr(style, key, value)
+
+
 def style_sheet(ws, col_widths, status_rows=None, header_row=1):
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -20175,19 +20451,33 @@ def style_sheet(ws, col_widths, status_rows=None, header_row=1):
         "none": PatternFill(),
     }
 
+    # 【效能】每種狀態只有一組樣式。第一次遇到時照原本方式設定（樣式加入工作簿的順序不變），
+    # 之後同狀態的儲存格直接沿用同一組樣式編號，省去每格重建並雜湊樣式物件。
+    # 結果與逐格設定完全相同；舊版 A～E 五張表合計約 2 分鐘。
     if status_rows:
+        style_ids_by_status = {}
         for r_idx, status_row in enumerate(status_rows, header_row + 1):
             for c_idx, status in enumerate(status_row, 1):
                 cell = ws.cell(r_idx, c_idx)
-                cell.fill = fill_map.get(status, PatternFill())
-                cell.font = Font(color="000000")
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                style_ids = style_ids_by_status.get(status)
+                if style_ids is None:
+                    cell.fill = fill_map.get(status, PatternFill())
+                    cell.font = Font(color="000000")
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    style_ids_by_status[status] = _cell_style_ids(cell, ("fillId", "fontId", "alignmentId"))
+                else:
+                    _apply_cell_style_ids(cell, style_ids)
             ws.row_dimensions[r_idx].height = 36
     else:
+        style_ids = None
         for row in ws.iter_rows(min_row=header_row + 1):
             for cell in row:
-                cell.font = Font(color="000000")
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                if style_ids is None:
+                    cell.font = Font(color="000000")
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    style_ids = _cell_style_ids(cell, ("fontId", "alignmentId"))
+                else:
+                    _apply_cell_style_ids(cell, style_ids)
 
     ws.freeze_panes = f"A{header_row + 1}"
 
@@ -20261,6 +20551,7 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
         fixed_len = 24
 
     ws.append(headers)
+    current_row_idx = 1
     status_rows = []
     exit_profit_result_cells = []
 
@@ -20341,7 +20632,9 @@ def write_group_sheet(wb, sheet_name, events, price_cache, is_c=False):
             ] + day_values
 
         ws.append(row)
-        current_row_idx = ws.max_row
+        # 新工作表只有表頭加上逐列 append，剛寫入的列號就是累計列數；
+        # 舊版每列呼叫 ws.max_row，要掃過整張表所有儲存格（數萬列時約 40 秒）。
+        current_row_idx += 1
         status_rows.append(["none"] * fixed_len + day_status)
 
         if ev["減碼獲利%"] is not None:
@@ -20873,23 +21166,39 @@ def _daily_sell_fifo_return_map_for_item(item):
     if df is None or df.empty or "日期" not in df.columns:
         return {}
 
-    df2 = df.copy()
-    df2["日期"] = df2["日期"].map(normalize_date_str)
-    df2["dt_parsed"] = df2["日期"].map(parse_date)
-    df2 = df2.dropna(subset=["dt_parsed"]).sort_values(["dt_parsed", "日期"]).reset_index(drop=True)
+    # 【效能】與舊版 copy → map → dropna → sort_values → itertuples 等價：
+    # 日期正規化、無法解析的日期剔除、依（日期, 日期字串）排序。
+    # 缺欄位時視為 0，與舊版 row_dict.get(欄位, 0) 相同。
+    row_count = len(df)
+
+    def column_values(name):
+        return df[name].tolist() if name in df.columns else [0] * row_count
+
+    parsed_rows = []
+    for raw_date, buy_qty_raw, buy_amount_raw, sell_qty_raw, sell_amount_raw in zip(
+        df["日期"].tolist(),
+        column_values("買進股數"),
+        column_values("買進金額"),
+        column_values("賣出股數"),
+        column_values("賣出金額"),
+    ):
+        date_str = normalize_date_str(raw_date)
+        parsed_dt = parse_date(date_str)
+        if parsed_dt is None:
+            continue
+        parsed_rows.append((parsed_dt, date_str, buy_qty_raw, buy_amount_raw, sell_qty_raw, sell_amount_raw))
+    parsed_rows.sort(key=lambda values: (values[0], values[1]))
 
     lots = []
     out = {}
     historical_buy_qty = 0.0
     historical_buy_amount = 0.0
 
-    for row in df2.itertuples(index=False):
-        row_dict = row._asdict()
-        date_str = normalize_date_str(row_dict.get("日期", ""))
-        buy_qty = top15_safe_float(row_dict.get("買進股數", 0), 0.0)
-        buy_amount = top15_safe_float(row_dict.get("買進金額", 0), 0.0)
-        sell_qty = top15_safe_float(row_dict.get("賣出股數", 0), 0.0)
-        sell_amount = top15_safe_float(row_dict.get("賣出金額", 0), 0.0)
+    for _parsed_dt, date_str, buy_qty_raw, buy_amount_raw, sell_qty_raw, sell_amount_raw in parsed_rows:
+        buy_qty = top15_safe_float(buy_qty_raw, 0.0)
+        buy_amount = top15_safe_float(buy_amount_raw, 0.0)
+        sell_qty = top15_safe_float(sell_qty_raw, 0.0)
+        sell_amount = top15_safe_float(sell_amount_raw, 0.0)
 
         # 權證不能當沖：同一天賣出先扣舊庫存，不吃同日買進。
         if sell_amount > 0:
@@ -21041,6 +21350,23 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
         if df is None or df.empty:
             continue
 
+        # 【效能】本表只輸出 cutoff 之後、有賣出股數與賣出金額的列。
+        # 近 N 日沒有這種列的組合（絕大多數）不會產生任何輸出，
+        # 不必複製 df、也不必替它重跑整段 FIFO（舊版 15 萬組全部重算，約 8 分鐘）。
+        # 判斷條件與下方迴圈完全相同；int() 的轉換也相同，異常值照樣會在這裡拋錯。
+        if {"日期", "賣出股數", "賣出金額"}.issubset(df.columns) and not any(
+            int(sell_s or 0) > 0
+            and int(sell_a or 0) > 0
+            and (trade_dt := parse_date(normalize_date_str(date_value))) is not None
+            and trade_dt >= cutoff_dt
+            for date_value, sell_s, sell_a in zip(
+                df["日期"].tolist(),
+                df["賣出股數"].tolist(),
+                df["賣出金額"].tolist(),
+            )
+        ):
+            continue
+
         position = 0
         df2 = df.copy()
         df2["日期"] = df2["日期"].map(normalize_date_str)
@@ -21158,15 +21484,24 @@ def write_daily_sell_detail_sheet(wb, items, a_events, b_events, c_events, d_eve
         "賣超": GREEN,
     }
 
+    # 【效能】同一狀態的列樣式完全相同：第一次照原本方式設定，其餘直接沿用樣式編號。
+    style_ids_by_status = {}
     for row in ws.iter_rows(min_row=2):
         status = str(row[5].value or "").strip()
         row_fill = fill_map.get(status, WHITE)
 
         for cell in row:
-            cell.font = Font(color="000000")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = normal_border
-            cell.fill = row_fill
+            style_ids = style_ids_by_status.get(status)
+            if style_ids is None:
+                cell.font = Font(color="000000")
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = normal_border
+                cell.fill = row_fill
+                style_ids_by_status[status] = _cell_style_ids(
+                    cell, ("fontId", "alignmentId", "borderId", "fillId")
+                )
+            else:
+                _apply_cell_style_ids(cell, style_ids)
 
         ws.row_dimensions[row[0].row].height = 28
 
@@ -24639,6 +24974,9 @@ def build_excel(a_events, b_events, c_events, d_events, e_events, item_map, pric
                 "  ⚠️ 取不到市場交易日曆，D+ 已自動退回舊的『用有價格的日子當日曆』行為。"
             )
 
+    # 回傳記憶體工作簿，讓 Google Sheet 同步不必再從磁碟讀回一次。
+    return wb
+
 
 
 
@@ -24728,6 +25066,7 @@ def build_selected_scope_excel(
     output_path,
     top15_detail_rows=None,
     top15_consensus_rows=None,
+    return_workbook=False,
 ):
     """只建立每日流程需要的 8 張精選五分點結果表；資料全部來自同次完整追蹤分點結果。"""
     a_events, b_events, c_events, d_events, e_events = selected_events
@@ -24748,6 +25087,8 @@ def build_selected_scope_excel(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     wb.save(output_path)
+    if return_workbook:
+        return output_path, wb
     return output_path
 
 
@@ -26160,9 +26501,61 @@ MONEYDJ_MAX_INVALID_ROW_COUNT = max(
     int(os.getenv("MONEYDJ_MAX_INVALID_ROW_COUNT", "3")), 0)
 
 
+# API5／API6 的 V2～V5 是買股數、賣股數、買金額（仟元）、賣金額（仟元）。
+# 舊版只檢查欄位存在，"N/A"、"nan" 之類的值會在轉換時悄悄變成 0，
+# 例如賣出 100 股、金額 N/A → 以 0 元賣出，FIFO 報酬直接算成 -100%。
+# 這裡把「看得到但不是合法數字」的列當成異常列，走與缺欄位相同的容忍／拒收規則。
+# 設 MONEYDJ_STRICT_NUMERIC_FIELDS=0 可回到舊行為。
+MONEYDJ_STRICT_NUMERIC_FIELDS = os.getenv(
+    "MONEYDJ_STRICT_NUMERIC_FIELDS", "1"
+).strip().lower() not in ("0", "false", "no")
+_MONEYDJ_NUMERIC_FIELDS_BY_SOURCE = {
+    "API5": ("V2", "V3", "V4", "V5"),
+    "API6": ("V2", "V3", "V4", "V5"),
+}
+# 常見的「零／無」佔位符號，視為 0，不當成異常。
+_MONEYDJ_ZERO_PLACEHOLDERS = {"-", "--", "—", "－", "–"}
+_MONEYDJ_INVALID_NUMERIC_SAMPLES = []
+_MONEYDJ_INVALID_NUMERIC_SAMPLES_LOCK = threading.Lock()
+_MONEYDJ_INVALID_NUMERIC_SAMPLE_LIMIT = 5
+
+
+def _moneydj_numeric_field_ok(value):
+    """買賣股數／金額必須是有限、非負的數字（允許千分位逗號與零佔位符號）。"""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(value) and value >= 0
+    text = str(value).replace(",", "").strip()
+    if text in _MONEYDJ_ZERO_PLACEHOLDERS:
+        return True
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number >= 0
+
+
+def _moneydj_note_invalid_numeric(source_name, field, value, row):
+    """只印前幾筆異常數值樣本，避免 log 被洗版，又能看出對方實際回了什麼。"""
+    with _MONEYDJ_INVALID_NUMERIC_SAMPLES_LOCK:
+        if len(_MONEYDJ_INVALID_NUMERIC_SAMPLES) >= _MONEYDJ_INVALID_NUMERIC_SAMPLE_LIMIT:
+            return
+        _MONEYDJ_INVALID_NUMERIC_SAMPLES.append((source_name, field, value))
+    print(
+        f"  ⚠️ {source_name} 數值欄位異常：{field}={value!r}｜"
+        f"日期={row.get('V1', '-')!r}｜此列不採用（不再當成 0）"
+    )
+
+
 def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_name="MoneyDJ"):
     """外層結構嚴格；獨立交易列略過並計數，超過比例或全部無效則拒收。"""
     stats = {"source": source_name, "total": 0, "invalid": 0, "valid": 0, "ratio": 0.0}
+    numeric_fields = (
+        _MONEYDJ_NUMERIC_FIELDS_BY_SOURCE.get(source_name, ())
+        if MONEYDJ_STRICT_NUMERIC_FIELDS
+        else ()
+    )
     _THREAD_LOCAL.moneydj_parse_stats = stats
     data = json.loads(response_content.decode("utf-8-sig"))
     blocks = data if isinstance(data, list) else [data]
@@ -26188,6 +26581,18 @@ def _moneydj_json_rows(response_content, required_fields=("V1", "V2"), source_na
                 for field in required_fields
             ):
                 stats["invalid"] += 1
+                continue
+            bad_field = next(
+                (
+                    field for field in numeric_fields
+                    if not _moneydj_numeric_field_ok(row.get(field))
+                ),
+                None,
+            )
+            if bad_field is not None:
+                stats["invalid"] += 1
+                count_event(f"{source_name} 數值欄位異常列")
+                _moneydj_note_invalid_numeric(source_name, bad_field, row.get(bad_field), row)
                 continue
             rows.append(row)
     stats["valid"] = len(rows)
@@ -27080,6 +27485,95 @@ def _save_prescan_failed_codes(failed_codes, target_date):
         print(f"  ⚠️ 預篩失敗代號寫入失敗：{type(exc).__name__}: {exc}")
 
 
+# daily 單日預篩只掃「目標日官方行情有成交」的權證。
+# 當天沒成交的權證不可能有分點買賣：2026/09/24 實測抽 1,000 檔無成交權證，
+# MoneyDJ API4 當日分點列 0 檔（對照組 60 檔有成交者 60 檔都有）。
+# 全市場 4.2 萬檔權證中當日有成交約 1.9 萬檔，可省下約 2.3 萬次 API4（約 25 分鐘）；
+# 每日固定失敗的 669 檔（MoneyDJ 沒收錄的指數／商品型權證）也都屬於無成交，一併免掃。
+# 安全條件：
+#   1. 只用於 daily 單日掃描；repair 窗口掃描不受影響。
+#   2. 兩個市場的目標日官方行情都完整才啟用，否則照舊全掃。
+#   3. 只跳過「官方行情表有列出、但沒有收盤價」的權證；行情表沒列到的照掃。
+#   4. 每次從被跳過的權證隨機抽樣實查；只要有任何一檔在目標日有分點資料，
+#      當天立即退回全市場掃描，並印出警告。
+# 設 MONEYDJ_PRESCAN_TRADED_ONLY=0 可回到全市場掃描。
+MONEYDJ_PRESCAN_TRADED_ONLY = os.getenv(
+    "MONEYDJ_PRESCAN_TRADED_ONLY", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_PRESCAN_UNTRADED_AUDIT_SAMPLE = max(
+    int(os.getenv("MONEYDJ_PRESCAN_UNTRADED_AUDIT_SAMPLE", "300")),
+    0,
+)
+
+
+def _moneydj_prescan_traded_only_filter(scan_warrants, target_dt, scan_one):
+    """回傳實際要掃描的權證清單；條件不足或抽樣發現例外時回傳原清單。"""
+    target_key = target_dt.strftime("%Y/%m/%d")
+    _fetch_market_close_snapshot_for_date(target_key)
+    if not _market_close_snapshot_fully_cached(target_key):
+        print(
+            f"  ℹ️ API4 成交預篩未啟用：{target_key} 官方行情不完整（任一市場失敗），照舊全市場掃描。"
+        )
+        return scan_warrants
+
+    prices, seen_codes = _fetch_market_close_snapshot_for_date(target_key)
+    traded = {_normalize_warrant_code_for_identity(code) for code in prices}
+    listed = {_normalize_warrant_code_for_identity(code) for code in seen_codes}
+
+    keep, skipped = [], []
+    for warrant in scan_warrants:
+        code = _normalize_warrant_code_for_identity(warrant.get("代號", ""))
+        if code and code in listed and code not in traded:
+            skipped.append(warrant)
+        else:
+            keep.append(warrant)
+    if not skipped:
+        return scan_warrants
+
+    sample_size = min(MONEYDJ_PRESCAN_UNTRADED_AUDIT_SAMPLE, len(skipped))
+    sample = random.Random(target_dt.toordinal()).sample(skipped, sample_size) if sample_size else []
+
+    def audit_one(warrant):
+        try:
+            _found, ok, latest_date = scan_one(warrant)
+            return ok, latest_date is not None
+        except Exception:
+            return False, False
+
+    hits, audit_ok = [], 0
+    if sample:
+        with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, len(sample))) as executor:
+            for warrant, (ok, has_target_rows) in zip(sample, executor.map(audit_one, sample)):
+                audit_ok += int(ok)
+                if has_target_rows:
+                    hits.append(_normalize_warrant_code_for_identity(warrant.get("代號", "")))
+
+    if hits:
+        print(
+            f"  ⚠️ API4 成交預篩自我驗證失敗：抽查 {len(sample):,} 檔無成交權證，"
+            f"有 {len(hits):,} 檔在 {target_key} 仍有分點資料（{'、'.join(hits[:10])}）；"
+            "本次退回全市場掃描，避免漏抓。"
+        )
+        count_event("API4 成交預篩自我驗證失敗")
+        return scan_warrants
+
+    # 抽查本身大多失敗時沒有任何證據，不可據此免掃；正常情況失敗率約 4%
+    # （MoneyDJ 未收錄的指數／商品型權證）。
+    if sample and audit_ok < len(sample) * 0.8:
+        print(
+            f"  ⚠️ API4 成交預篩未啟用：抽查 {len(sample):,} 檔僅成功 {audit_ok:,} 檔，"
+            "證據不足，本次照舊全市場掃描。"
+        )
+        return scan_warrants
+
+    print(
+        f"  ⚡ API4 成交預篩：目標日有成交 {len(keep):,} 檔照掃｜無成交 {len(skipped):,} 檔免掃"
+        f"｜抽查無成交 {len(sample):,} 檔（成功 {audit_ok:,}）皆無分點資料"
+    )
+    count_event("API4 成交預篩免掃權證", len(skipped))
+    return keep
+
+
 def _moneydj_scan_candidates(
     warrants,
     broker_map,
@@ -27194,6 +27688,15 @@ def _moneydj_scan_candidates(
                     api_broker_code,
                 ))
         return found, ok, latest_date
+
+    if (
+        MONEYDJ_PRESCAN_TRADED_ONLY
+        and exact_target_date
+        and not window_start_date
+        and scan_warrants
+    ):
+        scan_warrants = _moneydj_prescan_traded_only_filter(scan_warrants, target_dt, scan_one)
+        MONEYDJ_PRESCAN_TOTAL_REQUESTS = len(scan_warrants)
 
     candidates = {}
     latest_market_date = None
@@ -28712,10 +29215,21 @@ def history_for_report(history_df, broker_map, target_date):
     return history_df[dates.notna() & (dates <= target_dt) & codes.isin(active_codes)].copy()
 
 
+# 主流程提前停止（資料不可信、來源不可用、驗證未過）時的退出碼。
+# 舊版只是 return，程式退出碼仍是 0，GitHub Actions 會顯示綠燈、看起來像成功。
+# 降級模式有產出報表，仍視為成功（退出碼 0）。
+# 設 EXIT_NONZERO_ON_ABORT=0 可回到舊行為（提前停止也回 0）。
+EXIT_CODE_ABORTED = 2
+EXIT_NONZERO_ON_ABORT = os.getenv(
+    "EXIT_NONZERO_ON_ABORT", "1"
+).strip().lower() not in ("0", "false", "no")
+
+
 def main():
     """
     對外進入點：不論正常結束、提前 return 或例外，都保證印出分段耗時。
     真正的流程在 _main_impl()；這層只負責把效能數據吐出來。
+    回傳 None＝完成（含降級模式），EXIT_CODE_ABORTED＝提前停止。
     """
     started = time.time()
     try:
@@ -28739,6 +29253,10 @@ def _main_impl():
     degraded_mode = False
     degraded_original_target = ""
     configure_run_mode()
+
+    # 先確認分點歷史快取讀得出來；壞掉就立刻停，不要先跑完母體與 API4 才發現。
+    if USE_CACHE and not ensure_history_cache_readable():
+        return EXIT_CODE_ABORTED
 
     today_fn = datetime.today().strftime("%Y%m%d")
     output_run_stamp = datetime.today().strftime("%Y%m%d_%H%M%S")
@@ -28779,14 +29297,14 @@ def _main_impl():
     record_stage_seconds("Step1 權證母體", time.perf_counter() - _stage_t)
     if not warrants:
         print("  ⚠️ 權證清單無法取得，本次停止，不修改 Google Sheet。")
-        return
+        return EXIT_CODE_ABORTED
 
     _stage_t = time.perf_counter()
     broker_map = filter_broker_map_for_active_targets(find_broker_codes_moneydj(warrants))
     record_stage_seconds("Step2 分點代號", time.perf_counter() - _stage_t)
     if not broker_map:
         print("  ⚠️ MoneyDJ 分點代號無法取得，本次停止，不修改 Google Sheet。")
-        return
+        return EXIT_CODE_ABORTED
 
     _stage_t = time.perf_counter()
     run_automatic_cache_maintenance(warrants)
@@ -28815,7 +29333,7 @@ def _main_impl():
             "     既有快取與 Google Sheet 完全沒有被修改，稍後重跑即可。"
         )
         print_moneydj_health_report()
-        return
+        return EXIT_CODE_ABORTED
 
     if workflow_is_repair() and REPAIR_FULL_HISTORY_FROM_MONEYDJ_ENABLED:
         # repair 的基準日一樣先確認 MoneyDJ 是否已發布，避免用尚未更新的日期重建。
@@ -28829,7 +29347,7 @@ def _main_impl():
                 f"  ⚠️ repair 無法確認 {market_target_date} 或之前的最近已發布交易日；"
                 "保留原歷史快取，本次不修改 Google Sheet。"
             )
-            return
+            return EXIT_CODE_ABORTED
 
         print(f"  ✅ repair 基準交易日：{repair_target_date}")
         _PRICE_PLAN_MAX_PUBLISHED_DATE = normalize_date_str(repair_target_date)
@@ -28852,11 +29370,11 @@ def _main_impl():
                 "本次停止且不修改 Google Sheet。"
             )
             print("  ℹ️ 既有歷史快取完全保留；下次 repair 會重新嘗試。")
-            return
+            return EXIT_CODE_ABORTED
 
         if history_cache_df is None or history_cache_df.empty:
             print("  ⚠️ repair 重建後歷史為空，本次停止，不修改 Google Sheet。")
-            return
+            return EXIT_CODE_ABORTED
 
         target_date = normalize_date_str(repair_target_date)
 
@@ -28873,7 +29391,7 @@ def _main_impl():
                 "為避免用單日資料誤算 FIFO、勝率與持倉，本次停止且不修改 Google Sheet。"
             )
             print("  ℹ️ 請先執行 WORKFLOW_MODE=repair 建立完整歷史；後續 daily 將只重抓當日。")
-            return
+            return EXIT_CODE_ABORTED
 
         if MONEYDJ_DAILY_TARGET_DATE:
             requested_dt = parse_date(MONEYDJ_DAILY_TARGET_DATE)
@@ -28882,7 +29400,7 @@ def _main_impl():
                     "  ⚠️ MONEYDJ_DAILY_TARGET_DATE 格式錯誤；"
                     "請使用 YYYY/MM/DD 或 YYYY-MM-DD，本次停止。"
                 )
-                return
+                return EXIT_CODE_ABORTED
             requested_daily_target = (
                 resolve_latest_trading_date_on_or_before(requested_dt)
             )
@@ -28919,7 +29437,7 @@ def _main_impl():
                 f"  ⚠️ MoneyDJ 無法確認 {requested_daily_target} 或之前的"
                 "最近已發布交易日；保留原歷史快取，本次不修改 Google Sheet。"
             )
-            return
+            return EXIT_CODE_ABORTED
 
         print(f"  ✅ 本次實際目標交易日：{target_date}")
         _PRICE_PLAN_MAX_PUBLISHED_DATE = target_date
@@ -28941,7 +29459,7 @@ def _main_impl():
             )
             if history_cache_df is None:
                 print_moneydj_health_report()
-                return
+                return EXIT_CODE_ABORTED
 
         _stage_t = time.perf_counter()
         history_cache_df = refresh_history_from_moneydj(
@@ -28997,7 +29515,7 @@ def _main_impl():
                 else:
                     print("  ⛔ 快取最後交易日就是目標日本身，沒有可退的日期，本次停止。")
                 print("  ℹ️ 既有快取與 Google Sheet 完全沒有被修改。")
-                return
+                return EXIT_CODE_ABORTED
 
             degraded_mode = True
             degraded_original_target = normalize_date_str(target_date)
@@ -29179,7 +29697,7 @@ def _main_impl():
             "可用 WARRANT_NAME_UNRESOLVED_TOLERANCE 調整門檻，"
             "或設 WARRANT_NAME_ALLOW_MARKED_FALLBACK=0 強制零容忍。"
         )
-        return
+        return EXIT_CODE_ABORTED
     if marked_unresolved_count:
         print(
             f"  ⚠️ 權證名稱完整性驗證："
@@ -29243,7 +29761,7 @@ def _main_impl():
                     "停止，不建立／覆寫勝率報表。可先補齊價格後重跑；"
                     "不建議關閉 WINRATE_MARK_TO_MARKET_FAIL_ON_UNRESOLVED。"
                 )
-                return
+                return EXIT_CODE_ABORTED
     elif workflow_is_repair():
         print(
             "  ⚠️ WINRATE_MARK_TO_MARKET_REPAIR_ENABLED=0："
@@ -29364,7 +29882,7 @@ def _main_impl():
     record_stage_seconds("Step4 repair 延伸報表（7/14/21日＋近10日）", time.perf_counter() - _stage_t)
 
     _stage_t = time.perf_counter()
-    build_excel(
+    main_workbook = build_excel(
         a_events, b_events, c_events, d_events, e_events,
         item_map, price_cache, items, output_path,
         top15_detail_rows, top15_consensus_rows,
@@ -29377,11 +29895,17 @@ def _main_impl():
     extra_scope_values = None
     if RUN_MODE == 2:
         selected_output_path = os.path.join(OUTPUT_DIR, f"warrant_backtest_MONEYDJ_ABCDE_selected5_{output_run_stamp}.xlsx")
-        build_selected_scope_excel(
+        _selected_path, selected_workbook = build_selected_scope_excel(
             selected_items, selected_events, selected_item_map, price_cache,
             selected_output_path, selected_top15_detail_rows, selected_top15_consensus_rows,
+            return_workbook=True,
         )
-        extra_scope_values = read_excel_values_by_title(selected_output_path, allowed_titles=set(DAILY_RESULT_SHEET_TITLES))
+        extra_scope_values = read_excel_values_by_title(
+            selected_output_path,
+            allowed_titles=set(DAILY_RESULT_SHEET_TITLES),
+            workbook=selected_workbook,
+        )
+        del selected_workbook
 
     sheet_refresh_dates = normalize_date_str(target_date)
     if not workflow_is_repair() and _HISTORY_IDENTITY_REPAIR_DATES:
@@ -29444,6 +29968,7 @@ def _main_impl():
         extra_scope_values=extra_scope_values,
         refresh_date=sheet_refresh_dates,
         top15_refresh_pairs=top15_refresh_pairs,
+        workbook=main_workbook,
     )
     record_stage_seconds("Step6 同步 Google Sheet", time.perf_counter() - _stage_t)
 
@@ -29464,4 +29989,9 @@ def _main_impl():
 
 
 if __name__ == "__main__":
-    main()
+    _exit_code = main()
+    if _exit_code:
+        if EXIT_NONZERO_ON_ABORT:
+            print(f"\n⛔ 本次提前停止，未完成更新（退出碼 {int(_exit_code)}）。原因請看上方 ⚠️／⛔ 訊息。")
+            sys.exit(int(_exit_code))
+        print("\n⛔ 本次提前停止，未完成更新（EXIT_NONZERO_ON_ABORT=0，仍以退出碼 0 結束）。")
