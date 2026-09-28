@@ -444,14 +444,13 @@ def _quote_bucket(now=None) -> str:
 
 
 def _mis_price(item: Dict[str, Any]) -> float:
-    """z＝最新成交；盤中瞬間沒有成交時是 "-"，退回最佳買價第一檔。"""
-    for raw in (item.get("z"), str(item.get("b") or "").split("_")[0]):
-        try:
-            value = float(raw)
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            continue
+    """只使用最新成交價；買一價不是成交價，不能用來計算漲幅。"""
+    try:
+        value = float(item.get("z"))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
     return 0.0
 
 
@@ -472,6 +471,7 @@ def _thread_session():
 
 _HTTP_LOCK = threading.Lock()
 _HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
+_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set()}   # 本輪彙總（用代號去重，重試不重算）
 
 
 def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -482,11 +482,26 @@ def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str
 
 def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
     session = session or _thread_session()               # 並行時傳 None，各執行緒用自己的 session
+    try:
+        markets = local_market_cache.stock_markets(codes)
+    except local_market_cache.DBError as exc:
+        _log_once("member_market_db", f"⚠️ MIS 成員市場別查詢失敗｜{type(exc).__name__}；本批不猜市場別")
+        markets = {}
+    channels = {}
+    for code in codes:
+        market = markets.get(code)
+        prefix = {"twse": "tse", "tpex": "otc"}.get(market)
+        if prefix:
+            channels[code] = f"{prefix}_{code}.tw"
+    with _HTTP_LOCK:
+        _BATCH_STATS["unknown"].update(c for c in codes if c not in channels)
+    if not channels:
+        return {}  # 市場別未知時不猜上市；交給覆蓋率檢查處理
     with _HTTP_LOCK:
         _HTTP_SENT[0] += 1
     began, status, items = time.perf_counter(), 0, []
     try:
-        response = session.get(MIS_URL, params={"ex_ch": "|".join(f"tse_{c}.tw" for c in codes),
+        response = session.get(MIS_URL, params={"ex_ch": "|".join(channels.values()),
                                                 "json": "1", "delay": "0"},
                                headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
         status = int(response.status_code)
@@ -500,14 +515,28 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         except Exception:
             pass
     out: Dict[str, Dict[str, Any]] = {}
+    today, no_trade = set(), set()
     for item in items:
         code = str(item.get("c") or "")
+        channel = channels.get(code)
+        if not channel or (item.get("ch") and item["ch"] != f"{code}.tw") \
+                or (item.get("ex") and item["ex"] != channel.split("_", 1)[0]):
+            continue
         price, previous = _mis_price(item), _num_field(item, "y")
-        if code and price > 0 and previous > 0 and tools.mis_item_is_today(item):
+        is_today = tools.mis_item_is_today(item)
+        if is_today:
+            today.add(code)
+            if price <= 0:
+                no_trade.add(code)
+        if code and price > 0 and previous > 0 and is_today:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
                          "value": lots * 1000 * price}     # 成交金額近似值（MIS 沒有逐檔成交金額）
+    with _HTTP_LOCK:
+        _BATCH_STATS["today"].update(today)
+        _BATCH_STATS["no_trade"].update(no_trade)
+        _BATCH_STATS["no_trade"].difference_update(out)   # 重試時有成交價就不算
     return out
 
 
@@ -523,6 +552,8 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     deadline = began + MEMBER_DEADLINE
     with _HTTP_LOCK:
         sent_before = _HTTP_SENT[0]
+        for bucket in _BATCH_STATS.values():
+            bucket.clear()
     request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
     batches = [codes[start:start + MEMBER_BATCH] for start in range(0, len(codes), MEMBER_BATCH)]
     # 有限並行（4 條）＋整體時限；逾時的批次直接放棄，缺的代號交給下面的小批重試
@@ -548,7 +579,10 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     missing = [c for c in codes if c not in out]
     with _HTTP_LOCK:
         sent = _HTTP_SENT[0] - sent_before     # 同時有其他查詢在抓時會一起算進來，屬上限值
+        unknown, today = len(_BATCH_STATS["unknown"]), len(_BATCH_STATS["today"])
+        no_trade = len(_BATCH_STATS["no_trade"])
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
+          f"｜市場別不明={unknown}｜無成交價={no_trade}/{today}（今日有效，未用買一價）"
           f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)
     return out

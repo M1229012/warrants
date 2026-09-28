@@ -736,6 +736,21 @@ def stock_market(stock_code: str) -> str:
     return str(rows[0][0]) if rows else ""
 
 
+def stock_markets(stock_codes: Iterable[str]) -> Dict[str, str]:
+    """批次取得每檔最新的上市／上櫃別；未知代號不回傳。"""
+    codes = list(dict.fromkeys(str(code).strip() for code in stock_codes if str(code).strip()))
+    if not codes:
+        return {}
+    marks = ",".join("?" for _ in codes)
+    rows = _read_strict(
+        "SELECT b.stock_code, b.market FROM daily_bars AS b JOIN "
+        "(SELECT stock_code, MAX(date) AS date FROM daily_bars "
+        f"WHERE stock_code IN ({marks}) AND market IN ('twse','tpex') "
+        "GROUP BY stock_code) AS latest "
+        "ON b.stock_code=latest.stock_code AND b.date=latest.date", tuple(codes))
+    return {str(code): str(market) for code, market in rows}
+
+
 def bar_dates(stock_code: str, dates: Iterable[str]) -> List[str]:
     """指定日期中，本地底庫有這檔日K 的日子。"""
     dates = [str(d) for d in dates]
