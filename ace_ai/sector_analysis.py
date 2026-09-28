@@ -615,6 +615,36 @@ def _top_stocks_text(row: Dict[str, Any]) -> str:
     return "・".join(f"{s['name']} {s['score']:.0f}" for s in row.get("top_stocks") or [])
 
 
+def _movers_text(movers: List[Dict[str, Any]]) -> str:
+    return "・".join(f"{m['name']} {m['change_pct']:+.2f}%" for m in movers or [])
+
+
+def _movers_label(movers: List[Dict[str, Any]]) -> list:
+    return [("領漲股", "accent", _movers_text(movers))] if movers else []
+
+
+def _live_top_movers(group_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """盤中：前幾名族群各抓有效成分股即時報價，取漲幅前 3（共用 5 分鐘報價快取）。失敗就回空，不影響排行。"""
+    try:
+        import sector_radar
+        by_name = {info["name"]: code for code, info in sector_roster.catalog().items()}
+        liquid = market_scan.value_liquid_codes()
+        members = {}
+        for name in group_names:
+            if name in by_name:
+                stocks = sector_roster.get_members(by_name[name]).get("stocks") or []
+                members[name] = [s["stock_code"] for s in stocks if s["stock_code"] in liquid]
+        quotes = sector_radar._quotes_for(sorted({c for codes in members.values() for c in codes}))
+        out = {}
+        for name, codes in members.items():
+            got = sorted((c for c in codes if c in quotes), key=lambda c: -quotes[c]["change_pct"])[:3]
+            out[name] = [{"code": c, "name": quotes[c].get("name", c), "change_pct": quotes[c]["change_pct"]} for c in got]
+        return out
+    except Exception as exc:
+        print(f"⚠️ 盤中族群前 3 檔取得失敗｜{type(exc).__name__}", flush=True)
+        return {}
+
+
 def _technical_market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     """大族群型態排行 TOP5（v2）：右側＝綜合分數；第二行＝中位型態＋75 分以上家數；下面一列型態 TOP5 個股。"""
     rows = [{
@@ -649,12 +679,14 @@ def _market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
         "coverage_text": (f"型態有效 {row['coverage']} / {row.get('total_members', row['members'])} 檔"
                           if technical else f"納入 {row['coverage']} / {row['members']} 檔"),
         "ratio_text": (f"75 分以上 {row['strong_ratio']:.0f}%" if technical else f"上漲家數比 {row['strong_ratio']:.0f}%"),
-        "leader_text": (f"代表股 {row['leader_name']}（{row['leader_code']}）" if row.get("leader_code") else ""),
+        "leader_text": "" if not technical else
+                       (f"代表股 {row['leader_name']}（{row['leader_code']}）" if row.get("leader_code") else ""),
+        "extra_labels": [] if technical else _movers_label(row.get("top_movers")),
     } for row in data.get("rows") or []]
     return {"sector": {
         "name": "全市場族群", "mode": "market_technical" if technical else "market_momentum",
-        "comparison_date": data.get("as_of", ""), "rows": rows[:3], "others": rows[3:5],
-        "coverage_note": "", "liquidity_note": f"共比較 {data.get('groups_ranked', 0)} 個族群（中位數排序）",
+        "comparison_date": data.get("as_of", ""), "rows": rows[:5], "others": [],
+        "coverage_note": "", "liquidity_note": f"共比較 {data.get('groups_ranked', 0)} 個族群（中位漲幅排序）｜前 3 檔只列有量成分股",
         "live_time": "",
     }}
 
@@ -681,18 +713,23 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
     if not rows:
         print(f"📡 盤中族群雷達沒有可用資料（errors={radar.get('errors') or '-'}），改用收盤底庫", flush=True)
         return None
+    rows = [r for r in rows if r.get("name") not in market_scan.EXCLUDED_NAMES]
     top = rows[:5]
+    movers = _live_top_movers([r.get("name", "") for r in top])
     panel_rows = [{
         "rank": index, "stock_code": "", "stock_name": row.get("name", ""), "market": "", "row_kind": "sector_group",
         "pattern_score": None, "change_pct": float(row.get("change_pct") or 0.0),
         "coverage_text": "盤中即時", "ratio_text": "", "leader_text": "",
+        "extra_labels": _movers_label(movers.get(row.get("name", ""))),
     } for index, row in enumerate(top, 1)]
     lines = ["**全市場族群漲幅排行｜盤中**"]
-    lines += [f"{r['rank']}. {r['stock_name']}｜{r['change_pct']:+.2f}%" for r in panel_rows]
+    lines += [f"{r['rank']}. {r['stock_name']}｜{r['change_pct']:+.2f}%"
+              + (f"｜領漲股 {_movers_text(movers.get(r['stock_name']))}" if movers.get(r['stock_name']) else "")
+              for r in panel_rows]
     lines += [f"資料時間：{radar.get('updated_at', '')}", "※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。"]
     panel = {"sector": {"name": "全市場族群", "mode": "market_momentum", "comparison_date": "",
-                        "rows": panel_rows[:3], "others": panel_rows[3:5], "coverage_note": "",
-                        "liquidity_note": "盤中即時族群指數漲跌", "live_time": str(radar.get("updated_at", ""))[-5:]}}
+                        "rows": panel_rows[:5], "others": [], "coverage_note": "",
+                        "liquidity_note": "盤中即時族群指數漲跌｜前 3 檔只列日均成交額 ≥5,000 萬的成分股", "live_time": str(radar.get("updated_at", ""))[-5:]}}
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [panel]}
 
 
@@ -722,7 +759,8 @@ def _market_radar_answer(mode: str) -> Dict[str, Any]:
                          f"75 分以上 {row['strong_count']}/{row['coverage']}（{row['strong_ratio']:.0f}%）｜"
                          f"代表股 {_top_stocks_text(row)}")
         else:
-            lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔")
+            lines.append(f"{row['rank']}. {row['name']}｜{value}｜納入 {row['coverage']}/{row['members']} 檔"
+                         + (f"｜領漲股 {_movers_text(row.get('top_movers'))}" if row.get("top_movers") else ""))
     lines.append(f"資料時間：{data.get('as_of', '')} 收盤")
     lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [_market_panel(data)]}

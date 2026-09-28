@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 import statistics
 import threading
 import time
@@ -38,6 +40,22 @@ TECH_STRONG_SCORE = 75
 TECH_MEDIAN_WEIGHT = 0.7
 TECH_OVERLAP_MAX = min(1.0, max(0.1, tools._env_float("DISCORD_AI_MARKET_TECH_OVERLAP", 0.7)))
 TECH_TOP_STOCKS = 5
+
+
+def _load_excluded() -> set:
+    try:
+        return set(json.loads((Path(__file__).parent / "sector_exclude.json").read_text(encoding="utf-8")).get("names") or [])
+    except Exception:
+        return set()
+
+
+EXCLUDED_NAMES = _load_excluded()      # 不進排行榜的題材（過時／季節／非產業），會員仍可單獨查
+
+
+def value_liquid_codes() -> set:
+    """近 N 日平均成交金額達標的股票（只看金額，高價股不吃虧）。"""
+    stats = local_market_cache.liquidity_map(LIQUIDITY_DAYS)
+    return {c for c, r in stats.items() if (r.get("avg_value") or 0) >= MIN_AVG_VALUE}
 
 
 def _liquid_codes() -> set:
@@ -101,7 +119,7 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     for group_code, info in catalog.items():
         all_codes = list(dict.fromkeys(members.get(group_code, [])))
-        if not all_codes:
+        if not all_codes or info["name"] in EXCLUDED_NAMES:
             continue
 
         if mode == "market_technical":
@@ -142,8 +160,11 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
                 "strong_count": strong_count,
                 "composite": round(TECH_MEDIAN_WEIGHT * row["median"] + (1 - TECH_MEDIAN_WEIGHT) * strong_pct, 1),
                 "top_stocks": [{"code": c, "name": names.get(c, c), "score": round(v, 1)} for c, v in top],
-                "_codes": set(all_codes),
+                "_codes": set(codes),          # 重疊用有效股判斷（冷門股不算）
             })
+        else:
+            row["top_movers"] = [{"code": c, "name": names.get(c, c), "change_pct": round(v, 2)}
+                                 for c, v in sorted(pairs, key=lambda x: -x[1])[:3]]
         rows.append(row)
     if mode == "market_technical":
         rows.sort(key=lambda r: (-r["composite"], -r["median"], r["name"]))
