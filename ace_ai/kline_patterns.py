@@ -535,7 +535,10 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             extra.append(f"今日盤中位於原{'上緣' if ev['dir'] == 1 else '下緣'} {_p(edge)} {where}（日 K 尚未完成）")
         vol_tag = ("股數基準變動，量比可比性受限" if f3_window(ev["bday"], 20) else "量能資料不足" if np.isnan(vol_ratio[ev["bday"]])
                    else ("突破日放量" if vol_ratio[ev["bday"]] >= VOL_RATIO else "突破日未達放量門檻"))
-        summary.append(f"{ev['kind']}（{_d(adj.index[ev['start']])} 起）：{main}" + ("；" + "；".join(extra) if extra else "") + f"；{vol_tag}")
+        # 起點日、突破日、目前收盤分開寫清楚，避免 AI 把「型態起點」誤當成「突破日」
+        act = "向上突破上緣" if ev["dir"] == 1 else "向下跌破下緣"
+        summary.append(f"{_d(adj.index[ev['start']])} 起形成{ev['kind']}，{_d(adj.index[ev['bday']])} 收盤{act}；"
+                       f"最新收盤 {_p(c[last_official])}，{main}" + ("；" + "；".join(extra) if extra else "") + f"；{vol_tag}")
         names.append(ev["kind"])
         up, dn = _at(ev["upper"], today), _at(ev["lower"], today)
         role_edge = "原壓力，突破待回測" if ev["dir"] == 1 else "原支撐，跌破待反抽"
@@ -564,7 +567,8 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
                 status = f"盤中越過上緣 {_p(up)}，待收盤確認"
             elif c[today] < dn - m:
                 status = f"盤中跌破下緣 {_p(dn)}，待收盤確認"
-        summary.append(f"{cur['kind']}（{_d(adj.index[cur['start']])} 起）：{status}（上緣 {_p(up)}、下緣 {_p(dn)}）")
+        summary.append(f"{_d(adj.index[cur['start']])} 起形成{cur['kind']}，尚未有效突破；最新收盤 {_p(c[today])}，"
+                       f"{status}（上緣 {_p(up)}、下緣 {_p(dn)}）")
         names.append(cur["kind"])
         levels += [f"{cur['kind']}上緣 {_p(up)}（上方候選壓力）", f"{cur['kind']}下緣 {_p(dn)}（下方候選支撐）"]
 
