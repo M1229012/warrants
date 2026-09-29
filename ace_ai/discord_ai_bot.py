@@ -153,6 +153,8 @@ class BotConfig:
     beta_tester_ids: Set[int] = field(default_factory=set)
     alert_channel_id: int = 0                                  # 管理員錯誤通知頻道；0＝不通知
     alert_mention_ids: Set[int] = field(default_factory=set)   # 嚴重錯誤要 @ 的使用者
+    # 會員限定頻道（含討論區貼文）：伺服器裡有列到的頻道時，非管理員只能在這些頻道使用；管理員不限
+    member_channel_ids: Set[int] = field(default_factory=set)
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -179,7 +181,25 @@ class BotConfig:
             weekly_pick_user_ids=_parse_id_set(os.getenv("DISCORD_AI_WEEKLY_PICK_USER_IDS", "")),
             weekly_pick_allow_admins=_env_flag("DISCORD_AI_WEEKLY_PICK_ALLOW_ADMINS", "1"),
             prefix_command_enabled=_env_flag("DISCORD_AI_PREFIX_COMMAND_ENABLE", "0"),
+            member_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_MEMBER_CHANNEL_IDS", "")),
         )
+
+
+def member_channel_block(config: BotConfig, member, channel, is_admin: bool) -> str:
+    """會員限定頻道：這個伺服器有列到的頻道時，非管理員只能在那些頻道（或其討論區貼文）使用。回傳拒絕訊息或空字串。"""
+    if is_admin or not config.member_channel_ids or channel is None:
+        return ""
+    roles = [getattr(r, "name", "") for r in getattr(member, "roles", None) or []]
+    if member is not None and not any(access_policy.is_general_role(r) for r in roles):
+        return ""                                   # 沒付費：交給後面的權限檢查顯示購買訊息
+    guild = getattr(channel, "guild", None) or getattr(member, "guild", None)
+    here = [c for c in (guild.get_channel(cid) for cid in sorted(config.member_channel_ids)) if c] if guild else []
+    if not here:
+        return ""                                   # 這個伺服器沒設定 → 不限
+    ids = {getattr(channel, "id", 0), getattr(channel, "parent_id", 0) or 0}
+    if ids & config.member_channel_ids:
+        return ""
+    return "艾斯 AI 請到以下頻道使用：" + "、".join(f"#{c.name}" for c in here)
 
 
 NOT_OPEN_MESSAGE = "目前 AI 分析功能尚未開放。"
@@ -6987,6 +7007,11 @@ def run_discord_bot(config: BotConfig) -> None:
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
         question = strip_command_prefix(question)      # 圖片標題、快取、記憶都用清乾淨的問句
+        entitled_admin = access_policy.UserEntitlement.from_member(interaction.user, config.superuser_ids).admin
+        blocked = member_channel_block(config, interaction.user, getattr(interaction, "channel", None), entitled_admin)
+        if blocked:
+            await interaction_image(interaction, "使用頻道", blocked, ephemeral=True)
+            return
         try:
             access, question = access_policy.resolve_access(interaction.user, config.superuser_ids,
                                                            question, admin_entry=admin_mode,
