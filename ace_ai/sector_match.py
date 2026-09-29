@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import sector_roster
+import warrant_ai_tools as tools
 
 ALIAS_PATH = Path(__file__).with_name("sector_aliases.json")
 CUSTOM_PATH = Path(__file__).with_name("custom_sectors.json")
@@ -67,7 +68,7 @@ def _data() -> Dict[str, Any]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception as exc:
-            print(f"⚠️ 族群設定讀取失敗：{path.name}｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 族群設定讀取失敗：{path.name}｜{tools.err_text(exc)}", flush=True)
             payload = {}
         if target == "alias":
             alias_raw = payload

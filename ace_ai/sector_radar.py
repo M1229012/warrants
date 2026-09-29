@@ -177,7 +177,7 @@ def _tick(force: bool) -> Dict[str, Any]:
         benchmarks = dict(quotes.get("benchmarks") or {})
         market_turnover = quotes.get("market_turnover")
     except Exception as exc:
-        print(f"⚠️ 官方類股指數取得失敗，本輪不存快照｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 官方類股指數取得失敗，本輪不存快照｜{tools.err_text(exc)}", flush=True)
     if not rows:   # 不用 CMoney 補：概念族群不能替代官方類股指數（兩套 universe 不混用）
         return {"saved": False, "reason": "官方類股指數取得失敗"}
     rows.sort(key=lambda r: -float(r.get("change_pct") or 0.0))
@@ -520,7 +520,7 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         response.raise_for_status()
         items = (response.json() or {}).get("msgArray") or []
     except Exception as exc:
-        print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{tools.err_text(exc)}", flush=True)
         with _HTTP_LOCK:
             _BATCH_STATS["conn_error"].add(type(exc).__name__)
     finally:
@@ -765,7 +765,7 @@ def enrich(rows: List[Dict[str, Any]], data: Dict[str, Any]) -> bool:
             shares = {c: float(v.get("shares") or 0) for c, v in index_contribution.component_universe().items()
                       if v.get("market") == "twse"}
         except Exception as exc:
-            print(f"⚠️ 發行股數取不到，主要帶動股改用成交金額｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 發行股數取不到，主要帶動股改用成交金額｜{tools.err_text(exc)}", flush=True)
             shares = {}
         members: Dict[str, List[str]] = {}
         for row in rows:

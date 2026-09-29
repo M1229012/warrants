@@ -55,7 +55,7 @@ def _load() -> Dict[str, Any]:
                 if isinstance(data, dict) and data.get("groups"):
                     break
         except Exception as exc:
-            print(f"⚠️ 族群名冊讀取失敗：{path}｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 族群名冊讀取失敗：{path}｜{tools.err_text(exc)}", flush=True)
             data = {}
     with _LOCK:
         _CACHE["data"] = data if isinstance(data, dict) else {}
@@ -250,7 +250,7 @@ def _group_names_from_cmoney() -> Dict[str, str]:
         groups = (cmoney_catalog.get_catalog() or {}).get("groups") or {}
         return {str(code).upper(): str(info.get("name") or code) for code, info in groups.items()}
     except Exception as exc:
-        print(f"⚠️ 取得 CMoney 族群名稱失敗，改用代碼當名稱｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 取得 CMoney 族群名稱失敗，改用代碼當名稱｜{tools.err_text(exc)}", flush=True)
         return {}
 
 

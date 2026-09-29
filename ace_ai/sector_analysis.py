@@ -181,7 +181,7 @@ def get_members(industry: str, display_name: str = "") -> Dict[str, Any]:
                     "tpex": sum(s["market"] == "tpex" for s in enriched),
                 }
         except Exception as exc:
-            print(f"⚠️ CMoney 族群市場別校正略過｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ CMoney 族群市場別校正略過｜{tools.err_text(exc)}", flush=True)
         return result
     if industry.startswith("fine:"):
         return fine_catalog.get_members(industry[5:])

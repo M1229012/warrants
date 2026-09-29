@@ -300,12 +300,14 @@ WARRANT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
 # 三大法人／一般籌碼不是權證分點；句中沒有明確權證字眼時，不附加也不保留 warrant。
 _INSTITUTIONAL_RE = re.compile(r"外資|投信|自營商|三大法人|法人|一般籌碼")
 _EXPLICIT_WARRANT_RE = re.compile(r"權證|分點|主力|大戶|吃貨")
+# 和「法人」一起出現時，「大戶／主力」是泛指籌碼（「法人與大戶是否買單」），只有權證／分點才蓋過法人
+_WARRANT_OVER_INST_RE = re.compile(r"權證|分點|吃貨")
 
 
 def normalize_intent_text(question: str) -> str:
     """回傳「原句｜標準關鍵字」；只供意圖判斷與權證辨識用。"""
     text = question or ""
-    institutional = bool(_INSTITUTIONAL_RE.search(text)) and not _EXPLICIT_WARRANT_RE.search(text)
+    institutional = bool(_INSTITUTIONAL_RE.search(text)) and not _WARRANT_OVER_INST_RE.search(text)
     rules = INTENT_SYNONYMS + (() if institutional else WARRANT_SYNONYMS)
     tags = [tag for pattern, tag in rules if pattern.search(text)]
     return text + ("｜" + " ".join(tags) if tags else "")
@@ -315,9 +317,9 @@ def detect_question_intents(question: str) -> Tuple[str, Set[str]]:
     normalized = normalize_intent_text(question)
     upper = normalized.upper()
     intents = {intent for intent, words in INTENT_KEYWORDS.items() if any(w.upper() in upper for w in words)}
-    if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
+    if _INSTITUTIONAL_RE.search(question or "") and not _WARRANT_OVER_INST_RE.search(question or ""):
         intents.discard("warrant")   # 外資買超、投信買超、自營商、三大法人不是權證
-    if _INSTITUTIONAL_RE.search(question or "") and not _EXPLICIT_WARRANT_RE.search(question or ""):
+    if _INSTITUTIONAL_RE.search(question or "") and not _WARRANT_OVER_INST_RE.search(question or ""):
         intents.add("institutional")  # 「外資今天買超多少」「三大法人偏買還偏賣」→ 三大法人（不是券商分點）
         intents.discard("warrant")    # 沒提權證／分點的「籌碼」是三大法人，不是權證分點
     if "部位" not in normalized and (_MA_SYNONYM_RE.search(question or "") or "整理" in (question or "")):
@@ -342,7 +344,9 @@ BROKER_PREFIXES = (
     "安泰", "大展", "口袋", "高橋", "北城", "元富",
 )
 
-STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}[A-Z]?)(?![0-9A-Za-z%/.\-年])(?![月日](?![K線營均]))")
+# 代號後面緊接 2 個以上大寫字母（「4958ECB」「4958KY」「2330CB」）＝代號＋英文縮寫，照樣認出代號
+STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}(?:[A-Z](?![A-Za-z]))?)"
+                           r"(?:(?=[A-Z]{2,})|(?![0-9A-Za-z%/.\-年])(?![月日](?![K線營均])))")
 COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價|套在|接在)\s*(?:在|是|為|約|大約|大概|大概是|差不多|約莫)?"
                      r"\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
 # 前面不可是數字（「3006日K」不是 6 日）；最多 3 位數（「近120天」）
@@ -2237,7 +2241,7 @@ AI_CARD_SCHEMA = {
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：一句話直接回答使用者的問題（20～50 字），像分析師的判斷，例如「趨勢是強的，但現在這個位置不適合追」。
 - why：「為什麼這樣看」2～4 句（60～180 字）。說明關鍵訊號代表什麼、彼此怎麼互相印證或矛盾；只引用 1～3 個真正影響判斷的數字，不要逐項重列均線、分數或價位。
-- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - summary：一句話總結（15～40 字），點出最重要的判斷，可以用簡單比喻，但不可給買賣指令或保證。"""
 
 
@@ -2407,7 +2411,7 @@ def question_focus(question: str) -> List[str]:
     if re.search(r"權證|分點", text):
         text = re.sub(r"籌碼", "", text)   # 權證分點籌碼走權證規則，不是三大法人
     labels = [label for pattern, label in _FOCUS_RULES if pattern.search(text)]
-    if "權證分點" in labels and _INSTITUTIONAL_RE.search(text) and not _EXPLICIT_WARRANT_RE.search(text):
+    if "權證分點" in labels and _INSTITUTIONAL_RE.search(text) and not _WARRANT_OVER_INST_RE.search(text):
         labels.remove("權證分點")   # 「外資在加碼」是三大法人，不是權證分點
     if "權證分點" in labels and "現股分點籌碼" in labels and "權證" not in text:
         labels.remove("權證分點")   # 「現股分點」不是權證分點
@@ -2647,6 +2651,7 @@ def _variants_of(text: str) -> Set[str]:
             continue
         if 0 < abs(value) < 10 and not value.is_integer():
             variants |= _number_variants(f"{value * 100:.4f}")   # 倍數寫成百分比：量比 0.79 倍＝79%
+            variants |= _number_variants(f"{abs(value - 1) * 100:.4f}")   # 增減幅：量比 1.28 倍＝多 28%、0.79 倍＝少 21%
     return variants
 
 
@@ -2672,6 +2677,11 @@ def _numeric_values(value: Any) -> List[float]:
         for v in value:
             numbers += _numeric_values(v)
     return numbers
+
+
+# 「中性偏多」「偏多格局」是評分等級用語，不算排列宣稱；只抓明確講多頭／空頭結構的說法
+_BULL_ALIGN_RE = re.compile(r"多頭排列|多方架構|多頭架構|多方掌控|多頭格局|多方格局|強勢多頭|多頭趨勢")
+_BEAR_ALIGN_RE = re.compile(r"空頭排列|空方架構|空頭架構|空方掌控|空頭格局|空方格局|弱勢空頭|空頭趨勢")
 
 
 class FactSheet:
@@ -2755,7 +2765,22 @@ class FactSheet:
         if subject:
             issues += self._ma_value_issues(sentence, subject)
             issues += self._direction_issues(sentence, subject)
+            issues += self._alignment_issues(sentence, subject)
         return issues
+
+    def _alignment_issues(self, sentence: str, code: str) -> List[str]:
+        """均線排列：實際空頭排列（MA5<MA10<MA20<MA60）卻寫多頭排列／多方架構強勢，或反過來 → 不符。"""
+        values = self.ma_values.get(code) or {}
+        try:
+            ma = [values[k][0] for k in ("MA5", "MA10", "MA20", "MA60")]
+        except (KeyError, IndexError):
+            return []
+        plain = _CONDITIONAL_RE.split(_PAREN_RE.sub("", sentence))[0]      # 條件句（若…）不核對
+        if ma[0] < ma[1] < ma[2] < ma[3] and _BULL_ALIGN_RE.search(plain):
+            return [f"排列不符：寫「{_BULL_ALIGN_RE.search(plain).group()}」，均線實際為空頭排列"]
+        if ma[0] > ma[1] > ma[2] > ma[3] and _BEAR_ALIGN_RE.search(plain):
+            return [f"排列不符：寫「{_BEAR_ALIGN_RE.search(plain).group()}」，均線實際為多頭排列"]
+        return []
 
     def _number_issues(self, sentence: str, codes: List[str]) -> List[str]:
         text = sentence
@@ -2853,6 +2878,26 @@ class FactSheet:
         return removed
 
 
+# 前一句被刪掉時，下一句開頭的轉折詞會變成沒頭沒尾（「然而，均線仍空頭排列」）→ 一起拿掉
+_LEADING_CONNECTOR_RE = re.compile(r"^\s*(?:然而|但是|但|不過|因此|所以|此外|另外|同時|而且|並且)\s*[，,、]?\s*")
+
+
+def _prune_clauses(sentence: str, current: str, checker: Callable[[str, str], List[str]]) -> Tuple[str, str]:
+    """整句有問題時，只刪有問題的子句（逗號分隔），其餘保留；回傳（保留的句子, 被刪的子句）。
+    句子不能拆（只有一個子句）或拆完全部都有問題 → 整句刪。"""
+    body = sentence.strip()
+    end = body[-1] if body and body[-1] in "。！？!?；;" else ""
+    parts = [p for p in re.split(r"[，,]", body[:-1] if end else body) if p.strip()]
+    if len(parts) < 2:
+        return "", ""
+    good = [p for p in parts if not checker(p, current)]
+    # 句子要完整：第一個子句（主詞／主要敘述）有問題就整句刪，不留下沒頭的半句
+    if not good or len(good) == len(parts) or good[0] is not parts[0]:
+        return "", ""
+    bad = "，".join(p for p in parts if p not in good)
+    return _LEADING_CONNECTOR_RE.sub("", "，".join(good)) + (end or "。"), bad
+
+
 def _scan_sentences(answer: str, checker: Callable[[str, str], List[str]],
                     heading: Optional[Callable[[str, str], str]] = None) -> Tuple[str, List[Tuple[str, List[str]]]]:
     """逐行逐句核對；標題行（【…】）保留。回傳（刪減後文字, [(被刪的句子, 原因)]）。"""
@@ -2867,14 +2912,24 @@ def _scan_sentences(answer: str, checker: Callable[[str, str], List[str]],
             kept_lines.append(line)
             continue
         kept = []
+        dropped_before = False
         for sentence in _SENTENCE_RE.findall(line):
             if not sentence.strip():
                 continue
             reasons = checker(sentence, current)
             if reasons:
-                removed.append((sentence.strip(), reasons))
-            else:
-                kept.append(sentence)
+                partial, bad = _prune_clauses(sentence, current, checker)
+                removed.append((bad or sentence.strip(), reasons))
+                if partial:
+                    kept.append(partial)
+                    dropped_before = False
+                else:
+                    dropped_before = True
+                continue
+            if dropped_before:
+                sentence = _LEADING_CONNECTOR_RE.sub("", sentence)
+            kept.append(sentence)
+            dropped_before = False
         text = "".join(kept).strip()
         if text and text not in ("・", "•", "-"):
             kept_lines.append(text)
@@ -2895,7 +2950,8 @@ def prune_ungrounded_sentences(answer: str, payload: Dict[str, Any], facts: Opti
         text, removed = _scan_sentences(answer, facts.sentence_issues, facts.heading_stock)
     else:
         text, removed = _scan_sentences(answer, lambda sentence, _current: find_ungrounded_numbers(sentence, payload))
-    return text, [sentence for sentence, _ in removed]
+    # Log 要看得出錯在哪：被刪的句子／子句＋原因（例「對不上的數字 28」「方向不符：寫站上 MA60，收盤實際為跌破」）
+    return text, [f"{sentence}【{'；'.join(reasons)}】" for sentence, reasons in removed]
 
 
 # ============================================================
@@ -3858,11 +3914,30 @@ _STRATEGY_RE = re.compile(r"操作策略|操作建議|交易策略|策略|進場
 _DIRECTIVE_RE = re.compile(r"建議(?:可|先|逢低|逢高|分批)?(?:買進|買入|賣出|進場|出場|加碼|減碼|布局|停損|停利)"
                            r"|停損(?:設|點|價|位)|停利(?:設|點|價|位)|(?:可|宜)(?:逢低)?(?:買進|進場|加碼)")
 STRATEGY_NOTICE = "艾斯 AI 不提供買賣建議，以下整理明天的觀察重點。"
+# 預測漲跌的說法（Gemini 偶爾在情境裡寫）：只刪那個子句，保留條件本身
+_PREDICTION_RE = re.compile(r"(?:有望|可望|將會?|即將)?(?:開啟|展開|迎來)?新一波(?:漲勢|跌勢|行情|攻勢)|有望(?:大漲|噴出|續漲|創高|挑戰新高)"
+                            r"|可望(?:大漲|噴出|續漲|創高)|多方續攻|空方續殺")
+# 情境短標：結構還沒轉多／轉空前，不用「續攻／續殺」這種字
+_SCENARIO_TITLE_FIX = (("多方續攻", "轉強條件"), ("空方續殺", "轉弱條件"))
 
 
 def drop_directives(text: str) -> str:
     parts = re.split(r"(?<=[。；！？])", text or "")
-    return "".join(p for p in parts if not _DIRECTIVE_RE.search(p)).strip()
+    kept = []
+    for p in parts:
+        if _DIRECTIVE_RE.search(p):
+            continue
+        if _PREDICTION_RE.search(p):
+            clauses = [c for c in re.split(r"[，,]", p.rstrip("。；！？")) if c.strip() and not _PREDICTION_RE.search(c)]
+            p = ("，".join(clauses) + "。") if clauses else ""
+        kept.append(p)
+    return "".join(kept).strip()
+
+
+def fix_scenario_title(title: str) -> str:
+    for old, new in _SCENARIO_TITLE_FIX:
+        title = (title or "").replace(old, new)
+    return title
 
 
 _RECOMMEND_RE = re.compile(r"推薦|明牌|報牌|買(?:什麼|哪[一支檔些]).{0,3}(?:股票|好)|哪[一支檔些](?:股票)?.{0,4}會(?:漲|噴|飆)")
@@ -4137,7 +4212,7 @@ def quota_exempt_ids() -> Set[str]:
 REQUIRED_MODULE_API = {
     "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets"),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
-    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version"),
+    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text"),
     "answer_image": ("wrap_cell",),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
@@ -5161,7 +5236,7 @@ class AceQueryEngine:
             source = "success"
             if removed:
                 self.log(f"   覆盤核對：刪除 {len(removed)} 句（數字對不上或事後歸因）｜"
-                         + "；".join(s[:30] for s in removed[:3]))
+                         + "；".join(s for s in removed[:5]))
         else:
             review = trade_review.fallback_review(payload)
             self.log(f"   覆盤 Gemini 失敗，改用程式版｜{result.error}")
@@ -5698,6 +5773,10 @@ class AceQueryEngine:
             for code in stocks_only:
                 plan.add("get_institutional_flow", stock_code=code)
         else:
+            if "institutional" in parsed.intents and stocks_only and _INSTITUTIONAL_ANALYSIS_RE.search(question):
+                # 「法人是否買單、對股價的影響」是要解讀：走型態頁（K 線＋法人副圖）＋AI，不是只給報價
+                parsed.intents.add("analysis")
+                parsed.intents.discard("price")          # 「對股價的影響」的「股價」不是問報價
             plan = self.router.plan(parsed, stats)
             if market_inst and plan.route == "rule_pattern":
                 # 「大盤型態跟外資動向」「櫃買型態跟投信」：指數型態頁＋同一個市場的三大法人
@@ -6115,8 +6194,10 @@ class AceQueryEngine:
         card["answer"], card["why"], card["summary"] = clean(card["answer"]), clean(card.get("why", "")), clean(card.get("summary", ""))
         card["scenarios"] = [dict(s, text=clean(s["text"])) for s in card.get("scenarios") or []]
         card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
+        if not card["answer"] and card["summary"]:
+            card["answer"], card["summary"] = card["summary"], ""     # 標題句被刪：改用一句話總結當標題，不整張丟掉
         if removed_all:
-            self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r[:40] for r in removed_all[:6])}")
+            self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r for r in removed_all[:6])}")
         if not card["answer"] or len(ai_card_text(card)) < before * 0.6:
             self.log("事實核對未通過（解讀卡），改用規則式回答")
             return None
@@ -6158,7 +6239,8 @@ class AceQueryEngine:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
             for key in ("why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
-            card["scenarios"] = [dict(x, text=drop_directives(x["text"])) for x in card.get("scenarios") or []]
+            card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=fix_scenario_title(x.get("title", "")))
+                                 for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
             if _STRATEGY_RE.search(question):
                 card["notice"] = "｜".join(x for x in (STRATEGY_NOTICE, card.get("notice")) if x)
@@ -6666,14 +6748,14 @@ def _intraday_sampling_loop(stop: threading.Event) -> None:
                 try:
                     sector_radar.tick()
                 except Exception as exc:
-                    print(f"⚠️ 族群雷達快照略過｜{type(exc).__name__}", flush=True)
+                    print(f"⚠️ 族群雷達快照略過｜{tools.err_text(exc)}", flush=True)
                 if time.monotonic() - last_basket >= INTRADAY_SAMPLE_SECONDS:
                     last_basket = time.monotonic()
                     try:
                         import intraday_volume
                         intraday_volume.sample_basket()      # 基準籃子取樣（走背景額度）
                     except Exception as exc:
-                        print(f"⚠️ 盤中量能取樣略過｜{type(exc).__name__}", flush=True)
+                        print(f"⚠️ 盤中量能取樣略過｜{tools.err_text(exc)}", flush=True)
         except Exception as exc:
             print(f"⚠️ 盤中取樣迴圈略過｜{type(exc).__name__}: {exc}", flush=True)
         if stop.wait(60):
@@ -6690,7 +6772,7 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
         import official_sector_members
         official_sector_members.warm_registry()   # 族群雷達的官方成員名冊：開機背景預載，查詢時不再等 10 秒
     except Exception as exc:
-        print(f"⚠️ 官方類股成員名冊預載略過｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 官方類股成員名冊預載略過｜{tools.err_text(exc)}", flush=True)
     while not stop.is_set():
         try:
             info = market_data.coverage()
@@ -6819,7 +6901,7 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
                     if tools.intraday_session_now():
                         sector_analysis.live_group_ranking()
                 except Exception as exc:
-                    print(f"⚠️ 盤中族群排行背景更新失敗｜{type(exc).__name__}", flush=True)
+                    print(f"⚠️ 盤中族群排行背景更新失敗｜{tools.err_text(exc)}", flush=True)
                 last_cmoney = time.time()
         # CMoney 分類屬低頻靜態資料：每個 tick 只補少量尚未存到 Persistent Volume 的族群，
         # 逐步把細產業／概念成分股抓齊，不影響 Fugle 額度。
@@ -6828,14 +6910,14 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
             try:
                 sector_analysis.cmoney_catalog.warm_member_catalog_batch(CMONEY_MEMBER_WARMUP_PER_TICK)
             except Exception as exc:
-                print(f"⚠️ CMoney 成分股名冊背景補齊失敗｜{type(exc).__name__}", flush=True)
+                print(f"⚠️ CMoney 成分股名冊背景補齊失敗｜{tools.err_text(exc)}", flush=True)
         # 只重查曾被問過、13:30 後仍未正式收盤的股票。
         try:
             recheck = tools.recheck_provisional_closes(max_items=5)
             if recheck.get("checked"):
                 print(f"🔁 盤後收盤查核｜checked={recheck['checked']}｜confirmed={recheck['confirmed']}｜pending={recheck['pending']}", flush=True)
         except Exception as exc:
-            print(f"⚠️ 盤後收盤查核失敗｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 盤後收盤查核失敗｜{tools.err_text(exc)}", flush=True)
         if time.time() - last_log < USAGE_LOG_SECONDS:
             continue
         resources, previous_cpu = _process_resource_snapshot(previous_cpu)

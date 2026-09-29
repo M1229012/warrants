@@ -81,7 +81,7 @@ def _refresh_background() -> None:
         try:
             _fetch_registry()
         except Exception as exc:
-            print(f"⚠️ 證交所上市公司基本資料背景更新失敗，沿用舊資料｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 證交所上市公司基本資料背景更新失敗，沿用舊資料｜{tools.err_text(exc)}", flush=True)
         finally:
             with _REGISTRY_LOCK:
                 _REFRESHING[0] = False
@@ -148,7 +148,7 @@ class OfficialSectorMemberResolver:
             try:
                 result = self._from_twse(sector_id, industry)
             except Exception as exc:
-                print(f"⚠️ 證交所產業別取不到，改用 FinMind｜{sector_id}｜{type(exc).__name__}", flush=True)
+                print(f"⚠️ 證交所產業別取不到，改用 FinMind｜{sector_id}｜{tools.err_text(exc)}", flush=True)
                 result = self._from_finmind(sector_id, industry)
             previous = local_market_cache.get_state(key, {}) or {}
             if previous.get("version") != result["version"]:   # 版本有變才寫入與印 log，避免每次查詢洗版

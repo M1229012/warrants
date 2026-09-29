@@ -274,7 +274,7 @@ def _fetch_components() -> Dict[str, Dict[str, Any]]:
         if len(tpex_members) < 100:
             tpex_members = {}
     except Exception as exc:
-        print(f"⚠️ TPEx 指數成分股端點失敗，改用官方公司基本資料備援｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ TPEx 指數成分股端點失敗，改用官方公司基本資料備援｜{tools.err_text(exc)}", flush=True)
 
     if tpex_members:
         missing_shares = 0
@@ -315,7 +315,7 @@ def _refresh_shares_background() -> None:
                     flush=True,
                 )
         except Exception as exc:
-            print(f"⚠️ 指數母體背景更新失敗，繼續沿用舊資料｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ 指數母體背景更新失敗，繼續沿用舊資料｜{tools.err_text(exc)}", flush=True)
         finally:
             with _SHARES_REFRESH_LOCK:
                 _SHARES_REFRESHING[0] = False
@@ -340,7 +340,7 @@ def component_universe(refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     try:
         components = _fetch_components()
     except Exception as exc:
-        print(f"⚠️ 指數母體更新失敗，沿用舊資料｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 指數母體更新失敗，沿用舊資料｜{tools.err_text(exc)}", flush=True)
         return old
     if components:
         local_market_cache.set_state(SHARES_STATE_KEY, {"at": time.time(), "components": components})
@@ -490,7 +490,7 @@ def _fetch_official_index_close(market: str) -> Tuple[Optional[float], Optional[
                     latest, previous = days[-1], days[-2]
                     return by_day[previous], by_day[latest], latest
     except Exception as exc:
-        print(f"⚠️ {INDEX_OF[market][1]} 官方收盤指數端點失敗，改用既有日K｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ {INDEX_OF[market][1]} 官方收盤指數端點失敗，改用既有日K｜{tools.err_text(exc)}", flush=True)
     return _index_prev_close(INDEX_OF[market][0])
 
 
@@ -868,7 +868,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             try:
                 quotes, batch_benchmark = _fetch_mis_batch(market, requested, deadline)
             except Exception as exc:
-                print(f"⚠️ {index_name} MIS 批次報價失敗｜{type(exc).__name__}", flush=True)
+                print(f"⚠️ {index_name} MIS 批次報價失敗｜{tools.err_text(exc)}", flush=True)
                 quotes, batch_benchmark = {}, {}
             if batch_benchmark:
                 benchmark = batch_benchmark

@@ -38,6 +38,15 @@ import local_market_cache
 # 環境設定
 # ============================================================
 
+_SECRET_IN_TEXT_RE = re.compile(r"((?:token|key|apikey|api_key|access_token|password|secret)=)[^&\s'\"]+", re.I)
+
+
+def err_text(exc: BaseException, limit: int = 160) -> str:
+    """Log 用的錯誤說明：類型＋訊息（遮掉網址裡的 token／key），讓 Log 看得出錯在哪。"""
+    message = _SECRET_IN_TEXT_RE.sub(r"\1***", str(exc) or "").replace("\n", " ").strip()
+    return f"{type(exc).__name__}: {message[:limit]}" if message else type(exc).__name__
+
+
 def _env_int(name: str, default: int) -> int:
     """讀取整數環境變數；格式錯誤時回傳預設值。"""
     try:
@@ -1760,7 +1769,7 @@ def recheck_provisional_closes(max_items: int = 5) -> Dict[str, int]:
             with _PROVISIONAL_CLOSE_LOCK:
                 if code in _PROVISIONAL_CLOSES:
                     _PROVISIONAL_CLOSES[code]["last_checked"] = time.time()
-            print(f"⚠️ {code} 延遲收盤重新確認失敗｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ {code} 延遲收盤重新確認失敗｜{err_text(exc)}", flush=True)
     return {"checked": checked, "confirmed": confirmed_count, "pending": provisional_close_stats()["count"]}
 
 
@@ -2473,7 +2482,7 @@ def _intraday_volume_estimate(code: str, bundle: Dict[str, Any], live: bool, sus
             prev_day_lots=lots(_num(last.get("Volume"))),
             mv5_lots=lots(_num(last.get("MV5"))), mv20_lots=lots(_num(last.get("MV20"))))
     except Exception as exc:
-        print(f"⚠️ {code} 盤中量能估算略過：{type(exc).__name__}", flush=True)
+        print(f"⚠️ {code} 盤中量能估算略過：{err_text(exc)}", flush=True)
         return {}
 
 
@@ -5755,7 +5764,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
                 "second_idx": int(stats["second_idx"]),
             }
     except Exception as exc:
-        print(f"⚠️ {code} 價量分布取得失敗：{type(exc).__name__}", flush=True)
+        print(f"⚠️ {code} 價量分布取得失敗：{err_text(exc)}", flush=True)
     marks: Dict[str, Any] = {}
     if with_marks:
         try:
@@ -5872,7 +5881,7 @@ def get_market_breadth() -> Dict[str, Any]:
                 elif label not in ("其他", "其他電子", "電子工業"):
                     sectors.append({"name": label, "change_pct": row["change_pct"]})
         except Exception as exc:
-            print(f"⚠️ 盤面廣度取指數失敗：{type(exc).__name__}", flush=True)
+            print(f"⚠️ 盤面廣度取指數失敗：{err_text(exc)}", flush=True)
         # 權值股走富果（MIS 的個股報價要 session、又會限流，抓不穩）；只取前幾檔，並沿用既有快取。
         heavy: List[Dict[str, Any]] = []
         deadline = time.monotonic() + HEAVYWEIGHT_BUDGET_SECONDS

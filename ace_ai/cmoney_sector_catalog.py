@@ -430,7 +430,7 @@ def get_members(code: str, refresh: bool = False) -> Dict[str, Any]:
     except Exception as exc:
         if disk_members.get("stocks"):
             result = dict(disk_members, complete=False, stale=True, catalog_note="")
-            print(f"⚠️ CMoney 成分股更新失敗，使用快取：{code}｜{type(exc).__name__}", flush=True)
+            print(f"⚠️ CMoney 成分股更新失敗，使用快取：{code}｜{tools.err_text(exc)}", flush=True)
         else:
             raise
     with _LOCK:

@@ -170,7 +170,7 @@ def fetch_market(day: _date, market: str) -> Tuple[str, List[Dict[str, Any]], st
             payload = _get_json(TPEX_DAY_URL.format(date=day.strftime("%Y/%m/%d")), "TPEx")
             rows, empty = _rows_from_tpex(payload), _tpex_empty(payload)
     except Exception as exc:
-        print(f"⚠️ 市場底庫：{'上市' if market == 'twse' else '上櫃'} {day} 取得失敗｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 市場底庫：{'上市' if market == 'twse' else '上櫃'} {day} 取得失敗｜{tools.err_text(exc)}", flush=True)
         return "source_error", [], f"{type(exc).__name__}: {exc}"
     need = complete_threshold(market, day.strftime("%Y-%m-%d"))
     if len(rows) >= need:
