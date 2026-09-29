@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import statistics
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -29,6 +30,7 @@ import sector_match
 INDUSTRIES = sector_match.OFFICIAL_INDUSTRIES
 MEMBER_TTL = max(60, tools._env_int("DISCORD_AI_SECTOR_MEMBERS_TTL", 86400))
 RESULT_TTL = max(10, tools._env_int("DISCORD_AI_SECTOR_RESULT_TTL", 300))
+CUSTOM_LIVE_MAX = max(1, tools._env_int("DISCORD_AI_CUSTOM_LIVE_MAX", 30))   # 自訂清單盤中即時重算上限
 SCAN_TIMEOUT = max(1.0, tools._env_float("DISCORD_AI_SECTOR_TIMEOUT", 90.0))
 # 族群新增的股票讀取共用節流，避免多個族群同時灌入免費行情額度。
 REQUEST_GAP = max(1.5, tools._env_float("DISCORD_AI_SECTOR_REQUEST_GAP", 1.5))
@@ -623,28 +625,6 @@ def _movers_label(movers: List[Dict[str, Any]]) -> list:
     return [("領漲股", "accent", _movers_text(movers))] if movers else []
 
 
-def _live_top_movers(group_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-    """盤中：前幾名族群各抓有效成分股即時報價，取漲幅前 3（共用 5 分鐘報價快取）。失敗就回空，不影響排行。"""
-    try:
-        import sector_radar
-        by_name = {info["name"]: code for code, info in sector_roster.catalog().items()}
-        liquid = market_scan.value_liquid_codes()
-        members = {}
-        for name in group_names:
-            if name in by_name:
-                stocks = sector_roster.get_members(by_name[name]).get("stocks") or []
-                members[name] = [s["stock_code"] for s in stocks if s["stock_code"] in liquid]
-        quotes = sector_radar._quotes_for(sorted({c for codes in members.values() for c in codes}))
-        out = {}
-        for name, codes in members.items():
-            got = sorted((c for c in codes if c in quotes), key=lambda c: -quotes[c]["change_pct"])[:3]
-            out[name] = [{"code": c, "name": quotes[c].get("name", c), "change_pct": quotes[c]["change_pct"]} for c in got]
-        return out
-    except Exception as exc:
-        print(f"⚠️ 盤中族群前 3 檔取得失敗｜{type(exc).__name__}", flush=True)
-        return {}
-
-
 def _technical_market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     """大族群型態排行 TOP5（v2）：右側＝綜合分數；第二行＝中位型態＋75 分以上家數；下面一列型態 TOP5 個股。"""
     rows = [{
@@ -698,38 +678,69 @@ _MARKET_HELP = {
 }
 
 
+LIVE_MIN_COVERAGE = 0.8      # 有效成分股報價覆蓋率門檻（全市場、單一族群都用）
+
+
+def live_group_ranking() -> Optional[Dict[str, Any]]:
+    """盤中族群漲幅排行：自己用證交所即時報價算（有效成分股中位漲幅），不依賴 CMoney 排行表。
+    報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
+    import sector_radar
+    catalog = sector_roster.catalog()
+    if not catalog:
+        return None
+    liquid = market_scan.value_liquid_codes()
+    members = {code: [c for c in dict.fromkeys(codes) if c in liquid]
+               for code, codes in market_scan._member_codes().items()
+               if code in catalog and catalog[code]["name"] not in market_scan.EXCLUDED_NAMES}
+    universe = sorted({c for codes in members.values() for c in codes})
+    if not universe:
+        return None
+    quotes = sector_radar._quotes_for(universe)
+    coverage = len(quotes) / len(universe)
+    if coverage < LIVE_MIN_COVERAGE:
+        print(f"📡 盤中族群排行：報價覆蓋 {coverage:.0%}（{len(quotes)}/{len(universe)}）不足，改用收盤底庫", flush=True)
+        return None
+    names = sector_roster._name_map()
+    rows = []
+    for code, codes in members.items():
+        got = [c for c in codes if c in quotes]
+        if len(got) < market_scan.MIN_MEMBERS or len(got) / len(codes) < LIVE_MIN_COVERAGE:
+            continue
+        changes = [quotes[c]["change_pct"] for c in got]
+        movers = sorted(got, key=lambda c: -quotes[c]["change_pct"])[:3]
+        rows.append({"group_code": code, "name": catalog[code]["name"], "median": round(statistics.median(changes), 2),
+                     "coverage": len(got), "members": len(codes),
+                     "strong_ratio": round(sum(1 for v in changes if v > 0) / len(changes) * 100, 0),
+                     "top_movers": [{"code": c, "name": names.get(c) or quotes[c].get("name", c),
+                                     "change_pct": quotes[c]["change_pct"]} for c in movers]})
+    rows.sort(key=lambda r: (-r["median"], r["name"]))
+    for index, row in enumerate(rows, 1):
+        row["rank"] = index
+    stamp = tools.taipei_now().strftime("%H:%M")
+    print(f"📡 盤中族群排行｜可排名 {len(rows)} 類｜報價 {len(quotes)}/{len(universe)} 檔｜{stamp}", flush=True)
+    return {"mode": "market_momentum", "rows": rows[:5], "groups_ranked": len(rows),
+            "as_of": tools.taipei_now().strftime("%Y-%m-%d"), "live_time": stamp} if rows else None
+
+
 def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
-    """盤中漲幅排行：CMoney 族群雷達有資料時優先用（那是即時的）。解析不到就回 None。"""
-    now = tools.taipei_now()
-    minutes = now.hour * 60 + now.minute
-    if not (now.weekday() < 5 and 9 * 60 <= minutes <= 13 * 60 + 30):
+    """盤中漲幅排行：用 live_group_ranking；盤外或資料不足回 None（改用收盤底庫）。"""
+    if not tools.intraday_session_now():
         return None
     try:
-        radar = cmoney_catalog.get_live_radar()
+        data = live_group_ranking()
     except Exception as exc:
-        print(f"⚠️ 盤中族群雷達取得失敗｜{type(exc).__name__}", flush=True)
+        print(f"⚠️ 盤中族群排行失敗｜{type(exc).__name__}: {exc}", flush=True)
         return None
-    rows = list(radar.get("rows") or [])
-    if not rows:
-        print(f"📡 盤中族群雷達沒有可用資料（errors={radar.get('errors') or '-'}），改用收盤底庫", flush=True)
+    if not data:
         return None
-    rows = [r for r in rows if r.get("name") not in market_scan.EXCLUDED_NAMES]
-    top = rows[:5]
-    movers = _live_top_movers([r.get("name", "") for r in top])
-    panel_rows = [{
-        "rank": index, "stock_code": "", "stock_name": row.get("name", ""), "market": "", "row_kind": "sector_group",
-        "pattern_score": None, "change_pct": float(row.get("change_pct") or 0.0),
-        "coverage_text": "盤中即時", "ratio_text": "", "leader_text": "",
-        "extra_labels": _movers_label(movers.get(row.get("name", ""))),
-    } for index, row in enumerate(top, 1)]
-    lines = ["**全市場族群漲幅排行｜盤中**"]
-    lines += [f"{r['rank']}. {r['stock_name']}｜{r['change_pct']:+.2f}%"
-              + (f"｜領漲股 {_movers_text(movers.get(r['stock_name']))}" if movers.get(r['stock_name']) else "")
-              for r in panel_rows]
-    lines += [f"資料時間：{radar.get('updated_at', '')}", "※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。"]
-    panel = {"sector": {"name": "全市場族群", "mode": "market_momentum", "comparison_date": "",
-                        "rows": panel_rows[:5], "others": [], "coverage_note": "",
-                        "liquidity_note": "盤中即時族群指數漲跌｜前 3 檔只列日均成交額 ≥5,000 萬的成分股", "live_time": str(radar.get("updated_at", ""))[-5:]}}
+    panel = _market_panel(data)
+    panel["sector"]["live_time"] = data["live_time"]
+    panel["sector"]["liquidity_note"] = (f"盤中即時｜共比較 {data['groups_ranked']} 個族群（有效成分股中位漲幅）"
+                                         "｜領漲股只列有量成分股")
+    lines = [f"**全市場族群漲幅排行｜盤中 {data['live_time']}**"]
+    lines += [f"{r['rank']}. {r['name']}｜中位漲幅 {r['median']:+.2f}%｜領漲股 {_movers_text(r['top_movers'])}"
+              for r in data["rows"]]
+    lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [panel]}
 
 
@@ -806,7 +817,11 @@ def rank_custom(stocks: List[Dict[str, str]], name: str) -> Dict[str, Any]:
     先用本地型態分數底庫排名（0 次 API）；本地沒有或分數日期較舊的才逐檔重算。前 3 名補完整加減分原因。
     """
     stocks = [dict(s) for s in stocks]
-    local_rows, pool = _local_rows(stocks)
+    if tools.intraday_session_now() and len(stocks) <= CUSTOM_LIVE_MAX:
+        # 盤中一律用即時 K 重算：不可混用本地收盤分數（日期不同會被當成資料不足）
+        local_rows, pool = [], list(stocks)
+    else:
+        local_rows, pool = _local_rows(stocks)
     latest = max((_iso_date(r.get("score_date")) for r in local_rows), default="")
     stale = [r for r in local_rows if _iso_date(r.get("score_date")) != latest]
     if stale:
@@ -853,6 +868,12 @@ def rank_custom(stocks: List[Dict[str, str]], name: str) -> Dict[str, Any]:
             "missing": [f"{s.get('stock_name') or ''}（{s['stock_code']}）" for s in missing]}
 
 
+def _missing_codes_text(missing: List[str], limit: int = 12) -> str:
+    """頁尾只放代號（名稱放文字版），超過 limit 檔寫「等 N 檔」，不讓頁尾超出圖片被切掉。"""
+    codes = [m.rsplit("（", 1)[-1].rstrip("）") for m in missing]
+    return "、".join(codes[:limit]) + (f" 等 {len(codes)} 檔" if len(codes) > limit else "")
+
+
 def answer_custom(stocks: List[Dict[str, str]], name: str, gateway, validate) -> Dict[str, Any]:
     """自訂清單型態排行＋前 3 名 AI 解讀；圖卡沿用族群排行版面，所有名次都列出。"""
     data = rank_custom(stocks, name)
@@ -869,7 +890,7 @@ def answer_custom(stocks: List[Dict[str, str]], name: str, gateway, validate) ->
         text += "\n\nAI 解讀暫時無法使用，以上為程式計算結果。"
     panel = ranking_panel(data, observations)
     panel["sector"]["others_title"] = "其他名次"
-    panel["sector"]["footer_text"] = ("股市艾斯  /  資料不足未排名：" + "、".join(data["missing"])[:80] if data.get("missing")
+    panel["sector"]["footer_text"] = ("股市艾斯  /  資料不足未排名：" + _missing_codes_text(data["missing"]) if data.get("missing")
                                       else "股市艾斯  /  型態分數依日 K 收盤資料計算，清單內相對比較")
     return {"text": text, "calls": 1, "panels": [panel], "ai_ok": bool(accepted),
             "input_tokens": int(getattr(result, "input_tokens", 0) or 0),

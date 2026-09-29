@@ -4074,6 +4074,8 @@ REQUIRED_MODULE_API = {
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
     "spot_chip": ("_official_trading_dates",),
+    "sector_analysis": ("live_group_ranking",),
+    "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
 
 
@@ -6733,14 +6735,15 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
                     tools.preload_sheet_data()
             except Exception as exc:
                 print(f"⚠️ 試算表版本檢查略過｜{type(exc).__name__}: {exc}", flush=True)
-        # 盤中 CMoney 雷達先在背景暖好，會員問「現在族群誰最強」時直接讀快取。
+        # 盤中族群排行（自算，證交所即時報價）先在背景暖好，會員問「現在族群誰最強」時直接讀 5 分鐘快取。
         minutes = now.hour * 60 + now.minute
         if now.weekday() < 5 and 8 * 60 + 50 <= minutes <= 13 * 60 + 45:
             if time.time() - last_cmoney >= max(60, getattr(sector_analysis.cmoney_catalog, "RADAR_TTL", 300)):
                 try:
-                    sector_analysis.cmoney_catalog.get_live_radar(refresh=True)
+                    if tools.intraday_session_now():
+                        sector_analysis.live_group_ranking()
                 except Exception as exc:
-                    print(f"⚠️ CMoney 盤中族群雷達背景更新失敗｜{type(exc).__name__}", flush=True)
+                    print(f"⚠️ 盤中族群排行背景更新失敗｜{type(exc).__name__}", flush=True)
                 last_cmoney = time.time()
         # CMoney 分類屬低頻靜態資料：每個 tick 只補少量尚未存到 Persistent Volume 的族群，
         # 逐步把細產業／概念成分股抓齊，不影響 Fugle 額度。
