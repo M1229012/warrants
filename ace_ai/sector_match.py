@@ -200,14 +200,16 @@ def _index() -> List[Tuple[str, str, str, str, int]]:
 
 def _codes_for_names(names: List[str]) -> Tuple[List[str], List[str]]:
     """把同義詞表寫的名稱清單換成名冊代碼；找不到的名稱直接略過。"""
-    index = {key: code for key, code, *_ in _index()}
+    index: Dict[str, List[str]] = {}
+    for key, code, *_ in _index():
+        index.setdefault(key, []).append(code)          # 同名（產業＋概念）要全部取聯集，不可互相覆蓋
     codes, hit_names = [], []
     for name in names:
-        key = normalize(name)
-        code = index.get(key)
-        if code and code not in codes:
-            codes.append(code)
-            hit_names.append(name)
+        for code in index.get(normalize(name), []):
+            if code not in codes:
+                codes.append(code)
+                if name not in hit_names:
+                    hit_names.append(name)
     return codes, hit_names
 
 
@@ -258,6 +260,13 @@ def _official_match(core: str, value: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _alias_in(key: str, value: str) -> bool:
+    """英數縮寫要有英數邊界（「RAID」不可命中「AI」）；中文別名照舊用子字串。"""
+    if re.fullmatch(r"[A-Z0-9.]+", key):
+        return re.search(rf"(?<![A-Z0-9]){re.escape(key)}(?![A-Z0-9])", value) is not None
+    return key in value
+
+
 def match(text: str) -> Optional[Dict[str, Any]]:
     """從問句找族群；對不到回 None（上層要誠實說查不到）。"""
     value = normalize(text)
@@ -279,7 +288,7 @@ def match(text: str) -> Optional[Dict[str, Any]]:
     for candidate, confidence in ((core, "exact"), (value, "alias")):
         target, used = aliases.get(candidate), candidate
         if target is None and confidence == "alias":
-            hits = sorted((k for k in aliases if len(k) >= 2 and k in value), key=len, reverse=True)
+            hits = sorted((k for k in aliases if len(k) >= 2 and _alias_in(k, value)), key=len, reverse=True)
             target, used = (aliases[hits[0]], hits[0]) if hits else (None, "")
         if not target:
             continue

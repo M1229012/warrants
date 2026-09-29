@@ -947,7 +947,10 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
             pass
         above = sorted((p, n) for n, p in cands if p > close * 1.002)
         below = sorted(((p, n) for n, p in cands if p < close * 0.998), reverse=True)
-        k = kline_patterns.detect(df, {"status": "ok", "items": []})
+        # 總覽不打 API：有當天已查過的公司行動就用，沒有就標「未核實」，不可假裝沒有事件（審查 #3）
+        cached = (tools._CORP_CACHE.get(code) or ("", None))
+        events = cached[1] if cached[0] == tools.taipei_now().strftime("%Y-%m-%d") else {"status": "unverified"}
+        k = kline_patterns.detect(df, events)
         shape = next((s.split("（")[0] for s in k.get("summary") or []
                       if any(w in s for w in ("趨勢", "三角", "箱型", "楔形", "通道")) and "沒有明確" not in s), "—")
         pct = lambda n: round((close / float(c.iloc[-1 - n]) - 1) * 100, 2)
@@ -959,7 +962,7 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
                                     "distance_pct": round((above[0][0] / close - 1) * 100, 2)} if above else None,
                      "support": {"label": below[0][1], "price": round(below[0][0], 2),
                                  "distance_pct": round((below[0][0] / close - 1) * 100, 2)} if below else None,
-                     "data_date": pd.Timestamp(df.index[-1]).strftime("%m/%d")})
+                     "data_date": pd.Timestamp(df.index[-1]).strftime("%m/%d"), "flags": list(k.get("flags") or [])})
     return rows
 
 
@@ -1004,7 +1007,10 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
     detail = [{k: r[k] for k in ("name", "code", "d1", "d5", "d20", "vs_high_pct", "new_high_60d", "above_ma20",
                                  "above_ma60", "shape", "resistance", "support")}
               for r in sorted(rows, key=lambda r: -r["value20"])[:15]]
-    payload = {"group": title, "data_date": date, "stats": stats, "stocks_by_turnover": detail}
+    unverified = sum("公司行動資料未核實" in (r.get("flags") or []) for r in rows)
+    payload = {"group": title, "data_date": date, "stats": stats, "stocks_by_turnover": detail,
+               "data_flags": ([f"{unverified} 檔的型態判斷未核對除權息等公司行動（未還原價格），"
+                               "跨事件日的轉折與缺口不可解讀為買賣壓"] if unverified else [])}
     schema = {"type": "object", "properties": {
         "answer": {"type": "string"}, "why": {"type": "array", "items": {"type": "string"}}, "watch": {"type": "string"}},
         "required": ["answer", "why", "watch"]}

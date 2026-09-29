@@ -262,7 +262,7 @@ def track(df: pd.DataFrame, piv: List[Dict], atr_prev: np.ndarray, vol_ratio: np
     search_lo = max(0, n - SEARCH_DAYS)
     lo_bound = search_lo
     event, ended, current, invalid = None, None, None, None
-    first_day = max(search_lo + MIN_BARS, n - SCAN_DAYS, 22)
+    first_day = max(search_lo + MIN_BARS, 22)       # 從搜尋範圍逐日重建（不可截短，見審查 #1）
     for d in range(first_day, last_official + 1):
         if event is None:
             ref = atr_prev[d]
@@ -391,6 +391,20 @@ def gaps(df: pd.DataFrame, atr_prev, last_official: int, f2_days: set) -> Dict[s
         if l[i - 1] - h[i] >= GAP_ATR * atr:
             zones.append({"dir": -1, "bottom": h[i], "top": l[i - 1], "date": _d(df.index[i]), "label": "向下缺口" + mark, "filled": False})
     price = c[-1]
+    if last_official < n - 1:
+        # 今天是盤中／暫定 K：用今天截至目前的高低價更新，標「截至目前」，不和昨日狀態混用（審查 #6）
+        i = n - 1
+        for z in zones:
+            if z["filled"]:
+                continue
+            if z["dir"] == 1 and l[i] < z["top"]:
+                z["filled"] = l[i] <= z["bottom"]
+                z["top"] = max(z["bottom"], l[i])
+                today_notes.append(f"{z['date']} {z['label']}盤中{'已回補' if z['filled'] else '部分回補'}（截至目前）")
+            elif z["dir"] == -1 and h[i] > z["bottom"]:
+                z["filled"] = h[i] >= z["top"]
+                z["bottom"] = min(z["top"], h[i])
+                today_notes.append(f"{z['date']} {z['label']}盤中{'已回補' if z['filled'] else '部分回補'}（截至目前）")
     live = [z for z in zones if not z["filled"]]
     inside = [z for z in live if z["bottom"] <= price <= z["top"]]
     below = [z for z in live if z["top"] < price]
@@ -497,7 +511,13 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             base = np.mean(vol[i - 20:i])
             vol_ratio[i] = vol[i] / base if base > 0 else np.nan
     f3_days = set(flags.get("F3_dates") or [])
-    f3_recent = any(d >= adj.index[max(0, n - 21)] for d in f3_days)
+
+    def f3_window(end: int, length: int) -> bool:
+        """量能比較窗口（end 當天與前 length 日）是否跨股數變動事件；每個被引用的比較各自判斷（審查 #5）。"""
+        start = adj.index[max(0, end - length)]
+        return any(start < d <= adj.index[end] for d in f3_days)
+
+    f3_recent = f3_window(n - 1, 20)
     summary: List[str] = []
     names: List[str] = []
     levels: List[str] = []
@@ -513,7 +533,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             edge = _at(ev["upper"] if ev["dir"] == 1 else ev["lower"], today)
             where = "之上" if c[today] > edge else "之下"
             extra.append(f"今日盤中位於原{'上緣' if ev['dir'] == 1 else '下緣'} {_p(edge)} {where}（日 K 尚未完成）")
-        vol_tag = ("股數基準變動，量比可比性受限" if f3_recent else "量能資料不足" if np.isnan(vol_ratio[ev["bday"]])
+        vol_tag = ("股數基準變動，量比可比性受限" if f3_window(ev["bday"], 20) else "量能資料不足" if np.isnan(vol_ratio[ev["bday"]])
                    else ("突破日放量" if vol_ratio[ev["bday"]] >= VOL_RATIO else "突破日未達放量門檻"))
         summary.append(f"{ev['kind']}（{_d(adj.index[ev['start']])} 起）：{main}" + ("；" + "；".join(extra) if extra else "") + f"；{vol_tag}")
         names.append(ev["kind"])
@@ -557,7 +577,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     summary += gp["text"]
     if gp["support"] or gp["resistance"] or gp["inside"]:
         names.append("缺口")
-    cd = candles(adj, atr_prev, today, f3_recent)
+    cd = candles(adj, atr_prev, today, f3_window(today, 5))   # 帶量長黑用 5 日均量窗口
     if cd:
         summary.append(("目前呈現" if provisional_today else "近期 K 線：") + "、".join(cd)
                        + ("（日 K 尚未完成）" if provisional_today else ""))
@@ -571,7 +591,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     if flags.get("F1"):
         flag_text.append("型態分析採還原價，歷史圖形可能與圖卡不同")
     flag_text += flags.get("F2") or []
-    if f3_recent:
+    if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")

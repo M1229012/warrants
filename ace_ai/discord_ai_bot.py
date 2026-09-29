@@ -2350,7 +2350,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
             data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
                                              "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
-            data["kline_patterns"] = (data_full_patterns or {}).get("summary") or []
+            data["kline_patterns"] = ((data_full_patterns or {}).get("summary") or []) + [f"資料旗標：{f}" for f in (data_full_patterns or {}).get("flags") or []]
             b = data.get("bollinger") or {}
             data["bollinger"] = {k: b.get(k) for k in ("position", "width_trend", "band_walk") if b.get(k)}   # 布林只留一句狀態
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
