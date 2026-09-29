@@ -155,6 +155,9 @@ class BotConfig:
     alert_mention_ids: Set[int] = field(default_factory=set)   # 嚴重錯誤要 @ 的使用者
     # 會員限定頻道（含討論區貼文）：伺服器裡有列到的頻道時，非管理員只能在這些頻道使用；管理員不限
     member_channel_ids: Set[int] = field(default_factory=set)
+    # 權證討論區／一般（現股）討論區：兩種都有的會員在權證區只能問權證籌碼、在一般區只能問現股籌碼
+    warrant_channel_ids: Set[int] = field(default_factory=set)
+    spot_channel_ids: Set[int] = field(default_factory=set)
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -182,6 +185,8 @@ class BotConfig:
             weekly_pick_allow_admins=_env_flag("DISCORD_AI_WEEKLY_PICK_ALLOW_ADMINS", "1"),
             prefix_command_enabled=_env_flag("DISCORD_AI_PREFIX_COMMAND_ENABLE", "0"),
             member_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_MEMBER_CHANNEL_IDS", "")),
+            warrant_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_WARRANT_CHANNEL_IDS", "")),
+            spot_channel_ids=_parse_id_set(os.getenv("DISCORD_AI_SPOT_CHANNEL_IDS", "")),
         )
 
 
@@ -200,6 +205,37 @@ def member_channel_block(config: BotConfig, member, channel, is_admin: bool) -> 
     if ids & config.member_channel_ids:
         return ""
     return "艾斯 AI 請到以下頻道使用：" + "、".join(f"#{c.name}" for c in here)
+
+
+def _channel_ids(channel) -> Set[int]:
+    return {getattr(channel, "id", 0) or 0, getattr(channel, "parent_id", 0) or 0} - {0}
+
+
+def narrow_by_channel(config: BotConfig, access, channel):
+    """權證討論區只當權證會員、一般討論區只當已訂閱（兩種都有的會員在各區只能問該區的籌碼）；管理員不限。"""
+    e = access.entitlement
+    if e.admin or channel is None:
+        return access
+    ids = _channel_ids(channel)
+    if ids & config.warrant_channel_ids:
+        e = replace(e, spot=False)
+    elif ids & config.spot_channel_ids:
+        e = replace(e, warrant=False)
+    return replace(access, entitlement=e) if e is not access.entitlement else access
+
+
+def chip_channel_hint(config: BotConfig, required: str, original, channel) -> str:
+    """被頻道收窄才擋下的籌碼題（本人其實有這個權限）→ 告訴他該去哪一區，不顯示購買訊息。"""
+    guild = getattr(channel, "guild", None)
+    ids = _channel_ids(channel) if channel is not None else set()
+    if required == "SPOT" and original.spot and ids & config.warrant_channel_ids:
+        target, label = config.spot_channel_ids, "現股籌碼"
+    elif required == "WARRANT" and original.warrant and ids & config.spot_channel_ids:
+        target, label = config.warrant_channel_ids, "權證籌碼"
+    else:
+        return ""                                   # 不是頻道收窄造成的 → 照舊顯示購買／解鎖訊息
+    names = [c.name for c in (guild.get_channel(cid) for cid in sorted(target)) if c] if guild else []
+    return f"{label}請到 " + ("、".join(f"#{n}" for n in names) or "指定的討論區") + " 詢問。"
 
 
 NOT_OPEN_MESSAGE = "目前 AI 分析功能尚未開放。"
@@ -7019,11 +7055,16 @@ def run_discord_bot(config: BotConfig) -> None:
         except access_policy.AccessDenied as exc:
             await send_access_denial(interaction, str(exc), exc.required)
             return
-        # /ace 測試模式的未解鎖畫面公開，方便管理員在群組展示；其他拒絕一律只給本人看。
         demo = bool(access.simulation)
+        original_entitlement = access.entitlement
+        access = narrow_by_channel(config, access, getattr(interaction, "channel", None))
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
         except access_policy.AccessDenied as exc:
+            hint = chip_channel_hint(config, exc.required, original_entitlement, getattr(interaction, "channel", None))
+            if hint:
+                await interaction_image(interaction, "使用頻道", hint, ephemeral=True)
+                return
             await send_access_denial(interaction, str(exc), exc.required)          # 購買／解鎖訊息一律只給本人看
             return
         is_admin = admin_mode = access.admin_mode
@@ -7089,7 +7130,12 @@ def run_discord_bot(config: BotConfig) -> None:
             result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access,
                                              image=image)
             if result.denied_feature:
-                await send_access_denial(interaction, result.text, result.denied_feature)
+                hint = chip_channel_hint(config, result.denied_feature, original_entitlement,
+                                         getattr(interaction, "channel", None))
+                if hint:
+                    await interaction_image(interaction, "使用頻道", hint, ephemeral=True)
+                else:
+                    await send_access_denial(interaction, result.text, result.denied_feature)
                 return
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
