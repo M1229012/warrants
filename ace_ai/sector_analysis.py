@@ -735,7 +735,7 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
         return None
     panel = _market_panel(data)
     panel["sector"]["live_time"] = data["live_time"]
-    panel["sector"]["liquidity_note"] = (f"盤中即時｜共比較 {data['groups_ranked']} 個族群（有效成分股中位漲幅）"
+    panel["sector"]["liquidity_note"] = (f"盤中估算（證交所五檔中價）｜共比較 {data['groups_ranked']} 個族群（有效成分股中位漲幅）"
                                          "｜領漲股只列有量成分股")
     lines = [f"**全市場族群漲幅排行｜盤中 {data['live_time']}**"]
     lines += [f"{r['rank']}. {r['name']}｜中位漲幅 {r['median']:+.2f}%｜領漲股 {_movers_text(r['top_movers'])}"

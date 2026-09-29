@@ -423,6 +423,7 @@ HEAT_HOT, HEAT_COLD = 1.2, 1.0
 HEAT_MIN_DAYS, HEAT_MAX_DAYS = 5, 20
 _QUOTE_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}   # {5 分鐘桶: {代號: 報價}}
 _QUOTE_LOCK = threading.Lock()
+_QUOTE_TRIED: Dict[str, set] = {}     # 5 分鐘桶內已經抓過的代號（含沒拿到的），避免每次查詢重打 MIS
 _ONCE: Dict[str, str] = {}
 
 
@@ -443,15 +444,26 @@ def _quote_bucket(now=None) -> str:
     return now.strftime("%Y%m%d") + ("close" if not session_open(now) else _bucket_of(now.strftime("%H:%M")))
 
 
+def _first_level(raw: Any) -> float:
+    try:
+        return float(str(raw or "").split("_")[0])
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _mis_price(item: Dict[str, Any]) -> float:
-    """只使用最新成交價；買一價不是成交價，不能用來計算漲幅。"""
+    """最新成交價；MIS 盤中常不給成交價（z="-"），改用最佳買賣「中價」估算（單邊掛單＝漲跌停，用有的那邊）。
+    不直接拿買一價當成交價。"""
     try:
         value = float(item.get("z"))
         if value > 0:
             return value
     except (TypeError, ValueError):
         pass
-    return 0.0
+    ask, bid = _first_level(item.get("a")), _first_level(item.get("b"))
+    if ask > 0 and bid > 0:
+        return round((ask + bid) / 2, 4)
+    return ask or bid
 
 
 def _num_field(item: Dict[str, Any], key: str) -> float:
@@ -471,7 +483,7 @@ def _thread_session():
 
 _HTTP_LOCK = threading.Lock()
 _HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
-_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set()}   # 本輪彙總（用代號去重，重試不重算）
+_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set()}   # 本輪彙總（用代號去重，重試不重算）
 
 
 def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -509,6 +521,8 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         items = (response.json() or {}).get("msgArray") or []
     except Exception as exc:
         print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{type(exc).__name__}", flush=True)
+        with _HTTP_LOCK:
+            _BATCH_STATS["conn_error"].add(type(exc).__name__)
     finally:
         try:
             tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - began)
@@ -526,7 +540,7 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         is_today = tools.mis_item_is_today(item)
         if is_today:
             today.add(code)
-            if price <= 0:
+            if price > 0 and _num_field(item, "z") <= 0:     # 沒有成交價、用五檔中價估算
                 no_trade.add(code)
         if code and price > 0 and previous > 0 and is_today:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
@@ -536,7 +550,6 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
     with _HTTP_LOCK:
         _BATCH_STATS["today"].update(today)
         _BATCH_STATS["no_trade"].update(no_trade)
-        _BATCH_STATS["no_trade"].difference_update(out)   # 重試時有成交價就不算
     return out
 
 
@@ -571,7 +584,9 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             print(f"⚠️ MIS 成員報價逾時，{len(pending)} 批略過", flush=True)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    retry = [c for c in codes if c not in out]
+    with _HTTP_LOCK:
+        blocked = bool(_BATCH_STATS["conn_error"])
+    retry = [] if blocked else [c for c in codes if c not in out]     # 連線被拒／錯誤就不重試，避免被限流
     for start in range(0, len(retry), MEMBER_RETRY_BATCH):
         if time.perf_counter() > deadline:
             break
@@ -582,7 +597,7 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         unknown, today = len(_BATCH_STATS["unknown"]), len(_BATCH_STATS["today"])
         no_trade = len(_BATCH_STATS["no_trade"])
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
-          f"｜市場別不明={unknown}｜無成交價={no_trade}/{today}（今日有效，未用買一價）"
+          f"｜市場別不明={unknown}｜中價估算={no_trade}/{today}（MIS 無成交價）"
           f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)
     return out
@@ -595,9 +610,13 @@ def _quotes_for(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         for key in [k for k in _QUOTE_CACHE if k != bucket]:
             _QUOTE_CACHE.pop(key, None)
         cached = _QUOTE_CACHE.setdefault(bucket, {})
-        missing = [c for c in codes if c not in cached]
+        tried = _QUOTE_TRIED.setdefault(bucket, set())
+        for key in [k for k in _QUOTE_TRIED if k != bucket]:
+            _QUOTE_TRIED.pop(key, None)
+        missing = [c for c in codes if c not in cached and c not in tried]   # 同一桶抓過沒拿到的不重抓
         if missing:
             cached.update(_fetch_stock_quotes(missing))
+            tried.update(missing)
         return {c: cached[c] for c in codes if c in cached}
 
 
