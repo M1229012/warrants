@@ -101,11 +101,17 @@ class AccessContext:
 def resolve_access(member, superuser_ids, question, *, admin_entry=False, beta_ids=()):
     real = UserEntitlement.from_member(member, superuser_ids, beta_ids)
     roles = tuple(str(getattr(r, "id", "")) for r in getattr(member, "roles", ()) if getattr(r, "id", None))
+    match = re.match(r"^\s*測試(?:\s|$)", question)
     if not admin_entry:
+        # /ask 也能模擬身分，但只有管理員；一般會員打「測試 …」就當普通問題
+        if real.admin and match:
+            parts = question.strip().split(maxsplit=2)
+            if len(parts) == 3 and parts[1].lower() in SIMULATED_ENTITLEMENTS:
+                mode = parts[1].lower()
+                return AccessContext(SIMULATED_ENTITLEMENTS[mode], "ask", mode, uuid.uuid4().hex, role_ids=roles), parts[2]
         return AccessContext(real, role_ids=roles), question
     if not real.admin:
         raise AccessDenied(ADMIN_DENIED, "ADMIN")
-    match = re.match(r"^\s*測試(?:\s|$)", question)
     if match:
         parts = question.strip().split(maxsplit=2)
         if len(parts) != 3 or parts[1].lower() not in SIMULATED_ENTITLEMENTS:
