@@ -7024,7 +7024,7 @@ def run_discord_bot(config: BotConfig) -> None:
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
         except access_policy.AccessDenied as exc:
-            await send_access_denial(interaction, str(exc), exc.required, public=demo)
+            await send_access_denial(interaction, str(exc), exc.required)          # 購買／解鎖訊息一律只給本人看
             return
         is_admin = admin_mode = access.admin_mode
         # /ask 與 /ace 的成功分析公開；/ace 管理指令（狀態、用量、底庫、維護、debug…）一開始就只給本人看，
@@ -7089,7 +7089,7 @@ def run_discord_bot(config: BotConfig) -> None:
             result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access,
                                              image=image)
             if result.denied_feature:
-                await send_access_denial(interaction, result.text, result.denied_feature, public=demo)
+                await send_access_denial(interaction, result.text, result.denied_feature)
                 return
             image_question = (result.weekly or {}).get("image_title", question) if result.layout == "weekly_article" else question
             image_question = result.image_title or image_question
