@@ -1947,6 +1947,22 @@ class GeminiQuota:
                 return "overloaded"
             return "other"
 
+    def rows(self, n_keys: int) -> List[Dict[str, Any]]:
+        """「/ace 用量」圖卡用：每個模型今日已用、上限、剩餘％、可用金鑰、狀態。"""
+        with self._lock:
+            self._roll()
+            now = time.monotonic()
+            out = []
+            for model in GEMINI_MODEL_CHAIN:
+                _, rpd = _model_limits(model)
+                limit = rpd * n_keys
+                used = sum(self._day.get((k, model), 0) for k in range(n_keys))
+                ready = sum(1 for k in range(n_keys) if now >= self._blocked.get((k, model), 0.0) and now >= self._bad_keys.get(k, 0.0))
+                state = "停用" if model in self._disabled else ("塞車暫停" if now < self._model_down.get(model, 0.0) else "正常")
+                out.append({"model": model, "used": used, "limit": limit, "ready": ready, "keys": n_keys, "state": state,
+                            "left_pct": round(max(0, limit - used) / limit * 100) if limit else 0})
+            return out
+
     def snapshot(self, n_keys: int) -> List[str]:
         """「/ace 系統狀態」與 Log 用：每個模型今天用了多少、剩下幾把金鑰可用。"""
         with self._lock:
@@ -2057,11 +2073,11 @@ class GeminiGateway:
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
         # 會員今日 AI 解讀用完：只放行判斷題意（planner），其他 AI 解讀直接跳過，回答改用圖表與數據
-        if purpose != "planner" and not getattr(_AI_GATE, "allowed", True):
+        if purpose not in ("planner", "intent") and not getattr(_AI_GATE, "allowed", True):
             _AI_GATE.blocked = True
             return GeminiResult(ok=False, error="user_ai_quota", purpose=purpose)
         result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
-        if result.ok and purpose != "planner":
+        if result.ok and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
             _AI_GATE.used = True
         return result
 
@@ -2241,7 +2257,7 @@ AI_CARD_SCHEMA = {
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：一句話直接回答使用者的問題（20～50 字），像分析師的判斷，例如「趨勢是強的，但現在這個位置不適合追」。
 - why：「為什麼這樣看」2～4 句（60～180 字）。說明關鍵訊號代表什麼、彼此怎麼互相印證或矛盾；只引用 1～3 個真正影響判斷的數字，不要逐項重列均線、分數或價位。
-- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。解讀重點依序：K 線型態（kline_patterns）→ 支撐壓力 → 量價 → 均線，布林最多一句；why 至少涵蓋三個不同面向，不要整段只講均線和布林。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天），不可自行下「突破成功／失敗」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - summary：一句話總結（15～40 字），點出最重要的判斷，可以用簡單比喻，但不可給買賣指令或保證。"""
 
 
@@ -2328,16 +2344,22 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     data = dict(data)
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
+        data_full_patterns = data.get("kline_patterns") or {}
+        data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
         if has_scorecard:
             # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
-            data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger", "ma20_cross_recent_3_days", "ma_kline_signals")}
+            data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
+                                             "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
+            data["kline_patterns"] = (data_full_patterns or {}).get("summary") or []
+            b = data.get("bollinger") or {}
+            data["bollinger"] = {k: b.get(k) for k in ("position", "width_trend", "band_walk") if b.get(k)}   # 布林只留一句狀態
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
-            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "tomorrow_close_needed_to_rise")}
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "tomorrow_close_needed_to_rise")}
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
@@ -2593,7 +2615,7 @@ _MA_LABEL = r"(?:" + _MA_NAME + r"|所有均線|全部均線|各均線|各條均
 # 「月線 31.2 元」「MA20（31.2）」「季線約 45」：標籤後面緊接的價格；後面接 %／日／張等單位的是距離或天數，不核對。
 # 指數（加權、櫃買）動輒五位數，寫法會有千分位逗號；不吃逗號的話「46,543」會被讀成「46」，
 # 事實核對就會把正確的句子當成數字錯誤刪掉。
-_MA_DEDUCTION_TALK_RE = re.compile(r"扣抵|扣除|上彎|下彎|翻揚|翻多|翻空|走平|需收|要收|收在|收上|收回")
+_MA_DEDUCTION_TALK_RE = re.compile(r"扣抵|扣除|上彎|下彎|翻揚|翻多|翻空|走平|需收|要收|收在|收上|收回|扣高|扣低|推算|支撐上移|支撐下移|壓力上移|壓力下移")
 _MA_VALUE_RE = re.compile(r"(" + _MA_NAME + r")[\s（(：:為在約於是]{0,4}(\d[\d,]*(?:\.\d+)?)(?![\d.%％日天個張億萬倍檔次週年])")
 _DIRECTION_RE = re.compile(
     r"(站上|站穩|站回|突破|守住|守穩|跌破|失守|跌落|摜破)\s*((?:" + _MA_LABEL + r")(?:\s*[、與和及/／]\s*(?:" + _MA_LABEL + r"))*)")
@@ -2684,6 +2706,10 @@ _BULL_ALIGN_RE = re.compile(r"多頭排列|多方架構|多頭架構|多方掌�
 _BEAR_ALIGN_RE = re.compile(r"空頭排列|空方架構|空頭架構|空方掌控|空頭格局|空方格局|弱勢空頭|空頭趨勢")
 
 
+# 只核對明確的型態名稱（「上升趨勢」這種一般用語不查，避免誤刪）
+_PATTERN_NAME_RE = re.compile(r"箱型|三角收斂|上升三角|下降三角|楔形|紅三兵|黑三兵|多頭吞噬|空頭吞噬|晨星|夜星|缺口")
+
+
 class FactSheet:
     """從 Tool 原始結果整理可核對的事實：每檔股票的數字、均線數值、收盤確認與盤中的均線位置。"""
 
@@ -2696,6 +2722,7 @@ class FactSheet:
         self.ma_aux: Dict[str, Dict[str, List[float]]] = {}
         self.closed_pos: Dict[str, Dict[str, str]] = {}
         self.live_pos: Dict[str, Dict[str, str]] = {}
+        self.patterns: Dict[str, Set[str]] = {}          # 程式判斷到的 K 線型態（AI 只能講這些）
         tool_results = payload.get("tool_results") or {}
         self.market = _variants_of(json.dumps(_strip_keys(tool_results, _USER_INPUT_KEYS), ensure_ascii=False, default=str))
         user_text = " ".join([question] + [str(v) for v in _find_values(tool_results, "cost_price")])
@@ -2733,6 +2760,9 @@ class FactSheet:
                 if re.fullmatch(r"MA\d+", label) and level.get("price") is not None:
                     values.setdefault(label, []).append(float(level["price"]))
                     closed.setdefault(label, position)
+        if isinstance(data.get("kline_patterns"), dict):
+            import kline_patterns
+            self.patterns.setdefault(code, set()).update(kline_patterns.names(data["kline_patterns"]))
         live = (data.get("intraday_observation") or {}).get("ma_positions") or {}
         if live:
             self.live_pos.setdefault(code, {}).update({k: v for k, v in live.items() if v in ("站上", "跌破", "持平")})
@@ -2766,7 +2796,17 @@ class FactSheet:
             issues += self._ma_value_issues(sentence, subject)
             issues += self._direction_issues(sentence, subject)
             issues += self._alignment_issues(sentence, subject)
+            issues += self._pattern_issues(sentence, subject)
         return issues
+
+    def _pattern_issues(self, sentence: str, code: str) -> List[str]:
+        """K 線型態名稱只能用程式判斷到的（條件句「若形成…」不查）；沒有型態資料的題目不查。"""
+        if code not in self.patterns:
+            return []
+        plain = _CONDITIONAL_RE.split(_PAREN_RE.sub("", sentence))[0]
+        known = self.patterns[code]
+        return [f"型態不符：寫「{m.group()}」，程式沒有判斷到" for m in _PATTERN_NAME_RE.finditer(plain)
+                if not any(m.group() in k or k.startswith(m.group()) for k in known)]
 
     def _alignment_issues(self, sentence: str, code: str) -> List[str]:
         """均線排列：實際空頭排列（MA5<MA10<MA20<MA60）卻寫多頭排列／多方架構強勢，或反過來 → 不符。"""
@@ -3940,6 +3980,12 @@ def fix_scenario_title(title: str) -> str:
     return title
 
 
+# AI 分類的 action → 規則的意圖（程式再用既有路由；AI 不直接決定工具）
+_AI_ACTION_INTENTS: Dict[str, Set[str]] = {
+    "pattern": {"analysis"}, "news": {"news"}, "price": {"price"}, "institutional": {"institutional"},
+    "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"},
+}
+
 _RECOMMEND_RE = re.compile(r"推薦|明牌|報牌|買(?:什麼|哪[一支檔些]).{0,3}(?:股票|好)|哪[一支檔些](?:股票)?.{0,4}會(?:漲|噴|飆)")
 _SUPPORTED_INTENTS = frozenset(("technical", "volume_profile", "warrant", "win_rate", "news", "recent_trades", "institutional",
                                 "cost", "volume", "futures", "position", "behavior"))
@@ -4218,6 +4264,7 @@ REQUIRED_MODULE_API = {
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
     "spot_chip": ("_official_trading_dates",),
+    "kline_patterns": ("detect", "names"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
@@ -5006,7 +5053,7 @@ class AceQueryEngine:
     # 草稿相關與維護指令回純文字：管理員要能直接複製、貼回去，也方便自己留檔。
     TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show",
                    "admin_status", "admin_market_sync", "admin_roster_build", "weekly_pick_hint",
-                   "admin_usage", "admin_errors"}
+                   "admin_errors", "admin_sector_alias"}   # admin_usage 改成圖卡（09-30）
 
     def _access(self):
         return getattr(getattr(self, "_request_local", None), "access", None)
@@ -5314,8 +5361,49 @@ class AceQueryEngine:
         if compact in ("錯誤紀錄", "錯誤記錄", "錯誤", "errors"):
             return AnswerResult(text=ADMIN_ALERTS.summary(), route="admin_errors", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
+        alias_cmd = re.match(r"^(新增|刪除)族群別名(.+)$", compact)
+        if alias_cmd or compact in ("族群別名", "族群別名清單"):
+            if alias_cmd and alias_cmd.group(1) == "新增" and "=" in alias_cmd.group(2):
+                key, names = alias_cmd.group(2).split("=", 1)
+                ok, msg = sector_match.add_alias(key, re.split(r"[,，、]", names))
+            elif alias_cmd and alias_cmd.group(1) == "刪除":
+                name = alias_cmd.group(2).strip()
+                msg = f"已刪除別名：{name}" if sector_match.remove_alias(name) else f"找不到管理員新增的別名：{name}"
+            elif alias_cmd:
+                msg = "用法：新增族群別名 TGV=玻璃基板（多個族群用逗號分開）／刪除族群別名 TGV"
+            else:
+                extra = sector_match._extra_aliases()
+                miss = dict(local_market_cache.get_state(sector_match.UNMATCHED_KEY, {}) or {})
+                msg = ("**管理員新增的別名**\n" + ("\n".join(f"{k} → {'、'.join(v)}" for k, v in extra.items()) or "（無）")
+                       + "\n\n**會員講過但對不到的說法（次數）**\n"
+                       + ("\n".join(f"{k}（{v}）" for k, v in list(miss.items())[:20]) or "（無）"))
+            return AnswerResult(text=msg, route="admin_sector_alias", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
         if compact in ("用量", "使用量", "今日用量", "usage"):
             info = local_market_cache.usage_summary()
+            try:
+                models = self.gateway.quota.rows(len(tools.core()._get_warrants_api_keys() or []))
+            except Exception as exc:
+                self.log(f"用量圖卡：Gemini 額度讀取失敗｜{tools.err_text(exc)}")
+                models = []
+            policy = getattr(self, "_quota_policy", None)
+            mode = {"bonus": "下午加開", "emergency": "緊急縮減"}.get(getattr(policy, "mode", ""), "一般")
+            cost = [l for l in cost_report_lines() if l.startswith(("若全部改付費", "Railway"))]
+            sections = [
+                {"type": "heading", "text": "Gemini 今日剩餘額度（台灣下午 4 點重置）"},
+                {"type": "stats", "items": [
+                    {"label": f"{m['model']}{'（主）' if i == 0 else '（備援）'}",
+                     "value": f"剩 {m['left_pct']}%｜{m['used']:,}/{m['limit']:,} 次｜金鑰 {m['ready']}/{m['keys']}｜{m['state']}"}
+                    for i, m in enumerate(models)] or [{"label": "Gemini", "value": "讀取失敗"}]},
+                {"type": "heading", "text": f"今日使用｜{info['day']}"},
+                {"type": "stats", "items": [
+                    {"label": "提問題數", "value": f"{info['questions']} 題"},
+                    {"label": "快取命中", "value": f"{info['cache_hits']} 題（{info['cache_hit_rate']}%）"},
+                    {"label": "平均／最慢耗時", "value": f"{info['avg_elapsed']}s／{info['slowest']}s"},
+                    {"label": "會員額度模式", "value": mode},
+                    {"label": "尖峰時段", "value": str(info.get("busiest_hour") or "-")}]},
+            ] + [{"type": "note", "text": "※ " + l.replace("**", "")} for l in cost]
+            card = {"branch": "艾斯 AI 用量", "tags": ["管理員"], "label": info["day"], "sections": sections}
             api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
             text = (f"**用量｜{info['day']}**" + chr(10) +
                     f"題數 {info['questions']}｜快取命中 {info['cache_hits']}（{info['cache_hit_rate']}%）" + chr(10) +
@@ -5323,7 +5411,8 @@ class AceQueryEngine:
                     f"平均耗時 {info['avg_elapsed']}s｜最慢 {info['slowest']}s｜尖峰 {info.get('busiest_hour') or '-'}" + chr(10) +
                     chr(10).join(cost_report_lines()))
             return AnswerResult(text=text, route="admin_usage", gemini_calls=0,
-                                elapsed=time.perf_counter()-started, cacheable=False)
+                                elapsed=time.perf_counter()-started, cacheable=False,
+                                image_title="艾斯 AI 用量", panels=[{"branch_card": card, "hide_text": True}])
         tester = re.match(r"^(新增|加入|移除|刪除)測試員(.*)$", compact)
         if tester or compact in ("測試員名單", "測試員"):
             names = [str(x) for x in (local_market_cache.get_state(QUOTA_EXEMPT_KEY, []) or [])]
@@ -5693,15 +5782,24 @@ class AceQueryEngine:
         return parsed, self.router.plan(parsed, stats), stats
 
     def _classify_fallback(self, question: str, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[QueryPlan]:
+        plan = self._classify_fallback_impl(question, parsed, stats)
+        if plan is not None and plan.route == "rule_stock_bundle":
+            return None                                       # 分類後仍是綜合包：沒有新資訊，沿用原本的規則結果
+        return plan
+
+    def _classify_fallback_impl(self, question: str, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[QueryPlan]:
         """規則認不出來時，花 1 次 Gemini 只做「主題／動作」分類（不產生任何數字）。"""
-        if not INTENT_FALLBACK_ENABLE:
+        if not INTENT_FALLBACK_ENABLE or getattr(self, "gateway", None) is None:
             return None
         schema = {"type": "object", "properties": {
             "subject": {"type": "string"}, "action": {"type": "string"}, "target": {"type": "string"}},
             "required": ["subject", "action", "target"]}
-        prompt = ("你是台股問句分類器，只輸出 JSON，不要解釋、不要回答問題本身。\n"
+        prompt = ("你是台股問句分類器，只輸出 JSON，不要解釋、不要回答問題本身。請讀完整句再判斷真正想問的事，口語、錯字、繞圈子的說法都要理解。\n"
                   'subject 從 ["stock","sector","market","branch","none"] 擇一；'
-                  'action 從 ["pattern","members","rank","compare","chips","news","price","none"] 擇一；'
+                  'action 從 ["pattern","members","rank","compare","chips","news","price","institutional","futures","cost","none"] 擇一'
+                  "（pattern＝走勢／型態／技術面／能不能追／會不會跌、institutional＝外資投信自營商法人、futures＝台指期未平倉、"
+                  "cost＝使用者講自己的成本或套牢、news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
+                  "compare＝比較兩檔、members＝族群成分股、rank＝排行）；"
                   "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串。\n問題：" + question)
         result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
         stats.record_gemini(result)
@@ -5726,15 +5824,24 @@ class AceQueryEngine:
                 parsed.sector = {"mode": mode, "industry": hit["industry"], "name": hit["name"]}
                 parsed.intents = set(parsed.intents) | {"sector"}
                 return QueryPlan(route="rule_sector", need_final_llm=mode in ("technical", "momentum"))
-        if subject == "stock" and target:
-            try:
-                retry = self.parser.parse(target, access=self._access())
-            except Exception:
-                retry = None
-            if retry is not None and retry.stocks:
-                parsed.stocks = list(retry.stocks[:2])
-                parsed.intents = set(parsed.intents) | set(retry.intents)
+        if subject == "stock":
+            # 規則已經認出的股票優先（AI 不能換掉）；規則沒認出才用 AI 的 target 重新對名冊
+            if not parsed.stocks and target:
+                try:
+                    retry = self.parser.parse(target, access=self._access())
+                except Exception:
+                    retry = None
+                if retry is not None and retry.stocks:
+                    parsed.stocks = list(retry.stocks[:2])
+                    parsed.intents = set(parsed.intents) | set(retry.intents)
+            added = _AI_ACTION_INTENTS.get(action, set())
+            if parsed.stocks and added:
+                parsed.intents = set(parsed.intents) | added     # 保留 AI 判斷的「要做什麼」，不只用股票名稱
                 return self.router.plan(parsed, stats)
+            if parsed.stocks and action not in ("none", "chips", ""):
+                return self.router.plan(parsed, stats)
+        if subject == "sector":
+            sector_match.record_unmatched(target or question)   # 對不到的說法記下來，管理員用「族群別名」查看
         near = sector_match.suggest(target or question) if subject == "sector" else []
         if near:
             options = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(near[:3]))
@@ -5783,7 +5890,8 @@ class AceQueryEngine:
                 plan.add("get_market_institutional", market=market_of(parsed))
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
-        if plan.route == "help" and not (unknown_codes(parsed) and not parsed.stocks):
+        if plan.route in ("help", "rule_stock_bundle") and not (unknown_codes(parsed) and not parsed.stocks):
+            # 規則沒把握（看不懂，或認得股票但看不出要問什麼）→ 1 次 Gemini 用「完整原句」分類，程式再檢查；
             # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
@@ -6105,6 +6213,13 @@ class AceQueryEngine:
             return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
 
         result = sector_analysis.answer(request, self.gateway, validate)
+        if request.get("matched_by"):
+            # 會員講別名（TGV、CCL…）或模糊比對：卡片說明列與文字都註明對應到哪個族群
+            result["text"] = f"（{request['matched_by']}）\n" + str(result.get("text") or "")
+            for panel in result.get("panels") or []:
+                sec = (panel or {}).get("sector")
+                if isinstance(sec, dict):
+                    sec["liquidity_note"] = "｜".join(x for x in (request["matched_by"], sec.get("liquidity_note")) if x)
         # 記住排行前幾名，讓「第一名的壓力在哪」「跟第二名比呢」接得起來。
         try:
             sector_panel = ((result.get("panels") or [{}])[0] or {}).get("sector") or {}

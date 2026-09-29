@@ -85,6 +85,8 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
             request["merged_names"] = hit["merged_names"]
         if hit.get("confidence") == "fuzzy":
             request["matched_by"] = f"對應族群：{hit['name']}"
+        elif hit.get("alias_used"):
+            request["matched_by"] = f"「{hit['alias_used']}」對應族群：{hit.get('merged_names') or hit['name']}"
         return request
 
     # 全市場族群排行：問的是「所有族群」，句子裡不能還留著某個特定族群名稱。

@@ -74,15 +74,72 @@ def _data() -> Dict[str, Any]:
             alias_raw = payload
         else:
             custom_raw = payload
+    aliases = dict(alias_raw.get("aliases") or {})
+    aliases.update(_extra_aliases())             # 管理員用 /ace 新增的別名（存資料庫，不用重新部署）
     with _LOCK:
         _CACHE.update({
             "ready": True,
-            "aliases_raw": dict(alias_raw.get("aliases") or {}),
+            "aliases_raw": aliases,
             "typos": dict(alias_raw.get("typos") or {}),
             "exclude": {str(x) for x in (alias_raw.get("exclude_groups") or [])},
             "custom": dict(custom_raw.get("groups") or {}),
         })
     return _CACHE
+
+
+EXTRA_ALIAS_KEY = "sector_alias_extra"          # {別名: [名冊族群名稱]}
+UNMATCHED_KEY = "sector_alias_unmatched"        # {沒對到的說法: 次數}
+
+
+def _extra_aliases() -> Dict[str, List[str]]:
+    try:
+        import local_market_cache
+        return dict(local_market_cache.get_state(EXTRA_ALIAS_KEY, {}) or {})
+    except Exception:
+        return {}
+
+
+def add_alias(alias: str, names: List[str]) -> Tuple[bool, str]:
+    """管理員新增別名：名稱必須是名冊裡的族群；成功後立刻生效。"""
+    alias = str(alias or "").strip()
+    codes, hit = _codes_for_names([str(n).strip() for n in names if str(n).strip()])
+    if not alias or not codes:
+        return False, "找不到這些族群名稱（要和名冊完全相同），例：新增族群別名 TGV=玻璃基板"
+    import local_market_cache
+    extra = _extra_aliases()
+    extra[alias] = hit
+    local_market_cache.set_state(EXTRA_ALIAS_KEY, extra)
+    unmatched = dict(local_market_cache.get_state(UNMATCHED_KEY, {}) or {})
+    unmatched.pop(alias, None)
+    local_market_cache.set_state(UNMATCHED_KEY, unmatched)
+    reload()
+    return True, f"已新增：{alias} → {'、'.join(hit)}"
+
+
+def remove_alias(alias: str) -> bool:
+    import local_market_cache
+    extra = _extra_aliases()
+    if alias not in extra:
+        return False
+    extra.pop(alias)
+    local_market_cache.set_state(EXTRA_ALIAS_KEY, extra)
+    reload()
+    return True
+
+
+def record_unmatched(term: str) -> None:
+    """會員講的族群說法對不到名冊：寫 Log 並累計次數，管理員用「族群別名」查看後決定要不要加。"""
+    term = str(term or "").strip()[:20]
+    if not term:
+        return
+    print(f"🔎 族群名稱沒對到：{term}", flush=True)
+    try:
+        import local_market_cache
+        data = dict(local_market_cache.get_state(UNMATCHED_KEY, {}) or {})
+        data[term] = int(data.get(term, 0)) + 1
+        local_market_cache.set_state(UNMATCHED_KEY, dict(sorted(data.items(), key=lambda kv: -kv[1])[:100]))
+    except Exception as exc:
+        print(f"⚠️ 族群未對到紀錄寫入失敗｜{tools.err_text(exc)}", flush=True)
 
 
 def reload() -> None:
@@ -220,10 +277,10 @@ def match(text: str) -> Optional[Dict[str, Any]]:
 
     # 2. 同義詞表：先比主題字，再比整句
     for candidate, confidence in ((core, "exact"), (value, "alias")):
-        target = aliases.get(candidate)
+        target, used = aliases.get(candidate), candidate
         if target is None and confidence == "alias":
             hits = sorted((k for k in aliases if len(k) >= 2 and k in value), key=len, reverse=True)
-            target = aliases[hits[0]] if hits else None
+            target, used = (aliases[hits[0]], hits[0]) if hits else (None, "")
         if not target:
             continue
         if any(str(t).startswith("__custom__") for t in target):
@@ -232,7 +289,10 @@ def match(text: str) -> Optional[Dict[str, Any]]:
         if codes:
             merged = "＋".join(names) if len(codes) > 1 else ""
             display = names[0] if len(codes) == 1 else (core or value)
-            return _pack(codes, display, "merged" if len(codes) > 1 else confidence, merged)
+            result = _pack(codes, display, "merged" if len(codes) > 1 else confidence, merged)
+            if used and not any(normalize(n) == used for n in names):
+                result["alias_used"] = used      # 會員講的是別名（例：TGV）→ 回答時註明對應到哪個族群
+            return result
 
     index = _index()
     # 3. 名冊名稱完全相同

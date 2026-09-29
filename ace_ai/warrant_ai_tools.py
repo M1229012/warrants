@@ -2659,7 +2659,70 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "ma_above_close": above_close,
             "signal": signal,
         }
+        # 扣高／扣低：扣抵價低於現價＝扣低（均線易揚、助漲），高於現價＝扣高（均線易彎、壓力）
+        low_flags = [d < close for d in deductions]
+        if all(low_flags):
+            trend = "扣低"
+        elif not any(low_flags):
+            trend = "扣高"
+        else:
+            highs = [str(i) for i, f in enumerate(low_flags, 1) if not f]
+            lows = [str(i) for i, f in enumerate(low_flags, 1) if f]
+            trend = (f"第{'、'.join(highs)}日扣高、其餘扣低" if len(highs) <= len(lows)
+                     else f"第{'、'.join(lows)}日扣低、其餘扣高")
+        move = projected - ma
+        role = ("壓力" if above_close else "支撐") + ("上移" if move > flat * k else "下移" if move < -flat * k else "持平")
+        result[f"MA{n}"].update({
+            "deduct_trend": trend,
+            "role_text": f"{role}至 {projected:,.2f}",
+            "hold_prices_3d": [_num(v) for v in deductions[:3]],       # 未來 3 日各自要收高於這價，均線才維持上揚
+            "outlook": f"未來 {k} 日{trend}，{role}至 {projected:,.2f}（收盤不變推算）",
+        })
     return result
+
+
+_CORP_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+
+
+def get_corporate_actions(code: str) -> Dict[str, Any]:
+    """公司行動事件（一天查一次）：除權息（純現金「息」可還原）、分割、面額變更；減資資料源權限不足，列為未涵蓋。
+    查詢失敗回 status=failed（型態模組會標「公司行動資料未核實」，不當成沒有事件）。"""
+    today = taipei_now().strftime("%Y-%m-%d")
+    cached = _CORP_CACHE.get(code)
+    if cached and cached[0] == today:
+        return cached[1]
+    kf = core()
+    start = (taipei_now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    items: List[Dict[str, Any]] = []
+    try:
+        div = kf._finmind_get_data("TaiwanStockDividendResult", data_id=code, start_date=start, end_date=today, allow_empty=True)
+        for r in (div.to_dict("records") if div is not None else []):
+            kind = str(r.get("stock_or_cache_dividend") or "")
+            before, after = float(r.get("before_price") or 0), float(r.get("after_price") or 0)
+            items.append({"date": str(r.get("date"))[:10], "kind": kind,
+                          "factor": after / before if kind == "息" and before > 0 and 0 < after < before else None})
+        for dataset, kind in (("TaiwanStockSplitPrice", "分割"), ("TaiwanStockParValueChange", "面額變更")):
+            raw = kf._finmind_get_data(dataset, data_id=code, start_date=start, end_date=today, allow_empty=True)
+            items += [{"date": str(r.get("date"))[:10], "kind": kind, "factor": None}
+                      for r in (raw.to_dict("records") if raw is not None else [])]
+        result = {"status": "ok", "items": items, "coverage": ["減資資料未涵蓋（資料源權限不足）"]}
+        record_api_event("FinMindData", status=200)
+    except Exception as exc:
+        print(f"⚠️ 公司行動資料查詢失敗｜{code}｜{err_text(exc)}", flush=True)
+        result = {"status": "failed", "items": []}
+    _CORP_CACHE[code] = (today, result)
+    return result
+
+
+def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = False) -> Dict[str, Any]:
+    try:
+        import kline_patterns
+        events = get_corporate_actions(code) if code else None
+        result = kline_patterns.detect(df, events, provisional_today)
+        return {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
+    except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
+        print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)
+        return {}
 
 
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
@@ -2726,6 +2789,11 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         },
         "bollinger": analyze_bollinger(df),
         "ma_kline_signals": safe_signal(kf.get_ma_kline_signals),
+        "kline_patterns": _kline_patterns(df, code, bool(use_live and (intraday.get("is_live") or intraday.get("post_close_provisional")))),
+        # 給 AI 看近期走勢：近 10 日 K 棒（日期 開 高 低 收）＋均線近 3 日（看均線往上／往下彎）
+        "recent_bars_10": [[_fmt_date(i)[5:], _num(r.get("Open")), _num(r.get("High")), _num(r.get("Low")), _num(r.get("Close"))]
+                           for i, r in df.iloc[-10:].iterrows()],
+        "ma_recent_3d": {f"MA{n}": [_num(v) for v in df[f"MA{n}"].iloc[-3:]] for n in (5, 10, 20, 60) if f"MA{n}" in df},
         "indicator_definition": "MA＝收盤簡單均線；KD＝9日RSV；MACD＝12/26/9；布林＝20日±2倍標準差（與週報相同）",
     }
 

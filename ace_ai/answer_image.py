@@ -1365,7 +1365,11 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
     info = (card.get('ma_deduction') or {}).get('MA20' if label == '布林中軌' else label)
     if info:
         outlook, color = _deduction_outlook(info)
-        return f"{'MA20 ' if label == '布林中軌' else ''}目前{info.get('direction_now', '')}｜收盤不變：{outlook}", color
+        plain = {'續揚': '持續上揚', '續彎': '持續下彎'}.get(outlook, outlook)
+        role = str(info.get('role_text') or '')
+        # 白話一行：「持續上揚，5 天後支撐上移到 34.92」（收盤不變推算）
+        tail = f"，5 天後{role.replace('至 ', '到 ')}" if role else ''
+        return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED
     if '布林' in label:
@@ -1453,10 +1457,17 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
     chips = []
     for key, info in deduction.items():
         outlook, color = _deduction_outlook(info)
+        trend = info.get('deduct_trend')
+        if trend and not info.get('turn'):
+            color = GOOD_INK if trend == '扣低' else WARN_INK if trend == '扣高' else color
         chips.append((f'{key} {outlook}', color))
     widths = [font(19, True).getlength(t) + 26 for t, _ in chips]
     start = x + font(20, True).getlength(label) + 16
     rows = _flow_rows(widths, width - (start - x), 10)
+    # 未來 3 日維持上揚門檻（扣抵價）：只列 MA5／MA20，收盤要高於這些價，均線才繼續往上
+    holds = [f"{k} {'、'.join(number(v) for v in deduction[k]['hold_prices_3d'])}"
+             for k in ('MA5', 'MA20') if (deduction.get(k) or {}).get('hold_prices_3d')]
+    hold_lines = wrap('未來 3 天收盤守住這些價，均線就會繼續往上：' + '｜'.join(holds), 19, width) if holds else []
     if not dry:
         draw.text((x, y + 17), label, font=font(20, True), fill=INK, anchor='lm')
         cx, cy = start, y
@@ -1466,7 +1477,9 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
             draw.rounded_rectangle((cx, cy, cx + w, cy + 34), radius=17, fill=TILE_BG, outline=LINE)
             draw.text((cx + w / 2, cy + 17), text, font=font(19, True), fill=color if color != MUTED else INK, anchor='mm')
             cx += w + 10
-    return rows * 44
+        for i, line in enumerate(hold_lines):
+            text_at(draw, (x, y + rows * 44 + 2 + i * 28), line, 19, MUTED)
+    return rows * 44 + len(hold_lines) * 28 + (6 if hold_lines else 0)
 
 
 def _draw_branch_table(draw, x, y, width, branches) -> None:
