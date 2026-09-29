@@ -666,7 +666,7 @@ def _market_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"sector": {
         "name": "全市場族群", "mode": "market_technical" if technical else "market_momentum",
         "comparison_date": data.get("as_of", ""), "rows": rows[:5], "others": [],
-        "coverage_note": "", "liquidity_note": f"共比較 {data.get('groups_ranked', 0)} 個族群（中位漲幅排序）｜前 3 檔只列有量成分股",
+        "coverage_note": "", "liquidity_note": f"共 {data.get('groups_ranked', 0)} 個族群｜有量成分股中位漲幅",
         "live_time": "",
     }}
 
@@ -733,11 +733,13 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
         return None
     if not data:
         return None
+    now = tools.taipei_now()
+    closed = now.hour * 60 + now.minute >= 13 * 60 + 30          # 13:30 收盤後 MIS 報價＝今日收盤價
     panel = _market_panel(data)
-    panel["sector"]["live_time"] = data["live_time"]
-    panel["sector"]["liquidity_note"] = (f"盤中估算（證交所五檔中價）｜共比較 {data['groups_ranked']} 個族群（有效成分股中位漲幅）"
-                                         "｜領漲股只列有量成分股")
-    lines = [f"**全市場族群漲幅排行｜盤中 {data['live_time']}**"]
+    panel["sector"]["live_time"] = "" if closed else data["live_time"]
+    panel["sector"]["comparison_date"] = data["as_of"]
+    panel["sector"]["liquidity_note"] = ("" if closed else "盤中估算｜") + f"共 {data['groups_ranked']} 個族群｜有量成分股中位漲幅"
+    lines = [f"**全市場族群漲幅排行｜{'今日收盤' if closed else '盤中 ' + data['live_time']}**"]
     lines += [f"{r['rank']}. {r['name']}｜中位漲幅 {r['median']:+.2f}%｜領漲股 {_movers_text(r['top_movers'])}"
               for r in data["rows"]]
     lines.append("※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。")
