@@ -2682,6 +2682,18 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
 
 
 _CORP_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+_CORP_MARKET: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
+
+
+def _market_corp_rows(kf, dataset: str, start: str, today: str) -> List[Dict[str, Any]]:
+    """全市場公司行動資料（一天一次，所有股票共用）。"""
+    cached = _CORP_MARKET.get(dataset)
+    if cached and cached[0] == today:
+        return cached[1]
+    raw = kf._finmind_get_data(dataset, start_date=start, end_date=today, allow_empty=True)
+    rows = raw.to_dict("records") if raw is not None else []
+    _CORP_MARKET[dataset] = (today, rows)
+    return rows
 
 
 def get_corporate_actions(code: str) -> Dict[str, Any]:
@@ -2701,11 +2713,16 @@ def get_corporate_actions(code: str) -> Dict[str, Any]:
             before, after = float(r.get("before_price") or 0), float(r.get("after_price") or 0)
             items.append({"date": str(r.get("date"))[:10], "kind": kind,
                           "factor": after / before if kind == "息" and before > 0 and 0 < after < before else None})
+        coverage = ["減資資料未涵蓋（資料源權限不足）"]
+        # 分割、面額變更：資料集不接受 data_id → 一天抓一次全市場再篩；抓不到只寫 Log，不影響除權息還原
         for dataset, kind in (("TaiwanStockSplitPrice", "分割"), ("TaiwanStockParValueChange", "面額變更")):
-            raw = kf._finmind_get_data(dataset, data_id=code, start_date=start, end_date=today, allow_empty=True)
-            items += [{"date": str(r.get("date"))[:10], "kind": kind, "factor": None}
-                      for r in (raw.to_dict("records") if raw is not None else [])]
-        result = {"status": "ok", "items": items, "coverage": ["減資資料未涵蓋（資料源權限不足）"]}
+            try:
+                rows = _market_corp_rows(kf, dataset, start, today)
+                items += [{"date": str(r.get("date"))[:10], "kind": kind, "factor": None}
+                          for r in rows if str(r.get("stock_id")) == code]
+            except Exception as exc:
+                coverage.append(f"{kind}資料暫時無法取得（{type(exc).__name__}）")
+        result = {"status": "ok", "items": items, "coverage": coverage}
         record_api_event("FinMindData", status=200)
     except Exception as exc:
         print(f"⚠️ 公司行動資料查詢失敗｜{code}｜{err_text(exc)}", flush=True)
