@@ -2181,7 +2181,7 @@ AI_CARD_SCHEMA = {
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：一句話直接回答使用者的問題（20～50 字），像分析師的判斷，例如「趨勢是強的，但現在這個位置不適合追」。
 - why：「為什麼這樣看」2～4 句（60～180 字）。說明關鍵訊號代表什麼、彼此怎麼互相印證或矛盾；只引用 1～3 個真正影響判斷的數字，不要逐項重列均線、分數或價位。
-- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - summary：一句話總結（15～40 字），點出最重要的判斷，可以用簡單比喻，但不可給買賣指令或保證。"""
 
 
@@ -3796,6 +3796,19 @@ _WHY_MOVE_RE = re.compile(r"(?:為什麼|為何|怎麼會|什麼原因|原因).{
 # 沒有的資料（基本面）：不能拿型態頁充數
 _FUNDAMENTAL_RE = re.compile(r"殖利率|股利|股息|配息|配股|除息|除權|填息|本益比|本淨比|EPS|每股盈餘|財報|毛利率|營益率|淨利率|ROE|股東會")
 # 報明牌：不提供
+# 問操作策略／進出場：照常回答型態，但明講不提供買賣建議，情境改成「明天觀察重點」
+_STRATEGY_RE = re.compile(r"操作策略|操作建議|交易策略|策略|進場|出場|買點|賣點|停損|停利|怎麼操作|如何操作|該買|該賣|加碼|減碼")
+# 解讀卡不可出現的買賣指令句（Gemini 偶爾會寫）：整句刪掉
+_DIRECTIVE_RE = re.compile(r"建議(?:可|先|逢低|逢高|分批)?(?:買進|買入|賣出|進場|出場|加碼|減碼|布局|停損|停利)"
+                           r"|停損(?:設|點|價|位)|停利(?:設|點|價|位)|(?:可|宜)(?:逢低)?(?:買進|進場|加碼)")
+STRATEGY_NOTICE = "艾斯 AI 不提供買賣建議，以下整理明天的觀察重點。"
+
+
+def drop_directives(text: str) -> str:
+    parts = re.split(r"(?<=[。；！？])", text or "")
+    return "".join(p for p in parts if not _DIRECTIVE_RE.search(p)).strip()
+
+
 _RECOMMEND_RE = re.compile(r"推薦|明牌|報牌|買(?:什麼|哪[一支檔些]).{0,3}(?:股票|好)|哪[一支檔些](?:股票)?.{0,4}會(?:漲|噴|飆)")
 _SUPPORTED_INTENTS = frozenset(("technical", "volume_profile", "warrant", "win_rate", "news", "recent_trades", "institutional",
                                 "cost", "volume", "futures", "position", "behavior"))
@@ -6087,6 +6100,13 @@ class AceQueryEngine:
             card = self._check_ai_card(card, payload, facts)
             if card is None:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
+            for key in ("why", "summary"):
+                card[key] = drop_directives(card.get(key, ""))
+            card["scenarios"] = [dict(x, text=drop_directives(x["text"])) for x in card.get("scenarios") or []]
+            card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
+            if _STRATEGY_RE.search(question):
+                card["notice"] = "｜".join(x for x in (STRATEGY_NOTICE, card.get("notice")) if x)
+                card["scenario_title"] = "明天觀察重點"
             time_line = build_data_time_line(results)
             card["footer"] = "｜".join(x for x in (time_line, "AI 解讀僅供參考，不構成投資建議。") if x)
             self._set_ai_card(card)

@@ -2316,7 +2316,7 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
         cy += _para(pen, ix0, cy, data['why'], 25, INK, width) + 16
     scenarios = [s for s in data.get('scenarios') or [] if s.get('text')][:2]
     if scenarios:
-        cy += section('接下來可能的走法' if len(scenarios) == 1 else '接下來可能的兩種走法')
+        cy += section(data.get('scenario_title') or ('接下來可能的走法' if len(scenarios) == 1 else '接下來可能的兩種走法'))
         gap = 20
         col = (width - gap * (len(scenarios) - 1)) / len(scenarios)
         box_h = max(_para(None, 0, 0, s['text'], 23, INK, col - 44) for s in scenarios) + 76
