@@ -724,6 +724,7 @@ def live_group_ranking() -> Optional[Dict[str, Any]]:
                      "top_movers": [{"code": c, "name": names.get(c) or quotes[c].get("name", c),
                                      "change_pct": quotes[c]["change_pct"]} for c in movers]})
     rows.sort(key=lambda r: (-r["median"], r["name"]))
+    rows = market_scan._dedupe_overlap(rows, members)          # 成分股重疊 >70% 併入前一名，不重複佔名次
     for index, row in enumerate(rows, 1):
         row["rank"] = index
     stamp = tools.taipei_now().strftime("%H:%M")

@@ -76,24 +76,32 @@ def _member_codes() -> Dict[str, List[str]]:
     return out
 
 
-def _dedupe_overlap(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """依綜合分數由高到低，和已保留族群重疊率 > 70% 的就去掉（保留分數較高者）；去重名單只寫 log。"""
+def _dedupe_overlap(rows: List[Dict[str, Any]], members: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
+    """依排名由高到低，和已保留族群重疊率 > 70%（共同檔數÷較小族群檔數）的不再佔名次，
+    併入前面那個族群的標題「A（含B）」（09-30：太陽能／鈣鈦礦同一批股票佔兩名）。漲幅、型態排行共用。"""
     kept: List[Dict[str, Any]] = []
     dropped: List[str] = []
     for row in rows:
-        codes = row.pop("_codes", set())
+        codes = row.pop("_codes", None)
+        if codes is None:
+            codes = set((members or {}).get(row.get("group_code"), []))
         clash = next((k for k in kept
                       if codes and k["_member_set"]
                       and len(codes & k["_member_set"]) / min(len(codes), len(k["_member_set"])) > TECH_OVERLAP_MAX), None)
         if clash:
             dropped.append(f"{row['name']}→{clash['name']}")
+            clash.setdefault("_merged", []).append(row["name"])
             continue
-        row["_member_set"] = codes
+        row["_member_set"] = set(codes)
         kept.append(row)
     for row in kept:
         row.pop("_member_set", None)
+        merged = row.pop("_merged", [])
+        if merged:
+            row["merged_names"] = merged
+            row["name"] = f"{row['name']}（含{'、'.join(merged[:2])}{'等' if len(merged) > 2 else ''}）"
     if dropped:
-        print(f"📚 型態排行去重（重疊率 >{TECH_OVERLAP_MAX:.0%}）：{'、'.join(dropped[:30])}"
+        print(f"📚 族群排行去重（重疊率 >{TECH_OVERLAP_MAX:.0%}）：{'、'.join(dropped[:30])}"
               + (f"…共 {len(dropped)} 個" if len(dropped) > 30 else ""), flush=True)
     return kept
 
@@ -171,6 +179,7 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
         rows = _dedupe_overlap(rows)
     else:
         rows.sort(key=lambda r: (-r["median"], r["name"]))
+        rows = _dedupe_overlap(rows, members)
     for index, row in enumerate(rows[:limit], 1):
         row["rank"] = index
     dates = local_market_cache.known_dates(limit=1)
