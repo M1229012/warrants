@@ -4062,7 +4062,9 @@ def is_unsupported_question(parsed: "ParsedQuestion", question: str) -> bool:
 
 _PRONOUN_RE = re.compile(r"這檔|那檔|這支|那支|該股|這家|那家|(?<!其)[它他]")
 NO_CONTEXT_MESSAGE = "請告訴我股票名稱或代號，例如：2344 現在技術面怎麼樣。"
-_COMPARE_RE = re.compile(r"比較|相比|對比|比呢|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
+# 「比較好／比較適合／比較強」是副詞（09-30：「從哪裡介入比較好」被當成和上一題那檔比較）
+_COMPARE_ADVERB = r"(?!好|適合|合適|安全|理想|有利|容易|穩|佳|強|弱|高|低|多|少|大|小|快|慢|久|划算|值得|保守|積極|不)"
+_COMPARE_RE = re.compile(r"比較" + _COMPARE_ADVERB + r"|相比|對比|比呢|比起來|跟.{1,8}比|和.{1,8}比|與.{1,8}比")
 
 
 @dataclass
