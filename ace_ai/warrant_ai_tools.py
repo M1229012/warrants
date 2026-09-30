@@ -765,10 +765,10 @@ def _truncate_sentences(text: Any, limit: int) -> str:
 
 
 def turn_phrase(turn: str, day: Optional[int]) -> str:
-    """均線轉向的時間用語：1＝明天、2＝後天、其餘「N 個交易日後」。"""
+    """均線轉向的時間用語：1＝明天、2＝後天、其餘「第 N 個交易日起」（09-30：「3 個交易日後」會被讀成第 4 天）。"""
     if not turn or not day:
         return ""
-    when = {1: "明天起", 2: "後天起"}.get(int(day), f"{int(day)} 個交易日後")
+    when = {1: "明天起", 2: "後天起"}.get(int(day), f"第 {int(day)} 個交易日起")
     return f"{when}{turn}"
 
 

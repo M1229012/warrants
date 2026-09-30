@@ -1354,8 +1354,8 @@ def _deduction_outlook(info: dict) -> tuple[str, str]:
     """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
     if info.get('turn'):
         day = info.get('turn_day')
-        text = info.get('turn_text') or f"{ {1: '明天起', 2: '後天起'}.get(day, f'{day} 個交易日後') }{info['turn']}"
-        return text, WARN_INK if info['turn'] == '轉下彎' else GOOD_INK
+        text = info.get('turn_text') or f"{ {1: '明天起', 2: '後天起'}.get(day, f'第 {day} 個交易日起') }{info['turn']}"
+        return text, DOWN if info['turn'] == '轉下彎' else UP          # 台股慣例：往上紅、往下綠
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1458,7 +1458,7 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
         outlook, color = _deduction_outlook(info)
         trend = info.get('deduct_trend')
         if trend and not info.get('turn'):
-            color = GOOD_INK if trend == '扣低' else WARN_INK if trend == '扣高' else color
+            color = UP if trend == '扣低' else DOWN if trend == '扣高' else color
         chips.append((f'{key} {outlook}', color))
     widths = [font(19, True).getlength(t) + 26 for t, _ in chips]
     start = x + font(20, True).getlength(label) + 16
