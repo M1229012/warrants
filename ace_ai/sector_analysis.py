@@ -698,29 +698,34 @@ def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5,
     members = {n: list(dict.fromkeys(groups.get(n) or [])) for n in names}
     liquid = local_market_cache.liquidity_map(20)
     ranked = sorted(names, key=lambda n: -len(members[n]))
-    codes = {c for n in ranked[:max_groups] for c in members[n]}
-    changes = local_market_cache.latest_changes(codes)
+    changes = local_market_cache.latest_changes({c for n in ranked for c in members[n]} | {code})
     try:
         name_map = tools.get_stock_name_map() or {}
     except Exception:
         name_map = {}
     name_map = {**sector_roster._name_map(), **name_map}
-    rows = []
+    label_of = lambda c: f"{name_map[c]} {c}" if name_map.get(c) and name_map[c] != c else c
+    own = (changes.get(code) or {}).get("change_pct")
+    sig = lambda v: f"{v:+.2f}%" if v is not None else "-"
+    rows, shown = [], {code}
     for n in ranked[:max_groups]:
-        top = sorted((c for c in members[n] if c != code), key=lambda c: -(liquid.get(c) or {}).get("avg_value", 0))
-        picks = [code] + top[:per_group - 1]
-        for i, c in enumerate(picks):
-            ch = (changes.get(c) or {}).get("change_pct")
-            rows.append([f"{n}（{len(members[n])} 檔）" if i == 0 else "",
-                         f"{name_map[c]} {c}" if name_map.get(c) and name_map[c] != c else c,
-                         f"{ch:+.2f}%" if ch is not None else "-"])
-    sections: List[Dict[str, Any]] = [{"type": "table", "columns": ["族群", "股票", "今日"], "widths": [0.46, 0.34, 0.20],
-                                        "signed": ("今日",), "accent": (), "rows": rows}]
+        vals = [changes[c]["change_pct"] for c in members[n] if c in changes and changes[c].get("change_pct") is not None]
+        med = statistics.median(vals) if vals else None
+        peers = [c for c in sorted(members[n], key=lambda c: -(liquid.get(c) or {}).get("avg_value", 0)) if c not in shown][:2]
+        shown.update(peers)
+        rows.append([f"{n}（{len(vals)}／{len(members[n])} 檔）", sig(med),
+                     f"{own - med:+.2f} 個百分點" if own is not None and med is not None else "-",
+                     "、".join(f"{label_of(c)} {sig((changes.get(c) or {}).get('change_pct'))}" for c in peers) or "（同上）"])
     rest = ranked[max_groups:]
-    note = "※ 每個族群列成交額前幾大（第一檔為本股），漲跌為最新收盤；族群分類僅供研究參考，不代表買賣建議。"
-    sections.append({"type": "note", "text": (f"其他族群：{'、'.join(rest)}\n" if rest else "") + note})
+    sections: List[Dict[str, Any]] = [
+        {"type": "stats", "items": [{"label": "本股今日", "value": sig(own)},
+                                    {"label": "所屬族群", "value": f"{len(names)} 個"}]},
+        {"type": "table", "columns": ["族群（有效／總檔）", "族群中位", "本股相對", "同行（成交額大，去重）"],
+         "widths": [0.30, 0.13, 0.17, 0.40], "signed": ("族群中位", "本股相對"), "accent": (), "rows": rows},
+        {"type": "note", "text": (f"其他族群：{'、'.join(rest)}；" if rest else "")
+         + "※ 族群中位＝有報價成分股的最新收盤漲跌中位數；本股相對＝本股減族群中位，只描述當日漲幅，不代表龍頭或資金流向。"}]
     date = next((v.get("date") for v in changes.values() if v.get("date")), "")
-    card = {"branch": f"{label}（{code}）｜所屬族群 {len(names)} 個", "tags": [], "label": f"{date} 收盤" if date else "",
+    card = {"branch": f"{label_of(code)}｜所屬族群", "tags": names[:6], "label": f"{date} 收盤" if date else "",
             "sections": sections}
     return {"branch_card": card, "hide_text": True}
 
