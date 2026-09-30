@@ -520,6 +520,17 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
             text.append(f"收盤創近 {n_days} 日新高"); names.append("創新高"); break
         if today >= n_days and c[today] < c[today - n_days:today].min():
             text.append(f"收盤創近 {n_days} 日新低"); names.append("創新低"); break
+    top70 = c[max(0, today - HIGH_DAYS[0]):today].max() if today > 0 else None
+    if top70 and not any("新高" in t for t in text) and c[today] >= top70 * 0.97:
+        start = max(0, today - HIGH_DAYS[0])
+        peak = start + int(np.argmax(c[start:today]))
+        gap = (top70 / c[today] - 1) * 100
+        if today - peak <= 5:     # 台股慣用語：5 日內創高後小幅回落＝創高拉回；更早創高、一直在高點附近＝高檔整理
+            text.append(f"{_d(df.index[peak])} 收盤創近 {HIGH_DAYS[0]} 日新高 {_p(top70)} 後拉回，目前距高點約 {gap:.1f}%")
+            names.append("創高拉回")
+        else:
+            text.append(f"高檔整理：收盤距 {_d(df.index[peak])} 近 {HIGH_DAYS[0]} 日最高收盤 {_p(top70)} 約 {gap:.1f}%")
+            names.append("高檔整理")
     # 2. 前高／前低：最近一個今天以前已確認的轉折
     for kind, sign, word in (("H", 1, "前高"), ("L", -1, "前低")):
         p = next((x for x in reversed(piv) if x["type"] == kind and x["confirm"] < today), None)
@@ -547,7 +558,8 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
                 continue
             w = c[d - n_days:d]
             top, bot = w.max(), w.min()
-            if top - bot > RANGE_ATR * a:
+            a0 = atr_prev[d - n_days] if not np.isnan(atr_prev[d - n_days]) else a
+            if top - bot > RANGE_ATR * min(a, a0):   # 用盤整開始時的 ATR：急漲會把 ATR 撐大、誤把上漲段當盤整（09-30 嘉晶）
                 continue
             sign = 1 if c[d] > top + PREV_BREAK * a else -1 if c[d] < bot - PREV_BREAK * a else 0
             if sign and all((c[x] - (top if sign > 0 else bot)) * sign > 0 for x in range(d, today + 1)):

@@ -736,8 +736,16 @@ def _shape_label(k: Dict[str, Any]) -> str:
     """族群總覽表的短標籤（09-30：3481 已越過前高卻顯示舊的「上升三角」、有些格子整句塞入）。
     優先：盤整突破／跌破 → 越過前高／跌破前低 → 型態＋狀態 → 趨勢 → 創新高／低。"""
     names = set(k.get("names") or [])
-    for key, label in (("盤整突破", "盤整突破"), ("盤整跌破", "盤整跌破"), ("突破前高", "越過前高"), ("跌破前低", "跌破前低")):
-        if key in names:
+    summary_all = k.get("summary") or []
+    if any(x.startswith("收盤創近 70 日新高") for x in summary_all):
+        return "創新高"                          # 寫「現在」的狀態：創整張圖新高／在高點附近優先（09-30 嘉晶）
+    for label in ("創高拉回", "高檔整理"):
+        if label in names:
+            return label
+    fresh = lambda word: any(word in x and not re.search(r"後第 [4-9]|後第 \d\d", x) for x in summary_all)   # 3 天內才算現在
+    for key, word, label in (("盤整突破", "向上脫離", "盤整突破"), ("盤整跌破", "向下脫離", "盤整跌破"),
+                             ("突破前高", "越過", "越過前高"), ("跌破前低", "跌破", "跌破前低")):
+        if key in names and fresh(word):
             return label
     summary = k.get("summary") or []
     for s in summary:
@@ -746,7 +754,11 @@ def _shape_label(k: Dict[str, Any]) -> str:
             rest = m.group(2)
             return m.group(1) + ("向上突破" if "向上突破" in rest else "跌破" if "向下跌破" in rest else "整理中")
     trend = next((s[:4] for s in summary if s.startswith(("上升趨勢", "下降趨勢"))), "")
-    return trend or ("創新高" if "創新高" in names else "創新低" if "創新低" in names else "—")
+    if trend:
+        return trend
+    # 只有創近 70 日（整張 K 線圖）新高／低才上短標籤；20 日新高在盤整區裡很常見，標「創新高」會誤導（09-30 環球晶）
+    return ("創新高" if any(s.startswith("收盤創近 70 日新高") for s in summary) else
+            "創新低" if any(s.startswith("收盤創近 70 日新低") for s in summary) else "—")
 
 
 def live_group_ranking() -> Optional[Dict[str, Any]]:

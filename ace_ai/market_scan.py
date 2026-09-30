@@ -86,14 +86,15 @@ def _dedupe_overlap(rows: List[Dict[str, Any]], members: Optional[Dict[str, List
         if codes is None:
             codes = set((members or {}).get(row.get("group_code"), []))
         movers = {m.get("code") for m in row.get("top_movers") or [] if m.get("code")}
-        # 全名單重疊 >70%，或前三名領漲股有 2 檔相同（09-30：太陽能／鈣鈦礦全名單只重疊 56%，領漲股卻完全一樣）
+        # 全名單重疊 >70%，或前三名領漲股完全相同（2 檔相同會誤併：大型股常同時領漲多個族群）（09-30：太陽能／鈣鈦礦全名單只重疊 56%，領漲股卻完全一樣）
         clash = next((k for k in kept
                       if (codes and k["_member_set"]
                           and len(codes & k["_member_set"]) / min(len(codes), len(k["_member_set"])) > TECH_OVERLAP_MAX)
-                      or len(movers & k["_movers"]) >= 2), None)
+                      or (len(movers) >= 3 and movers == k["_movers"])), None)
         if clash:
             dropped.append(f"{row['name']}→{clash['name']}")
-            clash.setdefault("_merged", []).append(row["name"])
+            if row["name"] != clash["name"] and row["name"] not in clash.get("_merged", []):
+                clash.setdefault("_merged", []).append(row["name"])   # 同名族群不寫成「太陽能（含太陽能）」
             continue
         row["_member_set"], row["_movers"] = set(codes), movers
         kept.append(row)
