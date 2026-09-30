@@ -52,6 +52,7 @@ import traceback
 import numpy as np
 
 import sector_match
+import kline_debug
 import sector_radar
 import trade_review
 
@@ -666,6 +667,7 @@ HELP_GROUPS = (
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
+    ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）",)),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫")),
@@ -1812,7 +1814,8 @@ GEMINI_MODEL_CHAIN = [m.strip() for m in os.getenv(
 _DEFAULT_MODEL_LIMITS = {"gemini-3.1-flash-lite": (15, 500), "gemini-2.5-flash": (5, 20), "gemini-3.5-flash-lite": (15, 500)}
 GEMINI_QUOTA_MARGIN = min(1.0, max(0.5, tools._env_float("DISCORD_AI_GEMINI_QUOTA_MARGIN", 0.9)))   # 只用到上限的 9 成
 GEMINI_OVERLOAD_COOLDOWN = max(10, tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 120))       # 503 塞車：整個模型暫停
-GEMINI_MINUTE_COOLDOWN = 60                                                                           # 每分鐘限流：這把金鑰×模型暫停
+GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
+GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
 _RATE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|exceeded", re.IGNORECASE)
 _DAILY_RE = re.compile(r"PerDay|per day|daily|RequestsPerDay", re.IGNORECASE)
@@ -1946,6 +1949,11 @@ class GeminiQuota:
                 self._model_down[model] = now + GEMINI_OVERLOAD_COOLDOWN
                 return "overloaded"
             return "other"
+
+    def note_ok(self, model: str) -> None:
+        """重試成功＝塞車已過，解除模型暫停，下一題不必再走備援。"""
+        with self._lock:
+            self._model_down.pop(model, None)
 
     def rows(self, n_keys: int) -> List[Dict[str, Any]]:
         """「/ace 用量」圖卡用：每個模型今日已用、上限、剩餘％、可用金鑰、狀態。"""
@@ -2127,6 +2135,7 @@ class GeminiGateway:
         for rank, model in enumerate(GEMINI_MODEL_CHAIN):
             if not self.quota.model_ready(model):
                 continue
+            overload_retried = False
             for key in self.quota.key_order(model, len(keys)):
                 if deadline and time.monotonic() >= deadline:
                     last_error = last_error or "deadline"
@@ -2146,9 +2155,16 @@ class GeminiGateway:
                                            latency=time.perf_counter() - call_started, detail=f"{purpose}:{model}:{kind}")
                     _record_gemini_usage(model, ok=False)
                     self.log(f"Gemini 嘗試失敗｜{model}｜key {key + 1}｜{kind}｜{last_error[:120]}")
+                    if kind == "overloaded" and rank == 0 and not overload_retried and len(keys) > 1 \
+                            and (not deadline or time.monotonic() + GEMINI_OVERLOAD_RETRY_WAIT < deadline):
+                        overload_retried = True    # 主模型塞車多半一下就過：等一下換金鑰再試一次，省下備援額度
+                        time.sleep(GEMINI_OVERLOAD_RETRY_WAIT)
+                        continue
                     if kind in ("overloaded", "missing_model"):
                         break          # 整個模型的問題：換金鑰沒用，直接換下一個模型
                     continue
+                if overload_retried:
+                    self.quota.note_ok(model)
                 text = str(getattr(response, "text", "") or "").strip()
                 latency = time.perf_counter() - started
                 tools.record_api_event("Gemini", status=200 if text else 500, latency=time.perf_counter() - call_started,
@@ -4655,6 +4671,8 @@ class AceQueryEngine:
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
+        if kline_debug.is_request(question):
+            return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode)
         if admin_mode:
             self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
         if any(word in compact for word in MEMORY_RESET_WORDS):
@@ -5324,6 +5342,22 @@ class AceQueryEngine:
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
                             as_text=not panels, image_title=result.get("title") or "族群雷達")
+
+    def _answer_kline_debug(self, question: str, started: float, *, is_admin: bool, admin_mode: bool) -> AnswerResult:
+        access = self._access()
+        if not (is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation):
+            return AnswerResult(text="型態驗證僅限管理員透過 /ace 使用。", route="admin_kline_denied",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
+        try:
+            code = kline_debug.parse_code(question)
+            panel = kline_debug.load_panel(code)
+        except Exception as exc:
+            self.log(f"型態驗證未完成｜{tools.err_text(exc)}")
+            return AnswerResult(text="型態驗證未完成：" + tools.err_text(exc), route="admin_kline_error",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
+        return AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
+                            route="admin_kline_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
+                            panels=[panel], cacheable=False, image_title=f"{code}｜型態驗證")
 
     def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
@@ -6395,7 +6429,7 @@ class AceQueryEngine:
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
-_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
+_ADMIN_PRIVATE_RE = re.compile(r"型態驗證|驗證型態|趨勢線驗證|錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
 
 # 週精選（只有管理員能用）：排名、草稿、改稿、套用文字、精選圖片都公開，不會因為 ephemeral 重新整理後消失
@@ -7453,7 +7487,7 @@ def run_discord_bot(config: BotConfig) -> None:
         await handle_question(interaction, question, admin_mode=False)
 
     @client.tree.command(name=config.admin_command_name, description="艾斯 AI 管理員：本週精選、草稿編輯與資料維護")
-    @app_commands.describe(question="例如：本週精選排名／3006 幫我生成週精選文字／系統狀態／說明",
+    @app_commands.describe(question="例如：型態驗證 2330／本週精選排名／3006 幫我生成週精選文字／系統狀態／說明",
                            attachment="匯入狀態：附上 .json.gz 檔；型態排行：附上股票清單截圖")
     async def admin_command(interaction: "discord.Interaction", question: str,
                             attachment: Optional[discord.Attachment] = None) -> None:

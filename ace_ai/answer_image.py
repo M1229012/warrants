@@ -2943,6 +2943,10 @@ def text_card(text: str) -> dict:
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯 AI｜研究筆記', demo: bool = False) -> Image.Image:
     panels = panels or []
+    debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
+    if debug_panel is not None:
+        from kline_debug import render
+        return render(debug_panel)
     # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
     sector_panels = [p for p in panels if _is_sector_panel(p)]
     article_panels = [p for p in panels if _is_article_panel(p)]

@@ -229,7 +229,8 @@ def build_formation(piv: List[Dict], closes: np.ndarray, day: int, lo_bound: int
                 key = (-(u["touches"] + lo["touches"]), u["cross"] + lo["cross"], (u["fit"] + lo["fit"]) / 2,
                        -(end - start), -start, u["a"], lo["a"])
                 cand = {"kind": cls["kind"], "start": start, "upper": (u["s"], u["k"]), "lower": (lo["s"], lo["k"]),
-                        "ref": ref, "end": end}
+                        "ref": ref, "end": end,
+                        "anchors": {"upper": [u["a"], u["b"]], "lower": [lo["a"], lo["b"]]}}
                 apex = _apex(cand)
                 if _at(cand["upper"], day) - _at(cand["lower"], day) <= 0 or (apex is not None and day >= apex):
                     if reached is not None and (gone_key is None or key < gone_key):
@@ -360,7 +361,8 @@ def trend(piv: List[Dict], c, ma20, atr_prev, day: int) -> Optional[Dict[str, An
     if down and c[day] > hs[1]["price"] + m:
         notes.append("原下降結構受破壞")
     text = f"{kind}（轉折高低點{'墊高' if up else '降低'}），趨勢線約 {_p(line)}" + ("；" + "、".join(notes) if notes else "")
-    return {"kind": kind, "line": _p(line), "notes": notes, "text": text}
+    return {"kind": kind, "line": _p(line), "notes": notes, "text": text,
+            "line_coefficients": _line(base[0], base[1]), "points": [dict(p) for p in base]}
 
 
 # ---------------------------------------------------------------- §7 缺口
@@ -489,7 +491,8 @@ def candles(df: pd.DataFrame, atr_prev, day: int, f3: bool) -> List[str]:
 
 
 # ---------------------------------------------------------------- 主函式
-def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False) -> Dict[str, Any]:
+def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
+           *, include_debug: bool = False) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
     need = ["Open", "High", "Low", "Close"]
     if df is None or not set(need) <= set(df.columns):
@@ -599,9 +602,15 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         flag_text.append("股數基準變動，量比可比性受限")
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
-    return {"summary": summary, "names": names, "levels": levels, "flags": flag_text,
+    result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text,
             "atr20": _p(atr_prev[last_official]) if not np.isnan(atr_prev[last_official]) else None,
             "pivots": piv, "formation": ev or cur, "ended": ended}
+    if include_debug:
+        # Admin-only caller consumes the exact calculation frame; never redraw from raw prices.
+        result["debug"] = {"frame": adj.copy(), "trend": tr, "invalid": state.get("invalid"),
+                           "last_official": last_official, "atr_prev": atr_prev.copy(),
+                           "break_multiplier": BREAK, "retest_multiplier": RETEST_ZONE}
+    return result
 
 
 def names(result: Dict[str, Any]) -> List[str]:
