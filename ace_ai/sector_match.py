@@ -279,10 +279,12 @@ def match(text: str) -> Optional[Dict[str, Any]]:
     # 1. 自訂族群（名冊沒有的：AI伺服器／重電／儲能）
     for name, info in customs.items():
         keys = [normalize(name)] + [normalize(a) for a in (info.get("aliases") or [])]
-        if core in keys:
-            return _custom(name, "exact")
-        if any(k and k in value for k in keys):
-            return _custom(name, "alias")
+        hit = core if core in keys else next((k for k in keys if k and k in value), "")
+        if hit:
+            result = _custom(name, "exact" if core in keys else "alias")
+            if hit != normalize(name):
+                result["alias_used"] = hit          # 會員講的是別名（例：TGV）→ 回答時註明對應到哪個族群
+            return result
 
     # 2. 同義詞表：先比主題字，再比整句
     for candidate, confidence in ((core, "exact"), (value, "alias")):
