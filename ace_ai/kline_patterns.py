@@ -507,30 +507,86 @@ def candles(df: pd.DataFrame, atr_prev, day: int, f3: bool) -> List[str]:
 
 
 # ---------------------------------------------------------------- 主函式
+def structure_observation(df: pd.DataFrame, state: Dict, day: int, provisional: bool) -> Optional[Dict]:
+    """Fixed fields for the selected formation; never infer states from prose."""
+    f = state.get("event") or state.get("current")
+    ended = state.get("ended")
+    if not f:
+        if not ended or ended.get("ended") != "crossed" or ended.get("end_day") != day - int(provisional):
+            return None
+        f = ended
+        validity, position = "failed", "failed_down" if f["dir"] == 1 else "failed_up"
+    else:
+        up, dn = _at(f["upper"], day), _at(f["lower"], day)
+        apex = _apex(f)
+        if up <= dn or (apex is not None and day >= apex):
+            return None
+        close = float(df["Close"].iloc[day])
+        margin = BREAK * f["ref"]
+        validity = "active"
+        if close > up + margin:
+            position = "break_up"
+        elif close < dn - margin:
+            position = "break_down"
+        elif dn <= close <= up:
+            position = "returned_inside" if "bday" in f else "inside"
+        else:
+            position = "near_upper" if close > up else "near_lower"
+    previous = float(df["Close"].iloc[day - 1]) if day else float(df["Close"].iloc[day])
+    close = float(df["Close"].iloc[day])
+    bday = f.get("bday")
+    return {"kind": f["kind"], "state": position, "validity": validity,
+            "formation_date": df.index[f["start"]].strftime("%Y-%m-%d"),
+            "event_date": df.index[bday].strftime("%Y-%m-%d") if bday is not None else None,
+            "event_age": day - bday if bday is not None else None,
+            "event_direction": f.get("dir"),
+            "is_provisional": provisional,
+            "daily_direction": "up" if close > previous else "down" if close < previous else "flat"}
+
+
+def trend_observation(tr: Optional[Dict], closes, atr_prev, day: int, provisional: bool) -> Optional[Dict]:
+    if not tr:
+        return None
+    sign = 1 if tr["kind"] == "上升趨勢" else -1
+    close, margin = closes[day], BREAK * atr_prev[day]
+    last_pivot = tr["points"][-1]["price"]
+    line = _at(tr["line_coefficients"], day)
+    status = ("broken" if (close - last_pivot) * sign < -margin else
+              "line_crossed" if (close - line) * sign < -margin else "intact")
+    return {"kind": tr["kind"], "state": status, "is_provisional": provisional}
+
+
 def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dict[str, Any]:
-    """§9a（09-30 使用者同意）：創新高／越過前高／脫離盤整區，只寫客觀事實、只給 AI。"""
+    """§9a（09-30 使用者同意）：創新高／越過前高／越過區間高低點，只寫客觀事實、只給 AI。"""
     c = df["Close"].to_numpy(dtype=float)
-    text, names = [], []
+    text, names, observations = [], [], []
+    def record(kind, d, **fields):
+        observations.append({"type": kind, "event_date": df.index[d].strftime("%Y-%m-%d"),
+                             "event_age": today - d, **fields})
     ref = atr_prev[today]
     if np.isnan(ref) or ref <= 0:
-        return {"text": text, "names": names}
+        return {"text": text, "names": names, "observations": observations}
     # 1. 收盤創近 N 日新高／新低（只寫最長的 N）
     for n_days in HIGH_DAYS:
         if today >= n_days and c[today] > c[today - n_days:today].max():
-            text.append(f"收盤創近 {n_days} 日新高"); names.append("創新高"); break
+            text.append(f"收盤創近 {n_days} 日新高"); names.append("創新高")
+            record("new_high", today, lookback=n_days); break
         if today >= n_days and c[today] < c[today - n_days:today].min():
-            text.append(f"收盤創近 {n_days} 日新低"); names.append("創新低"); break
+            text.append(f"收盤創近 {n_days} 日新低"); names.append("創新低")
+            record("new_low", today, lookback=n_days); break
     top70 = c[max(0, today - HIGH_DAYS[0]):today].max() if today > 0 else None
     if top70 and not any("新高" in t for t in text) and c[today] >= top70 * 0.97:
         start = max(0, today - HIGH_DAYS[0])
         peak = start + int(np.argmax(c[start:today]))
         gap = (top70 / c[today] - 1) * 100
-        if today - peak <= 5:     # 台股慣用語：5 日內創高後小幅回落＝創高拉回；更早創高、一直在高點附近＝高檔整理
+        if today - peak <= 5:     # 台股慣用語：5 日內創高後小幅回落＝創高拉回；更早高點只能描述位置，不能證明整理
             text.append(f"{_d(df.index[peak])} 收盤創近 {HIGH_DAYS[0]} 日新高 {_p(top70)} 後拉回，目前距高點約 {gap:.1f}%")
             names.append("創高拉回")
+            record("high_pullback", peak, lookback=HIGH_DAYS[0])
         else:
-            text.append(f"高檔整理：收盤距 {_d(df.index[peak])} 近 {HIGH_DAYS[0]} 日最高收盤 {_p(top70)} 約 {gap:.1f}%")
-            names.append("高檔整理")
+            text.append(f"接近近 {HIGH_DAYS[0]} 日高點：收盤距 {_d(df.index[peak])} 最高收盤 {_p(top70)} 約 {gap:.1f}%")
+            names.append("接近近期高點")
+            record("near_high", today, lookback=HIGH_DAYS[0])
     # 2. 前高／前低：最近一個今天以前已確認的轉折
     for kind, sign, word in (("H", 1, "前高"), ("L", -1, "前低")):
         p = next((x for x in reversed(piv) if x["type"] == kind and x["confirm"] < today), None)
@@ -546,9 +602,10 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
             text.append(f"{_d(df.index[beyond[0]])} 收盤{act} {_d(df.index[p['idx']])} {word} {_p(p['price'])}"
                         + (f"（{act}後第 {k + 1} 日）" if k else ""))
             names.append("突破前高" if sign > 0 else "跌破前低")
+            record("pivot_break_up" if sign > 0 else "pivot_break_down", beyond[0])
         elif sign > 0 and 0 < (p["price"] - c[today]) / c[today] <= 0.1:
             text.append(f"距 {_d(df.index[p['idx']])} 前高 {_p(p['price'])} 約 {(p['price'] - c[today]) / c[today] * 100:.1f}%")
-    # 3. 脫離盤整區：突破前 N 日收盤高低差 ≤ RANGE_ATR×ATR，突破日收盤超出 ≥ PREV_BREAK×ATR（最長的 N 優先）
+    # 3. 區間高低點事件：振幅有限不能證明橫盤，禁止命名為盤整／箱型。
     for d in range(max(1, today - BREAK_LOOKBACK + 1), today + 1):
         a = atr_prev[d]
         if np.isnan(a):
@@ -564,12 +621,14 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
             sign = 1 if c[d] > top + PREV_BREAK * a else -1 if c[d] < bot - PREV_BREAK * a else 0
             if sign and all((c[x] - (top if sign > 0 else bot)) * sign > 0 for x in range(d, today + 1)):
                 k = today - d
-                text.append(f"{_d(df.index[d])} 收盤{'向上' if sign > 0 else '向下'}脫離近 {n_days} 日盤整區 "
+                text.append(f"{_d(df.index[d])} 收盤{'越過' if sign > 0 else '跌破'}近 {n_days} 日區間{'高點' if sign > 0 else '低點'} "
                             f"{_p(bot)}～{_p(top)}" + (f"（脫離後第 {k + 1} 日）" if k else ""))
-                names.append("盤整突破" if sign > 0 else "盤整跌破")
-                return {"text": text, "names": names}
+                names.append("越過區間高點" if sign > 0 else "跌破區間低點")
+                record("range_break_up" if sign > 0 else "range_break_down", d, lookback=n_days,
+                       upper=float(top), lower=float(bot))
+                return {"text": text, "names": names, "observations": observations}
             break                                          # 最長的盤整窗口沒突破：不再找較短的
-    return {"text": text, "names": names}
+    return {"text": text, "names": names, "observations": observations}
 
 
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
@@ -611,6 +670,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     state = track(adj, piv, atr_prev, vol_ratio, f3_days, last_official)
     ev, ended, cur = state["event"], state["ended"], state["current"]
     today = n - 1
+    shape_observation = structure_observation(adj, state, today, provisional_today)
     if ev:
         main, extra = _event_status(ev, last_official, c, h, l, True)
         if provisional_today:
@@ -645,6 +705,9 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         apex = _apex(cur)
         near = apex is not None and (day - cur["start"]) >= APEX_NEAR * (apex - cur["start"])
         status = f"上下緣距離剩約 {_p(up - dn)}，接近交會點" if near else "型態內整理"
+        if cur["kind"] in ("上升通道", "下降通道") and shape_observation and shape_observation["state"] == "inside":
+            direction = shape_observation["daily_direction"]
+            status = cur["kind"] + "內" + ("走高" if direction == "up" else "回落" if direction == "down" else "")
         if provisional_today:
             m = BREAK * cur["ref"]
             if c[today] > up + m:
@@ -691,6 +754,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text,
             "atr20": _p(atr_prev[last_official]) if not np.isnan(atr_prev[last_official]) else None,
             "pivots": piv, "formation": ev or cur, "ended": ended}
+    result["observations"] = {
+        "structure": shape_observation,
+        "trend": trend_observation(tr, c, atr_prev, last_official, provisional_today),
+        "price_events": [dict(x, is_provisional=provisional_today) for x in lv.get("observations", [])],
+    }
     if include_debug:
         # Admin-only caller consumes the exact calculation frame; never redraw from raw prices.
         result["debug"] = {"frame": adj.copy(), "trend": tr, "invalid": state.get("invalid"),

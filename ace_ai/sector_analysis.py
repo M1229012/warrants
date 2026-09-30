@@ -729,36 +729,46 @@ def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5,
     return {"branch_card": card, "hide_text": True}
 
 
-_FORMATION_RE = re.compile(r"\d\d/\d\d 起形成(\S+?)，(.*)")
-
-
 def _shape_label(k: Dict[str, Any]) -> str:
-    """族群總覽表的短標籤（09-30：3481 已越過前高卻顯示舊的「上升三角」、有些格子整句塞入）。
-    優先：盤整突破／跌破 → 越過前高／跌破前低 → 型態＋狀態 → 趨勢 → 創新高／低。"""
-    names = set(k.get("names") or [])
-    summary_all = k.get("summary") or []
-    if any(x.startswith("收盤創近 70 日新高") for x in summary_all):
-        return "創新高"                          # 寫「現在」的狀態：創整張圖新高／在高點附近優先（09-30 嘉晶）
-    for label in ("創高拉回", "高檔整理"):
-        if label in names:
-            return label
-    fresh = lambda word: any(word in x and not re.search(r"後第 [4-9]|後第 \d\d", x) for x in summary_all)   # 3 天內才算現在
-    for key, word, label in (("盤整突破", "向上脫離", "盤整突破"), ("盤整跌破", "向下脫離", "盤整跌破"),
-                             ("突破前高", "越過", "越過前高"), ("跌破前低", "跌破", "跌破前低")):
-        if key in names and fresh(word):
-            return label
-    summary = k.get("summary") or []
-    for s in summary:
-        m = _FORMATION_RE.match(s)
-        if m:
-            rest = m.group(2)
-            return m.group(1) + ("向上突破" if "向上突破" in rest else "跌破" if "向下跌破" in rest else "整理中")
-    trend = next((s[:4] for s in summary if s.startswith(("上升趨勢", "下降趨勢"))), "")
+    """Read calculation fields only; prose and name lists cannot establish validity."""
+    observations = k.get("observations") or {}
+    shape = observations.get("structure")
+    if shape and shape.get("validity") in ("active", "failed"):
+        kind, state = shape["kind"], shape["state"]
+        base = "箱型" if kind == "箱型整理" else kind
+        labels = {"break_up": base + "向上突破", "break_down": base + "跌破",
+                  "near_upper": base + "上緣附近", "near_lower": base + "下緣附近",
+                  "failed_down": base + "突破後跌破下緣", "failed_up": base + "跌破後站上上緣",
+                  "returned_inside": base + ("跌破後" if shape.get("event_direction") == -1 else "突破後") + "回到型態內"}
+        if state == "inside":
+            if kind in ("上升通道", "下降通道"):
+                direction = shape.get("daily_direction")
+                label = kind + "內" + ("走高" if direction == "up" else "回落" if direction == "down" else "")
+            else:
+                label = base + "整理中"
+        else:
+            label = labels.get(state)
+        if label:
+            return label + ("（待收盤）" if shape.get("is_provisional") else "")
+    trend = observations.get("trend")
     if trend:
-        return trend
-    # 只有創近 70 日（整張 K 線圖）新高／低才上短標籤；20 日新高在盤整區裡很常見，標「創新高」會誤導（09-30 環球晶）
-    return ("創新高" if any(s.startswith("收盤創近 70 日新高") for s in summary) else
-            "創新低" if any(s.startswith("收盤創近 70 日新低") for s in summary) else "—")
+        kind, state = trend["kind"], trend["state"]
+        label = ("原" + kind[:2] + "結構受破壞" if state == "broken" else
+                 ("跌破上升趨勢線" if kind == "上升趨勢" else "站上下降趨勢線") if state == "line_crossed" else kind)
+        return label + ("（待收盤）" if trend.get("is_provisional") else "")
+    events = observations.get("price_events") or []
+    for types, max_age in (({"new_high", "new_low"}, 0), ({"high_pullback"}, 5), ({"near_high"}, 0),
+                           ({"pivot_break_up", "pivot_break_down"}, 2), ({"range_break_up", "range_break_down"}, 2)):
+        for event in events:
+            if event.get("type") not in types or not 0 <= event.get("event_age", -1) <= max_age:
+                continue
+            if event["type"] in {"new_high", "new_low", "high_pullback", "near_high"} and event.get("lookback") != 70:
+                continue
+            labels = {"new_high": "創近70日新高", "new_low": "創近70日新低", "high_pullback": "創高拉回",
+                      "near_high": "接近近70日高點", "pivot_break_up": "越過前高", "pivot_break_down": "跌破前低",
+                      "range_break_up": "越過近期區間高點", "range_break_down": "跌破近期區間低點"}
+            return labels[event["type"]] + ("（待收盤）" if event.get("is_provisional") else "")
+    return "—"
 
 
 def live_group_ranking() -> Optional[Dict[str, Any]]:
