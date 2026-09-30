@@ -714,11 +714,11 @@ def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5,
         peers = [c for c in sorted(members[n], key=lambda c: -(liquid.get(c) or {}).get("avg_value", 0)) if c not in shown][:2]
         shown.update(peers)
         rows.append([f"{n}（{len(vals)}／{len(members[n])} 檔）", sig(med),
-                     f"{own - med:+.2f} 個百分點" if own is not None and med is not None else "-",
+                     f"{own - med:+.2f}%" if own is not None and med is not None else "-",
                      "、".join(f"{label_of(c)} {sig((changes.get(c) or {}).get('change_pct'))}" for c in peers) or "（同上）"])
     rest = ranked[max_groups:]
     sections: List[Dict[str, Any]] = [
-        {"type": "stats", "items": [{"label": "本股今日", "value": sig(own)},
+        {"type": "stats", "items": [{"label": "本股今日", "value": sig(own), "tone": "signed"},
                                     {"label": "所屬族群", "value": f"{len(names)} 個"}]},
         {"type": "table", "columns": ["族群（有效／總檔）", "族群中位", "本股相對", "同行（成交額大，去重）"],
          "widths": [0.30, 0.13, 0.17, 0.40], "signed": ("族群中位", "本股相對"), "accent": (), "rows": rows},

@@ -2420,8 +2420,11 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     for j, line in enumerate(labels):
                         text_at(draw, (tx + 16, ty + 10 + j * 26), line, lsize, MUTED)
                     vy = ty + 12 + len(labels) * 26
+                    raw = str(chunk[i].get('value', '')).strip()        # tone=signed：正紅負綠（台股慣例）
+                    color = ((UP if raw.startswith('+') else DOWN if raw.startswith('-') else INK)
+                             if chunk[i].get('tone') == 'signed' else INK)
                     for j, line in enumerate(values):
-                        text_at(draw, (tx + 16, vy + j * 34), line, vsize, INK, True)
+                        text_at(draw, (tx + 16, vy + j * 34), line, vsize, color, True)
             total += tile_h + 12
         return total + 6
     if kind == 'bars':
