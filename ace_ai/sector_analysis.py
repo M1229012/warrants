@@ -691,6 +691,26 @@ _MARKET_HELP = {
 LIVE_MIN_COVERAGE = 0.8      # 有效成分股報價覆蓋率門檻（全市場、單一族群都用）
 
 
+_FORMATION_RE = re.compile(r"\d\d/\d\d 起形成(\S+?)，(.*)")
+
+
+def _shape_label(k: Dict[str, Any]) -> str:
+    """族群總覽表的短標籤（09-30：3481 已越過前高卻顯示舊的「上升三角」、有些格子整句塞入）。
+    優先：盤整突破／跌破 → 越過前高／跌破前低 → 型態＋狀態 → 趨勢 → 創新高／低。"""
+    names = set(k.get("names") or [])
+    for key, label in (("盤整突破", "盤整突破"), ("盤整跌破", "盤整跌破"), ("突破前高", "越過前高"), ("跌破前低", "跌破前低")):
+        if key in names:
+            return label
+    summary = k.get("summary") or []
+    for s in summary:
+        m = _FORMATION_RE.match(s)
+        if m:
+            rest = m.group(2)
+            return m.group(1) + ("向上突破" if "向上突破" in rest else "跌破" if "向下跌破" in rest else "整理中")
+    trend = next((s[:4] for s in summary if s.startswith(("上升趨勢", "下降趨勢"))), "")
+    return trend or ("創新高" if "創新高" in names else "創新低" if "創新低" in names else "—")
+
+
 def live_group_ranking() -> Optional[Dict[str, Any]]:
     """盤中族群漲幅排行：自己用證交所即時報價算（有效成分股中位漲幅），不依賴 CMoney 排行表。
     報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
@@ -952,8 +972,7 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
         cached = (tools._CORP_CACHE.get(code) or ("", None))
         events = cached[1] if cached[0] == tools.taipei_now().strftime("%Y-%m-%d") else {"status": "unverified"}
         k = kline_patterns.detect(df, events)
-        shape = next((s.split("（")[0] for s in k.get("summary") or []
-                      if any(w in s for w in ("趨勢", "三角", "箱型", "楔形", "通道")) and "沒有明確" not in s), "—")
+        shape = _shape_label(k)
         pct = lambda n: round((close / float(c.iloc[-1 - n]) - 1) * 100, 2)
         rows.append({"code": code, "name": names.get(code, code), "d1": pct(1), "d5": pct(5), "d20": pct(20),
                      "value20": float(value.tail(20).mean()), "value5": float(value.tail(5).mean()),
