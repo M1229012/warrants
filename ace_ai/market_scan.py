@@ -85,17 +85,21 @@ def _dedupe_overlap(rows: List[Dict[str, Any]], members: Optional[Dict[str, List
         codes = row.pop("_codes", None)
         if codes is None:
             codes = set((members or {}).get(row.get("group_code"), []))
+        movers = {m.get("code") for m in row.get("top_movers") or [] if m.get("code")}
+        # 全名單重疊 >70%，或前三名領漲股有 2 檔相同（09-30：太陽能／鈣鈦礦全名單只重疊 56%，領漲股卻完全一樣）
         clash = next((k for k in kept
-                      if codes and k["_member_set"]
-                      and len(codes & k["_member_set"]) / min(len(codes), len(k["_member_set"])) > TECH_OVERLAP_MAX), None)
+                      if (codes and k["_member_set"]
+                          and len(codes & k["_member_set"]) / min(len(codes), len(k["_member_set"])) > TECH_OVERLAP_MAX)
+                      or len(movers & k["_movers"]) >= 2), None)
         if clash:
             dropped.append(f"{row['name']}→{clash['name']}")
             clash.setdefault("_merged", []).append(row["name"])
             continue
-        row["_member_set"] = set(codes)
+        row["_member_set"], row["_movers"] = set(codes), movers
         kept.append(row)
     for row in kept:
         row.pop("_member_set", None)
+        row.pop("_movers", None)
         merged = row.pop("_merged", [])
         if merged:
             row["merged_names"] = merged
