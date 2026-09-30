@@ -6876,6 +6876,8 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 WEEKLY_PICK_ACK = "📊 本週精選候選計算中，正在整理事件、股價與分點資料。首次查詢可能需要數分鐘；完成後這張圖會更新為結果。"
 
 USAGE_LOG_SECONDS = max(60, tools._env_int("DISCORD_AI_USAGE_LOG_SECONDS", 300))
+_MARKET_AVATAR = None  # Daily close update, driven by the existing monitor.
+
 BACKGROUND_TICK_SECONDS = max(30, tools._env_int("DISCORD_AI_BACKGROUND_TICK_SECONDS", 60))
 CMONEY_MEMBER_WARMUP_PER_TICK = max(0, tools._env_int("DISCORD_AI_CMONEY_MEMBER_WARMUP_PER_TICK", 1))
 # 全市場日K底庫：證交所／櫃買官方資料，每個交易日 2 個請求，不吃 FinMind 額度。
@@ -7054,6 +7056,8 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
     tools.SHEET_CHANGE_LISTENERS[:] = [lambda: engine._answer_cache.invalidate(("",))]
     while not stop.wait(BACKGROUND_TICK_SECONDS):
         now = tools.taipei_now()
+        if _MARKET_AVATAR is not None:
+            _MARKET_AVATAR.tick()
         try:
             refreshed = tools.refresh_reference_caches()
             if refreshed:
@@ -7274,6 +7278,11 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_ready() -> None:
+        global _MARKET_AVATAR
+        if _MARKET_AVATAR is None:
+            import market_avatar
+            _MARKET_AVATAR = market_avatar.AvatarController(client, asyncio.get_running_loop())
+        await asyncio.to_thread(_MARKET_AVATAR.tick)
         _ADMIN_NOTICE.update(client=client, config=config, loop=asyncio.get_running_loop())
         if not usage_monitor_started.is_set():
             usage_monitor_started.set()
