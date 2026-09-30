@@ -2383,6 +2383,48 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             draw.rectangle((x0, y + 8, x0 + 5, y + 36), fill=ACCENT)
             text_at(draw, (x0 + 18, y + 4), section['text'], 27, INK, True)
         return 54
+    if kind == 'headline':
+        # 「今日 +2.95%」＋一行灰字說明（所屬族群卡，09-30）
+        value = str(section.get('value', ''))
+        if not dry:
+            text_at(draw, (x0, y + 10), section.get('label', ''), 24, MUTED)
+            text_at(draw, (x0 + font(24).getlength(section.get('label', '')) + 12, y), value, 36,
+                    _tone_color(value, 'signed'), True)
+            text_at(draw, (x0, y + 54), section.get('note', ''), 19, MUTED)
+        return 92
+    if kind == 'group_cards':
+        # 每個族群一張小卡：左上名稱＋檔數、左下「本股比族群…＋同行」（放不下自動換行）、右側族群中位大字
+        total = 0
+        for item in section.get('items') or []:
+            med = str(item.get('median', '-'))
+            med_w = max(font(17).getlength('族群中位'), font(34, True).getlength(med))
+            limit = x1 - 24 - med_w - 30
+            units = [[(item.get('rel_label', ''), 19, MUTED, False), (str(item.get('rel', '')), 19, None, True),
+                      ('　　同行 ', 19, MUTED, False)]]
+            units += [[(name + ' ', 19, INK, False), (pct + '　', 19, None, True)] for name, pct in item.get('peers') or []]
+            lines, cur, cx = [], [], x0 + 24                       # 名稱＋漲跌是一組，不拆開換行
+            for unit in units:
+                w = sum(font(s, b).getlength(t) for t, s, _, b in unit)
+                if cur and cx + w > limit:
+                    lines.append(cur); cur, cx = [], x0 + 24
+                for text, size, color, bold in unit:
+                    cur.append((cx, text, size, color, bold)); cx += font(size, bold).getlength(text)
+            lines.append(cur)
+            h = 64 + len(lines) * 30 + 10
+            if not dry:
+                ty = y + total
+                draw.rounded_rectangle((x0, ty, x1, ty + h), radius=14, fill=TILE_BG)
+                name = str(item.get('name', ''))
+                text_at(draw, (x0 + 24, ty + 16), name, 26, INK, True)
+                text_at(draw, (x0 + 24 + font(26, True).getlength(name) + 12, ty + 23), str(item.get('count', '')), 18, MUTED)
+                for j, line in enumerate(lines):
+                    for lx, text, size, color, bold in line:
+                        text_at(draw, (lx, ty + 60 + j * 30), text, size,
+                                color or _tone_color(text.strip(), 'signed'), bold)
+                text_at(draw, (x1 - 24 - font(17).getlength('族群中位'), ty + 16), '族群中位', 17, MUTED)
+                text_at(draw, (x1 - 24 - font(34, True).getlength(med), ty + 40), med, 34, _tone_color(med, 'signed'), True)
+            total += h + 12
+        return total + 4
     if kind == 'tiles':
         items = section.get('items') or []
         gap, tile_h = 14, 112
