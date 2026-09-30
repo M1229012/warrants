@@ -27,6 +27,10 @@ MIN_BARS = int(_env("MIN_BARS", 15))
 ANCHOR_GAP = int(_env("ANCHOR_GAP", 3))
 WICK_TOL = _env("WICK_TOL", 0.7)
 TOUCH = _env("TOUCH", 0.3)
+HIGH_DAYS = (120, 60, 20)                                        # §9a 創新高／新低天數（長的優先）
+PREV_BREAK, BREAK_LOOKBACK = _env("PREV_BREAK", 0.5), int(_env("BREAK_LOOKBACK", 5))
+RANGE_MIN, RANGE_MAX, RANGE_ATR = int(_env("RANGE_MIN", 15)), int(_env("RANGE_MAX", 40)), _env("RANGE_ATR", 4.0)
+SPIKE_RATIO =_env("SPIKE_RATIO", 2.0)   # §4.3a：進、出兩段都 ≥ 區間波段中位數×此倍數＝V 型轉折，不當錨點
 CROSS_LOW, CROSS_HIGH, CROSS_MAX = _env("CROSS_LOW", 0.25), _env("CROSS_HIGH", 0.5), _env("CROSS_MAX", 0.10)
 FIT_MAX = _env("FIT_MAX", 0.5)
 FLAT_SLOPE, FLAT_DRIFT = _env("FLAT_SLOPE", 0.05), _env("FLAT_DRIFT", 0.25)
@@ -143,14 +147,25 @@ def _line(a: Dict, b: Dict) -> Tuple[float, float]:
     return s, a["price"] - s * a["idx"]
 
 
-def _side_lines(points: List[Dict], upper: bool, closes: np.ndarray, start: int, end: int, ref: float) -> List[Dict]:
-    """某一邊所有合格的邊界線（§4.3、§4.4 單邊條件）。"""
+def _v_spikes(seq: List[Dict]) -> set:
+    """§4.3a：進、出兩段波段都 ≥ 區間波段中位數×SPIKE_RATIO 的轉折（急殺後急拉／急拉後急殺）。
+    只用已確認的前後轉折；最後一個轉折沒有出段，不判。"""
+    legs = [abs(b["price"] - a["price"]) for a, b in zip(seq, seq[1:])]
+    if len(legs) < 3:
+        return set()
+    lim = SPIKE_RATIO * float(np.median(legs))
+    return {seq[i]["idx"] for i in range(1, len(seq) - 1) if legs[i - 1] >= lim and legs[i] >= lim}
+
+
+def _side_lines(points: List[Dict], upper: bool, closes: np.ndarray, start: int, end: int, ref: float,
+                spikes: set = frozenset()) -> List[Dict]:
+    """某一邊所有合格的邊界線（§4.3、§4.4 單邊條件）；V 型轉折不當錨點（§4.3a）。"""
     out = []
     idx = np.arange(start, end + 1)
     seg = closes[start:end + 1]
     for i, a in enumerate(points):
         for b in points[i + 1:]:
-            if b["idx"] - a["idx"] < ANCHOR_GAP:
+            if b["idx"] - a["idx"] < ANCHOR_GAP or a["idx"] in spikes or b["idx"] in spikes:
                 continue
             s, k = _line(a, b)
             dist = [(p["price"] - (s * p["idx"] + k)) * (1 if upper else -1) for p in points]
@@ -210,6 +225,7 @@ def build_formation(piv: List[Dict], closes: np.ndarray, day: int, lo_bound: int
     end = day - 1
     usable = [p for p in piv if p["confirm"] <= end and p["idx"] >= lo_bound]
     best, best_key, gone_key = None, None, None
+    spikes = _v_spikes(usable)
     for start in sorted({p["idx"] for p in usable}):
         if end - start + 1 < MIN_BARS:
             continue
@@ -217,8 +233,8 @@ def build_formation(piv: List[Dict], closes: np.ndarray, day: int, lo_bound: int
         ls = [p for p in usable if p["type"] == "L" and p["idx"] >= start]
         if len(hs) < 2 or len(ls) < 2:
             continue
-        ups = _side_lines(hs, True, closes, start, end, ref)
-        downs = _side_lines(ls, False, closes, start, end, ref)
+        ups = _side_lines(hs, True, closes, start, end, ref, spikes)
+        downs = _side_lines(ls, False, closes, start, end, ref, spikes)
         for u in ups:
             for lo in downs:
                 if (u["cross"] + lo["cross"]) > CROSS_MAX or (u["fit"] + lo["fit"]) / 2 > FIT_MAX:
@@ -491,6 +507,59 @@ def candles(df: pd.DataFrame, atr_prev, day: int, f3: bool) -> List[str]:
 
 
 # ---------------------------------------------------------------- 主函式
+def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dict[str, Any]:
+    """§9a（09-30 使用者同意）：創新高／越過前高／脫離盤整區，只寫客觀事實、只給 AI。"""
+    c = df["Close"].to_numpy(dtype=float)
+    text, names = [], []
+    ref = atr_prev[today]
+    if np.isnan(ref) or ref <= 0:
+        return {"text": text, "names": names}
+    # 1. 收盤創近 N 日新高／新低（只寫最長的 N）
+    for n_days in HIGH_DAYS:
+        if today >= n_days and c[today] > c[today - n_days:today].max():
+            text.append(f"收盤創近 {n_days} 日新高"); names.append("創新高"); break
+        if today >= n_days and c[today] < c[today - n_days:today].min():
+            text.append(f"收盤創近 {n_days} 日新低"); names.append("創新低"); break
+    # 2. 前高／前低：最近一個今天以前已確認的轉折
+    for kind, sign, word in (("H", 1, "前高"), ("L", -1, "前低")):
+        p = next((x for x in reversed(piv) if x["type"] == kind and x["confirm"] < today), None)
+        if not p:
+            continue
+        line = p["price"] + sign * PREV_BREAK * atr_prev[p["confirm"]]
+        beyond = [d for d in range(max(p["confirm"] + 1, today - BREAK_LOOKBACK + 1), today + 1)
+                  if (c[d] - line) * sign > 0]
+        fresh = beyond and (beyond[0] == p["confirm"] + 1 or (c[beyond[0] - 1] - line) * sign <= 0)   # 更早就越過＝舊事件不寫
+        if fresh and all((c[d] - line) * sign > 0 for d in range(beyond[0], today + 1)):
+            act = "越過" if sign > 0 else "跌破"
+            k = today - beyond[0]
+            text.append(f"{_d(df.index[beyond[0]])} 收盤{act} {_d(df.index[p['idx']])} {word} {_p(p['price'])}"
+                        + (f"（{act}後第 {k + 1} 日）" if k else ""))
+            names.append("突破前高" if sign > 0 else "跌破前低")
+        elif sign > 0 and 0 < (p["price"] - c[today]) / c[today] <= 0.1:
+            text.append(f"距 {_d(df.index[p['idx']])} 前高 {_p(p['price'])} 約 {(p['price'] - c[today]) / c[today] * 100:.1f}%")
+    # 3. 脫離盤整區：突破前 N 日收盤高低差 ≤ RANGE_ATR×ATR，突破日收盤超出 ≥ PREV_BREAK×ATR（最長的 N 優先）
+    for d in range(max(1, today - BREAK_LOOKBACK + 1), today + 1):
+        a = atr_prev[d]
+        if np.isnan(a):
+            continue
+        for n_days in range(RANGE_MAX, RANGE_MIN - 1, -1):
+            if d < n_days:
+                continue
+            w = c[d - n_days:d]
+            top, bot = w.max(), w.min()
+            if top - bot > RANGE_ATR * a:
+                continue
+            sign = 1 if c[d] > top + PREV_BREAK * a else -1 if c[d] < bot - PREV_BREAK * a else 0
+            if sign and all((c[x] - (top if sign > 0 else bot)) * sign > 0 for x in range(d, today + 1)):
+                k = today - d
+                text.append(f"{_d(df.index[d])} 收盤{'向上' if sign > 0 else '向下'}脫離近 {n_days} 日盤整區 "
+                            f"{_p(bot)}～{_p(top)}" + (f"（脫離後第 {k + 1} 日）" if k else ""))
+                names.append("盤整突破" if sign > 0 else "盤整跌破")
+                return {"text": text, "names": names}
+            break                                          # 最長的盤整窗口沒突破：不再找較短的
+    return {"text": text, "names": names}
+
+
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
            *, include_debug: bool = False) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
@@ -589,6 +658,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         summary.append(("目前呈現" if provisional_today else "近期 K 線：") + "、".join(cd)
                        + ("（日 K 尚未完成）" if provisional_today else ""))
         names += cd
+    lv = levels_break(adj, piv, atr_prev, today)
+    if lv:
+        tag = "（盤中暫時，尚待收盤確認）" if provisional_today else ""
+        summary += [t + tag for t in lv["text"]]
+        names += lv["names"]
     part = adj.iloc[-SEARCH_DAYS:]
     hi, lo = float(part["High"].max()), float(part["Low"].min())
     if hi > lo:

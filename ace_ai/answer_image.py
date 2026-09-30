@@ -1137,13 +1137,10 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     price_top, price_bottom = top + lane_top, bottom - lane_bottom
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
-    for b in bars:
-        for key in list(MA_COLORS) + list(BAND_COLORS):
-            if b.get(key) is not None:
-                lows.append(b[key]); highs.append(b[key])
+    # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
     low, high = min(lows), max(highs)
-    padding = max((high - low) * .08, abs(high) * .005, .01)
-    low -= padding; high += padding
+    span = max(high - low, abs(high) * .005, .01)
+    low, high = low - span * .11, high + span * .05
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
     px = lambda i: left + (i + .5) * step
@@ -1170,7 +1167,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     for key, line_color in MA_COLORS.items():
         segment = []
         for i, bar in enumerate(bars):
-            if bar.get(key) is None:
+            if bar.get(key) is None or not price_top <= py(bar[key]) <= price_bottom:
                 if len(segment) > 1:
                     draw.line(segment, fill=line_color, width=2)
                 segment = []
@@ -1187,6 +1184,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             if a is None or b is None:
                 continue
             xa, ya, xb, yb = px(i-1), py(a), px(i), py(b)
+            if not (price_top <= ya <= price_bottom and price_top <= yb <= price_bottom):
+                continue
             distance = math.hypot(xb-xa, yb-ya)
             for start in range(0, max(1, math.ceil(distance)), 12):
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
