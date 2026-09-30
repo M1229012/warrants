@@ -293,6 +293,7 @@ INTENT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
     (_MA_SYNONYM_RE, "均線 支撐"),
     (re.compile(r"有壓|壓在|哪裡有撐|有撐|撐在|撐得住|卡在|大量區.{0,3}[上下]|[上下]面.{0,3}大量區"), "壓力 支撐 大量區"),
     (re.compile(r"量有?出來|量有?放大|爆量|量縮|帶量|放量|量增"), "量能 價量"),
+    (re.compile(r"滿足點|滿足價|目標價|目標位"), "壓力 支撐 分析"),   # 09-30：只問股價會漏掉 AI；規則 3 不給目標價，改說上方壓力
 )
 WARRANT_SYNONYMS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
     (re.compile(r"吃貨|誰在買|誰在收|誰在加碼|哪些分點|分點在買|在加碼"), "分點 在買"),
@@ -2201,7 +2202,7 @@ FINAL_BASE_PROMPT = """你是「艾斯 AI 台股數據研究助手」。你的�
 規則：
 1. 只能依 tool_results 的事實與數字回答，不可自創資料。使用者自己提供的成本或假設價格必須明確標成「你的成本／假設價格」，不可當成現價。
 2. 保持客觀。可以直接說目前結構偏強、偏弱、轉強、承壓、支撐較明確等，但每個判斷都要緊接數據或型態依據；最重要的不利條件用條件式帶過（例「若跌破 34.79 才轉弱」），不可蓋過主要判斷。買超、高勝率都不是未來保證。
-3. 不給目標價或報酬保證，不替使用者做最後買賣決定。
+3. 不給目標價或報酬保證，不替使用者做最後買賣決定。問滿足點／目標價時，一句說明不提供目標價，改說上方有哪些壓力（前高、缺口、布林上軌、大量區）與站上的條件。
 4. 回答以問題為中心：通常先用 1～2 句直接回答，再補 2～3 個最重要證據，最後視需要說後續最值得觀察什麼。不要固定套【回答】【觀察重點】；除非資訊很多，否則自然分段即可。
 5. 圖片本身已顯示 K 線、均線、布林、大量區與分點標記，文字不要再逐項報數；只引用真正影響判斷的 1～3 個數據。沒有資料的欄位直接略過，不要在回答中列一串系統缺漏原因。
 6. 不要提資料供應商、Google Sheet、工作表或內部系統名稱。需要時說「日K資料」「權證分點統計」「歷史事件統計」。
@@ -4276,7 +4277,8 @@ def quota_exempt_ids() -> Set[str]:
 REQUIRED_MODULE_API = {
     "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets"),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
-    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text"),
+    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
+                         "chart_marks_for_stock"),
     "answer_image": ("wrap_cell",),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
@@ -4895,6 +4897,26 @@ class AceQueryEngine:
         main = spot or warrant
         denials = [] if chip != "combined" else [k for k, ok in (("SPOT", want_spot), ("WARRANT", want_warrant)) if not ok]
         return replace(main, followups=[warrant] if spot and warrant else [], denial_followups=denials)
+
+    def _fallback_branch_marks(self, panel: Dict[str, Any], code: str, results: List[tools.ToolResult]) -> None:
+        """09-30：沒有高勝率（★）分點可標時，改標「主要分點狀態」表的前 2 家，圖和表一致（圖上不另外註明門檻）。"""
+        marks = panel.get("marks")
+        if not panel.get("bars") or not isinstance(marks, dict) or marks.get("events") or marks.get("mode") == "flow":
+            return
+        chips = next((r.data for r in results if r.ok and r.name == "get_sheet_stock_chips"
+                      and str((r.data or {}).get("stock_code") or code) == code), None)
+        branches = [b for b in (chips or {}).get("branches") or [] if b.get("events_recent") or b.get("event_count_lookback")]
+        names = [str(b["branch"]) for b in branches[:2] if b.get("branch")]
+        if not names:
+            return
+        try:
+            fallback = tools.chart_marks_for_stock(code, [bar["date"] for bar in panel["bars"]], ",".join(names))
+        except Exception as exc:   # 標不出來就維持原圖
+            self.log(f"主要分點標註略過：{type(exc).__name__}: {exc}")
+            return
+        if (fallback or {}).get("events"):
+            panel["marks"] = fallback
+            self.log(f"無高勝率分點，改標主要分點：{'、'.join(names)}")
 
     def _spot_combo_section(self, parsed: ParsedQuestion) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """型態分析頁裡的「籌碼重點」區塊與給 AI 的精簡資料；權限在抓取前檢查。"""
@@ -6021,6 +6043,8 @@ class AceQueryEngine:
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
+            else:
+                self._fallback_branch_marks(panel, code, results)
             panels.append(panel)
         if getattr(parsed, "spot_combo", False):
             spot_panel, spot_data = self._spot_combo_section(parsed)
