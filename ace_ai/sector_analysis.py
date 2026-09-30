@@ -709,12 +709,13 @@ def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5,
     for n in ranked[:max_groups]:
         top = sorted((c for c in members[n] if c != code), key=lambda c: -(liquid.get(c) or {}).get("avg_value", 0))
         picks = [code] + top[:per_group - 1]
-        parts = []
-        for c in picks:
+        for i, c in enumerate(picks):
             ch = (changes.get(c) or {}).get("change_pct")
-            parts.append((f"{name_map[c]} {c}" if name_map.get(c) and name_map[c] != c else c) + (f" {ch:+.2f}%" if ch is not None else ""))
-        rows.append({"lead": f"{n}（{len(members[n])} 檔）", "parts": parts})
-    sections: List[Dict[str, Any]] = [{"type": "rows", "items": rows}]
+            rows.append([f"{n}（{len(members[n])} 檔）" if i == 0 else "",
+                         f"{name_map[c]} {c}" if name_map.get(c) and name_map[c] != c else c,
+                         f"{ch:+.2f}%" if ch is not None else "-"])
+    sections: List[Dict[str, Any]] = [{"type": "table", "columns": ["族群", "股票", "今日"], "widths": [0.46, 0.34, 0.20],
+                                        "signed": ("今日",), "accent": (), "rows": rows}]
     rest = ranked[max_groups:]
     note = "※ 每個族群列成交額前幾大（第一檔為本股），漲跌為最新收盤；族群分類僅供研究參考，不代表買賣建議。"
     sections.append({"type": "note", "text": (f"其他族群：{'、'.join(rest)}\n" if rest else "") + note})
