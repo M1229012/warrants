@@ -631,6 +631,79 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
     return {"text": text, "names": names, "observations": observations}
 
 
+# ---------------------------------------------------------------- §4b 使用者畫法三角（09-30 使用者手繪 40+ 張歸納）
+TRI_DAYS, TRI_TOUCH, TRI_RECENT = int(_env("TRI_DAYS", 180)), _env("TRI_TOUCH", 0.3), int(_env("TRI_RECENT", 20))
+TRI_UP_POKE, TRI_DN_POKE, TRI_POKES, TRI_FLAT = _env("TRI_UP_POKE", 2.0), _env("TRI_DN_POKE", 1.5), int(_env("TRI_POKES", 3)), _env("TRI_FLAT", 1.0)
+
+
+def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[set] = None) -> List[Dict[str, Any]]:
+    """單邊候選線：局部轉折（左右各 2 根）的影線或實體兩兩相連；收盤不可有效穿越、影線刺穿有上限、接觸 3 日內合併。
+    first 有給時只用這些 index 當第一個錨點（上緣＝整理區最高峰）。"""
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+    wick, body = (H, top) if upper else (L, bot)
+    sg = 1 if upper else -1
+    ext = (lambda v, i: v[i] == v[i - 2:i + 3].max()) if upper else (lambda v, i: v[i] == v[i - 2:i + 3].min())
+    piv = [i for i in range(max(lo, 2), end - 1) if ext(wick, i) or ext(body, i)]
+    firsts = sorted(first) if first else piv
+    x_all = np.arange(end + 1)
+    out = []
+    for i in firsts:
+        for j in piv:
+            if j - i < 5:
+                continue
+            for pi, pj in ((wick, wick), (wick, body), (body, wick), (body, body)):
+                s = (pj[j] - pi[i]) / (j - i); k = pi[i] - s * i
+                x = x_all[i:end]                                     # 形成期到前一日；今天另判突破
+                ln = s * x + k
+                if ((C[x] - ln) * sg > 0.5 * A[x]).any():
+                    continue
+                poke = (wick[x] - ln) * sg
+                if (poke > (TRI_UP_POKE if upper else TRI_DN_POKE) * A[x]).any() or (poke > TRI_TOUCH * A[x]).sum() > TRI_POKES:
+                    continue
+                hit = x[(np.abs(wick[x] - ln) <= TRI_TOUCH * A[x]) | (np.abs(body[x] - ln) <= TRI_TOUCH * A[x])]
+                groups, last = 0, -99
+                for h in hit:
+                    groups += h - last >= 3
+                    last = h
+                if groups < (2 if upper else 3) or hit[-1] < end - TRI_RECENT:
+                    continue
+                out.append({"s": float(s), "k": float(k), "a": (int(i), int(j)), "g": int(groups)})
+    return out
+
+
+def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
+    """下緣＝起漲點→回檔低點的長上升支撐（≥3 次），上緣＝下緣起點後最高峰起畫（≥2 次，不可比下緣陡）。"""
+    H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
+    A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
+    lo = max(21, end - TRI_DAYS)
+    if end - lo < 30:
+        return None
+    best = None
+    for d in _tri_lines(H, L, O, C, A, False, lo, end):
+        seg = np.arange(d["a"][0], end)
+        peaks = {int(seg[np.argmax(H[seg])]), int(seg[np.argmax(np.maximum(O, C)[seg])])}
+        for u in _tri_lines(H, L, O, C, A, True, d["a"][0], end, peaks):
+            if u["s"] > d["s"] * 0.5 or u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
+                continue
+            key = (d["g"] + u["g"], end - d["a"][0])
+            if best is None or key > best[0]:
+                best = (key, u, d)
+    if not best:
+        return None
+    _, u, d = best
+    a_ref = float(np.nanmedian(A[end - 19:end + 1]))
+    flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
+    kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "三角收斂" if u["s"] < 0 else "上升楔形")
+    up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
+    state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
+             else "位於型態內")
+    start = df.index[min(u["a"][0], d["a"][0])]
+    text = (f"{_d(start)} 起形成{kind}，最新收盤 {_p(C[end])}，{state}（上緣 {_p(up)}、下緣 {_p(dn)}；"
+            f"上緣接觸 {u['g']} 次、下緣 {d['g']} 次）")
+    return {"kind": kind, "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]), "anchors": {"upper": u["a"], "lower": d["a"]},
+            "state": state, "text": text}
+
+
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
            *, include_debug: bool = False) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
@@ -749,9 +822,16 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     flag_text += flags.get("F2") or []
     if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
+    tri = None if ev else user_triangle(adj, atr_prev, last_official)   # 進行中的突破事件用固定線追蹤（時間正確），不覆蓋
+    if tri:     # §4b 使用者畫法三角優先：取代舊畫線型態的描述，避免兩套線互相矛盾
+        old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
+        summary = [x for x in summary if "起形成" not in x and "原上緣" not in x and "原下緣" not in x]
+        names = [x for x in names if x not in old]
+        summary.insert(0, tri["text"])
+        names.insert(0, tri["kind"])
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
-    result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text,
+    result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text, "triangle": tri,
             "atr20": _p(atr_prev[last_official]) if not np.isnan(atr_prev[last_official]) else None,
             "pivots": piv, "formation": ev or cur, "ended": ended}
     result["observations"] = {
