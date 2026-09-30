@@ -715,15 +715,17 @@ def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5,
         shown.update(peers)
         rows.append([f"{n}（{len(vals)}／{len(members[n])} 檔）", sig(med),
                      f"{own - med:+.2f}%" if own is not None and med is not None else "-",
-                     "、".join(f"{label_of(c)} {sig((changes.get(c) or {}).get('change_pct'))}" for c in peers) or "（同上）"])
+                     *[x for c in (peers + ["", ""])[:2]
+                       for x in ((label_of(c), sig((changes.get(c) or {}).get("change_pct"))) if c else ("", ""))]])
     rest = ranked[max_groups:]
     sections: List[Dict[str, Any]] = [
         {"type": "stats", "items": [{"label": "本股今日", "value": sig(own), "tone": "signed"},
                                     {"label": "所屬族群", "value": f"{len(names)} 個"}]},
-        {"type": "table", "columns": ["族群（有效／總檔）", "族群中位", "本股相對", "同行（成交額大，去重）"],
-         "widths": [0.30, 0.13, 0.17, 0.40], "signed": ("族群中位", "本股相對"), "accent": (), "rows": rows},
+        {"type": "table", "columns": ["族群（有效／總檔）", "族群中位", "本股相對", "同行", "漲跌", "同行 ", "漲跌 "],
+         "widths": [0.27, 0.11, 0.11, 0.16, 0.09, 0.16, 0.10],
+         "signed": ("族群中位", "本股相對", "漲跌", "漲跌 "), "accent": (), "rows": rows},
         {"type": "note", "text": (f"其他族群：{'、'.join(rest)}；" if rest else "")
-         + "※ 族群中位＝有報價成分股的最新收盤漲跌中位數；本股相對＝本股減族群中位，只描述當日漲幅，不代表龍頭或資金流向。"}]
+         + "※ 同行＝成交額較大的 2 檔（已列過的不重複）；族群中位＝有報價成分股的最新收盤漲跌中位數；本股相對＝本股減族群中位，只描述當日漲幅，不代表龍頭或資金流向。"}]
     date = next((v.get("date") for v in changes.values() if v.get("date")), "")
     card = {"branch": f"{label_of(code)}｜所屬族群", "tags": names[:6], "label": f"{date} 收盤" if date else "",
             "sections": sections}
