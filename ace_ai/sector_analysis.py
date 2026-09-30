@@ -691,6 +691,39 @@ _MARKET_HELP = {
 LIVE_MIN_COVERAGE = 0.8      # 有效成分股報價覆蓋率門檻（全市場、單一族群都用）
 
 
+def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5, per_group: int = 5) -> Dict[str, Any]:
+    """「3055 是什麼族群」：每個族群列成交額前 5 大（問的那檔放最前）＋最新漲跌；純本地資料（09-30）。"""
+    groups = {str(v.get("name")): list(v.get("stocks") or []) for v in (sector_roster._load().get("groups") or {}).values()}
+    groups.update({n: [str(c) for c in (v.get("stocks") or [])] for n, v in (sector_match._data().get("custom") or {}).items()})
+    members = {n: list(dict.fromkeys(groups.get(n) or [])) for n in names}
+    liquid = local_market_cache.liquidity_map(20)
+    ranked = sorted(names, key=lambda n: -len(members[n]))
+    codes = {c for n in ranked[:max_groups] for c in members[n]}
+    changes = local_market_cache.latest_changes(codes)
+    try:
+        name_map = tools.get_stock_name_map() or {}
+    except Exception:
+        name_map = {}
+    name_map = {**sector_roster._name_map(), **name_map}
+    rows = []
+    for n in ranked[:max_groups]:
+        top = sorted((c for c in members[n] if c != code), key=lambda c: -(liquid.get(c) or {}).get("avg_value", 0))
+        picks = [code] + top[:per_group - 1]
+        parts = []
+        for c in picks:
+            ch = (changes.get(c) or {}).get("change_pct")
+            parts.append((f"{name_map[c]} {c}" if name_map.get(c) and name_map[c] != c else c) + (f" {ch:+.2f}%" if ch is not None else ""))
+        rows.append({"lead": f"{n}（{len(members[n])} 檔）", "parts": parts})
+    sections: List[Dict[str, Any]] = [{"type": "rows", "items": rows}]
+    rest = ranked[max_groups:]
+    note = "※ 每個族群列成交額前幾大（第一檔為本股），漲跌為最新收盤；族群分類僅供研究參考，不代表買賣建議。"
+    sections.append({"type": "note", "text": (f"其他族群：{'、'.join(rest)}\n" if rest else "") + note})
+    date = next((v.get("date") for v in changes.values() if v.get("date")), "")
+    card = {"branch": f"{label}（{code}）｜所屬族群 {len(names)} 個", "tags": [], "label": f"{date} 收盤" if date else "",
+            "sections": sections}
+    return {"branch_card": card, "hide_text": True}
+
+
 _FORMATION_RE = re.compile(r"\d\d/\d\d 起形成(\S+?)，(.*)")
 
 
@@ -1090,7 +1123,12 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
             return {"text": f"名冊裡查不到 {label}（{code}）所屬的族群。", "calls": 0, "cacheable": False}
         lines = [f"**{label}（{code}）｜所屬族群**", f"共 {len(names)} 個族群：", "、".join(names),
                  "※ 族群分類僅供研究參考，不代表買賣建議。"]
-        return {"text": "\n".join(lines), "calls": 0, "cacheable": True}
+        try:
+            panels = [_belongs_panel(code, label, names)]
+        except Exception as exc:        # 圖卡失敗就回純文字，不影響回答
+            print(f"⚠️ 所屬族群圖卡略過：{type(exc).__name__}: {exc}", flush=True)
+            panels = []
+        return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": panels}
     try:
         if mode == "members":
             data = get_members(request["industry"], display_name=str(request.get("name") or ""))

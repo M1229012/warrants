@@ -5083,6 +5083,16 @@ def estimate_leverage(spot: Optional[float], strike: Optional[float], days: Opti
     return abs(delta) * spot / price if price > spot * 1e-6 else None
 
 
+def bs_value(spot, strike, days, sigma, call: bool) -> Optional[float]:
+    """Black-Scholes 理論價（每單位標的）；估算報酬用，參數不全回 None。"""
+    if not spot or not strike or not sigma or not days or days <= 0 or spot <= 0 or strike <= 0 or sigma <= 0:
+        return None
+    t = days / 365.0
+    d1 = (math.log(spot / strike) + 0.5 * sigma * sigma * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    return spot * _norm_cdf(d1) - strike * _norm_cdf(d2) if call else strike * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
 def _closes(stock_code: str) -> Dict[str, float]:
     """標的收盤（YYYY-MM-DD → 收盤），讀本地底庫／既有日K快取；失敗回空。"""
     try:
@@ -5130,6 +5140,13 @@ def _warrant_metrics(p: Dict[str, Any], closes: Dict[str, float], buy_day: str, 
     if buy_day:
         out["buy"] = at(buy_day)
     out["now"] = at(today)
+    # 09-30 估算報酬：買進日與今天的理論價比（同一個波動率，發行商定價偏差大致抵銷）；剩 ≤5 天不估
+    b, n = out.get("buy") or {}, out["now"]
+    if b.get("sigma") and (n.get("days") or 0) > 5:
+        v0 = bs_value(b.get("spot"), strike, b.get("days"), b["sigma"], call)
+        v1 = bs_value(n.get("spot"), strike, n.get("days"), b["sigma"], call)
+        if v0 and v1 is not None and v0 > (b.get("spot") or 0) * 1e-4:
+            out["est_return"] = (v1 / v0 - 1) * 100
     return out
 
 
@@ -5241,7 +5258,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
                 "moneyness_now": _num(now.get("money"), 1), "leverage_now": _num(now.get("leverage"), 1),
                 "leverage_tier": _tier(now.get("leverage"), 4, 8, "低中高"),
                 "tenor_at_buy": buy.get("days"), "moneyness_at_buy": _num(buy.get("money"), 1),
-                "leverage_at_buy": _num(buy.get("leverage"), 1)})
+                "leverage_at_buy": _num(buy.get("leverage"), 1),
+                "est_return_pct": _num(metrics.get("est_return"), 1) if holding else None})
         if len(groups) >= group_limit:
             hidden.append(label)
             continue

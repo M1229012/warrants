@@ -721,7 +721,7 @@ WARRANT_TOOLS = frozenset((
     "get_branch_event_window", "get_branch_warrant_detail",
 ))
 # 「買了哪些權證／權證代號／權證名稱」：列出權證本身（不是標的股）。「哪些股票的權證」仍是標的清單。
-_WARRANT_DETAIL_RE = re.compile(r"(?:哪些|哪幾檔|哪幾支|哪檔|哪支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)")
+_WARRANT_DETAIL_RE = re.compile(r"(?:[哪那]些|[哪那]幾檔|[哪那]幾支|[哪那]檔|[哪那]支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)")
 
 
 def warrant_allowed(parsed: "ParsedQuestion") -> bool:
@@ -1252,9 +1252,10 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
                          f"{w['remaining_pct']}%" if w.get("remaining_lots") else "-",
                          ("已到期" if days_left <= 0 else f"{days_left}天") if days_left is not None else "-",
                          f"{'價內' if money_now >= 0 else '價外'}{abs(money_now):.0f}%" if money_now is not None else "-",
-                         f"{lev_now:.1f}倍" if lev_now is not None else "-"])
-        sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘%", "天期", "價內外", "槓桿"],
-                         "widths": (0.34, 0.16, 0.11, 0.11, 0.14, 0.14), "signed": (),
+                         f"{lev_now:.1f}倍" if lev_now is not None else "-",
+                         f"{w['est_return_pct']:+.0f}%" if w.get("est_return_pct") is not None else "-"])
+        sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘%", "天期", "價內外", "槓桿", "估算報酬"],
+                         "widths": (0.30, 0.14, 0.09, 0.10, 0.13, 0.11, 0.13), "signed": ("估算報酬",),
                          "accent": ("剩餘張數", "剩餘%", "槓桿"), "rows": rows})
     hidden = len(d.get("hidden_stocks") or []) + max(0, len(d.get("groups") or []) - 3)
     tail = f"另有 {hidden} 檔標的未列出，可問「{d.get('branch')} 代號 買哪些權證」。" if hidden else ""
@@ -1264,7 +1265,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         tail += f"{'、'.join(d['store_missing'][:3])} 張數依事件表。"
     if d.get("near_expiry_holdings"):
         tail += f"快到期仍持有：{'、'.join(x.split(' ')[0] for x in d['near_expiry_holdings'][:3])}。"
-    sections.append({"type": "note", "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算。{tail}"})
+    sections.append({"type": "note", "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算；估算報酬＝依標的漲跌與時間推算的理論值，非權證實際成交價。{tail}"})
     return sections
 
 
@@ -2500,7 +2501,7 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
                              "（權證檔數、天期、價內外、估算槓桿的中位數；資料只含認購，不要談認售），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
                              "解讀這個分點的操作風格：偏好長天期還是短天期、價內還是價外、高槓桿還是低槓桿，代表押波段、押短線或是保守；"
                              "目前主力部位在哪一檔標的、剩多少；哪些持有中的權證快到期（near_expiry_holdings）要注意時間價值流失。"
-                             "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"
+                             "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」；est_return_pct 是依標的漲跌與時間推算的估算報酬（非實際成交價），提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"
                              "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝一句話講這個分點的挑權證風格；why 2～3 句；scenarios 給空陣列；"
                              "summary 一句說接下來要留意什麼。")
 
