@@ -107,6 +107,7 @@ def _connect() -> sqlite3.Connection:
                         cache_hit INTEGER DEFAULT 0
                     )
                 """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts)")
                 # 盤中高頻資料一律「一筆一列」往後加，不再每 5 分鐘整包重寫 JSON（降低底層區塊重寫量）
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS radar_snapshots (
@@ -907,7 +908,7 @@ def _recent_turnover(conn: sqlite3.Connection, today: str = "") -> List[Dict[str
 
 
 def daily_maintenance(today: str = "") -> Dict[str, int]:
-    """清過期的雷達快照／量能原始取樣／成交占比／用量紀錄／舊版 JSON 快照，裁掉超過保留天數的日 K，
+    """清過期的雷達快照／量能原始取樣／成交占比／舊版行情 JSON 快照（統計永久保留），裁掉超過保留天數的日 K，
     最後 PRAGMA wal_checkpoint(TRUNCATE)。刻意不 VACUUM：整顆重寫反而放大底層區塊重寫量。"""
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     today = today or now.strftime("%Y-%m-%d")
@@ -933,15 +934,11 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                         conn.execute("DELETE FROM kv WHERE key='ivol_samples'")
                     elif kept != legacy:
                         _put_states(conn, {"ivol_samples": kept})
+                # 會員、股票、模型Token與伺服器用量屬統計紀錄，不隨行情快取清理。
                 for label, sql, arg in (
                         ("radar_snapshots", "DELETE FROM radar_snapshots WHERE day < ?", cut(RADAR_KEEP_DAYS)),
                         ("ivol_samples", "DELETE FROM ivol_samples WHERE day < ?", cut(IVOL_RAW_KEEP_DAYS)),
                         ("radar_turnover", "DELETE FROM radar_turnover WHERE day < ?", cut(TURNOVER_KEEP_DAYS)),
-                        ("usage_log", "DELETE FROM usage_log WHERE day < ?", cut(USAGE_KEEP_DAYS)),
-                        ("gemini_usage", "DELETE FROM kv WHERE key GLOB 'gemini_usage:*' AND key < ?",
-                         "gemini_usage:" + cut(USAGE_KEEP_DAYS)),
-                        ("railway_usage", "DELETE FROM kv WHERE key GLOB 'railway_usage:*' AND key < ?",
-                         "railway_usage:" + cut(USAGE_KEEP_DAYS)),
                         ("user_quota", "DELETE FROM kv WHERE key GLOB 'user_quota:*' AND key < ?",
                          "user_quota:" + cut(2)),
                         ("tpex_inst", "DELETE FROM kv WHERE key GLOB 'tpex_inst:*' AND key < ?",
@@ -1031,15 +1028,19 @@ def export_state() -> Tuple[bytes, Dict[str, Any]]:
         state = {k: _normalize_trade_reviews(k, v) if k.startswith("trade_review:") else v
                  for k, v in state.items()}
         turnover = _recent_turnover(conn)
+        import member_usage_stats
+        statistics = member_usage_stats.export_statistics(conn)
     payload = {"version": EXPORT_VERSION, "exported_at": datetime.now(timezone.utc).isoformat(),
-               "kv": state, "radar_turnover": turnover}
+               "kv": state, "radar_turnover": turnover, "statistics": statistics}
     raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if len(raw) > STATE_JSON_MAX_BYTES:
         raise ValueError("狀態內容超過解壓後 50MB 上限")
     data = gzip.compress(raw)
     if len(data) > STATE_FILE_MAX_BYTES:
         raise ValueError("狀態匯出檔超過 10MB 上限")
-    return data, _state_summary(state, turnover)
+    summary=_state_summary(state,turnover)
+    summary['statistics_rows']=sum(len(rows) for rows in statistics['tables'].values())
+    return data,summary
 
 
 def _state_summary(state: Dict[str, Any], turnover: Optional[List[dict]] = None) -> Dict[str, Any]:
@@ -1077,7 +1078,7 @@ def _validate_state_payload(payload: Any) -> None:
 
     require(isinstance(payload, dict))
     require(type(payload.get("version")) is int and payload["version"] in (1, EXPORT_VERSION))
-    require(set(payload) <= {"version", "exported_at", "kv", "radar_turnover"})
+    require(set(payload) <= {"version", "exported_at", "kv", "radar_turnover", "statistics"})
     require(isinstance(payload.get("exported_at"), str) and isinstance(payload.get("kv"), dict))
     require(payload["version"] == 1 or "radar_turnover" in payload)
     for key, value in payload["kv"].items():
@@ -1099,6 +1100,9 @@ def _validate_state_payload(payload: Any) -> None:
                 for day, values in entry.items():
                     require(_valid_day(day))
                     points(values, ratio=key == "ivol_daily_medians")
+    if 'statistics' in payload:
+        import member_usage_stats
+        member_usage_stats.validate_statistics(payload['statistics'])
     require(isinstance(payload.get("radar_turnover", []), list))
     for row in payload.get("radar_turnover", []):
         require(isinstance(row, dict) and set(row) == {"day", "bucket", "data"})
@@ -1170,6 +1174,9 @@ def import_state(data: bytes) -> Dict[str, Any]:
                 (row["day"], row["bucket"], json.dumps(row["data"], ensure_ascii=False))).rowcount
         current.update(updates)
         summary = _state_summary(current, _recent_turnover(conn, today))
+        if 'statistics' in payload:
+            import member_usage_stats
+            summary['written_statistics']=member_usage_stats.import_statistics(conn,payload['statistics'])
     summary.update({"written_keys": len(updates), "written_turnover": written_turnover,
                     "exported_at": payload["exported_at"]})
     return summary

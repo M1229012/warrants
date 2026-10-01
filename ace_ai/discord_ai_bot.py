@@ -674,7 +674,7 @@ HELP_GROUPS = (
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
-    ("會員統計", ("問答次數（前10名）", "問答次數完整名單（CSV）", "使用統計（可加近7天／本月／今日／累計）")),
+    ("會員統計", ("問答次數（前10名）", "問答次數完整名單（CSV）", "使用統計（可加近7天／本月／今日／累計）", "最近7天大家問哪些股票", "大家都問什麼類型的問題", "熱門股票完整名單")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）",)),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
@@ -7003,7 +7003,7 @@ ADMIN_HELP_MESSAGE = """**管理員指令**（一般會員看不到，也不能�
 • `用量`：今日 Gemini 與各 API 使用量
 • `型態排名`＋attachment 附上股票清單截圖（或直接打 `1528 2303 2441 誰型態最好`）：清單內依型態分數排名，前 3 名附 AI 解讀
 • `錯誤紀錄`：最近 24 小時會員遇到的錯誤（即時通知另送到管理員頻道）
-• `匯出狀態`：打包覆盤紀錄、盤中量能學習結果與近 45 天成交占比（只有自己看得到，換 Volume 前用）
+• `匯出狀態`：打包覆盤、所有使用統計、盤中量能學習結果與近 45 天成交占比（只有自己看得到，換 Volume 前用）
 • `匯入狀態`＋attachment：匯回上面的檔案（已存在的紀錄不覆蓋）
 
 一般個股、族群、權證分點問題請照常用 /ask。"""
@@ -7451,12 +7451,22 @@ def run_discord_bot(config: BotConfig) -> None:
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
         entitled_admin = access_policy.UserEntitlement.from_member(interaction.user, config.superuser_ids).admin
-        async def record_member_usage(outcome, route=''):
+        async def record_member_usage(outcome, route='', result=None):
             if not interaction.response.is_done():
                 await interaction.response.defer(thinking=True, ephemeral=True)
+            stocks = []
+            if outcome == 'success':
+                try:
+                    parsed_stats = await asyncio.to_thread(engine.parser.parse, question)
+                    stocks = parsed_stats.stocks
+                    if not stocks and result is not None and result.route in ('rule_pattern','trade_review','answer_cache'):
+                        found = {(p.get('stock_code'),p.get('stock_name','')) for p in result.panels if p.get('stock_code')}
+                        if len(found)==1:stocks=list(found)
+                except Exception as exc:
+                    print(f'統計股票辨識失敗：{type(exc).__name__}',flush=True)
             await asyncio.to_thread(member_usage_stats.record, interaction.id, interaction.guild_id,
                                     user_id, outcome, question, route, entitled_admin,
-                                    bool(statistics_access[0] and statistics_access[0].simulation))
+                                    bool(statistics_access[0] and statistics_access[0].simulation),stocks)
         statistics_access = [None]
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
@@ -7492,7 +7502,7 @@ def run_discord_bot(config: BotConfig) -> None:
                                                                    interaction.guild_id, excluded)
                 await interaction_text(interaction, summary, ephemeral=True)
                 if attachment_data is not None:
-                    with discord.File(io.BytesIO(attachment_data), filename='member-usage.csv') as stats_file:
+                    with discord.File(io.BytesIO(attachment_data), filename='stock-questions.csv' if stats_command.kind in ('股票詢問統計','熱門股票') else 'member-usage.csv') as stats_file:
                         await interaction.followup.send(file=stats_file, ephemeral=True, allowed_mentions=no_mentions)
             except Exception as exc:
                 print(f'會員統計查詢失敗：{type(exc).__name__}: {exc}', flush=True)
@@ -7597,7 +7607,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
                                         panels_with_context(extra), ephemeral=ephemeral, followup=True)
             if member_usage_stats.successful(result):
-                await record_member_usage('success', result.route)
+                await record_member_usage('success', result.route, result)
             elif re.search(r'error|fail', result.route):
                 await record_member_usage('failed', result.route)
             for required in result.denial_followups:
@@ -7735,6 +7745,7 @@ def run_discord_bot(config: BotConfig) -> None:
                         f"覆盤紀錄：{summary['reviews']} 筆｜使用者：{summary['users']} 人｜"
                         f"盤中量能學習：{summary['ivol_days']} 日｜其他永久狀態：{summary['other_keys']} 項\n"
                         f"成交占比：{summary['turnover_days']} 天／{summary['turnover_rows']} 筆\n"
+                        f"統計資料：{summary.get('statistics_rows',0)} 筆（會員／股票／類型／模型與伺服器用量）\n"
                         "檔案含會員交易紀錄，請自行保存，不要放進 Git。換新 Volume 後用「/ace 匯入狀態」附上這個檔。")
                 await interaction.followup.send(content=text, file=discord.File(io.BytesIO(data), filename=name),
                                                 ephemeral=True)
@@ -7754,7 +7765,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 f"盤中量能學習：{summary['ivol_days']} 日｜其他永久狀態：{summary['other_keys']} 項｜"
                 f"實際寫入 {summary['written_keys']} 項\n"
                 f"成交占比：{summary['turnover_days']} 天／{summary['turnover_rows']} 筆，新增 {summary['written_turnover']} 筆"
-                "（已存在的紀錄不覆蓋）", ephemeral=True)
+                f"\n新增統計資料：{summary.get('written_statistics',0)} 筆（重複匯入不重複計次）", ephemeral=True)
             print(f"📦 狀態匯入｜{summary}｜by {interaction.user.id}", flush=True)
         except ValueError as exc:
             await interaction.followup.send(f"匯入失敗：{exc}", ephemeral=True)
