@@ -2260,7 +2260,9 @@ FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先
 AI_CARD_SCHEMA = {
     "type": "object",
     "properties": {
-        "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"]},
+        "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"],
+                           "description": "依完整原句判斷語氣；股票諧音或誇張玩笑即使問明天也可為playful。"},
+        "humor_opening": {"type": "string", "description": "playful時必填一句針對原梗新寫的幽默短句，不含行情數字或漲跌承諾；不知道、無法預測、重述問題不算幽默。serious或concerned填空字串。"},
         "answer": {"type": "string"},
         "why": {"type": "string"},
         "scenarios": {
@@ -2277,7 +2279,7 @@ AI_CARD_SCHEMA = {
         },
         "summary": {"type": "string"},
     },
-    "required": ["response_style", "answer", "why", "scenarios", "summary"],
+    "required": ["response_style", "humor_opening", "answer", "why", "scenarios", "summary"],
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
@@ -2555,6 +2557,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if stock_banter.holding_question(payload['question']):
         sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
     sections.append('語氣判斷與回應（優先於一般格式先寫結構及字數限制）：閱讀完整使用者原句，結合股票名稱和上下文，語意判斷 response_style 為 serious、playful 或 concerned；不要依固定關鍵字、特定拼字或笑話清單分類。辨認諧音、錯別字、誇張、比喻與反問；不因換字就忽略原本的玩笑意圖。playful 的 answer 必須先用一句簡短、針對這次原問句新寫的溫和接話，再直接回答股票問題，合計可到100字；幽默直接包含在AI解讀，不能另設區塊或只在summary接梗。不使用固定笑話模板，不要每題同一句量價口號。serious 正常分析，不硬加笑話；concerned 先接住擔心再說可核對的風險，不嘲笑虧損、不用玩笑淡化困境。玩笑不代表看多，不能保證漲跌或替人決定買賣。輸出前自行檢查：playful 的answer是否已接住這次原梗且包含客觀分析，若沒有就在本次輸出內修正。')
+    sections.append('接梗輸出規則：response_style=playful時，先在humor_opening寫一個完整、簡短、有趣的回應，呼應使用者的諧音、比喻或誇張，不能只重述原句。answer另寫客觀行情分析，不重複接梗，程式會把兩者合成同一段AI解讀。不能以「我不知道」「無法預測」「不能保證」充當humor_opening；不預測漲跌限制的是行情事實與承諾，不禁止語言上的幽默。問明天且同時玩梗，不要因此改成嚴肅拒答；接梗後分析目前可觀察的條件即可。幽默不可自創行情、數字、交易經歷或買賣建議。一般認真問題與真正焦慮時humor_opening留空。輸出前檢查playful是否有實際接梗，而不是拒答或表達不知道。此欄位規則取代前文在answer直接撰寫接梗的要求。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -4905,7 +4908,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['語意語氣解讀v7',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['語意接梗分欄合併v8',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6940,7 +6943,12 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
     if not answer or not (why or summary):
         return None
     style = data.get("response_style", "serious")
-    return {"response_style": style if style in ("serious", "playful", "concerned") else "serious",
+    style = style if style in ("serious", "playful", "concerned") else "serious"
+    opening = _clean_card_text(data.get("humor_opening"), 100) if style == "playful" else ""
+    if opening and not answer.startswith(opening):
+        # 同一次模型產生的接梗與分析在事實核對前合併；不另設圖卡、不注入固定笑話。
+        answer = opening + ("" if opening[-1] in "。！？!?…" else "。") + answer
+    return {"response_style": style,
             "answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
 
 
