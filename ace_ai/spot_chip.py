@@ -450,7 +450,7 @@ def _fetch_status(state: str, stock_code: str, date: str, latest_date: str) -> s
 def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None,
-                background: bool = False) -> Dict[str, int]:
+                background: bool = False, retry_pending: bool = False) -> Dict[str, int]:
     """只補還沒確認的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補（拿到鎖後重讀狀態，
     同一 stock＋date 不會重抓），全域同時最多 MAX_CONCURRENCY。latest_date＝目前最新交易日（查不到資料時判 pending_update）。
     回傳的 remaining 是「重新讀 DB 後仍未確認」的天數（嘗試過≠完成）。bar_dates 保留相容，不再用來判斷停牌。
@@ -458,14 +458,17 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
     now = now or tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
     latest_date = latest_date or (max(dates) if dates else today)
+    budget_started = time.monotonic()
     lock = _stock_lock(stock_code)
     # 背景正在補同一檔時，會員這一題不排隊等它：直接用資料庫已有的資料回答。
     if not lock.acquire(timeout=max(0.0, budget if lock_wait is None else lock_wait)):
         return {"fetched": 0, "remaining": len(dates), "busy": 1}
     handoff: List[threading.Thread] = []   # 時限到了仍在收尾的抓取連線：鎖等它們結束才放
     try:
+        budget = max(0.0, budget - (time.monotonic() - budget_started))
         status = local_market_cache.spot_day_status(stock_code, dates)
-        missing = sorted((d for d in dates if _needs_fetch(status.get(d), d, today, now)), reverse=True)
+        missing = sorted((d for d in dates if _needs_fetch(status.get(d), d, today, now)
+                          or (retry_pending and (status.get(d) or {}).get('status') not in CONFIRMED_STATUSES)), reverse=True)
         fetched = errors = streak = 0
         if missing and source_cooling():
             return {"fetched": 0, "remaining": _unresolved(stock_code, dates, status), "cooldown": 1, "statuses": status}

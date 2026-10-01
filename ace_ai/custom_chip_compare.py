@@ -3,6 +3,7 @@ import json
 import math
 import time
 import threading
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, wait
 import pandas as pd
 import price_adjustment
@@ -14,6 +15,18 @@ import warrant_ai_tools as tools
 _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ace-custom-chips")
 _PENDING = {}
 _LOCK = threading.Lock()
+_SPOT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ace-compare-spot")
+COMPARE_BACKFILL_SECONDS = max(0, min(180, tools._env_float('DISCORD_AI_COMPARE_BACKFILL_SECONDS', 90)))
+
+
+def _prepare_spot(code, dates, deadline):
+    left = max(0, deadline - time.monotonic())
+    if not dates or left <= 0:
+        return
+    with tools.api_request_scope(str(getattr(tools._API_REQUEST_LOCAL, 'request_id', '') or '')):
+        progress = spot_chip.ensure_days(code, dates, budget=left, latest_date=dates[-1],
+                                        lock_wait=left, retry_pending=True)
+    print(f"📚 截圖籌碼補齊｜{code}｜{json.dumps(progress, ensure_ascii=False, default=str)}", flush=True)
 
 
 def margin_future(code, dates):
@@ -73,8 +86,13 @@ def load_margin(code, dates):
     key = 'custom_margin:' + code
     cached = store.get_state(key, {})
     now = time.time()
-    if now - float(cached.get('checked', 0)) < (1800 if cached.get('failed') else 21600):
-        return margin_summary(cached.get('rows', []), dates)
+    summary = margin_summary(cached.get('rows', []), dates)
+    fresh_complete = (summary.get('data_date') == dates[-1] and
+                      all(summary.get('periods', {}).get(str(n), {}).get('complete') for n in (20, 70)))
+    if fresh_complete and now - float(cached.get('checked', 0)) < 21600:
+        return summary
+    if cached.get('failed') and now - float(cached.get('checked', 0)) < 60:
+        return summary
     kf = tools.core()
     started = time.perf_counter()
     try:
@@ -90,7 +108,8 @@ def load_margin(code, dates):
         store.set_state(key, {'checked': now, 'rows': records})
         tools.record_api_event('FinMindData', status=200, latency=time.perf_counter()-started)
         return margin_summary(records, dates)
-    except Exception:
+    except Exception as exc:
+        print(f"⚠️ 截圖融資券來源失敗｜{code}｜FinMind TaiwanStockMarginPurchaseShortSale｜{tools.err_text(exc)}", flush=True)
         tools.record_api_event('FinMindData', status=500, latency=time.perf_counter()-started)
         store.set_state(key, {'checked': now, 'rows': cached.get('rows', []), 'failed': True})
         result = margin_summary(cached.get('rows', []), dates)
@@ -109,15 +128,39 @@ def spot_summary(report):
 def enrich(data):
     rows = data['rows'] + data.get('others', [])
     calendar = spot_chip.candidate_dates(tools.taipei_now())
-    dates = calendar[0]
+    as_of = str(data.get('comparison_date') or '')[:10].replace('/', '-')
+    dates = [d for d in calendar[0] if not as_of or d <= as_of]
+    calendar = (dates, calendar[1])
+    deadline = time.monotonic() + COMPARE_BACKFILL_SECONDS
+    request_id = str(getattr(tools._API_REQUEST_LOCAL, 'request_id', '') or '')
+    def prepare(code):
+        with tools.api_request_scope(request_id):
+            return _prepare_spot(code, dates, deadline)
+    pending = {row['stock_code']: _SPOT_POOL.submit(contextvars.copy_context().run, prepare, row['stock_code'])
+               for row in rows} if dates and COMPARE_BACKFILL_SECONDS else {}
+    done, _ = wait(list(pending.values()), timeout=max(0, deadline - time.monotonic())) if pending else (set(), set())
+    for code, future in pending.items():
+        if future in done:
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"⚠️ 截圖籌碼補齊失敗｜{code}｜{tools.err_text(exc)}", flush=True)
+        else:
+            print(f"⚠️ 截圖籌碼補齊逾時｜{code}｜後續仍由背景補齊", flush=True)
     for row in rows:
         code = row['stock_code']
         try:
-            # Zero foreground history crawling: existing persistent DB + background queue.
+            # Re-read after foreground/backfill completes; do not render the pre-fill snapshot.
             report = spot_chip.build_report(code, 'quick', budget=0, calendar=calendar)
             spot_chip.remember_history(code)
             row['spot_chips'] = spot_summary(report)
-        except Exception:
+            statuses = spot_chip.local_market_cache.spot_day_status(code, dates[-70:])
+            unresolved = {d: (statuses.get(d) or {}).get('status', 'not_fetched') for d in dates[-70:]
+                          if (statuses.get(d) or {}).get('status') not in spot_chip.CONFIRMED_STATUSES}
+            print(f"📚 截圖現股涵蓋｜{code}｜來源={spot_chip.SOURCE_NAME}｜日期={row['spot_chips']['data_date']}｜"
+                  f"缺漏={json.dumps(unresolved, ensure_ascii=False)}", flush=True)
+        except Exception as exc:
+            print(f"⚠️ 截圖現股讀取失敗｜{code}｜{tools.err_text(exc)}", flush=True)
             row['spot_chips'] = {'available': False, 'reason': '現股分點暫時無法讀取'}
     futures = {row['stock_code']: margin_future(row['stock_code'], dates)
                for row in rows} if dates else {}
@@ -265,13 +308,13 @@ def apply_scores(data, rows):
 def score_panel(rows):
     def part(row, key):
         value = row['composite_score']['components'][key]
-        return f'{value:.1f}' if value is not None else '待補'
+        return f'{value:.1f}' if value is not None else '—'
     sections = [{'type': 'table', 'title':'綜合觀察分數（100分）',
         'columns':['股票','技術／60','現股／30','融資券／10','綜合'],
         'widths':[.30,.16,.18,.19,.17], 'rows':[
             [f"{r.get('composite_rank', '—')}. {r['stock_code']} {r.get('stock_name','')}",
              part(r,'technical'),part(r,'spot'),part(r,'margin'),
-             f"{r['composite_score']['total']:.1f}" if r['composite_score']['complete'] else '待補'] for r in rows]}]
+             f"{r['composite_score']['total']:.1f}" if r['composite_score']['complete'] else '—'] for r in rows]}]
     sections.append({'type':'note','text':'同日、完整資料才計綜合分及排名；待補不等於0分。技術原分數按60%換算；籌碼及融資券以20日70%、70日30%加權。'})
     sections.append({'type':'note','text':'融資券以中性5分起算，搭配股價、位階與變化幅度調整。這是觀察規則，未經績效驗證；不判定散戶或大戶身分，不代表買賣推薦。'})
     for row in rows:
@@ -279,7 +322,8 @@ def score_panel(rows):
         missing = row['composite_score']['missing']
         labels = {'technical':'技術同日分數','spot':'現股20／70日同日完整資料','margin':'融資券與價格20／70日同日完整資料'}
         explanation = '；'.join(reasons) + ('；待補：'+'、'.join(labels[k] for k in missing) if missing else '')
-        sections.append({'type':'note','text':f"{row['stock_code']} {row.get('stock_name','')}：{explanation}"})
+        print(f"📊 截圖評分診斷｜{row['stock_code']}｜{explanation}", flush=True)
+    sections = sections[:1]
     return {'branch_card':{'branch':'技術與籌碼綜合比較','tags':[],'sections':sections},'hide_text':True}
 
 
@@ -287,13 +331,14 @@ def comparison_panel(rows):
     def val(row, kind, n, field):
         p = row.get(kind, {}).get('periods', {}).get(str(n), {})
         if kind == 'spot_chips' and (p.get('insufficient') or not p):
-            return '不足 ' + str(p.get('available', 0)) + '/' + str(n)
+            return '—'
         if kind == 'margin_short' and not p.get('complete'):
-            return '股數調整' if '股數調整' in p.get('reason', '') else '資料不足'
+            return '—'
         v = p.get(field)
         return f'{v:+,.0f}' if v is not None else '—'
     sections = []
     for n in (20, 70):
+        sections.append({'type':'note', 'text': f'近 {n} 個交易日'})
         sections.append({'type': 'table', 'title': f'近 {n} 個交易日比較',
             'columns': ['股票', '分點集中度', '融資增減', '融券增減'],
             'widths': [.31, .25, .22, .22], 'signed': ('融資增減', '融券增減'),
@@ -304,9 +349,9 @@ def comparison_panel(rows):
                 val(r, 'margin_short', n, 'margin_change'), val(r, 'margin_short', n, 'short_change')]
                 for r in rows]})
     sections.append({'type': 'note', 'text': '融資／融券餘額增減單位：張。分點集中度為每日前段分點近似統計，非全市場資金淨流入；融券不含借券。'})
-    sections.append({'type': 'note', 'text': '資料日期（現股／融資券）：' + '；'.join(
+    print('📅 截圖資料日期｜' + '；'.join(
         r['stock_code'] + ' ' + str(r.get('spot_chips', {}).get('data_date') or '未取得') + '／' +
-        str(r.get('margin_short', {}).get('data_date') or '未取得') for r in rows)})
+        str(r.get('margin_short', {}).get('data_date') or '未取得') for r in rows), flush=True)
     return {'branch_card': {'branch': '清單現股籌碼與融資券比較', 'tags': [], 'sections': sections}, 'hide_text': True}
 
 
@@ -328,6 +373,17 @@ def ai_compare(data, question, gateway, validate):
         json.dumps({'question': question, 'stocks': rows, 'technical_date': data.get('comparison_date')},
                    ensure_ascii=False, default=tools.json_safe))
     result = gateway.generate(prompt, purpose='sector_answer', schema=schema, temperature=.2)
+    calls = 1
+    first_tokens = {k: int(getattr(result, k, 0) or 0) for k in ('input_tokens','output_tokens','total_tokens')}
+    error = str(getattr(result, 'error', '') or '')
+    if not result.ok and any(word in error.lower() for word in ('503', 'unavailable', 'overloaded', 'high demand')):
+        print(f"⚠️ 截圖 AI 服務忙碌，短暫退避後重試一次｜{error[:180]}", flush=True)
+        time.sleep(2)
+        result = gateway.generate(prompt, purpose='sector_answer', schema=schema, temperature=.2)
+        calls += 1
+        for field, value in first_tokens.items():
+            setattr(result, field, int(getattr(result, field, 0) or 0) + value)
+    result.comparison_calls = calls
     card = None
     if result.ok:
         try:
@@ -336,7 +392,10 @@ def ai_compare(data, question, gateway, validate):
             clean = {k: raw[k].strip() for k in ('answer', 'why', 'summary')
                      if isinstance(raw.get(k), str) and validate(raw[k], check)}
             if clean.get('answer'):
-                card = dict(clean, scenarios=[], footer='清單內相對比較｜資料不足不代表籌碼為零。')
+                card = dict(clean, scenarios=[], footer='清單內相對比較')
         except (ValueError, TypeError):
             pass
+    if card is None:
+        print(f"⚠️ 截圖 AI 解讀未產生｜ok={result.ok}｜error={getattr(result, 'error', '')}｜"
+              f"validation_or_json_failed={bool(result.ok)}", flush=True)
     return card, result

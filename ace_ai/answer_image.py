@@ -1978,13 +1978,14 @@ def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], 
             ry += SECTOR_OTHER_ROW_H
             continue
         if technical:
-            score = _finite(row.get('pattern_score')) or 0.0
+            score_value = _finite(row.get('pattern_score'))
+            score = score_value or 0.0
             bar_l, bar_r = x + 470, x + width - 430
             draw.rounded_rectangle((bar_l, mid - 5, bar_r, mid + 5), radius=5, fill=LINE)
             filled = max(0.0, min(1.0, score / 100)) * (bar_r - bar_l)
             if filled > 10:
                 draw.rounded_rectangle((bar_l, mid - 5, bar_l + filled, mid + 5), radius=5, fill='#C9B48E')
-            draw.text((bar_r + 70, mid), f'{score:.1f}', font=font(21, True), fill=INK, anchor='rm')
+            draw.text((bar_r + 70, mid), f'{score:.1f}' if score_value is not None else '—', font=font(21, True), fill=INK, anchor='rm')
             grade = str(row.get('grade', ''))
             bg, ink = GRADE_STYLE.get(grade, (TILE_BG, INK))
             gw = font(17, True).getlength(grade) + 22

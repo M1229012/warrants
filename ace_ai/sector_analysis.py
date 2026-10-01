@@ -587,9 +587,12 @@ def ranking_panel(data: Dict[str, Any], observations: Optional[Dict[str, str]] =
         flush=True,
     )
     live = [r.get("intraday") or {} for r in rows]
+    others = data.get('others') or []
+    if data.get('source') == '管理員提供的清單':
+        others = [dict(row, rank='—', grade='') if row.get('pattern_score') is None else row for row in others]
     return {"sector": {
         "name": data["name"], "mode": data["mode"], "comparison_date": data["comparison_date"],
-        "rows": rows, "others": data.get("others") or [],
+        "rows": rows, "others": others,
         "coverage_note": "", "liquidity_note": "",
         "live_time": next((i.get("time", "") for i in live if i.get("is_live")), ""),
     }}
@@ -989,13 +992,14 @@ def answer_custom(stocks: List[Dict[str, str]], name: str, gateway, validate, qu
         value = f"{score['total']:.1f}/100" if score['complete'] else "待補（僅顯示已有單項）"
         text += f"\n{row['stock_name']}（{row['stock_code']}）：{value}"
     card, result = custom_chip_compare.ai_compare(data, question or name, gateway, validate)
-    panels = [custom_chip_compare.score_panel(rows), custom_chip_compare.comparison_panel(rows)]
+    # Restore the original top-three cards and remaining-ranking layout.
+    panels = [ranking_panel(data), custom_chip_compare.score_panel(rows), custom_chip_compare.comparison_panel(rows)]
     if card:
         panels.append({"ai_card": card})
         text += "\n\n【AI 清單比較】\n" + "\n".join(card.get(k, '') for k in ('answer', 'why', 'summary'))
     else:
-        text += "\n\nAI 解讀暫時無法使用，以上為程式整理的資料。"
-    return {"text": text, "calls": 1, "panels": panels, "ai_ok": bool(card), "cacheable": bool(card) and len(complete) == len(rows),
+        print(f"⚠️ 自訂清單 AI 解讀失敗｜{tools.err_text(getattr(result, 'error', '') or 'JSON／數字核對未通過')}", flush=True)
+    return {"text": text, "calls": int(getattr(result, 'comparison_calls', 1)), "panels": panels, "ai_ok": bool(card), "cacheable": bool(card) and len(complete) == len(rows),
             "input_tokens": int(getattr(result, "input_tokens", 0) or 0),
             "output_tokens": int(getattr(result, "output_tokens", 0) or 0),
             "total_tokens": int(getattr(result, "total_tokens", 0) or 0),

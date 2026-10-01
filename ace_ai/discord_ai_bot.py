@@ -1834,7 +1834,9 @@ GEMINI_MODEL_CHAIN = [m.strip() for m in os.getenv(
 # 免費方案每個專案的（每分鐘, 每天）請求上限；可用 DISCORD_AI_GEMINI_LIMITS="模型=RPM/RPD;…" 覆蓋
 _DEFAULT_MODEL_LIMITS = {"gemini-3.1-flash-lite": (15, 500), "gemini-2.5-flash": (5, 20), "gemini-3.5-flash-lite": (15, 500)}
 GEMINI_QUOTA_MARGIN = min(1.0, max(0.5, tools._env_float("DISCORD_AI_GEMINI_QUOTA_MARGIN", 0.9)))   # 只用到上限的 9 成
-GEMINI_OVERLOAD_COOLDOWN = max(10, tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 120))       # 503 塞車：整個模型暫停
+_OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
+# 將先前 env.example 的 120 秒預設一併遷移，避免舊 Railway 設定繼續鎖住所有模型。
+GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
 GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
@@ -1908,6 +1910,15 @@ class GeminiQuota:
     def model_ready(self, model: str) -> bool:
         with self._lock:
             return model not in self._disabled and time.monotonic() >= self._model_down.get(model, 0.0)
+
+    def recovery_wait(self, models) -> float:
+        """Only wait for transient model overload; never bypass 429/key/daily restrictions."""
+        with self._lock:
+            now = time.monotonic()
+            active = [m for m in models if m not in self._disabled]
+            if not active or any(now >= self._model_down.get(m, 0) for m in active):
+                return 0.0
+            return min(self._model_down[m] - now for m in active)
 
     def key_order(self, model: str, n_keys: int) -> List[int]:
         """這個模型目前可用的金鑰（輪流起點）；已用完、限流中、無效的跳過。"""
@@ -2157,6 +2168,10 @@ class GeminiGateway:
             config.update(response_mime_type="application/json", response_schema=schema)
         contents = prompt if contents is None else contents
         started, attempts, last_error, kinds = time.perf_counter(), 0, "", []
+        recovery = self.quota.recovery_wait(GEMINI_MODEL_CHAIN)
+        if 0 < recovery <= 16 and (not deadline or time.monotonic() + recovery + 1 < deadline):
+            self.log(f"Gemini 模型忙碌，等待恢復｜{recovery:.1f}s｜用途={purpose}")
+            time.sleep(recovery + .05)
         for rank, model in enumerate(GEMINI_MODEL_CHAIN):
             if not self.quota.model_ready(model):
                 continue
@@ -2209,9 +2224,10 @@ class GeminiGateway:
                 break
         latency = time.perf_counter() - started
         if not attempts:
-            last_error = last_error or "所有模型與金鑰的額度都暫時用完或暫停中"
+            last_error = last_error or ("Gemini 模型暫時忙碌（503 冷卻中）" if self.quota.recovery_wait(GEMINI_MODEL_CHAIN)
+                                        else "所有模型與金鑰的額度都暫時用完或暫停中")
         self.log(f"Gemini 呼叫｜用途={purpose}｜嘗試 {attempts} 次｜latency={latency:.2f}s｜結果=失敗｜{last_error[:160]}")
-        rate_limited = (not attempts) or any(k in ("daily", "minute") for k in kinds) or \
+        rate_limited = (not attempts and '503' not in last_error) or any(k in ("daily", "minute") for k in kinds) or \
             any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
         return GeminiResult(ok=False, error=last_error or "Gemini 沒有回傳內容", rate_limited=rate_limited,
                             latency=latency, purpose=purpose, token_source="none")
