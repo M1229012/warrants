@@ -25,6 +25,7 @@ import pandas as pd
 
 import warrant_ai_tools as tools
 import local_market_cache
+import review_language
 
 _TRIGGER_RE = re.compile(r"覆盤|复盘|復盤")
 _WARRANT_RE = re.compile(r"權證|分點|主力|券商|大戶|[A-E]\s*事件|ABCDE", re.IGNORECASE)
@@ -65,7 +66,10 @@ def _parse_date(month: int, day: int, year: Optional[int], today: date) -> Optio
     except ValueError:
         return None
     if not year and value > today:           # 沒寫年份又比今天晚＝去年
-        value = date(today.year - 1, month, day)
+        try:
+            value = date(today.year - 1, month, day)
+        except ValueError:
+            return None
     return value
 
 
@@ -131,15 +135,59 @@ def parse_request(text: str) -> Dict[str, Any]:
             rest = rest.replace(name, "")
         reason = re.sub(r"^[\s，,。:：]*(買進|買入|買|進場)?[\s，,。:：]*", "", rest).strip()
     lots_hit = _LOTS_RE.search(head)
-    return {"code": code, "name": name, "buy_date": buy_date, "sell_date": sell_date,
+    natural = review_language.extract(head, code, today)
+    # 請求目的不是進場理由，不能拿「後續怎麼看」去核對買進當天的盤面。
+    if not reason_hit:
+        reason = review_language.DATE.sub('', main)
+        reason = _NOT_CODE_RE.sub('', _TRIGGER_RE.sub('', reason))
+        reason = _CODE_RE.sub('',reason)
+        if name:
+            reason = reason.replace(name,'')
+        reason = re.sub(r'(?:後續|後面|接下來|請|幫我|怎麼|該怎麼|這交易|交易的|優缺點|哪邊).*$','',reason).strip(' ，,。')
+        reason = review_language.DATE.sub('',reason)
+        reason = re.sub(r'^(?:(?:今天|今日|昨天|昨日|前天|買在|買進|買入|賣在|賣出|賣掉|買|賣)[\s，,。]*)+','',reason).strip(' ，,。')
+    reason = review_language.clean_reason(reason)
+    sell_reason = review_language.clean_reason(sell_reason)
+    return {"code": code, "name": name, "buy_date": natural['buy_date'], "sell_date": natural['sell_date'],
             "reason": reason, "sell_reason": sell_reason, "price": buy_price, "sell_price": sell_price,
             "lots": float(lots_hit.group(1)) if lots_hit else None,
-            "need_warrant": bool(_WARRANT_RE.search(reason)), "need_inst": bool(_INST_RE.search(reason))}
+            "need_warrant": bool(_WARRANT_RE.search(reason)), "need_inst": bool(_INST_RE.search(reason)),
+            **{k:v for k,v in natural.items() if k not in ('price','sell_price')},
+            **{k:v for k,v in natural.items() if k in ('price','sell_price') and v is not None}}
 
 
 def missing_fields(req: Dict[str, Any]) -> List[str]:
-    return [label for key, label in (("code", "股票"), ("buy_date", "買進日"), ("reason", "買進理由"))
-            if not req.get(key)]
+    if req.get('parse_error'):
+        return [req['parse_error']]
+    missing = [] if req.get('code') else ['股票名稱或代號']
+    if not req.get('buy_date') and not req.get('price'):
+        missing.append('買進價或買進日（提供其中一個即可）')
+    if req.get('closed') and not req.get('sell_date') and not req.get('sell_price'):
+        missing.append('賣出價或賣出日（提供其中一個即可）')
+    return missing
+
+
+def price_review(req: Dict[str, Any]) -> str:
+    """沒有完整日期的已賣出交易，只回顧可核實的價格結果與記錄限制。"""
+    estimated = [key for key in ('price','sell_price') if req.get(key) is None]
+    for key, day in [('price',req.get('buy_date')),('sell_price',req.get('sell_date'))]:
+        if req.get(key) is None and day:
+            frame = tools.closed_frame(tools._load_price_bundle(req['code'])).sort_index()
+            matches = [i for i,d in enumerate(frame.index) if pd.Timestamp(d).date() == day]
+            if not matches:
+                raise tools.ToolDataError('指定交易日尚無收盤資料，請直接補充實際成交價格。')
+            req[key] = float(frame['Close'].iloc[matches[-1]])
+    buy, sell = req.get('price'), req.get('sell_price')
+    if buy is None or sell is None:
+        raise tools.ToolDataError('請補充買進價與賣出價；也可以提供交易日期。')
+    gain = sell-buy
+    basis = '\n未提供價格的部分，以指定交易日收盤價估算。' if estimated else ''
+    return (f"{req.get('name') or req['code']}（{req['code']}）交易回顧\n\n"
+            f"買進 {buy:g} 元 → 賣出 {sell:g} 元\n每股價差 {gain:+g} 元｜價差報酬 {gain/buy*100:+.2f}%（未扣手續費與交易稅）{basis}\n\n"
+            '可確認的結果：這筆交易已實現價差'+('獲利。' if gain>0 else '虧損。' if gain<0 else '打平。')+'\n'
+            '操作優缺點：目前缺少完整買賣日期與操作理由，不能判斷是否追高、賣太早、遵守停損或控制回撤；獲利也不等於操作一定好。\n'
+            '可以進步的地方：下次記下進場依據、當時預定的風險界線，以及實際出場原因，再對照是否照原先計畫執行。\n'
+            '若想檢查實際進出時機，直接補一句「9/1買、9/30賣」即可，不必照固定格式。')
 
 
 # ============================================================
@@ -154,6 +202,23 @@ def _index_on_or_after(df: pd.DataFrame, day: date) -> Optional[int]:
     dates = pd.DatetimeIndex(df.index).normalize()
     hits = [i for i, d in enumerate(dates) if d.date() >= day]
     return hits[0] if hits else None
+
+
+def _index_on_date(df: pd.DataFrame, day: date) -> Optional[int]:
+    hits = [i for i, d in enumerate(df.index) if pd.Timestamp(d).date() == day]
+    return hits[-1] if hits else None
+
+
+def close_on_date(code: str, day: date) -> float:
+    """只使用指定日已收盤行情，不偷偷改成下一個交易日或盤中價。"""
+    frame = tools.closed_frame(tools._load_price_bundle(code)).sort_index()
+    idx = _index_on_date(frame, day)
+    if idx is None:
+        raise tools.ToolDataError(f'{day:%Y/%m/%d}沒有可用的收盤資料，可能是休市、尚未收盤或資料未更新；請確認交易日或補實際成交價。')
+    value = float(frame['Close'].iloc[idx])
+    if not pd.notna(value) or value <= 0:
+        raise tools.ToolDataError('指定日收盤價無效，請補充實際成交價或稍後再試。')
+    return value
 
 
 def _kd_cross_days_ago(part: pd.DataFrame, lookback: int = 3, down: bool = False) -> Optional[int]:
@@ -887,19 +952,26 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
     df = df[~df.index.duplicated(keep="last")]
     live = bundle["df"].sort_index()
     live = live[~live.index.duplicated(keep="last")]
-    idx = _index_on_or_after(df, req["buy_date"])
+    idx = _index_on_date(df, req["buy_date"])
     if idx is None:
-        raise tools.ToolDataError("買進日晚於目前最新的日 K 資料")
+        raise tools.ToolDataError('買進日沒有已收盤日K，可能是休市、尚未收盤或資料不足；請確認實際交易日。')
     if idx == 0:
         raise tools.ToolDataError(f"本地日 K 只回溯到 {tools._fmt_date(df.index[0])}，買進日太早，無法覆盤")
-    live_idx = _index_on_or_after(live, req["buy_date"])
-    sell_idx = _index_on_or_after(live, req["sell_date"]) if req.get("sell_date") else None
-    if sell_idx is not None and sell_idx <= live_idx:  # 賣出日早於（或等於）買進日：視為沒填
-        sell_idx = None
+    live_idx = _index_on_date(live, req["buy_date"])
+    if live_idx is None:
+        raise tools.ToolDataError('買進日行情未完整載入，請稍後再試。')
+    sell_idx = _index_on_date(live, req["sell_date"]) if req.get("sell_date") else None
+    if req.get('sell_date') and sell_idx is None:
+        raise tools.ToolDataError('賣出日尚無可用行情，請提供實際賣出價或等行情更新後再試。')
+    if sell_idx is not None and sell_idx < live_idx:
+        raise tools.ToolDataError('賣出日早於買進日，請確認日期。')
     buy_price = float(req.get("price") or df["Close"].iloc[idx])
     sell_price = None
     if sell_idx is not None:
-        sell_price = float(req.get("sell_price") or live["Close"].iloc[sell_idx])
+        close_idx = _index_on_date(df, req['sell_date'])
+        if req.get('sell_price') is None and close_idx is None:
+            raise tools.ToolDataError('賣出日尚無收盤價，請補實際賣出價，或等收盤資料更新後再覆盤。')
+        sell_price = float(req.get("sell_price") or df["Close"].iloc[close_idx])
     snap = snapshot_at(df, idx)
     result = after_buy(live, live_idx, buy_price, sell_idx, sell_price)
     intraday = bundle.get("intraday") or {}
@@ -954,7 +1026,7 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
     sell_checks = []
     if closed and req.get("sell_reason"):
         # 出場理由也用「賣出當天（含）以前」的資料核對，不看賣後走勢
-        sell_close_idx = _index_on_or_after(df, live.index[sell_idx].date())
+        sell_close_idx = _index_on_date(df, live.index[sell_idx].date())
         if sell_close_idx is not None:
             sell_snap = snapshot_at(df, sell_close_idx)
             sell_inst = inst_summary(frame, pd.Timestamp(df.index[sell_close_idx]).normalize()) \
@@ -1057,7 +1129,7 @@ def _slim(value: Any) -> Any:
 
 
 def build_prompt(payload: Dict[str, Any]) -> str:
-    return REVIEW_PROMPT + json.dumps(_slim(payload), ensure_ascii=False, default=str)
+    return REVIEW_PROMPT + '\n若未提供進場或出場理由，不可自行補造動機；依可核實走勢回顧，並說明未提供理由。\n' + json.dumps(_slim(payload), ensure_ascii=False, default=str)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1098,8 +1170,9 @@ def fallback_review(payload: Dict[str, Any]) -> Dict[str, Any]:
         headline = "部分進場理由缺資料，無法核對"
     else:
         headline = "進場理由都與當天資料相符"
-    body = (f"原始理由是{t.get('entry_reason_raw') or '、'.join(t['entry_reasons'])}，"
-            f"核對結果見上方。進場後最大回撤 {a['max_drawdown_pct']:+.2f}%，這是進場後的走勢，不是原始理由。")
+    original_reason = t.get('entry_reason_raw') or '、'.join(t['entry_reasons'])
+    body = ((f"原始理由是{original_reason}，核對結果見上方。" if original_reason else '未提供進場理由，先回顧可核實的交易過程。') +
+            f"進場後最大回撤 {a['max_drawdown_pct']:+.2f}%，這是進場後的走勢，不是原始理由。")
     good = [c["claim"] for c in checks if c["status"] == "✅"]
     wrong = [c["claim"] for c in checks if c["status"] in ("❌", "⚠️")]
     reason_line = (f"{'、'.join(wrong[:2])}與當天資料不完全相符" if wrong

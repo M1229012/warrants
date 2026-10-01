@@ -55,6 +55,8 @@ import sector_match
 import kline_debug
 import sector_radar
 import trade_review
+import review_language
+import stock_banter
 import member_usage_stats
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
@@ -327,6 +329,10 @@ def detect_question_intents(question: str) -> Tuple[str, Set[str]]:
         intents.discard("warrant")    # 沒提權證／分點的「籌碼」是三大法人，不是權證分點
     if "部位" not in normalized and (_MA_SYNONYM_RE.search(question or "") or "整理" in (question or "")):
         intents.discard("position")  # 「還在月線上嗎」「還在整理嗎」的「還在」不是問分點部位
+    if stock_banter.wants_analysis(question):
+        intents.update({'analysis', 'technical'})
+        if stock_banter.holding_question(question):
+            intents.add('cost')  # 成本可選填；也讓同一使用者的持倉追問沿用原有成本。
     return normalized, intents
 
 
@@ -350,8 +356,7 @@ BROKER_PREFIXES = (
 # 代號後面緊接 2 個以上大寫字母（「4958ECB」「4958KY」「2330CB」）＝代號＋英文縮寫，照樣認出代號
 STOCK_CODE_RE = re.compile(r"(?<![0-9A-Za-z/.\-])(\d{4,6}(?:[A-Z](?![A-Za-z]))?)"
                            r"(?:(?=[A-Z]{2,})|(?![0-9A-Za-z%/.\-年])(?![月日](?![K線營均])))")
-COST_RE = re.compile(r"(?:成本價?|均價|買在|買進價|進場價|套在|接在)\s*(?:在|是|為|約|大約|大概|大概是|差不多|約莫)?"
-                     r"\s*(\d+(?:\.\d+)?)\s*(?:元|塊)?")
+COST_RE = stock_banter.COST_RE
 # 前面不可是數字（「3006日K」不是 6 日）；最多 3 位數（「近120天」）
 DAYS_RE = re.compile(r"(?<!\d)(?:近|最近)?\s*(\d{1,3})\s*(?:個)?\s*(?:交易)?\s*(?:日|天)")
 # 字母前面不可是英數字（00981A 的 A 是代號）、「型」後面不可接「態」（「型態」不是 A 型事件）
@@ -454,7 +459,7 @@ class QuestionParser:
 
         cost_match = COST_RE.search(question)
         if cost_match:
-            parsed.cost_price = float(cost_match.group(1))
+            parsed.cost_price = float((cost_match.group(1) or cost_match.group(2)).replace(',', ''))
             parsed.intents.add("cost")
             question = question.replace(cost_match.group(0), " ")
         days_match = DAYS_RE.search(question)
@@ -2541,6 +2546,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     elif "get_pattern_scorecard" in names:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
+    if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
+        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。若原句有玩笑／諧音，answer可先用一句15～25字的溫和幽默接話，再給行情結論；不可嘲笑虧損或用玩笑暗示一定賺錢。題目已說幽默開場由程式提供時不重複接梗。用戶要賣不等於已賣出。")
+        if review_language.intent(payload['question']) == 'review':
+            sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -3972,8 +3981,10 @@ _FUNDAMENTAL_RE = re.compile(r"殖利率|股利|股息|配息|配股|除息|除�
 _STRATEGY_RE = re.compile(r"操作策略|操作建議|交易策略|策略|進場|出場|買點|賣點|停損|停利|怎麼操作|如何操作|該買|該賣|加碼|減碼")
 # 解讀卡不可出現的買賣指令句（Gemini 偶爾會寫）：整句刪掉
 _DIRECTIVE_RE = re.compile(r"建議(?:可|先|逢低|逢高|分批)?(?:買進|買入|賣出|進場|出場|加碼|減碼|布局|停損|停利)"
-                           r"|停損(?:設|點|價|位)|停利(?:設|點|價|位)|(?:可|宜)(?:逢低)?(?:買進|進場|加碼)")
-STRATEGY_NOTICE = "艾斯 AI 不提供買賣建議，以下整理明天的觀察重點。"
+                           r"|停損(?:設|點|價|位)|停利(?:設|點|價|位)|(?:可|宜)(?:逢低)?(?:買進|進場|加碼)"
+                           r"|(?:建議|推薦|應該|可以|適合|值得|不值得|不適合|不要|別再|繼續|先|趕快|直接|立即)(?:你|您)?(?:繼續|先|分批|逢高|逢低)?(?:持有|續抱|抱著|抱住|賣掉|賣出|賣了|買入|買進|加碼|減碼|認賠|停損|出清)"
+                           r"|(?:一定|保證|肯定|穩穩)(?:會)?(?:回本|賺錢|獲利|上漲)|穩賺|必漲|必賺")
+STRATEGY_NOTICE = "艾斯助手｜喬巴整理目前結構與後續觀察條件，不代替你做買賣決定。"
 # 預測漲跌的說法（Gemini 偶爾在情境裡寫）：只刪那個子句，保留條件本身
 _PREDICTION_RE = re.compile(r"(?:有望|可望|將會?|即將)?(?:開啟|展開|迎來)?新一波(?:漲勢|跌勢|行情|攻勢)|有望(?:大漲|噴出|續漲|創高|挑戰新高)"
                             r"|可望(?:大漲|噴出|續漲|創高)|多方續攻|空方續殺")
@@ -4038,6 +4049,11 @@ def clarify_message(parsed: "ParsedQuestion") -> str:
         return (f"**查不到這個代號**\n股票名冊裡沒有「{'、'.join(codes)}」，請確認代號是否正確（上市櫃普通股、ETF 皆可），"
                 f"或改用股票名稱問我，例如：\n{examples}")
     unknown = next((t for t in parsed.unknown_terms if 2 <= len(t) <= 8), "")
+    if stock_banter.wants_analysis(question):
+        if unknown and not parsed.stocks:
+            return f'還沒辨識到「{unknown}」是哪一檔，給我股票代號就能接著看；成本可選填。'
+        if not parsed.stocks:
+            return '想問哪一檔股票？告訴我名稱或代號就好；例如「2330還能抱嗎」，成本可以不填。'
     if unknown and not (parsed.intents & _SUPPORTED_INTENTS - {"technical", "volume_profile"}):
         head = f"找不到「{unknown}」這檔股票或分點，可以確認名稱，或改用股票代號問我。"
     elif parsed.intents - {"analysis"}:
@@ -4694,12 +4710,16 @@ class AceQueryEngine:
                 return AnswerResult(text="MoneyDJ 備援圖片僅限管理員使用。", route="admin_moneydj_denied", gemini_calls=0, elapsed=time.perf_counter()-started)
             return self._answer_admin_moneydj_image(question, started)
         # 覆盤筆記：目前只開放管理員（SUPERUSER／伺服器管理員，/ask 或 /ace 皆可）；個人紀錄依 Discord 使用者分開存
-        if trade_review.is_review_request(question) or trade_review.is_list_request(question):
+        question_intent = review_language.intent(question)
+        if question_intent == 'review' or trade_review.is_list_request(question):
             access = self._access()
             if access is not None and not access.entitlement.admin:
                 return AnswerResult(text="「交易覆盤」目前只開放管理員使用，開放後會再通知。", route="review_locked",
                                     gemini_calls=0, elapsed=time.perf_counter() - started, as_text=True)
             return self._answer_review(question, context_key, started)
+
+        if review_language.dated_purchase(question):
+            return self._answer_dated_current(question, context_key, on_queue, started)
 
         if not admin_mode:
             # /ask 只做一般問答；精選相關的字眼直接導向管理員指令，不進草稿流程。
@@ -4754,8 +4774,45 @@ class AceQueryEngine:
         # 管理員指令裡的一般問題（例如先看排名再問個股）仍然走一般問答。
         return self._answer_general(question, context_key, on_queue, started, compact)
 
+    def _answer_dated_current(self, question: str, context_key: str, on_queue, started: float) -> AnswerResult:
+        """使用者問目前型態但提供歷史買進日：只補估算成本，不建立覆盤筆記。"""
+        try:
+            req = trade_review.parse_request(question)
+            if req.get('parse_error'):
+                raise tools.ToolDataError(req['parse_error'])
+            if not req.get('code') or not req.get('buy_date') or req.get('price') is not None:
+                return self._answer_general(question, context_key, on_queue, started, re.sub(r'\s+', '',question))
+            price = trade_review.close_on_date(req['code'],req['buy_date'])
+        except tools.ToolDataError as exc:
+            return AnswerResult(text=str(exc),route='clarify',gemini_calls=0,elapsed=time.perf_counter()-started,as_text=True)
+        note = f"買進價未提供：以{req['buy_date']:%Y/%m/%d}收盤價{price:g}元估算成本，並非實際成交價；本題分析目前行情。"
+        effective = question+f"（成本{price:g}元為買進日收盤估算；本題只分析目前行情。）"
+        result = self._answer_general(effective,context_key,on_queue,started,re.sub(r'\s+', '',effective))
+        if result.route not in CARD_ROUTES and result.route != 'answer_cache':
+            return result
+        panel = {'branch_card':{'branch':'成本估算','sections':[{'type':'note','text':note}]},'hide_text':True}
+        return replace(result,text=note+'\n\n'+result.text,panels=[panel]+list(result.panels or []))
+
     def _answer_general(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
                         started: float, compact: str) -> AnswerResult:
+        """接住股票口語，幽默開場與正常分析共用原本的權限及快取流程。"""
+        banter = None
+        if stock_banter._SLANG.search(question):
+            try:
+                banter = stock_banter.prepare(question, tools.get_stock_name_map())
+            except tools.ToolDataError:
+                pass  # 原有解析流程會回報資料讀取錯誤。
+        if not banter:
+            return self._answer_general_impl(question, context_key, on_queue, started, compact)
+        normalized, opener = banter
+        result = self._answer_general_impl(normalized, context_key, on_queue, started, re.sub(r'\s+', '', normalized))
+        if result.route not in CARD_ROUTES and result.route != 'answer_cache':
+            return result  # 權限、澄清與錯誤訊息照原本處理。
+        panel = {'branch_card': {'branch':'喬巴先說一句','sections':[{'type':'note','text':opener}]}, 'hide_text':True}
+        return replace(result, text=opener+'\n\n'+result.text, panels=[panel]+list(result.panels or []))
+
+    def _answer_general_impl(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
+                             started: float, compact: str) -> AnswerResult:
         """一般問答：解析 → 追問記憶 → 快取 → 排隊 → 計算。"""
         # 先判斷是不是族群雷達（「哪些族群正在轉強」），不是才解析族群名稱，
         # 否則「正在轉強」會被當成族群名稱去查。
@@ -4771,6 +4828,9 @@ class AceQueryEngine:
             self.log(f"問題解析失敗：{exc}")
             return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         self._perf_add("router", time.perf_counter() - router_started)
+        if parsed.cost_price is not None and parsed.cost_price <= 0:
+            return AnswerResult(text='買進成本應大於0，請確認價格；也可以不填成本，直接問目前走勢。',
+                                route='clarify', gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
         note = self.memory.resolve(context_key, parsed)
         remembered = self.memory.get(context_key)
         access = self._access()
@@ -5286,10 +5346,25 @@ class AceQueryEngine:
         missing = trade_review.missing_fields(req)
         if missing:
             return AnswerResult(
-                text=(f"覆盤還缺：{'、'.join(missing)}。\n範例：覆盤 2454 9/1 買進 1285，理由：站上月線、外資連三天買超\n"
-                      "已賣出：覆盤 2454 9/1 買進 1285 9/30 5600 賣掉，理由：…，賣出理由：…\n"
-                      "（價格、張數、賣出日可省略；沒寫價格就用當天收盤價）"),
+                text=('再補充一下：'+'、'.join(missing)+'\n可以直接說「2330買在2300，後續怎麼看」或「2330買在9/1，今天賣」。'),
                 route="review_help", gemini_calls=0, elapsed=elapsed(), cacheable=False, as_text=True)
+        if req.get('closed') and (not req.get('buy_date') or not req.get('sell_date')):
+            try:
+                text = trade_review.price_review(req)
+            except tools.ToolDataError as exc:
+                return AnswerResult(text=str(exc), route='review_help', gemini_calls=0,
+                                    elapsed=elapsed(), cacheable=False, as_text=True)
+            return AnswerResult(text=text+'\n\n'+DISCLAIMER, route='trade_review', gemini_calls=0,
+                                elapsed=elapsed(), cacheable=False, as_text=True)
+        if not req.get('buy_date'):
+            reason_context = (f"。我的進場理由是：{req['reason']}" if req.get('reason') else '。未提供進場理由')
+            effective = f"交易回顧：我{req['code']}成本{req['price']:g}元{reason_context}。請回顧這筆交易的進場依據、交易規劃與改善方向；未提供買進日，不能驗證買進當天的行情，目前行情僅作成本與風險補充。"
+            result = self._answer_general(effective,context_key,None,started,re.sub(r'\s+', '',effective))
+            if result.route not in CARD_ROUTES and result.route != 'answer_cache':
+                return result
+            note = '覆盤資料不完整：未提供買進日，先回顧進場依據與交易規劃，不推測買進當天的型態或持有期間。'
+            panel = {'branch_card': {'branch':'覆盤範圍','sections':[{'type':'note','text':note}]}, 'hide_text':True}
+            return replace(result, route='trade_review', cacheable=False, text=note+'\n\n'+result.text, panels=[panel]+list(result.panels or []))
         self.log(f"覆盤｜{req['code']} {req.get('name', '')}｜買進 {req['buy_date']}｜賣出 {req.get('sell_date') or '-'}"
                  f"｜價格 {req.get('price') or '收盤'}｜抓權證={req['need_warrant']}｜抓法人={req['need_inst']}")
         stats = AnswerStats()
@@ -5356,6 +5431,15 @@ class AceQueryEngine:
             RATE_LIMIT_MESSAGE if result.rate_limited else "AI 覆盤暫時無法使用，以下為系統整理的簡短版本。")
         text = f"**{heading}**\n\n" + (f"{prefix}\n\n" if prefix else "") + f"{body}\n\n{DISCLAIMER}"
         panels = [panel, trade_review.review_panel(payload, review, source)]
+        estimates=[]
+        if req.get('price') is None:
+            estimates.append(f"買進價以{req['buy_date']:%Y/%m/%d}收盤價估算")
+        if req.get('sell_date') and req.get('sell_price') is None:
+            estimates.append(f"賣出價以{req['sell_date']:%Y/%m/%d}收盤價估算")
+        if estimates:
+            note='；'.join(estimates)+'，並非實際成交價。'
+            text=note+'\n\n'+text
+            panels.insert(0,{'branch_card':{'branch':'價格估算','sections':[{'type':'note','text':note}]},'hide_text':True})
         return AnswerResult(text=text, route="trade_review", gemini_calls=stats.gemini_calls, elapsed=elapsed(),
                             cacheable=False, panels=panels, image_title=heading,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
@@ -5859,7 +5943,7 @@ class AceQueryEngine:
                   'subject 從 ["stock","sector","market","branch","none"] 擇一；'
                   'action 從 ["pattern","members","rank","compare","chips","news","price","institutional","futures","cost","none"] 擇一'
                   "（pattern＝走勢／型態／技術面／能不能追／會不會跌、institutional＝外資投信自營商法人、futures＝台指期未平倉、"
-                  "cost＝使用者講自己的成本或套牢、news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
+                  "cost＝使用者講自己的成本、套牢、賠錢、還值得持有嗎、要不要賣、回本或進場理由；沒有成本數字也可選cost。股票諧音、玩笑、火箭、帶我飛、豁達等投資口語，若是在問這檔的好壞或走勢，選pattern，不能因為是玩笑就選none。無關股市的聊天仍選none。news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
                   "compare＝比較兩檔、members＝族群成分股、rank＝排行）；"
                   "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串。\n問題：" + question)
         result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
@@ -6417,11 +6501,13 @@ class AceQueryEngine:
             card = self._check_ai_card(card, payload, facts)
             if card is None:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
-            for key in ("why", "summary"):
+            for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
-            card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=fix_scenario_title(x.get("title", "")))
+            card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=drop_directives(fix_scenario_title(x.get("title", ""))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
+            if not card['answer']:
+                return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
             pattern_names = [n for r in results if r.ok and r.name == "get_technical_analysis"
                              for n in ((r.data.get("kline_patterns") or {}).get("names") or [])]
             card_text = ai_card_text(card)
@@ -6429,7 +6515,7 @@ class AceQueryEngine:
                 self.log(f"⚠️ AI 解讀沒有提到 K 線型態｜程式判斷：{'、'.join(pattern_names[:4])}")
             if _STRATEGY_RE.search(question):
                 card["notice"] = "｜".join(x for x in (STRATEGY_NOTICE, card.get("notice")) if x)
-                card["scenario_title"] = "明天觀察重點"
+                card["scenario_title"] = "後續觀察重點"
             time_line = build_data_time_line(results)
             card["footer"] = "｜".join(x for x in (time_line, "AI 解讀僅供參考，不構成投資建議。") if x)
             self._set_ai_card(card)
